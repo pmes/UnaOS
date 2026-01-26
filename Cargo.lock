@@ -4264,6 +4264,8 @@ dependencies = [
  "dotenvy",
  "gneiss_pal",
  "reqwest",
+ "serde",
+ "serde_json",
  "tokio",
 ]
 

@@ -4,6 +4,9 @@ use std::thread;
 use tokio::runtime::Runtime;
 use dotenvy::dotenv;
 
+mod api;
+use api::GeminiClient;
+
 struct State {
     status_text: String,
     #[allow(dead_code)]
@@ -75,18 +78,37 @@ fn main() {
         rt.block_on(async {
             println!(":: VEIN :: Async Core Starting...");
 
-            // Initialize Reqwest Client
-            let _client = reqwest::Client::new();
+            // Initialize Gemini Client
+            let client_result = GeminiClient::new();
 
             // Simulate startup delay
             tokio::time::sleep(tokio::time::Duration::from_millis(1500)).await;
 
-            {
-                let mut s = state_for_bg.lock().unwrap();
-                s.status_text = "Network Stack Initialized".to_string();
-                s.network_initialized = true;
+            match client_result {
+                Ok(client) => {
+                    println!(":: VEIN :: Connecting to Synapse...");
+                    match client.generate_content("Hello, I am Vein. System check.").await {
+                        Ok(response) => {
+                            let mut s = state_for_bg.lock().unwrap();
+                            s.status_text = response;
+                            s.network_initialized = true;
+                            println!(":: VEIN :: Synapse Connection Established.");
+                        }
+                        Err(e) => {
+                            let mut s = state_for_bg.lock().unwrap();
+                            s.status_text = format!("Connection Failed: {}", e);
+                            s.network_initialized = true;
+                            eprintln!(":: VEIN :: Synapse Connection Failed: {}", e);
+                        }
+                    }
+                }
+                Err(e) => {
+                    let mut s = state_for_bg.lock().unwrap();
+                    s.status_text = format!("Config Error: {}", e);
+                    s.network_initialized = true;
+                    eprintln!(":: VEIN :: Config Error: {}", e);
+                }
             }
-            println!(":: VEIN :: Network Stack Initialized");
 
             // Keep the runtime alive for future tasks
             loop {
