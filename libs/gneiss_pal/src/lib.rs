@@ -25,8 +25,6 @@ pub trait GneissPal {
     fn draw_pixel(&mut self, x: u32, y: u32, color: u32);
     fn poll_event(&mut self) -> Event;
     fn render(&mut self);
-
-    // NEW: High-level helpers required by Console/Vug
     fn width(&self) -> u32;
     fn height(&self) -> u32;
 
@@ -46,19 +44,15 @@ pub trait GneissPal {
         }
     }
 
-    // Placeholder for text - real implementation requires a font map
     fn draw_text(&mut self, _x: usize, _y: usize, _text: &str, _color: u32) {
-        // No-op for now to satisfy the compiler
     }
 }
 
-// New Handler Trait (Inversion of Control)
 pub trait AppHandler {
     fn handle_event(&mut self, event: Event);
     fn draw(&mut self, buffer: &mut [u32], width: u32, height: u32);
 }
 
-// --- USERSPACE EXPORTS ---
 #[cfg(feature = "std")]
 pub mod backend;
 
@@ -66,7 +60,8 @@ pub mod backend;
 pub mod text;
 
 #[cfg(feature = "std")]
-pub use crate::backend::{WaylandApp, WindowEvent};
+pub use backend::EventLoop;
 
+// Compatibility alias if needed, though vein uses EventLoop now.
 #[cfg(feature = "std")]
 pub use raw_window_handle::{HasDisplayHandle, HasWindowHandle};

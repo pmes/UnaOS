@@ -1,4 +1,4 @@
-use gneiss_pal::{WaylandApp, AppHandler, text, Event, KeyCode};
+use gneiss_pal::{EventLoop, AppHandler, text, Event, KeyCode};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use tokio::runtime::Runtime;
@@ -280,7 +280,10 @@ fn main() {
 
     // Start UI
     println!(":: VEIN :: Initializing Graphical Interface...");
-    let app = WaylandApp::new().expect("Failed to initialize PAL");
+
+    // NEW: Use EventLoop instead of WaylandApp
+    let event_loop = EventLoop::new();
+
     let handler = VeinApp {
         state,
         input_buffer: String::new(),
@@ -289,7 +292,7 @@ fn main() {
         font,
     };
 
-    if let Err(e) = app.run_window(handler) {
+    if let Err(e) = event_loop.run(handler) {
         eprintln!(":: VEIN CRASH :: {}", e);
     }
 
