@@ -44,9 +44,18 @@ pub trait GneissPal {
     }
 }
 
+// New Handler Trait (Inversion of Control)
+pub trait AppHandler {
+    fn update(&mut self);
+    fn draw(&mut self, buffer: &mut [u32], width: u32, height: u32);
+}
+
 // --- USERSPACE EXPORTS ---
 #[cfg(feature = "std")]
 pub mod backend;
+
+#[cfg(feature = "std")]
+pub mod text;
 
 #[cfg(feature = "std")]
 pub use crate::backend::{KeyCode, WaylandApp, WindowEvent};
