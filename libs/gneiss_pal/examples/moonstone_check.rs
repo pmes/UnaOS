@@ -1,30 +1,22 @@
-use gneiss_pal::{GneissPal, HostPal, MOONSTONE_PURPLE, Event};
+use gneiss_pal::{WaylandApp, AppHandler, MOONSTONE_PURPLE};
+
+struct MoonstoneApp;
+
+impl AppHandler for MoonstoneApp {
+    fn update(&mut self) {}
+
+    fn draw(&mut self, buffer: &mut [u32], _width: u32, _height: u32) {
+        for pixel in buffer.iter_mut() {
+            *pixel = MOONSTONE_PURPLE;
+        }
+    }
+}
 
 fn main() {
-    // 1. Initialize the Body
-    let width = 800;
-    let height = 600;
-    let mut pal = HostPal::new(width, height);
-
     println!("Initializing Moonstone check...");
-
-    // 2. The Main Loop (The Heartbeat)
-    loop {
-        // A. Input
-        if let Event::Quit = pal.poll_event() {
-            break;
-        }
-
-        // B. Logic (Fill Screen with Moonstone Purple)
-        for y in 0..height {
-            for x in 0..width {
-                pal.draw_pixel(x as u32, y as u32, MOONSTONE_PURPLE);
-            }
-        }
-
-        // C. Render
-        pal.render();
+    let app = WaylandApp::new().expect("Failed to init");
+    if let Err(e) = app.run_window(MoonstoneApp) {
+        eprintln!("Error: {}", e);
     }
-
     println!("Check complete.");
 }

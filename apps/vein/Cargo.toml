@@ -6,3 +6,6 @@ edition = "2021"
 [dependencies]
 # Pointing to the new location in libs/
 gneiss_pal = { path = "../../libs/gneiss_pal" }
+reqwest = { version = "0.11", features = ["json"] }
+tokio = { version = "1.36", features = ["full"] }
+dotenvy = "0.15"
