@@ -20,4 +20,4 @@ Thumbs.db
 # Secrets (Just in case)
 secret.txt
 evidence.txt
-apps/vein/.env
+.env
