@@ -1,0 +1,15 @@
+[package]
+name = "gneiss_mac"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+gneiss_pal = { path = "../core" }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.5"
+objc2-app-kit = { version = "0.2", features = ["NSApplication", "NSWindow", "NSResponder", "NSView", "NSMenu", "NSMenuItem", "NSRunningApplication", "NSApplicationScripting"] }
+objc2-foundation = { version = "0.2", features = ["NSString", "NSNotification", "NSValue", "NSDate", "NSProcessInfo"] }
+
+[target.'cfg(not(target_os = "macos"))'.dependencies]
+libc = "0.2"
