@@ -11,7 +11,7 @@ pub fn draw_text(
     start_x: i32,
     start_y: i32,
     color: u32,
-) {
+) -> i32 {
     let font = FontRef::try_from_slice(FONT_DATA).expect("Error loading embedded font");
     let scale = PxScale { x: 24.0, y: 24.0 }; // 24px font size
     let mut caret = point(start_x as f32, start_y as f32);
@@ -28,6 +28,13 @@ pub fn draw_text(
         }
 
         let glyph_id = font.glyph_id(c);
+        let advance = font.as_scaled(scale).h_advance(glyph_id);
+
+        if caret.x + advance > width as f32 {
+            caret.x = start_x as f32;
+            caret.y += scale.y * 1.2;
+        }
+
         let glyph = glyph_id.with_scale_and_position(scale, caret);
 
         if let Some(outlined) = font.outline_glyph(glyph) {
@@ -49,6 +56,7 @@ pub fn draw_text(
             });
         }
 
-        caret.x += font.as_scaled(scale).h_advance(glyph_id);
+        caret.x += advance;
     }
+    (caret.y + scale.y * 1.2) as i32
 }

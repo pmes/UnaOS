@@ -1,7 +1,8 @@
-use gneiss_pal::{WaylandApp, AppHandler, text};
+use gneiss_pal::{WaylandApp, AppHandler, text, Event, KeyCode};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use tokio::runtime::Runtime;
+use tokio::sync::mpsc;
 use dotenvy::dotenv;
 
 mod api;
@@ -11,21 +12,50 @@ struct State {
     status_text: String,
     #[allow(dead_code)]
     network_initialized: bool,
+    chat_history: Vec<String>,
 }
 
 struct VeinApp {
     state: Arc<Mutex<State>>,
+    input_buffer: String,
+    tx: mpsc::UnboundedSender<String>,
 }
 
 impl AppHandler for VeinApp {
-    fn update(&mut self) {
-        // Future: Poll for specific updates if needed
+    fn handle_event(&mut self, event: Event) {
+        match event {
+            Event::Char(c) => {
+                self.input_buffer.push(c);
+            }
+            Event::KeyDown(KeyCode::Backspace) => {
+                self.input_buffer.pop();
+            }
+            Event::KeyDown(KeyCode::Enter) => {
+                if !self.input_buffer.is_empty() {
+                    let msg = self.input_buffer.clone();
+                    // Update Local State
+                    {
+                        let mut s = self.state.lock().unwrap();
+                        s.chat_history.push(format!("> {}", msg));
+                        // Keep history manageable
+                        if s.chat_history.len() > 15 {
+                            s.chat_history.remove(0);
+                        }
+                    }
+                    // Send to background
+                    if let Err(e) = self.tx.send(msg) {
+                        eprintln!("Failed to send message: {}", e);
+                    }
+                    // Clear buffer
+                    self.input_buffer.clear();
+                }
+            }
+            _ => {}
+        }
     }
 
     fn draw(&mut self, buffer: &mut [u32], width: u32, height: u32) {
         // Fill Background with Una Blue
-        // 0xFF00AAFF is ARGB (assuming softbuffer uses 0RGB or ARGB, usually top byte ignored or alpha)
-        // User specified 0x00aaff.
         let bg_color = 0x00aaff;
         for pixel in buffer.iter_mut() {
             *pixel = bg_color;
@@ -45,7 +75,7 @@ impl AppHandler for VeinApp {
         );
 
         // Network Status
-        text::draw_text(
+        let mut y = text::draw_text(
             buffer,
             width,
             height,
@@ -53,6 +83,41 @@ impl AppHandler for VeinApp {
             50,
             90, // A bit lower
             0xFFFFFFFF, // White
+        );
+
+        y += 20; // Padding
+
+        // Draw History
+        for msg in &state.chat_history {
+            y = text::draw_text(buffer, width, height, msg, 50, y, 0xFFFFFFFF);
+            // Simple clip check
+            if y > (height as i32 - 60) {
+                 break;
+            }
+        }
+
+        // Draw Input Line
+        let input_y = (height as i32) - 40;
+
+        // Separator Line
+        let sep_y = input_y - 10;
+        if sep_y > 0 && sep_y < height as i32 {
+             for x in 0..width {
+                  let idx = (sep_y * width as i32 + x as i32) as usize;
+                  if idx < buffer.len() {
+                      buffer[idx] = 0xFFCCCCCC;
+                  }
+             }
+        }
+
+        text::draw_text(
+            buffer,
+            width,
+            height,
+            &format!("{} _", self.input_buffer),
+            50,
+            input_y,
+            0xFF00FF00, // Green
         );
     }
 }
@@ -67,8 +132,10 @@ fn main() {
     let state = Arc::new(Mutex::new(State {
         status_text: "Initializing Network Stack...".to_string(),
         network_initialized: false,
+        chat_history: Vec::new(),
     }));
 
+    let (tx, mut rx) = mpsc::unbounded_channel::<String>();
     let state_for_bg = state.clone();
 
     // Spawn Background Async Runtime
@@ -79,40 +146,65 @@ fn main() {
             println!(":: VEIN :: Async Core Starting...");
 
             // Initialize Gemini Client
-            let client_result = GeminiClient::new();
-
-            // Simulate startup delay
-            tokio::time::sleep(tokio::time::Duration::from_millis(1500)).await;
-
-            match client_result {
-                Ok(client) => {
-                    println!(":: VEIN :: Connecting to Synapse...");
-                    match client.generate_content("Hello, I am Vein. System check.").await {
-                        Ok(response) => {
-                            let mut s = state_for_bg.lock().unwrap();
-                            s.status_text = response;
-                            s.network_initialized = true;
-                            println!(":: VEIN :: Synapse Connection Established.");
-                        }
-                        Err(e) => {
-                            let mut s = state_for_bg.lock().unwrap();
-                            s.status_text = format!("Connection Failed: {}", e);
-                            s.network_initialized = true;
-                            eprintln!(":: VEIN :: Synapse Connection Failed: {}", e);
-                        }
-                    }
-                }
+            let client_option = match GeminiClient::new() {
+                Ok(client) => Some(client),
                 Err(e) => {
                     let mut s = state_for_bg.lock().unwrap();
                     s.status_text = format!("Config Error: {}", e);
                     s.network_initialized = true;
                     eprintln!(":: VEIN :: Config Error: {}", e);
+                    None
                 }
+            };
+
+            // Initial System Check (only if client exists)
+            if let Some(client) = &client_option {
+                 // Simulate startup delay
+                 tokio::time::sleep(tokio::time::Duration::from_millis(1500)).await;
+
+                 println!(":: VEIN :: Connecting to Synapse...");
+                 match client.generate_content("Hello, I am Vein. System check.").await {
+                     Ok(response) => {
+                         let mut s = state_for_bg.lock().unwrap();
+                         s.chat_history.push(format!("System: {}", response));
+                         s.status_text = "System Online".to_string();
+                         s.network_initialized = true;
+                         println!(":: VEIN :: Synapse Connection Established.");
+                     }
+                     Err(e) => {
+                         let mut s = state_for_bg.lock().unwrap();
+                         s.status_text = format!("Connection Failed: {}", e);
+                         s.network_initialized = true;
+                         eprintln!(":: VEIN :: Synapse Connection Failed: {}", e);
+                     }
+                 }
             }
 
-            // Keep the runtime alive for future tasks
-            loop {
-                tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
+            // Message Loop
+            if let Some(client) = &client_option {
+                while let Some(msg) = rx.recv().await {
+                    match client.generate_content(&msg).await {
+                         Ok(response) => {
+                             let mut s = state_for_bg.lock().unwrap();
+                             s.chat_history.push(response);
+                             if s.chat_history.len() > 15 {
+                                 s.chat_history.remove(0);
+                             }
+                         }
+                         Err(e) => {
+                             let mut s = state_for_bg.lock().unwrap();
+                             s.chat_history.push(format!("Error: {}", e));
+                             if s.chat_history.len() > 15 {
+                                 s.chat_history.remove(0);
+                             }
+                         }
+                    }
+                }
+            } else {
+                 // If no client, we can't do anything but maybe log errors
+                 while let Some(_) = rx.recv().await {
+                      state_for_bg.lock().unwrap().chat_history.push("System Error: AI Config Missing".to_string());
+                 }
             }
         });
     });
@@ -120,7 +212,11 @@ fn main() {
     // Start UI
     println!(":: VEIN :: Initializing Graphical Interface...");
     let app = WaylandApp::new().expect("Failed to initialize PAL");
-    let handler = VeinApp { state };
+    let handler = VeinApp {
+        state,
+        input_buffer: String::new(),
+        tx,
+    };
 
     if let Err(e) = app.run_window(handler) {
         eprintln!(":: VEIN CRASH :: {}", e);
