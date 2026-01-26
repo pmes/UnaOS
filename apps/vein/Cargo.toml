@@ -1,0 +1,8 @@
+[package]
+name = "vein"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+# Pointing to the new location in libs/
+gneiss_pal = { path = "../../libs/gneiss_pal" }

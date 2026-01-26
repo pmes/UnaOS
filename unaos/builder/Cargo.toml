@@ -1,0 +1,7 @@
+[package]
+name = "unaos-builder"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+bootloader = "0.11.14"

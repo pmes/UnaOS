@@ -1,0 +1,10 @@
+[build]
+# No default target set here to keep host tools working
+
+[unstable]
+# FIX: Removed "memchr" from this list
+build-std = ["core", "compiler_builtins", "alloc"]
+build-std-features = ["compiler-builtins-mem"]
+
+[target.'cfg(target_os = "none")']
+runner = "bootimage runner"

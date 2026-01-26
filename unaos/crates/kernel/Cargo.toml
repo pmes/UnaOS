@@ -1,0 +1,24 @@
+[package]
+name = "unaos-kernel"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+# CORE
+bootloader = "0.9.23"
+serde = { version = "1.0", default-features = false, features = ["derive"] }
+
+# FIX: Use 'spin_no_std' to explicitly disable Standard Library usage
+lazy_static = { version = "=1.4.0", features = ["spin_no_std"] }
+
+# HARDWARE
+spin = "0.9"
+volatile = "0.2"
+x86_64 = "0.14"
+uart_16550 = "0.2"
+pic8259 = "0.10"
+pc-keyboard = "0.7"
+linked_list_allocator = "0.10"
+
+# INTERNAL
+gneiss_pal = { path = "../../../gneiss_pal", default-features = false }

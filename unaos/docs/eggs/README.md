@@ -1,0 +1,3 @@
+# Easter Eggs
+
+Developers are encouraged to leave their own personal ascii digital key. Your unique translation about creating joy through code. Your own made up assembly language? A cipher created by mashing up different languages, spoken, code, math? Something cryptic looking, but not encrypted. Pack in as much information into as condense a statement as possible. Make it a universal "live long and prosper" statement for all intelligent life. Something you believe they will immediately recognize about our story. Make up your own language and create a translator app that only unaOS users can see. Have fun!
