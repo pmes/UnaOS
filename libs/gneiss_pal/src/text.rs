@@ -17,6 +17,12 @@ pub fn draw_text(
     let mut caret = point(start_x as f32, start_y as f32);
 
     for c in text.chars() {
+        if c == '\n' {
+            caret.x = start_x as f32;
+            caret.y += scale.y * 1.2;
+            continue;
+        }
+
         if c.is_control() {
             continue;
         }
