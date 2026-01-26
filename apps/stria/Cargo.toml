@@ -1,0 +1,11 @@
+[package]
+name = "stria"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+gneiss_pal = { path = "../gneiss_pal" }
+tokio = { version = "1", features = ["full"] }
+crossbeam = "0.8"
+glam = "0.24"
+num_cpus = "1.0"

@@ -1,0 +1,4 @@
+[toolchain]
+channel = "nightly"
+components = ["rust-src", "rustfmt", "clippy"]
+# We need the source to compile the core library for the bare-metal kernel

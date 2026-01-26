@@ -1,0 +1,117 @@
+#!/bin/bash
+# ARROYO: The Stream that Feeds the River
+# "Ad Astra Per Aspera"
+#
+# Usage: ./arroyo [command]
+# If no command is provided, interactive mode is engaged.
+
+# --- Configuration ---
+COLOR_RESET="\033[0m"
+COLOR_PURPLE="\033[0;35m" # Moonstone Purple
+COLOR_CYAN="\033[0;36m"
+COLOR_GREEN="\033[0;32m"
+COLOR_YELLOW="\033[0;33m"
+
+verify_mission() {
+    echo -e "\n${COLOR_YELLOW}--- MISSION CHECKLIST [J9:VS-23] ---${COLOR_RESET}"
+    echo -e "1. [ ] Prompt: ${COLOR_CYAN}root@unaOS / # ${COLOR_RESET} (Identity check)"
+    echo -e "2. [ ] Scroll: Fill screen with text. (Panic/Bounds check)"
+    echo -e "3. [ ] Command: 'vug' -> Full screen gradient. (Graphics check)"
+    echo -e "4. [ ] Exit: 'shutdown' -> CPU Halt. (Control check)"
+    echo -e "5. [ ] PCI SCAN: Check terminal for '${COLOR_GREEN}TARGET LOCKED: USB xHCI${COLOR_RESET}'"
+    echo -e "${COLOR_YELLOW}-------------------------------------${COLOR_RESET}"
+    read -p "Press [Enter] to launch..."
+}
+
+# --- The Interface ---
+show_menu() {
+    echo -e "${COLOR_PURPLE}=== ARROYO CONSOLE ===${COLOR_RESET}"
+    echo -e "${COLOR_CYAN}Select a directive:${COLOR_RESET}"
+    echo "1) Check (Quick Syntax)"
+    echo "2) Build (Debug)"
+    echo "3) Build (Release)"
+    echo "4) Test (All Crates)"
+    echo "5) Clean (Purge Artifacts)"
+    echo "6) PAL (Moonstone Verification)"
+    echo "7) SIM (Launch unaOS Kernel)"
+    echo "q) Quit"
+    echo -e "${COLOR_PURPLE}======================${COLOR_RESET}"
+    read -p "Command: " choice
+    case $choice in
+        1) run_task "check";;
+        2) run_task "build";;
+        3) run_task "release";;
+        4) run_task "test";;
+        5) run_task "clean";;
+        6) run_task "pal";;
+        7) run_task "kernel";;
+        q) exit 0;;
+        *) echo "Invalid option.";;
+    esac
+}
+
+# --- The Engine ---
+run_task() {
+    case $1 in
+        "check")
+            echo -e "${COLOR_YELLOW}Running Syntax Check...${COLOR_RESET}"
+            cargo check --workspace
+            ;;
+        "build")
+            echo -e "${COLOR_YELLOW}Building Workspace (Debug)...${COLOR_RESET}"
+            cargo build --workspace
+            ;;
+        "release")
+            echo -e "${COLOR_YELLOW}Building Workspace (Release)...${COLOR_RESET}"
+            cargo build --workspace --release
+            ;;
+        "test")
+            echo -e "${COLOR_YELLOW}Running Unit Tests...${COLOR_RESET}"
+            cargo test --workspace
+            ;;
+        "clean")
+            echo -e "${COLOR_YELLOW}Purging Target Directory...${COLOR_RESET}"
+            cargo clean
+            ;;
+        "pal")
+            echo -e "${COLOR_PURPLE}Targeting Gneiss PAL (Moonstone)...${COLOR_RESET}"
+            # Targeted run for the graphical check
+            cargo run -p gneiss_pal --example moonstone_check --features std
+            ;;
+        "kernel")
+            verify_mission
+            echo -e "${COLOR_GREEN}Booting unaOS (Jules 1)...${COLOR_RESET}"
+            # Building Kernel with correct flags
+            cd crates/kernel
+            cargo +nightly build \
+              --release \
+              --target x86_64-unknown-none \
+              -Z build-std=core,compiler_builtins,alloc \
+              -Z build-std-features=compiler-builtins-mem
+            cd ../..
+
+            # Running Builder
+            echo -e "${COLOR_CYAN}Launching Builder...${COLOR_RESET}"
+            cd builder
+            cargo +nightly run --release
+            cd ..
+            ;;
+        *)
+            # Passthrough for direct cargo commands
+            echo -e "${COLOR_CYAN}Executing custom command: cargo $@${COLOR_RESET}"
+            cargo "$@"
+            ;;
+    esac
+}
+
+# --- Entry Point ---
+if [ -z "$1" ]; then
+    # No arguments? Be the Guide (Novice Mode)
+    while true; do
+        show_menu
+        echo ""
+    done
+else
+    # Arguments present? Be the Tool (Expert Mode)
+    run_task "$@"
+fi

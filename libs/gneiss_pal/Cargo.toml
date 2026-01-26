@@ -1,0 +1,11 @@
+[package]
+name = "gneiss_pal"
+version = "0.1.0"
+edition = "2021"
+
+[features]
+default = ["std"]
+std = ["minifb"]
+
+[dependencies]
+minifb = { version = "0.23", optional = true }

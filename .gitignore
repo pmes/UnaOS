@@ -1,0 +1,22 @@
+# Rust Build Artifacts
+target/
+**/*.rs.bk
+
+# Large Binary Assets
+*.img
+*.iso
+*.bin
+
+# OS Clutter
+.DS_Store
+Thumbs.db
+
+# Editor Clutter
+.idea/
+.vscode/
+*.swp
+*~
+
+# Secrets (Just in case)
+secret.txt
+evidence.txt
