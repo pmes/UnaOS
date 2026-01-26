@@ -3,10 +3,18 @@
 pub const MOONSTONE_PURPLE: u32 = 0x2C003E;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeyCode {
+    Enter,
+    Backspace,
+    Other,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Event {
     Quit,
     Timer,
-    Key(u8),
+    KeyDown(KeyCode),
+    Char(char),
     Mouse { x: i32, y: i32 },
     None,
     Unknown,
@@ -46,7 +54,7 @@ pub trait GneissPal {
 
 // New Handler Trait (Inversion of Control)
 pub trait AppHandler {
-    fn update(&mut self);
+    fn handle_event(&mut self, event: Event);
     fn draw(&mut self, buffer: &mut [u32], width: u32, height: u32);
 }
 
@@ -58,7 +66,7 @@ pub mod backend;
 pub mod text;
 
 #[cfg(feature = "std")]
-pub use crate::backend::{KeyCode, WaylandApp, WindowEvent};
+pub use crate::backend::{WaylandApp, WindowEvent};
 
 #[cfg(feature = "std")]
 pub use raw_window_handle::{HasDisplayHandle, HasWindowHandle};

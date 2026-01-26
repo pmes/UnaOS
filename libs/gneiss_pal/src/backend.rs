@@ -1,15 +1,15 @@
 use softbuffer::{Context, Surface};
 use std::num::NonZeroU32;
 use std::rc::Rc;
-use winit::event::{Event, WindowEvent as WinitWindowEvent};
+use winit::event::{ElementState, Event, WindowEvent as WinitWindowEvent};
 use winit::event_loop::{ControlFlow, EventLoop};
+use winit::keyboard::{Key, NamedKey};
 use winit::window::WindowBuilder;
-use crate::AppHandler;
+use crate::{AppHandler, Event as PalEvent, KeyCode as PalKeyCode};
 
 // --- EXPORTS FOR LIB.RS ---
 // We alias winit types so lib.rs doesn't break
 pub use winit::event::WindowEvent;
-pub use winit::keyboard::KeyCode;
 
 pub struct WaylandApp {
     event_loop: Option<EventLoop<()>>,
@@ -67,7 +67,7 @@ impl WaylandApp {
                         }
                     }
                     Event::AboutToWait => {
-                        handler.update();
+                        handler.handle_event(PalEvent::Timer);
                         window.request_redraw();
                     }
                     Event::WindowEvent {
@@ -75,6 +75,30 @@ impl WaylandApp {
                         ..
                     } => {
                         elwt.exit();
+                    }
+                    Event::WindowEvent {
+                        event: WinitWindowEvent::KeyboardInput { event: key_event, .. },
+                        ..
+                    } => {
+                        if key_event.state == ElementState::Pressed {
+                            match key_event.logical_key {
+                                Key::Named(NamedKey::Enter) => {
+                                    handler.handle_event(PalEvent::KeyDown(PalKeyCode::Enter));
+                                }
+                                Key::Named(NamedKey::Backspace) => {
+                                    handler.handle_event(PalEvent::KeyDown(PalKeyCode::Backspace));
+                                }
+                                _ => {}
+                            }
+
+                            if let Some(text) = key_event.text {
+                                for c in text.chars() {
+                                    if !c.is_control() {
+                                        handler.handle_event(PalEvent::Char(c));
+                                    }
+                                }
+                            }
+                        }
                     }
                     _ => {}
                 }
