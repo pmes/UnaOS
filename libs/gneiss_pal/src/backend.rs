@@ -3,10 +3,16 @@ use std::cell::RefCell;
 use std::rc::Rc;
 use raw_window_handle::{
     HasDisplayHandle, HasWindowHandle, DisplayHandle, WindowHandle,
-    RawDisplayHandle, RawWindowHandle, XlibDisplayHandle, XlibWindowHandle,
-    AppKitDisplayHandle, AppKitWindowHandle, Win32WindowHandle, WaylandDisplayHandle, WaylandWindowHandle
 };
-use std::ptr::NonNull;
+
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+use raw_window_handle::{RawDisplayHandle, RawWindowHandle};
+
+#[cfg(target_os = "macos")]
+use raw_window_handle::{AppKitDisplayHandle, AppKitWindowHandle};
+
+#[cfg(target_os = "windows")]
+use raw_window_handle::Win32WindowHandle;
 
 #[cfg(target_os = "linux")]
 mod linux_impl {
@@ -14,7 +20,6 @@ mod linux_impl {
     use gtk4::prelude::*;
     use libadwaita as adw;
     use adw::prelude::*;
-    use gtk4::gdk;
 
     pub struct Window {
         window: adw::ApplicationWindow,
