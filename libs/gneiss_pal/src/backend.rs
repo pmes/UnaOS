@@ -93,6 +93,7 @@ mod linux_impl {
         let buffer = Rc::new(RefCell::new(vec![0u32; 800 * 600]));
         let size = Rc::new(RefCell::new((800u32, 600u32)));
 
+        let tick_handler = handler.clone();
         window.add_tick_callback(move |win, _clock| {
             let width = win.width();
             let height = win.height();
@@ -111,11 +112,11 @@ mod linux_impl {
                 buf.resize((w * h) as usize, 0);
             }
 
-            let mut hdl = handler.borrow_mut();
+            let mut hdl = tick_handler.borrow_mut();
             hdl.handle_event(Event::Timer);
             hdl.draw(&mut buf, w, h);
 
-            let (prefix, data, suffix) = unsafe { buf.align_to::<u8>() };
+            let (_prefix, data, _suffix) = unsafe { buf.align_to::<u8>() };
             let byte_data = data.to_vec();
             let bytes = glib::Bytes::from(&byte_data);
 
@@ -133,9 +134,9 @@ mod linux_impl {
         });
 
         let key_controller = gtk4::EventControllerKey::new();
-        let h_clone = handler.clone();
+        let key_handler = handler.clone();
         key_controller.connect_key_pressed(move |_, key, _keycode, _modifiers| {
-            let mut h = h_clone.borrow_mut();
+            let mut h = key_handler.borrow_mut();
             match key {
                  gtk4::gdk::Key::Return => h.handle_event(Event::KeyDown(KeyCode::Enter)),
                  gtk4::gdk::Key::BackSpace => h.handle_event(Event::KeyDown(KeyCode::Backspace)),
