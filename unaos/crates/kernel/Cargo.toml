@@ -21,4 +21,4 @@ pc-keyboard = "0.7"
 linked_list_allocator = "0.10"
 
 # INTERNAL
-gneiss_pal = { path = "../../../gneiss_pal", default-features = false }
+gneiss_pal = { path = "../../../libs/gneiss_pal", default-features = false }
