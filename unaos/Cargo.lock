@@ -49,6 +49,12 @@ dependencies = [
 
 [[package]]
 name = "bootloader"
+version = "0.9.33"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7bdfddac270bbdd45903296bc1caf29a7fdce6b326aaf0bbab7f04c5f98b7447"
+
+[[package]]
+name = "bootloader"
 version = "0.11.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7685d9acfe7a1b725bb3b2da5aa1b7b262cc80c2cf333ec00678f77c54791a3a"
@@ -73,12 +79,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "bootloader_api"
-version = "0.11.14"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "039c770d47edb905d1f08ec8af202831b5f1415e70f1b43b54eacf6d0899508c"
-
-[[package]]
 name = "bumpalo"
 version = "3.19.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -95,12 +95,6 @@ name = "cfg-if"
 version = "1.0.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9330f8b2ff13f34540b44e946ef35111825727b38d33286ef986142615121801"
-
-[[package]]
-name = "const_fn"
-version = "0.4.11"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2f8a2ca5ac02d09563609681103aada9e1777d54fc57a5acd7a41404f9c93b6e"
 
 [[package]]
 name = "crc"
@@ -145,12 +139,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "font8x8"
-version = "0.3.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "875488b8711a968268c7cf5d139578713097ca4635a76044e8fe8eedf831d07e"
-
-[[package]]
 name = "funty"
 version = "2.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -171,9 +159,6 @@ dependencies = [
 [[package]]
 name = "gneiss_pal"
 version = "0.1.0"
-dependencies = [
- "bitflags 2.10.0",
-]
 
 [[package]]
 name = "gpt"
@@ -205,11 +190,11 @@ dependencies = [
 
 [[package]]
 name = "lazy_static"
-version = "1.5.0"
+version = "1.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bbd2bcb4c963f2ddae06a2efc7e9f3591312473c50c6685e1f298068316e66fe"
+checksum = "e2abad23fbc42b3700f2f279844dc832adb2b2eb069b2df918f455c4e18cc646"
 dependencies = [
- "spin",
+ "spin 0.5.2",
 ]
 
 [[package]]
@@ -287,11 +272,11 @@ checksum = "ed089a1fbffe3337a1a345501c981f1eb1e47e69de5a40e852433e12953c3174"
 
 [[package]]
 name = "pic8259"
-version = "0.11.0"
+version = "0.10.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "62d9a86c292b165f757e47e7fd66855def189b2564609bc4203727b27c33db22"
+checksum = "cb844b5b01db1e0b17938685738f113bfc903846f18932b378bc0eabfa40e194"
 dependencies = [
- "x86_64 0.15.4",
+ "x86_64",
 ]
 
 [[package]]
@@ -423,6 +408,12 @@ dependencies = [
 
 [[package]]
 name = "spin"
+version = "0.5.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6e63cff320ae2c57904679ba7cb63280a3dc4613885beafb148ee7bf9aa9042d"
+
+[[package]]
+name = "spin"
 version = "0.9.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6980e8d7511241f8acf4aebddbb1ff938df5eebe98691418c4468d0b72a96a67"
@@ -508,7 +499,7 @@ checksum = "614ff2a87880d4bd4374722268598a970bbad05ced8bf630439417347254ab2e"
 dependencies = [
  "bitflags 1.3.2",
  "rustversion",
- "x86_64 0.14.13",
+ "x86_64",
 ]
 
 [[package]]
@@ -577,7 +568,7 @@ checksum = "0c8352f8c05e47892e7eaf13b34abd76a7f4aeaf817b716e88789381927f199c"
 name = "unaos-builder"
 version = "0.1.0"
 dependencies = [
- "bootloader",
+ "bootloader 0.11.14",
 ]
 
 [[package]]
@@ -588,17 +579,17 @@ version = "0.1.0"
 name = "unaos-kernel"
 version = "0.1.0"
 dependencies = [
- "bootloader_api",
- "font8x8",
+ "bootloader 0.9.33",
  "gneiss_pal",
  "lazy_static",
  "linked_list_allocator",
  "pc-keyboard",
  "pic8259",
- "spin",
+ "serde",
+ "spin 0.9.8",
  "uart_16550",
  "volatile 0.2.7",
- "x86_64 0.14.13",
+ "x86_64",
 ]
 
 [[package]]
@@ -734,19 +725,6 @@ checksum = "c101112411baafbb4bf8d33e4c4a80ab5b02d74d2612331c61e8192fc9710491"
 dependencies = [
  "bit_field",
  "bitflags 2.10.0",
- "rustversion",
- "volatile 0.4.6",
-]
-
-[[package]]
-name = "x86_64"
-version = "0.15.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f7841fa0098ceb15c567d93d3fae292c49e10a7662b4936d5f6a9728594555ba"
-dependencies = [
- "bit_field",
- "bitflags 2.10.0",
- "const_fn",
  "rustversion",
  "volatile 0.4.6",
 ]

@@ -1,7 +1,10 @@
 #![cfg_attr(not(feature = "std"), no_std)]
 
+pub const MOONSTONE_PURPLE: u32 = 0x2C003E;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Event {
+    Quit,
     Timer,
     Key(u8),
     Mouse { x: i32, y: i32 },
@@ -42,11 +45,11 @@ pub trait GneissPal {
 }
 
 // --- USERSPACE EXPORTS ---
-#[cfg(feature = "wayland")]
+#[cfg(feature = "std")]
 pub mod backend;
 
-#[cfg(feature = "wayland")]
+#[cfg(feature = "std")]
 pub use crate::backend::{KeyCode, WaylandApp, WindowEvent};
 
-#[cfg(feature = "wayland")]
+#[cfg(feature = "std")]
 pub use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
