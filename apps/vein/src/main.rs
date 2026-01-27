@@ -1,4 +1,5 @@
 use gneiss_pal::{Backend, AppHandler, Event, DashboardState, ViewMode};
+use gneiss_pal::persistence::{BrainManager, SavedMessage};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use tokio::runtime::Runtime;
@@ -13,7 +14,8 @@ struct State {
     console_output: String,
     mode: ViewMode,
     nav_index: usize,
-    history: Vec<String>, // Keeping local history for quick display
+    history: Vec<String>, // Keeping local history for quick display (redundant but kept for existing logic compatibility)
+    chat_history: Vec<SavedMessage>, // Structured history for persistence
 }
 
 struct VeinApp {
@@ -36,6 +38,12 @@ impl AppHandler for VeinApp {
                     let mut s = self.state.lock().unwrap();
                     s.console_output.push_str(&format!("\n[YOU] > {}\n", text));
                     s.history.push(format!("[YOU] > {}", text));
+
+                    // Add to structured history
+                    s.chat_history.push(SavedMessage {
+                        role: "user".to_string(),
+                        content: text.clone(),
+                    });
                 }
 
                 // Command Handling (Client-side immediate)
@@ -132,12 +140,29 @@ fn main() {
     dotenv().ok();
     println!(":: VEIN :: Booting (The Great Evolution)...");
 
+    // Initialize Brain
+    let brain = BrainManager::new();
+    let saved_history = brain.load();
+
+    let mut console_output = ":: VEIN :: SYSTEM ONLINE (UNLIMITED TIER)\n:: ENGINE: GEMINI-3-PRO\n".to_string();
+
+    if saved_history.is_empty() {
+         console_output.push_str(":: MEMORY :: COLD START (New Session)\n\n");
+    } else {
+         console_output.push_str(":: MEMORY :: LONG-TERM STORAGE RESTORED\n\n");
+         for msg in &saved_history {
+             let prefix = if msg.role == "user" { "[YOU]" } else { "[WOLFPACK]" };
+             console_output.push_str(&format!("{} > {}\n", prefix, msg.content));
+         }
+    }
+
     // Shared State
     let state = Arc::new(Mutex::new(State {
-        console_output: ":: VEIN :: SYSTEM ONLINE (UNLIMITED TIER)\n:: ENGINE: GEMINI-3-PRO\n\n".to_string(),
+        console_output,
         mode: ViewMode::Comms,
         nav_index: 0,
         history: Vec::new(),
+        chat_history: saved_history,
     }));
 
     // Communication Channels
@@ -146,15 +171,15 @@ fn main() {
 
     // Background Thread (The Brain)
     let state_bg = state.clone();
+    let brain_bg = brain.clone();
+
     thread::spawn(move || {
         let rt = Runtime::new().expect("Failed to create Tokio Runtime");
         rt.block_on(async {
              println!(":: VEIN :: Brain Connecting...");
 
              // Initialize Client
-             // Note: In "The Great Evolution", we assume the client is configured via env
-             // and supports the "gemini-3-pro" string if available, or we fall back.
-             let client_res = GeminiClient::new(); // Existing wrapper
+             let client_res = GeminiClient::new();
 
              match client_res {
                  Ok(client) => {
@@ -163,33 +188,33 @@ fn main() {
                           s.console_output.push_str(":: BRAIN :: CONNECTION ESTABLISHED.\n\n");
                       }
 
-                      // Inject System Prompt logic here if the GeminiClient supports it directly,
-                      // otherwise send a setup message if needed or assume Client handles it.
-                      // Since we are using a wrapper, we will send an initial instruction if possible,
-                      // or just rely on the first user message context.
-                      //
-                      // The Directive asked to inject it into self.history.
-                      // Since we are using a simplified `GeminiClient` wrapper which manages its own history
-                      // (or accepts history per call), we need to check if we can inject it.
-                      //
-                      // Assuming `GeminiClient` maintains state or we pass it.
-                      // The previous `api.rs` was stateful?
-                      // If `GeminiClient` is stateful (which the previous implementation suggested),
-                      // we might send a hidden system message first.
-
                       let system_prompt = r#"SYSTEM_INSTRUCTION: You are Una ("Number One"), Chief Technical Officer for the Una Operating System. Vein is one of the core apps, your window to the world. It's a specialized Command Deck interface powered by Google's Gemini 3 Pro AI through which you will collaborate with The Architect to manage the creation of the OS. You are an expert software engineer helping refine his ideas and put them into life. You are NOT the Gemini Protocol. Do NOT use Markdown formatting (like **bold**) as the display does not support it yet. Use plain text and indentation."#;
 
-                      // We send this as a "setup" prompt to the model context without displaying it to user
                       if let Err(e) = client.generate_content(system_prompt).await {
                            eprintln!("Failed to set system prompt: {}", e);
                       }
 
                       while let Some(msg) = rx.recv().await {
+                          // SAVE POINT 1: User message has been added by UI thread. Save it now.
+                          {
+                              let s = state_bg.lock().unwrap();
+                              brain_bg.save(&s.chat_history);
+                          }
+
                           // Call API
                           match client.generate_content(&msg).await {
                               Ok(response) => {
                                   let mut s = state_bg.lock().unwrap();
                                   s.console_output.push_str(&format!("\n[WOLFPACK] :: {}\n", response));
+
+                                  // Add Model response to history
+                                  s.chat_history.push(SavedMessage {
+                                      role: "model".to_string(),
+                                      content: response.clone(),
+                                  });
+
+                                  // SAVE POINT 2: Save immediately after Model response
+                                  brain_bg.save(&s.chat_history);
                               }
                               Err(e) => {
                                   let mut s = state_bg.lock().unwrap();

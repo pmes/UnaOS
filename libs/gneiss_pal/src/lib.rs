@@ -89,6 +89,9 @@ pub mod backend;
 pub mod text;
 
 #[cfg(feature = "std")]
+pub mod persistence;
+
+#[cfg(feature = "std")]
 pub use backend::Backend; // Renamed from EventLoop in "The Great Evolution"
 
 // Compatibility alias if needed, though vein uses EventLoop now.
