@@ -36,8 +36,8 @@ impl AppHandler for VeinApp {
                 // UI Thread Update (Instant Feedback)
                 {
                     let mut s = self.state.lock().unwrap();
-                    s.console_output.push_str(&format!("\n[YOU] > {}\n", text));
-                    s.history.push(format!("[YOU] > {}", text));
+                    s.console_output.push_str(&format!("\n[ARCHITECT] > {}\n", text));
+                    s.history.push(format!("[ARCHITECT] > {}", text));
 
                     // Add to structured history
                     s.chat_history.push(SavedMessage {
@@ -153,7 +153,7 @@ fn main() {
          for msg in &saved_history {
              // Only display relevant messages (skip system instructions if they somehow got saved)
              if !msg.content.starts_with("SYSTEM_INSTRUCTION") {
-                 let prefix = if msg.role == "user" { "[YOU]" } else { "[WOLFPACK]" };
+                 let prefix = if msg.role == "user" { "[ARCHITECT]" } else { "[UNA]" };
                  console_output.push_str(&format!("{} > {}\n", prefix, msg.content));
              }
          }
@@ -233,7 +233,7 @@ fn main() {
                           match client.generate_content(&context).await {
                               Ok(response) => {
                                   let mut s = state_bg.lock().unwrap();
-                                  s.console_output.push_str(&format!("\n[WOLFPACK] :: {}\n", response));
+                                  s.console_output.push_str(&format!("\n[UNA] :: {}\n", response));
 
                                   // Add Model response to history
                                   s.chat_history.push(SavedMessage {
