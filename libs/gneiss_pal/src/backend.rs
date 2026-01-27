@@ -1,11 +1,13 @@
 use crate::AppHandler;
 
-#[cfg(any(target_os = "macos", target_os = "windows"))]
+// Shared imports
+#[allow(unused_imports)]
 use crate::{Event, KeyCode};
-#[cfg(any(target_os = "macos", target_os = "windows"))]
+#[allow(unused_imports)]
 use std::cell::RefCell;
-#[cfg(any(target_os = "macos", target_os = "windows"))]
+#[allow(unused_imports)]
 use std::rc::Rc;
+
 #[cfg(any(target_os = "macos", target_os = "windows"))]
 use raw_window_handle::{
     HasDisplayHandle, HasWindowHandle, DisplayHandle, WindowHandle,
@@ -23,9 +25,10 @@ use raw_window_handle::Win32WindowHandle;
 #[cfg(target_os = "linux")]
 mod linux_impl {
     use super::*;
-    use gtk4::prelude::*;
+    use gtk4::{prelude::*, EventControllerKey};
     use libadwaita as adw;
     use adw::prelude::*;
+    use glib;
 
     pub struct EventLoop<H: AppHandler + 'static> {
         app: adw::Application,
@@ -43,8 +46,11 @@ mod linux_impl {
             }
         }
 
-        pub fn run(self, _handler: H) -> Result<(), String> {
-            self.app.connect_activate(|app| {
+        pub fn run(self, handler: H) -> Result<(), String> {
+            // Wrap handler for shared access in closures
+            let handler_rc = Rc::new(RefCell::new(handler));
+
+            self.app.connect_activate(move |app| {
                 let window = adw::ApplicationWindow::builder()
                     .application(app)
                     .title("Vein")
@@ -58,11 +64,72 @@ mod linux_impl {
 
                 let text_view = gtk4::TextView::builder()
                     .editable(false)
+                    .monospace(true)
+                    .wrap_mode(gtk4::WrapMode::WordChar)
                     .build();
-                text_view.buffer().set_text("System Check: Native GTK Widgets Active.");
+
+                // Set Initial Text
+                text_view.buffer().set_text(&handler_rc.borrow().view());
 
                 toolbar_view.set_content(Some(&text_view));
                 window.set_content(Some(&toolbar_view));
+
+                // Input Handling
+                let key_controller = EventControllerKey::new();
+                let h_input = handler_rc.clone();
+                key_controller.connect_key_pressed(move |_controller, keyval, _keycode, _state| {
+                    let mut h = h_input.borrow_mut();
+                    let mut handled = false;
+
+                    match keyval {
+                        gtk4::gdk::Key::Return | gtk4::gdk::Key::KP_Enter | gtk4::gdk::Key::ISO_Enter => {
+                            h.handle_event(Event::KeyDown(KeyCode::Enter));
+                            handled = true;
+                        }
+                        gtk4::gdk::Key::BackSpace => {
+                            h.handle_event(Event::KeyDown(KeyCode::Backspace));
+                            handled = true;
+                        }
+                        _ => {
+                            if let Some(c) = keyval.to_unicode() {
+                                if !c.is_control() {
+                                    h.handle_event(Event::Char(c));
+                                    handled = true;
+                                }
+                            }
+                        }
+                    }
+
+                    if handled {
+                        glib::Propagation::Stop
+                    } else {
+                        glib::Propagation::Proceed
+                    }
+                });
+                window.add_controller(key_controller);
+
+                // Tick Loop (Visual Updates)
+                let h_tick = handler_rc.clone();
+                let buffer = text_view.buffer();
+                glib::timeout_add_local(std::time::Duration::from_millis(16), move || {
+                    let mut h = h_tick.borrow_mut();
+
+                    // Timer Event (e.g. for cursor blink)
+                    h.handle_event(Event::Timer);
+
+                    // Update View if changed
+                    let new_text = h.view();
+                    let start = buffer.start_iter();
+                    let end = buffer.end_iter();
+                    let current_text = buffer.text(&start, &end, false);
+
+                    if current_text != new_text {
+                        buffer.set_text(&new_text);
+                    }
+
+                    glib::ControlFlow::Continue
+                });
+
                 window.present();
             });
 
@@ -82,8 +149,8 @@ mod mac_impl {
     use objc2::{define_class, msg_send, msg_send_id, ClassType, MainThreadMarker, sel};
     use objc2_app_kit::{
         NSApplication, NSApplicationDelegate, NSWindow, NSWindowStyleMask, NSBackingStoreType,
-        NSApplicationActivationPolicy, NSColor, NSView, NSImage, NSBitmapImageRep,
-        NSGraphicsContext, NSDeviceRGBColorSpace, NSBitmapFormat
+        NSApplicationActivationPolicy, NSColor, NSView,
+        NSGraphicsContext, NSDeviceRGBColorSpace
     };
     use objc2_foundation::{NSNotification, NSString, NSPoint, NSSize, NSRect, NSObject, NSObjectProtocol, NSTimer, NSDate};
 
@@ -136,7 +203,6 @@ mod mac_impl {
     }
 
     static mut GLOBAL_HANDLER: Option<Rc<RefCell<dyn AppHandler>>> = None;
-    static mut GLOBAL_BUFFER: Option<Vec<u32>> = None;
     static mut GLOBAL_WINDOW: Option<Retained<NSWindow>> = None;
 
     define_class!(
@@ -152,51 +218,7 @@ mod mac_impl {
 
              #[unsafe(method(drawRect:))]
              fn draw_rect(&self, dirty_rect: NSRect) {
-                 unsafe {
-                     if let Some(buffer) = &mut GLOBAL_BUFFER {
-                         let bounds = self.bounds();
-                         let width = bounds.size.width as i32;
-                         let height = bounds.size.height as i32;
-
-                         if width > 0 && height > 0 && buffer.len() >= (width * height) as usize {
-
-                             let mut planes_ptr: *mut u8 = buffer.as_mut_ptr() as *mut u8;
-                             let planes: *mut *mut u8 = &mut planes_ptr;
-
-                             // Alloc NSBitmapImageRep
-                             let rep = NSBitmapImageRep::alloc(MainThreadMarker::new().unwrap_unchecked());
-
-                             // initWithBitmapDataPlanes
-                             let rep = rep.initWithBitmapDataPlanes_pixelsWide_pixelsHigh_bitsPerSample_samplesPerPixel_hasAlpha_isPlanar_colorSpaceName_bitmapFormat_bytesPerRow_bitsPerPixel(
-                                 Some(planes),
-                                 width as isize,
-                                 height as isize,
-                                 8,
-                                 4,
-                                 true,
-                                 false,
-                                 NSDeviceRGBColorSpace, // "NSDeviceRGBColorSpace"
-                                 NSBitmapFormat::NSBitmapFormatAlphaFirst, // ARGB usually means Alpha First if little endian?
-                                 // Gneiss uses 0xAARRGGBB.
-                                 // Win32 GDI expects 0x00RRGGBB.
-                                 // Let's assume standard RGB.
-                                 (width * 4) as isize,
-                                 32
-                             );
-
-                             if let Some(rep) = rep {
-                                 // Create Image
-                                 let image = NSImage::alloc(MainThreadMarker::new().unwrap_unchecked());
-                                 let size = NSSize::new(bounds.size.width, bounds.size.height);
-                                 let image = image.initWithSize(size);
-                                 image.addRepresentation(&rep);
-
-                                 // Draw
-                                 image.drawInRect(bounds);
-                             }
-                         }
-                     }
-                 }
+                 // Stub: No drawing
              }
         }
     );
@@ -220,44 +242,7 @@ mod mac_impl {
                     GLOBAL_WINDOW = Some(win_struct.window.clone());
                 }
 
-                unsafe {
-                    let _: Retained<NSTimer> = NSTimer::scheduledTimerWithTimeInterval_target_selector_userInfo_repeats(
-                        0.016,
-                        self,
-                        sel!(onTimer:),
-                        None,
-                        true
-                    );
-                }
-
                 app.activateIgnoringOtherApps(true);
-            }
-        }
-
-        impl AppDelegate {
-            #[unsafe(method(onTimer:))]
-            fn on_timer(&self, _timer: &NSTimer) {
-                unsafe {
-                    if let (Some(handler), Some(buffer), Some(window)) = (&GLOBAL_HANDLER, &mut GLOBAL_BUFFER, &GLOBAL_WINDOW) {
-                        let mut h = handler.borrow_mut();
-                        h.handle_event(Event::Timer);
-
-                        let view = window.contentView().unwrap();
-                        let frame = view.frame();
-                        let w = frame.size.width as u32;
-                        let h = frame.size.height as u32;
-
-                        if w > 0 && h > 0 {
-                             if buffer.len() != (w * h) as usize {
-                                 buffer.resize((w * h) as usize, 0);
-                             }
-                             h.draw(buffer, w, h);
-
-                             // Trigger drawRect
-                             view.setNeedsDisplay(true);
-                        }
-                    }
-                }
             }
         }
     );
@@ -273,7 +258,6 @@ mod mac_impl {
 
             unsafe {
                 GLOBAL_HANDLER = Some(Rc::new(RefCell::new(handler)));
-                GLOBAL_BUFFER = Some(vec![0u32; 800 * 600]);
             }
 
             let delegate = AppDelegate::alloc(mtm).init();
@@ -328,8 +312,6 @@ mod win_impl {
     }
 
     static mut GLOBAL_HANDLER: Option<Rc<RefCell<dyn AppHandler>>> = None;
-    static mut GLOBAL_BUFFER: Option<Vec<u32>> = None;
-    static mut GLOBAL_WINDOW_STRUCT: Option<Window> = None;
 
     pub struct EventLoop<H: AppHandler + 'static> {
         handler: Option<H>,
@@ -356,7 +338,6 @@ mod win_impl {
 
                 RegisterClassW(&wc);
                 GLOBAL_HANDLER = Some(Rc::new(RefCell::new(handler)));
-                GLOBAL_BUFFER = Some(vec![0u32; 800 * 600]);
 
                 let hwnd = CreateWindowExW(
                     WINDOW_EX_STYLE::default(),
@@ -372,10 +353,6 @@ mod win_impl {
                     instance,
                     None,
                 );
-
-                GLOBAL_WINDOW_STRUCT = Some(Window::new(hwnd));
-
-                SetTimer(hwnd, 1, 16, None);
 
                 let mut message = MSG::default();
                 while GetMessageW(&mut message, None, 0, 0).into() {
@@ -395,72 +372,10 @@ mod win_impl {
                     LRESULT(0)
                 }
                 WM_PAINT => {
+                    // Stub: No drawing
                     let mut ps = PAINTSTRUCT::default();
-                    let hdc = BeginPaint(window, &mut ps);
-                    let mut rect = RECT::default();
-                    GetClientRect(window, &mut rect);
-                    let width = (rect.right - rect.left) as u32;
-                    let height = (rect.bottom - rect.top) as u32;
-
-                    if width > 0 && height > 0 {
-                        if let (Some(handler_rc), Some(buffer)) = (&GLOBAL_HANDLER, &mut GLOBAL_BUFFER) {
-                             if buffer.len() != (width * height) as usize {
-                                 buffer.resize((width * height) as usize, 0);
-                             }
-                             handler_rc.borrow_mut().draw(buffer, width, height);
-
-                             let bmi = BITMAPINFO {
-                                bmiHeader: BITMAPINFOHEADER {
-                                    biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
-                                    biWidth: width as i32,
-                                    biHeight: -(height as i32),
-                                    biPlanes: 1,
-                                    biBitCount: 32,
-                                    biCompression: BI_RGB,
-                                    ..Default::default()
-                                },
-                                ..Default::default()
-                            };
-
-                            StretchDIBits(
-                                hdc, 0, 0, width as i32, height as i32, 0, 0, width as i32, height as i32,
-                                Some(buffer.as_ptr() as *const c_void), &bmi, DIB_RGB_COLORS, SRCCOPY
-                            );
-                        }
-                    }
+                    BeginPaint(window, &mut ps);
                     EndPaint(window, &ps);
-                    LRESULT(0)
-                }
-                WM_TIMER => {
-                     if let Some(handler_rc) = &GLOBAL_HANDLER {
-                         handler_rc.borrow_mut().handle_event(Event::Timer);
-                         InvalidateRect(window, None, FALSE);
-                     }
-                     LRESULT(0)
-                }
-                WM_KEYDOWN => {
-                     if let Some(handler_rc) = &GLOBAL_HANDLER {
-                         let key = match wparam.0 as u8 {
-                             0x0D => Some(KeyCode::Enter),
-                             0x08 => Some(KeyCode::Backspace),
-                             _ => None
-                         };
-                         if let Some(k) = key {
-                             handler_rc.borrow_mut().handle_event(Event::KeyDown(k));
-                             InvalidateRect(window, None, FALSE);
-                         }
-                     }
-                     LRESULT(0)
-                }
-                WM_CHAR => {
-                    if let Some(handler_rc) = &GLOBAL_HANDLER {
-                        if let Some(c) = std::char::from_u32(wparam.0 as u32) {
-                            if !c.is_control() {
-                                 handler_rc.borrow_mut().handle_event(Event::Char(c));
-                                 InvalidateRect(window, None, FALSE);
-                            }
-                        }
-                    }
                     LRESULT(0)
                 }
                 _ => DefWindowProcW(window, message, wparam, lparam),
