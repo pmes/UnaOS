@@ -265,7 +265,13 @@ mod linux_impl {
                          for item_text in &state.nav_items {
                              let row = gtk4::ListBoxRow::new();
                              let label = gtk4::Label::new(Some(item_text));
-                             label.set_margin_all(12);
+
+                             // CORRECTED SYNTAX: Explicitly set margins
+                             label.set_margin_top(12);
+                             label.set_margin_bottom(12);
+                             label.set_margin_start(12);
+                             label.set_margin_end(12);
+
                              label.set_xalign(0.0);
                              row.set_child(Some(&label));
                              nav_list.append(&row);
