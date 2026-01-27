@@ -1,6 +1,12 @@
-use crate::{AppHandler, Event, KeyCode};
+use crate::AppHandler;
+
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+use crate::{Event, KeyCode};
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 use std::cell::RefCell;
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 use std::rc::Rc;
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 use raw_window_handle::{
     HasDisplayHandle, HasWindowHandle, DisplayHandle, WindowHandle,
 };
@@ -21,140 +27,46 @@ mod linux_impl {
     use libadwaita as adw;
     use adw::prelude::*;
 
-    pub struct Window {
-        window: adw::ApplicationWindow,
-    }
-
-    impl Window {
-        pub fn new(app: &adw::Application) -> Self {
-            let window = adw::ApplicationWindow::builder()
-                .application(app)
-                .title("UnaOS :: Vein")
-                .default_width(800)
-                .default_height(600)
-                .build();
-            Self { window }
-        }
-    }
-
-    impl HasDisplayHandle for Window {
-        fn display_handle(&self) -> Result<DisplayHandle<'_>, raw_window_handle::HandleError> {
-             Err(raw_window_handle::HandleError::Unavailable)
-        }
-    }
-
-    impl HasWindowHandle for Window {
-        fn window_handle(&self) -> Result<WindowHandle<'_>, raw_window_handle::HandleError> {
-            Err(raw_window_handle::HandleError::Unavailable)
-        }
-    }
-
     pub struct EventLoop<H: AppHandler + 'static> {
         app: adw::Application,
-        handler: Option<H>,
+        _marker: std::marker::PhantomData<H>,
     }
 
     impl<H: AppHandler + 'static> EventLoop<H> {
         pub fn new() -> Self {
             let app = adw::Application::builder()
-                .application_id("com.unaos.vein")
+                .application_id("org.unaos.vein")
                 .build();
             Self {
                 app,
-                handler: None,
+                _marker: std::marker::PhantomData,
             }
         }
 
-        pub fn run(mut self, handler: H) -> Result<(), String> {
-            self.handler = Some(handler);
-            let handler_storage = Rc::new(RefCell::new(self.handler));
+        pub fn run(self, _handler: H) -> Result<(), String> {
+            self.app.connect_activate(|app| {
+                let window = adw::ApplicationWindow::builder()
+                    .application(app)
+                    .title("Vein")
+                    .default_width(800)
+                    .default_height(600)
+                    .build();
 
-            self.app.connect_activate(move |app| {
-                if let Some(handler) = handler_storage.borrow_mut().take() {
-                    let window = Window::new(app);
-                    build_ui(window, handler);
-                }
+                let header_bar = gtk4::HeaderBar::new();
+                window.set_titlebar(Some(&header_bar));
+
+                let text_view = gtk4::TextView::builder()
+                    .editable(false)
+                    .build();
+                text_view.buffer().set_text("System Check: Native GTK Widgets Active.");
+
+                window.set_content(Some(&text_view));
+                window.present();
             });
 
             self.app.run_with_args::<&str>(&[]);
             Ok(())
         }
-    }
-
-    fn build_ui<H: AppHandler + 'static>(win_struct: Window, handler: H) {
-        let window = win_struct.window;
-
-        let picture = gtk4::Picture::new();
-        picture.set_hexpand(true);
-        picture.set_vexpand(true);
-        picture.set_content_fit(gtk4::ContentFit::Fill);
-
-        window.set_content(Some(&picture));
-        window.present();
-
-        let handler = Rc::new(RefCell::new(handler));
-        let picture_rc = Rc::new(picture);
-
-        let buffer = Rc::new(RefCell::new(vec![0u32; 800 * 600]));
-        let size = Rc::new(RefCell::new((800u32, 600u32)));
-
-        let tick_handler = handler.clone();
-        window.add_tick_callback(move |win, _clock| {
-            let width = win.width();
-            let height = win.height();
-            let w = width as u32;
-            let h = height as u32;
-
-            if w == 0 || h == 0 {
-                return glib::ControlFlow::Continue;
-            }
-
-            let mut buf = buffer.borrow_mut();
-            let mut sz = size.borrow_mut();
-
-            if w != sz.0 || h != sz.1 {
-                *sz = (w, h);
-                buf.resize((w * h) as usize, 0);
-            }
-
-            let mut hdl = tick_handler.borrow_mut();
-            hdl.handle_event(Event::Timer);
-            hdl.draw(&mut buf, w, h);
-
-            let (_prefix, data, _suffix) = unsafe { buf.align_to::<u8>() };
-            let byte_data = data.to_vec();
-            let bytes = glib::Bytes::from(&byte_data);
-
-            let texture = gtk4::gdk::MemoryTexture::new(
-                w as i32,
-                h as i32,
-                gtk4::gdk::MemoryFormat::B8g8r8a8,
-                &bytes,
-                (w * 4) as usize
-            );
-
-            picture_rc.set_paintable(Some(&texture));
-
-            glib::ControlFlow::Continue
-        });
-
-        let key_controller = gtk4::EventControllerKey::new();
-        let key_handler = handler.clone();
-        key_controller.connect_key_pressed(move |_, key, _keycode, _modifiers| {
-            let mut h = key_handler.borrow_mut();
-            match key {
-                 gtk4::gdk::Key::Return => h.handle_event(Event::KeyDown(KeyCode::Enter)),
-                 gtk4::gdk::Key::BackSpace => h.handle_event(Event::KeyDown(KeyCode::Backspace)),
-                 _ => {}
-            }
-            if let Some(c) = key.to_unicode() {
-                if !c.is_control() {
-                     h.handle_event(Event::Char(c));
-                }
-            }
-            glib::Propagation::Proceed
-        });
-        window.add_controller(key_controller);
     }
 }
 
