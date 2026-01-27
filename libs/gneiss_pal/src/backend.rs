@@ -46,7 +46,7 @@ mod linux_impl {
                 // 1. THE WINDOW (Adwaita)
                 let window = adw::ApplicationWindow::builder()
                     .application(app)
-                    .title("Vein")
+                    .title("UnaOS :: Vein") // Updated Title
                     .default_width(1200)
                     .default_height(800)
                     .build();
@@ -63,6 +63,7 @@ mod linux_impl {
                 left_pane.set_margin_top(12);
                 left_pane.set_margin_bottom(12);
                 left_pane.set_margin_start(12);
+                left_pane.set_margin_end(6); // Added spacing
 
                 let nav_list = gtk4::ListBox::new();
                 nav_list.set_vexpand(true);
@@ -156,6 +157,7 @@ mod linux_impl {
                 // MARGINS (Calibration)
                 right_pane.set_margin_top(12);
                 right_pane.set_margin_bottom(12);
+                right_pane.set_margin_start(6); // Added spacing
                 right_pane.set_margin_end(12);
 
                 let right_scroll = gtk4::ScrolledWindow::builder()
