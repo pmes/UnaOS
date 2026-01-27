@@ -59,6 +59,11 @@ mod linux_impl {
                 left_pane.set_width_request(250);
                 left_pane.add_css_class("navigation-sidebar"); // Native Adwaita styling
 
+                // MARGINS (Calibration)
+                left_pane.set_margin_top(12);
+                left_pane.set_margin_bottom(12);
+                left_pane.set_margin_start(12);
+
                 let nav_list = gtk4::ListBox::new();
                 nav_list.set_vexpand(true);
                 nav_list.set_selection_mode(gtk4::SelectionMode::Single);
@@ -110,6 +115,13 @@ mod linux_impl {
                     .accepts_tab(false)
                     .build();
 
+                // INPUT VOID CALIBRATION
+                input_view.add_css_class("card");
+                input_view.set_margin_start(10);
+                input_view.set_margin_end(10);
+                input_view.set_margin_top(10);
+                input_view.set_margin_bottom(10);
+
                 let input_scroll = gtk4::ScrolledWindow::builder()
                     .child(&input_view)
                     .min_content_height(35)   // Start small (1 line)
@@ -140,10 +152,11 @@ mod linux_impl {
                 // RIGHT PANE (Actions)
                 let right_pane = gtk4::Box::new(gtk4::Orientation::Vertical, 10);
                 right_pane.set_width_request(200);
-                right_pane.set_margin_start(10);
-                right_pane.set_margin_end(10);
-                right_pane.set_margin_top(10);
-                right_pane.set_margin_bottom(10);
+
+                // MARGINS (Calibration)
+                right_pane.set_margin_top(12);
+                right_pane.set_margin_bottom(12);
+                right_pane.set_margin_end(12);
 
                 let right_scroll = gtk4::ScrolledWindow::builder()
                     .child(&right_pane)
