@@ -33,7 +33,7 @@ impl AppHandler for VeinApp {
                     self.active_nav_index = 0; // Reset nav
                     {
                          let mut s = self.state.lock().unwrap();
-                         s.chat_history.push("> [SYSTEM]: Switching to Wolfpack Grid...".to_string());
+                         s.chat_history.push("[SYS] :: Switching to Wolfpack Grid...".to_string());
                     }
                     return;
                 } else if text.trim() == "/comms" {
@@ -41,7 +41,7 @@ impl AppHandler for VeinApp {
                     self.active_nav_index = 0;
                     {
                          let mut s = self.state.lock().unwrap();
-                         s.chat_history.push("> [SYSTEM]: Secure Comms Established.".to_string());
+                         s.chat_history.push("[SYS] :: Secure Comms Established.".to_string());
                     }
                     return;
                 }
@@ -49,7 +49,7 @@ impl AppHandler for VeinApp {
                 // Normal Message Handling
                 {
                     let mut s = self.state.lock().unwrap();
-                    s.chat_history.push(format!("> {}", text));
+                    s.chat_history.push(format!("[YOU] > {}", text));
                     // Keep history manageable
                     if s.chat_history.len() > 50 {
                         s.chat_history.remove(0);
@@ -63,9 +63,6 @@ impl AppHandler for VeinApp {
             }
             Event::Nav(index) => {
                 self.active_nav_index = index;
-                // Simple logic: If in Comms mode, index 0 = General, 1 = Encrypted.
-                // Switching channels could be implemented here by filtering history.
-                // For now, we just track the selection.
             }
             Event::Action(index) => {
                 match self.mode {
@@ -76,7 +73,7 @@ impl AppHandler for VeinApp {
                             }
                             1 => { // Save Log (Placeholder)
                                 let mut s = self.state.lock().unwrap();
-                                s.chat_history.push("[SYSTEM]: Log saved to secure storage.".to_string());
+                                s.chat_history.push("[SYS] :: Log saved to secure storage.".to_string());
                             }
                             _ => {}
                         }
@@ -188,7 +185,7 @@ fn main() {
                  match client.generate_content("Hello, I am Vein. System check.").await {
                      Ok(response) => {
                          let mut s = state_for_bg.lock().unwrap();
-                         s.chat_history.push(format!("System: {}", response));
+                         s.chat_history.push(format!("[SYS] :: System: {}", response));
                          s.status_text = "System Online".to_string();
                          s.network_initialized = true;
                          println!(":: VEIN :: Synapse Connection Established.");
@@ -208,14 +205,14 @@ fn main() {
                     match client.generate_content(&msg).await {
                          Ok(response) => {
                              let mut s = state_for_bg.lock().unwrap();
-                             s.chat_history.push(response);
+                             s.chat_history.push(format!("[SYS] :: {}", response));
                              if s.chat_history.len() > 50 {
                                  s.chat_history.remove(0);
                              }
                          }
                          Err(e) => {
                              let mut s = state_for_bg.lock().unwrap();
-                             s.chat_history.push(format!("Error: {}", e));
+                             s.chat_history.push(format!("[SYS] :: Error: {}", e));
                              if s.chat_history.len() > 50 {
                                  s.chat_history.remove(0);
                              }
@@ -225,7 +222,7 @@ fn main() {
             } else {
                  // If no client, we can't do anything but maybe log errors
                  while let Some(_) = rx.recv().await {
-                      state_for_bg.lock().unwrap().chat_history.push("System Error: AI Config Missing".to_string());
+                      state_for_bg.lock().unwrap().chat_history.push("[SYS] :: System Error: AI Config Missing".to_string());
                  }
             }
         });
