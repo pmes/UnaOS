@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::PathBuf;
-use directories::ProjectDirs;
+use directories::BaseDirs;
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct SavedMessage {
@@ -16,10 +16,18 @@ pub struct BrainManager {
 
 impl BrainManager {
     pub fn new() -> Self {
-        let proj_dirs = ProjectDirs::from("org", "unaos", "vein")
-            .expect("Could not determine home directory");
-        let data_dir = proj_dirs.data_dir();
-        fs::create_dir_all(data_dir).expect("Failed to create data directory");
+        // MANUAL OVERRIDE: Force ~/.local/share/unaos/vein
+        // We ask for the base data directory (usually ~/.local/share)
+        // and manually append our specific hierarchy.
+        let base_dirs = BaseDirs::new()
+            .expect("Could not determine base directories");
+
+        let data_dir = base_dirs.data_local_dir()
+            .join("unaos")  // The Organization
+            .join("vein");  // The App
+
+        // Create the directory tree
+        fs::create_dir_all(&data_dir).expect("Failed to create data directory");
 
         Self {
             file_path: data_dir.join("history.json"),
