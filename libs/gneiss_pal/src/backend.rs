@@ -54,7 +54,7 @@ mod linux_impl {
                 let window = adw::ApplicationWindow::builder()
                     .application(app)
                     .title("Vein")
-                    .default_width(1000)
+                    .default_width(1100)
                     .default_height(700)
                     .build();
 
@@ -73,71 +73,107 @@ mod linux_impl {
                 let left_box = gtk4::Box::builder()
                     .orientation(gtk4::Orientation::Vertical)
                     .width_request(200)
-                    .css_classes(vec!["sidebar"]) // Adwaita style class
+                    .css_classes(vec!["navigation-sidebar"]) // Adwaita style class
                     .build();
 
                 let nav_list = gtk4::ListBox::builder()
                     .selection_mode(gtk4::SelectionMode::Single)
-                    .build();
-
-                // Add Scroll for List
-                let left_scroll = gtk4::ScrolledWindow::builder()
-                    .hscrollbar_policy(gtk4::PolicyType::Never)
-                    .child(&nav_list)
                     .vexpand(true)
                     .build();
 
-                left_box.append(&left_scroll);
+                left_box.append(&nav_list);
                 main_box.append(&left_box);
 
                 // Separator
                 main_box.append(&gtk4::Separator::new(gtk4::Orientation::Vertical));
 
-                // 2. CENTER PANE (Stack)
+                // 2. CENTER PANE (The Stage)
                 let center_stack = gtk4::Stack::new();
                 center_stack.set_hexpand(true);
 
-                // Page 1: Comms (TextView)
-                let text_view = gtk4::TextView::builder()
+                // Page 1: COMMS CONSOLE (Split View)
+                let comms_box = gtk4::Box::builder()
+                    .orientation(gtk4::Orientation::Vertical)
+                    .spacing(12)
+                    .margin_top(12)
+                    .margin_bottom(12)
+                    .margin_start(12)
+                    .margin_end(12)
+                    .build();
+
+                // Top: Output Log
+                let output_scroll = gtk4::ScrolledWindow::builder()
+                    .vexpand(true)
+                    .build();
+
+                let output_view = gtk4::TextView::builder()
                     .editable(false)
+                    .cursor_visible(false)
                     .monospace(true)
                     .wrap_mode(gtk4::WrapMode::WordChar)
-                    .bottom_margin(20)
-                    .top_margin(20)
-                    .left_margin(20)
-                    .right_margin(20)
                     .build();
 
-                let text_scroll = gtk4::ScrolledWindow::builder()
-                    .child(&text_view)
+                output_scroll.set_child(Some(&output_view));
+                comms_box.append(&output_scroll);
+
+                // Bottom: Input Area (Card Style)
+                let input_card = gtk4::Box::builder()
+                    .orientation(gtk4::Orientation::Horizontal)
+                    .spacing(8)
+                    .css_classes(vec!["card"])
                     .build();
 
-                center_stack.add_named(&text_scroll, Some("comms"));
+                let input_view = gtk4::TextView::builder()
+                    .wrap_mode(gtk4::WrapMode::WordChar)
+                    .accepts_tab(false)
+                    .hexpand(true)
+                    .build();
 
-                // Page 2: Wolfpack (Label for now)
+                // Scrollable Input Wrapper
+                let input_scroll = gtk4::ScrolledWindow::builder()
+                    .child(&input_view)
+                    .propagate_natural_height(true)
+                    .max_content_height(150)
+                    .min_content_height(40)
+                    .build();
+
+                input_card.append(&input_scroll);
+
+                // Send Button
+                let send_btn = gtk4::Button::from_icon_name("mail-send-symbolic");
+                send_btn.add_css_class("flat");
+                input_card.append(&send_btn);
+
+                comms_box.append(&input_card);
+                center_stack.add_named(&comms_box, Some("Comms"));
+
+                // Page 2: WOLFPACK GRID (Placeholder)
                 let wolfpack_label = gtk4::Label::builder()
-                    .label("Wolfpack Grid System - OFFLINE")
+                    .label("WOLFPACK STATUS: OFFLINE")
                     .css_classes(vec!["title-1"])
                     .build();
-
-                center_stack.add_named(&wolfpack_label, Some("wolfpack"));
+                center_stack.add_named(&wolfpack_label, Some("Wolfpack"));
 
                 main_box.append(&center_stack);
 
                 // Separator
                 main_box.append(&gtk4::Separator::new(gtk4::Orientation::Vertical));
 
-                // 3. RIGHT PANE (Actions)
+                // 3. RIGHT PANE (Action Deck)
                 let right_box = gtk4::Box::builder()
                     .orientation(gtk4::Orientation::Vertical)
                     .width_request(200)
-                    .spacing(10)
-                    .margin_top(10)
-                    .margin_bottom(10)
-                    .margin_start(10)
-                    .margin_end(10)
+                    .spacing(6)
+                    .margin_top(12)
+                    .margin_end(12)
                     .build();
 
+                let action_list = gtk4::ListBox::builder()
+                    .selection_mode(gtk4::SelectionMode::None)
+                    .css_classes(vec!["boxed-list"])
+                    .build();
+
+                right_box.append(&action_list);
                 main_box.append(&right_box);
 
                 // Set Content
@@ -145,41 +181,57 @@ mod linux_impl {
                 window.set_content(Some(&toolbar_view));
 
 
-                // --- INPUT HANDLING ---
+                // --- INPUT LOGIC: INTELLIGENT ENTER KEY ---
                 let key_controller = EventControllerKey::new();
                 let h_input = handler_rc.clone();
-                key_controller.connect_key_pressed(move |_controller, keyval, _keycode, _state| {
-                    let mut h = h_input.borrow_mut();
-                    let mut handled = false;
+                let iv_clone = input_view.clone();
 
-                    match keyval {
-                        gtk4::gdk::Key::Return | gtk4::gdk::Key::KP_Enter | gtk4::gdk::Key::ISO_Enter => {
-                            h.handle_event(Event::KeyDown(KeyCode::Enter));
-                            handled = true;
+                key_controller.connect_key_pressed(move |_controller, keyval, _keycode, modifiers| {
+                    if keyval == gtk4::gdk::Key::Return || keyval == gtk4::gdk::Key::KP_Enter || keyval == gtk4::gdk::Key::ISO_Enter {
+                        let buffer = iv_clone.buffer();
+                        let (start, end) = buffer.bounds();
+                        let text = buffer.text(&start, &end, false);
+
+                        let is_multiline = text.contains('\n') || text.len() > 80;
+                        let force_send = modifiers.contains(gtk4::gdk::ModifierType::CONTROL_MASK);
+
+                        // If Control+Enter OR (Not Multiline AND Not Shift+Enter (implicit in simple check))
+                        // Simplified Logic:
+                        // If Ctrl+Enter -> Send
+                        // If Enter (no Shift) -> Send (unless explicitly desired otherwise, but prompt says "Intelligent")
+                        // Prompt says: "It only sends a signal when the message is complete."
+                        // Let's implement standard chat app behavior: Enter sends, Shift+Enter adds newline.
+
+                        let shift_pressed = modifiers.contains(gtk4::gdk::ModifierType::SHIFT_MASK);
+
+                        if !shift_pressed || force_send {
+                             // SEND ACTION
+                             if !text.trim().is_empty() {
+                                 h_input.borrow_mut().handle_event(Event::Input(text.to_string()));
+                                 buffer.set_text("");
+                             }
+                             return glib::Propagation::Stop;
                         }
-                        gtk4::gdk::Key::BackSpace => {
-                            h.handle_event(Event::KeyDown(KeyCode::Backspace));
-                            handled = true;
-                        }
-                        _ => {
-                            if let Some(c) = keyval.to_unicode() {
-                                if !c.is_control() {
-                                    h.handle_event(Event::Char(c));
-                                    handled = true;
-                                }
-                            }
-                        }
+                        // Else: Allow default newline insertion (Shift+Enter)
                     }
+                    glib::Propagation::Proceed
+                });
+                input_view.add_controller(key_controller);
 
-                    if handled {
-                        glib::Propagation::Stop
-                    } else {
-                        glib::Propagation::Proceed
+                // Send Button Logic
+                let h_btn = handler_rc.clone();
+                let iv_btn = input_view.clone();
+                send_btn.connect_clicked(move |_| {
+                    let buffer = iv_btn.buffer();
+                    let (start, end) = buffer.bounds();
+                    let text = buffer.text(&start, &end, false);
+                    if !text.trim().is_empty() {
+                        h_btn.borrow_mut().handle_event(Event::Input(text.to_string()));
+                        buffer.set_text("");
                     }
                 });
-                window.add_controller(key_controller);
 
-                // --- SIGNAL HANDLING (Nav List) ---
+                // --- SIGNAL HANDLING (Nav & Actions) ---
                 let h_nav = handler_rc.clone();
                 nav_list.connect_row_activated(move |_list, row| {
                      let idx = row.index();
@@ -190,14 +242,9 @@ mod linux_impl {
 
                 // --- RENDER LOOP ---
                 let h_tick = handler_rc.clone();
-                let text_buffer = text_view.buffer();
+                let text_buffer = output_view.buffer();
 
                 // Track previous state to optimize updates
-                // Note: We can't easily store full state in closure without refcells,
-                // so we'll just check specific things or rebuild cheap things.
-                // For strings, we check. For lists, we might rebuild if different length/content.
-
-                // Helper to manage action buttons closure state
                 let current_actions = Rc::new(RefCell::new(Vec::<String>::new()));
                 let current_navs = Rc::new(RefCell::new(Vec::<String>::new()));
 
@@ -218,13 +265,15 @@ mod linux_impl {
                             nav_list.remove(&child);
                         }
                         for item_text in &state.nav_items {
+                             let row = gtk4::ListBoxRow::new();
                              let label = gtk4::Label::new(Some(item_text));
                              label.set_margin_start(10);
                              label.set_margin_end(10);
                              label.set_margin_top(10);
                              label.set_margin_bottom(10);
                              label.set_xalign(0.0);
-                             nav_list.append(&label);
+                             row.set_child(Some(&label));
+                             nav_list.append(&row);
                         }
                         *navs_cache = state.nav_items.clone();
                     }
@@ -239,22 +288,24 @@ mod linux_impl {
                     // 2. Sync Center (Stack & Text)
                     match state.mode {
                         ViewMode::Comms => {
-                            if center_stack.visible_child_name().as_deref() != Some("comms") {
-                                center_stack.set_visible_child_name("comms");
+                            if center_stack.visible_child_name().as_deref() != Some("Comms") {
+                                center_stack.set_visible_child_name("Comms");
                             }
-                            // Update Text
+                            // Update Text (Console Log)
                             let start = text_buffer.start_iter();
                             let end = text_buffer.end_iter();
                             let current_text = text_buffer.text(&start, &end, false);
                             if current_text != state.console_output {
                                 text_buffer.set_text(&state.console_output);
-                                // Scroll to bottom?
-                                // Usually handled by setting iter to end and placing cursor
+                                // Auto-scroll
+                                let end_iter = text_buffer.end_iter();
+                                let mark = text_buffer.create_mark(None, &end_iter, false);
+                                output_view.scroll_to_mark(&mark, 0.0, true, 0.0, 1.0);
                             }
                         },
                         ViewMode::Wolfpack => {
-                            if center_stack.visible_child_name().as_deref() != Some("wolfpack") {
-                                center_stack.set_visible_child_name("wolfpack");
+                            if center_stack.visible_child_name().as_deref() != Some("Wolfpack") {
+                                center_stack.set_visible_child_name("Wolfpack");
                             }
                         }
                     }
@@ -263,45 +314,24 @@ mod linux_impl {
                     let mut actions_cache = current_actions.borrow_mut();
                     if *actions_cache != state.actions {
                         // Rebuild Actions
-                        while let Some(child) = right_box.first_child() {
-                            right_box.remove(&child);
+                        while let Some(child) = action_list.first_child() {
+                            action_list.remove(&child);
                         }
                         for (i, action_text) in state.actions.iter().enumerate() {
+                            let row = gtk4::ListBoxRow::new();
                             let btn = gtk4::Button::with_label(action_text);
                             btn.set_height_request(50);
 
                             // Wire Click
-                            let h_btn = h_tick.clone(); // Clone the RC, not the ref
-                             // Wait, we are borrowing h_tick (h) right now. We cannot clone it easily inside the loop to pass to signal?
-                             // Actually, we are inside the closure of timeout_add_local.
-                             // `h` is a RefMut. `h_tick` is the Rc<RefCell>.
-                             // We need to pass a clone of the Rc to the button signal.
-                             // BUT we are currently borrowing it mutably via `h`.
-                             // If we attach the signal now, the signal handler won't run until main loop, so the borrow will be dropped.
-                             // So it is safe to clone the Rc.
-
-                             // Problem: We can't access `h_tick` inside the closure easily if we move it?
-                             // `h_tick` is already moved into the timeout closure.
-                             // We need to clone it *outside* the loop? No, the loop runs repeatedly.
-                             // We can clone `h_tick` (the Rc) inside the loop? Yes, Rc::clone(&h_tick).
-
-                             // However, `h_tick` is captured by the closure.
-                             // Is it captured by value or ref? `move ||` -> by value.
-
-                             // So we can clone it.
-
-                             // WAIT. We are currently borrowing `h_tick` as `h`.
-                             // `h` is `RefMut`.
-                             // We can clone `h_tick` (the Rc) safely even if borrowed, as long as we don't borrow it again in this scope.
-                             // The button callback runs LATER.
-
                             let h_action = Rc::clone(&h_tick); // Clone the Rc
-
                             btn.connect_clicked(move |_| {
                                 h_action.borrow_mut().handle_event(Event::Action(i));
                             });
 
-                            right_box.append(&btn);
+                            row.set_child(Some(&btn));
+                            row.set_activatable(false);
+                            row.set_selectable(false);
+                            action_list.append(&row);
                         }
                         *actions_cache = state.actions.clone();
                     }

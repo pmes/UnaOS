@@ -1,4 +1,4 @@
-use gneiss_pal::{EventLoop, AppHandler, Event, KeyCode, DashboardState, ViewMode};
+use gneiss_pal::{EventLoop, AppHandler, Event, DashboardState, ViewMode};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use tokio::runtime::Runtime;
@@ -17,9 +17,7 @@ struct State {
 
 struct VeinApp {
     state: Arc<Mutex<State>>,
-    input_buffer: String,
     tx: mpsc::UnboundedSender<String>,
-    frame_count: u64,
     // Local UI State
     mode: ViewMode,
     active_nav_index: usize,
@@ -28,23 +26,46 @@ struct VeinApp {
 impl AppHandler for VeinApp {
     fn handle_event(&mut self, event: Event) {
         match event {
-            Event::Timer => {
-                self.frame_count = self.frame_count.wrapping_add(1);
+            Event::Input(text) => {
+                // Command Handling (Client-side)
+                if text.trim() == "/wolf" {
+                    self.mode = ViewMode::Wolfpack;
+                    self.active_nav_index = 0; // Reset nav
+                    {
+                         let mut s = self.state.lock().unwrap();
+                         s.chat_history.push("> [SYSTEM]: Switching to Wolfpack Grid...".to_string());
+                    }
+                    return;
+                } else if text.trim() == "/comms" {
+                    self.mode = ViewMode::Comms;
+                    self.active_nav_index = 0;
+                    {
+                         let mut s = self.state.lock().unwrap();
+                         s.chat_history.push("> [SYSTEM]: Secure Comms Established.".to_string());
+                    }
+                    return;
+                }
+
+                // Normal Message Handling
+                {
+                    let mut s = self.state.lock().unwrap();
+                    s.chat_history.push(format!("> {}", text));
+                    // Keep history manageable
+                    if s.chat_history.len() > 50 {
+                        s.chat_history.remove(0);
+                    }
+                }
+
+                // Send to background Async Core
+                if let Err(e) = self.tx.send(text) {
+                    eprintln!("Failed to send message: {}", e);
+                }
             }
             Event::Nav(index) => {
                 self.active_nav_index = index;
-                // Switch mode based on selection for now
-                // Left Pane logic:
-                // Comms: [General, Encrypted]
-                // Wolfpack: [J-Series, S-Series]
-                //
-                // Wait, the lists change based on mode. But how do we switch mode?
-                // The prompt says: "If Comms: Left = ... If Wolfpack: Left = ..."
-                // It implies the mode switching might be external or via Actions?
-                // Or maybe Nav items switch sub-contexts.
-
-                // Let's assume Nav selection just updates active index.
-                // Mode switching via Actions.
+                // Simple logic: If in Comms mode, index 0 = General, 1 = Encrypted.
+                // Switching channels could be implemented here by filtering history.
+                // For now, we just track the selection.
             }
             Event::Action(index) => {
                 match self.mode {
@@ -52,58 +73,27 @@ impl AppHandler for VeinApp {
                         match index {
                             0 => { // Clear
                                 self.state.lock().unwrap().chat_history.clear();
-                                self.input_buffer.clear();
                             }
-                            1 => { // Save / Switch Mode Test
-                                // Let's use this to toggle mode for demonstration
-                                self.mode = ViewMode::Wolfpack;
-                                self.active_nav_index = 0;
+                            1 => { // Save Log (Placeholder)
+                                let mut s = self.state.lock().unwrap();
+                                s.chat_history.push("[SYSTEM]: Log saved to secure storage.".to_string());
                             }
                             _ => {}
                         }
                     }
                     ViewMode::Wolfpack => {
                         match index {
-                            0 => { // Deploy / Switch Back
-                                self.mode = ViewMode::Comms;
-                                self.active_nav_index = 0;
+                            0 => { // Deploy J1
+                                let mut s = self.state.lock().unwrap();
+                                s.status_text = "Deploying J-Series Unit...".to_string();
                             }
-                            1 => { // Sleep
-                                // Do nothing
+                            1 => { // Sleep All
+                                let mut s = self.state.lock().unwrap();
+                                s.status_text = "Wolfpack Units Entering Sleep Mode.".to_string();
                             }
                             _ => {}
                         }
                     }
-                }
-            }
-            Event::Char(c) => {
-                if self.mode == ViewMode::Comms {
-                    self.input_buffer.push(c);
-                }
-            }
-            Event::KeyDown(KeyCode::Backspace) => {
-                if self.mode == ViewMode::Comms {
-                    self.input_buffer.pop();
-                }
-            }
-            Event::KeyDown(KeyCode::Enter) => {
-                if self.mode == ViewMode::Comms && !self.input_buffer.is_empty() {
-                    let msg = self.input_buffer.clone();
-                    // Update Local State
-                    {
-                        let mut s = self.state.lock().unwrap();
-                        s.chat_history.push(format!("> {}", msg));
-                        // Keep history manageable
-                        if s.chat_history.len() > 15 {
-                            s.chat_history.remove(0);
-                        }
-                    }
-                    // Send to background
-                    if let Err(e) = self.tx.send(msg) {
-                        eprintln!("Failed to send message: {}", e);
-                    }
-                    // Clear buffer
-                    self.input_buffer.clear();
                 }
             }
             _ => {}
@@ -111,13 +101,13 @@ impl AppHandler for VeinApp {
     }
 
     fn view(&self) -> DashboardState {
-        // Grab state quickly and drop lock
+        // Grab state snapshot
         let (status_text, history) = {
             let s = self.state.lock().unwrap();
             (s.status_text.clone(), s.chat_history.clone())
         };
 
-        // Construct Comms Output
+        // Construct Console Output
         let mut console_output = String::new();
         if self.mode == ViewMode::Comms {
             console_output.push_str("UnaOS Virtual Office: ONLINE\n");
@@ -128,21 +118,19 @@ impl AppHandler for VeinApp {
                 console_output.push_str(msg);
                 console_output.push_str("\n\n");
             }
-
-            let cursor = if (self.frame_count % 60) < 30 { "_" } else { " " };
-            console_output.push_str(&format!("> {}{}", self.input_buffer, cursor));
         } else {
-            console_output = "Wolfpack Grid Active (Placeholder)".to_string();
+            console_output.push_str("Wolfpack Grid Active\n");
+            console_output.push_str(&format!("Status: {}\n", status_text));
         }
 
         let (nav_items, actions) = match self.mode {
             ViewMode::Comms => (
                 vec!["General".to_string(), "Encrypted".to_string()],
-                vec!["Clear".to_string(), "Wolfpack".to_string()]
+                vec!["Clear".to_string(), "Save Log".to_string()]
             ),
             ViewMode::Wolfpack => (
                 vec!["J-Series".to_string(), "S-Series".to_string()],
-                vec!["Comms".to_string(), "Sleep".to_string()]
+                vec!["Deploy J1".to_string(), "Sleep All".to_string()]
             ),
         };
 
@@ -221,14 +209,14 @@ fn main() {
                          Ok(response) => {
                              let mut s = state_for_bg.lock().unwrap();
                              s.chat_history.push(response);
-                             if s.chat_history.len() > 15 {
+                             if s.chat_history.len() > 50 {
                                  s.chat_history.remove(0);
                              }
                          }
                          Err(e) => {
                              let mut s = state_for_bg.lock().unwrap();
                              s.chat_history.push(format!("Error: {}", e));
-                             if s.chat_history.len() > 15 {
+                             if s.chat_history.len() > 50 {
                                  s.chat_history.remove(0);
                              }
                          }
@@ -251,9 +239,7 @@ fn main() {
 
     let handler = VeinApp {
         state,
-        input_buffer: String::new(),
         tx,
-        frame_count: 0,
         mode: ViewMode::Comms,
         active_nav_index: 0,
     };
