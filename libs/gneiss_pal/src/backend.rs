@@ -2,7 +2,7 @@ use crate::AppHandler;
 
 // Shared imports
 #[allow(unused_imports)]
-use crate::{Event, KeyCode};
+use crate::{Event, KeyCode, DashboardState, ViewMode};
 #[allow(unused_imports)]
 use std::cell::RefCell;
 #[allow(unused_imports)]
@@ -54,27 +54,98 @@ mod linux_impl {
                 let window = adw::ApplicationWindow::builder()
                     .application(app)
                     .title("Vein")
-                    .default_width(800)
-                    .default_height(600)
+                    .default_width(1000)
+                    .default_height(700)
                     .build();
 
                 let toolbar_view = adw::ToolbarView::new();
                 let header_bar = adw::HeaderBar::new();
                 toolbar_view.add_top_bar(&header_bar);
 
+                // --- LAYOUT STRUCTURE ---
+                // Root Horizontal Box
+                let main_box = gtk4::Box::builder()
+                    .orientation(gtk4::Orientation::Horizontal)
+                    .spacing(0)
+                    .build();
+
+                // 1. LEFT PANE (Navigation)
+                let left_box = gtk4::Box::builder()
+                    .orientation(gtk4::Orientation::Vertical)
+                    .width_request(200)
+                    .css_classes(vec!["sidebar"]) // Adwaita style class
+                    .build();
+
+                let nav_list = gtk4::ListBox::builder()
+                    .selection_mode(gtk4::SelectionMode::Single)
+                    .build();
+
+                // Add Scroll for List
+                let left_scroll = gtk4::ScrolledWindow::builder()
+                    .hscrollbar_policy(gtk4::PolicyType::Never)
+                    .child(&nav_list)
+                    .vexpand(true)
+                    .build();
+
+                left_box.append(&left_scroll);
+                main_box.append(&left_box);
+
+                // Separator
+                main_box.append(&gtk4::Separator::new(gtk4::Orientation::Vertical));
+
+                // 2. CENTER PANE (Stack)
+                let center_stack = gtk4::Stack::new();
+                center_stack.set_hexpand(true);
+
+                // Page 1: Comms (TextView)
                 let text_view = gtk4::TextView::builder()
                     .editable(false)
                     .monospace(true)
                     .wrap_mode(gtk4::WrapMode::WordChar)
+                    .bottom_margin(20)
+                    .top_margin(20)
+                    .left_margin(20)
+                    .right_margin(20)
                     .build();
 
-                // Set Initial Text
-                text_view.buffer().set_text(&handler_rc.borrow().view());
+                let text_scroll = gtk4::ScrolledWindow::builder()
+                    .child(&text_view)
+                    .build();
 
-                toolbar_view.set_content(Some(&text_view));
+                center_stack.add_named(&text_scroll, Some("comms"));
+
+                // Page 2: Wolfpack (Label for now)
+                let wolfpack_label = gtk4::Label::builder()
+                    .label("Wolfpack Grid System - OFFLINE")
+                    .css_classes(vec!["title-1"])
+                    .build();
+
+                center_stack.add_named(&wolfpack_label, Some("wolfpack"));
+
+                main_box.append(&center_stack);
+
+                // Separator
+                main_box.append(&gtk4::Separator::new(gtk4::Orientation::Vertical));
+
+                // 3. RIGHT PANE (Actions)
+                let right_box = gtk4::Box::builder()
+                    .orientation(gtk4::Orientation::Vertical)
+                    .width_request(200)
+                    .spacing(10)
+                    .margin_top(10)
+                    .margin_bottom(10)
+                    .margin_start(10)
+                    .margin_end(10)
+                    .build();
+
+                main_box.append(&right_box);
+
+                // Set Content
+                toolbar_view.set_content(Some(&main_box));
                 window.set_content(Some(&toolbar_view));
 
-                // Input Handling
+
+                // --- INPUT HANDLING ---
                 let key_controller = EventControllerKey::new();
                 let h_input = handler_rc.clone();
                 key_controller.connect_key_pressed(move |_controller, keyval, _keycode, _state| {
@@ -108,23 +179,131 @@ mod linux_impl {
                 });
                 window.add_controller(key_controller);
 
-                // Tick Loop (Visual Updates)
+                // --- SIGNAL HANDLING (Nav List) ---
+                let h_nav = handler_rc.clone();
+                nav_list.connect_row_activated(move |_list, row| {
+                     let idx = row.index();
+                     if idx >= 0 {
+                         h_nav.borrow_mut().handle_event(Event::Nav(idx as usize));
+                     }
+                });
+
+                // --- RENDER LOOP ---
                 let h_tick = handler_rc.clone();
-                let buffer = text_view.buffer();
-                glib::timeout_add_local(std::time::Duration::from_millis(16), move || {
+                let text_buffer = text_view.buffer();
+
+                // Track previous state to optimize updates
+                // Note: We can't easily store full state in closure without refcells,
+                // so we'll just check specific things or rebuild cheap things.
+                // For strings, we check. For lists, we might rebuild if different length/content.
+
+                // Helper to manage action buttons closure state
+                let current_actions = Rc::new(RefCell::new(Vec::<String>::new()));
+                let current_navs = Rc::new(RefCell::new(Vec::<String>::new()));
+
+                glib::timeout_add_local(std::time::Duration::from_millis(32), move || {
                     let mut h = h_tick.borrow_mut();
 
-                    // Timer Event (e.g. for cursor blink)
+                    // Timer Event
                     h.handle_event(Event::Timer);
 
-                    // Update View if changed
-                    let new_text = h.view();
-                    let start = buffer.start_iter();
-                    let end = buffer.end_iter();
-                    let current_text = buffer.text(&start, &end, false);
+                    // Get View State
+                    let state = h.view();
 
-                    if current_text != new_text {
-                        buffer.set_text(&new_text);
+                    // 1. Sync Left (Nav)
+                    let mut navs_cache = current_navs.borrow_mut();
+                    if *navs_cache != state.nav_items {
+                        // Rebuild Nav
+                        while let Some(child) = nav_list.first_child() {
+                            nav_list.remove(&child);
+                        }
+                        for item_text in &state.nav_items {
+                             let label = gtk4::Label::new(Some(item_text));
+                             label.set_margin_start(10);
+                             label.set_margin_end(10);
+                             label.set_margin_top(10);
+                             label.set_margin_bottom(10);
+                             label.set_xalign(0.0);
+                             nav_list.append(&label);
+                        }
+                        *navs_cache = state.nav_items.clone();
+                    }
+
+                    // Sync Selection
+                    if let Some(row) = nav_list.row_at_index(state.active_nav_index as i32) {
+                        if !row.is_selected() {
+                            nav_list.select_row(Some(&row));
+                        }
+                    }
+
+                    // 2. Sync Center (Stack & Text)
+                    match state.mode {
+                        ViewMode::Comms => {
+                            if center_stack.visible_child_name().as_deref() != Some("comms") {
+                                center_stack.set_visible_child_name("comms");
+                            }
+                            // Update Text
+                            let start = text_buffer.start_iter();
+                            let end = text_buffer.end_iter();
+                            let current_text = text_buffer.text(&start, &end, false);
+                            if current_text != state.console_output {
+                                text_buffer.set_text(&state.console_output);
+                                // Scroll to bottom?
+                                // Usually handled by setting iter to end and placing cursor
+                            }
+                        },
+                        ViewMode::Wolfpack => {
+                            if center_stack.visible_child_name().as_deref() != Some("wolfpack") {
+                                center_stack.set_visible_child_name("wolfpack");
+                            }
+                        }
+                    }
+
+                    // 3. Sync Right (Actions)
+                    let mut actions_cache = current_actions.borrow_mut();
+                    if *actions_cache != state.actions {
+                        // Rebuild Actions
+                        while let Some(child) = right_box.first_child() {
+                            right_box.remove(&child);
+                        }
+                        for (i, action_text) in state.actions.iter().enumerate() {
+                            let btn = gtk4::Button::with_label(action_text);
+                            btn.set_height_request(50);
+
+                            // Wire Click
+                            let h_btn = h_tick.clone(); // Clone the RC, not the ref
+                             // Wait, we are borrowing h_tick (h) right now. We cannot clone it easily inside the loop to pass to signal?
+                             // Actually, we are inside the closure of timeout_add_local.
+                             // `h` is a RefMut. `h_tick` is the Rc<RefCell>.
+                             // We need to pass a clone of the Rc to the button signal.
+                             // BUT we are currently borrowing it mutably via `h`.
+                             // If we attach the signal now, the signal handler won't run until main loop, so the borrow will be dropped.
+                             // So it is safe to clone the Rc.
+
+                             // Problem: We can't access `h_tick` inside the closure easily if we move it?
+                             // `h_tick` is already moved into the timeout closure.
+                             // We need to clone it *outside* the loop? No, the loop runs repeatedly.
+                             // We can clone `h_tick` (the Rc) inside the loop? Yes, Rc::clone(&h_tick).
+
+                             // However, `h_tick` is captured by the closure.
+                             // Is it captured by value or ref? `move ||` -> by value.
+
+                             // So we can clone it.
+
+                             // WAIT. We are currently borrowing `h_tick` as `h`.
+                             // `h` is `RefMut`.
+                             // We can clone `h_tick` (the Rc) safely even if borrowed, as long as we don't borrow it again in this scope.
+                             // The button callback runs LATER.
+
+                            let h_action = Rc::clone(&h_tick); // Clone the Rc
+
+                            btn.connect_clicked(move |_| {
+                                h_action.borrow_mut().handle_event(Event::Action(i));
+                            });
+
+                            right_box.append(&btn);
+                        }
+                        *actions_cache = state.actions.clone();
                     }
 
                     glib::ControlFlow::Continue
@@ -175,11 +354,6 @@ mod mac_impl {
                  window.setTitle(Some(&NSString::from_str("UnaOS :: Vein (Mac Native)")));
                  window.makeKeyAndOrderFront(None);
                  window.setBackgroundColor(Some(&NSColor::blackColor()));
-
-                 // Create and set custom view
-                 let view_rect = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(800.0, 600.0));
-                 let view = GneissView::alloc(mtm).initWithFrame(view_rect);
-                 window.setContentView(Some(&view));
             }
             Self { window }
         }
@@ -218,7 +392,7 @@ mod mac_impl {
 
              #[unsafe(method(drawRect:))]
              fn draw_rect(&self, dirty_rect: NSRect) {
-                 // Stub: No drawing
+                 // Stub
              }
         }
     );

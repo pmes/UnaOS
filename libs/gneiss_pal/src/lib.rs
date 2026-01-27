@@ -1,5 +1,10 @@
 #![cfg_attr(not(feature = "std"), no_std)]
 
+#[cfg(feature = "std")]
+use std::string::String;
+#[cfg(feature = "std")]
+use std::vec::Vec;
+
 pub const MOONSTONE_PURPLE: u32 = 0x2C003E;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -16,8 +21,27 @@ pub enum Event {
     KeyDown(KeyCode),
     Char(char),
     Mouse { x: i32, y: i32 },
+    Nav(usize),
+    Action(usize),
     None,
     Unknown,
+}
+
+#[derive(Clone, PartialEq)]
+pub enum ViewMode {
+    Comms,
+    Wolfpack,
+}
+
+pub struct DashboardState {
+    pub mode: ViewMode,
+    // Left Pane
+    pub nav_items: Vec<String>,
+    pub active_nav_index: usize,
+    // Center Pane (Comms)
+    pub console_output: String,
+    // Right Pane
+    pub actions: Vec<String>,
 }
 
 // THE KERNEL INTERFACE
@@ -50,7 +74,7 @@ pub trait GneissPal {
 
 pub trait AppHandler {
     fn handle_event(&mut self, event: Event);
-    fn view(&self) -> String;
+    fn view(&self) -> DashboardState;
 }
 
 #[cfg(feature = "std")]
