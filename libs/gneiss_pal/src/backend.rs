@@ -36,6 +36,7 @@ mod linux_impl {
         pub fn new<H: AppHandler + 'static>(app_id: &str, handler: H) -> Self {
             let handler = Rc::new(RefCell::new(handler));
 
+            // ACTION 1: SWITCH TO ADWAITA APP (Already done, but ensuring)
             let app = adw::Application::builder()
                 .application_id(app_id)
                 .build();
@@ -46,7 +47,7 @@ mod linux_impl {
                 // 1. THE WINDOW (Adwaita)
                 let window = adw::ApplicationWindow::builder()
                     .application(app)
-                    .title("VEIN :: UPDATED VERSION") // LOUD TEST
+                    .title("UnaOS :: Vein")
                     .default_width(1200)
                     .default_height(800)
                     .build();
@@ -63,7 +64,7 @@ mod linux_impl {
                 left_pane.set_margin_top(12);
                 left_pane.set_margin_bottom(12);
                 left_pane.set_margin_start(12);
-                left_pane.set_margin_end(6); // Added spacing
+                left_pane.set_margin_end(6);
 
                 let nav_list = gtk4::ListBox::new();
                 nav_list.set_vexpand(true);
@@ -89,7 +90,6 @@ mod linux_impl {
                     .editable(false)
                     .monospace(true)
                     .cursor_visible(false)
-                    // .selectable(true) // Not available in gtk4::TextView builder, set later if needed or default
                     .wrap_mode(gtk4::WrapMode::WordChar)
                     .left_margin(12)
                     .right_margin(12)
@@ -133,13 +133,24 @@ mod linux_impl {
                     .hexpand(true)
                     .build();
 
+                // ACTION 2: HARD FRAME (Backup for Input)
+                let input_frame = gtk4::Frame::new(None);
+                // input_frame.set_child(Some(&input_scroll)); // gtk4::Frame doesn't have set_child in 4.0? It inherits from Widget.
+                // Wait, gtk4::Frame IS a Bin/Widget.
+                // Checking docs... gtk4::Frame has set_child.
+                input_frame.set_child(Some(&input_scroll));
+
+                // Add margins to frame so it doesn't touch buttons
+                // input_frame.set_margin_end(10); // Spacing from button is handled by box spacing (10)
+
                 // Send Button
                 let send_btn = gtk4::Button::from_icon_name("mail-send-symbolic");
                 send_btn.add_css_class("suggested-action");
                 send_btn.set_valign(gtk4::Align::End); // Align to bottom of input box
                 send_btn.set_margin_bottom(4); // Visual tweak
 
-                input_area.append(&input_scroll);
+                // Append FRAME instead of Scroll
+                input_area.append(&input_frame);
                 input_area.append(&send_btn);
                 comms_box.append(&input_area);
 
@@ -157,7 +168,7 @@ mod linux_impl {
                 // MARGINS (Calibration)
                 right_pane.set_margin_top(12);
                 right_pane.set_margin_bottom(12);
-                right_pane.set_margin_start(6); // Added spacing
+                right_pane.set_margin_start(6);
                 right_pane.set_margin_end(12);
 
                 let right_scroll = gtk4::ScrolledWindow::builder()
@@ -281,7 +292,7 @@ mod linux_impl {
                              let row = gtk4::ListBoxRow::new();
                              let label = gtk4::Label::new(Some(item_text));
 
-                             // CORRECTED SYNTAX: Explicitly set margins
+                             // Explicit margins
                              label.set_margin_top(12);
                              label.set_margin_bottom(12);
                              label.set_margin_start(12);
