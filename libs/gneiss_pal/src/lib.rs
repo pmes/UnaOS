@@ -50,7 +50,7 @@ pub trait GneissPal {
 
 pub trait AppHandler {
     fn handle_event(&mut self, event: Event);
-    fn draw(&mut self, buffer: &mut [u32], width: u32, height: u32);
+    fn view(&self) -> String;
 }
 
 #[cfg(feature = "std")]
