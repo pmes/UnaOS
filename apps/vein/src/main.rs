@@ -211,5 +211,5 @@ fn main() {
     let app = VeinApp::new(tx, state);
 
     // "org.unaos.vein"
-    Backend::new("org.unaos.vein", app);
+    Backend::new("org.unaos.vein.evolution", app);
 }
