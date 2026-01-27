@@ -14,7 +14,7 @@ pub enum KeyCode {
     Other,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Event {
     Quit,
     Timer,
@@ -23,16 +23,18 @@ pub enum Event {
     Mouse { x: i32, y: i32 },
     Nav(usize),
     Action(usize),
+    Input(String),
     None,
     Unknown,
 }
 
-#[derive(Clone, PartialEq)]
+#[derive(Clone, PartialEq, Debug)]
 pub enum ViewMode {
     Comms,
     Wolfpack,
 }
 
+#[derive(Clone, Debug)]
 pub struct DashboardState {
     pub mode: ViewMode,
     // Left Pane
