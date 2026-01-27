@@ -1,4 +1,4 @@
-use gneiss_pal::{EventLoop, AppHandler, Event, KeyCode};
+use gneiss_pal::{EventLoop, AppHandler, Event, KeyCode, DashboardState, ViewMode};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use tokio::runtime::Runtime;
@@ -20,24 +20,74 @@ struct VeinApp {
     input_buffer: String,
     tx: mpsc::UnboundedSender<String>,
     frame_count: u64,
+    // Local UI State
+    mode: ViewMode,
+    active_nav_index: usize,
 }
 
 impl AppHandler for VeinApp {
     fn handle_event(&mut self, event: Event) {
-        // Blink timer and input handling
-        if let Event::Timer = event {
-            self.frame_count = self.frame_count.wrapping_add(1);
-        }
-
         match event {
+            Event::Timer => {
+                self.frame_count = self.frame_count.wrapping_add(1);
+            }
+            Event::Nav(index) => {
+                self.active_nav_index = index;
+                // Switch mode based on selection for now
+                // Left Pane logic:
+                // Comms: [General, Encrypted]
+                // Wolfpack: [J-Series, S-Series]
+                //
+                // Wait, the lists change based on mode. But how do we switch mode?
+                // The prompt says: "If Comms: Left = ... If Wolfpack: Left = ..."
+                // It implies the mode switching might be external or via Actions?
+                // Or maybe Nav items switch sub-contexts.
+
+                // Let's assume Nav selection just updates active index.
+                // Mode switching via Actions.
+            }
+            Event::Action(index) => {
+                match self.mode {
+                    ViewMode::Comms => {
+                        match index {
+                            0 => { // Clear
+                                self.state.lock().unwrap().chat_history.clear();
+                                self.input_buffer.clear();
+                            }
+                            1 => { // Save / Switch Mode Test
+                                // Let's use this to toggle mode for demonstration
+                                self.mode = ViewMode::Wolfpack;
+                                self.active_nav_index = 0;
+                            }
+                            _ => {}
+                        }
+                    }
+                    ViewMode::Wolfpack => {
+                        match index {
+                            0 => { // Deploy / Switch Back
+                                self.mode = ViewMode::Comms;
+                                self.active_nav_index = 0;
+                            }
+                            1 => { // Sleep
+                                // Do nothing
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            }
             Event::Char(c) => {
-                self.input_buffer.push(c);
+                if self.mode == ViewMode::Comms {
+                    self.input_buffer.push(c);
+                }
             }
             Event::KeyDown(KeyCode::Backspace) => {
-                self.input_buffer.pop();
+                if self.mode == ViewMode::Comms {
+                    self.input_buffer.pop();
+                }
             }
             Event::KeyDown(KeyCode::Enter) => {
-                if !self.input_buffer.is_empty() {
+                if self.mode == ViewMode::Comms && !self.input_buffer.is_empty() {
                     let msg = self.input_buffer.clone();
                     // Update Local State
                     {
@@ -60,27 +110,49 @@ impl AppHandler for VeinApp {
         }
     }
 
-    fn view(&self) -> String {
+    fn view(&self) -> DashboardState {
         // Grab state quickly and drop lock
         let (status_text, history) = {
             let s = self.state.lock().unwrap();
             (s.status_text.clone(), s.chat_history.clone())
         };
 
-        let mut view = String::new();
-        view.push_str("UnaOS Virtual Office: ONLINE\n");
-        view.push_str(&format!("{}\n", status_text));
-        view.push_str("----------------------------------------\n\n");
+        // Construct Comms Output
+        let mut console_output = String::new();
+        if self.mode == ViewMode::Comms {
+            console_output.push_str("UnaOS Virtual Office: ONLINE\n");
+            console_output.push_str(&format!("{}\n", status_text));
+            console_output.push_str("----------------------------------------\n\n");
 
-        for msg in &history {
-            view.push_str(msg);
-            view.push_str("\n\n");
+            for msg in &history {
+                console_output.push_str(msg);
+                console_output.push_str("\n\n");
+            }
+
+            let cursor = if (self.frame_count % 60) < 30 { "_" } else { " " };
+            console_output.push_str(&format!("> {}{}", self.input_buffer, cursor));
+        } else {
+            console_output = "Wolfpack Grid Active (Placeholder)".to_string();
         }
 
-        let cursor = if (self.frame_count % 60) < 30 { "_" } else { " " };
-        view.push_str(&format!("> {}{}", self.input_buffer, cursor));
+        let (nav_items, actions) = match self.mode {
+            ViewMode::Comms => (
+                vec!["General".to_string(), "Encrypted".to_string()],
+                vec!["Clear".to_string(), "Wolfpack".to_string()]
+            ),
+            ViewMode::Wolfpack => (
+                vec!["J-Series".to_string(), "S-Series".to_string()],
+                vec!["Comms".to_string(), "Sleep".to_string()]
+            ),
+        };
 
-        view
+        DashboardState {
+            mode: self.mode.clone(),
+            nav_items,
+            active_nav_index: self.active_nav_index,
+            console_output,
+            actions,
+        }
     }
 }
 
@@ -182,6 +254,8 @@ fn main() {
         input_buffer: String::new(),
         tx,
         frame_count: 0,
+        mode: ViewMode::Comms,
+        active_nav_index: 0,
     };
 
     if let Err(e) = event_loop.run(handler) {
