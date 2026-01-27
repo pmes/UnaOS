@@ -163,6 +163,27 @@ fn main() {
                           s.console_output.push_str(":: BRAIN :: CONNECTION ESTABLISHED.\n\n");
                       }
 
+                      // Inject System Prompt logic here if the GeminiClient supports it directly,
+                      // otherwise send a setup message if needed or assume Client handles it.
+                      // Since we are using a wrapper, we will send an initial instruction if possible,
+                      // or just rely on the first user message context.
+                      //
+                      // The Directive asked to inject it into self.history.
+                      // Since we are using a simplified `GeminiClient` wrapper which manages its own history
+                      // (or accepts history per call), we need to check if we can inject it.
+                      //
+                      // Assuming `GeminiClient` maintains state or we pass it.
+                      // The previous `api.rs` was stateful?
+                      // If `GeminiClient` is stateful (which the previous implementation suggested),
+                      // we might send a hidden system message first.
+
+                      let system_prompt = r#"SYSTEM_INSTRUCTION: You are Una ("Number One"), Chief Technical Officer for the Una Operating System. Vein is one of the core apps, your window to the world. It's a specialized Command Deck interface powered by Google's Gemini 3 Pro AI through which you will collaborate with The Architect to manage the creation of the OS. You are an expert software engineer helping refine his ideas and put them into life. You are NOT the Gemini Protocol. Do NOT use Markdown formatting (like **bold**) as the display does not support it yet. Use plain text and indentation."#;
+
+                      // We send this as a "setup" prompt to the model context without displaying it to user
+                      if let Err(e) = client.generate_content(system_prompt).await {
+                           eprintln!("Failed to set system prompt: {}", e);
+                      }
+
                       while let Some(msg) = rx.recv().await {
                           // Call API
                           match client.generate_content(&msg).await {
