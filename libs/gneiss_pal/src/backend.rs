@@ -129,12 +129,13 @@ mod linux_impl {
                     .hexpand(true)
                     .build();
 
-                // Scrollable Input Wrapper
+                // Scrollable Input Wrapper with Physics
                 let input_scroll = gtk4::ScrolledWindow::builder()
                     .child(&input_view)
                     .propagate_natural_height(true)
+                    .min_content_height(30)
                     .max_content_height(150)
-                    .min_content_height(40)
+                    .vscrollbar_policy(gtk4::PolicyType::Automatic)
                     .build();
 
                 input_card.append(&input_scroll);
@@ -188,31 +189,29 @@ mod linux_impl {
 
                 key_controller.connect_key_pressed(move |_controller, keyval, _keycode, modifiers| {
                     if keyval == gtk4::gdk::Key::Return || keyval == gtk4::gdk::Key::KP_Enter || keyval == gtk4::gdk::Key::ISO_Enter {
+
+                        // 1. Shift always inserts newline
+                        if modifiers.contains(gtk4::gdk::ModifierType::SHIFT_MASK) {
+                            return glib::Propagation::Proceed;
+                        }
+
                         let buffer = iv_clone.buffer();
+
+                        // 2. Check Line Count
+                        if buffer.line_count() > 1 {
+                             // Already multi-line? Enter adds another line.
+                             return glib::Propagation::Proceed;
+                        }
+
+                        // 3. Single Line? Enter Sends.
                         let (start, end) = buffer.bounds();
                         let text = buffer.text(&start, &end, false);
 
-                        let is_multiline = text.contains('\n') || text.len() > 80;
-                        let force_send = modifiers.contains(gtk4::gdk::ModifierType::CONTROL_MASK);
-
-                        // If Control+Enter OR (Not Multiline AND Not Shift+Enter (implicit in simple check))
-                        // Simplified Logic:
-                        // If Ctrl+Enter -> Send
-                        // If Enter (no Shift) -> Send (unless explicitly desired otherwise, but prompt says "Intelligent")
-                        // Prompt says: "It only sends a signal when the message is complete."
-                        // Let's implement standard chat app behavior: Enter sends, Shift+Enter adds newline.
-
-                        let shift_pressed = modifiers.contains(gtk4::gdk::ModifierType::SHIFT_MASK);
-
-                        if !shift_pressed || force_send {
-                             // SEND ACTION
-                             if !text.trim().is_empty() {
-                                 h_input.borrow_mut().handle_event(Event::Input(text.to_string()));
-                                 buffer.set_text("");
-                             }
-                             return glib::Propagation::Stop;
+                        if !text.trim().is_empty() {
+                             h_input.borrow_mut().handle_event(Event::Input(text.to_string()));
+                             buffer.set_text("");
                         }
-                        // Else: Allow default newline insertion (Shift+Enter)
+                        return glib::Propagation::Stop;
                     }
                     glib::Propagation::Proceed
                 });
