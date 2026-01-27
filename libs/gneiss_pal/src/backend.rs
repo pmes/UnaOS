@@ -46,7 +46,7 @@ mod linux_impl {
                 // 1. THE WINDOW (Adwaita)
                 let window = adw::ApplicationWindow::builder()
                     .application(app)
-                    .title("UnaOS :: Vein") // Updated Title
+                    .title("VEIN :: UPDATED VERSION") // LOUD TEST
                     .default_width(1200)
                     .default_height(800)
                     .build();
