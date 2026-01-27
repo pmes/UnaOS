@@ -7,8 +7,6 @@ use gtk4::{
 use std::rc::Rc;
 use glib::clone;
 
-// DIRECTIVE: UPDATE IDENTITY
-// We establish the namespace 'org.unaos.vein' to claim our territory in the OS.
 const APP_ID: &str = "org.unaos.vein";
 const BUFFER_LIMIT: i32 = 50;
 
@@ -40,7 +38,9 @@ fn build_ui(app: &Application) {
     rooms_list.append(&make_sidebar_row("General", true));
     rooms_list.append(&make_sidebar_row("Encrypted", false));
     rooms_list.append(&make_sidebar_row("Jules (Private)", false));
-    sidebar_stack.add_named(&rooms_list, "rooms");
+
+    // FIX 1: Wrap string in Some()
+    sidebar_stack.add_named(&rooms_list, Some("rooms"));
 
     // PANEL B: Shard Status
     let status_box = Box::new(Orientation::Vertical, 10);
@@ -53,7 +53,8 @@ fn build_ui(app: &Application) {
     status_box.append(&make_status_row("Vein (Cloud)", "🟡 Building..."));
     status_box.append(&make_status_row("Jules", "🔵 Thinking"));
 
-    sidebar_stack.add_named(&status_box, "status");
+    // FIX 1: Wrap string in Some()
+    sidebar_stack.add_named(&status_box, Some("status"));
 
     // THE DOCK
     let bottom_dock = Box::new(Orientation::Horizontal, 5);
@@ -87,7 +88,6 @@ fn build_ui(app: &Application) {
 
     // The Header
     let header = HeaderBar::new();
-    // UPDATED TITLE to reflect UnaOS Identity
     let title = WindowTitle::new("Vein", "UnaOS Control Node");
     header.set_title_widget(Some(&title));
     main_box.append(&header);
@@ -98,7 +98,13 @@ fn build_ui(app: &Application) {
         .build();
 
     let chat_box = Box::new(Orientation::Vertical, 10);
-    chat_box.set_margin_all(20);
+
+    // FIX 2: Explicit Margins (set_margin_all does not exist)
+    chat_box.set_margin_top(20);
+    chat_box.set_margin_bottom(20);
+    chat_box.set_margin_start(20);
+    chat_box.set_margin_end(20);
+
     chat_box.set_valign(Align::End);
 
     // Initial Wake-Up Messages
@@ -136,7 +142,13 @@ fn build_ui(app: &Application) {
 
     // --- INPUT AREA ---
     let input_box = Box::new(Orientation::Horizontal, 10);
-    input_box.set_margin_all(10);
+
+    // FIX 2: Explicit Margins
+    input_box.set_margin_top(10);
+    input_box.set_margin_bottom(10);
+    input_box.set_margin_start(10);
+    input_box.set_margin_end(10);
+
     input_box.add_css_class("linked");
 
     let input_entry = gtk4::Entry::builder().placeholder_text("Enter Directive...").hexpand(true).build();
@@ -183,7 +195,13 @@ fn build_ui(app: &Application) {
 
 fn make_sidebar_row(name: &str, active: bool) -> Box {
     let row = Box::new(Orientation::Horizontal, 10);
-    row.set_margin_all(10);
+
+    // FIX 2: Explicit Margins
+    row.set_margin_top(10);
+    row.set_margin_bottom(10);
+    row.set_margin_start(10);
+    row.set_margin_end(10);
+
     let label = Label::new(Some(name));
     row.append(&label);
 
@@ -196,7 +214,13 @@ fn make_sidebar_row(name: &str, active: bool) -> Box {
 
 fn make_status_row(shard: &str, status: &str) -> Box {
     let row = Box::new(Orientation::Horizontal, 10);
-    row.set_margin_all(5);
+
+    // FIX 2: Explicit Margins
+    row.set_margin_top(5);
+    row.set_margin_bottom(5);
+    row.set_margin_start(5);
+    row.set_margin_end(5);
+
     let l1 = Label::builder().label(shard).hexpand(true).xalign(0.0).build();
     let l2 = Label::new(Some(status));
     row.append(&l1);
