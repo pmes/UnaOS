@@ -52,15 +52,17 @@ mod linux_impl {
                     .default_height(600)
                     .build();
 
-                let header_bar = gtk4::HeaderBar::new();
-                window.set_titlebar(Some(&header_bar));
+                let toolbar_view = adw::ToolbarView::new();
+                let header_bar = adw::HeaderBar::new();
+                toolbar_view.add_top_bar(&header_bar);
 
                 let text_view = gtk4::TextView::builder()
                     .editable(false)
                     .build();
                 text_view.buffer().set_text("System Check: Native GTK Widgets Active.");
 
-                window.set_content(Some(&text_view));
+                toolbar_view.set_content(Some(&text_view));
+                window.set_content(Some(&toolbar_view));
                 window.present();
             });
 
