@@ -7,14 +7,15 @@ struct GenerateContentRequest {
     contents: Vec<Content>,
 }
 
-#[derive(Serialize)]
-struct Content {
-    parts: Vec<Part>,
+#[derive(Serialize, Clone, Debug)]
+pub struct Content {
+    pub role: String,
+    pub parts: Vec<Part>,
 }
 
-#[derive(Serialize)]
-struct Part {
-    text: String,
+#[derive(Serialize, Clone, Debug)]
+pub struct Part {
+    pub text: String,
 }
 
 #[derive(Deserialize, Debug)]
@@ -51,18 +52,14 @@ impl GeminiClient {
         })
     }
 
-    pub async fn generate_content(&self, prompt: &str) -> Result<String, String> {
+    pub async fn generate_content(&self, history: &[Content]) -> Result<String, String> {
         let url = format!(
             "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={}",
             self.api_key
         );
 
         let request_body = GenerateContentRequest {
-            contents: vec![Content {
-                parts: vec![Part {
-                    text: prompt.to_string(),
-                }],
-            }],
+            contents: history.to_vec(),
         };
 
         let response = self.client
@@ -104,13 +101,14 @@ mod tests {
     fn test_request_serialization() {
         let request = GenerateContentRequest {
             contents: vec![Content {
+                role: "user".to_string(),
                 parts: vec![Part {
                     text: "Hello".to_string(),
                 }],
             }],
         };
         let json = serde_json::to_string(&request).unwrap();
-        assert_eq!(json, r#"{"contents":[{"parts":[{"text":"Hello"}]}]}"#);
+        assert_eq!(json, r#"{"contents":[{"role":"user","parts":[{"text":"Hello"}]}]}"#);
     }
 
     #[test]
