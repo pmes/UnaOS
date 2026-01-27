@@ -21,9 +21,12 @@ pub enum Event {
     KeyDown(KeyCode),
     Char(char),
     Mouse { x: i32, y: i32 },
-    Nav(usize),
-    Action(usize),
-    Input(String),
+
+    // Command Deck Events
+    Input(String),         // The "Intelligent" full message
+    TemplateAction(usize), // Clicking a button in the Right Pane
+    NavSelect(usize),      // Clicking a row in the Left Pane
+
     None,
     Unknown,
 }
@@ -86,7 +89,7 @@ pub mod backend;
 pub mod text;
 
 #[cfg(feature = "std")]
-pub use backend::EventLoop;
+pub use backend::Backend; // Renamed from EventLoop in "The Great Evolution"
 
 // Compatibility alias if needed, though vein uses EventLoop now.
 #[cfg(feature = "std")]
