@@ -7,7 +7,7 @@ use tokio::sync::mpsc;
 use dotenvy::dotenv;
 
 mod api;
-use api::GeminiClient;
+use api::{GeminiClient, Content, Part};
 
 // Shared State between UI (Sync) and Backend (Async)
 struct State {
@@ -151,9 +151,13 @@ fn main() {
     } else {
          console_output.push_str(":: MEMORY :: LONG-TERM STORAGE RESTORED\n\n");
          for msg in &saved_history {
-             let prefix = if msg.role == "user" { "[YOU]" } else { "[WOLFPACK]" };
-             console_output.push_str(&format!("{} > {}\n", prefix, msg.content));
+             // Only display relevant messages (skip system instructions if they somehow got saved)
+             if !msg.content.starts_with("SYSTEM_INSTRUCTION") {
+                 let prefix = if msg.role == "user" { "[YOU]" } else { "[WOLFPACK]" };
+                 console_output.push_str(&format!("{} > {}\n", prefix, msg.content));
+             }
          }
+         println!("DEBUG: Restored {} items to history context.", saved_history.len());
     }
 
     // Shared State
@@ -188,21 +192,45 @@ fn main() {
                           s.console_output.push_str(":: BRAIN :: CONNECTION ESTABLISHED.\n\n");
                       }
 
-                      let system_prompt = r#"SYSTEM_INSTRUCTION: You are Una ("Number One"), Chief Technical Officer for the Una Operating System. Vein is one of the core apps, your window to the world. It's a specialized Command Deck interface powered by Google's Gemini 3 Pro AI through which you will collaborate with The Architect to manage the creation of the OS. You are an expert software engineer helping refine his ideas and put them into life. You are NOT the Gemini Protocol. Do NOT use Markdown formatting (like **bold**) as the display does not support it yet. Use plain text and indentation."#;
+                      while let Some(_msg) = rx.recv().await {
+                          // Note: `msg` is already in `chat_history`. We use the full history for context.
 
-                      if let Err(e) = client.generate_content(system_prompt).await {
-                           eprintln!("Failed to set system prompt: {}", e);
-                      }
-
-                      while let Some(msg) = rx.recv().await {
                           // SAVE POINT 1: User message has been added by UI thread. Save it now.
                           {
                               let s = state_bg.lock().unwrap();
                               brain_bg.save(&s.chat_history);
                           }
 
-                          // Call API
-                          match client.generate_content(&msg).await {
+                          // 1. Build Context for Neural Pathways
+                          let mut context = Vec::new();
+
+                          // 1a. The Anchor (Always fresh System Prompt)
+                          let system_instruction = r#"SYSTEM_INSTRUCTION: You are Una ("Number One"), Chief Technical Officer for the Una Operating System. Vein is one of the core apps, your window to the world. It's a specialized Command Deck interface powered by Google's Gemini 3 Pro AI through which you will collaborate with The Architect to manage the creation of the OS. You are an expert software engineer helping refine his ideas and put them into life. You are NOT the Gemini Protocol. Do NOT use Markdown formatting (like **bold**) as the display does not support it yet. Use plain text and indentation."#;
+
+                          context.push(Content {
+                              role: "model".to_string(), // Using "model" as the Anchor
+                              parts: vec![Part { text: system_instruction.to_string() }]
+                          });
+
+                          // 1b. The Memories (From persistent storage)
+                          let history_snapshot = {
+                              let s = state_bg.lock().unwrap();
+                              s.chat_history.clone()
+                          };
+
+                          for saved in history_snapshot {
+                              // Filter out any stale system instructions
+                              if saved.content.starts_with("SYSTEM_INSTRUCTION") {
+                                  continue;
+                              }
+                              context.push(Content {
+                                  role: saved.role.clone(),
+                                  parts: vec![Part { text: saved.content.clone() }]
+                              });
+                          }
+
+                          // Call API with full context
+                          match client.generate_content(&context).await {
                               Ok(response) => {
                                   let mut s = state_bg.lock().unwrap();
                                   s.console_output.push_str(&format!("\n[WOLFPACK] :: {}\n", response));
