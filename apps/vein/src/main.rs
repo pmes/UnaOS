@@ -1,4 +1,4 @@
-use gneiss_pal::{EventLoop, AppHandler, Event, DashboardState, ViewMode};
+use gneiss_pal::{Backend, AppHandler, Event, DashboardState, ViewMode};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use tokio::runtime::Runtime;
@@ -8,242 +8,187 @@ use dotenvy::dotenv;
 mod api;
 use api::GeminiClient;
 
+// Shared State between UI (Sync) and Backend (Async)
 struct State {
-    status_text: String,
-    #[allow(dead_code)]
-    network_initialized: bool,
-    chat_history: Vec<String>,
+    console_output: String,
+    mode: ViewMode,
+    nav_index: usize,
+    history: Vec<String>, // Keeping local history for quick display
 }
 
 struct VeinApp {
     state: Arc<Mutex<State>>,
     tx: mpsc::UnboundedSender<String>,
-    // Local UI State
-    mode: ViewMode,
-    active_nav_index: usize,
+}
+
+impl VeinApp {
+    fn new(tx: mpsc::UnboundedSender<String>, state: Arc<Mutex<State>>) -> Self {
+        Self { state, tx }
+    }
 }
 
 impl AppHandler for VeinApp {
     fn handle_event(&mut self, event: Event) {
         match event {
             Event::Input(text) => {
-                // Command Handling (Client-side)
-                if text.trim() == "/wolf" {
-                    self.mode = ViewMode::Wolfpack;
-                    self.active_nav_index = 0; // Reset nav
-                    {
-                         let mut s = self.state.lock().unwrap();
-                         s.chat_history.push("[SYS] :: Switching to Wolfpack Grid...".to_string());
-                    }
-                    return;
-                } else if text.trim() == "/comms" {
-                    self.mode = ViewMode::Comms;
-                    self.active_nav_index = 0;
-                    {
-                         let mut s = self.state.lock().unwrap();
-                         s.chat_history.push("[SYS] :: Secure Comms Established.".to_string());
-                    }
-                    return;
-                }
-
-                // Normal Message Handling
+                // UI Thread Update (Instant Feedback)
                 {
                     let mut s = self.state.lock().unwrap();
-                    s.chat_history.push(format!("[YOU] > {}", text));
-                    // Keep history manageable
-                    if s.chat_history.len() > 50 {
-                        s.chat_history.remove(0);
-                    }
+                    s.console_output.push_str(&format!("\n[YOU] > {}\n", text));
+                    s.history.push(format!("[YOU] > {}", text));
                 }
 
-                // Send to background Async Core
+                // Command Handling (Client-side immediate)
+                if text.trim() == "/wolf" {
+                    let mut s = self.state.lock().unwrap();
+                    s.mode = ViewMode::Wolfpack;
+                    s.console_output.push_str("\n[SYSTEM] :: Switching to Wolfpack Grid...\n");
+                    return;
+                } else if text.trim() == "/comms" {
+                    let mut s = self.state.lock().unwrap();
+                    s.mode = ViewMode::Comms;
+                    s.console_output.push_str("\n[SYSTEM] :: Secure Comms Established.\n");
+                    return;
+                } else if text.trim() == "/clear" {
+                     let mut s = self.state.lock().unwrap();
+                     s.console_output.clear();
+                     s.console_output.push_str(":: VEIN :: SYSTEM CLEARED\n\n");
+                     return;
+                }
+
+                // Send to Async Core
                 if let Err(e) = self.tx.send(text) {
-                    eprintln!("Failed to send message: {}", e);
+                     let mut s = self.state.lock().unwrap();
+                     s.console_output.push_str(&format!("\n[SYSTEM ERROR] :: Failed to send: {}\n", e));
                 }
             }
-            Event::Nav(index) => {
-                self.active_nav_index = index;
-            }
-            Event::Action(index) => {
-                match self.mode {
-                    ViewMode::Comms => {
-                        match index {
-                            0 => { // Clear
-                                self.state.lock().unwrap().chat_history.clear();
-                            }
-                            1 => { // Save Log (Placeholder)
-                                let mut s = self.state.lock().unwrap();
-                                s.chat_history.push("[SYS] :: Log saved to secure storage.".to_string());
-                            }
-                            _ => {}
+            Event::TemplateAction(idx) => {
+                match idx {
+                    0 => { // Clear / Deploy J1
+                        let mut s = self.state.lock().unwrap();
+                        if s.mode == ViewMode::Comms {
+                            s.console_output.clear();
+                            s.console_output.push_str(":: VEIN :: SYSTEM CLEARED\n\n");
+                        } else {
+                            s.console_output.push_str("\n[WOLFPACK] :: Deploying J-Series Unit...\n");
                         }
                     }
-                    ViewMode::Wolfpack => {
-                        match index {
-                            0 => { // Deploy J1
-                                let mut s = self.state.lock().unwrap();
-                                s.status_text = "Deploying J-Series Unit...".to_string();
-                            }
-                            1 => { // Sleep All
-                                let mut s = self.state.lock().unwrap();
-                                s.status_text = "Wolfpack Units Entering Sleep Mode.".to_string();
-                            }
-                            _ => {}
+                    1 => { // Wolfpack View / Deploy S5
+                        let mut s = self.state.lock().unwrap();
+                        if s.mode == ViewMode::Comms {
+                            s.mode = ViewMode::Wolfpack;
+                            s.console_output.push_str("\n[SYSTEM] :: Switching to Wolfpack Grid...\n");
+                        } else {
+                            s.console_output.push_str("\n[WOLFPACK] :: Deploying S-Series Unit...\n");
                         }
                     }
+                    2 => { // Back to Comms
+                         let mut s = self.state.lock().unwrap();
+                         if s.mode == ViewMode::Wolfpack {
+                             s.mode = ViewMode::Comms;
+                             s.console_output.push_str("\n[SYSTEM] :: Returning to Comms.\n");
+                         }
+                    }
+                    _ => {}
                 }
+            }
+            Event::NavSelect(idx) => {
+                let mut s = self.state.lock().unwrap();
+                s.nav_index = idx;
+                // Channel switching logic could go here
             }
             _ => {}
         }
     }
 
     fn view(&self) -> DashboardState {
-        // Grab state snapshot
-        let (status_text, history) = {
-            let s = self.state.lock().unwrap();
-            (s.status_text.clone(), s.chat_history.clone())
-        };
-
-        // Construct Console Output
-        let mut console_output = String::new();
-        if self.mode == ViewMode::Comms {
-            console_output.push_str("UnaOS Virtual Office: ONLINE\n");
-            console_output.push_str(&format!("{}\n", status_text));
-            console_output.push_str("----------------------------------------\n\n");
-
-            for msg in &history {
-                console_output.push_str(msg);
-                console_output.push_str("\n\n");
-            }
-        } else {
-            console_output.push_str("Wolfpack Grid Active\n");
-            console_output.push_str(&format!("Status: {}\n", status_text));
-        }
-
-        let (nav_items, actions) = match self.mode {
-            ViewMode::Comms => (
-                vec!["General".to_string(), "Encrypted".to_string()],
-                vec!["Clear".to_string(), "Save Log".to_string()]
-            ),
-            ViewMode::Wolfpack => (
-                vec!["J-Series".to_string(), "S-Series".to_string()],
-                vec!["Deploy J1".to_string(), "Sleep All".to_string()]
-            ),
-        };
+        let s = self.state.lock().unwrap();
 
         DashboardState {
-            mode: self.mode.clone(),
-            nav_items,
-            active_nav_index: self.active_nav_index,
-            console_output,
-            actions,
+            mode: s.mode.clone(),
+            nav_items: vec![
+                "General".into(),
+                "Encrypted".into(),
+                "Jules (Private)".into()
+            ],
+            active_nav_index: s.nav_index,
+            console_output: s.console_output.clone(),
+            actions: match s.mode {
+                ViewMode::Comms => vec![
+                    "Clear Buffer".into(),
+                    "Wolfpack View".into()
+                ],
+                ViewMode::Wolfpack => vec![
+                    "Deploy J1".into(),
+                    "Deploy S5".into(),
+                    "Back to Comms".into()
+                ],
+            },
         }
     }
 }
 
 fn main() {
-    // Load environment variables
     dotenv().ok();
-
-    println!(":: VEIN :: Booting...");
+    println!(":: VEIN :: Booting (The Great Evolution)...");
 
     // Shared State
     let state = Arc::new(Mutex::new(State {
-        status_text: "Initializing Network Stack...".to_string(),
-        network_initialized: false,
-        chat_history: Vec::new(),
+        console_output: ":: VEIN :: SYSTEM ONLINE (UNLIMITED TIER)\n:: ENGINE: GEMINI-3-PRO\n\n".to_string(),
+        mode: ViewMode::Comms,
+        nav_index: 0,
+        history: Vec::new(),
     }));
 
+    // Communication Channels
+    // UI -> Async
     let (tx, mut rx) = mpsc::unbounded_channel::<String>();
-    let state_for_bg = state.clone();
 
-    // Spawn Background Async Runtime
+    // Background Thread (The Brain)
+    let state_bg = state.clone();
     thread::spawn(move || {
         let rt = Runtime::new().expect("Failed to create Tokio Runtime");
-
         rt.block_on(async {
-            println!(":: VEIN :: Async Core Starting...");
+             println!(":: VEIN :: Brain Connecting...");
 
-            // Initialize Gemini Client
-            let client_option = match GeminiClient::new() {
-                Ok(client) => Some(client),
-                Err(e) => {
-                    let mut s = state_for_bg.lock().unwrap();
-                    s.status_text = format!("Config Error: {}", e);
-                    s.network_initialized = true;
-                    eprintln!(":: VEIN :: Config Error: {}", e);
-                    None
-                }
-            };
+             // Initialize Client
+             // Note: In "The Great Evolution", we assume the client is configured via env
+             // and supports the "gemini-3-pro" string if available, or we fall back.
+             let client_res = GeminiClient::new(); // Existing wrapper
 
-            // Initial System Check (only if client exists)
-            if let Some(client) = &client_option {
-                 // Simulate startup delay
-                 tokio::time::sleep(tokio::time::Duration::from_millis(1500)).await;
+             match client_res {
+                 Ok(client) => {
+                      {
+                          let mut s = state_bg.lock().unwrap();
+                          s.console_output.push_str(":: BRAIN :: CONNECTION ESTABLISHED.\n\n");
+                      }
 
-                 println!(":: VEIN :: Connecting to Synapse...");
-                 match client.generate_content("Hello, I am Vein. System check.").await {
-                     Ok(response) => {
-                         let mut s = state_for_bg.lock().unwrap();
-                         s.chat_history.push(format!("[SYS] :: System: {}", response));
-                         s.status_text = "System Online".to_string();
-                         s.network_initialized = true;
-                         println!(":: VEIN :: Synapse Connection Established.");
-                     }
-                     Err(e) => {
-                         let mut s = state_for_bg.lock().unwrap();
-                         s.status_text = format!("Connection Failed: {}", e);
-                         s.network_initialized = true;
-                         eprintln!(":: VEIN :: Synapse Connection Failed: {}", e);
-                     }
+                      while let Some(msg) = rx.recv().await {
+                          // Call API
+                          match client.generate_content(&msg).await {
+                              Ok(response) => {
+                                  let mut s = state_bg.lock().unwrap();
+                                  s.console_output.push_str(&format!("\n[WOLFPACK] :: {}\n", response));
+                              }
+                              Err(e) => {
+                                  let mut s = state_bg.lock().unwrap();
+                                  s.console_output.push_str(&format!("\n[SYSTEM ERROR] :: {}\n", e));
+                              }
+                          }
+                      }
                  }
-            }
-
-            // Message Loop
-            if let Some(client) = &client_option {
-                while let Some(msg) = rx.recv().await {
-                    match client.generate_content(&msg).await {
-                         Ok(response) => {
-                             let mut s = state_for_bg.lock().unwrap();
-                             s.chat_history.push(format!("[SYS] :: {}", response));
-                             if s.chat_history.len() > 50 {
-                                 s.chat_history.remove(0);
-                             }
-                         }
-                         Err(e) => {
-                             let mut s = state_for_bg.lock().unwrap();
-                             s.chat_history.push(format!("[SYS] :: Error: {}", e));
-                             if s.chat_history.len() > 50 {
-                                 s.chat_history.remove(0);
-                             }
-                         }
-                    }
-                }
-            } else {
-                 // If no client, we can't do anything but maybe log errors
-                 while let Some(_) = rx.recv().await {
-                      state_for_bg.lock().unwrap().chat_history.push("[SYS] :: System Error: AI Config Missing".to_string());
+                 Err(e) => {
+                      let mut s = state_bg.lock().unwrap();
+                      s.console_output.push_str(&format!(":: FATAL :: Brain Error: {}\n", e));
                  }
-            }
+             }
         });
     });
 
-    // Start UI
-    println!(":: VEIN :: Initializing Graphical Interface...");
+    // Start UI (The Body)
+    println!(":: VEIN :: Engaging Chassis...");
+    let app = VeinApp::new(tx, state);
 
-    // NEW: Use EventLoop instead of WaylandApp
-    let event_loop = EventLoop::new();
-
-    let handler = VeinApp {
-        state,
-        tx,
-        mode: ViewMode::Comms,
-        active_nav_index: 0,
-    };
-
-    if let Err(e) = event_loop.run(handler) {
-        eprintln!(":: VEIN CRASH :: {}", e);
-    }
-
-    println!(":: VEIN :: Shutdown.");
+    // "org.unaos.vein"
+    Backend::new("org.unaos.vein", app);
 }
