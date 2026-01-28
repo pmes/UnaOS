@@ -273,8 +273,11 @@ fn main() {
                         s.console_output.push_str(":: BRAIN :: CONNECTION ESTABLISHED.\n\n");
                     }
 
-                    while let Some(_msg) = rx.recv().await {
-                        // User input received. Trigger a save via the actor.
+                    while let Some(msg) = rx.recv().await {
+                        println!("DEBUG: Processing input: '{}'", msg); // <--- LOG 1: Confirm Input Receipt
+
+                        // 2. PERSIST (Async - Fire and Forget)
+                        // Note: User message is already added to state in handle_event (UI thread).
                         {
                             let s = state_bg.lock().unwrap();
                             // Clone history while holding lock (fast memory copy)
@@ -306,18 +309,26 @@ fn main() {
                             });
                         }
 
+                        // 3. CALL API (The Thinking Part)
+                        println!("DEBUG: Sending request to Gemini..."); // <--- LOG 2: Confirm API Call
+
                         match client.generate_content(&context).await {
                             Ok(response) => {
+                                println!("DEBUG: Response received."); // <--- LOG 3: Confirm Success
+
+                                // 4. UPDATE UI WITH RESPONSE
                                 let mut s = state_bg.lock().unwrap();
                                 s.console_output.push_str(&format!("\n[UNA] :: {}\n", response));
                                 s.chat_history.push(SavedMessage {
                                     role: "model".to_string(),
                                     content: response.clone(),
                                 });
-                                // Trigger save again for the response
+
+                                // 5. PERSIST RESPONSE (Async)
                                 let _ = save_tx.send(s.chat_history.clone());
                             }
                             Err(e) => {
+                                println!("ERROR: Gemini API Failed: {:?}", e);
                                 let mut s = state_bg.lock().unwrap();
                                 s.console_output.push_str(&format!("\n[SYSTEM ERROR] :: {}\n", e));
                                 error!("Gemini API interaction failed: {}", e);
