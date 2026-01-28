@@ -10,9 +10,8 @@ use std::thread;
 use std::sync::mpsc::channel;
 use tokio::runtime::Runtime;
 use tokio::sync::mpsc;
-use log::{info, error};
-use std::time::Instant;
-use std::io::Write;
+use log::info; // Removed unused error
+// Removed unused std::io::Write
 use std::rc::Rc;
 
 mod api;
@@ -38,7 +37,7 @@ fn build_ui(
     app: &Application,
     state: Arc<Mutex<State>>,
     logic_tx: mpsc::UnboundedSender<String>,
-    ui_rx: glib::Receiver<UiEvent>
+    ui_rx: async_channel::Receiver<UiEvent> // Switched to async_channel
 ) {
     let window = ApplicationWindow::builder()
         .application(app)
@@ -105,6 +104,7 @@ fn build_ui(
 
     let main_context = MainContext::default();
     main_context.spawn_local(async move {
+        // Use async_channel recv in async block
         while let Ok(event) = ui_rx.recv().await {
             match event {
                 UiEvent::AppendText(text) => {
@@ -154,7 +154,8 @@ fn main() {
 
     // 2. State & Channels
     // UI Event Channel: Threads -> UI
-    let (ui_tx, ui_rx) = MainContext::channel(glib::Priority::DEFAULT);
+    // Switched to async_channel to support MainContext::spawn_local properly without Sender/Receiver type confusion
+    let (ui_tx, ui_rx) = async_channel::unbounded::<UiEvent>();
 
     // Logic Channel: UI -> Tokio
     let (logic_tx, mut logic_rx) = mpsc::unbounded_channel::<String>();
@@ -192,8 +193,8 @@ fn main() {
             should_save = snapshot.len() > loaded.len();
         }
 
-        // Notify UI
-        let _ = ui_tx_loader.send(UiEvent::LoadedHistory(loaded));
+        // Notify UI (async_channel send is async, but we are in a thread. block_on or use send_blocking)
+        let _ = ui_tx_loader.send_blocking(UiEvent::LoadedHistory(loaded));
 
         // If user typed during load, we missed the save in the Logic Loop (because !history_loaded).
         // Trigger it now.
@@ -212,13 +213,13 @@ fn main() {
         rt.block_on(async {
             let client_res = GeminiClient::new();
             if let Ok(client) = client_res {
-                let _ = ui_tx_bg.send(UiEvent::AppendText(":: BRAIN :: CONNECTION ESTABLISHED.\n\n".into()));
+                let _ = ui_tx_bg.send(UiEvent::AppendText(":: BRAIN :: CONNECTION ESTABLISHED.\n\n".into())).await;
 
                 while let Some(msg) = logic_rx.recv().await {
                     println!("DEBUG: Processing input: '{}'", msg);
 
                     // 1. Update UI (Immediate Echo)
-                    let _ = ui_tx_bg.send(UiEvent::AppendText(format!("\n[ARCHITECT] > {}\n", msg)));
+                    let _ = ui_tx_bg.send(UiEvent::AppendText(format!("\n[ARCHITECT] > {}\n", msg))).await;
 
                     // 2. Persist User Msg
                     let mut history_snapshot;
@@ -254,7 +255,7 @@ fn main() {
                     match client.generate_content(&context).await {
                         Ok(response) => {
                              // 4. Update UI (Response)
-                             let _ = ui_tx_bg.send(UiEvent::AppendText(format!("\n[UNA] :: {}\n", response)));
+                             let _ = ui_tx_bg.send(UiEvent::AppendText(format!("\n[UNA] :: {}\n", response))).await;
 
                              // 5. Persist Response
                              let loaded_res;
@@ -273,12 +274,12 @@ fn main() {
                              }
                         }
                         Err(e) => {
-                            let _ = ui_tx_bg.send(UiEvent::AppendText(format!("\n[SYSTEM ERROR] :: {}\n", e)));
+                            let _ = ui_tx_bg.send(UiEvent::AppendText(format!("\n[SYSTEM ERROR] :: {}\n", e))).await;
                         }
                     }
                 }
             } else {
-                 let _ = ui_tx_bg.send(UiEvent::AppendText(":: FATAL :: Brain Error: Connection Failed.\n".into()));
+                 let _ = ui_tx_bg.send(UiEvent::AppendText(":: FATAL :: Brain Error: Connection Failed.\n".into())).await;
             }
         });
     });
