@@ -10,9 +10,9 @@ use std::thread;
 use std::sync::mpsc::channel;
 use tokio::runtime::Runtime;
 use tokio::sync::mpsc;
-use log::info; // Removed unused error
-// Removed unused std::io::Write
+use log::info;
 use std::rc::Rc;
+use std::time::Instant; // Added Import
 
 mod api;
 use api::{Content, GeminiClient, Part};
@@ -35,9 +35,9 @@ const APP_ID: &str = "org.unaos.vein.evolution";
 
 fn build_ui(
     app: &Application,
-    state: Arc<Mutex<State>>,
+    _state: Arc<Mutex<State>>, // Renamed unused variable
     logic_tx: mpsc::UnboundedSender<String>,
-    ui_rx: async_channel::Receiver<UiEvent> // Switched to async_channel
+    ui_rx: async_channel::Receiver<UiEvent>
 ) {
     let window = ApplicationWindow::builder()
         .application(app)
@@ -97,7 +97,7 @@ fn build_ui(
     window.set_child(Some(&main_box));
 
     // --- Signal Handling (The bridge from threads to UI) ---
-    let state_clone = state.clone();
+    // Removed unused state_clone
 
     // Use spawn_local to handle UI updates on the main thread without Send requirement for Rc<ScrollableText>
     let log_view_rc = log_view.clone();
