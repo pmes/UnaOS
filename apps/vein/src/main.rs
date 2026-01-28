@@ -1,9 +1,9 @@
 use dotenvy::dotenv;
 use gneiss_pal::persistence::{BrainManager, SavedMessage};
-// We rely on gneiss_pal for Persistence only now.
-// UI is handled natively by GTK4.
+// Use the new Gneiss PAL Widget abstraction
+use gneiss_pal::widgets::ScrollableText;
 use gtk4::prelude::*;
-use gtk4::{Application, ApplicationWindow, ScrolledWindow, TextView, TextBuffer, PolicyType, WrapMode};
+use gtk4::{Application, ApplicationWindow, TextView, TextBuffer, WrapMode};
 use glib::MainContext;
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -13,6 +13,7 @@ use tokio::sync::mpsc;
 use log::{info, error};
 use std::time::Instant;
 use std::io::Write;
+use std::rc::Rc;
 
 mod api;
 use api::{Content, GeminiClient, Part};
@@ -22,6 +23,7 @@ struct State {
     console_output: String, // Kept for consistency/persistence if needed, but UI uses Buffer
     // ViewMode, NavIndex etc are UI state, now handled by GTK widgets or local variables
     chat_history: Vec<SavedMessage>,
+    history_loaded: bool, // Prevent overwriting history file before load completes
 }
 
 // UI Event Enum for signaling main thread from background
@@ -45,33 +47,12 @@ fn build_ui(
         .default_height(600)
         .build();
 
-    // 1. The Controller: Handles the scrolling logic
-    let scrolled_window = ScrolledWindow::builder()
-        .hscrollbar_policy(PolicyType::Never)
-        .vscrollbar_policy(PolicyType::Automatic)
-        .vexpand(true)
-        .hexpand(true)
-        .build();
+    // 1. The Controller/View Wrapper (PAL)
+    // We wrap it in Rc to share with the local spawn closure
+    let log_view = Rc::new(ScrollableText::new());
+    log_view.set_content(":: VEIN :: SYSTEM ONLINE (UNLIMITED TIER)\n:: ENGINE: GEMINI-3-PRO\n\n");
 
-    // 2. The Model: TextBuffer
-    let buffer = TextBuffer::new(None);
-    buffer.set_text(":: VEIN :: SYSTEM ONLINE (UNLIMITED TIER)\n:: ENGINE: GEMINI-3-PRO\n\n");
-
-    // 3. The View: Displays only what fits on screen
-    let text_view = TextView::builder()
-        .buffer(&buffer)
-        .editable(false)
-        .monospace(true)
-        .wrap_mode(WrapMode::WordChar)
-        .left_margin(10)
-        .right_margin(10)
-        .top_margin(10)
-        .bottom_margin(10)
-        .build();
-
-    scrolled_window.set_child(Some(&text_view));
-
-    // Input Area
+    // Input Area (Keep this specific for now as it handles special key events)
     let input_box = gtk4::Box::new(gtk4::Orientation::Horizontal, 0);
     input_box.add_css_class("linked");
 
@@ -109,69 +90,45 @@ fn build_ui(
 
     // Layout
     let main_box = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
-    main_box.append(&scrolled_window);
+    // Use container exposed by PAL
+    main_box.append(&log_view.container);
     main_box.append(&gtk4::Separator::new(gtk4::Orientation::Horizontal));
     main_box.append(&input_box);
 
     window.set_child(Some(&main_box));
 
     // --- Signal Handling (The bridge from threads to UI) ---
-    // We attach the receiver to the main context (UI thread)
-    let buffer_clone = buffer.clone();
     let state_clone = state.clone();
-    let text_view_clone = text_view.clone();
 
-    ui_rx.attach(None, move |event| {
-        match event {
-            UiEvent::AppendText(text) => {
-                let mut end = buffer_clone.end_iter();
-                buffer_clone.insert(&mut end, &text);
+    // Use spawn_local to handle UI updates on the main thread without Send requirement for Rc<ScrollableText>
+    let log_view_rc = log_view.clone();
 
-                // Auto-scroll
-                let mark = buffer_clone.create_mark(None, &buffer_clone.end_iter(), false);
-                text_view_clone.scroll_to_mark(&mark, 0.0, false, 0.0, 1.0);
-            }
-            UiEvent::LoadedHistory(history) => {
-                 let mut s = state_clone.lock().unwrap();
-                 // Merge history logic (simpler here: just prepend visual, logic already handled in loader thread if we were using the old way.
-                 // But wait, we moved logic ownership to MainContext? No, logic is in threads.)
+    let main_context = MainContext::default();
+    main_context.spawn_local(async move {
+        while let Ok(event) = ui_rx.recv().await {
+            match event {
+                UiEvent::AppendText(text) => {
+                    log_view_rc.append_content(&text);
+                }
+                UiEvent::LoadedHistory(history) => {
+                     // Note: Logic state is already updated by loader thread.
+                     // Here we just update the Visual state.
 
-                 // Display history
-                 let mut full_text = String::new();
-                 full_text.push_str(":: MEMORY :: LONG-TERM STORAGE RESTORED\n\n");
-                 for msg in &history {
-                     if !msg.content.starts_with("SYSTEM_INSTRUCTION") {
-                        let prefix = if msg.role == "user" { "[ARCHITECT]" } else { "[UNA]" };
-                        full_text.push_str(&format!("{} > {}\n", prefix, msg.content));
+                     // Display history
+                     let mut full_text = String::new();
+                     full_text.push_str(":: MEMORY :: LONG-TERM STORAGE RESTORED\n\n");
+                     for msg in &history {
+                         if !msg.content.starts_with("SYSTEM_INSTRUCTION") {
+                            let prefix = if msg.role == "user" { "[ARCHITECT]" } else { "[UNA]" };
+                            full_text.push_str(&format!("{} > {}\n", prefix, msg.content));
+                         }
                      }
-                 }
 
-                 // Prepend? Standard TextBuffer doesn't handle prepend easily while preserving scroll,
-                 // but typically we load history once at start.
-                 // For now, let's just Insert at Start (after the header).
-                 // Actually, "LoadedHistory" event comes from Loader.
-
-                 // We can just dump it.
-                 let mut start = buffer_clone.start_iter();
-                 // Skip the initial "SYSTEM ONLINE" header if we want, or just append.
-                 // Let's just append to the end for simplicity, assuming this happens fast.
-                 // OR, strictly follows:
-                 // The buffer was "Initializing...".
-                 // Now we replace or append.
-
-                 // Let's clear and re-render full history + any new logs
-                 // buffer_clone.set_text(&full_text); // Simple reset
-                 // But wait, if user typed while loading?
-                 // The loader thread logic in previous step handled merging.
-                 // Here, we just display what was loaded.
-                 // For "Buttery Smooth", we can just insert.
-
-                 // Let's iterate and insert.
-                 let mut end = buffer_clone.end_iter();
-                 buffer_clone.insert(&mut end, &full_text);
+                     // Append history
+                     log_view_rc.append_content(&full_text);
+                }
             }
         }
-        glib::ControlFlow::Continue
     });
 
     window.present();
@@ -205,31 +162,44 @@ fn main() {
     let state = Arc::new(Mutex::new(State {
         console_output: String::new(),
         chat_history: Vec::new(),
+        history_loaded: false,
     }));
 
     // 3. Background Loader
     let brain_loader = brain.clone();
     let state_loader = state.clone();
     let ui_tx_loader = ui_tx.clone();
+    let save_tx_loader = save_tx.clone();
 
     thread::spawn(move || {
         let loaded = brain_loader.load();
 
+        let should_save;
+        let snapshot;
         // Update Logic State
         {
             let mut s = state_loader.lock().unwrap();
-            // We blindly overwrite/append for now.
-            // In a real scenario, we'd merge carefuly.
-            // Since this runs at startup, s.chat_history is likely empty or has just a few inputs.
-            // Let's Prepend loaded to current.
+
+            // Prepend loaded to current
             let mut current = s.chat_history.clone();
             let mut new_history = loaded.clone();
             new_history.append(&mut current);
             s.chat_history = new_history;
+            s.history_loaded = true;
+
+            // Check if we need to trigger a save (user typed while loading)
+            snapshot = s.chat_history.clone();
+            should_save = snapshot.len() > loaded.len();
         }
 
         // Notify UI
         let _ = ui_tx_loader.send(UiEvent::LoadedHistory(loaded));
+
+        // If user typed during load, we missed the save in the Logic Loop (because !history_loaded).
+        // Trigger it now.
+        if should_save {
+            let _ = save_tx_loader.send(snapshot);
+        }
     });
 
     // 4. Tokio Runtime (The Brain)
@@ -252,6 +222,7 @@ fn main() {
 
                     // 2. Persist User Msg
                     let mut history_snapshot;
+                    let loaded;
                     {
                         let mut s = state_bg.lock().unwrap();
                         s.chat_history.push(SavedMessage {
@@ -259,8 +230,15 @@ fn main() {
                             content: msg.clone(),
                         });
                         history_snapshot = s.chat_history.clone();
+                        loaded = s.history_loaded;
                     }
-                    let _ = save_tx_bg.send(history_snapshot.clone());
+
+                    // CRITICAL: Only save if history is fully loaded to prevent overwriting the file with a partial state.
+                    if loaded {
+                        let _ = save_tx_bg.send(history_snapshot.clone());
+                    } else {
+                         info!("PERSISTENCE: Skipping save, history still loading...");
+                    }
 
                     // 3. Call API
                     let mut context = Vec::new();
@@ -279,6 +257,7 @@ fn main() {
                              let _ = ui_tx_bg.send(UiEvent::AppendText(format!("\n[UNA] :: {}\n", response)));
 
                              // 5. Persist Response
+                             let loaded_res;
                              {
                                  let mut s = state_bg.lock().unwrap();
                                  s.chat_history.push(SavedMessage {
@@ -286,8 +265,12 @@ fn main() {
                                      content: response.clone(),
                                  });
                                  history_snapshot = s.chat_history.clone();
+                                 loaded_res = s.history_loaded;
                              }
-                             let _ = save_tx_bg.send(history_snapshot);
+
+                             if loaded_res {
+                                 let _ = save_tx_bg.send(history_snapshot);
+                             }
                         }
                         Err(e) => {
                             let _ = ui_tx_bg.send(UiEvent::AppendText(format!("\n[SYSTEM ERROR] :: {}\n", e)));

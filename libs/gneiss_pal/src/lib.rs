@@ -13,6 +13,7 @@ use std::io::Write; // For stdout/stderr flush
 
 
 pub mod persistence;
+pub mod widgets; // Added module
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum ViewMode {
