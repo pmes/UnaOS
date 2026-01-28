@@ -3,6 +3,7 @@ use gneiss_pal::persistence::{BrainManager, SavedMessage};
 use gneiss_pal::{AppHandler, Backend, DashboardState, Event, SidebarPosition, ViewMode};
 use std::sync::{Arc, Mutex};
 use std::thread;
+use std::sync::mpsc::channel;
 use tokio::runtime::Runtime;
 use tokio::sync::mpsc;
 use log::{info, error};
@@ -167,51 +168,88 @@ fn main() {
 
     info!(":: VEIN :: Booting (The Great Evolution)...");
 
-    let brain_init_time = Instant::now();
     let brain = BrainManager::new();
-    let saved_history = brain.load();
-    info!("STARTUP: BrainManager initialized and history loaded. Elapsed: {:?}", brain_init_time.elapsed());
-    let _ = std::io::stdout().flush();
-    let _ = std::io::stderr().flush();
 
+    // --- Persistence Actor Setup ---
+    let (save_tx, save_rx) = channel::<Vec<SavedMessage>>();
+    let brain_actor = brain.clone();
 
-    let mut console_output =
-        ":: VEIN :: SYSTEM ONLINE (UNLIMITED TIER)\n:: ENGINE: GEMINI-3-PRO\n".to_string();
-
-    if saved_history.is_empty() {
-        console_output.push_str(":: MEMORY :: COLD START (New Session)\n\n");
-    } else {
-        console_output.push_str(":: MEMORY :: LONG-TERM STORAGE RESTORED\n\n");
-        for msg in &saved_history {
-            if !msg.content.starts_with("SYSTEM_INSTRUCTION") {
-                let prefix = if msg.role == "user" {
-                    "[ARCHITECT]"
-                } else {
-                    "[UNA]"
-                };
-                console_output.push_str(&format!("{} > {}\n", prefix, msg.content));
-            }
+    // Spawn the Persistence Actor (dedicated thread for file I/O)
+    thread::spawn(move || {
+        info!("PERSISTENCE: Actor thread started.");
+        while let Ok(history) = save_rx.recv() {
+            // This is a blocking file I/O operation, but it happens in its own thread.
+            // It does NOT hold the State mutex.
+            brain_actor.save(&history);
         }
-        info!(
-            "Restored {} items to history context. Elapsed: {:?}",
-            saved_history.len(), app_start_time.elapsed()
-        );
-        let _ = std::io::stdout().flush();
-        let _ = std::io::stderr().flush();
-    }
+        info!("PERSISTENCE: Actor thread shutting down.");
+    });
+
+
+    // --- State Initialization (Cold Start) ---
+    // We start with an empty state and "Initializing" message to show the window immediately.
+    let console_output = ":: VEIN :: SYSTEM :: INITIALIZING MEMORY...\n".to_string();
 
     let state = Arc::new(Mutex::new(State {
         console_output,
         mode: ViewMode::Comms,
         nav_index: 0,
-        chat_history: saved_history,
+        chat_history: Vec::new(),
         sidebar_position: SidebarPosition::default(),
     }));
+
+    // --- Background History Loader ---
+    let brain_loader = brain.clone();
+    let state_loader = state.clone();
+    let app_start_time_clone = app_start_time; // Copy for closure
+
+    thread::spawn(move || {
+        let load_start = Instant::now();
+        info!("LOADER: Starting history load...");
+        let mut loaded_history = brain_loader.load();
+        info!("LOADER: History loaded from disk in {:?}. Acquiring state lock...", load_start.elapsed());
+
+        let mut s = state_loader.lock().unwrap();
+
+        // Prepend loaded history to any new messages typed during load
+        // Note: s.chat_history might contain new user messages if they typed fast.
+        // We want: [Old History] + [New Messages]
+        // Vec::append moves elements from `other` to `self`.
+        // So we append `s.chat_history` (new stuff) to `loaded_history` (old stuff),
+        // then swap them.
+        loaded_history.append(&mut s.chat_history);
+        s.chat_history = loaded_history;
+
+        // Rebuild Console Output
+        let mut new_console = ":: VEIN :: SYSTEM ONLINE (UNLIMITED TIER)\n:: ENGINE: GEMINI-3-PRO\n".to_string();
+
+        if s.chat_history.is_empty() {
+             new_console.push_str(":: MEMORY :: COLD START (New Session)\n\n");
+        } else {
+             new_console.push_str(":: MEMORY :: LONG-TERM STORAGE RESTORED\n\n");
+             for msg in &s.chat_history {
+                if !msg.content.starts_with("SYSTEM_INSTRUCTION") {
+                    let prefix = if msg.role == "user" {
+                        "[ARCHITECT]"
+                    } else {
+                        "[UNA]"
+                    };
+                    new_console.push_str(&format!("{} > {}\n", prefix, msg.content));
+                }
+            }
+        }
+
+        s.console_output = new_console;
+
+        info!(
+            "LOADER: State updated with {} items. Total startup time: {:?}",
+            s.chat_history.len(), app_start_time_clone.elapsed()
+        );
+    });
 
     let (tx, mut rx) = mpsc::unbounded_channel::<String>();
 
     let state_bg = state.clone();
-    let brain_bg = brain.clone();
 
     thread::spawn(move || {
         let rt_spawn_time = Instant::now();
@@ -236,9 +274,13 @@ fn main() {
                     }
 
                     while let Some(_msg) = rx.recv().await {
+                        // User input received. Trigger a save via the actor.
                         {
                             let s = state_bg.lock().unwrap();
-                            brain_bg.save(&s.chat_history);
+                            // Clone history while holding lock (fast memory copy)
+                            // Send to actor (instant channel send)
+                            // This replaces the blocking brain_bg.save() call.
+                            let _ = save_tx.send(s.chat_history.clone());
                         }
 
                         let mut context = Vec::new();
@@ -272,7 +314,8 @@ fn main() {
                                     role: "model".to_string(),
                                     content: response.clone(),
                                 });
-                                brain_bg.save(&s.chat_history);
+                                // Trigger save again for the response
+                                let _ = save_tx.send(s.chat_history.clone());
                             }
                             Err(e) => {
                                 let mut s = state_bg.lock().unwrap();
