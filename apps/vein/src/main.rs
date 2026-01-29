@@ -311,7 +311,7 @@ fn main() {
             info!(":: VEIN :: Brain Connecting...");
 
             // Initialize Forge (GitHub) Client
-            let _forge_client = match ForgeClient::new() {
+            let forge_client = match ForgeClient::new() {
                 Ok(client) => {
                     let _ = tx_to_ui_bg_clone.send(":: FORGE :: CONNECTED (GitHub Integration Active)\n".to_string());
                     Some(client)
@@ -330,7 +330,27 @@ fn main() {
                         error!("Failed to send initial connection message to UI: {}", e);
                     }
 
-                    while let Some(_user_input_text) = rx_from_ui.recv().await {
+                    while let Some(user_input_text) = rx_from_ui.recv().await {
+                        // Phase 2: Handle /forge command
+                        if user_input_text.trim() == "/forge" {
+                            let response_msg = if let Some(client) = &forge_client {
+                                match client.get_user_info().await {
+                                    Ok(info) => format!("\n[FORGE] :: {}\n", info),
+                                    Err(e) => format!("\n[FORGE ERROR] :: {}\n", e),
+                                }
+                            } else {
+                                "\n[FORGE] :: Offline. (GITHUB_TOKEN not found)\n".to_string()
+                            };
+
+                            // Send to UI
+                            if let Err(e) = tx_to_ui_bg_clone.send(response_msg) {
+                                error!("Failed to send Forge response: {}", e);
+                            }
+
+                            // Continue loop (skip sending "/forge" to Gemini)
+                            continue;
+                        }
+
                         {
                             let s = state_bg.lock().unwrap();
                             brain_bg.save(&s.chat_history);
