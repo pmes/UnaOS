@@ -1,5 +1,5 @@
-use uefi::proto::console::gop::PixelFormat;
 use crate::font::FONT;
+use uefi::proto::console::gop::PixelFormat;
 
 pub struct FramebufferWriter {
     pub base_addr: *mut u8,
@@ -9,7 +9,12 @@ pub struct FramebufferWriter {
 }
 
 impl FramebufferWriter {
-    pub fn new(base_addr: *mut u8, stride: usize, format: PixelFormat, bytes_per_pixel: usize) -> Self {
+    pub fn new(
+        base_addr: *mut u8,
+        stride: usize,
+        format: PixelFormat,
+        bytes_per_pixel: usize,
+    ) -> Self {
         Self {
             base_addr,
             stride,
@@ -31,13 +36,13 @@ impl FramebufferWriter {
                     pixel_ptr.write_volatile(color[0]);
                     pixel_ptr.add(1).write_volatile(color[1]);
                     pixel_ptr.add(2).write_volatile(color[2]);
-                },
+                }
                 PixelFormat::Bgr => {
                     // BGR: [B, G, R]
                     pixel_ptr.write_volatile(color[2]);
                     pixel_ptr.add(1).write_volatile(color[1]);
                     pixel_ptr.add(2).write_volatile(color[0]);
-                },
+                }
                 _ => {
                     // Fallback for other formats (e.g. Bitmask) - use Grey for visibility if unknown
                     // Ideally we should handle Bitmask properly, but for this task Rgb/Bgr are primary.

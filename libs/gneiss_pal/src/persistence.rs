@@ -1,7 +1,7 @@
+use directories::BaseDirs;
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::PathBuf;
-use directories::BaseDirs;
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct SavedMessage {
@@ -19,12 +19,12 @@ impl BrainManager {
         // MANUAL OVERRIDE: Force ~/.local/share/unaos/vein
         // We ask for the base data directory (usually ~/.local/share)
         // and manually append our specific hierarchy.
-        let base_dirs = BaseDirs::new()
-            .expect("Could not determine base directories");
+        let base_dirs = BaseDirs::new().expect("Could not determine base directories");
 
-        let data_dir = base_dirs.data_local_dir()
-            .join("unaos")  // The Organization
-            .join("vein");  // The App
+        let data_dir = base_dirs
+            .data_local_dir()
+            .join("unaos") // The Organization
+            .join("vein"); // The App
 
         // Create the directory tree
         fs::create_dir_all(&data_dir).expect("Failed to create data directory");

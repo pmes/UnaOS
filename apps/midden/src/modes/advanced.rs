@@ -18,11 +18,9 @@ pub fn launch(guardian: Guardian, args: Vec<String>) -> Result<()> {
 
     // 2. If safe, pass through to the OS
     // This makes Midden transparent!
-    let output = Command::new(&args[0])
-        .args(&args[1..])
-        .output()?;
+    let output = Command::new(&args[0]).args(&args[1..]).output()?;
 
     println!("{}", String::from_utf8_lossy(&output.stdout));
-    
+
     Ok(())
 }

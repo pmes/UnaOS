@@ -1,7 +1,10 @@
+#![allow(deprecated)]
+
 use gtk4::prelude::*;
 use gtk4::{
     Application, ApplicationWindow, Box, Orientation, Label, Button, Stack, ScrolledWindow,
     PolicyType, Align, ListBox, Separator, StackTransitionType, TextView, EventControllerKey,
+    TextBuffer, Adjustment, FileChooserNative, ResponseType, FileChooserAction
 };
 use gtk4::gdk::{Key, ModifierType};
 use std::rc::Rc;
@@ -9,11 +12,10 @@ use std::cell::RefCell;
 use std::time::Duration;
 use log::{info};
 use std::time::Instant;
-use std::io::Write; // For stdout/stderr flush
-
+use std::io::Write;
+use std::path::PathBuf; // Import PathBuf
 
 pub mod persistence;
-pub mod widgets; // Added module
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum ViewMode {
@@ -39,6 +41,9 @@ pub enum Event {
     TemplateAction(usize),
     NavSelect(usize),
     DockAction(usize),
+    TextBufferUpdate(TextBuffer, Adjustment),
+    UploadRequest, // Kept for compatibility, though effectively unused now
+    FileSelected(PathBuf), // NEW: Carries the selected path back to Vein
 }
 
 #[derive(Clone, Debug)]
@@ -48,7 +53,6 @@ pub struct DashboardState {
     pub active_nav_index: usize,
     pub console_output: String,
     pub actions: Vec<String>,
-
     pub sidebar_position: SidebarPosition,
     pub dock_actions: Vec<String>,
 }
@@ -105,7 +109,6 @@ fn build_ui(app: &Application, app_handler_rc: Rc<RefCell<impl AppHandler>>) {
     let _ = std::io::stdout().flush();
     let _ = std::io::stderr().flush();
 
-
     // --- MAIN WINDOW ---
     let window = ApplicationWindow::builder()
         .application(app)
@@ -113,20 +116,11 @@ fn build_ui(app: &Application, app_handler_rc: Rc<RefCell<impl AppHandler>>) {
         .default_height(700)
         .title("Vein (Powered by unaOS Gneiss)")
         .build();
-    info!("UI_BUILD: ApplicationWindow created. Elapsed: {:?}", ui_build_start_time.elapsed());
-    let _ = std::io::stdout().flush();
-    let _ = std::io::stderr().flush();
-
 
     let split_view = libadwaita::OverlaySplitView::new();
-    window.set_child(Some(&split_view)); // Set the split view as the main content
-    info!("UI_BUILD: OverlaySplitView set. Elapsed: {:?}", ui_build_start_time.elapsed());
-    let _ = std::io::stdout().flush();
-    let _ = std::io::stderr().flush();
-
+    window.set_child(Some(&split_view));
 
     // --- SIDEBAR (Left/Right Panel) ---
-    let sidebar_build_time = Instant::now();
     let sidebar_box = Box::new(Orientation::Vertical, 0);
     sidebar_box.set_width_request(260);
 
@@ -153,7 +147,6 @@ fn build_ui(app: &Application, app_handler_rc: Rc<RefCell<impl AppHandler>>) {
     });
     sidebar_stack.add_named(&rooms_list, Some("rooms"));
 
-
     let status_box = Box::new(Orientation::Vertical, 10);
     set_margins(&status_box, 10);
     status_box.append(&Label::builder().label(":: SYSTEM STATUS ::").css_classes(vec!["heading"]).build());
@@ -161,7 +154,7 @@ fn build_ui(app: &Application, app_handler_rc: Rc<RefCell<impl AppHandler>>) {
     status_box.append(&make_status_row("Una (Link)", "🟢 Connected"));
     sidebar_stack.add_named(&status_box, Some("status"));
 
-    // --- BOTTOM DOCK FOR NAVIGATION (Zed-like) ---
+    // --- BOTTOM DOCK ---
     let bottom_dock = Box::new(Orientation::Horizontal, 5);
     set_margins(&bottom_dock, 10);
     bottom_dock.set_halign(Align::Center);
@@ -187,13 +180,8 @@ fn build_ui(app: &Application, app_handler_rc: Rc<RefCell<impl AppHandler>>) {
         });
         bottom_dock.append(&button);
     }
-    info!("UI_BUILD: Sidebar and Dock built. Elapsed: {:?}", sidebar_build_time.elapsed());
-    let _ = std::io::stdout().flush();
-    let _ = std::io::stderr().flush();
-
 
     // --- MAIN CONTENT AREA ---
-    let main_content_build_time = Instant::now();
     let main_content_box = Box::new(Orientation::Vertical, 0);
 
     let scrolled_window = ScrolledWindow::builder()
@@ -202,32 +190,63 @@ fn build_ui(app: &Application, app_handler_rc: Rc<RefCell<impl AppHandler>>) {
         .vexpand(true)
         .build();
 
-    let chat_display_box = Box::new(Orientation::Vertical, 10);
-    set_margins(&chat_display_box, 20);
-    chat_display_box.set_valign(Align::End);
+    let text_buffer = TextBuffer::new(None);
+    text_buffer.set_text(&app_handler_rc.borrow().view().console_output);
 
-    let initial_output = app_handler_rc.borrow().view().console_output;
-    let console_label = Label::builder()
-        .label(&initial_output)
-        .wrap(true)
-        .xalign(0.0)
-        .yalign(1.0)
+    let console_text_view = TextView::builder()
+        .wrap_mode(gtk4::WrapMode::WordChar)
+        .editable(false)
+        .buffer(&text_buffer)
         .vexpand(true)
         .build();
-    chat_display_box.append(&console_label);
 
-    scrolled_window.set_child(Some(&chat_display_box));
+    let text_buffer_clone = text_buffer.clone();
+    let scrolled_window_adj_clone = scrolled_window.vadjustment();
+
+    app_handler_rc.borrow_mut().handle_event(Event::TextBufferUpdate(text_buffer_clone, scrolled_window_adj_clone));
+
+    scrolled_window.set_child(Some(&console_text_view));
     main_content_box.append(&scrolled_window);
-    info!("UI_BUILD: Main Content display area built. Elapsed: {:?}", main_content_build_time.elapsed());
-    let _ = std::io::stdout().flush();
-    let _ = std::io::stderr().flush();
-
 
     // --- INPUT AREA ---
-    let input_area_build_time = Instant::now();
     let input_container = Box::new(Orientation::Horizontal, 10);
     set_margins(&input_container, 10);
     input_container.add_css_class("linked");
+
+    // NEW: Upload Button logic using pure GTK4 FileChooserNative
+    let upload_btn = Button::builder().icon_name("paperclip-symbolic").valign(Align::End).css_classes(vec!["suggested-action"]).build();
+    let app_handler_rc_for_upload = app_handler_rc.clone();
+    let window_weak = window.downgrade(); // Use weak ref to avoid cycles
+
+    upload_btn.connect_clicked(move |_| {
+        let dialog = FileChooserNative::builder()
+            .title("Select File to Upload")
+            .action(FileChooserAction::Open)
+            .modal(true)
+            .accept_label("Upload")
+            .cancel_label("Cancel")
+            .build();
+
+        if let Some(window) = window_weak.upgrade() {
+            dialog.set_transient_for(Some(&window));
+        }
+
+        let handler_clone = app_handler_rc_for_upload.clone();
+
+        dialog.connect_response(move |d, response| {
+            if response == ResponseType::Accept {
+                if let Some(file) = d.file() {
+                    if let Some(path) = file.path() {
+                        handler_clone.borrow_mut().handle_event(Event::FileSelected(path));
+                    }
+                }
+            }
+            d.destroy();
+        });
+
+        dialog.show();
+    });
+    input_container.append(&upload_btn);
 
     let input_scroll = ScrolledWindow::builder()
         .hscrollbar_policy(PolicyType::Never)
@@ -248,11 +267,10 @@ fn build_ui(app: &Application, app_handler_rc: Rc<RefCell<impl AppHandler>>) {
     let send_btn = Button::builder().icon_name("mail-send-symbolic").valign(Align::End).css_classes(vec!["suggested-action"]).build();
 
     let app_handler_rc_for_send = app_handler_rc.clone();
-    let console_label_for_send = console_label.clone();
     let text_view_for_send = text_view.clone();
     let scrolled_window_adj = scrolled_window.vadjustment();
 
-    let send_message_rc: Rc<dyn Fn()> = Rc::new(move || {
+    let send_message_rc: Rc<dyn Fn() + 'static> = Rc::new(move || {
         let buffer = text_view_for_send.buffer();
         let (start, end) = buffer.bounds();
         let text = buffer.text(&start, &end, false).to_string();
@@ -261,9 +279,6 @@ fn build_ui(app: &Application, app_handler_rc: Rc<RefCell<impl AppHandler>>) {
         if clean_text.is_empty() { return; }
 
         app_handler_rc_for_send.borrow_mut().handle_event(Event::Input(clean_text.to_string()));
-
-        let current_state = app_handler_rc_for_send.borrow().view();
-        console_label_for_send.set_text(&current_state.console_output);
 
         buffer.set_text("");
 
@@ -303,32 +318,16 @@ fn build_ui(app: &Application, app_handler_rc: Rc<RefCell<impl AppHandler>>) {
     input_container.append(&input_scroll);
     input_container.append(&send_btn);
     main_content_box.append(&input_container);
-    info!("UI_BUILD: Input area built. Elapsed: {:?}", input_area_build_time.elapsed());
-    let _ = std::io::stdout().flush();
-    let _ = std::io::stderr().flush();
 
-
-    // --- Set Sidebar and Main Content ---
-    let split_view_setup_time = Instant::now();
     split_view.set_sidebar(Some(&sidebar_box));
     split_view.set_content(Some(&main_content_box));
-    info!("UI_BUILD: OverlaySplitView content and sidebar set. Elapsed: {:?}", split_view_setup_time.elapsed());
-    let _ = std::io::stdout().flush();
-    let _ = std::io::stderr().flush();
-
 
     window.present();
     info!("UI_BUILD: Window presented. Total build_ui duration: {:?}", ui_build_start_time.elapsed());
     let _ = std::io::stdout().flush();
     let _ = std::io::stderr().flush();
-
-    // REMOVED: The problematic gtk4::events_pending() and gtk4::main_iteration() loop.
-    // This code was causing compilation errors and was a heuristic attempt for display.
-    // If the problem persists, it's definitively outside our Rust code's GTK calls.
 }
 
-
-// --- UI HELPERS (moved from main.rs into gneiss_pal) ---
 fn set_margins(w: &Box, s: i32) { w.set_margin_top(s); w.set_margin_bottom(s); w.set_margin_start(s); w.set_margin_end(s); }
 fn make_sidebar_row(n: &str, a: bool) -> Box {
     let r = Box::new(Orientation::Horizontal, 10); set_margins(&r, 10);
