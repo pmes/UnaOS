@@ -4,6 +4,11 @@ use std::env;
 use std::time::Duration;
 use log::{info, error};
 use tokio::time::sleep;
+use std::sync::Arc;
+
+use google_cloud_auth::project::Config;
+use google_cloud_auth::token::DefaultTokenSourceProvider;
+use google_cloud_token::{TokenSourceProvider, TokenSource};
 
 #[derive(Serialize)]
 struct GenerateContentRequest {
@@ -83,7 +88,7 @@ struct SafetyRating {
 
 pub struct GeminiClient {
     client: Client,
-    access_token: String,
+    token_source: Arc<dyn TokenSource>,
     model_url: String,
 }
 
@@ -98,26 +103,25 @@ impl GeminiClient {
             .or_else(|_| env::var("REGION"))
             .unwrap_or_else(|_| "us-central1".to_string());
 
-        let model_name = env::var("GEMINI_MODEL_NAME").unwrap_or_else(|_| "gemini-1.5-pro-001".to_string());
+        let model_name = env::var("GEMINI_MODEL_NAME").unwrap_or_else(|_| "gemini-3-pro-preview".to_string());
 
-        // Vertex AI Endpoint
+        // Vertex AI Endpoint - Targeted at global resources via regional endpoint
         let model_url = format!(
-            "https://{}-aiplatform.googleapis.com/v1/projects/{}/locations/{}/publishers/google/models/{}:generateContent",
-            location, project_id, location, model_name
+            "https://{}-aiplatform.googleapis.com/v1/projects/{}/locations/global/publishers/google/models/{}:generateContent",
+            location, project_id, model_name
         );
 
-        // Authentication Setup - Bypass using gcloud CLI
-        let token_command = std::process::Command::new("gcloud")
-            .arg("auth")
-            .arg("print-access-token")
-            .output()
-            .map_err(|e| format!("Failed to execute 'gcloud auth print-access-token': {}", e))?;
+        // Authentication Setup
+        let config = Config {
+            audience: Some("https://us-central1-aiplatform.googleapis.com/"),
+            scopes: Some(&["https://www.googleapis.com/auth/cloud-platform"]),
+            ..Default::default()
+        };
+        let tsp = DefaultTokenSourceProvider::new(config)
+            .await
+            .map_err(|e| format!("Failed to create token source provider: {}", e))?;
 
-        if !token_command.status.success() {
-            let stderr = String::from_utf8_lossy(&token_command.stderr);
-            return Err(format!("'gcloud auth print-access-token' failed: {}", stderr));
-        }
-        let access_token = String::from_utf8_lossy(&token_command.stdout).trim().to_string();
+        let token_source = tsp.token_source();
 
         let client = ClientBuilder::new()
             .timeout(Duration::from_secs(60))
@@ -128,7 +132,7 @@ impl GeminiClient {
 
         Ok(Self {
             client,
-            access_token,
+            token_source,
             model_url,
         })
     }
@@ -141,12 +145,18 @@ impl GeminiClient {
             attempt += 1;
             info!("Sending request to Vertex AI (Attempt {}/{}) using model: {}", attempt, MAX_RETRIES, self.model_url);
 
+            // Fetch fresh token
+            let token = match self.token_source.token().await {
+                Ok(t) => t,
+                Err(e) => return Err(format!("Failed to acquire auth token: {}", e)),
+            };
+
             let request_body = GenerateContentRequest {
                 contents: history.to_vec(),
             };
 
             let response_result = self.client.post(&self.model_url)
-                .bearer_auth(&self.access_token)
+                .bearer_auth(&token)
                 .json(&request_body)
                 .send()
                 .await;
@@ -220,16 +230,22 @@ impl GeminiClient {
             .map_err(|_| "GOOGLE_CLOUD_PROJECT_ID (or PROJECT_ID) not set".to_string())?;
 
         // Target the Publishers endpoint to find Foundation Models (Gemini, etc.)
-        // URL: https://[LOCATION]-aiplatform.googleapis.com/v1/projects/[PROJECT]/locations/[LOCATION]/publishers/google/models
+        // URL: https://[LOCATION]-aiplatform.googleapis.com/v1/projects/[PROJECT]/locations/global/publishers/google/models
         let url = format!(
-            "https://{}-aiplatform.googleapis.com/v1/projects/{}/locations/{}/publishers/google/models",
-            location, project_id, location
+            "https://{}-aiplatform.googleapis.com/v1/projects/{}/locations/global/publishers/google/models",
+            location, project_id
         );
 
         info!("Requesting Model List from: {}", url);
 
+        // Fetch fresh token
+        let token = match self.token_source.token().await {
+            Ok(t) => t,
+            Err(e) => return Err(format!("Failed to acquire auth token: {}", e)),
+        };
+
         let response = self.client.get(&url)
-            .bearer_auth(&self.access_token)
+            .bearer_auth(&token)
             .send()
             .await
             .map_err(|e| format!("Failed to send request: {}", e))?;
