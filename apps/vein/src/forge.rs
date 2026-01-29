@@ -33,11 +33,17 @@ impl ForgeClient {
             .map_err(|e| format!("Failed to list repos: {}", e))
     }
 
-    pub async fn get_file_content(&self, owner: &str, repo: &str, path: &str) -> Result<String, String> {
-        let content_items = self.inner
-            .repos(owner, repo)
+    pub async fn get_file_content(&self, owner: &str, repo: &str, path: &str, branch: Option<&str>) -> Result<String, String> {
+        let repo_handler = self.inner.repos(owner, repo);
+        let mut builder = repo_handler
             .get_content()
-            .path(path)
+            .path(path);
+
+        if let Some(b) = branch {
+            builder = builder.r#ref(b);
+        }
+
+        let content_items = builder
             .send()
             .await
             .map_err(|e| format!("Failed to fetch file content: {}", e))?;

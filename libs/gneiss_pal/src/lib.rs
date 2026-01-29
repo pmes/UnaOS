@@ -44,6 +44,7 @@ pub enum Event {
     TextBufferUpdate(TextBuffer, Adjustment),
     UploadRequest, // Kept for compatibility, though effectively unused now
     FileSelected(PathBuf), // NEW: Carries the selected path back to Vein
+    ToggleSidebar, // NEW: Toggle sidebar visibility
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -71,6 +72,7 @@ pub struct DashboardState {
     pub sidebar_position: SidebarPosition,
     pub dock_actions: Vec<String>,
     pub shard_tree: Vec<Shard>,
+    pub sidebar_collapsed: bool,
 }
 
 impl Default for DashboardState {
@@ -84,6 +86,7 @@ impl Default for DashboardState {
             sidebar_position: SidebarPosition::default(),
             dock_actions: Vec::new(),
             shard_tree: Vec::new(),
+            sidebar_collapsed: false,
         }
     }
 }
@@ -144,6 +147,18 @@ fn build_ui(app: &Application, app_handler_rc: Rc<RefCell<impl AppHandler>>) {
     let sidebar_header = libadwaita::HeaderBar::new();
     sidebar_header.set_show_end_title_buttons(false);
     sidebar_header.set_show_start_title_buttons(false);
+
+    // Toggle button in header
+    let toggle_btn = Button::builder()
+        .icon_name("sidebar-show-symbolic")
+        .css_classes(vec!["flat"])
+        .build();
+    let app_handler_rc_for_toggle = app_handler_rc.clone();
+    toggle_btn.connect_clicked(move |_| {
+        app_handler_rc_for_toggle.borrow_mut().handle_event(Event::ToggleSidebar);
+    });
+    sidebar_header.pack_end(&toggle_btn);
+
     sidebar_box.append(&sidebar_header);
 
     let sidebar_stack = Stack::new();
@@ -338,6 +353,34 @@ fn build_ui(app: &Application, app_handler_rc: Rc<RefCell<impl AppHandler>>) {
 
     split_view.set_sidebar(Some(&sidebar_box));
     split_view.set_content(Some(&main_content_box));
+
+    // Handle initial collapsed state (though dynamic updates require a signal or re-render which we lack here for simplicity,
+    // we rely on the split_view properties if we had a reactive loop.
+    // GneissPal's current architecture rebuilds UI only on init, so dynamic updates need a reactive binding or manual signal.
+    // For now, we are just building the UI. The toggle logic usually needs to manipulate the widget *after* build.
+    // Since GneissPal is simple, we might need to expose the split_view to the handler or use a global signal.
+    // However, given the constraints, we'll try to set it initially.
+    if app_handler_rc.borrow().view().sidebar_collapsed {
+        split_view.set_collapsed(true);
+    }
+
+    // Hack: To support dynamic toggling without full reactivity, we can use a closure attached to the button
+    // that modifies the widget directly if we had access. But the button handler above just emits an event.
+    // The AppHandler updates state, but the UI doesn't know to redraw or update properties.
+    // Real fix: The Event loop needs to trigger a UI update. Vein uses `do_append_and_scroll`, but for structural changes...
+    // We will leave the "ToggleSidebar" event to update state, and maybe the AppHandler can trigger a rebuild?
+    // Or we inject a closure into the AppHandler?
+    // For this specific task, we will just implement the Event.
+    // Wait, the user asked for a "Toggle Button". If the UI doesn't react, it's useless.
+    // We can use `split_view.bind_property` or similar if we had a GObject for state.
+    // Simpler: The toggle button itself can toggle the split_view directly!
+    // But we also need to update the State to persist it.
+    // So:
+    let split_view_clone = split_view.clone();
+    toggle_btn.connect_clicked(move |_| {
+        let is_collapsed = split_view_clone.is_collapsed();
+        split_view_clone.set_collapsed(!is_collapsed);
+    });
 
     window.present();
     info!("UI_BUILD: Window presented. Total build_ui duration: {:?}", ui_build_start_time.elapsed());
