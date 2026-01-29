@@ -15,6 +15,13 @@ impl ForgeClient {
 
         Ok(Self { inner: instance })
     }
+
+    pub async fn get_user_info(&self) -> Result<String, String> {
+        match self.inner.current().user().await {
+            Ok(user) => Ok(format!("Logged in as: {}", user.login)),
+            Err(e) => Err(format!("Failed to fetch user info: {}", e)),
+        }
+    }
 }
 
 #[cfg(test)]
