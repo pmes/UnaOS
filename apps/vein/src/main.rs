@@ -354,6 +354,20 @@ fn main() {
                             continue;
                         }
 
+                        // Phase 3: Handle /vertex_models command
+                        if user_input_text.trim() == "/vertex_models" {
+                             let _ = tx_to_ui_bg_clone.send("\n[SYSTEM] :: Querying Vertex AI Model List...\n".to_string());
+                             match client.list_vertex_models().await {
+                                 Ok(json) => {
+                                     let _ = tx_to_ui_bg_clone.send(format!("\n[VERTEX MODELS] ::\n{}\n", json));
+                                 },
+                                 Err(e) => {
+                                     let _ = tx_to_ui_bg_clone.send(format!("\n[VERTEX ERROR] :: {}\n", e));
+                                 }
+                             }
+                             continue;
+                        }
+
                         {
                             let s = state_bg.lock().unwrap();
                             brain_bg.save(&s.chat_history);

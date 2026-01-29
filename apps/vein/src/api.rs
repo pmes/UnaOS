@@ -208,4 +208,34 @@ impl GeminiClient {
             return Err("[SIGNAL LOST] - Unexpected response format.".to_string());
         }
     }
+
+    pub async fn list_vertex_models(&self) -> Result<String, String> {
+        // Retrieve location from env or default
+        let location = env::var("GOOGLE_CLOUD_REGION")
+            .or_else(|_| env::var("REGION"))
+            .unwrap_or_else(|_| "us-central1".to_string());
+
+        // Target the Publishers endpoint to find Foundation Models (Gemini, etc.)
+        // URL: https://[LOCATION]-aiplatform.googleapis.com/v1/publishers/google/models
+        let url = format!(
+            "https://{}-aiplatform.googleapis.com/v1/publishers/google/models",
+            location
+        );
+
+        info!("Requesting Model List from: {}", url);
+
+        let response = self.client.get(&url)
+            .bearer_auth(&self.access_token)
+            .send()
+            .await
+            .map_err(|e| format!("Failed to send request: {}", e))?;
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let text = response.text().await.unwrap_or_default();
+            return Err(format!("Model List Error {}: {}", status, text));
+        }
+
+        response.text().await.map_err(|e| format!("Failed to read response body: {}", e))
+    }
 }
