@@ -22,6 +22,9 @@ use base64::{Engine as _, engine::general_purpose};
 mod api;
 use api::{Content, GeminiClient, Part};
 
+mod forge;
+use forge::ForgeClient;
+
 struct State {
     mode: ViewMode,
     nav_index: usize,
@@ -306,6 +309,19 @@ fn main() {
         let rt = Runtime::new().expect("Failed to create Tokio Runtime");
         rt.block_on(async move {
             info!(":: VEIN :: Brain Connecting...");
+
+            // Initialize Forge (GitHub) Client
+            let _forge_client = match ForgeClient::new() {
+                Ok(client) => {
+                    let _ = tx_to_ui_bg_clone.send(":: FORGE :: CONNECTED (GitHub Integration Active)\n".to_string());
+                    Some(client)
+                },
+                Err(_) => {
+                    let _ = tx_to_ui_bg_clone.send(":: FORGE :: OFFLINE (No Token Detected)\n".to_string());
+                    None
+                }
+            };
+
             let client_res = GeminiClient::new();
 
             match client_res {
