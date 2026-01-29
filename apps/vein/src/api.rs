@@ -4,6 +4,11 @@ use std::env;
 use std::time::Duration;
 use log::{info, error};
 use tokio::time::sleep;
+use std::sync::Arc;
+
+use google_cloud_auth::project::Config;
+use google_cloud_auth::token::DefaultTokenSourceProvider;
+use google_cloud_token::{TokenSourceProvider, TokenSource};
 
 #[derive(Serialize)]
 struct GenerateContentRequest {
@@ -83,21 +88,39 @@ struct SafetyRating {
 
 pub struct GeminiClient {
     client: Client,
-    api_key: String,
+    token_source: Arc<dyn TokenSource>,
     model_url: String,
 }
 
 impl GeminiClient {
-    pub fn new() -> Result<Self, String> {
-        let api_key =
-            env::var("GEMINI_API_KEY").map_err(|_| "GEMINI_API_KEY not set".to_string())?;
+    pub async fn new() -> Result<Self, String> {
+        // Vertex AI requires Project ID and Location
+        let project_id = env::var("GOOGLE_CLOUD_PROJECT_ID")
+            .or_else(|_| env::var("PROJECT_ID"))
+            .map_err(|_| "GOOGLE_CLOUD_PROJECT_ID (or PROJECT_ID) not set".to_string())?;
 
-        let model_name = env::var("GEMINI_MODEL_NAME").unwrap_or_else(|_| "gemini-3-pro-preview".to_string());
+        let location = env::var("GOOGLE_CLOUD_REGION")
+            .or_else(|_| env::var("REGION"))
+            .unwrap_or_else(|_| "us-central1".to_string());
 
+        let model_name = env::var("GEMINI_MODEL_NAME").unwrap_or_else(|_| "gemini-2.5-flash".to_string());
+
+        // Vertex AI Endpoint
         let model_url = format!(
-            "https://generativelanguage.googleapis.com/v1beta/models/{}:generateContent?key={}",
-            model_name, api_key
+            "https://{}-aiplatform.googleapis.com/v1/projects/{}/locations/{}/publishers/google/models/{}:generateContent",
+            location, project_id, location, model_name
         );
+
+        // Authentication Setup
+        let config = Config {
+            scopes: Some(&["https://www.googleapis.com/auth/cloud-platform"]),
+            ..Default::default()
+        };
+        let tsp = DefaultTokenSourceProvider::new(config)
+            .await
+            .map_err(|e| format!("Failed to create token source provider: {}", e))?;
+
+        let token_source = tsp.token_source();
 
         let client = ClientBuilder::new()
             .timeout(Duration::from_secs(60))
@@ -108,7 +131,7 @@ impl GeminiClient {
 
         Ok(Self {
             client,
-            api_key,
+            token_source,
             model_url,
         })
     }
@@ -119,13 +142,20 @@ impl GeminiClient {
 
         loop {
             attempt += 1;
-            info!("Sending request to Gemini API (Attempt {}/{}) using model: {}", attempt, MAX_RETRIES, self.model_url);
+            info!("Sending request to Vertex AI (Attempt {}/{}) using model: {}", attempt, MAX_RETRIES, self.model_url);
+
+            // Fetch fresh token
+            let token = match self.token_source.token().await {
+                Ok(t) => t,
+                Err(e) => return Err(format!("Failed to acquire auth token: {}", e)),
+            };
 
             let request_body = GenerateContentRequest {
                 contents: history.to_vec(),
             };
 
             let response_result = self.client.post(&self.model_url)
+                .bearer_auth(&token)
                 .json(&request_body)
                 .send()
                 .await;

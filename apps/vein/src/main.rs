@@ -1,6 +1,6 @@
 use dotenvy::dotenv;
 use gneiss_pal::persistence::{BrainManager, SavedMessage};
-use gneiss_pal::{AppHandler, Backend, DashboardState, Event, SidebarPosition, ViewMode};
+use gneiss_pal::{AppHandler, Backend, DashboardState, Event, SidebarPosition, ViewMode, Shard, ShardStatus};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use tokio::runtime::Runtime;
@@ -89,9 +89,11 @@ fn trigger_upload(path: PathBuf, tx_ui: mpsc::UnboundedSender<String>) {
             let client = reqwest::Client::new();
             let url = "https://vein-s9-upload-1035558613434.us-central1.run.app/upload";
 
+            // Use mime_str correctly and ensure proper chaining
             let part = reqwest::multipart::Part::bytes(file_bytes)
                 .file_name(filename.clone())
-                .mime_str("application/octet-stream").unwrap();
+                .mime_str("application/octet-stream")
+                .expect("Failed to set mime type");
 
             let form = reqwest::multipart::Form::new()
                 .part("file", part)
@@ -248,6 +250,7 @@ impl AppHandler for VeinApp {
             },
             sidebar_position: s.sidebar_position.clone(),
             dock_actions: vec!["Rooms".into(), "Status".into()],
+            shard_tree: Vec::new(),
         }
     }
 }
@@ -322,7 +325,7 @@ fn main() {
                 }
             };
 
-            let client_res = GeminiClient::new();
+            let client_res = GeminiClient::new().await;
 
             match client_res {
                 Ok(client) => {
