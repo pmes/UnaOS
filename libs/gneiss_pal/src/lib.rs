@@ -46,6 +46,21 @@ pub enum Event {
     FileSelected(PathBuf), // NEW: Carries the selected path back to Vein
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub enum ShardStatus {
+    Online,
+    Offline,
+    Syncing,
+    Error,
+}
+
+#[derive(Clone, Debug)]
+pub struct Shard {
+    pub name: String,
+    pub status: ShardStatus,
+    pub children: Vec<Shard>,
+}
+
 #[derive(Clone, Debug)]
 pub struct DashboardState {
     pub mode: ViewMode,
@@ -55,6 +70,7 @@ pub struct DashboardState {
     pub actions: Vec<String>,
     pub sidebar_position: SidebarPosition,
     pub dock_actions: Vec<String>,
+    pub shard_tree: Vec<Shard>,
 }
 
 impl Default for DashboardState {
@@ -67,6 +83,7 @@ impl Default for DashboardState {
             actions: Vec::new(),
             sidebar_position: SidebarPosition::default(),
             dock_actions: Vec::new(),
+            shard_tree: Vec::new(),
         }
     }
 }
