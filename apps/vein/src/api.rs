@@ -4,11 +4,6 @@ use std::env;
 use std::time::Duration;
 use log::{info, error};
 use tokio::time::sleep;
-use std::sync::Arc;
-
-use google_cloud_auth::project::Config;
-use google_cloud_auth::token::DefaultTokenSourceProvider;
-use google_cloud_token::{TokenSourceProvider, TokenSource};
 
 #[derive(Serialize)]
 struct GenerateContentRequest {
@@ -88,7 +83,7 @@ struct SafetyRating {
 
 pub struct GeminiClient {
     client: Client,
-    token_source: Arc<dyn TokenSource>,
+    access_token: String,
     model_url: String,
 }
 
@@ -111,17 +106,18 @@ impl GeminiClient {
             location, project_id, model_name
         );
 
-        // Authentication Setup
-        let config = Config {
-            audience: Some("https://us-central1-aiplatform.googleapis.com/"),
-            scopes: Some(&["https://www.googleapis.com/auth/cloud-platform"]),
-            ..Default::default()
-        };
-        let tsp = DefaultTokenSourceProvider::new(config)
-            .await
-            .map_err(|e| format!("Failed to create token source provider: {}", e))?;
+        // Authentication Setup - Bypass using gcloud CLI
+        let token_command = std::process::Command::new("gcloud")
+            .arg("auth")
+            .arg("print-access-token")
+            .output()
+            .map_err(|e| format!("Failed to execute 'gcloud auth print-access-token': {}", e))?;
 
-        let token_source = tsp.token_source();
+        if !token_command.status.success() {
+            let stderr = String::from_utf8_lossy(&token_command.stderr);
+            return Err(format!("'gcloud auth print-access-token' failed: {}", stderr));
+        }
+        let access_token = String::from_utf8_lossy(&token_command.stdout).trim().to_string();
 
         let client = ClientBuilder::new()
             .timeout(Duration::from_secs(60))
@@ -132,7 +128,7 @@ impl GeminiClient {
 
         Ok(Self {
             client,
-            token_source,
+            access_token,
             model_url,
         })
     }
@@ -145,18 +141,12 @@ impl GeminiClient {
             attempt += 1;
             info!("Sending request to Vertex AI (Attempt {}/{}) using model: {}", attempt, MAX_RETRIES, self.model_url);
 
-            // Fetch fresh token
-            let token = match self.token_source.token().await {
-                Ok(t) => t,
-                Err(e) => return Err(format!("Failed to acquire auth token: {}", e)),
-            };
-
             let request_body = GenerateContentRequest {
                 contents: history.to_vec(),
             };
 
             let response_result = self.client.post(&self.model_url)
-                .bearer_auth(&token)
+                .bearer_auth(&self.access_token)
                 .json(&request_body)
                 .send()
                 .await;
@@ -238,14 +228,8 @@ impl GeminiClient {
 
         info!("Requesting Model List from: {}", url);
 
-        // Fetch fresh token
-        let token = match self.token_source.token().await {
-            Ok(t) => t,
-            Err(e) => return Err(format!("Failed to acquire auth token: {}", e)),
-        };
-
         let response = self.client.get(&url)
-            .bearer_auth(&token)
+            .bearer_auth(&self.access_token)
             .send()
             .await
             .map_err(|e| format!("Failed to send request: {}", e))?;
