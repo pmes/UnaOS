@@ -98,7 +98,7 @@ impl GeminiClient {
             .or_else(|_| env::var("REGION"))
             .unwrap_or_else(|_| "us-central1".to_string());
 
-        let model_name = env::var("GEMINI_MODEL_NAME").unwrap_or_else(|_| "gemini-3-pro-preview".to_string());
+        let model_name = env::var("GEMINI_MODEL_NAME").unwrap_or_else(|_| "gemini-1.5-pro-001".to_string());
 
         // Vertex AI Endpoint
         let model_url = format!(
@@ -215,11 +215,15 @@ impl GeminiClient {
             .or_else(|_| env::var("REGION"))
             .unwrap_or_else(|_| "us-central1".to_string());
 
+        let project_id = env::var("GOOGLE_CLOUD_PROJECT_ID")
+            .or_else(|_| env::var("PROJECT_ID"))
+            .map_err(|_| "GOOGLE_CLOUD_PROJECT_ID (or PROJECT_ID) not set".to_string())?;
+
         // Target the Publishers endpoint to find Foundation Models (Gemini, etc.)
-        // URL: https://[LOCATION]-aiplatform.googleapis.com/v1/publishers/google/models
+        // URL: https://[LOCATION]-aiplatform.googleapis.com/v1/projects/[PROJECT]/locations/[LOCATION]/publishers/google/models
         let url = format!(
-            "https://{}-aiplatform.googleapis.com/v1/publishers/google/models",
-            location
+            "https://{}-aiplatform.googleapis.com/v1/projects/{}/locations/{}/publishers/google/models",
+            location, project_id, location
         );
 
         info!("Requesting Model List from: {}", url);
