@@ -103,7 +103,7 @@ impl GeminiClient {
             .or_else(|_| env::var("REGION"))
             .unwrap_or_else(|_| "us-central1".to_string());
 
-        let model_name = env::var("GEMINI_MODEL_NAME").unwrap_or_else(|_| "gemini-2.5-flash".to_string());
+        let model_name = env::var("GEMINI_MODEL_NAME").unwrap_or_else(|_| "gemini-3-pro-preview".to_string());
 
         // Vertex AI Endpoint
         let model_url = format!(
@@ -113,6 +113,7 @@ impl GeminiClient {
 
         // Authentication Setup
         let config = Config {
+            audience: Some("https://us-central1-aiplatform.googleapis.com/"),
             scopes: Some(&["https://www.googleapis.com/auth/cloud-platform"]),
             ..Default::default()
         };
