@@ -5381,7 +5381,6 @@ version = "0.1.0"
 dependencies = [
  "ab_glyph",
  "async-channel",
- "base64 0.21.7",
  "dotenvy",
  "env_logger",
  "glib",

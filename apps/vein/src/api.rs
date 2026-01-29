@@ -16,36 +16,41 @@ pub struct Content {
     pub parts: Vec<Part>,
 }
 
-// MODIFIED: Enum to support Text and Inline Data (Images)
 #[derive(Serialize, Clone, Debug)]
-#[serde(untagged)] // Critical: Serialize variants directly without wrapping
+#[serde(untagged)]
 pub enum Part {
     Text { text: String },
-    InlineData { inline_data: InlineData },
+    FileData { file_data: FileData },
 }
 
-// Helper to construct variants easily
 impl Part {
     pub fn text(t: String) -> Self {
         Part::Text { text: t }
     }
 
-    pub fn image(mime_type: String, data: String) -> Self {
-        Part::InlineData {
-            inline_data: InlineData {
+    pub fn file_data(mime_type: String, file_uri: String) -> Self {
+        Part::FileData {
+            file_data: FileData {
                 mime_type,
-                data,
+                file_uri,
             },
         }
     }
 }
 
 #[derive(Serialize, Clone, Debug)]
-pub struct InlineData {
+pub struct FileData {
+    #[serde(rename = "mimeType")]
     pub mime_type: String,
-    pub data: String, // Base64 encoded string
+    #[serde(rename = "fileUri")]
+    pub file_uri: String,
 }
 
+// Response structs for streamGenerateContent (returns an array of chunks usually)
+// But wait, the standard stream API returns a stream of JSON objects.
+// However, reqwest's `json()` reads the whole body.
+// If the endpoint is `streamGenerateContent`, the response body is a stream of JSON objects like `[{...}, {...}]` or line-delimited?
+// Google Vertex AI `streamGenerateContent` returns a JSON array `[...]`.
 #[derive(Deserialize, Debug)]
 struct GenerateContentResponse {
     candidates: Option<Vec<Candidate>>,
@@ -54,7 +59,7 @@ struct GenerateContentResponse {
 
 #[derive(Deserialize, Debug)]
 struct Candidate {
-    content: ContentResponse,
+    content: Option<ContentResponse>, // Make optional as it might be missing in some chunks
     finish_reason: Option<String>,
     safety_ratings: Option<Vec<SafetyRating>>,
 }
@@ -89,7 +94,6 @@ pub struct GeminiClient {
 
 impl GeminiClient {
     pub async fn new() -> Result<Self, String> {
-        // Vertex AI requires Project ID and Location
         let project_id = env::var("GOOGLE_CLOUD_PROJECT_ID")
             .or_else(|_| env::var("PROJECT_ID"))
             .map_err(|_| "GOOGLE_CLOUD_PROJECT_ID (or PROJECT_ID) not set".to_string())?;
@@ -100,27 +104,28 @@ impl GeminiClient {
 
         let model_name = env::var("GEMINI_MODEL_NAME").unwrap_or_else(|_| "gemini-3-pro-preview".to_string());
 
-        // Vertex AI Endpoint - Targeted at global resources via regional endpoint
+        // Use streamGenerateContent on global endpoint
         let model_url = format!(
-            "https://{}-aiplatform.googleapis.com/v1/projects/{}/locations/global/publishers/google/models/{}:generateContent",
-            location, project_id, model_name
+            "https://aiplatform.googleapis.com/v1/projects/{}/locations/global/publishers/google/models/{}:streamGenerateContent",
+            project_id, model_name
         );
 
-        // Authentication Setup - Bypass using gcloud CLI
+        // Authentication via gcloud CLI (application-default)
         let token_command = std::process::Command::new("gcloud")
             .arg("auth")
+            .arg("application-default")
             .arg("print-access-token")
             .output()
-            .map_err(|e| format!("Failed to execute 'gcloud auth print-access-token': {}", e))?;
+            .map_err(|e| format!("Failed to execute 'gcloud auth application-default print-access-token': {}", e))?;
 
         if !token_command.status.success() {
             let stderr = String::from_utf8_lossy(&token_command.stderr);
-            return Err(format!("'gcloud auth print-access-token' failed: {}", stderr));
+            return Err(format!("'gcloud auth application-default print-access-token' failed: {}", stderr));
         }
         let access_token = String::from_utf8_lossy(&token_command.stdout).trim().to_string();
 
         let client = ClientBuilder::new()
-            .timeout(Duration::from_secs(60))
+            .timeout(Duration::from_secs(120)) // Increased timeout for streaming
             .connection_verbose(true)
             .tcp_keepalive(Some(Duration::from_secs(30)))
             .build()
@@ -168,11 +173,9 @@ impl GeminiClient {
             if status.is_server_error() || status.as_u16() == 429 || status.as_u16() == 503 {
                 let text = response.text().await.unwrap_or_default();
                 error!("API Retryable Error {}: {}", status, text);
-
                 if attempt >= MAX_RETRIES {
                     return Err(format!("API Error {} Not Retried: {}", status, text));
                 }
-
                 sleep(Duration::from_secs(5 * attempt as u64)).await;
                 continue;
             }
@@ -183,34 +186,45 @@ impl GeminiClient {
                 return Err(format!("API Error {}: {}", status, text));
             }
 
-            let response_data: GenerateContentResponse = match response.json().await {
+            // For streamGenerateContent, the response is a JSON array of chunks.
+            // We parse it as a Vec<GenerateContentResponse>.
+            let response_chunks: Vec<GenerateContentResponse> = match response.json().await {
                 Ok(data) => data,
                 Err(e) => {
-                    error!("Failed to parse JSON response: {}", e);
+                    error!("Failed to parse JSON stream response: {}", e);
                     return Err(format!("Failed to parse JSON: {}", e));
                 }
             };
 
-            if let Some(feedback) = response_data.prompt_feedback {
-                if let Some(reason) = feedback.block_reason {
-                    return Err(format!("Prompt Blocked by API: {}", reason));
-                }
-            }
+            let mut full_text = String::new();
 
-            if let Some(candidates) = response_data.candidates {
-                if let Some(first_candidate) = candidates.first() {
-                    if let Some(first_part) = first_candidate.content.parts.first() {
-                        return Ok(first_part.text.clone());
+            for chunk in response_chunks {
+                 if let Some(feedback) = chunk.prompt_feedback {
+                    if let Some(reason) = feedback.block_reason {
+                        return Err(format!("Prompt Blocked by API: {}", reason));
+                    }
+                }
+
+                if let Some(candidates) = chunk.candidates {
+                    if let Some(first_candidate) = candidates.first() {
+                         if let Some(content) = &first_candidate.content {
+                             for part in &content.parts {
+                                 full_text.push_str(&part.text);
+                             }
+                         }
                     }
                 }
             }
 
-            return Err("[SIGNAL LOST] - Unexpected response format.".to_string());
+            if full_text.is_empty() {
+                 return Err("[SIGNAL LOST] - Empty response from model.".to_string());
+            }
+
+            return Ok(full_text);
         }
     }
 
     pub async fn list_vertex_models(&self) -> Result<String, String> {
-        // Retrieve location from env or default
         let location = env::var("GOOGLE_CLOUD_REGION")
             .or_else(|_| env::var("REGION"))
             .unwrap_or_else(|_| "us-central1".to_string());
@@ -219,8 +233,6 @@ impl GeminiClient {
             .or_else(|_| env::var("PROJECT_ID"))
             .map_err(|_| "GOOGLE_CLOUD_PROJECT_ID (or PROJECT_ID) not set".to_string())?;
 
-        // Target the Publishers endpoint to find Foundation Models (Gemini, etc.)
-        // URL: https://[LOCATION]-aiplatform.googleapis.com/v1/projects/[PROJECT]/locations/global/publishers/google/models
         let url = format!(
             "https://{}-aiplatform.googleapis.com/v1/projects/{}/locations/global/publishers/google/models",
             location, project_id
