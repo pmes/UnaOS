@@ -73,7 +73,10 @@ fn main(_image_handle: Handle, mut system_table: SystemTable<Boot>) -> Status {
     let fb_ptr = fb.as_mut_ptr();
     let fb_base = fb_ptr as u64;
 
-    println!("[ GOP ] Resolution: {}x{}, Stride: {}, Base: 0x{:016x}", width, height, stride, fb_base);
+    println!(
+        "[ GOP ] Resolution: {}x{}, Stride: {}, Base: 0x{:016x}",
+        width, height, stride, fb_base
+    );
 
     // Task: The Proof (Blue Screen of Life)
     // We assume 4 bytes per pixel for RGB/BGR modes.
@@ -92,13 +95,13 @@ fn main(_image_handle: Handle, mut system_table: SystemTable<Boot>) -> Status {
                         pixel_ptr.write_volatile(0);
                         pixel_ptr.add(1).write_volatile(0);
                         pixel_ptr.add(2).write_volatile(255);
-                    },
+                    }
                     PixelFormat::Bgr => {
                         // Blue: [255, 0, 0]
                         pixel_ptr.write_volatile(255);
                         pixel_ptr.add(1).write_volatile(0);
                         pixel_ptr.add(2).write_volatile(0);
-                    },
+                    }
                     _ => {
                         // Grey: [128, 128, 128] for unsupported/other
                         pixel_ptr.write_volatile(128);

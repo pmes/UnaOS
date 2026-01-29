@@ -8,7 +8,9 @@ impl MediaGraph {
         // High-Performance Strategy:
         // We will eventually pin specific threads to specific cores
         // using `core_affinity` to prevent context switching.
-        Self { worker_threads: cores }
+        Self {
+            worker_threads: cores,
+        }
     }
 
     pub fn cores(&self) -> usize {

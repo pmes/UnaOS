@@ -5,7 +5,7 @@ use memmap2::MmapOptions;
 use rand::Rng;
 use sha2::{Digest, Sha256};
 use std::fs::{File, OpenOptions};
-use std::io::{Read, Write, BufReader, BufWriter, Seek, SeekFrom};
+use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::PathBuf;
 use std::time::Instant;
 
@@ -102,13 +102,29 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     match cli.command {
         Commands::Inspect { target } => inspect_target(target),
-        Commands::Image { source, dest, block_size } => image_drive(source, dest, block_size),
-        Commands::Search { target, text, hex_pattern, limit } =>
-            search_target(target, text, hex_pattern, limit),
-        Commands::Extract { target, offset, length, out } =>
-            extract_data(target, offset, length, out),
-        Commands::Wipe { target, method, passes, force } =>
-            wipe_target(target, method, passes, force),
+        Commands::Image {
+            source,
+            dest,
+            block_size,
+        } => image_drive(source, dest, block_size),
+        Commands::Search {
+            target,
+            text,
+            hex_pattern,
+            limit,
+        } => search_target(target, text, hex_pattern, limit),
+        Commands::Extract {
+            target,
+            offset,
+            length,
+            out,
+        } => extract_data(target, offset, length, out),
+        Commands::Wipe {
+            target,
+            method,
+            passes,
+            force,
+        } => wipe_target(target, method, passes, force),
     }
 }
 
@@ -120,9 +136,8 @@ fn inspect_target(target: PathBuf) -> Result<(), Box<dyn std::error::Error>> {
 
     // SAFETY CRITICAL: Open in Read-Only mode.
     // We never open with write permissions in the inspection phase.
-    let file = File::open(&target).map_err(|e| {
-        format!("Failed to open target '{:?}': {}", target, e)
-    })?;
+    let file =
+        File::open(&target).map_err(|e| format!("Failed to open target '{:?}': {}", target, e))?;
 
     // Map the file safely into virtual memory.
     // This allows us to handle massive files (GBs/TBs) without loading them into RAM.
@@ -176,7 +191,11 @@ fn inspect_target(target: PathBuf) -> Result<(), Box<dyn std::error::Error>> {
 }
 
 // --- COMMAND 2: THE REPLICATOR (New Logic) ---
-fn image_drive(source: PathBuf, dest: PathBuf, block_size: usize) -> Result<(), Box<dyn std::error::Error>> {
+fn image_drive(
+    source: PathBuf,
+    dest: PathBuf,
+    block_size: usize,
+) -> Result<(), Box<dyn std::error::Error>> {
     println!("--- AMBER REPLICATOR INITIATED ---");
     println!("SOURCE: {:?}", source);
     println!("DEST:   {:?}", dest);
@@ -208,7 +227,9 @@ fn image_drive(source: PathBuf, dest: PathBuf, block_size: usize) -> Result<(), 
     // 5. The Copy Loop
     loop {
         let bytes_read = reader.read(&mut buffer)?;
-        if bytes_read == 0 { break; } // EOF
+        if bytes_read == 0 {
+            break;
+        } // EOF
 
         // A. Feed the Hasher
         hasher.update(&buffer[0..bytes_read]);
@@ -237,7 +258,12 @@ fn image_drive(source: PathBuf, dest: PathBuf, block_size: usize) -> Result<(), 
 }
 
 // --- COMMAND 3: THE SEEKER (New Logic) ---
-fn search_target(target: PathBuf, text: Option<String>, hex: Option<String>, limit: usize) -> Result<(), Box<dyn std::error::Error>> {
+fn search_target(
+    target: PathBuf,
+    text: Option<String>,
+    hex: Option<String>,
+    limit: usize,
+) -> Result<(), Box<dyn std::error::Error>> {
     println!("--- AMBER SEEKER ACTIVATED ---");
 
     // 1. Prepare the Needle
@@ -304,7 +330,12 @@ fn search_target(target: PathBuf, text: Option<String>, hex: Option<String>, lim
 }
 
 // --- COMMAND 4: THE SCALPEL (New Logic) ---
-fn extract_data(target: PathBuf, offset_str: String, length: usize, out_path: PathBuf) -> Result<(), Box<dyn std::error::Error>> {
+fn extract_data(
+    target: PathBuf,
+    offset_str: String,
+    length: usize,
+    out_path: PathBuf,
+) -> Result<(), Box<dyn std::error::Error>> {
     println!("--- AMBER SCALPEL ACTIVATED ---");
 
     // 1. Parse the Offset
@@ -351,7 +382,12 @@ fn parse_offset(s: &str) -> Result<u64, std::num::ParseIntError> {
 }
 
 // --- COMMAND 5: THE ERASER (New Logic) ---
-fn wipe_target(target: PathBuf, method: String, passes: usize, force: bool) -> Result<(), Box<dyn std::error::Error>> {
+fn wipe_target(
+    target: PathBuf,
+    method: String,
+    passes: usize,
+    force: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
     println!("--- AMBER ERASER INITIATED ---");
 
     // 1. Safety Check
