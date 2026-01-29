@@ -27,6 +27,7 @@ struct State {
     nav_index: usize,
     chat_history: Vec<SavedMessage>,
     sidebar_position: SidebarPosition,
+    sidebar_collapsed: bool,
 }
 
 #[derive(Clone)]
@@ -158,7 +159,24 @@ impl AppHandler for VeinApp {
                 else if text.trim() == "/sidebar_right" {
                     s.sidebar_position = SidebarPosition::Right;
                     self.append_to_console_ui("\n[SYSTEM] :: Sidebar moved to right.\n");
-                } else {
+                }
+                else if text.trim().starts_with("/read") {
+                    // /read owner repo branch path
+                    // e.g. /read unaos vein main Cargo.toml
+                    let parts: Vec<&str> = text.split_whitespace().collect();
+                    if parts.len() >= 5 {
+                        let owner = parts[1];
+                        let repo = parts[2];
+                        let branch = parts[3];
+                        let path = parts[4];
+
+                        let branch_opt = if branch == "default" || branch == "main" { None } else { Some(branch) };
+                        let _ = self.tx.send(format!("READ_REPO:{}:{}:{}:{}", owner, repo, branch_opt.unwrap_or(""), path));
+                    } else {
+                        self.append_to_console_ui("\n[SYSTEM] :: Usage: /read [owner] [repo] [branch] [path]\n");
+                    }
+                }
+                else {
                     if let Err(e) = self.tx.send(text) {
                         self.append_to_console_ui(&format!("\n[SYSTEM ERROR] :: Failed to send: {}\n", e));
                     }
@@ -218,6 +236,11 @@ impl AppHandler for VeinApp {
                 trigger_upload(path, self.tx_ui.clone());
             }
             Event::UploadRequest => {}
+            Event::ToggleSidebar => {
+                s.sidebar_collapsed = !s.sidebar_collapsed;
+                // Note: The UI widget toggling is handled in lib.rs via button connection for immediate feedback,
+                // but we update state here for persistence.
+            }
         }
     }
 
@@ -235,6 +258,7 @@ impl AppHandler for VeinApp {
             sidebar_position: s.sidebar_position.clone(),
             dock_actions: vec!["Rooms".into(), "Status".into()],
             shard_tree: Vec::new(),
+            sidebar_collapsed: s.sidebar_collapsed,
         }
     }
 }
@@ -280,6 +304,7 @@ fn main() {
         nav_index: 0,
         chat_history: saved_history,
         sidebar_position: SidebarPosition::default(),
+        sidebar_collapsed: false,
     }));
 
     let (tx_to_bg, mut rx_from_ui) = mpsc::unbounded_channel::<String>();
@@ -318,6 +343,30 @@ fn main() {
                     }
 
                     while let Some(user_input_text) = rx_from_ui.recv().await {
+                        // Handle READ_REPO special command
+                        if user_input_text.starts_with("READ_REPO:") {
+                            let parts: Vec<&str> = user_input_text.split(':').collect();
+                            if parts.len() >= 5 {
+                                let owner = parts[1];
+                                let repo = parts[2];
+                                let branch_raw = parts[3];
+                                let path = parts[4];
+
+                                let branch = if branch_raw.is_empty() { None } else { Some(branch_raw) };
+
+                                let response_msg = if let Some(client) = &forge_client {
+                                    match client.get_file_content(owner, repo, path, branch).await {
+                                        Ok(content) => format!("\n[FORGE READ] :: {}/{}/{} ::\n{}\n", owner, repo, path, content),
+                                        Err(e) => format!("\n[FORGE ERROR] :: {}\n", e),
+                                    }
+                                } else {
+                                    "\n[FORGE] :: Offline.\n".to_string()
+                                };
+                                let _ = tx_to_ui_bg_clone.send(response_msg);
+                            }
+                            continue;
+                        }
+
                         // Phase 2: Handle /forge command
                         if user_input_text.trim() == "/forge" {
                             let response_msg = if let Some(client) = &forge_client {
