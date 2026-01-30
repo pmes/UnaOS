@@ -5,7 +5,7 @@ use gtk4::{
     Application, ApplicationWindow, Box, Orientation, Label, Button, Stack, ScrolledWindow,
     PolicyType, Align, ListBox, Separator, StackTransitionType, TextView, EventControllerKey,
     TextBuffer, Adjustment, FileChooserNative, ResponseType, FileChooserAction,
-    HeaderBar, StackSwitcher, ToggleButton, CssProvider, StyleContext, IconTheme
+    HeaderBar, StackSwitcher, ToggleButton, CssProvider, StyleContext, Image
 };
 use gtk4::gdk::{Key, ModifierType};
 use std::rc::Rc;
@@ -130,12 +130,6 @@ fn build_ui(app: &Application, app_handler_rc: Rc<RefCell<impl AppHandler>>) {
     let _ = std::io::stdout().flush();
     let _ = std::io::stderr().flush();
 
-    // 1. ADD RESOURCE PATH TO THEME
-    if let Some(display) = gtk4::gdk::Display::default() {
-        let theme = IconTheme::for_display(&display);
-        theme.add_resource_path("/org/una/vein/icons");
-    }
-
     // --- MAIN WINDOW ---
     let window = ApplicationWindow::builder()
         .application(app)
@@ -163,6 +157,7 @@ fn build_ui(app: &Application, app_handler_rc: Rc<RefCell<impl AppHandler>>) {
     // --- SIDEBAR ---
     let sidebar_box = Box::new(Orientation::Vertical, 0);
     sidebar_box.set_width_request(200); // FIX: Reduced from 250
+    sidebar_box.set_hexpand(false);
     sidebar_box.add_css_class("sidebar");
 
     // Stack (Rooms | Status)
@@ -253,8 +248,9 @@ fn build_ui(app: &Application, app_handler_rc: Rc<RefCell<impl AppHandler>>) {
     // input_container.add_css_class("linked"); // Removed linked class for spacing
 
     // Upload Button (Share Symbolic)
+    let upload_icon = Image::from_resource("/org/una/vein/icons/share-symbolic");
     let upload_btn = Button::builder()
-        .icon_name("share-symbolic") // Our custom icon
+        .child(&upload_icon)
         .valign(Align::End)
         .build();
     upload_btn.add_css_class("flat");
@@ -294,6 +290,7 @@ fn build_ui(app: &Application, app_handler_rc: Rc<RefCell<impl AppHandler>>) {
         .vscrollbar_policy(PolicyType::Automatic)
         .propagate_natural_height(true)
         .max_content_height(150)
+        .min_content_height(24) // FORCE small initial height
         .vexpand(false) // CRITICAL: Do not eat vertical space
         .valign(Align::End)
         .has_frame(true)
@@ -304,13 +301,16 @@ fn build_ui(app: &Application, app_handler_rc: Rc<RefCell<impl AppHandler>>) {
         .wrap_mode(gtk4::WrapMode::WordChar)
         .accepts_tab(false)
         .top_margin(2).bottom_margin(2).left_margin(4).right_margin(4)
+        .pixels_above_lines(0)
+        .pixels_below_lines(0)
         .build();
 
     input_scroll.set_child(Some(&text_view));
 
     // Send Button (Paper Plane Symbolic)
+    let send_icon = Image::from_resource("/org/una/vein/icons/paper-plane-symbolic");
     let send_btn = Button::builder()
-        .icon_name("paper-plane-symbolic") // Our custom icon
+        .child(&send_icon)
         .valign(Align::End)
         .css_classes(vec!["suggested-action"])
         .build();
