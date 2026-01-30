@@ -263,6 +263,9 @@ impl AppHandler for VeinApp {
     }
 }
 
+// Embed the compiled resource file directly into the binary
+static RESOURCES_BYTES: &[u8] = include_bytes!("resources.gresource");
+
 fn main() {
     let app_start_time = Instant::now();
     dotenv().ok();
@@ -494,7 +497,7 @@ fn main() {
     info!(":: VEIN :: Engaging Chassis...");
 
     // Load resources (embedded)
-    let bytes = glib::Bytes::from_static(include_bytes!("resources.gresource"));
+    let bytes = glib::Bytes::from_static(RESOURCES_BYTES);
     let res = gtk4::gio::Resource::from_data(&bytes).expect("Failed to load resources");
     gtk4::gio::resources_register(&res);
 
