@@ -492,6 +492,12 @@ fn main() {
     });
 
     info!(":: VEIN :: Engaging Chassis...");
+
+    // Load resources (embedded)
+    let bytes = glib::Bytes::from_static(include_bytes!("resources.gresource"));
+    let res = gtk4::gio::Resource::from_data(&bytes).expect("Failed to load resources");
+    gtk4::gio::resources_register(&res);
+
     let tx_to_ui_for_app = tx_to_ui.clone();
     let app = VeinApp::new(tx_to_bg, state.clone(), ui_updater_rc_clone_for_app, tx_to_ui_for_app);
 
