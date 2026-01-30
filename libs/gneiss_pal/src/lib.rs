@@ -4,7 +4,8 @@ use gtk4::prelude::*;
 use gtk4::{
     Application, ApplicationWindow, Box, Orientation, Label, Button, Stack, ScrolledWindow,
     PolicyType, Align, ListBox, Separator, StackTransitionType, TextView, EventControllerKey,
-    TextBuffer, Adjustment, FileChooserNative, ResponseType, FileChooserAction
+    TextBuffer, Adjustment, FileChooserNative, ResponseType, FileChooserAction, WindowHandle,
+    WindowControls
 };
 use gtk4::gdk::{Key, ModifierType};
 use std::rc::Rc;
@@ -137,17 +138,63 @@ fn build_ui(app: &Application, app_handler_rc: Rc<RefCell<impl AppHandler>>) {
         .title("Vein (Powered by unaOS Gneiss)")
         .build();
 
+    // --- CUSTOM TITLEBAR (Header Architecture) ---
+    let header_box = Box::new(Orientation::Horizontal, 0);
+    header_box.add_css_class("titlebar");
+
+    // Left Header Area (matches sidebar width approx)
+    let left_header_box = Box::new(Orientation::Horizontal, 0);
+    left_header_box.set_width_request(260);
+
+    // Sidebar Header Content (Draggable)
+    let sidebar_handle = WindowHandle::new();
+    let sidebar_header_content = Box::new(Orientation::Horizontal, 10);
+    set_margins(&sidebar_header_content, 10);
+    // Placeholder title or logo could go here
+    sidebar_handle.set_child(Some(&sidebar_header_content));
+    left_header_box.append(&sidebar_handle);
+
+    header_box.append(&left_header_box);
+    header_box.append(&Separator::new(Orientation::Vertical));
+
+    // Right Header Area (Main Content Controls + Window Controls)
+    let right_header_box = Box::new(Orientation::Horizontal, 0);
+    right_header_box.set_hexpand(true);
+
+    // Main Content Header Handle (Draggable)
+    let main_handle = WindowHandle::new();
+    let main_header_content = Box::new(Orientation::Horizontal, 10);
+    main_header_content.set_hexpand(true);
+    // Margins to align visually
+    set_margins(&main_header_content, 6);
+
+    // Toggle button (moved to main header area)
+    let toggle_btn = Button::builder()
+        .icon_name("sidebar-show-symbolic")
+        .css_classes(vec!["flat"])
+        .build();
+    // Logic connected later
+
+    main_header_content.append(&toggle_btn);
+    main_handle.set_child(Some(&main_header_content));
+
+    right_header_box.append(&main_handle);
+
+    // Window Controls (Close/Max/Min)
+    let window_controls = WindowControls::new(gtk4::PackType::End);
+    right_header_box.append(&window_controls);
+
+    header_box.append(&right_header_box);
+
+    window.set_titlebar(Some(&header_box));
+
     let split_view = libadwaita::OverlaySplitView::new();
     window.set_child(Some(&split_view));
 
     // --- SIDEBAR (Left/Right Panel) ---
     let sidebar_box = Box::new(Orientation::Vertical, 0);
     sidebar_box.set_width_request(260);
-
-    let sidebar_header = libadwaita::HeaderBar::new();
-    sidebar_header.set_show_end_title_buttons(false);
-    sidebar_header.set_show_start_title_buttons(false);
-    sidebar_box.append(&sidebar_header);
+    // Removed legacy HeaderBar
 
     let sidebar_stack = Stack::new();
     sidebar_stack.set_vexpand(true);
@@ -233,23 +280,13 @@ fn build_ui(app: &Application, app_handler_rc: Rc<RefCell<impl AppHandler>>) {
 
     scrolled_window.set_child(Some(&console_text_view));
 
-    // Add Main Content HeaderBar with Toggle Button
-    let content_header = libadwaita::HeaderBar::new();
-    content_header.set_show_end_title_buttons(true);
-    content_header.set_show_start_title_buttons(true);
-
-    // Toggle button in content header (top-left)
-    let toggle_btn = Button::builder()
-        .icon_name("sidebar-show-symbolic")
-        .css_classes(vec!["flat"])
-        .build();
+    // Legacy HeaderBar removed.
+    // Connect the Toggle Button we created in the custom titlebar
     let app_handler_rc_for_toggle = app_handler_rc.clone();
     toggle_btn.connect_clicked(move |_| {
         app_handler_rc_for_toggle.borrow_mut().handle_event(Event::ToggleSidebar);
     });
-    content_header.pack_start(&toggle_btn);
 
-    main_content_box.append(&content_header);
     main_content_box.append(&scrolled_window);
 
     // --- INPUT AREA ---
@@ -295,6 +332,7 @@ fn build_ui(app: &Application, app_handler_rc: Rc<RefCell<impl AppHandler>>) {
     let input_scroll = ScrolledWindow::builder()
         .hscrollbar_policy(PolicyType::Never)
         .vscrollbar_policy(PolicyType::Automatic)
+        .propagate_natural_height(true) // Key property for growing input
         .has_frame(true)
         .hexpand(true)
         .height_request(45)
@@ -308,7 +346,7 @@ fn build_ui(app: &Application, app_handler_rc: Rc<RefCell<impl AppHandler>>) {
         .build();
 
     input_scroll.set_child(Some(&text_view));
-    let send_btn = Button::builder().icon_name("share-symbolic").valign(Align::End).css_classes(vec!["suggested-action"]).build();
+    let send_btn = Button::builder().icon_name("paper-plane-symbolic").valign(Align::End).css_classes(vec!["suggested-action"]).build();
 
     let app_handler_rc_for_send = app_handler_rc.clone();
     let text_view_for_send = text_view.clone();
