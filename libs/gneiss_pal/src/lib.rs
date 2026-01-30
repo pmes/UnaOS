@@ -177,7 +177,7 @@ fn build_ui(app: &Application, app_handler_rc: Rc<RefCell<impl AppHandler>>) {
         let idx = row.index() as usize;
         app_handler_rc_clone_for_nav.borrow_mut().handle_event(Event::NavSelect(idx));
     });
-    sidebar_stack.add_named(&rooms_list, Some("rooms"));
+    sidebar_stack.add_titled(&rooms_list, Some("rooms"), "Rooms");
 
     // Page 2: Status
     let status_box = Box::new(Orientation::Vertical, 10);
@@ -192,7 +192,7 @@ fn build_ui(app: &Application, app_handler_rc: Rc<RefCell<impl AppHandler>>) {
     status_box.append(&relink_btn);
     // TODO: Connect relink button to handler
 
-    sidebar_stack.add_named(&status_box, Some("status"));
+    sidebar_stack.add_titled(&status_box, Some("status"), "Status");
 
     sidebar_box.append(&sidebar_stack);
 
@@ -286,7 +286,6 @@ fn build_ui(app: &Application, app_handler_rc: Rc<RefCell<impl AppHandler>>) {
         .vscrollbar_policy(PolicyType::Automatic)
         .propagate_natural_height(true)
         .max_content_height(150)
-        .min_content_height(38)
         .vexpand(false) // CRITICAL: Do not eat vertical space
         .valign(Align::End)
         .has_frame(true)
@@ -296,7 +295,7 @@ fn build_ui(app: &Application, app_handler_rc: Rc<RefCell<impl AppHandler>>) {
     let text_view = TextView::builder()
         .wrap_mode(gtk4::WrapMode::WordChar)
         .accepts_tab(false)
-        .top_margin(8).bottom_margin(8).left_margin(8).right_margin(8)
+        .top_margin(2).bottom_margin(2).left_margin(8).right_margin(8)
         .build();
 
     input_scroll.set_child(Some(&text_view));
