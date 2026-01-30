@@ -5,7 +5,7 @@ use gtk4::{
     Application, ApplicationWindow, Box, Orientation, Label, Button, Stack, ScrolledWindow,
     PolicyType, Align, ListBox, Separator, StackTransitionType, TextView, EventControllerKey,
     TextBuffer, Adjustment, FileChooserNative, ResponseType, FileChooserAction,
-    HeaderBar, ActionBar, StackSwitcher, ToggleButton, IconTheme
+    HeaderBar, ActionBar, StackSwitcher, ToggleButton, Image, CssProvider, StyleContext, WindowControls
 };
 use gtk4::gdk::{Key, ModifierType};
 use std::rc::Rc;
@@ -130,12 +130,6 @@ fn build_ui(app: &Application, app_handler_rc: Rc<RefCell<impl AppHandler>>) {
     let _ = std::io::stdout().flush();
     let _ = std::io::stderr().flush();
 
-    // 1. ADD RESOURCE PATH TO THEME
-    if let Some(display) = gtk4::gdk::Display::default() {
-        let theme = IconTheme::for_display(&display);
-        theme.add_resource_path("/org/una/vein/icons");
-    }
-
     // --- MAIN WINDOW ---
     let window = ApplicationWindow::builder()
         .application(app)
@@ -147,9 +141,10 @@ fn build_ui(app: &Application, app_handler_rc: Rc<RefCell<impl AppHandler>>) {
     // --- HEADER BAR ---
     let header_bar = HeaderBar::new();
 
-    // Sidebar Toggle (Left)
+    // Icon: Toggle (Standard system icon fallback)
+    let toggle_icon = Image::from_icon_name("sidebar-show-symbolic");
     let sidebar_toggle = ToggleButton::builder()
-        .icon_name("sidebar-show-symbolic")
+        .child(&toggle_icon)
         .active(true)
         .tooltip_text("Toggle Sidebar")
         .build();
@@ -162,7 +157,7 @@ fn build_ui(app: &Application, app_handler_rc: Rc<RefCell<impl AppHandler>>) {
 
     // --- SIDEBAR ---
     let sidebar_box = Box::new(Orientation::Vertical, 0);
-    sidebar_box.set_width_request(250);
+    sidebar_box.set_width_request(200); // FIX: Reduced from 250
     sidebar_box.add_css_class("sidebar");
 
     // Stack (Rooms | Status)
@@ -190,6 +185,13 @@ fn build_ui(app: &Application, app_handler_rc: Rc<RefCell<impl AppHandler>>) {
     status_box.append(&Label::builder().label(":: SYSTEM STATUS ::").css_classes(vec!["heading"]).build());
     status_box.append(&make_status_row("S9 (Upload)", "🟢 Online"));
     status_box.append(&make_status_row("Una (Link)", "🟢 Connected"));
+
+    // Re-Link Button
+    let relink_btn = Button::with_label("Re-Link Brain");
+    relink_btn.add_css_class("destructive-action");
+    status_box.append(&relink_btn);
+    // TODO: Connect relink button to handler
+
     sidebar_stack.add_named(&status_box, Some("status"));
 
     sidebar_box.append(&sidebar_stack);
@@ -223,8 +225,8 @@ fn build_ui(app: &Application, app_handler_rc: Rc<RefCell<impl AppHandler>>) {
     let console_text_view = TextView::builder()
         .wrap_mode(gtk4::WrapMode::WordChar)
         .editable(false)
+        .monospace(true)
         .buffer(&text_buffer)
-        .vexpand(true)
         .margin_start(12).margin_end(12).margin_top(12).margin_bottom(12)
         .build();
 
@@ -236,15 +238,18 @@ fn build_ui(app: &Application, app_handler_rc: Rc<RefCell<impl AppHandler>>) {
     content_box.append(&scrolled_window);
 
     // Input Area
-    let input_container = Box::new(Orientation::Horizontal, 10);
+    let input_container = Box::new(Orientation::Horizontal, 8);
     set_margins(&input_container, 10);
-    input_container.add_css_class("linked");
+    input_container.set_valign(Align::End);
+    // input_container.add_css_class("linked"); // Removed linked class for spacing
 
-    // Upload Button (Share Symbolic)
+    // Upload Button (Explicit Resource)
+    let upload_icon = Image::from_resource("/org/una/vein/icons/share-symbolic");
     let upload_btn = Button::builder()
-        .icon_name("share-symbolic") // Our custom icon
-        .valign(Align::End)
+        .child(&upload_icon)
+        .valign(Align::End) // Align to bottom
         .build();
+    upload_btn.add_css_class("flat");
 
     let app_handler_rc_for_upload = app_handler_rc.clone();
     let window_weak = window.downgrade();
@@ -275,16 +280,18 @@ fn build_ui(app: &Application, app_handler_rc: Rc<RefCell<impl AppHandler>>) {
     });
     input_container.append(&upload_btn);
 
-    // Input Field
+    // Input Field (FIXED HEIGHT)
     let input_scroll = ScrolledWindow::builder()
         .hscrollbar_policy(PolicyType::Never)
         .vscrollbar_policy(PolicyType::Automatic)
         .propagate_natural_height(true)
-        .has_frame(true)
-        .hexpand(true)
-        .height_request(45)
         .max_content_height(150)
+        .min_content_height(38)
+        .vexpand(false) // CRITICAL: Do not eat vertical space
+        .valign(Align::End)
+        .has_frame(true)
         .build();
+    input_scroll.set_hexpand(true);
 
     let text_view = TextView::builder()
         .wrap_mode(gtk4::WrapMode::WordChar)
@@ -294,9 +301,10 @@ fn build_ui(app: &Application, app_handler_rc: Rc<RefCell<impl AppHandler>>) {
 
     input_scroll.set_child(Some(&text_view));
 
-    // Send Button (Paper Plane Symbolic)
+    // Send Button (Explicit Resource)
+    let send_icon = Image::from_resource("/org/una/vein/icons/paper-plane-symbolic");
     let send_btn = Button::builder()
-        .icon_name("paper-plane-symbolic") // Our custom icon
+        .child(&send_icon)
         .valign(Align::End)
         .css_classes(vec!["suggested-action"])
         .build();
@@ -361,6 +369,19 @@ fn build_ui(app: &Application, app_handler_rc: Rc<RefCell<impl AppHandler>>) {
         sidebar_toggle.set_active(false);
         sidebar_box.set_visible(false);
     }
+
+    // CSS
+    let provider = CssProvider::new();
+    provider.load_from_data("
+        window { border-radius: 8px; }
+        .sidebar { background: #1e1e1e; }
+        textview { font-family: 'Monospace'; font-size: 11pt; }
+    ");
+    StyleContext::add_provider_for_display(
+        &gtk4::gdk::Display::default().expect("No display"),
+        &provider,
+        gtk4::STYLE_PROVIDER_PRIORITY_APPLICATION,
+    );
 
     window.present();
     info!("UI_BUILD: Window presented. Total build_ui duration: {:?}", ui_build_start_time.elapsed());
