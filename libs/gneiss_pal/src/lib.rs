@@ -300,8 +300,8 @@ fn build_ui(app: &Application, app_handler_rc: Rc<RefCell<impl AppHandler>>) {
     let text_view = TextView::builder()
         .wrap_mode(gtk4::WrapMode::WordChar)
         .accepts_tab(false)
-        .top_margin(6)
-        .bottom_margin(6)
+        .top_margin(2)
+        .bottom_margin(2)
         .left_margin(8)
         .right_margin(8)
         .build();
