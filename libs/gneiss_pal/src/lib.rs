@@ -5,7 +5,7 @@ use gtk4::{
     Application, ApplicationWindow, Box, Orientation, Label, Button, Stack, ScrolledWindow,
     PolicyType, Align, ListBox, Separator, StackTransitionType, TextView, EventControllerKey,
     TextBuffer, Adjustment, FileChooserNative, ResponseType, FileChooserAction,
-    HeaderBar, ActionBar, StackSwitcher, ToggleButton, Image, CssProvider, StyleContext, WindowControls
+    HeaderBar, StackSwitcher, ToggleButton, CssProvider, StyleContext, IconTheme
 };
 use gtk4::gdk::{Key, ModifierType};
 use std::rc::Rc;
@@ -130,6 +130,12 @@ fn build_ui(app: &Application, app_handler_rc: Rc<RefCell<impl AppHandler>>) {
     let _ = std::io::stdout().flush();
     let _ = std::io::stderr().flush();
 
+    // 1. ADD RESOURCE PATH TO THEME
+    if let Some(display) = gtk4::gdk::Display::default() {
+        let theme = IconTheme::for_display(&display);
+        theme.add_resource_path("/org/una/vein/icons");
+    }
+
     // --- MAIN WINDOW ---
     let window = ApplicationWindow::builder()
         .application(app)
@@ -141,10 +147,9 @@ fn build_ui(app: &Application, app_handler_rc: Rc<RefCell<impl AppHandler>>) {
     // --- HEADER BAR ---
     let header_bar = HeaderBar::new();
 
-    // Icon: Toggle (Standard system icon fallback)
-    let toggle_icon = Image::from_icon_name("sidebar-show-symbolic");
+    // Sidebar Toggle (Left)
     let sidebar_toggle = ToggleButton::builder()
-        .child(&toggle_icon)
+        .icon_name("sidebar-show-symbolic")
         .active(true)
         .tooltip_text("Toggle Sidebar")
         .build();
@@ -196,14 +201,18 @@ fn build_ui(app: &Application, app_handler_rc: Rc<RefCell<impl AppHandler>>) {
 
     sidebar_box.append(&sidebar_stack);
 
-    // ActionBar (Tabs)
-    let action_bar = ActionBar::new();
+    // Tabs (Box) - Replaces ActionBar
+    let tab_box = Box::new(Orientation::Horizontal, 0);
+    tab_box.set_halign(Align::Center);
+    tab_box.set_margin_top(5);
+    tab_box.set_margin_bottom(5);
+
     let stack_switcher = StackSwitcher::builder()
         .stack(&sidebar_stack)
         .build();
-    action_bar.set_center_widget(Some(&stack_switcher));
+    tab_box.append(&stack_switcher);
 
-    sidebar_box.append(&action_bar);
+    sidebar_box.append(&tab_box);
 
     body_box.append(&sidebar_box);
     body_box.append(&Separator::new(Orientation::Vertical));
@@ -243,11 +252,10 @@ fn build_ui(app: &Application, app_handler_rc: Rc<RefCell<impl AppHandler>>) {
     input_container.set_valign(Align::End);
     // input_container.add_css_class("linked"); // Removed linked class for spacing
 
-    // Upload Button (Explicit Resource)
-    let upload_icon = Image::from_resource("/org/una/vein/icons/share-symbolic");
+    // Upload Button (Share Symbolic)
     let upload_btn = Button::builder()
-        .child(&upload_icon)
-        .valign(Align::End) // Align to bottom
+        .icon_name("share-symbolic") // Our custom icon
+        .valign(Align::End)
         .build();
     upload_btn.add_css_class("flat");
 
@@ -295,15 +303,14 @@ fn build_ui(app: &Application, app_handler_rc: Rc<RefCell<impl AppHandler>>) {
     let text_view = TextView::builder()
         .wrap_mode(gtk4::WrapMode::WordChar)
         .accepts_tab(false)
-        .top_margin(2).bottom_margin(2).left_margin(8).right_margin(8)
+        .top_margin(2).bottom_margin(2).left_margin(4).right_margin(4)
         .build();
 
     input_scroll.set_child(Some(&text_view));
 
-    // Send Button (Explicit Resource)
-    let send_icon = Image::from_resource("/org/una/vein/icons/paper-plane-symbolic");
+    // Send Button (Paper Plane Symbolic)
     let send_btn = Button::builder()
-        .child(&send_icon)
+        .icon_name("paper-plane-symbolic") // Our custom icon
         .valign(Align::End)
         .css_classes(vec!["suggested-action"])
         .build();
@@ -374,7 +381,7 @@ fn build_ui(app: &Application, app_handler_rc: Rc<RefCell<impl AppHandler>>) {
     provider.load_from_data("
         window { border-radius: 8px; }
         .sidebar { background: #1e1e1e; }
-        textview { font-family: 'Monospace'; font-size: 11pt; }
+        textview { font-family: 'Monospace'; font-size: 11pt; padding: 0px; }
     ");
     StyleContext::add_provider_for_display(
         &gtk4::gdk::Display::default().expect("No display"),
