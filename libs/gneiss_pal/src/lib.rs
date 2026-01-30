@@ -147,18 +147,6 @@ fn build_ui(app: &Application, app_handler_rc: Rc<RefCell<impl AppHandler>>) {
     let sidebar_header = libadwaita::HeaderBar::new();
     sidebar_header.set_show_end_title_buttons(false);
     sidebar_header.set_show_start_title_buttons(false);
-
-    // Toggle button in header
-    let toggle_btn = Button::builder()
-        .icon_name("sidebar-show-symbolic")
-        .css_classes(vec!["flat"])
-        .build();
-    let app_handler_rc_for_toggle = app_handler_rc.clone();
-    toggle_btn.connect_clicked(move |_| {
-        app_handler_rc_for_toggle.borrow_mut().handle_event(Event::ToggleSidebar);
-    });
-    sidebar_header.pack_end(&toggle_btn);
-
     sidebar_box.append(&sidebar_header);
 
     let sidebar_stack = Stack::new();
@@ -237,7 +225,31 @@ fn build_ui(app: &Application, app_handler_rc: Rc<RefCell<impl AppHandler>>) {
 
     app_handler_rc.borrow_mut().handle_event(Event::TextBufferUpdate(text_buffer_clone, scrolled_window_adj_clone));
 
+    // Add margins to the console view container for better readability
+    console_text_view.set_margin_start(12);
+    console_text_view.set_margin_end(12);
+    console_text_view.set_margin_top(12);
+    console_text_view.set_margin_bottom(12);
+
     scrolled_window.set_child(Some(&console_text_view));
+
+    // Add Main Content HeaderBar with Toggle Button
+    let content_header = libadwaita::HeaderBar::new();
+    content_header.set_show_end_title_buttons(true);
+    content_header.set_show_start_title_buttons(true);
+
+    // Toggle button in content header (top-left)
+    let toggle_btn = Button::builder()
+        .icon_name("sidebar-show-symbolic")
+        .css_classes(vec!["flat"])
+        .build();
+    let app_handler_rc_for_toggle = app_handler_rc.clone();
+    toggle_btn.connect_clicked(move |_| {
+        app_handler_rc_for_toggle.borrow_mut().handle_event(Event::ToggleSidebar);
+    });
+    content_header.pack_start(&toggle_btn);
+
+    main_content_box.append(&content_header);
     main_content_box.append(&scrolled_window);
 
     // --- INPUT AREA ---
@@ -246,7 +258,7 @@ fn build_ui(app: &Application, app_handler_rc: Rc<RefCell<impl AppHandler>>) {
     input_container.add_css_class("linked");
 
     // NEW: Upload Button logic using pure GTK4 FileChooserNative
-    let upload_btn = Button::builder().icon_name("paperclip-symbolic").valign(Align::End).css_classes(vec!["suggested-action"]).build();
+    let upload_btn = Button::builder().icon_name("file-cabinet-symbolic").valign(Align::End).css_classes(vec!["suggested-action"]).build();
     let app_handler_rc_for_upload = app_handler_rc.clone();
     let window_weak = window.downgrade(); // Use weak ref to avoid cycles
 
@@ -296,7 +308,7 @@ fn build_ui(app: &Application, app_handler_rc: Rc<RefCell<impl AppHandler>>) {
         .build();
 
     input_scroll.set_child(Some(&text_view));
-    let send_btn = Button::builder().icon_name("mail-send-symbolic").valign(Align::End).css_classes(vec!["suggested-action"]).build();
+    let send_btn = Button::builder().icon_name("share-symbolic").valign(Align::End).css_classes(vec!["suggested-action"]).build();
 
     let app_handler_rc_for_send = app_handler_rc.clone();
     let text_view_for_send = text_view.clone();
