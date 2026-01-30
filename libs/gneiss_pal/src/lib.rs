@@ -253,7 +253,6 @@ fn build_ui(app: &Application, app_handler_rc: Rc<RefCell<impl AppHandler>>) {
         .child(&upload_icon)
         .valign(Align::End)
         .build();
-    upload_btn.add_css_class("flat");
 
     let app_handler_rc_for_upload = app_handler_rc.clone();
     let window_weak = window.downgrade();
@@ -290,20 +289,24 @@ fn build_ui(app: &Application, app_handler_rc: Rc<RefCell<impl AppHandler>>) {
         .vscrollbar_policy(PolicyType::Automatic)
         .propagate_natural_height(true)
         .max_content_height(150)
-        .min_content_height(24) // FORCE small initial height
-        .vexpand(false) // CRITICAL: Do not eat vertical space
-        .valign(Align::End)
-        .has_frame(true)
+        .vexpand(false)
+        .valign(Align::Fill)
+        .has_frame(false)
         .build();
+
     input_scroll.set_hexpand(true);
+    input_scroll.add_css_class("chat-input-area");
 
     let text_view = TextView::builder()
         .wrap_mode(gtk4::WrapMode::WordChar)
         .accepts_tab(false)
-        .top_margin(2).bottom_margin(2).left_margin(4).right_margin(4)
-        .pixels_above_lines(0)
-        .pixels_below_lines(0)
+        .top_margin(6)
+        .bottom_margin(6)
+        .left_margin(8)
+        .right_margin(8)
         .build();
+
+    text_view.add_css_class("transparent-text");
 
     input_scroll.set_child(Some(&text_view));
 
@@ -314,6 +317,17 @@ fn build_ui(app: &Application, app_handler_rc: Rc<RefCell<impl AppHandler>>) {
         .valign(Align::End)
         .css_classes(vec!["suggested-action"])
         .build();
+
+    // VISUAL ONLY: Blue for quick chat, Gray for long edits.
+    let buffer = text_view.buffer();
+    let btn_style_clone = send_btn.clone();
+    buffer.connect_changed(move |buf| {
+        if buf.line_count() > 1 {
+            btn_style_clone.remove_css_class("suggested-action");
+        } else {
+            btn_style_clone.add_css_class("suggested-action");
+        }
+    });
 
     let app_handler_rc_for_send = app_handler_rc.clone();
     let text_view_for_send = text_view.clone();
@@ -381,6 +395,28 @@ fn build_ui(app: &Application, app_handler_rc: Rc<RefCell<impl AppHandler>>) {
     provider.load_from_data("
         window { border-radius: 8px; }
         .sidebar { background: #1e1e1e; }
+
+        /* THE PILL: Distinct, rounded, bordered */
+        .chat-input-area {
+            background: #2d2d2d;
+            border: 1px solid #555555;
+            border-radius: 20px; /* The \"Bubble\" look */
+            transition: border-color 0.2s;
+        }
+
+        /* Focus Glow */
+        .chat-input-area:focus-within {
+            border-color: #3584e4;
+            background: #333333;
+        }
+
+        /* Make the TextView invisible so the Pill shines through */
+        .transparent-text {
+            background: transparent;
+            caret-color: white;
+            color: white;
+        }
+
         textview { font-family: 'Monospace'; font-size: 11pt; padding: 0px; }
     ");
     StyleContext::add_provider_for_display(
