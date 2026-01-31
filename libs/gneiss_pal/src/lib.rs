@@ -503,6 +503,7 @@ fn build_ui(app: &Application, app_handler_rc: Rc<RefCell<impl AppHandler>>) {
             background: #2d2d2d;
             border: 1px solid #555555;
             border-radius: 20px;
+            overflow: hidden; /* CRITICAL FIX: Clips the square child */
             transition: border-color 0.2s;
         }
 
