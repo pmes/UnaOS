@@ -2,7 +2,7 @@
 
 use gtk4::prelude::*;
 use gtk4::{
-    Application, ApplicationWindow, Box, Orientation, Label, Button, Stack, ScrolledWindow,
+    Application, Box, Orientation, Label, Button, Stack, ScrolledWindow,
     PolicyType, Align, ListBox, Separator, StackTransitionType, TextView, EventControllerKey,
     TextBuffer, Adjustment, FileChooserNative, ResponseType, FileChooserAction,
     HeaderBar, StackSwitcher, ToggleButton, CssProvider, StyleContext, Image
@@ -17,6 +17,8 @@ use std::io::Write;
 use std::path::PathBuf;
 
 pub mod persistence;
+mod window;
+use window::UnaWindow;
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum ViewMode {
@@ -131,12 +133,7 @@ fn build_ui(app: &Application, app_handler_rc: Rc<RefCell<impl AppHandler>>) {
     let _ = std::io::stderr().flush();
 
     // --- MAIN WINDOW ---
-    let window = ApplicationWindow::builder()
-        .application(app)
-        .default_width(1100)
-        .default_height(750)
-        .title("Vein")
-        .build();
+    let window = UnaWindow::new(app);
 
     // --- HEADER BAR ---
     let header_bar = HeaderBar::new();
@@ -373,7 +370,7 @@ fn build_ui(app: &Application, app_handler_rc: Rc<RefCell<impl AppHandler>>) {
     content_box.append(&input_container);
 
     body_box.append(&content_box);
-    window.set_child(Some(&body_box));
+    window.set_content(&body_box);
 
     // Toggle Logic
     let sidebar_box_clone = sidebar_box.clone();
