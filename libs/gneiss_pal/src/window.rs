@@ -56,10 +56,15 @@ impl UnaWindow {
         }
     }
 
+    #[allow(unused_variables)]
     pub fn set_titlebar(&self, titlebar: Option<&impl IsA<Widget>>) {
         match &self.inner {
             #[cfg(feature = "gnome")]
-            WindowBackend::Adwaita(w) => w.set_titlebar(titlebar),
+            WindowBackend::Adwaita(_w) => {
+                // CRITICAL FIX: Adwaita forbids set_titlebar.
+                // We ignore this call to prevent a crash.
+                // In S23, we will map this to an AdwToolbarView.
+            },
             #[cfg(not(feature = "gnome"))]
             WindowBackend::Gtk(w) => w.set_titlebar(titlebar),
         }
