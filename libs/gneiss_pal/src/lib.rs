@@ -5,7 +5,8 @@ use gtk4::{
     Application, Box, Orientation, Label, Button, Stack, ScrolledWindow,
     PolicyType, Align, ListBox, Separator, StackTransitionType, TextView, EventControllerKey,
     TextBuffer, Adjustment, FileChooserNative, ResponseType, FileChooserAction,
-    HeaderBar, StackSwitcher, ToggleButton, CssProvider, StyleContext, Image, MenuButton, Popover
+    HeaderBar, StackSwitcher, ToggleButton, CssProvider, StyleContext, Image, MenuButton, Popover,
+    Paned
 };
 use gtk4::gdk::{Key, ModifierType};
 use std::rc::Rc;
@@ -203,6 +204,13 @@ fn build_ui(app: &Application, app_handler_rc: Rc<RefCell<impl AppHandler>>) {
     let popover_box = Box::new(Orientation::Vertical, 5);
     set_margins(&popover_box, 5);
 
+    // System Info Button
+    let info_btn = Button::builder()
+        .label("System Info")
+        .icon_name("dialog-information-symbolic")
+        .build();
+    popover_box.append(&info_btn);
+
     let relink_btn = Button::with_label("Re-Link Brain");
     relink_btn.add_css_class("destructive-action");
     relink_btn.connect_clicked(move |_| {
@@ -247,11 +255,13 @@ fn build_ui(app: &Application, app_handler_rc: Rc<RefCell<impl AppHandler>>) {
     body_box.append(&sidebar_box);
     body_box.append(&Separator::new(Orientation::Vertical));
 
-    // --- CONTENT ---
-    let content_box = Box::new(Orientation::Vertical, 0);
-    content_box.set_hexpand(true);
+    // --- CONTENT (Paned) ---
+    let paned = Paned::new(Orientation::Vertical);
+    paned.set_vexpand(true);
+    paned.set_hexpand(true);
+    paned.set_position(500);
 
-    // Console
+    // Console (Top Pane)
     let scrolled_window = ScrolledWindow::builder()
         .hscrollbar_policy(PolicyType::Never)
         .vscrollbar_policy(PolicyType::Automatic)
@@ -274,12 +284,11 @@ fn build_ui(app: &Application, app_handler_rc: Rc<RefCell<impl AppHandler>>) {
     app_handler_rc.borrow_mut().handle_event(Event::TextBufferUpdate(text_buffer_clone, scrolled_window_adj_clone));
 
     scrolled_window.set_child(Some(&console_text_view));
-    content_box.append(&scrolled_window);
+    paned.set_start_child(Some(&scrolled_window));
 
-    // Input Area
+    // Input Area (Bottom Pane)
     let input_container = Box::new(Orientation::Horizontal, 8);
     set_margins(&input_container, 10);
-    input_container.set_valign(Align::End);
     // input_container.add_css_class("linked"); // Removed linked class for spacing
 
     // Upload Button (Share Symbolic)
@@ -318,13 +327,13 @@ fn build_ui(app: &Application, app_handler_rc: Rc<RefCell<impl AppHandler>>) {
     });
     input_container.append(&upload_btn);
 
-    // Input Field (FIXED HEIGHT)
+    // Input Field
     let input_scroll = ScrolledWindow::builder()
         .hscrollbar_policy(PolicyType::Never)
         .vscrollbar_policy(PolicyType::Automatic)
         .propagate_natural_height(true)
-        .max_content_height(150)
-        .vexpand(false)
+        .max_content_height(500)
+        .vexpand(true)
         .valign(Align::Fill)
         .has_frame(false)
         .build();
@@ -405,9 +414,10 @@ fn build_ui(app: &Application, app_handler_rc: Rc<RefCell<impl AppHandler>>) {
 
     input_container.append(&input_scroll);
     input_container.append(&send_btn);
-    content_box.append(&input_container);
 
-    body_box.append(&content_box);
+    paned.set_end_child(Some(&input_container));
+
+    body_box.append(&paned);
     window.set_content(&body_box);
 
     // Toggle Logic
@@ -453,6 +463,8 @@ fn build_ui(app: &Application, app_handler_rc: Rc<RefCell<impl AppHandler>>) {
         }
 
         textview { font-family: 'Monospace'; font-size: 11pt; padding: 0px; }
+        .success { color: #2ec27e; }
+        .dim-label { opacity: 0.5; }
     ");
     StyleContext::add_provider_for_display(
         &gtk4::gdk::Display::default().expect("No display"),
