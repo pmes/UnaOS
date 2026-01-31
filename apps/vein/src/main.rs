@@ -1,6 +1,6 @@
 use dotenvy::dotenv;
 use gneiss_pal::persistence::{BrainManager, SavedMessage};
-use gneiss_pal::{AppHandler, Backend, DashboardState, Event, SidebarPosition, ViewMode, Shard, ShardStatus, ShardRole};
+use gneiss_pal::{AppHandler, Backend, DashboardState, Event, SidebarPosition, ViewMode, Shard, ShardStatus, ShardRole, GuiUpdate};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use tokio::runtime::Runtime;
@@ -116,11 +116,12 @@ struct VeinApp {
     tx: mpsc::UnboundedSender<String>,
     ui_updater: Rc<RefCell<Option<UiUpdater>>>,
     tx_ui: mpsc::UnboundedSender<String>,
+    gui_tx: async_channel::Sender<GuiUpdate>,
 }
 
 impl VeinApp {
-    fn new(tx: mpsc::UnboundedSender<String>, state: Arc<Mutex<State>>, ui_updater_rc: Rc<RefCell<Option<UiUpdater>>>, tx_ui: mpsc::UnboundedSender<String>) -> Self {
-        Self { state, tx, ui_updater: ui_updater_rc, tx_ui }
+    fn new(tx: mpsc::UnboundedSender<String>, state: Arc<Mutex<State>>, ui_updater_rc: Rc<RefCell<Option<UiUpdater>>>, tx_ui: mpsc::UnboundedSender<String>, gui_tx: async_channel::Sender<GuiUpdate>) -> Self {
+        Self { state, tx, ui_updater: ui_updater_rc, tx_ui, gui_tx }
     }
 
     fn append_to_console_ui(&self, text: &str) {
@@ -510,8 +511,10 @@ fn main() {
     let res = gtk4::gio::Resource::from_data(&bytes).expect("Failed to load resources");
     gtk4::gio::resources_register(&res);
 
+    let (gui_tx, gui_rx) = async_channel::unbounded();
+
     let tx_to_ui_for_app = tx_to_ui.clone();
-    let app = VeinApp::new(tx_to_bg, state.clone(), ui_updater_rc_clone_for_app, tx_to_ui_for_app);
+    let app = VeinApp::new(tx_to_bg, state.clone(), ui_updater_rc_clone_for_app, tx_to_ui_for_app, gui_tx);
 
     let initial_output_clone = initial_console_output.clone();
     let ui_updater_rc_clone_for_initial_pop = ui_updater_rc.clone();
@@ -555,6 +558,6 @@ fn main() {
         ControlFlow::Continue
     });
 
-    Backend::new("org.unaos.vein.evolution", app);
+    Backend::new("org.unaos.vein.evolution", app, gui_rx);
     info!("SHUTDOWN: UI Backend runtime complete. Total application runtime: {:?}", app_start_time.elapsed());
 }

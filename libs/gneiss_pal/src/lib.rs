@@ -19,12 +19,19 @@ use log::{info};
 use std::time::Instant;
 use std::io::Write;
 use std::path::PathBuf;
+use async_channel::Receiver;
 
 pub mod persistence;
 pub mod shard;
 mod window;
 use window::UnaWindow;
 pub use shard::{Shard, ShardRole, ShardStatus};
+
+#[derive(Debug, Clone)]
+pub enum GuiUpdate {
+    ShardStatusChanged { id: String, status: ShardStatus },
+    ConsoleLog(String),
+}
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum ViewMode {
@@ -97,7 +104,7 @@ pub struct Backend<A: AppHandler> {
 }
 
 impl<A: AppHandler> Backend<A> {
-    pub fn new(app_id: &str, app_handler: A) -> Self {
+    pub fn new(app_id: &str, app_handler: A, rx: Receiver<GuiUpdate>) -> Self {
         let app = Application::builder()
             .application_id(app_id)
             .build();
@@ -106,7 +113,7 @@ impl<A: AppHandler> Backend<A> {
         let app_handler_rc_clone = app_handler_rc.clone();
 
         app.connect_activate(move |app| {
-            build_ui(app, app_handler_rc_clone.clone());
+            build_ui(app, app_handler_rc_clone.clone(), rx.clone());
         });
         app.run();
 
@@ -117,7 +124,7 @@ impl<A: AppHandler> Backend<A> {
     }
 }
 
-fn build_ui(app: &Application, app_handler_rc: Rc<RefCell<impl AppHandler>>) {
+fn build_ui(app: &Application, app_handler_rc: Rc<RefCell<impl AppHandler>>, rx: Receiver<GuiUpdate>) {
     let ui_build_start_time = Instant::now();
     info!("UI_BUILD: Starting build_ui function.");
     let _ = std::io::stdout().flush();
@@ -176,52 +183,9 @@ fn build_ui(app: &Application, app_handler_rc: Rc<RefCell<impl AppHandler>>) {
     shard_list.set_selection_mode(gtk4::SelectionMode::None);
     shard_list.add_css_class("shard-list");
 
-    // Una-Prime (Root)
-    let root_row = Box::new(Orientation::Horizontal, 10);
-    set_margins(&root_row, 5);
-    let root_icon = Image::from_icon_name("computer-symbolic");
-    root_icon.add_css_class("success");
-    root_row.append(&root_icon);
-    root_row.append(&Label::builder().label("Una-Prime (Root)").hexpand(true).xalign(0.0).build());
-
-    // Menu Button for Root
-    let root_menu_btn = MenuButton::builder()
-        .icon_name("view-more-symbolic")
-        .has_frame(false)
-        .build();
-
-    let popover = Popover::new();
-    let popover_box = Box::new(Orientation::Vertical, 5);
-    set_margins(&popover_box, 5);
-
-    // System Info Button
-    let info_btn = Button::builder()
-        .label("System Info")
-        .icon_name("dialog-information-symbolic")
-        .build();
-    popover_box.append(&info_btn);
-
-    let relink_btn = Button::with_label("Re-Link Brain");
-    relink_btn.add_css_class("destructive-action");
-    relink_btn.connect_clicked(move |_| {
-        // TODO: Connect relink button to handler
-    });
-
-    popover_box.append(&relink_btn);
-    popover.set_child(Some(&popover_box));
-    root_menu_btn.set_popover(Some(&popover));
-
-    root_row.append(&root_menu_btn);
-    shard_list.append(&root_row);
-
-    // S9-Mule (Builder)
-    let mule_row = Box::new(Orientation::Horizontal, 10);
-    set_margins(&mule_row, 5);
-    let mule_icon = Image::from_icon_name("network-server-symbolic");
-    mule_icon.add_css_class("dim-label");
-    mule_row.append(&mule_icon);
-    mule_row.append(&Label::builder().label("S9-Mule (Builder)").hexpand(true).xalign(0.0).build());
-    shard_list.append(&mule_row);
+    // Dynamic Shard Rendering
+    let initial_shards = app_handler_rc.borrow().view().shard_tree;
+    build_shard_rows(&shard_list, &initial_shards, 0);
 
     status_box.append(&shard_list);
 
@@ -501,6 +465,7 @@ fn build_ui(app: &Application, app_handler_rc: Rc<RefCell<impl AppHandler>>) {
 
         .success { color: #2ec27e; }
         .dim-label { opacity: 0.5; }
+        .warning { color: #f5c211; }
     ");
     StyleContext::add_provider_for_display(
         &gtk4::gdk::Display::default().expect("No display"),
@@ -510,6 +475,125 @@ fn build_ui(app: &Application, app_handler_rc: Rc<RefCell<impl AppHandler>>) {
 
     window.present();
     info!("UI_BUILD: Window presented. Total build_ui duration: {:?}", ui_build_start_time.elapsed());
+
+    // The Nervous System (Signal Listener)
+    let shard_list_weak = shard_list.downgrade();
+    let text_buffer_weak = text_buffer.downgrade();
+    let scrolled_window_adj_weak = scrolled_window.vadjustment().downgrade();
+
+    glib::MainContext::default().spawn_local(async move {
+        while let Ok(update) = rx.recv().await {
+            match update {
+                 GuiUpdate::ShardStatusChanged { id, status } => {
+                    if let Some(list) = shard_list_weak.upgrade() {
+                        // Iterate rows to find the matching ID
+                        let mut i = 0;
+                        while let Some(row) = list.row_at_index(i) {
+                             if let Some(child_box) = row.child() {
+                                 // We expect the first child of the row to be our Box
+                                 if let Some(box_widget) = child_box.downcast_ref::<Box>() {
+                                     // Iterate children of the box to find the Icon (Image)
+                                     let mut child = box_widget.first_child();
+                                     while let Some(widget) = child {
+                                         if let Some(icon) = widget.downcast_ref::<Image>() {
+                                             if icon.widget_name() == id {
+                                                 // FOUND IT. Update classes.
+                                                 icon.remove_css_class("success");
+                                                 icon.remove_css_class("dim-label");
+                                                 icon.remove_css_class("warning");
+                                                 icon.remove_css_class("destructive-action");
+
+                                                 match status {
+                                                     ShardStatus::Online => icon.add_css_class("success"),
+                                                     ShardStatus::Offline => icon.add_css_class("dim-label"),
+                                                     ShardStatus::Busy => icon.add_css_class("warning"),
+                                                     ShardStatus::Error => icon.add_css_class("destructive-action"),
+                                                 }
+                                             }
+                                         }
+                                         child = widget.next_sibling();
+                                     }
+                                 }
+                             }
+                            i += 1;
+                        }
+                    }
+                 },
+                 GuiUpdate::ConsoleLog(msg) => {
+                     if let Some(buffer) = text_buffer_weak.upgrade() {
+                         let mut end_iter = buffer.end_iter();
+                         buffer.insert(&mut end_iter, &msg);
+                         if let Some(adj) = scrolled_window_adj_weak.upgrade() {
+                             // Scroll to bottom
+                             adj.set_value(adj.upper());
+                         }
+                     }
+                 }
+            }
+        }
+    });
+}
+
+// Helper for recursive shard rendering
+fn build_shard_rows(list: &ListBox, shards: &[Shard], depth: usize) {
+    for shard in shards {
+        let row_box = Box::new(Orientation::Horizontal, 10);
+        set_margins(&row_box, 5);
+        // Indentation
+        if depth > 0 {
+             row_box.set_margin_start(5 + (depth as i32 * 15));
+        }
+
+        // Icon
+        let icon_name = match shard.role {
+            ShardRole::Root => "computer-symbolic",
+            ShardRole::Builder => "network-server-symbolic",
+            ShardRole::Storage => "server-database-symbolic",
+            ShardRole::Kernel => "chip-symbolic",
+            _ => "dialog-question-symbolic",
+        };
+        let icon = Image::from_icon_name(icon_name);
+        icon.set_widget_name(&shard.id); // VITAL: Set ID for lookup
+
+        // Initial Status
+        match shard.status {
+            ShardStatus::Online => icon.add_css_class("success"),
+            ShardStatus::Offline => icon.add_css_class("dim-label"),
+            ShardStatus::Busy => icon.add_css_class("warning"),
+            ShardStatus::Error => icon.add_css_class("destructive-action"),
+        }
+        row_box.append(&icon);
+
+        // Label
+        let label = Label::builder().label(&format!("{} ({:?})", shard.name, shard.role)).hexpand(true).xalign(0.0).build();
+        row_box.append(&label);
+
+        // Root Actions (Popover) - Only for Root for now, matching original logic
+        if shard.role == ShardRole::Root {
+            let menu_btn = MenuButton::builder()
+                .icon_name("view-more-symbolic")
+                .has_frame(false)
+                .build();
+            let popover = Popover::new();
+            let popover_box = Box::new(Orientation::Vertical, 5);
+            set_margins(&popover_box, 5);
+            let info_btn = Button::builder().label("System Info").icon_name("dialog-information-symbolic").build();
+            popover_box.append(&info_btn);
+            let relink_btn = Button::with_label("Re-Link Brain");
+            relink_btn.add_css_class("destructive-action");
+            popover_box.append(&relink_btn);
+            popover.set_child(Some(&popover_box));
+            menu_btn.set_popover(Some(&popover));
+            row_box.append(&menu_btn);
+        }
+
+        list.append(&row_box);
+
+        // Recursion
+        if !shard.children.is_empty() {
+            build_shard_rows(list, &shard.children, depth + 1);
+        }
+    }
 }
 
 fn set_margins(w: &Box, s: i32) { w.set_margin_top(s); w.set_margin_bottom(s); w.set_margin_start(s); w.set_margin_end(s); }
