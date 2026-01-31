@@ -17,6 +17,8 @@ pub enum WindowBackend {
 
 pub struct UnaWindow {
     inner: WindowBackend,
+    #[cfg(feature = "gnome")]
+    view: libadwaita::ToolbarView,
 }
 
 impl UnaWindow {
@@ -29,8 +31,13 @@ impl UnaWindow {
                 .default_height(750)
                 .title("Vein")
                 .build();
+
+            let view = libadwaita::ToolbarView::new();
+            window.set_content(Some(&view));
+
             Self {
                 inner: WindowBackend::Adwaita(window),
+                view,
             }
         }
         #[cfg(not(feature = "gnome"))]
@@ -50,20 +57,19 @@ impl UnaWindow {
     pub fn set_content(&self, content: &impl IsA<Widget>) {
         match &self.inner {
             #[cfg(feature = "gnome")]
-            WindowBackend::Adwaita(w) => w.set_content(Some(content)),
+            WindowBackend::Adwaita(_) => self.view.set_content(Some(content)),
             #[cfg(not(feature = "gnome"))]
             WindowBackend::Gtk(w) => w.set_child(Some(content)),
         }
     }
 
-    #[allow(unused_variables)]
     pub fn set_titlebar(&self, titlebar: Option<&impl IsA<Widget>>) {
         match &self.inner {
             #[cfg(feature = "gnome")]
-            WindowBackend::Adwaita(_w) => {
-                // CRITICAL FIX: Adwaita forbids set_titlebar.
-                // We ignore this call to prevent a crash.
-                // In S23, we will map this to an AdwToolbarView.
+            WindowBackend::Adwaita(_) => {
+                if let Some(t) = titlebar {
+                    self.view.add_top_bar(t);
+                }
             },
             #[cfg(not(feature = "gnome"))]
             WindowBackend::Gtk(w) => w.set_titlebar(titlebar),
