@@ -472,10 +472,12 @@ fn build_ui(app: &Application, app_handler_rc: Rc<RefCell<impl AppHandler>>) {
             padding: 0px;
         }
 
-        /* FORCE TRANSPARENCY on the input widget so white text is visible on dark pill */
-        .transparent-text {
-            background-color: transparent;
-            background-image: none;
+        /* FORCE TRANSPARENCY */
+        .transparent-text,
+        .transparent-text sourceview,
+        .transparent-text text {
+            background-color: transparent !important;
+            background-image: none !important;
             caret-color: white;
             color: white;
         }
