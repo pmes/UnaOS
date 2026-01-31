@@ -1667,6 +1667,7 @@ name = "gneiss_pal"
 version = "0.1.0"
 dependencies = [
  "ab_glyph",
+ "async-channel",
  "directories",
  "glib",
  "gtk4",
