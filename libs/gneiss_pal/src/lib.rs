@@ -8,6 +8,7 @@ use gtk4::{
     HeaderBar, StackSwitcher, ToggleButton, CssProvider, StyleContext, Image, MenuButton, Popover,
     Paned
 };
+use sourceview5::View as SourceView;
 use gtk4::gdk::{Key, ModifierType};
 use std::rc::Rc;
 use std::cell::RefCell;
@@ -259,7 +260,7 @@ fn build_ui(app: &Application, app_handler_rc: Rc<RefCell<impl AppHandler>>) {
     let paned = Paned::new(Orientation::Vertical);
     paned.set_vexpand(true);
     paned.set_hexpand(true);
-    paned.set_position(500);
+    paned.set_position(550);
 
     // Console (Top Pane)
     let scrolled_window = ScrolledWindow::builder()
@@ -288,14 +289,16 @@ fn build_ui(app: &Application, app_handler_rc: Rc<RefCell<impl AppHandler>>) {
 
     // Input Area (Bottom Pane)
     let input_container = Box::new(Orientation::Horizontal, 8);
-    set_margins(&input_container, 10);
-    // input_container.add_css_class("linked"); // Removed linked class for spacing
+    set_margins(&input_container, 0); // Removed margins for paned handling
+    input_container.set_valign(Align::Fill);
 
     // Upload Button (Share Symbolic)
     let upload_icon = Image::from_resource("/org/una/vein/icons/share-symbolic");
     let upload_btn = Button::builder()
         .child(&upload_icon)
         .valign(Align::End)
+        .margin_bottom(10) // Restore visual margin
+        .margin_start(10)
         .build();
 
     let app_handler_rc_for_upload = app_handler_rc.clone();
@@ -335,14 +338,18 @@ fn build_ui(app: &Application, app_handler_rc: Rc<RefCell<impl AppHandler>>) {
         .max_content_height(500)
         .vexpand(true)
         .valign(Align::Fill)
+        .margin_top(10)
+        .margin_bottom(10)
         .has_frame(false)
         .build();
 
     input_scroll.set_hexpand(true);
     input_scroll.add_css_class("chat-input-area");
 
-    let text_view = TextView::builder()
+    let text_view = SourceView::builder()
         .wrap_mode(gtk4::WrapMode::WordChar)
+        .show_line_numbers(false)
+        .auto_indent(true)
         .accepts_tab(false)
         .top_margin(2)
         .bottom_margin(2)
@@ -359,6 +366,8 @@ fn build_ui(app: &Application, app_handler_rc: Rc<RefCell<impl AppHandler>>) {
     let send_btn = Button::builder()
         .child(&send_icon)
         .valign(Align::End)
+        .margin_bottom(10) // Restore visual margin
+        .margin_end(10)
         .css_classes(vec!["suggested-action"])
         .build();
 
@@ -462,7 +471,7 @@ fn build_ui(app: &Application, app_handler_rc: Rc<RefCell<impl AppHandler>>) {
             color: white;
         }
 
-        textview { font-family: 'Monospace'; font-size: 11pt; padding: 0px; }
+        sourceview { font-family: 'Monospace'; font-size: 11pt; padding: 0px; }
         .success { color: #2ec27e; }
         .dim-label { opacity: 0.5; }
     ");
