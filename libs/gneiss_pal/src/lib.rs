@@ -402,6 +402,7 @@ fn build_ui(app: &Application, app_handler_rc: Rc<RefCell<impl AppHandler>>) {
     });
 
     let controller = EventControllerKey::new();
+    controller.set_propagation_phase(gtk4::PropagationPhase::Capture);
     let send_action_clone_for_controller = send_message_rc.clone();
     controller.connect_key_pressed(move |ctrl, key, _, modifiers| {
         if key == Key::Return || key == Key::KP_Enter {
@@ -464,14 +465,34 @@ fn build_ui(app: &Application, app_handler_rc: Rc<RefCell<impl AppHandler>>) {
             background: #333333;
         }
 
-        /* Make the TextView invisible so the Pill shines through */
+        /* Apply fonts to both console and input */
+        textview, sourceview {
+            font-family: 'Monospace';
+            font-size: 11pt;
+            padding: 0px;
+        }
+
+        /* FORCE TRANSPARENCY on the input widget so white text is visible on dark pill */
         .transparent-text {
-            background: transparent;
+            background-color: transparent;
+            background-image: none;
             caret-color: white;
             color: white;
         }
 
-        sourceview { font-family: 'Monospace'; font-size: 11pt; padding: 0px; }
+        /* The Pill Container */
+        .chat-input-area {
+            background: #2d2d2d;
+            border: 1px solid #555555;
+            border-radius: 20px;
+            transition: border-color 0.2s;
+        }
+
+        .chat-input-area:focus-within {
+            border-color: #3584e4;
+            background: #333333;
+        }
+
         .success { color: #2ec27e; }
         .dim-label { opacity: 0.5; }
     ");
