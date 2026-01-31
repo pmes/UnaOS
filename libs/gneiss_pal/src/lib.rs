@@ -21,8 +21,10 @@ use std::io::Write;
 use std::path::PathBuf;
 
 pub mod persistence;
+pub mod shard;
 mod window;
 use window::UnaWindow;
+pub use shard::{Shard, ShardRole, ShardStatus};
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum ViewMode {
@@ -52,21 +54,6 @@ pub enum Event {
     UploadRequest, // Kept for compatibility, though effectively unused now
     FileSelected(PathBuf), // NEW: Carries the selected path back to Vein
     ToggleSidebar, // NEW: Toggle sidebar visibility
-}
-
-#[derive(Clone, Debug, PartialEq)]
-pub enum ShardStatus {
-    Online,
-    Offline,
-    Syncing,
-    Error,
-}
-
-#[derive(Clone, Debug)]
-pub struct Shard {
-    pub name: String,
-    pub status: ShardStatus,
-    pub children: Vec<Shard>,
 }
 
 #[derive(Clone, Debug)]

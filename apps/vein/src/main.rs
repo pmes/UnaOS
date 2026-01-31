@@ -1,6 +1,6 @@
 use dotenvy::dotenv;
 use gneiss_pal::persistence::{BrainManager, SavedMessage};
-use gneiss_pal::{AppHandler, Backend, DashboardState, Event, SidebarPosition, ViewMode, Shard, ShardStatus};
+use gneiss_pal::{AppHandler, Backend, DashboardState, Event, SidebarPosition, ViewMode, Shard, ShardStatus, ShardRole};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use tokio::runtime::Runtime;
@@ -257,7 +257,16 @@ impl AppHandler for VeinApp {
             },
             sidebar_position: s.sidebar_position.clone(),
             dock_actions: vec!["Rooms".into(), "Status".into()],
-            shard_tree: Vec::new(),
+            shard_tree: {
+                let mut root = Shard::new("root-01", "Una-Prime", ShardRole::Root);
+                root.status = ShardStatus::Online;
+
+                let mut child = Shard::new("builder-01", "S9-Mule", ShardRole::Builder);
+                child.status = ShardStatus::Offline;
+
+                root.children.push(child);
+                vec![root]
+            },
             sidebar_collapsed: s.sidebar_collapsed,
         }
     }
