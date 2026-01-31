@@ -5,7 +5,7 @@ use gtk4::{
     Application, Box, Orientation, Label, Button, Stack, ScrolledWindow,
     PolicyType, Align, ListBox, Separator, StackTransitionType, TextView, EventControllerKey,
     TextBuffer, Adjustment, FileChooserNative, ResponseType, FileChooserAction,
-    HeaderBar, StackSwitcher, ToggleButton, CssProvider, StyleContext, Image
+    HeaderBar, StackSwitcher, ToggleButton, CssProvider, StyleContext, Image, MenuButton, Popover
 };
 use gtk4::gdk::{Key, ModifierType};
 use std::rc::Rc;
@@ -188,28 +188,48 @@ fn build_ui(app: &Application, app_handler_rc: Rc<RefCell<impl AppHandler>>) {
     // Una-Prime (Root)
     let root_row = Box::new(Orientation::Horizontal, 10);
     set_margins(&root_row, 5);
-    root_row.append(&Image::from_icon_name("computer-symbolic"));
+    let root_icon = Image::from_icon_name("computer-symbolic");
+    root_icon.add_css_class("success");
+    root_row.append(&root_icon);
     root_row.append(&Label::builder().label("Una-Prime (Root)").hexpand(true).xalign(0.0).build());
+
+    // Menu Button for Root
+    let root_menu_btn = MenuButton::builder()
+        .icon_name("view-more-symbolic")
+        .has_frame(false)
+        .build();
+
+    let popover = Popover::new();
+    let popover_box = Box::new(Orientation::Vertical, 5);
+    set_margins(&popover_box, 5);
+
+    let relink_btn = Button::with_label("Re-Link Brain");
+    relink_btn.add_css_class("destructive-action");
+    relink_btn.connect_clicked(move |_| {
+        // TODO: Connect relink button to handler
+    });
+
+    popover_box.append(&relink_btn);
+    popover.set_child(Some(&popover_box));
+    root_menu_btn.set_popover(Some(&popover));
+
+    root_row.append(&root_menu_btn);
     root_row.append(&Image::from_icon_name("emblem-default-symbolic"));
     shard_list.append(&root_row);
 
     // S9-Mule (Builder)
     let mule_row = Box::new(Orientation::Horizontal, 10);
     set_margins(&mule_row, 5);
-    mule_row.append(&Image::from_icon_name("network-server-symbolic"));
+    let mule_icon = Image::from_icon_name("network-server-symbolic");
+    mule_icon.add_css_class("dim-label");
+    mule_row.append(&mule_icon);
     mule_row.append(&Label::builder().label("S9-Mule (Builder)").hexpand(true).xalign(0.0).build());
     let offline_lbl = Label::new(Some("Offline"));
-    offline_lbl.add_css_class("dim-label"); // Assuming dim-label or similar exists, else just default
+    offline_lbl.add_css_class("dim-label");
     mule_row.append(&offline_lbl);
     shard_list.append(&mule_row);
 
     status_box.append(&shard_list);
-
-    // Re-Link Button
-    let relink_btn = Button::with_label("Re-Link Brain");
-    relink_btn.add_css_class("destructive-action");
-    status_box.append(&relink_btn);
-    // TODO: Connect relink button to handler
 
     sidebar_stack.add_titled(&status_box, Some("status"), "Status");
 
