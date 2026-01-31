@@ -179,9 +179,31 @@ fn build_ui(app: &Application, app_handler_rc: Rc<RefCell<impl AppHandler>>) {
     // Page 2: Status
     let status_box = Box::new(Orientation::Vertical, 10);
     set_margins(&status_box, 10);
-    status_box.append(&Label::builder().label(":: SYSTEM STATUS ::").css_classes(vec!["heading"]).build());
-    status_box.append(&make_status_row("S9 (Upload)", "🟢 Online"));
-    status_box.append(&make_status_row("Una (Link)", "🟢 Connected"));
+
+    // Shard List
+    let shard_list = ListBox::new();
+    shard_list.set_selection_mode(gtk4::SelectionMode::None);
+    shard_list.add_css_class("shard-list");
+
+    // Una-Prime (Root)
+    let root_row = Box::new(Orientation::Horizontal, 10);
+    set_margins(&root_row, 5);
+    root_row.append(&Image::from_icon_name("computer-symbolic"));
+    root_row.append(&Label::builder().label("Una-Prime (Root)").hexpand(true).xalign(0.0).build());
+    root_row.append(&Image::from_icon_name("emblem-default-symbolic"));
+    shard_list.append(&root_row);
+
+    // S9-Mule (Builder)
+    let mule_row = Box::new(Orientation::Horizontal, 10);
+    set_margins(&mule_row, 5);
+    mule_row.append(&Image::from_icon_name("network-server-symbolic"));
+    mule_row.append(&Label::builder().label("S9-Mule (Builder)").hexpand(true).xalign(0.0).build());
+    let offline_lbl = Label::new(Some("Offline"));
+    offline_lbl.add_css_class("dim-label"); // Assuming dim-label or similar exists, else just default
+    mule_row.append(&offline_lbl);
+    shard_list.append(&mule_row);
+
+    status_box.append(&shard_list);
 
     // Re-Link Button
     let relink_btn = Button::with_label("Re-Link Brain");
@@ -431,6 +453,7 @@ fn make_sidebar_row(n: &str, a: bool) -> Box {
     let r = Box::new(Orientation::Horizontal, 10); set_margins(&r, 10);
     r.append(&Label::new(Some(n))); if a { r.append(&Label::new(Some("●"))); } r
 }
+#[allow(dead_code)]
 fn make_status_row(s: &str, st: &str) -> Box {
     let r = Box::new(Orientation::Horizontal, 10); set_margins(&r, 5);
     r.append(&Label::builder().label(s).hexpand(true).xalign(0.0).build()); r.append(&Label::new(Some(st))); r
