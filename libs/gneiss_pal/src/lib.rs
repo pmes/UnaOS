@@ -8,7 +8,9 @@ use gtk4::{
     HeaderBar, StackSwitcher, ToggleButton, CssProvider, StyleContext, Image, MenuButton, Popover,
     Paned
 };
+use sourceview5::prelude::*;
 use sourceview5::View as SourceView;
+use sourceview5::{Buffer, StyleSchemeManager};
 use gtk4::gdk::{Key, ModifierType};
 use std::rc::Rc;
 use std::cell::RefCell;
@@ -356,6 +358,16 @@ fn build_ui(app: &Application, app_handler_rc: Rc<RefCell<impl AppHandler>>) {
         .left_margin(8)
         .right_margin(8)
         .build();
+
+    // FORCE DARK MODE SCHEME
+    let sv_buffer = text_view.buffer().downcast::<Buffer>().expect("SourceView should have a SourceBuffer");
+    let manager = StyleSchemeManager::new();
+    if let Some(scheme) = manager.scheme("Adwaita-dark") {
+        sv_buffer.set_style_scheme(Some(&scheme));
+    } else if let Some(scheme) = manager.scheme("oblivion") {
+         // Fallback if Adwaita-dark missing
+         sv_buffer.set_style_scheme(Some(&scheme));
+    }
 
     text_view.add_css_class("transparent-text");
 
