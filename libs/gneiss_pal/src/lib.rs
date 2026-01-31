@@ -214,7 +214,6 @@ fn build_ui(app: &Application, app_handler_rc: Rc<RefCell<impl AppHandler>>) {
     root_menu_btn.set_popover(Some(&popover));
 
     root_row.append(&root_menu_btn);
-    root_row.append(&Image::from_icon_name("emblem-default-symbolic"));
     shard_list.append(&root_row);
 
     // S9-Mule (Builder)
@@ -224,9 +223,6 @@ fn build_ui(app: &Application, app_handler_rc: Rc<RefCell<impl AppHandler>>) {
     mule_icon.add_css_class("dim-label");
     mule_row.append(&mule_icon);
     mule_row.append(&Label::builder().label("S9-Mule (Builder)").hexpand(true).xalign(0.0).build());
-    let offline_lbl = Label::new(Some("Offline"));
-    offline_lbl.add_css_class("dim-label");
-    mule_row.append(&offline_lbl);
     shard_list.append(&mule_row);
 
     status_box.append(&shard_list);
