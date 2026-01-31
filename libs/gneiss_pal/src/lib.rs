@@ -484,14 +484,18 @@ fn build_ui(app: &Application, app_handler_rc: Rc<RefCell<impl AppHandler>>) {
             padding: 0px;
         }
 
-        /* FORCE TRANSPARENCY */
+        /* S25-Polish: Force transparency over Style Scheme */
         .transparent-text,
         .transparent-text sourceview,
         .transparent-text text {
-            background-color: transparent !important;
-            background-image: none !important;
-            caret-color: white;
-            color: white;
+             background-color: transparent !important;
+             background-image: none !important;
+        }
+
+        /* Ensure cursor and text match dark theme */
+        .transparent-text {
+             caret-color: white;
+             color: white;
         }
 
         /* The Pill Container */
