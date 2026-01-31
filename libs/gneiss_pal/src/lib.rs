@@ -25,7 +25,7 @@ pub mod persistence;
 pub mod shard;
 mod window;
 use window::UnaWindow;
-pub use shard::{Shard, ShardRole, ShardStatus};
+pub use shard::{Shard, ShardRole, ShardStatus, Heartbeat};
 
 #[derive(Debug, Clone)]
 pub enum GuiUpdate {

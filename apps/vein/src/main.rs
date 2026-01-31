@@ -262,7 +262,7 @@ impl AppHandler for VeinApp {
                 let mut root = Shard::new("root-01", "Una-Prime", ShardRole::Root);
                 root.status = ShardStatus::Online;
 
-                let mut child = Shard::new("builder-01", "S9-Mule", ShardRole::Builder);
+                let mut child = Shard::new("s9-mule", "S9-Mule", ShardRole::Builder);
                 child.status = ShardStatus::Offline;
 
                 root.children.push(child);
@@ -512,6 +512,33 @@ fn main() {
     gtk4::gio::resources_register(&res);
 
     let (gui_tx, gui_rx) = async_channel::unbounded();
+
+    // S24: The Nervous System - Heartbeat Simulation
+    let gui_tx_sim = gui_tx.clone();
+    thread::spawn(move || {
+        let rt = Runtime::new().unwrap();
+        rt.block_on(async {
+            // Boot delay
+            tokio::time::sleep(Duration::from_secs(5)).await;
+
+            // "S9 is Online!"
+            let _ = gui_tx_sim.send(GuiUpdate::ConsoleLog("\n[SIMULATION] :: S9-Mule coming online...\n".into())).await;
+            let _ = gui_tx_sim.send(GuiUpdate::ShardStatusChanged {
+                id: "s9-mule".to_string(),
+                status: ShardStatus::Online
+            }).await;
+
+            // Work delay
+            tokio::time::sleep(Duration::from_secs(3)).await;
+
+            // "S9 is Busy!"
+            let _ = gui_tx_sim.send(GuiUpdate::ConsoleLog("\n[SIMULATION] :: S9-Mule processing build...\n".into())).await;
+            let _ = gui_tx_sim.send(GuiUpdate::ShardStatusChanged {
+                id: "s9-mule".to_string(),
+                status: ShardStatus::Busy
+            }).await;
+        });
+    });
 
     let tx_to_ui_for_app = tx_to_ui.clone();
     let app = VeinApp::new(tx_to_bg, state.clone(), ui_updater_rc_clone_for_app, tx_to_ui_for_app, gui_tx);

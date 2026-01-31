@@ -27,6 +27,13 @@ pub struct Shard {
     pub children: Vec<Shard>,
 }
 
+#[derive(Debug, Clone)]
+pub struct Heartbeat {
+    pub id: String,
+    pub status: ShardStatus,
+    pub cpu_load: u8,
+}
+
 impl Shard {
     pub fn new(id: &str, name: &str, role: ShardRole) -> Self {
         Self {
