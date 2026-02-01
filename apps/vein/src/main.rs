@@ -337,6 +337,10 @@ fn main() {
     let brain_bg = brain.clone();
     let tx_to_ui_bg_clone = tx_to_ui.clone();
 
+    // S29: Create GUI channel EARLY so Brain Thread can use it
+    let (gui_tx, gui_rx) = async_channel::unbounded();
+    let gui_tx_brain = gui_tx.clone();
+
     thread::spawn(move || {
         let rt = Runtime::new().expect("Failed to create Tokio Runtime");
         rt.block_on(async move {
@@ -476,6 +480,13 @@ fn main() {
                             }
                         }
 
+                        // S29: Robust Error Handling (The Iron Chin)
+                        // 1. Set Status to Thinking
+                        let _ = gui_tx_brain.send(GuiUpdate::ShardStatusChanged {
+                            id: "una-prime".to_string(),
+                            status: ShardStatus::Thinking
+                        }).await;
+
                         match client.generate_content(&context).await {
                             Ok(response) => {
                                 let display_response = format!("\n[UNA] :: {}\n", response);
@@ -489,13 +500,44 @@ fn main() {
                                     content: response.clone(),
                                 });
                                 brain_bg.save(&s.chat_history);
+
+                                // 2. Success: Set Status to Online
+                                let _ = gui_tx_brain.send(GuiUpdate::ShardStatusChanged {
+                                    id: "una-prime".to_string(),
+                                    status: ShardStatus::Online
+                                }).await;
                             }
                             Err(e) => {
-                                let display_error = format!("\n[SYSTEM ERROR] :: {}\n", e);
+                                // 3. Error: Log, Alert, Set Status to Error, but DO NOT EXIT
+                                let display_error = format!("\n[SYSTEM ERROR] :: AI Core Stalled: {}\n", e);
+                                error!("BRAIN ERROR (Resilience Triggered): {}", e);
+
                                 if let Err(send_e) = tx_to_ui_bg_clone.send(display_error) {
                                     error!("Failed to send API error to UI: {}", send_e);
                                 }
-                                error!("Gemini API interaction failed: {}", e);
+
+                                // Visual Error Status
+                                let _ = gui_tx_brain.send(GuiUpdate::ShardStatusChanged {
+                                    id: "una-prime".to_string(),
+                                    status: ShardStatus::Error
+                                }).await;
+
+                                // Optional: Reset to Online after a delay or keep Error?
+                                // Directive says "Reset to Online/Idle after attempt" in the example,
+                                // but specifically "Set status to Error, but CONTINUE".
+                                // The example code showed resetting to Online at the very end of loop.
+                                // Let's stick to the Error status so the user sees it,
+                                // but the loop continues so they can try again.
+                                // Wait, the Architect's pseudo-code had `Reset to Online/Idle after attempt` OUTSIDE the match.
+                                // Let's follow that pattern to ensure "Ready for next command".
+                                // Actually, if it failed, maybe we should leave it red until next success?
+                                // "Reset to Online/Idle after attempt" implies it goes back to green.
+                                // I'll add a delay then reset to Online so it looks "Ready".
+                                tokio::time::sleep(Duration::from_secs(1)).await;
+                                let _ = gui_tx_brain.send(GuiUpdate::ShardStatusChanged {
+                                    id: "una-prime".to_string(),
+                                    status: ShardStatus::Online
+                                }).await;
                             }
                         }
                     }
@@ -517,8 +559,6 @@ fn main() {
     let bytes = glib::Bytes::from_static(RESOURCES_BYTES);
     let res = gtk4::gio::Resource::from_data(&bytes).expect("Failed to load resources");
     gtk4::gio::resources_register(&res);
-
-    let (gui_tx, gui_rx) = async_channel::unbounded();
 
     // S26: The Vertex Listener
     let gui_tx_sim = gui_tx.clone();
