@@ -39,7 +39,8 @@ fn main() {
 
     // --- HARDWARE CONFIGURATION ---
     // Enable QEMU's Magic Exit (Port 0xF4)
-    cmd.arg("-device").arg("isa-debug-exit,iobase=0xf4,iosize=0x04");
+    cmd.arg("-device")
+        .arg("isa-debug-exit,iobase=0xf4,iosize=0x04");
 
     // Enable USB xHCI for PCI Scanning
     // UNA-18-SLOT: Name the controller 'xhci'
@@ -47,7 +48,10 @@ fn main() {
 
     // UNA-22-HAUL: Swap Mouse for Mass Storage
     // Attach the raw image as a drive, then attach the drive to the USB bus
-    cmd.arg("-drive").arg(format!("if=none,id=stick,format=raw,file={}", usb_image.display()));
+    cmd.arg("-drive").arg(format!(
+        "if=none,id=stick,format=raw,file={}",
+        usb_image.display()
+    ));
     cmd.arg("-device").arg("usb-storage,bus=xhci.0,drive=stick");
 
     let mut child = cmd.spawn().unwrap();

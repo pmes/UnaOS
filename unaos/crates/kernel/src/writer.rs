@@ -17,8 +17,12 @@ impl Writer {
         // No-op
     }
 
-    pub fn width(&self) -> usize { 0 }
-    pub fn height(&self) -> usize { 0 }
+    pub fn width(&self) -> usize {
+        0
+    }
+    pub fn height(&self) -> usize {
+        0
+    }
     pub fn write_pixel(&mut self, _x: usize, _y: usize, _color: u32) {}
 }
 
