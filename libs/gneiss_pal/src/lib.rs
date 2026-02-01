@@ -466,6 +466,14 @@ fn build_ui(app: &Application, app_handler_rc: Rc<RefCell<impl AppHandler>>, rx:
         .success { color: #2ec27e; }
         .dim-label { opacity: 0.5; }
         .warning { color: #f5c211; }
+
+        .status-online { color: #2ec27e; }
+        .status-on-call { color: #0D7C66; }
+        .status-active { color: #41B3A2; }
+        .status-thinking { color: #D7C3F1; }
+        .status-paused { color: #f5c211; }
+        .status-error { color: #e01b24; }
+        .status-offline { opacity: 0.5; }
     ");
     StyleContext::add_provider_for_display(
         &gtk4::gdk::Display::default().expect("No display"),
@@ -497,17 +505,24 @@ fn build_ui(app: &Application, app_handler_rc: Rc<RefCell<impl AppHandler>>, rx:
                                      while let Some(widget) = child {
                                          if let Some(icon) = widget.downcast_ref::<Image>() {
                                              if icon.widget_name() == id {
-                                                 // FOUND IT. Update classes.
+                                                 // FOUND IT. Clear all status classes.
+                                                 for class in ["status-online", "status-on-call", "status-active", "status-thinking", "status-paused", "status-error", "status-offline"] {
+                                                     icon.remove_css_class(class);
+                                                 }
+                                                 // Legacy cleanup (just in case)
                                                  icon.remove_css_class("success");
                                                  icon.remove_css_class("dim-label");
                                                  icon.remove_css_class("warning");
                                                  icon.remove_css_class("destructive-action");
 
                                                  match status {
-                                                     ShardStatus::Online => icon.add_css_class("success"),
-                                                     ShardStatus::Offline => icon.add_css_class("dim-label"),
-                                                     ShardStatus::Busy => icon.add_css_class("warning"),
-                                                     ShardStatus::Error => icon.add_css_class("destructive-action"),
+                                                     ShardStatus::Online => icon.add_css_class("status-online"),
+                                                     ShardStatus::OnCall => icon.add_css_class("status-on-call"),
+                                                     ShardStatus::Active => icon.add_css_class("status-active"),
+                                                     ShardStatus::Thinking => icon.add_css_class("status-thinking"),
+                                                     ShardStatus::Paused => icon.add_css_class("status-paused"),
+                                                     ShardStatus::Error => icon.add_css_class("status-error"),
+                                                     ShardStatus::Offline => icon.add_css_class("status-offline"),
                                                  }
                                              }
                                          }
@@ -557,10 +572,13 @@ fn build_shard_rows(list: &ListBox, shards: &[Shard], depth: usize) {
 
         // Initial Status
         match shard.status {
-            ShardStatus::Online => icon.add_css_class("success"),
-            ShardStatus::Offline => icon.add_css_class("dim-label"),
-            ShardStatus::Busy => icon.add_css_class("warning"),
-            ShardStatus::Error => icon.add_css_class("destructive-action"),
+            ShardStatus::Online => icon.add_css_class("status-online"),
+            ShardStatus::OnCall => icon.add_css_class("status-on-call"),
+            ShardStatus::Active => icon.add_css_class("status-active"),
+            ShardStatus::Thinking => icon.add_css_class("status-thinking"),
+            ShardStatus::Paused => icon.add_css_class("status-paused"),
+            ShardStatus::Error => icon.add_css_class("status-error"),
+            ShardStatus::Offline => icon.add_css_class("status-offline"),
         }
         row_box.append(&icon);
 

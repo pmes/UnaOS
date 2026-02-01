@@ -12,9 +12,12 @@ pub enum ShardRole {
 #[derive(Debug, Clone, PartialEq)]
 pub enum ShardStatus {
     Online,     // Green
-    Offline,    // Grey
-    Busy,       // Yellow/Orange
+    OnCall,     // Teal
+    Active,     // Seafoam
+    Thinking,   // Purple
+    Paused,     // Yellow
     Error,      // Red
+    Offline,    // Grey
 }
 
 #[derive(Debug, Clone)]
