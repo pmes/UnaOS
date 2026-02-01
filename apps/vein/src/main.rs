@@ -525,9 +525,9 @@ fn main() {
     thread::spawn(move || {
         let rt = Runtime::new().unwrap();
         rt.block_on(async {
-            let socket = match tokio::net::UdpSocket::bind("127.0.0.1:4200").await {
+            let socket = match tokio::net::UdpSocket::bind("0.0.0.0:4200").await {
                 Ok(s) => {
-                    let _ = gui_tx_sim.send(GuiUpdate::ConsoleLog("\n[LISTENER] :: Bound to UDP 4200. Ready for Vertex Packets.\n".into())).await;
+                    let _ = gui_tx_sim.send(GuiUpdate::ConsoleLog("\n[LISTENER] :: Bound to UDP 0.0.0.0:4200 (Network Open). Ready for Vertex Packets.\n".into())).await;
                     s
                 },
                 Err(e) => {

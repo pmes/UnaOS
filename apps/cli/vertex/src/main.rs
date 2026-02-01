@@ -11,6 +11,10 @@ struct Cli {
 
     /// The Status or Color (e.g., Online, green)
     status: String,
+
+    /// Target Vein IP address
+    #[arg(short, long, default_value = "127.0.0.1")]
+    target: String,
 }
 
 #[derive(Serialize)]
@@ -86,8 +90,8 @@ fn main() {
         process::exit(1);
     });
 
-    let target = "127.0.0.1:4200";
-    match socket.send_to(json.as_bytes(), target) {
+    let target = format!("{}:4200", args.target);
+    match socket.send_to(json.as_bytes(), &target) {
         Ok(_) => {
             println!("Vertex Signal Fired.");
             println!("Target: {}", target);
