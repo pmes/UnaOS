@@ -1,6 +1,7 @@
 // libs/gneiss_pal/src/shard.rs
+use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum ShardRole {
     Root,       // Una-Prime (The Command Deck)
     Builder,    // S9 (CI/CD)
@@ -9,7 +10,7 @@ pub enum ShardRole {
     Unknown,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum ShardStatus {
     Online,     // Green
     OnCall,     // Teal

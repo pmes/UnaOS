@@ -15,6 +15,7 @@ use std::path::PathBuf;
 use gtk4::prelude::*;
 use gtk4::{Adjustment, TextBuffer};
 use glib::ControlFlow;
+use serde::Deserialize;
 
 mod api;
 use api::{Content, GeminiClient, Part};
@@ -34,6 +35,12 @@ struct State {
 struct UiUpdater {
     text_buffer: TextBuffer,
     scroll_adj: Adjustment,
+}
+
+#[derive(Deserialize, Debug)]
+struct VertexPacket {
+    id: String,
+    status: ShardStatus,
 }
 
 fn do_append_and_scroll(ui_updater_rc: &Rc<RefCell<Option<UiUpdater>>>, text: &str) {
@@ -513,29 +520,41 @@ fn main() {
 
     let (gui_tx, gui_rx) = async_channel::unbounded();
 
-    // S25-C: The Spectrum Cycle (Simulated Status Loop)
+    // S26: The Vertex Listener
     let gui_tx_sim = gui_tx.clone();
     thread::spawn(move || {
         let rt = Runtime::new().unwrap();
         rt.block_on(async {
-            // Status Cycle Loop
+            let socket = match tokio::net::UdpSocket::bind("127.0.0.1:4200").await {
+                Ok(s) => {
+                    let _ = gui_tx_sim.send(GuiUpdate::ConsoleLog("\n[LISTENER] :: Bound to UDP 4200. Ready for Vertex Packets.\n".into())).await;
+                    s
+                },
+                Err(e) => {
+                    let _ = gui_tx_sim.send(GuiUpdate::ConsoleLog(format!("\n[LISTENER ERROR] :: Failed to bind UDP 4200: {}\n", e))).await;
+                    return;
+                }
+            };
+
+            let mut buf = [0u8; 1024];
             loop {
-                let states = vec![
-                    ShardStatus::Online,
-                    ShardStatus::Active,
-                    ShardStatus::Thinking,
-                    ShardStatus::OnCall,
-                    ShardStatus::Paused,
-                    ShardStatus::Error,
-                ];
-
-                for status in states {
-                    let _ = gui_tx_sim.send(GuiUpdate::ShardStatusChanged {
-                        id: "una-prime".to_string(),
-                        status
-                    }).await;
-
-                    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+                match socket.recv_from(&mut buf).await {
+                    Ok((len, _addr)) => {
+                        match serde_json::from_slice::<VertexPacket>(&buf[..len]) {
+                            Ok(packet) => {
+                                let _ = gui_tx_sim.send(GuiUpdate::ShardStatusChanged {
+                                    id: packet.id,
+                                    status: packet.status
+                                }).await;
+                            },
+                            Err(e) => {
+                                let _ = gui_tx_sim.send(GuiUpdate::ConsoleLog(format!("\n[LISTENER ERROR] :: JSON Parse Failed: {}\n", e))).await;
+                            }
+                        }
+                    },
+                    Err(e) => {
+                        let _ = gui_tx_sim.send(GuiUpdate::ConsoleLog(format!("\n[LISTENER ERROR] :: Socket Receive Failed: {}\n", e))).await;
+                    }
                 }
             }
         });
