@@ -9,6 +9,7 @@ members = [
     "apps/vug",
     "apps/sledge",
     "apps/amber_bytes",
+    "apps/cli/vertex",
     "unaos/builder",
     "unaos/crates/kernel",
     "unaos/crates/compat",
