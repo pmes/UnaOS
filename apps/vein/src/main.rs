@@ -244,11 +244,12 @@ impl AppHandler for VeinApp {
                     scroll_adj: adj.clone(),
                 });
 
-                // --- J7 NERVE SPLICE ---
-                let mut s = self.state.lock().unwrap();
+                // --- J7 FIXED NERVE SPLICE (NO DEADLOCK) ---
+                // We use 's' which is ALREADY locked by handle_event top-level
                 if !s.scroll_signal_connected {
                     s.scroll_signal_connected = true;
 
+                    // We need a separate clone for the closure, which runs later
                     let state_clone = self.state.clone();
                     let buffer_clone = buffer.clone();
 
@@ -256,31 +257,31 @@ impl AppHandler for VeinApp {
                     adj.connect_value_changed(move |adjustment| {
                         // Threshold: If we are near the top (pixels)
                         if adjustment.value() < 20.0 {
-                            let mut s = state_clone.lock().unwrap();
+                            // NOW we lock, because this runs in the future/signal context
+                            let mut inner_s = state_clone.lock().unwrap();
 
-                            // 1. DEBOUNCE: Are we already working?
-                            if s.is_loading_history { return; }
+                            // 1. DEBOUNCE
+                            if inner_s.is_loading_history { return; }
 
-                            // 2. CHECK: Is there more to load?
-                            let total = s.chat_history.len();
-                            let current_vis = s.visible_history_count;
-                            if current_vis >= total { return; } // Hit the bedrock
+                            // 2. CHECK
+                            let total = inner_s.chat_history.len();
+                            let current_vis = inner_s.visible_history_count;
+                            if current_vis >= total { return; } // Hit bedrock
 
                             // 3. ENGAGE
-                            s.is_loading_history = true;
+                            inner_s.is_loading_history = true;
 
                             // 4. CALCULATE CHUNK (Load 20 older lines)
                             let chunk_size = 20;
                             let next_vis = if current_vis + chunk_size > total { total } else { current_vis + chunk_size };
 
                             // Determine vector slice indices
-                            // If total is 100, current is 50. We need items 30..50.
                             let end_idx = total - current_vis;
                             let start_idx = total - next_vis;
 
                             // 5. FORMAT TEXT
                             let mut history_chunk = String::from("\n--- [ARCHIVE RETRIEVAL] ---\n");
-                            for msg in s.chat_history[start_idx..end_idx].iter() {
+                            for msg in inner_s.chat_history[start_idx..end_idx].iter() {
                                 if msg.content.starts_with("SYSTEM_INSTRUCTION") { continue; }
                                 let prefix = if msg.role == "user" { "[ARCHITECT]" } else { "[UNA]" };
                                 if msg.content.starts_with("data:image/") || msg.content.starts_with("[GCS_IMAGE_URI]") {
@@ -295,13 +296,8 @@ impl AppHandler for VeinApp {
                             buffer_clone.insert(&mut start_iter, &history_chunk);
 
                             // 7. UPDATE & RESET
-                            s.visible_history_count = next_vis;
-
-                            // Reset flag immediately? Or wait?
-                            // Since we inserted text, the scrollbar physically moves/shrinks,
-                            // pushing 'value' effectively down relative to content.
-                            // We reset immediately to allow subsequent pulls.
-                            s.is_loading_history = false;
+                            inner_s.visible_history_count = next_vis;
+                            inner_s.is_loading_history = false;
                         }
                     });
                 }
