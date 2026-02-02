@@ -438,47 +438,52 @@ fn main() {
                             parts: vec![Part::text(system_instruction.to_string())]
                         });
 
+                        // --- J7 SURGICAL IMPLANT (REVISED) ---
+                        // 1. Snapshot
                         let history_snapshot = {
                             let s = state_bg.lock().unwrap();
                             s.chat_history.clone()
                         };
 
-                        // MODIFIED: Parse history to find images (inline or GCS)
-                        for saved in history_snapshot {
-                            if saved.content.starts_with("SYSTEM_INSTRUCTION") {
-                                continue;
-                            }
+                        // 2. Window Calculation (Max 20)
+                        let window_size = 20;
+                        let start_index = if history_snapshot.len() > window_size {
+                            history_snapshot.len() - window_size
+                        } else {
+                            0
+                        };
 
+                        // 3. Iterate Window
+                        for saved in history_snapshot.iter().skip(start_index) {
+                            // Filter A: No System Instruction (Already Anchored)
+                            if saved.content.starts_with("SYSTEM_INSTRUCTION") { continue; }
+
+                            // Filter B: No Legacy Base64 Images (Token Waste)
+                            if saved.content.starts_with("data:image/") { continue; }
+
+                            // Filter C: Handle GCS URIs
                             if saved.content.starts_with("[GCS_IMAGE_URI]") {
                                 let uri = saved.content.replace("[GCS_IMAGE_URI]", "");
-                                // Guess mime type, default to png
-                                let mime = if uri.to_lowercase().ends_with(".jpg") || uri.to_lowercase().ends_with(".jpeg") {
-                                    "image/jpeg".to_string()
+                                let lower = uri.to_lowercase();
+                                let mime = if lower.ends_with(".jpg") || lower.ends_with(".jpeg") {
+                                    "image/jpeg"
                                 } else {
-                                    "image/png".to_string()
+                                    "image/png"
                                 };
+
                                 context.push(Content {
                                     role: saved.role.clone(),
-                                    parts: vec![Part::file_data(mime, uri)]
+                                    parts: vec![Part::file_data(mime.to_string(), uri)]
                                 });
-
-                            } else if saved.content.starts_with("data:image/") {
-                                 // Legacy Inline Image (keep for compatibility if needed, or ignore)
-                                 // Current Vertex AI API on Global endpoint MIGHT support inline data too,
-                                 // but preference is GCS. We won't break it if we don't have to.
-                                 // But Part struct changed. We need to implement InlineData logic in API or here.
-                                 // Wait, I removed InlineData constructor from Part?
-                                 // No, `Part` enum still has `FileData`, I removed `InlineData` variant based on instructions.
-                                 // "Implement Part::FileData and remove InlineData."
-                                 // So we skip legacy inline images to avoid serialization errors.
-                                 continue;
                             } else {
+                                // Default: Text
                                 context.push(Content {
                                     role: saved.role.clone(),
                                     parts: vec![Part::text(saved.content.clone())]
                                 });
                             }
                         }
+                        // --- END IMPLANT ---
 
                         // S29: Robust Error Handling (The Iron Chin)
                         // 1. Set Status to Thinking
