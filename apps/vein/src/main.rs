@@ -29,6 +29,10 @@ struct State {
     chat_history: Vec<SavedMessage>,
     sidebar_position: SidebarPosition,
     sidebar_collapsed: bool,
+    // --- J7 ADDITIONS ---
+    visible_history_count: usize,
+    scroll_signal_connected: bool,
+    is_loading_history: bool,
 }
 
 #[derive(Clone)]
@@ -236,9 +240,71 @@ impl AppHandler for VeinApp {
             }
             Event::TextBufferUpdate(buffer, adj) => {
                 *self.ui_updater.borrow_mut() = Some(UiUpdater {
-                    text_buffer: buffer,
-                    scroll_adj: adj,
+                    text_buffer: buffer.clone(),
+                    scroll_adj: adj.clone(),
                 });
+
+                // --- J7 NERVE SPLICE ---
+                let mut s = self.state.lock().unwrap();
+                if !s.scroll_signal_connected {
+                    s.scroll_signal_connected = true;
+
+                    let state_clone = self.state.clone();
+                    let buffer_clone = buffer.clone();
+
+                    // Connect the "Eye" to the "Scroll"
+                    adj.connect_value_changed(move |adjustment| {
+                        // Threshold: If we are near the top (pixels)
+                        if adjustment.value() < 20.0 {
+                            let mut s = state_clone.lock().unwrap();
+
+                            // 1. DEBOUNCE: Are we already working?
+                            if s.is_loading_history { return; }
+
+                            // 2. CHECK: Is there more to load?
+                            let total = s.chat_history.len();
+                            let current_vis = s.visible_history_count;
+                            if current_vis >= total { return; } // Hit the bedrock
+
+                            // 3. ENGAGE
+                            s.is_loading_history = true;
+
+                            // 4. CALCULATE CHUNK (Load 20 older lines)
+                            let chunk_size = 20;
+                            let next_vis = if current_vis + chunk_size > total { total } else { current_vis + chunk_size };
+
+                            // Determine vector slice indices
+                            // If total is 100, current is 50. We need items 30..50.
+                            let end_idx = total - current_vis;
+                            let start_idx = total - next_vis;
+
+                            // 5. FORMAT TEXT
+                            let mut history_chunk = String::from("\n--- [ARCHIVE RETRIEVAL] ---\n");
+                            for msg in s.chat_history[start_idx..end_idx].iter() {
+                                if msg.content.starts_with("SYSTEM_INSTRUCTION") { continue; }
+                                let prefix = if msg.role == "user" { "[ARCHITECT]" } else { "[UNA]" };
+                                if msg.content.starts_with("data:image/") || msg.content.starts_with("[GCS_IMAGE_URI]") {
+                                    history_chunk.push_str(&format!("{} > [IMAGE]\n", prefix));
+                                } else {
+                                    history_chunk.push_str(&format!("{} > {}\n", prefix, msg.content));
+                                }
+                            }
+
+                            // 6. INJECT AT TOP
+                            let mut start_iter = buffer_clone.start_iter();
+                            buffer_clone.insert(&mut start_iter, &history_chunk);
+
+                            // 7. UPDATE & RESET
+                            s.visible_history_count = next_vis;
+
+                            // Reset flag immediately? Or wait?
+                            // Since we inserted text, the scrollbar physically moves/shrinks,
+                            // pushing 'value' effectively down relative to content.
+                            // We reset immediately to allow subsequent pulls.
+                            s.is_loading_history = false;
+                        }
+                    });
+                }
             }
             Event::FileSelected(path) => {
                 trigger_upload(path, self.tx_ui.clone());
@@ -302,19 +368,24 @@ fn main() {
     let mut initial_console_output =
         ":: VEIN :: SYSTEM ONLINE (UNLIMITED TIER)\n:: ENGINE: GEMINI-3-PRO\n".to_string();
 
+    // CAP LOGIC
+    let cap_size = 50;
+    let total_history = saved_history.len();
+    let start_index = if total_history > cap_size { total_history - cap_size } else { 0 };
+    let initial_visible_count = total_history - start_index;
+
     if saved_history.is_empty() {
-        initial_console_output.push_str(":: MEMORY :: COLD START (New Session)\n\n");
+        initial_console_output.push_str(":: MEMORY :: COLD START\n\n");
     } else {
-        initial_console_output.push_str(":: MEMORY :: LONG-TERM STORAGE RESTORED\n\n");
-        for msg in &saved_history {
-            if !msg.content.starts_with("SYSTEM_INSTRUCTION") {
-                let prefix = if msg.role == "user" { "[ARCHITECT]" } else { "[UNA]" };
-                // Hide huge image payloads (or GCS URIs) from initial console load to avoid clutter
-                if msg.content.starts_with("data:image/") || msg.content.starts_with("[GCS_IMAGE_URI]") {
-                    initial_console_output.push_str(&format!("{} > [IMAGE ATTACHMENT]\n", prefix));
-                } else {
-                    initial_console_output.push_str(&format!("{} > {}\n", prefix, msg.content));
-                }
+        initial_console_output.push_str(":: MEMORY :: ARCHIVE CONNECTED (Recent)\n\n");
+        // Iterate only the capped slice
+        for msg in saved_history.iter().skip(start_index) {
+            if msg.content.starts_with("SYSTEM_INSTRUCTION") { continue; }
+            let prefix = if msg.role == "user" { "[ARCHITECT]" } else { "[UNA]" };
+            if msg.content.starts_with("data:image/") || msg.content.starts_with("[GCS_IMAGE_URI]") {
+                initial_console_output.push_str(&format!("{} > [IMAGE]\n", prefix));
+            } else {
+                initial_console_output.push_str(&format!("{} > {}\n", prefix, msg.content));
             }
         }
     }
@@ -325,6 +396,10 @@ fn main() {
         chat_history: saved_history,
         sidebar_position: SidebarPosition::default(),
         sidebar_collapsed: false,
+        // --- J7 INITIALIZATION ---
+        visible_history_count: initial_visible_count,
+        scroll_signal_connected: false,
+        is_loading_history: false,
     }));
 
     let (tx_to_bg, mut rx_from_ui) = mpsc::unbounded_channel::<String>();
