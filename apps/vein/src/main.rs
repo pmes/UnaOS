@@ -16,6 +16,7 @@ use gtk4::prelude::*;
 use gtk4::{Adjustment, TextBuffer};
 use glib::ControlFlow;
 use serde::Deserialize;
+use chrono::Local;
 
 mod api;
 use api::{Content, GeminiClient, Part};
@@ -565,7 +566,12 @@ fn main() {
 
                         match client.generate_content(&context).await {
                             Ok(response) => {
-                                let display_response = format!("\n[UNA] :: {}\n", response);
+                                // THE CHRONOMETER
+                                let timestamp = Local::now().format("%H:%M:%S.%f").to_string();
+
+                                // Format: [UNA] [14:05:01.123456] :: Response
+                                let display_response = format!("\n[UNA] [{}] :: {}\n", timestamp, response);
+
                                 if let Err(e) = tx_to_ui_bg_clone.send(display_response) {
                                     error!("Failed to send Model response to UI: {}", e);
                                 }
@@ -577,38 +583,24 @@ fn main() {
                                 });
                                 brain_bg.save(&s.chat_history);
 
-                                // 2. Success: Set Status to Online
                                 let _ = gui_tx_brain.send(GuiUpdate::ShardStatusChanged {
                                     id: "una-prime".to_string(),
                                     status: ShardStatus::Online
                                 }).await;
                             }
                             Err(e) => {
-                                // 3. Error: Log, Alert, Set Status to Error, but DO NOT EXIT
                                 let display_error = format!("\n[SYSTEM ERROR] :: AI Core Stalled: {}\n", e);
-                                error!("BRAIN ERROR (Resilience Triggered): {}", e);
+                                error!("BRAIN ERROR: {}", e);
 
                                 if let Err(send_e) = tx_to_ui_bg_clone.send(display_error) {
                                     error!("Failed to send API error to UI: {}", send_e);
                                 }
 
-                                // Visual Error Status
                                 let _ = gui_tx_brain.send(GuiUpdate::ShardStatusChanged {
                                     id: "una-prime".to_string(),
                                     status: ShardStatus::Error
                                 }).await;
 
-                                // Optional: Reset to Online after a delay or keep Error?
-                                // Directive says "Reset to Online/Idle after attempt" in the example,
-                                // but specifically "Set status to Error, but CONTINUE".
-                                // The example code showed resetting to Online at the very end of loop.
-                                // Let's stick to the Error status so the user sees it,
-                                // but the loop continues so they can try again.
-                                // Wait, the Architect's pseudo-code had `Reset to Online/Idle after attempt` OUTSIDE the match.
-                                // Let's follow that pattern to ensure "Ready for next command".
-                                // Actually, if it failed, maybe we should leave it red until next success?
-                                // "Reset to Online/Idle after attempt" implies it goes back to green.
-                                // I'll add a delay then reset to Online so it looks "Ready".
                                 tokio::time::sleep(Duration::from_secs(1)).await;
                                 let _ = gui_tx_brain.send(GuiUpdate::ShardStatusChanged {
                                     id: "una-prime".to_string(),
