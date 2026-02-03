@@ -1,175 +1,176 @@
 mod api;
-
-// J7 FIX: Import GTK Prelude so we can use methods on Buffer/Adjustment
-use gtk4::prelude::*;
-
+use api::{GeminiClient, Content, Part};
 use gneiss_pal::{
-    AppHandler, Backend, DashboardState, Event, BrainManager,
-    Shard, ShardRole, ShardStatus, SavedMessage, ViewMode, SidebarPosition
+    AppHandler, Backend, DashboardState, Event, BrainManager, Shard, ShardRole, ShardStatus,
+    SavedMessage, ViewMode, GuiUpdate
 };
-use crate::api::{GeminiClient, Content, Part};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use tokio::runtime::Runtime;
 use tokio::sync::mpsc;
 use chrono::Local;
+use std::path::PathBuf;
+use gtk4::prelude::*;
 
-// --- State Wrapper for Thread Safety ---
+#[derive(serde::Deserialize)]
+struct VertexPacket { id: String, status: String }
+
 struct VeinApp {
     state: Arc<Mutex<DashboardState>>,
-    tx_logic: mpsc::Sender<String>, // Channel to send input to the async brain
-    brain: BrainManager,
+    tx_logic: mpsc::Sender<String>,
+    tx_upload: mpsc::Sender<PathBuf>,
 }
 
-// --- The Brain Loop (Async Logic) ---
 async fn run_brain(
     mut rx: mpsc::Receiver<String>,
+    mut rx_files: mpsc::Receiver<PathBuf>,
     state: Arc<Mutex<DashboardState>>,
-    brain_io: BrainManager
+    brain_io: BrainManager,
+    gui_tx: async_channel::Sender<GuiUpdate>
 ) {
-    let client = GeminiClient::new();
+    let client = GeminiClient::new().await.unwrap_or_else(|e| {
+        let _ = gui_tx.send_blocking(GuiUpdate::ConsoleLog(format!("FATAL: {}\n", e)));
+        panic!("Brain Death");
+    });
 
-    while let Some(user_input) = rx.recv().await {
-        let is_s9 = user_input.trim().to_lowercase().starts_with("/s9");
-
-        // 1. Update State (Thinking)
-        {
-            let mut s = state.lock().unwrap();
-            s.console_output.push_str(&format!("\n[USER] {}\n", user_input));
-
-            // Set Shard Status
-            if let Some(shard) = s.shard_tree.iter_mut().find(|sh| sh.id == if is_s9 { "s9-mule" } else { "una-prime" }) {
-                shard.status = ShardStatus::Thinking;
-            }
-        } // Lock drops
-
-        // 2. Prepare AI Context
-        let system_instruction = if is_s9 {
-             "SYSTEM: You are S9-Mule. Write Rust code. No prose."
-        } else {
-             "SYSTEM: You are Una. Be terse. Be brilliant."
-        };
-
-        // Load history from disk for context
-        let history = brain_io.load();
-        let mut context = Vec::new();
-        context.push(Content { role: "model".to_string(), parts: vec![Part::text(system_instruction.to_string())] });
-        for msg in history {
-            let role = if msg.role == "user" { "user" } else { "model" };
-            context.push(Content { role: role.to_string(), parts: vec![Part::text(msg.content)] });
-        }
-        // Add current input
-        context.push(Content { role: "user".to_string(), parts: vec![Part::text(user_input.clone())] });
-
-        // 3. Call API
-        let response = match client.generate_content(&context).await {
-            Ok(text) => text,
-            Err(e) => format!("Error: {}", e),
-        };
-
-        // 4. Update State (Response)
-        let timestamp = Local::now().format("%H:%M:%S");
-        let tag = if is_s9 { "[S9]" } else { "[UNA]" };
-        let final_text = format!("\n{} [{}] :: {}\n", tag, timestamp, response);
-
-        {
-            let mut s = state.lock().unwrap();
-            s.console_output.push_str(&final_text);
-
-            // Restore Status
-            if let Some(shard) = s.shard_tree.iter_mut().find(|sh| sh.id == if is_s9 { "s9-mule" } else { "una-prime" }) {
-                shard.status = ShardStatus::Online;
+    // UDP LISTENER
+    let gui_udp = gui_tx.clone();
+    tokio::spawn(async move {
+        let sock = tokio::net::UdpSocket::bind("0.0.0.0:4200").await.unwrap();
+        let mut buf = [0u8; 1024];
+        loop {
+            if let Ok((len, _)) = sock.recv_from(&mut buf).await {
+                if let Ok(p) = serde_json::from_slice::<VertexPacket>(&buf[..len]) {
+                    let s = match p.status.as_str() { "thinking" => ShardStatus::Thinking, "error" => ShardStatus::Error, _ => ShardStatus::Online };
+                    let _ = gui_udp.send(GuiUpdate::ShardStatusChanged { id: p.id, status: s }).await;
+                }
             }
         }
+    });
 
-        // 5. Save Memory
-        let mut new_history = brain_io.load();
-        new_history.push(SavedMessage { role: "user".to_string(), content: user_input });
-        new_history.push(SavedMessage { role: "model".to_string(), content: response });
-        brain_io.save(&new_history);
+    loop {
+        tokio::select! {
+            Some(path) = rx_files.recv() => {
+                let _ = gui_tx.send(GuiUpdate::ConsoleLog(format!("\n[SYSTEM] Uploading: {:?}...\n", path))).await;
+                // Upload Logic (S9 Archive)
+                let client = reqwest::Client::new();
+                let filename = path.file_name().unwrap().to_string_lossy().to_string();
+                let bytes = std::fs::read(&path).unwrap_or_default();
+
+                let part = reqwest::multipart::Part::bytes(bytes).file_name(filename.clone());
+                let form = reqwest::multipart::Form::new().part("file", part);
+
+                match client.post("https://vein-s9-upload-1035558613434.us-central1.run.app/upload").multipart(form).send().await {
+                    Ok(res) => {
+                        let txt = res.text().await.unwrap_or_default();
+                        if let Ok(json) = serde_json::from_str::<serde_json::Value>(&txt) {
+                            if let Some(uri) = json.get("storage_uri").and_then(|v| v.as_str()) {
+                                let _ = gui_tx.send(GuiUpdate::ConsoleLog(format!("[GCS_IMAGE_URI]{}\n", uri))).await;
+                            }
+                        }
+                    },
+                    Err(e) => { let _ = gui_tx.send(GuiUpdate::ConsoleLog(format!("Upload Failed: {}\n", e))).await; }
+                }
+            }
+            Some(input) = rx.recv() => {
+                let is_s9 = input.starts_with("/s9");
+                let shard_id = if is_s9 { "s9-mule" } else { "una-prime" };
+
+                let _ = gui_tx.send(GuiUpdate::ShardStatusChanged { id: shard_id.to_string(), status: ShardStatus::Thinking }).await;
+
+                let hist = brain_io.load();
+                let mut ctx = Vec::new();
+
+                // System Instruction
+                let sys = if is_s9 { "You are S9. Code only." } else { "You are Una. Dangerous elegance." };
+                ctx.push(Content { role: "model".to_string(), parts: vec![Part::text(sys.to_string())] });
+
+                for m in hist {
+                    // Check for GCS URI in history to inject as FileData
+                    if m.content.starts_with("[GCS_IMAGE_URI]") {
+                        let uri = m.content.replace("[GCS_IMAGE_URI]", "").trim().to_string();
+                        ctx.push(Content { role: m.role, parts: vec![Part::file_data("image/jpeg".to_string(), uri)]});
+                    } else {
+                        ctx.push(Content { role: if m.role == "user" { "user".into() } else { "model".into() }, parts: vec![Part::text(m.content)] });
+                    }
+                }
+                ctx.push(Content { role: "user".to_string(), parts: vec![Part::text(input.clone())] });
+
+                let _ = gui_tx.send(GuiUpdate::ConsoleLog(format!("\n[USER] {}\n", input))).await;
+
+                match client.generate_content(&ctx).await {
+                    Ok(resp) => {
+                        let _ = gui_tx.send(GuiUpdate::ConsoleLog(format!("\n[{}] :: {}\n", if is_s9 { "S9" } else { "UNA" }, resp))).await;
+                        let mut h = brain_io.load();
+                        h.push(SavedMessage { role: "user".into(), content: input });
+                        h.push(SavedMessage { role: "model".into(), content: resp });
+                        brain_io.save(&h);
+                        let _ = gui_tx.send(GuiUpdate::ShardStatusChanged { id: shard_id.to_string(), status: ShardStatus::Online }).await;
+                    },
+                    Err(e) => {
+                        let _ = gui_tx.send(GuiUpdate::ConsoleLog(format!("Error: {}\n", e))).await;
+                        let _ = gui_tx.send(GuiUpdate::ShardStatusChanged { id: shard_id.to_string(), status: ShardStatus::Error }).await;
+                    }
+                }
+            }
+        }
     }
 }
 
 impl AppHandler for VeinApp {
     fn handle_event(&mut self, event: Event) {
         match event {
-            Event::Input(text) => {
-                // Send to async brain
-                let _ = self.tx_logic.blocking_send(text);
-            }
-            Event::NavSelect(idx) => {
-                let mut s = self.state.lock().unwrap();
-                s.active_nav_index = idx;
-            }
+            Event::Input(t) => { let _ = self.tx_logic.blocking_send(t); },
+            Event::FileSelected(p) => { let _ = self.tx_upload.blocking_send(p); },
+            Event::NavSelect(i) => { self.state.lock().unwrap().active_nav_index = i; },
             Event::ToggleSidebar => {
                 let mut s = self.state.lock().unwrap();
                 s.sidebar_collapsed = !s.sidebar_collapsed;
-            }
-            Event::TextBufferUpdate(buffer, adj) => {
-                // Keep the UI buffer synced with state
+            },
+            Event::TextBufferUpdate(buf, adj) => {
                 let s = self.state.lock().unwrap();
-                if buffer.text(&buffer.start_iter(), &buffer.end_iter(), false).as_str() != s.console_output {
-                    buffer.set_text(&s.console_output);
-                    // Auto-scroll
-                    adj.set_value(adj.upper());
-                }
+                // Simple sync: if buffer end != console end, append difference.
+                // For now, full overwrite if mismatch to keep it simple, or just append logic in Brain.
+                // Actually, the Brain sends ConsoleLog events which the Lib handles directly.
+                // So this is just for state persistence if needed.
             }
-            _ => {}
         }
     }
-
-    fn view(&self) -> DashboardState {
-        self.state.lock().unwrap().clone()
-    }
+    fn view(&self) -> DashboardState { self.state.lock().unwrap().clone() }
 }
 
 fn main() {
-    // 1. Setup Brain & State
     let brain = BrainManager::new();
     let history = brain.load();
 
-    // Initial Console State from History
-    let mut initial_output = String::new();
-    for msg in history {
-        let tag = if msg.role == "user" { "[USER]" } else { "[UNA]" };
-        initial_output.push_str(&format!("\n{} :: {}\n", tag, msg.content));
-    }
-
-    // Define Shards
+    // Initial State
     let mut root = Shard::new("una-prime", "Una-Prime", ShardRole::Root);
     root.status = ShardStatus::Online;
     let mut s9 = Shard::new("s9-mule", "S9-Mule", ShardRole::Builder);
-    s9.status = ShardStatus::Offline;
+    root.children.push(s9);
 
-    let initial_state = DashboardState {
-        nav_items: vec!["Comms".into(), "Wolfpack".into(), "Forge".into()],
-        active_nav_index: 0,
-        console_output: initial_output,
-        shard_tree: vec![root, s9], // Flat list for now, or build tree
-        sidebar_position: SidebarPosition::Right,
+    let mut output = String::new();
+    for m in history { output.push_str(&format!("\n[{}] {}\n", m.role.to_uppercase(), m.content)); }
+
+    let state = Arc::new(Mutex::new(DashboardState {
+        nav_items: vec!["Comms".into(), "Wolfpack".into()],
+        console_output: output,
+        shard_tree: vec![root],
         ..Default::default()
-    };
+    }));
 
-    let state = Arc::new(Mutex::new(initial_state));
+    let (tx, rx) = mpsc::channel(100);
+    let (tx_file, rx_file) = mpsc::channel(10);
+    let (gui_tx, gui_rx) = async_channel::unbounded();
 
-    // 2. Setup Channels & Async Runtime
-    let (tx, rx) = mpsc::channel::<String>(100);
+    let s_clone = state.clone();
+    let b_clone = brain.clone();
+    let g_clone = gui_tx.clone();
 
-    let rt = Runtime::new().unwrap();
-    let state_clone = state.clone();
-    let brain_clone = brain.clone();
-
-    // Spawn Background Brain
     thread::spawn(move || {
-        rt.block_on(run_brain(rx, state_clone, brain_clone));
+        let rt = Runtime::new().unwrap();
+        rt.block_on(run_brain(rx, rx_file, s_clone, b_clone, g_clone));
     });
 
-    // 3. Launch UI
-    let app = VeinApp {
-        state,
-        tx_logic: tx,
-        brain: BrainManager::new(),
-    };
-
-    Backend::new("org.una.vein", app);
+    Backend::new("org.una.vein", VeinApp { state, tx_logic: tx, tx_upload: tx_file }, gui_rx);
 }
