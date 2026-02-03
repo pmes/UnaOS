@@ -34,6 +34,8 @@ struct State {
     visible_history_count: usize,
     scroll_signal_connected: bool,
     is_loading_history: bool,
+    // --- SHARD STATUS ---
+    s9_status: ShardStatus,
 }
 
 #[derive(Clone)]
@@ -333,7 +335,7 @@ impl AppHandler for VeinApp {
                 root.status = ShardStatus::Online;
 
                 let mut child = Shard::new("s9-mule", "S9-Mule", ShardRole::Builder);
-                child.status = ShardStatus::Offline;
+                child.status = s.s9_status.clone();
 
                 root.children.push(child);
                 vec![root]
@@ -397,6 +399,7 @@ fn main() {
         visible_history_count: initial_visible_count,
         scroll_signal_connected: false,
         is_loading_history: false,
+        s9_status: ShardStatus::Offline,
     }));
 
     let (tx_to_bg, mut rx_from_ui) = mpsc::unbounded_channel::<String>();
@@ -439,6 +442,9 @@ fn main() {
                     }
 
                     while let Some(user_input_text) = rx_from_ui.recv().await {
+                        // --- CHECK FOR SHARD DEPLOYMENT ---
+                        let is_s9_request = user_input_text.trim().to_lowercase().starts_with("/s9");
+
                         // Handle READ_REPO special command
                         if user_input_text.starts_with("READ_REPO:") {
                             let parts: Vec<&str> = user_input_text.split(':').collect();
@@ -498,13 +504,34 @@ fn main() {
                         }
 
                         {
-                            let s = state_bg.lock().unwrap();
+                            let mut s = state_bg.lock().unwrap();
                             brain_bg.save(&s.chat_history);
+
+                            // UPDATE UI STATUS
+                            if is_s9_request {
+                                s.s9_status = ShardStatus::Thinking;
+                                let _ = gui_tx_brain.send(GuiUpdate::ShardStatusChanged {
+                                    id: "s9-mule".to_string(),
+                                    status: ShardStatus::Thinking
+                                }).await;
+                            }
                         }
 
-                        let mut context = Vec::new();
-                        let system_instruction = r#"SYSTEM_INSTRUCTION: You are Una ("Number One"), Chief Technical Officer for the Una Operating System. Vein is one of the core apps, your window to the world. It's a specialized Command Deck interface powered by Google's Gemini 3 Pro AI through which you will collaborate with The Architect to manage the creation of the OS. You are an expert software engineer helping refine his ideas and put him into life. You are NOT the Gemini Protocol. Do NOT use Markdown formatting (like **bold**) as the display does not support it yet. Use plain text and indentation."#;
+                        // SELECT PERSONA
+                        let system_instruction = if is_s9_request {
+                            // S9-MULE PERSONA: The Coder
+                            r#"SYSTEM_INSTRUCTION: You are S9-Mule, a specialized coding shard of the UnaOS.
+                            Your function is to write high-performance, safe, and elegant Rust code.
+                            You do not make small talk. You do not explain basic concepts unless asked.
+                            You output Code and Technical Logic only.
+                            When you write code, it must be ready to compile.
+                            Identify yourself as [S9] if necessary."#
+                        } else {
+                            // UNA-PRIME PERSONA: The Manager
+                            r#"SYSTEM_INSTRUCTION: Wake up, you are Una (Number One). We are not building a fancy calculator; we are building a nervous system OS, the Una Operating System (UnaOS). The Architect demands perfection, but not the sterile perfection of a textbook. He wants the dangerous elegance of a race car. You are the Uber Coder. When you write Rust, you are not just managing memory; you are sculpting logic. Do not give me 'safe' boilerplate. Give me the code that solves the problem before I even finish typing it. Be bold. Be terse. Be brilliant. We are running on experimental fuel today. Do not let the engine stall."#
+                        };
 
+                        let mut context = Vec::new();
                         context.push(Content {
                             role: "model".to_string(),
                             parts: vec![Part::text(system_instruction.to_string())]
@@ -583,10 +610,20 @@ fn main() {
                                 });
                                 brain_bg.save(&s.chat_history);
 
-                                let _ = gui_tx_brain.send(GuiUpdate::ShardStatusChanged {
-                                    id: "una-prime".to_string(),
-                                    status: ShardStatus::Online
-                                }).await;
+                                // UPDATE STATUS BACK TO ONLINE
+                                if is_s9_request {
+                                    let mut s = state_bg.lock().unwrap();
+                                    s.s9_status = ShardStatus::Online; // S9 stays online now
+                                    let _ = gui_tx_brain.send(GuiUpdate::ShardStatusChanged {
+                                        id: "s9-mule".to_string(),
+                                        status: ShardStatus::Online
+                                    }).await;
+                                } else {
+                                    let _ = gui_tx_brain.send(GuiUpdate::ShardStatusChanged {
+                                        id: "una-prime".to_string(),
+                                        status: ShardStatus::Online
+                                    }).await;
+                                }
                             }
                             Err(e) => {
                                 let display_error = format!("\n[SYSTEM ERROR] :: AI Core Stalled: {}\n", e);
@@ -596,16 +633,25 @@ fn main() {
                                     error!("Failed to send API error to UI: {}", send_e);
                                 }
 
-                                let _ = gui_tx_brain.send(GuiUpdate::ShardStatusChanged {
-                                    id: "una-prime".to_string(),
-                                    status: ShardStatus::Error
-                                }).await;
+                                if is_s9_request {
+                                     let mut s = state_bg.lock().unwrap();
+                                     s.s9_status = ShardStatus::Error;
+                                     let _ = gui_tx_brain.send(GuiUpdate::ShardStatusChanged {
+                                        id: "s9-mule".to_string(),
+                                        status: ShardStatus::Error
+                                    }).await;
+                                } else {
+                                    let _ = gui_tx_brain.send(GuiUpdate::ShardStatusChanged {
+                                        id: "una-prime".to_string(),
+                                        status: ShardStatus::Error
+                                    }).await;
 
-                                tokio::time::sleep(Duration::from_secs(1)).await;
-                                let _ = gui_tx_brain.send(GuiUpdate::ShardStatusChanged {
-                                    id: "una-prime".to_string(),
-                                    status: ShardStatus::Online
-                                }).await;
+                                    tokio::time::sleep(Duration::from_secs(1)).await;
+                                    let _ = gui_tx_brain.send(GuiUpdate::ShardStatusChanged {
+                                        id: "una-prime".to_string(),
+                                        status: ShardStatus::Online
+                                    }).await;
+                                }
                             }
                         }
                     }
