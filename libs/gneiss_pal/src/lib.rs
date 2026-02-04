@@ -3,9 +3,9 @@ use gtk4::prelude::*;
 use gtk4::{
     Application, ApplicationWindow, Box, Orientation, Label, Button, Stack, ScrolledWindow,
     PolicyType, Align, ListBox, Separator, StackTransitionType, TextView, EventControllerKey,
-    TextBuffer, Adjustment, FileChooserNative, ResponseType, FileChooserAction,
+    TextBuffer, Adjustment, FileDialog, ResponseType, FileChooserAction,
     HeaderBar, StackSwitcher, ToggleButton, CssProvider, StyleContext, Image, MenuButton, Popover,
-    Paned
+    Paned, Window
 };
 use gtk4::gdk::{Key, ModifierType};
 use std::rc::Rc;
@@ -163,16 +163,19 @@ fn build_ui(app: &Application, handler: Rc<RefCell<impl AppHandler>>, rx: async_
     sidebar.append(&stack);
     sidebar.append(&StackSwitcher::builder().stack(&stack).halign(Align::Center).margin_bottom(10).build());
 
-    // Content
-    let content = Box::new(Orientation::Vertical, 0);
-    content.set_hexpand(true);
+    // Content Area
+    let content_stack = Stack::new();
+    content_stack.set_hexpand(true);
+
+    // Comms View (Console + Input)
+    let comms_box = Box::new(Orientation::Vertical, 0);
 
     // Console
     let scroller = ScrolledWindow::builder().vexpand(true).hscrollbar_policy(PolicyType::Never).build();
     let console = TextView::builder().editable(false).wrap_mode(gtk4::WrapMode::WordChar).build();
     console.add_css_class("console");
     scroller.set_child(Some(&console));
-    content.append(&scroller);
+    comms_box.append(&scroller);
 
     // Input Area
     let input_box = Box::new(Orientation::Horizontal, 10);
@@ -181,15 +184,24 @@ fn build_ui(app: &Application, handler: Rc<RefCell<impl AppHandler>>, rx: async_
     let upload_btn = Button::builder().icon_name("folder-open-symbolic").valign(Align::End).build();
     let h_up = handler.clone();
     let w_up = window.downgrade();
+
+    // Modern File Dialog
     upload_btn.connect_clicked(move |_| {
-        let f = FileChooserNative::builder().title("Upload").action(FileChooserAction::Open).modal(true).build();
-        if let Some(w) = w_up.upgrade() { f.set_transient_for(Some(&w)); }
         let h = h_up.clone();
-        f.connect_response(move |d, r| {
-            if r == ResponseType::Accept { if let Some(file) = d.file() { if let Some(p) = file.path() { h.borrow_mut().handle_event(Event::FileSelected(p)); }}}
-            d.destroy();
+        let w_clone = w_up.clone();
+        glib::MainContext::default().spawn_local(async move {
+            if let Some(w) = w_clone.upgrade() {
+                let dialog = FileDialog::builder().title("Upload").modal(true).build();
+                let parent_window: Option<&Window> = Some(w.upcast_ref());
+
+                // GTK 0.10: open_future uses async/await
+                if let Ok(file) = dialog.open_future(parent_window).await {
+                    if let Some(p) = file.path() {
+                        h.borrow_mut().handle_event(Event::FileSelected(p));
+                    }
+                }
+            }
         });
-        f.show();
     });
     input_box.append(&upload_btn);
 
@@ -231,13 +243,40 @@ fn build_ui(app: &Application, handler: Rc<RefCell<impl AppHandler>>, rx: async_
     send_btn.connect_clicked(move |_| send_fn());
     input_box.append(&send_btn);
 
-    content.append(&input_box);
+    comms_box.append(&input_box);
+    content_stack.add_named(&comms_box, Some("comms"));
 
-    // Layout
-    main_box.append(&sidebar);
-    main_box.append(&Separator::new(Orientation::Vertical));
-    main_box.append(&content);
+    // Wolfpack View (Placeholder)
+    let wolfpack_box = Box::new(Orientation::Vertical, 0);
+    wolfpack_box.append(&Label::new(Some(":: WOLFPACK GRID ACTIVE ::")));
+    content_stack.add_named(&wolfpack_box, Some("wolfpack"));
+
+    // Layout Logic (Sidebar Position)
+    let sep = Separator::new(Orientation::Vertical);
+
+    if state_view.sidebar_position == SidebarPosition::Left {
+        main_box.append(&sidebar);
+        main_box.append(&sep);
+        main_box.append(&content_stack);
+    } else {
+        main_box.append(&content_stack);
+        main_box.append(&sep);
+        main_box.append(&sidebar);
+    }
+
     window.set_child(Some(&main_box));
+
+    // ViewMode Switcher
+    let stack_clone = content_stack.clone();
+    let h_mode = handler.clone();
+    glib::timeout_add_local(Duration::from_millis(200), move || {
+        let mode = h_mode.borrow().view().mode;
+        let target = match mode { ViewMode::Comms => "comms", ViewMode::Wolfpack => "wolfpack" };
+        if stack_clone.visible_child_name().map(|s| s != target).unwrap_or(true) {
+            stack_clone.set_visible_child_name(target);
+        }
+        glib::ControlFlow::Continue
+    });
 
     // Connectors
     let s_box = sidebar.clone();
