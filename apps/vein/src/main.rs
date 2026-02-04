@@ -11,6 +11,9 @@ use tokio::sync::mpsc;
 use chrono::Local;
 use std::path::PathBuf;
 use gtk4::prelude::*;
+use log::info;
+use dotenvy::dotenv;
+use gtk4::{gio, glib};
 
 #[derive(serde::Deserialize)]
 struct VertexPacket { id: String, status: String }
@@ -129,17 +132,32 @@ impl AppHandler for VeinApp {
             },
             Event::TextBufferUpdate(buf, adj) => {
                 let s = self.state.lock().unwrap();
-                // Simple sync: if buffer end != console end, append difference.
-                // For now, full overwrite if mismatch to keep it simple, or just append logic in Brain.
-                // Actually, the Brain sends ConsoleLog events which the Lib handles directly.
-                // So this is just for state persistence if needed.
+                // Polling Sync Logic
             }
         }
     }
     fn view(&self) -> DashboardState { self.state.lock().unwrap().clone() }
 }
 
+// Embed the compiled resource file directly into the binary
+static RESOURCES_BYTES: &[u8] = include_bytes!("resources.gresource");
+
 fn main() {
+    let app_start_time = std::time::Instant::now();
+    dotenv().ok();
+
+    env_logger::Builder::from_default_env()
+        .filter_level(log::LevelFilter::Info)
+        .try_init()
+        .ok();
+
+    info!("STARTUP: Initializing environment and logger. Elapsed: {:?}", app_start_time.elapsed());
+
+    // Load resources (embedded)
+    let bytes = glib::Bytes::from_static(RESOURCES_BYTES);
+    let res = gio::Resource::from_data(&bytes).expect("Failed to load resources");
+    gio::resources_register(&res);
+
     let brain = BrainManager::new();
     let history = brain.load();
 

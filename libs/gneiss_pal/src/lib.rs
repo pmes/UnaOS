@@ -181,7 +181,9 @@ fn build_ui(app: &Application, handler: Rc<RefCell<impl AppHandler>>, rx: async_
     let input_box = Box::new(Orientation::Horizontal, 10);
     input_box.set_margin_start(10); input_box.set_margin_end(10); input_box.set_margin_bottom(10);
 
-    let upload_btn = Button::builder().icon_name("folder-open-symbolic").valign(Align::End).build();
+    // Upload Icon (Custom Resource)
+    let upload_icon = Image::from_resource("/org/una/vein/icons/share-symbolic");
+    let upload_btn = Button::builder().child(&upload_icon).valign(Align::End).build();
     let h_up = handler.clone();
     let w_up = window.downgrade();
 
@@ -214,7 +216,9 @@ fn build_ui(app: &Application, handler: Rc<RefCell<impl AppHandler>>, rx: async_
     input_scroll.set_child(Some(&input_view));
     input_box.append(&input_scroll);
 
-    let send_btn = Button::builder().icon_name("mail-send-symbolic").valign(Align::End).build();
+    // Send Icon (Custom Resource)
+    let send_icon = Image::from_resource("/org/una/vein/icons/paper-plane-symbolic");
+    let send_btn = Button::builder().child(&send_icon).valign(Align::End).css_classes(vec!["suggested-action"]).build();
     let h_send = handler.clone();
     let v_send = input_view.clone();
     let adj_scroll = scroller.vadjustment();
@@ -254,6 +258,7 @@ fn build_ui(app: &Application, handler: Rc<RefCell<impl AppHandler>>, rx: async_
     // Layout Logic (Sidebar Position)
     let sep = Separator::new(Orientation::Vertical);
 
+    // Logic Swap: Left means Sidebar on Left
     if state_view.sidebar_position == SidebarPosition::Left {
         main_box.append(&sidebar);
         main_box.append(&sep);

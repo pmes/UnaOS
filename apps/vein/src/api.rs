@@ -91,7 +91,7 @@ impl GeminiClient {
             .map_err(|_| "GEMINI_API_KEY not set in .env".to_string())?;
 
         // Hardcoded to Experimental as per original spec
-        let model_name = "gemini-experimental";
+        let model_name = "gemini-3-pro-preview";
         let model_url = format!(
             "https://generativelanguage.googleapis.com/v1beta/models/{}:generateContent?key={}",
             model_name, api_key
