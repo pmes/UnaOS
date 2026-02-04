@@ -2,7 +2,7 @@ mod api;
 use api::{GeminiClient, Content, Part};
 use gneiss_pal::{
     AppHandler, Backend, DashboardState, Event, BrainManager, Shard, ShardRole, ShardStatus,
-    SavedMessage, ViewMode, GuiUpdate
+    SavedMessage, ViewMode, GuiUpdate, SidebarPosition
 };
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -174,6 +174,7 @@ fn main() {
         nav_items: vec!["Comms".into(), "Wolfpack".into()],
         console_output: output,
         shard_tree: vec![root],
+        sidebar_position: SidebarPosition::Left,
         ..Default::default()
     }));
 

@@ -70,11 +70,13 @@ impl BrainManager {
     pub fn new() -> Self { Self { path: "memories".to_string() } }
     pub fn save(&self, h: &Vec<SavedMessage>) {
         let _ = fs::create_dir_all(&self.path);
-        let f = OpenOptions::new().write(true).create(true).truncate(true).open(Path::new(&self.path).join("history.json"));
+        // FIXED: Filename restored to chat_history.json
+        let f = OpenOptions::new().write(true).create(true).truncate(true).open(Path::new(&self.path).join("chat_history.json"));
         if let Ok(mut file) = f { let _ = file.write_all(serde_json::to_string_pretty(h).unwrap().as_bytes()); }
     }
     pub fn load(&self) -> Vec<SavedMessage> {
-        if let Ok(mut f) = File::open(Path::new(&self.path).join("history.json")) {
+        // FIXED: Filename restored to chat_history.json
+        if let Ok(mut f) = File::open(Path::new(&self.path).join("chat_history.json")) {
             let mut s = String::new();
             if f.read_to_string(&mut s).is_ok() { return serde_json::from_str(&s).unwrap_or_default(); }
         }
@@ -105,7 +107,8 @@ pub struct DashboardState {
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
-pub enum SidebarPosition { #[default] Right, Left }
+// FIXED: Default is Left
+pub enum SidebarPosition { #[default] Left, Right }
 
 pub trait AppHandler: 'static {
     fn handle_event(&mut self, event: Event);
@@ -167,21 +170,26 @@ fn build_ui(app: &Application, handler: Rc<RefCell<impl AppHandler>>, rx: async_
     let content_stack = Stack::new();
     content_stack.set_hexpand(true);
 
-    // Comms View (Console + Input)
-    let comms_box = Box::new(Orientation::Vertical, 0);
+    // Comms View (Paned Console + Input)
+    // FIXED: Use Paned for resizing
+    let content_paned = Paned::builder().orientation(Orientation::Vertical).wide_handle(true).build();
+    content_paned.set_hexpand(true);
 
     // Console
     let scroller = ScrolledWindow::builder().vexpand(true).hscrollbar_policy(PolicyType::Never).build();
     let console = TextView::builder().editable(false).wrap_mode(gtk4::WrapMode::WordChar).build();
     console.add_css_class("console");
     scroller.set_child(Some(&console));
-    comms_box.append(&scroller);
+    // Start Child (Top)
+    content_paned.set_start_child(Some(&scroller));
+    content_paned.set_resize_start_child(true);
+    content_paned.set_shrink_start_child(false);
 
     // Input Area
     let input_box = Box::new(Orientation::Horizontal, 10);
-    input_box.set_margin_start(10); input_box.set_margin_end(10); input_box.set_margin_bottom(10);
+    input_box.set_margin_start(10); input_box.set_margin_end(10); input_box.set_margin_bottom(10); input_box.set_margin_top(10);
 
-    // Upload Icon (Custom Resource)
+    // Upload Icon
     let upload_icon = Image::from_resource("/org/una/vein/icons/share-symbolic");
     let upload_btn = Button::builder().child(&upload_icon).valign(Align::End).build();
     let h_up = handler.clone();
@@ -196,7 +204,6 @@ fn build_ui(app: &Application, handler: Rc<RefCell<impl AppHandler>>, rx: async_
                 let dialog = FileDialog::builder().title("Upload").modal(true).build();
                 let parent_window: Option<&Window> = Some(w.upcast_ref());
 
-                // GTK 0.10: open_future uses async/await
                 if let Ok(file) = dialog.open_future(parent_window).await {
                     if let Some(p) = file.path() {
                         h.borrow_mut().handle_event(Event::FileSelected(p));
@@ -207,16 +214,18 @@ fn build_ui(app: &Application, handler: Rc<RefCell<impl AppHandler>>, rx: async_
     });
     input_box.append(&upload_btn);
 
-    let input_scroll = ScrolledWindow::builder().max_content_height(150).vexpand(false).propagate_natural_height(true).hscrollbar_policy(PolicyType::Never).build();
+    // FIXED: Propagate Natural Height FALSE allows Paned to control size
+    let input_scroll = ScrolledWindow::builder().propagate_natural_height(false).hscrollbar_policy(PolicyType::Never).build();
     input_scroll.set_hexpand(true);
-    input_scroll.add_css_class("chat-input");
+    input_scroll.set_vexpand(true);
+    input_scroll.add_css_class("chat-input-area");
 
     let input_view = TextView::builder().wrap_mode(gtk4::WrapMode::WordChar).top_margin(8).bottom_margin(8).left_margin(8).right_margin(8).build();
     input_view.add_css_class("transparent-text");
     input_scroll.set_child(Some(&input_view));
     input_box.append(&input_scroll);
 
-    // Send Icon (Custom Resource)
+    // Send Icon
     let send_icon = Image::from_resource("/org/una/vein/icons/paper-plane-symbolic");
     let send_btn = Button::builder().child(&send_icon).valign(Align::End).css_classes(vec!["suggested-action"]).build();
     let h_send = handler.clone();
@@ -247,8 +256,13 @@ fn build_ui(app: &Application, handler: Rc<RefCell<impl AppHandler>>, rx: async_
     send_btn.connect_clicked(move |_| send_fn());
     input_box.append(&send_btn);
 
-    comms_box.append(&input_box);
-    content_stack.add_named(&comms_box, Some("comms"));
+    // End Child (Bottom)
+    content_paned.set_end_child(Some(&input_box));
+    content_paned.set_resize_end_child(true);
+    content_paned.set_shrink_end_child(false);
+    content_paned.set_position(650); // Default handle position
+
+    content_stack.add_named(&content_paned, Some("comms"));
 
     // Wolfpack View (Placeholder)
     let wolfpack_box = Box::new(Orientation::Vertical, 0);
@@ -258,7 +272,7 @@ fn build_ui(app: &Application, handler: Rc<RefCell<impl AppHandler>>, rx: async_
     // Layout Logic (Sidebar Position)
     let sep = Separator::new(Orientation::Vertical);
 
-    // Logic Swap: Left means Sidebar on Left
+    // Logic: If Left, Sidebar is First
     if state_view.sidebar_position == SidebarPosition::Left {
         main_box.append(&sidebar);
         main_box.append(&sep);
@@ -299,8 +313,8 @@ fn build_ui(app: &Application, handler: Rc<RefCell<impl AppHandler>>, rx: async_
     let css = CssProvider::new();
     css.load_from_data("
         .sidebar { background: #1e1e1e; }
-        .chat-input { background: #2d2d2d; border-radius: 20px; border: 1px solid #555; }
-        .chat-input:focus-within { border-color: #3584e4; }
+        .chat-input-area { background: #2d2d2d; border-radius: 20px; border: 1px solid #555; }
+        .chat-input-area:focus-within { border-color: #3584e4; }
         .transparent-text { background: transparent; color: white; caret-color: white; }
         .console { font-family: 'Monospace'; font-size: 11pt; }
         .status-online { color: #2ec27e; }
