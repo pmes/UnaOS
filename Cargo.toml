@@ -7,7 +7,7 @@ members = [
     "apps/stria",
     "apps/midden",
     "apps/vug",
-    "apps/sledge",
+    "apps/aulë",
     "apps/amber_bytes",
     "apps/cli/vertex",
     "unaos/builder",

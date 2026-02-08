@@ -1,8 +1,8 @@
+use log::{error, info};
 use reqwest::{Client, ClientBuilder};
 use serde::{Deserialize, Serialize};
 use std::env;
 use std::time::Duration;
-use log::{info, error};
 
 #[derive(Serialize)]
 struct GenerateContentRequest {
@@ -88,11 +88,11 @@ pub struct GeminiClient {
 impl GeminiClient {
     pub async fn new() -> Result<Self, String> {
         // 1. Get the Key (Simpler Auth)
-        let api_key = env::var("GEMINI_API_KEY")
-            .map_err(|_| "GEMINI_API_KEY not set in .env".to_string())?;
+        let api_key =
+            env::var("GEMINI_API_KEY").map_err(|_| "GEMINI_API_KEY not set in .env".to_string())?;
 
         // 2. Hardcode to Experimental as requested
-        let model_name = "gemini-experimental";
+        let model_name = "gemini-3-pro-preview";
 
         // 3. Use the Developer API URL (Not Vertex)
         // using generateContent (Buffered) to avoid timeout/stream issues for now
@@ -127,7 +127,9 @@ impl GeminiClient {
 
         info!("Transmitting to Neural Core...");
 
-        let response = self.client.post(&self.model_url)
+        let response = self
+            .client
+            .post(&self.model_url)
             .json(&request_body)
             .send()
             .await
@@ -140,7 +142,9 @@ impl GeminiClient {
             return Err(format!("System Failure {}: {}", status, text));
         }
 
-        let data: GenerateContentResponse = response.json().await
+        let data: GenerateContentResponse = response
+            .json()
+            .await
             .map_err(|e| format!("Failed to decode neural pattern: {}", e))?;
 
         if let Some(feedback) = data.promptFeedback {

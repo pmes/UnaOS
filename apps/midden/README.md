@@ -1,80 +1,84 @@
-Midden: The System Archivist
-"We do not pipe text. We compile intent."
+# 🧠 Midden: The System Archivist
 
-Midden is a next-generation shell environment and system archivist designed for unaOS. It rejects the POSIX philosophy of spawning heavy, clumsy legacy binaries (grep, find, ls) in favor of Direct System Execution.
+> *"We do not pipe text. We compile intent."*
 
-Instead of gluing black-box tools together, Midden compiles your intent into specialized Rust artifacts called Shards, executes them directly via the Gneiss PAL (Platform Abstraction Layer), and stores the result in a semantic Knowledge Pile.
+**Midden** is the context-aware shell environment for **UnaOS**. It rejects the POSIX philosophy of spawning heavy, clumsy legacy binaries (`grep`, `find`, `ls`) in favor of **Direct System Execution**.
 
-🏗 Architecture
-1. The Knowledge Pile (The Archive)
-Midden does not treat the filesystem as a stranger. It maintains a persistent, indexed state of the system.
+Instead of gluing black-box tools together with string manipulation, Midden compiles your intent into specialized Rust artifacts called **Shards**, executes them directly via **Gneiss PAL** (Plexus Abstraction Layer), and stores the result in a semantic **Knowledge Pile**.
 
-Traditional Shell: Runs ls -R to find a file, forgetting the result immediately.
+---
 
-Midden: Queries the internal Archive. If the Archive is stale, it updates the index via direct kernel calls, then answers the query instantly.
+## 🏗 Architecture
 
-2. The Shard (The Execution Unit)
-For complex tasks, Midden creates Shards.
+### 1. The Crystal (Visual Status)
+Midden communicates the emotional state of the system via the **Crystal Indicator** in the prompt. It doesn't just wait for input; it reports health. For example:
 
-Concept: A Shard is a transient, hyper-specialized Rust binary compiled on-the-fly.
+*   🟢 **GREEN:** Stable. Last command successful (Exit Code 0). Git tree clean.
+*   🟠 **AMBER:** Caution. Background jobs active, or working in a "Dirty" git state (Uncommitted changes tracked by **aulë**).
+*   🔴 **RED:** Critical. Last command failed, or system invariant violated.
+*   🔵 **BLUE:** Una Mode. The AI Interface is active and listening.
 
-Example: Instead of grep "impl" ./src | wc -l, Midden generates a minimal Rust struct that opens the directory, reads the bytes, and counts the matches using zero-copy memory mapping.
+### 2. The Knowledge Pile (The Archive)
+Midden maintains a persistent, indexed state of the system.
+*   **Traditional Shell:** Runs `ls -R` to find a file, forgetting the result immediately.
+*   **Midden:** Queries the internal Archive. If the Archive is stale, it updates the index via direct kernel calls, then answers the query instantly.
+*   **Context:** It remembers *why* you are in a directory. If you open a project, Midden loads the relevant **Elessar** context automatically.
 
-Benefit: Zero process-spawning overhead, type-safe data handling, and maximum speed.
+### 3. The Shard (The Execution Unit)
+For complex tasks, Midden creates **Shards**.
+*   **Concept:** A Shard is a transient, hyper-specialized Rust binary compiled on-the-fly.
+*   **Example:** Instead of `grep "impl" ./src | wc -l`, Midden generates a minimal Rust struct that opens the directory, reads the bytes, and counts the matches using zero-copy memory mapping.
+*   **Benefit:** Zero process-spawning overhead, type-safe data handling, and maximum speed.
 
-3. Gneiss PAL (The Bedrock)
-Midden interacts with the hardware through Gneiss PAL, a cross-platform abstraction that allows it to run on:
+---
 
-Host Mode: Fedora Rawhide (for development and build management).
+## 🛠 Developer Information
 
-Target Mode: unaOS (as the native shell 0).
+**Status:** "Princess" Phase (Pre-Alpha).
+*Midden is delicate, strict, and currently requires precise handling.*
 
-🛠 Developer Information
-Midden is currently in the "Princess" Phase (Pre-Alpha). It is delicate, strict, and requires precise handling.
+**Prerequisites:**
+*   Rust Toolchain: `nightly` (Strictly enforced via `rust-toolchain.toml`)
+*   **aulë:** Must be present in the workspace to handle version control status.
 
-Prerequisites
-Rust Toolchain: nightly (Strictly enforced via rust-toolchain.toml).
-
-Build Instructions
-Midden is part of the unaOS workspace.
-
-Bash
-# Build Midden (Host Mode)
-cargo build --package midden --release
+**Build & Run:**
+Midden is part of the `UnaOS` workspace.
+```bash
+# Build Midden (Host Mode - Runs on Linux/macOS)
+cargo build -p midden --release
 
 # Run the Midden REPL
-cargo run --package midden
-🤖 Directives for Agents (Jules)
-ATTENTION: If you are an AI agent (Jules) contributing to this repository, you must adhere to the following Shard Protocol:
+cargo run -p midden
+```
 
-1. The "Anti-Legacy" Rule
-DO NOT use std::process::Command to invoke system tools like git, grep, or gcc unless absolutely unavoidable (e.g., the bootstrap compiler).
+---
 
-Incorrect: Spawning ls to list files.
+## 🤖 Directives for Agents (The Wolfpack)
 
-Correct: Using std::fs::read_dir or Gneiss PAL primitives.
+**ATTENTION:** If you are an AI agent (J1-J20) contributing to this repository, you must adhere to the following **Shard Protocol**:
 
-2. The "No Unwind" Constraint
-Midden must be compatible with the no_std kernel environment of unaOS.
+### 1. The "Anti-Legacy" Rule
+**DO NOT** use `std::process::Command` to invoke system tools like `git`, `grep`, or `gcc` unless absolutely unavoidable (e.g., the bootstrap compiler).
+*   ❌ **Incorrect:** Spawning `ls` to list files.
+*   ✅ **Correct:** Using `std::fs::read_dir` or **Gneiss PAL** primitives.
 
-Avoid panic!. Use Result<T, E> for all control flow.
+### 2. The "No Unwind" Constraint
+Midden must be compatible with the `no_std` kernel environment of UnaOS.
+*   Avoid `panic!`. Use `Result<T, E>` for all control flow.
+*   Do not pull in dependencies that require `libc` unless they are behind a `feature = "std"` flag.
 
-Do not pull in dependencies that require libc unless they are behind a feature = "std" flag.
+### 3. The "Moonstone" Visual Standard
+Visual Output must respect the UnaOS identity.
+*   **Color:** Moonstone Purple (Approx `0x2C003E` background).
+*   **Feedback:** Midden does not speak unless spoken to, or when reporting a `[SHARD FAILURE]`.
 
-3. The "Moonstone" Visual Standard
-Visual Output: All terminal output should respect the unaOS visual identity.
+---
 
-Color: Moonstone Purple (Approx 0x2C003E background).
+## 🔮 Roadmap
 
-Feedback: Midden does not speak unless spoken to, or when reporting a [SHARD FAILURE].
+*   [ ] **Phase 1: The Indexer** - Implement the file walker and "Knowledge Pile" database (aulë integration).
+*   [ ] **Phase 2: The Crystal** - Implement the Status Line and Git/aulë state detection.
+*   [ ] **Phase 3: The Compiler** - Implement the on-the-fly `rustc` invocation to build simple Shards.
+*   [ ] **Phase 4: The Sovereign** - Port Midden to run as `PID 1` inside UnaOS (replacing the kernel init).
 
-🔮 Roadmap
-[ ] Phase 1: The Indexer - Implement the file walker and "Knowledge Pile" database (Sledge integration).
-
-[ ] Phase 2: The Compiler - Implement the on-the-fly rustc invocation to build simple Shards.
-
-[ ] Phase 3: The Shell - Replace the user's login shell with Midden on the Host.
-
-[ ] Phase 4: The Sovereign - Port Midden to run as PID 1 inside unaOS.
-
-"Midden remembers."
+> *"Midden remembers."*

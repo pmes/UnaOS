@@ -15,7 +15,7 @@ fn main() {
     let args: Vec<String> = std::env::args().collect();
     let command = args.get(1).map(|s| s.as_str()).unwrap_or("status");
 
-    println!(":: SLEDGE HAMMER INITIALIZED :: Mode: [{}]", command);
+    println!(":: aulë HAMMER INITIALIZED :: Mode: [{}]", command);
 
     match command {
         "status" => execute_on_all("git", &["status", "-s", "-b"]),
@@ -23,8 +23,8 @@ fn main() {
             execute_on_all("git", &["fetch", "--all"]);
             execute_on_all("git", &["pull"]);
         }
-        "snap" => println!(":: SLEDGE :: Snapshot logic pending..."),
-        _ => println!(":: SLEDGE :: Unknown directive. Usage: sledge [status|sync|snap]"),
+        "snap" => println!(":: aulë :: Snapshot logic pending..."),
+        _ => println!(":: aulë :: Unknown directive. Usage: aulë [status|sync|snap]"),
     }
 }
 
