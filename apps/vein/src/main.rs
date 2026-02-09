@@ -129,12 +129,12 @@ struct VeinApp {
     tx: mpsc::UnboundedSender<String>,
     ui_updater: Rc<RefCell<Option<UiUpdater>>>,
     tx_ui: mpsc::UnboundedSender<String>,
-    gui_tx: async_channel::Sender<GuiUpdate>,
+    _gui_tx: async_channel::Sender<GuiUpdate>,
 }
 
 impl VeinApp {
     fn new(tx: mpsc::UnboundedSender<String>, state: Arc<Mutex<State>>, ui_updater_rc: Rc<RefCell<Option<UiUpdater>>>, tx_ui: mpsc::UnboundedSender<String>, gui_tx: async_channel::Sender<GuiUpdate>) -> Self {
-        Self { state, tx, ui_updater: ui_updater_rc, tx_ui, gui_tx }
+        Self { state, tx, ui_updater: ui_updater_rc, tx_ui, _gui_tx: gui_tx }
     }
 
     fn append_to_console_ui(&self, text: &str) {
@@ -669,51 +669,6 @@ fn main() {
                         error!("Failed to send fatal brain error to UI: {}", send_e);
                     }
                     error!("GeminiClient initialization failed: {}", e);
-                }
-            }
-        });
-    });
-
-    info!(":: VEIN :: Engaging Chassis...");
-
-    // Load resources (embedded) via lib function
-    gneiss_pal::register_resources();
-
-    // S26: The Vertex Listener
-    let gui_tx_sim = gui_tx.clone();
-    thread::spawn(move || {
-        let rt = Runtime::new().unwrap();
-        rt.block_on(async {
-            let socket = match tokio::net::UdpSocket::bind("0.0.0.0:4200").await {
-                Ok(s) => {
-                    let _ = gui_tx_sim.send(GuiUpdate::ConsoleLog("\n[LISTENER] :: Bound to UDP 0.0.0.0:4200 (Network Open). Ready for Vertex Packets.\n".into())).await;
-                    s
-                },
-                Err(e) => {
-                    let _ = gui_tx_sim.send(GuiUpdate::ConsoleLog(format!("\n[LISTENER ERROR] :: Failed to bind UDP 4200: {}\n", e))).await;
-                    return;
-                }
-            };
-
-            let mut buf = [0u8; 1024];
-            loop {
-                match socket.recv_from(&mut buf).await {
-                    Ok((len, _addr)) => {
-                        match serde_json::from_slice::<VertexPacket>(&buf[..len]) {
-                            Ok(packet) => {
-                                let _ = gui_tx_sim.send(GuiUpdate::ShardStatusChanged {
-                                    id: packet.id,
-                                    status: packet.status
-                                }).await;
-                            },
-                            Err(e) => {
-                                let _ = gui_tx_sim.send(GuiUpdate::ConsoleLog(format!("\n[LISTENER ERROR] :: JSON Parse Failed: {}\n", e))).await;
-                            }
-                        }
-                    },
-                    Err(e) => {
-                        let _ = gui_tx_sim.send(GuiUpdate::ConsoleLog(format!("\n[LISTENER ERROR] :: Socket Receive Failed: {}\n", e))).await;
-                    }
                 }
             }
         });
