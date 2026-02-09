@@ -17,7 +17,7 @@ Henry Ford did not just build the Model T; he built the **River Rouge Complex**.
 **UnaOS is the Digital River Rouge.**
 We are not building an OS that merely "runs CAD software." We are building an environment where:
 1.  **Elessar** defines the geometry.
-2.  **Vairë** tracks the atomic versioning of the physical and digital.
+2.  **Aulë** tracks the atomic versioning of the physical and digital.
 3.  **The Kernel** drives the stepper motors directly.
 
 In this forge, there is no "Export." There is no "Slicer." There is only the uninterrupted flow from **Neuron to Electron to Atom.**

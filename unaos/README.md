@@ -63,12 +63,12 @@ Following the "xHCI Silent Stall" incident, all kernel development must adhere t
 - [x] **Panic Handler:** "Blue Screen of Life" with stack trace.
 - [x] **Mirror Dimension Fix:** Corrected RGB vs BGR bit-ordering bugs.
 
-### Phase 4: The Nerves (Input) 🚧
-- [x] **IDT (Interrupts):** Implementing the `iretq` wrappers.
-- [x] **The Wolfpack (xHCI):** Finalizing the USB Keyboard/Mouse enumeration using **Shard J17**.
-- [x] **Legacy Shim:** PS/2 fallback for ancient hardware.
+### Phase 4: The Nerves (Input - *Current Focus*) 🚧
+- [ ] **IDT (Interrupts):** Implementing the `iretq` wrappers.
+- [ ] **The Wolfpack (xHCI):** Finalizing the USB Keyboard/Mouse enumeration using **Shard J17**.
+- [ ] **Legacy Shim:** PS/2 fallback for ancient hardware.
 
-### Phase 5: The Brain (Memory & Tasks - *Current Focus*)
+### Phase 5: The Brain (Memory & Tasks)
 - [ ] **GDT:** Global Descriptor Table setup.
 - [ ] **Paging:** 4-Level Page Tables (Virtual Memory).
 - [ ] **Scheduler:** Cooperative multitasking (Game Loop style) using **Zone 1** trampolines.

@@ -16,7 +16,7 @@ if [[ "$1" == "--merge" ]]; then
     git push origin "$CURRENT"
     git checkout main
     git pull origin main
-    git merge "$CURRENT" --no-ff -m "Merge $CURRENT into main [via vairë]"
+    git merge "$CURRENT" --no-ff -m "Merge $CURRENT into main [via aulë]"
     git push origin main
     git checkout "$CURRENT"
     echo "✅ unaOS is synchronized on main."

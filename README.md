@@ -53,12 +53,12 @@ The system is composed of specialized shards, each with a distinct role:
 *   [x] **Native Text Rendering:** No dependency on UEFI `ConOut`.
 *   [x] **Panic Handler:** "Blue Screen of Life" visual debugging.
 
-### Phase 4: The Nerves (Input) 🚧
+### Phase 4: The Nerves (Input - *Current Focus*) 🚧
 *   [x] **IDT (Interrupt Descriptor Table):** CPU Exception handling.
 *   [x] **The Wolfpack Protocol:** xHCI (USB 3.0) Driver implementation via `unsafe` Assembly Doorbells.
 *   [x] **Keyboard/Mouse:** PS/2 Legacy fallback and USB HID support.
 
-### Phase 5: The Engine (Kernel Core - *Current Focus*)
+### Phase 5: The Engine (Kernel Core)
 *   [ ] **GDT & TSS:** Stack switching and privilege levels (Ring 0 vs Ring 3).
 *   [ ] **Memory Manager:** Paging, Virtual Memory, and Heap Allocation.
 *   [ ] **Multithreading:** Cooperative multitasking scheduler.
