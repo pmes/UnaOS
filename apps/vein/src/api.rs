@@ -7,7 +7,8 @@ use std::time::Duration;
 #[derive(Serialize)]
 struct GenerateContentRequest {
     contents: Vec<Content>,
-    generationConfig: GenerationConfig, // Added for control
+    #[serde(rename = "generationConfig")]
+    generation_config: GenerationConfig, // Added for control
 }
 
 #[derive(Serialize)]
@@ -25,7 +26,10 @@ pub struct Content {
 #[serde(untagged)]
 pub enum Part {
     Text { text: String },
-    FileData { file_data: FileData },
+    FileData {
+        #[serde(rename = "fileData")]
+        file_data: FileData
+    },
 }
 
 impl Part {
@@ -55,13 +59,15 @@ pub struct FileData {
 #[derive(Deserialize, Debug)]
 struct GenerateContentResponse {
     candidates: Option<Vec<Candidate>>,
-    promptFeedback: Option<PromptFeedback>, // Note camelCase
+    #[serde(rename = "promptFeedback")]
+    prompt_feedback: Option<PromptFeedback>, // Note camelCase
 }
 
 #[derive(Deserialize, Debug)]
 struct Candidate {
     content: Option<ContentResponse>,
-    finishReason: Option<String>,
+    #[serde(rename = "finishReason")]
+    finish_reason: Option<String>,
 }
 
 #[derive(Deserialize, Debug)]
@@ -76,12 +82,12 @@ struct PartResponse {
 
 #[derive(Deserialize, Debug)]
 struct PromptFeedback {
-    blockReason: Option<String>,
+    #[serde(rename = "blockReason")]
+    block_reason: Option<String>,
 }
 
 pub struct GeminiClient {
     client: Client,
-    api_key: String,
     model_url: String,
 }
 
@@ -110,7 +116,6 @@ impl GeminiClient {
 
         Ok(Self {
             client,
-            api_key, // Kept in struct if we need it later, though it's in the URL
             model_url,
         })
     }
@@ -120,7 +125,7 @@ impl GeminiClient {
 
         let request_body = GenerateContentRequest {
             contents: history.to_vec(),
-            generationConfig: GenerationConfig {
+            generation_config: GenerationConfig {
                 temperature: 0.9, // High creativity
             },
         };
@@ -147,8 +152,8 @@ impl GeminiClient {
             .await
             .map_err(|e| format!("Failed to decode neural pattern: {}", e))?;
 
-        if let Some(feedback) = data.promptFeedback {
-            if let Some(reason) = feedback.blockReason {
+        if let Some(feedback) = data.prompt_feedback {
+            if let Some(reason) = feedback.block_reason {
                 return Err(format!("Safety Protocols Engaged: {}", reason));
             }
         }

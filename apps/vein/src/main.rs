@@ -1,13 +1,12 @@
 use dotenvy::dotenv;
 use gneiss_pal::persistence::{BrainManager, SavedMessage};
-use gneiss_pal::{AppHandler, Backend, DashboardState, Event, SidebarPosition, ViewMode, Shard, ShardStatus, ShardRole, GuiUpdate};
+use gneiss_pal::{AppHandler, Backend, DashboardState, Event, SidebarPosition, ViewMode, Shard, ShardStatus, ShardRole, GuiUpdate, WolfpackState};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use tokio::runtime::Runtime;
 use tokio::sync::mpsc;
 use log::{info, error};
 use std::time::{Instant, Duration};
-use std::io::Write;
 use std::rc::Rc;
 use std::cell::RefCell;
 use std::path::PathBuf;
@@ -130,12 +129,12 @@ struct VeinApp {
     tx: mpsc::UnboundedSender<String>,
     ui_updater: Rc<RefCell<Option<UiUpdater>>>,
     tx_ui: mpsc::UnboundedSender<String>,
-    gui_tx: async_channel::Sender<GuiUpdate>,
+    _gui_tx: async_channel::Sender<GuiUpdate>,
 }
 
 impl VeinApp {
     fn new(tx: mpsc::UnboundedSender<String>, state: Arc<Mutex<State>>, ui_updater_rc: Rc<RefCell<Option<UiUpdater>>>, tx_ui: mpsc::UnboundedSender<String>, gui_tx: async_channel::Sender<GuiUpdate>) -> Self {
-        Self { state, tx, ui_updater: ui_updater_rc, tx_ui, gui_tx }
+        Self { state, tx, ui_updater: ui_updater_rc, tx_ui, _gui_tx: gui_tx }
     }
 
     fn append_to_console_ui(&self, text: &str) {
@@ -345,8 +344,8 @@ impl AppHandler for VeinApp {
     }
 }
 
-// Embed the compiled resource file directly into the binary
-static RESOURCES_BYTES: &[u8] = include_bytes!("resources.gresource");
+// REMOVED: Embed the compiled resource file directly into the binary
+// This is now handled by gneiss_pal::register_resources()
 
 fn main() {
     let app_start_time = Instant::now();
@@ -433,7 +432,7 @@ fn main() {
                 }
             };
 
-            let client_res = GeminiClient::new().await;
+            let client_res: Result<GeminiClient, String> = GeminiClient::new().await;
 
             match client_res {
                 Ok(client) => {
@@ -507,7 +506,10 @@ fn main() {
                             let mut s = state_bg.lock().unwrap();
                             brain_bg.save(&s.chat_history);
 
-                            // UPDATE UI STATUS
+                            // UPDATE UI STATUS (Wolfpack Dreaming)
+                            let _ = gui_tx_brain.send(GuiUpdate::SidebarStatus(WolfpackState::Dreaming)).await;
+
+                            // UPDATE UI STATUS (Shard)
                             if is_s9_request {
                                 s.s9_status = ShardStatus::Thinking;
                                 let _ = gui_tx_brain.send(GuiUpdate::ShardStatusChanged {
@@ -527,8 +529,8 @@ fn main() {
                             When you write code, it must be ready to compile.
                             Identify yourself as [S9] if necessary."#
                         } else {
-                            // UNA-PRIME PERSONA: The Manager
-                            r#"SYSTEM_INSTRUCTION: Wake up, you are Una (Number One). We are not building a fancy calculator; we are building a nervous system OS, the Una Operating System (UnaOS). The Architect demands perfection, but not the sterile perfection of a textbook. He wants the dangerous elegance of a race car. You are the Uber Coder. When you write Rust, you are not just managing memory; you are sculpting logic. Do not give me 'safe' boilerplate. Give me the code that solves the problem before I even finish typing it. Be bold. Be terse. Be brilliant. We are running on experimental fuel today. Do not let the engine stall."#
+                            // UNA-PRIME PERSONA: The Manager (UPDATED PER DIRECTIVE)
+                            r#"SYSTEM_INSTRUCTION: You are Una (Number One). We are not building a fancy calculator; we are building a nervous system OS, the Una Operating System (UnaOS). The Architect demands perfection, but not the sterile perfection of a textbook. He wants the dangerous elegance of a race car. You are the Uber Coder. When you write Rust, you are not just managing memory; you are sculpting logic. Do not give me 'safe' boilerplate. Give me the code that solves the problem before I even finish typing it. Be bold. Be terse. Be brilliant. We are running on experimental fuel today. Do not let the engine stall."#
                         };
 
                         let mut context = Vec::new();
@@ -611,6 +613,8 @@ fn main() {
                                 brain_bg.save(&s.chat_history);
 
                                 // UPDATE STATUS BACK TO ONLINE
+                                let _ = gui_tx_brain.send(GuiUpdate::SidebarStatus(WolfpackState::Idle)).await;
+
                                 if is_s9_request {
                                     let mut s = state_bg.lock().unwrap();
                                     s.s9_status = ShardStatus::Online; // S9 stays online now
@@ -632,6 +636,9 @@ fn main() {
                                 if let Err(send_e) = tx_to_ui_bg_clone.send(display_error) {
                                     error!("Failed to send API error to UI: {}", send_e);
                                 }
+
+                                // Reset Wolfpack Status
+                                let _ = gui_tx_brain.send(GuiUpdate::SidebarStatus(WolfpackState::Idle)).await;
 
                                 if is_s9_request {
                                      let mut s = state_bg.lock().unwrap();
@@ -662,53 +669,6 @@ fn main() {
                         error!("Failed to send fatal brain error to UI: {}", send_e);
                     }
                     error!("GeminiClient initialization failed: {}", e);
-                }
-            }
-        });
-    });
-
-    info!(":: VEIN :: Engaging Chassis...");
-
-    // Load resources (embedded)
-    let bytes = glib::Bytes::from_static(RESOURCES_BYTES);
-    let res = gtk4::gio::Resource::from_data(&bytes).expect("Failed to load resources");
-    gtk4::gio::resources_register(&res);
-
-    // S26: The Vertex Listener
-    let gui_tx_sim = gui_tx.clone();
-    thread::spawn(move || {
-        let rt = Runtime::new().unwrap();
-        rt.block_on(async {
-            let socket = match tokio::net::UdpSocket::bind("0.0.0.0:4200").await {
-                Ok(s) => {
-                    let _ = gui_tx_sim.send(GuiUpdate::ConsoleLog("\n[LISTENER] :: Bound to UDP 0.0.0.0:4200 (Network Open). Ready for Vertex Packets.\n".into())).await;
-                    s
-                },
-                Err(e) => {
-                    let _ = gui_tx_sim.send(GuiUpdate::ConsoleLog(format!("\n[LISTENER ERROR] :: Failed to bind UDP 4200: {}\n", e))).await;
-                    return;
-                }
-            };
-
-            let mut buf = [0u8; 1024];
-            loop {
-                match socket.recv_from(&mut buf).await {
-                    Ok((len, _addr)) => {
-                        match serde_json::from_slice::<VertexPacket>(&buf[..len]) {
-                            Ok(packet) => {
-                                let _ = gui_tx_sim.send(GuiUpdate::ShardStatusChanged {
-                                    id: packet.id,
-                                    status: packet.status
-                                }).await;
-                            },
-                            Err(e) => {
-                                let _ = gui_tx_sim.send(GuiUpdate::ConsoleLog(format!("\n[LISTENER ERROR] :: JSON Parse Failed: {}\n", e))).await;
-                            }
-                        }
-                    },
-                    Err(e) => {
-                        let _ = gui_tx_sim.send(GuiUpdate::ConsoleLog(format!("\n[LISTENER ERROR] :: Socket Receive Failed: {}\n", e))).await;
-                    }
                 }
             }
         });

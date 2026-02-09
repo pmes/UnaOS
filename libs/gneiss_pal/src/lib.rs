@@ -6,7 +6,7 @@ use gtk4::{
     PolicyType, Align, ListBox, Separator, StackTransitionType, TextView, EventControllerKey,
     TextBuffer, Adjustment, FileChooserNative, ResponseType, FileChooserAction,
     HeaderBar, StackSwitcher, ToggleButton, CssProvider, StyleContext, Image, MenuButton, Popover,
-    Paned
+    Paned, Spinner
 };
 use sourceview5::prelude::*;
 use sourceview5::View as SourceView;
@@ -27,10 +27,28 @@ mod window;
 use window::UnaWindow;
 pub use shard::{Shard, ShardRole, ShardStatus, Heartbeat};
 
+// --- PHASE 0: RELIQUARY ---
+static RESOURCES_BYTES: &[u8] = include_bytes!("../assets/resources.gresource");
+
+pub fn register_resources() {
+    let bytes = glib::Bytes::from_static(RESOURCES_BYTES);
+    let res = gtk4::gio::Resource::from_data(&bytes).expect("Failed to load resources");
+    gtk4::gio::resources_register(&res);
+}
+
+// --- PHASE 2: WOLFPACK STATE ---
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum WolfpackState {
+    Idle,
+    Dreaming,
+    Fabricating,
+}
+
 #[derive(Debug, Clone)]
 pub enum GuiUpdate {
     ShardStatusChanged { id: String, status: ShardStatus },
     ConsoleLog(String),
+    SidebarStatus(WolfpackState), // The Pulse
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -151,13 +169,13 @@ fn build_ui(app: &Application, app_handler_rc: Rc<RefCell<impl AppHandler>>, rx:
 
     // --- SIDEBAR ---
     let sidebar_box = Box::new(Orientation::Vertical, 0);
-    sidebar_box.set_width_request(200); // FIX: Reduced from 250
+    sidebar_box.set_width_request(200); // FIX: 200px
     sidebar_box.set_hexpand(false);
     sidebar_box.add_css_class("sidebar");
 
     // Stack (Rooms | Status)
     let sidebar_stack = Stack::new();
-    sidebar_stack.set_vexpand(true);
+    sidebar_stack.set_vexpand(true); // FIX: Vexpand true
     sidebar_stack.set_transition_type(StackTransitionType::SlideLeftRight);
 
     // Page 1: Rooms
@@ -196,8 +214,8 @@ fn build_ui(app: &Application, app_handler_rc: Rc<RefCell<impl AppHandler>>, rx:
     // Tabs (Box) - Replaces ActionBar
     let tab_box = Box::new(Orientation::Horizontal, 0);
     tab_box.set_halign(Align::Center);
-    tab_box.set_margin_top(5);
-    tab_box.set_margin_bottom(5);
+    // Switcher sits flush at the footer - handled by container structure (box has vexpand false at bottom)
+    // but sidebar_stack above has vexpand(true) pushing this down.
 
     let stack_switcher = StackSwitcher::builder()
         .stack(&sidebar_stack)
@@ -206,6 +224,19 @@ fn build_ui(app: &Application, app_handler_rc: Rc<RefCell<impl AppHandler>>, rx:
 
     sidebar_box.append(&tab_box);
 
+    // Sidebar Status Indicator (The Pulse)
+    // Adding a small status bar at the very bottom of the sidebar
+    let sidebar_status_box = Box::new(Orientation::Horizontal, 5);
+    set_margins(&sidebar_status_box, 5);
+    sidebar_status_box.set_halign(Align::Center);
+    let sidebar_spinner = Spinner::new();
+    let sidebar_status_icon = Image::from_icon_name("system-run-symbolic");
+    sidebar_status_box.append(&sidebar_status_icon);
+    sidebar_status_box.append(&sidebar_spinner);
+    sidebar_box.append(&sidebar_status_box);
+
+
+    // Sidebar Position: LEFT (Hardcoded as per directive for now, ignoring state.sidebar_position which defaults Right in old code)
     body_box.append(&sidebar_box);
     body_box.append(&Separator::new(Orientation::Vertical));
 
@@ -241,16 +272,17 @@ fn build_ui(app: &Application, app_handler_rc: Rc<RefCell<impl AppHandler>>, rx:
     paned.set_start_child(Some(&scrolled_window));
 
     // Input Area (Bottom Pane)
-    let input_container = Box::new(Orientation::Horizontal, 8);
-    set_margins(&input_container, 0); // Removed margins for paned handling
+    let input_container = Box::new(Orientation::Horizontal, 8); // FIX: 8px spacing
+    set_margins(&input_container, 0);
     input_container.set_valign(Align::Fill);
 
     // Upload Button (Share Symbolic)
+    // Phase 0: Load from resource
     let upload_icon = Image::from_resource("/org/una/vein/icons/share-symbolic");
     let upload_btn = Button::builder()
         .child(&upload_icon)
-        .valign(Align::End)
-        .margin_bottom(10) // Restore visual margin
+        .valign(Align::End) // FIX: Align End
+        .margin_bottom(10) // FIX: Margin Bottom 10
         .margin_start(10)
         .build();
 
@@ -297,7 +329,7 @@ fn build_ui(app: &Application, app_handler_rc: Rc<RefCell<impl AppHandler>>, rx:
         .build();
 
     input_scroll.set_hexpand(true);
-    input_scroll.add_css_class("chat-input-area");
+    input_scroll.add_css_class("chat-input-area"); // Has border-radius: 20px in CSS below
 
     let text_view = SourceView::builder()
         .wrap_mode(gtk4::WrapMode::WordChar)
@@ -325,11 +357,12 @@ fn build_ui(app: &Application, app_handler_rc: Rc<RefCell<impl AppHandler>>, rx:
     input_scroll.set_child(Some(&text_view));
 
     // Send Button (Paper Plane Symbolic)
+    // Phase 0: Load from resource
     let send_icon = Image::from_resource("/org/una/vein/icons/paper-plane-symbolic");
     let send_btn = Button::builder()
         .child(&send_icon)
-        .valign(Align::End)
-        .margin_bottom(10) // Restore visual margin
+        .valign(Align::End) // FIX: Align End
+        .margin_bottom(10) // FIX: Margin Bottom 10
         .margin_end(10)
         .css_classes(vec!["suggested-action"])
         .build();
@@ -488,6 +521,8 @@ fn build_ui(app: &Application, app_handler_rc: Rc<RefCell<impl AppHandler>>, rx:
     let shard_list_weak = shard_list.downgrade();
     let text_buffer_weak = text_buffer.downgrade();
     let scrolled_window_adj_weak = scrolled_window.vadjustment().downgrade();
+    let sidebar_status_icon_weak = sidebar_status_icon.downgrade();
+    let sidebar_spinner_weak = sidebar_spinner.downgrade();
 
     glib::MainContext::default().spawn_local(async move {
         while let Ok(update) = rx.recv().await {
@@ -541,6 +576,24 @@ fn build_ui(app: &Application, app_handler_rc: Rc<RefCell<impl AppHandler>>, rx:
                          if let Some(adj) = scrolled_window_adj_weak.upgrade() {
                              // Scroll to bottom
                              adj.set_value(adj.upper());
+                         }
+                     }
+                 },
+                 GuiUpdate::SidebarStatus(state) => {
+                     // Phase 2: Handle Sidebar Status (The Pulse)
+                     if let (Some(icon), Some(spinner)) = (sidebar_status_icon_weak.upgrade(), sidebar_spinner_weak.upgrade()) {
+                         match state {
+                             WolfpackState::Dreaming => {
+                                 icon.set_visible(false);
+                                 spinner.set_visible(true);
+                                 spinner.start();
+                             },
+                             _ => {
+                                 spinner.stop();
+                                 spinner.set_visible(false);
+                                 icon.set_visible(true);
+                                 // Could change icon based on state if needed (e.g. Fabricating)
+                             }
                          }
                      }
                  }
@@ -614,7 +667,9 @@ fn build_shard_rows(list: &ListBox, shards: &[Shard], depth: usize) {
     }
 }
 
-fn set_margins(w: &Box, s: i32) { w.set_margin_top(s); w.set_margin_bottom(s); w.set_margin_start(s); w.set_margin_end(s); }
+// RESTORE: set_margins
+pub fn set_margins(w: &Box, s: i32) { w.set_margin_top(s); w.set_margin_bottom(s); w.set_margin_start(s); w.set_margin_end(s); }
+
 fn make_sidebar_row(n: &str, a: bool) -> Box {
     let r = Box::new(Orientation::Horizontal, 10); set_margins(&r, 10);
     r.append(&Label::new(Some(n))); if a { r.append(&Label::new(Some("●"))); } r

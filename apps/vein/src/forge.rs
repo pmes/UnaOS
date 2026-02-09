@@ -23,6 +23,7 @@ impl ForgeClient {
         }
     }
 
+    #[allow(dead_code)]
     pub async fn list_repos(&self) -> Result<Vec<String>, String> {
         self.inner
             .current()

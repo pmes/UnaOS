@@ -6,7 +6,7 @@
 
 Instead of long command line arguments gluing black-box tools together with string manipulation, Midden compiles your intent into specialized Rust artifacts called **Shards**, executes them directly via **Gneiss PAL** (Plexus Abstraction Layer), and stores the result in a semantic **Knowledge Pile**.
 
-Turning off AI in UnaOS installs the full complement of POSIX tools if you have not already done so. Default expert mode does not rely on the standard executables, Midden gives you the illusion you're calling them executing directly from your text.
+Turning off AI in UnaOS installs the full complement of POSIX tools if you have not already done so. We recommend skipping them. Default expert mode does not rely on the standard executables. Midden gives you the illusion you're calling them executing directly from your text.
 
 ---
 
@@ -16,7 +16,7 @@ Turning off AI in UnaOS installs the full complement of POSIX tools if you have 
 Midden communicates the emotional state of the system via the **Crystal Indicator** in the prompt. It doesn't just wait for input; it reports health. For example:
 
 *   🟢 **GREEN:** Stable. Last command successful (Exit Code 0). Git tree clean.
-*   🟠 **AMBER:** Caution. Background jobs active, or working in a "Dirty" git state (Uncommitted changes tracked by **aulë**).
+*   🟠 **AMBER:** Caution. Background jobs active, or working in a "Dirty" git state (Uncommitted changes tracked by **Vairë**).
 *   🔴 **RED:** Critical. Last command failed, or system invariant violated.
 *   🔵 **BLUE:** Una Mode. The AI Interface is active and listening.
 
@@ -41,7 +41,7 @@ For complex tasks, Midden creates **Shards**.
 
 **Prerequisites:**
 *   Rust Toolchain: `nightly` (Strictly enforced via `rust-toolchain.toml`)
-*   **aulë:** Must be present in the workspace to handle version control status.
+*   **vairë:** Must be present in the workspace to handle version control status.
 
 **Build & Run:**
 Midden is part of the `UnaOS` workspace.
@@ -78,8 +78,8 @@ Visual Output must respect the UnaOS identity.
 
 ## 🔮 Roadmap
 
-*   [ ] **Phase 1: The Indexer** - Implement the file walker and "Knowledge Pile" database (aulë integration).
-*   [ ] **Phase 2: The Crystal** - Implement the Status Line and Git/aulë state detection.
+*   [ ] **Phase 1: The Indexer** - Implement the file walker and "Knowledge Pile" database (vairë integration).
+*   [ ] **Phase 2: The Crystal** - Implement the Status Line and Git/vairë state detection.
 *   [ ] **Phase 3: The Compiler** - Implement the on-the-fly `rustc` invocation to build simple Shards.
 *   [ ] **Phase 4: The Sovereign** - Port Midden to run as `PID 1` inside UnaOS (replacing the kernel init).
 
