@@ -173,4 +173,3 @@ impl GeminiClient {
         Ok("Model listing unavailable in Experimental Key Mode.".to_string())
     }
 }
-# S33 Gneiss Plexus

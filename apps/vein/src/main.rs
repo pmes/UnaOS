@@ -7,7 +7,6 @@ use tokio::runtime::Runtime;
 use tokio::sync::mpsc;
 use log::{info, error};
 use std::time::{Instant, Duration};
-use std::io::Write;
 use std::rc::Rc;
 use std::cell::RefCell;
 use std::path::PathBuf;
@@ -433,7 +432,7 @@ fn main() {
                 }
             };
 
-            let client_res = GeminiClient::new().await;
+            let client_res: Result<GeminiClient, String> = GeminiClient::new().await;
 
             match client_res {
                 Ok(client) => {
