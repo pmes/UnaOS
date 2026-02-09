@@ -55,9 +55,9 @@ The system is composed of specialized shards, each with a distinct role:
 *   [x] **Panic Handler:** "Blue Screen of Life" visual debugging.
 
 ### Phase 4: The Nerves (Input - *Current Focus*) 🚧
-*   [ ] **IDT (Interrupt Descriptor Table):** CPU Exception handling.
-*   [ ] **The Wolfpack Protocol:** xHCI (USB 3.0) Driver implementation via `unsafe` Assembly Doorbells.
-*   [ ] **Keyboard/Mouse:** PS/2 Legacy fallback and USB HID support.
+*   [x] **IDT (Interrupt Descriptor Table):** CPU Exception handling.
+*   [x] **The Wolfpack Protocol:** xHCI (USB 3.0) Driver implementation via `unsafe` Assembly Doorbells.
+*   [x] **Keyboard/Mouse:** PS/2 Legacy fallback and USB HID support.
 
 ### Phase 5: The Engine (Kernel Core)
 *   [ ] **GDT & TSS:** Stack switching and privilege levels (Ring 0 vs Ring 3).
