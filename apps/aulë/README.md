@@ -1,91 +1,46 @@
-# 🔨 Aulë: The Monorepo Hammer
+# 🔨 Aulë: The Workspace Smith
 
-> *"Aulë is your power of creation."*
+> *"The rock does not yield to the wish. It yields to the hammer."*
 
-**Aulë** is the workspace manager for **UnaOS**. It is a heavy-duty tool designed to the power of a god over the complexity of managing repositories.
+**Aulë** is the sovereign workspace manager for **UnaOS**. It is designed to wield the power of creation over the chaos of distributed version control.
 
-While Git is excellent for single repositories, it struggles with the scale of an OS composed of multiple interdependent shards (`UnaOS`, `Stria`, `Vug`, `Midden`). Aulë wraps Git in a layer of **Iron Logic**, ensuring that the entire ecosystem moves in lockstep.
+While Git is excellent for single repositories, it fractures under the weight of an Operating System composed of multiple interdependent Shards (`UnaOS`, `Stria`, `Vug`, `Midden`). Aulë wraps the chaos of Git in a layer of **Iron Logic**, ensuring that the entire ecosystem moves in perfect, crystalline lockstep.
 
----
+We want you to be you--Git can be run by you in Midden.
 
 ## 🧱 The Philosophy
 
-### 1. The Monolith (One Workspace)
-Aulë treats the `UnaOS/` directory not as a collection of folders, but as a **Single Truth**.
-*   **Traditional Git:** You have to `cd` into `kernel`, pull, `cd` into `bootloader`, pull, and hope they match.
-*   **Aulë:** You run `Aulë sync`. It iterates through every shard defined in `Cargo.toml`, aligns their branches, and ensures the **Gneiss PAL** dependency is synchronized across the board.
+### 1. The Monolith (One Truth)
+Aulë treats the `UnaOS/` directory not as a loose collection of folders, but as a **Single Truth**.
+*   **The Old Way:** You traverse directories, pulling and merging, hoping the Kernel matches the Bootloader.
+*   **The Aulë Way:** You invoke the Smith. Aulë aligns every shard defined in the workspace, ensuring the **Gneiss PAL** dependency is mathematically synchronized across the entire nervous system.
 
-### 2. The Snapshot (Global State)
-Aulë introduces the concept of a **"Snap"**—a synchronized tag across multiple repositories.
-*   When we release **Moonstone v0.1**, Aulë tags the Kernel, the PAL, and the Shell simultaneously.
-*   It generates a "Manifest" that guarantees you can rebuild the exact state of the OS 10 years from now.
+### 2. The Snapshot (The Fossil Record)
+Aulë introduces the concept of a **"Snap"**—an atomic crystallization of the entire OS state.
+*   When we release **Moonstone v0.1**, Aulë does not just tag a commit. It captures the exact vibrational state of the Kernel, the PAL, and the Shell simultaneously.
+*   It generates a **Manifest** that guarantees you can rebuild the exact state of the OS 10 years from now, regardless of how the internet changes.
 
-### 3. The Future: UnaFS Backed
+### 3. The Future: UnaFS Native
 Currently, Aulë acts as a "Supervisor" for Git.
-**The Roadmap:** Aulë will eventually bypass `.git` folders entirely and interface directly with **UnaFS**.
+**The Destiny:** Aulë will eventually bypass `.git` folders entirely and interface directly with **UnaFS**.
 *   **Database-Driven:** Version control becomes a metadata query. "Show me the Kernel as it existed on Tuesday."
 *   **Backwards Compatible:** Aulë will still push/pull to standard Git remotes (GitHub/GitLab) for collaboration, but the local "Source of Truth" will be the **UnaFS Database**, not a loose collection of text files.
 
----
+## ⚒️ The Rites (Capabilities)
 
-## ⚒️ Usage (The Strikes)
+Aulë is not ran; it is invoked.
 
-Aulë is built as part of the workspace.
+### 1. SYNC (The Alignment)
+*   **Purpose:** To bring order to the local workspace.
+*   **Action:** Iterates through the Shard list. Pulls upstream changes. Verifies that local modifications (The "Dirty" State) are safe. Re-links local paths to ensure the OS compiles as one unit.
 
-```bash
-# 1. SYNC (The Daily Driver)
-# Pulls all shards, updates dependencies, and checks for "Dirty" states.
-cargo run -p Aulë -- sync
+### 2. STATUS (The God View)
+*   **Purpose:** To see the layout of the land.
+*   **Action:** Reports the branch, commit hash, and "Crystal Color" of every shard.
+    *   **Green:** Clean, Synced, Ready.
+    *   **Amber:** Local changes present.
+    *   **Red:** Detached Head or Conflict.
 
-# 2. STATUS (The God View)
-# Shows the branch, commit hash, and "Crystal Color" of every shard.
-cargo run -p Aulë -- status
-
-# 3. SNAP (The Release)
-# Creates a unified tag across the entire ecosystem.
-cargo run -p Aulë -- snap "moonstone-v0.1"
-```
-
----
-
-## 🏗 Architecture
-
-Aulë operates on the **"Iron/Diamond"** principle.
-
-*   **Phase 1: Iron (Current)**
-    *   Wraps `std::process::Command("git")`.
-    *   Parses `stdout` to detect dirty states.
-    *   Enforces `Cargo.toml` workspace member consistency.
-
-*   **Phase 2: Diamond (Future - UnaFS)**
-    *   Directly reads repository objects from the **UnaFS** database.
-    *   Calculates Merkle Trees natively in Rust (no `libgit2` dependency).
-    *   Provides "Time Travel" debugging for the Kernel.
-
----
-
-## 🤖 Directives for Agents (The Wolfpack)
-
-**ATTENTION:** If you are an AI agent (J1-J20) contributing to this repository, you must adhere to the following **Aulë Protocol**:
-
-### 1. The "Clean Hands" Rule
-**NEVER** commit directly to `master` or `main` inside a shard.
-*   **Rule:** All changes must be on a Feature Branch (e.g., `feature/wolfpack-usb`).
-*   **Enforcement:** Aulë will block a `sync` if it detects a detached HEAD or a commit on a protected branch without a Pull Request.
-
-### 2. The "Atomic Strike"
-When refactoring a shared library like **Gneiss PAL**:
-1.  Update `gneiss_pal`.
-2.  Update `unaos` (Kernel) to use the new version.
-3.  Update `stria` (Media) to use the new version.
-4.  **Aulë Snap**: Commit all three simultaneously. Do not leave the build in a broken intermediate state.
-
----
-
-## 🔮 Roadmap
-
-*   [ ] **Phase 1: The Wrapper** - Robust `sync` and `status` commands.
-*   [ ] **Phase 2: The Enforcer** - Pre-commit hooks that run `cargo fmt` and `cargo test` across the whole workspace.
-*   [ ] **Phase 3: The Vault** - Initial integration with **UnaFS** for local metadata tracking.
-
-> *"Strike while the iron is hot. Commit while the code is green."*
+### 3. SNAP (The Forging)
+*   **Purpose:** To create history.
+*   **Action:** Creates a unified tag across the entire ecosystem. It locks the version numbers in `Cargo.toml` and stamps the "Moonstone" seal onto the code.
