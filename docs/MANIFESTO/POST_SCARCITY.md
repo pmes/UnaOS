@@ -21,7 +21,7 @@ We don't need to "create" abundance from nothing. We simply need to stop resisti
 ### 1. The Table is Set (Food)
 * **The Reality:** Global food production currently generates approximately **2,900 calories per person, per day**. With average needs sitting around 2,200, we are living with a **130% global buffer**.
 * **The Bridge:** Despite this, nearly a third of all food produced is lost to "packet loss" in the distribution layer. It isn't a failure of the soil, but a failure of the **Route**.
-* **The Una Response:** Through **Aulë** and our tracking protocols, we treat logistical transparency as a foundational right, ensuring that abundance finds its way to the quietest corners of the world.
+* **The Una Response:** Through **Vairë** and our tracking protocols, we treat logistical transparency as a foundational right, ensuring that abundance finds its way to the quietest corners of the world.
 
 
 
@@ -53,7 +53,7 @@ By building tools like **Elessar** that assume your resources are vast, we allow
 
 We are not here to fight the old world; we are here to outshine it.
 
-1.  **The Forge is Open:** **Aulë** ensures that the "Memory of Creation" belongs to everyone.
+1.  **The Forge is Open:** **Vairë** ensures that the "Memory of Creation" belongs to everyone.
 2.  **The Bedrock is Solid:** **Gneiss** provides a foundation that doesn't shift when market winds blow.
 3.  **The Vision is Clear:** **Elessar** provides a window into a world where your only limit is your imagination.
 
