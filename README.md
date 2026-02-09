@@ -28,18 +28,10 @@ The system is composed of specialized shards, each with a distinct role:
 | **Gneiss PAL** | **The Body** | *Plexus Abstraction Layer.* The metamorphic rock that translates Intent into System Calls. |
 | **Midden** | **The Mind** | *Context-Aware Shell.* A local, privacy-first intelligence that compiles intent into action, manages history and predicts commands. |
 | **Elessar** | **The Lens** | *Polymorphic Editor.* A "Vision Stone" that transmutes its interface (Code, CAD, NLE) based on the asset type. |
-<<<<<<< HEAD
-| **Aulë** | **The Smith** | *Repository Forge.* The workspace manager that treats the Monorepo as a single, divine structure. |
-| **Stria** | **The Groove** | *Media Engine.* The playback and streaming core optimized for raw pixel throughput. |
-| **Vug** | **The Retina** | *Geometry Kernel.* The parametric rendering engine responsible for the 3D-spatial UI. |
-| **Vein** | **The Pulse** | *Autonomic Nervous System.* The Cloud Infrastructure that builds and verifies the system while we sleep. |
-| **Aulë** | **The Hand** | *Tooling.* The Vala of your Forge, archivist of your creations, or you can stick with git. |
-=======
 | **Vairë** | **The Weaver** | *Repository Historian.* Every change captured--the archivist of your creations, or you can stick with git. |
 | **Stria** | **The Groove** | *Media Engine.* The playback and streaming core optimized for raw pixel throughput. |
 | **Vug** | **The Retina** | *Geometry Kernel.* The parametric rendering engine responsible for the 3D-spatial UI. |
 | **Vein** | **The Pulse** | *Autonomic Nervous System.* The Cloud Infrastructure that builds and verifies the system while we sleep. |
->>>>>>> origin/j8-vein-s33-gneiss-plexus-9431329697366953615
 | **Amber Bytes**| **The Silo** | *Forensic Recovery.* The low-level disk manager responsible for raw sector access and disaster recovery. |
 
 ---
