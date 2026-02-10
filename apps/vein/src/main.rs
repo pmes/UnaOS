@@ -1,6 +1,6 @@
 use dotenvy::dotenv;
 use gneiss_pal::persistence::{BrainManager, SavedMessage};
-use gneiss_pal::{AppHandler, Backend, DashboardState, Event, SidebarPosition, ViewMode, Shard, ShardStatus};
+use gneiss_pal::{AppHandler, Backend, DashboardState, Event, SidebarPosition, ViewMode, Shard, ShardStatus, ShardRole, GuiUpdate};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use tokio::runtime::Runtime;
@@ -15,6 +15,7 @@ use std::path::PathBuf;
 use gtk4::prelude::*;
 use gtk4::{Adjustment, TextBuffer};
 use glib::ControlFlow;
+use serde::Deserialize;
 
 mod api;
 use api::{Content, GeminiClient, Part};
@@ -34,6 +35,12 @@ struct State {
 struct UiUpdater {
     text_buffer: TextBuffer,
     scroll_adj: Adjustment,
+}
+
+#[derive(Deserialize, Debug)]
+struct VertexPacket {
+    id: String,
+    status: ShardStatus,
 }
 
 fn do_append_and_scroll(ui_updater_rc: &Rc<RefCell<Option<UiUpdater>>>, text: &str) {
@@ -116,11 +123,12 @@ struct VeinApp {
     tx: mpsc::UnboundedSender<String>,
     ui_updater: Rc<RefCell<Option<UiUpdater>>>,
     tx_ui: mpsc::UnboundedSender<String>,
+    gui_tx: async_channel::Sender<GuiUpdate>,
 }
 
 impl VeinApp {
-    fn new(tx: mpsc::UnboundedSender<String>, state: Arc<Mutex<State>>, ui_updater_rc: Rc<RefCell<Option<UiUpdater>>>, tx_ui: mpsc::UnboundedSender<String>) -> Self {
-        Self { state, tx, ui_updater: ui_updater_rc, tx_ui }
+    fn new(tx: mpsc::UnboundedSender<String>, state: Arc<Mutex<State>>, ui_updater_rc: Rc<RefCell<Option<UiUpdater>>>, tx_ui: mpsc::UnboundedSender<String>, gui_tx: async_channel::Sender<GuiUpdate>) -> Self {
+        Self { state, tx, ui_updater: ui_updater_rc, tx_ui, gui_tx }
     }
 
     fn append_to_console_ui(&self, text: &str) {
@@ -257,7 +265,16 @@ impl AppHandler for VeinApp {
             },
             sidebar_position: s.sidebar_position.clone(),
             dock_actions: vec!["Rooms".into(), "Status".into()],
-            shard_tree: Vec::new(),
+            shard_tree: {
+                let mut root = Shard::new("una-prime", "Una-Prime", ShardRole::Root);
+                root.status = ShardStatus::Online;
+
+                let mut child = Shard::new("s9-mule", "S9-Mule", ShardRole::Builder);
+                child.status = ShardStatus::Offline;
+
+                root.children.push(child);
+                vec![root]
+            },
             sidebar_collapsed: s.sidebar_collapsed,
         }
     }
@@ -501,8 +518,50 @@ fn main() {
     let res = gtk4::gio::Resource::from_data(&bytes).expect("Failed to load resources");
     gtk4::gio::resources_register(&res);
 
+    let (gui_tx, gui_rx) = async_channel::unbounded();
+
+    // S26: The Vertex Listener
+    let gui_tx_sim = gui_tx.clone();
+    thread::spawn(move || {
+        let rt = Runtime::new().unwrap();
+        rt.block_on(async {
+            let socket = match tokio::net::UdpSocket::bind("127.0.0.1:4200").await {
+                Ok(s) => {
+                    let _ = gui_tx_sim.send(GuiUpdate::ConsoleLog("\n[LISTENER] :: Bound to UDP 4200. Ready for Vertex Packets.\n".into())).await;
+                    s
+                },
+                Err(e) => {
+                    let _ = gui_tx_sim.send(GuiUpdate::ConsoleLog(format!("\n[LISTENER ERROR] :: Failed to bind UDP 4200: {}\n", e))).await;
+                    return;
+                }
+            };
+
+            let mut buf = [0u8; 1024];
+            loop {
+                match socket.recv_from(&mut buf).await {
+                    Ok((len, _addr)) => {
+                        match serde_json::from_slice::<VertexPacket>(&buf[..len]) {
+                            Ok(packet) => {
+                                let _ = gui_tx_sim.send(GuiUpdate::ShardStatusChanged {
+                                    id: packet.id,
+                                    status: packet.status
+                                }).await;
+                            },
+                            Err(e) => {
+                                let _ = gui_tx_sim.send(GuiUpdate::ConsoleLog(format!("\n[LISTENER ERROR] :: JSON Parse Failed: {}\n", e))).await;
+                            }
+                        }
+                    },
+                    Err(e) => {
+                        let _ = gui_tx_sim.send(GuiUpdate::ConsoleLog(format!("\n[LISTENER ERROR] :: Socket Receive Failed: {}\n", e))).await;
+                    }
+                }
+            }
+        });
+    });
+
     let tx_to_ui_for_app = tx_to_ui.clone();
-    let app = VeinApp::new(tx_to_bg, state.clone(), ui_updater_rc_clone_for_app, tx_to_ui_for_app);
+    let app = VeinApp::new(tx_to_bg, state.clone(), ui_updater_rc_clone_for_app, tx_to_ui_for_app, gui_tx);
 
     let initial_output_clone = initial_console_output.clone();
     let ui_updater_rc_clone_for_initial_pop = ui_updater_rc.clone();
@@ -546,6 +605,6 @@ fn main() {
         ControlFlow::Continue
     });
 
-    Backend::new("org.unaos.vein.evolution", app);
+    Backend::new("org.unaos.vein.evolution", app, gui_rx);
     info!("SHUTDOWN: UI Backend runtime complete. Total application runtime: {:?}", app_start_time.elapsed());
 }
