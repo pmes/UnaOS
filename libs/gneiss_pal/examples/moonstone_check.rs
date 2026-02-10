@@ -1,4 +1,4 @@
-use gneiss_pal::{WaylandApp, AppHandler, MOONSTONE_PURPLE, Event};
+use gneiss_pal::{AppHandler, Event, WaylandApp, MOONSTONE_PURPLE};
 
 struct MoonstoneApp;
 

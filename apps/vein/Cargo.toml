@@ -5,11 +5,15 @@ edition = "2021"
 
 [dependencies]
 gneiss_pal = { path = "../../libs/gneiss_pal" }
-reqwest = { version = "0.11", features = ["json", "stream"] } # Ensure "stream" is present
+reqwest = { version = "0.11", features = ["json", "stream", "multipart"] }
 tokio = { version = "1.36", features = ["full"] }
 dotenvy = "0.15"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-ab_glyph = "0.2.32" # Keep if gneiss_pal or other parts use it
+ab_glyph = "0.2.32"
 log = "0.4"
 env_logger = "0.10"
+gtk4 = { version = "0.9.7", features = ["v4_12"] }
+glib = "0.20"
+async-channel = "2.1"
+base64 = "0.21"
