@@ -2,11 +2,15 @@
 
 use gtk4::prelude::*;
 use gtk4::{
-    Application, ApplicationWindow, Box, Orientation, Label, Button, Stack, ScrolledWindow,
+    Application, Box, Orientation, Label, Button, Stack, ScrolledWindow,
     PolicyType, Align, ListBox, Separator, StackTransitionType, TextView, EventControllerKey,
     TextBuffer, Adjustment, FileChooserNative, ResponseType, FileChooserAction,
-    HeaderBar, StackSwitcher, ToggleButton, CssProvider, StyleContext, Image
+    HeaderBar, StackSwitcher, ToggleButton, CssProvider, StyleContext, Image, MenuButton, Popover,
+    Paned
 };
+use sourceview5::prelude::*;
+use sourceview5::View as SourceView;
+use sourceview5::{Buffer, StyleSchemeManager};
 use gtk4::gdk::{Key, ModifierType};
 use std::rc::Rc;
 use std::cell::RefCell;
@@ -17,6 +21,8 @@ use std::io::Write;
 use std::path::PathBuf;
 
 pub mod persistence;
+mod window;
+use window::UnaWindow;
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum ViewMode {
@@ -131,12 +137,7 @@ fn build_ui(app: &Application, app_handler_rc: Rc<RefCell<impl AppHandler>>) {
     let _ = std::io::stderr().flush();
 
     // --- MAIN WINDOW ---
-    let window = ApplicationWindow::builder()
-        .application(app)
-        .default_width(1100)
-        .default_height(750)
-        .title("Vein")
-        .build();
+    let window = UnaWindow::new(app);
 
     // --- HEADER BAR ---
     let header_bar = HeaderBar::new();
@@ -182,15 +183,60 @@ fn build_ui(app: &Application, app_handler_rc: Rc<RefCell<impl AppHandler>>) {
     // Page 2: Status
     let status_box = Box::new(Orientation::Vertical, 10);
     set_margins(&status_box, 10);
-    status_box.append(&Label::builder().label(":: SYSTEM STATUS ::").css_classes(vec!["heading"]).build());
-    status_box.append(&make_status_row("S9 (Upload)", "🟢 Online"));
-    status_box.append(&make_status_row("Una (Link)", "🟢 Connected"));
 
-    // Re-Link Button
+    // Shard List
+    let shard_list = ListBox::new();
+    shard_list.set_selection_mode(gtk4::SelectionMode::None);
+    shard_list.add_css_class("shard-list");
+
+    // Una-Prime (Root)
+    let root_row = Box::new(Orientation::Horizontal, 10);
+    set_margins(&root_row, 5);
+    let root_icon = Image::from_icon_name("computer-symbolic");
+    root_icon.add_css_class("success");
+    root_row.append(&root_icon);
+    root_row.append(&Label::builder().label("Una-Prime (Root)").hexpand(true).xalign(0.0).build());
+
+    // Menu Button for Root
+    let root_menu_btn = MenuButton::builder()
+        .icon_name("view-more-symbolic")
+        .has_frame(false)
+        .build();
+
+    let popover = Popover::new();
+    let popover_box = Box::new(Orientation::Vertical, 5);
+    set_margins(&popover_box, 5);
+
+    // System Info Button
+    let info_btn = Button::builder()
+        .label("System Info")
+        .icon_name("dialog-information-symbolic")
+        .build();
+    popover_box.append(&info_btn);
+
     let relink_btn = Button::with_label("Re-Link Brain");
     relink_btn.add_css_class("destructive-action");
-    status_box.append(&relink_btn);
-    // TODO: Connect relink button to handler
+    relink_btn.connect_clicked(move |_| {
+        // TODO: Connect relink button to handler
+    });
+
+    popover_box.append(&relink_btn);
+    popover.set_child(Some(&popover_box));
+    root_menu_btn.set_popover(Some(&popover));
+
+    root_row.append(&root_menu_btn);
+    shard_list.append(&root_row);
+
+    // S9-Mule (Builder)
+    let mule_row = Box::new(Orientation::Horizontal, 10);
+    set_margins(&mule_row, 5);
+    let mule_icon = Image::from_icon_name("network-server-symbolic");
+    mule_icon.add_css_class("dim-label");
+    mule_row.append(&mule_icon);
+    mule_row.append(&Label::builder().label("S9-Mule (Builder)").hexpand(true).xalign(0.0).build());
+    shard_list.append(&mule_row);
+
+    status_box.append(&shard_list);
 
     sidebar_stack.add_titled(&status_box, Some("status"), "Status");
 
@@ -212,11 +258,13 @@ fn build_ui(app: &Application, app_handler_rc: Rc<RefCell<impl AppHandler>>) {
     body_box.append(&sidebar_box);
     body_box.append(&Separator::new(Orientation::Vertical));
 
-    // --- CONTENT ---
-    let content_box = Box::new(Orientation::Vertical, 0);
-    content_box.set_hexpand(true);
+    // --- CONTENT (Paned) ---
+    let paned = Paned::new(Orientation::Vertical);
+    paned.set_vexpand(true);
+    paned.set_hexpand(true);
+    paned.set_position(550);
 
-    // Console
+    // Console (Top Pane)
     let scrolled_window = ScrolledWindow::builder()
         .hscrollbar_policy(PolicyType::Never)
         .vscrollbar_policy(PolicyType::Automatic)
@@ -239,19 +287,20 @@ fn build_ui(app: &Application, app_handler_rc: Rc<RefCell<impl AppHandler>>) {
     app_handler_rc.borrow_mut().handle_event(Event::TextBufferUpdate(text_buffer_clone, scrolled_window_adj_clone));
 
     scrolled_window.set_child(Some(&console_text_view));
-    content_box.append(&scrolled_window);
+    paned.set_start_child(Some(&scrolled_window));
 
-    // Input Area
+    // Input Area (Bottom Pane)
     let input_container = Box::new(Orientation::Horizontal, 8);
-    set_margins(&input_container, 10);
-    input_container.set_valign(Align::End);
-    // input_container.add_css_class("linked"); // Removed linked class for spacing
+    set_margins(&input_container, 0); // Removed margins for paned handling
+    input_container.set_valign(Align::Fill);
 
     // Upload Button (Share Symbolic)
     let upload_icon = Image::from_resource("/org/una/vein/icons/share-symbolic");
     let upload_btn = Button::builder()
         .child(&upload_icon)
         .valign(Align::End)
+        .margin_bottom(10) // Restore visual margin
+        .margin_start(10)
         .build();
 
     let app_handler_rc_for_upload = app_handler_rc.clone();
@@ -283,28 +332,42 @@ fn build_ui(app: &Application, app_handler_rc: Rc<RefCell<impl AppHandler>>) {
     });
     input_container.append(&upload_btn);
 
-    // Input Field (FIXED HEIGHT)
+    // Input Field
     let input_scroll = ScrolledWindow::builder()
         .hscrollbar_policy(PolicyType::Never)
         .vscrollbar_policy(PolicyType::Automatic)
         .propagate_natural_height(true)
-        .max_content_height(150)
-        .vexpand(false)
+        .max_content_height(500)
+        .vexpand(true)
         .valign(Align::Fill)
+        .margin_top(10)
+        .margin_bottom(10)
         .has_frame(false)
         .build();
 
     input_scroll.set_hexpand(true);
     input_scroll.add_css_class("chat-input-area");
 
-    let text_view = TextView::builder()
+    let text_view = SourceView::builder()
         .wrap_mode(gtk4::WrapMode::WordChar)
+        .show_line_numbers(false)
+        .auto_indent(true)
         .accepts_tab(false)
         .top_margin(2)
         .bottom_margin(2)
         .left_margin(8)
         .right_margin(8)
         .build();
+
+    // FORCE DARK MODE SCHEME
+    let sv_buffer = text_view.buffer().downcast::<Buffer>().expect("SourceView should have a SourceBuffer");
+    let manager = StyleSchemeManager::new();
+    if let Some(scheme) = manager.scheme("Adwaita-dark") {
+        sv_buffer.set_style_scheme(Some(&scheme));
+    } else if let Some(scheme) = manager.scheme("oblivion") {
+         // Fallback if Adwaita-dark missing
+         sv_buffer.set_style_scheme(Some(&scheme));
+    }
 
     text_view.add_css_class("transparent-text");
 
@@ -315,6 +378,8 @@ fn build_ui(app: &Application, app_handler_rc: Rc<RefCell<impl AppHandler>>) {
     let send_btn = Button::builder()
         .child(&send_icon)
         .valign(Align::End)
+        .margin_bottom(10) // Restore visual margin
+        .margin_end(10)
         .css_classes(vec!["suggested-action"])
         .build();
 
@@ -349,6 +414,7 @@ fn build_ui(app: &Application, app_handler_rc: Rc<RefCell<impl AppHandler>>) {
     });
 
     let controller = EventControllerKey::new();
+    controller.set_propagation_phase(gtk4::PropagationPhase::Capture);
     let send_action_clone_for_controller = send_message_rc.clone();
     controller.connect_key_pressed(move |ctrl, key, _, modifiers| {
         if key == Key::Return || key == Key::KP_Enter {
@@ -370,10 +436,11 @@ fn build_ui(app: &Application, app_handler_rc: Rc<RefCell<impl AppHandler>>) {
 
     input_container.append(&input_scroll);
     input_container.append(&send_btn);
-    content_box.append(&input_container);
 
-    body_box.append(&content_box);
-    window.set_child(Some(&body_box));
+    paned.set_end_child(Some(&input_container));
+
+    body_box.append(&paned);
+    window.set_content(&body_box);
 
     // Toggle Logic
     let sidebar_box_clone = sidebar_box.clone();
@@ -410,14 +477,43 @@ fn build_ui(app: &Application, app_handler_rc: Rc<RefCell<impl AppHandler>>) {
             background: #333333;
         }
 
-        /* Make the TextView invisible so the Pill shines through */
-        .transparent-text {
-            background: transparent;
-            caret-color: white;
-            color: white;
+        /* Apply fonts to both console and input */
+        textview, sourceview {
+            font-family: 'Monospace';
+            font-size: 11pt;
+            padding: 0px;
         }
 
-        textview { font-family: 'Monospace'; font-size: 11pt; padding: 0px; }
+        /* S25-Polish: Force transparency over Style Scheme */
+        .transparent-text,
+        .transparent-text sourceview,
+        .transparent-text text {
+             background-color: transparent !important;
+             background-image: none !important;
+        }
+
+        /* Ensure cursor and text match dark theme */
+        .transparent-text {
+             caret-color: white;
+             color: white;
+        }
+
+        /* The Pill Container */
+        .chat-input-area {
+            background: #2d2d2d;
+            border: 1px solid #555555;
+            border-radius: 20px;
+            overflow: hidden; /* CRITICAL FIX: Clips the square child */
+            transition: border-color 0.2s;
+        }
+
+        .chat-input-area:focus-within {
+            border-color: #3584e4;
+            background: #333333;
+        }
+
+        .success { color: #2ec27e; }
+        .dim-label { opacity: 0.5; }
     ");
     StyleContext::add_provider_for_display(
         &gtk4::gdk::Display::default().expect("No display"),
@@ -434,6 +530,7 @@ fn make_sidebar_row(n: &str, a: bool) -> Box {
     let r = Box::new(Orientation::Horizontal, 10); set_margins(&r, 10);
     r.append(&Label::new(Some(n))); if a { r.append(&Label::new(Some("●"))); } r
 }
+#[allow(dead_code)]
 fn make_status_row(s: &str, st: &str) -> Box {
     let r = Box::new(Orientation::Horizontal, 10); set_margins(&r, 5);
     r.append(&Label::builder().label(s).hexpand(true).xalign(0.0).build()); r.append(&Label::new(Some(st))); r
