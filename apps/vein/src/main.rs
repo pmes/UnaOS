@@ -1,6 +1,6 @@
 use dotenvy::dotenv;
 use gneiss_pal::persistence::{BrainManager, SavedMessage};
-use gneiss_pal::{AppHandler, Backend, DashboardState, Event, SidebarPosition, ViewMode};
+use gneiss_pal::{AppHandler, Backend, DashboardState, Event, SidebarPosition, ViewMode, Shard, ShardStatus};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use tokio::runtime::Runtime;
@@ -16,9 +16,6 @@ use gtk4::prelude::*;
 use gtk4::{Adjustment, TextBuffer};
 use glib::ControlFlow;
 
-// NEW: Base64 for Image Encoding
-use base64::{Engine as _, engine::general_purpose};
-
 mod api;
 use api::{Content, GeminiClient, Part};
 
@@ -30,6 +27,7 @@ struct State {
     nav_index: usize,
     chat_history: Vec<SavedMessage>,
     sidebar_position: SidebarPosition,
+    sidebar_collapsed: bool,
 }
 
 #[derive(Clone)]
@@ -61,7 +59,7 @@ fn trigger_upload(path: PathBuf, tx_ui: mpsc::UnboundedSender<String>) {
     std::thread::spawn(move || {
         let rt = Runtime::new().unwrap();
         rt.block_on(async {
-            // 1. Read File for S9 Upload AND Vision
+            // 1. Read File for S9 Upload
             let file_bytes = match std::fs::read(&path) {
                 Ok(b) => b,
                 Err(e) => {
@@ -70,28 +68,15 @@ fn trigger_upload(path: PathBuf, tx_ui: mpsc::UnboundedSender<String>) {
                 }
             };
 
-            // 2. ENCODE FOR VISION (The Retina)
-            // Encode to Base64
-            let b64 = general_purpose::STANDARD.encode(&file_bytes);
-            // Assume PNG/JPEG based on extension, or default to png
-            let mime = if filename.to_lowercase().ends_with(".jpg") || filename.to_lowercase().ends_with(".jpeg") {
-                "image/jpeg"
-            } else {
-                "image/png"
-            };
-            let image_data_uri = format!("data:{};base64,{}", mime, b64);
-
-            // Send the image payload to the UI thread (hidden from user view, saved to history)
-            let _ = tx_ui.send(format!("[IMAGE_PAYLOAD]{}", image_data_uri));
-
-
-            // 3. S9 UPLOAD (The Archive)
+            // 2. S9 UPLOAD (The Archive)
             let client = reqwest::Client::new();
             let url = "https://vein-s9-upload-1035558613434.us-central1.run.app/upload";
 
+            // Use mime_str correctly and ensure proper chaining
             let part = reqwest::multipart::Part::bytes(file_bytes)
                 .file_name(filename.clone())
-                .mime_str("application/octet-stream").unwrap();
+                .mime_str("application/octet-stream")
+                .expect("Failed to set mime type");
 
             let form = reqwest::multipart::Form::new()
                 .part("file", part)
@@ -105,6 +90,8 @@ fn trigger_upload(path: PathBuf, tx_ui: mpsc::UnboundedSender<String>) {
                         let text = response.text().await.unwrap_or_default();
                         if let Ok(json) = serde_json::from_str::<serde_json::Value>(&text) {
                              if let Some(uri) = json.get("storage_uri").and_then(|v| v.as_str()) {
+                                 // NEW: Send GCS URI tag for backend processing
+                                 let _ = tx_ui.send(format!("[GCS_IMAGE_URI]{}", uri));
                                  format!("\n[SYSTEM] :: Upload Complete.\nURI: {}\n", uri)
                              } else {
                                  format!("\n[SYSTEM] :: Upload Complete (Raw): {}\n", text)
@@ -172,7 +159,24 @@ impl AppHandler for VeinApp {
                 else if text.trim() == "/sidebar_right" {
                     s.sidebar_position = SidebarPosition::Right;
                     self.append_to_console_ui("\n[SYSTEM] :: Sidebar moved to right.\n");
-                } else {
+                }
+                else if text.trim().starts_with("/read") {
+                    // /read owner repo branch path
+                    // e.g. /read unaos vein main Cargo.toml
+                    let parts: Vec<&str> = text.split_whitespace().collect();
+                    if parts.len() >= 5 {
+                        let owner = parts[1];
+                        let repo = parts[2];
+                        let branch = parts[3];
+                        let path = parts[4];
+
+                        let branch_opt = if branch == "default" || branch == "main" { None } else { Some(branch) };
+                        let _ = self.tx.send(format!("READ_REPO:{}:{}:{}:{}", owner, repo, branch_opt.unwrap_or(""), path));
+                    } else {
+                        self.append_to_console_ui("\n[SYSTEM] :: Usage: /read [owner] [repo] [branch] [path]\n");
+                    }
+                }
+                else {
                     if let Err(e) = self.tx.send(text) {
                         self.append_to_console_ui(&format!("\n[SYSTEM ERROR] :: Failed to send: {}\n", e));
                     }
@@ -232,6 +236,11 @@ impl AppHandler for VeinApp {
                 trigger_upload(path, self.tx_ui.clone());
             }
             Event::UploadRequest => {}
+            Event::ToggleSidebar => {
+                s.sidebar_collapsed = !s.sidebar_collapsed;
+                // Note: The UI widget toggling is handled in lib.rs via button connection for immediate feedback,
+                // but we update state here for persistence.
+            }
         }
     }
 
@@ -248,6 +257,8 @@ impl AppHandler for VeinApp {
             },
             sidebar_position: s.sidebar_position.clone(),
             dock_actions: vec!["Rooms".into(), "Status".into()],
+            shard_tree: Vec::new(),
+            sidebar_collapsed: s.sidebar_collapsed,
         }
     }
 }
@@ -278,9 +289,9 @@ fn main() {
         for msg in &saved_history {
             if !msg.content.starts_with("SYSTEM_INSTRUCTION") {
                 let prefix = if msg.role == "user" { "[ARCHITECT]" } else { "[UNA]" };
-                // Hide huge image payloads from initial console load to avoid lag
-                if msg.content.starts_with("data:image/") {
-                    initial_console_output.push_str(&format!("{} > [IMAGE DATA]\n", prefix));
+                // Hide huge image payloads (or GCS URIs) from initial console load to avoid clutter
+                if msg.content.starts_with("data:image/") || msg.content.starts_with("[GCS_IMAGE_URI]") {
+                    initial_console_output.push_str(&format!("{} > [IMAGE ATTACHMENT]\n", prefix));
                 } else {
                     initial_console_output.push_str(&format!("{} > {}\n", prefix, msg.content));
                 }
@@ -293,6 +304,7 @@ fn main() {
         nav_index: 0,
         chat_history: saved_history,
         sidebar_position: SidebarPosition::default(),
+        sidebar_collapsed: false,
     }));
 
     let (tx_to_bg, mut rx_from_ui) = mpsc::unbounded_channel::<String>();
@@ -322,7 +334,7 @@ fn main() {
                 }
             };
 
-            let client_res = GeminiClient::new();
+            let client_res = GeminiClient::new().await;
 
             match client_res {
                 Ok(client) => {
@@ -331,6 +343,30 @@ fn main() {
                     }
 
                     while let Some(user_input_text) = rx_from_ui.recv().await {
+                        // Handle READ_REPO special command
+                        if user_input_text.starts_with("READ_REPO:") {
+                            let parts: Vec<&str> = user_input_text.split(':').collect();
+                            if parts.len() >= 5 {
+                                let owner = parts[1];
+                                let repo = parts[2];
+                                let branch_raw = parts[3];
+                                let path = parts[4];
+
+                                let branch = if branch_raw.is_empty() { None } else { Some(branch_raw) };
+
+                                let response_msg = if let Some(client) = &forge_client {
+                                    match client.get_file_content(owner, repo, path, branch).await {
+                                        Ok(content) => format!("\n[FORGE READ] :: {}/{}/{} ::\n{}\n", owner, repo, path, content),
+                                        Err(e) => format!("\n[FORGE ERROR] :: {}\n", e),
+                                    }
+                                } else {
+                                    "\n[FORGE] :: Offline.\n".to_string()
+                                };
+                                let _ = tx_to_ui_bg_clone.send(response_msg);
+                            }
+                            continue;
+                        }
+
                         // Phase 2: Handle /forge command
                         if user_input_text.trim() == "/forge" {
                             let response_msg = if let Some(client) = &forge_client {
@@ -351,6 +387,20 @@ fn main() {
                             continue;
                         }
 
+                        // Phase 3: Handle /vertex_models command
+                        if user_input_text.trim() == "/vertex_models" {
+                             let _ = tx_to_ui_bg_clone.send("\n[SYSTEM] :: Querying Vertex AI Model List...\n".to_string());
+                             match client.list_vertex_models().await {
+                                 Ok(json) => {
+                                     let _ = tx_to_ui_bg_clone.send(format!("\n[VERTEX MODELS] ::\n{}\n", json));
+                                 },
+                                 Err(e) => {
+                                     let _ = tx_to_ui_bg_clone.send(format!("\n[VERTEX ERROR] :: {}\n", e));
+                                 }
+                             }
+                             continue;
+                        }
+
                         {
                             let s = state_bg.lock().unwrap();
                             brain_bg.save(&s.chat_history);
@@ -369,26 +419,35 @@ fn main() {
                             s.chat_history.clone()
                         };
 
-                        // MODIFIED: Parse history to find images
+                        // MODIFIED: Parse history to find images (inline or GCS)
                         for saved in history_snapshot {
                             if saved.content.starts_with("SYSTEM_INSTRUCTION") {
                                 continue;
                             }
 
-                            if saved.content.starts_with("data:image/") {
-                                 // It's an image! Parse mime and data.
-                                 // Format: data:image/png;base64,....
-                                 let parts: Vec<&str> = saved.content.split(",").collect();
-                                 if parts.len() == 2 {
-                                     let meta = parts[0]; // data:image/png;base64
-                                     let data = parts[1].to_string();
-                                     let mime = meta.replace("data:", "").replace(";base64", "");
+                            if saved.content.starts_with("[GCS_IMAGE_URI]") {
+                                let uri = saved.content.replace("[GCS_IMAGE_URI]", "");
+                                // Guess mime type, default to png
+                                let mime = if uri.to_lowercase().ends_with(".jpg") || uri.to_lowercase().ends_with(".jpeg") {
+                                    "image/jpeg".to_string()
+                                } else {
+                                    "image/png".to_string()
+                                };
+                                context.push(Content {
+                                    role: saved.role.clone(),
+                                    parts: vec![Part::file_data(mime, uri)]
+                                });
 
-                                     context.push(Content {
-                                         role: saved.role.clone(),
-                                         parts: vec![Part::image(mime, data)]
-                                     });
-                                 }
+                            } else if saved.content.starts_with("data:image/") {
+                                 // Legacy Inline Image (keep for compatibility if needed, or ignore)
+                                 // Current Vertex AI API on Global endpoint MIGHT support inline data too,
+                                 // but preference is GCS. We won't break it if we don't have to.
+                                 // But Part struct changed. We need to implement InlineData logic in API or here.
+                                 // Wait, I removed InlineData constructor from Part?
+                                 // No, `Part` enum still has `FileData`, I removed `InlineData` variant based on instructions.
+                                 // "Implement Part::FileData and remove InlineData."
+                                 // So we skip legacy inline images to avoid serialization errors.
+                                 continue;
                             } else {
                                 context.push(Content {
                                     role: saved.role.clone(),
@@ -448,15 +507,19 @@ fn main() {
 
     glib::timeout_add_local(Duration::from_millis(50), move || {
         if let Ok(message_to_ui) = rx_from_bg.try_recv() {
-            // MODIFIED: Handle hidden image payloads
-            if message_to_ui.starts_with("[IMAGE_PAYLOAD]") {
-                let image_data = message_to_ui.replace("[IMAGE_PAYLOAD]", "");
+            // MODIFIED: Handle hidden GCS URI payloads
+            if message_to_ui.starts_with("[GCS_IMAGE_URI]") {
+                let uri = message_to_ui.clone(); // Keep the tag for parsing later
                 let mut s = state_clone_for_bg.lock().unwrap();
                 s.chat_history.push(SavedMessage {
                     role: "user".to_string(),
-                    content: image_data, // Store raw data for API
+                    content: uri,
                 });
-                // Do NOT display in console
+                // Do NOT display in console, or display a marker?
+                // The main console logic filters these tags, so safe to push.
+            } else if message_to_ui.starts_with("[IMAGE_PAYLOAD]") {
+                 // Legacy handler, ignore or convert?
+                 // Ignore to prevent crash.
             } else {
                 // Display normal message
                 do_append_and_scroll(&ui_updater_rc_clone_for_bg_messages, &message_to_ui);

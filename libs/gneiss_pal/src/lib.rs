@@ -4,7 +4,8 @@ use gtk4::prelude::*;
 use gtk4::{
     Application, ApplicationWindow, Box, Orientation, Label, Button, Stack, ScrolledWindow,
     PolicyType, Align, ListBox, Separator, StackTransitionType, TextView, EventControllerKey,
-    TextBuffer, Adjustment, FileChooserNative, ResponseType, FileChooserAction
+    TextBuffer, Adjustment, FileChooserNative, ResponseType, FileChooserAction, WindowHandle,
+    WindowControls
 };
 use gtk4::gdk::{Key, ModifierType};
 use std::rc::Rc;
@@ -44,6 +45,22 @@ pub enum Event {
     TextBufferUpdate(TextBuffer, Adjustment),
     UploadRequest, // Kept for compatibility, though effectively unused now
     FileSelected(PathBuf), // NEW: Carries the selected path back to Vein
+    ToggleSidebar, // NEW: Toggle sidebar visibility
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum ShardStatus {
+    Online,
+    Offline,
+    Syncing,
+    Error,
+}
+
+#[derive(Clone, Debug)]
+pub struct Shard {
+    pub name: String,
+    pub status: ShardStatus,
+    pub children: Vec<Shard>,
 }
 
 #[derive(Clone, Debug)]
@@ -55,6 +72,8 @@ pub struct DashboardState {
     pub actions: Vec<String>,
     pub sidebar_position: SidebarPosition,
     pub dock_actions: Vec<String>,
+    pub shard_tree: Vec<Shard>,
+    pub sidebar_collapsed: bool,
 }
 
 impl Default for DashboardState {
@@ -67,6 +86,8 @@ impl Default for DashboardState {
             actions: Vec::new(),
             sidebar_position: SidebarPosition::default(),
             dock_actions: Vec::new(),
+            shard_tree: Vec::new(),
+            sidebar_collapsed: false,
         }
     }
 }
@@ -117,17 +138,63 @@ fn build_ui(app: &Application, app_handler_rc: Rc<RefCell<impl AppHandler>>) {
         .title("Vein (Powered by unaOS Gneiss)")
         .build();
 
+    // --- CUSTOM TITLEBAR (Header Architecture) ---
+    let header_box = Box::new(Orientation::Horizontal, 0);
+    header_box.add_css_class("titlebar");
+
+    // Left Header Area (matches sidebar width approx)
+    let left_header_box = Box::new(Orientation::Horizontal, 0);
+    left_header_box.set_width_request(260);
+
+    // Sidebar Header Content (Draggable)
+    let sidebar_handle = WindowHandle::new();
+    let sidebar_header_content = Box::new(Orientation::Horizontal, 10);
+    set_margins(&sidebar_header_content, 10);
+    // Placeholder title or logo could go here
+    sidebar_handle.set_child(Some(&sidebar_header_content));
+    left_header_box.append(&sidebar_handle);
+
+    header_box.append(&left_header_box);
+    header_box.append(&Separator::new(Orientation::Vertical));
+
+    // Right Header Area (Main Content Controls + Window Controls)
+    let right_header_box = Box::new(Orientation::Horizontal, 0);
+    right_header_box.set_hexpand(true);
+
+    // Main Content Header Handle (Draggable)
+    let main_handle = WindowHandle::new();
+    let main_header_content = Box::new(Orientation::Horizontal, 10);
+    main_header_content.set_hexpand(true);
+    // Margins to align visually
+    set_margins(&main_header_content, 6);
+
+    // Toggle button (moved to main header area)
+    let toggle_btn = Button::builder()
+        .icon_name("sidebar-show-symbolic")
+        .css_classes(vec!["flat"])
+        .build();
+    // Logic connected later
+
+    main_header_content.append(&toggle_btn);
+    main_handle.set_child(Some(&main_header_content));
+
+    right_header_box.append(&main_handle);
+
+    // Window Controls (Close/Max/Min)
+    let window_controls = WindowControls::new(gtk4::PackType::End);
+    right_header_box.append(&window_controls);
+
+    header_box.append(&right_header_box);
+
+    window.set_titlebar(Some(&header_box));
+
     let split_view = libadwaita::OverlaySplitView::new();
     window.set_child(Some(&split_view));
 
     // --- SIDEBAR (Left/Right Panel) ---
     let sidebar_box = Box::new(Orientation::Vertical, 0);
     sidebar_box.set_width_request(260);
-
-    let sidebar_header = libadwaita::HeaderBar::new();
-    sidebar_header.set_show_end_title_buttons(false);
-    sidebar_header.set_show_start_title_buttons(false);
-    sidebar_box.append(&sidebar_header);
+    // Removed legacy HeaderBar
 
     let sidebar_stack = Stack::new();
     sidebar_stack.set_vexpand(true);
@@ -205,7 +272,21 @@ fn build_ui(app: &Application, app_handler_rc: Rc<RefCell<impl AppHandler>>) {
 
     app_handler_rc.borrow_mut().handle_event(Event::TextBufferUpdate(text_buffer_clone, scrolled_window_adj_clone));
 
+    // Add margins to the console view container for better readability
+    console_text_view.set_margin_start(12);
+    console_text_view.set_margin_end(12);
+    console_text_view.set_margin_top(12);
+    console_text_view.set_margin_bottom(12);
+
     scrolled_window.set_child(Some(&console_text_view));
+
+    // Legacy HeaderBar removed.
+    // Connect the Toggle Button we created in the custom titlebar
+    let app_handler_rc_for_toggle = app_handler_rc.clone();
+    toggle_btn.connect_clicked(move |_| {
+        app_handler_rc_for_toggle.borrow_mut().handle_event(Event::ToggleSidebar);
+    });
+
     main_content_box.append(&scrolled_window);
 
     // --- INPUT AREA ---
@@ -214,7 +295,7 @@ fn build_ui(app: &Application, app_handler_rc: Rc<RefCell<impl AppHandler>>) {
     input_container.add_css_class("linked");
 
     // NEW: Upload Button logic using pure GTK4 FileChooserNative
-    let upload_btn = Button::builder().icon_name("paperclip-symbolic").valign(Align::End).css_classes(vec!["suggested-action"]).build();
+    let upload_btn = Button::builder().icon_name("file-cabinet-symbolic").valign(Align::End).css_classes(vec!["suggested-action"]).build();
     let app_handler_rc_for_upload = app_handler_rc.clone();
     let window_weak = window.downgrade(); // Use weak ref to avoid cycles
 
@@ -251,6 +332,7 @@ fn build_ui(app: &Application, app_handler_rc: Rc<RefCell<impl AppHandler>>) {
     let input_scroll = ScrolledWindow::builder()
         .hscrollbar_policy(PolicyType::Never)
         .vscrollbar_policy(PolicyType::Automatic)
+        .propagate_natural_height(true) // Key property for growing input
         .has_frame(true)
         .hexpand(true)
         .height_request(45)
@@ -264,7 +346,7 @@ fn build_ui(app: &Application, app_handler_rc: Rc<RefCell<impl AppHandler>>) {
         .build();
 
     input_scroll.set_child(Some(&text_view));
-    let send_btn = Button::builder().icon_name("mail-send-symbolic").valign(Align::End).css_classes(vec!["suggested-action"]).build();
+    let send_btn = Button::builder().icon_name("paper-plane-symbolic").valign(Align::End).css_classes(vec!["suggested-action"]).build();
 
     let app_handler_rc_for_send = app_handler_rc.clone();
     let text_view_for_send = text_view.clone();
@@ -321,6 +403,34 @@ fn build_ui(app: &Application, app_handler_rc: Rc<RefCell<impl AppHandler>>) {
 
     split_view.set_sidebar(Some(&sidebar_box));
     split_view.set_content(Some(&main_content_box));
+
+    // Handle initial collapsed state (though dynamic updates require a signal or re-render which we lack here for simplicity,
+    // we rely on the split_view properties if we had a reactive loop.
+    // GneissPal's current architecture rebuilds UI only on init, so dynamic updates need a reactive binding or manual signal.
+    // For now, we are just building the UI. The toggle logic usually needs to manipulate the widget *after* build.
+    // Since GneissPal is simple, we might need to expose the split_view to the handler or use a global signal.
+    // However, given the constraints, we'll try to set it initially.
+    if app_handler_rc.borrow().view().sidebar_collapsed {
+        split_view.set_collapsed(true);
+    }
+
+    // Hack: To support dynamic toggling without full reactivity, we can use a closure attached to the button
+    // that modifies the widget directly if we had access. But the button handler above just emits an event.
+    // The AppHandler updates state, but the UI doesn't know to redraw or update properties.
+    // Real fix: The Event loop needs to trigger a UI update. Vein uses `do_append_and_scroll`, but for structural changes...
+    // We will leave the "ToggleSidebar" event to update state, and maybe the AppHandler can trigger a rebuild?
+    // Or we inject a closure into the AppHandler?
+    // For this specific task, we will just implement the Event.
+    // Wait, the user asked for a "Toggle Button". If the UI doesn't react, it's useless.
+    // We can use `split_view.bind_property` or similar if we had a GObject for state.
+    // Simpler: The toggle button itself can toggle the split_view directly!
+    // But we also need to update the State to persist it.
+    // So:
+    let split_view_clone = split_view.clone();
+    toggle_btn.connect_clicked(move |_| {
+        let is_collapsed = split_view_clone.is_collapsed();
+        split_view_clone.set_collapsed(!is_collapsed);
+    });
 
     window.present();
     info!("UI_BUILD: Window presented. Total build_ui duration: {:?}", ui_build_start_time.elapsed());
