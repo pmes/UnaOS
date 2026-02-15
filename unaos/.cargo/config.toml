@@ -1,0 +1,4 @@
+[unstable]
+# FIX: Removed "memchr" from this list
+build-std = ["core", "compiler_builtins", "alloc"]
+build-std-features = ["compiler-builtins-mem"]
