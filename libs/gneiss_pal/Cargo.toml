@@ -4,9 +4,9 @@ version = "0.1.0"
 edition = "2021"
 
 [features]
-default = ["universal"]
+default = ["gtk"]
+gtk = []
 gnome = ["dep:libadwaita"]
-universal = []
 
 [dependencies]
 ab_glyph = "0.2.23"
