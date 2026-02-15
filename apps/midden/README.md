@@ -4,16 +4,19 @@
 
 **Midden** is the context-aware shell environment for **UnaOS**. It rejects the POSIX philosophy of spawning heavy, clumsy legacy binaries (`grep`, `find`, `ls`) in favor of **Direct System Execution**.
 
-Instead of long command line arguments gluing black-box tools together with string manipulation, Midden compiles your intent into specialized Rust artifacts called **Shards**, executes them directly via **Gneiss PAL** (Plexus Abstraction Layer), and stores the result in a semantic **Knowledge Pile**.
+Instead of chaining black-box tools together with fragile string manipulation, Midden compiles your intent into specialized Rust artifacts called **Shards**, executes them directly via **Gneiss PAL** (Plexus Abstraction Layer), and stores the result in a semantic **Knowledge Pile**.
 
-Turning off AI in UnaOS installs the full complement of POSIX tools if you have not already done so. We recommend skipping them. Default expert mode does not rely on the standard executables. Midden gives you the illusion you're calling them executing directly from your text.
+### The Illusion of Legacy
+In **Expert Mode** (Default), Midden does not rely on standard executables. When you type `ls`, you are not calling a binary from 1987; you are triggering a Gneiss enumerator.
+
+*If you engage the **Manual Override** (AI Off), UnaOS can hydrate a compatibility layer of POSIX binaries, but the true Architect relies on the Shard.*
 
 ---
 
 ## 🏗 Architecture
 
 ### 1. The Crystal (Visual Status)
-Midden communicates the emotional state of the system via the **Crystal Indicator** in the prompt. It doesn't just wait for input; it reports health. For example:
+Midden communicates the emotional state of the system via the **Crystal Indicator** in the prompt. It doesn't just wait for input; it reports health.
 
 *   🟢 **GREEN:** Stable. Last command successful (Exit Code 0). Git tree clean.
 *   🟠 **AMBER:** Caution. Background jobs active, or working in a "Dirty" git state (Uncommitted changes tracked by **Vairë**).
@@ -41,7 +44,7 @@ For complex tasks, Midden creates **Shards**.
 
 **Prerequisites:**
 *   Rust Toolchain: `nightly` (Strictly enforced via `rust-toolchain.toml`)
-*   **vairë:** Must be present in the workspace to handle version control status.
+*   **Vairë:** Must be present in the workspace to handle version control status.
 
 **Build & Run:**
 Midden is part of the `UnaOS` workspace.
@@ -78,8 +81,8 @@ Visual Output must respect the UnaOS identity.
 
 ## 🔮 Roadmap
 
-*   [ ] **Phase 1: The Indexer** - Implement the file walker and "Knowledge Pile" database (vairë integration).
-*   [ ] **Phase 2: The Crystal** - Implement the Status Line and Git/vairë state detection.
+*   [ ] **Phase 1: The Indexer** - Implement the file walker and "Knowledge Pile" database (Vairë integration).
+*   [ ] **Phase 2: The Crystal** - Implement the Status Line and Git/Vairë state detection.
 *   [ ] **Phase 3: The Compiler** - Implement the on-the-fly `rustc` invocation to build simple Shards.
 *   [ ] **Phase 4: The Sovereign** - Port Midden to run as `PID 1` inside UnaOS (replacing the kernel init).
 

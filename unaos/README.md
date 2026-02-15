@@ -1,15 +1,5 @@
 # 🏎️ UnaOS: The Kernel
 
-**Version:** `v0.1.0-moonstone`
-**Architecture:** x86_64 UEFI (Heavy Metal)
-**Status:** Pre-Alpha (Phase 4: xHCI/Input)
-
-> *The Engine Block of the Una Ecosystem.*
-
----
-
-## ⚙️ The Mechanics
-
 **UnaOS** is a `no_std` Rust kernel designed for **Real-Time Spatial Computing**.
 Unlike monolithic kernels that abstract hardware behind virtual files, UnaOS is built to be one thing: **A Game Engine running on Bare Metal.**
 
@@ -89,12 +79,33 @@ Following the "xHCI Silent Stall" incident, all kernel development must adhere t
 2.  **Volatile Writes:** When talking to MMIO, always use `write_volatile` or the **Wolfpack Assembly** macros.
 3.  **Panic is Death:** In the kernel, a panic is a system halt. Handle `Result<T, E>` gracefully.
 
-**Build:**
-The kernel is built via the root workspace script.
-```bash
-# From the project root
-./scripts/run.sh
-```
+---
+
+## 📜 Appendix A: Is Assembly Unsafe?
+
+> *"The rock does not yield to the wish. It yields to the hammer."*
+
+Using Assembly language in a kernel is not inherently "unsafe" in the sense that it must be avoided at all costs, but it **bypasses all safety mechanisms** provided by higher-level languages.
+
+In a kernel context, "unsafe" usually refers to memory safety (buffer overflows, use-after-free) and type safety. Assembly provides **zero** guarantees for either. However, it is also **unavoidable** for certain parts of a kernel.
+
+### The "Unsafe" Aspects
+* **No Guardrails:** Assembly allows you to write to any memory address, jump to any instruction, and misunderstand data types. A single error in a register calculation can corrupt kernel memory or crash the system immediately.
+* **Portability:** Assembly is tied to the specific processor architecture (e.g., x86_64 vs. ARM64). Writing in Assembly means writing unportable code that is harder to audit and maintain.
+* **Complexity:** It is difficult for humans to reason about the state of the machine when reading Assembly, increasing the likelihood of subtle logic bugs that compilers would otherwise catch.
+
+### The "Necessary" Aspects
+Despite the risks, you **cannot** write a functioning kernel without some Assembly (or a language that acts exactly like it, like Rust's `unsafe` blocks or inline assembly). You need it for:
+1.  **Bootloading:** Setting up the initial CPU state (switching from Real Mode to Protected/Long Mode).
+2.  **Context Switching:** Saving and restoring CPU registers when switching between threads or processes.
+3.  **Interrupt Handling:** The raw entry and exit points for hardware interrupts (ISRs) often require manual stack manipulation that C/Rust cannot express.
+4.  **Hardware Instructions:** Accessing specific CPU features (like control registers `CR0`, `CR3`, or special instructions like `HLT`, `LIDT`, `LGDT`) that have no standard high-level equivalent.
+
+### The UnaOS Approach: The Safety Sandwich
+Modern kernel developers (like the Rust-for-Linux project or Redox OS) minimize Assembly use to the absolute fringes.
+1.  **Isolate it:** Wrap the Assembly instructions in small, well-audited functions.
+2.  **Interface it:** Expose these functions to the rest of the kernel as safe abstractions.
+3.  **Verify it:** Since the compiler can't check Assembly, these sections require the most rigorous human review.
 
 ---
 
