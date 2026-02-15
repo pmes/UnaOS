@@ -23,6 +23,9 @@ use api::{Content, GeminiClient, Part};
 mod forge;
 use forge::ForgeClient;
 
+mod splines;
+use splines::ide::IdeSpline;
+
 struct State {
     mode: ViewMode,
     nav_index: usize,
@@ -147,6 +150,22 @@ impl AppHandler for VeinApp {
         let mut s = self.state.lock().unwrap();
 
         match event {
+            // --- ELESSAR HANDSHAKE ---
+            Event::AuleIgnite => {
+                self.append_to_console_ui("[AULË] :: Ignition Sequence Start...\n");
+            },
+            Event::MatrixFileClick(path) => {
+                // Read File Content
+                match std::fs::read_to_string(&path) {
+                    Ok(content) => {
+                        splines::ide::load_tabula_text(&content);
+                        self.append_to_console_ui(&format!("[MATRIX] :: Loaded {}\n", path.display()));
+                    },
+                    Err(e) => {
+                        self.append_to_console_ui(&format!("[MATRIX ERROR] :: {}\n", e));
+                    }
+                }
+            },
             Event::Input(text) => {
                 let current_text = format!("\n[ARCHITECT] > {}\n", text);
                 s.chat_history.push(SavedMessage {
@@ -719,6 +738,14 @@ fn main() {
         ControlFlow::Continue
     });
 
-    Backend::new("org.unaos.vein.evolution", app, gui_rx);
+    // --- S40: ELESSAR BOOTSTRAP ---
+    let ide_spline = Arc::new(IdeSpline::new());
+    let ide_spline_clone = ide_spline.clone();
+
+    // Pass the closure to Backend
+    Backend::new("org.unaos.vein.evolution", app, gui_rx, move |window, tx| {
+        ide_spline_clone.bootstrap(window, tx)
+    });
+
     info!("SHUTDOWN: UI Backend runtime complete. Total application runtime: {:?}", app_start_time.elapsed());
 }

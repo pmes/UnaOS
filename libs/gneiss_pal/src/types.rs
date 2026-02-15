@@ -1,6 +1,17 @@
-use gtk4::{TextBuffer, Adjustment};
+use gtk4::{TextBuffer, Adjustment, Widget, Window};
 use std::path::PathBuf;
 use crate::shard::{Shard, ShardStatus};
+use std::sync::{Arc, Mutex};
+
+// --- ELESSAR MUTATION (S40) ---
+pub trait Spline: Send + Sync {
+    fn bootstrap(&self, window: &Window) -> Widget;
+    // We simplify handle_event to allow direct manipulation via interior mutability if needed,
+    // or passing a channel sender. For now, basic signature.
+    // However, since `AppHandler` is the main loop, Spline might need to hook into it.
+    // Let's keep it simple: Bootstrap returns the Widget tree.
+    // The Widget tree should contain its own signal handlers that communicate via the existing `Event` loop.
+}
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum WolfpackState {
@@ -22,7 +33,6 @@ pub enum ViewMode {
     Wolfpack,
 }
 
-// Ensure default derived or implemented
 impl Default for ViewMode {
     fn default() -> Self {
         ViewMode::Comms
@@ -48,9 +58,12 @@ pub enum Event {
     NavSelect(usize),
     DockAction(usize),
     TextBufferUpdate(TextBuffer, Adjustment),
-    UploadRequest, // Kept for compatibility, though effectively unused now
-    FileSelected(PathBuf), // NEW: Carries the selected path back to Vein
-    ToggleSidebar, // NEW: Toggle sidebar visibility
+    UploadRequest, // Kept for compatibility
+    FileSelected(PathBuf), // File Upload Selection
+    ToggleSidebar,
+    // --- ELESSAR EVENTS ---
+    MatrixFileClick(PathBuf), // File Tree Click
+    AuleIgnite, // Forge Action
 }
 
 #[derive(Clone, Debug)]

@@ -1,3 +1,4 @@
+// libs/gneiss_pal/src/lib.rs (Updated)
 #![allow(deprecated)]
 
 pub mod persistence;
@@ -21,11 +22,19 @@ pub fn register_resources() {
 
 // --- PLATFORM SWITCHBOARD ---
 
-// Priority: Gnome > GTK
-// If "gnome" feature is enabled, use it (even if "gtk" is also enabled via default)
 #[cfg(feature = "gnome")]
 pub use platforms::gnome::Backend;
 
-// Fallback: Use "gtk" only if "gnome" is NOT enabled
 #[cfg(all(feature = "gtk", not(feature = "gnome")))]
 pub use platforms::gtk::Backend;
+
+// --- ELESSAR MUTATION ---
+// Re-export sourceview5 for consumers
+pub mod prelude {
+    pub use sourceview5::prelude::*;
+    pub use sourceview5::View as SourceView;
+    pub use sourceview5::{Buffer, StyleSchemeManager};
+    pub use crate::types::*;
+    pub use crate::shard::*;
+    pub use crate::Backend; // Export Backend so vein can see new()
+}

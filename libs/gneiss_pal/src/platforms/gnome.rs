@@ -8,7 +8,7 @@ use gtk4::{
     PolicyType, Align, ListBox, StackTransitionType, TextView, EventControllerKey,
     TextBuffer, Adjustment, FileChooserNative, ResponseType, FileChooserAction,
     StackSwitcher, ToggleButton, CssProvider, StyleContext, Image, MenuButton, Popover,
-    Paned, Spinner
+    Paned, Spinner, ApplicationWindow
 };
 use sourceview5::prelude::*;
 use sourceview5::View as SourceView;
@@ -32,7 +32,10 @@ pub struct Backend<A: AppHandler> {
 }
 
 impl<A: AppHandler> Backend<A> {
-    pub fn new(app_id: &str, app_handler: A, rx: Receiver<GuiUpdate>) -> Self {
+    // S40: Updated signature to accept bootstrap_fn
+    pub fn new<F>(app_id: &str, app_handler: A, rx: Receiver<GuiUpdate>, bootstrap_fn: F) -> Self
+    where F: Fn(&ApplicationWindow, async_channel::Sender<Event>) -> gtk4::Widget + 'static
+    {
         // Ensure resources are registered
         crate::register_resources();
 
@@ -46,10 +49,21 @@ impl<A: AppHandler> Backend<A> {
         });
 
         let app_handler_rc = Rc::new(RefCell::new(app_handler));
-        let app_handler_rc_clone = app_handler_rc.clone();
+
+        let (tx_event, rx_event) = async_channel::unbounded::<Event>();
+
+        // Bridge Loop
+        let handler_clone_for_bridge = app_handler_rc.clone();
+        glib::MainContext::default().spawn_local(async move {
+            while let Ok(event) = rx_event.recv().await {
+                handler_clone_for_bridge.borrow_mut().handle_event(event);
+            }
+        });
+
+        let bootstrap_rc = Rc::new(bootstrap_fn);
 
         app.connect_activate(move |app| {
-            build_ui(app, app_handler_rc_clone.clone(), rx.clone());
+            build_ui(app, rx.clone(), bootstrap_rc.clone(), tx_event.clone());
         });
         app.run();
 
@@ -60,514 +74,40 @@ impl<A: AppHandler> Backend<A> {
     }
 }
 
-fn build_ui(app: &Application, app_handler_rc: Rc<RefCell<impl AppHandler>>, rx: Receiver<GuiUpdate>) {
+fn build_ui<F>(
+    app: &Application,
+    _rx: Receiver<GuiUpdate>,
+    bootstrap: Rc<F>,
+    tx_event: async_channel::Sender<Event>
+)
+where F: Fn(&ApplicationWindow, async_channel::Sender<Event>) -> gtk4::Widget + 'static
+{
     let ui_build_start_time = Instant::now();
-    info!("UI_BUILD: Starting build_ui function (Adwaita/Gnome).");
-    let _ = std::io::stdout().flush();
-    let _ = std::io::stderr().flush();
+    info!("UI_BUILD: Starting build_ui function (Adwaita Spline).");
 
     // --- MAIN WINDOW (Adwaita) ---
+    // AdwApplicationWindow
     let window = adw::ApplicationWindow::builder()
         .application(app)
-        .default_width(1100)
-        .default_height(750)
-        .title("Vein (Gnome)")
+        .default_width(1200)
+        .default_height(800)
+        .title("Elessar (UnaOS)")
         .build();
 
-    // --- TOOLBAR VIEW (Root) ---
-    let toolbar_view = adw::ToolbarView::new();
+    // Bootstrap returns a Widget.
+    // However, AdwApplicationWindow expects content.
+    // We need to cast AdwApplicationWindow to gtk::ApplicationWindow or pass it as is?
+    // The signature says `&ApplicationWindow` (which is gtk::ApplicationWindow).
+    // `adw::ApplicationWindow` is a subclass of `gtk::ApplicationWindow`.
+    // So we can upcast.
 
-    // --- HEADER BAR ---
-    let header_bar = adw::HeaderBar::new();
-    toolbar_view.add_top_bar(&header_bar);
+    let gtk_window = window.upcast_ref::<gtk4::ApplicationWindow>();
 
-    // Sidebar Toggle (Left) - AdwHeaderBar usually puts window controls there, but we can add start
-    let sidebar_toggle = ToggleButton::builder()
-        .icon_name("sidebar-show-symbolic")
-        .active(true)
-        .tooltip_text("Toggle Sidebar")
-        .build();
+    let content = bootstrap(gtk_window, tx_event);
 
-    // In Adwaita, we pack start/end
-    header_bar.pack_start(&sidebar_toggle);
-
-    // --- SPLIT VIEW (Sidebar | Content) ---
-    // Using AdwOverlaySplitView for modern sidebar behavior
-    let split_view = adw::OverlaySplitView::new();
-    split_view.set_sidebar_position(gtk4::PackType::Start); // Left
-    split_view.set_max_sidebar_width(250.0); // Slightly wider for Adwaita
-    split_view.set_min_sidebar_width(200.0);
-    split_view.set_pin_sidebar(true); // Keep it visible on desktop
-
-    // --- SIDEBAR ---
-    let sidebar_box = Box::new(Orientation::Vertical, 0);
-    sidebar_box.add_css_class("sidebar"); // Use same class for dark bg if needed, though Adwaita handles theme
-
-    // Stack (Rooms | Status)
-    let sidebar_stack = Stack::new();
-    sidebar_stack.set_vexpand(true);
-    sidebar_stack.set_transition_type(StackTransitionType::SlideLeftRight);
-
-    // Page 1: Rooms
-    let rooms_list = ListBox::new();
-    rooms_list.set_selection_mode(gtk4::SelectionMode::None);
-    rooms_list.add_css_class("navigation-sidebar"); // Adwaita style list
-
-    let active_state = app_handler_rc.borrow().view();
-    for (idx, item) in active_state.nav_items.iter().enumerate() {
-        rooms_list.append(&make_sidebar_row(item, idx == active_state.active_nav_index));
-    }
-    let app_handler_rc_clone_for_nav = app_handler_rc.clone();
-    rooms_list.connect_row_activated(move |_list_box, row| {
-        let idx = row.index() as usize;
-        app_handler_rc_clone_for_nav.borrow_mut().handle_event(Event::NavSelect(idx));
-    });
-    sidebar_stack.add_titled(&rooms_list, Some("rooms"), "Rooms");
-
-    // Page 2: Status
-    let status_box = Box::new(Orientation::Vertical, 10);
-    set_margins(&status_box, 10);
-
-    // Shard List
-    let shard_list = ListBox::new();
-    shard_list.set_selection_mode(gtk4::SelectionMode::None);
-    shard_list.add_css_class("shard-list");
-    shard_list.add_css_class("navigation-sidebar");
-
-    // Dynamic Shard Rendering
-    let initial_shards = app_handler_rc.borrow().view().shard_tree;
-    build_shard_rows(&shard_list, &initial_shards, 0);
-
-    status_box.append(&shard_list);
-
-    sidebar_stack.add_titled(&status_box, Some("status"), "Status");
-
-    sidebar_box.append(&sidebar_stack);
-
-    // Stack Switcher (Tabs)
-    let tab_box = Box::new(Orientation::Horizontal, 0);
-    tab_box.set_halign(Align::Center);
-    // Adwaita ViewSwitcher is better but StackSwitcher works
-    let stack_switcher = StackSwitcher::builder()
-        .stack(&sidebar_stack)
-        .build();
-    tab_box.append(&stack_switcher);
-    sidebar_box.append(&tab_box);
-
-    // Sidebar Status Indicator (The Pulse)
-    let sidebar_status_box = Box::new(Orientation::Horizontal, 5);
-    set_margins(&sidebar_status_box, 5);
-    sidebar_status_box.set_halign(Align::Center);
-    let sidebar_spinner = Spinner::new();
-    let sidebar_status_icon = Image::from_icon_name("system-run-symbolic");
-    sidebar_status_box.append(&sidebar_status_icon);
-    sidebar_status_box.append(&sidebar_spinner);
-    sidebar_box.append(&sidebar_status_box);
-
-    split_view.set_sidebar(Some(&sidebar_box));
-
-    // --- CONTENT (Paned) ---
-    // Using Paned inside the content area
-    let paned = Paned::new(Orientation::Vertical);
-    paned.set_vexpand(true);
-    paned.set_hexpand(true);
-    paned.set_position(550);
-
-    // Console (Top Pane)
-    let scrolled_window = ScrolledWindow::builder()
-        .hscrollbar_policy(PolicyType::Never)
-        .vscrollbar_policy(PolicyType::Automatic)
-        .vexpand(true)
-        .build();
-
-    let text_buffer = TextBuffer::new(None);
-    text_buffer.set_text(&app_handler_rc.borrow().view().console_output);
-
-    let console_text_view = TextView::builder()
-        .wrap_mode(gtk4::WrapMode::WordChar)
-        .editable(false)
-        .monospace(true)
-        .buffer(&text_buffer)
-        .margin_start(12).margin_end(12).margin_top(12).margin_bottom(12)
-        .build();
-
-    let text_buffer_clone = text_buffer.clone();
-    let scrolled_window_adj_clone = scrolled_window.vadjustment();
-    app_handler_rc.borrow_mut().handle_event(Event::TextBufferUpdate(text_buffer_clone, scrolled_window_adj_clone));
-
-    scrolled_window.set_child(Some(&console_text_view));
-    paned.set_start_child(Some(&scrolled_window));
-
-    // Input Area (Bottom Pane)
-    let input_container = Box::new(Orientation::Horizontal, 8);
-    set_margins(&input_container, 0);
-    input_container.set_valign(Align::Fill);
-
-    // Upload Button
-    let upload_icon = Image::from_resource("/org/una/vein/icons/share-symbolic");
-    let upload_btn = Button::builder()
-        .child(&upload_icon)
-        .valign(Align::End)
-        .margin_bottom(10)
-        .margin_start(10)
-        .build();
-
-    let app_handler_rc_for_upload = app_handler_rc.clone();
-    // AdwApplicationWindow doesn't easily downgrade to gtk::Window for transients, but it is a gtk::Window
-    // let window_weak = window.downgrade(); // AdwApplicationWindow is IsA<Window>
-    // but strict type might be issue. AdwApplicationWindow impls IsA<GtkWindow>.
-    let window_weak = window.upcast_ref::<gtk4::Window>().downgrade();
-
-    upload_btn.connect_clicked(move |_| {
-         let dialog = FileChooserNative::builder()
-            .title("Select File to Upload")
-            .action(FileChooserAction::Open)
-            .modal(true)
-            .accept_label("Upload")
-            .cancel_label("Cancel")
-            .build();
-        if let Some(window) = window_weak.upgrade() {
-            dialog.set_transient_for(Some(&window));
-        }
-        let handler_clone = app_handler_rc_for_upload.clone();
-        dialog.connect_response(move |d, response| {
-            if response == ResponseType::Accept {
-                if let Some(file) = d.file() {
-                    if let Some(path) = file.path() {
-                        handler_clone.borrow_mut().handle_event(Event::FileSelected(path));
-                    }
-                }
-            }
-            d.destroy();
-        });
-        dialog.show();
-    });
-    input_container.append(&upload_btn);
-
-    // Input Field
-    let input_scroll = ScrolledWindow::builder()
-        .hscrollbar_policy(PolicyType::Never)
-        .vscrollbar_policy(PolicyType::Automatic)
-        .propagate_natural_height(true)
-        .max_content_height(500)
-        .vexpand(true)
-        .valign(Align::Fill)
-        .margin_top(10)
-        .margin_bottom(10)
-        .has_frame(false)
-        .build();
-
-    input_scroll.set_hexpand(true);
-    input_scroll.add_css_class("chat-input-area");
-
-    let text_view = SourceView::builder()
-        .wrap_mode(gtk4::WrapMode::WordChar)
-        .show_line_numbers(false)
-        .auto_indent(true)
-        .accepts_tab(false)
-        .top_margin(2)
-        .bottom_margin(2)
-        .left_margin(8)
-        .right_margin(8)
-        .build();
-
-    // FORCE DARK MODE SCHEME
-    let sv_buffer = text_view.buffer().downcast::<Buffer>().expect("SourceView should have a SourceBuffer");
-    let manager = StyleSchemeManager::new();
-    if let Some(scheme) = manager.scheme("Adwaita-dark") {
-        sv_buffer.set_style_scheme(Some(&scheme));
-    } else if let Some(scheme) = manager.scheme("oblivion") {
-         sv_buffer.set_style_scheme(Some(&scheme));
-    }
-
-    text_view.add_css_class("transparent-text");
-
-    input_scroll.set_child(Some(&text_view));
-
-    // Send Button
-    let send_icon = Image::from_resource("/org/una/vein/icons/paper-plane-symbolic");
-    let send_btn = Button::builder()
-        .child(&send_icon)
-        .valign(Align::End)
-        .margin_bottom(10)
-        .margin_end(10)
-        .css_classes(vec!["suggested-action"])
-        .build();
-
-    let buffer = text_view.buffer();
-    let btn_style_clone = send_btn.clone();
-    buffer.connect_changed(move |buf| {
-        if buf.line_count() > 1 {
-            btn_style_clone.remove_css_class("suggested-action");
-        } else {
-            btn_style_clone.add_css_class("suggested-action");
-        }
-    });
-
-    let app_handler_rc_for_send = app_handler_rc.clone();
-    let text_view_for_send = text_view.clone();
-    let scrolled_window_adj = scrolled_window.vadjustment();
-
-    let send_message_rc: Rc<dyn Fn() + 'static> = Rc::new(move || {
-        let buffer = text_view_for_send.buffer();
-        let (start, end) = buffer.bounds();
-        let text = buffer.text(&start, &end, false).to_string();
-        let clean_text = text.trim();
-        if clean_text.is_empty() { return; }
-        app_handler_rc_for_send.borrow_mut().handle_event(Event::Input(clean_text.to_string()));
-        buffer.set_text("");
-        let adj_clone = scrolled_window_adj.clone();
-        glib::timeout_add_local(Duration::from_millis(50), move || {
-            adj_clone.set_value(adj_clone.upper());
-            glib::ControlFlow::Break
-        });
-    });
-
-    let controller = EventControllerKey::new();
-    controller.set_propagation_phase(gtk4::PropagationPhase::Capture);
-    let send_action_clone_for_controller = send_message_rc.clone();
-    controller.connect_key_pressed(move |ctrl, key, _, modifiers| {
-        if key == Key::Return || key == Key::KP_Enter {
-            let tv = ctrl.widget().expect("Controller must be attached to a TextView").downcast::<TextView>().expect("Widget must be a TextView");
-            let buffer = tv.buffer();
-            if buffer.line_count() == 1 || modifiers.contains(ModifierType::SHIFT_MASK) {
-                if !modifiers.contains(ModifierType::SHIFT_MASK) {
-                    send_action_clone_for_controller();
-                    return glib::Propagation::Stop;
-                }
-            }
-            return glib::Propagation::Proceed;
-        }
-        glib::Propagation::Proceed
-    });
-    text_view.add_controller(controller);
-    let send_action_clone_for_button = send_message_rc.clone();
-    send_btn.connect_clicked(move |_| send_action_clone_for_button());
-
-    input_container.append(&input_scroll);
-    input_container.append(&send_btn);
-
-    paned.set_end_child(Some(&input_container));
-
-    // Finish assembling the window
-    split_view.set_content(Some(&paned));
-    toolbar_view.set_content(Some(&split_view));
-    window.set_content(Some(&toolbar_view));
-
-    // Toggle Logic
-    // We bind the toggle button to the split_view
-    let split_view_clone = split_view.clone();
-    let app_handler_rc_for_toggle = app_handler_rc.clone();
-
-    // Initial State from model
-    if app_handler_rc.borrow().view().sidebar_collapsed {
-        split_view.set_show_sidebar(false);
-        sidebar_toggle.set_active(false);
-    } else {
-        split_view.set_show_sidebar(true);
-        sidebar_toggle.set_active(true);
-    }
-
-    sidebar_toggle.connect_toggled(move |btn| {
-        split_view_clone.set_show_sidebar(btn.is_active());
-        app_handler_rc_for_toggle.borrow_mut().handle_event(Event::ToggleSidebar);
-    });
-
-    // Also bind split_view state back to toggle button (e.g. if collapsed by swipe)
-    // split_view.connect_show_sidebar_notify(...) ?
-    // This creates a loop if not careful, but useful for correct state.
-
-    // CSS
-    let provider = CssProvider::new();
-    provider.load_from_data("
-        /* Adwaita styling is mostly automatic, but we keep the Pill and Text styles */
-
-        .chat-input-area {
-            background: #2d2d2d;
-            border: 1px solid #555555;
-            border-radius: 20px;
-            overflow: hidden;
-            transition: border-color 0.2s;
-        }
-
-        .chat-input-area:focus-within {
-            border-color: #3584e4;
-            background: #333333;
-        }
-
-        textview, sourceview {
-            font-family: 'Monospace';
-            font-size: 11pt;
-            padding: 0px;
-        }
-
-        .transparent-text,
-        .transparent-text sourceview,
-        .transparent-text text {
-             background-color: transparent !important;
-             background-image: none !important;
-        }
-
-        .transparent-text {
-             caret-color: white;
-             color: white;
-        }
-
-        .success { color: #2ec27e; }
-        .dim-label { opacity: 0.5; }
-        .warning { color: #f5c211; }
-
-        .status-online { color: #2ec27e; }
-        .status-on-call { color: #0D7C66; }
-        .status-active { color: #41B3A2; }
-        .status-thinking { color: #D7C3F1; }
-        .status-paused { color: #f5c211; }
-        .status-error { color: #e01b24; }
-        .status-offline { opacity: 0.5; }
-    ");
-    StyleContext::add_provider_for_display(
-        &gtk4::gdk::Display::default().expect("No display"),
-        &provider,
-        gtk4::STYLE_PROVIDER_PRIORITY_APPLICATION,
-    );
+    // AdwApplicationWindow content
+    window.set_content(Some(&content));
 
     window.present();
     info!("UI_BUILD: Window presented. Total build_ui duration: {:?}", ui_build_start_time.elapsed());
-
-    // The Nervous System (Signal Listener)
-    // (Same as GTK version)
-    let shard_list_weak = shard_list.downgrade();
-    let text_buffer_weak = text_buffer.downgrade();
-    let scrolled_window_adj_weak = scrolled_window.vadjustment().downgrade();
-    let sidebar_status_icon_weak = sidebar_status_icon.downgrade();
-    let sidebar_spinner_weak = sidebar_spinner.downgrade();
-
-    glib::MainContext::default().spawn_local(async move {
-        while let Ok(update) = rx.recv().await {
-            match update {
-                 GuiUpdate::ShardStatusChanged { id, status } => {
-                    if let Some(list) = shard_list_weak.upgrade() {
-                        let mut i = 0;
-                        while let Some(row) = list.row_at_index(i) {
-                             if let Some(child_box) = row.child() {
-                                 if let Some(box_widget) = child_box.downcast_ref::<Box>() {
-                                     let mut child = box_widget.first_child();
-                                     while let Some(widget) = child {
-                                         if let Some(icon) = widget.downcast_ref::<Image>() {
-                                             if icon.widget_name() == id {
-                                                 for class in ["status-online", "status-on-call", "status-active", "status-thinking", "status-paused", "status-error", "status-offline"] {
-                                                     icon.remove_css_class(class);
-                                                 }
-                                                 match status {
-                                                     ShardStatus::Online => icon.add_css_class("status-online"),
-                                                     ShardStatus::OnCall => icon.add_css_class("status-on-call"),
-                                                     ShardStatus::Active => icon.add_css_class("status-active"),
-                                                     ShardStatus::Thinking => icon.add_css_class("status-thinking"),
-                                                     ShardStatus::Paused => icon.add_css_class("status-paused"),
-                                                     ShardStatus::Error => icon.add_css_class("status-error"),
-                                                     ShardStatus::Offline => icon.add_css_class("status-offline"),
-                                                 }
-                                             }
-                                         }
-                                         child = widget.next_sibling();
-                                     }
-                                 }
-                             }
-                            i += 1;
-                        }
-                    }
-                 },
-                 GuiUpdate::ConsoleLog(msg) => {
-                     if let Some(buffer) = text_buffer_weak.upgrade() {
-                         let mut end_iter = buffer.end_iter();
-                         buffer.insert(&mut end_iter, &msg);
-                         if let Some(adj) = scrolled_window_adj_weak.upgrade() {
-                             adj.set_value(adj.upper());
-                         }
-                     }
-                 },
-                 GuiUpdate::SidebarStatus(state) => {
-                     if let (Some(icon), Some(spinner)) = (sidebar_status_icon_weak.upgrade(), sidebar_spinner_weak.upgrade()) {
-                         match state {
-                             WolfpackState::Dreaming => {
-                                 icon.set_visible(false);
-                                 spinner.set_visible(true);
-                                 spinner.start();
-                             },
-                             _ => {
-                                 spinner.stop();
-                                 spinner.set_visible(false);
-                                 icon.set_visible(true);
-                             }
-                         }
-                     }
-                 }
-            }
-        }
-    });
-}
-
-fn build_shard_rows(list: &ListBox, shards: &[Shard], depth: usize) {
-    for shard in shards {
-        let row_box = Box::new(Orientation::Horizontal, 10);
-        set_margins(&row_box, 5);
-        if depth > 0 {
-             row_box.set_margin_start(5 + (depth as i32 * 15));
-        }
-
-        let icon_name = match shard.role {
-            ShardRole::Root => "computer-symbolic",
-            ShardRole::Builder => "network-server-symbolic",
-            ShardRole::Storage => "server-database-symbolic",
-            ShardRole::Kernel => "chip-symbolic",
-            _ => "dialog-question-symbolic",
-        };
-        let icon = Image::from_icon_name(icon_name);
-        icon.set_widget_name(&shard.id);
-
-        match shard.status {
-            ShardStatus::Online => icon.add_css_class("status-online"),
-            ShardStatus::OnCall => icon.add_css_class("status-on-call"),
-            ShardStatus::Active => icon.add_css_class("status-active"),
-            ShardStatus::Thinking => icon.add_css_class("status-thinking"),
-            ShardStatus::Paused => icon.add_css_class("status-paused"),
-            ShardStatus::Error => icon.add_css_class("status-error"),
-            ShardStatus::Offline => icon.add_css_class("status-offline"),
-        }
-        row_box.append(&icon);
-
-        let label = Label::builder().label(&format!("{} ({:?})", shard.name, shard.role)).hexpand(true).xalign(0.0).build();
-        row_box.append(&label);
-
-        if shard.role == ShardRole::Root {
-            let menu_btn = MenuButton::builder()
-                .icon_name("view-more-symbolic")
-                .has_frame(false)
-                .build();
-            let popover = Popover::new();
-            let popover_box = Box::new(Orientation::Vertical, 5);
-            set_margins(&popover_box, 5);
-            let info_btn = Button::builder().label("System Info").icon_name("dialog-information-symbolic").build();
-            popover_box.append(&info_btn);
-            let relink_btn = Button::with_label("Re-Link Brain");
-            relink_btn.add_css_class("destructive-action");
-            popover_box.append(&relink_btn);
-            popover.set_child(Some(&popover_box));
-            menu_btn.set_popover(Some(&popover));
-            row_box.append(&menu_btn);
-        }
-
-        list.append(&row_box);
-
-        if !shard.children.is_empty() {
-            build_shard_rows(list, &shard.children, depth + 1);
-        }
-    }
-}
-
-pub fn set_margins(w: &Box, s: i32) { w.set_margin_top(s); w.set_margin_bottom(s); w.set_margin_start(s); w.set_margin_end(s); }
-
-fn make_sidebar_row(n: &str, a: bool) -> Box {
-    let r = Box::new(Orientation::Horizontal, 10); set_margins(&r, 10);
-    r.append(&Label::new(Some(n))); if a { r.append(&Label::new(Some("●"))); } r
 }
