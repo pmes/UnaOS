@@ -24,7 +24,7 @@ mod forge;
 use forge::ForgeClient;
 
 mod splines;
-use splines::ide::IdeSpline;
+use splines::comms::CommsSpline;
 
 struct State {
     mode: ViewMode,
@@ -150,22 +150,6 @@ impl AppHandler for VeinApp {
         let mut s = self.state.lock().unwrap();
 
         match event {
-            // --- ELESSAR HANDSHAKE ---
-            Event::AuleIgnite => {
-                self.append_to_console_ui("[AULË] :: Ignition Sequence Start...\n");
-            },
-            Event::MatrixFileClick(path) => {
-                // Read File Content
-                match std::fs::read_to_string(&path) {
-                    Ok(content) => {
-                        splines::ide::load_tabula_text(&content);
-                        self.append_to_console_ui(&format!("[MATRIX] :: Loaded {}\n", path.display()));
-                    },
-                    Err(e) => {
-                        self.append_to_console_ui(&format!("[MATRIX ERROR] :: {}\n", e));
-                    }
-                }
-            },
             Event::Input(text) => {
                 let current_text = format!("\n[ARCHITECT] > {}\n", text);
                 s.chat_history.push(SavedMessage {
@@ -332,6 +316,7 @@ impl AppHandler for VeinApp {
                 // Note: The UI widget toggling is handled in lib.rs via button connection for immediate feedback,
                 // but we update state here for persistence.
             }
+            _ => { /* Ignore new Elessar events in Vein */ }
         }
     }
 
@@ -738,13 +723,13 @@ fn main() {
         ControlFlow::Continue
     });
 
-    // --- S40: ELESSAR BOOTSTRAP ---
-    let ide_spline = Arc::new(IdeSpline::new());
-    let ide_spline_clone = ide_spline.clone();
+    // --- S40: RESTORED VEIN BOOTSTRAP ---
+    let comms_spline = Arc::new(CommsSpline::new());
+    let comms_spline_clone = comms_spline.clone();
 
     // Pass the closure to Backend
     Backend::new("org.unaos.vein.evolution", app, gui_rx, move |window, tx| {
-        ide_spline_clone.bootstrap(window, tx)
+        comms_spline_clone.bootstrap(window, tx)
     });
 
     info!("SHUTDOWN: UI Backend runtime complete. Total application runtime: {:?}", app_start_time.elapsed());
