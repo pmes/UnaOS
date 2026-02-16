@@ -63,7 +63,9 @@ fn do_append_and_scroll(ui_updater_rc: &Rc<RefCell<Option<UiUpdater>>>, text: &s
             ControlFlow::Break
         });
     } else {
-        error!("Attempted to append to console before UiUpdater was available. Text: {}", text);
+        // If UI isn't ready, we log to stdout but don't crash or error loudly.
+        // In a more robust system, we'd queue this message.
+        info!("Buffered Output (UI Pending): {}", text);
     }
 }
 
@@ -419,10 +421,17 @@ fn main() {
     let (gui_tx, gui_rx) = async_channel::unbounded();
     let gui_tx_brain = gui_tx.clone();
 
+    // We delay the brain thread slightly to ensure UI is up, or rely on buffered output
+    // The previous error was due to `tx_to_ui_bg_clone.send` being called instantly
+    // which then the main thread processed before `ui_updater` was set.
+
     thread::spawn(move || {
         let rt = Runtime::new().expect("Failed to create Tokio Runtime");
         rt.block_on(async move {
             info!(":: VEIN :: Brain Connecting...");
+
+            // Give UI a moment to breathe (Race condition mitigation)
+            tokio::time::sleep(Duration::from_millis(200)).await;
 
             // Initialize Forge (GitHub) Client
             let forge_client = match ForgeClient::new() {

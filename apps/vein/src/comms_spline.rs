@@ -4,7 +4,7 @@ use gtk4::{
     PolicyType, Align, ListBox, Separator, StackTransitionType, TextView,
     TextBuffer, HeaderBar, StackSwitcher, ToggleButton, Image,
     Paned, ApplicationWindow, Widget, Window, CssProvider, StyleContext,
-    EventControllerKey, Spinner, MenuButton, Popover,
+    EventControllerKey, Spinner, MenuButton, Popover, FileDialog,
     gdk::{Key, ModifierType}, PropagationPhase
 };
 use async_channel::Receiver;
@@ -58,7 +58,7 @@ impl CommsSpline {
                 color: #ffffff;
             }
 
-            /* Send Button */
+            /* Send and Attach Buttons */
             .suggested-action {
                 background-color: #0078d4;
                 color: #ffffff;
@@ -67,6 +67,22 @@ impl CommsSpline {
                 min-width: 42px;
                 min-height: 42px;
                 margin-left: 8px;
+            }
+
+            .attach-action {
+                background-color: transparent;
+                color: #888888;
+                border-radius: 100%;
+                padding: 0px;
+                min-width: 42px;
+                min-height: 42px;
+                margin-right: 8px;
+                border: none;
+                box-shadow: none;
+            }
+            .attach-action:hover {
+                background-color: rgba(255, 255, 255, 0.1);
+                color: #ffffff;
             }
 
             .shard-list { background-color: transparent; }
@@ -261,11 +277,40 @@ impl CommsSpline {
         // Input Area (Bottom Pane)
         let input_container = Box::new(Orientation::Horizontal, 8);
         input_container.set_valign(Align::Fill);
-        input_container.set_margin_start(16); // Increased margin
-        input_container.set_margin_end(16);   // Increased margin
-        input_container.set_margin_bottom(16); // Increased margin
+        input_container.set_margin_start(16);
+        input_container.set_margin_end(16);
+        input_container.set_margin_bottom(16);
 
-        // Input Field
+        // Attach Button (Left)
+        let attach_btn = Button::builder()
+            .valign(Align::End)
+            .css_classes(vec!["attach-action"])
+            .child(&Image::from_resource("/org/una/vein/icons/share-symbolic"))
+            .build();
+
+        // Implement Attach logic (Using FileDialog)
+        let tx_clone_file = tx_event.clone();
+        let window_clone = window.clone();
+        attach_btn.connect_clicked(move |_| {
+            let tx = tx_clone_file.clone();
+            let parent_window = window_clone.clone();
+
+            glib::MainContext::default().spawn_local(async move {
+                let dialog = FileDialog::new();
+                // dialog.set_title("Select File to Upload"); // Not available in all GTK versions, safe to omit
+
+                if let Ok(file) = dialog.open_future(Some(&parent_window)).await {
+                    if let Some(path) = file.path() {
+                        let path_str = path.to_string_lossy().to_string();
+                        // For now, just send the path as input or handle it differently.
+                        // Ideally we'd have a specific Event::FileSelected
+                        let _ = tx.send(Event::Input(format!("/upload {}", path_str))).await;
+                    }
+                }
+            });
+        });
+
+        // Input Field (Center)
         let input_scroll = ScrolledWindow::builder()
             .hscrollbar_policy(PolicyType::Never)
             .vscrollbar_policy(PolicyType::Automatic)
@@ -273,7 +318,6 @@ impl CommsSpline {
             .max_content_height(500)
             .vexpand(true)
             .valign(Align::Fill)
-            // Removed direct margins here to let container handle spacing
             .has_frame(false)
             .build();
         input_scroll.set_hexpand(true);
@@ -284,21 +328,20 @@ impl CommsSpline {
             .show_line_numbers(false)
             .auto_indent(true)
             .accepts_tab(false)
-            .top_margin(12)    // Increased internal padding
-            .bottom_margin(12) // Increased internal padding
-            .left_margin(12)   // Increased internal padding
-            .right_margin(12)  // Increased internal padding
+            .top_margin(12)
+            .bottom_margin(12)
+            .left_margin(12)
+            .right_margin(12)
             .build();
 
         text_view.add_css_class("transparent-text");
         input_scroll.set_child(Some(&text_view));
 
-        // Send Button
+        // Send Button (Right)
         let send_btn = Button::builder()
-            .icon_name("paper-plane-symbolic")
             .valign(Align::End)
-            // Removed bottom margin since container has it
             .css_classes(vec!["suggested-action"])
+            .child(&Image::from_resource("/org/una/vein/icons/paper-plane-symbolic"))
             .build();
 
         let tx_clone_send = tx_event.clone();
@@ -333,6 +376,7 @@ impl CommsSpline {
             }
         });
 
+        input_container.append(&attach_btn);
         input_container.append(&input_scroll);
         input_container.append(&send_btn);
 
