@@ -46,9 +46,6 @@ impl IdeSpline {
 
         // --- HEADER BAR ---
         let header_bar = HeaderBar::new();
-        // Elessar doesn't need a toggle button strictly if using Adwaita Split View in future,
-        // but for now we keep it standard.
-        // Or keep it clean.
 
         // --- MAIN CONTAINER ---
         let main_box = Box::new(Orientation::Horizontal, 0);
@@ -88,18 +85,23 @@ impl IdeSpline {
         }
 
         let tx_clone_matrix = tx_event.clone();
-        matrix_list.connect_row_activated(move |_list, row| {
-            if let Some(box_widget) = row.child().and_then(|c| c.downcast::<Box>().ok()) {
-                let mut children = box_widget.first_child();
-                while let Some(child) = children {
-                    if let Some(label) = child.downcast_ref::<Label>() {
-                        let text = label.text();
-                        let _ = tx_clone_matrix.send_blocking(Event::MatrixFileClick(PathBuf::from(text.as_str())));
-                        break;
-                    }
-                    children = child.next_sibling();
-                }
-            }
+        // Updated signal handler for listbox rows
+        matrix_list.connect_row_activated(move |list, row| {
+             // We need to extract the label text.
+             // The child of the row is our Box.
+             if let Some(child) = row.child() {
+                 if let Some(box_widget) = child.downcast_ref::<Box>() {
+                      let mut children = box_widget.first_child();
+                      while let Some(c) = children {
+                          if let Some(label) = c.downcast_ref::<Label>() {
+                              let text = label.text();
+                              let _ = tx_clone_matrix.send_blocking(Event::MatrixFileClick(PathBuf::from(text.as_str())));
+                              break;
+                          }
+                          children = c.next_sibling();
+                      }
+                 }
+             }
         });
 
         let matrix_scroll = ScrolledWindow::builder().child(&matrix_list).build();
@@ -172,7 +174,6 @@ impl IdeSpline {
 
         let midden_buf = midden_view.buffer();
         let midden_adj = midden_scroll.vadjustment();
-        let _ = tx_event.send_blocking(Event::TextBufferUpdate(midden_buf, midden_adj));
 
         midden_scroll.set_child(Some(&midden_view));
         paned.set_end_child(Some(&midden_scroll));
@@ -192,10 +193,25 @@ impl IdeSpline {
             gtk4::STYLE_PROVIDER_PRIORITY_APPLICATION,
         );
 
-        // --- RX LOOP (Drain) ---
+        // --- RX LOOP (Console Updates) ---
+        let midden_buf_clone = midden_buf.clone();
+        let midden_adj_clone = midden_adj.clone();
+
         glib::MainContext::default().spawn_local(async move {
-            while let Ok(_update) = rx.recv().await {
-                // Drain messages
+            while let Ok(update) = rx.recv().await {
+                match update {
+                    GuiUpdate::ConsoleLog(text) => {
+                        let mut end = midden_buf_clone.end_iter();
+                        midden_buf_clone.insert(&mut end, &text);
+                        // Scroll
+                        let adj = midden_adj_clone.clone();
+                        glib::timeout_add_local(std::time::Duration::from_millis(50), move || {
+                            adj.set_value(adj.upper());
+                            glib::ControlFlow::Break
+                        });
+                    },
+                    _ => {}
+                }
             }
         });
 

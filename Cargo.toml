@@ -1,1 +1,1 @@
-workspace = { members = ["libs/gneiss_pal", "apps/vein", "apps/elessar"] }
+workspace = { members = ["libs/gneiss_pal", "apps/vein", "apps/elessar", "libs/quartzite"] }
