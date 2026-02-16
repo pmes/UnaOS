@@ -35,7 +35,7 @@ impl CommsSpline {
         // Updated CSS for Visibility and "Breathing" Look
         provider.load_from_data("
             .sidebar { background-color: #1e1e1e; color: #ffffff; }
-            .console { background-color: #101010; color: #dddddd; font-family: 'Monospace'; caret-color: #dddddd; }
+            .console { background-color: #101010; color: #dddddd; font-family: 'Monospace'; caret-color: #dddddd; padding: 12px; }
 
             /* Input Area Container (The Pill) */
             .chat-input-area {
@@ -51,6 +51,7 @@ impl CommsSpline {
                 caret-color: #ffffff;
                 font-family: 'Sans';
                 font-size: 15px;
+                padding: 6px; /* Added internal padding */
             }
 
             textview.transparent-text text {
@@ -70,18 +71,21 @@ impl CommsSpline {
             }
 
             .attach-action {
-                background-color: transparent;
+                background-color: #333333; /* Visible background */
                 color: #cccccc;
+                border-radius: 4px; /* Match suggested-action */
                 padding: 0px;
                 min-width: 42px;
                 min-height: 42px;
                 margin-right: 8px;
-                border: none;
-                box-shadow: none;
+                /* Removed border: none to allow default button feel/depression */
             }
             .attach-action:hover {
                 color: #ffffff;
-                background-color: rgba(255, 255, 255, 0.1);
+                background-color: #444444;
+            }
+            .attach-action:active {
+                background-color: #222222; /* Depressed state */
             }
 
             .shard-list { background-color: transparent; }
@@ -287,7 +291,7 @@ impl CommsSpline {
         let attach_btn = Button::builder()
             .valign(Align::End)
             .css_classes(vec!["attach-action"])
-            .icon_name("paperclip-symbolic")
+            .child(&Image::from_resource("/org/una/vein/icons/share-symbolic"))
             .build();
 
         // Implement Attach logic (Using FileDialog)
@@ -343,7 +347,7 @@ impl CommsSpline {
         let send_btn = Button::builder()
             .valign(Align::End)
             .css_classes(vec!["suggested-action"])
-            .icon_name("send-to-symbolic")
+            .child(&Image::from_resource("/org/una/vein/icons/paper-plane-symbolic"))
             .build();
 
         let tx_clone_send = tx_event.clone();
