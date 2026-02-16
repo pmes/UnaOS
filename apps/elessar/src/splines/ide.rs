@@ -181,12 +181,12 @@ impl IdeSpline {
 
         // CSS
         let provider = CssProvider::new();
-        provider.load_from_data("
+        provider.load_from_string("
             .sidebar { background: #1e1e1e; }
             .console { background: #101010; color: #A6E3A1; } /* Catppuccin Green (Softer) */
             textview { font-family: 'Monospace'; font-size: 11pt; }
         ");
-        StyleContext::add_provider_for_display(
+        gtk4::style_context_add_provider_for_display(
             &gtk4::gdk::Display::default().expect("No display"),
             &provider,
             gtk4::STYLE_PROVIDER_PRIORITY_APPLICATION,

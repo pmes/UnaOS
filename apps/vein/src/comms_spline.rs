@@ -33,7 +33,7 @@ impl CommsSpline {
         // --- STYLE PROVIDER ---
         let provider = CssProvider::new();
         // Updated CSS for Visibility and "Breathing" Look
-        provider.load_from_data("
+        provider.load_from_string("
             .sidebar { background-color: #1e1e1e; color: #ffffff; }
             .console { background-color: #101010; color: #dddddd; font-family: 'Monospace'; caret-color: #dddddd; padding: 12px; }
 
@@ -70,22 +70,32 @@ impl CommsSpline {
                 margin-left: 8px;
             }
 
+            .suggested-action image {
+                -gtk-icon-style: symbolic;
+                color: #ffffff;
+            }
+
             .attach-action {
-                background-color: #333333; /* Visible background */
+                background-color: #333333;
                 color: #cccccc;
-                border-radius: 4px; /* Match suggested-action */
+                border-radius: 4px;
                 padding: 0px;
                 min-width: 42px;
                 min-height: 42px;
                 margin-right: 8px;
-                /* Removed border: none to allow default button feel/depression */
             }
+
+            .attach-action image {
+                -gtk-icon-style: symbolic;
+                color: inherit; /* Inherit from button text color */
+            }
+
             .attach-action:hover {
                 color: #ffffff;
                 background-color: #444444;
             }
             .attach-action:active {
-                background-color: #222222; /* Depressed state */
+                background-color: #222222;
             }
 
             .shard-list { background-color: transparent; }
@@ -111,7 +121,7 @@ impl CommsSpline {
             }
         ");
 
-        StyleContext::add_provider_for_display(
+        gtk4::style_context_add_provider_for_display(
             &gtk4::gdk::Display::default().expect("No display"),
             &provider,
             gtk4::STYLE_PROVIDER_PRIORITY_APPLICATION,
