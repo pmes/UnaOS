@@ -3,8 +3,11 @@ use gtk4::{
     Box, Orientation, Label, Button, Stack, ScrolledWindow,
     PolicyType, Align, ListBox, Separator, StackTransitionType, TextView,
     TextBuffer, HeaderBar, StackSwitcher, ToggleButton, Image,
-    Paned, ApplicationWindow, Widget, Window
+    Paned, ApplicationWindow, Widget, Window, CssProvider, StyleContext,
+    EventControllerKey, Spinner,
+    gdk::{Key, ModifierType}
 };
+use async_channel::Receiver;
 use sourceview5::View as SourceView;
 
 // Import Adwaita if feature is enabled
@@ -14,6 +17,7 @@ use libadwaita::prelude::*;
 use libadwaita as adw;
 
 use gneiss_pal::types::*;
+use gneiss_pal::shard::ShardStatus;
 
 pub struct CommsSpline {}
 
@@ -22,15 +26,46 @@ impl CommsSpline {
         Self {}
     }
 
-    pub fn bootstrap<W: IsA<Window> + IsA<Widget> + Cast>(&self, _window: &W, tx_event: async_channel::Sender<Event>) -> Widget {
-        // --- HEADER BAR ---
-        let header_bar = HeaderBar::new();
+    pub fn bootstrap<W: IsA<Window> + IsA<Widget> + Cast>(&self, _window: &W, tx_event: async_channel::Sender<Event>, rx: Receiver<GuiUpdate>) -> Widget {
+        // --- STYLE PROVIDER ---
+        let provider = CssProvider::new();
+        provider.load_from_data("
+            .sidebar { background-color: #1e1e1e; color: #ffffff; }
+            .console { background-color: #101010; color: #00ff00; font-family: 'Monospace'; }
+            .chat-input-area { background-color: #2d2d2d; border-radius: 12px; padding: 6px; }
+            .transparent-text { background-color: transparent; color: #ffffff; font-family: 'Monospace'; }
+            .suggested-action { background-color: #0078d4; color: #ffffff; border-radius: 50%; padding: 8px; }
+            .shard-list { background-color: transparent; }
+            window { background-color: #1e1e1e; }
+        ");
+
+        StyleContext::add_provider_for_display(
+            &gtk4::gdk::Display::default().expect("No display"),
+            &provider,
+            gtk4::STYLE_PROVIDER_PRIORITY_APPLICATION,
+        );
+
+        // --- HEADER BAR (Polymorphic) ---
         let sidebar_toggle = ToggleButton::builder()
             .icon_name("sidebar-show-symbolic")
             .active(true)
             .tooltip_text("Toggle Sidebar")
             .build();
-        header_bar.pack_start(&sidebar_toggle);
+
+        #[cfg(feature = "gnome")]
+        let header_bar = {
+            let hb = adw::HeaderBar::new();
+            hb.pack_start(&sidebar_toggle);
+            hb
+        };
+
+        #[cfg(not(feature = "gnome"))]
+        let header_bar = {
+            let hb = HeaderBar::new();
+            hb.pack_start(&sidebar_toggle);
+            hb.set_show_title_buttons(true);
+            hb
+        };
 
         // --- BODY CONTAINER ---
         let body_box = Box::new(Orientation::Horizontal, 0);
@@ -60,19 +95,36 @@ impl CommsSpline {
         });
         sidebar_stack.add_titled(&rooms_list, Some("rooms"), "Rooms");
 
-        // Page 2: Status
+        // Page 2: Status (With Dynamic Updates)
         let status_box = Box::new(Orientation::Vertical, 10);
         status_box.set_margin_top(10);
         let shard_list = ListBox::new();
         shard_list.add_css_class("shard-list");
-        let row_box = Box::new(Orientation::Horizontal, 10);
-        let icon = Image::from_icon_name("computer-symbolic");
-        icon.set_widget_name("una-prime");
-        row_box.append(&icon);
-        row_box.append(&Label::new(Some("Una-Prime")));
-        shard_list.append(&row_box);
-        status_box.append(&shard_list);
 
+        // Helper to create row (Manual for now to keep refs)
+        // 1. Una-Prime
+        let row_una = Box::new(Orientation::Horizontal, 10);
+        row_una.set_margin_start(10);
+        let icon_una = Image::from_icon_name("computer-symbolic");
+        let label_una = Label::new(Some("Una-Prime"));
+        let spinner_una = Spinner::new();
+        row_una.append(&icon_una);
+        row_una.append(&label_una);
+        row_una.append(&spinner_una);
+        shard_list.append(&row_una);
+
+        // 2. S9-Mule
+        let row_s9 = Box::new(Orientation::Horizontal, 10);
+        row_s9.set_margin_start(10);
+        let icon_s9 = Image::from_icon_name("network-server-symbolic");
+        let label_s9 = Label::new(Some("S9-Mule"));
+        let spinner_s9 = Spinner::new();
+        row_s9.append(&icon_s9);
+        row_s9.append(&label_s9);
+        row_s9.append(&spinner_s9);
+        shard_list.append(&row_s9);
+
+        status_box.append(&shard_list);
         sidebar_stack.add_titled(&status_box, Some("status"), "Status");
 
         sidebar_box.append(&sidebar_stack);
@@ -107,6 +159,7 @@ impl CommsSpline {
             .buffer(&text_buffer)
             .margin_start(12).margin_end(12).margin_top(12).margin_bottom(12)
             .build();
+        console_text_view.add_css_class("console");
 
         let text_buffer_clone = text_buffer.clone();
         let scrolled_window_adj_clone = scrolled_window.vadjustment();
@@ -118,6 +171,9 @@ impl CommsSpline {
         // Input Area (Bottom Pane)
         let input_container = Box::new(Orientation::Horizontal, 8);
         input_container.set_valign(Align::Fill);
+        input_container.set_margin_start(10);
+        input_container.set_margin_end(10);
+        input_container.set_margin_bottom(10);
 
         // Input Field
         let input_scroll = ScrolledWindow::builder()
@@ -159,6 +215,26 @@ impl CommsSpline {
 
         let tx_clone_send = tx_event.clone();
         let buffer = text_view.buffer();
+
+        // --- ENTER KEY HANDLER ---
+        let key_controller = EventControllerKey::new();
+        let tx_clone_key = tx_event.clone();
+        let buffer_key = buffer.clone();
+        key_controller.connect_key_pressed(move |_ctrl, key, _keycode, state| {
+            if key == Key::Return && !state.contains(ModifierType::SHIFT_MASK) {
+                let (start, end) = buffer_key.bounds();
+                let text = buffer_key.text(&start, &end, false).to_string();
+                if !text.trim().is_empty() {
+                    let _ = tx_clone_key.send_blocking(Event::Input(text));
+                    buffer_key.set_text("");
+                }
+                return glib::Propagation::Stop;
+            }
+            glib::Propagation::Proceed
+        });
+        text_view.add_controller(key_controller);
+
+        // Click Handler
         send_btn.connect_clicked(move |_| {
             let (start, end) = buffer.bounds();
             let text = buffer.text(&start, &end, false).to_string();
@@ -178,6 +254,53 @@ impl CommsSpline {
         let sidebar_box_clone = sidebar_box.clone();
         sidebar_toggle.connect_toggled(move |btn| {
             sidebar_box_clone.set_visible(btn.is_active());
+        });
+
+        // --- STATUS UPDATE LOOP ---
+        let label_una_clone = label_una.clone();
+        let spinner_una_clone = spinner_una.clone();
+        let label_s9_clone = label_s9.clone();
+        let spinner_s9_clone = spinner_s9.clone();
+
+        glib::MainContext::default().spawn_local(async move {
+            while let Ok(update) = rx.recv().await {
+                match update {
+                    GuiUpdate::ShardStatusChanged { id, status } => {
+                        let (spinner, label, name) = if id == "una-prime" {
+                            (&spinner_una_clone, &label_una_clone, "Una-Prime")
+                        } else if id == "s9-mule" {
+                            (&spinner_s9_clone, &label_s9_clone, "S9-Mule")
+                        } else {
+                            continue;
+                        };
+
+                        match status {
+                            ShardStatus::Thinking => {
+                                spinner.start();
+                                label.set_text(&format!("{} (Thinking)", name));
+                            }
+                            ShardStatus::Online => {
+                                spinner.stop();
+                                label.set_text(name);
+                            }
+                            ShardStatus::Error => {
+                                spinner.stop();
+                                label.set_text(&format!("{} (Error)", name));
+                            }
+                            _ => {
+                                spinner.stop();
+                                label.set_text(&format!("{} ({:?})", name, status));
+                            }
+                        }
+                    }
+                    GuiUpdate::SidebarStatus(state) => {
+                         // Update generic status or both?
+                         // For now, let ShardStatusChanged handle individual spinners.
+                         // WolfpackState might be global.
+                    }
+                    _ => {}
+                }
+            }
         });
 
         // --- POLYMORPHIC RETURN ---

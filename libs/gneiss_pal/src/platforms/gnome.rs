@@ -34,7 +34,7 @@ pub struct Backend<A: AppHandler> {
 impl<A: AppHandler> Backend<A> {
     // S40: Updated signature to accept bootstrap_fn
     pub fn new<F>(app_id: &str, app_handler: A, rx: Receiver<GuiUpdate>, bootstrap_fn: F) -> Self
-    where F: Fn(&ApplicationWindow, async_channel::Sender<Event>) -> gtk4::Widget + 'static
+    where F: Fn(&ApplicationWindow, async_channel::Sender<Event>, Receiver<GuiUpdate>) -> gtk4::Widget + 'static
     {
         // Ensure resources are registered
         crate::register_resources();
@@ -61,9 +61,10 @@ impl<A: AppHandler> Backend<A> {
         });
 
         let bootstrap_rc = Rc::new(bootstrap_fn);
+        let rx_clone = rx.clone(); // Clone channel receiver (async-channel is multi-consumer)
 
         app.connect_activate(move |app| {
-            build_ui(app, rx.clone(), bootstrap_rc.clone(), tx_event.clone());
+            build_ui(app, rx_clone.clone(), bootstrap_rc.clone(), tx_event.clone());
         });
         app.run();
 
@@ -76,11 +77,11 @@ impl<A: AppHandler> Backend<A> {
 
 fn build_ui<F>(
     app: &Application,
-    _rx: Receiver<GuiUpdate>,
+    rx: Receiver<GuiUpdate>,
     bootstrap: Rc<F>,
     tx_event: async_channel::Sender<Event>
 )
-where F: Fn(&ApplicationWindow, async_channel::Sender<Event>) -> gtk4::Widget + 'static
+where F: Fn(&ApplicationWindow, async_channel::Sender<Event>, Receiver<GuiUpdate>) -> gtk4::Widget + 'static
 {
     let ui_build_start_time = Instant::now();
     info!("UI_BUILD: Starting build_ui function (Adwaita Spline).");
@@ -103,7 +104,7 @@ where F: Fn(&ApplicationWindow, async_channel::Sender<Event>) -> gtk4::Widget + 
 
     let gtk_window = window.upcast_ref::<gtk4::ApplicationWindow>();
 
-    let content = bootstrap(gtk_window, tx_event);
+    let content = bootstrap(gtk_window, tx_event, rx);
 
     // AdwApplicationWindow content
     window.set_content(Some(&content));

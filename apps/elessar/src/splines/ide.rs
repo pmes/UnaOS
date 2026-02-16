@@ -14,6 +14,7 @@ use std::cell::RefCell;
 use std::fs;
 use std::path::PathBuf;
 use std::thread_local;
+use async_channel::Receiver;
 
 // Import Adwaita if feature is enabled
 #[cfg(feature = "gnome")]
@@ -39,7 +40,7 @@ impl IdeSpline {
     }
 
     // Accepts IsA<Window> to be polymorphic
-    pub fn bootstrap<W: IsA<Window> + IsA<Widget> + Cast>(&self, _window: &W, tx_event: async_channel::Sender<Event>) -> Widget {
+    pub fn bootstrap<W: IsA<Window> + IsA<Widget> + Cast>(&self, _window: &W, tx_event: async_channel::Sender<Event>, rx: Receiver<GuiUpdate>) -> Widget {
         // --- HEADER BAR ---
         let header_bar = HeaderBar::new();
 
@@ -184,6 +185,13 @@ impl IdeSpline {
             &provider,
             gtk4::STYLE_PROVIDER_PRIORITY_APPLICATION,
         );
+
+        // --- RX LOOP (Drain) ---
+        glib::MainContext::default().spawn_local(async move {
+            while let Ok(_update) = rx.recv().await {
+                // Drain messages
+            }
+        });
 
         // --- POLYMORPHIC RETURN ---
         #[cfg(feature = "gnome")]

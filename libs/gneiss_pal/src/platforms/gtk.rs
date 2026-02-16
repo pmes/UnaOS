@@ -37,9 +37,9 @@ impl<A: AppHandler> Backend<A> {
     // But `vein` is the only consumer.
     // I will add a `bootstrap_fn` argument.
 
-    // Using a callback: `Fn(&Window, Sender<Event>) -> Widget`
+    // Using a callback: `Fn(&Window, Sender<Event>, Receiver<GuiUpdate>) -> Widget`
     pub fn new<F>(app_id: &str, app_handler: A, rx: Receiver<GuiUpdate>, bootstrap_fn: F) -> Self
-    where F: Fn(&ApplicationWindow, async_channel::Sender<Event>) -> gtk4::Widget + 'static
+    where F: Fn(&ApplicationWindow, async_channel::Sender<Event>, Receiver<GuiUpdate>) -> gtk4::Widget + 'static
     {
         // Ensure resources are registered
         crate::register_resources();
@@ -72,9 +72,10 @@ impl<A: AppHandler> Backend<A> {
         // We also need the `rx` (GuiUpdate) loop.
 
         let bootstrap_rc = Rc::new(bootstrap_fn);
+        let rx_clone = rx.clone();
 
         app.connect_activate(move |app| {
-            build_ui(app, rx.clone(), bootstrap_rc.clone(), tx_event.clone());
+            build_ui(app, rx_clone.clone(), bootstrap_rc.clone(), tx_event.clone());
         });
         app.run();
 
@@ -91,7 +92,7 @@ fn build_ui<F>(
     bootstrap: Rc<F>,
     tx_event: async_channel::Sender<Event>
 )
-where F: Fn(&ApplicationWindow, async_channel::Sender<Event>) -> gtk4::Widget + 'static
+where F: Fn(&ApplicationWindow, async_channel::Sender<Event>, Receiver<GuiUpdate>) -> gtk4::Widget + 'static
 {
     let ui_build_start_time = Instant::now();
     info!("UI_BUILD: Starting build_ui function (Spline Mode).");
@@ -106,7 +107,7 @@ where F: Fn(&ApplicationWindow, async_channel::Sender<Event>) -> gtk4::Widget + 
 
     // --- BOOTSTRAP THE SPLINE ---
     // S40: "Window content to change entirely"
-    let content = bootstrap(&window, tx_event);
+    let content = bootstrap(&window, tx_event, rx);
     window.set_child(Some(&content));
 
     window.present();
@@ -156,13 +157,12 @@ where F: Fn(&ApplicationWindow, async_channel::Sender<Event>) -> gtk4::Widget + 
     // `VeinApp` can call that.
 
     // So `rx` loop might be dead code for Elessar, but we keep it to satisfy the compiler/legacy.
-
-    glib::MainContext::default().spawn_local(async move {
-        while let Ok(_update) = rx.recv().await {
-            // Legacy loop - effectively silent for Elessar Spline
-            // Unless we want to support ShardStatus later.
-        }
-    });
+    // NOTE: The bootstrap function is now responsible for handling RX updates if it cares about them.
+    // If not, the channel will fill up unless we drain it, but bootstrap takes ownership of a clone/receiver.
+    // We passed `rx` to bootstrap. We should not drain it here unless we clone it, which we did.
+    // Wait, `Receiver` is multi-consumer (async-channel).
+    // If we drain it here, `bootstrap` might lose messages.
+    // So we REMOVE the drain loop here. Bootstrap owns the logic.
 }
 
 // ... helper functions (set_margins etc) can be removed or kept if used by other modules?

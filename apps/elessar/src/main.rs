@@ -102,7 +102,7 @@ fn main() {
     let ide_spline_clone = ide_spline.clone();
 
     // S40: Bootstrap into IdeSpline
-    Backend::new("org.unaos.elessar", app, gui_rx, move |window, tx| {
-        ide_spline_clone.bootstrap(window, tx)
+    Backend::new("org.unaos.elessar", app, gui_rx, move |window, tx, rx| {
+        ide_spline_clone.bootstrap(window, tx, rx)
     });
 }

@@ -728,8 +728,8 @@ fn main() {
     let comms_spline_clone = comms_spline.clone();
 
     // Pass the closure to Backend
-    Backend::new("org.unaos.vein.evolution", app, gui_rx, move |window, tx| {
-        comms_spline_clone.bootstrap(window, tx)
+    Backend::new("org.unaos.vein.evolution", app, gui_rx, move |window, tx, rx| {
+        comms_spline_clone.bootstrap(window, tx, rx)
     });
 
     info!("SHUTDOWN: UI Backend runtime complete. Total application runtime: {:?}", app_start_time.elapsed());
