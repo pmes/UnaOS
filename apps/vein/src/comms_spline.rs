@@ -4,8 +4,8 @@ use gtk4::{
     PolicyType, Align, ListBox, Separator, StackTransitionType, TextView,
     TextBuffer, HeaderBar, StackSwitcher, ToggleButton, Image,
     Paned, ApplicationWindow, Widget, Window, CssProvider, StyleContext,
-    EventControllerKey, Spinner,
-    gdk::{Key, ModifierType}
+    EventControllerKey, Spinner, MenuButton, Popover,
+    gdk::{Key, ModifierType}, PropagationPhase
 };
 use async_channel::Receiver;
 use sourceview5::View as SourceView;
@@ -26,7 +26,10 @@ impl CommsSpline {
         Self {}
     }
 
-    pub fn bootstrap<W: IsA<Window> + IsA<Widget> + Cast>(&self, _window: &W, tx_event: async_channel::Sender<Event>, rx: Receiver<GuiUpdate>) -> Widget {
+    pub fn bootstrap<W: IsA<Window> + IsA<Widget> + Cast>(&self, window: &W, tx_event: async_channel::Sender<Event>, rx: Receiver<GuiUpdate>) -> Widget {
+        // --- WINDOW TITLE ---
+        window.set_title(Some("Vein"));
+
         // --- STYLE PROVIDER ---
         let provider = CssProvider::new();
         provider.load_from_data("
@@ -45,6 +48,41 @@ impl CommsSpline {
             gtk4::STYLE_PROVIDER_PRIORITY_APPLICATION,
         );
 
+        // --- ACTIONS MENU ---
+        let menu_box = Box::new(Orientation::Vertical, 5);
+        menu_box.set_margin_start(10);
+        menu_box.set_margin_end(10);
+        menu_box.set_margin_top(10);
+        menu_box.set_margin_bottom(10);
+
+        let btn_clear = Button::with_label("Clear Console");
+        let tx_clear = tx_event.clone();
+        btn_clear.connect_clicked(move |_| {
+            let _ = tx_clear.send_blocking(Event::Input("/clear".into()));
+        });
+
+        let btn_wolf = Button::with_label("Wolfpack Mode");
+        let tx_wolf = tx_event.clone();
+        btn_wolf.connect_clicked(move |_| {
+            let _ = tx_wolf.send_blocking(Event::Input("/wolf".into()));
+        });
+
+        let btn_comms = Button::with_label("Comms Mode");
+        let tx_comms = tx_event.clone();
+        btn_comms.connect_clicked(move |_| {
+            let _ = tx_comms.send_blocking(Event::Input("/comms".into()));
+        });
+
+        menu_box.append(&btn_clear);
+        menu_box.append(&btn_wolf);
+        menu_box.append(&btn_comms);
+
+        let popover = Popover::builder().child(&menu_box).build();
+        let menu_button = MenuButton::builder()
+            .icon_name("open-menu-symbolic")
+            .popover(&popover)
+            .build();
+
         // --- HEADER BAR (Polymorphic) ---
         let sidebar_toggle = ToggleButton::builder()
             .icon_name("sidebar-show-symbolic")
@@ -56,6 +94,7 @@ impl CommsSpline {
         let header_bar = {
             let hb = adw::HeaderBar::new();
             hb.pack_start(&sidebar_toggle);
+            hb.pack_end(&menu_button);
             hb
         };
 
@@ -63,6 +102,7 @@ impl CommsSpline {
         let header_bar = {
             let hb = HeaderBar::new();
             hb.pack_start(&sidebar_toggle);
+            hb.pack_end(&menu_button);
             hb.set_show_title_buttons(true);
             hb
         };
@@ -216,8 +256,9 @@ impl CommsSpline {
         let tx_clone_send = tx_event.clone();
         let buffer = text_view.buffer();
 
-        // --- ENTER KEY HANDLER ---
+        // --- ENTER KEY HANDLER (CAPTURE PHASE) ---
         let key_controller = EventControllerKey::new();
+        key_controller.set_propagation_phase(PropagationPhase::Capture);
         let tx_clone_key = tx_event.clone();
         let buffer_key = buffer.clone();
         key_controller.connect_key_pressed(move |_ctrl, key, _keycode, state| {
@@ -294,9 +335,7 @@ impl CommsSpline {
                         }
                     }
                     GuiUpdate::SidebarStatus(state) => {
-                         // Update generic status or both?
-                         // For now, let ShardStatusChanged handle individual spinners.
-                         // WolfpackState might be global.
+                         // Optional: Global Pulse
                     }
                     _ => {}
                 }
@@ -315,7 +354,7 @@ impl CommsSpline {
         #[cfg(not(feature = "gnome"))]
         {
             // GTK Mode: Set titlebar on window
-            if let Some(app_win) = _window.dynamic_cast_ref::<gtk4::ApplicationWindow>() {
+            if let Some(app_win) = window.dynamic_cast_ref::<gtk4::ApplicationWindow>() {
                 app_win.set_titlebar(Some(&header_bar));
             }
             body_box.into()

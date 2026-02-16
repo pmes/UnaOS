@@ -40,9 +40,15 @@ impl IdeSpline {
     }
 
     // Accepts IsA<Window> to be polymorphic
-    pub fn bootstrap<W: IsA<Window> + IsA<Widget> + Cast>(&self, _window: &W, tx_event: async_channel::Sender<Event>, rx: Receiver<GuiUpdate>) -> Widget {
+    pub fn bootstrap<W: IsA<Window> + IsA<Widget> + Cast>(&self, window: &W, tx_event: async_channel::Sender<Event>, rx: Receiver<GuiUpdate>) -> Widget {
+        // --- WINDOW TITLE ---
+        window.set_title(Some("Elessar (UnaOS)"));
+
         // --- HEADER BAR ---
         let header_bar = HeaderBar::new();
+        // Elessar doesn't need a toggle button strictly if using Adwaita Split View in future,
+        // but for now we keep it standard.
+        // Or keep it clean.
 
         // --- MAIN CONTAINER ---
         let main_box = Box::new(Orientation::Horizontal, 0);
@@ -205,7 +211,7 @@ impl IdeSpline {
         #[cfg(not(feature = "gnome"))]
         {
             // GTK Mode: Set titlebar on window
-            if let Some(app_win) = _window.dynamic_cast_ref::<gtk4::ApplicationWindow>() {
+            if let Some(app_win) = window.dynamic_cast_ref::<gtk4::ApplicationWindow>() {
                 app_win.set_titlebar(Some(&header_bar));
             }
             main_box.into()
