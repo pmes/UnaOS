@@ -5,11 +5,12 @@ edition = "2021"
 
 [features]
 default = ["gtk"]
-gtk = ["gneiss_pal/gtk"]
-gnome = ["gneiss_pal/gnome", "dep:libadwaita"]
+gtk = ["quartzite/gtk"]
+gnome = ["quartzite/gnome", "dep:libadwaita"]
 
 [dependencies]
 gneiss_pal = { path = "../../libs/gneiss_pal" }
+quartzite = { path = "../../libs/quartzite" }
 reqwest = { version = "0.11", features = ["json", "stream", "multipart"] }
 tokio = { version = "1.36", features = ["full"] }
 dotenvy = "0.15"
@@ -23,5 +24,4 @@ glib = "0.20"
 async-channel = "2.1"
 octocrab = "0.38"
 chrono = "0.4"
-sourceview5 = "0.9"
 libadwaita = { version = "0.7.2", features = ["v1_4"], optional = true }

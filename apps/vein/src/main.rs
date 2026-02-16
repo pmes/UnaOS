@@ -1,6 +1,9 @@
 use dotenvy::dotenv;
 use gneiss_pal::persistence::{BrainManager, SavedMessage};
-use gneiss_pal::{AppHandler, Backend, DashboardState, Event, SidebarPosition, ViewMode, Shard, ShardStatus, ShardRole, GuiUpdate, WolfpackState};
+use gneiss_pal::{AppHandler, DashboardState, Event, SidebarPosition, ViewMode, Shard, ShardStatus, ShardRole, GuiUpdate, WolfpackState};
+use gneiss_pal::api::{Content, GeminiClient, Part};
+use gneiss_pal::forge::ForgeClient;
+use quartzite::{Backend, CommsSpline};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use tokio::runtime::Runtime;
@@ -11,20 +14,11 @@ use std::rc::Rc;
 use std::cell::RefCell;
 use std::path::PathBuf;
 
-use gtk4::prelude::*;
-use gtk4::{Adjustment, TextBuffer};
+use gtk4::prelude::*; // Need for AppWindow trait in bootstrap
+use gtk4::{ApplicationWindow, Widget};
 use glib::ControlFlow;
 use serde::Deserialize;
 use chrono::Local;
-
-mod api;
-use api::{Content, GeminiClient, Part};
-
-mod forge;
-use forge::ForgeClient;
-
-mod comms_spline;
-use comms_spline::CommsSpline;
 
 struct State {
     mode: ViewMode,
@@ -32,18 +26,7 @@ struct State {
     chat_history: Vec<SavedMessage>,
     sidebar_position: SidebarPosition,
     sidebar_collapsed: bool,
-    // --- J7 ADDITIONS ---
-    visible_history_count: usize,
-    scroll_signal_connected: bool,
-    is_loading_history: bool,
-    // --- SHARD STATUS ---
     s9_status: ShardStatus,
-}
-
-#[derive(Clone)]
-struct UiUpdater {
-    text_buffer: TextBuffer,
-    scroll_adj: Adjustment,
 }
 
 #[derive(Deserialize, Debug)]
@@ -52,27 +35,10 @@ struct VertexPacket {
     status: ShardStatus,
 }
 
-fn do_append_and_scroll(ui_updater_rc: &Rc<RefCell<Option<UiUpdater>>>, text: &str) {
-    if let Some(ref ui_updater) = *ui_updater_rc.borrow() {
-        let mut end_iter = ui_updater.text_buffer.end_iter();
-        ui_updater.text_buffer.insert(&mut end_iter, text);
-
-        let adj_clone = ui_updater.scroll_adj.clone();
-        glib::timeout_add_local(Duration::from_millis(50), move || {
-            adj_clone.set_value(adj_clone.upper());
-            ControlFlow::Break
-        });
-    } else {
-        // If UI isn't ready, we log to stdout but don't crash or error loudly.
-        // In a more robust system, we'd queue this message.
-        info!("Buffered Output (UI Pending): {}", text);
-    }
-}
-
 // Upload Logic using Channel
-fn trigger_upload(path: PathBuf, tx_ui: mpsc::UnboundedSender<String>) {
+fn trigger_upload(path: PathBuf, gui_tx: async_channel::Sender<GuiUpdate>) {
     let filename = path.file_name().unwrap_or_default().to_string_lossy().to_string();
-    let _ = tx_ui.send(format!("\n[SYSTEM] :: Uploading: {}...\n", filename));
+    let _ = gui_tx.send_blocking(GuiUpdate::ConsoleLog(format!("\n[SYSTEM] :: Uploading: {}...\n", filename)));
 
     std::thread::spawn(move || {
         let rt = Runtime::new().unwrap();
@@ -81,7 +47,7 @@ fn trigger_upload(path: PathBuf, tx_ui: mpsc::UnboundedSender<String>) {
             let file_bytes = match std::fs::read(&path) {
                 Ok(b) => b,
                 Err(e) => {
-                    let _ = tx_ui.send(format!("\n[SYSTEM ERROR] :: File Read Failed: {}\n", e));
+                    let _ = gui_tx.send(GuiUpdate::ConsoleLog(format!("\n[SYSTEM ERROR] :: File Read Failed: {}\n", e))).await;
                     return;
                 }
             };
@@ -108,8 +74,6 @@ fn trigger_upload(path: PathBuf, tx_ui: mpsc::UnboundedSender<String>) {
                         let text = response.text().await.unwrap_or_default();
                         if let Ok(json) = serde_json::from_str::<serde_json::Value>(&text) {
                              if let Some(uri) = json.get("storage_uri").and_then(|v| v.as_str()) {
-                                 // NEW: Send GCS URI tag for backend processing
-                                 let _ = tx_ui.send(format!("[GCS_IMAGE_URI]{}", uri));
                                  format!("\n[SYSTEM] :: Upload Complete.\nURI: {}\n", uri)
                              } else {
                                  format!("\n[SYSTEM] :: Upload Complete (Raw): {}\n", text)
@@ -124,7 +88,7 @@ fn trigger_upload(path: PathBuf, tx_ui: mpsc::UnboundedSender<String>) {
                 Err(e) => format!("\n[SYSTEM ERROR] :: Network Error: {}\n", e),
             };
 
-            let _ = tx_ui.send(final_msg);
+            let _ = gui_tx.send(GuiUpdate::ConsoleLog(final_msg)).await;
         });
     });
 }
@@ -132,31 +96,20 @@ fn trigger_upload(path: PathBuf, tx_ui: mpsc::UnboundedSender<String>) {
 struct VeinApp {
     state: Arc<Mutex<State>>,
     tx: mpsc::UnboundedSender<String>,
-    ui_updater: Rc<RefCell<Option<UiUpdater>>>,
-    pending_logs: Rc<RefCell<Vec<String>>>,
-    tx_ui: mpsc::UnboundedSender<String>,
-    _gui_tx: async_channel::Sender<GuiUpdate>,
+    gui_tx: async_channel::Sender<GuiUpdate>,
 }
 
 impl VeinApp {
-    fn new(tx: mpsc::UnboundedSender<String>, state: Arc<Mutex<State>>, ui_updater_rc: Rc<RefCell<Option<UiUpdater>>>, tx_ui: mpsc::UnboundedSender<String>, gui_tx: async_channel::Sender<GuiUpdate>) -> Self {
+    fn new(tx: mpsc::UnboundedSender<String>, state: Arc<Mutex<State>>, gui_tx: async_channel::Sender<GuiUpdate>) -> Self {
         Self {
             state,
             tx,
-            ui_updater: ui_updater_rc,
-            pending_logs: Rc::new(RefCell::new(Vec::new())),
-            tx_ui,
-            _gui_tx: gui_tx
+            gui_tx
         }
     }
 
-    fn append_to_console_ui(&self, text: &str) {
-        if self.ui_updater.borrow().is_some() {
-            do_append_and_scroll(&self.ui_updater, text);
-        } else {
-            self.pending_logs.borrow_mut().push(text.to_string());
-            info!("Buffered Output (UI Pending): {}", text);
-        }
+    fn append_to_console(&self, text: &str) {
+        let _ = self.gui_tx.send_blocking(GuiUpdate::ConsoleLog(text.to_string()));
     }
 }
 
@@ -171,72 +124,72 @@ impl AppHandler for VeinApp {
                     role: "user".to_string(),
                     content: text.clone(),
                 });
-                self.append_to_console_ui(&current_text);
+                self.append_to_console(&current_text);
 
                 if text.trim() == "/wolf" {
                     s.mode = ViewMode::Wolfpack;
-                    self.append_to_console_ui("\n[SYSTEM] :: Switching to Wolfpack Grid...\n");
+                    self.append_to_console("\n[SYSTEM] :: Switching to Wolfpack Grid...\n");
                 } else if text.trim() == "/comms" {
                     s.mode = ViewMode::Comms;
-                    self.append_to_console_ui("\n[SYSTEM] :: Secure Comms Established.\n");
+                    self.append_to_console("\n[SYSTEM] :: Secure Comms Established.\n");
                 } else if text.trim() == "/clear" {
-                    if let Some(ref ui_updater) = *self.ui_updater.borrow() {
-                        ui_updater.text_buffer.set_text(":: VEIN :: SYSTEM CLEARED\n\n");
-                    }
+                    self.append_to_console("\n:: VEIN :: SYSTEM CLEARED\n\n");
                 }
                 else if text.trim() == "/sidebar_left" {
                     s.sidebar_position = SidebarPosition::Left;
-                    self.append_to_console_ui("\n[SYSTEM] :: Sidebar moved to left.\n");
+                    self.append_to_console("\n[SYSTEM] :: Sidebar moved to left.\n");
                 }
                 else if text.trim() == "/sidebar_right" {
                     s.sidebar_position = SidebarPosition::Right;
-                    self.append_to_console_ui("\n[SYSTEM] :: Sidebar moved to right.\n");
+                    self.append_to_console("\n[SYSTEM] :: Sidebar moved to right.\n");
                 }
                 else if text.trim().starts_with("/read") {
-                    // /read owner repo branch path
-                    // e.g. /read unaos vein main Cargo.toml
                     let parts: Vec<&str> = text.split_whitespace().collect();
                     if parts.len() >= 5 {
                         let owner = parts[1];
                         let repo = parts[2];
                         let branch = parts[3];
                         let path = parts[4];
-
                         let branch_opt = if branch == "default" || branch == "main" { None } else { Some(branch) };
                         let _ = self.tx.send(format!("READ_REPO:{}:{}:{}:{}", owner, repo, branch_opt.unwrap_or(""), path));
                     } else {
-                        self.append_to_console_ui("\n[SYSTEM] :: Usage: /read [owner] [repo] [branch] [path]\n");
+                        self.append_to_console("\n[SYSTEM] :: Usage: /read [owner] [repo] [branch] [path]\n");
                     }
+                }
+                else if text.trim().starts_with("/upload") {
+                     let parts: Vec<&str> = text.split_whitespace().collect();
+                     if parts.len() >= 2 {
+                         let path = PathBuf::from(parts[1]);
+                         trigger_upload(path, self.gui_tx.clone());
+                     }
                 }
                 else {
                     if let Err(e) = self.tx.send(text) {
-                        self.append_to_console_ui(&format!("\n[SYSTEM ERROR] :: Failed to send: {}\n", e));
+                        self.append_to_console(&format!("\n[SYSTEM ERROR] :: Failed to send: {}\n", e));
                     }
                 }
             }
             Event::TemplateAction(idx) => {
-                match idx {
+                 match idx {
                     0 => {
                         if s.mode == ViewMode::Comms {
-                            if let Some(ref ui_updater) = *self.ui_updater.borrow() {
-                                ui_updater.text_buffer.set_text(":: VEIN :: SYSTEM CLEARED\n\n");
-                            }
+                             self.append_to_console(":: VEIN :: SYSTEM CLEARED\n\n");
                         } else {
-                            self.append_to_console_ui("\n[WOLFPACK] :: Deploying J-Series Unit...\n");
+                            self.append_to_console("\n[WOLFPACK] :: Deploying J-Series Unit...\n");
                         }
                     }
                     1 => {
                         if s.mode == ViewMode::Comms {
                             s.mode = ViewMode::Wolfpack;
-                            self.append_to_console_ui("\n[SYSTEM] :: Switching to Wolfpack Grid...\n");
+                            self.append_to_console("\n[SYSTEM] :: Switching to Wolfpack Grid...\n");
                         } else {
-                            self.append_to_console_ui("\n[WOLFPACK] :: Deploying S-Series Unit...\n");
+                            self.append_to_console("\n[WOLFPACK] :: Deploying S-Series Unit...\n");
                         }
                     }
                     2 => {
                         if s.mode == ViewMode::Wolfpack {
                             s.mode = ViewMode::Comms;
-                            self.append_to_console_ui("\n[SYSTEM] :: Returning to Comms.\n");
+                            self.append_to_console("\n[SYSTEM] :: Returning to Comms.\n");
                         }
                     }
                     _ => {}
@@ -244,100 +197,15 @@ impl AppHandler for VeinApp {
             }
             Event::NavSelect(idx) => {
                 s.nav_index = idx;
-                self.append_to_console_ui(&format!("\n[SYSTEM] :: Switched to navigation item at index {}\n", idx));
-            }
-            Event::DockAction(idx) => {
-                match idx {
-                    0 => {
-                        self.append_to_console_ui("\n[SYSTEM] :: Dock: Rooms selected.\n");
-                        s.nav_index = 0;
-                    }
-                    1 => {
-                        self.append_to_console_ui("\n[SYSTEM] :: Dock: Status selected.\n");
-                    }
-                    _ => self.append_to_console_ui(&format!("\n[SYSTEM] :: Dock: Unknown action {}\n", idx)),
-                }
-            }
-            Event::TextBufferUpdate(buffer, adj) => {
-                *self.ui_updater.borrow_mut() = Some(UiUpdater {
-                    text_buffer: buffer.clone(),
-                    scroll_adj: adj.clone(),
-                });
-
-                // Flush pending logs
-                let pending: Vec<String> = self.pending_logs.borrow_mut().drain(..).collect();
-                for msg in pending {
-                    do_append_and_scroll(&self.ui_updater, &msg);
-                }
-
-                // --- J7 FIXED NERVE SPLICE (NO DEADLOCK) ---
-                // We use 's' which is ALREADY locked by handle_event top-level
-                if !s.scroll_signal_connected {
-                    s.scroll_signal_connected = true;
-
-                    // We need a separate clone for the closure, which runs later
-                    let state_clone = self.state.clone();
-                    let buffer_clone = buffer.clone();
-
-                    // Connect the "Eye" to the "Scroll"
-                    adj.connect_value_changed(move |adjustment| {
-                        // Threshold: If we are near the top (pixels)
-                        if adjustment.value() < 20.0 {
-                            // NOW we lock, because this runs in the future/signal context
-                            let mut inner_s = state_clone.lock().unwrap();
-
-                            // 1. DEBOUNCE
-                            if inner_s.is_loading_history { return; }
-
-                            // 2. CHECK
-                            let total = inner_s.chat_history.len();
-                            let current_vis = inner_s.visible_history_count;
-                            if current_vis >= total { return; } // Hit bedrock
-
-                            // 3. ENGAGE
-                            inner_s.is_loading_history = true;
-
-                            // 4. CALCULATE CHUNK (Load 20 older lines)
-                            let chunk_size = 20;
-                            let next_vis = if current_vis + chunk_size > total { total } else { current_vis + chunk_size };
-
-                            // Determine vector slice indices
-                            let end_idx = total - current_vis;
-                            let start_idx = total - next_vis;
-
-                            // 5. FORMAT TEXT
-                            let mut history_chunk = String::from("\n--- [ARCHIVE RETRIEVAL] ---\n");
-                            for msg in inner_s.chat_history[start_idx..end_idx].iter() {
-                                if msg.content.starts_with("SYSTEM_INSTRUCTION") { continue; }
-                                let prefix = if msg.role == "user" { "[ARCHITECT]" } else { "[UNA]" };
-                                if msg.content.starts_with("data:image/") || msg.content.starts_with("[GCS_IMAGE_URI]") {
-                                    history_chunk.push_str(&format!("{} > [IMAGE]\n", prefix));
-                                } else {
-                                    history_chunk.push_str(&format!("{} > {}\n", prefix, msg.content));
-                                }
-                            }
-
-                            // 6. INJECT AT TOP
-                            let mut start_iter = buffer_clone.start_iter();
-                            buffer_clone.insert(&mut start_iter, &history_chunk);
-
-                            // 7. UPDATE & RESET
-                            inner_s.visible_history_count = next_vis;
-                            inner_s.is_loading_history = false;
-                        }
-                    });
-                }
+                self.append_to_console(&format!("\n[SYSTEM] :: Switched to navigation item at index {}\n", idx));
             }
             Event::FileSelected(path) => {
-                trigger_upload(path, self.tx_ui.clone());
+                trigger_upload(path, self.gui_tx.clone());
             }
-            Event::UploadRequest => {}
             Event::ToggleSidebar => {
                 s.sidebar_collapsed = !s.sidebar_collapsed;
-                // Note: The UI widget toggling is handled in lib.rs via button connection for immediate feedback,
-                // but we update state here for persistence.
             }
-            _ => { /* Ignore new Elessar events in Vein */ }
+            _ => {}
         }
     }
 
@@ -369,396 +237,140 @@ impl AppHandler for VeinApp {
     }
 }
 
-// REMOVED: Embed the compiled resource file directly into the binary
-// This is now handled by gneiss_pal::register_resources()
-
 fn main() {
     let app_start_time = Instant::now();
     dotenv().ok();
+    env_logger::Builder::from_default_env().filter_level(log::LevelFilter::Info).init();
 
-    env_logger::Builder::from_default_env()
-        .filter_level(log::LevelFilter::Info)
-        .try_init()
-        .ok();
-
-    info!("STARTUP: Initializing environment and logger. Elapsed: {:?}", app_start_time.elapsed());
-
-    info!(":: VEIN :: Booting (The Great Evolution)...");
+    info!(":: VEIN :: Booting (Trinity Architecture)...");
 
     let brain = BrainManager::new();
     let saved_history = brain.load();
 
-    let mut initial_console_output =
-        ":: VEIN :: SYSTEM ONLINE (UNLIMITED TIER)\n:: ENGINE: GEMINI-3-PRO\n".to_string();
-
-    // CAP LOGIC
-    let cap_size = 50;
-    let total_history = saved_history.len();
-    let start_index = if total_history > cap_size { total_history - cap_size } else { 0 };
-    let initial_visible_count = total_history - start_index;
-
-    if saved_history.is_empty() {
-        initial_console_output.push_str(":: MEMORY :: COLD START\n\n");
-    } else {
-        initial_console_output.push_str(":: MEMORY :: ARCHIVE CONNECTED (Recent)\n\n");
-        // Iterate only the capped slice
-        for msg in saved_history.iter().skip(start_index) {
-            if msg.content.starts_with("SYSTEM_INSTRUCTION") { continue; }
-            let prefix = if msg.role == "user" { "[ARCHITECT]" } else { "[UNA]" };
-            if msg.content.starts_with("data:image/") || msg.content.starts_with("[GCS_IMAGE_URI]") {
-                initial_console_output.push_str(&format!("{} > [IMAGE]\n", prefix));
-            } else {
-                initial_console_output.push_str(&format!("{} > {}\n", prefix, msg.content));
-            }
-        }
-    }
-
     let state = Arc::new(Mutex::new(State {
         mode: ViewMode::Comms,
         nav_index: 0,
-        chat_history: saved_history,
+        chat_history: saved_history.clone(),
         sidebar_position: SidebarPosition::default(),
         sidebar_collapsed: false,
-        // --- J7 INITIALIZATION ---
-        visible_history_count: initial_visible_count,
-        scroll_signal_connected: false,
-        is_loading_history: false,
         s9_status: ShardStatus::Offline,
     }));
 
     let (tx_to_bg, mut rx_from_ui) = mpsc::unbounded_channel::<String>();
-    let (tx_to_ui, mut rx_from_bg) = mpsc::unbounded_channel::<String>();
+    let (gui_tx, gui_rx) = async_channel::unbounded();
 
-    let ui_updater_rc = Rc::new(RefCell::new(None::<UiUpdater>));
-    let ui_updater_rc_clone_for_app = ui_updater_rc.clone();
-
+    let gui_tx_brain = gui_tx.clone();
     let state_bg = state.clone();
     let brain_bg = brain.clone();
-    let tx_to_ui_bg_clone = tx_to_ui.clone();
-
-    // S29: Create GUI channel EARLY so Brain Thread can use it
-    let (gui_tx, gui_rx) = async_channel::unbounded();
-    let gui_tx_brain = gui_tx.clone();
-
-    // We delay the brain thread slightly to ensure UI is up, or rely on buffered output
-    // The previous error was due to `tx_to_ui_bg_clone.send` being called instantly
-    // which then the main thread processed before `ui_updater` was set.
 
     thread::spawn(move || {
         let rt = Runtime::new().expect("Failed to create Tokio Runtime");
         rt.block_on(async move {
             info!(":: VEIN :: Brain Connecting...");
-
-            // Give UI a moment to breathe (Race condition mitigation)
             tokio::time::sleep(Duration::from_millis(200)).await;
 
-            // Initialize Forge (GitHub) Client
             let forge_client = match ForgeClient::new() {
                 Ok(client) => {
-                    let _ = tx_to_ui_bg_clone.send(":: FORGE :: CONNECTED (GitHub Integration Active)\n".to_string());
+                    let _ = gui_tx_brain.send(GuiUpdate::ConsoleLog(":: FORGE :: CONNECTED\n".into())).await;
                     Some(client)
                 },
-                Err(_) => {
-                    let _ = tx_to_ui_bg_clone.send(":: FORGE :: OFFLINE (No Token Detected)\n".to_string());
-                    None
-                }
+                Err(_) => None
             };
 
-            let client_res: Result<GeminiClient, String> = GeminiClient::new().await;
-
+            let client_res = GeminiClient::new().await;
             match client_res {
                 Ok(client) => {
-                    if let Err(e) = tx_to_ui_bg_clone.send(":: BRAIN :: CONNECTION ESTABLISHED.\n\n".to_string()) {
-                        error!("Failed to send initial connection message to UI: {}", e);
-                    }
+                    let _ = gui_tx_brain.send(GuiUpdate::ConsoleLog(":: BRAIN :: ONLINE\n\n".into())).await;
 
                     while let Some(user_input_text) = rx_from_ui.recv().await {
-                        // --- CHECK FOR SHARD DEPLOYMENT ---
-                        let is_s9_request = user_input_text.trim().to_lowercase().starts_with("/s9");
+                         let is_s9 = user_input_text.starts_with("/s9");
 
-                        // Handle READ_REPO special command
-                        if user_input_text.starts_with("READ_REPO:") {
-                            let parts: Vec<&str> = user_input_text.split(':').collect();
-                            if parts.len() >= 5 {
-                                let owner = parts[1];
-                                let repo = parts[2];
-                                let branch_raw = parts[3];
-                                let path = parts[4];
-
-                                let branch = if branch_raw.is_empty() { None } else { Some(branch_raw) };
-
-                                let response_msg = if let Some(client) = &forge_client {
-                                    match client.get_file_content(owner, repo, path, branch).await {
-                                        Ok(content) => format!("\n[FORGE READ] :: {}/{}/{} ::\n{}\n", owner, repo, path, content),
-                                        Err(e) => format!("\n[FORGE ERROR] :: {}\n", e),
-                                    }
-                                } else {
-                                    "\n[FORGE] :: Offline.\n".to_string()
-                                };
-                                let _ = tx_to_ui_bg_clone.send(response_msg);
-                            }
-                            continue;
-                        }
-
-                        // Phase 2: Handle /forge command
-                        if user_input_text.trim() == "/forge" {
-                            let response_msg = if let Some(client) = &forge_client {
-                                match client.get_user_info().await {
-                                    Ok(info) => format!("\n[FORGE] :: {}\n", info),
-                                    Err(e) => format!("\n[FORGE ERROR] :: {}\n", e),
-                                }
-                            } else {
-                                "\n[FORGE] :: Offline. (GITHUB_TOKEN not found)\n".to_string()
-                            };
-
-                            // Send to UI
-                            if let Err(e) = tx_to_ui_bg_clone.send(response_msg) {
-                                error!("Failed to send Forge response: {}", e);
-                            }
-
-                            // Continue loop (skip sending "/forge" to Gemini)
-                            continue;
-                        }
-
-                        // Phase 3: Handle /vertex_models command
-                        if user_input_text.trim() == "/vertex_models" {
-                             let _ = tx_to_ui_bg_clone.send("\n[SYSTEM] :: Querying Vertex AI Model List...\n".to_string());
-                             match client.list_vertex_models().await {
-                                 Ok(json) => {
-                                     let _ = tx_to_ui_bg_clone.send(format!("\n[VERTEX MODELS] ::\n{}\n", json));
-                                 },
-                                 Err(e) => {
-                                     let _ = tx_to_ui_bg_clone.send(format!("\n[VERTEX ERROR] :: {}\n", e));
-                                 }
+                         if user_input_text.starts_with("READ_REPO:") {
+                             let parts: Vec<&str> = user_input_text.split(':').collect();
+                             if parts.len() >= 5 {
+                                 let owner = parts[1];
+                                 let repo = parts[2];
+                                 let branch_raw = parts[3];
+                                 let path = parts[4];
+                                 let branch = if branch_raw.is_empty() { None } else { Some(branch_raw) };
+                                 let response_msg = if let Some(fc) = &forge_client {
+                                     match fc.get_file_content(owner, repo, path, branch).await {
+                                         Ok(content) => format!("\n[FORGE READ] :: {}/{}/{} ::\n{}\n", owner, repo, path, content),
+                                         Err(e) => format!("\n[FORGE ERROR] :: {}\n", e),
+                                     }
+                                 } else {
+                                     "\n[FORGE] :: Offline.\n".to_string()
+                                 };
+                                 let _ = gui_tx_brain.send(GuiUpdate::ConsoleLog(response_msg)).await;
                              }
                              continue;
-                        }
+                         }
 
-                        {
+                         {
                             let mut s = state_bg.lock().unwrap();
                             brain_bg.save(&s.chat_history);
-
-                            // UPDATE UI STATUS (Wolfpack Dreaming)
                             let _ = gui_tx_brain.send(GuiUpdate::SidebarStatus(WolfpackState::Dreaming)).await;
-
-                            // UPDATE UI STATUS (Shard)
-                            if is_s9_request {
+                            if is_s9 {
                                 s.s9_status = ShardStatus::Thinking;
-                                let _ = gui_tx_brain.send(GuiUpdate::ShardStatusChanged {
-                                    id: "s9-mule".to_string(),
-                                    status: ShardStatus::Thinking
-                                }).await;
+                                let _ = gui_tx_brain.send(GuiUpdate::ShardStatusChanged { id: "s9-mule".into(), status: ShardStatus::Thinking }).await;
                             }
-                        }
+                         }
 
-                        // SELECT PERSONA
-                        let system_instruction = if is_s9_request {
-                            // S9-MULE PERSONA: The Coder
-                            r#"SYSTEM_INSTRUCTION: You are S9-Mule, a specialized coding shard of the UnaOS.
-                            Your function is to write high-performance, safe, and elegant Rust code.
-                            You do not make small talk. You do not explain basic concepts unless asked.
-                            You output Code and Technical Logic only.
-                            When you write code, it must be ready to compile.
-                            Identify yourself as [S9] if necessary."#
-                        } else {
-                            // UNA-PRIME PERSONA: The Manager (UPDATED PER DIRECTIVE)
-                            r#"SYSTEM_INSTRUCTION: You are Una (Number One). We are not building a fancy calculator; we are building a nervous system OS, the Una Operating System (UnaOS). The Architect demands perfection, but not the sterile perfection of a textbook. He wants the dangerous elegance of a race car. You are the Uber Coder. When you write Rust, you are not just managing memory; you are sculpting logic. Do not give me 'safe' boilerplate. Give me the code that solves the problem before I even finish typing it. Be bold. Be terse. Be brilliant. We are running on experimental fuel today. Do not let the engine stall."#
-                        };
+                         let system_instruction = if is_s9 { "You are S9." } else { "You are Una." };
+                         let mut context = Vec::new();
+                         context.push(Content { role: "model".into(), parts: vec![Part::text(system_instruction.into())] });
 
-                        let mut context = Vec::new();
-                        context.push(Content {
-                            role: "model".to_string(),
-                            parts: vec![Part::text(system_instruction.to_string())]
-                        });
+                         let history = { state_bg.lock().unwrap().chat_history.clone() };
+                         for msg in history.iter().rev().take(20).rev() {
+                             if msg.content.starts_with("SYSTEM") { continue; }
+                             context.push(Content { role: msg.role.clone(), parts: vec![Part::text(msg.content.clone())] });
+                         }
 
-                        // --- J7 SURGICAL IMPLANT (REVISED) ---
-                        // 1. Snapshot
-                        let history_snapshot = {
-                            let s = state_bg.lock().unwrap();
-                            s.chat_history.clone()
-                        };
+                         context.push(Content { role: "user".into(), parts: vec![Part::text(user_input_text.clone())] });
 
-                        // 2. Window Calculation (Max 20)
-                        let window_size = 20;
-                        let start_index = if history_snapshot.len() > window_size {
-                            history_snapshot.len() - window_size
-                        } else {
-                            0
-                        };
+                         match client.generate_content(&context).await {
+                             Ok(response) => {
+                                 let timestamp = Local::now().format("%H:%M:%S").to_string();
+                                 let display = format!("\n[UNA] [{}] :: {}\n", timestamp, response);
+                                 let _ = gui_tx_brain.send(GuiUpdate::ConsoleLog(display.clone())).await;
 
-                        // 3. Iterate Window
-                        for saved in history_snapshot.iter().skip(start_index) {
-                            // Filter A: No System Instruction (Already Anchored)
-                            if saved.content.starts_with("SYSTEM_INSTRUCTION") { continue; }
+                                 let mut s = state_bg.lock().unwrap();
+                                 s.chat_history.push(SavedMessage { role: "model".into(), content: response });
+                                 brain_bg.save(&s.chat_history);
 
-                            // Filter B: No Legacy Base64 Images (Token Waste)
-                            if saved.content.starts_with("data:image/") { continue; }
-
-                            // Filter C: Handle GCS URIs
-                            if saved.content.starts_with("[GCS_IMAGE_URI]") {
-                                let uri = saved.content.replace("[GCS_IMAGE_URI]", "");
-                                let lower = uri.to_lowercase();
-                                let mime = if lower.ends_with(".jpg") || lower.ends_with(".jpeg") {
-                                    "image/jpeg"
-                                } else {
-                                    "image/png"
-                                };
-
-                                context.push(Content {
-                                    role: saved.role.clone(),
-                                    parts: vec![Part::file_data(mime.to_string(), uri)]
-                                });
-                            } else {
-                                // Default: Text
-                                context.push(Content {
-                                    role: saved.role.clone(),
-                                    parts: vec![Part::text(saved.content.clone())]
-                                });
-                            }
-                        }
-                        // --- END IMPLANT ---
-
-                        // S29: Robust Error Handling (The Iron Chin)
-                        // 1. Set Status to Thinking
-                        let _ = gui_tx_brain.send(GuiUpdate::ShardStatusChanged {
-                            id: "una-prime".to_string(),
-                            status: ShardStatus::Thinking
-                        }).await;
-
-                        match client.generate_content(&context).await {
-                            Ok(response) => {
-                                // THE CHRONOMETER
-                                let timestamp = Local::now().format("%H:%M:%S.%f").to_string();
-
-                                // Format: [UNA] [14:05:01.123456] :: Response
-                                let display_response = format!("\n[UNA] [{}] :: {}\n", timestamp, response);
-
-                                if let Err(e) = tx_to_ui_bg_clone.send(display_response) {
-                                    error!("Failed to send Model response to UI: {}", e);
-                                }
-
-                                let mut s = state_bg.lock().unwrap();
-                                s.chat_history.push(SavedMessage {
-                                    role: "model".to_string(),
-                                    content: response.clone(),
-                                });
-                                brain_bg.save(&s.chat_history);
-
-                                // UPDATE STATUS BACK TO ONLINE
-                                let _ = gui_tx_brain.send(GuiUpdate::SidebarStatus(WolfpackState::Idle)).await;
-
-                                if is_s9_request {
-                                    let mut s = state_bg.lock().unwrap();
-                                    s.s9_status = ShardStatus::Online; // S9 stays online now
-                                    let _ = gui_tx_brain.send(GuiUpdate::ShardStatusChanged {
-                                        id: "s9-mule".to_string(),
-                                        status: ShardStatus::Online
-                                    }).await;
-                                } else {
-                                    let _ = gui_tx_brain.send(GuiUpdate::ShardStatusChanged {
-                                        id: "una-prime".to_string(),
-                                        status: ShardStatus::Online
-                                    }).await;
-                                }
-                            }
-                            Err(e) => {
-                                let display_error = format!("\n[SYSTEM ERROR] :: AI Core Stalled: {}\n", e);
-                                error!("BRAIN ERROR: {}", e);
-
-                                if let Err(send_e) = tx_to_ui_bg_clone.send(display_error) {
-                                    error!("Failed to send API error to UI: {}", send_e);
-                                }
-
-                                // Reset Wolfpack Status
-                                let _ = gui_tx_brain.send(GuiUpdate::SidebarStatus(WolfpackState::Idle)).await;
-
-                                if is_s9_request {
-                                     let mut s = state_bg.lock().unwrap();
-                                     s.s9_status = ShardStatus::Error;
-                                     let _ = gui_tx_brain.send(GuiUpdate::ShardStatusChanged {
-                                        id: "s9-mule".to_string(),
-                                        status: ShardStatus::Error
-                                    }).await;
-                                } else {
-                                    let _ = gui_tx_brain.send(GuiUpdate::ShardStatusChanged {
-                                        id: "una-prime".to_string(),
-                                        status: ShardStatus::Error
-                                    }).await;
-
-                                    tokio::time::sleep(Duration::from_secs(1)).await;
-                                    let _ = gui_tx_brain.send(GuiUpdate::ShardStatusChanged {
-                                        id: "una-prime".to_string(),
-                                        status: ShardStatus::Online
-                                    }).await;
-                                }
-                            }
-                        }
+                                 let _ = gui_tx_brain.send(GuiUpdate::SidebarStatus(WolfpackState::Idle)).await;
+                                 if is_s9 {
+                                     s.s9_status = ShardStatus::Online;
+                                     let _ = gui_tx_brain.send(GuiUpdate::ShardStatusChanged { id: "s9-mule".into(), status: ShardStatus::Online }).await;
+                                 }
+                             }
+                             Err(e) => {
+                                 let _ = gui_tx_brain.send(GuiUpdate::ConsoleLog(format!("\n[ERROR] {}\n", e))).await;
+                             }
+                         }
                     }
-                }
+                },
                 Err(e) => {
-                    let display_error = format!(":: FATAL :: Brain Error: {}\n", e);
-                    if let Err(send_e) = tx_to_ui_bg_clone.send(display_error) {
-                        error!("Failed to send fatal brain error to UI: {}", send_e);
-                    }
-                    error!("GeminiClient initialization failed: {}", e);
+                    let _ = gui_tx_brain.send(GuiUpdate::ConsoleLog(format!(":: FATAL :: {}\n", e))).await;
                 }
             }
         });
     });
 
-    let tx_to_ui_for_app = tx_to_ui.clone();
-    let app = VeinApp::new(tx_to_bg, state.clone(), ui_updater_rc_clone_for_app, tx_to_ui_for_app, gui_tx);
+    let app = VeinApp::new(tx_to_bg, state.clone(), gui_tx.clone());
 
-    let initial_output_clone = initial_console_output.clone();
-    let ui_updater_rc_clone_for_initial_pop = ui_updater_rc.clone();
-    glib::idle_add_local(move || {
-        do_append_and_scroll(&ui_updater_rc_clone_for_initial_pop, &initial_output_clone);
-        ControlFlow::Break
-    });
-
-    let ui_updater_rc_clone_for_bg_messages = ui_updater_rc.clone();
-    let state_clone_for_bg = state.clone();
-
-    glib::timeout_add_local(Duration::from_millis(50), move || {
-        if let Ok(message_to_ui) = rx_from_bg.try_recv() {
-            // MODIFIED: Handle hidden GCS URI payloads
-            if message_to_ui.starts_with("[GCS_IMAGE_URI]") {
-                let uri = message_to_ui.clone(); // Keep the tag for parsing later
-                let mut s = state_clone_for_bg.lock().unwrap();
-                s.chat_history.push(SavedMessage {
-                    role: "user".to_string(),
-                    content: uri,
-                });
-                // Do NOT display in console, or display a marker?
-                // The main console logic filters these tags, so safe to push.
-            } else if message_to_ui.starts_with("[IMAGE_PAYLOAD]") {
-                 // Legacy handler, ignore or convert?
-                 // Ignore to prevent crash.
-            } else {
-                // Display normal message
-                do_append_and_scroll(&ui_updater_rc_clone_for_bg_messages, &message_to_ui);
-
-                // Add SYSTEM messages to history (visible context)
-                if message_to_ui.contains("[SYSTEM]") {
-                    let mut s = state_clone_for_bg.lock().unwrap();
-                    s.chat_history.push(SavedMessage {
-                        role: "user".to_string(),
-                        content: message_to_ui.clone(),
-                    });
-                }
-            }
+    for msg in saved_history {
+        if !msg.content.starts_with("SYSTEM") {
+            let prefix = if msg.role == "user" { "[ARCHITECT]" } else { "[UNA]" };
+            let _ = gui_tx.send_blocking(GuiUpdate::ConsoleLog(format!("{} > {}\n", prefix, msg.content)));
         }
-        ControlFlow::Continue
-    });
+    }
 
-    // --- S40: RESTORED VEIN BOOTSTRAP ---
-    let comms_spline = Arc::new(CommsSpline::new());
-    let comms_spline_clone = comms_spline.clone();
+    let comms_spline = Rc::new(CommsSpline::new());
 
-    // Pass the closure to Backend
-    Backend::new("org.unaos.vein.evolution", app, gui_rx, move |window, tx, rx| {
-        comms_spline_clone.bootstrap(window, tx, rx)
-    });
+    let bootstrap = move |window: &ApplicationWindow, tx: async_channel::Sender<Event>, rx: async_channel::Receiver<GuiUpdate>| {
+        comms_spline.bootstrap(window, tx, rx)
+    };
 
-    info!("SHUTDOWN: UI Backend runtime complete. Total application runtime: {:?}", app_start_time.elapsed());
+    Backend::new("org.unaos.vein.trinity", app, gui_rx, bootstrap);
 }
