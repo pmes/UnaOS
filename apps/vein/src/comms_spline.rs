@@ -32,14 +32,64 @@ impl CommsSpline {
 
         // --- STYLE PROVIDER ---
         let provider = CssProvider::new();
+        // Updated CSS for Visibility and "Breathing" Look
         provider.load_from_data("
             .sidebar { background-color: #1e1e1e; color: #ffffff; }
-            .console { background-color: #101010; color: #00ff00; font-family: 'Monospace'; }
-            .chat-input-area { background-color: #2d2d2d; border-radius: 12px; padding: 6px; }
-            .transparent-text { background-color: transparent; color: #ffffff; font-family: 'Monospace'; }
-            .suggested-action { background-color: #0078d4; color: #ffffff; border-radius: 50%; padding: 8px; }
+            .console { background-color: #101010; color: #00ff00; font-family: 'Monospace'; caret-color: #00ff00; }
+
+            /* Input Area Container (The Pill) */
+            .chat-input-area {
+                background-color: #2d2d2d;
+                border-radius: 24px;
+                padding: 2px;
+            }
+
+            /* The Text View inside */
+            textview.transparent-text {
+                background-color: transparent;
+                color: #ffffff;
+                caret-color: #ffffff;
+                font-family: 'Sans';
+                font-size: 15px;
+            }
+
+            textview.transparent-text text {
+                background-color: transparent;
+                color: #ffffff;
+            }
+
+            /* Send Button */
+            .suggested-action {
+                background-color: #0078d4;
+                color: #ffffff;
+                border-radius: 100%;
+                padding: 0px;
+                min-width: 42px;
+                min-height: 42px;
+                margin-left: 8px;
+            }
+
             .shard-list { background-color: transparent; }
+
             window { background-color: #1e1e1e; }
+
+            /* Sidebar Stack Switcher */
+            stackswitcher button {
+                background: transparent;
+                color: #888888;
+                border: none;
+                box-shadow: none;
+                padding: 8px 16px;
+                font-weight: bold;
+            }
+            stackswitcher button:checked {
+                color: #ffffff;
+                border-bottom: 2px solid #0078d4;
+                background: rgba(255, 255, 255, 0.05);
+            }
+            stackswitcher button:hover {
+                background: rgba(255, 255, 255, 0.1);
+            }
         ");
 
         StyleContext::add_provider_for_display(
@@ -211,9 +261,9 @@ impl CommsSpline {
         // Input Area (Bottom Pane)
         let input_container = Box::new(Orientation::Horizontal, 8);
         input_container.set_valign(Align::Fill);
-        input_container.set_margin_start(10);
-        input_container.set_margin_end(10);
-        input_container.set_margin_bottom(10);
+        input_container.set_margin_start(16); // Increased margin
+        input_container.set_margin_end(16);   // Increased margin
+        input_container.set_margin_bottom(16); // Increased margin
 
         // Input Field
         let input_scroll = ScrolledWindow::builder()
@@ -223,8 +273,7 @@ impl CommsSpline {
             .max_content_height(500)
             .vexpand(true)
             .valign(Align::Fill)
-            .margin_top(10)
-            .margin_bottom(10)
+            // Removed direct margins here to let container handle spacing
             .has_frame(false)
             .build();
         input_scroll.set_hexpand(true);
@@ -235,10 +284,10 @@ impl CommsSpline {
             .show_line_numbers(false)
             .auto_indent(true)
             .accepts_tab(false)
-            .top_margin(2)
-            .bottom_margin(2)
-            .left_margin(8)
-            .right_margin(8)
+            .top_margin(12)    // Increased internal padding
+            .bottom_margin(12) // Increased internal padding
+            .left_margin(12)   // Increased internal padding
+            .right_margin(12)  // Increased internal padding
             .build();
 
         text_view.add_css_class("transparent-text");
@@ -248,8 +297,7 @@ impl CommsSpline {
         let send_btn = Button::builder()
             .icon_name("paper-plane-symbolic")
             .valign(Align::End)
-            .margin_bottom(10)
-            .margin_end(10)
+            // Removed bottom margin since container has it
             .css_classes(vec!["suggested-action"])
             .build();
 
