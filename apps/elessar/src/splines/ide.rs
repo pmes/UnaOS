@@ -2,7 +2,8 @@ use gtk4::prelude::*;
 use gtk4::{
     Box, Orientation, Label, Button, Stack, ScrolledWindow,
     Align, ListBox, StackSwitcher,
-    TextView, TextBuffer, Paned, Window, Widget, Image, StackTransitionType, CssProvider, StyleContext
+    TextView, TextBuffer, Paned, Window, Widget, Image, StackTransitionType, CssProvider, StyleContext,
+    HeaderBar, ToggleButton
 };
 use sourceview5::prelude::*;
 use sourceview5::View as SourceView;
@@ -23,7 +24,7 @@ thread_local! {
 }
 
 pub struct IdeSpline {
-    // State could go here
+    // State could go here, but for now we rely on the widget tree and events
 }
 
 impl IdeSpline {
@@ -31,7 +32,22 @@ impl IdeSpline {
         Self {}
     }
 
-    pub fn bootstrap<W: IsA<Window>>(&self, _window: &W, tx_event: async_channel::Sender<Event>) -> Widget {
+    // Accepts IsA<Window> to be polymorphic
+    pub fn bootstrap<W: IsA<Window> + IsA<Widget> + Cast>(&self, _window: &W, tx_event: async_channel::Sender<Event>) -> Widget {
+        // --- HEADER BAR (Added for Gnome/GTK consistency) ---
+        let header_bar = HeaderBar::new();
+        // Elessar might not need a sidebar toggle in the header if it uses AdwOverlaySplitView in Gnome,
+        // but for pure GTK fallback we add it.
+        // Note: IdeSpline bootstrap constructs the *content*.
+        // In Gnome mode, Backend wraps this content in AdwApplicationWindow.
+        // AdwApplicationWindow can handle HeaderBars if they are part of content (ToolbarView) or set as titlebar.
+
+        // Let's attach it to the window titlebar for simplicity in both backends.
+        // (Similar to CommsSpline)
+        if let Some(app_win) = _window.dynamic_cast_ref::<gtk4::ApplicationWindow>() {
+            app_win.set_titlebar(Some(&header_bar));
+        }
+
         // --- MAIN CONTAINER ---
         let main_box = Box::new(Orientation::Horizontal, 0);
 
@@ -48,10 +64,11 @@ impl IdeSpline {
         let matrix_list = ListBox::new();
         matrix_list.set_selection_mode(gtk4::SelectionMode::None);
 
+        // Populate with current dir
         if let Ok(entries) = fs::read_dir(".") {
             for entry in entries.flatten() {
                 if let Ok(ft) = entry.file_type() {
-                    if ft.is_file() {
+                    if ft.is_file() { // Simplification: Only files
                         if let Some(name) = entry.file_name().to_str() {
                             let row = Box::new(Orientation::Horizontal, 10);
                             row.set_margin_start(10); row.set_margin_end(10);
@@ -70,11 +87,13 @@ impl IdeSpline {
 
         let tx_clone_matrix = tx_event.clone();
         matrix_list.connect_row_activated(move |_list, row| {
+            // Extract filename from label (Hack: iterating children)
             if let Some(box_widget) = row.child().and_then(|c| c.downcast::<Box>().ok()) {
                 let mut children = box_widget.first_child();
                 while let Some(child) = children {
                     if let Some(label) = child.downcast_ref::<Label>() {
                         let text = label.text();
+                        // Send Event (Async Channel)
                         let _ = tx_clone_matrix.send_blocking(Event::MatrixFileClick(PathBuf::from(text.as_str())));
                         break;
                     }
@@ -86,10 +105,11 @@ impl IdeSpline {
         let matrix_scroll = ScrolledWindow::builder().child(&matrix_list).build();
         sidebar_stack.add_titled(&matrix_scroll, Some("matrix"), "Matrix");
 
+
         // 2. VAIRE (Git)
         let vaire_box = Box::new(Orientation::Vertical, 10);
         vaire_box.set_valign(Align::Center);
-        vaire_box.append(&Label::new(Some("No Git Repository Detected")));
+        vaire_box.append(&Label::new(Some("No Git Repository Detected"))); // Requirement
         sidebar_stack.add_titled(&vaire_box, Some("vaire"), "Vairë");
 
         // 3. AULE (Forge)
@@ -110,6 +130,7 @@ impl IdeSpline {
 
         sidebar_box.append(&sidebar_stack);
 
+        // Sidebar Tabs (Switcher)
         let stack_switcher = StackSwitcher::builder().stack(&sidebar_stack).build();
         let switcher_box = Box::new(Orientation::Horizontal, 0);
         switcher_box.set_halign(Align::Center);
@@ -121,8 +142,8 @@ impl IdeSpline {
         // --- RIGHT: WORKSPACE ---
         let paned = Paned::new(Orientation::Vertical);
         paned.set_hexpand(true);
-        paned.set_vexpand(true);
-        paned.set_position(400);
+        paned.set_vexpand(true); // Ensure it takes height
+        paned.set_position(400); // Top gets more space
 
         // TOP: TABULA (Editor)
         let tabula_scroll = ScrolledWindow::new();
@@ -133,6 +154,8 @@ impl IdeSpline {
             .auto_indent(true)
             .build();
 
+        // --- HANDSHAKE LOGIC ---
+        // Store Tabula buffer in thread_local so we can update it later
         let tb_buffer = tabula_view.buffer().upcast::<TextBuffer>();
         TABULA_BUFFER.with(|b| *b.borrow_mut() = Some(tb_buffer));
 
@@ -148,6 +171,7 @@ impl IdeSpline {
             .build();
         midden_view.add_css_class("console");
 
+        // Send Midden buffer to VeinApp via existing protocol for "System Logs"
         let midden_buf = midden_view.buffer();
         let midden_adj = midden_scroll.vadjustment();
         let _ = tx_event.send_blocking(Event::TextBufferUpdate(midden_buf, midden_adj));
@@ -157,6 +181,7 @@ impl IdeSpline {
 
         main_box.append(&paned);
 
+        // CSS
         let provider = CssProvider::new();
         provider.load_from_data("
             .sidebar { background: #1e1e1e; }
@@ -173,6 +198,7 @@ impl IdeSpline {
     }
 }
 
+// Public helper to load text into Tabula (Called by VeinApp)
 pub fn load_tabula_text(text: &str) {
     TABULA_BUFFER.with(|b| {
         if let Some(buf) = b.borrow().as_ref() {

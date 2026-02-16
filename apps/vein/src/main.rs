@@ -23,8 +23,8 @@ use api::{Content, GeminiClient, Part};
 mod forge;
 use forge::ForgeClient;
 
-mod splines;
-use splines::comms::CommsSpline;
+mod comms_spline;
+use comms_spline::CommsSpline;
 
 struct State {
     mode: ViewMode,
