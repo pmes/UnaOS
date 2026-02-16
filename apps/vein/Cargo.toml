@@ -6,7 +6,7 @@ edition = "2021"
 [features]
 default = ["gtk"]
 gtk = ["gneiss_pal/gtk"]
-gnome = ["gneiss_pal/gnome"]
+gnome = ["gneiss_pal/gnome", "dep:libadwaita"]
 
 [dependencies]
 gneiss_pal = { path = "../../libs/gneiss_pal" }
@@ -24,3 +24,4 @@ async-channel = "2.1"
 octocrab = "0.38"
 chrono = "0.4"
 sourceview5 = "0.9"
+libadwaita = { version = "0.7.2", features = ["v1_4"], optional = true }

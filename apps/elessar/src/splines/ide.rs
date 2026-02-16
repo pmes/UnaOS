@@ -15,6 +15,12 @@ use std::fs;
 use std::path::PathBuf;
 use std::thread_local;
 
+// Import Adwaita if feature is enabled
+#[cfg(feature = "gnome")]
+use libadwaita::prelude::*;
+#[cfg(feature = "gnome")]
+use libadwaita as adw;
+
 use gneiss_pal::types::*;
 
 // --- S40: ELESSAR MUTATION ---
@@ -34,19 +40,8 @@ impl IdeSpline {
 
     // Accepts IsA<Window> to be polymorphic
     pub fn bootstrap<W: IsA<Window> + IsA<Widget> + Cast>(&self, _window: &W, tx_event: async_channel::Sender<Event>) -> Widget {
-        // --- HEADER BAR (Added for Gnome/GTK consistency) ---
+        // --- HEADER BAR ---
         let header_bar = HeaderBar::new();
-        // Elessar might not need a sidebar toggle in the header if it uses AdwOverlaySplitView in Gnome,
-        // but for pure GTK fallback we add it.
-        // Note: IdeSpline bootstrap constructs the *content*.
-        // In Gnome mode, Backend wraps this content in AdwApplicationWindow.
-        // AdwApplicationWindow can handle HeaderBars if they are part of content (ToolbarView) or set as titlebar.
-
-        // Let's attach it to the window titlebar for simplicity in both backends.
-        // (Similar to CommsSpline)
-        if let Some(app_win) = _window.dynamic_cast_ref::<gtk4::ApplicationWindow>() {
-            app_win.set_titlebar(Some(&header_bar));
-        }
 
         // --- MAIN CONTAINER ---
         let main_box = Box::new(Orientation::Horizontal, 0);
@@ -68,7 +63,7 @@ impl IdeSpline {
         if let Ok(entries) = fs::read_dir(".") {
             for entry in entries.flatten() {
                 if let Ok(ft) = entry.file_type() {
-                    if ft.is_file() { // Simplification: Only files
+                    if ft.is_file() {
                         if let Some(name) = entry.file_name().to_str() {
                             let row = Box::new(Orientation::Horizontal, 10);
                             row.set_margin_start(10); row.set_margin_end(10);
@@ -87,13 +82,11 @@ impl IdeSpline {
 
         let tx_clone_matrix = tx_event.clone();
         matrix_list.connect_row_activated(move |_list, row| {
-            // Extract filename from label (Hack: iterating children)
             if let Some(box_widget) = row.child().and_then(|c| c.downcast::<Box>().ok()) {
                 let mut children = box_widget.first_child();
                 while let Some(child) = children {
                     if let Some(label) = child.downcast_ref::<Label>() {
                         let text = label.text();
-                        // Send Event (Async Channel)
                         let _ = tx_clone_matrix.send_blocking(Event::MatrixFileClick(PathBuf::from(text.as_str())));
                         break;
                     }
@@ -155,7 +148,6 @@ impl IdeSpline {
             .build();
 
         // --- HANDSHAKE LOGIC ---
-        // Store Tabula buffer in thread_local so we can update it later
         let tb_buffer = tabula_view.buffer().upcast::<TextBuffer>();
         TABULA_BUFFER.with(|b| *b.borrow_mut() = Some(tb_buffer));
 
@@ -171,7 +163,6 @@ impl IdeSpline {
             .build();
         midden_view.add_css_class("console");
 
-        // Send Midden buffer to VeinApp via existing protocol for "System Logs"
         let midden_buf = midden_view.buffer();
         let midden_adj = midden_scroll.vadjustment();
         let _ = tx_event.send_blocking(Event::TextBufferUpdate(midden_buf, midden_adj));
@@ -194,7 +185,23 @@ impl IdeSpline {
             gtk4::STYLE_PROVIDER_PRIORITY_APPLICATION,
         );
 
-        main_box.into()
+        // --- POLYMORPHIC RETURN ---
+        #[cfg(feature = "gnome")]
+        {
+            let view = adw::ToolbarView::new();
+            view.add_top_bar(&header_bar);
+            view.set_content(Some(&main_box));
+            view.upcast::<Widget>()
+        }
+
+        #[cfg(not(feature = "gnome"))]
+        {
+            // GTK Mode: Set titlebar on window
+            if let Some(app_win) = _window.dynamic_cast_ref::<gtk4::ApplicationWindow>() {
+                app_win.set_titlebar(Some(&header_bar));
+            }
+            main_box.into()
+        }
     }
 }
 

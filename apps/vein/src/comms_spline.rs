@@ -7,6 +7,12 @@ use gtk4::{
 };
 use sourceview5::View as SourceView;
 
+// Import Adwaita if feature is enabled
+#[cfg(feature = "gnome")]
+use libadwaita::prelude::*;
+#[cfg(feature = "gnome")]
+use libadwaita as adw;
+
 use gneiss_pal::types::*;
 
 pub struct CommsSpline {}
@@ -25,19 +31,6 @@ impl CommsSpline {
             .tooltip_text("Toggle Sidebar")
             .build();
         header_bar.pack_start(&sidebar_toggle);
-
-        // Attempt to set titlebar if it's an ApplicationWindow
-        if let Some(app_window) = _window.upcast_ref::<Widget>().downcast_ref::<ApplicationWindow>() {
-             app_window.set_titlebar(Some(&header_bar));
-        } else if let Some(win) = _window.upcast_ref::<Window>().downcast_ref::<ApplicationWindow>() {
-             // Try via Window path?
-             win.set_titlebar(Some(&header_bar));
-        } else {
-            // Dynamic cast fallback
-            if let Some(app_win) = _window.dynamic_cast_ref::<ApplicationWindow>() {
-                app_win.set_titlebar(Some(&header_bar));
-            }
-        }
 
         // --- BODY CONTAINER ---
         let body_box = Box::new(Orientation::Horizontal, 0);
@@ -187,6 +180,22 @@ impl CommsSpline {
             sidebar_box_clone.set_visible(btn.is_active());
         });
 
-        body_box.into()
+        // --- POLYMORPHIC RETURN ---
+        #[cfg(feature = "gnome")]
+        {
+            let view = adw::ToolbarView::new();
+            view.add_top_bar(&header_bar);
+            view.set_content(Some(&body_box));
+            view.upcast::<Widget>()
+        }
+
+        #[cfg(not(feature = "gnome"))]
+        {
+            // GTK Mode: Set titlebar on window
+            if let Some(app_win) = _window.dynamic_cast_ref::<gtk4::ApplicationWindow>() {
+                app_win.set_titlebar(Some(&header_bar));
+            }
+            body_box.into()
+        }
     }
 }

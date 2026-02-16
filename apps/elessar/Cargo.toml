@@ -6,7 +6,7 @@ edition = "2021"
 [features]
 default = ["gtk"]
 gtk = ["gneiss_pal/gtk"]
-gnome = ["gneiss_pal/gnome"]
+gnome = ["gneiss_pal/gnome", "dep:libadwaita"]
 
 [dependencies]
 gneiss_pal = { path = "../../libs/gneiss_pal" }

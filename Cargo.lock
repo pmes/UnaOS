@@ -2623,6 +2623,7 @@ dependencies = [
  "glib",
  "gneiss_pal",
  "gtk4",
+ "libadwaita",
  "log",
  "octocrab",
  "reqwest",
