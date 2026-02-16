@@ -183,7 +183,7 @@ impl IdeSpline {
         let provider = CssProvider::new();
         provider.load_from_data("
             .sidebar { background: #1e1e1e; }
-            .console { background: #000000; color: #00FF00; }
+            .console { background: #101010; color: #A6E3A1; } /* Catppuccin Green (Softer) */
             textview { font-family: 'Monospace'; font-size: 11pt; }
         ");
         StyleContext::add_provider_for_display(

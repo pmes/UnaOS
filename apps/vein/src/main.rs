@@ -133,17 +133,30 @@ struct VeinApp {
     state: Arc<Mutex<State>>,
     tx: mpsc::UnboundedSender<String>,
     ui_updater: Rc<RefCell<Option<UiUpdater>>>,
+    pending_logs: Rc<RefCell<Vec<String>>>,
     tx_ui: mpsc::UnboundedSender<String>,
     _gui_tx: async_channel::Sender<GuiUpdate>,
 }
 
 impl VeinApp {
     fn new(tx: mpsc::UnboundedSender<String>, state: Arc<Mutex<State>>, ui_updater_rc: Rc<RefCell<Option<UiUpdater>>>, tx_ui: mpsc::UnboundedSender<String>, gui_tx: async_channel::Sender<GuiUpdate>) -> Self {
-        Self { state, tx, ui_updater: ui_updater_rc, tx_ui, _gui_tx: gui_tx }
+        Self {
+            state,
+            tx,
+            ui_updater: ui_updater_rc,
+            pending_logs: Rc::new(RefCell::new(Vec::new())),
+            tx_ui,
+            _gui_tx: gui_tx
+        }
     }
 
     fn append_to_console_ui(&self, text: &str) {
-        do_append_and_scroll(&self.ui_updater, text);
+        if self.ui_updater.borrow().is_some() {
+            do_append_and_scroll(&self.ui_updater, text);
+        } else {
+            self.pending_logs.borrow_mut().push(text.to_string());
+            info!("Buffered Output (UI Pending): {}", text);
+        }
     }
 }
 
@@ -250,6 +263,12 @@ impl AppHandler for VeinApp {
                     text_buffer: buffer.clone(),
                     scroll_adj: adj.clone(),
                 });
+
+                // Flush pending logs
+                let pending: Vec<String> = self.pending_logs.borrow_mut().drain(..).collect();
+                for msg in pending {
+                    do_append_and_scroll(&self.ui_updater, &msg);
+                }
 
                 // --- J7 FIXED NERVE SPLICE (NO DEADLOCK) ---
                 // We use 's' which is ALREADY locked by handle_event top-level

@@ -35,12 +35,12 @@ impl CommsSpline {
         // Updated CSS for Visibility and "Breathing" Look
         provider.load_from_data("
             .sidebar { background-color: #1e1e1e; color: #ffffff; }
-            .console { background-color: #101010; color: #00ff00; font-family: 'Monospace'; caret-color: #00ff00; }
+            .console { background-color: #101010; color: #dddddd; font-family: 'Monospace'; caret-color: #dddddd; }
 
             /* Input Area Container (The Pill) */
             .chat-input-area {
                 background-color: #2d2d2d;
-                border-radius: 24px;
+                border-radius: 12px;
                 padding: 2px;
             }
 
@@ -62,17 +62,16 @@ impl CommsSpline {
             .suggested-action {
                 background-color: #0078d4;
                 color: #ffffff;
-                border-radius: 100%;
+                border-radius: 4px;
                 padding: 0px;
-                min-width: 42px;
-                min-height: 42px;
+                min-width: 34px;
+                min-height: 34px;
                 margin-left: 8px;
             }
 
             .attach-action {
                 background-color: transparent;
-                color: #888888;
-                border-radius: 100%;
+                color: #cccccc;
                 padding: 0px;
                 min-width: 42px;
                 min-height: 42px;
@@ -81,8 +80,8 @@ impl CommsSpline {
                 box-shadow: none;
             }
             .attach-action:hover {
-                background-color: rgba(255, 255, 255, 0.1);
                 color: #ffffff;
+                background-color: rgba(255, 255, 255, 0.1);
             }
 
             .shard-list { background-color: transparent; }
@@ -212,6 +211,7 @@ impl CommsSpline {
         let row_una = Box::new(Orientation::Horizontal, 10);
         row_una.set_margin_start(10);
         let icon_una = Image::from_icon_name("computer-symbolic");
+        icon_una.set_widget_name("una-prime");
         let label_una = Label::new(Some("Una-Prime"));
         let spinner_una = Spinner::new();
         row_una.append(&icon_una);
@@ -223,6 +223,7 @@ impl CommsSpline {
         let row_s9 = Box::new(Orientation::Horizontal, 10);
         row_s9.set_margin_start(10);
         let icon_s9 = Image::from_icon_name("network-server-symbolic");
+        icon_s9.set_widget_name("s9-mule");
         let label_s9 = Label::new(Some("S9-Mule"));
         let spinner_s9 = Spinner::new();
         row_s9.append(&icon_s9);
@@ -280,12 +281,13 @@ impl CommsSpline {
         input_container.set_margin_start(16);
         input_container.set_margin_end(16);
         input_container.set_margin_bottom(16);
+        input_container.set_margin_top(16);
 
         // Attach Button (Left)
         let attach_btn = Button::builder()
             .valign(Align::End)
             .css_classes(vec!["attach-action"])
-            .child(&Image::from_resource("/org/una/vein/icons/share-symbolic"))
+            .icon_name("paperclip-symbolic")
             .build();
 
         // Implement Attach logic (Using FileDialog)
@@ -328,10 +330,10 @@ impl CommsSpline {
             .show_line_numbers(false)
             .auto_indent(true)
             .accepts_tab(false)
-            .top_margin(12)
-            .bottom_margin(12)
-            .left_margin(12)
-            .right_margin(12)
+            .top_margin(8)
+            .bottom_margin(8)
+            .left_margin(10)
+            .right_margin(10)
             .build();
 
         text_view.add_css_class("transparent-text");
@@ -341,7 +343,7 @@ impl CommsSpline {
         let send_btn = Button::builder()
             .valign(Align::End)
             .css_classes(vec!["suggested-action"])
-            .child(&Image::from_resource("/org/una/vein/icons/paper-plane-symbolic"))
+            .icon_name("send-to-symbolic")
             .build();
 
         let tx_clone_send = tx_event.clone();
