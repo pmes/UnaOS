@@ -1,9 +1,7 @@
 pub mod backend;
-pub mod splines;
 pub mod text;
 
 pub use backend::Backend;
-pub use splines::CommsSpline;
 
 // Re-export specific logic types that UI might need directly
 pub use gneiss_pal::types::*;

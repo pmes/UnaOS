@@ -1,0 +1,20 @@
+[package]
+name = "una"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+elessar = { path = "../../libs/elessar" }
+matrix = { path = "../../handlers/matrix" }
+vaire = { path = "../../handlers/vaire" }
+aule = { path = "../../handlers/aule" }
+tabula = { path = "../../handlers/tabula" }
+midden = { path = "../../handlers/midden" }
+gtk4 = { version = "0.9.7", features = ["v4_12"] }
+glib = "0.20"
+async-channel = "2.1"
+log = "0.4"
+env_logger = "0.10"
+dotenvy = "0.15"
+libadwaita = { version = "0.7.2", features = ["v1_4"], optional = true }
+sourceview5 = "0.9" # Used by Tabula types?

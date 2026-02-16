@@ -1,1 +1,15 @@
-workspace = { members = ["libs/gneiss_pal", "apps/vein", "apps/elessar", "libs/quartzite"] }
+[workspace]
+resolver = "2"
+members = [
+    "libs/gneiss_pal",
+    "libs/quartzite",
+    "libs/elessar",
+    "handlers/vein",
+    "handlers/matrix",
+    "handlers/vaire",
+    "handlers/aule",
+    "handlers/tabula",
+    "handlers/midden",
+    "apps/lumen",
+    "apps/una"
+]
