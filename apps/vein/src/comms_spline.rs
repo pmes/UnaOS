@@ -298,10 +298,13 @@ impl CommsSpline {
         input_container.set_margin_top(16);
 
         // Attach Button (Left)
+        let attach_icon = Image::from_icon_name("share-symbolic");
+        attach_icon.set_pixel_size(24);
+
         let attach_btn = Button::builder()
             .valign(Align::End)
             .css_classes(vec!["attach-action"])
-            .child(&Image::from_resource("/org/una/vein/icons/share-symbolic"))
+            .child(&attach_icon)
             .build();
 
         // Implement Attach logic (Using FileDialog)
@@ -354,10 +357,13 @@ impl CommsSpline {
         input_scroll.set_child(Some(&text_view));
 
         // Send Button (Right)
+        let send_icon = Image::from_icon_name("paper-plane-symbolic");
+        send_icon.set_pixel_size(24);
+
         let send_btn = Button::builder()
             .valign(Align::End)
             .css_classes(vec!["suggested-action"])
-            .child(&Image::from_resource("/org/una/vein/icons/paper-plane-symbolic"))
+            .child(&send_icon)
             .build();
 
         let tx_clone_send = tx_event.clone();

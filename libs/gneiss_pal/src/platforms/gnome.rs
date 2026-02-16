@@ -46,6 +46,12 @@ impl<A: AppHandler> Backend<A> {
         // Initialize Libadwaita
         app.connect_startup(|_| {
             adw::init().unwrap();
+
+             // S40: Register Icon Theme Protocol
+             if let Some(display) = gtk4::gdk::Display::default() {
+                 let icon_theme = gtk4::IconTheme::for_display(&display);
+                 icon_theme.add_resource_path("/org/una/vein/icons");
+             }
         });
 
         let app_handler_rc = Rc::new(RefCell::new(app_handler));

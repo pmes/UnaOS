@@ -48,6 +48,14 @@ impl<A: AppHandler> Backend<A> {
             .application_id(app_id)
             .build();
 
+        app.connect_startup(|_| {
+             // S40: Register Icon Theme Protocol
+             if let Some(display) = gtk4::gdk::Display::default() {
+                 let icon_theme = gtk4::IconTheme::for_display(&display);
+                 icon_theme.add_resource_path("/org/una/vein/icons");
+             }
+        });
+
         let app_handler_rc = Rc::new(RefCell::new(app_handler));
         let app_handler_rc_clone = app_handler_rc.clone();
 
