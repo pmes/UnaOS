@@ -1,4 +1,4 @@
-use crate::node::{AudioNode, GraphContext};
+use crate::core::{AudioNode, GraphContext};
 use crate::{BLOCK_SIZE, Sample};
 use std::f64::consts::TAU;
 
@@ -68,7 +68,7 @@ impl AudioNode for SineOscillator {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::node::GraphContext;
+    use crate::core::GraphContext;
 
     #[test]
     fn test_sine_oscillator_basic() {
