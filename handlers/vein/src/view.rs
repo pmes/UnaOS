@@ -69,19 +69,22 @@ impl CommsSpline {
         menu_box.set_margin_top(10);
         menu_box.set_margin_bottom(10);
 
-        let btn_clear = Button::with_label("Clear Console");
+        let btn_clear = Button::from_icon_name("user-trash-symbolic");
+        btn_clear.set_tooltip_text(Some("Clear Console"));
         let tx_clear = tx_event.clone();
         btn_clear.connect_clicked(move |_| {
             let _ = tx_clear.send_blocking(Event::Input("/clear".into()));
         });
 
-        let btn_wolf = Button::with_label("Wolfpack Mode");
+        let btn_wolf = Button::from_icon_name("view-grid-symbolic");
+        btn_wolf.set_tooltip_text(Some("Wolfpack Mode"));
         let tx_wolf = tx_event.clone();
         btn_wolf.connect_clicked(move |_| {
             let _ = tx_wolf.send_blocking(Event::Input("/wolf".into()));
         });
 
-        let btn_comms = Button::with_label("Comms Mode");
+        let btn_comms = Button::from_icon_name("call-start-symbolic");
+        btn_comms.set_tooltip_text(Some("Comms Mode"));
         let tx_comms = tx_event.clone();
         btn_comms.connect_clicked(move |_| {
             let _ = tx_comms.send_blocking(Event::Input("/comms".into()));
@@ -220,7 +223,7 @@ impl CommsSpline {
         });
         column_view.add_controller(click_controller);
 
-        sidebar_stack.add_titled(&rooms_scroll, Some("nodes"), "Nodes");
+        // sidebar_stack.add_titled(&rooms_scroll, Some("nodes"), "Nodes"); // Moved down to layout
 
         let status_box = Box::new(Orientation::Vertical, 10);
         status_box.set_margin_top(10);
@@ -266,10 +269,8 @@ impl CommsSpline {
         footer_box.set_margin_end(8);
         footer_box.set_margin_bottom(8);
 
-        let new_node_btn = Button::builder()
-            .icon_name("list-add-symbolic")
-            .tooltip_text("New Node")
-            .build();
+        let new_node_btn = Button::from_icon_name("list-add-symbolic");
+        new_node_btn.set_tooltip_text(Some("New Node"));
 
         let tx_node_create = tx_event.clone();
         let parent_win = window.upcast_ref::<Window>().clone();
@@ -395,7 +396,14 @@ impl CommsSpline {
         footer_box.append(&new_node_btn);
         footer_box.append(&proto_box);
 
-        sidebar_box.append(&footer_box);
+        // Re-parent Logic (Hierarchy Fix)
+        let nodes_layout = Box::new(Orientation::Vertical, 0);
+        rooms_scroll.set_vexpand(true);
+        nodes_layout.append(&rooms_scroll);
+        footer_box.set_vexpand(false);
+        nodes_layout.append(&footer_box);
+
+        sidebar_stack.add_titled(&nodes_layout, Some("nodes"), "Nodes");
 
         body_box.append(&sidebar_box);
         body_box.append(&Separator::new(Orientation::Vertical));
@@ -498,6 +506,15 @@ impl CommsSpline {
 
         let tx_clone_send = tx_event.clone();
         let buffer = text_view.buffer();
+
+        let btn_send_clone = send_btn.clone();
+        buffer.connect_changed(move |buf| {
+            if buf.line_count() > 1 {
+                btn_send_clone.remove_css_class("suggested-action");
+            } else {
+                btn_send_clone.add_css_class("suggested-action");
+            }
+        });
 
         let key_controller = EventControllerKey::new();
         key_controller.set_propagation_phase(PropagationPhase::Capture);
