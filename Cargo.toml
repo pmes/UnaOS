@@ -11,10 +11,8 @@ members = [
     "handlers/tabula",
     "handlers/midden",
     "handlers/amber_bytes",
-    "handlers/cli/vertex",
     "handlers/vug",
-    "handlers/midden_legacy",
-    "handlers/vairë_legacy",
+    "apps/cli/vertex",
     "apps/lumen",
     "apps/una"
 ]
