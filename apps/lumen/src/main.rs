@@ -1,7 +1,6 @@
 use directories::BaseDirs;
 use dotenvy::dotenv;
 use elessar::prelude::*;
-use elessar::quartzite;
 use log::info;
 use std::fs;
 use std::path::PathBuf;

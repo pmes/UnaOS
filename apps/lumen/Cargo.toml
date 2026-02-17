@@ -11,6 +11,7 @@ gnome = ["vein/gnome", "elessar/gnome", "dep:libadwaita"]
 [dependencies]
 elessar = { path = "../../libs/elessar" }
 vein = { path = "../../handlers/vein" }
+quartzite = { path = "../../libs/quartzite" }
 gtk4 = { version = "0.10.3", features = ["v4_12"] }
 glib = "0.21"
 async-channel = "2.5"
