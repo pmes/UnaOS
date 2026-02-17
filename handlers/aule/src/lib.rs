@@ -8,7 +8,7 @@ pub fn create_view(tx: Sender<Event>) -> Widget {
     aule_box.set_margin_top(20);
 
     let ignite_btn = Button::with_label("Ignite");
-    ignite_btn.set_icon_name("hammer-symbolic");
+    ignite_btn.set_icon_name("applications-engineering-symbolic");
     ignite_btn.add_css_class("suggested-action");
 
     let tx_clone = tx.clone();
