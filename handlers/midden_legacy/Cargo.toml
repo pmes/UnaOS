@@ -1,5 +1,5 @@
 [package]
-name = "midden"
+name = "midden_legacy"
 version = "0.1.0"
 edition = "2021"
 authors = ["pmes"]
@@ -32,5 +32,5 @@ name = "midden_core"
 path = "src/lib.rs"
 
 [[bin]]
-name = "midden"
+name = "midden_legacy"
 path = "src/main.rs"
