@@ -14,6 +14,7 @@ pub enum WolfpackState {
 pub enum GuiUpdate {
     ShardStatusChanged { id: String, status: ShardStatus },
     ConsoleLog(String),
+    EditorLoad(String),
     SidebarStatus(WolfpackState), // The Pulse
 }
 

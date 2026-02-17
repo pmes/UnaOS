@@ -37,6 +37,7 @@ impl AppHandler for UnaApp {
             Event::MatrixFileClick(path) => match std::fs::read_to_string(&path) {
                 Ok(content) => {
                     self.log(&format!("[MATRIX] :: Loaded {}\n", path.display()));
+                    let _ = self.gui_tx.send_blocking(GuiUpdate::EditorLoad(content));
                 }
                 Err(e) => self.log(&format!("[MATRIX ERROR] :: {}\n", e)),
             },
@@ -94,7 +95,7 @@ impl IdeSpline {
         paned.set_vexpand(true);
         paned.set_position(400);
 
-        let (tabula_widget, _tabula_buf) = tabula::create_view();
+        let (tabula_widget, tabula_buf) = tabula::create_view();
         paned.set_start_child(Some(&tabula_widget));
 
         let (midden_widget, midden_buf) = midden::create_view();
@@ -104,11 +105,18 @@ impl IdeSpline {
 
         // RX Loop
         let midden_buf_clone = midden_buf.clone();
+        let tabula_buf_clone = tabula_buf.clone();
         glib::MainContext::default().spawn_local(async move {
             while let Ok(update) = rx.recv().await {
-                if let GuiUpdate::ConsoleLog(text) = update {
-                    let mut end = midden_buf_clone.end_iter();
-                    midden_buf_clone.insert(&mut end, &text);
+                match update {
+                    GuiUpdate::ConsoleLog(text) => {
+                        let mut end = midden_buf_clone.end_iter();
+                        midden_buf_clone.insert(&mut end, &text);
+                    }
+                    GuiUpdate::EditorLoad(content) => {
+                        tabula_buf_clone.set_text(&content);
+                    }
+                    _ => {}
                 }
             }
         });
