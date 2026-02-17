@@ -1,8 +1,23 @@
 use dotenvy::dotenv;
 use elessar::prelude::*;
 use log::info;
+use std::fs;
+use std::path::PathBuf;
 use std::rc::Rc;
 use vein::{CommsSpline, VeinHandler};
+
+// Directive S68: The Lumen Homestead
+fn get_lumen_home() -> PathBuf {
+    let mut path = dirs::data_local_dir().expect("Alien Soil not supported");
+    path.push("unaos");
+    path.push("lumen");
+
+    if !path.exists() {
+        fs::create_dir_all(&path).expect("Failed to establish base camp");
+    }
+
+    path
+}
 
 fn main() {
     dotenv().ok();
@@ -17,10 +32,26 @@ fn main() {
 
     info!(":: LUMEN :: Booting...");
 
+    // 1. Establish Base Camp
+    let home = get_lumen_home();
+    let asset_path = home.join("quartzite.gresource");
+    let history_path = home.join("history.json");
+
+    // 2. Deploy Assets (Stop Gap)
+    if !asset_path.exists() {
+        info!(":: LUMEN :: Deploying assets to {}", asset_path.display());
+        if let Err(e) = quartzite::deploy_assets(&asset_path) {
+            log::error!("Failed to deploy assets: {}", e);
+        }
+    }
+
+    // 3. Initialize Quartzite with specific path
+    quartzite::init_with_path(&asset_path);
+
     let (gui_tx, gui_rx) = async_channel::unbounded();
 
-    // Logic
-    let app = VeinHandler::new(gui_tx);
+    // Logic (With History Path)
+    let app = VeinHandler::new(gui_tx, history_path);
 
     // View
     let spline = Rc::new(CommsSpline::new());

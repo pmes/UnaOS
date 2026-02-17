@@ -19,3 +19,4 @@ env_logger = "0.11"
 dotenvy = "0.15"
 libadwaita = { version = "0.8.1", features = ["v1_4"], optional = true }
 rustls = { version = "0.23", features = ["ring"] }
+directories = "5.0"

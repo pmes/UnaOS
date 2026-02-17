@@ -104,8 +104,8 @@ pub struct VeinHandler {
 }
 
 impl VeinHandler {
-    pub fn new(gui_tx: async_channel::Sender<GuiUpdate>) -> Self {
-        let brain = BrainManager::new();
+    pub fn new(gui_tx: async_channel::Sender<GuiUpdate>, history_path: PathBuf) -> Self {
+        let brain = BrainManager::new(history_path);
         let saved_history = brain.load();
 
         let state = Arc::new(Mutex::new(State {

@@ -15,23 +15,12 @@ pub struct BrainManager {
 }
 
 impl BrainManager {
-    pub fn new() -> Self {
-        // MANUAL OVERRIDE: Force ~/.local/share/unaos/vein
-        // We ask for the base data directory (usually ~/.local/share)
-        // and manually append our specific hierarchy.
-        let base_dirs = BaseDirs::new().expect("Could not determine base directories");
-
-        let data_dir = base_dirs
-            .data_local_dir()
-            .join("unaos") // The Organization
-            .join("vein"); // The App
-
-        // Create the directory tree
-        fs::create_dir_all(&data_dir).expect("Failed to create data directory");
-
-        Self {
-            file_path: data_dir.join("history.json"),
+    pub fn new(file_path: PathBuf) -> Self {
+        if let Some(parent) = file_path.parent() {
+            fs::create_dir_all(parent).expect("Failed to create data directory");
         }
+
+        Self { file_path }
     }
 
     pub fn save(&self, messages: &[SavedMessage]) {
