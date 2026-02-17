@@ -1,0 +1,164 @@
+{
+  "created_at": {
+    "secs_since_epoch": 1769002510,
+    "nanos_since_epoch": 716196130
+  },
+  "entries": [
+    {
+      "path": "/home/pmes/src/pmes/midden",
+      "is_file": false,
+      "size": 150,
+      "tags": []
+    },
+    {
+      "path": "/home/pmes/src/pmes/midden/LICENSE",
+      "is_file": true,
+      "size": 35149,
+      "tags": []
+    },
+    {
+      "path": "/home/pmes/src/pmes/midden/src",
+      "is_file": false,
+      "size": 102,
+      "tags": []
+    },
+    {
+      "path": "/home/pmes/src/pmes/midden/src/brain.rs",
+      "is_file": true,
+      "size": 2126,
+      "tags": [
+        "code",
+        "rs"
+      ]
+    },
+    {
+      "path": "/home/pmes/src/pmes/midden/src/modes",
+      "is_file": false,
+      "size": 86,
+      "tags": []
+    },
+    {
+      "path": "/home/pmes/src/pmes/midden/src/modes/advanced.rs",
+      "is_file": true,
+      "size": 760,
+      "tags": [
+        "code",
+        "rs"
+      ]
+    },
+    {
+      "path": "/home/pmes/src/pmes/midden/src/modes/mod.rs",
+      "is_file": true,
+      "size": 112,
+      "tags": [
+        "code",
+        "rs"
+      ]
+    },
+    {
+      "path": "/home/pmes/src/pmes/midden/src/modes/intermediate.rs",
+      "is_file": true,
+      "size": 183,
+      "tags": [
+        "code",
+        "rs"
+      ]
+    },
+    {
+      "path": "/home/pmes/src/pmes/midden/src/modes/beginner.rs",
+      "is_file": true,
+      "size": 179,
+      "tags": [
+        "code",
+        "rs"
+      ]
+    },
+    {
+      "path": "/home/pmes/src/pmes/midden/src/lib.rs",
+      "is_file": true,
+      "size": 43,
+      "tags": [
+        "code",
+        "rs"
+      ]
+    },
+    {
+      "path": "/home/pmes/src/pmes/midden/src/main.rs",
+      "is_file": true,
+      "size": 2438,
+      "tags": [
+        "code",
+        "rs"
+      ]
+    },
+    {
+      "path": "/home/pmes/src/pmes/midden/src/indexer.rs",
+      "is_file": true,
+      "size": 1702,
+      "tags": [
+        "code",
+        "rs"
+      ]
+    },
+    {
+      "path": "/home/pmes/src/pmes/midden/src/pile.rs",
+      "is_file": true,
+      "size": 529,
+      "tags": [
+        "code",
+        "rs"
+      ]
+    },
+    {
+      "path": "/home/pmes/src/pmes/midden/src/shell.rs",
+      "is_file": true,
+      "size": 4330,
+      "tags": [
+        "code",
+        "rs"
+      ]
+    },
+    {
+      "path": "/home/pmes/src/pmes/midden/.gitignore",
+      "is_file": true,
+      "size": 25,
+      "tags": []
+    },
+    {
+      "path": "/home/pmes/src/pmes/midden/Cargo.lock",
+      "is_file": true,
+      "size": 99828,
+      "tags": [
+        "meta",
+        "lock"
+      ]
+    },
+    {
+      "path": "/home/pmes/src/pmes/midden/Cargo.toml",
+      "is_file": true,
+      "size": 804,
+      "tags": [
+        "config",
+        "toml"
+      ]
+    },
+    {
+      "path": "/home/pmes/src/pmes/midden/README.md",
+      "is_file": true,
+      "size": 3410,
+      "tags": [
+        "doc",
+        "md"
+      ]
+    },
+    {
+      "path": "/home/pmes/src/pmes/midden/midden_pile.json",
+      "is_file": true,
+      "size": 2232,
+      "tags": [
+        "config",
+        "json"
+      ]
+    }
+  ]
+}
