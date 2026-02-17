@@ -69,21 +69,30 @@ impl CommsSpline {
         menu_box.set_margin_top(10);
         menu_box.set_margin_bottom(10);
 
-        let btn_clear = Button::from_icon_name("user-trash-symbolic");
+        let btn_clear = Button::new();
+        let icon_clear = Image::from_icon_name("user-trash-symbolic");
+        icon_clear.set_pixel_size(16);
+        btn_clear.set_child(Some(&icon_clear));
         btn_clear.set_tooltip_text(Some("Clear Console"));
         let tx_clear = tx_event.clone();
         btn_clear.connect_clicked(move |_| {
             let _ = tx_clear.send_blocking(Event::Input("/clear".into()));
         });
 
-        let btn_wolf = Button::from_icon_name("view-grid-symbolic");
+        let btn_wolf = Button::new();
+        let icon_wolf = Image::from_icon_name("view-grid-symbolic");
+        icon_wolf.set_pixel_size(16);
+        btn_wolf.set_child(Some(&icon_wolf));
         btn_wolf.set_tooltip_text(Some("Wolfpack Mode"));
         let tx_wolf = tx_event.clone();
         btn_wolf.connect_clicked(move |_| {
             let _ = tx_wolf.send_blocking(Event::Input("/wolf".into()));
         });
 
-        let btn_comms = Button::from_icon_name("call-start-symbolic");
+        let btn_comms = Button::new();
+        let icon_comms = Image::from_icon_name("call-start-symbolic");
+        icon_comms.set_pixel_size(16);
+        btn_comms.set_child(Some(&icon_comms));
         btn_comms.set_tooltip_text(Some("Comms Mode"));
         let tx_comms = tx_event.clone();
         btn_comms.connect_clicked(move |_| {
@@ -269,7 +278,10 @@ impl CommsSpline {
         footer_box.set_margin_end(8);
         footer_box.set_margin_bottom(8);
 
-        let new_node_btn = Button::from_icon_name("list-add-symbolic");
+        let new_node_btn = Button::new();
+        let icon_new_node = Image::from_icon_name("list-add-symbolic");
+        icon_new_node.set_pixel_size(16);
+        new_node_btn.set_child(Some(&icon_new_node));
         new_node_btn.set_tooltip_text(Some("New Node"));
 
         let tx_node_create = tx_event.clone();
