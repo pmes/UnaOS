@@ -1,4 +1,4 @@
-use ab_glyph::{Font, FontRef, PxScale, point, ScaleFont};
+use ab_glyph::{Font, FontRef, PxScale, ScaleFont, point};
 
 // Embed the font data
 const FONT_DATA: &[u8] = include_bytes!("../assets/Hack-Regular.ttf");
@@ -29,25 +29,29 @@ pub fn measure_text_height(width: u32, text: &str, font: &FontRef) -> i32 {
             let word_width = width_of_text(font, scale, &full_word);
 
             if caret.x + word_width <= max_x {
-                 caret.x += word_width;
+                caret.x += word_width;
             } else if start_x as f32 + word_width <= max_x {
-                 caret.x = start_x as f32 + word_width;
-                 caret.y += line_height;
+                caret.x = start_x as f32 + word_width;
+                caret.y += line_height;
             } else {
-                 if caret.x > start_x as f32 {
-                     caret.x = start_x as f32;
-                     caret.y += line_height;
-                 }
-                 let text_to_draw = if i > 0 && caret.x == start_x as f32 { word } else { &full_word };
-                 for c in text_to_draw.chars() {
-                     let glyph_id = font.glyph_id(c);
-                     let advance = scaled_font.h_advance(glyph_id);
-                     if caret.x + advance > max_x {
-                         caret.x = start_x as f32;
-                         caret.y += line_height;
-                     }
-                     caret.x += advance;
-                 }
+                if caret.x > start_x as f32 {
+                    caret.x = start_x as f32;
+                    caret.y += line_height;
+                }
+                let text_to_draw = if i > 0 && caret.x == start_x as f32 {
+                    word
+                } else {
+                    &full_word
+                };
+                for c in text_to_draw.chars() {
+                    let glyph_id = font.glyph_id(c);
+                    let advance = scaled_font.h_advance(glyph_id);
+                    if caret.x + advance > max_x {
+                        caret.x = start_x as f32;
+                        caret.y += line_height;
+                    }
+                    caret.x += advance;
+                }
             }
         }
     }
@@ -86,32 +90,40 @@ pub fn draw_text(
 
             // Case 1: Word fits
             if caret.x + word_width <= max_x {
-                draw_str(buffer, width, height, font, scale, &mut caret, &full_word, color);
+                draw_str(
+                    buffer, width, height, font, scale, &mut caret, &full_word, color,
+                );
             }
             // Case 2: Fits on new line
             else if start_x as f32 + word_width <= max_x {
                 caret.x = start_x as f32;
                 caret.y += line_height;
                 let trimmed = if i > 0 { word } else { &full_word };
-                draw_str(buffer, width, height, font, scale, &mut caret, trimmed, color);
+                draw_str(
+                    buffer, width, height, font, scale, &mut caret, trimmed, color,
+                );
             }
             // Case 3: Giant word
             else {
-                 if caret.x > start_x as f32 {
-                     caret.x = start_x as f32;
-                     caret.y += line_height;
-                 }
-                 let text_to_draw = if i > 0 && caret.x == start_x as f32 { word } else { &full_word };
-                 for c in text_to_draw.chars() {
-                     let glyph_id = font.glyph_id(c);
-                     let advance = scaled_font.h_advance(glyph_id);
-                     if caret.x + advance > max_x {
-                         caret.x = start_x as f32;
-                         caret.y += line_height;
-                     }
-                     draw_glyph(buffer, width, height, font, scale, caret, c, color);
-                     caret.x += advance;
-                 }
+                if caret.x > start_x as f32 {
+                    caret.x = start_x as f32;
+                    caret.y += line_height;
+                }
+                let text_to_draw = if i > 0 && caret.x == start_x as f32 {
+                    word
+                } else {
+                    &full_word
+                };
+                for c in text_to_draw.chars() {
+                    let glyph_id = font.glyph_id(c);
+                    let advance = scaled_font.h_advance(glyph_id);
+                    if caret.x + advance > max_x {
+                        caret.x = start_x as f32;
+                        caret.y += line_height;
+                    }
+                    draw_glyph(buffer, width, height, font, scale, caret, c, color);
+                    caret.x += advance;
+                }
             }
         }
     }

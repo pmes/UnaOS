@@ -1,7 +1,7 @@
 use gtk4::prelude::*;
-use sourceview5::prelude::*;
-use sourceview5::View as SourceView;
 use gtk4::{ScrolledWindow, TextBuffer, Widget};
+use sourceview5::View as SourceView;
+use sourceview5::prelude::*;
 
 pub fn create_view() -> (Widget, TextBuffer) {
     let scroll = ScrolledWindow::new();

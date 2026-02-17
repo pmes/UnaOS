@@ -1,26 +1,25 @@
 // handlers/vein/src/view.rs
+use async_channel::Receiver;
 use gtk4::prelude::*;
 use gtk4::{
-    Box, Orientation, Label, Button, Stack, ScrolledWindow,
-    PolicyType, Align, ListBox, Separator, StackTransitionType, TextView,
-    TextBuffer, HeaderBar, StackSwitcher, ToggleButton, Image,
-    Paned, Widget, Window, CssProvider,
-    EventControllerKey, Spinner, MenuButton, Popover, FileDialog,
-    gdk::{Key, ModifierType}, PropagationPhase,
-    ColumnView, ColumnViewColumn, SingleSelection, SignalListItemFactory,
-    ListItem, StringObject, gio
+    Align, Box, Button, ColumnView, ColumnViewColumn, CssProvider, EventControllerKey, FileDialog,
+    HeaderBar, Image, Label, ListBox, ListItem, MenuButton, Orientation, Paned, PolicyType,
+    Popover, PropagationPhase, ScrolledWindow, Separator, SignalListItemFactory, SingleSelection,
+    Spinner, Stack, StackSwitcher, StackTransitionType, StringObject, TextBuffer, TextView,
+    ToggleButton, Widget, Window,
+    gdk::{Key, ModifierType},
+    gio,
 };
-use async_channel::Receiver;
 use sourceview5::View as SourceView;
 
 // Import Elessar (Engine)
-use elessar::prelude::*; // Provides Event, GuiUpdate, AppHandler
-use elessar::gneiss_pal::shard::ShardStatus; // Specific import if not in prelude (it's not)
+use elessar::gneiss_pal::shard::ShardStatus;
+use elessar::prelude::*; // Provides Event, GuiUpdate, AppHandler // Specific import if not in prelude (it's not)
 
 #[cfg(feature = "gnome")]
-use libadwaita::prelude::*;
-#[cfg(feature = "gnome")]
 use libadwaita as adw;
+#[cfg(feature = "gnome")]
+use libadwaita::prelude::*;
 
 pub struct CommsSpline {}
 
@@ -29,7 +28,12 @@ impl CommsSpline {
         Self {}
     }
 
-    pub fn bootstrap<W: IsA<Window> + IsA<Widget> + Cast>(&self, window: &W, tx_event: async_channel::Sender<Event>, rx: Receiver<GuiUpdate>) -> Widget {
+    pub fn bootstrap<W: IsA<Window> + IsA<Widget> + Cast>(
+        &self,
+        window: &W,
+        tx_event: async_channel::Sender<Event>,
+        rx: Receiver<GuiUpdate>,
+    ) -> Widget {
         window.set_title(Some("Vein (Trinity Architecture)"));
 
         let provider = CssProvider::new();
@@ -66,24 +70,37 @@ impl CommsSpline {
 
         let btn_clear = Button::with_label("Clear Console");
         let tx_clear = tx_event.clone();
-        btn_clear.connect_clicked(move |_| { let _ = tx_clear.send_blocking(Event::Input("/clear".into())); });
+        btn_clear.connect_clicked(move |_| {
+            let _ = tx_clear.send_blocking(Event::Input("/clear".into()));
+        });
 
         let btn_wolf = Button::with_label("Wolfpack Mode");
         let tx_wolf = tx_event.clone();
-        btn_wolf.connect_clicked(move |_| { let _ = tx_wolf.send_blocking(Event::Input("/wolf".into())); });
+        btn_wolf.connect_clicked(move |_| {
+            let _ = tx_wolf.send_blocking(Event::Input("/wolf".into()));
+        });
 
         let btn_comms = Button::with_label("Comms Mode");
         let tx_comms = tx_event.clone();
-        btn_comms.connect_clicked(move |_| { let _ = tx_comms.send_blocking(Event::Input("/comms".into())); });
+        btn_comms.connect_clicked(move |_| {
+            let _ = tx_comms.send_blocking(Event::Input("/comms".into()));
+        });
 
         menu_box.append(&btn_clear);
         menu_box.append(&btn_wolf);
         menu_box.append(&btn_comms);
 
         let popover = Popover::builder().child(&menu_box).build();
-        let menu_button = MenuButton::builder().icon_name("open-menu-symbolic").popover(&popover).build();
+        let menu_button = MenuButton::builder()
+            .icon_name("open-menu-symbolic")
+            .popover(&popover)
+            .build();
 
-        let sidebar_toggle = ToggleButton::builder().icon_name("sidebar-show-symbolic").active(true).tooltip_text("Toggle Sidebar").build();
+        let sidebar_toggle = ToggleButton::builder()
+            .icon_name("sidebar-show-symbolic")
+            .active(true)
+            .tooltip_text("Toggle Sidebar")
+            .build();
 
         #[cfg(feature = "gnome")]
         let header_bar = {
@@ -143,15 +160,22 @@ impl CommsSpline {
         column_view.append_column(&column);
 
         let tx_clone_nav = tx_event.clone();
-        column_view.model().unwrap().connect_selection_changed(move |model, _pos, _n_items| {
-             let selection = model.downcast_ref::<SingleSelection>().unwrap();
-             if let Some(_selected_item) = selection.selected_item() {
-                 let idx = selection.selected() as usize;
-                 let _ = tx_clone_nav.send_blocking(Event::NavSelect(idx));
-             }
-        });
+        column_view
+            .model()
+            .unwrap()
+            .connect_selection_changed(move |model, _pos, _n_items| {
+                let selection = model.downcast_ref::<SingleSelection>().unwrap();
+                if let Some(_selected_item) = selection.selected_item() {
+                    let idx = selection.selected() as usize;
+                    let _ = tx_clone_nav.send_blocking(Event::NavSelect(idx));
+                }
+            });
 
-        let rooms_scroll = ScrolledWindow::builder().hscrollbar_policy(PolicyType::Never).child(&column_view).vexpand(true).build();
+        let rooms_scroll = ScrolledWindow::builder()
+            .hscrollbar_policy(PolicyType::Never)
+            .child(&column_view)
+            .vexpand(true)
+            .build();
         sidebar_stack.add_titled(&rooms_scroll, Some("rooms"), "Rooms");
 
         let status_box = Box::new(Orientation::Vertical, 10);
@@ -212,7 +236,10 @@ impl CommsSpline {
             .editable(false)
             .monospace(true)
             .buffer(&text_buffer)
-            .margin_start(12).margin_end(12).margin_top(12).margin_bottom(12)
+            .margin_start(12)
+            .margin_end(12)
+            .margin_top(12)
+            .margin_bottom(12)
             .build();
         console_text_view.add_css_class("console");
 
@@ -232,7 +259,11 @@ impl CommsSpline {
 
         let attach_icon = Image::from_icon_name("share-symbolic");
         attach_icon.set_pixel_size(24);
-        let attach_btn = Button::builder().valign(Align::End).css_classes(vec!["attach-action"]).child(&attach_icon).build();
+        let attach_btn = Button::builder()
+            .valign(Align::End)
+            .css_classes(vec!["attach-action"])
+            .child(&attach_icon)
+            .build();
 
         let tx_clone_file = tx_event.clone();
         let window_clone = window.clone();
@@ -250,17 +281,38 @@ impl CommsSpline {
             });
         });
 
-        let input_scroll = ScrolledWindow::builder().hscrollbar_policy(PolicyType::Never).vscrollbar_policy(PolicyType::Automatic).propagate_natural_height(true).max_content_height(500).vexpand(true).valign(Align::Fill).has_frame(false).build();
+        let input_scroll = ScrolledWindow::builder()
+            .hscrollbar_policy(PolicyType::Never)
+            .vscrollbar_policy(PolicyType::Automatic)
+            .propagate_natural_height(true)
+            .max_content_height(500)
+            .vexpand(true)
+            .valign(Align::Fill)
+            .has_frame(false)
+            .build();
         input_scroll.set_hexpand(true);
         input_scroll.add_css_class("chat-input-area");
 
-        let text_view = SourceView::builder().wrap_mode(gtk4::WrapMode::WordChar).show_line_numbers(false).auto_indent(true).accepts_tab(false).top_margin(8).bottom_margin(8).left_margin(10).right_margin(10).build();
+        let text_view = SourceView::builder()
+            .wrap_mode(gtk4::WrapMode::WordChar)
+            .show_line_numbers(false)
+            .auto_indent(true)
+            .accepts_tab(false)
+            .top_margin(8)
+            .bottom_margin(8)
+            .left_margin(10)
+            .right_margin(10)
+            .build();
         text_view.add_css_class("transparent-text");
         input_scroll.set_child(Some(&text_view));
 
         let send_icon = Image::from_icon_name("paper-plane-symbolic");
         send_icon.set_pixel_size(24);
-        let send_btn = Button::builder().valign(Align::End).css_classes(vec!["suggested-action"]).child(&send_icon).build();
+        let send_btn = Button::builder()
+            .valign(Align::End)
+            .css_classes(vec!["suggested-action"])
+            .child(&send_icon)
+            .build();
 
         let tx_clone_send = tx_event.clone();
         let buffer = text_view.buffer();
@@ -312,14 +364,14 @@ impl CommsSpline {
             while let Ok(update) = rx.recv().await {
                 match update {
                     GuiUpdate::ConsoleLog(text) => {
-                         let mut end_iter = text_buffer_clone.end_iter();
-                         text_buffer_clone.insert(&mut end_iter, &text);
-                         let adj = scroll_adj_clone.clone();
-                         glib::timeout_add_local(std::time::Duration::from_millis(50), move || {
-                             adj.set_value(adj.upper());
-                             glib::ControlFlow::Break
-                         });
-                    },
+                        let mut end_iter = text_buffer_clone.end_iter();
+                        text_buffer_clone.insert(&mut end_iter, &text);
+                        let adj = scroll_adj_clone.clone();
+                        glib::timeout_add_local(std::time::Duration::from_millis(50), move || {
+                            adj.set_value(adj.upper());
+                            glib::ControlFlow::Break
+                        });
+                    }
                     GuiUpdate::ShardStatusChanged { id, status } => {
                         let (spinner, label, name) = if id == "una-prime" {
                             (&spinner_una_clone, &label_una_clone, "Una-Prime")

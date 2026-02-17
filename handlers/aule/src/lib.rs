@@ -1,7 +1,7 @@
-use gtk4::prelude::*;
-use gtk4::{Box, Orientation, Button, Widget};
 use async_channel::Sender;
 use elessar::gneiss_pal::Event;
+use gtk4::prelude::*;
+use gtk4::{Box, Button, Orientation, Widget};
 
 pub fn create_view(tx: Sender<Event>) -> Widget {
     let aule_box = Box::new(Orientation::Vertical, 10);

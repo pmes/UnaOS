@@ -1,7 +1,7 @@
 [package]
 name = "lumen"
 version = "0.1.0"
-edition = "2021"
+edition = "2024"
 
 [features]
 default = ["gtk"]
@@ -11,10 +11,10 @@ gnome = ["vein/gnome", "elessar/gnome", "dep:libadwaita"]
 [dependencies]
 elessar = { path = "../../libs/elessar" }
 vein = { path = "../../handlers/vein" }
-gtk4 = { version = "0.9.7", features = ["v4_12"] }
-glib = "0.20"
-async-channel = "2.1"
+gtk4 = { version = "0.10.3", features = ["v4_12"] }
+glib = "0.21"
+async-channel = "2.5"
 log = "0.4"
-env_logger = "0.10"
+env_logger = "0.11"
 dotenvy = "0.15"
-libadwaita = { version = "0.7.2", features = ["v1_4"], optional = true }
+libadwaita = { version = "0.8.1", features = ["v1_4"], optional = true }

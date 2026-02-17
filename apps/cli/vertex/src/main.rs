@@ -95,7 +95,10 @@ fn main() {
         Ok(_) => {
             println!("Vertex Signal Fired.");
             println!("Target: {}", target);
-            println!("Payload: {{ id: \"{}\", status: \"{}\" }}", args.id, final_status);
+            println!(
+                "Payload: {{ id: \"{}\", status: \"{}\" }}",
+                args.id, final_status
+            );
         }
         Err(e) => {
             eprintln!("Failed to send packet: {}", e);

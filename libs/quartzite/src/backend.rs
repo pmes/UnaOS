@@ -1,16 +1,16 @@
 // libs/quartzite/src/backend.rs
+use async_channel::Receiver;
 use gtk4::prelude::*;
 use gtk4::{Application, ApplicationWindow};
-use async_channel::Receiver;
-use std::rc::Rc;
-use std::cell::RefCell;
 use log::info;
+use std::cell::RefCell;
+use std::rc::Rc;
 use std::time::Instant;
 
 #[cfg(feature = "gnome")]
-use libadwaita::prelude::*;
-#[cfg(feature = "gnome")]
 use libadwaita as adw;
+#[cfg(feature = "gnome")]
+use libadwaita::prelude::*;
 
 use gneiss_pal::{AppHandler, Event, GuiUpdate};
 
@@ -22,7 +22,13 @@ pub struct Backend<A: AppHandler> {
 impl<A: AppHandler> Backend<A> {
     // We relax the window type to IsA<ApplicationWindow> to support both GTK and Adwaita
     pub fn new<F>(app_id: &str, app_handler: A, rx: Receiver<GuiUpdate>, bootstrap_fn: F) -> Self
-    where F: Fn(&ApplicationWindow, async_channel::Sender<Event>, Receiver<GuiUpdate>) -> gtk4::Widget + 'static
+    where
+        F: Fn(
+                &ApplicationWindow,
+                async_channel::Sender<Event>,
+                Receiver<GuiUpdate>,
+            ) -> gtk4::Widget
+            + 'static,
     {
         crate::init();
 
@@ -32,10 +38,10 @@ impl<A: AppHandler> Backend<A> {
         let app = Application::builder().application_id(app_id).build();
 
         app.connect_startup(|_| {
-             if let Some(display) = gtk4::gdk::Display::default() {
-                 let icon_theme = gtk4::IconTheme::for_display(&display);
-                 icon_theme.add_resource_path("/org/una/vein/icons");
-             }
+            if let Some(display) = gtk4::gdk::Display::default() {
+                let icon_theme = gtk4::IconTheme::for_display(&display);
+                icon_theme.add_resource_path("/org/una/vein/icons");
+            }
         });
 
         let app_handler_rc = Rc::new(RefCell::new(app_handler));
@@ -81,7 +87,10 @@ impl<A: AppHandler> Backend<A> {
             window.set_child(Some(&content));
 
             window.present();
-            info!("UI_BUILD: Window presented. Duration: {:?}", ui_build_start_time.elapsed());
+            info!(
+                "UI_BUILD: Window presented. Duration: {:?}",
+                ui_build_start_time.elapsed()
+            );
         });
 
         app.run();

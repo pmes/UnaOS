@@ -25,10 +25,12 @@ pub struct Content {
 #[derive(Serialize, Clone, Debug)]
 #[serde(untagged)]
 pub enum Part {
-    Text { text: String },
+    Text {
+        text: String,
+    },
     FileData {
         #[serde(rename = "fileData")]
-        file_data: FileData
+        file_data: FileData,
     },
 }
 
@@ -114,10 +116,7 @@ impl GeminiClient {
 
         info!("System Ignited. Target: {} (Developer API)", model_name);
 
-        Ok(Self {
-            client,
-            model_url,
-        })
+        Ok(Self { client, model_url })
     }
 
     pub async fn generate_content(&self, history: &[Content]) -> Result<String, String> {

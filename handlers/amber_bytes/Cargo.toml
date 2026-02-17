@@ -1,7 +1,7 @@
 [package]
 name = "amber_bytes"
 version = "0.1.0"
-edition = "2021"
+edition = "2024"
 authors = ["pmes"]
 description = "Forensic data recovery and preservation tool"
 
@@ -10,7 +10,7 @@ description = "Forensic data recovery and preservation tool"
 memmap2 = "0.9"
 
 # THE INTERFACE: 'clap' for robust command-line parsing.
-clap = { version = "4.4", features = ["derive"] }
+clap = { version = "4.5", features = ["derive"] }
 
 # THE VISUALIZER: 'hex' ensures we see the raw truth.
 hex = "0.4"
@@ -19,10 +19,10 @@ hex = "0.4"
 sha2 = "0.10"
 
 # NEW: For professional progress bars
-indicatif = "0.17"
+indicatif = "0.18"
 
 # NEW: The Hyper-Fast Searcher
-memchr = "2.7"
+memchr = "2.8"
 
 # NEW: The Chaos Engine
-rand = "0.8"
+rand = "0.10"

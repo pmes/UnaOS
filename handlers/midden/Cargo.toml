@@ -1,9 +1,9 @@
 [package]
 name = "midden"
 version = "0.1.0"
-edition = "2021"
+edition = "2024"
 
 [dependencies]
 elessar = { path = "../../libs/elessar" }
-gtk4 = { version = "0.9.7", features = ["v4_12"] }
-glib = "0.20"
+gtk4 = { version = "0.10.3", features = ["v4_12"] }
+glib = "0.21"

@@ -1,5 +1,5 @@
-use std::path::PathBuf;
 use crate::shard::{Shard, ShardStatus};
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 // --- PURE LOGIC TYPES ---
@@ -49,13 +49,13 @@ pub enum Event {
     NavSelect(usize),
     DockAction(usize),
     // REMOVED: TextBufferUpdate (GTK Dependency)
-    UploadRequest, // Kept for compatibility
+    UploadRequest,         // Kept for compatibility
     FileSelected(PathBuf), // File Upload Selection
     ToggleSidebar,
     // --- ELESSAR EVENTS ---
     MatrixFileClick(PathBuf), // File Tree Click
-    AuleIgnite, // Forge Action
-    Timer, // For heartbeat
+    AuleIgnite,               // Forge Action
+    Timer,                    // For heartbeat
 }
 
 #[derive(Clone, Debug)]

@@ -1,5 +1,5 @@
 use gtk4::prelude::*;
-use gtk4::{Box, Orientation, Label, Align, Widget};
+use gtk4::{Align, Box, Label, Orientation, Widget};
 
 pub fn create_view() -> Widget {
     let vaire_box = Box::new(Orientation::Vertical, 10);

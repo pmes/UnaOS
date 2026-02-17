@@ -3,22 +3,22 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum ShardRole {
-    Root,       // Una-Prime (The Command Deck)
-    Builder,    // S9 (CI/CD)
-    Storage,    // The Mule (Big Data)
-    Kernel,     // Hardware Debugging
+    Root,    // Una-Prime (The Command Deck)
+    Builder, // S9 (CI/CD)
+    Storage, // The Mule (Big Data)
+    Kernel,  // Hardware Debugging
     Unknown,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum ShardStatus {
-    Online,     // Green
-    OnCall,     // Teal
-    Active,     // Seafoam
-    Thinking,   // Purple
-    Paused,     // Yellow
-    Error,      // Red
-    Offline,    // Grey
+    Online,   // Green
+    OnCall,   // Teal
+    Active,   // Seafoam
+    Thinking, // Purple
+    Paused,   // Yellow
+    Error,    // Red
+    Offline,  // Grey
 }
 
 #[derive(Debug, Clone)]

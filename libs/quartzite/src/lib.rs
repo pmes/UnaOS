@@ -4,8 +4,8 @@ pub mod text;
 pub use backend::Backend;
 
 // Re-export specific logic types that UI might need directly
-pub use gneiss_pal::types::*;
 pub use gneiss_pal::shard::*;
+pub use gneiss_pal::types::*;
 
 use gtk4::prelude::*;
 

@@ -1,50 +1,66 @@
+use async_channel::{Receiver, Sender};
 use dotenvy::dotenv;
 use elessar::prelude::*;
-use std::rc::Rc;
+use gtk4::{
+    Align, Box, HeaderBar, Orientation, Paned, ScrolledWindow, Stack, StackSwitcher,
+    StackTransitionType, TextBuffer,
+};
 use log::info;
-use gtk4::{Box, Orientation, Stack, StackTransitionType, StackSwitcher, Align, Paned, HeaderBar, ScrolledWindow, TextBuffer};
-use async_channel::{Sender, Receiver};
+use std::rc::Rc;
 
 // Handlers
-use matrix;
-use vaire;
 use aule;
-use tabula;
+use matrix;
 use midden;
+use tabula;
+use vaire;
 
 struct UnaApp {
     gui_tx: Sender<GuiUpdate>,
 }
 
 impl UnaApp {
-    fn new(gui_tx: Sender<GuiUpdate>) -> Self { Self { gui_tx } }
-    fn log(&self, msg: &str) { let _ = self.gui_tx.send_blocking(GuiUpdate::ConsoleLog(msg.to_string())); }
+    fn new(gui_tx: Sender<GuiUpdate>) -> Self {
+        Self { gui_tx }
+    }
+    fn log(&self, msg: &str) {
+        let _ = self
+            .gui_tx
+            .send_blocking(GuiUpdate::ConsoleLog(msg.to_string()));
+    }
 }
 
 impl AppHandler for UnaApp {
     fn handle_event(&mut self, event: Event) {
         match event {
             Event::AuleIgnite => self.log("[AULË] :: Ignition Sequence Start...\n"),
-            Event::MatrixFileClick(path) => {
-                match std::fs::read_to_string(&path) {
-                    Ok(content) => {
-                        self.log(&format!("[MATRIX] :: Loaded {}\n", path.display()));
-                    },
-                    Err(e) => self.log(&format!("[MATRIX ERROR] :: {}\n", e)),
+            Event::MatrixFileClick(path) => match std::fs::read_to_string(&path) {
+                Ok(content) => {
+                    self.log(&format!("[MATRIX] :: Loaded {}\n", path.display()));
                 }
+                Err(e) => self.log(&format!("[MATRIX ERROR] :: {}\n", e)),
             },
             _ => {}
         }
     }
-    fn view(&self) -> DashboardState { DashboardState::default() }
+    fn view(&self) -> DashboardState {
+        DashboardState::default()
+    }
 }
 
 struct IdeSpline {}
 
 impl IdeSpline {
-    fn new() -> Self { Self {} }
+    fn new() -> Self {
+        Self {}
+    }
 
-    fn bootstrap<W: IsA<Window> + IsA<Widget> + Cast>(&self, window: &W, tx: Sender<Event>, rx: Receiver<GuiUpdate>) -> Widget {
+    fn bootstrap<W: IsA<Window> + IsA<Widget> + Cast>(
+        &self,
+        window: &W,
+        tx: Sender<Event>,
+        rx: Receiver<GuiUpdate>,
+    ) -> Widget {
         window.set_title(Some("Una (The IDE)"));
 
         let header = HeaderBar::new();
@@ -117,12 +133,16 @@ impl IdeSpline {
 
 fn main() {
     dotenv().ok();
-    env_logger::Builder::from_default_env().filter_level(log::LevelFilter::Info).init();
+    env_logger::Builder::from_default_env()
+        .filter_level(log::LevelFilter::Info)
+        .init();
     info!(":: UNA :: Booting...");
 
     let (gui_tx, gui_rx) = async_channel::unbounded();
     let app = UnaApp::new(gui_tx);
     let spline = Rc::new(IdeSpline::new());
 
-    Backend::new("org.unaos.una", app, gui_rx, move |w, tx, rx| spline.bootstrap(w, tx, rx));
+    Backend::new("org.unaos.una", app, gui_rx, move |w, tx, rx| {
+        spline.bootstrap(w, tx, rx)
+    });
 }
