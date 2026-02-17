@@ -9,7 +9,7 @@ use elessar::gneiss_pal::{
     AppHandler, DashboardState, Event, GuiUpdate, Shard, ShardRole, ShardStatus, SidebarPosition,
     ViewMode, WolfpackState,
 };
-use log::{error, info};
+use log::info;
 use serde::Deserialize;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -25,12 +25,6 @@ struct State {
     sidebar_position: SidebarPosition,
     sidebar_collapsed: bool,
     s9_status: ShardStatus,
-}
-
-#[derive(Deserialize, Debug)]
-struct VertexPacket {
-    id: String,
-    status: ShardStatus,
 }
 
 // Upload Logic
@@ -188,18 +182,22 @@ impl VeinHandler {
                             {
                                 let mut s = state_bg.lock().unwrap();
                                 brain_bg.save(&s.chat_history);
-                                let _ = gui_tx_brain
-                                    .send(GuiUpdate::SidebarStatus(WolfpackState::Dreaming))
-                                    .await;
                                 if is_s9 {
                                     s.s9_status = ShardStatus::Thinking;
-                                    let _ = gui_tx_brain
-                                        .send(GuiUpdate::ShardStatusChanged {
-                                            id: "s9-mule".into(),
-                                            status: ShardStatus::Thinking,
-                                        })
-                                        .await;
                                 }
+                            }
+
+                            let _ = gui_tx_brain
+                                .send(GuiUpdate::SidebarStatus(WolfpackState::Dreaming))
+                                .await;
+
+                            if is_s9 {
+                                let _ = gui_tx_brain
+                                    .send(GuiUpdate::ShardStatusChanged {
+                                        id: "s9-mule".into(),
+                                        status: ShardStatus::Thinking,
+                                    })
+                                    .await;
                             }
 
                             let system_instruction =
@@ -210,7 +208,10 @@ impl VeinHandler {
                                 parts: vec![Part::text(system_instruction.into())],
                             });
 
-                            let history = { state_bg.lock().unwrap().chat_history.clone() };
+                            let history = {
+                                let guard = state_bg.lock().unwrap();
+                                guard.chat_history.clone()
+                            };
                             for msg in history.iter().rev().take(20).rev() {
                                 if msg.content.starts_with("SYSTEM") {
                                     continue;
@@ -235,18 +236,23 @@ impl VeinHandler {
                                         .send(GuiUpdate::ConsoleLog(display.clone()))
                                         .await;
 
-                                    let mut s = state_bg.lock().unwrap();
-                                    s.chat_history.push(SavedMessage {
-                                        role: "model".into(),
-                                        content: response,
-                                    });
-                                    brain_bg.save(&s.chat_history);
+                                    {
+                                        let mut s = state_bg.lock().unwrap();
+                                        s.chat_history.push(SavedMessage {
+                                            role: "model".into(),
+                                            content: response,
+                                        });
+                                        brain_bg.save(&s.chat_history);
+                                        if is_s9 {
+                                            s.s9_status = ShardStatus::Online;
+                                        }
+                                    }
 
                                     let _ = gui_tx_brain
                                         .send(GuiUpdate::SidebarStatus(WolfpackState::Idle))
                                         .await;
+
                                     if is_s9 {
-                                        s.s9_status = ShardStatus::Online;
                                         let _ = gui_tx_brain
                                             .send(GuiUpdate::ShardStatusChanged {
                                                 id: "s9-mule".into(),

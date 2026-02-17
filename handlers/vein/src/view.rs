@@ -3,13 +3,16 @@ use async_channel::Receiver;
 use gtk4::prelude::*;
 use gtk4::{
     Align, Box, Button, ColumnView, ColumnViewColumn, CssProvider, EventControllerKey, FileDialog,
-    HeaderBar, Image, Label, ListBox, ListItem, MenuButton, Orientation, Paned, PolicyType,
+    Image, Label, ListBox, ListItem, MenuButton, Orientation, Paned, PolicyType,
     Popover, PropagationPhase, ScrolledWindow, Separator, SignalListItemFactory, SingleSelection,
     Spinner, Stack, StackSwitcher, StackTransitionType, StringObject, TextBuffer, TextView,
     ToggleButton, Widget, Window,
     gdk::{Key, ModifierType},
     gio,
 };
+#[cfg(not(feature = "gnome"))]
+use gtk4::HeaderBar;
+
 use sourceview5::View as SourceView;
 
 // Import Elessar (Engine)
@@ -18,8 +21,6 @@ use elessar::prelude::*; // Provides Event, GuiUpdate, AppHandler // Specific im
 
 #[cfg(feature = "gnome")]
 use libadwaita as adw;
-#[cfg(feature = "gnome")]
-use libadwaita::prelude::*;
 
 pub struct CommsSpline {}
 
@@ -272,7 +273,8 @@ impl CommsSpline {
             let parent_window = window_clone.clone();
             glib::MainContext::default().spawn_local(async move {
                 let dialog = FileDialog::new();
-                if let Ok(file) = dialog.open_future(Some(&parent_window)).await {
+                let result = dialog.open_future(Some(&parent_window)).await;
+                if let Ok(file) = result {
                     if let Some(path) = file.path() {
                         let path_str = path.to_string_lossy().to_string();
                         let _ = tx.send(Event::Input(format!("/upload {}", path_str))).await;

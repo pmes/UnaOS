@@ -69,7 +69,7 @@ struct GenerateContentResponse {
 struct Candidate {
     content: Option<ContentResponse>,
     #[serde(rename = "finishReason")]
-    finish_reason: Option<String>,
+    _finish_reason: Option<String>,
 }
 
 #[derive(Deserialize, Debug)]

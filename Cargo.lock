@@ -1804,6 +1804,7 @@ dependencies = [
  "gtk4",
  "libadwaita",
  "log",
+ "rustls",
  "vein",
 ]
 
