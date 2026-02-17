@@ -3,6 +3,11 @@ name = "una"
 version = "0.1.0"
 edition = "2021"
 
+[features]
+default = ["gtk"]
+gtk = ["elessar/gtk"]
+gnome = ["elessar/gnome", "dep:libadwaita"]
+
 [dependencies]
 elessar = { path = "../../libs/elessar" }
 matrix = { path = "../../handlers/matrix" }
@@ -17,4 +22,4 @@ log = "0.4"
 env_logger = "0.10"
 dotenvy = "0.15"
 libadwaita = { version = "0.7.2", features = ["v1_4"], optional = true }
-sourceview5 = "0.9" # Used by Tabula types?
+sourceview5 = "0.9"

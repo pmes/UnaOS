@@ -1274,6 +1274,7 @@ dependencies = [
  "env_logger",
  "glib",
  "gtk4",
+ "libadwaita",
  "log",
  "vein",
 ]
