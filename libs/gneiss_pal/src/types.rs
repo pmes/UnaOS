@@ -56,6 +56,18 @@ pub enum Event {
     MatrixFileClick(PathBuf), // File Tree Click
     AuleIgnite,               // Forge Action
     Timer,                    // For heartbeat
+
+    // --- VEIN EVENTS (Node Management) ---
+    CreateNode {
+        model: String,
+        history: bool,
+        temperature: f64,
+        system_prompt: String,
+    },
+    NodeAction {
+        action: String, // "exec", "arch", "debug", "una"
+        active: bool,
+    },
 }
 
 #[derive(Clone, Debug)]

@@ -2,11 +2,11 @@
 use async_channel::Receiver;
 use gtk4::prelude::*;
 use gtk4::{
-    Align, Box, Button, ColumnView, ColumnViewColumn, CssProvider, EventControllerKey, FileDialog,
-    Image, Label, ListBox, ListItem, MenuButton, Orientation, Paned, PolicyType,
-    Popover, PropagationPhase, ScrolledWindow, Separator, SignalListItemFactory, SingleSelection,
-    Spinner, Stack, StackSwitcher, StackTransitionType, StringObject, TextBuffer, TextView,
-    ToggleButton, Widget, Window,
+    Adjustment, Align, Box, Button, ColumnView, ColumnViewColumn, CssProvider, DropDown,
+    EventControllerKey, FileDialog, Image, Label, ListBox, ListItem, MenuButton, Orientation,
+    Paned, PolicyType, Popover, PropagationPhase, Scale, ScrolledWindow, Separator,
+    SignalListItemFactory, SingleSelection, Spinner, Stack, StackSwitcher, StackTransitionType,
+    StringList, StringObject, Switch, TextBuffer, TextView, ToggleButton, Widget, Window,
     gdk::{Key, ModifierType},
     gio,
 };
@@ -177,7 +177,50 @@ impl CommsSpline {
             .child(&column_view)
             .vexpand(true)
             .build();
-        sidebar_stack.add_titled(&rooms_scroll, Some("rooms"), "Rooms");
+
+        // Context Menu for Nodes
+        let menu_model = gio::Menu::new();
+        menu_model.append(Some("Connect"), Some("node.connect"));
+        menu_model.append(Some("Edit (Principia)"), Some("node.edit"));
+        menu_model.append(Some("Delete"), Some("node.delete"));
+
+        let popover_menu = Popover::builder()
+            .child(&Box::new(Orientation::Vertical, 0)) // Placeholder, PopoverMenu handles model
+            .build();
+        // GTK4 PopoverMenu from model is tricky without detailed setup,
+        // using simple Popover with buttons for robustness in this snippet context
+        // but following the directive "ColumnView needs a GtkPopoverMenu"
+        // simpler approach: Right click controller on ColumnView
+
+        let click_controller = gtk4::GestureClick::new();
+        click_controller.set_button(3); // Right click
+        let popover_clone = popover_menu.clone();
+
+        // Manual menu construction for robustness
+        let menu_box = Box::new(Orientation::Vertical, 0);
+        let btn_conn = Button::with_label("Connect");
+        btn_conn.add_css_class("flat");
+        let btn_edit = Button::with_label("Edit (Principia)");
+        btn_edit.add_css_class("flat");
+        let btn_del = Button::with_label("Delete");
+        btn_del.add_css_class("flat");
+
+        menu_box.append(&btn_conn);
+        menu_box.append(&btn_edit);
+        menu_box.append(&btn_del);
+
+        let ctx_popover = Popover::builder()
+            .child(&menu_box)
+            .has_arrow(false)
+            .build();
+
+        click_controller.connect_pressed(move |gesture, _n, x, y| {
+            ctx_popover.set_pointing_to(Some(&gtk4::gdk::Rectangle::new(x as i32, y as i32, 1, 1)));
+            ctx_popover.popup();
+        });
+        column_view.add_controller(click_controller);
+
+        sidebar_stack.add_titled(&rooms_scroll, Some("nodes"), "Nodes");
 
         let status_box = Box::new(Orientation::Vertical, 10);
         status_box.set_margin_top(10);
@@ -216,6 +259,143 @@ impl CommsSpline {
         tab_box.set_halign(Align::Center);
         tab_box.append(&stack_switcher);
         sidebar_box.append(&tab_box);
+
+        // Sidebar Footer
+        let footer_box = Box::new(Orientation::Vertical, 4);
+        footer_box.set_margin_start(8);
+        footer_box.set_margin_end(8);
+        footer_box.set_margin_bottom(8);
+
+        let new_node_btn = Button::builder()
+            .icon_name("list-add-symbolic")
+            .tooltip_text("New Node")
+            .build();
+
+        let tx_node_create = tx_event.clone();
+        let parent_win = window.upcast_ref::<Window>().clone();
+
+        new_node_btn.connect_clicked(move |_| {
+            let dialog = Window::builder()
+                .title("New Node Configuration")
+                .modal(true)
+                .transient_for(&parent_win)
+                .default_width(400)
+                .default_height(500)
+                .build();
+
+            let vbox = Box::new(Orientation::Vertical, 12);
+            vbox.set_margin_top(12);
+            vbox.set_margin_bottom(12);
+            vbox.set_margin_start(12);
+            vbox.set_margin_end(12);
+
+            vbox.append(&Label::new(Some("Model")));
+            let models = StringList::new(&["Gemini 2.0 Flash", "Gemini 1.5 Pro", "Claude 3.5 Sonnet"]);
+            let dropdown = DropDown::new(Some(models), None::<gtk4::Expression>);
+            vbox.append(&dropdown);
+
+            let hbox_hist = Box::new(Orientation::Horizontal, 12);
+            hbox_hist.append(&Label::new(Some("Enable History")));
+            let switch_hist = Switch::new();
+            switch_hist.set_active(true);
+            hbox_hist.append(&switch_hist);
+            vbox.append(&hbox_hist);
+
+            vbox.append(&Label::new(Some("Temperature (0.1 - 0.9)")));
+            let adj = Adjustment::new(0.7, 0.1, 0.9, 0.1, 0.0, 0.0);
+            let scale = Scale::new(Orientation::Horizontal, Some(&adj));
+            scale.set_digits(1);
+            scale.set_draw_value(true);
+            vbox.append(&scale);
+
+            vbox.append(&Label::new(Some("System Prompt")));
+            let prompt_buffer = TextBuffer::new(None);
+            let prompt_view = TextView::with_buffer(&prompt_buffer);
+            prompt_view.set_wrap_mode(gtk4::WrapMode::WordChar);
+            let scroll = ScrolledWindow::builder()
+                .child(&prompt_view)
+                .vexpand(true)
+                .height_request(150)
+                .build();
+            vbox.append(&scroll);
+
+            let hbox_btns = Box::new(Orientation::Horizontal, 12);
+            hbox_btns.set_halign(Align::End);
+
+            let btn_cancel = Button::with_label("Cancel");
+            let win_weak = dialog.downgrade();
+            btn_cancel.connect_clicked(move |_| {
+                if let Some(win) = win_weak.upgrade() {
+                    win.close();
+                }
+            });
+
+            let btn_create = Button::with_label("Create Node");
+            btn_create.add_css_class("suggested-action");
+            let win_weak2 = dialog.downgrade();
+            let tx = tx_node_create.clone();
+
+            btn_create.connect_clicked(move |_| {
+                if let Some(win) = win_weak2.upgrade() {
+                    let model_obj = dropdown.selected_item().and_then(|obj| obj.downcast::<StringObject>().ok());
+                    let model = model_obj.map(|s| s.string().to_string()).unwrap_or_default();
+                    let history = switch_hist.is_active();
+                    let temp = adj.value();
+                    let (start, end) = prompt_buffer.bounds();
+                    let prompt = prompt_buffer.text(&start, &end, false).to_string();
+
+                    let _ = tx.send_blocking(Event::CreateNode {
+                        model,
+                        history,
+                        temperature: temp,
+                        system_prompt: prompt,
+                    });
+                    win.close();
+                }
+            });
+
+            hbox_btns.append(&btn_cancel);
+            hbox_btns.append(&btn_create);
+            vbox.append(&hbox_btns);
+
+            dialog.set_child(Some(&vbox));
+            dialog.present();
+        });
+
+        let proto_box = Box::new(Orientation::Horizontal, 4);
+        proto_box.set_halign(Align::Center);
+
+        let btn_exec = ToggleButton::with_label("EXEC");
+        let btn_arch = ToggleButton::with_label("ARCH");
+        let btn_debug = ToggleButton::with_label("DEBUG");
+        let btn_una = ToggleButton::with_label("UNA");
+
+        for (btn, action) in [
+            (&btn_exec, "exec"),
+            (&btn_arch, "arch"),
+            (&btn_debug, "debug"),
+            (&btn_una, "una")
+        ] {
+             btn.add_css_class("small-button");
+             let tx = tx_event.clone();
+             let action_str = action.to_string();
+             btn.connect_toggled(move |b| {
+                 let _ = tx.send_blocking(Event::NodeAction {
+                     action: action_str.clone(),
+                     active: b.is_active()
+                 });
+             });
+        }
+
+        proto_box.append(&btn_exec);
+        proto_box.append(&btn_arch);
+        proto_box.append(&btn_debug);
+        proto_box.append(&btn_una);
+
+        footer_box.append(&new_node_btn);
+        footer_box.append(&proto_box);
+
+        sidebar_box.append(&footer_box);
 
         body_box.append(&sidebar_box);
         body_box.append(&Separator::new(Orientation::Vertical));
@@ -324,7 +504,18 @@ impl CommsSpline {
         let tx_clone_key = tx_event.clone();
         let buffer_key = buffer.clone();
         key_controller.connect_key_pressed(move |_ctrl, key, _keycode, state| {
-            if key == Key::Return && !state.contains(ModifierType::SHIFT_MASK) {
+            if key != Key::Return {
+                return glib::Propagation::Proceed;
+            }
+
+            if state.contains(ModifierType::SHIFT_MASK) {
+                return glib::Propagation::Proceed;
+            }
+
+            let is_ctrl = state.contains(ModifierType::CONTROL_MASK);
+            let line_count = buffer_key.line_count();
+
+            if is_ctrl || line_count <= 1 {
                 let (start, end) = buffer_key.bounds();
                 let text = buffer_key.text(&start, &end, false).to_string();
                 if !text.trim().is_empty() {
@@ -333,6 +524,7 @@ impl CommsSpline {
                 }
                 return glib::Propagation::Stop;
             }
+
             glib::Propagation::Proceed
         });
         text_view.add_controller(key_controller);
@@ -370,7 +562,8 @@ impl CommsSpline {
                         text_buffer_clone.insert(&mut end_iter, &text);
                         let adj = scroll_adj_clone.clone();
                         glib::timeout_add_local(std::time::Duration::from_millis(50), move || {
-                            adj.set_value(adj.upper());
+                            let val = (adj.upper() - adj.page_size()).max(adj.lower());
+                            adj.set_value(val);
                             glib::ControlFlow::Break
                         });
                     }
