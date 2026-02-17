@@ -1,6 +1,5 @@
 use crate::shard::{Shard, ShardStatus};
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
 
 // --- PURE LOGIC TYPES ---
 

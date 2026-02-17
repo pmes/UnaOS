@@ -1,7 +1,9 @@
 // libs/quartzite/src/backend.rs
 use async_channel::Receiver;
 use gtk4::prelude::*;
-use gtk4::{Application, ApplicationWindow};
+#[cfg(not(feature = "gnome"))]
+use gtk4::Application;
+use gtk4::ApplicationWindow;
 use log::info;
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -15,8 +17,8 @@ use libadwaita::prelude::*;
 use gneiss_pal::{AppHandler, Event, GuiUpdate};
 
 pub struct Backend<A: AppHandler> {
-    app_handler: Rc<RefCell<A>>,
-    app_id: String,
+    _app_handler: Rc<RefCell<A>>,
+    _app_id: String,
 }
 
 impl<A: AppHandler> Backend<A> {
@@ -96,8 +98,8 @@ impl<A: AppHandler> Backend<A> {
         app.run();
 
         Self {
-            app_handler: app_handler_rc,
-            app_id: app_id.to_string(),
+            _app_handler: app_handler_rc,
+            _app_id: app_id.to_string(),
         }
     }
 }

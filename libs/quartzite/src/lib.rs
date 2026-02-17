@@ -7,8 +7,6 @@ pub use backend::Backend;
 pub use gneiss_pal::shard::*;
 pub use gneiss_pal::types::*;
 
-use gtk4::prelude::*;
-
 // --- ASSETS ---
 static RESOURCES_BYTES: &[u8] = include_bytes!("../assets/resources.gresource");
 
