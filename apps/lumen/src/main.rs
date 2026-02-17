@@ -1,5 +1,7 @@
+use directories::BaseDirs;
 use dotenvy::dotenv;
 use elessar::prelude::*;
+use elessar::quartzite;
 use log::info;
 use std::fs;
 use std::path::PathBuf;
@@ -8,7 +10,8 @@ use vein::{CommsSpline, VeinHandler};
 
 // Directive S68: The Lumen Homestead
 fn get_lumen_home() -> PathBuf {
-    let mut path = dirs::data_local_dir().expect("Alien Soil not supported");
+    let base_dirs = BaseDirs::new().expect("Alien Soil not supported");
+    let mut path = base_dirs.data_local_dir().to_path_buf();
     path.push("unaos");
     path.push("lumen");
 
