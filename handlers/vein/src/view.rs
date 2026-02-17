@@ -267,22 +267,24 @@ impl CommsSpline {
         sidebar_box.append(&sidebar_stack);
 
         let stack_switcher = StackSwitcher::builder().stack(&sidebar_stack).build();
-        let tab_box = Box::new(Orientation::Horizontal, 0);
-        tab_box.set_halign(Align::Center);
-        tab_box.append(&stack_switcher);
-        sidebar_box.append(&tab_box);
 
-        // Sidebar Footer
-        let footer_box = Box::new(Orientation::Vertical, 4);
-        footer_box.set_margin_start(8);
-        footer_box.set_margin_end(8);
-        footer_box.set_margin_bottom(8);
+        // Sidebar Footer Structure (Directive S69)
+        let footer = Box::new(Orientation::Vertical, 8);
+        footer.set_margin_start(10);
+        footer.set_margin_end(10);
+        footer.set_margin_bottom(10);
+        footer.set_margin_top(10);
+
+        // A. The Action Row (+ and Filters)
+        let actions_box = Box::new(Orientation::Horizontal, 5);
+        actions_box.set_halign(Align::Center);
 
         let new_node_btn = Button::new();
         let icon_new_node = Image::from_icon_name("list-add-symbolic");
         icon_new_node.set_pixel_size(16);
         new_node_btn.set_child(Some(&icon_new_node));
         new_node_btn.set_tooltip_text(Some("New Node"));
+        new_node_btn.add_css_class("flat");
 
         let tx_node_create = tx_event.clone();
         let parent_win = window.upcast_ref::<Window>().clone();
@@ -375,8 +377,8 @@ impl CommsSpline {
             dialog.present();
         });
 
-        let proto_box = Box::new(Orientation::Horizontal, 4);
-        proto_box.set_halign(Align::Center);
+        let filter_group = Box::new(Orientation::Horizontal, 0);
+        filter_group.add_css_class("linked");
 
         let btn_exec = ToggleButton::with_label("EXEC");
         let btn_arch = ToggleButton::with_label("ARCH");
@@ -400,24 +402,41 @@ impl CommsSpline {
              });
         }
 
-        proto_box.append(&btn_exec);
-        proto_box.append(&btn_arch);
-        proto_box.append(&btn_debug);
-        proto_box.append(&btn_una);
+        filter_group.append(&btn_exec);
+        filter_group.append(&btn_arch);
+        filter_group.append(&btn_debug);
+        filter_group.append(&btn_una);
 
-        footer_box.append(&new_node_btn);
-        footer_box.append(&proto_box);
+        actions_box.append(&new_node_btn);
+        actions_box.append(&filter_group);
 
-        // Re-parent Logic (Hierarchy Fix)
-        let nodes_layout = Box::new(Orientation::Vertical, 0);
-        rooms_scroll.set_vexpand(true);
-        nodes_layout.append(&rooms_scroll);
-        footer_box.set_vexpand(false);
-        nodes_layout.append(&footer_box);
+        footer.append(&actions_box);
 
-        sidebar_stack.add_titled(&nodes_layout, Some("nodes"), "Nodes");
+        // B. The Mode Switcher
+        stack_switcher.set_halign(Align::Center);
+        footer.append(&stack_switcher);
+
+        // Sidebar Assembly (Three-Tier)
+        // 1. Content (Stack) - expands
+        // 2. Separator
+        // 3. Footer (Fixed)
+
+        sidebar_stack.add_titled(&rooms_scroll, Some("nodes"), "Nodes"); // Nodes is just the list now
 
         body_box.append(&sidebar_box);
+
+        // Note: sidebar_stack was appended to sidebar_box earlier.
+        // We need to ensure the order: Stack, Sep, Footer.
+        // The earlier code append(&sidebar_stack) needs to be correct.
+        // Let's verify where sidebar_stack was appended.
+        // It was appended right after creation.
+        // We append the separator and footer now.
+
+        sidebar_box.append(&Separator::new(Orientation::Vertical)); // Wait, Horizontal separator for vertical stack? Vertical box -> Horizontal separator.
+        // Code snippet said: Separator::new(Orientation::Horizontal);
+
+        sidebar_box.append(&Separator::new(Orientation::Horizontal));
+        sidebar_box.append(&footer);
         body_box.append(&Separator::new(Orientation::Vertical));
 
         let paned = Paned::new(Orientation::Vertical);
