@@ -2,6 +2,7 @@ use directories::BaseDirs;
 use dotenvy::dotenv;
 use elessar::prelude::*;
 use log::info;
+use quartzite;
 use std::fs;
 use std::path::PathBuf;
 use std::rc::Rc;
