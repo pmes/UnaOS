@@ -10,6 +10,6 @@ pub mod bitmap;
 pub mod fs;
 
 pub use storage::{BlockDevice, MemDevice, BLOCK_SIZE};
-pub use inode::{Inode, Extent, ExtentList, AttributeValue, InodeError};
+pub use inode::{Inode, Extent, ExtentList, AttributeValue, InodeError, FileKind};
 pub use superblock::Superblock;
 pub use fs::{UnaFS, DirEntry};

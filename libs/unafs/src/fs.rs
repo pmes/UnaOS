@@ -349,27 +349,7 @@ impl<D: BlockDevice> UnaFS<D> {
         // 6. Serialize and Write Back
         let data = bincode::serialize(&entries)?;
 
-        // We overwrite the entire directory data for now.
-        // Important: `write_data` with offset 0 overwrites, but doesn't necessarily truncate if previous data was longer.
-        // However, `read_data` uses `inode.size`.
-        // If we write less data than before, old data remains at tail but is ignored if we update size?
-        // Wait, `write_data` updates `inode.size` only if we grow past it. It does NOT shrink it.
-        // We need a way to truncate or overwrite fully.
-        // Since we are rewriting the WHOLE list, the new size is `data.len()`.
-        // We should update the inode size explicitly if it shrank, or ensure `write_data` handles it.
-        // `write_data` logic: `if current_offset > inode.size { inode.size = current_offset }`.
-        // It does NOT handle shrinking.
-        // For correctness, we should update the size to `data.len()` after writing 0..len.
-
         self.write_data(parent_id, 0, &data)?;
-
-        // Manually update size if we shrunk (rare for directory growing, but possible if we deleted entries later)
-        // Here we only append/insert, so size usually grows.
-        // But bincode size might vary.
-        // Let's force update size to match data length.
-        let mut parent_inode = self.read_inode(parent_id)?;
-        parent_inode.size = data.len() as u64;
-        self.write_inode(&parent_inode)?;
 
         Ok(new_id)
     }
