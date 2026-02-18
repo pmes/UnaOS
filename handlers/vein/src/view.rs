@@ -206,7 +206,6 @@ impl CommsSpline {
 
         let click_controller = gtk4::GestureClick::new();
         click_controller.set_button(3); // Right click
-        let popover_clone = popover_menu.clone();
 
         // Manual menu construction for robustness
         let menu_box = Box::new(Orientation::Vertical, 0);
@@ -226,7 +225,7 @@ impl CommsSpline {
             .has_arrow(false)
             .build();
 
-        click_controller.connect_pressed(move |gesture, _n, x, y| {
+        click_controller.connect_pressed(move |_gesture, _n, x, y| {
             ctx_popover.set_pointing_to(Some(&gtk4::gdk::Rectangle::new(x as i32, y as i32, 1, 1)));
             ctx_popover.popup();
         });
@@ -423,20 +422,12 @@ impl CommsSpline {
 
         sidebar_stack.add_titled(&rooms_scroll, Some("nodes"), "Nodes"); // Nodes is just the list now
 
-        body_box.append(&sidebar_box);
-
         // Note: sidebar_stack was appended to sidebar_box earlier.
-        // We need to ensure the order: Stack, Sep, Footer.
-        // The earlier code append(&sidebar_stack) needs to be correct.
-        // Let's verify where sidebar_stack was appended.
-        // It was appended right after creation.
-        // We append the separator and footer now.
-
-        sidebar_box.append(&Separator::new(Orientation::Vertical)); // Wait, Horizontal separator for vertical stack? Vertical box -> Horizontal separator.
-        // Code snippet said: Separator::new(Orientation::Horizontal);
 
         sidebar_box.append(&Separator::new(Orientation::Horizontal));
         sidebar_box.append(&footer);
+
+        body_box.append(&sidebar_box);
         body_box.append(&Separator::new(Orientation::Vertical));
 
         let paned = Paned::new(Orientation::Vertical);
