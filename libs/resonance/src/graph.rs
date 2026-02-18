@@ -76,6 +76,20 @@ impl AudioGraph {
         inputs[input_index] = Some(src);
     }
 
+    /// Sets a parameter on a specific node.
+    ///
+    /// This delegates the call to the node's `set_param` method.
+    ///
+    /// # Arguments
+    /// * `node` - The ID of the target node.
+    /// * `param_id` - The parameter ID.
+    /// * `value` - The new value.
+    pub fn set_node_param(&mut self, node: NodeId, param_id: usize, value: f64) {
+        if let Some(n) = self.nodes.get_mut(node.0) {
+            n.set_param(param_id, value);
+        }
+    }
+
     /// Processes one block of audio through the entire graph.
     ///
     /// Iterates through nodes in the order they were added (topological order is expected).

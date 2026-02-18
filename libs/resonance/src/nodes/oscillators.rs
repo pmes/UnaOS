@@ -63,6 +63,14 @@ impl AudioNode for SineOscillator {
             }
         }
     }
+
+    fn set_param(&mut self, id: usize, value: f64) {
+        match id {
+            // Param 0: Frequency
+            0 => self.frequency = value,
+            _ => {}
+        }
+    }
 }
 
 #[cfg(test)]
@@ -103,5 +111,13 @@ mod tests {
         for i in 0..BLOCK_SIZE {
             assert!(outputs[0][i] >= -1.0 && outputs[0][i] <= 1.0);
         }
+    }
+
+    #[test]
+    fn test_sine_oscillator_set_param() {
+        let mut osc = SineOscillator::new(440.0);
+        assert_eq!(osc.frequency, 440.0);
+        osc.set_param(0, 880.0);
+        assert_eq!(osc.frequency, 880.0);
     }
 }

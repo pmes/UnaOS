@@ -31,4 +31,13 @@ pub trait AudioNode {
         outputs: &mut [&mut [Sample; BLOCK_SIZE]],
         context: &GraphContext,
     );
+
+    /// Set a node-specific parameter.
+    ///
+    /// # Arguments
+    /// * `id` - The parameter ID (meaning defined by the implementation).
+    /// * `value` - The new value.
+    fn set_param(&mut self, _id: usize, _value: f64) {
+        // Default implementation does nothing.
+    }
 }
