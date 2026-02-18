@@ -12,4 +12,4 @@ pub mod fs;
 pub use storage::{BlockDevice, MemDevice, BLOCK_SIZE};
 pub use inode::{Inode, Extent, ExtentList, AttributeValue, InodeError};
 pub use superblock::Superblock;
-pub use fs::UnaFS;
+pub use fs::{UnaFS, DirEntry};

@@ -1,4 +1,5 @@
 use unafs::{MemDevice, BlockDevice, Inode, AttributeValue, BLOCK_SIZE};
+use unafs::inode::FileKind;
 
 #[test]
 fn test_inode_serialization_vector() {
@@ -6,7 +7,7 @@ fn test_inode_serialization_vector() {
     let mut device = MemDevice::new();
 
     // 2. Create Inode
-    let mut inode = Inode::new(101);
+    let mut inode = Inode::new(101, FileKind::File);
     let vector_data = vec![0.1f32, 0.2, 0.9];
     inode.attributes.insert(
         "embedding".to_string(),

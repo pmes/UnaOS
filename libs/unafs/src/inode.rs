@@ -12,6 +12,14 @@ pub enum InodeError {
     Serialization(#[from] bincode::Error),
 }
 
+/// The type of file represented by an Inode.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, PartialOrd, Copy)]
+pub enum FileKind {
+    File,
+    Directory,
+    Symlink,
+}
+
 /// Represents a contiguous chunk of data on the disk.
 ///
 /// Extents allow for efficient storage of large files by mapping logical offsets
@@ -54,6 +62,10 @@ pub enum AttributeValue {
 pub struct Inode {
     /// Unique identifier for the Inode.
     pub id: u64,
+    /// The type of file (File, Directory, Symlink).
+    pub kind: FileKind,
+    /// The logical size of the file data in bytes.
+    pub size: u64,
     /// List of data extents.
     pub chunks: ExtentList,
     /// Key-value map of semantic attributes.
@@ -61,10 +73,12 @@ pub struct Inode {
 }
 
 impl Inode {
-    /// Create a new Inode with the given ID.
-    pub fn new(id: u64) -> Self {
+    /// Create a new Inode with the given ID and default File kind.
+    pub fn new(id: u64, kind: FileKind) -> Self {
         Self {
             id,
+            kind,
+            size: 0,
             chunks: Vec::new(),
             attributes: BTreeMap::new(),
         }
