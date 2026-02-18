@@ -40,12 +40,10 @@ fn main() {
     let asset_path = home.join("quartzite.gresource");
     let history_path = home.join("history.json");
 
-    // 2. Deploy Assets (Stop Gap)
-    if !asset_path.exists() {
-        info!(":: LUMEN :: Deploying assets to {}", asset_path.display());
-        if let Err(e) = quartzite::deploy_assets(&asset_path) {
-            log::error!("Failed to deploy assets: {}", e);
-        }
+    // 2. FORCE DEPLOY (S74)
+    info!(":: LUMEN :: Deploying assets to {}", asset_path.display());
+    if let Err(e) = quartzite::deploy_assets(&asset_path) {
+        log::error!("Failed to deploy assets: {}", e);
     }
 
     // 3. Initialize Quartzite with specific path

@@ -1,7 +1,7 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <gresources>
   <gresource prefix="/org/unaos/lumen/icons">
-    <file alias="paper-plane-symbolic">icons/paper-plane-symbolic.svg</file>
-    <file alias="share-symbolic">icons/share-symbolic.svg</file>
+    <file alias="scalable/actions/paper-plane-symbolic.svg">icons/paper-plane-symbolic.svg</file>
+    <file alias="scalable/actions/share-symbolic.svg">icons/share-symbolic.svg</file>
   </gresource>
 </gresources>
