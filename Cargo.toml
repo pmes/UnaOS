@@ -4,6 +4,8 @@ members = [
     "libs/gneiss_pal",
     "libs/quartzite",
     "libs/elessar",
+    "libs/resonance",
+    "libs/unafs",
     "handlers/vein",
     "handlers/matrix",
     "handlers/vaire",
@@ -13,6 +15,7 @@ members = [
     "handlers/amber_bytes",
     "handlers/vug",
     "apps/cli/vertex",
+    "apps/cli/unafs",
     "apps/lumen",
     "apps/una"
 ]
