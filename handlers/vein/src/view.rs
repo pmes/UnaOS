@@ -473,6 +473,7 @@ impl CommsSpline {
         let attach_btn = Button::builder()
             .valign(Align::End)
             .css_classes(vec!["attach-action"])
+            .tooltip_text("Attach File")
             .child(&attach_icon)
             .build();
 
@@ -523,6 +524,7 @@ impl CommsSpline {
         let send_btn = Button::builder()
             .valign(Align::End)
             .css_classes(vec!["suggested-action"])
+            .tooltip_text("Send Message (Ctrl+Enter)")
             .child(&send_icon)
             .build();
 
