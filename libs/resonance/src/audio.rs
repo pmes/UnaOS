@@ -1,3 +1,4 @@
+use bandy::{BandyMember, SMessage};
 use crate::commands::AudioCommand;
 use crate::graph::AudioGraph;
 use crate::{BLOCK_SIZE, Sample};
@@ -9,6 +10,8 @@ use std::sync::{Arc, Mutex};
 pub struct AudioEngine {
     // The stream must be held to keep the audio running.
     _stream: cpal::Stream,
+    pub sample_rate: u32,
+    pub is_active: bool,
 }
 
 impl AudioEngine {
@@ -29,6 +32,7 @@ impl AudioEngine {
 
         let config = device.default_output_config()?;
         let sample_format = config.sample_format();
+        let sample_rate = config.sample_rate().0;
         let config: cpal::StreamConfig = config.into();
 
         let channels = config.channels as usize;
@@ -75,7 +79,42 @@ impl AudioEngine {
 
         stream.play()?;
 
-        Ok((Self { _stream: stream }, producer))
+        Ok((
+            Self {
+                _stream: stream,
+                sample_rate,
+                is_active: true,
+            },
+            producer,
+        ))
+    }
+
+    /// Simulates processing a chunk of audio and broadcasting it.
+    /// This is where the physics (Resonance) meets the wire (Bandy).
+    pub fn process_frame(&self, raw_samples: Vec<f32>) -> anyhow::Result<()> {
+        // 1. (Future) Apply DSP / Noise Reduction here.
+
+        // 2. Wrap it in the Monolithic Enum.
+        let msg = SMessage::AudioChunk {
+            source_id: "mic_01".to_string(),
+            samples: raw_samples, // In reality, this would be the processed buffer
+            sample_rate: self.sample_rate,
+        };
+
+        // 3. Publish to the Nervous System.
+        self.publish("system/audio/input", msg)?;
+
+        Ok(())
+    }
+}
+
+// Implement the Nervous System Interface
+impl BandyMember for AudioEngine {
+    fn publish(&self, topic: &str, msg: SMessage) -> anyhow::Result<()> {
+        // TODO: This will eventually push to the specific Transport Layer (MQTT/ZMQ).
+        // For now, we just acknowledge the data structure exists.
+        println!("[BANDY] Publishing to '{}': {:?}", topic, msg);
+        Ok(())
     }
 }
 

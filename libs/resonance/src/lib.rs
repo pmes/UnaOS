@@ -4,6 +4,7 @@ pub const BLOCK_SIZE: usize = 64;
 pub mod audio;
 pub mod commands;
 pub mod core;
+pub mod dsp;
 pub mod graph;
 pub mod nodes;
 
