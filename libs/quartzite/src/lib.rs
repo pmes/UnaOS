@@ -19,6 +19,9 @@ pub fn deploy_assets(path: &std::path::Path) -> std::io::Result<()> {
 }
 
 pub fn init_with_path(path: &std::path::Path) {
+    println!(":: QUARTZITE :: INIT_WITH_PATH CALLED. IF YOU SEE THIS, THE WIRE IS CONNECTED.");
+    panic!(":: QUARTZITE :: I AM ALIVE! (Remove this panic after verification)");
+
     let resource = gtk4::gio::Resource::load(path).expect("Failed to load GResource from path");
     gtk4::gio::resources_register(&resource);
 
@@ -30,6 +33,9 @@ pub fn init_with_path(path: &std::path::Path) {
 
 // Initialize function to setup resources and theme (Embedded fallback)
 pub fn init() {
+    println!(":: QUARTZITE :: INIT CALLED. IF YOU SEE THIS, THE WIRE IS CONNECTED.");
+    panic!(":: QUARTZITE :: I AM ALIVE! (Remove this panic after verification)");
+
     // 1. Load the compiled binary from the OUT_DIR
     let res_bytes = glib::Bytes::from_static(EMBEDDED_RESOURCE);
 
