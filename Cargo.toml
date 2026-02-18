@@ -5,6 +5,7 @@ members = [
     "libs/quartzite",
     "libs/elessar",
     "libs/resonance",
+    "libs/unafs",
     "handlers/vein",
     "handlers/matrix",
     "handlers/vaire",
