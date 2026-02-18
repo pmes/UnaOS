@@ -5,6 +5,11 @@
 
 pub mod storage;
 pub mod inode;
+pub mod superblock;
+pub mod bitmap;
+pub mod fs;
 
 pub use storage::{BlockDevice, MemDevice, BLOCK_SIZE};
 pub use inode::{Inode, Extent, ExtentList, AttributeValue, InodeError};
+pub use superblock::Superblock;
+pub use fs::UnaFS;
