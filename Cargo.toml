@@ -6,6 +6,7 @@ members = [
     "libs/elessar",
     "libs/resonance",
     "libs/unafs",
+    "libs/bandy",
     "handlers/vein",
     "handlers/matrix",
     "handlers/vaire",
