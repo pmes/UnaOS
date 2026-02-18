@@ -15,6 +15,7 @@ members = [
     "handlers/amber_bytes",
     "handlers/vug",
     "apps/cli/vertex",
+    "apps/cli/unafs",
     "apps/lumen",
     "apps/una"
 ]
