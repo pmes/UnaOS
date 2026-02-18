@@ -4,6 +4,7 @@
 pub mod api;
 pub mod forge;
 pub mod persistence;
+pub mod paths;
 pub mod shard;
 pub mod types;
 

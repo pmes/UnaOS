@@ -3657,6 +3657,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "unafs-cli"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "gneiss_pal",
+ "unafs",
+]
+
+[[package]]
 name = "unicase"
 version = "2.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
