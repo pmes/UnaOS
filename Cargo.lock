@@ -2825,6 +2825,7 @@ name = "resonance"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "bandy",
  "cpal",
  "ringbuf",
 ]
@@ -3703,6 +3704,7 @@ dependencies = [
 name = "unafs"
 version = "0.1.0"
 dependencies = [
+ "bandy",
  "bincode",
  "serde",
  "thiserror 2.0.18",
@@ -3792,6 +3794,7 @@ name = "vein"
 version = "0.1.0"
 dependencies = [
  "async-channel",
+ "bandy",
  "chrono",
  "elessar",
  "glib",
