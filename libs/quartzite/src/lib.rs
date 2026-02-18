@@ -19,8 +19,7 @@ pub fn deploy_assets(path: &std::path::Path) -> std::io::Result<()> {
 }
 
 pub fn init_with_path(path: &std::path::Path) {
-    println!(":: QUARTZITE :: INIT_WITH_PATH CALLED. IF YOU SEE THIS, THE WIRE IS CONNECTED.");
-    panic!(":: QUARTZITE :: I AM ALIVE! (Remove this panic after verification)");
+    println!(":: QUARTZITE :: Loading assets from: {}", path.display());
 
     let resource = gtk4::gio::Resource::load(path).expect("Failed to load GResource from path");
     gtk4::gio::resources_register(&resource);
@@ -28,14 +27,38 @@ pub fn init_with_path(path: &std::path::Path) {
     if let Some(display) = gtk4::gdk::Display::default() {
         let theme = gtk4::IconTheme::for_display(&display);
         theme.add_resource_path("/org/unaos/lumen/icons");
+        println!(":: QUARTZITE :: Search Path Added: /org/unaos/lumen/icons");
+    }
+
+    println!(":: QUARTZITE :: Dumping GResource Inventory...");
+    let target_path = "/org/unaos/lumen/icons/scalable/actions";
+
+    match gtk4::gio::resources_enumerate_children(
+        target_path,
+        gtk4::gio::ResourceLookupFlags::NONE
+    ) {
+        Ok(children) => {
+            if children.is_empty() {
+                println!(":: QUARTZITE :: WARNING: Folder exists but is EMPTY: {}", target_path);
+            }
+            for name in children {
+                println!("   [FOUND] {}/{}", target_path, name);
+            }
+        }
+        Err(e) => {
+            println!(":: QUARTZITE :: CRITICAL FAILURE: Could not read path '{}'", target_path);
+            println!(":: QUARTZITE :: Error: {}", e);
+            println!(":: QUARTZITE :: Attempting root dump...");
+
+            if let Ok(root) = gtk4::gio::resources_enumerate_children("/", gtk4::gio::ResourceLookupFlags::NONE) {
+                for r in root { println!("   [ROOT] /{}", r); }
+            }
+        }
     }
 }
 
 // Initialize function to setup resources and theme (Embedded fallback)
 pub fn init() {
-    println!(":: QUARTZITE :: INIT CALLED. IF YOU SEE THIS, THE WIRE IS CONNECTED.");
-    panic!(":: QUARTZITE :: I AM ALIVE! (Remove this panic after verification)");
-
     // 1. Load the compiled binary from the OUT_DIR
     let res_bytes = glib::Bytes::from_static(EMBEDDED_RESOURCE);
 
