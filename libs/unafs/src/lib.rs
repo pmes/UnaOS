@@ -13,3 +13,6 @@ pub use storage::{BlockDevice, FileDevice, MemDevice, BLOCK_SIZE};
 pub use inode::{Inode, Extent, ExtentList, AttributeValue, InodeError, FileKind};
 pub use superblock::Superblock;
 pub use fs::{UnaFS, DirEntry};
+
+/// The default FileSystem type backed by a host file.
+pub type FileSystem = UnaFS<FileDevice>;

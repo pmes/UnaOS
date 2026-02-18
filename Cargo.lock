@@ -3714,8 +3714,10 @@ dependencies = [
 name = "unafs-cli"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
+ "bandy",
  "clap",
- "gneiss_pal",
+ "tokio",
  "unafs",
 ]
 
