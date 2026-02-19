@@ -51,6 +51,16 @@ pub enum SMessage {
         path: String,
         event: String // e.g., "Created", "Modified"
     },
+
+    // --- MIDDEN (The Terminal) ---
+    /// No operation.
+    NoOp,
+    /// Standard output from the terminal.
+    TerminalOutput(String),
+    /// Standard error from the terminal.
+    TerminalError(String),
+    /// A generic file system event message (unstructured).
+    FileSystemEvent(String),
 }
 
 /// The trait that defines a "Nerve Ending" in the system.

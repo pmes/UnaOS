@@ -2055,9 +2055,12 @@ dependencies = [
 name = "midden"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
+ "bandy",
  "elessar",
  "glib",
  "gtk4",
+ "unafs",
 ]
 
 [[package]]
