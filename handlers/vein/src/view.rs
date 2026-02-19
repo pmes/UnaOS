@@ -3,8 +3,8 @@ use async_channel::Receiver;
 use gtk4::prelude::*;
 use gtk4::{
     Adjustment, Align, Box, Button, ColumnView, ColumnViewColumn, CssProvider, DropDown,
-    EventControllerKey, FileDialog, Image, Label, ListBox, ListItem, MenuButton, Orientation,
-    Paned, PolicyType, Popover, PropagationPhase, Scale, ScrolledWindow, Separator,
+    EventControllerKey, FileDialog, GLArea, Image, Label, ListBox, ListItem, MenuButton,
+    Orientation, Paned, PolicyType, Popover, PropagationPhase, Scale, ScrolledWindow, Separator,
     SignalListItemFactory, SingleSelection, Spinner, Stack, StackSwitcher, StackTransitionType,
     StringList, StringObject, Switch, TextBuffer, TextView, ToggleButton, Widget, Window,
     gdk::{Key, ModifierType},
@@ -14,6 +14,9 @@ use gtk4::{
 use gtk4::HeaderBar;
 
 use sourceview5::View as SourceView;
+use std::cell::RefCell;
+use std::rc::Rc;
+use vug::renderer::Renderer;
 
 // Import Elessar (Engine)
 use elessar::gneiss_pal::shard::ShardStatus;
@@ -459,7 +462,22 @@ impl CommsSpline {
         let scroll_adj_clone = scrolled_window_adj.clone();
 
         scrolled_window.set_child(Some(&console_text_view));
-        paned.set_start_child(Some(&scrolled_window));
+
+        // Spatial Cortex (Strike 2)
+        let h_paned = Paned::new(Orientation::Horizontal);
+        h_paned.set_start_child(Some(&scrolled_window));
+
+        let gl_area = GLArea::new();
+        gl_area.set_has_depth_buffer(true);
+        gl_area.set_size_request(300, -1);
+
+        let renderer = Rc::new(RefCell::new(Renderer::new()));
+        gl_area.connect_render(move |area, ctx| renderer.borrow_mut().draw(area, ctx));
+
+        h_paned.set_end_child(Some(&gl_area));
+        h_paned.set_position(800); // Favor console width
+
+        paned.set_start_child(Some(&h_paned));
 
         let input_container = Box::new(Orientation::Horizontal, 8);
         input_container.set_valign(Align::Fill);
@@ -595,9 +613,16 @@ impl CommsSpline {
         let label_s9_clone = label_s9.clone();
         let spinner_s9_clone = spinner_s9.clone();
 
+        let gl_area_clone = gl_area.clone();
+        let renderer_clone = renderer.clone();
+
         glib::MainContext::default().spawn_local(async move {
             while let Ok(update) = rx.recv().await {
                 match update {
+                    GuiUpdate::Spectrum(data) => {
+                        renderer_clone.borrow_mut().update_spectrum(data);
+                        gl_area_clone.queue_render();
+                    }
                     GuiUpdate::ConsoleLog(text) => {
                         let mut end_iter = text_buffer_clone.end_iter();
                         text_buffer_clone.insert(&mut end_iter, &text);

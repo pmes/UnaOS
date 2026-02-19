@@ -1,0 +1,12 @@
+[package]
+name = "junct"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+cpal = "0.15"
+tokio = { version = "1.49", features = ["full"] }
+anyhow = "1.0"
+log = "0.4"
+bandy = { path = "../../libs/bandy" }
+resonance = { path = "../../libs/resonance" }

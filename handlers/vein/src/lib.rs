@@ -16,7 +16,9 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 use tokio::runtime::Runtime;
-use tokio::sync::mpsc;
+use tokio::sync::{broadcast, mpsc};
+
+use bandy::{BandyMember, SMessage};
 
 struct State {
     mode: ViewMode,
@@ -101,10 +103,15 @@ pub struct VeinHandler {
     state: Arc<Mutex<State>>,
     tx: mpsc::UnboundedSender<String>,
     gui_tx: async_channel::Sender<GuiUpdate>,
+    bandy_tx: broadcast::Sender<SMessage>,
 }
 
 impl VeinHandler {
-    pub fn new(gui_tx: async_channel::Sender<GuiUpdate>, history_path: PathBuf) -> Self {
+    pub fn new(
+        gui_tx: async_channel::Sender<GuiUpdate>,
+        history_path: PathBuf,
+        bandy_tx: broadcast::Sender<SMessage>,
+    ) -> Self {
         let brain = BrainManager::new(history_path);
         let saved_history = brain.load();
 
@@ -293,10 +300,49 @@ impl VeinHandler {
             }
         }
 
+        // Spawn Bandy Listener
+        let mut bandy_rx = bandy_tx.subscribe();
+        let gui_tx_bandy = gui_tx.clone();
+
+        thread::spawn(move || {
+            let rt = Runtime::new().expect("Failed to create Bandy Runtime");
+            rt.block_on(async move {
+                while let Ok(msg) = bandy_rx.recv().await {
+                    match msg {
+                        SMessage::FileEvent { path, event } => {
+                            let _ = gui_tx_bandy
+                                .send(GuiUpdate::ConsoleLog(format!(
+                                    "\n[BANDY] File {}: {}\n",
+                                    event, path
+                                )))
+                                .await;
+                        }
+                        SMessage::Log {
+                            level,
+                            source,
+                            content,
+                        } => {
+                            let _ = gui_tx_bandy
+                                .send(GuiUpdate::ConsoleLog(format!(
+                                    "\n[LOG:{}] {}: {}\n",
+                                    level, source, content
+                                )))
+                                .await;
+                        }
+                        SMessage::Spectrum { magnitude } => {
+                            let _ = gui_tx_bandy.send(GuiUpdate::Spectrum(magnitude)).await;
+                        }
+                        _ => {}
+                    }
+                }
+            });
+        });
+
         Self {
             state,
             tx: tx_to_bg,
             gui_tx,
+            bandy_tx,
         }
     }
 
@@ -304,6 +350,15 @@ impl VeinHandler {
         let _ = self
             .gui_tx
             .send_blocking(GuiUpdate::ConsoleLog(text.to_string()));
+    }
+}
+
+impl BandyMember for VeinHandler {
+    fn publish(&self, _topic: &str, msg: SMessage) -> anyhow::Result<()> {
+        self.bandy_tx
+            .send(msg)
+            .map_err(|e| anyhow::anyhow!("Bandy Send Error: {}", e))?;
+        Ok(())
     }
 }
 

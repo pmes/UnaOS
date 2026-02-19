@@ -1,11 +1,14 @@
 use directories::BaseDirs;
 use dotenvy::dotenv;
+use bandy::SMessage;
 use elessar::prelude::*;
+use junct::JunctHandler;
 use log::info;
 use quartzite;
 use std::fs;
 use std::path::PathBuf;
 use std::rc::Rc;
+use tokio::sync::broadcast;
 use vein::{CommsSpline, VeinHandler};
 
 // Directive S68: The Lumen Homestead
@@ -49,10 +52,32 @@ fn main() {
     // 3. Initialize Quartzite with specific path
     quartzite::init_with_path(&asset_path);
 
+    // 4. Initialize Nervous System (Bandy)
+    let (bandy_tx, _bandy_rx) = broadcast::channel::<SMessage>(100);
+
     let (gui_tx, gui_rx) = async_channel::unbounded();
 
     // Logic (With History Path)
-    let app = VeinHandler::new(gui_tx, history_path);
+    let app = VeinHandler::new(gui_tx, history_path, bandy_tx.clone());
+
+    // 5. Initialize Voice (Junct)
+    let _voice = match JunctHandler::new(bandy_tx.clone()) {
+        Ok(v) => {
+            info!(":: JUNCT :: Listening...");
+            Some(v)
+        }
+        Err(e) => {
+            log::warn!(":: JUNCT :: Failed to initialize microphone: {}", e);
+            None
+        }
+    };
+
+    // Test Pulse
+    let _ = bandy_tx.send(SMessage::Log {
+        level: "INFO".into(),
+        source: "LUMEN".into(),
+        content: "Nervous System Online".into(),
+    });
 
     // View
     let spline = Rc::new(CommsSpline::new());
