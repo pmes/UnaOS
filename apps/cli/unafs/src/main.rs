@@ -1,6 +1,6 @@
 use clap::{Parser, Subcommand};
-use anyhow::Result;
-use unafs::FileSystem; // Assuming this is the main struct in libs/unafs
+use anyhow::{Context, Result};
+use unafs::{FileSystem, FileDevice};
 use bandy::{SMessage, BandyMember};
 
 #[derive(Parser)]
@@ -44,8 +44,18 @@ async fn main() -> Result<()> {
     match &cli.command {
         Commands::Init { path, size_mb } => {
             println!("⚡ [OPERATOR] Initializing Vault at '{}' ({} MB)...", path, size_mb);
-            // FileSystem::init(path, size_mb)?;
-            // TODO: Connect to libs/unafs implementation
+
+            // Pre-allocate file
+            let file = std::fs::File::create(path).context("Failed to create file")?;
+            file.set_len(size_mb * 1024 * 1024).context("Failed to set file size")?;
+
+            // Open as block device
+            let device = FileDevice::open(path).context("Failed to open device")?;
+            let fs = FileSystem::format(device, *size_mb).context("Failed to format filesystem")?;
+
+            // Notify
+            let msg = SMessage::FileEvent { path: path.clone(), event: "Created".into() };
+            fs.publish("system/fs/created", msg)?;
         }
         Commands::Ls { path } => {
             println!("📂 [OPERATOR] Listing '{}'...", path);
