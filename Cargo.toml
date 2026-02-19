@@ -7,6 +7,7 @@ members = [
     "libs/resonance",
     "libs/unafs",
     "libs/bandy",
+    "libs/euclase",
     "handlers/vein",
     "handlers/matrix",
     "handlers/vaire",
