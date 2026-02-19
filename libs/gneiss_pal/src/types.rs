@@ -16,6 +16,7 @@ pub enum GuiUpdate {
     ConsoleLog(String),
     EditorLoad(String),
     SidebarStatus(WolfpackState), // The Pulse
+    Spectrum(Vec<f32>),
 }
 
 #[derive(Clone, Debug, PartialEq)]

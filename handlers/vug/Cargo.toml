@@ -4,3 +4,8 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+gtk4 = { version = "0.10.3", features = ["v4_12"] }
+glib = "0.21"
+epoxy = "0.1.0"
+euclase = { path = "../../libs/euclase" }
+log = "0.4"
