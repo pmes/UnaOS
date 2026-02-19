@@ -1,13 +1,49 @@
 use async_channel::Sender;
 use elessar::gneiss_pal::Event;
+use elessar::{Context, Spline};
 use gtk4::prelude::*;
 use gtk4::{Box, Image, Label, ListBox, Orientation, ScrolledWindow, Widget};
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+
+pub struct ProjectView {
+    pub root_path: PathBuf,
+    pub spline: Spline,
+}
+
+impl ProjectView {
+    pub fn new(path: &Path) -> Self {
+        // 1. DETECT REALITY
+        let context = Context::new(path);
+
+        println!("[MATRIX] Loading Project: {:?}", path);
+        println!("[MATRIX] Detected Spline: {:?}", context.spline);
+
+        Self {
+            root_path: path.to_path_buf(),
+            spline: context.spline,
+        }
+    }
+
+    pub fn get_icon_name(&self) -> &str {
+        match self.spline {
+            Spline::UnaOS => "computer-symbolic", // The Monolith
+            Spline::Rust => "applications-engineering-symbolic", // The Gear
+            Spline::Web => "network-server-symbolic", // The Web
+            Spline::Python => "media-playlist-shuffle-symbolic", // The Snake (Abstract)
+            Spline::Void => "folder-symbolic", // Generic
+        }
+    }
+}
 
 pub fn create_view(tx: Sender<Event>) -> Widget {
     let matrix_list = ListBox::new();
     matrix_list.set_selection_mode(gtk4::SelectionMode::None);
+
+    // Initialize ProjectView to detect Spline
+    let project_view = ProjectView::new(Path::new("."));
+    // We could use project_view.get_icon_name() to decorate the root if we displayed a root node.
+    // For now, it just logs to stdout as requested.
 
     if let Ok(entries) = fs::read_dir(".") {
         for entry in entries.flatten() {

@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+anyhow = "1.0"
 elessar = { path = "../../libs/elessar" }
 gtk4 = { version = "0.10.3", features = ["v4_12"] }
 glib = "0.21"
