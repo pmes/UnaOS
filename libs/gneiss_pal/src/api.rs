@@ -1,8 +1,8 @@
 use log::{error, info};
 use reqwest::{Client, ClientBuilder};
 use serde::{Deserialize, Serialize};
-use std::env;
 use std::time::Duration;
+use std::process::Command;
 
 #[derive(Serialize)]
 struct GenerateContentRequest {
@@ -91,22 +91,33 @@ struct PromptFeedback {
 pub struct GeminiClient {
     client: Client,
     model_url: String,
+    token: String, // Added to store the active gcloud token
 }
 
 impl GeminiClient {
     pub async fn new() -> Result<Self, String> {
-        // 1. Get the Key (Simpler Auth)
-        let api_key =
-            env::var("GEMINI_API_KEY").map_err(|_| "GEMINI_API_KEY not set in .env".to_string())?;
+        // 1. Simple Auth broken. Fetch Bearer Token dynamically via gcloud ADC
+        let output = Command::new("gcloud")
+            .args(["auth", "application-default", "print-access-token"])
+            .output()
+            .map_err(|e| format!("Failed to execute gcloud for token: {}", e))?;
+
+        if !output.status.success() {
+            return Err("Failed to retrieve gcloud access token. Ensure gcloud ADC is configured.".to_string());
+        }
+
+        let token = String::from_utf8(output.stdout)
+            .map_err(|_| "Invalid UTF-8 in gcloud token".to_string())?
+            .trim()
+            .to_string();
 
         // 2. Hardcode to Experimental as requested
         let model_name = "gemini-3-pro-preview";
 
-        // 3. Use the Developer API URL (Not Vertex)
-        // using generateContent (Buffered) to avoid timeout/stream issues for now
+        // 3. Pure Vertex URL (No API key appended)
         let model_url = format!(
-            "https://generativelanguage.googleapis.com/v1beta/models/{}:generateContent?key={}",
-            model_name, api_key
+            "https://aiplatform.googleapis.com/v1/projects/unauploads-1769528906/locations/global/publishers/google/models/{}:generateContent",
+            model_name
         );
 
         let client = ClientBuilder::new()
@@ -114,18 +125,16 @@ impl GeminiClient {
             .build()
             .map_err(|e| format!("Failed to build HTTP client: {}", e))?;
 
-        info!("System Ignited. Target: {} (Developer API)", model_name);
+        info!("System Ignited. Target: {} (Vertex API)", model_name);
 
-        Ok(Self { client, model_url })
+        Ok(Self { client, model_url, token })
     }
 
     pub async fn generate_content(&self, history: &[Content]) -> Result<String, String> {
-        // NO RETRY LOOP. Raw connection.
-
         let request_body = GenerateContentRequest {
             contents: history.to_vec(),
             generation_config: GenerationConfig {
-                temperature: 0.9, // High creativity
+                temperature: 0.4, // shoot down the middle
             },
         };
 
@@ -134,6 +143,7 @@ impl GeminiClient {
         let response = self
             .client
             .post(&self.model_url)
+            .bearer_auth(&self.token) // Injects the exact header Vertex demands
             .json(&request_body)
             .send()
             .await
@@ -172,8 +182,7 @@ impl GeminiClient {
         Err("Neural Core returned silence (Empty Response).".to_string())
     }
 
-    // Stubbed out because we aren't using Vertex Token anymore
     pub async fn list_vertex_models(&self) -> Result<String, String> {
-        Ok("Model listing unavailable in Experimental Key Mode.".to_string())
+        Ok("Model listing bypass engaged. Hardcoded to gemini-3-pro-preview.".to_string())
     }
 }
