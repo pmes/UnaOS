@@ -3723,6 +3723,7 @@ dependencies = [
 name = "unafs"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "bandy",
  "bincode",
  "serde",

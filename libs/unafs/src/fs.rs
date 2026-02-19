@@ -1,3 +1,4 @@
+use bandy::{BandyMember, SMessage};
 use crate::storage::{BlockDevice, Error as StorageError, BLOCK_SIZE};
 use crate::superblock::{Superblock, SuperblockError};
 use crate::bitmap::SpaceMap;
@@ -42,8 +43,17 @@ pub struct UnaFS<D: BlockDevice> {
 
 impl<D: BlockDevice> UnaFS<D> {
     /// Format the device with a new UnaFS filesystem.
-    pub fn format(mut device: D) -> Result<Self, FileSystemError> {
-        let block_count = device.block_count();
+    pub fn format(mut device: D, size_mb: u64) -> Result<Self, FileSystemError> {
+        // Use provided size if device is empty or for initialization
+        let blocks_from_size = (size_mb * 1024 * 1024) / BLOCK_SIZE;
+        let mut block_count = device.block_count();
+
+        if block_count == 0 {
+             block_count = blocks_from_size;
+             // Note: Device backing should ideally be resized here, but BlockDevice trait doesn't have resize.
+             // MemDevice auto-resizes on write. FileDevice will write at offsets.
+        }
+
         let mut superblock = Superblock::new(block_count);
         let mut bitmap = SpaceMap::new(block_count);
 
@@ -81,12 +91,12 @@ impl<D: BlockDevice> UnaFS<D> {
     }
 
     /// Mount an existing UnaFS filesystem.
-    pub fn mount(device: D) -> Result<Self, FileSystemError> {
+    pub fn mount(mut device: D) -> Result<Self, FileSystemError> {
         let mut sb_block = vec![0u8; BLOCK_SIZE as usize];
         device.read_block(0, &mut sb_block)?;
         let superblock = Superblock::from_bytes(&sb_block)?;
 
-        let bitmap = SpaceMap::load(&device, superblock.bitmap_start, superblock.bitmap_blocks)?;
+        let bitmap = SpaceMap::load(&mut device, superblock.bitmap_start, superblock.bitmap_blocks)?;
 
         Ok(Self {
             device,
@@ -96,7 +106,7 @@ impl<D: BlockDevice> UnaFS<D> {
     }
 
     /// Read an Inode by ID.
-    pub fn read_inode(&self, id: u64) -> Result<Inode, FileSystemError> {
+    pub fn read_inode(&mut self, id: u64) -> Result<Inode, FileSystemError> {
         let mut block = vec![0u8; BLOCK_SIZE as usize];
         self.device.read_block(id, &mut block)?;
         let inode = Inode::from_bytes(&block)?;
@@ -236,7 +246,7 @@ impl<D: BlockDevice> UnaFS<D> {
     }
 
     /// Read data from an Inode.
-    pub fn read_data(&self, inode_id: u64, offset: u64, length: u64) -> Result<Vec<u8>, FileSystemError> {
+    pub fn read_data(&mut self, inode_id: u64, offset: u64, length: u64) -> Result<Vec<u8>, FileSystemError> {
         let inode = self.read_inode(inode_id)?;
         let mut buffer = Vec::with_capacity(length as usize);
         let mut read_so_far = 0;
@@ -284,7 +294,7 @@ impl<D: BlockDevice> UnaFS<D> {
     }
 
     /// List directory contents.
-    pub fn ls(&self, inode_id: u64) -> Result<Vec<DirEntry>, FileSystemError> {
+    pub fn ls(&mut self, inode_id: u64) -> Result<Vec<DirEntry>, FileSystemError> {
         let inode = self.read_inode(inode_id)?;
 
         if inode.kind != FileKind::Directory {
@@ -322,6 +332,12 @@ impl<D: BlockDevice> UnaFS<D> {
         }
 
         // 2. Read Existing Entries
+        // Note: ls calls read_data which calls read_inode. All need &mut self.
+        // But we just called read_inode(parent_id) which borrows self.
+        // We need to drop the borrow of parent_inode before calling ls?
+        // parent_inode is an owned Inode (returned by value from read_inode).
+        // So the borrow of self in read_inode ends when it returns.
+
         let mut entries = if parent_inode.size > 0 {
             self.ls(parent_id)?
         } else {
@@ -352,5 +368,12 @@ impl<D: BlockDevice> UnaFS<D> {
         self.write_data(parent_id, 0, &data)?;
 
         Ok(new_id)
+    }
+}
+
+impl<D: BlockDevice> BandyMember for UnaFS<D> {
+    fn publish(&self, topic: &str, msg: SMessage) -> anyhow::Result<()> {
+        println!("[UNAFS] Broadcasting event to '{}': {:?}", topic, msg);
+        Ok(())
     }
 }

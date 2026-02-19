@@ -31,7 +31,7 @@ pub trait BlockDevice {
     /// # Arguments
     /// * `id` - The block ID to read.
     /// * `buf` - The buffer to read into. Must be exactly `BLOCK_SIZE` bytes.
-    fn read_block(&self, id: u64, buf: &mut [u8]) -> Result<(), Error>;
+    fn read_block(&mut self, id: u64, buf: &mut [u8]) -> Result<(), Error>;
 
     /// Write a block to the device.
     ///
@@ -62,48 +62,15 @@ impl FileDevice {
 }
 
 impl BlockDevice for FileDevice {
-    fn read_block(&self, id: u64, buf: &mut [u8]) -> Result<(), Error> {
+    fn read_block(&mut self, id: u64, buf: &mut [u8]) -> Result<(), Error> {
         if buf.len() as u64 != BLOCK_SIZE {
             return Err(Error::BadBlockSize(buf.len(), BLOCK_SIZE));
         }
 
-        // We need mutable access to the file to seek/read, but the trait takes &self.
-        // `File` has internal mutability for I/O operations in some contexts, but `Read` requires `&mut self`.
-        // However, `&File` implements `Read` and `Write` in recent Rust versions?
-        // No, `&File` implements `Read` and `Write` via system calls which are thread-safe (mostly),
-        // BUT `Seek` on `&File` is tricky.
-        // Actually, looking at std::fs::File, `Read` is implemented for `&File`.
-        // Wait, `impl Read for &File` exists.
-        // So we can use `(&self.file).seek(...)`? No, seek modifies the file pointer.
-        // If we have multiple threads reading, seeking would race.
-        // But here we are single-threaded for now or need to be careful.
-        // The trait definition `fn read_block(&self, ...)` implies concurrent reads might be possible.
-        // `File` in Rust:
-        // `impl Read for &File`
-        // `impl Write for &File`
-        // `impl Seek for &File`
-        // Yes, all implemented for `&File`. This allows concurrent access if the OS supports it (e.g. pread/pwrite).
-        // However, `seek` + `read` is not atomic.
-        // If we use `seek` then `read`, another thread could `seek` in between.
-        // For `FileDevice`, we should ideally use `std::os::unix::fs::FileExt` for `read_at` / `write_at` to avoid seek races,
-        // but that's Unix-specific.
-        // The instructions say "Wrapper around `std::fs::File`... Use `file.seek(...)` then `read_exact`".
-        // If the trait signature is `&self` for read, and we use `seek`, we have a race condition if shared.
-        // But for this task, we can assume single ownership or use a Mutex if needed.
-        // But `File` methods for `&File` use the shared file descriptor.
-        // Given the instructions, I will use `seek` and `read_exact` on `&self.file`.
-        // Note: `seek` takes `&mut self` on `File`, but `&File` implements `Seek`?
-        // Let's check `std::fs::File`.
-        // `impl Seek for &File` exists.
-        // So we can do `(&self.file).seek(...)`.
-
-        let mut file = &self.file;
-        // seek to offset
-        file.seek(SeekFrom::Start(id * BLOCK_SIZE))
+        self.file.seek(SeekFrom::Start(id * BLOCK_SIZE))
             .map_err(|e| Error::Io(e.to_string()))?;
 
-        // read exact
-        file.read_exact(buf)
+        self.file.read_exact(buf)
             .map_err(|e| Error::Io(e.to_string()))?;
 
         Ok(())
@@ -152,7 +119,7 @@ impl MemDevice {
 }
 
 impl BlockDevice for MemDevice {
-    fn read_block(&self, id: u64, buf: &mut [u8]) -> Result<(), Error> {
+    fn read_block(&mut self, id: u64, buf: &mut [u8]) -> Result<(), Error> {
         if buf.len() as u64 != BLOCK_SIZE {
             return Err(Error::BadBlockSize(buf.len(), BLOCK_SIZE));
         }

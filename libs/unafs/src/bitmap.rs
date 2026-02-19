@@ -23,7 +23,7 @@ impl SpaceMap {
     /// Load the bitmap from the device.
     ///
     /// Reads from `start_block` for `count` blocks.
-    pub fn load<D: BlockDevice>(device: &D, start_block: u64, count: u64) -> Result<Self, StorageError> {
+    pub fn load<D: BlockDevice>(device: &mut D, start_block: u64, count: u64) -> Result<Self, StorageError> {
         let mut bits = Vec::with_capacity((count * BLOCK_SIZE) as usize);
         let mut buf = vec![0u8; BLOCK_SIZE as usize];
 
