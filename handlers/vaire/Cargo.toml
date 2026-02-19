@@ -6,6 +6,7 @@ edition = "2024"
 [dependencies]
 anyhow = "1.0"
 bandy = { path = "../../libs/bandy" }
+git2 = { version = "0.20", default-features = false }
 elessar = { path = "../../libs/elessar" }
 gtk4 = { version = "0.10.3", features = ["v4_12"] }
 glib = "0.21"
