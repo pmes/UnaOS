@@ -17,6 +17,7 @@ members = [
     "handlers/vug",
     "apps/cli/vertex",
     "apps/cli/unafs",
+    "apps/sentinel",
     "apps/lumen",
     "apps/una"
 ]
