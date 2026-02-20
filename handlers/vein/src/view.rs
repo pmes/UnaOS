@@ -82,8 +82,8 @@ impl CommsSpline {
         // --- Left Pane (The Silhouette) ---
         let left_vbox = Box::new(Orientation::Vertical, 0);
         left_vbox.add_css_class("sidebar");
-        left_vbox.add_css_class("background"); // Directive 059
-        left_vbox.set_width_request(215);
+        left_vbox.add_css_class("background"); // Directive 059 & 060
+        left_vbox.set_width_request(215); // Directive 060
 
         // Blank HeaderBar
         #[cfg(feature = "gnome")]
@@ -337,6 +337,7 @@ impl CommsSpline {
 
         // --- Right Pane (The Command Center) ---
         let right_vbox = Box::new(Orientation::Vertical, 0);
+        right_vbox.set_hexpand(true); // Directive 060: Kinematic Enforcement
 
         // Command HeaderBar
         #[cfg(feature = "gnome")]
