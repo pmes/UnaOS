@@ -40,6 +40,9 @@ fn main() {
 
     // 1. Establish Base Camp
     let home = get_lumen_home();
+    // THE ANCHOR (Contextual Grounding)
+    info!(":: LUMEN :: UnaOS Root Directory: {}", home.display());
+
     let asset_path = home.join("quartzite.gresource");
     let history_path = home.join("history.json");
 
