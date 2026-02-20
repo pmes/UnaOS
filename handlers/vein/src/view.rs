@@ -174,15 +174,94 @@ impl CommsSpline {
 
         // New Node Click Logic (Abbreviated for brevity, same as before)
         let tx_node_create = tx_event.clone();
-        let parent_win = window.upcast_ref::<Window>().clone();
+        let _parent_win = window.upcast_ref::<Window>().clone(); // Omega: _parent_win
+
         new_node_btn.connect_clicked(move |_| {
-            // ... (Same dialog logic) ...
-            let _ = tx_node_create.send_blocking(Event::CreateNode {
-                 model: "Gemini 2.0 Flash".into(),
-                 history: true,
-                 temperature: 0.7,
-                 system_prompt: "".into()
+            let dialog = Window::builder()
+                .title("New Node Configuration")
+                .modal(true)
+                .transient_for(&_parent_win) // Omega: _parent_win
+                .default_width(400)
+                .default_height(500)
+                .build();
+
+            let vbox = Box::new(Orientation::Vertical, 12);
+            vbox.set_margin_top(12);
+            vbox.set_margin_bottom(12);
+            vbox.set_margin_start(12);
+            vbox.set_margin_end(12);
+
+            vbox.append(&Label::new(Some("Model")));
+            let models = StringList::new(&["Gemini 2.0 Flash", "Gemini 1.5 Pro", "Claude 3.5 Sonnet"]);
+            let dropdown = DropDown::new(Some(models), None::<gtk4::Expression>);
+            vbox.append(&dropdown);
+
+            let hbox_hist = Box::new(Orientation::Horizontal, 12);
+            hbox_hist.append(&Label::new(Some("Enable History")));
+            let switch_hist = Switch::new();
+            switch_hist.set_active(true);
+            hbox_hist.append(&switch_hist);
+            vbox.append(&hbox_hist);
+
+            vbox.append(&Label::new(Some("Temperature (0.1 - 0.9)")));
+            let adj = Adjustment::new(0.7, 0.1, 0.9, 0.1, 0.0, 0.0);
+            let scale = Scale::new(Orientation::Horizontal, Some(&adj));
+            scale.set_digits(1);
+            scale.set_draw_value(true);
+            vbox.append(&scale);
+
+            vbox.append(&Label::new(Some("System Prompt")));
+            let prompt_buffer = TextBuffer::new(None);
+            let prompt_view = TextView::with_buffer(&prompt_buffer);
+            prompt_view.set_wrap_mode(gtk4::WrapMode::WordChar);
+            let scroll = ScrolledWindow::builder()
+                .child(&prompt_view)
+                .vexpand(true)
+                .height_request(150)
+                .build();
+            vbox.append(&scroll);
+
+            let hbox_btns = Box::new(Orientation::Horizontal, 12);
+            hbox_btns.set_halign(Align::End);
+
+            let btn_cancel = Button::with_label("Cancel");
+            let win_weak = dialog.downgrade();
+            btn_cancel.connect_clicked(move |_| {
+                if let Some(win) = win_weak.upgrade() {
+                    win.close();
+                }
             });
+
+            let btn_create = Button::with_label("Create Node");
+            btn_create.add_css_class("suggested-action");
+            let win_weak2 = dialog.downgrade();
+            let tx = tx_node_create.clone();
+
+            btn_create.connect_clicked(move |_| {
+                if let Some(win) = win_weak2.upgrade() {
+                    let model_obj = dropdown.selected_item().and_then(|obj| obj.downcast::<StringObject>().ok());
+                    let model = model_obj.map(|s| s.string().to_string()).unwrap_or_default();
+                    let history = switch_hist.is_active();
+                    let temp = adj.value();
+                    let (start, end) = prompt_buffer.bounds();
+                    let prompt = prompt_buffer.text(&start, &end, false).to_string();
+
+                    let _ = tx.send_blocking(Event::CreateNode {
+                        model,
+                        history,
+                        temperature: temp,
+                        system_prompt: prompt,
+                    });
+                    win.close();
+                }
+            });
+
+            hbox_btns.append(&btn_cancel);
+            hbox_btns.append(&btn_create);
+            vbox.append(&hbox_btns);
+
+            dialog.set_child(Some(&vbox));
+            dialog.present();
         });
         nodes_box.append(&new_node_btn);
 
@@ -284,7 +363,10 @@ impl CommsSpline {
         gl_area.set_has_depth_buffer(true);
         gl_area.set_size_request(300, -1);
         let renderer = Rc::new(RefCell::new(Renderer::new()));
-        gl_area.connect_render(move |area, ctx| renderer.borrow_mut().draw(area, ctx));
+
+        // 1. THE RENDERER CLONE (Omega Fix)
+        let renderer_draw = renderer.clone();
+        gl_area.connect_render(move |area, ctx| renderer_draw.borrow_mut().draw(area, ctx));
 
         h_paned.set_end_child(Some(&gl_area));
         h_paned.set_position(800);
@@ -395,7 +477,7 @@ impl CommsSpline {
         let b_ex = btn_exec.clone();
         let b_ar = btn_arch.clone();
         let b_db = btn_debug.clone();
-        let b_un = btn_una.clone();
+        let _b_un = btn_una.clone(); // Omega: _b_un
 
         btn_comp_send.connect_clicked(move |_| {
             if let Some(pop) = pop_weak.upgrade() {
