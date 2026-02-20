@@ -17,6 +17,7 @@ use sourceview5::View as SourceView;
 use std::cell::RefCell;
 use std::rc::Rc;
 use vug::renderer::Renderer;
+use vug::{gl, epoxy};
 
 // Import Elessar (Engine)
 use elessar::gneiss_pal::shard::ShardStatus;
@@ -366,6 +367,13 @@ impl CommsSpline {
 
         // 1. THE RENDERER CLONE (Omega Fix)
         let renderer_draw = renderer.clone();
+        let renderer_realize = renderer.clone();
+
+        gl_area.connect_realize(move |_area| {
+            gl::load_with(|s| epoxy::get_proc_addr(s));
+            renderer_realize.borrow_mut().init_gl();
+        });
+
         gl_area.connect_render(move |area, ctx| renderer_draw.borrow_mut().draw(area, ctx));
 
         h_paned.set_end_child(Some(&gl_area));
@@ -423,7 +431,10 @@ impl CommsSpline {
         let tx_composer = tx_event.clone();
         let popover_composer = Popover::builder().build();
         let pop_box = Box::new(Orientation::Vertical, 8);
-        pop_box.set_margin_all(10);
+        pop_box.set_margin_top(10);
+        pop_box.set_margin_bottom(10);
+        pop_box.set_margin_start(10);
+        pop_box.set_margin_end(10);
         pop_box.set_width_request(400);
 
         // Action Buttons (EXEC, ARCH, DEBUG, UNA)

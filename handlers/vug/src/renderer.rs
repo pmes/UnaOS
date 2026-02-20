@@ -67,8 +67,8 @@ impl Renderer {
         self.spectrum = data;
     }
 
-    fn init(&mut self) {
-        gl::load_with(|s| epoxy::get_proc_addr(s));
+    pub fn init_gl(&mut self) {
+        // gl::load_with moved to handlers/vein/src/view.rs connect_realize
 
         unsafe {
             let vertex_shader = compile_shader(gl::VERTEX_SHADER, VERTEX_SHADER_SRC);
@@ -151,7 +151,8 @@ impl Renderer {
 
     pub fn draw(&mut self, area: &GLArea, _ctx: &GLContext) -> glib::Propagation {
         if self.program == 0 {
-            self.init();
+            // Not initialized yet, wait for realize signal
+            return glib::Propagation::Proceed;
         }
 
         unsafe {
