@@ -83,11 +83,20 @@ impl CommsSpline {
 
         // Blank HeaderBar
         #[cfg(feature = "gnome")]
-        let blank_header_bar = adw::HeaderBar::new();
-        #[cfg(not(feature = "gnome"))]
-        let blank_header_bar = HeaderBar::new();
+        let blank_header_bar = {
+            let hb = adw::HeaderBar::new();
+            hb.set_show_start_title_buttons(false);
+            hb.set_show_end_title_buttons(false);
+            hb
+        };
 
-        blank_header_bar.set_show_title_buttons(false);
+        #[cfg(not(feature = "gnome"))]
+        let blank_header_bar = {
+            let hb = HeaderBar::new();
+            hb.set_show_title_buttons(false);
+            hb
+        };
+
         left_vbox.append(&blank_header_bar);
 
         // Sidebar Content
@@ -324,11 +333,20 @@ impl CommsSpline {
 
         // Command HeaderBar
         #[cfg(feature = "gnome")]
-        let command_header_bar = adw::HeaderBar::new();
-        #[cfg(not(feature = "gnome"))]
-        let command_header_bar = HeaderBar::new();
+        let command_header_bar = {
+            let hb = adw::HeaderBar::new();
+            hb.set_show_start_title_buttons(true);
+            hb.set_show_end_title_buttons(true);
+            hb
+        };
 
-        command_header_bar.set_show_title_buttons(true);
+        #[cfg(not(feature = "gnome"))]
+        let command_header_bar = {
+            let hb = HeaderBar::new();
+            hb.set_show_title_buttons(true);
+            hb
+        };
+
         // command_header_bar.set_title_widget(Some(&Label::new(Some("Lumen")))); // Title handled by window usually, but explicit requested? "Lumen"
 
         // Grouping: Toggle + Telemetry
