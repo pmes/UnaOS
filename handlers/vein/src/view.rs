@@ -3,26 +3,26 @@ use async_channel::Receiver;
 use gtk4::prelude::*;
 use gtk4::{
     Adjustment, Align, Box, Button, CheckButton, ColumnView, ColumnViewColumn, CssProvider, DropDown, Entry,
-    EventControllerKey, FileDialog, GLArea, Image, Label, ListBox, ListItem, MenuButton,
-    Orientation, Paned, PolicyType, Popover, PropagationPhase, Scale, ScrolledWindow, Separator,
+    EventControllerKey, FileDialog, GLArea, Image, Label, ListBox, ListItem,
+    Orientation, Paned, PolicyType, Popover, PropagationPhase, Scale, ScrolledWindow,
     SignalListItemFactory, SingleSelection, Spinner, Stack, StackSwitcher, StackTransitionType,
     StringList, StringObject, Switch, TextBuffer, TextView, ToggleButton, Widget, Window,
     gdk::{Key, ModifierType},
     gio,
 };
-#[cfg(not(feature = "gnome"))]
-use gtk4::HeaderBar;
 
 use sourceview5::View as SourceView;
 use std::cell::RefCell;
 use std::rc::Rc;
 use vug::renderer::Renderer;
-use vug::{gl, epoxy};
 
 // Import Elessar (Engine)
 use elessar::gneiss_pal::shard::ShardStatus;
 use elessar::gneiss_pal::{GuiUpdate, WolfpackState};
 use elessar::prelude::*;
+
+#[cfg(not(feature = "gnome"))]
+use gtk4::HeaderBar;
 
 #[cfg(feature = "gnome")]
 use libadwaita as adw;
@@ -42,25 +42,25 @@ impl CommsSpline {
     ) -> Widget {
         window.set_title(Some("Vein (Trinity Architecture)"));
 
-        // THE PULSE (Visual Feedback)
+        // THE PULSE (Stripped of Tab Hacks)
         let provider = CssProvider::new();
         provider.load_from_string("
-            box.sidebar { background-color: #28282c; color: #ffffff; }
-            .background { background-color: #28282c; color: #ffffff; }
-            .console { background-color: #101010; color: #dddddd; font-family: 'Monospace'; caret-color: #dddddd; padding: 12px; }
-            .chat-input-area { background-color: #2d2d2d; border-radius: 12px; padding: 2px; }
-            textview.transparent-text { background-color: transparent; color: #ffffff; caret-color: #ffffff; font-family: 'Sans'; font-size: 15px; padding: 6px; }
-            textview.transparent-text text { background-color: transparent; color: #ffffff; }
-            .suggested-action { background-color: #0078d4; color: #ffffff; border-radius: 4px; padding: 0px; min-width: 34px; min-height: 34px; margin-left: 8px; }
-            .suggested-action image { -gtk-icon-style: symbolic; color: #ffffff; }
-            .attach-action { background-color: #333333; color: #cccccc; border-radius: 4px; padding: 0px; min-width: 42px; min-height: 42px; margin-right: 8px; }
-            .attach-action image { -gtk-icon-style: symbolic; color: inherit; }
-            .attach-action:hover { color: #ffffff; background-color: #444444; }
-            .attach-action:active { background-color: #222222; }
-            .composer-action { background-color: #333333; color: #cccccc; border-radius: 4px; padding: 0px; min-width: 42px; min-height: 42px; margin-right: 8px; }
-            .composer-action:hover { color: #ffffff; background-color: #444444; }
-            .pulse-active { color: #0078d4; -gtk-icon-style: symbolic; transition: opacity 1s ease-in-out; }
-            window { background-color: #1e1e1e; }
+            .console { font-family: 'Monospace'; padding: 12px; }
+            .chat-input-area { border-radius: 12px; padding: 2px; border: 1px solid alpha(currentColor, 0.1); }
+            textview.transparent-text { background-color: transparent; font-family: 'Sans'; font-size: 15px; padding: 6px; }
+            textview.transparent-text text { background-color: transparent; }
+
+            /* Native Icon Scaling */
+            .suggested-action { background-color: #0078d4; color: #ffffff; border-radius: 4px; }
+            .attach-action { border-radius: 4px; }
+
+            /* Pulse Animation */
+            @keyframes throb {
+                0% { opacity: 0.3; }
+                50% { opacity: 1.0; }
+                100% { opacity: 0.3; }
+            }
+            .pulse-active { animation: throb 1.5s infinite ease-in-out; color: #0078d4; }
             .nexus-header { font-weight: bold; margin-top: 12px; margin-bottom: 4px; opacity: 0.7; font-size: 0.9em; }
         ");
 
@@ -70,51 +70,49 @@ impl CommsSpline {
             gtk4::STYLE_PROVIDER_PRIORITY_APPLICATION,
         );
 
-        // --- Root Layout (Directive 058-B v3) ---
+        // UI Controls (Created early so they can be packed into either architecture)
+        let sidebar_toggle = ToggleButton::builder()
+            .icon_name("sidebar-show-symbolic")
+            .active(true)
+            .tooltip_text("Toggle Sidebar")
+            .build();
+
+        let token_label = Label::new(Some("Tokens: 0"));
+        token_label.add_css_class("dim-label");
+        token_label.set_margin_end(10);
+
+        let pulse_icon = Image::from_icon_name("activity-start-symbolic");
+        pulse_icon.set_pixel_size(16);
+        pulse_icon.set_opacity(0.3);
+
+        let status_group = Box::new(Orientation::Horizontal, 8);
+        status_group.append(&sidebar_toggle);
+        status_group.append(&token_label);
+        status_group.append(&pulse_icon);
+
+        // --- Root Layout ---
         let main_h_paned = Paned::new(Orientation::Horizontal);
         main_h_paned.set_position(215);
         main_h_paned.set_hexpand(true);
         main_h_paned.set_vexpand(true);
-        main_h_paned.set_wide_handle(true); // Directive 061
+        main_h_paned.set_wide_handle(false); // Thin vertical divider
+        main_h_paned.set_shrink_start_child(false);
 
         // --- Left Pane (The Silhouette) ---
         let left_vbox = Box::new(Orientation::Vertical, 0);
-        left_vbox.add_css_class("sidebar");
-        left_vbox.add_css_class("background"); // Directive 059 & 060
-        left_vbox.add_css_class("navigation-sidebar"); // Directive 061
-        left_vbox.set_width_request(215); // Directive 060
-
-        // Blank HeaderBar
-        #[cfg(feature = "gnome")]
-        let blank_header_bar = {
-            let hb = adw::HeaderBar::new();
-            hb.set_show_start_title_buttons(false);
-            hb.set_show_end_title_buttons(false);
-            hb
-        };
-
-        #[cfg(not(feature = "gnome"))]
-        let blank_header_bar = {
-            let hb = HeaderBar::new();
-            hb.set_show_title_buttons(false);
-            hb
-        };
-
-        // Ensure Left Header is Empty
-        blank_header_bar.set_title_widget(Some(&Label::new(None)));
-        blank_header_bar.add_css_class("titlebar"); // Directive 063: GTK Titlebar Fix
-
-        left_vbox.append(&blank_header_bar);
+        left_vbox.add_css_class("background");
+        left_vbox.add_css_class("navigation-sidebar");
+        left_vbox.set_width_request(215);
 
         // Sidebar Content
         let sidebar_box = Box::new(Orientation::Vertical, 0);
-        sidebar_box.set_vexpand(true); // Ensure sidebar fills remaining space
+        sidebar_box.set_vexpand(true);
 
         let sidebar_stack = Stack::new();
         sidebar_stack.set_vexpand(true);
         sidebar_stack.set_transition_type(StackTransitionType::SlideLeftRight);
 
-        // 1. Nodes Tab (Column View)
+        // 1. Nodes Tab
         let store = gio::ListStore::new::<StringObject>();
         for item in ["General", "Encrypted", "Jules (Private)"].iter() {
             store.append(&StringObject::new(item));
@@ -153,9 +151,6 @@ impl CommsSpline {
             .vexpand(true)
             .build();
 
-        // Add "New Node" button to Nodes tab bottom?
-        // Logic: Keep simple. "New Node" button was in footer.
-        // I'll put it at the bottom of the Nodes tab.
         let nodes_box = Box::new(Orientation::Vertical, 0);
         nodes_box.append(&nodes_scroll);
 
@@ -170,15 +165,14 @@ impl CommsSpline {
         new_node_btn.set_tooltip_text(Some("New Node"));
         new_node_btn.add_css_class("flat");
 
-        // New Node Click Logic (Abbreviated for brevity, same as before)
         let tx_node_create = tx_event.clone();
-        let _parent_win = window.upcast_ref::<Window>().clone(); // Omega: _parent_win
+        let _parent_win = window.upcast_ref::<Window>().clone();
 
         new_node_btn.connect_clicked(move |_| {
             let dialog = Window::builder()
                 .title("New Node Configuration")
                 .modal(true)
-                .transient_for(&_parent_win) // Omega: _parent_win
+                .transient_for(&_parent_win)
                 .default_width(400)
                 .default_height(500)
                 .build();
@@ -263,7 +257,7 @@ impl CommsSpline {
         });
         node_actions_box.append(&new_node_btn);
 
-        // THE COMPOSER (Relocated)
+        // THE COMPOSER
         let composer_icon = Image::from_icon_name("chat-message-new-symbolic");
         let composer_btn = Button::builder()
             .css_classes(vec!["flat"])
@@ -276,7 +270,7 @@ impl CommsSpline {
 
         sidebar_stack.add_titled(&nodes_box, Some("nodes"), "Nodes");
 
-        // 2. THE NEXUS Tab (Hierarchy)
+        // 2. THE NEXUS Tab
         let nexus_box = Box::new(Orientation::Vertical, 0);
         nexus_box.set_margin_start(10);
         nexus_box.set_margin_end(10);
@@ -286,10 +280,8 @@ impl CommsSpline {
         nexus_list.add_css_class("shard-list");
         nexus_list.set_selection_mode(gtk4::SelectionMode::None);
 
-        // Header: Primes
         nexus_list.append(&Label::builder().label("PRIMES").xalign(0.0).css_classes(vec!["nexus-header"]).build());
 
-        // Una Prime
         let row_una = Box::new(Orientation::Horizontal, 10);
         let icon_una = Image::from_icon_name("computer-symbolic");
         let label_una = Label::new(Some("Una-Prime"));
@@ -299,22 +291,19 @@ impl CommsSpline {
         row_una.append(&spinner_una);
         nexus_list.append(&row_una);
 
-        // Claude Prime (Placeholder)
         let row_claude = Box::new(Orientation::Horizontal, 10);
         let icon_claude = Image::from_icon_name("avatar-default-symbolic");
         let label_claude = Label::new(Some("Claude-Prime"));
-        let spinner_claude = Spinner::new(); // Static for now
+        let spinner_claude = Spinner::new();
         row_claude.append(&icon_claude);
         row_claude.append(&label_claude);
         row_claude.append(&spinner_claude);
         nexus_list.append(&row_claude);
 
-        // Header: Sub-processes
         nexus_list.append(&Label::builder().label("SUB-PROCESSES").xalign(0.0).css_classes(vec!["nexus-header"]).build());
 
-        // S9-Mule
         let row_s9 = Box::new(Orientation::Horizontal, 10);
-        row_s9.set_margin_start(15); // Indent
+        row_s9.set_margin_start(15);
         let icon_s9 = Image::from_icon_name("network-server-symbolic");
         let label_s9 = Label::new(Some("S9-Mule"));
         let spinner_s9 = Spinner::new();
@@ -324,78 +313,75 @@ impl CommsSpline {
         nexus_list.append(&row_s9);
 
         nexus_box.append(&nexus_list);
-        sidebar_stack.add_titled(&nexus_box, Some("nexus"), "Nexus"); // Directive 063: Native casing
+        sidebar_stack.add_titled(&nexus_box, Some("nexus"), "Nexus");
 
         sidebar_box.append(&sidebar_stack);
 
+        // Native Tabs (No CSS overrides)
         let stack_switcher = StackSwitcher::builder().stack(&sidebar_stack).halign(Align::Center).build();
         sidebar_box.append(&stack_switcher);
-        sidebar_box.append(&Separator::new(Orientation::Horizontal)); // Footer separator
 
         left_vbox.append(&sidebar_box);
         main_h_paned.set_start_child(Some(&left_vbox));
 
         // --- Right Pane (The Command Center) ---
         let right_vbox = Box::new(Orientation::Vertical, 0);
-        right_vbox.set_hexpand(true); // Directive 060: Kinematic Enforcement
+        right_vbox.set_hexpand(true);
 
-        // Directive 063: GTK4 Window Padding (Non-Adwaita only)
-        #[cfg(not(feature = "gnome"))]
+        // --- ARCHITECTURE SPLIT (ADWAITA vs PURE GTK) ---
+        #[cfg(feature = "gnome")]
         {
-            right_vbox.set_margin_start(8);
-            right_vbox.set_margin_end(8);
-            right_vbox.set_margin_bottom(8);
+            // Adwaita Split HeaderBars
+            let blank_header_bar = adw::HeaderBar::new();
+            blank_header_bar.set_show_start_title_buttons(false);
+            blank_header_bar.set_show_end_title_buttons(false);
+            blank_header_bar.set_title_widget(Some(&adw::WindowTitle::new("", "")));
+            left_vbox.prepend(&blank_header_bar); // Add to top of left column
+
+            let command_header_bar = adw::HeaderBar::new();
+            command_header_bar.set_show_start_title_buttons(true);
+            command_header_bar.set_show_end_title_buttons(true);
+            command_header_bar.set_title_widget(Some(&adw::WindowTitle::new("Lumen", "")));
+            command_header_bar.pack_start(&status_group);
+            right_vbox.append(&command_header_bar); // Add to top of right column
         }
 
-        // Command HeaderBar
-        #[cfg(feature = "gnome")]
-        let command_header_bar = {
-            let hb = adw::HeaderBar::new();
-            hb.set_show_start_title_buttons(true);
-            hb.set_show_end_title_buttons(true);
-            hb
-        };
-
         #[cfg(not(feature = "gnome"))]
-        let command_header_bar = {
-            let hb = HeaderBar::new();
-            hb.set_show_title_buttons(true);
-            hb
-        };
+        {
+            // Pure GTK Unified HeaderBar
+            let unified_header_bar = HeaderBar::new();
+            unified_header_bar.set_show_title_buttons(true);
+            unified_header_bar.set_title_widget(Some(&Label::new(Some("Lumen"))));
 
-        // Explicit Title for Right Header (Directive 059)
-        command_header_bar.set_title_widget(Some(&Label::new(Some("Lumen"))));
-        command_header_bar.add_css_class("titlebar"); // Directive 063: GTK Titlebar Fix
+            // The Phantom Spacer: Matches the sidebar width and syncs with the toggle
+            let header_spacer = Box::new(Orientation::Horizontal, 0);
 
-        // Grouping: Toggle + Telemetry
-        let sidebar_toggle = ToggleButton::builder()
-            .icon_name("sidebar-show-symbolic")
-            .active(true)
-            .tooltip_text("Toggle Sidebar")
-            .build();
+            // 1. Bind the spacer's width directly to the Paned slider's pixel position
+            main_h_paned.bind_property("position", &header_spacer, "width-request")
+                .sync_create()
+                .build();
 
-        let token_label = Label::new(Some("Tokens: 0"));
-        token_label.add_css_class("dim-label");
-        token_label.set_margin_end(10);
+            // 2. Bind the visibility to the toggle button
+            sidebar_toggle.bind_property("active", &header_spacer, "visible")
+                .sync_create()
+                .build();
 
-        let pulse_icon = Image::from_icon_name("activity-start-symbolic");
-        pulse_icon.set_pixel_size(16);
-        pulse_icon.set_opacity(0.3);
+            // Pack the spacer first to push the status group over
+            unified_header_bar.pack_start(&header_spacer);
+            unified_header_bar.pack_start(&status_group);
 
-        let status_group = Box::new(Orientation::Horizontal, 8);
-        status_group.append(&sidebar_toggle);
-        status_group.append(&token_label);
-        status_group.append(&pulse_icon);
+            if let Some(app_win) = window.dynamic_cast_ref::<gtk4::ApplicationWindow>() {
+                app_win.set_titlebar(Some(&unified_header_bar));
+            }
+        }
 
-        command_header_bar.pack_start(&status_group);
-        right_vbox.append(&command_header_bar);
-
-        // --- Main Content (Console/Input) ---
-        // The Root Vertical Split: Content (Top) / Input (Bottom)
-        let paned = Paned::new(Orientation::Vertical);
-        paned.set_vexpand(true);
-        paned.set_hexpand(true);
-        paned.set_position(550);
+        // --- Main Content (Console/Input Slider) ---
+        let main_paned = Paned::new(Orientation::Vertical);
+        main_paned.set_vexpand(true);
+        main_paned.set_hexpand(true);
+        main_paned.set_position(9999);
+        main_paned.set_shrink_end_child(false);
+        main_paned.set_wide_handle(true); // Restores the horizontal slider grip
 
         // Console
         let scrolled_window = ScrolledWindow::builder()
@@ -421,44 +407,29 @@ impl CommsSpline {
         let scroll_adj_clone = scrolled_window_adj.clone();
         scrolled_window.set_child(Some(&console_text_view));
 
-        // --- The Spatial Cortex (Restored) ---
-        // GL Area setup
+        // --- The Spatial Cortex (Quarantined) ---
         let gl_area = GLArea::new();
         gl_area.set_has_depth_buffer(true);
-        // Request Core Profile 3.3
         gl_area.set_required_version(3, 3);
-        gl_area.set_size_request(300, 200); // Give it some height
+        gl_area.set_size_request(300, 200);
         gl_area.set_hexpand(true);
         gl_area.set_vexpand(true);
 
         let renderer = Rc::new(RefCell::new(Renderer::new()));
-
-        // 1. THE RENDERER CLONE (Omega Fix)
         let renderer_draw = renderer.clone();
         let renderer_realize = renderer.clone();
 
         gl_area.connect_realize(move |area| {
-            eprintln!(":: VUG :: connect_realize callback FIRED");
             area.make_current();
-
-            // Safety check: If GTK failed to allocate the GPU context, abort gracefully
-            if let Some(err) = area.error() {
-                eprintln!(":: VUG :: Fatal GL Error on Realize: {:?}", err);
-                return;
-            }
-
-            eprintln!(":: VUG :: Calling vug::Renderer::load_gl_functions");
+            if let Some(_err) = area.error() { return; }
             vug::renderer::Renderer::load_gl_functions();
-            eprintln!(":: VUG :: Calling init_gl");
             renderer_realize.borrow_mut().init_gl();
         });
 
         gl_area.connect_render(move |area, ctx| renderer_draw.borrow_mut().draw(area, ctx));
 
-        // --- DIRECTIVE 059 - OVERRIDE: THE GL_AREA QUARANTINE ---
-        // Do not attach the GL Area to the UI hierarchy. It remains orphaned.
-        // We attach the console directly to the start child of the main pane.
-        paned.set_start_child(Some(&scrolled_window));
+        // Attach console to the top pane
+        main_paned.set_start_child(Some(&scrolled_window));
 
         // --- Input Area ---
         let input_container = Box::new(Orientation::Horizontal, 8);
@@ -468,16 +439,14 @@ impl CommsSpline {
         input_container.set_margin_bottom(16);
         input_container.set_margin_top(16);
 
-        // Attach Button
-        let attach_icon = Image::from_icon_name("share-symbolic");
-        // Directive 063: Remove pixel size
+        // Native Button Scaling Fix
         let attach_btn = Button::builder()
             .valign(Align::End)
+            .icon_name("share-symbolic")
             .css_classes(vec!["attach-action"])
             .tooltip_text("Attach File")
-            .child(&attach_icon)
             .build();
-        // (Attach Logic same as before, omitted for brevity but preserved in intent)
+
         let tx_clone_file = tx_event.clone();
         let window_clone = window.clone();
         attach_btn.connect_clicked(move |_| {
@@ -495,7 +464,7 @@ impl CommsSpline {
             });
         });
 
-        // THE COMPOSER (Wolfpack Interface) - Button moved to Sidebar
+        // THE COMPOSER
         let active_directive = Rc::new(RefCell::new("Directive 055".to_string()));
         let active_directive_clone = active_directive.clone();
 
@@ -508,18 +477,17 @@ impl CommsSpline {
         pop_box.set_margin_end(10);
         pop_box.set_width_request(400);
 
-        // Action Buttons (EXEC, ARCH, DEBUG, UNA)
         let action_box = Box::new(Orientation::Horizontal, 0);
         action_box.add_css_class("linked");
         let btn_exec = ToggleButton::with_label("EXEC");
         let btn_arch = ToggleButton::with_label("ARCH");
         let btn_debug = ToggleButton::with_label("DEBUG");
         let btn_una = ToggleButton::with_label("UNA");
-        // Group them
+
         btn_arch.set_group(Some(&btn_exec));
         btn_debug.set_group(Some(&btn_exec));
         btn_una.set_group(Some(&btn_exec));
-        btn_exec.set_active(true); // Default
+        btn_exec.set_active(true);
 
         action_box.append(&btn_exec);
         action_box.append(&btn_arch);
@@ -527,12 +495,10 @@ impl CommsSpline {
         action_box.append(&btn_una);
         pop_box.append(&action_box);
 
-        // Subject
         let subject_entry = Entry::new();
         subject_entry.set_placeholder_text(Some("Subject"));
         pop_box.append(&subject_entry);
 
-        // Body
         let body_buffer = TextBuffer::new(None);
         let body_view = TextView::with_buffer(&body_buffer);
         body_view.set_wrap_mode(gtk4::WrapMode::WordChar);
@@ -544,11 +510,9 @@ impl CommsSpline {
             .build();
         pop_box.append(&body_scroll);
 
-        // Point Break
         let pb_check = CheckButton::with_label("Point Break");
         pop_box.append(&pb_check);
 
-        // Send Button
         let btn_comp_send = Button::with_label("Transmit Order");
         btn_comp_send.add_css_class("suggested-action");
         let pop_weak = popover_composer.downgrade();
@@ -559,7 +523,7 @@ impl CommsSpline {
         let b_ex = btn_exec.clone();
         let b_ar = btn_arch.clone();
         let b_db = btn_debug.clone();
-        let _b_un = btn_una.clone(); // Omega: _b_un
+        let _b_un = btn_una.clone();
 
         btn_comp_send.connect_clicked(move |_| {
             if let Some(pop) = pop_weak.upgrade() {
@@ -587,19 +551,17 @@ impl CommsSpline {
         let ad_ref = active_directive.clone();
         let sub_ent_pop = subject_entry.clone();
         composer_btn.connect_clicked(move |btn| {
-            // Auto-fill subject with Active Directive
             sub_ent_pop.set_text(&ad_ref.borrow());
             popover_composer.set_parent(btn);
             popover_composer.popup();
         });
 
-        // Chat Input (Baseline)
+        // Chat Input
         let input_scroll = ScrolledWindow::builder()
             .hscrollbar_policy(PolicyType::Never)
             .vscrollbar_policy(PolicyType::Automatic)
             .propagate_natural_height(true)
             .max_content_height(500)
-            .vexpand(true)
             .valign(Align::Fill)
             .has_frame(false)
             .build();
@@ -619,16 +581,14 @@ impl CommsSpline {
         text_view.add_css_class("transparent-text");
         input_scroll.set_child(Some(&text_view));
 
-        let send_icon = Image::from_icon_name("paper-plane-symbolic");
-        // Directive 063: Remove pixel size
+        // Native Button Scaling Fix
         let send_btn = Button::builder()
             .valign(Align::End)
+            .icon_name("paper-plane-symbolic")
             .css_classes(vec!["suggested-action"])
             .tooltip_text("Send Message (Ctrl+Enter)")
-            .child(&send_icon)
             .build();
 
-        // (Key Handling same as before)
         let tx_clone_send = tx_event.clone();
         let buffer = text_view.buffer();
         let btn_send_clone = send_btn.clone();
@@ -671,23 +631,19 @@ impl CommsSpline {
         input_container.append(&attach_btn);
         input_container.append(&input_scroll);
         input_container.append(&send_btn);
-        paned.set_end_child(Some(&input_container));
 
-        right_vbox.append(&paned);
+        // Attach input to bottom pane
+        main_paned.set_end_child(Some(&input_container));
+
+        right_vbox.append(&main_paned);
         main_h_paned.set_end_child(Some(&right_vbox));
 
-        // Toggle logic for the new layout:
-        // Hiding sidebar_box works, but left_vbox still occupies 215px.
-        // We should collapse the main_h_paned position or hide the left pane.
-        // However, standard toggle behavior often just hides content or collapses.
-        // Given "Full Height Split", if we toggle off, we likely want the sidebar GONE.
-        // So let's hide the left_vbox entirely.
         let left_vbox_clone = left_vbox.clone();
         sidebar_toggle.connect_toggled(move |btn| {
             left_vbox_clone.set_visible(btn.is_active());
         });
 
-        // Clones for async loop
+        // Async loop
         let label_una_clone = label_una.clone();
         let spinner_una_clone = spinner_una.clone();
         let label_s9_clone = label_s9.clone();
@@ -711,7 +667,7 @@ impl CommsSpline {
                         let adj = scroll_adj_clone.clone();
                         glib::timeout_add_local(std::time::Duration::from_millis(50), move || {
                             if adj.upper() > adj.page_size() {
-                                let val = adj.upper() - adj.page_size();
+                                let val = (adj.upper() - adj.page_size()).max(adj.lower());
                                 adj.set_value(val);
                             }
                             glib::ControlFlow::Break
@@ -752,11 +708,9 @@ impl CommsSpline {
                          match state {
                              WolfpackState::Dreaming => {
                                  pulse_icon_clone.add_css_class("pulse-active");
-                                 pulse_icon_clone.set_opacity(1.0);
                              },
                              _ => {
                                  pulse_icon_clone.remove_css_class("pulse-active");
-                                 pulse_icon_clone.set_opacity(0.3);
                              }
                          }
                     }
@@ -773,23 +727,11 @@ impl CommsSpline {
 
         #[cfg(feature = "gnome")]
         {
-            if let Some(app_win) = window.dynamic_cast_ref::<gtk4::ApplicationWindow>() {
-                // Directive 061: Destroy the Global Titlebar
-                app_win.set_titlebar(Some(&gtk4::Box::new(gtk4::Orientation::Horizontal, 0)));
-            }
             main_h_paned.upcast::<Widget>()
         }
 
         #[cfg(not(feature = "gnome"))]
         {
-            if let Some(app_win) = window.dynamic_cast_ref::<gtk4::ApplicationWindow>() {
-                // Remove any existing titlebar from window if possible, or set None.
-                // app_win.set_titlebar(None::<&Widget>);
-                // But set_titlebar expects Some.
-                // We'll just set child. The window manager decorations depend on the platform.
-                // If we want CSD, the HeaderBars inside the panes handle it.
-                app_win.set_titlebar(None::<&Widget>);
-            }
             main_h_paned.into()
         }
     }
