@@ -17,6 +17,8 @@ pub enum GuiUpdate {
     EditorLoad(String),
     SidebarStatus(WolfpackState), // The Pulse
     Spectrum(Vec<f32>),
+    TokenUsage(u64),
+    ActiveDirective(String),
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -68,6 +70,12 @@ pub enum Event {
     NodeAction {
         action: String, // "exec", "arch", "debug", "una"
         active: bool,
+    },
+    ComplexInput {
+        subject: String,
+        body: String,
+        point_break: bool,
+        action: String, // "exec", "arch", "debug", "una"
     },
 }
 

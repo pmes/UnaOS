@@ -6,6 +6,7 @@ use std::path::PathBuf;
 pub struct SavedMessage {
     pub role: String, // "user" or "model"
     pub content: String,
+    pub timestamp: Option<String>,
 }
 
 #[derive(Clone)]
@@ -37,5 +38,16 @@ impl BrainManager {
         } else {
             vec![]
         }
+    }
+
+    pub fn get_active_directive(&self) -> String {
+        // Try to read 'directive.txt' in the same folder
+        if let Some(parent) = self.file_path.parent() {
+            let path = parent.join("directive.txt");
+            if let Ok(content) = fs::read_to_string(path) {
+                return content.trim().to_string();
+            }
+        }
+        "Directive 055".to_string() // Default as per mission
     }
 }

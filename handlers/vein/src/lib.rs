@@ -2,7 +2,7 @@ pub mod view;
 pub use view::CommsSpline;
 
 use chrono::Local;
-use elessar::gneiss_pal::api::{Content, GeminiClient, Part};
+use elessar::gneiss_pal::api::{Content, Part, ResilientClient};
 use elessar::gneiss_pal::forge::ForgeClient;
 use elessar::gneiss_pal::persistence::{BrainManager, SavedMessage};
 use elessar::gneiss_pal::{
@@ -146,12 +146,16 @@ impl VeinHandler {
                     Err(_) => None,
                 };
 
-                let client_res = GeminiClient::new().await;
+                let client_res = ResilientClient::new().await;
                 match client_res {
-                    Ok(client) => {
+                    Ok(mut client) => {
                         let _ = gui_tx_brain
                             .send(GuiUpdate::ConsoleLog(":: BRAIN :: ONLINE\n\n".into()))
                             .await;
+
+                        // Broadcast Active Directive
+                        let directive = brain_bg.get_active_directive();
+                        let _ = gui_tx_brain.send(GuiUpdate::ActiveDirective(directive)).await;
 
                         while let Some(user_input_text) = rx_from_ui.recv().await {
                             let is_s9 = user_input_text.starts_with("/s9");
@@ -235,7 +239,7 @@ impl VeinHandler {
                             });
 
                             match client.generate_content(&context).await {
-                                Ok(response) => {
+                                Ok((response, metadata)) => {
                                     let timestamp = Local::now().format("%H:%M:%S").to_string();
                                     let display =
                                         format!("\n[UNA] [{}] :: {}\n", timestamp, response);
@@ -243,11 +247,18 @@ impl VeinHandler {
                                         .send(GuiUpdate::ConsoleLog(display.clone()))
                                         .await;
 
+                                    if let Some(meta) = metadata {
+                                        if let Some(total) = meta.total_token_count {
+                                            let _ = gui_tx_brain.send(GuiUpdate::TokenUsage(total as u64)).await;
+                                        }
+                                    }
+
                                     {
                                         let mut s = state_bg.lock().unwrap();
                                         s.chat_history.push(SavedMessage {
                                             role: "model".into(),
-                                            content: response,
+                                            content: response.clone(),
+                                            timestamp: Some(timestamp),
                                         });
                                         brain_bg.save(&s.chat_history);
                                         if is_s9 {
@@ -293,9 +304,10 @@ impl VeinHandler {
                 } else {
                     "[UNA]"
                 };
+                let ts = msg.timestamp.clone().unwrap_or_else(|| "--:--:--".to_string());
                 let _ = gui_tx.send_blocking(GuiUpdate::ConsoleLog(format!(
-                    "{} > {}\n",
-                    prefix, msg.content
+                    "{} [{}] > {}\n",
+                    prefix, ts, msg.content
                 )));
             }
         }
@@ -368,10 +380,12 @@ impl AppHandler for VeinHandler {
 
         match event {
             Event::Input(text) => {
-                let current_text = format!("\n[ARCHITECT] > {}\n", text);
+                let timestamp = Local::now().format("%H:%M:%S").to_string();
+                let current_text = format!("\n[ARCHITECT] [{}] > {}\n", timestamp, text);
                 s.chat_history.push(SavedMessage {
                     role: "user".to_string(),
                     content: text.clone(),
+                    timestamp: Some(timestamp),
                 });
                 self.append_to_console(&current_text);
 
@@ -434,6 +448,23 @@ impl AppHandler for VeinHandler {
             }
             Event::ToggleSidebar => {
                 s.sidebar_collapsed = !s.sidebar_collapsed;
+            }
+            Event::ComplexInput { subject, body, point_break, action: _ } => {
+                let prefix = if point_break { "Point Break: " } else { "" };
+                let full_message = format!("\nSubject: {}{}\n\n{}", prefix, subject, body);
+
+                let timestamp = Local::now().format("%H:%M:%S").to_string();
+                let current_text = format!("\n[ARCHITECT] [{}] > {}\n", timestamp, full_message);
+                s.chat_history.push(SavedMessage {
+                    role: "user".to_string(),
+                    content: full_message.clone(),
+                    timestamp: Some(timestamp),
+                });
+                self.append_to_console(&current_text);
+
+                if let Err(e) = self.tx.send(full_message) {
+                    self.append_to_console(&format!("\n[SYSTEM ERROR] :: Failed to send: {}\n", e));
+                }
             }
             _ => {}
         }
