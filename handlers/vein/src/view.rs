@@ -386,15 +386,18 @@ impl CommsSpline {
         let renderer_realize = renderer.clone();
 
         gl_area.connect_realize(move |area| {
+            eprintln!(":: VUG :: connect_realize callback FIRED");
             area.make_current();
 
             // Safety check: If GTK failed to allocate the GPU context, abort gracefully
-            if area.error().is_some() {
-                eprintln!(":: VUG :: Fatal GL Error on Realize");
+            if let Some(err) = area.error() {
+                eprintln!(":: VUG :: Fatal GL Error on Realize: {:?}", err);
                 return;
             }
 
-            gl::load_with(|s| epoxy::get_proc_addr(s));
+            eprintln!(":: VUG :: Calling vug::Renderer::load_gl_functions");
+            vug::renderer::Renderer::load_gl_functions();
+            eprintln!(":: VUG :: Calling init_gl");
             renderer_realize.borrow_mut().init_gl();
         });
 

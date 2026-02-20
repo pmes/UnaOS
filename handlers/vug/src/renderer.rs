@@ -53,6 +53,7 @@ impl Default for Renderer {
 
 impl Renderer {
     pub fn new() -> Self {
+        eprintln!(":: VUG :: Renderer::new()");
         Self {
             program: 0,
             vao: 0,
@@ -67,10 +68,23 @@ impl Renderer {
         self.spectrum = data;
     }
 
+    pub fn load_gl_functions() {
+        eprintln!(":: VUG :: load_gl_functions() - CALLED");
+        gl::load_with(|s| {
+            let ptr = epoxy::get_proc_addr(s);
+            if ptr.is_null() {
+                eprintln!(":: VUG :: WARNING: Failed to load symbol: {}", s);
+            }
+            ptr
+        });
+        eprintln!(":: VUG :: load_gl_functions() - FINISHED");
+    }
+
     pub fn init_gl(&mut self) {
-        // gl::load_with moved to handlers/vein/src/view.rs connect_realize
+        eprintln!(":: VUG :: Renderer::init_gl() - START");
 
         unsafe {
+            eprintln!(":: VUG :: compiling shaders");
             let vertex_shader = compile_shader(gl::VERTEX_SHADER, VERTEX_SHADER_SRC);
             let fragment_shader = compile_shader(gl::FRAGMENT_SHADER, FRAGMENT_SHADER_SRC);
             self.program = link_program(vertex_shader, fragment_shader);
@@ -152,6 +166,7 @@ impl Renderer {
     pub fn draw(&mut self, area: &GLArea, _ctx: &GLContext) -> glib::Propagation {
         if self.program == 0 {
             // Not initialized yet, wait for realize signal
+            eprintln!(":: VUG :: draw() - SKIPPING (uninitialized)");
             return glib::Propagation::Proceed;
         }
 
