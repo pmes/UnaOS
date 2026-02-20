@@ -1,5 +1,6 @@
 use epoxy;
-use euclase::{Mat4, Vec3, Vec4};
+use euclase::mat::Mat4;
+use euclase::vec::{Vec3, Vec4};
 use gtk4::prelude::*;
 use gtk4::{gdk::GLContext, GLArea};
 use std::ffi::CString;
@@ -66,12 +67,14 @@ impl Renderer {
     }
 
     fn init(&mut self) {
+        gl::load_with(|s| epoxy::get_proc_addr(s));
+
         unsafe {
-            let vertex_shader = compile_shader(epoxy::gl::VERTEX_SHADER, VERTEX_SHADER_SRC);
-            let fragment_shader = compile_shader(epoxy::gl::FRAGMENT_SHADER, FRAGMENT_SHADER_SRC);
+            let vertex_shader = compile_shader(gl::VERTEX_SHADER, VERTEX_SHADER_SRC);
+            let fragment_shader = compile_shader(gl::FRAGMENT_SHADER, FRAGMENT_SHADER_SRC);
             self.program = link_program(vertex_shader, fragment_shader);
-            epoxy::gl::DeleteShader(vertex_shader);
-            epoxy::gl::DeleteShader(fragment_shader);
+            gl::DeleteShader(vertex_shader);
+            gl::DeleteShader(fragment_shader);
 
             // Cube Vertices (Pos + Color)
             let vertices: [f32; 48] = [
@@ -96,52 +99,52 @@ impl Renderer {
                 4, 5, 1, 1, 0, 4, // Bottom
             ];
 
-            epoxy::gl::GenVertexArrays(1, &mut self.vao);
-            epoxy::gl::GenBuffers(1, &mut self.vbo);
-            epoxy::gl::GenBuffers(1, &mut self.ebo);
+            gl::GenVertexArrays(1, &mut self.vao);
+            gl::GenBuffers(1, &mut self.vbo);
+            gl::GenBuffers(1, &mut self.ebo);
 
-            epoxy::gl::BindVertexArray(self.vao);
+            gl::BindVertexArray(self.vao);
 
-            epoxy::gl::BindBuffer(epoxy::gl::ARRAY_BUFFER, self.vbo);
-            epoxy::gl::BufferData(
-                epoxy::gl::ARRAY_BUFFER,
+            gl::BindBuffer(gl::ARRAY_BUFFER, self.vbo);
+            gl::BufferData(
+                gl::ARRAY_BUFFER,
                 (vertices.len() * mem::size_of::<f32>()) as isize,
                 vertices.as_ptr() as *const _,
-                epoxy::gl::STATIC_DRAW,
+                gl::STATIC_DRAW,
             );
 
-            epoxy::gl::BindBuffer(epoxy::gl::ELEMENT_ARRAY_BUFFER, self.ebo);
-            epoxy::gl::BufferData(
-                epoxy::gl::ELEMENT_ARRAY_BUFFER,
+            gl::BindBuffer(gl::ELEMENT_ARRAY_BUFFER, self.ebo);
+            gl::BufferData(
+                gl::ELEMENT_ARRAY_BUFFER,
                 (indices.len() * mem::size_of::<u32>()) as isize,
                 indices.as_ptr() as *const _,
-                epoxy::gl::STATIC_DRAW,
+                gl::STATIC_DRAW,
             );
 
             // Pos
-            epoxy::gl::VertexAttribPointer(
+            gl::VertexAttribPointer(
                 0,
                 3,
-                epoxy::gl::FLOAT,
-                epoxy::gl::FALSE,
+                gl::FLOAT,
+                gl::FALSE,
                 (6 * mem::size_of::<f32>()) as i32,
                 ptr::null(),
             );
-            epoxy::gl::EnableVertexAttribArray(0);
+            gl::EnableVertexAttribArray(0);
 
             // Color
-            epoxy::gl::VertexAttribPointer(
+            gl::VertexAttribPointer(
                 1,
                 3,
-                epoxy::gl::FLOAT,
-                epoxy::gl::FALSE,
+                gl::FLOAT,
+                gl::FALSE,
                 (6 * mem::size_of::<f32>()) as i32,
                 (3 * mem::size_of::<f32>()) as *const _,
             );
-            epoxy::gl::EnableVertexAttribArray(1);
+            gl::EnableVertexAttribArray(1);
 
-            epoxy::gl::BindBuffer(epoxy::gl::ARRAY_BUFFER, 0);
-            epoxy::gl::BindVertexArray(0);
+            gl::BindBuffer(gl::ARRAY_BUFFER, 0);
+            gl::BindVertexArray(0);
         }
     }
 
@@ -151,11 +154,11 @@ impl Renderer {
         }
 
         unsafe {
-            epoxy::gl::ClearColor(0.1, 0.1, 0.1, 1.0);
-            epoxy::gl::Clear(epoxy::gl::COLOR_BUFFER_BIT | epoxy::gl::DEPTH_BUFFER_BIT);
-            epoxy::gl::Enable(epoxy::gl::DEPTH_TEST);
+            gl::ClearColor(0.1, 0.1, 0.1, 1.0);
+            gl::Clear(gl::COLOR_BUFFER_BIT | gl::DEPTH_BUFFER_BIT);
+            gl::Enable(gl::DEPTH_TEST);
 
-            epoxy::gl::UseProgram(self.program);
+            gl::UseProgram(self.program);
 
             let now = self.start_time.elapsed().as_secs_f32();
             let angle = now * 1.0;
@@ -166,7 +169,15 @@ impl Renderer {
                 1.0 + self.spectrum.iter().sum::<f32>() / self.spectrum.len() as f32 * 10.0
             };
 
-            let model = rotate_y(angle) * rotate_x(angle * 0.5) * Mat4::from_scale(Vec3::new(scale_val, scale_val, scale_val));
+            let scale = Mat4::from_scale(Vec3::new(scale_val, scale_val, scale_val));
+            // Manual rotation multiplication since * might not be implemented for Mat4 directly in Euclase
+            // or to be safe. Actually Euclase implements Mul for Mat4.
+            // But let's construct the model matrix carefully.
+            // model = Ry * Rx * Scale
+            let rx = rotate_x(angle * 0.5);
+            let ry = rotate_y(angle);
+            let model = ry * rx * scale;
+
             let view = Mat4::look_at_rh(
                 Vec3::new(0.0, 2.0, 4.0),
                 Vec3::ZERO,
@@ -183,27 +194,27 @@ impl Renderer {
             let view_loc = CString::new("view").unwrap();
             let proj_loc = CString::new("projection").unwrap();
 
-            epoxy::gl::UniformMatrix4fv(
-                epoxy::gl::GetUniformLocation(self.program, model_loc.as_ptr()),
+            gl::UniformMatrix4fv(
+                gl::GetUniformLocation(self.program, model_loc.as_ptr()),
                 1,
-                epoxy::gl::FALSE,
+                gl::FALSE,
                 model.to_cols_array().as_ptr(),
             );
-            epoxy::gl::UniformMatrix4fv(
-                epoxy::gl::GetUniformLocation(self.program, view_loc.as_ptr()),
+            gl::UniformMatrix4fv(
+                gl::GetUniformLocation(self.program, view_loc.as_ptr()),
                 1,
-                epoxy::gl::FALSE,
+                gl::FALSE,
                 view.to_cols_array().as_ptr(),
             );
-            epoxy::gl::UniformMatrix4fv(
-                epoxy::gl::GetUniformLocation(self.program, proj_loc.as_ptr()),
+            gl::UniformMatrix4fv(
+                gl::GetUniformLocation(self.program, proj_loc.as_ptr()),
                 1,
-                epoxy::gl::FALSE,
+                gl::FALSE,
                 projection.to_cols_array().as_ptr(),
             );
 
-            epoxy::gl::BindVertexArray(self.vao);
-            epoxy::gl::DrawElements(epoxy::gl::TRIANGLES, 36, epoxy::gl::UNSIGNED_INT, ptr::null());
+            gl::BindVertexArray(self.vao);
+            gl::DrawElements(gl::TRIANGLES, 36, gl::UNSIGNED_INT, ptr::null());
         }
 
         area.queue_render(); // Request continuous redraw for animation
@@ -212,18 +223,18 @@ impl Renderer {
 }
 
 unsafe fn compile_shader(shader_type: u32, source: &str) -> u32 {
-    let shader = epoxy::gl::CreateShader(shader_type);
+    let shader = gl::CreateShader(shader_type);
     let c_str = CString::new(source.as_bytes()).unwrap();
-    epoxy::gl::ShaderSource(shader, 1, &c_str.as_ptr(), ptr::null());
-    epoxy::gl::CompileShader(shader);
+    gl::ShaderSource(shader, 1, &c_str.as_ptr(), ptr::null());
+    gl::CompileShader(shader);
     shader
 }
 
 unsafe fn link_program(vertex: u32, fragment: u32) -> u32 {
-    let program = epoxy::gl::CreateProgram();
-    epoxy::gl::AttachShader(program, vertex);
-    epoxy::gl::AttachShader(program, fragment);
-    epoxy::gl::LinkProgram(program);
+    let program = gl::CreateProgram();
+    gl::AttachShader(program, vertex);
+    gl::AttachShader(program, fragment);
+    gl::LinkProgram(program);
     program
 }
 
