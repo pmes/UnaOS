@@ -46,6 +46,7 @@ impl CommsSpline {
         let provider = CssProvider::new();
         provider.load_from_string("
             .sidebar { background-color: #28282c; color: #ffffff; }
+            .background { background-color: #28282c; color: #ffffff; }
             .console { background-color: #101010; color: #dddddd; font-family: 'Monospace'; caret-color: #dddddd; padding: 12px; }
             .chat-input-area { background-color: #2d2d2d; border-radius: 12px; padding: 2px; }
             textview.transparent-text { background-color: transparent; color: #ffffff; caret-color: #ffffff; font-family: 'Sans'; font-size: 15px; padding: 6px; }
@@ -75,10 +76,13 @@ impl CommsSpline {
         // --- Root Layout (Directive 058-B v3) ---
         let main_h_paned = Paned::new(Orientation::Horizontal);
         main_h_paned.set_position(215);
+        main_h_paned.set_hexpand(true);
+        main_h_paned.set_vexpand(true);
 
         // --- Left Pane (The Silhouette) ---
         let left_vbox = Box::new(Orientation::Vertical, 0);
         left_vbox.add_css_class("sidebar");
+        left_vbox.add_css_class("background"); // Directive 059
         left_vbox.set_width_request(215);
 
         // Blank HeaderBar
@@ -96,6 +100,9 @@ impl CommsSpline {
             hb.set_show_title_buttons(false);
             hb
         };
+
+        // Ensure Left Header is Empty
+        blank_header_bar.set_title_widget(Some(&Label::new(None)));
 
         left_vbox.append(&blank_header_bar);
 
@@ -347,7 +354,8 @@ impl CommsSpline {
             hb
         };
 
-        // command_header_bar.set_title_widget(Some(&Label::new(Some("Lumen")))); // Title handled by window usually, but explicit requested? "Lumen"
+        // Explicit Title for Right Header (Directive 059)
+        command_header_bar.set_title_widget(Some(&Label::new(Some("Lumen"))));
 
         // Grouping: Toggle + Telemetry
         let sidebar_toggle = ToggleButton::builder()
@@ -373,11 +381,13 @@ impl CommsSpline {
         right_vbox.append(&command_header_bar);
 
         // --- Main Content (Console/Input) ---
+        // The Root Vertical Split: Content (Top) / Input (Bottom)
         let paned = Paned::new(Orientation::Vertical);
         paned.set_vexpand(true);
         paned.set_hexpand(true);
         paned.set_position(550);
 
+        // Console
         let scrolled_window = ScrolledWindow::builder()
             .hscrollbar_policy(PolicyType::Never)
             .vscrollbar_policy(PolicyType::Automatic)
@@ -401,18 +411,16 @@ impl CommsSpline {
         let scroll_adj_clone = scrolled_window_adj.clone();
         scrolled_window.set_child(Some(&console_text_view));
 
-        // Spatial Cortex (Amputated per Directive 058-A)
-        // We bypass the h_paned and set the console as the direct child
-        paned.set_start_child(Some(&scrolled_window));
-
-        // The Phantom GL Area
-        // We keep it instantiated to satisfy compiler dependencies (signal closures),
-        // but it is orphaned from the UI tree so it never realizes.
+        // --- The Spatial Cortex (Restored) ---
+        // GL Area setup
         let gl_area = GLArea::new();
         gl_area.set_has_depth_buffer(true);
         // Request Core Profile 3.3
         gl_area.set_required_version(3, 3);
-        gl_area.set_size_request(300, -1);
+        gl_area.set_size_request(300, 200); // Give it some height
+        gl_area.set_hexpand(true);
+        gl_area.set_vexpand(true);
+
         let renderer = Rc::new(RefCell::new(Renderer::new()));
 
         // 1. THE RENDERER CLONE (Omega Fix)
@@ -437,9 +445,16 @@ impl CommsSpline {
 
         gl_area.connect_render(move |area, ctx| renderer_draw.borrow_mut().draw(area, ctx));
 
-        // h_paned.set_end_child(Some(&gl_area)); // Amputated
-        // h_paned.set_position(800); // Amputated
-        // paned.set_start_child(Some(&h_paned)); // Replaced above
+        // Content Split: Top = GL Area, Bottom = Console
+        let content_split = Paned::new(Orientation::Vertical);
+        content_split.set_vexpand(true);
+        content_split.set_hexpand(true);
+        content_split.set_position(300); // Give GL Area 300px height initially
+        content_split.set_start_child(Some(&gl_area));
+        content_split.set_end_child(Some(&scrolled_window));
+
+        // Set Content Split as the start child of the main vertical pane
+        paned.set_start_child(Some(&content_split));
 
         // --- Input Area ---
         let input_container = Box::new(Orientation::Horizontal, 8);
@@ -691,8 +706,10 @@ impl CommsSpline {
                         text_buffer_clone.insert(&mut end_iter, &text);
                         let adj = scroll_adj_clone.clone();
                         glib::timeout_add_local(std::time::Duration::from_millis(50), move || {
-                            let val = (adj.upper() - adj.page_size()).max(adj.lower());
-                            adj.set_value(val);
+                            if adj.upper() > adj.page_size() {
+                                let val = adj.upper() - adj.page_size();
+                                adj.set_value(val);
+                            }
                             glib::ControlFlow::Break
                         });
                     }
