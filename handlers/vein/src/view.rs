@@ -45,7 +45,7 @@ impl CommsSpline {
         // THE PULSE (Visual Feedback)
         let provider = CssProvider::new();
         provider.load_from_string("
-            .sidebar { background-color: #1e1e1e; color: #ffffff; }
+            .sidebar { background-color: #28282c; color: #ffffff; }
             .console { background-color: #101010; color: #dddddd; font-family: 'Monospace'; caret-color: #dddddd; padding: 12px; }
             .chat-input-area { background-color: #2d2d2d; border-radius: 12px; padding: 2px; }
             textview.transparent-text { background-color: transparent; color: #ffffff; caret-color: #ffffff; font-family: 'Sans'; font-size: 15px; padding: 6px; }
@@ -92,13 +92,13 @@ impl CommsSpline {
         let header_status_box = Box::new(Orientation::Horizontal, 5);
         header_status_box.append(&token_label);
         header_status_box.append(&pulse_icon);
-        header_status_box.set_margin_start(12); // Spacing from sidebar toggle
+        // header_status_box.set_margin_start(12); // Removed per Directive 058-B (Center/Title Widget)
 
         #[cfg(feature = "gnome")]
         let header_bar = {
             let hb = adw::HeaderBar::new();
             hb.pack_start(&sidebar_toggle);
-            hb.pack_start(&header_status_box);
+            hb.set_title_widget(Some(&header_status_box));
             hb
         };
 
@@ -106,16 +106,17 @@ impl CommsSpline {
         let header_bar = {
             let hb = HeaderBar::new();
             hb.pack_start(&sidebar_toggle);
-            hb.pack_start(&header_status_box);
+            hb.set_title_widget(Some(&header_status_box));
             hb.set_show_title_buttons(true);
             hb
         };
 
         // --- Sidebar ---
-        let body_box = Box::new(Orientation::Horizontal, 0);
+        let main_h_paned = Paned::new(Orientation::Horizontal);
+        main_h_paned.set_position(215);
 
         let sidebar_box = Box::new(Orientation::Vertical, 0);
-        sidebar_box.set_width_request(220);
+        sidebar_box.set_width_request(215);
         sidebar_box.add_css_class("sidebar");
 
         let sidebar_stack = Stack::new();
@@ -340,8 +341,7 @@ impl CommsSpline {
         sidebar_box.append(&stack_switcher);
         sidebar_box.append(&Separator::new(Orientation::Horizontal)); // Footer separator
 
-        body_box.append(&sidebar_box);
-        body_box.append(&Separator::new(Orientation::Vertical));
+        main_h_paned.set_start_child(Some(&sidebar_box));
 
         // --- Main Content ---
         let paned = Paned::new(Orientation::Vertical);
@@ -624,7 +624,8 @@ impl CommsSpline {
         input_container.append(&input_scroll);
         input_container.append(&send_btn);
         paned.set_end_child(Some(&input_container));
-        body_box.append(&paned);
+
+        main_h_paned.set_end_child(Some(&paned));
 
         let sidebar_box_clone = sidebar_box.clone();
         sidebar_toggle.connect_toggled(move |btn| {
@@ -669,18 +670,22 @@ impl CommsSpline {
                         };
                         match status {
                             ShardStatus::Thinking => {
+                                spinner.set_spinning(true);
                                 spinner.start();
                                 label.set_text(&format!("{} (Thinking)", name));
                             }
                             ShardStatus::Online => {
+                                spinner.set_spinning(false);
                                 spinner.stop();
                                 label.set_text(name);
                             }
                             ShardStatus::Error => {
+                                spinner.set_spinning(false);
                                 spinner.stop();
                                 label.set_text(&format!("{} (Error)", name));
                             }
                             _ => {
+                                spinner.set_spinning(false);
                                 spinner.stop();
                                 label.set_text(&format!("{} ({:?})", name, status));
                             }
@@ -713,7 +718,7 @@ impl CommsSpline {
         {
             let view = adw::ToolbarView::new();
             view.add_top_bar(&header_bar);
-            view.set_content(Some(&body_box));
+            view.set_content(Some(&main_h_paned));
             view.upcast::<Widget>()
         }
 
@@ -722,7 +727,7 @@ impl CommsSpline {
             if let Some(app_win) = window.dynamic_cast_ref::<gtk4::ApplicationWindow>() {
                 app_win.set_titlebar(Some(&header_bar));
             }
-            body_box.into()
+            main_h_paned.into()
         }
     }
 }
