@@ -61,9 +61,6 @@ impl CommsSpline {
             .composer-action:hover { color: #ffffff; background-color: #444444; }
             .pulse-active { color: #0078d4; -gtk-icon-style: symbolic; transition: opacity 1s ease-in-out; }
             window { background-color: #1e1e1e; }
-            stackswitcher button { background: transparent; color: #888888; border: none; box-shadow: none; padding: 8px 16px; font-weight: bold; }
-            stackswitcher button:checked { color: #ffffff; border-bottom: 2px solid #0078d4; background: rgba(255, 255, 255, 0.05); }
-            stackswitcher button:hover { background: rgba(255, 255, 255, 0.1); }
             .nexus-header { font-weight: bold; margin-top: 12px; margin-bottom: 4px; opacity: 0.7; font-size: 0.9em; }
         ");
 
@@ -105,6 +102,7 @@ impl CommsSpline {
 
         // Ensure Left Header is Empty
         blank_header_bar.set_title_widget(Some(&Label::new(None)));
+        blank_header_bar.add_css_class("titlebar"); // Directive 063: GTK Titlebar Fix
 
         left_vbox.append(&blank_header_bar);
 
@@ -326,7 +324,7 @@ impl CommsSpline {
         nexus_list.append(&row_s9);
 
         nexus_box.append(&nexus_list);
-        sidebar_stack.add_titled(&nexus_box, Some("nexus"), "THE NEXUS");
+        sidebar_stack.add_titled(&nexus_box, Some("nexus"), "Nexus"); // Directive 063: Native casing
 
         sidebar_box.append(&sidebar_stack);
 
@@ -340,6 +338,14 @@ impl CommsSpline {
         // --- Right Pane (The Command Center) ---
         let right_vbox = Box::new(Orientation::Vertical, 0);
         right_vbox.set_hexpand(true); // Directive 060: Kinematic Enforcement
+
+        // Directive 063: GTK4 Window Padding (Non-Adwaita only)
+        #[cfg(not(feature = "gnome"))]
+        {
+            right_vbox.set_margin_start(8);
+            right_vbox.set_margin_end(8);
+            right_vbox.set_margin_bottom(8);
+        }
 
         // Command HeaderBar
         #[cfg(feature = "gnome")]
@@ -359,6 +365,7 @@ impl CommsSpline {
 
         // Explicit Title for Right Header (Directive 059)
         command_header_bar.set_title_widget(Some(&Label::new(Some("Lumen"))));
+        command_header_bar.add_css_class("titlebar"); // Directive 063: GTK Titlebar Fix
 
         // Grouping: Toggle + Telemetry
         let sidebar_toggle = ToggleButton::builder()
@@ -463,7 +470,7 @@ impl CommsSpline {
 
         // Attach Button
         let attach_icon = Image::from_icon_name("share-symbolic");
-        attach_icon.set_pixel_size(24);
+        // Directive 063: Remove pixel size
         let attach_btn = Button::builder()
             .valign(Align::End)
             .css_classes(vec!["attach-action"])
@@ -613,7 +620,7 @@ impl CommsSpline {
         input_scroll.set_child(Some(&text_view));
 
         let send_icon = Image::from_icon_name("paper-plane-symbolic");
-        send_icon.set_pixel_size(24);
+        // Directive 063: Remove pixel size
         let send_btn = Button::builder()
             .valign(Align::End)
             .css_classes(vec!["suggested-action"])
