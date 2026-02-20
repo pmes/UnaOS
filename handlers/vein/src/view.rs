@@ -45,7 +45,7 @@ impl CommsSpline {
         // THE PULSE (Visual Feedback)
         let provider = CssProvider::new();
         provider.load_from_string("
-            .sidebar { background-color: #28282c; color: #ffffff; }
+            box.sidebar { background-color: #28282c; color: #ffffff; }
             .background { background-color: #28282c; color: #ffffff; }
             .console { background-color: #101010; color: #dddddd; font-family: 'Monospace'; caret-color: #dddddd; padding: 12px; }
             .chat-input-area { background-color: #2d2d2d; border-radius: 12px; padding: 2px; }
@@ -78,11 +78,13 @@ impl CommsSpline {
         main_h_paned.set_position(215);
         main_h_paned.set_hexpand(true);
         main_h_paned.set_vexpand(true);
+        main_h_paned.set_wide_handle(true); // Directive 061
 
         // --- Left Pane (The Silhouette) ---
         let left_vbox = Box::new(Orientation::Vertical, 0);
         left_vbox.add_css_class("sidebar");
         left_vbox.add_css_class("background"); // Directive 059 & 060
+        left_vbox.add_css_class("navigation-sidebar"); // Directive 061
         left_vbox.set_width_request(215); // Directive 060
 
         // Blank HeaderBar
@@ -764,12 +766,10 @@ impl CommsSpline {
 
         #[cfg(feature = "gnome")]
         {
-            // For Adwaita, we usually set content directly if we manage headerbars manually inside panes.
-            // If we use ToolbarView, it expects top bars.
-            // Since we split the headerbars, we just return the main_h_paned as content.
-            // Note: AdwWindow might need a titlebar widget set to None if we want full custom client decorations?
-            // Actually, AdwApplicationWindow with no titlebar set will default to system decorations or empty.
-            // But since we put HeaderBars inside, they will act as drag handles.
+            if let Some(app_win) = window.dynamic_cast_ref::<gtk4::ApplicationWindow>() {
+                // Directive 061: Destroy the Global Titlebar
+                app_win.set_titlebar(Some(&gtk4::Box::new(gtk4::Orientation::Horizontal, 0)));
+            }
             main_h_paned.upcast::<Widget>()
         }
 
