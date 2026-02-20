@@ -89,15 +89,16 @@ impl CommsSpline {
         pulse_icon.set_pixel_size(16);
         pulse_icon.set_opacity(0.3);
 
-        let header_end_box = Box::new(Orientation::Horizontal, 5);
-        header_end_box.append(&token_label);
-        header_end_box.append(&pulse_icon);
+        let header_status_box = Box::new(Orientation::Horizontal, 5);
+        header_status_box.append(&token_label);
+        header_status_box.append(&pulse_icon);
+        header_status_box.set_margin_start(12); // Spacing from sidebar toggle
 
         #[cfg(feature = "gnome")]
         let header_bar = {
             let hb = adw::HeaderBar::new();
             hb.pack_start(&sidebar_toggle);
-            hb.pack_end(&header_end_box);
+            hb.pack_start(&header_status_box);
             hb
         };
 
@@ -105,7 +106,7 @@ impl CommsSpline {
         let header_bar = {
             let hb = HeaderBar::new();
             hb.pack_start(&sidebar_toggle);
-            hb.pack_end(&header_end_box);
+            hb.pack_start(&header_status_box);
             hb.set_show_title_buttons(true);
             hb
         };
@@ -165,13 +166,17 @@ impl CommsSpline {
         // I'll put it at the bottom of the Nodes tab.
         let nodes_box = Box::new(Orientation::Vertical, 0);
         nodes_box.append(&nodes_scroll);
+
+        let node_actions_box = Box::new(Orientation::Horizontal, 5);
+        node_actions_box.set_halign(Align::Center);
+        node_actions_box.set_margin_bottom(10);
+        node_actions_box.set_margin_top(10);
+
         let new_node_btn = Button::new();
         let icon_new_node = Image::from_icon_name("list-add-symbolic");
         new_node_btn.set_child(Some(&icon_new_node));
         new_node_btn.set_tooltip_text(Some("New Node"));
         new_node_btn.add_css_class("flat");
-        new_node_btn.set_margin_bottom(10);
-        new_node_btn.set_margin_top(10);
 
         // New Node Click Logic (Abbreviated for brevity, same as before)
         let tx_node_create = tx_event.clone();
@@ -264,7 +269,18 @@ impl CommsSpline {
             dialog.set_child(Some(&vbox));
             dialog.present();
         });
-        nodes_box.append(&new_node_btn);
+        node_actions_box.append(&new_node_btn);
+
+        // THE COMPOSER (Relocated)
+        let composer_icon = Image::from_icon_name("chat-message-new-symbolic");
+        let composer_btn = Button::builder()
+            .css_classes(vec!["flat"])
+            .tooltip_text("Open Composer (Formal Command)")
+            .child(&composer_icon)
+            .build();
+
+        node_actions_box.append(&composer_btn);
+        nodes_box.append(&node_actions_box);
 
         sidebar_stack.add_titled(&nodes_box, Some("nodes"), "Nodes");
 
@@ -369,7 +385,15 @@ impl CommsSpline {
         let renderer_draw = renderer.clone();
         let renderer_realize = renderer.clone();
 
-        gl_area.connect_realize(move |_area| {
+        gl_area.connect_realize(move |area| {
+            area.make_current();
+
+            // Safety check: If GTK failed to allocate the GPU context, abort gracefully
+            if area.error().is_some() {
+                eprintln!(":: VUG :: Fatal GL Error on Realize");
+                return;
+            }
+
             gl::load_with(|s| epoxy::get_proc_addr(s));
             renderer_realize.borrow_mut().init_gl();
         });
@@ -415,16 +439,7 @@ impl CommsSpline {
             });
         });
 
-        // THE COMPOSER (Wolfpack Interface)
-        let composer_icon = Image::from_icon_name("chat-message-new-symbolic");
-        composer_icon.set_pixel_size(24);
-        let composer_btn = Button::builder()
-            .valign(Align::End)
-            .css_classes(vec!["composer-action"])
-            .tooltip_text("Open Composer (Formal Command)")
-            .child(&composer_icon)
-            .build();
-
+        // THE COMPOSER (Wolfpack Interface) - Button moved to Sidebar
         let active_directive = Rc::new(RefCell::new("Directive 055".to_string()));
         let active_directive_clone = active_directive.clone();
 
@@ -598,7 +613,6 @@ impl CommsSpline {
         });
 
         input_container.append(&attach_btn);
-        input_container.append(&composer_btn); // Added
         input_container.append(&input_scroll);
         input_container.append(&send_btn);
         paned.set_end_child(Some(&input_container));
