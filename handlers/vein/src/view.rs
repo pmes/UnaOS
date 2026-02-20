@@ -445,16 +445,10 @@ impl CommsSpline {
 
         gl_area.connect_render(move |area, ctx| renderer_draw.borrow_mut().draw(area, ctx));
 
-        // Content Split: Top = GL Area, Bottom = Console
-        let content_split = Paned::new(Orientation::Vertical);
-        content_split.set_vexpand(true);
-        content_split.set_hexpand(true);
-        content_split.set_position(300); // Give GL Area 300px height initially
-        content_split.set_start_child(Some(&gl_area));
-        content_split.set_end_child(Some(&scrolled_window));
-
-        // Set Content Split as the start child of the main vertical pane
-        paned.set_start_child(Some(&content_split));
+        // --- DIRECTIVE 059 - OVERRIDE: THE GL_AREA QUARANTINE ---
+        // Do not attach the GL Area to the UI hierarchy. It remains orphaned.
+        // We attach the console directly to the start child of the main pane.
+        paned.set_start_child(Some(&scrolled_window));
 
         // --- Input Area ---
         let input_container = Box::new(Orientation::Horizontal, 8);
