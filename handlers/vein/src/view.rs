@@ -72,52 +72,27 @@ impl CommsSpline {
             gtk4::STYLE_PROVIDER_PRIORITY_APPLICATION,
         );
 
-        // --- HeaderBar & Tokens ---
-        let sidebar_toggle = ToggleButton::builder()
-            .icon_name("sidebar-show-symbolic")
-            .active(true)
-            .tooltip_text("Toggle Sidebar")
-            .build();
-
-        // THE METER (Resource Awareness)
-        let token_label = Label::new(Some("Tokens: 0"));
-        token_label.add_css_class("dim-label");
-        token_label.set_margin_end(10);
-
-        // THE PULSE
-        let pulse_icon = Image::from_icon_name("activity-start-symbolic"); // or similar
-        pulse_icon.set_pixel_size(16);
-        pulse_icon.set_opacity(0.3);
-
-        let header_status_box = Box::new(Orientation::Horizontal, 5);
-        header_status_box.append(&token_label);
-        header_status_box.append(&pulse_icon);
-        // header_status_box.set_margin_start(12); // Removed per Directive 058-B (Center/Title Widget)
-
-        #[cfg(feature = "gnome")]
-        let header_bar = {
-            let hb = adw::HeaderBar::new();
-            hb.pack_start(&sidebar_toggle);
-            hb.set_title_widget(Some(&header_status_box));
-            hb
-        };
-
-        #[cfg(not(feature = "gnome"))]
-        let header_bar = {
-            let hb = HeaderBar::new();
-            hb.pack_start(&sidebar_toggle);
-            hb.set_title_widget(Some(&header_status_box));
-            hb.set_show_title_buttons(true);
-            hb
-        };
-
-        // --- Sidebar ---
+        // --- Root Layout (Directive 058-B v3) ---
         let main_h_paned = Paned::new(Orientation::Horizontal);
         main_h_paned.set_position(215);
 
+        // --- Left Pane (The Silhouette) ---
+        let left_vbox = Box::new(Orientation::Vertical, 0);
+        left_vbox.add_css_class("sidebar");
+        left_vbox.set_width_request(215);
+
+        // Blank HeaderBar
+        #[cfg(feature = "gnome")]
+        let blank_header_bar = adw::HeaderBar::new();
+        #[cfg(not(feature = "gnome"))]
+        let blank_header_bar = HeaderBar::new();
+
+        blank_header_bar.set_show_title_buttons(false);
+        left_vbox.append(&blank_header_bar);
+
+        // Sidebar Content
         let sidebar_box = Box::new(Orientation::Vertical, 0);
-        sidebar_box.set_width_request(215);
-        sidebar_box.add_css_class("sidebar");
+        sidebar_box.set_vexpand(true); // Ensure sidebar fills remaining space
 
         let sidebar_stack = Stack::new();
         sidebar_stack.set_vexpand(true);
@@ -341,9 +316,45 @@ impl CommsSpline {
         sidebar_box.append(&stack_switcher);
         sidebar_box.append(&Separator::new(Orientation::Horizontal)); // Footer separator
 
-        main_h_paned.set_start_child(Some(&sidebar_box));
+        left_vbox.append(&sidebar_box);
+        main_h_paned.set_start_child(Some(&left_vbox));
 
-        // --- Main Content ---
+        // --- Right Pane (The Command Center) ---
+        let right_vbox = Box::new(Orientation::Vertical, 0);
+
+        // Command HeaderBar
+        #[cfg(feature = "gnome")]
+        let command_header_bar = adw::HeaderBar::new();
+        #[cfg(not(feature = "gnome"))]
+        let command_header_bar = HeaderBar::new();
+
+        command_header_bar.set_show_title_buttons(true);
+        // command_header_bar.set_title_widget(Some(&Label::new(Some("Lumen")))); // Title handled by window usually, but explicit requested? "Lumen"
+
+        // Grouping: Toggle + Telemetry
+        let sidebar_toggle = ToggleButton::builder()
+            .icon_name("sidebar-show-symbolic")
+            .active(true)
+            .tooltip_text("Toggle Sidebar")
+            .build();
+
+        let token_label = Label::new(Some("Tokens: 0"));
+        token_label.add_css_class("dim-label");
+        token_label.set_margin_end(10);
+
+        let pulse_icon = Image::from_icon_name("activity-start-symbolic");
+        pulse_icon.set_pixel_size(16);
+        pulse_icon.set_opacity(0.3);
+
+        let status_group = Box::new(Orientation::Horizontal, 8);
+        status_group.append(&sidebar_toggle);
+        status_group.append(&token_label);
+        status_group.append(&pulse_icon);
+
+        command_header_bar.pack_start(&status_group);
+        right_vbox.append(&command_header_bar);
+
+        // --- Main Content (Console/Input) ---
         let paned = Paned::new(Orientation::Vertical);
         paned.set_vexpand(true);
         paned.set_hexpand(true);
@@ -625,11 +636,18 @@ impl CommsSpline {
         input_container.append(&send_btn);
         paned.set_end_child(Some(&input_container));
 
-        main_h_paned.set_end_child(Some(&paned));
+        right_vbox.append(&paned);
+        main_h_paned.set_end_child(Some(&right_vbox));
 
-        let sidebar_box_clone = sidebar_box.clone();
+        // Toggle logic for the new layout:
+        // Hiding sidebar_box works, but left_vbox still occupies 215px.
+        // We should collapse the main_h_paned position or hide the left pane.
+        // However, standard toggle behavior often just hides content or collapses.
+        // Given "Full Height Split", if we toggle off, we likely want the sidebar GONE.
+        // So let's hide the left_vbox entirely.
+        let left_vbox_clone = left_vbox.clone();
         sidebar_toggle.connect_toggled(move |btn| {
-            sidebar_box_clone.set_visible(btn.is_active());
+            left_vbox_clone.set_visible(btn.is_active());
         });
 
         // Clones for async loop
@@ -716,16 +734,24 @@ impl CommsSpline {
 
         #[cfg(feature = "gnome")]
         {
-            let view = adw::ToolbarView::new();
-            view.add_top_bar(&header_bar);
-            view.set_content(Some(&main_h_paned));
-            view.upcast::<Widget>()
+            // For Adwaita, we usually set content directly if we manage headerbars manually inside panes.
+            // If we use ToolbarView, it expects top bars.
+            // Since we split the headerbars, we just return the main_h_paned as content.
+            // Note: AdwWindow might need a titlebar widget set to None if we want full custom client decorations?
+            // Actually, AdwApplicationWindow with no titlebar set will default to system decorations or empty.
+            // But since we put HeaderBars inside, they will act as drag handles.
+            main_h_paned.upcast::<Widget>()
         }
 
         #[cfg(not(feature = "gnome"))]
         {
             if let Some(app_win) = window.dynamic_cast_ref::<gtk4::ApplicationWindow>() {
-                app_win.set_titlebar(Some(&header_bar));
+                // Remove any existing titlebar from window if possible, or set None.
+                // app_win.set_titlebar(None::<&Widget>);
+                // But set_titlebar expects Some.
+                // We'll just set child. The window manager decorations depend on the platform.
+                // If we want CSD, the HeaderBars inside the panes handle it.
+                app_win.set_titlebar(None::<&Widget>);
             }
             main_h_paned.into()
         }
