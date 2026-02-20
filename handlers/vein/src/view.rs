@@ -372,10 +372,13 @@ impl CommsSpline {
         let scroll_adj_clone = scrolled_window_adj.clone();
         scrolled_window.set_child(Some(&console_text_view));
 
-        // Spatial Cortex
-        let h_paned = Paned::new(Orientation::Horizontal);
-        h_paned.set_start_child(Some(&scrolled_window));
+        // Spatial Cortex (Amputated per Directive 058-A)
+        // We bypass the h_paned and set the console as the direct child
+        paned.set_start_child(Some(&scrolled_window));
 
+        // The Phantom GL Area
+        // We keep it instantiated to satisfy compiler dependencies (signal closures),
+        // but it is orphaned from the UI tree so it never realizes.
         let gl_area = GLArea::new();
         gl_area.set_has_depth_buffer(true);
         // Request Core Profile 3.3
@@ -405,9 +408,9 @@ impl CommsSpline {
 
         gl_area.connect_render(move |area, ctx| renderer_draw.borrow_mut().draw(area, ctx));
 
-        h_paned.set_end_child(Some(&gl_area));
-        h_paned.set_position(800);
-        paned.set_start_child(Some(&h_paned));
+        // h_paned.set_end_child(Some(&gl_area)); // Amputated
+        // h_paned.set_position(800); // Amputated
+        // paned.set_start_child(Some(&h_paned)); // Replaced above
 
         // --- Input Area ---
         let input_container = Box::new(Orientation::Horizontal, 8);
