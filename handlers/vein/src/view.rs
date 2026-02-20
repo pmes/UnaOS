@@ -378,6 +378,8 @@ impl CommsSpline {
 
         let gl_area = GLArea::new();
         gl_area.set_has_depth_buffer(true);
+        // Request Core Profile 3.3
+        gl_area.set_required_version(3, 3);
         gl_area.set_size_request(300, -1);
         let renderer = Rc::new(RefCell::new(Renderer::new()));
 

@@ -75,6 +75,9 @@ impl Renderer {
             if ptr.is_null() {
                 eprintln!(":: VUG :: WARNING: Failed to load symbol: {}", s);
             }
+            if s == "glCreateShader" {
+                eprintln!(":: VUG :: glCreateShader -> {:?}", ptr);
+            }
             ptr
         });
         eprintln!(":: VUG :: load_gl_functions() - FINISHED");
@@ -84,6 +87,14 @@ impl Renderer {
         eprintln!(":: VUG :: Renderer::init_gl() - START");
 
         unsafe {
+            let version = gl::GetString(gl::VERSION);
+            if !version.is_null() {
+                let v = std::ffi::CStr::from_ptr(version as *const i8);
+                eprintln!(":: VUG :: GL Version: {:?}", v);
+            } else {
+                eprintln!(":: VUG :: FAIL: glGetString returned NULL");
+            }
+
             eprintln!(":: VUG :: compiling shaders");
             let vertex_shader = compile_shader(gl::VERTEX_SHADER, VERTEX_SHADER_SRC);
             let fragment_shader = compile_shader(gl::FRAGMENT_SHADER, FRAGMENT_SHADER_SRC);
