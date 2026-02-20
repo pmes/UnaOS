@@ -1,3 +1,4 @@
+#![allow(unsafe_op_in_unsafe_fn)]
 use epoxy;
 use euclase::mat::Mat4;
 use euclase::vec::{Vec3, Vec4};

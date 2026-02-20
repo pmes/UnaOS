@@ -162,11 +162,11 @@ fn process_commands(
                 // _graph.set_node_param(crate::NodeId(0), 0, _freq);
             }
             AudioCommand::SetParam {
-                node_id,
-                param_id,
-                value,
+                node_id: _node_id,
+                param_id: _param_id,
+                value: _value,
             } => {
-                // _graph.set_node_param(crate::NodeId(node_id), param_id, value);
+                // _graph.set_node_param(crate::NodeId(_node_id), _param_id, _value);
             }
             AudioCommand::Stop => {
             }
