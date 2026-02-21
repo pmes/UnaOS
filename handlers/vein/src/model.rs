@@ -1,5 +1,6 @@
 use glib::subclass::prelude::*;
-use glib::{Properties, ParamSpec, Value, ToValue};
+use glib::prelude::*;
+use glib::Properties;
 use std::cell::RefCell;
 
 mod imp {

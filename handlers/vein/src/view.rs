@@ -6,7 +6,7 @@ use gtk4::{
     EventControllerKey, FileDialog, Image, Label, ListBox, ListItem,
     Orientation, Paned, PolicyType, Popover, PropagationPhase, Scale, ScrolledWindow,
     SignalListItemFactory, SingleSelection, Spinner, Stack, StackSwitcher, StackTransitionType,
-    StringList, StringObject, Switch, TextView, ToggleButton, Widget, Window,
+    StringList, StringObject, Switch, ToggleButton, Widget, Window,
     ListView, FilterListModel, Expander,
     gdk::{Key, ModifierType},
     gio,
@@ -789,7 +789,7 @@ impl CommsSpline {
                         // Parse incoming log
                         let mut sender = "System".to_string();
                         let mut is_chat = true;
-                        let mut content = text.clone();
+                        let content = text.clone();
                         let mut subject = "Log".to_string();
 
                         if text.trim().starts_with("[ARCHITECT]") {
