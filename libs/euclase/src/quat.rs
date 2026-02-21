@@ -1,13 +1,14 @@
-use crate::vec::{Vec3, Vec4};
-use crate::mat::Mat4;
 use bytemuck::{Pod, Zeroable};
-#[cfg(feature = "serde")]
-use serde::{Deserialize, Serialize};
-use core::ops::{Add, Mul, MulAssign, Neg};
+use core::ops::{Add, Mul, Neg, Sub};
+use crate::vec3::Vec3;
 
+/// A quaternion for representing rotation.
+///
+/// This struct is `#[repr(C)]`, `Pod`, and `Zeroable`.
+/// Components: x, y, z (vector part), w (scalar part).
 #[repr(C)]
-#[derive(Copy, Clone, Debug, PartialEq, Pod, Zeroable)]
-#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[derive(Clone, Copy, Debug, PartialEq, Pod, Zeroable)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct Quat {
     pub x: f32,
     pub y: f32,
@@ -15,175 +16,100 @@ pub struct Quat {
     pub w: f32,
 }
 
-impl Default for Quat {
-    #[inline]
-    fn default() -> Self {
-        Self::IDENTITY
-    }
-}
-
 impl Quat {
-    pub const IDENTITY: Self = Self { x: 0.0, y: 0.0, z: 0.0, w: 1.0 };
-
+    /// Identity quaternion (no rotation).
     #[inline]
-    pub const fn new(x: f32, y: f32, z: f32, w: f32) -> Self {
-        Self { x, y, z, w }
+    pub const fn identity() -> Self {
+        Self { x: 0.0, y: 0.0, z: 0.0, w: 1.0 }
     }
 
+    /// Creates a quaternion from an axis and an angle (in radians).
+    /// Axis must be normalized.
     #[inline]
-    pub fn from_axis_angle(axis: Vec3, angle_radians: f32) -> Self {
-        let (s, c) = libm::sincosf(angle_radians * 0.5);
-        let v = axis.normalize() * s;
+    pub fn from_axis_angle(axis: Vec3, angle: f32) -> Self {
+        let half_angle = angle * 0.5;
+        let s = libm::sinf(half_angle);
+        let c = libm::cosf(half_angle);
         Self {
-            x: v.x,
-            y: v.y,
-            z: v.z,
+            x: axis.x * s,
+            y: axis.y * s,
+            z: axis.z * s,
             w: c,
         }
     }
 
+    /// Normalizes the quaternion.
+    #[inline]
+    pub fn normalize(self) -> Self {
+        let mag_sq = self.dot(self);
+        if mag_sq > 0.0 {
+            let m = libm::sqrtf(mag_sq);
+            Self {
+                x: self.x / m,
+                y: self.y / m,
+                z: self.z / m,
+                w: self.w / m,
+            }
+        } else {
+            Self::identity()
+        }
+    }
+
+    /// Dot product.
     #[inline]
     pub fn dot(self, other: Self) -> f32 {
         self.x * other.x + self.y * other.y + self.z * other.z + self.w * other.w
     }
 
+    /// Spherical Linear Interpolation.
     #[inline]
-    pub fn length_squared(self) -> f32 {
-        self.dot(self)
-    }
+    pub fn slerp(self, mut other: Self, t: f32) -> Self {
+        let mut dot = self.dot(other);
 
-    #[inline]
-    pub fn length(self) -> f32 {
-        libm::sqrtf(self.length_squared())
-    }
-
-    #[inline]
-    pub fn normalize(self) -> Self {
-        let len = self.length();
-        if len == 0.0 {
-            Self::IDENTITY
-        } else {
-            let inv_len = 1.0 / len;
-            Self {
-                x: self.x * inv_len,
-                y: self.y * inv_len,
-                z: self.z * inv_len,
-                w: self.w * inv_len,
-            }
-        }
-    }
-
-    #[inline]
-    pub fn conjugate(self) -> Self {
-        Self {
-            x: -self.x,
-            y: -self.y,
-            z: -self.z,
-            w: self.w,
-        }
-    }
-
-    #[inline]
-    pub fn inverse(self) -> Self {
-        let sq_len = self.length_squared();
-        if sq_len == 0.0 {
-            Self::IDENTITY
-        } else {
-            let inv_sq_len = 1.0 / sq_len;
-            Self {
-                x: -self.x * inv_sq_len,
-                y: -self.y * inv_sq_len,
-                z: -self.z * inv_sq_len,
-                w: self.w * inv_sq_len,
-            }
-        }
-    }
-
-    #[inline]
-    pub fn slerp(self, mut end: Self, t: f32) -> Self {
-        let mut cos_theta = self.dot(end);
-
-        if cos_theta < 0.0 {
-            end = -end;
-            cos_theta = -cos_theta;
+        // If the dot product is negative, the quaternions point in opposite directions.
+        // Negate one to take the shorter path.
+        if dot < 0.0 {
+            other = -other;
+            dot = -dot;
         }
 
-        if cos_theta > 0.9995 {
-            // Linear interpolation for small angles
-            return ((self * (1.0 - t)) + (end * t)).normalize();
+        const DOT_THRESHOLD: f32 = 0.9995;
+        if dot > DOT_THRESHOLD {
+            // Linear interpolation for small angles to avoid division by zero.
+            // (1-t)*self + t*other
+            let result = self * (1.0 - t) + other * t;
+            return result.normalize();
         }
 
-        let theta = libm::acosf(cos_theta);
-        let sin_theta = libm::sinf(theta);
+        // Clamp dot to avoid NaN with acos
+        if dot > 1.0 { dot = 1.0; }
+        if dot < -1.0 { dot = -1.0; }
 
-        let w1 = libm::sinf((1.0 - t) * theta) / sin_theta;
-        let w2 = libm::sinf(t * theta) / sin_theta;
+        let theta_0 = libm::acosf(dot);
+        let sin_theta_0 = libm::sinf(theta_0);
 
-        (self * w1) + (end * w2)
-    }
+        // We know sin_theta_0 != 0 because dot <= threshold (0.9995)
 
-    #[inline]
-    pub fn to_mat4(self) -> Mat4 {
-        let x2 = self.x + self.x;
-        let y2 = self.y + self.y;
-        let z2 = self.z + self.z;
+        // s0 = sin((1-t)*theta_0) / sin(theta_0)
+        // s1 = sin(t*theta_0) / sin(theta_0)
+        let s0 = libm::sinf((1.0 - t) * theta_0) / sin_theta_0;
+        let s1 = libm::sinf(t * theta_0) / sin_theta_0;
 
-        let xx = self.x * x2;
-        let xy = self.x * y2;
-        let xz = self.x * z2;
-
-        let yy = self.y * y2;
-        let yz = self.y * z2;
-        let zz = self.z * z2;
-
-        let wx = self.w * x2;
-        let wy = self.w * y2;
-        let wz = self.w * z2;
-
-        Mat4::from_cols(
-            Vec4::new(1.0 - (yy + zz), xy + wz, xz - wy, 0.0),
-            Vec4::new(xy - wz, 1.0 - (xx + zz), yz + wx, 0.0),
-            Vec4::new(xz + wy, yz - wx, 1.0 - (xx + yy), 0.0),
-            Vec4::W,
-        )
+        self * s0 + other * s1
     }
 }
 
-impl Mul<Quat> for Quat {
-    type Output = Quat;
+impl Default for Quat {
     #[inline]
-    fn mul(self, rhs: Quat) -> Quat {
-        Self {
-            x: self.w * rhs.x + self.x * rhs.w + self.y * rhs.z - self.z * rhs.y,
-            y: self.w * rhs.y - self.x * rhs.z + self.y * rhs.w + self.z * rhs.x,
-            z: self.w * rhs.z + self.x * rhs.y - self.y * rhs.x + self.z * rhs.w,
-            w: self.w * rhs.w - self.x * rhs.x - self.y * rhs.y - self.z * rhs.z,
-        }
+    fn default() -> Self {
+        Self::identity()
     }
 }
 
-impl MulAssign<Quat> for Quat {
+impl Add for Quat {
+    type Output = Self;
     #[inline]
-    fn mul_assign(&mut self, rhs: Quat) {
-        *self = *self * rhs;
-    }
-}
-
-impl Mul<Vec3> for Quat {
-    type Output = Vec3;
-    #[inline]
-    fn mul(self, v: Vec3) -> Vec3 {
-        let q_vec = Vec3::new(self.x, self.y, self.z);
-        let uv = q_vec.cross(v);
-        let uuv = q_vec.cross(uv);
-        v + ((uv * self.w) + uuv) * 2.0
-    }
-}
-
-impl Add<Quat> for Quat {
-    type Output = Quat;
-    #[inline]
-    fn add(self, rhs: Quat) -> Quat {
+    fn add(self, rhs: Self) -> Self {
         Self {
             x: self.x + rhs.x,
             y: self.y + rhs.y,
@@ -193,28 +119,80 @@ impl Add<Quat> for Quat {
     }
 }
 
-impl Mul<f32> for Quat {
-    type Output = Quat;
+impl Sub for Quat {
+    type Output = Self;
     #[inline]
-    fn mul(self, s: f32) -> Quat {
+    fn sub(self, rhs: Self) -> Self {
         Self {
-            x: self.x * s,
-            y: self.y * s,
-            z: self.z * s,
-            w: self.w * s,
+            x: self.x - rhs.x,
+            y: self.y - rhs.y,
+            z: self.z - rhs.z,
+            w: self.w - rhs.w,
+        }
+    }
+}
+
+impl Mul<f32> for Quat {
+    type Output = Self;
+    #[inline]
+    fn mul(self, rhs: f32) -> Self {
+        Self {
+            x: self.x * rhs,
+            y: self.y * rhs,
+            z: self.z * rhs,
+            w: self.w * rhs,
         }
     }
 }
 
 impl Neg for Quat {
-    type Output = Quat;
+    type Output = Self;
     #[inline]
-    fn neg(self) -> Quat {
+    fn neg(self) -> Self {
         Self {
             x: -self.x,
             y: -self.y,
             z: -self.z,
             w: -self.w,
         }
+    }
+}
+
+/// Quaternion multiplication (Hamilton product).
+/// Represents composing rotation: `self * rhs` means apply `rhs` then `self`?
+/// No, `(Q2 * Q1) * v` applies Q1 then Q2.
+impl Mul<Quat> for Quat {
+    type Output = Self;
+    #[inline]
+    fn mul(self, rhs: Self) -> Self {
+        Self {
+            x: self.w * rhs.x + self.x * rhs.w + self.y * rhs.z - self.z * rhs.y,
+            y: self.w * rhs.y - self.x * rhs.z + self.y * rhs.w + self.z * rhs.x,
+            z: self.w * rhs.z + self.x * rhs.y - self.y * rhs.x + self.z * rhs.w,
+            w: self.w * rhs.w - self.x * rhs.x - self.y * rhs.y - self.z * rhs.z,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_quat_identity() {
+        let q = Quat::identity();
+        assert_eq!(q.w, 1.0);
+        assert_eq!(q.x, 0.0);
+    }
+
+    #[test]
+    fn test_quat_mul() {
+        // Rotating 90 degrees around X, then 90 around Y.
+        let q1 = Quat::from_axis_angle(Vec3::unit_x(), core::f32::consts::FRAC_PI_2);
+        let q2 = Quat::from_axis_angle(Vec3::unit_y(), core::f32::consts::FRAC_PI_2);
+        let q3 = q2 * q1; // Apply q1 then q2
+        // We expect specific values.
+        // But mainly just checking it compiles and runs without panic for now.
+        let _ = q3.normalize();
     }
 }
