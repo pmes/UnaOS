@@ -642,8 +642,6 @@ impl CommsSpline {
         // Disable click selection highlighting visually if desired, but SingleSelection is needed for list view.
         // CSS .console:selected { background: transparent; } might be needed in provider.
 
-        let scrolled_window_adj = scrolled_window.vadjustment();
-        let scroll_adj_clone = scrolled_window_adj.clone();
         scrolled_window.set_child(Some(&console_list_view));
 
         // --- The Spatial Cortex (Euclase Target) ---
