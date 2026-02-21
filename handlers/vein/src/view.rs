@@ -14,6 +14,21 @@ use gtk4::{
 use sourceview5::View as SourceView;
 use std::cell::RefCell;
 use std::rc::Rc;
+use libspelling;
+
+// Wrapper to allow storing !Send GObjects in set_data (Safe on main thread)
+struct SendWrapper<T>(pub T);
+unsafe impl<T> Send for SendWrapper<T> {}
+unsafe impl<T> Sync for SendWrapper<T> {}
+
+fn enable_spelling(view: &SourceView) {
+    if let Some(buffer) = view.buffer().downcast::<sourceview5::Buffer>().ok() {
+        let provider = libspelling::Provider::default();
+        let adapter = libspelling::TextBufferAdapter::new(&buffer, &provider);
+        adapter.set_enabled(true);
+        buffer.set_data("spell-adapter", SendWrapper(adapter));
+    }
+}
 
 // Import Elessar (Engine)
 use elessar::gneiss_pal::shard::ShardStatus;
@@ -202,9 +217,12 @@ impl CommsSpline {
             vbox.append(&scale);
 
             vbox.append(&Label::new(Some("System Prompt")));
-            let prompt_buffer = TextBuffer::new(None);
-            let prompt_view = TextView::with_buffer(&prompt_buffer);
+            let prompt_buffer = sourceview5::Buffer::new(None);
+            let prompt_view = SourceView::with_buffer(&prompt_buffer);
+            prompt_view.set_show_line_numbers(false);
+            prompt_view.set_monospace(false);
             prompt_view.set_wrap_mode(gtk4::WrapMode::WordChar);
+            enable_spelling(&prompt_view);
             let scroll = ScrolledWindow::builder()
                 .child(&prompt_view)
                 .vexpand(true)
@@ -483,9 +501,12 @@ impl CommsSpline {
         subject_entry.set_placeholder_text(Some("Subject"));
         pop_box.append(&subject_entry);
 
-        let body_buffer = TextBuffer::new(None);
-        let body_view = TextView::with_buffer(&body_buffer);
+        let body_buffer = sourceview5::Buffer::new(None);
+        let body_view = SourceView::with_buffer(&body_buffer);
+        body_view.set_show_line_numbers(false);
+        body_view.set_monospace(false);
         body_view.set_wrap_mode(gtk4::WrapMode::WordChar);
+        enable_spelling(&body_view);
         body_view.set_height_request(150);
         let body_scroll = ScrolledWindow::builder()
             .child(&body_view)
@@ -562,6 +583,7 @@ impl CommsSpline {
             .left_margin(10)
             .right_margin(10)
             .build();
+        enable_spelling(&text_view);
         text_view.add_css_class("transparent-text");
         input_scroll.set_child(Some(&text_view));
 

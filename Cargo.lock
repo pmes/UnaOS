@@ -2031,6 +2031,35 @@ dependencies = [
 ]
 
 [[package]]
+name = "libspelling"
+version = "0.4.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "dc92df39e5bcfed67e8263756b1f4d4f839370baf8a493cbd958e192944c85c2"
+dependencies = [
+ "gio",
+ "glib",
+ "gtk4",
+ "libc",
+ "libspelling-sys",
+ "sourceview5",
+]
+
+[[package]]
+name = "libspelling-sys"
+version = "0.4.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "286fffcc712568745b5c7f74063f84d99b2094c49345966b1fc12ff1a216fa5f"
+dependencies = [
+ "gio-sys",
+ "glib-sys",
+ "gobject-sys",
+ "gtk4-sys",
+ "libc",
+ "sourceview5-sys",
+ "system-deps",
+]
+
+[[package]]
 name = "libz-sys"
 version = "1.1.23"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3482,6 +3511,7 @@ dependencies = [
  "elessar",
  "glib",
  "gtk4",
+ "libspelling",
  "sourceview5",
 ]
 
@@ -3920,6 +3950,7 @@ dependencies = [
  "glib",
  "gtk4",
  "libadwaita",
+ "libspelling",
  "log",
  "reqwest",
  "serde",
