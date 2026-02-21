@@ -47,7 +47,7 @@ impl Default for SidebarPosition {
 
 #[derive(Debug)]
 pub enum Event {
-    Input(String),
+    Input { target: String, text: String },
     TemplateAction(usize),
     NavSelect(usize),
     DockAction(usize),
@@ -72,6 +72,7 @@ pub enum Event {
         active: bool,
     },
     ComplexInput {
+        target: String,
         subject: String,
         body: String,
         point_break: bool,

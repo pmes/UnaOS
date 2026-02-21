@@ -380,7 +380,7 @@ impl AppHandler for VeinHandler {
         let mut s = self.state.lock().unwrap();
 
         match event {
-            Event::Input(text) => {
+            Event::Input { target: _, text } => {
                 let timestamp = Local::now().format("%H:%M:%S").to_string();
                 let current_text = format!("\n[ARCHITECT] [{}] > {}\n", timestamp, text);
                 s.chat_history.push(SavedMessage {
@@ -450,7 +450,7 @@ impl AppHandler for VeinHandler {
             Event::ToggleSidebar => {
                 s.sidebar_collapsed = !s.sidebar_collapsed;
             }
-            Event::ComplexInput { subject, body, point_break, action: _ } => {
+            Event::ComplexInput { target: _, subject, body, point_break, action: _ } => {
                 let prefix = if point_break { "Point Break: " } else { "" };
                 let full_message = format!("\nSubject: {}{}\n\n{}", prefix, subject, body);
 

@@ -321,7 +321,44 @@ impl CommsSpline {
 
         let nexus_list = ListBox::new();
         nexus_list.add_css_class("shard-list");
-        nexus_list.set_selection_mode(gtk4::SelectionMode::None);
+        nexus_list.set_selection_mode(gtk4::SelectionMode::Single); // Enable selection
+
+        // Target Tracking
+        let active_target = Rc::new(RefCell::new("Una-Prime".to_string()));
+        let active_target_clone = active_target.clone();
+
+        nexus_list.connect_row_selected(move |_, row| {
+            if let Some(row) = row {
+                let index = row.index();
+                // Map index to Shard Name.
+                // Row 0: Header "PRIMES" (unselectable ideally, but ListBox counts it)
+                // Row 1: Una-Prime
+                // Row 2: Claude-Prime
+                // Row 3: Header "SUB-PROCESSES"
+                // Row 4: S9-Mule
+
+                // Better approach: Attach data to the row widget using object data, or just simple mapping for now.
+                // Or check the label text if we can traverse children.
+                // Mapping by index is fragile but fast for Phase 3.1.
+                // Let's traverse children to find the label.
+
+                if let Some(child) = row.child() {
+                    if let Some(box_widget) = child.downcast_ref::<Box>() {
+                        // It's one of our custom rows
+                        // Structure: [Icon, Label, Spinner]
+                        // Child 1 is Label
+                        if let Some(label_widget) = box_widget.last_child().and_then(|w| w.prev_sibling()).and_then(|w| w.downcast::<Label>().ok()) {
+                             // Wait, structure is append(icon), append(label), append(spinner).
+                             // So first_child = icon, next = label.
+                             let text = label_widget.text().to_string();
+                             // Strip status suffixes like " (Thinking)"
+                             let name = text.split(" (").next().unwrap_or(&text).to_string();
+                             *active_target_clone.borrow_mut() = name;
+                        }
+                    }
+                }
+            }
+        });
 
         nexus_list.append(&Label::builder().label("PRIMES").xalign(0.0).css_classes(vec!["nexus-header"]).build());
 
@@ -749,6 +786,7 @@ impl CommsSpline {
         let b_ar = btn_arch.clone();
         let b_db = btn_debug.clone();
         let _b_un = btn_una.clone();
+        let target_comp = active_target.clone();
 
         btn_comp_send.connect_clicked(move |_| {
             if let Some(pop) = pop_weak.upgrade() {
@@ -762,6 +800,7 @@ impl CommsSpline {
                              else { "una" };
 
                 let _ = tx_composer.send_blocking(Event::ComplexInput {
+                    target: target_comp.borrow().clone(),
                     subject,
                     body,
                     point_break: pb,
@@ -829,6 +868,8 @@ impl CommsSpline {
         key_controller.set_propagation_phase(PropagationPhase::Capture);
         let tx_clone_key = tx_event.clone();
         let buffer_key = buffer.clone();
+        let target_key = active_target.clone();
+
         key_controller.connect_key_pressed(move |_ctrl, key, _keycode, state| {
             if key != Key::Return { return glib::Propagation::Proceed; }
             if state.contains(ModifierType::SHIFT_MASK) { return glib::Propagation::Proceed; }
@@ -837,7 +878,10 @@ impl CommsSpline {
                 let (start, end) = buffer_key.bounds();
                 let text = buffer_key.text(&start, &end, false).to_string();
                 if !text.trim().is_empty() {
-                    let _ = tx_clone_key.send_blocking(Event::Input(text));
+                    let _ = tx_clone_key.send_blocking(Event::Input {
+                        target: target_key.borrow().clone(),
+                        text
+                    });
                     buffer_key.set_text("");
                 }
                 return glib::Propagation::Stop;
@@ -845,11 +889,16 @@ impl CommsSpline {
             glib::Propagation::Proceed
         });
         text_view.add_controller(key_controller);
+
+        let target_send = active_target.clone();
         send_btn.connect_clicked(move |_| {
             let (start, end) = buffer.bounds();
             let text = buffer.text(&start, &end, false).to_string();
             if !text.trim().is_empty() {
-                let _ = tx_clone_send.send_blocking(Event::Input(text));
+                let _ = tx_clone_send.send_blocking(Event::Input {
+                    target: target_send.borrow().clone(),
+                    text
+                });
                 buffer.set_text("");
             }
         });
