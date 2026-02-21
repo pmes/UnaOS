@@ -17,7 +17,7 @@ use sourceview5::prelude::*;
 use std::cell::RefCell;
 use std::rc::Rc;
 use libspelling;
-use crate::model::{DispatchObject, DispatchRecord};
+use crate::model::DispatchObject;
 use crate::storage::DiskManager;
 
 // Wrapper to allow storing !Send GObjects in set_data (Safe on main thread)

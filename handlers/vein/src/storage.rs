@@ -1,4 +1,4 @@
-use unafs::{UnaFS, FileDevice, FileSystem, FileKind, DirEntry};
+use unafs::{UnaFS, FileDevice, FileSystem};
 use crate::model::DispatchRecord;
 use std::path::Path;
 use anyhow::{Result, Context};
@@ -21,8 +21,8 @@ impl DiskManager {
             fs
         } else {
             // Format new
-            let mut device = FileDevice::open(path)?;
-            let mut fs = UnaFS::format(&mut device, 64)?;
+            let device = FileDevice::open(path)?;
+            let mut fs = UnaFS::format(device, 64)?;
             Self::create_history_file(&mut fs)?;
             fs
         };
@@ -56,7 +56,7 @@ impl DiskManager {
             .ok_or_else(|| anyhow::anyhow!("History file not found"))?;
 
         // Write data
-        self.fs.write_data(entry.inode, 0, &data)?;
+        self.fs.write_data(entry.inode_id, 0, &data)?;
         Ok(())
     }
 
@@ -65,11 +65,11 @@ impl DiskManager {
         let root_entries = self.fs.ls(root_inode)?;
 
         if let Some(entry) = root_entries.iter().find(|e| e.name == HISTORY_FILE) {
-            let inode_obj = self.fs.read_inode(entry.inode)?;
+            let inode_obj = self.fs.read_inode(entry.inode_id)?;
             if inode_obj.size == 0 {
                 return Ok(Vec::new());
             }
-            let data = self.fs.read_data(entry.inode, 0, inode_obj.size)?;
+            let data = self.fs.read_data(entry.inode_id, 0, inode_obj.size)?;
             if data.is_empty() {
                 return Ok(Vec::new());
             }
