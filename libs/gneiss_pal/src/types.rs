@@ -14,6 +14,7 @@ pub enum WolfpackState {
 pub enum GuiUpdate {
     ShardStatusChanged { id: String, status: ShardStatus },
     ConsoleLog(String),
+    ClearConsole,
     EditorLoad(String),
     SidebarStatus(WolfpackState), // The Pulse
     Spectrum(Vec<f32>),
@@ -78,6 +79,7 @@ pub enum Event {
         point_break: bool,
         action: String, // "exec", "arch", "debug", "una"
     },
+    ShardSelect(String),
 }
 
 #[derive(Clone, Debug)]

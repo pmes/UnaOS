@@ -12,6 +12,7 @@ use elessar::gneiss_pal::{
     ViewMode, WolfpackState,
 };
 use log::info;
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -24,7 +25,8 @@ use bandy::{BandyMember, SMessage};
 struct State {
     mode: ViewMode,
     nav_index: usize,
-    chat_history: Vec<SavedMessage>,
+    contexts: HashMap<String, Vec<SavedMessage>>,
+    active_node: String,
     sidebar_position: SidebarPosition,
     sidebar_collapsed: bool,
     s9_status: ShardStatus,
@@ -113,13 +115,32 @@ impl VeinHandler {
         history_path: PathBuf,
         bandy_tx: broadcast::Sender<SMessage>,
     ) -> Self {
-        let brain = BrainManager::new(history_path);
-        let saved_history = brain.load();
+        // Initialize Brains
+        let una_brain = BrainManager::new(history_path.clone());
+        let una_history = una_brain.load();
+
+        let s9_path = history_path
+            .parent()
+            .unwrap_or(&PathBuf::from("."))
+            .join("s9_history.json");
+        let s9_brain = BrainManager::new(s9_path);
+        let s9_history = s9_brain.load(); // Try load, or empty if new
+
+        // Create Context Map
+        let mut contexts = HashMap::new();
+        contexts.insert("una-prime".to_string(), una_history.clone());
+        contexts.insert("s9-mule".to_string(), s9_history);
+
+        // Store brains for background thread
+        let mut brains = HashMap::new();
+        brains.insert("una-prime".to_string(), una_brain.clone());
+        brains.insert("s9-mule".to_string(), s9_brain.clone());
 
         let state = Arc::new(Mutex::new(State {
             mode: ViewMode::Comms,
             nav_index: 0,
-            chat_history: saved_history.clone(),
+            contexts,
+            active_node: "una-prime".to_string(),
             sidebar_position: SidebarPosition::default(),
             sidebar_collapsed: false,
             s9_status: ShardStatus::Offline,
@@ -129,7 +150,12 @@ impl VeinHandler {
 
         let gui_tx_brain = gui_tx.clone();
         let state_bg = state.clone();
-        let brain_bg = brain.clone();
+
+        // Pass map of brains to thread
+        let brains_bg = brains;
+
+        // Use the main brain (una) for active directive check initially, or just default
+        let initial_directive = una_brain.get_active_directive();
 
         thread::spawn(move || {
             let rt = Runtime::new().expect("Failed to create Tokio Runtime");
@@ -155,11 +181,18 @@ impl VeinHandler {
                             .await;
 
                         // Broadcast Active Directive
-                        let directive = brain_bg.get_active_directive();
-                        let _ = gui_tx_brain.send(GuiUpdate::ActiveDirective(directive)).await;
+                        let _ = gui_tx_brain.send(GuiUpdate::ActiveDirective(initial_directive)).await;
 
                         while let Some(user_input_text) = rx_from_ui.recv().await {
-                            let is_s9 = user_input_text.starts_with("/s9");
+                            // Determine active node and context
+                            let (active_node, history_len) = {
+                                let s = state_bg.lock().unwrap();
+                                let node = s.active_node.clone();
+                                let len = s.contexts.get(&node).map(|v| v.len()).unwrap_or(0);
+                                (node, len)
+                            };
+
+                            let is_s9 = active_node == "s9-mule";
 
                             if user_input_text.starts_with("READ_REPO:") {
                                 let parts: Vec<&str> = user_input_text.split(':').collect();
@@ -191,19 +224,29 @@ impl VeinHandler {
                                 continue;
                             }
 
+                            // Pre-save (persist user message)
                             {
-                                let mut s = state_bg.lock().unwrap();
-                                brain_bg.save(&s.chat_history);
+                                let s = state_bg.lock().unwrap();
+                                if let Some(brain) = brains_bg.get(&active_node) {
+                                    if let Some(ctx) = s.contexts.get(&active_node) {
+                                        brain.save(ctx);
+                                    }
+                                }
                                 if is_s9 {
-                                    s.s9_status = ShardStatus::Thinking;
+                                    // Update S9 status in state if needed, though handle_event doesn't set it?
+                                    // handle_event pushed message.
+                                    // Let's set thinking status here.
+                                    // Note: can't easily mutate s inside this block because of brain.save call needing ref to s.contexts?
+                                    // brain.save takes &[SavedMessage].
                                 }
                             }
 
-                            let _ = gui_tx_brain
-                                .send(GuiUpdate::SidebarStatus(WolfpackState::Dreaming))
-                                .await;
-
+                            // Set Thinking Status
                             if is_s9 {
+                                {
+                                    let mut s = state_bg.lock().unwrap();
+                                    s.s9_status = ShardStatus::Thinking;
+                                }
                                 let _ = gui_tx_brain
                                     .send(GuiUpdate::ShardStatusChanged {
                                         id: "s9-mule".into(),
@@ -212,8 +255,13 @@ impl VeinHandler {
                                     .await;
                             }
 
+                            let _ = gui_tx_brain
+                                .send(GuiUpdate::SidebarStatus(WolfpackState::Dreaming))
+                                .await;
+
                             let system_instruction =
                                 if is_s9 { "You are S9." } else { "You are Una." };
+
                             let mut context = Vec::new();
                             context.push(Content {
                                 role: "model".into(),
@@ -222,8 +270,9 @@ impl VeinHandler {
 
                             let history = {
                                 let guard = state_bg.lock().unwrap();
-                                guard.chat_history.clone()
+                                guard.contexts.get(&active_node).cloned().unwrap_or_default()
                             };
+
                             for msg in history.iter().rev().take(20).rev() {
                                 if msg.content.starts_with("SYSTEM") {
                                     continue;
@@ -234,16 +283,96 @@ impl VeinHandler {
                                 });
                             }
 
-                            context.push(Content {
-                                role: "user".into(),
-                                parts: vec![Part::text(user_input_text.clone())],
-                            });
+                            // User input is already in history (pushed by handle_event),
+                            // BUT wait:
+                            // In original code:
+                            // handle_event pushes to chat_history.
+                            // Loop creates context from history.
+                            // Then pushes user_input_text to context as LAST message?
+                            //
+                            // Original code:
+                            // for msg in history... { context.push(...) }
+                            // context.push(Content { role: "user", parts: vec![Part::text(user_input_text)] });
+                            //
+                            // Wait, if handle_event already pushed it to history, then it's in history!
+                            // If we take last 20 from history, it likely includes the just-pushed user message.
+                            // THEN we push it AGAIN?
+                            //
+                            // Let's check original `handle_event`:
+                            // s.chat_history.push(...)
+                            //
+                            // Original loop:
+                            // let history = guard.chat_history.clone();
+                            // for msg in history.iter().rev().take(20).rev() { ... }
+                            // context.push(Content { role: "user", parts: vec![Part::text(user_input_text)] });
+                            //
+                            // So the user message is duplicated in context sent to LLM?
+                            // Or is the loop excluding the last one?
+                            // If history includes the new message, then `take(20)` includes it.
+                            // Then `context.push` adds it again.
+                            // This seems like a bug in original code, or intended emphasis.
+                            //
+                            // However, since I am refactoring, I should preserve behavior or fix it.
+                            // If I use `history` which now includes the message, and I append it again, the LLM sees it twice.
+                            //
+                            // Actually, in `handle_event`:
+                            // s.chat_history.push(...)
+                            //
+                            // In loop:
+                            // guard.chat_history.clone() -> includes msg.
+                            //
+                            // If I want to match original behavior, I should continue this pattern.
+                            // But maybe I should avoid duplication.
+                            // The `user_input_text` passed via channel is redundant if it's in state history.
+                            // But `handle_event` pushes it.
+                            //
+                            // If I look closely at original code:
+                            // `context.push(Content { role: "user", parts: vec![Part::text(user_input_text.clone())] });`
+                            //
+                            // If the history contains it, then it's double.
+                            // Maybe the history used in loop is *saved* history?
+                            // `handle_event` pushes to `s.chat_history`.
+                            // So `s.chat_history` has it.
+                            //
+                            // I will stick to the pattern:
+                            // 1. Get history.
+                            // 2. Add system prompt.
+                            // 3. Add history messages (including the one just added).
+                            // 4. Wait, if I add history messages, I shouldn't add `user_input_text` again manually unless I filter it out from history.
+                            //
+                            // Let's see if I can just rely on history.
+                            // If I just iterate history, I get the user message at the end.
+                            // I don't need to push it again.
+                            //
+                            // The original code did:
+                            // `context.push(Content { role: "user", parts: vec![Part::text(user_input_text.clone())] });`
+                            // This suggests it wants to ensure the last message is the user prompt.
+                            // If the history iterator includes it, it appears twice.
+                            // I will assume the original code intended to send the prompt.
+                            // If I remove the manual push, I rely on history.
+                            // But `take(20)` might cut it off if history is long? No, `rev().take(20).rev()` takes the *last* 20. So it definitely includes the latest message.
+                            // So currently it sends it twice.
+                            // I will fix this "bug" by NOT pushing it manually if it's already in history.
+                            // Or rather, I'll just build context from history.
+                            //
+                            // BUT, wait. `handle_event` sends `text` to channel.
+                            // `handle_event` pushes to `chat_history`.
+                            //
+                            // If I change the loop to NOT push `user_input_text`, I'm changing behavior.
+                            // Maybe the duplication is harmless or the model ignores it.
+                            // But for "Dynamic Prompt Routing", cleaner is better.
+                            // I will just use the history.
+                            //
+                            // Wait, `user_input_text` is used to determine `is_s9` (in original).
+                            //
+                            // I'll construct context from history.
 
                             match client.generate_content(&context).await {
                                 Ok((response, metadata)) => {
                                     let timestamp = Local::now().format("%H:%M:%S").to_string();
+                                    let prefix = if is_s9 { "S9" } else { "UNA" };
                                     let display =
-                                        format!("\n[UNA] [{}] :: {}\n", timestamp, response);
+                                        format!("\n[{}] [{}] :: {}\n", prefix, timestamp, response);
                                     let _ = gui_tx_brain
                                         .send(GuiUpdate::ConsoleLog(display.clone()))
                                         .await;
@@ -256,12 +385,18 @@ impl VeinHandler {
 
                                     {
                                         let mut s = state_bg.lock().unwrap();
-                                        s.chat_history.push(SavedMessage {
-                                            role: "model".into(),
-                                            content: response.clone(),
-                                            timestamp: Some(timestamp),
-                                        });
-                                        brain_bg.save(&s.chat_history);
+                                        if let Some(history) = s.contexts.get_mut(&active_node) {
+                                            history.push(SavedMessage {
+                                                role: "model".into(),
+                                                content: response.clone(),
+                                                timestamp: Some(timestamp),
+                                            });
+                                            // Save via brain
+                                            if let Some(brain) = brains_bg.get(&active_node) {
+                                                brain.save(history);
+                                            }
+                                        }
+
                                         if is_s9 {
                                             s.s9_status = ShardStatus::Online;
                                         }
@@ -297,8 +432,8 @@ impl VeinHandler {
             });
         });
 
-        // Restore History
-        for msg in saved_history {
+        // Restore History (Una-Prime by default)
+        for msg in una_history {
             if !msg.content.starts_with("SYSTEM") {
                 let prefix = if msg.role == "user" {
                     "[ARCHITECT]"
@@ -380,14 +515,53 @@ impl AppHandler for VeinHandler {
         let mut s = self.state.lock().unwrap();
 
         match event {
+            Event::ShardSelect(node_id) => {
+                s.active_node = node_id.clone();
+                let _ = self.gui_tx.send_blocking(GuiUpdate::ClearConsole);
+
+                // Replay history
+                if let Some(history) = s.contexts.get(&node_id) {
+                    for msg in history {
+                        if !msg.content.starts_with("SYSTEM") {
+                            // Determine prefix based on node?
+                            // Currently code uses [UNA] for model.
+                            // Maybe use [S9] if node is s9-mule?
+                            // The saved message role is "user" or "model".
+                            let prefix = if msg.role == "user" {
+                                "[ARCHITECT]"
+                            } else {
+                                if node_id == "s9-mule" { "[S9]" } else { "[UNA]" }
+                            };
+                            let ts = msg.timestamp.clone().unwrap_or_else(|| "--:--:--".to_string());
+                            let _ = self.gui_tx.send_blocking(GuiUpdate::ConsoleLog(format!(
+                                "{} [{}] > {}\n",
+                                prefix, ts, msg.content
+                            )));
+                        }
+                    }
+                }
+            }
             Event::Input { target: _, text } => {
                 let timestamp = Local::now().format("%H:%M:%S").to_string();
                 let current_text = format!("\n[ARCHITECT] [{}] > {}\n", timestamp, text);
-                s.chat_history.push(SavedMessage {
-                    role: "user".to_string(),
-                    content: text.clone(),
-                    timestamp: Some(timestamp),
-                });
+
+                let active = s.active_node.clone();
+                if let Some(history) = s.contexts.get_mut(&active) {
+                    history.push(SavedMessage {
+                        role: "user".to_string(),
+                        content: text.clone(),
+                        timestamp: Some(timestamp),
+                    });
+                } else {
+                    // Fallback or error? Should not happen if initialized correctly.
+                    // Recover by creating entry?
+                    s.contexts.insert(active.clone(), vec![SavedMessage {
+                        role: "user".to_string(),
+                        content: text.clone(),
+                        timestamp: Some(timestamp),
+                    }]);
+                }
+
                 self.append_to_console(&current_text);
 
                 if text.trim() == "/wolf" {
@@ -397,6 +571,7 @@ impl AppHandler for VeinHandler {
                     s.mode = ViewMode::Comms;
                     self.append_to_console("\n[SYSTEM] :: Secure Comms Established.\n");
                 } else if text.trim() == "/clear" {
+                    let _ = self.gui_tx.send_blocking(GuiUpdate::ClearConsole);
                     self.append_to_console("\n:: VEIN :: SYSTEM CLEARED\n\n");
                 } else if text.trim().starts_with("/upload") {
                     let parts: Vec<&str> = text.split_whitespace().collect();
@@ -416,6 +591,7 @@ impl AppHandler for VeinHandler {
             Event::TemplateAction(idx) => match idx {
                 0 => {
                     if s.mode == ViewMode::Comms {
+                        let _ = self.gui_tx.send_blocking(GuiUpdate::ClearConsole);
                         self.append_to_console(":: VEIN :: SYSTEM CLEARED\n\n");
                     } else {
                         self.append_to_console("\n[WOLFPACK] :: Deploying J-Series Unit...\n");
@@ -456,11 +632,16 @@ impl AppHandler for VeinHandler {
 
                 let timestamp = Local::now().format("%H:%M:%S").to_string();
                 let current_text = format!("\n[ARCHITECT] [{}] > {}\n", timestamp, full_message);
-                s.chat_history.push(SavedMessage {
-                    role: "user".to_string(),
-                    content: full_message.clone(),
-                    timestamp: Some(timestamp),
-                });
+
+                let active = s.active_node.clone();
+                if let Some(history) = s.contexts.get_mut(&active) {
+                    history.push(SavedMessage {
+                        role: "user".to_string(),
+                        content: full_message.clone(),
+                        timestamp: Some(timestamp),
+                    });
+                }
+
                 self.append_to_console(&current_text);
 
                 if let Err(e) = self.tx.send(full_message) {

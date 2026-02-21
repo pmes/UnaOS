@@ -327,17 +327,10 @@ impl CommsSpline {
         // Target Tracking
         let active_target = Rc::new(RefCell::new("Una-Prime".to_string()));
         let active_target_clone = active_target.clone();
+        let tx_nexus = tx_event.clone();
 
         nexus_list.connect_row_selected(move |_, row| {
             if let Some(row) = row {
-                let index = row.index();
-                // Map index to Shard Name.
-                // Row 0: Header "PRIMES" (unselectable ideally, but ListBox counts it)
-                // Row 1: Una-Prime
-                // Row 2: Claude-Prime
-                // Row 3: Header "SUB-PROCESSES"
-                // Row 4: S9-Mule
-
                 // Better approach: Attach data to the row widget using object data, or just simple mapping for now.
                 // Or check the label text if we can traverse children.
                 // Mapping by index is fragile but fast for Phase 3.1.
@@ -354,7 +347,9 @@ impl CommsSpline {
                              let text = label_widget.text().to_string();
                              // Strip status suffixes like " (Thinking)"
                              let name = text.split(" (").next().unwrap_or(&text).to_string();
-                             *active_target_clone.borrow_mut() = name;
+                             *active_target_clone.borrow_mut() = name.clone();
+
+                             let _ = tx_nexus.send_blocking(Event::ShardSelect(name.to_lowercase()));
                         }
                     }
                 }
@@ -1090,6 +1085,9 @@ impl CommsSpline {
                     }
                     GuiUpdate::ActiveDirective(d) => {
                         *active_directive_async.borrow_mut() = d;
+                    }
+                    GuiUpdate::ClearConsole => {
+                        console_store.remove_all();
                     }
                     _ => {}
                 }
