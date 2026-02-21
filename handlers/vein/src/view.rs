@@ -708,16 +708,21 @@ impl CommsSpline {
 
         let tx_clone_file = tx_event.clone();
         let window_clone = window.clone();
+        let target_file = active_target.clone();
         attach_btn.connect_clicked(move |_| {
             let tx = tx_clone_file.clone();
             let parent_window = window_clone.clone();
+            let target = target_file.clone();
             glib::MainContext::default().spawn_local(async move {
                 let dialog = FileDialog::new();
                 let result = dialog.open_future(Some(&parent_window)).await;
                 if let Ok(file) = result {
                     if let Some(path) = file.path() {
                         let path_str = path.to_string_lossy().to_string();
-                        let _ = tx.send(Event::Input(format!("/upload {}", path_str))).await;
+                        let _ = tx.send(Event::Input {
+                            target: target.borrow().clone(),
+                            text: format!("/upload {}", path_str)
+                        }).await;
                     }
                 }
             });

@@ -15,7 +15,7 @@ impl DiskManager {
         let path = Path::new(DISK_PATH);
         let fs = if path.exists() {
             // Mount existing
-            let mut device = FileDevice::open(path)?;
+            let device = FileDevice::open(path)?;
             let mut fs = UnaFS::mount(device)?;
             Self::ensure_history_file(&mut fs)?;
             fs
