@@ -17,7 +17,8 @@ use sourceview5::prelude::*;
 use std::cell::RefCell;
 use std::rc::Rc;
 use libspelling;
-use crate::model::DispatchObject;
+use crate::model::{DispatchObject, DispatchRecord};
+use crate::storage::DiskManager;
 
 // Wrapper to allow storing !Send GObjects in set_data (Safe on main thread)
 struct SendWrapper<T>(pub T);
@@ -879,6 +880,24 @@ impl CommsSpline {
         let pulse_icon_clone = pulse_icon.clone();
         let active_directive_async = active_directive_clone.clone();
 
+        // Load History from UnaFS
+        if let Ok(mut disk) = DiskManager::new() {
+            if let Ok(records) = disk.load_history() {
+                // Populate ListStore (Reverse order because we use insert(0))
+                // The records on disk are likely chronological (oldest first).
+                // If we insert(0), we should iterate oldest to newest so newest ends up at index 0?
+                // Wait: insert(0) puts item at top.
+                // If records are [Old, ..., New], iterating and insert(0) -> [New, ..., Old] at indices [0, ..., N].
+                // This matches the "Newest at Top" paradigm.
+                for record in records {
+                    let obj = DispatchObject::from_record(&record);
+                    console_store.insert(0, &obj);
+                }
+            }
+        }
+
+        let console_store_async = console_store.clone();
+
         glib::MainContext::default().spawn_local(async move {
             while let Ok(update) = rx.recv().await {
                 match update {
@@ -927,6 +946,34 @@ impl CommsSpline {
                         );
 
                         console_store.insert(0, &obj);
+
+                        // Persist to UnaFS (Async Shadow Copy)
+                        // We need a snapshot of all items to save.
+                        // Collecting from ListStore on main thread is fast enough for text.
+                        // We iterate from 0 to N.
+                        // If store has [Newest, ..., Oldest] (reversed view),
+                        // we should probably save them as [Oldest, ..., Newest] (chronological)
+                        // so they load back correctly?
+                        // Yes. iterate reverse or collect and reverse.
+
+                        let mut snapshot = Vec::new();
+                        let n_items = console_store_async.n_items();
+                        for i in 0..n_items {
+                            if let Some(item) = console_store_async.item(i) {
+                                if let Some(dobj) = item.downcast_ref::<DispatchObject>() {
+                                    snapshot.push(dobj.to_record());
+                                }
+                            }
+                        }
+                        // Snapshot is [Newest, ..., Oldest].
+                        // Reverse to store [Oldest, ..., Newest].
+                        snapshot.reverse();
+
+                        std::thread::spawn(move || {
+                            if let Ok(mut disk) = DiskManager::new() {
+                                let _ = disk.save_history(&snapshot);
+                            }
+                        });
                     }
                     GuiUpdate::ShardStatusChanged { id, status } => {
                         let (spinner, label, name) = if id == "una-prime" {

@@ -2,6 +2,17 @@ use glib::subclass::prelude::*;
 use glib::prelude::*;
 use glib::Properties;
 use std::cell::RefCell;
+use serde::{Serialize, Deserialize};
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct DispatchRecord {
+    pub id: String,
+    pub sender: String,
+    pub subject: String,
+    pub timestamp: String,
+    pub content: String,
+    pub is_chat: bool,
+}
 
 mod imp {
     use super::*;
@@ -57,5 +68,27 @@ impl DispatchObject {
             .property("is_chat", is_chat)
             .property("is_expanded", false)
             .build()
+    }
+
+    pub fn from_record(record: &DispatchRecord) -> Self {
+        Self::new(
+            &record.id,
+            &record.sender,
+            &record.subject,
+            &record.timestamp,
+            &record.content,
+            record.is_chat,
+        )
+    }
+
+    pub fn to_record(&self) -> DispatchRecord {
+        DispatchRecord {
+            id: self.id(),
+            sender: self.sender(),
+            subject: self.subject(),
+            timestamp: self.timestamp(),
+            content: self.content(),
+            is_chat: self.is_chat(),
+        }
     }
 }

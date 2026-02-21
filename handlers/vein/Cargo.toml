@@ -25,3 +25,5 @@ chrono = "0.4"
 tokio = { version = "1.49", features = ["full"] }
 # vug = { path = "../vug" }
 anyhow = "1.0.102"
+unafs = { path = "../../libs/unafs" }
+bincode = "1.3"
