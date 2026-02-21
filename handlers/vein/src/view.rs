@@ -929,35 +929,29 @@ impl CommsSpline {
         let active_directive_async = active_directive_clone.clone();
         let buffer_async = buffer.clone();
 
-        // Load History from UnaFS
-        if let Ok(mut disk) = DiskManager::new() {
-            if let Ok(records) = disk.load_history() {
-                // Populate ListStore (Reverse order because we use insert(0))
-                // The records on disk are likely chronological (oldest first).
-                // If we insert(0), we should iterate oldest to newest so newest ends up at index 0?
-                // Wait: insert(0) puts item at top.
-                // If records are [Old, ..., New], iterating and insert(0) -> [New, ..., Old] at indices [0, ..., N].
-                // This matches the "Newest at Top" paradigm.
-                for record in records {
-                    let obj = DispatchObject::from_record(&record);
-                    console_store.insert(0, &obj);
-                }
+        // 1. Initialize DiskManager ONCE on the main thread
+        let mut disk = match DiskManager::new() {
+            Ok(d) => d,
+            Err(e) => {
+                eprintln!(":: FATAL :: Storage Init Failed: {}", e);
+                panic!("Storage Failure: {}", e);
+            }
+        };
+
+        // 2. Load History Synchronously
+        if let Ok(records) = disk.load_history() {
+            for record in records {
+                let obj = DispatchObject::from_record(&record);
+                console_store.insert(0, &obj);
             }
         }
 
         let console_store_async = console_store.clone();
 
-        // The Librarian Actor (Serialized Disk Access)
+        // 3. Spawn Librarian and transfer ownership of `disk`
         let (storage_tx, mut storage_rx) = mpsc::unbounded_channel::<Vec<crate::model::DispatchRecord>>();
 
         std::thread::spawn(move || {
-            let mut disk = match DiskManager::new() {
-                Ok(d) => d,
-                Err(e) => {
-                    eprintln!(":: LIBRARIAN :: Failed to mount UnaFS: {}", e);
-                    return;
-                }
-            };
             let rt = tokio::runtime::Runtime::new().unwrap();
             rt.block_on(async move {
                 while let Some(records) = storage_rx.recv().await {
