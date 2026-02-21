@@ -26,6 +26,7 @@ impl DiskManager {
                 }
                 Err(e) => {
                     eprintln!(":: LIBRARIAN :: Mount failed ({}), reformatting...", e);
+                    std::fs::File::create(path)?.set_len(64 * 1024 * 1024)?;
                     let device = FileDevice::open(path)?;
                     let mut fs = UnaFS::format(device, 64)?;
                     Self::create_history_file(&mut fs)?;
@@ -33,6 +34,7 @@ impl DiskManager {
                 }
             }
         } else {
+            std::fs::File::create(path)?.set_len(64 * 1024 * 1024)?;
             let device = FileDevice::open(path)?;
             let mut fs = UnaFS::format(device, 64)?;
             Self::create_history_file(&mut fs)?;
