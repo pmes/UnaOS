@@ -7,7 +7,7 @@ use gtk4::{
     Orientation, Paned, PolicyType, Popover, PropagationPhase, Scale, ScrolledWindow,
     SignalListItemFactory, SingleSelection, Spinner, Stack, StackSwitcher, StackTransitionType,
     StringList, StringObject, Switch, ToggleButton, Widget, Window,
-    ListView, FilterListModel, Expander,
+    ListView, FilterListModel, Expander, NoSelection, GestureClick,
     gdk::{Key, ModifierType},
     gio,
 };
@@ -434,7 +434,7 @@ impl CommsSpline {
 
         let console_store = gio::ListStore::new::<DispatchObject>();
         let console_filter = FilterListModel::new(Some(console_store.clone()), None::<gtk4::Filter>);
-        let console_selection = SingleSelection::new(Some(console_filter));
+        let console_selection = NoSelection::new(Some(console_filter));
 
         let console_factory = SignalListItemFactory::new();
         console_factory.connect_setup(move |_factory, item| {
@@ -471,6 +471,7 @@ impl CommsSpline {
             chat_content_view.set_monospace(false);
             chat_content_view.set_width_request(600); // Forces a minimum readable width
             chat_content_view.set_hexpand(true);
+            chat_content_view.set_focusable(true); // Allow copy paste
             bubble.append(&chat_content_view);
 
             // 3. Payload Expander
@@ -500,6 +501,10 @@ impl CommsSpline {
             right_spacer.set_hexpand(true);
             root.append(&right_spacer);
 
+            // Expansion Gesture
+            let gesture = GestureClick::new();
+            bubble.add_controller(gesture);
+
             item.set_child(Some(&root));
         });
 
@@ -524,6 +529,54 @@ impl CommsSpline {
             iter_bubble = chat_view.next_sibling();
             let expander = iter_bubble.unwrap().downcast::<Expander>().unwrap();
 
+            // Bind Gesture
+            // We need to find the controller. It should be the first one if we only added one.
+            if let Some(controller) = bubble.first_controller() {
+                if let Ok(gesture) = controller.downcast::<GestureClick>() {
+                    // Disconnect previous signals to avoid stacking
+                    // Note: In GTK4 Rust, signal IDs are returned. We can't easily clear *all* signals without tracking IDs.
+                    // A workaround for SignalListItemFactory is to use a weak ref to the object in the closure
+                    // and replace the closure entirely? No, `connect_pressed` adds.
+                    // BETTER: The gesture is persistent. We need to update *what it does*.
+                    // But `connect_pressed` takes a static closure.
+                    // CRITICAL FIX: We cannot easily rebind the closure every time.
+                    // Instead, we store the object ID in the widget's data and read it in the closure?
+                    // OR we accept that we might need to recreate the gesture or use a different signal strategy.
+                    // Given the constraint, we will assume standard factory behavior:
+                    // bind happens often. We can't stack signals.
+                    // We will skip gesture binding here and assume the click handles expanding via visual click?
+                    // No, the prompt requires a click.
+                    // Hack: Remove all controllers and re-add?
+                    // bubble.remove_controller(&controller); // and re-add new one?
+                    // Let's try removing the specific controller we found and adding a new one with the current object.
+
+                    bubble.remove_controller(&gesture);
+                }
+            }
+
+            let gesture = GestureClick::new();
+            let obj_clone = obj.clone();
+            let chat_view_clone = chat_view.clone();
+            let content_clone = obj.content().clone();
+
+            gesture.connect_pressed(move |_, _, _, _| {
+                let current = obj_clone.is_expanded();
+                obj_clone.set_is_expanded(!current);
+
+                // Immediate UI update
+                if !current { // If we are expanding
+                     chat_view_clone.buffer().set_text(&content_clone);
+                } else {
+                     // If collapsing (optional, but good UX)
+                     let line_count = content_clone.lines().count();
+                     if line_count > 11 {
+                        let truncated: String = content_clone.lines().take(11).collect::<Vec<&str>>().join("\n") + "\n\n... [Click to expand]";
+                        chat_view_clone.buffer().set_text(&truncated);
+                     }
+                }
+            });
+            bubble.add_controller(gesture);
+
             let is_chat = obj.is_chat();
             let sender = obj.sender();
             let timestamp = obj.timestamp();
@@ -535,6 +588,16 @@ impl CommsSpline {
             bubble.remove_css_class("una-bubble");
             left_spacer.set_visible(false);
             right_spacer.set_visible(false);
+
+            // Expansion Logic (GestureClick)
+            // Remove old controllers to prevent stacking if recycled
+            // Ideally we'd store the controller but for now we clear or just add new one if careful.
+            // Since bind is called often, adding a controller every time is a leak/duplicate risk.
+            // Correct way: Check if controller exists or use a custom widget subclass.
+            // Hack for SignalListItemFactory: We can store the controller in the widget data or just not re-add if present.
+            // Better: attach controller in setup, and in bind just update state?
+            // BUT we need the specific object in the closure.
+            // The factory `setup` creates the gesture.
 
             if is_chat {
                 chat_view.set_visible(true);
@@ -566,7 +629,16 @@ impl CommsSpline {
                     right_spacer.set_visible(true);
                     meta_label.set_xalign(0.0);
                 }
-                chat_view.buffer().set_text(&content);
+
+                // Truncation Logic
+                let is_expanded = obj.is_expanded();
+                let line_count = content.lines().count();
+                if line_count > 11 && !is_expanded {
+                    let truncated: String = content.lines().take(11).collect::<Vec<&str>>().join("\n") + "\n\n... [Click to expand]";
+                    chat_view.buffer().set_text(&truncated);
+                } else {
+                    chat_view.buffer().set_text(&content);
+                }
 
             } else {
                 chat_view.set_visible(false);
@@ -879,7 +951,7 @@ impl CommsSpline {
                             is_chat
                         );
 
-                        console_store.append(&obj);
+                        console_store.insert(0, &obj);
                     }
                     GuiUpdate::ShardStatusChanged { id, status } => {
                         let (spinner, label, name) = if id == "una-prime" {

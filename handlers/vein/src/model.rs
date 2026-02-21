@@ -21,6 +21,8 @@ mod imp {
         content: RefCell<String>,
         #[property(get, set)]
         is_chat: RefCell<bool>,
+        #[property(get, set)]
+        is_expanded: RefCell<bool>,
     }
 
     #[glib::object_subclass]
@@ -53,6 +55,7 @@ impl DispatchObject {
             .property("timestamp", timestamp)
             .property("content", content)
             .property("is_chat", is_chat)
+            .property("is_expanded", false)
             .build()
     }
 }
