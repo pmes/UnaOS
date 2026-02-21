@@ -15,6 +15,7 @@ pub enum GuiUpdate {
     ShardStatusChanged { id: String, status: ShardStatus },
     ConsoleLog(String),
     ClearConsole,
+    AppendInput(String),
     EditorLoad(String),
     SidebarStatus(WolfpackState), // The Pulse
     Spectrum(Vec<f32>),

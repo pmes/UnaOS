@@ -926,6 +926,7 @@ impl CommsSpline {
         let token_label_clone = token_label.clone();
         let pulse_icon_clone = pulse_icon.clone();
         let active_directive_async = active_directive_clone.clone();
+        let buffer_async = buffer.clone();
 
         // Load History from UnaFS
         if let Ok(mut disk) = DiskManager::new() {
@@ -1087,6 +1088,10 @@ impl CommsSpline {
                     }
                     GuiUpdate::ClearConsole => {
                         console_store.remove_all();
+                    }
+                    GuiUpdate::AppendInput(text) => {
+                        let mut end = buffer_async.end_iter();
+                        buffer_async.insert(&mut end, &text);
                     }
                     _ => {}
                 }

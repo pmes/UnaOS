@@ -32,6 +32,16 @@ struct State {
     s9_status: ShardStatus,
 }
 
+fn get_mime_type(filename: &str) -> &str {
+    let lower = filename.to_lowercase();
+    if lower.ends_with(".png") { "image/png" }
+    else if lower.ends_with(".jpg") || lower.ends_with(".jpeg") { "image/jpeg" }
+    else if lower.ends_with(".pdf") { "application/pdf" }
+    else if lower.ends_with(".mp4") { "video/mp4" }
+    else if lower.ends_with(".mp3") || lower.ends_with(".wav") { "audio/mpeg" }
+    else { "text/plain" }
+}
+
 // Upload Logic
 fn trigger_upload(path: PathBuf, gui_tx: async_channel::Sender<GuiUpdate>) {
     let filename = path
@@ -74,30 +84,23 @@ fn trigger_upload(path: PathBuf, gui_tx: async_channel::Sender<GuiUpdate>) {
 
             let res = client.post(url).multipart(form).send().await;
 
-            let final_msg = match res {
-                Ok(response) => {
-                    if response.status().is_success() {
-                        let text = response.text().await.unwrap_or_default();
-                        if let Ok(json) = serde_json::from_str::<serde_json::Value>(&text) {
-                            if let Some(uri) = json.get("storage_uri").and_then(|v| v.as_str()) {
-                                format!("\n[SYSTEM] :: Upload Complete.\nURI: {}\n", uri)
-                            } else {
-                                format!("\n[SYSTEM] :: Upload Complete (Raw): {}\n", text)
-                            }
-                        } else {
-                            format!("\n[SYSTEM] :: Upload Complete (Raw): {}\n", text)
+            if let Ok(response) = res {
+                if response.status().is_success() {
+                    let text = response.text().await.unwrap_or_default();
+                    if let Ok(json) = serde_json::from_str::<serde_json::Value>(&text) {
+                        if let Some(uri) = json.get("storage_uri").and_then(|v| v.as_str()) {
+                            let mime = get_mime_type(&filename);
+                            let tag = format!("\n[ATTACHMENT:{}|{}]\n", mime, uri);
+                            let _ = gui_tx.send(GuiUpdate::AppendInput(tag)).await;
+                            let _ = gui_tx.send(GuiUpdate::ConsoleLog(format!("\n[SYSTEM] :: {} Encased.\n", filename))).await;
                         }
-                    } else {
-                        format!(
-                            "\n[SYSTEM ERROR] :: Upload Failed: Status {}\n",
-                            response.status()
-                        )
                     }
+                } else {
+                    let _ = gui_tx.send(GuiUpdate::ConsoleLog(format!("\n[SYSTEM ERROR] :: Upload Failed: Status {}\n", response.status()))).await;
                 }
-                Err(e) => format!("\n[SYSTEM ERROR] :: Network Error: {}\n", e),
-            };
-
-            let _ = gui_tx.send(GuiUpdate::ConsoleLog(final_msg)).await;
+            } else if let Err(e) = res {
+                let _ = gui_tx.send(GuiUpdate::ConsoleLog(format!("\n[SYSTEM ERROR] :: Network Error: {}\n", e))).await;
+            }
         });
     });
 }
@@ -277,9 +280,33 @@ impl VeinHandler {
                                 if msg.content.starts_with("SYSTEM") {
                                     continue;
                                 }
+
+                                let mut parts = Vec::new();
+                                let mut current_text = msg.content.clone();
+
+                                while let Some(start) = current_text.find("[ATTACHMENT:") {
+                                    if let Some(end) = current_text[start..].find("]") {
+                                        let absolute_end = start + end;
+                                        let tag = &current_text[start + 12 .. absolute_end];
+
+                                        if let Some((mime, uri)) = tag.split_once('|') {
+                                            if start > 0 {
+                                                parts.push(Part::text(current_text[..start].to_string()));
+                                            }
+                                            parts.push(Part::file_data(mime.to_string(), uri.to_string()));
+                                        }
+                                        current_text = current_text[absolute_end + 1..].to_string();
+                                    } else {
+                                        break;
+                                    }
+                                }
+                                if !current_text.trim().is_empty() {
+                                    parts.push(Part::text(current_text));
+                                }
+
                                 context.push(Content {
                                     role: msg.role.clone(),
-                                    parts: vec![Part::text(msg.content.clone())],
+                                    parts,
                                 });
                             }
 
