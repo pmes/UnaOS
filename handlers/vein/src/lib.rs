@@ -10,7 +10,6 @@ use elessar::gneiss_pal::{
     ViewMode, WolfpackState,
 };
 use log::info;
-use serde::Deserialize;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::thread;

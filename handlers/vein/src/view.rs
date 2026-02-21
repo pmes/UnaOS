@@ -25,7 +25,7 @@ unsafe impl<T> Sync for SendWrapper<T> {}
 fn enable_spelling(view: &SourceView) {
     if let Some(buffer) = view.buffer().downcast::<sourceview5::Buffer>().ok() {
         let provider = libspelling::Provider::default();
-        let checker = libspelling::Checker::new(&provider, "en_US");
+        let checker = libspelling::Checker::new(Some(&provider), Some("en_US"));
         let adapter = libspelling::TextBufferAdapter::new(&buffer, &checker);
         adapter.set_enabled(true);
         buffer.set_data("spell-adapter", SendWrapper(adapter));
