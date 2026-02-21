@@ -66,7 +66,21 @@ impl CommsSpline {
         let provider = CssProvider::new();
         provider.load_from_string("
             .console { font-family: 'Monospace'; background: transparent; }
-            .console-row { margin: 4px; padding: 4px; }
+            .console-row { margin-bottom: 16px; padding: 0px; }
+
+            .bubble-box {
+                border-radius: 12px;
+                padding: 12px;
+            }
+
+            .architect-bubble {
+                background-color: alpha(currentColor, 0.08);
+            }
+
+            .una-bubble {
+                background-color: alpha(currentColor, 0.05);
+            }
+
             .chat-input-area { border-radius: 12px; padding: 2px; border: 1px solid alpha(currentColor, 0.1); }
             .transparent-text { background-color: transparent; font-family: 'Sans'; font-size: 15px; padding: 6px; color: @theme_text_color; }
             .transparent-text text { background-color: transparent; color: inherit; }
@@ -426,60 +440,73 @@ impl CommsSpline {
         console_factory.connect_setup(move |_factory, item| {
             let item = item.downcast_ref::<ListItem>().unwrap();
 
-            // Root Container
-            let root = Box::new(Orientation::Vertical, 0);
+            // Root Container (Expanded Horizontally)
+            let root = Box::new(Orientation::Horizontal, 0);
+            root.set_hexpand(true);
             root.add_css_class("console-row");
 
-            // 1. Chat View Container
-            let chat_box = Box::new(Orientation::Vertical, 4);
+            // Bubble Container (Restricted Width)
+            let bubble = Box::new(Orientation::Vertical, 4);
+            bubble.add_css_class("bubble-box");
+            bubble.set_width_request(400); // Minimum comfortable width
+            // We can't set exact max-width on Box easily in GTK4 without CSS or wrapping,
+            // but relying on halign in a wide container provides the visual effect.
+            // For true 75% max-width, we'd need a custom layout manager or specific CSS on the widget name.
+            // Here we rely on natural sizing plus alignment to avoid the "crushed" look.
+
+            // 1. Meta Label
             let meta_label = Label::new(None);
             meta_label.set_xalign(0.0);
             meta_label.add_css_class("dim-label");
+            bubble.append(&meta_label);
 
-            // Using SourceView for content to match requirement, even for chat
+            // 2. Chat Content
             let chat_content_buffer = sourceview5::Buffer::new(None);
             let chat_content_view = SourceView::with_buffer(&chat_content_buffer);
             chat_content_view.set_editable(false);
             chat_content_view.set_wrap_mode(gtk4::WrapMode::WordChar);
             chat_content_view.set_show_line_numbers(false);
             chat_content_view.add_css_class("transparent-text");
-            chat_content_view.set_monospace(false); // Clean look for chat
+            chat_content_view.set_monospace(false);
+            bubble.append(&chat_content_view);
 
-            chat_box.append(&meta_label);
-            chat_box.append(&chat_content_view);
-
-            // 2. Payload View Container (Expander)
+            // 3. Payload Expander
             let expander = Expander::new(None);
             let expander_label = Label::new(None);
-            expander.set_child(Some(&expander_label)); // Placeholder title
+            expander.set_child(Some(&expander_label));
 
             let payload_content_buffer = sourceview5::Buffer::new(None);
             let payload_content_view = SourceView::with_buffer(&payload_content_buffer);
             payload_content_view.set_editable(false);
             payload_content_view.set_wrap_mode(gtk4::WrapMode::WordChar);
-            payload_content_view.set_show_line_numbers(true); // Code often needs line numbers
+            payload_content_view.set_show_line_numbers(true);
             payload_content_view.set_monospace(true);
 
             let payload_scroll = ScrolledWindow::builder()
                 .child(&payload_content_view)
-                .height_request(200) // Default height for payload
+                .height_request(200)
                 .build();
 
             expander.set_child(Some(&payload_scroll));
+            bubble.append(&expander);
 
-            root.append(&chat_box);
-            root.append(&expander);
-
+            root.append(&bubble);
             item.set_child(Some(&root));
         });
 
         console_factory.connect_bind(move |_factory, item| {
             let item = item.downcast_ref::<ListItem>().unwrap();
             let root = item.child().unwrap().downcast::<Box>().unwrap();
+            let bubble = root.first_child().unwrap().downcast::<Box>().unwrap();
             let obj = item.item().unwrap().downcast::<DispatchObject>().unwrap();
 
-            let chat_box = root.first_child().unwrap().downcast::<Box>().unwrap();
-            let expander = root.last_child().unwrap().downcast::<Expander>().unwrap();
+            // Children: Meta Label (0), Chat View (1), Expander (2)
+            let mut iter = bubble.first_child();
+            let meta_label = iter.unwrap().downcast::<Label>().unwrap();
+            iter = meta_label.next_sibling();
+            let chat_view = iter.unwrap().downcast::<SourceView>().unwrap();
+            iter = chat_view.next_sibling();
+            let expander = iter.unwrap().downcast::<Expander>().unwrap();
 
             let is_chat = obj.is_chat();
             let sender = obj.sender();
@@ -487,13 +514,13 @@ impl CommsSpline {
             let content = obj.content();
             let subject = obj.subject();
 
-            if is_chat {
-                chat_box.set_visible(true);
-                expander.set_visible(false);
+            // Reset Bubble Classes
+            bubble.remove_css_class("architect-bubble");
+            bubble.remove_css_class("una-bubble");
 
-                // Bind Chat
-                let meta_label = chat_box.first_child().unwrap().downcast::<Label>().unwrap();
-                let content_view = chat_box.last_child().unwrap().downcast::<SourceView>().unwrap();
+            if is_chat {
+                chat_view.set_visible(true);
+                expander.set_visible(false);
 
                 meta_label.set_text(&format!("{} • {}", sender, timestamp));
 
@@ -504,34 +531,36 @@ impl CommsSpline {
 
                 if sender == "Architect" {
                     meta_label.add_css_class("role-architect");
-                    root.set_halign(Align::End); // Right align architect
+                    bubble.add_css_class("architect-bubble");
+                    bubble.set_halign(Align::End);
                     meta_label.set_xalign(1.0);
                 } else if sender == "Una-Prime" {
                     meta_label.add_css_class("role-una");
-                    root.set_halign(Align::Start);
+                    bubble.add_css_class("una-bubble");
+                    bubble.set_halign(Align::Start);
                     meta_label.set_xalign(0.0);
                 } else {
                     meta_label.add_css_class("role-system");
-                    root.set_halign(Align::Start);
+                    bubble.add_css_class("una-bubble");
+                    bubble.set_halign(Align::Start);
                     meta_label.set_xalign(0.0);
                 }
-
-                content_view.buffer().set_text(&content);
+                chat_view.buffer().set_text(&content);
 
             } else {
-                chat_box.set_visible(false);
+                chat_view.set_visible(false);
                 expander.set_visible(true);
-                root.set_halign(Align::Fill); // Payloads take full width
 
-                // Bind Payload
-                // Set Expander Label (We have to recreate it or find it if we want custom widget there)
-                // Expander::set_label sets simple text. For "Sender | Subject | Time", simple text is fine for now.
+                // Payloads generally align left or fill
+                bubble.set_halign(Align::Fill);
+                bubble.add_css_class("una-bubble"); // Default to dark background
+
                 expander.set_label(Some(&format!("{} | {} | {}", sender, subject, timestamp)));
 
                 let scroll = expander.child().unwrap().downcast::<ScrolledWindow>().unwrap();
                 let content_view = scroll.child().unwrap().downcast::<SourceView>().unwrap();
                 content_view.buffer().set_text(&content);
-                expander.set_expanded(false); // Default closed
+                expander.set_expanded(false);
             }
         });
 
