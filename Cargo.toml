@@ -15,7 +15,7 @@ members = [
     "handlers/tabula",
     "handlers/midden",
     "handlers/amber_bytes",
-    "handlers/vug",
+    # "handlers/vug",
     "apps/cli/vertex",
     "apps/cli/unafs",
     "apps/sentinel",
