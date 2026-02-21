@@ -53,7 +53,9 @@ pub fn create_view(mode: EditorMode) -> (Widget, TextBuffer) {
                 let checker = libspelling::Checker::new(Some(&provider), Some("en_US"));
                 let adapter = libspelling::TextBufferAdapter::new(&buffer, &checker);
                 adapter.set_enabled(true);
-                buffer.set_data("spell-adapter", SendWrapper(adapter));
+                unsafe {
+                    buffer.set_data("spell-adapter", SendWrapper(adapter));
+                }
             }
         },
         EditorMode::Log => {
