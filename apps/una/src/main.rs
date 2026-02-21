@@ -95,7 +95,7 @@ impl IdeSpline {
         paned.set_vexpand(true);
         paned.set_position(400);
 
-        let (tabula_widget, tabula_buf) = tabula::create_view();
+        let (tabula_widget, tabula_buf) = tabula::create_view(tabula::EditorMode::Prose);
         paned.set_start_child(Some(&tabula_widget));
 
         let (midden_widget, midden_buf) = midden::create_view();

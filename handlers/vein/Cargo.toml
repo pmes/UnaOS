@@ -9,6 +9,7 @@ gtk = ["elessar/gtk"]
 gnome = ["elessar/gnome", "dep:libadwaita"]
 
 [dependencies]
+libspelling = "0.4.1"
 elessar = { path = "../../libs/elessar" }
 bandy = { path = "../../libs/bandy" }
 gtk4 = { version = "0.10.3", features = ["v4_12"] }
