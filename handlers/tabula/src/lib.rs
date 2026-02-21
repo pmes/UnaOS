@@ -50,7 +50,8 @@ pub fn create_view(mode: EditorMode) -> (Widget, TextBuffer) {
             // Spellcheck (The Boz Protocol)
             if let Some(buffer) = view.buffer().downcast::<sourceview5::Buffer>().ok() {
                 let provider = libspelling::Provider::default();
-                let adapter = libspelling::TextBufferAdapter::new(&buffer, &provider);
+                let checker = libspelling::Checker::new(&provider, "en_US");
+                let adapter = libspelling::TextBufferAdapter::new(&buffer, &checker);
                 adapter.set_enabled(true);
                 buffer.set_data("spell-adapter", SendWrapper(adapter));
             }

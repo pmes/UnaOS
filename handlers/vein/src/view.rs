@@ -12,6 +12,7 @@ use gtk4::{
 };
 
 use sourceview5::View as SourceView;
+use sourceview5::prelude::*;
 use std::cell::RefCell;
 use std::rc::Rc;
 use libspelling;
@@ -24,7 +25,8 @@ unsafe impl<T> Sync for SendWrapper<T> {}
 fn enable_spelling(view: &SourceView) {
     if let Some(buffer) = view.buffer().downcast::<sourceview5::Buffer>().ok() {
         let provider = libspelling::Provider::default();
-        let adapter = libspelling::TextBufferAdapter::new(&buffer, &provider);
+        let checker = libspelling::Checker::new(&provider, "en_US");
+        let adapter = libspelling::TextBufferAdapter::new(&buffer, &checker);
         adapter.set_enabled(true);
         buffer.set_data("spell-adapter", SendWrapper(adapter));
     }
