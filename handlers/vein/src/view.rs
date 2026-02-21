@@ -65,8 +65,8 @@ impl CommsSpline {
         provider.load_from_string("
             .console { font-family: 'Monospace'; padding: 12px; }
             .chat-input-area { border-radius: 12px; padding: 2px; border: 1px solid alpha(currentColor, 0.1); }
-            textview.transparent-text { background-color: transparent; font-family: 'Sans'; font-size: 15px; padding: 6px; }
-            textview.transparent-text text { background-color: transparent; }
+            .transparent-text { background-color: transparent; font-family: 'Sans'; font-size: 15px; padding: 6px; color: @theme_text_color; }
+.transparent-text text { background-color: transparent; color: inherit; }
 
             /* Native Icon Scaling */
             .suggested-action { background-color: #0078d4; color: #ffffff; border-radius: 4px; }
