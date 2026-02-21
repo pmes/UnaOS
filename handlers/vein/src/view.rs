@@ -84,7 +84,7 @@ impl CommsSpline {
             }
 
             .chat-input-area { border-radius: 12px; padding: 2px; border: 1px solid alpha(currentColor, 0.1); }
-            .transparent-text { background-color: transparent; font-family: 'Sans'; font-size: 15px; padding: 6px; color: @theme_text_color; }
+            .transparent-text { background-color: transparent; font-family: 'Monospace'; font-size: 15px; padding: 6px; color: @theme_text_color; }
             .transparent-text text { background-color: transparent; color: inherit; }
 
             /* Native Icon Scaling */
@@ -502,8 +502,8 @@ impl CommsSpline {
             chat_content_view.set_wrap_mode(gtk4::WrapMode::WordChar);
             chat_content_view.set_show_line_numbers(false);
             chat_content_view.add_css_class("transparent-text");
-            chat_content_view.set_monospace(false);
-            chat_content_view.set_width_request(600); // Forces a minimum readable width
+            chat_content_view.set_monospace(true);
+            chat_content_view.set_width_request(800); // Forces a minimum readable width
             chat_content_view.set_hexpand(true);
             chat_content_view.set_focusable(true); // Allow copy paste
             bubble.append(&chat_content_view);
@@ -825,8 +825,7 @@ impl CommsSpline {
         let input_scroll = ScrolledWindow::builder()
             .hscrollbar_policy(PolicyType::Never)
             .vscrollbar_policy(PolicyType::Automatic)
-            .propagate_natural_height(true)
-            .max_content_height(500)
+            .height_request(80)
             .valign(Align::Fill)
             .has_frame(false)
             .build();
