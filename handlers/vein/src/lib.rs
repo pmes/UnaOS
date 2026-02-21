@@ -188,7 +188,7 @@ impl VeinHandler {
 
                         while let Some(user_input_text) = rx_from_ui.recv().await {
                             // Determine active node and context
-                            let (active_node, history_len) = {
+                            let (active_node, _history_len) = {
                                 let s = state_bg.lock().unwrap();
                                 let node = s.active_node.clone();
                                 let len = s.contexts.get(&node).map(|v| v.len()).unwrap_or(0);

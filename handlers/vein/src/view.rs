@@ -891,15 +891,16 @@ impl CommsSpline {
         text_view.add_controller(key_controller);
 
         let target_send = active_target.clone();
+        let buffer_send = buffer.clone();
         send_btn.connect_clicked(move |_| {
-            let (start, end) = buffer.bounds();
-            let text = buffer.text(&start, &end, false).to_string();
+            let (start, end) = buffer_send.bounds();
+            let text = buffer_send.text(&start, &end, false).to_string();
             if !text.trim().is_empty() {
                 let _ = tx_clone_send.send_blocking(Event::Input {
                     target: target_send.borrow().clone(),
                     text
                 });
-                buffer.set_text("");
+                buffer_send.set_text("");
             }
         });
 
