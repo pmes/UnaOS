@@ -13,14 +13,26 @@ pub struct DiskManager {
 impl DiskManager {
     pub fn new() -> Result<Self> {
         let path = Path::new(DISK_PATH);
-        let fs = if path.exists() {
-            // Mount existing
+
+        // Verify file exists and is at least the size of one block (4096 bytes)
+        let is_valid_disk = path.exists() && std::fs::metadata(path).map(|m| m.len()).unwrap_or(0) >= 4096;
+
+        let fs = if is_valid_disk {
             let device = FileDevice::open(path)?;
-            let mut fs = UnaFS::mount(device)?;
-            Self::ensure_history_file(&mut fs)?;
-            fs
+            match UnaFS::mount(device) {
+                Ok(mut fs) => {
+                    Self::ensure_history_file(&mut fs)?;
+                    fs
+                }
+                Err(e) => {
+                    eprintln!(":: LIBRARIAN :: Mount failed ({}), reformatting...", e);
+                    let device = FileDevice::open(path)?;
+                    let mut fs = UnaFS::format(device, 64)?;
+                    Self::create_history_file(&mut fs)?;
+                    fs
+                }
+            }
         } else {
-            // Format new
             let device = FileDevice::open(path)?;
             let mut fs = UnaFS::format(device, 64)?;
             Self::create_history_file(&mut fs)?;
