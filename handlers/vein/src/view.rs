@@ -11,6 +11,7 @@ use gtk4::{
     gdk::{Key, ModifierType},
     gio,
 };
+use tokio::sync::mpsc;
 
 use sourceview5::View as SourceView;
 use sourceview5::prelude::*;
@@ -950,6 +951,27 @@ impl CommsSpline {
 
         let console_store_async = console_store.clone();
 
+        // The Librarian Actor (Serialized Disk Access)
+        let (storage_tx, mut storage_rx) = mpsc::unbounded_channel::<Vec<crate::model::DispatchRecord>>();
+
+        std::thread::spawn(move || {
+            let mut disk = match DiskManager::new() {
+                Ok(d) => d,
+                Err(e) => {
+                    eprintln!(":: LIBRARIAN :: Failed to mount UnaFS: {}", e);
+                    return;
+                }
+            };
+            let rt = tokio::runtime::Runtime::new().unwrap();
+            rt.block_on(async move {
+                while let Some(records) = storage_rx.recv().await {
+                    if let Err(e) = disk.save_history(&records) {
+                        eprintln!(":: LIBRARIAN :: Save failed: {}", e);
+                    }
+                }
+            });
+        });
+
         glib::MainContext::default().spawn_local(async move {
             while let Ok(update) = rx.recv().await {
                 match update {
@@ -1020,12 +1042,7 @@ impl CommsSpline {
                         // Snapshot is [Newest, ..., Oldest].
                         // Reverse to store [Oldest, ..., Newest].
                         snapshot.reverse();
-
-                        std::thread::spawn(move || {
-                            if let Ok(mut disk) = DiskManager::new() {
-                                let _ = disk.save_history(&snapshot);
-                            }
-                        });
+                        let _ = storage_tx.send(snapshot);
                     }
                     GuiUpdate::ShardStatusChanged { id, status } => {
                         let (spinner, label, name) = if id == "una-prime" {
