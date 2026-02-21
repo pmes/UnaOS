@@ -19,6 +19,20 @@ pub enum JournalOp {
     EndOp {
         op_id: u64,
     },
+    // --- Phase 2: Total Transaction Coverage ---
+    BeginCreate {
+        parent_inode: u64,
+        name: String,
+    },
+    EndCreate {
+        inode_id: u64,
+    },
+    BeginWrite {
+        inode_id: u64,
+    },
+    EndWrite {
+        inode_id: u64,
+    },
 }
 
 #[derive(Error, Debug)]
@@ -68,7 +82,22 @@ impl Journal {
     /// Returns true if the FS was dirty (unclosed transaction found).
     pub fn check_recovery<D: BlockDevice>(&mut self, device: &mut D) -> Result<bool, JournalError> {
         let mut offset = 0;
-        let mut open_ops = std::collections::HashSet::new();
+        let mut open_ops = std::collections::HashSet::new(); // Tracks op_ids
+        // For Create/Write ops without explicit ID in Begin, we need a way to track pairing.
+        // But `BeginCreate` doesn't have an ID yet. `EndCreate` has the new ID.
+        // Wait, if we crash during Create, we might have allocated the ID but not finished.
+        // Or we might not have allocated it.
+        // Simple heuristic: Count Begins vs Ends.
+        // Actually, the requirement is just to detect *dirty state*.
+        // Any Begin without an End is dirty.
+        // But `BeginCreate` doesn't have a unique ID to match with `EndCreate` easily if multiple happen (single threaded assumption?).
+        // UnaFS is single threaded context usually.
+        // Let's track nesting depth or just strict pairing?
+        // Since we are linear, we can just say: "Is the last op a Begin?"
+        // Or "Do we have any open transactions?"
+        // Let's use a counter for general "open transactions".
+
+        let mut open_transaction_count = 0;
 
         loop {
              if offset >= JOURNAL_BLOCKS * BLOCK_SIZE {
@@ -81,10 +110,6 @@ impl Journal {
 
              // Check if we can read length (8 bytes)
              if offset_in_block + 8 > BLOCK_SIZE as usize {
-                 // Skip to next block if near end?
-                 // My write logic handles spanning or skipping.
-                 // Write logic: "If not, skip to next block."
-                 // So if < 8 bytes remain, we skip to next block.
                  offset = (block_idx + 1) * BLOCK_SIZE;
                  continue;
              }
@@ -96,32 +121,10 @@ impl Journal {
              let len = u64::from_le_bytes(len_bytes);
 
              if len == 0 {
-                 // End of log
                  break;
              }
 
-             // Check if data fits in current block
              if offset_in_block + 8 + (len as usize) > BLOCK_SIZE as usize {
-                 // Write logic skips to next block if data doesn't fit?
-                 // "If offset_in_block + bytes.len() > BLOCK_SIZE ... self.write_offset = (block_idx + 1) * BLOCK_SIZE;"
-                 // Wait, write logic checks `offset_in_block + total_len`.
-                 // If it doesn't fit, it writes to NEXT block from start.
-                 // So if we found a length here, it MUST be valid or we are misinterpreting padding.
-                 // But wait, if write logic skipped, the length bytes at current offset would be 0?
-                 // No, `block` is read from disk. If we skipped, we left the end of previous block as is (likely zeros if formatted).
-                 // So if `len` is 0, we assume end.
-                 // But what if `len` is garbage?
-                 // We trust valid data is contiguous until 0.
-
-                 // If `len` indicates data spans across boundary but logic says skip:
-                 // The write logic:
-                 // if offset_in_block + total_len > BLOCK_SIZE {
-                 //    write_offset = next_block;
-                 //    recurse;
-                 // }
-                 // So if we read a non-zero length that forces span, it means we are reading garbage or logic is mismatched.
-                 // Actually, if we are at `offset`, and `len` says it doesn't fit, then `len` IS garbage (because writer wouldn't put it there).
-                 // So treat as end of log.
                  break;
              }
 
@@ -134,16 +137,23 @@ impl Journal {
                      JournalOp::EndOp { op_id } => {
                          open_ops.remove(&op_id);
                      }
+                     JournalOp::BeginCreate { .. } | JournalOp::BeginWrite { .. } => {
+                         open_transaction_count += 1;
+                     }
+                     JournalOp::EndCreate { .. } | JournalOp::EndWrite { .. } => {
+                         if open_transaction_count > 0 {
+                             open_transaction_count -= 1;
+                         }
+                     }
                  }
              } else {
-                 // Deserialization failed - corruption or end
                  break;
              }
 
              offset += 8 + len;
         }
 
-        Ok(!open_ops.is_empty())
+        Ok(!open_ops.is_empty() || open_transaction_count > 0)
     }
 
     // Helper to write with length prefix (Refined append logic)

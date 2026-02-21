@@ -1,7 +1,6 @@
 use serde::{Deserialize, Serialize};
-use std::hash::{Hash, Hasher};
-use std::collections::hash_map::DefaultHasher;
 use crate::inode::AttributeValue;
+use crate::hash::{FnvHasher, hash_bytes};
 
 /// An entry in the Attribute Catalog.
 /// Maps a (Key, Value) pair to an Inode ID.
@@ -14,9 +13,8 @@ pub struct CatalogEntry {
 
 impl CatalogEntry {
     pub fn new(key: &str, value: &AttributeValue, inode_id: u64) -> Self {
-        let mut hasher = DefaultHasher::new();
-        key.hash(&mut hasher);
-        let key_hash = hasher.finish();
+        // Use Stable Hashing
+        let key_hash = hash_bytes(key.as_bytes());
 
         let val_hash = hash_value(value);
 
@@ -30,15 +28,24 @@ impl CatalogEntry {
 
 /// Helper to hash an AttributeValue.
 pub fn hash_value(value: &AttributeValue) -> u64 {
-    let mut hasher = DefaultHasher::new();
+    let mut hasher = FnvHasher::new();
     match value {
-        AttributeValue::Int(i) => i.hash(&mut hasher),
-        AttributeValue::Float(f) => f.to_bits().hash(&mut hasher),
-        AttributeValue::String(s) => s.hash(&mut hasher),
-        AttributeValue::Blob(b) => b.hash(&mut hasher),
+        AttributeValue::Int(i) => {
+            hasher.write(&i.to_be_bytes());
+        }
+        AttributeValue::Float(f) => {
+            hasher.write(&f.to_be_bytes()); // Use bits? f.to_bits() is unstable for NaN?
+            // f64::to_be_bytes() is just bits.
+        }
+        AttributeValue::String(s) => {
+            hasher.write(s.as_bytes());
+        }
+        AttributeValue::Blob(b) => {
+            hasher.write(b);
+        }
         AttributeValue::Vector(v) => {
             for f in v {
-                f.to_bits().hash(&mut hasher);
+                hasher.write(&f.to_be_bytes());
             }
         }
     }

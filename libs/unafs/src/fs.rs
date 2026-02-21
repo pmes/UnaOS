@@ -6,6 +6,7 @@ use crate::inode::{Inode, AttributeValue, InodeError, FileKind, Extent, ExtentLi
 use crate::wal::{Journal, JournalOp};
 use crate::catalog::{CatalogEntry, serialize_catalog, deserialize_catalog, hash_value};
 use crate::query::{Query, QueryOp};
+use crate::hash::hash_bytes;
 use thiserror::Error;
 use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
@@ -134,7 +135,7 @@ impl<D: BlockDevice> UnaFS<D> {
 
         // Check for recovery (Log only for now)
         if journal.check_recovery(&mut device)? {
-            println!("[UNAFS] WARNING: Dirty journal detected. Recovery not implemented.");
+            println!("[WARNING] :: DIRTY MOUNT DETECTED. TORN TRANSACTION IN JOURNAL.");
         }
 
         Ok(Self {
@@ -164,16 +165,10 @@ impl<D: BlockDevice> UnaFS<D> {
 
     /// Create a new Inode with given attributes and kind.
     fn create_inode_internal(&mut self, kind: FileKind, attributes: BTreeMap<String, AttributeValue>) -> Result<u64, FileSystemError> {
-        // Since we don't know ID yet, use 0 or dummy ID for BeginOp?
-        // Or we allocate ID first?
-        // Allocation modifies bitmap.
-        // Ideally: Log Intent -> Allocate -> Log Intent with ID -> ...
-        // Simplification: Log generic "CreateInode" intent with ID 0.
-        // Or allocate block first (which modifies in-memory bitmap), then Log "CreateInode: ID", then Sync.
-
         let inode_id = self.allocate_inode_block()?;
 
-        self.journal.log(&mut self.device, JournalOp::BeginOp { op_id: inode_id, desc: "CreateInode".into() })?;
+        // Log generic creation intent
+        self.journal.log(&mut self.device, JournalOp::BeginCreate { parent_inode: 0, name: "unknown".into() })?;
 
         let mut inode = Inode::new(inode_id, kind);
         inode.attributes = attributes;
@@ -181,7 +176,7 @@ impl<D: BlockDevice> UnaFS<D> {
         self.write_inode(&inode)?;
         self.sync_metadata()?;
 
-        self.journal.log(&mut self.device, JournalOp::EndOp { op_id: inode_id })?;
+        self.journal.log(&mut self.device, JournalOp::EndCreate { inode_id })?;
 
         Ok(inode_id)
     }
@@ -214,7 +209,7 @@ impl<D: BlockDevice> UnaFS<D> {
             return Ok(());
         }
 
-        self.journal.log(&mut self.device, JournalOp::BeginOp { op_id: inode_id, desc: "WriteData".into() })?;
+        self.journal.log(&mut self.device, JournalOp::BeginWrite { inode_id })?;
 
         let mut inode = self.read_inode(inode_id)?;
         let mut current_offset = offset;
@@ -286,7 +281,7 @@ impl<D: BlockDevice> UnaFS<D> {
         self.write_inode(&inode)?;
         self.sync_metadata()?;
 
-        self.journal.log(&mut self.device, JournalOp::EndOp { op_id: inode_id })?;
+        self.journal.log(&mut self.device, JournalOp::EndWrite { inode_id })?;
 
         Ok(())
     }
@@ -486,13 +481,8 @@ impl<D: BlockDevice> UnaFS<D> {
             let data = self.read_data(catalog_id, 0, inode.size)?;
             let entries = deserialize_catalog(&data)?;
 
-            let target_key_hash = {
-                use std::collections::hash_map::DefaultHasher;
-                use std::hash::{Hash, Hasher};
-                let mut h = DefaultHasher::new();
-                query.key.hash(&mut h);
-                h.finish()
-            };
+            // Use Stable Hasher
+            let target_key_hash = hash_bytes(query.key.as_bytes());
 
             let target_val_hash = if let QueryOp::Eq = query.op {
                  Some(hash_value(&query.value))

@@ -11,6 +11,7 @@ pub mod fs;
 pub mod wal;
 pub mod catalog;
 pub mod query;
+pub mod hash;
 
 pub use storage::{BlockDevice, FileDevice, MemDevice, BLOCK_SIZE};
 pub use inode::{Inode, Extent, ExtentList, AttributeValue, InodeError, FileKind};
