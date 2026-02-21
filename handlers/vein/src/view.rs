@@ -445,14 +445,15 @@ impl CommsSpline {
             root.set_hexpand(true);
             root.add_css_class("console-row");
 
+            // Left Spacer
+            let left_spacer = Box::new(Orientation::Horizontal, 0);
+            left_spacer.set_hexpand(true);
+            root.append(&left_spacer);
+
             // Bubble Container (Restricted Width)
             let bubble = Box::new(Orientation::Vertical, 4);
             bubble.add_css_class("bubble-box");
             bubble.set_width_request(400); // Minimum comfortable width
-            // We can't set exact max-width on Box easily in GTK4 without CSS or wrapping,
-            // but relying on halign in a wide container provides the visual effect.
-            // For true 75% max-width, we'd need a custom layout manager or specific CSS on the widget name.
-            // Here we rely on natural sizing plus alignment to avoid the "crushed" look.
 
             // 1. Meta Label
             let meta_label = Label::new(None);
@@ -468,6 +469,8 @@ impl CommsSpline {
             chat_content_view.set_show_line_numbers(false);
             chat_content_view.add_css_class("transparent-text");
             chat_content_view.set_monospace(false);
+            chat_content_view.set_width_request(600); // Forces a minimum readable width
+            chat_content_view.set_hexpand(true);
             bubble.append(&chat_content_view);
 
             // 3. Payload Expander
@@ -491,22 +494,35 @@ impl CommsSpline {
             bubble.append(&expander);
 
             root.append(&bubble);
+
+            // Right Spacer
+            let right_spacer = Box::new(Orientation::Horizontal, 0);
+            right_spacer.set_hexpand(true);
+            root.append(&right_spacer);
+
             item.set_child(Some(&root));
         });
 
         console_factory.connect_bind(move |_factory, item| {
             let item = item.downcast_ref::<ListItem>().unwrap();
             let root = item.child().unwrap().downcast::<Box>().unwrap();
-            let bubble = root.first_child().unwrap().downcast::<Box>().unwrap();
+
+            let mut iter = root.first_child();
+            let left_spacer = iter.unwrap().downcast::<Box>().unwrap();
+            iter = left_spacer.next_sibling();
+            let bubble = iter.unwrap().downcast::<Box>().unwrap();
+            iter = bubble.next_sibling();
+            let right_spacer = iter.unwrap().downcast::<Box>().unwrap();
+
             let obj = item.item().unwrap().downcast::<DispatchObject>().unwrap();
 
             // Children: Meta Label (0), Chat View (1), Expander (2)
-            let mut iter = bubble.first_child();
-            let meta_label = iter.unwrap().downcast::<Label>().unwrap();
-            iter = meta_label.next_sibling();
-            let chat_view = iter.unwrap().downcast::<SourceView>().unwrap();
-            iter = chat_view.next_sibling();
-            let expander = iter.unwrap().downcast::<Expander>().unwrap();
+            let mut iter_bubble = bubble.first_child();
+            let meta_label = iter_bubble.unwrap().downcast::<Label>().unwrap();
+            iter_bubble = meta_label.next_sibling();
+            let chat_view = iter_bubble.unwrap().downcast::<SourceView>().unwrap();
+            iter_bubble = chat_view.next_sibling();
+            let expander = iter_bubble.unwrap().downcast::<Expander>().unwrap();
 
             let is_chat = obj.is_chat();
             let sender = obj.sender();
@@ -514,9 +530,11 @@ impl CommsSpline {
             let content = obj.content();
             let subject = obj.subject();
 
-            // Reset Bubble Classes
+            // Reset Bubble Classes and Visibility
             bubble.remove_css_class("architect-bubble");
             bubble.remove_css_class("una-bubble");
+            left_spacer.set_visible(false);
+            right_spacer.set_visible(false);
 
             if is_chat {
                 chat_view.set_visible(true);
@@ -530,19 +548,22 @@ impl CommsSpline {
                 meta_label.remove_css_class("role-system");
 
                 if sender == "Architect" {
+                    // Architect (Right Aligned): Left Spacer Visible, Right Spacer Hidden
                     meta_label.add_css_class("role-architect");
                     bubble.add_css_class("architect-bubble");
-                    bubble.set_halign(Align::End);
+                    left_spacer.set_visible(true);
+                    right_spacer.set_visible(false);
                     meta_label.set_xalign(1.0);
-                } else if sender == "Una-Prime" {
-                    meta_label.add_css_class("role-una");
-                    bubble.add_css_class("una-bubble");
-                    bubble.set_halign(Align::Start);
-                    meta_label.set_xalign(0.0);
                 } else {
-                    meta_label.add_css_class("role-system");
+                    // Una/System (Left Aligned): Left Spacer Hidden, Right Spacer Visible
+                    if sender == "Una-Prime" {
+                        meta_label.add_css_class("role-una");
+                    } else {
+                        meta_label.add_css_class("role-system");
+                    }
                     bubble.add_css_class("una-bubble");
-                    bubble.set_halign(Align::Start);
+                    left_spacer.set_visible(false);
+                    right_spacer.set_visible(true);
                     meta_label.set_xalign(0.0);
                 }
                 chat_view.buffer().set_text(&content);
@@ -551,9 +572,12 @@ impl CommsSpline {
                 chat_view.set_visible(false);
                 expander.set_visible(true);
 
-                // Payloads generally align left or fill
-                bubble.set_halign(Align::Fill);
+                // Payloads generally align left but take full space if possible,
+                // but for bubbles we can stick to Una style (Left aligned) or fill.
+                // Let's stick to Una style (Left Aligned) with spacer to avoid full stretch.
                 bubble.add_css_class("una-bubble"); // Default to dark background
+                left_spacer.set_visible(false);
+                right_spacer.set_visible(true);
 
                 expander.set_label(Some(&format!("{} | {} | {}", sender, subject, timestamp)));
 
@@ -856,16 +880,6 @@ impl CommsSpline {
                         );
 
                         console_store.append(&obj);
-
-                        // Auto-scroll logic
-                        let adj = scroll_adj_clone.clone();
-                        glib::timeout_add_local(std::time::Duration::from_millis(50), move || {
-                            if adj.upper() > adj.page_size() {
-                                let val = (adj.upper() - adj.page_size()).max(adj.lower());
-                                adj.set_value(val);
-                            }
-                            glib::ControlFlow::Break
-                        });
                     }
                     GuiUpdate::ShardStatusChanged { id, status } => {
                         let (spinner, label, name) = if id == "una-prime" {
