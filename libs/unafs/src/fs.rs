@@ -2,7 +2,10 @@ use bandy::{BandyMember, SMessage};
 use crate::storage::{BlockDevice, Error as StorageError, BLOCK_SIZE};
 use crate::superblock::{Superblock, SuperblockError};
 use crate::bitmap::SpaceMap;
-use crate::inode::{Inode, AttributeValue, InodeError, FileKind, Extent};
+use crate::inode::{Inode, AttributeValue, InodeError, FileKind, Extent, ExtentList};
+use crate::wal::{Journal, JournalOp};
+use crate::catalog::{CatalogEntry, serialize_catalog, deserialize_catalog, hash_value};
+use crate::query::{Query, QueryOp};
 use thiserror::Error;
 use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
@@ -25,6 +28,14 @@ pub enum FileSystemError {
     NotADirectory,
     #[error("File already exists")]
     FileExists,
+    #[error("Attribute too large for inline storage")]
+    AttributeTooLarge,
+    #[error("Journal error: {0}")]
+    Journal(#[from] crate::wal::JournalError),
+    #[error("Invalid Attribute Data")]
+    InvalidAttributeData,
+    #[error("Query error: {0}")]
+    Query(String),
 }
 
 /// A directory entry pointing to an inode.
@@ -39,6 +50,7 @@ pub struct UnaFS<D: BlockDevice> {
     pub device: D,
     pub superblock: Superblock,
     pub bitmap: SpaceMap,
+    pub journal: Journal,
 }
 
 impl<D: BlockDevice> UnaFS<D> {
@@ -50,32 +62,52 @@ impl<D: BlockDevice> UnaFS<D> {
 
         if block_count == 0 {
              block_count = blocks_from_size;
-             // Note: Device backing should ideally be resized here, but BlockDevice trait doesn't have resize.
-             // MemDevice auto-resizes on write. FileDevice will write at offsets.
         }
 
         let mut superblock = Superblock::new(block_count);
         let mut bitmap = SpaceMap::new(block_count);
+        let mut journal = Journal::new();
 
+        // 1. Mark System Blocks as Used
+        // Superblock
         bitmap.mark_used(0);
+
+        // Journal Blocks
+        for i in 0..superblock.journal_blocks {
+            bitmap.mark_used(superblock.journal_start + i);
+        }
+
+        // Bitmap Blocks
         for i in 0..superblock.bitmap_blocks {
             bitmap.mark_used(superblock.bitmap_start + i);
         }
 
+        // Initialize Journal on disk
+        journal.reset(&mut device)?;
+
+        // 2. Allocate Root Inode (Should be ID after bitmap, effectively)
         let root_id = bitmap.allocate().ok_or(FileSystemError::NoSpace)?;
         superblock.root_inode = root_id;
-
-        if superblock.free_blocks > 0 {
-            superblock.free_blocks -= 1;
-        }
+        if superblock.free_blocks > 0 { superblock.free_blocks -= 1; }
 
         let root_inode = Inode::new(root_id, FileKind::Directory);
-
         let root_bytes = root_inode.to_bytes()?;
         let mut root_block = vec![0u8; BLOCK_SIZE as usize];
         root_block[..root_bytes.len()].copy_from_slice(&root_bytes);
         device.write_block(root_id, &root_block)?;
 
+        // 3. Allocate Attribute Catalog Inode (System File)
+        let catalog_id = bitmap.allocate().ok_or(FileSystemError::NoSpace)?;
+        superblock.catalog_inode = catalog_id;
+        if superblock.free_blocks > 0 { superblock.free_blocks -= 1; }
+
+        let catalog_inode = Inode::new(catalog_id, FileKind::System);
+        let catalog_bytes = catalog_inode.to_bytes()?;
+        let mut catalog_block = vec![0u8; BLOCK_SIZE as usize];
+        catalog_block[..catalog_bytes.len()].copy_from_slice(&catalog_bytes);
+        device.write_block(catalog_id, &catalog_block)?;
+
+        // 4. Save Metadata
         bitmap.save(&mut device, superblock.bitmap_start)?;
 
         let sb_bytes = superblock.to_bytes()?;
@@ -87,6 +119,7 @@ impl<D: BlockDevice> UnaFS<D> {
             device,
             superblock,
             bitmap,
+            journal,
         })
     }
 
@@ -97,11 +130,18 @@ impl<D: BlockDevice> UnaFS<D> {
         let superblock = Superblock::from_bytes(&sb_block)?;
 
         let bitmap = SpaceMap::load(&mut device, superblock.bitmap_start, superblock.bitmap_blocks)?;
+        let mut journal = Journal::new();
+
+        // Check for recovery (Log only for now)
+        if journal.check_recovery(&mut device)? {
+            println!("[UNAFS] WARNING: Dirty journal detected. Recovery not implemented.");
+        }
 
         Ok(Self {
             device,
             superblock,
             bitmap,
+            journal,
         })
     }
 
@@ -123,23 +163,33 @@ impl<D: BlockDevice> UnaFS<D> {
     }
 
     /// Create a new Inode with given attributes and kind.
-    /// Internal helper.
     fn create_inode_internal(&mut self, kind: FileKind, attributes: BTreeMap<String, AttributeValue>) -> Result<u64, FileSystemError> {
+        // Since we don't know ID yet, use 0 or dummy ID for BeginOp?
+        // Or we allocate ID first?
+        // Allocation modifies bitmap.
+        // Ideally: Log Intent -> Allocate -> Log Intent with ID -> ...
+        // Simplification: Log generic "CreateInode" intent with ID 0.
+        // Or allocate block first (which modifies in-memory bitmap), then Log "CreateInode: ID", then Sync.
+
         let inode_id = self.allocate_inode_block()?;
+
+        self.journal.log(&mut self.device, JournalOp::BeginOp { op_id: inode_id, desc: "CreateInode".into() })?;
+
         let mut inode = Inode::new(inode_id, kind);
         inode.attributes = attributes;
 
         self.write_inode(&inode)?;
         self.sync_metadata()?;
+
+        self.journal.log(&mut self.device, JournalOp::EndOp { op_id: inode_id })?;
+
         Ok(inode_id)
     }
 
-    // Legacy support for tests that might use create_inode assuming File
     pub fn create_inode(&mut self, attributes: BTreeMap<String, AttributeValue>) -> Result<u64, FileSystemError> {
         self.create_inode_internal(FileKind::File, attributes)
     }
 
-    /// Helper to allocate a block for an inode and update superblock free count.
     fn allocate_inode_block(&mut self) -> Result<u64, FileSystemError> {
         let block_id = self.bitmap.allocate().ok_or(FileSystemError::NoSpace)?;
         if self.superblock.free_blocks > 0 {
@@ -148,7 +198,6 @@ impl<D: BlockDevice> UnaFS<D> {
         Ok(block_id)
     }
 
-    /// Helper to sync Superblock and Bitmap to disk.
     fn sync_metadata(&mut self) -> Result<(), FileSystemError> {
         self.bitmap.save(&mut self.device, self.superblock.bitmap_start)?;
 
@@ -165,21 +214,19 @@ impl<D: BlockDevice> UnaFS<D> {
             return Ok(());
         }
 
-        let mut inode = self.read_inode(inode_id)?;
+        self.journal.log(&mut self.device, JournalOp::BeginOp { op_id: inode_id, desc: "WriteData".into() })?;
 
+        let mut inode = self.read_inode(inode_id)?;
         let mut current_offset = offset;
         let mut data_written = 0;
 
         while data_written < data.len() {
-            // Find which logical block we are in
             let block_offset = (current_offset % BLOCK_SIZE) as usize;
             let to_write = std::cmp::min(BLOCK_SIZE as usize - block_offset, data.len() - data_written);
 
-            // Find physical block
             let mut physical_block = 0;
             let mut extent_found = false;
 
-            // Search extents
             for extent in inode.chunks.iter() {
                 let extent_end = extent.logical_offset + extent.length;
                 if current_offset >= extent.logical_offset && current_offset < extent_end {
@@ -192,13 +239,11 @@ impl<D: BlockDevice> UnaFS<D> {
             }
 
             if !extent_found {
-                // We need to allocate a new block.
                 let new_block = self.bitmap.allocate().ok_or(FileSystemError::NoSpace)?;
                 if self.superblock.free_blocks > 0 {
                     self.superblock.free_blocks -= 1;
                 }
 
-                // Vector Optimization: Merge Extents
                 let mut merged = false;
                 if let Some(last) = inode.chunks.last_mut() {
                     let last_block_count = last.length.div_ceil(BLOCK_SIZE);
@@ -218,7 +263,7 @@ impl<D: BlockDevice> UnaFS<D> {
                     let new_extent = Extent {
                         logical_offset: aligned_logical,
                         physical_block: new_block,
-                        length: BLOCK_SIZE, // Allocated 1 block
+                        length: BLOCK_SIZE,
                     };
                     inode.chunks.push(new_extent);
                     physical_block = new_block;
@@ -234,13 +279,14 @@ impl<D: BlockDevice> UnaFS<D> {
             current_offset += to_write as u64;
         }
 
-        // Update Inode Size
         if current_offset > inode.size {
             inode.size = current_offset;
         }
 
         self.write_inode(&inode)?;
-        self.sync_metadata()?; // To save bitmap changes
+        self.sync_metadata()?;
+
+        self.journal.log(&mut self.device, JournalOp::EndOp { op_id: inode_id })?;
 
         Ok(())
     }
@@ -248,19 +294,23 @@ impl<D: BlockDevice> UnaFS<D> {
     /// Read data from an Inode.
     pub fn read_data(&mut self, inode_id: u64, offset: u64, length: u64) -> Result<Vec<u8>, FileSystemError> {
         let inode = self.read_inode(inode_id)?;
+        self.read_from_extents(&inode.chunks, offset, length, inode.size)
+    }
+
+    /// Internal helper to read data from a specific ExtentList.
+    fn read_from_extents(&mut self, chunks: &ExtentList, offset: u64, length: u64, total_size: u64) -> Result<Vec<u8>, FileSystemError> {
         let mut buffer = Vec::with_capacity(length as usize);
         let mut read_so_far = 0;
         let mut current_offset = offset;
 
-        // Cap length at file size
-        let available = inode.size.saturating_sub(offset);
+        let available = total_size.saturating_sub(offset);
         let to_read_total = std::cmp::min(length, available);
 
         while read_so_far < to_read_total {
              let mut physical_block = 0;
              let mut found = false;
 
-             for extent in &inode.chunks {
+             for extent in chunks {
                  let extent_end = extent.logical_offset + extent.length;
                  if current_offset >= extent.logical_offset && current_offset < extent_end {
                      let offset_in_extent = current_offset - extent.logical_offset;
@@ -293,50 +343,53 @@ impl<D: BlockDevice> UnaFS<D> {
         Ok(buffer)
     }
 
-    /// List directory contents.
     pub fn ls(&mut self, inode_id: u64) -> Result<Vec<DirEntry>, FileSystemError> {
         let inode = self.read_inode(inode_id)?;
-
         if inode.kind != FileKind::Directory {
             return Err(FileSystemError::NotADirectory);
         }
-
         if inode.size == 0 {
             return Ok(Vec::new());
         }
-
-        // Read all data from directory inode
         let data = self.read_data(inode_id, 0, inode.size)?;
-
-        // Deserialize
         let entries: Vec<DirEntry> = bincode::deserialize(&data)?;
         Ok(entries)
     }
 
-    /// Create a directory inside a parent directory.
     pub fn mkdir(&mut self, parent_id: u64, name: String) -> Result<u64, FileSystemError> {
         self.add_entry(parent_id, name, FileKind::Directory)
     }
 
-    /// Create a file inside a parent directory.
     pub fn create_file(&mut self, parent_id: u64, name: String) -> Result<u64, FileSystemError> {
         self.add_entry(parent_id, name, FileKind::File)
     }
 
-    /// Helper to add an entry to a directory.
+    /// Resolves a path string to an Inode ID.
+    pub fn resolve_path(&mut self, path: &str) -> Result<u64, FileSystemError> {
+        let path = path.trim_start_matches('/');
+        if path.is_empty() {
+            return Ok(self.superblock.root_inode);
+        }
+
+        let parts: Vec<&str> = path.split('/').collect();
+        let mut current_id = self.superblock.root_inode;
+
+        for part in parts {
+            if part.is_empty() { continue; }
+
+            let entries = self.ls(current_id)?;
+            let entry = entries.into_iter().find(|e| e.name == part).ok_or(FileSystemError::RootMissing)?; // TODO: specific error
+            current_id = entry.inode_id;
+        }
+
+        Ok(current_id)
+    }
+
     fn add_entry(&mut self, parent_id: u64, name: String, kind: FileKind) -> Result<u64, FileSystemError> {
-        // 1. Verify Parent
         let parent_inode = self.read_inode(parent_id)?;
         if parent_inode.kind != FileKind::Directory {
             return Err(FileSystemError::NotADirectory);
         }
-
-        // 2. Read Existing Entries
-        // Note: ls calls read_data which calls read_inode. All need &mut self.
-        // But we just called read_inode(parent_id) which borrows self.
-        // We need to drop the borrow of parent_inode before calling ls?
-        // parent_inode is an owned Inode (returned by value from read_inode).
-        // So the borrow of self in read_inode ends when it returns.
 
         let mut entries = if parent_inode.size > 0 {
             self.ls(parent_id)?
@@ -344,30 +397,209 @@ impl<D: BlockDevice> UnaFS<D> {
             Vec::new()
         };
 
-        // 3. Check for duplicates
         if entries.iter().any(|e| e.name == name) {
             return Err(FileSystemError::FileExists);
         }
 
-        // 4. Create New Inode
         let new_id = self.create_inode_internal(kind, BTreeMap::new())?;
 
-        // 5. Update Parent Directory List
         entries.push(DirEntry {
             name,
             inode_id: new_id,
             kind,
         });
-
-        // Maintain sort order (Vector Special)
         entries.sort_by(|a, b| a.name.cmp(&b.name));
 
-        // 6. Serialize and Write Back
         let data = bincode::serialize(&entries)?;
-
         self.write_data(parent_id, 0, &data)?;
 
         Ok(new_id)
+    }
+
+    // --- ATTRIBUTE ENGINE (The Soul) ---
+
+    pub fn set_attribute(&mut self, inode_id: u64, key: String, value: AttributeValue) -> Result<(), FileSystemError> {
+        self.journal.log(&mut self.device, JournalOp::BeginOp { op_id: inode_id, desc: format!("SetAttr: {}", key) })?;
+
+        let mut inode = self.read_inode(inode_id)?;
+
+        if let Some(extents) = inode.large_attributes.remove(&key) {
+             self.free_extents(&extents)?;
+        }
+
+        let is_large = match &value {
+            AttributeValue::Vector(v) => v.len() > 64, // > 256 bytes
+            AttributeValue::Blob(b) => b.len() > 256,
+            AttributeValue::String(s) => s.len() > 256,
+            _ => false,
+        };
+
+        if is_large {
+            let data = bincode::serialize(&value)?;
+            let extents = self.allocate_and_write_extents(&data)?;
+            inode.large_attributes.insert(key.clone(), extents);
+            inode.attributes.remove(&key);
+        } else {
+            inode.attributes.insert(key.clone(), value.clone());
+        }
+
+        self.write_inode(&inode)?;
+        self.update_catalog(&key, &value, inode_id)?;
+        self.journal.log(&mut self.device, JournalOp::EndOp { op_id: inode_id })?;
+
+        let msg = SMessage::FileEvent {
+            path: format!("inode:{}", inode_id),
+            event: format!("AttributeSet:{}", key)
+        };
+        let _ = self.publish("system/fs/change", msg);
+
+        Ok(())
+    }
+
+    pub fn get_attribute(&mut self, inode_id: u64, key: &str) -> Result<Option<AttributeValue>, FileSystemError> {
+        let inode = self.read_inode(inode_id)?;
+
+        if let Some(val) = inode.attributes.get(key) {
+            return Ok(Some(val.clone()));
+        }
+
+        if let Some(extents) = inode.large_attributes.get(key) {
+            let total_size: u64 = extents.iter().map(|e| e.length).sum();
+            let data = self.read_from_extents(extents, 0, total_size, total_size)?;
+            let val: AttributeValue = bincode::deserialize(&data).map_err(|_| FileSystemError::InvalidAttributeData)?;
+            return Ok(Some(val));
+        }
+
+        Ok(None)
+    }
+
+    // --- QUERY ENGINE ---
+
+    pub fn query(&mut self, query_str: &str) -> Result<Vec<Inode>, FileSystemError> {
+        let query = Query::parse(query_str).map_err(|e| FileSystemError::Query(e))?;
+
+        let catalog_id = self.superblock.catalog_inode;
+        let mut candidates = Vec::new();
+
+        if catalog_id != 0 {
+            let inode = self.read_inode(catalog_id)?;
+            let data = self.read_data(catalog_id, 0, inode.size)?;
+            let entries = deserialize_catalog(&data)?;
+
+            let target_key_hash = {
+                use std::collections::hash_map::DefaultHasher;
+                use std::hash::{Hash, Hasher};
+                let mut h = DefaultHasher::new();
+                query.key.hash(&mut h);
+                h.finish()
+            };
+
+            let target_val_hash = if let QueryOp::Eq = query.op {
+                 Some(hash_value(&query.value))
+            } else {
+                 None
+            };
+
+            for entry in entries {
+                if entry.key_hash == target_key_hash {
+                     if let Some(tv) = target_val_hash {
+                         if entry.val_hash == tv {
+                             candidates.push(entry.inode_id);
+                         }
+                     } else {
+                         candidates.push(entry.inode_id);
+                     }
+                }
+            }
+        }
+
+        candidates.sort();
+        candidates.dedup();
+
+        let mut results = Vec::new();
+        for id in candidates {
+            let inode = self.read_inode(id)?;
+
+            let mut val_opt = None;
+            if let Some(v) = inode.attributes.get(&query.key) {
+                val_opt = Some(v.clone());
+            } else if let Some(extents) = inode.large_attributes.get(&query.key) {
+                 let total = extents.iter().map(|e| e.length).sum();
+                 let data = self.read_from_extents(extents, 0, total, total)?;
+                 if let Ok(v) = bincode::deserialize::<AttributeValue>(&data) {
+                     val_opt = Some(v);
+                 }
+            }
+
+            if let Some(val) = val_opt {
+                if check_condition(&val, &query.op, &query.value) {
+                    results.push(inode);
+                }
+            }
+        }
+
+        Ok(results)
+    }
+
+    // --- HELPERS ---
+
+    fn free_extents(&mut self, extents: &ExtentList) -> Result<(), FileSystemError> {
+        for extent in extents {
+            let blocks = extent.length.div_ceil(BLOCK_SIZE);
+            for i in 0..blocks {
+                self.bitmap.free(extent.physical_block + i);
+                if self.superblock.free_blocks < self.superblock.block_count {
+                    self.superblock.free_blocks += 1;
+                }
+            }
+        }
+        self.sync_metadata()?;
+        Ok(())
+    }
+
+    fn allocate_and_write_extents(&mut self, data: &[u8]) -> Result<ExtentList, FileSystemError> {
+        let mut extents = Vec::new();
+        let mut data_written = 0;
+        let mut current_logical = 0;
+
+        while data_written < data.len() {
+            let block_id = self.bitmap.allocate().ok_or(FileSystemError::NoSpace)?;
+            if self.superblock.free_blocks > 0 { self.superblock.free_blocks -= 1; }
+
+            let to_write = std::cmp::min(BLOCK_SIZE as usize, data.len() - data_written);
+
+            let mut block = vec![0u8; BLOCK_SIZE as usize];
+            block[..to_write].copy_from_slice(&data[data_written..data_written+to_write]);
+            self.device.write_block(block_id, &block)?;
+
+            extents.push(Extent {
+                logical_offset: current_logical,
+                physical_block: block_id,
+                length: to_write as u64,
+            });
+
+            data_written += to_write;
+            current_logical += to_write as u64;
+        }
+
+        self.sync_metadata()?;
+        Ok(extents)
+    }
+
+    fn update_catalog(&mut self, key: &str, value: &AttributeValue, inode_id: u64) -> Result<(), FileSystemError> {
+        let catalog_id = self.superblock.catalog_inode;
+        if catalog_id == 0 { return Ok(()); }
+
+        let inode = self.read_inode(catalog_id)?;
+        let data = self.read_data(catalog_id, 0, inode.size)?;
+        let mut entries = deserialize_catalog(&data)?;
+
+        entries.push(CatalogEntry::new(key, value, inode_id));
+
+        let new_data = serialize_catalog(&entries)?;
+        self.write_data(catalog_id, 0, &new_data)?;
+
+        Ok(())
     }
 }
 
@@ -375,5 +607,40 @@ impl<D: BlockDevice> BandyMember for UnaFS<D> {
     fn publish(&self, topic: &str, msg: SMessage) -> anyhow::Result<()> {
         println!("[UNAFS] Broadcasting event to '{}': {:?}", topic, msg);
         Ok(())
+    }
+}
+
+pub fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
+    if a.len() != b.len() { return 0.0; }
+    let dot: f32 = a.iter().zip(b).map(|(x, y)| x * y).sum();
+    let mag_a: f32 = a.iter().map(|x| x * x).sum::<f32>().sqrt();
+    let mag_b: f32 = b.iter().map(|x| x * x).sum::<f32>().sqrt();
+    if mag_a == 0.0 || mag_b == 0.0 { return 0.0; }
+    dot / (mag_a * mag_b)
+}
+
+fn check_condition(val: &AttributeValue, op: &QueryOp, target: &AttributeValue) -> bool {
+    match op {
+        QueryOp::Eq => val == target,
+        QueryOp::Neq => val != target,
+        QueryOp::Gt => partial_cmp_attr(val, target).map(|o| o.is_gt()).unwrap_or(false),
+        QueryOp::Lt => partial_cmp_attr(val, target).map(|o| o.is_lt()).unwrap_or(false),
+        QueryOp::SimilarityGt(threshold) => {
+            if let (AttributeValue::Vector(v1), AttributeValue::Vector(v2)) = (val, target) {
+                cosine_similarity(v1, v2) > *threshold
+            } else {
+                false
+            }
+        }
+    }
+}
+
+use std::cmp::Ordering;
+fn partial_cmp_attr(a: &AttributeValue, b: &AttributeValue) -> Option<Ordering> {
+    match (a, b) {
+        (AttributeValue::Int(i1), AttributeValue::Int(i2)) => i1.partial_cmp(i2),
+        (AttributeValue::Float(f1), AttributeValue::Float(f2)) => f1.partial_cmp(f2),
+        (AttributeValue::String(s1), AttributeValue::String(s2)) => s1.partial_cmp(s2),
+        _ => None,
     }
 }
