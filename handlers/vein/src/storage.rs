@@ -14,7 +14,7 @@ impl DiskManager {
     pub fn new() -> Result<Self> {
         let path = Path::new(DISK_PATH);
 
-        // Verify file exists and is at least the size of one block (4096 bytes)
+        // Only mount if the file is at least 1 block long (4096 bytes)
         let is_valid_disk = path.exists() && std::fs::metadata(path).map(|m| m.len()).unwrap_or(0) >= 4096;
 
         let fs = if is_valid_disk {
@@ -26,6 +26,7 @@ impl DiskManager {
                 }
                 Err(e) => {
                     eprintln!(":: LIBRARIAN :: Mount failed ({}), reformatting...", e);
+                    // FORCE THE OS TO ALLOCATE 64MB BEFORE FORMATTING
                     std::fs::File::create(path)?.set_len(64 * 1024 * 1024)?;
                     let device = FileDevice::open(path)?;
                     let mut fs = UnaFS::format(device, 64)?;
@@ -34,6 +35,7 @@ impl DiskManager {
                 }
             }
         } else {
+            // FORCE THE OS TO ALLOCATE 64MB BEFORE FORMATTING
             std::fs::File::create(path)?.set_len(64 * 1024 * 1024)?;
             let device = FileDevice::open(path)?;
             let mut fs = UnaFS::format(device, 64)?;

@@ -12,7 +12,6 @@ use gtk4::{
     gio,
 };
 use tokio::sync::mpsc;
-
 use sourceview5::View as SourceView;
 use sourceview5::prelude::*;
 use std::cell::RefCell;
@@ -327,29 +326,15 @@ impl CommsSpline {
         // Target Tracking
         let active_target = Rc::new(RefCell::new("Una-Prime".to_string()));
         let active_target_clone = active_target.clone();
-        let tx_nexus = tx_event.clone();
 
         nexus_list.connect_row_selected(move |_, row| {
             if let Some(row) = row {
-                // Better approach: Attach data to the row widget using object data, or just simple mapping for now.
-                // Or check the label text if we can traverse children.
-                // Mapping by index is fragile but fast for Phase 3.1.
-                // Let's traverse children to find the label.
-
                 if let Some(child) = row.child() {
                     if let Some(box_widget) = child.downcast_ref::<Box>() {
-                        // It's one of our custom rows
-                        // Structure: [Icon, Label, Spinner]
-                        // Child 1 is Label
                         if let Some(label_widget) = box_widget.last_child().and_then(|w| w.prev_sibling()).and_then(|w| w.downcast::<Label>().ok()) {
-                             // Wait, structure is append(icon), append(label), append(spinner).
-                             // So first_child = icon, next = label.
                              let text = label_widget.text().to_string();
-                             // Strip status suffixes like " (Thinking)"
                              let name = text.split(" (").next().unwrap_or(&text).to_string();
-                             *active_target_clone.borrow_mut() = name.clone();
-
-                             let _ = tx_nexus.send_blocking(Event::ShardSelect(name.to_lowercase()));
+                             *active_target_clone.borrow_mut() = name;
                         }
                     }
                 }
@@ -597,16 +582,6 @@ impl CommsSpline {
             bubble.remove_css_class("una-bubble");
             left_spacer.set_visible(false);
             right_spacer.set_visible(false);
-
-            // Expansion Logic (GestureClick)
-            // Remove old controllers to prevent stacking if recycled
-            // Ideally we'd store the controller but for now we clear or just add new one if careful.
-            // Since bind is called often, adding a controller every time is a leak/duplicate risk.
-            // Correct way: Check if controller exists or use a custom widget subclass.
-            // Hack for SignalListItemFactory: We can store the controller in the widget data or just not re-add if present.
-            // Better: attach controller in setup, and in bind just update state?
-            // BUT we need the specific object in the closure.
-            // The factory `setup` creates the gesture.
 
             if is_chat {
                 chat_view.set_visible(true);
@@ -927,7 +902,6 @@ impl CommsSpline {
         let token_label_clone = token_label.clone();
         let pulse_icon_clone = pulse_icon.clone();
         let active_directive_async = active_directive_clone.clone();
-        let buffer_async = buffer.clone();
 
         // 1. Initialize DiskManager ONCE on the main thread
         let mut disk = match DiskManager::new() {
@@ -962,9 +936,15 @@ impl CommsSpline {
             });
         });
 
+        let buffer_async = buffer.clone();
+
         glib::MainContext::default().spawn_local(async move {
             while let Ok(update) = rx.recv().await {
                 match update {
+                    GuiUpdate::AppendInput(text) => {
+                        let mut end = buffer_async.end_iter();
+                        buffer_async.insert(&mut end, &text);
+                    }
                     GuiUpdate::Spectrum(_data) => {
                         // Euclase engine hook will go here.
                     }
@@ -1011,15 +991,6 @@ impl CommsSpline {
 
                         console_store.insert(0, &obj);
 
-                        // Persist to UnaFS (Async Shadow Copy)
-                        // We need a snapshot of all items to save.
-                        // Collecting from ListStore on main thread is fast enough for text.
-                        // We iterate from 0 to N.
-                        // If store has [Newest, ..., Oldest] (reversed view),
-                        // we should probably save them as [Oldest, ..., Newest] (chronological)
-                        // so they load back correctly?
-                        // Yes. iterate reverse or collect and reverse.
-
                         let mut snapshot = Vec::new();
                         let n_items = console_store_async.n_items();
                         for i in 0..n_items {
@@ -1029,8 +1000,6 @@ impl CommsSpline {
                                 }
                             }
                         }
-                        // Snapshot is [Newest, ..., Oldest].
-                        // Reverse to store [Oldest, ..., Newest].
                         snapshot.reverse();
                         let _ = storage_tx.send(snapshot);
                     }
@@ -1080,13 +1049,6 @@ impl CommsSpline {
                     }
                     GuiUpdate::ActiveDirective(d) => {
                         *active_directive_async.borrow_mut() = d;
-                    }
-                    GuiUpdate::ClearConsole => {
-                        console_store.remove_all();
-                    }
-                    GuiUpdate::AppendInput(text) => {
-                        let mut end = buffer_async.end_iter();
-                        buffer_async.insert(&mut end, &text);
                     }
                     _ => {}
                 }
