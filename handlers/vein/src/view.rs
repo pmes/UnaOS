@@ -501,8 +501,29 @@ impl CommsSpline {
             right_spacer.set_hexpand(true);
             root.append(&right_spacer);
 
-            // Expansion Gesture
+            // Expansion Gesture (Setup Phase)
             let gesture = GestureClick::new();
+            let item_clone = item.clone();
+            let chat_content_view_clone = chat_content_view.clone();
+
+            gesture.connect_pressed(move |_, n_press, _, _| {
+                if n_press == 1 {
+                    if let Some(obj) = item_clone.item().and_downcast::<crate::model::DispatchObject>() {
+                        let expanded = !obj.is_expanded();
+                        obj.set_is_expanded(expanded);
+
+                        let content = obj.content();
+                        let line_count = content.lines().count();
+
+                        if line_count > 11 && !expanded {
+                            let truncated: String = content.lines().take(11).collect::<Vec<&str>>().join("\n") + "\n\n... [Click to expand]";
+                            chat_content_view_clone.buffer().set_text(&truncated);
+                        } else {
+                            chat_content_view_clone.buffer().set_text(&content);
+                        }
+                    }
+                }
+            });
             bubble.add_controller(gesture);
 
             item.set_child(Some(&root));
@@ -529,53 +550,7 @@ impl CommsSpline {
             iter_bubble = chat_view.next_sibling();
             let expander = iter_bubble.unwrap().downcast::<Expander>().unwrap();
 
-            // Bind Gesture
-            // We need to find the controller. It should be the first one if we only added one.
-            if let Some(controller) = bubble.first_controller() {
-                if let Ok(gesture) = controller.downcast::<GestureClick>() {
-                    // Disconnect previous signals to avoid stacking
-                    // Note: In GTK4 Rust, signal IDs are returned. We can't easily clear *all* signals without tracking IDs.
-                    // A workaround for SignalListItemFactory is to use a weak ref to the object in the closure
-                    // and replace the closure entirely? No, `connect_pressed` adds.
-                    // BETTER: The gesture is persistent. We need to update *what it does*.
-                    // But `connect_pressed` takes a static closure.
-                    // CRITICAL FIX: We cannot easily rebind the closure every time.
-                    // Instead, we store the object ID in the widget's data and read it in the closure?
-                    // OR we accept that we might need to recreate the gesture or use a different signal strategy.
-                    // Given the constraint, we will assume standard factory behavior:
-                    // bind happens often. We can't stack signals.
-                    // We will skip gesture binding here and assume the click handles expanding via visual click?
-                    // No, the prompt requires a click.
-                    // Hack: Remove all controllers and re-add?
-                    // bubble.remove_controller(&controller); // and re-add new one?
-                    // Let's try removing the specific controller we found and adding a new one with the current object.
-
-                    bubble.remove_controller(&gesture);
-                }
-            }
-
-            let gesture = GestureClick::new();
-            let obj_clone = obj.clone();
-            let chat_view_clone = chat_view.clone();
-            let content_clone = obj.content().clone();
-
-            gesture.connect_pressed(move |_, _, _, _| {
-                let current = obj_clone.is_expanded();
-                obj_clone.set_is_expanded(!current);
-
-                // Immediate UI update
-                if !current { // If we are expanding
-                     chat_view_clone.buffer().set_text(&content_clone);
-                } else {
-                     // If collapsing (optional, but good UX)
-                     let line_count = content_clone.lines().count();
-                     if line_count > 11 {
-                        let truncated: String = content_clone.lines().take(11).collect::<Vec<&str>>().join("\n") + "\n\n... [Click to expand]";
-                        chat_view_clone.buffer().set_text(&truncated);
-                     }
-                }
-            });
-            bubble.add_controller(gesture);
+            // Gesture logic handled in setup via item.item() dynamic retrieval
 
             let is_chat = obj.is_chat();
             let sender = obj.sender();
