@@ -1,4 +1,5 @@
 pub mod view;
+pub mod model;
 pub use view::CommsSpline;
 
 use chrono::Local;

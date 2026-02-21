@@ -6,7 +6,8 @@ use gtk4::{
     EventControllerKey, FileDialog, Image, Label, ListBox, ListItem,
     Orientation, Paned, PolicyType, Popover, PropagationPhase, Scale, ScrolledWindow,
     SignalListItemFactory, SingleSelection, Spinner, Stack, StackSwitcher, StackTransitionType,
-    StringList, StringObject, Switch, TextBuffer, TextView, ToggleButton, Widget, Window,
+    StringList, StringObject, Switch, TextView, ToggleButton, Widget, Window,
+    ListView, FilterListModel, Expander,
     gdk::{Key, ModifierType},
     gio,
 };
@@ -16,6 +17,7 @@ use sourceview5::prelude::*;
 use std::cell::RefCell;
 use std::rc::Rc;
 use libspelling;
+use crate::model::DispatchObject;
 
 // Wrapper to allow storing !Send GObjects in set_data (Safe on main thread)
 struct SendWrapper<T>(pub T);
@@ -63,10 +65,11 @@ impl CommsSpline {
         // THE PULSE (Stripped of Tab Hacks)
         let provider = CssProvider::new();
         provider.load_from_string("
-            .console { font-family: 'Monospace'; padding: 12px; }
+            .console { font-family: 'Monospace'; background: transparent; }
+            .console-row { margin: 4px; padding: 4px; }
             .chat-input-area { border-radius: 12px; padding: 2px; border: 1px solid alpha(currentColor, 0.1); }
             .transparent-text { background-color: transparent; font-family: 'Sans'; font-size: 15px; padding: 6px; color: @theme_text_color; }
-.transparent-text text { background-color: transparent; color: inherit; }
+            .transparent-text text { background-color: transparent; color: inherit; }
 
             /* Native Icon Scaling */
             .suggested-action { background-color: #0078d4; color: #ffffff; border-radius: 4px; }
@@ -80,6 +83,10 @@ impl CommsSpline {
             }
             .pulse-active { animation: throb 1.5s infinite ease-in-out; color: #0078d4; }
             .nexus-header { font-weight: bold; margin-top: 12px; margin-bottom: 4px; opacity: 0.7; font-size: 0.9em; }
+
+            .role-architect { color: #0078d4; font-weight: bold; }
+            .role-una { color: #d40078; font-weight: bold; }
+            .role-system { color: #888888; font-style: italic; }
         ");
 
         gtk4::style_context_add_provider_for_display(
@@ -404,29 +411,139 @@ impl CommsSpline {
         main_paned.set_shrink_end_child(false);
         main_paned.set_wide_handle(true); // Restores the horizontal slider grip
 
-        // Console
+        // Console (REFACTORED FOR LISTVIEW)
         let scrolled_window = ScrolledWindow::builder()
             .hscrollbar_policy(PolicyType::Never)
             .vscrollbar_policy(PolicyType::Automatic)
             .vexpand(true)
             .build();
 
-        let text_buffer = TextBuffer::new(None);
-        let console_text_view = TextView::builder()
-            .wrap_mode(gtk4::WrapMode::WordChar)
-            .editable(false)
-            .monospace(true)
-            .buffer(&text_buffer)
-            .margin_start(12)
-            .margin_end(12)
-            .margin_top(12)
-            .margin_bottom(12)
-            .build();
-        console_text_view.add_css_class("console");
-        let text_buffer_clone = text_buffer.clone();
+        let console_store = gio::ListStore::new::<DispatchObject>();
+        let console_filter = FilterListModel::new(Some(console_store.clone()), None::<gtk4::Filter>);
+        let console_selection = SingleSelection::new(Some(console_filter));
+
+        let console_factory = SignalListItemFactory::new();
+        console_factory.connect_setup(move |_factory, item| {
+            let item = item.downcast_ref::<ListItem>().unwrap();
+
+            // Root Container
+            let root = Box::new(Orientation::Vertical, 0);
+            root.add_css_class("console-row");
+
+            // 1. Chat View Container
+            let chat_box = Box::new(Orientation::Vertical, 4);
+            let meta_label = Label::new(None);
+            meta_label.set_xalign(0.0);
+            meta_label.add_css_class("dim-label");
+
+            // Using SourceView for content to match requirement, even for chat
+            let chat_content_buffer = sourceview5::Buffer::new(None);
+            let chat_content_view = SourceView::with_buffer(&chat_content_buffer);
+            chat_content_view.set_editable(false);
+            chat_content_view.set_wrap_mode(gtk4::WrapMode::WordChar);
+            chat_content_view.set_show_line_numbers(false);
+            chat_content_view.add_css_class("transparent-text");
+            chat_content_view.set_monospace(false); // Clean look for chat
+
+            chat_box.append(&meta_label);
+            chat_box.append(&chat_content_view);
+
+            // 2. Payload View Container (Expander)
+            let expander = Expander::new(None);
+            let expander_label = Label::new(None);
+            expander.set_child(Some(&expander_label)); // Placeholder title
+
+            let payload_content_buffer = sourceview5::Buffer::new(None);
+            let payload_content_view = SourceView::with_buffer(&payload_content_buffer);
+            payload_content_view.set_editable(false);
+            payload_content_view.set_wrap_mode(gtk4::WrapMode::WordChar);
+            payload_content_view.set_show_line_numbers(true); // Code often needs line numbers
+            payload_content_view.set_monospace(true);
+
+            let payload_scroll = ScrolledWindow::builder()
+                .child(&payload_content_view)
+                .height_request(200) // Default height for payload
+                .build();
+
+            expander.set_child(Some(&payload_scroll));
+
+            root.append(&chat_box);
+            root.append(&expander);
+
+            item.set_child(Some(&root));
+        });
+
+        console_factory.connect_bind(move |_factory, item| {
+            let item = item.downcast_ref::<ListItem>().unwrap();
+            let root = item.child().unwrap().downcast::<Box>().unwrap();
+            let obj = item.item().unwrap().downcast::<DispatchObject>().unwrap();
+
+            let chat_box = root.first_child().unwrap().downcast::<Box>().unwrap();
+            let expander = root.last_child().unwrap().downcast::<Expander>().unwrap();
+
+            let is_chat = obj.is_chat();
+            let sender = obj.sender();
+            let timestamp = obj.timestamp();
+            let content = obj.content();
+            let subject = obj.subject();
+
+            if is_chat {
+                chat_box.set_visible(true);
+                expander.set_visible(false);
+
+                // Bind Chat
+                let meta_label = chat_box.first_child().unwrap().downcast::<Label>().unwrap();
+                let content_view = chat_box.last_child().unwrap().downcast::<SourceView>().unwrap();
+
+                meta_label.set_text(&format!("{} • {}", sender, timestamp));
+
+                // Style sender
+                meta_label.remove_css_class("role-architect");
+                meta_label.remove_css_class("role-una");
+                meta_label.remove_css_class("role-system");
+
+                if sender == "Architect" {
+                    meta_label.add_css_class("role-architect");
+                    root.set_halign(Align::End); // Right align architect
+                    meta_label.set_xalign(1.0);
+                } else if sender == "Una-Prime" {
+                    meta_label.add_css_class("role-una");
+                    root.set_halign(Align::Start);
+                    meta_label.set_xalign(0.0);
+                } else {
+                    meta_label.add_css_class("role-system");
+                    root.set_halign(Align::Start);
+                    meta_label.set_xalign(0.0);
+                }
+
+                content_view.buffer().set_text(&content);
+
+            } else {
+                chat_box.set_visible(false);
+                expander.set_visible(true);
+                root.set_halign(Align::Fill); // Payloads take full width
+
+                // Bind Payload
+                // Set Expander Label (We have to recreate it or find it if we want custom widget there)
+                // Expander::set_label sets simple text. For "Sender | Subject | Time", simple text is fine for now.
+                expander.set_label(Some(&format!("{} | {} | {}", sender, subject, timestamp)));
+
+                let scroll = expander.child().unwrap().downcast::<ScrolledWindow>().unwrap();
+                let content_view = scroll.child().unwrap().downcast::<SourceView>().unwrap();
+                content_view.buffer().set_text(&content);
+                expander.set_expanded(false); // Default closed
+            }
+        });
+
+        let console_list_view = ListView::new(Some(console_selection), Some(console_factory));
+        console_list_view.add_css_class("console");
+
+        // Disable click selection highlighting visually if desired, but SingleSelection is needed for list view.
+        // CSS .console:selected { background: transparent; } might be needed in provider.
+
         let scrolled_window_adj = scrolled_window.vadjustment();
         let scroll_adj_clone = scrolled_window_adj.clone();
-        scrolled_window.set_child(Some(&console_text_view));
+        scrolled_window.set_child(Some(&console_list_view));
 
         // --- The Spatial Cortex (Euclase Target) ---
         let spatial_canvas = gtk4::Picture::new();
@@ -669,8 +786,49 @@ impl CommsSpline {
                         // Euclase engine hook will go here.
                     }
                     GuiUpdate::ConsoleLog(text) => {
-                        let mut end_iter = text_buffer_clone.end_iter();
-                        text_buffer_clone.insert(&mut end_iter, &text);
+                        // Parse incoming log
+                        let mut sender = "System".to_string();
+                        let mut is_chat = true;
+                        let mut content = text.clone();
+                        let mut subject = "Log".to_string();
+
+                        if text.trim().starts_with("[ARCHITECT]") {
+                            sender = "Architect".to_string();
+                            is_chat = true;
+                        } else if text.trim().starts_with("[UNA]") {
+                            sender = "Una-Prime".to_string();
+                            is_chat = true;
+                        } else if text.trim().starts_with("[S") {
+                            // Check if it's likely a shard (S followed by digit)
+                            let after_s = &text.trim()[2..];
+                            if let Some(first_char) = after_s.chars().next() {
+                                if first_char.is_numeric() {
+                                    sender = "Shard".to_string();
+                                    is_chat = false; // Wolfpack
+                                    subject = "Wolfpack Output".to_string();
+                                }
+                            }
+                        }
+
+                        // Generate local timestamp
+                        let timestamp = glib::DateTime::now_local()
+                            .map(|dt| dt.format("%H:%M:%S").unwrap().to_string())
+                            .unwrap_or_else(|_| "00:00:00".to_string());
+
+                        let id = format!("{}", chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0));
+
+                        let obj = DispatchObject::new(
+                            &id,
+                            &sender,
+                            &subject,
+                            &timestamp,
+                            &content,
+                            is_chat
+                        );
+
+                        console_store.append(&obj);
+
+                        // Auto-scroll logic
                         let adj = scroll_adj_clone.clone();
                         glib::timeout_add_local(std::time::Duration::from_millis(50), move || {
                             if adj.upper() > adj.page_size() {
