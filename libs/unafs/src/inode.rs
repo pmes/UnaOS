@@ -18,6 +18,8 @@ pub enum FileKind {
     File,
     Directory,
     Symlink,
+    /// A system-internal file (e.g., Attribute Catalog).
+    System,
 }
 
 /// Represents a contiguous chunk of data on the disk.
@@ -51,6 +53,8 @@ pub enum AttributeValue {
     /// A binary blob (e.g., thumbnail).
     Blob(Vec<u8>),
     /// A vector of 32-bit floats (e.g., AI embedding).
+    /// Used for small vectors that fit in the Inode.
+    /// Larger vectors are stored in `large_attributes`.
     Vector(Vec<f32>),
 }
 
@@ -62,14 +66,17 @@ pub enum AttributeValue {
 pub struct Inode {
     /// Unique identifier for the Inode.
     pub id: u64,
-    /// The type of file (File, Directory, Symlink).
+    /// The type of file (File, Directory, Symlink, System).
     pub kind: FileKind,
     /// The logical size of the file data in bytes.
     pub size: u64,
     /// List of data extents.
     pub chunks: ExtentList,
-    /// Key-value map of semantic attributes.
+    /// Key-value map of small semantic attributes.
     pub attributes: BTreeMap<String, AttributeValue>,
+    /// Key-value map of large attributes stored in external blocks.
+    /// Used for large vectors or blobs (> 256 bytes).
+    pub large_attributes: BTreeMap<String, ExtentList>,
 }
 
 impl Inode {
@@ -81,6 +88,7 @@ impl Inode {
             size: 0,
             chunks: Vec::new(),
             attributes: BTreeMap::new(),
+            large_attributes: BTreeMap::new(),
         }
     }
 

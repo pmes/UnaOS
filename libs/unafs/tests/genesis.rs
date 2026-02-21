@@ -22,28 +22,32 @@ fn test_big_bang() {
     assert_eq!(device.block_count(), block_count);
 
     // 2. Format
-    let mut fs = UnaFS::format(device).expect("Format failed");
+    let mut fs = UnaFS::format(device, 10).expect("Format failed");
 
     // 3. Assert Superblock
     let sb = &fs.superblock;
     assert_eq!(sb.magic, MAGIC);
     assert_eq!(sb.version, VERSION);
     assert_eq!(sb.block_count, block_count);
-    assert_eq!(sb.bitmap_start, 1);
+
+    // Updated Layout:
+    // SB (0)
+    // Journal (1..10) -> 10 blocks
+    // Bitmap (11..) -> 1 block for 2560 bits
+    assert_eq!(sb.bitmap_start, 11);
 
     // Check bitmap size: 2560 bits -> 320 bytes -> fits in 1 block (4096 bytes)
     assert_eq!(sb.bitmap_blocks, 1);
 
     // 4. Assert Root Inode
     let root_id = sb.root_inode;
-    // Root should be after SB (0) and Bitmap (1) -> Block 2
-    // Wait, if bitmap is large it might take more blocks. 2560 bits fits in 1 block.
-    // Bitmap is at block 1.
-    // Allocation starts searching from 0.
-    // Block 0 is marked used (SB).
-    // Block 1 is marked used (Bitmap).
-    // Block 2 is first free -> Root.
-    assert_eq!(root_id, 2);
+    // Bitmap ends at 11.
+    // Root Inode allocated next -> 12.
+    assert_eq!(root_id, 12);
+
+    // Assert Catalog Inode
+    let catalog_id = sb.catalog_inode;
+    assert_eq!(catalog_id, 13);
 
     // Read Root Inode using internal FS method
     let root_inode = fs.read_inode(root_id).expect("Failed to read root inode");
@@ -55,18 +59,18 @@ fn test_big_bang() {
 
     let file_id = fs.create_inode(attrs).expect("Failed to create file");
 
-    // File should be next free block (3)
-    assert_eq!(file_id, 3);
+    // File should be next free block (14)
+    assert_eq!(file_id, 14);
 
     // 6. Verify Persistence (Mount)
     // UnaFS consumes device. We need to extract it back.
     // Since `fs` owns `device` (public), we can take it.
     let device_back = fs.device;
 
-    let fs2 = UnaFS::mount(device_back).expect("Mount failed");
+    let mut fs2 = UnaFS::mount(device_back).expect("Mount failed");
 
     assert_eq!(fs2.superblock.magic, MAGIC);
-    assert_eq!(fs2.superblock.root_inode, 2);
+    assert_eq!(fs2.superblock.root_inode, 12);
 
     // Check file exists
     let file_inode = fs2.read_inode(file_id).expect("Failed to read file after mount");

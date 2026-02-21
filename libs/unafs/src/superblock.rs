@@ -5,7 +5,7 @@ use thiserror::Error;
 /// The Magic Number for UnaFS: "UNAFS" in ASCII.
 pub const MAGIC: [u8; 5] = *b"UNAFS";
 /// The current version of the filesystem.
-pub const VERSION: u32 = 1;
+pub const VERSION: u32 = 2; // Bumped version for Attribute Engine
 
 #[derive(Error, Debug)]
 pub enum SuperblockError {
@@ -42,6 +42,16 @@ pub struct Superblock {
     pub bitmap_start: u64,
     /// The number of blocks occupied by the bitmap.
     pub bitmap_blocks: u64,
+
+    // --- UNAFS 2.0: The Semantic Vault ---
+
+    /// The starting block of the Write-Ahead Log (WAL).
+    pub journal_start: u64,
+    /// The number of blocks reserved for the WAL.
+    pub journal_blocks: u64,
+
+    /// The Inode ID of the Attribute Catalog (System File).
+    pub catalog_inode: u64,
 }
 
 impl Superblock {
@@ -49,19 +59,22 @@ impl Superblock {
     /// Calculates the bitmap size and placement automatically.
     pub fn new(block_count: u64) -> Self {
         // Calculate bitmap size.
-        // 1 bit per block.
-        // bits = block_count
-        // bytes = (block_count + 7) / 8
-        // blocks = (bytes + BLOCK_SIZE - 1) / BLOCK_SIZE
         let bitmap_bytes = block_count.div_ceil(8);
         let bitmap_blocks = bitmap_bytes.div_ceil(BLOCK_SIZE);
 
-        // Bitmap starts at Block 1 (immediately after Superblock).
-        let bitmap_start = 1;
+        // Layout:
+        // Block 0: Superblock
+        // Block 1..11: Journal (10 blocks)
+        // Block 11..(11+bitmap_blocks): Bitmap
 
-        // Total used blocks initially: Superblock (1) + Bitmap blocks.
-        // Root inode will be allocated later, decreasing free_blocks then.
-        let initial_used = 1 + bitmap_blocks;
+        let journal_start = 1;
+        let journal_blocks = 10;
+
+        let bitmap_start = journal_start + journal_blocks;
+
+        // Total used blocks initially: Superblock (1) + Journal (10) + Bitmap blocks.
+        // Root inode and Catalog inode will be allocated later.
+        let initial_used = 1 + journal_blocks + bitmap_blocks;
         let free_blocks = block_count.saturating_sub(initial_used);
 
         Self {
@@ -73,6 +86,9 @@ impl Superblock {
             free_blocks,
             bitmap_start,
             bitmap_blocks,
+            journal_start,
+            journal_blocks,
+            catalog_inode: 0, // Will be set after allocation
         }
     }
 
@@ -92,6 +108,8 @@ impl Superblock {
         if sb.magic != MAGIC {
             return Err(SuperblockError::InvalidMagic);
         }
+        // Backward compatibility: If we were really maintaining it, we would check version.
+        // But for this exercise, we are upgrading the format entirely.
         if sb.version != VERSION {
             return Err(SuperblockError::InvalidVersion(sb.version));
         }

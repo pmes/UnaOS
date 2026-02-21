@@ -10,7 +10,7 @@ fn test_tree_of_life() {
     device.write_block(block_count - 1, &empty_block).expect("Failed to set disk size");
 
     // 2. Format
-    let mut fs = UnaFS::format(device).expect("Format failed");
+    let mut fs = UnaFS::format(device, 10).expect("Format failed");
     let root_id = fs.superblock.root_inode;
 
     // 3. Create Directory Structure
@@ -71,6 +71,7 @@ fn test_tree_of_life() {
     assert_eq!(updated_inode.size, (data1.len() + data2.len() + 5000) as u64);
 
     // Verify data correctness at end
+    // Note: read_data returns Vec<u8> which we compare to Vec<u8>.
     let read_huge = fs.read_data(notes_id, (data1.len() + data2.len()) as u64, 5000).expect("Failed to read huge data");
     assert_eq!(read_huge, huge_data);
 }
