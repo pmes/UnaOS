@@ -20,11 +20,11 @@ use tokio::runtime::Runtime;
 use tokio::sync::{broadcast, mpsc};
 
 use bandy::{BandyMember, SMessage};
+use crate::storage::DiskManager;
 
 struct State {
     mode: ViewMode,
     nav_index: usize,
-    chat_history: Vec<SavedMessage>,
     sidebar_position: SidebarPosition,
     sidebar_collapsed: bool,
     s9_status: ShardStatus,
@@ -167,13 +167,12 @@ impl VeinHandler {
         history_path: PathBuf,
         bandy_tx: broadcast::Sender<SMessage>,
     ) -> Self {
+        // BrainManager kept ONLY for directive reading
         let brain = BrainManager::new(history_path);
-        let saved_history = brain.load();
 
         let state = Arc::new(Mutex::new(State {
             mode: ViewMode::Comms,
             nav_index: 0,
-            chat_history: saved_history.clone(),
             sidebar_position: SidebarPosition::default(),
             sidebar_collapsed: false,
             s9_status: ShardStatus::Offline,
@@ -189,6 +188,24 @@ impl VeinHandler {
             let rt = Runtime::new().expect("Failed to create Tokio Runtime");
             rt.block_on(async move {
                 info!(":: VEIN :: Brain Connecting...");
+
+                // === THE SEMANTIC VAULT ===
+                // Initialize DiskManager (UnaFS)
+                let mut disk = DiskManager::new().expect("Failed to initialize Semantic Vault (UnaFS)");
+
+                // Load History for UI (Visual Only)
+                if let Ok(records) = disk.load_all_memories() {
+                    for record in records {
+                        let prefix = if record.sender == "user" {
+                            "[ARCHITECT]"
+                        } else {
+                            "[UNA]"
+                        };
+                        let msg = format!("{} [{}] > {}\n", prefix, record.timestamp, record.content);
+                        let _ = gui_tx_brain.send(GuiUpdate::ConsoleLog(msg)).await;
+                    }
+                }
+
                 tokio::time::sleep(Duration::from_millis(200)).await;
 
                 let forge_client = match ForgeClient::new() {
@@ -205,7 +222,7 @@ impl VeinHandler {
                 match client_res {
                     Ok(mut client) => {
                         let _ = gui_tx_brain
-                            .send(GuiUpdate::ConsoleLog(":: BRAIN :: ONLINE\n\n".into()))
+                            .send(GuiUpdate::ConsoleLog(":: BRAIN :: ONLINE (PLEXUS ENABLED)\n\n".into()))
                             .await;
 
                         // Broadcast Active Directive
@@ -216,6 +233,7 @@ impl VeinHandler {
                             let is_s9 = user_input_text.starts_with("/s9");
 
                             if user_input_text.starts_with("READ_REPO:") {
+                                // ... (Forge logic kept as is) ...
                                 let parts: Vec<&str> = user_input_text.split(':').collect();
                                 if parts.len() >= 5 {
                                     let owner = parts[1];
@@ -247,7 +265,7 @@ impl VeinHandler {
 
                             {
                                 let mut s = state_bg.lock().unwrap();
-                                brain_bg.save(&s.chat_history);
+                                // brain_bg.save(&s.chat_history); // REMOVED
                                 if is_s9 {
                                     s.s9_status = ShardStatus::Thinking;
                                 }
@@ -266,29 +284,47 @@ impl VeinHandler {
                                     .await;
                             }
 
-                            let system_instruction =
-                                if is_s9 { "You are S9." } else { "You are Una." };
+                            // === THE PLEXUS LOOP ===
+
+                            // 1. Embed User Input
+                            let user_embedding = match client.embed_content(&user_input_text).await {
+                                Ok(vec) => vec,
+                                Err(e) => {
+                                    eprintln!(":: PLEXUS :: Embedding Failed: {}", e);
+                                    vec![] // Continue without RAG if embedding fails
+                                }
+                            };
+
+                            // 2. RAG Retrieval
+                            let mut retrieved_context = String::new();
+                            if !user_embedding.is_empty() {
+                                match disk.search_memories(&user_embedding, 0.70) {
+                                    Ok(memories) => {
+                                        if !memories.is_empty() {
+                                            retrieved_context = memories.join("\n\n");
+                                            info!(":: PLEXUS :: Recalled {} memories.", memories.len());
+                                        }
+                                    }
+                                    Err(e) => {
+                                        eprintln!(":: PLEXUS :: Recall Failed: {}", e);
+                                    }
+                                }
+                            }
+
+                            let system_base = if is_s9 { "You are S9." } else { "You are Una." };
+                            let combined_system = if !retrieved_context.is_empty() {
+                                format!("{}\n\n[SEMANTIC MEMORY RECALL]:\n{}", system_base, retrieved_context)
+                            } else {
+                                system_base.to_string()
+                            };
+
                             let mut context = Vec::new();
                             context.push(Content {
                                 role: "model".into(),
-                                parts: vec![Part::text(system_instruction.into())],
+                                parts: vec![Part::text(combined_system)],
                             });
 
-                            let history = {
-                                let guard = state_bg.lock().unwrap();
-                                guard.chat_history.clone()
-                            };
-
-                            for msg in history.iter().rev().take(20).rev() {
-                                if msg.content.starts_with("SYSTEM") {
-                                    continue;
-                                }
-                                context.push(Content {
-                                    role: msg.role.clone(),
-                                    parts: parse_multimodal_text(&msg.content),
-                                });
-                            }
-
+                            // Only push current user input. NO HISTORY LOOP.
                             context.push(Content {
                                 role: "user".into(),
                                 parts: parse_multimodal_text(&user_input_text),
@@ -311,15 +347,24 @@ impl VeinHandler {
 
                                     {
                                         let mut s = state_bg.lock().unwrap();
-                                        s.chat_history.push(SavedMessage {
-                                            role: "model".into(),
-                                            content: response.clone(),
-                                            timestamp: Some(timestamp),
-                                        });
-                                        brain_bg.save(&s.chat_history);
+                                        // s.chat_history.push(...) // REMOVED
                                         if is_s9 {
                                             s.s9_status = ShardStatus::Online;
                                         }
+                                    }
+
+                                    // 3. Save Memories (User + Model)
+                                    // Embed Response
+                                    let response_embedding = match client.embed_content(&response).await {
+                                        Ok(vec) => vec,
+                                        Err(_) => vec![],
+                                    };
+
+                                    if let Err(e) = disk.save_memory("user", &user_input_text, &timestamp, user_embedding) {
+                                        eprintln!(":: PLEXUS :: Failed to save user memory: {}", e);
+                                    }
+                                    if let Err(e) = disk.save_memory("model", &response, &timestamp, response_embedding) {
+                                        eprintln!(":: PLEXUS :: Failed to save model memory: {}", e);
                                     }
 
                                     let _ = gui_tx_brain
@@ -352,21 +397,7 @@ impl VeinHandler {
             });
         });
 
-        // Restore History
-        for msg in saved_history {
-            if !msg.content.starts_with("SYSTEM") {
-                let prefix = if msg.role == "user" {
-                    "[ARCHITECT]"
-                } else {
-                    "[UNA]"
-                };
-                let ts = msg.timestamp.clone().unwrap_or_else(|| "--:--:--".to_string());
-                let _ = gui_tx.send_blocking(GuiUpdate::ConsoleLog(format!(
-                    "{} [{}] > {}\n",
-                    prefix, ts, msg.content
-                )));
-            }
-        }
+        // REMOVED: Old History Restore Loop (Now handled inside thread)
 
         // Spawn Bandy Listener
         let mut bandy_rx = bandy_tx.subscribe();
@@ -438,11 +469,7 @@ impl AppHandler for VeinHandler {
             Event::Input { target: _, text } => {
                 let timestamp = Local::now().format("%H:%M:%S").to_string();
                 let current_text = format!("\n[ARCHITECT] [{}] > {}\n", timestamp, text);
-                s.chat_history.push(SavedMessage {
-                    role: "user".to_string(),
-                    content: text.clone(),
-                    timestamp: Some(timestamp),
-                });
+                // s.chat_history.push(...); // REMOVED
                 self.append_to_console(&current_text);
 
                 if text.trim() == "/wolf" {
@@ -452,7 +479,7 @@ impl AppHandler for VeinHandler {
                     s.mode = ViewMode::Comms;
                     self.append_to_console("\n[SYSTEM] :: Secure Comms Established.\n");
                 } else if text.trim() == "/clear" {
-                    s.chat_history.clear();
+                    // s.chat_history.clear(); // REMOVED
                     self.append_to_console("\n:: VEIN :: SYSTEM CLEARED\n\n");
                 } else if let Some(path_str) = text.trim().strip_prefix("/upload ") {
                     let path = PathBuf::from(path_str.trim());
@@ -509,11 +536,7 @@ impl AppHandler for VeinHandler {
 
                 let timestamp = Local::now().format("%H:%M:%S").to_string();
                 let current_text = format!("\n[ARCHITECT] [{}] > {}\n", timestamp, full_message);
-                s.chat_history.push(SavedMessage {
-                    role: "user".to_string(),
-                    content: full_message.clone(),
-                    timestamp: Some(timestamp),
-                });
+                // s.chat_history.push(...); // REMOVED
                 self.append_to_console(&current_text);
 
                 if let Err(e) = self.tx.send(full_message) {

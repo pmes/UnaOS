@@ -1,13 +1,13 @@
-use unafs::{UnaFS, FileDevice, FileSystem};
+use unafs::{FileSystem, FileDevice, AttributeValue, UnaFS};
 use crate::model::DispatchRecord;
 use std::path::Path;
 use anyhow::{Result, Context};
+use std::collections::BTreeMap;
 
 const DISK_PATH: &str = "/tmp/lumen_storage.ufs";
-const HISTORY_FILE: &str = "history.bin";
 
 pub struct DiskManager {
-    fs: FileSystem,
+    pub fs: FileSystem,
 }
 
 impl DiskManager {
@@ -17,83 +17,102 @@ impl DiskManager {
         // Only mount if the file is at least 1 block long (4096 bytes)
         let is_valid_disk = path.exists() && std::fs::metadata(path).map(|m| m.len()).unwrap_or(0) >= 4096;
 
-        let fs = if is_valid_disk {
+        if is_valid_disk {
             let device = FileDevice::open(path)?;
             match UnaFS::mount(device) {
-                Ok(mut fs) => {
-                    Self::ensure_history_file(&mut fs)?;
-                    fs
+                Ok(fs) => {
+                    Ok(Self { fs })
                 }
                 Err(e) => {
                     eprintln!(":: LIBRARIAN :: Mount failed ({}), reformatting...", e);
-                    // FORCE THE OS TO ALLOCATE 64MB BEFORE FORMATTING
                     std::fs::File::create(path)?.set_len(64 * 1024 * 1024)?;
                     let device = FileDevice::open(path)?;
-                    let mut fs = UnaFS::format(device, 64)?;
-                    Self::create_history_file(&mut fs)?;
-                    fs
+                    let fs = UnaFS::format(device, 64)?;
+                    Ok(Self { fs })
                 }
             }
         } else {
-            // FORCE THE OS TO ALLOCATE 64MB BEFORE FORMATTING
             std::fs::File::create(path)?.set_len(64 * 1024 * 1024)?;
             let device = FileDevice::open(path)?;
-            let mut fs = UnaFS::format(device, 64)?;
-            Self::create_history_file(&mut fs)?;
-            fs
-        };
-
-        Ok(Self { fs })
+            let fs = UnaFS::format(device, 64)?;
+            Ok(Self { fs })
+        }
     }
 
-    fn create_history_file(fs: &mut FileSystem) -> Result<()> {
-        let root_inode = fs.superblock.root_inode;
+    pub fn save_memory(&mut self, sender: &str, content: &str, timestamp: &str, embedding: Vec<f32>) -> Result<()> {
+        let mut attrs = BTreeMap::new();
+        attrs.insert("type".to_string(), AttributeValue::String("chat".to_string()));
+        attrs.insert("sender".to_string(), AttributeValue::String(sender.to_string()));
+        attrs.insert("timestamp".to_string(), AttributeValue::String(timestamp.to_string()));
 
-        let root = fs.ls(root_inode)?;
-        let exists = root.iter().any(|e| e.name == HISTORY_FILE);
+        let inode_id = self.fs.create_inode(attrs).context("Failed to create inode")?;
+        self.fs.write_data(inode_id, 0, content.as_bytes()).context("Failed to write content")?;
 
-        if !exists {
-             fs.create_file(root_inode, HISTORY_FILE.to_string())?;
-        }
+        // Save embedding separately to handle potentially large attributes safely
+        self.fs.set_attribute(inode_id, "embedding".to_string(), AttributeValue::Vector(embedding))
+            .context("Failed to save embedding")?;
+
         Ok(())
     }
 
-    fn ensure_history_file(fs: &mut FileSystem) -> Result<()> {
-        Self::create_history_file(fs)
-    }
+    pub fn search_memories(&mut self, embedding: &[f32], threshold: f32) -> Result<Vec<String>> {
+        // Query syntax: similarity(embedding, [0.1,0.2,...]) > 0.7
+        let vec_str = format!("[{}]", embedding.iter().map(|f| f.to_string()).collect::<Vec<_>>().join(","));
+        let query_str = format!("similarity(embedding, {}) > {}", vec_str, threshold);
 
-    pub fn save_history(&mut self, records: &[DispatchRecord]) -> Result<()> {
-        let data = bincode::serialize(records).context("Failed to serialize history")?;
+        let inodes = self.fs.query(&query_str).map_err(|e| anyhow::anyhow!("Query failed: {:?}", e))?;
+        let mut memories = Vec::new();
 
-        // Find inode for history file
-        let root_inode = self.fs.superblock.root_inode;
-        let root_entries = self.fs.ls(root_inode)?;
-        let entry = root_entries.iter().find(|e| e.name == HISTORY_FILE)
-            .ok_or_else(|| anyhow::anyhow!("History file not found"))?;
+        for inode in inodes {
+             let data = self.fs.read_data(inode.id, 0, inode.size).unwrap_or_default();
+             let content = String::from_utf8(data).unwrap_or_default();
 
-        // Write data
-        self.fs.write_data(entry.inode_id, 0, &data)?;
-        Ok(())
-    }
+             let sender = match inode.attributes.get("sender") {
+                 Some(AttributeValue::String(s)) => s.as_str(),
+                 _ => "Unknown",
+             };
 
-    pub fn load_history(&mut self) -> Result<Vec<DispatchRecord>> {
-        let root_inode = self.fs.superblock.root_inode;
-        let root_entries = self.fs.ls(root_inode)?;
-
-        if let Some(entry) = root_entries.iter().find(|e| e.name == HISTORY_FILE) {
-            let inode_obj = self.fs.read_inode(entry.inode_id)?;
-            if inode_obj.size == 0 {
-                return Ok(Vec::new());
-            }
-            let data = self.fs.read_data(entry.inode_id, 0, inode_obj.size)?;
-            if data.is_empty() {
-                return Ok(Vec::new());
-            }
-            let records: Vec<DispatchRecord> = bincode::deserialize(&data)
-                .context("Failed to deserialize history")?;
-            Ok(records)
-        } else {
-            Ok(Vec::new())
+             // Format: [Sender]: Content
+             memories.push(format!("[{}]: {}", sender, content));
         }
+
+        Ok(memories)
+    }
+
+    pub fn load_all_memories(&mut self) -> Result<Vec<DispatchRecord>> {
+        // Retrieve all chat memories for UI startup
+        let query_str = "type == \"chat\"";
+
+        let mut inodes = self.fs.query(query_str).map_err(|e| anyhow::anyhow!("Query failed: {:?}", e))?;
+
+        // Sort by ID (Creation Order)
+        inodes.sort_by_key(|inode| inode.id);
+
+        let mut records = Vec::new();
+        for inode in inodes {
+            let data = self.fs.read_data(inode.id, 0, inode.size).unwrap_or_default();
+            let content = String::from_utf8(data).unwrap_or_default();
+
+            let sender = match inode.attributes.get("sender") {
+                Some(AttributeValue::String(s)) => s.clone(),
+                _ => "System".to_string(),
+            };
+
+            let timestamp = match inode.attributes.get("timestamp") {
+                Some(AttributeValue::String(s)) => s.clone(),
+                _ => "".to_string(),
+            };
+
+            records.push(DispatchRecord {
+                id: inode.id.to_string(),
+                sender,
+                subject: "Memory".to_string(),
+                timestamp,
+                content,
+                is_chat: true,
+            });
+        }
+
+        Ok(records)
     }
 }
