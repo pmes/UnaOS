@@ -11,14 +11,12 @@ use gtk4::{
     gdk::{Key, ModifierType},
     gio,
 };
-use tokio::sync::mpsc;
 use sourceview5::View as SourceView;
 use sourceview5::prelude::*;
 use std::cell::RefCell;
 use std::rc::Rc;
 use libspelling;
 use crate::model::DispatchObject;
-use crate::storage::DiskManager;
 
 // Wrapper to allow storing !Send GObjects in set_data (Safe on main thread)
 struct SendWrapper<T>(pub T);
@@ -903,39 +901,6 @@ impl CommsSpline {
         let pulse_icon_clone = pulse_icon.clone();
         let active_directive_async = active_directive_clone.clone();
 
-        // 1. Initialize DiskManager ONCE on the main thread
-        let mut disk = match DiskManager::new() {
-            Ok(d) => d,
-            Err(e) => {
-                eprintln!(":: FATAL :: Storage Init Failed: {}", e);
-                panic!("Storage Failure: {}", e);
-            }
-        };
-
-        // 2. Load History Synchronously
-        if let Ok(records) = disk.load_history() {
-            for record in records {
-                let obj = DispatchObject::from_record(&record);
-                console_store.insert(0, &obj);
-            }
-        }
-
-        let console_store_async = console_store.clone();
-
-        // 3. Spawn Librarian and transfer ownership of `disk`
-        let (storage_tx, mut storage_rx) = mpsc::unbounded_channel::<Vec<crate::model::DispatchRecord>>();
-
-        std::thread::spawn(move || {
-            let rt = tokio::runtime::Runtime::new().unwrap();
-            rt.block_on(async move {
-                while let Some(records) = storage_rx.recv().await {
-                    if let Err(e) = disk.save_history(&records) {
-                        eprintln!(":: LIBRARIAN :: Save failed: {}", e);
-                    }
-                }
-            });
-        });
-
         let buffer_async = buffer.clone();
 
         glib::MainContext::default().spawn_local(async move {
@@ -990,18 +955,6 @@ impl CommsSpline {
                         );
 
                         console_store.insert(0, &obj);
-
-                        let mut snapshot = Vec::new();
-                        let n_items = console_store_async.n_items();
-                        for i in 0..n_items {
-                            if let Some(item) = console_store_async.item(i) {
-                                if let Some(dobj) = item.downcast_ref::<DispatchObject>() {
-                                    snapshot.push(dobj.to_record());
-                                }
-                            }
-                        }
-                        snapshot.reverse();
-                        let _ = storage_tx.send(snapshot);
                     }
                     GuiUpdate::ShardStatusChanged { id, status } => {
                         let (spinner, label, name) = if id == "una-prime" {

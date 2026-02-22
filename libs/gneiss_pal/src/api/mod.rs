@@ -226,4 +226,84 @@ impl ResilientClient {
     pub async fn list_vertex_models(&self) -> Result<String, String> {
         Ok("Model listing bypass engaged. Hardcoded to gemini-3-pro-preview.".to_string())
     }
+
+    pub async fn embed_content(&mut self, text: &str) -> Result<Vec<f32>, String> {
+        let url = "https://aiplatform.googleapis.com/v1/projects/unauploads-1769528906/locations/global/publishers/google/models/text-embedding-004:predict";
+
+        let request_body = EmbedContentRequest {
+            instances: vec![EmbedContentInstance {
+                content: text.to_string(),
+            }],
+        };
+
+        let mut attempts = 0;
+        loop {
+            attempts += 1;
+
+            let response = self
+                .client
+                .post(url)
+                .bearer_auth(&self.token)
+                .json(&request_body)
+                .send()
+                .await
+                .map_err(|e| format!("Embedding Transmission Failed: {}", e))?;
+
+            if response.status() == StatusCode::UNAUTHORIZED {
+                if attempts < 2 {
+                    warn!("401 Unauthorized (Embedding). Initiating Lazarus Protocol...");
+                    if let Err(e) = self.refresh_token().await {
+                        return Err(format!("Lazarus Protocol Failed: {}", e));
+                    }
+                    continue;
+                } else {
+                    return Err("Authentication Failed after retry.".to_string());
+                }
+            }
+
+            if !response.status().is_success() {
+                let status = response.status();
+                let text = response.text().await.unwrap_or_default();
+                return Err(format!("Embedding Failure {}: {}", status, text));
+            }
+
+            let data: EmbedContentResponse = response
+                .json()
+                .await
+                .map_err(|e| format!("Failed to decode embedding: {}", e))?;
+
+            if let Some(predictions) = data.predictions {
+                if let Some(first) = predictions.first() {
+                    return Ok(first.embeddings.values.clone());
+                }
+            }
+
+            return Err("Neural Core returned no embedding.".to_string());
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct EmbedContentRequest {
+    instances: Vec<EmbedContentInstance>,
+}
+
+#[derive(Serialize)]
+struct EmbedContentInstance {
+    content: String,
+}
+
+#[derive(Deserialize)]
+struct EmbedContentResponse {
+    predictions: Option<Vec<EmbedPrediction>>,
+}
+
+#[derive(Deserialize)]
+struct EmbedPrediction {
+    embeddings: EmbedValues,
+}
+
+#[derive(Deserialize)]
+struct EmbedValues {
+    values: Vec<f32>,
 }
