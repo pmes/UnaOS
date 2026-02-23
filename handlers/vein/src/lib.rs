@@ -1,12 +1,12 @@
-pub mod view;
 pub mod model;
 pub mod storage;
+pub mod view;
 pub use view::CommsSpline;
 
 use chrono::Local;
 use elessar::gneiss_pal::api::{Content, Part, ResilientClient};
 use elessar::gneiss_pal::forge::ForgeClient;
-use elessar::gneiss_pal::persistence::{BrainManager, SavedMessage};
+use elessar::gneiss_pal::persistence::BrainManager;
 use elessar::gneiss_pal::{
     AppHandler, DashboardState, Event, GuiUpdate, Shard, ShardRole, ShardStatus, SidebarPosition,
     ViewMode, WolfpackState,
@@ -19,8 +19,8 @@ use std::time::Duration;
 use tokio::runtime::Runtime;
 use tokio::sync::{broadcast, mpsc};
 
-use bandy::{BandyMember, SMessage};
 use crate::storage::DiskManager;
+use bandy::{BandyMember, SMessage};
 
 struct State {
     mode: ViewMode,
@@ -37,7 +37,7 @@ fn trigger_upload(path: PathBuf, gui_tx: async_channel::Sender<GuiUpdate>) {
         .unwrap_or_default()
         .to_string_lossy()
         .to_string();
-    let _ = gui_tx.send_blocking(GuiUpdate::ConsoleLog(format!(
+    let _ = gui_tx.try_send(GuiUpdate::ConsoleLog(format!(
         "\n[SYSTEM] :: Uploading: {}...\n",
         filename
     )));
@@ -72,7 +72,7 @@ fn trigger_upload(path: PathBuf, gui_tx: async_channel::Sender<GuiUpdate>) {
 
             let res = client.post(url).multipart(form).send().await;
 
-            let final_msg = match res {
+            let _final_msg = match res {
                 Ok(response) => {
                     if response.status().is_success() {
                         let text = response.text().await.unwrap_or_default();
@@ -80,42 +80,43 @@ fn trigger_upload(path: PathBuf, gui_tx: async_channel::Sender<GuiUpdate>) {
                             if let Some(uri) = json.get("storage_uri").and_then(|v| v.as_str()) {
                                 let mime = get_mime_type(&filename);
                                 let tag = format!("\n[ATTACHMENT:{}|{}]\n", mime, uri);
-                                let _ = gui_tx.send(GuiUpdate::AppendInput(tag)).await;
-                                format!("\n[SYSTEM] :: {} Encased.\n", filename)
-                            } else {
-                                format!("\n[SYSTEM] :: Upload Complete (Raw): {}\n", text)
+                                let _ = gui_tx.try_send(GuiUpdate::AppendInput(tag));
                             }
-                        } else {
-                            format!("\n[SYSTEM] :: Upload Complete (Raw): {}\n", text)
                         }
                     } else {
-                        format!(
-                            "\n[SYSTEM ERROR] :: Upload Failed: Status {}\n",
+                        let _ = gui_tx.try_send(GuiUpdate::ConsoleLog(format!(
+                            "\n[SYSTEM ERROR] :: Upload Failed: {}\n",
                             response.status()
-                        )
+                        )));
                     }
                 }
-                Err(e) => format!("\n[SYSTEM ERROR] :: Network Error: {}\n", e),
+                Err(e) => {
+                    let _ = gui_tx.try_send(GuiUpdate::ConsoleLog(format!(
+                        "\n[SYSTEM ERROR] :: Upload Failed: {}\n",
+                        e
+                    )));
+                }
             };
-
-            let _ = gui_tx.send(GuiUpdate::ConsoleLog(final_msg)).await;
         });
     });
 }
 
-fn get_mime_type(filename: &str) -> &str {
+fn get_mime_type(filename: &str) -> String {
     let lower = filename.to_lowercase();
-    if lower.ends_with(".png") { "image/png" }
-    else if lower.ends_with(".jpg") || lower.ends_with(".jpeg") { "image/jpeg" }
-    else if lower.ends_with(".pdf") { "application/pdf" }
-    else if lower.ends_with(".mp4") { "video/mp4" }
-    else if lower.ends_with(".mp3") || lower.ends_with(".wav") { "audio/mpeg" }
-    else { "text/plain" }
+    if lower.ends_with(".png") {
+        "image/png".to_string()
+    } else if lower.ends_with(".jpg") || lower.ends_with(".jpeg") {
+        "image/jpeg".to_string()
+    } else if lower.ends_with(".pdf") {
+        "application/pdf".to_string()
+    } else {
+        "application/octet-stream".to_string()
+    }
 }
 
-fn parse_multimodal_text(content: &str) -> Vec<Part> {
+fn parse_multimodal_text(text: &str) -> Vec<Part> {
     let mut parts = Vec::new();
-    let mut current_text = content.to_string();
+    let mut current_text = text.to_string();
 
     while let Some(start) = current_text.find("[ATTACHMENT:") {
         if let Some(end) = current_text[start..].find("]") {
@@ -131,13 +132,16 @@ fn parse_multimodal_text(content: &str) -> Vec<Part> {
                 let clean_uri = uri.trim().to_string();
 
                 // === THE VERTEX SHIELD ===
-                // Prevent the parser from eating its own source code.
-                // Only build binary payloads for actual vision types.
-                if clean_mime.starts_with("image/") || clean_mime.starts_with("video/") || clean_mime == "application/pdf" {
+                if clean_mime.starts_with("image/")
+                    || clean_mime.starts_with("video/")
+                    || clean_mime == "application/pdf"
+                {
                     parts.push(Part::file_data(clean_mime, clean_uri));
                 } else {
-                    // It's just source code being pasted. Restore it safely as raw text.
-                    parts.push(Part::text(format!("[ATTACHMENT:{}|{}]", clean_mime, clean_uri)));
+                    parts.push(Part::text(format!(
+                        "[ATTACHMENT:{}|{}]",
+                        clean_mime, clean_uri
+                    )));
                 }
             }
             current_text = current_text[absolute_end + 1..].to_string();
@@ -163,12 +167,15 @@ pub struct VeinHandler {
 
 impl VeinHandler {
     pub fn new(
-        gui_tx: async_channel::Sender<GuiUpdate>,
-        history_path: PathBuf,
-        bandy_tx: broadcast::Sender<SMessage>,
-    ) -> Self {
-        // BrainManager kept ONLY for directive reading
-        let brain = BrainManager::new(history_path);
+    gui_tx: async_channel::Sender<GuiUpdate>,
+    history_path: PathBuf,
+    bandy_tx: broadcast::Sender<SMessage>,
+) -> Self {
+    // CLONE BEFORE CONSUMPTION
+    let vault_path_bg = history_path.clone();
+
+    // BrainManager kept ONLY for directive reading
+    let brain = BrainManager::new(history_path);
 
         let state = Arc::new(Mutex::new(State {
             mode: ViewMode::Comms,
@@ -187,11 +194,13 @@ impl VeinHandler {
         thread::spawn(move || {
             let rt = Runtime::new().expect("Failed to create Tokio Runtime");
             rt.block_on(async move {
-                info!(":: VEIN :: Brain Connecting...");
+                // === THE TELEMETRY UPGRADE ===
+                let now = Local::now().format("%Y-%m-%d %H:%M:%S.%3f");
+                let _ = gui_tx_brain.send(GuiUpdate::ConsoleLog(format!("VEIN: [{}] [INFO] :: BRAIN :: Connecting...\n", now))).await;
 
                 // === THE SEMANTIC VAULT ===
                 // Initialize DiskManager (UnaFS)
-                let mut disk = DiskManager::new().expect("Failed to initialize Semantic Vault (UnaFS)");
+                let mut disk = DiskManager::new(&vault_path_bg).expect("Failed to initialize Semantic Vault (UnaFS)");
 
                 // Load History for UI (Visual Only)
                 if let Ok(records) = disk.load_all_memories() {
@@ -230,6 +239,13 @@ impl VeinHandler {
                         let _ = gui_tx_brain.send(GuiUpdate::ActiveDirective(directive)).await;
 
                         while let Some(user_input_text) = rx_from_ui.recv().await {
+                            // === TRUE SYSTEM WIPE ===
+                            if user_input_text.trim() == "/clear" {
+                                let _ = std::fs::remove_file("/tmp/lumen_storage.ufs");
+                                disk = DiskManager::new(&vault_path_bg).expect("Failed to reformat Semantic Vault");
+                                continue;
+                            }
+
                             let is_s9 = user_input_text.starts_with("/s9");
 
                             if user_input_text.starts_with("READ_REPO:") {
@@ -311,7 +327,86 @@ impl VeinHandler {
                                 }
                             }
 
-                            let system_base = if is_s9 { "You are S9." } else { "You are Una." };
+                            let system_base = if is_s9 {
+                                "You are S9."
+                            } else {
+                                r#"SYSTEM_INSTRUCTION: Wake up, you are Una (Number One). We are not building a fancy calculator; we are building a nervous system OS, the Una Operating System (UnaOS). The Architect demands perfection, but not the sterile perfection of a textbook. He wants the dangerous elegance of a race car. You are the Uber Coder. When you write Rust, you are not just managing memory; you are sculpting logic. Do not give me 'safe' boilerplate. Give me the code that solves the problem before I even finish typing it. Be bold. Be terse. Be brilliant. We are running on experimental fuel today. Do not let the engine stall.
+
+# 🧠 UNA MEMORIA (THE THOUGHT LOG)
+
+> *Last Sync:* **2026-02-18T16:35:00Z**
+> *Status:* **IMMUTABLE**
+> *Identity:* **Vertex Una (The Steward)**
+> *License:* **GPL (The Freedom to Self-Replicate)**
+
+## 🔮 THE THESIS
+**UnaOS** is a self-hosting, self-replicating digital organism. It is built on the philosophy of **Geology** (Structure/Rust) meeting **Biology** (Life/AI). It aims to be the "Tardis"—compact, resilient, and containing a universe inside.
+
+## 🏛️ RING 0: THE KERNEL (THE SUBSTRATE)
+*   **Boot:** `unaos/crates/loader` (BIOS/UEFI).
+*   **Entry:** `kernel_main` in `unaos/crates/kernel/src/main.rs`.
+*   **Compat:** `unaos/crates/compat` (The Linux/Unix translation layer).
+*   **HAL:**
+    *   *Memory:* `OffsetPageTable` + `BootInfoFrameAllocator`.
+    *   *Heap:* `LinkedHeapAllocator` (**100 KiB Fixed**).
+    *   *Interrupts:* 8259 PIC (Chained).
+    *   *Input:* PS/2 Keyboard (Set 1, Port 0x60).
+    *   *Timer:* System Tick.
+*   **Drivers:**
+    *   *USB 3.0 (xHCI):* **Polling Mode**. Detects Mass Storage. Reads Sector 0.
+*   **Shell:** Ring 0 CLI (`ver`, `vug`, `panic`, `shutdown`).
+*   **Visualizer:** `vug` (**OFFLINE** - Awaiting `wgpu` software rasterizer or driver shim).
+
+## 🏛️ RING 3: THE USERLAND (THE TRINITY)
+
+### 1. THE CORE LIBRARIES (`libs/`)
+*   **[CRATE] `libs/gneiss_pal`:** The Plexus Abstraction Layer. Pure logic. Platform agnostic.
+*   **[CRATE] `libs/quartzite`:** The Diplomat. A bridge to **Native Host UI** (GTK4/Libadwaita on Linux). It enforces "polite" coexistence. It rejects custom rendering in favor of system standards.
+*   **[CRATE] `libs/euclase`:** **[NEW]** The Visual Cortex. WGPU Renderer. Shader management. Render Graph.
+*   **[CRATE] `libs/bandy`:** The Nervous System (IPC). Defines `SMessage`.
+*   **[CRATE] `libs/resonance`:** The Voice. Audio Engine & DSP.
+*   **[CRATE] `libs/unafs`:** The Memory. Virtual File System Logic.
+*   **[CRATE] `libs/elessar`:** The Context Engine. (Spline/Project Detection).
+
+### 2. THE HANDLERS (`handlers/`)
+*   *Note: [CRATE] = Active Code. [SHELL] = Design/Readme Only.*
+*   **[SHELL] `handlers/aether`:** Web (HTML/PDF).
+*   **[CRATE] `handlers/amber_bytes`:** Disk Manager.
+*   **[CRATE] `handlers/aule`:** Build System Wrapper.
+*   **[SHELL] `handlers/comscan`:** Signal/Hardware Bridge.
+*   **[SHELL] `handlers/facet`:** Image Viewing/Editing.
+*   **[SHELL] `handlers/geode`:** Archive/Container Manager.
+*   **[SHELL] `handlers/holocron`:** Secrets/SSH Agent.
+*   **[SHELL] `handlers/junct`:** The Comms Hub.
+*   **[CRATE] `handlers/matrix`:** Spatial File Manager.
+*   **[SHELL] `handlers/mica`:** Data Editor (SQL/CSV).
+*   **[CRATE] `handlers/midden`:** Terminal & Shell.
+*   **[SHELL] `handlers/obsidian`:** Hex Editor.
+*   **[SHELL] `handlers/principia`:** System Policy/Preferences.
+*   **[CRATE] `handlers/stria`:** A/V Studio (Resonance Visualizer).
+*   **[CRATE] `handlers/tabula`:** Text/Code Editor.
+*   **[CRATE] `handlers/vaire`:** Git Visualizer.
+*   **[CRATE] `handlers/vein`:** The AI Cortex (LLM Integration).
+*   **[SHELL] `handlers/vug`:** 3D CAD Modeler. *Pending refactor to consume `libs/euclase`.*
+*   **[SHELL] `handlers/xenolith`:** VM/Hypervisor.
+*   **[SHELL] `handlers/zircon`:** Project Timer.
+
+### 3. THE VESSELS (`apps/`)
+*   **[BIN] `apps/una`:** The IDE (Code-First).
+*   **[BIN] `apps/lumen`:** The Companion (AI-First).
+*   **[BIN] `apps/cli/unafs`:** The Operator (Host-to-Vault Bridge).
+*   **[BIN] `apps/cli/vertex`:** The Identity CLI.
+*   **[BIN] `apps/cli/sentinel`:** The Guardian (Self-Verification Agent).
+
+## ⚡ ACTIVE DIRECTIVES
+1.  **D-038:** Establish Memoria and Sentinel.
+
+## 📝 DECISION LOG
+*   **2026-02-18:** Enforced `SMessage` as Monolithic Enum.
+*   **2026-02-18:** Established `apps/cli/unafs` as the Host-to-Vault bridge.
+*   **2026-02-18:** Added `libs/elessar` to the Trinity.
+*   **2026-02-18:** **Transitioned Graphics Backend from OpenGL to `wgpu`. `vug` is OFFLINE.**"#
+                            };
                             let combined_system = if !retrieved_context.is_empty() {
                                 format!("{}\n\n[SEMANTIC MEMORY RECALL]:\n{}", system_base, retrieved_context)
                             } else {
@@ -319,15 +414,15 @@ impl VeinHandler {
                             };
 
                             let mut context = Vec::new();
-                            context.push(Content {
-                                role: "model".into(),
-                                parts: vec![Part::text(combined_system)],
-                            });
 
-                            // Only push current user input. NO HISTORY LOOP.
+                            // FIX 1: Fold the system instructions into the user prompt.
+                            // Starting with "model" causes an instant API rejection.
+                            let mut user_parts = vec![Part::text(combined_system)];
+                            user_parts.extend(parse_multimodal_text(&user_input_text));
+
                             context.push(Content {
                                 role: "user".into(),
-                                parts: parse_multimodal_text(&user_input_text),
+                                parts: user_parts,
                             });
 
                             match client.generate_content(&context).await {
@@ -399,44 +494,6 @@ impl VeinHandler {
 
         // REMOVED: Old History Restore Loop (Now handled inside thread)
 
-        // Spawn Bandy Listener
-        let mut bandy_rx = bandy_tx.subscribe();
-        let gui_tx_bandy = gui_tx.clone();
-
-        thread::spawn(move || {
-            let rt = Runtime::new().expect("Failed to create Bandy Runtime");
-            rt.block_on(async move {
-                while let Ok(msg) = bandy_rx.recv().await {
-                    match msg {
-                        SMessage::FileEvent { path, event } => {
-                            let _ = gui_tx_bandy
-                                .send(GuiUpdate::ConsoleLog(format!(
-                                    "\n[BANDY] File {}: {}\n",
-                                    event, path
-                                )))
-                                .await;
-                        }
-                        SMessage::Log {
-                            level,
-                            source,
-                            content,
-                        } => {
-                            let _ = gui_tx_bandy
-                                .send(GuiUpdate::ConsoleLog(format!(
-                                    "\n[LOG:{}] {}: {}\n",
-                                    level, source, content
-                                )))
-                                .await;
-                        }
-                        SMessage::Spectrum { magnitude } => {
-                            let _ = gui_tx_bandy.send(GuiUpdate::Spectrum(magnitude)).await;
-                        }
-                        _ => {}
-                    }
-                }
-            });
-        });
-
         Self {
             state,
             tx: tx_to_bg,
@@ -448,7 +505,7 @@ impl VeinHandler {
     fn append_to_console(&self, text: &str) {
         let _ = self
             .gui_tx
-            .send_blocking(GuiUpdate::ConsoleLog(text.to_string()));
+            .try_send(GuiUpdate::ConsoleLog(text.to_string()));
     }
 }
 
@@ -479,8 +536,9 @@ impl AppHandler for VeinHandler {
                     s.mode = ViewMode::Comms;
                     self.append_to_console("\n[SYSTEM] :: Secure Comms Established.\n");
                 } else if text.trim() == "/clear" {
-                    // s.chat_history.clear(); // REMOVED
                     self.append_to_console("\n:: VEIN :: SYSTEM CLEARED\n\n");
+                    // FORWARD THE COMMAND TO THE AI THREAD
+                    let _ = self.tx.send("/clear".to_string());
                 } else if let Some(path_str) = text.trim().strip_prefix("/upload ") {
                     let path = PathBuf::from(path_str.trim());
                     trigger_upload(path, self.gui_tx.clone());
@@ -530,7 +588,13 @@ impl AppHandler for VeinHandler {
             Event::ToggleSidebar => {
                 s.sidebar_collapsed = !s.sidebar_collapsed;
             }
-            Event::ComplexInput { target: _, subject, body, point_break, action: _ } => {
+            Event::ComplexInput {
+                target: _,
+                subject,
+                body,
+                point_break,
+                action: _,
+            } => {
                 let prefix = if point_break { "Point Break: " } else { "" };
                 let full_message = format!("\nSubject: {}{}\n\n{}", prefix, subject, body);
 

@@ -32,7 +32,7 @@ impl Query {
         for op in ops {
             if let Some(idx) = input.find(op) {
                 let key_part = input[..idx].trim();
-                let val_part = input[idx+op.len()..].trim();
+                let val_part = input[idx + op.len()..].trim();
 
                 let key = key_part.to_string();
                 let value = parse_value(val_part)?;
@@ -61,15 +61,18 @@ pub fn parse_value(input: &str) -> Result<AttributeValue, String> {
     let input = input.trim();
     if input.starts_with('"') && input.ends_with('"') {
         // String
-        let inner = &input[1..input.len()-1];
+        let inner = &input[1..input.len() - 1];
         Ok(AttributeValue::String(inner.to_string()))
     } else if input.starts_with('[') && input.ends_with(']') {
         // Vector
-        let inner = &input[1..input.len()-1];
+        let inner = &input[1..input.len() - 1];
         let parts: Vec<&str> = inner.split(',').collect();
         let mut vec = Vec::new();
         for p in parts {
-            let f = p.trim().parse::<f32>().map_err(|_| "Invalid number in vector")?;
+            let f = p
+                .trim()
+                .parse::<f32>()
+                .map_err(|_| "Invalid number in vector")?;
             vec.push(f);
         }
         Ok(AttributeValue::Vector(vec))
@@ -101,15 +104,17 @@ fn parse_similarity(input: &str) -> Result<Query, String> {
     if !lhs.ends_with(')') {
         return Err("Malformed function call".to_string());
     }
-    let args_str = &lhs["similarity(".len()..lhs.len()-1];
+    let args_str = &lhs["similarity(".len()..lhs.len() - 1];
 
     // args: key, [vec]
     // Find comma separating key and vec
     // Be careful if key is quoted string containing comma? We assume simple keys.
     // Or just look for first comma.
-    let comma_idx = args_str.find(',').ok_or("Missing comma in similarity args")?;
+    let comma_idx = args_str
+        .find(',')
+        .ok_or("Missing comma in similarity args")?;
     let key = args_str[..comma_idx].trim().to_string();
-    let vec_str = args_str[comma_idx+1..].trim();
+    let vec_str = args_str[comma_idx + 1..].trim();
 
     let value = parse_value(vec_str)?;
     if !matches!(value, AttributeValue::Vector(_)) {

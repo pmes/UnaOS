@@ -7,7 +7,7 @@ pub use backend::Backend;
 pub use gneiss_pal::shard::*;
 pub use gneiss_pal::types::*;
 
-use gtk4::prelude::*; // Required for Display/IconTheme traits
+// use gtk4::prelude::*; // Required for Display/IconTheme traits
 
 const EMBEDDED_RESOURCE: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/quartzite.gresource"));
 
@@ -33,25 +33,33 @@ pub fn init_with_path(path: &std::path::Path) {
     println!(":: QUARTZITE :: Dumping GResource Inventory...");
     let target_path = "/org/unaos/lumen/icons/scalable/actions";
 
-    match gtk4::gio::resources_enumerate_children(
-        target_path,
-        gtk4::gio::ResourceLookupFlags::NONE
-    ) {
+    match gtk4::gio::resources_enumerate_children(target_path, gtk4::gio::ResourceLookupFlags::NONE)
+    {
         Ok(children) => {
             if children.is_empty() {
-                println!(":: QUARTZITE :: WARNING: Folder exists but is EMPTY: {}", target_path);
+                println!(
+                    ":: QUARTZITE :: WARNING: Folder exists but is EMPTY: {}",
+                    target_path
+                );
             }
             for name in children {
                 println!("   [FOUND] {}/{}", target_path, name);
             }
         }
         Err(e) => {
-            println!(":: QUARTZITE :: CRITICAL FAILURE: Could not read path '{}'", target_path);
+            println!(
+                ":: QUARTZITE :: CRITICAL FAILURE: Could not read path '{}'",
+                target_path
+            );
             println!(":: QUARTZITE :: Error: {}", e);
             println!(":: QUARTZITE :: Attempting root dump...");
 
-            if let Ok(root) = gtk4::gio::resources_enumerate_children("/", gtk4::gio::ResourceLookupFlags::NONE) {
-                for r in root { println!("   [ROOT] /{}", r); }
+            if let Ok(root) =
+                gtk4::gio::resources_enumerate_children("/", gtk4::gio::ResourceLookupFlags::NONE)
+            {
+                for r in root {
+                    println!("   [ROOT] /{}", r);
+                }
             }
         }
     }

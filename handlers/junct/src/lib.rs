@@ -1,6 +1,9 @@
-use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-use resonance::{dsp::{Complex, FftContext}, BLOCK_SIZE};
 use bandy::SMessage;
+use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+use resonance::{
+    BLOCK_SIZE,
+    dsp::{Complex, FftContext},
+};
 use tokio::sync::broadcast;
 
 pub struct JunctHandler {
@@ -13,7 +16,9 @@ impl JunctHandler {
         // If no device, we warn but don't crash the whole app?
         // Logic says "Junct ... aggregate the host OS microphone".
         // If fail, we return Error.
-        let device = host.default_input_device().ok_or_else(|| anyhow::anyhow!("No input device"))?;
+        let device = host
+            .default_input_device()
+            .ok_or_else(|| anyhow::anyhow!("No input device"))?;
         let config = device.default_input_config()?;
         let channels = config.channels() as usize;
         let config: cpal::StreamConfig = config.into();
@@ -31,14 +36,15 @@ impl JunctHandler {
                     let sample = if !frame.is_empty() { frame[0] } else { 0.0 };
 
                     if buf_idx < BLOCK_SIZE {
-                         buffer[buf_idx] = Complex::new(sample, 0.0);
-                         buf_idx += 1;
+                        buffer[buf_idx] = Complex::new(sample, 0.0);
+                        buf_idx += 1;
                     }
 
                     if buf_idx >= BLOCK_SIZE {
                         fft.process(&mut buffer);
 
-                        let magnitude: Vec<f32> = buffer.iter()
+                        let magnitude: Vec<f32> = buffer
+                            .iter()
                             .take(BLOCK_SIZE / 2)
                             .map(|c| (c.re * c.re + c.im * c.im).sqrt())
                             .collect();
@@ -49,7 +55,7 @@ impl JunctHandler {
                 }
             },
             err_fn,
-            None
+            None,
         )?;
 
         stream.play()?;

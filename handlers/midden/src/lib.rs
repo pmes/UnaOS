@@ -1,7 +1,7 @@
+use anyhow::Result;
+use bandy::{BandyMember, SMessage};
 use gtk4::prelude::*;
 use gtk4::{ScrolledWindow, TextBuffer, TextView, Widget};
-use anyhow::Result;
-use bandy::{SMessage, BandyMember};
 use unafs::FileSystem;
 
 pub fn create_view() -> (Widget, TextBuffer) {
@@ -48,15 +48,23 @@ impl Midden {
             "ls" => self.list_files(),
             "pwd" => self.print_cwd(),
             "touch" => self.touch_file(parts.get(1)),
-            "help" => Ok(SMessage::TerminalOutput("Available: ls, pwd, touch, help".to_string())),
-            _ => Ok(SMessage::TerminalOutput(format!("Unknown command: {}", parts[0]))),
+            "help" => Ok(SMessage::TerminalOutput(
+                "Available: ls, pwd, touch, help".to_string(),
+            )),
+            _ => Ok(SMessage::TerminalOutput(format!(
+                "Unknown command: {}",
+                parts[0]
+            ))),
         }
     }
 
     fn list_files(&self) -> Result<SMessage> {
         // TODO: Hook into libs/unafs here
         // For now, we simulate the response
-        Ok(SMessage::TerminalOutput(format!("Listing contents of {}... [STUB]", self.current_path)))
+        Ok(SMessage::TerminalOutput(format!(
+            "Listing contents of {}... [STUB]",
+            self.current_path
+        )))
     }
 
     fn print_cwd(&self) -> Result<SMessage> {
@@ -65,8 +73,13 @@ impl Midden {
 
     fn touch_file(&self, filename: Option<&&str>) -> Result<SMessage> {
         match filename {
-            Some(name) => Ok(SMessage::FileSystemEvent(format!("Creating file: {}", name))),
-            None => Ok(SMessage::TerminalError("Usage: touch <filename>".to_string())),
+            Some(name) => Ok(SMessage::FileSystemEvent(format!(
+                "Creating file: {}",
+                name
+            ))),
+            None => Ok(SMessage::TerminalError(
+                "Usage: touch <filename>".to_string(),
+            )),
         }
     }
 }

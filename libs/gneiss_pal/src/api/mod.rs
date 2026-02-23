@@ -1,8 +1,8 @@
 use log::{error, info, warn};
 use reqwest::{Client, ClientBuilder, StatusCode};
 use serde::{Deserialize, Serialize};
-use std::time::Duration;
 use std::process::Command;
+use std::time::Duration;
 
 #[derive(Serialize)]
 struct GenerateContentRequest {
@@ -111,7 +111,7 @@ impl ResilientClient {
         let token = Self::fetch_token()?;
 
         // 2. Hardcode to Experimental as requested
-        let model_name = "gemini-3-pro-preview";
+        let model_name = "gemini-3.1-pro-preview";
 
         // 3. Pure Vertex URL (No API key appended)
         let model_url = format!(
@@ -126,7 +126,11 @@ impl ResilientClient {
 
         info!("System Ignited. Target: {} (Vertex API)", model_name);
 
-        Ok(Self { client, model_url, token })
+        Ok(Self {
+            client,
+            model_url,
+            token,
+        })
     }
 
     fn fetch_token() -> Result<String, String> {
@@ -136,7 +140,10 @@ impl ResilientClient {
             .map_err(|e| format!("Failed to execute gcloud for token: {}", e))?;
 
         if !output.status.success() {
-            return Err("Failed to retrieve gcloud access token. Ensure gcloud ADC is configured.".to_string());
+            return Err(
+                "Failed to retrieve gcloud access token. Ensure gcloud ADC is configured."
+                    .to_string(),
+            );
         }
 
         String::from_utf8(output.stdout)
@@ -155,12 +162,13 @@ impl ResilientClient {
         }
     }
 
-    pub async fn generate_content(&mut self, history: &[Content]) -> Result<(String, Option<UsageMetadata>), String> {
+    pub async fn generate_content(
+        &mut self,
+        history: &[Content],
+    ) -> Result<(String, Option<UsageMetadata>), String> {
         let request_body = GenerateContentRequest {
             contents: history.to_vec(),
-            generation_config: GenerationConfig {
-                temperature: 0.4,
-            },
+            generation_config: GenerationConfig { temperature: 0.4 },
         };
 
         let mut attempts = 0;
@@ -224,7 +232,7 @@ impl ResilientClient {
     }
 
     pub async fn list_vertex_models(&self) -> Result<String, String> {
-        Ok("Model listing bypass engaged. Hardcoded to gemini-3-pro-preview.".to_string())
+        Ok("Model listing bypass engaged. Hardcoded to gemini-3.1-pro-preview.".to_string())
     }
 
     pub async fn embed_content(&mut self, text: &str) -> Result<Vec<f32>, String> {

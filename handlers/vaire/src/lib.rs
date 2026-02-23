@@ -1,7 +1,7 @@
-use gtk4::prelude::*;
-use gtk4::{Align, Box, Label, Orientation, Widget};
 use anyhow::{Context, Result};
 use git2::{Repository, StatusOptions};
+use gtk4::prelude::*;
+use gtk4::{Align, Box, Label, Orientation, Widget};
 
 pub fn create_view() -> Widget {
     let vaire_box = Box::new(Orientation::Vertical, 10);
@@ -12,7 +12,10 @@ pub fn create_view() -> Widget {
     // Let's try to look and show it!
 
     let label_text = match Vaire::look() {
-        Ok(status) => format!("Branch: {}\nCommit: {}\nDirty: {}", status.branch, status.commit, status.is_dirty),
+        Ok(status) => format!(
+            "Branch: {}\nCommit: {}\nDirty: {}",
+            status.branch, status.commit, status.is_dirty
+        ),
         Err(_) => "No Git Repository Detected".to_string(),
     };
 

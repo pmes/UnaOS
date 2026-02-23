@@ -1,5 +1,5 @@
+use crate::storage::{BLOCK_SIZE, BlockDevice, Error as StorageError};
 use serde::{Deserialize, Serialize};
-use crate::storage::{BlockDevice, BLOCK_SIZE, Error as StorageError};
 use thiserror::Error;
 
 /// The number of blocks reserved for the journal.
@@ -74,7 +74,11 @@ impl Journal {
     }
 
     /// Append an entry to the journal.
-    pub fn append<D: BlockDevice>(&mut self, device: &mut D, op: JournalOp) -> Result<(), JournalError> {
+    pub fn append<D: BlockDevice>(
+        &mut self,
+        device: &mut D,
+        op: JournalOp,
+    ) -> Result<(), JournalError> {
         self.log(device, op)
     }
 
@@ -100,69 +104,75 @@ impl Journal {
         let mut open_transaction_count = 0;
 
         loop {
-             if offset >= JOURNAL_BLOCKS * BLOCK_SIZE {
-                 break;
-             }
+            if offset >= JOURNAL_BLOCKS * BLOCK_SIZE {
+                break;
+            }
 
-             let block_idx = offset / BLOCK_SIZE;
-             let offset_in_block = (offset % BLOCK_SIZE) as usize;
-             let physical_block = JOURNAL_START + block_idx;
+            let block_idx = offset / BLOCK_SIZE;
+            let offset_in_block = (offset % BLOCK_SIZE) as usize;
+            let physical_block = JOURNAL_START + block_idx;
 
-             // Check if we can read length (8 bytes)
-             if offset_in_block + 8 > BLOCK_SIZE as usize {
-                 offset = (block_idx + 1) * BLOCK_SIZE;
-                 continue;
-             }
+            // Check if we can read length (8 bytes)
+            if offset_in_block + 8 > BLOCK_SIZE as usize {
+                offset = (block_idx + 1) * BLOCK_SIZE;
+                continue;
+            }
 
-             let mut block = vec![0u8; BLOCK_SIZE as usize];
-             device.read_block(physical_block, &mut block)?;
+            let mut block = vec![0u8; BLOCK_SIZE as usize];
+            device.read_block(physical_block, &mut block)?;
 
-             let len_bytes: [u8; 8] = block[offset_in_block..offset_in_block+8].try_into().unwrap();
-             let len = u64::from_le_bytes(len_bytes);
+            let len_bytes: [u8; 8] = block[offset_in_block..offset_in_block + 8]
+                .try_into()
+                .unwrap();
+            let len = u64::from_le_bytes(len_bytes);
 
-             if len == 0 {
-                 break;
-             }
+            if len == 0 {
+                break;
+            }
 
-             if offset_in_block + 8 + (len as usize) > BLOCK_SIZE as usize {
-                 break;
-             }
+            if offset_in_block + 8 + (len as usize) > BLOCK_SIZE as usize {
+                break;
+            }
 
-             let data = &block[offset_in_block+8 .. offset_in_block+8+(len as usize)];
-             if let Ok(op) = bincode::deserialize::<JournalOp>(data) {
-                 match op {
-                     JournalOp::BeginOp { op_id, .. } => {
-                         open_ops.insert(op_id);
-                     }
-                     JournalOp::EndOp { op_id } => {
-                         open_ops.remove(&op_id);
-                     }
-                     JournalOp::BeginCreate { .. } | JournalOp::BeginWrite { .. } => {
-                         open_transaction_count += 1;
-                     }
-                     JournalOp::EndCreate { .. } | JournalOp::EndWrite { .. } => {
-                         if open_transaction_count > 0 {
-                             open_transaction_count -= 1;
-                         }
-                     }
-                 }
-             } else {
-                 break;
-             }
+            let data = &block[offset_in_block + 8..offset_in_block + 8 + (len as usize)];
+            if let Ok(op) = bincode::deserialize::<JournalOp>(data) {
+                match op {
+                    JournalOp::BeginOp { op_id, .. } => {
+                        open_ops.insert(op_id);
+                    }
+                    JournalOp::EndOp { op_id } => {
+                        open_ops.remove(&op_id);
+                    }
+                    JournalOp::BeginCreate { .. } | JournalOp::BeginWrite { .. } => {
+                        open_transaction_count += 1;
+                    }
+                    JournalOp::EndCreate { .. } | JournalOp::EndWrite { .. } => {
+                        if open_transaction_count > 0 {
+                            open_transaction_count -= 1;
+                        }
+                    }
+                }
+            } else {
+                break;
+            }
 
-             offset += 8 + len;
+            offset += 8 + len;
         }
 
         Ok(!open_ops.is_empty() || open_transaction_count > 0)
     }
 
     // Helper to write with length prefix (Refined append logic)
-    pub fn log<D: BlockDevice>(&mut self, device: &mut D, op: JournalOp) -> Result<(), JournalError> {
+    pub fn log<D: BlockDevice>(
+        &mut self,
+        device: &mut D,
+        op: JournalOp,
+    ) -> Result<(), JournalError> {
         let bytes = bincode::serialize(&op)?;
         let len = bytes.len() as u64;
         let total_len = 8 + len; // 8 bytes for length prefix
 
-         // Check capacity
+        // Check capacity
         if self.write_offset + total_len > (JOURNAL_BLOCKS * BLOCK_SIZE) {
             self.reset(device)?;
         }
@@ -174,9 +184,9 @@ impl Journal {
 
         // Check if it fits in current block
         if offset_in_block + (total_len as usize) > BLOCK_SIZE as usize {
-             // Move to next block start
-             self.write_offset = (block_idx + 1) * BLOCK_SIZE;
-             return self.log(device, op);
+            // Move to next block start
+            self.write_offset = (block_idx + 1) * BLOCK_SIZE;
+            return self.log(device, op);
         }
 
         let mut block = vec![0u8; BLOCK_SIZE as usize];
@@ -184,10 +194,10 @@ impl Journal {
 
         // Write Length
         let len_bytes = len.to_le_bytes();
-        block[offset_in_block..offset_in_block+8].copy_from_slice(&len_bytes);
+        block[offset_in_block..offset_in_block + 8].copy_from_slice(&len_bytes);
 
         // Write Data
-        block[offset_in_block+8..offset_in_block+8+bytes.len()].copy_from_slice(&bytes);
+        block[offset_in_block + 8..offset_in_block + 8 + bytes.len()].copy_from_slice(&bytes);
 
         device.write_block(physical_block, &block)?;
 

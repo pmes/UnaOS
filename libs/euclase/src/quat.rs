@@ -1,6 +1,6 @@
+use crate::vec3::Vec3;
 use bytemuck::{Pod, Zeroable};
 use core::ops::{Add, Mul, Neg, Sub};
-use crate::vec3::Vec3;
 
 /// A quaternion for representing rotation.
 ///
@@ -20,7 +20,12 @@ impl Quat {
     /// Identity quaternion (no rotation).
     #[inline]
     pub const fn identity() -> Self {
-        Self { x: 0.0, y: 0.0, z: 0.0, w: 1.0 }
+        Self {
+            x: 0.0,
+            y: 0.0,
+            z: 0.0,
+            w: 1.0,
+        }
     }
 
     /// Creates a quaternion from an axis and an angle (in radians).
@@ -82,8 +87,12 @@ impl Quat {
         }
 
         // Clamp dot to avoid NaN with acos
-        if dot > 1.0 { dot = 1.0; }
-        if dot < -1.0 { dot = -1.0; }
+        if dot > 1.0 {
+            dot = 1.0;
+        }
+        if dot < -1.0 {
+            dot = -1.0;
+        }
 
         let theta_0 = libm::acosf(dot);
         let sin_theta_0 = libm::sinf(theta_0);

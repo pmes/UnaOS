@@ -1,6 +1,6 @@
+use crate::vec3::Vec3;
 use bytemuck::{Pod, Zeroable};
 use core::ops::{Add, AddAssign, Div, DivAssign, Mul, MulAssign, Neg, Sub, SubAssign};
-use crate::vec3::Vec3;
 
 /// A 4-dimensional vector.
 ///
@@ -26,7 +26,12 @@ impl Vec4 {
     /// Creates a `Vec4` from a `Vec3` and a `w` component.
     #[inline]
     pub const fn from_vec3(v: Vec3, w: f32) -> Self {
-        Self { x: v.x, y: v.y, z: v.z, w }
+        Self {
+            x: v.x,
+            y: v.y,
+            z: v.z,
+            w,
+        }
     }
 
     /// Returns the XYZ components as a `Vec3`.
@@ -81,11 +86,7 @@ impl Vec4 {
     #[inline]
     pub fn normalize(self) -> Self {
         let m = self.magnitude();
-        if m > 0.0 {
-            self / m
-        } else {
-            Self::zero()
-        }
+        if m > 0.0 { self / m } else { Self::zero() }
     }
 
     /// Linearly interpolates between this vector and another.
@@ -106,7 +107,12 @@ impl Add for Vec4 {
     type Output = Self;
     #[inline]
     fn add(self, rhs: Self) -> Self {
-        Self::new(self.x + rhs.x, self.y + rhs.y, self.z + rhs.z, self.w + rhs.w)
+        Self::new(
+            self.x + rhs.x,
+            self.y + rhs.y,
+            self.z + rhs.z,
+            self.w + rhs.w,
+        )
     }
 }
 
@@ -121,7 +127,12 @@ impl Sub for Vec4 {
     type Output = Self;
     #[inline]
     fn sub(self, rhs: Self) -> Self {
-        Self::new(self.x - rhs.x, self.y - rhs.y, self.z - rhs.z, self.w - rhs.w)
+        Self::new(
+            self.x - rhs.x,
+            self.y - rhs.y,
+            self.z - rhs.z,
+            self.w - rhs.w,
+        )
     }
 }
 
@@ -160,7 +171,12 @@ impl Mul<Vec4> for Vec4 {
     type Output = Self;
     #[inline]
     fn mul(self, rhs: Self) -> Self {
-        Self::new(self.x * rhs.x, self.y * rhs.y, self.z * rhs.z, self.w * rhs.w)
+        Self::new(
+            self.x * rhs.x,
+            self.y * rhs.y,
+            self.z * rhs.z,
+            self.w * rhs.w,
+        )
     }
 }
 
@@ -190,7 +206,12 @@ impl Div<Vec4> for Vec4 {
     type Output = Self;
     #[inline]
     fn div(self, rhs: Self) -> Self {
-        Self::new(self.x / rhs.x, self.y / rhs.y, self.z / rhs.z, self.w / rhs.w)
+        Self::new(
+            self.x / rhs.x,
+            self.y / rhs.y,
+            self.z / rhs.z,
+            self.w / rhs.w,
+        )
     }
 }
 

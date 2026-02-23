@@ -1,5 +1,33 @@
+pub mod telemetry;
 use serde::{Deserialize, Serialize};
+use tokio::sync::broadcast;
 
+pub struct Synapse {
+    tx: broadcast::Sender<SMessage>,
+}
+
+impl Synapse {
+    pub fn new() -> Self {
+        let (tx, _) = broadcast::channel(100);
+        Self { tx }
+    }
+
+    /// Fire an action potential down the spine.
+    pub fn fire(&self, msg: SMessage) {
+        // We ignore SendError. If there are no receivers, the message dissipates.
+        let _ = self.tx.send(msg);
+    }
+
+    /// Hand a cloned transmitter to a Shard (like Vein).
+    pub fn tx(&self) -> broadcast::Sender<SMessage> {
+        self.tx.clone()
+    }
+
+    /// Subscribe to the nervous system.
+    pub fn rx(&self) -> broadcast::Receiver<SMessage> {
+        self.tx.subscribe()
+    }
+}
 /// SMessage (The Shard Message).
 /// The atomic unit of truth in UnaOS.
 /// This Enum defines the limits of what can be said between processes.
@@ -19,20 +47,24 @@ pub enum SMessage {
     Log {
         level: String,
         source: String,
-        content: String
+        content: String,
     },
+
+    // --- EUCLASE (The Visual Cortex) ---
+    /// Resize the WGPU surface.
+    EuclaseResize(u32, u32),
+    /// Trigger a render pass.
+    VugPulse,
 
     // --- RESONANCE (The Voice) ---
     /// Raw audio data passed from the DSP to the AI or Network.
     AudioChunk {
         source_id: String,
         samples: Vec<f32>,
-        sample_rate: u32
+        sample_rate: u32,
     },
     /// Frequency domain data for visualization.
-    Spectrum {
-        magnitude: Vec<f32>
-    },
+    Spectrum { magnitude: Vec<f32> },
 
     // --- VEIN / LUMEN (The Mind) ---
     /// A prompt typed or spoken by the user.
@@ -40,16 +72,13 @@ pub enum SMessage {
     /// A token stream from the LLM.
     AiToken(String),
     /// A request for the AI to analyze a specific context.
-    AnalyzeContext {
-        id: String,
-        content: String,
-    },
+    AnalyzeContext { id: String, content: String },
 
     // --- UNAFS / MATRIX (The Memory) ---
     /// Notification that a file has changed.
     FileEvent {
         path: String,
-        event: String // e.g., "Created", "Modified"
+        event: String, // e.g., "Created", "Modified"
     },
 
     // --- MIDDEN (The Terminal) ---

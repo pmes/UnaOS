@@ -1,8 +1,8 @@
-use bytemuck::{Pod, Zeroable};
-use core::ops::Mul;
+use crate::quat::Quat;
 use crate::vec3::Vec3;
 use crate::vec4::Vec4;
-use crate::quat::Quat;
+use bytemuck::{Pod, Zeroable};
+use core::ops::Mul;
 
 /// A 4x4 matrix, stored in column-major order.
 ///
@@ -39,6 +39,14 @@ impl Mat4 {
                 Vec4::new(0.0, 0.0, 0.0, 0.0),
                 Vec4::new(0.0, 0.0, 0.0, 0.0),
             ],
+        }
+    }
+
+    /// Creates a matrix from columns.
+    #[inline]
+    pub const fn from_cols(col0: Vec4, col1: Vec4, col2: Vec4, col3: Vec4) -> Self {
+        Self {
+            cols: [col0, col1, col2, col3],
         }
     }
 
@@ -112,13 +120,30 @@ impl Mat4 {
         }
     }
 
+    /// Creates a perspective projection matrix (Right-Handed, Z in [-1, 1] for OpenGL).
+    /// `fov_y` is in radians.
+    #[inline]
+    pub fn perspective_rh_gl(fov_y: f32, aspect_ratio: f32, z_near: f32, z_far: f32) -> Self {
+        let f = 1.0 / libm::tanf(fov_y * 0.5);
+        let fn_inv = 1.0 / (z_near - z_far);
+
+        Self {
+            cols: [
+                Vec4::new(f / aspect_ratio, 0.0, 0.0, 0.0),
+                Vec4::new(0.0, f, 0.0, 0.0),
+                Vec4::new(0.0, 0.0, (z_far + z_near) * fn_inv, -1.0),
+                Vec4::new(0.0, 0.0, (2.0 * z_far * z_near) * fn_inv, 0.0),
+            ],
+        }
+    }
+
     /// Creates a view matrix (Look At).
     /// Right-Handed: Z comes out of screen (eye - center).
     #[inline]
     pub fn look_at_rh(eye: Vec3, center: Vec3, up: Vec3) -> Self {
         let f = (center - eye).normalize(); // Forward (into screen, -Z)
-        let s = f.cross(up).normalize();    // Right (+X)
-        let u = s.cross(f);                 // Up (+Y)
+        let s = f.cross(up).normalize(); // Right (+X)
+        let u = s.cross(f); // Up (+Y)
 
         Self {
             cols: [
@@ -148,6 +173,12 @@ impl Mat4 {
     pub fn transform_vector3(self, v: Vec3) -> Vec3 {
         let res = self.mul_vec4(Vec4::from_vec3(v, 0.0));
         res.xyz()
+    }
+
+    /// Returns the raw array of columns (for OpenGL/WGPU upload).
+    #[inline]
+    pub fn to_cols_array(&self) -> [f32; 16] {
+        unsafe { core::mem::transmute(*self) }
     }
 }
 

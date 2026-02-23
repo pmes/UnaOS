@@ -49,7 +49,10 @@ impl Default for SidebarPosition {
 
 #[derive(Debug)]
 pub enum Event {
-    Input { target: String, text: String },
+    Input {
+        target: String,
+        text: String,
+    },
     TemplateAction(usize),
     NavSelect(usize),
     DockAction(usize),

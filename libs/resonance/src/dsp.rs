@@ -89,11 +89,17 @@ impl FftContext {
 }
 
 fn complex_add(a: Complex, b: Complex) -> Complex {
-    Complex { re: a.re + b.re, im: a.im + b.im }
+    Complex {
+        re: a.re + b.re,
+        im: a.im + b.im,
+    }
 }
 
 fn complex_sub(a: Complex, b: Complex) -> Complex {
-    Complex { re: a.re - b.re, im: a.im - b.im }
+    Complex {
+        re: a.re - b.re,
+        im: a.im - b.im,
+    }
 }
 
 fn complex_mul(a: Complex, b: Complex) -> Complex {

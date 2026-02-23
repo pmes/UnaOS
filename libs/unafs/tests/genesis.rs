@@ -1,6 +1,6 @@
-use unafs::{MemDevice, BlockDevice, UnaFS, BLOCK_SIZE, AttributeValue};
-use unafs::superblock::{MAGIC, VERSION};
 use std::collections::BTreeMap;
+use unafs::superblock::{MAGIC, VERSION};
+use unafs::{AttributeValue, BLOCK_SIZE, BlockDevice, MemDevice, UnaFS};
 
 #[test]
 fn test_big_bang() {
@@ -16,7 +16,9 @@ fn test_big_bang() {
     // We must pre-allocate the "Disk".
     // Write the last block to force size.
     let empty_block = vec![0u8; BLOCK_SIZE as usize];
-    device.write_block(block_count - 1, &empty_block).expect("Failed to set disk size");
+    device
+        .write_block(block_count - 1, &empty_block)
+        .expect("Failed to set disk size");
 
     // Verify block count
     assert_eq!(device.block_count(), block_count);
@@ -55,7 +57,10 @@ fn test_big_bang() {
 
     // 5. Create a File
     let mut attrs = BTreeMap::new();
-    attrs.insert("filename".to_string(), AttributeValue::String("manifesto.txt".to_string()));
+    attrs.insert(
+        "filename".to_string(),
+        AttributeValue::String("manifesto.txt".to_string()),
+    );
 
     let file_id = fs.create_inode(attrs).expect("Failed to create file");
 
@@ -73,7 +78,9 @@ fn test_big_bang() {
     assert_eq!(fs2.superblock.root_inode, 12);
 
     // Check file exists
-    let file_inode = fs2.read_inode(file_id).expect("Failed to read file after mount");
+    let file_inode = fs2
+        .read_inode(file_id)
+        .expect("Failed to read file after mount");
 
     // Verify attributes
     match file_inode.attributes.get("filename") {

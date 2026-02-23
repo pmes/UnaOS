@@ -1,8 +1,8 @@
-use glib::subclass::prelude::*;
-use glib::prelude::*;
 use glib::Properties;
+use glib::prelude::*;
+use glib::subclass::prelude::*;
+use serde::{Deserialize, Serialize};
 use std::cell::RefCell;
-use serde::{Serialize, Deserialize};
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct DispatchRecord {

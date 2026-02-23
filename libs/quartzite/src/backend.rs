@@ -1,9 +1,9 @@
 // libs/quartzite/src/backend.rs
 use async_channel::Receiver;
-use gtk4::prelude::*;
 #[cfg(not(feature = "gnome"))]
 use gtk4::Application;
 use gtk4::ApplicationWindow;
+use gtk4::prelude::*;
 use log::info;
 use std::cell::RefCell;
 use std::rc::Rc;

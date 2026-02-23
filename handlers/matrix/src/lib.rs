@@ -31,7 +31,7 @@ impl ProjectView {
             Spline::Rust => "applications-engineering-symbolic", // The Gear
             Spline::Web => "network-server-symbolic", // The Web
             Spline::Python => "media-playlist-shuffle-symbolic", // The Snake (Abstract)
-            Spline::Void => "folder-symbolic", // Generic
+            Spline::Void => "folder-symbolic",    // Generic
         }
     }
 }

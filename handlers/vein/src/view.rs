@@ -1,22 +1,22 @@
 // handlers/vein/src/view.rs
+use crate::model::DispatchObject;
 use async_channel::Receiver;
 use gtk4::prelude::*;
 use gtk4::{
-    Adjustment, Align, Box, Button, CheckButton, ColumnView, ColumnViewColumn, CssProvider, DropDown, Entry,
-    EventControllerKey, FileDialog, Image, Label, ListBox, ListItem,
-    Orientation, Paned, PolicyType, Popover, PropagationPhase, Scale, ScrolledWindow,
-    SignalListItemFactory, SingleSelection, Spinner, Stack, StackSwitcher, StackTransitionType,
-    StringList, StringObject, Switch, ToggleButton, Widget, Window,
-    ListView, FilterListModel, Expander, NoSelection, GestureClick,
+    Adjustment, Align, Box, Button, CheckButton, ColumnView, ColumnViewColumn, CssProvider,
+    DropDown, Entry, EventControllerKey, Expander, FileDialog, FilterListModel, GestureClick,
+    Image, Label, ListBox, ListItem, ListView, NoSelection, Orientation, Paned, PolicyType,
+    Popover, PropagationPhase, Scale, ScrolledWindow, SignalListItemFactory, SingleSelection,
+    Spinner, Stack, StackSwitcher, StackTransitionType, StringList, StringObject, Switch,
+    ToggleButton, Widget, Window,
     gdk::{Key, ModifierType},
     gio,
 };
+use libspelling;
 use sourceview5::View as SourceView;
 use sourceview5::prelude::*;
 use std::cell::RefCell;
 use std::rc::Rc;
-use libspelling;
-use crate::model::DispatchObject;
 
 // Wrapper to allow storing !Send GObjects in set_data (Safe on main thread)
 struct SendWrapper<T>(pub T);
@@ -176,13 +176,16 @@ impl CommsSpline {
         let column_view = ColumnView::new(Some(selection_model));
         column_view.append_column(&ColumnViewColumn::new(None, Some(factory)));
         let tx_clone_nav = tx_event.clone();
-        column_view.model().unwrap().connect_selection_changed(move |model, _, _| {
-            let selection = model.downcast_ref::<SingleSelection>().unwrap();
-            if let Some(_) = selection.selected_item() {
-                let idx = selection.selected() as usize;
-                let _ = tx_clone_nav.send_blocking(Event::NavSelect(idx));
-            }
-        });
+        column_view
+            .model()
+            .unwrap()
+            .connect_selection_changed(move |model, _, _| {
+                let selection = model.downcast_ref::<SingleSelection>().unwrap();
+                if let Some(_) = selection.selected_item() {
+                    let idx = selection.selected() as usize;
+                    let _ = tx_clone_nav.send_blocking(Event::NavSelect(idx));
+                }
+            });
         let nodes_scroll = ScrolledWindow::builder()
             .hscrollbar_policy(PolicyType::Never)
             .child(&column_view)
@@ -222,7 +225,8 @@ impl CommsSpline {
             vbox.set_margin_end(12);
 
             vbox.append(&Label::new(Some("Model")));
-            let models = StringList::new(&["Gemini 2.0 Flash", "Gemini 1.5 Pro", "Claude 3.5 Sonnet"]);
+            let models =
+                StringList::new(&["Gemini 2.0 Flash", "Gemini 1.5 Pro", "Claude 3.5 Sonnet"]);
             let dropdown = DropDown::new(Some(models), None::<gtk4::Expression>);
             vbox.append(&dropdown);
 
@@ -233,8 +237,8 @@ impl CommsSpline {
             hbox_hist.append(&switch_hist);
             vbox.append(&hbox_hist);
 
-            vbox.append(&Label::new(Some("Temperature (0.1 - 0.9)")));
-            let adj = Adjustment::new(0.7, 0.1, 0.9, 0.1, 0.0, 0.0);
+            vbox.append(&Label::new(Some("Temperature (0.0 - 1.0)")));
+            let adj = Adjustment::new(0.7, 0.0, 1.0, 0.1, 0.1, 0.0);
             let scale = Scale::new(Orientation::Horizontal, Some(&adj));
             scale.set_digits(1);
             scale.set_draw_value(true);
@@ -272,8 +276,12 @@ impl CommsSpline {
 
             btn_create.connect_clicked(move |_| {
                 if let Some(win) = win_weak2.upgrade() {
-                    let model_obj = dropdown.selected_item().and_then(|obj| obj.downcast::<StringObject>().ok());
-                    let model = model_obj.map(|s| s.string().to_string()).unwrap_or_default();
+                    let model_obj = dropdown
+                        .selected_item()
+                        .and_then(|obj| obj.downcast::<StringObject>().ok());
+                    let model = model_obj
+                        .map(|s| s.string().to_string())
+                        .unwrap_or_default();
                     let history = switch_hist.is_active();
                     let temp = adj.value();
                     let (start, end) = prompt_buffer.bounds();
@@ -329,17 +337,27 @@ impl CommsSpline {
             if let Some(row) = row {
                 if let Some(child) = row.child() {
                     if let Some(box_widget) = child.downcast_ref::<Box>() {
-                        if let Some(label_widget) = box_widget.last_child().and_then(|w| w.prev_sibling()).and_then(|w| w.downcast::<Label>().ok()) {
-                             let text = label_widget.text().to_string();
-                             let name = text.split(" (").next().unwrap_or(&text).to_string();
-                             *active_target_clone.borrow_mut() = name;
+                        if let Some(label_widget) = box_widget
+                            .last_child()
+                            .and_then(|w| w.prev_sibling())
+                            .and_then(|w| w.downcast::<Label>().ok())
+                        {
+                            let text = label_widget.text().to_string();
+                            let name = text.split(" (").next().unwrap_or(&text).to_string();
+                            *active_target_clone.borrow_mut() = name;
                         }
                     }
                 }
             }
         });
 
-        nexus_list.append(&Label::builder().label("PRIMES").xalign(0.0).css_classes(vec!["nexus-header"]).build());
+        nexus_list.append(
+            &Label::builder()
+                .label("PRIMES")
+                .xalign(0.0)
+                .css_classes(vec!["nexus-header"])
+                .build(),
+        );
 
         let row_una = Box::new(Orientation::Horizontal, 10);
         let icon_una = Image::from_icon_name("computer-symbolic");
@@ -359,7 +377,13 @@ impl CommsSpline {
         row_claude.append(&spinner_claude);
         nexus_list.append(&row_claude);
 
-        nexus_list.append(&Label::builder().label("SUB-PROCESSES").xalign(0.0).css_classes(vec!["nexus-header"]).build());
+        nexus_list.append(
+            &Label::builder()
+                .label("SUB-PROCESSES")
+                .xalign(0.0)
+                .css_classes(vec!["nexus-header"])
+                .build(),
+        );
 
         let row_s9 = Box::new(Orientation::Horizontal, 10);
         row_s9.set_margin_start(15);
@@ -377,7 +401,10 @@ impl CommsSpline {
         sidebar_box.append(&sidebar_stack);
 
         // Native Tabs (No CSS overrides)
-        let stack_switcher = StackSwitcher::builder().stack(&sidebar_stack).halign(Align::Center).build();
+        let stack_switcher = StackSwitcher::builder()
+            .stack(&sidebar_stack)
+            .halign(Align::Center)
+            .build();
         sidebar_box.append(&stack_switcher);
 
         left_vbox.append(&sidebar_box);
@@ -416,12 +443,14 @@ impl CommsSpline {
             let header_spacer = Box::new(Orientation::Horizontal, 0);
 
             // 1. Bind the spacer's width directly to the Paned slider's pixel position
-            main_h_paned.bind_property("position", &header_spacer, "width-request")
+            main_h_paned
+                .bind_property("position", &header_spacer, "width-request")
                 .sync_create()
                 .build();
 
             // 2. Bind the visibility to the toggle button
-            sidebar_toggle.bind_property("active", &header_spacer, "visible")
+            sidebar_toggle
+                .bind_property("active", &header_spacer, "visible")
                 .sync_create()
                 .build();
 
@@ -440,7 +469,7 @@ impl CommsSpline {
         main_paned.set_hexpand(true);
         main_paned.set_position(9999);
         main_paned.set_shrink_end_child(false);
-        main_paned.set_wide_handle(true); // Restores the horizontal slider grip
+        main_paned.set_wide_handle(false); // Restores the horizontal slider grip
 
         // Console (REFACTORED FOR LISTVIEW)
         let scrolled_window = ScrolledWindow::builder()
@@ -450,7 +479,8 @@ impl CommsSpline {
             .build();
 
         let console_store = gio::ListStore::new::<DispatchObject>();
-        let console_filter = FilterListModel::new(Some(console_store.clone()), None::<gtk4::Filter>);
+        let console_filter =
+            FilterListModel::new(Some(console_store.clone()), None::<gtk4::Filter>);
         let console_selection = NoSelection::new(Some(console_filter));
 
         let console_factory = SignalListItemFactory::new();
@@ -525,7 +555,10 @@ impl CommsSpline {
 
             gesture.connect_pressed(move |_, n_press, _, _| {
                 if n_press == 1 {
-                    if let Some(obj) = item_clone.item().and_downcast::<crate::model::DispatchObject>() {
+                    if let Some(obj) = item_clone
+                        .item()
+                        .and_downcast::<crate::model::DispatchObject>()
+                    {
                         let expanded = !obj.is_expanded();
                         obj.set_is_expanded(expanded);
 
@@ -533,7 +566,9 @@ impl CommsSpline {
                         let line_count = content.lines().count();
 
                         if line_count > 11 && !expanded {
-                            let truncated: String = content.lines().take(11).collect::<Vec<&str>>().join("\n") + "\n\n... [Click to expand]";
+                            let truncated: String =
+                                content.lines().take(11).collect::<Vec<&str>>().join("\n")
+                                    + "\n\n... [Click to expand]";
                             chat_content_view_clone.buffer().set_text(&truncated);
                         } else {
                             chat_content_view_clone.buffer().set_text(&content);
@@ -616,12 +651,13 @@ impl CommsSpline {
                 let is_expanded = obj.is_expanded();
                 let line_count = content.lines().count();
                 if line_count > 11 && !is_expanded {
-                    let truncated: String = content.lines().take(11).collect::<Vec<&str>>().join("\n") + "\n\n... [Click to expand]";
+                    let truncated: String =
+                        content.lines().take(11).collect::<Vec<&str>>().join("\n")
+                            + "\n\n... [Click to expand]";
                     chat_view.buffer().set_text(&truncated);
                 } else {
                     chat_view.buffer().set_text(&content);
                 }
-
             } else {
                 chat_view.set_visible(false);
                 expander.set_visible(true);
@@ -635,7 +671,11 @@ impl CommsSpline {
 
                 expander.set_label(Some(&format!("{} | {} | {}", sender, subject, timestamp)));
 
-                let scroll = expander.child().unwrap().downcast::<ScrolledWindow>().unwrap();
+                let scroll = expander
+                    .child()
+                    .unwrap()
+                    .downcast::<ScrolledWindow>()
+                    .unwrap();
                 let content_view = scroll.child().unwrap().downcast::<SourceView>().unwrap();
                 content_view.buffer().set_text(&content);
                 expander.set_expanded(false);
@@ -688,10 +728,12 @@ impl CommsSpline {
                 if let Ok(file) = result {
                     if let Some(path) = file.path() {
                         let path_str = path.to_string_lossy().to_string();
-                        let _ = tx.send(Event::Input {
-                            target: target.borrow().clone(),
-                            text: format!("/upload {}", path_str)
-                        }).await;
+                        let _ = tx
+                            .send(Event::Input {
+                                target: target.borrow().clone(),
+                                text: format!("/upload {}", path_str),
+                            })
+                            .await;
                     }
                 }
             });
@@ -768,18 +810,33 @@ impl CommsSpline {
                 let (start, end) = bod_buf.bounds();
                 let body = bod_buf.text(&start, &end, false).to_string();
                 let pb = pb_chk.is_active();
-                let action = if b_ex.is_active() { "exec" }
-                             else if b_ar.is_active() { "arch" }
-                             else if b_db.is_active() { "debug" }
-                             else { "una" };
+                let action = if b_ex.is_active() {
+                    "exec"
+                } else if b_ar.is_active() {
+                    "arch"
+                } else if b_db.is_active() {
+                    "debug"
+                } else {
+                    "una"
+                };
 
-                let _ = tx_composer.send_blocking(Event::ComplexInput {
-                    target: target_comp.borrow().clone(),
-                    subject,
-                    body,
-                    point_break: pb,
-                    action: action.to_string(),
+                // === ASYNC DISPATCH ===
+                let tx_async = tx_composer.clone();
+                let target_val = target_comp.borrow().clone();
+                let action_val = action.to_string();
+
+                glib::MainContext::default().spawn_local(async move {
+                    let _ = tx_async
+                        .send(Event::ComplexInput {
+                            target: target_val,
+                            subject,
+                            body,
+                            point_break: pb,
+                            action: action_val,
+                        })
+                        .await;
                 });
+
                 pop.popdown();
             }
         });
@@ -844,16 +901,27 @@ impl CommsSpline {
         let target_key = active_target.clone();
 
         key_controller.connect_key_pressed(move |_ctrl, key, _keycode, state| {
-            if key != Key::Return { return glib::Propagation::Proceed; }
-            if state.contains(ModifierType::SHIFT_MASK) { return glib::Propagation::Proceed; }
+            if key != Key::Return {
+                return glib::Propagation::Proceed;
+            }
+            if state.contains(ModifierType::SHIFT_MASK) {
+                return glib::Propagation::Proceed;
+            }
             let is_ctrl = state.contains(ModifierType::CONTROL_MASK);
             if is_ctrl || buffer_key.line_count() <= 1 {
                 let (start, end) = buffer_key.bounds();
                 let text = buffer_key.text(&start, &end, false).to_string();
                 if !text.trim().is_empty() {
-                    let _ = tx_clone_key.send_blocking(Event::Input {
-                        target: target_key.borrow().clone(),
-                        text
+                    // === ASYNC DISPATCH ===
+                    let tx_async = tx_clone_key.clone();
+                    let target_val = target_key.borrow().clone();
+                    glib::MainContext::default().spawn_local(async move {
+                        let _ = tx_async
+                            .send(Event::Input {
+                                target: target_val,
+                                text,
+                            })
+                            .await;
                     });
                     buffer_key.set_text("");
                 }
@@ -869,9 +937,16 @@ impl CommsSpline {
             let (start, end) = buffer_send.bounds();
             let text = buffer_send.text(&start, &end, false).to_string();
             if !text.trim().is_empty() {
-                let _ = tx_clone_send.send_blocking(Event::Input {
-                    target: target_send.borrow().clone(),
-                    text
+                // === ASYNC DISPATCH ===
+                let tx_async = tx_clone_send.clone();
+                let target_val = target_send.borrow().clone();
+                glib::MainContext::default().spawn_local(async move {
+                    let _ = tx_async
+                        .send(Event::Input {
+                            target: target_val,
+                            text,
+                        })
+                        .await;
                 });
                 buffer_send.set_text("");
             }
@@ -943,15 +1018,11 @@ impl CommsSpline {
                             .map(|dt| dt.format("%H:%M:%S").unwrap().to_string())
                             .unwrap_or_else(|_| "00:00:00".to_string());
 
-                        let id = format!("{}", chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0));
+                        let id =
+                            format!("{}", chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0));
 
                         let obj = DispatchObject::new(
-                            &id,
-                            &sender,
-                            &subject,
-                            &timestamp,
-                            &content,
-                            is_chat
+                            &id, &sender, &subject, &timestamp, &content, is_chat,
                         );
 
                         console_store.insert(0, &obj);
@@ -987,16 +1058,14 @@ impl CommsSpline {
                             }
                         }
                     }
-                    GuiUpdate::SidebarStatus(state) => {
-                         match state {
-                             WolfpackState::Dreaming => {
-                                 pulse_icon_clone.add_css_class("pulse-active");
-                             },
-                             _ => {
-                                 pulse_icon_clone.remove_css_class("pulse-active");
-                             }
-                         }
-                    }
+                    GuiUpdate::SidebarStatus(state) => match state {
+                        WolfpackState::Dreaming => {
+                            pulse_icon_clone.add_css_class("pulse-active");
+                        }
+                        _ => {
+                            pulse_icon_clone.remove_css_class("pulse-active");
+                        }
+                    },
                     GuiUpdate::TokenUsage(tokens) => {
                         token_label_clone.set_text(&format!("Tokens: {}", tokens));
                     }

@@ -1,5 +1,5 @@
-use unafs::{MemDevice, BlockDevice, UnaFS, BLOCK_SIZE};
 use unafs::inode::FileKind;
+use unafs::{BLOCK_SIZE, BlockDevice, MemDevice, UnaFS};
 
 #[test]
 fn test_tree_of_life() {
@@ -7,7 +7,9 @@ fn test_tree_of_life() {
     let block_count = 2560;
     let mut device = MemDevice::new();
     let empty_block = vec![0u8; BLOCK_SIZE as usize];
-    device.write_block(block_count - 1, &empty_block).expect("Failed to set disk size");
+    device
+        .write_block(block_count - 1, &empty_block)
+        .expect("Failed to set disk size");
 
     // 2. Format
     let mut fs = UnaFS::format(device, 10).expect("Format failed");
@@ -15,13 +17,19 @@ fn test_tree_of_life() {
 
     // 3. Create Directory Structure
     // /home
-    let home_id = fs.mkdir(root_id, "home".to_string()).expect("Failed to create /home");
+    let home_id = fs
+        .mkdir(root_id, "home".to_string())
+        .expect("Failed to create /home");
 
     // /home/vector
-    let vector_id = fs.mkdir(home_id, "vector".to_string()).expect("Failed to create /home/vector");
+    let vector_id = fs
+        .mkdir(home_id, "vector".to_string())
+        .expect("Failed to create /home/vector");
 
     // /home/vector/notes.txt
-    let notes_id = fs.create_file(vector_id, "notes.txt".to_string()).expect("Failed to create notes.txt");
+    let notes_id = fs
+        .create_file(vector_id, "notes.txt".to_string())
+        .expect("Failed to create notes.txt");
 
     // 4. Verify Structure (ls)
     // Check Root
@@ -46,12 +54,14 @@ fn test_tree_of_life() {
 
     // 5. Write Data to File
     let data1 = b"Hello, ";
-    fs.write_data(notes_id, 0, data1).expect("Failed to write data1");
+    fs.write_data(notes_id, 0, data1)
+        .expect("Failed to write data1");
 
     let data2 = b"World!";
     // Append to end
     let offset = data1.len() as u64;
-    fs.write_data(notes_id, offset, data2).expect("Failed to write data2");
+    fs.write_data(notes_id, offset, data2)
+        .expect("Failed to write data2");
 
     // 6. Read Data Back
     let read_data = fs.read_data(notes_id, 0, 100).expect("Failed to read data");
@@ -64,14 +74,22 @@ fn test_tree_of_life() {
     // 8. Test Extent Spanning (Write across block boundary)
     // Write huge data to force new blocks
     let huge_data = vec![0xAAu8; 5000]; // > 4096
-    fs.write_data(notes_id, notes_inode.size, &huge_data).expect("Failed to write huge data");
+    fs.write_data(notes_id, notes_inode.size, &huge_data)
+        .expect("Failed to write huge data");
 
-    let updated_inode = fs.read_inode(notes_id).expect("Failed to read updated inode");
+    let updated_inode = fs
+        .read_inode(notes_id)
+        .expect("Failed to read updated inode");
     // Size should be old size + 5000
-    assert_eq!(updated_inode.size, (data1.len() + data2.len() + 5000) as u64);
+    assert_eq!(
+        updated_inode.size,
+        (data1.len() + data2.len() + 5000) as u64
+    );
 
     // Verify data correctness at end
     // Note: read_data returns Vec<u8> which we compare to Vec<u8>.
-    let read_huge = fs.read_data(notes_id, (data1.len() + data2.len()) as u64, 5000).expect("Failed to read huge data");
+    let read_huge = fs
+        .read_data(notes_id, (data1.len() + data2.len()) as u64, 5000)
+        .expect("Failed to read huge data");
     assert_eq!(read_huge, huge_data);
 }

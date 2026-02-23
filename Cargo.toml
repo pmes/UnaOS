@@ -18,7 +18,7 @@ members = [
     # "handlers/vug",
     "apps/cli/vertex",
     "apps/cli/unafs",
-    "apps/sentinel",
+    "apps/cli/sentinel",
     "apps/lumen",
     "apps/una"
 ]

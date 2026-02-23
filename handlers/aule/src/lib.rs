@@ -1,12 +1,12 @@
+use anyhow::{Context as AnyhowContext, Result};
 use async_channel::Sender;
+use bandy::{BandyMember, SMessage};
 use elessar::gneiss_pal::Event;
+use elessar::{Context, Spline};
 use gtk4::prelude::*;
 use gtk4::{Box, Button, Orientation, Widget};
-use anyhow::{Context as AnyhowContext, Result};
-use bandy::{SMessage, BandyMember};
-use elessar::{Context, Spline};
-use std::process::{Command, Stdio};
 use std::io::{BufRead, BufReader};
+use std::process::{Command, Stdio};
 use std::thread;
 
 pub fn create_view(tx: Sender<Event>) -> Widget {
@@ -44,7 +44,7 @@ impl Aule {
             Spline::UnaOS | Spline::Rust => ("cargo", vec!["build"]),
             Spline::Web => ("npm", vec!["run", "build"]),
             Spline::Python => ("python", vec!["setup.py", "build"]), // Or pip
-            Spline::Void => return Ok(()), // Nothing to build
+            Spline::Void => return Ok(()),                           // Nothing to build
         };
 
         println!("[AULE] Forging with: {} {:?}", program, args);

@@ -1,5 +1,5 @@
-use serde::{Deserialize, Serialize};
 use crate::storage::{BLOCK_SIZE, Error as StorageError};
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 /// The Magic Number for UnaFS: "UNAFS" in ASCII.
@@ -44,7 +44,6 @@ pub struct Superblock {
     pub bitmap_blocks: u64,
 
     // --- UNAFS 2.0: The Semantic Vault ---
-
     /// The starting block of the Write-Ahead Log (WAL).
     pub journal_start: u64,
     /// The number of blocks reserved for the WAL.
@@ -114,7 +113,10 @@ impl Superblock {
             return Err(SuperblockError::InvalidVersion(sb.version));
         }
         if sb.block_size as u64 != BLOCK_SIZE {
-            return Err(SuperblockError::BlockSizeMismatch(BLOCK_SIZE as u32, sb.block_size));
+            return Err(SuperblockError::BlockSizeMismatch(
+                BLOCK_SIZE as u32,
+                sb.block_size,
+            ));
         }
 
         Ok(sb)

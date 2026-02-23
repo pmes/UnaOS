@@ -1,6 +1,6 @@
-use serde::{Deserialize, Serialize};
-use crate::inode::AttributeValue;
 use crate::hash::{FnvHasher, hash_bytes};
+use crate::inode::AttributeValue;
+use serde::{Deserialize, Serialize};
 
 /// An entry in the Attribute Catalog.
 /// Maps a (Key, Value) pair to an Inode ID.

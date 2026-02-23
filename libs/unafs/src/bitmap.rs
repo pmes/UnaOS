@@ -1,4 +1,4 @@
-use crate::storage::{BlockDevice, BLOCK_SIZE, Error as StorageError};
+use crate::storage::{BLOCK_SIZE, BlockDevice, Error as StorageError};
 
 /// A simple bitmap implementation for managing free space.
 ///
@@ -23,7 +23,11 @@ impl SpaceMap {
     /// Load the bitmap from the device.
     ///
     /// Reads from `start_block` for `count` blocks.
-    pub fn load<D: BlockDevice>(device: &mut D, start_block: u64, count: u64) -> Result<Self, StorageError> {
+    pub fn load<D: BlockDevice>(
+        device: &mut D,
+        start_block: u64,
+        count: u64,
+    ) -> Result<Self, StorageError> {
         let mut bits = Vec::with_capacity((count * BLOCK_SIZE) as usize);
         let mut buf = vec![0u8; BLOCK_SIZE as usize];
 
@@ -44,7 +48,11 @@ impl SpaceMap {
     /// Save the bitmap to the device.
     ///
     /// Writes to `start_block`. It will use as many blocks as needed.
-    pub fn save<D: BlockDevice>(&self, device: &mut D, start_block: u64) -> Result<(), StorageError> {
+    pub fn save<D: BlockDevice>(
+        &self,
+        device: &mut D,
+        start_block: u64,
+    ) -> Result<(), StorageError> {
         let mut buf = vec![0u8; BLOCK_SIZE as usize];
         // Split bits into 4096-byte chunks
         let chunks = self.bits.chunks(BLOCK_SIZE as usize);

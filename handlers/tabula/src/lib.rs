@@ -1,8 +1,8 @@
 use gtk4::prelude::*;
 use gtk4::{ScrolledWindow, TextBuffer, Widget};
+use libspelling;
 use sourceview5::View as SourceView;
 use sourceview5::prelude::*;
-use libspelling;
 
 // Wrapper to allow storing !Send GObjects in set_data (Safe on main thread)
 struct SendWrapper<T>(pub T);
@@ -21,9 +21,7 @@ pub fn create_view(mode: EditorMode) -> (Widget, TextBuffer) {
     scroll.set_vexpand(true);
 
     // Base configuration
-    let view = SourceView::builder()
-        .auto_indent(true)
-        .build();
+    let view = SourceView::builder().auto_indent(true).build();
 
     // Mode-specific configuration
     match &mode {
@@ -39,7 +37,7 @@ pub fn create_view(mode: EditorMode) -> (Widget, TextBuffer) {
                     buffer.set_language(Some(&lang));
                 }
             }
-        },
+        }
         EditorMode::Prose => {
             view.set_monospace(false); // Sans-serif for prose
             view.set_show_line_numbers(false);
@@ -57,7 +55,7 @@ pub fn create_view(mode: EditorMode) -> (Widget, TextBuffer) {
                     buffer.set_data("spell-adapter", SendWrapper(adapter));
                 }
             }
-        },
+        }
         EditorMode::Log => {
             view.set_monospace(true);
             view.set_show_line_numbers(false);

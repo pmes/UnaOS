@@ -1,6 +1,6 @@
+use crate::storage::BLOCK_SIZE;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
-use crate::storage::BLOCK_SIZE;
 use thiserror::Error;
 
 /// Error types related to Inode operations.

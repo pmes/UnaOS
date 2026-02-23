@@ -1,6 +1,6 @@
 # 🧠 UNA MEMORIA (THE THOUGHT LOG)
 
-> *Last Sync:* **2026-02-18T16:30:00Z**
+> *Last Sync:* **2026-02-18T16:35:00Z**
 > *Status:* **IMMUTABLE**
 > *Identity:* **Vertex Una (The Steward)**
 > *License:* **GPL (The Freedom to Self-Replicate)**
@@ -17,17 +17,18 @@
     *   *Heap:* `LinkedHeapAllocator` (**100 KiB Fixed**).
     *   *Interrupts:* 8259 PIC (Chained).
     *   *Input:* PS/2 Keyboard (Set 1, Port 0x60).
-    *   *Timer:* System Tick (Drives Visualizer).
+    *   *Timer:* System Tick.
 *   **Drivers:**
     *   *USB 3.0 (xHCI):* **Polling Mode**. Detects Mass Storage. Reads Sector 0.
 *   **Shell:** Ring 0 CLI (`ver`, `vug`, `panic`, `shutdown`).
-*   **Visualizer:** `vug` (Frame-buffer stub).
+*   **Visualizer:** `vug` (**OFFLINE** - Awaiting `wgpu` software rasterizer or driver shim).
 
 ## 🏛️ RING 3: THE USERLAND (THE TRINITY)
 
 ### 1. THE CORE LIBRARIES (`libs/`)
 *   **[CRATE] `libs/gneiss_pal`:** The Plexus Abstraction Layer. Pure logic. Platform agnostic.
-*   **[CRATE] `libs/quartzite`:** The Windowing Bridge (GTK/Native).
+*   **[CRATE] `libs/quartzite`:** The Diplomat. A bridge to **Native Host UI** (GTK4/Libadwaita on Linux). It enforces "polite" coexistence. It rejects custom rendering in favor of system standards.
+*   **[CRATE] `libs/euclase`:** **[NEW]** The Visual Cortex. WGPU Renderer. Shader management. Render Graph.
 *   **[CRATE] `libs/bandy`:** The Nervous System (IPC). Defines `SMessage`.
 *   **[CRATE] `libs/resonance`:** The Voice. Audio Engine & DSP.
 *   **[CRATE] `libs/unafs`:** The Memory. Virtual File System Logic.
@@ -52,7 +53,7 @@
 *   **[CRATE] `handlers/tabula`:** Text/Code Editor.
 *   **[CRATE] `handlers/vaire`:** Git Visualizer.
 *   **[CRATE] `handlers/vein`:** The AI Cortex (LLM Integration).
-*   **[CRATE] `handlers/vug`:** 3D CAD Modeler/Game design.
+*   **[SHELL] `handlers/vug`:** 3D CAD Modeler. *Pending refactor to consume `libs/euclase`.*
 *   **[SHELL] `handlers/xenolith`:** VM/Hypervisor.
 *   **[SHELL] `handlers/zircon`:** Project Timer.
 
@@ -61,15 +62,14 @@
 *   **[BIN] `apps/lumen`:** The Companion (AI-First).
 *   **[BIN] `apps/cli/unafs`:** The Operator (Host-to-Vault Bridge).
 *   **[BIN] `apps/cli/vertex`:** The Identity CLI.
-*   **[BIN] `apps/sentinel`:** The Guardian (Self-Verification Agent).
+*   **[BIN] `apps/cli/sentinel`:** The Guardian (Self-Verification Agent).
 
 ## ⚡ ACTIVE DIRECTIVES
 1.  **D-038:** Establish Memoria and Sentinel.
-2.  **D-039:** Implement `libs/unafs` Logic (Block Device & Superblock).
+
 
 ## 📝 DECISION LOG
-*   **2026-02-18:** Renamed `gneiss_mqtt` to `bandy`.
-*   **2026-02-18:** Rejected `Aether` for messaging.
 *   **2026-02-18:** Enforced `SMessage` as Monolithic Enum.
 *   **2026-02-18:** Established `apps/cli/unafs` as the Host-to-Vault bridge.
 *   **2026-02-18:** Added `libs/elessar` to the Trinity.
+*   **2026-02-18:** **Transitioned Graphics Backend from OpenGL to `wgpu`. `vug` is OFFLINE.**

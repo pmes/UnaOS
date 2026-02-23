@@ -1,7 +1,7 @@
-use bandy::{BandyMember, SMessage};
 use crate::commands::AudioCommand;
 use crate::graph::AudioGraph;
 use crate::{BLOCK_SIZE, Sample};
+use bandy::{BandyMember, SMessage};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use ringbuf::{Consumer, HeapRb, Producer};
 use std::sync::Arc;
@@ -168,8 +168,7 @@ fn process_commands(
             } => {
                 // _graph.set_node_param(crate::NodeId(_node_id), _param_id, _value);
             }
-            AudioCommand::Stop => {
-            }
+            AudioCommand::Stop => {}
         }
     }
 }

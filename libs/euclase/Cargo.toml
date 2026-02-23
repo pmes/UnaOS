@@ -7,6 +7,9 @@ edition = "2024"
 bytemuck = { version = "1.16", features = ["derive"] }
 libm = "0.2"
 serde = { version = "1.0", default-features = false, features = ["derive"], optional = true }
+wgpu = "0.19"
+winit = "0.29"
+bandy = { path = "../bandy" }
 
 [features]
 default = []

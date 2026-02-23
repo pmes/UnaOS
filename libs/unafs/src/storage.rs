@@ -59,6 +59,15 @@ impl FileDevice {
             .open(path)?;
         Ok(Self { file })
     }
+    /// Open a file as a read-only block device (for Sentinel/Diagnostics).
+    pub fn open_read_only(path: impl AsRef<Path>) -> Result<Self, std::io::Error> {
+        let file = OpenOptions::new()
+            .read(true)
+            .write(false)
+            .create(false)
+            .open(path)?;
+        Ok(Self { file })
+    }
 }
 
 impl BlockDevice for FileDevice {
@@ -67,10 +76,12 @@ impl BlockDevice for FileDevice {
             return Err(Error::BadBlockSize(buf.len(), BLOCK_SIZE));
         }
 
-        self.file.seek(SeekFrom::Start(id * BLOCK_SIZE))
+        self.file
+            .seek(SeekFrom::Start(id * BLOCK_SIZE))
             .map_err(|e| Error::Io(e.to_string()))?;
 
-        self.file.read_exact(buf)
+        self.file
+            .read_exact(buf)
             .map_err(|e| Error::Io(e.to_string()))?;
 
         Ok(())
@@ -85,14 +96,14 @@ impl BlockDevice for FileDevice {
         file.seek(SeekFrom::Start(id * BLOCK_SIZE))
             .map_err(|e| Error::Io(e.to_string()))?;
 
-        file.write_all(buf)
-            .map_err(|e| Error::Io(e.to_string()))?;
+        file.write_all(buf).map_err(|e| Error::Io(e.to_string()))?;
 
         Ok(())
     }
 
     fn block_count(&self) -> u64 {
-        self.file.metadata()
+        self.file
+            .metadata()
             .map(|m| m.len() / BLOCK_SIZE)
             .unwrap_or(0)
     }
@@ -147,7 +158,7 @@ impl BlockDevice for MemDevice {
 
         // partial read handling if data len is not multiple of block size (shouldn't happen if we only write blocks)
         if end > self.data.len() {
-             return Err(Error::OutOfBounds(id));
+            return Err(Error::OutOfBounds(id));
         }
 
         buf.copy_from_slice(&self.data[start..end]);

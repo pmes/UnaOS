@@ -57,6 +57,11 @@ impl Vec3 {
         Self::new(0.0, 0.0, 1.0)
     }
 
+    /// The Zero vector constant.
+    pub const ZERO: Self = Self::zero();
+    /// The Y axis constant.
+    pub const Y: Self = Self::unit_y();
+
     /// Calculates the dot product of this vector and another.
     ///
     /// The dot product represents the alignment of two vectors.
@@ -104,11 +109,7 @@ impl Vec3 {
     #[inline]
     pub fn normalize(self) -> Self {
         let m = self.magnitude();
-        if m > 0.0 {
-            self / m
-        } else {
-            Self::zero()
-        }
+        if m > 0.0 { self / m } else { Self::zero() }
     }
 
     /// Linearly interpolates between this vector and another based on `t`.
