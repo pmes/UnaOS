@@ -177,7 +177,7 @@ pub fn fetch_token() -> Result<String, String> {
     ) -> Result<(String, Option<UsageMetadata>), String> {
         let request_body = GenerateContentRequest {
             contents: history.to_vec(),
-            generation_config: GenerationConfig { temperature: 0.9 },
+            generation_config: GenerationConfig { temperature: 0.4 },
         };
 
         let mut attempts = 0;

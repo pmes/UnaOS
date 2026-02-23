@@ -1,7 +1,7 @@
+mod core;
 mod cortex;
 
 use bandy::{telemetry, SMessage, Synapse};
-use cortex::Cortex;
 use gneiss_pal::paths::UnaPaths;
 use gtk4::ApplicationWindow;
 use quartzite::{self, Backend};
@@ -10,31 +10,32 @@ use vein::{CommsSpline, VeinHandler};
 
 fn main() {
     // 0. Ignite the Substrate Reactor (Tokio)
-    // CURES THE "CONNECTING..." LOOP: reqwest and async channels require a reactor.
     let rt = tokio::runtime::Runtime::new().expect("CRITICAL: Failed to ignite Tokio reactor");
     let _guard = rt.enter();
 
     // 1. Establish Base Camp
     UnaPaths::awaken().expect("CRITICAL: Failed to awaken spatial paths");
     let asset_path = UnaPaths::root().join("quartzite.gresource");
-    let storage_path = UnaPaths::lumen_storage();
 
-    // 2. Ignite Telemetry (Curing the Blackout)
+    // Split the brain: Conscious (Vein) vs Subconscious (Core)
+    let vein_storage = UnaPaths::lumen_storage();
+    let cortex_vault = UnaPaths::root().join("cortex.vault");
+
+    // 2. Ignite Telemetry
     telemetry::ignite(UnaPaths::root().join("logs"));
     log::info!("Lumen Boot Sequence Initiated.");
 
     // 3. Ignite the Spine
-    let mut synapse = Synapse::new();
+    let synapse = Synapse::new();
 
     // 4. Initialize Crypto Substrate
     let _ = rustls::crypto::ring::default_provider().install_default();
 
-    // 5. Awaken the Cortex
-    let mut brain = Cortex::awaken(&mut synapse);
-    brain.imprint(
-        "sys.boot.timestamp",
-        &chrono::Utc::now().timestamp().to_be_bytes(),
-    );
+    // 5. Awaken the Autonomous Core (The Subconscious)
+    let core_synapse = synapse.clone();
+    rt.spawn(async move {
+        core::ignite(cortex_vault, core_synapse).await;
+    });
 
     // 6. FORCE DEPLOY ASSETS (S74)
     if let Err(e) = quartzite::deploy_assets(&asset_path) {
@@ -46,9 +47,9 @@ fn main() {
     }
     quartzite::init_with_path(&asset_path);
 
-    // 7. Ignite the AI Handler (Vein)
+    // 7. Ignite the AI Handler (The Conscious Vein)
     let (gui_tx, gui_rx) = async_channel::unbounded();
-    let app = VeinHandler::new(gui_tx, storage_path, synapse.tx());
+    let app = VeinHandler::new(gui_tx, vein_storage, synapse.tx());
 
     synapse.fire(SMessage::Log {
         level: String::from("INFO"),

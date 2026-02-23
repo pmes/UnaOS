@@ -1,32 +1,35 @@
 use crate::SMessage;
-use async_channel::{unbounded, Receiver, Sender};
+use tokio::sync::broadcast;
 
 /// The connective tissue of the nervous system.
+/// Uses a broadcast channel so multiple lobes (UI, Subconscious, AI)
+/// can react to the same stimulus simultaneously.
 #[derive(Clone)]
 pub struct Synapse {
-    tx: Sender<SMessage>,
-    rx: Receiver<SMessage>,
+    tx: broadcast::Sender<SMessage>,
 }
 
 impl Synapse {
     pub fn new() -> Self {
-        let (tx, rx) = unbounded();
-        Self { tx, rx }
+        // 1024 action potentials in flight. If we hit this, the system is seizing.
+        let (tx, _) = broadcast::channel(1024);
+        Self { tx }
     }
 
     /// Fires a stimulus across the nervous system.
     pub fn fire(&self, msg: SMessage) {
-        if let Err(e) = self.tx.send_blocking(msg) {
-            eprintln!(">> [SYNAPSE FAULT] Failed to fire message: {}", e);
-        }
+        // We ignore SendError. If a tree falls in the forest...
+        let _ = self.tx.send(msg);
     }
 
-    pub fn tx(&self) -> Sender<SMessage> {
+    /// Direct access to the transmitter.
+    pub fn tx(&self) -> broadcast::Sender<SMessage> {
         self.tx.clone()
     }
 
-    pub fn rx(&self) -> Receiver<SMessage> {
-        self.rx.clone()
+    /// Sprout a new nerve ending to listen to the system.
+    pub fn rx(&self) -> broadcast::Receiver<SMessage> {
+        self.tx.subscribe()
     }
 }
 
