@@ -1,6 +1,6 @@
 mod cortex;
 
-use bandy::{SMessage, Synapse};
+use bandy::{telemetry, SMessage, Synapse};
 use cortex::Cortex;
 use gneiss_pal::paths::UnaPaths;
 use gtk4::ApplicationWindow;
@@ -9,25 +9,34 @@ use std::rc::Rc;
 use vein::{CommsSpline, VeinHandler};
 
 fn main() {
-    // 1. Ignite the Spine
-    let mut synapse = Synapse::new();
+    // 0. Ignite the Substrate Reactor (Tokio)
+    // CURES THE "CONNECTING..." LOOP: reqwest and async channels require a reactor.
+    let rt = tokio::runtime::Runtime::new().expect("CRITICAL: Failed to ignite Tokio reactor");
+    let _guard = rt.enter();
 
-    // 2. Establish Base Camp
+    // 1. Establish Base Camp
     UnaPaths::awaken().expect("CRITICAL: Failed to awaken spatial paths");
     let asset_path = UnaPaths::root().join("quartzite.gresource");
     let storage_path = UnaPaths::lumen_storage();
 
-    // 3. Initialize Crypto Substrate
+    // 2. Ignite Telemetry (Curing the Blackout)
+    telemetry::ignite(UnaPaths::root().join("logs"));
+    log::info!("Lumen Boot Sequence Initiated.");
+
+    // 3. Ignite the Spine
+    let mut synapse = Synapse::new();
+
+    // 4. Initialize Crypto Substrate
     let _ = rustls::crypto::ring::default_provider().install_default();
 
-    // 4. Awaken the Cortex
+    // 5. Awaken the Cortex
     let mut brain = Cortex::awaken(&mut synapse);
     brain.imprint(
         "sys.boot.timestamp",
         &chrono::Utc::now().timestamp().to_be_bytes(),
     );
 
-    // 5. FORCE DEPLOY ASSETS (S74)
+    // 6. FORCE DEPLOY ASSETS (S74)
     if let Err(e) = quartzite::deploy_assets(&asset_path) {
         synapse.fire(SMessage::Log {
             level: String::from("ERROR"),
@@ -37,7 +46,7 @@ fn main() {
     }
     quartzite::init_with_path(&asset_path);
 
-    // 6. Ignite the AI Handler (Vein)
+    // 7. Ignite the AI Handler (Vein)
     let (gui_tx, gui_rx) = async_channel::unbounded();
     let app = VeinHandler::new(gui_tx, storage_path, synapse.tx());
 
@@ -47,9 +56,10 @@ fn main() {
         content: String::from("Nervous System Online. Handing control to Quartzite."),
     });
 
-    // 7. View & Engine Ignition
+    // 8. View & Engine Ignition
     let spline = Rc::new(CommsSpline::new());
     let bootstrap = move |window: &ApplicationWindow, tx, rx| spline.bootstrap(window, tx, rx);
 
+    // The GTK loop blocks here, keeping the Tokio runtime alive in the background.
     Backend::new("org.unaos.lumen", app, gui_rx, bootstrap);
 }

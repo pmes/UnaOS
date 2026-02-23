@@ -10,7 +10,7 @@ pub struct UnaLogger {
 
 impl log::Log for UnaLogger {
     fn enabled(&self, metadata: &Metadata) -> bool {
-        metadata.level() <= Level::Info
+        metadata.level() <= Level::Debug // Unchoked from Info
     }
 
     fn log(&self, record: &Record) {
@@ -25,9 +25,16 @@ impl log::Log for UnaLogger {
             // Echo to stdout for the Architect
             print!("{}: {}", target.to_uppercase(), msg);
 
-            // Route to specific subsystem log
-            if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(log_file) {
-                let _ = file.write_all(msg.as_bytes());
+            // Route to specific subsystem log. Do not swallow errors silently.
+            match OpenOptions::new().create(true).append(true).open(&log_file) {
+                Ok(mut file) => {
+                    if let Err(e) = file.write_all(msg.as_bytes()) {
+                        eprintln!(">> [TELEMETRY FAULT] Failed to write to {}: {}", log_file.display(), e);
+                    }
+                }
+                Err(e) => {
+                    eprintln!(">> [TELEMETRY FAULT] Failed to open {}: {}", log_file.display(), e);
+                }
             }
         }
     }
@@ -38,11 +45,14 @@ impl log::Log for UnaLogger {
 /// Ignites the autonomic telemetry routing system.
 pub fn ignite(log_dir: PathBuf) {
     if !log_dir.exists() {
-        fs::create_dir_all(&log_dir).expect("Failed to construct telemetry vault");
+        if let Err(e) = fs::create_dir_all(&log_dir) {
+            eprintln!(">> [CRITICAL] Failed to construct telemetry vault at {}: {}", log_dir.display(), e);
+            return;
+        }
     }
 
     let logger = Box::new(UnaLogger { log_dir });
     log::set_boxed_logger(logger)
-        .map(|()| log::set_max_level(LevelFilter::Info))
+        .map(|()| log::set_max_level(LevelFilter::Debug)) // Unchoke the output
         .expect("Nervous system logging failed to ignite");
 }
