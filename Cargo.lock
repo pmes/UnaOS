@@ -283,6 +283,7 @@ name = "bandy"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-channel",
  "chrono",
  "log",
  "serde",

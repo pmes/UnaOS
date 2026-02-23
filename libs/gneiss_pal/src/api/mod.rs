@@ -1,9 +1,9 @@
-use log::{error, info, warn};
 use reqwest::{Client, ClientBuilder, StatusCode};
-use serde::{Deserialize, Serialize};
+use log::warn;
 use std::process::Command;
+use serde::{Deserialize, Serialize};
 use std::time::Duration;
-
+use log::{error, info};
 #[derive(Serialize)]
 struct GenerateContentRequest {
     contents: Vec<Content>,
@@ -133,32 +133,32 @@ impl ResilientClient {
         })
     }
 
-    fn fetch_token() -> Result<String, String> {
-        info!("Executing gcloud ADC token fetch...");
-        let output = Command::new("gcloud")
-            .args(["auth", "application-default", "print-access-token"])
-            .output()
-            .map_err(|e| {
-                error!("gcloud execution failed: {}", e);
-                format!("Failed to execute gcloud for token: {}", e)
-            })?;
+pub fn fetch_token() -> Result<String, String> {
+    info!("Executing gcloud ADC token fetch...");
+    let output = Command::new("gcloud")
+        .args(["auth", "application-default", "print-access-token"])
+        .output()
+        .map_err(|e| {
+            error!("gcloud execution failed: {}", e);
+            format!("Failed to execute gcloud for token: {}", e)
+        })?;
 
-        if !output.status.success() {
-            let err_msg = String::from_utf8_lossy(&output.stderr);
-            error!("gcloud ADC failed: {}", err_msg);
-            return Err(
-                "Failed to retrieve gcloud access token. Ensure gcloud ADC is configured."
-                    .to_string(),
-            );
-        }
-
-        String::from_utf8(output.stdout)
-            .map(|s| s.trim().to_string())
-            .map_err(|_| {
-                error!("Invalid UTF-8 in gcloud token");
-                "Invalid UTF-8 in gcloud token".to_string()
-            })
+    if !output.status.success() {
+        let err_msg = String::from_utf8_lossy(&output.stderr);
+        error!("gcloud ADC failed: {}", err_msg);
+        return Err(
+            "Failed to retrieve gcloud access token. Ensure gcloud ADC is configured."
+                .to_string(),
+        );
     }
+
+    String::from_utf8(output.stdout)
+        .map(|s| s.trim().to_string())
+        .map_err(|_| {
+            error!("Invalid UTF-8 in gcloud token");
+            "Invalid UTF-8 in gcloud token".to_string()
+        })
+}
 
     pub async fn refresh_token(&mut self) -> Result<(), String> {
         info!("Refreshing GCloud Token (Lazarus Protocol)...");
@@ -177,7 +177,7 @@ impl ResilientClient {
     ) -> Result<(String, Option<UsageMetadata>), String> {
         let request_body = GenerateContentRequest {
             contents: history.to_vec(),
-            generation_config: GenerationConfig { temperature: 0.4 },
+            generation_config: GenerationConfig { temperature: 0.9 },
         };
 
         let mut attempts = 0;

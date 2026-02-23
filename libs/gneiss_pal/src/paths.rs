@@ -42,12 +42,24 @@ impl UnaPaths {
         Self::root().join("lumen").join("lumen_storage.ufs")
     }
 
-    /// Bootstraps the physical directory structure.
-    pub fn awaken() -> std::io::Result<()> {
-        fs::create_dir_all(Self::cortex())?;
-        fs::create_dir_all(Self::vault())?;
-        fs::create_dir_all(Self::config())?;
-        fs::create_dir_all(Self::root().join("lumen"))?;
+    /// Bootstraps the physical directory structure. Fails hard if the host rejects us.
+    pub fn awaken() -> Result<(), String> {
+        let required_nodes = [
+            Self::cortex(),
+            Self::vault(),
+            Self::config(),
+            Self::root().join("lumen"),
+            Self::root().join("logs"), // Ensure Telemetry has a physical home
+        ];
+
+        for node in required_nodes {
+            if !node.exists() {
+                fs::create_dir_all(&node).map_err(|e| {
+                    format!("CRITICAL: Failed to carve spatial anchor at {}: {}", node.display(), e)
+                })?;
+            }
+        }
+
         Ok(())
     }
 }

@@ -1,6 +1,7 @@
 pub mod telemetry;
 use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast;
+pub mod synapse;
 
 pub struct Synapse {
     tx: broadcast::Sender<SMessage>,
