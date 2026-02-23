@@ -1,3 +1,5 @@
+use std::env;
+use std::fs;
 use std::path::PathBuf;
 
 /// The Spatial Truth of UnaOS.
@@ -7,14 +9,15 @@ impl UnaPaths {
     /// The root of the organism.
     /// Bare-metal: `/`. Host-mode: `$UNA_ROOT` or XDG Data Local (`~/.local/share/unaos`).
     pub fn root() -> PathBuf {
-        std::env::var("UNA_ROOT")
-            .map(PathBuf::from)
-            .unwrap_or_else(|_| {
-                directories::BaseDirs::new()
-                    .expect("CRITICAL: Alien Soil not supported. Host OS rejected spatial query.")
-                    .data_local_dir()
-                    .join("unaos")
-            })
+        if let Ok(root) = env::var("UNA_ROOT") {
+            return PathBuf::from(root);
+        }
+
+        let mut vault = PathBuf::from(
+            env::var("HOME").expect("CRITICAL: HOME environment variable missing. Engine stalled.")
+        );
+        vault.push(".local/share/unaos");
+        vault
     }
 
     // --- The Organs ---
@@ -36,14 +39,15 @@ impl UnaPaths {
 
     /// The Lumen Storage File - The specific UnaFS block file
     pub fn lumen_storage() -> PathBuf {
-        Self::vault().join("lumen_storage.ufs")
+        Self::root().join("lumen").join("lumen_storage.ufs")
     }
 
     /// Bootstraps the physical directory structure.
     pub fn awaken() -> std::io::Result<()> {
-        std::fs::create_dir_all(Self::cortex())?;
-        std::fs::create_dir_all(Self::vault())?;
-        std::fs::create_dir_all(Self::config())?;
+        fs::create_dir_all(Self::cortex())?;
+        fs::create_dir_all(Self::vault())?;
+        fs::create_dir_all(Self::config())?;
+        fs::create_dir_all(Self::root().join("lumen"))?;
         Ok(())
     }
 }

@@ -239,10 +239,13 @@ impl VeinHandler {
                         let _ = gui_tx_brain.send(GuiUpdate::ActiveDirective(directive)).await;
 
                         while let Some(user_input_text) = rx_from_ui.recv().await {
+
                             // === TRUE SYSTEM WIPE ===
                             if user_input_text.trim() == "/clear" {
-                                let _ = std::fs::remove_file("/tmp/lumen_storage.ufs");
+                                drop(disk); // Release the file descriptor lock
+                                let _ = std::fs::remove_file(&vault_path_bg); // Delete the REAL vault
                                 disk = DiskManager::new(&vault_path_bg).expect("Failed to reformat Semantic Vault");
+                                let _ = gui_tx_brain.send(GuiUpdate::ConsoleLog(":: PLEXUS :: Semantic Vault Physically Reformatted.\n".into())).await;
                                 continue;
                             }
 
@@ -413,16 +416,33 @@ impl VeinHandler {
                                 system_base.to_string()
                             };
 
-                            let mut context = Vec::new();
+                            let mut context: Vec<Content> = Vec::new();
 
                             // FIX 1: Fold the system instructions into the user prompt.
                             // Starting with "model" causes an instant API rejection.
                             let mut user_parts = vec![Part::text(combined_system)];
                             user_parts.extend(parse_multimodal_text(&user_input_text));
 
+                            let combined_system = if !retrieved_context.is_empty() {
+                                format!("{}\n\n[SEMANTIC MEMORY RECALL]:\n{}", system_base, retrieved_context)
+                            } else {
+                                system_base.to_string()
+                            };
+
+                            // FIX: Fold the system prompt cleanly into the user's text.
+                            // Vertex rejects multiple consecutive Part::Text blocks in a single turn.
+                            let mut parsed_parts = parse_multimodal_text(&user_input_text);
+
+                            if let Some(Part::Text { text }) = parsed_parts.first_mut() {
+                                *text = format!("{}\n\n{}", combined_system, text);
+                            } else {
+                                parsed_parts.insert(0, Part::text(combined_system));
+                            }
+
+                            let mut context = Vec::new();
                             context.push(Content {
                                 role: "user".into(),
-                                parts: user_parts,
+                                parts: parsed_parts,
                             });
 
                             match client.generate_content(&context).await {

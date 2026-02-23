@@ -1,5 +1,4 @@
 use anyhow::{Context, Result};
-use directories::BaseDirs;
 use elessar::{Context as ElessarContext, Spline};
 use regex::Regex;
 use std::env;

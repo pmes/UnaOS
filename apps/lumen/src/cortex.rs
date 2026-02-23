@@ -1,6 +1,6 @@
 use bandy::{SMessage, Synapse};
-use directories::BaseDirs;
-use std::path::{Path, PathBuf};
+use gneiss_pal::paths::UnaPaths;
+use std::path::PathBuf;
 
 pub struct Cortex {
     pub vault_path: PathBuf,
@@ -8,12 +8,7 @@ pub struct Cortex {
 
 impl Cortex {
     pub fn awaken(synapse: &mut Synapse) -> Self {
-        let base_dirs = BaseDirs::new().expect("CRITICAL: Alien Soil not supported");
-        let vault_path = base_dirs.data_local_dir().join("unaos").join("lumen");
-
-        if !vault_path.exists() {
-            std::fs::create_dir_all(&vault_path).expect("CRITICAL: Failed to establish base camp");
-        }
+        let vault_path = UnaPaths::root().join("lumen");
 
         synapse.fire(SMessage::Log {
             level: String::from("INFO"),

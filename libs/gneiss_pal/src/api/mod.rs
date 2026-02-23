@@ -115,12 +115,12 @@ impl ResilientClient {
 
         // 3. Pure Vertex URL (No API key appended)
         let model_url = format!(
-            "https://aiplatform.googleapis.com/v1/projects/unauploads-1769528906/locations/global/publishers/google/models/{}:generateContent",
+            "https://aiplatform.googleapis.com/v1beta1/projects/unauploads-1769528906/locations/global/publishers/google/models/{}:generateContent",
             model_name
         );
 
         let client = ClientBuilder::new()
-            .timeout(Duration::from_secs(60))
+            .timeout(Duration::from_secs(300))
             .build()
             .map_err(|e| format!("Failed to build HTTP client: {}", e))?;
 
@@ -236,7 +236,7 @@ impl ResilientClient {
     }
 
     pub async fn embed_content(&mut self, text: &str) -> Result<Vec<f32>, String> {
-        let url = "https://aiplatform.googleapis.com/v1/projects/unauploads-1769528906/locations/global/publishers/google/models/text-embedding-004:predict";
+        let url = "https://us-central1-aiplatform.googleapis.com/v1beta1/projects/unauploads-1769528906/locations/us-central1/publishers/google/models/text-embedding-004:predict";
 
         let request_body = EmbedContentRequest {
             instances: vec![EmbedContentInstance {
