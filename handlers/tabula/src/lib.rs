@@ -1,71 +1,94 @@
 use gtk4::prelude::*;
-use gtk4::{ScrolledWindow, TextBuffer, Widget};
-use libspelling;
-use sourceview5::View as SourceView;
+use gtk4::{ScrolledWindow, Widget};
 use sourceview5::prelude::*;
-
-// Wrapper to allow storing !Send GObjects in set_data (Safe on main thread)
-struct SendWrapper<T>(pub T);
-unsafe impl<T> Send for SendWrapper<T> {}
-unsafe impl<T> Sync for SendWrapper<T> {}
+use sourceview5::{LanguageManager, View as SourceView};
+use std::fs;
+use std::path::Path;
 
 #[derive(Debug, Clone)]
 pub enum EditorMode {
-    Code(String), // Language ID (e.g., "rust", "python")
+    Code(String), // Language ID
     Prose,
     Log,
 }
 
-pub fn create_view(mode: EditorMode) -> (Widget, TextBuffer) {
-    let scroll = ScrolledWindow::new();
-    scroll.set_vexpand(true);
+pub struct TabulaView {
+    pub view: SourceView,
+    container: ScrolledWindow,
+}
 
-    // Base configuration
-    let view = SourceView::builder().auto_indent(true).build();
+impl TabulaView {
+    pub fn new(mode: EditorMode) -> Self {
+        let view = SourceView::builder().auto_indent(true).build();
 
-    // Mode-specific configuration
-    match &mode {
-        EditorMode::Code(lang_id) => {
-            view.set_monospace(true);
-            view.set_show_line_numbers(true);
-            view.set_wrap_mode(gtk4::WrapMode::None);
+        match &mode {
+            EditorMode::Code(lang_id) => {
+                view.set_monospace(true);
+                view.set_show_line_numbers(true);
+                view.set_wrap_mode(gtk4::WrapMode::None);
 
-            // Syntax Highlighting
-            let lm = sourceview5::LanguageManager::default();
-            if let Some(lang) = lm.language(lang_id) {
-                if let Some(buffer) = view.buffer().downcast::<sourceview5::Buffer>().ok() {
-                    buffer.set_language(Some(&lang));
+                let lm = LanguageManager::default();
+                if let Some(lang) = lm.language(lang_id) {
+                    if let Some(buffer) = view.buffer().downcast::<sourceview5::Buffer>().ok() {
+                        buffer.set_language(Some(&lang));
+                    }
                 }
             }
-        }
-        EditorMode::Prose => {
-            view.set_monospace(false); // Sans-serif for prose
-            view.set_show_line_numbers(false);
-            view.set_wrap_mode(gtk4::WrapMode::WordChar);
-            view.set_left_margin(12);
-            view.set_right_margin(12);
-
-            // Spellcheck (The Boz Protocol)
-            if let Some(buffer) = view.buffer().downcast::<sourceview5::Buffer>().ok() {
-                let provider = libspelling::Provider::default();
-                let checker = libspelling::Checker::new(Some(&provider), Some("en_US"));
-                let adapter = libspelling::TextBufferAdapter::new(&buffer, &checker);
-                adapter.set_enabled(true);
-                unsafe {
-                    buffer.set_data("spell-adapter", SendWrapper(adapter));
-                }
+            EditorMode::Prose => {
+                view.set_monospace(false);
+                view.set_show_line_numbers(false);
+                view.set_wrap_mode(gtk4::WrapMode::WordChar);
+                view.set_left_margin(12);
+                view.set_right_margin(12);
+                // Note: libspelling adapter can be re-attached here if needed.
+            }
+            EditorMode::Log => {
+                view.set_monospace(true);
+                view.set_show_line_numbers(false);
+                view.set_editable(false);
+                view.set_wrap_mode(gtk4::WrapMode::WordChar);
             }
         }
-        EditorMode::Log => {
-            view.set_monospace(true);
-            view.set_show_line_numbers(false);
-            view.set_editable(false);
-            view.set_wrap_mode(gtk4::WrapMode::WordChar);
-        }
+
+        let container = ScrolledWindow::builder()
+            .child(&view)
+            .hexpand(true)
+            .vexpand(true)
+            .build();
+
+        Self { view, container }
     }
 
-    let buffer = view.buffer().upcast::<TextBuffer>();
-    scroll.set_child(Some(&view));
+    pub fn widget(&self) -> Widget {
+        self.container.clone().upcast()
+    }
 
-    (scroll.upcast::<Widget>(), buffer)
+    pub fn load_file(&self, path: &Path) {
+        let buffer = self.view.buffer().downcast::<sourceview5::Buffer>().unwrap();
+
+        // Auto-detect language based on extension
+        if let Some(ext) = path.extension().and_then(|s| s.to_str()) {
+            let lm = LanguageManager::default();
+            let lang_id = match ext {
+                "rs" => "rust",
+                "toml" => "toml",
+                "md" => "markdown",
+                "py" => "python",
+                "js" | "ts" => "javascript",
+                "json" => "json",
+                "c" | "h" | "cpp" => "c",
+                _ => "txt",
+            };
+            if let Some(lang) = lm.language(lang_id) {
+                buffer.set_language(Some(&lang));
+            } else {
+                buffer.set_language(sourceview5::Language::NONE);
+            }
+        }
+
+        match fs::read_to_string(path) {
+            Ok(content) => buffer.set_text(&content),
+            Err(e) => buffer.set_text(&format!("// UNAOS: FAILED TO LOAD {:?}\n// ERROR: {}", path, e)),
+        }
+    }
 }

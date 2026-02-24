@@ -1,10 +1,11 @@
-use async_channel::Sender;
-use elessar::gneiss_pal::Event;
+use bandy::{SMessage, MatrixEvent};
+use crossbeam_channel::Sender;
 use elessar::{Context, Spline};
 use gtk4::prelude::*;
 use gtk4::{Box, Image, Label, ListBox, Orientation, ScrolledWindow, Widget};
-use std::fs;
 use std::path::{Path, PathBuf};
+
+use crate::MatrixScanner; // The DAG builder we just wrote
 
 pub struct ProjectView {
     pub root_path: PathBuf,
@@ -13,12 +14,8 @@ pub struct ProjectView {
 
 impl ProjectView {
     pub fn new(path: &Path) -> Self {
-        // 1. DETECT REALITY
         let context = Context::new(path);
-
-        println!("[MATRIX] Loading Project: {:?}", path);
-        println!("[MATRIX] Detected Spline: {:?}", context.spline);
-
+        println!("[MATRIX] 👁️ Reality Detected: {:?}", context.spline);
         Self {
             root_path: path.to_path_buf(),
             spline: context.spline,
@@ -27,61 +24,60 @@ impl ProjectView {
 
     pub fn get_icon_name(&self) -> &str {
         match self.spline {
-            Spline::UnaOS => "computer-symbolic", // The Monolith
-            Spline::Rust => "applications-engineering-symbolic", // The Gear
-            Spline::Web => "network-server-symbolic", // The Web
-            Spline::Python => "media-playlist-shuffle-symbolic", // The Snake (Abstract)
-            Spline::Void => "folder-symbolic",    // Generic
+            Spline::UnaOS => "computer-symbolic",
+            Spline::Rust => "applications-engineering-symbolic",
+            Spline::Web => "network-server-symbolic",
+            Spline::Python => "media-playlist-shuffle-symbolic",
+            Spline::Void => "folder-symbolic",
         }
     }
 }
 
-pub fn create_view(tx: Sender<Event>) -> Widget {
+/// The UI Builder. It takes the Nerve Transmitter and binds it to the GTK event loop.
+pub fn create_view(nerve_tx: Sender<SMessage>, root_path: &Path) -> Widget {
     let matrix_list = ListBox::new();
-    matrix_list.set_selection_mode(gtk4::SelectionMode::None);
+    matrix_list.set_selection_mode(gtk4::SelectionMode::Single);
 
-    // Initialize ProjectView to detect Spline
-    let project_view = ProjectView::new(Path::new("."));
-    // We could use project_view.get_icon_name() to decorate the root if we displayed a root node.
-    // For now, it just logs to stdout as requested.
+    let _project_view = ProjectView::new(root_path);
 
-    if let Ok(entries) = fs::read_dir(".") {
-        for entry in entries.flatten() {
-            if let Ok(ft) = entry.file_type() {
-                if ft.is_file() {
-                    if let Some(name) = entry.file_name().to_str() {
-                        let row = Box::new(Orientation::Horizontal, 10);
-                        row.set_margin_start(10);
-                        row.set_margin_end(10);
-                        row.set_margin_top(5);
-                        row.set_margin_bottom(5);
-                        row.append(&Image::from_icon_name("text-x-generic-symbolic"));
-                        let label = Label::new(Some(name));
-                        label.set_hexpand(true);
-                        label.set_xalign(0.0);
-                        row.append(&label);
-                        matrix_list.append(&row);
-                    }
-                }
-            }
+    // 1. BLITZ THE TOPOLOGY
+    // Instead of a flat read_dir, we use the Scanner to get the spatial nodes.
+    if let Ok(MatrixEvent::IngestTopology { nodes, .. }) = MatrixScanner::map_topology(root_path) {
+        // Filter to just the files (modules) for the visual list
+        for node in nodes.into_iter().filter(|n| n.kind == "module") {
+            let row = Box::new(Orientation::Horizontal, 10);
+            row.set_margin_start(10);
+            row.set_margin_end(10);
+            row.set_margin_top(5);
+            row.set_margin_bottom(5);
+
+            row.append(&Image::from_icon_name("text-x-generic-symbolic"));
+
+            let label = Label::new(Some(&node.id));
+            label.set_hexpand(true);
+            label.set_xalign(0.0);
+
+            // HACK/ELEGANCE: Store the absolute path in the widget's internal name string.
+            // This avoids complex GTK subclassing just to hold a PathBuf.
+            row.set_widget_name(&node.path.to_string_lossy());
+
+            row.append(&label);
+            matrix_list.append(&row);
         }
     }
 
-    let tx_clone_matrix = tx.clone();
+    // 2. WIRE THE SYNAPSE
+    let tx_clone = nerve_tx.clone();
     matrix_list.connect_row_activated(move |_list, row| {
         if let Some(child) = row.child() {
-            if let Some(box_widget) = child.downcast_ref::<Box>() {
-                let mut children = box_widget.first_child();
-                while let Some(c) = children {
-                    if let Some(label) = c.downcast_ref::<Label>() {
-                        let text = label.text();
-                        let _ = tx_clone_matrix
-                            .send_blocking(Event::MatrixFileClick(PathBuf::from(text.as_str())));
-                        break;
-                    }
-                    children = c.next_sibling();
-                }
-            }
+            // Extract the path we hid in the widget name
+            let path_str = child.widget_name();
+            let path = PathBuf::from(path_str.as_str());
+
+            println!("[MATRIX] ⚡ Firing Synapse: Node Selected -> {:?}", path);
+
+            // Fire the impulse across the OS bus. Una (the IDE) will catch this.
+            let _ = tx_clone.send(SMessage::Matrix(MatrixEvent::NodeSelected(path)));
         }
     });
 

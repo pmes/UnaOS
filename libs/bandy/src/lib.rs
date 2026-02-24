@@ -2,6 +2,7 @@ pub mod synapse;
 pub mod telemetry;
 
 use serde::{Deserialize, Serialize};
+use std::path::PathBuf;
 pub use synapse::Synapse;
 
 /// SMessage (The Shard Message).
@@ -51,6 +52,44 @@ pub enum SMessage {
     TerminalOutput(String),
     TerminalError(String),
     FileSystemEvent(String),
+
+    // --- PRINCIPIA (The Basal Ganglia) ---
+    Principia(PrincipiaCommand),
+
+    // --- MATRIX (The Spatial Cortex) ---
+    Matrix(MatrixEvent),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum PrincipiaCommand {
+    SetSystemRoot(PathBuf),
+    SystemRootChanged(PathBuf),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum MatrixEvent {
+    /// Matrix broadcasts the entire topological map of the OS
+    IngestTopology { nodes: Vec<SpatialNode>, edges: Vec<SpatialEdge> },
+    /// Vein asks Matrix to focus on a specific sector (e.g., "euclase")
+    FocusSector(String),
+    /// Matrix returns the raw context of that sector
+    SectorFocused { target: String, context: String },
+    /// Matrix UI fires this when a spatial node is activated
+    NodeSelected(PathBuf),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SpatialNode {
+    pub id: String,
+    pub kind: String, // "crate", "struct", "fn"
+    pub path: PathBuf,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SpatialEdge {
+    pub from: String,
+    pub to: String,
+    pub relation: String, // "imports", "implements", "calls"
 }
 
 /// The trait that defines a "Nerve Ending" in the system.
