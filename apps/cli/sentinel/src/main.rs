@@ -69,7 +69,7 @@ fn main() -> Result<()> {
     println!(">> INITIATING PHASE 2: SEMANTIC VAULT VERIFICATION");
 
     // Ask the Plexus for the absolute truth
-    let vault_path = elessar::gneiss_pal::paths::UnaPaths::lumen_storage();
+    let vault_path = elessar::gneiss_pal::paths::UnaPaths::primary_vault();
 
     if vault_path.exists() {
         // Open in Read-Only mode so we don't corrupt Lumen's active session

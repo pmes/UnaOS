@@ -18,8 +18,8 @@ fn main() {
     let asset_path = UnaPaths::root().join("quartzite.gresource");
 
     // Split the brain: Conscious (Vein) vs Subconscious (Core)
-    let vein_storage = UnaPaths::lumen_storage();
-    let cortex_vault = UnaPaths::root().join("cortex.vault");
+    let vein_storage = UnaPaths::primary_vault();
+    let cortex_vault = UnaPaths::subconscious_vault();
 
     // 2. Ignite Telemetry
     telemetry::ignite(UnaPaths::root().join("logs"));

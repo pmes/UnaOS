@@ -88,13 +88,14 @@ impl CommsSpline {
             .suggested-action { background-color: #0078d4; color: #ffffff; border-radius: 4px; }
             .attach-action { border-radius: 4px; }
 
-            /* Pulse Animation */
-            @keyframes throb {
-                0% { opacity: 0.3; }
-                50% { opacity: 1.0; }
-                100% { opacity: 0.3; }
+            /* Spin Animation */
+            @keyframes spin {
+                to { transform: rotate(1turn); }
             }
-            .pulse-active { animation: throb 1.5s infinite ease-in-out; color: #0078d4; }
+            .spin-active {
+                animation: spin 1.2s linear infinite;
+                color: #0078d4;
+            }
             .nexus-header { font-weight: bold; margin-top: 12px; margin-bottom: 4px; opacity: 0.7; font-size: 0.9em; }
 
             .role-architect { color: #0078d4; font-weight: bold; }
@@ -116,10 +117,10 @@ impl CommsSpline {
             .build();
 
         let token_label = Label::new(Some("Tokens: 0"));
-        token_label.add_css_class("dim-label");
+//        token_label.add_css_class("dim-label");
         token_label.set_margin_end(10);
 
-        let pulse_icon = Image::from_icon_name("activity-start-symbolic");
+        let pulse_icon = Image::from_icon_name("spinner-symbolic");
         pulse_icon.set_pixel_size(16);
         pulse_icon.set_opacity(0.3);
 
@@ -1060,10 +1061,10 @@ impl CommsSpline {
                     }
                     GuiUpdate::SidebarStatus(state) => match state {
                         WolfpackState::Dreaming => {
-                            pulse_icon_clone.add_css_class("pulse-active");
+                            pulse_icon_clone.add_css_class("spin-active");
                         }
                         _ => {
-                            pulse_icon_clone.remove_css_class("pulse-active");
+                            pulse_icon_clone.remove_css_class("spin-active");
                         }
                     },
                     GuiUpdate::TokenUsage(tokens) => {

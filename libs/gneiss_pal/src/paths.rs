@@ -6,13 +6,10 @@ use std::path::PathBuf;
 pub struct UnaPaths;
 
 impl UnaPaths {
-    /// The root of the organism.
-    /// Bare-metal: `/`. Host-mode: `$UNA_ROOT` or XDG Data Local (`~/.local/share/unaos`).
     pub fn root() -> PathBuf {
         if let Ok(root) = env::var("UNA_ROOT") {
             return PathBuf::from(root);
         }
-
         let mut vault = PathBuf::from(
             env::var("HOME").expect("CRITICAL: HOME environment variable missing. Engine stalled."),
         );
@@ -20,11 +17,14 @@ impl UnaPaths {
         vault
     }
 
-    // --- The Organs ---
-
-    /// The AI Cortex (Vein) - LLM Models and Vector DBs
+    /// The AI Cortex (Vein) - LLM Models and Subconscious
     pub fn cortex() -> PathBuf {
         Self::root().join("cortex")
+    }
+
+    /// The Subconscious Vault (Raw Telemetry)
+    pub fn subconscious_vault() -> PathBuf {
+        Self::cortex().join("subconscious.ufs")
     }
 
     /// The Memory Vault (UnaFS) - The Encrypted Block Storage
@@ -32,14 +32,14 @@ impl UnaPaths {
         Self::root().join("vault")
     }
 
+    /// The Primary Conscious Memory (Replaces lumen_storage)
+    pub fn primary_vault() -> PathBuf {
+        Self::vault().join("primary.ufs")
+    }
+
     /// System Policy (Principia) - OS Configuration
     pub fn config() -> PathBuf {
         Self::root().join("principia")
-    }
-
-    /// The Lumen Storage File - The specific UnaFS block file
-    pub fn lumen_storage() -> PathBuf {
-        Self::root().join("lumen").join("lumen_storage.ufs")
     }
 
     /// Bootstraps the physical directory structure. Fails hard if the host rejects us.
@@ -48,8 +48,7 @@ impl UnaPaths {
             Self::cortex(),
             Self::vault(),
             Self::config(),
-            Self::root().join("lumen"),
-            Self::root().join("logs"), // Ensure Telemetry has a physical home
+            Self::root().join("logs"),
         ];
 
         for node in required_nodes {
