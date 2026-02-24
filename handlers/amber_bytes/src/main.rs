@@ -420,7 +420,7 @@ fn wipe_target(
         while bytes_written < file_len {
             // Fill Buffer
             if method == "random" {
-                rand::thread_rng().fill(&mut buffer[..]);
+                rand::rng().fill_bytes(&mut buffer[..]);
             } else {
                 // "zeros" - buffer is already zeroed, but ensure clean if reused
                 buffer.fill(0);

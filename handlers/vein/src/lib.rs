@@ -47,8 +47,15 @@ fn get_mime_type(filename: &str) -> String {
 }
 
 fn trigger_upload(path: PathBuf, gui_tx: async_channel::Sender<GuiUpdate>) {
-    let filename = path.file_name().unwrap_or_default().to_string_lossy().to_string();
-    let _ = gui_tx.try_send(GuiUpdate::ConsoleLog(format!("\n[SYSTEM] :: Uploading: {}...\n", filename)));
+    let filename = path
+        .file_name()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .to_string();
+    let _ = gui_tx.try_send(GuiUpdate::ConsoleLog(format!(
+        "\n[SYSTEM] :: Uploading: {}...\n",
+        filename
+    )));
 
     std::thread::spawn(move || {
         let rt = Runtime::new().unwrap();
@@ -56,7 +63,12 @@ fn trigger_upload(path: PathBuf, gui_tx: async_channel::Sender<GuiUpdate>) {
             let file_bytes = match std::fs::read(&path) {
                 Ok(b) => b,
                 Err(e) => {
-                    let _ = gui_tx.send(GuiUpdate::ConsoleLog(format!("\n[SYSTEM ERROR] :: File Read Failed: {}\n", e))).await;
+                    let _ = gui_tx
+                        .send(GuiUpdate::ConsoleLog(format!(
+                            "\n[SYSTEM ERROR] :: File Read Failed: {}\n",
+                            e
+                        )))
+                        .await;
                     return;
                 }
             };
@@ -81,15 +93,30 @@ fn trigger_upload(path: PathBuf, gui_tx: async_channel::Sender<GuiUpdate>) {
                             let mime = get_mime_type(&filename);
                             let tag = format!("\n[ATTACHMENT:{}|{}]\n", mime, uri);
                             let _ = gui_tx.send(GuiUpdate::AppendInput(tag)).await;
-                            let _ = gui_tx.send(GuiUpdate::ConsoleLog(format!("\n[SYSTEM] :: Upload Complete: {}\n", filename))).await;
+                            let _ = gui_tx
+                                .send(GuiUpdate::ConsoleLog(format!(
+                                    "\n[SYSTEM] :: Upload Complete: {}\n",
+                                    filename
+                                )))
+                                .await;
                         }
                     }
                 }
                 Ok(response) => {
-                    let _ = gui_tx.send(GuiUpdate::ConsoleLog(format!("\n[SYSTEM ERROR] :: Upload Failed: {}\n", response.status()))).await;
+                    let _ = gui_tx
+                        .send(GuiUpdate::ConsoleLog(format!(
+                            "\n[SYSTEM ERROR] :: Upload Failed: {}\n",
+                            response.status()
+                        )))
+                        .await;
                 }
                 Err(e) => {
-                    let _ = gui_tx.send(GuiUpdate::ConsoleLog(format!("\n[SYSTEM ERROR] :: Upload Request Failed: {}\n", e))).await;
+                    let _ = gui_tx
+                        .send(GuiUpdate::ConsoleLog(format!(
+                            "\n[SYSTEM ERROR] :: Upload Request Failed: {}\n",
+                            e
+                        )))
+                        .await;
                 }
             }
         });
@@ -119,7 +146,10 @@ fn parse_multimodal_text(text: &str) -> Vec<Part> {
                 {
                     parts.push(Part::file_data(clean_mime, clean_uri));
                 } else {
-                    parts.push(Part::text(format!("[ATTACHMENT:{}|{}]", clean_mime, clean_uri)));
+                    parts.push(Part::text(format!(
+                        "[ATTACHMENT:{}|{}]",
+                        clean_mime, clean_uri
+                    )));
                 }
             }
             current_text = current_text[absolute_end + 1..].to_string();
@@ -431,13 +461,17 @@ impl VeinHandler {
     }
 
     fn append_to_console(&self, text: &str) {
-        let _ = self.gui_tx.try_send(GuiUpdate::ConsoleLog(text.to_string()));
+        let _ = self
+            .gui_tx
+            .try_send(GuiUpdate::ConsoleLog(text.to_string()));
     }
 }
 
 impl BandyMember for VeinHandler {
     fn publish(&self, _topic: &str, msg: SMessage) -> anyhow::Result<()> {
-        self.bandy_tx.send(msg).map_err(|e| anyhow::anyhow!("Bandy Send Error: {}", e))?;
+        self.bandy_tx
+            .send(msg)
+            .map_err(|e| anyhow::anyhow!("Bandy Send Error: {}", e))?;
         Ok(())
     }
 }
@@ -466,7 +500,10 @@ impl AppHandler for VeinHandler {
                     trigger_upload(path, self.gui_tx.clone());
                 } else {
                     if let Err(e) = self.tx.send(text) {
-                        self.append_to_console(&format!("\n[SYSTEM ERROR] :: Failed to send: {}\n", e));
+                        self.append_to_console(&format!(
+                            "\n[SYSTEM ERROR] :: Failed to send: {}\n",
+                            e
+                        ));
                     }
                 }
             }
@@ -496,7 +533,10 @@ impl AppHandler for VeinHandler {
             },
             Event::NavSelect(idx) => {
                 s.nav_index = idx;
-                self.append_to_console(&format!("\n[SYSTEM] :: Switched to navigation item at index {}\n", idx));
+                self.append_to_console(&format!(
+                    "\n[SYSTEM] :: Switched to navigation item at index {}\n",
+                    idx
+                ));
             }
             Event::FileSelected(path) => {
                 trigger_upload(path, self.gui_tx.clone());

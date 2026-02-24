@@ -29,11 +29,19 @@ impl log::Log for UnaLogger {
             match OpenOptions::new().create(true).append(true).open(&log_file) {
                 Ok(mut file) => {
                     if let Err(e) = file.write_all(msg.as_bytes()) {
-                        eprintln!(">> [TELEMETRY FAULT] Failed to write to {}: {}", log_file.display(), e);
+                        eprintln!(
+                            ">> [TELEMETRY FAULT] Failed to write to {}: {}",
+                            log_file.display(),
+                            e
+                        );
                     }
                 }
                 Err(e) => {
-                    eprintln!(">> [TELEMETRY FAULT] Failed to open {}: {}", log_file.display(), e);
+                    eprintln!(
+                        ">> [TELEMETRY FAULT] Failed to open {}: {}",
+                        log_file.display(),
+                        e
+                    );
                 }
             }
         }
@@ -46,7 +54,11 @@ impl log::Log for UnaLogger {
 pub fn ignite(log_dir: PathBuf) {
     if !log_dir.exists() {
         if let Err(e) = fs::create_dir_all(&log_dir) {
-            eprintln!(">> [CRITICAL] Failed to construct telemetry vault at {}: {}", log_dir.display(), e);
+            eprintln!(
+                ">> [CRITICAL] Failed to construct telemetry vault at {}: {}",
+                log_dir.display(),
+                e
+            );
             return;
         }
     }

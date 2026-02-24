@@ -1,8 +1,8 @@
 pub mod synapse;
 pub mod telemetry;
 
-pub use synapse::Synapse;
 use serde::{Deserialize, Serialize};
+pub use synapse::Synapse;
 
 /// SMessage (The Shard Message).
 /// The atomic unit of truth in UnaOS.
@@ -28,12 +28,17 @@ pub enum SMessage {
         samples: Vec<f32>,
         sample_rate: u32,
     },
-    Spectrum { magnitude: Vec<f32> },
+    Spectrum {
+        magnitude: Vec<f32>,
+    },
 
     // --- VEIN / LUMEN (The Mind) ---
     UserPrompt(String),
     AiToken(String),
-    AnalyzeContext { id: String, content: String },
+    AnalyzeContext {
+        id: String,
+        content: String,
+    },
 
     // --- UNAFS / MATRIX (The Memory) ---
     FileEvent {

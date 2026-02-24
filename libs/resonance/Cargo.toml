@@ -5,6 +5,6 @@ edition = "2024"
 
 [dependencies]
 bandy = { path = "../bandy" }
-anyhow = "1.0.101"
+anyhow = "1.0.102"
 cpal = "0.15"
 ringbuf = "0.3"

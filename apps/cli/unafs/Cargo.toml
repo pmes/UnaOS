@@ -15,4 +15,4 @@ bandy = { path = "../../../libs/bandy" }
 # CLI Utilities
 clap = { version = "4.5", features = ["derive"] }
 anyhow = "1.0"
-tokio = { version = "1.0", features = ["full"] }
+tokio = { version = "1.49", features = ["full"] }

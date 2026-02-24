@@ -15,7 +15,9 @@ impl SynapticRetry for RequestBuilder {
         loop {
             // Clone the request. If it panics here, you passed a streaming body
             // that can't be cloned. Don't do that in the Cortex.
-            let req = self.try_clone().expect("CRITICAL: Uncloneable Cortex payload");
+            let req = self
+                .try_clone()
+                .expect("CRITICAL: Uncloneable Cortex payload");
             let res = req.send().await?;
 
             if res.status() == StatusCode::TOO_MANY_REQUESTS {

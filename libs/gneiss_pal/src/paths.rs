@@ -14,7 +14,7 @@ impl UnaPaths {
         }
 
         let mut vault = PathBuf::from(
-            env::var("HOME").expect("CRITICAL: HOME environment variable missing. Engine stalled.")
+            env::var("HOME").expect("CRITICAL: HOME environment variable missing. Engine stalled."),
         );
         vault.push(".local/share/unaos");
         vault
@@ -55,7 +55,11 @@ impl UnaPaths {
         for node in required_nodes {
             if !node.exists() {
                 fs::create_dir_all(&node).map_err(|e| {
-                    format!("CRITICAL: Failed to carve spatial anchor at {}: {}", node.display(), e)
+                    format!(
+                        "CRITICAL: Failed to carve spatial anchor at {}: {}",
+                        node.display(),
+                        e
+                    )
                 })?;
             }
         }

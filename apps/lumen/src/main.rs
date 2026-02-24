@@ -1,7 +1,7 @@
 mod core;
 mod cortex;
 
-use bandy::{telemetry, SMessage, Synapse};
+use bandy::{SMessage, Synapse, telemetry};
 use gneiss_pal::paths::UnaPaths;
 use gtk4::ApplicationWindow;
 use quartzite::{self, Backend};

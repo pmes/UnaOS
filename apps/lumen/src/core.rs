@@ -25,14 +25,19 @@ pub async fn ignite(vault_path: PathBuf, mut synapse: Synapse) {
                     log::warn!(">> [LUMEN CORE] Kill signal received. Severing.");
                     break;
                 }
-                SMessage::Log { source, content, .. } => {
+                SMessage::Log {
+                    source, content, ..
+                } => {
                     let payload = format!("{}: {}", source, content);
                     cortex.imprint("stimulus.log", payload.as_bytes());
                 }
                 _ => {} // The subconscious absorbs the noise.
             },
             Err(RecvError::Lagged(skipped)) => {
-                log::warn!(">> [LUMEN CORE] Synapse overloaded. Skipped {} stimuli.", skipped);
+                log::warn!(
+                    ">> [LUMEN CORE] Synapse overloaded. Skipped {} stimuli.",
+                    skipped
+                );
             }
             Err(RecvError::Closed) => {
                 log::warn!(">> [LUMEN CORE] Nervous system severed. Shutting down.");
