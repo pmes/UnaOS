@@ -3,6 +3,7 @@
 
 pub mod api;
 pub mod forge;
+pub mod io;
 pub mod paths;
 pub mod persistence;
 pub mod shard;

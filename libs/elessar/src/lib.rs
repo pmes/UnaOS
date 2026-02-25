@@ -1,11 +1,16 @@
-pub use gneiss_pal;
+#[cfg(feature = "gtk")]
 pub use quartzite;
+
+pub mod context;
 
 // Facade for the Trinity
 pub mod prelude {
     pub use gneiss_pal::{AppHandler, DashboardState, Event, GuiUpdate};
+    #[cfg(feature = "gtk")]
     pub use gtk4::prelude::*;
+    #[cfg(feature = "gtk")]
     pub use gtk4::{self, ApplicationWindow, Widget, Window};
+    #[cfg(feature = "gtk")]
     pub use quartzite::Backend;
 }
 

@@ -8,6 +8,7 @@ pub mod catalog;
 pub mod fs;
 pub mod hash;
 pub mod inode;
+pub mod io;
 pub mod query;
 pub mod storage;
 pub mod superblock;

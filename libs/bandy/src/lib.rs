@@ -40,6 +40,14 @@ pub enum SMessage {
         id: String,
         content: String,
     },
+    // Vaire / Git Integration
+    GetDiff {
+        commit_a: String,
+        commit_b: String,
+    },
+    DiffPayload {
+        diff: String,
+    },
 
     // --- UNAFS / MATRIX (The Memory) ---
     FileEvent {
