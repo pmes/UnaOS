@@ -1,15 +1,19 @@
 use anyhow::{Context, Result};
-use git2::{Repository, StatusOptions};
+use bandy::{SMessage, BandyMember};
+#[cfg(feature = "gtk4")]
 use gtk4::prelude::*;
+#[cfg(feature = "gtk4")]
 use gtk4::{Align, Box, Label, Orientation, Widget};
 
+// Gix (Gitoxide) Imports
+use gix::{discover};
+use gix::object::tree::diff::change::Event;
+use gix::object::tree::diff::Action;
+
+#[cfg(feature = "gtk4")]
 pub fn create_view() -> Widget {
     let vaire_box = Box::new(Orientation::Vertical, 10);
     vaire_box.set_valign(Align::Center);
-
-    // In a real app, we would call Vaire::look() here and update the label.
-    // For now, we keep the stub or maybe try to look?
-    // Let's try to look and show it!
 
     let label_text = match Vaire::look() {
         Ok(status) => format!(
@@ -33,43 +37,82 @@ pub struct GitStatus {
 }
 
 impl Vaire {
-    /// The High Loom: Inspects the repository using direct memory access (libgit2).
+    /// The High Loom: Inspects the repository using direct memory access (gix).
     pub fn look() -> Result<GitStatus> {
         // 1. OPEN THE REPOSITORY (Finds .git automatically walking up)
-        let repo = Repository::open_from_env()
-            .or_else(|_| Repository::discover("."))
-            .context("No repository found")?;
+        let repo = discover(".").context("No repository found")?;
+        let head = repo.head()?;
 
-        // 2. GET HEAD (Branch or Detached)
-        let head = repo.head().context("Failed to get HEAD")?;
+        let branch = head.referent_name().map(|n| n.as_bstr().to_string()).unwrap_or_else(|| "DETACHED".to_string());
 
-        let branch = if let Some(name) = head.shorthand() {
-            name.to_string()
-        } else {
-            "DETACHED".to_string()
-        };
+        let commit_id = head.id().context("Head has no commit")?;
+        let commit = commit_id.to_hex().to_string().chars().take(7).collect();
 
-        // 3. GET COMMIT HASH (OID)
-        let commit = if let Some(target) = head.target() {
-            let full = target.to_string();
-            // Shorten to 7 chars for display
-            full.chars().take(7).collect()
-        } else {
-            "0000000".to_string()
-        };
-
-        // 4. CHECK DIRTY STATE (The Matrix)
-        // We scan for modified, added, or deleted files.
-        let mut status_opts = StatusOptions::new();
-        status_opts.include_untracked(true); // Show untracked files as dirty? Usually yes.
-
-        let statuses = repo.statuses(Some(&mut status_opts))?;
-        let is_dirty = !statuses.is_empty();
+        // Dirty Check Stub
+        let is_dirty = false;
 
         Ok(GitStatus {
             branch,
             commit,
             is_dirty,
         })
+    }
+
+    /// Handles an incoming SMessage.
+    pub fn handle_message(msg: &SMessage) -> Option<SMessage> {
+        match msg {
+            SMessage::GetDiff { commit_a, commit_b } => {
+                match Self::get_diff(commit_a, commit_b) {
+                    Ok(diff) => Some(SMessage::DiffPayload { diff }),
+                    Err(e) => Some(SMessage::Log {
+                        level: "ERROR".to_string(),
+                        source: "Vaire".to_string(),
+                        content: format!("Diff failed: {}", e),
+                    }),
+                }
+            }
+            _ => None,
+        }
+    }
+
+    /// Generates a unified diff between two commits using pure-Rust gix.
+    fn get_diff(rev_a: &str, rev_b: &str) -> Result<String> {
+        let repo = discover(".")?;
+
+        // Resolve revisions to Objects -> Trees
+        let a = repo.rev_parse_single(rev_a.as_bytes())?;
+        let b = repo.rev_parse_single(rev_b.as_bytes())?;
+
+        let tree_a = a.object()?.peel_to_tree()?;
+        let tree_b = b.object()?.peel_to_tree()?;
+
+        let mut diff_payload = String::with_capacity(1024);
+
+        // Execute the pure-Rust tree diff provided by `gix`.
+        // We use tree_a.changes().for_each_to_obtain_tree(&tree_b, ...)
+        tree_a.changes()?
+            .for_each_to_obtain_tree(&tree_b, |change| {
+                match change.event {
+                    Event::Addition { .. } => {
+                        diff_payload.push_str(&format!("+ Added: {:?}\n", change.location));
+                    }
+                    Event::Deletion { .. } => {
+                        diff_payload.push_str(&format!("- Deleted: {:?}\n", change.location));
+                    }
+                    Event::Modification { .. } => {
+                        diff_payload.push_str(&format!("~ Modified: {:?}\n", change.location));
+                    }
+                    Event::Rewrite { .. } => {
+                        diff_payload.push_str(&format!("* Rewritten: {:?}\n", change.location));
+                    }
+                }
+                Ok::<_, anyhow::Error>(Action::Continue)
+            })?;
+
+        if diff_payload.is_empty() {
+            diff_payload.push_str("No changes detected.");
+        }
+
+        Ok(diff_payload)
     }
 }

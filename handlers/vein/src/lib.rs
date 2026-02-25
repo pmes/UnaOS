@@ -1,3 +1,4 @@
+pub mod cortex;
 pub mod model;
 pub mod storage;
 pub mod synapse;
@@ -195,12 +196,19 @@ impl VeinHandler {
         let gui_tx_brain = gui_tx.clone();
         let state_bg = state.clone();
         let brain_bg = brain.clone();
+        let bandy_tx_bg = bandy_tx.clone();
 
         thread::spawn(move || {
             let rt = Runtime::new().expect("Failed to create Tokio Runtime");
             rt.block_on(async move {
                 let now = Local::now().format("%Y-%m-%d %H:%M:%S.%3f");
                 let _ = gui_tx_brain.send(GuiUpdate::ConsoleLog(format!("VEIN: [{}] [INFO] :: BRAIN :: Connecting...\n", now))).await;
+
+                // Fire up the Cortex Indexer in the background
+                let root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+                rt.spawn(async move {
+                    cortex::run_indexer(root, bandy_tx_bg).await;
+                });
 
                 let mut disk = DiskManager::new(&vault_path_bg).expect("Failed to initialize Semantic Vault (UnaFS)");
 

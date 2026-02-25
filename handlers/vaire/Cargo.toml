@@ -3,10 +3,15 @@ name = "vaire"
 version = "0.1.0"
 edition = "2024"
 
+[features]
+default = []
+
 [dependencies]
 anyhow = "1.0"
 bandy = { path = "../../libs/bandy" }
-git2 = { version = "0.20", default-features = false }
-elessar = { path = "../../libs/elessar" }
-gtk4 = { version = "0.10.3", features = ["v4_12"] }
-glib = "0.21"
+# git2 removed in favor of pure-Rust gix
+gix = { version = "0.66", default-features = false, features = ["parallel", "revision", "blob-diff"] }
+# elexar uses glib/gtk by default, we need to disable that if we are testing in isolation
+elessar = { path = "../../libs/elessar", default-features = false }
+gtk4 = { version = "0.10.3", features = ["v4_12"], optional = true }
+glib = { version = "0.21", optional = true }
