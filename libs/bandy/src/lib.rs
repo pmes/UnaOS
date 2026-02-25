@@ -3,7 +3,30 @@ pub mod telemetry;
 
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
+use std::sync::Arc;
 pub use synapse::Synapse;
+
+/// WeightedSkeleton
+///
+/// A struct representing a scored, prioritized code skeleton.
+/// This is the payload for the Context Telemetry stream.
+///
+/// It wraps the raw `content` in an `Arc<String>` to allow zero-copy
+/// passing between threads (e.g., from the Vein Cortex thread to the GTK Main Loop).
+///
+/// Note: The `content` field is skipped during serialization because `Arc`
+/// pointers are only valid within the same process address space.
+/// For future inter-process telemetry, we will rely on `unafs` shared memory paths.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WeightedSkeleton {
+    /// The file path of the skeleton source.
+    pub path: PathBuf,
+    /// The calculated relevance score (Gravity Model).
+    pub score: f32,
+    /// The raw skeleton content (Arc-wrapped for zero-copy thread transfer).
+    #[serde(skip)]
+    pub content: Arc<String>,
+}
 
 /// SMessage (The Shard Message).
 /// The atomic unit of truth in UnaOS.
@@ -47,6 +70,10 @@ pub enum SMessage {
     },
     DiffPayload {
         diff: String,
+    },
+    // Context Telemetry (Lumen HUD)
+    ContextTelemetry {
+        skeletons: Vec<WeightedSkeleton>,
     },
 
     // --- UNAFS / MATRIX (The Memory) ---

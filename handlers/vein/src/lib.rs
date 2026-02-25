@@ -1,4 +1,5 @@
 pub mod cortex;
+pub mod gravity;
 pub mod model;
 pub mod storage;
 pub mod synapse;
@@ -23,6 +24,8 @@ use tokio::sync::{broadcast, mpsc};
 
 use crate::storage::DiskManager;
 use bandy::{BandyMember, SMessage};
+#[cfg(feature = "glib")]
+use glib;
 
 struct State {
     mode: ViewMode,
@@ -179,6 +182,7 @@ impl VeinHandler {
         gui_tx: async_channel::Sender<GuiUpdate>,
         history_path: PathBuf,
         bandy_tx: broadcast::Sender<SMessage>,
+        #[cfg(feature = "glib")] telemetry_tx: glib::Sender<SMessage>,
     ) -> Self {
         let vault_path_bg = history_path.clone();
         let brain = BrainManager::new(history_path);
@@ -213,6 +217,9 @@ impl VeinHandler {
                 // We drop the `rt.` prefix and use `tokio::spawn` directly.
                 // This schedules the task on the running engine without trying to move the engine itself.
                 tokio::spawn(async move {
+                    #[cfg(feature = "glib")]
+                    cortex::run_indexer(root, bandy_tx_bg, telemetry_tx).await;
+                    #[cfg(not(feature = "glib"))]
                     cortex::run_indexer(root, bandy_tx_bg).await;
                 });
 

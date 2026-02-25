@@ -1,9 +1,12 @@
 mod core;
 mod cortex;
+mod ui;
 
+use crate::ui::telemetry::ContextView;
 use bandy::{SMessage, Synapse, telemetry};
 use gneiss_pal::paths::UnaPaths;
-use gtk4::ApplicationWindow;
+use gtk4::prelude::*;
+use gtk4::{ApplicationWindow, Paned, Orientation};
 use quartzite::{self, Backend};
 use std::rc::Rc;
 use vein::{CommsSpline, VeinHandler};
@@ -24,6 +27,10 @@ fn main() {
     // 2. Ignite Telemetry
     telemetry::ignite(UnaPaths::root().join("logs"));
     log::info!("Lumen Boot Sequence Initiated.");
+
+    // NEW: Create Telemetry Channel (High Priority)
+    // This is the direct line from the Cortex to the HUD.
+    let (telemetry_tx, telemetry_rx) = glib::MainContext::channel(glib::Priority::DEFAULT);
 
     // 3. Ignite the Spine
     let synapse = Synapse::new();
@@ -49,7 +56,8 @@ fn main() {
 
     // 7. Ignite the AI Handler (The Conscious Vein)
     let (gui_tx, gui_rx) = async_channel::unbounded();
-    let app = VeinHandler::new(gui_tx, vein_storage, synapse.tx());
+    // We pass the telemetry_tx to Vein so it can broadcast gravity updates.
+    let app = VeinHandler::new(gui_tx, vein_storage, synapse.tx(), telemetry_tx);
 
     synapse.fire(SMessage::Log {
         level: String::from("INFO"),
@@ -59,7 +67,37 @@ fn main() {
 
     // 8. View & Engine Ignition
     let spline = Rc::new(CommsSpline::new());
-    let bootstrap = move |window: &ApplicationWindow, tx, rx| spline.bootstrap(window, tx, rx);
+
+    // THE FUSION: We wrap the Vein UI with our new HUD.
+    let bootstrap = move |window: &ApplicationWindow, tx: async_channel::Sender<quartzite::Event>, rx: async_channel::Receiver<vein::model::GuiUpdate>| {
+        // 1. Get the Vein UI (The Command Center)
+        // We cast the generic type to Widget immediately.
+        let vein_widget = spline.bootstrap(window, tx, rx);
+
+        // 2. Create the HUD (ContextView)
+        let hud = ContextView::new();
+        let hud_widget = hud.container.clone();
+
+        // 3. Attach the Telemetry Stream
+        // This closure will run on the main thread whenever the Cortex pushes an update.
+        telemetry_rx.attach(None, move |msg| {
+            if let SMessage::ContextTelemetry { skeletons } = msg {
+                hud.update(skeletons);
+            }
+            glib::ControlFlow::Continue
+        });
+
+        // 4. Fuse them (Paned)
+        // We put the HUD on the right (End) and the Cortex on the left (Start).
+        let root = Paned::new(Orientation::Horizontal);
+        root.set_start_child(Some(&vein_widget));
+        root.set_end_child(Some(&hud_widget));
+        root.set_position(900); // Prioritize Vein width
+        root.set_wide_handle(true);
+        root.set_shrink_end_child(false); // HUD should not shrink to zero
+
+        root.upcast::<gtk4::Widget>()
+    };
 
     // The GTK loop blocks here, keeping the Tokio runtime alive in the background.
     Backend::new("org.unaos.lumen", app, gui_rx, bootstrap);
