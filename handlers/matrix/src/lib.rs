@@ -1,4 +1,4 @@
-use bandy::{SMessage, MatrixEvent};
+use bandy::{MatrixEvent, SMessage};
 use crossbeam_channel::Sender;
 use elessar::{Context, Spline};
 use gtk4::prelude::*;

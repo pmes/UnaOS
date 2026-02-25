@@ -61,6 +61,12 @@ impl CommsSpline {
     ) -> Widget {
         window.set_title(Some("Vein (Trinity Architecture)"));
 
+        // 1. Nodes Tab Rename
+        let store = gio::ListStore::new::<StringObject>();
+        for item in ["Prime", "Encrypted", "Jules (Private)"].iter() {
+            store.append(&StringObject::new(item));
+        }
+
         // THE PULSE (Stripped of Tab Hacks)
         let provider = CssProvider::new();
         provider.load_from_string("
@@ -117,12 +123,12 @@ impl CommsSpline {
             .build();
 
         let token_label = Label::new(Some("Tokens: 0"));
-//        token_label.add_css_class("dim-label");
+        //        token_label.add_css_class("dim-label");
         token_label.set_margin_end(10);
 
         let pulse_icon = Image::from_icon_name("spinner-symbolic");
         pulse_icon.set_pixel_size(16);
-        pulse_icon.set_opacity(0.3);
+        pulse_icon.set_opacity(0.5);
 
         let status_group = Box::new(Orientation::Horizontal, 8);
         status_group.append(&sidebar_toggle);
@@ -415,6 +421,45 @@ impl CommsSpline {
         let right_vbox = Box::new(Orientation::Vertical, 0);
         right_vbox.set_hexpand(true);
 
+        // ... [HeaderBar Setup (Adwaita/GTK)] ...
+
+        // === NEW: NEXUS ACTIVE HEADER ===
+        let nexus_active_header = Label::builder()
+            .use_markup(true)
+            .label("<span font_desc='11' weight='bold' color='#00ffcc'>NEXUS LINK: UNA-PRIME (ACTIVE)</span>")
+            .halign(Align::Center)
+            .margin_top(8)
+            .margin_bottom(8)
+            .build();
+        right_vbox.append(&nexus_active_header);
+
+        // --- Main Content (Console/Input Slider) ---
+        let main_paned = Paned::new(Orientation::Vertical);
+        main_paned.set_vexpand(true);
+        main_paned.set_hexpand(true);
+        main_paned.set_position(9999);
+
+        let scrolled_window = ScrolledWindow::builder()
+            .hscrollbar_policy(PolicyType::Never)
+            .vscrollbar_policy(PolicyType::Automatic)
+            .vexpand(true)
+            .build();
+
+        // === FIX: SAFE AUTO-SCROLL ===
+        let adj = scrolled_window.vadjustment();
+        adj.connect_upper_notify(|adj| {
+            let upper = adj.upper();
+            let page_size = adj.page_size();
+            let max_scroll = (upper - page_size).max(0.0);
+            if (adj.value() - max_scroll).abs() > f64::EPSILON {
+                adj.set_value(max_scroll);
+            }
+        });
+
+        // --- Right Pane (The Command Center) ---
+        let right_vbox = Box::new(Orientation::Vertical, 0);
+        right_vbox.set_hexpand(true);
+
         // --- ARCHITECTURE SPLIT (ADWAITA vs PURE GTK) ---
         #[cfg(feature = "gnome")]
         {
@@ -686,10 +731,11 @@ impl CommsSpline {
         let console_list_view = ListView::new(Some(console_selection), Some(console_factory));
         console_list_view.add_css_class("console");
 
-        // Disable click selection highlighting visually if desired, but SingleSelection is needed for list view.
-        // CSS .console:selected { background: transparent; } might be needed in provider.
+        // === FIX: ALIGN TO BOTTOM ===
+        console_list_view.set_valign(Align::End);
 
         scrolled_window.set_child(Some(&console_list_view));
+
 
         // --- The Spatial Cortex (Euclase Target) ---
         let spatial_canvas = gtk4::Picture::new();
@@ -877,6 +923,32 @@ impl CommsSpline {
         text_view.add_css_class("transparent-text");
         input_scroll.set_child(Some(&text_view));
 
+        // === FIX: CRASH RECOVERY (AUTOSAVE) WITHOUT MACROS ===
+        let draft_path = elessar::gneiss_pal::paths::UnaPaths::root().join(".lumen_draft.txt");
+        if let Ok(draft) = std::fs::read_to_string(&draft_path) {
+            text_view.buffer().set_text(&draft);
+        }
+
+        let pending_save: Rc<RefCell<Option<glib::SourceId>>> = Rc::new(RefCell::new(None));
+        let draft_path_clone = draft_path.clone();
+        let buffer_for_save = text_view.buffer();
+
+        buffer_for_save.connect_changed(move |buf| {
+            if let Some(source) = pending_save.borrow_mut().take() {
+                source.remove();
+            }
+            let (start, end) = buf.bounds();
+            let text = buf.text(&start, &end, false).to_string();
+            let path = draft_path_clone.clone();
+
+            let pending_timeout = pending_save.clone();
+            *pending_save.borrow_mut() = Some(glib::timeout_add_local(std::time::Duration::from_millis(500), move || {
+                let _ = std::fs::write(&path, &text);
+                *pending_timeout.borrow_mut() = None; // Wipe the ghost ID
+                glib::ControlFlow::Break
+            }));
+        });
+
         // Native Button Scaling Fix
         let send_btn = Button::builder()
             .valign(Align::End)
@@ -888,6 +960,7 @@ impl CommsSpline {
         let tx_clone_send = tx_event.clone();
         let buffer = text_view.buffer();
         let btn_send_clone = send_btn.clone();
+
         buffer.connect_changed(move |buf| {
             if buf.line_count() > 1 {
                 btn_send_clone.remove_css_class("suggested-action");
@@ -895,11 +968,13 @@ impl CommsSpline {
                 btn_send_clone.add_css_class("suggested-action");
             }
         });
+
         let key_controller = EventControllerKey::new();
         key_controller.set_propagation_phase(PropagationPhase::Capture);
         let tx_clone_key = tx_event.clone();
         let buffer_key = buffer.clone();
         let target_key = active_target.clone();
+        let draft_wipe_path1 = draft_path.clone();
 
         key_controller.connect_key_pressed(move |_ctrl, key, _keycode, state| {
             if key != Key::Return {
@@ -913,16 +988,11 @@ impl CommsSpline {
                 let (start, end) = buffer_key.bounds();
                 let text = buffer_key.text(&start, &end, false).to_string();
                 if !text.trim().is_empty() {
-                    // === ASYNC DISPATCH ===
+                    let _ = std::fs::remove_file(&draft_wipe_path1); // WIPE DRAFT
                     let tx_async = tx_clone_key.clone();
                     let target_val = target_key.borrow().clone();
                     glib::MainContext::default().spawn_local(async move {
-                        let _ = tx_async
-                            .send(Event::Input {
-                                target: target_val,
-                                text,
-                            })
-                            .await;
+                        let _ = tx_async.send(Event::Input { target: target_val, text }).await;
                     });
                     buffer_key.set_text("");
                 }
@@ -934,20 +1004,17 @@ impl CommsSpline {
 
         let target_send = active_target.clone();
         let buffer_send = buffer.clone();
+        let draft_wipe_path2 = draft_path.clone();
+
         send_btn.connect_clicked(move |_| {
             let (start, end) = buffer_send.bounds();
             let text = buffer_send.text(&start, &end, false).to_string();
             if !text.trim().is_empty() {
-                // === ASYNC DISPATCH ===
+                let _ = std::fs::remove_file(&draft_wipe_path2); // WIPE DRAFT
                 let tx_async = tx_clone_send.clone();
                 let target_val = target_send.borrow().clone();
                 glib::MainContext::default().spawn_local(async move {
-                    let _ = tx_async
-                        .send(Event::Input {
-                            target: target_val,
-                            text,
-                        })
-                        .await;
+                    let _ = tx_async.send(Event::Input { target: target_val, text }).await;
                 });
                 buffer_send.set_text("");
             }
@@ -982,51 +1049,41 @@ impl CommsSpline {
         glib::MainContext::default().spawn_local(async move {
             while let Ok(update) = rx.recv().await {
                 match update {
-                    GuiUpdate::AppendInput(text) => {
-                        let mut end = buffer_async.end_iter();
-                        buffer_async.insert(&mut end, &text);
-                    }
-                    GuiUpdate::Spectrum(_data) => {
-                        // Euclase engine hook will go here.
-                    }
+
                     GuiUpdate::ConsoleLog(text) => {
-                        // Parse incoming log
-                        let mut sender = "System".to_string();
-                        let mut is_chat = true;
-                        let content = text.clone();
-                        let mut subject = "Log".to_string();
+    let mut sender = "System".to_string();
+    let mut is_chat = true;
+    let content = text.clone();
+    let mut subject = "Log".to_string();
 
-                        if text.trim().starts_with("[ARCHITECT]") {
-                            sender = "Architect".to_string();
-                            is_chat = true;
-                        } else if text.trim().starts_with("[UNA]") {
-                            sender = "Una-Prime".to_string();
-                            is_chat = true;
-                        } else if text.trim().starts_with("[S") {
-                            // Check if it's likely a shard (S followed by digit)
-                            let after_s = &text.trim()[2..];
-                            if let Some(first_char) = after_s.chars().next() {
-                                if first_char.is_numeric() {
-                                    sender = "Shard".to_string();
-                                    is_chat = false; // Wolfpack
-                                    subject = "Wolfpack Output".to_string();
-                                }
-                            }
-                        }
+    if text.trim().starts_with("[ARCHITECT]") {
+        sender = "Architect".to_string();
+        is_chat = true;
+    } else if text.trim().starts_with("[UNA]") {
+        sender = "Una-Prime".to_string();
+        is_chat = true;
+    } else if text.trim().starts_with("[S") {
+        let after_s = &text.trim()[2..];
+        if let Some(first_char) = after_s.chars().next() {
+            if first_char.is_numeric() {
+                sender = "Shard".to_string();
+                is_chat = false;
+                subject = "Wolfpack Output".to_string();
+            }
+        }
+    }
 
-                        // Generate local timestamp
-                        let timestamp = glib::DateTime::now_local()
-                            .map(|dt| dt.format("%H:%M:%S").unwrap().to_string())
-                            .unwrap_or_else(|_| "00:00:00".to_string());
+    let timestamp = glib::DateTime::now_local()
+        .map(|dt| dt.format("%H:%M:%S").unwrap().to_string())
+        .unwrap_or_else(|_| "00:00:00".to_string());
 
-                        let id =
-                            format!("{}", chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0));
+    let id = format!("{}", chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0));
 
-                        let obj = DispatchObject::new(
-                            &id, &sender, &subject, &timestamp, &content, is_chat,
-                        );
+    let obj = DispatchObject::new(
+        &id, &sender, &subject, &timestamp, &content, is_chat,
+    );
 
-                        console_store.insert(0, &obj);
+    console_store.append(&obj);
                     }
                     GuiUpdate::ShardStatusChanged { id, status } => {
                         let (spinner, label, name) = if id == "una-prime" {
@@ -1077,6 +1134,12 @@ impl CommsSpline {
                 }
             }
         });
+
+        // === FIX: HARDWIRE NEXUS SELECTION (Put this right before returning main_h_paned) ===
+        // Index 0 is the "PRIMES" label. Index 1 is Una-Prime.
+        if let Some(row) = nexus_list.row_at_index(1) {
+            nexus_list.select_row(Some(&row));
+        }
 
         #[cfg(feature = "gnome")]
         {

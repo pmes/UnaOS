@@ -1,94 +1,89 @@
-use bandy::SMessage;
-use wgpu::*;
+use std::sync::Arc;
+use wgpu::{
+    Backends, Device, DeviceDescriptor, Features, Instance, InstanceDescriptor, Limits,
+    PowerPreference, Queue, RequestAdapterOptions, Surface,
+};
 
-pub struct VisualCortex {
-    device: Device,
-    queue: Queue,
-    surface: Surface<'static>,
-    config: SurfaceConfiguration,
+pub struct Cortex<'a> {
+    pub instance: Instance,
+    pub surface: Surface<'a>,
+    pub device: Arc<Device>,
+    pub queue: Arc<Queue>,
+    pub config: wgpu::SurfaceConfiguration,
 }
 
-impl VisualCortex {
-    /// Ignites the wgpu substrate. Panics if the hardware is unworthy.
-    pub async fn ignite(window: std::sync::Arc<winit::window::Window>) -> Self {
+impl<'a> Cortex<'a> {
+    /// Ignites the visual cortex. Binds to the Quartzite-provided window.
+    pub async fn ignite(
+        window: impl Into<wgpu::SurfaceTarget<'a>>,
+        width: u32,
+        height: u32,
+    ) -> Self {
         let instance = Instance::new(InstanceDescriptor {
-            backends: Backends::VULKAN | Backends::METAL,
+            backends: Backends::VULKAN | Backends::METAL, // Legacy is dead to us.
             ..Default::default()
         });
 
         let surface = instance
-            .create_surface(window.clone())
-            .expect("Surface creation failed.");
+            .create_surface(window)
+            .expect("Surface creation failed. Quartzite betrayed us.");
+
         let adapter = instance
             .request_adapter(&RequestAdapterOptions {
                 power_preference: PowerPreference::HighPerformance,
-                compatible_surface: Some(&surface),
                 force_fallback_adapter: false,
+                compatible_surface: Some(&surface),
             })
             .await
-            .expect("No GPU found. Cortex dead.");
+            .expect("Silicon rejected the adapter request. Engine stalled.");
 
+        // We demand PolygonMode::Line for Vug's wireframes.
         let (device, queue) = adapter
-            .request_device(&DeviceDescriptor::default(), None)
+            .request_device(
+                &DeviceDescriptor {
+                    label: Some("Euclase_Primary_Cortex"),
+                    required_features: Features::POLYGON_MODE_LINE,
+                    required_limits: Limits::default(),
+                },
+                None,
+            )
             .await
-            .expect("Device request denied.");
+            .expect("Device request failed. Insufficient GPU authority.");
 
-        let size = window.inner_size();
-        let config = surface
-            .get_default_config(&adapter, size.width, size.height)
-            .expect("Surface config unsupported.");
+        let surface_caps = surface.get_capabilities(&adapter);
+        let format = surface_caps
+            .formats
+            .into_iter()
+            .find(|f| f.is_srgb())
+            .unwrap_or(surface_caps.formats[0]);
+
+        let config = wgpu::SurfaceConfiguration {
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            format,
+            width: width.max(1),
+            height: height.max(1),
+            present_mode: wgpu::PresentMode::AutoNoVsync, // Tear the screen if you have to. Go fast.
+            alpha_mode: surface_caps.alpha_modes[0],
+            view_formats: vec![],
+            desired_maximum_frame_latency: 2,
+        };
+
         surface.configure(&device, &config);
 
         Self {
-            device,
-            queue,
+            instance,
             surface,
+            device: Arc::new(device),
+            queue: Arc::new(queue),
             config,
         }
     }
 
-    #[inline(always)]
-    pub fn react(&mut self, msg: SMessage) {
-        match msg {
-            SMessage::EuclaseResize(w, h) => {
-                self.config.width = w.max(1);
-                self.config.height = h.max(1);
-                self.surface.configure(&self.device, &self.config);
-            }
-            SMessage::VugPulse => self.render(),
-            _ => {} // Ignore non-visual stimuli
+    pub fn resize(&mut self, width: u32, height: u32) {
+        if width > 0 && height > 0 {
+            self.config.width = width;
+            self.config.height = height;
+            self.surface.configure(&self.device, &self.config);
         }
-    }
-
-    #[inline(always)]
-    fn render(&self) {
-        let frame = self.surface.get_current_texture().expect("Frame dropped.");
-        let view = frame.texture.create_view(&TextureViewDescriptor::default());
-        let mut encoder = self
-            .device
-            .create_command_encoder(&CommandEncoderDescriptor {
-                label: Some("Vug_Pulse"),
-            });
-
-        {
-            let _rpass = encoder.begin_render_pass(&RenderPassDescriptor {
-                label: Some("Vug_Pass"),
-                color_attachments: &[Some(RenderPassColorAttachment {
-                    view: &view,
-                    resolve_target: None,
-                    ops: Operations {
-                        load: LoadOp::Clear(Color::BLACK),
-                        store: StoreOp::Store,
-                    },
-                })],
-                depth_stencil_attachment: None,
-                timestamp_writes: None,
-                occlusion_query_set: None,
-            });
-            // Vug shader pipeline binds go here.
-        }
-
-        self.queue.submit(Some(encoder.finish()));
-        frame.present();
     }
 }

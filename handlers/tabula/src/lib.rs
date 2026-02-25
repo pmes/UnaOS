@@ -64,7 +64,11 @@ impl TabulaView {
     }
 
     pub fn load_file(&self, path: &Path) {
-        let buffer = self.view.buffer().downcast::<sourceview5::Buffer>().unwrap();
+        let buffer = self
+            .view
+            .buffer()
+            .downcast::<sourceview5::Buffer>()
+            .unwrap();
 
         // Auto-detect language based on extension
         if let Some(ext) = path.extension().and_then(|s| s.to_str()) {
@@ -88,7 +92,10 @@ impl TabulaView {
 
         match fs::read_to_string(path) {
             Ok(content) => buffer.set_text(&content),
-            Err(e) => buffer.set_text(&format!("// UNAOS: FAILED TO LOAD {:?}\n// ERROR: {}", path, e)),
+            Err(e) => buffer.set_text(&format!(
+                "// UNAOS: FAILED TO LOAD {:?}\n// ERROR: {}",
+                path, e
+            )),
         }
     }
 }

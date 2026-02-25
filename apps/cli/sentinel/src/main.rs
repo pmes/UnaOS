@@ -9,7 +9,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process;
 use std::time::Instant;
-use unafs::{BlockDevice, FileDevice, Superblock, BLOCK_SIZE};
+use unafs::{BLOCK_SIZE, BlockDevice, FileDevice, Superblock};
 
 const MEMORIA_FILENAME: &str = "UNA_MEMORIA.md"; // Adjusted to match standard UnaOS naming, fallback to MEMORIA.md if needed.
 
@@ -29,7 +29,11 @@ fn main() -> Result<()> {
 
     // --- PHASE 1: PHYSICAL REPO VERIFICATION ---
     println!(">> PHASE 1: STRUCTURAL VERIFICATION");
-    let memoria_path = if Path::new("UNA_MEMORIA.md").exists() { "UNA_MEMORIA.md" } else { "MEMORIA.md" };
+    let memoria_path = if Path::new("UNA_MEMORIA.md").exists() {
+        "UNA_MEMORIA.md"
+    } else {
+        "MEMORIA.md"
+    };
 
     if let Ok(content) = fs::read_to_string(memoria_path) {
         let re = Regex::new(r"\*\s+\*\*\[(CRATE|BIN|SHELL)\]\s+`(.*?)`:\*\*").unwrap();
@@ -39,16 +43,24 @@ fn main() -> Result<()> {
             let type_tag = &cap[1];
             let rel_path = &cap[2];
 
-            if type_tag == "SHELL" { continue; }
+            if type_tag == "SHELL" {
+                continue;
+            }
 
             if Path::new(rel_path).exists() {
                 verified += 1;
             } else {
-                println!("   ❌ [FAIL] MEMORIA hallucination: '{}' is missing.", rel_path);
+                println!(
+                    "   ❌ [FAIL] MEMORIA hallucination: '{}' is missing.",
+                    rel_path
+                );
                 errors += 1;
             }
         }
-        println!("   [PASS] Reality Confirmed. {} Artifacts Verified.", verified);
+        println!(
+            "   [PASS] Reality Confirmed. {} Artifacts Verified.",
+            verified
+        );
     } else {
         println!("   ❌ [FAIL] Could not read Memoria file.");
         errors += 1;
@@ -66,7 +78,10 @@ fn main() -> Result<()> {
                     let total_mb = (sb.block_count * BLOCK_SIZE) / (1024 * 1024);
                     let free_mb = (sb.free_blocks * BLOCK_SIZE) / (1024 * 1024);
                     println!("   [PASS] Vault Signature Valid: UNAFS v{}", sb.version);
-                    println!("   [INFO] Capacity: {} MB Total / {} MB Free", total_mb, free_mb);
+                    println!(
+                        "   [INFO] Capacity: {} MB Total / {} MB Free",
+                        total_mb, free_mb
+                    );
                 } else {
                     println!("   ❌ [FAIL] Vault Superblock Corrupted.");
                     errors += 1;
@@ -74,7 +89,10 @@ fn main() -> Result<()> {
             }
         }
     } else {
-        println!("   [WARN] Vault not found at {}. Awaiting Lumen initialization.", vault_path.display());
+        println!(
+            "   [WARN] Vault not found at {}. Awaiting Lumen initialization.",
+            vault_path.display()
+        );
     }
 
     // --- PHASE 3: CRYPTOGRAPHIC SEAL ---
@@ -115,7 +133,10 @@ fn main() -> Result<()> {
 
     println!("\n----------------------------------------");
     if errors > 0 {
-        println!("🚨 SENTINEL RUN COMPLETE: {} CRITICAL ERRORS DETECTED.", errors);
+        println!(
+            "🚨 SENTINEL RUN COMPLETE: {} CRITICAL ERRORS DETECTED.",
+            errors
+        );
         process::exit(1);
     } else {
         println!("✨ SENTINEL RUN COMPLETE IN {:?}", start.elapsed());

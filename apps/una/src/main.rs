@@ -57,7 +57,9 @@ fn build_ui(app: &Application) {
     sidebar.append(&stack);
 
     // 3. THE WORKSPACE (Tabula & Midden)
-    let tabula = Rc::new(RefCell::new(TabulaView::new(EditorMode::Code("rust".to_string()))));
+    let tabula = Rc::new(RefCell::new(TabulaView::new(EditorMode::Code(
+        "rust".to_string(),
+    ))));
     let tabula_widget = tabula.borrow().widget();
 
     // TODO: Add Midden back to the bottom pane
