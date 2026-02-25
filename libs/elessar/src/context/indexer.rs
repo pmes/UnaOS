@@ -1,6 +1,5 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use log::info;
 use serde::{Deserialize, Serialize};
 
 // We don't need unafs here. We just need standard paths.

@@ -6,10 +6,10 @@ pub mod view;
 pub use view::CommsSpline;
 
 use chrono::Local;
-use elessar::gneiss_pal::api::{Content, Part, ResilientClient};
-use elessar::gneiss_pal::forge::ForgeClient;
-use elessar::gneiss_pal::persistence::BrainManager;
-use elessar::gneiss_pal::{
+use gneiss_pal::api::{Content, Part, ResilientClient};
+use gneiss_pal::forge::ForgeClient;
+use gneiss_pal::persistence::BrainManager;
+use gneiss_pal::{
     AppHandler, DashboardState, Event, GuiUpdate, Shard, ShardRole, ShardStatus, SidebarPosition,
     ViewMode, WolfpackState,
 };
@@ -199,14 +199,20 @@ impl VeinHandler {
         let bandy_tx_bg = bandy_tx.clone();
 
         thread::spawn(move || {
-            let rt = Runtime::new().expect("Failed to create Tokio Runtime");
+            // Ignite the Can-Am V8 (Tokio Runtime)
+            let rt = tokio::runtime::Runtime::new().expect("Failed to create Tokio Runtime");
+
+            // block_on borrows the runtime to execute our main async block.
             rt.block_on(async move {
                 let now = Local::now().format("%Y-%m-%d %H:%M:%S.%3f");
                 let _ = gui_tx_brain.send(GuiUpdate::ConsoleLog(format!("VEIN: [{}] [INFO] :: BRAIN :: Connecting...\n", now))).await;
 
                 // Fire up the Cortex Indexer in the background
                 let root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-                rt.spawn(async move {
+                // We are now INSIDE the Tokio context.
+                // We drop the `rt.` prefix and use `tokio::spawn` directly.
+                // This schedules the task on the running engine without trying to move the engine itself.
+                tokio::spawn(async move {
                     cortex::run_indexer(root, bandy_tx_bg).await;
                 });
 

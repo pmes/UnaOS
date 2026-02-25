@@ -1177,17 +1177,12 @@ name = "elessar"
 version = "0.1.0"
 dependencies = [
  "async-channel",
- "glib",
  "gneiss_pal",
- "gtk4",
- "libadwaita",
  "log",
  "proc-macro2",
- "quartzite",
  "quote",
  "serde",
  "serde_json",
- "sourceview5",
  "syn 2.0.116",
 ]
 
@@ -5594,9 +5589,9 @@ dependencies = [
  "glib",
  "gneiss_pal",
  "gtk4",
- "libadwaita",
  "libspelling",
  "log",
+ "quartzite",
  "reqwest",
  "serde",
  "serde_json",

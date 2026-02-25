@@ -53,7 +53,7 @@ pub async fn run_indexer(root: std::path::PathBuf, tx: broadcast::Sender<SMessag
 
     let mut total_skeletons = 0;
 
-    for (crate_name, node) in indexer.nodes {
+    for (_crate_name, node) in indexer.nodes {
         // Iterate over source files in the crate
         // Assuming src/lib.rs or src/main.rs exists
         let src_dir = node.path.join("src");

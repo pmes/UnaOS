@@ -4,17 +4,10 @@ version = "0.1.0"
 edition = "2024"
 
 [features]
-default = ["gtk"]
-gtk = ["quartzite/gtk"]
-gnome = ["quartzite/gnome", "dep:libadwaita"]
+default = []
 
 [dependencies]
 gneiss_pal = { path = "../gneiss_pal" }
-quartzite = { path = "../quartzite", optional = true }
-gtk4 = { version = "0.10.3", features = ["v4_12"], optional = true }
-glib = { version = "0.21", optional = true }
-libadwaita = { version = "0.8.1", features = ["v1_4"], optional = true }
-sourceview5 = { version = "0.10", optional = true }
 log = "0.4"
 async-channel = "2.5"
 serde = { version = "1.0", features = ["derive"] }

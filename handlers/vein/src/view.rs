@@ -1,4 +1,5 @@
 // handlers/vein/src/view.rs
+use quartzite::Event;
 use crate::model::DispatchObject;
 use async_channel::Receiver;
 use gtk4::prelude::*;
@@ -36,9 +37,9 @@ fn enable_spelling(view: &SourceView) {
 }
 
 // Import Elessar (Engine)
-use elessar::gneiss_pal::shard::ShardStatus;
-use elessar::gneiss_pal::{GuiUpdate, WolfpackState};
-use elessar::prelude::*;
+use gneiss_pal::shard::ShardStatus;
+use gneiss_pal::{GuiUpdate, WolfpackState};
+
 
 #[cfg(not(feature = "gnome"))]
 use gtk4::HeaderBar;
@@ -924,7 +925,7 @@ impl CommsSpline {
         input_scroll.set_child(Some(&text_view));
 
         // === FIX: CRASH RECOVERY (AUTOSAVE) WITHOUT MACROS ===
-        let draft_path = elessar::gneiss_pal::paths::UnaPaths::root().join(".lumen_draft.txt");
+        let draft_path = gneiss_pal::paths::UnaPaths::root().join(".lumen_draft.txt");
         if let Ok(draft) = std::fs::read_to_string(&draft_path) {
             text_view.buffer().set_text(&draft);
         }
@@ -1044,7 +1045,7 @@ impl CommsSpline {
         let pulse_icon_clone = pulse_icon.clone();
         let active_directive_async = active_directive_clone.clone();
 
-        let buffer_async = buffer.clone();
+        let _buffer_async = buffer.clone();
 
         glib::MainContext::default().spawn_local(async move {
             while let Ok(update) = rx.recv().await {

@@ -1,3 +1,8 @@
+# =====================================================================
+# CRATE: apps/lumen/Cargo.toml
+# DESCRIPTION: The Companion (AI-First). The Master Switchboard.
+# =====================================================================
+
 [package]
 name = "lumen"
 version = "0.1.0"
@@ -5,24 +10,29 @@ edition = "2024"
 
 [features]
 default = ["gtk"]
-gtk = ["vein/gtk", "elessar/gtk"]
-gnome = ["vein/gnome", "elessar/gnome", "dep:libadwaita"]
+# We have snipped elessar from the UI chain. Pure logic only!
+gtk = ["vein/gtk"]
+gnome = ["vein/gnome", "dep:libadwaita"]
 
 [dependencies]
+# The Trinity Core
 elessar = { path = "../../libs/elessar" }
 vein = { path = "../../handlers/vein" }
 quartzite = { path = "../../libs/quartzite" }
 bandy = { path = "../../libs/bandy" }
 gneiss_pal = { path = "../../libs/gneiss_pal" }
 unafs = { path = "../../libs/unafs" }
+junct = { path = "../../handlers/junct" }
+
+# Host UI & System
 gtk4 = "0.10.3"
 glib = "0.21"
+libadwaita = { version = "0.8.1", features = ["v1_4"], optional = true }
+
+# Async & Utilities
 async-channel = "2.5"
 log = "0.4"
 dotenvy = "0.15"
-libadwaita = { version = "0.8.1", features = ["v1_4"], optional = true }
 rustls = { version = "0.23", features = ["ring"] }
 chrono = "0.4"
-
 tokio = { version = "1.49", features = ["sync", "rt", "macros"] }
-junct = { path = "../../handlers/junct" }
