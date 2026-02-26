@@ -10,10 +10,22 @@ impl UnaPaths {
         if let Ok(root) = env::var("UNA_ROOT") {
             return PathBuf::from(root);
         }
+
         let mut vault = PathBuf::from(
             env::var("HOME").expect("CRITICAL: HOME environment variable missing. Engine stalled."),
         );
-        vault.push(".local/share/unaos");
+
+        #[cfg(target_os = "macos")]
+        {
+            vault.push("Library/Application Support/unaos");
+        }
+
+        #[cfg(not(target_os = "macos"))]
+        {
+            // Linux / Default to XDG-ish structure
+            vault.push(".local/share/unaos");
+        }
+
         vault
     }
 
