@@ -40,7 +40,6 @@ fn enable_spelling(view: &SourceView) {
 // Import Elessar (Engine)
 use gneiss_pal::shard::ShardStatus;
 use gneiss_pal::{GuiUpdate, WolfpackState};
-use chrono::DateTime; // Import explicit DateTime
 
 #[cfg(not(feature = "gnome"))]
 use gtk4::HeaderBar;
@@ -935,7 +934,7 @@ impl CommsSpline {
         let draft_path_clone = draft_path.clone();
         let buffer_for_save = text_view.buffer();
 
-        buffer_for_save.connect_changed(move |buf: &sourceview5::Buffer| {
+        buffer_for_save.connect_changed(move |buf: &gtk4::TextBuffer| {
             if let Some(source) = pending_save.borrow_mut().take() {
                 source.remove();
             }
@@ -963,7 +962,7 @@ impl CommsSpline {
         let buffer = text_view.buffer();
         let btn_send_clone = send_btn.clone();
 
-        buffer.connect_changed(move |buf: &sourceview5::Buffer| {
+        buffer.connect_changed(move |buf: &gtk4::TextBuffer| {
             if buf.line_count() > 1 {
                 btn_send_clone.remove_css_class("suggested-action");
             } else {

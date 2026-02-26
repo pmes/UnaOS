@@ -3340,6 +3340,7 @@ dependencies = [
  "log",
  "quartzite",
  "rustls",
+ "serde",
  "sourceview5",
  "tokio",
  "unafs",
