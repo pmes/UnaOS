@@ -8,8 +8,6 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::broadcast;
 use log::info;
-#[cfg(feature = "glib")]
-use glib;
 
 /// Ingests a source file into the AI Cortex's memory matrix.
 ///
@@ -46,23 +44,16 @@ pub fn ingest_for_lumen(file_path: &Path) -> Result<String, String> {
 
 /// The Background Indexer Task.
 /// It scans the workspace and builds the context.
-#[cfg(feature = "glib")]
-pub async fn run_indexer(root: PathBuf, tx: broadcast::Sender<SMessage>, telemetry_tx: glib::Sender<SMessage>) {
+pub async fn run_indexer(root: PathBuf, tx: broadcast::Sender<SMessage>, telemetry_tx: async_channel::Sender<SMessage>) {
     let payload = scan_and_score(&root, &tx).await;
 
     if !payload.is_empty() {
         info!(":: CORTEX :: Broadcasting Telemetry Payload ({} items)", payload.len());
         // We send the compiled telemetry across the thread boundary.
         // The payload contains Arc<String>, so no actual skeleton text is copied.
-        // We use the High-Priority Telemetry Channel (Glib) directly to the UI.
-        let _ = telemetry_tx.send(SMessage::ContextTelemetry { skeletons: payload });
+        // We use the High-Priority Telemetry Channel (Async) directly to the UI.
+        let _ = telemetry_tx.send(SMessage::ContextTelemetry { skeletons: payload }).await;
     }
-}
-
-/// The Background Indexer Task (Headless Fallback).
-#[cfg(not(feature = "glib"))]
-pub async fn run_indexer(root: PathBuf, tx: broadcast::Sender<SMessage>) {
-    let _ = scan_and_score(&root, &tx).await;
 }
 
 async fn scan_and_score(root: &Path, tx: &broadcast::Sender<SMessage>) -> Vec<bandy::WeightedSkeleton> {

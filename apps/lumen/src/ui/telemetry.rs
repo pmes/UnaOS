@@ -1,8 +1,9 @@
 use gtk4::prelude::*;
 use gtk4::{
     gio, glib, Box, Label, ListView, Orientation, PolicyType, ScrolledWindow, SignalListItemFactory,
-    SingleSelection, ListItem, Align, PangoLayout, Window, TextView, WrapMode,
+    SingleSelection, ListItem, Align, Window, TextView, WrapMode,
 };
+use gtk4::subclass::prelude::ObjectSubclassIsExt; // Required for imp()
 use bandy::WeightedSkeleton;
 use std::cell::RefCell;
 
@@ -63,6 +64,7 @@ impl SkeletonObject {
 // This struct manages the GTK widgetry for displaying the telemetry stream.
 // It uses a `ListView` for high-performance recycling of widgets.
 
+#[derive(Clone)] // Clone is cheap for GObjects/Widgets (Reference Counted)
 pub struct ContextView {
     /// The root widget to be added to the UI hierarchy.
     pub container: ScrolledWindow,
@@ -154,7 +156,8 @@ impl ContextView {
 
                 // Spawn a transient HUD Window
                 let window = Window::builder()
-                    .title(&data.path.to_string_lossy())
+                    // Use deref coercion for Cow<str> to &str
+                    .title(&*data.path.to_string_lossy())
                     .default_width(800)
                     .default_height(600)
                     .modal(true)

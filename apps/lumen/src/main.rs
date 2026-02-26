@@ -10,6 +10,7 @@ use gtk4::{ApplicationWindow, Paned, Orientation};
 use quartzite::{self, Backend};
 use std::rc::Rc;
 use vein::{CommsSpline, VeinHandler};
+use glib::MainContext;
 
 fn main() {
     // 0. Ignite the Substrate Reactor (Tokio)
@@ -28,9 +29,10 @@ fn main() {
     telemetry::ignite(UnaPaths::root().join("logs"));
     log::info!("Lumen Boot Sequence Initiated.");
 
-    // NEW: Create Telemetry Channel (High Priority)
+    // NEW: Create Telemetry Channel (Pure Async)
     // This is the direct line from the Cortex to the HUD.
-    let (telemetry_tx, telemetry_rx) = glib::MainContext::channel(glib::Priority::DEFAULT);
+    // Una: We use async_channel here, not glib::MainContext::channel.
+    let (telemetry_tx, telemetry_rx) = async_channel::unbounded::<SMessage>();
 
     // 3. Ignite the Spine
     let synapse = Synapse::new();
@@ -78,13 +80,16 @@ fn main() {
         let hud = ContextView::new();
         let hud_widget = hud.container.clone();
 
-        // 3. Attach the Telemetry Stream
-        // This closure will run on the main thread whenever the Cortex pushes an update.
-        telemetry_rx.attach(None, move |msg| {
-            if let SMessage::ContextTelemetry { skeletons } = msg {
-                hud.update(skeletons);
+        // 3. Attach the Telemetry Stream (Async -> Main Loop Bridge)
+        // We spawn a local task on the GTK main loop to poll the async channel.
+        let telemetry_rx_clone = telemetry_rx.clone();
+
+        MainContext::default().spawn_local(async move {
+            while let Ok(msg) = telemetry_rx_clone.recv().await {
+                if let SMessage::ContextTelemetry { skeletons } = msg {
+                    hud.update(skeletons);
+                }
             }
-            glib::ControlFlow::Continue
         });
 
         // 4. Fuse them (Paned)

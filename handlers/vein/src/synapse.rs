@@ -1,43 +1,49 @@
 use reqwest::{RequestBuilder, Response, StatusCode};
 use std::time::Duration;
 use tokio::time::sleep;
+use std::future::Future;
+use rand::Rng;
 
 /// The Synaptic Governor.
 /// Prevents Lumen from DDOSing the Vertex AI endpoint.
 pub trait SynapticRetry {
-    async fn fire_with_backoff(self) -> reqwest::Result<Response>;
+    // Desugared to avoid `async fn` in trait warning and allow Send bounds.
+    fn fire_with_backoff(self) -> impl Future<Output = reqwest::Result<Response>> + Send;
 }
 
 impl SynapticRetry for RequestBuilder {
-    async fn fire_with_backoff(self) -> reqwest::Result<Response> {
-        let mut attempt = 0;
+    fn fire_with_backoff(self) -> impl Future<Output = reqwest::Result<Response>> + Send {
+        // We move the template into the async block.
+        // But since `try_clone()` borrows `self`, we need to ensure the async block owns `self`
+        // and clones FROM it repeatedly.
+        let template = self;
 
-        loop {
-            // Clone the request. If it panics here, you passed a streaming body
-            // that can't be cloned. Don't do that in the Cortex.
-            let req = self
-                .try_clone()
-                .expect("CRITICAL: Uncloneable Cortex payload");
-            let res = req.send().await?;
+        async move {
+            let mut attempt = 0;
+            loop {
+                // Try to create a fresh request from the template.
+                let req = template
+                    .try_clone()
+                    .expect("CRITICAL: Uncloneable Cortex payload");
 
-            if res.status() == StatusCode::TOO_MANY_REQUESTS {
-                if attempt >= 5 {
-                    // The substrate is completely unresponsive. Bubble up the failure.
-                    return Ok(res);
+                match req.send().await {
+                    Ok(res) => {
+                        if res.status() == StatusCode::TOO_MANY_REQUESTS {
+                            if attempt >= 5 {
+                                return Ok(res);
+                            }
+                            // Using standard rand crate now
+                            let jitter: u64 = rand::thread_rng().gen_range(0..250);
+                            let backoff = (1000 << attempt) + jitter;
+                            sleep(Duration::from_millis(backoff)).await;
+                            attempt += 1;
+                            continue;
+                        }
+                        return Ok(res);
+                    }
+                    Err(e) => return Err(e),
                 }
-
-                // Exponential backoff with jitter (bitwise shift for speed).
-                // Base: 1s, 2s, 4s, 8s, 16s + up to 250ms of chaos.
-                let jitter = fastrand::u64(0..250);
-                let backoff = (1000 << attempt) + jitter;
-
-                // Throttle the thread.
-                sleep(Duration::from_millis(backoff)).await;
-                attempt += 1;
-                continue;
             }
-
-            return Ok(res);
         }
     }
 }

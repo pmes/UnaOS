@@ -10,7 +10,7 @@ edition = "2024"
 
 [features]
 default = ["gtk"]
-# We have snipped elessar from the UI chain. Pure logic only!
+# Una: Removed vein/glib feature requirement as we refactored vein to be pure
 gtk = ["vein/gtk"]
 gnome = ["vein/gnome", "dep:libadwaita"]
 
