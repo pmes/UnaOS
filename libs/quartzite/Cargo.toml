@@ -45,5 +45,8 @@ objc2-app-kit = { version = "0.2.2", features = [
 ] }
 block2 = "0.5"
 
-[build-dependencies]
+# 🦅 MACH'S BRIDGE: BUILD DEPENDENCIES
+# glib-build-tools is ONLY needed on Linux to compile GResources.
+# On macOS, it pulls glib-sys, causing build failures if pkg-config is missing.
+[target.'cfg(target_os = "linux")'.build-dependencies]
 glib-build-tools = "0.21"
