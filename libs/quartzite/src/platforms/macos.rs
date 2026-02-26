@@ -1,6 +1,7 @@
 #![cfg(target_os = "macos")]
 
 use objc2::{declare_class, msg_send, msg_send_id, ClassType};
+use objc2::mutability::MainThreadOnly;
 use objc2_app_kit::{NSApplication, NSApplicationActivationPolicy, NSApplicationDelegate, NSWindow, NSWindowStyleMask, NSWindowBackingStoreType, NSView};
 use objc2_foundation::{MainThreadMarker, NSObject, NSObjectProtocol, NSRect, NSPoint, NSSize};
 use objc2::rc::Retained;
@@ -25,7 +26,8 @@ declare_class!(
     unsafe impl ClassType for UnaAppDelegate {
         #[inherits(NSObject)]
         type Super = NSObject;
-        const NAME: &'static str = "UnaAppDelegate";
+        type Mutability = MainThreadOnly;
+        const NAME = "UnaAppDelegate";
     }
 
     unsafe impl UnaAppDelegate {}
