@@ -935,7 +935,7 @@ impl CommsSpline {
         let draft_path_clone = draft_path.clone();
         let buffer_for_save = text_view.buffer();
 
-        buffer_for_save.connect_changed(move |buf| {
+        buffer_for_save.connect_changed(move |buf: &sourceview5::Buffer| {
             if let Some(source) = pending_save.borrow_mut().take() {
                 source.remove();
             }
@@ -963,7 +963,7 @@ impl CommsSpline {
         let buffer = text_view.buffer();
         let btn_send_clone = send_btn.clone();
 
-        buffer.connect_changed(move |buf| {
+        buffer.connect_changed(move |buf: &sourceview5::Buffer| {
             if buf.line_count() > 1 {
                 btn_send_clone.remove_css_class("suggested-action");
             } else {
@@ -1075,9 +1075,7 @@ impl CommsSpline {
         }
     }
 
-    let timestamp = DateTime::now_local()
-        .map(|dt| dt.format("%H:%M:%S").to_string())
-        .unwrap_or_else(|_| "00:00:00".to_string());
+    let timestamp = chrono::Local::now().format("%H:%M:%S").to_string();
 
     let id = format!("{}", chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0));
 

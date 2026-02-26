@@ -2,9 +2,10 @@
 use gtk4::prelude::*;
 use gtk4::subclass::prelude::*;
 use gtk4::{glib, glib::Properties};
+use serde::{Deserialize, Serialize};
 use std::cell::RefCell;
 
-// Define a local struct for UI dispatch records
+#[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct DispatchRecord {
     pub id: String,
     pub sender: String,
@@ -79,5 +80,16 @@ impl DispatchObject {
             &record.content,
             record.is_chat,
         )
+    }
+
+    pub fn to_record(&self) -> DispatchRecord {
+        DispatchRecord {
+            id: self.id(),
+            sender: self.sender(),
+            subject: self.subject(),
+            timestamp: self.timestamp(),
+            content: self.content(),
+            is_chat: self.is_chat(),
+        }
     }
 }

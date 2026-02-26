@@ -36,3 +36,5 @@ dotenvy = "0.15"
 rustls = { version = "0.23", features = ["ring"] }
 chrono = "0.4"
 tokio = { version = "1.49", features = ["sync", "rt", "macros"] }
+sourceview5 = "0.10.0"
+libspelling = "0.4.1"

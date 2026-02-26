@@ -9,9 +9,10 @@ use gtk4::prelude::*;
 use gtk4::{ApplicationWindow, Paned, Orientation};
 use quartzite::{self, Backend};
 use std::rc::Rc;
-use vein::{CommsSpline, VeinHandler};
+use crate::ui::view::CommsSpline;
+use vein::VeinHandler;
 use glib::MainContext;
-use gneiss_pal::GuiUpdate; // Corrected import
+use gneiss_pal::GuiUpdate;
 
 fn main() {
     // 0. Ignite the Substrate Reactor (Tokio)
