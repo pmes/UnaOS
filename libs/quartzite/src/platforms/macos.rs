@@ -1,7 +1,7 @@
 #![cfg(target_os = "macos")]
 
-use objc2::{define_class, msg_send, msg_send_id, ClassType};
-use objc2_app_kit::{NSApplication, NSApplicationActivationPolicy, NSApplicationDelegate, NSWindow, NSWindowStyleMask, NSBackingStoreType, NSView};
+use objc2::{declare_class, msg_send, msg_send_id, ClassType};
+use objc2_app_kit::{NSApplication, NSApplicationActivationPolicy, NSApplicationDelegate, NSWindow, NSWindowStyleMask, NSWindowBackingStoreType, NSView};
 use objc2_foundation::{MainThreadMarker, NSObject, NSObjectProtocol, NSRect, NSPoint, NSSize};
 use objc2::rc::Retained;
 use std::cell::RefCell;
@@ -19,15 +19,20 @@ thread_local! {
 // -----------------------------------------------------------------------------
 // THE DELEGATE (OBJECTIVE-C FFI)
 // -----------------------------------------------------------------------------
-define_class!(
-    #[unsafe(super(NSObject))]
-    #[name = "UnaAppDelegate"]
+declare_class!(
     struct UnaAppDelegate;
 
-    // Implement the NSApplicationDelegate protocol
+    unsafe impl ClassType for UnaAppDelegate {
+        #[inherits(NSObject)]
+        type Super = NSObject;
+        const NAME: &'static str = "UnaAppDelegate";
+    }
+
+    unsafe impl UnaAppDelegate {}
+
     unsafe impl NSApplicationDelegate for UnaAppDelegate {
-        #[unsafe(method(applicationDidFinishLaunching:))]
-        fn did_finish_launching(&self, _notification: &NSObject) {
+        #[method(applicationDidFinishLaunching:)]
+        unsafe fn applicationDidFinishLaunching(&self, _notification: &NSObject) {
             println!("[UnaOS::Quartzite] macOS Application Runloop Ignited.");
 
             // 1. The engine is awake. Create the NativeWindow (NSWindow).
@@ -41,17 +46,13 @@ define_class!(
                 | NSWindowStyleMask::Resizable;
 
             let window = unsafe {
-                // Correctly use mtm.alloc() to ensure main thread allocation context if available,
-                // or fall back to standard [NSWindow alloc].
-                // In objc2 v0.5+, allocation is usually done via ClassType::alloc().
-                // We use standard allocation to be safe across minor versions.
                 let alloc: Retained<NSWindow> = msg_send![NSWindow::class(), alloc];
 
                 NSWindow::initWithContentRect_styleMask_backing_defer(
                     alloc,
                     content_rect,
                     style,
-                    NSBackingStoreType::Buffered,
+                    NSWindowBackingStoreType::Buffered, // Corrected Enum
                     false
                 )
             };
@@ -79,12 +80,19 @@ define_class!(
             }
         }
 
-        #[unsafe(method(applicationShouldTerminateAfterLastWindowClosed:))]
-        fn should_terminate_after_last_window_closed(&self, _sender: &NSApplication) -> bool {
+        #[method(applicationShouldTerminateAfterLastWindowClosed:)]
+        unsafe fn should_terminate_after_last_window_closed(&self, _sender: &NSApplication) -> bool {
             true
         }
     }
 );
+
+impl UnaAppDelegate {
+    fn new(mtm: MainThreadMarker) -> Retained<Self> {
+        let this = mtm.alloc();
+        unsafe { msg_send_id![this, init] }
+    }
+}
 
 // -----------------------------------------------------------------------------
 // THE BACKEND IMPLEMENTATION
@@ -113,11 +121,8 @@ impl Backend {
         }
 
         // 3. Allocate and set our custom delegate.
-        let delegate = unsafe {
-            let alloc: Retained<UnaAppDelegate> = msg_send![UnaAppDelegate::class(), alloc];
-            let init: Retained<UnaAppDelegate> = msg_send![&alloc, init];
-            init
-        };
+        // We use our helper new() to keep it clean
+        let delegate = UnaAppDelegate::new(mtm);
 
         unsafe {
             let _: () = msg_send![&app, setDelegate: &*delegate];
