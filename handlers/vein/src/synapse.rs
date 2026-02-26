@@ -32,8 +32,8 @@ impl SynapticRetry for RequestBuilder {
                             if attempt >= 5 {
                                 return Ok(res);
                             }
-                            // Using standard rand crate now
-                            let jitter: u64 = rand::thread_rng().gen_range(0..250);
+                            // Modern Rand API
+                            let jitter: u64 = rand::rng().random_range(0..250);
                             let backoff = (1000 << attempt) + jitter;
                             sleep(Duration::from_millis(backoff)).await;
                             attempt += 1;

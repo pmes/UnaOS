@@ -11,6 +11,7 @@ use quartzite::{self, Backend};
 use std::rc::Rc;
 use vein::{CommsSpline, VeinHandler};
 use glib::MainContext;
+use gneiss_pal::GuiUpdate; // Corrected import
 
 fn main() {
     // 0. Ignite the Substrate Reactor (Tokio)
@@ -71,7 +72,7 @@ fn main() {
     let spline = Rc::new(CommsSpline::new());
 
     // THE FUSION: We wrap the Vein UI with our new HUD.
-    let bootstrap = move |window: &ApplicationWindow, tx: async_channel::Sender<quartzite::Event>, rx: async_channel::Receiver<vein::model::GuiUpdate>| {
+    let bootstrap = move |window: &ApplicationWindow, tx: async_channel::Sender<quartzite::Event>, rx: async_channel::Receiver<GuiUpdate>| {
         // 1. Get the Vein UI (The Command Center)
         // We cast the generic type to Widget immediately.
         let vein_widget = spline.bootstrap(window, tx, rx);

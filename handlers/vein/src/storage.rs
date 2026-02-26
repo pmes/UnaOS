@@ -1,10 +1,21 @@
-use crate::model::DispatchRecord;
+// use crate::model::DispatchRecord; // <-- EXCISED
 use anyhow::{Context, Result};
 use gneiss_pal::paths::UnaPaths;
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use unafs::{AttributeValue, FileDevice, FileSystem, UnaFS};
+
+// Define a local struct for memory loading since we can't depend on UI models
+pub struct DispatchRecord {
+    pub id: String,
+    pub sender: String,
+    pub subject: String,
+    pub timestamp: String,
+    pub content: String,
+    pub is_chat: bool,
+}
+
 pub struct CortexStorage {
     base_dir: PathBuf,
 }

@@ -1,6 +1,6 @@
-// handlers/vein/src/view.rs
+// apps/lumen/src/ui/view.rs
 use quartzite::Event;
-use crate::model::DispatchObject;
+use crate::ui::model::DispatchObject; // Corrected path
 use async_channel::Receiver;
 use gtk4::prelude::*;
 use gtk4::{
@@ -12,6 +12,7 @@ use gtk4::{
     ToggleButton, Widget, Window,
     gdk::{Key, ModifierType},
     gio,
+    glib, // Use explicitly imported glib
 };
 use libspelling;
 use sourceview5::View as SourceView;
@@ -39,7 +40,7 @@ fn enable_spelling(view: &SourceView) {
 // Import Elessar (Engine)
 use gneiss_pal::shard::ShardStatus;
 use gneiss_pal::{GuiUpdate, WolfpackState};
-
+use chrono::DateTime; // Import explicit DateTime
 
 #[cfg(not(feature = "gnome"))]
 use gtk4::HeaderBar;
@@ -604,7 +605,7 @@ impl CommsSpline {
                 if n_press == 1 {
                     if let Some(obj) = item_clone
                         .item()
-                        .and_downcast::<crate::model::DispatchObject>()
+                        .and_downcast::<crate::ui::model::DispatchObject>()
                     {
                         let expanded = !obj.is_expanded();
                         obj.set_is_expanded(expanded);
@@ -1074,8 +1075,8 @@ impl CommsSpline {
         }
     }
 
-    let timestamp = glib::DateTime::now_local()
-        .map(|dt| dt.format("%H:%M:%S").unwrap().to_string())
+    let timestamp = DateTime::now_local()
+        .map(|dt| dt.format("%H:%M:%S").to_string())
         .unwrap_or_else(|_| "00:00:00".to_string());
 
     let id = format!("{}", chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0));

@@ -1,10 +1,10 @@
-use glib::Properties;
-use glib::prelude::*;
-use glib::subclass::prelude::*;
-use serde::{Deserialize, Serialize};
+// apps/lumen/src/ui/model.rs
+use gtk4::prelude::*;
+use gtk4::subclass::prelude::*;
+use gtk4::{glib, glib::Properties};
 use std::cell::RefCell;
 
-#[derive(Serialize, Deserialize, Debug, Clone)]
+// Define a local struct for UI dispatch records
 pub struct DispatchRecord {
     pub id: String,
     pub sender: String,
@@ -21,19 +21,19 @@ mod imp {
     #[properties(wrapper_type = super::DispatchObject)]
     pub struct DispatchObject {
         #[property(get, set)]
-        id: RefCell<String>,
+        pub id: RefCell<String>,
         #[property(get, set)]
-        sender: RefCell<String>,
+        pub sender: RefCell<String>,
         #[property(get, set)]
-        subject: RefCell<String>,
+        pub subject: RefCell<String>,
         #[property(get, set)]
-        timestamp: RefCell<String>,
+        pub timestamp: RefCell<String>,
         #[property(get, set)]
-        content: RefCell<String>,
+        pub content: RefCell<String>,
         #[property(get, set)]
-        is_chat: RefCell<bool>,
+        pub is_chat: RefCell<bool>,
         #[property(get, set)]
-        is_expanded: RefCell<bool>,
+        pub is_expanded: RefCell<bool>,
     }
 
     #[glib::object_subclass]
@@ -65,8 +65,8 @@ impl DispatchObject {
             .property("subject", subject)
             .property("timestamp", timestamp)
             .property("content", content)
-            .property("is_chat", is_chat)
-            .property("is_expanded", false)
+            .property("is-chat", is_chat)
+            .property("is-expanded", false)
             .build()
     }
 
@@ -79,16 +79,5 @@ impl DispatchObject {
             &record.content,
             record.is_chat,
         )
-    }
-
-    pub fn to_record(&self) -> DispatchRecord {
-        DispatchRecord {
-            id: self.id(),
-            sender: self.sender(),
-            subject: self.subject(),
-            timestamp: self.timestamp(),
-            content: self.content(),
-            is_chat: self.is_chat(),
-        }
     }
 }

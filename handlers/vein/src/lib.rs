@@ -1,10 +1,10 @@
 pub mod cortex;
 pub mod gravity;
-pub mod model;
+// pub mod model; // <-- EXCISED: Moved to apps/lumen/src/ui/model.rs
 pub mod storage;
 pub mod synapse;
-pub mod view;
-pub use view::CommsSpline;
+// pub mod view;  // <-- EXCISED: Moved to apps/lumen/src/ui/view.rs
+// pub use view::CommsSpline; // <-- REMOVED
 
 use chrono::Local;
 use gneiss_pal::api::{Content, Part, ResilientClient};
