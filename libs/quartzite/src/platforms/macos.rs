@@ -27,7 +27,7 @@ declare_class!(
         #[inherits(NSObject)]
         type Super = NSObject;
         type Mutability = MainThreadOnly;
-        const NAME = "UnaAppDelegate";
+        const NAME: &'static str = "UnaAppDelegate";
     }
 
     unsafe impl UnaAppDelegate {}
