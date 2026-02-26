@@ -2,6 +2,7 @@
 
 use objc2::{declare_class, msg_send, msg_send_id, ClassType};
 use objc2::mutability::MainThreadOnly;
+use objc2::declare::DeclaredClass;
 use objc2_app_kit::{NSApplication, NSApplicationActivationPolicy, NSApplicationDelegate, NSWindow, NSWindowStyleMask, NSBackingStoreType, NSView};
 use objc2_foundation::{MainThreadMarker, NSObject, NSObjectProtocol, NSRect, NSPoint, NSSize};
 use objc2::rc::Retained;
@@ -24,7 +25,6 @@ declare_class!(
     struct UnaAppDelegate;
 
     unsafe impl ClassType for UnaAppDelegate {
-        #[inherits(NSObject)]
         type Super = NSObject;
         type Mutability = MainThreadOnly;
         const NAME: &'static str = "UnaAppDelegate";
@@ -33,8 +33,6 @@ declare_class!(
     impl DeclaredClass for UnaAppDelegate {
         type Ivars = ();
     }
-
-    unsafe impl NSObjectProtocol for UnaAppDelegate {}
 
     unsafe impl NSApplicationDelegate for UnaAppDelegate {
         #[method(applicationDidFinishLaunching:)]
