@@ -1,6 +1,6 @@
 #![cfg(target_os = "macos")]
 
-use objc2::{define_class, msg_send};
+use objc2::{define_class, msg_send, MainThreadOnly};
 use objc2::rc::Retained;
 use objc2_app_kit::{NSApplication, NSApplicationActivationPolicy, NSApplicationDelegate, NSWindow, NSWindowStyleMask};
 use objc2_foundation::{MainThreadMarker, NSObject, NSObjectProtocol, NSRect, NSPoint, NSSize};
