@@ -244,15 +244,12 @@ impl VeinHandler {
                         let _ = gui_tx_brain.send(GuiUpdate::ActiveDirective(directive)).await;
 
                         while let Some(user_input_text) = rx_from_ui.recv().await {
-                            // === INTERCEPTOR: PAYLOAD DISPATCH ===
-                            // If the input starts with DISPATCH_PAYLOAD:, we bypass logic and send raw JSON
+                            // === ROUTE A: Execution of an Approved Interceptor Payload ===
                             if user_input_text.starts_with("DISPATCH_PAYLOAD:") {
-                                let json_payload = user_input_text.replace("DISPATCH_PAYLOAD:", "");
-                                if let Ok(context) = serde_json::from_str::<Vec<Content>>(&json_payload) {
-                                     let _ = gui_tx_brain.send(GuiUpdate::ConsoleLog("\n[SYSTEM] :: INTERCEPTOR TRANSMITTING...\n".into())).await;
-                                     let _ = gui_tx_brain.send(GuiUpdate::SidebarStatus(WolfpackState::Dreaming)).await;
+                                let payload_str = &user_input_text["DISPATCH_PAYLOAD:".len()..];
 
-                                     // === GHOST ECHO FIX: RENDER USER INPUT NOW ===
+                                if let Ok(context) = serde_json::from_str::<Vec<Content>>(payload_str) {
+                                    // === GHOST ECHO FIX: RENDER USER INPUT NOW ===
                                      if let Some(last_msg) = context.last() {
                                          if last_msg.role == "user" {
                                              if let Some(Part::Text { text }) = last_msg.parts.last() {
@@ -268,29 +265,27 @@ impl VeinHandler {
                                          }
                                      }
 
-                                     // === THE EXACT SAME GENERATION LOGIC AS BELOW ===
-                                     match client.generate_content(&context).await {
+                                    match client.generate_content(&context).await {
                                         Ok((response, metadata)) => {
-                                            let timestamp = Local::now().format("%H:%M:%S").to_string();
+                                            let timestamp = chrono::Local::now().format("%H:%M:%S").to_string();
                                             let display = format!("\n[UNA] [{}] :: {}\n", timestamp, response);
+
+                                            // ONLY echo to console upon actual API generation
                                             let _ = gui_tx_brain.send(GuiUpdate::ConsoleLog(display.clone())).await;
 
                                             if let Some(meta) = metadata {
-                                                let p = meta.prompt_token_count.unwrap_or(0);
-                                                let c = meta.candidates_token_count.unwrap_or(0);
-                                                let t = meta.total_token_count.unwrap_or(0);
-                                                let _ = gui_tx_brain.send(GuiUpdate::TokenUsage(p, c, t)).await;
+                                                let p_tok = meta.prompt_token_count.unwrap_or(0);
+                                                let c_tok = meta.candidates_token_count.unwrap_or(0);
+                                                let t_tok = meta.total_token_count.unwrap_or(0);
+                                                let _ = gui_tx_brain.send(GuiUpdate::TokenUsage(p_tok, c_tok, t_tok)).await;
                                             }
 
-                                            let response_embedding = match client.embed_content(&response).await {
+                                            let safe_embed: String = response.chars().take(6000).collect();
+                                            let response_embedding = match client.embed_content(&safe_embed).await {
                                                 Ok(vec) => vec,
                                                 Err(_) => vec![],
                                             };
-
-                                            // Save Logic (Duplicated for safety)
-                                            if let Err(e) = disk.save_memory("model", &response, &timestamp, response_embedding) {
-                                                eprintln!(":: PLEXUS :: Failed to save model memory: {}", e);
-                                            }
+                                            let _ = disk.save_memory("model", &response, &timestamp, response_embedding);
 
                                             let _ = gui_tx_brain.send(GuiUpdate::SidebarStatus(WolfpackState::Idle)).await;
                                         }
@@ -367,26 +362,20 @@ impl VeinHandler {
                                 }
                             }
                             let timestamp = Local::now().format("%H:%M:%S").to_string();
-                            if let Err(e) = disk.save_memory("user", &clean_memory_text, &timestamp, user_embedding) {
+                            if let Err(e) = disk.save_memory("user", &clean_memory_text, &timestamp, user_embedding.clone()) {
                                 eprintln!(":: PLEXUS :: Failed to save user memory: {}", e);
                             }
 
-                            // === TARGET 2: LINEAR MEMORY RECONSTRUCTION ===
-                            let mut history_context: Vec<Content> = Vec::new();
-
-                            // Load ALL memories (DiskManager handles the query)
-                            // But we must slice the LAST 10 to prevent token explosion.
-                            if let Ok(records) = disk.load_all_memories() {
-                                // Take the last 10 records.
-                                let start_index = if records.len() > 10 { records.len() - 10 } else { 0 };
-                                let slice = &records[start_index..];
-
-                                for record in slice {
-                                    let role = if record.sender == "user" || record.sender == "Architect" { "user" } else { "model" };
-                                    history_context.push(Content {
-                                        role: role.to_string(),
-                                        parts: vec![Part::text(record.content.clone())],
-                                    });
+                            let mut retrieved_context = String::new();
+                            if !user_embedding.is_empty() {
+                                match disk.search_memories(&user_embedding, 0.70) {
+                                    Ok(memories) => {
+                                        if !memories.is_empty() {
+                                            retrieved_context = memories.join("\n\n");
+                                            info!(":: PLEXUS :: Recalled {} memories.", memories.len());
+                                        }
+                                    }
+                                    Err(e) => eprintln!(":: PLEXUS :: Recall Failed: {}", e),
                                 }
                             }
 
@@ -557,28 +546,54 @@ Sincerely,
 The Architect
                             "# };
 
-                            // INJECT SYSTEM PROMPT INTO THE FIRST ELEMENT ONLY
-                            if let Some(first) = history_context.first_mut() {
-                                if let Some(Part::Text { text }) = first.parts.first_mut() {
-                                    *text = format!("{}\n\n{}", system_base, text);
-                                } else {
-                                    first.parts.insert(0, Part::text(system_base.to_string()));
-                                }
+                            // === ROUTE B: Standard Context Generation (Pre-Flight Intercept) ===
+                            let combined_system = if !retrieved_context.is_empty() {
+                                format!("{}\n\n[SEMANTIC MEMORY RECALL]:\n{}", system_base, retrieved_context)
                             } else {
-                                // If history is empty, seed it (though this shouldn't happen after a user message save)
-                                history_context.push(Content {
-                                    role: "user".into(),
-                                    parts: vec![Part::text(system_base.to_string())],
+                                system_base.to_string()
+                            };
+
+                            let mut context: Vec<Content> = Vec::new();
+                            // Load history (already loaded at start of loop implicitly if we assume `disk` is stateful, but here we query again or rely on the `records` loaded earlier if we kept state.
+                            // Actually, let's query fresh to be safe and stateless.)
+                            let history = disk.load_all_memories().unwrap_or_default();
+
+                            // Enforce strict memory bounds (Last 10 messages)
+                            let skip_count = if history.len() > 10 { history.len() - 10 } else { 0 };
+                            let recent_history: Vec<_> = history.into_iter().skip(skip_count).collect();
+
+                            let mut first_element = true;
+                            for record in recent_history {
+                                let role = if record.sender == "user" || record.sender == "Architect" { "user" } else { "model" };
+                                let mut text = record.content.clone();
+
+                                // Inject System Directive ONLY on the very first element of the entire payload
+                                if first_element {
+                                    text = format!("{}\n\n[SYSTEM DIRECTIVE]:\n{}", combined_system, text);
+                                    first_element = false;
+                                }
+
+                                context.push(Content {
+                                    role: role.to_string(),
+                                    parts: vec![Part::text(text)],
                                 });
                             }
 
-                            // === TARGET 4: THE INTERCEPTOR ===
-                            // Instead of calling client.generate_content immediately,
-                            // we serialize the payload and send it to the UI for review.
-                            if let Ok(json_dump) = serde_json::to_string_pretty(&history_context) {
-                                let _ = gui_tx_brain.send(GuiUpdate::ReviewPayload(json_dump)).await;
+                            let mut current_text = user_input_text.clone();
+                            if first_element {
+                                current_text = format!("{}\n\n[SYSTEM DIRECTIVE]:\n{}", combined_system, current_text);
+                            }
+
+                            context.push(Content {
+                                role: "user".into(),
+                                parts: parse_multimodal_text(&current_text),
+                            });
+
+                            // HALT GENERATION. Serialize the absolute final payload and dispatch to the UI Interceptor.
+                            if let Ok(json_payload) = serde_json::to_string_pretty(&context) {
+                                let _ = gui_tx_brain.send(GuiUpdate::ReviewPayload(json_payload)).await;
                             } else {
-                                let _ = gui_tx_brain.send(GuiUpdate::ConsoleLog(":: ERROR :: Failed to serialize payload for review.\n".into())).await;
+                                let _ = gui_tx_brain.send(GuiUpdate::ConsoleLog("\n[SYSTEM ERROR] :: Failed to serialize payload.\n".into())).await;
                             }
                         }
                     }

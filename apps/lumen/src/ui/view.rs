@@ -137,7 +137,7 @@ impl CommsSpline {
         token_label.set_justify(gtk4::Justification::Center);
 
         let pulse_icon = Image::from_icon_name("spinner-symbolic");
-        pulse_icon.set_pixel_size(24);
+        pulse_icon.set_pixel_size(16); // Reverted to 16px (Phase 4)
         // pulse_icon.set_opacity(0.5); // Removed for Phase 4
 
         let status_group = Box::new(Orientation::Horizontal, 8);
@@ -473,15 +473,8 @@ impl CommsSpline {
         comms_page.set_hexpand(true);
         comms_page.set_vexpand(true);
 
-        // Nexus Active Header
-        let nexus_active_header = Label::builder()
-            .use_markup(true)
-            .label("<span font_desc='11' weight='bold' color='#00ffcc'>NEXUS LINK: UNA-PRIME (ACTIVE)</span>")
-            .halign(Align::Center)
-            .margin_top(8)
-            .margin_bottom(8)
-            .build();
-        comms_page.append(&nexus_active_header);
+        // Removed Nexus Active Header (Phase 1)
+        // let nexus_active_header = Label::builder()... // DELETED
 
         let main_paned = Paned::new(Orientation::Vertical);
         main_paned.set_vexpand(true);
@@ -507,7 +500,7 @@ impl CommsSpline {
             }
         });
 
-        // HeaderBar Setup (Split Architecture)
+        // HeaderBar Setup (Split Architecture - Phase 1)
         let main_switcher = StackSwitcher::builder()
             .stack(&workspace_stack)
             .halign(Align::Center)
@@ -515,24 +508,38 @@ impl CommsSpline {
 
         #[cfg(feature = "gnome")]
         {
-            // Left Header (Sidebar Control)
+            // Left Header (Sidebar Control) - Blank
             let blank_header_bar = adw::HeaderBar::new();
             blank_header_bar.set_show_start_title_buttons(false);
             blank_header_bar.set_show_end_title_buttons(false);
-            // Title widget handles the Switcher, pack_start handles icons if needed.
-            // But adw::HeaderBar doesn't natively support arbitrary child packing like Box without custom title widget handling.
-            // Actually adw::HeaderBar has set_title_widget.
-            // We want the Switcher in the center.
-            blank_header_bar.set_title_widget(Some(&sidebar_switcher));
+            // blank_header_bar.set_title_widget(Some(&sidebar_switcher)); // REMOVED (Phase 1)
+            blank_header_bar.set_title_widget(Some(&adw::WindowTitle::new("", ""))); // Ensure blank
             left_vbox.prepend(&blank_header_bar);
 
-            // Right Header (Workspace Control)
+            // Sub-Header Grid: Sidebar Switcher Below Header (Phase 1)
+            let sidebar_header_box = Box::new(Orientation::Horizontal, 0);
+            sidebar_header_box.set_halign(Align::Center);
+            sidebar_header_box.set_margin_top(4);
+            sidebar_header_box.set_margin_bottom(4);
+            sidebar_header_box.append(&sidebar_switcher);
+            left_vbox.insert_child_after(&sidebar_header_box, Some(&blank_header_bar));
+
+            // Right Header (Workspace Control) - Only Status Group
             let command_header_bar = adw::HeaderBar::new();
             command_header_bar.set_show_start_title_buttons(true);
             command_header_bar.set_show_end_title_buttons(true);
-            command_header_bar.set_title_widget(Some(&main_switcher));
+            // command_header_bar.set_title_widget(Some(&main_switcher)); // REMOVED (Phase 1)
+            command_header_bar.set_title_widget(Some(&adw::WindowTitle::new("Lumen", ""))); // Or empty
             command_header_bar.pack_start(&status_group);
             right_vbox.append(&command_header_bar);
+
+            // Sub-Header Grid: Main Switcher Below Header (Phase 1)
+            let workspace_header_box = Box::new(Orientation::Horizontal, 0);
+            workspace_header_box.set_halign(Align::Center);
+            workspace_header_box.set_margin_top(4);
+            workspace_header_box.set_margin_bottom(4);
+            workspace_header_box.append(&main_switcher);
+            right_vbox.append(&workspace_header_box);
         }
 
         #[cfg(not(feature = "gnome"))]
@@ -780,6 +787,12 @@ impl CommsSpline {
         body_view.set_monospace(false);
         body_view.set_wrap_mode(gtk4::WrapMode::WordChar);
         enable_spelling(&body_view);
+        // Phase 3: Dark Scheme
+        let style_manager = sourceview5::StyleSchemeManager::default();
+        if let Some(scheme) = style_manager.scheme("Adwaita-dark") {
+            body_buffer.set_style_scheme(Some(&scheme));
+        }
+
         body_view.set_height_request(150);
         let body_scroll = ScrolledWindow::builder()
             .child(&body_view)
@@ -844,6 +857,12 @@ impl CommsSpline {
         // Phase 2: Add view class
         text_view.add_css_class("view");
         input_scroll.set_child(Some(&text_view));
+
+        // Phase 3: Dark Scheme
+        let style_manager_input = sourceview5::StyleSchemeManager::default();
+        if let Some(scheme) = style_manager_input.scheme("Adwaita-dark") {
+            text_view.buffer().set_style_scheme(Some(&scheme));
+        }
 
         let draft_path = gneiss_pal::paths::UnaPaths::root().join(".lumen_draft.txt");
         if let Ok(draft) = std::fs::read_to_string(&draft_path) { text_view.buffer().set_text(&draft); }
@@ -939,6 +958,13 @@ impl CommsSpline {
         enable_spelling(&payload_view);
         // Phase 2: Add view class
         payload_view.add_css_class("view");
+
+        // Phase 3: Dark Scheme & Editable
+        payload_view.set_editable(true);
+        let style_manager_payload = sourceview5::StyleSchemeManager::default();
+        if let Some(scheme) = style_manager_payload.scheme("Adwaita-dark") {
+            payload_buffer.set_style_scheme(Some(&scheme));
+        }
 
         let payload_scroll = ScrolledWindow::builder()
             .child(&payload_view)
