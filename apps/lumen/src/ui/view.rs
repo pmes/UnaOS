@@ -213,13 +213,104 @@ impl CommsSpline {
         new_node_btn.set_tooltip_text(Some("New Node"));
         new_node_btn.add_css_class("flat");
 
-        // ... [Node Creation Dialog - Skipped for Brevity, assumes same code as before] ...
-         let tx_node_create = tx_event.clone();
+        let tx_node_create = tx_event.clone();
         let _parent_win = window.upcast_ref::<Window>().clone();
-        new_node_btn.connect_clicked(move |_| {
-            // ... (Same as before) ...
-        });
 
+        new_node_btn.connect_clicked(move |_| {
+            let dialog = Window::builder()
+                .title("New Node Configuration")
+                .modal(true)
+                .transient_for(&_parent_win)
+                .default_width(400)
+                .default_height(500)
+                .build();
+
+            let vbox = Box::new(Orientation::Vertical, 12);
+            vbox.set_margin_top(12);
+            vbox.set_margin_bottom(12);
+            vbox.set_margin_start(12);
+            vbox.set_margin_end(12);
+
+            vbox.append(&Label::new(Some("Model")));
+            let models =
+                StringList::new(&["Gemini 2.0 Flash", "Gemini 1.5 Pro", "Claude 3.5 Sonnet"]);
+            let dropdown = DropDown::new(Some(models), None::<gtk4::Expression>);
+            vbox.append(&dropdown);
+
+            let hbox_hist = Box::new(Orientation::Horizontal, 12);
+            hbox_hist.append(&Label::new(Some("Enable History")));
+            let switch_hist = Switch::new();
+            switch_hist.set_active(true);
+            hbox_hist.append(&switch_hist);
+            vbox.append(&hbox_hist);
+
+            vbox.append(&Label::new(Some("Temperature (0.0 - 1.0)")));
+            let adj = Adjustment::new(0.7, 0.0, 1.0, 0.1, 0.1, 0.0);
+            let scale = Scale::new(Orientation::Horizontal, Some(&adj));
+            scale.set_digits(1);
+            scale.set_draw_value(true);
+            vbox.append(&scale);
+
+            vbox.append(&Label::new(Some("System Prompt")));
+            let prompt_buffer = sourceview5::Buffer::new(None);
+            let prompt_view = SourceView::with_buffer(&prompt_buffer);
+            prompt_view.set_show_line_numbers(false);
+            prompt_view.set_monospace(false);
+            prompt_view.set_wrap_mode(gtk4::WrapMode::WordChar);
+            enable_spelling(&prompt_view);
+            let scroll = ScrolledWindow::builder()
+                .child(&prompt_view)
+                .vexpand(true)
+                .height_request(150)
+                .build();
+            vbox.append(&scroll);
+
+            let hbox_btns = Box::new(Orientation::Horizontal, 12);
+            hbox_btns.set_halign(Align::End);
+
+            let btn_cancel = Button::with_label("Cancel");
+            let win_weak = dialog.downgrade();
+            btn_cancel.connect_clicked(move |_| {
+                if let Some(win) = win_weak.upgrade() {
+                    win.close();
+                }
+            });
+
+            let btn_create = Button::with_label("Create Node");
+            btn_create.add_css_class("suggested-action");
+            let win_weak2 = dialog.downgrade();
+            let tx = tx_node_create.clone();
+
+            btn_create.connect_clicked(move |_| {
+                if let Some(win) = win_weak2.upgrade() {
+                    let model_obj = dropdown
+                        .selected_item()
+                        .and_then(|obj| obj.downcast::<StringObject>().ok());
+                    let model = model_obj
+                        .map(|s| s.string().to_string())
+                        .unwrap_or_default();
+                    let history = switch_hist.is_active();
+                    let temp = adj.value();
+                    let (start, end) = prompt_buffer.bounds();
+                    let prompt = prompt_buffer.text(&start, &end, false).to_string();
+
+                    let _ = tx.send_blocking(Event::CreateNode {
+                        model,
+                        history,
+                        temperature: temp,
+                        system_prompt: prompt,
+                    });
+                    win.close();
+                }
+            });
+
+            hbox_btns.append(&btn_cancel);
+            hbox_btns.append(&btn_create);
+            vbox.append(&hbox_btns);
+
+            dialog.set_child(Some(&vbox));
+            dialog.present();
+        });
         node_actions_box.append(&new_node_btn);
 
         // THE COMPOSER
@@ -267,7 +358,6 @@ impl CommsSpline {
             }
         });
 
-        // ... [Nexus List Population - Same as before] ...
         nexus_list.append(
             &Label::builder()
                 .label("PRIMES")
@@ -805,10 +895,15 @@ impl CommsSpline {
         control_box.set_margin_bottom(12);
         control_box.set_margin_start(12);
         control_box.set_margin_end(12);
-        control_box.set_halign(Align::End);
 
+        // Auto-Send Checkbox
         let auto_send_check = CheckButton::with_label("Auto-Send (Bypass Review)");
         control_box.append(&auto_send_check);
+
+        // Spacer to push Transmit to the right
+        let editor_spacer = Box::new(Orientation::Horizontal, 0);
+        editor_spacer.set_hexpand(true);
+        control_box.append(&editor_spacer);
 
         let btn_transmit = Button::with_label("TRANSMIT PAYLOAD");
         btn_transmit.add_css_class("suggested-action");
