@@ -64,6 +64,14 @@ define_class!(
                 ]
             };
 
+            // MACH: Prevent AppKit from auto-releasing the window when closed.
+            // Since we hold a Retained<NSWindow> in WINDOW_HOLDER, we want explicit ownership.
+            // If we don't do this, AppKit releases it on close/exit, and then our thread-local destructor
+            // releases it again -> Segfault 11.
+            unsafe {
+                window.setReleasedWhenClosed(false);
+            }
+
             window.setTitle(&NSString::from_str("Vein (Trinity)"));
             window.center();
 
@@ -116,7 +124,7 @@ pub struct Backend {
 impl Backend {
     pub fn new<F>(_app_id: &str, bootstrap_fn: F) -> Self
     where
-        F: FnOnce(&NativeWindow) -> NativeView + 'static,
+        F: FnOnce(&NativeWindow) -> NativeView + 'static
     {
         // 1. Store the bootstrap closure for the delegate to pick up later.
         BOOTSTRAP_CLOSURE.with(|b| {
@@ -144,7 +152,7 @@ impl Backend {
 
         Backend {
             _app: app,
-            _delegate: delegate,
+            _delegate: delegate
         }
     }
 
