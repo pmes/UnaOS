@@ -7,16 +7,19 @@ use bandy::{SMessage, Synapse, telemetry};
 use gneiss_pal::paths::UnaPaths;
 use quartzite::{self, Backend, NativeWindow, NativeView};
 use std::rc::Rc;
+#[cfg(target_os = "linux")]
 use crate::ui::view::CommsSpline;
 use vein::VeinHandler;
-use glib::MainContext;
 use gneiss_pal::GuiUpdate;
+use gneiss_pal::AppHandler; // Fix E0599
 
 // Platform-specific imports
 #[cfg(target_os = "linux")]
 use gtk4::prelude::*;
 #[cfg(target_os = "linux")]
 use gtk4::{Orientation, Paned};
+#[cfg(target_os = "linux")]
+use glib::MainContext;
 
 fn main() {
     // 0. Ignite the Substrate Reactor (Tokio)
@@ -96,11 +99,11 @@ fn main() {
             unsafe {
                  // In a real app, we would alloc init an NSView here.
                  // For now, we return a Retained<NSView> using standard alloc/init.
-                 use objc2::{msg_send, msg_send_id, ClassType};
+                 use objc2::{msg_send, ClassType};
                  use objc2_app_kit::NSView;
                  use objc2::rc::Retained;
 
-                 let view: Retained<NSView> = msg_send_id![NSView::class(), new];
+                 let view: Retained<NSView> = msg_send![NSView::class(), new];
                  view
             }
         };

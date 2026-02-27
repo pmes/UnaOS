@@ -26,6 +26,7 @@ define_class!(
 
     unsafe impl NSObjectProtocol for UnaAppDelegate {}
     unsafe impl NSApplicationDelegate for UnaAppDelegate {
+        #[allow(non_snake_case)]
         #[unsafe(method(applicationDidFinishLaunching:))]
         fn applicationDidFinishLaunching(&self, _notification: &NSObject) {
             println!("[UnaOS::Quartzite] macOS Application Runloop Ignited (objc2 0.6).");
@@ -74,6 +75,7 @@ define_class!(
             }
         }
 
+        #[allow(non_snake_case)]
         #[unsafe(method(applicationShouldTerminateAfterLastWindowClosed:))]
         fn should_terminate_after_last_window_closed(&self, _sender: &NSApplication) -> bool {
             true

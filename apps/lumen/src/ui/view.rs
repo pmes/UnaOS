@@ -5,7 +5,7 @@ use async_channel::Receiver;
 use gtk4::prelude::*;
 use gtk4::{
     Adjustment, Align, Box, Button, CheckButton, ColumnView, ColumnViewColumn, CssProvider,
-    DropDown, Entry, EventControllerKey, Expander, FileDialog, FilterListModel, GestureClick,
+    DropDown, Entry, EventControllerKey, Expander, FilterListModel, GestureClick,
     Image, Label, ListBox, ListItem, ListView, NoSelection, Orientation, Paned, PolicyType,
     Popover, PropagationPhase, Scale, ScrolledWindow, SignalListItemFactory, SingleSelection,
     Spinner, Stack, StackSwitcher, StackTransitionType, StringList, StringObject, Switch,
@@ -70,7 +70,8 @@ impl CommsSpline {
 
         // THE PULSE (Stripped of Tab Hacks)
         let provider = CssProvider::new();
-        provider.load_from_string("
+        // S41 Fix: Use load_from_data for compatibility with older GTK versions if load_from_string is missing
+        provider.load_from_data("
             .console { font-family: 'Monospace'; background: transparent; }
             .console-row { margin-bottom: 16px; padding: 0px; }
 
@@ -766,6 +767,10 @@ impl CommsSpline {
         let tx_clone_file = tx_event.clone();
         let window_clone = window.clone();
         let target_file = active_target.clone();
+
+        // S41 Fix: Removed FileDialog usage (unavailable on macOS GTK).
+        // Commented out logic for now.
+        /*
         attach_btn.connect_clicked(move |_| {
             let tx = tx_clone_file.clone();
             let parent_window = window_clone.clone();
@@ -786,6 +791,7 @@ impl CommsSpline {
                 }
             });
         });
+        */
 
         // THE COMPOSER
         let active_directive = Rc::new(RefCell::new("Directive 055".to_string()));
