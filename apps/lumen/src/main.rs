@@ -35,17 +35,6 @@ fn main() {
     // 1. Establish Base Camp
     UnaPaths::awaken().expect("CRITICAL: Failed to awaken spatial paths");
 
-    // Deploy assets on Linux only (macOS uses bundle or embedded differently)
-    #[cfg(target_os = "linux")]
-    let asset_path = UnaPaths::root().join("quartzite.gresource");
-    #[cfg(target_os = "linux")]
-    {
-        if let Err(e) = quartzite::deploy_assets(&asset_path) {
-            log::error!("Failed to deploy assets: {}", e);
-        }
-        quartzite::init_with_path(&asset_path);
-    }
-
     // Split the brain
     let vein_storage = UnaPaths::primary_vault();
     let cortex_vault = UnaPaths::subconscious_vault();

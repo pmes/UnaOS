@@ -61,7 +61,6 @@ impl CommsSpline {
         rx: Receiver<GuiUpdate>,
     ) -> Widget {
         window.set_title(Some("Vein (Trinity Architecture)"));
-        window.set_icon_name(Some("lumen-symbolic"));
 
         // 1. Nodes Tab Rename
         let store = gio::ListStore::new::<StringObject>();
@@ -370,7 +369,7 @@ impl CommsSpline {
         );
 
         let row_una = Box::new(Orientation::Horizontal, 10);
-        let icon_una = Image::from_icon_name("una-symbolic");
+        let icon_una = Image::from_icon_name("computer-symbolic");
         let label_una = Label::new(Some("Una-Prime"));
         let spinner_una = Spinner::new();
         row_una.append(&icon_una);
