@@ -1,9 +1,9 @@
 #![cfg(target_os = "macos")]
 
-use objc2::{declare_class, msg_send, msg_send_id, ClassType, DeclaredClass, MainThreadMarker};
+use objc2::{declare_class, msg_send, msg_send_id, ClassType, DeclaredClass};
 use objc2::mutability::MainThreadOnly;
 use objc2_app_kit::{NSApplication, NSApplicationActivationPolicy, NSApplicationDelegate, NSWindow, NSWindowStyleMask};
-use objc2_foundation::{NSObject, NSObjectProtocol, NSRect, NSPoint, NSSize};
+use objc2_foundation::{MainThreadMarker, NSObject, NSObjectProtocol, NSRect, NSPoint, NSSize};
 use objc2::rc::Retained;
 use std::cell::RefCell;
 
@@ -60,7 +60,7 @@ declare_class!(
                 mtm.alloc::<NSWindow>().initWithContentRect_styleMask_backing_defer(
                     content_rect,
                     style,
-                    objc2_app_kit::NSBackingStoreBuffered, // Using the typed enum if available
+                    2 as _, // Using raw integer to force compile (NSBackingStoreBuffered)
                     false
                 )
             };
