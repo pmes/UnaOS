@@ -12,12 +12,24 @@ pub use gneiss_pal::types::*;
 // closures while quartzite handles the platform-specific memory and types.
 
 #[cfg(not(target_os = "macos"))]
+#[cfg(feature = "gtk")]
 pub type NativeWindow = gtk4::ApplicationWindow;
+
 #[cfg(not(target_os = "macos"))]
+#[cfg(feature = "gtk")]
 pub type NativeView = gtk4::Widget;
+
+#[cfg(not(target_os = "macos"))]
+#[cfg(not(feature = "gtk"))]
+pub type NativeWindow = ();
+
+#[cfg(not(target_os = "macos"))]
+#[cfg(not(feature = "gtk"))]
+pub type NativeView = ();
 
 #[cfg(target_os = "macos")]
 pub type NativeWindow = objc2_app_kit::NSWindow;
+
 #[cfg(target_os = "macos")]
 // Retained ensures we safely cross the Objective-C ARC memory boundary.
 pub type NativeView = objc2::rc::Retained<objc2_app_kit::NSView>;
@@ -26,15 +38,20 @@ pub type NativeView = objc2::rc::Retained<objc2_app_kit::NSView>;
 // PLATFORM ROUTING
 // -----------------------------------------------------------------------------
 #[cfg(not(target_os = "macos"))]
+#[cfg(feature = "gtk")]
 pub use platforms::gtk::Backend;
+
+#[cfg(not(target_os = "macos"))]
+#[cfg(not(feature = "gtk"))]
+pub struct Backend; // Dummy backend for non-GTK builds (e.g. tests)
 
 #[cfg(target_os = "macos")]
 pub use platforms::macos::Backend;
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(all(not(target_os = "macos"), feature = "gtk"))]
 const EMBEDDED_RESOURCE: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/quartzite.gresource"));
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(all(not(target_os = "macos"), feature = "gtk"))]
 pub fn deploy_assets(path: &std::path::Path) -> std::io::Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
@@ -42,7 +59,7 @@ pub fn deploy_assets(path: &std::path::Path) -> std::io::Result<()> {
     std::fs::write(path, EMBEDDED_RESOURCE)
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(all(not(target_os = "macos"), feature = "gtk"))]
 pub fn init_with_path(path: &std::path::Path) {
     println!(":: QUARTZITE :: Loading assets from: {}", path.display());
 
@@ -57,7 +74,7 @@ pub fn init_with_path(path: &std::path::Path) {
 }
 
 // Initialize function to setup resources and theme (Embedded fallback)
-#[cfg(not(target_os = "macos"))]
+#[cfg(all(not(target_os = "macos"), feature = "gtk"))]
 pub fn init() {
     // 1. Load the compiled binary from the OUT_DIR
     let res_bytes = glib::Bytes::from_static(EMBEDDED_RESOURCE);
@@ -73,18 +90,18 @@ pub fn init() {
     }
 }
 
-// Dummy init functions for macOS to prevent breaking API contracts
-#[cfg(target_os = "macos")]
+// Dummy init functions for macOS or non-GTK to prevent breaking API contracts
+#[cfg(any(target_os = "macos", not(feature = "gtk")))]
 pub fn init() {
     // macOS resources are handled by the app bundle or embedded differently.
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", not(feature = "gtk")))]
 pub fn deploy_assets(_path: &std::path::Path) -> std::io::Result<()> {
     Ok(())
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", not(feature = "gtk")))]
 pub fn init_with_path(_path: &std::path::Path) {
     // No-op
 }

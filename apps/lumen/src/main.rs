@@ -95,15 +95,18 @@ fn main() {
 
         #[cfg(target_os = "macos")]
         let vein_widget = {
-            // macOS UI implementation placeholder
             unsafe {
-                 // In a real app, we would alloc init an NSView here.
-                 // For now, we return a Retained<NSView> using standard alloc/init.
                  use objc2::{msg_send, ClassType};
                  use objc2_app_kit::NSView;
+                 use objc2_foundation::{MainThreadMarker, NSRect, NSPoint, NSSize};
                  use objc2::rc::Retained;
 
-                 let view: Retained<NSView> = msg_send![NSView::class(), new];
+                 let mtm = MainThreadMarker::new().expect("Bootstrap on main thread");
+                 // Initialize frame (e.g., matching window size or generic)
+                 let frame = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(800.0, 600.0));
+
+                 // Explicit allocation and initialization to ensure +1 ownership convention
+                 let view: Retained<NSView> = msg_send![mtm.alloc::<NSView>(), initWithFrame: frame];
                  view
             }
         };
