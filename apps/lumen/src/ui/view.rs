@@ -31,6 +31,12 @@ fn enable_spelling(view: &SourceView) {
         let checker = libspelling::Checker::new(Some(&provider), Some("en_US"));
         let adapter = libspelling::TextBufferAdapter::new(&buffer, &checker);
         adapter.set_enabled(true);
+
+        // BIND NATIVE RIGHT-CLICK SUGGESTIONS
+        if let Some(menu) = adapter.menu_model() {
+            view.set_extra_menu(Some(&menu));
+        }
+
         unsafe {
             buffer.set_data("spell-adapter", SendWrapper(adapter));
         }
@@ -87,20 +93,17 @@ impl CommsSpline {
                 background-color: alpha(currentColor, 0.05);
             }
 
-            .chat-input-area { border-radius: 12px; padding: 2px; border: 1px solid alpha(currentColor, 0.1); }
-            .transparent-text { background-color: transparent; font-family: 'Monospace'; font-size: 15px; padding: 6px; color: @theme_text_color; }
-            .transparent-text text { background-color: transparent; color: inherit; }
-
             /* Native Icon Scaling */
             .suggested-action { background-color: #0078d4; color: #ffffff; border-radius: 4px; }
             .attach-action { border-radius: 4px; }
 
-            /* Spin Animation */
-            @keyframes spin {
-                to { transform: rotate(1turn); }
+            /* Spin Animation (Random Roll) */
+            @keyframes random-roll {
+                0% { transform: rotate(0deg); }
+                100% { transform: rotate(360deg); }
             }
             .spin-active {
-                animation: spin 1.2s linear infinite;
+                animation: random-roll 1.5s infinite linear;
                 color: #0078d4;
             }
             .nexus-header { font-weight: bold; margin-top: 12px; margin-bottom: 4px; opacity: 0.7; font-size: 0.9em; }
@@ -123,8 +126,13 @@ impl CommsSpline {
             .tooltip_text("Toggle Sidebar")
             .build();
 
+        // Token Label moved to TeleHUD
         let token_label = Label::new(Some("Tokens: IN: 0 | OUT: 0 | TOTAL: 0"));
+        token_label.set_margin_start(10);
         token_label.set_margin_end(10);
+        token_label.set_margin_top(10);
+        token_label.set_wrap(true);
+        token_label.set_justify(gtk4::Justification::Center);
 
         let pulse_icon = Image::from_icon_name("spinner-symbolic");
         pulse_icon.set_pixel_size(16);
@@ -132,12 +140,11 @@ impl CommsSpline {
 
         let status_group = Box::new(Orientation::Horizontal, 8);
         status_group.append(&sidebar_toggle);
-        status_group.append(&token_label);
         status_group.append(&pulse_icon);
 
         // --- Root Layout ---
         let main_h_paned = Paned::new(Orientation::Horizontal);
-        main_h_paned.set_position(215);
+        main_h_paned.set_position(260); // Slightly wider sidebar for TeleHUD
         main_h_paned.set_hexpand(true);
         main_h_paned.set_vexpand(true);
         main_h_paned.set_wide_handle(false);
@@ -147,7 +154,7 @@ impl CommsSpline {
         let left_vbox = Box::new(Orientation::Vertical, 0);
         left_vbox.add_css_class("background");
         left_vbox.add_css_class("navigation-sidebar");
-        left_vbox.set_width_request(215);
+        left_vbox.set_width_request(260);
 
         // Sidebar Content
         let sidebar_box = Box::new(Orientation::Vertical, 0);
@@ -409,14 +416,36 @@ impl CommsSpline {
         nexus_box.append(&nexus_list);
         sidebar_stack.add_titled(&nexus_box, Some("nexus"), "Nexus");
 
+        // 3. THE TeleHUD Tab (New Phase 3)
+        let telehud_box = Box::new(Orientation::Vertical, 12);
+        telehud_box.set_margin_top(12);
+        telehud_box.set_margin_bottom(12);
+        telehud_box.set_margin_start(12);
+        telehud_box.set_margin_end(12);
+
+        telehud_box.append(&Label::builder().label("TOKEN TELEMETRY").css_classes(vec!["nexus-header"]).xalign(0.0).build());
+        telehud_box.append(&token_label);
+
+        telehud_box.append(&Label::builder().label("CONTEXT VECTOR").css_classes(vec!["nexus-header"]).xalign(0.0).margin_top(20).build());
+
+        let context_list = ListBox::new();
+        context_list.add_css_class("boxed-list");
+        context_list.append(&Label::new(Some("libs/bandy/src/lib.rs (0.95)")));
+        context_list.append(&Label::new(Some("handlers/vein/src/lib.rs (0.80)")));
+        telehud_box.append(&context_list);
+
+        sidebar_stack.add_titled(&telehud_box, Some("telehud"), "TeleHUD");
+
         sidebar_box.append(&sidebar_stack);
 
-        // Native Tabs
-        let stack_switcher = StackSwitcher::builder()
+        // Sidebar Switcher (Moved to HeaderBar in GNOME build)
+        let sidebar_switcher = StackSwitcher::builder()
             .stack(&sidebar_stack)
             .halign(Align::Center)
             .build();
-        sidebar_box.append(&stack_switcher);
+
+        #[cfg(not(feature = "gnome"))]
+        sidebar_box.append(&sidebar_switcher);
 
         left_vbox.append(&sidebar_box);
         main_h_paned.set_start_child(Some(&left_vbox));
@@ -469,25 +498,26 @@ impl CommsSpline {
             }
         });
 
-        // HeaderBar Setup (Refactored to include Workspace Switcher)
-        let workspace_switcher = StackSwitcher::builder()
+        // HeaderBar Setup (Split Architecture)
+        let main_switcher = StackSwitcher::builder()
             .stack(&workspace_stack)
             .halign(Align::Center)
             .build();
 
         #[cfg(feature = "gnome")]
         {
+            // Left Header (Sidebar Control)
             let blank_header_bar = adw::HeaderBar::new();
             blank_header_bar.set_show_start_title_buttons(false);
             blank_header_bar.set_show_end_title_buttons(false);
-            blank_header_bar.set_title_widget(Some(&adw::WindowTitle::new("", "")));
+            blank_header_bar.set_title_widget(Some(&sidebar_switcher));
             left_vbox.prepend(&blank_header_bar);
 
+            // Right Header (Workspace Control)
             let command_header_bar = adw::HeaderBar::new();
             command_header_bar.set_show_start_title_buttons(true);
             command_header_bar.set_show_end_title_buttons(true);
-            // We replace the title widget with the stack switcher
-            command_header_bar.set_title_widget(Some(&workspace_switcher));
+            command_header_bar.set_title_widget(Some(&main_switcher));
             command_header_bar.pack_start(&status_group);
             right_vbox.append(&command_header_bar);
         }
@@ -496,7 +526,7 @@ impl CommsSpline {
         {
             let unified_header_bar = HeaderBar::new();
             unified_header_bar.set_show_title_buttons(true);
-            unified_header_bar.set_title_widget(Some(&workspace_switcher));
+            unified_header_bar.set_title_widget(Some(&main_switcher));
 
             let header_spacer = Box::new(Orientation::Horizontal, 0);
             main_h_paned
@@ -542,7 +572,8 @@ impl CommsSpline {
             chat_content_view.set_editable(false);
             chat_content_view.set_wrap_mode(gtk4::WrapMode::WordChar);
             chat_content_view.set_show_line_numbers(false);
-            chat_content_view.add_css_class("transparent-text");
+            // Removed manual CSS classes for Phase 1
+            // chat_content_view.add_css_class("transparent-text");
             chat_content_view.set_monospace(true);
             chat_content_view.set_width_request(800);
             chat_content_view.set_hexpand(true);
@@ -788,10 +819,12 @@ impl CommsSpline {
         // Chat Input
         let input_scroll = ScrolledWindow::builder().hscrollbar_policy(PolicyType::Never).vscrollbar_policy(PolicyType::Automatic).height_request(80).valign(Align::Fill).has_frame(false).build();
         input_scroll.set_hexpand(true);
-        input_scroll.add_css_class("chat-input-area");
+        // Removed manual CSS class for Phase 1
+        // input_scroll.add_css_class("chat-input-area");
         let text_view = SourceView::builder().wrap_mode(gtk4::WrapMode::WordChar).show_line_numbers(false).auto_indent(true).accepts_tab(false).top_margin(8).bottom_margin(8).left_margin(10).right_margin(10).build();
         enable_spelling(&text_view);
-        text_view.add_css_class("transparent-text");
+        // Removed manual CSS class for Phase 1
+        // text_view.add_css_class("transparent-text");
         input_scroll.set_child(Some(&text_view));
 
         let draft_path = gneiss_pal::paths::UnaPaths::root().join(".lumen_draft.txt");
@@ -907,6 +940,16 @@ impl CommsSpline {
         let editor_spacer = Box::new(Orientation::Horizontal, 0);
         editor_spacer.set_hexpand(true);
         control_box.append(&editor_spacer);
+
+        // Cancel Button (Phase 4)
+        let btn_cancel = Button::with_label("Cancel");
+        let stack_cancel = workspace_stack.clone();
+        let buf_cancel = payload_buffer.clone();
+        btn_cancel.connect_clicked(move |_| {
+            buf_cancel.set_text("");
+            stack_cancel.set_visible_child_name("comms");
+        });
+        control_box.append(&btn_cancel);
 
         let btn_transmit = Button::with_label("TRANSMIT PAYLOAD");
         btn_transmit.add_css_class("suggested-action");
