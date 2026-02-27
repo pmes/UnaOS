@@ -29,7 +29,7 @@ impl MacOSSpline {
         let root_view = unsafe {
             let view: Retained<NSView> = msg_send![mtm.alloc::<NSView>(), initWithFrame: frame];
             // Autoresizing: Width + Height
-            let mask = NSAutoresizingMaskOptions::WidthSizable | NSAutoresizingMaskOptions::HeightSizable;
+            let mask = NSAutoresizingMaskOptions::ViewWidthSizable | NSAutoresizingMaskOptions::ViewHeightSizable;
             view.setAutoresizingMask(mask);
             view
         };
@@ -39,7 +39,7 @@ impl MacOSSpline {
             let scroll_frame = NSRect::new(NSPoint::new(20.0, 60.0), NSSize::new(760.0, 520.0));
             let scroll: Retained<NSScrollView> = msg_send![mtm.alloc::<NSScrollView>(), initWithFrame: scroll_frame];
             scroll.setHasVerticalScroller(true);
-            let mask = NSAutoresizingMaskOptions::WidthSizable | NSAutoresizingMaskOptions::HeightSizable;
+            let mask = NSAutoresizingMaskOptions::ViewWidthSizable | NSAutoresizingMaskOptions::ViewHeightSizable;
             scroll.setAutoresizingMask(mask);
             scroll
         };
