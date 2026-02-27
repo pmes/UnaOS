@@ -1,10 +1,7 @@
 pub mod cortex;
 pub mod gravity;
-// pub mod model; // <-- EXCISED: Moved to apps/lumen/src/ui/model.rs
 pub mod storage;
 pub mod synapse;
-// pub mod view;  // <-- EXCISED: Moved to apps/lumen/src/ui/view.rs
-// pub use view::CommsSpline; // <-- REMOVED
 
 use chrono::Local;
 use gneiss_pal::api::{Content, Part, ResilientClient};
@@ -247,10 +244,54 @@ impl VeinHandler {
                         let _ = gui_tx_brain.send(GuiUpdate::ActiveDirective(directive)).await;
 
                         while let Some(user_input_text) = rx_from_ui.recv().await {
+                            // === INTERCEPTOR: PAYLOAD DISPATCH ===
+                            // If the input starts with DISPATCH_PAYLOAD:, we bypass logic and send raw JSON
+                            if user_input_text.starts_with("DISPATCH_PAYLOAD:") {
+                                let json_payload = user_input_text.replace("DISPATCH_PAYLOAD:", "");
+                                if let Ok(context) = serde_json::from_str::<Vec<Content>>(&json_payload) {
+                                     let _ = gui_tx_brain.send(GuiUpdate::ConsoleLog("\n[SYSTEM] :: INTERCEPTOR TRANSMITTING...\n".into())).await;
+                                     let _ = gui_tx_brain.send(GuiUpdate::SidebarStatus(WolfpackState::Dreaming)).await;
+
+                                     // === THE EXACT SAME GENERATION LOGIC AS BELOW ===
+                                     match client.generate_content(&context).await {
+                                        Ok((response, metadata)) => {
+                                            let timestamp = Local::now().format("%H:%M:%S").to_string();
+                                            let display = format!("\n[UNA] [{}] :: {}\n", timestamp, response);
+                                            let _ = gui_tx_brain.send(GuiUpdate::ConsoleLog(display.clone())).await;
+
+                                            if let Some(meta) = metadata {
+                                                let p = meta.prompt_token_count.unwrap_or(0);
+                                                let c = meta.candidates_token_count.unwrap_or(0);
+                                                let t = meta.total_token_count.unwrap_or(0);
+                                                let _ = gui_tx_brain.send(GuiUpdate::TokenUsage(p, c, t)).await;
+                                            }
+
+                                            let response_embedding = match client.embed_content(&response).await {
+                                                Ok(vec) => vec,
+                                                Err(_) => vec![],
+                                            };
+
+                                            // Save Logic (Duplicated for safety)
+                                            if let Err(e) = disk.save_memory("model", &response, &timestamp, response_embedding) {
+                                                eprintln!(":: PLEXUS :: Failed to save model memory: {}", e);
+                                            }
+
+                                            let _ = gui_tx_brain.send(GuiUpdate::SidebarStatus(WolfpackState::Idle)).await;
+                                        }
+                                        Err(e) => {
+                                            let _ = gui_tx_brain.send(GuiUpdate::ConsoleLog(format!("\n[ERROR] {}\n", e))).await;
+                                        }
+                                    }
+                                }
+                                continue;
+                            }
+
+
                             if user_input_text.trim() == "/clear" {
                                 drop(disk);
                                 let _ = std::fs::remove_file(&vault_path_bg);
                                 disk = DiskManager::new(&vault_path_bg).expect("Failed to reformat Semantic Vault");
+                                let _ = gui_tx_brain.send(GuiUpdate::ClearConsole).await; // <-- TARGET 3 FIX
                                 let _ = gui_tx_brain.send(GuiUpdate::ConsoleLog(":: PLEXUS :: Semantic Vault Physically Reformatted.\n".into())).await;
                                 continue;
                             }
@@ -283,8 +324,6 @@ impl VeinHandler {
                                 if is_s9 { s.s9_status = ShardStatus::Thinking; }
                             }
 
-                            let _ = gui_tx_brain.send(GuiUpdate::SidebarStatus(WolfpackState::Dreaming)).await;
-
                             if is_s9 {
                                 let _ = gui_tx_brain.send(GuiUpdate::ShardStatusChanged {
                                     id: "s9-mule".into(),
@@ -300,16 +339,38 @@ impl VeinHandler {
                                 }
                             };
 
-                            let mut retrieved_context = String::new();
-                            if !user_embedding.is_empty() {
-                                match disk.search_memories(&user_embedding, 0.70) {
-                                    Ok(memories) => {
-                                        if !memories.is_empty() {
-                                            retrieved_context = memories.join("\n\n");
-                                            info!(":: PLEXUS :: Recalled {} memories.", memories.len());
-                                        }
-                                    }
-                                    Err(e) => eprintln!(":: PLEXUS :: Recall Failed: {}", e),
+                            // SAVE USER MEMORY FIRST (So it's included in the history fetch)
+                            // We strip heavy attachments first.
+                            let mut parsed_parts_for_save = parse_multimodal_text(&user_input_text);
+                            let mut clean_memory_text = String::new();
+                            for part in &parsed_parts_for_save {
+                                if let Part::Text { text } = part {
+                                    clean_memory_text.push_str(text);
+                                } else {
+                                    clean_memory_text.push_str(" [System: User attached a file/image] ");
+                                }
+                            }
+                            let timestamp = Local::now().format("%H:%M:%S").to_string();
+                            if let Err(e) = disk.save_memory("user", &clean_memory_text, &timestamp, user_embedding) {
+                                eprintln!(":: PLEXUS :: Failed to save user memory: {}", e);
+                            }
+
+                            // === TARGET 2: LINEAR MEMORY RECONSTRUCTION ===
+                            let mut history_context: Vec<Content> = Vec::new();
+
+                            // Load ALL memories (DiskManager handles the query)
+                            // But we must slice the LAST 10 to prevent token explosion.
+                            if let Ok(records) = disk.load_all_memories() {
+                                // Take the last 10 records.
+                                let start_index = if records.len() > 10 { records.len() - 10 } else { 0 };
+                                let slice = &records[start_index..];
+
+                                for record in slice {
+                                    let role = if record.sender == "user" || record.sender == "Architect" { "user" } else { "model" };
+                                    history_context.push(Content {
+                                        role: role.to_string(),
+                                        parts: vec![Part::text(record.content.clone())],
+                                    });
                                 }
                             }
 
@@ -480,70 +541,28 @@ Sincerely,
 The Architect
                             "# };
 
-                            let combined_system = if !retrieved_context.is_empty() {
-                                format!("{}\n\n[SEMANTIC MEMORY RECALL]:\n{}", system_base, retrieved_context)
-                            } else {
-                                system_base.to_string()
-                            };
-
-                            let mut parsed_parts = parse_multimodal_text(&user_input_text);
-
-                            // === THE NEUROSURGERY: PAYLOAD PRUNING ===
-                            // We strip the heavy attachment tags before saving to the Semantic Vault.
-                            // This prevents the 429 Snowball Effect on subsequent memory recalls.
-                            let mut clean_memory_text = String::new();
-                            for part in &parsed_parts {
-                                if let Part::Text { text } = part {
-                                    clean_memory_text.push_str(text);
+                            // INJECT SYSTEM PROMPT INTO THE FIRST ELEMENT ONLY
+                            if let Some(first) = history_context.first_mut() {
+                                if let Some(Part::Text { text }) = first.parts.first_mut() {
+                                    *text = format!("{}\n\n{}", system_base, text);
                                 } else {
-                                    clean_memory_text.push_str(" [System: User attached a file/image] ");
+                                    first.parts.insert(0, Part::text(system_base.to_string()));
                                 }
-                            }
-
-                            if let Some(Part::Text { text }) = parsed_parts.first_mut() {
-                                *text = format!("{}\n\n{}", combined_system, text);
                             } else {
-                                parsed_parts.insert(0, Part::text(combined_system));
+                                // If history is empty, seed it (though this shouldn't happen after a user message save)
+                                history_context.push(Content {
+                                    role: "user".into(),
+                                    parts: vec![Part::text(system_base.to_string())],
+                                });
                             }
 
-                            let context = vec![Content {
-                                role: "user".into(),
-                                parts: parsed_parts,
-                            }];
-
-                            match client.generate_content(&context).await {
-                                Ok((response, _metadata)) => {
-                                    let timestamp = Local::now().format("%H:%M:%S").to_string();
-                                    let display = format!("\n[UNA] [{}] :: {}\n", timestamp, response);
-                                    let _ = gui_tx_brain.send(GuiUpdate::ConsoleLog(display.clone())).await;
-
-                                    // ... [Token usage and Shard status updates] ...
-
-                                    let response_embedding = match client.embed_content(&response).await {
-                                        Ok(vec) => vec,
-                                        Err(_) => vec![],
-                                    };
-
-                                    // SAVE THE PRUNED TEXT, NOT THE RAW PAYLOAD
-                                    if let Err(e) = disk.save_memory("user", &clean_memory_text, &timestamp, user_embedding) {
-                                        eprintln!(":: PLEXUS :: Failed to save user memory: {}", e);
-                                    }
-                                    if let Err(e) = disk.save_memory("model", &response, &timestamp, response_embedding) {
-                                        eprintln!(":: PLEXUS :: Failed to save model memory: {}", e);
-                                    }
-
-                                    let _ = gui_tx_brain.send(GuiUpdate::SidebarStatus(WolfpackState::Idle)).await;
-
-                                    if is_s9 {
-                                        let _ = gui_tx_brain.send(GuiUpdate::ShardStatusChanged {
-                                            id: "s9-mule".into(),
-                                            status: ShardStatus::Online,
-                                        }).await;
-                                    }
-                                }
-                                Err(e) => {
-                                    let _ = gui_tx_brain.send(GuiUpdate::ConsoleLog(format!("\n[ERROR] {}\n", e))).await;
-                                }
+                            // === TARGET 4: THE INTERCEPTOR ===
+                            // Instead of calling client.generate_content immediately,
+                            // we serialize the payload and send it to the UI for review.
+                            if let Ok(json_dump) = serde_json::to_string_pretty(&history_context) {
+                                let _ = gui_tx_brain.send(GuiUpdate::ReviewPayload(json_dump)).await;
+                            } else {
+                                let _ = gui_tx_brain.send(GuiUpdate::ConsoleLog(":: ERROR :: Failed to serialize payload for review.\n".into())).await;
                             }
                         }
                     }
@@ -664,6 +683,11 @@ impl AppHandler for VeinHandler {
                     self.append_to_console(&format!("\n[SYSTEM ERROR] :: Failed to send: {}\n", e));
                 }
             }
+            Event::DispatchPayload(json_payload) => {
+                // The UI has approved the payload. We send it back to the Brain via the mpsc channel
+                // prefixed with our magic header so the loop picks it up.
+                let _ = self.tx.send(format!("DISPATCH_PAYLOAD:{}", json_payload));
+            }
             _ => {}
         }
     }
@@ -699,4 +723,3 @@ impl AppHandler for VeinHandler {
         }
     }
 }
-

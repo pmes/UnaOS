@@ -16,13 +16,13 @@ struct GenerationConfig {
     temperature: f32,
 }
 
-#[derive(Serialize, Clone, Debug)]
+#[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct Content {
     pub role: String,
     pub parts: Vec<Part>,
 }
 
-#[derive(Serialize, Clone, Debug)]
+#[derive(Serialize, Deserialize, Clone, Debug)]
 #[serde(untagged)]
 pub enum Part {
     Text {
@@ -49,7 +49,7 @@ impl Part {
     }
 }
 
-#[derive(Serialize, Clone, Debug)]
+#[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct FileData {
     #[serde(rename = "mimeType")]
     pub mime_type: String,

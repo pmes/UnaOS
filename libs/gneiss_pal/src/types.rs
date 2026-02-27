@@ -19,8 +19,9 @@ pub enum GuiUpdate {
     EditorLoad(String),
     SidebarStatus(WolfpackState), // The Pulse
     Spectrum(Vec<f32>),
-    TokenUsage(u64),
+    TokenUsage(i32, i32, i32), // Prompt, Candidates, Total
     ActiveDirective(String),
+    ReviewPayload(String), // The Interceptor
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -84,6 +85,7 @@ pub enum Event {
         action: String, // "exec", "arch", "debug", "una"
     },
     ShardSelect(String),
+    DispatchPayload(String), // The Interceptor
 }
 
 #[derive(Clone, Debug)]

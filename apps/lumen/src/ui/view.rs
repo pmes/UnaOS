@@ -1,6 +1,6 @@
 // apps/lumen/src/ui/view.rs
 use quartzite::Event;
-use crate::ui::model::DispatchObject; // Corrected path
+use crate::ui::model::DispatchObject;
 use async_channel::Receiver;
 use gtk4::prelude::*;
 use gtk4::{
@@ -12,7 +12,7 @@ use gtk4::{
     ToggleButton, Widget, Window,
     gdk::{Key, ModifierType},
     gio,
-    glib, // Use explicitly imported glib
+    glib,
 };
 use libspelling;
 use sourceview5::View as SourceView;
@@ -31,6 +31,11 @@ fn enable_spelling(view: &SourceView) {
         let checker = libspelling::Checker::new(Some(&provider), Some("en_US"));
         let adapter = libspelling::TextBufferAdapter::new(&buffer, &checker);
         adapter.set_enabled(true);
+
+        // BIND NATIVE RIGHT-CLICK SUGGESTIONS
+        let menu = adapter.menu_model();
+        view.set_extra_menu(Some(&menu));
+
         unsafe {
             buffer.set_data("spell-adapter", SendWrapper(adapter));
         }
@@ -70,7 +75,6 @@ impl CommsSpline {
 
         // THE PULSE (Stripped of Tab Hacks)
         let provider = CssProvider::new();
-        // S41: Reverting to load_from_string (v4_12) as we forced the feature
         provider.load_from_string("
             .console { font-family: 'Monospace'; background: transparent; }
             .console-row { margin-bottom: 16px; padding: 0px; }
@@ -88,20 +92,17 @@ impl CommsSpline {
                 background-color: alpha(currentColor, 0.05);
             }
 
-            .chat-input-area { border-radius: 12px; padding: 2px; border: 1px solid alpha(currentColor, 0.1); }
-            .transparent-text { background-color: transparent; font-family: 'Monospace'; font-size: 15px; padding: 6px; color: @theme_text_color; }
-            .transparent-text text { background-color: transparent; color: inherit; }
-
             /* Native Icon Scaling */
             .suggested-action { background-color: #0078d4; color: #ffffff; border-radius: 4px; }
             .attach-action { border-radius: 4px; }
 
-            /* Spin Animation */
-            @keyframes spin {
-                to { transform: rotate(1turn); }
+            /* Spin Animation (Random Roll) */
+            @keyframes random-roll {
+                0% { transform: rotate(0deg); }
+                100% { transform: rotate(360deg); }
             }
             .spin-active {
-                animation: spin 1.2s linear infinite;
+                animation: random-roll 1.5s infinite linear;
                 color: #0078d4;
             }
             .nexus-header { font-weight: bold; margin-top: 12px; margin-bottom: 4px; opacity: 0.7; font-size: 0.9em; }
@@ -117,16 +118,20 @@ impl CommsSpline {
             gtk4::STYLE_PROVIDER_PRIORITY_APPLICATION,
         );
 
-        // UI Controls (Created early so they can be packed into either architecture)
+        // UI Controls
         let sidebar_toggle = ToggleButton::builder()
             .icon_name("sidebar-show-symbolic")
             .active(true)
             .tooltip_text("Toggle Sidebar")
             .build();
 
-        let token_label = Label::new(Some("Tokens: 0"));
-        //        token_label.add_css_class("dim-label");
+        // Token Label moved to TeleHUD
+        let token_label = Label::new(Some("Tokens: IN: 0 | OUT: 0 | TOTAL: 0"));
+        token_label.set_margin_start(10);
         token_label.set_margin_end(10);
+        token_label.set_margin_top(10);
+        token_label.set_wrap(true);
+        token_label.set_justify(gtk4::Justification::Center);
 
         let pulse_icon = Image::from_icon_name("spinner-symbolic");
         pulse_icon.set_pixel_size(16);
@@ -134,22 +139,21 @@ impl CommsSpline {
 
         let status_group = Box::new(Orientation::Horizontal, 8);
         status_group.append(&sidebar_toggle);
-        status_group.append(&token_label);
         status_group.append(&pulse_icon);
 
         // --- Root Layout ---
         let main_h_paned = Paned::new(Orientation::Horizontal);
-        main_h_paned.set_position(215);
+        main_h_paned.set_position(260); // Slightly wider sidebar for TeleHUD
         main_h_paned.set_hexpand(true);
         main_h_paned.set_vexpand(true);
-        main_h_paned.set_wide_handle(false); // Thin vertical divider
+        main_h_paned.set_wide_handle(false);
         main_h_paned.set_shrink_start_child(false);
 
         // --- Left Pane (The Silhouette) ---
         let left_vbox = Box::new(Orientation::Vertical, 0);
         left_vbox.add_css_class("background");
         left_vbox.add_css_class("navigation-sidebar");
-        left_vbox.set_width_request(215);
+        left_vbox.set_width_request(260);
 
         // Sidebar Content
         let sidebar_box = Box::new(Orientation::Vertical, 0);
@@ -316,6 +320,9 @@ impl CommsSpline {
         node_actions_box.append(&new_node_btn);
 
         // THE COMPOSER
+        let active_directive = Rc::new(RefCell::new("Directive 055".to_string()));
+        let active_directive_clone = active_directive.clone();
+
         let composer_icon = Image::from_icon_name("chat-message-new-symbolic");
         let composer_btn = Button::builder()
             .css_classes(vec!["flat"])
@@ -336,7 +343,7 @@ impl CommsSpline {
 
         let nexus_list = ListBox::new();
         nexus_list.add_css_class("shard-list");
-        nexus_list.set_selection_mode(gtk4::SelectionMode::Single); // Enable selection
+        nexus_list.set_selection_mode(gtk4::SelectionMode::Single);
 
         // Target Tracking
         let active_target = Rc::new(RefCell::new("Una-Prime".to_string()));
@@ -404,17 +411,40 @@ impl CommsSpline {
         row_s9.append(&spinner_s9);
         nexus_list.append(&row_s9);
 
+
         nexus_box.append(&nexus_list);
         sidebar_stack.add_titled(&nexus_box, Some("nexus"), "Nexus");
 
+        // 3. THE TeleHUD Tab (New Phase 3)
+        let telehud_box = Box::new(Orientation::Vertical, 12);
+        telehud_box.set_margin_top(12);
+        telehud_box.set_margin_bottom(12);
+        telehud_box.set_margin_start(12);
+        telehud_box.set_margin_end(12);
+
+        telehud_box.append(&Label::builder().label("TOKEN TELEMETRY").css_classes(vec!["nexus-header"]).xalign(0.0).build());
+        telehud_box.append(&token_label);
+
+        telehud_box.append(&Label::builder().label("CONTEXT VECTOR").css_classes(vec!["nexus-header"]).xalign(0.0).margin_top(20).build());
+
+        let context_list = ListBox::new();
+        context_list.add_css_class("boxed-list");
+        context_list.append(&Label::new(Some("libs/bandy/src/lib.rs (0.95)")));
+        context_list.append(&Label::new(Some("handlers/vein/src/lib.rs (0.80)")));
+        telehud_box.append(&context_list);
+
+        sidebar_stack.add_titled(&telehud_box, Some("telehud"), "TeleHUD");
+
         sidebar_box.append(&sidebar_stack);
 
-        // Native Tabs (No CSS overrides)
-        let stack_switcher = StackSwitcher::builder()
+        // Sidebar Switcher (Moved to HeaderBar in GNOME build)
+        let sidebar_switcher = StackSwitcher::builder()
             .stack(&sidebar_stack)
             .halign(Align::Center)
             .build();
-        sidebar_box.append(&stack_switcher);
+
+        #[cfg(not(feature = "gnome"))]
+        sidebar_box.append(&sidebar_switcher);
 
         left_vbox.append(&sidebar_box);
         main_h_paned.set_start_child(Some(&left_vbox));
@@ -423,9 +453,17 @@ impl CommsSpline {
         let right_vbox = Box::new(Orientation::Vertical, 0);
         right_vbox.set_hexpand(true);
 
-        // ... [HeaderBar Setup (Adwaita/GTK)] ...
+        // === THE WORKSPACE STACK ===
+        let workspace_stack = Stack::new();
+        workspace_stack.set_vexpand(true);
+        workspace_stack.set_transition_type(StackTransitionType::SlideLeftRight);
 
-        // === NEW: NEXUS ACTIVE HEADER ===
+        // --- PAGE 1: COMMS (The Original Chat View) ---
+        let comms_page = Box::new(Orientation::Vertical, 0);
+        comms_page.set_hexpand(true);
+        comms_page.set_vexpand(true);
+
+        // Nexus Active Header
         let nexus_active_header = Label::builder()
             .use_markup(true)
             .label("<span font_desc='11' weight='bold' color='#00ffcc'>NEXUS LINK: UNA-PRIME (ACTIVE)</span>")
@@ -433,13 +471,14 @@ impl CommsSpline {
             .margin_top(8)
             .margin_bottom(8)
             .build();
-        right_vbox.append(&nexus_active_header);
+        comms_page.append(&nexus_active_header);
 
-        // --- Main Content (Console/Input Slider) ---
         let main_paned = Paned::new(Orientation::Vertical);
         main_paned.set_vexpand(true);
         main_paned.set_hexpand(true);
         main_paned.set_position(9999);
+        main_paned.set_shrink_end_child(false);
+        main_paned.set_wide_handle(false);
 
         let scrolled_window = ScrolledWindow::builder()
             .hscrollbar_policy(PolicyType::Never)
@@ -447,7 +486,7 @@ impl CommsSpline {
             .vexpand(true)
             .build();
 
-        // === FIX: SAFE AUTO-SCROLL ===
+        // Safe Auto-Scroll
         let adj = scrolled_window.vadjustment();
         adj.connect_upper_notify(|adj| {
             let upper = adj.upper();
@@ -458,51 +497,46 @@ impl CommsSpline {
             }
         });
 
-        // --- Right Pane (The Command Center) ---
-        let right_vbox = Box::new(Orientation::Vertical, 0);
-        right_vbox.set_hexpand(true);
+        // HeaderBar Setup (Split Architecture)
+        let main_switcher = StackSwitcher::builder()
+            .stack(&workspace_stack)
+            .halign(Align::Center)
+            .build();
 
-        // --- ARCHITECTURE SPLIT (ADWAITA vs PURE GTK) ---
         #[cfg(feature = "gnome")]
         {
-            // Adwaita Split HeaderBars
+            // Left Header (Sidebar Control)
             let blank_header_bar = adw::HeaderBar::new();
             blank_header_bar.set_show_start_title_buttons(false);
             blank_header_bar.set_show_end_title_buttons(false);
-            blank_header_bar.set_title_widget(Some(&adw::WindowTitle::new("", "")));
-            left_vbox.prepend(&blank_header_bar); // Add to top of left column
+            blank_header_bar.set_title_widget(Some(&sidebar_switcher));
+            left_vbox.prepend(&blank_header_bar);
 
+            // Right Header (Workspace Control)
             let command_header_bar = adw::HeaderBar::new();
             command_header_bar.set_show_start_title_buttons(true);
             command_header_bar.set_show_end_title_buttons(true);
-            command_header_bar.set_title_widget(Some(&adw::WindowTitle::new("Lumen", "")));
+            command_header_bar.set_title_widget(Some(&main_switcher));
             command_header_bar.pack_start(&status_group);
-            right_vbox.append(&command_header_bar); // Add to top of right column
+            right_vbox.append(&command_header_bar);
         }
 
         #[cfg(not(feature = "gnome"))]
         {
-            // Pure GTK Unified HeaderBar
             let unified_header_bar = HeaderBar::new();
             unified_header_bar.set_show_title_buttons(true);
-            unified_header_bar.set_title_widget(Some(&Label::new(Some("Lumen"))));
+            unified_header_bar.set_title_widget(Some(&main_switcher));
 
-            // The Phantom Spacer: Matches the sidebar width and syncs with the toggle
             let header_spacer = Box::new(Orientation::Horizontal, 0);
-
-            // 1. Bind the spacer's width directly to the Paned slider's pixel position
             main_h_paned
                 .bind_property("position", &header_spacer, "width-request")
                 .sync_create()
                 .build();
-
-            // 2. Bind the visibility to the toggle button
             sidebar_toggle
                 .bind_property("active", &header_spacer, "visible")
                 .sync_create()
                 .build();
 
-            // Pack the spacer first to push the status group over
             unified_header_bar.pack_start(&header_spacer);
             unified_header_bar.pack_start(&status_group);
 
@@ -511,112 +545,68 @@ impl CommsSpline {
             }
         }
 
-        // --- Main Content (Console/Input Slider) ---
-        let main_paned = Paned::new(Orientation::Vertical);
-        main_paned.set_vexpand(true);
-        main_paned.set_hexpand(true);
-        main_paned.set_position(9999);
-        main_paned.set_shrink_end_child(false);
-        main_paned.set_wide_handle(false); // Restores the horizontal slider grip
-
-        // Console (REFACTORED FOR LISTVIEW)
-        let scrolled_window = ScrolledWindow::builder()
-            .hscrollbar_policy(PolicyType::Never)
-            .vscrollbar_policy(PolicyType::Automatic)
-            .vexpand(true)
-            .build();
-
+        // Console ListView
         let console_store = gio::ListStore::new::<DispatchObject>();
-        let console_filter =
-            FilterListModel::new(Some(console_store.clone()), None::<gtk4::Filter>);
+        let console_filter = FilterListModel::new(Some(console_store.clone()), None::<gtk4::Filter>);
         let console_selection = NoSelection::new(Some(console_filter));
 
         let console_factory = SignalListItemFactory::new();
         console_factory.connect_setup(move |_factory, item| {
-            let item = item.downcast_ref::<ListItem>().unwrap();
-
-            // Root Container (Expanded Horizontally)
+             let item = item.downcast_ref::<ListItem>().unwrap();
             let root = Box::new(Orientation::Horizontal, 0);
             root.set_hexpand(true);
             root.add_css_class("console-row");
-
-            // Left Spacer
             let left_spacer = Box::new(Orientation::Horizontal, 0);
             left_spacer.set_hexpand(true);
             root.append(&left_spacer);
-
-            // Bubble Container (Restricted Width)
             let bubble = Box::new(Orientation::Vertical, 4);
             bubble.add_css_class("bubble-box");
-            bubble.set_width_request(400); // Minimum comfortable width
-
-            // 1. Meta Label
+            bubble.set_width_request(400);
             let meta_label = Label::new(None);
             meta_label.set_xalign(0.0);
             meta_label.add_css_class("dim-label");
             bubble.append(&meta_label);
-
-            // 2. Chat Content
             let chat_content_buffer = sourceview5::Buffer::new(None);
             let chat_content_view = SourceView::with_buffer(&chat_content_buffer);
             chat_content_view.set_editable(false);
             chat_content_view.set_wrap_mode(gtk4::WrapMode::WordChar);
             chat_content_view.set_show_line_numbers(false);
-            chat_content_view.add_css_class("transparent-text");
+            // Removed manual CSS classes for Phase 1
+            // chat_content_view.add_css_class("transparent-text");
             chat_content_view.set_monospace(true);
-            chat_content_view.set_width_request(800); // Forces a minimum readable width
+            chat_content_view.set_width_request(800);
             chat_content_view.set_hexpand(true);
-            chat_content_view.set_focusable(true); // Allow copy paste
+            chat_content_view.set_focusable(true);
             bubble.append(&chat_content_view);
-
-            // 3. Payload Expander
             let expander = Expander::new(None);
             let expander_label = Label::new(None);
             expander.set_child(Some(&expander_label));
-
             let payload_content_buffer = sourceview5::Buffer::new(None);
             let payload_content_view = SourceView::with_buffer(&payload_content_buffer);
             payload_content_view.set_editable(false);
             payload_content_view.set_wrap_mode(gtk4::WrapMode::WordChar);
             payload_content_view.set_show_line_numbers(true);
             payload_content_view.set_monospace(true);
-
-            let payload_scroll = ScrolledWindow::builder()
-                .child(&payload_content_view)
-                .height_request(200)
-                .build();
-
+            let payload_scroll = ScrolledWindow::builder().child(&payload_content_view).height_request(200).build();
             expander.set_child(Some(&payload_scroll));
             bubble.append(&expander);
-
             root.append(&bubble);
-
-            // Right Spacer
             let right_spacer = Box::new(Orientation::Horizontal, 0);
             right_spacer.set_hexpand(true);
             root.append(&right_spacer);
 
-            // Expansion Gesture (Setup Phase)
             let gesture = GestureClick::new();
             let item_clone = item.clone();
             let chat_content_view_clone = chat_content_view.clone();
-
             gesture.connect_pressed(move |_, n_press, _, _| {
                 if n_press == 1 {
-                    if let Some(obj) = item_clone
-                        .item()
-                        .and_downcast::<crate::ui::model::DispatchObject>()
-                    {
+                    if let Some(obj) = item_clone.item().and_downcast::<crate::ui::model::DispatchObject>() {
                         let expanded = !obj.is_expanded();
                         obj.set_is_expanded(expanded);
-
                         let content = obj.content();
                         let line_count = content.lines().count();
-
                         if line_count > 11 && !expanded {
-                            let truncated: String =
-                                content.lines().take(11).collect::<Vec<&str>>().join("\n")
-                                    + "\n\n... [Click to expand]";
+                            let truncated: String = content.lines().take(11).collect::<Vec<&str>>().join("\n") + "\n\n... [Click to expand]";
                             chat_content_view_clone.buffer().set_text(&truncated);
                         } else {
                             chat_content_view_clone.buffer().set_text(&content);
@@ -625,24 +615,20 @@ impl CommsSpline {
                 }
             });
             bubble.add_controller(gesture);
-
             item.set_child(Some(&root));
         });
 
         console_factory.connect_bind(move |_factory, item| {
             let item = item.downcast_ref::<ListItem>().unwrap();
             let root = item.child().unwrap().downcast::<Box>().unwrap();
-
             let mut iter = root.first_child();
             let left_spacer = iter.unwrap().downcast::<Box>().unwrap();
             iter = left_spacer.next_sibling();
             let bubble = iter.unwrap().downcast::<Box>().unwrap();
             iter = bubble.next_sibling();
             let right_spacer = iter.unwrap().downcast::<Box>().unwrap();
-
             let obj = item.item().unwrap().downcast::<DispatchObject>().unwrap();
 
-            // Children: Meta Label (0), Chat View (1), Expander (2)
             let mut iter_bubble = bubble.first_child();
             let meta_label = iter_bubble.unwrap().downcast::<Label>().unwrap();
             iter_bubble = meta_label.next_sibling();
@@ -650,15 +636,12 @@ impl CommsSpline {
             iter_bubble = chat_view.next_sibling();
             let expander = iter_bubble.unwrap().downcast::<Expander>().unwrap();
 
-            // Gesture logic handled in setup via item.item() dynamic retrieval
-
             let is_chat = obj.is_chat();
             let sender = obj.sender();
             let timestamp = obj.timestamp();
             let content = obj.content();
             let subject = obj.subject();
 
-            // Reset Bubble Classes and Visibility
             bubble.remove_css_class("architect-bubble");
             bubble.remove_css_class("una-bubble");
             left_spacer.set_visible(false);
@@ -667,41 +650,27 @@ impl CommsSpline {
             if is_chat {
                 chat_view.set_visible(true);
                 expander.set_visible(false);
-
                 meta_label.set_text(&format!("{} • {}", sender, timestamp));
-
-                // Style sender
                 meta_label.remove_css_class("role-architect");
                 meta_label.remove_css_class("role-una");
                 meta_label.remove_css_class("role-system");
-
                 if sender == "Architect" {
-                    // Architect (Right Aligned): Left Spacer Visible, Right Spacer Hidden
                     meta_label.add_css_class("role-architect");
                     bubble.add_css_class("architect-bubble");
                     left_spacer.set_visible(true);
                     right_spacer.set_visible(false);
                     meta_label.set_xalign(1.0);
                 } else {
-                    // Una/System (Left Aligned): Left Spacer Hidden, Right Spacer Visible
-                    if sender == "Una-Prime" {
-                        meta_label.add_css_class("role-una");
-                    } else {
-                        meta_label.add_css_class("role-system");
-                    }
+                    if sender == "Una-Prime" { meta_label.add_css_class("role-una"); } else { meta_label.add_css_class("role-system"); }
                     bubble.add_css_class("una-bubble");
                     left_spacer.set_visible(false);
                     right_spacer.set_visible(true);
                     meta_label.set_xalign(0.0);
                 }
-
-                // Truncation Logic
                 let is_expanded = obj.is_expanded();
                 let line_count = content.lines().count();
                 if line_count > 11 && !is_expanded {
-                    let truncated: String =
-                        content.lines().take(11).collect::<Vec<&str>>().join("\n")
-                            + "\n\n... [Click to expand]";
+                    let truncated: String = content.lines().take(11).collect::<Vec<&str>>().join("\n") + "\n\n... [Click to expand]";
                     chat_view.buffer().set_text(&truncated);
                 } else {
                     chat_view.buffer().set_text(&content);
@@ -709,21 +678,11 @@ impl CommsSpline {
             } else {
                 chat_view.set_visible(false);
                 expander.set_visible(true);
-
-                // Payloads generally align left but take full space if possible,
-                // but for bubbles we can stick to Una style (Left aligned) or fill.
-                // Let's stick to Una style (Left Aligned) with spacer to avoid full stretch.
-                bubble.add_css_class("una-bubble"); // Default to dark background
+                bubble.add_css_class("una-bubble");
                 left_spacer.set_visible(false);
                 right_spacer.set_visible(true);
-
                 expander.set_label(Some(&format!("{} | {} | {}", sender, subject, timestamp)));
-
-                let scroll = expander
-                    .child()
-                    .unwrap()
-                    .downcast::<ScrolledWindow>()
-                    .unwrap();
+                let scroll = expander.child().unwrap().downcast::<ScrolledWindow>().unwrap();
                 let content_view = scroll.child().unwrap().downcast::<SourceView>().unwrap();
                 content_view.buffer().set_text(&content);
                 expander.set_expanded(false);
@@ -732,23 +691,12 @@ impl CommsSpline {
 
         let console_list_view = ListView::new(Some(console_selection), Some(console_factory));
         console_list_view.add_css_class("console");
-
-        // === FIX: ALIGN TO BOTTOM ===
         console_list_view.set_valign(Align::End);
-
         scrolled_window.set_child(Some(&console_list_view));
 
-
-        // --- The Spatial Cortex (Euclase Target) ---
-        let spatial_canvas = gtk4::Picture::new();
-        spatial_canvas.set_hexpand(true);
-        spatial_canvas.set_vexpand(true);
-        // We will bind this to a toggle button later to reveal the 3rd pane.
-
-        // Attach console to the top pane
         main_paned.set_start_child(Some(&scrolled_window));
 
-        // --- Input Area ---
+        // Input Area
         let input_container = Box::new(Orientation::Horizontal, 8);
         input_container.set_valign(Align::Fill);
         input_container.set_margin_start(16);
@@ -756,19 +704,10 @@ impl CommsSpline {
         input_container.set_margin_bottom(16);
         input_container.set_margin_top(16);
 
-        // Native Button Scaling Fix
-        let attach_btn = Button::builder()
-            .valign(Align::End)
-            .icon_name("share-symbolic")
-            .css_classes(vec!["attach-action"])
-            .tooltip_text("Attach File")
-            .build();
-
-        let tx_clone_file = tx_event.clone();
+        let attach_btn = Button::builder().valign(Align::End).icon_name("share-symbolic").css_classes(vec!["attach-action"]).tooltip_text("Attach File").build();
+         let tx_clone_file = tx_event.clone();
         let window_clone = window.clone();
         let target_file = active_target.clone();
-
-        // S41 Fix: FileDialog usage restored (feature v4_12 enabled)
         attach_btn.connect_clicked(move |_| {
             let tx = tx_clone_file.clone();
             let parent_window = window_clone.clone();
@@ -779,21 +718,14 @@ impl CommsSpline {
                 if let Ok(file) = result {
                     if let Some(path) = file.path() {
                         let path_str = path.to_string_lossy().to_string();
-                        let _ = tx
-                            .send(Event::Input {
-                                target: target.borrow().clone(),
-                                text: format!("/upload {}", path_str),
-                            })
-                            .await;
+                        let _ = tx.send(Event::Input { target: target.borrow().clone(), text: format!("/upload {}", path_str) }).await;
                     }
                 }
             });
         });
 
-        // THE COMPOSER
-        let active_directive = Rc::new(RefCell::new("Directive 055".to_string()));
-        let active_directive_clone = active_directive.clone();
-
+        // ... [Composer Logic - Same as before] ...
+        // Redefined due to move
         let tx_composer = tx_event.clone();
         let popover_composer = Popover::builder().build();
         let pop_box = Box::new(Orientation::Vertical, 8);
@@ -861,33 +793,13 @@ impl CommsSpline {
                 let (start, end) = bod_buf.bounds();
                 let body = bod_buf.text(&start, &end, false).to_string();
                 let pb = pb_chk.is_active();
-                let action = if b_ex.is_active() {
-                    "exec"
-                } else if b_ar.is_active() {
-                    "arch"
-                } else if b_db.is_active() {
-                    "debug"
-                } else {
-                    "una"
-                };
-
-                // === ASYNC DISPATCH ===
+                let action = if b_ex.is_active() { "exec" } else if b_ar.is_active() { "arch" } else if b_db.is_active() { "debug" } else { "una" };
                 let tx_async = tx_composer.clone();
                 let target_val = target_comp.borrow().clone();
                 let action_val = action.to_string();
-
                 glib::MainContext::default().spawn_local(async move {
-                    let _ = tx_async
-                        .send(Event::ComplexInput {
-                            target: target_val,
-                            subject,
-                            body,
-                            point_break: pb,
-                            action: action_val,
-                        })
-                        .await;
+                    let _ = tx_async.send(Event::ComplexInput { target: target_val, subject, body, point_break: pb, action: action_val }).await;
                 });
-
                 pop.popdown();
             }
         });
@@ -902,75 +814,42 @@ impl CommsSpline {
             popover_composer.popup();
         });
 
-        // Chat Input
-        let input_scroll = ScrolledWindow::builder()
-            .hscrollbar_policy(PolicyType::Never)
-            .vscrollbar_policy(PolicyType::Automatic)
-            .height_request(80)
-            .valign(Align::Fill)
-            .has_frame(false)
-            .build();
-        input_scroll.set_hexpand(true);
-        input_scroll.add_css_class("chat-input-area");
 
-        let text_view = SourceView::builder()
-            .wrap_mode(gtk4::WrapMode::WordChar)
-            .show_line_numbers(false)
-            .auto_indent(true)
-            .accepts_tab(false)
-            .top_margin(8)
-            .bottom_margin(8)
-            .left_margin(10)
-            .right_margin(10)
-            .build();
+        // Chat Input
+        let input_scroll = ScrolledWindow::builder().hscrollbar_policy(PolicyType::Never).vscrollbar_policy(PolicyType::Automatic).height_request(80).valign(Align::Fill).has_frame(false).build();
+        input_scroll.set_hexpand(true);
+        // Removed manual CSS class for Phase 1
+        // input_scroll.add_css_class("chat-input-area");
+        let text_view = SourceView::builder().wrap_mode(gtk4::WrapMode::WordChar).show_line_numbers(false).auto_indent(true).accepts_tab(false).top_margin(8).bottom_margin(8).left_margin(10).right_margin(10).build();
         enable_spelling(&text_view);
-        text_view.add_css_class("transparent-text");
+        // Removed manual CSS class for Phase 1
+        // text_view.add_css_class("transparent-text");
         input_scroll.set_child(Some(&text_view));
 
-        // === FIX: CRASH RECOVERY (AUTOSAVE) WITHOUT MACROS ===
         let draft_path = gneiss_pal::paths::UnaPaths::root().join(".lumen_draft.txt");
-        if let Ok(draft) = std::fs::read_to_string(&draft_path) {
-            text_view.buffer().set_text(&draft);
-        }
-
+        if let Ok(draft) = std::fs::read_to_string(&draft_path) { text_view.buffer().set_text(&draft); }
         let pending_save: Rc<RefCell<Option<glib::SourceId>>> = Rc::new(RefCell::new(None));
         let draft_path_clone = draft_path.clone();
         let buffer_for_save = text_view.buffer();
-
         buffer_for_save.connect_changed(move |buf: &gtk4::TextBuffer| {
-            if let Some(source) = pending_save.borrow_mut().take() {
-                source.remove();
-            }
+            if let Some(source) = pending_save.borrow_mut().take() { source.remove(); }
             let (start, end) = buf.bounds();
             let text = buf.text(&start, &end, false).to_string();
             let path = draft_path_clone.clone();
-
             let pending_timeout = pending_save.clone();
             *pending_save.borrow_mut() = Some(glib::timeout_add_local(std::time::Duration::from_millis(500), move || {
                 let _ = std::fs::write(&path, &text);
-                *pending_timeout.borrow_mut() = None; // Wipe the ghost ID
+                *pending_timeout.borrow_mut() = None;
                 glib::ControlFlow::Break
             }));
         });
 
-        // Native Button Scaling Fix
-        let send_btn = Button::builder()
-            .valign(Align::End)
-            .icon_name("paper-plane-symbolic")
-            .css_classes(vec!["suggested-action"])
-            .tooltip_text("Send Message (Ctrl+Enter)")
-            .build();
-
+        let send_btn = Button::builder().valign(Align::End).icon_name("paper-plane-symbolic").css_classes(vec!["suggested-action"]).tooltip_text("Send Message (Ctrl+Enter)").build();
         let tx_clone_send = tx_event.clone();
         let buffer = text_view.buffer();
         let btn_send_clone = send_btn.clone();
-
         buffer.connect_changed(move |buf: &gtk4::TextBuffer| {
-            if buf.line_count() > 1 {
-                btn_send_clone.remove_css_class("suggested-action");
-            } else {
-                btn_send_clone.add_css_class("suggested-action");
-            }
+            if buf.line_count() > 1 { btn_send_clone.remove_css_class("suggested-action"); } else { btn_send_clone.add_css_class("suggested-action"); }
         });
 
         let key_controller = EventControllerKey::new();
@@ -979,25 +858,18 @@ impl CommsSpline {
         let buffer_key = buffer.clone();
         let target_key = active_target.clone();
         let draft_wipe_path1 = draft_path.clone();
-
         key_controller.connect_key_pressed(move |_ctrl, key, _keycode, state| {
-            if key != Key::Return {
-                return glib::Propagation::Proceed;
-            }
-            if state.contains(ModifierType::SHIFT_MASK) {
-                return glib::Propagation::Proceed;
-            }
+            if key != Key::Return { return glib::Propagation::Proceed; }
+            if state.contains(ModifierType::SHIFT_MASK) { return glib::Propagation::Proceed; }
             let is_ctrl = state.contains(ModifierType::CONTROL_MASK);
             if is_ctrl || buffer_key.line_count() <= 1 {
                 let (start, end) = buffer_key.bounds();
                 let text = buffer_key.text(&start, &end, false).to_string();
                 if !text.trim().is_empty() {
-                    let _ = std::fs::remove_file(&draft_wipe_path1); // WIPE DRAFT
+                    let _ = std::fs::remove_file(&draft_wipe_path1);
                     let tx_async = tx_clone_key.clone();
                     let target_val = target_key.borrow().clone();
-                    glib::MainContext::default().spawn_local(async move {
-                        let _ = tx_async.send(Event::Input { target: target_val, text }).await;
-                    });
+                    glib::MainContext::default().spawn_local(async move { let _ = tx_async.send(Event::Input { target: target_val, text }).await; });
                     buffer_key.set_text("");
                 }
                 return glib::Propagation::Stop;
@@ -1009,17 +881,14 @@ impl CommsSpline {
         let target_send = active_target.clone();
         let buffer_send = buffer.clone();
         let draft_wipe_path2 = draft_path.clone();
-
         send_btn.connect_clicked(move |_| {
             let (start, end) = buffer_send.bounds();
             let text = buffer_send.text(&start, &end, false).to_string();
             if !text.trim().is_empty() {
-                let _ = std::fs::remove_file(&draft_wipe_path2); // WIPE DRAFT
+                let _ = std::fs::remove_file(&draft_wipe_path2);
                 let tx_async = tx_clone_send.clone();
                 let target_val = target_send.borrow().clone();
-                glib::MainContext::default().spawn_local(async move {
-                    let _ = tx_async.send(Event::Input { target: target_val, text }).await;
-                });
+                glib::MainContext::default().spawn_local(async move { let _ = tx_async.send(Event::Input { target: target_val, text }).await; });
                 buffer_send.set_text("");
             }
         });
@@ -1028,10 +897,84 @@ impl CommsSpline {
         input_container.append(&input_scroll);
         input_container.append(&send_btn);
 
-        // Attach input to bottom pane
         main_paned.set_end_child(Some(&input_container));
+        comms_page.append(&main_paned);
+        workspace_stack.add_titled(&comms_page, Some("comms"), "Comms");
 
-        right_vbox.append(&main_paned);
+        // --- PAGE 2: PAYLOAD EDITOR (The Interceptor) ---
+        let payload_page = Box::new(Orientation::Vertical, 0);
+        let payload_header = Label::builder()
+            .use_markup(true)
+            .label("<span font_desc='11' weight='bold' color='#ff00ff'>INTERCEPTOR: PAYLOAD REVIEW</span>")
+            .halign(Align::Center)
+            .margin_top(8)
+            .margin_bottom(8)
+            .build();
+        payload_page.append(&payload_header);
+
+        let payload_buffer = sourceview5::Buffer::new(None);
+        let payload_view = SourceView::with_buffer(&payload_buffer);
+        payload_view.set_show_line_numbers(true);
+        payload_view.set_monospace(true);
+        payload_view.set_wrap_mode(gtk4::WrapMode::WordChar);
+        enable_spelling(&payload_view);
+
+        let payload_scroll = ScrolledWindow::builder()
+            .child(&payload_view)
+            .vexpand(true)
+            .build();
+        payload_page.append(&payload_scroll);
+
+        let control_box = Box::new(Orientation::Horizontal, 12);
+        control_box.set_margin_top(12);
+        control_box.set_margin_bottom(12);
+        control_box.set_margin_start(12);
+        control_box.set_margin_end(12);
+
+        // Auto-Send Checkbox
+        let auto_send_check = CheckButton::with_label("Auto-Send (Bypass Review)");
+        control_box.append(&auto_send_check);
+
+        // Spacer to push Transmit to the right
+        let editor_spacer = Box::new(Orientation::Horizontal, 0);
+        editor_spacer.set_hexpand(true);
+        control_box.append(&editor_spacer);
+
+        // Cancel Button (Phase 4)
+        let btn_cancel = Button::with_label("Cancel");
+        let stack_cancel = workspace_stack.clone();
+        let buf_cancel = payload_buffer.clone();
+        btn_cancel.connect_clicked(move |_| {
+            buf_cancel.set_text("");
+            stack_cancel.set_visible_child_name("comms");
+        });
+        control_box.append(&btn_cancel);
+
+        let btn_transmit = Button::with_label("TRANSMIT PAYLOAD");
+        btn_transmit.add_css_class("suggested-action");
+
+        let tx_interceptor = tx_event.clone();
+        let payload_buf_clone = payload_buffer.clone();
+        let stack_clone = workspace_stack.clone();
+
+        btn_transmit.connect_clicked(move |_| {
+            let (start, end) = payload_buf_clone.bounds();
+            let final_payload = payload_buf_clone.text(&start, &end, false).to_string();
+
+            let tx_clone = tx_interceptor.clone();
+            glib::MainContext::default().spawn_local(async move {
+                let _ = tx_clone.send(Event::DispatchPayload(final_payload)).await;
+            });
+            // Switch back to comms
+            stack_clone.set_visible_child_name("comms");
+        });
+
+        control_box.append(&btn_transmit);
+        payload_page.append(&control_box);
+
+        workspace_stack.add_titled(&payload_page, Some("editor"), "Payload Editor");
+
+        right_vbox.append(&workspace_stack);
         main_h_paned.set_end_child(Some(&right_vbox));
 
         let left_vbox_clone = left_vbox.clone();
@@ -1048,44 +991,47 @@ impl CommsSpline {
         let pulse_icon_clone = pulse_icon.clone();
         let active_directive_async = active_directive_clone.clone();
 
-        let _buffer_async = buffer.clone();
+        let console_store_async = console_store.clone();
+
+        let payload_buf_async = payload_buffer.clone();
+        let auto_send_check_async = auto_send_check.clone();
+        let stack_async = workspace_stack.clone();
+        let tx_interceptor_async = tx_event.clone();
 
         glib::MainContext::default().spawn_local(async move {
             while let Ok(update) = rx.recv().await {
                 match update {
 
                     GuiUpdate::ConsoleLog(text) => {
-    let mut sender = "System".to_string();
-    let mut is_chat = true;
-    let content = text.clone();
-    let mut subject = "Log".to_string();
+                        let mut sender = "System".to_string();
+                        let mut is_chat = true;
+                        let content = text.clone();
+                        let mut subject = "Log".to_string();
 
-    if text.trim().starts_with("[ARCHITECT]") {
-        sender = "Architect".to_string();
-        is_chat = true;
-    } else if text.trim().starts_with("[UNA]") {
-        sender = "Una-Prime".to_string();
-        is_chat = true;
-    } else if text.trim().starts_with("[S") {
-        let after_s = &text.trim()[2..];
-        if let Some(first_char) = after_s.chars().next() {
-            if first_char.is_numeric() {
-                sender = "Shard".to_string();
-                is_chat = false;
-                subject = "Wolfpack Output".to_string();
-            }
-        }
-    }
+                        if text.trim().starts_with("[ARCHITECT]") {
+                            sender = "Architect".to_string();
+                            is_chat = true;
+                        } else if text.trim().starts_with("[UNA]") {
+                            sender = "Una-Prime".to_string();
+                            is_chat = true;
+                        } else if text.trim().starts_with("[S") {
+                            let after_s = &text.trim()[2..];
+                            if let Some(first_char) = after_s.chars().next() {
+                                if first_char.is_numeric() {
+                                    sender = "Shard".to_string();
+                                    is_chat = false;
+                                    subject = "Wolfpack Output".to_string();
+                                }
+                            }
+                        }
 
-    let timestamp = chrono::Local::now().format("%H:%M:%S").to_string();
-
-    let id = format!("{}", chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0));
-
-    let obj = DispatchObject::new(
-        &id, &sender, &subject, &timestamp, &content, is_chat,
-    );
-
-    console_store.append(&obj);
+                        let timestamp = chrono::Local::now().format("%H:%M:%S").to_string();
+                        let id = format!("{}", chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0));
+                        let obj = DispatchObject::new(&id, &sender, &subject, &timestamp, &content, is_chat);
+                        console_store_async.append(&obj);
+                    }
+                    GuiUpdate::ClearConsole => {
+                        console_store_async.remove_all();
                     }
                     GuiUpdate::ShardStatusChanged { id, status } => {
                         let (spinner, label, name) = if id == "una-prime" {
@@ -1126,19 +1072,32 @@ impl CommsSpline {
                             pulse_icon_clone.remove_css_class("spin-active");
                         }
                     },
-                    GuiUpdate::TokenUsage(tokens) => {
-                        token_label_clone.set_text(&format!("Tokens: {}", tokens));
+                    GuiUpdate::TokenUsage(p, c, t) => {
+                        token_label_clone.set_text(&format!("Tokens: IN: {} | OUT: {} | TOTAL: {}", p, c, t));
                     }
                     GuiUpdate::ActiveDirective(d) => {
                         *active_directive_async.borrow_mut() = d;
+                    }
+                    GuiUpdate::ReviewPayload(json_payload) => {
+                         // === TARGET 4: THE INTERCEPTOR LOGIC ===
+                         if auto_send_check_async.is_active() {
+                             // Auto-Send: Bypass UI Review
+                             let tx_clone = tx_interceptor_async.clone();
+                             glib::MainContext::default().spawn_local(async move {
+                                let _ = tx_clone.send(Event::DispatchPayload(json_payload)).await;
+                            });
+                         } else {
+                             // Manual Review: Populate and Switch Tab
+                             payload_buf_async.set_text(&json_payload);
+                             stack_async.set_visible_child_name("editor");
+                         }
                     }
                     _ => {}
                 }
             }
         });
 
-        // === FIX: HARDWIRE NEXUS SELECTION (Put this right before returning main_h_paned) ===
-        // Index 0 is the "PRIMES" label. Index 1 is Una-Prime.
+        // === FIX: HARDWIRE NEXUS SELECTION ===
         if let Some(row) = nexus_list.row_at_index(1) {
             nexus_list.select_row(Some(&row));
         }
