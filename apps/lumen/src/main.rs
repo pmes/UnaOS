@@ -2,6 +2,7 @@ mod core;
 mod cortex;
 mod ui;
 
+#[cfg(target_os = "linux")]
 use crate::ui::telemetry::ContextView;
 use bandy::{SMessage, Synapse, telemetry};
 use gneiss_pal::paths::UnaPaths;
