@@ -33,9 +33,8 @@ fn enable_spelling(view: &SourceView) {
         adapter.set_enabled(true);
 
         // BIND NATIVE RIGHT-CLICK SUGGESTIONS
-        if let Some(menu) = adapter.menu_model() {
-            view.set_extra_menu(Some(&menu));
-        }
+        let menu = adapter.menu_model();
+        view.set_extra_menu(Some(&menu));
 
         unsafe {
             buffer.set_data("spell-adapter", SendWrapper(adapter));
