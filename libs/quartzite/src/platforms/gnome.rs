@@ -3,28 +3,14 @@
 use gtk4::prelude::*;
 use libadwaita::prelude::*;
 use libadwaita as adw;
-use gtk4::{
-    Application, Box, Orientation, Label, Button, Stack, ScrolledWindow,
-    PolicyType, Align, ListBox, StackTransitionType, TextView, EventControllerKey,
-    TextBuffer, Adjustment, FileChooserNative, ResponseType, FileChooserAction,
-    StackSwitcher, ToggleButton, CssProvider, StyleContext, Image, MenuButton, Popover,
-    Paned, Spinner, ApplicationWindow
-};
-use sourceview5::prelude::*;
-use sourceview5::View as SourceView;
-use sourceview5::{Buffer, StyleSchemeManager};
-use gtk4::gdk::{Key, ModifierType};
+use gtk4::{Application, ApplicationWindow};
 use std::rc::Rc;
 use std::cell::RefCell;
-use std::time::Duration;
 use log::info;
 use std::time::Instant;
-use std::io::Write;
-use std::path::PathBuf;
 use async_channel::Receiver;
 
-use crate::types::*;
-use crate::shard::{Shard, ShardRole, ShardStatus};
+use gneiss_pal::{Event, GuiUpdate, AppHandler};
 
 pub struct Backend<A: AppHandler> {
     app_handler: Rc<RefCell<A>>,
@@ -36,9 +22,6 @@ impl<A: AppHandler> Backend<A> {
     pub fn new<F>(app_id: &str, app_handler: A, rx: Receiver<GuiUpdate>, bootstrap_fn: F) -> Self
     where F: Fn(&ApplicationWindow, async_channel::Sender<Event>, Receiver<GuiUpdate>) -> gtk4::Widget + 'static
     {
-        // Ensure resources are registered
-        crate::register_resources();
-
         let app = Application::builder()
             .application_id(app_id)
             .build();

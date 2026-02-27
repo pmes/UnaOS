@@ -49,7 +49,6 @@ fn enable_spelling(view: &SourceView) {
 use gneiss_pal::shard::ShardStatus;
 use gneiss_pal::{GuiUpdate, WolfpackState};
 
-#[cfg(not(feature = "gnome"))]
 use gtk4::HeaderBar;
 
 #[cfg(feature = "gnome")]
@@ -69,6 +68,28 @@ impl CommsSpline {
         rx: Receiver<GuiUpdate>,
     ) -> Widget {
         window.set_title(Some("Vein (Trinity Architecture)"));
+
+        // Phase 3 Helper: Dynamic Theme Compliance
+        let setup_dynamic_theme = |buffer: &sourceview5::Buffer| {
+            let buffer_weak = buffer.downgrade();
+            let settings = gtk4::Settings::default().expect("Could not get default settings");
+
+            let update_theme = move |settings: &gtk4::Settings| {
+                if let Some(buf) = buffer_weak.upgrade() {
+                    // Note: We check specifically for dark preference.
+                    // Adwaita-dark vs Adwaita is the standard.
+                    let prefer_dark = settings.property::<bool>("gtk-application-prefer-dark-theme");
+                    let scheme_name = if prefer_dark { "Adwaita-dark" } else { "Adwaita" };
+                    let style_manager = sourceview5::StyleSchemeManager::default();
+                    if let Some(scheme) = style_manager.scheme(scheme_name) {
+                        buf.set_style_scheme(Some(&scheme));
+                    }
+                }
+            };
+
+            update_theme(&settings);
+            settings.connect_gtk_application_prefer_dark_theme_notify(update_theme);
+        };
 
         // 1. Nodes Tab Rename
         let store = gio::ListStore::new::<StringObject>();
@@ -99,15 +120,6 @@ impl CommsSpline {
             .suggested-action { background-color: #0078d4; color: #ffffff; border-radius: 4px; }
             .attach-action { border-radius: 4px; }
 
-            /* Spin Animation (Random Roll) */
-            @keyframes random-roll {
-                0% { transform: rotate(0deg); }
-                100% { transform: rotate(360deg); }
-            }
-            .spin-active {
-                animation: random-roll 1.5s infinite linear;
-                color: #0078d4;
-            }
             .nexus-header { font-weight: bold; margin-top: 12px; margin-bottom: 4px; opacity: 0.7; font-size: 0.9em; }
 
             .role-architect { color: #0078d4; font-weight: bold; }
@@ -136,9 +148,7 @@ impl CommsSpline {
         token_label.set_wrap(true);
         token_label.set_justify(gtk4::Justification::Center);
 
-        let pulse_icon = Image::from_icon_name("spinner-symbolic");
-        pulse_icon.set_pixel_size(16); // Reverted to 16px (Phase 4)
-        // pulse_icon.set_opacity(0.5); // Removed for Phase 4
+        let pulse_icon = Spinner::new();
 
         let status_group = Box::new(Orientation::Horizontal, 8);
         status_group.append(&sidebar_toggle);
@@ -500,70 +510,56 @@ impl CommsSpline {
             }
         });
 
-        // HeaderBar Setup (Split Architecture - Phase 1)
+        // HeaderBar Setup (Universal 2x2 CSD Grid)
         let main_switcher = StackSwitcher::builder()
             .stack(&workspace_stack)
             .halign(Align::Center)
             .build();
 
-        #[cfg(feature = "gnome")]
-        {
-            // Left Header (Sidebar Control) - Blank
-            let blank_header_bar = adw::HeaderBar::new();
-            blank_header_bar.set_show_start_title_buttons(false);
-            blank_header_bar.set_show_end_title_buttons(false);
-            // blank_header_bar.set_title_widget(Some(&sidebar_switcher)); // REMOVED (Phase 1)
-            blank_header_bar.set_title_widget(Some(&adw::WindowTitle::new("", ""))); // Ensure blank
-            left_vbox.prepend(&blank_header_bar);
+        // 1. Master Titlebar
+        let master_titlebar = Box::new(Orientation::Vertical, 0);
 
-            // Sub-Header Grid: Sidebar Switcher Below Header (Phase 1)
-            let sidebar_header_box = Box::new(Orientation::Horizontal, 0);
-            sidebar_header_box.set_halign(Align::Center);
-            sidebar_header_box.set_margin_top(4);
-            sidebar_header_box.set_margin_bottom(4);
-            sidebar_header_box.append(&sidebar_switcher);
-            left_vbox.insert_child_after(&sidebar_header_box, Some(&blank_header_bar));
+        // 2. Row 1 (The Headers)
+        let top_hbox = Box::new(Orientation::Horizontal, 0);
 
-            // Right Header (Workspace Control) - Only Status Group
-            let command_header_bar = adw::HeaderBar::new();
-            command_header_bar.set_show_start_title_buttons(true);
-            command_header_bar.set_show_end_title_buttons(true);
-            // command_header_bar.set_title_widget(Some(&main_switcher)); // REMOVED (Phase 1)
-            command_header_bar.set_title_widget(Some(&adw::WindowTitle::new("Lumen", ""))); // Or empty
-            command_header_bar.pack_start(&status_group);
-            right_vbox.append(&command_header_bar);
+        let left_header = HeaderBar::new();
+        left_header.set_show_title_buttons(false);
+        left_header.set_width_request(260);
 
-            // Sub-Header Grid: Main Switcher Below Header (Phase 1)
-            let workspace_header_box = Box::new(Orientation::Horizontal, 0);
-            workspace_header_box.set_halign(Align::Center);
-            workspace_header_box.set_margin_top(4);
-            workspace_header_box.set_margin_bottom(4);
-            workspace_header_box.append(&main_switcher);
-            right_vbox.append(&workspace_header_box);
-        }
+        let right_header = HeaderBar::new();
+        right_header.set_show_title_buttons(true);
+        right_header.set_hexpand(true);
+        right_header.pack_start(&status_group);
 
-        #[cfg(not(feature = "gnome"))]
-        {
-            let unified_header_bar = HeaderBar::new();
-            unified_header_bar.set_show_title_buttons(true);
-            unified_header_bar.set_title_widget(Some(&main_switcher));
+        top_hbox.append(&left_header);
+        top_hbox.append(&right_header);
 
-            let header_spacer = Box::new(Orientation::Horizontal, 0);
-            main_h_paned
-                .bind_property("position", &header_spacer, "width-request")
-                .sync_create()
-                .build();
-            sidebar_toggle
-                .bind_property("active", &header_spacer, "visible")
-                .sync_create()
-                .build();
+        // 3. Row 2 (The Tabs)
+        let bottom_hbox = Box::new(Orientation::Horizontal, 0);
 
-            unified_header_bar.pack_start(&header_spacer);
-            unified_header_bar.pack_start(&status_group);
+        let left_tabs_container = Box::new(Orientation::Horizontal, 0);
+        left_tabs_container.set_width_request(260);
 
-            if let Some(app_win) = window.dynamic_cast_ref::<gtk4::ApplicationWindow>() {
-                app_win.set_titlebar(Some(&unified_header_bar));
-            }
+        sidebar_switcher.set_halign(Align::Center);
+        sidebar_switcher.set_hexpand(true); // Center inside container
+        left_tabs_container.append(&sidebar_switcher);
+
+        let right_tabs_container = Box::new(Orientation::Horizontal, 0);
+        right_tabs_container.set_hexpand(true);
+
+        main_switcher.set_halign(Align::Center);
+        main_switcher.set_hexpand(true); // Center inside container
+        right_tabs_container.append(&main_switcher);
+
+        bottom_hbox.append(&left_tabs_container);
+        bottom_hbox.append(&right_tabs_container);
+
+        // Execution
+        master_titlebar.append(&top_hbox);
+        master_titlebar.append(&bottom_hbox);
+
+        if let Some(app_win) = window.dynamic_cast_ref::<gtk4::ApplicationWindow>() {
+            app_win.set_titlebar(Some(&master_titlebar));
         }
 
         // Console ListView
@@ -788,10 +784,7 @@ impl CommsSpline {
         body_view.set_wrap_mode(gtk4::WrapMode::WordChar);
         enable_spelling(&body_view);
         // Phase 3: Dark Scheme
-        let style_manager = sourceview5::StyleSchemeManager::default();
-        if let Some(scheme) = style_manager.scheme("Adwaita-dark") {
-            body_buffer.set_style_scheme(Some(&scheme));
-        }
+        setup_dynamic_theme(&body_buffer);
 
         body_view.set_height_request(150);
         let body_scroll = ScrolledWindow::builder()
@@ -859,11 +852,8 @@ impl CommsSpline {
         input_scroll.set_child(Some(&text_view));
 
         // Phase 3: Dark Scheme
-        let style_manager_input = sourceview5::StyleSchemeManager::default();
-        if let Some(scheme) = style_manager_input.scheme("Adwaita-dark") {
-            if let Ok(buffer) = text_view.buffer().downcast::<sourceview5::Buffer>() {
-                buffer.set_style_scheme(Some(&scheme));
-            }
+        if let Ok(buffer) = text_view.buffer().downcast::<sourceview5::Buffer>() {
+            setup_dynamic_theme(&buffer);
         }
 
         let draft_path = gneiss_pal::paths::UnaPaths::root().join(".lumen_draft.txt");
@@ -963,10 +953,7 @@ impl CommsSpline {
 
         // Phase 3: Dark Scheme & Editable
         payload_view.set_editable(true);
-        let style_manager_payload = sourceview5::StyleSchemeManager::default();
-        if let Some(scheme) = style_manager_payload.scheme("Adwaita-dark") {
-            payload_buffer.set_style_scheme(Some(&scheme));
-        }
+        setup_dynamic_theme(&payload_buffer);
 
         let payload_scroll = ScrolledWindow::builder()
             .child(&payload_view)
@@ -1116,10 +1103,10 @@ impl CommsSpline {
                     }
                     GuiUpdate::SidebarStatus(state) => match state {
                         WolfpackState::Dreaming => {
-                            pulse_icon_clone.add_css_class("spin-active");
+                            pulse_icon_clone.start();
                         }
                         _ => {
-                            pulse_icon_clone.remove_css_class("spin-active");
+                            pulse_icon_clone.stop();
                         }
                     },
                     GuiUpdate::TokenUsage(p, c, t) => {
@@ -1154,14 +1141,6 @@ impl CommsSpline {
             nexus_list.select_row(Some(&row));
         }
 
-        #[cfg(feature = "gnome")]
-        {
-            main_h_paned.upcast::<Widget>()
-        }
-
-        #[cfg(not(feature = "gnome"))]
-        {
-            main_h_paned.into()
-        }
+        main_h_paned.upcast::<Widget>()
     }
 }
