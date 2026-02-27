@@ -1,8 +1,7 @@
 #![cfg(target_os = "macos")]
 
-use objc2::{define_class, msg_send, msg_send_id, ClassType};
+use objc2::{define_class, msg_send};
 use objc2::rc::Retained;
-use objc2::mutability::MainThreadOnly;
 use objc2_app_kit::{NSApplication, NSApplicationActivationPolicy, NSApplicationDelegate, NSWindow, NSWindowStyleMask};
 use objc2_foundation::{MainThreadMarker, NSObject, NSObjectProtocol, NSRect, NSPoint, NSSize};
 use std::cell::RefCell;
@@ -19,18 +18,12 @@ thread_local! {
 // -----------------------------------------------------------------------------
 // THE DELEGATE (OBJECTIVE-C FFI)
 // -----------------------------------------------------------------------------
-// In objc2 0.6, we use define_class! which handles both declaration and implementation.
-// It automatically handles DeclaredClass, Ivars (via fields), and Protocols.
-
 define_class!(
     #[unsafe(super(NSObject))]
-    // We strictly define MainThreadOnly mutability for UI delegates.
     #[thread_kind = MainThreadOnly]
     #[name = "UnaAppDelegate"]
-    // We declare the struct directly. If we needed ivars, we would add fields here.
     struct UnaAppDelegate;
 
-    // Conformance to Protocols
     unsafe impl NSObjectProtocol for UnaAppDelegate {}
     unsafe impl NSApplicationDelegate for UnaAppDelegate {
         #[unsafe(method(applicationDidFinishLaunching:))]
@@ -38,8 +31,6 @@ define_class!(
             println!("[UnaOS::Quartzite] macOS Application Runloop Ignited (objc2 0.6).");
 
             // 1. The engine is awake.
-            // In objc2 0.6, `MainThreadMarker` is often passed or we get it from context.
-            // We can still fetch it safely.
             let mtm = MainThreadMarker::new().expect("Must be on main thread");
 
             // Coordinates: (0, 0) is bottom-left on macOS.
@@ -53,7 +44,7 @@ define_class!(
             // UNAOS THREAD SAFETY MANDATE (APPKIT)
             // -------------------------------------------------------------------
             let window: Retained<NSWindow> = unsafe {
-                msg_send_id![
+                msg_send![
                     mtm.alloc::<NSWindow>(),
                     initWithContentRect: content_rect,
                     styleMask: style,
@@ -92,10 +83,8 @@ define_class!(
 
 impl UnaAppDelegate {
     fn new(mtm: MainThreadMarker) -> Retained<Self> {
-        // In 0.6, allocation is cleaner.
-        // But `define_class!` generates a type we can alloc.
         let this = mtm.alloc();
-        unsafe { msg_send_id![this, init] }
+        unsafe { msg_send![this, init] }
     }
 }
 
