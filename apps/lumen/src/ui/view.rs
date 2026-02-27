@@ -69,28 +69,6 @@ impl CommsSpline {
     ) -> Widget {
         window.set_title(Some("Vein (Trinity Architecture)"));
 
-        // Phase 3 Helper: Dynamic Theme Compliance
-        let setup_dynamic_theme = |buffer: &sourceview5::Buffer| {
-            let buffer_weak = buffer.downgrade();
-            let settings = gtk4::Settings::default().expect("Could not get default settings");
-
-            let update_theme = move |settings: &gtk4::Settings| {
-                if let Some(buf) = buffer_weak.upgrade() {
-                    // Note: We check specifically for dark preference.
-                    // Adwaita-dark vs Adwaita is the standard.
-                    let prefer_dark = settings.property::<bool>("gtk-application-prefer-dark-theme");
-                    let scheme_name = if prefer_dark { "Adwaita-dark" } else { "Adwaita" };
-                    let style_manager = sourceview5::StyleSchemeManager::default();
-                    if let Some(scheme) = style_manager.scheme(scheme_name) {
-                        buf.set_style_scheme(Some(&scheme));
-                    }
-                }
-            };
-
-            update_theme(&settings);
-            settings.connect_gtk_application_prefer_dark_theme_notify(update_theme);
-        };
-
         // 1. Nodes Tab Rename
         let store = gio::ListStore::new::<StringObject>();
         for item in ["Prime", "Encrypted", "Jules (Private)"].iter() {
@@ -510,57 +488,36 @@ impl CommsSpline {
             }
         });
 
-        // HeaderBar Setup (Universal 2x2 CSD Grid)
+        // Phase 2: Paned Header Fusion
         let main_switcher = StackSwitcher::builder()
             .stack(&workspace_stack)
             .halign(Align::Center)
             .build();
 
-        // 1. Master Titlebar
-        let master_titlebar = Box::new(Orientation::Vertical, 0);
+        // Left Workspace (Sidebar) Headers
+        let blank_header_bar = HeaderBar::new();
+        blank_header_bar.set_show_title_buttons(false);
 
-        // 2. Row 1 (The Headers)
-        let top_hbox = Box::new(Orientation::Horizontal, 0);
-
-        let left_header = HeaderBar::new();
-        left_header.set_show_title_buttons(false);
-        left_header.set_width_request(260);
-
-        let right_header = HeaderBar::new();
-        right_header.set_show_title_buttons(true);
-        right_header.set_hexpand(true);
-        right_header.pack_start(&status_group);
-
-        top_hbox.append(&left_header);
-        top_hbox.append(&right_header);
-
-        // 3. Row 2 (The Tabs)
-        let bottom_hbox = Box::new(Orientation::Horizontal, 0);
-
-        let left_tabs_container = Box::new(Orientation::Horizontal, 0);
-        left_tabs_container.set_width_request(260);
-
+        let left_tabs_box = Box::new(Orientation::Horizontal, 0);
+        left_tabs_box.add_css_class("toolbar");
         sidebar_switcher.set_halign(Align::Center);
-        sidebar_switcher.set_hexpand(true); // Center inside container
-        left_tabs_container.append(&sidebar_switcher);
+        left_tabs_box.append(&sidebar_switcher);
 
-        let right_tabs_container = Box::new(Orientation::Horizontal, 0);
-        right_tabs_container.set_hexpand(true);
+        left_vbox.prepend(&left_tabs_box);
+        left_vbox.prepend(&blank_header_bar);
 
+        // Right Workspace (Command Center) Headers
+        let command_header_bar = HeaderBar::new();
+        command_header_bar.set_show_title_buttons(true);
+        command_header_bar.pack_start(&status_group);
+
+        let right_tabs_box = Box::new(Orientation::Horizontal, 0);
+        right_tabs_box.add_css_class("toolbar");
         main_switcher.set_halign(Align::Center);
-        main_switcher.set_hexpand(true); // Center inside container
-        right_tabs_container.append(&main_switcher);
+        right_tabs_box.append(&main_switcher);
 
-        bottom_hbox.append(&left_tabs_container);
-        bottom_hbox.append(&right_tabs_container);
-
-        // Execution
-        master_titlebar.append(&top_hbox);
-        master_titlebar.append(&bottom_hbox);
-
-        if let Some(app_win) = window.dynamic_cast_ref::<gtk4::ApplicationWindow>() {
-            app_win.set_titlebar(Some(&master_titlebar));
-        }
+        right_vbox.prepend(&right_tabs_box);
+        right_vbox.prepend(&command_header_bar);
 
         // Console ListView
         let console_store = gio::ListStore::new::<DispatchObject>();
@@ -783,8 +740,6 @@ impl CommsSpline {
         body_view.set_monospace(false);
         body_view.set_wrap_mode(gtk4::WrapMode::WordChar);
         enable_spelling(&body_view);
-        // Phase 3: Dark Scheme
-        setup_dynamic_theme(&body_buffer);
 
         body_view.set_height_request(150);
         let body_scroll = ScrolledWindow::builder()
@@ -850,11 +805,6 @@ impl CommsSpline {
         // Phase 2: Add view class
         text_view.add_css_class("view");
         input_scroll.set_child(Some(&text_view));
-
-        // Phase 3: Dark Scheme
-        if let Ok(buffer) = text_view.buffer().downcast::<sourceview5::Buffer>() {
-            setup_dynamic_theme(&buffer);
-        }
 
         let draft_path = gneiss_pal::paths::UnaPaths::root().join(".lumen_draft.txt");
         if let Ok(draft) = std::fs::read_to_string(&draft_path) { text_view.buffer().set_text(&draft); }
@@ -951,9 +901,8 @@ impl CommsSpline {
         // Phase 2: Add view class
         payload_view.add_css_class("view");
 
-        // Phase 3: Dark Scheme & Editable
+        // Phase 3: Editable
         payload_view.set_editable(true);
-        setup_dynamic_theme(&payload_buffer);
 
         let payload_scroll = ScrolledWindow::builder()
             .child(&payload_view)
@@ -1017,6 +966,31 @@ impl CommsSpline {
         sidebar_toggle.connect_toggled(move |btn| {
             left_vbox_clone.set_visible(btn.is_active());
         });
+
+        // Phase 3: Real-Time Dynamic Theme Listening
+        if let Some(settings) = gtk4::Settings::default() {
+            let buf_chat = text_view.buffer().downcast::<sourceview5::Buffer>().unwrap();
+            let buf_comp = body_buffer.clone();
+            let buf_pay = payload_buffer.clone();
+
+            let update_theme = move |is_dark: bool| {
+                let manager = sourceview5::StyleSchemeManager::default();
+                let scheme_name = if is_dark { "Adwaita-dark" } else { "Adwaita" };
+                if let Some(scheme) = manager.scheme(scheme_name) {
+                    buf_chat.set_style_scheme(Some(&scheme));
+                    buf_comp.set_style_scheme(Some(&scheme));
+                    buf_pay.set_style_scheme(Some(&scheme));
+                }
+            };
+
+            // Apply immediately on boot
+            update_theme(settings.is_gtk_application_prefer_dark_theme());
+
+            // Listen for OS-level theme swaps in real-time
+            settings.connect_gtk_application_prefer_dark_theme_notify(move |s| {
+                update_theme(s.is_gtk_application_prefer_dark_theme());
+            });
+        }
 
         // Async loop
         let label_una_clone = label_una.clone();
