@@ -1,9 +1,9 @@
 #![cfg(target_os = "macos")]
 
-use objc2::{declare_class, msg_send, msg_send_id, ClassType, DeclaredClass};
+use objc2::{declare_class, msg_send, msg_send_id, ClassType, DeclaredClass, MainThreadMarker};
 use objc2::mutability::MainThreadOnly;
 use objc2_app_kit::{NSApplication, NSApplicationActivationPolicy, NSApplicationDelegate, NSWindow, NSWindowStyleMask};
-use objc2_foundation::{MainThreadMarker, NSObject, NSObjectProtocol, NSRect, NSPoint, NSSize};
+use objc2_foundation::{NSObject, NSObjectProtocol, NSRect, NSPoint, NSSize};
 use objc2::rc::Retained;
 use std::cell::RefCell;
 
@@ -50,12 +50,17 @@ declare_class!(
                 | NSWindowStyleMask::Miniaturizable
                 | NSWindowStyleMask::Resizable;
 
+            // -------------------------------------------------------------------
+            // UNAOS THREAD SAFETY MANDATE (APPKIT)
+            // AppKit strictly requires UI elements to be allocated on the Main Thread.
+            // objc2 0.5 encodes this rule into the type system (MainThreadOnly).
+            // We use the MainThreadMarker to allocate the window safely.
+            // -------------------------------------------------------------------
             let window = unsafe {
-                // Use the generated alloc method from ClassType via NSWindow
-                NSWindow::alloc().initWithContentRect_styleMask_backing_defer(
+                mtm.alloc::<NSWindow>().initWithContentRect_styleMask_backing_defer(
                     content_rect,
                     style,
-                    2 as _, // NSBackingStoreBuffered
+                    objc2_app_kit::NSBackingStoreBuffered, // Using the typed enum if available
                     false
                 )
             };
