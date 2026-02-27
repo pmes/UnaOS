@@ -11,7 +11,7 @@ use std::rc::Rc;
 use crate::ui::view::CommsSpline;
 use vein::VeinHandler;
 use gneiss_pal::GuiUpdate;
-use gneiss_pal::AppHandler; // Fix E0599
+use gneiss_pal::AppHandler;
 
 // Platform-specific imports
 #[cfg(target_os = "linux")]

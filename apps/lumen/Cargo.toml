@@ -34,7 +34,11 @@ rustls = { version = "0.23", features = ["ring"] }
 chrono = "0.4"
 tokio = { version = "1.49", features = ["sync", "rt", "macros"] }
 serde = { version = "1.0.228", features = ["derive"] }
-gtk4 = "0.10.3"
+
+# Explicitly enable GTK 4.12 features to ensure FileDialog and load_from_string are available.
+# This forces the Rust bindings to expose these types even if the host GTK version is older
+# (though it may fail at runtime if the symbols are missing).
+gtk4 = { version = "0.10.3", features = ["v4_12"] }
 glib = "0.21"
 sourceview5 = "0.10.0"
 libspelling = "0.4.1"
@@ -46,7 +50,7 @@ objc2-foundation = "0.3.2"
 # LINUX / GTK4 TARGETS
 # ------------------------------------------------------------------------------
 [target.'cfg(target_os = "linux")'.dependencies]
-gtk4 = "0.10.3"
+gtk4 = { version = "0.10.3", features = ["v4_12"] }
 glib = "0.21"
 libadwaita = { version = "0.8.1", features = ["v1_4"], optional = true }
 sourceview5 = "0.10.0"
