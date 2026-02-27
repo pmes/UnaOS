@@ -30,6 +30,9 @@ fn enable_spelling(view: &SourceView) {
         let provider = libspelling::Provider::default();
         let checker = libspelling::Checker::new(Some(&provider), Some("en_US"));
         let adapter = libspelling::TextBufferAdapter::new(&buffer, &checker);
+
+        // CRITICAL FIX: Explicitly set the language to activate the menu
+        adapter.set_language("en_US");
         adapter.set_enabled(true);
 
         // BIND NATIVE RIGHT-CLICK SUGGESTIONS
@@ -134,11 +137,12 @@ impl CommsSpline {
         token_label.set_justify(gtk4::Justification::Center);
 
         let pulse_icon = Image::from_icon_name("spinner-symbolic");
-        pulse_icon.set_pixel_size(16);
-        pulse_icon.set_opacity(0.5);
+        pulse_icon.set_pixel_size(24);
+        // pulse_icon.set_opacity(0.5); // Removed for Phase 4
 
         let status_group = Box::new(Orientation::Horizontal, 8);
         status_group.append(&sidebar_toggle);
+        status_group.append(&token_label); // Kept here as per request
         status_group.append(&pulse_icon);
 
         // --- Root Layout ---
@@ -423,7 +427,13 @@ impl CommsSpline {
         telehud_box.set_margin_end(12);
 
         telehud_box.append(&Label::builder().label("TOKEN TELEMETRY").css_classes(vec!["nexus-header"]).xalign(0.0).build());
-        telehud_box.append(&token_label);
+        // Note: token_label is now packed in the header bar as well, but kept here for completeness if needed.
+        // If it can only have one parent, GTK will warn. Since status_group claims it, we should probably clone or use a separate label.
+        // For safety, let's create a *second* label for TeleHUD to avoid "widget already has a parent" panic.
+        let telehud_token_label = Label::new(Some("Waiting for telemetry..."));
+        telehud_token_label.set_wrap(true);
+        telehud_token_label.set_justify(gtk4::Justification::Center);
+        telehud_box.append(&telehud_token_label);
 
         telehud_box.append(&Label::builder().label("CONTEXT VECTOR").css_classes(vec!["nexus-header"]).xalign(0.0).margin_top(20).build());
 
@@ -509,6 +519,10 @@ impl CommsSpline {
             let blank_header_bar = adw::HeaderBar::new();
             blank_header_bar.set_show_start_title_buttons(false);
             blank_header_bar.set_show_end_title_buttons(false);
+            // Title widget handles the Switcher, pack_start handles icons if needed.
+            // But adw::HeaderBar doesn't natively support arbitrary child packing like Box without custom title widget handling.
+            // Actually adw::HeaderBar has set_title_widget.
+            // We want the Switcher in the center.
             blank_header_bar.set_title_widget(Some(&sidebar_switcher));
             left_vbox.prepend(&blank_header_bar);
 
@@ -577,6 +591,8 @@ impl CommsSpline {
             chat_content_view.set_width_request(800);
             chat_content_view.set_hexpand(true);
             chat_content_view.set_focusable(true);
+            // Phase 2: Add view class
+            chat_content_view.add_css_class("view");
             bubble.append(&chat_content_view);
             let expander = Expander::new(None);
             let expander_label = Label::new(None);
@@ -587,6 +603,7 @@ impl CommsSpline {
             payload_content_view.set_wrap_mode(gtk4::WrapMode::WordChar);
             payload_content_view.set_show_line_numbers(true);
             payload_content_view.set_monospace(true);
+            payload_content_view.add_css_class("view");
             let payload_scroll = ScrolledWindow::builder().child(&payload_content_view).height_request(200).build();
             expander.set_child(Some(&payload_scroll));
             bubble.append(&expander);
@@ -824,6 +841,8 @@ impl CommsSpline {
         enable_spelling(&text_view);
         // Removed manual CSS class for Phase 1
         // text_view.add_css_class("transparent-text");
+        // Phase 2: Add view class
+        text_view.add_css_class("view");
         input_scroll.set_child(Some(&text_view));
 
         let draft_path = gneiss_pal::paths::UnaPaths::root().join(".lumen_draft.txt");
@@ -918,6 +937,8 @@ impl CommsSpline {
         payload_view.set_monospace(true);
         payload_view.set_wrap_mode(gtk4::WrapMode::WordChar);
         enable_spelling(&payload_view);
+        // Phase 2: Add view class
+        payload_view.add_css_class("view");
 
         let payload_scroll = ScrolledWindow::builder()
             .child(&payload_view)
@@ -990,6 +1011,7 @@ impl CommsSpline {
         let token_label_clone = token_label.clone();
         let pulse_icon_clone = pulse_icon.clone();
         let active_directive_async = active_directive_clone.clone();
+        let telehud_token_label_clone = telehud_token_label.clone();
 
         let console_store_async = console_store.clone();
 
@@ -1073,7 +1095,9 @@ impl CommsSpline {
                         }
                     },
                     GuiUpdate::TokenUsage(p, c, t) => {
-                        token_label_clone.set_text(&format!("Tokens: IN: {} | OUT: {} | TOTAL: {}", p, c, t));
+                        let text = format!("Tokens: IN: {} | OUT: {} | TOTAL: {}", p, c, t);
+                        token_label_clone.set_text(&text);
+                        telehud_token_label_clone.set_text(&text); // Update TeleHUD as well
                     }
                     GuiUpdate::ActiveDirective(d) => {
                         *active_directive_async.borrow_mut() = d;

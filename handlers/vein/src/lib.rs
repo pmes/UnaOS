@@ -252,6 +252,22 @@ impl VeinHandler {
                                      let _ = gui_tx_brain.send(GuiUpdate::ConsoleLog("\n[SYSTEM] :: INTERCEPTOR TRANSMITTING...\n".into())).await;
                                      let _ = gui_tx_brain.send(GuiUpdate::SidebarStatus(WolfpackState::Dreaming)).await;
 
+                                     // === GHOST ECHO FIX: RENDER USER INPUT NOW ===
+                                     if let Some(last_msg) = context.last() {
+                                         if last_msg.role == "user" {
+                                             if let Some(Part::Text { text }) = last_msg.parts.last() {
+                                                 // We strip the system prompt if present to show just the user's message
+                                                 let display_text = if text.contains("SYSTEM_INSTRUCTION") {
+                                                     text.split("SYSTEM_INSTRUCTION").last().unwrap_or(text).trim()
+                                                 } else {
+                                                     text.as_str()
+                                                 };
+                                                 let timestamp = Local::now().format("%H:%M:%S").to_string();
+                                                 let _ = gui_tx_brain.send(GuiUpdate::ConsoleLog(format!("\n[ARCHITECT] [{}] > {}\n", timestamp, display_text))).await;
+                                             }
+                                         }
+                                     }
+
                                      // === THE EXACT SAME GENERATION LOGIC AS BELOW ===
                                      match client.generate_content(&context).await {
                                         Ok((response, metadata)) => {
@@ -605,7 +621,9 @@ impl AppHandler for VeinHandler {
             Event::Input { target: _, text } => {
                 let timestamp = Local::now().format("%H:%M:%S").to_string();
                 let current_text = format!("\n[ARCHITECT] [{}] > {}\n", timestamp, text);
-                self.append_to_console(&current_text);
+
+                // === GHOST ECHO FIX: REMOVE IMMEDIATE ECHO ===
+                // self.append_to_console(&current_text);
 
                 if text.trim() == "/wolf" {
                     s.mode = ViewMode::Wolfpack;
