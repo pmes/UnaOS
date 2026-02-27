@@ -110,7 +110,11 @@ impl Backend {
         let app = NSApplication::sharedApplication(mtm);
 
         unsafe {
-            let _: () = msg_send![&app, setActivationPolicy: NSApplicationActivationPolicy::Regular];
+            // S41 Fix: setActivationPolicy returns BOOL. We must capture it to satisfy runtime check.
+            let success: bool = msg_send![&app, setActivationPolicy: NSApplicationActivationPolicy::Regular];
+            if !success {
+                println!("[UnaOS::Quartzite] WARNING: Failed to set activation policy.");
+            }
         }
 
         let delegate = UnaAppDelegate::new(mtm);
