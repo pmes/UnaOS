@@ -1,6 +1,6 @@
 // apps/lumen/src/ui/view.rs
 use quartzite::Event;
-use crate::ui::model::DispatchObject; // Corrected path
+use crate::ui::model::DispatchObject;
 use async_channel::Receiver;
 use gtk4::prelude::*;
 use gtk4::{
@@ -12,7 +12,7 @@ use gtk4::{
     ToggleButton, Widget, Window,
     gdk::{Key, ModifierType},
     gio,
-    glib, // Use explicitly imported glib
+    glib,
 };
 use libspelling;
 use sourceview5::View as SourceView;
@@ -124,7 +124,7 @@ impl CommsSpline {
             .tooltip_text("Toggle Sidebar")
             .build();
 
-        let token_label = Label::new(Some("Tokens: 0"));
+        let token_label = Label::new(Some("Tokens: IN: 0 | OUT: 0 | TOTAL: 0"));
         //        token_label.add_css_class("dim-label");
         token_label.set_margin_end(10);
 
@@ -1049,43 +1049,50 @@ impl CommsSpline {
         let active_directive_async = active_directive_clone.clone();
 
         let _buffer_async = buffer.clone();
+        let console_store_async = console_store.clone();
+
+        let tx_interceptor = tx_event.clone();
+        let window_interceptor = window.clone();
 
         glib::MainContext::default().spawn_local(async move {
             while let Ok(update) = rx.recv().await {
                 match update {
 
                     GuiUpdate::ConsoleLog(text) => {
-    let mut sender = "System".to_string();
-    let mut is_chat = true;
-    let content = text.clone();
-    let mut subject = "Log".to_string();
+                        let mut sender = "System".to_string();
+                        let mut is_chat = true;
+                        let content = text.clone();
+                        let mut subject = "Log".to_string();
 
-    if text.trim().starts_with("[ARCHITECT]") {
-        sender = "Architect".to_string();
-        is_chat = true;
-    } else if text.trim().starts_with("[UNA]") {
-        sender = "Una-Prime".to_string();
-        is_chat = true;
-    } else if text.trim().starts_with("[S") {
-        let after_s = &text.trim()[2..];
-        if let Some(first_char) = after_s.chars().next() {
-            if first_char.is_numeric() {
-                sender = "Shard".to_string();
-                is_chat = false;
-                subject = "Wolfpack Output".to_string();
-            }
-        }
-    }
+                        if text.trim().starts_with("[ARCHITECT]") {
+                            sender = "Architect".to_string();
+                            is_chat = true;
+                        } else if text.trim().starts_with("[UNA]") {
+                            sender = "Una-Prime".to_string();
+                            is_chat = true;
+                        } else if text.trim().starts_with("[S") {
+                            let after_s = &text.trim()[2..];
+                            if let Some(first_char) = after_s.chars().next() {
+                                if first_char.is_numeric() {
+                                    sender = "Shard".to_string();
+                                    is_chat = false;
+                                    subject = "Wolfpack Output".to_string();
+                                }
+                            }
+                        }
 
-    let timestamp = chrono::Local::now().format("%H:%M:%S").to_string();
+                        let timestamp = chrono::Local::now().format("%H:%M:%S").to_string();
 
-    let id = format!("{}", chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0));
+                        let id = format!("{}", chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0));
 
-    let obj = DispatchObject::new(
-        &id, &sender, &subject, &timestamp, &content, is_chat,
-    );
+                        let obj = DispatchObject::new(
+                            &id, &sender, &subject, &timestamp, &content, is_chat,
+                        );
 
-    console_store.append(&obj);
+                        console_store_async.append(&obj);
+                    }
+                    GuiUpdate::ClearConsole => {
+                        console_store_async.remove_all();
                     }
                     GuiUpdate::ShardStatusChanged { id, status } => {
                         let (spinner, label, name) = if id == "una-prime" {
@@ -1126,11 +1133,77 @@ impl CommsSpline {
                             pulse_icon_clone.remove_css_class("spin-active");
                         }
                     },
-                    GuiUpdate::TokenUsage(tokens) => {
-                        token_label_clone.set_text(&format!("Tokens: {}", tokens));
+                    GuiUpdate::TokenUsage(p, c, t) => {
+                        token_label_clone.set_text(&format!("Tokens: IN: {} | OUT: {} | TOTAL: {}", p, c, t));
                     }
                     GuiUpdate::ActiveDirective(d) => {
                         *active_directive_async.borrow_mut() = d;
+                    }
+                    GuiUpdate::ReviewPayload(json_payload) => {
+                         // === TARGET 4: THE INTERCEPTOR UI ===
+                         let interceptor_win = Window::builder()
+                            .title("Interceptor: Pre-Flight Payload Review")
+                            .modal(true)
+                            .transient_for(&window_interceptor.clone().upcast::<Window>())
+                            .default_width(800)
+                            .default_height(600)
+                            .build();
+
+                        let vbox = Box::new(Orientation::Vertical, 0);
+                        let buffer = sourceview5::Buffer::new(None);
+                        buffer.set_text(&json_payload);
+
+                        let view = SourceView::with_buffer(&buffer);
+                        view.set_show_line_numbers(true);
+                        view.set_monospace(true);
+                        view.set_wrap_mode(gtk4::WrapMode::None); // JSON is usually better without wrap
+
+                         let scroll = ScrolledWindow::builder()
+                            .child(&view)
+                            .vexpand(true)
+                            .build();
+                        vbox.append(&scroll);
+
+                        let action_bar = Box::new(Orientation::Horizontal, 10);
+                        action_bar.set_margin_top(10);
+                        action_bar.set_margin_bottom(10);
+                        action_bar.set_margin_end(10);
+                        action_bar.set_halign(Align::End);
+
+                        let btn_cancel = Button::with_label("Abort");
+                        let win_weak = interceptor_win.downgrade();
+                        btn_cancel.connect_clicked(move |_| {
+                            if let Some(win) = win_weak.upgrade() {
+                                win.close();
+                            }
+                        });
+
+                        let btn_transmit = Button::with_label("TRANSMIT PAYLOAD");
+                        btn_transmit.add_css_class("suggested-action");
+
+                        let win_weak2 = interceptor_win.downgrade();
+                        let tx = tx_interceptor.clone();
+                        let buf = buffer.clone();
+
+                        btn_transmit.connect_clicked(move |_| {
+                            if let Some(win) = win_weak2.upgrade() {
+                                let (start, end) = buf.bounds();
+                                let final_payload = buf.text(&start, &end, false).to_string();
+
+                                let tx_clone = tx.clone();
+                                glib::MainContext::default().spawn_local(async move {
+                                    let _ = tx_clone.send(Event::DispatchPayload(final_payload)).await;
+                                });
+                                win.close();
+                            }
+                        });
+
+                        action_bar.append(&btn_cancel);
+                        action_bar.append(&btn_transmit);
+                        vbox.append(&action_bar);
+
+                        interceptor_win.set_child(Some(&vbox));
+                        interceptor_win.present();
                     }
                     _ => {}
                 }
