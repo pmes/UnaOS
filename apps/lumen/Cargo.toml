@@ -34,6 +34,13 @@ rustls = { version = "0.23", features = ["ring"] }
 chrono = "0.4"
 tokio = { version = "1.49", features = ["sync", "rt", "macros"] }
 serde = { version = "1.0.228", features = ["derive"] }
+gtk4 = "0.10.3"
+glib = "0.21"
+sourceview5 = "0.10.0"
+libspelling = "0.4.1"
+objc2 = "0.6.4"
+objc2-app-kit = "0.3.2"
+objc2-foundation = "0.3.2"
 
 # ------------------------------------------------------------------------------
 # LINUX / GTK4 TARGETS
