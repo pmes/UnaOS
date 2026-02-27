@@ -95,6 +95,8 @@ impl UnaAppDelegate {
 // -----------------------------------------------------------------------------
 pub struct Backend {
     _app: Retained<NSApplication>,
+    // S41 Fix: We must retain the delegate because NSApplication.delegate is weak.
+    _delegate: Retained<UnaAppDelegate>,
 }
 
 impl Backend {
@@ -110,7 +112,7 @@ impl Backend {
         let app = NSApplication::sharedApplication(mtm);
 
         unsafe {
-            // S41 Fix: setActivationPolicy returns BOOL. We must capture it to satisfy runtime check.
+            // S41 Fix: Capture BOOL return to satisfy runtime check.
             let success: bool = msg_send![&app, setActivationPolicy: NSApplicationActivationPolicy::Regular];
             if !success {
                 println!("[UnaOS::Quartzite] WARNING: Failed to set activation policy.");
@@ -123,7 +125,11 @@ impl Backend {
             let _: () = msg_send![&app, setDelegate: &*delegate];
         }
 
-        Backend { _app: app }
+        // Store delegate in Backend to keep it alive
+        Backend {
+            _app: app,
+            _delegate: delegate
+        }
     }
 
     pub fn run(&self) {
