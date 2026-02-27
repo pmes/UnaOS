@@ -7,6 +7,7 @@ use crate::ui::telemetry::ContextView;
 #[cfg(target_os = "macos")]
 use crate::ui::macos_view::MacOSSpline;
 
+#[allow(unused_imports)]
 use bandy::{SMessage, Synapse, telemetry};
 use gneiss_pal::paths::UnaPaths;
 use quartzite::{self, Backend, NativeWindow, NativeView};
@@ -14,6 +15,7 @@ use std::rc::Rc;
 #[cfg(target_os = "linux")]
 use crate::ui::view::CommsSpline;
 use vein::VeinHandler;
+#[allow(unused_imports)]
 use gneiss_pal::GuiUpdate;
 use gneiss_pal::AppHandler;
 
@@ -52,7 +54,7 @@ fn main() {
     telemetry::ignite(UnaPaths::root().join("logs"));
     log::info!("Lumen Boot Sequence Initiated.");
 
-    let (telemetry_tx, telemetry_rx) = async_channel::unbounded::<SMessage>();
+    let (telemetry_tx, _telemetry_rx) = async_channel::unbounded::<SMessage>();
 
     // 3. Ignite the Spine
     let synapse = Synapse::new();
@@ -109,7 +111,7 @@ fn main() {
             let hud = ContextView::new();
             let hud_widget = hud.container.clone();
 
-            let telemetry_rx_clone = telemetry_rx.clone();
+            let telemetry_rx_clone = _telemetry_rx.clone();
             MainContext::default().spawn_local(async move {
                 while let Ok(msg) = telemetry_rx_clone.recv().await {
                     if let SMessage::ContextTelemetry { skeletons } = msg {
