@@ -861,7 +861,9 @@ impl CommsSpline {
         // Phase 3: Dark Scheme
         let style_manager_input = sourceview5::StyleSchemeManager::default();
         if let Some(scheme) = style_manager_input.scheme("Adwaita-dark") {
-            text_view.buffer().set_style_scheme(Some(&scheme));
+            if let Ok(buffer) = text_view.buffer().downcast::<sourceview5::Buffer>() {
+                buffer.set_style_scheme(Some(&scheme));
+            }
         }
 
         let draft_path = gneiss_pal::paths::UnaPaths::root().join(".lumen_draft.txt");
