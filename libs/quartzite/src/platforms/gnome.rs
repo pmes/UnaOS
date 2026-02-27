@@ -22,9 +22,6 @@ impl<A: AppHandler> Backend<A> {
     pub fn new<F>(app_id: &str, app_handler: A, rx: Receiver<GuiUpdate>, bootstrap_fn: F) -> Self
     where F: Fn(&ApplicationWindow, async_channel::Sender<Event>, Receiver<GuiUpdate>) -> gtk4::Widget + 'static
     {
-        // Ensure resources are registered
-        crate::register_resources();
-
         let app = Application::builder()
             .application_id(app_id)
             .build();

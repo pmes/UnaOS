@@ -6,6 +6,7 @@ use libadwaita as adw;
 #[cfg(feature = "gnome")]
 use libadwaita::prelude::*;
 
+#[allow(unused_imports)]
 use gtk4::{Application, ApplicationWindow};
 use log::info;
 use std::cell::RefCell;
@@ -74,7 +75,7 @@ impl Backend {
 
             // Execute bootstrap if available
             if let Some(bootstrap) = bootstrap_option.borrow_mut().take() {
-                 let content: NativeView = (bootstrap)(&window);
+                 let content: NativeView = (bootstrap)(window.upcast_ref());
 
                 #[cfg(feature = "gnome")]
                 window.set_content(Some(&content));
