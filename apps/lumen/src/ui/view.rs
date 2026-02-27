@@ -314,6 +314,9 @@ impl CommsSpline {
         node_actions_box.append(&new_node_btn);
 
         // THE COMPOSER
+        let active_directive = Rc::new(RefCell::new("Directive 055".to_string()));
+        let active_directive_clone = active_directive.clone();
+
         let composer_icon = Image::from_icon_name("chat-message-new-symbolic");
         let composer_btn = Button::builder()
             .css_classes(vec!["flat"])
