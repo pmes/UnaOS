@@ -22,3 +22,14 @@ members = [
     "apps/lumen",
     "apps/una"
 ]
+
+# 🦅 MACH'S BRIDGE:
+# By default, a bare `cargo build` will ONLY build our host-native tools and their dependencies.
+# It will automatically target Mac (aarch64-apple-darwin).
+default-members = [
+    "apps/lumen",
+    "apps/una",
+    "apps/cli/vertex",
+    "apps/cli/unafs",
+    "apps/cli/sentinel"
+]

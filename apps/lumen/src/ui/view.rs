@@ -70,6 +70,7 @@ impl CommsSpline {
 
         // THE PULSE (Stripped of Tab Hacks)
         let provider = CssProvider::new();
+        // S41: Reverting to load_from_string (v4_12) as we forced the feature
         provider.load_from_string("
             .console { font-family: 'Monospace'; background: transparent; }
             .console-row { margin-bottom: 16px; padding: 0px; }
@@ -766,6 +767,8 @@ impl CommsSpline {
         let tx_clone_file = tx_event.clone();
         let window_clone = window.clone();
         let target_file = active_target.clone();
+
+        // S41 Fix: FileDialog usage restored (feature v4_12 enabled)
         attach_btn.connect_clicked(move |_| {
             let tx = tx_clone_file.clone();
             let parent_window = window_clone.clone();

@@ -10,8 +10,8 @@ edition = "2024"
 # ==================================================================================
 
 [features]
-default = ["gtk"]
-gtk = ["dep:gtk4", "sourceview5"]
+default = []
+gtk = ["dep:gtk4", "sourceview5", "dep:libspelling"]
 gnome = ["gtk", "dep:libadwaita"]
 
 [dependencies]
@@ -43,8 +43,7 @@ rand = "0.9"
 gtk4 = { version = "0.10.3", optional = true }
 libadwaita = { version = "0.8.1", features = ["v1_4"], optional = true }
 sourceview5 = { version = "0.10", optional = true }
-libspelling = "0.4.1"
-# REMOVED: glib dependency - Vein must remain pure.
+libspelling = { version = "0.4.1", optional = true }
 
 [dev-dependencies]
 # None (Vein is too complex for unit tests; requires integration tests)

@@ -1,7 +1,12 @@
+use std::path::Path;
+
 fn main() {
-    glib_build_tools::compile_resources(
-        &["assets"],                      // Source directory
-        "assets/resources.gresource.xml", // Input XML
-        "quartzite.gresource",            // Output binary name
-    );
+    #[cfg(all(not(target_os = "macos"), feature = "gtk"))]
+    {
+        glib_build_tools::compile_resources(
+            &["assets"],
+            "assets/resources.gresource.xml",
+            "quartzite.gresource",
+        );
+    }
 }

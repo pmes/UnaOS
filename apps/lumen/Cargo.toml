@@ -9,33 +9,44 @@ version = "0.1.0"
 edition = "2024"
 
 [features]
-default = ["gtk"]
-# Una: Removed vein/glib feature requirement as we refactored vein to be pure
-gtk = ["vein/gtk"]
-gnome = ["vein/gnome", "dep:libadwaita"]
+default = []
+gtk = ["vein/gtk", "quartzite/gtk"]
+gnome = ["vein/gnome", "quartzite/gnome", "dep:libadwaita"]
 
 [dependencies]
 # The Trinity Core
 elessar = { path = "../../libs/elessar" }
-vein = { path = "../../handlers/vein" }
-quartzite = { path = "../../libs/quartzite" }
+vein = { path = "../../handlers/vein", default-features = false }
+quartzite = { path = "../../libs/quartzite", default-features = false }
 bandy = { path = "../../libs/bandy" }
 gneiss_pal = { path = "../../libs/gneiss_pal" }
 unafs = { path = "../../libs/unafs" }
 junct = { path = "../../handlers/junct" }
 
-# Host UI & System
-gtk4 = "0.10.3"
-glib = "0.21"
-libadwaita = { version = "0.8.1", features = ["v1_4"], optional = true }
-
-# Async & Utilities
+# Host UI & System (Platform Agnostic Imports)
 async-channel = "2.5"
 log = "0.4"
 dotenvy = "0.15"
 rustls = { version = "0.23", features = ["ring"] }
 chrono = "0.4"
 tokio = { version = "1.49", features = ["sync", "rt", "macros"] }
+serde = { version = "1.0.228", features = ["derive"] }
+
+# ------------------------------------------------------------------------------
+# LINUX / GTK4 TARGETS
+# ------------------------------------------------------------------------------
+[target.'cfg(target_os = "linux")'.dependencies]
+gtk4 = { version = "0.10.3", features = ["v4_12"] }
+glib = "0.21"
+libadwaita = { version = "0.8.1", features = ["v1_4"], optional = true }
 sourceview5 = "0.10.0"
 libspelling = "0.4.1"
-serde = { version = "1.0.228", features = ["derive"] }
+
+# ------------------------------------------------------------------------------
+# macOS / APP KIT TARGETS
+# ------------------------------------------------------------------------------
+[target.'cfg(target_os = "macos")'.dependencies]
+# Quartzite handles FFI, but Lumen needs specific crates for logic/widgets
+objc2 = "0.6.4"
+objc2-app-kit = "0.3.2"
+objc2-foundation = "0.3.2"
