@@ -1,8 +1,8 @@
 #![cfg(target_os = "macos")]
 
-use objc2::{declare_class, msg_send, msg_send_id, ClassType};
+use objc2::{declare_class, msg_send, msg_send_id, ClassType, DeclaredClass};
 use objc2::mutability::MainThreadOnly;
-use objc2_app_kit::{NSApplication, NSApplicationActivationPolicy, NSApplicationDelegate, NSWindow, NSWindowStyleMask, NSBackingStoreBuffered};
+use objc2_app_kit::{NSApplication, NSApplicationActivationPolicy, NSApplicationDelegate, NSWindow, NSWindowStyleMask, NSView};
 use objc2_foundation::{MainThreadMarker, NSObject, NSRect, NSPoint, NSSize};
 use objc2::rc::Retained;
 use std::cell::RefCell;
@@ -23,7 +23,6 @@ declare_class!(
     struct UnaAppDelegate;
 
     unsafe impl ClassType for UnaAppDelegate {
-        // REMOVED: #[inherits(NSObject)] - Root object has no ancestors.
         type Super = NSObject;
         type Mutability = MainThreadOnly;
         const NAME: &'static str = "UnaAppDelegate";
@@ -51,11 +50,13 @@ declare_class!(
             let window = unsafe {
                 let alloc: Retained<NSWindow> = msg_send![NSWindow::class(), alloc];
 
+                // We pass `2 as _` directly for NSBackingStoreBuffered.
+                // This bypasses the deprecated enum constant while satisfying the FFI.
                 NSWindow::initWithContentRect_styleMask_backing_defer(
                     alloc,
                     content_rect,
                     style,
-                    NSBackingStoreBuffered,
+                    2 as _,
                     false
                 )
             };
