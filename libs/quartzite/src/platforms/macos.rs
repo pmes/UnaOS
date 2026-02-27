@@ -2,12 +2,10 @@
 
 use objc2::{declare_class, msg_send, msg_send_id, ClassType};
 use objc2::mutability::MainThreadOnly;
-use objc2::declare::DeclaredClass;
-use objc2_app_kit::{NSApplication, NSApplicationActivationPolicy, NSApplicationDelegate, NSWindow, NSWindowStyleMask, NSBackingStoreType, NSView};
-use objc2_foundation::{MainThreadMarker, NSObject, NSObjectProtocol, NSRect, NSPoint, NSSize};
+use objc2_app_kit::{NSApplication, NSApplicationActivationPolicy, NSApplicationDelegate, NSWindow, NSWindowStyleMask, NSBackingStoreBuffered};
+use objc2_foundation::{MainThreadMarker, NSObject, NSRect, NSPoint, NSSize};
 use objc2::rc::Retained;
 use std::cell::RefCell;
-use std::rc::Rc;
 
 use crate::{NativeWindow, NativeView};
 
@@ -25,6 +23,7 @@ declare_class!(
     struct UnaAppDelegate;
 
     unsafe impl ClassType for UnaAppDelegate {
+        // REMOVED: #[inherits(NSObject)] - Root object has no ancestors.
         type Super = NSObject;
         type Mutability = MainThreadOnly;
         const NAME: &'static str = "UnaAppDelegate";
@@ -56,7 +55,7 @@ declare_class!(
                     alloc,
                     content_rect,
                     style,
-                    NSBackingStoreType::NSBackingStoreBuffered,
+                    NSBackingStoreBuffered,
                     false
                 )
             };
