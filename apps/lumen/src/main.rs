@@ -4,6 +4,9 @@ mod ui;
 
 #[cfg(target_os = "linux")]
 use crate::ui::telemetry::ContextView;
+#[cfg(target_os = "macos")]
+use crate::ui::macos_view::MacOSSpline;
+
 use bandy::{SMessage, Synapse, telemetry};
 use gneiss_pal::paths::UnaPaths;
 use quartzite::{self, Backend, NativeWindow, NativeView};
@@ -83,9 +86,12 @@ fn main() {
     });
 
     // 7. View & Engine Ignition
-    // On Linux, we use CommsSpline. On macOS, we use a placeholder or partial logic.
+    // On Linux, we use CommsSpline. On macOS, we use MacOSSpline.
     #[cfg(target_os = "linux")]
     let spline = Rc::new(CommsSpline::new());
+
+    #[cfg(target_os = "macos")]
+    let spline = Rc::new(MacOSSpline::new());
 
     // THE FUSION
     let bootstrap = move |window: &NativeWindow| -> NativeView {
@@ -95,22 +101,7 @@ fn main() {
         let vein_widget = spline.bootstrap(window, event_tx.clone(), gui_rx.clone());
 
         #[cfg(target_os = "macos")]
-        let vein_widget = {
-            unsafe {
-                 use objc2::{msg_send, ClassType};
-                 use objc2_app_kit::NSView;
-                 use objc2_foundation::{MainThreadMarker, NSRect, NSPoint, NSSize};
-                 use objc2::rc::Retained;
-
-                 let mtm = MainThreadMarker::new().expect("Bootstrap on main thread");
-                 // Initialize frame (e.g., matching window size or generic)
-                 let frame = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(800.0, 600.0));
-
-                 // Explicit allocation and initialization to ensure +1 ownership convention
-                 let view: Retained<NSView> = msg_send![mtm.alloc::<NSView>(), initWithFrame: frame];
-                 view
-            }
-        };
+        let vein_widget = spline.bootstrap(window, event_tx.clone(), gui_rx.clone());
 
         // 2. Create the HUD (ContextView) - GTK Only for now
         #[cfg(target_os = "linux")]
