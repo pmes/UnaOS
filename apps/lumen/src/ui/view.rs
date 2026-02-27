@@ -49,7 +49,6 @@ fn enable_spelling(view: &SourceView) {
 use gneiss_pal::shard::ShardStatus;
 use gneiss_pal::{GuiUpdate, WolfpackState};
 
-#[cfg(not(feature = "gnome"))]
 use gtk4::HeaderBar;
 
 #[cfg(feature = "gnome")]
@@ -511,91 +510,56 @@ impl CommsSpline {
             }
         });
 
-        // HeaderBar Setup (Split Architecture - Phase 1)
+        // HeaderBar Setup (Universal 2x2 CSD Grid)
         let main_switcher = StackSwitcher::builder()
             .stack(&workspace_stack)
             .halign(Align::Center)
             .build();
 
-        #[cfg(feature = "gnome")]
-        {
-            // 1. Create the Master Titlebar Box
-            let master_titlebar_box = Box::new(Orientation::Vertical, 0);
+        // 1. Master Titlebar
+        let master_titlebar = Box::new(Orientation::Vertical, 0);
 
-            // 2. Top Row (Primary Headers)
-            let row_one = Box::new(Orientation::Horizontal, 0);
+        // 2. Row 1 (The Headers)
+        let top_hbox = Box::new(Orientation::Horizontal, 0);
 
-            // Left Header - Blank
-            let blank_header_bar = adw::HeaderBar::new();
-            blank_header_bar.set_show_start_title_buttons(false);
-            blank_header_bar.set_show_end_title_buttons(false);
-            blank_header_bar.set_title_widget(Some(&adw::WindowTitle::new("", "")));
+        let left_header = HeaderBar::new();
+        left_header.set_show_title_buttons(false);
+        left_header.set_width_request(260);
 
-            // Right Header - Status Group
-            let command_header_bar = adw::HeaderBar::new();
-            command_header_bar.set_show_start_title_buttons(true);
-            command_header_bar.set_show_end_title_buttons(true);
-            command_header_bar.set_title_widget(Some(&adw::WindowTitle::new("Lumen", "")));
-            command_header_bar.pack_start(&status_group);
+        let right_header = HeaderBar::new();
+        right_header.set_show_title_buttons(true);
+        right_header.set_hexpand(true);
+        right_header.pack_start(&status_group);
 
-            // Spacer for Row 1
-            let spacer_one = Box::new(Orientation::Horizontal, 0);
-            spacer_one.set_hexpand(true);
+        top_hbox.append(&left_header);
+        top_hbox.append(&right_header);
 
-            row_one.append(&blank_header_bar);
-            row_one.append(&spacer_one);
-            row_one.append(&command_header_bar);
+        // 3. Row 2 (The Tabs)
+        let bottom_hbox = Box::new(Orientation::Horizontal, 0);
 
-            // 3. Bottom Row (Secondary Toolbars)
-            let row_two = Box::new(Orientation::Horizontal, 0);
-            row_two.set_margin_top(4);
-            row_two.set_margin_bottom(4);
+        let left_tabs_container = Box::new(Orientation::Horizontal, 0);
+        left_tabs_container.set_width_request(260);
 
-            // Sidebar Switcher (Left)
-            sidebar_switcher.set_halign(Align::Center);
+        sidebar_switcher.set_halign(Align::Center);
+        sidebar_switcher.set_hexpand(true); // Center inside container
+        left_tabs_container.append(&sidebar_switcher);
 
-            // Main Switcher (Right)
-            main_switcher.set_halign(Align::Center);
+        let right_tabs_container = Box::new(Orientation::Horizontal, 0);
+        right_tabs_container.set_hexpand(true);
 
-            // Spacer for Row 2
-            let spacer_two = Box::new(Orientation::Horizontal, 0);
-            spacer_two.set_hexpand(true);
+        main_switcher.set_halign(Align::Center);
+        main_switcher.set_hexpand(true); // Center inside container
+        right_tabs_container.append(&main_switcher);
 
-            row_two.append(&sidebar_switcher);
-            row_two.append(&spacer_two);
-            row_two.append(&main_switcher);
+        bottom_hbox.append(&left_tabs_container);
+        bottom_hbox.append(&right_tabs_container);
 
-            master_titlebar_box.append(&row_one);
-            master_titlebar_box.append(&row_two);
+        // Execution
+        master_titlebar.append(&top_hbox);
+        master_titlebar.append(&bottom_hbox);
 
-            // 4. Stack & Apply
-            if let Some(app_win) = window.dynamic_cast_ref::<gtk4::ApplicationWindow>() {
-                app_win.set_titlebar(Some(&master_titlebar_box));
-            }
-        }
-
-        #[cfg(not(feature = "gnome"))]
-        {
-            let unified_header_bar = HeaderBar::new();
-            unified_header_bar.set_show_title_buttons(true);
-            unified_header_bar.set_title_widget(Some(&main_switcher));
-
-            let header_spacer = Box::new(Orientation::Horizontal, 0);
-            main_h_paned
-                .bind_property("position", &header_spacer, "width-request")
-                .sync_create()
-                .build();
-            sidebar_toggle
-                .bind_property("active", &header_spacer, "visible")
-                .sync_create()
-                .build();
-
-            unified_header_bar.pack_start(&header_spacer);
-            unified_header_bar.pack_start(&status_group);
-
-            if let Some(app_win) = window.dynamic_cast_ref::<gtk4::ApplicationWindow>() {
-                app_win.set_titlebar(Some(&unified_header_bar));
-            }
+        if let Some(app_win) = window.dynamic_cast_ref::<gtk4::ApplicationWindow>() {
+            app_win.set_titlebar(Some(&master_titlebar));
         }
 
         // Console ListView
@@ -1177,14 +1141,6 @@ impl CommsSpline {
             nexus_list.select_row(Some(&row));
         }
 
-        #[cfg(feature = "gnome")]
-        {
-            main_h_paned.upcast::<Widget>()
-        }
-
-        #[cfg(not(feature = "gnome"))]
-        {
-            main_h_paned.into()
-        }
+        main_h_paned.upcast::<Widget>()
     }
 }
