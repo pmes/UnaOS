@@ -19,9 +19,6 @@ ab_glyph = "0.2.32"
 # ------------------------------------------------------------------------------
 # LINUX / GTK4 TARGETS
 # ------------------------------------------------------------------------------
-# 🦅 MACH'S BRIDGE: POSITIVE GATING
-# We strictly whitelist Linux for GTK dependencies.
-# This prevents glib-sys from leaking into macOS or UEFI (target_os="none" or "uefi").
 [target.'cfg(target_os = "linux")'.dependencies]
 gtk4 = { version = "0.10.3", features = ["v4_12"] }
 glib = "0.21"
@@ -34,19 +31,16 @@ sourceview5 = "0.10"
 # macOS / APP KIT TARGETS
 # ------------------------------------------------------------------------------
 [target.'cfg(target_os = "macos")'.dependencies]
-objc2 = "0.5.2"
-objc2-foundation = { version = "0.2.2", features = ["NSThread", "NSString", "NSBundle", "NSObject"] }
-objc2-app-kit = { version = "0.2.2", features = [
+objc2 = "0.6.4"
+objc2-foundation = { version = "0.3.2", features = ["NSThread", "NSString", "NSBundle", "NSObject"] }
+objc2-app-kit = { version = "0.3.2", features = [
     "NSApplication",
     "NSView",
     "NSWindow",
     "NSResponder",
     "NSRunningApplication"
 ] }
-block2 = "0.5"
+block2 = "0.6.2"
 
-# 🦅 MACH'S BRIDGE: BUILD DEPENDENCIES
-# glib-build-tools is ONLY needed on Linux to compile GResources.
-# On macOS, it pulls glib-sys, causing build failures if pkg-config is missing.
 [target.'cfg(target_os = "linux")'.build-dependencies]
 glib-build-tools = "0.21"
