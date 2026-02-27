@@ -41,6 +41,8 @@ declare_class!(
             println!("[UnaOS::Quartzite] macOS Application Runloop Ignited.");
 
             // 1. The engine is awake. Create the NativeWindow (NSWindow).
+            // We re-obtain the MainThreadMarker to satisfy local scope requirements,
+            // though self is technically proof of main thread execution in this callback.
             let mtm = MainThreadMarker::new().expect("Must be on main thread");
 
             // Coordinates: (0, 0) is bottom-left on macOS. We center it later.
@@ -51,18 +53,21 @@ declare_class!(
                 | NSWindowStyleMask::Resizable;
 
             // -------------------------------------------------------------------
-            // UNAOS THREAD SAFETY MANDATE (APPKIT)
-            // AppKit strictly requires UI elements to be allocated on the Main Thread.
-            // objc2 0.5 encodes this rule into the type system (MainThreadOnly).
-            // We use the MainThreadMarker to allocate the window safely.
+            // UNAOS DIRECT RUNTIME INVOCATION (THE CAN-AM WAY)
+            // The objc2_app_kit crate strips generated methods if transitive feature
+            // flags for their arguments are missing in Cargo.toml.
+            // Instead of fighting the wrapper, we bypass it. We use msg_send_id!
+            // to send the initialization message directly to the Objective-C runtime.
+            // This is raw, zero-overhead execution. No restrictor plates.
             // -------------------------------------------------------------------
-            let window = unsafe {
-                mtm.alloc::<NSWindow>().initWithContentRect_styleMask_backing_defer(
-                    content_rect,
-                    style,
-                    2 as _, // Using raw integer to force compile (NSBackingStoreBuffered)
-                    false
-                )
+            let window: Retained<NSWindow> = unsafe {
+                msg_send_id![
+                    mtm.alloc::<NSWindow>(),
+                    initWithContentRect: content_rect,
+                    styleMask: style,
+                    backing: 2usize, // NSBackingStoreBuffered = 2 (NSUInteger maps to usize)
+                    defer: false
+                ]
             };
 
             window.setTitle(&objc2_foundation::NSString::from_str("Vein (Trinity)"));
