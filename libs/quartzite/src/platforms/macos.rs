@@ -1,9 +1,10 @@
 #![cfg(target_os = "macos")]
 
-use objc2::{declare_class, msg_send, msg_send_id, ClassType, DeclaredClass};
+use objc2::{declare_class, msg_send, msg_send_id, ClassType};
 use objc2::mutability::MainThreadOnly;
-use objc2_app_kit::{NSApplication, NSApplicationActivationPolicy, NSApplicationDelegate, NSWindow, NSWindowStyleMask, NSView};
-use objc2_foundation::{MainThreadMarker, NSObject, NSRect, NSPoint, NSSize};
+use objc2::declare::DeclaredClass;
+use objc2_app_kit::{NSApplication, NSApplicationActivationPolicy, NSApplicationDelegate, NSWindow, NSWindowStyleMask};
+use objc2_foundation::{MainThreadMarker, NSObject, NSObjectProtocol, NSRect, NSPoint, NSSize};
 use objc2::rc::Retained;
 use std::cell::RefCell;
 
@@ -32,6 +33,9 @@ declare_class!(
         type Ivars = ();
     }
 
+    // Explicitly implement NSObjectProtocol as required by objc2 0.5+
+    unsafe impl NSObjectProtocol for UnaAppDelegate {}
+
     unsafe impl NSApplicationDelegate for UnaAppDelegate {
         #[method(applicationDidFinishLaunching:)]
         unsafe fn applicationDidFinishLaunching(&self, _notification: &NSObject) {
@@ -48,15 +52,11 @@ declare_class!(
                 | NSWindowStyleMask::Resizable;
 
             let window = unsafe {
-                let alloc: Retained<NSWindow> = msg_send![NSWindow::class(), alloc];
-
-                // We pass `2 as _` directly for NSBackingStoreBuffered.
-                // This bypasses the deprecated enum constant while satisfying the FFI.
-                NSWindow::initWithContentRect_styleMask_backing_defer(
-                    alloc,
+                // Use the generated alloc method from ClassType via NSWindow
+                NSWindow::alloc().initWithContentRect_styleMask_backing_defer(
                     content_rect,
                     style,
-                    2 as _,
+                    2 as _, // NSBackingStoreBuffered
                     false
                 )
             };
