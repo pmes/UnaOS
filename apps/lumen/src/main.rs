@@ -2,8 +2,6 @@ mod core;
 mod cortex;
 mod ui;
 
-#[cfg(target_os = "linux")]
-use crate::ui::telemetry::ContextView;
 #[cfg(target_os = "macos")]
 use crate::ui::macos_view::MacOSSpline;
 
@@ -22,10 +20,6 @@ use gneiss_pal::AppHandler;
 // Platform-specific imports
 #[cfg(target_os = "linux")]
 use gtk4::prelude::*;
-#[cfg(target_os = "linux")]
-use gtk4::{Orientation, Paned};
-#[cfg(target_os = "linux")]
-use glib::MainContext;
 
 fn main() {
     // 0. Ignite the Substrate Reactor (Tokio)
@@ -94,29 +88,12 @@ fn main() {
         #[cfg(target_os = "macos")]
         let vein_widget = spline.bootstrap(window, event_tx.clone(), gui_rx.clone());
 
-        // 2. Create the HUD (ContextView) - GTK Only for now
+        // 2. Create the HUD (ContextView) - DEPRECATED (Phase 4)
+        // The "TeleHUD" sidebar tab is now the sole authorized telemetry view.
+        // We simply return the vein_widget directly.
         #[cfg(target_os = "linux")]
         {
-            let hud = ContextView::new();
-            let hud_widget = hud.container.clone();
-
-            let telemetry_rx_clone = _telemetry_rx.clone();
-            MainContext::default().spawn_local(async move {
-                while let Ok(msg) = telemetry_rx_clone.recv().await {
-                    if let SMessage::ContextTelemetry { skeletons } = msg {
-                        hud.update(skeletons);
-                    }
-                }
-            });
-
-            let root = Paned::new(Orientation::Horizontal);
-            root.set_start_child(Some(&vein_widget));
-            root.set_end_child(Some(&hud_widget));
-            root.set_position(900);
-            root.set_wide_handle(true);
-            root.set_shrink_end_child(false);
-
-            root.upcast::<gtk4::Widget>()
+            vein_widget
         }
 
         #[cfg(target_os = "macos")]

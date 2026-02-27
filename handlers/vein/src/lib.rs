@@ -249,22 +249,6 @@ impl VeinHandler {
                                 let payload_str = &user_input_text["DISPATCH_PAYLOAD:".len()..];
 
                                 if let Ok(context) = serde_json::from_str::<Vec<Content>>(payload_str) {
-                                    // === GHOST ECHO FIX: RENDER USER INPUT NOW ===
-                                     if let Some(last_msg) = context.last() {
-                                         if last_msg.role == "user" {
-                                             if let Some(Part::Text { text }) = last_msg.parts.last() {
-                                                 // We strip the system prompt if present to show just the user's message
-                                                 let display_text = if text.contains("SYSTEM_INSTRUCTION") {
-                                                     text.split("SYSTEM_INSTRUCTION").last().unwrap_or(text).trim()
-                                                 } else {
-                                                     text.as_str()
-                                                 };
-                                                 let timestamp = Local::now().format("%H:%M:%S").to_string();
-                                                 let _ = gui_tx_brain.send(GuiUpdate::ConsoleLog(format!("\n[ARCHITECT] [{}] > {}\n", timestamp, display_text))).await;
-                                             }
-                                         }
-                                     }
-
                                     match client.generate_content(&context).await {
                                         Ok((response, metadata)) => {
                                             let timestamp = chrono::Local::now().format("%H:%M:%S").to_string();
@@ -352,7 +336,7 @@ impl VeinHandler {
 
                             // SAVE USER MEMORY FIRST (So it's included in the history fetch)
                             // We strip heavy attachments first.
-                            let mut parsed_parts_for_save = parse_multimodal_text(&user_input_text);
+                            let parsed_parts_for_save = parse_multimodal_text(&user_input_text);
                             let mut clean_memory_text = String::new();
                             for part in &parsed_parts_for_save {
                                 if let Part::Text { text } = part {
@@ -554,8 +538,6 @@ The Architect
                             };
 
                             let mut context: Vec<Content> = Vec::new();
-                            // Load history (already loaded at start of loop implicitly if we assume `disk` is stateful, but here we query again or rely on the `records` loaded earlier if we kept state.
-                            // Actually, let's query fresh to be safe and stateless.)
                             let history = disk.load_all_memories().unwrap_or_default();
 
                             // Enforce strict memory bounds (Last 10 messages)
@@ -635,7 +617,7 @@ impl AppHandler for VeinHandler {
         match event {
             Event::Input { target: _, text } => {
                 let timestamp = Local::now().format("%H:%M:%S").to_string();
-                let current_text = format!("\n[ARCHITECT] [{}] > {}\n", timestamp, text);
+                let _current_text = format!("\n[ARCHITECT] [{}] > {}\n", timestamp, text);
 
                 // === GHOST ECHO FIX: REMOVE IMMEDIATE ECHO ===
                 // self.append_to_console(&current_text);
