@@ -2,7 +2,7 @@
 
 > *"Light is information. Color is code. We do not just look; we inspect."*
 
-**Facet** is the high-performance raster graphics engine of **UnaOS**. It rejects the slow, bloated "Photo Viewers" of legacy systems that blur images to hide the pixels.
+**Facet** is the high-performance raster graphics app of **UnaOS**. It rejects the slow, bloated "Photo Viewers" of legacy systems that blur images to hide the pixels.
 
 **Facet** embraces the pixel. It is a tool for precision inspection, texture manipulation, and instant visual feedback.
 
