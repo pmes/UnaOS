@@ -20,7 +20,8 @@ members = [
     "apps/cli/unafs",
     "apps/cli/sentinel",
     "apps/lumen",
-    "apps/una"
+    "apps/una",
+    "libs/lux"
 ]
 
 # 🦅 MACH'S BRIDGE:
