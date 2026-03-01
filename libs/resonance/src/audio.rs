@@ -3,8 +3,7 @@ use crate::graph::AudioGraph;
 use crate::{BLOCK_SIZE, Sample};
 use bandy::{BandyMember, SMessage};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-use ringbuf::{Consumer, HeapRb, Producer};
-use std::sync::Arc;
+use ringbuf::{HeapRb, traits::*};
 
 /// The engine that manages the audio driver and drives the graph.
 pub struct AudioEngine {
@@ -23,7 +22,7 @@ impl AudioEngine {
     /// Returns the engine instance (which must be kept alive) and a command producer.
     pub fn new(
         mut graph: AudioGraph,
-    ) -> Result<(Self, Producer<AudioCommand, Arc<HeapRb<AudioCommand>>>), anyhow::Error> {
+    ) -> Result<(Self, impl Producer<Item = AudioCommand>), anyhow::Error> {
         let host = cpal::default_host();
 
         let device = host
@@ -32,7 +31,7 @@ impl AudioEngine {
 
         let config = device.default_output_config()?;
         let sample_format = config.sample_format();
-        let sample_rate = config.sample_rate().0;
+        let sample_rate = config.sample_rate();
         let config: cpal::StreamConfig = config.into();
 
         let channels = config.channels as usize;
@@ -123,7 +122,7 @@ fn write_output_f32(
     graph: &mut AudioGraph,
     current_block: &mut [Sample; BLOCK_SIZE],
     block_offset: &mut usize,
-    consumer: &mut Consumer<AudioCommand, Arc<HeapRb<AudioCommand>>>,
+    consumer: &mut impl Consumer<Item = AudioCommand>,
 ) {
     // Iterate over frames (chunks of samples, one per channel)
     for frame in output.chunks_mut(channels) {
@@ -154,9 +153,9 @@ fn write_output_f32(
 /// Consumes commands from the ring buffer and applies them to the graph.
 fn process_commands(
     _graph: &mut AudioGraph,
-    consumer: &mut Consumer<AudioCommand, Arc<HeapRb<AudioCommand>>>,
+    consumer: &mut impl Consumer<Item = AudioCommand>,
 ) {
-    while let Some(cmd) = consumer.pop() {
+    while let Some(cmd) = consumer.try_pop() {
         match cmd {
             AudioCommand::SetMasterFrequency(_freq) => {
                 // _graph.set_node_param(crate::NodeId(0), 0, _freq);

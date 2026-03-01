@@ -10,7 +10,7 @@ default = []
 anyhow = "1.0"
 bandy = { path = "../../libs/bandy" }
 # git2 removed in favor of pure-Rust gix
-gix = { version = "0.66", default-features = false, features = ["parallel", "revision", "blob-diff"] }
+gix = { version = "0.80", default-features = false, features = ["parallel", "revision", "blob-diff"] }
 # elexar uses glib/gtk by default, we need to disable that if we are testing in isolation
 elessar = { path = "../../libs/elessar", default-features = false }
 gtk4 = { version = "0.10.3", features = ["v4_12"], optional = true }

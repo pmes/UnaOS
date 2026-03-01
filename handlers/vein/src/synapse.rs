@@ -2,7 +2,7 @@ use reqwest::{RequestBuilder, Response, StatusCode};
 use std::time::Duration;
 use tokio::time::sleep;
 use std::future::Future;
-use rand::Rng;
+use rand::RngExt;
 
 /// The Synaptic Governor.
 /// Prevents Lumen from DDOSing the Vertex AI endpoint.

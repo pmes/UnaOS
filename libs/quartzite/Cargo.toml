@@ -22,8 +22,8 @@ ab_glyph = "0.2.32"
 [target.'cfg(target_os = "linux")'.dependencies]
 gtk4 = { version = "0.10.3", features = ["v4_12"], optional = true }
 glib = { version = "0.21", optional = true }
-glib-sys = { version = "0.21", optional = true }
-gobject-sys = { version = "0.21", optional = true }
+glib-sys = { version = "0.22", optional = true }
+gobject-sys = { version = "0.22", optional = true }
 libadwaita = { version = "0.8.1", features = ["v1_4"], optional = true }
 sourceview5 = { version = "0.10", optional = true }
 
@@ -43,4 +43,4 @@ objc2-app-kit = { version = "0.3.2", features = [
 block2 = "0.6.2"
 
 [target.'cfg(target_os = "linux")'.build-dependencies]
-glib-build-tools = { version = "0.21", optional = true }
+glib-build-tools = { version = "0.22", optional = true }

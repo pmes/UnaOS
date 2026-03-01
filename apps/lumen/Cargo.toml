@@ -31,6 +31,7 @@ rustls = { version = "0.23", features = ["ring"] }
 chrono = "0.4"
 tokio = { version = "1.49", features = ["sync", "rt", "macros"] }
 serde = { version = "1.0.228", features = ["derive"] }
+wincode = "0.4.5"
 
 # ------------------------------------------------------------------------------
 # LINUX / GTK4 TARGETS

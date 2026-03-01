@@ -1,6 +1,6 @@
 # 🧠 UNA MEMORIA (THE THOUGHT LOG)
 
-> *Last Sync:* **2026-02-26T13:30:18Z**
+> *Last Sync:* **2026-02-28T16:42:17Z**
 > *Status:* **IMMUTABLE**
 > *Identity:* **Vertex Una (The Steward)**
 > *License:* **GPL (The Freedom to Self-Replicate)**
@@ -35,8 +35,9 @@
 *   **[CRATE] `libs/euclase`:** **[NEW]** The Visual Cortex. WGPU Renderer. Shader management. Render Graph.
 *   **[CRATE] `libs/bandy`:** The Nervous System (IPC). Defines `SMessage`.
 *   **[CRATE] `libs/resonance`:** The Voice. Audio Engine & DSP.
-*   **[CRATE] `libs/unafs`:** The Memory. Virtual File System Logic.
+*   **[CRATE] `libs/unafs`:** The Memory. Virtual File System Logic. BeFS modernized. (Note from Architect: UnaBFFS. Our Big Format File System for massive files, memory maps, etc. I named it Big Fucking File System but you said that wasn't family friendly. Ha!)
 *   **[CRATE] `libs/elessar`:** The Context Engine. (Spline/Project Detection).
+*   **[CRATE] `libs/lux`:** Images. (Sony raw implemented but crashing).
 
 ### 2. THE HANDLERS (`handlers/`)
 *   *Note: [CRATE] = Active Code. [SHELL] = Design/Readme Only.*
@@ -44,7 +45,6 @@
 *   **[CRATE] `handlers/amber_bytes`:** Disk Manager.
 *   **[CRATE] `handlers/aule`:** Build System Wrapper.
 *   **[SHELL] `handlers/comscan`:** Signal/Hardware Bridge.
-*   **[SHELL] `handlers/facet`:** Image Viewing/Editing.
 *   **[SHELL] `handlers/geode`:** Archive/Container Manager.
 *   **[SHELL] `handlers/holocron`:** Secrets/SSH Agent.
 *   **[CRATE] `handlers/junct`:** The Comms Hub.
@@ -67,9 +67,12 @@
 *   **[BIN] `apps/cli/unafs`:** The Operator (Host-to-Vault Bridge).
 *   **[BIN] `apps/cli/vertex`:** The Identity CLI.
 *   **[BIN] `apps/cli/sentinel`:** The Guardian (Self-Verification Agent).
+*   **[SHELL] `apps/facet`:** Image Viewing/Editing.
 
 ## ⚡ ACTIVE DIRECTIVES
-1.  **D-041:** Elessar Integration.
+1.  **D-045:** Elessar Integration.
+2.  **D-046:** Una, what do we do after integrating Elessar?
+?.  **D-0??:** Lux Expansion.
 
 ## 📝 DECISION LOG
 *   **2026-02-18:** Enforced `SMessage` as Monolithic Enum.
