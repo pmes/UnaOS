@@ -12,6 +12,8 @@ use std::sync::Once;
 
 use crate::{NativeView, NativeWindow};
 
+pub mod spline;
+
 // -----------------------------------------------------------------------------
 // THE IGNITION CHAMBER (THREAD LOCAL STORAGE)
 // -----------------------------------------------------------------------------

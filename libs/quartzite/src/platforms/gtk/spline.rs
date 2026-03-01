@@ -1,6 +1,6 @@
-// apps/lumen/src/ui/view.rs
-use quartzite::Event;
-use crate::ui::model::DispatchObject;
+// libs/quartzite/src/platforms/gtk/spline.rs
+use crate::Event;
+use crate::widgets::model::DispatchObject;
 use async_channel::Receiver;
 use gtk4::prelude::*;
 use gtk4::{
@@ -61,12 +61,12 @@ impl CommsSpline {
         Self {}
     }
 
-    pub fn bootstrap<W: IsA<Window> + IsA<Widget> + Cast>(
+    pub fn bootstrap(
         &self,
-        window: &W,
+        window: &crate::NativeWindow,
         tx_event: async_channel::Sender<Event>,
         rx: Receiver<GuiUpdate>,
-    ) -> Widget {
+    ) -> crate::NativeView {
         window.set_title(Some("Vein (Trinity Architecture)"));
 
         // 1. Nodes Tab Rename
@@ -577,7 +577,7 @@ impl CommsSpline {
             let chat_content_view_clone = chat_content_view.clone();
             gesture.connect_pressed(move |_, n_press, _, _| {
                 if n_press == 1 {
-                    if let Some(obj) = item_clone.item().and_downcast::<crate::ui::model::DispatchObject>() {
+                            if let Some(obj) = item_clone.item().and_downcast::<crate::widgets::model::DispatchObject>() {
                         let expanded = !obj.is_expanded();
                         obj.set_is_expanded(expanded);
                         let content = obj.content();
