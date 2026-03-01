@@ -58,9 +58,6 @@ use gneiss_pal::{GuiUpdate, WolfpackState};
 
 use gtk4::HeaderBar;
 
-#[cfg(feature = "gnome")]
-use libadwaita as adw;
-
 pub struct CommsSpline {}
 
 impl CommsSpline {
@@ -76,10 +73,35 @@ impl CommsSpline {
     ) -> crate::NativeView {
         window.set_title(Some("Vein (Trinity Architecture)"));
 
-        // NUKE THE HOST'S DEFAULT TOP TITLEBAR
-        // This allows our nested HeaderBars to act as the true Can-Am titlebars.
-        let dummy_titlebar = gtk4::Box::new(Orientation::Horizontal, 0);
-        window.set_titlebar(Some(&dummy_titlebar));
+        // THE 4-QUADRANT HEADER FUSION
+        // We override the host window titlebar with a split grid representing our CSD.
+        let titlebar_grid = gtk4::Grid::builder().hexpand(true).build();
+
+        // Quadrant 1: Top Left (Empty Drag Area)
+        let top_left = gtk4::WindowHandle::new();
+        top_left.set_hexpand(true);
+
+        // Quadrant 2: Bottom Left (Tabs)
+        let bottom_left = Box::new(Orientation::Horizontal, 0);
+        bottom_left.add_css_class("toolbar");
+
+        // Quadrant 3: Top Right (Telemetry, Spinner, Window Controls)
+        let top_right = Box::new(Orientation::Horizontal, 8);
+        top_right.set_halign(Align::End);
+        let window_controls = gtk4::WindowControls::new(gtk4::PackType::End);
+        top_right.append(&window_controls);
+        // We defer appending token_label and pulse_icon here until they are defined later
+
+        // Quadrant 4: Bottom Right (Tabs)
+        let bottom_right = Box::new(Orientation::Horizontal, 0);
+        bottom_right.add_css_class("toolbar");
+
+        titlebar_grid.attach(&top_left, 0, 0, 1, 1);
+        titlebar_grid.attach(&bottom_left, 0, 1, 1, 1);
+        titlebar_grid.attach(&top_right, 1, 0, 1, 1);
+        titlebar_grid.attach(&bottom_right, 1, 1, 1, 1);
+
+        window.set_titlebar(Some(&titlebar_grid));
 
         // 1. Nodes Tab Rename
         let store = gio::ListStore::new::<StringObject>();
@@ -153,22 +175,15 @@ impl CommsSpline {
         let pulse_icon = Spinner::new();
         // Give the spinner a unique class for targeting with inline CSS
         pulse_icon.add_css_class("pulse-spinner");
-        // CRITICAL FIX: The spinner must be active to be visible in GTK4.
-        // Our custom CSS will handle the chaotic "random roll" on top of this.
-        pulse_icon.set_spinning(true);
+        // Pulse starts stopped. We use GTK native properties.
+        pulse_icon.set_spinning(false);
 
         let status_group = Box::new(Orientation::Horizontal, 8);
         status_group.append(&sidebar_toggle);
-        status_group.append(&token_label); // Kept here as per request
-        status_group.append(&pulse_icon);
 
-        // Define a custom provider specifically for the inline random rotation
-        let pulse_css_provider = CssProvider::new();
-        gtk4::style_context_add_provider_for_display(
-            &gtk4::gdk::Display::default().expect("No display"),
-            &pulse_css_provider,
-            gtk4::STYLE_PROVIDER_PRIORITY_APPLICATION + 1,
-        );
+        // Connect telemetry and spinner to Quadrant 3
+        top_right.prepend(&pulse_icon);
+        top_right.prepend(&token_label);
 
         // --- Root Layout ---
         let main_h_paned = Paned::new(Orientation::Horizontal);
@@ -513,32 +528,16 @@ impl CommsSpline {
         adj.connect_upper_notify(|adj| {
             let upper = adj.upper();
             let page_size = adj.page_size();
-            let max_scroll = (upper - page_size).max(adj.lower());
-            if (adj.value() - max_scroll).abs() > f64::EPSILON {
-                adj.set_value(max_scroll);
+            if upper > page_size {
+                let max_scroll = upper - page_size;
+                if (adj.value() - max_scroll).abs() > f64::EPSILON {
+                    adj.set_value(max_scroll);
+                }
             }
         });
 
-        // Edge Reached (Top) - History Load
-        let tx_scroll = tx_event.clone();
-        scrolled_window.connect_edge_reached(move |_, pos| {
-            if pos == gtk4::PositionType::Top {
-                let tx_async = tx_scroll.clone();
-                glib::MainContext::default().spawn_local(async move {
-                    let _ = tx_async.send(Event::LoadHistory).await;
-                });
-            }
-        });
-
-        // Phase 2/3: Paned Header Fusion (Gnome Builder Style)
-        // LEFT PANE HEADERS
-        let blank_header_bar = HeaderBar::new();
-        blank_header_bar.set_show_title_buttons(false);
-
-        let left_tabs_box = Box::new(Orientation::Horizontal, 0);
-        left_tabs_box.add_css_class("toolbar");
-        left_tabs_box.set_halign(Align::Center);
-
+        // 4-Quadrant Appends
+        // Quadrant 2: Bottom Left Tabs
         let tab_nodes = ToggleButton::builder().label("Nodes").css_classes(vec!["flat", "builder-tab"]).active(true).build();
         let tab_nexus = ToggleButton::builder().label("Nexus").css_classes(vec!["flat", "builder-tab"]).group(&tab_nodes).build();
         let tab_telehud = ToggleButton::builder().label("TeleHUD").css_classes(vec!["flat", "builder-tab"]).group(&tab_nodes).build();
@@ -550,22 +549,17 @@ impl CommsSpline {
         let sidebar_stack_clone3 = sidebar_stack.clone();
         tab_telehud.connect_toggled(move |btn| { if btn.is_active() { sidebar_stack_clone3.set_visible_child_name("telehud"); } });
 
-        left_tabs_box.append(&tab_nodes);
-        left_tabs_box.append(&tab_nexus);
-        left_tabs_box.append(&tab_telehud);
+        bottom_left.append(&tab_nodes);
+        bottom_left.append(&tab_nexus);
+        bottom_left.append(&tab_telehud);
 
-        left_vbox.prepend(&left_tabs_box);
-        left_vbox.prepend(&blank_header_bar);
-
-        // RIGHT PANE HEADERS
+        // Right side layout requires status group on top
         let command_header_bar = HeaderBar::new();
-        command_header_bar.set_show_title_buttons(true);
+        command_header_bar.set_show_title_buttons(false);
         command_header_bar.pack_start(&status_group);
+        right_vbox.prepend(&command_header_bar);
 
-        let right_tabs_box = Box::new(Orientation::Horizontal, 0);
-        right_tabs_box.add_css_class("toolbar");
-        right_tabs_box.set_halign(Align::Center);
-
+        // Quadrant 4: Bottom Right Tabs
         let tab_comms = ToggleButton::builder().label("Comms").css_classes(vec!["flat", "builder-tab"]).active(true).build();
         let tab_editor = ToggleButton::builder().label("Payload Editor").css_classes(vec!["flat", "builder-tab"]).group(&tab_comms).build();
 
@@ -574,11 +568,9 @@ impl CommsSpline {
         let workspace_stack_clone2 = workspace_stack.clone();
         tab_editor.connect_toggled(move |btn| { if btn.is_active() { workspace_stack_clone2.set_visible_child_name("editor"); } });
 
-        right_tabs_box.append(&tab_comms);
-        right_tabs_box.append(&tab_editor);
+        bottom_right.append(&tab_comms);
+        bottom_right.append(&tab_editor);
 
-        right_vbox.prepend(&right_tabs_box);
-        right_vbox.prepend(&command_header_bar);
 
         // Console ListView
         let console_store = gio::ListStore::new::<DispatchObject>();
@@ -1059,26 +1051,9 @@ impl CommsSpline {
         let label_s9_clone = label_s9.clone();
         let spinner_s9_clone = spinner_s9.clone();
         let token_label_clone = token_label.clone();
+        let pulse_icon_clone = pulse_icon.clone();
         let active_directive_async = active_directive_clone.clone();
         let telehud_token_label_clone = telehud_token_label.clone();
-
-        let pulse_is_active = Rc::new(RefCell::new(false));
-        let pulse_is_active_clone = pulse_is_active.clone();
-        let pulse_css_provider_clone = pulse_css_provider.clone();
-
-        // Spawn background random roll task
-        glib::timeout_add_local(std::time::Duration::from_millis(150), move || {
-            if *pulse_is_active_clone.borrow() {
-                // Random degree between 0 and 360 using basic math (rand not imported to stay pure)
-                let time_ns = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
-                let rand_deg = time_ns % 360;
-                let css = format!(".pulse-spinner {{ transform: rotate({}deg); }}", rand_deg);
-                pulse_css_provider_clone.load_from_string(&css);
-            } else {
-                pulse_css_provider_clone.load_from_string(".pulse-spinner { transform: none; }");
-            }
-            glib::ControlFlow::Continue
-        });
 
         let console_store_async = console_store.clone();
 
@@ -1155,10 +1130,10 @@ impl CommsSpline {
                     }
                     GuiUpdate::SidebarStatus(state) => match state {
                         WolfpackState::Dreaming => {
-                            *pulse_is_active.borrow_mut() = true;
+                            pulse_icon_clone.start();
                         }
                         _ => {
-                            *pulse_is_active.borrow_mut() = false;
+                            pulse_icon_clone.stop();
                         }
                     },
                     GuiUpdate::TokenUsage(p, c, t) => {

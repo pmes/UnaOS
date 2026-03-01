@@ -219,6 +219,8 @@ impl VeinHandler {
                     DiskManager::new(&vault_path_bg).expect("Failed to initialize Semantic Vault (UnaFS)")
                 ));
 
+                tokio::time::sleep(Duration::from_millis(800)).await;
+
                 if let Ok(records) = disk.lock().unwrap().load_all_memories() {
                     for record in records {
                         let prefix = if record.sender == "user" { "[ARCHITECT]" } else { "[UNA]" };
@@ -226,8 +228,6 @@ impl VeinHandler {
                         let _ = gui_tx_brain.send(GuiUpdate::ConsoleLog(msg)).await;
                     }
                 }
-
-                tokio::time::sleep(Duration::from_millis(200)).await;
 
                 let forge_client = match ForgeClient::new() {
                     Ok(client) => {
@@ -544,9 +544,9 @@ impl AppHandler for VeinHandler {
         match event {
             Event::Input { target: _, text } => {
                 let timestamp = Local::now().format("%H:%M:%S").to_string();
-                let current_text = format!("\n[ARCHITECT] [{}] > {}\n", timestamp, text);
+                let _current_text = format!("\n[ARCHITECT] [{}] > {}\n", timestamp, text);
 
-                self.append_to_console(&current_text);
+                // Input echo removed as per Architect mandate
 
                 if text.trim() == "/wolf" {
                     s.mode = ViewMode::Wolfpack;

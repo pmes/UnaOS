@@ -6,7 +6,7 @@ use unafs::{AttributeValue, FileDevice, FileSystem, UnaFS};
 /// The Subconscious Vault.
 /// Silently records the raw stimuli of the nervous system.
 pub struct Cortex {
-    pub vault_path: PathBuf,
+    pub _vault_path: PathBuf,
     fs: FileSystem,
 }
 
@@ -36,7 +36,7 @@ impl Cortex {
             content: format!("Deep subconscious online at {}", vault_path.display()),
         });
 
-        Self { vault_path, fs }
+        Self { _vault_path: vault_path, fs }
     }
 
     /// Burns a raw memory into the UnaFS Substrate.
