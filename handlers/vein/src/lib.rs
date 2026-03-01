@@ -544,10 +544,9 @@ impl AppHandler for VeinHandler {
         match event {
             Event::Input { target: _, text } => {
                 let timestamp = Local::now().format("%H:%M:%S").to_string();
-                let _current_text = format!("\n[ARCHITECT] [{}] > {}\n", timestamp, text);
+                let current_text = format!("\n[ARCHITECT] [{}] > {}\n", timestamp, text);
 
-                // === GHOST ECHO FIX: REMOVE IMMEDIATE ECHO ===
-                // self.append_to_console(&current_text);
+                self.append_to_console(&current_text);
 
                 if text.trim() == "/wolf" {
                     s.mode = ViewMode::Wolfpack;
@@ -629,6 +628,9 @@ impl AppHandler for VeinHandler {
                 // The UI has approved the payload. We send it back to the Brain via the mpsc channel
                 // prefixed with our magic header so the loop picks it up.
                 let _ = self.tx.send(format!("DISPATCH_PAYLOAD:{}", json_payload));
+            }
+            Event::LoadHistory => {
+                self.append_to_console("\n[SYSTEM] :: Loading historical records...\n");
             }
             _ => {}
         }

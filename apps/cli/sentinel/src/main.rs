@@ -68,7 +68,7 @@ fn main() -> Result<()> {
 
     // --- PHASE 2: SEMANTIC VAULT VERIFICATION ---
     println!("\n>> PHASE 2: VAULT INTEGRITY");
-    let vault_path = elessar::gneiss_pal::paths::UnaPaths::primary_vault();
+    let vault_path = gneiss_pal::paths::UnaPaths::primary_vault();
 
     if vault_path.exists() {
         if let Ok(mut device) = FileDevice::open_read_only(&vault_path) {

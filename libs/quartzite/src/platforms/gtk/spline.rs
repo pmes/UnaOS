@@ -37,7 +37,18 @@ fn enable_spelling(view: &SourceView) {
 
         // BIND NATIVE RIGHT-CLICK SUGGESTIONS
         let menu = adapter.menu_model();
-        view.set_extra_menu(Some(&menu));
+        view.connect_populate_popup(move |_, popup| {
+            if let Some(popover) = popup.downcast_ref::<gtk4::PopoverMenu>() {
+                if let Some(model) = popover.menu_model() {
+                    let new_model = gio::Menu::new();
+                    // Append libspelling suggestions to the top
+                    new_model.append_section(None, &menu);
+                    // Append native items
+                    new_model.append_section(None, &model);
+                    popover.set_menu_model(Some(&new_model));
+                }
+            }
+        });
 
         unsafe {
             buffer.set_data("spell-adapter", SendWrapper(adapter));
@@ -103,6 +114,18 @@ impl CommsSpline {
             .role-architect { color: #0078d4; font-weight: bold; }
             .role-una { color: #d40078; font-weight: bold; }
             .role-system { color: #888888; font-style: italic; }
+
+            /* GNOME BUILDER HEADER FUSION TABS */
+            .builder-tab {
+                border-radius: 0px;
+                padding-left: 16px;
+                padding-right: 16px;
+                margin-bottom: 0px;
+                border-bottom: 2px solid transparent;
+            }
+            .builder-tab:checked {
+                border-bottom: 2px solid @accent_bg_color;
+            }
         ");
 
         gtk4::style_context_add_provider_for_display(
@@ -127,11 +150,21 @@ impl CommsSpline {
         token_label.set_justify(gtk4::Justification::Center);
 
         let pulse_icon = Spinner::new();
+        // Give the spinner a unique class for targeting with inline CSS
+        pulse_icon.add_css_class("pulse-spinner");
 
         let status_group = Box::new(Orientation::Horizontal, 8);
         status_group.append(&sidebar_toggle);
         status_group.append(&token_label); // Kept here as per request
         status_group.append(&pulse_icon);
+
+        // Define a custom provider specifically for the inline random rotation
+        let pulse_css_provider = CssProvider::new();
+        gtk4::style_context_add_provider_for_display(
+            &gtk4::gdk::Display::default().expect("No display"),
+            &pulse_css_provider,
+            gtk4::STYLE_PROVIDER_PRIORITY_APPLICATION + 1,
+        );
 
         // --- Root Layout ---
         let main_h_paned = Paned::new(Orientation::Horizontal);
@@ -140,6 +173,7 @@ impl CommsSpline {
         main_h_paned.set_vexpand(true);
         main_h_paned.set_wide_handle(false);
         main_h_paned.set_shrink_start_child(false);
+        main_h_paned.set_resize_start_child(false);
 
         // --- Left Pane (The Silhouette) ---
         let left_vbox = Box::new(Orientation::Vertical, 0);
@@ -435,14 +469,7 @@ impl CommsSpline {
 
         sidebar_box.append(&sidebar_stack);
 
-        // Sidebar Switcher (Moved to HeaderBar in GNOME build)
-        let sidebar_switcher = StackSwitcher::builder()
-            .stack(&sidebar_stack)
-            .halign(Align::Center)
-            .build();
-
-        #[cfg(not(feature = "gnome"))]
-        sidebar_box.append(&sidebar_switcher);
+        // (Sidebar Switcher logic replaced by Custom Builder Tabs)
 
         left_vbox.append(&sidebar_box);
         main_h_paned.set_start_child(Some(&left_vbox));
@@ -482,39 +509,69 @@ impl CommsSpline {
         adj.connect_upper_notify(|adj| {
             let upper = adj.upper();
             let page_size = adj.page_size();
-            let max_scroll = (upper - page_size).max(0.0);
+            let max_scroll = (upper - page_size).max(adj.lower());
             if (adj.value() - max_scroll).abs() > f64::EPSILON {
                 adj.set_value(max_scroll);
             }
         });
 
-        // Phase 2: Paned Header Fusion
-        let main_switcher = StackSwitcher::builder()
-            .stack(&workspace_stack)
-            .halign(Align::Center)
-            .build();
+        // Edge Reached (Top) - History Load
+        let tx_scroll = tx_event.clone();
+        scrolled_window.connect_edge_reached(move |_, pos| {
+            if pos == gtk4::PositionType::Top {
+                let tx_async = tx_scroll.clone();
+                glib::MainContext::default().spawn_local(async move {
+                    let _ = tx_async.send(Event::LoadHistory).await;
+                });
+            }
+        });
 
-        // Left Workspace (Sidebar) Headers
+        // Phase 2/3: Paned Header Fusion (Gnome Builder Style)
+        // LEFT PANE HEADERS
         let blank_header_bar = HeaderBar::new();
         blank_header_bar.set_show_title_buttons(false);
 
         let left_tabs_box = Box::new(Orientation::Horizontal, 0);
         left_tabs_box.add_css_class("toolbar");
-        sidebar_switcher.set_halign(Align::Center);
-        left_tabs_box.append(&sidebar_switcher);
+        left_tabs_box.set_halign(Align::Center);
+
+        let tab_nodes = ToggleButton::builder().label("Nodes").css_classes(vec!["flat", "builder-tab"]).active(true).build();
+        let tab_nexus = ToggleButton::builder().label("Nexus").css_classes(vec!["flat", "builder-tab"]).group(&tab_nodes).build();
+        let tab_telehud = ToggleButton::builder().label("TeleHUD").css_classes(vec!["flat", "builder-tab"]).group(&tab_nodes).build();
+
+        let sidebar_stack_clone1 = sidebar_stack.clone();
+        tab_nodes.connect_toggled(move |btn| { if btn.is_active() { sidebar_stack_clone1.set_visible_child_name("nodes"); } });
+        let sidebar_stack_clone2 = sidebar_stack.clone();
+        tab_nexus.connect_toggled(move |btn| { if btn.is_active() { sidebar_stack_clone2.set_visible_child_name("nexus"); } });
+        let sidebar_stack_clone3 = sidebar_stack.clone();
+        tab_telehud.connect_toggled(move |btn| { if btn.is_active() { sidebar_stack_clone3.set_visible_child_name("telehud"); } });
+
+        left_tabs_box.append(&tab_nodes);
+        left_tabs_box.append(&tab_nexus);
+        left_tabs_box.append(&tab_telehud);
 
         left_vbox.prepend(&left_tabs_box);
         left_vbox.prepend(&blank_header_bar);
 
-        // Right Workspace (Command Center) Headers
+        // RIGHT PANE HEADERS
         let command_header_bar = HeaderBar::new();
         command_header_bar.set_show_title_buttons(true);
         command_header_bar.pack_start(&status_group);
 
         let right_tabs_box = Box::new(Orientation::Horizontal, 0);
         right_tabs_box.add_css_class("toolbar");
-        main_switcher.set_halign(Align::Center);
-        right_tabs_box.append(&main_switcher);
+        right_tabs_box.set_halign(Align::Center);
+
+        let tab_comms = ToggleButton::builder().label("Comms").css_classes(vec!["flat", "builder-tab"]).active(true).build();
+        let tab_editor = ToggleButton::builder().label("Payload Editor").css_classes(vec!["flat", "builder-tab"]).group(&tab_comms).build();
+
+        let workspace_stack_clone1 = workspace_stack.clone();
+        tab_comms.connect_toggled(move |btn| { if btn.is_active() { workspace_stack_clone1.set_visible_child_name("comms"); } });
+        let workspace_stack_clone2 = workspace_stack.clone();
+        tab_editor.connect_toggled(move |btn| { if btn.is_active() { workspace_stack_clone2.set_visible_child_name("editor"); } });
+
+        right_tabs_box.append(&tab_comms);
+        right_tabs_box.append(&tab_editor);
 
         right_vbox.prepend(&right_tabs_box);
         right_vbox.prepend(&command_header_bar);
@@ -998,9 +1055,26 @@ impl CommsSpline {
         let label_s9_clone = label_s9.clone();
         let spinner_s9_clone = spinner_s9.clone();
         let token_label_clone = token_label.clone();
-        let pulse_icon_clone = pulse_icon.clone();
         let active_directive_async = active_directive_clone.clone();
         let telehud_token_label_clone = telehud_token_label.clone();
+
+        let pulse_is_active = Rc::new(RefCell::new(false));
+        let pulse_is_active_clone = pulse_is_active.clone();
+        let pulse_css_provider_clone = pulse_css_provider.clone();
+
+        // Spawn background random roll task
+        glib::timeout_add_local(std::time::Duration::from_millis(150), move || {
+            if *pulse_is_active_clone.borrow() {
+                // Random degree between 0 and 360 using basic math (rand not imported to stay pure)
+                let time_ns = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
+                let rand_deg = time_ns % 360;
+                let css = format!(".pulse-spinner {{ transform: rotate({}deg); }}", rand_deg);
+                pulse_css_provider_clone.load_from_string(&css);
+            } else {
+                pulse_css_provider_clone.load_from_string(".pulse-spinner { transform: none; }");
+            }
+            glib::ControlFlow::Continue
+        });
 
         let console_store_async = console_store.clone();
 
@@ -1077,10 +1151,10 @@ impl CommsSpline {
                     }
                     GuiUpdate::SidebarStatus(state) => match state {
                         WolfpackState::Dreaming => {
-                            pulse_icon_clone.start();
+                            *pulse_is_active.borrow_mut() = true;
                         }
                         _ => {
-                            pulse_icon_clone.stop();
+                            *pulse_is_active.borrow_mut() = false;
                         }
                     },
                     GuiUpdate::TokenUsage(p, c, t) => {
