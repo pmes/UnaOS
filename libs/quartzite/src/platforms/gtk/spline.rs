@@ -35,6 +35,10 @@ fn enable_spelling(view: &SourceView) {
         adapter.set_language("en_US");
         adapter.set_enabled(true);
 
+        // CRITICAL FIX: Wire the actions to the view.
+        // Without this, the menu items cannot trigger and remain greyed out.
+        view.insert_action_group("spelling", Some(&adapter));
+
         // BIND NATIVE RIGHT-CLICK SUGGESTIONS
         // UNAOS DIRECTIVE: GTK4 removed `populate-popup`. We use `set_extra_menu`.
         // The host compositor will automatically and safely merge these suggestions
@@ -71,6 +75,11 @@ impl CommsSpline {
         rx: Receiver<GuiUpdate>,
     ) -> crate::NativeView {
         window.set_title(Some("Vein (Trinity Architecture)"));
+
+        // NUKE THE HOST'S DEFAULT TOP TITLEBAR
+        // This allows our nested HeaderBars to act as the true Can-Am titlebars.
+        let dummy_titlebar = gtk4::Box::new(Orientation::Horizontal, 0);
+        window.set_titlebar(Some(&dummy_titlebar));
 
         // 1. Nodes Tab Rename
         let store = gio::ListStore::new::<StringObject>();
@@ -144,6 +153,9 @@ impl CommsSpline {
         let pulse_icon = Spinner::new();
         // Give the spinner a unique class for targeting with inline CSS
         pulse_icon.add_css_class("pulse-spinner");
+        // CRITICAL FIX: The spinner must be active to be visible in GTK4.
+        // Our custom CSS will handle the chaotic "random roll" on top of this.
+        pulse_icon.set_spinning(true);
 
         let status_group = Box::new(Orientation::Horizontal, 8);
         status_group.append(&sidebar_toggle);
