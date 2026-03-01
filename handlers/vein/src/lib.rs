@@ -215,9 +215,11 @@ impl VeinHandler {
                     cortex::run_indexer(root, bandy_tx_bg, telemetry_tx).await;
                 });
 
-                let mut disk = DiskManager::new(&vault_path_bg).expect("Failed to initialize Semantic Vault (UnaFS)");
+                let disk = Arc::new(std::sync::Mutex::new(
+                    DiskManager::new(&vault_path_bg).expect("Failed to initialize Semantic Vault (UnaFS)")
+                ));
 
-                if let Ok(records) = disk.load_all_memories() {
+                if let Ok(records) = disk.lock().unwrap().load_all_memories() {
                     for record in records {
                         let prefix = if record.sender == "user" { "[ARCHITECT]" } else { "[UNA]" };
                         let msg = format!("{} [{}] > {}\n", prefix, record.timestamp, record.content);
@@ -269,7 +271,19 @@ impl VeinHandler {
                                                 Ok(vec) => vec,
                                                 Err(_) => vec![],
                                             };
-                                            let _ = disk.save_memory("model", &response, &timestamp, response_embedding);
+
+                                            let disk_clone = disk.clone();
+                                            let response_clone = response.clone();
+                                            let timestamp_clone = timestamp.clone();
+
+                                            // OFFLOAD TO BLOCKING THREAD POOL
+                                            // The async reactor immediately yields and continues processing UI events.
+                                            tokio::task::spawn_blocking(move || {
+                                                let mut d = disk_clone.lock().unwrap();
+                                                if let Err(e) = d.save_memory("model", &response_clone, &timestamp_clone, response_embedding) {
+                                                    eprintln!(":: PLEXUS :: Failed to save model memory: {}", e);
+                                                }
+                                            }).await.unwrap();
 
                                             let _ = gui_tx_brain.send(GuiUpdate::SidebarStatus(WolfpackState::Idle)).await;
                                         }
@@ -283,9 +297,27 @@ impl VeinHandler {
 
 
                             if user_input_text.trim() == "/clear" {
-                                drop(disk);
-                                let _ = std::fs::remove_file(&vault_path_bg);
-                                disk = DiskManager::new(&vault_path_bg).expect("Failed to reformat Semantic Vault");
+                                // Recreate the disk manager inside a blocking task
+                                let vault_path_clone = vault_path_bg.clone();
+                                let disk_clone = Arc::clone(&disk);
+                                let _ = tokio::task::spawn_blocking(move || {
+                                    // We need to drop the old DiskManager to release file handles.
+                                    // But wait, the previous code just did `drop(disk); ... disk = DiskManager::new(...)`.
+                                    // Now it's behind Arc<Mutex>.
+                                    // We can just let the old FS drop by overwriting `*locked_disk`.
+                                    // Let's ensure the old FileSystem is dropped before we delete the file.
+                                    // However, to do that, we could use an Option in the Mutex, or we can just
+                                    // rely on the fact that replacing it drops the old one. But we need to remove the file *before* creating the new one.
+                                    // Since we don't have an Option, we can't easily drop it before.
+                                    // Actually, if we just remove the file, on Linux (which UnaOS targets) it unlinks it fine.
+                                    // Let's just do it sequentially.
+                                    let mut locked_disk = disk_clone.lock().unwrap();
+                                    let _ = std::fs::remove_file(&vault_path_clone);
+                                    if let Ok(new_disk) = DiskManager::new(&vault_path_clone) {
+                                        *locked_disk = new_disk;
+                                    }
+                                }).await;
+
                                 let _ = gui_tx_brain.send(GuiUpdate::ClearConsole).await; // <-- TARGET 3 FIX
                                 let _ = gui_tx_brain.send(GuiUpdate::ConsoleLog(":: PLEXUS :: Semantic Vault Physically Reformatted.\n".into())).await;
                                 continue;
@@ -346,20 +378,46 @@ impl VeinHandler {
                                 }
                             }
                             let timestamp = Local::now().format("%H:%M:%S").to_string();
-                            if let Err(e) = disk.save_memory("user", &clean_memory_text, &timestamp, user_embedding.clone()) {
-                                eprintln!(":: PLEXUS :: Failed to save user memory: {}", e);
-                            }
+
+                            let disk_clone = Arc::clone(&disk);
+                            let clean_memory_clone = clean_memory_text.clone();
+                            let user_embedding_clone = user_embedding.clone();
+                            let timestamp_clone = timestamp.clone();
+
+                            // [UNAOS DIRECTIVE] A stalled reactor is a dead engine.
+                            // Offload the synchronous disk save operation.
+                            let _ = tokio::task::spawn_blocking(move || {
+                                if let Ok(mut locked_disk) = disk_clone.lock() {
+                                    if let Err(e) = locked_disk.save_memory("user", &clean_memory_clone, &timestamp_clone, user_embedding_clone) {
+                                        eprintln!(":: PLEXUS :: Failed to save user memory: {}", e);
+                                    }
+                                }
+                            }).await;
 
                             let mut retrieved_context = String::new();
                             if !user_embedding.is_empty() {
-                                match disk.search_memories(&user_embedding, 0.70) {
-                                    Ok(memories) => {
+                                let disk_clone = Arc::clone(&disk);
+                                let user_embedding_clone = user_embedding.clone();
+
+                                // [UNAOS DIRECTIVE] A stalled reactor is a dead engine.
+                                // Offload the synchronous disk search operation.
+                                let memories_result = tokio::task::spawn_blocking(move || {
+                                    if let Ok(mut locked_disk) = disk_clone.lock() {
+                                        locked_disk.search_memories(&user_embedding_clone, 0.70)
+                                    } else {
+                                        Err(anyhow::anyhow!("Mutex poisoned"))
+                                    }
+                                }).await;
+
+                                match memories_result {
+                                    Ok(Ok(memories)) => {
                                         if !memories.is_empty() {
                                             retrieved_context = memories.join("\n\n");
                                             info!(":: PLEXUS :: Recalled {} memories.", memories.len());
                                         }
                                     }
-                                    Err(e) => eprintln!(":: PLEXUS :: Recall Failed: {}", e),
+                                    Ok(Err(e)) => eprintln!(":: PLEXUS :: Recall Failed: {}", e),
+                                    Err(e) => eprintln!(":: PLEXUS :: Blocking Task Failed: {}", e),
                                 }
                             }
 
@@ -397,7 +455,17 @@ My role is similar to a Project Manager. I work with the Architect to produce Di
                             };
 
                             let mut context: Vec<Content> = Vec::new();
-                            let history = disk.load_all_memories().unwrap_or_default();
+
+                            // [UNAOS DIRECTIVE] A stalled reactor is a dead engine.
+                            // Offload the synchronous disk history load.
+                            let disk_clone = Arc::clone(&disk);
+                            let history = tokio::task::spawn_blocking(move || {
+                                if let Ok(mut locked_disk) = disk_clone.lock() {
+                                    locked_disk.load_all_memories().unwrap_or_default()
+                                } else {
+                                    Vec::new()
+                                }
+                            }).await.unwrap_or_default();
 
                             // Enforce strict memory bounds (Last 10 messages)
                             let skip_count = if history.len() > 10 { history.len() - 10 } else { 0 };

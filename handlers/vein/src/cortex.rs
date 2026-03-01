@@ -2,7 +2,7 @@ use crate::gravity::GravityWell;
 use unafs::io::MappedFile;
 use elessar::context::SkeletonGenerator;
 use gneiss_pal::io::MemoryMappedRegion;
-use bandy::SMessage;
+use bandy::{SMessage, MatrixEvent, SpatialNode, SpatialEdge};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -43,7 +43,7 @@ pub fn ingest_for_lumen(file_path: &Path) -> Result<String, String> {
 }
 
 /// The Background Indexer Task.
-/// It scans the workspace and builds the context.
+/// It scans the workspace, maps the topology, and builds the context.
 pub async fn run_indexer(root: PathBuf, tx: broadcast::Sender<SMessage>, telemetry_tx: async_channel::Sender<SMessage>) {
     let payload = scan_and_score(&root, &tx).await;
 
@@ -59,20 +59,39 @@ pub async fn run_indexer(root: PathBuf, tx: broadcast::Sender<SMessage>, telemet
 async fn scan_and_score(root: &Path, tx: &broadcast::Sender<SMessage>) -> Vec<bandy::WeightedSkeleton> {
     info!(":: CORTEX :: Indexing Workspace at {:?}", root);
 
-    // Naive scan for .rs files in libs/ and handlers/
-    // In a real implementation, we would use `elessar::context::WorkspaceIndexer`.
-    // Let's use it!
-
+    // 1. IGNITE THE INDEXER
+    // We use Elessar to build a DAG of the workspace crates.
     let mut indexer = elessar::context::WorkspaceIndexer::new();
     indexer.scan(root);
 
+    let mut spatial_nodes = Vec::new();
+    let mut spatial_edges = Vec::new();
     let mut skeleton_cache: HashMap<PathBuf, Arc<String>> = HashMap::new();
     let mut gravity = GravityWell::new();
     let mut total_skeletons = 0;
 
-    for (_crate_name, node) in indexer.nodes {
-        // Iterate over source files in the crate
-        // Assuming src/lib.rs or src/main.rs exists
+    // 2. EXTRACT TOPOLOGY & INGEST SKELETONS
+    for (crate_name, node) in &indexer.nodes {
+        // Map the Crate to a Spatial Node for the Matrix UI
+        spatial_nodes.push(SpatialNode {
+            id: crate_name.clone(),
+            kind: "crate".to_string(),
+            path: node.path.clone(),
+        });
+
+        // Map the dependencies to Spatial Edges
+        for dep in &node.dependencies {
+            // We only map edges to crates that exist within our local workspace DAG
+            if indexer.nodes.contains_key(dep) {
+                spatial_edges.push(SpatialEdge {
+                    from: crate_name.clone(),
+                    to: dep.clone(),
+                    relation: "depends_on".to_string(),
+                });
+            }
+        }
+
+        // Ingest the source files for this specific crate
         let src_dir = node.path.join("src");
         if src_dir.exists() {
             // Recursive walk to find all .rs files
@@ -100,8 +119,6 @@ async fn scan_and_score(root: &Path, tx: &broadcast::Sender<SMessage>) -> Vec<ba
                         total_skeletons += 1;
 
                         // Mock Heuristic for "Context Awareness":
-                        // If we encounter 'libs/bandy/src/lib.rs', we simulate user focus on it.
-                        // In the real system, this would come from `SMessage::FileEvent` or IDE state.
                         if file.to_string_lossy().contains("libs/bandy/src/lib.rs") {
                              gravity.set_focus(file.clone());
                         }
@@ -118,14 +135,20 @@ async fn scan_and_score(root: &Path, tx: &broadcast::Sender<SMessage>) -> Vec<ba
         }
     }
 
+    // 3. BROADCAST THE TOPOLOGY
+    // We fire the DAG across the nervous system so Matrix can render the 3D/List view immediately.
+    let _ = tx.send(SMessage::Matrix(MatrixEvent::IngestTopology {
+        nodes: spatial_nodes,
+        edges: spatial_edges,
+    }));
+
     let _ = tx.send(SMessage::Log {
         level: "INFO".to_string(),
         source: "Cortex".to_string(),
         content: format!("Workspace Indexed. Generated {} AST Skeletons.", total_skeletons),
     });
 
-    // === THE TELEMETRY COMPILER ===
+    // 4. COMPILE TELEMETRY
     // We calculate the gravitational pull of the current context.
-    // This filters the massive amount of raw data into a prioritized stream.
     gravity.calculate_scores(&skeleton_cache)
 }

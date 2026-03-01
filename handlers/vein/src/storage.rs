@@ -44,6 +44,13 @@ impl CortexStorage {
     }
 }
 
+/// The DiskManager is the synchronous guardian of the Semantic Vault.
+///
+/// ARCHITECTURAL NOTE (THE CAN-AM RULE):
+/// This struct is strictly synchronous. It performs heavy, blocking I/O via UnaFS.
+/// It MUST NEVER be called directly on the Tokio async reactor thread.
+/// The caller (e.g., `lib.rs`) must wrap instances of this in `Arc<std::sync::Mutex<DiskManager>>`
+/// and offload all method calls to `tokio::task::spawn_blocking`.
 pub struct DiskManager {
     pub fs: FileSystem,
 }
