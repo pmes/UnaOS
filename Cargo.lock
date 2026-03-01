@@ -5117,6 +5117,7 @@ dependencies = [
  "colored",
  "directories",
  "elessar",
+ "gneiss_pal",
  "ignore",
  "rayon",
  "regex",

@@ -61,6 +61,7 @@ pub enum Event {
     UploadRequest,         // Kept for compatibility
     FileSelected(PathBuf), // File Upload Selection
     ToggleSidebar,
+    LoadHistory,           // Fetch history when scrolling to top
     // --- ELESSAR EVENTS ---
     MatrixFileClick(PathBuf), // File Tree Click
     AuleIgnite,               // Forge Action

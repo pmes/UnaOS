@@ -1,5 +1,3 @@
-use std::path::Path;
-
 fn main() {
     #[cfg(all(not(target_os = "macos"), feature = "gtk"))]
     {

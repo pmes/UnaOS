@@ -19,3 +19,4 @@ blake3 = { version = "1.8", features = ["rayon", "mmap"] }
 # Internal Trinity
 elessar = { path = "../../../libs/elessar" }
 unafs = { path = "../../../libs/unafs" }
+gneiss_pal = { path = "../../../libs/gneiss_pal" }
