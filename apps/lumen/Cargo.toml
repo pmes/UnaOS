@@ -10,8 +10,8 @@ edition = "2024"
 
 [features]
 default = []
-gtk = ["vein/gtk", "quartzite/gtk"]
-gnome = ["vein/gnome", "quartzite/gnome"]
+gtk = ["quartzite/gtk"]
+gnome = ["quartzite/gnome"]
 
 [dependencies]
 # The Trinity Core
