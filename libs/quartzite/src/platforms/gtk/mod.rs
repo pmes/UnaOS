@@ -77,7 +77,7 @@ impl Backend {
 
             // Execute bootstrap if available
             if let Some(bootstrap) = bootstrap_option.borrow_mut().take() {
-                 let content: NativeView = (bootstrap)(window.upcast_ref());
+                 let content: NativeView = (bootstrap)(&window);
 
                 #[cfg(feature = "gnome")]
                 window.set_content(Some(&content));

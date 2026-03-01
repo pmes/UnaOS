@@ -7,6 +7,7 @@ edition = "2024"
 default = []
 gtk = ["dep:gtk4", "dep:glib", "dep:glib-sys", "dep:gobject-sys", "dep:sourceview5", "dep:libspelling", "dep:glib-build-tools"]
 gnome = ["dep:libadwaita", "gtk"]
+qt = [] # Reserves the Qt embassy feature flag for future *nix expansion
 
 [dependencies]
 gneiss_pal = { path = "../gneiss_pal" }

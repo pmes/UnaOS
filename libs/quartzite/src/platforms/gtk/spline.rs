@@ -8,7 +8,7 @@ use gtk4::{
     DropDown, Entry, EventControllerKey, Expander, FileDialog, FilterListModel, GestureClick,
     Image, Label, ListBox, ListItem, ListView, NoSelection, Orientation, Paned, PolicyType,
     Popover, PropagationPhase, Scale, ScrolledWindow, SignalListItemFactory, SingleSelection,
-    Spinner, Stack, StackSwitcher, StackTransitionType, StringList, StringObject, Switch,
+    Spinner, Stack, StackTransitionType, StringList, StringObject, Switch,
     ToggleButton, Widget, Window,
     gdk::{Key, ModifierType},
     gio,
@@ -36,19 +36,11 @@ fn enable_spelling(view: &SourceView) {
         adapter.set_enabled(true);
 
         // BIND NATIVE RIGHT-CLICK SUGGESTIONS
+        // UNAOS DIRECTIVE: GTK4 removed `populate-popup`. We use `set_extra_menu`.
+        // The host compositor will automatically and safely merge these suggestions
+        // with the native Copy/Paste/Select All context menu options.
         let menu = adapter.menu_model();
-        view.connect_populate_popup(move |_, popup| {
-            if let Some(popover) = popup.downcast_ref::<gtk4::PopoverMenu>() {
-                if let Some(model) = popover.menu_model() {
-                    let new_model = gio::Menu::new();
-                    // Append libspelling suggestions to the top
-                    new_model.append_section(None, &menu);
-                    // Append native items
-                    new_model.append_section(None, &model);
-                    popover.set_menu_model(Some(&new_model));
-                }
-            }
-        });
+        view.set_extra_menu(Some(&menu));
 
         unsafe {
             buffer.set_data("spell-adapter", SendWrapper(adapter));
