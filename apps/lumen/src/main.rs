@@ -1,25 +1,15 @@
 mod core;
 mod cortex;
-mod ui;
-
-#[cfg(target_os = "macos")]
-use crate::ui::macos_view::MacOSSpline;
 
 #[allow(unused_imports)]
 use bandy::{SMessage, Synapse, telemetry};
 use gneiss_pal::paths::UnaPaths;
 use quartzite::{self, Backend, NativeWindow, NativeView};
 use std::rc::Rc;
-#[cfg(target_os = "linux")]
-use crate::ui::view::CommsSpline;
 use vein::VeinHandler;
 #[allow(unused_imports)]
 use gneiss_pal::GuiUpdate;
 use gneiss_pal::AppHandler;
-
-// Platform-specific imports
-#[cfg(target_os = "linux")]
-use gtk4::prelude::*;
 
 fn main() {
     // 0. Ignite the Substrate Reactor (Tokio)
@@ -71,32 +61,16 @@ fn main() {
     });
 
     // 7. View & Engine Ignition
-    // On Linux, we use CommsSpline. On macOS, we use MacOSSpline.
-    #[cfg(target_os = "linux")]
-    let spline = Rc::new(CommsSpline::new());
-
-    #[cfg(target_os = "macos")]
-    let spline = Rc::new(MacOSSpline::new());
+    let spline = Rc::new(quartzite::Spline::new());
 
     // THE FUSION
     let bootstrap = move |window: &NativeWindow| -> NativeView {
         // 1. Get the Vein UI (The Command Center)
-
-        #[cfg(target_os = "linux")]
-        let vein_widget = spline.bootstrap(window, event_tx.clone(), gui_rx.clone());
-
-        #[cfg(target_os = "macos")]
         let vein_widget = spline.bootstrap(window, event_tx.clone(), gui_rx.clone());
 
         // 2. Create the HUD (ContextView) - DEPRECATED (Phase 4)
         // The "TeleHUD" sidebar tab is now the sole authorized telemetry view.
         // We simply return the vein_widget directly.
-        #[cfg(target_os = "linux")]
-        {
-            vein_widget
-        }
-
-        #[cfg(target_os = "macos")]
         vein_widget
     };
 

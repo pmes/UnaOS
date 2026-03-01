@@ -1,9 +1,9 @@
-// apps/lumen/src/ui/macos_view.rs
+// libs/quartzite/src/platforms/macos/spline.rs
 #![cfg(target_os = "macos")]
 
 use async_channel::{Receiver, Sender};
 use gneiss_pal::GuiUpdate;
-use quartzite::{Event, NativeView, NativeWindow};
+use crate::{Event, NativeView, NativeWindow};
 use objc2::msg_send;
 use objc2::rc::Retained;
 use objc2_app_kit::{NSView, NSTextView, NSScrollView, NSAutoresizingMaskOptions};

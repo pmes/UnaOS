@@ -7,10 +7,13 @@
 
 pub mod platforms;
 pub mod text;
+pub mod spline;
+pub mod widgets;
 
 // Re-export specific logic types that UI might need directly
 pub use gneiss_pal::shard::*;
 pub use gneiss_pal::types::*;
+pub use spline::Spline;
 
 // -----------------------------------------------------------------------------
 // THE DIPLOMAT'S BRIDGE: NATIVE ABSTRACTIONS

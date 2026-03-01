@@ -15,6 +15,8 @@ use std::time::Instant;
 
 use crate::{NativeWindow, NativeView};
 
+pub mod spline;
+
 pub struct Backend {
     #[cfg(feature = "gnome")]
     app: adw::Application,
