@@ -1,7 +1,7 @@
 use ab_glyph::{Font, FontRef, PxScale, ScaleFont, point};
 
 // Embed the font data
-const FONT_DATA: &[u8] = include_bytes!("../assets/Hack-Regular.ttf");
+const FONT_DATA: &[u8] = include_bytes!("assets/Hack-Regular.ttf");
 
 pub fn get_font() -> FontRef<'static> {
     FontRef::try_from_slice(FONT_DATA).expect("Error loading embedded font")
