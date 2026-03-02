@@ -71,7 +71,6 @@ impl CommsSpline {
         tx_event: async_channel::Sender<Event>,
         rx: Receiver<GuiUpdate>,
     ) -> crate::NativeView {
-        window.set_title(Some("Vein (Trinity Architecture)"));
 
         let bottom_left = Box::new(Orientation::Horizontal, 0);
         bottom_left.add_css_class("toolbar");
@@ -177,8 +176,13 @@ impl CommsSpline {
         left_vbox.set_width_request(260);
 
         let left_header = HeaderBar::builder().show_title_buttons(false).build();
-        left_vbox.append(&left_header);
-        left_vbox.append(&bottom_left);
+
+        let left_mega_bar = Box::new(Orientation::Vertical, 0);
+        left_mega_bar.add_css_class("titlebar");
+        left_mega_bar.append(&left_header);
+        left_mega_bar.append(&bottom_left);
+
+        left_vbox.append(&left_mega_bar);
 
         // Sidebar Content
         let sidebar_box = Box::new(Orientation::Vertical, 0);
@@ -538,8 +542,12 @@ impl CommsSpline {
         command_header_bar.set_title_widget(Some(&Label::new(Some("Lumen"))));
         command_header_bar.pack_start(&status_group);
 
-        right_vbox.prepend(&bottom_right);
-        right_vbox.prepend(&command_header_bar);
+        let right_mega_bar = Box::new(Orientation::Vertical, 0);
+        right_mega_bar.add_css_class("titlebar");
+        right_mega_bar.append(&command_header_bar);
+        right_mega_bar.append(&bottom_right);
+
+        right_vbox.prepend(&right_mega_bar);
 
         // Quadrant 4: Bottom Right Tabs
         let tab_comms = ToggleButton::builder().label("Comms").css_classes(vec!["flat", "builder-tab"]).active(true).build();

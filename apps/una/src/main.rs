@@ -54,17 +54,25 @@ fn main() -> Result<()> {
         let matrix_widget = create_matrix_view(tx_brain.clone(), &cwd);
         left_stack.add_titled(&matrix_widget, Some("matrix"), "Matrix");
 
-        let left_switcher = StackSwitcher::builder().stack(&left_stack).build();
+        let left_switcher = StackSwitcher::builder()
+            .stack(&left_stack)
+            .halign(gtk4::Align::Center)
+            .hexpand(true)
+            .build();
         let left_toolbar = Box::new(Orientation::Horizontal, 0);
         left_toolbar.add_css_class("toolbar");
         left_toolbar.append(&left_switcher);
 
         let left_header = HeaderBar::builder().show_title_buttons(false).build();
 
+        let left_mega_bar = Box::new(Orientation::Vertical, 0);
+        left_mega_bar.add_css_class("titlebar");
+        left_mega_bar.append(&left_header);
+        left_mega_bar.append(&left_toolbar);
+
         let left_vbox = Box::new(Orientation::Vertical, 0);
         left_vbox.set_width_request(260);
-        left_vbox.append(&left_header);
-        left_vbox.append(&left_toolbar);
+        left_vbox.append(&left_mega_bar);
         left_vbox.append(&left_stack);
 
 
@@ -79,17 +87,26 @@ fn main() -> Result<()> {
         let tabula_widget = tabula.borrow().widget();
         right_stack.add_titled(&tabula_widget, Some("tabula"), "Editor");
 
-        let right_switcher = StackSwitcher::builder().stack(&right_stack).build();
+        let right_switcher = StackSwitcher::builder()
+            .stack(&right_stack)
+            .halign(gtk4::Align::Center)
+            .hexpand(true)
+            .build();
         let right_toolbar = Box::new(Orientation::Horizontal, 0);
         right_toolbar.add_css_class("toolbar");
         right_toolbar.append(&right_switcher);
 
         let right_header = HeaderBar::builder().show_title_buttons(true).build();
+        right_header.set_title_widget(Some(&gtk4::Label::new(Some("Una"))));
+
+        let right_mega_bar = Box::new(Orientation::Vertical, 0);
+        right_mega_bar.add_css_class("titlebar");
+        right_mega_bar.append(&right_header);
+        right_mega_bar.append(&right_toolbar);
 
         let right_vbox = Box::new(Orientation::Vertical, 0);
         right_vbox.set_hexpand(true);
-        right_vbox.append(&right_header);
-        right_vbox.append(&right_toolbar);
+        right_vbox.append(&right_mega_bar);
         right_vbox.append(&right_stack);
 
         // 5. THE MASTER LAYOUT
