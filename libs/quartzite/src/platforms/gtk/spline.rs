@@ -8,12 +8,14 @@ use gtk4::{
     DropDown, Entry, EventControllerKey, Expander, FileDialog, FilterListModel, GestureClick,
     Image, Label, ListBox, ListItem, ListView, NoSelection, Orientation, Paned, PolicyType,
     Popover, PropagationPhase, Scale, ScrolledWindow, SignalListItemFactory, SingleSelection,
-    Spinner, Stack, StackTransitionType, StringList, StringObject, Switch,
-    ToggleButton, Widget, Window,
+    Spinner, Stack, StackSwitcher, StackTransitionType, StringList, StringObject, Switch,
+    ToggleButton, Widget, Window, Separator,
     gdk::{Key, ModifierType},
     gio,
     glib,
 };
+#[cfg(feature = "gnome")]
+use libadwaita as adw;
 use libspelling;
 use sourceview5::View as SourceView;
 use sourceview5::prelude::*;
@@ -72,13 +74,6 @@ impl CommsSpline {
         rx: Receiver<GuiUpdate>,
     ) -> crate::NativeView {
 
-        let bottom_left = Box::new(Orientation::Horizontal, 0);
-        bottom_left.add_css_class("toolbar");
-        bottom_left.set_halign(Align::Center);
-
-        let bottom_right = Box::new(Orientation::Horizontal, 0);
-        bottom_right.add_css_class("toolbar");
-        bottom_right.set_halign(Align::Center);
 
         // 1. Nodes Tab Rename
         let store = gio::ListStore::new::<StringObject>();
@@ -169,28 +164,49 @@ impl CommsSpline {
         main_h_paned.set_shrink_start_child(false);
         main_h_paned.set_resize_start_child(false);
 
-        // --- Left Pane (The Silhouette) ---
+        #[cfg(not(feature = "gnome"))]
         let left_vbox = Box::new(Orientation::Vertical, 0);
+        #[cfg(not(feature = "gnome"))]
         left_vbox.add_css_class("background");
+        #[cfg(not(feature = "gnome"))]
         left_vbox.add_css_class("navigation-sidebar");
+        #[cfg(not(feature = "gnome"))]
         left_vbox.set_width_request(260);
 
-        let left_header = HeaderBar::builder().show_title_buttons(false).build();
+        #[cfg(feature = "gnome")]
+        let left_toolbar = adw::ToolbarView::new();
+        #[cfg(feature = "gnome")]
+        left_toolbar.add_css_class("background");
+        #[cfg(feature = "gnome")]
+        left_toolbar.add_css_class("navigation-sidebar");
+        #[cfg(feature = "gnome")]
+        left_toolbar.set_width_request(260);
 
-        let left_mega_bar = Box::new(Orientation::Vertical, 0);
-        left_mega_bar.add_css_class("titlebar");
-        left_mega_bar.append(&left_header);
-        left_mega_bar.append(&bottom_left);
+        #[cfg(feature = "gnome")]
+        let left_header = adw::HeaderBar::builder()
+            .show_end_title_buttons(false)
+            .build();
 
-        left_vbox.append(&left_mega_bar);
+        #[cfg(feature = "gnome")]
+        let left_tab_view = adw::TabView::new();
+        #[cfg(feature = "gnome")]
+        let left_tab_bar = adw::TabBar::new();
+        #[cfg(feature = "gnome")]
+        left_tab_bar.set_view(Some(&left_tab_view));
 
-        // Sidebar Content
-        let sidebar_box = Box::new(Orientation::Vertical, 0);
-        sidebar_box.set_vexpand(true);
+        #[cfg(feature = "gnome")]
+        left_toolbar.add_top_bar(&left_header);
+        #[cfg(feature = "gnome")]
+        left_toolbar.add_top_bar(&left_tab_bar);
+        #[cfg(feature = "gnome")]
+        left_toolbar.set_content(Some(&left_tab_view));
 
-        let sidebar_stack = Stack::new();
-        sidebar_stack.set_vexpand(true);
-        sidebar_stack.set_transition_type(StackTransitionType::SlideLeftRight);
+        #[cfg(not(feature = "gnome"))]
+        let left_stack = Stack::new();
+        #[cfg(not(feature = "gnome"))]
+        left_stack.set_vexpand(true);
+        #[cfg(not(feature = "gnome"))]
+        left_stack.set_transition_type(StackTransitionType::SlideLeftRight);
 
         // 1. Nodes Tab
         let store = gio::ListStore::new::<StringObject>();
@@ -362,7 +378,14 @@ impl CommsSpline {
         node_actions_box.append(&composer_btn);
         nodes_box.append(&node_actions_box);
 
-        sidebar_stack.add_titled(&nodes_box, Some("nodes"), "Nodes");
+        #[cfg(feature = "gnome")]
+        {
+            left_tab_view.append(&nodes_box);
+            let page = left_tab_view.page(&nodes_box);
+            page.set_title("Nodes");
+        }
+        #[cfg(not(feature = "gnome"))]
+        left_stack.add_titled(&nodes_box, Some("nodes"), "Nodes");
 
         // 2. THE NEXUS Tab
         let nexus_box = Box::new(Orientation::Vertical, 0);
@@ -442,7 +465,14 @@ impl CommsSpline {
 
 
         nexus_box.append(&nexus_list);
-        sidebar_stack.add_titled(&nexus_box, Some("nexus"), "Nexus");
+        #[cfg(feature = "gnome")]
+        {
+            left_tab_view.append(&nexus_box);
+            let page = left_tab_view.page(&nexus_box);
+            page.set_title("Nexus");
+        }
+        #[cfg(not(feature = "gnome"))]
+        left_stack.add_titled(&nexus_box, Some("nexus"), "Nexus");
 
         // 3. THE TeleHUD Tab (New Phase 3)
         let telehud_box = Box::new(Orientation::Vertical, 12);
@@ -468,22 +498,45 @@ impl CommsSpline {
         context_list.append(&Label::new(Some("handlers/vein/src/lib.rs (0.80)")));
         telehud_box.append(&context_list);
 
-        sidebar_stack.add_titled(&telehud_box, Some("telehud"), "TeleHUD");
+        #[cfg(feature = "gnome")]
+        {
+            left_tab_view.append(&telehud_box);
+            let page = left_tab_view.page(&telehud_box);
+            page.set_title("TeleHUD");
+        }
+        #[cfg(not(feature = "gnome"))]
+        left_stack.add_titled(&telehud_box, Some("telehud"), "TeleHUD");
 
-        sidebar_box.append(&sidebar_stack);
+        #[cfg(not(feature = "gnome"))]
+        {
+            let left_switcher = StackSwitcher::builder()
+                .stack(&left_stack)
+                .halign(gtk4::Align::Center)
+                .hexpand(true)
+                .build();
+            let left_toolbar_box = Box::new(Orientation::Horizontal, 0);
+            left_toolbar_box.add_css_class("toolbar");
+            left_toolbar_box.append(&left_switcher);
+            left_vbox.append(&left_toolbar_box);
+            left_vbox.append(&left_stack);
+            main_h_paned.set_start_child(Some(&left_vbox));
+        }
 
-        // (Sidebar Switcher logic replaced by Custom Builder Tabs)
-
-        left_vbox.append(&sidebar_box);
-        main_h_paned.set_start_child(Some(&left_vbox));
+        #[cfg(feature = "gnome")]
+        main_h_paned.set_start_child(Some(&left_toolbar));
 
         // --- Right Pane (The Command Center) ---
+        #[cfg(not(feature = "gnome"))]
         let right_vbox = Box::new(Orientation::Vertical, 0);
+        #[cfg(not(feature = "gnome"))]
         right_vbox.set_hexpand(true);
 
         // === THE WORKSPACE STACK ===
+        #[cfg(not(feature = "gnome"))]
         let workspace_stack = Stack::new();
+        #[cfg(not(feature = "gnome"))]
         workspace_stack.set_vexpand(true);
+        #[cfg(not(feature = "gnome"))]
         workspace_stack.set_transition_type(StackTransitionType::SlideLeftRight);
 
         // --- PAGE 1: COMMS (The Original Chat View) ---
@@ -520,46 +573,38 @@ impl CommsSpline {
             }
         });
 
-        // 4-Quadrant Appends
-        // Quadrant 2: Bottom Left Tabs
-        let tab_nodes = ToggleButton::builder().label("Nodes").css_classes(vec!["flat", "builder-tab"]).active(true).build();
-        let tab_nexus = ToggleButton::builder().label("Nexus").css_classes(vec!["flat", "builder-tab"]).group(&tab_nodes).build();
-        let tab_telehud = ToggleButton::builder().label("TeleHUD").css_classes(vec!["flat", "builder-tab"]).group(&tab_nodes).build();
-
-        let sidebar_stack_clone1 = sidebar_stack.clone();
-        tab_nodes.connect_toggled(move |btn| { if btn.is_active() { sidebar_stack_clone1.set_visible_child_name("nodes"); } });
-        let sidebar_stack_clone2 = sidebar_stack.clone();
-        tab_nexus.connect_toggled(move |btn| { if btn.is_active() { sidebar_stack_clone2.set_visible_child_name("nexus"); } });
-        let sidebar_stack_clone3 = sidebar_stack.clone();
-        tab_telehud.connect_toggled(move |btn| { if btn.is_active() { sidebar_stack_clone3.set_visible_child_name("telehud"); } });
-
-        bottom_left.append(&tab_nodes);
-        bottom_left.append(&tab_nexus);
-        bottom_left.append(&tab_telehud);
-
-        // Right side layout requires status group on top
-        let command_header_bar = HeaderBar::builder().show_title_buttons(true).build();
+        // 4. THE WORKSPACE (Right Pane)
+        #[cfg(feature = "gnome")]
+        let right_toolbar = adw::ToolbarView::new();
+        #[cfg(feature = "gnome")]
+        let command_header_bar = adw::HeaderBar::builder()
+            .show_start_title_buttons(false)
+            .build();
+        #[cfg(feature = "gnome")]
         command_header_bar.set_title_widget(Some(&Label::new(Some("Lumen"))));
+        #[cfg(feature = "gnome")]
         command_header_bar.pack_start(&status_group);
 
-        let right_mega_bar = Box::new(Orientation::Vertical, 0);
-        right_mega_bar.add_css_class("titlebar");
-        right_mega_bar.append(&command_header_bar);
-        right_mega_bar.append(&bottom_right);
+        #[cfg(feature = "gnome")]
+        let right_tab_view = adw::TabView::new();
+        #[cfg(feature = "gnome")]
+        let right_tab_bar = adw::TabBar::new();
+        #[cfg(feature = "gnome")]
+        right_tab_bar.set_view(Some(&right_tab_view));
 
-        right_vbox.prepend(&right_mega_bar);
+        #[cfg(feature = "gnome")]
+        right_tab_view.append(&comms_page);
+        #[cfg(feature = "gnome")]
+        let comms_page_ref = right_tab_view.page(&comms_page);
+        #[cfg(feature = "gnome")]
+        comms_page_ref.set_title("Comms");
 
-        // Quadrant 4: Bottom Right Tabs
-        let tab_comms = ToggleButton::builder().label("Comms").css_classes(vec!["flat", "builder-tab"]).active(true).build();
-        let tab_editor = ToggleButton::builder().label("Payload Editor").css_classes(vec!["flat", "builder-tab"]).group(&tab_comms).build();
-
-        let workspace_stack_clone1 = workspace_stack.clone();
-        tab_comms.connect_toggled(move |btn| { if btn.is_active() { workspace_stack_clone1.set_visible_child_name("comms"); } });
-        let workspace_stack_clone2 = workspace_stack.clone();
-        tab_editor.connect_toggled(move |btn| { if btn.is_active() { workspace_stack_clone2.set_visible_child_name("editor"); } });
-
-        bottom_right.append(&tab_comms);
-        bottom_right.append(&tab_editor);
+        #[cfg(feature = "gnome")]
+        right_toolbar.add_top_bar(&command_header_bar);
+        #[cfg(feature = "gnome")]
+        right_toolbar.add_top_bar(&right_tab_bar);
+        #[cfg(feature = "gnome")]
+        right_toolbar.set_content(Some(&right_tab_view));
 
 
         // Console ListView
@@ -922,6 +967,8 @@ impl CommsSpline {
 
         main_paned.set_end_child(Some(&input_container));
         comms_page.append(&main_paned);
+
+        #[cfg(not(feature = "gnome"))]
         workspace_stack.add_titled(&comms_page, Some("comms"), "Comms");
 
         // --- PAGE 2: PAYLOAD EDITOR (The Interceptor) ---
@@ -1000,14 +1047,50 @@ impl CommsSpline {
         control_box.append(&btn_transmit);
         payload_page.append(&control_box);
 
-        workspace_stack.add_titled(&payload_page, Some("editor"), "Payload Editor");
+        #[cfg(feature = "gnome")]
+        {
+            right_tab_view.append(&payload_page);
+            let page = right_tab_view.page(&payload_page);
+            page.set_title("Payload Editor");
+        }
 
-        right_vbox.append(&workspace_stack);
-        main_h_paned.set_end_child(Some(&right_vbox));
+        #[cfg(not(feature = "gnome"))]
+        {
+            workspace_stack.add_titled(&payload_page, Some("editor"), "Payload Editor");
+
+            let right_switcher = StackSwitcher::builder()
+                .stack(&workspace_stack)
+                .halign(gtk4::Align::Center)
+                .hexpand(true)
+                .build();
+            let right_toolbar_box = Box::new(Orientation::Horizontal, 0);
+            right_toolbar_box.add_css_class("toolbar");
+            right_toolbar_box.append(&right_switcher);
+
+            // Re-add status group in pure GTK fallback since it was not appended to adw::HeaderBar
+            let fallback_header_container = Box::new(Orientation::Horizontal, 0);
+            fallback_header_container.add_css_class("titlebar");
+            fallback_header_container.append(&status_group);
+
+            right_vbox.append(&fallback_header_container);
+            right_vbox.append(&right_toolbar_box);
+            right_vbox.append(&workspace_stack);
+
+            main_h_paned.set_end_child(Some(&right_vbox));
+        }
+
+        #[cfg(feature = "gnome")]
+        main_h_paned.set_end_child(Some(&right_toolbar));
 
         let left_vbox_clone = left_vbox.clone();
+        #[cfg(feature = "gnome")]
+        let left_toolbar_clone = left_toolbar.clone();
+
         sidebar_toggle.connect_toggled(move |btn| {
+            #[cfg(not(feature = "gnome"))]
             left_vbox_clone.set_visible(btn.is_active());
+            #[cfg(feature = "gnome")]
+            left_toolbar_clone.set_visible(btn.is_active());
         });
 
         // Phase 3: Real-Time Dynamic Theme Listening
@@ -1156,6 +1239,28 @@ impl CommsSpline {
         // === FIX: HARDWIRE NEXUS SELECTION ===
         if let Some(row) = nexus_list.row_at_index(1) {
             nexus_list.select_row(Some(&row));
+        }
+
+        #[cfg(not(feature = "gnome"))]
+        {
+            let title_box = Box::new(Orientation::Horizontal, 0);
+
+            let fallback_left_header = HeaderBar::builder().show_title_buttons(false).build();
+            let fallback_separator = Separator::new(Orientation::Vertical);
+            let fallback_right_header = HeaderBar::builder().show_title_buttons(true).build();
+            fallback_right_header.set_title_widget(Some(&Label::new(Some("Lumen"))));
+            fallback_right_header.set_hexpand(true);
+
+            title_box.append(&fallback_left_header);
+            title_box.append(&fallback_separator);
+            title_box.append(&fallback_right_header);
+
+            window.set_titlebar(Some(&title_box));
+
+            main_h_paned.connect_position_notify(move |p| {
+                let pos = p.position();
+                fallback_left_header.set_width_request(pos);
+            });
         }
 
         main_h_paned.upcast::<Widget>()

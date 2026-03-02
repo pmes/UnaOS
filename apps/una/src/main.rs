@@ -1,9 +1,8 @@
 use anyhow::Result;
 use gtk4::prelude::*;
-use gtk4::{
-    Box, HeaderBar, Orientation, Paned, Stack, StackSwitcher,
-    StackTransitionType,
-};
+use gtk4::{Box, HeaderBar, Orientation, Paned, Stack, StackSwitcher, StackTransitionType, Separator};
+#[cfg(feature = "gnome")]
+use libadwaita as adw;
 use std::cell::RefCell;
 use std::env;
 use std::rc::Rc;
@@ -45,80 +44,134 @@ fn main() -> Result<()> {
     let cwd = env::current_dir().unwrap_or_default();
 
     // THE FUSION
-    let bootstrap = move |_window: &NativeWindow| -> NativeView {
-        // 3. THE SIDEBAR (Left Pane)
-        let left_stack = Stack::new();
-        left_stack.set_vexpand(true);
-        left_stack.set_transition_type(StackTransitionType::SlideLeftRight);
-
-        let matrix_widget = create_matrix_view(tx_brain.clone(), &cwd);
-        left_stack.add_titled(&matrix_widget, Some("matrix"), "Matrix");
-
-        let left_switcher = StackSwitcher::builder()
-            .stack(&left_stack)
-            .halign(gtk4::Align::Center)
-            .hexpand(true)
-            .build();
-        let left_toolbar = Box::new(Orientation::Horizontal, 0);
-        left_toolbar.add_css_class("toolbar");
-        left_toolbar.append(&left_switcher);
-
-        let left_header = HeaderBar::builder().show_title_buttons(false).build();
-
-        let left_mega_bar = Box::new(Orientation::Vertical, 0);
-        left_mega_bar.add_css_class("titlebar");
-        left_mega_bar.append(&left_header);
-        left_mega_bar.append(&left_toolbar);
-
-        let left_vbox = Box::new(Orientation::Vertical, 0);
-        left_vbox.set_width_request(260);
-        left_vbox.append(&left_mega_bar);
-        left_vbox.append(&left_stack);
-
-
-        // 4. THE WORKSPACE (Right Pane)
-        let right_stack = Stack::new();
-        right_stack.set_vexpand(true);
-        right_stack.set_transition_type(StackTransitionType::SlideLeftRight);
-
+    let bootstrap = move |window: &NativeWindow| -> NativeView {
         let tabula = Rc::new(RefCell::new(TabulaView::new(EditorMode::Code(
             "rust".to_string(),
         ))));
         let tabula_widget = tabula.borrow().widget();
-        right_stack.add_titled(&tabula_widget, Some("tabula"), "Editor");
 
-        let right_switcher = StackSwitcher::builder()
-            .stack(&right_stack)
-            .halign(gtk4::Align::Center)
-            .hexpand(true)
-            .build();
-        let right_toolbar = Box::new(Orientation::Horizontal, 0);
-        right_toolbar.add_css_class("toolbar");
-        right_toolbar.append(&right_switcher);
+        let matrix_widget = create_matrix_view(tx_brain.clone(), &cwd);
 
-        let right_header = HeaderBar::builder().show_title_buttons(true).build();
-        right_header.set_title_widget(Some(&gtk4::Label::new(Some("Una"))));
+        #[cfg(feature = "gnome")]
+        let view = {
+            // 3. THE SIDEBAR (Left Pane)
+            let left_toolbar = adw::ToolbarView::new();
+            let left_header = adw::HeaderBar::builder()
+                .show_end_title_buttons(false)
+                .build();
+            let left_tab_view = adw::TabView::new();
+            let left_tab_bar = adw::TabBar::new();
+            left_tab_bar.set_view(Some(&left_tab_view));
 
-        let right_mega_bar = Box::new(Orientation::Vertical, 0);
-        right_mega_bar.add_css_class("titlebar");
-        right_mega_bar.append(&right_header);
-        right_mega_bar.append(&right_toolbar);
+            left_tab_view.append(&matrix_widget);
+            let left_page = left_tab_view.page(&matrix_widget);
+            left_page.set_title("Matrix");
 
-        let right_vbox = Box::new(Orientation::Vertical, 0);
-        right_vbox.set_hexpand(true);
-        right_vbox.append(&right_mega_bar);
-        right_vbox.append(&right_stack);
+            left_toolbar.add_top_bar(&left_header);
+            left_toolbar.add_top_bar(&left_tab_bar);
+            left_toolbar.set_content(Some(&left_tab_view));
 
-        // 5. THE MASTER LAYOUT
-        let main_paned = Paned::builder()
-            .orientation(Orientation::Horizontal)
-            .start_child(&left_vbox)
-            .end_child(&right_vbox)
-            .position(260)
-            .resize_start_child(false)
-            .shrink_start_child(false)
-            .wide_handle(true)
-            .build();
+
+            // 4. THE WORKSPACE (Right Pane)
+            let right_toolbar = adw::ToolbarView::new();
+            let right_header = adw::HeaderBar::builder()
+                .show_start_title_buttons(false)
+                .build();
+            right_header.set_title_widget(Some(&gtk4::Label::new(Some("Una"))));
+
+            let right_tab_view = adw::TabView::new();
+            let right_tab_bar = adw::TabBar::new();
+            right_tab_bar.set_view(Some(&right_tab_view));
+
+            right_tab_view.append(&tabula_widget);
+            let right_page = right_tab_view.page(&tabula_widget);
+            right_page.set_title("Editor");
+
+            right_toolbar.add_top_bar(&right_header);
+            right_toolbar.add_top_bar(&right_tab_bar);
+            right_toolbar.set_content(Some(&right_tab_view));
+
+            // 5. THE MASTER LAYOUT
+            let main_paned = Paned::builder()
+                .orientation(Orientation::Horizontal)
+                .start_child(&left_toolbar)
+                .end_child(&right_toolbar)
+                .position(260)
+                .resize_start_child(false)
+                .shrink_start_child(false)
+                .wide_handle(true)
+                .build();
+            main_paned.upcast::<gtk4::Widget>()
+        };
+
+        #[cfg(not(feature = "gnome"))]
+        let view = {
+            // --- Pure GTK4 Fallback ---
+            let title_box = Box::new(Orientation::Horizontal, 0);
+
+            let left_header = HeaderBar::builder().show_title_buttons(false).build();
+            let separator = Separator::new(Orientation::Vertical);
+            let right_header = HeaderBar::builder().show_title_buttons(true).build();
+            right_header.set_title_widget(Some(&gtk4::Label::new(Some("Una"))));
+            right_header.set_hexpand(true);
+
+            title_box.append(&left_header);
+            title_box.append(&separator);
+            title_box.append(&right_header);
+
+            window.set_titlebar(Some(&title_box));
+
+            // Inner Workspaces
+            let left_stack = Stack::new();
+            left_stack.set_vexpand(true);
+            left_stack.set_transition_type(StackTransitionType::SlideLeftRight);
+            left_stack.add_titled(&matrix_widget, Some("matrix"), "Matrix");
+            let left_switcher = StackSwitcher::builder()
+                .stack(&left_stack)
+                .halign(gtk4::Align::Center)
+                .hexpand(true)
+                .build();
+            let left_toolbar = Box::new(Orientation::Horizontal, 0);
+            left_toolbar.add_css_class("toolbar");
+            left_toolbar.append(&left_switcher);
+            let left_vbox = Box::new(Orientation::Vertical, 0);
+            left_vbox.append(&left_toolbar);
+            left_vbox.append(&left_stack);
+
+            let right_stack = Stack::new();
+            right_stack.set_vexpand(true);
+            right_stack.set_transition_type(StackTransitionType::SlideLeftRight);
+            right_stack.add_titled(&tabula_widget, Some("tabula"), "Editor");
+            let right_switcher = StackSwitcher::builder()
+                .stack(&right_stack)
+                .halign(gtk4::Align::Center)
+                .hexpand(true)
+                .build();
+            let right_toolbar = Box::new(Orientation::Horizontal, 0);
+            right_toolbar.add_css_class("toolbar");
+            right_toolbar.append(&right_switcher);
+            let right_vbox = Box::new(Orientation::Vertical, 0);
+            right_vbox.append(&right_toolbar);
+            right_vbox.append(&right_stack);
+
+            let main_paned = Paned::builder()
+                .orientation(Orientation::Horizontal)
+                .start_child(&left_vbox)
+                .end_child(&right_vbox)
+                .position(260)
+                .resize_start_child(false)
+                .shrink_start_child(false)
+                .wide_handle(true)
+                .build();
+
+            // The Synchronization Trick
+            main_paned.connect_position_notify(move |p| {
+                let pos = p.position();
+                left_header.set_width_request(pos);
+            });
+
+            main_paned.upcast::<gtk4::Widget>()
+        };
 
         // 6. WIRE THE REFLEX ARC (UI Receiver Loop)
         let tabula_clone = tabula.clone();
@@ -135,7 +188,7 @@ fn main() -> Result<()> {
             }
         });
 
-        main_paned.upcast::<gtk4::Widget>()
+        view
     };
 
     // 7. Ignite Quartzite

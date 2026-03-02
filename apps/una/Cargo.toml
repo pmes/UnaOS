@@ -12,6 +12,7 @@ gnome = ["quartzite/gnome"]
 anyhow = "1.0"
 gtk4 = { version = "0.10.3", features = ["v4_16", "v4_18"] }
 glib = "0.21"
+libadwaita = { version = "0.8.1", features = ["v1_4", "v1_5"] }
 
 # The Trinity Core
 quartzite = { path = "../../libs/quartzite", default-features = false }
