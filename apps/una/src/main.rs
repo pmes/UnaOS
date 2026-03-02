@@ -45,11 +45,7 @@ fn main() -> Result<()> {
     let cwd = env::current_dir().unwrap_or_default();
 
     // THE FUSION
-    let bootstrap = move |window: &NativeWindow| -> NativeView {
-        // Prevent GTK from drawing its default top titlebar
-        let dummy_titlebar = gtk4::Box::new(Orientation::Horizontal, 0);
-        window.set_titlebar(Some(&dummy_titlebar));
-
+    let bootstrap = move |_window: &NativeWindow| -> NativeView {
         // 3. THE SIDEBAR (Left Pane)
         let left_stack = Stack::new();
         left_stack.set_vexpand(true);
