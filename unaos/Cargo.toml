@@ -4,6 +4,7 @@ members = [
     "crates/compat",
     "crates/kernel",
     "crates/loader",
+    "crates/net",
     "crates/userspace",
 ]
 resolver = "2"
