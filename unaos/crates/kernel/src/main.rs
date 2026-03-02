@@ -30,7 +30,10 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     serial_println!(":: KERNEL HEAP ALLOCATED ::");
 
     // 4. Motherboard Hardware Interconnects
-    unaos_kernel::pci::PciScanner::scan();
+    if let Some(xhci_phys_addr) = unaos_kernel::pci::PciScanner::scan() {
+        let xhci_virt_addr = phys_offset + xhci_phys_addr;
+        unaos_kernel::xhci::init(xhci_virt_addr, &mut mapper);
+    }
 
     // 5. Framebuffer Init
     if let Some(framebuffer) = boot_info.framebuffer.as_mut() {

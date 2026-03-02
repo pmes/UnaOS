@@ -82,11 +82,13 @@ impl PciScanner {
         None
     }
 
-    pub fn scan() {
+    pub fn scan() -> Option<u64> {
         if let Some(addr) = Self::enumerate_buses() {
             serial_println!("[PCI] FOUND XHCI CONTROLLER AT PHYSICAL ADDRESS: 0x{:X}", addr);
+            Some(addr)
         } else {
             serial_println!("[PCI] WARNING: XHCI CONTROLLER NOT FOUND");
+            None
         }
     }
 

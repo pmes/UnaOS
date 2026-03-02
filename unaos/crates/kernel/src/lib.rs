@@ -18,14 +18,8 @@ pub mod console;
 pub mod user;
 pub mod vug;
 
-// Stubs
-pub mod pci {
-    pub struct PciScanner;
-    impl PciScanner {
-        pub fn scan() {}
-    }
-}
-pub mod xhci {}
+pub mod pci;
+pub mod xhci;
 
 pub fn init() {
     gdt::init();
