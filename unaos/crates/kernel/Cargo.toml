@@ -5,7 +5,8 @@ edition = "2024"
 
 [dependencies]
 # CORE
-bootloader = "0.9.23"
+bootloader = "0.11.14"
+bootloader_api = "0.11.14"
 serde = { version = "1.0", default-features = false, features = ["derive"] }
 
 # FIX: Use 'spin_no_std' to explicitly disable Standard Library usage

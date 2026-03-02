@@ -3,30 +3,28 @@
 
 extern crate alloc;
 
-use bootloader::{entry_point, BootInfo};
+use bootloader_api::{entry_point, BootInfo};
 use core::panic::PanicInfo;
-// Removed VirtAddr for now to simplify the boot path
 use unaos_kernel::serial_println;
 
 // ENTRY POINT
 entry_point!(kernel_main);
 
-fn kernel_main(boot_info: &'static BootInfo) -> ! {
+fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     // 1. Core Hardware Init (GDT, IDT, PICS)
     unaos_kernel::init();
 
     // 2. Serial Verification
-    // We skip complex memory mapping for this specific heartbeat test
-    // because bootloader 0.9.x fields vary by environment.
-    serial_println!(":: UnaOS Kernel Initialized ::");
-    serial_println!(":: Status: ONLINE ::");
-    serial_println!(":: Architect Verified ::");
+    serial_println!(":: UNAOS KERNEL AWAKE ::");
 
-    // 3. Memory Map Telemetry (Optional Diagnostic)
-    serial_println!(
-        ":: Memory Regions Detected: {} ::",
-        boot_info.memory_map.iter().count()
-    );
+    // 3. Framebuffer Init
+    if let Some(framebuffer) = boot_info.framebuffer.as_mut() {
+        let info = framebuffer.info();
+        let buffer = framebuffer.buffer_mut();
+        unaos_kernel::vug::init(buffer, info);
+    } else {
+        serial_println!(":: WARNING: No framebuffer detected ::");
+    }
 
     loop {
         // Halt the CPU until the next interrupt
