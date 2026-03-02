@@ -1,0 +1,3 @@
+## 2025-03-02 - [PCI Bus Scanner & Thread Safety]
+**Anomaly:** The PCI Configuration Access Mechanism (CAM) utilizes a two-step read via CPU ports 0xCF8 (Address) and 0xCFC (Data). Running this inline is subject to race conditions if a hardware interrupt fires between the address setup and the data read.
+**Resolution:** Encapsulated the Port access behind a globally static `spin::Mutex<PciPort>`. To completely eliminate deadlocks, the `.lock()` operation is executed exclusively inside an `x86_64::instructions::interrupts::without_interrupts` closure. Successfully discovered the Intel XHCI controller by parsing multi-function headers and matching Class 0x0C, Subclass 0x03, Prog IF 0x30, handling 64-bit BARs safely.

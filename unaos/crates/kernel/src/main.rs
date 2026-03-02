@@ -29,7 +29,10 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         .expect("Heap initialization failed");
     serial_println!(":: KERNEL HEAP ALLOCATED ::");
 
-    // 4. Framebuffer Init
+    // 4. Motherboard Hardware Interconnects
+    unaos_kernel::pci::PciScanner::scan();
+
+    // 5. Framebuffer Init
     if let Some(framebuffer) = boot_info.framebuffer.as_mut() {
         let info = framebuffer.info();
         let buffer = framebuffer.buffer_mut();
