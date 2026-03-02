@@ -3,18 +3,29 @@ name = "una"
 version = "0.1.0"
 edition = "2024"
 
+[features]
+default = []
+gtk = ["quartzite/gtk"]
+gnome = ["quartzite/gnome"]
+
 [dependencies]
 anyhow = "1.0"
-crossbeam-channel = "0.5"
-gtk4 = "0.10.3"
+gtk4 = { version = "0.10.3", features = ["v4_16", "v4_18"] }
 glib = "0.21"
-sourceview5 = "0.10" # Adjusted to match gtk4 0.7 compatibility
 
-# The Trinity & Handlers
+# The Trinity Core
+quartzite = { path = "../../libs/quartzite", default-features = false }
+gneiss_pal = { path = "../../libs/gneiss_pal" }
 bandy = { path = "../../libs/bandy" }
 elessar = { path = "../../libs/elessar" }
+
+# Host UI & System
+async-channel = "2.5"
+tokio = { version = "1.49", features = ["sync", "rt", "rt-multi-thread", "macros"] }
+
+# Handlers
 matrix = { path = "../../handlers/matrix" }
 tabula = { path = "../../handlers/tabula" }
 # midden = { path = "../../handlers/midden" }
 # vaire = { path = "../../handlers/vaire" }
-# aule = { path = "../../handlers/aule" }c
+# aule = { path = "../../handlers/aule" }

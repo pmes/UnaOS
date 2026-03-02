@@ -86,7 +86,7 @@ impl TabulaView {
             if let Some(lang) = lm.language(lang_id) {
                 buffer.set_language(Some(&lang));
             } else {
-                buffer.set_language(sourceview5::Language::NONE);
+                buffer.set_language(None::<&sourceview5::Language>);
             }
         }
 

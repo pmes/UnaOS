@@ -71,37 +71,14 @@ impl CommsSpline {
         tx_event: async_channel::Sender<Event>,
         rx: Receiver<GuiUpdate>,
     ) -> crate::NativeView {
-        window.set_title(Some("Vein (Trinity Architecture)"));
 
-        // THE 4-QUADRANT HEADER FUSION
-        // We override the host window titlebar with a split grid representing our CSD.
-        let titlebar_grid = gtk4::Grid::builder().hexpand(true).build();
-
-        // Quadrant 1: Top Left (Empty Drag Area)
-        let top_left = gtk4::WindowHandle::new();
-        top_left.set_hexpand(true);
-
-        // Quadrant 2: Bottom Left (Tabs)
         let bottom_left = Box::new(Orientation::Horizontal, 0);
         bottom_left.add_css_class("toolbar");
+        bottom_left.set_halign(Align::Center);
 
-        // Quadrant 3: Top Right (Telemetry, Spinner, Window Controls)
-        let top_right = Box::new(Orientation::Horizontal, 8);
-        top_right.set_halign(Align::End);
-        let window_controls = gtk4::WindowControls::new(gtk4::PackType::End);
-        top_right.append(&window_controls);
-        // We defer appending token_label and pulse_icon here until they are defined later
-
-        // Quadrant 4: Bottom Right (Tabs)
         let bottom_right = Box::new(Orientation::Horizontal, 0);
         bottom_right.add_css_class("toolbar");
-
-        titlebar_grid.attach(&top_left, 0, 0, 1, 1);
-        titlebar_grid.attach(&bottom_left, 0, 1, 1, 1);
-        titlebar_grid.attach(&top_right, 1, 0, 1, 1);
-        titlebar_grid.attach(&bottom_right, 1, 1, 1, 1);
-
-        window.set_titlebar(Some(&titlebar_grid));
+        bottom_right.set_halign(Align::Center);
 
         // 1. Nodes Tab Rename
         let store = gio::ListStore::new::<StringObject>();
@@ -180,10 +157,8 @@ impl CommsSpline {
 
         let status_group = Box::new(Orientation::Horizontal, 8);
         status_group.append(&sidebar_toggle);
-
-        // Connect telemetry and spinner to Quadrant 3
-        top_right.prepend(&pulse_icon);
-        top_right.prepend(&token_label);
+        status_group.append(&pulse_icon);
+        status_group.append(&token_label);
 
         // --- Root Layout ---
         let main_h_paned = Paned::new(Orientation::Horizontal);
@@ -199,6 +174,15 @@ impl CommsSpline {
         left_vbox.add_css_class("background");
         left_vbox.add_css_class("navigation-sidebar");
         left_vbox.set_width_request(260);
+
+        let left_header = HeaderBar::builder().show_title_buttons(false).build();
+
+        let left_mega_bar = Box::new(Orientation::Vertical, 0);
+        left_mega_bar.add_css_class("titlebar");
+        left_mega_bar.append(&left_header);
+        left_mega_bar.append(&bottom_left);
+
+        left_vbox.append(&left_mega_bar);
 
         // Sidebar Content
         let sidebar_box = Box::new(Orientation::Vertical, 0);
@@ -554,10 +538,16 @@ impl CommsSpline {
         bottom_left.append(&tab_telehud);
 
         // Right side layout requires status group on top
-        let command_header_bar = HeaderBar::new();
-        command_header_bar.set_show_title_buttons(false);
+        let command_header_bar = HeaderBar::builder().show_title_buttons(true).build();
+        command_header_bar.set_title_widget(Some(&Label::new(Some("Lumen"))));
         command_header_bar.pack_start(&status_group);
-        right_vbox.prepend(&command_header_bar);
+
+        let right_mega_bar = Box::new(Orientation::Vertical, 0);
+        right_mega_bar.add_css_class("titlebar");
+        right_mega_bar.append(&command_header_bar);
+        right_mega_bar.append(&bottom_right);
+
+        right_vbox.prepend(&right_mega_bar);
 
         // Quadrant 4: Bottom Right Tabs
         let tab_comms = ToggleButton::builder().label("Comms").css_classes(vec!["flat", "builder-tab"]).active(true).build();
