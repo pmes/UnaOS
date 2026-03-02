@@ -1,11 +1,34 @@
-use bandy::{MatrixEvent, SMessage};
-use crossbeam_channel::Sender;
+use async_channel::Sender;
+use bandy::MatrixEvent;
 use elessar::{Context, Spline};
+use gneiss_pal::Event;
 use gtk4::prelude::*;
 use gtk4::{Box, Image, Label, ListBox, Orientation, ScrolledWindow, Widget};
 use std::path::{Path, PathBuf};
 
-use crate::MatrixScanner; // The DAG builder we just wrote
+// Temporary Shim to replace the J37 deleted DAG scanner
+pub struct MatrixScanner;
+impl MatrixScanner {
+    pub fn map_topology(path: &Path) -> Result<MatrixEvent, String> {
+        let mut nodes = Vec::new();
+        if let Ok(entries) = std::fs::read_dir(path) {
+            for entry in entries.flatten() {
+                let p = entry.path();
+                let kind = if p.is_dir() { "directory" } else { "module" };
+                // Map to the bandy struct
+                nodes.push(bandy::SpatialNode {
+                    id: p.file_name().unwrap_or_default().to_string_lossy().into_owned(),
+                    kind: kind.to_string(),
+                    path: p,
+                });
+            }
+        }
+        Ok(MatrixEvent::IngestTopology {
+            nodes,
+            edges: vec![],
+        })
+    }
+}
 
 pub struct ProjectView {
     pub root_path: PathBuf,
@@ -34,7 +57,7 @@ impl ProjectView {
 }
 
 /// The UI Builder. It takes the Nerve Transmitter and binds it to the GTK event loop.
-pub fn create_view(nerve_tx: Sender<SMessage>, root_path: &Path) -> Widget {
+pub fn create_view(nerve_tx: Sender<Event>, root_path: &Path) -> Widget {
     let matrix_list = ListBox::new();
     matrix_list.set_selection_mode(gtk4::SelectionMode::Single);
 
@@ -77,7 +100,8 @@ pub fn create_view(nerve_tx: Sender<SMessage>, root_path: &Path) -> Widget {
             println!("[MATRIX] ⚡ Firing Synapse: Node Selected -> {:?}", path);
 
             // Fire the impulse across the OS bus. Una (the IDE) will catch this.
-            let _ = tx_clone.send(SMessage::Matrix(MatrixEvent::NodeSelected(path)));
+            // S49: Use gneiss_pal::Event instead of SMessage
+            let _ = tx_clone.send_blocking(Event::FileSelected(path));
         }
     });
 

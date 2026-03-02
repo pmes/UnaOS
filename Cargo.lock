@@ -3433,8 +3433,10 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-channel",
+ "bandy",
  "elessar",
  "glib 0.21.5",
+ "gneiss_pal",
  "gtk4",
  "log",
 ]
@@ -5881,14 +5883,16 @@ name = "una"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-channel",
  "bandy",
- "crossbeam-channel",
  "elessar",
  "glib 0.21.5",
+ "gneiss_pal",
  "gtk4",
  "matrix",
- "sourceview5",
+ "quartzite",
  "tabula",
+ "tokio",
 ]
 
 [[package]]
