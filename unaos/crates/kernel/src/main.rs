@@ -3,30 +3,40 @@
 
 extern crate alloc;
 
-use bootloader::{entry_point, BootInfo};
+use bootloader_api::{entry_point, BootInfo};
 use core::panic::PanicInfo;
-// Removed VirtAddr for now to simplify the boot path
+use x86_64::VirtAddr;
 use unaos_kernel::serial_println;
 
 // ENTRY POINT
 entry_point!(kernel_main);
 
-fn kernel_main(boot_info: &'static BootInfo) -> ! {
+fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     // 1. Core Hardware Init (GDT, IDT, PICS)
     unaos_kernel::init();
 
     // 2. Serial Verification
-    // We skip complex memory mapping for this specific heartbeat test
-    // because bootloader 0.9.x fields vary by environment.
-    serial_println!(":: UnaOS Kernel Initialized ::");
-    serial_println!(":: Status: ONLINE ::");
-    serial_println!(":: Architect Verified ::");
+    serial_println!(":: UNAOS KERNEL AWAKE ::");
 
-    // 3. Memory Map Telemetry (Optional Diagnostic)
-    serial_println!(
-        ":: Memory Regions Detected: {} ::",
-        boot_info.memory_map.iter().count()
-    );
+    // 3. Global Heap Allocation (Phase 3 Memory Translation)
+    let physical_memory_offset = boot_info.physical_memory_offset.into_option().unwrap();
+    let phys_offset = VirtAddr::new(physical_memory_offset);
+
+    let mut mapper = unsafe { unaos_kernel::memory::init(phys_offset) };
+    let mut frame_allocator = unsafe { unaos_kernel::memory::BootInfoFrameAllocator::init(&boot_info.memory_regions) };
+
+    unaos_kernel::allocator::init_heap(&mut mapper, &mut frame_allocator)
+        .expect("Heap initialization failed");
+    serial_println!(":: KERNEL HEAP ALLOCATED ::");
+
+    // 4. Framebuffer Init
+    if let Some(framebuffer) = boot_info.framebuffer.as_mut() {
+        let info = framebuffer.info();
+        let buffer = framebuffer.buffer_mut();
+        unaos_kernel::vug::init(buffer, info);
+    } else {
+        serial_println!(":: WARNING: No framebuffer detected ::");
+    }
 
     loop {
         // Halt the CPU until the next interrupt

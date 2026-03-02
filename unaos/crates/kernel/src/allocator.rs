@@ -1,4 +1,7 @@
-use linked_list_allocator::LockedHeap;
+use core::alloc::{GlobalAlloc, Layout};
+use core::ptr::null_mut;
+use linked_list_allocator::Heap;
+use spin::Mutex;
 use x86_64::{
     structures::paging::{
         mapper::MapToError, FrameAllocator, Mapper, Page, PageTableFlags, Size4KiB,
@@ -9,8 +12,45 @@ use x86_64::{
 pub const HEAP_START: usize = 0x_4444_4444_0000;
 pub const HEAP_SIZE: usize = 100 * 1024; // 100 KiB
 
+pub struct Locked<A> {
+    inner: Mutex<A>,
+}
+
+impl<A> Locked<A> {
+    pub const fn new(inner: A) -> Self {
+        Locked {
+            inner: Mutex::new(inner),
+        }
+    }
+
+    pub fn lock(&self) -> spin::MutexGuard<A> {
+        self.inner.lock()
+    }
+}
+
+unsafe impl GlobalAlloc for Locked<Heap> {
+    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        let mut result = null_mut();
+        x86_64::instructions::interrupts::without_interrupts(|| {
+            let mut heap = self.inner.lock();
+            match heap.allocate_first_fit(layout) {
+                Ok(ptr) => result = ptr.as_ptr(),
+                Err(_) => {}
+            }
+        });
+        result
+    }
+
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+        x86_64::instructions::interrupts::without_interrupts(|| {
+            let mut heap = self.inner.lock();
+            heap.deallocate(core::ptr::NonNull::new(ptr).unwrap(), layout);
+        });
+    }
+}
+
 #[global_allocator]
-static ALLOCATOR: LockedHeap = LockedHeap::empty();
+static ALLOCATOR: Locked<Heap> = Locked::new(Heap::empty());
 
 pub fn init_heap(
     mapper: &mut impl Mapper<Size4KiB>,
