@@ -5,6 +5,7 @@ extern crate alloc;
 
 use bootloader_api::{entry_point, BootInfo};
 use core::panic::PanicInfo;
+use x86_64::VirtAddr;
 use unaos_kernel::serial_println;
 
 // ENTRY POINT
@@ -17,7 +18,18 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     // 2. Serial Verification
     serial_println!(":: UNAOS KERNEL AWAKE ::");
 
-    // 3. Framebuffer Init
+    // 3. Global Heap Allocation (Phase 3 Memory Translation)
+    let physical_memory_offset = boot_info.physical_memory_offset.into_option().unwrap();
+    let phys_offset = VirtAddr::new(physical_memory_offset);
+
+    let mut mapper = unsafe { unaos_kernel::memory::init(phys_offset) };
+    let mut frame_allocator = unsafe { unaos_kernel::memory::BootInfoFrameAllocator::init(&boot_info.memory_regions) };
+
+    unaos_kernel::allocator::init_heap(&mut mapper, &mut frame_allocator)
+        .expect("Heap initialization failed");
+    serial_println!(":: KERNEL HEAP ALLOCATED ::");
+
+    // 4. Framebuffer Init
     if let Some(framebuffer) = boot_info.framebuffer.as_mut() {
         let info = framebuffer.info();
         let buffer = framebuffer.buffer_mut();
