@@ -74,7 +74,7 @@ define_class!(
                 window.setReleasedWhenClosed(false);
             }
 
-            window.setTitle(&NSString::from_str("Vein (Trinity)"));
+            window.setTitle(&NSString::from_str(""));
             window.center();
 
             // 2. Extract bootstrap closure

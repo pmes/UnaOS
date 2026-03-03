@@ -101,3 +101,5 @@ where F: Fn(&ApplicationWindow, async_channel::Sender<Event>, Receiver<GuiUpdate
     window.present();
     info!("UI_BUILD: Window presented. Total build_ui duration: {:?}", ui_build_start_time.elapsed());
 }
+
+pub mod mega_bar;

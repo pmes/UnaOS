@@ -1,0 +1,211 @@
+use gtk4::prelude::*;
+use gtk4::{Box, CssProvider, HeaderBar, Label, Orientation, Paned};
+
+pub struct MegaBar;
+
+impl MegaBar {
+    pub fn build(
+        window: &gtk4::ApplicationWindow,
+        title: &str,
+        status_widget: &gtk4::Widget,
+        left_tabs: &gtk4::Widget,
+        right_tabs: &gtk4::Widget,
+        left_content: &gtk4::Widget,
+        right_content: &gtk4::Widget,
+    ) -> gtk4::Widget {
+        // 0. The Dark Mode Hard-Wire (Direct GNOME DBus Wiretap)
+        if let Some(source) = gtk4::gio::SettingsSchemaSource::default() {
+            if source.lookup("org.gnome.desktop.interface", true).is_some() {
+                let settings = gtk4::gio::Settings::new("org.gnome.desktop.interface");
+
+                // Initial Check
+                if settings.string("color-scheme").as_str() == "prefer-dark" {
+                    window.add_css_class("una-dark");
+                    if let Some(gtk_settings) = gtk4::Settings::default() {
+                        gtk_settings.set_gtk_application_prefer_dark_theme(true);
+                    }
+                }
+
+                // Listen for GNOME Quick Settings changes
+                let win_clone = window.clone();
+                settings.connect_changed(Some("color-scheme"), move |s, _| {
+                    if s.string("color-scheme").as_str() == "prefer-dark" {
+                        win_clone.add_css_class("una-dark");
+                        if let Some(gtk_settings) = gtk4::Settings::default() {
+                            gtk_settings.set_gtk_application_prefer_dark_theme(true);
+                        }
+                    } else {
+                        win_clone.remove_css_class("una-dark");
+                        if let Some(gtk_settings) = gtk4::Settings::default() {
+                            gtk_settings.set_gtk_application_prefer_dark_theme(false);
+                        }
+                    }
+                });
+
+                // CRITICAL FIX: Keep the wiretap alive by tying it to the Window's lifecycle.
+                // The window will hold this closure (and the settings object) until it is destroyed.
+                window.connect_unrealize(move |_| {
+                    let _ = &settings;
+                });
+            }
+        }
+        // 1. Inject CSS
+        let provider = CssProvider::new();
+        provider.load_from_string(
+            "
+            /* -- PANED HANDLE FIX -- */
+            paned > separator { background-color: transparent; }
+
+            /* === LIGHT MODE (DEFAULT) === */
+            .builder-sidebar, .builder-sidebar > background {
+                background-color: #ebebed;
+                background-image: none;
+            }
+            .builder-sidebar:backdrop, .builder-sidebar:backdrop > background {
+                background-color: #fafafa;
+                background-image: none;
+            }
+            .builder-view, .builder-view > background {
+                background-color: #ffffff;
+                background-image: none;
+                border-left: 1px solid @borders;
+            }
+            .builder-view:backdrop, .builder-view:backdrop > background {
+                background-color: #fcfcfc;
+                background-image: none;
+                border-left: 1px solid @borders;
+            }
+
+            /* === DARK MODE (HARDWIRED RUST CLASS) === */
+            .una-dark .builder-sidebar, .una-dark .builder-sidebar > background {
+                background-color: #2e2e32;
+                background-image: none;
+            }
+            .una-dark .builder-sidebar:backdrop, .una-dark .builder-sidebar:backdrop > background {
+                background-color: #26262a;
+                background-image: none;
+            }
+            .una-dark .builder-view, .una-dark .builder-view > background {
+                background-color: #1d1d20;
+                background-image: none;
+                border-left: 1px solid @borders;
+            }
+            .una-dark .builder-view:backdrop, .una-dark .builder-view:backdrop > background {
+                background-color: #18181a;
+                background-image: none;
+                border-left: 1px solid @borders;
+            }
+
+            /* -- CHILD TRANSPARENCY -- */
+            .builder-sidebar box,
+            .builder-sidebar scrolledwindow,
+            .builder-sidebar listview,
+            .builder-sidebar columnview,
+            .builder-sidebar listbox,
+            .builder-sidebar row,
+            .builder-sidebar tabview,
+            .builder-sidebar stack {
+                background-color: transparent;
+                background-image: none;
+                box-shadow: none;
+            }
+
+            /* -- UNIFIED HEADERS & TABS -- */
+            headerbar {
+                background: transparent;
+                border: none;
+                box-shadow: none;
+                min-height: 46px;
+            }
+            tabbar {
+                background: transparent;
+                border-bottom: 1px solid @borders;
+            }
+
+            /* -- GTK FALLBACK MEGA BAR BORDERS -- */
+            .title-vbox {
+                border-bottom: 1px solid @borders;
+            }
+            .title-vbox stackswitcher {
+                margin-left: 8px; margin-right: 8px; margin-bottom: 4px;
+            }
+            ",
+        );
+
+        gtk4::style_context_add_provider_for_display(
+            &gtk4::gdk::Display::default().expect("No display"),
+            &provider,
+            gtk4::STYLE_PROVIDER_PRIORITY_APPLICATION,
+        );
+
+        // 2. Build the Titlebar Paned
+        let title_paned = Paned::new(Orientation::Horizontal);
+        title_paned.set_position(260); // Match starting position
+        title_paned.set_wide_handle(false); // Hide the handle
+
+        // Left Side: Header + Tabs
+        let left_title_vbox = Box::new(Orientation::Vertical, 0);
+        left_title_vbox.add_css_class("builder-sidebar"); // EXTEND LEFT SHADING UPWARD
+        left_title_vbox.add_css_class("title-vbox");
+        let fallback_left_header = HeaderBar::builder().show_title_buttons(false).build();
+        left_title_vbox.append(&fallback_left_header);
+        left_title_vbox.append(left_tabs);
+
+        // Right Side: Header + Status + Tabs
+        let right_title_vbox = Box::new(Orientation::Vertical, 0);
+        right_title_vbox.add_css_class("builder-view"); // EXTEND RIGHT SHADING UPWARD
+        right_title_vbox.add_css_class("title-vbox");
+        right_title_vbox.set_hexpand(true);
+        let fallback_right_header = HeaderBar::builder().show_title_buttons(true).build();
+        fallback_right_header.set_title_widget(Some(&Label::new(Some(title))));
+
+        // Pack the status widget into the right header
+        fallback_right_header.pack_start(status_widget);
+
+        // CRITICAL ALIGNMENT FIX FOR GTK:
+        let header_size_group = gtk4::SizeGroup::new(gtk4::SizeGroupMode::Vertical);
+        header_size_group.add_widget(&fallback_left_header);
+        header_size_group.add_widget(&fallback_right_header);
+
+        right_title_vbox.append(&fallback_right_header);
+        right_title_vbox.append(right_tabs);
+
+        title_paned.set_start_child(Some(&left_title_vbox));
+        title_paned.set_end_child(Some(&right_title_vbox));
+
+        window.set_titlebar(Some(&title_paned));
+
+        // 3. Build the Content Frame
+        let main_h_paned = Paned::new(Orientation::Horizontal);
+        main_h_paned.set_position(260); // Slightly wider sidebar for TeleHUD
+        main_h_paned.set_hexpand(true);
+        main_h_paned.set_vexpand(true);
+        main_h_paned.set_wide_handle(false);
+        main_h_paned.set_shrink_start_child(false);
+        main_h_paned.set_resize_start_child(false);
+
+        let left_vbox = Box::new(Orientation::Vertical, 0);
+        left_vbox.add_css_class("builder-sidebar");
+        left_vbox.set_width_request(260);
+        left_vbox.append(left_content);
+
+        let right_vbox = Box::new(Orientation::Vertical, 0);
+        right_vbox.add_css_class("builder-view");
+        right_vbox.set_hexpand(true);
+        right_vbox.append(right_content);
+
+        main_h_paned.set_start_child(Some(&left_vbox));
+        main_h_paned.set_end_child(Some(&right_vbox));
+
+        // 4. Bind the Sync
+        // CRITICAL FIX: Bidirectional binding ensures neither side can violate
+        // the other's minimum width limits. They move in absolute lockstep.
+        main_h_paned
+            .bind_property("position", &title_paned, "position")
+            .flags(glib::BindingFlags::SYNC_CREATE | glib::BindingFlags::BIDIRECTIONAL)
+            .build();
+
+        // 5. Return the Frame
+        main_h_paned.upcast::<gtk4::Widget>()
+    }
+}

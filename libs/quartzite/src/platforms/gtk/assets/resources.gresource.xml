@@ -4,5 +4,6 @@
     <file alias="scalable/actions/paper-plane-symbolic.svg">icons/paper-plane-symbolic.svg</file>
     <file alias="scalable/actions/share-symbolic.svg">icons/share-symbolic.svg</file>
     <file alias="scalable/actions/spinner-symbolic.svg">icons/spinner-symbolic.svg</file>
+    <file alias="scalable/actions/brain-symbolic.svg">icons/brain-symbolic.svg</file>
   </gresource>
 </gresources>
