@@ -1,22 +1,23 @@
 // libs/quartzite/src/platforms/gtk/spline.rs
-use crate::widgets::model::DispatchObject;
 use crate::Event;
+use crate::widgets::model::DispatchObject;
 use async_channel::Receiver;
 use gtk4::prelude::*;
 use gtk4::{
-    gdk::{Key, ModifierType},
-    gio, glib, Adjustment, Align, Box, Button, CheckButton, ColumnView, ColumnViewColumn,
-    CssProvider, DropDown, Entry, EventControllerKey, Expander, FileDialog, FilterListModel,
-    GestureClick, Image, Label, ListBox, ListItem, ListView, NoSelection, Orientation, Paned,
-    PolicyType, Popover, PropagationPhase, Scale, ScrolledWindow, Separator, SignalListItemFactory,
+    Adjustment, Align, Box, Button, CheckButton, ColumnView, ColumnViewColumn, CssProvider,
+    DropDown, Entry, EventControllerKey, Expander, FileDialog, FilterListModel, GestureClick,
+    Image, Label, ListBox, ListItem, ListView, NoSelection, Orientation, Paned, PolicyType,
+    Popover, PropagationPhase, Scale, ScrolledWindow, Separator, SignalListItemFactory,
     SingleSelection, Spinner, Stack, StackSwitcher, StackTransitionType, StringList, StringObject,
     Switch, ToggleButton, Widget, Window,
+    gdk::{Key, ModifierType},
+    gio, glib,
 };
 #[cfg(feature = "gnome")]
 use libadwaita as adw;
 use libspelling;
-use sourceview5::prelude::*;
 use sourceview5::View as SourceView;
+use sourceview5::prelude::*;
 use std::cell::RefCell;
 use std::rc::Rc;
 
@@ -96,51 +97,58 @@ fn build_gnome_ui(
     provider.load_from_string("
             .console { font-family: 'Monospace'; background: transparent; }
             .console-row { margin-bottom: 16px; padding: 0px; }
-
-            .bubble-box {
-                border-radius: 12px;
-                padding: 12px;
-            }
-
-            .architect-bubble {
-                background-color: alpha(currentColor, 0.08);
-            }
-
-            .una-bubble {
-                background-color: alpha(currentColor, 0.05);
-            }
-
-            /* Native Icon Scaling */
-            .suggested-action { background-color: #0078d4; color: #ffffff; border-radius: 4px; }
-            .attach-action { border-radius: 4px; }
-
+            .bubble-box { border-radius: 12px; padding: 12px; }
+            .architect-bubble { background-color: alpha(currentColor, 0.08); }
+            .una-bubble { background-color: alpha(currentColor, 0.05); }
             .nexus-header { font-weight: bold; margin-top: 12px; margin-bottom: 4px; opacity: 0.7; font-size: 0.9em; }
-
             .role-architect { color: #0078d4; font-weight: bold; }
             .role-una { color: #d40078; font-weight: bold; }
             .role-system { color: #888888; font-style: italic; }
 
+            /* -- PANED HANDLE FIX -- */
+            paned > separator { background-color: transparent; }
 
-
-
-            /* Shadow Emulation for GTK/Adw Split */
-            .elevated-quadrant {
-                box-shadow: 3px 0 5px rgba(0, 0, 0, 0.07), 0 3px 5px rgba(0, 0, 0, 0.07);
-                clip-path: inset(-10px -10px -10px -10px);
+            /* -- LEFT: GNOME BUILDER GRAY -- */
+            .builder-sidebar, .builder-sidebar > background {
+                background-color: @headerbar_bg_color; /* Maps exactly to #ebebed / #2e2e32 */
             }
-            paned > separator {
+            .builder-sidebar box,
+            .builder-sidebar scrolledwindow,
+            .builder-sidebar listview,
+            .builder-sidebar columnview,
+            .builder-sidebar listbox,
+            .builder-sidebar row,
+            .builder-sidebar tabview,
+            .builder-sidebar stack {
                 background-color: transparent;
+                background-image: none;
+                box-shadow: none;
             }
-            /* GNOME BUILDER HEADER FUSION TABS */
-            .builder-tab {
-                border-radius: 0px;
-                padding-left: 16px;
-                padding-right: 16px;
-                margin-bottom: 0px;
-                border-bottom: 2px solid transparent;
+
+            /* -- RIGHT: GNOME BUILDER WHITE -- */
+            .builder-view {
+                background-color: @view_bg_color;
+                border-left: 1px solid @borders;
             }
-            .builder-tab:checked {
-                border-bottom: 2px solid @accent_bg_color;
+
+            /* -- UNIFIED HEADERS & TABS -- */
+            headerbar {
+                background: transparent;
+                border: none;
+                box-shadow: none;
+                min-height: 46px;
+            }
+            tabbar {
+                background: transparent;
+                border-bottom: 1px solid @borders;
+            }
+
+            /* -- GTK FALLBACK MEGA BAR BORDERS -- */
+            .title-vbox {
+                border-bottom: 1px solid @borders;
+            }
+            .title-vbox stackswitcher {
+                margin-left: 8px; margin-right: 8px; margin-bottom: 4px;
             }
         ");
 
@@ -161,7 +169,6 @@ fn build_gnome_ui(
     let token_label = Label::new(Some("Tokens: IN: 0 | OUT: 0 | TOTAL: 0"));
     token_label.set_margin_start(10);
     token_label.set_margin_end(10);
-    token_label.set_margin_top(10);
     token_label.set_wrap(true);
     token_label.set_justify(gtk4::Justification::Center);
 
@@ -172,6 +179,7 @@ fn build_gnome_ui(
     pulse_icon.set_spinning(false);
 
     let status_group = Box::new(Orientation::Horizontal, 8);
+    status_group.set_valign(gtk4::Align::Center);
     status_group.append(&sidebar_toggle);
     status_group.append(&pulse_icon);
     status_group.append(&token_label);
@@ -186,11 +194,9 @@ fn build_gnome_ui(
     main_h_paned.set_resize_start_child(false);
 
     let left_toolbar = adw::ToolbarView::new();
-        left_toolbar.add_css_class("elevated-quadrant");
-        left_toolbar.set_widget_name("left");
+    left_toolbar.set_widget_name("left");
 
-    left_toolbar.add_css_class("background");
-    left_toolbar.add_css_class("navigation-sidebar");
+    left_toolbar.add_css_class("builder-sidebar");
     left_toolbar.set_width_request(260);
 
     let left_header = adw::HeaderBar::builder()
@@ -198,7 +204,6 @@ fn build_gnome_ui(
         .build();
 
     let left_tab_view = adw::TabView::new();
-        left_tab_view.add_css_class("background");
     let left_tab_bar = adw::TabBar::new();
     left_tab_bar.set_view(Some(&left_tab_view));
 
@@ -549,9 +554,9 @@ fn build_gnome_ui(
 
     // 4. THE WORKSPACE (Right Pane)
     let right_toolbar = adw::ToolbarView::new();
-        right_toolbar.set_widget_name("right");
+    right_toolbar.set_widget_name("right");
 
-        right_toolbar.add_css_class("view");
+    right_toolbar.add_css_class("builder-view");
 
     let command_header_bar = adw::HeaderBar::builder()
         .show_start_title_buttons(false)
@@ -559,9 +564,21 @@ fn build_gnome_ui(
     command_header_bar.set_title_widget(Some(&Label::new(Some("Lumen"))));
     command_header_bar.pack_start(&status_group);
 
+    // CRITICAL ALIGNMENT FIX: Force left and right headers to be identical heights
+    let header_size_group = gtk4::SizeGroup::new(gtk4::SizeGroupMode::Vertical);
+    header_size_group.add_widget(&left_header);
+    header_size_group.add_widget(&command_header_bar);
+
     let right_tab_view = adw::TabView::new();
-        right_tab_view.add_css_class("view");
     let right_tab_bar = adw::TabBar::new();
+    // Mathematically lock the tab bars to the exact same height
+    let tab_size_group = gtk4::SizeGroup::new(gtk4::SizeGroupMode::Vertical);
+    tab_size_group.add_widget(&left_tab_bar);
+    tab_size_group.add_widget(&right_tab_bar);
+
+    // Strip native Adwaita toolbar shadows to prevent misalignment
+    left_toolbar.set_top_bar_style(adw::ToolbarStyle::Flat);
+    right_toolbar.set_top_bar_style(adw::ToolbarStyle::Flat);
     right_tab_bar.set_view(Some(&right_tab_view));
 
     right_tab_view.append(&comms_page);
@@ -1114,7 +1131,6 @@ fn build_gnome_ui(
 
     main_h_paned.set_end_child(Some(&right_toolbar));
 
-
     let left_toolbar_clone = left_toolbar.clone();
 
     sidebar_toggle.connect_toggled(move |btn| {
@@ -1261,7 +1277,7 @@ fn build_gnome_ui(
                         // Manual Review: Populate and Switch Tab
                         payload_buf_async.set_text(&json_payload);
                         let page = tv_async.page(&payload_page_clone);
-                             tv_async.set_selected_page(&page);
+                        tv_async.set_selected_page(&page);
                     }
                 }
                 _ => {}
@@ -1294,50 +1310,58 @@ fn build_gtk_ui(
     provider.load_from_string("
             .console { font-family: 'Monospace'; background: transparent; }
             .console-row { margin-bottom: 16px; padding: 0px; }
-
-            .bubble-box {
-                border-radius: 12px;
-                padding: 12px;
-            }
-
-            .architect-bubble {
-                background-color: alpha(currentColor, 0.08);
-            }
-
-            .una-bubble {
-                background-color: alpha(currentColor, 0.05);
-            }
-
-            /* Native Icon Scaling */
-            .suggested-action { background-color: #0078d4; color: #ffffff; border-radius: 4px; }
-            .attach-action { border-radius: 4px; }
-
+            .bubble-box { border-radius: 12px; padding: 12px; }
+            .architect-bubble { background-color: alpha(currentColor, 0.08); }
+            .una-bubble { background-color: alpha(currentColor, 0.05); }
             .nexus-header { font-weight: bold; margin-top: 12px; margin-bottom: 4px; opacity: 0.7; font-size: 0.9em; }
-
             .role-architect { color: #0078d4; font-weight: bold; }
             .role-una { color: #d40078; font-weight: bold; }
             .role-system { color: #888888; font-style: italic; }
 
+            /* -- PANED HANDLE FIX -- */
+            paned > separator { background-color: transparent; }
 
-
-            /* Shadow Emulation for GTK/Adw Split */
-            .elevated-quadrant {
-                box-shadow: 3px 0 5px rgba(0, 0, 0, 0.07), 0 3px 5px rgba(0, 0, 0, 0.07);
-                clip-path: inset(-10px -10px -10px -10px);
+            /* -- LEFT: GNOME BUILDER GRAY -- */
+            .builder-sidebar, .builder-sidebar > background {
+                background-color: @headerbar_bg_color; /* Maps exactly to #ebebed / #2e2e32 */
             }
-            paned > separator {
+            .builder-sidebar box,
+            .builder-sidebar scrolledwindow,
+            .builder-sidebar listview,
+            .builder-sidebar columnview,
+            .builder-sidebar listbox,
+            .builder-sidebar row,
+            .builder-sidebar tabview,
+            .builder-sidebar stack {
                 background-color: transparent;
+                background-image: none;
+                box-shadow: none;
             }
-            /* GNOME BUILDER HEADER FUSION TABS */
-            .builder-tab {
-                border-radius: 0px;
-                padding-left: 16px;
-                padding-right: 16px;
-                margin-bottom: 0px;
-                border-bottom: 2px solid transparent;
+
+            /* -- RIGHT: GNOME BUILDER WHITE -- */
+            .builder-view {
+                background-color: @view_bg_color;
+                border-left: 1px solid @borders;
             }
-            .builder-tab:checked {
-                border-bottom: 2px solid @accent_bg_color;
+
+            /* -- UNIFIED HEADERS & TABS -- */
+            headerbar {
+                background: transparent;
+                border: none;
+                box-shadow: none;
+                min-height: 46px;
+            }
+            tabbar {
+                background: transparent;
+                border-bottom: 1px solid @borders;
+            }
+
+            /* -- GTK FALLBACK MEGA BAR BORDERS -- */
+            .title-vbox {
+                border-bottom: 1px solid @borders;
+            }
+            .title-vbox stackswitcher {
+                margin-left: 8px; margin-right: 8px; margin-bottom: 4px;
             }
         ");
 
@@ -1358,7 +1382,6 @@ fn build_gtk_ui(
     let token_label = Label::new(Some("Tokens: IN: 0 | OUT: 0 | TOTAL: 0"));
     token_label.set_margin_start(10);
     token_label.set_margin_end(10);
-    token_label.set_margin_top(10);
     token_label.set_wrap(true);
     token_label.set_justify(gtk4::Justification::Center);
 
@@ -1369,6 +1392,7 @@ fn build_gtk_ui(
     pulse_icon.set_spinning(false);
 
     let status_group = Box::new(Orientation::Horizontal, 8);
+    status_group.set_valign(gtk4::Align::Center);
     status_group.append(&sidebar_toggle);
     status_group.append(&pulse_icon);
     status_group.append(&token_label);
@@ -1383,11 +1407,8 @@ fn build_gtk_ui(
     main_h_paned.set_resize_start_child(false);
 
     let left_vbox = Box::new(Orientation::Vertical, 0);
-        left_vbox.add_css_class("elevated-quadrant");
-        left_vbox.set_widget_name("left");
+    left_vbox.add_css_class("builder-sidebar");
 
-    left_vbox.add_css_class("background");
-    left_vbox.add_css_class("navigation-sidebar");
     left_vbox.set_width_request(260);
 
     let left_stack = Stack::new();
@@ -1690,15 +1711,14 @@ fn build_gtk_ui(
 
     // --- Right Pane (The Command Center) ---
     let right_vbox = Box::new(Orientation::Vertical, 0);
-        right_vbox.set_widget_name("right");
+    right_vbox.set_widget_name("right");
 
-        right_vbox.add_css_class("view");
+    right_vbox.add_css_class("builder-view");
 
     right_vbox.set_hexpand(true);
 
     // === THE WORKSPACE STACK ===
     let workspace_stack = Stack::new();
-        workspace_stack.add_css_class("view");
     workspace_stack.set_vexpand(true);
     workspace_stack.set_transition_type(StackTransitionType::SlideLeftRight);
 
@@ -2436,22 +2456,51 @@ fn build_gtk_ui(
     }
 
     {
-        let title_box = Box::new(Orientation::Horizontal, 0);
+        // Use a Paned for the titlebar to perfectly mimic the main content splits
+        let title_paned = Paned::new(Orientation::Horizontal);
+        title_paned.set_position(260); // Match starting position
+        title_paned.set_wide_handle(false); // Hide the handle
 
+        // Left Side: Header + Tabs
+        let left_title_vbox = Box::new(Orientation::Vertical, 0);
+        left_title_vbox.add_css_class("builder-sidebar"); // EXTEND LEFT SHADING UPWARD
+        left_title_vbox.add_css_class("title-vbox");
         let fallback_left_header = HeaderBar::builder().show_title_buttons(false).build();
-        let fallback_separator = Separator::new(Orientation::Vertical);
+        let left_switcher = StackSwitcher::new();
+        left_switcher.set_stack(Some(&left_stack));
+        left_title_vbox.append(&fallback_left_header);
+        left_title_vbox.append(&left_switcher);
+
+        // Right Side: Header + Status + Tabs
+        let right_title_vbox = Box::new(Orientation::Vertical, 0);
+        right_title_vbox.add_css_class("builder-view"); // EXTEND RIGHT SHADING UPWARD
+        right_title_vbox.add_css_class("title-vbox");
+        right_title_vbox.set_hexpand(true);
         let fallback_right_header = HeaderBar::builder().show_title_buttons(true).build();
         fallback_right_header.set_title_widget(Some(&Label::new(Some("Lumen"))));
-        fallback_right_header.set_hexpand(true);
 
-        title_box.append(&fallback_left_header);
-        title_box.append(&fallback_separator);
-        title_box.append(&fallback_right_header);
+        fallback_right_header.pack_start(&status_group);
 
-        window.set_titlebar(Some(&title_box));
+        // CRITICAL ALIGNMENT FIX FOR GTK:
+        let header_size_group = gtk4::SizeGroup::new(gtk4::SizeGroupMode::Vertical);
+        header_size_group.add_widget(&fallback_left_header);
+        header_size_group.add_widget(&fallback_right_header);
 
-        main_h_paned.bind_property("position", &fallback_left_header, "width-request")
-            .flags(glib::BindingFlags::SYNC_CREATE)
+        let right_switcher = StackSwitcher::new();
+        right_switcher.set_stack(Some(&workspace_stack));
+        right_title_vbox.append(&fallback_right_header);
+        right_title_vbox.append(&right_switcher);
+
+        title_paned.set_start_child(Some(&left_title_vbox));
+        title_paned.set_end_child(Some(&right_title_vbox));
+
+        window.set_titlebar(Some(&title_paned));
+
+        // CRITICAL FIX: Bidirectional binding ensures neither side can violate
+        // the other's minimum width limits. They move in absolute lockstep.
+        main_h_paned
+            .bind_property("position", &title_paned, "position")
+            .flags(glib::BindingFlags::SYNC_CREATE | glib::BindingFlags::BIDIRECTIONAL)
             .build();
     }
 
