@@ -4,7 +4,7 @@ use objc2::rc::Retained;
 use objc2::{define_class, msg_send, MainThreadOnly, DeclaredClass};
 use objc2_app_kit::{
     NSApplication, NSApplicationActivationPolicy, NSApplicationDelegate, NSWindow,
-    NSWindowStyleMask, NSBackingStoreType,
+    NSWindowStyleMask, NSBackingStoreType, NSWindowTitleVisibility, NSToolbar,
 };
 use objc2_foundation::{MainThreadMarker, NSObject, NSObjectProtocol, NSPoint, NSRect, NSSize, NSString};
 use std::cell::RefCell;
@@ -49,7 +49,8 @@ define_class!(
             let style = NSWindowStyleMask::Titled
                 | NSWindowStyleMask::Closable
                 | NSWindowStyleMask::Miniaturizable
-                | NSWindowStyleMask::Resizable;
+                | NSWindowStyleMask::Resizable
+                | NSWindowStyleMask::FullSizeContentView;
 
             // -------------------------------------------------------------------
             // UNAOS THREAD SAFETY MANDATE (APPKIT)
@@ -75,6 +76,14 @@ define_class!(
             }
 
             window.setTitle(&NSString::from_str(""));
+            window.setTitleVisibility(NSWindowTitleVisibility::Hidden);
+            window.setTitlebarAppearsTransparent(true);
+
+            let toolbar = unsafe {
+                let tb: Retained<NSToolbar> = msg_send![mtm.alloc::<NSToolbar>(), initWithIdentifier: &*NSString::from_str("UnaOSToolbar")];
+                tb
+            };
+            window.setToolbar(Some(&*toolbar));
             window.center();
 
             // 2. Extract bootstrap closure
