@@ -1,6 +1,5 @@
 use gtk4::prelude::*;
 use gtk4::{Box, CssProvider, Orientation, Paned};
-use libadwaita::prelude::*;
 use libadwaita as adw;
 
 pub struct MegaBar;

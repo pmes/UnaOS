@@ -57,7 +57,6 @@ fn enable_spelling(view: &SourceView) {
 use gneiss_pal::shard::ShardStatus;
 use gneiss_pal::{GuiUpdate, WolfpackState};
 
-use gtk4::HeaderBar;
 
 pub struct CommsSpline {}
 
@@ -443,7 +442,6 @@ fn build_gnome_ui(
         page.set_title("TeleHUD");
     }
 
-    main_h_paned.set_start_child(Some(&left_toolbar));
 
     // --- Right Pane (The Command Center) ---
 
@@ -492,9 +490,6 @@ fn build_gnome_ui(
     let comms_page_ref = right_tab_view.page(&comms_page);
     comms_page_ref.set_title("Comms");
 
-    right_toolbar.add_top_bar(&command_header_bar);
-    right_toolbar.add_top_bar(&right_tab_bar);
-    right_toolbar.set_content(Some(&right_tab_view));
 
     // Console ListView
     let console_store = gio::ListStore::new::<DispatchObject>();
@@ -1198,7 +1193,7 @@ fn build_gnome_ui(
     crate::platforms::gnome::mega_bar::MegaBar::build(
         window.upcast_ref::<gtk4::ApplicationWindow>(),
         "Vein (Trinity)",
-        &status_group,
+        status_group.upcast_ref::<gtk4::Widget>(),
         left_tab_bar.upcast_ref::<gtk4::Widget>(),
         right_tab_bar.upcast_ref::<gtk4::Widget>(),
         left_tab_view.upcast_ref::<gtk4::Widget>(),
@@ -1558,18 +1553,7 @@ fn build_gtk_ui(
 
     left_stack.add_titled(&telehud_box, Some("telehud"), "TeleHUD");
 
-    {
-        left_vbox.append(&left_stack);
-        main_h_paned.set_start_child(Some(&left_vbox));
-    }
 
-    // --- Right Pane (The Command Center) ---
-    let right_vbox = Box::new(Orientation::Vertical, 0);
-    right_vbox.set_widget_name("right");
-
-    right_vbox.add_css_class("builder-view");
-
-    right_vbox.set_hexpand(true);
 
     // === THE WORKSPACE STACK ===
     let workspace_stack = Stack::new();
@@ -2316,7 +2300,7 @@ fn build_gtk_ui(
     crate::platforms::gtk::mega_bar::MegaBar::build(
         window.upcast_ref::<gtk4::ApplicationWindow>(),
         "Vein (Trinity)",
-        &status_group,
+        status_group.upcast_ref::<gtk4::Widget>(),
         left_switcher.upcast_ref::<gtk4::Widget>(),
         right_switcher.upcast_ref::<gtk4::Widget>(),
         left_stack.upcast_ref::<gtk4::Widget>(),

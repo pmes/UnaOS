@@ -1,5 +1,5 @@
 use gtk4::prelude::*;
-use gtk4::{Box, CssProvider, HeaderBar, Label, Orientation, Paned, StackSwitcher};
+use gtk4::{Box, CssProvider, HeaderBar, Label, Orientation, Paned};
 
 pub struct MegaBar;
 
