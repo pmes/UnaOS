@@ -13,6 +13,42 @@ impl MegaBar {
         left_content: &gtk4::Widget,
         right_content: &gtk4::Widget,
     ) -> gtk4::Widget {
+        // 0. The Dark Mode Hard-Wire (Direct GNOME DBus Wiretap)
+        if let Some(source) = gtk4::gio::SettingsSchemaSource::default() {
+            if source.lookup("org.gnome.desktop.interface", true).is_some() {
+                let settings = gtk4::gio::Settings::new("org.gnome.desktop.interface");
+
+                // Initial Check
+                if settings.string("color-scheme").as_str() == "prefer-dark" {
+                    window.add_css_class("una-dark");
+                    if let Some(gtk_settings) = gtk4::Settings::default() {
+                        gtk_settings.set_gtk_application_prefer_dark_theme(true);
+                    }
+                }
+
+                // Listen for GNOME Quick Settings changes
+                let win_clone = window.clone();
+                settings.connect_changed(Some("color-scheme"), move |s, _| {
+                    if s.string("color-scheme").as_str() == "prefer-dark" {
+                        win_clone.add_css_class("una-dark");
+                        if let Some(gtk_settings) = gtk4::Settings::default() {
+                            gtk_settings.set_gtk_application_prefer_dark_theme(true);
+                        }
+                    } else {
+                        win_clone.remove_css_class("una-dark");
+                        if let Some(gtk_settings) = gtk4::Settings::default() {
+                            gtk_settings.set_gtk_application_prefer_dark_theme(false);
+                        }
+                    }
+                });
+
+                // CRITICAL FIX: Keep the wiretap alive by tying it to the Window's lifecycle.
+                // The window will hold this closure (and the settings object) until it is destroyed.
+                window.connect_unrealize(move |_| {
+                    let _ = &settings;
+                });
+            }
+        }
         // 1. Inject CSS
         let provider = CssProvider::new();
         provider.load_from_string(
@@ -20,10 +56,47 @@ impl MegaBar {
             /* -- PANED HANDLE FIX -- */
             paned > separator { background-color: transparent; }
 
-            /* -- LEFT: GNOME BUILDER GRAY -- */
-            .builder-sidebar, .builder-sidebar:backdrop, .builder-sidebar > background {
-                background-color: @headerbar_bg_color; /* Maps exactly to #ebebed / #2e2e32 */
+            /* === LIGHT MODE (DEFAULT) === */
+            .builder-sidebar, .builder-sidebar > background {
+                background-color: #ebebed;
+                background-image: none;
             }
+            .builder-sidebar:backdrop, .builder-sidebar:backdrop > background {
+                background-color: #fafafa;
+                background-image: none;
+            }
+            .builder-view, .builder-view > background {
+                background-color: #ffffff;
+                background-image: none;
+                border-left: 1px solid @borders;
+            }
+            .builder-view:backdrop, .builder-view:backdrop > background {
+                background-color: #fcfcfc;
+                background-image: none;
+                border-left: 1px solid @borders;
+            }
+
+            /* === DARK MODE (HARDWIRED RUST CLASS) === */
+            .una-dark .builder-sidebar, .una-dark .builder-sidebar > background {
+                background-color: #2e2e32;
+                background-image: none;
+            }
+            .una-dark .builder-sidebar:backdrop, .una-dark .builder-sidebar:backdrop > background {
+                background-color: #26262a;
+                background-image: none;
+            }
+            .una-dark .builder-view, .una-dark .builder-view > background {
+                background-color: #1d1d20;
+                background-image: none;
+                border-left: 1px solid @borders;
+            }
+            .una-dark .builder-view:backdrop, .una-dark .builder-view:backdrop > background {
+                background-color: #18181a;
+                background-image: none;
+                border-left: 1px solid @borders;
+            }
+
+            /* -- CHILD TRANSPARENCY -- */
             .builder-sidebar box,
             .builder-sidebar scrolledwindow,
             .builder-sidebar listview,
@@ -35,12 +108,6 @@ impl MegaBar {
                 background-color: transparent;
                 background-image: none;
                 box-shadow: none;
-            }
-
-            /* -- RIGHT: GNOME BUILDER WHITE -- */
-            .builder-view {
-                background-color: @view_bg_color;
-                border-left: 1px solid @borders;
             }
 
             /* -- UNIFIED HEADERS & TABS -- */

@@ -137,9 +137,13 @@ fn build_gnome_ui(
     status_group.append(&pulse_icon);
     status_group.append(&token_label);
 
-    let left_tab_view = adw::TabView::new();
-    let left_tab_bar = adw::TabBar::new();
-    left_tab_bar.set_view(Some(&left_tab_view));
+    let left_stack = Stack::new();
+    left_stack.set_vexpand(true);
+    left_stack.set_transition_type(StackTransitionType::SlideLeftRight);
+
+    let left_switcher = StackSwitcher::new();
+    left_switcher.set_stack(Some(&left_stack));
+    left_switcher.set_halign(Align::Center); // Shrinks the pill to fit the icons
 
     // 1. Nodes Tab
     let store = gio::ListStore::new::<StringObject>();
@@ -311,9 +315,8 @@ fn build_gnome_ui(
     nodes_box.append(&node_actions_box);
 
     {
-        left_tab_view.append(&nodes_box);
-        let page = left_tab_view.page(&nodes_box);
-        page.set_title("Nodes");
+        let page = left_stack.add_named(&nodes_box, Some("nodes"));
+        page.set_icon_name("system-users-symbolic");
     }
 
     // 2. THE NEXUS Tab
@@ -394,9 +397,8 @@ fn build_gnome_ui(
 
     nexus_box.append(&nexus_list);
     {
-        left_tab_view.append(&nexus_box);
-        let page = left_tab_view.page(&nexus_box);
-        page.set_title("Nexus");
+        let page = left_stack.add_named(&nexus_box, Some("nexus"));
+        page.set_icon_name("network-workgroup-symbolic");
     }
 
     // 3. THE TeleHUD Tab (New Phase 3)
@@ -437,9 +439,8 @@ fn build_gnome_ui(
     telehud_box.append(&context_list);
 
     {
-        left_tab_view.append(&telehud_box);
-        let page = left_tab_view.page(&telehud_box);
-        page.set_title("TeleHUD");
+        let page = left_stack.add_named(&telehud_box, Some("telehud"));
+        page.set_icon_name("error-correct-symbolic");
     }
 
 
@@ -1031,10 +1032,9 @@ fn build_gnome_ui(
         page.set_title("Payload Editor");
     }
 
-    let left_tab_view_clone = left_tab_view.clone();
-
+    let left_stack_clone = left_stack.clone();
     sidebar_toggle.connect_toggled(move |btn| {
-        left_tab_view_clone.set_visible(btn.is_active());
+        left_stack_clone.set_visible(btn.is_active());
     });
 
     // Phase 3: Real-Time Dynamic Theme Listening
@@ -1192,11 +1192,11 @@ fn build_gnome_ui(
 
     crate::platforms::gnome::mega_bar::MegaBar::build(
         window.upcast_ref::<gtk4::ApplicationWindow>(),
-        "Vein (Trinity)",
+        "",
         status_group.upcast_ref::<gtk4::Widget>(),
-        left_tab_bar.upcast_ref::<gtk4::Widget>(),
+        left_switcher.upcast_ref::<gtk4::Widget>(), // Changed
         right_tab_bar.upcast_ref::<gtk4::Widget>(),
-        left_tab_view.upcast_ref::<gtk4::Widget>(),
+        left_stack.upcast_ref::<gtk4::Widget>(),    // Changed
         right_tab_view.upcast_ref::<gtk4::Widget>(),
     )
 }
@@ -1249,7 +1249,7 @@ fn build_gtk_ui(
 
     let pulse_icon = Spinner::new();
     // Give the spinner a unique class for targeting with inline CSS
-    pulse_icon.add_css_class("pulse-spinner");
+    pulse_icon.add_css_class("brain-symbolic");
     // Pulse starts stopped. We use GTK native properties.
     pulse_icon.set_spinning(false);
 
@@ -1433,7 +1433,8 @@ fn build_gtk_ui(
     node_actions_box.append(&composer_btn);
     nodes_box.append(&node_actions_box);
 
-    left_stack.add_titled(&nodes_box, Some("nodes"), "Nodes");
+    let page = left_stack.add_named(&nodes_box, Some("nodes"));
+    page.set_icon_name("system-users-symbolic");
 
     // 2. THE NEXUS Tab
     let nexus_box = Box::new(Orientation::Vertical, 0);
@@ -1512,7 +1513,8 @@ fn build_gtk_ui(
     nexus_list.append(&row_s9);
 
     nexus_box.append(&nexus_list);
-    left_stack.add_titled(&nexus_box, Some("nexus"), "Nexus");
+    let page = left_stack.add_named(&nexus_box, Some("nexus"));
+    page.set_icon_name("network-workgroup-symbolic");
 
     // 3. THE TeleHUD Tab (New Phase 3)
     let telehud_box = Box::new(Orientation::Vertical, 12);
@@ -1551,9 +1553,8 @@ fn build_gtk_ui(
     context_list.append(&Label::new(Some("handlers/vein/src/lib.rs (0.80)")));
     telehud_box.append(&context_list);
 
-    left_stack.add_titled(&telehud_box, Some("telehud"), "TeleHUD");
-
-
+    let page = left_stack.add_named(&telehud_box, Some("telehud"));
+    page.set_icon_name("error-correct-symbolic");
 
     // === THE WORKSPACE STACK ===
     let workspace_stack = Stack::new();
@@ -2293,13 +2294,14 @@ fn build_gtk_ui(
 
     let left_switcher = StackSwitcher::new();
     left_switcher.set_stack(Some(&left_stack));
+    left_switcher.set_halign(Align::Center); // Add this line to shrink to fit!
 
     let right_switcher = StackSwitcher::new();
     right_switcher.set_stack(Some(&workspace_stack));
 
     crate::platforms::gtk::mega_bar::MegaBar::build(
         window.upcast_ref::<gtk4::ApplicationWindow>(),
-        "Vein (Trinity)",
+        "",
         status_group.upcast_ref::<gtk4::Widget>(),
         left_switcher.upcast_ref::<gtk4::Widget>(),
         right_switcher.upcast_ref::<gtk4::Widget>(),

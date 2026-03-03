@@ -64,7 +64,7 @@ impl Backend {
                 .application(app)
                 .default_width(1200)
                 .default_height(800)
-                .title("Vein (Trinity)")
+                .title("")
                 .build();
 
             #[cfg(not(feature = "gnome"))]
@@ -72,7 +72,7 @@ impl Backend {
                 .application(app)
                 .default_width(1200)
                 .default_height(800)
-                .title("Vein (Trinity)")
+                .title("")
                 .build();
 
             // Execute bootstrap if available

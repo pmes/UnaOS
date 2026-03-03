@@ -6,7 +6,7 @@ pub struct MegaBar;
 
 impl MegaBar {
     pub fn build(
-        _window: &gtk4::ApplicationWindow,
+        window: &gtk4::ApplicationWindow,
         _title: &str, // Native GNOME handles titles via the window system or we can let it be
         status_widget: &gtk4::Widget,
         left_tabs: &gtk4::Widget,
@@ -14,6 +14,20 @@ impl MegaBar {
         left_content: &gtk4::Widget,
         right_content: &gtk4::Widget,
     ) -> gtk4::Widget {
+        // 0. The Dark Mode Hard-Wire (GNOME)
+        let style_manager = adw::StyleManager::default();
+        let win_clone = window.clone();
+        if style_manager.is_dark() {
+            win_clone.add_css_class("una-dark");
+        }
+        style_manager.connect_dark_notify(move |sm| {
+            if sm.is_dark() {
+                win_clone.add_css_class("una-dark");
+            } else {
+                win_clone.remove_css_class("una-dark");
+            }
+        });
+
         // 1. Inject CSS
         let provider = CssProvider::new();
         provider.load_from_string(
@@ -21,10 +35,47 @@ impl MegaBar {
             /* -- PANED HANDLE FIX -- */
             paned > separator { background-color: transparent; }
 
-            /* -- LEFT: GNOME BUILDER GRAY -- */
-            .builder-sidebar, .builder-sidebar:backdrop, .builder-sidebar > background {
-                background-color: @headerbar_bg_color; /* Maps exactly to #ebebed / #2e2e32 */
+            /* === LIGHT MODE (DEFAULT) === */
+            .builder-sidebar, .builder-sidebar > background {
+                background-color: #ebebed;
+                background-image: none;
             }
+            .builder-sidebar:backdrop, .builder-sidebar:backdrop > background {
+                background-color: #fafafa;
+                background-image: none;
+            }
+            .builder-view, .builder-view > background {
+                background-color: #ffffff;
+                background-image: none;
+                border-left: 1px solid @borders;
+            }
+            .builder-view:backdrop, .builder-view:backdrop > background {
+                background-color: #fcfcfc;
+                background-image: none;
+                border-left: 1px solid @borders;
+            }
+
+            /* === DARK MODE (HARDWIRED RUST CLASS) === */
+            .una-dark .builder-sidebar, .una-dark .builder-sidebar > background {
+                background-color: #2e2e32;
+                background-image: none;
+            }
+            .una-dark .builder-sidebar:backdrop, .una-dark .builder-sidebar:backdrop > background {
+                background-color: #26262a;
+                background-image: none;
+            }
+            .una-dark .builder-view, .una-dark .builder-view > background {
+                background-color: #1d1d20;
+                background-image: none;
+                border-left: 1px solid @borders;
+            }
+            .una-dark .builder-view:backdrop, .una-dark .builder-view:backdrop > background {
+                background-color: #18181a;
+                background-image: none;
+                border-left: 1px solid @borders;
+            }
+
+            /* -- CHILD TRANSPARENCY -- */
             .builder-sidebar box,
             .builder-sidebar scrolledwindow,
             .builder-sidebar listview,
@@ -38,12 +89,6 @@ impl MegaBar {
                 box-shadow: none;
             }
 
-            /* -- RIGHT: GNOME BUILDER WHITE -- */
-            .builder-view {
-                background-color: @view_bg_color;
-                border-left: 1px solid @borders;
-            }
-
             /* -- UNIFIED HEADERS & TABS -- */
             headerbar {
                 background: transparent;
@@ -54,14 +99,6 @@ impl MegaBar {
             tabbar {
                 background: transparent;
                 border-bottom: 1px solid @borders;
-            }
-
-            /* -- GTK FALLBACK MEGA BAR BORDERS -- */
-            .title-vbox {
-                border-bottom: 1px solid @borders;
-            }
-            .title-vbox stackswitcher {
-                margin-left: 8px; margin-right: 8px; margin-bottom: 4px;
             }
             ",
         );
