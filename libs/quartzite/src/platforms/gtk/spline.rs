@@ -122,22 +122,14 @@ fn build_gnome_ui(
 
 
 
+
             /* Shadow Emulation for GTK/Adw Split */
             .elevated-quadrant {
-                box-shadow: -3px 0 5px rgba(0, 0, 0, 0.07);
+                box-shadow: 3px 0 5px rgba(0, 0, 0, 0.07), 0 3px 5px rgba(0, 0, 0, 0.07);
                 clip-path: inset(-10px -10px -10px -10px);
             }
             paned > separator {
                 background-color: transparent;
-                min-width: 0; min-height: 0;
-            }
-
-            #left { background-color: #ebebed; }
-            #right { background-color: #ffffff; }
-
-            @media (prefers-color-scheme: dark) {
-                #left { background-color: #2e2e32; }
-                #right { background-color: #1d1d20; }
             }
             /* GNOME BUILDER HEADER FUSION TABS */
             .builder-tab {
@@ -194,6 +186,7 @@ fn build_gnome_ui(
     main_h_paned.set_resize_start_child(false);
 
     let left_toolbar = adw::ToolbarView::new();
+        left_toolbar.add_css_class("elevated-quadrant");
         left_toolbar.set_widget_name("left");
 
     left_toolbar.add_css_class("background");
@@ -205,6 +198,7 @@ fn build_gnome_ui(
         .build();
 
     let left_tab_view = adw::TabView::new();
+        left_tab_view.add_css_class("background");
     let left_tab_bar = adw::TabBar::new();
     left_tab_bar.set_view(Some(&left_tab_view));
 
@@ -556,7 +550,7 @@ fn build_gnome_ui(
     // 4. THE WORKSPACE (Right Pane)
     let right_toolbar = adw::ToolbarView::new();
         right_toolbar.set_widget_name("right");
-        right_toolbar.add_css_class("elevated-quadrant");
+
         right_toolbar.add_css_class("view");
 
     let command_header_bar = adw::HeaderBar::builder()
@@ -566,6 +560,7 @@ fn build_gnome_ui(
     command_header_bar.pack_start(&status_group);
 
     let right_tab_view = adw::TabView::new();
+        right_tab_view.add_css_class("view");
     let right_tab_bar = adw::TabBar::new();
     right_tab_bar.set_view(Some(&right_tab_view));
 
@@ -1324,22 +1319,14 @@ fn build_gtk_ui(
             .role-system { color: #888888; font-style: italic; }
 
 
+
             /* Shadow Emulation for GTK/Adw Split */
             .elevated-quadrant {
-                box-shadow: -3px 0 5px rgba(0, 0, 0, 0.07);
+                box-shadow: 3px 0 5px rgba(0, 0, 0, 0.07), 0 3px 5px rgba(0, 0, 0, 0.07);
                 clip-path: inset(-10px -10px -10px -10px);
             }
             paned > separator {
                 background-color: transparent;
-                min-width: 0; min-height: 0;
-            }
-
-            #left { background-color: #ebebed; }
-            #right { background-color: #ffffff; }
-
-            @media (prefers-color-scheme: dark) {
-                #left { background-color: #2e2e32; }
-                #right { background-color: #1d1d20; }
             }
             /* GNOME BUILDER HEADER FUSION TABS */
             .builder-tab {
@@ -1396,6 +1383,7 @@ fn build_gtk_ui(
     main_h_paned.set_resize_start_child(false);
 
     let left_vbox = Box::new(Orientation::Vertical, 0);
+        left_vbox.add_css_class("elevated-quadrant");
         left_vbox.set_widget_name("left");
 
     left_vbox.add_css_class("background");
@@ -1696,15 +1684,6 @@ fn build_gtk_ui(
     left_stack.add_titled(&telehud_box, Some("telehud"), "TeleHUD");
 
     {
-        let left_switcher = StackSwitcher::builder()
-            .stack(&left_stack)
-            .halign(gtk4::Align::Center)
-            .hexpand(true)
-            .build();
-        let left_toolbar_box = Box::new(Orientation::Horizontal, 0);
-        left_toolbar_box.add_css_class("toolbar");
-        left_toolbar_box.append(&left_switcher);
-        left_vbox.append(&left_toolbar_box);
         left_vbox.append(&left_stack);
         main_h_paned.set_start_child(Some(&left_vbox));
     }
@@ -1712,13 +1691,14 @@ fn build_gtk_ui(
     // --- Right Pane (The Command Center) ---
     let right_vbox = Box::new(Orientation::Vertical, 0);
         right_vbox.set_widget_name("right");
-        right_vbox.add_css_class("elevated-quadrant");
+
         right_vbox.add_css_class("view");
 
     right_vbox.set_hexpand(true);
 
     // === THE WORKSPACE STACK ===
     let workspace_stack = Stack::new();
+        workspace_stack.add_css_class("view");
     workspace_stack.set_vexpand(true);
     workspace_stack.set_transition_type(StackTransitionType::SlideLeftRight);
 
@@ -2293,22 +2273,6 @@ fn build_gtk_ui(
     {
         workspace_stack.add_titled(&payload_page, Some("editor"), "Payload Editor");
 
-        let right_switcher = StackSwitcher::builder()
-            .stack(&workspace_stack)
-            .halign(gtk4::Align::Center)
-            .hexpand(true)
-            .build();
-        let right_toolbar_box = Box::new(Orientation::Horizontal, 0);
-        right_toolbar_box.add_css_class("toolbar");
-        right_toolbar_box.append(&right_switcher);
-
-        // Re-add status group in pure GTK fallback since it was not appended to adw::HeaderBar
-        let fallback_header_container = Box::new(Orientation::Horizontal, 0);
-        fallback_header_container.add_css_class("titlebar");
-        fallback_header_container.append(&status_group);
-
-        right_vbox.append(&fallback_header_container);
-        right_vbox.append(&right_toolbar_box);
         right_vbox.append(&workspace_stack);
 
         main_h_paned.set_end_child(Some(&right_vbox));
