@@ -87,11 +87,12 @@ impl DiskManager {
         content: &str,
         timestamp: &str,
         embedding: Vec<f32>,
+        memory_type: &str,
     ) -> Result<()> {
         let mut attrs = BTreeMap::new();
         attrs.insert(
             "type".to_string(),
-            AttributeValue::String("chat".to_string()),
+            AttributeValue::String(memory_type.to_string()),
         );
         attrs.insert(
             "sender".to_string(),
@@ -122,8 +123,8 @@ impl DiskManager {
         Ok(())
     }
 
-    pub fn search_memories(&mut self, embedding: &[f32], threshold: f32) -> Result<Vec<String>> {
-        // Query syntax: similarity(embedding, [0.1,0.2,...]) > 0.7
+    pub fn search_memories(&mut self, embedding: &[f32], threshold: f32, memory_type: &str) -> Result<Vec<String>> {
+        // Query syntax: similarity(embedding, [0.1,0.2,...]) > 0.7 AND type == "engram"
         let vec_str = format!(
             "[{}]",
             embedding
@@ -132,7 +133,7 @@ impl DiskManager {
                 .collect::<Vec<_>>()
                 .join(",")
         );
-        let query_str = format!("similarity(embedding, {}) > {}", vec_str, threshold);
+        let query_str = format!("similarity(embedding, {}) > {} AND type == \"{}\"", vec_str, threshold, memory_type);
 
         let mut inodes = self
             .fs

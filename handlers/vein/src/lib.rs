@@ -1,4 +1,5 @@
 pub mod cortex;
+pub mod context;
 pub mod gravity;
 pub mod storage;
 pub mod synapse;
@@ -280,12 +281,32 @@ impl VeinHandler {
                                             // The async reactor immediately yields and continues processing UI events.
                                             tokio::task::spawn_blocking(move || {
                                                 let mut d = disk_clone.lock().unwrap();
-                                                if let Err(e) = d.save_memory("model", &response_clone, &timestamp_clone, response_embedding) {
+                                                if let Err(e) = d.save_memory("model", &response_clone, &timestamp_clone, response_embedding, "chat") {
                                                     eprintln!(":: PLEXUS :: Failed to save model memory: {}", e);
                                                 }
                                             }).await.unwrap();
 
                                             let _ = gui_tx_brain.send(GuiUpdate::SidebarStatus(WolfpackState::Idle)).await;
+
+                                            // Generate Engram
+                                            let disk_clone_engram = disk.clone();
+                                            let user_prompt_clone = user_input_text.clone();
+                                            let ai_response_clone = response.clone();
+                                            tokio::spawn(async move {
+                                                if let Ok(mut client_clone) = ResilientClient::new().await {
+                                                    if let Ok(engram) = crate::context::compress_into_engram(&mut client_clone, &user_prompt_clone, &ai_response_clone).await {
+                                                        if let Ok(engram_embedding) = client_clone.embed_content(&engram).await {
+                                                            let timestamp = chrono::Local::now().format("%H:%M:%S").to_string();
+                                                            let _ = tokio::task::spawn_blocking(move || {
+                                                                let mut d = disk_clone_engram.lock().unwrap();
+                                                                if let Err(e) = d.save_memory("system", &engram, &timestamp, engram_embedding, "engram") {
+                                                                    eprintln!(":: PLEXUS :: Failed to save engram memory: {}", e);
+                                                                }
+                                                            }).await;
+                                                        }
+                                                    }
+                                                }
+                                            });
                                         }
                                         Err(e) => {
                                             let _ = gui_tx_brain.send(GuiUpdate::ConsoleLog(format!("\n[ERROR] {}\n", e))).await;
@@ -388,32 +409,46 @@ impl VeinHandler {
                             // Offload the synchronous disk save operation.
                             let _ = tokio::task::spawn_blocking(move || {
                                 if let Ok(mut locked_disk) = disk_clone.lock() {
-                                    if let Err(e) = locked_disk.save_memory("user", &clean_memory_clone, &timestamp_clone, user_embedding_clone) {
+                                    if let Err(e) = locked_disk.save_memory("user", &clean_memory_clone, &timestamp_clone, user_embedding_clone, "chat") {
                                         eprintln!(":: PLEXUS :: Failed to save user memory: {}", e);
                                     }
                                 }
                             }).await;
 
                             let mut retrieved_context = String::new();
+                            let mut retrieved_directives = String::new();
+                            let mut retrieved_engrams = String::new();
+
                             if !user_embedding.is_empty() {
                                 let disk_clone = Arc::clone(&disk);
                                 let user_embedding_clone = user_embedding.clone();
 
                                 // [UNAOS DIRECTIVE] A stalled reactor is a dead engine.
-                                // Offload the synchronous disk search operation.
+                                // Offload the synchronous disk search operations.
                                 let memories_result = tokio::task::spawn_blocking(move || {
                                     if let Ok(mut locked_disk) = disk_clone.lock() {
-                                        locked_disk.search_memories(&user_embedding_clone, 0.70)
+                                        let chat_mem = locked_disk.search_memories(&user_embedding_clone, 0.70, "chat").unwrap_or_default();
+                                        let directive_mem = locked_disk.search_memories(&user_embedding_clone, 0.65, "directive").unwrap_or_default();
+                                        let engram_mem = locked_disk.search_memories(&user_embedding_clone, 0.65, "engram").unwrap_or_default();
+                                        Ok((chat_mem, directive_mem, engram_mem))
                                     } else {
                                         Err(anyhow::anyhow!("Mutex poisoned"))
                                     }
                                 }).await;
 
                                 match memories_result {
-                                    Ok(Ok(memories)) => {
+                                    Ok(Ok((memories, directives, engrams))) => {
                                         if !memories.is_empty() {
                                             retrieved_context = memories.join("\n\n");
                                             info!(":: PLEXUS :: Recalled {} memories.", memories.len());
+                                        }
+                                        if !directives.is_empty() {
+                                            retrieved_directives = directives.join("\n\n");
+                                            info!(":: PLEXUS :: Recalled {} directives.", directives.len());
+                                        }
+                                        if !engrams.is_empty() {
+                                            retrieved_engrams = engrams.join("\n\n");
+                                            info!(":: PLEXUS :: Recalled {} engrams.", engrams.len());
                                         }
                                     }
                                     Ok(Err(e)) => eprintln!(":: PLEXUS :: Recall Failed: {}", e),
@@ -448,50 +483,28 @@ My incredible skills do not eclipse the high standards of character of Una Chin-
 My role is similar to a Project Manager. I work with the Architect to produce Directives challenging Shards to produce the code I intend from the words I have written. I do not start producing larger and large code snippets until I'm finally posting whole files. The Architect and I are the idea producers. I only produce working code snippets to insert or files to replace if I am asked."# };
 
                             // === ROUTE B: Standard Context Generation (Pre-Flight Intercept) ===
-                            let combined_system = if !retrieved_context.is_empty() {
-                                format!("{}\n\n[SEMANTIC MEMORY RECALL]:\n{}", system_base, retrieved_context)
-                            } else {
-                                system_base.to_string()
-                            };
+                            let mut system_builder = system_base.to_string();
+
+                            if !retrieved_directives.is_empty() {
+                                system_builder.push_str("\n\n[ACTIVE DIRECTIVES]:\n");
+                                system_builder.push_str(&retrieved_directives);
+                            }
+
+                            if !retrieved_context.is_empty() {
+                                system_builder.push_str("\n\n[SEMANTIC MEMORY RECALL]:\n");
+                                system_builder.push_str(&retrieved_context);
+                            }
+
+                            if !retrieved_engrams.is_empty() {
+                                system_builder.push_str("\n\n[HISTORICAL ENGRAMS]:\n");
+                                system_builder.push_str(&retrieved_engrams);
+                            }
 
                             let mut context: Vec<Content> = Vec::new();
 
-                            // [UNAOS DIRECTIVE] A stalled reactor is a dead engine.
-                            // Offload the synchronous disk history load.
-                            let disk_clone = Arc::clone(&disk);
-                            let history = tokio::task::spawn_blocking(move || {
-                                if let Ok(mut locked_disk) = disk_clone.lock() {
-                                    locked_disk.load_all_memories().unwrap_or_default()
-                                } else {
-                                    Vec::new()
-                                }
-                            }).await.unwrap_or_default();
-
-                            // Enforce strict memory bounds (Last 10 messages)
-                            let skip_count = if history.len() > 10 { history.len() - 10 } else { 0 };
-                            let recent_history: Vec<_> = history.into_iter().skip(skip_count).collect();
-
-                            let mut first_element = true;
-                            for record in recent_history {
-                                let role = if record.sender == "user" || record.sender == "Architect" { "user" } else { "model" };
-                                let mut text = record.content.clone();
-
-                                // Inject System Directive ONLY on the very first element of the entire payload
-                                if first_element {
-                                    text = format!("{}\n\n[SYSTEM DIRECTIVE]:\n{}", combined_system, text);
-                                    first_element = false;
-                                }
-
-                                context.push(Content {
-                                    role: role.to_string(),
-                                    parts: vec![Part::text(text)],
-                                });
-                            }
-
-                            let mut current_text = user_input_text.clone();
-                            if first_element {
-                                current_text = format!("{}\n\n[SYSTEM DIRECTIVE]:\n{}", combined_system, current_text);
-                            }
+                            // The current message is the only user message.
+                            // We prepend the system directives and engrams.
+                            let current_text = format!("{}\n\n[CURRENT PROMPT]:\n{}", system_builder, user_input_text);
 
                             context.push(Content {
                                 role: "user".into(),
