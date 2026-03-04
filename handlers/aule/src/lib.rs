@@ -1,7 +1,7 @@
 use anyhow::{Context as AnyhowContext, Result};
 use async_channel::Sender;
 use bandy::{BandyMember, SMessage};
-use elessar::gneiss_pal::Event;
+use gneiss_pal::Event;
 use elessar::{Context, Spline};
 use gtk4::prelude::*;
 use gtk4::{Box, Button, Orientation, Widget};

@@ -247,6 +247,7 @@ dependencies = [
  "bandy",
  "elessar",
  "glib 0.21.5",
+ "gneiss_pal",
  "gtk4",
 ]
 

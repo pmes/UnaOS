@@ -7,7 +7,7 @@ use gtk4::{Align, Box, Label, Orientation, Widget};
 
 // Gix (Gitoxide) Imports
 use gix::{discover};
-use gix::object::tree::diff::change::Event;
+use gix::object::tree::diff::Change;
 use gix::object::tree::diff::Action;
 
 #[cfg(feature = "gtk4")]
@@ -92,21 +92,21 @@ impl Vaire {
         // We use tree_a.changes().for_each_to_obtain_tree(&tree_b, ...)
         tree_a.changes()?
             .for_each_to_obtain_tree(&tree_b, |change| {
-                match change.event {
-                    Event::Addition { .. } => {
-                        diff_payload.push_str(&format!("+ Added: {:?}\n", change.location));
+                match change {
+                    Change::Addition { location, .. } => {
+                        diff_payload.push_str(&format!("+ Added: {:?}\n", location));
                     }
-                    Event::Deletion { .. } => {
-                        diff_payload.push_str(&format!("- Deleted: {:?}\n", change.location));
+                    Change::Deletion { location, .. } => {
+                        diff_payload.push_str(&format!("- Deleted: {:?}\n", location));
                     }
-                    Event::Modification { .. } => {
-                        diff_payload.push_str(&format!("~ Modified: {:?}\n", change.location));
+                    Change::Modification { location, .. } => {
+                        diff_payload.push_str(&format!("~ Modified: {:?}\n", location));
                     }
-                    Event::Rewrite { .. } => {
-                        diff_payload.push_str(&format!("* Rewritten: {:?}\n", change.location));
+                    Change::Rewrite { location, .. } => {
+                        diff_payload.push_str(&format!("* Rewritten: {:?}\n", location));
                     }
                 }
-                Ok::<_, anyhow::Error>(Action::Continue)
+                Ok::<_, anyhow::Error>(Action::Continue(()))
             })?;
 
         if diff_payload.is_empty() {

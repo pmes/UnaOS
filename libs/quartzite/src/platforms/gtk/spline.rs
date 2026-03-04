@@ -509,24 +509,26 @@ fn build_gnome_ui(
         let bubble = Box::new(Orientation::Vertical, 4);
         bubble.add_css_class("bubble-box");
         bubble.set_width_request(400);
+
         let meta_label = Label::new(None);
         meta_label.set_xalign(0.0);
         meta_label.add_css_class("dim-label");
         bubble.append(&meta_label);
+
+        // --- Standard Mode (Message View) ---
         let chat_content_buffer = sourceview5::Buffer::new(None);
         let chat_content_view = SourceView::with_buffer(&chat_content_buffer);
         chat_content_view.set_editable(false);
         chat_content_view.set_wrap_mode(gtk4::WrapMode::WordChar);
         chat_content_view.set_show_line_numbers(false);
-        // Removed manual CSS classes for Phase 1
-        // chat_content_view.add_css_class("transparent-text");
         chat_content_view.set_monospace(true);
         chat_content_view.set_width_request(800);
         chat_content_view.set_hexpand(true);
         chat_content_view.set_focusable(true);
-        // Phase 2: Add view class
         chat_content_view.add_css_class("view");
         bubble.append(&chat_content_view);
+
+        // --- Standard Mode (Expander) ---
         let expander = Expander::new(None);
         let expander_label = Label::new(None);
         expander.set_child(Some(&expander_label));
@@ -543,6 +545,70 @@ fn build_gnome_ui(
             .build();
         expander.set_child(Some(&payload_scroll));
         bubble.append(&expander);
+
+        // --- Staging Mode (Payload Editor) ---
+        let staging_box = Box::new(Orientation::Vertical, 8);
+        staging_box.set_visible(false);
+
+        let system_label = Label::builder().label("SYSTEM").xalign(0.0).css_classes(vec!["dim-label"]).build();
+        let system_view = SourceView::builder().wrap_mode(gtk4::WrapMode::WordChar).editable(true).monospace(true).build();
+        system_view.add_css_class("view");
+        let sys_scroll = ScrolledWindow::builder().child(&system_view).min_content_height(100).build();
+        staging_box.append(&system_label);
+        staging_box.append(&sys_scroll);
+
+        let directives_label = Label::builder().label("DIRECTIVES").xalign(0.0).css_classes(vec!["dim-label"]).build();
+        let directives_view = SourceView::builder().wrap_mode(gtk4::WrapMode::WordChar).editable(true).monospace(true).build();
+        directives_view.add_css_class("view");
+        let dir_scroll = ScrolledWindow::builder().child(&directives_view).min_content_height(100).build();
+        staging_box.append(&directives_label);
+        staging_box.append(&dir_scroll);
+
+        let engrams_label = Label::builder().label("ENGRAMS").xalign(0.0).css_classes(vec!["dim-label"]).build();
+        let engrams_view = SourceView::builder().wrap_mode(gtk4::WrapMode::WordChar).editable(true).monospace(true).build();
+        engrams_view.add_css_class("view");
+        let eng_scroll = ScrolledWindow::builder().child(&engrams_view).min_content_height(100).build();
+        staging_box.append(&engrams_label);
+        staging_box.append(&eng_scroll);
+
+        let prompt_label = Label::builder().label("PROMPT").xalign(0.0).css_classes(vec!["dim-label"]).build();
+        let prompt_view = SourceView::builder().wrap_mode(gtk4::WrapMode::WordChar).editable(true).monospace(true).build();
+        prompt_view.add_css_class("view");
+        let prm_scroll = ScrolledWindow::builder().child(&prompt_view).min_content_height(100).build();
+        staging_box.append(&prompt_label);
+        staging_box.append(&prm_scroll);
+
+        let actions_box = Box::new(Orientation::Horizontal, 8);
+        actions_box.set_halign(Align::End);
+        let cancel_btn = Button::builder().icon_name("stop-sign-large-outline-symbolic").tooltip_text("Delete Post").css_classes(vec!["flat", "destructive-action"]).build();
+        let dispatch_btn = Button::builder().icon_name("document-save-symbolic").tooltip_text("Save and Send").css_classes(vec!["suggested-action"]).build();
+        actions_box.append(&cancel_btn);
+        actions_box.append(&dispatch_btn);
+        staging_box.append(&actions_box);
+
+        bubble.append(&staging_box);
+
+        // --- Pulse Mode (Animation) ---
+        let pulse_box = Box::new(Orientation::Horizontal, 8);
+        pulse_box.set_visible(false);
+        pulse_box.set_halign(Align::Center);
+        pulse_box.set_margin_top(12);
+        pulse_box.set_margin_bottom(12);
+
+        let pulse_spinner = Spinner::new();
+        pulse_spinner.set_spinning(true);
+        pulse_spinner.add_css_class("pulse-spinner"); // Added CSS hook for Una Blue
+
+        let pulse_icon = Image::builder()
+            .icon_name("brain-symbolic")
+            .pixel_size(32)
+            .build();
+        pulse_icon.add_css_class("accent");
+
+        pulse_box.append(&pulse_icon);
+        pulse_box.append(&pulse_spinner);
+        bubble.append(&pulse_box);
+
         root.append(&bubble);
         let right_spacer = Box::new(Orientation::Horizontal, 0);
         right_spacer.set_hexpand(true);
@@ -576,83 +642,238 @@ fn build_gnome_ui(
         item.set_child(Some(&root));
     });
 
+    let tx_dispatch = tx_event.clone();
     console_factory.connect_bind(move |_factory, item| {
         let item = item.downcast_ref::<ListItem>().unwrap();
         let root = item.child().unwrap().downcast::<Box>().unwrap();
-        let mut iter = root.first_child();
-        let left_spacer = iter.unwrap().downcast::<Box>().unwrap();
-        iter = left_spacer.next_sibling();
-        let bubble = iter.unwrap().downcast::<Box>().unwrap();
-        iter = bubble.next_sibling();
-        let right_spacer = iter.unwrap().downcast::<Box>().unwrap();
+
+        let left_spacer = root.first_child().unwrap().downcast::<Box>().unwrap();
+        let bubble = left_spacer.next_sibling().unwrap().downcast::<Box>().unwrap();
+        let right_spacer = bubble.next_sibling().unwrap().downcast::<Box>().unwrap();
+
         let obj = item.item().unwrap().downcast::<DispatchObject>().unwrap();
 
-        let mut iter_bubble = bubble.first_child();
-        let meta_label = iter_bubble.unwrap().downcast::<Label>().unwrap();
-        iter_bubble = meta_label.next_sibling();
-        let chat_view = iter_bubble.unwrap().downcast::<SourceView>().unwrap();
-        iter_bubble = chat_view.next_sibling();
-        let expander = iter_bubble.unwrap().downcast::<Expander>().unwrap();
+        let meta_label = bubble.first_child().unwrap().downcast::<Label>().unwrap();
+        let chat_view = meta_label.next_sibling().unwrap().downcast::<SourceView>().unwrap();
+        let expander = chat_view.next_sibling().unwrap().downcast::<Expander>().unwrap();
+        let staging_box = expander.next_sibling().unwrap().downcast::<Box>().unwrap();
+        let pulse_box = staging_box.next_sibling().unwrap().downcast::<Box>().unwrap();
 
-        let is_chat = obj.is_chat();
-        let sender = obj.sender();
-        let timestamp = obj.timestamp();
-        let content = obj.content();
-        let subject = obj.subject();
+        // Extract children for Staging mode
+        let sys_scroll = staging_box.first_child().unwrap().next_sibling().unwrap().downcast::<ScrolledWindow>().unwrap();
+        let system_view = sys_scroll.child().unwrap().downcast::<SourceView>().unwrap();
+
+        let dir_scroll = sys_scroll.next_sibling().unwrap().next_sibling().unwrap().downcast::<ScrolledWindow>().unwrap();
+        let directives_view = dir_scroll.child().unwrap().downcast::<SourceView>().unwrap();
+
+        let eng_scroll = dir_scroll.next_sibling().unwrap().next_sibling().unwrap().downcast::<ScrolledWindow>().unwrap();
+        let engrams_view = eng_scroll.child().unwrap().downcast::<SourceView>().unwrap();
+
+        let prm_scroll = eng_scroll.next_sibling().unwrap().next_sibling().unwrap().downcast::<ScrolledWindow>().unwrap();
+        let prompt_view = prm_scroll.child().unwrap().downcast::<SourceView>().unwrap();
+
+        let actions_box = prm_scroll.next_sibling().unwrap().downcast::<Box>().unwrap();
+        let cancel_btn = actions_box.first_child().unwrap().downcast::<Button>().unwrap();
+        let dispatch_btn = cancel_btn.next_sibling().unwrap().downcast::<Button>().unwrap();
+
+        let message_type = obj.message_type();
 
         bubble.remove_css_class("architect-bubble");
         bubble.remove_css_class("una-bubble");
         left_spacer.set_visible(false);
         right_spacer.set_visible(false);
 
-        if is_chat {
-            chat_view.set_visible(true);
-            expander.set_visible(false);
-            meta_label.set_text(&format!("{} • {}", sender, timestamp));
-            meta_label.remove_css_class("role-architect");
-            meta_label.remove_css_class("role-una");
-            meta_label.remove_css_class("role-system");
-            if sender == "Architect" {
-                meta_label.add_css_class("role-architect");
-                bubble.add_css_class("architect-bubble");
-                left_spacer.set_visible(true);
-                right_spacer.set_visible(false);
-                meta_label.set_xalign(1.0);
-            } else {
-                if sender == "Una-Prime" {
-                    meta_label.add_css_class("role-una");
-                } else {
-                    meta_label.add_css_class("role-system");
+        chat_view.set_visible(false);
+        expander.set_visible(false);
+        staging_box.set_visible(false);
+        pulse_box.set_visible(false);
+
+        if message_type == 1 {
+            // STAGING MODE
+            staging_box.set_visible(true);
+            bubble.add_css_class("architect-bubble");
+            left_spacer.set_visible(true);
+            right_spacer.set_visible(false);
+
+            meta_label.set_text("PRE-FLIGHT STAGING");
+            meta_label.add_css_class("role-architect");
+            meta_label.set_xalign(1.0);
+
+            system_view.buffer().set_text(&obj.system_text());
+            directives_view.buffer().set_text(&obj.directives_text());
+            engrams_view.buffer().set_text(&obj.engrams_text());
+            prompt_view.buffer().set_text(&obj.prompt_text());
+
+            let is_locked = obj.is_locked();
+            system_view.set_editable(!is_locked);
+            directives_view.set_editable(!is_locked);
+            engrams_view.set_editable(!is_locked);
+            prompt_view.set_editable(!is_locked);
+            dispatch_btn.set_sensitive(!is_locked);
+            cancel_btn.set_sensitive(!is_locked);
+
+            let tx_clone = tx_dispatch.clone();
+            let obj_clone = obj.clone();
+            let sys_view_clone = system_view.clone();
+            let dir_view_clone = directives_view.clone();
+            let eng_view_clone = engrams_view.clone();
+            let prm_view_clone = prompt_view.clone();
+
+            let bubble_clone = bubble.clone();
+            let console_store_clone = console_store.clone();
+
+            cancel_btn.connect_clicked(move |_| {
+                let dialog = gtk4::MessageDialog::builder()
+                    .text("Delete Payload?")
+                    .secondary_text("Are you sure you want to discard this pre-flight payload? This cannot be undone.")
+                    .message_type(gtk4::MessageType::Warning)
+                    .buttons(gtk4::ButtonsType::Cancel)
+                    .modal(true)
+                    .build();
+
+                dialog.add_button("Delete", gtk4::ResponseType::DestructiveAction);
+
+                let obj_cancel = obj_clone.clone();
+                let store_cancel = console_store_clone.clone();
+                dialog.connect_response(move |d, response| {
+                    if response == gtk4::ResponseType::DestructiveAction {
+                        // Remove from store
+                        let n = store_cancel.n_items();
+                        for i in 0..n {
+                            if let Some(item) = store_cancel.item(i).and_downcast::<DispatchObject>() {
+                                if item.id() == obj_cancel.id() {
+                                    store_cancel.remove(i);
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    d.close();
+                });
+
+                let root_win = bubble_clone.root().and_downcast::<gtk4::Window>();
+                if let Some(win) = root_win {
+                    dialog.set_transient_for(Some(&win));
                 }
-                bubble.add_css_class("una-bubble");
-                left_spacer.set_visible(false);
-                right_spacer.set_visible(true);
-                meta_label.set_xalign(0.0);
-            }
-            let is_expanded = obj.is_expanded();
-            let line_count = content.lines().count();
-            if line_count > 11 && !is_expanded {
-                let truncated: String = content.lines().take(11).collect::<Vec<&str>>().join("\n")
-                    + "\n\n... [Click to expand]";
-                chat_view.buffer().set_text(&truncated);
-            } else {
-                chat_view.buffer().set_text(&content);
-            }
-        } else {
-            chat_view.set_visible(false);
-            expander.set_visible(true);
+
+                dialog.present();
+            });
+
+            let tx_clone2 = tx_dispatch.clone();
+            let obj_clone2 = obj.clone();
+            let sys_view_clone2 = system_view.clone();
+            let dir_view_clone2 = directives_view.clone();
+            let eng_view_clone2 = engrams_view.clone();
+            let prm_view_clone2 = prompt_view.clone();
+            let cancel_btn_clone = cancel_btn.clone();
+            let dispatch_btn_clone = dispatch_btn.clone();
+            let console_store_pulse = console_store.clone();
+
+            dispatch_btn_clone.connect_clicked(move |_| {
+                obj_clone2.set_is_locked(true);
+                sys_view_clone2.set_editable(false);
+                dir_view_clone2.set_editable(false);
+                eng_view_clone2.set_editable(false);
+                prm_view_clone2.set_editable(false);
+                cancel_btn_clone.set_sensitive(false);
+                dispatch_btn_clone.set_sensitive(false);
+
+                // Add pulse
+                let id = format!("{}-pulse", chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0));
+                let pulse_obj = DispatchObject::new_pulse(&id);
+                console_store_pulse.append(&pulse_obj);
+
+                let (s, e) = sys_view_clone2.buffer().bounds();
+                let system_text = sys_view_clone2.buffer().text(&s, &e, false).to_string();
+
+                let (s, e) = dir_view_clone2.buffer().bounds();
+                let directives_text = dir_view_clone2.buffer().text(&s, &e, false).to_string();
+
+                let (s, e) = eng_view_clone2.buffer().bounds();
+                let engrams_text = eng_view_clone2.buffer().text(&s, &e, false).to_string();
+
+                let (s, e) = prm_view_clone2.buffer().bounds();
+                let prompt_text = prm_view_clone2.buffer().text(&s, &e, false).to_string();
+
+                obj_clone2.set_system_text(system_text.clone());
+                obj_clone2.set_directives_text(directives_text.clone());
+                obj_clone2.set_engrams_text(engrams_text.clone());
+                obj_clone2.set_prompt_text(prompt_text.clone());
+
+                let payload = gneiss_pal::PreFlightPayload {
+                    system: system_text,
+                    directives: directives_text,
+                    engrams: engrams_text,
+                    prompt: prompt_text,
+                };
+                let json = serde_json::to_string(&payload).unwrap();
+
+                let tx_async = tx_clone2.clone();
+                glib::MainContext::default().spawn_local(async move {
+                    let _ = tx_async.send(Event::DispatchPayload(json)).await;
+                });
+            });
+
+        } else if message_type == 2 {
+            // PULSE MODE
+            pulse_box.set_visible(true);
             bubble.add_css_class("una-bubble");
             left_spacer.set_visible(false);
             right_spacer.set_visible(true);
-            expander.set_label(Some(&format!("{} | {} | {}", sender, subject, timestamp)));
-            let scroll = expander
-                .child()
-                .unwrap()
-                .downcast::<ScrolledWindow>()
-                .unwrap();
-            let content_view = scroll.child().unwrap().downcast::<SourceView>().unwrap();
-            content_view.buffer().set_text(&content);
-            expander.set_expanded(false);
+            meta_label.set_text("AWAITING SYNAPSE...");
+            meta_label.add_css_class("role-una");
+            meta_label.set_xalign(0.0);
+        } else {
+            // STANDARD MODE
+            let is_chat = obj.is_chat();
+            let sender = obj.sender();
+            let timestamp = obj.timestamp();
+            let content = obj.content();
+            let subject = obj.subject();
+
+            if is_chat {
+                chat_view.set_visible(true);
+                meta_label.set_text(&format!("{} • {}", sender, timestamp));
+                meta_label.remove_css_class("role-architect");
+                meta_label.remove_css_class("role-una");
+                meta_label.remove_css_class("role-system");
+                if sender == "Architect" {
+                    meta_label.add_css_class("role-architect");
+                    bubble.add_css_class("architect-bubble");
+                    left_spacer.set_visible(true);
+                    right_spacer.set_visible(false);
+                    meta_label.set_xalign(1.0);
+                } else {
+                    if sender == "Una-Prime" {
+                        meta_label.add_css_class("role-una");
+                    } else {
+                        meta_label.add_css_class("role-system");
+                    }
+                    bubble.add_css_class("una-bubble");
+                    left_spacer.set_visible(false);
+                    right_spacer.set_visible(true);
+                    meta_label.set_xalign(0.0);
+                }
+                let is_expanded = obj.is_expanded();
+                let line_count = content.lines().count();
+                if line_count > 11 && !is_expanded {
+                    let truncated: String = content.lines().take(11).collect::<Vec<&str>>().join("\n")
+                        + "\n\n... [Click to expand]";
+                    chat_view.buffer().set_text(&truncated);
+                } else {
+                    chat_view.buffer().set_text(&content);
+                }
+            } else {
+                expander.set_visible(true);
+                bubble.add_css_class("una-bubble");
+                left_spacer.set_visible(false);
+                right_spacer.set_visible(true);
+                expander.set_label(Some(&format!("{} | {} | {}", sender, subject, timestamp)));
+                let scroll = expander.child().unwrap().downcast::<ScrolledWindow>().unwrap();
+                let content_view = scroll.child().unwrap().downcast::<SourceView>().unwrap();
+                content_view.buffer().set_text(&content);
+                expander.set_expanded(false);
+            }
         }
     });
 
@@ -944,93 +1165,7 @@ fn build_gnome_ui(
     main_paned.set_end_child(Some(&input_container));
     comms_page.append(&main_paned);
 
-    // --- PAGE 2: PAYLOAD EDITOR (The Interceptor) ---
-    let payload_page = Box::new(Orientation::Vertical, 0);
-    let payload_header = Label::builder()
-        .use_markup(true)
-        .label(
-            "<span font_desc='11' weight='bold' color='#ff00ff'>INTERCEPTOR: PAYLOAD REVIEW</span>",
-        )
-        .halign(Align::Center)
-        .margin_top(8)
-        .margin_bottom(8)
-        .build();
-    payload_page.append(&payload_header);
-
-    let payload_buffer = sourceview5::Buffer::new(None);
-    let payload_view = SourceView::with_buffer(&payload_buffer);
-    payload_view.set_show_line_numbers(true);
-    payload_view.set_monospace(true);
-    payload_view.set_wrap_mode(gtk4::WrapMode::WordChar);
-    enable_spelling(&payload_view);
-    // Phase 2: Add view class
-    payload_view.add_css_class("view");
-
-    // Phase 3: Editable
-    payload_view.set_editable(true);
-
-    let payload_scroll = ScrolledWindow::builder()
-        .child(&payload_view)
-        .vexpand(true)
-        .build();
-    payload_page.append(&payload_scroll);
-
-    let control_box = Box::new(Orientation::Horizontal, 12);
-    control_box.set_margin_top(12);
-    control_box.set_margin_bottom(12);
-    control_box.set_margin_start(12);
-    control_box.set_margin_end(12);
-
-    // Auto-Send Checkbox
-    let auto_send_check = CheckButton::with_label("Auto-Send (Bypass Review)");
-    control_box.append(&auto_send_check);
-
-    // Spacer to push Transmit to the right
-    let editor_spacer = Box::new(Orientation::Horizontal, 0);
-    editor_spacer.set_hexpand(true);
-    control_box.append(&editor_spacer);
-
-    // Cancel Button (Phase 4)
-    let btn_cancel = Button::with_label("Cancel");
-    let tv_cancel = right_tab_view.clone();
-    let comms_page_clone = comms_page.clone();
-    let buf_cancel = payload_buffer.clone();
-    btn_cancel.connect_clicked(move |_| {
-        buf_cancel.set_text("");
-        let page = tv_cancel.page(&comms_page_clone);
-        tv_cancel.set_selected_page(&page);
-    });
-    control_box.append(&btn_cancel);
-
-    let btn_transmit = Button::with_label("TRANSMIT PAYLOAD");
-    btn_transmit.add_css_class("suggested-action");
-
-    let tx_interceptor = tx_event.clone();
-    let payload_buf_clone = payload_buffer.clone();
-    let tv_tx = right_tab_view.clone();
-    let comms_page_clone_tx = comms_page.clone();
-
-    btn_transmit.connect_clicked(move |_| {
-        let (start, end) = payload_buf_clone.bounds();
-        let final_payload = payload_buf_clone.text(&start, &end, false).to_string();
-
-        let tx_clone = tx_interceptor.clone();
-        glib::MainContext::default().spawn_local(async move {
-            let _ = tx_clone.send(Event::DispatchPayload(final_payload)).await;
-        });
-        // Switch back to comms
-        let page = tv_tx.page(&comms_page_clone_tx);
-        tv_tx.set_selected_page(&page);
-    });
-
-    control_box.append(&btn_transmit);
-    payload_page.append(&control_box);
-
-    {
-        right_tab_view.append(&payload_page);
-        let page = right_tab_view.page(&payload_page);
-        page.set_title("Payload Editor");
-    }
+    // Removing PAGE 2: PAYLOAD EDITOR (The Interceptor)
 
     let left_stack_clone = left_stack.clone();
     sidebar_toggle.connect_toggled(move |btn| {
@@ -1044,7 +1179,6 @@ fn build_gnome_ui(
             .downcast::<sourceview5::Buffer>()
             .unwrap();
         let buf_comp = body_buffer.clone();
-        let buf_pay = payload_buffer.clone();
 
         let update_theme = move |is_dark: bool| {
             let manager = sourceview5::StyleSchemeManager::default();
@@ -1052,7 +1186,6 @@ fn build_gnome_ui(
             if let Some(scheme) = manager.scheme(scheme_name) {
                 buf_chat.set_style_scheme(Some(&scheme));
                 buf_comp.set_style_scheme(Some(&scheme));
-                buf_pay.set_style_scheme(Some(&scheme));
             }
         };
 
@@ -1077,12 +1210,6 @@ fn build_gnome_ui(
 
     let console_store_async = console_store.clone();
 
-    let payload_buf_async = payload_buffer.clone();
-    let auto_send_check_async = auto_send_check.clone();
-    let tv_async = right_tab_view.clone();
-    let payload_page_clone = payload_page.clone();
-    let tx_interceptor_async = tx_event.clone();
-
     glib::MainContext::default().spawn_local(async move {
         while let Ok(update) = rx.recv().await {
             match update {
@@ -1098,6 +1225,28 @@ fn build_gnome_ui(
                     } else if text.trim().starts_with("[UNA]") {
                         sender = "Una-Prime".to_string();
                         is_chat = true;
+
+                        // When Una Responds successfully, drop the pulse and transform the staging view
+                        let n = console_store_async.n_items();
+                        let mut removals = Vec::new();
+                        for i in 0..n {
+                            if let Some(obj) = console_store_async.item(i).and_downcast::<DispatchObject>() {
+                                let t = obj.message_type();
+                                if t == 2 {
+                                    removals.push(i); // Drop Pulse
+                                } else if t == 1 {
+                                    // Mutate Staging into standard User message
+                                    obj.set_message_type(0);
+                                    let prm = obj.prompt_text();
+                                    obj.set_content(prm);
+                                    console_store_async.items_changed(i, 1, 1); // Force redraw
+                                }
+                            }
+                        }
+                        // Remove from back to front to preserve indices
+                        for idx in removals.iter().rev() {
+                            console_store_async.remove(*idx);
+                        }
                     } else if text.trim().starts_with("[S") {
                         let after_s = &text.trim()[2..];
                         if let Some(first_char) = after_s.chars().next() {
@@ -1165,20 +1314,49 @@ fn build_gnome_ui(
                 GuiUpdate::ActiveDirective(d) => {
                     *active_directive_async.borrow_mut() = d;
                 }
-                GuiUpdate::ReviewPayload(json_payload) => {
-                    // === TARGET 4: THE INTERCEPTOR LOGIC ===
-                    if auto_send_check_async.is_active() {
-                        // Auto-Send: Bypass UI Review
-                        let tx_clone = tx_interceptor_async.clone();
-                        glib::MainContext::default().spawn_local(async move {
-                            let _ = tx_clone.send(Event::DispatchPayload(json_payload)).await;
-                        });
-                    } else {
-                        // Manual Review: Populate and Switch Tab
-                        payload_buf_async.set_text(&json_payload);
-                        let page = tv_async.page(&payload_page_clone);
-                        tv_async.set_selected_page(&page);
+                GuiUpdate::ReviewPayload(payload) => {
+                    let id = format!("{}", chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0));
+                    let staging_obj = DispatchObject::new_staging(
+                        &id,
+                        &payload.system,
+                        &payload.directives,
+                        &payload.engrams,
+                        &payload.prompt,
+                    );
+                    console_store_async.append(&staging_obj);
+                }
+                GuiUpdate::SynapseError(err_msg) => {
+                    // Find and remove pulse
+                    let n = console_store_async.n_items();
+                    let mut pulse_idx = None;
+                    for i in 0..n {
+                        if let Some(obj) = console_store_async.item(i).and_downcast::<DispatchObject>() {
+                            if obj.message_type() == 2 {
+                                pulse_idx = Some(i);
+                                break;
+                            }
+                        }
                     }
+                    if let Some(idx) = pulse_idx {
+                        console_store_async.remove(idx);
+                    }
+
+                    // Unlock staging
+                    let n = console_store_async.n_items();
+                    for i in 0..n {
+                        if let Some(obj) = console_store_async.item(i).and_downcast::<DispatchObject>() {
+                            if obj.message_type() == 1 {
+                                obj.set_is_locked(false);
+                                console_store_async.items_changed(i, 1, 1);
+                            }
+                        }
+                    }
+
+                    // Show error
+                    let timestamp = chrono::Local::now().format("%H:%M:%S").to_string();
+                    let id = format!("{}", chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0));
+                    let err_obj = DispatchObject::new(&id, "System Error", "Log", &timestamp, &err_msg, true);
+                    console_store_async.append(&err_obj);
                 }
                 _ => {}
             }
@@ -1614,24 +1792,26 @@ fn build_gtk_ui(
         let bubble = Box::new(Orientation::Vertical, 4);
         bubble.add_css_class("bubble-box");
         bubble.set_width_request(400);
+
         let meta_label = Label::new(None);
         meta_label.set_xalign(0.0);
         meta_label.add_css_class("dim-label");
         bubble.append(&meta_label);
+
+        // --- Standard Mode (Message View) ---
         let chat_content_buffer = sourceview5::Buffer::new(None);
         let chat_content_view = SourceView::with_buffer(&chat_content_buffer);
         chat_content_view.set_editable(false);
         chat_content_view.set_wrap_mode(gtk4::WrapMode::WordChar);
         chat_content_view.set_show_line_numbers(false);
-        // Removed manual CSS classes for Phase 1
-        // chat_content_view.add_css_class("transparent-text");
         chat_content_view.set_monospace(true);
         chat_content_view.set_width_request(800);
         chat_content_view.set_hexpand(true);
         chat_content_view.set_focusable(true);
-        // Phase 2: Add view class
         chat_content_view.add_css_class("view");
         bubble.append(&chat_content_view);
+
+        // --- Standard Mode (Expander) ---
         let expander = Expander::new(None);
         let expander_label = Label::new(None);
         expander.set_child(Some(&expander_label));
@@ -1648,6 +1828,70 @@ fn build_gtk_ui(
             .build();
         expander.set_child(Some(&payload_scroll));
         bubble.append(&expander);
+
+        // --- Staging Mode (Payload Editor) ---
+        let staging_box = Box::new(Orientation::Vertical, 8);
+        staging_box.set_visible(false);
+
+        let system_label = Label::builder().label("SYSTEM").xalign(0.0).css_classes(vec!["dim-label"]).build();
+        let system_view = SourceView::builder().wrap_mode(gtk4::WrapMode::WordChar).editable(true).monospace(true).build();
+        system_view.add_css_class("view");
+        let sys_scroll = ScrolledWindow::builder().child(&system_view).min_content_height(100).build();
+        staging_box.append(&system_label);
+        staging_box.append(&sys_scroll);
+
+        let directives_label = Label::builder().label("DIRECTIVES").xalign(0.0).css_classes(vec!["dim-label"]).build();
+        let directives_view = SourceView::builder().wrap_mode(gtk4::WrapMode::WordChar).editable(true).monospace(true).build();
+        directives_view.add_css_class("view");
+        let dir_scroll = ScrolledWindow::builder().child(&directives_view).min_content_height(100).build();
+        staging_box.append(&directives_label);
+        staging_box.append(&dir_scroll);
+
+        let engrams_label = Label::builder().label("ENGRAMS").xalign(0.0).css_classes(vec!["dim-label"]).build();
+        let engrams_view = SourceView::builder().wrap_mode(gtk4::WrapMode::WordChar).editable(true).monospace(true).build();
+        engrams_view.add_css_class("view");
+        let eng_scroll = ScrolledWindow::builder().child(&engrams_view).min_content_height(100).build();
+        staging_box.append(&engrams_label);
+        staging_box.append(&eng_scroll);
+
+        let prompt_label = Label::builder().label("PROMPT").xalign(0.0).css_classes(vec!["dim-label"]).build();
+        let prompt_view = SourceView::builder().wrap_mode(gtk4::WrapMode::WordChar).editable(true).monospace(true).build();
+        prompt_view.add_css_class("view");
+        let prm_scroll = ScrolledWindow::builder().child(&prompt_view).min_content_height(100).build();
+        staging_box.append(&prompt_label);
+        staging_box.append(&prm_scroll);
+
+        let actions_box = Box::new(Orientation::Horizontal, 8);
+        actions_box.set_halign(Align::End);
+        let cancel_btn = Button::builder().icon_name("stop-sign-large-outline-symbolic").tooltip_text("Delete Post").css_classes(vec!["flat", "destructive-action"]).build();
+        let dispatch_btn = Button::builder().icon_name("document-save-symbolic").tooltip_text("Save and Send").css_classes(vec!["suggested-action"]).build();
+        actions_box.append(&cancel_btn);
+        actions_box.append(&dispatch_btn);
+        staging_box.append(&actions_box);
+
+        bubble.append(&staging_box);
+
+        // --- Pulse Mode (Animation) ---
+        let pulse_box = Box::new(Orientation::Horizontal, 8);
+        pulse_box.set_visible(false);
+        pulse_box.set_halign(Align::Center);
+        pulse_box.set_margin_top(12);
+        pulse_box.set_margin_bottom(12);
+
+        let pulse_spinner = Spinner::new();
+        pulse_spinner.set_spinning(true);
+        pulse_spinner.add_css_class("pulse-spinner"); // Added CSS hook for Una Blue
+
+        let pulse_icon = Image::builder()
+            .icon_name("brain-symbolic")
+            .pixel_size(32)
+            .build();
+        pulse_icon.add_css_class("accent");
+
+        pulse_box.append(&pulse_icon);
+        pulse_box.append(&pulse_spinner);
+        bubble.append(&pulse_box);
+
         root.append(&bubble);
         let right_spacer = Box::new(Orientation::Horizontal, 0);
         right_spacer.set_hexpand(true);
@@ -1681,83 +1925,238 @@ fn build_gtk_ui(
         item.set_child(Some(&root));
     });
 
+    let tx_dispatch = tx_event.clone();
     console_factory.connect_bind(move |_factory, item| {
         let item = item.downcast_ref::<ListItem>().unwrap();
         let root = item.child().unwrap().downcast::<Box>().unwrap();
-        let mut iter = root.first_child();
-        let left_spacer = iter.unwrap().downcast::<Box>().unwrap();
-        iter = left_spacer.next_sibling();
-        let bubble = iter.unwrap().downcast::<Box>().unwrap();
-        iter = bubble.next_sibling();
-        let right_spacer = iter.unwrap().downcast::<Box>().unwrap();
+
+        let left_spacer = root.first_child().unwrap().downcast::<Box>().unwrap();
+        let bubble = left_spacer.next_sibling().unwrap().downcast::<Box>().unwrap();
+        let right_spacer = bubble.next_sibling().unwrap().downcast::<Box>().unwrap();
+
         let obj = item.item().unwrap().downcast::<DispatchObject>().unwrap();
 
-        let mut iter_bubble = bubble.first_child();
-        let meta_label = iter_bubble.unwrap().downcast::<Label>().unwrap();
-        iter_bubble = meta_label.next_sibling();
-        let chat_view = iter_bubble.unwrap().downcast::<SourceView>().unwrap();
-        iter_bubble = chat_view.next_sibling();
-        let expander = iter_bubble.unwrap().downcast::<Expander>().unwrap();
+        let meta_label = bubble.first_child().unwrap().downcast::<Label>().unwrap();
+        let chat_view = meta_label.next_sibling().unwrap().downcast::<SourceView>().unwrap();
+        let expander = chat_view.next_sibling().unwrap().downcast::<Expander>().unwrap();
+        let staging_box = expander.next_sibling().unwrap().downcast::<Box>().unwrap();
+        let pulse_box = staging_box.next_sibling().unwrap().downcast::<Box>().unwrap();
 
-        let is_chat = obj.is_chat();
-        let sender = obj.sender();
-        let timestamp = obj.timestamp();
-        let content = obj.content();
-        let subject = obj.subject();
+        // Extract children for Staging mode
+        let sys_scroll = staging_box.first_child().unwrap().next_sibling().unwrap().downcast::<ScrolledWindow>().unwrap();
+        let system_view = sys_scroll.child().unwrap().downcast::<SourceView>().unwrap();
+
+        let dir_scroll = sys_scroll.next_sibling().unwrap().next_sibling().unwrap().downcast::<ScrolledWindow>().unwrap();
+        let directives_view = dir_scroll.child().unwrap().downcast::<SourceView>().unwrap();
+
+        let eng_scroll = dir_scroll.next_sibling().unwrap().next_sibling().unwrap().downcast::<ScrolledWindow>().unwrap();
+        let engrams_view = eng_scroll.child().unwrap().downcast::<SourceView>().unwrap();
+
+        let prm_scroll = eng_scroll.next_sibling().unwrap().next_sibling().unwrap().downcast::<ScrolledWindow>().unwrap();
+        let prompt_view = prm_scroll.child().unwrap().downcast::<SourceView>().unwrap();
+
+        let actions_box = prm_scroll.next_sibling().unwrap().downcast::<Box>().unwrap();
+        let cancel_btn = actions_box.first_child().unwrap().downcast::<Button>().unwrap();
+        let dispatch_btn = cancel_btn.next_sibling().unwrap().downcast::<Button>().unwrap();
+
+        let message_type = obj.message_type();
 
         bubble.remove_css_class("architect-bubble");
         bubble.remove_css_class("una-bubble");
         left_spacer.set_visible(false);
         right_spacer.set_visible(false);
 
-        if is_chat {
-            chat_view.set_visible(true);
-            expander.set_visible(false);
-            meta_label.set_text(&format!("{} • {}", sender, timestamp));
-            meta_label.remove_css_class("role-architect");
-            meta_label.remove_css_class("role-una");
-            meta_label.remove_css_class("role-system");
-            if sender == "Architect" {
-                meta_label.add_css_class("role-architect");
-                bubble.add_css_class("architect-bubble");
-                left_spacer.set_visible(true);
-                right_spacer.set_visible(false);
-                meta_label.set_xalign(1.0);
-            } else {
-                if sender == "Una-Prime" {
-                    meta_label.add_css_class("role-una");
-                } else {
-                    meta_label.add_css_class("role-system");
+        chat_view.set_visible(false);
+        expander.set_visible(false);
+        staging_box.set_visible(false);
+        pulse_box.set_visible(false);
+
+        if message_type == 1 {
+            // STAGING MODE
+            staging_box.set_visible(true);
+            bubble.add_css_class("architect-bubble");
+            left_spacer.set_visible(true);
+            right_spacer.set_visible(false);
+
+            meta_label.set_text("PRE-FLIGHT STAGING");
+            meta_label.add_css_class("role-architect");
+            meta_label.set_xalign(1.0);
+
+            system_view.buffer().set_text(&obj.system_text());
+            directives_view.buffer().set_text(&obj.directives_text());
+            engrams_view.buffer().set_text(&obj.engrams_text());
+            prompt_view.buffer().set_text(&obj.prompt_text());
+
+            let is_locked = obj.is_locked();
+            system_view.set_editable(!is_locked);
+            directives_view.set_editable(!is_locked);
+            engrams_view.set_editable(!is_locked);
+            prompt_view.set_editable(!is_locked);
+            dispatch_btn.set_sensitive(!is_locked);
+            cancel_btn.set_sensitive(!is_locked);
+
+            let tx_clone = tx_dispatch.clone();
+            let obj_clone = obj.clone();
+            let sys_view_clone = system_view.clone();
+            let dir_view_clone = directives_view.clone();
+            let eng_view_clone = engrams_view.clone();
+            let prm_view_clone = prompt_view.clone();
+
+            let bubble_clone = bubble.clone();
+            let console_store_clone = console_store.clone();
+
+            cancel_btn.connect_clicked(move |_| {
+                let dialog = gtk4::MessageDialog::builder()
+                    .text("Delete Payload?")
+                    .secondary_text("Are you sure you want to discard this pre-flight payload? This cannot be undone.")
+                    .message_type(gtk4::MessageType::Warning)
+                    .buttons(gtk4::ButtonsType::Cancel)
+                    .modal(true)
+                    .build();
+
+                dialog.add_button("Delete", gtk4::ResponseType::DestructiveAction);
+
+                let obj_cancel = obj_clone.clone();
+                let store_cancel = console_store_clone.clone();
+                dialog.connect_response(move |d, response| {
+                    if response == gtk4::ResponseType::DestructiveAction {
+                        // Remove from store
+                        let n = store_cancel.n_items();
+                        for i in 0..n {
+                            if let Some(item) = store_cancel.item(i).and_downcast::<DispatchObject>() {
+                                if item.id() == obj_cancel.id() {
+                                    store_cancel.remove(i);
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    d.close();
+                });
+
+                let root_win = bubble_clone.root().and_downcast::<gtk4::Window>();
+                if let Some(win) = root_win {
+                    dialog.set_transient_for(Some(&win));
                 }
-                bubble.add_css_class("una-bubble");
-                left_spacer.set_visible(false);
-                right_spacer.set_visible(true);
-                meta_label.set_xalign(0.0);
-            }
-            let is_expanded = obj.is_expanded();
-            let line_count = content.lines().count();
-            if line_count > 11 && !is_expanded {
-                let truncated: String = content.lines().take(11).collect::<Vec<&str>>().join("\n")
-                    + "\n\n... [Click to expand]";
-                chat_view.buffer().set_text(&truncated);
-            } else {
-                chat_view.buffer().set_text(&content);
-            }
-        } else {
-            chat_view.set_visible(false);
-            expander.set_visible(true);
+
+                dialog.present();
+            });
+
+            let tx_clone2 = tx_dispatch.clone();
+            let obj_clone2 = obj.clone();
+            let sys_view_clone2 = system_view.clone();
+            let dir_view_clone2 = directives_view.clone();
+            let eng_view_clone2 = engrams_view.clone();
+            let prm_view_clone2 = prompt_view.clone();
+            let cancel_btn_clone = cancel_btn.clone();
+            let dispatch_btn_clone = dispatch_btn.clone();
+            let console_store_pulse = console_store.clone();
+
+            dispatch_btn_clone.connect_clicked(move |_| {
+                obj_clone2.set_is_locked(true);
+                sys_view_clone2.set_editable(false);
+                dir_view_clone2.set_editable(false);
+                eng_view_clone2.set_editable(false);
+                prm_view_clone2.set_editable(false);
+                cancel_btn_clone.set_sensitive(false);
+                dispatch_btn_clone.set_sensitive(false);
+
+                // Add pulse
+                let id = format!("{}-pulse", chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0));
+                let pulse_obj = DispatchObject::new_pulse(&id);
+                console_store_pulse.append(&pulse_obj);
+
+                let (s, e) = sys_view_clone2.buffer().bounds();
+                let system_text = sys_view_clone2.buffer().text(&s, &e, false).to_string();
+
+                let (s, e) = dir_view_clone2.buffer().bounds();
+                let directives_text = dir_view_clone2.buffer().text(&s, &e, false).to_string();
+
+                let (s, e) = eng_view_clone2.buffer().bounds();
+                let engrams_text = eng_view_clone2.buffer().text(&s, &e, false).to_string();
+
+                let (s, e) = prm_view_clone2.buffer().bounds();
+                let prompt_text = prm_view_clone2.buffer().text(&s, &e, false).to_string();
+
+                obj_clone2.set_system_text(system_text.clone());
+                obj_clone2.set_directives_text(directives_text.clone());
+                obj_clone2.set_engrams_text(engrams_text.clone());
+                obj_clone2.set_prompt_text(prompt_text.clone());
+
+                let payload = gneiss_pal::PreFlightPayload {
+                    system: system_text,
+                    directives: directives_text,
+                    engrams: engrams_text,
+                    prompt: prompt_text,
+                };
+                let json = serde_json::to_string(&payload).unwrap();
+
+                let tx_async = tx_clone2.clone();
+                glib::MainContext::default().spawn_local(async move {
+                    let _ = tx_async.send(Event::DispatchPayload(json)).await;
+                });
+            });
+
+        } else if message_type == 2 {
+            // PULSE MODE
+            pulse_box.set_visible(true);
             bubble.add_css_class("una-bubble");
             left_spacer.set_visible(false);
             right_spacer.set_visible(true);
-            expander.set_label(Some(&format!("{} | {} | {}", sender, subject, timestamp)));
-            let scroll = expander
-                .child()
-                .unwrap()
-                .downcast::<ScrolledWindow>()
-                .unwrap();
-            let content_view = scroll.child().unwrap().downcast::<SourceView>().unwrap();
-            content_view.buffer().set_text(&content);
-            expander.set_expanded(false);
+            meta_label.set_text("AWAITING SYNAPSE...");
+            meta_label.add_css_class("role-una");
+            meta_label.set_xalign(0.0);
+        } else {
+            // STANDARD MODE
+            let is_chat = obj.is_chat();
+            let sender = obj.sender();
+            let timestamp = obj.timestamp();
+            let content = obj.content();
+            let subject = obj.subject();
+
+            if is_chat {
+                chat_view.set_visible(true);
+                meta_label.set_text(&format!("{} • {}", sender, timestamp));
+                meta_label.remove_css_class("role-architect");
+                meta_label.remove_css_class("role-una");
+                meta_label.remove_css_class("role-system");
+                if sender == "Architect" {
+                    meta_label.add_css_class("role-architect");
+                    bubble.add_css_class("architect-bubble");
+                    left_spacer.set_visible(true);
+                    right_spacer.set_visible(false);
+                    meta_label.set_xalign(1.0);
+                } else {
+                    if sender == "Una-Prime" {
+                        meta_label.add_css_class("role-una");
+                    } else {
+                        meta_label.add_css_class("role-system");
+                    }
+                    bubble.add_css_class("una-bubble");
+                    left_spacer.set_visible(false);
+                    right_spacer.set_visible(true);
+                    meta_label.set_xalign(0.0);
+                }
+                let is_expanded = obj.is_expanded();
+                let line_count = content.lines().count();
+                if line_count > 11 && !is_expanded {
+                    let truncated: String = content.lines().take(11).collect::<Vec<&str>>().join("\n")
+                        + "\n\n... [Click to expand]";
+                    chat_view.buffer().set_text(&truncated);
+                } else {
+                    chat_view.buffer().set_text(&content);
+                }
+            } else {
+                expander.set_visible(true);
+                bubble.add_css_class("una-bubble");
+                left_spacer.set_visible(false);
+                right_spacer.set_visible(true);
+                expander.set_label(Some(&format!("{} | {} | {}", sender, subject, timestamp)));
+                let scroll = expander.child().unwrap().downcast::<ScrolledWindow>().unwrap();
+                let content_view = scroll.child().unwrap().downcast::<SourceView>().unwrap();
+                content_view.buffer().set_text(&content);
+                expander.set_expanded(false);
+            }
         }
     });
 
@@ -2051,88 +2450,7 @@ fn build_gtk_ui(
 
     workspace_stack.add_titled(&comms_page, Some("comms"), "Comms");
 
-    // --- PAGE 2: PAYLOAD EDITOR (The Interceptor) ---
-    let payload_page = Box::new(Orientation::Vertical, 0);
-    let payload_header = Label::builder()
-        .use_markup(true)
-        .label(
-            "<span font_desc='11' weight='bold' color='#ff00ff'>INTERCEPTOR: PAYLOAD REVIEW</span>",
-        )
-        .halign(Align::Center)
-        .margin_top(8)
-        .margin_bottom(8)
-        .build();
-    payload_page.append(&payload_header);
-
-    let payload_buffer = sourceview5::Buffer::new(None);
-    let payload_view = SourceView::with_buffer(&payload_buffer);
-    payload_view.set_show_line_numbers(true);
-    payload_view.set_monospace(true);
-    payload_view.set_wrap_mode(gtk4::WrapMode::WordChar);
-    enable_spelling(&payload_view);
-    // Phase 2: Add view class
-    payload_view.add_css_class("view");
-
-    // Phase 3: Editable
-    payload_view.set_editable(true);
-
-    let payload_scroll = ScrolledWindow::builder()
-        .child(&payload_view)
-        .vexpand(true)
-        .build();
-    payload_page.append(&payload_scroll);
-
-    let control_box = Box::new(Orientation::Horizontal, 12);
-    control_box.set_margin_top(12);
-    control_box.set_margin_bottom(12);
-    control_box.set_margin_start(12);
-    control_box.set_margin_end(12);
-
-    // Auto-Send Checkbox
-    let auto_send_check = CheckButton::with_label("Auto-Send (Bypass Review)");
-    control_box.append(&auto_send_check);
-
-    // Spacer to push Transmit to the right
-    let editor_spacer = Box::new(Orientation::Horizontal, 0);
-    editor_spacer.set_hexpand(true);
-    control_box.append(&editor_spacer);
-
-    // Cancel Button (Phase 4)
-    let btn_cancel = Button::with_label("Cancel");
-    let stack_cancel = workspace_stack.clone();
-    let buf_cancel = payload_buffer.clone();
-    btn_cancel.connect_clicked(move |_| {
-        buf_cancel.set_text("");
-        stack_cancel.set_visible_child_name("comms");
-    });
-    control_box.append(&btn_cancel);
-
-    let btn_transmit = Button::with_label("TRANSMIT PAYLOAD");
-    btn_transmit.add_css_class("suggested-action");
-
-    let tx_interceptor = tx_event.clone();
-    let payload_buf_clone = payload_buffer.clone();
-    let stack_clone = workspace_stack.clone();
-
-    btn_transmit.connect_clicked(move |_| {
-        let (start, end) = payload_buf_clone.bounds();
-        let final_payload = payload_buf_clone.text(&start, &end, false).to_string();
-
-        let tx_clone = tx_interceptor.clone();
-        glib::MainContext::default().spawn_local(async move {
-            let _ = tx_clone.send(Event::DispatchPayload(final_payload)).await;
-        });
-        // Switch back to comms
-        stack_clone.set_visible_child_name("comms");
-    });
-
-    control_box.append(&btn_transmit);
-    payload_page.append(&control_box);
-
-    {
-        workspace_stack.add_titled(&payload_page, Some("editor"), "Payload Editor");
-
-    }
+    // Removing PAGE 2: PAYLOAD EDITOR (The Interceptor)
 
     // Since left_vbox was managed inside MegaBar, we just toggle the left_stack inside it.
     let left_stack_clone = left_stack.clone();
@@ -2148,7 +2466,6 @@ fn build_gtk_ui(
             .downcast::<sourceview5::Buffer>()
             .unwrap();
         let buf_comp = body_buffer.clone();
-        let buf_pay = payload_buffer.clone();
 
         let update_theme = move |is_dark: bool| {
             let manager = sourceview5::StyleSchemeManager::default();
@@ -2156,7 +2473,6 @@ fn build_gtk_ui(
             if let Some(scheme) = manager.scheme(scheme_name) {
                 buf_chat.set_style_scheme(Some(&scheme));
                 buf_comp.set_style_scheme(Some(&scheme));
-                buf_pay.set_style_scheme(Some(&scheme));
             }
         };
 
@@ -2181,9 +2497,6 @@ fn build_gtk_ui(
 
     let console_store_async = console_store.clone();
 
-    let payload_buf_async = payload_buffer.clone();
-    let auto_send_check_async = auto_send_check.clone();
-    let stack_async = workspace_stack.clone();
     let tx_interceptor_async = tx_event.clone();
 
     glib::MainContext::default().spawn_local(async move {
@@ -2201,6 +2514,28 @@ fn build_gtk_ui(
                     } else if text.trim().starts_with("[UNA]") {
                         sender = "Una-Prime".to_string();
                         is_chat = true;
+
+                        // When Una Responds successfully, drop the pulse and transform the staging view
+                        let n = console_store_async.n_items();
+                        let mut removals = Vec::new();
+                        for i in 0..n {
+                            if let Some(obj) = console_store_async.item(i).and_downcast::<DispatchObject>() {
+                                let t = obj.message_type();
+                                if t == 2 {
+                                    removals.push(i); // Drop Pulse
+                                } else if t == 1 {
+                                    // Mutate Staging into standard User message
+                                    obj.set_message_type(0);
+                                    let prm = obj.prompt_text();
+                                    obj.set_content(prm);
+                                    console_store_async.items_changed(i, 1, 1); // Force redraw
+                                }
+                            }
+                        }
+                        // Remove from back to front to preserve indices
+                        for idx in removals.iter().rev() {
+                            console_store_async.remove(*idx);
+                        }
                     } else if text.trim().starts_with("[S") {
                         let after_s = &text.trim()[2..];
                         if let Some(first_char) = after_s.chars().next() {
@@ -2268,24 +2603,56 @@ fn build_gtk_ui(
                 GuiUpdate::ActiveDirective(d) => {
                     *active_directive_async.borrow_mut() = d;
                 }
-                GuiUpdate::ReviewPayload(json_payload) => {
-                    // === TARGET 4: THE INTERCEPTOR LOGIC ===
-                    if auto_send_check_async.is_active() {
-                        // Auto-Send: Bypass UI Review
-                        let tx_clone = tx_interceptor_async.clone();
-                        glib::MainContext::default().spawn_local(async move {
-                            let _ = tx_clone.send(Event::DispatchPayload(json_payload)).await;
-                        });
-                    } else {
-                        // Manual Review: Populate and Switch Tab
-                        payload_buf_async.set_text(&json_payload);
-                        stack_async.set_visible_child_name("editor");
+                GuiUpdate::ReviewPayload(payload) => {
+                    let id = format!("{}", chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0));
+                    let staging_obj = DispatchObject::new_staging(
+                        &id,
+                        &payload.system,
+                        &payload.directives,
+                        &payload.engrams,
+                        &payload.prompt,
+                    );
+                    console_store_async.append(&staging_obj);
+                }
+                GuiUpdate::SynapseError(err_msg) => {
+                    // Find and remove pulse
+                    let n = console_store_async.n_items();
+                    let mut pulse_idx = None;
+                    for i in 0..n {
+                        if let Some(obj) = console_store_async.item(i).and_downcast::<DispatchObject>() {
+                            if obj.message_type() == 2 {
+                                pulse_idx = Some(i);
+                                break;
+                            }
+                        }
                     }
+                    if let Some(idx) = pulse_idx {
+                        console_store_async.remove(idx);
+                    }
+
+                    // Unlock staging
+                    let n = console_store_async.n_items();
+                    for i in 0..n {
+                        if let Some(obj) = console_store_async.item(i).and_downcast::<DispatchObject>() {
+                            if obj.message_type() == 1 {
+                                obj.set_is_locked(false);
+                                console_store_async.items_changed(i, 1, 1);
+                            }
+                        }
+                    }
+
+                    // Show error
+                    let timestamp = chrono::Local::now().format("%H:%M:%S").to_string();
+                    let id = format!("{}", chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0));
+                    let err_obj = DispatchObject::new(&id, "System Error", "Log", &timestamp, &err_msg, true);
+                    console_store_async.append(&err_obj);
                 }
                 _ => {}
             }
         }
     });
+
+    let _ = tx_interceptor_async; // Make sure it's kept alive or removed if truly unused
 
     // === FIX: HARDWIRE NEXUS SELECTION ===
     if let Some(row) = nexus_list.row_at_index(1) {

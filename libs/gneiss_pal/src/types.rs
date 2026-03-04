@@ -10,6 +10,16 @@ pub enum WolfpackState {
     Fabricating,
 }
 
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PreFlightPayload {
+    pub system: String,
+    pub directives: String,
+    pub engrams: String,
+    pub prompt: String,
+}
+
 #[derive(Debug, Clone)]
 pub enum GuiUpdate {
     ShardStatusChanged { id: String, status: ShardStatus },
@@ -21,7 +31,8 @@ pub enum GuiUpdate {
     Spectrum(Vec<f32>),
     TokenUsage(i32, i32, i32), // Prompt, Candidates, Total
     ActiveDirective(String),
-    ReviewPayload(String), // The Interceptor
+    ReviewPayload(PreFlightPayload), // The Interceptor
+    SynapseError(String), // Discrete failure signal
 }
 
 #[derive(Clone, Debug, PartialEq)]
