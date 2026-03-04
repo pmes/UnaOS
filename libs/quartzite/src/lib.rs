@@ -77,6 +77,17 @@ pub type NativeView = ();
 )))]
 pub struct Backend;
 
+#[cfg(not(any(
+    target_os = "macos",
+    target_os = "windows",
+    all(target_os = "linux", feature = "gtk"),
+    all(target_os = "linux", feature = "qt")
+)))]
+impl Backend {
+    pub fn new<F>(_app_id: &str, _bootstrap: F) -> Self { Backend }
+    pub fn run(&self) {}
+}
+
 // -----------------------------------------------------------------------------
 // ASSET DEPLOYMENT & INITIALIZATION
 // -----------------------------------------------------------------------------

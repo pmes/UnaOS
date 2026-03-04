@@ -14,8 +14,6 @@ gtk = ["quartzite/gtk"]
 gnome = ["quartzite/gnome"]
 
 [dependencies]
-libadwaita = { version = "0.8.1", features = ["v1_4", "v1_5"] }
-
 # The Trinity Core
 elessar = { path = "../../libs/elessar" }
 vein = { path = "../../handlers/vein", default-features = false }
@@ -35,3 +33,5 @@ tokio = { version = "1.49", features = ["sync", "rt", "macros"] }
 serde = { version = "1.0.228", features = ["derive"] }
 wincode = "0.4.5"
 
+[target.'cfg(target_os = "linux")'.dependencies]
+libadwaita = { version = "0.8.1", features = ["v1_4"] }

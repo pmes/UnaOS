@@ -1,7 +1,9 @@
 use anyhow::Result;
+#[cfg(target_os = "linux")]
 use gtk4::prelude::*;
+#[cfg(target_os = "linux")]
 use gtk4::{Box, HeaderBar, Orientation, Paned, Stack, StackSwitcher, StackTransitionType, Separator};
-#[cfg(feature = "gnome")]
+#[cfg(all(target_os = "linux", feature = "gnome"))]
 use libadwaita as adw;
 use std::cell::RefCell;
 use std::env;
@@ -11,7 +13,9 @@ use std::path::PathBuf;
 use gneiss_pal::{Event, GuiUpdate};
 use quartzite::{Backend, NativeView, NativeWindow};
 
+#[cfg(target_os = "linux")]
 use matrix::create_view as create_matrix_view;
+#[cfg(target_os = "linux")]
 use tabula::{EditorMode, TabulaView};
 
 const APP_ID: &str = "org.unaos.UnaIDE";
@@ -43,16 +47,27 @@ fn main() -> Result<()> {
 
     let cwd = env::current_dir().unwrap_or_default();
 
+    // 7. View & Engine Ignition
+    let spline = Rc::new(quartzite::Spline::new());
+
     // THE FUSION
     let bootstrap = move |window: &NativeWindow| -> NativeView {
+        #[cfg(target_os = "macos")]
+        let view = {
+            spline.bootstrap(window, tx_brain.clone(), rx_gui.clone())
+        };
+
+        #[cfg(target_os = "linux")]
         let tabula = Rc::new(RefCell::new(TabulaView::new(EditorMode::Code(
             "rust".to_string(),
         ))));
+        #[cfg(target_os = "linux")]
         let tabula_widget = tabula.borrow().widget();
 
+        #[cfg(target_os = "linux")]
         let matrix_widget = create_matrix_view(tx_brain.clone(), &cwd);
 
-        #[cfg(feature = "gnome")]
+        #[cfg(all(target_os = "linux", feature = "gnome"))]
         let view = {
             // 3. THE SIDEBAR (Left Pane)
             let left_toolbar = adw::ToolbarView::new();
@@ -104,8 +119,8 @@ fn main() -> Result<()> {
             main_paned.upcast::<gtk4::Widget>()
         };
 
-        #[cfg(not(feature = "gnome"))]
-        let view = {
+        #[cfg(all(target_os = "linux", not(feature = "gnome")))]
+        let view: NativeView = {
             // --- Pure GTK4 Fallback ---
             let title_box = Box::new(Orientation::Horizontal, 0);
 
@@ -119,6 +134,7 @@ fn main() -> Result<()> {
             title_box.append(&separator);
             title_box.append(&right_header);
 
+            #[cfg(all(target_os = "linux", feature = "gtk"))]
             window.set_titlebar(Some(&title_box));
 
             // Inner Workspaces
@@ -170,11 +186,21 @@ fn main() -> Result<()> {
                 left_header.set_width_request(pos);
             });
 
-            main_paned.upcast::<gtk4::Widget>()
+            #[cfg(all(target_os = "linux", feature = "gtk"))]
+            let ret = main_paned.upcast::<gtk4::Widget>();
+            #[cfg(not(all(target_os = "linux", feature = "gtk")))]
+            let ret = ();
+
+            ret
         };
 
+        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+        let view: NativeView = ();
+
         // 6. WIRE THE REFLEX ARC (UI Receiver Loop)
+        #[cfg(target_os = "linux")]
         let tabula_clone = tabula.clone();
+        #[cfg(target_os = "linux")]
         glib::MainContext::default().spawn_local(async move {
             while let Ok(update) = rx_gui.recv().await {
                 match update {

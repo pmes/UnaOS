@@ -10,9 +10,6 @@ gnome = ["quartzite/gnome"]
 
 [dependencies]
 anyhow = "1.0"
-gtk4 = { version = "0.10.3", features = ["v4_16", "v4_18"] }
-glib = "0.21"
-libadwaita = { version = "0.8.1", features = ["v1_4", "v1_5"] }
 
 # The Trinity Core
 quartzite = { path = "../../libs/quartzite", default-features = false }
@@ -30,3 +27,8 @@ tabula = { path = "../../handlers/tabula" }
 # midden = { path = "../../handlers/midden" }
 # vaire = { path = "../../handlers/vaire" }
 # aule = { path = "../../handlers/aule" }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+gtk4 = { version = "0.10.3", features = ["v4_14"] }
+glib = "0.21"
+libadwaita = { version = "0.8.1", features = ["v1_4"] }

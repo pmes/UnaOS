@@ -100,6 +100,6 @@ impl MacOSSpline {
         // Suppress unused warning for rx_gui until async implementation
         let _ = rx_gui;
 
-        split_view
+        Retained::into_super(split_view)
     }
 }
