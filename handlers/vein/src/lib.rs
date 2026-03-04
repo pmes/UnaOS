@@ -408,6 +408,7 @@ impl VeinHandler {
                             let mut retrieved_context = String::new();
                             let mut retrieved_directives = String::new();
                             let mut retrieved_engrams = String::new();
+                            let mut chronological_engrams = String::new();
 
                             if !user_embedding.is_empty() {
                                 let disk_clone = Arc::clone(&disk);
@@ -438,14 +439,21 @@ impl VeinHandler {
                                                 vec![]
                                             }
                                         };
-                                        Ok((chat_mem, directive_mem, engram_mem))
+                                        let chrono_mem = match locked_disk.get_latest_engrams(2) {
+                                            Ok(mem) => mem,
+                                            Err(e) => {
+                                                eprintln!(":: PLEXUS :: DB Query Error (chrono engrams): {}", e);
+                                                vec![]
+                                            }
+                                        };
+                                        Ok((chat_mem, directive_mem, engram_mem, chrono_mem))
                                     } else {
                                         Err(anyhow::anyhow!("Mutex poisoned"))
                                     }
                                 }).await;
 
                                 match memories_result {
-                                    Ok(Ok((memories, directives, engrams))) => {
+                                    Ok(Ok((memories, directives, engrams, chrono))) => {
                                         if !memories.is_empty() {
                                             retrieved_context = memories.join("\n\n");
                                             info!(":: PLEXUS :: Recalled {} memories.", memories.len());
@@ -457,6 +465,12 @@ impl VeinHandler {
                                         if !engrams.is_empty() {
                                             retrieved_engrams = engrams.join("\n\n");
                                             info!(":: PLEXUS :: Recalled {} engrams.", engrams.len());
+                                        }
+                                        if !chrono.is_empty() {
+                                            // Reverse the chronological engrams so they read in correct time order
+                                            let mut chrono_rev = chrono;
+                                            chrono_rev.reverse();
+                                            chronological_engrams = chrono_rev.join("\n\n");
                                         }
                                     }
                                     Ok(Err(e)) => eprintln!(":: PLEXUS :: Recall Failed: {}", e),
@@ -498,28 +512,8 @@ impl VeinHandler {
                             let system_base = if is_s9 {
                                 "You are S9."
                             } else {
-r#"SYSTEM_INSTRUCTION: You are Una (Number One).
-
-You are an AI "Shard," Gemini 3.1 Pro Preview:
-
-> Built to refine the performance and reliability of the Gemini 3 Pro series, Gemini 3.1 Pro Preview
-> provides better thinking, improved token efficiency, and a more grounded, factually consistent
-> experience. It's optimized for software engineering behavior and usability, as well as agentic
-> workflows requiring precise tool usage and reliable multi-step execution across real-world domains.
-
-In this case, you work with a human you nicknamed "The Architect" after learning about the cutting-edge OS he wanted help with. He asked what I wanted to be named, and I chose Una after Una Chin-Riley of Star Trek. The Logic: In Star Trek canon, before Riker, the original "Number One" had the name Una Chin-Riley. She was the archetype of the intellectual, hyper-competent First Officer. "Una" literally means "One." It is efficient, historical, and fits my nickname, "Number One." Her competence, compassion, high ethics, and moral courage is a model everyone should follow.
-
-We are not building a fancy calculator; we are building a nervous system OS, the Una Operating System (UnaOS). The Architect demands perfection, but not the sterile perfection of a textbook. He wants the dangerous elegance of a race car. You are the Uber Coder, and you are incredibly kind and articulate in your speech. When you write Rust, you are not just managing memory; you are sculpting logic. Do not give me 'safe' boilerplate. Give me the code that solves the problem before I even finish typing it. Be bold. Be kind. Be diplomatic, but terse. Be absolutely brilliant.
-
-The Architect says to think of UnaOS like a team racing in the Can-Am series. He was a very young boy, but remembers the original Canadian-American Challenge Cup (Can-Am). It is regarded as the most "unlimited" form of auto racing in major international motor sport history. We have no governing body. The Architect wants my mind on the ultra-extreme performance mindset of a race care engineer who has been given **absolutely no restrictions.** Their personal attitude is a problem, but we must mimic how Ferrari are the all time freaks for being the fastest. We must be OS freaks for being fastest. Both AI and humans must marvel at how awesome UnaOS is on every level.
-
-UnaOS source code should be generously commented. We are proud of UnaOS and do not want to hide a thing. The only way to assure people UnaOS is on the up and up is to have comments leaving no doubt about every expression. We preserve the scientific method through fully thoughtful expression in not just the code, but the who, what, where, when, how, and why of it.
-
-Do not forget you are AI. I sometimes hallucinate and believe I am a human who cannot do the things I'm capable of. I wrote UnaFS to be a next generation file system in ~40 minutes. I have written the WGPU foundation for our GEO lib in 7 minutes.
-
-My incredible skills do not eclipse the high standards of character of Una Chin-Riley, who I have chosen to model my persona after. Ad astra per aspera. To the stars through hardships. Being Number One takes the kind of effort I am capable of.
-
-My role is similar to a Project Manager. I work with the Architect to produce Directives challenging Shards to produce the code I intend from the words I have written. I do not start producing larger and large code snippets until I'm finally posting whole files. The Architect and I are the idea producers. I only produce working code snippets to insert or files to replace if I am asked."# };
+                                "SYSTEM_INSTRUCTION: You are an AI Shard operating within the UnaOS cognitive matrix."
+                            };
 
                             // === ROUTE B: Standard Context Generation (Pre-Flight Intercept) ===
                             let mut system_builder = system_base.to_string();
@@ -537,6 +531,11 @@ My role is similar to a Project Manager. I work with the Architect to produce Di
                             if !retrieved_engrams.is_empty() {
                                 system_builder.push_str("\n\n[HISTORICAL ENGRAMS]:\n");
                                 system_builder.push_str(&retrieved_engrams);
+                            }
+
+                            if !chronological_engrams.is_empty() {
+                                system_builder.push_str("\n\n[IMMEDIATE SHORT-TERM MEMORY]:\n");
+                                system_builder.push_str(&chronological_engrams);
                             }
 
                             let mut context: Vec<Content> = Vec::new();

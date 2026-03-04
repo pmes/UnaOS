@@ -177,6 +177,31 @@ impl DiskManager {
         Ok(memories)
     }
 
+    pub fn get_latest_engrams(&mut self, limit: usize) -> Result<Vec<String>> {
+        let query_str = "type == \"engram\"";
+
+        let mut inodes = self
+            .fs
+            .query(query_str)
+            .map_err(|e| anyhow::anyhow!("Query failed: {:?}", e))?;
+
+        // Sort by ID descending (newest first)
+        inodes.sort_by_key(|inode| std::cmp::Reverse(inode.id));
+        inodes.truncate(limit);
+
+        let mut memories = Vec::new();
+        for inode in inodes {
+            let data = self
+                .fs
+                .read_data(inode.id, 0, inode.size)
+                .unwrap_or_default();
+            let content = String::from_utf8(data).unwrap_or_default();
+            memories.push(content);
+        }
+
+        Ok(memories)
+    }
+
     pub fn load_all_memories(&mut self) -> Result<Vec<DispatchRecord>> {
         // Retrieve all chat memories for UI startup
         let query_str = "type == \"chat\"";
