@@ -279,12 +279,15 @@ impl VeinHandler {
 
                                             // OFFLOAD TO BLOCKING THREAD POOL
                                             // The async reactor immediately yields and continues processing UI events.
-                                            tokio::task::spawn_blocking(move || {
-                                                let mut d = disk_clone.lock().unwrap();
-                                                if let Err(e) = d.save_memory("model", &response_clone, &timestamp_clone, response_embedding, "chat") {
-                                                    eprintln!(":: PLEXUS :: Failed to save model memory: {}", e);
-                                                }
-                                            }).await.unwrap();
+                                            // Fire-and-forget
+                                            tokio::spawn(async move {
+                                                let _ = tokio::task::spawn_blocking(move || {
+                                                    let mut d = disk_clone.lock().unwrap();
+                                                    if let Err(e) = d.save_memory("model", &response_clone, &timestamp_clone, response_embedding, "chat") {
+                                                        eprintln!(":: PLEXUS :: Failed to save model memory: {}", e);
+                                                    }
+                                                }).await;
+                                            });
 
                                             let _ = gui_tx_brain.send(GuiUpdate::SidebarStatus(WolfpackState::Idle)).await;
 
@@ -387,34 +390,6 @@ impl VeinHandler {
                                 }
                             };
 
-                            // SAVE USER MEMORY FIRST (So it's included in the history fetch)
-                            // We strip heavy attachments first.
-                            let parsed_parts_for_save = parse_multimodal_text(&user_input_text);
-                            let mut clean_memory_text = String::new();
-                            for part in &parsed_parts_for_save {
-                                if let Part::Text { text } = part {
-                                    clean_memory_text.push_str(text);
-                                } else {
-                                    clean_memory_text.push_str(" [System: User attached a file/image] ");
-                                }
-                            }
-                            let timestamp = Local::now().format("%H:%M:%S").to_string();
-
-                            let disk_clone = Arc::clone(&disk);
-                            let clean_memory_clone = clean_memory_text.clone();
-                            let user_embedding_clone = user_embedding.clone();
-                            let timestamp_clone = timestamp.clone();
-
-                            // [UNAOS DIRECTIVE] A stalled reactor is a dead engine.
-                            // Offload the synchronous disk save operation.
-                            let _ = tokio::task::spawn_blocking(move || {
-                                if let Ok(mut locked_disk) = disk_clone.lock() {
-                                    if let Err(e) = locked_disk.save_memory("user", &clean_memory_clone, &timestamp_clone, user_embedding_clone, "chat") {
-                                        eprintln!(":: PLEXUS :: Failed to save user memory: {}", e);
-                                    }
-                                }
-                            }).await;
-
                             let mut retrieved_context = String::new();
                             let mut retrieved_directives = String::new();
                             let mut retrieved_engrams = String::new();
@@ -473,6 +448,37 @@ impl VeinHandler {
                                     Err(e) => eprintln!(":: PLEXUS :: Blocking Task Failed: {}", e),
                                 }
                             }
+
+                            // SAVE USER MEMORY LAST (Resolving Temporal Paradox)
+                            // We strip heavy attachments first.
+                            let parsed_parts_for_save = parse_multimodal_text(&user_input_text);
+                            let mut clean_memory_text = String::new();
+                            for part in &parsed_parts_for_save {
+                                if let Part::Text { text } = part {
+                                    clean_memory_text.push_str(text);
+                                } else {
+                                    clean_memory_text.push_str(" [System: User attached a file/image] ");
+                                }
+                            }
+                            let timestamp = Local::now().format("%H:%M:%S").to_string();
+
+                            let disk_clone = Arc::clone(&disk);
+                            let clean_memory_clone = clean_memory_text.clone();
+                            let user_embedding_clone = user_embedding.clone();
+                            let timestamp_clone = timestamp.clone();
+
+                            // [UNAOS DIRECTIVE] A stalled reactor is a dead engine.
+                            // Offload the synchronous disk save operation.
+                            // Fire-and-forget: do not await on the UI thread!
+                            tokio::spawn(async move {
+                                let _ = tokio::task::spawn_blocking(move || {
+                                    if let Ok(mut locked_disk) = disk_clone.lock() {
+                                        if let Err(e) = locked_disk.save_memory("user", &clean_memory_clone, &timestamp_clone, user_embedding_clone, "chat") {
+                                            eprintln!(":: PLEXUS :: Failed to save user memory: {}", e);
+                                        }
+                                    }
+                                }).await;
+                            });
 
                             let system_base = if is_s9 {
                                 "You are S9."
