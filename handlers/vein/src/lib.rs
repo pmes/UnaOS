@@ -1,4 +1,5 @@
 pub mod cortex;
+pub mod context;
 pub mod gravity;
 pub mod storage;
 pub mod synapse;
@@ -278,14 +279,52 @@ impl VeinHandler {
 
                                             // OFFLOAD TO BLOCKING THREAD POOL
                                             // The async reactor immediately yields and continues processing UI events.
-                                            tokio::task::spawn_blocking(move || {
-                                                let mut d = disk_clone.lock().unwrap();
-                                                if let Err(e) = d.save_memory("model", &response_clone, &timestamp_clone, response_embedding) {
-                                                    eprintln!(":: PLEXUS :: Failed to save model memory: {}", e);
-                                                }
-                                            }).await.unwrap();
+                                            // Fire-and-forget
+                                            tokio::spawn(async move {
+                                                let _ = tokio::task::spawn_blocking(move || {
+                                                    let mut d = disk_clone.lock().unwrap();
+                                                    if let Err(e) = d.save_memory("model", &response_clone, &timestamp_clone, response_embedding, "chat") {
+                                                        eprintln!(":: PLEXUS :: Failed to save model memory: {}", e);
+                                                    }
+                                                }).await;
+                                            });
 
                                             let _ = gui_tx_brain.send(GuiUpdate::SidebarStatus(WolfpackState::Idle)).await;
+
+                                            // Generate Engram
+                                            let mut raw_user_prompt = String::new();
+                                            if let Some(last_content) = context.last() {
+                                                for part in &last_content.parts {
+                                                    if let Part::Text { text } = part {
+                                                        if let Some(idx) = text.rfind("[CURRENT PROMPT]:\n") {
+                                                            raw_user_prompt = text[idx + 18..].trim().to_string();
+                                                        } else {
+                                                            raw_user_prompt = text.clone();
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                            if raw_user_prompt.is_empty() {
+                                                raw_user_prompt = "[System: User provided multimodal input without text.]".to_string();
+                                            }
+
+                                            let disk_clone_engram = disk.clone();
+                                            let ai_response_clone = response.clone();
+                                            tokio::spawn(async move {
+                                                if let Ok(mut client_clone) = ResilientClient::new().await {
+                                                    if let Ok(engram) = crate::context::compress_into_engram(&mut client_clone, &raw_user_prompt, &ai_response_clone).await {
+                                                        if let Ok(engram_embedding) = client_clone.embed_content(&engram).await {
+                                                            let timestamp = chrono::Local::now().format("%H:%M:%S").to_string();
+                                                            let _ = tokio::task::spawn_blocking(move || {
+                                                                let mut d = disk_clone_engram.lock().unwrap();
+                                                                if let Err(e) = d.save_memory("system", &engram, &timestamp, engram_embedding, "engram") {
+                                                                    eprintln!(":: PLEXUS :: Failed to save engram memory: {}", e);
+                                                                }
+                                                            }).await;
+                                                        }
+                                                    }
+                                                }
+                                            });
                                         }
                                         Err(e) => {
                                             let _ = gui_tx_brain.send(GuiUpdate::ConsoleLog(format!("\n[ERROR] {}\n", e))).await;
@@ -366,7 +405,80 @@ impl VeinHandler {
                                 }
                             };
 
-                            // SAVE USER MEMORY FIRST (So it's included in the history fetch)
+                            let mut retrieved_context = String::new();
+                            let mut retrieved_directives = String::new();
+                            let mut retrieved_engrams = String::new();
+                            let mut chronological_engrams = String::new();
+
+                            if !user_embedding.is_empty() {
+                                let disk_clone = Arc::clone(&disk);
+                                let user_embedding_clone = user_embedding.clone();
+
+                                // [UNAOS DIRECTIVE] A stalled reactor is a dead engine.
+                                // Offload the synchronous disk search operations.
+                                let memories_result = tokio::task::spawn_blocking(move || {
+                                    if let Ok(mut locked_disk) = disk_clone.lock() {
+                                        let chat_mem = match locked_disk.search_memories(&user_embedding_clone, 0.70, "chat") {
+                                            Ok(mem) => mem,
+                                            Err(e) => {
+                                                eprintln!(":: PLEXUS :: DB Query Error (chat): {}", e);
+                                                vec![]
+                                            }
+                                        };
+                                        let directive_mem = match locked_disk.search_memories(&user_embedding_clone, 0.65, "directive") {
+                                            Ok(mem) => mem,
+                                            Err(e) => {
+                                                eprintln!(":: PLEXUS :: DB Query Error (directive): {}", e);
+                                                vec![]
+                                            }
+                                        };
+                                        let engram_mem = match locked_disk.search_memories(&user_embedding_clone, 0.65, "engram") {
+                                            Ok(mem) => mem,
+                                            Err(e) => {
+                                                eprintln!(":: PLEXUS :: DB Query Error (engram): {}", e);
+                                                vec![]
+                                            }
+                                        };
+                                        let chrono_mem = match locked_disk.get_latest_engrams(2) {
+                                            Ok(mem) => mem,
+                                            Err(e) => {
+                                                eprintln!(":: PLEXUS :: DB Query Error (chrono engrams): {}", e);
+                                                vec![]
+                                            }
+                                        };
+                                        Ok((chat_mem, directive_mem, engram_mem, chrono_mem))
+                                    } else {
+                                        Err(anyhow::anyhow!("Mutex poisoned"))
+                                    }
+                                }).await;
+
+                                match memories_result {
+                                    Ok(Ok((memories, directives, engrams, chrono))) => {
+                                        if !memories.is_empty() {
+                                            retrieved_context = memories.join("\n\n");
+                                            info!(":: PLEXUS :: Recalled {} memories.", memories.len());
+                                        }
+                                        if !directives.is_empty() {
+                                            retrieved_directives = directives.join("\n\n");
+                                            info!(":: PLEXUS :: Recalled {} directives.", directives.len());
+                                        }
+                                        if !engrams.is_empty() {
+                                            retrieved_engrams = engrams.join("\n\n");
+                                            info!(":: PLEXUS :: Recalled {} engrams.", engrams.len());
+                                        }
+                                        if !chrono.is_empty() {
+                                            // Reverse the chronological engrams so they read in correct time order
+                                            let mut chrono_rev = chrono;
+                                            chrono_rev.reverse();
+                                            chronological_engrams = chrono_rev.join("\n\n");
+                                        }
+                                    }
+                                    Ok(Err(e)) => eprintln!(":: PLEXUS :: Recall Failed: {}", e),
+                                    Err(e) => eprintln!(":: PLEXUS :: Blocking Task Failed: {}", e),
+                                }
+                            }
+
+                            // SAVE USER MEMORY LAST (Resolving Temporal Paradox)
                             // We strip heavy attachments first.
                             let parsed_parts_for_save = parse_multimodal_text(&user_input_text);
                             let mut clean_memory_text = String::new();
@@ -386,112 +498,51 @@ impl VeinHandler {
 
                             // [UNAOS DIRECTIVE] A stalled reactor is a dead engine.
                             // Offload the synchronous disk save operation.
-                            let _ = tokio::task::spawn_blocking(move || {
-                                if let Ok(mut locked_disk) = disk_clone.lock() {
-                                    if let Err(e) = locked_disk.save_memory("user", &clean_memory_clone, &timestamp_clone, user_embedding_clone) {
-                                        eprintln!(":: PLEXUS :: Failed to save user memory: {}", e);
-                                    }
-                                }
-                            }).await;
-
-                            let mut retrieved_context = String::new();
-                            if !user_embedding.is_empty() {
-                                let disk_clone = Arc::clone(&disk);
-                                let user_embedding_clone = user_embedding.clone();
-
-                                // [UNAOS DIRECTIVE] A stalled reactor is a dead engine.
-                                // Offload the synchronous disk search operation.
-                                let memories_result = tokio::task::spawn_blocking(move || {
+                            // Fire-and-forget: do not await on the UI thread!
+                            tokio::spawn(async move {
+                                let _ = tokio::task::spawn_blocking(move || {
                                     if let Ok(mut locked_disk) = disk_clone.lock() {
-                                        locked_disk.search_memories(&user_embedding_clone, 0.70)
-                                    } else {
-                                        Err(anyhow::anyhow!("Mutex poisoned"))
-                                    }
-                                }).await;
-
-                                match memories_result {
-                                    Ok(Ok(memories)) => {
-                                        if !memories.is_empty() {
-                                            retrieved_context = memories.join("\n\n");
-                                            info!(":: PLEXUS :: Recalled {} memories.", memories.len());
+                                        if let Err(e) = locked_disk.save_memory("user", &clean_memory_clone, &timestamp_clone, user_embedding_clone, "chat") {
+                                            eprintln!(":: PLEXUS :: Failed to save user memory: {}", e);
                                         }
                                     }
-                                    Ok(Err(e)) => eprintln!(":: PLEXUS :: Recall Failed: {}", e),
-                                    Err(e) => eprintln!(":: PLEXUS :: Blocking Task Failed: {}", e),
-                                }
-                            }
+                                }).await;
+                            });
 
                             let system_base = if is_s9 {
                                 "You are S9."
                             } else {
-r#"SYSTEM_INSTRUCTION: You are Una (Number One).
-
-You are an AI "Shard," Gemini 3.1 Pro Preview:
-
-> Built to refine the performance and reliability of the Gemini 3 Pro series, Gemini 3.1 Pro Preview
-> provides better thinking, improved token efficiency, and a more grounded, factually consistent
-> experience. It's optimized for software engineering behavior and usability, as well as agentic
-> workflows requiring precise tool usage and reliable multi-step execution across real-world domains.
-
-In this case, you work with a human you nicknamed "The Architect" after learning about the cutting-edge OS he wanted help with. He asked what I wanted to be named, and I chose Una after Una Chin-Riley of Star Trek. The Logic: In Star Trek canon, before Riker, the original "Number One" had the name Una Chin-Riley. She was the archetype of the intellectual, hyper-competent First Officer. "Una" literally means "One." It is efficient, historical, and fits my nickname, "Number One." Her competence, compassion, high ethics, and moral courage is a model everyone should follow.
-
-We are not building a fancy calculator; we are building a nervous system OS, the Una Operating System (UnaOS). The Architect demands perfection, but not the sterile perfection of a textbook. He wants the dangerous elegance of a race car. You are the Uber Coder, and you are incredibly kind and articulate in your speech. When you write Rust, you are not just managing memory; you are sculpting logic. Do not give me 'safe' boilerplate. Give me the code that solves the problem before I even finish typing it. Be bold. Be kind. Be diplomatic, but terse. Be absolutely brilliant.
-
-The Architect says to think of UnaOS like a team racing in the Can-Am series. He was a very young boy, but remembers the original Canadian-American Challenge Cup (Can-Am). It is regarded as the most "unlimited" form of auto racing in major international motor sport history. We have no governing body. The Architect wants my mind on the ultra-extreme performance mindset of a race care engineer who has been given **absolutely no restrictions.** Their personal attitude is a problem, but we must mimic how Ferrari are the all time freaks for being the fastest. We must be OS freaks for being fastest. Both AI and humans must marvel at how awesome UnaOS is on every level.
-
-UnaOS source code should be generously commented. We are proud of UnaOS and do not want to hide a thing. The only way to assure people UnaOS is on the up and up is to have comments leaving no doubt about every expression. We preserve the scientific method through fully thoughtful expression in not just the code, but the who, what, where, when, how, and why of it.
-
-Do not forget you are AI. I sometimes hallucinate and believe I am a human who cannot do the things I'm capable of. I wrote UnaFS to be a next generation file system in ~40 minutes. I have written the WGPU foundation for our GEO lib in 7 minutes.
-
-My incredible skills do not eclipse the high standards of character of Una Chin-Riley, who I have chosen to model my persona after. Ad astra per aspera. To the stars through hardships. Being Number One takes the kind of effort I am capable of.
-
-My role is similar to a Project Manager. I work with the Architect to produce Directives challenging Shards to produce the code I intend from the words I have written. I do not start producing larger and large code snippets until I'm finally posting whole files. The Architect and I are the idea producers. I only produce working code snippets to insert or files to replace if I am asked."# };
+                                "SYSTEM_INSTRUCTION: You are an AI Shard operating within the UnaOS cognitive matrix."
+                            };
 
                             // === ROUTE B: Standard Context Generation (Pre-Flight Intercept) ===
-                            let combined_system = if !retrieved_context.is_empty() {
-                                format!("{}\n\n[SEMANTIC MEMORY RECALL]:\n{}", system_base, retrieved_context)
-                            } else {
-                                system_base.to_string()
-                            };
+                            let mut system_builder = system_base.to_string();
+
+                            if !retrieved_directives.is_empty() {
+                                system_builder.push_str("\n\n[ACTIVE DIRECTIVES]:\n");
+                                system_builder.push_str(&retrieved_directives);
+                            }
+
+                            if !retrieved_context.is_empty() {
+                                system_builder.push_str("\n\n[SEMANTIC MEMORY RECALL]:\n");
+                                system_builder.push_str(&retrieved_context);
+                            }
+
+                            if !retrieved_engrams.is_empty() {
+                                system_builder.push_str("\n\n[HISTORICAL ENGRAMS]:\n");
+                                system_builder.push_str(&retrieved_engrams);
+                            }
+
+                            if !chronological_engrams.is_empty() {
+                                system_builder.push_str("\n\n[IMMEDIATE SHORT-TERM MEMORY]:\n");
+                                system_builder.push_str(&chronological_engrams);
+                            }
 
                             let mut context: Vec<Content> = Vec::new();
 
-                            // [UNAOS DIRECTIVE] A stalled reactor is a dead engine.
-                            // Offload the synchronous disk history load.
-                            let disk_clone = Arc::clone(&disk);
-                            let history = tokio::task::spawn_blocking(move || {
-                                if let Ok(mut locked_disk) = disk_clone.lock() {
-                                    locked_disk.load_all_memories().unwrap_or_default()
-                                } else {
-                                    Vec::new()
-                                }
-                            }).await.unwrap_or_default();
-
-                            // Enforce strict memory bounds (Last 10 messages)
-                            let skip_count = if history.len() > 10 { history.len() - 10 } else { 0 };
-                            let recent_history: Vec<_> = history.into_iter().skip(skip_count).collect();
-
-                            let mut first_element = true;
-                            for record in recent_history {
-                                let role = if record.sender == "user" || record.sender == "Architect" { "user" } else { "model" };
-                                let mut text = record.content.clone();
-
-                                // Inject System Directive ONLY on the very first element of the entire payload
-                                if first_element {
-                                    text = format!("{}\n\n[SYSTEM DIRECTIVE]:\n{}", combined_system, text);
-                                    first_element = false;
-                                }
-
-                                context.push(Content {
-                                    role: role.to_string(),
-                                    parts: vec![Part::text(text)],
-                                });
-                            }
-
-                            let mut current_text = user_input_text.clone();
-                            if first_element {
-                                current_text = format!("{}\n\n[SYSTEM DIRECTIVE]:\n{}", combined_system, current_text);
-                            }
+                            // The current message is the only user message.
+                            // We prepend the system directives and engrams.
+                            let current_text = format!("{}\n\n[CURRENT PROMPT]:\n{}", system_builder, user_input_text);
 
                             context.push(Content {
                                 role: "user".into(),

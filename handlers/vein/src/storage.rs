@@ -87,11 +87,12 @@ impl DiskManager {
         content: &str,
         timestamp: &str,
         embedding: Vec<f32>,
+        memory_type: &str,
     ) -> Result<()> {
         let mut attrs = BTreeMap::new();
         attrs.insert(
             "type".to_string(),
-            AttributeValue::String("chat".to_string()),
+            AttributeValue::String(memory_type.to_string()),
         );
         attrs.insert(
             "sender".to_string(),
@@ -122,7 +123,7 @@ impl DiskManager {
         Ok(())
     }
 
-    pub fn search_memories(&mut self, embedding: &[f32], threshold: f32) -> Result<Vec<String>> {
+    pub fn search_memories(&mut self, embedding: &[f32], threshold: f32, memory_type: &str) -> Result<Vec<String>> {
         // Query syntax: similarity(embedding, [0.1,0.2,...]) > 0.7
         let vec_str = format!(
             "[{}]",
@@ -139,9 +140,19 @@ impl DiskManager {
             .query(&query_str)
             .map_err(|e| anyhow::anyhow!("Query failed: {:?}", e))?;
 
+        // Manual filtering since UnaFS query does not support `AND type == "..."`
+        inodes.retain(|inode| {
+            if let Some(AttributeValue::String(t)) = inode.attributes.get("type") {
+                t == memory_type
+            } else {
+                false
+            }
+        });
+
         // === THE NEUROSURGERY: ATTENTION SPAN ===
         // Sort by newest first, and strictly truncate to the top 3 results.
         // This permanently prevents 429 API Payload explosions.
+        // TODO [UnaOS]: Alter UnaFS `query` to return `(Inode, f32)` so we can sort the cognitive attention span by pure vector gravity instead of chronological recency.
         inodes.sort_by_key(|inode| std::cmp::Reverse(inode.id));
         inodes.truncate(3);
 
@@ -161,6 +172,31 @@ impl DiskManager {
 
             // Format: [Sender]: Content
             memories.push(format!("[{}]: {}", sender, content));
+        }
+
+        Ok(memories)
+    }
+
+    pub fn get_latest_engrams(&mut self, limit: usize) -> Result<Vec<String>> {
+        let query_str = "type == \"engram\"";
+
+        let mut inodes = self
+            .fs
+            .query(query_str)
+            .map_err(|e| anyhow::anyhow!("Query failed: {:?}", e))?;
+
+        // Sort by ID descending (newest first)
+        inodes.sort_by_key(|inode| std::cmp::Reverse(inode.id));
+        inodes.truncate(limit);
+
+        let mut memories = Vec::new();
+        for inode in inodes {
+            let data = self
+                .fs
+                .read_data(inode.id, 0, inode.size)
+                .unwrap_or_default();
+            let content = String::from_utf8(data).unwrap_or_default();
+            memories.push(content);
         }
 
         Ok(memories)

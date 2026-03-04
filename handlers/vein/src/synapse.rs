@@ -28,7 +28,8 @@ impl SynapticRetry for RequestBuilder {
 
                 match req.send().await {
                     Ok(res) => {
-                        if res.status() == StatusCode::TOO_MANY_REQUESTS {
+                        let status = res.status();
+                        if status == StatusCode::TOO_MANY_REQUESTS || status.is_server_error() {
                             if attempt >= 5 {
                                 return Ok(res);
                             }
