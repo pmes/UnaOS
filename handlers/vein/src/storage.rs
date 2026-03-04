@@ -133,32 +133,22 @@ impl DiskManager {
                 .collect::<Vec<_>>()
                 .join(",")
         );
-        let query_str = format!("similarity(embedding, {}) > {}", vec_str, threshold);
+        let query_str = format!("similarity(embedding, {}) > {} AND type == \"{}\"", vec_str, threshold, memory_type);
 
         let mut inodes = self
             .fs
             .query(&query_str)
             .map_err(|e| anyhow::anyhow!("Query failed: {:?}", e))?;
 
-        // Manual filtering since UnaFS query does not support `AND type == "..."`
-        inodes.retain(|inode| {
-            if let Some(AttributeValue::String(t)) = inode.attributes.get("type") {
-                t == memory_type
-            } else {
-                false
-            }
-        });
-
         // === THE NEUROSURGERY: ATTENTION SPAN ===
-        // Sort by newest first, and strictly truncate to the top 3 results.
+        // Sort by pure vector gravity (descending)
         // This permanently prevents 429 API Payload explosions.
-        // TODO [UnaOS]: Alter UnaFS `query` to return `(Inode, f32)` so we can sort the cognitive attention span by pure vector gravity instead of chronological recency.
-        inodes.sort_by_key(|inode| std::cmp::Reverse(inode.id));
+        inodes.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
         inodes.truncate(3);
 
         let mut memories = Vec::new();
 
-        for inode in inodes {
+        for (inode, _) in inodes {
             let data = self
                 .fs
                 .read_data(inode.id, 0, inode.size)
@@ -186,11 +176,11 @@ impl DiskManager {
             .map_err(|e| anyhow::anyhow!("Query failed: {:?}", e))?;
 
         // Sort by ID descending (newest first)
-        inodes.sort_by_key(|inode| std::cmp::Reverse(inode.id));
+        inodes.sort_by_key(|(inode, _)| std::cmp::Reverse(inode.id));
         inodes.truncate(limit);
 
         let mut memories = Vec::new();
-        for inode in inodes {
+        for (inode, _) in inodes {
             let data = self
                 .fs
                 .read_data(inode.id, 0, inode.size)
@@ -212,10 +202,10 @@ impl DiskManager {
             .map_err(|e| anyhow::anyhow!("Query failed: {:?}", e))?;
 
         // Sort by ID (Creation Order)
-        inodes.sort_by_key(|inode| inode.id);
+        inodes.sort_by_key(|(inode, _)| inode.id);
 
         let mut records = Vec::new();
-        for inode in inodes {
+        for (inode, _) in inodes {
             let data = self
                 .fs
                 .read_data(inode.id, 0, inode.size)

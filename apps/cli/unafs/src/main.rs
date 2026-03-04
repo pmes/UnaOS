@@ -193,8 +193,8 @@ async fn main() -> Result<()> {
             let results = fs.query(query).map_err(|e| anyhow::anyhow!(e))?;
 
             println!("Found {} results:", results.len());
-            for inode in results {
-                println!("  Inode {} (Size: {} bytes)", inode.id, inode.size);
+            for (inode, score) in results {
+                println!("  Inode {} (Size: {} bytes) [Score: {:.4}]", inode.id, inode.size, score);
             }
         }
     }

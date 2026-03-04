@@ -15,45 +15,71 @@ pub struct Query {
     pub key: String,
     pub op: QueryOp,
     pub value: AttributeValue, // For Similarity, this holds the target vector
+    pub secondary_filters: Vec<(String, String)>,
 }
 
 impl Query {
     pub fn parse(input: &str) -> Result<Self, String> {
         let input = input.trim();
 
-        // Check for function call syntax first: similarity(key, [vec]) > threshold
-        if input.starts_with("similarity(") {
-            return parse_similarity(input);
+        // Split by " AND "
+        let parts: Vec<&str> = input.split(" AND ").collect();
+        if parts.is_empty() {
+            return Err("Invalid query syntax".to_string());
         }
 
-        // Simple binary ops: key op value
-        // Split by operators
-        let ops = ["==", "!=", ">", "<"];
-        for op in ops {
-            if let Some(idx) = input.find(op) {
-                let key_part = input[..idx].trim();
-                let val_part = input[idx + op.len()..].trim();
+        let primary_input = parts[0].trim();
+        let mut base_query = if primary_input.starts_with("similarity(") {
+            parse_similarity(primary_input)?
+        } else {
+            let mut result = None;
+            let ops = ["==", "!=", ">", "<"];
+            for op in ops {
+                if let Some(idx) = primary_input.find(op) {
+                    let key_part = primary_input[..idx].trim();
+                    let val_part = primary_input[idx + op.len()..].trim();
 
-                let key = key_part.to_string();
-                let value = parse_value(val_part)?;
+                    let key = key_part.to_string();
+                    let value = parse_value(val_part)?;
 
-                let query_op = match op {
-                    "==" => QueryOp::Eq,
-                    "!=" => QueryOp::Neq,
-                    ">" => QueryOp::Gt,
-                    "<" => QueryOp::Lt,
-                    _ => return Err("Unknown operator".to_string()),
-                };
+                    let query_op = match op {
+                        "==" => QueryOp::Eq,
+                        "!=" => QueryOp::Neq,
+                        ">" => QueryOp::Gt,
+                        "<" => QueryOp::Lt,
+                        _ => return Err("Unknown operator".to_string()),
+                    };
 
-                return Ok(Query {
-                    key,
-                    op: query_op,
-                    value,
-                });
+                    result = Some(Query {
+                        key,
+                        op: query_op,
+                        value,
+                        secondary_filters: Vec::new(),
+                    });
+                    break;
+                }
+            }
+            result.ok_or_else(|| "Invalid query syntax".to_string())?
+        };
+
+        // Parse secondary filters
+        for part in parts.into_iter().skip(1) {
+            let filter_str = part.trim();
+            if let Some(idx) = filter_str.find("==") {
+                let key = filter_str[..idx].trim().to_string();
+                let mut val_str = filter_str[idx + 2..].trim().to_string();
+
+                if val_str.starts_with('"') && val_str.ends_with('"') {
+                    val_str = val_str[1..val_str.len() - 1].to_string();
+                }
+
+                base_query.secondary_filters.push((key, val_str));
+            } else {
+                return Err(format!("Secondary filters must use '==' operator. Got: {}", filter_str));
             }
         }
 
-        Err("Invalid query syntax".to_string())
+        Ok(base_query)
     }
 }
 
@@ -125,5 +151,6 @@ fn parse_similarity(input: &str) -> Result<Query, String> {
         key,
         op: QueryOp::SimilarityGt(threshold),
         value,
+        secondary_filters: Vec::new(),
     })
 }
