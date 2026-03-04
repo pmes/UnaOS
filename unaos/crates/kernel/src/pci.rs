@@ -1,37 +1,108 @@
+use lazy_static::lazy_static;
+use spin::Mutex;
 use x86_64::instructions::port::Port;
 use crate::serial_println;
+
+pub struct PciPort {
+    address_port: Port<u32>,
+    data_port: Port<u32>,
+}
+
+impl PciPort {
+    pub const fn new() -> Self {
+        PciPort {
+            address_port: Port::new(0xCF8),
+            data_port: Port::new(0xCFC),
+        }
+    }
+}
+
+lazy_static! {
+    static ref PCI_CONFIG: Mutex<PciPort> = Mutex::new(PciPort::new());
+}
 
 pub struct PciScanner;
 
 impl PciScanner {
-    pub fn scan() {
-        serial_println!("PCI: Scanning...");
-        // Bus 0..256 (u8 covers 0..255, loop should be 0..=255 or 0..256 with larger type)
-        // bus is u16 in loop to reach 256, cast to u8
-        for bus in 0u16..256 {
-            for slot in 0u8..32 {
-                // Check if device exists (Vendor ID at offset 0x00)
-                let vendor_id = unsafe { Self::read_config_16(bus as u8, slot, 0, 0x00) };
+    pub fn read_word(bus: u8, device: u8, func: u8, offset: u8) -> u32 {
+        let address = 0x8000_0000
+            | ((bus as u32) << 16)
+            | ((device as u32) << 11)
+            | ((func as u32) << 8)
+            | ((offset as u32) & 0xFC);
+
+        x86_64::instructions::interrupts::without_interrupts(|| {
+            let mut ports = PCI_CONFIG.lock();
+            unsafe {
+                ports.address_port.write(address);
+                ports.data_port.read()
+            }
+        })
+    }
+
+    pub fn enumerate_buses() -> Option<u64> {
+        serial_println!("PCI: Commencing motherboard scan...");
+
+        for bus in 0..=255 {
+            for device in 0..=31 {
+                let vendor_id_reg = Self::read_word(bus, device, 0, 0x00);
+                let vendor_id = (vendor_id_reg & 0xFFFF) as u16;
+
                 if vendor_id == 0xFFFF {
                     continue;
                 }
 
-                // Read Class/Subclass at offset 0x0A
-                let class_word = unsafe { Self::read_config_16(bus as u8, slot, 0, 0x0A) };
+                let header_type_reg = Self::read_word(bus, device, 0, 0x0C);
+                let header_type = ((header_type_reg >> 16) & 0xFF) as u8;
+                let is_multi_function = (header_type & 0x80) != 0;
 
-                // High byte is Class, Low byte is Subclass
-                let class_code = (class_word >> 8) as u8;
-                let subclass = (class_word & 0xFF) as u8;
+                let max_func = if is_multi_function { 7 } else { 0 };
 
-                serial_println!("CONTACT: [{:02x}:{:02x}:00] Class: {:02x} Sub: {:02x}",
-                    bus, slot, class_code, subclass);
+                for func in 0..=max_func {
+                    if func != 0 {
+                        let vendor_id_reg = Self::read_word(bus, device, func, 0x00);
+                        if (vendor_id_reg & 0xFFFF) as u16 == 0xFFFF {
+                            continue;
+                        }
+                    }
 
-                if class_code == 0x0C && subclass == 0x03 {
-                    serial_println!("TARGET LOCKED: USB xHCI");
+                    let class_reg = Self::read_word(bus, device, func, 0x08);
+                    let class_code = ((class_reg >> 24) & 0xFF) as u8;
+                    let subclass = ((class_reg >> 16) & 0xFF) as u8;
+                    let prog_if = ((class_reg >> 8) & 0xFF) as u8;
+
+                    if class_code == 0x0C && subclass == 0x03 && prog_if == 0x30 {
+                        // Found XHCI
+                        return Some(Self::read_bar0(bus, device, func));
+                    }
                 }
             }
         }
-        serial_println!("PCI: Scan Complete.");
+
+        None
+    }
+
+    pub fn scan() -> Option<u64> {
+        if let Some(addr) = Self::enumerate_buses() {
+            serial_println!("[PCI] FOUND XHCI CONTROLLER AT PHYSICAL ADDRESS: 0x{:X}", addr);
+            Some(addr)
+        } else {
+            serial_println!("[PCI] WARNING: XHCI CONTROLLER NOT FOUND");
+            None
+        }
+    }
+
+    fn read_bar0(bus: u8, device: u8, func: u8) -> u64 {
+        let bar0 = Self::read_word(bus, device, func, 0x10);
+        let is_64bit = (bar0 & 0x06) == 0x04; // Bits 1-2. 0x00 = 32-bit, 0x04 = 64-bit (Type 02 = 10b => bit 1 is 0, bit 2 is 1 => 4) Wait, 0x2 memory type is bits 1-2. 0x2 << 1 is 0x4.
+        let addr_low = bar0 & 0xFFFFFFF0;
+
+        if is_64bit {
+            let bar1 = Self::read_word(bus, device, func, 0x14);
+            (addr_low as u64) | ((bar1 as u64) << 32)
+        } else {
+            addr_low as u64
+        }
     }
 
     pub fn find_device(target_class: u8, target_subclass: u8) -> Option<(u8, u8, u8)> {

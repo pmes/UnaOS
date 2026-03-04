@@ -1,4 +1,6 @@
 // FIX: Use crate:: instead of unaos_kernel::
+use bootloader_api::info::{FrameBufferInfo, PixelFormat};
+
 use crate::pal::TargetPal;
 use gneiss_pal::GneissPal;
 
@@ -6,6 +8,54 @@ const METER_SEGMENTS: usize = 10;
 const SEG_HEIGHT: u32 = 10;
 const SEG_SPACING: u32 = 2;
 const SEG_WIDTH: u32 = 40;
+
+pub fn init(framebuffer: &mut [u8], info: FrameBufferInfo) {
+    let width = info.width;
+    let height = info.height;
+    let stride = info.stride;
+    let format = info.pixel_format;
+
+    crate::serial_println!(":: VUG Init ::");
+    crate::serial_println!(":: FB Size: {}x{} (stride {}) ::", width, height, stride);
+    crate::serial_println!(":: FB Format: {:?} ::", format);
+
+    // Can-Am dark grey: #1E1E1E
+    let r_val = 0x1E;
+    let g_val = 0x1E;
+    let b_val = 0x1E;
+
+    let bytes_per_pixel = info.bytes_per_pixel;
+
+    for y in 0..height {
+        for x in 0..width {
+            let offset = (y * stride + x) * bytes_per_pixel;
+            if offset + bytes_per_pixel <= framebuffer.len() {
+                match format {
+                    PixelFormat::Rgb => {
+                        framebuffer[offset] = r_val;
+                        framebuffer[offset + 1] = g_val;
+                        framebuffer[offset + 2] = b_val;
+                        // Alpha/Reserved byte is unmodified or set to 0
+                    }
+                    PixelFormat::Bgr => {
+                        framebuffer[offset] = b_val;
+                        framebuffer[offset + 1] = g_val;
+                        framebuffer[offset + 2] = r_val;
+                    }
+                    PixelFormat::U8 => {
+                        // Greyscale approximation
+                        framebuffer[offset] = 0x1E;
+                    }
+                    _ => {
+                        // Unknown format, do not write
+                    }
+                }
+            }
+        }
+    }
+
+    crate::serial_println!(":: Framebuffer painted #1E1E1E ::");
+}
 
 pub fn draw_vug_stats(pal: &mut TargetPal, tick: u64) {
     // FIX: Removed extra parentheses

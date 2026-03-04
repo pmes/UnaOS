@@ -9,7 +9,72 @@ use self::event::{EventRing, ErstEntry, ErstTable};
 use self::context::{InputContext, DeviceContext};
 use spin::Mutex;
 use crate::serial_println;
-use x86_64::PhysAddr;
+use x86_64::{structures::paging::{OffsetPageTable, Translate}, VirtAddr, PhysAddr};
+
+pub fn init(base_address: VirtAddr, mapper: &mut OffsetPageTable<'static>) {
+    serial_println!("xHCI: Virtual Handoff. Base Address: {:#x}", base_address.as_u64());
+
+    let cap_ptr = base_address.as_u64() as *const u32;
+    let cap_word = unsafe { core::ptr::read_volatile(cap_ptr) };
+    let cap_length = (cap_word & 0xFF) as u8;
+
+    let op_base = base_address + cap_length as u64;
+    serial_println!("xHCI: CapLength: {}, Operational Base: {:#x}", cap_length, op_base.as_u64());
+
+    let usbcmd_ptr = op_base.as_u64() as *mut u32;
+    let usbsts_ptr = (op_base.as_u64() + 0x04) as *const u32;
+
+    unsafe {
+        // Halt Controller
+        let cmd = core::ptr::read_volatile(usbcmd_ptr);
+        core::ptr::write_volatile(usbcmd_ptr, cmd & !1);
+
+        loop {
+            let status = core::ptr::read_volatile(usbsts_ptr);
+            if (status & 1) != 0 {
+                break;
+            }
+            core::hint::spin_loop();
+        }
+        serial_println!("xHCI: Controller Halted.");
+
+        // Reset Controller
+        let cmd = core::ptr::read_volatile(usbcmd_ptr);
+        core::ptr::write_volatile(usbcmd_ptr, cmd | 2);
+
+        loop {
+            let current_cmd = core::ptr::read_volatile(usbcmd_ptr);
+            if (current_cmd & 2) == 0 {
+                break;
+            }
+            core::hint::spin_loop();
+        }
+
+        // Wait for Controller Not Ready (CNR) to clear
+        loop {
+            let status = core::ptr::read_volatile(usbsts_ptr);
+            if (status & (1 << 11)) == 0 {
+                break;
+            }
+            core::hint::spin_loop();
+        }
+        serial_println!("xHCI: Controller Reset Complete.");
+    }
+
+    let command_ring_ptr = ring::allocate_command_ring();
+    let ring_virt = VirtAddr::from_ptr(command_ring_ptr);
+
+    if let Some(phys_addr) = mapper.translate_addr(ring_virt) {
+        let crcr_reg = (op_base.as_u64() + 0x18) as *mut u64;
+        let crcr_value = phys_addr.as_u64() | 1; // Bit 0 (RCS) = 1
+        unsafe {
+            core::ptr::write_volatile(crcr_reg, crcr_value);
+        }
+        serial_println!("[XHCI] CONTROLLER RESET AND COMMAND RING ALLOCATED.");
+    } else {
+        panic!("xHCI: Failed to translate Command Ring virtual address!");
+    }
+}
 
 pub static COMMAND_RING: Mutex<CommandRing> = Mutex::new(CommandRing::new());
 pub static EVENT_RING: Mutex<EventRing> = Mutex::new(EventRing::new());
