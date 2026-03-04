@@ -292,12 +292,27 @@ impl VeinHandler {
                                             let _ = gui_tx_brain.send(GuiUpdate::SidebarStatus(WolfpackState::Idle)).await;
 
                                             // Generate Engram
+                                            let mut raw_user_prompt = String::new();
+                                            if let Some(last_content) = context.last() {
+                                                for part in &last_content.parts {
+                                                    if let Part::Text { text } = part {
+                                                        if let Some(idx) = text.rfind("[CURRENT PROMPT]:\n") {
+                                                            raw_user_prompt = text[idx + 18..].trim().to_string();
+                                                        } else {
+                                                            raw_user_prompt = text.clone();
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                            if raw_user_prompt.is_empty() {
+                                                raw_user_prompt = "[System: User provided multimodal input without text.]".to_string();
+                                            }
+
                                             let disk_clone_engram = disk.clone();
-                                            let user_prompt_clone = user_input_text.clone();
                                             let ai_response_clone = response.clone();
                                             tokio::spawn(async move {
                                                 if let Ok(mut client_clone) = ResilientClient::new().await {
-                                                    if let Ok(engram) = crate::context::compress_into_engram(&mut client_clone, &user_prompt_clone, &ai_response_clone).await {
+                                                    if let Ok(engram) = crate::context::compress_into_engram(&mut client_clone, &raw_user_prompt, &ai_response_clone).await {
                                                         if let Ok(engram_embedding) = client_clone.embed_content(&engram).await {
                                                             let timestamp = chrono::Local::now().format("%H:%M:%S").to_string();
                                                             let _ = tokio::task::spawn_blocking(move || {

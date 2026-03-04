@@ -152,6 +152,7 @@ impl DiskManager {
         // === THE NEUROSURGERY: ATTENTION SPAN ===
         // Sort by newest first, and strictly truncate to the top 3 results.
         // This permanently prevents 429 API Payload explosions.
+        // TODO [UnaOS]: Alter UnaFS `query` to return `(Inode, f32)` so we can sort the cognitive attention span by pure vector gravity instead of chronological recency.
         inodes.sort_by_key(|inode| std::cmp::Reverse(inode.id));
         inodes.truncate(3);
 
