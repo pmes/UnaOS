@@ -124,7 +124,7 @@ impl DiskManager {
     }
 
     pub fn search_memories(&mut self, embedding: &[f32], threshold: f32, memory_type: &str) -> Result<Vec<String>> {
-        // Query syntax: similarity(embedding, [0.1,0.2,...]) > 0.7 AND type == "engram"
+        // Query syntax: similarity(embedding, [0.1,0.2,...]) > 0.7
         let vec_str = format!(
             "[{}]",
             embedding
@@ -133,12 +133,21 @@ impl DiskManager {
                 .collect::<Vec<_>>()
                 .join(",")
         );
-        let query_str = format!("similarity(embedding, {}) > {} AND type == \"{}\"", vec_str, threshold, memory_type);
+        let query_str = format!("similarity(embedding, {}) > {}", vec_str, threshold);
 
         let mut inodes = self
             .fs
             .query(&query_str)
             .map_err(|e| anyhow::anyhow!("Query failed: {:?}", e))?;
+
+        // Manual filtering since UnaFS query does not support `AND type == "..."`
+        inodes.retain(|inode| {
+            if let Some(AttributeValue::String(t)) = inode.attributes.get("type") {
+                t == memory_type
+            } else {
+                false
+            }
+        });
 
         // === THE NEUROSURGERY: ATTENTION SPAN ===
         // Sort by newest first, and strictly truncate to the top 3 results.
