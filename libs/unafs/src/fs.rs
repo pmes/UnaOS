@@ -215,7 +215,7 @@ impl<D: BlockDevice> UnaFS<D> {
         Ok(block_id)
     }
 
-    fn sync_metadata(&mut self) -> Result<(), FileSystemError> {
+    pub fn sync_metadata(&mut self) -> Result<(), FileSystemError> {
         self.bitmap
             .save(&mut self.device, self.superblock.bitmap_start)?;
 

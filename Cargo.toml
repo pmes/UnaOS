@@ -18,6 +18,7 @@ members = [
     # "handlers/vug",
     "apps/cli/vertex",
     "apps/cli/unafs",
+    "apps/cli/unafs_bench",
     "apps/cli/sentinel",
     "apps/lumen",
     "apps/una",
@@ -32,5 +33,6 @@ default-members = [
     "apps/una",
     "apps/cli/vertex",
     "apps/cli/unafs",
+    "apps/cli/unafs_bench",
     "apps/cli/sentinel"
 ]
