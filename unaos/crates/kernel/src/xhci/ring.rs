@@ -1,7 +1,16 @@
+use core::alloc::Layout;
 use super::trb::Trb;
 use crate::serial_println;
 
 const RING_SIZE: usize = 16;
+
+pub fn allocate_command_ring() -> *mut u8 {
+    unsafe {
+        // 256 TRBs * 16 bytes = 4096 bytes
+        let layout = Layout::from_size_align(4096, 64).unwrap();
+        alloc::alloc::alloc_zeroed(layout)
+    }
+}
 
 #[repr(C, align(64))] // xHCI requires 64-byte alignment for ring segments
 pub struct CommandRing {
