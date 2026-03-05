@@ -1061,12 +1061,12 @@ fn build_gnome_ui(
         }
 
         // Only intercept if a bubble Box has focus.
-        if let Some(focused) = console_list_view_clone.root().and_downcast::<gtk4::Window>().and_then(|w| w.focus()) {
+        if let Some(focused) = console_list_view_clone.root().and_downcast::<gtk4::Window>().and_then(|w| w.focus_widget()) {
             if focused.has_css_class("bubble-box") {
                 // Find current index
-                let mut current_idx = None;
+                let mut current_idx: Option<i32> = None;
                 let mut child = console_list_view_clone.first_child();
-                let mut idx = 0;
+                let mut idx: i32 = 0;
                 while let Some(c) = child {
                     if let Ok(list_item_widget) = c.clone().downcast::<gtk4::Widget>() {
                         // Traverse list item widget to find bubble Box
@@ -1096,7 +1096,7 @@ fn build_gnome_ui(
 
                     if next_idx != idx {
                         let mut child = console_list_view_clone.first_child();
-                        let mut curr = 0;
+                        let mut curr: i32 = 0;
                         let mut found_focus = false;
                         while let Some(c) = child {
                             if curr == next_idx {
@@ -2589,12 +2589,12 @@ fn build_gtk_ui(
         }
 
         // Only intercept if a bubble Box has focus.
-        if let Some(focused) = console_list_view_clone.root().and_downcast::<gtk4::Window>().and_then(|w| w.focus()) {
+        if let Some(focused) = console_list_view_clone.root().and_downcast::<gtk4::Window>().and_then(|w| w.focus_widget()) {
             if focused.has_css_class("bubble-box") {
                 // Find current index
-                let mut current_idx = None;
+                let mut current_idx: Option<i32> = None;
                 let mut child = console_list_view_clone.first_child();
-                let mut idx = 0;
+                let mut idx: i32 = 0;
                 while let Some(c) = child {
                     if let Ok(list_item_widget) = c.clone().downcast::<gtk4::Widget>() {
                         // Traverse list item widget to find bubble Box
@@ -2624,7 +2624,7 @@ fn build_gtk_ui(
 
                     if next_idx != idx {
                         let mut child = console_list_view_clone.first_child();
-                        let mut curr = 0;
+                        let mut curr: i32 = 0;
                         let mut found_focus = false;
                         while let Some(c) = child {
                             if curr == next_idx {
