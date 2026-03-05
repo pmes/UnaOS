@@ -7,9 +7,9 @@ use gtk4::{
     Adjustment, Align, Box, Button, CheckButton, ColumnView, ColumnViewColumn, CssProvider,
     DropDown, Entry, EventControllerKey, Expander, FileDialog, FilterListModel, GestureClick,
     Image, Label, ListBox, ListItem, ListView, NoSelection, Orientation, Paned, PolicyType,
-    Popover, PropagationPhase, Scale, ScrolledWindow, Separator, SignalListItemFactory,
+    Popover, PropagationPhase, Scale, ScrolledWindow, SignalListItemFactory,
     SingleSelection, Spinner, Stack, StackSwitcher, StackTransitionType, StringList, StringObject,
-    Switch, ToggleButton, Widget, Window,
+    Switch, ToggleButton, Window,
     gdk::{Key, ModifierType},
     gio, glib,
 };
@@ -722,41 +722,44 @@ fn build_gnome_ui(
             let bubble_clone = bubble.clone();
             let console_store_clone = console_store.clone();
 
-            cancel_btn.connect_clicked(move |_| {
-                let dialog = gtk4::MessageDialog::builder()
-                    .text("Delete Payload?")
-                    .secondary_text("Are you sure you want to discard this pre-flight payload? This cannot be undone.")
-                    .message_type(gtk4::MessageType::Warning)
-                    .buttons(gtk4::ButtonsType::Cancel)
+            if let Some(sig) = unsafe { cancel_btn.data::<glib::SignalHandlerId>("clicked_sig") } {
+                cancel_btn.disconnect(sig.as_ref().clone());
+            }
+            let cancel_sig = cancel_btn.connect_clicked(move |_| {
+                let dialog = gtk4::AlertDialog::builder()
+                    .heading("Delete Payload?")
+                    .detail("Are you sure you want to discard this pre-flight payload? This cannot be undone.")
+                    .buttons(["Cancel", "Delete"])
+                    .cancel_button(0)
+                    .destructive_button(1)
                     .modal(true)
                     .build();
 
-                dialog.add_button("Delete", gtk4::ResponseType::DestructiveAction);
-
                 let obj_cancel = obj_clone.clone();
                 let store_cancel = console_store_clone.clone();
-                dialog.connect_response(move |d, response| {
-                    if response == gtk4::ResponseType::DestructiveAction {
-                        // Remove from store
-                        let n = store_cancel.n_items();
-                        for i in 0..n {
-                            if let Some(item) = store_cancel.item(i).and_downcast::<DispatchObject>() {
-                                if item.id() == obj_cancel.id() {
-                                    store_cancel.remove(i);
-                                    break;
+
+                let root_win = bubble_clone.root().and_downcast::<gtk4::Window>();
+
+                dialog.choose(
+                    root_win.as_ref(),
+                    None::<&gio::Cancellable>,
+                    move |result| {
+                        if let Ok(choice) = result {
+                            if choice == 1 { // "Delete" button index
+                                // Logic to remove the item from the store
+                                let n = store_cancel.n_items();
+                                for i in 0..n {
+                                    if let Some(item) = store_cancel.item(i).and_downcast::<DispatchObject>() {
+                                        if item.id() == obj_cancel.id() {
+                                            store_cancel.remove(i);
+                                            break;
+                                        }
+                                    }
                                 }
                             }
                         }
                     }
-                    d.close();
-                });
-
-                let root_win = bubble_clone.root().and_downcast::<gtk4::Window>();
-                if let Some(win) = root_win {
-                    dialog.set_transient_for(Some(&win));
-                }
-
-                dialog.present();
+                );
             });
 
             let tx_clone2 = tx_dispatch.clone();
@@ -765,11 +768,56 @@ fn build_gnome_ui(
             let dir_view_clone2 = directives_view.clone();
             let eng_view_clone2 = engrams_view.clone();
             let prm_view_clone2 = prompt_view.clone();
+
+            // Bind text updates to prevent data loss on scroll
+            let obj_sys = obj.clone();
+            if let Some(sig) = unsafe { system_view.buffer().data::<glib::SignalHandlerId>("changed_sig") } {
+                system_view.buffer().disconnect(sig.as_ref().clone());
+            }
+            let sig_sys = system_view.buffer().connect_changed(move |buf| {
+                let (s, e) = buf.bounds();
+                obj_sys.set_system_text(buf.text(&s, &e, false).to_string());
+            });
+            unsafe { system_view.buffer().set_data("changed_sig", sig_sys); }
+
+            let obj_dir = obj.clone();
+            if let Some(sig) = unsafe { directives_view.buffer().data::<glib::SignalHandlerId>("changed_sig") } {
+                directives_view.buffer().disconnect(sig.as_ref().clone());
+            }
+            let sig_dir = directives_view.buffer().connect_changed(move |buf| {
+                let (s, e) = buf.bounds();
+                obj_dir.set_directives_text(buf.text(&s, &e, false).to_string());
+            });
+            unsafe { directives_view.buffer().set_data("changed_sig", sig_dir); }
+
+            let obj_eng = obj.clone();
+            if let Some(sig) = unsafe { engrams_view.buffer().data::<glib::SignalHandlerId>("changed_sig") } {
+                engrams_view.buffer().disconnect(sig.as_ref().clone());
+            }
+            let sig_eng = engrams_view.buffer().connect_changed(move |buf| {
+                let (s, e) = buf.bounds();
+                obj_eng.set_engrams_text(buf.text(&s, &e, false).to_string());
+            });
+            unsafe { engrams_view.buffer().set_data("changed_sig", sig_eng); }
+
+            let obj_prm = obj.clone();
+            if let Some(sig) = unsafe { prompt_view.buffer().data::<glib::SignalHandlerId>("changed_sig") } {
+                prompt_view.buffer().disconnect(sig.as_ref().clone());
+            }
+            let sig_prm = prompt_view.buffer().connect_changed(move |buf| {
+                let (s, e) = buf.bounds();
+                obj_prm.set_prompt_text(buf.text(&s, &e, false).to_string());
+            });
+            unsafe { prompt_view.buffer().set_data("changed_sig", sig_prm); }
+
             let cancel_btn_clone = cancel_btn.clone();
             let dispatch_btn_clone = dispatch_btn.clone();
             let console_store_pulse = console_store.clone();
 
-            dispatch_btn_clone.connect_clicked(move |_| {
+            if let Some(sig) = unsafe { dispatch_btn_clone.data::<glib::SignalHandlerId>("clicked_sig") } {
+                dispatch_btn_clone.disconnect(sig.as_ref().clone());
+            }
+            let dispatch_sig = dispatch_btn_clone.connect_clicked(move |_| {
                 obj_clone2.set_is_locked(true);
                 sys_view_clone2.set_editable(false);
                 dir_view_clone2.set_editable(false);
@@ -813,6 +861,10 @@ fn build_gnome_ui(
                     let _ = tx_async.send(Event::DispatchPayload(json)).await;
                 });
             });
+            unsafe {
+                cancel_btn.set_data("clicked_sig", cancel_sig);
+                dispatch_btn.set_data("clicked_sig", dispatch_sig);
+            }
 
         } else if message_type == 2 {
             // PULSE MODE
@@ -1229,17 +1281,32 @@ fn build_gnome_ui(
                         // When Una Responds successfully, drop the pulse and transform the staging view
                         let n = console_store_async.n_items();
                         let mut removals = Vec::new();
+
+                        // We only mutate the last Staging view that was locked.
+                        // Find the index of the locked staging view.
+                        let mut target_staging_idx = None;
+                        for i in (0..n).rev() {
+                            if let Some(obj) = console_store_async.item(i).and_downcast::<DispatchObject>() {
+                                if obj.message_type() == 1 && obj.is_locked() {
+                                    target_staging_idx = Some(i);
+                                    break;
+                                }
+                            }
+                        }
+
                         for i in 0..n {
                             if let Some(obj) = console_store_async.item(i).and_downcast::<DispatchObject>() {
                                 let t = obj.message_type();
                                 if t == 2 {
                                     removals.push(i); // Drop Pulse
                                 } else if t == 1 {
-                                    // Mutate Staging into standard User message
-                                    obj.set_message_type(0);
-                                    let prm = obj.prompt_text();
-                                    obj.set_content(prm);
-                                    console_store_async.items_changed(i, 1, 1); // Force redraw
+                                    if Some(i) == target_staging_idx {
+                                        // Mutate Staging into standard User message
+                                        obj.set_message_type(0);
+                                        let prm = obj.prompt_text();
+                                        obj.set_content(prm);
+                                        console_store_async.items_changed(i, 1, 1); // Force redraw
+                                    }
                                 }
                             }
                         }
@@ -2005,41 +2072,44 @@ fn build_gtk_ui(
             let bubble_clone = bubble.clone();
             let console_store_clone = console_store.clone();
 
-            cancel_btn.connect_clicked(move |_| {
-                let dialog = gtk4::MessageDialog::builder()
-                    .text("Delete Payload?")
-                    .secondary_text("Are you sure you want to discard this pre-flight payload? This cannot be undone.")
-                    .message_type(gtk4::MessageType::Warning)
-                    .buttons(gtk4::ButtonsType::Cancel)
+            if let Some(sig) = unsafe { cancel_btn.data::<glib::SignalHandlerId>("clicked_sig") } {
+                cancel_btn.disconnect(sig.as_ref().clone());
+            }
+            let cancel_sig = cancel_btn.connect_clicked(move |_| {
+                let dialog = gtk4::AlertDialog::builder()
+                    .heading("Delete Payload?")
+                    .detail("Are you sure you want to discard this pre-flight payload? This cannot be undone.")
+                    .buttons(["Cancel", "Delete"])
+                    .cancel_button(0)
+                    .destructive_button(1)
                     .modal(true)
                     .build();
 
-                dialog.add_button("Delete", gtk4::ResponseType::DestructiveAction);
-
                 let obj_cancel = obj_clone.clone();
                 let store_cancel = console_store_clone.clone();
-                dialog.connect_response(move |d, response| {
-                    if response == gtk4::ResponseType::DestructiveAction {
-                        // Remove from store
-                        let n = store_cancel.n_items();
-                        for i in 0..n {
-                            if let Some(item) = store_cancel.item(i).and_downcast::<DispatchObject>() {
-                                if item.id() == obj_cancel.id() {
-                                    store_cancel.remove(i);
-                                    break;
+
+                let root_win = bubble_clone.root().and_downcast::<gtk4::Window>();
+
+                dialog.choose(
+                    root_win.as_ref(),
+                    None::<&gio::Cancellable>,
+                    move |result| {
+                        if let Ok(choice) = result {
+                            if choice == 1 { // "Delete" button index
+                                // Logic to remove the item from the store
+                                let n = store_cancel.n_items();
+                                for i in 0..n {
+                                    if let Some(item) = store_cancel.item(i).and_downcast::<DispatchObject>() {
+                                        if item.id() == obj_cancel.id() {
+                                            store_cancel.remove(i);
+                                            break;
+                                        }
+                                    }
                                 }
                             }
                         }
                     }
-                    d.close();
-                });
-
-                let root_win = bubble_clone.root().and_downcast::<gtk4::Window>();
-                if let Some(win) = root_win {
-                    dialog.set_transient_for(Some(&win));
-                }
-
-                dialog.present();
+                );
             });
 
             let tx_clone2 = tx_dispatch.clone();
@@ -2048,11 +2118,56 @@ fn build_gtk_ui(
             let dir_view_clone2 = directives_view.clone();
             let eng_view_clone2 = engrams_view.clone();
             let prm_view_clone2 = prompt_view.clone();
+
+            // Bind text updates to prevent data loss on scroll
+            let obj_sys = obj.clone();
+            if let Some(sig) = unsafe { system_view.buffer().data::<glib::SignalHandlerId>("changed_sig") } {
+                system_view.buffer().disconnect(sig.as_ref().clone());
+            }
+            let sig_sys = system_view.buffer().connect_changed(move |buf| {
+                let (s, e) = buf.bounds();
+                obj_sys.set_system_text(buf.text(&s, &e, false).to_string());
+            });
+            unsafe { system_view.buffer().set_data("changed_sig", sig_sys); }
+
+            let obj_dir = obj.clone();
+            if let Some(sig) = unsafe { directives_view.buffer().data::<glib::SignalHandlerId>("changed_sig") } {
+                directives_view.buffer().disconnect(sig.as_ref().clone());
+            }
+            let sig_dir = directives_view.buffer().connect_changed(move |buf| {
+                let (s, e) = buf.bounds();
+                obj_dir.set_directives_text(buf.text(&s, &e, false).to_string());
+            });
+            unsafe { directives_view.buffer().set_data("changed_sig", sig_dir); }
+
+            let obj_eng = obj.clone();
+            if let Some(sig) = unsafe { engrams_view.buffer().data::<glib::SignalHandlerId>("changed_sig") } {
+                engrams_view.buffer().disconnect(sig.as_ref().clone());
+            }
+            let sig_eng = engrams_view.buffer().connect_changed(move |buf| {
+                let (s, e) = buf.bounds();
+                obj_eng.set_engrams_text(buf.text(&s, &e, false).to_string());
+            });
+            unsafe { engrams_view.buffer().set_data("changed_sig", sig_eng); }
+
+            let obj_prm = obj.clone();
+            if let Some(sig) = unsafe { prompt_view.buffer().data::<glib::SignalHandlerId>("changed_sig") } {
+                prompt_view.buffer().disconnect(sig.as_ref().clone());
+            }
+            let sig_prm = prompt_view.buffer().connect_changed(move |buf| {
+                let (s, e) = buf.bounds();
+                obj_prm.set_prompt_text(buf.text(&s, &e, false).to_string());
+            });
+            unsafe { prompt_view.buffer().set_data("changed_sig", sig_prm); }
+
             let cancel_btn_clone = cancel_btn.clone();
             let dispatch_btn_clone = dispatch_btn.clone();
             let console_store_pulse = console_store.clone();
 
-            dispatch_btn_clone.connect_clicked(move |_| {
+            if let Some(sig) = unsafe { dispatch_btn_clone.data::<glib::SignalHandlerId>("clicked_sig") } {
+                dispatch_btn_clone.disconnect(sig.as_ref().clone());
+            }
+            let dispatch_sig = dispatch_btn_clone.connect_clicked(move |_| {
                 obj_clone2.set_is_locked(true);
                 sys_view_clone2.set_editable(false);
                 dir_view_clone2.set_editable(false);
@@ -2096,6 +2211,10 @@ fn build_gtk_ui(
                     let _ = tx_async.send(Event::DispatchPayload(json)).await;
                 });
             });
+            unsafe {
+                cancel_btn.set_data("clicked_sig", cancel_sig);
+                dispatch_btn.set_data("clicked_sig", dispatch_sig);
+            }
 
         } else if message_type == 2 {
             // PULSE MODE
@@ -2518,17 +2637,32 @@ fn build_gtk_ui(
                         // When Una Responds successfully, drop the pulse and transform the staging view
                         let n = console_store_async.n_items();
                         let mut removals = Vec::new();
+
+                        // We only mutate the last Staging view that was locked.
+                        // Find the index of the locked staging view.
+                        let mut target_staging_idx = None;
+                        for i in (0..n).rev() {
+                            if let Some(obj) = console_store_async.item(i).and_downcast::<DispatchObject>() {
+                                if obj.message_type() == 1 && obj.is_locked() {
+                                    target_staging_idx = Some(i);
+                                    break;
+                                }
+                            }
+                        }
+
                         for i in 0..n {
                             if let Some(obj) = console_store_async.item(i).and_downcast::<DispatchObject>() {
                                 let t = obj.message_type();
                                 if t == 2 {
                                     removals.push(i); // Drop Pulse
                                 } else if t == 1 {
-                                    // Mutate Staging into standard User message
-                                    obj.set_message_type(0);
-                                    let prm = obj.prompt_text();
-                                    obj.set_content(prm);
-                                    console_store_async.items_changed(i, 1, 1); // Force redraw
+                                    if Some(i) == target_staging_idx {
+                                        // Mutate Staging into standard User message
+                                        obj.set_message_type(0);
+                                        let prm = obj.prompt_text();
+                                        obj.set_content(prm);
+                                        console_store_async.items_changed(i, 1, 1); // Force redraw
+                                    }
                                 }
                             }
                         }
