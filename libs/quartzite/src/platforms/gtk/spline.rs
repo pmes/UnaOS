@@ -489,28 +489,28 @@ fn build_gnome_ui(
     // --- Scrolled Window Adjustment & Pagination Fix ---
     let adj = scrolled_window.vadjustment();
 
-    // Track states to prevent API loops and violent UI snapping
     let was_at_bottom = Rc::new(RefCell::new(true));
-    let was_at_top = Rc::new(RefCell::new(true)); // Starts true so it doesn't double-fire on boot
-    let tx_clone_hist = tx_event.clone();
+    let was_at_top = Rc::new(RefCell::new(true));
+    let last_upper = Rc::new(RefCell::new(0.0));
+    let is_prepending = Rc::new(RefCell::new(false));
 
+    let tx_clone_hist = tx_event.clone();
     let was_at_bottom_val = was_at_bottom.clone();
+    let was_at_top_val = was_at_top.clone();
+
     adj.connect_value_notify(move |a| {
         let val = a.value();
         let page_size = a.page_size();
         let upper = a.upper();
         let lower = a.lower();
 
-        // 1. Maintain Auto-Scroll state
         let max_scroll = upper - page_size;
         *was_at_bottom_val.borrow_mut() = (val - max_scroll).abs() < 10.0;
 
-        // 2. Pagination Threshold Crossing (The 429 Fix)
         let is_at_top = val <= lower + 10.0;
-        let previously_at_top = *was_at_top.borrow();
-        *was_at_top.borrow_mut() = is_at_top;
+        let previously_at_top = *was_at_top_val.borrow();
+        *was_at_top_val.borrow_mut() = is_at_top;
 
-        // ONLY fire LoadHistory exactly when entering the top threshold, not while resting there.
         if is_at_top && !previously_at_top && upper > page_size {
             let tx_for_async = tx_clone_hist.clone();
             glib::MainContext::default().spawn_local(async move {
@@ -520,14 +520,23 @@ fn build_gnome_ui(
     });
 
     let was_at_bottom_upper = was_at_bottom.clone();
+    let is_prepending_upper = is_prepending.clone();
+    let last_upper_ref = last_upper.clone();
+
     adj.connect_upper_notify(move |a| {
         let upper = a.upper();
         let page_size = a.page_size();
+        let old_upper = *last_upper_ref.borrow();
+        let delta = upper - old_upper;
+        *last_upper_ref.borrow_mut() = upper;
+
         if upper > page_size {
-            // ONLY snap to the bottom if the user was ALREADY at the bottom (new chat msg).
-            // This stops the violent snapping when history or logs load.
             if *was_at_bottom_upper.borrow() {
                 a.set_value(upper - page_size);
+            } else if *is_prepending_upper.borrow() && delta > 0.0 {
+                // MATHEMATICAL CORRECTION: Shift viewport down by the exact height of the new items
+                a.set_value(a.value() + delta);
+                *is_prepending_upper.borrow_mut() = false;
             }
         }
     });
@@ -1421,10 +1430,20 @@ fn build_gnome_ui(
     let active_directive_async = active_directive_clone.clone();
 
     let console_store_async = console_store.clone();
+    let is_prepending_async = is_prepending.clone();
 
     glib::MainContext::default().spawn_local(async move {
         while let Ok(update) = rx.recv().await {
             match update {
+                GuiUpdate::HistoryBatch(messages) => {
+                    *is_prepending_async.borrow_mut() = true; // Lock state to apply mathematical delta shift
+                    // Insert in reverse order so they appear chronologically at the top
+                    for msg in messages.into_iter().rev() {
+                        let id = format!("{}-hist", chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0));
+                        let obj = DispatchObject::new(&id, &msg.sender, "History", &msg.timestamp, &msg.content, msg.is_chat);
+                        console_store_async.insert(0, &obj);
+                    }
+                }
                 GuiUpdate::ConsoleLog(text) => {
                     let mut sender = "System".to_string();
                     let mut is_chat = true;
@@ -1995,28 +2014,28 @@ fn build_gtk_ui(
     // --- Scrolled Window Adjustment & Pagination Fix ---
     let adj = scrolled_window.vadjustment();
 
-    // Track states to prevent API loops and violent UI snapping
     let was_at_bottom = Rc::new(RefCell::new(true));
-    let was_at_top = Rc::new(RefCell::new(true)); // Starts true so it doesn't double-fire on boot
-    let tx_clone_hist = tx_event.clone();
+    let was_at_top = Rc::new(RefCell::new(true));
+    let last_upper = Rc::new(RefCell::new(0.0));
+    let is_prepending = Rc::new(RefCell::new(false));
 
+    let tx_clone_hist = tx_event.clone();
     let was_at_bottom_val = was_at_bottom.clone();
+    let was_at_top_val = was_at_top.clone();
+
     adj.connect_value_notify(move |a| {
         let val = a.value();
         let page_size = a.page_size();
         let upper = a.upper();
         let lower = a.lower();
 
-        // 1. Maintain Auto-Scroll state
         let max_scroll = upper - page_size;
         *was_at_bottom_val.borrow_mut() = (val - max_scroll).abs() < 10.0;
 
-        // 2. Pagination Threshold Crossing (The 429 Fix)
         let is_at_top = val <= lower + 10.0;
-        let previously_at_top = *was_at_top.borrow();
-        *was_at_top.borrow_mut() = is_at_top;
+        let previously_at_top = *was_at_top_val.borrow();
+        *was_at_top_val.borrow_mut() = is_at_top;
 
-        // ONLY fire LoadHistory exactly when entering the top threshold, not while resting there.
         if is_at_top && !previously_at_top && upper > page_size {
             let tx_for_async = tx_clone_hist.clone();
             glib::MainContext::default().spawn_local(async move {
@@ -2026,14 +2045,23 @@ fn build_gtk_ui(
     });
 
     let was_at_bottom_upper = was_at_bottom.clone();
+    let is_prepending_upper = is_prepending.clone();
+    let last_upper_ref = last_upper.clone();
+
     adj.connect_upper_notify(move |a| {
         let upper = a.upper();
         let page_size = a.page_size();
+        let old_upper = *last_upper_ref.borrow();
+        let delta = upper - old_upper;
+        *last_upper_ref.borrow_mut() = upper;
+
         if upper > page_size {
-            // ONLY snap to the bottom if the user was ALREADY at the bottom (new chat msg).
-            // This stops the violent snapping when history or logs load.
             if *was_at_bottom_upper.borrow() {
                 a.set_value(upper - page_size);
+            } else if *is_prepending_upper.borrow() && delta > 0.0 {
+                // MATHEMATICAL CORRECTION: Shift viewport down by the exact height of the new items
+                a.set_value(a.value() + delta);
+                *is_prepending_upper.borrow_mut() = false;
             }
         }
     });
@@ -2923,12 +2951,22 @@ fn build_gtk_ui(
     let active_directive_async = active_directive_clone.clone();
 
     let console_store_async = console_store.clone();
+    let is_prepending_async = is_prepending.clone();
 
     let tx_interceptor_async = tx_event.clone();
 
     glib::MainContext::default().spawn_local(async move {
         while let Ok(update) = rx.recv().await {
             match update {
+                GuiUpdate::HistoryBatch(messages) => {
+                    *is_prepending_async.borrow_mut() = true; // Lock state to apply mathematical delta shift
+                    // Insert in reverse order so they appear chronologically at the top
+                    for msg in messages.into_iter().rev() {
+                        let id = format!("{}-hist", chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0));
+                        let obj = DispatchObject::new(&id, &msg.sender, "History", &msg.timestamp, &msg.content, msg.is_chat);
+                        console_store_async.insert(0, &obj);
+                    }
+                }
                 GuiUpdate::ConsoleLog(text) => {
                     let mut sender = "System".to_string();
                     let mut is_chat = true;
