@@ -502,19 +502,23 @@ fn build_gnome_ui(
     // Flawless Historical Pagination (Phase 1)
     let pagination_debounce: Rc<RefCell<Option<glib::SourceId>>> = Rc::new(RefCell::new(None));
     let tx_pagination = tx_event.clone();
+    let debounce_clone = pagination_debounce.clone();
     adj.connect_value_notify(move |adj| {
         let value = adj.value();
         let lower = adj.lower();
         if value <= lower + 10.0 {
-            let mut debounce = pagination_debounce.borrow_mut();
+            let mut debounce = debounce_clone.borrow_mut();
             if debounce.is_none() {
                 let tx_clone = tx_pagination.clone();
+                let inner_debounce_clone = debounce_clone.clone();
                 *debounce = Some(glib::timeout_add_local(
                     std::time::Duration::from_secs(1),
                     move || {
+                        let tx_for_async = tx_clone.clone();
                         glib::MainContext::default().spawn_local(async move {
-                            let _ = tx_clone.send(Event::LoadHistory).await;
+                            let _ = tx_for_async.send(Event::LoadHistory).await;
                         });
+                        *inner_debounce_clone.borrow_mut() = None;
                         glib::ControlFlow::Break
                     },
                 ));
@@ -1996,19 +2000,23 @@ fn build_gtk_ui(
     // Flawless Historical Pagination (Phase 1)
     let pagination_debounce: Rc<RefCell<Option<glib::SourceId>>> = Rc::new(RefCell::new(None));
     let tx_pagination = tx_event.clone();
+    let debounce_clone = pagination_debounce.clone();
     adj.connect_value_notify(move |adj| {
         let value = adj.value();
         let lower = adj.lower();
         if value <= lower + 10.0 {
-            let mut debounce = pagination_debounce.borrow_mut();
+            let mut debounce = debounce_clone.borrow_mut();
             if debounce.is_none() {
                 let tx_clone = tx_pagination.clone();
+                let inner_debounce_clone = debounce_clone.clone();
                 *debounce = Some(glib::timeout_add_local(
                     std::time::Duration::from_secs(1),
                     move || {
+                        let tx_for_async = tx_clone.clone();
                         glib::MainContext::default().spawn_local(async move {
-                            let _ = tx_clone.send(Event::LoadHistory).await;
+                            let _ = tx_for_async.send(Event::LoadHistory).await;
                         });
+                        *inner_debounce_clone.borrow_mut() = None;
                         glib::ControlFlow::Break
                     },
                 ));
