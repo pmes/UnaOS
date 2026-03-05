@@ -30,6 +30,7 @@ fn main() -> Result<()> {
     // 1. Establish async_channel pairs
     let (tx_brain, rx_brain) = async_channel::unbounded::<Event>();
     let (tx_gui, rx_gui) = async_channel::unbounded::<GuiUpdate>();
+    let (_tx_telemetry, rx_telemetry) = async_channel::unbounded::<bandy::SMessage>();
 
     // 2. Spawn central background task (Tokio)
     rt.spawn(async move {
@@ -54,7 +55,7 @@ fn main() -> Result<()> {
     let bootstrap = move |window: &NativeWindow| -> NativeView {
         #[cfg(target_os = "macos")]
         let view = {
-            spline.bootstrap(window, tx_brain.clone(), rx_gui.clone())
+            spline.bootstrap(window, tx_brain.clone(), rx_gui.clone(), rx_telemetry.clone())
         };
 
         #[cfg(target_os = "linux")]

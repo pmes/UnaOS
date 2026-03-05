@@ -44,7 +44,7 @@ pub fn ingest_for_lumen(file_path: &Path) -> Result<String, String> {
 
 /// The Background Indexer Task.
 /// It scans the workspace, maps the topology, and builds the context.
-pub async fn run_indexer(root: PathBuf, tx: broadcast::Sender<SMessage>, telemetry_tx: async_channel::Sender<SMessage>) {
+pub async fn run_indexer(root: PathBuf, tx: broadcast::Sender<SMessage>, telemetry_tx: async_channel::Sender<SMessage>) -> Vec<bandy::WeightedSkeleton> {
     let payload = scan_and_score(&root, &tx).await;
 
     if !payload.is_empty() {
@@ -52,8 +52,11 @@ pub async fn run_indexer(root: PathBuf, tx: broadcast::Sender<SMessage>, telemet
         // We send the compiled telemetry across the thread boundary.
         // The payload contains Arc<String>, so no actual skeleton text is copied.
         // We use the High-Priority Telemetry Channel (Async) directly to the UI.
-        let _ = telemetry_tx.send(SMessage::ContextTelemetry { skeletons: payload }).await;
+        let broadcast_payload = payload.clone();
+        let _ = telemetry_tx.send(SMessage::ContextTelemetry { skeletons: broadcast_payload }).await;
     }
+
+    payload
 }
 
 async fn scan_and_score(root: &Path, tx: &broadcast::Sender<SMessage>) -> Vec<bandy::WeightedSkeleton> {

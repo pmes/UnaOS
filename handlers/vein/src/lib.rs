@@ -29,6 +29,7 @@ struct State {
     sidebar_position: SidebarPosition,
     sidebar_collapsed: bool,
     s9_status: ShardStatus,
+    live_context: Vec<bandy::WeightedSkeleton>,
 }
 
 fn get_mime_type(filename: &str) -> String {
@@ -189,6 +190,7 @@ impl VeinHandler {
             sidebar_position: SidebarPosition::default(),
             sidebar_collapsed: false,
             s9_status: ShardStatus::Offline,
+            live_context: Vec::new(),
         }));
 
         let (tx_to_bg, mut rx_from_ui) = mpsc::unbounded_channel::<String>();
@@ -212,8 +214,11 @@ impl VeinHandler {
                 // We are now INSIDE the Tokio context.
                 // We drop the `rt.` prefix and use `tokio::spawn` directly.
                 // This schedules the task on the running engine without trying to move the engine itself.
+                let state_indexer = state_bg.clone();
                 tokio::spawn(async move {
-                    cortex::run_indexer(root, bandy_tx_bg, telemetry_tx).await;
+                    let live_ctx = cortex::run_indexer(root, bandy_tx_bg, telemetry_tx).await;
+                    let mut s = state_indexer.lock().unwrap();
+                    s.live_context = live_ctx;
                 });
 
                 let disk = Arc::new(std::sync::Mutex::new(
@@ -547,6 +552,22 @@ impl VeinHandler {
                             } else {
                                 "SYSTEM_INSTRUCTION: You are an AI Shard operating within the UnaOS cognitive matrix.".to_string()
                             };
+
+                            // Inject high-gravity live workspace context
+                            {
+                                let s = state_bg.lock().unwrap();
+                                if !s.live_context.is_empty() {
+                                    system_builder.push_str("\n\n[LIVE WORKSPACE CONTEXT (GRAVITY WELL)]:\n");
+                                    for skel in &s.live_context {
+                                        system_builder.push_str(&format!(
+                                            "--- FILE: {} (Gravity: {:.2}) ---\n{}\n\n",
+                                            skel.path.display(),
+                                            skel.score,
+                                            skel.content
+                                        ));
+                                    }
+                                }
+                            }
 
                             if !retrieved_context.is_empty() {
                                 system_builder.push_str("\n\n[SEMANTIC MEMORY RECALL]:\n");
