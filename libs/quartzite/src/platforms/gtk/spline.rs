@@ -550,7 +550,8 @@ fn build_gnome_ui(
         bubble.set_focusable(true);
 
         let click_grab = GestureClick::new();
-        click_grab.set_propagation_phase(PropagationPhase::Bubble);
+        // CHANGED: Target phase prevents the bubble from stealing focus from text inputs
+        click_grab.set_propagation_phase(PropagationPhase::Target);
         let bubble_clone_grab = bubble.clone();
         click_grab.connect_pressed(move |_, n_press, _, _| {
             if n_press == 1 {
@@ -629,28 +630,29 @@ fn build_gnome_ui(
         staging_box.set_width_request(800);
 
         let system_label = Label::builder().label("SYSTEM").xalign(0.0).css_classes(vec!["dim-label"]).build();
-        let system_view = SourceView::builder().wrap_mode(gtk4::WrapMode::WordChar).editable(true).monospace(true).vexpand(true).build();
+        // CHANGED: Removed vexpand(true) to allow propagate_natural_height to function
+        let system_view = SourceView::builder().wrap_mode(gtk4::WrapMode::WordChar).editable(true).monospace(true).build();
         system_view.add_css_class("view");
         let sys_scroll = ScrolledWindow::builder().child(&system_view).propagate_natural_height(true).min_content_height(150).max_content_height(600).build();
         staging_box.append(&system_label);
         staging_box.append(&sys_scroll);
 
         let directives_label = Label::builder().label("DIRECTIVES").xalign(0.0).css_classes(vec!["dim-label"]).build();
-        let directives_view = SourceView::builder().wrap_mode(gtk4::WrapMode::WordChar).editable(true).monospace(true).vexpand(true).build();
+        let directives_view = SourceView::builder().wrap_mode(gtk4::WrapMode::WordChar).editable(true).monospace(true).build();
         directives_view.add_css_class("view");
         let dir_scroll = ScrolledWindow::builder().child(&directives_view).propagate_natural_height(true).min_content_height(150).max_content_height(600).build();
         staging_box.append(&directives_label);
         staging_box.append(&dir_scroll);
 
         let engrams_label = Label::builder().label("ENGRAMS").xalign(0.0).css_classes(vec!["dim-label"]).build();
-        let engrams_view = SourceView::builder().wrap_mode(gtk4::WrapMode::WordChar).editable(true).monospace(true).vexpand(true).build();
+        let engrams_view = SourceView::builder().wrap_mode(gtk4::WrapMode::WordChar).editable(true).monospace(true).build();
         engrams_view.add_css_class("view");
         let eng_scroll = ScrolledWindow::builder().child(&engrams_view).propagate_natural_height(true).min_content_height(150).max_content_height(600).build();
         staging_box.append(&engrams_label);
         staging_box.append(&eng_scroll);
 
         let prompt_label = Label::builder().label("PROMPT").xalign(0.0).css_classes(vec!["dim-label"]).build();
-        let prompt_view = SourceView::builder().wrap_mode(gtk4::WrapMode::WordChar).editable(true).monospace(true).vexpand(true).build();
+        let prompt_view = SourceView::builder().wrap_mode(gtk4::WrapMode::WordChar).editable(true).monospace(true).build();
         prompt_view.add_css_class("view");
         let prm_scroll = ScrolledWindow::builder().child(&prompt_view).propagate_natural_height(true).min_content_height(150).max_content_height(600).build();
         staging_box.append(&prompt_label);
@@ -1989,7 +1991,8 @@ fn build_gtk_ui(
         bubble.set_focusable(true);
 
         let click_grab = GestureClick::new();
-        click_grab.set_propagation_phase(PropagationPhase::Bubble);
+        // CHANGED: Target phase prevents the bubble from stealing focus from text inputs
+        click_grab.set_propagation_phase(PropagationPhase::Target);
         let bubble_clone_grab = bubble.clone();
         click_grab.connect_pressed(move |_, n_press, _, _| {
             if n_press == 1 {
@@ -2067,28 +2070,29 @@ fn build_gtk_ui(
         staging_box.set_width_request(800);
 
         let system_label = Label::builder().label("SYSTEM").xalign(0.0).css_classes(vec!["dim-label"]).build();
-        let system_view = SourceView::builder().wrap_mode(gtk4::WrapMode::WordChar).editable(true).monospace(true).vexpand(true).build();
+        // CHANGED: Removed vexpand(true) to allow propagate_natural_height to function
+        let system_view = SourceView::builder().wrap_mode(gtk4::WrapMode::WordChar).editable(true).monospace(true).build();
         system_view.add_css_class("view");
         let sys_scroll = ScrolledWindow::builder().child(&system_view).propagate_natural_height(true).min_content_height(150).max_content_height(600).build();
         staging_box.append(&system_label);
         staging_box.append(&sys_scroll);
 
         let directives_label = Label::builder().label("DIRECTIVES").xalign(0.0).css_classes(vec!["dim-label"]).build();
-        let directives_view = SourceView::builder().wrap_mode(gtk4::WrapMode::WordChar).editable(true).monospace(true).vexpand(true).build();
+        let directives_view = SourceView::builder().wrap_mode(gtk4::WrapMode::WordChar).editable(true).monospace(true).build();
         directives_view.add_css_class("view");
         let dir_scroll = ScrolledWindow::builder().child(&directives_view).propagate_natural_height(true).min_content_height(150).max_content_height(600).build();
         staging_box.append(&directives_label);
         staging_box.append(&dir_scroll);
 
         let engrams_label = Label::builder().label("ENGRAMS").xalign(0.0).css_classes(vec!["dim-label"]).build();
-        let engrams_view = SourceView::builder().wrap_mode(gtk4::WrapMode::WordChar).editable(true).monospace(true).vexpand(true).build();
+        let engrams_view = SourceView::builder().wrap_mode(gtk4::WrapMode::WordChar).editable(true).monospace(true).build();
         engrams_view.add_css_class("view");
         let eng_scroll = ScrolledWindow::builder().child(&engrams_view).propagate_natural_height(true).min_content_height(150).max_content_height(600).build();
         staging_box.append(&engrams_label);
         staging_box.append(&eng_scroll);
 
         let prompt_label = Label::builder().label("PROMPT").xalign(0.0).css_classes(vec!["dim-label"]).build();
-        let prompt_view = SourceView::builder().wrap_mode(gtk4::WrapMode::WordChar).editable(true).monospace(true).vexpand(true).build();
+        let prompt_view = SourceView::builder().wrap_mode(gtk4::WrapMode::WordChar).editable(true).monospace(true).build();
         prompt_view.add_css_class("view");
         let prm_scroll = ScrolledWindow::builder().child(&prompt_view).propagate_natural_height(true).min_content_height(150).max_content_height(600).build();
         staging_box.append(&prompt_label);
