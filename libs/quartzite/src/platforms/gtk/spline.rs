@@ -1061,7 +1061,7 @@ fn build_gnome_ui(
         }
 
         // Only intercept if a bubble Box has focus.
-        if let Some(focused) = console_list_view_clone.root().and_downcast::<gtk4::Window>().and_then(|w| w.focus_widget()) {
+        if let Some(focused) = console_list_view_clone.root().and_then(|r| gtk4::prelude::RootExt::focus(&r)) {
             if focused.has_css_class("bubble-box") {
                 // Find current index
                 let mut current_idx: Option<i32> = None;
@@ -2589,7 +2589,7 @@ fn build_gtk_ui(
         }
 
         // Only intercept if a bubble Box has focus.
-        if let Some(focused) = console_list_view_clone.root().and_downcast::<gtk4::Window>().and_then(|w| w.focus_widget()) {
+        if let Some(focused) = console_list_view_clone.root().and_then(|r| gtk4::prelude::RootExt::focus(&r)) {
             if focused.has_css_class("bubble-box") {
                 // Find current index
                 let mut current_idx: Option<i32> = None;
