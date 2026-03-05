@@ -117,7 +117,7 @@ fn build_gnome_ui(
             .bubble-box { border-radius: 12px; padding: 12px; }
             .architect-bubble { background-color: alpha(currentColor, 0.08); }
             .una-bubble { background-color: alpha(currentColor, 0.05); }
-            .nexus-header { font-weight: bold; margin-top: 12px; margin-bottom: 4px; opacity: 0.7; font-size: 0.9em; }
+            .nexus-header { font-weight: bold; margin-top: 12px; margin-bottom: 4px; }
             .role-architect { color: #0078d4; font-weight: bold; }
             .role-una { color: #d40078; font-weight: bold; }
             .role-system { color: #888888; font-style: italic; }
@@ -601,6 +601,7 @@ fn build_gnome_ui(
         chat_content_view.set_width_request(800);
         chat_content_view.set_hexpand(true);
         chat_content_view.set_focusable(false);
+        chat_content_view.set_can_target(false);
         chat_content_view.add_css_class("view");
         bubble.append(&chat_content_view);
 
@@ -615,6 +616,7 @@ fn build_gnome_ui(
         payload_content_view.set_show_line_numbers(true);
         payload_content_view.set_monospace(true);
         payload_content_view.set_focusable(false);
+        payload_content_view.set_can_target(false);
         payload_content_view.add_css_class("view");
         let payload_scroll = ScrolledWindow::builder()
             .child(&payload_content_view)
@@ -1315,8 +1317,8 @@ fn build_gnome_ui(
     input_container.append(&input_scroll);
     input_container.append(&send_btn);
 
-    main_paned.set_end_child(Some(&input_container));
     comms_page.append(&main_paned);
+    comms_page.append(&input_container);
 
     // Removing PAGE 2: PAYLOAD EDITOR (The Interceptor)
 
@@ -1572,7 +1574,7 @@ fn build_gtk_ui(
             .bubble-box { border-radius: 12px; padding: 12px; }
             .architect-bubble { background-color: alpha(currentColor, 0.08); }
             .una-bubble { background-color: alpha(currentColor, 0.05); }
-            .nexus-header { font-weight: bold; margin-top: 12px; margin-bottom: 4px; opacity: 0.7; font-size: 0.9em; }
+            .nexus-header { font-weight: bold; margin-top: 12px; margin-bottom: 4px; }
             .role-architect { color: #0078d4; font-weight: bold; }
             .role-una { color: #d40078; font-weight: bold; }
             .role-system { color: #888888; font-style: italic; }
@@ -2038,6 +2040,7 @@ fn build_gtk_ui(
         chat_content_view.set_width_request(800);
         chat_content_view.set_hexpand(true);
         chat_content_view.set_focusable(false);
+        chat_content_view.set_can_target(false);
         chat_content_view.add_css_class("view");
         bubble.append(&chat_content_view);
 
@@ -2052,6 +2055,7 @@ fn build_gtk_ui(
         payload_content_view.set_show_line_numbers(true);
         payload_content_view.set_monospace(true);
         payload_content_view.set_focusable(false);
+        payload_content_view.set_can_target(false);
         payload_content_view.add_css_class("view");
         let payload_scroll = ScrolledWindow::builder()
             .child(&payload_content_view)
@@ -2752,8 +2756,8 @@ fn build_gtk_ui(
     input_container.append(&input_scroll);
     input_container.append(&send_btn);
 
-    main_paned.set_end_child(Some(&input_container));
     comms_page.append(&main_paned);
+    comms_page.append(&input_container);
 
     workspace_stack.add_titled(&comms_page, Some("comms"), "Comms");
 
