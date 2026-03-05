@@ -427,21 +427,21 @@ impl VeinHandler {
                                 // Offload the synchronous disk search operations.
                                 let memories_result = tokio::task::spawn_blocking(move || {
                                     if let Ok(mut locked_disk) = disk_clone.lock() {
-                                        let chat_mem = match locked_disk.search_memories(&user_embedding_clone, 0.70, "chat") {
+                                        let chat_mem = match locked_disk.search_memories(&user_embedding_clone, 0.45, "chat") {
                                             Ok(mem) => mem,
                                             Err(e) => {
                                                 eprintln!(":: PLEXUS :: DB Query Error (chat): {}", e);
                                                 vec![]
                                             }
                                         };
-                                        let directive_mem = match locked_disk.search_memories(&user_embedding_clone, 0.65, "directive") {
+                                        let directive_mem = match locked_disk.search_memories(&user_embedding_clone, 0.45, "directive") {
                                             Ok(mem) => mem,
                                             Err(e) => {
                                                 eprintln!(":: PLEXUS :: DB Query Error (directive): {}", e);
                                                 vec![]
                                             }
                                         };
-                                        let engram_mem = match locked_disk.search_memories(&user_embedding_clone, 0.65, "engram") {
+                                        let engram_mem = match locked_disk.search_memories(&user_embedding_clone, 0.45, "engram") {
                                             Ok(mem) => mem,
                                             Err(e) => {
                                                 eprintln!(":: PLEXUS :: DB Query Error (engram): {}", e);

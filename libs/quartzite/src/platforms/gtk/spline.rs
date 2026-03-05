@@ -551,6 +551,7 @@ fn build_gnome_ui(
         let staging_box = Box::new(Orientation::Vertical, 8);
         staging_box.set_visible(false);
         staging_box.set_hexpand(true);
+        staging_box.set_width_request(800);
 
         let system_label = Label::builder().label("SYSTEM").xalign(0.0).css_classes(vec!["dim-label"]).build();
         let system_view = SourceView::builder().wrap_mode(gtk4::WrapMode::WordChar).editable(true).monospace(true).build();
@@ -582,7 +583,7 @@ fn build_gnome_ui(
 
         let actions_box = Box::new(Orientation::Horizontal, 8);
         actions_box.set_halign(Align::End);
-        let cancel_btn = Button::builder().icon_name("stop-sign-outline-symbolic").tooltip_text("Delete Post").css_classes(vec!["flat", "destructive-action"]).build();
+        let cancel_btn = Button::builder().icon_name("window-close-symbolic").tooltip_text("Delete Post").css_classes(vec!["flat", "destructive-action"]).build();
         let dispatch_btn = Button::builder().icon_name("document-save-symbolic").tooltip_text("Save and Send").css_classes(vec!["suggested-action"]).build();
         actions_box.append(&cancel_btn);
         actions_box.append(&dispatch_btn);
@@ -1900,6 +1901,7 @@ fn build_gtk_ui(
         let staging_box = Box::new(Orientation::Vertical, 8);
         staging_box.set_visible(false);
         staging_box.set_hexpand(true);
+        staging_box.set_width_request(800);
 
         let system_label = Label::builder().label("SYSTEM").xalign(0.0).css_classes(vec!["dim-label"]).build();
         let system_view = SourceView::builder().wrap_mode(gtk4::WrapMode::WordChar).editable(true).monospace(true).build();
@@ -1931,7 +1933,7 @@ fn build_gtk_ui(
 
         let actions_box = Box::new(Orientation::Horizontal, 8);
         actions_box.set_halign(Align::End);
-        let cancel_btn = Button::builder().icon_name("stop-sign-outline-symbolic").tooltip_text("Delete Post").css_classes(vec!["flat", "destructive-action"]).build();
+        let cancel_btn = Button::builder().icon_name("window-close-symbolic").tooltip_text("Delete Post").css_classes(vec!["flat", "destructive-action"]).build();
         let dispatch_btn = Button::builder().icon_name("document-save-symbolic").tooltip_text("Save and Send").css_classes(vec!["suggested-action"]).build();
         actions_box.append(&cancel_btn);
         actions_box.append(&dispatch_btn);
