@@ -565,19 +565,29 @@ fn build_gnome_ui(
         meta_label.set_xalign(0.0);
         meta_label.add_css_class("dim-label");
 
-        let expand_btn = Button::builder()
+        let left_expand_btn = Button::builder()
             .icon_name("pan-down-symbolic")
             .css_classes(vec!["flat", "circular"])
             .tooltip_text("Expand / Collapse")
             .build();
-        expand_btn.set_visible(false);
+        left_expand_btn.set_visible(false);
 
-        // By default, assume Una-Prime layout: label at start, button at end.
-        header_box.append(&meta_label);
+        let right_expand_btn = Button::builder()
+            .icon_name("pan-down-symbolic")
+            .css_classes(vec!["flat", "circular"])
+            .tooltip_text("Expand / Collapse")
+            .build();
+        right_expand_btn.set_visible(false);
+
         let header_spacer = Box::new(Orientation::Horizontal, 0);
         header_spacer.set_hexpand(true);
+
+        // Fixed layout: [Left Button] [Label] [Spacer] [Right Button]
+        // Visibility is toggled in connect_bind based on sender role.
+        header_box.append(&left_expand_btn);
+        header_box.append(&meta_label);
         header_box.append(&header_spacer);
-        header_box.append(&expand_btn);
+        header_box.append(&right_expand_btn);
 
         bubble.append(&header_box);
 
@@ -682,32 +692,34 @@ fn build_gnome_ui(
         right_spacer.set_hexpand(true);
         root.append(&right_spacer);
 
-        let item_clone = item.clone();
-        let chat_content_view_clone = chat_content_view.clone();
-        let expand_btn_clone = expand_btn.clone();
+        let connect_expand = |btn: &Button, item_clone: ListItem, chat_view_clone: SourceView| {
+            let btn_clone = btn.clone();
+            btn.connect_clicked(move |_| {
+                if let Some(obj) = item_clone
+                    .item()
+                    .and_downcast::<crate::widgets::model::DispatchObject>()
+                {
+                    let expanded = !obj.is_expanded();
+                    obj.set_is_expanded(expanded);
+                    let content = obj.content();
+                    let line_count = content.lines().count();
 
-        expand_btn.connect_clicked(move |_| {
-            if let Some(obj) = item_clone
-                .item()
-                .and_downcast::<crate::widgets::model::DispatchObject>()
-            {
-                let expanded = !obj.is_expanded();
-                obj.set_is_expanded(expanded);
-                let content = obj.content();
-                let line_count = content.lines().count();
-
-                if line_count > 11 && !expanded {
-                    let truncated: String =
-                        content.lines().take(11).collect::<Vec<&str>>().join("\n")
-                            + "\n\n... [Click to expand]";
-                    chat_content_view_clone.buffer().set_text(&truncated);
-                    expand_btn_clone.set_icon_name("pan-down-symbolic");
-                } else {
-                    chat_content_view_clone.buffer().set_text(&content);
-                    expand_btn_clone.set_icon_name("pan-up-symbolic");
+                    if line_count > 11 && !expanded {
+                        let truncated: String =
+                            content.lines().take(11).collect::<Vec<&str>>().join("\n")
+                                + "\n\n... [Click to expand]";
+                        chat_view_clone.buffer().set_text(&truncated);
+                        btn_clone.set_icon_name("pan-down-symbolic");
+                    } else {
+                        chat_view_clone.buffer().set_text(&content);
+                        btn_clone.set_icon_name("pan-up-symbolic");
+                    }
                 }
-            }
-        });
+            });
+        };
+
+        connect_expand(&left_expand_btn, item.clone(), chat_content_view.clone());
+        connect_expand(&right_expand_btn, item.clone(), chat_content_view.clone());
         item.set_child(Some(&root));
     });
 
@@ -717,57 +729,39 @@ fn build_gnome_ui(
         let item = item.downcast_ref::<ListItem>().unwrap();
         let root = item.child().unwrap().downcast::<Box>().unwrap();
 
-        let left_spacer = root.first_child().unwrap().downcast::<Box>().unwrap();
-        let bubble = left_spacer.next_sibling().unwrap().downcast::<Box>().unwrap();
-        let right_spacer = bubble.next_sibling().unwrap().downcast::<Box>().unwrap();
+        let Some(left_spacer) = root.first_child().and_then(|c| c.downcast::<Box>().ok()) else { return; };
+        let Some(bubble) = left_spacer.next_sibling().and_then(|c| c.downcast::<Box>().ok()) else { return; };
+        let Some(right_spacer) = bubble.next_sibling().and_then(|c| c.downcast::<Box>().ok()) else { return; };
 
-        let obj = item.item().unwrap().downcast::<DispatchObject>().unwrap();
+        let Some(obj) = item.item().and_downcast::<DispatchObject>() else { return; };
 
-        let header_box = bubble.first_child().unwrap().downcast::<Box>().unwrap();
-        // Since header_box has label, spacer, button (in different orders), we can find label/button
-        let mut meta_label = None;
-        let mut expand_btn = None;
-        let mut header_spacer_existing = None;
-        let mut child = header_box.first_child();
-        while let Some(c) = child {
-            if let Ok(lbl) = c.clone().downcast::<Label>() {
-                meta_label = Some(lbl);
-            } else if let Ok(btn) = c.clone().downcast::<Button>() {
-                expand_btn = Some(btn);
-            } else if let Ok(bx) = c.clone().downcast::<Box>() {
-                header_spacer_existing = Some(bx);
-            }
-            child = c.next_sibling();
-        }
-        let meta_label = meta_label.unwrap();
-        let expand_btn = expand_btn.unwrap();
-        let header_spacer = header_spacer_existing.unwrap_or_else(|| {
-            let sp = Box::new(Orientation::Horizontal, 0);
-            sp.set_hexpand(true);
-            sp
-        });
+        let Some(header_box) = bubble.first_child().and_then(|c| c.downcast::<Box>().ok()) else { return; };
 
-        let chat_view = header_box.next_sibling().unwrap().downcast::<SourceView>().unwrap();
-        let expander = chat_view.next_sibling().unwrap().downcast::<Expander>().unwrap();
-        let staging_box = expander.next_sibling().unwrap().downcast::<Box>().unwrap();
-        let pulse_box = staging_box.next_sibling().unwrap().downcast::<Box>().unwrap();
+        let Some(left_expand_btn) = header_box.first_child().and_then(|c| c.downcast::<Button>().ok()) else { return; };
+        let Some(meta_label) = left_expand_btn.next_sibling().and_then(|c| c.downcast::<Label>().ok()) else { return; };
+        let Some(right_expand_btn) = header_box.last_child().and_then(|c| c.downcast::<Button>().ok()) else { return; };
+
+        let Some(chat_view) = header_box.next_sibling().and_then(|c| c.downcast::<SourceView>().ok()) else { return; };
+        let Some(expander) = chat_view.next_sibling().and_then(|c| c.downcast::<Expander>().ok()) else { return; };
+        let Some(staging_box) = expander.next_sibling().and_then(|c| c.downcast::<Box>().ok()) else { return; };
+        let Some(pulse_box) = staging_box.next_sibling().and_then(|c| c.downcast::<Box>().ok()) else { return; };
 
         // Extract children for Staging mode
-        let sys_scroll = staging_box.first_child().unwrap().next_sibling().unwrap().downcast::<ScrolledWindow>().unwrap();
-        let system_view = sys_scroll.child().unwrap().downcast::<SourceView>().unwrap();
+        let Some(sys_scroll) = staging_box.first_child().and_then(|c| c.next_sibling()).and_then(|c| c.downcast::<ScrolledWindow>().ok()) else { return; };
+        let Some(system_view) = sys_scroll.child().and_downcast::<SourceView>() else { return; };
 
-        let dir_scroll = sys_scroll.next_sibling().unwrap().next_sibling().unwrap().downcast::<ScrolledWindow>().unwrap();
-        let directives_view = dir_scroll.child().unwrap().downcast::<SourceView>().unwrap();
+        let Some(dir_scroll) = sys_scroll.next_sibling().and_then(|c| c.next_sibling()).and_then(|c| c.downcast::<ScrolledWindow>().ok()) else { return; };
+        let Some(directives_view) = dir_scroll.child().and_downcast::<SourceView>() else { return; };
 
-        let eng_scroll = dir_scroll.next_sibling().unwrap().next_sibling().unwrap().downcast::<ScrolledWindow>().unwrap();
-        let engrams_view = eng_scroll.child().unwrap().downcast::<SourceView>().unwrap();
+        let Some(eng_scroll) = dir_scroll.next_sibling().and_then(|c| c.next_sibling()).and_then(|c| c.downcast::<ScrolledWindow>().ok()) else { return; };
+        let Some(engrams_view) = eng_scroll.child().and_downcast::<SourceView>() else { return; };
 
-        let prm_scroll = eng_scroll.next_sibling().unwrap().next_sibling().unwrap().downcast::<ScrolledWindow>().unwrap();
-        let prompt_view = prm_scroll.child().unwrap().downcast::<SourceView>().unwrap();
+        let Some(prm_scroll) = eng_scroll.next_sibling().and_then(|c| c.next_sibling()).and_then(|c| c.downcast::<ScrolledWindow>().ok()) else { return; };
+        let Some(prompt_view) = prm_scroll.child().and_downcast::<SourceView>() else { return; };
 
-        let actions_box = prm_scroll.next_sibling().unwrap().downcast::<Box>().unwrap();
-        let cancel_btn = actions_box.first_child().unwrap().downcast::<Button>().unwrap();
-        let dispatch_btn = cancel_btn.next_sibling().unwrap().downcast::<Button>().unwrap();
+        let Some(actions_box) = prm_scroll.next_sibling().and_then(|c| c.downcast::<Box>().ok()) else { return; };
+        let Some(cancel_btn) = actions_box.first_child().and_then(|c| c.downcast::<Button>().ok()) else { return; };
+        let Some(dispatch_btn) = cancel_btn.next_sibling().and_then(|c| c.downcast::<Button>().ok()) else { return; };
 
         let message_type = obj.message_type();
 
@@ -780,6 +774,8 @@ fn build_gnome_ui(
         expander.set_visible(false);
         staging_box.set_visible(false);
         pulse_box.set_visible(false);
+        left_expand_btn.set_visible(false);
+        right_expand_btn.set_visible(false);
 
         if message_type == 1 {
             // STAGING MODE
@@ -979,23 +975,14 @@ fn build_gnome_ui(
                 meta_label.remove_css_class("role-una");
                 meta_label.remove_css_class("role-system");
 
-                // Reorder Header Box
-                let mut c = header_box.first_child();
-                while let Some(child) = c {
-                    header_box.remove(&child);
-                    c = header_box.first_child();
-                }
+                let is_architect = sender == "Architect";
 
-                if sender == "Architect" {
+                if is_architect {
                     meta_label.add_css_class("role-architect");
                     bubble.add_css_class("architect-bubble");
                     left_spacer.set_visible(true);
                     right_spacer.set_visible(false);
                     meta_label.set_xalign(1.0);
-
-                    header_box.append(&expand_btn);
-                    header_box.append(&header_spacer);
-                    header_box.append(&meta_label);
                 } else {
                     if sender == "Una-Prime" {
                         meta_label.add_css_class("role-una");
@@ -1006,29 +993,28 @@ fn build_gnome_ui(
                     left_spacer.set_visible(false);
                     right_spacer.set_visible(true);
                     meta_label.set_xalign(0.0);
-
-                    header_box.append(&meta_label);
-                    header_box.append(&header_spacer);
-                    header_box.append(&expand_btn);
                 }
 
                 let is_expanded = obj.is_expanded();
                 let line_count = content.lines().count();
+                let collapsible = line_count > 11;
 
-                if line_count > 11 {
-                    expand_btn.set_visible(true);
-                } else {
-                    expand_btn.set_visible(false);
+                if is_architect && collapsible {
+                    left_expand_btn.set_visible(true);
+                } else if collapsible {
+                    right_expand_btn.set_visible(true);
                 }
 
-                if line_count > 11 && !is_expanded {
+                if collapsible && !is_expanded {
                     let truncated: String = content.lines().take(11).collect::<Vec<&str>>().join("\n")
                         + "\n\n... [Click to expand]";
                     chat_view.buffer().set_text(&truncated);
-                    expand_btn.set_icon_name("pan-down-symbolic");
+                    left_expand_btn.set_icon_name("pan-down-symbolic");
+                    right_expand_btn.set_icon_name("pan-down-symbolic");
                 } else {
                     chat_view.buffer().set_text(&content);
-                    expand_btn.set_icon_name("pan-up-symbolic");
+                    left_expand_btn.set_icon_name("pan-up-symbolic");
+                    right_expand_btn.set_icon_name("pan-up-symbolic");
                 }
             } else {
                 expander.set_visible(true);
@@ -1047,90 +1033,6 @@ fn build_gnome_ui(
     let console_list_view = ListView::new(Some(console_selection), Some(console_factory));
     console_list_view.add_css_class("console");
     console_list_view.set_valign(Align::End);
-
-    let list_key_controller = EventControllerKey::new();
-    list_key_controller.set_propagation_phase(PropagationPhase::Bubble);
-    let console_list_view_clone = console_list_view.clone();
-    list_key_controller.connect_key_pressed(move |_, key, _keycode, _state| {
-        let is_nav_key = matches!(
-            key,
-            Key::Up | Key::Down | Key::Page_Up | Key::Page_Down
-        );
-
-        if !is_nav_key {
-            return glib::Propagation::Proceed;
-        }
-
-        // Only intercept if a bubble Box has focus.
-        if let Some(focused) = console_list_view_clone.root().and_then(|r| gtk4::prelude::RootExt::focus(&r)) {
-            if focused.has_css_class("bubble-box") {
-                // Find current index
-                let mut current_idx: Option<i32> = None;
-                let mut child = console_list_view_clone.first_child();
-                let mut idx: i32 = 0;
-                while let Some(c) = child {
-                    if let Ok(list_item_widget) = c.clone().downcast::<gtk4::Widget>() {
-                        // Traverse list item widget to find bubble Box
-                        if let Some(root_box) = list_item_widget.first_child() {
-                            if let Some(left_spacer) = root_box.first_child() {
-                                if let Some(bubble) = left_spacer.next_sibling() {
-                                    if bubble == focused {
-                                        current_idx = Some(idx);
-                                        break;
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    child = c.next_sibling();
-                    idx += 1;
-                }
-
-                if let Some(idx) = current_idx {
-                    let next_idx = match key {
-                        Key::Up => idx.saturating_sub(1),
-                        Key::Down => idx + 1,
-                        Key::Page_Up => idx.saturating_sub(5),
-                        Key::Page_Down => idx + 5,
-                        _ => idx,
-                    };
-
-                    if next_idx != idx {
-                        let mut child = console_list_view_clone.first_child();
-                        let mut curr: i32 = 0;
-                        let mut found_focus = false;
-                        while let Some(c) = child {
-                            if curr == next_idx {
-                                if let Ok(list_item_widget) = c.downcast::<gtk4::Widget>() {
-                                    if let Some(root_box) = list_item_widget.first_child() {
-                                        if let Some(left_spacer) = root_box.first_child() {
-                                            if let Some(bubble) = left_spacer.next_sibling() {
-                                                bubble.grab_focus();
-                                                found_focus = true;
-                                                return glib::Propagation::Stop;
-                                            }
-                                        }
-                                    }
-                                }
-                                break;
-                            }
-                            child = c.next_sibling();
-                            curr += 1;
-                        }
-                        if found_focus {
-                            return glib::Propagation::Stop;
-                        }
-                    }
-                    // If we didn't find the next bubble (e.g., end of realized items), proceed so GTK scrolls it.
-                    return glib::Propagation::Proceed;
-                }
-            }
-        }
-
-        glib::Propagation::Proceed
-    });
-    console_list_view.add_controller(list_key_controller);
-
     scrolled_window.set_child(Some(&console_list_view));
 
     main_paned.set_start_child(Some(&scrolled_window));
@@ -2102,18 +2004,28 @@ fn build_gtk_ui(
         meta_label.set_xalign(0.0);
         meta_label.add_css_class("dim-label");
 
-        let expand_btn = Button::builder()
+        let left_expand_btn = Button::builder()
             .icon_name("pan-down-symbolic")
             .css_classes(vec!["flat", "circular"])
             .tooltip_text("Expand / Collapse")
             .build();
-        expand_btn.set_visible(false);
+        left_expand_btn.set_visible(false);
 
-        header_box.append(&meta_label);
+        let right_expand_btn = Button::builder()
+            .icon_name("pan-down-symbolic")
+            .css_classes(vec!["flat", "circular"])
+            .tooltip_text("Expand / Collapse")
+            .build();
+        right_expand_btn.set_visible(false);
+
         let header_spacer = Box::new(Orientation::Horizontal, 0);
         header_spacer.set_hexpand(true);
+
+        // Fixed layout: [Left Button] [Label] [Spacer] [Right Button]
+        header_box.append(&left_expand_btn);
+        header_box.append(&meta_label);
         header_box.append(&header_spacer);
-        header_box.append(&expand_btn);
+        header_box.append(&right_expand_btn);
 
         bubble.append(&header_box);
 
@@ -2218,32 +2130,34 @@ fn build_gtk_ui(
         right_spacer.set_hexpand(true);
         root.append(&right_spacer);
 
-        let item_clone = item.clone();
-        let chat_content_view_clone = chat_content_view.clone();
-        let expand_btn_clone = expand_btn.clone();
+        let connect_expand = |btn: &Button, item_clone: ListItem, chat_view_clone: SourceView| {
+            let btn_clone = btn.clone();
+            btn.connect_clicked(move |_| {
+                if let Some(obj) = item_clone
+                    .item()
+                    .and_downcast::<crate::widgets::model::DispatchObject>()
+                {
+                    let expanded = !obj.is_expanded();
+                    obj.set_is_expanded(expanded);
+                    let content = obj.content();
+                    let line_count = content.lines().count();
 
-        expand_btn.connect_clicked(move |_| {
-            if let Some(obj) = item_clone
-                .item()
-                .and_downcast::<crate::widgets::model::DispatchObject>()
-            {
-                let expanded = !obj.is_expanded();
-                obj.set_is_expanded(expanded);
-                let content = obj.content();
-                let line_count = content.lines().count();
-
-                if line_count > 11 && !expanded {
-                    let truncated: String =
-                        content.lines().take(11).collect::<Vec<&str>>().join("\n")
-                            + "\n\n... [Click to expand]";
-                    chat_content_view_clone.buffer().set_text(&truncated);
-                    expand_btn_clone.set_icon_name("pan-down-symbolic");
-                } else {
-                    chat_content_view_clone.buffer().set_text(&content);
-                    expand_btn_clone.set_icon_name("pan-up-symbolic");
+                    if line_count > 11 && !expanded {
+                        let truncated: String =
+                            content.lines().take(11).collect::<Vec<&str>>().join("\n")
+                                + "\n\n... [Click to expand]";
+                        chat_view_clone.buffer().set_text(&truncated);
+                        btn_clone.set_icon_name("pan-down-symbolic");
+                    } else {
+                        chat_view_clone.buffer().set_text(&content);
+                        btn_clone.set_icon_name("pan-up-symbolic");
+                    }
                 }
-            }
-        });
+            });
+        };
+
+        connect_expand(&left_expand_btn, item.clone(), chat_content_view.clone());
+        connect_expand(&right_expand_btn, item.clone(), chat_content_view.clone());
         item.set_child(Some(&root));
     });
 
@@ -2253,56 +2167,39 @@ fn build_gtk_ui(
         let item = item.downcast_ref::<ListItem>().unwrap();
         let root = item.child().unwrap().downcast::<Box>().unwrap();
 
-        let left_spacer = root.first_child().unwrap().downcast::<Box>().unwrap();
-        let bubble = left_spacer.next_sibling().unwrap().downcast::<Box>().unwrap();
-        let right_spacer = bubble.next_sibling().unwrap().downcast::<Box>().unwrap();
+        let Some(left_spacer) = root.first_child().and_then(|c| c.downcast::<Box>().ok()) else { return; };
+        let Some(bubble) = left_spacer.next_sibling().and_then(|c| c.downcast::<Box>().ok()) else { return; };
+        let Some(right_spacer) = bubble.next_sibling().and_then(|c| c.downcast::<Box>().ok()) else { return; };
 
-        let obj = item.item().unwrap().downcast::<DispatchObject>().unwrap();
+        let Some(obj) = item.item().and_downcast::<DispatchObject>() else { return; };
 
-        let header_box = bubble.first_child().unwrap().downcast::<Box>().unwrap();
-        let mut meta_label = None;
-        let mut expand_btn = None;
-        let mut header_spacer_existing = None;
-        let mut child = header_box.first_child();
-        while let Some(c) = child {
-            if let Ok(lbl) = c.clone().downcast::<Label>() {
-                meta_label = Some(lbl);
-            } else if let Ok(btn) = c.clone().downcast::<Button>() {
-                expand_btn = Some(btn);
-            } else if let Ok(bx) = c.clone().downcast::<Box>() {
-                header_spacer_existing = Some(bx);
-            }
-            child = c.next_sibling();
-        }
-        let meta_label = meta_label.unwrap();
-        let expand_btn = expand_btn.unwrap();
-        let header_spacer = header_spacer_existing.unwrap_or_else(|| {
-            let sp = Box::new(Orientation::Horizontal, 0);
-            sp.set_hexpand(true);
-            sp
-        });
+        let Some(header_box) = bubble.first_child().and_then(|c| c.downcast::<Box>().ok()) else { return; };
 
-        let chat_view = header_box.next_sibling().unwrap().downcast::<SourceView>().unwrap();
-        let expander = chat_view.next_sibling().unwrap().downcast::<Expander>().unwrap();
-        let staging_box = expander.next_sibling().unwrap().downcast::<Box>().unwrap();
-        let pulse_box = staging_box.next_sibling().unwrap().downcast::<Box>().unwrap();
+        let Some(left_expand_btn) = header_box.first_child().and_then(|c| c.downcast::<Button>().ok()) else { return; };
+        let Some(meta_label) = left_expand_btn.next_sibling().and_then(|c| c.downcast::<Label>().ok()) else { return; };
+        let Some(right_expand_btn) = header_box.last_child().and_then(|c| c.downcast::<Button>().ok()) else { return; };
+
+        let Some(chat_view) = header_box.next_sibling().and_then(|c| c.downcast::<SourceView>().ok()) else { return; };
+        let Some(expander) = chat_view.next_sibling().and_then(|c| c.downcast::<Expander>().ok()) else { return; };
+        let Some(staging_box) = expander.next_sibling().and_then(|c| c.downcast::<Box>().ok()) else { return; };
+        let Some(pulse_box) = staging_box.next_sibling().and_then(|c| c.downcast::<Box>().ok()) else { return; };
 
         // Extract children for Staging mode
-        let sys_scroll = staging_box.first_child().unwrap().next_sibling().unwrap().downcast::<ScrolledWindow>().unwrap();
-        let system_view = sys_scroll.child().unwrap().downcast::<SourceView>().unwrap();
+        let Some(sys_scroll) = staging_box.first_child().and_then(|c| c.next_sibling()).and_then(|c| c.downcast::<ScrolledWindow>().ok()) else { return; };
+        let Some(system_view) = sys_scroll.child().and_downcast::<SourceView>() else { return; };
 
-        let dir_scroll = sys_scroll.next_sibling().unwrap().next_sibling().unwrap().downcast::<ScrolledWindow>().unwrap();
-        let directives_view = dir_scroll.child().unwrap().downcast::<SourceView>().unwrap();
+        let Some(dir_scroll) = sys_scroll.next_sibling().and_then(|c| c.next_sibling()).and_then(|c| c.downcast::<ScrolledWindow>().ok()) else { return; };
+        let Some(directives_view) = dir_scroll.child().and_downcast::<SourceView>() else { return; };
 
-        let eng_scroll = dir_scroll.next_sibling().unwrap().next_sibling().unwrap().downcast::<ScrolledWindow>().unwrap();
-        let engrams_view = eng_scroll.child().unwrap().downcast::<SourceView>().unwrap();
+        let Some(eng_scroll) = dir_scroll.next_sibling().and_then(|c| c.next_sibling()).and_then(|c| c.downcast::<ScrolledWindow>().ok()) else { return; };
+        let Some(engrams_view) = eng_scroll.child().and_downcast::<SourceView>() else { return; };
 
-        let prm_scroll = eng_scroll.next_sibling().unwrap().next_sibling().unwrap().downcast::<ScrolledWindow>().unwrap();
-        let prompt_view = prm_scroll.child().unwrap().downcast::<SourceView>().unwrap();
+        let Some(prm_scroll) = eng_scroll.next_sibling().and_then(|c| c.next_sibling()).and_then(|c| c.downcast::<ScrolledWindow>().ok()) else { return; };
+        let Some(prompt_view) = prm_scroll.child().and_downcast::<SourceView>() else { return; };
 
-        let actions_box = prm_scroll.next_sibling().unwrap().downcast::<Box>().unwrap();
-        let cancel_btn = actions_box.first_child().unwrap().downcast::<Button>().unwrap();
-        let dispatch_btn = cancel_btn.next_sibling().unwrap().downcast::<Button>().unwrap();
+        let Some(actions_box) = prm_scroll.next_sibling().and_then(|c| c.downcast::<Box>().ok()) else { return; };
+        let Some(cancel_btn) = actions_box.first_child().and_then(|c| c.downcast::<Button>().ok()) else { return; };
+        let Some(dispatch_btn) = cancel_btn.next_sibling().and_then(|c| c.downcast::<Button>().ok()) else { return; };
 
         let message_type = obj.message_type();
 
@@ -2315,6 +2212,8 @@ fn build_gtk_ui(
         expander.set_visible(false);
         staging_box.set_visible(false);
         pulse_box.set_visible(false);
+        left_expand_btn.set_visible(false);
+        right_expand_btn.set_visible(false);
 
         if message_type == 1 {
             // STAGING MODE
@@ -2514,23 +2413,14 @@ fn build_gtk_ui(
                 meta_label.remove_css_class("role-una");
                 meta_label.remove_css_class("role-system");
 
-                // Reorder Header Box
-                let mut c = header_box.first_child();
-                while let Some(child) = c {
-                    header_box.remove(&child);
-                    c = header_box.first_child();
-                }
+                let is_architect = sender == "Architect";
 
-                if sender == "Architect" {
+                if is_architect {
                     meta_label.add_css_class("role-architect");
                     bubble.add_css_class("architect-bubble");
                     left_spacer.set_visible(true);
                     right_spacer.set_visible(false);
                     meta_label.set_xalign(1.0);
-
-                    header_box.append(&expand_btn);
-                    header_box.append(&header_spacer);
-                    header_box.append(&meta_label);
                 } else {
                     if sender == "Una-Prime" {
                         meta_label.add_css_class("role-una");
@@ -2541,29 +2431,28 @@ fn build_gtk_ui(
                     left_spacer.set_visible(false);
                     right_spacer.set_visible(true);
                     meta_label.set_xalign(0.0);
-
-                    header_box.append(&meta_label);
-                    header_box.append(&header_spacer);
-                    header_box.append(&expand_btn);
                 }
 
                 let is_expanded = obj.is_expanded();
                 let line_count = content.lines().count();
+                let collapsible = line_count > 11;
 
-                if line_count > 11 {
-                    expand_btn.set_visible(true);
-                } else {
-                    expand_btn.set_visible(false);
+                if is_architect && collapsible {
+                    left_expand_btn.set_visible(true);
+                } else if collapsible {
+                    right_expand_btn.set_visible(true);
                 }
 
-                if line_count > 11 && !is_expanded {
+                if collapsible && !is_expanded {
                     let truncated: String = content.lines().take(11).collect::<Vec<&str>>().join("\n")
                         + "\n\n... [Click to expand]";
                     chat_view.buffer().set_text(&truncated);
-                    expand_btn.set_icon_name("pan-down-symbolic");
+                    left_expand_btn.set_icon_name("pan-down-symbolic");
+                    right_expand_btn.set_icon_name("pan-down-symbolic");
                 } else {
                     chat_view.buffer().set_text(&content);
-                    expand_btn.set_icon_name("pan-up-symbolic");
+                    left_expand_btn.set_icon_name("pan-up-symbolic");
+                    right_expand_btn.set_icon_name("pan-up-symbolic");
                 }
             } else {
                 expander.set_visible(true);
@@ -2582,90 +2471,6 @@ fn build_gtk_ui(
     let console_list_view = ListView::new(Some(console_selection), Some(console_factory));
     console_list_view.add_css_class("console");
     console_list_view.set_valign(Align::End);
-
-    let list_key_controller = EventControllerKey::new();
-    list_key_controller.set_propagation_phase(PropagationPhase::Bubble);
-    let console_list_view_clone = console_list_view.clone();
-    list_key_controller.connect_key_pressed(move |_, key, _keycode, _state| {
-        let is_nav_key = matches!(
-            key,
-            Key::Up | Key::Down | Key::Page_Up | Key::Page_Down
-        );
-
-        if !is_nav_key {
-            return glib::Propagation::Proceed;
-        }
-
-        // Only intercept if a bubble Box has focus.
-        if let Some(focused) = console_list_view_clone.root().and_then(|r| gtk4::prelude::RootExt::focus(&r)) {
-            if focused.has_css_class("bubble-box") {
-                // Find current index
-                let mut current_idx: Option<i32> = None;
-                let mut child = console_list_view_clone.first_child();
-                let mut idx: i32 = 0;
-                while let Some(c) = child {
-                    if let Ok(list_item_widget) = c.clone().downcast::<gtk4::Widget>() {
-                        // Traverse list item widget to find bubble Box
-                        if let Some(root_box) = list_item_widget.first_child() {
-                            if let Some(left_spacer) = root_box.first_child() {
-                                if let Some(bubble) = left_spacer.next_sibling() {
-                                    if bubble == focused {
-                                        current_idx = Some(idx);
-                                        break;
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    child = c.next_sibling();
-                    idx += 1;
-                }
-
-                if let Some(idx) = current_idx {
-                    let next_idx = match key {
-                        Key::Up => idx.saturating_sub(1),
-                        Key::Down => idx + 1,
-                        Key::Page_Up => idx.saturating_sub(5),
-                        Key::Page_Down => idx + 5,
-                        _ => idx,
-                    };
-
-                    if next_idx != idx {
-                        let mut child = console_list_view_clone.first_child();
-                        let mut curr: i32 = 0;
-                        let mut found_focus = false;
-                        while let Some(c) = child {
-                            if curr == next_idx {
-                                if let Ok(list_item_widget) = c.downcast::<gtk4::Widget>() {
-                                    if let Some(root_box) = list_item_widget.first_child() {
-                                        if let Some(left_spacer) = root_box.first_child() {
-                                            if let Some(bubble) = left_spacer.next_sibling() {
-                                                bubble.grab_focus();
-                                                found_focus = true;
-                                                return glib::Propagation::Stop;
-                                            }
-                                        }
-                                    }
-                                }
-                                break;
-                            }
-                            child = c.next_sibling();
-                            curr += 1;
-                        }
-                        if found_focus {
-                            return glib::Propagation::Stop;
-                        }
-                    }
-                    // If we didn't find the next bubble (e.g., end of realized items), proceed so GTK scrolls it.
-                    return glib::Propagation::Proceed;
-                }
-            }
-        }
-
-        glib::Propagation::Proceed
-    });
-    console_list_view.add_controller(list_key_controller);
-
     scrolled_window.set_child(Some(&console_list_view));
 
     main_paned.set_start_child(Some(&scrolled_window));
