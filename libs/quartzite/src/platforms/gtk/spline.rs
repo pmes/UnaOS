@@ -731,7 +731,7 @@ fn build_gnome_ui(
                     .detail("Are you sure you want to discard this pre-flight payload? This cannot be undone.")
                     .buttons(["Cancel", "Delete"])
                     .cancel_button(0)
-                    .destructive_button(1)
+                    .default_button(1)
                     .modal(true)
                     .build();
 
@@ -2081,7 +2081,7 @@ fn build_gtk_ui(
                     .detail("Are you sure you want to discard this pre-flight payload? This cannot be undone.")
                     .buttons(["Cancel", "Delete"])
                     .cancel_button(0)
-                    .destructive_button(1)
+                    .default_button(1)
                     .modal(true)
                     .build();
 
