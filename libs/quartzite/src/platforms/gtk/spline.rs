@@ -643,6 +643,7 @@ fn build_gnome_ui(
     });
 
     let tx_dispatch = tx_event.clone();
+    let console_store_bind = console_store.clone();
     console_factory.connect_bind(move |_factory, item| {
         let item = item.downcast_ref::<ListItem>().unwrap();
         let root = item.child().unwrap().downcast::<Box>().unwrap();
@@ -712,15 +713,10 @@ fn build_gnome_ui(
             dispatch_btn.set_sensitive(!is_locked);
             cancel_btn.set_sensitive(!is_locked);
 
-            let tx_clone = tx_dispatch.clone();
             let obj_clone = obj.clone();
-            let sys_view_clone = system_view.clone();
-            let dir_view_clone = directives_view.clone();
-            let eng_view_clone = engrams_view.clone();
-            let prm_view_clone = prompt_view.clone();
 
             let bubble_clone = bubble.clone();
-            let console_store_clone = console_store.clone();
+            let console_store_clone = console_store_bind.clone();
 
             if let Some(sig) = unsafe { cancel_btn.steal_data::<glib::SignalHandlerId>("clicked_sig") } {
                 cancel_btn.disconnect(sig);
@@ -812,11 +808,12 @@ fn build_gnome_ui(
 
             let cancel_btn_clone = cancel_btn.clone();
             let dispatch_btn_clone = dispatch_btn.clone();
-            let console_store_pulse = console_store.clone();
+            let console_store_pulse = console_store_bind.clone();
 
             if let Some(sig) = unsafe { dispatch_btn_clone.steal_data::<glib::SignalHandlerId>("clicked_sig") } {
                 dispatch_btn_clone.disconnect(sig);
             }
+            let btn_for_closure = dispatch_btn_clone.clone();
             let dispatch_sig = dispatch_btn_clone.connect_clicked(move |_| {
                 obj_clone2.set_is_locked(true);
                 sys_view_clone2.set_editable(false);
@@ -824,7 +821,7 @@ fn build_gnome_ui(
                 eng_view_clone2.set_editable(false);
                 prm_view_clone2.set_editable(false);
                 cancel_btn_clone.set_sensitive(false);
-                dispatch_btn_clone.set_sensitive(false);
+                btn_for_closure.set_sensitive(false);
 
                 // Add pulse
                 let id = format!("{}-pulse", chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0));
@@ -1993,6 +1990,7 @@ fn build_gtk_ui(
     });
 
     let tx_dispatch = tx_event.clone();
+    let console_store_bind = console_store.clone();
     console_factory.connect_bind(move |_factory, item| {
         let item = item.downcast_ref::<ListItem>().unwrap();
         let root = item.child().unwrap().downcast::<Box>().unwrap();
@@ -2062,15 +2060,10 @@ fn build_gtk_ui(
             dispatch_btn.set_sensitive(!is_locked);
             cancel_btn.set_sensitive(!is_locked);
 
-            let tx_clone = tx_dispatch.clone();
             let obj_clone = obj.clone();
-            let sys_view_clone = system_view.clone();
-            let dir_view_clone = directives_view.clone();
-            let eng_view_clone = engrams_view.clone();
-            let prm_view_clone = prompt_view.clone();
 
             let bubble_clone = bubble.clone();
-            let console_store_clone = console_store.clone();
+            let console_store_clone = console_store_bind.clone();
 
             if let Some(sig) = unsafe { cancel_btn.steal_data::<glib::SignalHandlerId>("clicked_sig") } {
                 cancel_btn.disconnect(sig);
@@ -2162,11 +2155,12 @@ fn build_gtk_ui(
 
             let cancel_btn_clone = cancel_btn.clone();
             let dispatch_btn_clone = dispatch_btn.clone();
-            let console_store_pulse = console_store.clone();
+            let console_store_pulse = console_store_bind.clone();
 
             if let Some(sig) = unsafe { dispatch_btn_clone.steal_data::<glib::SignalHandlerId>("clicked_sig") } {
                 dispatch_btn_clone.disconnect(sig);
             }
+            let btn_for_closure = dispatch_btn_clone.clone();
             let dispatch_sig = dispatch_btn_clone.connect_clicked(move |_| {
                 obj_clone2.set_is_locked(true);
                 sys_view_clone2.set_editable(false);
@@ -2174,7 +2168,7 @@ fn build_gtk_ui(
                 eng_view_clone2.set_editable(false);
                 prm_view_clone2.set_editable(false);
                 cancel_btn_clone.set_sensitive(false);
-                dispatch_btn_clone.set_sensitive(false);
+                btn_for_closure.set_sensitive(false);
 
                 // Add pulse
                 let id = format!("{}-pulse", chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0));
