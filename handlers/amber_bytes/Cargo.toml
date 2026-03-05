@@ -2,6 +2,7 @@
 name = "amber_bytes"
 version = "0.1.0"
 edition = "2024"
+license = "LGPL-3.0-or-later"
 authors = ["pmes"]
 description = "Forensic data recovery and preservation tool"
 

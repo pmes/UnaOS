@@ -2,6 +2,7 @@
 name = "unafs"
 version = "0.1.0"
 edition = "2024"
+license = "LGPL-3.0-or-later"
 
 [dependencies]
 gneiss_pal = { path = "../gneiss_pal" }

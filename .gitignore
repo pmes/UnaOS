@@ -21,3 +21,4 @@ Thumbs.db
 secret.txt
 evidence.txt
 .env
+cargo_check.log
