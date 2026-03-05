@@ -429,7 +429,6 @@ fn build_gnome_ui(
     telehud_box.append(
         &Label::builder()
             .label("CONTEXT VECTOR")
-            .css_classes(vec!["nexus-header"])
             .xalign(0.0)
             .margin_top(20)
             .build(),
@@ -601,7 +600,7 @@ fn build_gnome_ui(
         chat_content_view.set_monospace(true);
         chat_content_view.set_width_request(800);
         chat_content_view.set_hexpand(true);
-        chat_content_view.set_focusable(true);
+        chat_content_view.set_focusable(false);
         chat_content_view.add_css_class("view");
         bubble.append(&chat_content_view);
 
@@ -615,6 +614,7 @@ fn build_gnome_ui(
         payload_content_view.set_wrap_mode(gtk4::WrapMode::WordChar);
         payload_content_view.set_show_line_numbers(true);
         payload_content_view.set_monospace(true);
+        payload_content_view.set_focusable(false);
         payload_content_view.add_css_class("view");
         let payload_scroll = ScrolledWindow::builder()
             .child(&payload_content_view)
@@ -708,8 +708,7 @@ fn build_gnome_ui(
 
                     if line_count > 11 && !expanded {
                         let truncated: String =
-                            content.lines().take(11).collect::<Vec<&str>>().join("\n")
-                                + "\n\n... [Click to expand]";
+                            content.lines().take(11).collect::<Vec<&str>>().join("\n");
                         chat_view_clone.buffer().set_text(&truncated);
                         btn_clone.set_icon_name("pan-down-symbolic");
                     } else {
@@ -1008,8 +1007,7 @@ fn build_gnome_ui(
                 }
 
                 if collapsible && !is_expanded {
-                    let truncated: String = content.lines().take(11).collect::<Vec<&str>>().join("\n")
-                        + "\n\n... [Click to expand]";
+                    let truncated: String = content.lines().take(11).collect::<Vec<&str>>().join("\n");
                     chat_view.buffer().set_text(&truncated);
                     left_expand_btn.set_icon_name("pan-down-symbolic");
                     right_expand_btn.set_icon_name("pan-down-symbolic");
@@ -1041,7 +1039,7 @@ fn build_gnome_ui(
 
     // Input Area
     let input_container = Box::new(Orientation::Horizontal, 8);
-    input_container.set_valign(Align::Fill);
+    input_container.set_valign(Align::End);
     input_container.set_margin_start(16);
     input_container.set_margin_end(16);
     input_container.set_margin_bottom(16);
@@ -1190,7 +1188,6 @@ fn build_gnome_ui(
         .vscrollbar_policy(PolicyType::Automatic)
         .propagate_natural_height(true)
         .max_content_height(600)
-        .valign(Align::Fill)
         .has_frame(false)
         .build();
     input_scroll.set_hexpand(true);
@@ -1880,7 +1877,6 @@ fn build_gtk_ui(
     telehud_box.append(
         &Label::builder()
             .label("CONTEXT VECTOR")
-            .css_classes(vec!["nexus-header"])
             .xalign(0.0)
             .margin_top(20)
             .build(),
@@ -2041,7 +2037,7 @@ fn build_gtk_ui(
         chat_content_view.set_monospace(true);
         chat_content_view.set_width_request(800);
         chat_content_view.set_hexpand(true);
-        chat_content_view.set_focusable(true);
+        chat_content_view.set_focusable(false);
         chat_content_view.add_css_class("view");
         bubble.append(&chat_content_view);
 
@@ -2055,6 +2051,7 @@ fn build_gtk_ui(
         payload_content_view.set_wrap_mode(gtk4::WrapMode::WordChar);
         payload_content_view.set_show_line_numbers(true);
         payload_content_view.set_monospace(true);
+        payload_content_view.set_focusable(false);
         payload_content_view.add_css_class("view");
         let payload_scroll = ScrolledWindow::builder()
             .child(&payload_content_view)
@@ -2148,8 +2145,7 @@ fn build_gtk_ui(
 
                     if line_count > 11 && !expanded {
                         let truncated: String =
-                            content.lines().take(11).collect::<Vec<&str>>().join("\n")
-                                + "\n\n... [Click to expand]";
+                            content.lines().take(11).collect::<Vec<&str>>().join("\n");
                         chat_view_clone.buffer().set_text(&truncated);
                         btn_clone.set_icon_name("pan-down-symbolic");
                     } else {
@@ -2448,8 +2444,7 @@ fn build_gtk_ui(
                 }
 
                 if collapsible && !is_expanded {
-                    let truncated: String = content.lines().take(11).collect::<Vec<&str>>().join("\n")
-                        + "\n\n... [Click to expand]";
+                    let truncated: String = content.lines().take(11).collect::<Vec<&str>>().join("\n");
                     chat_view.buffer().set_text(&truncated);
                     left_expand_btn.set_icon_name("pan-down-symbolic");
                     right_expand_btn.set_icon_name("pan-down-symbolic");
@@ -2481,7 +2476,7 @@ fn build_gtk_ui(
 
     // Input Area
     let input_container = Box::new(Orientation::Horizontal, 8);
-    input_container.set_valign(Align::Fill);
+    input_container.set_valign(Align::End);
     input_container.set_margin_start(16);
     input_container.set_margin_end(16);
     input_container.set_margin_bottom(16);
@@ -2630,7 +2625,6 @@ fn build_gtk_ui(
         .vscrollbar_policy(PolicyType::Automatic)
         .propagate_natural_height(true)
         .max_content_height(600)
-        .valign(Align::Fill)
         .has_frame(false)
         .build();
     input_scroll.set_hexpand(true);
