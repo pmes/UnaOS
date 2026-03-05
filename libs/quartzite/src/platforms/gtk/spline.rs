@@ -500,6 +500,8 @@ fn build_gnome_ui(
     let console_factory = SignalListItemFactory::new();
     console_factory.connect_setup(move |_factory, item| {
         let item = item.downcast_ref::<ListItem>().unwrap();
+        item.set_activatable(false);
+        item.set_selectable(false);
         let root = Box::new(Orientation::Horizontal, 0);
         root.set_hexpand(true);
         root.add_css_class("console-row");
@@ -508,7 +510,6 @@ fn build_gnome_ui(
         root.append(&left_spacer);
         let bubble = Box::new(Orientation::Vertical, 4);
         bubble.add_css_class("bubble-box");
-        bubble.set_width_request(400);
 
         let meta_label = Label::new(None);
         meta_label.set_xalign(0.0);
@@ -549,6 +550,7 @@ fn build_gnome_ui(
         // --- Staging Mode (Payload Editor) ---
         let staging_box = Box::new(Orientation::Vertical, 8);
         staging_box.set_visible(false);
+        staging_box.set_hexpand(true);
 
         let system_label = Label::builder().label("SYSTEM").xalign(0.0).css_classes(vec!["dim-label"]).build();
         let system_view = SourceView::builder().wrap_mode(gtk4::WrapMode::WordChar).editable(true).monospace(true).build();
@@ -580,7 +582,7 @@ fn build_gnome_ui(
 
         let actions_box = Box::new(Orientation::Horizontal, 8);
         actions_box.set_halign(Align::End);
-        let cancel_btn = Button::builder().icon_name("stop-sign-large-outline-symbolic").tooltip_text("Delete Post").css_classes(vec!["flat", "destructive-action"]).build();
+        let cancel_btn = Button::builder().icon_name("stop-sign-outline-symbolic").tooltip_text("Delete Post").css_classes(vec!["flat", "destructive-action"]).build();
         let dispatch_btn = Button::builder().icon_name("document-save-symbolic").tooltip_text("Save and Send").css_classes(vec!["suggested-action"]).build();
         actions_box.append(&cancel_btn);
         actions_box.append(&dispatch_btn);
@@ -1298,11 +1300,11 @@ fn build_gnome_ui(
                                     removals.push(i); // Drop Pulse
                                 } else if t == 1 {
                                     if Some(i) == target_staging_idx {
-                                        // Mutate Staging into standard User message
-                                        obj.set_message_type(0);
+                                        let timestamp = chrono::Local::now().format("%H:%M:%S").to_string();
+                                        let id = obj.id();
                                         let prm = obj.prompt_text();
-                                        obj.set_content(prm);
-                                        console_store_async.items_changed(i, 1, 1); // Force redraw
+                                        let user_obj = DispatchObject::new(&id, "Architect", "Log", &timestamp, &prm, true);
+                                        console_store_async.splice(i, 1, &[user_obj]);
                                     }
                                 }
                             }
@@ -1847,6 +1849,8 @@ fn build_gtk_ui(
     let console_factory = SignalListItemFactory::new();
     console_factory.connect_setup(move |_factory, item| {
         let item = item.downcast_ref::<ListItem>().unwrap();
+        item.set_activatable(false);
+        item.set_selectable(false);
         let root = Box::new(Orientation::Horizontal, 0);
         root.set_hexpand(true);
         root.add_css_class("console-row");
@@ -1855,7 +1859,6 @@ fn build_gtk_ui(
         root.append(&left_spacer);
         let bubble = Box::new(Orientation::Vertical, 4);
         bubble.add_css_class("bubble-box");
-        bubble.set_width_request(400);
 
         let meta_label = Label::new(None);
         meta_label.set_xalign(0.0);
@@ -1896,6 +1899,7 @@ fn build_gtk_ui(
         // --- Staging Mode (Payload Editor) ---
         let staging_box = Box::new(Orientation::Vertical, 8);
         staging_box.set_visible(false);
+        staging_box.set_hexpand(true);
 
         let system_label = Label::builder().label("SYSTEM").xalign(0.0).css_classes(vec!["dim-label"]).build();
         let system_view = SourceView::builder().wrap_mode(gtk4::WrapMode::WordChar).editable(true).monospace(true).build();
@@ -1927,7 +1931,7 @@ fn build_gtk_ui(
 
         let actions_box = Box::new(Orientation::Horizontal, 8);
         actions_box.set_halign(Align::End);
-        let cancel_btn = Button::builder().icon_name("stop-sign-large-outline-symbolic").tooltip_text("Delete Post").css_classes(vec!["flat", "destructive-action"]).build();
+        let cancel_btn = Button::builder().icon_name("stop-sign-outline-symbolic").tooltip_text("Delete Post").css_classes(vec!["flat", "destructive-action"]).build();
         let dispatch_btn = Button::builder().icon_name("document-save-symbolic").tooltip_text("Save and Send").css_classes(vec!["suggested-action"]).build();
         actions_box.append(&cancel_btn);
         actions_box.append(&dispatch_btn);
@@ -2651,11 +2655,11 @@ fn build_gtk_ui(
                                     removals.push(i); // Drop Pulse
                                 } else if t == 1 {
                                     if Some(i) == target_staging_idx {
-                                        // Mutate Staging into standard User message
-                                        obj.set_message_type(0);
+                                        let timestamp = chrono::Local::now().format("%H:%M:%S").to_string();
+                                        let id = obj.id();
                                         let prm = obj.prompt_text();
-                                        obj.set_content(prm);
-                                        console_store_async.items_changed(i, 1, 1); // Force redraw
+                                        let user_obj = DispatchObject::new(&id, "Architect", "Log", &timestamp, &prm, true);
+                                        console_store_async.splice(i, 1, &[user_obj]);
                                     }
                                 }
                             }
