@@ -138,6 +138,9 @@ impl ContextView {
 
             path_label.set_text(&filename);
             score_label.set_text(&format!("Gravity: {:.2}", data.score));
+
+            // --- NEW: ADD TOOLTIP ---
+            widget.set_tooltip_text(Some(&data.path.to_string_lossy()));
         });
 
         // 4. The View

@@ -30,6 +30,8 @@ struct State {
     sidebar_collapsed: bool,
     s9_status: ShardStatus,
     live_context: Vec<bandy::WeightedSkeleton>,
+    skeleton_cache: std::collections::HashMap<PathBuf, Arc<String>>, // <-- NEW
+    focused_file: Option<PathBuf>, // <-- NEW
 }
 
 fn get_mime_type(filename: &str) -> String {
@@ -172,6 +174,7 @@ pub struct VeinHandler {
     tx: mpsc::UnboundedSender<String>,
     gui_tx: async_channel::Sender<GuiUpdate>,
     bandy_tx: broadcast::Sender<SMessage>,
+    telemetry_tx: async_channel::Sender<SMessage>, // <-- NEW
 }
 
 impl VeinHandler {
@@ -191,6 +194,8 @@ impl VeinHandler {
             sidebar_collapsed: false,
             s9_status: ShardStatus::Offline,
             live_context: Vec::new(),
+            skeleton_cache: std::collections::HashMap::new(), // <-- NEW
+            focused_file: None, // <-- NEW
         }));
 
         let (tx_to_bg, mut rx_from_ui) = mpsc::unbounded_channel::<String>();
@@ -199,6 +204,7 @@ impl VeinHandler {
         let state_bg = state.clone();
         let brain_bg = brain.clone();
         let bandy_tx_bg = bandy_tx.clone();
+        let telemetry_tx_bg = telemetry_tx.clone();
 
         thread::spawn(move || {
             // Ignite the Can-Am V8 (Tokio Runtime)
@@ -215,10 +221,24 @@ impl VeinHandler {
                 // We drop the `rt.` prefix and use `tokio::spawn` directly.
                 // This schedules the task on the running engine without trying to move the engine itself.
                 let state_indexer = state_bg.clone();
+                let telemetry_tx_indexer = telemetry_tx_bg.clone();
                 tokio::spawn(async move {
-                    let live_ctx = cortex::run_indexer(root, bandy_tx_bg, telemetry_tx).await;
-                    let mut s = state_indexer.lock().unwrap();
-                    s.live_context = live_ctx;
+                    let cache = cortex::run_indexer(root, bandy_tx_bg).await;
+
+                    let live_ctx = {
+                        let mut s = state_indexer.lock().unwrap();
+                        s.skeleton_cache = cache;
+
+                        // Initial Gravity Calculation
+                        let gravity = crate::gravity::GravityWell::new();
+                        let live_ctx = gravity.calculate_scores(&s.skeleton_cache);
+                        s.live_context = live_ctx.clone();
+                        live_ctx
+                    };
+
+                    if !live_ctx.is_empty() {
+                        let _ = telemetry_tx_indexer.send(SMessage::ContextTelemetry { skeletons: live_ctx }).await;
+                    }
                 });
 
                 let disk = Arc::new(std::sync::Mutex::new(
@@ -608,6 +628,7 @@ impl VeinHandler {
             tx: tx_to_bg,
             gui_tx,
             bandy_tx,
+            telemetry_tx, // <-- NEW
         }
     }
 
@@ -633,6 +654,21 @@ impl AppHandler for VeinHandler {
 
         match event {
             Event::Input { target: _, text } => {
+                // --- NEW: DYNAMIC GRAVITY RECALCULATION ---
+                {
+                    let mut gravity = crate::gravity::GravityWell::new();
+                    if let Some(f) = &s.focused_file {
+                        gravity.set_focus(f.clone());
+                    }
+                    gravity.extract_keywords(&text);
+                    let live_ctx = gravity.calculate_scores(&s.skeleton_cache);
+                    s.live_context = live_ctx.clone();
+
+                    // Instantly update the TeleHUD
+                    let _ = self.telemetry_tx.send_blocking(SMessage::ContextTelemetry { skeletons: live_ctx });
+                }
+                // ------------------------------------------
+
                 let timestamp = Local::now().format("%H:%M:%S").to_string();
                 let _current_text = format!("\n[ARCHITECT] [{}] > {}\n", timestamp, text);
 
@@ -694,7 +730,17 @@ impl AppHandler for VeinHandler {
                 ));
             }
             Event::FileSelected(path) => {
-                trigger_upload(path, self.gui_tx.clone());
+                trigger_upload(path.clone(), self.gui_tx.clone());
+
+                // --- NEW: DYNAMIC GRAVITY FOCUS ---
+                s.focused_file = Some(path.clone());
+                let mut gravity = crate::gravity::GravityWell::new();
+                gravity.set_focus(path);
+                let live_ctx = gravity.calculate_scores(&s.skeleton_cache);
+                s.live_context = live_ctx.clone();
+
+                let _ = self.telemetry_tx.send_blocking(SMessage::ContextTelemetry { skeletons: live_ctx });
+                // ----------------------------------
             }
             Event::ToggleSidebar => {
                 s.sidebar_collapsed = !s.sidebar_collapsed;

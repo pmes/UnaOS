@@ -14,29 +14,36 @@ use bandy::WeightedSkeleton;
 /// 2. The Write-Ahead Log (Secondary Weight)
 /// 3. Git Activity (Tertiary Weight)
 pub struct GravityWell {
-    /// The file currently open in the IDE/Editor.
     pub focused_file: Option<PathBuf>,
-    /// Files currently being mutated in the UnaFS Write-Ahead Log.
-    /// Key: File Path, Value: Intensity (0.0 - 1.0).
     pub wal_activity: HashMap<PathBuf, f32>,
-    /// Files with recent changes in the Git Index.
-    /// Key: File Path, Value: Intensity (0.0 - 1.0).
     pub git_activity: HashMap<PathBuf, f32>,
+    pub prompt_keywords: Vec<String>, // <-- NEW
 }
 
 impl GravityWell {
-    /// Initialize a new, empty Gravity Well.
     pub fn new() -> Self {
         Self {
             focused_file: None,
             wal_activity: HashMap::new(),
             git_activity: HashMap::new(),
+            prompt_keywords: Vec::new(),
         }
     }
 
-    /// Update the primary focus point.
     pub fn set_focus(&mut self, path: PathBuf) {
         self.focused_file = Some(path);
+    }
+
+    // --- NEW: EXTRACT SEMANTIC KEYWORDS FROM PROMPT ---
+    pub fn extract_keywords(&mut self, prompt: &str) {
+        let stop_words = ["this", "that", "with", "from", "your", "what", "when", "where", "have", "will", "just", "like", "need", "make", "sure", "code", "file"];
+        self.prompt_keywords = prompt
+            // Split by non-alphanumeric EXCEPT underscores (preserves snake_case like telemetry_tx)
+            .split(|c: char| !c.is_alphanumeric() && c != '_')
+            .filter(|w| w.len() > 3) // Ignore tiny words
+            .map(|w| w.to_lowercase())
+            .filter(|w| !stop_words.contains(&w.as_str()))
+            .collect();
     }
 
     /// Mark a file as active in the Write-Ahead Log.
@@ -58,44 +65,39 @@ impl GravityWell {
 
         for (path, content) in skeletons {
             let mut score = 0.0;
+            let path_str = path.to_string_lossy().to_lowercase();
 
-            // 1. Primary Weight (1.0): The Focused File
-            // If this file is what the user is looking at, it is paramount.
+            // 1. Primary Weight
             if let Some(focus) = &self.focused_file {
-                if path == focus {
-                    score += 1.0;
+                if path == focus { score += 1.0; }
+            }
+
+            // 2. Secondary Weights
+            if let Some(val) = self.wal_activity.get(path) { score += 0.8 * val; }
+            if let Some(val) = self.git_activity.get(path) { score += 0.5 * val; }
+
+            // 3. NEW: Semantic Prompt Weight
+            if !self.prompt_keywords.is_empty() {
+                let content_lower = content.to_lowercase();
+                for kw in &self.prompt_keywords {
+                    if path_str.contains(kw) {
+                        score += 0.6; // High gravity if the filename matches
+                    } else if content_lower.contains(kw) {
+                        score += 0.3; // Medium gravity if the code contains the keyword
+                    }
                 }
             }
 
-            // 2. Secondary Weight (0.8): WAL Activity
-            // If the user is typing in this file (even if not focused, e.g. multi-pane),
-            // it is highly relevant.
-            if let Some(val) = self.wal_activity.get(path) {
-                score += 0.8 * val;
-            }
-
-            // 3. Tertiary Weight (0.5): Git Activity
-            // If the file changed recently, it's likely part of the current task.
-            if let Some(val) = self.git_activity.get(path) {
-                score += 0.5 * val;
-            }
-
-            // We only care about things with SOME gravity.
-            // A score of 0.0 means it's just background noise.
             if score > 0.0 {
                 results.push(WeightedSkeleton {
                     path: path.clone(),
                     score,
-                    content: content.clone(), // Zero-copy clone of the Arc
+                    content: content.clone(),
                 });
             }
         }
 
-        // Sort by score descending (Highest Gravity first).
         results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
-
-        // The Can-Am Rule: Do not overwhelm the driver.
-        // We only return the Top 5 most relevant items.
         results.into_iter().take(5).collect()
     }
 }
