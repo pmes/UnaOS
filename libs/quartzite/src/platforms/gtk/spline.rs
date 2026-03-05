@@ -550,6 +550,7 @@ fn build_gnome_ui(
         bubble.set_focusable(true);
 
         let click_grab = GestureClick::new();
+        click_grab.set_propagation_phase(PropagationPhase::Bubble);
         let bubble_clone_grab = bubble.clone();
         click_grab.connect_pressed(move |_, n_press, _, _| {
             if n_press == 1 {
@@ -618,30 +619,30 @@ fn build_gnome_ui(
         staging_box.set_width_request(800);
 
         let system_label = Label::builder().label("SYSTEM").xalign(0.0).css_classes(vec!["dim-label"]).build();
-        let system_view = SourceView::builder().wrap_mode(gtk4::WrapMode::WordChar).editable(true).monospace(true).build();
+        let system_view = SourceView::builder().wrap_mode(gtk4::WrapMode::WordChar).editable(true).monospace(true).vexpand(true).build();
         system_view.add_css_class("view");
-        let sys_scroll = ScrolledWindow::builder().child(&system_view).propagate_natural_height(true).max_content_height(600).build();
+        let sys_scroll = ScrolledWindow::builder().child(&system_view).propagate_natural_height(true).min_content_height(150).max_content_height(600).build();
         staging_box.append(&system_label);
         staging_box.append(&sys_scroll);
 
         let directives_label = Label::builder().label("DIRECTIVES").xalign(0.0).css_classes(vec!["dim-label"]).build();
-        let directives_view = SourceView::builder().wrap_mode(gtk4::WrapMode::WordChar).editable(true).monospace(true).build();
+        let directives_view = SourceView::builder().wrap_mode(gtk4::WrapMode::WordChar).editable(true).monospace(true).vexpand(true).build();
         directives_view.add_css_class("view");
-        let dir_scroll = ScrolledWindow::builder().child(&directives_view).propagate_natural_height(true).max_content_height(600).build();
+        let dir_scroll = ScrolledWindow::builder().child(&directives_view).propagate_natural_height(true).min_content_height(150).max_content_height(600).build();
         staging_box.append(&directives_label);
         staging_box.append(&dir_scroll);
 
         let engrams_label = Label::builder().label("ENGRAMS").xalign(0.0).css_classes(vec!["dim-label"]).build();
-        let engrams_view = SourceView::builder().wrap_mode(gtk4::WrapMode::WordChar).editable(true).monospace(true).build();
+        let engrams_view = SourceView::builder().wrap_mode(gtk4::WrapMode::WordChar).editable(true).monospace(true).vexpand(true).build();
         engrams_view.add_css_class("view");
-        let eng_scroll = ScrolledWindow::builder().child(&engrams_view).propagate_natural_height(true).max_content_height(600).build();
+        let eng_scroll = ScrolledWindow::builder().child(&engrams_view).propagate_natural_height(true).min_content_height(150).max_content_height(600).build();
         staging_box.append(&engrams_label);
         staging_box.append(&eng_scroll);
 
         let prompt_label = Label::builder().label("PROMPT").xalign(0.0).css_classes(vec!["dim-label"]).build();
-        let prompt_view = SourceView::builder().wrap_mode(gtk4::WrapMode::WordChar).editable(true).monospace(true).build();
+        let prompt_view = SourceView::builder().wrap_mode(gtk4::WrapMode::WordChar).editable(true).monospace(true).vexpand(true).build();
         prompt_view.add_css_class("view");
-        let prm_scroll = ScrolledWindow::builder().child(&prompt_view).propagate_natural_height(true).max_content_height(600).build();
+        let prm_scroll = ScrolledWindow::builder().child(&prompt_view).propagate_natural_height(true).min_content_height(150).max_content_height(600).build();
         staging_box.append(&prompt_label);
         staging_box.append(&prm_scroll);
 
@@ -1632,6 +1633,12 @@ fn build_gnome_ui(
         nexus_list.select_row(Some(&row));
     }
 
+    // INITIAL LOAD HISTORY DISPATCH
+    let tx_initial_load = tx_event.clone();
+    glib::MainContext::default().spawn_local(async move {
+        let _ = tx_initial_load.send(Event::LoadHistory).await;
+    });
+
     crate::platforms::gnome::mega_bar::MegaBar::build(
         window.upcast_ref::<gtk4::ApplicationWindow>(),
         "",
@@ -2080,6 +2087,7 @@ fn build_gtk_ui(
         bubble.set_focusable(true);
 
         let click_grab = GestureClick::new();
+        click_grab.set_propagation_phase(PropagationPhase::Bubble);
         let bubble_clone_grab = bubble.clone();
         click_grab.connect_pressed(move |_, n_press, _, _| {
             if n_press == 1 {
@@ -2147,30 +2155,30 @@ fn build_gtk_ui(
         staging_box.set_width_request(800);
 
         let system_label = Label::builder().label("SYSTEM").xalign(0.0).css_classes(vec!["dim-label"]).build();
-        let system_view = SourceView::builder().wrap_mode(gtk4::WrapMode::WordChar).editable(true).monospace(true).build();
+        let system_view = SourceView::builder().wrap_mode(gtk4::WrapMode::WordChar).editable(true).monospace(true).vexpand(true).build();
         system_view.add_css_class("view");
-        let sys_scroll = ScrolledWindow::builder().child(&system_view).propagate_natural_height(true).max_content_height(600).build();
+        let sys_scroll = ScrolledWindow::builder().child(&system_view).propagate_natural_height(true).min_content_height(150).max_content_height(600).build();
         staging_box.append(&system_label);
         staging_box.append(&sys_scroll);
 
         let directives_label = Label::builder().label("DIRECTIVES").xalign(0.0).css_classes(vec!["dim-label"]).build();
-        let directives_view = SourceView::builder().wrap_mode(gtk4::WrapMode::WordChar).editable(true).monospace(true).build();
+        let directives_view = SourceView::builder().wrap_mode(gtk4::WrapMode::WordChar).editable(true).monospace(true).vexpand(true).build();
         directives_view.add_css_class("view");
-        let dir_scroll = ScrolledWindow::builder().child(&directives_view).propagate_natural_height(true).max_content_height(600).build();
+        let dir_scroll = ScrolledWindow::builder().child(&directives_view).propagate_natural_height(true).min_content_height(150).max_content_height(600).build();
         staging_box.append(&directives_label);
         staging_box.append(&dir_scroll);
 
         let engrams_label = Label::builder().label("ENGRAMS").xalign(0.0).css_classes(vec!["dim-label"]).build();
-        let engrams_view = SourceView::builder().wrap_mode(gtk4::WrapMode::WordChar).editable(true).monospace(true).build();
+        let engrams_view = SourceView::builder().wrap_mode(gtk4::WrapMode::WordChar).editable(true).monospace(true).vexpand(true).build();
         engrams_view.add_css_class("view");
-        let eng_scroll = ScrolledWindow::builder().child(&engrams_view).propagate_natural_height(true).max_content_height(600).build();
+        let eng_scroll = ScrolledWindow::builder().child(&engrams_view).propagate_natural_height(true).min_content_height(150).max_content_height(600).build();
         staging_box.append(&engrams_label);
         staging_box.append(&eng_scroll);
 
         let prompt_label = Label::builder().label("PROMPT").xalign(0.0).css_classes(vec!["dim-label"]).build();
-        let prompt_view = SourceView::builder().wrap_mode(gtk4::WrapMode::WordChar).editable(true).monospace(true).build();
+        let prompt_view = SourceView::builder().wrap_mode(gtk4::WrapMode::WordChar).editable(true).monospace(true).vexpand(true).build();
         prompt_view.add_css_class("view");
-        let prm_scroll = ScrolledWindow::builder().child(&prompt_view).propagate_natural_height(true).max_content_height(600).build();
+        let prm_scroll = ScrolledWindow::builder().child(&prompt_view).propagate_natural_height(true).min_content_height(150).max_content_height(600).build();
         staging_box.append(&prompt_label);
         staging_box.append(&prm_scroll);
 
@@ -3167,6 +3175,12 @@ fn build_gtk_ui(
     if let Some(row) = nexus_list.row_at_index(1) {
         nexus_list.select_row(Some(&row));
     }
+
+    // INITIAL LOAD HISTORY DISPATCH
+    let tx_initial_load = tx_event.clone();
+    glib::MainContext::default().spawn_local(async move {
+        let _ = tx_initial_load.send(Event::LoadHistory).await;
+    });
 
     let left_switcher = StackSwitcher::new();
     left_switcher.set_stack(Some(&left_stack));
