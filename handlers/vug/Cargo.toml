@@ -2,6 +2,7 @@
 name = "vug"
 version = "0.1.0"
 edition = "2024"
+license = "LGPL-3.0-or-later"
 
 [dependencies]
 gtk4 = { version = "0.10.3", features = ["v4_12"] }

@@ -2,6 +2,7 @@
 name = "lux"
 version = "0.1.0"
 edition = "2024"
+license = "LGPL-3.0-or-later"
 
 [dependencies]
 memmap2 = "0.9.10"
