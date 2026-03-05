@@ -288,6 +288,30 @@ impl VeinHandler {
                         let _ = gui_tx_brain.send(GuiUpdate::ActiveDirective(directive)).await;
 
                         while let Some(user_input_text) = rx_from_ui.recv().await {
+                            // === ROUTE: History Load ===
+                            if user_input_text == "LOAD_HISTORY" {
+                                let disk_hist = disk.clone();
+                                let tx_gui_hist = gui_tx_brain.clone();
+                                tokio::spawn(async move {
+                                    let result = tokio::task::spawn_blocking(move || {
+                                        disk_hist.lock().unwrap().load_all_memories()
+                                    }).await;
+                                    if let Ok(Ok(records)) = result {
+                                        let messages: Vec<gneiss_pal::HistoryItem> = records
+                                            .into_iter()
+                                            .map(|r| gneiss_pal::HistoryItem {
+                                                sender: r.sender,
+                                                content: r.content,
+                                                timestamp: r.timestamp,
+                                                is_chat: r.is_chat,
+                                            })
+                                            .collect();
+                                        let _ = tx_gui_hist.send(GuiUpdate::HistoryBatch(messages)).await;
+                                    }
+                                });
+                                continue;
+                            }
+
                             // === ROUTE: Directive Injection ===
                             if user_input_text.starts_with("SAVE_DIRECTIVE:") {
                                 let dir_text = user_input_text["SAVE_DIRECTIVE:".len()..].to_string();
@@ -785,7 +809,8 @@ impl AppHandler for VeinHandler {
                 let _ = self.tx.send(format!("DISPATCH_PAYLOAD:{}", json_payload));
             }
             Event::LoadHistory => {
-                self.append_to_console("\n[SYSTEM] :: Loading historical records...\n");
+                // To fetch history safely in a block. We send a command to the brain to do it asynchronously.
+                let _ = self.tx.send("LOAD_HISTORY".to_string());
             }
             _ => {}
         }
