@@ -32,6 +32,7 @@ use log::info;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::thread;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use tokio::runtime::Runtime;
 use tokio::sync::{broadcast, mpsc};
@@ -786,14 +787,17 @@ impl AppHandler for VeinHandler {
             }
             Event::LoadHistory => {
                 // Return a mock history array to the UI as requested
+                static HAS_LOADED_MOCK: AtomicBool = AtomicBool::new(false);
                 let mut mock_history = Vec::new();
-                for i in 0..10 {
-                    mock_history.push(gneiss_pal::HistoryItem {
-                        sender: "Una-Prime".to_string(),
-                        content: format!("Archived Log Entry #{}", 10 - i),
-                        timestamp: "00:00:00".to_string(),
-                        is_chat: true,
-                    });
+                if !HAS_LOADED_MOCK.swap(true, Ordering::SeqCst) {
+                    for i in 0..10 {
+                        mock_history.push(gneiss_pal::HistoryItem {
+                            sender: "Una-Prime".to_string(),
+                            content: format!("Archived Log Entry #{}", 10 - i),
+                            timestamp: "00:00:00".to_string(),
+                            is_chat: true,
+                        });
+                    }
                 }
                 let tx = self.gui_tx.clone();
                 tokio::spawn(async move {

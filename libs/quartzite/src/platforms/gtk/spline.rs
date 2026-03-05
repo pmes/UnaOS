@@ -488,11 +488,13 @@ fn build_gnome_ui(
     let was_at_top = Rc::new(RefCell::new(true));
     let last_upper = Rc::new(RefCell::new(0.0));
     let is_prepending = Rc::new(RefCell::new(false));
+    let is_fetching = Rc::new(RefCell::new(false));
 
     let tx_clone_hist = tx_event.clone();
     let was_at_bottom_val = was_at_bottom.clone();
     let was_at_top_val = was_at_top.clone();
     let is_prepending_val = is_prepending.clone();
+    let is_fetching_val = is_fetching.clone();
 
     adj.connect_value_notify(move |a| {
         let val = a.value();
@@ -507,11 +509,14 @@ fn build_gnome_ui(
         *was_at_top_val.borrow_mut() = is_at_top;
 
         if is_at_top && !previously_at_top && upper > page_size {
-            *is_prepending_val.borrow_mut() = true;
-            let tx_for_async = tx_clone_hist.clone();
-            glib::MainContext::default().spawn_local(async move {
-                let _ = tx_for_async.send(Event::LoadHistory).await;
-            });
+            if !*is_fetching_val.borrow() {
+                *is_fetching_val.borrow_mut() = true; // HARD LOCK ENGAGED
+                *is_prepending_val.borrow_mut() = true;
+                let tx_for_async = tx_clone_hist.clone();
+                glib::MainContext::default().spawn_local(async move {
+                    let _ = tx_for_async.send(Event::LoadHistory).await;
+                });
+            }
         }
     });
 
@@ -537,6 +542,7 @@ fn build_gnome_ui(
     });
 
     let is_prepending_async = is_prepending.clone();
+    let is_fetching_async = is_fetching.clone();
 
     // 4. THE WORKSPACE (Right Pane)
     let right_tab_view = adw::TabView::new();
@@ -1488,6 +1494,12 @@ fn build_gnome_ui(
                     console_store_async.append(&obj);
                 }
                 GuiUpdate::HistoryBatch(messages) => {
+                    if messages.is_empty() {
+                        *is_fetching_async.borrow_mut() = false;
+                        *is_prepending_async.borrow_mut() = false;
+                        continue;
+                    }
+
                     *is_prepending_async.borrow_mut() = true;
                     let mut new_objects = Vec::new();
                     for (i, msg) in messages.into_iter().enumerate() {
@@ -1497,6 +1509,13 @@ fn build_gnome_ui(
                     }
                     // Atomic insertion to trigger upper_notify exactly once
                     console_store_async.splice(0, 0, &new_objects);
+
+                    // UI UNLOCK TIMEOUT (Absorbs the GTK layout bounce)
+                    let fetch_lock = is_fetching_async.clone();
+                    glib::timeout_add_local(std::time::Duration::from_millis(500), move || {
+                        *fetch_lock.borrow_mut() = false;
+                        glib::ControlFlow::Break
+                    });
                 }
                 GuiUpdate::ClearConsole => {
                     console_store_async.remove_all();
@@ -2000,11 +2019,13 @@ fn build_gtk_ui(
     let was_at_top = Rc::new(RefCell::new(true));
     let last_upper = Rc::new(RefCell::new(0.0));
     let is_prepending = Rc::new(RefCell::new(false));
+    let is_fetching = Rc::new(RefCell::new(false));
 
     let tx_clone_hist = tx_event.clone();
     let was_at_bottom_val = was_at_bottom.clone();
     let was_at_top_val = was_at_top.clone();
     let is_prepending_val = is_prepending.clone();
+    let is_fetching_val = is_fetching.clone();
 
     adj.connect_value_notify(move |a| {
         let val = a.value();
@@ -2019,11 +2040,14 @@ fn build_gtk_ui(
         *was_at_top_val.borrow_mut() = is_at_top;
 
         if is_at_top && !previously_at_top && upper > page_size {
-            *is_prepending_val.borrow_mut() = true;
-            let tx_for_async = tx_clone_hist.clone();
-            glib::MainContext::default().spawn_local(async move {
-                let _ = tx_for_async.send(Event::LoadHistory).await;
-            });
+            if !*is_fetching_val.borrow() {
+                *is_fetching_val.borrow_mut() = true; // HARD LOCK ENGAGED
+                *is_prepending_val.borrow_mut() = true;
+                let tx_for_async = tx_clone_hist.clone();
+                glib::MainContext::default().spawn_local(async move {
+                    let _ = tx_for_async.send(Event::LoadHistory).await;
+                });
+            }
         }
     });
 
@@ -2049,6 +2073,7 @@ fn build_gtk_ui(
     });
 
     let is_prepending_async = is_prepending.clone();
+    let is_fetching_async = is_fetching.clone();
 
     // 4. THE WORKSPACE (Right Pane)
 
@@ -2998,6 +3023,12 @@ fn build_gtk_ui(
                     console_store_async.append(&obj);
                 }
                 GuiUpdate::HistoryBatch(messages) => {
+                    if messages.is_empty() {
+                        *is_fetching_async.borrow_mut() = false;
+                        *is_prepending_async.borrow_mut() = false;
+                        continue;
+                    }
+
                     *is_prepending_async.borrow_mut() = true;
                     let mut new_objects = Vec::new();
                     for (i, msg) in messages.into_iter().enumerate() {
@@ -3007,6 +3038,13 @@ fn build_gtk_ui(
                     }
                     // Atomic insertion to trigger upper_notify exactly once
                     console_store_async.splice(0, 0, &new_objects);
+
+                    // UI UNLOCK TIMEOUT (Absorbs the GTK layout bounce)
+                    let fetch_lock = is_fetching_async.clone();
+                    glib::timeout_add_local(std::time::Duration::from_millis(500), move || {
+                        *fetch_lock.borrow_mut() = false;
+                        glib::ControlFlow::Break
+                    });
                 }
                 GuiUpdate::ClearConsole => {
                     console_store_async.remove_all();
