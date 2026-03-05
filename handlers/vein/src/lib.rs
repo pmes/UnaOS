@@ -247,6 +247,30 @@ impl VeinHandler {
                         let _ = gui_tx_brain.send(GuiUpdate::ActiveDirective(directive)).await;
 
                         while let Some(user_input_text) = rx_from_ui.recv().await {
+                            // === ROUTE: Directive Injection ===
+                            if user_input_text.starts_with("SAVE_DIRECTIVE:") {
+                                let dir_text = user_input_text["SAVE_DIRECTIVE:".len()..].to_string();
+                                let timestamp = chrono::Local::now().format("%H:%M:%S").to_string();
+                                let disk_clone = disk.clone();
+
+                                match client.embed_content(&dir_text).await {
+                                    Ok(embedding) => {
+                                        tokio::spawn(async move {
+                                            let _ = tokio::task::spawn_blocking(move || {
+                                                let mut d = disk_clone.lock().unwrap();
+                                                if let Err(e) = d.save_memory("system", &dir_text, &timestamp, embedding, "directive") {
+                                                    eprintln!(":: PLEXUS :: Failed to save directive: {}", e);
+                                                }
+                                            }).await;
+                                        });
+                                    }
+                                    Err(e) => {
+                                        eprintln!(":: PLEXUS :: Failed to embed directive: {}", e);
+                                    }
+                                }
+                                continue;
+                            }
+
                             // === ROUTE A: Execution of an Approved Interceptor Payload ===
                             if user_input_text.starts_with("DISPATCH_PAYLOAD:") {
                                 let payload_str = &user_input_text["DISPATCH_PAYLOAD:".len()..];
@@ -605,6 +629,9 @@ impl AppHandler for VeinHandler {
                 } else if let Some(path_str) = text.trim().strip_prefix("/upload ") {
                     let path = PathBuf::from(path_str.trim());
                     trigger_upload(path, self.gui_tx.clone());
+                } else if let Some(dir_text) = text.trim().strip_prefix("/directive ") {
+                    self.append_to_console("\n[SYSTEM] :: Burning Active Directive to Vault...\n");
+                    let _ = self.tx.send(format!("SAVE_DIRECTIVE:{}", dir_text));
                 } else {
                     if let Err(e) = self.tx.send(text) {
                         self.append_to_console(&format!(
