@@ -429,7 +429,6 @@ fn build_gnome_ui(
     telehud_box.append(
         &Label::builder()
             .label("CONTEXT VECTOR")
-            .css_classes(vec!["nexus-header"])
             .xalign(0.0)
             .margin_top(20)
             .build(),
@@ -496,6 +495,29 @@ fn build_gnome_ui(
         }
     });
 
+    // Historical Pagination - Load History
+    let tx_clone_hist = tx_event.clone();
+    let adj_hist = scrolled_window.vadjustment();
+
+    let last_load_time = Rc::new(RefCell::new(std::time::Instant::now()));
+
+    adj_hist.connect_value_notify(move |adj| {
+        let value = adj.value();
+        let lower = adj.lower();
+
+        // Debounce: Allow triggering history load once every 1 second
+        if value <= lower + f64::EPSILON {
+            let now = std::time::Instant::now();
+            if now.duration_since(*last_load_time.borrow()).as_secs_f64() > 1.0 {
+                *last_load_time.borrow_mut() = now;
+                let tx = tx_clone_hist.clone();
+                glib::MainContext::default().spawn_local(async move {
+                    let _ = tx.send(Event::LoadHistory).await;
+                });
+            }
+        }
+    });
+
     // 4. THE WORKSPACE (Right Pane)
     let right_tab_view = adw::TabView::new();
     let right_tab_bar = adw::TabBar::new();
@@ -524,11 +546,50 @@ fn build_gnome_ui(
         root.append(&left_spacer);
         let bubble = Box::new(Orientation::Vertical, 4);
         bubble.add_css_class("bubble-box");
+        bubble.set_focusable(true);
+
+        let click_grab = GestureClick::new();
+        // CHANGED: Target phase prevents the bubble from stealing focus from text inputs
+        click_grab.set_propagation_phase(PropagationPhase::Target);
+        let bubble_clone_grab = bubble.clone();
+        click_grab.connect_pressed(move |_, n_press, _, _| {
+            if n_press == 1 {
+                bubble_clone_grab.grab_focus();
+            }
+        });
+        bubble.add_controller(click_grab);
+
+        let header_box = Box::new(Orientation::Horizontal, 8);
 
         let meta_label = Label::new(None);
         meta_label.set_xalign(0.0);
         meta_label.add_css_class("dim-label");
-        bubble.append(&meta_label);
+
+        let left_expand_btn = Button::builder()
+            .icon_name("pan-down-symbolic")
+            .css_classes(vec!["flat", "circular"])
+            .tooltip_text("Expand / Collapse")
+            .build();
+        left_expand_btn.set_visible(false);
+
+        let right_expand_btn = Button::builder()
+            .icon_name("pan-down-symbolic")
+            .css_classes(vec!["flat", "circular"])
+            .tooltip_text("Expand / Collapse")
+            .build();
+        right_expand_btn.set_visible(false);
+
+        let header_spacer = Box::new(Orientation::Horizontal, 0);
+        header_spacer.set_hexpand(true);
+
+        // Fixed layout: [Left Button] [Label] [Spacer] [Right Button]
+        // Visibility is toggled in connect_bind based on sender role.
+        header_box.append(&left_expand_btn);
+        header_box.append(&meta_label);
+        header_box.append(&header_spacer);
+        header_box.append(&right_expand_btn);
+
+        bubble.append(&header_box);
 
         // --- Standard Mode (Message View) ---
         let chat_content_buffer = sourceview5::Buffer::new(None);
@@ -539,7 +600,7 @@ fn build_gnome_ui(
         chat_content_view.set_monospace(true);
         chat_content_view.set_width_request(800);
         chat_content_view.set_hexpand(true);
-        chat_content_view.set_focusable(true);
+        chat_content_view.set_focusable(false);
         chat_content_view.add_css_class("view");
         bubble.append(&chat_content_view);
 
@@ -553,6 +614,7 @@ fn build_gnome_ui(
         payload_content_view.set_wrap_mode(gtk4::WrapMode::WordChar);
         payload_content_view.set_show_line_numbers(true);
         payload_content_view.set_monospace(true);
+        payload_content_view.set_focusable(false);
         payload_content_view.add_css_class("view");
         let payload_scroll = ScrolledWindow::builder()
             .child(&payload_content_view)
@@ -568,30 +630,31 @@ fn build_gnome_ui(
         staging_box.set_width_request(800);
 
         let system_label = Label::builder().label("SYSTEM").xalign(0.0).css_classes(vec!["dim-label"]).build();
+        // CHANGED: Removed vexpand(true) to allow propagate_natural_height to function
         let system_view = SourceView::builder().wrap_mode(gtk4::WrapMode::WordChar).editable(true).monospace(true).build();
         system_view.add_css_class("view");
-        let sys_scroll = ScrolledWindow::builder().child(&system_view).min_content_height(100).build();
+        let sys_scroll = ScrolledWindow::builder().child(&system_view).propagate_natural_height(true).min_content_height(150).max_content_height(600).build();
         staging_box.append(&system_label);
         staging_box.append(&sys_scroll);
 
         let directives_label = Label::builder().label("DIRECTIVES").xalign(0.0).css_classes(vec!["dim-label"]).build();
         let directives_view = SourceView::builder().wrap_mode(gtk4::WrapMode::WordChar).editable(true).monospace(true).build();
         directives_view.add_css_class("view");
-        let dir_scroll = ScrolledWindow::builder().child(&directives_view).min_content_height(100).build();
+        let dir_scroll = ScrolledWindow::builder().child(&directives_view).propagate_natural_height(true).min_content_height(150).max_content_height(600).build();
         staging_box.append(&directives_label);
         staging_box.append(&dir_scroll);
 
         let engrams_label = Label::builder().label("ENGRAMS").xalign(0.0).css_classes(vec!["dim-label"]).build();
         let engrams_view = SourceView::builder().wrap_mode(gtk4::WrapMode::WordChar).editable(true).monospace(true).build();
         engrams_view.add_css_class("view");
-        let eng_scroll = ScrolledWindow::builder().child(&engrams_view).min_content_height(100).build();
+        let eng_scroll = ScrolledWindow::builder().child(&engrams_view).propagate_natural_height(true).min_content_height(150).max_content_height(600).build();
         staging_box.append(&engrams_label);
         staging_box.append(&eng_scroll);
 
         let prompt_label = Label::builder().label("PROMPT").xalign(0.0).css_classes(vec!["dim-label"]).build();
         let prompt_view = SourceView::builder().wrap_mode(gtk4::WrapMode::WordChar).editable(true).monospace(true).build();
         prompt_view.add_css_class("view");
-        let prm_scroll = ScrolledWindow::builder().child(&prompt_view).min_content_height(100).build();
+        let prm_scroll = ScrolledWindow::builder().child(&prompt_view).propagate_natural_height(true).min_content_height(150).max_content_height(600).build();
         staging_box.append(&prompt_label);
         staging_box.append(&prm_scroll);
 
@@ -631,11 +694,9 @@ fn build_gnome_ui(
         right_spacer.set_hexpand(true);
         root.append(&right_spacer);
 
-        let gesture = GestureClick::new();
-        let item_clone = item.clone();
-        let chat_content_view_clone = chat_content_view.clone();
-        gesture.connect_pressed(move |_, n_press, _, _| {
-            if n_press == 1 {
+        let connect_expand = |btn: &Button, item_clone: ListItem, chat_view_clone: SourceView| {
+            let btn_clone = btn.clone();
+            btn.connect_clicked(move |_| {
                 if let Some(obj) = item_clone
                     .item()
                     .and_downcast::<crate::widgets::model::DispatchObject>()
@@ -644,18 +705,22 @@ fn build_gnome_ui(
                     obj.set_is_expanded(expanded);
                     let content = obj.content();
                     let line_count = content.lines().count();
+
                     if line_count > 11 && !expanded {
                         let truncated: String =
-                            content.lines().take(11).collect::<Vec<&str>>().join("\n")
-                                + "\n\n... [Click to expand]";
-                        chat_content_view_clone.buffer().set_text(&truncated);
+                            content.lines().take(11).collect::<Vec<&str>>().join("\n");
+                        chat_view_clone.buffer().set_text(&truncated);
+                        btn_clone.set_icon_name("pan-down-symbolic");
                     } else {
-                        chat_content_view_clone.buffer().set_text(&content);
+                        chat_view_clone.buffer().set_text(&content);
+                        btn_clone.set_icon_name("pan-up-symbolic");
                     }
                 }
-            }
-        });
-        bubble.add_controller(gesture);
+            });
+        };
+
+        connect_expand(&left_expand_btn, item.clone(), chat_content_view.clone());
+        connect_expand(&right_expand_btn, item.clone(), chat_content_view.clone());
         item.set_child(Some(&root));
     });
 
@@ -665,34 +730,39 @@ fn build_gnome_ui(
         let item = item.downcast_ref::<ListItem>().unwrap();
         let root = item.child().unwrap().downcast::<Box>().unwrap();
 
-        let left_spacer = root.first_child().unwrap().downcast::<Box>().unwrap();
-        let bubble = left_spacer.next_sibling().unwrap().downcast::<Box>().unwrap();
-        let right_spacer = bubble.next_sibling().unwrap().downcast::<Box>().unwrap();
+        let Some(left_spacer) = root.first_child().and_then(|c| c.downcast::<Box>().ok()) else { return; };
+        let Some(bubble) = left_spacer.next_sibling().and_then(|c| c.downcast::<Box>().ok()) else { return; };
+        let Some(right_spacer) = bubble.next_sibling().and_then(|c| c.downcast::<Box>().ok()) else { return; };
 
-        let obj = item.item().unwrap().downcast::<DispatchObject>().unwrap();
+        let Some(obj) = item.item().and_downcast::<DispatchObject>() else { return; };
 
-        let meta_label = bubble.first_child().unwrap().downcast::<Label>().unwrap();
-        let chat_view = meta_label.next_sibling().unwrap().downcast::<SourceView>().unwrap();
-        let expander = chat_view.next_sibling().unwrap().downcast::<Expander>().unwrap();
-        let staging_box = expander.next_sibling().unwrap().downcast::<Box>().unwrap();
-        let pulse_box = staging_box.next_sibling().unwrap().downcast::<Box>().unwrap();
+        let Some(header_box) = bubble.first_child().and_then(|c| c.downcast::<Box>().ok()) else { return; };
+
+        let Some(left_expand_btn) = header_box.first_child().and_then(|c| c.downcast::<Button>().ok()) else { return; };
+        let Some(meta_label) = left_expand_btn.next_sibling().and_then(|c| c.downcast::<Label>().ok()) else { return; };
+        let Some(right_expand_btn) = header_box.last_child().and_then(|c| c.downcast::<Button>().ok()) else { return; };
+
+        let Some(chat_view) = header_box.next_sibling().and_then(|c| c.downcast::<SourceView>().ok()) else { return; };
+        let Some(expander) = chat_view.next_sibling().and_then(|c| c.downcast::<Expander>().ok()) else { return; };
+        let Some(staging_box) = expander.next_sibling().and_then(|c| c.downcast::<Box>().ok()) else { return; };
+        let Some(pulse_box) = staging_box.next_sibling().and_then(|c| c.downcast::<Box>().ok()) else { return; };
 
         // Extract children for Staging mode
-        let sys_scroll = staging_box.first_child().unwrap().next_sibling().unwrap().downcast::<ScrolledWindow>().unwrap();
-        let system_view = sys_scroll.child().unwrap().downcast::<SourceView>().unwrap();
+        let Some(sys_scroll) = staging_box.first_child().and_then(|c| c.next_sibling()).and_then(|c| c.downcast::<ScrolledWindow>().ok()) else { return; };
+        let Some(system_view) = sys_scroll.child().and_downcast::<SourceView>() else { return; };
 
-        let dir_scroll = sys_scroll.next_sibling().unwrap().next_sibling().unwrap().downcast::<ScrolledWindow>().unwrap();
-        let directives_view = dir_scroll.child().unwrap().downcast::<SourceView>().unwrap();
+        let Some(dir_scroll) = sys_scroll.next_sibling().and_then(|c| c.next_sibling()).and_then(|c| c.downcast::<ScrolledWindow>().ok()) else { return; };
+        let Some(directives_view) = dir_scroll.child().and_downcast::<SourceView>() else { return; };
 
-        let eng_scroll = dir_scroll.next_sibling().unwrap().next_sibling().unwrap().downcast::<ScrolledWindow>().unwrap();
-        let engrams_view = eng_scroll.child().unwrap().downcast::<SourceView>().unwrap();
+        let Some(eng_scroll) = dir_scroll.next_sibling().and_then(|c| c.next_sibling()).and_then(|c| c.downcast::<ScrolledWindow>().ok()) else { return; };
+        let Some(engrams_view) = eng_scroll.child().and_downcast::<SourceView>() else { return; };
 
-        let prm_scroll = eng_scroll.next_sibling().unwrap().next_sibling().unwrap().downcast::<ScrolledWindow>().unwrap();
-        let prompt_view = prm_scroll.child().unwrap().downcast::<SourceView>().unwrap();
+        let Some(prm_scroll) = eng_scroll.next_sibling().and_then(|c| c.next_sibling()).and_then(|c| c.downcast::<ScrolledWindow>().ok()) else { return; };
+        let Some(prompt_view) = prm_scroll.child().and_downcast::<SourceView>() else { return; };
 
-        let actions_box = prm_scroll.next_sibling().unwrap().downcast::<Box>().unwrap();
-        let cancel_btn = actions_box.first_child().unwrap().downcast::<Button>().unwrap();
-        let dispatch_btn = cancel_btn.next_sibling().unwrap().downcast::<Button>().unwrap();
+        let Some(actions_box) = prm_scroll.next_sibling().and_then(|c| c.downcast::<Box>().ok()) else { return; };
+        let Some(cancel_btn) = actions_box.first_child().and_then(|c| c.downcast::<Button>().ok()) else { return; };
+        let Some(dispatch_btn) = cancel_btn.next_sibling().and_then(|c| c.downcast::<Button>().ok()) else { return; };
 
         let message_type = obj.message_type();
 
@@ -705,6 +775,8 @@ fn build_gnome_ui(
         expander.set_visible(false);
         staging_box.set_visible(false);
         pulse_box.set_visible(false);
+        left_expand_btn.set_visible(false);
+        right_expand_btn.set_visible(false);
 
         if message_type == 1 {
             // STAGING MODE
@@ -903,7 +975,10 @@ fn build_gnome_ui(
                 meta_label.remove_css_class("role-architect");
                 meta_label.remove_css_class("role-una");
                 meta_label.remove_css_class("role-system");
-                if sender == "Architect" {
+
+                let is_architect = sender == "Architect";
+
+                if is_architect {
                     meta_label.add_css_class("role-architect");
                     bubble.add_css_class("architect-bubble");
                     left_spacer.set_visible(true);
@@ -920,14 +995,26 @@ fn build_gnome_ui(
                     right_spacer.set_visible(true);
                     meta_label.set_xalign(0.0);
                 }
+
                 let is_expanded = obj.is_expanded();
                 let line_count = content.lines().count();
-                if line_count > 11 && !is_expanded {
-                    let truncated: String = content.lines().take(11).collect::<Vec<&str>>().join("\n")
-                        + "\n\n... [Click to expand]";
+                let collapsible = line_count > 11;
+
+                if is_architect && collapsible {
+                    left_expand_btn.set_visible(true);
+                } else if collapsible {
+                    right_expand_btn.set_visible(true);
+                }
+
+                if collapsible && !is_expanded {
+                    let truncated: String = content.lines().take(11).collect::<Vec<&str>>().join("\n");
                     chat_view.buffer().set_text(&truncated);
+                    left_expand_btn.set_icon_name("pan-down-symbolic");
+                    right_expand_btn.set_icon_name("pan-down-symbolic");
                 } else {
                     chat_view.buffer().set_text(&content);
+                    left_expand_btn.set_icon_name("pan-up-symbolic");
+                    right_expand_btn.set_icon_name("pan-up-symbolic");
                 }
             } else {
                 expander.set_visible(true);
@@ -952,7 +1039,7 @@ fn build_gnome_ui(
 
     // Input Area
     let input_container = Box::new(Orientation::Horizontal, 8);
-    input_container.set_valign(Align::Fill);
+    input_container.set_valign(Align::End);
     input_container.set_margin_start(16);
     input_container.set_margin_end(16);
     input_container.set_margin_bottom(16);
@@ -1099,8 +1186,8 @@ fn build_gnome_ui(
     let input_scroll = ScrolledWindow::builder()
         .hscrollbar_policy(PolicyType::Never)
         .vscrollbar_policy(PolicyType::Automatic)
-        .height_request(80)
-        .valign(Align::Fill)
+        .propagate_natural_height(true)
+        .max_content_height(600)
         .has_frame(false)
         .build();
     input_scroll.set_hexpand(true);
@@ -1447,6 +1534,12 @@ fn build_gnome_ui(
         nexus_list.select_row(Some(&row));
     }
 
+    // INITIAL LOAD HISTORY DISPATCH
+    let tx_initial_load = tx_event.clone();
+    glib::MainContext::default().spawn_local(async move {
+        let _ = tx_initial_load.send(Event::LoadHistory).await;
+    });
+
     crate::platforms::gnome::mega_bar::MegaBar::build(
         window.upcast_ref::<gtk4::ApplicationWindow>(),
         "",
@@ -1784,7 +1877,6 @@ fn build_gtk_ui(
     telehud_box.append(
         &Label::builder()
             .label("CONTEXT VECTOR")
-            .css_classes(vec!["nexus-header"])
             .xalign(0.0)
             .margin_top(20)
             .build(),
@@ -1849,6 +1941,29 @@ fn build_gtk_ui(
         }
     });
 
+    // Historical Pagination - Load History
+    let tx_clone_hist = tx_event.clone();
+    let adj_hist = scrolled_window.vadjustment();
+
+    let last_load_time = Rc::new(RefCell::new(std::time::Instant::now()));
+
+    adj_hist.connect_value_notify(move |adj| {
+        let value = adj.value();
+        let lower = adj.lower();
+
+        // Debounce: Allow triggering history load once every 1 second
+        if value <= lower + f64::EPSILON {
+            let now = std::time::Instant::now();
+            if now.duration_since(*last_load_time.borrow()).as_secs_f64() > 1.0 {
+                *last_load_time.borrow_mut() = now;
+                let tx = tx_clone_hist.clone();
+                glib::MainContext::default().spawn_local(async move {
+                    let _ = tx.send(Event::LoadHistory).await;
+                });
+            }
+        }
+    });
+
     // 4. THE WORKSPACE (Right Pane)
 
     // Console ListView
@@ -1869,11 +1984,49 @@ fn build_gtk_ui(
         root.append(&left_spacer);
         let bubble = Box::new(Orientation::Vertical, 4);
         bubble.add_css_class("bubble-box");
+        bubble.set_focusable(true);
+
+        let click_grab = GestureClick::new();
+        // CHANGED: Target phase prevents the bubble from stealing focus from text inputs
+        click_grab.set_propagation_phase(PropagationPhase::Target);
+        let bubble_clone_grab = bubble.clone();
+        click_grab.connect_pressed(move |_, n_press, _, _| {
+            if n_press == 1 {
+                bubble_clone_grab.grab_focus();
+            }
+        });
+        bubble.add_controller(click_grab);
+
+        let header_box = Box::new(Orientation::Horizontal, 8);
 
         let meta_label = Label::new(None);
         meta_label.set_xalign(0.0);
         meta_label.add_css_class("dim-label");
-        bubble.append(&meta_label);
+
+        let left_expand_btn = Button::builder()
+            .icon_name("pan-down-symbolic")
+            .css_classes(vec!["flat", "circular"])
+            .tooltip_text("Expand / Collapse")
+            .build();
+        left_expand_btn.set_visible(false);
+
+        let right_expand_btn = Button::builder()
+            .icon_name("pan-down-symbolic")
+            .css_classes(vec!["flat", "circular"])
+            .tooltip_text("Expand / Collapse")
+            .build();
+        right_expand_btn.set_visible(false);
+
+        let header_spacer = Box::new(Orientation::Horizontal, 0);
+        header_spacer.set_hexpand(true);
+
+        // Fixed layout: [Left Button] [Label] [Spacer] [Right Button]
+        header_box.append(&left_expand_btn);
+        header_box.append(&meta_label);
+        header_box.append(&header_spacer);
+        header_box.append(&right_expand_btn);
+
+        bubble.append(&header_box);
 
         // --- Standard Mode (Message View) ---
         let chat_content_buffer = sourceview5::Buffer::new(None);
@@ -1884,7 +2037,7 @@ fn build_gtk_ui(
         chat_content_view.set_monospace(true);
         chat_content_view.set_width_request(800);
         chat_content_view.set_hexpand(true);
-        chat_content_view.set_focusable(true);
+        chat_content_view.set_focusable(false);
         chat_content_view.add_css_class("view");
         bubble.append(&chat_content_view);
 
@@ -1898,6 +2051,7 @@ fn build_gtk_ui(
         payload_content_view.set_wrap_mode(gtk4::WrapMode::WordChar);
         payload_content_view.set_show_line_numbers(true);
         payload_content_view.set_monospace(true);
+        payload_content_view.set_focusable(false);
         payload_content_view.add_css_class("view");
         let payload_scroll = ScrolledWindow::builder()
             .child(&payload_content_view)
@@ -1913,30 +2067,31 @@ fn build_gtk_ui(
         staging_box.set_width_request(800);
 
         let system_label = Label::builder().label("SYSTEM").xalign(0.0).css_classes(vec!["dim-label"]).build();
+        // CHANGED: Removed vexpand(true) to allow propagate_natural_height to function
         let system_view = SourceView::builder().wrap_mode(gtk4::WrapMode::WordChar).editable(true).monospace(true).build();
         system_view.add_css_class("view");
-        let sys_scroll = ScrolledWindow::builder().child(&system_view).min_content_height(100).build();
+        let sys_scroll = ScrolledWindow::builder().child(&system_view).propagate_natural_height(true).min_content_height(150).max_content_height(600).build();
         staging_box.append(&system_label);
         staging_box.append(&sys_scroll);
 
         let directives_label = Label::builder().label("DIRECTIVES").xalign(0.0).css_classes(vec!["dim-label"]).build();
         let directives_view = SourceView::builder().wrap_mode(gtk4::WrapMode::WordChar).editable(true).monospace(true).build();
         directives_view.add_css_class("view");
-        let dir_scroll = ScrolledWindow::builder().child(&directives_view).min_content_height(100).build();
+        let dir_scroll = ScrolledWindow::builder().child(&directives_view).propagate_natural_height(true).min_content_height(150).max_content_height(600).build();
         staging_box.append(&directives_label);
         staging_box.append(&dir_scroll);
 
         let engrams_label = Label::builder().label("ENGRAMS").xalign(0.0).css_classes(vec!["dim-label"]).build();
         let engrams_view = SourceView::builder().wrap_mode(gtk4::WrapMode::WordChar).editable(true).monospace(true).build();
         engrams_view.add_css_class("view");
-        let eng_scroll = ScrolledWindow::builder().child(&engrams_view).min_content_height(100).build();
+        let eng_scroll = ScrolledWindow::builder().child(&engrams_view).propagate_natural_height(true).min_content_height(150).max_content_height(600).build();
         staging_box.append(&engrams_label);
         staging_box.append(&eng_scroll);
 
         let prompt_label = Label::builder().label("PROMPT").xalign(0.0).css_classes(vec!["dim-label"]).build();
         let prompt_view = SourceView::builder().wrap_mode(gtk4::WrapMode::WordChar).editable(true).monospace(true).build();
         prompt_view.add_css_class("view");
-        let prm_scroll = ScrolledWindow::builder().child(&prompt_view).min_content_height(100).build();
+        let prm_scroll = ScrolledWindow::builder().child(&prompt_view).propagate_natural_height(true).min_content_height(150).max_content_height(600).build();
         staging_box.append(&prompt_label);
         staging_box.append(&prm_scroll);
 
@@ -1976,11 +2131,9 @@ fn build_gtk_ui(
         right_spacer.set_hexpand(true);
         root.append(&right_spacer);
 
-        let gesture = GestureClick::new();
-        let item_clone = item.clone();
-        let chat_content_view_clone = chat_content_view.clone();
-        gesture.connect_pressed(move |_, n_press, _, _| {
-            if n_press == 1 {
+        let connect_expand = |btn: &Button, item_clone: ListItem, chat_view_clone: SourceView| {
+            let btn_clone = btn.clone();
+            btn.connect_clicked(move |_| {
                 if let Some(obj) = item_clone
                     .item()
                     .and_downcast::<crate::widgets::model::DispatchObject>()
@@ -1989,18 +2142,22 @@ fn build_gtk_ui(
                     obj.set_is_expanded(expanded);
                     let content = obj.content();
                     let line_count = content.lines().count();
+
                     if line_count > 11 && !expanded {
                         let truncated: String =
-                            content.lines().take(11).collect::<Vec<&str>>().join("\n")
-                                + "\n\n... [Click to expand]";
-                        chat_content_view_clone.buffer().set_text(&truncated);
+                            content.lines().take(11).collect::<Vec<&str>>().join("\n");
+                        chat_view_clone.buffer().set_text(&truncated);
+                        btn_clone.set_icon_name("pan-down-symbolic");
                     } else {
-                        chat_content_view_clone.buffer().set_text(&content);
+                        chat_view_clone.buffer().set_text(&content);
+                        btn_clone.set_icon_name("pan-up-symbolic");
                     }
                 }
-            }
-        });
-        bubble.add_controller(gesture);
+            });
+        };
+
+        connect_expand(&left_expand_btn, item.clone(), chat_content_view.clone());
+        connect_expand(&right_expand_btn, item.clone(), chat_content_view.clone());
         item.set_child(Some(&root));
     });
 
@@ -2010,34 +2167,39 @@ fn build_gtk_ui(
         let item = item.downcast_ref::<ListItem>().unwrap();
         let root = item.child().unwrap().downcast::<Box>().unwrap();
 
-        let left_spacer = root.first_child().unwrap().downcast::<Box>().unwrap();
-        let bubble = left_spacer.next_sibling().unwrap().downcast::<Box>().unwrap();
-        let right_spacer = bubble.next_sibling().unwrap().downcast::<Box>().unwrap();
+        let Some(left_spacer) = root.first_child().and_then(|c| c.downcast::<Box>().ok()) else { return; };
+        let Some(bubble) = left_spacer.next_sibling().and_then(|c| c.downcast::<Box>().ok()) else { return; };
+        let Some(right_spacer) = bubble.next_sibling().and_then(|c| c.downcast::<Box>().ok()) else { return; };
 
-        let obj = item.item().unwrap().downcast::<DispatchObject>().unwrap();
+        let Some(obj) = item.item().and_downcast::<DispatchObject>() else { return; };
 
-        let meta_label = bubble.first_child().unwrap().downcast::<Label>().unwrap();
-        let chat_view = meta_label.next_sibling().unwrap().downcast::<SourceView>().unwrap();
-        let expander = chat_view.next_sibling().unwrap().downcast::<Expander>().unwrap();
-        let staging_box = expander.next_sibling().unwrap().downcast::<Box>().unwrap();
-        let pulse_box = staging_box.next_sibling().unwrap().downcast::<Box>().unwrap();
+        let Some(header_box) = bubble.first_child().and_then(|c| c.downcast::<Box>().ok()) else { return; };
+
+        let Some(left_expand_btn) = header_box.first_child().and_then(|c| c.downcast::<Button>().ok()) else { return; };
+        let Some(meta_label) = left_expand_btn.next_sibling().and_then(|c| c.downcast::<Label>().ok()) else { return; };
+        let Some(right_expand_btn) = header_box.last_child().and_then(|c| c.downcast::<Button>().ok()) else { return; };
+
+        let Some(chat_view) = header_box.next_sibling().and_then(|c| c.downcast::<SourceView>().ok()) else { return; };
+        let Some(expander) = chat_view.next_sibling().and_then(|c| c.downcast::<Expander>().ok()) else { return; };
+        let Some(staging_box) = expander.next_sibling().and_then(|c| c.downcast::<Box>().ok()) else { return; };
+        let Some(pulse_box) = staging_box.next_sibling().and_then(|c| c.downcast::<Box>().ok()) else { return; };
 
         // Extract children for Staging mode
-        let sys_scroll = staging_box.first_child().unwrap().next_sibling().unwrap().downcast::<ScrolledWindow>().unwrap();
-        let system_view = sys_scroll.child().unwrap().downcast::<SourceView>().unwrap();
+        let Some(sys_scroll) = staging_box.first_child().and_then(|c| c.next_sibling()).and_then(|c| c.downcast::<ScrolledWindow>().ok()) else { return; };
+        let Some(system_view) = sys_scroll.child().and_downcast::<SourceView>() else { return; };
 
-        let dir_scroll = sys_scroll.next_sibling().unwrap().next_sibling().unwrap().downcast::<ScrolledWindow>().unwrap();
-        let directives_view = dir_scroll.child().unwrap().downcast::<SourceView>().unwrap();
+        let Some(dir_scroll) = sys_scroll.next_sibling().and_then(|c| c.next_sibling()).and_then(|c| c.downcast::<ScrolledWindow>().ok()) else { return; };
+        let Some(directives_view) = dir_scroll.child().and_downcast::<SourceView>() else { return; };
 
-        let eng_scroll = dir_scroll.next_sibling().unwrap().next_sibling().unwrap().downcast::<ScrolledWindow>().unwrap();
-        let engrams_view = eng_scroll.child().unwrap().downcast::<SourceView>().unwrap();
+        let Some(eng_scroll) = dir_scroll.next_sibling().and_then(|c| c.next_sibling()).and_then(|c| c.downcast::<ScrolledWindow>().ok()) else { return; };
+        let Some(engrams_view) = eng_scroll.child().and_downcast::<SourceView>() else { return; };
 
-        let prm_scroll = eng_scroll.next_sibling().unwrap().next_sibling().unwrap().downcast::<ScrolledWindow>().unwrap();
-        let prompt_view = prm_scroll.child().unwrap().downcast::<SourceView>().unwrap();
+        let Some(prm_scroll) = eng_scroll.next_sibling().and_then(|c| c.next_sibling()).and_then(|c| c.downcast::<ScrolledWindow>().ok()) else { return; };
+        let Some(prompt_view) = prm_scroll.child().and_downcast::<SourceView>() else { return; };
 
-        let actions_box = prm_scroll.next_sibling().unwrap().downcast::<Box>().unwrap();
-        let cancel_btn = actions_box.first_child().unwrap().downcast::<Button>().unwrap();
-        let dispatch_btn = cancel_btn.next_sibling().unwrap().downcast::<Button>().unwrap();
+        let Some(actions_box) = prm_scroll.next_sibling().and_then(|c| c.downcast::<Box>().ok()) else { return; };
+        let Some(cancel_btn) = actions_box.first_child().and_then(|c| c.downcast::<Button>().ok()) else { return; };
+        let Some(dispatch_btn) = cancel_btn.next_sibling().and_then(|c| c.downcast::<Button>().ok()) else { return; };
 
         let message_type = obj.message_type();
 
@@ -2050,6 +2212,8 @@ fn build_gtk_ui(
         expander.set_visible(false);
         staging_box.set_visible(false);
         pulse_box.set_visible(false);
+        left_expand_btn.set_visible(false);
+        right_expand_btn.set_visible(false);
 
         if message_type == 1 {
             // STAGING MODE
@@ -2248,7 +2412,10 @@ fn build_gtk_ui(
                 meta_label.remove_css_class("role-architect");
                 meta_label.remove_css_class("role-una");
                 meta_label.remove_css_class("role-system");
-                if sender == "Architect" {
+
+                let is_architect = sender == "Architect";
+
+                if is_architect {
                     meta_label.add_css_class("role-architect");
                     bubble.add_css_class("architect-bubble");
                     left_spacer.set_visible(true);
@@ -2265,14 +2432,26 @@ fn build_gtk_ui(
                     right_spacer.set_visible(true);
                     meta_label.set_xalign(0.0);
                 }
+
                 let is_expanded = obj.is_expanded();
                 let line_count = content.lines().count();
-                if line_count > 11 && !is_expanded {
-                    let truncated: String = content.lines().take(11).collect::<Vec<&str>>().join("\n")
-                        + "\n\n... [Click to expand]";
+                let collapsible = line_count > 11;
+
+                if is_architect && collapsible {
+                    left_expand_btn.set_visible(true);
+                } else if collapsible {
+                    right_expand_btn.set_visible(true);
+                }
+
+                if collapsible && !is_expanded {
+                    let truncated: String = content.lines().take(11).collect::<Vec<&str>>().join("\n");
                     chat_view.buffer().set_text(&truncated);
+                    left_expand_btn.set_icon_name("pan-down-symbolic");
+                    right_expand_btn.set_icon_name("pan-down-symbolic");
                 } else {
                     chat_view.buffer().set_text(&content);
+                    left_expand_btn.set_icon_name("pan-up-symbolic");
+                    right_expand_btn.set_icon_name("pan-up-symbolic");
                 }
             } else {
                 expander.set_visible(true);
@@ -2297,7 +2476,7 @@ fn build_gtk_ui(
 
     // Input Area
     let input_container = Box::new(Orientation::Horizontal, 8);
-    input_container.set_valign(Align::Fill);
+    input_container.set_valign(Align::End);
     input_container.set_margin_start(16);
     input_container.set_margin_end(16);
     input_container.set_margin_bottom(16);
@@ -2444,8 +2623,8 @@ fn build_gtk_ui(
     let input_scroll = ScrolledWindow::builder()
         .hscrollbar_policy(PolicyType::Never)
         .vscrollbar_policy(PolicyType::Automatic)
-        .height_request(80)
-        .valign(Align::Fill)
+        .propagate_natural_height(true)
+        .max_content_height(600)
         .has_frame(false)
         .build();
     input_scroll.set_hexpand(true);
@@ -2799,6 +2978,12 @@ fn build_gtk_ui(
     if let Some(row) = nexus_list.row_at_index(1) {
         nexus_list.select_row(Some(&row));
     }
+
+    // INITIAL LOAD HISTORY DISPATCH
+    let tx_initial_load = tx_event.clone();
+    glib::MainContext::default().spawn_local(async move {
+        let _ = tx_initial_load.send(Event::LoadHistory).await;
+    });
 
     let left_switcher = StackSwitcher::new();
     left_switcher.set_stack(Some(&left_stack));
