@@ -486,42 +486,48 @@ fn build_gnome_ui(
         .vexpand(true)
         .build();
 
-    // Safe Auto-Scroll
+    // --- Scrolled Window Adjustment & Pagination Fix ---
     let adj = scrolled_window.vadjustment();
-    adj.connect_upper_notify(|adj| {
-        let upper = adj.upper();
-        let page_size = adj.page_size();
-        if upper > page_size {
-            let max_scroll = upper - page_size;
-            if (adj.value() - max_scroll).abs() > f64::EPSILON {
-                adj.set_value(max_scroll);
-            }
+
+    // Track states to prevent API loops and violent UI snapping
+    let was_at_bottom = Rc::new(RefCell::new(true));
+    let was_at_top = Rc::new(RefCell::new(true)); // Starts true so it doesn't double-fire on boot
+    let tx_clone_hist = tx_event.clone();
+
+    let was_at_bottom_val = was_at_bottom.clone();
+    adj.connect_value_notify(move |a| {
+        let val = a.value();
+        let page_size = a.page_size();
+        let upper = a.upper();
+        let lower = a.lower();
+
+        // 1. Maintain Auto-Scroll state
+        let max_scroll = upper - page_size;
+        *was_at_bottom_val.borrow_mut() = (val - max_scroll).abs() < 10.0;
+
+        // 2. Pagination Threshold Crossing (The 429 Fix)
+        let is_at_top = val <= lower + 10.0;
+        let previously_at_top = *was_at_top.borrow();
+        *was_at_top.borrow_mut() = is_at_top;
+
+        // ONLY fire LoadHistory exactly when entering the top threshold, not while resting there.
+        if is_at_top && !previously_at_top && upper > page_size {
+            let tx_for_async = tx_clone_hist.clone();
+            glib::MainContext::default().spawn_local(async move {
+                let _ = tx_for_async.send(Event::LoadHistory).await;
+            });
         }
     });
 
-    // Flawless Historical Pagination (Phase 1)
-    let pagination_debounce: Rc<RefCell<Option<glib::SourceId>>> = Rc::new(RefCell::new(None));
-    let tx_pagination = tx_event.clone();
-    let debounce_clone = pagination_debounce.clone();
-    adj.connect_value_notify(move |adj| {
-        let value = adj.value();
-        let lower = adj.lower();
-        if value <= lower + 10.0 {
-            let mut debounce = debounce_clone.borrow_mut();
-            if debounce.is_none() {
-                let tx_clone = tx_pagination.clone();
-                let inner_debounce_clone = debounce_clone.clone();
-                *debounce = Some(glib::timeout_add_local(
-                    std::time::Duration::from_secs(1),
-                    move || {
-                        let tx_for_async = tx_clone.clone();
-                        glib::MainContext::default().spawn_local(async move {
-                            let _ = tx_for_async.send(Event::LoadHistory).await;
-                        });
-                        *inner_debounce_clone.borrow_mut() = None;
-                        glib::ControlFlow::Break
-                    },
-                ));
+    let was_at_bottom_upper = was_at_bottom.clone();
+    adj.connect_upper_notify(move |a| {
+        let upper = a.upper();
+        let page_size = a.page_size();
+        if upper > page_size {
+            // ONLY snap to the bottom if the user was ALREADY at the bottom (new chat msg).
+            // This stops the violent snapping when history or logs load.
+            if *was_at_bottom_upper.borrow() {
+                a.set_value(upper - page_size);
             }
         }
     });
@@ -1073,9 +1079,11 @@ fn build_gnome_ui(
                 left_spacer.set_visible(false);
                 right_spacer.set_visible(true);
                 expander.set_label(Some(&format!("{} | {} | {}", sender, subject, timestamp)));
-                let scroll = expander.child().unwrap().downcast::<ScrolledWindow>().unwrap();
-                let content_view = scroll.child().unwrap().downcast::<SourceView>().unwrap();
-                content_view.buffer().set_text(&content);
+                if let Some(scroll) = expander.child().and_then(|c| c.downcast::<ScrolledWindow>().ok()) {
+                    if let Some(content_view) = scroll.child().and_then(|c| c.downcast::<SourceView>().ok()) {
+                        content_view.buffer().set_text(&content);
+                    }
+                }
                 expander.set_expanded(false);
             }
         }
@@ -1984,42 +1992,48 @@ fn build_gtk_ui(
         .vexpand(true)
         .build();
 
-    // Safe Auto-Scroll
+    // --- Scrolled Window Adjustment & Pagination Fix ---
     let adj = scrolled_window.vadjustment();
-    adj.connect_upper_notify(|adj| {
-        let upper = adj.upper();
-        let page_size = adj.page_size();
-        if upper > page_size {
-            let max_scroll = upper - page_size;
-            if (adj.value() - max_scroll).abs() > f64::EPSILON {
-                adj.set_value(max_scroll);
-            }
+
+    // Track states to prevent API loops and violent UI snapping
+    let was_at_bottom = Rc::new(RefCell::new(true));
+    let was_at_top = Rc::new(RefCell::new(true)); // Starts true so it doesn't double-fire on boot
+    let tx_clone_hist = tx_event.clone();
+
+    let was_at_bottom_val = was_at_bottom.clone();
+    adj.connect_value_notify(move |a| {
+        let val = a.value();
+        let page_size = a.page_size();
+        let upper = a.upper();
+        let lower = a.lower();
+
+        // 1. Maintain Auto-Scroll state
+        let max_scroll = upper - page_size;
+        *was_at_bottom_val.borrow_mut() = (val - max_scroll).abs() < 10.0;
+
+        // 2. Pagination Threshold Crossing (The 429 Fix)
+        let is_at_top = val <= lower + 10.0;
+        let previously_at_top = *was_at_top.borrow();
+        *was_at_top.borrow_mut() = is_at_top;
+
+        // ONLY fire LoadHistory exactly when entering the top threshold, not while resting there.
+        if is_at_top && !previously_at_top && upper > page_size {
+            let tx_for_async = tx_clone_hist.clone();
+            glib::MainContext::default().spawn_local(async move {
+                let _ = tx_for_async.send(Event::LoadHistory).await;
+            });
         }
     });
 
-    // Flawless Historical Pagination (Phase 1)
-    let pagination_debounce: Rc<RefCell<Option<glib::SourceId>>> = Rc::new(RefCell::new(None));
-    let tx_pagination = tx_event.clone();
-    let debounce_clone = pagination_debounce.clone();
-    adj.connect_value_notify(move |adj| {
-        let value = adj.value();
-        let lower = adj.lower();
-        if value <= lower + 10.0 {
-            let mut debounce = debounce_clone.borrow_mut();
-            if debounce.is_none() {
-                let tx_clone = tx_pagination.clone();
-                let inner_debounce_clone = debounce_clone.clone();
-                *debounce = Some(glib::timeout_add_local(
-                    std::time::Duration::from_secs(1),
-                    move || {
-                        let tx_for_async = tx_clone.clone();
-                        glib::MainContext::default().spawn_local(async move {
-                            let _ = tx_for_async.send(Event::LoadHistory).await;
-                        });
-                        *inner_debounce_clone.borrow_mut() = None;
-                        glib::ControlFlow::Break
-                    },
-                ));
+    let was_at_bottom_upper = was_at_bottom.clone();
+    adj.connect_upper_notify(move |a| {
+        let upper = a.upper();
+        let page_size = a.page_size();
+        if upper > page_size {
+            // ONLY snap to the bottom if the user was ALREADY at the bottom (new chat msg).
+            // This stops the violent snapping when history or logs load.
+            if *was_at_bottom_upper.borrow() {
+                a.set_value(upper - page_size);
             }
         }
     });
@@ -2563,9 +2577,11 @@ fn build_gtk_ui(
                 left_spacer.set_visible(false);
                 right_spacer.set_visible(true);
                 expander.set_label(Some(&format!("{} | {} | {}", sender, subject, timestamp)));
-                let scroll = expander.child().unwrap().downcast::<ScrolledWindow>().unwrap();
-                let content_view = scroll.child().unwrap().downcast::<SourceView>().unwrap();
-                content_view.buffer().set_text(&content);
+                if let Some(scroll) = expander.child().and_then(|c| c.downcast::<ScrolledWindow>().ok()) {
+                    if let Some(content_view) = scroll.child().and_then(|c| c.downcast::<SourceView>().ok()) {
+                        content_view.buffer().set_text(&content);
+                    }
+                }
                 expander.set_expanded(false);
             }
         }
