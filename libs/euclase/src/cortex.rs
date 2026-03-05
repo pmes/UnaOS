@@ -19,7 +19,7 @@ impl<'a> Cortex<'a> {
         width: u32,
         height: u32,
     ) -> Self {
-        let instance = Instance::new(InstanceDescriptor {
+        let instance = Instance::new(&InstanceDescriptor {
             backends: Backends::VULKAN | Backends::METAL, // Legacy is dead to us.
             ..Default::default()
         });
@@ -44,8 +44,8 @@ impl<'a> Cortex<'a> {
                     label: Some("Euclase_Primary_Cortex"),
                     required_features: Features::POLYGON_MODE_LINE,
                     required_limits: Limits::default(),
-                },
-                None,
+                    ..Default::default()
+                }
             )
             .await
             .expect("Device request failed. Insufficient GPU authority.");
@@ -53,8 +53,9 @@ impl<'a> Cortex<'a> {
         let surface_caps = surface.get_capabilities(&adapter);
         let format = surface_caps
             .formats
-            .into_iter()
+            .iter()
             .find(|f| f.is_srgb())
+            .copied()
             .unwrap_or(surface_caps.formats[0]);
 
         let config = wgpu::SurfaceConfiguration {

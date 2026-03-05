@@ -9,7 +9,7 @@ use gneiss_pal::api::{Content, Part, ResilientClient};
 use gneiss_pal::forge::ForgeClient;
 use gneiss_pal::persistence::BrainManager;
 use gneiss_pal::{
-    AppHandler, DashboardState, Event, GuiUpdate, Shard, ShardRole, ShardStatus, SidebarPosition,
+    AppHandler, DashboardState, Event, GuiUpdate, PreFlightPayload, Shard, ShardRole, ShardStatus, SidebarPosition,
     ViewMode, WolfpackState,
 };
 use log::info;
@@ -247,11 +247,52 @@ impl VeinHandler {
                         let _ = gui_tx_brain.send(GuiUpdate::ActiveDirective(directive)).await;
 
                         while let Some(user_input_text) = rx_from_ui.recv().await {
+                            // === ROUTE: Directive Injection ===
+                            if user_input_text.starts_with("SAVE_DIRECTIVE:") {
+                                let dir_text = user_input_text["SAVE_DIRECTIVE:".len()..].to_string();
+                                let timestamp = chrono::Local::now().format("%H:%M:%S").to_string();
+                                let disk_clone = disk.clone();
+
+                                match client.embed_content(&dir_text).await {
+                                    Ok(embedding) => {
+                                        tokio::spawn(async move {
+                                            let _ = tokio::task::spawn_blocking(move || {
+                                                let mut d = disk_clone.lock().unwrap();
+                                                if let Err(e) = d.save_memory("system", &dir_text, &timestamp, embedding, "directive") {
+                                                    eprintln!(":: PLEXUS :: Failed to save directive: {}", e);
+                                                }
+                                            }).await;
+                                        });
+                                    }
+                                    Err(e) => {
+                                        eprintln!(":: PLEXUS :: Failed to embed directive: {}", e);
+                                    }
+                                }
+                                continue;
+                            }
+
                             // === ROUTE A: Execution of an Approved Interceptor Payload ===
                             if user_input_text.starts_with("DISPATCH_PAYLOAD:") {
                                 let payload_str = &user_input_text["DISPATCH_PAYLOAD:".len()..];
 
-                                if let Ok(context) = serde_json::from_str::<Vec<Content>>(payload_str) {
+                                if let Ok(payload) = serde_json::from_str::<PreFlightPayload>(payload_str) {
+                                    let mut system_builder = payload.system.clone();
+                                    if !payload.directives.is_empty() {
+                                        system_builder.push_str("\n\n[ACTIVE DIRECTIVES]:\n");
+                                        system_builder.push_str(&payload.directives);
+                                    }
+                                    if !payload.engrams.is_empty() {
+                                        system_builder.push_str("\n\n[HISTORICAL & SHORT-TERM ENGRAMS]:\n");
+                                        system_builder.push_str(&payload.engrams);
+                                    }
+
+                                    let mut context: Vec<Content> = Vec::new();
+                                    let current_text = format!("{}\n\n[CURRENT PROMPT]:\n{}", system_builder, payload.prompt);
+                                    context.push(Content {
+                                        role: "user".into(),
+                                        parts: parse_multimodal_text(&current_text),
+                                    });
+
                                     match client.generate_content(&context).await {
                                         Ok((response, metadata)) => {
                                             let timestamp = chrono::Local::now().format("%H:%M:%S").to_string();
@@ -292,18 +333,7 @@ impl VeinHandler {
                                             let _ = gui_tx_brain.send(GuiUpdate::SidebarStatus(WolfpackState::Idle)).await;
 
                                             // Generate Engram
-                                            let mut raw_user_prompt = String::new();
-                                            if let Some(last_content) = context.last() {
-                                                for part in &last_content.parts {
-                                                    if let Part::Text { text } = part {
-                                                        if let Some(idx) = text.rfind("[CURRENT PROMPT]:\n") {
-                                                            raw_user_prompt = text[idx + 18..].trim().to_string();
-                                                        } else {
-                                                            raw_user_prompt = text.clone();
-                                                        }
-                                                    }
-                                                }
-                                            }
+                                            let mut raw_user_prompt = payload.prompt.clone();
                                             if raw_user_prompt.is_empty() {
                                                 raw_user_prompt = "[System: User provided multimodal input without text.]".to_string();
                                             }
@@ -327,9 +357,12 @@ impl VeinHandler {
                                             });
                                         }
                                         Err(e) => {
-                                            let _ = gui_tx_brain.send(GuiUpdate::ConsoleLog(format!("\n[ERROR] {}\n", e))).await;
+                                            let err_msg = format!("Synapse failure: {}", e);
+                                            let _ = gui_tx_brain.send(GuiUpdate::SynapseError(err_msg)).await;
                                         }
                                     }
+                                } else {
+                                    let _ = gui_tx_brain.send(GuiUpdate::SynapseError("Failed to deserialize PreFlightPayload".to_string())).await;
                                 }
                                 continue;
                             }
@@ -418,21 +451,21 @@ impl VeinHandler {
                                 // Offload the synchronous disk search operations.
                                 let memories_result = tokio::task::spawn_blocking(move || {
                                     if let Ok(mut locked_disk) = disk_clone.lock() {
-                                        let chat_mem = match locked_disk.search_memories(&user_embedding_clone, 0.70, "chat") {
+                                        let chat_mem = match locked_disk.search_memories(&user_embedding_clone, 0.45, "chat") {
                                             Ok(mem) => mem,
                                             Err(e) => {
                                                 eprintln!(":: PLEXUS :: DB Query Error (chat): {}", e);
                                                 vec![]
                                             }
                                         };
-                                        let directive_mem = match locked_disk.search_memories(&user_embedding_clone, 0.65, "directive") {
+                                        let directive_mem = match locked_disk.search_memories(&user_embedding_clone, 0.45, "directive") {
                                             Ok(mem) => mem,
                                             Err(e) => {
                                                 eprintln!(":: PLEXUS :: DB Query Error (directive): {}", e);
                                                 vec![]
                                             }
                                         };
-                                        let engram_mem = match locked_disk.search_memories(&user_embedding_clone, 0.65, "engram") {
+                                        let engram_mem = match locked_disk.search_memories(&user_embedding_clone, 0.45, "engram") {
                                             Ok(mem) => mem,
                                             Err(e) => {
                                                 eprintln!(":: PLEXUS :: DB Query Error (engram): {}", e);
@@ -509,52 +542,37 @@ impl VeinHandler {
                                 }).await;
                             });
 
-                            let system_base = if is_s9 {
-                                "You are S9."
+                            let mut system_builder = if is_s9 {
+                                "You are S9.".to_string()
                             } else {
-                                "SYSTEM_INSTRUCTION: You are an AI Shard operating within the UnaOS cognitive matrix."
+                                "SYSTEM_INSTRUCTION: You are an AI Shard operating within the UnaOS cognitive matrix.".to_string()
                             };
-
-                            // === ROUTE B: Standard Context Generation (Pre-Flight Intercept) ===
-                            let mut system_builder = system_base.to_string();
-
-                            if !retrieved_directives.is_empty() {
-                                system_builder.push_str("\n\n[ACTIVE DIRECTIVES]:\n");
-                                system_builder.push_str(&retrieved_directives);
-                            }
 
                             if !retrieved_context.is_empty() {
                                 system_builder.push_str("\n\n[SEMANTIC MEMORY RECALL]:\n");
                                 system_builder.push_str(&retrieved_context);
                             }
 
+                            let mut engrams_combined = String::new();
                             if !retrieved_engrams.is_empty() {
-                                system_builder.push_str("\n\n[HISTORICAL ENGRAMS]:\n");
-                                system_builder.push_str(&retrieved_engrams);
+                                engrams_combined.push_str(&retrieved_engrams);
                             }
-
                             if !chronological_engrams.is_empty() {
-                                system_builder.push_str("\n\n[IMMEDIATE SHORT-TERM MEMORY]:\n");
-                                system_builder.push_str(&chronological_engrams);
+                                if !engrams_combined.is_empty() {
+                                    engrams_combined.push_str("\n\n");
+                                }
+                                engrams_combined.push_str(&chronological_engrams);
                             }
 
-                            let mut context: Vec<Content> = Vec::new();
+                            let pre_flight_payload = PreFlightPayload {
+                                system: system_builder,
+                                directives: retrieved_directives,
+                                engrams: engrams_combined,
+                                prompt: user_input_text.clone(),
+                            };
 
-                            // The current message is the only user message.
-                            // We prepend the system directives and engrams.
-                            let current_text = format!("{}\n\n[CURRENT PROMPT]:\n{}", system_builder, user_input_text);
-
-                            context.push(Content {
-                                role: "user".into(),
-                                parts: parse_multimodal_text(&current_text),
-                            });
-
-                            // HALT GENERATION. Serialize the absolute final payload and dispatch to the UI Interceptor.
-                            if let Ok(json_payload) = serde_json::to_string_pretty(&context) {
-                                let _ = gui_tx_brain.send(GuiUpdate::ReviewPayload(json_payload)).await;
-                            } else {
-                                let _ = gui_tx_brain.send(GuiUpdate::ConsoleLog("\n[SYSTEM ERROR] :: Failed to serialize payload.\n".into())).await;
-                            }
+                            // HALT GENERATION. Dispatch the strongly typed payload to the UI Interceptor.
+                            let _ = gui_tx_brain.send(GuiUpdate::ReviewPayload(pre_flight_payload)).await;
                         }
                     }
                     Err(e) => {
@@ -611,6 +629,9 @@ impl AppHandler for VeinHandler {
                 } else if let Some(path_str) = text.trim().strip_prefix("/upload ") {
                     let path = PathBuf::from(path_str.trim());
                     trigger_upload(path, self.gui_tx.clone());
+                } else if let Some(dir_text) = text.trim().strip_prefix("/directive ") {
+                    self.append_to_console("\n[SYSTEM] :: Burning Active Directive to Vault...\n");
+                    let _ = self.tx.send(format!("SAVE_DIRECTIVE:{}", dir_text));
                 } else {
                     if let Err(e) = self.tx.send(text) {
                         self.append_to_console(&format!(
