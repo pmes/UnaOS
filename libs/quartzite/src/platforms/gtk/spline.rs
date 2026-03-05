@@ -429,6 +429,7 @@ fn build_gnome_ui(
     telehud_box.append(
         &Label::builder()
             .label("CONTEXT VECTOR")
+            .css_classes(vec!["nexus-header"])
             .xalign(0.0)
             .margin_top(20)
             .build(),
@@ -506,7 +507,7 @@ fn build_gnome_ui(
         let lower = adj.lower();
 
         // Debounce: Allow triggering history load once every 1 second
-        if value <= lower + f64::EPSILON {
+        if value <= lower + 10.0 {
             let now = std::time::Instant::now();
             if now.duration_since(*last_load_time.borrow()).as_secs_f64() > 1.0 {
                 *last_load_time.borrow_mut() = now;
@@ -1317,8 +1318,8 @@ fn build_gnome_ui(
     input_container.append(&input_scroll);
     input_container.append(&send_btn);
 
+    main_paned.set_end_child(Some(&input_container));
     comms_page.append(&main_paned);
-    comms_page.append(&input_container);
 
     // Removing PAGE 2: PAYLOAD EDITOR (The Interceptor)
 
@@ -1602,7 +1603,7 @@ fn build_gtk_ui(
 
     let pulse_icon = Spinner::new();
     // Give the spinner a unique class for targeting with inline CSS
-    pulse_icon.add_css_class("brain-symbolic");
+    pulse_icon.add_css_class("pulse-spinner");
     // Pulse starts stopped. We use GTK native properties.
     pulse_icon.set_spinning(false);
 
@@ -1879,6 +1880,7 @@ fn build_gtk_ui(
     telehud_box.append(
         &Label::builder()
             .label("CONTEXT VECTOR")
+            .css_classes(vec!["nexus-header"])
             .xalign(0.0)
             .margin_top(20)
             .build(),
@@ -1954,7 +1956,7 @@ fn build_gtk_ui(
         let lower = adj.lower();
 
         // Debounce: Allow triggering history load once every 1 second
-        if value <= lower + f64::EPSILON {
+        if value <= lower + 10.0 {
             let now = std::time::Instant::now();
             if now.duration_since(*last_load_time.borrow()).as_secs_f64() > 1.0 {
                 *last_load_time.borrow_mut() = now;
@@ -2756,8 +2758,8 @@ fn build_gtk_ui(
     input_container.append(&input_scroll);
     input_container.append(&send_btn);
 
+    main_paned.set_end_child(Some(&input_container));
     comms_page.append(&main_paned);
-    comms_page.append(&input_container);
 
     workspace_stack.add_titled(&comms_page, Some("comms"), "Comms");
 
