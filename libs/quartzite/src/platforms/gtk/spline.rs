@@ -496,6 +496,29 @@ fn build_gnome_ui(
         }
     });
 
+    // Historical Pagination - Load History
+    let tx_clone_hist = tx_event.clone();
+    let adj_hist = scrolled_window.vadjustment();
+
+    let last_load_time = Rc::new(RefCell::new(std::time::Instant::now()));
+
+    adj_hist.connect_value_notify(move |adj| {
+        let value = adj.value();
+        let lower = adj.lower();
+
+        // Debounce: Allow triggering history load once every 1 second
+        if value <= lower + f64::EPSILON {
+            let now = std::time::Instant::now();
+            if now.duration_since(*last_load_time.borrow()).as_secs_f64() > 1.0 {
+                *last_load_time.borrow_mut() = now;
+                let tx = tx_clone_hist.clone();
+                glib::MainContext::default().spawn_local(async move {
+                    let _ = tx.send(Event::LoadHistory).await;
+                });
+            }
+        }
+    });
+
     // 4. THE WORKSPACE (Right Pane)
     let right_tab_view = adw::TabView::new();
     let right_tab_bar = adw::TabBar::new();
@@ -524,11 +547,38 @@ fn build_gnome_ui(
         root.append(&left_spacer);
         let bubble = Box::new(Orientation::Vertical, 4);
         bubble.add_css_class("bubble-box");
+        bubble.set_focusable(true);
+
+        let click_grab = GestureClick::new();
+        let bubble_clone_grab = bubble.clone();
+        click_grab.connect_pressed(move |_, n_press, _, _| {
+            if n_press == 1 {
+                bubble_clone_grab.grab_focus();
+            }
+        });
+        bubble.add_controller(click_grab);
+
+        let header_box = Box::new(Orientation::Horizontal, 8);
 
         let meta_label = Label::new(None);
         meta_label.set_xalign(0.0);
         meta_label.add_css_class("dim-label");
-        bubble.append(&meta_label);
+
+        let expand_btn = Button::builder()
+            .icon_name("pan-down-symbolic")
+            .css_classes(vec!["flat", "circular"])
+            .tooltip_text("Expand / Collapse")
+            .build();
+        expand_btn.set_visible(false);
+
+        // By default, assume Una-Prime layout: label at start, button at end.
+        header_box.append(&meta_label);
+        let header_spacer = Box::new(Orientation::Horizontal, 0);
+        header_spacer.set_hexpand(true);
+        header_box.append(&header_spacer);
+        header_box.append(&expand_btn);
+
+        bubble.append(&header_box);
 
         // --- Standard Mode (Message View) ---
         let chat_content_buffer = sourceview5::Buffer::new(None);
@@ -570,28 +620,28 @@ fn build_gnome_ui(
         let system_label = Label::builder().label("SYSTEM").xalign(0.0).css_classes(vec!["dim-label"]).build();
         let system_view = SourceView::builder().wrap_mode(gtk4::WrapMode::WordChar).editable(true).monospace(true).build();
         system_view.add_css_class("view");
-        let sys_scroll = ScrolledWindow::builder().child(&system_view).min_content_height(100).build();
+        let sys_scroll = ScrolledWindow::builder().child(&system_view).propagate_natural_height(true).max_content_height(600).build();
         staging_box.append(&system_label);
         staging_box.append(&sys_scroll);
 
         let directives_label = Label::builder().label("DIRECTIVES").xalign(0.0).css_classes(vec!["dim-label"]).build();
         let directives_view = SourceView::builder().wrap_mode(gtk4::WrapMode::WordChar).editable(true).monospace(true).build();
         directives_view.add_css_class("view");
-        let dir_scroll = ScrolledWindow::builder().child(&directives_view).min_content_height(100).build();
+        let dir_scroll = ScrolledWindow::builder().child(&directives_view).propagate_natural_height(true).max_content_height(600).build();
         staging_box.append(&directives_label);
         staging_box.append(&dir_scroll);
 
         let engrams_label = Label::builder().label("ENGRAMS").xalign(0.0).css_classes(vec!["dim-label"]).build();
         let engrams_view = SourceView::builder().wrap_mode(gtk4::WrapMode::WordChar).editable(true).monospace(true).build();
         engrams_view.add_css_class("view");
-        let eng_scroll = ScrolledWindow::builder().child(&engrams_view).min_content_height(100).build();
+        let eng_scroll = ScrolledWindow::builder().child(&engrams_view).propagate_natural_height(true).max_content_height(600).build();
         staging_box.append(&engrams_label);
         staging_box.append(&eng_scroll);
 
         let prompt_label = Label::builder().label("PROMPT").xalign(0.0).css_classes(vec!["dim-label"]).build();
         let prompt_view = SourceView::builder().wrap_mode(gtk4::WrapMode::WordChar).editable(true).monospace(true).build();
         prompt_view.add_css_class("view");
-        let prm_scroll = ScrolledWindow::builder().child(&prompt_view).min_content_height(100).build();
+        let prm_scroll = ScrolledWindow::builder().child(&prompt_view).propagate_natural_height(true).max_content_height(600).build();
         staging_box.append(&prompt_label);
         staging_box.append(&prm_scroll);
 
@@ -631,31 +681,32 @@ fn build_gnome_ui(
         right_spacer.set_hexpand(true);
         root.append(&right_spacer);
 
-        let gesture = GestureClick::new();
         let item_clone = item.clone();
         let chat_content_view_clone = chat_content_view.clone();
-        gesture.connect_pressed(move |_, n_press, _, _| {
-            if n_press == 1 {
-                if let Some(obj) = item_clone
-                    .item()
-                    .and_downcast::<crate::widgets::model::DispatchObject>()
-                {
-                    let expanded = !obj.is_expanded();
-                    obj.set_is_expanded(expanded);
-                    let content = obj.content();
-                    let line_count = content.lines().count();
-                    if line_count > 11 && !expanded {
-                        let truncated: String =
-                            content.lines().take(11).collect::<Vec<&str>>().join("\n")
-                                + "\n\n... [Click to expand]";
-                        chat_content_view_clone.buffer().set_text(&truncated);
-                    } else {
-                        chat_content_view_clone.buffer().set_text(&content);
-                    }
+        let expand_btn_clone = expand_btn.clone();
+
+        expand_btn.connect_clicked(move |_| {
+            if let Some(obj) = item_clone
+                .item()
+                .and_downcast::<crate::widgets::model::DispatchObject>()
+            {
+                let expanded = !obj.is_expanded();
+                obj.set_is_expanded(expanded);
+                let content = obj.content();
+                let line_count = content.lines().count();
+
+                if line_count > 11 && !expanded {
+                    let truncated: String =
+                        content.lines().take(11).collect::<Vec<&str>>().join("\n")
+                            + "\n\n... [Click to expand]";
+                    chat_content_view_clone.buffer().set_text(&truncated);
+                    expand_btn_clone.set_icon_name("pan-down-symbolic");
+                } else {
+                    chat_content_view_clone.buffer().set_text(&content);
+                    expand_btn_clone.set_icon_name("pan-up-symbolic");
                 }
             }
         });
-        bubble.add_controller(gesture);
         item.set_child(Some(&root));
     });
 
@@ -671,8 +722,31 @@ fn build_gnome_ui(
 
         let obj = item.item().unwrap().downcast::<DispatchObject>().unwrap();
 
-        let meta_label = bubble.first_child().unwrap().downcast::<Label>().unwrap();
-        let chat_view = meta_label.next_sibling().unwrap().downcast::<SourceView>().unwrap();
+        let header_box = bubble.first_child().unwrap().downcast::<Box>().unwrap();
+        // Since header_box has label, spacer, button (in different orders), we can find label/button
+        let mut meta_label = None;
+        let mut expand_btn = None;
+        let mut header_spacer_existing = None;
+        let mut child = header_box.first_child();
+        while let Some(c) = child {
+            if let Ok(lbl) = c.clone().downcast::<Label>() {
+                meta_label = Some(lbl);
+            } else if let Ok(btn) = c.clone().downcast::<Button>() {
+                expand_btn = Some(btn);
+            } else if let Ok(bx) = c.clone().downcast::<Box>() {
+                header_spacer_existing = Some(bx);
+            }
+            child = c.next_sibling();
+        }
+        let meta_label = meta_label.unwrap();
+        let expand_btn = expand_btn.unwrap();
+        let header_spacer = header_spacer_existing.unwrap_or_else(|| {
+            let sp = Box::new(Orientation::Horizontal, 0);
+            sp.set_hexpand(true);
+            sp
+        });
+
+        let chat_view = header_box.next_sibling().unwrap().downcast::<SourceView>().unwrap();
         let expander = chat_view.next_sibling().unwrap().downcast::<Expander>().unwrap();
         let staging_box = expander.next_sibling().unwrap().downcast::<Box>().unwrap();
         let pulse_box = staging_box.next_sibling().unwrap().downcast::<Box>().unwrap();
@@ -903,12 +977,24 @@ fn build_gnome_ui(
                 meta_label.remove_css_class("role-architect");
                 meta_label.remove_css_class("role-una");
                 meta_label.remove_css_class("role-system");
+
+                // Reorder Header Box
+                let mut c = header_box.first_child();
+                while let Some(child) = c {
+                    header_box.remove(&child);
+                    c = header_box.first_child();
+                }
+
                 if sender == "Architect" {
                     meta_label.add_css_class("role-architect");
                     bubble.add_css_class("architect-bubble");
                     left_spacer.set_visible(true);
                     right_spacer.set_visible(false);
                     meta_label.set_xalign(1.0);
+
+                    header_box.append(&expand_btn);
+                    header_box.append(&header_spacer);
+                    header_box.append(&meta_label);
                 } else {
                     if sender == "Una-Prime" {
                         meta_label.add_css_class("role-una");
@@ -919,15 +1005,29 @@ fn build_gnome_ui(
                     left_spacer.set_visible(false);
                     right_spacer.set_visible(true);
                     meta_label.set_xalign(0.0);
+
+                    header_box.append(&meta_label);
+                    header_box.append(&header_spacer);
+                    header_box.append(&expand_btn);
                 }
+
                 let is_expanded = obj.is_expanded();
                 let line_count = content.lines().count();
+
+                if line_count > 11 {
+                    expand_btn.set_visible(true);
+                } else {
+                    expand_btn.set_visible(false);
+                }
+
                 if line_count > 11 && !is_expanded {
                     let truncated: String = content.lines().take(11).collect::<Vec<&str>>().join("\n")
                         + "\n\n... [Click to expand]";
                     chat_view.buffer().set_text(&truncated);
+                    expand_btn.set_icon_name("pan-down-symbolic");
                 } else {
                     chat_view.buffer().set_text(&content);
+                    expand_btn.set_icon_name("pan-up-symbolic");
                 }
             } else {
                 expander.set_visible(true);
@@ -946,6 +1046,90 @@ fn build_gnome_ui(
     let console_list_view = ListView::new(Some(console_selection), Some(console_factory));
     console_list_view.add_css_class("console");
     console_list_view.set_valign(Align::End);
+
+    let list_key_controller = EventControllerKey::new();
+    list_key_controller.set_propagation_phase(PropagationPhase::Bubble);
+    let console_list_view_clone = console_list_view.clone();
+    list_key_controller.connect_key_pressed(move |_, key, _keycode, _state| {
+        let is_nav_key = matches!(
+            key,
+            Key::Up | Key::Down | Key::Page_Up | Key::Page_Down
+        );
+
+        if !is_nav_key {
+            return glib::Propagation::Proceed;
+        }
+
+        // Only intercept if a bubble Box has focus.
+        if let Some(focused) = console_list_view_clone.root().and_downcast::<gtk4::Window>().and_then(|w| w.focus()) {
+            if focused.has_css_class("bubble-box") {
+                // Find current index
+                let mut current_idx = None;
+                let mut child = console_list_view_clone.first_child();
+                let mut idx = 0;
+                while let Some(c) = child {
+                    if let Ok(list_item_widget) = c.clone().downcast::<gtk4::Widget>() {
+                        // Traverse list item widget to find bubble Box
+                        if let Some(root_box) = list_item_widget.first_child() {
+                            if let Some(left_spacer) = root_box.first_child() {
+                                if let Some(bubble) = left_spacer.next_sibling() {
+                                    if bubble == focused {
+                                        current_idx = Some(idx);
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    child = c.next_sibling();
+                    idx += 1;
+                }
+
+                if let Some(idx) = current_idx {
+                    let next_idx = match key {
+                        Key::Up => idx.saturating_sub(1),
+                        Key::Down => idx + 1,
+                        Key::Page_Up => idx.saturating_sub(5),
+                        Key::Page_Down => idx + 5,
+                        _ => idx,
+                    };
+
+                    if next_idx != idx {
+                        let mut child = console_list_view_clone.first_child();
+                        let mut curr = 0;
+                        let mut found_focus = false;
+                        while let Some(c) = child {
+                            if curr == next_idx {
+                                if let Ok(list_item_widget) = c.downcast::<gtk4::Widget>() {
+                                    if let Some(root_box) = list_item_widget.first_child() {
+                                        if let Some(left_spacer) = root_box.first_child() {
+                                            if let Some(bubble) = left_spacer.next_sibling() {
+                                                bubble.grab_focus();
+                                                found_focus = true;
+                                                return glib::Propagation::Stop;
+                                            }
+                                        }
+                                    }
+                                }
+                                break;
+                            }
+                            child = c.next_sibling();
+                            curr += 1;
+                        }
+                        if found_focus {
+                            return glib::Propagation::Stop;
+                        }
+                    }
+                    // If we didn't find the next bubble (e.g., end of realized items), proceed so GTK scrolls it.
+                    return glib::Propagation::Proceed;
+                }
+            }
+        }
+
+        glib::Propagation::Proceed
+    });
+    console_list_view.add_controller(list_key_controller);
+
     scrolled_window.set_child(Some(&console_list_view));
 
     main_paned.set_start_child(Some(&scrolled_window));
@@ -1099,7 +1283,8 @@ fn build_gnome_ui(
     let input_scroll = ScrolledWindow::builder()
         .hscrollbar_policy(PolicyType::Never)
         .vscrollbar_policy(PolicyType::Automatic)
-        .height_request(80)
+        .propagate_natural_height(true)
+        .max_content_height(600)
         .valign(Align::Fill)
         .has_frame(false)
         .build();
@@ -1849,6 +2034,29 @@ fn build_gtk_ui(
         }
     });
 
+    // Historical Pagination - Load History
+    let tx_clone_hist = tx_event.clone();
+    let adj_hist = scrolled_window.vadjustment();
+
+    let last_load_time = Rc::new(RefCell::new(std::time::Instant::now()));
+
+    adj_hist.connect_value_notify(move |adj| {
+        let value = adj.value();
+        let lower = adj.lower();
+
+        // Debounce: Allow triggering history load once every 1 second
+        if value <= lower + f64::EPSILON {
+            let now = std::time::Instant::now();
+            if now.duration_since(*last_load_time.borrow()).as_secs_f64() > 1.0 {
+                *last_load_time.borrow_mut() = now;
+                let tx = tx_clone_hist.clone();
+                glib::MainContext::default().spawn_local(async move {
+                    let _ = tx.send(Event::LoadHistory).await;
+                });
+            }
+        }
+    });
+
     // 4. THE WORKSPACE (Right Pane)
 
     // Console ListView
@@ -1869,11 +2077,37 @@ fn build_gtk_ui(
         root.append(&left_spacer);
         let bubble = Box::new(Orientation::Vertical, 4);
         bubble.add_css_class("bubble-box");
+        bubble.set_focusable(true);
+
+        let click_grab = GestureClick::new();
+        let bubble_clone_grab = bubble.clone();
+        click_grab.connect_pressed(move |_, n_press, _, _| {
+            if n_press == 1 {
+                bubble_clone_grab.grab_focus();
+            }
+        });
+        bubble.add_controller(click_grab);
+
+        let header_box = Box::new(Orientation::Horizontal, 8);
 
         let meta_label = Label::new(None);
         meta_label.set_xalign(0.0);
         meta_label.add_css_class("dim-label");
-        bubble.append(&meta_label);
+
+        let expand_btn = Button::builder()
+            .icon_name("pan-down-symbolic")
+            .css_classes(vec!["flat", "circular"])
+            .tooltip_text("Expand / Collapse")
+            .build();
+        expand_btn.set_visible(false);
+
+        header_box.append(&meta_label);
+        let header_spacer = Box::new(Orientation::Horizontal, 0);
+        header_spacer.set_hexpand(true);
+        header_box.append(&header_spacer);
+        header_box.append(&expand_btn);
+
+        bubble.append(&header_box);
 
         // --- Standard Mode (Message View) ---
         let chat_content_buffer = sourceview5::Buffer::new(None);
@@ -1915,28 +2149,28 @@ fn build_gtk_ui(
         let system_label = Label::builder().label("SYSTEM").xalign(0.0).css_classes(vec!["dim-label"]).build();
         let system_view = SourceView::builder().wrap_mode(gtk4::WrapMode::WordChar).editable(true).monospace(true).build();
         system_view.add_css_class("view");
-        let sys_scroll = ScrolledWindow::builder().child(&system_view).min_content_height(100).build();
+        let sys_scroll = ScrolledWindow::builder().child(&system_view).propagate_natural_height(true).max_content_height(600).build();
         staging_box.append(&system_label);
         staging_box.append(&sys_scroll);
 
         let directives_label = Label::builder().label("DIRECTIVES").xalign(0.0).css_classes(vec!["dim-label"]).build();
         let directives_view = SourceView::builder().wrap_mode(gtk4::WrapMode::WordChar).editable(true).monospace(true).build();
         directives_view.add_css_class("view");
-        let dir_scroll = ScrolledWindow::builder().child(&directives_view).min_content_height(100).build();
+        let dir_scroll = ScrolledWindow::builder().child(&directives_view).propagate_natural_height(true).max_content_height(600).build();
         staging_box.append(&directives_label);
         staging_box.append(&dir_scroll);
 
         let engrams_label = Label::builder().label("ENGRAMS").xalign(0.0).css_classes(vec!["dim-label"]).build();
         let engrams_view = SourceView::builder().wrap_mode(gtk4::WrapMode::WordChar).editable(true).monospace(true).build();
         engrams_view.add_css_class("view");
-        let eng_scroll = ScrolledWindow::builder().child(&engrams_view).min_content_height(100).build();
+        let eng_scroll = ScrolledWindow::builder().child(&engrams_view).propagate_natural_height(true).max_content_height(600).build();
         staging_box.append(&engrams_label);
         staging_box.append(&eng_scroll);
 
         let prompt_label = Label::builder().label("PROMPT").xalign(0.0).css_classes(vec!["dim-label"]).build();
         let prompt_view = SourceView::builder().wrap_mode(gtk4::WrapMode::WordChar).editable(true).monospace(true).build();
         prompt_view.add_css_class("view");
-        let prm_scroll = ScrolledWindow::builder().child(&prompt_view).min_content_height(100).build();
+        let prm_scroll = ScrolledWindow::builder().child(&prompt_view).propagate_natural_height(true).max_content_height(600).build();
         staging_box.append(&prompt_label);
         staging_box.append(&prm_scroll);
 
@@ -1976,31 +2210,32 @@ fn build_gtk_ui(
         right_spacer.set_hexpand(true);
         root.append(&right_spacer);
 
-        let gesture = GestureClick::new();
         let item_clone = item.clone();
         let chat_content_view_clone = chat_content_view.clone();
-        gesture.connect_pressed(move |_, n_press, _, _| {
-            if n_press == 1 {
-                if let Some(obj) = item_clone
-                    .item()
-                    .and_downcast::<crate::widgets::model::DispatchObject>()
-                {
-                    let expanded = !obj.is_expanded();
-                    obj.set_is_expanded(expanded);
-                    let content = obj.content();
-                    let line_count = content.lines().count();
-                    if line_count > 11 && !expanded {
-                        let truncated: String =
-                            content.lines().take(11).collect::<Vec<&str>>().join("\n")
-                                + "\n\n... [Click to expand]";
-                        chat_content_view_clone.buffer().set_text(&truncated);
-                    } else {
-                        chat_content_view_clone.buffer().set_text(&content);
-                    }
+        let expand_btn_clone = expand_btn.clone();
+
+        expand_btn.connect_clicked(move |_| {
+            if let Some(obj) = item_clone
+                .item()
+                .and_downcast::<crate::widgets::model::DispatchObject>()
+            {
+                let expanded = !obj.is_expanded();
+                obj.set_is_expanded(expanded);
+                let content = obj.content();
+                let line_count = content.lines().count();
+
+                if line_count > 11 && !expanded {
+                    let truncated: String =
+                        content.lines().take(11).collect::<Vec<&str>>().join("\n")
+                            + "\n\n... [Click to expand]";
+                    chat_content_view_clone.buffer().set_text(&truncated);
+                    expand_btn_clone.set_icon_name("pan-down-symbolic");
+                } else {
+                    chat_content_view_clone.buffer().set_text(&content);
+                    expand_btn_clone.set_icon_name("pan-up-symbolic");
                 }
             }
         });
-        bubble.add_controller(gesture);
         item.set_child(Some(&root));
     });
 
@@ -2016,8 +2251,30 @@ fn build_gtk_ui(
 
         let obj = item.item().unwrap().downcast::<DispatchObject>().unwrap();
 
-        let meta_label = bubble.first_child().unwrap().downcast::<Label>().unwrap();
-        let chat_view = meta_label.next_sibling().unwrap().downcast::<SourceView>().unwrap();
+        let header_box = bubble.first_child().unwrap().downcast::<Box>().unwrap();
+        let mut meta_label = None;
+        let mut expand_btn = None;
+        let mut header_spacer_existing = None;
+        let mut child = header_box.first_child();
+        while let Some(c) = child {
+            if let Ok(lbl) = c.clone().downcast::<Label>() {
+                meta_label = Some(lbl);
+            } else if let Ok(btn) = c.clone().downcast::<Button>() {
+                expand_btn = Some(btn);
+            } else if let Ok(bx) = c.clone().downcast::<Box>() {
+                header_spacer_existing = Some(bx);
+            }
+            child = c.next_sibling();
+        }
+        let meta_label = meta_label.unwrap();
+        let expand_btn = expand_btn.unwrap();
+        let header_spacer = header_spacer_existing.unwrap_or_else(|| {
+            let sp = Box::new(Orientation::Horizontal, 0);
+            sp.set_hexpand(true);
+            sp
+        });
+
+        let chat_view = header_box.next_sibling().unwrap().downcast::<SourceView>().unwrap();
         let expander = chat_view.next_sibling().unwrap().downcast::<Expander>().unwrap();
         let staging_box = expander.next_sibling().unwrap().downcast::<Box>().unwrap();
         let pulse_box = staging_box.next_sibling().unwrap().downcast::<Box>().unwrap();
@@ -2248,12 +2505,24 @@ fn build_gtk_ui(
                 meta_label.remove_css_class("role-architect");
                 meta_label.remove_css_class("role-una");
                 meta_label.remove_css_class("role-system");
+
+                // Reorder Header Box
+                let mut c = header_box.first_child();
+                while let Some(child) = c {
+                    header_box.remove(&child);
+                    c = header_box.first_child();
+                }
+
                 if sender == "Architect" {
                     meta_label.add_css_class("role-architect");
                     bubble.add_css_class("architect-bubble");
                     left_spacer.set_visible(true);
                     right_spacer.set_visible(false);
                     meta_label.set_xalign(1.0);
+
+                    header_box.append(&expand_btn);
+                    header_box.append(&header_spacer);
+                    header_box.append(&meta_label);
                 } else {
                     if sender == "Una-Prime" {
                         meta_label.add_css_class("role-una");
@@ -2264,15 +2533,29 @@ fn build_gtk_ui(
                     left_spacer.set_visible(false);
                     right_spacer.set_visible(true);
                     meta_label.set_xalign(0.0);
+
+                    header_box.append(&meta_label);
+                    header_box.append(&header_spacer);
+                    header_box.append(&expand_btn);
                 }
+
                 let is_expanded = obj.is_expanded();
                 let line_count = content.lines().count();
+
+                if line_count > 11 {
+                    expand_btn.set_visible(true);
+                } else {
+                    expand_btn.set_visible(false);
+                }
+
                 if line_count > 11 && !is_expanded {
                     let truncated: String = content.lines().take(11).collect::<Vec<&str>>().join("\n")
                         + "\n\n... [Click to expand]";
                     chat_view.buffer().set_text(&truncated);
+                    expand_btn.set_icon_name("pan-down-symbolic");
                 } else {
                     chat_view.buffer().set_text(&content);
+                    expand_btn.set_icon_name("pan-up-symbolic");
                 }
             } else {
                 expander.set_visible(true);
@@ -2291,6 +2574,90 @@ fn build_gtk_ui(
     let console_list_view = ListView::new(Some(console_selection), Some(console_factory));
     console_list_view.add_css_class("console");
     console_list_view.set_valign(Align::End);
+
+    let list_key_controller = EventControllerKey::new();
+    list_key_controller.set_propagation_phase(PropagationPhase::Bubble);
+    let console_list_view_clone = console_list_view.clone();
+    list_key_controller.connect_key_pressed(move |_, key, _keycode, _state| {
+        let is_nav_key = matches!(
+            key,
+            Key::Up | Key::Down | Key::Page_Up | Key::Page_Down
+        );
+
+        if !is_nav_key {
+            return glib::Propagation::Proceed;
+        }
+
+        // Only intercept if a bubble Box has focus.
+        if let Some(focused) = console_list_view_clone.root().and_downcast::<gtk4::Window>().and_then(|w| w.focus()) {
+            if focused.has_css_class("bubble-box") {
+                // Find current index
+                let mut current_idx = None;
+                let mut child = console_list_view_clone.first_child();
+                let mut idx = 0;
+                while let Some(c) = child {
+                    if let Ok(list_item_widget) = c.clone().downcast::<gtk4::Widget>() {
+                        // Traverse list item widget to find bubble Box
+                        if let Some(root_box) = list_item_widget.first_child() {
+                            if let Some(left_spacer) = root_box.first_child() {
+                                if let Some(bubble) = left_spacer.next_sibling() {
+                                    if bubble == focused {
+                                        current_idx = Some(idx);
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    child = c.next_sibling();
+                    idx += 1;
+                }
+
+                if let Some(idx) = current_idx {
+                    let next_idx = match key {
+                        Key::Up => idx.saturating_sub(1),
+                        Key::Down => idx + 1,
+                        Key::Page_Up => idx.saturating_sub(5),
+                        Key::Page_Down => idx + 5,
+                        _ => idx,
+                    };
+
+                    if next_idx != idx {
+                        let mut child = console_list_view_clone.first_child();
+                        let mut curr = 0;
+                        let mut found_focus = false;
+                        while let Some(c) = child {
+                            if curr == next_idx {
+                                if let Ok(list_item_widget) = c.downcast::<gtk4::Widget>() {
+                                    if let Some(root_box) = list_item_widget.first_child() {
+                                        if let Some(left_spacer) = root_box.first_child() {
+                                            if let Some(bubble) = left_spacer.next_sibling() {
+                                                bubble.grab_focus();
+                                                found_focus = true;
+                                                return glib::Propagation::Stop;
+                                            }
+                                        }
+                                    }
+                                }
+                                break;
+                            }
+                            child = c.next_sibling();
+                            curr += 1;
+                        }
+                        if found_focus {
+                            return glib::Propagation::Stop;
+                        }
+                    }
+                    // If we didn't find the next bubble (e.g., end of realized items), proceed so GTK scrolls it.
+                    return glib::Propagation::Proceed;
+                }
+            }
+        }
+
+        glib::Propagation::Proceed
+    });
+    console_list_view.add_controller(list_key_controller);
+
     scrolled_window.set_child(Some(&console_list_view));
 
     main_paned.set_start_child(Some(&scrolled_window));
@@ -2444,7 +2811,8 @@ fn build_gtk_ui(
     let input_scroll = ScrolledWindow::builder()
         .hscrollbar_policy(PolicyType::Never)
         .vscrollbar_policy(PolicyType::Automatic)
-        .height_request(80)
+        .propagate_natural_height(true)
+        .max_content_height(600)
         .valign(Align::Fill)
         .has_frame(false)
         .build();
