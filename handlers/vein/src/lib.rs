@@ -785,7 +785,20 @@ impl AppHandler for VeinHandler {
                 let _ = self.tx.send(format!("DISPATCH_PAYLOAD:{}", json_payload));
             }
             Event::LoadHistory => {
-                self.append_to_console("\n[SYSTEM] :: Loading historical records...\n");
+                // Return a mock history array to the UI as requested
+                let mut mock_history = Vec::new();
+                for i in 0..10 {
+                    mock_history.push(gneiss_pal::HistoryItem {
+                        sender: "Una-Prime".to_string(),
+                        content: format!("Archived Log Entry #{}", 10 - i),
+                        timestamp: "00:00:00".to_string(),
+                        is_chat: true,
+                    });
+                }
+                let tx = self.gui_tx.clone();
+                tokio::spawn(async move {
+                    let _ = tx.send(GuiUpdate::HistoryBatch(mock_history)).await;
+                });
             }
             _ => {}
         }
