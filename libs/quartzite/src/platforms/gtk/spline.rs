@@ -722,12 +722,12 @@ fn build_gnome_ui(
             let bubble_clone = bubble.clone();
             let console_store_clone = console_store.clone();
 
-            if let Some(sig) = unsafe { cancel_btn.data::<glib::SignalHandlerId>("clicked_sig") } {
-                cancel_btn.disconnect(sig.as_ref().clone());
+            if let Some(sig) = unsafe { cancel_btn.steal_data::<glib::SignalHandlerId>("clicked_sig") } {
+                cancel_btn.disconnect(sig);
             }
             let cancel_sig = cancel_btn.connect_clicked(move |_| {
                 let dialog = gtk4::AlertDialog::builder()
-                    .heading("Delete Payload?")
+                    .message("Delete Payload?")
                     .detail("Are you sure you want to discard this pre-flight payload? This cannot be undone.")
                     .buttons(["Cancel", "Delete"])
                     .cancel_button(0)
@@ -771,8 +771,8 @@ fn build_gnome_ui(
 
             // Bind text updates to prevent data loss on scroll
             let obj_sys = obj.clone();
-            if let Some(sig) = unsafe { system_view.buffer().data::<glib::SignalHandlerId>("changed_sig") } {
-                system_view.buffer().disconnect(sig.as_ref().clone());
+            if let Some(sig) = unsafe { system_view.buffer().steal_data::<glib::SignalHandlerId>("changed_sig") } {
+                system_view.buffer().disconnect(sig);
             }
             let sig_sys = system_view.buffer().connect_changed(move |buf| {
                 let (s, e) = buf.bounds();
@@ -781,8 +781,8 @@ fn build_gnome_ui(
             unsafe { system_view.buffer().set_data("changed_sig", sig_sys); }
 
             let obj_dir = obj.clone();
-            if let Some(sig) = unsafe { directives_view.buffer().data::<glib::SignalHandlerId>("changed_sig") } {
-                directives_view.buffer().disconnect(sig.as_ref().clone());
+            if let Some(sig) = unsafe { directives_view.buffer().steal_data::<glib::SignalHandlerId>("changed_sig") } {
+                directives_view.buffer().disconnect(sig);
             }
             let sig_dir = directives_view.buffer().connect_changed(move |buf| {
                 let (s, e) = buf.bounds();
@@ -791,8 +791,8 @@ fn build_gnome_ui(
             unsafe { directives_view.buffer().set_data("changed_sig", sig_dir); }
 
             let obj_eng = obj.clone();
-            if let Some(sig) = unsafe { engrams_view.buffer().data::<glib::SignalHandlerId>("changed_sig") } {
-                engrams_view.buffer().disconnect(sig.as_ref().clone());
+            if let Some(sig) = unsafe { engrams_view.buffer().steal_data::<glib::SignalHandlerId>("changed_sig") } {
+                engrams_view.buffer().disconnect(sig);
             }
             let sig_eng = engrams_view.buffer().connect_changed(move |buf| {
                 let (s, e) = buf.bounds();
@@ -801,8 +801,8 @@ fn build_gnome_ui(
             unsafe { engrams_view.buffer().set_data("changed_sig", sig_eng); }
 
             let obj_prm = obj.clone();
-            if let Some(sig) = unsafe { prompt_view.buffer().data::<glib::SignalHandlerId>("changed_sig") } {
-                prompt_view.buffer().disconnect(sig.as_ref().clone());
+            if let Some(sig) = unsafe { prompt_view.buffer().steal_data::<glib::SignalHandlerId>("changed_sig") } {
+                prompt_view.buffer().disconnect(sig);
             }
             let sig_prm = prompt_view.buffer().connect_changed(move |buf| {
                 let (s, e) = buf.bounds();
@@ -814,8 +814,8 @@ fn build_gnome_ui(
             let dispatch_btn_clone = dispatch_btn.clone();
             let console_store_pulse = console_store.clone();
 
-            if let Some(sig) = unsafe { dispatch_btn_clone.data::<glib::SignalHandlerId>("clicked_sig") } {
-                dispatch_btn_clone.disconnect(sig.as_ref().clone());
+            if let Some(sig) = unsafe { dispatch_btn_clone.steal_data::<glib::SignalHandlerId>("clicked_sig") } {
+                dispatch_btn_clone.disconnect(sig);
             }
             let dispatch_sig = dispatch_btn_clone.connect_clicked(move |_| {
                 obj_clone2.set_is_locked(true);
@@ -2072,12 +2072,12 @@ fn build_gtk_ui(
             let bubble_clone = bubble.clone();
             let console_store_clone = console_store.clone();
 
-            if let Some(sig) = unsafe { cancel_btn.data::<glib::SignalHandlerId>("clicked_sig") } {
-                cancel_btn.disconnect(sig.as_ref().clone());
+            if let Some(sig) = unsafe { cancel_btn.steal_data::<glib::SignalHandlerId>("clicked_sig") } {
+                cancel_btn.disconnect(sig);
             }
             let cancel_sig = cancel_btn.connect_clicked(move |_| {
                 let dialog = gtk4::AlertDialog::builder()
-                    .heading("Delete Payload?")
+                    .message("Delete Payload?")
                     .detail("Are you sure you want to discard this pre-flight payload? This cannot be undone.")
                     .buttons(["Cancel", "Delete"])
                     .cancel_button(0)
@@ -2121,8 +2121,8 @@ fn build_gtk_ui(
 
             // Bind text updates to prevent data loss on scroll
             let obj_sys = obj.clone();
-            if let Some(sig) = unsafe { system_view.buffer().data::<glib::SignalHandlerId>("changed_sig") } {
-                system_view.buffer().disconnect(sig.as_ref().clone());
+            if let Some(sig) = unsafe { system_view.buffer().steal_data::<glib::SignalHandlerId>("changed_sig") } {
+                system_view.buffer().disconnect(sig);
             }
             let sig_sys = system_view.buffer().connect_changed(move |buf| {
                 let (s, e) = buf.bounds();
@@ -2131,8 +2131,8 @@ fn build_gtk_ui(
             unsafe { system_view.buffer().set_data("changed_sig", sig_sys); }
 
             let obj_dir = obj.clone();
-            if let Some(sig) = unsafe { directives_view.buffer().data::<glib::SignalHandlerId>("changed_sig") } {
-                directives_view.buffer().disconnect(sig.as_ref().clone());
+            if let Some(sig) = unsafe { directives_view.buffer().steal_data::<glib::SignalHandlerId>("changed_sig") } {
+                directives_view.buffer().disconnect(sig);
             }
             let sig_dir = directives_view.buffer().connect_changed(move |buf| {
                 let (s, e) = buf.bounds();
@@ -2141,8 +2141,8 @@ fn build_gtk_ui(
             unsafe { directives_view.buffer().set_data("changed_sig", sig_dir); }
 
             let obj_eng = obj.clone();
-            if let Some(sig) = unsafe { engrams_view.buffer().data::<glib::SignalHandlerId>("changed_sig") } {
-                engrams_view.buffer().disconnect(sig.as_ref().clone());
+            if let Some(sig) = unsafe { engrams_view.buffer().steal_data::<glib::SignalHandlerId>("changed_sig") } {
+                engrams_view.buffer().disconnect(sig);
             }
             let sig_eng = engrams_view.buffer().connect_changed(move |buf| {
                 let (s, e) = buf.bounds();
@@ -2151,8 +2151,8 @@ fn build_gtk_ui(
             unsafe { engrams_view.buffer().set_data("changed_sig", sig_eng); }
 
             let obj_prm = obj.clone();
-            if let Some(sig) = unsafe { prompt_view.buffer().data::<glib::SignalHandlerId>("changed_sig") } {
-                prompt_view.buffer().disconnect(sig.as_ref().clone());
+            if let Some(sig) = unsafe { prompt_view.buffer().steal_data::<glib::SignalHandlerId>("changed_sig") } {
+                prompt_view.buffer().disconnect(sig);
             }
             let sig_prm = prompt_view.buffer().connect_changed(move |buf| {
                 let (s, e) = buf.bounds();
@@ -2164,8 +2164,8 @@ fn build_gtk_ui(
             let dispatch_btn_clone = dispatch_btn.clone();
             let console_store_pulse = console_store.clone();
 
-            if let Some(sig) = unsafe { dispatch_btn_clone.data::<glib::SignalHandlerId>("clicked_sig") } {
-                dispatch_btn_clone.disconnect(sig.as_ref().clone());
+            if let Some(sig) = unsafe { dispatch_btn_clone.steal_data::<glib::SignalHandlerId>("clicked_sig") } {
+                dispatch_btn_clone.disconnect(sig);
             }
             let dispatch_sig = dispatch_btn_clone.connect_clicked(move |_| {
                 obj_clone2.set_is_locked(true);
