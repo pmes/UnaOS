@@ -66,7 +66,7 @@ fn main() {
     // THE FUSION
     let bootstrap = move |window: &NativeWindow| -> NativeView {
         // 1. Get the Vein UI (The Command Center)
-        let vein_widget = spline.bootstrap(window, event_tx.clone(), gui_rx.clone());
+        let vein_widget = spline.bootstrap(window, event_tx.clone(), gui_rx.clone(), _telemetry_rx.clone());
 
         // 2. Create the HUD (ContextView) - DEPRECATED (Phase 4)
         // The "TeleHUD" sidebar tab is now the sole authorized telemetry view.

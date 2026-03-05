@@ -36,9 +36,10 @@ impl Spline {
         _window: &NativeWindow,
         _tx_event: async_channel::Sender<Event>,
         _rx_gui: async_channel::Receiver<GuiUpdate>,
+        _rx_telemetry: async_channel::Receiver<bandy::SMessage>,
     ) -> NativeView {
         #[cfg(any(all(target_os = "linux", feature = "gtk"), target_os = "macos"))]
-        return self.inner.bootstrap(_window, _tx_event, _rx_gui);
+        return self.inner.bootstrap(_window, _tx_event, _rx_gui, _rx_telemetry);
 
         #[cfg(not(any(all(target_os = "linux", feature = "gtk"), target_os = "macos")))]
         return (); // Fallback

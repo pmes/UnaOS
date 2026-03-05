@@ -25,6 +25,7 @@ impl MacOSSpline {
         _window: &NativeWindow,
         _tx_event: Sender<Event>,
         rx_gui: Receiver<GuiUpdate>,
+        _rx_telemetry: Receiver<bandy::SMessage>,
     ) -> NativeView {
         let mtm = MainThreadMarker::new().expect("Must be on main thread");
 

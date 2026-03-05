@@ -1,4 +1,3 @@
-use crate::gravity::GravityWell;
 use unafs::io::MappedFile;
 use elessar::context::SkeletonGenerator;
 use gneiss_pal::io::MemoryMappedRegion;
@@ -42,46 +41,32 @@ pub fn ingest_for_lumen(file_path: &Path) -> Result<String, String> {
     Ok(skeleton)
 }
 
-/// The Background Indexer Task.
-/// It scans the workspace, maps the topology, and builds the context.
-pub async fn run_indexer(root: PathBuf, tx: broadcast::Sender<SMessage>, telemetry_tx: async_channel::Sender<SMessage>) {
-    let payload = scan_and_score(&root, &tx).await;
-
-    if !payload.is_empty() {
-        info!(":: CORTEX :: Broadcasting Telemetry Payload ({} items)", payload.len());
-        // We send the compiled telemetry across the thread boundary.
-        // The payload contains Arc<String>, so no actual skeleton text is copied.
-        // We use the High-Priority Telemetry Channel (Async) directly to the UI.
-        let _ = telemetry_tx.send(SMessage::ContextTelemetry { skeletons: payload }).await;
-    }
+// Update the signature to return the HashMap
+pub async fn run_indexer(root: PathBuf, tx: broadcast::Sender<SMessage>) -> HashMap<PathBuf, Arc<String>> {
+    let payload = scan_workspace(&root, &tx).await;
+    payload
 }
 
-async fn scan_and_score(root: &Path, tx: &broadcast::Sender<SMessage>) -> Vec<bandy::WeightedSkeleton> {
+// Rename and update return type
+async fn scan_workspace(root: &Path, tx: &broadcast::Sender<SMessage>) -> HashMap<PathBuf, Arc<String>> {
     info!(":: CORTEX :: Indexing Workspace at {:?}", root);
 
-    // 1. IGNITE THE INDEXER
-    // We use Elessar to build a DAG of the workspace crates.
     let mut indexer = elessar::context::WorkspaceIndexer::new();
     indexer.scan(root);
 
     let mut spatial_nodes = Vec::new();
     let mut spatial_edges = Vec::new();
     let mut skeleton_cache: HashMap<PathBuf, Arc<String>> = HashMap::new();
-    let mut gravity = GravityWell::new();
     let mut total_skeletons = 0;
 
-    // 2. EXTRACT TOPOLOGY & INGEST SKELETONS
     for (crate_name, node) in &indexer.nodes {
-        // Map the Crate to a Spatial Node for the Matrix UI
         spatial_nodes.push(SpatialNode {
             id: crate_name.clone(),
             kind: "crate".to_string(),
             path: node.path.clone(),
         });
 
-        // Map the dependencies to Spatial Edges
         for dep in &node.dependencies {
-            // We only map edges to crates that exist within our local workspace DAG
             if indexer.nodes.contains_key(dep) {
                 spatial_edges.push(SpatialEdge {
                     from: crate_name.clone(),
@@ -91,10 +76,8 @@ async fn scan_and_score(root: &Path, tx: &broadcast::Sender<SMessage>) -> Vec<ba
             }
         }
 
-        // Ingest the source files for this specific crate
         let src_dir = node.path.join("src");
         if src_dir.exists() {
-            // Recursive walk to find all .rs files
             let mut files = Vec::new();
             let mut stack = vec![src_dir];
 
@@ -114,41 +97,21 @@ async fn scan_and_score(root: &Path, tx: &broadcast::Sender<SMessage>) -> Vec<ba
             for file in files {
                 match ingest_for_lumen(&file) {
                     Ok(skeleton) => {
-                        // Store the skeleton in the memory cache (Zero-Copy Arc)
                         skeleton_cache.insert(file.clone(), Arc::new(skeleton));
                         total_skeletons += 1;
-
-                        // Mock Heuristic for "Context Awareness":
-                        if file.to_string_lossy().contains("libs/bandy/src/lib.rs") {
-                             gravity.set_focus(file.clone());
-                        }
+                        // REMOVED: The hardcoded bandy focus
                     }
                     Err(e) => {
-                        let _ = tx.send(SMessage::Log {
-                            level: "WARN".to_string(),
-                            source: "Cortex".to_string(),
-                            content: e,
-                        });
+                        let _ = tx.send(SMessage::Log { level: "WARN".into(), source: "Cortex".into(), content: e });
                     }
                 }
             }
         }
     }
 
-    // 3. BROADCAST THE TOPOLOGY
-    // We fire the DAG across the nervous system so Matrix can render the 3D/List view immediately.
-    let _ = tx.send(SMessage::Matrix(MatrixEvent::IngestTopology {
-        nodes: spatial_nodes,
-        edges: spatial_edges,
-    }));
+    let _ = tx.send(SMessage::Matrix(MatrixEvent::IngestTopology { nodes: spatial_nodes, edges: spatial_edges }));
+    let _ = tx.send(SMessage::Log { level: "INFO".into(), source: "Cortex".into(), content: format!("Workspace Indexed. Generated {} AST Skeletons.", total_skeletons) });
 
-    let _ = tx.send(SMessage::Log {
-        level: "INFO".to_string(),
-        source: "Cortex".to_string(),
-        content: format!("Workspace Indexed. Generated {} AST Skeletons.", total_skeletons),
-    });
-
-    // 4. COMPILE TELEMETRY
-    // We calculate the gravitational pull of the current context.
-    gravity.calculate_scores(&skeleton_cache)
+    // Return the raw cache
+    skeleton_cache
 }

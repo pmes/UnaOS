@@ -70,12 +70,13 @@ impl CommsSpline {
         window: &crate::NativeWindow,
         tx_event: async_channel::Sender<Event>,
         rx: Receiver<GuiUpdate>,
+        rx_telemetry: Receiver<bandy::SMessage>,
     ) -> crate::NativeView {
         #[cfg(feature = "gnome")]
-        return build_gnome_ui(window, tx_event, rx);
+        return build_gnome_ui(window, tx_event, rx, rx_telemetry);
 
         #[cfg(not(feature = "gnome"))]
-        return build_gtk_ui(window, tx_event, rx);
+        return build_gtk_ui(window, tx_event, rx, rx_telemetry);
     }
 }
 
@@ -84,6 +85,7 @@ fn build_gnome_ui(
     window: &crate::NativeWindow,
     tx_event: async_channel::Sender<Event>,
     rx: Receiver<GuiUpdate>,
+    rx_telemetry: Receiver<bandy::SMessage>,
 ) -> crate::NativeView {
     // 1. Nodes Tab Rename
     let store = gio::ListStore::new::<StringObject>();
@@ -410,21 +412,6 @@ fn build_gnome_ui(
 
     telehud_box.append(
         &Label::builder()
-            .label("TOKEN TELEMETRY")
-            .css_classes(vec!["nexus-header"])
-            .xalign(0.0)
-            .build(),
-    );
-    // Note: token_label is now packed in the header bar as well, but kept here for completeness if needed.
-    // If it can only have one parent, GTK will warn. Since status_group claims it, we should probably clone or use a separate label.
-    // For safety, let's create a *second* label for TeleHUD to avoid "widget already has a parent" panic.
-    let telehud_token_label = Label::new(Some("Waiting for telemetry..."));
-    telehud_token_label.set_wrap(true);
-    telehud_token_label.set_justify(gtk4::Justification::Center);
-    telehud_box.append(&telehud_token_label);
-
-    telehud_box.append(
-        &Label::builder()
             .label("CONTEXT VECTOR")
             .css_classes(vec!["nexus-header"])
             .xalign(0.0)
@@ -432,11 +419,22 @@ fn build_gnome_ui(
             .build(),
     );
 
-    let context_list = ListBox::new();
-    context_list.add_css_class("boxed-list");
-    context_list.append(&Label::new(Some("libs/bandy/src/lib.rs (0.95)")));
-    context_list.append(&Label::new(Some("handlers/vein/src/lib.rs (0.80)")));
-    telehud_box.append(&context_list);
+    let context_view = crate::widgets::telemetry::ContextView::new();
+    telehud_box.append(&context_view.container);
+
+    // Spawn a local loop to listen to telemetry
+    let context_view_clone = context_view.clone();
+    let rx_telemetry_clone = rx_telemetry.clone();
+    glib::MainContext::default().spawn_local(async move {
+        while let Ok(msg) = rx_telemetry_clone.recv().await {
+            match msg {
+                bandy::SMessage::ContextTelemetry { skeletons } => {
+                    context_view_clone.update(skeletons);
+                }
+                _ => {}
+            }
+        }
+    });
 
     {
         let page = left_stack.add_named(&telehud_box, Some("telehud"));
@@ -1258,7 +1256,6 @@ fn build_gnome_ui(
     let token_label_clone = token_label.clone();
     let pulse_icon_clone = pulse_icon.clone();
     let active_directive_async = active_directive_clone.clone();
-    let telehud_token_label_clone = telehud_token_label.clone();
 
     let console_store_async = console_store.clone();
 
@@ -1376,7 +1373,6 @@ fn build_gnome_ui(
                 GuiUpdate::TokenUsage(p, c, t) => {
                     let text = format!("Tokens: IN: {} | OUT: {} | TOTAL: {}", p, c, t);
                     token_label_clone.set_text(&text);
-                    telehud_token_label_clone.set_text(&text); // Update TeleHUD as well
                 }
                 GuiUpdate::ActiveDirective(d) => {
                     *active_directive_async.borrow_mut() = d;
@@ -1451,6 +1447,7 @@ fn build_gtk_ui(
     window: &crate::NativeWindow,
     tx_event: async_channel::Sender<Event>,
     rx: Receiver<GuiUpdate>,
+    rx_telemetry: Receiver<bandy::SMessage>,
 ) -> crate::NativeView {
     // 1. Nodes Tab Rename
     let store = gio::ListStore::new::<StringObject>();
@@ -1770,21 +1767,6 @@ fn build_gtk_ui(
 
     telehud_box.append(
         &Label::builder()
-            .label("TOKEN TELEMETRY")
-            .css_classes(vec!["nexus-header"])
-            .xalign(0.0)
-            .build(),
-    );
-    // Note: token_label is now packed in the header bar as well, but kept here for completeness if needed.
-    // If it can only have one parent, GTK will warn. Since status_group claims it, we should probably clone or use a separate label.
-    // For safety, let's create a *second* label for TeleHUD to avoid "widget already has a parent" panic.
-    let telehud_token_label = Label::new(Some("Waiting for telemetry..."));
-    telehud_token_label.set_wrap(true);
-    telehud_token_label.set_justify(gtk4::Justification::Center);
-    telehud_box.append(&telehud_token_label);
-
-    telehud_box.append(
-        &Label::builder()
             .label("CONTEXT VECTOR")
             .css_classes(vec!["nexus-header"])
             .xalign(0.0)
@@ -1792,11 +1774,22 @@ fn build_gtk_ui(
             .build(),
     );
 
-    let context_list = ListBox::new();
-    context_list.add_css_class("boxed-list");
-    context_list.append(&Label::new(Some("libs/bandy/src/lib.rs (0.95)")));
-    context_list.append(&Label::new(Some("handlers/vein/src/lib.rs (0.80)")));
-    telehud_box.append(&context_list);
+    let context_view = crate::widgets::telemetry::ContextView::new();
+    telehud_box.append(&context_view.container);
+
+    // Spawn a local loop to listen to telemetry
+    let context_view_clone = context_view.clone();
+    let rx_telemetry_clone = rx_telemetry.clone();
+    glib::MainContext::default().spawn_local(async move {
+        while let Ok(msg) = rx_telemetry_clone.recv().await {
+            match msg {
+                bandy::SMessage::ContextTelemetry { skeletons } => {
+                    context_view_clone.update(skeletons);
+                }
+                _ => {}
+            }
+        }
+    });
 
     let page = left_stack.add_named(&telehud_box, Some("telehud"));
     page.set_icon_name("error-correct-symbolic");
@@ -2612,7 +2605,6 @@ fn build_gtk_ui(
     let token_label_clone = token_label.clone();
     let pulse_icon_clone = pulse_icon.clone();
     let active_directive_async = active_directive_clone.clone();
-    let telehud_token_label_clone = telehud_token_label.clone();
 
     let console_store_async = console_store.clone();
 
@@ -2732,7 +2724,6 @@ fn build_gtk_ui(
                 GuiUpdate::TokenUsage(p, c, t) => {
                     let text = format!("Tokens: IN: {} | OUT: {} | TOTAL: {}", p, c, t);
                     token_label_clone.set_text(&text);
-                    telehud_token_label_clone.set_text(&text); // Update TeleHUD as well
                 }
                 GuiUpdate::ActiveDirective(d) => {
                     *active_directive_async.borrow_mut() = d;
