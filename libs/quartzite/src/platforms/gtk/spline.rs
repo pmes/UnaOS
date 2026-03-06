@@ -635,69 +635,61 @@ fn build_gnome_ui(
         let staging_box = Box::new(Orientation::Vertical, 8);
         staging_box.set_visible(false);
         staging_box.set_hexpand(true);
-        staging_box.set_width_request(800);
 
-        let system_label = Label::builder().label("SYSTEM").xalign(0.0).css_classes(vec!["dim-label"]).build();
-        let system_view = SourceView::builder().wrap_mode(gtk4::WrapMode::WordChar).editable(true).monospace(true).build();
-        system_view.add_css_class("view");
-        let sys_scroll = ScrolledWindow::builder().child(&system_view)
-            .propagate_natural_height(true)
-            .min_content_height(150)
-            .max_content_height(600)
-            .valign(gtk4::Align::Start)
-            .build();
-        let box_sys = Box::new(Orientation::Vertical, 4);
-        box_sys.append(&system_label);
-        box_sys.append(&sys_scroll);
+        let create_staging_section = |title: &str| -> (Box, SourceView) {
+            let section_box = Box::new(Orientation::Vertical, 4);
+            section_box.set_vexpand(true);
 
-        let directives_label = Label::builder().label("DIRECTIVES").xalign(0.0).css_classes(vec!["dim-label"]).build();
-        let directives_view = SourceView::builder().wrap_mode(gtk4::WrapMode::WordChar).editable(true).monospace(true).build();
-        directives_view.add_css_class("view");
-        let dir_scroll = ScrolledWindow::builder().child(&directives_view)
-            .propagate_natural_height(true)
-            .min_content_height(150)
-            .max_content_height(600)
-            .valign(gtk4::Align::Start)
-            .build();
-        let box_dir = Box::new(Orientation::Vertical, 4);
-        box_dir.append(&directives_label);
-        box_dir.append(&dir_scroll);
+            let label = Label::builder().label(title).xalign(0.0).css_classes(vec!["dim-label"]).build();
+            let view = SourceView::builder().wrap_mode(gtk4::WrapMode::WordChar).editable(true).monospace(true).build();
+            view.add_css_class("view");
+            view.set_vexpand(true);
 
-        let engrams_label = Label::builder().label("ENGRAMS").xalign(0.0).css_classes(vec!["dim-label"]).build();
-        let engrams_view = SourceView::builder().wrap_mode(gtk4::WrapMode::WordChar).editable(true).monospace(true).build();
-        engrams_view.add_css_class("view");
-        let eng_scroll = ScrolledWindow::builder().child(&engrams_view)
-            .propagate_natural_height(true)
-            .min_content_height(150)
-            .max_content_height(600)
-            .valign(gtk4::Align::Start)
-            .build();
-        let box_eng = Box::new(Orientation::Vertical, 4);
-        box_eng.append(&engrams_label);
-        box_eng.append(&eng_scroll);
+            let scroll = ScrolledWindow::builder()
+                .child(&view)
+                .hscrollbar_policy(PolicyType::Never)
+                .vscrollbar_policy(PolicyType::Automatic)
+                .vexpand(true)
+                .build();
 
-        let prompt_label = Label::builder().label("PROMPT").xalign(0.0).css_classes(vec!["dim-label"]).build();
-        let prompt_view = SourceView::builder().wrap_mode(gtk4::WrapMode::WordChar).editable(true).monospace(true).build();
-        prompt_view.add_css_class("view");
-        let prm_scroll = ScrolledWindow::builder().child(&prompt_view)
-            .propagate_natural_height(true)
-            .min_content_height(150)
-            .max_content_height(600)
-            .valign(gtk4::Align::Start)
-            .build();
-        let box_prm = Box::new(Orientation::Vertical, 4);
-        box_prm.append(&prompt_label);
-        box_prm.append(&prm_scroll);
+            section_box.append(&label);
+            section_box.append(&scroll);
 
-        let paned_3 = Paned::builder().orientation(Orientation::Vertical).wide_handle(true).build();
+            (section_box, view)
+        };
+
+        let (box_sys, system_view) = create_staging_section("SYSTEM");
+        let (box_dir, directives_view) = create_staging_section("DIRECTIVES");
+        let (box_eng, engrams_view) = create_staging_section("ENGRAMS");
+        let (box_prm, prompt_view) = create_staging_section("PROMPT");
+
+        let paned_1 = Paned::new(Orientation::Vertical);
+        let paned_2 = Paned::new(Orientation::Vertical);
+        let paned_3 = Paned::new(Orientation::Vertical);
+
+        paned_1.set_wide_handle(true);
+        paned_2.set_wide_handle(true);
+        paned_3.set_wide_handle(true);
+
+        // Prevent squishing to 0
+        paned_1.set_shrink_start_child(false); paned_1.set_shrink_end_child(false);
+        paned_2.set_shrink_start_child(false); paned_2.set_shrink_end_child(false);
+        paned_3.set_shrink_start_child(false); paned_3.set_shrink_end_child(false);
+
+        // HARD LOCK total height so the cascade actually exists
+        paned_1.set_height_request(800);
+
+        // Mathematically distribute the sliders (200px each)
+        paned_1.set_position(200);
+        paned_2.set_position(200);
+        paned_3.set_position(200);
+
         paned_3.set_start_child(Some(&box_eng));
         paned_3.set_end_child(Some(&box_prm));
 
-        let paned_2 = Paned::builder().orientation(Orientation::Vertical).wide_handle(true).build();
         paned_2.set_start_child(Some(&box_dir));
         paned_2.set_end_child(Some(&paned_3));
 
-        let paned_1 = Paned::builder().orientation(Orientation::Vertical).wide_handle(true).build();
         paned_1.set_start_child(Some(&box_sys));
         paned_1.set_end_child(Some(&paned_2));
 
@@ -797,38 +789,6 @@ fn build_gnome_ui(
         let Some(staging_box) = expander.next_sibling().and_then(|c| c.downcast::<Box>().ok()) else { return; };
         let Some(pulse_box) = staging_box.next_sibling().and_then(|c| c.downcast::<Box>().ok()) else { return; };
 
-        // Extract children for Staging mode (The Paned Cascade)
-        let Some(paned_1) = staging_box.first_child().and_then(|c| c.downcast::<Paned>().ok()) else { return; };
-        let Some(actions_box) = paned_1.next_sibling().and_then(|c| c.downcast::<Box>().ok()) else { return; };
-
-        // Cascade 1: System
-        let Some(box_sys) = paned_1.start_child().and_then(|c| c.downcast::<Box>().ok()) else { return; };
-        let Some(sys_scroll) = box_sys.last_child().and_then(|c| c.downcast::<ScrolledWindow>().ok()) else { return; };
-        let Some(system_view) = sys_scroll.child().and_downcast::<SourceView>() else { return; };
-
-        // Cascade 2: Directives
-        let Some(paned_2) = paned_1.end_child().and_then(|c| c.downcast::<Paned>().ok()) else { return; };
-        let Some(box_dir) = paned_2.start_child().and_then(|c| c.downcast::<Box>().ok()) else { return; };
-        let Some(dir_scroll) = box_dir.last_child().and_then(|c| c.downcast::<ScrolledWindow>().ok()) else { return; };
-        let Some(directives_view) = dir_scroll.child().and_downcast::<SourceView>() else { return; };
-
-        // Cascade 3: Engrams & Prompt
-        let Some(paned_3) = paned_2.end_child().and_then(|c| c.downcast::<Paned>().ok()) else { return; };
-
-        let Some(box_eng) = paned_3.start_child().and_then(|c| c.downcast::<Box>().ok()) else { return; };
-        let Some(eng_scroll) = box_eng.last_child().and_then(|c| c.downcast::<ScrolledWindow>().ok()) else { return; };
-        let Some(engrams_view) = eng_scroll.child().and_downcast::<SourceView>() else { return; };
-
-        let Some(box_prm) = paned_3.end_child().and_then(|c| c.downcast::<Box>().ok()) else { return; };
-        let Some(prm_scroll) = box_prm.last_child().and_then(|c| c.downcast::<ScrolledWindow>().ok()) else { return; };
-        let Some(prompt_view) = prm_scroll.child().and_downcast::<SourceView>() else { return; };
-
-        // Actions
-        let Some(cancel_btn) = actions_box.first_child().and_then(|c| c.downcast::<Button>().ok()) else { return; };
-        let Some(dispatch_btn) = cancel_btn.next_sibling().and_then(|c| c.downcast::<Button>().ok()) else { return; };
-
-        let message_type = obj.message_type();
-
         bubble.remove_css_class("architect-bubble");
         bubble.remove_css_class("una-bubble");
         left_spacer.set_visible(false);
@@ -838,6 +798,35 @@ fn build_gnome_ui(
         expander.set_visible(false);
         staging_box.set_visible(false);
         pulse_box.set_visible(false);
+        left_expand_btn.set_visible(false);
+        right_expand_btn.set_visible(false);
+
+        // Extract children for Staging mode (The Paned Cascade)
+        let Some(paned_1) = staging_box.first_child().and_then(|c| c.downcast::<Paned>().ok()) else { return; };
+        let Some(actions_box) = paned_1.next_sibling().and_then(|c| c.downcast::<Box>().ok()) else { return; };
+
+        let Some(box_sys) = paned_1.start_child().and_then(|c| c.downcast::<Box>().ok()) else { return; };
+        let Some(sys_scroll) = box_sys.last_child().and_then(|c| c.downcast::<ScrolledWindow>().ok()) else { return; };
+        let Some(system_view) = sys_scroll.child().and_downcast::<SourceView>() else { return; };
+
+        let Some(paned_2) = paned_1.end_child().and_then(|c| c.downcast::<Paned>().ok()) else { return; };
+        let Some(box_dir) = paned_2.start_child().and_then(|c| c.downcast::<Box>().ok()) else { return; };
+        let Some(dir_scroll) = box_dir.last_child().and_then(|c| c.downcast::<ScrolledWindow>().ok()) else { return; };
+        let Some(directives_view) = dir_scroll.child().and_downcast::<SourceView>() else { return; };
+
+        let Some(paned_3) = paned_2.end_child().and_then(|c| c.downcast::<Paned>().ok()) else { return; };
+        let Some(box_eng) = paned_3.start_child().and_then(|c| c.downcast::<Box>().ok()) else { return; };
+        let Some(eng_scroll) = box_eng.last_child().and_then(|c| c.downcast::<ScrolledWindow>().ok()) else { return; };
+        let Some(engrams_view) = eng_scroll.child().and_downcast::<SourceView>() else { return; };
+
+        let Some(box_prm) = paned_3.end_child().and_then(|c| c.downcast::<Box>().ok()) else { return; };
+        let Some(prm_scroll) = box_prm.last_child().and_then(|c| c.downcast::<ScrolledWindow>().ok()) else { return; };
+        let Some(prompt_view) = prm_scroll.child().and_downcast::<SourceView>() else { return; };
+
+        let Some(cancel_btn) = actions_box.first_child().and_then(|c| c.downcast::<Button>().ok()) else { return; };
+        let Some(dispatch_btn) = cancel_btn.next_sibling().and_then(|c| c.downcast::<Button>().ok()) else { return; };
+
+        let message_type = obj.message_type();
 
         if message_type == 1 {
             // STAGING MODE
@@ -2164,69 +2153,61 @@ fn build_gtk_ui(
         let staging_box = Box::new(Orientation::Vertical, 8);
         staging_box.set_visible(false);
         staging_box.set_hexpand(true);
-        staging_box.set_width_request(800);
 
-        let system_label = Label::builder().label("SYSTEM").xalign(0.0).css_classes(vec!["dim-label"]).build();
-        let system_view = SourceView::builder().wrap_mode(gtk4::WrapMode::WordChar).editable(true).monospace(true).build();
-        system_view.add_css_class("view");
-        let sys_scroll = ScrolledWindow::builder().child(&system_view)
-            .propagate_natural_height(true)
-            .min_content_height(150)
-            .max_content_height(600)
-            .valign(gtk4::Align::Start)
-            .build();
-        let box_sys = Box::new(Orientation::Vertical, 4);
-        box_sys.append(&system_label);
-        box_sys.append(&sys_scroll);
+        let create_staging_section = |title: &str| -> (Box, SourceView) {
+            let section_box = Box::new(Orientation::Vertical, 4);
+            section_box.set_vexpand(true);
 
-        let directives_label = Label::builder().label("DIRECTIVES").xalign(0.0).css_classes(vec!["dim-label"]).build();
-        let directives_view = SourceView::builder().wrap_mode(gtk4::WrapMode::WordChar).editable(true).monospace(true).build();
-        directives_view.add_css_class("view");
-        let dir_scroll = ScrolledWindow::builder().child(&directives_view)
-            .propagate_natural_height(true)
-            .min_content_height(150)
-            .max_content_height(600)
-            .valign(gtk4::Align::Start)
-            .build();
-        let box_dir = Box::new(Orientation::Vertical, 4);
-        box_dir.append(&directives_label);
-        box_dir.append(&dir_scroll);
+            let label = Label::builder().label(title).xalign(0.0).css_classes(vec!["dim-label"]).build();
+            let view = SourceView::builder().wrap_mode(gtk4::WrapMode::WordChar).editable(true).monospace(true).build();
+            view.add_css_class("view");
+            view.set_vexpand(true);
 
-        let engrams_label = Label::builder().label("ENGRAMS").xalign(0.0).css_classes(vec!["dim-label"]).build();
-        let engrams_view = SourceView::builder().wrap_mode(gtk4::WrapMode::WordChar).editable(true).monospace(true).build();
-        engrams_view.add_css_class("view");
-        let eng_scroll = ScrolledWindow::builder().child(&engrams_view)
-            .propagate_natural_height(true)
-            .min_content_height(150)
-            .max_content_height(600)
-            .valign(gtk4::Align::Start)
-            .build();
-        let box_eng = Box::new(Orientation::Vertical, 4);
-        box_eng.append(&engrams_label);
-        box_eng.append(&eng_scroll);
+            let scroll = ScrolledWindow::builder()
+                .child(&view)
+                .hscrollbar_policy(PolicyType::Never)
+                .vscrollbar_policy(PolicyType::Automatic)
+                .vexpand(true)
+                .build();
 
-        let prompt_label = Label::builder().label("PROMPT").xalign(0.0).css_classes(vec!["dim-label"]).build();
-        let prompt_view = SourceView::builder().wrap_mode(gtk4::WrapMode::WordChar).editable(true).monospace(true).build();
-        prompt_view.add_css_class("view");
-        let prm_scroll = ScrolledWindow::builder().child(&prompt_view)
-            .propagate_natural_height(true)
-            .min_content_height(150)
-            .max_content_height(600)
-            .valign(gtk4::Align::Start)
-            .build();
-        let box_prm = Box::new(Orientation::Vertical, 4);
-        box_prm.append(&prompt_label);
-        box_prm.append(&prm_scroll);
+            section_box.append(&label);
+            section_box.append(&scroll);
 
-        let paned_3 = Paned::builder().orientation(Orientation::Vertical).wide_handle(true).build();
+            (section_box, view)
+        };
+
+        let (box_sys, system_view) = create_staging_section("SYSTEM");
+        let (box_dir, directives_view) = create_staging_section("DIRECTIVES");
+        let (box_eng, engrams_view) = create_staging_section("ENGRAMS");
+        let (box_prm, prompt_view) = create_staging_section("PROMPT");
+
+        let paned_1 = Paned::new(Orientation::Vertical);
+        let paned_2 = Paned::new(Orientation::Vertical);
+        let paned_3 = Paned::new(Orientation::Vertical);
+
+        paned_1.set_wide_handle(true);
+        paned_2.set_wide_handle(true);
+        paned_3.set_wide_handle(true);
+
+        // Prevent squishing to 0
+        paned_1.set_shrink_start_child(false); paned_1.set_shrink_end_child(false);
+        paned_2.set_shrink_start_child(false); paned_2.set_shrink_end_child(false);
+        paned_3.set_shrink_start_child(false); paned_3.set_shrink_end_child(false);
+
+        // HARD LOCK total height so the cascade actually exists
+        paned_1.set_height_request(800);
+
+        // Mathematically distribute the sliders (200px each)
+        paned_1.set_position(200);
+        paned_2.set_position(200);
+        paned_3.set_position(200);
+
         paned_3.set_start_child(Some(&box_eng));
         paned_3.set_end_child(Some(&box_prm));
 
-        let paned_2 = Paned::builder().orientation(Orientation::Vertical).wide_handle(true).build();
         paned_2.set_start_child(Some(&box_dir));
         paned_2.set_end_child(Some(&paned_3));
 
-        let paned_1 = Paned::builder().orientation(Orientation::Vertical).wide_handle(true).build();
         paned_1.set_start_child(Some(&box_sys));
         paned_1.set_end_child(Some(&paned_2));
 
@@ -2326,38 +2307,6 @@ fn build_gtk_ui(
         let Some(staging_box) = expander.next_sibling().and_then(|c| c.downcast::<Box>().ok()) else { return; };
         let Some(pulse_box) = staging_box.next_sibling().and_then(|c| c.downcast::<Box>().ok()) else { return; };
 
-        // Extract children for Staging mode (The Paned Cascade)
-        let Some(paned_1) = staging_box.first_child().and_then(|c| c.downcast::<Paned>().ok()) else { return; };
-        let Some(actions_box) = paned_1.next_sibling().and_then(|c| c.downcast::<Box>().ok()) else { return; };
-
-        // Cascade 1: System
-        let Some(box_sys) = paned_1.start_child().and_then(|c| c.downcast::<Box>().ok()) else { return; };
-        let Some(sys_scroll) = box_sys.last_child().and_then(|c| c.downcast::<ScrolledWindow>().ok()) else { return; };
-        let Some(system_view) = sys_scroll.child().and_downcast::<SourceView>() else { return; };
-
-        // Cascade 2: Directives
-        let Some(paned_2) = paned_1.end_child().and_then(|c| c.downcast::<Paned>().ok()) else { return; };
-        let Some(box_dir) = paned_2.start_child().and_then(|c| c.downcast::<Box>().ok()) else { return; };
-        let Some(dir_scroll) = box_dir.last_child().and_then(|c| c.downcast::<ScrolledWindow>().ok()) else { return; };
-        let Some(directives_view) = dir_scroll.child().and_downcast::<SourceView>() else { return; };
-
-        // Cascade 3: Engrams & Prompt
-        let Some(paned_3) = paned_2.end_child().and_then(|c| c.downcast::<Paned>().ok()) else { return; };
-
-        let Some(box_eng) = paned_3.start_child().and_then(|c| c.downcast::<Box>().ok()) else { return; };
-        let Some(eng_scroll) = box_eng.last_child().and_then(|c| c.downcast::<ScrolledWindow>().ok()) else { return; };
-        let Some(engrams_view) = eng_scroll.child().and_downcast::<SourceView>() else { return; };
-
-        let Some(box_prm) = paned_3.end_child().and_then(|c| c.downcast::<Box>().ok()) else { return; };
-        let Some(prm_scroll) = box_prm.last_child().and_then(|c| c.downcast::<ScrolledWindow>().ok()) else { return; };
-        let Some(prompt_view) = prm_scroll.child().and_downcast::<SourceView>() else { return; };
-
-        // Actions
-        let Some(cancel_btn) = actions_box.first_child().and_then(|c| c.downcast::<Button>().ok()) else { return; };
-        let Some(dispatch_btn) = cancel_btn.next_sibling().and_then(|c| c.downcast::<Button>().ok()) else { return; };
-
-        let message_type = obj.message_type();
-
         bubble.remove_css_class("architect-bubble");
         bubble.remove_css_class("una-bubble");
         left_spacer.set_visible(false);
@@ -2367,6 +2316,35 @@ fn build_gtk_ui(
         expander.set_visible(false);
         staging_box.set_visible(false);
         pulse_box.set_visible(false);
+        left_expand_btn.set_visible(false);
+        right_expand_btn.set_visible(false);
+
+        // Extract children for Staging mode (The Paned Cascade)
+        let Some(paned_1) = staging_box.first_child().and_then(|c| c.downcast::<Paned>().ok()) else { return; };
+        let Some(actions_box) = paned_1.next_sibling().and_then(|c| c.downcast::<Box>().ok()) else { return; };
+
+        let Some(box_sys) = paned_1.start_child().and_then(|c| c.downcast::<Box>().ok()) else { return; };
+        let Some(sys_scroll) = box_sys.last_child().and_then(|c| c.downcast::<ScrolledWindow>().ok()) else { return; };
+        let Some(system_view) = sys_scroll.child().and_downcast::<SourceView>() else { return; };
+
+        let Some(paned_2) = paned_1.end_child().and_then(|c| c.downcast::<Paned>().ok()) else { return; };
+        let Some(box_dir) = paned_2.start_child().and_then(|c| c.downcast::<Box>().ok()) else { return; };
+        let Some(dir_scroll) = box_dir.last_child().and_then(|c| c.downcast::<ScrolledWindow>().ok()) else { return; };
+        let Some(directives_view) = dir_scroll.child().and_downcast::<SourceView>() else { return; };
+
+        let Some(paned_3) = paned_2.end_child().and_then(|c| c.downcast::<Paned>().ok()) else { return; };
+        let Some(box_eng) = paned_3.start_child().and_then(|c| c.downcast::<Box>().ok()) else { return; };
+        let Some(eng_scroll) = box_eng.last_child().and_then(|c| c.downcast::<ScrolledWindow>().ok()) else { return; };
+        let Some(engrams_view) = eng_scroll.child().and_downcast::<SourceView>() else { return; };
+
+        let Some(box_prm) = paned_3.end_child().and_then(|c| c.downcast::<Box>().ok()) else { return; };
+        let Some(prm_scroll) = box_prm.last_child().and_then(|c| c.downcast::<ScrolledWindow>().ok()) else { return; };
+        let Some(prompt_view) = prm_scroll.child().and_downcast::<SourceView>() else { return; };
+
+        let Some(cancel_btn) = actions_box.first_child().and_then(|c| c.downcast::<Button>().ok()) else { return; };
+        let Some(dispatch_btn) = cancel_btn.next_sibling().and_then(|c| c.downcast::<Button>().ok()) else { return; };
+
+        let message_type = obj.message_type();
 
         if message_type == 1 {
             // STAGING MODE
