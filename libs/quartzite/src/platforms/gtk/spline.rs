@@ -559,8 +559,6 @@ fn build_gnome_ui(
     let console_filter = FilterListModel::new(Some(console_store.clone()), None::<gtk4::Filter>);
     let console_selection = NoSelection::new(Some(console_filter));
 
-    let adj_for_factory = adj.clone();
-
     let console_factory = SignalListItemFactory::new();
     console_factory.connect_setup(move |_factory, item| {
         let item = item.downcast_ref::<ListItem>().unwrap();
@@ -2074,8 +2072,6 @@ fn build_gtk_ui(
     let console_store = gio::ListStore::new::<DispatchObject>();
     let console_filter = FilterListModel::new(Some(console_store.clone()), None::<gtk4::Filter>);
     let console_selection = NoSelection::new(Some(console_filter));
-
-    let adj_for_factory = adj.clone();
 
     let console_factory = SignalListItemFactory::new();
     console_factory.connect_setup(move |_factory, item| {

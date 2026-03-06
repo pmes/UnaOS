@@ -29,7 +29,9 @@ use async_channel::Receiver;
 use gneiss_pal::{Event, GuiUpdate, AppHandler};
 
 pub struct Backend<A: AppHandler> {
+    #[allow(dead_code)]
     app_handler: Rc<RefCell<A>>,
+    #[allow(dead_code)]
     app_id: String,
 }
 
