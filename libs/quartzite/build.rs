@@ -30,7 +30,8 @@ fn main() {
             let mut builder = cxx_qt_build::CxxQtBuilder::new()
                 .qt_module("Network")
                 .qt_module("Quick")
-                .file("src/platforms/qt/bridge.rs");
+                .file("src/platforms/qt/bridge.rs")
+                .file("src/platforms/qt/mod.rs");
 
             builder = builder.cc_builder(|cc| {
                 cc.include("src/platforms/qt");
