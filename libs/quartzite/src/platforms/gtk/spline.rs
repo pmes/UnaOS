@@ -778,41 +778,54 @@ fn build_gnome_ui(
     let tx_dispatch = tx_event.clone();
     let console_store_bind = console_store.clone();
     console_factory.connect_bind(move |_factory, item| {
-        let item = item.downcast_ref::<ListItem>().unwrap();
-        let root = item.child().unwrap().downcast::<Box>().unwrap();
+        let Some(item) = item.downcast_ref::<ListItem>() else { return; };
+        let Some(root) = item.child().and_then(|c| c.downcast::<Box>().ok()) else { return; };
 
-        let left_spacer = root.first_child().unwrap().downcast::<Box>().unwrap();
-        let bubble = left_spacer.next_sibling().unwrap().downcast::<Box>().unwrap();
-        let right_spacer = bubble.next_sibling().unwrap().downcast::<Box>().unwrap();
+        let Some(left_spacer) = root.first_child().and_then(|c| c.downcast::<Box>().ok()) else { return; };
+        let Some(bubble) = left_spacer.next_sibling().and_then(|c| c.downcast::<Box>().ok()) else { return; };
+        let Some(right_spacer) = bubble.next_sibling().and_then(|c| c.downcast::<Box>().ok()) else { return; };
 
-        let obj = item.item().unwrap().downcast::<DispatchObject>().unwrap();
+        let Some(obj) = item.item().and_then(|c| c.downcast::<DispatchObject>().ok()) else { return; };
 
-        let header_box = bubble.first_child().unwrap().downcast::<Box>().unwrap();
-        let left_expand_btn = header_box.first_child().unwrap().downcast::<Button>().unwrap();
-        let meta_label = left_expand_btn.next_sibling().unwrap().downcast::<Label>().unwrap();
-        let right_expand_btn = header_box.last_child().unwrap().downcast::<Button>().unwrap();
+        let Some(header_box) = bubble.first_child().and_then(|c| c.downcast::<Box>().ok()) else { return; };
+        let Some(left_expand_btn) = header_box.first_child().and_then(|c| c.downcast::<Button>().ok()) else { return; };
+        let Some(meta_label) = left_expand_btn.next_sibling().and_then(|c| c.downcast::<Label>().ok()) else { return; };
+        let Some(right_expand_btn) = header_box.last_child().and_then(|c| c.downcast::<Button>().ok()) else { return; };
 
-        let chat_view = header_box.next_sibling().unwrap().downcast::<SourceView>().unwrap();
-        let expander = chat_view.next_sibling().unwrap().downcast::<Expander>().unwrap();
-        let staging_box = expander.next_sibling().unwrap().downcast::<Box>().unwrap();
-        let pulse_box = staging_box.next_sibling().unwrap().downcast::<Box>().unwrap();
+        let Some(chat_view) = header_box.next_sibling().and_then(|c| c.downcast::<SourceView>().ok()) else { return; };
+        let Some(expander) = chat_view.next_sibling().and_then(|c| c.downcast::<Expander>().ok()) else { return; };
+        let Some(staging_box) = expander.next_sibling().and_then(|c| c.downcast::<Box>().ok()) else { return; };
+        let Some(pulse_box) = staging_box.next_sibling().and_then(|c| c.downcast::<Box>().ok()) else { return; };
 
-        // Extract children for Staging mode
-        let sys_scroll = staging_box.first_child().unwrap().next_sibling().unwrap().downcast::<ScrolledWindow>().unwrap();
-        let system_view = sys_scroll.child().unwrap().downcast::<SourceView>().unwrap();
+        // Extract children for Staging mode (The Paned Cascade)
+        let Some(paned_1) = staging_box.first_child().and_then(|c| c.downcast::<Paned>().ok()) else { return; };
+        let Some(actions_box) = paned_1.next_sibling().and_then(|c| c.downcast::<Box>().ok()) else { return; };
 
-        let dir_scroll = sys_scroll.next_sibling().unwrap().next_sibling().unwrap().downcast::<ScrolledWindow>().unwrap();
-        let directives_view = dir_scroll.child().unwrap().downcast::<SourceView>().unwrap();
+        // Cascade 1: System
+        let Some(box_sys) = paned_1.start_child().and_then(|c| c.downcast::<Box>().ok()) else { return; };
+        let Some(sys_scroll) = box_sys.last_child().and_then(|c| c.downcast::<ScrolledWindow>().ok()) else { return; };
+        let Some(system_view) = sys_scroll.child().and_downcast::<SourceView>() else { return; };
 
-        let eng_scroll = dir_scroll.next_sibling().unwrap().next_sibling().unwrap().downcast::<ScrolledWindow>().unwrap();
-        let engrams_view = eng_scroll.child().unwrap().downcast::<SourceView>().unwrap();
+        // Cascade 2: Directives
+        let Some(paned_2) = paned_1.end_child().and_then(|c| c.downcast::<Paned>().ok()) else { return; };
+        let Some(box_dir) = paned_2.start_child().and_then(|c| c.downcast::<Box>().ok()) else { return; };
+        let Some(dir_scroll) = box_dir.last_child().and_then(|c| c.downcast::<ScrolledWindow>().ok()) else { return; };
+        let Some(directives_view) = dir_scroll.child().and_downcast::<SourceView>() else { return; };
 
-        let prm_scroll = eng_scroll.next_sibling().unwrap().next_sibling().unwrap().downcast::<ScrolledWindow>().unwrap();
-        let prompt_view = prm_scroll.child().unwrap().downcast::<SourceView>().unwrap();
+        // Cascade 3: Engrams & Prompt
+        let Some(paned_3) = paned_2.end_child().and_then(|c| c.downcast::<Paned>().ok()) else { return; };
 
-        let actions_box = prm_scroll.next_sibling().unwrap().downcast::<Box>().unwrap();
-        let cancel_btn = actions_box.first_child().unwrap().downcast::<Button>().unwrap();
-        let dispatch_btn = cancel_btn.next_sibling().unwrap().downcast::<Button>().unwrap();
+        let Some(box_eng) = paned_3.start_child().and_then(|c| c.downcast::<Box>().ok()) else { return; };
+        let Some(eng_scroll) = box_eng.last_child().and_then(|c| c.downcast::<ScrolledWindow>().ok()) else { return; };
+        let Some(engrams_view) = eng_scroll.child().and_downcast::<SourceView>() else { return; };
+
+        let Some(box_prm) = paned_3.end_child().and_then(|c| c.downcast::<Box>().ok()) else { return; };
+        let Some(prm_scroll) = box_prm.last_child().and_then(|c| c.downcast::<ScrolledWindow>().ok()) else { return; };
+        let Some(prompt_view) = prm_scroll.child().and_downcast::<SourceView>() else { return; };
+
+        // Actions
+        let Some(cancel_btn) = actions_box.first_child().and_then(|c| c.downcast::<Button>().ok()) else { return; };
+        let Some(dispatch_btn) = cancel_btn.next_sibling().and_then(|c| c.downcast::<Button>().ok()) else { return; };
 
         let message_type = obj.message_type();
 
@@ -1074,9 +1087,11 @@ fn build_gnome_ui(
                 left_spacer.set_visible(false);
                 right_spacer.set_visible(true);
                 expander.set_label(Some(&format!("{} | {} | {}", sender, subject, timestamp)));
-                let scroll = expander.child().unwrap().downcast::<ScrolledWindow>().unwrap();
-                let content_view = scroll.child().unwrap().downcast::<SourceView>().unwrap();
-                content_view.buffer().set_text(&content);
+                if let Some(scroll) = expander.child().and_then(|c| c.downcast::<ScrolledWindow>().ok()) {
+                    if let Some(content_view) = scroll.child().and_then(|c| c.downcast::<SourceView>().ok()) {
+                        content_view.buffer().set_text(&content);
+                    }
+                }
                 expander.set_expanded(false);
             }
         }
@@ -2292,41 +2307,54 @@ fn build_gtk_ui(
     let tx_dispatch = tx_event.clone();
     let console_store_bind = console_store.clone();
     console_factory.connect_bind(move |_factory, item| {
-        let item = item.downcast_ref::<ListItem>().unwrap();
-        let root = item.child().unwrap().downcast::<Box>().unwrap();
+        let Some(item) = item.downcast_ref::<ListItem>() else { return; };
+        let Some(root) = item.child().and_then(|c| c.downcast::<Box>().ok()) else { return; };
 
-        let left_spacer = root.first_child().unwrap().downcast::<Box>().unwrap();
-        let bubble = left_spacer.next_sibling().unwrap().downcast::<Box>().unwrap();
-        let right_spacer = bubble.next_sibling().unwrap().downcast::<Box>().unwrap();
+        let Some(left_spacer) = root.first_child().and_then(|c| c.downcast::<Box>().ok()) else { return; };
+        let Some(bubble) = left_spacer.next_sibling().and_then(|c| c.downcast::<Box>().ok()) else { return; };
+        let Some(right_spacer) = bubble.next_sibling().and_then(|c| c.downcast::<Box>().ok()) else { return; };
 
-        let obj = item.item().unwrap().downcast::<DispatchObject>().unwrap();
+        let Some(obj) = item.item().and_then(|c| c.downcast::<DispatchObject>().ok()) else { return; };
 
-        let header_box = bubble.first_child().unwrap().downcast::<Box>().unwrap();
-        let left_expand_btn = header_box.first_child().unwrap().downcast::<Button>().unwrap();
-        let meta_label = left_expand_btn.next_sibling().unwrap().downcast::<Label>().unwrap();
-        let right_expand_btn = header_box.last_child().unwrap().downcast::<Button>().unwrap();
+        let Some(header_box) = bubble.first_child().and_then(|c| c.downcast::<Box>().ok()) else { return; };
+        let Some(left_expand_btn) = header_box.first_child().and_then(|c| c.downcast::<Button>().ok()) else { return; };
+        let Some(meta_label) = left_expand_btn.next_sibling().and_then(|c| c.downcast::<Label>().ok()) else { return; };
+        let Some(right_expand_btn) = header_box.last_child().and_then(|c| c.downcast::<Button>().ok()) else { return; };
 
-        let chat_view = header_box.next_sibling().unwrap().downcast::<SourceView>().unwrap();
-        let expander = chat_view.next_sibling().unwrap().downcast::<Expander>().unwrap();
-        let staging_box = expander.next_sibling().unwrap().downcast::<Box>().unwrap();
-        let pulse_box = staging_box.next_sibling().unwrap().downcast::<Box>().unwrap();
+        let Some(chat_view) = header_box.next_sibling().and_then(|c| c.downcast::<SourceView>().ok()) else { return; };
+        let Some(expander) = chat_view.next_sibling().and_then(|c| c.downcast::<Expander>().ok()) else { return; };
+        let Some(staging_box) = expander.next_sibling().and_then(|c| c.downcast::<Box>().ok()) else { return; };
+        let Some(pulse_box) = staging_box.next_sibling().and_then(|c| c.downcast::<Box>().ok()) else { return; };
 
-        // Extract children for Staging mode
-        let sys_scroll = staging_box.first_child().unwrap().next_sibling().unwrap().downcast::<ScrolledWindow>().unwrap();
-        let system_view = sys_scroll.child().unwrap().downcast::<SourceView>().unwrap();
+        // Extract children for Staging mode (The Paned Cascade)
+        let Some(paned_1) = staging_box.first_child().and_then(|c| c.downcast::<Paned>().ok()) else { return; };
+        let Some(actions_box) = paned_1.next_sibling().and_then(|c| c.downcast::<Box>().ok()) else { return; };
 
-        let dir_scroll = sys_scroll.next_sibling().unwrap().next_sibling().unwrap().downcast::<ScrolledWindow>().unwrap();
-        let directives_view = dir_scroll.child().unwrap().downcast::<SourceView>().unwrap();
+        // Cascade 1: System
+        let Some(box_sys) = paned_1.start_child().and_then(|c| c.downcast::<Box>().ok()) else { return; };
+        let Some(sys_scroll) = box_sys.last_child().and_then(|c| c.downcast::<ScrolledWindow>().ok()) else { return; };
+        let Some(system_view) = sys_scroll.child().and_downcast::<SourceView>() else { return; };
 
-        let eng_scroll = dir_scroll.next_sibling().unwrap().next_sibling().unwrap().downcast::<ScrolledWindow>().unwrap();
-        let engrams_view = eng_scroll.child().unwrap().downcast::<SourceView>().unwrap();
+        // Cascade 2: Directives
+        let Some(paned_2) = paned_1.end_child().and_then(|c| c.downcast::<Paned>().ok()) else { return; };
+        let Some(box_dir) = paned_2.start_child().and_then(|c| c.downcast::<Box>().ok()) else { return; };
+        let Some(dir_scroll) = box_dir.last_child().and_then(|c| c.downcast::<ScrolledWindow>().ok()) else { return; };
+        let Some(directives_view) = dir_scroll.child().and_downcast::<SourceView>() else { return; };
 
-        let prm_scroll = eng_scroll.next_sibling().unwrap().next_sibling().unwrap().downcast::<ScrolledWindow>().unwrap();
-        let prompt_view = prm_scroll.child().unwrap().downcast::<SourceView>().unwrap();
+        // Cascade 3: Engrams & Prompt
+        let Some(paned_3) = paned_2.end_child().and_then(|c| c.downcast::<Paned>().ok()) else { return; };
 
-        let actions_box = prm_scroll.next_sibling().unwrap().downcast::<Box>().unwrap();
-        let cancel_btn = actions_box.first_child().unwrap().downcast::<Button>().unwrap();
-        let dispatch_btn = cancel_btn.next_sibling().unwrap().downcast::<Button>().unwrap();
+        let Some(box_eng) = paned_3.start_child().and_then(|c| c.downcast::<Box>().ok()) else { return; };
+        let Some(eng_scroll) = box_eng.last_child().and_then(|c| c.downcast::<ScrolledWindow>().ok()) else { return; };
+        let Some(engrams_view) = eng_scroll.child().and_downcast::<SourceView>() else { return; };
+
+        let Some(box_prm) = paned_3.end_child().and_then(|c| c.downcast::<Box>().ok()) else { return; };
+        let Some(prm_scroll) = box_prm.last_child().and_then(|c| c.downcast::<ScrolledWindow>().ok()) else { return; };
+        let Some(prompt_view) = prm_scroll.child().and_downcast::<SourceView>() else { return; };
+
+        // Actions
+        let Some(cancel_btn) = actions_box.first_child().and_then(|c| c.downcast::<Button>().ok()) else { return; };
+        let Some(dispatch_btn) = cancel_btn.next_sibling().and_then(|c| c.downcast::<Button>().ok()) else { return; };
 
         let message_type = obj.message_type();
 
@@ -2588,9 +2616,11 @@ fn build_gtk_ui(
                 left_spacer.set_visible(false);
                 right_spacer.set_visible(true);
                 expander.set_label(Some(&format!("{} | {} | {}", sender, subject, timestamp)));
-                let scroll = expander.child().unwrap().downcast::<ScrolledWindow>().unwrap();
-                let content_view = scroll.child().unwrap().downcast::<SourceView>().unwrap();
-                content_view.buffer().set_text(&content);
+                if let Some(scroll) = expander.child().and_then(|c| c.downcast::<ScrolledWindow>().ok()) {
+                    if let Some(content_view) = scroll.child().and_then(|c| c.downcast::<SourceView>().ok()) {
+                        content_view.buffer().set_text(&content);
+                    }
+                }
                 expander.set_expanded(false);
             }
         }
