@@ -570,6 +570,7 @@ fn build_gnome_ui(
         root.append(&left_spacer);
         let bubble = Box::new(Orientation::Vertical, 4);
         bubble.add_css_class("bubble-box");
+        bubble.set_hexpand(true);
 
         let header_box = Box::new(Orientation::Horizontal, 8);
 
@@ -635,10 +636,12 @@ fn build_gnome_ui(
         let staging_box = Box::new(Orientation::Vertical, 8);
         staging_box.set_visible(false);
         staging_box.set_hexpand(true);
+        staging_box.set_vexpand(true);
 
         let create_staging_section = |title: &str| -> (Box, SourceView) {
             let section_box = Box::new(Orientation::Vertical, 4);
             section_box.set_vexpand(true);
+            section_box.set_hexpand(true);
 
             let label = Label::builder().label(title).xalign(0.0).css_classes(vec!["dim-label"]).build();
             let view = SourceView::builder().wrap_mode(gtk4::WrapMode::WordChar).editable(true).monospace(true).build();
@@ -649,6 +652,7 @@ fn build_gnome_ui(
                 .child(&view)
                 .hscrollbar_policy(PolicyType::Never)
                 .vscrollbar_policy(PolicyType::Automatic)
+                .min_content_height(80)
                 .vexpand(true)
                 .build();
 
@@ -671,18 +675,14 @@ fn build_gnome_ui(
         paned_2.set_wide_handle(true);
         paned_3.set_wide_handle(true);
 
+        paned_1.set_vexpand(true); paned_1.set_hexpand(true);
+        paned_2.set_vexpand(true); paned_2.set_hexpand(true);
+        paned_3.set_vexpand(true); paned_3.set_hexpand(true);
+
         // Prevent squishing to 0
         paned_1.set_shrink_start_child(false); paned_1.set_shrink_end_child(false);
         paned_2.set_shrink_start_child(false); paned_2.set_shrink_end_child(false);
         paned_3.set_shrink_start_child(false); paned_3.set_shrink_end_child(false);
-
-        // HARD LOCK total height so the cascade actually exists
-        paned_1.set_height_request(1600);
-
-        // Mathematically distribute the sliders (400px each)
-        paned_1.set_position(400);
-        paned_2.set_position(400);
-        paned_3.set_position(400);
 
         paned_3.set_start_child(Some(&box_eng));
         paned_3.set_end_child(Some(&box_prm));
@@ -2088,6 +2088,7 @@ fn build_gtk_ui(
         root.append(&left_spacer);
         let bubble = Box::new(Orientation::Vertical, 4);
         bubble.add_css_class("bubble-box");
+        bubble.set_hexpand(true);
 
         let header_box = Box::new(Orientation::Horizontal, 8);
 
@@ -2153,10 +2154,12 @@ fn build_gtk_ui(
         let staging_box = Box::new(Orientation::Vertical, 8);
         staging_box.set_visible(false);
         staging_box.set_hexpand(true);
+        staging_box.set_vexpand(true);
 
         let create_staging_section = |title: &str| -> (Box, SourceView) {
             let section_box = Box::new(Orientation::Vertical, 4);
             section_box.set_vexpand(true);
+            section_box.set_hexpand(true);
 
             let label = Label::builder().label(title).xalign(0.0).css_classes(vec!["dim-label"]).build();
             let view = SourceView::builder().wrap_mode(gtk4::WrapMode::WordChar).editable(true).monospace(true).build();
@@ -2167,6 +2170,7 @@ fn build_gtk_ui(
                 .child(&view)
                 .hscrollbar_policy(PolicyType::Never)
                 .vscrollbar_policy(PolicyType::Automatic)
+                .min_content_height(80)
                 .vexpand(true)
                 .build();
 
@@ -2189,18 +2193,14 @@ fn build_gtk_ui(
         paned_2.set_wide_handle(true);
         paned_3.set_wide_handle(true);
 
+        paned_1.set_vexpand(true); paned_1.set_hexpand(true);
+        paned_2.set_vexpand(true); paned_2.set_hexpand(true);
+        paned_3.set_vexpand(true); paned_3.set_hexpand(true);
+
         // Prevent squishing to 0
         paned_1.set_shrink_start_child(false); paned_1.set_shrink_end_child(false);
         paned_2.set_shrink_start_child(false); paned_2.set_shrink_end_child(false);
         paned_3.set_shrink_start_child(false); paned_3.set_shrink_end_child(false);
-
-        // HARD LOCK total height so the cascade actually exists
-        paned_1.set_height_request(1600);
-
-        // Mathematically distribute the sliders (400px each)
-        paned_1.set_position(400);
-        paned_2.set_position(400);
-        paned_3.set_position(400);
 
         paned_3.set_start_child(Some(&box_eng));
         paned_3.set_end_child(Some(&box_prm));
