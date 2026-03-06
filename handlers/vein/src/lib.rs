@@ -786,23 +786,13 @@ impl AppHandler for VeinHandler {
                 let _ = self.tx.send(format!("DISPATCH_PAYLOAD:{}", json_payload));
             }
             Event::LoadHistory => {
-                // Return a mock history array to the UI as requested
-                static HAS_LOADED_MOCK: AtomicBool = AtomicBool::new(false);
-                let mut mock_history = Vec::new();
-                if !HAS_LOADED_MOCK.swap(true, Ordering::SeqCst) {
-                    for i in 0..10 {
-                        mock_history.push(gneiss_pal::HistoryItem {
-                            sender: "Una-Prime".to_string(),
-                            content: format!("Archived Log Entry #{}", 10 - i),
-                            timestamp: "00:00:00".to_string(),
-                            is_chat: true,
-                        });
-                    }
-                }
-                let tx = self.gui_tx.clone();
-                tokio::spawn(async move {
-                    let _ = tx.send(GuiUpdate::HistoryBatch(mock_history)).await;
-                });
+                // Not returning anything directly from memory yet, we need access to the disk manager.
+                // However, since DiskManager is behind a Mutex inside the background thread,
+                // we should probably send a message to the background thread to handle it, or just
+                // load them if we have access. Wait, `handle_event` doesn't have direct access to `disk`.
+                // Actually, `vein`'s history logic should query `UnaFS`.
+                // To do this right, we can send a custom command via `self.tx`, e.g. "LOAD_HISTORY".
+                let _ = self.tx.send("LOAD_HISTORY".to_string());
             }
             _ => {}
         }
