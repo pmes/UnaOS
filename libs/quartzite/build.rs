@@ -23,4 +23,22 @@ fn main() {
             "quartzite.gresource",
         );
     }
+
+    #[cfg(feature = "qt")]
+    {
+        unsafe {
+            cxx_qt_build::CxxQtBuilder::new()
+                .qt_module("Network")
+                .qt_module("Quick")
+                .file("src/platforms/qt/bridge.rs")
+                .cc_builder(|cc| {
+                    cc.include("src/platforms/qt");
+                    // Explicitly add QtWidgets include path
+                    cc.include("/usr/include/x86_64-linux-gnu/qt6/QtWidgets");
+                    cc.include("/usr/include/x86_64-linux-gnu/qt6/QtQuickWidgets");
+                    cc.file("src/platforms/qt/main_window.cpp");
+                })
+                .build();
+        }
+    }
 }

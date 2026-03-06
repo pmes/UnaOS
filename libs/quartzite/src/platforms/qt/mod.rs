@@ -22,20 +22,54 @@
 //! This module will bridge UnaOS to the Qt ecosystem, providing a
 //! high-performance alternative to GTK on Linux and BSD hosts.
 
-use crate::{NativeView, NativeWindow};
+pub mod bridge;
 
-pub struct Backend;
+use crate::{NativeView, NativeWindow};
+use cxx_qt_lib::QGuiApplication;
+
+#[cxx::bridge]
+pub mod ffi {
+    unsafe extern "C++" {
+        include!("main_window.h");
+        type LumenMainWindow;
+
+        fn create_main_window() -> UniquePtr<LumenMainWindow>;
+        fn show_main_window(window: Pin<&mut LumenMainWindow>);
+    }
+}
+
+pub struct Backend {
+    app: cxx::UniquePtr<QGuiApplication>,
+    main_window: cxx::UniquePtr<ffi::LumenMainWindow>,
+}
 
 impl Backend {
     pub fn new<F>(_app_id: &str, _bootstrap_fn: F) -> Self
     where
         F: FnOnce(&NativeWindow) -> NativeView + 'static,
     {
-        // TODO: Initialize QApplication.
-        Self {}
+        // Actually, we must create a pure QApplication to use QWidgets,
+        // but cxx_qt_lib only supports QGuiApplication or QQmlApplicationEngine currently in 0.8
+        // However, if we instantiate it manually on C++ side through ffi, we can bypass this constraint.
+        // For compilation in the short-term, QGuiApplication handles the Rust loop init,
+        // while C++ handles the QMainWindow structure.
+        let app = QGuiApplication::new();
+
+        // Provide the NativeWindow and invoke bootstrap logic here
+        // The bootstrap function creates the C++ QMainWindow skeleton and wire it up
+        let window = ();
+        let main_window = _bootstrap_fn(&window);
+
+        Self { app, main_window }
     }
 
-    pub fn run(&self) {
-        // TODO: Engage the Qt event loop.
+    pub fn run(&mut self) {
+        if !self.main_window.is_null() {
+            ffi::show_main_window(self.main_window.pin_mut());
+        }
+
+        if let Some(app) = self.app.as_mut() {
+            app.exec();
+        }
     }
 }

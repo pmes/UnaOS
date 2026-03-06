@@ -57,7 +57,14 @@ impl Spline {
         #[cfg(any(all(target_os = "linux", feature = "gtk"), target_os = "macos"))]
         return self.inner.bootstrap(_window, _tx_event, _rx_gui, _rx_telemetry);
 
-        #[cfg(not(any(all(target_os = "linux", feature = "gtk"), target_os = "macos")))]
+        #[cfg(all(target_os = "linux", feature = "qt"))]
+        {
+            // Connect to Qt backend properly
+            use crate::platforms::qt::ffi;
+            return ffi::create_main_window();
+        }
+
+        #[cfg(not(any(all(target_os = "linux", feature = "gtk"), target_os = "macos", all(target_os = "linux", feature = "qt"))))]
         return (); // Fallback
     }
 }
