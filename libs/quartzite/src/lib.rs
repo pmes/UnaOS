@@ -64,9 +64,13 @@ pub use platforms::gtk::Backend;
 
 // --- Linux (*nix) / Qt ---
 #[cfg(all(target_os = "linux", feature = "qt"))]
-pub type NativeWindow = ();
+pub struct NativeWindow {
+    pub ptr: *mut std::ffi::c_void,
+}
 #[cfg(all(target_os = "linux", feature = "qt"))]
-pub type NativeView = cxx::UniquePtr<platforms::qt::ffi::LumenMainWindow>;
+pub struct NativeView {
+    pub ptr: cxx::UniquePtr<platforms::qt::ffi::LumenMainWindow>,
+}
 #[cfg(all(target_os = "linux", feature = "qt"))]
 pub use platforms::qt::Backend;
 

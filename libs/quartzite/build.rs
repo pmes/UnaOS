@@ -27,18 +27,31 @@ fn main() {
     #[cfg(feature = "qt")]
     {
         unsafe {
-            cxx_qt_build::CxxQtBuilder::new()
+            let mut builder = cxx_qt_build::CxxQtBuilder::new()
                 .qt_module("Network")
                 .qt_module("Quick")
-                .file("src/platforms/qt/bridge.rs")
-                .cc_builder(|cc| {
-                    cc.include("src/platforms/qt");
-                    // Explicitly add QtWidgets include path
-                    cc.include("/usr/include/x86_64-linux-gnu/qt6/QtWidgets");
-                    cc.include("/usr/include/x86_64-linux-gnu/qt6/QtQuickWidgets");
-                    cc.file("src/platforms/qt/main_window.cpp");
-                })
-                .build();
+                .file("src/platforms/qt/bridge.rs");
+
+            builder = builder.cc_builder(|cc| {
+                cc.include("src/platforms/qt");
+
+                // Dynamically find Qt Widgets and Quick Widgets include paths via pkg-config
+                if let Ok(qt_widgets) = pkg_config::Config::new().probe("Qt6Widgets") {
+                    for path in qt_widgets.include_paths {
+                        cc.include(path);
+                    }
+                }
+
+                if let Ok(qt_quick_widgets) = pkg_config::Config::new().probe("Qt6QuickWidgets") {
+                    for path in qt_quick_widgets.include_paths {
+                        cc.include(path);
+                    }
+                }
+
+                cc.file("src/platforms/qt/main_window.cpp");
+            });
+
+            builder.build();
         }
     }
 }

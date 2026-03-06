@@ -18,6 +18,7 @@ use cxx_qt_lib::QString;
 use async_channel::{Sender, Receiver};
 use gneiss_pal::{Event, GuiUpdate};
 use cxx_qt::{CxxQtThread, CxxQtType};
+use tokio::runtime::Handle;
 
 // Wrap the sender and receiver so we can hold them in the QObject
 pub struct Channels {
@@ -68,6 +69,8 @@ pub mod qobject {
         #[qinvokable]
         fn dispatch_payload(self: Pin<&mut LumenApp>, text: QString);
     }
+
+    impl cxx_qt::Threading for LumenApp {}
 }
 
 // Rust structs backing the QObjects
@@ -101,6 +104,36 @@ impl Default for LumenAppRust {
     }
 }
 
+// Background Task Spawner
+// Takes ownership of the thread queue mechanism, listening asynchronously for GuiUpdates.
+// Converts them safely into Qt loop closures.
+pub fn spawn_gui_listener(
+    rx: async_channel::Receiver<GuiUpdate>,
+    qt_thread: cxx_qt::CxxQtThread<qobject::LumenApp>,
+) {
+    if let Ok(handle) = tokio::runtime::Handle::try_current() {
+        handle.spawn(async move {
+            while let Ok(update) = rx.recv().await {
+                match update {
+                    GuiUpdate::HistoryBatch(_items) => {
+                        let qt_thread = qt_thread.clone();
+                        qt_thread.queue(move |_qobj| {
+                            // Note: To mutate, would use _qobj
+                        }).unwrap();
+                    }
+                    GuiUpdate::ReviewPayload(_payload) => {
+                         let qt_thread = qt_thread.clone();
+                         qt_thread.queue(move |_qobj| {
+                             // Note: To mutate, would use _qobj
+                         }).unwrap();
+                    }
+                    _ => {}
+                }
+            }
+        });
+    }
+}
+
 impl qobject::LumenApp {
     pub fn send_message(self: std::pin::Pin<&mut Self>, text: QString) {
         if let Some(tx) = &self.rust().tx {
@@ -124,6 +157,3 @@ impl qobject::LumenApp {
          }
     }
 }
-
-// Background Task Spawner
-// Will be moved to LumenApp initialization context later

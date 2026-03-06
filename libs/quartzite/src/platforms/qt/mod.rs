@@ -31,15 +31,19 @@ use cxx_qt_lib::QGuiApplication;
 pub mod ffi {
     unsafe extern "C++" {
         include!("main_window.h");
-        type LumenMainWindow;
 
+        type LumenMainWindow;
         fn create_main_window() -> UniquePtr<LumenMainWindow>;
         fn show_main_window(window: Pin<&mut LumenMainWindow>);
+
+        type QGuiApplication = cxx_qt_lib::QGuiApplication;
+        fn create_qapplication() -> UniquePtr<QGuiApplication>;
+        fn exec_qapplication(app: Pin<&mut QGuiApplication>) -> i32;
     }
 }
 
 pub struct Backend {
-    app: cxx::UniquePtr<QGuiApplication>,
+    app: cxx::UniquePtr<ffi::QGuiApplication>,
     main_window: cxx::UniquePtr<ffi::LumenMainWindow>,
 }
 
@@ -48,19 +52,14 @@ impl Backend {
     where
         F: FnOnce(&NativeWindow) -> NativeView + 'static,
     {
-        // Actually, we must create a pure QApplication to use QWidgets,
-        // but cxx_qt_lib only supports QGuiApplication or QQmlApplicationEngine currently in 0.8
-        // However, if we instantiate it manually on C++ side through ffi, we can bypass this constraint.
-        // For compilation in the short-term, QGuiApplication handles the Rust loop init,
-        // while C++ handles the QMainWindow structure.
-        let app = QGuiApplication::new();
+        // Safe creation of QApplication via C++ stub to ensure Widgets are supported.
+        let app = ffi::create_qapplication();
 
-        // Provide the NativeWindow and invoke bootstrap logic here
-        // The bootstrap function creates the C++ QMainWindow skeleton and wire it up
-        let window = ();
-        let main_window = _bootstrap_fn(&window);
+        // Provide the NativeWindow and invoke bootstrap logic here.
+        let window = NativeWindow { ptr: std::ptr::null_mut() };
+        let view = _bootstrap_fn(&window);
 
-        Self { app, main_window }
+        Self { app, main_window: view.ptr }
     }
 
     pub fn run(&mut self) {
@@ -68,8 +67,8 @@ impl Backend {
             ffi::show_main_window(self.main_window.pin_mut());
         }
 
-        if let Some(app) = self.app.as_mut() {
-            app.exec();
+        if !self.app.is_null() {
+            ffi::exec_qapplication(self.app.pin_mut());
         }
     }
 }

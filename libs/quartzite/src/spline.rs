@@ -61,7 +61,9 @@ impl Spline {
         {
             // Connect to Qt backend properly
             use crate::platforms::qt::ffi;
-            return ffi::create_main_window();
+            return crate::NativeView {
+                ptr: ffi::create_main_window(),
+            };
         }
 
         #[cfg(not(any(all(target_os = "linux", feature = "gtk"), target_os = "macos", all(target_os = "linux", feature = "qt"))))]
