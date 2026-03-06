@@ -677,12 +677,12 @@ fn build_gnome_ui(
         paned_3.set_shrink_start_child(false); paned_3.set_shrink_end_child(false);
 
         // HARD LOCK total height so the cascade actually exists
-        paned_1.set_height_request(800);
+        paned_1.set_height_request(1600);
 
-        // Mathematically distribute the sliders (200px each)
-        paned_1.set_position(200);
-        paned_2.set_position(200);
-        paned_3.set_position(200);
+        // Mathematically distribute the sliders (400px each)
+        paned_1.set_position(400);
+        paned_2.set_position(400);
+        paned_3.set_position(400);
 
         paned_3.set_start_child(Some(&box_eng));
         paned_3.set_end_child(Some(&box_prm));
@@ -1242,8 +1242,7 @@ fn build_gnome_ui(
     let input_scroll = ScrolledWindow::builder()
         .hscrollbar_policy(PolicyType::Never)
         .vscrollbar_policy(PolicyType::Automatic)
-        .propagate_natural_height(true)
-        .max_content_height(600)
+        .vexpand(true)
         .valign(Align::Fill)
         .has_frame(false)
         .build();
@@ -1259,6 +1258,7 @@ fn build_gnome_ui(
         .bottom_margin(8)
         .left_margin(10)
         .right_margin(10)
+        .vexpand(true)
         .build();
     enable_spelling(&text_view);
     // Removed manual CSS class for Phase 1
@@ -2195,12 +2195,12 @@ fn build_gtk_ui(
         paned_3.set_shrink_start_child(false); paned_3.set_shrink_end_child(false);
 
         // HARD LOCK total height so the cascade actually exists
-        paned_1.set_height_request(800);
+        paned_1.set_height_request(1600);
 
-        // Mathematically distribute the sliders (200px each)
-        paned_1.set_position(200);
-        paned_2.set_position(200);
-        paned_3.set_position(200);
+        // Mathematically distribute the sliders (400px each)
+        paned_1.set_position(400);
+        paned_2.set_position(400);
+        paned_3.set_position(400);
 
         paned_3.set_start_child(Some(&box_eng));
         paned_3.set_end_child(Some(&box_prm));
@@ -2760,8 +2760,7 @@ fn build_gtk_ui(
     let input_scroll = ScrolledWindow::builder()
         .hscrollbar_policy(PolicyType::Never)
         .vscrollbar_policy(PolicyType::Automatic)
-        .propagate_natural_height(true)
-        .max_content_height(600)
+        .vexpand(true)
         .valign(Align::Fill)
         .has_frame(false)
         .build();
@@ -2777,6 +2776,7 @@ fn build_gtk_ui(
         .bottom_margin(8)
         .left_margin(10)
         .right_margin(10)
+        .vexpand(true)
         .build();
     enable_spelling(&text_view);
     // Removed manual CSS class for Phase 1
