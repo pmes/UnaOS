@@ -32,6 +32,7 @@ use log::info;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::thread;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use tokio::runtime::Runtime;
 use tokio::sync::{broadcast, mpsc};
@@ -785,7 +786,13 @@ impl AppHandler for VeinHandler {
                 let _ = self.tx.send(format!("DISPATCH_PAYLOAD:{}", json_payload));
             }
             Event::LoadHistory => {
-                self.append_to_console("\n[SYSTEM] :: Loading historical records...\n");
+                // Not returning anything directly from memory yet, we need access to the disk manager.
+                // However, since DiskManager is behind a Mutex inside the background thread,
+                // we should probably send a message to the background thread to handle it, or just
+                // load them if we have access. Wait, `handle_event` doesn't have direct access to `disk`.
+                // Actually, `vein`'s history logic should query `UnaFS`.
+                // To do this right, we can send a custom command via `self.tx`, e.g. "LOAD_HISTORY".
+                let _ = self.tx.send("LOAD_HISTORY".to_string());
             }
             _ => {}
         }

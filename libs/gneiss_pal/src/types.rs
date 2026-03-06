@@ -37,7 +37,16 @@ pub struct PreFlightPayload {
 }
 
 #[derive(Debug, Clone)]
+pub struct HistoryItem {
+    pub sender: String,
+    pub content: String,
+    pub timestamp: String,
+    pub is_chat: bool,
+}
+
+#[derive(Debug, Clone)]
 pub enum GuiUpdate {
+    HistoryBatch(Vec<HistoryItem>),
     ShardStatusChanged { id: String, status: ShardStatus },
     ConsoleLog(String),
     ClearConsole,

@@ -714,6 +714,13 @@ impl<D: BlockDevice> UnaFS<D> {
     }
 }
 
+impl<D: BlockDevice> Drop for UnaFS<D> {
+    fn drop(&mut self) {
+        let _ = self.sync_metadata();
+        let _ = self.device.flush();
+    }
+}
+
 impl<D: BlockDevice> BandyMember for UnaFS<D> {
     fn publish(&self, topic: &str, msg: SMessage) -> anyhow::Result<()> {
         println!("[UNAFS] Broadcasting event to '{}': {:?}", topic, msg);
