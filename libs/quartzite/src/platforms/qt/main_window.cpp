@@ -21,7 +21,8 @@
 #include <qqml.h>
 #include <QDirIterator>
 #include <QDebug>
-#include "quartzite/src/platforms/qt/bridge.cxxqt.h"
+#include "quartzite/src/platforms/qt/window.cxxqt.h"
+#include "quartzite/src/platforms/qt/vein_bridge.cxxqt.h"
 
 // Explicitly link the generated cxx_qt plugin block for this crate.
 // This prevents the GNU static linker from garbage collecting it

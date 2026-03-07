@@ -14,7 +14,7 @@
 // You should have received a copy of the GNU Lesser General Public License
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-use cxx_qt_lib::{QString, QVariant, QByteArray, QModelIndex};
+use cxx_qt_lib::{QString, QVariant, QByteArray, QModelIndex, QHash_i32_QByteArray};
 use std::sync::OnceLock;
 use cxx_qt::CxxQtThread;
 use std::pin::Pin;
@@ -40,7 +40,7 @@ pub mod qobject {
         include!("cxx-qt-lib/qbytearray.h");
         type QByteArray = cxx_qt_lib::QByteArray;
         include!("cxx-qt-lib/qhash.h");
-        type QHash_i32_QByteArray = cxx_qt_lib::QHash<cxx_qt_lib::QHashPair_i32_QByteArray>;
+        type QHash_i32_QByteArray = cxx_qt_lib::QHash_i32_QByteArray;
     }
 
     unsafe extern "RustQt" {
@@ -75,6 +75,22 @@ pub mod qobject {
         #[qinvokable]
         #[cxx_name = "registerModelThread"]
         fn register_model_thread(self: Pin<&mut HistoryModel>);
+
+        #[inherit]
+        #[cxx_name = "beginInsertRows"]
+        fn begin_insert_rows(self: Pin<&mut HistoryModel>, parent: &QModelIndex, first: i32, last: i32);
+
+        #[inherit]
+        #[cxx_name = "endInsertRows"]
+        fn end_insert_rows(self: Pin<&mut HistoryModel>);
+
+        #[inherit]
+        #[cxx_name = "beginResetModel"]
+        fn begin_reset_model(self: Pin<&mut HistoryModel>);
+
+        #[inherit]
+        #[cxx_name = "endResetModel"]
+        fn end_reset_model(self: Pin<&mut HistoryModel>);
     }
 
     impl cxx_qt::Threading for HistoryModel {}
@@ -212,8 +228,8 @@ impl qobject::HistoryModel {
         }
     }
 
-    pub fn role_names(&self) -> cxx_qt_lib::QHash<cxx_qt_lib::QHashPair_i32_QByteArray> {
-        let mut roles = cxx_qt_lib::QHash::<cxx_qt_lib::QHashPair_i32_QByteArray>::default();
+    pub fn role_names(&self) -> QHash_i32_QByteArray {
+        let mut roles = QHash_i32_QByteArray::default();
         roles.insert(0, QByteArray::from("sender"));
         roles.insert(1, QByteArray::from("content"));
         roles.insert(2, QByteArray::from("timestamp"));
