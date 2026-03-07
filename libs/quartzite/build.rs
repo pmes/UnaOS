@@ -23,4 +23,39 @@ fn main() {
             "quartzite.gresource",
         );
     }
+
+    #[cfg(feature = "qt")]
+    {
+        unsafe {
+            let mut builder = cxx_qt_build::CxxQtBuilder::new()
+                .qt_module("Network")
+                .qt_module("Quick")
+                .qt_module("Qml")
+                .qt_module("Widgets")
+                .file("src/platforms/qt/bridge.rs")
+                .file("src/platforms/qt/mod.rs")
+                .qrc("src/platforms/qt/assets/qml/qml.qrc");
+
+            builder = builder.cc_builder(|cc| {
+                cc.include("src/platforms/qt");
+
+                // Dynamically find Qt Widgets and Quick Widgets include paths via pkg-config
+                if let Ok(qt_widgets) = pkg_config::Config::new().probe("Qt6Widgets") {
+                    for path in qt_widgets.include_paths {
+                        cc.include(path);
+                    }
+                }
+
+                if let Ok(qt_quick_widgets) = pkg_config::Config::new().probe("Qt6QuickWidgets") {
+                    for path in qt_quick_widgets.include_paths {
+                        cc.include(path);
+                    }
+                }
+
+                cc.file("src/platforms/qt/main_window.cpp");
+            });
+
+            builder.build();
+        }
+    }
 }

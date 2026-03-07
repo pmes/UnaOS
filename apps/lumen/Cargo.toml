@@ -13,6 +13,7 @@ license = "GPL-3.0-or-later"
 default = []
 gtk = ["quartzite/gtk"]
 gnome = ["quartzite/gnome"]
+qt = ["quartzite/qt"]
 
 [dependencies]
 # The Trinity Core
@@ -35,4 +36,4 @@ serde = { version = "1.0.228", features = ["derive"] }
 wincode = "0.4.5"
 
 [target.'cfg(target_os = "linux")'.dependencies]
-libadwaita = { version = "0.8.1", features = ["v1_4"] }
+libadwaita = { version = "0.8.1", features = ["v1_4"], optional = true }
