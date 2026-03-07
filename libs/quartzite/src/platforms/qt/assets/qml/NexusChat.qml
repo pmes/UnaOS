@@ -17,37 +17,33 @@ Rectangle {
         anchors.fill: parent
         anchors.margins: 10
 
-        // Chat / Message View
-        ScrollView {
+        // Chat / Message View natively scrolls via Flickable
+        ListView {
+            id: chatListView
             Layout.fillWidth: true
             Layout.fillHeight: true
             clip: true
+            model: historyModel
+            spacing: 8
+            delegate: Rectangle {
+                width: chatListView.width
+                height: messageText.implicitHeight + 20
+                color: model.toolTip ? "#0078D7" : "#333333"
+                radius: 8
 
-            ListView {
-                id: chatListView
-                anchors.fill: parent
-                model: historyModel
-                spacing: 8
-                delegate: Rectangle {
-                    width: chatListView.width
-                    height: messageText.implicitHeight + 20
-                    color: model.toolTip ? "#0078D7" : "#333333"
-                    radius: 8
-
-                    Text {
-                        id: messageText
-                        anchors.centerIn: parent
-                        width: parent.width - 20
-                        text: model.display || ""
-                        color: "#FFFFFF"
-                        wrapMode: Text.WordWrap
-                    }
+                Text {
+                    id: messageText
+                    anchors.centerIn: parent
+                    width: parent.width - 20
+                    text: display || model.display || ""
+                    color: "#FFFFFF"
+                    wrapMode: Text.WordWrap
                 }
+            }
 
-                onCountChanged: {
-                    // Auto-scroll to bottom on new messages
-                    chatListView.positionViewAtEnd()
-                }
+            onCountChanged: {
+                // Auto-scroll to bottom on new messages
+                chatListView.positionViewAtEnd()
             }
         }
 
