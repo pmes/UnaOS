@@ -1,5 +1,7 @@
 <RCC>
     <qresource prefix="/qt/qml">
         <file>main.qml</file>
+        <file>NexusChat.qml</file>
+        <file>NodesEmail.qml</file>
     </qresource>
 </RCC>
