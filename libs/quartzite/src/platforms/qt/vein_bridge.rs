@@ -14,11 +14,11 @@
 // You should have received a copy of the GNU Lesser General Public License
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-use cxx_qt_lib::{QString, QVariant, QByteArray, QModelIndex, QHash_i32_QByteArray};
+use cxx_qt_lib::{QString, QVariant, QModelIndex};
+use cxx_qt::CxxQtType;
 use std::sync::OnceLock;
-use cxx_qt::CxxQtThread;
 use std::pin::Pin;
-use gneiss_pal::{Event, GuiUpdate, PreFlightPayload, HistoryItem};
+use gneiss_pal::{Event, PreFlightPayload, HistoryItem};
 use crate::platforms::qt::window::GLOBAL_TX;
 
 pub static VEIN_THREAD: OnceLock<cxx_qt::CxxQtThread<qobject::VeinBridge>> = OnceLock::new();
@@ -37,10 +37,6 @@ pub mod qobject {
         type QVariant = cxx_qt_lib::QVariant;
         include!("cxx-qt-lib/qmodelindex.h");
         type QModelIndex = cxx_qt_lib::QModelIndex;
-        include!("cxx-qt-lib/qbytearray.h");
-        type QByteArray = cxx_qt_lib::QByteArray;
-        include!("cxx-qt-lib/qhash.h");
-        type QHash_i32_QByteArray = cxx_qt_lib::QHash_i32_QByteArray;
     }
 
     unsafe extern "RustQt" {
@@ -69,8 +65,6 @@ pub mod qobject {
         fn rowCount(self: &HistoryModel, parent: &QModelIndex) -> i32;
         #[qinvokable(cxx_override)]
         fn data(self: &HistoryModel, index: &QModelIndex, role: i32) -> QVariant;
-        #[qinvokable(cxx_override)]
-        fn roleNames(self: &HistoryModel) -> QHash_i32_QByteArray;
 
         #[qinvokable]
         #[cxx_name = "registerModelThread"]
@@ -227,17 +221,7 @@ impl qobject::HistoryModel {
             _ => QVariant::default(),
         }
     }
-
-    pub fn roleNames(&self) -> QHash_i32_QByteArray {
-        let mut roles = QHash_i32_QByteArray::default();
-        roles.insert(0, QByteArray::from("sender"));
-        roles.insert(1, QByteArray::from("content"));
-        roles.insert(2, QByteArray::from("timestamp"));
-        roles.insert(3, QByteArray::from("isChat"));
-        roles
-    }
 }
-
 
 pub fn route_history_batch(items: Vec<HistoryItem>) {
     let rust_items: Vec<HistoryItemRust> = items.into_iter().map(|i| HistoryItemRust {
