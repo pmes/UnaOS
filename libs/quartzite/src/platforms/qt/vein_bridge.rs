@@ -66,11 +66,11 @@ pub mod qobject {
         type HistoryModel = super::HistoryModelRust;
 
         #[qinvokable(cxx_override)]
-        fn row_count(self: &HistoryModel, parent: &QModelIndex) -> i32;
+        fn rowCount(self: &HistoryModel, parent: &QModelIndex) -> i32;
         #[qinvokable(cxx_override)]
         fn data(self: &HistoryModel, index: &QModelIndex, role: i32) -> QVariant;
         #[qinvokable(cxx_override)]
-        fn role_names(self: &HistoryModel) -> QHash_i32_QByteArray;
+        fn roleNames(self: &HistoryModel) -> QHash_i32_QByteArray;
 
         #[qinvokable]
         #[cxx_name = "registerModelThread"]
@@ -208,7 +208,7 @@ impl qobject::HistoryModel {
         self.as_mut().end_reset_model();
     }
 
-    pub fn row_count(&self, _parent: &QModelIndex) -> i32 {
+    pub fn rowCount(&self, _parent: &QModelIndex) -> i32 {
         self.rust().rows.len() as i32
     }
 
@@ -228,7 +228,7 @@ impl qobject::HistoryModel {
         }
     }
 
-    pub fn role_names(&self) -> QHash_i32_QByteArray {
+    pub fn roleNames(&self) -> QHash_i32_QByteArray {
         let mut roles = QHash_i32_QByteArray::default();
         roles.insert(0, QByteArray::from("sender"));
         roles.insert(1, QByteArray::from("content"));
