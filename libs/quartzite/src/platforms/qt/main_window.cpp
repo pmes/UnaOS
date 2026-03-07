@@ -21,14 +21,9 @@
 #include <QDirIterator>
 #include <QDebug>
 
-// Force the linker to include the CXX-Qt generated plugin
-// Explicitly force linkage to the generated CXX-Qt initialization block
-// Using rust_cxx_qt_init_... pattern which prevents the linker from discarding the plugin
-extern "C" void rust_cxx_qt_init_quartzite();
+// REMOVED the CXX_QT_QML_PLUGIN macro that was causing the linker panic.
 
 LumenMainWindow::LumenMainWindow(QWidget *parent) : QMainWindow(parent) {
-    // Call the generated function so the linker knows we depend on the static object
-    rust_cxx_qt_init_quartzite();
     setWindowTitle("Lumen (Qt)");
     resize(1024, 768);
 
