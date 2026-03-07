@@ -58,7 +58,7 @@ pub mod qobject {
 
     unsafe extern "RustQt" {
         #[qobject]
-        #[base = "QAbstractListModel"]
+        #[base = QAbstractListModel]
         #[qml_element]
         type HistoryModel = super::HistoryModelRust;
 
