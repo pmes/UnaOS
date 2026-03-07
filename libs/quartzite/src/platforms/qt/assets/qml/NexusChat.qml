@@ -8,7 +8,7 @@ import com.unaos.lumen 1.0
 
 Rectangle {
     id: root
-    color: "#252526"
+    color: "#121212"
 
     property var historyModel: null
     property var backend: null
@@ -38,8 +38,8 @@ Rectangle {
                         id: messageText
                         anchors.centerIn: parent
                         width: parent.width - 20
-                        text: model.decoration !== undefined ? model.decoration : ""
-                        color: "white"
+                        text: model.display || ""
+                        color: "#FFFFFF"
                         wrapMode: Text.WordWrap
                     }
                 }
@@ -54,6 +54,7 @@ Rectangle {
         // Input Area
         RowLayout {
             Layout.fillWidth: true
+            Layout.alignment: Qt.AlignBottom
 
             TextField {
                 id: inputField

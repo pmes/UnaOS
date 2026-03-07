@@ -17,7 +17,7 @@
 use cxx_qt_lib::{QString, QVariant, QModelIndex};
 use cxx_qt::CxxQtType;
 use std::sync::OnceLock;
-
+use std::pin::Pin;
 use gneiss_pal::{Event, PreFlightPayload, HistoryItem};
 use crate::platforms::qt::window::GLOBAL_TX;
 
@@ -214,10 +214,10 @@ impl qobject::HistoryModel {
 
         let item = &self.rust().rows[row as usize];
         match role {
-            0 => QVariant::from(&QString::from(&item.sender)),
-            1 => QVariant::from(&QString::from(&item.content)),
-            2 => QVariant::from(&QString::from(&item.timestamp)),
-            3 => QVariant::from(&item.is_chat),
+            0 => QVariant::from(&QString::from(&item.content)), // DisplayRole
+            1 => QVariant::default(), // DecorationRole (Must be icon/pixmap, leaving empty)
+            2 => QVariant::from(&QString::from(&item.sender)), // EditRole
+            3 => QVariant::from(&item.is_chat), // ToolTipRole
             _ => QVariant::default(),
         }
     }

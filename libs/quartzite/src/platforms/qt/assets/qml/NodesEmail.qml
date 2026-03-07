@@ -34,14 +34,14 @@ Rectangle {
                 spacing: 4
 
                 Text {
-                    text: model.display !== undefined ? model.display : ""
-                    color: "white"
+                    text: model.edit || ""
+                    color: "#FFFFFF"
                     font.bold: true
                     Layout.fillWidth: true
                 }
                 Text {
-                    text: model.decoration !== undefined ? model.decoration : ""
-                    color: "#aaa"
+                    text: model.display || ""
+                    color: "#CCCCCC"
                     elide: Text.ElideRight
                     Layout.fillWidth: true
                 }
