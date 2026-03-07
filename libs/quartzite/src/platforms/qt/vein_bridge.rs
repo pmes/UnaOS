@@ -233,7 +233,7 @@ pub fn route_history_batch(items: Vec<HistoryItem>) {
 
     if let Some(thread) = HISTORY_MODEL_THREAD.get() {
         let thread = thread.clone();
-        thread.queue(move |qobj| {
+        thread.queue(move |mut qobj| {
             qobj.add_items(rust_items);
         }).unwrap();
     }
@@ -242,7 +242,7 @@ pub fn route_history_batch(items: Vec<HistoryItem>) {
 pub fn route_review_payload(payload: PreFlightPayload) {
     if let Some(thread) = PREFLIGHT_THREAD.get() {
         let thread = thread.clone();
-        thread.queue(move |qobj| {
+        thread.queue(move |mut qobj| {
             qobj.as_mut().set_system(QString::from(&payload.system));
             qobj.as_mut().set_directives(QString::from(&payload.directives));
             qobj.as_mut().set_engrams(QString::from(&payload.engrams));
