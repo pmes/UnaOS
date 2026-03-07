@@ -17,6 +17,7 @@
 #include "quartzite/src/platforms/qt/mod.cxx.h"
 #include <QVBoxLayout>
 #include <QWidget>
+#include <QQmlEngine>
 
 LumenMainWindow::LumenMainWindow(QWidget *parent)
     : QMainWindow(parent)
@@ -36,6 +37,9 @@ LumenMainWindow::LumenMainWindow(QWidget *parent)
     // Initialize QQuickWidget
     m_quickWidget = new QQuickWidget(this);
     m_quickWidget->setResizeMode(QQuickWidget::SizeRootObjectToView);
+
+    // The QML engine must be aware of the cxx-qt generated QML plugin embedded in the QRC
+    m_quickWidget->engine()->addImportPath("qrc:/qt/qml");
 
     // Load QML
     m_quickWidget->setSource(QUrl(QStringLiteral("qrc:/qt/qml/main.qml")));
