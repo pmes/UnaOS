@@ -28,6 +28,9 @@ pub static PREFLIGHT_THREAD: OnceLock<cxx_qt::CxxQtThread<qobject::PreFlightPayl
 #[cxx_qt::bridge]
 pub mod qobject {
     unsafe extern "C++" {
+        include!("cxx-qt-lib/qabstractlistmodel.h");
+        type QAbstractListModel = cxx_qt_lib::QAbstractListModel;
+
         include!("cxx-qt-lib/qstring.h");
         type QString = cxx_qt_lib::QString;
         include!("cxx-qt-lib/qvariant.h");
