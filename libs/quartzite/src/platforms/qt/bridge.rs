@@ -15,8 +15,11 @@
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 use cxx_qt_lib::QString;
-use async_channel::Sender;
-use gneiss_pal::Event;
+use async_channel::{Sender, Receiver};
+use gneiss_pal::{Event, GuiUpdate};
+use cxx_qt::CxxQtThread;
+use tokio::runtime::Handle;
+use std::sync::OnceLock;
 
 // Wrap the sender and receiver so we can hold them in the QObject
 pub struct Channels {
@@ -93,7 +96,6 @@ pub struct PreFlightPayloadQmlRust {
 }
 
 // Global channel hooks since QML instantiates the object
-use std::sync::OnceLock;
 
 pub static GLOBAL_TX: OnceLock<Sender<Event>> = OnceLock::new();
 pub static GLOBAL_QT_THREAD: OnceLock<cxx_qt::CxxQtThread<qobject::LumenApp>> = OnceLock::new();
@@ -107,6 +109,36 @@ impl Default for LumenAppRust {
         Self {
             current_input: QString::from(""),
         }
+    }
+}
+
+// Background Task Spawner
+// Takes ownership of the thread queue mechanism, listening asynchronously for GuiUpdates.
+// Converts them safely into Qt loop closures.
+pub fn spawn_gui_listener(
+    rx: Receiver<GuiUpdate>,
+    qt_thread: CxxQtThread<qobject::LumenApp>,
+) {
+    if let Ok(handle) = Handle::try_current() {
+        handle.spawn(async move {
+            while let Ok(update) = rx.recv().await {
+                match update {
+                    GuiUpdate::HistoryBatch(_items) => {
+                        let qt_thread = qt_thread.clone();
+                        qt_thread.queue(move |_qobj| {
+                            // Note: To mutate, would use _qobj
+                        }).unwrap();
+                    }
+                    GuiUpdate::ReviewPayload(_payload) => {
+                         let qt_thread = qt_thread.clone();
+                         qt_thread.queue(move |_qobj| {
+                             // Note: To mutate, would use _qobj
+                         }).unwrap();
+                    }
+                    _ => {}
+                }
+            }
+        });
     }
 }
 
