@@ -17,33 +17,38 @@
 #include "quartzite/src/platforms/qt/mod.cxx.h"
 #include <QVBoxLayout>
 #include <QWidget>
-#include <QQmlEngine> // YOU MUST ADD THIS
+#include <QQmlEngine>
+#include <QDirIterator>
+#include <QDebug>
 
-LumenMainWindow::LumenMainWindow(QWidget *parent)
-    : QMainWindow(parent)
-{
-    // Configure window
+LumenMainWindow::LumenMainWindow(QWidget *parent) : QMainWindow(parent) {
     setWindowTitle("Lumen (Qt)");
     resize(1024, 768);
 
-    // Create central widget
     QWidget* centralWidget = new QWidget(this);
     setCentralWidget(centralWidget);
 
-    // Create layout
     QVBoxLayout* layout = new QVBoxLayout(centralWidget);
     layout->setContentsMargins(0, 0, 0, 0);
 
-    // Initialize QQuickWidget
     m_quickWidget = new QQuickWidget(this);
     m_quickWidget->setResizeMode(QQuickWidget::SizeRootObjectToView);
 
-    // YOU MUST ADD THIS EXACT LINE BEFORE setSource:
+    // Blanket Import Paths
+    m_quickWidget->engine()->addImportPath(QStringLiteral("qrc:/"));
     m_quickWidget->engine()->addImportPath(QStringLiteral("qrc:/qt/qml"));
 
-    // Load QML
-    m_quickWidget->setSource(QUrl(QStringLiteral("qrc:/qt/qml/main.qml")));
+    // TELEMETRY: Dump Resource System to verify module existence
+    qInfo() << "[LUMEN QT] Scanning Resource Tree for CXX-Qt Modules...";
+    QDirIterator it(":", QDirIterator::Subdirectories);
+    while (it.hasNext()) {
+        QString path = it.next();
+        if (path.contains("unaos") || path.contains("qmldir")) {
+            qInfo() << " >> FOUND RESOURCE:" << path;
+        }
+    }
 
+    m_quickWidget->setSource(QUrl(QStringLiteral("qrc:/qt/qml/main.qml")));
     layout->addWidget(m_quickWidget);
 }
 

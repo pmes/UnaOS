@@ -15,10 +15,8 @@
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 use cxx_qt_lib::QString;
-use async_channel::{Sender, Receiver};
+use async_channel::Sender;
 use gneiss_pal::{Event, GuiUpdate};
-use cxx_qt::{CxxQtThread, CxxQtType};
-use tokio::runtime::Handle;
 
 // Wrap the sender and receiver so we can hold them in the QObject
 pub struct Channels {
@@ -116,7 +114,7 @@ impl Default for LumenAppRust {
 // Takes ownership of the thread queue mechanism, listening asynchronously for GuiUpdates.
 // Converts them safely into Qt loop closures.
 pub fn spawn_gui_listener(
-    mut rx: async_channel::Receiver<GuiUpdate>,
+    rx: async_channel::Receiver<GuiUpdate>,
     qt_thread: cxx_qt::CxxQtThread<qobject::LumenApp>,
 ) {
     if let Ok(handle) = tokio::runtime::Handle::try_current() {

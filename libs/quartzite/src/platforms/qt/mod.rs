@@ -25,7 +25,6 @@
 pub mod bridge;
 
 use crate::{NativeView, NativeWindow};
-use cxx_qt_lib::QGuiApplication;
 
 #[cxx::bridge]
 pub mod ffi {

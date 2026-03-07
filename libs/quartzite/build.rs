@@ -30,6 +30,8 @@ fn main() {
             let mut builder = cxx_qt_build::CxxQtBuilder::new()
                 .qt_module("Network")
                 .qt_module("Quick")
+                .qt_module("Qml")
+                .qt_module("Widgets")
                 .file("src/platforms/qt/bridge.rs")
                 .file("src/platforms/qt/mod.rs")
                 .qrc("src/platforms/qt/assets/qml/qml.qrc");
