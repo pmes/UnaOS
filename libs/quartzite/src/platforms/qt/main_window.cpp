@@ -33,8 +33,12 @@ extern "C" void cxx_qt_init_crate_quartzite();
 LumenMainWindow::LumenMainWindow(QWidget *parent) : QMainWindow(parent) {
     // Call the generated function to force initialization
     cxx_qt_init_crate_quartzite();
-
     // Manually register QML types to bypass fragile static QRC plugin loading
+    qmlRegisterType<LumenWindow>("com.unaos.lumen", 1, 0, "LumenWindow");
+    qmlRegisterType<VeinBridge>("com.unaos.lumen", 1, 0, "VeinBridge");
+    qmlRegisterUncreatableType<HistoryModel>("com.unaos.lumen", 1, 0, "HistoryModel", "Rust owned");
+    qmlRegisterUncreatableType<PreFlightPayloadQml>("com.unaos.lumen", 1, 0, "PreFlightPayloadQml", "Rust owned");
+
 
     setWindowTitle("Lumen (Qt)");
     resize(1024, 768);
