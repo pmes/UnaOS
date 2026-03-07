@@ -18,6 +18,7 @@
 #include <QVBoxLayout>
 #include <QWidget>
 #include <QQmlEngine>
+#include <QQmlContext>
 #include <qqml.h>
 #include <QDirIterator>
 #include <QDebug>
@@ -36,8 +37,8 @@ LumenMainWindow::LumenMainWindow(QWidget *parent) : QMainWindow(parent) {
     // Manually register QML types to bypass fragile static QRC plugin loading
     qmlRegisterType<LumenWindow>("com.unaos.lumen", 1, 0, "LumenWindow");
     qmlRegisterType<VeinBridge>("com.unaos.lumen", 1, 0, "VeinBridge");
-    qmlRegisterType<HistoryModel>("com.unaos.lumen", 1, 0, "HistoryModel");
-    qmlRegisterType<PreFlightPayloadQml>("com.unaos.lumen", 1, 0, "PreFlightPayloadQml");
+    qmlRegisterUncreatableType<HistoryModel>("com.unaos.lumen", 1, 0, "HistoryModel", "Models are strictly instantiated by the Rust backend");
+    qmlRegisterUncreatableType<PreFlightPayloadQml>("com.unaos.lumen", 1, 0, "PreFlightPayloadQml", "Models are strictly instantiated by the Rust backend");
 
     setWindowTitle("Lumen (Qt)");
     resize(1024, 768);
@@ -50,6 +51,15 @@ LumenMainWindow::LumenMainWindow(QWidget *parent) : QMainWindow(parent) {
 
     m_quickWidget = new QQuickWidget(this);
     m_quickWidget->setResizeMode(QQuickWidget::SizeRootObjectToView);
+
+    // Instantiate Rust-backed models and expose them to QML via context
+    HistoryModel* historyModel = new HistoryModel(this);
+    historyModel->registerModelThread();
+    PreFlightPayloadQml* preflightPayload = new PreFlightPayloadQml(this);
+    preflightPayload->registerThread();
+
+    m_quickWidget->rootContext()->setContextProperty("_historyModel", historyModel);
+    m_quickWidget->rootContext()->setContextProperty("_preflightPayload", preflightPayload);
 
     // Blanket Import Paths
     m_quickWidget->engine()->addImportPath(QStringLiteral("qrc:/"));

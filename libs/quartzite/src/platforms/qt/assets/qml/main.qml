@@ -41,20 +41,7 @@ Item {
         }
     }
 
-    PreFlightPayloadQml {
-        id: preflightPayload
-        Component.onCompleted: {
-            preflightPayload.registerThread();
-        }
-    }
-
-    // Models
-    HistoryModel {
-        id: historyModel
-        Component.onCompleted: {
-            historyModel.registerModelThread();
-        }
-    }
+    // Models are now uncreatable and injected via the context property from C++ or acquired via singleton
 
     SplitView {
         anchors.fill: parent
@@ -66,7 +53,8 @@ Item {
             SplitView.fillHeight: true
             SplitView.minimumWidth: 150
 
-            historyModel: historyModel
+            // Assuming context properties "historyModel" and "preflightPayload" will be injected
+            historyModel: typeof _historyModel !== 'undefined' ? _historyModel : null
             backend: veinBridge
         }
 
@@ -75,7 +63,7 @@ Item {
             SplitView.fillWidth: true
             SplitView.fillHeight: true
 
-            historyModel: historyModel
+            historyModel: typeof _historyModel !== 'undefined' ? _historyModel : null
             backend: veinBridge
         }
     }
