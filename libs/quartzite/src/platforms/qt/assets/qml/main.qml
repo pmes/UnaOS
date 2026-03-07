@@ -17,7 +17,7 @@
 import QtQuick 2.15
 import QtQuick.Controls 2.15
 import QtQuick.Layouts 1.15
-import RustQt 1.0
+import com.unaos.lumen 1.0
 
 Item {
     id: root
@@ -30,9 +30,13 @@ Item {
     LumenApp {
         id: lumenApp
 
+        Component.onCompleted: {
+            lumenApp.register_thread();
+        }
+
         // This simulates reacting to the history changes
-        onHistoryChanged: {
-             console.log("History updated.");
+        onCurrentInputChanged: {
+             console.log("Input changed.");
         }
     }
 

@@ -57,6 +57,7 @@ pub mod qobject {
     unsafe extern "RustQt" {
         #[qobject]
         #[qml_element]
+        #[cxx_name = "LumenApp"]
         #[qproperty(QString, current_input)]
         type LumenApp = super::LumenAppRust;
 
