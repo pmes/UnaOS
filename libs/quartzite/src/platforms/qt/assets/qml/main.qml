@@ -31,7 +31,7 @@ Item {
         id: lumenApp
 
         Component.onCompleted: {
-            lumenApp.register_thread();
+            lumenApp.registerThread();
         }
 
         // This simulates reacting to the history changes
@@ -115,7 +115,7 @@ Item {
                             radius: 4
                         }
                         onAccepted: {
-                            lumenApp.send_message(inputField.text);
+                            lumenApp.sendMessage(inputField.text);
                             inputField.text = "";
                         }
                     }
@@ -123,7 +123,7 @@ Item {
                     Button {
                         text: "Send"
                         onClicked: {
-                            lumenApp.send_message(inputField.text);
+                            lumenApp.sendMessage(inputField.text);
                             inputField.text = "";
                         }
                     }

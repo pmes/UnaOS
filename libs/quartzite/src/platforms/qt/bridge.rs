@@ -59,19 +59,23 @@ pub mod qobject {
         #[qobject]
         #[qml_element]
         #[cxx_name = "LumenApp"]
-        #[qproperty(QString, current_input)]
+        #[qproperty(QString, current_input, cxx_name = "currentInput")]
         type LumenApp = super::LumenAppRust;
 
         #[qinvokable]
+        #[cxx_name = "sendMessage"]
         fn send_message(self: Pin<&mut LumenApp>, text: QString);
 
         #[qinvokable]
+        #[cxx_name = "requestHistory"]
         fn request_history(self: Pin<&mut LumenApp>);
 
         #[qinvokable]
+        #[cxx_name = "dispatchPayload"]
         fn dispatch_payload(self: Pin<&mut LumenApp>, text: QString);
 
         #[qinvokable]
+        #[cxx_name = "registerThread"]
         fn register_thread(self: Pin<&mut LumenApp>);
     }
 
