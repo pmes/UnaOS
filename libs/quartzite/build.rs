@@ -31,7 +31,8 @@ fn main() {
                 .qt_module("Network")
                 .qt_module("Quick")
                 .file("src/platforms/qt/bridge.rs")
-                .file("src/platforms/qt/mod.rs");
+                .file("src/platforms/qt/mod.rs")
+                .qrc("src/platforms/qt/assets/qml/qml.qrc");
 
             builder = builder.cc_builder(|cc| {
                 cc.include("src/platforms/qt");
