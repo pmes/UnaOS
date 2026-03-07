@@ -34,8 +34,9 @@ LumenMainWindow::LumenMainWindow(QWidget *parent) : QMainWindow(parent) {
     cxx_qt_init_crate_quartzite();
 
     // Manually register QML types to bypass fragile static QRC plugin loading
-    qmlRegisterType<LumenApp>("com.unaos.lumen", 1, 0, "LumenApp");
-    qmlRegisterType<HistoryItemQml>("com.unaos.lumen", 1, 0, "HistoryItemQml");
+    qmlRegisterType<LumenWindow>("com.unaos.lumen", 1, 0, "LumenWindow");
+    qmlRegisterType<VeinBridge>("com.unaos.lumen", 1, 0, "VeinBridge");
+    qmlRegisterType<HistoryModel>("com.unaos.lumen", 1, 0, "HistoryModel");
     qmlRegisterType<PreFlightPayloadQml>("com.unaos.lumen", 1, 0, "PreFlightPayloadQml");
 
     setWindowTitle("Lumen (Qt)");
