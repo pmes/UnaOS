@@ -58,8 +58,8 @@ LumenMainWindow::LumenMainWindow(QWidget *parent) : QMainWindow(parent) {
     PreFlightPayloadQml* preflightPayload = new PreFlightPayloadQml(this);
     preflightPayload->registerThread();
 
-    m_quickWidget->rootContext()->setContextProperty("_historyModel", historyModel);
-    m_quickWidget->rootContext()->setContextProperty("_preflightPayload", preflightPayload);
+    m_quickWidget->engine()->rootContext()->setContextProperty("_historyModel", historyModel);
+    m_quickWidget->engine()->rootContext()->setContextProperty("_preflightPayload", preflightPayload);
 
     // Blanket Import Paths
     m_quickWidget->engine()->addImportPath(QStringLiteral("qrc:/"));
