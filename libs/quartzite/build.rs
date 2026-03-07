@@ -32,7 +32,8 @@ fn main() {
                 .qt_module("Quick")
                 .qt_module("Qml")
                 .qt_module("Widgets")
-                .file("src/platforms/qt/bridge.rs")
+                .file("src/platforms/qt/window.rs")
+                .file("src/platforms/qt/vein_bridge.rs")
                 .file("src/platforms/qt/mod.rs")
                 .qrc("src/platforms/qt/assets/qml/qml.qrc");
 
