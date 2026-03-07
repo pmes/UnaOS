@@ -21,9 +21,15 @@
 #include <QDirIterator>
 #include <QDebug>
 
-// REMOVED the CXX_QT_QML_PLUGIN macro that was causing the linker panic.
+// Explicitly link the generated cxx_qt plugin block for this crate.
+// This prevents the GNU static linker from garbage collecting it
+// because it believes the QML modules are unreferenced static objects.
+extern "C" void cxx_qt_init_crate_quartzite();
 
 LumenMainWindow::LumenMainWindow(QWidget *parent) : QMainWindow(parent) {
+    // Call the generated function to force initialization
+    cxx_qt_init_crate_quartzite();
+
     setWindowTitle("Lumen (Qt)");
     resize(1024, 768);
 

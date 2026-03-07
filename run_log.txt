@@ -1,0 +1,51 @@
+LUMEN: [2026-03-07 03:43:49.623] [INFO] Lumen Boot Sequence Initiated.
+[WARNING] :: DIRTY MOUNT DETECTED. TORN TRANSACTION IN JOURNAL.
+LUMEN: [2026-03-07 03:43:49.624] [INFO] >> [LUMEN CORE] Synapses firing. Autonomous loop engaged.
+VEIN: [2026-03-07 03:43:49.625] [INFO] :: CORTEX :: Indexing Workspace at "/app"
+QStandardPaths: XDG_RUNTIME_DIR not set, defaulting to '/tmp/runtime-jules'
+[LUMEN QT] Scanning Resource Tree for CXX-Qt Modules...
+ >> FOUND RESOURCE: ":/qt-project.org/imports/QtQml/qmldir"
+ >> FOUND RESOURCE: ":/qt-project.org/imports/QtQml/Models/qmldir"
+ >> FOUND RESOURCE: ":/qt-project.org/imports/QtQuick/qmldir"
+qrc:/qt/qml/main.qml:20:1: module "com.unaos.lumen" is not installed
+     import com.unaos.lumen 1.0
+     ^
+qrc:/qt/qml/main.qml:19:1: module "QtQuick.Layouts" is not installed
+     import QtQuick.Layouts 1.15
+     ^
+qrc:/qt/qml/main.qml:18:1: module "QtQuick.Controls" is not installed
+     import QtQuick.Controls 2.15
+     ^
+qrc:/qt/qml/main.qml: module "QtQml.WorkerScript" is not installed
+qrc:/qt/qml/main.qml:20:1: module "com.unaos.lumen" is not installed
+     import com.unaos.lumen 1.0
+     ^
+qrc:/qt/qml/main.qml:19:1: module "QtQuick.Layouts" is not installed
+     import QtQuick.Layouts 1.15
+     ^
+qrc:/qt/qml/main.qml:18:1: module "QtQuick.Controls" is not installed
+     import QtQuick.Controls 2.15
+     ^
+qrc:/qt/qml/main.qml: module "QtQml.WorkerScript" is not installed
+qrc:/qt/qml/main.qml:20:1: module "com.unaos.lumen" is not installed
+     import com.unaos.lumen 1.0
+     ^
+qrc:/qt/qml/main.qml:19:1: module "QtQuick.Layouts" is not installed
+     import QtQuick.Layouts 1.15
+     ^
+qrc:/qt/qml/main.qml:18:1: module "QtQuick.Controls" is not installed
+     import QtQuick.Controls 2.15
+     ^
+qrc:/qt/qml/main.qml: module "QtQml.WorkerScript" is not installed
+qrc:/qt/qml/main.qml:20:1: module "com.unaos.lumen" is not installed
+     import com.unaos.lumen 1.0
+     ^
+qrc:/qt/qml/main.qml:19:1: module "QtQuick.Layouts" is not installed
+     import QtQuick.Layouts 1.15
+     ^
+qrc:/qt/qml/main.qml:18:1: module "QtQuick.Controls" is not installed
+     import QtQuick.Controls 2.15
+     ^
+qrc:/qt/qml/main.qml: module "QtQml.WorkerScript" is not installed
+GNEISS_PAL: [2026-03-07 03:43:50.426] [INFO] Executing gcloud ADC token fetch...
+GNEISS_PAL: [2026-03-07 03:43:50.427] [ERROR] gcloud execution failed: No such file or directory (os error 2)
