@@ -18,10 +18,12 @@
 #include <QVBoxLayout>
 #include <QWidget>
 #include <QQmlEngine>
+#include <QQmlContext>
 #include <qqml.h>
 #include <QDirIterator>
 #include <QDebug>
-#include "quartzite/src/platforms/qt/bridge.cxxqt.h"
+#include "quartzite/src/platforms/qt/window.cxxqt.h"
+#include "quartzite/src/platforms/qt/vein_bridge.cxxqt.h"
 
 // Explicitly link the generated cxx_qt plugin block for this crate.
 // This prevents the GNU static linker from garbage collecting it
@@ -31,11 +33,12 @@ extern "C" void cxx_qt_init_crate_quartzite();
 LumenMainWindow::LumenMainWindow(QWidget *parent) : QMainWindow(parent) {
     // Call the generated function to force initialization
     cxx_qt_init_crate_quartzite();
-
     // Manually register QML types to bypass fragile static QRC plugin loading
-    qmlRegisterType<LumenApp>("com.unaos.lumen", 1, 0, "LumenApp");
-    qmlRegisterType<HistoryItemQml>("com.unaos.lumen", 1, 0, "HistoryItemQml");
-    qmlRegisterType<PreFlightPayloadQml>("com.unaos.lumen", 1, 0, "PreFlightPayloadQml");
+    qmlRegisterType<LumenWindow>("com.unaos.lumen", 1, 0, "LumenWindow");
+    qmlRegisterType<VeinBridge>("com.unaos.lumen", 1, 0, "VeinBridge");
+    qmlRegisterUncreatableType<HistoryModel>("com.unaos.lumen", 1, 0, "HistoryModel", "Rust owned");
+    qmlRegisterUncreatableType<PreFlightPayloadQml>("com.unaos.lumen", 1, 0, "PreFlightPayloadQml", "Rust owned");
+
 
     setWindowTitle("Lumen (Qt)");
     resize(1024, 768);
@@ -48,6 +51,15 @@ LumenMainWindow::LumenMainWindow(QWidget *parent) : QMainWindow(parent) {
 
     m_quickWidget = new QQuickWidget(this);
     m_quickWidget->setResizeMode(QQuickWidget::SizeRootObjectToView);
+
+    // Instantiate Rust-backed models and expose them to QML via context
+    HistoryModel* historyModel = new HistoryModel(this);
+    historyModel->registerModelThread();
+    PreFlightPayloadQml* preflightPayload = new PreFlightPayloadQml(this);
+    preflightPayload->registerThread();
+
+    m_quickWidget->rootContext()->setContextProperty("_historyModel", historyModel);
+    m_quickWidget->rootContext()->setContextProperty("_preflightPayload", preflightPayload);
 
     // Blanket Import Paths
     m_quickWidget->engine()->addImportPath(QStringLiteral("qrc:/"));
