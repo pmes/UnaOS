@@ -69,6 +69,9 @@ pub mod qobject {
 
         #[qinvokable]
         fn dispatch_payload(self: Pin<&mut LumenApp>, text: QString);
+
+        #[qinvokable]
+        fn register_thread(self: Pin<&mut LumenApp>);
     }
 
     impl cxx_qt::Threading for LumenApp {}
@@ -91,16 +94,20 @@ pub struct PreFlightPayloadQmlRust {
     pub prompt: QString,
 }
 
+// Global channel hooks since QML instantiates the object
+use std::sync::OnceLock;
+
+pub static GLOBAL_TX: OnceLock<Sender<Event>> = OnceLock::new();
+pub static GLOBAL_QT_THREAD: OnceLock<cxx_qt::CxxQtThread<qobject::LumenApp>> = OnceLock::new();
+
 pub struct LumenAppRust {
     pub current_input: QString,
-    pub tx: Option<Sender<Event>>,
 }
 
 impl Default for LumenAppRust {
     fn default() -> Self {
         Self {
             current_input: QString::from(""),
-            tx: None,
         }
     }
 }
@@ -109,7 +116,7 @@ impl Default for LumenAppRust {
 // Takes ownership of the thread queue mechanism, listening asynchronously for GuiUpdates.
 // Converts them safely into Qt loop closures.
 pub fn spawn_gui_listener(
-    rx: async_channel::Receiver<GuiUpdate>,
+    mut rx: async_channel::Receiver<GuiUpdate>,
     qt_thread: cxx_qt::CxxQtThread<qobject::LumenApp>,
 ) {
     if let Ok(handle) = tokio::runtime::Handle::try_current() {
@@ -135,9 +142,17 @@ pub fn spawn_gui_listener(
     }
 }
 
+// In cxx-qt 0.8, we can implement qobject::LumenApp methods
+impl qobject::LumenApp {
+    pub fn register_thread(self: std::pin::Pin<&mut Self>) {
+        use cxx_qt::Threading;
+        let _ = GLOBAL_QT_THREAD.set(self.qt_thread());
+    }
+}
+
 impl qobject::LumenApp {
     pub fn send_message(self: std::pin::Pin<&mut Self>, text: QString) {
-        if let Some(tx) = &self.rust().tx {
+        if let Some(tx) = GLOBAL_TX.get() {
             let event = Event::Input {
                 target: "chat".to_string(),
                 text: text.to_string(),
@@ -147,13 +162,13 @@ impl qobject::LumenApp {
     }
 
     pub fn request_history(self: std::pin::Pin<&mut Self>) {
-        if let Some(tx) = &self.rust().tx {
+        if let Some(tx) = GLOBAL_TX.get() {
             let _ = tx.try_send(Event::LoadHistory);
         }
     }
 
     pub fn dispatch_payload(self: std::pin::Pin<&mut Self>, text: QString) {
-         if let Some(tx) = &self.rust().tx {
+         if let Some(tx) = GLOBAL_TX.get() {
              let _ = tx.try_send(Event::DispatchPayload(text.to_string()));
          }
     }
