@@ -25,19 +25,20 @@ Rectangle {
 
             ListView {
                 id: chatListView
+                anchors.fill: parent
                 model: historyModel
                 spacing: 8
                 delegate: Rectangle {
                     width: chatListView.width
                     height: messageText.implicitHeight + 20
-                    color: model.isChat ? "#0078D7" : "#333333"
+                    color: model.toolTip ? "#0078D7" : "#333333"
                     radius: 8
 
                     Text {
                         id: messageText
                         anchors.centerIn: parent
                         width: parent.width - 20
-                        text: model.content
+                        text: model.decoration !== undefined ? model.decoration : ""
                         color: "white"
                         wrapMode: Text.WordWrap
                     }

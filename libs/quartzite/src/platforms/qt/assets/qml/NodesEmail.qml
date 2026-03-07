@@ -23,7 +23,7 @@ Rectangle {
             width: emailListView.width
             height: 60
             background: Rectangle {
-                color: model.isChat ? "#2d2d30" : "#1e1e1e"
+                color: model.toolTip ? "#2d2d30" : "#1e1e1e"
                 border.color: "#333"
                 border.width: 1
             }
@@ -34,13 +34,13 @@ Rectangle {
                 spacing: 4
 
                 Text {
-                    text: model.sender
+                    text: model.display !== undefined ? model.display : ""
                     color: "white"
                     font.bold: true
                     Layout.fillWidth: true
                 }
                 Text {
-                    text: model.content
+                    text: model.decoration !== undefined ? model.decoration : ""
                     color: "#aaa"
                     elide: Text.ElideRight
                     Layout.fillWidth: true
