@@ -18,8 +18,10 @@
 #include <QVBoxLayout>
 #include <QWidget>
 #include <QQmlEngine>
+#include <qqml.h>
 #include <QDirIterator>
 #include <QDebug>
+#include "quartzite/src/platforms/qt/bridge.cxxqt.h"
 
 // Explicitly link the generated cxx_qt plugin block for this crate.
 // This prevents the GNU static linker from garbage collecting it
@@ -29,6 +31,11 @@ extern "C" void cxx_qt_init_crate_quartzite();
 LumenMainWindow::LumenMainWindow(QWidget *parent) : QMainWindow(parent) {
     // Call the generated function to force initialization
     cxx_qt_init_crate_quartzite();
+
+    // Manually register QML types to bypass fragile static QRC plugin loading
+    qmlRegisterType<LumenApp>("com.unaos.lumen", 1, 0, "LumenApp");
+    qmlRegisterType<HistoryItemQml>("com.unaos.lumen", 1, 0, "HistoryItemQml");
+    qmlRegisterType<PreFlightPayloadQml>("com.unaos.lumen", 1, 0, "PreFlightPayloadQml");
 
     setWindowTitle("Lumen (Qt)");
     resize(1024, 768);
