@@ -16,7 +16,7 @@
 
 use std::sync::OnceLock;
 use async_channel::{Receiver, Sender};
-use cxx_qt_lib::QString;
+
 use gneiss_pal::{Event, GuiUpdate};
 use tokio::runtime::Handle;
 use crate::{NativeView, NativeWindow};
