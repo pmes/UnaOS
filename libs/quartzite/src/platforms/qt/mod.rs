@@ -36,14 +36,15 @@ pub mod ffi {
         fn create_main_window() -> UniquePtr<LumenMainWindow>;
         fn show_main_window(window: Pin<&mut LumenMainWindow>);
 
-        type QGuiApplication = cxx_qt_lib::QGuiApplication;
-        fn create_qapplication() -> UniquePtr<QGuiApplication>;
-        fn exec_qapplication(app: Pin<&mut QGuiApplication>) -> i32;
+        // Define an opaque type for QApplication since cxx_qt_lib only exposes QGuiApplication
+        type LumenQApp;
+        fn create_qapplication() -> UniquePtr<LumenQApp>;
+        fn exec_qapplication(app: Pin<&mut LumenQApp>) -> i32;
     }
 }
 
 pub struct Backend {
-    app: cxx::UniquePtr<ffi::QGuiApplication>,
+    app: cxx::UniquePtr<ffi::LumenQApp>,
     main_window: cxx::UniquePtr<ffi::LumenMainWindow>,
 }
 

@@ -15,7 +15,7 @@
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 #pragma once
-#include <QGuiApplication>
+#include <QApplication>
 #include <QMainWindow>
 #include <QQuickWidget>
 #include "rust/cxx.h"
@@ -29,8 +29,16 @@ private:
     QQuickWidget* m_quickWidget;
 };
 
+// Opaque wrapper for QApplication to bridge across CXX
+struct LumenQApp {
+    QApplication* app;
+    LumenQApp(int& argc, char** argv);
+    ~LumenQApp();
+    int exec();
+};
+
 std::unique_ptr<LumenMainWindow> create_main_window();
 void show_main_window(LumenMainWindow& window);
 
-std::unique_ptr<QGuiApplication> create_qapplication();
-int exec_qapplication(QGuiApplication& app);
+std::unique_ptr<LumenQApp> create_qapplication();
+int exec_qapplication(LumenQApp& app);

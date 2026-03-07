@@ -54,14 +54,27 @@ void show_main_window(LumenMainWindow& window) {
     window.show();
 }
 
+// LumenQApp Implementation
+LumenQApp::LumenQApp(int& argc, char** argv) {
+    app = new QApplication(argc, argv);
+}
+
+LumenQApp::~LumenQApp() {
+    delete app;
+}
+
+int LumenQApp::exec() {
+    return app->exec();
+}
+
 static int fake_argc = 1;
 static char fake_arg0[] = "lumen";
 static char* fake_argv[] = { fake_arg0, nullptr };
 
-std::unique_ptr<QGuiApplication> create_qapplication() {
-    return std::make_unique<QGuiApplication>(fake_argc, fake_argv);
+std::unique_ptr<LumenQApp> create_qapplication() {
+    return std::make_unique<LumenQApp>(fake_argc, fake_argv);
 }
 
-int exec_qapplication(QGuiApplication& app) {
+int exec_qapplication(LumenQApp& app) {
     return app.exec();
 }
