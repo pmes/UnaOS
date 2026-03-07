@@ -21,7 +21,6 @@
 #include "rust/cxx.h"
 
 class LumenMainWindow : public QMainWindow {
-    Q_OBJECT
 public:
     explicit LumenMainWindow(QWidget *parent = nullptr);
     ~LumenMainWindow() override;
