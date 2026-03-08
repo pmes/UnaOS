@@ -17,7 +17,7 @@
 use cxx_qt_lib::{QString, QVariant, QModelIndex};
 use cxx_qt::CxxQtType;
 use std::sync::OnceLock;
-use std::pin::Pin;
+
 use gneiss_pal::{Event, PreFlightPayload, HistoryItem};
 use crate::platforms::qt::window::GLOBAL_TX;
 
@@ -62,7 +62,8 @@ pub mod qobject {
         type HistoryModel = super::HistoryModelRust;
 
         #[qinvokable(cxx_override)]
-        fn rowCount(self: &HistoryModel, parent: &QModelIndex) -> i32;
+        #[cxx_name = "rowCount"]
+        fn row_count(self: &HistoryModel, parent: &QModelIndex) -> i32;
         #[qinvokable(cxx_override)]
         fn data(self: &HistoryModel, index: &QModelIndex, role: i32) -> QVariant;
 
@@ -190,7 +191,7 @@ impl qobject::HistoryModel {
         self.as_mut().end_reset_model();
     }
 
-    pub fn rowCount(&self, _parent: &QModelIndex) -> i32 {
+    pub fn row_count(&self, _parent: &QModelIndex) -> i32 {
         self.rust().rows.len() as i32
     }
 
@@ -221,11 +222,11 @@ pub fn route_history_batch(items: Vec<HistoryItem>) {
 
     if let Some(thread) = HISTORY_MODEL_THREAD.get() {
         let thread = thread.clone();
-        thread.queue(move |mut qobj| {
+        thread.queue(move |qobj| {
             qobj.add_items(rust_items);
         }).unwrap();
     } else {
-        eprintln!(":: PLEXUS :: Payload dropped: HistoryModel thread not registered.");
+        eprintln!("DROPPED: QML failed to register the HistoryModel thread.");
     }
 }
 
