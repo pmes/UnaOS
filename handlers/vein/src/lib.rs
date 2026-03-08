@@ -268,7 +268,7 @@ impl VeinHandler {
                         sender: r.sender,
                         content: r.content,
                         timestamp: r.timestamp,
-                        is_chat: r.memory_type == "chat",
+                        is_chat: r.is_chat,
                     }).collect();
                     let _ = gui_tx_brain.send(GuiUpdate::HistoryBatch(items)).await;
                 }
@@ -301,7 +301,7 @@ impl VeinHandler {
                                                 sender: r.sender,
                                                 content: r.content,
                                                 timestamp: r.timestamp,
-                                                is_chat: r.memory_type == "chat",
+                                                is_chat: r.is_chat,
                                             }).collect();
                                             let _ = gui_tx_clone.send_blocking(GuiUpdate::HistoryBatch(items));
                                         }
