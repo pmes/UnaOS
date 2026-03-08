@@ -13,6 +13,15 @@ Rectangle {
     property var historyModel: null
     property var backend: null
 
+    Component.onCompleted: {
+        if (historyModel) {
+            historyModel.registerModelThread();
+        }
+        if (backend) {
+            backend.registerThread();
+        }
+    }
+
     ColumnLayout {
         anchors.fill: parent
         anchors.margins: 10
@@ -23,7 +32,7 @@ Rectangle {
             Layout.fillWidth: true
             Layout.fillHeight: true
             clip: true
-            model: historyModel
+            model: historyModel ? historyModel : null
             spacing: 8
             delegate: Rectangle {
                 width: chatListView.width

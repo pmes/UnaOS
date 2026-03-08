@@ -224,6 +224,8 @@ pub fn route_history_batch(items: Vec<HistoryItem>) {
         thread.queue(move |mut qobj| {
             qobj.add_items(rust_items);
         }).unwrap();
+    } else {
+        eprintln!(":: PLEXUS :: Payload dropped: HistoryModel thread not registered.");
     }
 }
 
