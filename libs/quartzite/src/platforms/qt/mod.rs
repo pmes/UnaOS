@@ -15,16 +15,16 @@
 // You should have received a copy of the GNU Lesser General Public License
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-
 //! Qt Native Embassy (*nix alternative)
 //!
 //! STUB: Awaiting future expansion.
 //! This module will bridge UnaOS to the Qt ecosystem, providing a
 //! high-performance alternative to GTK on Linux and BSD hosts.
 
-pub mod bridge;
+pub mod window;
+pub mod vein_bridge;
 
-use crate::{NativeView, NativeWindow};
+pub use window::Backend;
 
 #[cxx::bridge]
 pub mod ffi {
@@ -39,36 +39,5 @@ pub mod ffi {
         type LumenQApp;
         fn create_qapplication() -> UniquePtr<LumenQApp>;
         fn exec_qapplication(app: Pin<&mut LumenQApp>) -> i32;
-    }
-}
-
-pub struct Backend {
-    app: cxx::UniquePtr<ffi::LumenQApp>,
-    main_window: cxx::UniquePtr<ffi::LumenMainWindow>,
-}
-
-impl Backend {
-    pub fn new<F>(_app_id: &str, _bootstrap_fn: F) -> Self
-    where
-        F: FnOnce(&NativeWindow) -> NativeView + 'static,
-    {
-        // Safe creation of QApplication via C++ stub to ensure Widgets are supported.
-        let app = ffi::create_qapplication();
-
-        // Provide the NativeWindow and invoke bootstrap logic here.
-        let window = NativeWindow { ptr: std::ptr::null_mut() };
-        let view = _bootstrap_fn(&window);
-
-        Self { app, main_window: view.ptr }
-    }
-
-    pub fn run(&mut self) {
-        if !self.main_window.is_null() {
-            ffi::show_main_window(self.main_window.pin_mut());
-        }
-
-        if !self.app.is_null() {
-            ffi::exec_qapplication(self.app.pin_mut());
-        }
     }
 }
