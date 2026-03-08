@@ -27,15 +27,15 @@ Rectangle {
             spacing: 8
             delegate: Rectangle {
                 width: chatListView.width
-                height: messageText.implicitHeight + 20
+                height: Math.max(messageText.implicitHeight + 24, 40)
                 color: model.toolTip ? "#0078D7" : "#333333"
                 radius: 8
 
                 Text {
                     id: messageText
                     anchors.centerIn: parent
-                    width: parent.width - 20
-                    text: display || model.display || ""
+                    width: parent.width - 16
+                    text: display !== undefined ? display : (model.display !== undefined ? model.display : "Awaiting Telemetry...")
                     color: "#FFFFFF"
                     wrapMode: Text.WordWrap
                 }

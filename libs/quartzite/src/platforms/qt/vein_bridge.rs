@@ -70,13 +70,7 @@ pub mod qobject {
         #[cxx_name = "registerModelThread"]
         fn register_model_thread(self: Pin<&mut HistoryModel>);
 
-        #[inherit]
-        #[cxx_name = "beginInsertRows"]
-        fn begin_insert_rows(self: Pin<&mut HistoryModel>, parent: &QModelIndex, first: i32, last: i32);
 
-        #[inherit]
-        #[cxx_name = "endInsertRows"]
-        fn end_insert_rows(self: Pin<&mut HistoryModel>);
 
         #[inherit]
         #[cxx_name = "beginResetModel"]
@@ -186,16 +180,10 @@ impl qobject::HistoryModel {
         if count == 0 {
             return;
         }
-        let current_len = self.rust().rows.len();
-        self.as_mut().begin_insert_rows(
-            &cxx_qt_lib::QModelIndex::default(),
-            current_len as i32,
-            (current_len + count - 1) as i32,
-        );
+        self.as_mut().begin_reset_model();
         self.as_mut().rust_mut().rows.extend(new_items);
-        self.as_mut().end_insert_rows();
+        self.as_mut().end_reset_model();
     }
-
     pub fn clear(mut self: std::pin::Pin<&mut Self>) {
         self.as_mut().begin_reset_model();
         self.as_mut().rust_mut().rows.clear();
