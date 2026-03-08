@@ -54,8 +54,6 @@ Item {
             SplitView.minimumWidth: 150
 
             // Assuming context properties "historyModel" and "preflightPayload" will be injected
-            historyModel: typeof _historyModel !== 'undefined' ? _historyModel : null
-            backend: veinBridge
         }
 
         // Nexus Chat (Main Area)
@@ -63,8 +61,6 @@ Item {
             SplitView.fillWidth: true
             SplitView.fillHeight: true
 
-            historyModel: typeof _historyModel !== 'undefined' ? _historyModel : null
-            backend: veinBridge
         }
     }
 }

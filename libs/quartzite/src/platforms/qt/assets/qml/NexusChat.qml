@@ -10,12 +10,11 @@ Rectangle {
     id: root
     color: "#121212"
 
-    property var historyModel: null
-    property var backend: null
-
-    Component.onCompleted: {
-        if (backend) {
-            backend.registerThread();
+    VeinBridge {
+        id: veinEngine
+        Component.onCompleted: {
+            veinEngine.registerThread();
+            veinEngine.requestHistory();
         }
     }
 
@@ -29,7 +28,7 @@ Rectangle {
             Layout.fillWidth: true
             Layout.fillHeight: true
             clip: true
-            model: historyModel ? historyModel : null
+            model: typeof _historyModel !== "undefined" ? _historyModel : null
             spacing: 8
             delegate: Rectangle {
                 width: Math.max(chatListView.width, 100)
@@ -68,8 +67,8 @@ Rectangle {
                     radius: 4
                 }
                 onAccepted: {
-                    if (backend && inputField.text !== "") {
-                        backend.sendMessage(inputField.text);
+                    if (inputField.text !== "") {
+                        veinEngine.sendMessage(inputField.text);
                         inputField.text = "";
                     }
                 }
@@ -78,8 +77,8 @@ Rectangle {
             Button {
                 text: "Send"
                 onClicked: {
-                    if (backend && inputField.text !== "") {
-                        backend.sendMessage(inputField.text);
+                    if (inputField.text !== "") {
+                        veinEngine.sendMessage(inputField.text);
                         inputField.text = "";
                     }
                 }

@@ -217,12 +217,22 @@ impl qobject::HistoryModel {
 }
 
 pub fn route_history_batch(items: Vec<HistoryItem>) {
-    let rust_items: Vec<HistoryItemRust> = items.into_iter().map(|i| HistoryItemRust {
+    let mut rust_items: Vec<HistoryItemRust> = items.into_iter().map(|i| HistoryItemRust {
         sender: i.sender,
         content: i.content,
         timestamp: i.timestamp,
         is_chat: i.is_chat,
     }).collect();
+
+    // FORCE VISUAL CONFIRMATION IF VAULT IS EMPTY
+    if rust_items.is_empty() {
+        rust_items.push(HistoryItemRust {
+            sender: "system".to_string(),
+            content: ":: UNAFS VAULT EMPTY. READY FOR TELEMETRY ::".to_string(),
+            timestamp: "".to_string(),
+            is_chat: false,
+        });
+    }
 
     if let Some(thread) = HISTORY_MODEL_THREAD.get() {
         let thread = thread.clone();
