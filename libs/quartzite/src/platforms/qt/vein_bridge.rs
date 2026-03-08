@@ -191,8 +191,12 @@ impl qobject::HistoryModel {
         self.as_mut().end_reset_model();
     }
 
-    pub fn row_count(&self, _parent: &QModelIndex) -> i32 {
-        self.rust().rows.len() as i32
+    pub fn row_count(&self, parent: &QModelIndex) -> i32 {
+        if parent.is_valid() {
+            0
+        } else {
+            self.rust().rows.len() as i32
+        }
     }
 
     pub fn data(&self, index: &QModelIndex, role: i32) -> QVariant {

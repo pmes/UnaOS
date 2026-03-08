@@ -14,9 +14,6 @@ Rectangle {
     property var backend: null
 
     Component.onCompleted: {
-        if (historyModel) {
-            historyModel.registerModelThread();
-        }
         if (backend) {
             backend.registerThread();
         }
