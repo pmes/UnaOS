@@ -264,11 +264,13 @@ impl VeinHandler {
                 tokio::time::sleep(Duration::from_millis(800)).await;
 
                 if let Ok(records) = disk.lock().unwrap().load_all_memories() {
-                    for record in records {
-                        let prefix = if record.sender == "user" { "[ARCHITECT]" } else { "[UNA]" };
-                        let msg = format!("{} [{}] > {}\n", prefix, record.timestamp, record.content);
-                        let _ = gui_tx_brain.send(GuiUpdate::ConsoleLog(msg)).await;
-                    }
+                    let items: Vec<gneiss_pal::HistoryItem> = records.into_iter().map(|r| gneiss_pal::HistoryItem {
+                        sender: r.sender,
+                        content: r.content,
+                        timestamp: r.timestamp,
+                        is_chat: r.memory_type == "chat",
+                    }).collect();
+                    let _ = gui_tx_brain.send(GuiUpdate::HistoryBatch(items)).await;
                 }
 
                 let forge_client = match ForgeClient::new() {
@@ -289,6 +291,25 @@ impl VeinHandler {
 
                         while let Some(user_input_text) = rx_from_ui.recv().await {
                             // === ROUTE: Directive Injection ===
+                            if user_input_text == "LOAD_HISTORY" {
+                                let disk_clone = disk.clone();
+                                let gui_tx_clone = gui_tx_brain.clone();
+                                tokio::spawn(async move {
+                                    let _ = tokio::task::spawn_blocking(move || {
+                                        if let Ok(records) = disk_clone.lock().unwrap().load_all_memories() {
+                                            let items: Vec<gneiss_pal::HistoryItem> = records.into_iter().map(|r| gneiss_pal::HistoryItem {
+                                                sender: r.sender,
+                                                content: r.content,
+                                                timestamp: r.timestamp,
+                                                is_chat: r.memory_type == "chat",
+                                            }).collect();
+                                            let _ = gui_tx_clone.send_blocking(GuiUpdate::HistoryBatch(items));
+                                        }
+                                    }).await;
+                                });
+                                continue;
+                            }
+
                             if user_input_text.starts_with("SAVE_DIRECTIVE:") {
                                 let dir_text = user_input_text["SAVE_DIRECTIVE:".len()..].to_string();
                                 let timestamp = chrono::Local::now().format("%H:%M:%S").to_string();

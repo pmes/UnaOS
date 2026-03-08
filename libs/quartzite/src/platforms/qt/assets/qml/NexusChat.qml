@@ -32,7 +32,7 @@ Rectangle {
             model: historyModel ? historyModel : null
             spacing: 8
             delegate: Rectangle {
-                width: chatListView.width
+                width: Math.max(chatListView.width, 100)
                 height: Math.max(messageText.implicitHeight + 24, 40)
                 color: model.toolTip ? "#0078D7" : "#333333"
                 radius: 8
@@ -40,7 +40,7 @@ Rectangle {
                 Text {
                     id: messageText
                     anchors.centerIn: parent
-                    width: parent.width - 16
+                    width: Math.max(parent.width - 16, 10)
                     text: display !== undefined ? display : (model.display !== undefined ? model.display : "Awaiting Telemetry...")
                     color: "#FFFFFF"
                     wrapMode: Text.WordWrap
