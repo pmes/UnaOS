@@ -21,7 +21,7 @@ import com.unaos.lumen 1.0
 
 Rectangle {
     id: root
-    color: "#0a0a0a" // Slightly darker for overlay distinctness
+    color: palette.window
     opacity: 0.95
     visible: false
 
@@ -41,7 +41,7 @@ Rectangle {
 
             Text {
                 text: "NETWORK LOG :: THE TRUTH VIEW"
-                color: "#FFFFFF"
+                color: palette.windowText
                 font.bold: true
                 font.pixelSize: 20
                 Layout.fillWidth: true
@@ -50,7 +50,7 @@ Rectangle {
             Button {
                 text: "X"
                 implicitWidth: 40
-                background: Rectangle { color: "#CC0000"; radius: 4 }
+                background: Rectangle { color: "#D70000"; radius: 4 }
                 contentItem: Text {
                     text: parent.text
                     color: "white"
@@ -75,8 +75,8 @@ Rectangle {
             delegate: Rectangle {
                 width: networkLogView.width
                 height: Math.max(logText.implicitHeight + 16, 30)
-                color: "#1e1e1e"
-                border.color: "#333333"
+                color: palette.base
+                border.color: palette.mid
                 border.width: 1
                 radius: 4
 

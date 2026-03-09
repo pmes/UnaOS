@@ -210,17 +210,26 @@ impl qobject::VeinBridge {
     }
 
     pub fn dispatch_payload(mut self: std::pin::Pin<&mut Self>, system: QString, directives: QString, engrams: QString, prompt: QString) {
-        // Construct the full payload string as it will go over the wire
-        let full_payload = format!(
-            "System:\n{}\n\nDirectives:\n{}\n\nEngrams:\n{}\n\nPrompt:\n{}",
-            system, directives, engrams, prompt
-        );
+        // Construct the struct the kernel actually expects
+        let payload = PreFlightPayload {
+            system: system.to_string(),
+            directives: directives.to_string(),
+            engrams: engrams.to_string(),
+            prompt: prompt.to_string(),
+        };
 
-        if let Some(tx) = GLOBAL_TX.get() {
-            // Emit the exact payload over the wire via signal to the Qt side (The Truth View)
-            self.as_mut().network_payload_dispatched(QString::from(&full_payload));
+        // Serialize to JSON for the core
+        if let Ok(json_payload) = serde_json::to_string(&payload) {
+            // Keep the formatted version for the Network Log visual
+            let display_payload = format!(
+                "System:\n{}\n\nDirectives:\n{}\n\nEngrams:\n{}\n\nPrompt:\n{}",
+                system, directives, engrams, prompt
+            );
 
-            let _ = tx.try_send(Event::DispatchPayload(full_payload));
+            if let Some(tx) = GLOBAL_TX.get() {
+                self.as_mut().network_payload_dispatched(QString::from(&display_payload));
+                let _ = tx.try_send(Event::DispatchPayload(json_payload));
+            }
         }
     }
 

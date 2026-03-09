@@ -188,8 +188,6 @@ Rectangle {
 
             Button {
                 text: "Cancel"
-                background: Rectangle { color: "#555555"; radius: 4; implicitWidth: 100; implicitHeight: 36 }
-                contentItem: Text { text: parent.text; color: "#FFFFFF"; horizontalAlignment: Text.AlignHCenter; verticalAlignment: Text.AlignVCenter }
                 onClicked: {
                     customCancelAlert.open();
                 }
@@ -197,8 +195,6 @@ Rectangle {
 
             Button {
                 text: "Send"
-                background: Rectangle { color: "#0078D7"; radius: 4; implicitWidth: 100; implicitHeight: 36 }
-                contentItem: Text { text: parent.text; color: "#FFFFFF"; font.bold: true; horizontalAlignment: Text.AlignHCenter; verticalAlignment: Text.AlignVCenter }
                 onClicked: {
                     if (backend && promptTextArea.text !== "") {
                         backend.dispatchPayload(

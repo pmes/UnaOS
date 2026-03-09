@@ -135,12 +135,8 @@ fn main() {
 
     // Block until the backend tasks finish their clean shutdown
     rt.block_on(async {
-        let _ = tokio::time::timeout(std::time::Duration::from_secs(3), async {
-            let _ = core_handle.await;
-            let _ = brain_loop_handle.await;
-            let _ = bg_handle.await;
-        }).await;
+        let _ = core_handle.await;
+        let _ = brain_loop_handle.await;
+        let _ = bg_handle.await;
     });
-
-    std::process::exit(0);
 }

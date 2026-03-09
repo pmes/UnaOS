@@ -35,8 +35,8 @@ Popup {
         id: dialogBox
         width: Math.max(380, contentLayout.implicitWidth + 32)
         height: contentLayout.implicitHeight + 32
-        color: "#1e1e1e"
-        border.color: "#444444"
+        color: palette.window
+        border.color: palette.mid
         border.width: 1
         radius: 8
     }
@@ -53,7 +53,7 @@ Popup {
 
             Text {
                 text: root.titleText
-                color: "#FFFFFF"
+                color: palette.windowText
                 font.pixelSize: 16
                 font.bold: true
                 visible: text !== ""
@@ -62,7 +62,7 @@ Popup {
 
             Text {
                 text: root.bodyText
-                color: "#CCCCCC"
+                color: palette.text
                 font.pixelSize: 14
                 visible: text !== ""
                 Layout.fillWidth: true
@@ -84,19 +84,6 @@ Popup {
                     model: root.buttons
                     Button {
                         text: modelData.label
-                        background: Rectangle {
-                            color: modelData.color ? modelData.color : "#333333"
-                            radius: 4
-                            implicitWidth: 100
-                            implicitHeight: 32
-                        }
-                        contentItem: Text {
-                            text: parent.text
-                            color: "#FFFFFF"
-                            font.bold: modelData.primary ? true : false
-                            horizontalAlignment: Text.AlignHCenter
-                            verticalAlignment: Text.AlignVCenter
-                        }
                         onClicked: root.actionTriggered(modelData.action)
                     }
                 }
