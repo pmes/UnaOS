@@ -80,14 +80,17 @@ Rectangle {
                 border.width: 1
                 radius: 4
 
-                Text {
+                TextEdit {
                     id: logText
                     anchors.centerIn: parent
                     width: Math.max(parent.width - 16, 10)
                     text: display !== undefined ? display : "Awaiting transmission..."
                     color: "#00FF00" // Hacker/Terminal Can-Am contrast
                     font.family: "Monospace"
-                    wrapMode: Text.WrapAnywhere
+                    wrapMode: TextEdit.WrapAnywhere
+                    readOnly: true
+                    selectByMouse: true
+                    cursorVisible: false
                 }
             }
 

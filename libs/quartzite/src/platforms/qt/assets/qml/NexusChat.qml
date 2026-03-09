@@ -146,10 +146,10 @@ Rectangle {
             }
         }
         function onPayloadReadyForReview(system, directives, engrams, prompt) {
-            preFlightOverlay.systemText = system;
-            preFlightOverlay.directivesText = directives;
-            preFlightOverlay.engramsText = engrams;
-            preFlightOverlay.promptText = prompt;
+            preFlightOverlay.systemTextAreaText = system;
+            preFlightOverlay.directivesTextAreaText = directives;
+            preFlightOverlay.engramsTextAreaText = engrams;
+            preFlightOverlay.promptTextAreaText = prompt;
             preFlightOverlay.visible = true;
         }
     }

@@ -343,19 +343,18 @@ pub fn route_history_batch(items: Vec<HistoryItem>) {
         is_chat: i.is_chat,
     }).collect();
 
-    // FORCE VISUAL CONFIRMATION IF VAULT IS EMPTY
-    if rust_items.is_empty() {
-        rust_items.push(HistoryItemRust {
-            sender: "system".to_string(),
-            content: ":: UNAFS VAULT EMPTY. READY FOR TELEMETRY ::".to_string(),
-            timestamp: "".to_string(),
-            is_chat: false,
-        });
-    }
-
     if let Some(thread) = HISTORY_MODEL_THREAD.get() {
         let thread = thread.clone();
-        thread.queue(move |qobj| {
+        thread.queue(move |mut qobj| {
+            // FORCE VISUAL CONFIRMATION IF VAULT IS EMPTY (prevent duplicates)
+            if rust_items.is_empty() && qobj.as_ref().rust().rows.is_empty() {
+                rust_items.push(HistoryItemRust {
+                    sender: "system".to_string(),
+                    content: ":: UNAFS VAULT EMPTY. READY FOR TELEMETRY ::".to_string(),
+                    timestamp: "".to_string(),
+                    is_chat: false,
+                });
+            }
             qobj.add_items(rust_items);
         }).unwrap();
     } else {

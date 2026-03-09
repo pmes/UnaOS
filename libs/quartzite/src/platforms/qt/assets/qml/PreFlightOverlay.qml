@@ -17,7 +17,6 @@
 import QtQuick 2.15
 import QtQuick.Controls 2.15
 import QtQuick.Layouts 1.15
-import Qt.labs.platform 1.1
 import com.unaos.lumen 1.0
 
 Rectangle {
@@ -27,10 +26,10 @@ Rectangle {
     opacity: 0.98
 
     property var backend: null
-    property string systemText: ""
-    property string directivesText: ""
-    property string engramsText: ""
-    property string promptText: ""
+    property alias systemTextAreaText: systemTextArea.text
+    property alias directivesTextAreaText: directivesTextArea.text
+    property alias engramsTextAreaText: engramsTextArea.text
+    property alias promptTextAreaText: promptTextArea.text
 
     // Custom signals to tell the parent to clear its input state
     signal payloadSent()
@@ -125,10 +124,8 @@ Rectangle {
                     anchors.margins: 8
                     TextArea {
                         id: systemTextArea
-                        text: root.systemText
                         color: "#FFFFFF"
                         wrapMode: Text.WordWrap
-                        onTextChanged: { root.systemText = text; }
                     }
                 }
             }
@@ -142,10 +139,8 @@ Rectangle {
                     anchors.margins: 8
                     TextArea {
                         id: directivesTextArea
-                        text: root.directivesText
                         color: "#FFFFFF"
                         wrapMode: Text.WordWrap
-                        onTextChanged: { root.directivesText = text; }
                     }
                 }
             }
@@ -159,10 +154,8 @@ Rectangle {
                     anchors.margins: 8
                     TextArea {
                         id: engramsTextArea
-                        text: root.engramsText
                         color: "#FFFFFF"
                         wrapMode: Text.WordWrap
-                        onTextChanged: { root.engramsText = text; }
                     }
                 }
             }
@@ -176,10 +169,8 @@ Rectangle {
                     anchors.margins: 8
                     TextArea {
                         id: promptTextArea
-                        text: root.promptText
                         color: "#FFFFFF"
                         wrapMode: Text.WordWrap
-                        onTextChanged: { root.promptText = text; }
                     }
                 }
             }
@@ -220,12 +211,25 @@ Rectangle {
         }
     }
 
-    MessageDialog {
+    // Use QtQuick.Controls Dialog instead of Qt.labs.platform to ensure
+    // the dialog anchors within the transient application window and properly
+    // blocks the parent UI (modal: true). Qt.labs.platform defaults to unparented
+    // native Wayland/Windows windows which can center arbitrarily.
+    Dialog {
         id: cancelDialog
         title: "Cancel Pre-Flight?"
-        text: "Are you sure you want to abort the payload? This will clear your current input."
-        buttons: MessageDialog.Yes | MessageDialog.No
-        onYesClicked: {
+        standardButtons: Dialog.Yes | Dialog.No
+        anchors.centerIn: parent
+        modal: true
+
+        background: Rectangle { color: "#1e1e1e"; border.color: "#444"; radius: 6 }
+
+        contentItem: Text {
+            text: "Are you sure you want to abort the payload?\nThis will clear your current input."
+            color: "#FFFFFF"
+        }
+
+        onAccepted: {
             root.payloadCanceled();
             root.visible = false;
         }
