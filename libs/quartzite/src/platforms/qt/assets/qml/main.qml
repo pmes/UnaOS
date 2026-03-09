@@ -65,7 +65,7 @@ Item {
             id: mainChatView
             SplitView.fillWidth: true
             SplitView.fillHeight: true
-
+            backend: veinBridge
         }
     }
 

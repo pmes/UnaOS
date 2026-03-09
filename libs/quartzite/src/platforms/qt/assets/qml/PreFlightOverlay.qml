@@ -17,6 +17,7 @@
 import QtQuick 2.15
 import QtQuick.Controls 2.15
 import QtQuick.Layouts 1.15
+import QtQuick.Dialogs 1.3
 import com.unaos.lumen 1.0
 
 Rectangle {
@@ -219,20 +220,12 @@ Rectangle {
         }
     }
 
-    Dialog {
+    MessageDialog {
         id: cancelDialog
         title: "Cancel Pre-Flight?"
-        standardButtons: Dialog.Yes | Dialog.No
-        anchors.centerIn: parent
-        modal: true
-
-        background: Rectangle { color: "#1e1e1e"; border.color: "#444"; radius: 6 }
-        contentItem: Text {
-            text: "Are you sure you want to abort the payload?\nThis will clear your current input."
-            color: "#FFFFFF"
-        }
-
-        onAccepted: {
+        text: "Are you sure you want to abort the payload? This will clear your current input."
+        standardButtons: StandardButton.Yes | StandardButton.No
+        onYes: {
             root.payloadCanceled();
             root.visible = false;
         }

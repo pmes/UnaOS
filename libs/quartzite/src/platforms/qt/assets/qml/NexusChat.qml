@@ -23,13 +23,7 @@ Rectangle {
     id: root
     color: "#121212"
 
-    VeinBridge {
-        id: veinEngine
-        Component.onCompleted: {
-            veinEngine.registerThread();
-            veinEngine.requestHistory();
-        }
-    }
+    property var backend: null
 
     ColumnLayout {
         anchors.fill: parent
@@ -102,8 +96,8 @@ Rectangle {
                     radius: 4
                 }
                 onAccepted: {
-                    if (inputField.text !== "") {
-                        veinEngine.requestPreFlightReview(inputField.text);
+                    if (backend && inputField.text !== "") {
+                        backend.requestPreFlightReview(inputField.text);
                     }
                 }
             }
@@ -113,10 +107,12 @@ Rectangle {
                 background: Rectangle { color: "#0078D7"; radius: 4 }
                 contentItem: Text { text: parent.text; color: "#FFF"; font.bold: true; horizontalAlignment: Text.AlignHCenter; verticalAlignment: Text.AlignVCenter }
                 onClicked: {
-                    if (inputField.text !== "") {
-                        veinEngine.requestPreFlightReview(inputField.text);
-                    } else {
-                        veinEngine.requestPreFlightReview("");
+                    if (backend) {
+                        if (inputField.text !== "") {
+                            backend.requestPreFlightReview(inputField.text);
+                        } else {
+                            backend.requestPreFlightReview("");
+                        }
                     }
                 }
             }
@@ -128,7 +124,7 @@ Rectangle {
         id: preFlightOverlay
         anchors.fill: parent
         z: 90
-        backend: veinEngine
+        backend: root.backend
 
         onPayloadSent: {
             inputField.text = "";
@@ -136,12 +132,14 @@ Rectangle {
 
         onPayloadCanceled: {
             inputField.text = "";
-            veinEngine.cancelPreFlight();
+            if (backend) {
+                backend.cancelPreFlight();
+            }
         }
     }
 
     Connections {
-        target: veinEngine
+        target: typeof root.backend !== "undefined" ? root.backend : null
         function onNetworkPayloadDispatched(payload) {
             if (typeof _networkLogModel !== "undefined" && _networkLogModel !== null) {
                 _networkLogModel.appendLog(payload);
