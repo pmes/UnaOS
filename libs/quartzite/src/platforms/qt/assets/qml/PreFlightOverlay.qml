@@ -204,11 +204,13 @@ Rectangle {
         onActionTriggered: function(action) {
             if (action === "reject") {
                 customCancelAlert.close();
-                // Clear the text fields manually
-                systemTextAreaText = "";
-                directivesTextAreaText = "";
-                engramsTextAreaText = "";
-                promptTextAreaText = "";
+                // Clear the exact TextAreas by ID
+                systemTextArea.text = "";
+                directivesTextArea.text = "";
+                engramsTextArea.text = "";
+                promptTextArea.text = "";
+
+                root.payloadCanceled();
                 root.visible = false;
             } else if (action === "return") {
                 customCancelAlert.close();

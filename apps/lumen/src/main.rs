@@ -77,7 +77,7 @@ fn main() {
 
     // 5. Awaken the Autonomous Core
     let core_synapse = synapse.clone();
-    let _core_handle = rt.spawn(async move {
+    let core_handle = rt.spawn(async move {
         core::ignite(cortex_vault, core_synapse).await;
     });
 
@@ -133,11 +133,17 @@ fn main() {
     // Broadcast shutdown in case GUI exited naturally instead of via SIGINT/SIGTERM
     let _ = shutdown_tx.send(());
 
-    // Block until the backend tasks finish their clean shutdown
+    // 1. Wait for UI tasks to sync and finish
     rt.block_on(async {
         let _ = brain_loop_handle.await;
         let _ = bg_handle.await;
     });
 
-    std::process::exit(0);
+    // 2. Abort the core handle to force it to drop cortex_vault and flush
+    core_handle.abort();
+
+    // 3. Briefly await the aborted handle to guarantee the Drop trait finishes
+    rt.block_on(async {
+        let _ = core_handle.await;
+    });
 }

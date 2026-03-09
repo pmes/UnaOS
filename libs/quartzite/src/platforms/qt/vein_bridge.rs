@@ -389,13 +389,22 @@ pub fn route_review_payload(payload: PreFlightPayload) {
     // We emit the signal directly from VeinBridge rather than filling a model.
     if let Some(thread) = VEIN_THREAD.get() {
         let thread = thread.clone();
-        thread.queue(move |qobj| {
-            qobj.payload_ready_for_review(
+        thread.queue(move |mut qobj| {
+            qobj.as_mut().payload_ready_for_review(
                 QString::from(&payload.system),
                 QString::from(&payload.directives),
                 QString::from(&payload.engrams),
                 QString::from(&payload.prompt),
             );
+        }).unwrap();
+    }
+}
+
+pub fn route_console_log(log: String) {
+    if let Some(thread) = NETWORK_LOG_MODEL_THREAD.get() {
+        let thread = thread.clone();
+        thread.queue(move |mut qobj| {
+            qobj.as_mut().append_log(QString::from(&log));
         }).unwrap();
     }
 }
