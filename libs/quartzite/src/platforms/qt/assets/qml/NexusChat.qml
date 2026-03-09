@@ -103,8 +103,7 @@ Rectangle {
                 }
                 onAccepted: {
                     if (inputField.text !== "") {
-                        preFlightOverlay.activePrompt = inputField.text;
-                        preFlightOverlay.visible = true;
+                        veinEngine.requestPreFlightReview(inputField.text);
                     }
                 }
             }
@@ -115,11 +114,9 @@ Rectangle {
                 contentItem: Text { text: parent.text; color: "#FFF"; font.bold: true; horizontalAlignment: Text.AlignHCenter; verticalAlignment: Text.AlignVCenter }
                 onClicked: {
                     if (inputField.text !== "") {
-                        preFlightOverlay.activePrompt = inputField.text;
-                        preFlightOverlay.visible = true;
+                        veinEngine.requestPreFlightReview(inputField.text);
                     } else {
-                        preFlightOverlay.activePrompt = "";
-                        preFlightOverlay.visible = true;
+                        veinEngine.requestPreFlightReview("");
                     }
                 }
             }
@@ -131,7 +128,6 @@ Rectangle {
         id: preFlightOverlay
         anchors.fill: parent
         z: 90
-        payloadModel: typeof _preflightPayload !== "undefined" ? _preflightPayload : null
         backend: veinEngine
 
         onPayloadSent: {
@@ -140,6 +136,7 @@ Rectangle {
 
         onPayloadCanceled: {
             inputField.text = "";
+            veinEngine.cancelPreFlight();
         }
     }
 
@@ -149,6 +146,13 @@ Rectangle {
             if (typeof _networkLogModel !== "undefined" && _networkLogModel !== null) {
                 _networkLogModel.appendLog(payload);
             }
+        }
+        function onPayloadReadyForReview(system, directives, engrams, prompt) {
+            preFlightOverlay.systemText = system;
+            preFlightOverlay.directivesText = directives;
+            preFlightOverlay.engramsText = engrams;
+            preFlightOverlay.promptText = prompt;
+            preFlightOverlay.visible = true;
         }
     }
 }

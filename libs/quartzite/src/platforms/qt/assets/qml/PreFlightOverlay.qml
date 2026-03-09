@@ -25,9 +25,11 @@ Rectangle {
     visible: false
     opacity: 0.98
 
-    property var payloadModel: null
     property var backend: null
-    property string activePrompt: ""
+    property string systemText: ""
+    property string directivesText: ""
+    property string engramsText: ""
+    property string promptText: ""
 
     // Custom signals to tell the parent to clear its input state
     signal payloadSent()
@@ -121,11 +123,11 @@ Rectangle {
                     anchors.fill: parent
                     anchors.margins: 8
                     TextArea {
-                        id: systemText
-                        text: payloadModel ? payloadModel.system : ""
+                        id: systemTextArea
+                        text: root.systemText
                         color: "#FFFFFF"
                         wrapMode: Text.WordWrap
-                        onTextChanged: { if(payloadModel) payloadModel.system = text; }
+                        onTextChanged: { root.systemText = text; }
                     }
                 }
             }
@@ -138,11 +140,11 @@ Rectangle {
                     anchors.fill: parent
                     anchors.margins: 8
                     TextArea {
-                        id: directivesText
-                        text: payloadModel ? payloadModel.directives : ""
+                        id: directivesTextArea
+                        text: root.directivesText
                         color: "#FFFFFF"
                         wrapMode: Text.WordWrap
-                        onTextChanged: { if(payloadModel) payloadModel.directives = text; }
+                        onTextChanged: { root.directivesText = text; }
                     }
                 }
             }
@@ -155,11 +157,11 @@ Rectangle {
                     anchors.fill: parent
                     anchors.margins: 8
                     TextArea {
-                        id: engramsText
-                        text: payloadModel ? payloadModel.engrams : ""
+                        id: engramsTextArea
+                        text: root.engramsText
                         color: "#FFFFFF"
                         wrapMode: Text.WordWrap
-                        onTextChanged: { if(payloadModel) payloadModel.engrams = text; }
+                        onTextChanged: { root.engramsText = text; }
                     }
                 }
             }
@@ -172,11 +174,11 @@ Rectangle {
                     anchors.fill: parent
                     anchors.margins: 8
                     TextArea {
-                        id: promptText
-                        text: payloadModel ? payloadModel.prompt : ""
+                        id: promptTextArea
+                        text: root.promptText
                         color: "#FFFFFF"
                         wrapMode: Text.WordWrap
-                        onTextChanged: { if(payloadModel) payloadModel.prompt = text; }
+                        onTextChanged: { root.promptText = text; }
                     }
                 }
             }
@@ -202,10 +204,13 @@ Rectangle {
                 background: Rectangle { color: "#0078D7"; radius: 4; implicitWidth: 100; implicitHeight: 36 }
                 contentItem: Text { text: parent.text; color: "#FFFFFF"; font.bold: true; horizontalAlignment: Text.AlignHCenter; verticalAlignment: Text.AlignVCenter }
                 onClicked: {
-                    // Send the finalized active prompt (which overrides the model's prompt if set here)
-                    if (backend && promptText.text !== "") {
-                        backend.sendMessage(promptText.text);
-                        promptText.text = "";
+                    if (backend && promptTextArea.text !== "") {
+                        backend.dispatchPayload(
+                            systemTextArea.text,
+                            directivesTextArea.text,
+                            engramsTextArea.text,
+                            promptTextArea.text
+                        );
                         root.payloadSent();
                         root.visible = false;
                     }
@@ -230,12 +235,6 @@ Rectangle {
         onAccepted: {
             root.payloadCanceled();
             root.visible = false;
-        }
-    }
-
-    onVisibleChanged: {
-        if (visible && payloadModel) {
-            promptText.text = root.activePrompt;
         }
     }
 }

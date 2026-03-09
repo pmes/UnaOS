@@ -132,15 +132,27 @@ pub mod qobject {
 
         #[qinvokable]
         #[cxx_name = "dispatchPayload"]
-        fn dispatch_payload(self: Pin<&mut VeinBridge>, text: QString);
+        fn dispatch_payload(self: Pin<&mut VeinBridge>, system: QString, directives: QString, engrams: QString, prompt: QString);
 
         #[qinvokable]
         #[cxx_name = "registerThread"]
         fn register_thread(self: Pin<&mut VeinBridge>);
 
+        #[qinvokable]
+        #[cxx_name = "requestPreFlightReview"]
+        fn request_pre_flight_review(self: Pin<&mut VeinBridge>, text: QString);
+
+        #[qinvokable]
+        #[cxx_name = "cancelPreFlight"]
+        fn cancel_pre_flight(self: Pin<&mut VeinBridge>);
+
         #[qsignal]
         #[cxx_name = "networkPayloadDispatched"]
         fn network_payload_dispatched(self: Pin<&mut VeinBridge>, payload: QString);
+
+        #[qsignal]
+        #[cxx_name = "payloadReadyForReview"]
+        fn payload_ready_for_review(self: Pin<&mut VeinBridge>, system: QString, directives: QString, engrams: QString, prompt: QString);
     }
 
     impl cxx_qt::Threading for VeinBridge {}
@@ -177,16 +189,12 @@ impl qobject::VeinBridge {
         let _ = VEIN_THREAD.set(self.qt_thread());
     }
 
-    pub fn send_message(mut self: std::pin::Pin<&mut Self>, text: QString) {
+    pub fn send_message(self: std::pin::Pin<&mut Self>, text: QString) {
         if let Some(tx) = GLOBAL_TX.get() {
             let event = Event::Input {
                 target: "chat".to_string(),
                 text: text.to_string(),
             };
-
-            // Emit the exact payload over the wire via signal to the Qt side
-            self.as_mut().network_payload_dispatched(text.clone());
-
             let _ = tx.try_send(event);
         }
     }
@@ -197,10 +205,41 @@ impl qobject::VeinBridge {
         }
     }
 
-    pub fn dispatch_payload(self: std::pin::Pin<&mut Self>, text: QString) {
-         if let Some(tx) = GLOBAL_TX.get() {
-             let _ = tx.try_send(Event::DispatchPayload(text.to_string()));
-         }
+    pub fn dispatch_payload(mut self: std::pin::Pin<&mut Self>, system: QString, directives: QString, engrams: QString, prompt: QString) {
+        // Construct the full payload string as it will go over the wire
+        let full_payload = format!(
+            "System:\n{}\n\nDirectives:\n{}\n\nEngrams:\n{}\n\nPrompt:\n{}",
+            system, directives, engrams, prompt
+        );
+
+        if let Some(tx) = GLOBAL_TX.get() {
+            // Emit the exact payload over the wire via signal to the Qt side (The Truth View)
+            self.as_mut().network_payload_dispatched(QString::from(&full_payload));
+
+            let _ = tx.try_send(Event::DispatchPayload(full_payload));
+        }
+    }
+
+    pub fn request_pre_flight_review(self: std::pin::Pin<&mut Self>, text: QString) {
+        if let Some(tx) = GLOBAL_TX.get() {
+            let event = Event::Input {
+                target: "chat".to_string(),
+                text: text.to_string(),
+            };
+            let _ = tx.try_send(event);
+        }
+    }
+
+    pub fn cancel_pre_flight(self: std::pin::Pin<&mut Self>) {
+        if let Some(tx) = GLOBAL_TX.get() {
+            // Per the directive, fully discard Event::Input on cancel.
+            // Sending ::CANCEL:: to the chat target will trigger the core to clear the state.
+            let event = Event::Input {
+                target: "chat".to_string(),
+                text: "::CANCEL::".to_string(),
+            };
+            let _ = tx.try_send(event);
+        }
     }
 }
 
@@ -325,13 +364,16 @@ pub fn route_history_batch(items: Vec<HistoryItem>) {
 }
 
 pub fn route_review_payload(payload: PreFlightPayload) {
-    if let Some(thread) = PREFLIGHT_THREAD.get() {
+    // We emit the signal directly from VeinBridge rather than filling a model.
+    if let Some(thread) = VEIN_THREAD.get() {
         let thread = thread.clone();
         thread.queue(move |mut qobj| {
-            qobj.as_mut().set_system(QString::from(&payload.system));
-            qobj.as_mut().set_directives(QString::from(&payload.directives));
-            qobj.as_mut().set_engrams(QString::from(&payload.engrams));
-            qobj.as_mut().set_prompt(QString::from(&payload.prompt));
+            qobj.as_mut().payload_ready_for_review(
+                QString::from(&payload.system),
+                QString::from(&payload.directives),
+                QString::from(&payload.engrams),
+                QString::from(&payload.prompt),
+            );
         }).unwrap();
     }
 }
