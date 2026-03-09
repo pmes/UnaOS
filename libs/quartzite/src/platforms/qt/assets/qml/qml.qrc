@@ -3,5 +3,8 @@
         <file>main.qml</file>
         <file>NexusChat.qml</file>
         <file>NodesEmail.qml</file>
+        <file>NexusPanel.qml</file>
+        <file>NetworkLogOverlay.qml</file>
+        <file>PreFlightOverlay.qml</file>
     </qresource>
 </RCC>

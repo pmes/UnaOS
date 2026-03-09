@@ -24,6 +24,7 @@ use crate::platforms::qt::window::GLOBAL_TX;
 pub static VEIN_THREAD: OnceLock<cxx_qt::CxxQtThread<qobject::VeinBridge>> = OnceLock::new();
 pub static HISTORY_MODEL_THREAD: OnceLock<cxx_qt::CxxQtThread<qobject::HistoryModel>> = OnceLock::new();
 pub static PREFLIGHT_THREAD: OnceLock<cxx_qt::CxxQtThread<qobject::PreFlightPayloadQml>> = OnceLock::new();
+pub static NETWORK_LOG_MODEL_THREAD: OnceLock<cxx_qt::CxxQtThread<qobject::NetworkLogModel>> = OnceLock::new();
 
 #[cxx_qt::bridge]
 pub mod qobject {
@@ -86,6 +87,37 @@ pub mod qobject {
 
     unsafe extern "RustQt" {
         #[qobject]
+        #[base = QAbstractListModel]
+        #[qml_element]
+        type NetworkLogModel = super::NetworkLogModelRust;
+
+        #[qinvokable(cxx_override)]
+        #[cxx_name = "rowCount"]
+        fn row_count(self: &NetworkLogModel, parent: &QModelIndex) -> i32;
+        #[qinvokable(cxx_override)]
+        fn data(self: &NetworkLogModel, index: &QModelIndex, role: i32) -> QVariant;
+
+        #[qinvokable]
+        #[cxx_name = "registerModelThread"]
+        fn register_model_thread(self: Pin<&mut NetworkLogModel>);
+
+        #[qinvokable]
+        #[cxx_name = "appendLog"]
+        fn append_log(self: Pin<&mut NetworkLogModel>, payload: QString);
+
+        #[inherit]
+        #[cxx_name = "beginResetModel"]
+        fn begin_reset_model(self: Pin<&mut NetworkLogModel>);
+
+        #[inherit]
+        #[cxx_name = "endResetModel"]
+        fn end_reset_model(self: Pin<&mut NetworkLogModel>);
+    }
+
+    impl cxx_qt::Threading for NetworkLogModel {}
+
+    unsafe extern "RustQt" {
+        #[qobject]
         #[qml_element]
         #[cxx_name = "VeinBridge"]
         type VeinBridge = super::VeinBridgeRust;
@@ -105,6 +137,10 @@ pub mod qobject {
         #[qinvokable]
         #[cxx_name = "registerThread"]
         fn register_thread(self: Pin<&mut VeinBridge>);
+
+        #[qsignal]
+        #[cxx_name = "networkPayloadDispatched"]
+        fn network_payload_dispatched(self: Pin<&mut VeinBridge>, payload: QString);
     }
 
     impl cxx_qt::Threading for VeinBridge {}
@@ -141,12 +177,16 @@ impl qobject::VeinBridge {
         let _ = VEIN_THREAD.set(self.qt_thread());
     }
 
-    pub fn send_message(self: std::pin::Pin<&mut Self>, text: QString) {
+    pub fn send_message(mut self: std::pin::Pin<&mut Self>, text: QString) {
         if let Some(tx) = GLOBAL_TX.get() {
             let event = Event::Input {
                 target: "chat".to_string(),
                 text: text.to_string(),
             };
+
+            // Emit the exact payload over the wire via signal to the Qt side
+            self.as_mut().network_payload_dispatched(text.clone());
+
             let _ = tx.try_send(event);
         }
     }
@@ -211,6 +251,46 @@ impl qobject::HistoryModel {
             1 => QVariant::default(), // DecorationRole (Must be icon/pixmap, leaving empty)
             2 => QVariant::from(&QString::from(&item.sender)), // EditRole
             3 => QVariant::from(&item.is_chat), // ToolTipRole
+            _ => QVariant::default(),
+        }
+    }
+}
+
+// QAbstractListModel implementation for NetworkLogModel
+#[derive(Default)]
+pub struct NetworkLogModelRust {
+    pub rows: Vec<String>,
+}
+
+impl qobject::NetworkLogModel {
+    pub fn register_model_thread(self: std::pin::Pin<&mut Self>) {
+        use cxx_qt::Threading;
+        let _ = NETWORK_LOG_MODEL_THREAD.set(self.qt_thread());
+    }
+
+    pub fn append_log(mut self: std::pin::Pin<&mut Self>, payload: QString) {
+        self.as_mut().begin_reset_model();
+        self.as_mut().rust_mut().rows.push(payload.to_string());
+        self.as_mut().end_reset_model();
+    }
+
+    pub fn row_count(&self, parent: &QModelIndex) -> i32 {
+        if parent.is_valid() {
+            0
+        } else {
+            self.rust().rows.len() as i32
+        }
+    }
+
+    pub fn data(&self, index: &QModelIndex, role: i32) -> QVariant {
+        let row = index.row();
+        if row < 0 || row >= self.rust().rows.len() as i32 {
+            return QVariant::default();
+        }
+
+        let item = &self.rust().rows[row as usize];
+        match role {
+            0 => QVariant::from(&QString::from(item)), // DisplayRole
             _ => QVariant::default(),
         }
     }

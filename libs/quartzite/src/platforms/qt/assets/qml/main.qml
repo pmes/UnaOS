@@ -48,19 +48,33 @@ Item {
         orientation: Qt.Horizontal
 
         // Nodes Email List (Sidebar)
-        NodesEmail {
+        NexusPanel {
             SplitView.preferredWidth: 250
             SplitView.fillHeight: true
             SplitView.minimumWidth: 150
+            historyModel: typeof _historyModel !== "undefined" ? _historyModel : null
+            backend: veinBridge // Uses the VeinBridge defined above in main.qml
 
-            // Assuming context properties "historyModel" and "preflightPayload" will be injected
+            onViewNetworkLog: {
+                networkLogOverlay.visible = true;
+            }
         }
 
         // Nexus Chat (Main Area)
         NexusChat {
+            id: mainChatView
             SplitView.fillWidth: true
             SplitView.fillHeight: true
 
         }
+    }
+
+    // Network Log Overlay Component (Instantiated here to cover chat area)
+    NetworkLogOverlay {
+        id: networkLogOverlay
+        anchors.fill: parent
+        z: 100 // Ensure it's above the SplitView
+        visible: false
+
     }
 }

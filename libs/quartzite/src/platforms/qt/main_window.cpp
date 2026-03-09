@@ -37,6 +37,7 @@ LumenMainWindow::LumenMainWindow(QWidget *parent) : QMainWindow(parent) {
     qmlRegisterType<LumenWindow>("com.unaos.lumen", 1, 0, "LumenWindow");
     qmlRegisterType<VeinBridge>("com.unaos.lumen", 1, 0, "VeinBridge");
     qmlRegisterUncreatableType<HistoryModel>("com.unaos.lumen", 1, 0, "HistoryModel", "Rust owned");
+    qmlRegisterUncreatableType<NetworkLogModel>("com.unaos.lumen", 1, 0, "NetworkLogModel", "Rust owned");
     qmlRegisterUncreatableType<PreFlightPayloadQml>("com.unaos.lumen", 1, 0, "PreFlightPayloadQml", "Rust owned");
 
 
@@ -55,10 +56,13 @@ LumenMainWindow::LumenMainWindow(QWidget *parent) : QMainWindow(parent) {
     // Instantiate Rust-backed models and expose them to QML via context
     HistoryModel* historyModel = new HistoryModel(this);
     historyModel->registerModelThread();
+    NetworkLogModel* networkLogModel = new NetworkLogModel(this);
+    networkLogModel->registerModelThread();
     PreFlightPayloadQml* preflightPayload = new PreFlightPayloadQml(this);
     preflightPayload->registerThread();
 
     m_quickWidget->engine()->rootContext()->setContextProperty("_historyModel", historyModel);
+    m_quickWidget->engine()->rootContext()->setContextProperty("_networkLogModel", networkLogModel);
     m_quickWidget->engine()->rootContext()->setContextProperty("_preflightPayload", preflightPayload);
 
     // Blanket Import Paths
