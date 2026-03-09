@@ -29,6 +29,10 @@ Rectangle {
     property var backend: null
     property string activePrompt: ""
 
+    // Custom signals to tell the parent to clear its input state
+    signal payloadSent()
+    signal payloadCanceled()
+
     // Prevent clicks from passing through
     MouseArea {
         anchors.fill: parent
@@ -53,10 +57,54 @@ Rectangle {
             Layout.fillWidth: true
             background: Rectangle { color: "#1e1e1e" }
 
-            TabButton { text: "System"; contentItem: Text{text: parent.text; color: parent.checked ? "#FFF" : "#888"; horizontalAlignment: Text.AlignHCenter; verticalAlignment: Text.AlignVCenter}; background: Rectangle{color: parent.checked ? "#333" : "transparent"} }
-            TabButton { text: "Directives"; contentItem: Text{text: parent.text; color: parent.checked ? "#FFF" : "#888"; horizontalAlignment: Text.AlignHCenter; verticalAlignment: Text.AlignVCenter}; background: Rectangle{color: parent.checked ? "#333" : "transparent"} }
-            TabButton { text: "Engrams"; contentItem: Text{text: parent.text; color: parent.checked ? "#FFF" : "#888"; horizontalAlignment: Text.AlignHCenter; verticalAlignment: Text.AlignVCenter}; background: Rectangle{color: parent.checked ? "#333" : "transparent"} }
-            TabButton { text: "Prompt"; contentItem: Text{text: parent.text; color: parent.checked ? "#FFF" : "#888"; horizontalAlignment: Text.AlignHCenter; verticalAlignment: Text.AlignVCenter}; background: Rectangle{color: parent.checked ? "#333" : "transparent"} }
+            TabButton {
+                text: "System"
+                contentItem: Text {
+                    text: parent.text
+                    color: parent.checked ? "#FFFFFF" : "#888888"
+                    horizontalAlignment: Text.AlignHCenter
+                    verticalAlignment: Text.AlignVCenter
+                }
+                background: Rectangle {
+                    color: parent.checked ? "#333333" : "transparent"
+                }
+            }
+            TabButton {
+                text: "Directives"
+                contentItem: Text {
+                    text: parent.text
+                    color: parent.checked ? "#FFFFFF" : "#888888"
+                    horizontalAlignment: Text.AlignHCenter
+                    verticalAlignment: Text.AlignVCenter
+                }
+                background: Rectangle {
+                    color: parent.checked ? "#333333" : "transparent"
+                }
+            }
+            TabButton {
+                text: "Engrams"
+                contentItem: Text {
+                    text: parent.text
+                    color: parent.checked ? "#FFFFFF" : "#888888"
+                    horizontalAlignment: Text.AlignHCenter
+                    verticalAlignment: Text.AlignVCenter
+                }
+                background: Rectangle {
+                    color: parent.checked ? "#333333" : "transparent"
+                }
+            }
+            TabButton {
+                text: "Prompt"
+                contentItem: Text {
+                    text: parent.text
+                    color: parent.checked ? "#FFFFFF" : "#888888"
+                    horizontalAlignment: Text.AlignHCenter
+                    verticalAlignment: Text.AlignVCenter
+                }
+                background: Rectangle {
+                    color: parent.checked ? "#333333" : "transparent"
+                }
+            }
         }
 
         StackLayout {
@@ -132,6 +180,7 @@ Rectangle {
                     }
                 }
             }
+        } // Close StackLayout
 
         // Action Buttons
         RowLayout {
@@ -157,7 +206,7 @@ Rectangle {
                     if (backend && promptText.text !== "") {
                         backend.sendMessage(promptText.text);
                         promptText.text = "";
-                    root.payloadSent();
+                        root.payloadSent();
                         root.visible = false;
                     }
                 }
