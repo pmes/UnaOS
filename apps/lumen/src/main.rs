@@ -77,7 +77,7 @@ fn main() {
 
     // 5. Awaken the Autonomous Core
     let core_synapse = synapse.clone();
-    let core_handle = rt.spawn(async move {
+    let _core_handle = rt.spawn(async move {
         core::ignite(cortex_vault, core_synapse).await;
     });
 
@@ -135,8 +135,9 @@ fn main() {
 
     // Block until the backend tasks finish their clean shutdown
     rt.block_on(async {
-        let _ = core_handle.await;
         let _ = brain_loop_handle.await;
         let _ = bg_handle.await;
     });
+
+    std::process::exit(0);
 }

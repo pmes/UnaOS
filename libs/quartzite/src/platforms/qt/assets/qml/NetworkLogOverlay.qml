@@ -21,9 +21,11 @@ import com.unaos.lumen 1.0
 
 Rectangle {
     id: root
-    color: palette.window
+    color: sys.window
     opacity: 0.95
     visible: false
+
+    SystemPalette { id: sys; colorGroup: SystemPalette.Active }
 
     // Prevent clicks from passing through
     MouseArea {
@@ -41,7 +43,7 @@ Rectangle {
 
             Text {
                 text: "NETWORK LOG :: THE TRUTH VIEW"
-                color: palette.windowText
+                color: sys.windowText
                 font.bold: true
                 font.pixelSize: 20
                 Layout.fillWidth: true
@@ -75,8 +77,8 @@ Rectangle {
             delegate: Rectangle {
                 width: networkLogView.width
                 height: Math.max(logText.implicitHeight + 16, 30)
-                color: palette.base
-                border.color: palette.mid
+                color: sys.base
+                border.color: sys.mid
                 border.width: 1
                 radius: 4
 

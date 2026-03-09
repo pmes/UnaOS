@@ -21,9 +21,11 @@ import com.unaos.lumen 1.0
 
 Rectangle {
     id: root
-    color: palette.window
+    color: sys.window
     visible: false
     opacity: 0.98
+
+    SystemPalette { id: sys; colorGroup: SystemPalette.Active }
 
     property var backend: null
     property alias systemTextAreaText: systemTextArea.text
@@ -48,7 +50,7 @@ Rectangle {
 
         Text {
             text: "PRE-FLIGHT REVIEW"
-            color: palette.windowText
+            color: sys.windowText
             font.pixelSize: 22
             font.bold: true
             Layout.alignment: Qt.AlignHCenter
@@ -57,54 +59,54 @@ Rectangle {
         TabBar {
             id: preflightTabBar
             Layout.fillWidth: true
-            background: Rectangle { color: palette.base }
+            background: Rectangle { color: sys.base }
 
             TabButton {
                 text: "System"
                 contentItem: Text {
                     text: parent.text
-                    color: parent.checked ? palette.text : palette.windowText
+                    color: parent.checked ? sys.text : sys.windowText
                     horizontalAlignment: Text.AlignHCenter
                     verticalAlignment: Text.AlignVCenter
                 }
                 background: Rectangle {
-                    color: parent.checked ? palette.mid : "transparent"
+                    color: parent.checked ? sys.mid : "transparent"
                 }
             }
             TabButton {
                 text: "Directives"
                 contentItem: Text {
                     text: parent.text
-                    color: parent.checked ? palette.text : palette.windowText
+                    color: parent.checked ? sys.text : sys.windowText
                     horizontalAlignment: Text.AlignHCenter
                     verticalAlignment: Text.AlignVCenter
                 }
                 background: Rectangle {
-                    color: parent.checked ? palette.mid : "transparent"
+                    color: parent.checked ? sys.mid : "transparent"
                 }
             }
             TabButton {
                 text: "Engrams"
                 contentItem: Text {
                     text: parent.text
-                    color: parent.checked ? palette.text : palette.windowText
+                    color: parent.checked ? sys.text : sys.windowText
                     horizontalAlignment: Text.AlignHCenter
                     verticalAlignment: Text.AlignVCenter
                 }
                 background: Rectangle {
-                    color: parent.checked ? palette.mid : "transparent"
+                    color: parent.checked ? sys.mid : "transparent"
                 }
             }
             TabButton {
                 text: "Prompt"
                 contentItem: Text {
                     text: parent.text
-                    color: parent.checked ? palette.text : palette.windowText
+                    color: parent.checked ? sys.text : sys.windowText
                     horizontalAlignment: Text.AlignHCenter
                     verticalAlignment: Text.AlignVCenter
                 }
                 background: Rectangle {
-                    color: parent.checked ? palette.mid : "transparent"
+                    color: parent.checked ? sys.mid : "transparent"
                 }
             }
         }
@@ -117,14 +119,14 @@ Rectangle {
 
             // System Tab
             Rectangle {
-                color: palette.base
-                border.color: palette.mid
+                color: sys.base
+                border.color: sys.mid
                 ScrollView {
                     anchors.fill: parent
                     anchors.margins: 8
                     TextArea {
                         id: systemTextArea
-                        color: palette.text
+                        color: sys.text
                         wrapMode: Text.WordWrap
                         background: Item {}
                     }
@@ -133,14 +135,14 @@ Rectangle {
 
             // Directives Tab
             Rectangle {
-                color: palette.base
-                border.color: palette.mid
+                color: sys.base
+                border.color: sys.mid
                 ScrollView {
                     anchors.fill: parent
                     anchors.margins: 8
                     TextArea {
                         id: directivesTextArea
-                        color: palette.text
+                        color: sys.text
                         wrapMode: Text.WordWrap
                         background: Item {}
                     }
@@ -149,14 +151,14 @@ Rectangle {
 
             // Engrams Tab
             Rectangle {
-                color: palette.base
-                border.color: palette.mid
+                color: sys.base
+                border.color: sys.mid
                 ScrollView {
                     anchors.fill: parent
                     anchors.margins: 8
                     TextArea {
                         id: engramsTextArea
-                        color: palette.text
+                        color: sys.text
                         wrapMode: Text.WordWrap
                         background: Item {}
                     }
@@ -165,14 +167,14 @@ Rectangle {
 
             // Prompt Tab
             Rectangle {
-                color: palette.base
-                border.color: palette.mid
+                color: sys.base
+                border.color: sys.mid
                 ScrollView {
                     anchors.fill: parent
                     anchors.margins: 8
                     TextArea {
                         id: promptTextArea
-                        color: palette.text
+                        color: sys.text
                         wrapMode: Text.WordWrap
                         background: Item {}
                     }
@@ -224,9 +226,6 @@ Rectangle {
         onActionTriggered: function(action) {
             if (action === "reject") {
                 customCancelAlert.close();
-                if (root.backend) {
-                    root.backend.abortPreFlight();
-                }
                 root.payloadCanceled();
                 root.visible = false;
             } else if (action === "return") {
