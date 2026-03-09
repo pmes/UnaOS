@@ -32,6 +32,30 @@ fn main() {
     let rt = tokio::runtime::Runtime::new().expect("CRITICAL: Failed to ignite Tokio reactor");
     let _guard = rt.enter();
 
+    let (shutdown_tx, _) = tokio::sync::broadcast::channel(1);
+
+    // Spawn Signal Interceptor Task
+    let signal_tx = shutdown_tx.clone();
+    rt.spawn(async move {
+        let mut sigint = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt()).unwrap();
+        let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).unwrap();
+        tokio::select! {
+            _ = sigint.recv() => {
+                log::info!("\n[UNAOS] :: SIGINT Caught. Initiating Graceful Shutdown...\n");
+                let _ = signal_tx.send(());
+            }
+            _ = sigterm.recv() => {
+                log::info!("\n[UNAOS] :: SIGTERM Caught. Initiating Graceful Shutdown...\n");
+                let _ = signal_tx.send(());
+            }
+        }
+
+        // Use CXX-Qt's thread queue or FFI call to explicitly terminate the Qt application.
+        // This unblocks the main thread.
+        #[cfg(feature = "qt")]
+        quartzite::platforms::qt::ffi::quit_qapplication();
+    });
+
     // 1. Establish Base Camp
     UnaPaths::awaken().expect("CRITICAL: Failed to awaken spatial paths");
 
@@ -53,7 +77,7 @@ fn main() {
 
     // 5. Awaken the Autonomous Core
     let core_synapse = synapse.clone();
-    rt.spawn(async move {
+    let core_handle = rt.spawn(async move {
         core::ignite(cortex_vault, core_synapse).await;
     });
 
@@ -66,13 +90,27 @@ fn main() {
     // Since VeinHandler is "Pure Logic", it should run on Tokio.
     // The `handle_event` method processes events from the UI.
 
-    let vein_handler = VeinHandler::new(gui_tx, vein_storage, synapse.tx(), telemetry_tx);
+    let (shutdown_tx_vein, shutdown_rx_vein) = (shutdown_tx.clone(), shutdown_tx.subscribe());
+    let (vein_handler, bg_handle) = VeinHandler::new(gui_tx, vein_storage, synapse.tx(), telemetry_tx, shutdown_tx_vein);
 
     // Spawn the Brain Loop
-    rt.spawn(async move {
+    let brain_loop_handle = rt.spawn(async move {
         let mut vein = vein_handler;
-        while let Ok(event) = event_rx.recv().await {
-            vein.handle_event(event);
+        let mut shutdown_rx = shutdown_rx_vein;
+        loop {
+            tokio::select! {
+                _ = shutdown_rx.recv() => {
+                    log::info!(":: VEIN :: Brain Event Loop terminating cleanly.");
+                    break;
+                }
+                event_res = event_rx.recv() => {
+                    if let Ok(event) = event_res {
+                        vein.handle_event(event);
+                    } else {
+                        break;
+                    }
+                }
+            }
         }
     });
 
@@ -91,4 +129,21 @@ fn main() {
     };
 
     Backend::new("org.unaos.lumen", bootstrap).run();
+
+    // Broadcast shutdown in case GUI exited naturally instead of via SIGINT/SIGTERM
+    let _ = shutdown_tx.send(());
+
+    // 1. Wait for UI tasks to sync and finish
+    rt.block_on(async {
+        let _ = brain_loop_handle.await;
+        let _ = bg_handle.await;
+    });
+
+    // 2. Abort the core handle to force it to drop cortex_vault and flush
+    core_handle.abort();
+
+    // 3. Briefly await the aborted handle to guarantee the Drop trait finishes
+    rt.block_on(async {
+        let _ = core_handle.await;
+    });
 }

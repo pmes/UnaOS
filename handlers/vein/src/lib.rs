@@ -31,7 +31,6 @@ use gneiss_pal::{
 use log::info;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
-use std::thread;
 use std::time::Duration;
 use tokio::runtime::Runtime;
 use tokio::sync::{broadcast, mpsc};
@@ -199,7 +198,8 @@ impl VeinHandler {
         history_path: PathBuf,
         bandy_tx: broadcast::Sender<SMessage>,
         telemetry_tx: async_channel::Sender<SMessage>, // Pure Async Channel
-    ) -> Self {
+        shutdown_tx: tokio::sync::broadcast::Sender<()>,
+    ) -> (Self, tokio::task::JoinHandle<()>) {
         let vault_path_bg = history_path.clone();
         let brain = BrainManager::new(history_path);
 
@@ -222,12 +222,8 @@ impl VeinHandler {
         let bandy_tx_bg = bandy_tx.clone();
         let telemetry_tx_bg = telemetry_tx.clone();
 
-        thread::spawn(move || {
-            // Ignite the Can-Am V8 (Tokio Runtime)
-            let rt = tokio::runtime::Runtime::new().expect("Failed to create Tokio Runtime");
-
-            // block_on borrows the runtime to execute our main async block.
-            rt.block_on(async move {
+        // Capture the JoinHandle by spawning on the current Runtime (instead of std::thread)
+        let brain_loop_handle = tokio::runtime::Handle::current().spawn(async move {
                 let now = Local::now().format("%Y-%m-%d %H:%M:%S.%3f");
                 let _ = gui_tx_brain.send(GuiUpdate::ConsoleLog(format!("VEIN: [{}] [INFO] :: BRAIN :: Connecting...\n", now))).await;
 
@@ -238,22 +234,29 @@ impl VeinHandler {
                 // This schedules the task on the running engine without trying to move the engine itself.
                 let state_indexer = state_bg.clone();
                 let telemetry_tx_indexer = telemetry_tx_bg.clone();
+                let mut shutdown_rx_indexer = shutdown_tx.subscribe();
                 tokio::spawn(async move {
-                    let cache = cortex::run_indexer(root, bandy_tx_bg).await;
+                    tokio::select! {
+                        _ = shutdown_rx_indexer.recv() => {
+                            log::info!(":: CORTEX :: Shutting down indexer cleanly.");
+                            return;
+                        }
+                        cache = cortex::run_indexer(root, bandy_tx_bg) => {
+                            let live_ctx = {
+                                let mut s = state_indexer.lock().unwrap();
+                                s.skeleton_cache = cache;
 
-                    let live_ctx = {
-                        let mut s = state_indexer.lock().unwrap();
-                        s.skeleton_cache = cache;
+                                // Initial Gravity Calculation
+                                let gravity = crate::gravity::GravityWell::new();
+                                let live_ctx = gravity.calculate_scores(&s.skeleton_cache);
+                                s.live_context = live_ctx.clone();
+                                live_ctx
+                            };
 
-                        // Initial Gravity Calculation
-                        let gravity = crate::gravity::GravityWell::new();
-                        let live_ctx = gravity.calculate_scores(&s.skeleton_cache);
-                        s.live_context = live_ctx.clone();
-                        live_ctx
-                    };
-
-                    if !live_ctx.is_empty() {
-                        let _ = telemetry_tx_indexer.send(SMessage::ContextTelemetry { skeletons: live_ctx }).await;
+                            if !live_ctx.is_empty() {
+                                let _ = telemetry_tx_indexer.send(SMessage::ContextTelemetry { skeletons: live_ctx }).await;
+                            }
+                        }
                     }
                 });
 
@@ -263,13 +266,21 @@ impl VeinHandler {
 
                 tokio::time::sleep(Duration::from_millis(800)).await;
 
-                if let Ok(records) = disk.lock().unwrap().load_all_memories() {
-                    let items: Vec<gneiss_pal::HistoryItem> = records.into_iter().map(|r| gneiss_pal::HistoryItem {
-                        sender: r.sender,
-                        content: r.content,
-                        timestamp: r.timestamp,
-                        is_chat: r.is_chat,
-                    }).collect();
+                let initial_history = {
+                    if let Ok(records) = disk.lock().unwrap().load_all_memories() {
+                        let items: Vec<gneiss_pal::HistoryItem> = records.into_iter().map(|r| gneiss_pal::HistoryItem {
+                            sender: r.sender,
+                            content: r.content,
+                            timestamp: r.timestamp,
+                            is_chat: r.is_chat,
+                        }).collect();
+                        Some(items)
+                    } else {
+                        None
+                    }
+                };
+
+                if let Some(items) = initial_history {
                     let _ = gui_tx_brain.send(GuiUpdate::HistoryBatch(items)).await;
                 }
 
@@ -289,7 +300,21 @@ impl VeinHandler {
                         let directive = brain_bg.get_active_directive();
                         let _ = gui_tx_brain.send(GuiUpdate::ActiveDirective(directive)).await;
 
-                        while let Some(user_input_text) = rx_from_ui.recv().await {
+                        let mut shutdown_rx_brain = shutdown_tx.subscribe();
+
+                        loop {
+                            tokio::select! {
+                                _ = shutdown_rx_brain.recv() => {
+                                    log::info!(":: VEIN :: Brain Loop terminating. Syncing vault to disk...");
+                                    // Explicitly drop the Arc<Mutex<DiskManager>> so UnaFS flushes to disk.
+                                    drop(disk);
+                                    break;
+                                }
+                                user_input_opt = rx_from_ui.recv() => {
+                                    let user_input_text = match user_input_opt {
+                                        Some(text) => text,
+                                        None => break,
+                                    };
                             // === ROUTE: Directive Injection ===
                             if user_input_text == "LOAD_HISTORY" {
                                 let disk_clone = disk.clone();
@@ -651,22 +676,23 @@ impl VeinHandler {
 
                             // HALT GENERATION. Dispatch the strongly typed payload to the UI Interceptor.
                             let _ = gui_tx_brain.send(GuiUpdate::ReviewPayload(pre_flight_payload)).await;
+                                }
+                            }
                         }
                     }
                     Err(e) => {
                         let _ = gui_tx_brain.send(GuiUpdate::ConsoleLog(format!(":: FATAL :: {}\n", e))).await;
                     }
                 }
-            });
         });
 
-        Self {
+        (Self {
             state,
             tx: tx_to_bg,
             gui_tx,
             bandy_tx,
             telemetry_tx, // <-- NEW
-        }
+        }, brain_loop_handle)
     }
 
     fn append_to_console(&self, text: &str) {

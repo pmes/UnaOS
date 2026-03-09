@@ -24,6 +24,7 @@ Item {
     width: 800
     height: 600
 
+
     // Core Window Logic & Routing Registration
     LumenWindow {
         id: lumenWindow
@@ -61,7 +62,7 @@ Item {
         }
 
         // Main Area Container (Isolates chat and overlays to the right pane)
-        Item {
+        Rectangle {
             SplitView.fillWidth: true
             SplitView.fillHeight: true
 

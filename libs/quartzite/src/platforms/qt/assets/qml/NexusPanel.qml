@@ -20,7 +20,7 @@ import QtQuick.Layouts 1.15
 
 Rectangle {
     id: root
-    color: "#121212"
+
 
     property var historyModel: null
     property var backend: null
@@ -35,40 +35,33 @@ Rectangle {
         TabBar {
             id: nexusTabBar
             Layout.fillWidth: true
-            background: Rectangle { color: "#1e1e1e" }
 
             TabButton {
                 text: "nodes"
                 width: implicitWidth
                 contentItem: Text {
                     text: parent.text
-                    color: parent.checked ? "#FFFFFF" : "#888888"
                     horizontalAlignment: Text.AlignHCenter
                     verticalAlignment: Text.AlignVCenter
                 }
-                background: Rectangle { color: parent.checked ? "#333333" : "transparent" }
             }
             TabButton {
                 text: "nexus"
                 width: implicitWidth
                 contentItem: Text {
                     text: parent.text
-                    color: parent.checked ? "#FFFFFF" : "#888888"
                     horizontalAlignment: Text.AlignHCenter
                     verticalAlignment: Text.AlignVCenter
                 }
-                background: Rectangle { color: parent.checked ? "#333333" : "transparent" }
             }
             TabButton {
                 text: "teleHUD"
                 width: implicitWidth
                 contentItem: Text {
                     text: parent.text
-                    color: parent.checked ? "#FFFFFF" : "#888888"
                     horizontalAlignment: Text.AlignHCenter
                     verticalAlignment: Text.AlignVCenter
                 }
-                background: Rectangle { color: parent.checked ? "#333333" : "transparent" }
             }
         }
 
@@ -88,7 +81,6 @@ Rectangle {
 
             // Tab 1: nexus (Network Log Trigger)
             Rectangle {
-                color: "#1e1e1e"
                 Layout.fillWidth: true
                 Layout.fillHeight: true
 
@@ -98,7 +90,6 @@ Rectangle {
 
                     Text {
                         text: "NEXUS ROUTING"
-                        color: "#FFFFFF"
                         font.pixelSize: 18
                         font.bold: true
                         Layout.alignment: Qt.AlignHCenter
@@ -108,14 +99,12 @@ Rectangle {
                         text: "View Network Log"
                         Layout.alignment: Qt.AlignHCenter
                         background: Rectangle {
-                            color: "#0078D7"
                             radius: 4
                             implicitWidth: 160
                             implicitHeight: 40
                         }
                         contentItem: Text {
                             text: parent.text
-                            color: "#FFFFFF"
                             font.bold: true
                             horizontalAlignment: Text.AlignHCenter
                             verticalAlignment: Text.AlignVCenter
@@ -129,14 +118,12 @@ Rectangle {
 
             // Tab 2: teleHUD (Placeholder)
             Rectangle {
-                color: "#1e1e1e"
                 Layout.fillWidth: true
                 Layout.fillHeight: true
 
                 Text {
                     anchors.centerIn: parent
                     text: "[TeleHUD Context Vector Awaiting Signal]"
-                    color: "#888888"
                     font.italic: true
                 }
             }

@@ -42,3 +42,4 @@ void show_main_window(LumenMainWindow& window);
 
 std::unique_ptr<LumenQApp> create_qapplication();
 int exec_qapplication(LumenQApp& app);
+void quit_qapplication();

@@ -76,6 +76,9 @@ pub fn spawn_gui_listener(
                     GuiUpdate::ReviewPayload(payload) => {
                         super::vein_bridge::route_review_payload(payload);
                     }
+                    GuiUpdate::ConsoleLog(log) => {
+                        super::vein_bridge::route_console_log(log);
+                    }
                     _ => {}
                 }
             }
