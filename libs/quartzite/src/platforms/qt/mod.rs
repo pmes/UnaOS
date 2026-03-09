@@ -39,5 +39,6 @@ pub mod ffi {
         type LumenQApp;
         fn create_qapplication() -> UniquePtr<LumenQApp>;
         fn exec_qapplication(app: Pin<&mut LumenQApp>) -> i32;
+        fn quit_qapplication();
     }
 }

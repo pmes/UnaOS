@@ -125,3 +125,7 @@ std::unique_ptr<LumenQApp> create_qapplication() {
 int exec_qapplication(LumenQApp& app) {
     return app.exec();
 }
+
+void quit_qapplication() {
+    QCoreApplication::quit();
+}

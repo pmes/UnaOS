@@ -124,6 +124,7 @@ Rectangle {
                     anchors.margins: 8
                     TextArea {
                         id: systemTextArea
+                        anchors.fill: parent
                         color: "#FFFFFF"
                         wrapMode: Text.WordWrap
                     }
@@ -139,6 +140,7 @@ Rectangle {
                     anchors.margins: 8
                     TextArea {
                         id: directivesTextArea
+                        anchors.fill: parent
                         color: "#FFFFFF"
                         wrapMode: Text.WordWrap
                     }
@@ -154,6 +156,7 @@ Rectangle {
                     anchors.margins: 8
                     TextArea {
                         id: engramsTextArea
+                        anchors.fill: parent
                         color: "#FFFFFF"
                         wrapMode: Text.WordWrap
                     }
@@ -169,6 +172,7 @@ Rectangle {
                     anchors.margins: 8
                     TextArea {
                         id: promptTextArea
+                        anchors.fill: parent
                         color: "#FFFFFF"
                         wrapMode: Text.WordWrap
                     }
@@ -213,6 +217,7 @@ Rectangle {
 
     UnaDialog {
         id: customCancelAlert
+        parent: Overlay.overlay
         titleText: "Cancel Pre-Flight?"
         bodyText: "Are you sure you want to abort the payload?\nThis will clear your current input."
         buttons: [

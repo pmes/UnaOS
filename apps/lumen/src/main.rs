@@ -49,6 +49,11 @@ fn main() {
                 let _ = signal_tx.send(());
             }
         }
+
+        // Use CXX-Qt's thread queue or FFI call to explicitly terminate the Qt application.
+        // This unblocks the main thread.
+        #[cfg(feature = "qt")]
+        quartzite::platforms::qt::ffi::quit_qapplication();
     });
 
     // 1. Establish Base Camp
