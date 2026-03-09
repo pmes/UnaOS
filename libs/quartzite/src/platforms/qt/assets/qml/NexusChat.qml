@@ -23,13 +23,7 @@ Rectangle {
     id: root
     color: "#121212"
 
-    VeinBridge {
-        id: veinEngine
-        Component.onCompleted: {
-            veinEngine.registerThread();
-            veinEngine.requestHistory();
-        }
-    }
+    property var backend: null
 
     ColumnLayout {
         anchors.fill: parent
@@ -43,19 +37,41 @@ Rectangle {
             clip: true
             model: typeof _historyModel !== "undefined" ? _historyModel : null
             spacing: 8
-            delegate: Rectangle {
-                width: Math.max(chatListView.width, 100)
-                height: Math.max(messageText.implicitHeight + 24, 40)
-                color: model.toolTip ? "#0078D7" : "#333333"
-                radius: 8
 
-                Text {
-                    id: messageText
-                    anchors.centerIn: parent
-                    width: Math.max(parent.width - 16, 10)
-                    text: display !== undefined ? display : (model.display !== undefined ? model.display : "Awaiting Telemetry...")
-                    color: "#FFFFFF"
-                    wrapMode: Text.WordWrap
+            // Fluid Geometry Constraints
+            property int fluidThreshold: 600
+            property bool isWideMode: width > fluidThreshold
+
+            delegate: Item {
+                // Total width is full list view, height is calculated text height
+                width: chatListView.width
+                height: Math.max(messageText.implicitHeight + 24, 40)
+
+                // Outer container for positioning (Staggered vs Inline)
+                Rectangle {
+                    id: bubble
+                    // Fluid Math:
+                    // If Wide Mode -> bubbles take 70% max width, align L/R.
+                    // If Narrow Mode -> bubbles take full width, stacked.
+                    width: chatListView.isWideMode ? Math.min(parent.width * 0.7, messageText.implicitWidth + 32) : parent.width
+                    height: parent.height
+
+                    // Anchoring logic for stagger
+                    anchors.left: chatListView.isWideMode && !model.toolTip ? parent.left : undefined
+                    anchors.right: chatListView.isWideMode && model.toolTip ? parent.right : undefined
+                    // Fallback to center if not staggered (though full width means it covers everything anyway)
+
+                    color: model.toolTip ? "#0078D7" : "#333333"
+                    radius: 8
+
+                    Text {
+                        id: messageText
+                        anchors.centerIn: parent
+                        width: Math.max(parent.width - 32, 10)
+                        text: display !== undefined ? display : (model.display !== undefined ? model.display : "Awaiting Telemetry...")
+                        color: "#FFFFFF"
+                        wrapMode: Text.WordWrap
+                    }
                 }
             }
 
@@ -80,22 +96,61 @@ Rectangle {
                     radius: 4
                 }
                 onAccepted: {
-                    if (inputField.text !== "") {
-                        veinEngine.sendMessage(inputField.text);
-                        inputField.text = "";
+                    if (backend && inputField.text !== "") {
+                        backend.requestPreFlightReview(inputField.text);
                     }
                 }
             }
 
             Button {
-                text: "Send"
+                text: "Pre-Flight"
+                background: Rectangle { color: "#0078D7"; radius: 4 }
+                contentItem: Text { text: parent.text; color: "#FFF"; font.bold: true; horizontalAlignment: Text.AlignHCenter; verticalAlignment: Text.AlignVCenter }
                 onClicked: {
-                    if (inputField.text !== "") {
-                        veinEngine.sendMessage(inputField.text);
-                        inputField.text = "";
+                    if (backend) {
+                        if (inputField.text !== "") {
+                            backend.requestPreFlightReview(inputField.text);
+                        } else {
+                            backend.requestPreFlightReview("");
+                        }
                     }
                 }
             }
+        }
+    }
+
+    // Embed the temporary Pre-Flight Overlay here to cover the chat completely
+    PreFlightOverlay {
+        id: preFlightOverlay
+        anchors.fill: parent
+        z: 90
+        backend: root.backend
+
+        onPayloadSent: {
+            inputField.text = "";
+        }
+
+        onPayloadCanceled: {
+            inputField.text = "";
+            if (backend) {
+                backend.cancelPreFlight();
+            }
+        }
+    }
+
+    Connections {
+        target: typeof root.backend !== "undefined" ? root.backend : null
+        function onNetworkPayloadDispatched(payload) {
+            if (typeof _networkLogModel !== "undefined" && _networkLogModel !== null) {
+                _networkLogModel.appendLog(payload);
+            }
+        }
+        function onPayloadReadyForReview(system, directives, engrams, prompt) {
+            preFlightOverlay.systemText = system;
+            preFlightOverlay.directivesText = directives;
+            preFlightOverlay.engramsText = engrams;
+            preFlightOverlay.promptText = prompt;
+            preFlightOverlay.visible = true;
         }
     }
 }

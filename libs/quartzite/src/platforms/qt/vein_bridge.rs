@@ -24,6 +24,7 @@ use crate::platforms::qt::window::GLOBAL_TX;
 pub static VEIN_THREAD: OnceLock<cxx_qt::CxxQtThread<qobject::VeinBridge>> = OnceLock::new();
 pub static HISTORY_MODEL_THREAD: OnceLock<cxx_qt::CxxQtThread<qobject::HistoryModel>> = OnceLock::new();
 pub static PREFLIGHT_THREAD: OnceLock<cxx_qt::CxxQtThread<qobject::PreFlightPayloadQml>> = OnceLock::new();
+pub static NETWORK_LOG_MODEL_THREAD: OnceLock<cxx_qt::CxxQtThread<qobject::NetworkLogModel>> = OnceLock::new();
 
 #[cxx_qt::bridge]
 pub mod qobject {
@@ -86,6 +87,37 @@ pub mod qobject {
 
     unsafe extern "RustQt" {
         #[qobject]
+        #[base = QAbstractListModel]
+        #[qml_element]
+        type NetworkLogModel = super::NetworkLogModelRust;
+
+        #[qinvokable(cxx_override)]
+        #[cxx_name = "rowCount"]
+        fn row_count(self: &NetworkLogModel, parent: &QModelIndex) -> i32;
+        #[qinvokable(cxx_override)]
+        fn data(self: &NetworkLogModel, index: &QModelIndex, role: i32) -> QVariant;
+
+        #[qinvokable]
+        #[cxx_name = "registerModelThread"]
+        fn register_model_thread(self: Pin<&mut NetworkLogModel>);
+
+        #[qinvokable]
+        #[cxx_name = "appendLog"]
+        fn append_log(self: Pin<&mut NetworkLogModel>, payload: QString);
+
+        #[inherit]
+        #[cxx_name = "beginResetModel"]
+        fn begin_reset_model(self: Pin<&mut NetworkLogModel>);
+
+        #[inherit]
+        #[cxx_name = "endResetModel"]
+        fn end_reset_model(self: Pin<&mut NetworkLogModel>);
+    }
+
+    impl cxx_qt::Threading for NetworkLogModel {}
+
+    unsafe extern "RustQt" {
+        #[qobject]
         #[qml_element]
         #[cxx_name = "VeinBridge"]
         type VeinBridge = super::VeinBridgeRust;
@@ -100,11 +132,27 @@ pub mod qobject {
 
         #[qinvokable]
         #[cxx_name = "dispatchPayload"]
-        fn dispatch_payload(self: Pin<&mut VeinBridge>, text: QString);
+        fn dispatch_payload(self: Pin<&mut VeinBridge>, system: QString, directives: QString, engrams: QString, prompt: QString);
 
         #[qinvokable]
         #[cxx_name = "registerThread"]
         fn register_thread(self: Pin<&mut VeinBridge>);
+
+        #[qinvokable]
+        #[cxx_name = "requestPreFlightReview"]
+        fn request_pre_flight_review(self: Pin<&mut VeinBridge>, text: QString);
+
+        #[qinvokable]
+        #[cxx_name = "cancelPreFlight"]
+        fn cancel_pre_flight(self: Pin<&mut VeinBridge>);
+
+        #[qsignal]
+        #[cxx_name = "networkPayloadDispatched"]
+        fn network_payload_dispatched(self: Pin<&mut VeinBridge>, payload: QString);
+
+        #[qsignal]
+        #[cxx_name = "payloadReadyForReview"]
+        fn payload_ready_for_review(self: Pin<&mut VeinBridge>, system: QString, directives: QString, engrams: QString, prompt: QString);
     }
 
     impl cxx_qt::Threading for VeinBridge {}
@@ -157,10 +205,41 @@ impl qobject::VeinBridge {
         }
     }
 
-    pub fn dispatch_payload(self: std::pin::Pin<&mut Self>, text: QString) {
-         if let Some(tx) = GLOBAL_TX.get() {
-             let _ = tx.try_send(Event::DispatchPayload(text.to_string()));
-         }
+    pub fn dispatch_payload(mut self: std::pin::Pin<&mut Self>, system: QString, directives: QString, engrams: QString, prompt: QString) {
+        // Construct the full payload string as it will go over the wire
+        let full_payload = format!(
+            "System:\n{}\n\nDirectives:\n{}\n\nEngrams:\n{}\n\nPrompt:\n{}",
+            system, directives, engrams, prompt
+        );
+
+        if let Some(tx) = GLOBAL_TX.get() {
+            // Emit the exact payload over the wire via signal to the Qt side (The Truth View)
+            self.as_mut().network_payload_dispatched(QString::from(&full_payload));
+
+            let _ = tx.try_send(Event::DispatchPayload(full_payload));
+        }
+    }
+
+    pub fn request_pre_flight_review(self: std::pin::Pin<&mut Self>, text: QString) {
+        if let Some(tx) = GLOBAL_TX.get() {
+            let event = Event::Input {
+                target: "chat".to_string(),
+                text: text.to_string(),
+            };
+            let _ = tx.try_send(event);
+        }
+    }
+
+    pub fn cancel_pre_flight(self: std::pin::Pin<&mut Self>) {
+        if let Some(tx) = GLOBAL_TX.get() {
+            // Per the directive, fully discard Event::Input on cancel.
+            // Sending ::CANCEL:: to the chat target will trigger the core to clear the state.
+            let event = Event::Input {
+                target: "chat".to_string(),
+                text: "::CANCEL::".to_string(),
+            };
+            let _ = tx.try_send(event);
+        }
     }
 }
 
@@ -216,6 +295,46 @@ impl qobject::HistoryModel {
     }
 }
 
+// QAbstractListModel implementation for NetworkLogModel
+#[derive(Default)]
+pub struct NetworkLogModelRust {
+    pub rows: Vec<String>,
+}
+
+impl qobject::NetworkLogModel {
+    pub fn register_model_thread(self: std::pin::Pin<&mut Self>) {
+        use cxx_qt::Threading;
+        let _ = NETWORK_LOG_MODEL_THREAD.set(self.qt_thread());
+    }
+
+    pub fn append_log(mut self: std::pin::Pin<&mut Self>, payload: QString) {
+        self.as_mut().begin_reset_model();
+        self.as_mut().rust_mut().rows.push(payload.to_string());
+        self.as_mut().end_reset_model();
+    }
+
+    pub fn row_count(&self, parent: &QModelIndex) -> i32 {
+        if parent.is_valid() {
+            0
+        } else {
+            self.rust().rows.len() as i32
+        }
+    }
+
+    pub fn data(&self, index: &QModelIndex, role: i32) -> QVariant {
+        let row = index.row();
+        if row < 0 || row >= self.rust().rows.len() as i32 {
+            return QVariant::default();
+        }
+
+        let item = &self.rust().rows[row as usize];
+        match role {
+            0 => QVariant::from(&QString::from(item)), // DisplayRole
+            _ => QVariant::default(),
+        }
+    }
+}
+
 pub fn route_history_batch(items: Vec<HistoryItem>) {
     let mut rust_items: Vec<HistoryItemRust> = items.into_iter().map(|i| HistoryItemRust {
         sender: i.sender,
@@ -245,13 +364,16 @@ pub fn route_history_batch(items: Vec<HistoryItem>) {
 }
 
 pub fn route_review_payload(payload: PreFlightPayload) {
-    if let Some(thread) = PREFLIGHT_THREAD.get() {
+    // We emit the signal directly from VeinBridge rather than filling a model.
+    if let Some(thread) = VEIN_THREAD.get() {
         let thread = thread.clone();
         thread.queue(move |mut qobj| {
-            qobj.as_mut().set_system(QString::from(&payload.system));
-            qobj.as_mut().set_directives(QString::from(&payload.directives));
-            qobj.as_mut().set_engrams(QString::from(&payload.engrams));
-            qobj.as_mut().set_prompt(QString::from(&payload.prompt));
+            qobj.as_mut().payload_ready_for_review(
+                QString::from(&payload.system),
+                QString::from(&payload.directives),
+                QString::from(&payload.engrams),
+                QString::from(&payload.prompt),
+            );
         }).unwrap();
     }
 }
