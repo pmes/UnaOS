@@ -146,6 +146,10 @@ pub mod qobject {
         #[cxx_name = "cancelPreFlight"]
         fn cancel_pre_flight(self: Pin<&mut VeinBridge>);
 
+        #[qinvokable]
+        #[cxx_name = "abortPreFlight"]
+        fn abort_pre_flight(self: Pin<&mut VeinBridge>);
+
         #[qsignal]
         #[cxx_name = "networkPayloadDispatched"]
         fn network_payload_dispatched(self: Pin<&mut VeinBridge>, payload: QString);
@@ -234,6 +238,16 @@ impl qobject::VeinBridge {
         if let Some(tx) = GLOBAL_TX.get() {
             // Per the directive, fully discard Event::Input on cancel.
             // Sending ::CANCEL:: to the chat target will trigger the core to clear the state.
+            let event = Event::Input {
+                target: "chat".to_string(),
+                text: "::CANCEL::".to_string(),
+            };
+            let _ = tx.try_send(event);
+        }
+    }
+
+    pub fn abort_pre_flight(self: std::pin::Pin<&mut Self>) {
+        if let Some(tx) = GLOBAL_TX.get() {
             let event = Event::Input {
                 target: "chat".to_string(),
                 text: "::CANCEL::".to_string(),

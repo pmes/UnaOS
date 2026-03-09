@@ -61,7 +61,8 @@ Item {
         }
 
         // Main Area Container (Isolates chat and overlays to the right pane)
-        Item {
+        Rectangle {
+            color: palette.window
             SplitView.fillWidth: true
             SplitView.fillHeight: true
 

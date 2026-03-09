@@ -229,7 +229,7 @@ Rectangle {
             if (action === "reject") {
                 customCancelAlert.close();
                 if (root.backend) {
-                    root.backend.cancelPreFlight();
+                    root.backend.abortPreFlight();
                 }
                 root.payloadCanceled();
                 root.visible = false;

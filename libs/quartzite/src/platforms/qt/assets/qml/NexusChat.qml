@@ -21,7 +21,7 @@ import com.unaos.lumen 1.0
 
 Rectangle {
     id: root
-    color: "#121212"
+    color: palette.window
 
     property var backend: null
 
@@ -61,7 +61,9 @@ Rectangle {
                     anchors.right: chatListView.isWideMode && model.toolTip ? parent.right : undefined
                     // Fallback to center if not staggered (though full width means it covers everything anyway)
 
-                    color: model.toolTip ? "#0078D7" : "#333333"
+                    color: model.toolTip ? palette.highlight : palette.base
+                    border.color: palette.mid
+                    border.width: 1
                     radius: 8
 
                     Text {
@@ -69,7 +71,7 @@ Rectangle {
                         anchors.centerIn: parent
                         width: Math.max(parent.width - 32, 10)
                         text: display !== undefined ? display : (model.display !== undefined ? model.display : "Awaiting Telemetry...")
-                        color: "#FFFFFF"
+                        color: model.toolTip ? palette.highlightedText : palette.text
                         wrapMode: Text.WordWrap
                     }
                 }
@@ -90,9 +92,10 @@ Rectangle {
                 id: inputField
                 Layout.fillWidth: true
                 placeholderText: "Type a message..."
-                color: "white"
+                color: palette.text
                 background: Rectangle {
-                    color: "#333333"
+                    color: palette.base
+                    border.color: palette.mid
                     radius: 4
                 }
                 onAccepted: {
@@ -104,8 +107,8 @@ Rectangle {
 
             Button {
                 text: "Pre-Flight"
-                background: Rectangle { color: "#0078D7"; radius: 4 }
-                contentItem: Text { text: parent.text; color: "#FFF"; font.bold: true; horizontalAlignment: Text.AlignHCenter; verticalAlignment: Text.AlignVCenter }
+                background: Rectangle { color: palette.highlight; radius: 4 }
+                contentItem: Text { text: parent.text; color: palette.highlightedText; font.bold: true; horizontalAlignment: Text.AlignHCenter; verticalAlignment: Text.AlignVCenter }
                 onClicked: {
                     if (backend) {
                         if (inputField.text !== "") {
@@ -122,10 +125,7 @@ Rectangle {
     // Embed the temporary Pre-Flight Overlay here to cover the chat completely
     PreFlightOverlay {
         id: preFlightOverlay
-        anchors.top: parent.top
-        anchors.right: parent.right
-        anchors.bottom: parent.bottom
-        width: parent.width * 0.5
+        anchors.fill: parent
         z: 90
         backend: root.backend
 

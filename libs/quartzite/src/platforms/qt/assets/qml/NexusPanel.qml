@@ -20,7 +20,8 @@ import QtQuick.Layouts 1.15
 
 Rectangle {
     id: root
-    color: "#121212"
+    color: palette.window
+    border.color: palette.mid
 
     property var historyModel: null
     property var backend: null
@@ -35,40 +36,40 @@ Rectangle {
         TabBar {
             id: nexusTabBar
             Layout.fillWidth: true
-            background: Rectangle { color: "#1e1e1e" }
+            background: Rectangle { color: palette.base }
 
             TabButton {
                 text: "nodes"
                 width: implicitWidth
                 contentItem: Text {
                     text: parent.text
-                    color: parent.checked ? "#FFFFFF" : "#888888"
+                    color: parent.checked ? palette.text : palette.windowText
                     horizontalAlignment: Text.AlignHCenter
                     verticalAlignment: Text.AlignVCenter
                 }
-                background: Rectangle { color: parent.checked ? "#333333" : "transparent" }
+                background: Rectangle { color: parent.checked ? palette.mid : "transparent" }
             }
             TabButton {
                 text: "nexus"
                 width: implicitWidth
                 contentItem: Text {
                     text: parent.text
-                    color: parent.checked ? "#FFFFFF" : "#888888"
+                    color: parent.checked ? palette.text : palette.windowText
                     horizontalAlignment: Text.AlignHCenter
                     verticalAlignment: Text.AlignVCenter
                 }
-                background: Rectangle { color: parent.checked ? "#333333" : "transparent" }
+                background: Rectangle { color: parent.checked ? palette.mid : "transparent" }
             }
             TabButton {
                 text: "teleHUD"
                 width: implicitWidth
                 contentItem: Text {
                     text: parent.text
-                    color: parent.checked ? "#FFFFFF" : "#888888"
+                    color: parent.checked ? palette.text : palette.windowText
                     horizontalAlignment: Text.AlignHCenter
                     verticalAlignment: Text.AlignVCenter
                 }
-                background: Rectangle { color: parent.checked ? "#333333" : "transparent" }
+                background: Rectangle { color: parent.checked ? palette.mid : "transparent" }
             }
         }
 
@@ -88,7 +89,7 @@ Rectangle {
 
             // Tab 1: nexus (Network Log Trigger)
             Rectangle {
-                color: "#1e1e1e"
+                color: palette.window
                 Layout.fillWidth: true
                 Layout.fillHeight: true
 
@@ -98,7 +99,7 @@ Rectangle {
 
                     Text {
                         text: "NEXUS ROUTING"
-                        color: "#FFFFFF"
+                        color: palette.text
                         font.pixelSize: 18
                         font.bold: true
                         Layout.alignment: Qt.AlignHCenter
@@ -108,14 +109,14 @@ Rectangle {
                         text: "View Network Log"
                         Layout.alignment: Qt.AlignHCenter
                         background: Rectangle {
-                            color: "#0078D7"
+                            color: palette.highlight
                             radius: 4
                             implicitWidth: 160
                             implicitHeight: 40
                         }
                         contentItem: Text {
                             text: parent.text
-                            color: "#FFFFFF"
+                            color: palette.highlightedText
                             font.bold: true
                             horizontalAlignment: Text.AlignHCenter
                             verticalAlignment: Text.AlignVCenter
