@@ -21,7 +21,7 @@ import com.unaos.lumen 1.0
 
 Rectangle {
     id: root
-    color: "#121212"
+    color: palette.window
     visible: false
     opacity: 0.98
 
@@ -48,7 +48,7 @@ Rectangle {
 
         Text {
             text: "PRE-FLIGHT REVIEW"
-            color: "#FFFFFF"
+            color: palette.windowText
             font.pixelSize: 22
             font.bold: true
             Layout.alignment: Qt.AlignHCenter
@@ -57,54 +57,54 @@ Rectangle {
         TabBar {
             id: preflightTabBar
             Layout.fillWidth: true
-            background: Rectangle { color: "#1e1e1e" }
+            background: Rectangle { color: palette.base }
 
             TabButton {
                 text: "System"
                 contentItem: Text {
                     text: parent.text
-                    color: parent.checked ? "#FFFFFF" : "#888888"
+                    color: parent.checked ? palette.text : palette.windowText
                     horizontalAlignment: Text.AlignHCenter
                     verticalAlignment: Text.AlignVCenter
                 }
                 background: Rectangle {
-                    color: parent.checked ? "#333333" : "transparent"
+                    color: parent.checked ? palette.mid : "transparent"
                 }
             }
             TabButton {
                 text: "Directives"
                 contentItem: Text {
                     text: parent.text
-                    color: parent.checked ? "#FFFFFF" : "#888888"
+                    color: parent.checked ? palette.text : palette.windowText
                     horizontalAlignment: Text.AlignHCenter
                     verticalAlignment: Text.AlignVCenter
                 }
                 background: Rectangle {
-                    color: parent.checked ? "#333333" : "transparent"
+                    color: parent.checked ? palette.mid : "transparent"
                 }
             }
             TabButton {
                 text: "Engrams"
                 contentItem: Text {
                     text: parent.text
-                    color: parent.checked ? "#FFFFFF" : "#888888"
+                    color: parent.checked ? palette.text : palette.windowText
                     horizontalAlignment: Text.AlignHCenter
                     verticalAlignment: Text.AlignVCenter
                 }
                 background: Rectangle {
-                    color: parent.checked ? "#333333" : "transparent"
+                    color: parent.checked ? palette.mid : "transparent"
                 }
             }
             TabButton {
                 text: "Prompt"
                 contentItem: Text {
                     text: parent.text
-                    color: parent.checked ? "#FFFFFF" : "#888888"
+                    color: parent.checked ? palette.text : palette.windowText
                     horizontalAlignment: Text.AlignHCenter
                     verticalAlignment: Text.AlignVCenter
                 }
                 background: Rectangle {
-                    color: parent.checked ? "#333333" : "transparent"
+                    color: parent.checked ? palette.mid : "transparent"
                 }
             }
         }
@@ -117,64 +117,64 @@ Rectangle {
 
             // System Tab
             Rectangle {
-                color: "#1e1e1e"
-                border.color: "#333"
+                color: palette.base
+                border.color: palette.mid
                 ScrollView {
                     anchors.fill: parent
                     anchors.margins: 8
                     TextArea {
                         id: systemTextArea
-                        anchors.fill: parent
-                        color: "#FFFFFF"
+                        color: palette.text
                         wrapMode: Text.WordWrap
+                        background: Item {}
                     }
                 }
             }
 
             // Directives Tab
             Rectangle {
-                color: "#1e1e1e"
-                border.color: "#333"
+                color: palette.base
+                border.color: palette.mid
                 ScrollView {
                     anchors.fill: parent
                     anchors.margins: 8
                     TextArea {
                         id: directivesTextArea
-                        anchors.fill: parent
-                        color: "#FFFFFF"
+                        color: palette.text
                         wrapMode: Text.WordWrap
+                        background: Item {}
                     }
                 }
             }
 
             // Engrams Tab
             Rectangle {
-                color: "#1e1e1e"
-                border.color: "#333"
+                color: palette.base
+                border.color: palette.mid
                 ScrollView {
                     anchors.fill: parent
                     anchors.margins: 8
                     TextArea {
                         id: engramsTextArea
-                        anchors.fill: parent
-                        color: "#FFFFFF"
+                        color: palette.text
                         wrapMode: Text.WordWrap
+                        background: Item {}
                     }
                 }
             }
 
             // Prompt Tab
             Rectangle {
-                color: "#1e1e1e"
-                border.color: "#333"
+                color: palette.base
+                border.color: palette.mid
                 ScrollView {
                     anchors.fill: parent
                     anchors.margins: 8
                     TextArea {
                         id: promptTextArea
-                        anchors.fill: parent
-                        color: "#FFFFFF"
+                        color: palette.text
                         wrapMode: Text.WordWrap
+                        background: Item {}
                     }
                 }
             }
@@ -191,7 +191,7 @@ Rectangle {
                 background: Rectangle { color: "#555555"; radius: 4; implicitWidth: 100; implicitHeight: 36 }
                 contentItem: Text { text: parent.text; color: "#FFFFFF"; horizontalAlignment: Text.AlignHCenter; verticalAlignment: Text.AlignVCenter }
                 onClicked: {
-                    customCancelAlert.visible = true;
+                    customCancelAlert.open();
                 }
             }
 
@@ -227,14 +227,14 @@ Rectangle {
 
         onActionTriggered: function(action) {
             if (action === "reject") {
-                customCancelAlert.visible = false;
+                customCancelAlert.close();
                 if (root.backend) {
                     root.backend.cancelPreFlight();
                 }
                 root.payloadCanceled();
                 root.visible = false;
             } else if (action === "return") {
-                customCancelAlert.visible = false;
+                customCancelAlert.close();
             }
         }
     }

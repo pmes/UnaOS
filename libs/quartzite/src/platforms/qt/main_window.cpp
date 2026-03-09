@@ -84,12 +84,10 @@ LumenMainWindow::LumenMainWindow(QWidget *parent) : QMainWindow(parent) {
 }
 
 LumenMainWindow::~LumenMainWindow() {
-    // NULL DISCONNECT ON EXIT (Anomaly 2)
-    // Clear the QML Engine before the CXX-Qt VeinBridge goes out of scope and is destroyed.
-    // This resolves QObject::disconnect: Unexpected nullptr parameter.
-    if (m_quickWidget && m_quickWidget->engine()) {
-        m_quickWidget->engine()->clearComponentCache();
-        m_quickWidget->setSource(QUrl());
+    if (m_quickWidget) {
+        m_quickWidget->disconnect();
+        delete m_quickWidget;
+        m_quickWidget = nullptr;
     }
 }
 
@@ -127,5 +125,5 @@ int exec_qapplication(LumenQApp& app) {
 }
 
 void quit_qapplication() {
-    QCoreApplication::quit();
+    QMetaObject::invokeMethod(qApp, "quit", Qt::QueuedConnection);
 }

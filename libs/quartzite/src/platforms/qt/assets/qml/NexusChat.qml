@@ -122,7 +122,10 @@ Rectangle {
     // Embed the temporary Pre-Flight Overlay here to cover the chat completely
     PreFlightOverlay {
         id: preFlightOverlay
-        anchors.fill: parent
+        anchors.top: parent.top
+        anchors.right: parent.right
+        anchors.bottom: parent.bottom
+        width: parent.width * 0.5
         z: 90
         backend: root.backend
 

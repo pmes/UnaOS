@@ -18,11 +18,11 @@ import QtQuick 2.15
 import QtQuick.Controls 2.15
 import QtQuick.Layouts 1.15
 
-Item {
+Popup {
     id: root
-    anchors.fill: parent
-    visible: false
-    z: 1000
+    anchors.centerIn: parent
+    modal: true
+    closePolicy: Popup.NoAutoClose
 
     property string titleText: ""
     property string bodyText: ""
@@ -31,28 +31,19 @@ Item {
 
     signal actionTriggered(string action)
 
-    MouseArea {
-        anchors.fill: parent
-        hoverEnabled: true
-        onClicked: {}
-        onWheel: {}
-    }
-
-    Rectangle {
-        anchors.fill: parent
-        color: "#000000"
-        opacity: 0.6
-    }
-
-    Rectangle {
+    background: Rectangle {
         id: dialogBox
         width: Math.max(380, contentLayout.implicitWidth + 32)
         height: contentLayout.implicitHeight + 32
-        anchors.centerIn: parent
         color: "#1e1e1e"
         border.color: "#444444"
         border.width: 1
         radius: 8
+    }
+
+    contentItem: Item {
+        width: dialogBox.width
+        height: dialogBox.height
 
         ColumnLayout {
             id: contentLayout
