@@ -60,21 +60,25 @@ Item {
             }
         }
 
-        // Nexus Chat (Main Area)
-        NexusChat {
-            id: mainChatView
+        // Main Area Container (Isolates chat and overlays to the right pane)
+        Item {
             SplitView.fillWidth: true
             SplitView.fillHeight: true
-            backend: veinBridge
+
+            // Nexus Chat (Main Area)
+            NexusChat {
+                id: mainChatView
+                anchors.fill: parent
+                backend: veinBridge
+            }
+
+            // Network Log Overlay Component (Contained within the right pane)
+            NetworkLogOverlay {
+                id: networkLogOverlay
+                anchors.fill: parent
+                z: 100 // Ensure it's above the chat view, but bound to this pane
+                visible: false
+            }
         }
-    }
-
-    // Network Log Overlay Component (Instantiated here to cover chat area)
-    NetworkLogOverlay {
-        id: networkLogOverlay
-        anchors.fill: parent
-        z: 100 // Ensure it's above the SplitView
-        visible: false
-
     }
 }

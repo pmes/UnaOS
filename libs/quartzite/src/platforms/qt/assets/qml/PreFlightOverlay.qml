@@ -17,7 +17,7 @@
 import QtQuick 2.15
 import QtQuick.Controls 2.15
 import QtQuick.Layouts 1.15
-import QtQuick.Dialogs
+import Qt.labs.platform 1.1
 import com.unaos.lumen 1.0
 
 Rectangle {
@@ -225,11 +225,9 @@ Rectangle {
         title: "Cancel Pre-Flight?"
         text: "Are you sure you want to abort the payload? This will clear your current input."
         buttons: MessageDialog.Yes | MessageDialog.No
-        onButtonClicked: function(button, role) {
-            if (button === MessageDialog.Yes) {
-                root.payloadCanceled();
-                root.visible = false;
-            }
+        onYesClicked: {
+            root.payloadCanceled();
+            root.visible = false;
         }
     }
 }
