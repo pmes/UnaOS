@@ -24,11 +24,9 @@ Popup {
     modal: true
     closePolicy: Popup.NoAutoClose
 
-    SystemPalette { id: sys; colorGroup: SystemPalette.Active }
 
     property string titleText: ""
     property string bodyText: ""
-    property var buttons: [] // Array of objects: [{ label: "Cancel", action: "reject", color: "#555" }]
     default property alias customContent: contentArea.data
 
     signal actionTriggered(string action)
@@ -37,8 +35,6 @@ Popup {
         id: dialogBox
         width: Math.max(380, contentLayout.implicitWidth + 32)
         height: contentLayout.implicitHeight + 32
-        color: sys.window
-        border.color: sys.mid
         border.width: 1
         radius: 8
     }
@@ -55,7 +51,6 @@ Popup {
 
             Text {
                 text: root.titleText
-                color: sys.windowText
                 font.pixelSize: 16
                 font.bold: true
                 visible: text !== ""
@@ -64,7 +59,6 @@ Popup {
 
             Text {
                 text: root.bodyText
-                color: sys.text
                 font.pixelSize: 14
                 visible: text !== ""
                 Layout.fillWidth: true

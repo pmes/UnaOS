@@ -21,11 +21,9 @@ import com.unaos.lumen 1.0
 
 Rectangle {
     id: root
-    color: sys.window
     opacity: 0.95
     visible: false
 
-    SystemPalette { id: sys; colorGroup: SystemPalette.Active }
 
     // Prevent clicks from passing through
     MouseArea {
@@ -43,7 +41,6 @@ Rectangle {
 
             Text {
                 text: "NETWORK LOG :: THE TRUTH VIEW"
-                color: sys.windowText
                 font.bold: true
                 font.pixelSize: 20
                 Layout.fillWidth: true
@@ -52,10 +49,8 @@ Rectangle {
             Button {
                 text: "X"
                 implicitWidth: 40
-                background: Rectangle { color: "#D70000"; radius: 4 }
                 contentItem: Text {
                     text: parent.text
-                    color: "white"
                     font.bold: true
                     horizontalAlignment: Text.AlignHCenter
                     verticalAlignment: Text.AlignVCenter
@@ -77,8 +72,6 @@ Rectangle {
             delegate: Rectangle {
                 width: networkLogView.width
                 height: Math.max(logText.implicitHeight + 16, 30)
-                color: sys.base
-                border.color: sys.mid
                 border.width: 1
                 radius: 4
 
@@ -87,7 +80,6 @@ Rectangle {
                     anchors.centerIn: parent
                     width: Math.max(parent.width - 16, 10)
                     text: display !== undefined ? display : "Awaiting transmission..."
-                    color: "#00FF00" // Hacker/Terminal Can-Am contrast
                     font.family: "Monospace"
                     wrapMode: TextEdit.WrapAnywhere
                     readOnly: true

@@ -21,11 +21,9 @@ import com.unaos.lumen 1.0
 
 Rectangle {
     id: root
-    color: sys.window
     visible: false
     opacity: 0.98
 
-    SystemPalette { id: sys; colorGroup: SystemPalette.Active }
 
     property var backend: null
     property alias systemTextAreaText: systemTextArea.text
@@ -50,7 +48,6 @@ Rectangle {
 
         Text {
             text: "PRE-FLIGHT REVIEW"
-            color: sys.windowText
             font.pixelSize: 22
             font.bold: true
             Layout.alignment: Qt.AlignHCenter
@@ -59,54 +56,45 @@ Rectangle {
         TabBar {
             id: preflightTabBar
             Layout.fillWidth: true
-            background: Rectangle { color: sys.base }
 
             TabButton {
                 text: "System"
                 contentItem: Text {
                     text: parent.text
-                    color: parent.checked ? sys.text : sys.windowText
                     horizontalAlignment: Text.AlignHCenter
                     verticalAlignment: Text.AlignVCenter
                 }
                 background: Rectangle {
-                    color: parent.checked ? sys.mid : "transparent"
                 }
             }
             TabButton {
                 text: "Directives"
                 contentItem: Text {
                     text: parent.text
-                    color: parent.checked ? sys.text : sys.windowText
                     horizontalAlignment: Text.AlignHCenter
                     verticalAlignment: Text.AlignVCenter
                 }
                 background: Rectangle {
-                    color: parent.checked ? sys.mid : "transparent"
                 }
             }
             TabButton {
                 text: "Engrams"
                 contentItem: Text {
                     text: parent.text
-                    color: parent.checked ? sys.text : sys.windowText
                     horizontalAlignment: Text.AlignHCenter
                     verticalAlignment: Text.AlignVCenter
                 }
                 background: Rectangle {
-                    color: parent.checked ? sys.mid : "transparent"
                 }
             }
             TabButton {
                 text: "Prompt"
                 contentItem: Text {
                     text: parent.text
-                    color: parent.checked ? sys.text : sys.windowText
                     horizontalAlignment: Text.AlignHCenter
                     verticalAlignment: Text.AlignVCenter
                 }
                 background: Rectangle {
-                    color: parent.checked ? sys.mid : "transparent"
                 }
             }
         }
@@ -119,14 +107,11 @@ Rectangle {
 
             // System Tab
             Rectangle {
-                color: sys.base
-                border.color: sys.mid
                 ScrollView {
                     anchors.fill: parent
                     anchors.margins: 8
                     TextArea {
                         id: systemTextArea
-                        color: sys.text
                         wrapMode: Text.WordWrap
                         background: Item {}
                     }
@@ -135,14 +120,11 @@ Rectangle {
 
             // Directives Tab
             Rectangle {
-                color: sys.base
-                border.color: sys.mid
                 ScrollView {
                     anchors.fill: parent
                     anchors.margins: 8
                     TextArea {
                         id: directivesTextArea
-                        color: sys.text
                         wrapMode: Text.WordWrap
                         background: Item {}
                     }
@@ -151,14 +133,11 @@ Rectangle {
 
             // Engrams Tab
             Rectangle {
-                color: sys.base
-                border.color: sys.mid
                 ScrollView {
                     anchors.fill: parent
                     anchors.margins: 8
                     TextArea {
                         id: engramsTextArea
-                        color: sys.text
                         wrapMode: Text.WordWrap
                         background: Item {}
                     }
@@ -167,14 +146,11 @@ Rectangle {
 
             // Prompt Tab
             Rectangle {
-                color: sys.base
-                border.color: sys.mid
                 ScrollView {
                     anchors.fill: parent
                     anchors.margins: 8
                     TextArea {
                         id: promptTextArea
-                        color: sys.text
                         wrapMode: Text.WordWrap
                         background: Item {}
                     }
@@ -190,6 +166,8 @@ Rectangle {
 
             Button {
                 text: "Cancel"
+                background: Rectangle { color: "#D70000"; radius: 4; implicitWidth: 100; implicitHeight: 36 }
+                contentItem: Text { text: parent.text; color: "#FFFFFF"; horizontalAlignment: Text.AlignHCenter; verticalAlignment: Text.AlignVCenter }
                 onClicked: {
                     customCancelAlert.open();
                 }
@@ -219,14 +197,18 @@ Rectangle {
         titleText: "Cancel Pre-Flight?"
         bodyText: "Are you sure you want to abort the payload?\nThis will clear your current input."
         buttons: [
-            { label: "No, Return", action: "return", color: "#333333" },
-            { label: "Yes, Abort", action: "reject", color: "#D70000", primary: true }
+            { label: "No, Return", action: "return" },
+            { label: "Yes, Abort", action: "reject" }
         ]
 
         onActionTriggered: function(action) {
             if (action === "reject") {
                 customCancelAlert.close();
-                root.payloadCanceled();
+                // Clear the text fields manually
+                systemTextAreaText = "";
+                directivesTextAreaText = "";
+                engramsTextAreaText = "";
+                promptTextAreaText = "";
                 root.visible = false;
             } else if (action === "return") {
                 customCancelAlert.close();

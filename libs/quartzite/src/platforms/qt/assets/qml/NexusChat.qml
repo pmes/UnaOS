@@ -21,9 +21,7 @@ import com.unaos.lumen 1.0
 
 Rectangle {
     id: root
-    color: sys.window
 
-    SystemPalette { id: sys; colorGroup: SystemPalette.Active }
 
     property var backend: null
 
@@ -63,8 +61,6 @@ Rectangle {
                     anchors.right: chatListView.isWideMode && model.toolTip ? parent.right : undefined
                     // Fallback to center if not staggered (though full width means it covers everything anyway)
 
-                    color: model.toolTip ? sys.highlight : sys.base
-                    border.color: sys.mid
                     border.width: 1
                     radius: 8
 
@@ -73,7 +69,6 @@ Rectangle {
                         anchors.centerIn: parent
                         width: Math.max(parent.width - 32, 10)
                         text: display !== undefined ? display : (model.display !== undefined ? model.display : "Awaiting Telemetry...")
-                        color: model.toolTip ? sys.highlightedText : sys.text
                         wrapMode: Text.WordWrap
                     }
                 }
@@ -94,10 +89,7 @@ Rectangle {
                 id: inputField
                 Layout.fillWidth: true
                 placeholderText: "Type a message..."
-                color: sys.text
                 background: Rectangle {
-                    color: sys.base
-                    border.color: sys.mid
                     radius: 4
                 }
                 onAccepted: {
@@ -109,8 +101,6 @@ Rectangle {
 
             Button {
                 text: "Pre-Flight"
-                background: Rectangle { color: sys.highlight; radius: 4 }
-                contentItem: Text { text: parent.text; color: sys.highlightedText; font.bold: true; horizontalAlignment: Text.AlignHCenter; verticalAlignment: Text.AlignVCenter }
                 onClicked: {
                     if (backend) {
                         if (inputField.text !== "") {

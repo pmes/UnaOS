@@ -24,7 +24,6 @@ Item {
     width: 800
     height: 600
 
-    SystemPalette { id: sys; colorGroup: SystemPalette.Active }
 
     // Core Window Logic & Routing Registration
     LumenWindow {
@@ -64,7 +63,6 @@ Item {
 
         // Main Area Container (Isolates chat and overlays to the right pane)
         Rectangle {
-            color: sys.window
             SplitView.fillWidth: true
             SplitView.fillHeight: true
 
