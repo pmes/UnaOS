@@ -32,6 +32,25 @@ fn main() {
     let rt = tokio::runtime::Runtime::new().expect("CRITICAL: Failed to ignite Tokio reactor");
     let _guard = rt.enter();
 
+    let (shutdown_tx, _) = tokio::sync::broadcast::channel(1);
+
+    // Spawn Signal Interceptor Task
+    let signal_tx = shutdown_tx.clone();
+    rt.spawn(async move {
+        let mut sigint = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt()).unwrap();
+        let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).unwrap();
+        tokio::select! {
+            _ = sigint.recv() => {
+                log::info!("\n[UNAOS] :: SIGINT Caught. Initiating Graceful Shutdown...\n");
+                let _ = signal_tx.send(());
+            }
+            _ = sigterm.recv() => {
+                log::info!("\n[UNAOS] :: SIGTERM Caught. Initiating Graceful Shutdown...\n");
+                let _ = signal_tx.send(());
+            }
+        }
+    });
+
     // 1. Establish Base Camp
     UnaPaths::awaken().expect("CRITICAL: Failed to awaken spatial paths");
 
@@ -66,7 +85,7 @@ fn main() {
     // Since VeinHandler is "Pure Logic", it should run on Tokio.
     // The `handle_event` method processes events from the UI.
 
-    let vein_handler = VeinHandler::new(gui_tx, vein_storage, synapse.tx(), telemetry_tx);
+    let vein_handler = VeinHandler::new(gui_tx, vein_storage, synapse.tx(), telemetry_tx, shutdown_tx);
 
     // Spawn the Brain Loop
     rt.spawn(async move {

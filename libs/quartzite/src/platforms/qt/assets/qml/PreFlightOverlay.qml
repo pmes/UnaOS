@@ -187,7 +187,7 @@ Rectangle {
                 background: Rectangle { color: "#555555"; radius: 4; implicitWidth: 100; implicitHeight: 36 }
                 contentItem: Text { text: parent.text; color: "#FFFFFF"; horizontalAlignment: Text.AlignHCenter; verticalAlignment: Text.AlignVCenter }
                 onClicked: {
-                    cancelDialog.open()
+                    customCancelAlert.visible = true;
                 }
             }
 
@@ -211,27 +211,23 @@ Rectangle {
         }
     }
 
-    // Use QtQuick.Controls Dialog instead of Qt.labs.platform to ensure
-    // the dialog anchors within the transient application window and properly
-    // blocks the parent UI (modal: true). Qt.labs.platform defaults to unparented
-    // native Wayland/Windows windows which can center arbitrarily.
-    Dialog {
-        id: cancelDialog
-        title: "Cancel Pre-Flight?"
-        standardButtons: Dialog.Yes | Dialog.No
-        anchors.centerIn: parent
-        modal: true
+    UnaDialog {
+        id: customCancelAlert
+        titleText: "Cancel Pre-Flight?"
+        bodyText: "Are you sure you want to abort the payload?\nThis will clear your current input."
+        buttons: [
+            { label: "No, Return", action: "return", color: "#333333" },
+            { label: "Yes, Abort", action: "reject", color: "#D70000", primary: true }
+        ]
 
-        background: Rectangle { color: "#1e1e1e"; border.color: "#444"; radius: 6 }
-
-        contentItem: Text {
-            text: "Are you sure you want to abort the payload?\nThis will clear your current input."
-            color: "#FFFFFF"
-        }
-
-        onAccepted: {
-            root.payloadCanceled();
-            root.visible = false;
+        onActionTriggered: function(action) {
+            if (action === "reject") {
+                customCancelAlert.visible = false;
+                root.payloadCanceled();
+                root.visible = false;
+            } else if (action === "return") {
+                customCancelAlert.visible = false;
+            }
         }
     }
 }

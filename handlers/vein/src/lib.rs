@@ -199,6 +199,7 @@ impl VeinHandler {
         history_path: PathBuf,
         bandy_tx: broadcast::Sender<SMessage>,
         telemetry_tx: async_channel::Sender<SMessage>, // Pure Async Channel
+        shutdown_tx: tokio::sync::broadcast::Sender<()>,
     ) -> Self {
         let vault_path_bg = history_path.clone();
         let brain = BrainManager::new(history_path);
@@ -238,22 +239,29 @@ impl VeinHandler {
                 // This schedules the task on the running engine without trying to move the engine itself.
                 let state_indexer = state_bg.clone();
                 let telemetry_tx_indexer = telemetry_tx_bg.clone();
+                let mut shutdown_rx_indexer = shutdown_tx.subscribe();
                 tokio::spawn(async move {
-                    let cache = cortex::run_indexer(root, bandy_tx_bg).await;
+                    tokio::select! {
+                        _ = shutdown_rx_indexer.recv() => {
+                            log::info!(":: CORTEX :: Shutting down indexer cleanly.");
+                            return;
+                        }
+                        cache = cortex::run_indexer(root, bandy_tx_bg) => {
+                            let live_ctx = {
+                                let mut s = state_indexer.lock().unwrap();
+                                s.skeleton_cache = cache;
 
-                    let live_ctx = {
-                        let mut s = state_indexer.lock().unwrap();
-                        s.skeleton_cache = cache;
+                                // Initial Gravity Calculation
+                                let gravity = crate::gravity::GravityWell::new();
+                                let live_ctx = gravity.calculate_scores(&s.skeleton_cache);
+                                s.live_context = live_ctx.clone();
+                                live_ctx
+                            };
 
-                        // Initial Gravity Calculation
-                        let gravity = crate::gravity::GravityWell::new();
-                        let live_ctx = gravity.calculate_scores(&s.skeleton_cache);
-                        s.live_context = live_ctx.clone();
-                        live_ctx
-                    };
-
-                    if !live_ctx.is_empty() {
-                        let _ = telemetry_tx_indexer.send(SMessage::ContextTelemetry { skeletons: live_ctx }).await;
+                            if !live_ctx.is_empty() {
+                                let _ = telemetry_tx_indexer.send(SMessage::ContextTelemetry { skeletons: live_ctx }).await;
+                            }
+                        }
                     }
                 });
 
@@ -289,7 +297,22 @@ impl VeinHandler {
                         let directive = brain_bg.get_active_directive();
                         let _ = gui_tx_brain.send(GuiUpdate::ActiveDirective(directive)).await;
 
-                        while let Some(user_input_text) = rx_from_ui.recv().await {
+                        let mut shutdown_rx_brain = shutdown_tx.subscribe();
+
+                        loop {
+                            tokio::select! {
+                                _ = shutdown_rx_brain.recv() => {
+                                    log::info!(":: VEIN :: Brain Loop terminating. Syncing vault to disk...");
+                                    // Explicitly drop the Arc<Mutex<DiskManager>> so UnaFS flushes to disk.
+                                    drop(disk);
+                                    break;
+                                }
+                                user_input_opt = rx_from_ui.recv() => {
+                                    let user_input_text = match user_input_opt {
+                                        Some(text) => text,
+                                        None => break,
+                                    };
+
                             // === ROUTE: Directive Injection ===
                             if user_input_text == "LOAD_HISTORY" {
                                 let disk_clone = disk.clone();
@@ -651,6 +674,8 @@ impl VeinHandler {
 
                             // HALT GENERATION. Dispatch the strongly typed payload to the UI Interceptor.
                             let _ = gui_tx_brain.send(GuiUpdate::ReviewPayload(pre_flight_payload)).await;
+                                }
+                            }
                         }
                     }
                     Err(e) => {
