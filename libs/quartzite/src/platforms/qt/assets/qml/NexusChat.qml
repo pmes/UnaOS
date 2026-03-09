@@ -139,7 +139,7 @@ Rectangle {
     }
 
     Connections {
-        target: typeof root.backend !== "undefined" ? root.backend : null
+        target: root.backend
         function onNetworkPayloadDispatched(payload) {
             if (typeof _networkLogModel !== "undefined" && _networkLogModel !== null) {
                 _networkLogModel.appendLog(payload);

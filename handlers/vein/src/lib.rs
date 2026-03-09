@@ -31,7 +31,6 @@ use gneiss_pal::{
 use log::info;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
-use std::thread;
 use std::time::Duration;
 use tokio::runtime::Runtime;
 use tokio::sync::{broadcast, mpsc};
@@ -200,7 +199,7 @@ impl VeinHandler {
         bandy_tx: broadcast::Sender<SMessage>,
         telemetry_tx: async_channel::Sender<SMessage>, // Pure Async Channel
         shutdown_tx: tokio::sync::broadcast::Sender<()>,
-    ) -> Self {
+    ) -> (Self, tokio::task::JoinHandle<()>) {
         let vault_path_bg = history_path.clone();
         let brain = BrainManager::new(history_path);
 
@@ -223,12 +222,8 @@ impl VeinHandler {
         let bandy_tx_bg = bandy_tx.clone();
         let telemetry_tx_bg = telemetry_tx.clone();
 
-        thread::spawn(move || {
-            // Ignite the Can-Am V8 (Tokio Runtime)
-            let rt = tokio::runtime::Runtime::new().expect("Failed to create Tokio Runtime");
-
-            // block_on borrows the runtime to execute our main async block.
-            rt.block_on(async move {
+        // Capture the JoinHandle by spawning on the current Runtime (instead of std::thread)
+        let brain_loop_handle = tokio::runtime::Handle::current().spawn(async move {
                 let now = Local::now().format("%Y-%m-%d %H:%M:%S.%3f");
                 let _ = gui_tx_brain.send(GuiUpdate::ConsoleLog(format!("VEIN: [{}] [INFO] :: BRAIN :: Connecting...\n", now))).await;
 
@@ -271,13 +266,21 @@ impl VeinHandler {
 
                 tokio::time::sleep(Duration::from_millis(800)).await;
 
-                if let Ok(records) = disk.lock().unwrap().load_all_memories() {
-                    let items: Vec<gneiss_pal::HistoryItem> = records.into_iter().map(|r| gneiss_pal::HistoryItem {
-                        sender: r.sender,
-                        content: r.content,
-                        timestamp: r.timestamp,
-                        is_chat: r.is_chat,
-                    }).collect();
+                let initial_history = {
+                    if let Ok(records) = disk.lock().unwrap().load_all_memories() {
+                        let items: Vec<gneiss_pal::HistoryItem> = records.into_iter().map(|r| gneiss_pal::HistoryItem {
+                            sender: r.sender,
+                            content: r.content,
+                            timestamp: r.timestamp,
+                            is_chat: r.is_chat,
+                        }).collect();
+                        Some(items)
+                    } else {
+                        None
+                    }
+                };
+
+                if let Some(items) = initial_history {
                     let _ = gui_tx_brain.send(GuiUpdate::HistoryBatch(items)).await;
                 }
 
@@ -312,7 +315,6 @@ impl VeinHandler {
                                         Some(text) => text,
                                         None => break,
                                     };
-
                             // === ROUTE: Directive Injection ===
                             if user_input_text == "LOAD_HISTORY" {
                                 let disk_clone = disk.clone();
@@ -682,16 +684,15 @@ impl VeinHandler {
                         let _ = gui_tx_brain.send(GuiUpdate::ConsoleLog(format!(":: FATAL :: {}\n", e))).await;
                     }
                 }
-            });
         });
 
-        Self {
+        (Self {
             state,
             tx: tx_to_bg,
             gui_tx,
             bandy_tx,
             telemetry_tx, // <-- NEW
-        }
+        }, brain_loop_handle)
     }
 
     fn append_to_console(&self, text: &str) {

@@ -84,6 +84,13 @@ LumenMainWindow::LumenMainWindow(QWidget *parent) : QMainWindow(parent) {
 }
 
 LumenMainWindow::~LumenMainWindow() {
+    // NULL DISCONNECT ON EXIT (Anomaly 2)
+    // Clear the QML Engine before the CXX-Qt VeinBridge goes out of scope and is destroyed.
+    // This resolves QObject::disconnect: Unexpected nullptr parameter.
+    if (m_quickWidget && m_quickWidget->engine()) {
+        m_quickWidget->engine()->clearComponentCache();
+        m_quickWidget->setSource(QUrl());
+    }
 }
 
 std::unique_ptr<LumenMainWindow> create_main_window() {

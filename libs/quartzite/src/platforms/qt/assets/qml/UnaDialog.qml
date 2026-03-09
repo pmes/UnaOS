@@ -48,9 +48,7 @@ Item {
         id: dialogBox
         width: Math.max(380, contentLayout.implicitWidth + 32)
         height: contentLayout.implicitHeight + 32
-        anchors.top: parent.top
-        anchors.topMargin: 24
-        anchors.horizontalCenter: parent.horizontalCenter
+        anchors.centerIn: parent
         color: "#1e1e1e"
         border.color: "#444444"
         border.width: 1

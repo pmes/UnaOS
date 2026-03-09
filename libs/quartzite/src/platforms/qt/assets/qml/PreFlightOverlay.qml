@@ -223,6 +223,9 @@ Rectangle {
         onActionTriggered: function(action) {
             if (action === "reject") {
                 customCancelAlert.visible = false;
+                if (root.backend) {
+                    root.backend.cancelPreFlight();
+                }
                 root.payloadCanceled();
                 root.visible = false;
             } else if (action === "return") {

@@ -355,7 +355,7 @@ pub fn route_history_batch(items: Vec<HistoryItem>) {
                     is_chat: false,
                 });
             }
-            qobj.add_items(rust_items);
+            qobj.as_mut().add_items(rust_items);
         }).unwrap();
     } else {
         eprintln!("DROPPED: QML failed to register the HistoryModel thread.");
@@ -366,8 +366,8 @@ pub fn route_review_payload(payload: PreFlightPayload) {
     // We emit the signal directly from VeinBridge rather than filling a model.
     if let Some(thread) = VEIN_THREAD.get() {
         let thread = thread.clone();
-        thread.queue(move |mut qobj| {
-            qobj.as_mut().payload_ready_for_review(
+        thread.queue(move |qobj| {
+            qobj.payload_ready_for_review(
                 QString::from(&payload.system),
                 QString::from(&payload.directives),
                 QString::from(&payload.engrams),
