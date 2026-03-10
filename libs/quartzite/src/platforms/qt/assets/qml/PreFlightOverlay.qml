@@ -24,6 +24,9 @@ Rectangle {
     visible: false
     opacity: 0.98
 
+    SystemPalette { id: sys; colorGroup: SystemPalette.Active }
+    color: sys.window
+
 
     property var backend: null
     property alias systemTextAreaText: systemTextArea.text
@@ -48,6 +51,7 @@ Rectangle {
 
         Text {
             text: "PRE-FLIGHT REVIEW"
+            color: sys.windowText
             font.pixelSize: 22
             font.bold: true
             Layout.alignment: Qt.AlignHCenter
@@ -56,46 +60,47 @@ Rectangle {
         TabBar {
             id: preflightTabBar
             Layout.fillWidth: true
+            background: Rectangle { color: sys.base }
 
             TabButton {
                 text: "System"
                 contentItem: Text {
                     text: parent.text
+                    color: parent.checked ? sys.text : sys.windowText
                     horizontalAlignment: Text.AlignHCenter
                     verticalAlignment: Text.AlignVCenter
                 }
-                background: Rectangle {
-                }
+                background: Rectangle { color: parent.checked ? sys.mid : "transparent" }
             }
             TabButton {
                 text: "Directives"
                 contentItem: Text {
                     text: parent.text
+                    color: parent.checked ? sys.text : sys.windowText
                     horizontalAlignment: Text.AlignHCenter
                     verticalAlignment: Text.AlignVCenter
                 }
-                background: Rectangle {
-                }
+                background: Rectangle { color: parent.checked ? sys.mid : "transparent" }
             }
             TabButton {
                 text: "Engrams"
                 contentItem: Text {
                     text: parent.text
+                    color: parent.checked ? sys.text : sys.windowText
                     horizontalAlignment: Text.AlignHCenter
                     verticalAlignment: Text.AlignVCenter
                 }
-                background: Rectangle {
-                }
+                background: Rectangle { color: parent.checked ? sys.mid : "transparent" }
             }
             TabButton {
                 text: "Prompt"
                 contentItem: Text {
                     text: parent.text
+                    color: parent.checked ? sys.text : sys.windowText
                     horizontalAlignment: Text.AlignHCenter
                     verticalAlignment: Text.AlignVCenter
                 }
-                background: Rectangle {
-                }
+                background: Rectangle { color: parent.checked ? sys.mid : "transparent" }
             }
         }
 
@@ -107,11 +112,14 @@ Rectangle {
 
             // System Tab
             Rectangle {
+                color: sys.base
+                border.color: sys.mid
                 ScrollView {
                     anchors.fill: parent
                     anchors.margins: 8
                     TextArea {
                         id: systemTextArea
+                        color: sys.text
                         wrapMode: Text.WordWrap
                         background: Item {}
                     }
@@ -120,11 +128,14 @@ Rectangle {
 
             // Directives Tab
             Rectangle {
+                color: sys.base
+                border.color: sys.mid
                 ScrollView {
                     anchors.fill: parent
                     anchors.margins: 8
                     TextArea {
                         id: directivesTextArea
+                        color: sys.text
                         wrapMode: Text.WordWrap
                         background: Item {}
                     }
@@ -133,11 +144,14 @@ Rectangle {
 
             // Engrams Tab
             Rectangle {
+                color: sys.base
+                border.color: sys.mid
                 ScrollView {
                     anchors.fill: parent
                     anchors.margins: 8
                     TextArea {
                         id: engramsTextArea
+                        color: sys.text
                         wrapMode: Text.WordWrap
                         background: Item {}
                     }
@@ -146,11 +160,14 @@ Rectangle {
 
             // Prompt Tab
             Rectangle {
+                color: sys.base
+                border.color: sys.mid
                 ScrollView {
                     anchors.fill: parent
                     anchors.margins: 8
                     TextArea {
                         id: promptTextArea
+                        color: sys.text
                         wrapMode: Text.WordWrap
                         background: Item {}
                     }
@@ -169,14 +186,7 @@ Rectangle {
                 background: Rectangle { color: "#D70000"; radius: 4; implicitWidth: 100; implicitHeight: 36 }
                 contentItem: Text { text: parent.text; color: "#FFFFFF"; horizontalAlignment: Text.AlignHCenter; verticalAlignment: Text.AlignVCenter }
                 onClicked: {
-                    // Hard-clear the TextAreas directly
-                    systemTextArea.text = "";
-                    directivesTextArea.text = "";
-                    engramsTextArea.text = "";
-                    promptTextArea.text = "";
-
-                    root.payloadCanceled();
-                    root.visible = false;
+                    customCancelAlert.open();
                 }
             }
 
