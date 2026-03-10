@@ -68,7 +68,7 @@ Rectangle {
                         id: messageText
                         anchors.centerIn: parent
                         width: Math.max(parent.width - 32, 10)
-                        text: display !== undefined ? display : (model.display !== undefined ? model.display : "Awaiting Telemetry...")
+                        text: model.display !== undefined ? model.display : (display !== undefined ? display : "Awaiting Telemetry...")
                         wrapMode: Text.WordWrap
                     }
                 }

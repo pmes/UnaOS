@@ -210,6 +210,10 @@ Rectangle {
                 engramsTextArea.text = "";
                 promptTextArea.text = "";
 
+                if (root.backend) {
+                    root.backend.abortPreFlight();
+                }
+
                 root.payloadCanceled();
                 root.visible = false;
             } else if (action === "return") {

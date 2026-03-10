@@ -21,10 +21,12 @@ import com.unaos.lumen 1.0
 
 Rectangle {
     id: root
-    color: "#1e1e1e"
+    color: sys.window
 
     property var historyModel: null
     property var backend: null
+
+    SystemPalette { id: sys; colorGroup: SystemPalette.Active }
 
     ListView {
         id: emailListView
@@ -36,8 +38,8 @@ Rectangle {
             width: emailListView.width
             height: 60
             background: Rectangle {
-                color: model.toolTip ? "#2d2d30" : "#1e1e1e"
-                border.color: "#333"
+                color: model.toolTip ? sys.highlight : sys.base
+                border.color: sys.mid
                 border.width: 1
             }
 
@@ -47,14 +49,14 @@ Rectangle {
                 spacing: 4
 
                 Text {
-                    text: model.edit || ""
-                    color: "#FFFFFF"
+                    text: model.edit !== undefined ? model.edit : ""
+                    color: model.toolTip ? sys.highlightedText : sys.text
                     font.bold: true
                     Layout.fillWidth: true
                 }
                 Text {
-                    text: model.display || ""
-                    color: "#CCCCCC"
+                    text: model.display !== undefined ? model.display : ""
+                    color: model.toolTip ? sys.highlightedText : sys.windowText
                     elide: Text.ElideRight
                     Layout.fillWidth: true
                 }
