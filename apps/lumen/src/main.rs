@@ -142,8 +142,7 @@ fn main() {
     // 2. Abort the core handle to force it to drop cortex_vault and flush
     core_handle.abort();
 
-    // 3. Briefly await the aborted handle to guarantee the Drop trait finishes
-    rt.block_on(async {
-        let _ = core_handle.await;
-    });
+    // 3. Keep the Tokio runtime alive explicitly for 1 second to allow UnaFS
+    // to finish its synchronous block-device flushes triggered by the Drop.
+    std::thread::sleep(std::time::Duration::from_millis(1000));
 }
