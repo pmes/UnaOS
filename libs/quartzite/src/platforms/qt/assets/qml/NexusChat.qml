@@ -35,7 +35,7 @@ Rectangle {
             Layout.fillWidth: true
             Layout.fillHeight: true
             clip: true
-            model: typeof _historyModel !== "undefined" ? _historyModel : null
+            model: _historyModel
             spacing: 8
 
             // Fluid Geometry Constraints

@@ -169,7 +169,14 @@ Rectangle {
                 background: Rectangle { color: "#D70000"; radius: 4; implicitWidth: 100; implicitHeight: 36 }
                 contentItem: Text { text: parent.text; color: "#FFFFFF"; horizontalAlignment: Text.AlignHCenter; verticalAlignment: Text.AlignVCenter }
                 onClicked: {
-                    customCancelAlert.open();
+                    // Hard-clear the TextAreas directly
+                    systemTextArea.text = "";
+                    directivesTextArea.text = "";
+                    engramsTextArea.text = "";
+                    promptTextArea.text = "";
+
+                    root.payloadCanceled();
+                    root.visible = false;
                 }
             }
 
