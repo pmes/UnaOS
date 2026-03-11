@@ -21,7 +21,6 @@ use bandy::{SMessage, MatrixEvent, SpatialNode, SpatialEdge};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use tokio::sync::broadcast;
 use log::info;
 
 /// Ingests a source file into the AI Cortex's memory matrix.
@@ -58,13 +57,13 @@ pub fn ingest_for_lumen(file_path: &Path) -> Result<String, String> {
 }
 
 // Update the signature to return the HashMap
-pub async fn run_indexer(root: PathBuf, tx: broadcast::Sender<SMessage>) -> HashMap<PathBuf, Arc<String>> {
-    let payload = scan_workspace(&root, &tx).await;
+pub async fn run_indexer(root: PathBuf, synapse: bandy::Synapse) -> HashMap<PathBuf, Arc<String>> {
+    let payload = scan_workspace(&root, &synapse).await;
     payload
 }
 
 // Rename and update return type
-async fn scan_workspace(root: &Path, tx: &broadcast::Sender<SMessage>) -> HashMap<PathBuf, Arc<String>> {
+async fn scan_workspace(root: &Path, synapse: &bandy::Synapse) -> HashMap<PathBuf, Arc<String>> {
     info!(":: CORTEX :: Indexing Workspace at {:?}", root);
 
     let mut indexer = elessar::context::WorkspaceIndexer::new();
@@ -118,15 +117,15 @@ async fn scan_workspace(root: &Path, tx: &broadcast::Sender<SMessage>) -> HashMa
                         // REMOVED: The hardcoded bandy focus
                     }
                     Err(e) => {
-                        let _ = tx.send(SMessage::Log { level: "WARN".into(), source: "Cortex".into(), content: e });
+                        synapse.fire_async(SMessage::Log { level: "WARN".into(), source: "Cortex".into(), content: e }).await;
                     }
                 }
             }
         }
     }
 
-    let _ = tx.send(SMessage::Matrix(MatrixEvent::IngestTopology { nodes: spatial_nodes, edges: spatial_edges }));
-    let _ = tx.send(SMessage::Log { level: "INFO".into(), source: "Cortex".into(), content: format!("Workspace Indexed. Generated {} AST Skeletons.", total_skeletons) });
+    synapse.fire_async(SMessage::Matrix(MatrixEvent::IngestTopology { nodes: spatial_nodes, edges: spatial_edges })).await;
+    synapse.fire_async(SMessage::Log { level: "INFO".into(), source: "Cortex".into(), content: format!("Workspace Indexed. Generated {} AST Skeletons.", total_skeletons) }).await;
 
     // Return the raw cache
     skeleton_cache
