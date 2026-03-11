@@ -17,19 +17,27 @@
 use crate::cortex::Cortex;
 use bandy::{SMessage, Synapse};
 use std::path::PathBuf;
-use tokio::sync::broadcast::error::RecvError;
 
 /// The Autonomous Loop.
 /// Runs silently in the background, absorbing the nervous system's telemetry.
-pub async fn ignite(vault_path: PathBuf, mut synapse: Synapse) {
+pub async fn ignite(
+    vault_path: PathBuf,
+    mut synapse: Synapse,
+    mut shutdown_rx: tokio::sync::broadcast::Receiver<()>,
+) {
     let mut cortex = Cortex::awaken(vault_path, &mut synapse);
-    let mut rx = synapse.rx();
+    let rx = synapse.rx();
 
     log::info!(">> [LUMEN CORE] Synapses firing. Autonomous loop engaged.");
 
     loop {
-        match rx.recv().await {
-            Ok(msg) => match msg {
+        tokio::select! {
+            _ = shutdown_rx.recv() => {
+                log::info!(">> [LUMEN CORE] Termination broadcast caught. Flushing cortex and severing.");
+                break;
+            }
+            res = rx.recv() => match res {
+                Ok(msg) => match msg {
                 SMessage::UserPrompt(text) => {
                     cortex.imprint("stimulus.prompt", text.as_bytes());
                 }
@@ -48,16 +56,11 @@ pub async fn ignite(vault_path: PathBuf, mut synapse: Synapse) {
                     cortex.imprint("stimulus.log", payload.as_bytes());
                 }
                 _ => {} // The subconscious absorbs the noise.
-            },
-            Err(RecvError::Lagged(skipped)) => {
-                log::warn!(
-                    ">> [LUMEN CORE] Synapse overloaded. Skipped {} stimuli.",
-                    skipped
-                );
-            }
-            Err(RecvError::Closed) => {
-                log::warn!(">> [LUMEN CORE] Nervous system severed. Shutting down.");
-                break;
+                },
+                Err(_) => {
+                    log::warn!(">> [LUMEN CORE] Nervous system severed. Shutting down.");
+                    break;
+                }
             }
         }
     }

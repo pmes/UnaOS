@@ -77,8 +77,9 @@ fn main() {
 
     // 5. Awaken the Autonomous Core
     let core_synapse = synapse.clone();
+    let shutdown_rx_core = shutdown_tx.subscribe();
     let core_handle = rt.spawn(async move {
-        core::ignite(cortex_vault, core_synapse).await;
+        core::ignite(cortex_vault, core_synapse, shutdown_rx_core).await;
     });
 
     // 6. Ignite the AI Handler (The Conscious Vein)
@@ -91,7 +92,7 @@ fn main() {
     // The `handle_event` method processes events from the UI.
 
     let (shutdown_tx_vein, shutdown_rx_vein) = (shutdown_tx.clone(), shutdown_tx.subscribe());
-    let (vein_handler, bg_handle) = VeinHandler::new(gui_tx, vein_storage, synapse.tx(), telemetry_tx, shutdown_tx_vein);
+    let (vein_handler, bg_handle) = VeinHandler::new(gui_tx, vein_storage, synapse.clone(), telemetry_tx, shutdown_tx_vein);
 
     // Spawn the Brain Loop
     let brain_loop_handle = rt.spawn(async move {
@@ -137,12 +138,6 @@ fn main() {
     rt.block_on(async {
         let _ = brain_loop_handle.await;
         let _ = bg_handle.await;
+        let _ = core_handle.await;
     });
-
-    // 2. Abort the core handle to force it to drop cortex_vault and flush
-    core_handle.abort();
-
-    // 3. Keep the Tokio runtime alive explicitly for 1 second to allow UnaFS
-    // to finish its synchronous block-device flushes triggered by the Drop.
-    std::thread::sleep(std::time::Duration::from_millis(1000));
 }

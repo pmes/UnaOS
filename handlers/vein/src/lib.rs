@@ -32,11 +32,10 @@ use log::info;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use tokio::runtime::Runtime;
-use tokio::sync::{broadcast, mpsc};
+use tokio::sync::mpsc;
 
 use crate::storage::DiskManager;
-use bandy::{BandyMember, SMessage};
+use bandy::{BandyMember, SMessage, Synapse};
 
 struct State {
     mode: ViewMode,
@@ -64,81 +63,76 @@ fn get_mime_type(filename: &str) -> String {
     }
 }
 
-fn trigger_upload(path: PathBuf, gui_tx: async_channel::Sender<GuiUpdate>) {
+async fn execute_upload(path: PathBuf, gui_tx: async_channel::Sender<GuiUpdate>) {
     let filename = path
         .file_name()
         .unwrap_or_default()
         .to_string_lossy()
         .to_string();
-    let _ = gui_tx.try_send(GuiUpdate::ConsoleLog(format!(
+    let _ = gui_tx.send(GuiUpdate::ConsoleLog(format!(
         "\n[SYSTEM] :: Uploading: {}...\n",
         filename
-    )));
+    ))).await;
 
-    std::thread::spawn(move || {
-        let rt = Runtime::new().unwrap();
-        rt.block_on(async {
-            let file_bytes = match std::fs::read(&path) {
-                Ok(b) => b,
-                Err(e) => {
+    let file_bytes = match tokio::fs::read(&path).await {
+        Ok(b) => b,
+        Err(e) => {
+            let _ = gui_tx
+                .send(GuiUpdate::ConsoleLog(format!(
+                    "\n[SYSTEM ERROR] :: File Read Failed: {}\n",
+                    e
+                )))
+                .await;
+            return;
+        }
+    };
+
+    let client = reqwest::Client::new();
+    let url = "https://vein-s9-upload-1035558613434.us-central1.run.app/upload";
+
+    let part = reqwest::multipart::Part::bytes(file_bytes)
+        .file_name(filename.clone())
+        .mime_str("application/octet-stream")
+        .expect("Failed to set mime type");
+
+    let form = reqwest::multipart::Form::new()
+        .part("file", part)
+        .text("description", "Uploaded via Vein Client");
+
+    match client.post(url).multipart(form).send().await {
+        Ok(response) if response.status().is_success() => {
+            let text = response.text().await.unwrap_or_default();
+            if let Ok(json) = serde_json::from_str::<serde_json::Value>(&text) {
+                if let Some(uri) = json.get("storage_uri").and_then(|v| v.as_str()) {
+                    let mime = get_mime_type(&filename);
+                    let tag = format!("\n[ATTACHMENT:{}|{}]\n", mime, uri);
+                    let _ = gui_tx.send(GuiUpdate::AppendInput(tag)).await;
                     let _ = gui_tx
                         .send(GuiUpdate::ConsoleLog(format!(
-                            "\n[SYSTEM ERROR] :: File Read Failed: {}\n",
-                            e
-                        )))
-                        .await;
-                    return;
-                }
-            };
-
-            let client = reqwest::Client::new();
-            let url = "https://vein-s9-upload-1035558613434.us-central1.run.app/upload";
-
-            let part = reqwest::multipart::Part::bytes(file_bytes)
-                .file_name(filename.clone())
-                .mime_str("application/octet-stream")
-                .expect("Failed to set mime type");
-
-            let form = reqwest::multipart::Form::new()
-                .part("file", part)
-                .text("description", "Uploaded via Vein Client");
-
-            match client.post(url).multipart(form).send().await {
-                Ok(response) if response.status().is_success() => {
-                    let text = response.text().await.unwrap_or_default();
-                    if let Ok(json) = serde_json::from_str::<serde_json::Value>(&text) {
-                        if let Some(uri) = json.get("storage_uri").and_then(|v| v.as_str()) {
-                            let mime = get_mime_type(&filename);
-                            let tag = format!("\n[ATTACHMENT:{}|{}]\n", mime, uri);
-                            let _ = gui_tx.send(GuiUpdate::AppendInput(tag)).await;
-                            let _ = gui_tx
-                                .send(GuiUpdate::ConsoleLog(format!(
-                                    "\n[SYSTEM] :: Upload Complete: {}\n",
-                                    filename
-                                )))
-                                .await;
-                        }
-                    }
-                }
-                Ok(response) => {
-                    let _ = gui_tx
-                        .send(GuiUpdate::ConsoleLog(format!(
-                            "\n[SYSTEM ERROR] :: Upload Failed: {}\n",
-                            response.status()
-                        )))
-                        .await;
-                }
-                Err(e) => {
-                    let _ = gui_tx
-                        .send(GuiUpdate::ConsoleLog(format!(
-                            "\n[SYSTEM ERROR] :: Upload Request Failed: {}\n",
-                            e
+                            "\n[SYSTEM] :: Upload Complete: {}\n",
+                            filename
                         )))
                         .await;
                 }
             }
-        });
-    });
+        }
+        Ok(response) => {
+            let _ = gui_tx
+                .send(GuiUpdate::ConsoleLog(format!(
+                    "\n[SYSTEM ERROR] :: Upload Failed: {}\n",
+                    response.status()
+                )))
+                .await;
+        }
+        Err(e) => {
+            let _ = gui_tx
+                .send(GuiUpdate::ConsoleLog(format!(
+                    "\n[SYSTEM ERROR] :: Upload Request Failed: {}\n",
+                    e
+                )))
+                .await;
+        }
+    }
 }
 
 fn parse_multimodal_text(text: &str) -> Vec<Part> {
@@ -188,7 +182,7 @@ pub struct VeinHandler {
     state: Arc<Mutex<State>>,
     tx: mpsc::UnboundedSender<String>,
     gui_tx: async_channel::Sender<GuiUpdate>,
-    bandy_tx: broadcast::Sender<SMessage>,
+    synapse: Synapse,
     telemetry_tx: async_channel::Sender<SMessage>, // <-- NEW
 }
 
@@ -196,7 +190,7 @@ impl VeinHandler {
     pub fn new(
         gui_tx: async_channel::Sender<GuiUpdate>,
         history_path: PathBuf,
-        bandy_tx: broadcast::Sender<SMessage>,
+        synapse: Synapse,
         telemetry_tx: async_channel::Sender<SMessage>, // Pure Async Channel
         shutdown_tx: tokio::sync::broadcast::Sender<()>,
     ) -> (Self, tokio::task::JoinHandle<()>) {
@@ -219,8 +213,9 @@ impl VeinHandler {
         let gui_tx_brain = gui_tx.clone();
         let state_bg = state.clone();
         let brain_bg = brain.clone();
-        let bandy_tx_bg = bandy_tx.clone();
+        let synapse_bg = synapse.clone();
         let telemetry_tx_bg = telemetry_tx.clone();
+        let synapse_loop = synapse.clone(); // <-- Clone for the async block to prevent moving the field
 
         // Capture the JoinHandle by spawning on the current Runtime (instead of std::thread)
         let brain_loop_handle = tokio::runtime::Handle::current().spawn(async move {
@@ -241,7 +236,7 @@ impl VeinHandler {
                             log::info!(":: CORTEX :: Shutting down indexer cleanly.");
                             return;
                         }
-                        cache = cortex::run_indexer(root, bandy_tx_bg) => {
+                                cache = cortex::run_indexer(root, synapse_bg) => {
                             let live_ctx = {
                                 let mut s = state_indexer.lock().unwrap();
                                 s.skeleton_cache = cache;
@@ -301,9 +296,20 @@ impl VeinHandler {
                         let _ = gui_tx_brain.send(GuiUpdate::ActiveDirective(directive)).await;
 
                         let mut shutdown_rx_brain = shutdown_tx.subscribe();
+                        let bandy_rx_brain = synapse_loop.rx();
 
                         loop {
                             tokio::select! {
+                                Ok(msg) = bandy_rx_brain.recv() => {
+                                    if let SMessage::TriggerUpload(path) = msg {
+                                        let gui_tx_upload = gui_tx_brain.clone();
+                                        tokio::spawn(async move {
+                                            execute_upload(path, gui_tx_upload).await;
+                                        });
+                                    } else {
+                                        // Ignore other messages not meant for Vein's background loop
+                                    }
+                                }
                                 _ = shutdown_rx_brain.recv() => {
                                     log::info!(":: VEIN :: Brain Loop terminating. Syncing vault to disk...");
                                     // Explicitly drop the Arc<Mutex<DiskManager>> so UnaFS flushes to disk.
@@ -690,7 +696,7 @@ impl VeinHandler {
             state,
             tx: tx_to_bg,
             gui_tx,
-            bandy_tx,
+            synapse,
             telemetry_tx, // <-- NEW
         }, brain_loop_handle)
     }
@@ -704,9 +710,7 @@ impl VeinHandler {
 
 impl BandyMember for VeinHandler {
     fn publish(&self, _topic: &str, msg: SMessage) -> anyhow::Result<()> {
-        self.bandy_tx
-            .send(msg)
-            .map_err(|e| anyhow::anyhow!("Bandy Send Error: {}", e))?;
+        self.synapse.fire(msg);
         Ok(())
     }
 }
@@ -748,7 +752,7 @@ impl AppHandler for VeinHandler {
                     let _ = self.tx.send("/clear".to_string());
                 } else if let Some(path_str) = text.trim().strip_prefix("/upload ") {
                     let path = PathBuf::from(path_str.trim());
-                    trigger_upload(path, self.gui_tx.clone());
+                    let _ = self.publish("upload", SMessage::TriggerUpload(path));
                 } else if let Some(dir_text) = text.trim().strip_prefix("/directive ") {
                     self.append_to_console("\n[SYSTEM] :: Burning Active Directive to Vault...\n");
                     let _ = self.tx.send(format!("SAVE_DIRECTIVE:{}", dir_text));
@@ -793,7 +797,7 @@ impl AppHandler for VeinHandler {
                 ));
             }
             Event::FileSelected(path) => {
-                trigger_upload(path.clone(), self.gui_tx.clone());
+                let _ = self.publish("upload", SMessage::TriggerUpload(path.clone()));
 
                 // --- NEW: DYNAMIC GRAVITY FOCUS ---
                 s.focused_file = Some(path.clone());

@@ -103,6 +103,7 @@ pub enum SMessage {
     TerminalOutput(String),
     TerminalError(String),
     FileSystemEvent(String),
+    TriggerUpload(PathBuf),
 
     // --- PRINCIPIA (The Basal Ganglia) ---
     Principia(PrincipiaCommand),
