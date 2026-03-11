@@ -14,17 +14,20 @@
 // You should have received a copy of the GNU Lesser General Public License
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-use cxx_qt_lib::{QString, QVariant, QModelIndex};
 use cxx_qt::CxxQtType;
+use cxx_qt_lib::{QModelIndex, QString, QVariant};
 use std::sync::OnceLock;
 
-use gneiss_pal::{Event, PreFlightPayload, HistoryItem};
 use crate::platforms::qt::window::GLOBAL_TX;
+use gneiss_pal::{Event, HistoryItem, PreFlightPayload};
 
 pub static VEIN_THREAD: OnceLock<cxx_qt::CxxQtThread<qobject::VeinBridge>> = OnceLock::new();
-pub static HISTORY_MODEL_THREAD: OnceLock<cxx_qt::CxxQtThread<qobject::HistoryModel>> = OnceLock::new();
-pub static PREFLIGHT_THREAD: OnceLock<cxx_qt::CxxQtThread<qobject::PreFlightPayloadQml>> = OnceLock::new();
-pub static NETWORK_LOG_MODEL_THREAD: OnceLock<cxx_qt::CxxQtThread<qobject::NetworkLogModel>> = OnceLock::new();
+pub static HISTORY_MODEL_THREAD: OnceLock<cxx_qt::CxxQtThread<qobject::HistoryModel>> =
+    OnceLock::new();
+pub static PREFLIGHT_THREAD: OnceLock<cxx_qt::CxxQtThread<qobject::PreFlightPayloadQml>> =
+    OnceLock::new();
+pub static NETWORK_LOG_MODEL_THREAD: OnceLock<cxx_qt::CxxQtThread<qobject::NetworkLogModel>> =
+    OnceLock::new();
 
 #[cxx_qt::bridge]
 pub mod qobject {
@@ -71,8 +74,6 @@ pub mod qobject {
         #[qinvokable]
         #[cxx_name = "registerModelThread"]
         fn register_model_thread(self: Pin<&mut HistoryModel>);
-
-
 
         #[inherit]
         #[cxx_name = "beginResetModel"]
@@ -132,7 +133,13 @@ pub mod qobject {
 
         #[qinvokable]
         #[cxx_name = "dispatchPayload"]
-        fn dispatch_payload(self: Pin<&mut VeinBridge>, system: QString, directives: QString, engrams: QString, prompt: QString);
+        fn dispatch_payload(
+            self: Pin<&mut VeinBridge>,
+            system: QString,
+            directives: QString,
+            engrams: QString,
+            prompt: QString,
+        );
 
         #[qinvokable]
         #[cxx_name = "registerThread"]
@@ -156,7 +163,13 @@ pub mod qobject {
 
         #[qsignal]
         #[cxx_name = "payloadReadyForReview"]
-        fn payload_ready_for_review(self: Pin<&mut VeinBridge>, system: QString, directives: QString, engrams: QString, prompt: QString);
+        fn payload_ready_for_review(
+            self: Pin<&mut VeinBridge>,
+            system: QString,
+            directives: QString,
+            engrams: QString,
+            prompt: QString,
+        );
     }
 
     impl cxx_qt::Threading for VeinBridge {}
@@ -209,7 +222,13 @@ impl qobject::VeinBridge {
         }
     }
 
-    pub fn dispatch_payload(mut self: std::pin::Pin<&mut Self>, system: QString, directives: QString, engrams: QString, prompt: QString) {
+    pub fn dispatch_payload(
+        mut self: std::pin::Pin<&mut Self>,
+        system: QString,
+        directives: QString,
+        engrams: QString,
+        prompt: QString,
+    ) {
         // Construct the struct the kernel actually expects
         let payload = PreFlightPayload {
             system: system.to_string(),
@@ -227,7 +246,8 @@ impl qobject::VeinBridge {
             );
 
             if let Some(tx) = GLOBAL_TX.get() {
-                self.as_mut().network_payload_dispatched(QString::from(&display_payload));
+                self.as_mut()
+                    .network_payload_dispatched(QString::from(&display_payload));
                 let _ = tx.try_send(Event::DispatchPayload(json_payload));
             }
         }
@@ -359,27 +379,32 @@ impl qobject::NetworkLogModel {
 }
 
 pub fn route_history_batch(items: Vec<HistoryItem>) {
-    let mut rust_items: Vec<HistoryItemRust> = items.into_iter().map(|i| HistoryItemRust {
-        sender: i.sender,
-        content: i.content,
-        timestamp: i.timestamp,
-        is_chat: i.is_chat,
-    }).collect();
+    let mut rust_items: Vec<HistoryItemRust> = items
+        .into_iter()
+        .map(|i| HistoryItemRust {
+            sender: i.sender,
+            content: i.content,
+            timestamp: i.timestamp,
+            is_chat: i.is_chat,
+        })
+        .collect();
 
     if let Some(thread) = HISTORY_MODEL_THREAD.get() {
         let thread = thread.clone();
-        thread.queue(move |mut qobj| {
-            // FORCE VISUAL CONFIRMATION IF VAULT IS EMPTY (prevent duplicates)
-            if rust_items.is_empty() && qobj.as_ref().rust().rows.is_empty() {
-                rust_items.push(HistoryItemRust {
-                    sender: "system".to_string(),
-                    content: ":: UNAFS VAULT EMPTY. READY FOR TELEMETRY ::".to_string(),
-                    timestamp: "".to_string(),
-                    is_chat: false,
-                });
-            }
-            qobj.as_mut().add_items(rust_items);
-        }).unwrap();
+        thread
+            .queue(move |mut qobj| {
+                // FORCE VISUAL CONFIRMATION IF VAULT IS EMPTY (prevent duplicates)
+                if rust_items.is_empty() && qobj.as_ref().rust().rows.is_empty() {
+                    rust_items.push(HistoryItemRust {
+                        sender: "system".to_string(),
+                        content: ":: UNAFS VAULT EMPTY. READY FOR TELEMETRY ::".to_string(),
+                        timestamp: "".to_string(),
+                        is_chat: false,
+                    });
+                }
+                qobj.as_mut().add_items(rust_items);
+            })
+            .unwrap();
     } else {
         eprintln!("DROPPED: QML failed to register the HistoryModel thread.");
     }
@@ -389,22 +414,26 @@ pub fn route_review_payload(payload: PreFlightPayload) {
     // We emit the signal directly from VeinBridge rather than filling a model.
     if let Some(thread) = VEIN_THREAD.get() {
         let thread = thread.clone();
-        thread.queue(move |mut qobj| {
-            qobj.as_mut().payload_ready_for_review(
-                QString::from(&payload.system),
-                QString::from(&payload.directives),
-                QString::from(&payload.engrams),
-                QString::from(&payload.prompt),
-            );
-        }).unwrap();
+        thread
+            .queue(move |mut qobj| {
+                qobj.as_mut().payload_ready_for_review(
+                    QString::from(&payload.system),
+                    QString::from(&payload.directives),
+                    QString::from(&payload.engrams),
+                    QString::from(&payload.prompt),
+                );
+            })
+            .unwrap();
     }
 }
 
 pub fn route_console_log(log: String) {
     if let Some(thread) = NETWORK_LOG_MODEL_THREAD.get() {
         let thread = thread.clone();
-        thread.queue(move |mut qobj| {
-            qobj.as_mut().append_log(QString::from(&log));
-        }).unwrap();
+        thread
+            .queue(move |mut qobj| {
+                qobj.as_mut().append_log(QString::from(&log));
+            })
+            .unwrap();
     }
 }

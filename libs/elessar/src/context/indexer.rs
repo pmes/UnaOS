@@ -14,9 +14,9 @@
 // You should have received a copy of the GNU Lesser General Public License
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
+use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use serde::{Deserialize, Serialize};
 
 // We don't need unafs here. We just need standard paths.
 // The indexer builds the graph of crates.
@@ -116,10 +116,10 @@ impl WorkspaceIndexer {
             if in_deps && !line.starts_with("#") && !line.is_empty() {
                 // dep = ...
                 if let Some(dep_name) = line.split('=').nth(0) {
-                     let clean = dep_name.trim();
-                     if !clean.is_empty() {
-                         dependencies.push(clean.to_string());
-                     }
+                    let clean = dep_name.trim();
+                    if !clean.is_empty() {
+                        dependencies.push(clean.to_string());
+                    }
                 }
             }
         }

@@ -14,11 +14,11 @@
 // You should have received a copy of the GNU Lesser General Public License
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
+use rand::RngExt;
 use reqwest::{RequestBuilder, Response, StatusCode};
+use std::future::Future;
 use std::time::Duration;
 use tokio::time::sleep;
-use std::future::Future;
-use rand::RngExt;
 
 /// The Synaptic Governor.
 /// Prevents Lumen from DDOSing the Vertex AI endpoint.

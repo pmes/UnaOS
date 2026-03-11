@@ -18,13 +18,15 @@ use anyhow::Result;
 #[cfg(target_os = "linux")]
 use gtk4::prelude::*;
 #[cfg(target_os = "linux")]
-use gtk4::{Box, HeaderBar, Orientation, Paned, Stack, StackSwitcher, StackTransitionType, Separator};
+use gtk4::{
+    Box, HeaderBar, Orientation, Paned, Separator, Stack, StackSwitcher, StackTransitionType,
+};
 #[cfg(all(target_os = "linux", feature = "gnome"))]
 use libadwaita as adw;
 use std::cell::RefCell;
 use std::env;
-use std::rc::Rc;
 use std::path::PathBuf;
+use std::rc::Rc;
 
 use gneiss_pal::{Event, GuiUpdate};
 use quartzite::{Backend, NativeView, NativeWindow};
@@ -55,7 +57,9 @@ fn main() -> Result<()> {
                 Event::FileSelected(path) => {
                     println!("[UNA CORE] 🧠 Routing Impulse: {:?}", path);
                     // Bouncing it as EditorLoad to trigger tabula
-                    let _ = tx_gui.send(GuiUpdate::EditorLoad(path.to_string_lossy().to_string())).await;
+                    let _ = tx_gui
+                        .send(GuiUpdate::EditorLoad(path.to_string_lossy().to_string()))
+                        .await;
                 }
                 _ => {}
             }
@@ -71,7 +75,12 @@ fn main() -> Result<()> {
     let bootstrap = move |window: &NativeWindow| -> NativeView {
         #[cfg(target_os = "macos")]
         let view = {
-            spline.bootstrap(window, tx_brain.clone(), rx_gui.clone(), rx_telemetry.clone())
+            spline.bootstrap(
+                window,
+                tx_brain.clone(),
+                rx_gui.clone(),
+                rx_telemetry.clone(),
+            )
         };
 
         #[cfg(target_os = "linux")]
@@ -102,7 +111,6 @@ fn main() -> Result<()> {
             left_toolbar.add_top_bar(&left_header);
             left_toolbar.add_top_bar(&left_tab_bar);
             left_toolbar.set_content(Some(&left_tab_view));
-
 
             // 4. THE WORKSPACE (Right Pane)
             let right_toolbar = adw::ToolbarView::new();

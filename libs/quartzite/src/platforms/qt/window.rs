@@ -14,12 +14,12 @@
 // You should have received a copy of the GNU Lesser General Public License
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-use std::sync::OnceLock;
 use async_channel::{Receiver, Sender};
+use std::sync::OnceLock;
 
+use crate::{NativeView, NativeWindow};
 use gneiss_pal::{Event, GuiUpdate};
 use tokio::runtime::Handle;
-use crate::{NativeView, NativeWindow};
 
 use super::ffi;
 
@@ -62,9 +62,7 @@ impl qobject::LumenWindow {
     }
 }
 
-pub fn spawn_gui_listener(
-    rx: Receiver<GuiUpdate>,
-) {
+pub fn spawn_gui_listener(rx: Receiver<GuiUpdate>) {
     if let Ok(handle) = Handle::try_current() {
         handle.spawn(async move {
             while let Ok(update) = rx.recv().await {
@@ -95,10 +93,15 @@ impl Backend {
         let app = ffi::create_qapplication();
 
         // Provide the NativeWindow and invoke bootstrap logic here.
-        let window = NativeWindow { ptr: std::ptr::null_mut() };
+        let window = NativeWindow {
+            ptr: std::ptr::null_mut(),
+        };
         let view = _bootstrap_fn(&window);
 
-        Self { app, main_window: view.ptr }
+        Self {
+            app,
+            main_window: view.ptr,
+        }
     }
 
     pub fn run(&mut self) {

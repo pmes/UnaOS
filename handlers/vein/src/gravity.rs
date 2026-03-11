@@ -14,10 +14,10 @@
 // You should have received a copy of the GNU Lesser General Public License
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
+use bandy::WeightedSkeleton;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
-use bandy::WeightedSkeleton;
 
 /// GravityWell
 ///
@@ -52,7 +52,10 @@ impl GravityWell {
 
     // --- NEW: EXTRACT SEMANTIC KEYWORDS FROM PROMPT ---
     pub fn extract_keywords(&mut self, prompt: &str) {
-        let stop_words = ["this", "that", "with", "from", "your", "what", "when", "where", "have", "will", "just", "like", "need", "make", "sure", "code", "file"];
+        let stop_words = [
+            "this", "that", "with", "from", "your", "what", "when", "where", "have", "will",
+            "just", "like", "need", "make", "sure", "code", "file",
+        ];
         self.prompt_keywords = prompt
             // Split by non-alphanumeric EXCEPT underscores (preserves snake_case like telemetry_tx)
             .split(|c: char| !c.is_alphanumeric() && c != '_')
@@ -76,7 +79,10 @@ impl GravityWell {
 
     /// Calculate the Gravitational Score for all known skeletons.
     /// Returns a sorted list of the most relevant skeletons.
-    pub fn calculate_scores(&self, skeletons: &HashMap<PathBuf, Arc<String>>) -> Vec<WeightedSkeleton> {
+    pub fn calculate_scores(
+        &self,
+        skeletons: &HashMap<PathBuf, Arc<String>>,
+    ) -> Vec<WeightedSkeleton> {
         let mut results = Vec::new();
 
         for (path, content) in skeletons {
@@ -85,12 +91,18 @@ impl GravityWell {
 
             // 1. Primary Weight
             if let Some(focus) = &self.focused_file {
-                if path == focus { score += 1.0; }
+                if path == focus {
+                    score += 1.0;
+                }
             }
 
             // 2. Secondary Weights
-            if let Some(val) = self.wal_activity.get(path) { score += 0.8 * val; }
-            if let Some(val) = self.git_activity.get(path) { score += 0.5 * val; }
+            if let Some(val) = self.wal_activity.get(path) {
+                score += 0.8 * val;
+            }
+            if let Some(val) = self.git_activity.get(path) {
+                score += 0.5 * val;
+            }
 
             // 3. NEW: Semantic Prompt Weight
             if !self.prompt_keywords.is_empty() {
@@ -113,7 +125,11 @@ impl GravityWell {
             }
         }
 
-        results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+        results.sort_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
         results.into_iter().take(5).collect()
     }
 }

@@ -22,8 +22,8 @@
 //! our architectural purity.
 
 pub mod platforms;
-pub mod text;
 pub mod spline;
+pub mod text;
 pub mod widgets;
 
 // Re-export specific logic types that UI might need directly
@@ -104,7 +104,9 @@ pub struct Backend;
     all(target_os = "linux", feature = "qt")
 )))]
 impl Backend {
-    pub fn new<F>(_app_id: &str, _bootstrap: F) -> Self { Backend }
+    pub fn new<F>(_app_id: &str, _bootstrap: F) -> Self {
+        Backend
+    }
     pub fn run(&self) {}
 }
 

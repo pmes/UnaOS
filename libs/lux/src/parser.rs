@@ -14,7 +14,7 @@
 // You should have received a copy of the GNU Lesser General Public License
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-use crate::{error::LuxError, RgbBuffer};
+use crate::{RgbBuffer, error::LuxError};
 use rayon::prelude::*;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -111,29 +111,44 @@ pub fn parse_arw(mmap: &[u8]) -> Result<RgbBuffer, LuxError> {
             let count = endianness.read_u32(&mmap[entry_offset + 4..entry_offset + 8]);
 
             // TIFF format: if data size <= 4 bytes, it's stored inline. Otherwise it's an offset.
-            let mut value_or_offset = endianness.read_u32(&mmap[entry_offset + 8..entry_offset + 12]);
+            let mut value_or_offset =
+                endianness.read_u32(&mmap[entry_offset + 8..entry_offset + 12]);
 
             // If it's a SHORT (type 3) and it's stored inline (count 1 or 2), we only want the actual short values.
             // When reading a 2-byte short inline from a 4-byte slot, big-endian places it at the start,
             // while little-endian places it at the end.
             if field_type == 3 && count == 1 {
-                 if endianness == Endianness::Big {
-                      value_or_offset = (value_or_offset >> 16) & 0xFFFF;
-                 } else {
-                      value_or_offset = value_or_offset & 0xFFFF;
-                 }
+                if endianness == Endianness::Big {
+                    value_or_offset = (value_or_offset >> 16) & 0xFFFF;
+                } else {
+                    value_or_offset = value_or_offset & 0xFFFF;
+                }
             }
 
             // Simplified extraction logic for critical tags
             match tag {
-                256 => width = value_or_offset, // ImageWidth
-                257 => height = value_or_offset, // ImageLength
+                256 => width = value_or_offset,              // ImageWidth
+                257 => height = value_or_offset,             // ImageLength
                 259 => compression = value_or_offset as u16, // Compression
-                273 => { // StripOffsets
-                    strip_offsets = extract_array(&endianness, mmap, field_type, count, endianness.read_u32(&mmap[entry_offset + 8..entry_offset + 12]))?;
+                273 => {
+                    // StripOffsets
+                    strip_offsets = extract_array(
+                        &endianness,
+                        mmap,
+                        field_type,
+                        count,
+                        endianness.read_u32(&mmap[entry_offset + 8..entry_offset + 12]),
+                    )?;
                 }
-                279 => { // StripByteCounts
-                    strip_byte_counts = extract_array(&endianness, mmap, field_type, count, endianness.read_u32(&mmap[entry_offset + 8..entry_offset + 12]))?;
+                279 => {
+                    // StripByteCounts
+                    strip_byte_counts = extract_array(
+                        &endianness,
+                        mmap,
+                        field_type,
+                        count,
+                        endianness.read_u32(&mmap[entry_offset + 8..entry_offset + 12]),
+                    )?;
                 }
                 _ => {}
             }
@@ -146,7 +161,9 @@ pub fn parse_arw(mmap: &[u8]) -> Result<RgbBuffer, LuxError> {
         // Very basic heuristic for finding the raw IFD - typically IFD0 contains subIFDs or is raw itself.
         // For Sony ARW, we usually find raw image data in one of the SubIFDs or IFD0.
         // For simplicity, let's assume we're looking for the uncompressed or ARW2 lossless data.
-        if !strip_offsets.is_empty() && (compression == 1 || compression == 32769 || compression == 32767) {
+        if !strip_offsets.is_empty()
+            && (compression == 1 || compression == 32769 || compression == 32767)
+        {
             found_raw = true;
             break; // Stop when we find a potentially raw IFD
         }
@@ -193,15 +210,21 @@ pub fn parse_arw(mmap: &[u8]) -> Result<RgbBuffer, LuxError> {
     })
 }
 
-fn extract_array(endianness: &Endianness, mmap: &[u8], field_type: u16, count: u32, value_or_offset: u32) -> Result<Vec<u32>, LuxError> {
+fn extract_array(
+    endianness: &Endianness,
+    mmap: &[u8],
+    field_type: u16,
+    count: u32,
+    value_or_offset: u32,
+) -> Result<Vec<u32>, LuxError> {
     if count == 1 {
         let mut inline_val = value_or_offset;
         if field_type == 3 {
-             if *endianness == Endianness::Big {
-                  inline_val = (inline_val >> 16) & 0xFFFF;
-             } else {
-                  inline_val = inline_val & 0xFFFF;
-             }
+            if *endianness == Endianness::Big {
+                inline_val = (inline_val >> 16) & 0xFFFF;
+            } else {
+                inline_val = inline_val & 0xFFFF;
+            }
         }
         return Ok(vec![inline_val]);
     }
@@ -215,7 +238,7 @@ fn extract_array(endianness: &Endianness, mmap: &[u8], field_type: u16, count: u
             return Err(LuxError::CorruptData);
         }
         for i in 0..count as usize {
-            vec.push(endianness.read_u16(&mmap[offset + i*2..]) as u32);
+            vec.push(endianness.read_u16(&mmap[offset + i * 2..]) as u32);
         }
     } else if field_type == 4 {
         // u32 array
@@ -223,21 +246,26 @@ fn extract_array(endianness: &Endianness, mmap: &[u8], field_type: u16, count: u
             return Err(LuxError::CorruptData);
         }
         for i in 0..count as usize {
-            vec.push(endianness.read_u32(&mmap[offset + i*4..]));
+            vec.push(endianness.read_u32(&mmap[offset + i * 4..]));
         }
     } else {
-         return Err(LuxError::CorruptData); // Simplification: we only handle u16 or u32
+        return Err(LuxError::CorruptData); // Simplification: we only handle u16 or u32
     }
 
     Ok(vec)
 }
 
-fn decompress_raw<'a>(compression: u16, data: &'a [u8], width: u32, height: u32) -> Result<BayerData<'a>, LuxError> {
+fn decompress_raw<'a>(
+    compression: u16,
+    data: &'a [u8],
+    width: u32,
+    height: u32,
+) -> Result<BayerData<'a>, LuxError> {
     if compression == 1 {
         // Uncompressed (Zero-Copy)
         let pixel_count = (width * height) as usize;
         if data.len() < pixel_count * 2 {
-             return Err(LuxError::CorruptData);
+            return Err(LuxError::CorruptData);
         }
         // Zero-copy representation. The slice itself is returned.
         Ok(BayerData::Uncompressed(data))
@@ -277,7 +305,9 @@ fn decompress_raw<'a>(compression: u16, data: &'a [u8], width: u32, height: u32)
         let mut pixels_decoded = 0;
 
         while pixels_decoded < pixel_count {
-            if bit_offset + 4 + 11 > data_len_bits { break; } // Not enough for block header
+            if bit_offset + 4 + 11 > data_len_bits {
+                break;
+            } // Not enough for block header
 
             let _table_idx = read_bits(&mut bit_offset, 4).unwrap(); // In a real codec, dictates delta bit-width
             let mut current_val = read_bits(&mut bit_offset, 11).unwrap() as u16;
@@ -288,7 +318,9 @@ fn decompress_raw<'a>(compression: u16, data: &'a [u8], width: u32, height: u32)
             pixels_decoded += 1;
 
             for _ in 0..15 {
-                if pixels_decoded >= pixel_count { break; }
+                if pixels_decoded >= pixel_count {
+                    break;
+                }
 
                 if let Some(delta_raw) = read_bits(&mut bit_offset, 7) {
                     // Sign extend 7-bit delta (bit 6 is sign bit)
@@ -329,60 +361,78 @@ fn demosaic_bilinear(bayer: &BayerData<'_>, width: usize, height: usize) -> Vec<
     // If it's a 12-bit raw, this would need to be 4095.0, but we assume 14-bit for Sony.
     let max_val = 16383.0f32;
 
-    rgb.par_chunks_exact_mut(width * 3).enumerate().for_each(|(y, row)| {
-        for x in 0..width {
-            let r;
-            let g;
-            let b;
+    rgb.par_chunks_exact_mut(width * 3)
+        .enumerate()
+        .for_each(|(y, row)| {
+            for x in 0..width {
+                let r;
+                let g;
+                let b;
 
-            let idx = |cx: isize, cy: isize| {
-                let cy_clamped = cy.clamp(0, (height - 1) as isize) as usize;
-                let cx_clamped = cx.clamp(0, (width - 1) as isize) as usize;
-                bayer.get_pixel(cy_clamped * width + cx_clamped) as f32
-            };
+                let idx = |cx: isize, cy: isize| {
+                    let cy_clamped = cy.clamp(0, (height - 1) as isize) as usize;
+                    let cx_clamped = cx.clamp(0, (width - 1) as isize) as usize;
+                    bayer.get_pixel(cy_clamped * width + cx_clamped) as f32
+                };
 
-            // Assuming RGGB Bayer Pattern
-            // Even Row: R G R G
-            // Odd Row:  G B G B
-            let is_even_row = y % 2 == 0;
-            let is_even_col = x % 2 == 0;
+                // Assuming RGGB Bayer Pattern
+                // Even Row: R G R G
+                // Odd Row:  G B G B
+                let is_even_row = y % 2 == 0;
+                let is_even_col = x % 2 == 0;
 
-            let x_i = x as isize;
-            let y_i = y as isize;
+                let x_i = x as isize;
+                let y_i = y as isize;
 
-            if is_even_row {
-                if is_even_col {
-                    // Pixel is Red
-                    r = idx(x_i, y_i);
-                    g = (idx(x_i - 1, y_i) + idx(x_i + 1, y_i) + idx(x_i, y_i - 1) + idx(x_i, y_i + 1)) / 4.0;
-                    b = (idx(x_i - 1, y_i - 1) + idx(x_i + 1, y_i - 1) + idx(x_i - 1, y_i + 1) + idx(x_i + 1, y_i + 1)) / 4.0;
+                if is_even_row {
+                    if is_even_col {
+                        // Pixel is Red
+                        r = idx(x_i, y_i);
+                        g = (idx(x_i - 1, y_i)
+                            + idx(x_i + 1, y_i)
+                            + idx(x_i, y_i - 1)
+                            + idx(x_i, y_i + 1))
+                            / 4.0;
+                        b = (idx(x_i - 1, y_i - 1)
+                            + idx(x_i + 1, y_i - 1)
+                            + idx(x_i - 1, y_i + 1)
+                            + idx(x_i + 1, y_i + 1))
+                            / 4.0;
+                    } else {
+                        // Pixel is Green (Red row)
+                        r = (idx(x_i - 1, y_i) + idx(x_i + 1, y_i)) / 2.0;
+                        g = idx(x_i, y_i);
+                        b = (idx(x_i, y_i - 1) + idx(x_i, y_i + 1)) / 2.0;
+                    }
                 } else {
-                    // Pixel is Green (Red row)
-                    r = (idx(x_i - 1, y_i) + idx(x_i + 1, y_i)) / 2.0;
-                    g = idx(x_i, y_i);
-                    b = (idx(x_i, y_i - 1) + idx(x_i, y_i + 1)) / 2.0;
+                    if is_even_col {
+                        // Pixel is Green (Blue row)
+                        r = (idx(x_i, y_i - 1) + idx(x_i, y_i + 1)) / 2.0;
+                        g = idx(x_i, y_i);
+                        b = (idx(x_i - 1, y_i) + idx(x_i + 1, y_i)) / 2.0;
+                    } else {
+                        // Pixel is Blue
+                        r = (idx(x_i - 1, y_i - 1)
+                            + idx(x_i + 1, y_i - 1)
+                            + idx(x_i - 1, y_i + 1)
+                            + idx(x_i + 1, y_i + 1))
+                            / 4.0;
+                        g = (idx(x_i - 1, y_i)
+                            + idx(x_i + 1, y_i)
+                            + idx(x_i, y_i - 1)
+                            + idx(x_i, y_i + 1))
+                            / 4.0;
+                        b = idx(x_i, y_i);
+                    }
                 }
-            } else {
-                if is_even_col {
-                    // Pixel is Green (Blue row)
-                    r = (idx(x_i, y_i - 1) + idx(x_i, y_i + 1)) / 2.0;
-                    g = idx(x_i, y_i);
-                    b = (idx(x_i - 1, y_i) + idx(x_i + 1, y_i)) / 2.0;
-                } else {
-                    // Pixel is Blue
-                    r = (idx(x_i - 1, y_i - 1) + idx(x_i + 1, y_i - 1) + idx(x_i - 1, y_i + 1) + idx(x_i + 1, y_i + 1)) / 4.0;
-                    g = (idx(x_i - 1, y_i) + idx(x_i + 1, y_i) + idx(x_i, y_i - 1) + idx(x_i, y_i + 1)) / 4.0;
-                    b = idx(x_i, y_i);
-                }
+
+                // Normalize and store
+                let pixel_idx = x * 3;
+                row[pixel_idx] = r / max_val;
+                row[pixel_idx + 1] = g / max_val;
+                row[pixel_idx + 2] = b / max_val;
             }
-
-            // Normalize and store
-            let pixel_idx = x * 3;
-            row[pixel_idx] = r / max_val;
-            row[pixel_idx + 1] = g / max_val;
-            row[pixel_idx + 2] = b / max_val;
-        }
-    });
+        });
 
     rgb
 }

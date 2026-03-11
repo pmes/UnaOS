@@ -15,16 +15,16 @@
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 use anyhow::{Context, Result};
-use bandy::{SMessage, BandyMember};
+use bandy::{BandyMember, SMessage};
 #[cfg(feature = "gtk4")]
 use gtk4::prelude::*;
 #[cfg(feature = "gtk4")]
 use gtk4::{Align, Box, Label, Orientation, Widget};
 
 // Gix (Gitoxide) Imports
-use gix::{discover};
-use gix::object::tree::diff::Change;
+use gix::discover;
 use gix::object::tree::diff::Action;
+use gix::object::tree::diff::Change;
 
 #[cfg(feature = "gtk4")]
 pub fn create_view() -> Widget {
@@ -59,7 +59,10 @@ impl Vaire {
         let repo = discover(".").context("No repository found")?;
         let head = repo.head()?;
 
-        let branch = head.referent_name().map(|n| n.as_bstr().to_string()).unwrap_or_else(|| "DETACHED".to_string());
+        let branch = head
+            .referent_name()
+            .map(|n| n.as_bstr().to_string())
+            .unwrap_or_else(|| "DETACHED".to_string());
 
         let commit_id = head.id().context("Head has no commit")?;
         let commit = commit_id.to_hex().to_string().chars().take(7).collect();
@@ -77,16 +80,14 @@ impl Vaire {
     /// Handles an incoming SMessage.
     pub fn handle_message(msg: &SMessage) -> Option<SMessage> {
         match msg {
-            SMessage::GetDiff { commit_a, commit_b } => {
-                match Self::get_diff(commit_a, commit_b) {
-                    Ok(diff) => Some(SMessage::DiffPayload { diff }),
-                    Err(e) => Some(SMessage::Log {
-                        level: "ERROR".to_string(),
-                        source: "Vaire".to_string(),
-                        content: format!("Diff failed: {}", e),
-                    }),
-                }
-            }
+            SMessage::GetDiff { commit_a, commit_b } => match Self::get_diff(commit_a, commit_b) {
+                Ok(diff) => Some(SMessage::DiffPayload { diff }),
+                Err(e) => Some(SMessage::Log {
+                    level: "ERROR".to_string(),
+                    source: "Vaire".to_string(),
+                    content: format!("Diff failed: {}", e),
+                }),
+            },
             _ => None,
         }
     }
@@ -106,7 +107,8 @@ impl Vaire {
 
         // Execute the pure-Rust tree diff provided by `gix`.
         // We use tree_a.changes().for_each_to_obtain_tree(&tree_b, ...)
-        tree_a.changes()?
+        tree_a
+            .changes()?
             .for_each_to_obtain_tree(&tree_b, |change| {
                 match change {
                     Change::Addition { location, .. } => {

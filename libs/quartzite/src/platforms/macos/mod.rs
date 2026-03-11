@@ -15,14 +15,15 @@
 // You should have received a copy of the GNU Lesser General Public License
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-
 use objc2::rc::Retained;
-use objc2::{define_class, msg_send, MainThreadOnly, DeclaredClass};
+use objc2::{DeclaredClass, MainThreadOnly, define_class, msg_send};
 use objc2_app_kit::{
-    NSApplication, NSApplicationActivationPolicy, NSApplicationDelegate, NSWindow,
-    NSWindowStyleMask, NSBackingStoreType, NSWindowTitleVisibility, NSToolbar,
+    NSApplication, NSApplicationActivationPolicy, NSApplicationDelegate, NSBackingStoreType,
+    NSToolbar, NSWindow, NSWindowStyleMask, NSWindowTitleVisibility,
 };
-use objc2_foundation::{MainThreadMarker, NSObject, NSObjectProtocol, NSPoint, NSRect, NSSize, NSString};
+use objc2_foundation::{
+    MainThreadMarker, NSObject, NSObjectProtocol, NSPoint, NSRect, NSSize, NSString,
+};
 use std::cell::RefCell;
 use std::sync::Once;
 
@@ -103,7 +104,8 @@ define_class!(
             window.center();
 
             // 2. Extract bootstrap closure
-            let bootstrap = BOOTSTRAP_CLOSURE.with(|b| b.borrow_mut().take())
+            let bootstrap = BOOTSTRAP_CLOSURE
+                .with(|b| b.borrow_mut().take())
                 .expect("CRITICAL: Bootstrap closure missing during macOS ignition sequence.");
 
             // 3. Execute bootstrap
@@ -126,7 +128,10 @@ define_class!(
         }
 
         #[unsafe(method(applicationShouldTerminateAfterLastWindowClosed:))]
-        fn application_should_terminate_after_last_window_closed(&self, _sender: &NSApplication) -> bool {
+        fn application_should_terminate_after_last_window_closed(
+            &self,
+            _sender: &NSApplication,
+        ) -> bool {
             true
         }
     }
@@ -151,7 +156,7 @@ pub struct Backend {
 impl Backend {
     pub fn new<F>(_app_id: &str, bootstrap_fn: F) -> Self
     where
-        F: FnOnce(&NativeWindow) -> NativeView + 'static
+        F: FnOnce(&NativeWindow) -> NativeView + 'static,
     {
         // 1. Store the bootstrap closure for the delegate to pick up later.
         BOOTSTRAP_CLOSURE.with(|b| {
@@ -164,7 +169,8 @@ impl Backend {
         // 2. Set Activation Policy (Regular App)
         // CRITICAL FIX: explicit boolean return capture prevents runtime signature mismatch panic.
         unsafe {
-            let success: bool = msg_send![&app, setActivationPolicy: NSApplicationActivationPolicy::Regular];
+            let success: bool =
+                msg_send![&app, setActivationPolicy: NSApplicationActivationPolicy::Regular];
             if !success {
                 println!("[UnaOS::Quartzite] WARNING: Failed to set activation policy.");
             }
@@ -179,7 +185,7 @@ impl Backend {
 
         Backend {
             _app: app,
-            _delegate: delegate
+            _delegate: delegate,
         }
     }
 

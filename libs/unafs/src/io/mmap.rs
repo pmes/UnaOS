@@ -14,10 +14,10 @@
 // You should have received a copy of the GNU Lesser General Public License
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
+use gneiss_pal::io::MemoryMappedRegion;
+use memmap2::Mmap;
 use std::fs::File;
 use std::path::Path;
-use memmap2::Mmap;
-use gneiss_pal::io::MemoryMappedRegion;
 
 /// UnaFS's implementation of a memory-mapped file.
 ///

@@ -15,7 +15,6 @@
 // You should have received a copy of the GNU Lesser General Public License
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-
 use gtk4::prelude::*;
 #[cfg(feature = "gnome")]
 use libadwaita as adw;
@@ -29,7 +28,7 @@ use std::cell::RefCell;
 use std::rc::Rc;
 use std::time::Instant;
 
-use crate::{NativeWindow, NativeView};
+use crate::{NativeView, NativeWindow};
 
 pub mod spline;
 
@@ -94,7 +93,8 @@ impl Backend {
             // Execute bootstrap if available
             if let Some(bootstrap) = bootstrap_option.borrow_mut().take() {
                 #[cfg(feature = "gnome")]
-                let content: NativeView = (bootstrap)(window.upcast_ref::<gtk4::ApplicationWindow>());
+                let content: NativeView =
+                    (bootstrap)(window.upcast_ref::<gtk4::ApplicationWindow>());
                 #[cfg(not(feature = "gnome"))]
                 let content: NativeView = (bootstrap)(&window);
 

@@ -57,7 +57,9 @@ impl Spline {
         _rx_telemetry: async_channel::Receiver<bandy::SMessage>,
     ) -> NativeView {
         #[cfg(any(all(target_os = "linux", feature = "gtk"), target_os = "macos"))]
-        return self.inner.bootstrap(_window, _tx_event, _rx_gui, _rx_telemetry);
+        return self
+            .inner
+            .bootstrap(_window, _tx_event, _rx_gui, _rx_telemetry);
 
         #[cfg(all(target_os = "linux", feature = "qt"))]
         {
@@ -75,7 +77,11 @@ impl Spline {
             };
         }
 
-        #[cfg(not(any(all(target_os = "linux", feature = "gtk"), target_os = "macos", all(target_os = "linux", feature = "qt"))))]
+        #[cfg(not(any(
+            all(target_os = "linux", feature = "gtk"),
+            target_os = "macos",
+            all(target_os = "linux", feature = "qt")
+        )))]
         return (); // Fallback
     }
 }

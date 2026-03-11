@@ -91,7 +91,10 @@ impl Query {
 
                 base_query.secondary_filters.push((key, val_str));
             } else {
-                return Err(format!("Secondary filters must use '==' operator. Got: {}", filter_str));
+                return Err(format!(
+                    "Secondary filters must use '==' operator. Got: {}",
+                    filter_str
+                ));
             }
         }
 

@@ -57,7 +57,7 @@ pub enum GuiUpdate {
     TokenUsage(i32, i32, i32), // Prompt, Candidates, Total
     ActiveDirective(String),
     ReviewPayload(PreFlightPayload), // The Interceptor
-    SynapseError(String), // Discrete failure signal
+    SynapseError(String),            // Discrete failure signal
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -97,7 +97,7 @@ pub enum Event {
     UploadRequest,         // Kept for compatibility
     FileSelected(PathBuf), // File Upload Selection
     ToggleSidebar,
-    LoadHistory,           // Fetch history when scrolling to top
+    LoadHistory, // Fetch history when scrolling to top
     // --- ELESSAR EVENTS ---
     MatrixFileClick(PathBuf), // File Tree Click
     AuleIgnite,               // Forge Action

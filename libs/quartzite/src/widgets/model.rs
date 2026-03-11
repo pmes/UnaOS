@@ -124,7 +124,10 @@ impl DispatchObject {
             .property("id", id)
             .property("sender", "Architect")
             .property("subject", "Pre-Flight Payload")
-            .property("timestamp", chrono::Local::now().format("%H:%M:%S").to_string())
+            .property(
+                "timestamp",
+                chrono::Local::now().format("%H:%M:%S").to_string(),
+            )
             .property("content", "Staging Payload")
             .property("is-chat", true)
             .property("is-expanded", false)
@@ -142,7 +145,10 @@ impl DispatchObject {
             .property("id", id)
             .property("sender", "Una-Prime")
             .property("subject", "Pulse")
-            .property("timestamp", chrono::Local::now().format("%H:%M:%S").to_string())
+            .property(
+                "timestamp",
+                chrono::Local::now().format("%H:%M:%S").to_string(),
+            )
             .property("content", "...")
             .property("is-chat", true)
             .property("is-expanded", false)

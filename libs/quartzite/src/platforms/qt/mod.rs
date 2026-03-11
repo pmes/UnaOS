@@ -21,8 +21,8 @@
 //! This module will bridge UnaOS to the Qt ecosystem, providing a
 //! high-performance alternative to GTK on Linux and BSD hosts.
 
-pub mod window;
 pub mod vein_bridge;
+pub mod window;
 
 pub use window::Backend;
 

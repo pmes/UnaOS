@@ -15,18 +15,17 @@
 // You should have received a copy of the GNU Lesser General Public License
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-
-use gtk4::prelude::*;
-use libadwaita::prelude::*;
-use libadwaita as adw;
-use gtk4::{Application, ApplicationWindow};
-use std::rc::Rc;
-use std::cell::RefCell;
-use log::info;
-use std::time::Instant;
 use async_channel::Receiver;
+use gtk4::prelude::*;
+use gtk4::{Application, ApplicationWindow};
+use libadwaita as adw;
+use libadwaita::prelude::*;
+use log::info;
+use std::cell::RefCell;
+use std::rc::Rc;
+use std::time::Instant;
 
-use gneiss_pal::{Event, GuiUpdate, AppHandler};
+use gneiss_pal::{AppHandler, Event, GuiUpdate};
 
 pub struct Backend<A: AppHandler> {
     #[allow(dead_code)]
@@ -38,21 +37,25 @@ pub struct Backend<A: AppHandler> {
 impl<A: AppHandler> Backend<A> {
     // S40: Updated signature to accept bootstrap_fn
     pub fn new<F>(app_id: &str, app_handler: A, rx: Receiver<GuiUpdate>, bootstrap_fn: F) -> Self
-    where F: Fn(&ApplicationWindow, async_channel::Sender<Event>, Receiver<GuiUpdate>) -> gtk4::Widget + 'static
+    where
+        F: Fn(
+                &ApplicationWindow,
+                async_channel::Sender<Event>,
+                Receiver<GuiUpdate>,
+            ) -> gtk4::Widget
+            + 'static,
     {
-        let app = Application::builder()
-            .application_id(app_id)
-            .build();
+        let app = Application::builder().application_id(app_id).build();
 
         // Initialize Libadwaita
         app.connect_startup(|_| {
             adw::init().unwrap();
 
-             // S40: Register Icon Theme Protocol
-             if let Some(display) = gtk4::gdk::Display::default() {
-                 let icon_theme = gtk4::IconTheme::for_display(&display);
-                 icon_theme.add_resource_path("/org/una/vein/icons");
-             }
+            // S40: Register Icon Theme Protocol
+            if let Some(display) = gtk4::gdk::Display::default() {
+                let icon_theme = gtk4::IconTheme::for_display(&display);
+                icon_theme.add_resource_path("/org/una/vein/icons");
+            }
         });
 
         let app_handler_rc = Rc::new(RefCell::new(app_handler));
@@ -71,7 +74,12 @@ impl<A: AppHandler> Backend<A> {
         let rx_clone = rx.clone(); // Clone channel receiver (async-channel is multi-consumer)
 
         app.connect_activate(move |app| {
-            build_ui(app, rx_clone.clone(), bootstrap_rc.clone(), tx_event.clone());
+            build_ui(
+                app,
+                rx_clone.clone(),
+                bootstrap_rc.clone(),
+                tx_event.clone(),
+            );
         });
         app.run();
 
@@ -86,9 +94,10 @@ fn build_ui<F>(
     app: &Application,
     rx: Receiver<GuiUpdate>,
     bootstrap: Rc<F>,
-    tx_event: async_channel::Sender<Event>
-)
-where F: Fn(&ApplicationWindow, async_channel::Sender<Event>, Receiver<GuiUpdate>) -> gtk4::Widget + 'static
+    tx_event: async_channel::Sender<Event>,
+) where
+    F: Fn(&ApplicationWindow, async_channel::Sender<Event>, Receiver<GuiUpdate>) -> gtk4::Widget
+        + 'static,
 {
     let ui_build_start_time = Instant::now();
     info!("UI_BUILD: Starting build_ui function (Adwaita Spline).");
@@ -117,7 +126,10 @@ where F: Fn(&ApplicationWindow, async_channel::Sender<Event>, Receiver<GuiUpdate
     window.set_content(Some(&content));
 
     window.present();
-    info!("UI_BUILD: Window presented. Total build_ui duration: {:?}", ui_build_start_time.elapsed());
+    info!(
+        "UI_BUILD: Window presented. Total build_ui duration: {:?}",
+        ui_build_start_time.elapsed()
+    );
 }
 
 pub mod mega_bar;

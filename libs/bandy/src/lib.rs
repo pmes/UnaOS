@@ -22,6 +22,19 @@ use std::path::PathBuf;
 use std::sync::Arc;
 pub use synapse::Synapse;
 
+/// DispatchRecord
+/// Represents a semantic memory entry.
+/// Shared between Vein and Amber Bytes.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DispatchRecord {
+    pub id: String,
+    pub sender: String,
+    pub subject: String,
+    pub timestamp: String,
+    pub content: String,
+    pub is_chat: bool,
+}
+
 /// WeightedSkeleton
 ///
 /// A struct representing a scored, prioritized code skeleton.
@@ -96,6 +109,39 @@ pub enum SMessage {
     FileEvent {
         path: String,
         event: String,
+    },
+
+    // --- AMBER BYTES (The Storage Rune) ---
+    StorageQuery {
+        receipt_id: u64,
+        embedding: Vec<f32>,
+    },
+    StorageQueryResult {
+        receipt_id: u64,
+        memories: Vec<String>,
+        directives: Vec<String>,
+        engrams: Vec<String>,
+        chrono: Vec<String>,
+    },
+    StorageSave {
+        receipt_id: u64,
+        sender: String,
+        content: String,
+        timestamp: String,
+        embedding: Vec<f32>,
+        memory_type: String,
+    },
+    StorageSaveResult {
+        receipt_id: u64,
+        success: bool,
+        error: Option<String>,
+    },
+    StorageLoadAll {
+        receipt_id: u64,
+    },
+    StorageLoadAllResult {
+        receipt_id: u64,
+        records: Vec<DispatchRecord>,
     },
 
     // --- MIDDEN (The Terminal) ---
