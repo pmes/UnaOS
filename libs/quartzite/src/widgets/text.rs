@@ -17,7 +17,7 @@
 #[cfg(target_os = "linux")]
 use gtk4::prelude::*;
 #[cfg(target_os = "linux")]
-use gtk4::{TextView, TextBuffer, ScrolledWindow, PolicyType, WrapMode};
+use gtk4::{PolicyType, ScrolledWindow, TextBuffer, TextView, WrapMode};
 
 // Platform-agnostic struct wrapper (inner fields depend on OS)
 pub struct ScrollableText {
@@ -75,7 +75,9 @@ impl ScrollableText {
     #[cfg(target_os = "linux")]
     pub fn scroll_to_bottom(&self) {
         // Create a mark at the end and scroll to it
-        let mark = self.buffer.create_mark(None, &self.buffer.end_iter(), false);
+        let mark = self
+            .buffer
+            .create_mark(None, &self.buffer.end_iter(), false);
         self.view.scroll_to_mark(&mark, 0.0, false, 0.0, 1.0);
     }
 }

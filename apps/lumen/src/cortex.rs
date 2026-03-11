@@ -52,7 +52,10 @@ impl Cortex {
             content: format!("Deep subconscious online at {}", vault_path.display()),
         });
 
-        Self { _vault_path: vault_path, fs }
+        Self {
+            _vault_path: vault_path,
+            fs,
+        }
     }
 
     /// Burns a raw memory into the UnaFS Substrate.

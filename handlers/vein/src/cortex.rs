@@ -14,14 +14,14 @@
 // You should have received a copy of the GNU Lesser General Public License
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-use unafs::io::MappedFile;
+use bandy::{MatrixEvent, SMessage, SpatialEdge, SpatialNode};
 use elessar::context::SkeletonGenerator;
 use gneiss_pal::io::MemoryMappedRegion;
-use bandy::{SMessage, MatrixEvent, SpatialNode, SpatialEdge};
+use log::info;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use log::info;
+use unafs::io::MappedFile;
 
 /// Ingests a source file into the AI Cortex's memory matrix.
 ///
@@ -41,7 +41,8 @@ pub fn ingest_for_lumen(file_path: &Path) -> Result<String, String> {
     // We extract the UTF-8 slice using the pure-Rust trait.
     // Vein doesn't care that this is a memory-mapped file; it only
     // cares that the contract is fulfilled.
-    let source_code = mapped_region.as_str()
+    let source_code = mapped_region
+        .as_str()
         .map_err(|_| "Cortex encountered invalid UTF-8".to_string())?;
 
     // 3. THE MIND (Elessar)
@@ -117,15 +118,35 @@ async fn scan_workspace(root: &Path, synapse: &bandy::Synapse) -> HashMap<PathBu
                         // REMOVED: The hardcoded bandy focus
                     }
                     Err(e) => {
-                        synapse.fire_async(SMessage::Log { level: "WARN".into(), source: "Cortex".into(), content: e }).await;
+                        synapse
+                            .fire_async(SMessage::Log {
+                                level: "WARN".into(),
+                                source: "Cortex".into(),
+                                content: e,
+                            })
+                            .await;
                     }
                 }
             }
         }
     }
 
-    synapse.fire_async(SMessage::Matrix(MatrixEvent::IngestTopology { nodes: spatial_nodes, edges: spatial_edges })).await;
-    synapse.fire_async(SMessage::Log { level: "INFO".into(), source: "Cortex".into(), content: format!("Workspace Indexed. Generated {} AST Skeletons.", total_skeletons) }).await;
+    synapse
+        .fire_async(SMessage::Matrix(MatrixEvent::IngestTopology {
+            nodes: spatial_nodes,
+            edges: spatial_edges,
+        }))
+        .await;
+    synapse
+        .fire_async(SMessage::Log {
+            level: "INFO".into(),
+            source: "Cortex".into(),
+            content: format!(
+                "Workspace Indexed. Generated {} AST Skeletons.",
+                total_skeletons
+            ),
+        })
+        .await;
 
     // Return the raw cache
     skeleton_cache

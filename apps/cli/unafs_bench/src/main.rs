@@ -18,14 +18,16 @@ use anyhow::{Context, Result};
 use rand::Rng;
 use std::fs;
 use std::time::Instant;
-use unafs::{AttributeValue, FileDevice, FileSystem, BLOCK_SIZE};
+use unafs::{AttributeValue, BLOCK_SIZE, FileDevice, FileSystem};
 
 fn main() -> Result<()> {
     println!("================================================================================");
     println!(":: UNAFS CAN-AM BENCHMARK (STRESS TEST) ::");
     println!("================================================================================");
 
-    let vault_dir = dirs::data_local_dir().unwrap_or_else(|| std::path::PathBuf::from(".")).join("unaos");
+    let vault_dir = dirs::data_local_dir()
+        .unwrap_or_else(|| std::path::PathBuf::from("."))
+        .join("unaos");
     fs::create_dir_all(&vault_dir)?;
     let disk_path = vault_dir.join("bench_vault.img");
 
@@ -47,7 +49,10 @@ fn main() -> Result<()> {
     let root_id = fs.superblock.root_inode;
     let num_inodes = 10_000;
 
-    println!("-> Firing loop to rapidly create {} blank Inodes...", num_inodes);
+    println!(
+        "-> Firing loop to rapidly create {} blank Inodes...",
+        num_inodes
+    );
 
     let mut rng = rand::thread_rng();
     let types = ["engram", "directive", "noise"];
@@ -55,7 +60,9 @@ fn main() -> Result<()> {
     let start_time = Instant::now();
     for i in 0..num_inodes {
         let filename = format!("file_{}.txt", i);
-        let inode_id = fs.create_file(root_id, filename).context("Failed to create file")?;
+        let inode_id = fs
+            .create_file(root_id, filename)
+            .context("Failed to create file")?;
 
         let mut vec_data = Vec::with_capacity(384);
         for _ in 0..384 {
@@ -64,10 +71,18 @@ fn main() -> Result<()> {
 
         let type_str = types[i % 3].to_string();
 
-        fs.set_attribute(inode_id, "embedding".to_string(), AttributeValue::Vector(vec_data))
-            .context("Failed to set embedding")?;
-        fs.set_attribute(inode_id, "type".to_string(), AttributeValue::String(type_str))
-            .context("Failed to set type")?;
+        fs.set_attribute(
+            inode_id,
+            "embedding".to_string(),
+            AttributeValue::Vector(vec_data),
+        )
+        .context("Failed to set embedding")?;
+        fs.set_attribute(
+            inode_id,
+            "type".to_string(),
+            AttributeValue::String(type_str),
+        )
+        .context("Failed to set type")?;
 
         if i > 0 && i % 1000 == 0 {
             println!("   ... created {} inodes", i);
@@ -94,8 +109,17 @@ fn main() -> Result<()> {
     // Verify
     // A quick way to verify inode count is to list the root directory
     let root_entries = fs.ls(root_id)?;
-    assert_eq!(root_entries.len(), num_inodes, "Cold-Boot failed! Expected {} inodes, found {}", num_inodes, root_entries.len());
-    println!("-> Cold-Boot verification passed! Recovered {} inodes.", root_entries.len());
+    assert_eq!(
+        root_entries.len(),
+        num_inodes,
+        "Cold-Boot failed! Expected {} inodes, found {}",
+        num_inodes,
+        root_entries.len()
+    );
+    println!(
+        "-> Cold-Boot verification passed! Recovered {} inodes.",
+        root_entries.len()
+    );
 
     // Action 3: The Vector Gravity Slalom
     println!("-> Executing heavy compound query...");
@@ -107,7 +131,10 @@ fn main() -> Result<()> {
     let vec_str = format!("{:?}", target_vec);
 
     // Using a lower threshold for benchmarking so it actually returns some results out of random vectors
-    let query_str = format!("similarity(embedding, {}) > -1.0 AND type == \"engram\"", vec_str);
+    let query_str = format!(
+        "similarity(embedding, {}) > -1.0 AND type == \"engram\"",
+        vec_str
+    );
 
     let query_start = Instant::now();
     let results = fs.query(&query_str)?;
@@ -118,14 +145,24 @@ fn main() -> Result<()> {
     let mut valid_count = 0;
     for (inode, score) in results {
         if let Some(AttributeValue::String(t)) = inode.attributes.get("type") {
-            assert_eq!(t, "engram", "Query corruption! Found type {} instead of engram", t);
+            assert_eq!(
+                t, "engram",
+                "Query corruption! Found type {} instead of engram",
+                t
+            );
             valid_count += 1;
         } else {
-            panic!("Query corruption! Inode {} missing 'type' attribute", inode.id);
+            panic!(
+                "Query corruption! Inode {} missing 'type' attribute",
+                inode.id
+            );
         }
     }
 
-    assert!(valid_count > 0, "Expected at least 1 result from -1.0 similarity threshold.");
+    assert!(
+        valid_count > 0,
+        "Expected at least 1 result from -1.0 similarity threshold."
+    );
 
     // Action 4: Telemetry Output
     println!("\n================================================================================");

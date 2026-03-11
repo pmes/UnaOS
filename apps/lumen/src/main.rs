@@ -19,13 +19,13 @@ mod cortex;
 
 #[allow(unused_imports)]
 use bandy::{SMessage, Synapse, telemetry};
-use gneiss_pal::paths::UnaPaths;
-use quartzite::{self, Backend, NativeWindow, NativeView};
-use std::rc::Rc;
-use vein::VeinHandler;
+use gneiss_pal::AppHandler;
 #[allow(unused_imports)]
 use gneiss_pal::GuiUpdate;
-use gneiss_pal::AppHandler;
+use gneiss_pal::paths::UnaPaths;
+use quartzite::{self, Backend, NativeView, NativeWindow};
+use std::rc::Rc;
+use vein::VeinHandler;
 
 fn main() {
     // 0. Ignite the Substrate Reactor (Tokio)
@@ -37,8 +37,10 @@ fn main() {
     // Spawn Signal Interceptor Task
     let signal_tx = shutdown_tx.clone();
     rt.spawn(async move {
-        let mut sigint = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt()).unwrap();
-        let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).unwrap();
+        let mut sigint =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt()).unwrap();
+        let mut sigterm =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).unwrap();
         tokio::select! {
             _ = sigint.recv() => {
                 log::info!("\n[UNAOS] :: SIGINT Caught. Initiating Graceful Shutdown...\n");
@@ -82,6 +84,13 @@ fn main() {
         core::ignite(cortex_vault, core_synapse, shutdown_rx_core).await;
     });
 
+    // 5.5 Ignite Amber Bytes Storage Rune
+    let amber_synapse = synapse.clone();
+    let amber_vault_path = vein_storage.clone();
+    let amber_handle = rt.spawn(async move {
+        amber_bytes::ignite(amber_vault_path, amber_synapse).await;
+    });
+
     // 6. Ignite the AI Handler (The Conscious Vein)
     let (gui_tx, gui_rx) = async_channel::unbounded();
     // Channels for UI Events (Spline -> Vein)
@@ -92,7 +101,13 @@ fn main() {
     // The `handle_event` method processes events from the UI.
 
     let (shutdown_tx_vein, shutdown_rx_vein) = (shutdown_tx.clone(), shutdown_tx.subscribe());
-    let (vein_handler, bg_handle) = VeinHandler::new(gui_tx, vein_storage, synapse.clone(), telemetry_tx, shutdown_tx_vein);
+    let (vein_handler, bg_handle) = VeinHandler::new(
+        gui_tx,
+        vein_storage,
+        synapse.clone(),
+        telemetry_tx,
+        shutdown_tx_vein,
+    );
 
     // Spawn the Brain Loop
     let brain_loop_handle = rt.spawn(async move {
@@ -121,7 +136,12 @@ fn main() {
     // THE FUSION
     let bootstrap = move |window: &NativeWindow| -> NativeView {
         // 1. Get the Vein UI (The Command Center)
-        let vein_widget = spline.bootstrap(window, event_tx.clone(), gui_rx.clone(), _telemetry_rx.clone());
+        let vein_widget = spline.bootstrap(
+            window,
+            event_tx.clone(),
+            gui_rx.clone(),
+            _telemetry_rx.clone(),
+        );
 
         // 2. Create the HUD (ContextView) - DEPRECATED (Phase 4)
         // The "TeleHUD" sidebar tab is now the sole authorized telemetry view.
@@ -139,5 +159,6 @@ fn main() {
         let _ = brain_loop_handle.await;
         let _ = bg_handle.await;
         let _ = core_handle.await;
+        amber_handle.abort();
     });
 }

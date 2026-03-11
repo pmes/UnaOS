@@ -14,13 +14,13 @@
 // You should have received a copy of the GNU Lesser General Public License
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-use gtk4::prelude::*;
-use gtk4::{
-    gio, glib, Box, Label, ListView, Orientation, PolicyType, ScrolledWindow, SignalListItemFactory,
-    SingleSelection, ListItem, Align, Window, TextView, WrapMode,
-};
-use gtk4::subclass::prelude::ObjectSubclassIsExt; // Required for imp()
 use bandy::WeightedSkeleton;
+use gtk4::prelude::*;
+use gtk4::subclass::prelude::ObjectSubclassIsExt; // Required for imp()
+use gtk4::{
+    Align, Box, Label, ListItem, ListView, Orientation, PolicyType, ScrolledWindow,
+    SignalListItemFactory, SingleSelection, TextView, Window, WrapMode, gio, glib,
+};
 use std::cell::RefCell;
 
 // ==================================================================================
@@ -70,7 +70,12 @@ impl SkeletonObject {
     /// Retrieve a clone of the underlying WeightedSkeleton data.
     /// This is cheap because `WeightedSkeleton` holds an `Arc<String>`.
     pub fn skeleton(&self) -> WeightedSkeleton {
-        self.imp().data.borrow().as_ref().expect("SkeletonObject data missing").clone()
+        self.imp()
+            .data
+            .borrow()
+            .as_ref()
+            .expect("SkeletonObject data missing")
+            .clone()
     }
 }
 
@@ -136,21 +141,31 @@ impl ContextView {
         // Called when a recycled widget is assigned to a new data item.
         factory.connect_bind(move |_factory, item| {
             let list_item = item.downcast_ref::<ListItem>().unwrap();
-            let widget = list_item.child().and_downcast::<Box>().expect("ListItem child is not a Box");
-            let obj = list_item.item().and_downcast::<SkeletonObject>().expect("Item is not SkeletonObject");
+            let widget = list_item
+                .child()
+                .and_downcast::<Box>()
+                .expect("ListItem child is not a Box");
+            let obj = list_item
+                .item()
+                .and_downcast::<SkeletonObject>()
+                .expect("Item is not SkeletonObject");
 
             let data = obj.skeleton();
 
             // Extract labels from the container
             // (Assuming order: Path Label is first, Score Label is second)
-            let path_label = widget.first_child().and_downcast::<Label>().expect("First child is not Label");
-            let score_label = widget.last_child().and_downcast::<Label>().expect("Last child is not Label");
+            let path_label = widget
+                .first_child()
+                .and_downcast::<Label>()
+                .expect("First child is not Label");
+            let score_label = widget
+                .last_child()
+                .and_downcast::<Label>()
+                .expect("Last child is not Label");
 
             // Update UI with Zero-Copy data
             // We only display the filename, not the full path, for brevity.
-            let filename = data.path.file_name()
-                .unwrap_or_default()
-                .to_string_lossy();
+            let filename = data.path.file_name().unwrap_or_default().to_string_lossy();
 
             path_label.set_text(&filename);
             score_label.set_text(&format!("Gravity: {:.2}", data.score));
@@ -167,10 +182,15 @@ impl ContextView {
         // This allows deep inspection of the skeleton without losing context.
         list_view.connect_activate(move |list_view, position| {
             let model = list_view.model().expect("No model in ListView");
-            let selection_model = model.downcast_ref::<SingleSelection>().expect("Not SingleSelection");
+            let selection_model = model
+                .downcast_ref::<SingleSelection>()
+                .expect("Not SingleSelection");
 
             // Get the item at the activated position
-            if let Some(obj) = selection_model.item(position).and_downcast::<SkeletonObject>() {
+            if let Some(obj) = selection_model
+                .item(position)
+                .and_downcast::<SkeletonObject>()
+            {
                 let data = obj.skeleton();
 
                 // Spawn a transient HUD Window
@@ -199,9 +219,7 @@ impl ContextView {
                 // Zero-Copy text set (Arc<String> -> &str)
                 text_view.buffer().set_text(&data.content);
 
-                let scroll = ScrolledWindow::builder()
-                    .child(&text_view)
-                    .build();
+                let scroll = ScrolledWindow::builder().child(&text_view).build();
 
                 window.set_child(Some(&scroll));
                 window.present();
@@ -227,10 +245,8 @@ impl ContextView {
     /// This ensures zero UI jitter and maximum efficiency.
     pub fn update(&self, skeletons: Vec<WeightedSkeleton>) {
         // Convert Rust structs to GObjects
-        let new_items: Vec<SkeletonObject> = skeletons
-            .into_iter()
-            .map(SkeletonObject::new)
-            .collect();
+        let new_items: Vec<SkeletonObject> =
+            skeletons.into_iter().map(SkeletonObject::new).collect();
 
         // ATOMIC SWAP:
         // Remove all items (0..n_items) and insert new_items in their place.

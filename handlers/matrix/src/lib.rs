@@ -33,7 +33,11 @@ impl MatrixScanner {
                 let kind = if p.is_dir() { "directory" } else { "module" };
                 // Map to the bandy struct
                 nodes.push(bandy::SpatialNode {
-                    id: p.file_name().unwrap_or_default().to_string_lossy().into_owned(),
+                    id: p
+                        .file_name()
+                        .unwrap_or_default()
+                        .to_string_lossy()
+                        .into_owned(),
                     kind: kind.to_string(),
                     path: p,
                 });

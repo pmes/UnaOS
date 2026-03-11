@@ -39,7 +39,9 @@ impl std::fmt::Display for LuxError {
             LuxError::InvalidMagic => write!(f, "Invalid magic number, expected TIFF"),
             LuxError::UnsupportedEndianness => write!(f, "Unsupported endianness"),
             LuxError::MissingData => write!(f, "Missing required tags or data"),
-            LuxError::UnsupportedCompression(c) => write!(f, "Unsupported compression scheme: {}", c),
+            LuxError::UnsupportedCompression(c) => {
+                write!(f, "Unsupported compression scheme: {}", c)
+            }
             LuxError::UnsupportedCFA => write!(f, "Unsupported CFA pattern"),
             LuxError::CorruptData => write!(f, "Data is corrupt"),
         }

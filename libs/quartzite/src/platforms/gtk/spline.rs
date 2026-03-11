@@ -23,9 +23,9 @@ use gtk4::{
     Adjustment, Align, Box, Button, CheckButton, ColumnView, ColumnViewColumn, CssProvider,
     DropDown, Entry, EventControllerKey, Expander, FileDialog, FilterListModel, GestureClick,
     Image, Label, ListBox, ListItem, ListView, NoSelection, Orientation, Paned, PolicyType,
-    Popover, PropagationPhase, Scale, ScrolledWindow, SignalListItemFactory,
-    SingleSelection, Spinner, Stack, StackSwitcher, StackTransitionType, StringList, StringObject,
-    Switch, ToggleButton, Window,
+    Popover, PropagationPhase, Scale, ScrolledWindow, SignalListItemFactory, SingleSelection,
+    Spinner, Stack, StackSwitcher, StackTransitionType, StringList, StringObject, Switch,
+    ToggleButton, Window,
     gdk::{Key, ModifierType},
     gio, glib,
 };
@@ -72,7 +72,6 @@ fn enable_spelling(view: &SourceView) {
 // Import Elessar (Engine)
 use gneiss_pal::shard::ShardStatus;
 use gneiss_pal::{GuiUpdate, WolfpackState};
-
 
 pub struct CommsSpline {}
 
@@ -457,7 +456,6 @@ fn build_gnome_ui(
         page.set_icon_name("error-correct-symbolic");
     }
 
-
     // --- Right Pane (The Command Center) ---
 
     // === THE WORKSPACE STACK ===
@@ -553,7 +551,6 @@ fn build_gnome_ui(
     let comms_page_ref = right_tab_view.page(&comms_page);
     comms_page_ref.set_title("Comms");
 
-
     // Console ListView
     let console_store = gio::ListStore::new::<DispatchObject>();
     let console_filter = FilterListModel::new(Some(console_store.clone()), None::<gtk4::Filter>);
@@ -643,8 +640,16 @@ fn build_gnome_ui(
             section_box.set_vexpand(true);
             section_box.set_hexpand(true);
 
-            let label = Label::builder().label(title).xalign(0.0).css_classes(vec!["dim-label"]).build();
-            let view = SourceView::builder().wrap_mode(gtk4::WrapMode::WordChar).editable(true).monospace(true).build();
+            let label = Label::builder()
+                .label(title)
+                .xalign(0.0)
+                .css_classes(vec!["dim-label"])
+                .build();
+            let view = SourceView::builder()
+                .wrap_mode(gtk4::WrapMode::WordChar)
+                .editable(true)
+                .monospace(true)
+                .build();
             view.add_css_class("view");
             view.set_vexpand(true);
 
@@ -675,14 +680,20 @@ fn build_gnome_ui(
         paned_2.set_wide_handle(true);
         paned_3.set_wide_handle(true);
 
-        paned_1.set_vexpand(true); paned_1.set_hexpand(true);
-        paned_2.set_vexpand(true); paned_2.set_hexpand(true);
-        paned_3.set_vexpand(true); paned_3.set_hexpand(true);
+        paned_1.set_vexpand(true);
+        paned_1.set_hexpand(true);
+        paned_2.set_vexpand(true);
+        paned_2.set_hexpand(true);
+        paned_3.set_vexpand(true);
+        paned_3.set_hexpand(true);
 
         // Prevent squishing to 0
-        paned_1.set_shrink_start_child(false); paned_1.set_shrink_end_child(false);
-        paned_2.set_shrink_start_child(false); paned_2.set_shrink_end_child(false);
-        paned_3.set_shrink_start_child(false); paned_3.set_shrink_end_child(false);
+        paned_1.set_shrink_start_child(false);
+        paned_1.set_shrink_end_child(false);
+        paned_2.set_shrink_start_child(false);
+        paned_2.set_shrink_end_child(false);
+        paned_3.set_shrink_start_child(false);
+        paned_3.set_shrink_end_child(false);
 
         paned_3.set_start_child(Some(&box_eng));
         paned_3.set_end_child(Some(&box_prm));
@@ -697,8 +708,16 @@ fn build_gnome_ui(
 
         let actions_box = Box::new(Orientation::Horizontal, 8);
         actions_box.set_halign(Align::End);
-        let cancel_btn = Button::builder().icon_name("window-close-symbolic").tooltip_text("Delete Post").css_classes(vec!["flat", "destructive-action"]).build();
-        let dispatch_btn = Button::builder().icon_name("document-save-symbolic").tooltip_text("Save and Send").css_classes(vec!["suggested-action"]).build();
+        let cancel_btn = Button::builder()
+            .icon_name("window-close-symbolic")
+            .tooltip_text("Delete Post")
+            .css_classes(vec!["flat", "destructive-action"])
+            .build();
+        let dispatch_btn = Button::builder()
+            .icon_name("document-save-symbolic")
+            .tooltip_text("Save and Send")
+            .css_classes(vec!["suggested-action"])
+            .build();
         actions_box.append(&cancel_btn);
         actions_box.append(&dispatch_btn);
         staging_box.append(&actions_box);
@@ -748,13 +767,19 @@ fn build_gnome_ui(
                     let content = obj.content();
                     let line_count = content.trim_end().lines().count();
                     if line_count > 11 && !expanded {
-                        let truncated: String =
-                            content.trim_end().lines().take(11).collect::<Vec<&str>>().join("\n");
+                        let truncated: String = content
+                            .trim_end()
+                            .lines()
+                            .take(11)
+                            .collect::<Vec<&str>>()
+                            .join("\n");
                         chat_content_view_clone.buffer().set_text(&truncated);
                         left_btn_clone.set_icon_name("pan-down-symbolic");
                         right_btn_clone.set_icon_name("pan-down-symbolic");
                     } else {
-                        chat_content_view_clone.buffer().set_text(content.trim_end());
+                        chat_content_view_clone
+                            .buffer()
+                            .set_text(content.trim_end());
                         if line_count > 11 {
                             left_btn_clone.set_icon_name("pan-up-symbolic");
                             right_btn_clone.set_icon_name("pan-up-symbolic");
@@ -1443,7 +1468,9 @@ fn build_gnome_ui(
                         // Find the index of the locked staging view.
                         let mut target_staging_idx = None;
                         for i in (0..n).rev() {
-                            if let Some(obj) = console_store_async.item(i).and_downcast::<DispatchObject>() {
+                            if let Some(obj) =
+                                console_store_async.item(i).and_downcast::<DispatchObject>()
+                            {
                                 if obj.message_type() == 1 && obj.is_locked() {
                                     target_staging_idx = Some(i);
                                     break;
@@ -1452,16 +1479,26 @@ fn build_gnome_ui(
                         }
 
                         for i in 0..n {
-                            if let Some(obj) = console_store_async.item(i).and_downcast::<DispatchObject>() {
+                            if let Some(obj) =
+                                console_store_async.item(i).and_downcast::<DispatchObject>()
+                            {
                                 let t = obj.message_type();
                                 if t == 2 {
                                     removals.push(i); // Drop Pulse
                                 } else if t == 1 {
                                     if Some(i) == target_staging_idx {
-                                        let timestamp = chrono::Local::now().format("%H:%M:%S").to_string();
+                                        let timestamp =
+                                            chrono::Local::now().format("%H:%M:%S").to_string();
                                         let id = obj.id();
                                         let prm = obj.prompt_text();
-                                        let user_obj = DispatchObject::new(&id, "Architect", "Log", &timestamp, &prm, true);
+                                        let user_obj = DispatchObject::new(
+                                            &id,
+                                            "Architect",
+                                            "Log",
+                                            &timestamp,
+                                            &prm,
+                                            true,
+                                        );
                                         console_store_async.splice(i, 1, &[user_obj]);
                                     }
                                 }
@@ -1498,8 +1535,19 @@ fn build_gnome_ui(
                     *is_prepending_async.borrow_mut() = true;
                     let mut new_objects = Vec::new();
                     for (i, msg) in messages.into_iter().enumerate() {
-                        let id = format!("{}-hist-{}", chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0), i);
-                        let obj = DispatchObject::new(&id, &msg.sender, "History", &msg.timestamp, &msg.content, msg.is_chat);
+                        let id = format!(
+                            "{}-hist-{}",
+                            chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0),
+                            i
+                        );
+                        let obj = DispatchObject::new(
+                            &id,
+                            &msg.sender,
+                            "History",
+                            &msg.timestamp,
+                            &msg.content,
+                            msg.is_chat,
+                        );
                         new_objects.push(obj);
                     }
                     // Atomic insertion to trigger upper_notify exactly once
@@ -1577,7 +1625,9 @@ fn build_gnome_ui(
                     let n = console_store_async.n_items();
                     let mut pulse_idx = None;
                     for i in 0..n {
-                        if let Some(obj) = console_store_async.item(i).and_downcast::<DispatchObject>() {
+                        if let Some(obj) =
+                            console_store_async.item(i).and_downcast::<DispatchObject>()
+                        {
                             if obj.message_type() == 2 {
                                 pulse_idx = Some(i);
                                 break;
@@ -1591,7 +1641,9 @@ fn build_gnome_ui(
                     // Unlock staging
                     let n = console_store_async.n_items();
                     for i in 0..n {
-                        if let Some(obj) = console_store_async.item(i).and_downcast::<DispatchObject>() {
+                        if let Some(obj) =
+                            console_store_async.item(i).and_downcast::<DispatchObject>()
+                        {
                             if obj.message_type() == 1 {
                                 obj.set_is_locked(false);
                                 console_store_async.items_changed(i, 1, 1);
@@ -1602,7 +1654,8 @@ fn build_gnome_ui(
                     // Show error
                     let timestamp = chrono::Local::now().format("%H:%M:%S").to_string();
                     let id = format!("{}", chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0));
-                    let err_obj = DispatchObject::new(&id, "System Error", "Log", &timestamp, &err_msg, true);
+                    let err_obj =
+                        DispatchObject::new(&id, "System Error", "Log", &timestamp, &err_msg, true);
                     console_store_async.append(&err_obj);
                 }
                 _ => {}
@@ -1626,7 +1679,7 @@ fn build_gnome_ui(
         status_group.upcast_ref::<gtk4::Widget>(),
         left_switcher.upcast_ref::<gtk4::Widget>(), // Changed
         right_tab_bar.upcast_ref::<gtk4::Widget>(),
-        left_stack.upcast_ref::<gtk4::Widget>(),    // Changed
+        left_stack.upcast_ref::<gtk4::Widget>(), // Changed
         right_tab_view.upcast_ref::<gtk4::Widget>(),
     )
 }
@@ -2161,8 +2214,16 @@ fn build_gtk_ui(
             section_box.set_vexpand(true);
             section_box.set_hexpand(true);
 
-            let label = Label::builder().label(title).xalign(0.0).css_classes(vec!["dim-label"]).build();
-            let view = SourceView::builder().wrap_mode(gtk4::WrapMode::WordChar).editable(true).monospace(true).build();
+            let label = Label::builder()
+                .label(title)
+                .xalign(0.0)
+                .css_classes(vec!["dim-label"])
+                .build();
+            let view = SourceView::builder()
+                .wrap_mode(gtk4::WrapMode::WordChar)
+                .editable(true)
+                .monospace(true)
+                .build();
             view.add_css_class("view");
             view.set_vexpand(true);
 
@@ -2193,14 +2254,20 @@ fn build_gtk_ui(
         paned_2.set_wide_handle(true);
         paned_3.set_wide_handle(true);
 
-        paned_1.set_vexpand(true); paned_1.set_hexpand(true);
-        paned_2.set_vexpand(true); paned_2.set_hexpand(true);
-        paned_3.set_vexpand(true); paned_3.set_hexpand(true);
+        paned_1.set_vexpand(true);
+        paned_1.set_hexpand(true);
+        paned_2.set_vexpand(true);
+        paned_2.set_hexpand(true);
+        paned_3.set_vexpand(true);
+        paned_3.set_hexpand(true);
 
         // Prevent squishing to 0
-        paned_1.set_shrink_start_child(false); paned_1.set_shrink_end_child(false);
-        paned_2.set_shrink_start_child(false); paned_2.set_shrink_end_child(false);
-        paned_3.set_shrink_start_child(false); paned_3.set_shrink_end_child(false);
+        paned_1.set_shrink_start_child(false);
+        paned_1.set_shrink_end_child(false);
+        paned_2.set_shrink_start_child(false);
+        paned_2.set_shrink_end_child(false);
+        paned_3.set_shrink_start_child(false);
+        paned_3.set_shrink_end_child(false);
 
         paned_3.set_start_child(Some(&box_eng));
         paned_3.set_end_child(Some(&box_prm));
@@ -2215,8 +2282,16 @@ fn build_gtk_ui(
 
         let actions_box = Box::new(Orientation::Horizontal, 8);
         actions_box.set_halign(Align::End);
-        let cancel_btn = Button::builder().icon_name("window-close-symbolic").tooltip_text("Delete Post").css_classes(vec!["flat", "destructive-action"]).build();
-        let dispatch_btn = Button::builder().icon_name("document-save-symbolic").tooltip_text("Save and Send").css_classes(vec!["suggested-action"]).build();
+        let cancel_btn = Button::builder()
+            .icon_name("window-close-symbolic")
+            .tooltip_text("Delete Post")
+            .css_classes(vec!["flat", "destructive-action"])
+            .build();
+        let dispatch_btn = Button::builder()
+            .icon_name("document-save-symbolic")
+            .tooltip_text("Save and Send")
+            .css_classes(vec!["suggested-action"])
+            .build();
         actions_box.append(&cancel_btn);
         actions_box.append(&dispatch_btn);
         staging_box.append(&actions_box);
@@ -2266,13 +2341,19 @@ fn build_gtk_ui(
                     let content = obj.content();
                     let line_count = content.trim_end().lines().count();
                     if line_count > 11 && !expanded {
-                        let truncated: String =
-                            content.trim_end().lines().take(11).collect::<Vec<&str>>().join("\n");
+                        let truncated: String = content
+                            .trim_end()
+                            .lines()
+                            .take(11)
+                            .collect::<Vec<&str>>()
+                            .join("\n");
                         chat_content_view_clone.buffer().set_text(&truncated);
                         left_btn_clone.set_icon_name("pan-down-symbolic");
                         right_btn_clone.set_icon_name("pan-down-symbolic");
                     } else {
-                        chat_content_view_clone.buffer().set_text(content.trim_end());
+                        chat_content_view_clone
+                            .buffer()
+                            .set_text(content.trim_end());
                         if line_count > 11 {
                             left_btn_clone.set_icon_name("pan-up-symbolic");
                             right_btn_clone.set_icon_name("pan-up-symbolic");
@@ -2967,7 +3048,9 @@ fn build_gtk_ui(
                         // Find the index of the locked staging view.
                         let mut target_staging_idx = None;
                         for i in (0..n).rev() {
-                            if let Some(obj) = console_store_async.item(i).and_downcast::<DispatchObject>() {
+                            if let Some(obj) =
+                                console_store_async.item(i).and_downcast::<DispatchObject>()
+                            {
                                 if obj.message_type() == 1 && obj.is_locked() {
                                     target_staging_idx = Some(i);
                                     break;
@@ -2976,16 +3059,26 @@ fn build_gtk_ui(
                         }
 
                         for i in 0..n {
-                            if let Some(obj) = console_store_async.item(i).and_downcast::<DispatchObject>() {
+                            if let Some(obj) =
+                                console_store_async.item(i).and_downcast::<DispatchObject>()
+                            {
                                 let t = obj.message_type();
                                 if t == 2 {
                                     removals.push(i); // Drop Pulse
                                 } else if t == 1 {
                                     if Some(i) == target_staging_idx {
-                                        let timestamp = chrono::Local::now().format("%H:%M:%S").to_string();
+                                        let timestamp =
+                                            chrono::Local::now().format("%H:%M:%S").to_string();
                                         let id = obj.id();
                                         let prm = obj.prompt_text();
-                                        let user_obj = DispatchObject::new(&id, "Architect", "Log", &timestamp, &prm, true);
+                                        let user_obj = DispatchObject::new(
+                                            &id,
+                                            "Architect",
+                                            "Log",
+                                            &timestamp,
+                                            &prm,
+                                            true,
+                                        );
                                         console_store_async.splice(i, 1, &[user_obj]);
                                     }
                                 }
@@ -3022,8 +3115,19 @@ fn build_gtk_ui(
                     *is_prepending_async.borrow_mut() = true;
                     let mut new_objects = Vec::new();
                     for (i, msg) in messages.into_iter().enumerate() {
-                        let id = format!("{}-hist-{}", chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0), i);
-                        let obj = DispatchObject::new(&id, &msg.sender, "History", &msg.timestamp, &msg.content, msg.is_chat);
+                        let id = format!(
+                            "{}-hist-{}",
+                            chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0),
+                            i
+                        );
+                        let obj = DispatchObject::new(
+                            &id,
+                            &msg.sender,
+                            "History",
+                            &msg.timestamp,
+                            &msg.content,
+                            msg.is_chat,
+                        );
                         new_objects.push(obj);
                     }
                     // Atomic insertion to trigger upper_notify exactly once
@@ -3101,7 +3205,9 @@ fn build_gtk_ui(
                     let n = console_store_async.n_items();
                     let mut pulse_idx = None;
                     for i in 0..n {
-                        if let Some(obj) = console_store_async.item(i).and_downcast::<DispatchObject>() {
+                        if let Some(obj) =
+                            console_store_async.item(i).and_downcast::<DispatchObject>()
+                        {
                             if obj.message_type() == 2 {
                                 pulse_idx = Some(i);
                                 break;
@@ -3115,7 +3221,9 @@ fn build_gtk_ui(
                     // Unlock staging
                     let n = console_store_async.n_items();
                     for i in 0..n {
-                        if let Some(obj) = console_store_async.item(i).and_downcast::<DispatchObject>() {
+                        if let Some(obj) =
+                            console_store_async.item(i).and_downcast::<DispatchObject>()
+                        {
                             if obj.message_type() == 1 {
                                 obj.set_is_locked(false);
                                 console_store_async.items_changed(i, 1, 1);
@@ -3126,7 +3234,8 @@ fn build_gtk_ui(
                     // Show error
                     let timestamp = chrono::Local::now().format("%H:%M:%S").to_string();
                     let id = format!("{}", chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0));
-                    let err_obj = DispatchObject::new(&id, "System Error", "Log", &timestamp, &err_msg, true);
+                    let err_obj =
+                        DispatchObject::new(&id, "System Error", "Log", &timestamp, &err_msg, true);
                     console_store_async.append(&err_obj);
                 }
                 _ => {}
