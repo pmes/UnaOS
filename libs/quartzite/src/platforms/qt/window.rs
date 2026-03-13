@@ -18,7 +18,10 @@ use async_channel::{Receiver, Sender};
 use std::sync::OnceLock;
 
 use crate::{NativeView, NativeWindow};
-use gneiss_pal::{Event, GuiUpdate};
+use gneiss_pal::Event;
+use bandy::SMessage;
+use bandy::state::AppState;
+use std::sync::{Arc, RwLock};
 use tokio::runtime::Handle;
 
 use super::ffi;
@@ -62,23 +65,32 @@ impl qobject::LumenWindow {
     }
 }
 
-pub fn spawn_gui_listener(rx: Receiver<GuiUpdate>) {
+pub fn spawn_state_listener(app_state: Arc<RwLock<AppState>>, rx: Receiver<SMessage>) {
     if let Ok(handle) = Handle::try_current() {
         handle.spawn(async move {
             while let Ok(update) = rx.recv().await {
-                // Route the GUI update to specific handler facades
-                match update {
-                    GuiUpdate::HistoryBatch(items) => {
-                        super::vein_bridge::route_history_batch(items);
+                if let SMessage::StateInvalidated = update {
+                    // Extract exactly what we need for the specific models using the read lock
+                    let (history, payload, logs) = {
+                        let state = app_state.read().unwrap();
+                        let hist = state.history.clone();
+                        let pay = state.review_payload.clone();
+                        let ls = state.console_logs.clone();
+                        (hist, pay, ls)
+                    };
+
+                    super::vein_bridge::route_history_batch(history);
+                    if let Some(p) = payload {
+                        super::vein_bridge::route_review_payload(p);
                     }
-                    GuiUpdate::ReviewPayload(payload) => {
-                        super::vein_bridge::route_review_payload(payload);
-                    }
-                    GuiUpdate::ConsoleLog(log) => {
-                        super::vein_bridge::route_console_log(log);
-                    }
-                    _ => {}
+
+                    // We simply pass the entire vector of logs to the router to sync
+                    super::vein_bridge::route_console_batch(logs);
                 }
+            }
+        });
+    }
+}
             }
         });
     }

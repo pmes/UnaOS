@@ -2666,6 +2666,7 @@ dependencies = [
 name = "gneiss_pal"
 version = "0.1.0"
 dependencies = [
+ "bandy",
  "chrono",
  "log",
  "octocrab",

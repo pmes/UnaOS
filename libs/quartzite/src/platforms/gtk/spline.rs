@@ -70,8 +70,8 @@ fn enable_spelling(view: &SourceView) {
 }
 
 // Import Elessar (Engine)
-use gneiss_pal::shard::ShardStatus;
-use gneiss_pal::{GuiUpdate, WolfpackState};
+use crate::platforms::gtk::types::GuiUpdate;
+use bandy::state::{WolfpackState, PreFlightPayload, AppState};
 
 pub struct CommsSpline {}
 
@@ -84,14 +84,15 @@ impl CommsSpline {
         &self,
         window: &crate::NativeWindow,
         tx_event: async_channel::Sender<Event>,
-        rx: Receiver<GuiUpdate>,
+        rx: Receiver<bandy::SMessage>,
+        app_state: std::sync::Arc<std::sync::RwLock<AppState>>,
         rx_telemetry: Receiver<bandy::SMessage>,
     ) -> crate::NativeView {
         #[cfg(feature = "gnome")]
         return build_gnome_ui(window, tx_event, rx, rx_telemetry);
 
         #[cfg(not(feature = "gnome"))]
-        return build_gtk_ui(window, tx_event, rx, rx_telemetry);
+        return build_gtk_ui(window, tx_event, app_state, rx_telemetry);
     }
 }
 
@@ -99,7 +100,8 @@ impl CommsSpline {
 fn build_gnome_ui(
     window: &crate::NativeWindow,
     tx_event: async_channel::Sender<Event>,
-    rx: Receiver<GuiUpdate>,
+    rx: Receiver<bandy::SMessage>,
+        app_state: std::sync::Arc<std::sync::RwLock<AppState>>,
     rx_telemetry: Receiver<bandy::SMessage>,
 ) -> crate::NativeView {
     // 1. Nodes Tab Rename
@@ -1009,7 +1011,7 @@ fn build_gnome_ui(
                 obj_clone2.set_engrams_text(engrams_text.clone());
                 obj_clone2.set_prompt_text(prompt_text.clone());
 
-                let payload = gneiss_pal::PreFlightPayload {
+                let payload = PreFlightPayload {
                     system: system_text,
                     directives: directives_text,
                     engrams: engrams_text,
@@ -1572,17 +1574,17 @@ fn build_gnome_ui(
                         continue;
                     };
                     match status {
-                        ShardStatus::Thinking => {
+                        bandy::state::bandy::state::bandy::state::bandy::state::bandy::state::ShardStatus::Thinking => {
                             spinner.set_spinning(true);
                             spinner.start();
                             label.set_text(&format!("{} (Thinking)", name));
                         }
-                        ShardStatus::Online => {
+                        bandy::state::bandy::state::bandy::state::bandy::state::bandy::state::ShardStatus::Online => {
                             spinner.set_spinning(false);
                             spinner.stop();
                             label.set_text(name);
                         }
-                        ShardStatus::Error => {
+                        bandy::state::bandy::state::bandy::state::bandy::state::bandy::state::ShardStatus::Error => {
                             spinner.set_spinning(false);
                             spinner.stop();
                             label.set_text(&format!("{} (Error)", name));
@@ -1688,7 +1690,8 @@ fn build_gnome_ui(
 fn build_gtk_ui(
     window: &crate::NativeWindow,
     tx_event: async_channel::Sender<Event>,
-    rx: Receiver<GuiUpdate>,
+    rx: Receiver<bandy::SMessage>,
+        app_state: std::sync::Arc<std::sync::RwLock<AppState>>,
     rx_telemetry: Receiver<bandy::SMessage>,
 ) -> crate::NativeView {
     // 1. Nodes Tab Rename
@@ -2583,7 +2586,7 @@ fn build_gtk_ui(
                 obj_clone2.set_engrams_text(engrams_text.clone());
                 obj_clone2.set_prompt_text(prompt_text.clone());
 
-                let payload = gneiss_pal::PreFlightPayload {
+                let payload = PreFlightPayload {
                     system: system_text,
                     directives: directives_text,
                     engrams: engrams_text,
@@ -3152,17 +3155,17 @@ fn build_gtk_ui(
                         continue;
                     };
                     match status {
-                        ShardStatus::Thinking => {
+                        bandy::state::bandy::state::bandy::state::bandy::state::bandy::state::ShardStatus::Thinking => {
                             spinner.set_spinning(true);
                             spinner.start();
                             label.set_text(&format!("{} (Thinking)", name));
                         }
-                        ShardStatus::Online => {
+                        bandy::state::bandy::state::bandy::state::bandy::state::bandy::state::ShardStatus::Online => {
                             spinner.set_spinning(false);
                             spinner.stop();
                             label.set_text(name);
                         }
-                        ShardStatus::Error => {
+                        bandy::state::bandy::state::bandy::state::bandy::state::bandy::state::ShardStatus::Error => {
                             spinner.set_spinning(false);
                             spinner.stop();
                             label.set_text(&format!("{} (Error)", name));

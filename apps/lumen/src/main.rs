@@ -21,7 +21,7 @@ mod cortex;
 use bandy::{SMessage, Synapse, telemetry};
 use gneiss_pal::AppHandler;
 #[allow(unused_imports)]
-use gneiss_pal::GuiUpdate;
+use std::sync::{Arc, RwLock};
 use gneiss_pal::paths::UnaPaths;
 use quartzite::{self, Backend, NativeView, NativeWindow};
 use std::rc::Rc;
@@ -69,7 +69,7 @@ fn main() {
     telemetry::ignite(UnaPaths::root().join("logs"));
     log::info!("Lumen Boot Sequence Initiated.");
 
-    let (telemetry_tx, _telemetry_rx) = async_channel::unbounded::<SMessage>();
+    let (_telemetry_tx, _telemetry_rx) = async_channel::unbounded::<SMessage>();
 
     // 3. Ignite the Spine
     let synapse = Synapse::new();
@@ -92,7 +92,7 @@ fn main() {
     });
 
     // 6. Ignite the AI Handler (The Conscious Vein)
-    let (gui_tx, gui_rx) = async_channel::unbounded();
+    let app_state = Arc::new(RwLock::new(bandy::state::AppState::default()));
     // Channels for UI Events (Spline -> Vein)
     let (event_tx, event_rx) = async_channel::unbounded::<quartzite::Event>();
 
@@ -102,10 +102,9 @@ fn main() {
 
     let (shutdown_tx_vein, shutdown_rx_vein) = (shutdown_tx.clone(), shutdown_tx.subscribe());
     let (vein_handler, bg_handle) = VeinHandler::new(
-        gui_tx,
         vein_storage,
         synapse.clone(),
-        telemetry_tx,
+        app_state.clone(),
         shutdown_tx_vein,
     );
 
@@ -139,7 +138,7 @@ fn main() {
         let vein_widget = spline.bootstrap(
             window,
             event_tx.clone(),
-            gui_rx.clone(),
+            app_state.clone(),
             _telemetry_rx.clone(),
         );
 

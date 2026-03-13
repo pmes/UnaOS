@@ -19,7 +19,8 @@
 
 use crate::{Event, NativeView, NativeWindow};
 use async_channel::{Receiver, Sender};
-use gneiss_pal::GuiUpdate;
+use bandy::state::AppState;
+use std::sync::{Arc, RwLock};
 use objc2::msg_send;
 use objc2::rc::Retained;
 use objc2_app_kit::{

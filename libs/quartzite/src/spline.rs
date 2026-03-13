@@ -5,17 +5,14 @@
 // it under the terms of the GNU Lesser General Public License as published by
 // the Free Software Foundation, either version 3 of the License, or
 // (at your option) any later version.
-//
-// This program is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-// GNU Lesser General Public License for more details.
-//
-// You should have received a copy of the GNU Lesser General Public License
-// along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 use crate::{NativeView, NativeWindow};
-use gneiss_pal::{Event, GuiUpdate};
+use gneiss_pal::Event;
+use std::sync::{Arc, RwLock};
+
+// Import the single source of truth from the nervous system
+use bandy::state::AppState;
+use bandy::SMessage;
 
 #[cfg(all(target_os = "linux", feature = "gtk"))]
 use crate::platforms::gtk::spline::CommsSpline;
@@ -53,13 +50,13 @@ impl Spline {
         &self,
         _window: &NativeWindow,
         _tx_event: async_channel::Sender<Event>,
-        _rx_gui: async_channel::Receiver<GuiUpdate>,
-        _rx_telemetry: async_channel::Receiver<bandy::SMessage>,
+        _app_state: Arc<RwLock<AppState>>,
+        _rx_synapse: async_channel::Receiver<SMessage>,
     ) -> NativeView {
         #[cfg(any(all(target_os = "linux", feature = "gtk"), target_os = "macos"))]
         return self
             .inner
-            .bootstrap(_window, _tx_event, _rx_gui, _rx_telemetry);
+            .bootstrap(_window, _tx_event, _app_state, _rx_synapse);
 
         #[cfg(all(target_os = "linux", feature = "qt"))]
         {
@@ -68,9 +65,8 @@ impl Spline {
             // To fulfill the nervous system, we inject the event_tx to the backend.
             let _ = crate::platforms::qt::window::GLOBAL_TX.set(_tx_event);
 
-            // Spawn the tokio backend to listen to GUI updates from Vein/Cortex
-            // window.rs acts as the Executive Router
-            crate::platforms::qt::window::spawn_gui_listener(_rx_gui);
+            // Spawn the tokio backend to listen to StateInvalidated pings from Vein/Cortex
+            crate::platforms::qt::window::spawn_state_listener(_app_state, _rx_synapse);
 
             return crate::NativeView {
                 ptr: ffi::create_main_window(),
