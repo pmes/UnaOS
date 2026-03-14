@@ -78,6 +78,7 @@ pub fn build(
     comms_page.set_vexpand(true);
 
     let chat_overlay = Overlay::new();
+    chat_overlay.set_size_request(400, 400); // Forces the Overlay open
     chat_overlay.set_hexpand(true);
     chat_overlay.set_vexpand(true);
 
@@ -412,6 +413,12 @@ pub fn build(
     list_container.set_vexpand(true);
     list_container.set_hexpand(true);
     list_container.set_valign(gtk4::Align::Fill);
+
+    // The Spatial Hard-Stop
+    let spacer = Box::new(Orientation::Vertical, 0);
+    spacer.set_size_request(1, 1);
+    spacer.set_opacity(0.0);
+    list_container.append(&spacer);
 
     list_container.append(&console_list_view);
 
