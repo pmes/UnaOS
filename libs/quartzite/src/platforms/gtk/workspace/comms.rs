@@ -84,6 +84,7 @@ pub fn build(
     let scrolled_window = ScrolledWindow::builder()
         .hscrollbar_policy(PolicyType::Never)
         .vscrollbar_policy(PolicyType::Automatic)
+        .min_content_height(400)
         .vexpand(true)
         .hexpand(true)
         .build();
@@ -104,9 +105,13 @@ pub fn build(
     let is_fetching_val = is_fetching.clone();
 
     adj.connect_value_notify(move |a| {
-        let val = a.value();
-        let page_size = a.page_size();
         let upper = a.upper();
+        let page_size = a.page_size();
+        if upper <= page_size || upper == 0.0 {
+            return;
+        }
+
+        let val = a.value();
         let lower = a.lower();
 
         *was_at_bottom_val.borrow_mut() = (val - (upper - page_size)).abs() < 10.0;
@@ -134,17 +139,19 @@ pub fn build(
     adj.connect_upper_notify(move |a| {
         let upper = a.upper();
         let page_size = a.page_size();
+        if upper <= page_size || upper == 0.0 {
+            return;
+        }
+
         let old_upper = *last_upper_ref.borrow();
         let delta = upper - old_upper;
         *last_upper_ref.borrow_mut() = upper;
 
-        if upper > page_size {
-            if *was_at_bottom_upper.borrow() {
-                a.set_value(upper - page_size);
-            } else if *is_prepending_upper.borrow() && delta > 0.0 {
-                a.set_value(a.value() + delta);
-                *is_prepending_upper.borrow_mut() = false;
-            }
+        if *was_at_bottom_upper.borrow() {
+            a.set_value(upper - page_size);
+        } else if *is_prepending_upper.borrow() && delta > 0.0 {
+            a.set_value(a.value() + delta);
+            *is_prepending_upper.borrow_mut() = false;
         }
     });
 
