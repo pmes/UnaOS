@@ -85,8 +85,6 @@ pub fn build(
     let scrolled_window = ScrolledWindow::builder()
         .hscrollbar_policy(PolicyType::Never)
         .vscrollbar_policy(PolicyType::Automatic)
-        .vexpand(true)
-        .hexpand(true)
         .build();
 
     chat_overlay.set_child(Some(&scrolled_window));
@@ -242,9 +240,9 @@ pub fn build(
         payload_content_view.set_monospace(true);
         payload_content_view.set_cursor_visible(false);
         payload_content_view.add_css_class("view");
+        payload_content_view.set_size_request(-1, 300);
         let payload_scroll = ScrolledWindow::builder()
             .child(&payload_content_view)
-            .max_content_height(300)
             .build();
         expander.set_child(Some(&payload_scroll));
         bubble.append(&expander);
