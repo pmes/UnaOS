@@ -63,6 +63,7 @@ pub fn spawn_listener(pointers: ReactorPointers, rx_gui: Receiver<GuiUpdate>) {
                     let timestamp = chrono::Local::now().format("%H:%M:%S").to_string();
                     let id = format!("{}", chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0));
                     let obj = HistoryObject::new(&id, &sender, &subject, &timestamp, &content, is_chat);
+                    println!("Appending system log item: {}", content);
                     pointers.console_store.append(&obj);
                 }
                 GuiUpdate::HistoryBatch(messages) => {
@@ -88,6 +89,7 @@ pub fn spawn_listener(pointers: ReactorPointers, rx_gui: Receiver<GuiUpdate>) {
                             &msg.content,
                             msg.is_chat,
                         );
+                        println!("Appending history item: {}", msg.content);
                         new_objects.push(obj);
                     }
                     pointers.console_store.splice(0, 0, &new_objects);

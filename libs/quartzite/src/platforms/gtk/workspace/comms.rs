@@ -84,6 +84,7 @@ pub fn build(
         .hscrollbar_policy(PolicyType::Never)
         .vscrollbar_policy(PolicyType::Automatic)
         .vexpand(true)
+        .hexpand(true)
         .build();
 
     chat_overlay.set_child(Some(&scrolled_window));
@@ -147,8 +148,21 @@ pub fn build(
     });
 
     let console_store = gio::ListStore::new::<HistoryObject>();
-    let console_filter = FilterListModel::new(Some(console_store.clone()), None::<gtk4::Filter>);
-    let console_selection = NoSelection::new(Some(console_filter));
+    // REMOVED FilterListModel per Architect instructions
+    let console_selection = NoSelection::new(Some(console_store.clone()));
+
+    // Create a Rust struct to hold the precise pointers without DOM traversal
+    #[derive(Clone)]
+    struct BubbleWidgets {
+        left_spacer: Box,
+        bubble: Box,
+        right_spacer: Box,
+        left_expand_btn: Button,
+        meta_label: Label,
+        right_expand_btn: Button,
+        chat_content_view: SourceView,
+        expander: Expander,
+    }
 
     let console_factory = SignalListItemFactory::new();
     console_factory.connect_setup(move |_factory, item| {
@@ -156,9 +170,11 @@ pub fn build(
         let root = Box::new(Orientation::Horizontal, 0);
         root.set_hexpand(true);
         root.add_css_class("console-row");
+
         let left_spacer = Box::new(Orientation::Horizontal, 0);
         left_spacer.set_hexpand(true);
         root.append(&left_spacer);
+
         let bubble = Box::new(Orientation::Vertical, 4);
         bubble.add_css_class("bubble-box");
         bubble.set_hexpand(true);
@@ -174,7 +190,6 @@ pub fn build(
         let meta_label = Label::new(None);
         meta_label.set_xalign(0.0);
         meta_label.add_css_class("dim-label");
-
         meta_label.set_hexpand(true);
 
         let right_expand_btn = Button::builder()
@@ -201,8 +216,6 @@ pub fn build(
         chat_content_view.set_cursor_visible(false);
         chat_content_view.add_css_class("view");
 
-        // Remove set_width_request, use min_content_width on a ScrolledWindow wrapper if needed.
-        // We will just let it expand naturally.
         bubble.append(&chat_content_view);
 
         // --- Standard Mode (Expander) ---
@@ -225,9 +238,26 @@ pub fn build(
         bubble.append(&expander);
 
         root.append(&bubble);
+
         let right_spacer = Box::new(Orientation::Horizontal, 0);
         right_spacer.set_hexpand(true);
         root.append(&right_spacer);
+
+        // Pack pointers securely into a struct and attach to the list item
+        let widgets = BubbleWidgets {
+            left_spacer,
+            bubble: bubble.clone(),
+            right_spacer,
+            left_expand_btn: left_expand_btn.clone(),
+            meta_label,
+            right_expand_btn: right_expand_btn.clone(),
+            chat_content_view: chat_content_view.clone(),
+            expander,
+        };
+        let boxed_widgets = glib::BoxedAnyObject::new(widgets);
+        unsafe {
+            item.set_data("widgets", boxed_widgets);
+        }
 
         let gesture = GestureClick::new();
         gesture.set_propagation_phase(PropagationPhase::Target);
@@ -273,31 +303,22 @@ pub fn build(
 
     console_factory.connect_bind(move |_factory, item| {
         let Some(item) = item.downcast_ref::<ListItem>() else { return; };
-        let Some(root) = item.child().and_then(|c| c.downcast::<Box>().ok()) else { return; };
-
-        let Some(left_spacer) = root.first_child().and_then(|c| c.downcast::<Box>().ok()) else { return; };
-        let Some(bubble) = left_spacer.next_sibling().and_then(|c| c.downcast::<Box>().ok()) else { return; };
-        let Some(right_spacer) = bubble.next_sibling().and_then(|c| c.downcast::<Box>().ok()) else { return; };
-
         let Some(obj) = item.item().and_then(|c| c.downcast::<HistoryObject>().ok()) else { return; };
 
-        let Some(header_box) = bubble.first_child().and_then(|c| c.downcast::<Box>().ok()) else { return; };
-        let Some(left_expand_btn) = header_box.first_child().and_then(|c| c.downcast::<Button>().ok()) else { return; };
-        let Some(meta_label) = left_expand_btn.next_sibling().and_then(|c| c.downcast::<Label>().ok()) else { return; };
-        let Some(right_expand_btn) = header_box.last_child().and_then(|c| c.downcast::<Button>().ok()) else { return; };
+        // Retrieve preserved absolute pointers securely
+        let boxed_widgets = unsafe { item.data::<glib::BoxedAnyObject>("widgets") };
+        let Some(boxed_ref) = boxed_widgets else { return; };
+        let widgets = boxed_ref.borrow::<BubbleWidgets>();
 
-        let Some(chat_view) = header_box.next_sibling().and_then(|c| c.downcast::<SourceView>().ok()) else { return; };
-        let Some(expander) = chat_view.next_sibling().and_then(|c| c.downcast::<Expander>().ok()) else { return; };
+        widgets.bubble.remove_css_class("architect-bubble");
+        widgets.bubble.remove_css_class("una-bubble");
+        widgets.left_spacer.set_visible(false);
+        widgets.right_spacer.set_visible(false);
 
-        bubble.remove_css_class("architect-bubble");
-        bubble.remove_css_class("una-bubble");
-        left_spacer.set_visible(false);
-        right_spacer.set_visible(false);
-
-        chat_view.set_visible(false);
-        expander.set_visible(false);
-        left_expand_btn.set_visible(false);
-        right_expand_btn.set_visible(false);
+        widgets.chat_content_view.set_visible(false);
+        widgets.expander.set_visible(false);
+        widgets.left_expand_btn.set_visible(false);
+        widgets.right_expand_btn.set_visible(false);
 
         // STANDARD MODE
         let is_chat = obj.is_chat();
@@ -307,74 +328,77 @@ pub fn build(
         let subject = obj.subject();
 
         if is_chat {
-            chat_view.set_visible(true);
-            meta_label.set_text(&format!("{} • {}", sender, timestamp));
-            meta_label.remove_css_class("role-architect");
-            meta_label.remove_css_class("role-una");
-            meta_label.remove_css_class("role-system");
+            widgets.chat_content_view.set_visible(true);
+            widgets.meta_label.set_text(&format!("{} • {}", sender, timestamp));
+            widgets.meta_label.remove_css_class("role-architect");
+            widgets.meta_label.remove_css_class("role-una");
+            widgets.meta_label.remove_css_class("role-system");
 
             let is_expanded = obj.is_expanded();
             let line_count = content.trim_end().lines().count();
 
             if sender == "Architect" {
-                meta_label.add_css_class("role-architect");
-                bubble.add_css_class("architect-bubble");
-                left_spacer.set_visible(true);
-                right_spacer.set_visible(false);
-                meta_label.set_halign(gtk4::Align::End);
-                meta_label.set_xalign(1.0);
+                widgets.meta_label.add_css_class("role-architect");
+                widgets.bubble.add_css_class("architect-bubble");
+                widgets.left_spacer.set_visible(true);
+                widgets.right_spacer.set_visible(false);
+                widgets.meta_label.set_halign(gtk4::Align::End);
+                widgets.meta_label.set_xalign(1.0);
                 if line_count > 11 {
-                    left_expand_btn.set_visible(true);
-                    right_expand_btn.set_visible(false);
-                    left_expand_btn.set_icon_name(if is_expanded { "pan-up-symbolic" } else { "pan-down-symbolic" });
+                    widgets.left_expand_btn.set_visible(true);
+                    widgets.right_expand_btn.set_visible(false);
+                    widgets.left_expand_btn.set_icon_name(if is_expanded { "pan-up-symbolic" } else { "pan-down-symbolic" });
                 } else {
-                    left_expand_btn.set_visible(false);
-                    right_expand_btn.set_visible(false);
+                    widgets.left_expand_btn.set_visible(false);
+                    widgets.right_expand_btn.set_visible(false);
                 }
             } else {
                 if sender == "Una-Prime" {
-                    meta_label.add_css_class("role-una");
+                    widgets.meta_label.add_css_class("role-una");
                 } else {
-                    meta_label.add_css_class("role-system");
+                    widgets.meta_label.add_css_class("role-system");
                 }
-                bubble.add_css_class("una-bubble");
-                left_spacer.set_visible(false);
-                right_spacer.set_visible(true);
-                meta_label.set_halign(gtk4::Align::Start);
-                meta_label.set_xalign(0.0);
+                widgets.bubble.add_css_class("una-bubble");
+                widgets.left_spacer.set_visible(false);
+                widgets.right_spacer.set_visible(true);
+                widgets.meta_label.set_halign(gtk4::Align::Start);
+                widgets.meta_label.set_xalign(0.0);
                 if line_count > 11 {
-                    left_expand_btn.set_visible(false);
-                    right_expand_btn.set_visible(true);
-                    right_expand_btn.set_icon_name(if is_expanded { "pan-up-symbolic" } else { "pan-down-symbolic" });
+                    widgets.left_expand_btn.set_visible(false);
+                    widgets.right_expand_btn.set_visible(true);
+                    widgets.right_expand_btn.set_icon_name(if is_expanded { "pan-up-symbolic" } else { "pan-down-symbolic" });
                 } else {
-                    left_expand_btn.set_visible(false);
-                    right_expand_btn.set_visible(false);
+                    widgets.left_expand_btn.set_visible(false);
+                    widgets.right_expand_btn.set_visible(false);
                 }
             }
             if line_count > 11 && !is_expanded {
                 let truncated: String = content.trim_end().lines().take(11).collect::<Vec<&str>>().join("\n");
-                chat_view.buffer().set_text(&truncated);
+                widgets.chat_content_view.buffer().set_text(&truncated);
             } else {
-                chat_view.buffer().set_text(content.trim_end());
+                widgets.chat_content_view.buffer().set_text(content.trim_end());
             }
         } else {
-            expander.set_visible(true);
-            bubble.add_css_class("una-bubble");
-            left_spacer.set_visible(false);
-            right_spacer.set_visible(true);
-            expander.set_label(Some(&format!("{} | {} | {}", sender, subject, timestamp)));
-            if let Some(scroll) = expander.child().and_then(|c| c.downcast::<ScrolledWindow>().ok()) {
+            widgets.expander.set_visible(true);
+            widgets.bubble.add_css_class("una-bubble");
+            widgets.left_spacer.set_visible(false);
+            widgets.right_spacer.set_visible(true);
+            widgets.expander.set_label(Some(&format!("{} | {} | {}", sender, subject, timestamp)));
+            // Direct access: No .child() traversal needed, we captured payload_content_view inside the BubbleWidgets if we want it, but wait, we didn't add payload_content_view to BubbleWidgets. I'll just use the traversal here since it's structurally fixed.
+            if let Some(scroll) = widgets.expander.child().and_then(|c| c.downcast::<ScrolledWindow>().ok()) {
                 if let Some(content_view) = scroll.child().and_then(|c| c.downcast::<SourceView>().ok()) {
                     content_view.buffer().set_text(&content);
                 }
             }
-            expander.set_expanded(false);
+            widgets.expander.set_expanded(false);
         }
     });
 
     let console_list_view = ListView::new(Some(console_selection), Some(console_factory));
     console_list_view.add_css_class("console");
     console_list_view.set_valign(Align::End);
+    console_list_view.set_vexpand(true);
+    console_list_view.set_hexpand(true);
     scrolled_window.set_child(Some(&console_list_view));
 
     // --- PRE-FLIGHT STACK (Layer 2) ---
