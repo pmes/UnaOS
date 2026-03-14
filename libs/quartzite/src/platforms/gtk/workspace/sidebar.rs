@@ -1,0 +1,389 @@
+// SPDX-License-Identifier: LGPL-3.0-or-later
+// Copyright (C) 2026 The Architect & Una
+
+use async_channel::Sender;
+use gtk4::prelude::*;
+use gtk4::{
+    Adjustment, Align, Box, Button, ColumnView, ColumnViewColumn, DropDown,
+    Image, Label, ListBox, ListItem, Orientation, PolicyType, Scale, ScrolledWindow,
+    SignalListItemFactory, SingleSelection, Spinner, Stack, StackSwitcher, StackTransitionType,
+    StringList, StringObject, Switch, ToggleButton, Window, gio,
+};
+use sourceview5::View as SourceView;
+use sourceview5::prelude::*;
+use std::cell::RefCell;
+use std::rc::Rc;
+
+use crate::Event;
+use crate::NativeWindow;
+
+pub struct SidebarWidgets {
+    pub left_stack: Stack,
+    pub status_group: Box,
+    pub left_switcher: StackSwitcher,
+    pub composer_btn: Button,
+}
+
+pub struct SidebarPointers {
+    pub active_target: Rc<RefCell<String>>,
+    pub spinner_una: Spinner,
+    pub label_una: Label,
+    pub spinner_s9: Spinner,
+    pub label_s9: Label,
+    pub token_label: Label,
+    pub pulse_icon: Spinner,
+    pub context_view: crate::widgets::telemetry::ContextView,
+}
+
+// Helper to avoid circular dependencies in spline
+fn enable_spelling(view: &SourceView) {
+    if let Some(buffer) = view.buffer().downcast::<sourceview5::Buffer>().ok() {
+        let provider = libspelling::Provider::default();
+        let checker = libspelling::Checker::new(Some(&provider), Some("en_US"));
+        let adapter = libspelling::TextBufferAdapter::new(&buffer, &checker);
+
+        adapter.set_language("en_US");
+        adapter.set_enabled(true);
+        view.insert_action_group("spelling", Some(&adapter));
+        let menu = adapter.menu_model();
+        view.set_extra_menu(Some(&menu));
+
+        struct SendWrapper<T>(pub T);
+        unsafe impl<T> Send for SendWrapper<T> {}
+        unsafe impl<T> Sync for SendWrapper<T> {}
+
+        unsafe {
+            buffer.set_data("spell-adapter", SendWrapper(adapter));
+        }
+    }
+}
+
+pub fn build(window: &NativeWindow, tx_event: Sender<Event>) -> (SidebarWidgets, SidebarPointers) {
+    // UI Controls
+    let sidebar_toggle = ToggleButton::builder()
+        .icon_name("sidebar-show-symbolic")
+        .active(true)
+        .tooltip_text("Toggle Sidebar")
+        .build();
+
+    let token_label = Label::new(Some("Tokens: IN: 0 | OUT: 0 | TOTAL: 0"));
+    token_label.set_margin_start(10);
+    token_label.set_margin_end(10);
+    token_label.set_wrap(true);
+    token_label.set_justify(gtk4::Justification::Center);
+
+    let pulse_icon = Spinner::new();
+    pulse_icon.add_css_class("pulse-spinner");
+    pulse_icon.set_spinning(false);
+
+    let status_group = Box::new(Orientation::Horizontal, 8);
+    status_group.set_valign(gtk4::Align::Center);
+    status_group.append(&sidebar_toggle);
+    status_group.append(&pulse_icon);
+    status_group.append(&token_label);
+
+    let left_stack = Stack::new();
+    left_stack.set_vexpand(true);
+    left_stack.set_transition_type(StackTransitionType::SlideLeftRight);
+
+    let left_switcher = StackSwitcher::new();
+    left_switcher.set_stack(Some(&left_stack));
+    left_switcher.set_halign(Align::Center);
+
+    let left_stack_clone = left_stack.clone();
+    sidebar_toggle.connect_toggled(move |btn| {
+        left_stack_clone.set_visible(btn.is_active());
+    });
+
+    // 1. Nodes Tab
+    let store = gio::ListStore::new::<StringObject>();
+    for item in ["Prime", "Encrypted", "Jules (Private)"].iter() {
+        store.append(&StringObject::new(item));
+    }
+    let selection_model = SingleSelection::new(Some(store));
+    let factory = SignalListItemFactory::new();
+    factory.connect_setup(move |_factory, item| {
+        let item = item.downcast_ref::<ListItem>().unwrap();
+        let label = Label::new(None);
+        label.set_margin_start(10);
+        label.set_margin_end(10);
+        label.set_margin_top(12);
+        label.set_margin_bottom(12);
+        label.set_xalign(0.0);
+        item.set_child(Some(&label));
+    });
+    factory.connect_bind(move |_factory, item| {
+        let item = item.downcast_ref::<ListItem>().unwrap();
+        let child = item.child().unwrap().downcast::<Label>().unwrap();
+        let obj = item.item().unwrap().downcast::<StringObject>().unwrap();
+        child.set_label(&obj.string());
+    });
+    let column_view = ColumnView::new(Some(selection_model));
+    column_view.append_column(&ColumnViewColumn::new(None, Some(factory)));
+    let tx_clone_nav = tx_event.clone();
+    column_view
+        .model()
+        .unwrap()
+        .connect_selection_changed(move |model, _, _| {
+            let selection = model.downcast_ref::<SingleSelection>().unwrap();
+            if let Some(_) = selection.selected_item() {
+                let idx = selection.selected() as usize;
+                let _ = tx_clone_nav.send_blocking(Event::NavSelect(idx));
+            }
+        });
+    let nodes_scroll = ScrolledWindow::builder()
+        .hscrollbar_policy(PolicyType::Never)
+        .child(&column_view)
+        .vexpand(true)
+        .build();
+
+    let nodes_box = Box::new(Orientation::Vertical, 0);
+    nodes_box.append(&nodes_scroll);
+
+    let node_actions_box = Box::new(Orientation::Horizontal, 5);
+    node_actions_box.set_halign(Align::Center);
+    node_actions_box.set_margin_bottom(10);
+    node_actions_box.set_margin_top(10);
+
+    let new_node_btn = Button::new();
+    let icon_new_node = Image::from_icon_name("list-add-symbolic");
+    new_node_btn.set_child(Some(&icon_new_node));
+    new_node_btn.set_tooltip_text(Some("New Node"));
+    new_node_btn.add_css_class("flat");
+
+    let tx_node_create = tx_event.clone();
+    let parent_win = window.upcast_ref::<Window>().clone();
+
+    new_node_btn.connect_clicked(move |_| {
+        let dialog = Window::builder()
+            .title("New Node Configuration")
+            .modal(true)
+            .transient_for(&parent_win)
+            .default_width(400)
+            .default_height(500)
+            .build();
+
+        let vbox = Box::new(Orientation::Vertical, 12);
+        vbox.set_margin_top(12);
+        vbox.set_margin_bottom(12);
+        vbox.set_margin_start(12);
+        vbox.set_margin_end(12);
+
+        vbox.append(&Label::new(Some("Model")));
+        let models = StringList::new(&["Gemini 2.0 Flash", "Gemini 1.5 Pro", "Claude 3.5 Sonnet"]);
+        let dropdown = DropDown::new(Some(models), None::<gtk4::Expression>);
+        vbox.append(&dropdown);
+
+        let hbox_hist = Box::new(Orientation::Horizontal, 12);
+        hbox_hist.append(&Label::new(Some("Enable History")));
+        let switch_hist = Switch::new();
+        switch_hist.set_active(true);
+        hbox_hist.append(&switch_hist);
+        vbox.append(&hbox_hist);
+
+        vbox.append(&Label::new(Some("Temperature (0.0 - 1.0)")));
+        let adj = Adjustment::new(0.7, 0.0, 1.0, 0.1, 0.1, 0.0);
+        let scale = Scale::new(Orientation::Horizontal, Some(&adj));
+        scale.set_digits(1);
+        scale.set_draw_value(true);
+        vbox.append(&scale);
+
+        vbox.append(&Label::new(Some("System Prompt")));
+        let prompt_buffer = sourceview5::Buffer::new(None);
+        let prompt_view = SourceView::with_buffer(&prompt_buffer);
+        prompt_view.set_show_line_numbers(false);
+        prompt_view.set_monospace(false);
+        prompt_view.set_wrap_mode(gtk4::WrapMode::WordChar);
+        enable_spelling(&prompt_view);
+        let scroll = ScrolledWindow::builder()
+            .child(&prompt_view)
+            .vexpand(true)
+            .height_request(150)
+            .build();
+        vbox.append(&scroll);
+
+        let hbox_btns = Box::new(Orientation::Horizontal, 12);
+        hbox_btns.set_halign(Align::End);
+
+        let btn_cancel = Button::with_label("Cancel");
+        let win_weak = dialog.downgrade();
+        btn_cancel.connect_clicked(move |_| {
+            if let Some(win) = win_weak.upgrade() {
+                win.close();
+            }
+        });
+
+        let btn_create = Button::with_label("Create Node");
+        btn_create.add_css_class("suggested-action");
+        let win_weak2 = dialog.downgrade();
+        let tx = tx_node_create.clone();
+
+        btn_create.connect_clicked(move |_| {
+            if let Some(win) = win_weak2.upgrade() {
+                let model_obj = dropdown
+                    .selected_item()
+                    .and_then(|obj| obj.downcast::<StringObject>().ok());
+                let model = model_obj
+                    .map(|s| s.string().to_string())
+                    .unwrap_or_default();
+                let history = switch_hist.is_active();
+                let temp = adj.value();
+                let (start, end) = prompt_buffer.bounds();
+                let prompt = prompt_buffer.text(&start, &end, false).to_string();
+
+                let _ = tx.send_blocking(Event::CreateNode {
+                    model,
+                    history,
+                    temperature: temp,
+                    system_prompt: prompt,
+                });
+                win.close();
+            }
+        });
+
+        hbox_btns.append(&btn_cancel);
+        hbox_btns.append(&btn_create);
+        vbox.append(&hbox_btns);
+
+        dialog.set_child(Some(&vbox));
+        dialog.present();
+    });
+    node_actions_box.append(&new_node_btn);
+
+    let composer_icon = Image::from_icon_name("chat-message-new-symbolic");
+    let composer_btn = Button::builder()
+        .css_classes(vec!["flat"])
+        .tooltip_text("Open Composer (Formal Command)")
+        .child(&composer_icon)
+        .build();
+
+    node_actions_box.append(&composer_btn);
+    nodes_box.append(&node_actions_box);
+    let page = left_stack.add_named(&nodes_box, Some("nodes"));
+    page.set_icon_name("system-users-symbolic");
+
+    // 2. THE NEXUS Tab
+    let nexus_box = Box::new(Orientation::Vertical, 0);
+    nexus_box.set_margin_start(10);
+    nexus_box.set_margin_end(10);
+    nexus_box.set_margin_top(10);
+
+    let nexus_list = ListBox::new();
+    nexus_list.add_css_class("shard-list");
+    nexus_list.set_selection_mode(gtk4::SelectionMode::Single);
+
+    let active_target = Rc::new(RefCell::new("Una-Prime".to_string()));
+    let active_target_clone = active_target.clone();
+
+    nexus_list.connect_row_selected(move |_, row| {
+        if let Some(row) = row {
+            if let Some(child) = row.child() {
+                if let Some(box_widget) = child.downcast_ref::<Box>() {
+                    if let Some(label_widget) = box_widget
+                        .last_child()
+                        .and_then(|w| w.prev_sibling())
+                        .and_then(|w| w.downcast::<Label>().ok())
+                    {
+                        let text = label_widget.text().to_string();
+                        let name = text.split(" (").next().unwrap_or(&text).to_string();
+                        *active_target_clone.borrow_mut() = name;
+                    }
+                }
+            }
+        }
+    });
+
+    nexus_list.append(
+        &Label::builder()
+            .label("PRIMES")
+            .xalign(0.0)
+            .css_classes(vec!["nexus-header"])
+            .build(),
+    );
+
+    let row_una = Box::new(Orientation::Horizontal, 10);
+    let icon_una = Image::from_icon_name("computer-symbolic");
+    let label_una = Label::new(Some("Una-Prime"));
+    let spinner_una = Spinner::new();
+    row_una.append(&icon_una);
+    row_una.append(&label_una);
+    row_una.append(&spinner_una);
+    nexus_list.append(&row_una);
+
+    let row_claude = Box::new(Orientation::Horizontal, 10);
+    let icon_claude = Image::from_icon_name("avatar-default-symbolic");
+    let label_claude = Label::new(Some("Claude-Prime"));
+    let spinner_claude = Spinner::new();
+    row_claude.append(&icon_claude);
+    row_claude.append(&label_claude);
+    row_claude.append(&spinner_claude);
+    nexus_list.append(&row_claude);
+
+    nexus_list.append(
+        &Label::builder()
+            .label("SUB-PROCESSES")
+            .xalign(0.0)
+            .css_classes(vec!["nexus-header"])
+            .build(),
+    );
+
+    let row_s9 = Box::new(Orientation::Horizontal, 10);
+    row_s9.set_margin_start(15);
+    let icon_s9 = Image::from_icon_name("network-server-symbolic");
+    let label_s9 = Label::new(Some("S9-Mule"));
+    let spinner_s9 = Spinner::new();
+    row_s9.append(&icon_s9);
+    row_s9.append(&label_s9);
+    row_s9.append(&spinner_s9);
+    nexus_list.append(&row_s9);
+
+    nexus_box.append(&nexus_list);
+    let page = left_stack.add_named(&nexus_box, Some("nexus"));
+    page.set_icon_name("network-workgroup-symbolic");
+
+    if let Some(row) = nexus_list.row_at_index(1) {
+        nexus_list.select_row(Some(&row));
+    }
+
+    // 3. THE TeleHUD Tab
+    let telehud_box = Box::new(Orientation::Vertical, 12);
+    telehud_box.set_margin_top(12);
+    telehud_box.set_margin_bottom(12);
+    telehud_box.set_margin_start(12);
+    telehud_box.set_margin_end(12);
+
+    telehud_box.append(
+        &Label::builder()
+            .label("CONTEXT VECTOR")
+            .css_classes(vec!["nexus-header"])
+            .xalign(0.0)
+            .margin_top(20)
+            .build(),
+    );
+
+    let context_view = crate::widgets::telemetry::ContextView::new();
+    telehud_box.append(&context_view.container);
+
+    let page = left_stack.add_named(&telehud_box, Some("telehud"));
+    page.set_icon_name("error-correct-symbolic");
+
+    let widgets = SidebarWidgets {
+        left_stack,
+        status_group,
+        left_switcher,
+        composer_btn,
+    };
+
+    let pointers = SidebarPointers {
+        active_target,
+        spinner_una,
+        label_una,
+        spinner_s9,
+        label_s9,
+        token_label,
+        pulse_icon,
+        context_view,
+    };
+
+    (widgets, pointers)
+}
