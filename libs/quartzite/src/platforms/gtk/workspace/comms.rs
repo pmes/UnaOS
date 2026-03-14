@@ -89,74 +89,6 @@ pub fn build(
 
     chat_overlay.set_child(Some(&scrolled_window));
 
-    let adj = scrolled_window.vadjustment();
-    let is_prepending = Rc::new(RefCell::new(false));
-    let is_fetching = Rc::new(RefCell::new(false));
-
-    let tx_clone_hist = tx_event.clone();
-    let adj_clone = adj.clone();
-    let is_prepending_bind = is_prepending.clone();
-    let is_fetching_bind = is_fetching.clone();
-
-    scrolled_window.connect_map(move |_| {
-        // Only connect the adjustments after the window is physically drawn
-        let was_at_bottom = Rc::new(RefCell::new(true));
-        let was_at_top = Rc::new(RefCell::new(true));
-        let last_upper = Rc::new(RefCell::new(0.0));
-
-        let was_at_bottom_val = was_at_bottom.clone();
-        let was_at_top_val = was_at_top.clone();
-        let is_prepending_val = is_prepending_bind.clone();
-        let is_fetching_val = is_fetching_bind.clone();
-        let tx_for_async = tx_clone_hist.clone();
-
-        adj_clone.connect_value_notify(move |a| {
-            let upper = a.upper();
-            let page_size = a.page_size();
-            if upper <= page_size || upper == 0.0 { return; }
-
-            let val = a.value();
-            let lower = a.lower();
-            *was_at_bottom_val.borrow_mut() = (val - (upper - page_size)).abs() < 10.0;
-
-            let is_at_top = val <= lower + 10.0;
-            let previously_at_top = *was_at_top_val.borrow();
-            *was_at_top_val.borrow_mut() = is_at_top;
-
-            if is_at_top && !previously_at_top && upper > page_size {
-                if !*is_fetching_val.borrow() {
-                    *is_fetching_val.borrow_mut() = true;
-                    *is_prepending_val.borrow_mut() = true;
-                    let tx_hist = tx_for_async.clone();
-                    glib::MainContext::default().spawn_local(async move {
-                        let _ = tx_hist.send(Event::LoadHistory).await;
-                    });
-                }
-            }
-        });
-
-        let was_at_bottom_upper = was_at_bottom.clone();
-        let is_prepending_upper = is_prepending_bind.clone();
-        let last_upper_ref = last_upper.clone();
-
-        adj_clone.connect_upper_notify(move |a| {
-            let upper = a.upper();
-            let page_size = a.page_size();
-            if upper <= page_size || upper == 0.0 { return; }
-
-            let old_upper = *last_upper_ref.borrow();
-            let delta = upper - old_upper;
-            *last_upper_ref.borrow_mut() = upper;
-
-            if *was_at_bottom_upper.borrow() {
-                a.set_value(upper - page_size);
-            } else if *is_prepending_upper.borrow() && delta > 0.0 {
-                a.set_value(a.value() + delta);
-                *is_prepending_upper.borrow_mut() = false;
-            }
-        });
-    });
-
     let console_store = gio::ListStore::new::<HistoryObject>();
     // REMOVED FilterListModel per Architect instructions
     let console_selection = NoSelection::new(Some(console_store.clone()));
@@ -857,8 +789,8 @@ pub fn build(
     let pointers = CommsPointers {
         console_store,
         active_directive,
-        is_prepending,
-        is_fetching,
+        is_prepending: Rc::new(RefCell::new(false)),
+        is_fetching: Rc::new(RefCell::new(false)),
         history_sync_cursor: Rc::new(RefCell::new(0)),
         preflight_overlay: chat_overlay,
         preflight_stack_container,
