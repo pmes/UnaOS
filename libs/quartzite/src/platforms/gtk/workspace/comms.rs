@@ -5,9 +5,9 @@ use async_channel::Sender;
 use gtk4::prelude::*;
 use gtk4::{
     Align, Box, Button, CheckButton, Entry, EventControllerKey, Expander, FileDialog,
-    FilterListModel, GestureClick, Image, Label, ListItem, ListView, NoSelection, Orientation,
-    Paned, PolicyType, Popover, PropagationPhase, ScrolledWindow, SignalListItemFactory, Stack,
-    StackSwitcher, StackTransitionType, ToggleButton,
+    GestureClick, Label, ListItem, ListView, NoSelection, Orientation,
+    PolicyType, Popover, PropagationPhase, ScrolledWindow, SignalListItemFactory, Stack,
+    StackSwitcher, StackTransitionType, ToggleButton, Overlay,
     gdk::{Key, ModifierType},
     gio, glib,
 };
@@ -18,7 +18,7 @@ use std::rc::Rc;
 
 use crate::Event;
 use crate::NativeWindow;
-use crate::widgets::model::DispatchObject;
+use crate::widgets::model::HistoryObject;
 
 pub struct CommsWidgets {
     pub workspace_stack: Stack,
@@ -30,6 +30,14 @@ pub struct CommsPointers {
     pub active_directive: Rc<RefCell<String>>,
     pub is_prepending: Rc<RefCell<bool>>,
     pub is_fetching: Rc<RefCell<bool>>,
+    pub history_sync_cursor: Rc<RefCell<usize>>,
+    pub preflight_overlay: Overlay,
+    pub preflight_stack_container: Box,
+    pub preflight_stack: Stack,
+    pub preflight_sys_buf: sourceview5::Buffer,
+    pub preflight_dir_buf: sourceview5::Buffer,
+    pub preflight_eng_buf: sourceview5::Buffer,
+    pub preflight_prm_buf: sourceview5::Buffer,
 }
 
 // Helper to avoid circular dependencies
@@ -69,80 +77,101 @@ pub fn build(
     comms_page.set_hexpand(true);
     comms_page.set_vexpand(true);
 
-    let main_paned = Paned::new(Orientation::Vertical);
-    main_paned.set_vexpand(true);
-    main_paned.set_hexpand(true);
-    main_paned.set_position(9999);
-    main_paned.set_shrink_end_child(false);
-    main_paned.set_wide_handle(false);
+    let chat_overlay = Overlay::new();
+    chat_overlay.set_hexpand(true);
+    chat_overlay.set_vexpand(true);
 
     let scrolled_window = ScrolledWindow::builder()
         .hscrollbar_policy(PolicyType::Never)
         .vscrollbar_policy(PolicyType::Automatic)
-        .vexpand(true)
         .build();
 
+    chat_overlay.set_child(Some(&scrolled_window));
+
     let adj = scrolled_window.vadjustment();
-    let was_at_bottom = Rc::new(RefCell::new(true));
-    let was_at_top = Rc::new(RefCell::new(true));
-    let last_upper = Rc::new(RefCell::new(0.0));
     let is_prepending = Rc::new(RefCell::new(false));
     let is_fetching = Rc::new(RefCell::new(false));
 
     let tx_clone_hist = tx_event.clone();
-    let was_at_bottom_val = was_at_bottom.clone();
-    let was_at_top_val = was_at_top.clone();
-    let is_prepending_val = is_prepending.clone();
-    let is_fetching_val = is_fetching.clone();
+    let adj_clone = adj.clone();
+    let is_prepending_bind = is_prepending.clone();
+    let is_fetching_bind = is_fetching.clone();
 
-    adj.connect_value_notify(move |a| {
-        let val = a.value();
-        let page_size = a.page_size();
-        let upper = a.upper();
-        let lower = a.lower();
+    scrolled_window.connect_map(move |_| {
+        // Only connect the adjustments after the window is physically drawn
+        let was_at_bottom = Rc::new(RefCell::new(true));
+        let was_at_top = Rc::new(RefCell::new(true));
+        let last_upper = Rc::new(RefCell::new(0.0));
 
-        *was_at_bottom_val.borrow_mut() = (val - (upper - page_size)).abs() < 10.0;
+        let was_at_bottom_val = was_at_bottom.clone();
+        let was_at_top_val = was_at_top.clone();
+        let is_prepending_val = is_prepending_bind.clone();
+        let is_fetching_val = is_fetching_bind.clone();
+        let tx_for_async = tx_clone_hist.clone();
 
-        let is_at_top = val <= lower + 10.0;
-        let previously_at_top = *was_at_top_val.borrow();
-        *was_at_top_val.borrow_mut() = is_at_top;
+        adj_clone.connect_value_notify(move |a| {
+            let upper = a.upper();
+            let page_size = a.page_size();
+            if upper <= page_size || upper == 0.0 { return; }
 
-        if is_at_top && !previously_at_top && upper > page_size {
-            if !*is_fetching_val.borrow() {
-                *is_fetching_val.borrow_mut() = true;
-                *is_prepending_val.borrow_mut() = true;
-                let tx_for_async = tx_clone_hist.clone();
-                glib::MainContext::default().spawn_local(async move {
-                    let _ = tx_for_async.send(Event::LoadHistory).await;
-                });
+            let val = a.value();
+            let lower = a.lower();
+            *was_at_bottom_val.borrow_mut() = (val - (upper - page_size)).abs() < 10.0;
+
+            let is_at_top = val <= lower + 10.0;
+            let previously_at_top = *was_at_top_val.borrow();
+            *was_at_top_val.borrow_mut() = is_at_top;
+
+            if is_at_top && !previously_at_top && upper > page_size {
+                if !*is_fetching_val.borrow() {
+                    *is_fetching_val.borrow_mut() = true;
+                    *is_prepending_val.borrow_mut() = true;
+                    let tx_hist = tx_for_async.clone();
+                    glib::MainContext::default().spawn_local(async move {
+                        let _ = tx_hist.send(Event::LoadHistory).await;
+                    });
+                }
             }
-        }
-    });
+        });
 
-    let was_at_bottom_upper = was_at_bottom.clone();
-    let is_prepending_upper = is_prepending.clone();
-    let last_upper_ref = last_upper.clone();
+        let was_at_bottom_upper = was_at_bottom.clone();
+        let is_prepending_upper = is_prepending_bind.clone();
+        let last_upper_ref = last_upper.clone();
 
-    adj.connect_upper_notify(move |a| {
-        let upper = a.upper();
-        let page_size = a.page_size();
-        let old_upper = *last_upper_ref.borrow();
-        let delta = upper - old_upper;
-        *last_upper_ref.borrow_mut() = upper;
+        adj_clone.connect_upper_notify(move |a| {
+            let upper = a.upper();
+            let page_size = a.page_size();
+            if upper <= page_size || upper == 0.0 { return; }
 
-        if upper > page_size {
+            let old_upper = *last_upper_ref.borrow();
+            let delta = upper - old_upper;
+            *last_upper_ref.borrow_mut() = upper;
+
             if *was_at_bottom_upper.borrow() {
                 a.set_value(upper - page_size);
             } else if *is_prepending_upper.borrow() && delta > 0.0 {
                 a.set_value(a.value() + delta);
                 *is_prepending_upper.borrow_mut() = false;
             }
-        }
+        });
     });
 
-    let console_store = gio::ListStore::new::<DispatchObject>();
-    let console_filter = FilterListModel::new(Some(console_store.clone()), None::<gtk4::Filter>);
-    let console_selection = NoSelection::new(Some(console_filter));
+    let console_store = gio::ListStore::new::<HistoryObject>();
+    // REMOVED FilterListModel per Architect instructions
+    let console_selection = NoSelection::new(Some(console_store.clone()));
+
+    // Create a Rust struct to hold the precise pointers without DOM traversal
+    #[derive(Clone)]
+    struct BubbleWidgets {
+        left_spacer: Box,
+        bubble: Box,
+        right_spacer: Box,
+        left_expand_btn: Button,
+        meta_label: Label,
+        right_expand_btn: Button,
+        chat_content_view: SourceView,
+        expander: Expander,
+    }
 
     let console_factory = SignalListItemFactory::new();
     console_factory.connect_setup(move |_factory, item| {
@@ -150,9 +179,11 @@ pub fn build(
         let root = Box::new(Orientation::Horizontal, 0);
         root.set_hexpand(true);
         root.add_css_class("console-row");
+
         let left_spacer = Box::new(Orientation::Horizontal, 0);
         left_spacer.set_hexpand(true);
         root.append(&left_spacer);
+
         let bubble = Box::new(Orientation::Vertical, 4);
         bubble.add_css_class("bubble-box");
         bubble.set_hexpand(true);
@@ -168,7 +199,6 @@ pub fn build(
         let meta_label = Label::new(None);
         meta_label.set_xalign(0.0);
         meta_label.add_css_class("dim-label");
-
         meta_label.set_hexpand(true);
 
         let right_expand_btn = Button::builder()
@@ -190,7 +220,6 @@ pub fn build(
         chat_content_view.set_wrap_mode(gtk4::WrapMode::WordChar);
         chat_content_view.set_show_line_numbers(false);
         chat_content_view.set_monospace(true);
-        chat_content_view.set_width_request(800);
         chat_content_view.set_hexpand(true);
         chat_content_view.set_focusable(true);
         chat_content_view.set_cursor_visible(false);
@@ -210,132 +239,34 @@ pub fn build(
         payload_content_view.set_monospace(true);
         payload_content_view.set_cursor_visible(false);
         payload_content_view.add_css_class("view");
+        payload_content_view.set_size_request(-1, 300);
         let payload_scroll = ScrolledWindow::builder()
             .child(&payload_content_view)
-            .height_request(200)
             .build();
         expander.set_child(Some(&payload_scroll));
         bubble.append(&expander);
 
-        // --- Staging Mode (Payload Editor) ---
-        let staging_box = Box::new(Orientation::Vertical, 8);
-        staging_box.set_visible(false);
-        staging_box.set_hexpand(true);
-        staging_box.set_vexpand(true);
-
-        let create_staging_section = |title: &str| -> (Box, SourceView) {
-            let section_box = Box::new(Orientation::Vertical, 4);
-            section_box.set_vexpand(true);
-            section_box.set_hexpand(true);
-
-            let label = Label::builder()
-                .label(title)
-                .xalign(0.0)
-                .css_classes(vec!["dim-label"])
-                .build();
-            let view = SourceView::builder()
-                .wrap_mode(gtk4::WrapMode::WordChar)
-                .editable(true)
-                .monospace(true)
-                .build();
-            view.add_css_class("view");
-            view.set_vexpand(true);
-
-            let scroll = ScrolledWindow::builder()
-                .child(&view)
-                .hscrollbar_policy(PolicyType::Never)
-                .vscrollbar_policy(PolicyType::Automatic)
-                .min_content_height(80)
-                .vexpand(true)
-                .build();
-
-            section_box.append(&label);
-            section_box.append(&scroll);
-
-            (section_box, view)
-        };
-
-        let (box_sys, system_view) = create_staging_section("SYSTEM");
-        let (box_dir, directives_view) = create_staging_section("DIRECTIVES");
-        let (box_eng, engrams_view) = create_staging_section("ENGRAMS");
-        let (box_prm, prompt_view) = create_staging_section("PROMPT");
-
-        let paned_1 = Paned::new(Orientation::Vertical);
-        let paned_2 = Paned::new(Orientation::Vertical);
-        let paned_3 = Paned::new(Orientation::Vertical);
-
-        paned_1.set_wide_handle(true);
-        paned_2.set_wide_handle(true);
-        paned_3.set_wide_handle(true);
-
-        paned_1.set_vexpand(true);
-        paned_1.set_hexpand(true);
-        paned_2.set_vexpand(true);
-        paned_2.set_hexpand(true);
-        paned_3.set_vexpand(true);
-        paned_3.set_hexpand(true);
-
-        paned_1.set_shrink_start_child(false);
-        paned_1.set_shrink_end_child(false);
-        paned_2.set_shrink_start_child(false);
-        paned_2.set_shrink_end_child(false);
-        paned_3.set_shrink_start_child(false);
-        paned_3.set_shrink_end_child(false);
-
-        paned_3.set_start_child(Some(&box_eng));
-        paned_3.set_end_child(Some(&box_prm));
-
-        paned_2.set_start_child(Some(&box_dir));
-        paned_2.set_end_child(Some(&paned_3));
-
-        paned_1.set_start_child(Some(&box_sys));
-        paned_1.set_end_child(Some(&paned_2));
-
-        staging_box.append(&paned_1);
-
-        let actions_box = Box::new(Orientation::Horizontal, 8);
-        actions_box.set_halign(Align::End);
-        let cancel_btn = Button::builder()
-            .icon_name("window-close-symbolic")
-            .tooltip_text("Delete Post")
-            .css_classes(vec!["flat", "destructive-action"])
-            .build();
-        let dispatch_btn = Button::builder()
-            .icon_name("document-save-symbolic")
-            .tooltip_text("Save and Send")
-            .css_classes(vec!["suggested-action"])
-            .build();
-        actions_box.append(&cancel_btn);
-        actions_box.append(&dispatch_btn);
-        staging_box.append(&actions_box);
-
-        bubble.append(&staging_box);
-
-        // --- Pulse Mode (Animation) ---
-        let pulse_box = Box::new(Orientation::Horizontal, 8);
-        pulse_box.set_visible(false);
-        pulse_box.set_halign(Align::Center);
-        pulse_box.set_margin_top(12);
-        pulse_box.set_margin_bottom(12);
-
-        let pulse_spinner = gtk4::Spinner::new();
-        pulse_spinner.set_spinning(true);
-        pulse_spinner.add_css_class("pulse-spinner");
-
-        let pulse_icon = Image::builder()
-            .icon_name("brain-symbolic")
-            .pixel_size(32)
-            .build();
-        pulse_icon.add_css_class("accent");
-
-        pulse_box.append(&pulse_icon);
-        pulse_box.append(&pulse_spinner);
-        bubble.append(&pulse_box);
-
         root.append(&bubble);
+
         let right_spacer = Box::new(Orientation::Horizontal, 0);
         right_spacer.set_hexpand(true);
         root.append(&right_spacer);
+
+        // Pack pointers securely into a struct and attach to the list item
+        let widgets = BubbleWidgets {
+            left_spacer,
+            bubble: bubble.clone(),
+            right_spacer,
+            left_expand_btn: left_expand_btn.clone(),
+            meta_label,
+            right_expand_btn: right_expand_btn.clone(),
+            chat_content_view: chat_content_view.clone(),
+            expander,
+        };
+        let boxed_widgets = glib::BoxedAnyObject::new(widgets);
+        unsafe {
+            item.set_data("widgets", boxed_widgets);
+        }
 
         let gesture = GestureClick::new();
         gesture.set_propagation_phase(PropagationPhase::Target);
@@ -347,7 +278,7 @@ pub fn build(
             if n_press == 1 {
                 if let Some(obj) = item_clone
                     .item()
-                    .and_downcast::<DispatchObject>()
+                    .and_downcast::<HistoryObject>()
                 {
                     let expanded = !obj.is_expanded();
                     obj.set_is_expanded(expanded);
@@ -379,329 +310,230 @@ pub fn build(
         item.set_child(Some(&root));
     });
 
-    let tx_dispatch = tx_event.clone();
-    let console_store_bind = console_store.clone();
     console_factory.connect_bind(move |_factory, item| {
         let Some(item) = item.downcast_ref::<ListItem>() else { return; };
-        let Some(root) = item.child().and_then(|c| c.downcast::<Box>().ok()) else { return; };
+        let Some(obj) = item.item().and_then(|c| c.downcast::<HistoryObject>().ok()) else { return; };
 
-        let Some(left_spacer) = root.first_child().and_then(|c| c.downcast::<Box>().ok()) else { return; };
-        let Some(bubble) = left_spacer.next_sibling().and_then(|c| c.downcast::<Box>().ok()) else { return; };
-        let Some(right_spacer) = bubble.next_sibling().and_then(|c| c.downcast::<Box>().ok()) else { return; };
+        // Retrieve preserved absolute pointers securely
+        let boxed_widgets = unsafe { item.data::<glib::BoxedAnyObject>("widgets") };
+        let Some(boxed_ptr) = boxed_widgets else { return; };
+        let widgets = unsafe { boxed_ptr.as_ref() }.borrow::<BubbleWidgets>();
 
-        let Some(obj) = item.item().and_then(|c| c.downcast::<DispatchObject>().ok()) else { return; };
+        widgets.bubble.remove_css_class("architect-bubble");
+        widgets.bubble.remove_css_class("una-bubble");
+        widgets.left_spacer.set_visible(false);
+        widgets.right_spacer.set_visible(false);
 
-        let Some(header_box) = bubble.first_child().and_then(|c| c.downcast::<Box>().ok()) else { return; };
-        let Some(left_expand_btn) = header_box.first_child().and_then(|c| c.downcast::<Button>().ok()) else { return; };
-        let Some(meta_label) = left_expand_btn.next_sibling().and_then(|c| c.downcast::<Label>().ok()) else { return; };
-        let Some(right_expand_btn) = header_box.last_child().and_then(|c| c.downcast::<Button>().ok()) else { return; };
+        widgets.chat_content_view.set_visible(false);
+        widgets.expander.set_visible(false);
+        widgets.left_expand_btn.set_visible(false);
+        widgets.right_expand_btn.set_visible(false);
 
-        let Some(chat_view) = header_box.next_sibling().and_then(|c| c.downcast::<SourceView>().ok()) else { return; };
-        let Some(expander) = chat_view.next_sibling().and_then(|c| c.downcast::<Expander>().ok()) else { return; };
-        let Some(staging_box) = expander.next_sibling().and_then(|c| c.downcast::<Box>().ok()) else { return; };
-        let Some(pulse_box) = staging_box.next_sibling().and_then(|c| c.downcast::<Box>().ok()) else { return; };
+        // STANDARD MODE
+        let is_chat = obj.is_chat();
+        let sender = obj.sender();
+        let timestamp = obj.timestamp();
+        let content = obj.content();
+        let subject = obj.subject();
 
-        bubble.remove_css_class("architect-bubble");
-        bubble.remove_css_class("una-bubble");
-        left_spacer.set_visible(false);
-        right_spacer.set_visible(false);
+        if is_chat {
+            widgets.chat_content_view.set_visible(true);
+            widgets.meta_label.set_text(&format!("{} • {}", sender, timestamp));
+            widgets.meta_label.remove_css_class("role-architect");
+            widgets.meta_label.remove_css_class("role-una");
+            widgets.meta_label.remove_css_class("role-system");
 
-        chat_view.set_visible(false);
-        expander.set_visible(false);
-        staging_box.set_visible(false);
-        pulse_box.set_visible(false);
-        left_expand_btn.set_visible(false);
-        right_expand_btn.set_visible(false);
+            let is_expanded = obj.is_expanded();
+            let line_count = content.trim_end().lines().count();
 
-        let Some(paned_1) = staging_box.first_child().and_then(|c| c.downcast::<Paned>().ok()) else { return; };
-        let Some(actions_box) = paned_1.next_sibling().and_then(|c| c.downcast::<Box>().ok()) else { return; };
-
-        let Some(box_sys) = paned_1.start_child().and_then(|c| c.downcast::<Box>().ok()) else { return; };
-        let Some(sys_scroll) = box_sys.last_child().and_then(|c| c.downcast::<ScrolledWindow>().ok()) else { return; };
-        let Some(system_view) = sys_scroll.child().and_downcast::<SourceView>() else { return; };
-
-        let Some(paned_2) = paned_1.end_child().and_then(|c| c.downcast::<Paned>().ok()) else { return; };
-        let Some(box_dir) = paned_2.start_child().and_then(|c| c.downcast::<Box>().ok()) else { return; };
-        let Some(dir_scroll) = box_dir.last_child().and_then(|c| c.downcast::<ScrolledWindow>().ok()) else { return; };
-        let Some(directives_view) = dir_scroll.child().and_downcast::<SourceView>() else { return; };
-
-        let Some(paned_3) = paned_2.end_child().and_then(|c| c.downcast::<Paned>().ok()) else { return; };
-        let Some(box_eng) = paned_3.start_child().and_then(|c| c.downcast::<Box>().ok()) else { return; };
-        let Some(eng_scroll) = box_eng.last_child().and_then(|c| c.downcast::<ScrolledWindow>().ok()) else { return; };
-        let Some(engrams_view) = eng_scroll.child().and_downcast::<SourceView>() else { return; };
-
-        let Some(box_prm) = paned_3.end_child().and_then(|c| c.downcast::<Box>().ok()) else { return; };
-        let Some(prm_scroll) = box_prm.last_child().and_then(|c| c.downcast::<ScrolledWindow>().ok()) else { return; };
-        let Some(prompt_view) = prm_scroll.child().and_downcast::<SourceView>() else { return; };
-
-        let Some(cancel_btn) = actions_box.first_child().and_then(|c| c.downcast::<Button>().ok()) else { return; };
-        let Some(dispatch_btn) = cancel_btn.next_sibling().and_then(|c| c.downcast::<Button>().ok()) else { return; };
-
-        let message_type = obj.message_type();
-
-        if message_type == 1 {
-            // STAGING MODE
-            staging_box.set_visible(true);
-            bubble.add_css_class("architect-bubble");
-            left_spacer.set_visible(true);
-            right_spacer.set_visible(false);
-
-            meta_label.set_text("PRE-FLIGHT STAGING");
-            meta_label.add_css_class("role-architect");
-            meta_label.set_xalign(1.0);
-
-            system_view.buffer().set_text(&obj.system_text());
-            directives_view.buffer().set_text(&obj.directives_text());
-            engrams_view.buffer().set_text(&obj.engrams_text());
-            prompt_view.buffer().set_text(&obj.prompt_text());
-
-            let is_locked = obj.is_locked();
-            system_view.set_editable(!is_locked);
-            directives_view.set_editable(!is_locked);
-            engrams_view.set_editable(!is_locked);
-            prompt_view.set_editable(!is_locked);
-            dispatch_btn.set_sensitive(!is_locked);
-            cancel_btn.set_sensitive(!is_locked);
-
-            let obj_clone = obj.clone();
-            let bubble_clone = bubble.clone();
-            let console_store_clone = console_store_bind.clone();
-
-            if let Some(sig) = unsafe { cancel_btn.steal_data::<glib::SignalHandlerId>("clicked_sig") } {
-                cancel_btn.disconnect(sig);
-            }
-            let cancel_sig = cancel_btn.connect_clicked(move |_| {
-                let dialog = gtk4::AlertDialog::builder()
-                    .message("Delete Payload?")
-                    .detail("Are you sure you want to discard this pre-flight payload? This cannot be undone.")
-                    .buttons(["Cancel", "Delete"])
-                    .cancel_button(0)
-                    .default_button(1)
-                    .modal(true)
-                    .build();
-
-                let obj_cancel = obj_clone.clone();
-                let store_cancel = console_store_clone.clone();
-
-                let root_win = bubble_clone.root().and_downcast::<gtk4::Window>();
-
-                dialog.choose(
-                    root_win.as_ref(),
-                    None::<&gio::Cancellable>,
-                    move |result| {
-                        if let Ok(choice) = result {
-                            if choice == 1 {
-                                let n = store_cancel.n_items();
-                                for i in 0..n {
-                                    if let Some(item) = store_cancel.item(i).and_downcast::<DispatchObject>() {
-                                        if item.id() == obj_cancel.id() {
-                                            store_cancel.remove(i);
-                                            break;
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                );
-            });
-
-            let tx_clone2 = tx_dispatch.clone();
-            let obj_clone2 = obj.clone();
-            let sys_view_clone2 = system_view.clone();
-            let dir_view_clone2 = directives_view.clone();
-            let eng_view_clone2 = engrams_view.clone();
-            let prm_view_clone2 = prompt_view.clone();
-
-            let obj_sys = obj.clone();
-            if let Some(sig) = unsafe { system_view.buffer().steal_data::<glib::SignalHandlerId>("changed_sig") } {
-                system_view.buffer().disconnect(sig);
-            }
-            let sig_sys = system_view.buffer().connect_changed(move |buf| {
-                let (s, e) = buf.bounds();
-                obj_sys.set_system_text(buf.text(&s, &e, false).to_string());
-            });
-            unsafe { system_view.buffer().set_data("changed_sig", sig_sys); }
-
-            let obj_dir = obj.clone();
-            if let Some(sig) = unsafe { directives_view.buffer().steal_data::<glib::SignalHandlerId>("changed_sig") } {
-                directives_view.buffer().disconnect(sig);
-            }
-            let sig_dir = directives_view.buffer().connect_changed(move |buf| {
-                let (s, e) = buf.bounds();
-                obj_dir.set_directives_text(buf.text(&s, &e, false).to_string());
-            });
-            unsafe { directives_view.buffer().set_data("changed_sig", sig_dir); }
-
-            let obj_eng = obj.clone();
-            if let Some(sig) = unsafe { engrams_view.buffer().steal_data::<glib::SignalHandlerId>("changed_sig") } {
-                engrams_view.buffer().disconnect(sig);
-            }
-            let sig_eng = engrams_view.buffer().connect_changed(move |buf| {
-                let (s, e) = buf.bounds();
-                obj_eng.set_engrams_text(buf.text(&s, &e, false).to_string());
-            });
-            unsafe { engrams_view.buffer().set_data("changed_sig", sig_eng); }
-
-            let obj_prm = obj.clone();
-            if let Some(sig) = unsafe { prompt_view.buffer().steal_data::<glib::SignalHandlerId>("changed_sig") } {
-                prompt_view.buffer().disconnect(sig);
-            }
-            let sig_prm = prompt_view.buffer().connect_changed(move |buf| {
-                let (s, e) = buf.bounds();
-                obj_prm.set_prompt_text(buf.text(&s, &e, false).to_string());
-            });
-            unsafe { prompt_view.buffer().set_data("changed_sig", sig_prm); }
-
-            let cancel_btn_clone = cancel_btn.clone();
-            let dispatch_btn_clone = dispatch_btn.clone();
-            let console_store_pulse = console_store_bind.clone();
-
-            if let Some(sig) = unsafe { dispatch_btn_clone.steal_data::<glib::SignalHandlerId>("clicked_sig") } {
-                dispatch_btn_clone.disconnect(sig);
-            }
-            let btn_for_closure = dispatch_btn_clone.clone();
-            let dispatch_sig = dispatch_btn_clone.connect_clicked(move |_| {
-                obj_clone2.set_is_locked(true);
-                sys_view_clone2.set_editable(false);
-                dir_view_clone2.set_editable(false);
-                eng_view_clone2.set_editable(false);
-                prm_view_clone2.set_editable(false);
-                cancel_btn_clone.set_sensitive(false);
-                btn_for_closure.set_sensitive(false);
-
-                let id = format!("{}-pulse", chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0));
-                let pulse_obj = DispatchObject::new_pulse(&id);
-                console_store_pulse.append(&pulse_obj);
-
-                let (s, e) = sys_view_clone2.buffer().bounds();
-                let system_text = sys_view_clone2.buffer().text(&s, &e, false).to_string();
-
-                let (s, e) = dir_view_clone2.buffer().bounds();
-                let directives_text = dir_view_clone2.buffer().text(&s, &e, false).to_string();
-
-                let (s, e) = eng_view_clone2.buffer().bounds();
-                let engrams_text = eng_view_clone2.buffer().text(&s, &e, false).to_string();
-
-                let (s, e) = prm_view_clone2.buffer().bounds();
-                let prompt_text = prm_view_clone2.buffer().text(&s, &e, false).to_string();
-
-                obj_clone2.set_system_text(system_text.clone());
-                obj_clone2.set_directives_text(directives_text.clone());
-                obj_clone2.set_engrams_text(engrams_text.clone());
-                obj_clone2.set_prompt_text(prompt_text.clone());
-
-                let payload = bandy::state::PreFlightPayload {
-                    system: system_text,
-                    directives: directives_text,
-                    engrams: engrams_text,
-                    prompt: prompt_text,
-                };
-                let json = serde_json::to_string(&payload).unwrap();
-
-                let tx_async = tx_clone2.clone();
-                glib::MainContext::default().spawn_local(async move {
-                    let _ = tx_async.send(Event::DispatchPayload(json)).await;
-                });
-            });
-            unsafe {
-                cancel_btn.set_data("clicked_sig", cancel_sig);
-                dispatch_btn.set_data("clicked_sig", dispatch_sig);
-            }
-
-        } else if message_type == 2 {
-            // PULSE MODE
-            pulse_box.set_visible(true);
-            bubble.add_css_class("una-bubble");
-            left_spacer.set_visible(false);
-            right_spacer.set_visible(true);
-            meta_label.set_text("AWAITING SYNAPSE...");
-            meta_label.add_css_class("role-una");
-            meta_label.set_xalign(0.0);
-        } else {
-            // STANDARD MODE
-            let is_chat = obj.is_chat();
-            let sender = obj.sender();
-            let timestamp = obj.timestamp();
-            let content = obj.content();
-            let subject = obj.subject();
-
-            if is_chat {
-                chat_view.set_visible(true);
-                meta_label.set_text(&format!("{} • {}", sender, timestamp));
-                meta_label.remove_css_class("role-architect");
-                meta_label.remove_css_class("role-una");
-                meta_label.remove_css_class("role-system");
-
-                let is_expanded = obj.is_expanded();
-                let line_count = content.trim_end().lines().count();
-
-                if sender == "Architect" {
-                    meta_label.add_css_class("role-architect");
-                    bubble.add_css_class("architect-bubble");
-                    left_spacer.set_visible(true);
-                    right_spacer.set_visible(false);
-                    meta_label.set_halign(gtk4::Align::End);
-                    meta_label.set_xalign(1.0);
-                    if line_count > 11 {
-                        left_expand_btn.set_visible(true);
-                        right_expand_btn.set_visible(false);
-                        left_expand_btn.set_icon_name(if is_expanded { "pan-up-symbolic" } else { "pan-down-symbolic" });
-                    } else {
-                        left_expand_btn.set_visible(false);
-                        right_expand_btn.set_visible(false);
-                    }
+            if sender == "Architect" {
+                widgets.meta_label.add_css_class("role-architect");
+                widgets.bubble.add_css_class("architect-bubble");
+                widgets.left_spacer.set_visible(true);
+                widgets.right_spacer.set_visible(false);
+                widgets.meta_label.set_halign(gtk4::Align::End);
+                widgets.meta_label.set_xalign(1.0);
+                if line_count > 11 {
+                    widgets.left_expand_btn.set_visible(true);
+                    widgets.right_expand_btn.set_visible(false);
+                    widgets.left_expand_btn.set_icon_name(if is_expanded { "pan-up-symbolic" } else { "pan-down-symbolic" });
                 } else {
-                    if sender == "Una-Prime" {
-                        meta_label.add_css_class("role-una");
-                    } else {
-                        meta_label.add_css_class("role-system");
-                    }
-                    bubble.add_css_class("una-bubble");
-                    left_spacer.set_visible(false);
-                    right_spacer.set_visible(true);
-                    meta_label.set_halign(gtk4::Align::Start);
-                    meta_label.set_xalign(0.0);
-                    if line_count > 11 {
-                        left_expand_btn.set_visible(false);
-                        right_expand_btn.set_visible(true);
-                        right_expand_btn.set_icon_name(if is_expanded { "pan-up-symbolic" } else { "pan-down-symbolic" });
-                    } else {
-                        left_expand_btn.set_visible(false);
-                        right_expand_btn.set_visible(false);
-                    }
-                }
-                if line_count > 11 && !is_expanded {
-                    let truncated: String = content.trim_end().lines().take(11).collect::<Vec<&str>>().join("\n");
-                    chat_view.buffer().set_text(&truncated);
-                } else {
-                    chat_view.buffer().set_text(content.trim_end());
+                    widgets.left_expand_btn.set_visible(false);
+                    widgets.right_expand_btn.set_visible(false);
                 }
             } else {
-                expander.set_visible(true);
-                bubble.add_css_class("una-bubble");
-                left_spacer.set_visible(false);
-                right_spacer.set_visible(true);
-                expander.set_label(Some(&format!("{} | {} | {}", sender, subject, timestamp)));
-                if let Some(scroll) = expander.child().and_then(|c| c.downcast::<ScrolledWindow>().ok()) {
-                    if let Some(content_view) = scroll.child().and_then(|c| c.downcast::<SourceView>().ok()) {
-                        content_view.buffer().set_text(&content);
-                    }
+                if sender == "Una-Prime" {
+                    widgets.meta_label.add_css_class("role-una");
+                } else {
+                    widgets.meta_label.add_css_class("role-system");
                 }
-                expander.set_expanded(false);
+                widgets.bubble.add_css_class("una-bubble");
+                widgets.left_spacer.set_visible(false);
+                widgets.right_spacer.set_visible(true);
+                widgets.meta_label.set_halign(gtk4::Align::Start);
+                widgets.meta_label.set_xalign(0.0);
+                if line_count > 11 {
+                    widgets.left_expand_btn.set_visible(false);
+                    widgets.right_expand_btn.set_visible(true);
+                    widgets.right_expand_btn.set_icon_name(if is_expanded { "pan-up-symbolic" } else { "pan-down-symbolic" });
+                } else {
+                    widgets.left_expand_btn.set_visible(false);
+                    widgets.right_expand_btn.set_visible(false);
+                }
             }
+            if line_count > 11 && !is_expanded {
+                let truncated: String = content.trim_end().lines().take(11).collect::<Vec<&str>>().join("\n");
+                widgets.chat_content_view.buffer().set_text(&truncated);
+            } else {
+                widgets.chat_content_view.buffer().set_text(content.trim_end());
+            }
+        } else {
+            widgets.expander.set_visible(true);
+            widgets.bubble.add_css_class("una-bubble");
+            widgets.left_spacer.set_visible(false);
+            widgets.right_spacer.set_visible(true);
+            widgets.expander.set_label(Some(&format!("{} | {} | {}", sender, subject, timestamp)));
+            // Direct access: No .child() traversal needed, we captured payload_content_view inside the BubbleWidgets if we want it, but wait, we didn't add payload_content_view to BubbleWidgets. I'll just use the traversal here since it's structurally fixed.
+            if let Some(scroll) = widgets.expander.child().and_then(|c: gtk4::Widget| c.downcast::<ScrolledWindow>().ok()) {
+                if let Some(content_view) = scroll.child().and_then(|c: gtk4::Widget| c.downcast::<SourceView>().ok()) {
+                    content_view.buffer().downcast::<sourceview5::Buffer>().unwrap().set_text(&content);
+                }
+            }
+            widgets.expander.set_expanded(false);
         }
     });
 
     let console_list_view = ListView::new(Some(console_selection), Some(console_factory));
     console_list_view.add_css_class("console");
-    console_list_view.set_valign(Align::End);
+    console_list_view.set_vexpand(true);
+    console_list_view.set_hexpand(true);
     scrolled_window.set_child(Some(&console_list_view));
 
-    main_paned.set_start_child(Some(&scrolled_window));
+    // --- PRE-FLIGHT STACK (Layer 2) ---
+    let preflight_stack_container = Box::new(Orientation::Vertical, 0);
+    preflight_stack_container.set_can_target(false);
+    preflight_stack_container.set_halign(gtk4::Align::Fill);
+    preflight_stack_container.set_valign(gtk4::Align::Fill);
+    preflight_stack_container.set_vexpand(true);
+    preflight_stack_container.set_hexpand(true);
+    preflight_stack_container.add_css_class("background"); // Ensure opacity over chat
+
+    let preflight_stack = Stack::new();
+    preflight_stack.set_transition_type(StackTransitionType::SlideLeftRight);
+    preflight_stack.set_vexpand(true);
+    preflight_stack.set_hexpand(true);
+
+    let create_preflight_tab = |_title: &str| -> (Box, sourceview5::Buffer) {
+        let vbox = Box::new(Orientation::Vertical, 4);
+        vbox.set_vexpand(true);
+        vbox.set_hexpand(true);
+
+        let buffer = sourceview5::Buffer::new(None);
+        let view = SourceView::with_buffer(&buffer);
+        view.set_wrap_mode(gtk4::WrapMode::WordChar);
+        view.set_editable(true);
+        view.set_monospace(true);
+        view.set_vexpand(true);
+        view.add_css_class("view");
+
+        let scroll = ScrolledWindow::builder()
+            .child(&view)
+            .hscrollbar_policy(PolicyType::Never)
+            .vscrollbar_policy(PolicyType::Automatic)
+            .vexpand(true)
+            .build();
+
+        vbox.append(&scroll);
+        (vbox, buffer)
+    };
+
+    let (box_sys, preflight_sys_buf) = create_preflight_tab("SYSTEM");
+    let (box_dir, preflight_dir_buf) = create_preflight_tab("DIRECTIVES");
+    let (box_eng, preflight_eng_buf) = create_preflight_tab("ENGRAMS");
+    let (box_prm, preflight_prm_buf) = create_preflight_tab("PROMPT");
+
+    preflight_stack.add_titled(&box_sys, Some("sys"), "System");
+    preflight_stack.add_titled(&box_dir, Some("dir"), "Directives");
+    preflight_stack.add_titled(&box_eng, Some("eng"), "Engrams");
+    preflight_stack.add_titled(&box_prm, Some("prm"), "Prompt");
+
+    let preflight_switcher = StackSwitcher::new();
+    preflight_switcher.set_stack(Some(&preflight_stack));
+    preflight_switcher.set_halign(Align::Center);
+    preflight_switcher.set_margin_top(8);
+    preflight_switcher.set_margin_bottom(8);
+
+    preflight_stack_container.append(&preflight_switcher);
+    preflight_stack_container.append(&preflight_stack);
+
+    let dispatch_actions_box = Box::new(Orientation::Horizontal, 8);
+    dispatch_actions_box.set_halign(Align::End);
+    dispatch_actions_box.set_margin_top(8);
+    dispatch_actions_box.set_margin_bottom(8);
+    dispatch_actions_box.set_margin_end(16);
+
+    let cancel_btn = Button::builder()
+        .icon_name("window-close-symbolic")
+        .tooltip_text("Discard Payload")
+        .css_classes(vec!["flat", "destructive-action"])
+        .build();
+    let dispatch_btn = Button::builder()
+        .icon_name("document-save-symbolic")
+        .tooltip_text("Save and Send Payload")
+        .css_classes(vec!["suggested-action"])
+        .build();
+
+    dispatch_actions_box.append(&cancel_btn);
+    dispatch_actions_box.append(&dispatch_btn);
+    preflight_stack_container.append(&dispatch_actions_box);
+
+    chat_overlay.add_overlay(&preflight_stack_container);
+    // Initially hide the PreFlight Stack
+    preflight_stack_container.set_visible(false);
+
+    let tx_dispatch_preflight = tx_event.clone();
+    let sys_buf_clone = preflight_sys_buf.clone();
+    let dir_buf_clone = preflight_dir_buf.clone();
+    let eng_buf_clone = preflight_eng_buf.clone();
+    let prm_buf_clone = preflight_prm_buf.clone();
+
+    dispatch_btn.connect_clicked(move |_| {
+        let (s, e) = sys_buf_clone.bounds();
+        let system_text = sys_buf_clone.text(&s, &e, false).to_string();
+
+        let (s, e) = dir_buf_clone.bounds();
+        let directives_text = dir_buf_clone.text(&s, &e, false).to_string();
+
+        let (s, e) = eng_buf_clone.bounds();
+        let engrams_text = eng_buf_clone.text(&s, &e, false).to_string();
+
+        let (s, e) = prm_buf_clone.bounds();
+        let prompt_text = prm_buf_clone.text(&s, &e, false).to_string();
+
+        let payload = bandy::state::PreFlightPayload {
+            system: system_text,
+            directives: directives_text,
+            engrams: engrams_text,
+            prompt: prompt_text,
+        };
+        let json = serde_json::to_string(&payload).unwrap();
+
+        let tx_async = tx_dispatch_preflight.clone();
+        glib::MainContext::default().spawn_local(async move {
+            let _ = tx_async.send(Event::DispatchPayload(json)).await;
+        });
+    });
+
+    let preflight_overlay_container = preflight_stack_container.clone();
+    cancel_btn.connect_clicked(move |_| {
+        // Here we just hide the overlay; the reactor will handle dropping it from AppState
+        preflight_overlay_container.set_visible(false);
+    });
+
+    comms_page.append(&chat_overlay);
 
     let input_container = Box::new(Orientation::Horizontal, 8);
-    input_container.set_valign(Align::Fill);
+    input_container.set_valign(Align::End);
     input_container.set_margin_start(16);
     input_container.set_margin_end(16);
     input_container.set_margin_bottom(16);
@@ -746,7 +578,6 @@ pub fn build(
     pop_box.set_margin_bottom(10);
     pop_box.set_margin_start(10);
     pop_box.set_margin_end(10);
-    pop_box.set_width_request(400);
 
     let action_box = Box::new(Orientation::Horizontal, 0);
     action_box.add_css_class("linked");
@@ -777,7 +608,6 @@ pub fn build(
     body_view.set_wrap_mode(gtk4::WrapMode::WordChar);
     enable_spelling(&body_view);
 
-    body_view.set_height_request(150);
     let body_scroll = ScrolledWindow::builder()
         .child(&body_view)
         .has_frame(true)
@@ -846,9 +676,9 @@ pub fn build(
     let input_scroll = ScrolledWindow::builder()
         .hscrollbar_policy(PolicyType::Never)
         .vscrollbar_policy(PolicyType::Automatic)
-        .vexpand(true)
-        .valign(Align::Fill)
         .has_frame(false)
+        .propagate_natural_height(true)
+        .max_content_height(150)
         .build();
     input_scroll.set_hexpand(true);
     let text_view = SourceView::builder()
@@ -860,7 +690,6 @@ pub fn build(
         .bottom_margin(8)
         .left_margin(10)
         .right_margin(10)
-        .vexpand(true)
         .build();
     enable_spelling(&text_view);
     text_view.add_css_class("view");
@@ -971,8 +800,7 @@ pub fn build(
     input_container.append(&input_scroll);
     input_container.append(&send_btn);
 
-    main_paned.set_end_child(Some(&input_container));
-    comms_page.append(&main_paned);
+    comms_page.append(&input_container);
 
     workspace_stack.add_titled(&comms_page, Some("comms"), "Comms");
 
@@ -1017,6 +845,14 @@ pub fn build(
         active_directive,
         is_prepending,
         is_fetching,
+        history_sync_cursor: Rc::new(RefCell::new(0)),
+        preflight_overlay: chat_overlay,
+        preflight_stack_container,
+        preflight_stack,
+        preflight_sys_buf,
+        preflight_dir_buf,
+        preflight_eng_buf,
+        preflight_prm_buf,
     };
 
     (widgets, pointers)

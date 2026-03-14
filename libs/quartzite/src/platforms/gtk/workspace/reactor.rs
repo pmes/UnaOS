@@ -4,12 +4,12 @@
 use async_channel::Receiver;
 use bandy::state::{ShardStatus, WolfpackState};
 use gtk4::prelude::*;
-use gtk4::{Label, Spinner};
+use gtk4::{Label, Spinner, Image, Overlay, Stack};
 use std::cell::RefCell;
 use std::rc::Rc;
 
 use crate::platforms::gtk::types::GuiUpdate;
-use crate::widgets::model::DispatchObject;
+use crate::widgets::model::HistoryObject;
 
 pub struct ReactorPointers {
     pub spinner_una: Spinner,
@@ -17,12 +17,20 @@ pub struct ReactorPointers {
     pub spinner_s9: Spinner,
     pub label_s9: Label,
     pub token_label: Label,
-    pub pulse_icon: Spinner,
+    pub pulse_icon: Image,
     pub context_view: crate::widgets::telemetry::ContextView,
     pub active_directive: Rc<RefCell<String>>,
     pub console_store: gtk4::gio::ListStore,
     pub is_fetching: Rc<RefCell<bool>>,
     pub is_prepending: Rc<RefCell<bool>>,
+    pub history_sync_cursor: Rc<RefCell<usize>>,
+    pub preflight_overlay: Overlay,
+    pub preflight_stack_container: gtk4::Box,
+    pub preflight_stack: Stack,
+    pub preflight_sys_buf: sourceview5::Buffer,
+    pub preflight_dir_buf: sourceview5::Buffer,
+    pub preflight_eng_buf: sourceview5::Buffer,
+    pub preflight_prm_buf: sourceview5::Buffer,
 }
 
 pub fn spawn_listener(pointers: ReactorPointers, rx_gui: Receiver<GuiUpdate>) {
@@ -41,55 +49,6 @@ pub fn spawn_listener(pointers: ReactorPointers, rx_gui: Receiver<GuiUpdate>) {
                     } else if text.trim().starts_with("[UNA]") {
                         sender = "Una-Prime".to_string();
                         is_chat = true;
-
-                        let n = pointers.console_store.n_items();
-                        let mut removals = Vec::new();
-
-                        let mut target_staging_idx = None;
-                        for i in (0..n).rev() {
-                            if let Some(obj) = pointers
-                                .console_store
-                                .item(i)
-                                .and_downcast::<DispatchObject>()
-                            {
-                                if obj.message_type() == 1 && obj.is_locked() {
-                                    target_staging_idx = Some(i);
-                                    break;
-                                }
-                            }
-                        }
-
-                        for i in 0..n {
-                            if let Some(obj) = pointers
-                                .console_store
-                                .item(i)
-                                .and_downcast::<DispatchObject>()
-                            {
-                                let t = obj.message_type();
-                                if t == 2 {
-                                    removals.push(i);
-                                } else if t == 1 {
-                                    if Some(i) == target_staging_idx {
-                                        let timestamp =
-                                            chrono::Local::now().format("%H:%M:%S").to_string();
-                                        let id = obj.id();
-                                        let prm = obj.prompt_text();
-                                        let user_obj = DispatchObject::new(
-                                            &id,
-                                            "Architect",
-                                            "Log",
-                                            &timestamp,
-                                            &prm,
-                                            true,
-                                        );
-                                        pointers.console_store.splice(i, 1, &[user_obj]);
-                                    }
-                                }
-                            }
-                        }
-                        for idx in removals.iter().rev() {
-                            pointers.console_store.remove(*idx);
-                        }
                     } else if text.trim().starts_with("[S") {
                         let after_s = &text.trim()[2..];
                         if let Some(first_char) = after_s.chars().next() {
@@ -103,8 +62,8 @@ pub fn spawn_listener(pointers: ReactorPointers, rx_gui: Receiver<GuiUpdate>) {
 
                     let timestamp = chrono::Local::now().format("%H:%M:%S").to_string();
                     let id = format!("{}", chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0));
-                    let obj =
-                        DispatchObject::new(&id, &sender, &subject, &timestamp, &content, is_chat);
+                    let obj = HistoryObject::new(&id, &sender, &subject, &timestamp, &content, is_chat);
+                    println!("Appending system log item: {}", content);
                     pointers.console_store.append(&obj);
                 }
                 GuiUpdate::HistoryBatch(messages) => {
@@ -114,29 +73,36 @@ pub fn spawn_listener(pointers: ReactorPointers, rx_gui: Receiver<GuiUpdate>) {
                         continue;
                     }
 
-                    *pointers.is_prepending.borrow_mut() = true;
-                    let mut new_objects = Vec::new();
-                    for (i, msg) in messages.into_iter().enumerate() {
-                        let id = format!(
-                            "{}-hist-{}",
-                            chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0),
-                            i
-                        );
-                        let obj = DispatchObject::new(
-                            &id,
-                            &msg.sender,
-                            "History",
-                            &msg.timestamp,
-                            &msg.content,
-                            msg.is_chat,
-                        );
-                        new_objects.push(obj);
+                    let mut cursor = pointers.history_sync_cursor.borrow_mut();
+                    let new_len = messages.len();
+
+                    if new_len > *cursor {
+                        // Extract only the delta
+                        let delta = &messages[*cursor..];
+                        for msg in delta {
+                            let id = format!("{}-hist", chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0));
+                            let obj = HistoryObject::new(&id, &msg.sender, "History", &msg.timestamp, &msg.content, msg.is_chat);
+                            println!("Appending history item: {}", msg.content);
+                            pointers.console_store.append(&obj);
+                        }
+                        // Advance the cursor
+                        *cursor = new_len;
+                    } else if new_len < *cursor {
+                        // The state was hard-cleared or rolled back.
+                        // Reset the entire list and cursor.
+                        pointers.console_store.remove_all();
+                        for msg in messages {
+                            let id = format!("{}-hist", chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0));
+                            let obj = HistoryObject::new(&id, &msg.sender, "History", &msg.timestamp, &msg.content, msg.is_chat);
+                            println!("Appending history item: {}", msg.content);
+                            pointers.console_store.append(&obj);
+                        }
+                        *cursor = new_len;
                     }
-                    pointers.console_store.splice(0, 0, &new_objects);
 
                     let fetch_lock = pointers.is_fetching.clone();
                     gtk4::glib::timeout_add_local(
-                        std::time::Duration::from_millis(500),
+                        std::time::Duration::from_millis(100),
                         move || {
                             *fetch_lock.borrow_mut() = false;
                             gtk4::glib::ControlFlow::Break
@@ -145,44 +111,68 @@ pub fn spawn_listener(pointers: ReactorPointers, rx_gui: Receiver<GuiUpdate>) {
                 }
                 GuiUpdate::ClearConsole => {
                     pointers.console_store.remove_all();
+                    *pointers.history_sync_cursor.borrow_mut() = 0;
                 }
                 GuiUpdate::ShardStatusChanged { id, status } => {
-                    let (spinner, label, name) = if id == "una-prime" {
-                        (&pointers.spinner_una, &pointers.label_una, "Una-Prime")
+                    if id == "una-prime" {
+                        match status {
+                            ShardStatus::Thinking => {
+                                pointers.spinner_una.set_spinning(true);
+                                pointers.spinner_una.start();
+                                pointers.label_una.set_text("Una-Prime (Thinking)");
+                                pointers.pulse_icon.add_css_class("thinking-pulse");
+                            }
+                            ShardStatus::Online => {
+                                pointers.spinner_una.set_spinning(false);
+                                pointers.spinner_una.stop();
+                                pointers.label_una.set_text("Una-Prime");
+                                pointers.pulse_icon.remove_css_class("thinking-pulse");
+                            }
+                            ShardStatus::Error => {
+                                pointers.spinner_una.set_spinning(false);
+                                pointers.spinner_una.stop();
+                                pointers.label_una.set_text("Una-Prime (Error)");
+                                pointers.pulse_icon.remove_css_class("thinking-pulse");
+                            }
+                            _ => {
+                                pointers.spinner_una.set_spinning(false);
+                                pointers.spinner_una.stop();
+                                pointers.label_una.set_text(&format!("Una-Prime ({:?})", status));
+                                pointers.pulse_icon.remove_css_class("thinking-pulse");
+                            }
+                        }
                     } else if id == "s9-mule" {
-                        (&pointers.spinner_s9, &pointers.label_s9, "S9-Mule")
-                    } else {
-                        continue;
-                    };
-                    match status {
-                        ShardStatus::Thinking => {
-                            spinner.set_spinning(true);
-                            spinner.start();
-                            label.set_text(&format!("{} (Thinking)", name));
-                        }
-                        ShardStatus::Online => {
-                            spinner.set_spinning(false);
-                            spinner.stop();
-                            label.set_text(name);
-                        }
-                        ShardStatus::Error => {
-                            spinner.set_spinning(false);
-                            spinner.stop();
-                            label.set_text(&format!("{} (Error)", name));
-                        }
-                        _ => {
-                            spinner.set_spinning(false);
-                            spinner.stop();
-                            label.set_text(&format!("{} ({:?})", name, status));
+                        match status {
+                            ShardStatus::Thinking => {
+                                pointers.spinner_s9.set_spinning(true);
+                                pointers.spinner_s9.start();
+                                pointers.label_s9.set_text("S9-Mule (Thinking)");
+                            }
+                            ShardStatus::Online => {
+                                pointers.spinner_s9.set_spinning(false);
+                                pointers.spinner_s9.stop();
+                                pointers.label_s9.set_text("S9-Mule");
+                            }
+                            ShardStatus::Error => {
+                                pointers.spinner_s9.set_spinning(false);
+                                pointers.spinner_s9.stop();
+                                pointers.label_s9.set_text("S9-Mule (Error)");
+                            }
+                            _ => {
+                                pointers.spinner_s9.set_spinning(false);
+                                pointers.spinner_s9.stop();
+                                pointers.label_s9.set_text(&format!("S9-Mule ({:?})", status));
+                            }
                         }
                     }
                 }
                 GuiUpdate::SidebarStatus(state) => match state {
                     WolfpackState::Dreaming => {
-                        pointers.pulse_icon.start();
+                        // The dreaming state can also activate the pulse
+                        pointers.pulse_icon.add_css_class("thinking-pulse");
                     }
                     _ => {
-                        pointers.pulse_icon.stop();
+                        pointers.pulse_icon.remove_css_class("thinking-pulse");
                     }
                 },
                 GuiUpdate::TokenUsage(p, c, t) => {
@@ -193,53 +183,20 @@ pub fn spawn_listener(pointers: ReactorPointers, rx_gui: Receiver<GuiUpdate>) {
                     *pointers.active_directive.borrow_mut() = d;
                 }
                 GuiUpdate::ReviewPayload(payload) => {
-                    let id = format!("{}", chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0));
-                    let staging_obj = DispatchObject::new_staging(
-                        &id,
-                        &payload.system,
-                        &payload.directives,
-                        &payload.engrams,
-                        &payload.prompt,
-                    );
-                    pointers.console_store.append(&staging_obj);
+                    // Update TextBuffers with Payload
+                    pointers.preflight_sys_buf.set_text(&payload.system);
+                    pointers.preflight_dir_buf.set_text(&payload.directives);
+                    pointers.preflight_eng_buf.set_text(&payload.engrams);
+                    pointers.preflight_prm_buf.set_text(&payload.prompt);
+
+                    // Show Pre-Flight Stack Overlay via direct pointer
+                    pointers.preflight_stack_container.set_visible(true);
                 }
                 GuiUpdate::SynapseError(err_msg) => {
-                    let n = pointers.console_store.n_items();
-                    let mut pulse_idx = None;
-                    for i in 0..n {
-                        if let Some(obj) = pointers
-                            .console_store
-                            .item(i)
-                            .and_downcast::<DispatchObject>()
-                        {
-                            if obj.message_type() == 2 {
-                                pulse_idx = Some(i);
-                                break;
-                            }
-                        }
-                    }
-                    if let Some(idx) = pulse_idx {
-                        pointers.console_store.remove(idx);
-                    }
-
-                    let n = pointers.console_store.n_items();
-                    for i in 0..n {
-                        if let Some(obj) = pointers
-                            .console_store
-                            .item(i)
-                            .and_downcast::<DispatchObject>()
-                        {
-                            if obj.message_type() == 1 {
-                                obj.set_is_locked(false);
-                                pointers.console_store.items_changed(i, 1, 1);
-                            }
-                        }
-                    }
-
                     let timestamp = chrono::Local::now().format("%H:%M:%S").to_string();
                     let id = format!("{}", chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0));
                     let err_obj =
-                        DispatchObject::new(&id, "System Error", "Log", &timestamp, &err_msg, true);
+                        HistoryObject::new(&id, "System Error", "Log", &timestamp, &err_msg, true);
                     pointers.console_store.append(&err_obj);
                 }
                 GuiUpdate::ContextTelemetry(skeletons) => {
