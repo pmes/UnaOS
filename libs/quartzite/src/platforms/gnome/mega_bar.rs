@@ -62,12 +62,14 @@ impl MegaBar {
         main_h_paned.set_vexpand(true);
         main_h_paned.set_wide_handle(false);
         main_h_paned.set_shrink_start_child(false);
+        main_h_paned.set_shrink_end_child(false);
         main_h_paned.set_resize_start_child(false);
 
         // --- LEFT SIDE ---
         let left_toolbar = adw::ToolbarView::new();
         left_toolbar.set_widget_name("left");
         left_toolbar.add_css_class("builder-sidebar");
+        left_toolbar.set_size_request(260, -1);
 
         // Strip native drop-shadows
         left_toolbar.set_top_bar_style(adw::ToolbarStyle::Flat);

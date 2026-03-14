@@ -121,10 +121,12 @@ impl MegaBar {
         main_h_paned.set_vexpand(true);
         main_h_paned.set_wide_handle(false);
         main_h_paned.set_shrink_start_child(false);
+        main_h_paned.set_shrink_end_child(false);
         main_h_paned.set_resize_start_child(false);
 
         let left_vbox = Box::new(Orientation::Vertical, 0);
         left_vbox.add_css_class("builder-sidebar");
+        left_vbox.set_size_request(260, -1);
         left_vbox.append(left_content);
 
         let right_vbox = Box::new(Orientation::Vertical, 0);
