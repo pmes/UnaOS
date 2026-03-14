@@ -7,7 +7,6 @@ use gtk4::prelude::*;
 use gtk4::{Label, Spinner, Image, Overlay, Stack};
 use std::cell::RefCell;
 use std::rc::Rc;
-use sourceview5::prelude::*;
 
 use crate::platforms::gtk::types::GuiUpdate;
 use crate::widgets::model::HistoryObject;

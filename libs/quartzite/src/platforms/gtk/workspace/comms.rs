@@ -5,7 +5,7 @@ use async_channel::Sender;
 use gtk4::prelude::*;
 use gtk4::{
     Align, Box, Button, CheckButton, Entry, EventControllerKey, Expander, FileDialog,
-    FilterListModel, GestureClick, Image, Label, ListItem, ListView, NoSelection, Orientation,
+    GestureClick, Label, ListItem, ListView, NoSelection, Orientation,
     PolicyType, Popover, PropagationPhase, ScrolledWindow, SignalListItemFactory, Stack,
     StackSwitcher, StackTransitionType, ToggleButton, Overlay,
     gdk::{Key, ModifierType},
@@ -307,8 +307,8 @@ pub fn build(
 
         // Retrieve preserved absolute pointers securely
         let boxed_widgets = unsafe { item.data::<glib::BoxedAnyObject>("widgets") };
-        let Some(boxed_ref) = boxed_widgets else { return; };
-        let widgets = boxed_ref.borrow::<BubbleWidgets>();
+        let Some(boxed_ptr) = boxed_widgets else { return; };
+        let widgets = unsafe { boxed_ptr.as_ref() }.borrow::<BubbleWidgets>();
 
         widgets.bubble.remove_css_class("architect-bubble");
         widgets.bubble.remove_css_class("una-bubble");
@@ -385,9 +385,9 @@ pub fn build(
             widgets.right_spacer.set_visible(true);
             widgets.expander.set_label(Some(&format!("{} | {} | {}", sender, subject, timestamp)));
             // Direct access: No .child() traversal needed, we captured payload_content_view inside the BubbleWidgets if we want it, but wait, we didn't add payload_content_view to BubbleWidgets. I'll just use the traversal here since it's structurally fixed.
-            if let Some(scroll) = widgets.expander.child().and_then(|c| c.downcast::<ScrolledWindow>().ok()) {
-                if let Some(content_view) = scroll.child().and_then(|c| c.downcast::<SourceView>().ok()) {
-                    content_view.buffer().set_text(&content);
+            if let Some(scroll) = widgets.expander.child().and_then(|c: gtk4::Widget| c.downcast::<ScrolledWindow>().ok()) {
+                if let Some(content_view) = scroll.child().and_then(|c: gtk4::Widget| c.downcast::<SourceView>().ok()) {
+                    content_view.buffer().downcast::<sourceview5::Buffer>().unwrap().set_text(&content);
                 }
             }
             widgets.expander.set_expanded(false);
