@@ -407,11 +407,15 @@ pub fn build(
 
     let console_list_view = ListView::new(Some(console_selection), Some(console_factory));
     console_list_view.add_css_class("console");
-    console_list_view.set_vexpand(true);
-    console_list_view.set_hexpand(true);
-    console_list_view.set_margin_top(1);
-    console_list_view.set_margin_bottom(1);
-    scrolled_window.set_child(Some(&console_list_view));
+
+    let list_container = Box::new(Orientation::Vertical, 0);
+    list_container.set_vexpand(true);
+    list_container.set_hexpand(true);
+    list_container.set_valign(gtk4::Align::Fill);
+
+    list_container.append(&console_list_view);
+
+    scrolled_window.set_child(Some(&list_container));
 
     // --- PRE-FLIGHT STACK (Layer 2) ---
     let preflight_stack_container = Box::new(Orientation::Vertical, 0);
