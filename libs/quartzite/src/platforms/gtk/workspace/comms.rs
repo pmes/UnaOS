@@ -30,6 +30,7 @@ pub struct CommsPointers {
     pub active_directive: Rc<RefCell<String>>,
     pub is_prepending: Rc<RefCell<bool>>,
     pub is_fetching: Rc<RefCell<bool>>,
+    pub history_sync_cursor: Rc<RefCell<usize>>,
     pub preflight_overlay: Overlay,
     pub preflight_stack_container: Box,
     pub preflight_stack: Stack,
@@ -403,7 +404,8 @@ pub fn build(
 
     // --- PRE-FLIGHT STACK (Layer 2) ---
     let preflight_stack_container = Box::new(Orientation::Vertical, 0);
-    preflight_stack_container.set_valign(Align::End);
+    preflight_stack_container.set_halign(gtk4::Align::Fill);
+    preflight_stack_container.set_valign(gtk4::Align::Fill);
     preflight_stack_container.set_vexpand(true);
     preflight_stack_container.set_hexpand(true);
     preflight_stack_container.add_css_class("background"); // Ensure opacity over chat
@@ -839,6 +841,7 @@ pub fn build(
         active_directive,
         is_prepending,
         is_fetching,
+        history_sync_cursor: Rc::new(RefCell::new(0)),
         preflight_overlay: chat_overlay,
         preflight_stack_container,
         preflight_stack,

@@ -23,6 +23,7 @@ pub struct ReactorPointers {
     pub console_store: gtk4::gio::ListStore,
     pub is_fetching: Rc<RefCell<bool>>,
     pub is_prepending: Rc<RefCell<bool>>,
+    pub history_sync_cursor: Rc<RefCell<usize>>,
     pub preflight_overlay: Overlay,
     pub preflight_stack_container: gtk4::Box,
     pub preflight_stack: Stack,
@@ -72,30 +73,36 @@ pub fn spawn_listener(pointers: ReactorPointers, rx_gui: Receiver<GuiUpdate>) {
                         continue;
                     }
 
-                    *pointers.is_prepending.borrow_mut() = true;
-                    let mut new_objects = Vec::new();
-                    for (i, msg) in messages.into_iter().enumerate() {
-                        let id = format!(
-                            "{}-hist-{}",
-                            chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0),
-                            i
-                        );
-                        let obj = HistoryObject::new(
-                            &id,
-                            &msg.sender,
-                            "History",
-                            &msg.timestamp,
-                            &msg.content,
-                            msg.is_chat,
-                        );
-                        println!("Appending history item: {}", msg.content);
-                        new_objects.push(obj);
+                    let mut cursor = pointers.history_sync_cursor.borrow_mut();
+                    let new_len = messages.len();
+
+                    if new_len > *cursor {
+                        // Extract only the delta
+                        let delta = &messages[*cursor..];
+                        for msg in delta {
+                            let id = format!("{}-hist", chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0));
+                            let obj = HistoryObject::new(&id, &msg.sender, "History", &msg.timestamp, &msg.content, msg.is_chat);
+                            println!("Appending history item: {}", msg.content);
+                            pointers.console_store.append(&obj);
+                        }
+                        // Advance the cursor
+                        *cursor = new_len;
+                    } else if new_len < *cursor {
+                        // The state was hard-cleared or rolled back.
+                        // Reset the entire list and cursor.
+                        pointers.console_store.remove_all();
+                        for msg in messages {
+                            let id = format!("{}-hist", chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0));
+                            let obj = HistoryObject::new(&id, &msg.sender, "History", &msg.timestamp, &msg.content, msg.is_chat);
+                            println!("Appending history item: {}", msg.content);
+                            pointers.console_store.append(&obj);
+                        }
+                        *cursor = new_len;
                     }
-                    pointers.console_store.splice(0, 0, &new_objects);
 
                     let fetch_lock = pointers.is_fetching.clone();
                     gtk4::glib::timeout_add_local(
-                        std::time::Duration::from_millis(500),
+                        std::time::Duration::from_millis(100),
                         move || {
                             *fetch_lock.borrow_mut() = false;
                             gtk4::glib::ControlFlow::Break
@@ -104,6 +111,7 @@ pub fn spawn_listener(pointers: ReactorPointers, rx_gui: Receiver<GuiUpdate>) {
                 }
                 GuiUpdate::ClearConsole => {
                     pointers.console_store.remove_all();
+                    *pointers.history_sync_cursor.borrow_mut() = 0;
                 }
                 GuiUpdate::ShardStatusChanged { id, status } => {
                     if id == "una-prime" {

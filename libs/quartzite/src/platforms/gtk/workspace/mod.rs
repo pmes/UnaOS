@@ -52,6 +52,7 @@ pub fn build(
         console_store: comms_pointers.console_store,
         is_fetching: comms_pointers.is_fetching,
         is_prepending: comms_pointers.is_prepending,
+        history_sync_cursor: comms_pointers.history_sync_cursor,
         preflight_overlay: comms_pointers.preflight_overlay,
         preflight_stack_container: comms_pointers.preflight_stack_container,
         preflight_stack: comms_pointers.preflight_stack,
