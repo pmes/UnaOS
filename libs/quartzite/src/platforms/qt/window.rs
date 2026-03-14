@@ -91,10 +91,6 @@ pub fn spawn_state_listener(app_state: Arc<RwLock<AppState>>, rx: Receiver<SMess
         });
     }
 }
-            }
-        });
-    }
-}
 
 impl Backend {
     pub fn new<F>(_app_id: &str, _bootstrap_fn: F) -> Self
