@@ -404,7 +404,6 @@ pub fn build(
 
     let console_list_view = ListView::new(Some(console_selection), Some(console_factory));
     console_list_view.add_css_class("console");
-    console_list_view.set_valign(Align::End);
     console_list_view.set_vexpand(true);
     console_list_view.set_hexpand(true);
     scrolled_window.set_child(Some(&console_list_view));
@@ -422,7 +421,7 @@ pub fn build(
     preflight_stack.set_vexpand(true);
     preflight_stack.set_hexpand(true);
 
-    let create_preflight_tab = |title: &str| -> (Box, sourceview5::Buffer) {
+    let create_preflight_tab = |_title: &str| -> (Box, sourceview5::Buffer) {
         let vbox = Box::new(Orientation::Vertical, 4);
         vbox.set_vexpand(true);
         vbox.set_hexpand(true);
