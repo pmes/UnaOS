@@ -29,6 +29,7 @@ impl MegaBar {
         right_tabs: &gtk4::Widget,
         left_content: &gtk4::Widget,
         right_content: &gtk4::Widget,
+        brain_icon: &gtk4::Image,
     ) -> gtk4::Widget {
         // 0. The Dark Mode Hard-Wire (GNOME)
         let style_manager = adw::StyleManager::default();
@@ -67,7 +68,6 @@ impl MegaBar {
         let left_toolbar = adw::ToolbarView::new();
         left_toolbar.set_widget_name("left");
         left_toolbar.add_css_class("builder-sidebar");
-        left_toolbar.set_width_request(260);
 
         // Strip native drop-shadows
         left_toolbar.set_top_bar_style(adw::ToolbarStyle::Flat);
@@ -98,8 +98,9 @@ impl MegaBar {
             .show_start_title_buttons(false) // Only show the window controls on the far right
             .build();
 
-        // Pack the status widget
+        // Pack the status widget and brain icon
         right_header.pack_start(status_widget);
+        right_header.pack_start(brain_icon);
 
         right_toolbar.add_top_bar(&right_header);
         right_toolbar.add_top_bar(right_tabs);
