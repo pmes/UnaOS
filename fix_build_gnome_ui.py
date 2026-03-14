@@ -3,34 +3,14 @@ import re
 with open('libs/quartzite/src/platforms/gtk/spline.rs', 'r') as f:
     code = f.read()
 
-# Fix types in GTK spline
 code = code.replace(
-    'use gneiss_pal::{GuiUpdate, WolfpackState};',
-    'use crate::platforms::gtk::types::GuiUpdate;\nuse bandy::state::{WolfpackState, PreFlightPayload, AppState, HistoryItem, ShardStatus};'
-)
-code = code.replace('gneiss_pal::PreFlightPayload', 'PreFlightPayload')
-code = code.replace('gneiss_pal::HistoryItem', 'HistoryItem')
-code = code.replace('use gneiss_pal::shard::ShardStatus;\n', '')
-code = re.sub(r'(?:bandy::state::)+ShardStatus::', 'bandy::state::ShardStatus::', code)
-
-# Update `build_gtk_ui` signature
-code = code.replace(
-    'fn build_gtk_ui(\n    window: &ApplicationWindow,\n    tx_event: async_channel::Sender<Event>,\n    rx: Receiver<GuiUpdate>,\n    rx_telemetry: Receiver<bandy::SMessage>,\n) -> gtk4::Widget {',
-    'fn build_gtk_ui(\n    window: &ApplicationWindow,\n    tx_event: async_channel::Sender<Event>,\n    app_state: std::sync::Arc<std::sync::RwLock<AppState>>,\n    rx_synapse: Receiver<bandy::SMessage>,\n) -> gtk4::Widget {'
+    'fn build_gnome_ui(\n    window: &crate::NativeWindow,\n    tx_event: async_channel::Sender<Event>,\n    rx: Receiver<GuiUpdate>,\n    rx_synapse: Receiver<bandy::SMessage>,\n) -> crate::NativeView {',
+    'fn build_gnome_ui(\n    window: &crate::NativeWindow,\n    tx_event: async_channel::Sender<Event>,\n    app_state: std::sync::Arc<std::sync::RwLock<AppState>>,\n    rx_synapse: Receiver<bandy::SMessage>,\n) -> crate::NativeView {'
 )
 
-# Update `build_gnome_ui` signature
-code = code.replace(
-    'fn build_gnome_ui(\n    window: &ApplicationWindow,\n    tx_event: async_channel::Sender<Event>,\n    rx: Receiver<GuiUpdate>,\n    rx_synapse: Receiver<bandy::SMessage>,\n) -> gtk4::Widget {',
-    'fn build_gnome_ui(\n    window: &ApplicationWindow,\n    tx_event: async_channel::Sender<Event>,\n    app_state: std::sync::Arc<std::sync::RwLock<AppState>>,\n    rx_synapse: Receiver<bandy::SMessage>,\n) -> gtk4::Widget {'
-)
-
-
-# Rebuild the main tokio select completely manually
-
-translator_loop = """
-    let (tx_gui, rx_glib) = async_channel::unbounded::<GuiUpdate>();
-
+# Replace the inner GLib loop
+translator = """
+    let (tx_gui, rx) = async_channel::unbounded::<GuiUpdate>();
     let rx_synapse_clone = rx_synapse.clone();
     let app_state_clone = app_state.clone();
 
@@ -74,11 +54,11 @@ translator_loop = """
         }
     });
 
-    let mut rx_glib = rx_glib;
+    let mut rx_glib = rx;
 """
 
-code = code.replace('let mut rx_glib = rx;', translator_loop)
-code = code.replace('rx_telemetry', 'rx_synapse')
+# Replace the original `let mut rx_glib = rx;`
+code = code.replace('let mut rx_glib = rx;\n', translator)
 
 with open('libs/quartzite/src/platforms/gtk/spline.rs', 'w') as f:
     f.write(code)
