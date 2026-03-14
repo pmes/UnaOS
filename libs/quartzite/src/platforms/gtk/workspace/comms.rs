@@ -547,7 +547,7 @@ pub fn build(
     comms_page.append(&chat_overlay);
 
     let input_container = Box::new(Orientation::Horizontal, 8);
-    input_container.set_valign(Align::Fill);
+    input_container.set_valign(Align::End);
     input_container.set_margin_start(16);
     input_container.set_margin_end(16);
     input_container.set_margin_bottom(16);
@@ -690,10 +690,9 @@ pub fn build(
     let input_scroll = ScrolledWindow::builder()
         .hscrollbar_policy(PolicyType::Never)
         .vscrollbar_policy(PolicyType::Automatic)
-        .vexpand(true)
-        .valign(Align::Fill)
         .has_frame(false)
-        .min_content_height(50)
+        .propagate_natural_height(true)
+        .max_content_height(150)
         .build();
     input_scroll.set_hexpand(true);
     let text_view = SourceView::builder()
@@ -705,7 +704,6 @@ pub fn build(
         .bottom_margin(8)
         .left_margin(10)
         .right_margin(10)
-        .vexpand(true)
         .build();
     enable_spelling(&text_view);
     text_view.add_css_class("view");
