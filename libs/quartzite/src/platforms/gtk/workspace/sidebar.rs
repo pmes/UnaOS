@@ -128,6 +128,8 @@ pub fn build(window: &NativeWindow, tx_event: Sender<Event>) -> (SidebarWidgets,
     let nodes_scroll = ScrolledWindow::builder()
         .hscrollbar_policy(PolicyType::Never)
         .child(&column_view)
+        .min_content_height(400)
+        .min_content_width(200)
         .vexpand(true)
         .build();
 

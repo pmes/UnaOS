@@ -693,6 +693,7 @@ pub fn build(
         .vexpand(true)
         .valign(Align::Fill)
         .has_frame(false)
+        .min_content_height(50)
         .build();
     input_scroll.set_hexpand(true);
     let text_view = SourceView::builder()
