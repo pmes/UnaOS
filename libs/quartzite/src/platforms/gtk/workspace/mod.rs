@@ -6,7 +6,6 @@ pub mod translator;
 use async_channel::{Receiver, Sender};
 use bandy::SMessage;
 use bandy::state::AppState;
-use gtk4::prelude::*;
 use std::sync::{Arc, RwLock};
 use crate::Event;
 use crate::NativeWindow;

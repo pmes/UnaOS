@@ -7,7 +7,7 @@ use gtk4::{
     Adjustment, Align, Box, Button, ColumnView, ColumnViewColumn, DropDown,
     Image, Label, ListBox, ListItem, Orientation, PolicyType, Scale, ScrolledWindow,
     SignalListItemFactory, SingleSelection, Spinner, Stack, StackSwitcher, StackTransitionType,
-    StringList, StringObject, Switch, ToggleButton, Window, gio, glib,
+    StringList, StringObject, Switch, ToggleButton, Window, gio,
 };
 use sourceview5::View as SourceView;
 use sourceview5::prelude::*;
