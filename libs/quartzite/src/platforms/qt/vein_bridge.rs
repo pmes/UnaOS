@@ -19,7 +19,8 @@ use cxx_qt_lib::{QModelIndex, QString, QVariant};
 use std::sync::OnceLock;
 
 use crate::platforms::qt::window::GLOBAL_TX;
-use gneiss_pal::{Event, HistoryItem, PreFlightPayload};
+use gneiss_pal::Event;
+use bandy::state::{HistoryItem, PreFlightPayload};
 
 pub static VEIN_THREAD: OnceLock<cxx_qt::CxxQtThread<qobject::VeinBridge>> = OnceLock::new();
 pub static HISTORY_MODEL_THREAD: OnceLock<cxx_qt::CxxQtThread<qobject::HistoryModel>> =
@@ -433,6 +434,19 @@ pub fn route_console_log(log: String) {
         thread
             .queue(move |mut qobj| {
                 qobj.as_mut().append_log(QString::from(&log));
+            })
+            .unwrap();
+    }
+}
+
+pub fn route_console_batch(logs: Vec<String>) {
+    if let Some(thread) = NETWORK_LOG_MODEL_THREAD.get() {
+        let thread = thread.clone();
+        thread
+            .queue(move |mut qobj| {
+                qobj.as_mut().begin_reset_model();
+                qobj.as_mut().rust_mut().rows = logs;
+                qobj.as_mut().end_reset_model();
             })
             .unwrap();
     }

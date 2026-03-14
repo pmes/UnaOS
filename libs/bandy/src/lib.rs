@@ -14,6 +14,7 @@
 // You should have received a copy of the GNU Lesser General Public License
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
+pub mod state;
 pub mod synapse;
 pub mod telemetry;
 
@@ -62,6 +63,7 @@ pub struct WeightedSkeleton {
 /// This Enum defines the limits of what can be said between processes.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum SMessage {
+    StateInvalidated,
     // --- SYSTEM HEARTBEAT ---
     Ping,
     Kill(String),

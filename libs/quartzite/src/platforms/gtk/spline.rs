@@ -70,8 +70,8 @@ fn enable_spelling(view: &SourceView) {
 }
 
 // Import Elessar (Engine)
-use gneiss_pal::shard::ShardStatus;
-use gneiss_pal::{GuiUpdate, WolfpackState};
+use crate::platforms::gtk::types::GuiUpdate;
+use bandy::state::{WolfpackState, PreFlightPayload, AppState, HistoryItem, ShardStatus};
 
 pub struct CommsSpline {}
 
@@ -84,14 +84,14 @@ impl CommsSpline {
         &self,
         window: &crate::NativeWindow,
         tx_event: async_channel::Sender<Event>,
-        rx: Receiver<GuiUpdate>,
-        rx_telemetry: Receiver<bandy::SMessage>,
+        app_state: std::sync::Arc<std::sync::RwLock<AppState>>,
+        rx_synapse: Receiver<bandy::SMessage>,
     ) -> crate::NativeView {
         #[cfg(feature = "gnome")]
-        return build_gnome_ui(window, tx_event, rx, rx_telemetry);
+        return build_gnome_ui(window, tx_event, rx, rx_synapse);
 
         #[cfg(not(feature = "gnome"))]
-        return build_gtk_ui(window, tx_event, rx, rx_telemetry);
+        return build_gtk_ui(window, tx_event, app_state, rx_synapse);
     }
 }
 
@@ -100,7 +100,7 @@ fn build_gnome_ui(
     window: &crate::NativeWindow,
     tx_event: async_channel::Sender<Event>,
     rx: Receiver<GuiUpdate>,
-    rx_telemetry: Receiver<bandy::SMessage>,
+    rx_synapse: Receiver<bandy::SMessage>,
 ) -> crate::NativeView {
     // 1. Nodes Tab Rename
     let store = gio::ListStore::new::<StringObject>();
@@ -439,9 +439,9 @@ fn build_gnome_ui(
 
     // Spawn a local loop to listen to telemetry
     let context_view_clone = context_view.clone();
-    let rx_telemetry_clone = rx_telemetry.clone();
+    let rx_synapse_clone = rx_synapse.clone();
     glib::MainContext::default().spawn_local(async move {
-        while let Ok(msg) = rx_telemetry_clone.recv().await {
+        while let Ok(msg) = rx_synapse_clone.recv().await {
             match msg {
                 bandy::SMessage::ContextTelemetry { skeletons } => {
                     context_view_clone.update(skeletons);
@@ -1009,7 +1009,7 @@ fn build_gnome_ui(
                 obj_clone2.set_engrams_text(engrams_text.clone());
                 obj_clone2.set_prompt_text(prompt_text.clone());
 
-                let payload = gneiss_pal::PreFlightPayload {
+                let payload = PreFlightPayload {
                     system: system_text,
                     directives: directives_text,
                     engrams: engrams_text,
@@ -1688,9 +1688,50 @@ fn build_gnome_ui(
 fn build_gtk_ui(
     window: &crate::NativeWindow,
     tx_event: async_channel::Sender<Event>,
-    rx: Receiver<GuiUpdate>,
-    rx_telemetry: Receiver<bandy::SMessage>,
+    app_state: std::sync::Arc<std::sync::RwLock<AppState>>,
+    rx_synapse: Receiver<bandy::SMessage>,
 ) -> crate::NativeView {
+    let (tx_gui, rx) = async_channel::unbounded::<GuiUpdate>();
+    let rx_synapse_clone = rx_synapse.clone();
+    let app_state_clone = app_state.clone();
+    tokio::spawn(async move {
+        while let Ok(msg) = rx_synapse_clone.recv().await {
+            if matches!(msg, bandy::SMessage::StateInvalidated) {
+                let (history, logs, payload, tokens, sidebar, active_dir, synapse_err, shards) = {
+                    let st = app_state_clone.read().unwrap();
+                    (
+                        st.history.clone(),
+                        st.console_logs.clone(),
+                        st.review_payload.clone(),
+                        st.token_usage.clone(),
+                        st.sidebar_status.clone(),
+                        st.active_directive.clone(),
+                        st.synapse_error.clone(),
+                        st.shard_statuses.clone()
+                    )
+                };
+                let _ = tx_gui.send(GuiUpdate::HistoryBatch(history)).await;
+                if let Some(log) = logs.last() {
+                    let _ = tx_gui.send(GuiUpdate::ConsoleLog(log.clone())).await;
+                }
+                if let Some(p) = payload {
+                    let _ = tx_gui.send(GuiUpdate::ReviewPayload(p)).await;
+                }
+                let _ = tx_gui.send(GuiUpdate::TokenUsage(tokens.0, tokens.1, tokens.2)).await;
+                let _ = tx_gui.send(GuiUpdate::SidebarStatus(sidebar)).await;
+                if !active_dir.is_empty() {
+                    let _ = tx_gui.send(GuiUpdate::ActiveDirective(active_dir)).await;
+                }
+                if let Some(err) = synapse_err {
+                    let _ = tx_gui.send(GuiUpdate::SynapseError(err)).await;
+                }
+                for (id, status) in shards {
+                    let _ = tx_gui.send(GuiUpdate::ShardStatusChanged { id, status }).await;
+                }
+            }
+        }
+    });
+
     // 1. Nodes Tab Rename
     let store = gio::ListStore::new::<StringObject>();
     for item in ["Prime", "Encrypted", "Jules (Private)"].iter() {
@@ -2021,9 +2062,9 @@ fn build_gtk_ui(
 
     // Spawn a local loop to listen to telemetry
     let context_view_clone = context_view.clone();
-    let rx_telemetry_clone = rx_telemetry.clone();
+    let rx_synapse_clone = rx_synapse.clone();
     glib::MainContext::default().spawn_local(async move {
-        while let Ok(msg) = rx_telemetry_clone.recv().await {
+        while let Ok(msg) = rx_synapse_clone.recv().await {
             match msg {
                 bandy::SMessage::ContextTelemetry { skeletons } => {
                     context_view_clone.update(skeletons);
@@ -2583,7 +2624,7 @@ fn build_gtk_ui(
                 obj_clone2.set_engrams_text(engrams_text.clone());
                 obj_clone2.set_prompt_text(prompt_text.clone());
 
-                let payload = gneiss_pal::PreFlightPayload {
+                let payload = PreFlightPayload {
                     system: system_text,
                     directives: directives_text,
                     engrams: engrams_text,
