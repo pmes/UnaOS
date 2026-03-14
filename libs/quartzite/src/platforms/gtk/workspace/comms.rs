@@ -74,12 +74,10 @@ pub fn build(
     workspace_stack.set_transition_type(StackTransitionType::SlideLeftRight);
 
     let comms_page = Box::new(Orientation::Vertical, 0);
-    comms_page.set_size_request(800, 600);
     comms_page.set_hexpand(true);
     comms_page.set_vexpand(true);
 
     let chat_overlay = Overlay::new();
-    chat_overlay.set_size_request(400, 400); // Forces the Overlay open
     chat_overlay.set_hexpand(true);
     chat_overlay.set_vexpand(true);
 
@@ -407,21 +405,9 @@ pub fn build(
 
     let console_list_view = ListView::new(Some(console_selection), Some(console_factory));
     console_list_view.add_css_class("console");
-
-    let list_container = Box::new(Orientation::Vertical, 0);
-    list_container.set_vexpand(true);
-    list_container.set_hexpand(true);
-    list_container.set_valign(gtk4::Align::Fill);
-
-    // The Spatial Hard-Stop
-    let spacer = Box::new(Orientation::Vertical, 0);
-    spacer.set_size_request(1, 1);
-    spacer.set_opacity(0.0);
-    list_container.append(&spacer);
-
-    list_container.append(&console_list_view);
-
-    scrolled_window.set_child(Some(&list_container));
+    console_list_view.set_vexpand(true);
+    console_list_view.set_hexpand(true);
+    scrolled_window.set_child(Some(&console_list_view));
 
     // --- PRE-FLIGHT STACK (Layer 2) ---
     let preflight_stack_container = Box::new(Orientation::Vertical, 0);
