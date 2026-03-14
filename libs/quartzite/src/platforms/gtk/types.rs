@@ -17,4 +17,5 @@ pub enum GuiUpdate {
     ActiveDirective(String),
     ReviewPayload(PreFlightPayload), // The Interceptor
     SynapseError(String),            // Discrete failure signal
+    ContextTelemetry(Vec<bandy::state::ContextSkeleton>),
 }

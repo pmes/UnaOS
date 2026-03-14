@@ -46,78 +46,7 @@ impl MegaBar {
 
         // 1. Inject CSS
         let provider = CssProvider::new();
-        provider.load_from_string(
-            "
-            /* -- PANED HANDLE FIX -- */
-            paned > separator { background-color: transparent; }
-
-            /* === LIGHT MODE (DEFAULT) === */
-            .builder-sidebar, .builder-sidebar > background {
-                background-color: #ebebed;
-                background-image: none;
-            }
-            .builder-sidebar:backdrop, .builder-sidebar:backdrop > background {
-                background-color: #fafafa;
-                background-image: none;
-            }
-            .builder-view, .builder-view > background {
-                background-color: #ffffff;
-                background-image: none;
-                border-left: 1px solid @borders;
-            }
-            .builder-view:backdrop, .builder-view:backdrop > background {
-                background-color: #fcfcfc;
-                background-image: none;
-                border-left: 1px solid @borders;
-            }
-
-            /* === DARK MODE (HARDWIRED RUST CLASS) === */
-            .una-dark .builder-sidebar, .una-dark .builder-sidebar > background {
-                background-color: #2e2e32;
-                background-image: none;
-            }
-            .una-dark .builder-sidebar:backdrop, .una-dark .builder-sidebar:backdrop > background {
-                background-color: #26262a;
-                background-image: none;
-            }
-            .una-dark .builder-view, .una-dark .builder-view > background {
-                background-color: #1d1d20;
-                background-image: none;
-                border-left: 1px solid @borders;
-            }
-            .una-dark .builder-view:backdrop, .una-dark .builder-view:backdrop > background {
-                background-color: #18181a;
-                background-image: none;
-                border-left: 1px solid @borders;
-            }
-
-            /* -- CHILD TRANSPARENCY -- */
-            .builder-sidebar box,
-            .builder-sidebar scrolledwindow,
-            .builder-sidebar listview,
-            .builder-sidebar columnview,
-            .builder-sidebar listbox,
-            .builder-sidebar row,
-            .builder-sidebar tabview,
-            .builder-sidebar stack {
-                background-color: transparent;
-                background-image: none;
-                box-shadow: none;
-            }
-
-            /* -- UNIFIED HEADERS & TABS -- */
-            headerbar {
-                background: transparent;
-                border: none;
-                box-shadow: none;
-                min-height: 46px;
-            }
-            tabbar {
-                background: transparent;
-                border-bottom: 1px solid @borders;
-            }
-            ",
-        );
+        provider.load_from_resource("/org/una/vein/style.css");
 
         gtk4::style_context_add_provider_for_display(
             &gtk4::gdk::Display::default().expect("No display"),
