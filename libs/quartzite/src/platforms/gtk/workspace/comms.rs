@@ -84,7 +84,6 @@ pub fn build(
     let scrolled_window = ScrolledWindow::builder()
         .hscrollbar_policy(PolicyType::Never)
         .vscrollbar_policy(PolicyType::Automatic)
-        .min_content_height(400)
         .vexpand(true)
         .hexpand(true)
         .build();
@@ -240,7 +239,7 @@ pub fn build(
         payload_content_view.add_css_class("view");
         let payload_scroll = ScrolledWindow::builder()
             .child(&payload_content_view)
-            .min_content_height(200)
+            .max_content_height(300)
             .build();
         expander.set_child(Some(&payload_scroll));
         bubble.append(&expander);
@@ -438,7 +437,6 @@ pub fn build(
             .child(&view)
             .hscrollbar_policy(PolicyType::Never)
             .vscrollbar_policy(PolicyType::Automatic)
-            .min_content_height(150)
             .vexpand(true)
             .build();
 
@@ -611,8 +609,6 @@ pub fn build(
         .child(&body_view)
         .has_frame(true)
         .vexpand(true)
-        .min_content_height(150)
-        .min_content_width(400)
         .build();
     pop_box.append(&body_scroll);
 
