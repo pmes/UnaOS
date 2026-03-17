@@ -87,8 +87,8 @@ pub fn spawn_listener(pointers: ReactorPointers, rx_gui: Receiver<GuiUpdate>) {
                         batch.push(obj.upcast());
                     }
                     if !batch.is_empty() {
-                        let len = pointers.console_store.n_items();
-                        pointers.console_store.splice(len, 0, &batch);
+                        // Splice at index 0 to properly prepend history
+                        pointers.console_store.splice(0, 0, &batch);
                     }
 
                     let fetch_lock = pointers.is_fetching.clone();

@@ -161,6 +161,11 @@ pub fn build(
                 let current_upper = a_clone.upper();
                 let current_page_size = a_clone.page_size();
 
+                // Add this guard to prevent layout assertion failures
+                if current_upper <= current_page_size || current_upper == 0.0 {
+                    return glib::ControlFlow::Break;
+                }
+
                 if was_at_bottom {
                     a_clone.set_value(current_upper - current_page_size);
                 } else if is_prepending && delta > 0.0 {
@@ -263,8 +268,6 @@ pub fn build(
 
         // --- Standard Mode (Expander) ---
         let expander = Expander::new(None);
-        let expander_label = Label::new(None);
-        expander.set_child(Some(&expander_label));
         let payload_content_buffer = sourceview5::Buffer::new(None);
         let payload_content_view = SourceView::with_buffer(&payload_content_buffer);
         payload_content_view.set_editable(false);
