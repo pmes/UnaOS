@@ -14,14 +14,42 @@ pub fn spawn_translator(
     let (tx_gui, rx_gui) = async_channel::unbounded::<GuiUpdate>();
 
     tokio::spawn(async move {
+        let mut history_cursor = 0;
+        let mut console_cursor = 0;
+
         while let Ok(msg) = rx_synapse.recv().await {
             match msg {
                 SMessage::StateInvalidated => {
-                    let (history, logs, payload, tokens, sidebar, active_dir, synapse_err, shards) = {
+                    let (new_history_len, new_console_len) = {
                         let st = app_state.read().unwrap();
+                        (st.history.len(), st.console_logs.len())
+                    };
+
+                    // Handle full state rollbacks/clears gracefully
+                    if new_history_len < history_cursor || new_console_len < console_cursor {
+                        history_cursor = 0;
+                        console_cursor = 0;
+                        let _ = tx_gui.send(GuiUpdate::ClearConsole).await;
+                    }
+
+                    let (history_delta, logs_delta, payload, tokens, sidebar, active_dir, synapse_err, shards) = {
+                        let st = app_state.read().unwrap();
+
+                        let h_delta = if st.history.len() > history_cursor {
+                            st.history[history_cursor..].to_vec()
+                        } else {
+                            Vec::new()
+                        };
+
+                        let l_delta = if st.console_logs.len() > console_cursor {
+                            st.console_logs[console_cursor..].to_vec()
+                        } else {
+                            Vec::new()
+                        };
+
                         (
-                            st.history.clone(),
-                            st.console_logs.clone(),
+                            h_delta,
+                            l_delta,
                             st.review_payload.clone(),
                             st.token_usage.clone(),
                             st.sidebar_status.clone(),
@@ -30,10 +58,16 @@ pub fn spawn_translator(
                             st.shard_statuses.clone()
                         )
                     };
-                    let _ = tx_gui.send(GuiUpdate::HistoryBatch(history)).await;
-                    if let Some(log) = logs.last() {
-                        let _ = tx_gui.send(GuiUpdate::ConsoleLog(log.clone())).await;
+
+                    if !history_delta.is_empty() {
+                        let _ = tx_gui.send(GuiUpdate::HistoryBatch(history_delta)).await;
+                        history_cursor = new_history_len;
                     }
+                    if !logs_delta.is_empty() {
+                        let _ = tx_gui.send(GuiUpdate::ConsoleLogBatch(logs_delta)).await;
+                        console_cursor = new_console_len;
+                    }
+
                     if let Some(p) = payload {
                         let _ = tx_gui.send(GuiUpdate::ReviewPayload(p)).await;
                     }
