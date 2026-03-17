@@ -173,6 +173,24 @@ pub fn build(
     });
 
     let console_store = gio::ListStore::new::<HistoryObject>();
+
+    // Immediately seed the console_store with an initialization engram before UI render.
+    // By guaranteeing the ListView is never geometrically empty at boot, the GTK4 ScrolledWindow
+    // will calculate a valid `upper` bounds > 0. This mathematically prevents the
+    // `gtk_adjustment_configure` assertion (`lower + page_size <= upper`) from triggering
+    // without relying on layout hacks (like `gtk::Box` wrapping) that break the GtkScrollable interface.
+    let boot_id = format!("{}-boot", chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0));
+    let boot_timestamp = chrono::Local::now().format("%H:%M:%S").to_string();
+    let boot_obj = HistoryObject::new(
+        &boot_id,
+        "System",
+        "Boot",
+        &boot_timestamp,
+        "UnaOS Telemetry Link Established.",
+        true
+    );
+    console_store.append(&boot_obj);
+
     // REMOVED FilterListModel per Architect instructions
     let console_selection = NoSelection::new(Some(console_store.clone()));
 
