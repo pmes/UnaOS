@@ -35,8 +35,8 @@ mod imp {
     use super::*;
 
     #[derive(Default, Properties)]
-    #[properties(wrapper_type = super::DispatchObject)]
-    pub struct DispatchObject {
+    #[properties(wrapper_type = super::HistoryObject)]
+    pub struct HistoryObject {
         #[property(get, set)]
         pub id: RefCell<String>,
         #[property(get, set)]
@@ -51,43 +51,23 @@ mod imp {
         pub is_chat: RefCell<bool>,
         #[property(get, set)]
         pub is_expanded: RefCell<bool>,
-
-        // --- Added for J52 Staging Bubble ---
-        // 0 = Standard, 1 = Staging, 2 = Pulse
-        #[property(get, set)]
-        pub message_type: RefCell<u32>,
-
-        #[property(get, set)]
-        pub is_locked: RefCell<bool>,
-
-        #[property(get, set)]
-        pub system_text: RefCell<String>,
-
-        #[property(get, set)]
-        pub directives_text: RefCell<String>,
-
-        #[property(get, set)]
-        pub engrams_text: RefCell<String>,
-
-        #[property(get, set)]
-        pub prompt_text: RefCell<String>,
     }
 
     #[glib::object_subclass]
-    impl ObjectSubclass for DispatchObject {
-        const NAME: &'static str = "DispatchObject";
-        type Type = super::DispatchObject;
+    impl ObjectSubclass for HistoryObject {
+        const NAME: &'static str = "HistoryObject";
+        type Type = super::HistoryObject;
     }
 
     #[glib::derived_properties]
-    impl ObjectImpl for DispatchObject {}
+    impl ObjectImpl for HistoryObject {}
 }
 
 glib::wrapper! {
-    pub struct DispatchObject(ObjectSubclass<imp::DispatchObject>);
+    pub struct HistoryObject(ObjectSubclass<imp::HistoryObject>);
 }
 
-impl DispatchObject {
+impl HistoryObject {
     pub fn new(
         id: &str,
         sender: &str,
@@ -104,60 +84,6 @@ impl DispatchObject {
             .property("content", content)
             .property("is-chat", is_chat)
             .property("is-expanded", false)
-            .property("message-type", 0u32)
-            .property("is-locked", false)
-            .property("system-text", "")
-            .property("directives-text", "")
-            .property("engrams-text", "")
-            .property("prompt-text", "")
-            .build()
-    }
-
-    pub fn new_staging(
-        id: &str,
-        system: &str,
-        directives: &str,
-        engrams: &str,
-        prompt: &str,
-    ) -> Self {
-        glib::Object::builder()
-            .property("id", id)
-            .property("sender", "Architect")
-            .property("subject", "Pre-Flight Payload")
-            .property(
-                "timestamp",
-                chrono::Local::now().format("%H:%M:%S").to_string(),
-            )
-            .property("content", "Staging Payload")
-            .property("is-chat", true)
-            .property("is-expanded", false)
-            .property("message-type", 1u32)
-            .property("is-locked", false)
-            .property("system-text", system)
-            .property("directives-text", directives)
-            .property("engrams-text", engrams)
-            .property("prompt-text", prompt)
-            .build()
-    }
-
-    pub fn new_pulse(id: &str) -> Self {
-        glib::Object::builder()
-            .property("id", id)
-            .property("sender", "Una-Prime")
-            .property("subject", "Pulse")
-            .property(
-                "timestamp",
-                chrono::Local::now().format("%H:%M:%S").to_string(),
-            )
-            .property("content", "...")
-            .property("is-chat", true)
-            .property("is-expanded", false)
-            .property("message-type", 2u32)
-            .property("is-locked", true)
-            .property("system-text", "")
-            .property("directives-text", "")
-            .property("engrams-text", "")
-            .property("prompt-text", "")
             .build()
     }
 

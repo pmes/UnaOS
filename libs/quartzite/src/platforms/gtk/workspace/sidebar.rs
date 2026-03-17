@@ -31,7 +31,6 @@ pub struct SidebarPointers {
     pub spinner_s9: Spinner,
     pub label_s9: Label,
     pub token_label: Label,
-    pub pulse_icon: Spinner,
     pub context_view: crate::widgets::telemetry::ContextView,
 }
 
@@ -72,14 +71,9 @@ pub fn build(window: &NativeWindow, tx_event: Sender<Event>) -> (SidebarWidgets,
     token_label.set_wrap(true);
     token_label.set_justify(gtk4::Justification::Center);
 
-    let pulse_icon = Spinner::new();
-    pulse_icon.add_css_class("pulse-spinner");
-    pulse_icon.set_spinning(false);
-
     let status_group = Box::new(Orientation::Horizontal, 8);
     status_group.set_valign(gtk4::Align::Center);
     status_group.append(&sidebar_toggle);
-    status_group.append(&pulse_icon);
     status_group.append(&token_label);
 
     let left_stack = Stack::new();
@@ -134,6 +128,8 @@ pub fn build(window: &NativeWindow, tx_event: Sender<Event>) -> (SidebarWidgets,
     let nodes_scroll = ScrolledWindow::builder()
         .hscrollbar_policy(PolicyType::Never)
         .child(&column_view)
+        .min_content_height(200)
+        .min_content_width(200)
         .vexpand(true)
         .build();
 
@@ -198,7 +194,7 @@ pub fn build(window: &NativeWindow, tx_event: Sender<Event>) -> (SidebarWidgets,
         let scroll = ScrolledWindow::builder()
             .child(&prompt_view)
             .vexpand(true)
-            .height_request(150)
+            .min_content_height(150)
             .build();
         vbox.append(&scroll);
 
@@ -381,7 +377,6 @@ pub fn build(window: &NativeWindow, tx_event: Sender<Event>) -> (SidebarWidgets,
         spinner_s9,
         label_s9,
         token_label,
-        pulse_icon,
         context_view,
     };
 

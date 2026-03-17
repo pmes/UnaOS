@@ -51,11 +51,14 @@ fn build_gnome_ui(
     app_state: Arc<RwLock<AppState>>,
     rx_synapse: Receiver<SMessage>,
 ) -> crate::NativeView {
+    let brain_icon = gtk4::Image::from_icon_name("brain-symbolic");
+
     let workspace_widgets = crate::platforms::gtk::workspace::build(
         window,
         tx_event,
         app_state,
         rx_synapse,
+        brain_icon.clone(),
     );
 
     // Assemble the GNOME specific TabView for the workspace
@@ -75,6 +78,7 @@ fn build_gnome_ui(
         right_tab_bar.upcast_ref::<gtk4::Widget>(),
         workspace_widgets.left_stack.upcast_ref::<gtk4::Widget>(),
         right_tab_view.upcast_ref::<gtk4::Widget>(),
+        &brain_icon,
     )
 }
 
@@ -85,11 +89,14 @@ fn build_gtk_ui(
     app_state: Arc<RwLock<AppState>>,
     rx_synapse: Receiver<SMessage>,
 ) -> crate::NativeView {
+    let brain_icon = gtk4::Image::from_icon_name("brain-symbolic");
+
     let workspace_widgets = crate::platforms::gtk::workspace::build(
         window,
         tx_event,
         app_state,
         rx_synapse,
+        brain_icon.clone(),
     );
 
     crate::platforms::gtk::mega_bar::MegaBar::build(
@@ -100,5 +107,6 @@ fn build_gtk_ui(
         workspace_widgets.right_switcher.upcast_ref::<gtk4::Widget>(),
         workspace_widgets.left_stack.upcast_ref::<gtk4::Widget>(),
         workspace_widgets.right_stack.upcast_ref::<gtk4::Widget>(),
+        &brain_icon,
     )
 }

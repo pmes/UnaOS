@@ -85,3 +85,13 @@ tabbar {
 .role-architect { color: #0078d4; font-weight: bold; }
 .role-una { color: #d40078; font-weight: bold; }
 .role-system { color: #888888; font-style: italic; }
+
+@keyframes pulse-una-blue {
+    0%   { opacity: 0.3; color: #00E5FF; text-shadow: 0 0 2px #00E5FF; }
+    50%  { opacity: 1.0; color: #00E5FF; text-shadow: 0 0 8px #00E5FF; }
+    100% { opacity: 0.3; color: #00E5FF; text-shadow: 0 0 2px #00E5FF; }
+}
+
+.thinking-pulse {
+    animation: pulse-una-blue 1.5s infinite ease-in-out;
+}

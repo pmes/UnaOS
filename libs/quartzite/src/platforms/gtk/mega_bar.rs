@@ -28,6 +28,7 @@ impl MegaBar {
         right_tabs: &gtk4::Widget,
         left_content: &gtk4::Widget,
         right_content: &gtk4::Widget,
+        brain_icon: &gtk4::Image,
     ) -> gtk4::Widget {
         // 0. The Dark Mode Hard-Wire (Direct GNOME DBus Wiretap)
         if let Some(source) = gtk4::gio::SettingsSchemaSource::default() {
@@ -96,8 +97,9 @@ impl MegaBar {
         let fallback_right_header = HeaderBar::builder().show_title_buttons(true).build();
         fallback_right_header.set_title_widget(Some(&Label::new(Some(title))));
 
-        // Pack the status widget into the right header
+        // Pack the status widget and brain icon into the right header
         fallback_right_header.pack_start(status_widget);
+        fallback_right_header.pack_start(brain_icon);
 
         // CRITICAL ALIGNMENT FIX FOR GTK:
         let header_size_group = gtk4::SizeGroup::new(gtk4::SizeGroupMode::Vertical);
@@ -119,11 +121,12 @@ impl MegaBar {
         main_h_paned.set_vexpand(true);
         main_h_paned.set_wide_handle(false);
         main_h_paned.set_shrink_start_child(false);
+        main_h_paned.set_shrink_end_child(false);
         main_h_paned.set_resize_start_child(false);
 
         let left_vbox = Box::new(Orientation::Vertical, 0);
         left_vbox.add_css_class("builder-sidebar");
-        left_vbox.set_width_request(260);
+        left_vbox.set_size_request(260, -1);
         left_vbox.append(left_content);
 
         let right_vbox = Box::new(Orientation::Vertical, 0);
