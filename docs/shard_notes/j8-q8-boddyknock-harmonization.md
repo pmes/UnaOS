@@ -28,13 +28,13 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 3.  **The Translator & Reactor (The Synapse Routing Fix):** Created a pure `translator.rs` node that strictly converts `SMessage` packets into UI-safe `GuiUpdate` enums. It then funnels this to a unified `reactor.rs` loop holding cleanly grouped structs of `Rc<RefCell<...>>` UI pointers, permanently preventing silent multiple-consumer channel blocking on `rx_synapse`.
 4.  **Signature Harmony:** Symmetrical wrappers inside `spline.rs` now just bootstrap the `workspace::build()` return widgets directly into their platform-specific GNOME / GTK outer `MegaBar` boundaries.
 
-### Note to J12 (The Stubborn Render Bug)
+### Note to J11 (The Stubborn Render Bug)
 
 **Anomaly:** While the structural dissection was pristine, there is an ongoing bug where UI ListBox renders drop content text, exclusively outputting generic `System - [Time]` blocks without their associated payloads or proper parsing.
 
-**Diagnostic Warning for J12:**
+**Diagnostic Warning for J11:**
 The issue resides in `comms.rs` or `reactor.rs` during the mapping of the `DispatchObject` into the `console_store`.
 - **Hypothesis 1:** When the `SMessage` is caught by `translator.rs`, the payload contents (e.g. `GuiUpdate::ConsoleLog(text)`) are not properly bubbling down through to the `item.set_child` logic in `comms.rs`.
 - **Hypothesis 2:** The `SignalListItemFactory` in `comms.rs` binds `obj.content()`, but during the extraction process, it's possible `chat_view.buffer().set_text(content.trim_end());` is binding too late, or the `SourceView` parameters (height request, wrap modes) are collapsing visually because the paned window lost its inherited GTK geometry hints from `spline.rs`.
 
-**Directive to J12:** Verify the `console_factory.connect_bind` closure inside `libs/quartzite/src/platforms/gtk/workspace/comms.rs`. Ensure `SourceView` visibility states aren't hiding the payload, and trace `GuiUpdate::ConsoleLog` and `GuiUpdate::HistoryBatch` variants entering `reactor.rs`.
+**Directive to J11:** Verify the `console_factory.connect_bind` closure inside `libs/quartzite/src/platforms/gtk/workspace/comms.rs`. Ensure `SourceView` visibility states aren't hiding the payload, and trace `GuiUpdate::ConsoleLog` and `GuiUpdate::HistoryBatch` variants entering `reactor.rs`.
