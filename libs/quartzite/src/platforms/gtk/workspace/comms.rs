@@ -83,6 +83,8 @@ pub fn build(
     let scrolled_window = ScrolledWindow::builder()
         .hscrollbar_policy(PolicyType::Never)
         .vscrollbar_policy(PolicyType::Automatic)
+        .vexpand(true)
+        .hexpand(true)
         .build();
 
     chat_overlay.set_child(Some(&scrolled_window));
@@ -606,6 +608,8 @@ pub fn build(
     body_view.set_monospace(false);
     body_view.set_wrap_mode(gtk4::WrapMode::WordChar);
     enable_spelling(&body_view);
+    body_view.set_vexpand(true);
+    body_view.set_size_request(-1, 150);
 
     let body_scroll = ScrolledWindow::builder()
         .child(&body_view)
