@@ -148,12 +148,27 @@ pub fn build(
             let delta = upper - old_upper;
             *last_upper_ref.borrow_mut() = upper;
 
-            if *was_at_bottom_upper.borrow() {
-                a.set_value(upper - page_size);
-            } else if *is_prepending_upper.borrow() && delta > 0.0 {
-                a.set_value(a.value() + delta);
-                *is_prepending_upper.borrow_mut() = false;
-            }
+            let a_clone = a.clone();
+            let was_at_bottom = *was_at_bottom_upper.borrow();
+            let is_prepending = *is_prepending_upper.borrow();
+            let is_prepending_upper_clone = is_prepending_upper.clone();
+
+            // Defer the adjustment value update to the GTK idle loop.
+            // By wrapping `vadjustment.set_value()` in `idle_add_local`, we yield
+            // to the GTK frame cycle, ensuring that layout and geometry allocation
+            // for the new list items are mathematically finalized before scrolling.
+            glib::idle_add_local(move || {
+                let current_upper = a_clone.upper();
+                let current_page_size = a_clone.page_size();
+
+                if was_at_bottom {
+                    a_clone.set_value(current_upper - current_page_size);
+                } else if is_prepending && delta > 0.0 {
+                    a_clone.set_value(a_clone.value() + delta);
+                    *is_prepending_upper_clone.borrow_mut() = false;
+                }
+                glib::ControlFlow::Break
+            });
         });
     });
 
