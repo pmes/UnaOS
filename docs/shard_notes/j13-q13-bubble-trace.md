@@ -39,3 +39,8 @@ Enforced architectural boundaries. Added explicit telemetry in `libs/quartzite/s
 
 **Resolution (Phase 4):**
 Injected granular lifecycle and lock-acquisition traces to isolate the exact point of failure. Validated thread boot (`[J13 TRACE] TRANSLATOR: Thread spawned`), `rx_synapse` receipt (`[J13 TRACE] TRANSLATOR: Received a Synapse message`), and atomic read locks over the `RwLock<AppState>` (`[J13 TRACE] TRANSLATOR: Read lock acquired...`).
+
+**Anomaly (Phase 5):** Suspected MPMC queue theft. `VeinHandler` is likely consuming GUI-bound messages.
+
+**Resolution (Phase 5):**
+Injected trap into `VeinHandler` match block to verify channel theft. Added explicit `SMessage::StateInvalidated` trace to prove it is starving `translator.rs` by dropping the update payload into a wildcard void.

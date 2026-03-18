@@ -308,6 +308,9 @@ impl VeinHandler {
                                             }
                                         }
                                     }
+                                    SMessage::StateInvalidated => {
+                                        println!(">>> [J13 TRACE] VEIN THIEF CAUGHT: VeinHandler stole SMessage::StateInvalidated from the queue. Translator is starving!");
+                                    }
                                     _ => {}
                                 }
                             }
