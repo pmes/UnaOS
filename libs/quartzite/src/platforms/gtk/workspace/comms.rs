@@ -82,7 +82,7 @@ pub fn build(
 
     let scrolled_window = ScrolledWindow::builder()
         .hscrollbar_policy(PolicyType::Never)
-        .vscrollbar_policy(PolicyType::Automatic)
+        .vscrollbar_policy(PolicyType::Always)
         .vexpand(true)
         .hexpand(true)
         .build();
@@ -98,82 +98,92 @@ pub fn build(
     let is_prepending_bind = is_prepending.clone();
     let is_fetching_bind = is_fetching.clone();
 
-    scrolled_window.connect_map(move |_| {
-        // Only connect the adjustments after the window is physically drawn
-        let was_at_bottom = Rc::new(RefCell::new(true));
-        let was_at_top = Rc::new(RefCell::new(true));
-        let last_upper = Rc::new(RefCell::new(0.0));
+    // Only connect the adjustments after the window is physically drawn
+    let was_at_bottom = Rc::new(RefCell::new(true));
+    let was_at_top = Rc::new(RefCell::new(true));
+    let last_upper = Rc::new(RefCell::new(0.0));
 
-        let was_at_bottom_val = was_at_bottom.clone();
-        let was_at_top_val = was_at_top.clone();
-        let is_prepending_val = is_prepending_bind.clone();
-        let is_fetching_val = is_fetching_bind.clone();
-        let tx_for_async = tx_clone_hist.clone();
+    let was_at_bottom_val = was_at_bottom.clone();
+    let was_at_top_val = was_at_top.clone();
+    let is_prepending_val = is_prepending_bind.clone();
+    let is_fetching_val = is_fetching_bind.clone();
+    let tx_for_async = tx_clone_hist.clone();
 
-        adj_clone.connect_value_notify(move |a| {
-            let upper = a.upper();
-            let page_size = a.page_size();
-            if upper <= page_size || upper == 0.0 { return; }
+    adj_clone.connect_value_notify(move |a| {
+        let upper = a.upper();
+        let page_size = a.page_size();
+        if upper <= page_size || upper == 0.0 { return; }
 
-            let val = a.value();
-            let lower = a.lower();
-            *was_at_bottom_val.borrow_mut() = (val - (upper - page_size)).abs() < 10.0;
+        let val = a.value();
+        let lower = a.lower();
+        *was_at_bottom_val.borrow_mut() = (val - (upper - page_size)).abs() < 10.0;
 
-            let is_at_top = val <= lower + 10.0;
-            let previously_at_top = *was_at_top_val.borrow();
-            *was_at_top_val.borrow_mut() = is_at_top;
+        let is_at_top = val <= lower + 10.0;
+        let previously_at_top = *was_at_top_val.borrow();
+        *was_at_top_val.borrow_mut() = is_at_top;
 
-            if is_at_top && !previously_at_top && upper > page_size {
-                if !*is_fetching_val.borrow() {
-                    *is_fetching_val.borrow_mut() = true;
-                    *is_prepending_val.borrow_mut() = true;
-                    let tx_hist = tx_for_async.clone();
-                    glib::MainContext::default().spawn_local(async move {
-                        let _ = tx_hist.send(Event::LoadHistory).await;
-                    });
-                }
+        if is_at_top && !previously_at_top && upper > page_size {
+            if !*is_fetching_val.borrow() {
+                *is_fetching_val.borrow_mut() = true;
+                *is_prepending_val.borrow_mut() = true;
+                let tx_hist = tx_for_async.clone();
+                glib::MainContext::default().spawn_local(async move {
+                    let _ = tx_hist.send(Event::LoadHistory).await;
+                });
             }
-        });
+        }
+    });
 
-        let was_at_bottom_upper = was_at_bottom.clone();
-        let is_prepending_upper = is_prepending_bind.clone();
-        let last_upper_ref = last_upper.clone();
+    let was_at_bottom_upper = was_at_bottom.clone();
+    let is_prepending_upper = is_prepending_bind.clone();
+    let last_upper_ref = last_upper.clone();
 
-        adj_clone.connect_upper_notify(move |a| {
-            let upper = a.upper();
-            let page_size = a.page_size();
-            if upper <= page_size || upper == 0.0 { return; }
+    let is_fetching_for_upper = is_fetching_bind.clone();
 
-            let old_upper = *last_upper_ref.borrow();
-            let delta = upper - old_upper;
-            *last_upper_ref.borrow_mut() = upper;
+    adj_clone.connect_upper_notify(move |a| {
+        let upper = a.upper();
+        let page_size = a.page_size();
+        if upper <= page_size || upper == 0.0 { return; }
 
-            let a_clone = a.clone();
-            let was_at_bottom = *was_at_bottom_upper.borrow();
-            let is_prepending = *is_prepending_upper.borrow();
-            let is_prepending_upper_clone = is_prepending_upper.clone();
+        let old_upper = *last_upper_ref.borrow();
+        let delta = upper - old_upper;
+        *last_upper_ref.borrow_mut() = upper;
 
-            // Defer the adjustment value update to the GTK idle loop.
-            // By wrapping `vadjustment.set_value()` in `idle_add_local`, we yield
-            // to the GTK frame cycle, ensuring that layout and geometry allocation
-            // for the new list items are mathematically finalized before scrolling.
-            glib::idle_add_local(move || {
-                let current_upper = a_clone.upper();
-                let current_page_size = a_clone.page_size();
+        let a_clone = a.clone();
+        let was_at_bottom = *was_at_bottom_upper.borrow();
+        let is_prepending = *is_prepending_upper.borrow();
+        let is_prepending_upper_clone = is_prepending_upper.clone();
 
-                // Add this guard to prevent layout assertion failures
-                if current_upper <= current_page_size || current_upper == 0.0 {
-                    return glib::ControlFlow::Break;
-                }
+        let fetching_for_idle = is_fetching_for_upper.clone();
 
-                if was_at_bottom {
-                    a_clone.set_value(current_upper - current_page_size);
-                } else if is_prepending && delta > 0.0 {
-                    a_clone.set_value(a_clone.value() + delta);
-                    *is_prepending_upper_clone.borrow_mut() = false;
-                }
-                glib::ControlFlow::Break
-            });
+        // Defer the adjustment value update to the GTK idle loop.
+        // By wrapping `vadjustment.set_value()` in `idle_add_local`, we yield
+        // to the GTK frame cycle, ensuring that layout and geometry allocation
+        // for the new list items are mathematically finalized before scrolling.
+        glib::idle_add_local(move || {
+            let current_upper = a_clone.upper();
+            let current_page_size = a_clone.page_size();
+            let current_lower = a_clone.lower();
+
+            let fetching = *fetching_for_idle.borrow();
+
+            // Add this guard to prevent layout assertion failures
+            if current_upper <= current_page_size || current_upper == 0.0 || fetching {
+                return glib::ControlFlow::Break;
+            }
+
+            // Calculate the absolute maximum valid scroll position
+            let max_valid_value = (current_upper - current_page_size).max(current_lower);
+
+            if was_at_bottom {
+                a_clone.set_value(max_valid_value);
+            } else if is_prepending && delta > 0.0 {
+                // Strictly clamp the new value so we never overshoot GTK's internal bounds
+                let target_val = a_clone.value() + delta;
+                a_clone.set_value(target_val.clamp(current_lower, max_valid_value));
+                *is_prepending_upper_clone.borrow_mut() = false;
+            }
+            glib::ControlFlow::Break
         });
     });
 
@@ -262,6 +272,7 @@ pub fn build(
         chat_content_view.set_hexpand(true);
         chat_content_view.set_focusable(true);
         chat_content_view.set_cursor_visible(false);
+        chat_content_view.set_size_request(100, -1);
         chat_content_view.add_css_class("view");
 
         bubble.append(&chat_content_view);
@@ -869,9 +880,23 @@ pub fn build(
         });
     }
 
+    // FIX: Wait for the display server to map the UI (width > 0) before measuring text
+    let boot_fetched = Rc::new(RefCell::new(false));
     let tx_clone_load_hist = tx_event.clone();
-    glib::MainContext::default().spawn_local(async move {
-        let _ = tx_clone_load_hist.send(Event::LoadHistory).await;
+    let is_fetching_boot = is_fetching.clone();
+    let is_prepending_boot = is_prepending.clone();
+
+    scrolled_window.connect_map(move |_| {
+        if !*boot_fetched.borrow() {
+            *boot_fetched.borrow_mut() = true;
+            *is_fetching_boot.borrow_mut() = true;
+            *is_prepending_boot.borrow_mut() = true;
+
+            let tx_async = tx_clone_load_hist.clone();
+            glib::MainContext::default().spawn_local(async move {
+                let _ = tx_async.send(Event::LoadHistory).await;
+            });
+        }
     });
 
     let widgets = CommsWidgets {
