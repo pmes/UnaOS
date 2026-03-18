@@ -275,6 +275,7 @@ impl VeinHandler {
                                         });
                                     }
                                     SMessage::StorageLoadAllResult { records, receipt_id: _ } => {
+                                        println!(">>> [J13 TRACE] BACKEND: StorageLoadAllResult processed. Populating state with {} items.", records.len());
                                         {
                                             let mut s = state_bg.write().unwrap();
                                             s.history = records.into_iter().map(|r| HistoryItem {
@@ -732,6 +733,7 @@ impl AppHandler for VeinHandler {
                 let _ = self.tx.send(format!("DISPATCH_PAYLOAD:{}", json_payload));
             }
             Event::LoadHistory => {
+                println!(">>> [J13 TRACE] BACKEND: Received Event::LoadHistory. Attempting to fetch...");
                 let _ = self.tx.send("LOAD_HISTORY".to_string());
             }
             _ => {}

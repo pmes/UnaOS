@@ -22,3 +22,10 @@ This establishes the proof needed to verify if the UI is completely blind or if 
 
 **Resolution:**
 Executed a strict quarantine protocol on the scroll event handlers by injecting an immediate `return;` as the first line inside the closures in `libs/quartzite/src/platforms/gtk/workspace/comms.rs`. This isolates the suspected volatile math without destructively altering The Architect's logic. Simultaneously, injected `>>> [J13 TRACE] COMMS: Dispatching Event::LoadHistory to Backend.` inside `scrolled_window.connect_map` prior to the `.send(Event::LoadHistory)` call to prove frontend dispatch occurs successfully.
+
+**Anomaly (Phase 2):** The `Gtk-CRITICAL` assertion failed despite the quarantine, proving the panic is structural, not tied to custom scroll closures. Additionally, while the UI successfully dispatched `Event::LoadHistory`, the backend never responded with `GuiUpdate::HistoryBatch`, indicating a swallowed request or translation failure.
+
+**Resolution (Phase 2):**
+1. Replaced `.vscrollbar_policy(PolicyType::Always)` with `.vscrollbar_policy(PolicyType::Automatic)` on the main chat view `ScrolledWindow` in `comms.rs`. Forcing a scrollbar on a nearly empty list triggers impossible scroll math in GTK4, asserting the crash.
+2. Injected `>>> [J13 TRACE] BACKEND: Received Event::LoadHistory. Attempting to fetch...` in `handlers/vein/src/lib.rs` inside the `AppHandler` event loop immediately before the string dispatch.
+3. Injected `>>> [J13 TRACE] BACKEND: StorageLoadAllResult processed. Populating state with {} items.` in `handlers/vein/src/lib.rs` when `SMessage::StorageLoadAllResult` is caught in the brain loop and mapped to `app_state.history`.
