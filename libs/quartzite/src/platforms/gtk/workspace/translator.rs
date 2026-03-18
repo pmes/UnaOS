@@ -17,11 +17,16 @@ pub fn spawn_translator(
         let mut history_cursor = 0;
         let mut console_cursor = 0;
 
+        println!(">>> [J13 TRACE] TRANSLATOR: Thread spawned. Waiting for Synapse messages...");
+
         while let Ok(msg) = rx_synapse.recv().await {
+            println!(">>> [J13 TRACE] TRANSLATOR: Received a Synapse message.");
             match msg {
                 SMessage::StateInvalidated => {
                     let (new_history_len, new_console_len) = {
+                        println!(">>> [J13 TRACE] TRANSLATOR: Processing StateInvalidated. Attempting to acquire read lock...");
                         let st = app_state.read().unwrap();
+                        println!(">>> [J13 TRACE] TRANSLATOR: Read lock acquired. history_len: {}, console_len: {}", st.history.len(), st.console_logs.len());
                         (st.history.len(), st.console_logs.len())
                     };
 

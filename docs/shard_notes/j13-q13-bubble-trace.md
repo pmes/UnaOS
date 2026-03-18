@@ -34,3 +34,8 @@ Executed a strict quarantine protocol on the scroll event handlers by injecting 
 
 **Resolution (Phase 3):**
 Enforced architectural boundaries. Added explicit telemetry in `libs/quartzite/src/platforms/gtk/workspace/translator.rs` right before `tx_gui.send(GuiUpdate::HistoryBatch)` to verify the payload construction. Lifted the GTK scroll math quarantine in `libs/quartzite/src/platforms/gtk/workspace/comms.rs` because the math is now mathematically verified innocent.
+
+**Anomaly (Phase 4):** `translator.rs` is entirely silent, failing to process any `StateInvalidated` events. Suspected deadlock or dead thread.
+
+**Resolution (Phase 4):**
+Injected granular lifecycle and lock-acquisition traces to isolate the exact point of failure. Validated thread boot (`[J13 TRACE] TRANSLATOR: Thread spawned`), `rx_synapse` receipt (`[J13 TRACE] TRANSLATOR: Received a Synapse message`), and atomic read locks over the `RwLock<AppState>` (`[J13 TRACE] TRANSLATOR: Read lock acquired...`).
