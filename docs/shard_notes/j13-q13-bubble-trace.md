@@ -15,3 +15,10 @@ Injected precise, non-destructive `println!` telemetry at the GTK boundary to ve
 2. In `libs/quartzite/src/platforms/gtk/workspace/comms.rs`: Validates the GTK4 UI component tree attempts to mount the data via `console_factory.connect_bind` by logging the `Sender`, `Subject`, and `Timestamp` from the `HistoryObject` immediately after `item.item().and_then(|c| c.downcast::<HistoryObject>().ok())`.
 
 This establishes the proof needed to verify if the UI is completely blind or if the layout structures are merely hiding the list via 0-pixel allocations.
+
+## 2026-03-18 - [Quarantine of GTK Custom Scroll Math]
+
+**Anomaly:** Custom geometry calculations inside `adj.connect_value_notify` and `adj.connect_upper_notify` might be mathematically conflicting with GTK4's internal lazy-layout engine (`lower + page_size <= upper`), causing `gtk_adjustment_configure` assertion crashes. Additionally, it was unclear if the initial `Event::LoadHistory` request was actually firing.
+
+**Resolution:**
+Executed a strict quarantine protocol on the scroll event handlers by injecting an immediate `return;` as the first line inside the closures in `libs/quartzite/src/platforms/gtk/workspace/comms.rs`. This isolates the suspected volatile math without destructively altering The Architect's logic. Simultaneously, injected `>>> [J13 TRACE] COMMS: Dispatching Event::LoadHistory to Backend.` inside `scrolled_window.connect_map` prior to the `.send(Event::LoadHistory)` call to prove frontend dispatch occurs successfully.

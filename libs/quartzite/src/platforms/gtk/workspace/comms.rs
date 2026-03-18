@@ -110,6 +110,7 @@ pub fn build(
     let tx_for_async = tx_clone_hist.clone();
 
     adj_clone.connect_value_notify(move |a| {
+        return;
         let upper = a.upper();
         let page_size = a.page_size();
         if upper <= page_size || upper == 0.0 { return; }
@@ -141,6 +142,7 @@ pub fn build(
     let is_fetching_for_upper = is_fetching_bind.clone();
 
     adj_clone.connect_upper_notify(move |a| {
+        return;
         let upper = a.upper();
         let page_size = a.page_size();
         if upper <= page_size || upper == 0.0 { return; }
@@ -896,6 +898,7 @@ pub fn build(
 
             let tx_async = tx_clone_load_hist.clone();
             glib::MainContext::default().spawn_local(async move {
+                println!(">>> [J13 TRACE] COMMS: Dispatching Event::LoadHistory to Backend.");
                 let _ = tx_async.send(Event::LoadHistory).await;
             });
         }
