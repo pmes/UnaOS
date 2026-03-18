@@ -110,7 +110,6 @@ pub fn build(
     let tx_for_async = tx_clone_hist.clone();
 
     adj_clone.connect_value_notify(move |a| {
-        return;
         let upper = a.upper();
         let page_size = a.page_size();
         if upper <= page_size || upper == 0.0 { return; }
@@ -142,7 +141,6 @@ pub fn build(
     let is_fetching_for_upper = is_fetching_bind.clone();
 
     adj_clone.connect_upper_notify(move |a| {
-        return;
         let upper = a.upper();
         let page_size = a.page_size();
         if upper <= page_size || upper == 0.0 { return; }

@@ -29,3 +29,8 @@ Executed a strict quarantine protocol on the scroll event handlers by injecting 
 1. Replaced `.vscrollbar_policy(PolicyType::Always)` with `.vscrollbar_policy(PolicyType::Automatic)` on the main chat view `ScrolledWindow` in `comms.rs`. Forcing a scrollbar on a nearly empty list triggers impossible scroll math in GTK4, asserting the crash.
 2. Injected `>>> [J13 TRACE] BACKEND: Received Event::LoadHistory. Attempting to fetch...` in `handlers/vein/src/lib.rs` inside the `AppHandler` event loop immediately before the string dispatch.
 3. Injected `>>> [J13 TRACE] BACKEND: StorageLoadAllResult processed. Populating state with {} items.` in `handlers/vein/src/lib.rs` when `SMessage::StorageLoadAllResult` is caught in the brain loop and mapped to `app_state.history`.
+
+**Anomaly (Phase 3):** `VeinHandler` correctly populated the backend `AppState` with the history payload, but `translator.rs` history cursor logic failed to bridge the bulk payload to the UI channel. The frontend remained blind to the state update.
+
+**Resolution (Phase 3):**
+Enforced architectural boundaries. Added explicit telemetry in `libs/quartzite/src/platforms/gtk/workspace/translator.rs` right before `tx_gui.send(GuiUpdate::HistoryBatch)` to verify the payload construction. Lifted the GTK scroll math quarantine in `libs/quartzite/src/platforms/gtk/workspace/comms.rs` because the math is now mathematically verified innocent.

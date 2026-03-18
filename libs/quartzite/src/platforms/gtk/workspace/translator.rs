@@ -36,6 +36,8 @@ pub fn spawn_translator(
                         let st = app_state.read().unwrap();
 
                         let h_delta = if st.history.len() > history_cursor {
+                            // If cursor is 0 (initial boot or clear), grab everything.
+                            // Otherwise, only grab the delta.
                             st.history[history_cursor..].to_vec()
                         } else {
                             Vec::new()
@@ -60,6 +62,7 @@ pub fn spawn_translator(
                     };
 
                     if !history_delta.is_empty() {
+                        println!(">>> [J13 TRACE] TRANSLATOR: Sending HistoryBatch with {} items", history_delta.len());
                         let _ = tx_gui.send(GuiUpdate::HistoryBatch(history_delta)).await;
                         history_cursor = new_history_len;
                     }
