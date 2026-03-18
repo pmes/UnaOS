@@ -257,7 +257,7 @@ impl VeinHandler {
                     let _ = synapse_loop.fire_async(SMessage::StateInvalidated).await;
 
                     let mut shutdown_rx_brain = shutdown_tx.subscribe();
-                    let bandy_rx_brain = synapse_loop.rx();
+                    let mut bandy_rx_brain = synapse_loop.subscribe();
                     let mut receipt_counter: u64 = 1;
 
                     // Simple local state for loop variables not in AppState
@@ -265,9 +265,10 @@ impl VeinHandler {
 
                     loop {
                         tokio::select! {
-                            Ok(msg) = bandy_rx_brain.recv() => {
-                                match msg {
-                                    SMessage::TriggerUpload(path) => {
+                            recv_res = bandy_rx_brain.recv() => {
+                                match recv_res {
+                                    Ok(msg) => match msg {
+                                        SMessage::TriggerUpload(path) => {
                                         let app_state_upload = state_bg.clone();
                                         let synapse_upload = synapse_loop.clone();
                                         tokio::spawn(async move {
@@ -309,9 +310,18 @@ impl VeinHandler {
                                         }
                                     }
                                     SMessage::StateInvalidated => {
-                                        println!(">>> [J13 TRACE] VEIN THIEF CAUGHT: VeinHandler stole SMessage::StateInvalidated from the queue. Translator is starving!");
+                                        println!(">>> [J13 TRACE] VEIN THIEF CAUGHT: VeinHandler caught SMessage::StateInvalidated. No longer a thief thanks to broadcast!");
                                     }
                                     _ => {}
+                                    },
+                                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                                        log::warn!("Synapse receiver lagged, dropping missed events.");
+                                        continue;
+                                    }
+                                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                                        log::info!(":: VEIN :: Synapse channel closed, terminating loop.");
+                                        break;
+                                    }
                                 }
                             }
                             _ = shutdown_rx_brain.recv() => {

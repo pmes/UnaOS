@@ -235,7 +235,7 @@ impl DiskManager {
 /// It listens to the Synapse for incoming storage requests, executes the bare-metal I/O,
 /// and fires the results back into the nervous system.
 pub async fn ignite(vault_path: PathBuf, synapse: Synapse) {
-    let rx = synapse.rx();
+    let mut rx = synapse.subscribe();
     let synapse_clone = synapse.clone();
 
     // Use spawn_blocking for initial mount to keep the reactor happy
@@ -262,8 +262,8 @@ pub async fn ignite(vault_path: PathBuf, synapse: Synapse) {
 
     // The Actor Loop
     loop {
-        if let Ok(msg) = rx.recv().await {
-            match msg {
+        match rx.recv().await {
+            Ok(msg) => match msg {
                 SMessage::StorageQuery {
                     receipt_id,
                     embedding,
@@ -355,6 +355,14 @@ pub async fn ignite(vault_path: PathBuf, synapse: Synapse) {
                         .await;
                 }
                 _ => {} // Ignore other messages
+            }
+            Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                eprintln!("Amber Bytes receiver lagged, dropping missed events.");
+                continue;
+            }
+            Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                println!(":: AMBER BYTES :: Synapse channel closed, terminating loop.");
+                break;
             }
         }
     }

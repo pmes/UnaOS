@@ -1,16 +1,17 @@
 // SPDX-License-Identifier: LGPL-3.0-or-later
 // Copyright (C) 2026 The Architect & Una
 
-use async_channel::Receiver;
+use async_channel::Receiver as AsyncReceiver;
+use tokio::sync::broadcast::Receiver as BroadcastReceiver;
 use std::sync::{Arc, RwLock};
 use bandy::state::AppState;
 use bandy::SMessage;
 use crate::platforms::gtk::types::GuiUpdate;
 
 pub fn spawn_translator(
-    rx_synapse: Receiver<SMessage>,
+    mut rx_synapse: BroadcastReceiver<SMessage>,
     app_state: Arc<RwLock<AppState>>,
-) -> Receiver<GuiUpdate> {
+) -> AsyncReceiver<GuiUpdate> {
     let (tx_gui, rx_gui) = async_channel::unbounded::<GuiUpdate>();
 
     tokio::spawn(async move {
@@ -19,9 +20,11 @@ pub fn spawn_translator(
 
         println!(">>> [J13 TRACE] TRANSLATOR: Thread spawned. Waiting for Synapse messages...");
 
-        while let Ok(msg) = rx_synapse.recv().await {
-            println!(">>> [J13 TRACE] TRANSLATOR: Received a Synapse message.");
-            match msg {
+        loop {
+            match rx_synapse.recv().await {
+                Ok(msg) => {
+                    println!(">>> [J13 TRACE] TRANSLATOR: Received a Synapse message.");
+                    match msg {
                 SMessage::StateInvalidated => {
                     let (new_history_len, new_console_len) = {
                         println!(">>> [J13 TRACE] TRANSLATOR: Processing StateInvalidated. Attempting to acquire read lock...");
@@ -91,10 +94,20 @@ pub fn spawn_translator(
                         let _ = tx_gui.send(GuiUpdate::ShardStatusChanged { id, status }).await;
                     }
                 }
-                SMessage::ContextTelemetry { skeletons } => {
-                    let _ = tx_gui.send(GuiUpdate::ContextTelemetry(skeletons)).await;
+                        SMessage::ContextTelemetry { skeletons } => {
+                            let _ = tx_gui.send(GuiUpdate::ContextTelemetry(skeletons)).await;
+                        }
+                        _ => {}
+                    }
                 }
-                _ => {}
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                    println!(">>> [J13 TRACE] TRANSLATOR: Synapse receiver lagged, dropping missed events.");
+                    continue;
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                    println!(">>> [J13 TRACE] TRANSLATOR: Synapse channel closed, terminating loop.");
+                    break;
+                }
             }
         }
     });

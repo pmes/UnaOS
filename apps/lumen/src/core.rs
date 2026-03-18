@@ -26,7 +26,7 @@ pub async fn ignite(
     mut shutdown_rx: tokio::sync::broadcast::Receiver<()>,
 ) {
     let mut cortex = Cortex::awaken(vault_path, &mut synapse);
-    let rx = synapse.rx();
+    let mut rx = synapse.subscribe();
 
     log::info!(">> [LUMEN CORE] Synapses firing. Autonomous loop engaged.");
 
@@ -57,7 +57,11 @@ pub async fn ignite(
                 }
                 _ => {} // The subconscious absorbs the noise.
                 },
-                Err(_) => {
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                    log::warn!(">> [LUMEN CORE] Receiver lagged, dropping missed events.");
+                    continue;
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => {
                     log::warn!(">> [LUMEN CORE] Nervous system severed. Shutting down.");
                     break;
                 }
