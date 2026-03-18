@@ -362,6 +362,8 @@ pub fn build(
         let Some(item) = item.downcast_ref::<ListItem>() else { return; };
         let Some(obj) = item.item().and_then(|c| c.downcast::<HistoryObject>().ok()) else { return; };
 
+        println!(">>> [J13 TRACE] COMMS: Binding item. Sender: {}, Subject: {}, Timestamp: {}", obj.sender(), obj.subject(), obj.timestamp());
+
         // Retrieve preserved absolute pointers securely
         let boxed_widgets = unsafe { item.data::<glib::BoxedAnyObject>("widgets") };
         let Some(boxed_ptr) = boxed_widgets else { return; };
