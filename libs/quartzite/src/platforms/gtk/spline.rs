@@ -15,9 +15,9 @@
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 use crate::Event;
-use async_channel::Receiver;
 use gtk4::prelude::*;
 use std::sync::{Arc, RwLock};
+use tokio::sync::broadcast::Receiver as BroadcastReceiver;
 
 use bandy::state::AppState;
 use bandy::SMessage;
@@ -34,7 +34,7 @@ impl CommsSpline {
         window: &crate::NativeWindow,
         tx_event: async_channel::Sender<Event>,
         app_state: Arc<RwLock<AppState>>,
-        rx_synapse: Receiver<SMessage>,
+        rx_synapse: BroadcastReceiver<SMessage>,
     ) -> crate::NativeView {
         #[cfg(feature = "gnome")]
         return build_gnome_ui(window, tx_event, app_state, rx_synapse);
@@ -49,7 +49,7 @@ fn build_gnome_ui(
     window: &crate::NativeWindow,
     tx_event: async_channel::Sender<Event>,
     app_state: Arc<RwLock<AppState>>,
-    rx_synapse: Receiver<SMessage>,
+    rx_synapse: BroadcastReceiver<SMessage>,
 ) -> crate::NativeView {
     let brain_icon = gtk4::Image::from_icon_name("brain-symbolic");
 
@@ -87,7 +87,7 @@ fn build_gtk_ui(
     window: &crate::NativeWindow,
     tx_event: async_channel::Sender<Event>,
     app_state: Arc<RwLock<AppState>>,
-    rx_synapse: Receiver<SMessage>,
+    rx_synapse: BroadcastReceiver<SMessage>,
 ) -> crate::NativeView {
     let brain_icon = gtk4::Image::from_icon_name("brain-symbolic");
 

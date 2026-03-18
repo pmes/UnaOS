@@ -69,8 +69,6 @@ fn main() {
     telemetry::ignite(UnaPaths::root().join("logs"));
     log::info!("Lumen Boot Sequence Initiated.");
 
-    let (_telemetry_tx, _telemetry_rx) = async_channel::unbounded::<SMessage>();
-
     // 3. Ignite the Spine
     let synapse = Synapse::new();
 
@@ -139,7 +137,7 @@ fn main() {
             window,
             event_tx.clone(),
             app_state.clone(),
-            _telemetry_rx.clone(),
+            synapse.subscribe(),
         );
 
         // 2. Create the HUD (ContextView) - DEPRECATED (Phase 4)
