@@ -880,14 +880,23 @@ pub fn build(
         });
     }
 
+    // FIX: Wait for the display server to map the UI (width > 0) before measuring text
+    let boot_fetched = Rc::new(RefCell::new(false));
     let tx_clone_load_hist = tx_event.clone();
+    let is_fetching_boot = is_fetching.clone();
+    let is_prepending_boot = is_prepending.clone();
 
-    // FIX: Lock the layout matrix before the boot fetch to prevent measurement crashes
-    *is_fetching.borrow_mut() = true;
-    *is_prepending.borrow_mut() = true;
+    scrolled_window.connect_map(move |_| {
+        if !*boot_fetched.borrow() {
+            *boot_fetched.borrow_mut() = true;
+            *is_fetching_boot.borrow_mut() = true;
+            *is_prepending_boot.borrow_mut() = true;
 
-    glib::MainContext::default().spawn_local(async move {
-        let _ = tx_clone_load_hist.send(Event::LoadHistory).await;
+            let tx_async = tx_clone_load_hist.clone();
+            glib::MainContext::default().spawn_local(async move {
+                let _ = tx_async.send(Event::LoadHistory).await;
+            });
+        }
     });
 
     let widgets = CommsWidgets {
