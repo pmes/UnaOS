@@ -38,7 +38,7 @@ pub fn spawn_listener(pointers: ReactorPointers, rx_gui: Receiver<GuiUpdate>) {
             match update {
                 GuiUpdate::ConsoleLogBatch(logs) => {
                     let mut batch: Vec<gtk4::glib::Object> = Vec::new();
-                    for text in logs {
+                    for (i, text) in logs.into_iter().enumerate() {
                         let mut sender = "System".to_string();
                         let mut is_chat = true;
                         let content = text.clone();
@@ -62,7 +62,7 @@ pub fn spawn_listener(pointers: ReactorPointers, rx_gui: Receiver<GuiUpdate>) {
                         }
 
                         let timestamp = chrono::Local::now().format("%H:%M:%S").to_string();
-                        let id = format!("{}", chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0));
+                        let id = format!("{}-sys-{}", chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0), i);
                         let obj = HistoryObject::new(&id, &sender, &subject, &timestamp, &content, is_chat);
                         println!("Appending system log item: {}", content);
                         batch.push(obj.upcast());
@@ -80,15 +80,15 @@ pub fn spawn_listener(pointers: ReactorPointers, rx_gui: Receiver<GuiUpdate>) {
                     }
 
                     let mut batch: Vec<gtk4::glib::Object> = Vec::new();
-                    for msg in messages {
-                        let id = format!("{}-hist", chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0));
+                    for (i, msg) in messages.into_iter().enumerate() {
+                        let id = format!("{}-hist-{}", chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0), i);
                         let obj = HistoryObject::new(&id, &msg.sender, "History", &msg.timestamp, &msg.content, msg.is_chat);
                         println!("Appending history item: {}", msg.content);
                         batch.push(obj.upcast());
                     }
                     if !batch.is_empty() {
-                        let len = pointers.console_store.n_items();
-                        pointers.console_store.splice(len, 0, &batch);
+                        // Splice at index 0 to properly prepend history
+                        pointers.console_store.splice(0, 0, &batch);
                     }
 
                     let fetch_lock = pointers.is_fetching.clone();
