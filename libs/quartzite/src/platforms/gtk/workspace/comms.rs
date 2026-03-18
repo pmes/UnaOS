@@ -82,7 +82,7 @@ pub fn build(
 
     let scrolled_window = ScrolledWindow::builder()
         .hscrollbar_policy(PolicyType::Never)
-        .vscrollbar_policy(PolicyType::Automatic)
+        .vscrollbar_policy(PolicyType::Always)
         .vexpand(true)
         .hexpand(true)
         .build();
