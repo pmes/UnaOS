@@ -881,6 +881,11 @@ pub fn build(
     }
 
     let tx_clone_load_hist = tx_event.clone();
+
+    // FIX: Lock the layout matrix before the boot fetch to prevent measurement crashes
+    *is_fetching.borrow_mut() = true;
+    *is_prepending.borrow_mut() = true;
+
     glib::MainContext::default().spawn_local(async move {
         let _ = tx_clone_load_hist.send(Event::LoadHistory).await;
     });
