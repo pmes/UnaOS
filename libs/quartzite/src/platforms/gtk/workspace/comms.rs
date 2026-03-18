@@ -163,6 +163,7 @@ pub fn build(
         glib::idle_add_local(move || {
             let current_upper = a_clone.upper();
             let current_page_size = a_clone.page_size();
+            let current_lower = a_clone.lower();
 
             let fetching = *fetching_for_idle.borrow();
 
@@ -171,10 +172,15 @@ pub fn build(
                 return glib::ControlFlow::Break;
             }
 
+            // Calculate the absolute maximum valid scroll position
+            let max_valid_value = (current_upper - current_page_size).max(current_lower);
+
             if was_at_bottom {
-                a_clone.set_value(current_upper - current_page_size);
+                a_clone.set_value(max_valid_value);
             } else if is_prepending && delta > 0.0 {
-                a_clone.set_value(a_clone.value() + delta);
+                // Strictly clamp the new value so we never overshoot GTK's internal bounds
+                let target_val = a_clone.value() + delta;
+                a_clone.set_value(target_val.clamp(current_lower, max_valid_value));
                 *is_prepending_upper_clone.borrow_mut() = false;
             }
             glib::ControlFlow::Break
