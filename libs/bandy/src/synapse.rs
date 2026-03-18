@@ -15,47 +15,38 @@
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 use crate::SMessage;
-use async_channel;
-use std::sync::{Arc, Mutex};
+use tokio::sync::broadcast;
 
 /// The connective tissue of the nervous system.
-/// Uses bounded async channels to broadcast to multiple lobes (UI, Subconscious, AI)
-/// so they can react to the same stimulus simultaneously while enforcing strict backpressure.
+/// Uses a tokio broadcast channel to broadcast to multiple lobes (UI, Subconscious, AI)
+/// so they can react to the same stimulus simultaneously.
 #[derive(Clone)]
 pub struct Synapse {
-    txs: Arc<Mutex<Vec<async_channel::Sender<SMessage>>>>,
+    tx: broadcast::Sender<SMessage>,
 }
 
 impl Synapse {
     pub fn new() -> Self {
-        Self {
-            txs: Arc::new(Mutex::new(Vec::new())),
-        }
+        // 1024 action potentials in flight. Buffer depth prevents immediate lagging.
+        let (tx, _rx) = broadcast::channel(1024);
+        Self { tx }
     }
 
-    /// Fires a stimulus across the nervous system synchronously with strict backpressure.
+    /// Fires a stimulus across the nervous system synchronously.
     pub fn fire(&self, msg: SMessage) {
-        let txs = self.txs.lock().unwrap().clone();
-        for tx in txs {
-            // We block to enforce backpressure. If a tree falls in the forest...
-            let _ = tx.send_blocking(msg.clone());
-        }
+        // Broadcast ignores SendError (which happens if there are no active receivers)
+        let _ = self.tx.send(msg);
     }
 
-    /// Fires a stimulus asynchronously with strict backpressure.
+    /// Fires a stimulus asynchronously.
     pub async fn fire_async(&self, msg: SMessage) {
-        let txs = self.txs.lock().unwrap().clone();
-        for tx in txs {
-            let _ = tx.send(msg.clone()).await;
-        }
+        // Broadcast ignores SendError
+        let _ = self.tx.send(msg);
     }
 
     /// Sprout a new nerve ending to listen to the system.
-    pub fn rx(&self) -> async_channel::Receiver<SMessage> {
-        // 1024 action potentials in flight. If we hit this, the system is strictly backpressured.
-        let (tx, rx) = async_channel::bounded(1024);
-        self.txs.lock().unwrap().push(tx);
-        rx
+    pub fn subscribe(&self) -> broadcast::Receiver<SMessage> {
+        self.tx.subscribe()
     }
 }
 
