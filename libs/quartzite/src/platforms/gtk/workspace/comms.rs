@@ -467,7 +467,6 @@ pub fn build(
 
     // --- PRE-FLIGHT STACK (Layer 2) ---
     let preflight_stack_container = Box::new(Orientation::Vertical, 0);
-    preflight_stack_container.set_can_target(false);
     preflight_stack_container.set_halign(gtk4::Align::Fill);
     preflight_stack_container.set_valign(gtk4::Align::Fill);
     preflight_stack_container.set_vexpand(true);
