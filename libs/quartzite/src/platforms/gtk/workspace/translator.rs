@@ -15,8 +15,8 @@ pub fn spawn_translator(
     let (tx_gui, rx_gui) = async_channel::unbounded::<GuiUpdate>();
 
     tokio::spawn(async move {
-        let mut history_cursor = 0;
-        let mut console_cursor = 0;
+        let mut last_history_seq = 0;
+        let mut last_console_seq = 0;
 
         println!(">>> [J13 TRACE] TRANSLATOR: Thread spawned. Waiting for Synapse messages...");
 
@@ -26,33 +26,41 @@ pub fn spawn_translator(
                     println!(">>> [J13 TRACE] TRANSLATOR: Received a Synapse message.");
                     match msg {
                 SMessage::StateInvalidated => {
-                    let (new_history_len, new_console_len) = {
+                    let (new_history_seq, new_console_seq) = {
                         println!(">>> [J13 TRACE] TRANSLATOR: Processing StateInvalidated. Attempting to acquire read lock...");
                         let st = app_state.read().unwrap();
-                        println!(">>> [J13 TRACE] TRANSLATOR: Read lock acquired. history_len: {}, console_len: {}", st.history.len(), st.console_logs.len());
-                        (st.history.len(), st.console_logs.len())
+                        println!(">>> [J13 TRACE] TRANSLATOR: Read lock acquired. history_seq: {}, console_seq: {}", st.history_seq, st.console_seq);
+                        (st.history_seq, st.console_seq)
                     };
 
                     // Handle full state rollbacks/clears gracefully
-                    if new_history_len < history_cursor || new_console_len < console_cursor {
-                        history_cursor = 0;
-                        console_cursor = 0;
+                    if new_history_seq < last_history_seq || new_console_seq < last_console_seq {
+                        last_history_seq = 0;
+                        last_console_seq = 0;
                         let _ = tx_gui.send(GuiUpdate::ClearConsole).await;
                     }
 
                     let (history_delta, logs_delta, payload, tokens, sidebar, active_dir, synapse_err, shards) = {
                         let st = app_state.read().unwrap();
 
-                        let h_delta = if st.history.len() > history_cursor {
-                            // If cursor is 0 (initial boot or clear), grab everything.
-                            // Otherwise, only grab the delta.
-                            st.history[history_cursor..].to_vec()
+                        let h_delta_count = st.history_seq.saturating_sub(last_history_seq);
+                        let h_delta = if h_delta_count > 0 {
+                            if h_delta_count >= st.history.len() {
+                                st.history.iter().cloned().collect::<Vec<_>>()
+                            } else {
+                                st.history.iter().skip(st.history.len() - h_delta_count).cloned().collect::<Vec<_>>()
+                            }
                         } else {
                             Vec::new()
                         };
 
-                        let l_delta = if st.console_logs.len() > console_cursor {
-                            st.console_logs[console_cursor..].to_vec()
+                        let l_delta_count = st.console_seq.saturating_sub(last_console_seq);
+                        let l_delta = if l_delta_count > 0 {
+                            if l_delta_count >= st.console_logs.len() {
+                                st.console_logs.iter().cloned().collect::<Vec<_>>()
+                            } else {
+                                st.console_logs.iter().skip(st.console_logs.len() - l_delta_count).cloned().collect::<Vec<_>>()
+                            }
                         } else {
                             Vec::new()
                         };
@@ -70,18 +78,18 @@ pub fn spawn_translator(
                     };
 
                     if !history_delta.is_empty() {
-                        if history_cursor == 0 {
+                        if last_history_seq == 0 {
                             println!(">>> [J16 TRACE] TRANSLATOR: Sending HistorySeed with {} items", history_delta.len());
                             let _ = tx_gui.send(GuiUpdate::HistorySeed(history_delta)).await;
                         } else {
                             println!(">>> [J16 TRACE] TRANSLATOR: Sending HistoryAppend with {} items", history_delta.len());
                             let _ = tx_gui.send(GuiUpdate::HistoryAppend(history_delta)).await;
                         }
-                        history_cursor = new_history_len;
+                        last_history_seq = new_history_seq;
                     }
                     if !logs_delta.is_empty() {
                         let _ = tx_gui.send(GuiUpdate::ConsoleLogBatch(logs_delta)).await;
-                        console_cursor = new_console_len;
+                        last_console_seq = new_console_seq;
                     }
 
                     if let Some(p) = payload {

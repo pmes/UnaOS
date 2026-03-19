@@ -1,8 +1,10 @@
 // SPDX-License-Identifier: LGPL-3.0-or-later
 // Copyright (C) 2026 The Architect & Una
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use serde::{Deserialize, Serialize};
+
+pub const MAX_STATE_CAPACITY: usize = 1000;
 
 // --- SHARD DOMAIN ---
 
@@ -140,10 +142,12 @@ impl Default for DashboardState {
 #[derive(Debug, Clone)]
 pub struct AppState {
     // The active timeline of thoughts/memories
-    pub history: Vec<HistoryItem>,
+    pub history: VecDeque<HistoryItem>,
+    pub history_seq: usize,
 
     // Telemetry and diagnostics
-    pub console_logs: Vec<String>,
+    pub console_logs: VecDeque<String>,
+    pub console_seq: usize,
     pub token_usage: (i32, i32, i32), // (Prompt, Response, Total)
 
     // UI Status Flags
@@ -170,8 +174,10 @@ pub struct AppState {
 impl Default for AppState {
     fn default() -> Self {
         AppState {
-            history: Vec::new(),
-            console_logs: Vec::new(),
+            history: VecDeque::new(),
+            history_seq: 0,
+            console_logs: VecDeque::new(),
+            console_seq: 0,
             token_usage: (0, 0, 0),
             is_computing: false,
             is_indexing: false,

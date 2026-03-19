@@ -218,13 +218,13 @@ fn main() -> Result<()> {
             #[cfg(all(target_os = "linux", feature = "gtk"))]
             let ret = main_paned.upcast::<gtk4::Widget>();
             #[cfg(not(all(target_os = "linux", feature = "gtk")))]
-            let ret = ();
+            let ret = NativeView { ptr: quartzite::platforms::qt::ffi::LumenMainWindow::null_ptr() };
 
             ret
         };
 
         #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-        let view: NativeView = ();
+        let view = NativeView { ptr: quartzite::platforms::qt::ffi::LumenMainWindow::null_ptr() };
 
         // 6. WIRE THE REFLEX ARC (UI Receiver Loop)
         #[cfg(target_os = "linux")]

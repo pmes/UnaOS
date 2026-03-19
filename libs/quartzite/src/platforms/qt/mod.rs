@@ -42,3 +42,9 @@ pub mod ffi {
         fn quit_qapplication();
     }
 }
+
+impl ffi::LumenMainWindow {
+    pub fn null_ptr() -> cxx::UniquePtr<Self> {
+        cxx::UniquePtr::null()
+    }
+}
