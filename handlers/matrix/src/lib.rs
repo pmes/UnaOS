@@ -31,7 +31,7 @@ pub struct MatrixScanner;
 
 impl MatrixScanner {
     /// J21 PATHFINDER: Core method for the Zero-Redundancy Indexed Dictionary DAG Scanner.
-    pub fn map_topology(path: &Path, absolute_workspace_root: &Path) -> Result<String, String> {
+    pub fn map_topology(paths: &[std::path::PathBuf], absolute_workspace_root: &Path) -> Result<String, String> {
         // Dictionary Engine
         let mut dict_map: HashMap<String, usize> = HashMap::new();
         let mut dict_list: Vec<String> = Vec::new();
@@ -39,12 +39,22 @@ impl MatrixScanner {
         // Edge connections: "NodeID:DepID,DepID|NodeID:DepID"
         let mut topology_edges: Vec<String> = Vec::new();
 
-        if path.is_file() {
-            Self::scan_file(path, absolute_workspace_root, &mut dict_map, &mut dict_list, &mut topology_edges);
-        } else if path.is_dir() {
-            Self::scan_directory(path, absolute_workspace_root, &mut dict_map, &mut dict_list, &mut topology_edges);
-        } else {
-            return Err("Target is neither a file nor a directory.".to_string());
+        let mut processed_any = false;
+
+        for path in paths {
+            if path.is_file() {
+                Self::scan_file(path, absolute_workspace_root, &mut dict_map, &mut dict_list, &mut topology_edges);
+                processed_any = true;
+            } else if path.is_dir() {
+                Self::scan_directory(path, absolute_workspace_root, &mut dict_map, &mut dict_list, &mut topology_edges);
+                processed_any = true;
+            } else {
+                log::warn!("[MATRIX] Target is neither a file nor a directory: {:?}", path);
+            }
+        }
+
+        if !processed_any {
+            return Err("No valid targets were provided.".to_string());
         }
 
         // AI-Readable Serialization Format (`DICTIONARY$TOPOLOGY`)
@@ -274,15 +284,17 @@ pub async fn ignite(synapse: Synapse, absolute_workspace_root: std::sync::Arc<Pa
 
     loop {
         match rx.recv().await {
-            Ok(SMessage::Matrix(MatrixEvent::FocusSector(relative_target))) => {
-                println!("[MATRIX] Analyzing Sector: {}", relative_target);
+            Ok(SMessage::Matrix(MatrixEvent::FocusSector(relative_targets_str))) => {
+                println!("[MATRIX] Analyzing Sectors: {}", relative_targets_str);
 
-                // J21 PATHFINDER: The relative_target (e.g., "libs/bandy") came from Vein.
-                // We join it with the absolute anchor to perform a robust read_dir,
-                // avoiding CWD brittleness.
-                let absolute_target = absolute_workspace_root.join(&relative_target);
+                // J21 PATHFINDER: Enable Multi-Sector Bundling
+                // Split the incoming space-separated targets and map them to absolute paths.
+                let absolute_targets: Vec<std::path::PathBuf> = relative_targets_str
+                    .split_whitespace()
+                    .map(|target| absolute_workspace_root.join(target))
+                    .collect();
 
-                if let Ok(compressed_payload) = MatrixScanner::map_topology(&absolute_target, &absolute_workspace_root) {
+                if let Ok(compressed_payload) = MatrixScanner::map_topology(&absolute_targets, &absolute_workspace_root) {
                     // J21 PATHFINDER: Fire the True DAG directly to `vein` via `IngestTopology`.
                     // This raw data structure fuels the instant UI payload mutation.
                     let _ = synapse.fire_async(SMessage::Matrix(MatrixEvent::IngestTopology { payload: compressed_payload })).await;
