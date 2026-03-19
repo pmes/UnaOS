@@ -15,7 +15,7 @@
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 use async_channel::Sender;
-use bandy::MatrixEvent;
+use bandy::{MatrixEvent, SMessage, Synapse};
 use elessar::{Context, Spline};
 use gneiss_pal::Event;
 use gtk4::prelude::*;
@@ -25,7 +25,7 @@ use std::path::{Path, PathBuf};
 // Temporary Shim to replace the J37 deleted DAG scanner
 pub struct MatrixScanner;
 impl MatrixScanner {
-    pub fn map_topology(path: &Path) -> Result<MatrixEvent, String> {
+    pub fn map_topology(path: &Path, absolute_workspace_root: &Path) -> Result<MatrixEvent, String> {
         let mut nodes = Vec::new();
         if let Ok(entries) = std::fs::read_dir(path) {
             for entry in entries.flatten() {
@@ -33,7 +33,7 @@ impl MatrixScanner {
                 let kind = if p.is_dir() { "directory" } else { "module" };
 
                 // J21 PATHFINDER: To conserve memory, store paths relative to the absolute root anchor.
-                let relative_path = p.strip_prefix(path).unwrap_or(&p).to_path_buf();
+                let relative_path = p.strip_prefix(absolute_workspace_root).unwrap_or(p.as_path()).to_path_buf();
 
                 // Map to the bandy struct
                 nodes.push(bandy::SpatialNode {
@@ -89,7 +89,10 @@ pub fn create_view(nerve_tx: Sender<Event>, root_path: &Path) -> Widget {
 
     // 1. BLITZ THE TOPOLOGY
     // Instead of a flat read_dir, we use the Scanner to get the spatial nodes.
-    if let Ok(MatrixEvent::IngestTopology { nodes, .. }) = MatrixScanner::map_topology(root_path) {
+    // J21 PATHFINDER: The `root_path` passed to `create_view` IS the absolute workspace root,
+    // so we can use it directly without calling `elessar::find_workspace_root` again.
+
+    if let Ok(MatrixEvent::IngestTopology { nodes, .. }) = MatrixScanner::map_topology(root_path, root_path) {
         // Filter to just the files (modules) for the visual list
         for node in nodes.into_iter().filter(|n| n.kind == "module") {
             let row = Box::new(Orientation::Horizontal, 10);
@@ -131,4 +134,46 @@ pub fn create_view(nerve_tx: Sender<Event>, root_path: &Path) -> Widget {
 
     let scroll = ScrolledWindow::builder().child(&matrix_list).build();
     scroll.upcast::<Widget>()
+}
+
+/// The Asynchronous Logic Kernel for the Matrix
+pub async fn ignite(synapse: Synapse, absolute_workspace_root: std::sync::Arc<PathBuf>) {
+    let mut rx = synapse.subscribe();
+    println!("[MATRIX] Spatial Anchor Established via Brain Loop: {:?}", absolute_workspace_root);
+
+    loop {
+        match rx.recv().await {
+            Ok(SMessage::Matrix(MatrixEvent::FocusSector(relative_target))) => {
+                println!("[MATRIX] Analyzing Sector: {}", relative_target);
+
+                // J21 PATHFINDER: The relative_target (e.g., "libs/bandy") came from Vein.
+                // We join it with the absolute anchor to perform a robust read_dir,
+                // avoiding CWD brittleness.
+                let absolute_target = absolute_workspace_root.join(&relative_target);
+
+                if let Ok(MatrixEvent::IngestTopology { nodes, .. }) = MatrixScanner::map_topology(&absolute_target, &absolute_workspace_root) {
+                    let mut context_string = String::new();
+                    for node in nodes {
+                        // J21 PATHFINDER: The path inside `node.path` is already relative thanks to MatrixScanner
+                        context_string.push_str(&format!("- [{}] {}\n", node.kind, node.path.display()));
+                    }
+
+                    let _ = synapse.fire_async(SMessage::Matrix(MatrixEvent::SectorFocused {
+                        target: relative_target,
+                        context: context_string,
+                    })).await;
+                }
+            }
+            Ok(_) => {}
+            Err(e) => {
+                let err_msg = e.to_string();
+                if err_msg.contains("lagged") {
+                    log::warn!("[MATRIX] Event loop lagging: {}", err_msg);
+                } else {
+                    log::info!("[MATRIX] Synapse channel closed or error. Terminating loop.");
+                    break;
+                }
+            }
+        }
+    }
 }

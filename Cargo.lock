@@ -3623,6 +3623,7 @@ dependencies = [
  "junct",
  "libadwaita",
  "log",
+ "matrix",
  "quartzite",
  "rustls",
  "serde",

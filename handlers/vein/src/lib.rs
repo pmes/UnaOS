@@ -370,8 +370,16 @@ impl VeinHandler {
                                                 let topology_str = format!("SECTOR: {}\n\n{}", target, context);
                                                 {
                                                     let mut s = state_bg.write().unwrap();
-                                                    s.matrix_topology = topology_str;
+                                                    s.matrix_topology = topology_str.clone();
+
+                                                    // J21 PATHFINDER: Instant Payload Mutation
+                                                    if let Some(ref mut payload) = s.review_payload {
+                                                        // Append the new DAG topology to the payload's system context
+                                                        payload.system.push_str("\n\n--- CURRENT SPATIAL TOPOLOGY (DAG) ---\n");
+                                                        payload.system.push_str(&topology_str);
+                                                    }
                                                 }
+                                                // IMMEDIATELY fire StateInvalidated so the UI repaints with the DAG
                                                 let _ = synapse_loop.fire_async(SMessage::StateInvalidated).await;
                                             }
                                             _ => {}

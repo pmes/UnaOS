@@ -19,6 +19,7 @@ qt = ["quartzite/qt"]
 # The Trinity Core
 elessar = { path = "../../libs/elessar" }
 amber_bytes = { path = "../../handlers/amber_bytes" }
+matrix = { path = "../../handlers/matrix" }
 vein = { path = "../../handlers/vein", default-features = false }
 quartzite = { path = "../../libs/quartzite", default-features = false }
 bandy = { path = "../../libs/bandy" }
