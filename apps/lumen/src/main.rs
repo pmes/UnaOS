@@ -89,8 +89,23 @@ fn main() {
         amber_bytes::ignite(amber_vault_path, amber_synapse).await;
     });
 
+    // J21 PATHFINDER: Resolve absolute workspace root zero-latency anchor exactly once
+    let absolute_workspace_root = elessar::find_workspace_root();
+    log::info!("[ELESSAR] Absolute Workspace Root Anchored: {:?}", absolute_workspace_root);
+    let absolute_workspace_root_arc = std::sync::Arc::new(absolute_workspace_root);
+
+    // 5.7 Ignite Matrix Spatial Mapper
+    let matrix_synapse = synapse.clone();
+    let matrix_root_arc = absolute_workspace_root_arc.clone();
+    let matrix_handle = rt.spawn(async move {
+        matrix::ignite(matrix_synapse, matrix_root_arc).await;
+    });
+
     // 6. Ignite the AI Handler (The Conscious Vein)
-    let app_state = Arc::new(RwLock::new(bandy::state::AppState::default()));
+    let mut default_state = bandy::state::AppState::default();
+    default_state.absolute_workspace_root = absolute_workspace_root_arc.clone();
+
+    let app_state = Arc::new(RwLock::new(default_state));
     // Channels for UI Events (Spline -> Vein)
     let (event_tx, event_rx) = async_channel::unbounded::<quartzite::Event>();
 
@@ -156,6 +171,7 @@ fn main() {
         let _ = brain_loop_handle.await;
         let _ = bg_handle.await;
         let _ = core_handle.await;
+        matrix_handle.abort();
         amber_handle.abort();
     });
 }

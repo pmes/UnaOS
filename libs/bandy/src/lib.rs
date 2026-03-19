@@ -172,8 +172,7 @@ pub enum PrincipiaCommand {
 pub enum MatrixEvent {
     /// Matrix broadcasts the entire topological map of the OS
     IngestTopology {
-        nodes: Vec<SpatialNode>,
-        edges: Vec<SpatialEdge>,
+        payload: String,
     },
     /// Vein asks Matrix to focus on a specific sector (e.g., "euclase")
     FocusSector(String),

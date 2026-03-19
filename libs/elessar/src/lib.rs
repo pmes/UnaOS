@@ -44,6 +44,40 @@ pub enum Spline {
     Void,
 }
 
+/// Resolves the absolute path to the workspace root.
+/// Calculates this exactly once during the initial boot sequence (Zero-Latency).
+/// If missing marker files, it gracefully falls back to the current working directory.
+pub fn find_workspace_root() -> std::path::PathBuf {
+    let current_dir = match std::env::current_dir() {
+        Ok(dir) => dir,
+        Err(e) => {
+            log::warn!("[ELESSAR] CRITICAL ANOMALY: Cannot read current directory: {}. Degraded spatial context.", e);
+            return std::path::PathBuf::from(".");
+        }
+    };
+
+    let mut dir = current_dir.clone();
+
+    // Traverse upwards to find the Monolith anchor
+    loop {
+        // Known anchors defining the root
+        if dir.join("MEMORIA.md").exists()
+            || dir.join("Cargo.toml").exists()
+            || dir.join("package.json").exists()
+        {
+            return dir;
+        }
+
+        if !dir.pop() {
+            break;
+        }
+    }
+
+    log::warn!("[ELESSAR] SPATIAL DEGRADATION: Could not find definitive workspace root (e.g., MEMORIA.md). Defaulting to current working directory.");
+    current_dir
+}
+
+
 /// The Context holds the spatial and structural awareness of our current environment.
 pub struct Context {
     pub path: std::path::PathBuf,

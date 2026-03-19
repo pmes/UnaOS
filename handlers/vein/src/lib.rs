@@ -350,28 +350,41 @@ impl VeinHandler {
                                     }
                                     SMessage::Matrix(matrix_event) => {
                                         match matrix_event {
-                                            bandy::MatrixEvent::IngestTopology { nodes, edges } => {
-                                                let mut topology_str = String::new();
-                                                for node in &nodes {
-                                                    topology_str.push_str(&format!("NODE: {} [{}]\n", node.id, node.kind));
-                                                }
-                                                topology_str.push_str("\n");
-                                                for edge in &edges {
-                                                    topology_str.push_str(&format!("EDGE: {} --{}--> {}\n", edge.from, edge.relation, edge.to));
-                                                }
-
+                                            bandy::MatrixEvent::IngestTopology { payload: compressed_payload } => {
                                                 {
                                                     let mut s = state_bg.write().unwrap();
-                                                    s.matrix_topology = topology_str;
+                                                    s.matrix_topology = compressed_payload.clone();
+
+                                                    // J21 PATHFINDER: Instant Payload Mutation for full DAG
+                                                    // Resolving asynchronous UI blindness: Only inject the DAG if it doesn't already exist
+                                                    // to prevent exponential string duplication during rapid Matrix pings.
+                                                    if let Some(ref mut payload) = s.review_payload {
+                                                        if !payload.system.contains("--- CURRENT SPATIAL TOPOLOGY") {
+                                                            payload.system.push_str("\n\n--- CURRENT SPATIAL TOPOLOGY (DAG) ---\n");
+                                                            payload.system.push_str(&compressed_payload);
+                                                        }
+                                                    }
                                                 }
+                                                // IMMEDIATELY fire StateInvalidated so the UI repaints with the DAG
                                                 let _ = synapse_loop.fire_async(SMessage::StateInvalidated).await;
                                             }
                                             bandy::MatrixEvent::SectorFocused { target, context } => {
                                                 let topology_str = format!("SECTOR: {}\n\n{}", target, context);
                                                 {
                                                     let mut s = state_bg.write().unwrap();
-                                                    s.matrix_topology = topology_str;
+                                                    s.matrix_topology = topology_str.clone();
+
+                                                    // J21 PATHFINDER: Instant Payload Mutation
+                                                    // Resolving asynchronous UI blindness: Only inject the DAG if it doesn't already exist
+                                                    // to prevent exponential string duplication during rapid Matrix pings.
+                                                    if let Some(ref mut payload) = s.review_payload {
+                                                        if !payload.system.contains("--- CURRENT SPATIAL TOPOLOGY") {
+                                                            payload.system.push_str("\n\n--- CURRENT SPATIAL TOPOLOGY (DAG) ---\n");
+                                                            payload.system.push_str(&topology_str);
+                                                        }
+                                                    }
                                                 }
+                                                // IMMEDIATELY fire StateInvalidated so the UI repaints with the DAG
                                                 let _ = synapse_loop.fire_async(SMessage::StateInvalidated).await;
                                             }
                                             _ => {}
@@ -765,8 +778,17 @@ impl AppHandler for VeinHandler {
         match event {
             Event::Input { target: _, text } => {
                 let trimmed = text.trim();
+                let absolute_workspace_root = {
+                    let s = self.app_state.read().unwrap();
+                    s.absolute_workspace_root.clone()
+                };
+
                 let path = std::path::Path::new(trimmed);
-                if path.exists() {
+                let absolute_path = absolute_workspace_root.join(path);
+
+                // J21 PATHFINDER: Mathematically verify existence via absolute path,
+                // but pass the relative path into Matrix for topology constraints.
+                if absolute_path.exists() {
                     let _ = self.synapse.fire(SMessage::Matrix(bandy::MatrixEvent::FocusSector(trimmed.to_string())));
                 }
 

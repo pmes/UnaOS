@@ -172,6 +172,10 @@ pub struct AppState {
 
     // The active spatial map (Matrix DAG topology)
     pub matrix_topology: String,
+
+    // The absolute workspace root anchor (J21 "Pathfinder" Directive)
+    // Cached immutably and passed by reference to achieve zero-latency resolution
+    pub absolute_workspace_root: std::sync::Arc<std::path::PathBuf>,
 }
 
 impl Default for AppState {
@@ -194,6 +198,9 @@ impl Default for AppState {
             shard_statuses: HashMap::new(),
             live_context: Vec::new(),
             matrix_topology: String::new(),
+            absolute_workspace_root: std::sync::Arc::new(
+                std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."))
+            ),
         }
     }
 }
