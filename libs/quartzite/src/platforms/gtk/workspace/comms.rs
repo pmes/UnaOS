@@ -765,7 +765,12 @@ pub fn build(
         *pending_save.borrow_mut() = Some(glib::timeout_add_local(
             std::time::Duration::from_millis(500),
             move || {
-                let _ = std::fs::write(&path, &text);
+                let path_for_task = path.clone();
+                let text_for_task = text.clone();
+                // Offload disk I/O to the Tokio blocking thread pool to protect the UI render cycle
+                tokio::task::spawn_blocking(move || {
+                    let _ = std::fs::write(&path_for_task, &text_for_task);
+                });
                 *pending_timeout.borrow_mut() = None;
                 glib::ControlFlow::Break
             },
@@ -807,7 +812,12 @@ pub fn build(
             let (start, end) = buffer_key.bounds();
             let text = buffer_key.text(&start, &end, false).to_string();
             if !text.trim().is_empty() {
-                let _ = std::fs::remove_file(&draft_wipe_path1);
+                let wipe_path = draft_wipe_path1.clone();
+                // Offload disk I/O to prevent UI stutter when clearing the draft
+                tokio::task::spawn_blocking(move || {
+                    let _ = std::fs::remove_file(&wipe_path);
+                });
+
                 let tx_async = tx_clone_key.clone();
                 let target_val = target_key.borrow().clone();
                 glib::MainContext::default().spawn_local(async move {
@@ -833,7 +843,12 @@ pub fn build(
         let (start, end) = buffer_send.bounds();
         let text = buffer_send.text(&start, &end, false).to_string();
         if !text.trim().is_empty() {
-            let _ = std::fs::remove_file(&draft_wipe_path2);
+            let wipe_path = draft_wipe_path2.clone();
+            // Offload disk I/O to prevent UI stutter when clearing the draft
+            tokio::task::spawn_blocking(move || {
+                let _ = std::fs::remove_file(&wipe_path);
+            });
+
             let tx_async = tx_clone_send.clone();
             let target_val = target_send.borrow().clone();
             glib::MainContext::default().spawn_local(async move {
