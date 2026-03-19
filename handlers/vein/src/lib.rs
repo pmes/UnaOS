@@ -350,19 +350,10 @@ impl VeinHandler {
                                     }
                                     SMessage::Matrix(matrix_event) => {
                                         match matrix_event {
-                                            bandy::MatrixEvent::IngestTopology { nodes, edges } => {
-                                                let mut topology_str = String::new();
-                                                for node in &nodes {
-                                                    topology_str.push_str(&format!("NODE: {} [{}]\n", node.id, node.kind));
-                                                }
-                                                topology_str.push_str("\n");
-                                                for edge in &edges {
-                                                    topology_str.push_str(&format!("EDGE: {} --{}--> {}\n", edge.from, edge.relation, edge.to));
-                                                }
-
+                                            bandy::MatrixEvent::IngestTopology { payload: compressed_payload } => {
                                                 {
                                                     let mut s = state_bg.write().unwrap();
-                                                    s.matrix_topology = topology_str.clone();
+                                                    s.matrix_topology = compressed_payload.clone();
 
                                                     // J21 PATHFINDER: Instant Payload Mutation for full DAG
                                                     // Resolving asynchronous UI blindness: Only inject the DAG if it doesn't already exist
@@ -370,7 +361,7 @@ impl VeinHandler {
                                                     if let Some(ref mut payload) = s.review_payload {
                                                         if !payload.system.contains("--- CURRENT SPATIAL TOPOLOGY") {
                                                             payload.system.push_str("\n\n--- CURRENT SPATIAL TOPOLOGY (DAG) ---\n");
-                                                            payload.system.push_str(&topology_str);
+                                                            payload.system.push_str(&compressed_payload);
                                                         }
                                                     }
                                                 }

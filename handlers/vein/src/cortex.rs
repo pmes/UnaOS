@@ -131,12 +131,10 @@ async fn scan_workspace(root: &Path, synapse: &bandy::Synapse) -> HashMap<PathBu
         }
     }
 
-    synapse
-        .fire_async(SMessage::Matrix(MatrixEvent::IngestTopology {
-            nodes: spatial_nodes,
-            edges: spatial_edges,
-        }))
-        .await;
+    // J21 PATHFINDER: The true IngestTopology has been replaced with the AI-readable
+    // DICTIONARY$TOPOLOGY serialization format driven entirely by the `matrix` scanner.
+    // The previous implementation is effectively a no-op, but we avoid breaking changes
+    // in the Cortex sequence by skipping the deprecated telemetry injection.
     synapse
         .fire_async(SMessage::Log {
             level: "INFO".into(),
