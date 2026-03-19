@@ -3,7 +3,8 @@ pub mod reactor;
 pub mod sidebar;
 pub mod translator;
 
-use async_channel::{Receiver, Sender};
+use async_channel::Sender;
+use tokio::sync::broadcast::Receiver as BroadcastReceiver;
 use bandy::SMessage;
 use bandy::state::AppState;
 use std::sync::{Arc, RwLock};
@@ -18,11 +19,15 @@ pub struct WorkspaceWidgets {
     pub right_switcher: gtk4::StackSwitcher,
 }
 
+// Why Broadcast? MPMC channels (`async_channel`) load-balance by consuming messages,
+// causing UI starvation if a background thread wins the race. `tokio::sync::broadcast`
+// enforces pub/sub physics, ensuring the UI and Backend independently observe the exact
+// same state reality without stealing from each other.
 pub fn build(
     window: &NativeWindow,
     tx_event: Sender<Event>,
     app_state: Arc<RwLock<AppState>>,
-    rx_synapse: Receiver<SMessage>,
+    rx_synapse: BroadcastReceiver<SMessage>,
     brain_icon: gtk4::Image,
 ) -> WorkspaceWidgets {
     // Spawn translator

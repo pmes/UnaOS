@@ -9,6 +9,7 @@
 use crate::{NativeView, NativeWindow};
 use gneiss_pal::Event;
 use std::sync::{Arc, RwLock};
+use tokio::sync::broadcast::Receiver as BroadcastReceiver;
 
 // Import the single source of truth from the nervous system
 use bandy::state::AppState;
@@ -51,7 +52,7 @@ impl Spline {
         _window: &NativeWindow,
         _tx_event: async_channel::Sender<Event>,
         _app_state: Arc<RwLock<AppState>>,
-        _rx_synapse: async_channel::Receiver<SMessage>,
+        _rx_synapse: BroadcastReceiver<SMessage>,
     ) -> NativeView {
         #[cfg(any(all(target_os = "linux", feature = "gtk"), target_os = "macos"))]
         return self
