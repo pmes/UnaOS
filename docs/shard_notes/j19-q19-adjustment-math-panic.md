@@ -28,3 +28,7 @@
 3. If `new_upper < lower + new_page_size` (content fits entirely within the viewport):
    - We strictly clamp the adjustment value to `lower`, ensuring the view rests cleanly at the top bound without overflowing.
 All calculations are safely deferred to the GTK idle loop to guarantee layout resolution before scroll actuation. The data-layer `boot_obj` was retained to ensure the initial list configuration yields a non-zero layout bound from the engine.
+
+**Anomaly Update:** The 1-pixel `boot_obj` was mathematically forcing the GTK panic, and synchronous layout interception was colliding with the engine.
+
+**Resolution Update:** Eradicated `boot_obj` completely. The `console_store` now starts genuinely empty. Deferred all adjustment clamping, including the `is_at_bottom` calculation, to the GTK idle loop to guarantee layout resolution is fully concluded before any viewport geometry is queried or actuated.

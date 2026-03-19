@@ -139,44 +139,39 @@ pub fn build(
 
     // Helper macro to handle layout recalculations on upper or page_size change
     let handle_geometry_change = move |a: &gtk4::Adjustment| {
-        let new_upper = a.upper();
-        let new_page_size = a.page_size();
-        let lower = a.lower();
-        let current_value = a.value();
-
-        let old_upper = *last_upper_ref.borrow();
-        let old_page_size = *last_page_size_ref.borrow();
-
-        let delta = new_upper - old_upper;
-
-        *last_upper_ref.borrow_mut() = new_upper;
-        *last_page_size_ref.borrow_mut() = new_page_size;
-
-        if new_upper == 0.0 { return; }
-
         let a_clone = a.clone();
-        let is_prepending = *is_prepending_upper.borrow();
-        let is_prepending_upper_clone = is_prepending_upper.clone();
+
+        let last_upper_idle = last_upper_ref.clone();
+        let last_page_size_idle = last_page_size_ref.clone();
+        let is_prepending_idle = is_prepending_upper.clone();
         let fetching_for_idle = is_fetching_for_upper.clone();
 
-        // Calculate physics logic based on J19 architecture rules
-        let is_at_bottom = current_value >= (old_upper - old_page_size - 1.0);
-
-        // Defer the adjustment value update to the GTK idle loop.
-        // By wrapping `vadjustment.set_value()` in `idle_add_local`, we yield
-        // to the GTK frame cycle, ensuring that layout and geometry allocation
-        // for the new list items are mathematically finalized before scrolling.
+        // Defer the entirety of the clamping logic to the GTK idle loop.
+        // This ensures the layout engine has completed its `gtk_adjustment_configure` pass
+        // before we query the bounds and attempt any manual viewport adjustments.
         glib::idle_add_local(move || {
             let current_upper = a_clone.upper();
             let current_page_size = a_clone.page_size();
             let current_lower = a_clone.lower();
+            let current_value = a_clone.value();
 
+            let old_upper = *last_upper_idle.borrow();
+            let old_page_size = *last_page_size_idle.borrow();
+            let is_prepending = *is_prepending_idle.borrow();
             let fetching = *fetching_for_idle.borrow();
+
+            let delta = current_upper - old_upper;
+
+            *last_upper_idle.borrow_mut() = current_upper;
+            *last_page_size_idle.borrow_mut() = current_page_size;
 
             // Add this guard to prevent layout assertion failures
             if current_upper == 0.0 || fetching {
                 return glib::ControlFlow::Break;
             }
+
+            // Calculate physics logic based on J19 architecture rules
+            let is_at_bottom = current_value >= (old_upper - old_page_size - 1.0);
 
             if current_upper >= current_lower + current_page_size {
                 // The Clamp: Content is larger than viewport
@@ -189,7 +184,7 @@ pub fn build(
                     let max_valid_value = (current_upper - current_page_size).max(current_lower);
                     let target_val = a_clone.value() + delta;
                     a_clone.set_value(target_val.clamp(current_lower, max_valid_value));
-                    *is_prepending_upper_clone.borrow_mut() = false;
+                    *is_prepending_idle.borrow_mut() = false;
                 } else {
                     // Do nothing. Respect user's current adj.value()
                 }
@@ -213,23 +208,6 @@ pub fn build(
     });
 
     let console_store = gio::ListStore::new::<HistoryObject>();
-
-    // Immediately seed the console_store with an initialization engram before UI render.
-    // By guaranteeing the ListView is never geometrically empty at boot, the GTK4 ScrolledWindow
-    // will calculate a valid `upper` bounds > 0. This mathematically prevents the
-    // `gtk_adjustment_configure` assertion (`lower + page_size <= upper`) from triggering
-    // without relying on layout hacks (like `gtk::Box` wrapping) that break the GtkScrollable interface.
-    let boot_id = format!("{}-boot", chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0));
-    let boot_timestamp = chrono::Local::now().format("%H:%M:%S").to_string();
-    let boot_obj = HistoryObject::new(
-        &boot_id,
-        "System",
-        "Boot",
-        &boot_timestamp,
-        "UnaOS Telemetry Link Established.",
-        true
-    );
-    console_store.append(&boot_obj);
 
     // REMOVED FilterListModel per Architect instructions
     let console_selection = NoSelection::new(Some(console_store.clone()));
