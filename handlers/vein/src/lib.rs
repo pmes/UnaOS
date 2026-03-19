@@ -764,24 +764,30 @@ impl AppHandler for VeinHandler {
 
         match event {
             Event::Input { target: _, text } => {
+                let trimmed = text.trim();
+                let path = std::path::Path::new(trimmed);
+                if path.exists() {
+                    let _ = self.synapse.fire(SMessage::Matrix(bandy::MatrixEvent::FocusSector(trimmed.to_string())));
+                }
+
                 let _ = self.synapse.fire(SMessage::ContextTelemetry {
                     skeletons: vec![],
                 });
 
-                if text.trim() == "/wolf" {
+                if trimmed == "/wolf" {
                     {
                         let mut s = self.app_state.write().unwrap();
                         s.sidebar_status = WolfpackState::Idle;
                     }
                     self.append_to_console("\n[SYSTEM] :: Switching to Wolfpack Grid...\n");
                     emit_ping = true;
-                } else if text.trim() == "/comms" {
+                } else if trimmed == "/comms" {
                     self.append_to_console("\n[SYSTEM] :: Secure Comms Established.\n");
                     emit_ping = true;
-                } else if let Some(path_str) = text.trim().strip_prefix("/upload ") {
+                } else if let Some(path_str) = trimmed.strip_prefix("/upload ") {
                     let path = PathBuf::from(path_str.trim());
                     let _ = self.publish("upload", SMessage::TriggerUpload(path));
-                } else if let Some(dir_text) = text.trim().strip_prefix("/directive ") {
+                } else if let Some(dir_text) = trimmed.strip_prefix("/directive ") {
                     self.append_to_console("\n[SYSTEM] :: Burning Active Directive to Vault...\n");
                     let _ = self.tx.send(format!("SAVE_DIRECTIVE:{}", dir_text));
                 } else {
