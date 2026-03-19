@@ -70,8 +70,13 @@ pub fn spawn_translator(
                     };
 
                     if !history_delta.is_empty() {
-                        println!(">>> [J13 TRACE] TRANSLATOR: Sending HistoryBatch with {} items", history_delta.len());
-                        let _ = tx_gui.send(GuiUpdate::HistoryBatch(history_delta)).await;
+                        if history_cursor == 0 {
+                            println!(">>> [J16 TRACE] TRANSLATOR: Sending HistorySeed with {} items", history_delta.len());
+                            let _ = tx_gui.send(GuiUpdate::HistorySeed(history_delta)).await;
+                        } else {
+                            println!(">>> [J16 TRACE] TRANSLATOR: Sending HistoryAppend with {} items", history_delta.len());
+                            let _ = tx_gui.send(GuiUpdate::HistoryAppend(history_delta)).await;
+                        }
                         history_cursor = new_history_len;
                     }
                     if !logs_delta.is_empty() {

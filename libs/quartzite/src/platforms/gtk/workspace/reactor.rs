@@ -73,7 +73,36 @@ pub fn spawn_listener(pointers: ReactorPointers, rx_gui: Receiver<GuiUpdate>) {
                         println!(">>> [J13 TRACE] REACTOR: Splice executed for {} items (ConsoleLogBatch)", batch.len());
                     }
                 }
-                GuiUpdate::HistoryBatch(messages) => {
+                GuiUpdate::HistorySeed(messages) => {
+                    if messages.is_empty() {
+                        *pointers.is_fetching.borrow_mut() = false;
+                        *pointers.is_prepending.borrow_mut() = false;
+                        continue;
+                    }
+
+                    let mut batch: Vec<gtk4::glib::Object> = Vec::new();
+                    for (i, msg) in messages.into_iter().enumerate() {
+                        let id = format!("{}-hist-{}", chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0), i);
+                        let obj = HistoryObject::new(&id, &msg.sender, "History", &msg.timestamp, &msg.content, msg.is_chat);
+                        println!("Seeding history item: {}", msg.content);
+                        batch.push(obj.upcast());
+                    }
+                    if !batch.is_empty() {
+                        // Splice at index 0 to properly prepend history
+                        pointers.console_store.splice(0, 0, &batch);
+                        println!(">>> [J16 TRACE] REACTOR: Splice executed for {} items (HistorySeed)", batch.len());
+                    }
+
+                    let fetch_lock = pointers.is_fetching.clone();
+                    gtk4::glib::timeout_add_local(
+                        std::time::Duration::from_millis(100),
+                        move || {
+                            *fetch_lock.borrow_mut() = false;
+                            gtk4::glib::ControlFlow::Break
+                        },
+                    );
+                }
+                GuiUpdate::HistoryAppend(messages) => {
                     if messages.is_empty() {
                         *pointers.is_fetching.borrow_mut() = false;
                         *pointers.is_prepending.borrow_mut() = false;
@@ -88,9 +117,9 @@ pub fn spawn_listener(pointers: ReactorPointers, rx_gui: Receiver<GuiUpdate>) {
                         batch.push(obj.upcast());
                     }
                     if !batch.is_empty() {
-                        // Splice at index 0 to properly prepend history
-                        pointers.console_store.splice(0, 0, &batch);
-                        println!(">>> [J13 TRACE] REACTOR: Splice executed for {} items (HistoryBatch)", batch.len());
+                        let len = pointers.console_store.n_items();
+                        pointers.console_store.splice(len, 0, &batch);
+                        println!(">>> [J16 TRACE] REACTOR: Splice executed for {} items (HistoryAppend)", batch.len());
                     }
 
                     let fetch_lock = pointers.is_fetching.clone();

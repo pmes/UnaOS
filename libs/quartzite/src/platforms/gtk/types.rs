@@ -5,7 +5,8 @@ use bandy::state::{HistoryItem, PreFlightPayload, WolfpackState, ShardStatus};
 
 #[derive(Debug, Clone)]
 pub enum GuiUpdate {
-    HistoryBatch(Vec<HistoryItem>),
+    HistorySeed(Vec<HistoryItem>),
+    HistoryAppend(Vec<HistoryItem>),
     ShardStatusChanged { id: String, status: ShardStatus },
     ConsoleLogBatch(Vec<String>),
     ClearConsole,
