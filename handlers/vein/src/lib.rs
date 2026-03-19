@@ -765,8 +765,17 @@ impl AppHandler for VeinHandler {
         match event {
             Event::Input { target: _, text } => {
                 let trimmed = text.trim();
+                let absolute_workspace_root = {
+                    let s = self.app_state.read().unwrap();
+                    s.absolute_workspace_root.clone()
+                };
+
                 let path = std::path::Path::new(trimmed);
-                if path.exists() {
+                let absolute_path = absolute_workspace_root.join(path);
+
+                // J21 PATHFINDER: Mathematically verify existence via absolute path,
+                // but pass the relative path into Matrix for topology constraints.
+                if absolute_path.exists() {
                     let _ = self.synapse.fire(SMessage::Matrix(bandy::MatrixEvent::FocusSector(trimmed.to_string())));
                 }
 

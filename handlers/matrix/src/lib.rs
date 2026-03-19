@@ -31,6 +31,10 @@ impl MatrixScanner {
             for entry in entries.flatten() {
                 let p = entry.path();
                 let kind = if p.is_dir() { "directory" } else { "module" };
+
+                // J21 PATHFINDER: To conserve memory, store paths relative to the absolute root anchor.
+                let relative_path = p.strip_prefix(path).unwrap_or(&p).to_path_buf();
+
                 // Map to the bandy struct
                 nodes.push(bandy::SpatialNode {
                     id: p
@@ -39,7 +43,7 @@ impl MatrixScanner {
                         .to_string_lossy()
                         .into_owned(),
                     kind: kind.to_string(),
-                    path: p,
+                    path: relative_path,
                 });
             }
         }

@@ -90,7 +90,14 @@ fn main() {
     });
 
     // 6. Ignite the AI Handler (The Conscious Vein)
-    let app_state = Arc::new(RwLock::new(bandy::state::AppState::default()));
+    let mut default_state = bandy::state::AppState::default();
+
+    // J21 PATHFINDER: Resolve absolute workspace root zero-latency anchor
+    let absolute_workspace_root = elessar::find_workspace_root();
+    log::info!("[ELESSAR] Absolute Workspace Root Anchored: {:?}", absolute_workspace_root);
+    default_state.absolute_workspace_root = std::sync::Arc::new(absolute_workspace_root);
+
+    let app_state = Arc::new(RwLock::new(default_state));
     // Channels for UI Events (Spline -> Vein)
     let (event_tx, event_rx) = async_channel::unbounded::<quartzite::Event>();
 
