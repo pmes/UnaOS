@@ -365,9 +365,13 @@ impl VeinHandler {
                                                     s.matrix_topology = topology_str.clone();
 
                                                     // J21 PATHFINDER: Instant Payload Mutation for full DAG
+                                                    // Resolving asynchronous UI blindness: Only inject the DAG if it doesn't already exist
+                                                    // to prevent exponential string duplication during rapid Matrix pings.
                                                     if let Some(ref mut payload) = s.review_payload {
-                                                        payload.system.push_str("\n\n--- CURRENT SPATIAL TOPOLOGY (DAG) ---\n");
-                                                        payload.system.push_str(&topology_str);
+                                                        if !payload.system.contains("--- CURRENT SPATIAL TOPOLOGY") {
+                                                            payload.system.push_str("\n\n--- CURRENT SPATIAL TOPOLOGY (DAG) ---\n");
+                                                            payload.system.push_str(&topology_str);
+                                                        }
                                                     }
                                                 }
                                                 // IMMEDIATELY fire StateInvalidated so the UI repaints with the DAG
@@ -380,10 +384,13 @@ impl VeinHandler {
                                                     s.matrix_topology = topology_str.clone();
 
                                                     // J21 PATHFINDER: Instant Payload Mutation
+                                                    // Resolving asynchronous UI blindness: Only inject the DAG if it doesn't already exist
+                                                    // to prevent exponential string duplication during rapid Matrix pings.
                                                     if let Some(ref mut payload) = s.review_payload {
-                                                        // Append the new DAG topology to the payload's system context
-                                                        payload.system.push_str("\n\n--- CURRENT SPATIAL TOPOLOGY (DAG) ---\n");
-                                                        payload.system.push_str(&topology_str);
+                                                        if !payload.system.contains("--- CURRENT SPATIAL TOPOLOGY") {
+                                                            payload.system.push_str("\n\n--- CURRENT SPATIAL TOPOLOGY (DAG) ---\n");
+                                                            payload.system.push_str(&topology_str);
+                                                        }
                                                     }
                                                 }
                                                 // IMMEDIATELY fire StateInvalidated so the UI repaints with the DAG
