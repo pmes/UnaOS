@@ -24,7 +24,7 @@ use tokio::sync::mpsc;
 
 // All UI/High-level state types have been evacuated from gneiss_pal and now live in bandy::state
 use bandy::state::{
-    AppState, PreFlightPayload, ShardStatus, WolfpackState, HistoryItem
+    AppState, PreFlightPayload, ShardStatus, WolfpackState, HistoryItem, MAX_STATE_CAPACITY
 };
 use bandy::{BandyMember, SMessage, Synapse};
 
@@ -53,7 +53,11 @@ async fn execute_upload(path: PathBuf, app_state: Arc<RwLock<AppState>>, synapse
     // STATE MUTATION & PING
     {
         let mut s = app_state.write().unwrap();
-        s.console_logs.push(format!("\n[SYSTEM] :: Uploading: {}...\n", filename));
+        s.console_logs.push_back(format!("\n[SYSTEM] :: Uploading: {}...\n", filename));
+        s.console_seq += 1;
+        while s.console_logs.len() > MAX_STATE_CAPACITY {
+            s.console_logs.pop_front();
+        }
     }
     let _ = synapse.fire_async(SMessage::StateInvalidated).await;
 
@@ -62,7 +66,11 @@ async fn execute_upload(path: PathBuf, app_state: Arc<RwLock<AppState>>, synapse
         Err(e) => {
             {
                 let mut s = app_state.write().unwrap();
-                s.console_logs.push(format!("\n[SYSTEM ERROR] :: File Read Failed: {}\n", e));
+                s.console_logs.push_back(format!("\n[SYSTEM ERROR] :: File Read Failed: {}\n", e));
+                s.console_seq += 1;
+                while s.console_logs.len() > MAX_STATE_CAPACITY {
+                    s.console_logs.pop_front();
+                }
             }
             let _ = synapse.fire_async(SMessage::StateInvalidated).await;
             return;
@@ -93,7 +101,11 @@ async fn execute_upload(path: PathBuf, app_state: Arc<RwLock<AppState>>, synapse
                     {
                         let mut s = app_state.write().unwrap();
                         s.active_input_buffer.push_str(&tag);
-                        s.console_logs.push(format!("\n[SYSTEM] :: Upload Complete: {}\n", filename));
+                        s.console_logs.push_back(format!("\n[SYSTEM] :: Upload Complete: {}\n", filename));
+                        s.console_seq += 1;
+                        while s.console_logs.len() > MAX_STATE_CAPACITY {
+                            s.console_logs.pop_front();
+                        }
                     }
                     let _ = synapse.fire_async(SMessage::StateInvalidated).await;
                 }
@@ -102,14 +114,22 @@ async fn execute_upload(path: PathBuf, app_state: Arc<RwLock<AppState>>, synapse
         Ok(response) => {
             {
                 let mut s = app_state.write().unwrap();
-                s.console_logs.push(format!("\n[SYSTEM ERROR] :: Upload Failed: {}\n", response.status()));
+                s.console_logs.push_back(format!("\n[SYSTEM ERROR] :: Upload Failed: {}\n", response.status()));
+                s.console_seq += 1;
+                while s.console_logs.len() > MAX_STATE_CAPACITY {
+                    s.console_logs.pop_front();
+                }
             }
             let _ = synapse.fire_async(SMessage::StateInvalidated).await;
         }
         Err(e) => {
             {
                 let mut s = app_state.write().unwrap();
-                s.console_logs.push(format!("\n[SYSTEM ERROR] :: Upload Request Failed: {}\n", e));
+                s.console_logs.push_back(format!("\n[SYSTEM ERROR] :: Upload Request Failed: {}\n", e));
+                s.console_seq += 1;
+                while s.console_logs.len() > MAX_STATE_CAPACITY {
+                    s.console_logs.pop_front();
+                }
             }
             let _ = synapse.fire_async(SMessage::StateInvalidated).await;
         }
@@ -189,7 +209,11 @@ impl VeinHandler {
             // 2. THE LEXICAL LOCK & PING
             {
                 let mut s = state_bg.write().unwrap();
-                s.console_logs.push(format!("VEIN: [{}] [INFO] :: BRAIN :: Connecting...\n", now));
+                s.console_logs.push_back(format!("VEIN: [{}] [INFO] :: BRAIN :: Connecting...\n", now));
+                s.console_seq += 1;
+                while s.console_logs.len() > MAX_STATE_CAPACITY {
+                    s.console_logs.pop_front();
+                }
             }
             let _ = synapse_loop.fire_async(SMessage::StateInvalidated).await;
 
@@ -238,7 +262,11 @@ impl VeinHandler {
                 Ok(client) => {
                     {
                         let mut s = state_bg.write().unwrap();
-                        s.console_logs.push(":: FORGE :: CONNECTED\n".into());
+                        s.console_logs.push_back(":: FORGE :: CONNECTED\n".into());
+                        s.console_seq += 1;
+                        while s.console_logs.len() > MAX_STATE_CAPACITY {
+                            s.console_logs.pop_front();
+                        }
                     }
                     let _ = synapse_loop.fire_async(SMessage::StateInvalidated).await;
                     Some(client)
@@ -251,7 +279,11 @@ impl VeinHandler {
                 Ok(mut client) => {
                     {
                         let mut s = state_bg.write().unwrap();
-                        s.console_logs.push(":: BRAIN :: ONLINE (PLEXUS ENABLED)\n\n".into());
+                        s.console_logs.push_back(":: BRAIN :: ONLINE (PLEXUS ENABLED)\n\n".into());
+                        s.console_seq += 1;
+                        while s.console_logs.len() > MAX_STATE_CAPACITY {
+                            s.console_logs.pop_front();
+                        }
                         s.active_directive = brain_bg.get_active_directive();
                     }
                     let _ = synapse_loop.fire_async(SMessage::StateInvalidated).await;
@@ -285,6 +317,10 @@ impl VeinHandler {
                                                 timestamp: r.timestamp,
                                                 is_chat: r.is_chat,
                                             }).collect();
+                                            while s.history.len() > MAX_STATE_CAPACITY {
+                                                s.history.pop_front();
+                                            }
+                                            s.history_seq += s.history.len();
                                         }
                                         let _ = synapse_loop.fire_async(SMessage::StateInvalidated).await;
                                     }
@@ -392,7 +428,11 @@ impl VeinHandler {
 
                                                 {
                                                     let mut s = state_bg.write().unwrap();
-                                                    s.console_logs.push(display.clone());
+                                                    s.console_logs.push_back(display.clone());
+                                                    s.console_seq += 1;
+                                                    while s.console_logs.len() > MAX_STATE_CAPACITY {
+                                                        s.console_logs.pop_front();
+                                                    }
                                                     if let Some(meta) = metadata {
                                                         s.token_usage = (
                                                             meta.prompt_token_count.unwrap_or(0) as i32,
@@ -486,7 +526,11 @@ impl VeinHandler {
                                         };
                                         {
                                             let mut s = state_bg.write().unwrap();
-                                            s.console_logs.push(response_msg);
+                                            s.console_logs.push_back(response_msg);
+                                            s.console_seq += 1;
+                                            while s.console_logs.len() > MAX_STATE_CAPACITY {
+                                                s.console_logs.pop_front();
+                                            }
                                         }
                                         let _ = synapse_loop.fire_async(SMessage::StateInvalidated).await;
                                     }
@@ -628,7 +672,11 @@ impl VeinHandler {
                 Err(e) => {
                     {
                         let mut s = state_bg.write().unwrap();
-                        s.console_logs.push(format!(":: FATAL :: {}\n", e));
+                        s.console_logs.push_back(format!(":: FATAL :: {}\n", e));
+                        s.console_seq += 1;
+                        while s.console_logs.len() > MAX_STATE_CAPACITY {
+                            s.console_logs.pop_front();
+                        }
                     }
                     let _ = synapse_loop.fire_async(SMessage::StateInvalidated).await;
                 }
@@ -648,7 +696,11 @@ impl VeinHandler {
     fn append_to_console(&self, text: &str) {
         {
             let mut s = self.app_state.write().unwrap();
-            s.console_logs.push(text.to_string());
+            s.console_logs.push_back(text.to_string());
+            s.console_seq += 1;
+            while s.console_logs.len() > MAX_STATE_CAPACITY {
+                s.console_logs.pop_front();
+            }
         }
         self.synapse.fire(SMessage::StateInvalidated);
     }

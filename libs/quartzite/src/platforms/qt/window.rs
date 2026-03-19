@@ -14,7 +14,8 @@
 // You should have received a copy of the GNU Lesser General Public License
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-use async_channel::{Receiver, Sender};
+use async_channel::Sender;
+use tokio::sync::broadcast::Receiver;
 use std::sync::OnceLock;
 
 use crate::{NativeView, NativeWindow};
@@ -65,7 +66,7 @@ impl qobject::LumenWindow {
     }
 }
 
-pub fn spawn_state_listener(app_state: Arc<RwLock<AppState>>, rx: Receiver<SMessage>) {
+pub fn spawn_state_listener(app_state: Arc<RwLock<AppState>>, mut rx: Receiver<SMessage>) {
     if let Ok(handle) = Handle::try_current() {
         handle.spawn(async move {
             while let Ok(update) = rx.recv().await {
@@ -73,9 +74,9 @@ pub fn spawn_state_listener(app_state: Arc<RwLock<AppState>>, rx: Receiver<SMess
                     // Extract exactly what we need for the specific models using the read lock
                     let (history, payload, logs) = {
                         let state = app_state.read().unwrap();
-                        let hist = state.history.clone();
+                        let hist = state.history.iter().cloned().collect::<Vec<_>>();
                         let pay = state.review_payload.clone();
-                        let ls = state.console_logs.clone();
+                        let ls = state.console_logs.iter().cloned().collect::<Vec<_>>();
                         (hist, pay, ls)
                     };
 
