@@ -186,7 +186,7 @@ impl DiskManager {
         Ok(memories)
     }
 
-    pub fn load_all_memories(&mut self) -> Result<Vec<DispatchRecord>> {
+    pub fn load_paged_memories(&mut self, offset: usize, limit: usize) -> Result<Vec<DispatchRecord>> {
         // Retrieve all chat memories for UI startup
         let query_str = "type == \"chat\"";
 
@@ -195,11 +195,17 @@ impl DiskManager {
             .query(query_str)
             .map_err(|e| anyhow::anyhow!("Query failed: {:?}", e))?;
 
-        // Sort by ID (Creation Order)
-        inodes.sort_by_key(|(inode, _)| inode.id);
+        // 1. Sort DESCENDING (newest first) to establish the pagination baseline
+        inodes.sort_by_key(|(inode, _)| std::cmp::Reverse(inode.id));
+
+        // 2. Slice the page
+        let mut paged_inodes: Vec<_> = inodes.into_iter().skip(offset).take(limit).collect();
+
+        // 3. Re-sort ASCENDING so the UI receives them in proper chronological order
+        paged_inodes.sort_by_key(|(inode, _)| inode.id);
 
         let mut records = Vec::new();
-        for (inode, _) in inodes {
+        for (inode, _) in paged_inodes {
             let data = self
                 .fs
                 .read_data(inode.id, 0, inode.size)
@@ -336,10 +342,10 @@ pub async fn ignite(vault_path: PathBuf, synapse: Synapse) {
                         }
                     }
                 }
-                SMessage::StorageLoadAll { receipt_id } => {
+                SMessage::StorageLoadPaged { receipt_id, offset, limit } => {
                     let mut dm = disk_manager;
                     let (dm_returned, result) = task::spawn_blocking(move || {
-                        let res = dm.load_all_memories().unwrap_or_default();
+                        let res = dm.load_paged_memories(offset, limit).unwrap_or_default();
                         (dm, res)
                     })
                     .await
@@ -348,7 +354,7 @@ pub async fn ignite(vault_path: PathBuf, synapse: Synapse) {
                     disk_manager = dm_returned;
 
                     synapse_clone
-                        .fire_async(SMessage::StorageLoadAllResult {
+                        .fire_async(SMessage::StorageLoadPagedResult {
                             receipt_id,
                             records: result,
                         })

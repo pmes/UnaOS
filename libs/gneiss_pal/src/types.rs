@@ -16,7 +16,7 @@ pub enum Event {
     UploadRequest,
     FileSelected(PathBuf),
     ToggleSidebar,
-    LoadHistory,
+    LoadHistory { offset: usize },
     MatrixFileClick(PathBuf),
     AuleIgnite,
     Timer,

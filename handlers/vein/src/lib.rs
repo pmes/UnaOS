@@ -256,7 +256,7 @@ impl VeinHandler {
 
             tokio::time::sleep(Duration::from_millis(800)).await;
 
-            let _ = synapse_loop.fire_async(SMessage::StorageLoadAll { receipt_id: 0 }).await;
+            let _ = synapse_loop.fire_async(SMessage::StorageLoadPaged { receipt_id: 0, offset: 0, limit: 50 }).await;
 
             let forge_client = match ForgeClient::new() {
                 Ok(client) => {
@@ -307,8 +307,8 @@ impl VeinHandler {
                                             execute_upload(path, app_state_upload, synapse_upload).await;
                                         });
                                     }
-                                    SMessage::StorageLoadAllResult { records, receipt_id: _ } => {
-                                        println!(">>> [J13 TRACE] BACKEND: StorageLoadAllResult processed. Populating state with {} items.", records.len());
+                                    SMessage::StorageLoadPagedResult { records, receipt_id: _ } => {
+                                        println!(">>> [J13 TRACE] BACKEND: StorageLoadPagedResult processed. Populating state with {} items.", records.len());
                                         {
                                             let mut s = state_bg.write().unwrap();
                                             s.history = records.into_iter().map(|r| HistoryItem {
@@ -370,9 +370,15 @@ impl VeinHandler {
                                     None => break,
                                 };
 
-                                if user_input_text == "LOAD_HISTORY" {
-                                    receipt_counter += 1;
-                                    let _ = synapse_loop.fire_async(SMessage::StorageLoadAll { receipt_id: receipt_counter }).await;
+                                if user_input_text.starts_with("LOAD_HISTORY:") {
+                                    if let Ok(offset) = user_input_text["LOAD_HISTORY:".len()..].parse::<usize>() {
+                                        receipt_counter += 1;
+                                        let _ = synapse_loop.fire_async(SMessage::StorageLoadPaged {
+                                            receipt_id: receipt_counter,
+                                            offset,
+                                            limit: 50
+                                        }).await;
+                                    }
                                     continue;
                                 }
 
@@ -797,9 +803,9 @@ impl AppHandler for VeinHandler {
             Event::DispatchPayload(json_payload) => {
                 let _ = self.tx.send(format!("DISPATCH_PAYLOAD:{}", json_payload));
             }
-            Event::LoadHistory => {
-                println!(">>> [J13 TRACE] BACKEND: Received Event::LoadHistory. Attempting to fetch...");
-                let _ = self.tx.send("LOAD_HISTORY".to_string());
+            Event::LoadHistory { offset } => {
+                println!(">>> [J13 TRACE] BACKEND: Received Event::LoadHistory {{ offset: {} }}. Attempting to fetch...", offset);
+                let _ = self.tx.send(format!("LOAD_HISTORY:{}", offset));
             }
             _ => {}
         }

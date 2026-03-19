@@ -98,6 +98,8 @@ pub fn build(
     let is_prepending_bind = is_prepending.clone();
     let is_fetching_bind = is_fetching.clone();
 
+    let console_store = gio::ListStore::new::<HistoryObject>();
+
     // Only connect the adjustments after the window is physically drawn
     let was_at_top = Rc::new(RefCell::new(true));
     let last_upper = Rc::new(RefCell::new(0.0));
@@ -107,6 +109,7 @@ pub fn build(
     let is_prepending_val = is_prepending_bind.clone();
     let is_fetching_val = is_fetching_bind.clone();
     let tx_for_async = tx_clone_hist.clone();
+    let store_for_async = console_store.clone();
 
     adj_clone.connect_value_notify(move |a| {
         let upper = a.upper();
@@ -125,8 +128,10 @@ pub fn build(
                 *is_fetching_val.borrow_mut() = true;
                 *is_prepending_val.borrow_mut() = true;
                 let tx_hist = tx_for_async.clone();
+                // We use the UI as the absolute source of truth for the offset.
+                let offset = store_for_async.n_items() as usize;
                 glib::MainContext::default().spawn_local(async move {
-                    let _ = tx_hist.send(Event::LoadHistory).await;
+                    let _ = tx_hist.send(Event::LoadHistory { offset }).await;
                 });
             }
         }
@@ -206,8 +211,6 @@ pub fn build(
     adj_clone.connect_page_size_notify(move |a| {
         handle_geometry_change(a);
     });
-
-    let console_store = gio::ListStore::new::<HistoryObject>();
 
     // REMOVED FilterListModel per Architect instructions
     let console_selection = NoSelection::new(Some(console_store.clone()));
@@ -905,6 +908,7 @@ pub fn build(
     let tx_clone_load_hist = tx_event.clone();
     let is_fetching_boot = is_fetching.clone();
     let is_prepending_boot = is_prepending.clone();
+    let store_for_boot = console_store.clone();
 
     scrolled_window.connect_map(move |_| {
         if !*boot_fetched.borrow() {
@@ -913,9 +917,10 @@ pub fn build(
             *is_prepending_boot.borrow_mut() = true;
 
             let tx_async = tx_clone_load_hist.clone();
+            let offset = store_for_boot.n_items() as usize;
             glib::MainContext::default().spawn_local(async move {
                 println!(">>> [J13 TRACE] COMMS: Dispatching Event::LoadHistory to Backend.");
-                let _ = tx_async.send(Event::LoadHistory).await;
+                let _ = tx_async.send(Event::LoadHistory { offset }).await;
             });
         }
     });
