@@ -19,3 +19,7 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 ## 2026-03-19 - [J20 "Chronos" :: Paginated Storage Loads]
 **Anomaly:** Blind history fetches over-saturated the GTK layout engine with duplicate records, causing math panics.
 **Resolution:** Implemented strict offset/limit pagination in UnaFS queries, utilizing bidirectional sorting to slice the correct historical window while preserving chronologic UI delivery.
+
+## 2026-03-19 - [J20 "Chronos" :: Matrix DAG Payload Integration]
+**Anomaly:** The active spatial code map (Matrix DAG topology) was not being injected into Vein's Pre-Flight Payload, leaving the UI's System tab oblivious to the spatial context.
+**Resolution:** Modified `AppState` to cache `matrix_topology` by listening for `SMessage::Matrix` events, and successfully injected the formatted string block (`--- CURRENT SPATIAL TOPOLOGY (DAG) ---`) into the `system_builder` during `PreFlightPayload` construction.

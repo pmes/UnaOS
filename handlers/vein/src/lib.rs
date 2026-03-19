@@ -348,6 +348,35 @@ impl VeinHandler {
                                     SMessage::StateInvalidated => {
                                         println!(">>> [J13 TRACE] VEIN THIEF CAUGHT: VeinHandler caught SMessage::StateInvalidated. No longer a thief thanks to broadcast!");
                                     }
+                                    SMessage::Matrix(matrix_event) => {
+                                        match matrix_event {
+                                            bandy::MatrixEvent::IngestTopology { nodes, edges } => {
+                                                let mut topology_str = String::new();
+                                                for node in &nodes {
+                                                    topology_str.push_str(&format!("NODE: {} [{}]\n", node.id, node.kind));
+                                                }
+                                                topology_str.push_str("\n");
+                                                for edge in &edges {
+                                                    topology_str.push_str(&format!("EDGE: {} --{}--> {}\n", edge.from, edge.relation, edge.to));
+                                                }
+
+                                                {
+                                                    let mut s = state_bg.write().unwrap();
+                                                    s.matrix_topology = topology_str;
+                                                }
+                                                let _ = synapse_loop.fire_async(SMessage::StateInvalidated).await;
+                                            }
+                                            bandy::MatrixEvent::SectorFocused { target, context } => {
+                                                let topology_str = format!("SECTOR: {}\n\n{}", target, context);
+                                                {
+                                                    let mut s = state_bg.write().unwrap();
+                                                    s.matrix_topology = topology_str;
+                                                }
+                                                let _ = synapse_loop.fire_async(SMessage::StateInvalidated).await;
+                                            }
+                                            _ => {}
+                                        }
+                                    }
                                     _ => {}
                                     },
                                     Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
@@ -598,6 +627,16 @@ impl VeinHandler {
                                         if !retrieved_context.is_empty() {
                                             system_builder.push_str("\n\n[SEMANTIC MEMORY RECALL]:\n");
                                             system_builder.push_str(&retrieved_context);
+                                        }
+
+                                        let matrix_topology = {
+                                            let s = state_bg.read().unwrap();
+                                            s.matrix_topology.clone()
+                                        };
+
+                                        if !matrix_topology.is_empty() {
+                                            system_builder.push_str("\n\n--- CURRENT SPATIAL TOPOLOGY (DAG) ---\n");
+                                            system_builder.push_str(&matrix_topology);
                                         }
 
                                         let mut engrams_combined = String::new();
