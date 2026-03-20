@@ -14,32 +14,28 @@
 // You should have received a copy of the GNU Lesser General Public License
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-#pragma once
-#include <QApplication>
-#include <QMainWindow>
-#include <QQuickWidget>
-#include "rust/cxx.h"
+use serde::{Deserialize, Serialize};
 
-class LumenMainWindow : public QMainWindow {
-public:
-    explicit LumenMainWindow(float split_ratio, QWidget *parent = nullptr);
-    ~LumenMainWindow() override;
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub enum TetraNode {
+    Matrix, // Future MatrixTetra (Sidebar)
+    Stream, // Future StreamTetra (Comms)
+    Empty,  // Placeholder
+}
 
-private:
-    QQuickWidget* m_quickWidget;
-};
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct WorkspaceTetra {
+    pub left_pane: TetraNode,
+    pub right_pane: TetraNode,
+    pub split_ratio: f32,
+}
 
-// Opaque wrapper for QApplication to bridge across CXX
-struct LumenQApp {
-    QApplication* app;
-    LumenQApp(int& argc, char** argv);
-    ~LumenQApp();
-    int exec();
-};
-
-std::unique_ptr<LumenMainWindow> create_main_window(float split_ratio);
-void show_main_window(LumenMainWindow& window);
-
-std::unique_ptr<LumenQApp> create_qapplication();
-int exec_qapplication(LumenQApp& app);
-void quit_qapplication();
+impl Default for WorkspaceTetra {
+    fn default() -> Self {
+        Self {
+            left_pane: TetraNode::Matrix,
+            right_pane: TetraNode::Stream,
+            split_ratio: 0.25,
+        }
+    }
+}

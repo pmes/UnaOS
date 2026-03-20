@@ -50,7 +50,7 @@ Item {
 
         // Nodes Email List (Sidebar)
         NexusPanel {
-            SplitView.preferredWidth: 250
+            SplitView.preferredWidth: parent.width * (typeof _splitRatio !== "undefined" ? _splitRatio : 0.25)
             SplitView.fillHeight: true
             SplitView.minimumWidth: 150
             historyModel: typeof _historyModel !== "undefined" ? _historyModel : null

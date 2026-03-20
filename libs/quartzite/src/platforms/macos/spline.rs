@@ -42,6 +42,7 @@ impl MacOSSpline {
         _tx_event: Sender<Event>,
         rx_gui: Receiver<GuiUpdate>,
         _rx_telemetry: Receiver<bandy::SMessage>,
+        _workspace_tetra: &crate::tetra::WorkspaceTetra,
     ) -> NativeView {
         let mtm = MainThreadMarker::new().expect("Must be on main thread");
 

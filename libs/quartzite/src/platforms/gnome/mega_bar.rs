@@ -30,6 +30,7 @@ impl MegaBar {
         left_content: &gtk4::Widget,
         right_content: &gtk4::Widget,
         brain_icon: &gtk4::Image,
+        workspace_tetra: &crate::tetra::WorkspaceTetra,
     ) -> gtk4::Widget {
         // 0. The Dark Mode Hard-Wire (GNOME)
         let style_manager = adw::StyleManager::default();
@@ -57,7 +58,14 @@ impl MegaBar {
 
         // 2. Build Content Frames with ToolbarViews
         let main_h_paned = Paned::new(Orientation::Horizontal);
-        main_h_paned.set_position(260); // Slightly wider sidebar for TeleHUD
+
+        // Calculate the initial split position based on the proportional ratio.
+        // If default_width is not set or returns 0 (some layouts), fallback to 1024.
+        let default_width = window.default_width();
+        let reference_width = if default_width > 0 { default_width as f32 } else { 1024.0 };
+        let initial_position = (reference_width * workspace_tetra.split_ratio) as i32;
+
+        main_h_paned.set_position(initial_position);
         main_h_paned.set_hexpand(true);
         main_h_paned.set_vexpand(true);
         main_h_paned.set_wide_handle(false);
@@ -69,7 +77,8 @@ impl MegaBar {
         let left_toolbar = adw::ToolbarView::new();
         left_toolbar.set_widget_name("left");
         left_toolbar.add_css_class("builder-sidebar");
-        left_toolbar.set_size_request(260, -1);
+        // Maintain a minimum size instead of a hardcoded request to allow the paned to dictate width.
+        left_toolbar.set_size_request((1024.0 * 0.15) as i32, -1); // Safe minimum fallback
 
         // Strip native drop-shadows
         left_toolbar.set_top_bar_style(adw::ToolbarStyle::Flat);
