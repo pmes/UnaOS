@@ -32,7 +32,7 @@ pub mod ffi {
         include!("main_window.h");
 
         type LumenMainWindow;
-        fn create_main_window(split_ratio: f32) -> UniquePtr<LumenMainWindow>;
+        fn create_main_window(split_ratio: f32, input_anchor: i32, scroll_behavior: i32, alignment: i32) -> UniquePtr<LumenMainWindow>;
         fn show_main_window(window: Pin<&mut LumenMainWindow>);
 
         // Define an opaque type for QApplication since cxx_qt_lib only exposes QGuiApplication

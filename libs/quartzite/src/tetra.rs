@@ -17,9 +17,45 @@
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+pub enum ScrollAnchor {
+    Top,
+    Bottom,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub enum ScrollBehavior {
+    AutoScroll,
+    Manual,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub enum StreamAlign {
+    Start,
+    End,
+    Center,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct StreamTetra {
+    pub input_anchor: ScrollAnchor,
+    pub scroll_behavior: ScrollBehavior,
+    pub alignment: StreamAlign,
+}
+
+impl Default for StreamTetra {
+    fn default() -> Self {
+        Self {
+            input_anchor: ScrollAnchor::Bottom,
+            scroll_behavior: ScrollBehavior::AutoScroll,
+            alignment: StreamAlign::Start,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum TetraNode {
     Matrix, // Future MatrixTetra (Sidebar)
-    Stream, // Future StreamTetra (Comms)
+    Stream(StreamTetra), // Structuring Comms
     Empty,  // Placeholder
 }
 
@@ -34,7 +70,7 @@ impl Default for WorkspaceTetra {
     fn default() -> Self {
         Self {
             left_pane: TetraNode::Matrix,
-            right_pane: TetraNode::Stream,
+            right_pane: TetraNode::Stream(StreamTetra::default()),
             split_ratio: 0.25,
         }
     }
