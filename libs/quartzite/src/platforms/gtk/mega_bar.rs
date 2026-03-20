@@ -29,6 +29,7 @@ impl MegaBar {
         left_content: &gtk4::Widget,
         right_content: &gtk4::Widget,
         brain_icon: &gtk4::Image,
+        workspace_tetra: &crate::tetra::WorkspaceTetra,
     ) -> gtk4::Widget {
         // 0. The Dark Mode Hard-Wire (Direct GNOME DBus Wiretap)
         if let Some(source) = gtk4::gio::SettingsSchemaSource::default() {
@@ -78,7 +79,12 @@ impl MegaBar {
 
         // 2. Build the Titlebar Paned
         let title_paned = Paned::new(Orientation::Horizontal);
-        title_paned.set_position(260); // Match starting position
+
+        let default_width = window.default_width();
+        let reference_width = if default_width > 0 { default_width as f32 } else { 1024.0 };
+        let initial_position = (reference_width * workspace_tetra.split_ratio) as i32;
+
+        title_paned.set_position(initial_position);
         title_paned.set_wide_handle(false); // Hide the handle
 
         // Left Side: Header + Tabs
@@ -116,7 +122,7 @@ impl MegaBar {
 
         // 3. Build the Content Frame
         let main_h_paned = Paned::new(Orientation::Horizontal);
-        main_h_paned.set_position(260); // Slightly wider sidebar for TeleHUD
+        main_h_paned.set_position(initial_position);
         main_h_paned.set_hexpand(true);
         main_h_paned.set_vexpand(true);
         main_h_paned.set_wide_handle(false);
@@ -126,7 +132,7 @@ impl MegaBar {
 
         let left_vbox = Box::new(Orientation::Vertical, 0);
         left_vbox.add_css_class("builder-sidebar");
-        left_vbox.set_size_request(260, -1);
+        left_vbox.set_size_request((1024.0 * 0.15) as i32, -1);
         left_vbox.append(left_content);
 
         let right_vbox = Box::new(Orientation::Vertical, 0);

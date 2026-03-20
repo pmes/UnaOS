@@ -30,7 +30,7 @@
 // because it believes the QML modules are unreferenced static objects.
 extern "C" void cxx_qt_init_crate_quartzite();
 
-LumenMainWindow::LumenMainWindow(QWidget *parent) : QMainWindow(parent) {
+LumenMainWindow::LumenMainWindow(float split_ratio, QWidget *parent) : QMainWindow(parent) {
     // Call the generated function to force initialization
     cxx_qt_init_crate_quartzite();
     // Manually register QML types to bypass fragile static QRC plugin loading
@@ -64,6 +64,7 @@ LumenMainWindow::LumenMainWindow(QWidget *parent) : QMainWindow(parent) {
     m_quickWidget->engine()->rootContext()->setContextProperty("_historyModel", historyModel);
     m_quickWidget->engine()->rootContext()->setContextProperty("_networkLogModel", networkLogModel);
     m_quickWidget->engine()->rootContext()->setContextProperty("_preflightPayload", preflightPayload);
+    m_quickWidget->engine()->rootContext()->setContextProperty("_splitRatio", split_ratio);
 
     // Blanket Import Paths
     m_quickWidget->engine()->addImportPath(QStringLiteral("qrc:/"));
@@ -91,8 +92,8 @@ LumenMainWindow::~LumenMainWindow() {
     }
 }
 
-std::unique_ptr<LumenMainWindow> create_main_window() {
-    return std::make_unique<LumenMainWindow>();
+std::unique_ptr<LumenMainWindow> create_main_window(float split_ratio) {
+    return std::make_unique<LumenMainWindow>(split_ratio);
 }
 
 void show_main_window(LumenMainWindow& window) {

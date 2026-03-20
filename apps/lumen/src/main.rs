@@ -145,6 +145,13 @@ fn main() {
     // 7. View & Engine Ignition
     let spline = Rc::new(quartzite::Spline::new());
 
+    // 7.5. Define the Workspace Layout via Declarative UI Engine
+    let workspace_tetra = quartzite::tetra::WorkspaceTetra {
+        left_pane: quartzite::tetra::TetraNode::Matrix,
+        right_pane: quartzite::tetra::TetraNode::Stream,
+        split_ratio: 0.25,
+    };
+
     // THE FUSION
     let bootstrap = move |window: &NativeWindow| -> NativeView {
         // 1. Get the Vein UI (The Command Center)
@@ -153,6 +160,7 @@ fn main() {
             event_tx.clone(),
             app_state.clone(),
             synapse.subscribe(),
+            &workspace_tetra,
         );
 
         // 2. Create the HUD (ContextView) - DEPRECATED (Phase 4)

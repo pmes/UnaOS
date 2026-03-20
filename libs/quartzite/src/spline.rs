@@ -53,11 +53,12 @@ impl Spline {
         _tx_event: async_channel::Sender<Event>,
         _app_state: Arc<RwLock<AppState>>,
         _rx_synapse: BroadcastReceiver<SMessage>,
+        _workspace_tetra: &crate::tetra::WorkspaceTetra,
     ) -> NativeView {
         #[cfg(any(all(target_os = "linux", feature = "gtk"), target_os = "macos"))]
         return self
             .inner
-            .bootstrap(_window, _tx_event, _app_state, _rx_synapse);
+            .bootstrap(_window, _tx_event, _app_state, _rx_synapse, _workspace_tetra);
 
         #[cfg(all(target_os = "linux", feature = "qt"))]
         {
@@ -70,7 +71,7 @@ impl Spline {
             crate::platforms::qt::window::spawn_state_listener(_app_state, _rx_synapse);
 
             return crate::NativeView {
-                ptr: ffi::create_main_window(),
+                ptr: ffi::create_main_window(_workspace_tetra.split_ratio),
             };
         }
 
