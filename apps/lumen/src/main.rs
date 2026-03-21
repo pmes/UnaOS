@@ -137,15 +137,6 @@ fn main() {
         let mut shutdown_rx = shutdown_rx_vein;
         let mut workspace_tetra = workspace_tetra_clone;
 
-        // J24.3 BOOT SYNC: Broadcast the initial Matrix DAG topology to wake up the UIs
-        if let quartzite::tetra::TetraNode::Matrix(ref mut matrix) = workspace_tetra.left_pane {
-            let flat_tree = matrix.tree.flatten();
-            let mapped_tree: Vec<(String, String, usize)> = flat_tree.into_iter().map(|(n, depth)| {
-                (n.id.clone(), n.label.clone(), depth)
-            }).collect();
-            synapse_event_loop.fire(bandy::SMessage::Matrix(bandy::MatrixEvent::TopologyMutated(mapped_tree)));
-        }
-
         loop {
             tokio::select! {
                 _ = shutdown_rx.recv() => {
@@ -155,6 +146,15 @@ fn main() {
                 event_res = event_rx.recv() => {
                     if let Ok(event) = event_res {
                         match event {
+                            quartzite::Event::UiReady => {
+                                if let quartzite::tetra::TetraNode::Matrix(ref mut matrix) = workspace_tetra.left_pane {
+                                    let flat_tree = matrix.tree.flatten();
+                                    let mapped_tree: Vec<(String, String, usize)> = flat_tree.into_iter().map(|(n, depth)| {
+                                        (n.id.clone(), n.label.clone(), depth)
+                                    }).collect();
+                                    synapse_event_loop.fire(bandy::SMessage::Matrix(bandy::MatrixEvent::TopologyMutated(mapped_tree)));
+                                }
+                            }
                             quartzite::Event::ToggleMatrixNode(id) => {
                                 if let quartzite::tetra::TetraNode::Matrix(ref mut matrix) = workspace_tetra.left_pane {
                                     matrix.tree.toggle_node(&id);

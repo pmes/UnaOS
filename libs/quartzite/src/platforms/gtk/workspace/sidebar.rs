@@ -424,6 +424,8 @@ pub fn build(window: &NativeWindow, tx_event: Sender<Event>) -> (SidebarWidgets,
     let page = left_stack.add_named(&telehud_box, Some("telehud"));
     page.set_icon_name("error-correct-symbolic");
 
+    let _ = tx_event.try_send(crate::Event::UiReady);
+
     let widgets = SidebarWidgets {
         left_stack,
         status_group,

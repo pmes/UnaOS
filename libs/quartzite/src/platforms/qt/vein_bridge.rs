@@ -191,6 +191,10 @@ pub mod qobject {
         fn request_pre_flight_review(self: Pin<&mut VeinBridge>, text: QString);
 
         #[qinvokable]
+        #[cxx_name = "uiReady"]
+        fn ui_ready(self: Pin<&mut VeinBridge>);
+
+        #[qinvokable]
         #[cxx_name = "cancelPreFlight"]
         fn cancel_pre_flight(self: Pin<&mut VeinBridge>);
 
@@ -245,6 +249,12 @@ impl qobject::VeinBridge {
     pub fn register_thread(self: std::pin::Pin<&mut Self>) {
         use cxx_qt::Threading;
         let _ = VEIN_THREAD.set(self.qt_thread());
+    }
+
+    pub fn ui_ready(self: std::pin::Pin<&mut Self>) {
+        if let Some(tx) = GLOBAL_TX.get() {
+            let _ = tx.try_send(Event::UiReady);
+        }
     }
 
     pub fn send_message(self: std::pin::Pin<&mut Self>, text: QString) {
