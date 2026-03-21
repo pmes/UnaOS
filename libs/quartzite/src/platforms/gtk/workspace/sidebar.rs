@@ -353,15 +353,6 @@ pub fn build(window: &NativeWindow, tx_event: Sender<Event>) -> (SidebarWidgets,
     telehud_box.set_margin_end(12);
 
     // --- MATRIX TETRA ---
-    telehud_box.append(
-        &Label::builder()
-            .label("MATRIX TETRA")
-            .css_classes(vec!["nexus-header"])
-            .xalign(0.0)
-            .margin_top(10)
-            .build(),
-    );
-
     let matrix_store = gio::ListStore::new::<crate::widgets::model::MatrixNodeObject>();
     let workspace_tetra = WorkspaceTetra::default();
     if let TetraNode::Matrix(matrix_tetra) = &workspace_tetra.left_pane {
@@ -421,23 +412,14 @@ pub fn build(window: &NativeWindow, tx_event: Sender<Event>) -> (SidebarWidgets,
         .hscrollbar_policy(PolicyType::Never)
         .child(&matrix_view)
         .min_content_height(150)
-        .vexpand(false)
+        .vexpand(true)
+        .hexpand(true)
         .build();
 
     telehud_box.append(&matrix_scroll);
     // --- END MATRIX TETRA ---
 
-    telehud_box.append(
-        &Label::builder()
-            .label("CONTEXT VECTOR")
-            .css_classes(vec!["nexus-header"])
-            .xalign(0.0)
-            .margin_top(20)
-            .build(),
-    );
-
     let context_view = crate::widgets::telemetry::ContextView::new();
-    telehud_box.append(&context_view.container);
 
     let page = left_stack.add_named(&telehud_box, Some("telehud"));
     page.set_icon_name("error-correct-symbolic");
