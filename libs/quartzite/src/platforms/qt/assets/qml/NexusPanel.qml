@@ -116,15 +116,59 @@ Rectangle {
                 }
             }
 
-            // Tab 2: teleHUD (Placeholder)
+            // Tab 2: teleHUD (Matrix Tetra)
             Rectangle {
                 Layout.fillWidth: true
                 Layout.fillHeight: true
 
-                Text {
-                    anchors.centerIn: parent
-                    text: "[TeleHUD Context Vector Awaiting Signal]"
-                    font.italic: true
+                ColumnLayout {
+                    anchors.fill: parent
+                    anchors.margins: 12
+                    spacing: 12
+
+                    Text {
+                        text: "MATRIX TETRA"
+                        font.pixelSize: 14
+                        font.bold: true
+                        color: "#888888"
+                    }
+
+                    ListView {
+                        id: matrixListView
+                        Layout.fillWidth: true
+                        Layout.preferredHeight: 150
+                        model: _matrixModel
+                        clip: true
+
+                        delegate: Rectangle {
+                            width: ListView.view.width
+                            height: 30
+                            color: "transparent"
+
+                            Text {
+                                anchors.verticalCenter: parent.verticalCenter
+                                anchors.left: parent.left
+                                anchors.leftMargin: 10
+                                text: display
+                                color: "white"
+                            }
+                        }
+                    }
+
+                    Text {
+                        text: "CONTEXT VECTOR"
+                        font.pixelSize: 14
+                        font.bold: true
+                        color: "#888888"
+                        Layout.topMargin: 20
+                    }
+
+                    Text {
+                        text: "[TeleHUD Context Vector Awaiting Signal]"
+                        font.italic: true
+                        color: "#666666"
+                        Layout.alignment: Qt.AlignHCenter
+                    }
                 }
             }
         }

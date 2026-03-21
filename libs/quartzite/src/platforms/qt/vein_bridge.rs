@@ -29,6 +29,8 @@ pub static PREFLIGHT_THREAD: OnceLock<cxx_qt::CxxQtThread<qobject::PreFlightPayl
     OnceLock::new();
 pub static NETWORK_LOG_MODEL_THREAD: OnceLock<cxx_qt::CxxQtThread<qobject::NetworkLogModel>> =
     OnceLock::new();
+pub static MATRIX_MODEL_THREAD: OnceLock<cxx_qt::CxxQtThread<qobject::MatrixModel>> =
+    OnceLock::new();
 
 #[cxx_qt::bridge]
 pub mod qobject {
@@ -117,6 +119,33 @@ pub mod qobject {
     }
 
     impl cxx_qt::Threading for NetworkLogModel {}
+
+    unsafe extern "RustQt" {
+        #[qobject]
+        #[base = QAbstractListModel]
+        #[qml_element]
+        type MatrixModel = super::MatrixModelRust;
+
+        #[qinvokable(cxx_override)]
+        #[cxx_name = "rowCount"]
+        fn row_count(self: &MatrixModel, parent: &QModelIndex) -> i32;
+        #[qinvokable(cxx_override)]
+        fn data(self: &MatrixModel, index: &QModelIndex, role: i32) -> QVariant;
+
+        #[qinvokable]
+        #[cxx_name = "registerModelThread"]
+        fn register_model_thread(self: Pin<&mut MatrixModel>);
+
+        #[inherit]
+        #[cxx_name = "beginResetModel"]
+        fn begin_reset_model(self: Pin<&mut MatrixModel>);
+
+        #[inherit]
+        #[cxx_name = "endResetModel"]
+        fn end_reset_model(self: Pin<&mut MatrixModel>);
+    }
+
+    impl cxx_qt::Threading for MatrixModel {}
 
     unsafe extern "RustQt" {
         #[qobject]
@@ -355,6 +384,64 @@ impl qobject::NetworkLogModel {
     pub fn append_log(mut self: std::pin::Pin<&mut Self>, payload: QString) {
         self.as_mut().begin_reset_model();
         self.as_mut().rust_mut().rows.push(payload.to_string());
+        self.as_mut().end_reset_model();
+    }
+
+    pub fn row_count(&self, parent: &QModelIndex) -> i32 {
+        if parent.is_valid() {
+            0
+        } else {
+            self.rust().rows.len() as i32
+        }
+    }
+
+    pub fn data(&self, index: &QModelIndex, role: i32) -> QVariant {
+        let row = index.row();
+        if row < 0 || row >= self.rust().rows.len() as i32 {
+            return QVariant::default();
+        }
+
+        let item = &self.rust().rows[row as usize];
+        match role {
+            0 => QVariant::from(&QString::from(item)), // DisplayRole
+            _ => QVariant::default(),
+        }
+    }
+}
+
+// QAbstractListModel implementation for MatrixModel
+pub struct MatrixModelRust {
+    pub rows: Vec<String>,
+}
+
+impl Default for MatrixModelRust {
+    fn default() -> Self {
+        let workspace_tetra = crate::tetra::WorkspaceTetra::default();
+        let rows = if let crate::tetra::TetraNode::Matrix(matrix_tetra) = workspace_tetra.left_pane {
+            matrix_tetra.tree.flatten().into_iter().map(|(n, depth)| {
+                let prefix = if depth == 0 {
+                    String::new()
+                } else {
+                    format!("{}├─ ", "  ".repeat(depth.saturating_sub(1)))
+                };
+                format!("{}{}", prefix, n.label)
+            }).collect()
+        } else {
+            Vec::new()
+        };
+        Self { rows }
+    }
+}
+
+impl qobject::MatrixModel {
+    pub fn register_model_thread(self: std::pin::Pin<&mut Self>) {
+        use cxx_qt::Threading;
+        let _ = MATRIX_MODEL_THREAD.set(self.qt_thread());
+    }
+
+    pub fn set_nodes(mut self: std::pin::Pin<&mut Self>, nodes: Vec<String>) {
+        self.as_mut().begin_reset_model();
+        self.as_mut().rust_mut().rows = nodes;
         self.as_mut().end_reset_model();
     }
 

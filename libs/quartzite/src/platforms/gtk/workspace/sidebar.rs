@@ -15,6 +15,7 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 use crate::Event;
+use crate::tetra::{WorkspaceTetra, TetraNode};
 use crate::NativeWindow;
 
 pub struct SidebarWidgets {
@@ -349,6 +350,54 @@ pub fn build(window: &NativeWindow, tx_event: Sender<Event>) -> (SidebarWidgets,
     telehud_box.set_margin_bottom(12);
     telehud_box.set_margin_start(12);
     telehud_box.set_margin_end(12);
+
+    // --- MATRIX TETRA ---
+    telehud_box.append(
+        &Label::builder()
+            .label("MATRIX TETRA")
+            .css_classes(vec!["nexus-header"])
+            .xalign(0.0)
+            .margin_top(10)
+            .build(),
+    );
+
+    let workspace_tetra = WorkspaceTetra::default();
+    if let TetraNode::Matrix(matrix_tetra) = &workspace_tetra.left_pane {
+        let flat_nodes = matrix_tetra.tree.flatten();
+        let matrix_list = ListBox::new();
+        matrix_list.add_css_class("shard-list");
+        matrix_list.set_selection_mode(gtk4::SelectionMode::None);
+
+        for (node, depth) in flat_nodes {
+            let row = Box::new(Orientation::Horizontal, 10);
+            row.set_margin_start(10);
+            row.set_margin_end(10);
+            row.set_margin_top(5);
+            row.set_margin_bottom(5);
+
+            let prefix = if depth == 0 {
+                String::new()
+            } else {
+                format!("{}├─ ", "  ".repeat(depth.saturating_sub(1)))
+            };
+
+            let display_text = format!("{}{}", prefix, node.label);
+            let label = Label::new(Some(&display_text));
+            label.set_xalign(0.0);
+            row.append(&label);
+            matrix_list.append(&row);
+        }
+
+        let matrix_scroll = ScrolledWindow::builder()
+            .hscrollbar_policy(PolicyType::Never)
+            .child(&matrix_list)
+            .min_content_height(150)
+            .vexpand(false)
+            .build();
+
+        telehud_box.append(&matrix_scroll);
+    }
+    // --- END MATRIX TETRA ---
 
     telehud_box.append(
         &Label::builder()
