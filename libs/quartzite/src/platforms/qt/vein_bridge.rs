@@ -418,7 +418,14 @@ impl Default for MatrixModelRust {
     fn default() -> Self {
         let workspace_tetra = crate::tetra::WorkspaceTetra::default();
         let rows = if let crate::tetra::TetraNode::Matrix(matrix_tetra) = workspace_tetra.left_pane {
-            matrix_tetra.tree.flatten().into_iter().map(|n| n.label.clone()).collect()
+            matrix_tetra.tree.flatten().into_iter().map(|(n, depth)| {
+                let prefix = if depth == 0 {
+                    String::new()
+                } else {
+                    format!("{}├─ ", "  ".repeat(depth.saturating_sub(1)))
+                };
+                format!("{}{}", prefix, n.label)
+            }).collect()
         } else {
             Vec::new()
         };

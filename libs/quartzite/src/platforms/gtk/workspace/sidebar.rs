@@ -368,14 +368,21 @@ pub fn build(window: &NativeWindow, tx_event: Sender<Event>) -> (SidebarWidgets,
         matrix_list.add_css_class("shard-list");
         matrix_list.set_selection_mode(gtk4::SelectionMode::None);
 
-        for node in flat_nodes {
+        for (node, depth) in flat_nodes {
             let row = Box::new(Orientation::Horizontal, 10);
             row.set_margin_start(10);
             row.set_margin_end(10);
             row.set_margin_top(5);
             row.set_margin_bottom(5);
 
-            let label = Label::new(Some(&node.label));
+            let prefix = if depth == 0 {
+                String::new()
+            } else {
+                format!("{}├─ ", "  ".repeat(depth.saturating_sub(1)))
+            };
+
+            let display_text = format!("{}{}", prefix, node.label);
+            let label = Label::new(Some(&display_text));
             label.set_xalign(0.0);
             row.append(&label);
             matrix_list.append(&row);

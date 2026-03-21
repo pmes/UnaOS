@@ -31,19 +31,19 @@ pub struct ExpandableList {
 }
 
 impl ExpandableList {
-    pub fn flatten(&self) -> Vec<&TreeNode> {
+    pub fn flatten(&self) -> Vec<(&TreeNode, usize)> {
         let mut result = Vec::new();
         for root in &self.roots {
-            self.flatten_recursive(root, &mut result);
+            self.flatten_recursive(root, 0, &mut result);
         }
         result
     }
 
-    fn flatten_recursive<'a>(&'a self, node: &'a TreeNode, result: &mut Vec<&'a TreeNode>) {
-        result.push(node);
+    fn flatten_recursive<'a>(&'a self, node: &'a TreeNode, depth: usize, result: &mut Vec<(&'a TreeNode, usize)>) {
+        result.push((node, depth));
         if node.is_expanded {
             for child in &node.children {
-                self.flatten_recursive(child, result);
+                self.flatten_recursive(child, depth + 1, result);
             }
         }
     }
@@ -58,6 +58,58 @@ pub struct SelectionState {
 pub struct MatrixTetra {
     pub tree: ExpandableList,
     pub selection: SelectionState,
+}
+
+impl Default for MatrixTetra {
+    fn default() -> Self {
+        let tree = ExpandableList {
+            roots: vec![
+                TreeNode {
+                    id: "unaos_core".to_string(),
+                    label: "UnaOS Core".to_string(),
+                    is_expanded: true,
+                    children: vec![
+                        TreeNode {
+                            id: "kernel".to_string(),
+                            label: "Kernel".to_string(),
+                            is_expanded: false,
+                            children: vec![],
+                        },
+                        TreeNode {
+                            id: "dmz".to_string(),
+                            label: "DMZ".to_string(),
+                            is_expanded: false,
+                            children: vec![],
+                        },
+                    ],
+                },
+                TreeNode {
+                    id: "embassies".to_string(),
+                    label: "Embassies".to_string(),
+                    is_expanded: false,
+                    children: vec![
+                        TreeNode {
+                            id: "gtk".to_string(),
+                            label: "GTK".to_string(),
+                            is_expanded: false,
+                            children: vec![],
+                        },
+                        TreeNode {
+                            id: "qt".to_string(),
+                            label: "Qt".to_string(),
+                            is_expanded: false,
+                            children: vec![],
+                        },
+                    ],
+                },
+            ],
+        };
+
+        Self {
+            tree,
+            selection: SelectionState::default(),
+        }
+    }
 }
 
 
@@ -113,56 +165,8 @@ pub struct WorkspaceTetra {
 
 impl Default for WorkspaceTetra {
     fn default() -> Self {
-        let tree = ExpandableList {
-            roots: vec![
-                TreeNode {
-                    id: "unaos_core".to_string(),
-                    label: "UnaOS Core".to_string(),
-                    is_expanded: true,
-                    children: vec![
-                        TreeNode {
-                            id: "kernel".to_string(),
-                            label: "Kernel".to_string(),
-                            is_expanded: false,
-                            children: vec![],
-                        },
-                        TreeNode {
-                            id: "dmz".to_string(),
-                            label: "DMZ".to_string(),
-                            is_expanded: false,
-                            children: vec![],
-                        },
-                    ],
-                },
-                TreeNode {
-                    id: "embassies".to_string(),
-                    label: "Embassies".to_string(),
-                    is_expanded: false,
-                    children: vec![
-                        TreeNode {
-                            id: "gtk".to_string(),
-                            label: "GTK".to_string(),
-                            is_expanded: false,
-                            children: vec![],
-                        },
-                        TreeNode {
-                            id: "qt".to_string(),
-                            label: "Qt".to_string(),
-                            is_expanded: false,
-                            children: vec![],
-                        },
-                    ],
-                },
-            ],
-        };
-
-        let matrix_tetra = MatrixTetra {
-            tree,
-            selection: SelectionState::default(),
-        };
-
         Self {
-            left_pane: TetraNode::Matrix(matrix_tetra),
+            left_pane: TetraNode::Matrix(MatrixTetra::default()),
             right_pane: TetraNode::Stream(StreamTetra::default()),
             split_ratio: 0.25,
         }
