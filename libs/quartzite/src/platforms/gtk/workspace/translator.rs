@@ -110,6 +110,9 @@ pub fn spawn_translator(
                         SMessage::ContextTelemetry { skeletons } => {
                             let _ = tx_gui.send(GuiUpdate::ContextTelemetry(skeletons)).await;
                         }
+                        SMessage::Matrix(bandy::MatrixEvent::TopologyMutated(topology)) => {
+                            let _ = tx_gui.send(GuiUpdate::RefreshMatrix(topology)).await;
+                        }
                         _ => {}
                     }
                 }

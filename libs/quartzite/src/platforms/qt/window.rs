@@ -70,23 +70,29 @@ pub fn spawn_state_listener(app_state: Arc<RwLock<AppState>>, mut rx: Receiver<S
     if let Ok(handle) = Handle::try_current() {
         handle.spawn(async move {
             while let Ok(update) = rx.recv().await {
-                if let SMessage::StateInvalidated = update {
-                    // Extract exactly what we need for the specific models using the read lock
-                    let (history, payload, logs) = {
-                        let state = app_state.read().unwrap();
-                        let hist = state.history.iter().cloned().collect::<Vec<_>>();
-                        let pay = state.review_payload.clone();
-                        let ls = state.console_logs.iter().cloned().collect::<Vec<_>>();
-                        (hist, pay, ls)
-                    };
+                match update {
+                    SMessage::StateInvalidated => {
+                        // Extract exactly what we need for the specific models using the read lock
+                        let (history, payload, logs) = {
+                            let state = app_state.read().unwrap();
+                            let hist = state.history.iter().cloned().collect::<Vec<_>>();
+                            let pay = state.review_payload.clone();
+                            let ls = state.console_logs.iter().cloned().collect::<Vec<_>>();
+                            (hist, pay, ls)
+                        };
 
-                    super::vein_bridge::route_history_batch(history);
-                    if let Some(p) = payload {
-                        super::vein_bridge::route_review_payload(p);
+                        super::vein_bridge::route_history_batch(history);
+                        if let Some(p) = payload {
+                            super::vein_bridge::route_review_payload(p);
+                        }
+
+                        // We simply pass the entire vector of logs to the router to sync
+                        super::vein_bridge::route_console_batch(logs);
                     }
-
-                    // We simply pass the entire vector of logs to the router to sync
-                    super::vein_bridge::route_console_batch(logs);
+                    SMessage::Matrix(bandy::MatrixEvent::TopologyMutated(topology)) => {
+                        super::vein_bridge::route_matrix_topology(topology);
+                    }
+                    _ => {}
                 }
             }
         });

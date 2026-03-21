@@ -109,6 +109,15 @@ fn main() {
     // Channels for UI Events (Spline -> Vein)
     let (event_tx, event_rx) = async_channel::unbounded::<quartzite::Event>();
 
+    // 7.5. Define the Workspace Layout via Declarative UI Engine
+    let workspace_tetra = quartzite::tetra::WorkspaceTetra {
+        left_pane: quartzite::tetra::TetraNode::Matrix(quartzite::tetra::MatrixTetra::default()),
+        right_pane: quartzite::tetra::TetraNode::Stream(quartzite::tetra::StreamTetra::default()),
+        split_ratio: 0.25,
+    };
+
+    let workspace_tetra_clone = workspace_tetra.clone();
+
     // We move VeinHandler into a separate task.
     // Since VeinHandler is "Pure Logic", it should run on Tokio.
     // The `handle_event` method processes events from the UI.
@@ -120,11 +129,14 @@ fn main() {
         app_state.clone(),
         shutdown_tx_vein,
     );
+    let synapse_event_loop = synapse.clone();
 
     // Spawn the Brain Loop
     let brain_loop_handle = rt.spawn(async move {
         let mut vein = vein_handler;
         let mut shutdown_rx = shutdown_rx_vein;
+        let mut workspace_tetra = workspace_tetra_clone;
+
         loop {
             tokio::select! {
                 _ = shutdown_rx.recv() => {
@@ -133,7 +145,21 @@ fn main() {
                 }
                 event_res = event_rx.recv() => {
                     if let Ok(event) = event_res {
-                        vein.handle_event(event);
+                        match event {
+                            quartzite::Event::ToggleMatrixNode(id) => {
+                                if let quartzite::tetra::TetraNode::Matrix(ref mut matrix) = workspace_tetra.left_pane {
+                                    matrix.tree.toggle_node(&id);
+                                    let flat_tree = matrix.tree.flatten();
+                                    let mapped_tree: Vec<(String, String, usize)> = flat_tree.into_iter().map(|(n, depth)| {
+                                        (n.id.clone(), n.label.clone(), depth)
+                                    }).collect();
+                                    synapse_event_loop.fire(bandy::SMessage::Matrix(bandy::MatrixEvent::TopologyMutated(mapped_tree)));
+                                }
+                            }
+                            _ => {
+                                vein.handle_event(event);
+                            }
+                        }
                     } else {
                         break;
                     }
@@ -144,13 +170,6 @@ fn main() {
 
     // 7. View & Engine Ignition
     let spline = Rc::new(quartzite::Spline::new());
-
-    // 7.5. Define the Workspace Layout via Declarative UI Engine
-    let workspace_tetra = quartzite::tetra::WorkspaceTetra {
-        left_pane: quartzite::tetra::TetraNode::Matrix(quartzite::tetra::MatrixTetra::default()),
-        right_pane: quartzite::tetra::TetraNode::Stream(quartzite::tetra::StreamTetra::default()),
-        split_ratio: 0.25,
-    };
 
     // THE FUSION
     let bootstrap = move |window: &NativeWindow| -> NativeView {

@@ -39,6 +39,7 @@ pub enum Event {
     },
     ShardSelect(String),
     DispatchPayload(String),
+    ToggleMatrixNode(String),
 }
 
 pub trait AppHandler: 'static {

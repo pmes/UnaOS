@@ -152,6 +152,13 @@ Rectangle {
                                 text: display
                                 color: "white"
                             }
+
+                            MouseArea {
+                                anchors.fill: parent
+                                onClicked: {
+                                    _matrixModel.toggleNode(idRole)
+                                }
+                            }
                         }
                     }
 

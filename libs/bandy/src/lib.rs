@@ -180,6 +180,8 @@ pub enum MatrixEvent {
     SectorFocused { target: String, context: String },
     /// Matrix UI fires this when a spatial node is activated
     NodeSelected(PathBuf),
+    /// Broadcasts an updated, flattened structural topology back to the UI
+    TopologyMutated(Vec<(String, String, usize)>),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
