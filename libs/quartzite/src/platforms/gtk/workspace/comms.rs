@@ -390,33 +390,21 @@ fn setup_input_area(tx_event: &Sender<Event>, window: &NativeWindow, active_targ
         chat_input_buffer,
     }
 }
-pub fn build(
-    window: &NativeWindow,
-    tx_event: Sender<Event>,
-    active_target: Rc<RefCell<String>>,
-    composer_btn: Button,
-    tetra: &crate::tetra::StreamTetra,
-) -> (CommsWidgets, CommsPointers) {
-    let workspace_stack = Stack::new();
-    workspace_stack.set_vexpand(true);
-    workspace_stack.set_transition_type(StackTransitionType::SlideLeftRight);
 
-    let comms_page = Box::new(Orientation::Vertical, 0);
-    comms_page.set_hexpand(true);
-    comms_page.set_vexpand(true);
+struct ChatAreaData {
+    scrolled_window: gtk4::ScrolledWindow,
+    console_store: gio::ListStore,
+    is_prepending: Rc<RefCell<bool>>,
+    is_fetching: Rc<RefCell<bool>>,
+}
 
-    let chat_overlay = Overlay::new();
-    chat_overlay.set_hexpand(true);
-    chat_overlay.set_vexpand(true);
-
+fn setup_chat_view(tx_event: &Sender<Event>, tetra: &crate::tetra::StreamTetra) -> ChatAreaData {
     let scrolled_window = ScrolledWindow::builder()
         .hscrollbar_policy(PolicyType::Never)
         .vscrollbar_policy(PolicyType::Automatic)
         .vexpand(true)
         .hexpand(true)
         .build();
-
-    chat_overlay.set_child(Some(&scrolled_window));
 
     let adj = scrolled_window.vadjustment();
     let is_prepending = Rc::new(RefCell::new(false));
@@ -708,8 +696,6 @@ pub fn build(
         let Some(item) = item.downcast_ref::<ListItem>() else { return; };
         let Some(obj) = item.item().and_then(|c| c.downcast::<HistoryObject>().ok()) else { return; };
 
-        println!(">>> [J13 TRACE] COMMS: Binding item. Sender: {}, Subject: {}, Timestamp: {}", obj.sender(), obj.subject(), obj.timestamp());
-
         // Retrieve preserved absolute pointers securely
         let boxed_widgets = unsafe { item.data::<glib::BoxedAnyObject>("widgets") };
         let Some(boxed_ptr) = boxed_widgets else { return; };
@@ -830,6 +816,63 @@ pub fn build(
     console_list_view.set_vexpand(true);
     console_list_view.set_hexpand(true);
     scrolled_window.set_child(Some(&console_list_view));
+
+    // FIX: Wait for the display server to map the UI (width > 0) before measuring text
+    let boot_fetched = Rc::new(RefCell::new(false));
+    let tx_clone_load_hist = tx_event.clone();
+    let is_fetching_boot = is_fetching.clone();
+    let is_prepending_boot = is_prepending.clone();
+    let store_for_boot = console_store.clone();
+
+    scrolled_window.connect_map(move |_| {
+        if !*boot_fetched.borrow() {
+            *boot_fetched.borrow_mut() = true;
+            *is_fetching_boot.borrow_mut() = true;
+            *is_prepending_boot.borrow_mut() = true;
+
+            let tx_async = tx_clone_load_hist.clone();
+            let offset = store_for_boot.n_items() as usize;
+            glib::MainContext::default().spawn_local(async move {
+                let _ = tx_async.send(Event::LoadHistory { offset }).await;
+            });
+        }
+    });
+
+    ChatAreaData {
+        scrolled_window,
+        console_store,
+        is_prepending,
+        is_fetching,
+    }
+}
+
+pub fn build(
+    window: &NativeWindow,
+    tx_event: Sender<Event>,
+    active_target: Rc<RefCell<String>>,
+    composer_btn: Button,
+    tetra: &crate::tetra::StreamTetra,
+) -> (CommsWidgets, CommsPointers) {
+    let workspace_stack = Stack::new();
+    workspace_stack.set_vexpand(true);
+    workspace_stack.set_transition_type(StackTransitionType::SlideLeftRight);
+
+    let comms_page = Box::new(Orientation::Vertical, 0);
+    comms_page.set_hexpand(true);
+    comms_page.set_vexpand(true);
+
+    let chat_overlay = Overlay::new();
+    chat_overlay.set_hexpand(true);
+    chat_overlay.set_vexpand(true);
+
+    let chat_area_data = setup_chat_view(&tx_event, tetra);
+    let scrolled_window = chat_area_data.scrolled_window;
+    let console_store = chat_area_data.console_store;
+    let is_prepending = chat_area_data.is_prepending;
+    let is_fetching = chat_area_data.is_fetching;
+
+    chat_overlay.set_child(Some(&scrolled_window));
+
 
     // --- PRE-FLIGHT STACK (Layer 2) ---
     let preflight_data = setup_preflight_stack(&tx_event);
@@ -989,28 +1032,6 @@ pub fn build(
             update_theme(s.is_gtk_application_prefer_dark_theme());
         });
     }
-
-    // FIX: Wait for the display server to map the UI (width > 0) before measuring text
-    let boot_fetched = Rc::new(RefCell::new(false));
-    let tx_clone_load_hist = tx_event.clone();
-    let is_fetching_boot = is_fetching.clone();
-    let is_prepending_boot = is_prepending.clone();
-    let store_for_boot = console_store.clone();
-
-    scrolled_window.connect_map(move |_| {
-        if !*boot_fetched.borrow() {
-            *boot_fetched.borrow_mut() = true;
-            *is_fetching_boot.borrow_mut() = true;
-            *is_prepending_boot.borrow_mut() = true;
-
-            let tx_async = tx_clone_load_hist.clone();
-            let offset = store_for_boot.n_items() as usize;
-            glib::MainContext::default().spawn_local(async move {
-                println!(">>> [J13 TRACE] COMMS: Dispatching Event::LoadHistory to Backend.");
-                let _ = tx_async.send(Event::LoadHistory { offset }).await;
-            });
-        }
-    });
 
     let widgets = CommsWidgets {
         workspace_stack,
