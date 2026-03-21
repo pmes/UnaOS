@@ -15,6 +15,51 @@
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct TreeNode {
+    pub id: String,
+    pub label: String,
+    pub children: Vec<TreeNode>,
+    pub is_expanded: bool,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ExpandableList {
+    pub roots: Vec<TreeNode>,
+}
+
+impl ExpandableList {
+    pub fn flatten(&self) -> Vec<&TreeNode> {
+        let mut result = Vec::new();
+        for root in &self.roots {
+            self.flatten_recursive(root, &mut result);
+        }
+        result
+    }
+
+    fn flatten_recursive<'a>(&'a self, node: &'a TreeNode, result: &mut Vec<&'a TreeNode>) {
+        result.push(node);
+        if node.is_expanded {
+            for child in &node.children {
+                self.flatten_recursive(child, result);
+            }
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Default)]
+pub struct SelectionState {
+    pub selected_ids: HashSet<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct MatrixTetra {
+    pub tree: ExpandableList,
+    pub selection: SelectionState,
+}
+
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum ScrollAnchor {
@@ -54,7 +99,7 @@ impl Default for StreamTetra {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum TetraNode {
-    Matrix, // Future MatrixTetra (Sidebar)
+    Matrix(MatrixTetra), // MatrixTetra (Sidebar)
     Stream(StreamTetra), // Structuring Comms
     Empty,  // Placeholder
 }
@@ -68,8 +113,56 @@ pub struct WorkspaceTetra {
 
 impl Default for WorkspaceTetra {
     fn default() -> Self {
+        let tree = ExpandableList {
+            roots: vec![
+                TreeNode {
+                    id: "unaos_core".to_string(),
+                    label: "UnaOS Core".to_string(),
+                    is_expanded: true,
+                    children: vec![
+                        TreeNode {
+                            id: "kernel".to_string(),
+                            label: "Kernel".to_string(),
+                            is_expanded: false,
+                            children: vec![],
+                        },
+                        TreeNode {
+                            id: "dmz".to_string(),
+                            label: "DMZ".to_string(),
+                            is_expanded: false,
+                            children: vec![],
+                        },
+                    ],
+                },
+                TreeNode {
+                    id: "embassies".to_string(),
+                    label: "Embassies".to_string(),
+                    is_expanded: false,
+                    children: vec![
+                        TreeNode {
+                            id: "gtk".to_string(),
+                            label: "GTK".to_string(),
+                            is_expanded: false,
+                            children: vec![],
+                        },
+                        TreeNode {
+                            id: "qt".to_string(),
+                            label: "Qt".to_string(),
+                            is_expanded: false,
+                            children: vec![],
+                        },
+                    ],
+                },
+            ],
+        };
+
+        let matrix_tetra = MatrixTetra {
+            tree,
+            selection: SelectionState::default(),
+        };
+
         Self {
-            left_pane: TetraNode::Matrix,
+            left_pane: TetraNode::Matrix(matrix_tetra),
             right_pane: TetraNode::Stream(StreamTetra::default()),
             split_ratio: 0.25,
         }
