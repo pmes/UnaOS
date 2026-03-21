@@ -30,6 +30,7 @@ pub struct ReactorPointers {
     pub preflight_dir_buf: sourceview5::Buffer,
     pub preflight_eng_buf: sourceview5::Buffer,
     pub preflight_prm_buf: sourceview5::Buffer,
+    pub matrix_store: gtk4::gio::ListStore,
 }
 
 pub fn spawn_listener(pointers: ReactorPointers, rx_gui: Receiver<GuiUpdate>) {
@@ -222,6 +223,13 @@ pub fn spawn_listener(pointers: ReactorPointers, rx_gui: Receiver<GuiUpdate>) {
                 }
                 GuiUpdate::ContextTelemetry(skeletons) => {
                     pointers.context_view.update(skeletons);
+                }
+                GuiUpdate::RefreshMatrix(topology) => {
+                    pointers.matrix_store.remove_all();
+                    for (id, label, depth) in topology {
+                        let obj = crate::widgets::model::MatrixNodeObject::new(&id, &label, depth as u32);
+                        pointers.matrix_store.append(&obj);
+                    }
                 }
                 _ => {}
             }

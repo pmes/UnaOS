@@ -19,4 +19,5 @@ pub enum GuiUpdate {
     ReviewPayload(PreFlightPayload), // The Interceptor
     SynapseError(String),            // Discrete failure signal
     ContextTelemetry(Vec<bandy::WeightedSkeleton>),
+    RefreshMatrix(Vec<(String, String, usize)>),
 }

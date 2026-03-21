@@ -33,6 +33,7 @@ pub struct SidebarPointers {
     pub label_s9: Label,
     pub token_label: Label,
     pub context_view: crate::widgets::telemetry::ContextView,
+    pub matrix_store: gio::ListStore,
 }
 
 // Helper to avoid circular dependencies in spline
@@ -361,42 +362,69 @@ pub fn build(window: &NativeWindow, tx_event: Sender<Event>) -> (SidebarWidgets,
             .build(),
     );
 
+    let matrix_store = gio::ListStore::new::<crate::widgets::model::MatrixNodeObject>();
     let workspace_tetra = WorkspaceTetra::default();
     if let TetraNode::Matrix(matrix_tetra) = &workspace_tetra.left_pane {
         let flat_nodes = matrix_tetra.tree.flatten();
-        let matrix_list = ListBox::new();
-        matrix_list.add_css_class("shard-list");
-        matrix_list.set_selection_mode(gtk4::SelectionMode::None);
-
         for (node, depth) in flat_nodes {
-            let row = Box::new(Orientation::Horizontal, 10);
-            row.set_margin_start(10);
-            row.set_margin_end(10);
-            row.set_margin_top(5);
-            row.set_margin_bottom(5);
-
-            let prefix = if depth == 0 {
-                String::new()
-            } else {
-                format!("{}├─ ", "  ".repeat(depth.saturating_sub(1)))
-            };
-
-            let display_text = format!("{}{}", prefix, node.label);
-            let label = Label::new(Some(&display_text));
-            label.set_xalign(0.0);
-            row.append(&label);
-            matrix_list.append(&row);
+            let obj = crate::widgets::model::MatrixNodeObject::new(&node.id, &node.label, depth as u32);
+            matrix_store.append(&obj);
         }
-
-        let matrix_scroll = ScrolledWindow::builder()
-            .hscrollbar_policy(PolicyType::Never)
-            .child(&matrix_list)
-            .min_content_height(150)
-            .vexpand(false)
-            .build();
-
-        telehud_box.append(&matrix_scroll);
     }
+
+    let matrix_selection = SingleSelection::new(Some(matrix_store.clone()));
+    let matrix_factory = SignalListItemFactory::new();
+
+    matrix_factory.connect_setup(move |_factory, item| {
+        let item = item.downcast_ref::<ListItem>().unwrap();
+        let row = Box::new(Orientation::Horizontal, 10);
+        row.set_margin_start(10);
+        row.set_margin_end(10);
+        row.set_margin_top(5);
+        row.set_margin_bottom(5);
+        let label = Label::new(None);
+        label.set_xalign(0.0);
+        row.append(&label);
+        item.set_child(Some(&row));
+    });
+
+    matrix_factory.connect_bind(move |_factory, item| {
+        let item = item.downcast_ref::<ListItem>().unwrap();
+        let child = item.child().unwrap().downcast::<Box>().unwrap();
+        let label = child.first_child().unwrap().downcast::<Label>().unwrap();
+        let obj = item.item().unwrap().downcast::<crate::widgets::model::MatrixNodeObject>().unwrap();
+
+        let depth = obj.depth();
+        let prefix = if depth == 0 {
+            String::new()
+        } else {
+            format!("{}├─ ", "  ".repeat(depth.saturating_sub(1) as usize))
+        };
+        let display_text = format!("{}{}", prefix, obj.label());
+        label.set_label(&display_text);
+    });
+
+    let matrix_view = ColumnView::new(Some(matrix_selection));
+    matrix_view.add_css_class("shard-list");
+    matrix_view.append_column(&ColumnViewColumn::new(None, Some(matrix_factory)));
+
+    let tx_matrix_nav = tx_event.clone();
+    matrix_view.connect_activate(move |view, pos| {
+        let model = view.model().unwrap().downcast::<SingleSelection>().unwrap();
+        if let Some(item) = model.item(pos) {
+            let obj = item.downcast::<crate::widgets::model::MatrixNodeObject>().unwrap();
+            let _ = tx_matrix_nav.send_blocking(Event::ToggleMatrixNode(obj.id()));
+        }
+    });
+
+    let matrix_scroll = ScrolledWindow::builder()
+        .hscrollbar_policy(PolicyType::Never)
+        .child(&matrix_view)
+        .min_content_height(150)
+        .vexpand(false)
+        .build();
+
+    telehud_box.append(&matrix_scroll);
     // --- END MATRIX TETRA ---
 
     telehud_box.append(
@@ -429,6 +457,7 @@ pub fn build(window: &NativeWindow, tx_event: Sender<Event>) -> (SidebarWidgets,
         label_s9,
         token_label,
         context_view,
+        matrix_store,
     };
 
     (widgets, pointers)

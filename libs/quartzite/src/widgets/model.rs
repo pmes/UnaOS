@@ -31,7 +31,7 @@ pub struct DispatchRecord {
     pub is_chat: bool,
 }
 
-mod imp {
+mod imp_history {
     use super::*;
 
     #[derive(Default, Properties)]
@@ -63,8 +63,36 @@ mod imp {
     impl ObjectImpl for HistoryObject {}
 }
 
+mod imp_matrix {
+    use super::*;
+
+    #[derive(Default, Properties)]
+    #[properties(wrapper_type = super::MatrixNodeObject)]
+    pub struct MatrixNodeObject {
+        #[property(get, set)]
+        pub id: RefCell<String>,
+        #[property(get, set)]
+        pub label: RefCell<String>,
+        #[property(get, set)]
+        pub depth: RefCell<u32>,
+    }
+
+    #[glib::object_subclass]
+    impl ObjectSubclass for MatrixNodeObject {
+        const NAME: &'static str = "MatrixNodeObject";
+        type Type = super::MatrixNodeObject;
+    }
+
+    #[glib::derived_properties]
+    impl ObjectImpl for MatrixNodeObject {}
+}
+
 glib::wrapper! {
-    pub struct HistoryObject(ObjectSubclass<imp::HistoryObject>);
+    pub struct HistoryObject(ObjectSubclass<imp_history::HistoryObject>);
+}
+
+glib::wrapper! {
+    pub struct MatrixNodeObject(ObjectSubclass<imp_matrix::MatrixNodeObject>);
 }
 
 impl HistoryObject {
@@ -107,5 +135,15 @@ impl HistoryObject {
             content: self.content(),
             is_chat: self.is_chat(),
         }
+    }
+}
+
+impl MatrixNodeObject {
+    pub fn new(id: &str, label: &str, depth: u32) -> Self {
+        glib::Object::builder()
+            .property("id", id)
+            .property("label", label)
+            .property("depth", depth)
+            .build()
     }
 }

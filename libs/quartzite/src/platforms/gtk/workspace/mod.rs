@@ -73,6 +73,7 @@ pub fn build(
         preflight_dir_buf: comms_pointers.preflight_dir_buf,
         preflight_eng_buf: comms_pointers.preflight_eng_buf,
         preflight_prm_buf: comms_pointers.preflight_prm_buf,
+        matrix_store: sidebar_pointers.matrix_store,
     };
 
     reactor::spawn_listener(pointers, rx_gui);

@@ -44,6 +44,10 @@ pub mod qobject {
         type QVariant = cxx_qt_lib::QVariant;
         include!("cxx-qt-lib/qmodelindex.h");
         type QModelIndex = cxx_qt_lib::QModelIndex;
+        include!("cxx-qt-lib/qbytearray.h");
+        type QByteArray = cxx_qt_lib::QByteArray;
+        include!("cxx-qt-lib/qhash.h");
+        type QHash_i32_QByteArray = cxx_qt_lib::QHash<cxx_qt_lib::QHashPair_i32_QByteArray>;
     }
 
     unsafe extern "RustQt" {
@@ -131,10 +135,17 @@ pub mod qobject {
         fn row_count(self: &MatrixModel, parent: &QModelIndex) -> i32;
         #[qinvokable(cxx_override)]
         fn data(self: &MatrixModel, index: &QModelIndex, role: i32) -> QVariant;
+        #[qinvokable(cxx_override)]
+        #[cxx_name = "roleNames"]
+        fn role_names(self: &MatrixModel) -> QHash_i32_QByteArray;
 
         #[qinvokable]
         #[cxx_name = "registerModelThread"]
         fn register_model_thread(self: Pin<&mut MatrixModel>);
+
+        #[qinvokable]
+        #[cxx_name = "toggleNode"]
+        fn toggle_node(self: Pin<&mut MatrixModel>, id: QString);
 
         #[inherit]
         #[cxx_name = "beginResetModel"]
@@ -409,9 +420,15 @@ impl qobject::NetworkLogModel {
     }
 }
 
+pub struct MatrixNodeRow {
+    pub id: String,
+    pub label: String,
+    pub depth: usize,
+}
+
 // QAbstractListModel implementation for MatrixModel
 pub struct MatrixModelRust {
-    pub rows: Vec<String>,
+    pub rows: Vec<MatrixNodeRow>,
 }
 
 impl Default for MatrixModelRust {
@@ -419,12 +436,11 @@ impl Default for MatrixModelRust {
         let workspace_tetra = crate::tetra::WorkspaceTetra::default();
         let rows = if let crate::tetra::TetraNode::Matrix(matrix_tetra) = workspace_tetra.left_pane {
             matrix_tetra.tree.flatten().into_iter().map(|(n, depth)| {
-                let prefix = if depth == 0 {
-                    String::new()
-                } else {
-                    format!("{}├─ ", "  ".repeat(depth.saturating_sub(1)))
-                };
-                format!("{}{}", prefix, n.label)
+                MatrixNodeRow {
+                    id: n.id.clone(),
+                    label: n.label.clone(),
+                    depth,
+                }
             }).collect()
         } else {
             Vec::new()
@@ -439,10 +455,22 @@ impl qobject::MatrixModel {
         let _ = MATRIX_MODEL_THREAD.set(self.qt_thread());
     }
 
-    pub fn set_nodes(mut self: std::pin::Pin<&mut Self>, nodes: Vec<String>) {
+    pub fn set_nodes(mut self: std::pin::Pin<&mut Self>, nodes: Vec<(String, String, usize)>) {
+        let rows = nodes.into_iter().map(|(id, label, depth)| MatrixNodeRow {
+            id,
+            label,
+            depth,
+        }).collect();
         self.as_mut().begin_reset_model();
-        self.as_mut().rust_mut().rows = nodes;
+        self.as_mut().rust_mut().rows = rows;
         self.as_mut().end_reset_model();
+    }
+
+    pub fn toggle_node(self: std::pin::Pin<&mut Self>, id: QString) {
+        if let Some(tx) = GLOBAL_TX.get() {
+            let event = Event::ToggleMatrixNode(id.to_string());
+            let _ = tx.try_send(event);
+        }
     }
 
     pub fn row_count(&self, parent: &QModelIndex) -> i32 {
@@ -461,9 +489,25 @@ impl qobject::MatrixModel {
 
         let item = &self.rust().rows[row as usize];
         match role {
-            0 => QVariant::from(&QString::from(item)), // DisplayRole
+            0 => {
+                let prefix = if item.depth == 0 {
+                    String::new()
+                } else {
+                    format!("{}├─ ", "  ".repeat(item.depth.saturating_sub(1)))
+                };
+                let display_text = format!("{}{}", prefix, item.label);
+                QVariant::from(&QString::from(&display_text)) // DisplayRole
+            },
+            1 => QVariant::from(&QString::from(&item.id)),    // idRole
             _ => QVariant::default(),
         }
+    }
+
+    pub fn role_names(&self) -> cxx_qt_lib::QHash<cxx_qt_lib::QHashPair_i32_QByteArray> {
+        let mut roles = cxx_qt_lib::QHash::<cxx_qt_lib::QHashPair_i32_QByteArray>::default();
+        roles.insert(0, cxx_qt_lib::QByteArray::from("display"));
+        roles.insert(1, cxx_qt_lib::QByteArray::from("idRole"));
+        roles
     }
 }
 
@@ -511,6 +555,17 @@ pub fn route_review_payload(payload: PreFlightPayload) {
                     QString::from(&payload.engrams),
                     QString::from(&payload.prompt),
                 );
+            })
+            .unwrap();
+    }
+}
+
+pub fn route_matrix_topology(topology: Vec<(String, String, usize)>) {
+    if let Some(thread) = MATRIX_MODEL_THREAD.get() {
+        let thread = thread.clone();
+        thread
+            .queue(move |mut qobj| {
+                qobj.as_mut().set_nodes(topology);
             })
             .unwrap();
     }
