@@ -14,12 +14,17 @@
 // You should have received a copy of the GNU Lesser General Public License
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
+#[cfg(feature = "gtk")]
 use async_channel::Sender;
 use bandy::{MatrixEvent, SMessage, Synapse};
+#[cfg(feature = "gtk")]
 use elessar::{Context, Spline};
+#[cfg(feature = "gtk")]
 use gneiss_pal::Event;
+#[cfg(feature = "gtk")]
 use gtk4::prelude::*;
-use gtk4::{Box, Image, Label, ListBox, Orientation, ScrolledWindow, Widget};
+#[cfg(feature = "gtk")]
+use gtk4::{ListBox, ScrolledWindow, Widget};
 use std::path::{Path, PathBuf};
 
 // True DAG Lexical Scanner
@@ -215,11 +220,13 @@ impl MatrixScanner {
     }
 }
 
+#[cfg(feature = "gtk")]
 pub struct ProjectView {
     pub root_path: PathBuf,
     pub spline: Spline,
 }
 
+#[cfg(feature = "gtk")]
 impl ProjectView {
     pub fn new(path: &Path) -> Self {
         let context = Context::new(path);
@@ -242,6 +249,7 @@ impl ProjectView {
 }
 
 /// The UI Builder. It takes the Nerve Transmitter and binds it to the GTK event loop.
+#[cfg(feature = "gtk")]
 pub fn create_view(nerve_tx: Sender<Event>, root_path: &Path) -> Widget {
     let matrix_list = ListBox::new();
     matrix_list.set_selection_mode(gtk4::SelectionMode::Single);

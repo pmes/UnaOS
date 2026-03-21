@@ -47,6 +47,32 @@ impl ExpandableList {
             }
         }
     }
+
+    /// Toggles the `is_expanded` state of a node by its `id`.
+    /// Returns `true` if the node was found and toggled, `false` otherwise.
+    pub fn toggle_node(&mut self, node_id: &str) -> bool {
+        for root in &mut self.roots {
+            if Self::toggle_node_recursive(root, node_id) {
+                return true;
+            }
+        }
+        false
+    }
+
+    fn toggle_node_recursive(node: &mut TreeNode, node_id: &str) -> bool {
+        if node.id == node_id {
+            node.is_expanded = !node.is_expanded;
+            return true;
+        }
+
+        for child in &mut node.children {
+            if Self::toggle_node_recursive(child, node_id) {
+                return true;
+            }
+        }
+
+        false
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Default)]
