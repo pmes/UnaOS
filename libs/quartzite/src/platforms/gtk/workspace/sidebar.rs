@@ -15,7 +15,8 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 use crate::Event;
-use crate::tetra::{WorkspaceTetra, TetraNode};
+use bandy::state::{WorkspaceState, ViewEntity};
+use bandy::state::TopologyNode;
 use crate::NativeWindow;
 
 pub struct SidebarWidgets {
@@ -59,7 +60,7 @@ fn enable_spelling(view: &SourceView) {
     }
 }
 
-pub fn build(window: &NativeWindow, tx_event: Sender<Event>) -> (SidebarWidgets, SidebarPointers) {
+pub fn build(window: &NativeWindow, tx_event: Sender<Event>, workspace_state: &WorkspaceState) -> (SidebarWidgets, SidebarPointers) {
     // UI Controls
     let sidebar_toggle = ToggleButton::builder()
         .icon_name("sidebar-show-symbolic")
@@ -354,9 +355,8 @@ pub fn build(window: &NativeWindow, tx_event: Sender<Event>) -> (SidebarWidgets,
 
     // --- MATRIX TETRA ---
     let matrix_store = gio::ListStore::new::<crate::widgets::model::MatrixNodeObject>();
-    let workspace_tetra = WorkspaceTetra::default();
-    if let TetraNode::Matrix(matrix_tetra) = &workspace_tetra.left_pane {
-        let flat_nodes = matrix_tetra.tree.flatten();
+    if let ViewEntity::Topology(topology_state) = &workspace_state.left_pane {
+        let flat_nodes = topology_state.tree.flatten();
         for (node, depth) in flat_nodes {
             let obj = crate::widgets::model::MatrixNodeObject::new(&node.id, &node.label, depth as u32);
             matrix_store.append(&obj);

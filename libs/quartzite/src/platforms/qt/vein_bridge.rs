@@ -31,6 +31,7 @@ pub static NETWORK_LOG_MODEL_THREAD: OnceLock<cxx_qt::CxxQtThread<qobject::Netwo
     OnceLock::new();
 pub static MATRIX_MODEL_THREAD: OnceLock<cxx_qt::CxxQtThread<qobject::MatrixModel>> =
     OnceLock::new();
+pub static WORKSPACE_STATE: OnceLock<bandy::state::WorkspaceState> = OnceLock::new();
 
 #[cxx_qt::bridge]
 pub mod qobject {
@@ -443,9 +444,9 @@ pub struct MatrixModelRust {
 
 impl Default for MatrixModelRust {
     fn default() -> Self {
-        let workspace_tetra = crate::tetra::WorkspaceTetra::default();
-        let rows = if let crate::tetra::TetraNode::Matrix(matrix_tetra) = workspace_tetra.left_pane {
-            matrix_tetra.tree.flatten().into_iter().map(|(n, depth)| {
+        let workspace_state = WORKSPACE_STATE.get().cloned().unwrap_or_default();
+        let rows = if let bandy::state::ViewEntity::Topology(topology_state) = workspace_state.left_pane {
+            topology_state.tree.flatten().into_iter().map(|(n, depth)| {
                 MatrixNodeRow {
                     id: n.id.clone(),
                     label: n.label.clone(),
@@ -515,7 +516,7 @@ impl qobject::MatrixModel {
 
     pub fn role_names(&self) -> cxx_qt_lib::QHash<cxx_qt_lib::QHashPair_i32_QByteArray> {
         let mut roles = cxx_qt_lib::QHash::<cxx_qt_lib::QHashPair_i32_QByteArray>::default();
-        roles.insert(0, cxx_qt_lib::QByteArray::from("display"));
+        roles.insert(0, cxx_qt_lib::QByteArray::from("matrixLabel"));
         roles.insert(1, cxx_qt_lib::QByteArray::from("idRole"));
         roles
     }

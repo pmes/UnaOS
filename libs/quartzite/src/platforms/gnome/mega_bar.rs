@@ -30,7 +30,7 @@ impl MegaBar {
         left_content: &gtk4::Widget,
         right_content: &gtk4::Widget,
         brain_icon: &gtk4::Image,
-        workspace_tetra: &crate::tetra::WorkspaceTetra,
+        workspace_tetra: &bandy::state::WorkspaceState,
     ) -> gtk4::Widget {
         // 0. The Dark Mode Hard-Wire (GNOME)
         let style_manager = adw::StyleManager::default();

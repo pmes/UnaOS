@@ -14,17 +14,7 @@
 // You should have received a copy of the GNU Lesser General Public License
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-#[cfg(feature = "gtk")]
-use async_channel::Sender;
 use bandy::{MatrixEvent, SMessage, Synapse};
-#[cfg(feature = "gtk")]
-use elessar::{Context, Spline};
-#[cfg(feature = "gtk")]
-use gneiss_pal::Event;
-#[cfg(feature = "gtk")]
-use gtk4::prelude::*;
-#[cfg(feature = "gtk")]
-use gtk4::{ListBox, ScrolledWindow, Widget};
 use std::path::{Path, PathBuf};
 
 // True DAG Lexical Scanner
@@ -35,6 +25,63 @@ use std::collections::HashMap;
 pub struct MatrixScanner;
 
 impl MatrixScanner {
+
+    pub fn build_genesis_tree(dir: &Path, absolute_root: &Path) -> Vec<bandy::state::TopologyNode> {
+        let mut nodes = Vec::new();
+
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return nodes;
+        };
+
+        let mut dirs = Vec::new();
+        let mut files = Vec::new();
+
+        for entry in entries {
+            if let Ok(entry) = entry {
+                let path = entry.path();
+                let file_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("").to_string();
+
+                if file_name == "target" || file_name == ".git" || file_name == "node_modules" {
+                    continue;
+                }
+
+                if path.is_dir() {
+                    dirs.push((path, file_name));
+                } else {
+                    files.push((path, file_name));
+                }
+            }
+        }
+
+        dirs.sort_by(|a, b| a.1.cmp(&b.1));
+        files.sort_by(|a, b| a.1.cmp(&b.1));
+
+        for (path, file_name) in dirs {
+            let relative_path = path.strip_prefix(absolute_root).unwrap_or(&path).to_path_buf();
+            let id = relative_path.to_string_lossy().into_owned();
+            let children = Self::build_genesis_tree(&path, absolute_root);
+            nodes.push(bandy::state::TopologyNode {
+                id,
+                label: file_name,
+                children,
+                is_expanded: false,
+            });
+        }
+
+        for (path, file_name) in files {
+            let relative_path = path.strip_prefix(absolute_root).unwrap_or(&path).to_path_buf();
+            let id = relative_path.to_string_lossy().into_owned();
+            nodes.push(bandy::state::TopologyNode {
+                id,
+                label: file_name,
+                children: Vec::new(),
+                is_expanded: false,
+            });
+        }
+
+        nodes
+    }
+
     /// J21 PATHFINDER: Core method for the Zero-Redundancy Indexed Dictionary DAG Scanner.
     pub fn map_topology(paths: &[std::path::PathBuf], absolute_workspace_root: &Path) -> Result<String, String> {
         // Dictionary Engine
@@ -220,70 +267,7 @@ impl MatrixScanner {
     }
 }
 
-#[cfg(feature = "gtk")]
-pub struct ProjectView {
-    pub root_path: PathBuf,
-    pub spline: Spline,
-}
 
-#[cfg(feature = "gtk")]
-impl ProjectView {
-    pub fn new(path: &Path) -> Self {
-        let context = Context::new(path);
-        println!("[MATRIX] 👁️ Reality Detected: {:?}", context.spline);
-        Self {
-            root_path: path.to_path_buf(),
-            spline: context.spline,
-        }
-    }
-
-    pub fn get_icon_name(&self) -> &str {
-        match self.spline {
-            Spline::UnaOS => "computer-symbolic",
-            Spline::Rust => "applications-engineering-symbolic",
-            Spline::Web => "network-server-symbolic",
-            Spline::Python => "media-playlist-shuffle-symbolic",
-            Spline::Void => "folder-symbolic",
-        }
-    }
-}
-
-/// The UI Builder. It takes the Nerve Transmitter and binds it to the GTK event loop.
-#[cfg(feature = "gtk")]
-pub fn create_view(nerve_tx: Sender<Event>, root_path: &Path) -> Widget {
-    let matrix_list = ListBox::new();
-    matrix_list.set_selection_mode(gtk4::SelectionMode::Single);
-
-    let _project_view = ProjectView::new(root_path);
-
-    // 1. BLITZ THE TOPOLOGY
-    // Instead of a flat read_dir, we use the Scanner to get the spatial nodes.
-    // J21 PATHFINDER: The `root_path` passed to `create_view` IS the absolute workspace root,
-    // so we can use it directly without calling `elessar::find_workspace_root` again.
-
-    // We eradicated the J37 flat list rendering loop as requested. The UI shim is no longer
-    // needed since Matrix streams the compressed true DAG. We leave the basic scroll view
-    // container for future telemetry UI components.
-
-    // 2. WIRE THE SYNAPSE
-    let tx_clone = nerve_tx.clone();
-    matrix_list.connect_row_activated(move |_list, row| {
-        if let Some(child) = row.child() {
-            // Extract the path we hid in the widget name
-            let path_str = child.widget_name();
-            let path = PathBuf::from(path_str.as_str());
-
-            println!("[MATRIX] ⚡ Firing Synapse: Node Selected -> {:?}", path);
-
-            // Fire the impulse across the OS bus. Una (the IDE) will catch this.
-            // S49: Use gneiss_pal::Event instead of SMessage
-            let _ = tx_clone.send_blocking(Event::FileSelected(path));
-        }
-    });
-
-    let scroll = ScrolledWindow::builder().child(&matrix_list).build();
-    scroll.upcast::<Widget>()
-}
 
 /// The Asynchronous Logic Kernel for the Matrix
 pub async fn ignite(synapse: Synapse, absolute_workspace_root: std::sync::Arc<PathBuf>) {

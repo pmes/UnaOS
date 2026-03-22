@@ -53,7 +53,7 @@ impl Spline {
         _tx_event: async_channel::Sender<Event>,
         _app_state: Arc<RwLock<AppState>>,
         _rx_synapse: BroadcastReceiver<SMessage>,
-        _workspace_tetra: &crate::tetra::WorkspaceTetra,
+        _workspace_tetra: &bandy::state::WorkspaceState,
     ) -> NativeView {
         #[cfg(any(all(target_os = "linux", feature = "gtk"), target_os = "macos"))]
         return self
@@ -70,9 +70,9 @@ impl Spline {
             // Spawn the tokio backend to listen to StateInvalidated pings from Vein/Cortex
             crate::platforms::qt::window::spawn_state_listener(_app_state, _rx_synapse);
 
-            let default_tetra = crate::tetra::StreamTetra::default();
+            let default_tetra = bandy::state::StreamState::default();
             let stream_tetra = match &_workspace_tetra.right_pane {
-                crate::tetra::TetraNode::Stream(tetra) => tetra,
+                bandy::state::ViewEntity::Stream(tetra) => tetra,
                 _ => &default_tetra,
             };
             return crate::NativeView {
