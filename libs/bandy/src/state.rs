@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: LGPL-3.0-or-later
 // Copyright (C) 2026 The Architect & Una
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, VecDeque, HashSet};
 use serde::{Deserialize, Serialize};
 
 pub const MAX_STATE_CAPACITY: usize = 1000;
@@ -201,6 +201,194 @@ impl Default for AppState {
             absolute_workspace_root: std::sync::Arc::new(
                 std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."))
             ),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct TopologyNode {
+    pub id: String,
+    pub label: String,
+    pub children: Vec<TopologyNode>,
+    pub is_expanded: bool,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ExpandableList {
+    pub roots: Vec<TopologyNode>,
+}
+
+impl ExpandableList {
+    pub fn flatten(&self) -> Vec<(&TopologyNode, usize)> {
+        let mut result = Vec::new();
+        for root in &self.roots {
+            self.flatten_recursive(root, 0, &mut result);
+        }
+        result
+    }
+
+    fn flatten_recursive<'a>(&'a self, node: &'a TopologyNode, depth: usize, result: &mut Vec<(&'a TopologyNode, usize)>) {
+        result.push((node, depth));
+        if node.is_expanded {
+            for child in &node.children {
+                self.flatten_recursive(child, depth + 1, result);
+            }
+        }
+    }
+
+    pub fn toggle_node(&mut self, node_id: &str) -> bool {
+        for root in &mut self.roots {
+            if Self::toggle_node_recursive(root, node_id) {
+                return true;
+            }
+        }
+        false
+    }
+
+    fn toggle_node_recursive(node: &mut TopologyNode, node_id: &str) -> bool {
+        if node.id == node_id {
+            node.is_expanded = !node.is_expanded;
+            return true;
+        }
+
+        for child in &mut node.children {
+            if Self::toggle_node_recursive(child, node_id) {
+                return true;
+            }
+        }
+
+        false
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Default)]
+pub struct SelectionState {
+    pub selected_ids: HashSet<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct TopologyState {
+    pub tree: ExpandableList,
+    pub selection: SelectionState,
+}
+
+impl Default for TopologyState {
+    fn default() -> Self {
+        let tree = ExpandableList {
+            roots: vec![
+                TopologyNode {
+                    id: "unaos_core".to_string(),
+                    label: "UnaOS Core".to_string(),
+                    is_expanded: true,
+                    children: vec![
+                        TopologyNode {
+                            id: "kernel".to_string(),
+                            label: "Kernel".to_string(),
+                            is_expanded: false,
+                            children: vec![],
+                        },
+                        TopologyNode {
+                            id: "dmz".to_string(),
+                            label: "DMZ".to_string(),
+                            is_expanded: false,
+                            children: vec![],
+                        },
+                    ],
+                },
+                TopologyNode {
+                    id: "embassies".to_string(),
+                    label: "Embassies".to_string(),
+                    is_expanded: false,
+                    children: vec![
+                        TopologyNode {
+                            id: "gtk".to_string(),
+                            label: "GTK".to_string(),
+                            is_expanded: false,
+                            children: vec![],
+                        },
+                        TopologyNode {
+                            id: "qt".to_string(),
+                            label: "Qt".to_string(),
+                            is_expanded: false,
+                            children: vec![],
+                        },
+                    ],
+                },
+            ],
+        };
+
+        Self {
+            tree,
+            selection: SelectionState::default(),
+        }
+    }
+}
+
+impl TopologyState {
+    pub fn new(roots: Vec<TopologyNode>) -> Self {
+        Self {
+            tree: ExpandableList { roots },
+            selection: SelectionState::default(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub enum ScrollAnchor {
+    Top,
+    Bottom,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub enum ScrollBehavior {
+    AutoScroll,
+    Manual,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub enum StreamAlign {
+    Start,
+    End,
+    Center,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct StreamState {
+    pub input_anchor: ScrollAnchor,
+    pub scroll_behavior: ScrollBehavior,
+    pub alignment: StreamAlign,
+}
+
+impl Default for StreamState {
+    fn default() -> Self {
+        Self {
+            input_anchor: ScrollAnchor::Bottom,
+            scroll_behavior: ScrollBehavior::AutoScroll,
+            alignment: StreamAlign::Start,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub enum ViewEntity {
+    Topology(TopologyState),
+    Stream(StreamState),
+    Empty,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct WorkspaceState {
+    pub left_pane: ViewEntity,
+    pub right_pane: ViewEntity,
+    pub split_ratio: f32,
+}
+
+impl Default for WorkspaceState {
+    fn default() -> Self {
+        Self {
+            left_pane: ViewEntity::Topology(TopologyState::default()),
+            right_pane: ViewEntity::Stream(StreamState::default()),
+            split_ratio: 0.25,
         }
     }
 }

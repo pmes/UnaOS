@@ -23,7 +23,7 @@
 
 pub mod platforms;
 pub mod spline;
-pub mod tetra;
+
 pub mod text;
 pub mod widgets;
 

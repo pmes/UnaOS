@@ -35,7 +35,7 @@ impl CommsSpline {
         tx_event: async_channel::Sender<Event>,
         app_state: Arc<RwLock<AppState>>,
         rx_synapse: BroadcastReceiver<SMessage>,
-        workspace_tetra: &crate::tetra::WorkspaceTetra,
+        workspace_tetra: &bandy::state::WorkspaceState,
     ) -> crate::NativeView {
         #[cfg(feature = "gnome")]
         return build_gnome_ui(window, tx_event, app_state, rx_synapse, workspace_tetra);
@@ -51,7 +51,7 @@ fn build_gnome_ui(
     tx_event: async_channel::Sender<Event>,
     app_state: Arc<RwLock<AppState>>,
     rx_synapse: BroadcastReceiver<SMessage>,
-    workspace_tetra: &crate::tetra::WorkspaceTetra,
+    workspace_tetra: &bandy::state::WorkspaceState,
 ) -> crate::NativeView {
     let brain_icon = gtk4::Image::from_icon_name("brain-symbolic");
 
@@ -92,7 +92,7 @@ fn build_gtk_ui(
     tx_event: async_channel::Sender<Event>,
     app_state: Arc<RwLock<AppState>>,
     rx_synapse: BroadcastReceiver<SMessage>,
-    workspace_tetra: &crate::tetra::WorkspaceTetra,
+    workspace_tetra: &bandy::state::WorkspaceState,
 ) -> crate::NativeView {
     let brain_icon = gtk4::Image::from_icon_name("brain-symbolic");
 

@@ -110,13 +110,14 @@ fn main() {
     let (event_tx, event_rx) = async_channel::unbounded::<quartzite::Event>();
 
     // 7.5. Define the Workspace Layout via Declarative UI Engine
-    let workspace_tetra = quartzite::tetra::WorkspaceTetra {
-        left_pane: quartzite::tetra::TetraNode::Matrix(quartzite::tetra::MatrixTetra::default()),
-        right_pane: quartzite::tetra::TetraNode::Stream(quartzite::tetra::StreamTetra::default()),
+    let genesis_roots = matrix::MatrixScanner::build_genesis_tree(&absolute_workspace_root_arc, &absolute_workspace_root_arc);
+    let workspace_state = bandy::state::WorkspaceState {
+        left_pane: bandy::state::ViewEntity::Topology(bandy::state::TopologyState::new(genesis_roots)),
+        right_pane: bandy::state::ViewEntity::Stream(bandy::state::StreamState::default()),
         split_ratio: 0.25,
     };
 
-    let workspace_tetra_clone = workspace_tetra.clone();
+    let workspace_state_clone = workspace_state.clone();
 
     // We move VeinHandler into a separate task.
     // Since VeinHandler is "Pure Logic", it should run on Tokio.
@@ -135,7 +136,7 @@ fn main() {
     let brain_loop_handle = rt.spawn(async move {
         let mut vein = vein_handler;
         let mut shutdown_rx = shutdown_rx_vein;
-        let mut workspace_tetra = workspace_tetra_clone;
+        let mut workspace_state = workspace_state_clone;
 
         loop {
             tokio::select! {
@@ -147,7 +148,7 @@ fn main() {
                     if let Ok(event) = event_res {
                         match event {
                             quartzite::Event::UiReady => {
-                                if let quartzite::tetra::TetraNode::Matrix(ref mut matrix) = workspace_tetra.left_pane {
+                                if let bandy::state::ViewEntity::Topology(ref mut matrix) = workspace_state.left_pane {
                                     let flat_tree = matrix.tree.flatten();
                                     let mapped_tree: Vec<(String, String, usize)> = flat_tree.into_iter().map(|(n, depth)| {
                                         (n.id.clone(), n.label.clone(), depth)
@@ -156,7 +157,7 @@ fn main() {
                                 }
                             }
                             quartzite::Event::ToggleMatrixNode(id) => {
-                                if let quartzite::tetra::TetraNode::Matrix(ref mut matrix) = workspace_tetra.left_pane {
+                                if let bandy::state::ViewEntity::Topology(ref mut matrix) = workspace_state.left_pane {
                                     matrix.tree.toggle_node(&id);
                                     let flat_tree = matrix.tree.flatten();
                                     let mapped_tree: Vec<(String, String, usize)> = flat_tree.into_iter().map(|(n, depth)| {
@@ -188,7 +189,7 @@ fn main() {
             event_tx.clone(),
             app_state.clone(),
             synapse.subscribe(),
-            &workspace_tetra,
+            &workspace_state,
         );
 
         // 2. Create the HUD (ContextView) - DEPRECATED (Phase 4)

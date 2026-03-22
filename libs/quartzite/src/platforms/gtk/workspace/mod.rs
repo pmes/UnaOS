@@ -29,18 +29,18 @@ pub fn build(
     app_state: Arc<RwLock<AppState>>,
     rx_synapse: BroadcastReceiver<SMessage>,
     brain_icon: gtk4::Image,
-    workspace_tetra: &crate::tetra::WorkspaceTetra,
+    workspace_state: &bandy::state::WorkspaceState,
 ) -> WorkspaceWidgets {
     // Spawn translator
     let rx_gui = translator::spawn_translator(rx_synapse, app_state);
 
     // Build Sidebar Lobes
-    let (sidebar_widgets, sidebar_pointers) = sidebar::build(window, tx_event.clone());
+    let (sidebar_widgets, sidebar_pointers) = sidebar::build(window, tx_event.clone(), workspace_state);
 
     // Extract StreamTetra from Right Pane
-    let default_tetra = crate::tetra::StreamTetra::default();
-    let stream_tetra = match &workspace_tetra.right_pane {
-        crate::tetra::TetraNode::Stream(tetra) => tetra,
+    let default_tetra = bandy::state::StreamState::default();
+    let stream_tetra = match &workspace_state.right_pane {
+        bandy::state::ViewEntity::Stream(tetra) => tetra,
         _ => &default_tetra,
     };
 
