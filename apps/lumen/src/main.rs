@@ -181,6 +181,12 @@ fn main() {
     // 7. View & Engine Ignition
     let spline = Rc::new(quartzite::Spline::new());
 
+    #[cfg(feature = "qt")]
+    {
+        // J24.5 ROUBAIX: Synchronously inject the state before the UI boot to ensure MatrixModel Rust has data on first frame.
+        let _ = quartzite::platforms::qt::vein_bridge::WORKSPACE_STATE.set(workspace_state.clone());
+    }
+
     // THE FUSION
     let bootstrap = move |window: &NativeWindow| -> NativeView {
         // 1. Get the Vein UI (The Command Center)

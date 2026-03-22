@@ -121,12 +121,6 @@ Rectangle {
                 Layout.fillWidth: true
                 Layout.fillHeight: true
 
-                Component.onCompleted: {
-                    if (root.backend) {
-                        root.backend.uiReady()
-                    }
-                }
-
                 ColumnLayout {
                     anchors.fill: parent
                     anchors.margins: 12
