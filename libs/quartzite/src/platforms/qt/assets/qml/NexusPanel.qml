@@ -121,6 +121,13 @@ Rectangle {
                 Layout.fillWidth: true
                 Layout.fillHeight: true
 
+                MatrixModel {
+                    id: matrixModel
+                    Component.onCompleted: {
+                        matrixModel.registerModelThread()
+                    }
+                }
+
                 ColumnLayout {
                     anchors.fill: parent
                     anchors.margins: 12
@@ -130,7 +137,7 @@ Rectangle {
                         id: matrixListView
                         Layout.fillWidth: true
                         Layout.fillHeight: true
-                        model: _matrixModel
+                        model: matrixModel
                         clip: true
 
                         delegate: Rectangle {
@@ -149,7 +156,7 @@ Rectangle {
                             MouseArea {
                                 anchors.fill: parent
                                 onClicked: {
-                                    _matrixModel.toggleNode(idRole)
+                                    matrixModel.toggleNode(idRole)
                                 }
                             }
                         }
