@@ -398,7 +398,7 @@ struct ChatAreaData {
     is_fetching: Rc<RefCell<bool>>,
 }
 
-fn setup_chat_view(tx_event: &Sender<Event>, tetra: &bandy::state::StreamState) -> ChatAreaData {
+fn setup_chat_view(tx_event: &Sender<Event>, tetra: &crate::tetra::StreamTetra) -> ChatAreaData {
     let scrolled_window = ScrolledWindow::builder()
         .hscrollbar_policy(PolicyType::Never)
         .vscrollbar_policy(PolicyType::Automatic)
@@ -502,10 +502,10 @@ fn setup_chat_view(tx_event: &Sender<Event>, tetra: &bandy::state::StreamState) 
                 if is_at_bottom {
                     // Execute auto-scroll based on StreamTetra policy
                     match behavior {
-                        bandy::state::ScrollBehavior::AutoScroll => {
+                        crate::tetra::ScrollBehavior::AutoScroll => {
                             a_clone.set_value(current_upper - current_page_size);
                         }
-                        bandy::state::ScrollBehavior::Manual => {
+                        crate::tetra::ScrollBehavior::Manual => {
                             // Do nothing
                         }
                     }
@@ -703,9 +703,9 @@ fn setup_chat_view(tx_event: &Sender<Event>, tetra: &bandy::state::StreamState) 
 
         let boxed_alignment = unsafe { item.data::<glib::BoxedAnyObject>("alignment_policy") };
         let alignment = if let Some(boxed_align_ptr) = boxed_alignment {
-            unsafe { boxed_align_ptr.as_ref() }.borrow::<bandy::state::StreamAlign>().clone()
+            unsafe { boxed_align_ptr.as_ref() }.borrow::<crate::tetra::StreamAlign>().clone()
         } else {
-            bandy::state::StreamAlign::Start
+            crate::tetra::StreamAlign::Start
         };
 
         widgets.bubble.remove_css_class("architect-bubble");
@@ -755,9 +755,9 @@ fn setup_chat_view(tx_event: &Sender<Event>, tetra: &bandy::state::StreamState) 
 
             // Default spacing based on standard roles if policy is start
             let (align_right, meta_halign, meta_xalign) = match alignment {
-                bandy::state::StreamAlign::Start => (is_user, if is_user { gtk4::Align::End } else { gtk4::Align::Start }, if is_user { 1.0 } else { 0.0 }),
-                bandy::state::StreamAlign::End => (!is_user, if !is_user { gtk4::Align::End } else { gtk4::Align::Start }, if !is_user { 1.0 } else { 0.0 }),
-                bandy::state::StreamAlign::Center => {
+                crate::tetra::StreamAlign::Start => (is_user, if is_user { gtk4::Align::End } else { gtk4::Align::Start }, if is_user { 1.0 } else { 0.0 }),
+                crate::tetra::StreamAlign::End => (!is_user, if !is_user { gtk4::Align::End } else { gtk4::Align::Start }, if !is_user { 1.0 } else { 0.0 }),
+                crate::tetra::StreamAlign::Center => {
                     widgets.bubble.set_halign(gtk4::Align::Center);
                     (false, gtk4::Align::Center, 0.5)
                 }
@@ -766,7 +766,7 @@ fn setup_chat_view(tx_event: &Sender<Event>, tetra: &bandy::state::StreamState) 
             if align_right {
                 widgets.left_spacer.set_visible(true);
                 widgets.right_spacer.set_visible(false);
-            } else if !matches!(alignment, bandy::state::StreamAlign::Center) {
+            } else if !matches!(alignment, crate::tetra::StreamAlign::Center) {
                 widgets.left_spacer.set_visible(false);
                 widgets.right_spacer.set_visible(true);
             }
@@ -851,7 +851,7 @@ pub fn build(
     tx_event: Sender<Event>,
     active_target: Rc<RefCell<String>>,
     composer_btn: Button,
-    tetra: &bandy::state::StreamState,
+    tetra: &crate::tetra::StreamTetra,
 ) -> (CommsWidgets, CommsPointers) {
     let workspace_stack = Stack::new();
     workspace_stack.set_vexpand(true);
@@ -1000,10 +1000,10 @@ pub fn build(
     });
 
     match tetra.input_anchor {
-        bandy::state::ScrollAnchor::Top => {
+        crate::tetra::ScrollAnchor::Top => {
             comms_page.prepend(&input_container);
         }
-        bandy::state::ScrollAnchor::Bottom => {
+        crate::tetra::ScrollAnchor::Bottom => {
             comms_page.append(&input_container);
         }
     }

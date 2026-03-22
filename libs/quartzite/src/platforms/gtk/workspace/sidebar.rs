@@ -16,7 +16,7 @@ use std::rc::Rc;
 
 use crate::Event;
 use bandy::state::{WorkspaceState, ViewEntity};
-use bandy::state::TopologyNode;
+
 use crate::NativeWindow;
 
 pub struct SidebarWidgets {
@@ -60,7 +60,7 @@ fn enable_spelling(view: &SourceView) {
     }
 }
 
-pub fn build(window: &NativeWindow, tx_event: Sender<Event>, workspace_state: &WorkspaceState) -> (SidebarWidgets, SidebarPointers) {
+pub fn build(window: &NativeWindow, tx_event: Sender<Event>, _workspace_tetra: &crate::tetra::WorkspaceTetra, workspace_state: &WorkspaceState) -> (SidebarWidgets, SidebarPointers) {
     // UI Controls
     let sidebar_toggle = ToggleButton::builder()
         .icon_name("sidebar-show-symbolic")

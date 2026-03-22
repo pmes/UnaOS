@@ -25,6 +25,7 @@ pub mod platforms;
 pub mod spline;
 
 pub mod text;
+pub mod tetra;
 pub mod widgets;
 
 // Re-export specific logic types that UI might need directly
