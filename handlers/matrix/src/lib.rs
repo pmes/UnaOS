@@ -36,6 +36,8 @@ impl MatrixScanner {
         let mut dirs = Vec::new();
         let mut files = Vec::new();
 
+        // 1. First Pass: Collect valid files and calculate children for directories.
+        // We only want to map spatial code logic. Configuration files and other noise are dropped.
         for entry in entries {
             if let Ok(entry) = entry {
                 let path = entry.path();
@@ -46,20 +48,29 @@ impl MatrixScanner {
                 }
 
                 if path.is_dir() {
-                    dirs.push((path, file_name));
-                } else {
-                    files.push((path, file_name));
+                    // Recursively process the directory first to see if it holds any logic.
+                    let children = Self::build_genesis_tree(&path, absolute_root);
+                    // A branch with no leaves is dead weight. Prune it.
+                    if !children.is_empty() {
+                        dirs.push((path, file_name, children));
+                    }
+                } else if path.is_file() {
+                    // J24.8 "Phil": Strictly isolate .rs files. Non-code files must vanish.
+                    if path.extension().and_then(|e| e.to_str()) == Some("rs") {
+                        files.push((path, file_name));
+                    }
                 }
             }
         }
 
+        // 2. Deterministic Sorting: Directories first, then Files (alphabetically).
         dirs.sort_by(|a, b| a.1.cmp(&b.1));
         files.sort_by(|a, b| a.1.cmp(&b.1));
 
-        for (path, file_name) in dirs {
+        // 3. Construct the TopologyNodes.
+        for (path, file_name, children) in dirs {
             let relative_path = path.strip_prefix(absolute_root).unwrap_or(&path).to_path_buf();
             let id = relative_path.to_string_lossy().into_owned();
-            let children = Self::build_genesis_tree(&path, absolute_root);
             nodes.push(bandy::state::TopologyNode {
                 id,
                 label: file_name,
