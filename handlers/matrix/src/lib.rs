@@ -22,6 +22,11 @@ use std::path::{Path, PathBuf};
 // DO NOT DELETE: This powers the core Spatial Code Map (Matrix DAG).
 use std::collections::HashMap;
 
+pub enum ScanDepth {
+    Interface,
+    DeepAST,
+}
+
 pub struct MatrixScanner;
 
 impl MatrixScanner {
@@ -94,7 +99,11 @@ impl MatrixScanner {
     }
 
     /// J21 PATHFINDER: Core method for the Zero-Redundancy Indexed Dictionary DAG Scanner.
-    pub fn map_topology(paths: &[std::path::PathBuf], absolute_workspace_root: &Path) -> Result<String, String> {
+    pub fn map_topology(
+        paths: &[std::path::PathBuf],
+        absolute_workspace_root: &Path,
+        depth: ScanDepth,
+    ) -> Result<String, String> {
         // Dictionary Engine
         let mut dict_map: HashMap<String, usize> = HashMap::new();
         let mut dict_list: Vec<String> = Vec::new();
@@ -104,12 +113,29 @@ impl MatrixScanner {
 
         let mut processed_any = false;
 
+        let is_single_file = paths.len() == 1 && paths[0].is_file();
+
         for path in paths {
             if path.is_file() {
-                Self::scan_file(path, absolute_workspace_root, &mut dict_map, &mut dict_list, &mut topology_edges);
+                Self::scan_file(
+                    path,
+                    absolute_workspace_root,
+                    &mut dict_map,
+                    &mut dict_list,
+                    &mut topology_edges,
+                    &depth,
+                    is_single_file,
+                );
                 processed_any = true;
             } else if path.is_dir() {
-                Self::scan_directory(path, absolute_workspace_root, &mut dict_map, &mut dict_list, &mut topology_edges);
+                Self::scan_directory(
+                    path,
+                    absolute_workspace_root,
+                    &mut dict_map,
+                    &mut dict_list,
+                    &mut topology_edges,
+                    &depth,
+                );
                 processed_any = true;
             } else {
                 log::warn!("[MATRIX] Target is neither a file nor a directory: {:?}", path);
@@ -145,14 +171,15 @@ impl MatrixScanner {
         dict_map: &mut HashMap<String, usize>,
         dict_list: &mut Vec<String>,
         topology_edges: &mut Vec<String>,
+        depth: &ScanDepth,
     ) {
         if let Ok(entries) = std::fs::read_dir(dir) {
             for entry in entries.flatten() {
                 let p = entry.path();
                 if p.is_dir() {
-                    Self::scan_directory(&p, absolute_workspace_root, dict_map, dict_list, topology_edges);
+                    Self::scan_directory(&p, absolute_workspace_root, dict_map, dict_list, topology_edges, depth);
                 } else if p.is_file() {
-                    Self::scan_file(&p, absolute_workspace_root, dict_map, dict_list, topology_edges);
+                    Self::scan_file(&p, absolute_workspace_root, dict_map, dict_list, topology_edges, depth, false);
                 }
             }
         }
@@ -373,6 +400,8 @@ impl MatrixScanner {
         dict_map: &mut HashMap<String, usize>,
         dict_list: &mut Vec<String>,
         topology_edges: &mut Vec<String>,
+        depth: &ScanDepth,
+        extract_symbols: bool,
     ) {
         if file_path.extension().and_then(|e| e.to_str()) != Some("rs") {
             return;
@@ -387,6 +416,80 @@ impl MatrixScanner {
             let no_comments = Self::strip_comments(&raw_contents);
 
             let mut local_deps = Vec::new();
+
+            if extract_symbols {
+                // Line-by-line lexical pass to find file symbols.
+                for line in no_comments.lines() {
+                    let mut clean_line = line.trim();
+                    while clean_line.starts_with("#[") || clean_line.starts_with("#![") {
+                        if let Some(end_idx) = clean_line.find(']') {
+                            clean_line = clean_line[end_idx + 1..].trim();
+                        } else {
+                            break;
+                        }
+                    }
+
+                    // A basic zero-copy parsing to find our target keywords
+                    let words: Vec<&str> = clean_line.split_whitespace().collect();
+                    if words.is_empty() {
+                        continue;
+                    }
+
+                    let mut is_pub = false;
+                    let mut keyword_idx = 0;
+
+                    if words[0] == "pub" {
+                        is_pub = true;
+                        keyword_idx = 1;
+                        // Handle `pub (crate)` where there's a space
+                        if words.len() > 1 && words[1].starts_with('(') {
+                            keyword_idx = 2;
+                        }
+                    } else if words[0].starts_with("pub(") {
+                        is_pub = true;
+                        keyword_idx = 1;
+                    }
+
+                    // Skip intermediate modifiers like `async`, `const`, `unsafe`, `extern`, `default`
+                    while keyword_idx < words.len() {
+                        let w = words[keyword_idx];
+                        if w == "async" || w == "const" || w == "unsafe" || w == "extern" || w == "default" {
+                            keyword_idx += 1;
+                        } else {
+                            break;
+                        }
+                    }
+
+                    if keyword_idx < words.len() {
+                        let keyword = words[keyword_idx];
+
+                        let is_target_symbol = match depth {
+                            ScanDepth::Interface => {
+                                is_pub && (keyword == "fn" || keyword == "struct" || keyword == "enum" || keyword == "trait")
+                            }
+                            ScanDepth::DeepAST => {
+                                keyword == "fn" || keyword == "struct" || keyword == "enum" || keyword == "trait" || keyword == "impl"
+                            }
+                        };
+
+                        if is_target_symbol {
+                            if let Some(name) = words.get(keyword_idx + 1) {
+                                // Extract the name, stopping at <, (, or {
+                                let mut clean_name = *name;
+                                if let Some(idx) = clean_name.find(|c| c == '<' || c == '(' || c == '{' || c == ':') {
+                                    clean_name = &clean_name[..idx];
+                                }
+
+                                if !clean_name.is_empty() {
+                                    let formatted_symbol = format!("{} {}", keyword, clean_name);
+                                    let symbol_id = Self::get_or_insert_id(&formatted_symbol, dict_map, dict_list);
+                                    local_deps.push(symbol_id);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
 
             // Very simple tokenization by semicolons
             let statements = no_comments.split(';');
@@ -446,7 +549,8 @@ pub async fn ignite(synapse: Synapse, absolute_workspace_root: std::sync::Arc<Pa
                     .map(|target| absolute_workspace_root.join(target))
                     .collect();
 
-                if let Ok(compressed_payload) = MatrixScanner::map_topology(&absolute_targets, &absolute_workspace_root) {
+                // Hardcode ScanDepth::Interface for now as per The Architect's instruction.
+                if let Ok(compressed_payload) = MatrixScanner::map_topology(&absolute_targets, &absolute_workspace_root, ScanDepth::Interface) {
                     // J21 PATHFINDER: Fire the True DAG directly to `vein` via `IngestTopology`.
                     // This raw data structure fuels the instant UI payload mutation.
                     let _ = synapse.fire_async(SMessage::Matrix(MatrixEvent::IngestTopology { payload: compressed_payload })).await;
