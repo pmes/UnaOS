@@ -403,10 +403,48 @@ pub fn build(window: &NativeWindow, tx_event: Sender<Event>, _workspace_tetra: &
     let nav_history_forward = std::rc::Rc::new(std::cell::RefCell::new(Vec::<String>::new()));
     let current_matrix_path = std::rc::Rc::new(std::cell::RefCell::new(String::new()));
 
+    let nav_box = Box::new(Orientation::Horizontal, 5);
+    nav_box.set_margin_start(5);
+    nav_box.set_margin_end(5);
+    nav_box.set_margin_top(5);
+    nav_box.set_margin_bottom(5);
+
+    let btn_back = Button::from_icon_name("go-previous-symbolic");
+    let btn_up = Button::from_icon_name("go-up-symbolic");
+    let btn_forward = Button::from_icon_name("go-next-symbolic");
+
+    btn_back.add_css_class("flat");
+    btn_up.add_css_class("flat");
+    btn_forward.add_css_class("flat");
+
+    // Progressive Disclosure: Spawn buttons in a deactivated state.
+    // They should only illuminate when spatial navigation actually permits their use.
+    btn_back.set_sensitive(false);
+    btn_up.set_sensitive(false);
+    btn_forward.set_sensitive(false);
+
+    // Shared update function to recalibrate button sensitivities based on local history state
+    let update_nav_btns = {
+        let btn_back = btn_back.clone();
+        let btn_up = btn_up.clone();
+        let btn_forward = btn_forward.clone();
+        let b_stack = nav_history_back.clone();
+        let f_stack = nav_history_forward.clone();
+        let c_path = current_matrix_path.clone();
+
+        move || {
+            btn_back.set_sensitive(!b_stack.borrow().is_empty());
+            btn_forward.set_sensitive(!f_stack.borrow().is_empty());
+            let current = c_path.borrow().clone();
+            btn_up.set_sensitive(!current.is_empty() && current.contains('/'));
+        }
+    };
+
     let tx_matrix_nav = tx_event.clone();
     let nav_back_clone = nav_history_back.clone();
     let nav_forward_clone = nav_history_forward.clone();
     let current_path_clone = current_matrix_path.clone();
+    let update_btns_activate = update_nav_btns.clone();
 
     matrix_view.connect_activate(move |view, pos| {
         let model = view.model().unwrap().downcast::<SingleSelection>().unwrap();
@@ -422,30 +460,21 @@ pub fn build(window: &NativeWindow, tx_event: Sender<Event>, _workspace_tetra: &
             }
             *current_path_clone.borrow_mut() = new_id.clone();
 
+            // Recalibrate navigation controls
+            update_btns_activate();
+
             // Checkpoint Delta: The Interactive Trigger
             // Trigger semantic extraction for the selected matrix node.
             let _ = tx_matrix_nav.send_blocking(Event::FocusMatrixSector(new_id));
         }
     });
 
-    let nav_box = Box::new(Orientation::Horizontal, 5);
-    nav_box.set_margin_start(5);
-    nav_box.set_margin_end(5);
-    nav_box.set_margin_top(5);
-    nav_box.set_margin_bottom(5);
-
-    let btn_back = Button::from_icon_name("go-previous-symbolic");
-    let btn_up = Button::from_icon_name("go-up-symbolic");
-    let btn_forward = Button::from_icon_name("go-next-symbolic");
-
-    btn_back.add_css_class("flat");
-    btn_up.add_css_class("flat");
-    btn_forward.add_css_class("flat");
-
     let tx_back = tx_event.clone();
     let back_b = nav_history_back.clone();
     let back_f = nav_history_forward.clone();
     let back_c = current_matrix_path.clone();
+    let update_btns_back = update_nav_btns.clone();
+
     btn_back.connect_clicked(move |_| {
         if let Some(prev) = back_b.borrow_mut().pop() {
             let current = back_c.borrow().clone();
@@ -453,6 +482,7 @@ pub fn build(window: &NativeWindow, tx_event: Sender<Event>, _workspace_tetra: &
                 back_f.borrow_mut().push(current);
             }
             *back_c.borrow_mut() = prev.clone();
+            update_btns_back();
             let _ = tx_back.send_blocking(Event::FocusMatrixSector(prev));
         }
     });
@@ -461,6 +491,8 @@ pub fn build(window: &NativeWindow, tx_event: Sender<Event>, _workspace_tetra: &
     let fwd_b = nav_history_back.clone();
     let fwd_f = nav_history_forward.clone();
     let fwd_c = current_matrix_path.clone();
+    let update_btns_fwd = update_nav_btns.clone();
+
     btn_forward.connect_clicked(move |_| {
         if let Some(next) = fwd_f.borrow_mut().pop() {
             let current = fwd_c.borrow().clone();
@@ -468,6 +500,7 @@ pub fn build(window: &NativeWindow, tx_event: Sender<Event>, _workspace_tetra: &
                 fwd_b.borrow_mut().push(current);
             }
             *fwd_c.borrow_mut() = next.clone();
+            update_btns_fwd();
             let _ = tx_fwd.send_blocking(Event::FocusMatrixSector(next));
         }
     });
@@ -476,6 +509,8 @@ pub fn build(window: &NativeWindow, tx_event: Sender<Event>, _workspace_tetra: &
     let up_b = nav_history_back.clone();
     let up_f = nav_history_forward.clone();
     let up_c = current_matrix_path.clone();
+    let update_btns_up = update_nav_btns.clone();
+
     btn_up.connect_clicked(move |_| {
         let current = up_c.borrow().clone();
         if !current.is_empty() && current.contains('/') {
@@ -487,6 +522,7 @@ pub fn build(window: &NativeWindow, tx_event: Sender<Event>, _workspace_tetra: &
             up_b.borrow_mut().push(current);
             up_f.borrow_mut().clear();
             *up_c.borrow_mut() = parent.clone();
+            update_btns_up();
             let _ = tx_up.send_blocking(Event::FocusMatrixSector(parent));
         }
     });
