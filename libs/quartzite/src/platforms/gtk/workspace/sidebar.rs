@@ -465,7 +465,7 @@ pub fn build(window: &NativeWindow, tx_event: Sender<Event>, _workspace_tetra: &
 
             // Checkpoint Delta: The Interactive Trigger
             // Trigger semantic extraction for the selected matrix node.
-            let _ = tx_matrix_nav.send_blocking(Event::FocusMatrixSector(new_id));
+            let _ = tx_matrix_nav.send_blocking(Event::ToggleMatrixNode(new_id));
         }
     });
 
@@ -484,7 +484,7 @@ pub fn build(window: &NativeWindow, tx_event: Sender<Event>, _workspace_tetra: &
             }
             *back_c.borrow_mut() = prev.clone();
             update_btns_back();
-            let _ = tx_back.send_blocking(Event::FocusMatrixSector(prev));
+            // let _ = tx_back.send_blocking(Event::FocusMatrixSector(prev));
         }
     });
 
@@ -503,7 +503,7 @@ pub fn build(window: &NativeWindow, tx_event: Sender<Event>, _workspace_tetra: &
             }
             *fwd_c.borrow_mut() = next.clone();
             update_btns_fwd();
-            let _ = tx_fwd.send_blocking(Event::FocusMatrixSector(next));
+            // let _ = tx_fwd.send_blocking(Event::FocusMatrixSector(next));
         }
     });
 
@@ -525,7 +525,7 @@ pub fn build(window: &NativeWindow, tx_event: Sender<Event>, _workspace_tetra: &
             up_f.borrow_mut().clear();
             *up_c.borrow_mut() = parent.clone();
             update_btns_up();
-            let _ = tx_up.send_blocking(Event::FocusMatrixSector(parent));
+            // let _ = tx_up.send_blocking(Event::FocusMatrixSector(parent));
         }
     });
 
