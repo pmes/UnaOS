@@ -190,6 +190,172 @@ impl MatrixScanner {
         result
     }
 
+    fn expand_use_path(path: &str, results: &mut Vec<String>) {
+        let path = path.trim();
+        if path.is_empty() {
+            return;
+        }
+
+        // Fast path for simple non-bracketed imports.
+        if !path.contains('{') {
+            // Remove " as alias" if present.
+            let clean_path = if let Some(as_idx) = path.find(" as ") {
+                path[..as_idx].trim()
+            } else {
+                path
+            };
+            if !clean_path.is_empty() {
+                results.push(clean_path.to_string());
+            }
+            return;
+        }
+
+        let mut stack = Vec::new();
+        let mut current_prefix = String::new();
+        let mut current_token = String::new();
+
+        let mut chars = path.chars().peekable();
+        while let Some(c) = chars.next() {
+            match c {
+                '{' => {
+                    let prefix = current_token.trim().trim_end_matches("::").trim();
+                    if !prefix.is_empty() {
+                        let full_prefix = if current_prefix.is_empty() {
+                            prefix.to_string()
+                        } else {
+                            format!("{}::{}", current_prefix, prefix)
+                        };
+                        stack.push(current_prefix.clone());
+                        current_prefix = full_prefix;
+                    } else {
+                        stack.push(current_prefix.clone());
+                    }
+                    current_token.clear();
+                }
+                '}' => {
+                    let token = current_token.trim();
+                    if !token.is_empty() {
+                        let clean_token = if let Some(as_idx) = token.find(" as ") {
+                            token[..as_idx].trim()
+                        } else {
+                            token
+                        };
+
+                        let full_path = if clean_token == "self" {
+                            current_prefix.clone()
+                        } else if current_prefix.is_empty() {
+                            clean_token.to_string()
+                        } else {
+                            format!("{}::{}", current_prefix, clean_token)
+                        };
+                        if !full_path.is_empty() {
+                            results.push(full_path);
+                        }
+                    }
+
+                    if let Some(prev_prefix) = stack.pop() {
+                        current_prefix = prev_prefix;
+                    }
+                    current_token.clear();
+                }
+                ',' => {
+                    let token = current_token.trim();
+                    if !token.is_empty() {
+                        let clean_token = if let Some(as_idx) = token.find(" as ") {
+                            token[..as_idx].trim()
+                        } else {
+                            token
+                        };
+
+                        let full_path = if clean_token == "self" {
+                            current_prefix.clone()
+                        } else if current_prefix.is_empty() {
+                            clean_token.to_string()
+                        } else {
+                            format!("{}::{}", current_prefix, clean_token)
+                        };
+                        if !full_path.is_empty() {
+                            results.push(full_path);
+                        }
+                    }
+                    current_token.clear();
+                }
+                _ => {
+                    current_token.push(c);
+                }
+            }
+        }
+
+        // Handle any trailing token (though unusual in well-formed bracketed uses)
+        let token = current_token.trim();
+        if !token.is_empty() {
+            let clean_token = if let Some(as_idx) = token.find(" as ") {
+                token[..as_idx].trim()
+            } else {
+                token
+            };
+
+            let full_path = if clean_token == "self" {
+                current_prefix.clone()
+            } else if current_prefix.is_empty() {
+                clean_token.to_string()
+            } else {
+                format!("{}::{}", current_prefix, clean_token)
+            };
+            if !full_path.is_empty() {
+                results.push(full_path);
+            }
+        }
+    }
+
+    fn extract_deps_from_stmt(stmt: &str) -> Vec<String> {
+        let mut deps = Vec::new();
+        let stmt = stmt.trim();
+
+        // 1. Handle visibility modifiers
+        let mut content = stmt;
+        if content.starts_with("pub") {
+            content = &content[3..].trim_start();
+            if content.starts_with('(') {
+                // Skip past the matching closing parenthesis
+                let mut depth = 0;
+                let mut end_idx = 0;
+                for (i, c) in content.char_indices() {
+                    if c == '(' {
+                        depth += 1;
+                    } else if c == ')' {
+                        depth -= 1;
+                        if depth == 0 {
+                            end_idx = i;
+                            break;
+                        }
+                    }
+                }
+                if end_idx > 0 {
+                    content = &content[end_idx + 1..].trim_start();
+                }
+            }
+        }
+
+        // 2. Parse mod or use
+        if content.starts_with("mod ") {
+            let mod_name = content[4..].trim();
+            // In cases like `mod a { ... }`, we only care about the name before `{` if any,
+            // though our split(';') might not give us blocks perfectly.
+            // We assume standard `mod a;` since blocks wouldn't end in `;` without internal `;`.
+            // Let's take the first token.
+            let name = mod_name.split_whitespace().next().unwrap_or("").trim_end_matches('{').trim();
+            if !name.is_empty() {
+                deps.push(name.to_string());
+            }
+        } else if content.starts_with("use ") {
+            let use_path = content[4..].trim();
+            Self::expand_use_path(use_path, &mut deps);
+        }
+
+        deps
+    }
+
     fn scan_file(
         file_path: &Path,
         absolute_workspace_root: &Path,
@@ -206,60 +372,43 @@ impl MatrixScanner {
         let node_id = Self::get_or_insert_id(&node_name, dict_map, dict_list);
 
         if let Ok(raw_contents) = std::fs::read_to_string(file_path) {
-            // Lexical Extraction: Strip comments and replace multi-line breaks
+            // Lexical Extraction: Strip comments
             let no_comments = Self::strip_comments(&raw_contents);
-            let single_line_content = no_comments.replace('\n', " ").replace('\r', " ");
 
             let mut local_deps = Vec::new();
 
             // Very simple tokenization by semicolons
-            let statements = single_line_content.split(';');
+            let statements = no_comments.split(';');
 
             for stmt in statements {
-                let trimmed = stmt.trim();
-
-                if trimmed.starts_with("mod ") || trimmed.starts_with("pub mod ") {
-                    let parts: Vec<&str> = trimmed.split_whitespace().collect();
-                    if let Some(mod_name) = parts.last() {
-                        let clean_name = mod_name.trim();
-                        let dep_id = Self::get_or_insert_id(clean_name, dict_map, dict_list);
-                        local_deps.push(dep_id);
+                // Skip empty or attribute-only lines simply by taking the non-attribute parts
+                // but for now, extract_deps_from_stmt will handle valid keywords.
+                // Note: We might have attributes like `#[cfg(test)] mod tests;`
+                // Let's strip simple attributes that might prepend our statements.
+                let mut clean_stmt = stmt.trim();
+                while clean_stmt.starts_with("#[") || clean_stmt.starts_with("#![") {
+                    if let Some(end_idx) = clean_stmt.find(']') {
+                        clean_stmt = clean_stmt[end_idx + 1..].trim();
+                    } else {
+                        break;
                     }
                 }
 
-                if trimmed.starts_with("use ") || trimmed.starts_with("pub use ") {
-                    // Find the start of the path
-                    let prefix_len = if trimmed.starts_with("use ") { 4 } else { 8 };
-                    let path_str = &trimmed[prefix_len..].trim();
+                // Also clean up multiline breaks (we didn't replace \n across the whole file anymore)
+                let single_line_stmt = clean_stmt.replace('\n', " ").replace('\r', " ");
 
-                    // Handle brackets: std::sync::{Arc, Mutex}
-                    if let Some(brace_start) = path_str.find('{') {
-                        if let Some(brace_end) = path_str.find('}') {
-                            let base_path = &path_str[..brace_start].trim_end_matches("::");
-                            let inside_braces = &path_str[brace_start + 1..brace_end];
-
-                            for item in inside_braces.split(',') {
-                                let item = item.trim();
-                                if !item.is_empty() {
-                                    let full_path = if base_path.is_empty() {
-                                        item.to_string()
-                                    } else {
-                                        format!("{}::{}", base_path, item)
-                                    };
-                                    let dep_id = Self::get_or_insert_id(&full_path, dict_map, dict_list);
-                                    local_deps.push(dep_id);
-                                }
-                            }
-                        }
-                    } else {
-                        // Standard single use
-                        let dep_id = Self::get_or_insert_id(path_str, dict_map, dict_list);
-                        local_deps.push(dep_id);
-                    }
+                let extracted_deps = Self::extract_deps_from_stmt(&single_line_stmt);
+                for dep in extracted_deps {
+                    let dep_id = Self::get_or_insert_id(&dep, dict_map, dict_list);
+                    local_deps.push(dep_id);
                 }
             }
 
             if !local_deps.is_empty() {
+                // Deduplicate local_deps just in case
+                local_deps.sort_unstable();
+                local_deps.dedup();
+
                 let dep_strs: Vec<String> = local_deps.iter().map(|id| id.to_string()).collect();
                 topology_edges.push(format!("{}:{}", node_id, dep_strs.join(",")));
             }
