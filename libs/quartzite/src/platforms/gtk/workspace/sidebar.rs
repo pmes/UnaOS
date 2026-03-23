@@ -476,7 +476,8 @@ pub fn build(window: &NativeWindow, tx_event: Sender<Event>, _workspace_tetra: &
     let update_btns_back = update_nav_btns.clone();
 
     btn_back.connect_clicked(move |_| {
-        if let Some(prev) = back_b.borrow_mut().pop() {
+        let prev_opt = back_b.borrow_mut().pop();
+        if let Some(prev) = prev_opt {
             let current = back_c.borrow().clone();
             if !current.is_empty() {
                 back_f.borrow_mut().push(current);
@@ -494,7 +495,8 @@ pub fn build(window: &NativeWindow, tx_event: Sender<Event>, _workspace_tetra: &
     let update_btns_fwd = update_nav_btns.clone();
 
     btn_forward.connect_clicked(move |_| {
-        if let Some(next) = fwd_f.borrow_mut().pop() {
+        let next_opt = fwd_f.borrow_mut().pop();
+        if let Some(next) = next_opt {
             let current = fwd_c.borrow().clone();
             if !current.is_empty() {
                 fwd_b.borrow_mut().push(current);
@@ -545,6 +547,7 @@ pub fn build(window: &NativeWindow, tx_event: Sender<Event>, _workspace_tetra: &
     // --- END MATRIX TETRA ---
 
     let context_view = crate::widgets::telemetry::ContextView::new();
+    telehud_box.append(&context_view.container);
 
     let page = left_stack.add_named(&telehud_box, Some("telehud"));
     page.set_icon_name("error-correct-symbolic");
