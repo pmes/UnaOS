@@ -160,10 +160,24 @@ fn main() {
                                 if let bandy::state::ViewEntity::Topology(ref mut matrix) = workspace_state.left_pane {
                                     matrix.tree.toggle_node(&id);
                                     let flat_tree = matrix.tree.flatten();
+
+                                    // Check if the node is expanded and is a .rs file
+                                    let mut is_expanded_rs = false;
+                                    for (n, _) in &flat_tree {
+                                        if n.id == id && n.is_expanded && id.ends_with(".rs") {
+                                            is_expanded_rs = true;
+                                            break;
+                                        }
+                                    }
+
                                     let mapped_tree: Vec<(String, String, usize)> = flat_tree.into_iter().map(|(n, depth)| {
                                         (n.id.clone(), n.label.clone(), depth)
                                     }).collect();
                                     synapse_event_loop.fire(bandy::SMessage::Matrix(bandy::MatrixEvent::TopologyMutated(mapped_tree)));
+
+                                    if is_expanded_rs {
+                                        synapse_event_loop.fire(bandy::SMessage::Matrix(bandy::MatrixEvent::FocusSector(id.clone())));
+                                    }
                                 }
                             }
                             quartzite::Event::FocusMatrixSector(id) => {
