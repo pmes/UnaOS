@@ -137,6 +137,7 @@ fn main() {
         let mut vein = vein_handler;
         let mut shutdown_rx = shutdown_rx_vein;
         let mut workspace_state = workspace_state_clone;
+        let mut synapse_rx = synapse_event_loop.subscribe();
 
         loop {
             tokio::select! {
@@ -191,6 +192,81 @@ fn main() {
                         }
                     } else {
                         break;
+                    }
+                }
+                // --- MATRIX EVENTS ---
+                // We handle Matrix events locally if they dictate UI structure mutations.
+                msg = synapse_rx.recv() => {
+                    if let Ok(bandy::SMessage::Matrix(bandy::MatrixEvent::GraftTopology { target_id, payload })) = msg {
+                        if let bandy::state::ViewEntity::Topology(ref mut matrix) = workspace_state.left_pane {
+                            // 1. Decompress payload: DICTIONARY$TOPOLOGY
+                            if let Some((dict_str, edges_str)) = payload.split_once('$') {
+                                let dict_list: Vec<&str> = dict_str.split(',').collect();
+
+                                // Parse edges "NodeID:DepID,DepID"
+                                let edges: Vec<&str> = edges_str.split('|').collect();
+
+                                // Since it's a single file scan, the first edge should be the file's edge
+                                // containing the symbol IDs.
+                                let mut symbols_to_graft = Vec::new();
+                                for edge in edges {
+                                    if let Some((node_id_str, deps_str)) = edge.split_once(':') {
+                                        if let Ok(node_id) = node_id_str.parse::<usize>() {
+                                            if let Some(node_name) = dict_list.get(node_id) {
+                                                // Check if this edge belongs to our target_id
+                                                if *node_name == target_id {
+                                                    for dep_id_str in deps_str.split(',') {
+                                                        if let Ok(dep_id) = dep_id_str.parse::<usize>() {
+                                                            if let Some(symbol_name) = dict_list.get(dep_id) {
+                                                                // Valid symbol! Instantiate a TopologyNode
+                                                                symbols_to_graft.push(bandy::state::TopologyNode {
+                                                                    id: format!("{}#{}", target_id, symbol_name),
+                                                                    label: symbol_name.to_string(),
+                                                                    children: Vec::new(),
+                                                                    is_expanded: false,
+                                                                });
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+
+                                // 2. Traverse matrix.tree to find `target_id` and append the nodes
+                                fn graft_to_node(node: &mut bandy::state::TopologyNode, target_id: &str, new_children: Vec<bandy::state::TopologyNode>) -> bool {
+                                    if node.id == target_id {
+                                        // Found the target node, replace its children (or append)
+                                        node.children = new_children;
+                                        return true;
+                                    }
+                                    for child in &mut node.children {
+                                        if graft_to_node(child, target_id, new_children.clone()) {
+                                            return true;
+                                        }
+                                    }
+                                    false
+                                }
+
+                                let mut grafted = false;
+                                for root_node in &mut matrix.tree.roots {
+                                    if graft_to_node(root_node, &target_id, symbols_to_graft.clone()) {
+                                        grafted = true;
+                                        break;
+                                    }
+                                }
+
+                                if grafted {
+                                    // 3. Re-render: flatten tree and broadcast Mutation
+                                    let flat_tree = matrix.tree.flatten();
+                                    let mapped_tree: Vec<(String, String, usize)> = flat_tree.into_iter().map(|(n, depth)| {
+                                        (n.id.clone(), n.label.clone(), depth)
+                                    }).collect();
+                                    synapse_event_loop.fire(bandy::SMessage::Matrix(bandy::MatrixEvent::TopologyMutated(mapped_tree)));
+                                }
+                            }
+                        }
                     }
                 }
             }

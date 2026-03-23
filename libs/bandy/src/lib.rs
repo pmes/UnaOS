@@ -174,6 +174,11 @@ pub enum MatrixEvent {
     IngestTopology {
         payload: String,
     },
+    /// Surgically appends extracted symbols to an existing node's children
+    GraftTopology {
+        target_id: String,
+        payload: String,
+    },
     /// Vein asks Matrix to focus on a specific sector (e.g., "euclase")
     FocusSector(String),
     /// Matrix returns the raw context of that sector

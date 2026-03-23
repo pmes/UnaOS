@@ -551,9 +551,20 @@ pub async fn ignite(synapse: Synapse, absolute_workspace_root: std::sync::Arc<Pa
 
                 // Hardcode ScanDepth::Interface for now as per The Architect's instruction.
                 if let Ok(compressed_payload) = MatrixScanner::map_topology(&absolute_targets, &absolute_workspace_root, ScanDepth::Interface) {
-                    // J21 PATHFINDER: Fire the True DAG directly to `vein` via `IngestTopology`.
-                    // This raw data structure fuels the instant UI payload mutation.
-                    let _ = synapse.fire_async(SMessage::Matrix(MatrixEvent::IngestTopology { payload: compressed_payload })).await;
+                    let is_single_file = absolute_targets.len() == 1 && absolute_targets[0].is_file();
+
+                    if is_single_file {
+                        let relative_path = absolute_targets[0].strip_prefix(&*absolute_workspace_root).unwrap_or(&absolute_targets[0]).to_path_buf();
+                        let target_id = relative_path.to_string_lossy().into_owned();
+                        let _ = synapse.fire_async(SMessage::Matrix(MatrixEvent::GraftTopology {
+                            target_id,
+                            payload: compressed_payload
+                        })).await;
+                    } else {
+                        // J21 PATHFINDER: Fire the True DAG directly to `vein` via `IngestTopology`.
+                        // This raw data structure fuels the instant UI payload mutation.
+                        let _ = synapse.fire_async(SMessage::Matrix(MatrixEvent::IngestTopology { payload: compressed_payload })).await;
+                    }
                 }
             }
             Ok(_) => {}
