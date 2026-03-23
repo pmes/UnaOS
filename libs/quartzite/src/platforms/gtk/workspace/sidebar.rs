@@ -399,16 +399,103 @@ pub fn build(window: &NativeWindow, tx_event: Sender<Event>, _workspace_tetra: &
     matrix_view.add_css_class("shard-list");
     matrix_view.append_column(&ColumnViewColumn::new(None, Some(matrix_factory)));
 
+    let nav_history_back = std::rc::Rc::new(std::cell::RefCell::new(Vec::<String>::new()));
+    let nav_history_forward = std::rc::Rc::new(std::cell::RefCell::new(Vec::<String>::new()));
+    let current_matrix_path = std::rc::Rc::new(std::cell::RefCell::new(String::new()));
+
     let tx_matrix_nav = tx_event.clone();
+    let nav_back_clone = nav_history_back.clone();
+    let nav_forward_clone = nav_history_forward.clone();
+    let current_path_clone = current_matrix_path.clone();
+
     matrix_view.connect_activate(move |view, pos| {
         let model = view.model().unwrap().downcast::<SingleSelection>().unwrap();
         if let Some(item) = model.item(pos) {
             let obj = item.downcast::<crate::widgets::model::MatrixNodeObject>().unwrap();
+            let new_id = obj.id();
+
+            // Only push to history if the path actually changed
+            let current = current_path_clone.borrow().clone();
+            if current != new_id && !current.is_empty() {
+                nav_back_clone.borrow_mut().push(current);
+                nav_forward_clone.borrow_mut().clear();
+            }
+            *current_path_clone.borrow_mut() = new_id.clone();
+
             // Checkpoint Delta: The Interactive Trigger
             // Trigger semantic extraction for the selected matrix node.
-            let _ = tx_matrix_nav.send_blocking(Event::FocusMatrixSector(obj.id()));
+            let _ = tx_matrix_nav.send_blocking(Event::FocusMatrixSector(new_id));
         }
     });
+
+    let nav_box = Box::new(Orientation::Horizontal, 5);
+    nav_box.set_margin_start(5);
+    nav_box.set_margin_end(5);
+    nav_box.set_margin_top(5);
+    nav_box.set_margin_bottom(5);
+
+    let btn_back = Button::from_icon_name("go-previous-symbolic");
+    let btn_up = Button::from_icon_name("go-up-symbolic");
+    let btn_forward = Button::from_icon_name("go-next-symbolic");
+
+    btn_back.add_css_class("flat");
+    btn_up.add_css_class("flat");
+    btn_forward.add_css_class("flat");
+
+    let tx_back = tx_event.clone();
+    let back_b = nav_history_back.clone();
+    let back_f = nav_history_forward.clone();
+    let back_c = current_matrix_path.clone();
+    btn_back.connect_clicked(move |_| {
+        if let Some(prev) = back_b.borrow_mut().pop() {
+            let current = back_c.borrow().clone();
+            if !current.is_empty() {
+                back_f.borrow_mut().push(current);
+            }
+            *back_c.borrow_mut() = prev.clone();
+            let _ = tx_back.send_blocking(Event::FocusMatrixSector(prev));
+        }
+    });
+
+    let tx_fwd = tx_event.clone();
+    let fwd_b = nav_history_back.clone();
+    let fwd_f = nav_history_forward.clone();
+    let fwd_c = current_matrix_path.clone();
+    btn_forward.connect_clicked(move |_| {
+        if let Some(next) = fwd_f.borrow_mut().pop() {
+            let current = fwd_c.borrow().clone();
+            if !current.is_empty() {
+                fwd_b.borrow_mut().push(current);
+            }
+            *fwd_c.borrow_mut() = next.clone();
+            let _ = tx_fwd.send_blocking(Event::FocusMatrixSector(next));
+        }
+    });
+
+    let tx_up = tx_event.clone();
+    let up_b = nav_history_back.clone();
+    let up_f = nav_history_forward.clone();
+    let up_c = current_matrix_path.clone();
+    btn_up.connect_clicked(move |_| {
+        let current = up_c.borrow().clone();
+        if !current.is_empty() && current.contains('/') {
+            // Split by '/' and remove the last segment to get the parent directory
+            let mut parts: Vec<&str> = current.split('/').collect();
+            parts.pop();
+            let parent = parts.join("/");
+
+            up_b.borrow_mut().push(current);
+            up_f.borrow_mut().clear();
+            *up_c.borrow_mut() = parent.clone();
+            let _ = tx_up.send_blocking(Event::FocusMatrixSector(parent));
+        }
+    });
+
+    nav_box.append(&btn_back);
+    nav_box.append(&btn_up);
+    nav_box.append(&btn_forward);
+
+    telehud_box.append(&nav_box);
 
     let matrix_scroll = ScrolledWindow::builder()
         .hscrollbar_policy(PolicyType::Never)

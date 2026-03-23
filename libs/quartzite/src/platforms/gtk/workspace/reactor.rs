@@ -236,18 +236,14 @@ pub fn spawn_listener(pointers: ReactorPointers, rx_gui: Receiver<GuiUpdate>) {
                     // We inject the extracted dictionary paths into the Matrix ListStore.
                     pointers.matrix_store.remove_all();
                     for path in paths {
-                        // Create a MatrixNodeObject with depth 0 since this is a flat dictionary list.
-                        // Extract just the filename to display, but keep the full path as the ID.
-                        let label = std::path::Path::new(&path)
-                            .file_name()
-                            .unwrap_or_default()
-                            .to_string_lossy()
-                            .into_owned();
+                        // Create a MatrixNodeObject with calculated depth.
+                        let depth = path.matches('/').count() as u32;
 
-                        // Prevent visual indent underflow panics, although depth is 0 here.
-                        // The rule: Prevent usize underflow panics using saturating_sub or guards.
-                        // Here depth is hardcoded to 0 for a flat list, so we're safe.
-                        let obj = crate::widgets::model::MatrixNodeObject::new(&path, &label, 0);
+                        // Extract just the filename to display, but keep the full path as the ID.
+                        let label = path.split('/').last().unwrap_or(&path).to_string();
+
+                        // Prevent visual indent underflow panics using saturating_sub or guards.
+                        let obj = crate::widgets::model::MatrixNodeObject::new(&path, &label, depth);
                         pointers.matrix_store.append(&obj);
                     }
                 }

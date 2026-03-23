@@ -119,7 +119,8 @@ pub fn spawn_translator(
                             if payload.contains('$') {
                                 let parts: Vec<&str> = payload.splitn(2, '$').collect();
                                 if let Some(dict_str) = parts.first() {
-                                    let paths: Vec<String> = dict_str.split(',').map(|s| s.to_string()).collect();
+                                    let mut paths: Vec<String> = dict_str.split(',').map(|s| s.to_string()).collect();
+                                    paths.sort_unstable();
                                     let _ = tx_gui.send(GuiUpdate::IngestMatrixTopology(paths)).await;
                                 }
                             }
