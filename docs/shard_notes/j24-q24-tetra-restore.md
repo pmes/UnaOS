@@ -1,0 +1,11 @@
+## 2023-10-25 - [Restore WorkspaceTetra]
+**Anomaly:** GTK/Qt builders were tightly coupled to `bandy::state::WorkspaceState`, which contains pure state that cannot easily cross boundaries without lifetime tangles, and was mixing logic state directly into physical UI rendering properties.
+**Resolution:** Re-established `WorkspaceTetra` as the pure pure-Rust UI layout blueprint in `libs/quartzite/src/tetra.rs`. It generates a set of primitive enums and structs that describe the UI frame independently of the data payload. Builders now instantiate `WorkspaceTetra` from the dynamic logic state (`WorkspaceState`) and pass the immutable layout constraints (like split ratios and scroll targets) to the presentation elements, while reserving `WorkspaceState` for the mutable content. Qt bindings expose the static elements safely as properties.
+
+## 2023-10-25 - [Eradicate Qt Blank Initial Render]
+**Anomaly:** The `MatrixModel` in the Qt Embassy failed to display data on the initial boot because the `OnceLock` (`WORKSPACE_STATE`) was not populated before GUI engine initialization, causing the model to instantiate as empty. The QML component attempted to resolve this dynamically via an asynchronous `uiReady()` pulse, introducing an unnecessary race condition.
+**Resolution:** Explicitly invoked `WORKSPACE_STATE.set(workspace_state)` synchronously in `apps/lumen/src/main.rs` before `Backend::new().run()` is called. Eradicated the asynchronous `uiReady()` pulse entirely from `NexusPanel.qml`. `route_matrix_topology` now strictly handles purely reactive runtime updates, while the initial structural read is flawlessly deterministic.
+
+## 2023-10-25 - [Eradicate Qt MatrixModel Dual Instantiation]
+**Anomaly:** The `MatrixModel` was being instantiated twice: once in C++ via `rootContext()->setContextProperty` and once via QML explicitly. This violated the Zero-Copy and Single Source of Truth architecture and caused threading lock contention.
+**Resolution:** Removed the `_matrixModel` explicit instantiation and C++ Context Property mapping from `main_window.cpp` entirely. Relied solely on `qmlRegisterType` to expose the CXX-Qt component. Placed explicit instantiation of `MatrixModel` strictly inside QML scope (`NexusPanel.qml`), allowing QML to fully own the lifecycle and execute thread registration deterministically on boot via `Component.onCompleted`.

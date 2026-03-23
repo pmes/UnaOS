@@ -17,6 +17,7 @@
 import QtQuick 2.15
 import QtQuick.Controls 2.15
 import QtQuick.Layouts 1.15
+import com.unaos.lumen 1.0
 
 Rectangle {
     id: root
@@ -121,9 +122,10 @@ Rectangle {
                 Layout.fillWidth: true
                 Layout.fillHeight: true
 
-                Component.onCompleted: {
-                    if (root.backend) {
-                        root.backend.uiReady()
+                MatrixModel {
+                    id: matrixModel
+                    Component.onCompleted: {
+                        matrixModel.registerModelThread()
                     }
                 }
 
@@ -136,7 +138,7 @@ Rectangle {
                         id: matrixListView
                         Layout.fillWidth: true
                         Layout.fillHeight: true
-                        model: _matrixModel
+                        model: matrixModel
                         clip: true
 
                         delegate: Rectangle {
@@ -155,7 +157,7 @@ Rectangle {
                             MouseArea {
                                 anchors.fill: parent
                                 onClicked: {
-                                    _matrixModel.toggleNode(idRole)
+                                    matrixModel.toggleNode(idRole)
                                 }
                             }
                         }

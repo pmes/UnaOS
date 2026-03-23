@@ -36,9 +36,9 @@ LumenMainWindow::LumenMainWindow(float split_ratio, int input_anchor, int scroll
     // Manually register QML types to bypass fragile static QRC plugin loading
     qmlRegisterType<LumenWindow>("com.unaos.lumen", 1, 0, "LumenWindow");
     qmlRegisterType<VeinBridge>("com.unaos.lumen", 1, 0, "VeinBridge");
+    qmlRegisterType<MatrixModel>("com.unaos.lumen", 1, 0, "MatrixModel");
     qmlRegisterUncreatableType<HistoryModel>("com.unaos.lumen", 1, 0, "HistoryModel", "Rust owned");
     qmlRegisterUncreatableType<NetworkLogModel>("com.unaos.lumen", 1, 0, "NetworkLogModel", "Rust owned");
-    qmlRegisterUncreatableType<MatrixModel>("com.unaos.lumen", 1, 0, "MatrixModel", "Rust owned");
     qmlRegisterUncreatableType<PreFlightPayloadQml>("com.unaos.lumen", 1, 0, "PreFlightPayloadQml", "Rust owned");
 
 
@@ -59,14 +59,11 @@ LumenMainWindow::LumenMainWindow(float split_ratio, int input_anchor, int scroll
     historyModel->registerModelThread();
     NetworkLogModel* networkLogModel = new NetworkLogModel(this);
     networkLogModel->registerModelThread();
-    MatrixModel* matrixModel = new MatrixModel(this);
-    matrixModel->registerModelThread();
     PreFlightPayloadQml* preflightPayload = new PreFlightPayloadQml(this);
     preflightPayload->registerThread();
 
     m_quickWidget->engine()->rootContext()->setContextProperty("_historyModel", historyModel);
     m_quickWidget->engine()->rootContext()->setContextProperty("_networkLogModel", networkLogModel);
-    m_quickWidget->engine()->rootContext()->setContextProperty("_matrixModel", matrixModel);
     m_quickWidget->engine()->rootContext()->setContextProperty("_preflightPayload", preflightPayload);
     m_quickWidget->engine()->rootContext()->setContextProperty("_splitRatio", split_ratio);
     m_quickWidget->engine()->rootContext()->setContextProperty("_tetraInputAnchor", input_anchor);
