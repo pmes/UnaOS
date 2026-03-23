@@ -404,7 +404,9 @@ pub fn build(window: &NativeWindow, tx_event: Sender<Event>, _workspace_tetra: &
         let model = view.model().unwrap().downcast::<SingleSelection>().unwrap();
         if let Some(item) = model.item(pos) {
             let obj = item.downcast::<crate::widgets::model::MatrixNodeObject>().unwrap();
-            let _ = tx_matrix_nav.send_blocking(Event::ToggleMatrixNode(obj.id()));
+            // Checkpoint Delta: The Interactive Trigger
+            // Trigger semantic extraction for the selected matrix node.
+            let _ = tx_matrix_nav.send_blocking(Event::FocusMatrixSector(obj.id()));
         }
     });
 

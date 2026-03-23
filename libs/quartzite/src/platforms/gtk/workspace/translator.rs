@@ -113,6 +113,17 @@ pub fn spawn_translator(
                         SMessage::Matrix(bandy::MatrixEvent::TopologyMutated(topology)) => {
                             let _ = tx_gui.send(GuiUpdate::RefreshMatrix(topology)).await;
                         }
+                        SMessage::Matrix(bandy::MatrixEvent::IngestTopology { payload }) => {
+                            // Checkpoint Beta: UI State Handshake
+                            // We only need the dictionary (file paths) for the visual list.
+                            if payload.contains('$') {
+                                let parts: Vec<&str> = payload.splitn(2, '$').collect();
+                                if let Some(dict_str) = parts.first() {
+                                    let paths: Vec<String> = dict_str.split(',').map(|s| s.to_string()).collect();
+                                    let _ = tx_gui.send(GuiUpdate::IngestMatrixTopology(paths)).await;
+                                }
+                            }
+                        }
                         _ => {}
                     }
                 }
