@@ -398,17 +398,6 @@ pub fn build(window: &NativeWindow, tx_event: Sender<Event>, _workspace_tetra: &
         };
         let display_text = format!("{}{}", prefix, obj.label());
         label.set_label(&display_text);
-
-        // Manually force GTK to paint the selection background when the state changes
-        item.connect_selected_notify(|list_item| {
-            if let Some(child_widget) = list_item.child() {
-                if list_item.is_selected() {
-                    child_widget.set_state_flags(gtk4::StateFlags::SELECTED, false);
-                } else {
-                    child_widget.unset_state_flags(gtk4::StateFlags::SELECTED);
-                }
-            }
-        });
     });
 
     let matrix_view = ColumnView::new(Some(matrix_selection.clone()));
