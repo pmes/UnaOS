@@ -52,6 +52,7 @@ pub fn build(
         sidebar_pointers.active_target.clone(),
         sidebar_widgets.composer_btn.clone(),
         stream_tetra,
+        sidebar_pointers.matrix_selection.clone(),
     );
 
     // Reactor bindings
