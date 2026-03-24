@@ -343,8 +343,7 @@ fn setup_input_area(tx_event: &Sender<Event>, window: &NativeWindow, active_targ
                     }
                 }
 
-                println!("CONTEXT CART READY: {:?}", selected_ids);
-
+                let cart_payload = selected_ids.clone();
                 let wipe_path = draft_wipe_path1.clone();
                 // Offload disk I/O to prevent UI stutter when clearing the draft
                 tokio::task::spawn_blocking(move || {
@@ -354,6 +353,12 @@ fn setup_input_area(tx_event: &Sender<Event>, window: &NativeWindow, active_targ
                 let tx_async = tx_clone_key.clone();
                 let target_val = target_key.borrow().clone();
                 glib::MainContext::default().spawn_local(async move {
+                    // 1. Dispatch the topological constraints FIRST
+                    if !cart_payload.is_empty() {
+                        let _ = tx_async.send(crate::Event::UpdateContextCart(cart_payload)).await;
+                    }
+
+                    // 2. Dispatch the standard input
                     let _ = tx_async
                         .send(Event::Input {
                             target: target_val,
@@ -391,8 +396,7 @@ fn setup_input_area(tx_event: &Sender<Event>, window: &NativeWindow, active_targ
                 }
             }
 
-            println!("CONTEXT CART READY: {:?}", selected_ids);
-
+            let cart_payload = selected_ids.clone();
             let wipe_path = draft_wipe_path2.clone();
             // Offload disk I/O to prevent UI stutter when clearing the draft
             tokio::task::spawn_blocking(move || {
@@ -402,6 +406,12 @@ fn setup_input_area(tx_event: &Sender<Event>, window: &NativeWindow, active_targ
             let tx_async = tx_clone_send.clone();
             let target_val = target_send.borrow().clone();
             glib::MainContext::default().spawn_local(async move {
+                // 1. Dispatch the topological constraints FIRST
+                if !cart_payload.is_empty() {
+                    let _ = tx_async.send(crate::Event::UpdateContextCart(cart_payload)).await;
+                }
+
+                // 2. Dispatch the standard input
                 let _ = tx_async
                     .send(Event::Input {
                         target: target_val,

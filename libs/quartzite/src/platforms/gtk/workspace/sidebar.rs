@@ -401,7 +401,7 @@ pub fn build(window: &NativeWindow, tx_event: Sender<Event>, _workspace_tetra: &
     });
 
     let matrix_view = ColumnView::new(Some(matrix_selection.clone()));
-    matrix_view.add_css_class("shard-list");
+    matrix_view.set_enable_rubberband(true);
     matrix_view.append_column(&ColumnViewColumn::new(None, Some(matrix_factory)));
 
     let nav_history_back = std::rc::Rc::new(std::cell::RefCell::new(Vec::<String>::new()));

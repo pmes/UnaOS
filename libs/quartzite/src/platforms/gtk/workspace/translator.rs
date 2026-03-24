@@ -18,18 +18,13 @@ pub fn spawn_translator(
         let mut last_history_seq = 0;
         let mut last_console_seq = 0;
 
-        println!(">>> [J13 TRACE] TRANSLATOR: Thread spawned. Waiting for Synapse messages...");
-
         loop {
             match rx_synapse.recv().await {
                 Ok(msg) => {
-                    println!(">>> [J13 TRACE] TRANSLATOR: Received a Synapse message.");
                     match msg {
                 SMessage::StateInvalidated => {
                     let (new_history_seq, new_console_seq) = {
-                        println!(">>> [J13 TRACE] TRANSLATOR: Processing StateInvalidated. Attempting to acquire read lock...");
                         let st = app_state.read().unwrap();
-                        println!(">>> [J13 TRACE] TRANSLATOR: Read lock acquired. history_seq: {}, console_seq: {}", st.history_seq, st.console_seq);
                         (st.history_seq, st.console_seq)
                     };
 
@@ -129,11 +124,9 @@ pub fn spawn_translator(
                     }
                 }
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
-                    println!(">>> [J13 TRACE] TRANSLATOR: Synapse receiver lagged, dropping missed events.");
                     continue;
                 }
                 Err(tokio::sync::broadcast::error::RecvError::Closed) => {
-                    println!(">>> [J13 TRACE] TRANSLATOR: Synapse channel closed, terminating loop.");
                     break;
                 }
             }
