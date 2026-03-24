@@ -74,10 +74,8 @@ pub fn spawn_translator(
 
                     if !history_delta.is_empty() {
                         if last_history_seq == 0 {
-                            println!(">>> [J16 TRACE] TRANSLATOR: Sending HistorySeed with {} items", history_delta.len());
                             let _ = tx_gui.send(GuiUpdate::HistorySeed(history_delta)).await;
                         } else {
-                            println!(">>> [J16 TRACE] TRANSLATOR: Sending HistoryAppend with {} items", history_delta.len());
                             let _ = tx_gui.send(GuiUpdate::HistoryAppend(history_delta)).await;
                         }
                         last_history_seq = new_history_seq;

@@ -17,7 +17,7 @@ pub enum Event {
     FileSelected(PathBuf),
     ToggleSidebar,
     LoadHistory { offset: usize },
-    UpdateContextCart(Vec<String>),
+    UpdateMatrixSelection(Vec<String>),
     MatrixFileClick(PathBuf),
     AuleIgnite,
     Timer,

@@ -312,11 +312,8 @@ fn setup_input_area(tx_event: &Sender<Event>, window: &NativeWindow, active_targ
 
     let key_controller = EventControllerKey::new();
     key_controller.set_propagation_phase(PropagationPhase::Capture);
-    let tx_clone_key = tx_event.clone();
     let buffer_key = buffer.clone();
-    let target_key = active_target.clone();
-    let draft_wipe_path1 = draft_path.clone();
-    let matrix_selection_key_clone = matrix_selection.clone();
+    let send_btn_clone = send_btn.clone();
     key_controller.connect_key_pressed(move |_ctrl, key, _keycode, state| {
         if key != Key::Return {
             return glib::Propagation::Proceed;
@@ -326,48 +323,7 @@ fn setup_input_area(tx_event: &Sender<Event>, window: &NativeWindow, active_targ
         }
         let is_ctrl = state.contains(ModifierType::CONTROL_MASK);
         if is_ctrl || buffer_key.line_count() <= 1 {
-            let (start, end) = buffer_key.bounds();
-            let text = buffer_key.text(&start, &end, false).to_string();
-            if !text.trim().is_empty() {
-                let bitset = matrix_selection_key_clone.selection();
-                let mut selected_ids = Vec::new();
-
-                let size = bitset.size() as u32;
-                for i in 0..size {
-                    let pos = bitset.nth(i);
-
-                    if let Some(obj) = matrix_selection_key_clone.item(pos) {
-                        if let Ok(node_obj) = obj.downcast::<crate::widgets::model::MatrixNodeObject>() {
-                            selected_ids.push(node_obj.id());
-                        }
-                    }
-                }
-
-                let cart_payload = selected_ids.clone();
-                let wipe_path = draft_wipe_path1.clone();
-                // Offload disk I/O to prevent UI stutter when clearing the draft
-                tokio::task::spawn_blocking(move || {
-                    let _ = std::fs::remove_file(&wipe_path);
-                });
-
-                let tx_async = tx_clone_key.clone();
-                let target_val = target_key.borrow().clone();
-                glib::MainContext::default().spawn_local(async move {
-                    // 1. Dispatch the topological constraints FIRST
-                    if !cart_payload.is_empty() {
-                        let _ = tx_async.send(crate::Event::UpdateContextCart(cart_payload)).await;
-                    }
-
-                    // 2. Dispatch the standard input
-                    let _ = tx_async
-                        .send(Event::Input {
-                            target: target_val,
-                            text,
-                        })
-                        .await;
-                });
-                buffer_key.set_text("");
-            }
+            send_btn_clone.emit_clicked();
             return glib::Propagation::Stop;
         }
         glib::Propagation::Proceed
@@ -408,7 +364,7 @@ fn setup_input_area(tx_event: &Sender<Event>, window: &NativeWindow, active_targ
             glib::MainContext::default().spawn_local(async move {
                 // 1. Dispatch the topological constraints FIRST
                 if !cart_payload.is_empty() {
-                    let _ = tx_async.send(crate::Event::UpdateContextCart(cart_payload)).await;
+                    let _ = tx_async.send(crate::Event::UpdateMatrixSelection(cart_payload)).await;
                 }
 
                 // 2. Dispatch the standard input
