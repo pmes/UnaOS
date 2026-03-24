@@ -203,7 +203,7 @@ fn setup_preflight_stack(tx_event: &Sender<Event>) -> PreflightStackData {
     }
 }
 
-fn setup_input_area(tx_event: &Sender<Event>, window: &NativeWindow, active_target: &Rc<RefCell<String>>) -> InputAreaData {
+fn setup_input_area(tx_event: &Sender<Event>, window: &NativeWindow, active_target: &Rc<RefCell<String>>, matrix_selection: gtk4::MultiSelection) -> InputAreaData {
     let input_container = Box::new(Orientation::Horizontal, 8);
     input_container.set_valign(Align::End);
     input_container.set_margin_start(16);
@@ -316,6 +316,7 @@ fn setup_input_area(tx_event: &Sender<Event>, window: &NativeWindow, active_targ
     let buffer_key = buffer.clone();
     let target_key = active_target.clone();
     let draft_wipe_path1 = draft_path.clone();
+    let matrix_selection_key_clone = matrix_selection.clone();
     key_controller.connect_key_pressed(move |_ctrl, key, _keycode, state| {
         if key != Key::Return {
             return glib::Propagation::Proceed;
@@ -328,6 +329,22 @@ fn setup_input_area(tx_event: &Sender<Event>, window: &NativeWindow, active_targ
             let (start, end) = buffer_key.bounds();
             let text = buffer_key.text(&start, &end, false).to_string();
             if !text.trim().is_empty() {
+                let bitset = matrix_selection_key_clone.selection();
+                let mut selected_ids = Vec::new();
+
+                let size = bitset.size() as u32;
+                for i in 0..size {
+                    let pos = bitset.nth(i);
+
+                    if let Some(obj) = matrix_selection_key_clone.item(pos) {
+                        if let Ok(node_obj) = obj.downcast::<crate::widgets::model::MatrixNodeObject>() {
+                            selected_ids.push(node_obj.id());
+                        }
+                    }
+                }
+
+                println!("CONTEXT CART READY: {:?}", selected_ids);
+
                 let wipe_path = draft_wipe_path1.clone();
                 // Offload disk I/O to prevent UI stutter when clearing the draft
                 tokio::task::spawn_blocking(move || {
@@ -355,10 +372,27 @@ fn setup_input_area(tx_event: &Sender<Event>, window: &NativeWindow, active_targ
     let target_send = active_target.clone();
     let buffer_send = buffer.clone();
     let draft_wipe_path2 = draft_path.clone();
+    let matrix_selection_btn_clone = matrix_selection.clone();
     send_btn.connect_clicked(move |_| {
         let (start, end) = buffer_send.bounds();
         let text = buffer_send.text(&start, &end, false).to_string();
         if !text.trim().is_empty() {
+            let bitset = matrix_selection_btn_clone.selection();
+            let mut selected_ids = Vec::new();
+
+            let size = bitset.size() as u32;
+            for i in 0..size {
+                let pos = bitset.nth(i);
+
+                if let Some(obj) = matrix_selection_btn_clone.item(pos) {
+                    if let Ok(node_obj) = obj.downcast::<crate::widgets::model::MatrixNodeObject>() {
+                        selected_ids.push(node_obj.id());
+                    }
+                }
+            }
+
+            println!("CONTEXT CART READY: {:?}", selected_ids);
+
             let wipe_path = draft_wipe_path2.clone();
             // Offload disk I/O to prevent UI stutter when clearing the draft
             tokio::task::spawn_blocking(move || {
@@ -852,6 +886,7 @@ pub fn build(
     active_target: Rc<RefCell<String>>,
     composer_btn: Button,
     tetra: &crate::tetra::StreamTetra,
+    matrix_selection: gtk4::MultiSelection,
 ) -> (CommsWidgets, CommsPointers) {
     let workspace_stack = Stack::new();
     workspace_stack.set_vexpand(true);
@@ -889,7 +924,7 @@ pub fn build(
 
     comms_page.append(&chat_overlay);
 
-    let input_area_data = setup_input_area(&tx_event, window, &active_target);
+    let input_area_data = setup_input_area(&tx_event, window, &active_target, matrix_selection);
     let input_container = input_area_data.input_container;
     let chat_input_buffer = input_area_data.chat_input_buffer;
 

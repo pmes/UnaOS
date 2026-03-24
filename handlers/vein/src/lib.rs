@@ -363,7 +363,6 @@ impl VeinHandler {
                                         });
                                     }
                                     SMessage::StorageLoadPagedResult { records, receipt_id: _ } => {
-                                        println!(">>> [J13 TRACE] BACKEND: StorageLoadPagedResult processed. Populating state with {} items.", records.len());
                                         {
                                             let mut s = state_bg.write().unwrap();
                                             s.history = records.into_iter().map(|r| HistoryItem {
@@ -393,15 +392,9 @@ impl VeinHandler {
                                             let _ = tx_to_bg_loop.send(format!("STORAGE_RESULT:{}", payload));
                                         }
                                     }
-                                    SMessage::StorageSaveResult { receipt_id: _, success, error } => {
-                                        if !success {
-                                            if let Some(err) = error {
-                                                eprintln!(":: PLEXUS :: Failed to save memory: {}", err);
-                                            }
-                                        }
+                                    SMessage::StorageSaveResult { receipt_id: _, success: _, error: _ } => {
                                     }
                                     SMessage::StateInvalidated => {
-                                        println!(">>> [J13 TRACE] VEIN THIEF CAUGHT: VeinHandler caught SMessage::StateInvalidated. No longer a thief thanks to broadcast!");
                                     }
                                     SMessage::Matrix(matrix_event) => {
                                         match matrix_event {
@@ -496,8 +489,7 @@ impl VeinHandler {
                                                 memory_type: "directive".to_string(),
                                             }).await;
                                         }
-                                        Err(e) => {
-                                            eprintln!(":: PLEXUS :: Failed to embed directive: {}", e);
+                                        Err(_e) => {
                                         }
                                     }
                                     continue;
@@ -738,10 +730,7 @@ impl VeinHandler {
 
                                 let user_embedding = match client.embed_content(&user_input_text).await {
                                     Ok(vec) => vec,
-                                    Err(e) => {
-                                        eprintln!(":: PLEXUS :: Embedding Failed: {}", e);
-                                        vec![]
-                                    }
+                                    Err(_e) => vec![]
                                 };
 
                                 let parsed_parts_for_save = parse_multimodal_text(&user_input_text);
@@ -833,23 +822,6 @@ impl AppHandler for VeinHandler {
         match event {
             Event::Input { target: _, text } => {
                 let trimmed = text.trim();
-                let absolute_workspace_root = {
-                    let s = self.app_state.read().unwrap();
-                    s.absolute_workspace_root.clone()
-                };
-
-                let path = std::path::Path::new(trimmed);
-                let absolute_path = absolute_workspace_root.join(path);
-
-                // J21 PATHFINDER: Mathematically verify existence via absolute path,
-                // but pass the relative path into Matrix for topology constraints.
-                if absolute_path.exists() {
-                    let _ = self.synapse.fire(SMessage::Matrix(bandy::MatrixEvent::FocusSector(trimmed.to_string())));
-                }
-
-                let _ = self.synapse.fire(SMessage::ContextTelemetry {
-                    skeletons: vec![],
-                });
 
                 if trimmed == "/wolf" {
                     {
@@ -926,7 +898,6 @@ impl AppHandler for VeinHandler {
                 let _ = self.tx.send(format!("DISPATCH_PAYLOAD:{}", json_payload));
             }
             Event::LoadHistory { offset } => {
-                println!(">>> [J13 TRACE] BACKEND: Received Event::LoadHistory {{ offset: {} }}. Attempting to fetch...", offset);
                 let _ = self.tx.send(format!("LOAD_HISTORY:{}", offset));
             }
             _ => {}

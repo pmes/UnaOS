@@ -35,6 +35,7 @@ pub struct SidebarPointers {
     pub token_label: Label,
     pub context_view: crate::widgets::telemetry::ContextView,
     pub matrix_store: gio::ListStore,
+    pub matrix_selection: gtk4::MultiSelection,
 }
 
 // Helper to avoid circular dependencies in spline
@@ -363,11 +364,15 @@ pub fn build(window: &NativeWindow, tx_event: Sender<Event>, _workspace_tetra: &
         }
     }
 
-    let matrix_selection = SingleSelection::new(Some(matrix_store.clone()));
+    let matrix_selection = gtk4::MultiSelection::new(Some(matrix_store.clone()));
     let matrix_factory = SignalListItemFactory::new();
 
     matrix_factory.connect_setup(move |_factory, item| {
         let item = item.downcast_ref::<ListItem>().unwrap();
+
+        // Enable visual selection highlight (Fixes GTK Ghost Outline)
+        item.set_selectable(true);
+
         let row = Box::new(Orientation::Horizontal, 10);
         row.set_margin_start(10);
         row.set_margin_end(10);
@@ -395,7 +400,7 @@ pub fn build(window: &NativeWindow, tx_event: Sender<Event>, _workspace_tetra: &
         label.set_label(&display_text);
     });
 
-    let matrix_view = ColumnView::new(Some(matrix_selection));
+    let matrix_view = ColumnView::new(Some(matrix_selection.clone()));
     matrix_view.add_css_class("shard-list");
     matrix_view.append_column(&ColumnViewColumn::new(None, Some(matrix_factory)));
 
@@ -447,7 +452,7 @@ pub fn build(window: &NativeWindow, tx_event: Sender<Event>, _workspace_tetra: &
     let update_btns_activate = update_nav_btns.clone();
 
     matrix_view.connect_activate(move |view, pos| {
-        let model = view.model().unwrap().downcast::<SingleSelection>().unwrap();
+        let model = view.model().unwrap().downcast::<gtk4::MultiSelection>().unwrap();
         if let Some(item) = model.item(pos) {
             let obj = item.downcast::<crate::widgets::model::MatrixNodeObject>().unwrap();
             let new_id = obj.id();
@@ -570,6 +575,7 @@ pub fn build(window: &NativeWindow, tx_event: Sender<Event>, _workspace_tetra: &
         token_label,
         context_view,
         matrix_store,
+        matrix_selection,
     };
 
     (widgets, pointers)
