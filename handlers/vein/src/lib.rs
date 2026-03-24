@@ -846,10 +846,29 @@ impl AppHandler for VeinHandler {
                 let _ = self.tx.send(format!("LOAD_HISTORY:{}", offset));
             }
             Event::UpdateMatrixSelection(node_ids) => {
+                let mut synthesized_context = String::new();
+                let root = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+
+                for id in &node_ids {
+                    let path = root.join(id);
+                    synthesized_context.push_str(&format!("// === NODE: {} ===\n", id));
+
+                    if path.is_file() {
+                        if let Ok(content) = std::fs::read_to_string(&path) {
+                            synthesized_context.push_str(&content);
+                        } else {
+                            synthesized_context.push_str("// [ERROR: UNREADABLE]");
+                        }
+                    } else {
+                        synthesized_context.push_str("// [VIRTUAL SYMBOL OR DIRECTORY]");
+                    }
+                    synthesized_context.push_str("\n\n");
+                }
+
                 let topology_str = if node_ids.is_empty() {
                     String::new()
                 } else {
-                    format!("--- EXPLICIT MATRIX SELECTIONS ---\n{}", node_ids.join("\n"))
+                    format!("--- CURRENT SPATIAL TOPOLOGY (DAG) ---\n{}", synthesized_context)
                 };
 
                 {
