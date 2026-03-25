@@ -355,7 +355,7 @@ impl VeinHandler {
                                                     // instantly mutate it so the UI updates without requiring a new prompt.
                                                     if let Some(ref mut payload) = s.review_payload {
                                                         if !payload.system.contains("--- SEMANTIC CODE TOPOLOGY") {
-                                                            payload.system.push_str("\n\n");
+                                                            payload.system.push_str("\n\n--- SEMANTIC CODE TOPOLOGY ---\n");
                                                             payload.system.push_str(&semantic_dag);
                                                         }
                                                     }
@@ -642,7 +642,7 @@ impl VeinHandler {
                                         };
 
                                         if !matrix_topology.is_empty() {
-                                            system_builder.push_str("\n\n");
+                                            system_builder.push_str("\n\n--- SEMANTIC CODE TOPOLOGY ---\n");
                                             system_builder.push_str(&matrix_topology);
                                         }
 
