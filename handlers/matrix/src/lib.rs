@@ -590,9 +590,17 @@ pub async fn ignite(synapse: Synapse, absolute_workspace_root: std::sync::Arc<Pa
                     if is_single_file {
                         let relative_path = absolute_targets[0].strip_prefix(&*absolute_workspace_root).unwrap_or(&absolute_targets[0]).to_path_buf();
                         let target_id = relative_path.to_string_lossy().into_owned();
+
+                        // Graft for UI structure
                         let _ = synapse.fire_async(SMessage::Matrix(MatrixEvent::GraftTopology {
-                            target_id,
+                            target_id: target_id.clone(),
                             payload: compressed_payload
+                        })).await;
+
+                        // Focus for LLM Context (Fixes missing DAG in single-file pre-flight)
+                        let _ = synapse.fire_async(SMessage::Matrix(MatrixEvent::SectorFocused {
+                            target: target_id,
+                            context: semantic_dag
                         })).await;
                     } else {
                         // J21 PATHFINDER: Fire the True DAG directly to `vein` via `IngestTopology`.
