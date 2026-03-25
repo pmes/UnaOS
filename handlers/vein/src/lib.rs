@@ -343,14 +343,16 @@ impl VeinHandler {
                                     }
                                     SMessage::Matrix(matrix_event) => {
                                         match matrix_event {
-                                            bandy::MatrixEvent::IngestTopology { ui_dag, semantic_dag } => {
+                                            bandy::MatrixEvent::IngestTopology { ui_dag: _, semantic_dag } => {
                                                 {
                                                     let mut s = state_bg.write().unwrap();
-                                                    s.matrix_topology = ui_dag;
 
-                                                    // J21 PATHFINDER: Instant Payload Mutation for full DAG
-                                                    // Resolving asynchronous UI blindness: Only inject the DAG if it doesn't already exist
-                                                    // to prevent exponential string duplication during rapid Matrix pings.
+                                                    // J24.13 PATHFINDER: The state variable used for LLM context construction
+                                                    // must hold the semantic string, not the compressed UI string.
+                                                    s.matrix_topology = semantic_dag.clone();
+
+                                                    // If a payload is actively pending review (the user has already typed a prompt),
+                                                    // instantly mutate it so the UI updates without requiring a new prompt.
                                                     if let Some(ref mut payload) = s.review_payload {
                                                         if !payload.system.contains("--- SEMANTIC CODE TOPOLOGY") {
                                                             payload.system.push_str("\n\n");
@@ -358,7 +360,7 @@ impl VeinHandler {
                                                         }
                                                     }
                                                 }
-                                                // IMMEDIATELY fire StateInvalidated so the UI repaints with the DAG
+                                                // Ping the UI to repaint
                                                 let _ = synapse_loop.fire_async(SMessage::StateInvalidated).await;
                                             }
                                             bandy::MatrixEvent::SectorFocused { target, context } => {
