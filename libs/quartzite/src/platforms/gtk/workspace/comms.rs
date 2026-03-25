@@ -550,12 +550,11 @@ fn setup_chat_view(tx_event: &Sender<Event>, tetra: &crate::tetra::StreamTetra) 
         left_expand_btn: Button,
         meta_label: Label,
         right_expand_btn: Button,
-        chat_content_view: SourceView,
+        msg_label: Label,
         expander: Expander,
     }
 
     let console_factory = SignalListItemFactory::new();
-    let alignment_policy = tetra.alignment.clone();
     console_factory.connect_setup(move |_factory, item| {
         let item = item.downcast_ref::<ListItem>().unwrap();
         let root = Box::new(Orientation::Horizontal, 0);
@@ -596,19 +595,15 @@ fn setup_chat_view(tx_event: &Sender<Event>, tetra: &crate::tetra::StreamTetra) 
         bubble.append(&header_box);
 
         // --- Standard Mode (Message View) ---
-        let chat_content_buffer = sourceview5::Buffer::new(None);
-        let chat_content_view = SourceView::with_buffer(&chat_content_buffer);
-        chat_content_view.set_editable(false);
-        chat_content_view.set_wrap_mode(gtk4::WrapMode::WordChar);
-        chat_content_view.set_show_line_numbers(false);
-        chat_content_view.set_monospace(true);
-        chat_content_view.set_hexpand(true);
-        chat_content_view.set_focusable(true);
-        chat_content_view.set_cursor_visible(false);
-        chat_content_view.set_size_request(100, -1);
-        chat_content_view.add_css_class("view");
+        let msg_label = Label::builder()
+            .wrap(true)
+            .lines(5) // Default locked state
+            .selectable(true)
+            .hexpand(true)
+            .build();
+        msg_label.add_css_class("view");
 
-        bubble.append(&chat_content_view);
+        bubble.append(&msg_label);
 
         // --- Standard Mode (Expander) ---
         let expander = Expander::new(None);
@@ -641,54 +636,33 @@ fn setup_chat_view(tx_event: &Sender<Event>, tetra: &crate::tetra::StreamTetra) 
             left_expand_btn: left_expand_btn.clone(),
             meta_label,
             right_expand_btn: right_expand_btn.clone(),
-            chat_content_view: chat_content_view.clone(),
+            msg_label: msg_label.clone(),
             expander,
         };
+
+        // 3. The Toggle Logic
+        let toggle_label = msg_label.clone();
+        left_expand_btn.connect_clicked(move |_| {
+            if toggle_label.lines() == 5 {
+                toggle_label.set_lines(-1); // Expand fully
+            } else {
+                toggle_label.set_lines(5);  // Collapse back
+            }
+        });
+
+        let toggle_label_right = msg_label.clone();
+        right_expand_btn.connect_clicked(move |_| {
+            if toggle_label_right.lines() == 5 {
+                toggle_label_right.set_lines(-1); // Expand fully
+            } else {
+                toggle_label_right.set_lines(5);  // Collapse back
+            }
+        });
+
         let boxed_widgets = glib::BoxedAnyObject::new(widgets);
         unsafe {
             item.set_data("widgets", boxed_widgets);
-            item.set_data("alignment_policy", glib::BoxedAnyObject::new(alignment_policy.clone()));
         }
-
-        let gesture = GestureClick::new();
-        gesture.set_propagation_phase(PropagationPhase::Target);
-        let item_clone = item.clone();
-        let chat_content_view_clone = chat_content_view.clone();
-        let left_btn_clone = left_expand_btn.clone();
-        let right_btn_clone = right_expand_btn.clone();
-        gesture.connect_pressed(move |_, n_press, _, _| {
-            if n_press == 1 {
-                if let Some(obj) = item_clone
-                    .item()
-                    .and_downcast::<HistoryObject>()
-                {
-                    let expanded = !obj.is_expanded();
-                    obj.set_is_expanded(expanded);
-                    let content = obj.content();
-                    let line_count = content.trim_end().lines().count();
-                    if line_count > 11 && !expanded {
-                        let truncated: String = content
-                            .trim_end()
-                            .lines()
-                            .take(11)
-                            .collect::<Vec<&str>>()
-                            .join("\n");
-                        chat_content_view_clone.buffer().set_text(&truncated);
-                        left_btn_clone.set_icon_name("pan-down-symbolic");
-                        right_btn_clone.set_icon_name("pan-down-symbolic");
-                    } else {
-                        chat_content_view_clone
-                            .buffer()
-                            .set_text(content.trim_end());
-                        if line_count > 11 {
-                            left_btn_clone.set_icon_name("pan-up-symbolic");
-                            right_btn_clone.set_icon_name("pan-up-symbolic");
-                        }
-                    }
-                }
-            }
-        });
-        bubble.add_controller(gesture);
         item.set_child(Some(&root));
     });
 
@@ -701,19 +675,12 @@ fn setup_chat_view(tx_event: &Sender<Event>, tetra: &crate::tetra::StreamTetra) 
         let Some(boxed_ptr) = boxed_widgets else { return; };
         let widgets = unsafe { boxed_ptr.as_ref() }.borrow::<BubbleWidgets>();
 
-        let boxed_alignment = unsafe { item.data::<glib::BoxedAnyObject>("alignment_policy") };
-        let alignment = if let Some(boxed_align_ptr) = boxed_alignment {
-            unsafe { boxed_align_ptr.as_ref() }.borrow::<crate::tetra::StreamAlign>().clone()
-        } else {
-            crate::tetra::StreamAlign::Start
-        };
-
         widgets.bubble.remove_css_class("architect-bubble");
         widgets.bubble.remove_css_class("una-bubble");
         widgets.left_spacer.set_visible(false);
         widgets.right_spacer.set_visible(false);
 
-        widgets.chat_content_view.set_visible(false);
+        widgets.msg_label.set_visible(false);
         widgets.expander.set_visible(false);
         widgets.left_expand_btn.set_visible(false);
         widgets.right_expand_btn.set_visible(false);
@@ -726,7 +693,7 @@ fn setup_chat_view(tx_event: &Sender<Event>, tetra: &crate::tetra::StreamTetra) 
         let subject = obj.subject();
 
         if is_chat {
-            widgets.chat_content_view.set_visible(true);
+            widgets.msg_label.set_visible(true);
             widgets.meta_label.set_text(&format!("{} • {}", sender, timestamp));
             widgets.meta_label.remove_css_class("role-architect");
             widgets.meta_label.remove_css_class("role-una");
@@ -734,66 +701,43 @@ fn setup_chat_view(tx_event: &Sender<Event>, tetra: &crate::tetra::StreamTetra) 
 
             let is_expanded = obj.is_expanded();
             let line_count = content.trim_end().lines().count();
+            widgets.msg_label.set_label(&content);
 
-            // Set styling based on role
-            if sender == "Architect" {
-                widgets.meta_label.add_css_class("role-architect");
-                widgets.bubble.add_css_class("architect-bubble");
-            } else {
-                if sender == "Una-Prime" {
-                    widgets.meta_label.add_css_class("role-una");
-                } else {
-                    widgets.meta_label.add_css_class("role-system");
-                }
-                widgets.bubble.add_css_class("una-bubble");
-            }
-
-            // Invert the physical layout orientation if StreamTetra asks us to align End, but typically
-            // sender determines alignment in standard chats. However, we'll apply alignment based on
-            // the `StreamAlign` policy + the sender role to keep the DMZ in charge.
             let is_user = sender == "Architect";
 
-            // Default spacing based on standard roles if policy is start
-            let (align_right, meta_halign, meta_xalign) = match alignment {
-                crate::tetra::StreamAlign::Start => (is_user, if is_user { gtk4::Align::End } else { gtk4::Align::Start }, if is_user { 1.0 } else { 0.0 }),
-                crate::tetra::StreamAlign::End => (!is_user, if !is_user { gtk4::Align::End } else { gtk4::Align::Start }, if !is_user { 1.0 } else { 0.0 }),
-                crate::tetra::StreamAlign::Center => {
-                    widgets.bubble.set_halign(gtk4::Align::Center);
-                    (false, gtk4::Align::Center, 0.5)
-                }
-            };
-
-            if align_right {
+            if is_user {
+                widgets.bubble.set_halign(gtk4::Align::End);
+                widgets.bubble.add_css_class("bubble-user");
                 widgets.left_spacer.set_visible(true);
                 widgets.right_spacer.set_visible(false);
-            } else if !matches!(alignment, crate::tetra::StreamAlign::Center) {
+                widgets.meta_label.set_halign(gtk4::Align::End);
+                widgets.meta_label.set_xalign(1.0);
+            } else {
+                widgets.bubble.set_halign(gtk4::Align::Start);
+                widgets.bubble.add_css_class("bubble-ai");
                 widgets.left_spacer.set_visible(false);
                 widgets.right_spacer.set_visible(true);
+                widgets.meta_label.set_halign(gtk4::Align::Start);
+                widgets.meta_label.set_xalign(0.0);
             }
 
-            widgets.meta_label.set_halign(meta_halign);
-            widgets.meta_label.set_xalign(meta_xalign);
-
-            if line_count > 11 {
-                if align_right {
+            if line_count > 5 {
+                if is_user {
                     widgets.left_expand_btn.set_visible(true);
                     widgets.right_expand_btn.set_visible(false);
-                    widgets.left_expand_btn.set_icon_name(if is_expanded { "pan-up-symbolic" } else { "pan-down-symbolic" });
                 } else {
                     widgets.left_expand_btn.set_visible(false);
                     widgets.right_expand_btn.set_visible(true);
-                    widgets.right_expand_btn.set_icon_name(if is_expanded { "pan-up-symbolic" } else { "pan-down-symbolic" });
                 }
             } else {
                 widgets.left_expand_btn.set_visible(false);
                 widgets.right_expand_btn.set_visible(false);
             }
 
-            if line_count > 11 && !is_expanded {
-                let truncated: String = content.trim_end().lines().take(11).collect::<Vec<&str>>().join("\n");
-                widgets.chat_content_view.buffer().set_text(&truncated);
+            if is_expanded {
+                widgets.msg_label.set_lines(-1);
             } else {
-                widgets.chat_content_view.buffer().set_text(content.trim_end());
+                widgets.msg_label.set_lines(5);
             }
         } else {
             widgets.expander.set_visible(true);

@@ -505,12 +505,40 @@ impl VeinHandler {
                                             system_builder.push_str(&payload.engrams);
                                         }
 
+                                        // JIT MATRIX EVALUATION
+                                        let (absolute_root, selected_nodes) = {
+                                            let s = state_bg.read().unwrap();
+                                            (s.absolute_workspace_root.clone(), s.active_matrix_selection.clone())
+                                        };
+
+                                        if !selected_nodes.is_empty() {
+                                            let absolute_targets: Vec<std::path::PathBuf> = selected_nodes
+                                                .into_iter()
+                                                .map(|target| absolute_root.join(target))
+                                                .collect();
+
+                                            if let Ok((_ui_dag, semantic_dag)) = matrix::MatrixScanner::map_topology(
+                                                &absolute_targets,
+                                                &absolute_root,
+                                                matrix::ScanDepth::Interface,
+                                            ) {
+                                                system_builder.push_str("\n\n--- SEMANTIC CODE TOPOLOGY ---\n");
+                                                system_builder.push_str(&semantic_dag);
+                                            }
+                                        }
+                                        // END JIT MATRIX EVALUATION
+
                                         let mut context: Vec<Content> = Vec::new();
                                         let current_text = format!("{}\n\n[CURRENT PROMPT]:\n{}", system_builder, payload.prompt);
                                         context.push(Content {
                                             role: "user".into(),
                                             parts: parse_multimodal_text(&current_text),
                                         });
+
+                                        let _ = synapse_loop.fire_async(SMessage::NetworkState("network-transmit-receive-symbolic".to_string())).await;
+                                        if let Ok(json_string) = serde_json::to_string_pretty(&context) {
+                                            let _ = synapse_loop.fire_async(SMessage::NetworkLog(json_string)).await;
+                                        }
 
                                         match client.generate_content(&context).await {
                                             Ok((response, metadata)) => {
@@ -872,9 +900,9 @@ impl AppHandler for VeinHandler {
                 let _ = self.tx.send(format!("LOAD_HISTORY:{}", offset));
             }
             Event::UpdateMatrixSelection(node_ids) => {
-                let relative_targets_str = node_ids.join(" ");
-                let _ = self.publish("matrix", SMessage::Matrix(bandy::MatrixEvent::FocusSector(relative_targets_str)));
-                emit_ping = true;
+                let mut s = self.app_state.write().unwrap();
+                s.active_matrix_selection = node_ids;
+                // Do NOT fire the Matrix scanner here. Do NOT set emit_ping = true.
             }
             _ => {}
         }
