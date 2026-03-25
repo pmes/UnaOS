@@ -9,6 +9,7 @@
 pub mod context;
 pub mod cortex;
 pub mod gravity;
+pub mod skeleton;
 pub mod storage;
 pub mod synapse;
 
@@ -346,40 +347,51 @@ impl VeinHandler {
                                             bandy::MatrixEvent::IngestTopology { ui_dag: _, semantic_dag } => {
                                                 {
                                                     let mut s = state_bg.write().unwrap();
-
-                                                    // J24.13 PATHFINDER: The state variable used for LLM context construction
-                                                    // must hold the semantic string, not the compressed UI string.
                                                     s.matrix_topology = semantic_dag.clone();
 
-                                                    // If a payload is actively pending review (the user has already typed a prompt),
-                                                    // instantly mutate it so the UI updates without requiring a new prompt.
                                                     if let Some(ref mut payload) = s.review_payload {
-                                                        if !payload.system.contains("--- SEMANTIC CODE TOPOLOGY") {
-                                                            payload.system.push_str("\n\n--- SEMANTIC CODE TOPOLOGY ---\n");
-                                                            payload.system.push_str(&semantic_dag);
+                                                        // HOT-SWAP: Slice off stale topology
+                                                        if let Some(idx) = payload.system.find("--- SEMANTIC CODE TOPOLOGY") {
+                                                            payload.system.truncate(idx);
+                                                        }
+                                                        if let Some(idx) = payload.system.find("--- CURRENT SPATIAL TOPOLOGY") {
+                                                            payload.system.truncate(idx);
+                                                        }
+
+                                                        let trimmed_dag = semantic_dag.trim_end();
+                                                        if !trimmed_dag.is_empty() {
+                                                            if !payload.system.ends_with("\n\n") {
+                                                                payload.system.push_str("\n\n");
+                                                            }
+                                                            payload.system.push_str(trimmed_dag);
+                                                            payload.system.push_str("\n\n");
                                                         }
                                                     }
                                                 }
-                                                // Ping the UI to repaint
                                                 let _ = synapse_loop.fire_async(SMessage::StateInvalidated).await;
                                             }
                                             bandy::MatrixEvent::SectorFocused { target, context } => {
-                                                let topology_str = format!("SECTOR: {}\n\n{}", target, context);
+                                                let topology_str = format!("--- CURRENT SPATIAL TOPOLOGY (DAG) ---\nSECTOR: {}\n\n{}", target, context);
                                                 {
                                                     let mut s = state_bg.write().unwrap();
                                                     s.matrix_topology = topology_str.clone();
 
-                                                    // J21 PATHFINDER: Instant Payload Mutation
-                                                    // Resolving asynchronous UI blindness: Only inject the DAG if it doesn't already exist
-                                                    // to prevent exponential string duplication during rapid Matrix pings.
                                                     if let Some(ref mut payload) = s.review_payload {
-                                                        if !payload.system.contains("--- CURRENT SPATIAL TOPOLOGY") {
-                                                            payload.system.push_str("\n\n--- CURRENT SPATIAL TOPOLOGY (DAG) ---\n");
-                                                            payload.system.push_str(&topology_str);
+                                                        // HOT-SWAP: Slice off stale topology
+                                                        if let Some(idx) = payload.system.find("--- SEMANTIC CODE TOPOLOGY") {
+                                                            payload.system.truncate(idx);
                                                         }
+                                                        if let Some(idx) = payload.system.find("--- CURRENT SPATIAL TOPOLOGY") {
+                                                            payload.system.truncate(idx);
+                                                        }
+
+                                                        if !payload.system.ends_with("\n\n") {
+                                                            payload.system.push_str("\n\n");
+                                                        }
+                                                        payload.system.push_str(&topology_str);
+                                                        payload.system.push_str("\n\n");
                                                     }
                                                 }
-                                                // IMMEDIATELY fire StateInvalidated so the UI repaints with the DAG
                                                 let _ = synapse_loop.fire_async(SMessage::StateInvalidated).await;
                                             }
                                             _ => {}

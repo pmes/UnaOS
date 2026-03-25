@@ -22,6 +22,8 @@ use std::path::{Path, PathBuf};
 // DO NOT DELETE: This powers the core Spatial Code Map (Matrix DAG).
 use std::collections::HashMap;
 
+pub mod indexer;
+
 pub enum ScanDepth {
     Interface,
     DeepAST,

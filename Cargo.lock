@@ -1345,11 +1345,6 @@ dependencies = [
  "async-channel",
  "gneiss_pal",
  "log",
- "proc-macro2",
- "quote",
- "serde",
- "serde_json",
- "syn",
 ]
 
 [[package]]
@@ -3671,6 +3666,7 @@ dependencies = [
  "gneiss_pal",
  "gtk4",
  "log",
+ "serde",
 ]
 
 [[package]]
@@ -6310,11 +6306,14 @@ dependencies = [
  "futures",
  "gneiss_pal",
  "log",
+ "matrix",
  "quartzite",
+ "quote",
  "rand 0.10.0",
  "reqwest",
  "serde",
  "serde_json",
+ "syn",
  "tokio",
  "unafs",
 ]
