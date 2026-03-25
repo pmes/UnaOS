@@ -20,6 +20,9 @@ gneiss_pal = { path = "../../libs/gneiss_pal" }
 unafs = { path = "../../libs/unafs" }
 elessar = { path = "../../libs/elessar" }
 quartzite = { path = "../../libs/quartzite" }
+matrix = { path = "../../handlers/matrix" }
+syn = { version = "2.0", features = ["full", "extra-traits"] }
+quote = "1.0"
 
 # Async & Runtime
 tokio = { version = "1.49", features = ["full"] }

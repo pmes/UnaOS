@@ -24,7 +24,6 @@
 //! This crate is strictly pure logic. It contains NO user interface code.
 
 // Connects to the spatial indexing logic (e.g., context/indexer.rs)
-pub mod context;
 
 use std::path::Path;
 

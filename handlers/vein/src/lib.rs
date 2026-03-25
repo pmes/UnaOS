@@ -9,6 +9,7 @@
 pub mod context;
 pub mod cortex;
 pub mod gravity;
+pub mod skeleton;
 pub mod storage;
 pub mod synapse;
 
@@ -346,40 +347,58 @@ impl VeinHandler {
                                             bandy::MatrixEvent::IngestTopology { ui_dag: _, semantic_dag } => {
                                                 {
                                                     let mut s = state_bg.write().unwrap();
-
-                                                    // J24.13 PATHFINDER: The state variable used for LLM context construction
-                                                    // must hold the semantic string, not the compressed UI string.
                                                     s.matrix_topology = semantic_dag.clone();
 
-                                                    // If a payload is actively pending review (the user has already typed a prompt),
-                                                    // instantly mutate it so the UI updates without requiring a new prompt.
                                                     if let Some(ref mut payload) = s.review_payload {
-                                                        if !payload.system.contains("--- SEMANTIC CODE TOPOLOGY") {
-                                                            payload.system.push_str("\n\n--- SEMANTIC CODE TOPOLOGY ---\n");
-                                                            payload.system.push_str(&semantic_dag);
+                                                        // HOT-SWAP: Slice off stale topology
+                                                        if let Some(idx) = payload.system.find("--- SEMANTIC CODE TOPOLOGY") {
+                                                            payload.system.truncate(idx);
+                                                        }
+                                                        if let Some(idx) = payload.system.find("--- CURRENT SPATIAL TOPOLOGY") {
+                                                            payload.system.truncate(idx);
+                                                        }
+
+                                                        let trimmed_dag = semantic_dag.trim_end();
+                                                        if !trimmed_dag.is_empty() {
+                                                            if !payload.system.ends_with("\n\n") {
+                                                                payload.system.push_str("\n\n");
+                                                            }
+                                                            payload.system.push_str(trimmed_dag);
+                                                            payload.system.push_str("\n\n");
                                                         }
                                                     }
                                                 }
-                                                // Ping the UI to repaint
                                                 let _ = synapse_loop.fire_async(SMessage::StateInvalidated).await;
                                             }
                                             bandy::MatrixEvent::SectorFocused { target, context } => {
-                                                let topology_str = format!("SECTOR: {}\n\n{}", target, context);
+                                                // Strip the duplicate header coming from matrix's semantic_dag
+                                                let clean_context = context.replace("--- SEMANTIC CODE TOPOLOGY ---\n", "");
+                                                let topology_str = format!("--- CURRENT SPATIAL TOPOLOGY (DAG) ---\nSECTOR: {}\n\n{}", target, clean_context.trim());
+
                                                 {
                                                     let mut s = state_bg.write().unwrap();
                                                     s.matrix_topology = topology_str.clone();
 
-                                                    // J21 PATHFINDER: Instant Payload Mutation
-                                                    // Resolving asynchronous UI blindness: Only inject the DAG if it doesn't already exist
-                                                    // to prevent exponential string duplication during rapid Matrix pings.
                                                     if let Some(ref mut payload) = s.review_payload {
-                                                        if !payload.system.contains("--- CURRENT SPATIAL TOPOLOGY") {
-                                                            payload.system.push_str("\n\n--- CURRENT SPATIAL TOPOLOGY (DAG) ---\n");
-                                                            payload.system.push_str(&topology_str);
+                                                        // HOT-SWAP: Slice off stale topology safely
+                                                        if let Some(idx) = payload.system.find("--- SEMANTIC CODE TOPOLOGY") {
+                                                            payload.system.truncate(idx);
                                                         }
+                                                        if let Some(idx) = payload.system.find("--- CURRENT SPATIAL TOPOLOGY") {
+                                                            payload.system.truncate(idx);
+                                                        }
+
+                                                        if !payload.system.ends_with("\n\n") {
+                                                            payload.system.push_str("\n\n");
+                                                        }
+                                                        payload.system.push_str(&topology_str);
+                                                        payload.system.push_str("\n\n");
                                                     }
                                                 }
-                                                // IMMEDIATELY fire StateInvalidated so the UI repaints with the DAG
+                                                let _ = synapse_loop.fire_async(SMessage::StateInvalidated).await;
+                                            }
+                                            bandy::MatrixEvent::GraftTopology { target_id: _, payload: _ } => {
+                                                // Ping the UI to ensure any topological highlights are repainted.
                                                 let _ = synapse_loop.fire_async(SMessage::StateInvalidated).await;
                                             }
                                             _ => {}
@@ -446,6 +465,36 @@ impl VeinHandler {
                                     let payload_str = &user_input_text["DISPATCH_PAYLOAD:".len()..];
 
                                     if let Ok(payload) = serde_json::from_str::<PreFlightPayload>(payload_str) {
+
+                                        // --- LATE BINDING: SAVE USER HISTORY ONLY ON DISPATCH ---
+                                        let parsed_parts_for_save = parse_multimodal_text(&payload.prompt);
+                                        let mut clean_memory_text = String::new();
+                                        for part in &parsed_parts_for_save {
+                                            if let Part::Text { text } = part {
+                                                clean_memory_text.push_str(text);
+                                            } else {
+                                                clean_memory_text.push_str(" [System: User attached a file/image] ");
+                                            }
+                                        }
+
+                                        let user_embedding = match client.embed_content(&payload.prompt).await {
+                                            Ok(vec) => vec,
+                                            Err(_) => vec![]
+                                        };
+
+                                        let timestamp = chrono::Local::now().format("%H:%M:%S").to_string();
+                                        receipt_counter += 1;
+                                        let synapse_clone_for_user_save = synapse_loop.clone();
+                                        let _ = synapse_clone_for_user_save.fire_async(SMessage::StorageSave {
+                                            receipt_id: receipt_counter,
+                                            sender: "user".to_string(),
+                                            content: clean_memory_text,
+                                            timestamp: timestamp.clone(),
+                                            embedding: user_embedding,
+                                            memory_type: "chat".to_string(),
+                                        }).await;
+                                        // --------------------------------------------------------
+
                                         let mut system_builder = payload.system.clone();
                                         if !payload.directives.is_empty() {
                                             system_builder.push_str("\n\n[ACTIVE DIRECTIVES]:\n");
@@ -456,12 +505,40 @@ impl VeinHandler {
                                             system_builder.push_str(&payload.engrams);
                                         }
 
+                                        // JIT MATRIX EVALUATION
+                                        let (absolute_root, selected_nodes) = {
+                                            let s = state_bg.read().unwrap();
+                                            (s.absolute_workspace_root.clone(), s.active_matrix_selection.clone())
+                                        };
+
+                                        if !selected_nodes.is_empty() {
+                                            let absolute_targets: Vec<std::path::PathBuf> = selected_nodes
+                                                .into_iter()
+                                                .map(|target| absolute_root.join(target))
+                                                .collect();
+
+                                            if let Ok((_ui_dag, semantic_dag)) = matrix::MatrixScanner::map_topology(
+                                                &absolute_targets,
+                                                &absolute_root,
+                                                matrix::ScanDepth::Interface,
+                                            ) {
+                                                system_builder.push_str("\n\n--- SEMANTIC CODE TOPOLOGY ---\n");
+                                                system_builder.push_str(&semantic_dag);
+                                            }
+                                        }
+                                        // END JIT MATRIX EVALUATION
+
                                         let mut context: Vec<Content> = Vec::new();
                                         let current_text = format!("{}\n\n[CURRENT PROMPT]:\n{}", system_builder, payload.prompt);
                                         context.push(Content {
                                             role: "user".into(),
                                             parts: parse_multimodal_text(&current_text),
                                         });
+
+                                        let _ = synapse_loop.fire_async(SMessage::NetworkState("network-transmit-receive-symbolic".to_string())).await;
+                                        if let Ok(json_string) = serde_json::to_string_pretty(&context) {
+                                            let _ = synapse_loop.fire_async(SMessage::NetworkLog(json_string)).await;
+                                        }
 
                                         match client.generate_content(&context).await {
                                             Ok((response, metadata)) => {
@@ -680,39 +757,14 @@ impl VeinHandler {
                                     Err(_e) => vec![]
                                 };
 
-                                let parsed_parts_for_save = parse_multimodal_text(&user_input_text);
-                                let mut clean_memory_text = String::new();
-                                for part in &parsed_parts_for_save {
-                                    if let Part::Text { text } = part {
-                                        clean_memory_text.push_str(text);
-                                    } else {
-                                        clean_memory_text.push_str(" [System: User attached a file/image] ");
-                                    }
-                                }
-                                let timestamp = Local::now().format("%H:%M:%S").to_string();
-
-                                let synapse_clone = synapse_loop.clone();
-                                let clean_memory_clone = clean_memory_text.clone();
-                                let user_embedding_clone = user_embedding.clone();
-
-                                receipt_counter += 1;
-                                let _ = synapse_clone.fire_async(SMessage::StorageSave {
-                                    receipt_id: receipt_counter,
-                                    sender: "user".to_string(),
-                                    content: clean_memory_clone,
-                                    timestamp: timestamp.clone(),
-                                    embedding: user_embedding_clone.clone(),
-                                    memory_type: "chat".to_string(),
-                                }).await;
-
                                 receipt_counter += 1;
                                 let query_receipt_id = receipt_counter;
-
                                 pending_prompts.insert(query_receipt_id, user_input_text.clone());
 
+                                // ONLY query storage to build the pre-flight payload. DO NOT save to history yet.
                                 let _ = synapse_loop.fire_async(SMessage::StorageQuery {
                                     receipt_id: query_receipt_id,
-                                    embedding: user_embedding_clone,
+                                    embedding: user_embedding,
                                 }).await;
                             }
                         }
@@ -848,9 +900,9 @@ impl AppHandler for VeinHandler {
                 let _ = self.tx.send(format!("LOAD_HISTORY:{}", offset));
             }
             Event::UpdateMatrixSelection(node_ids) => {
-                let relative_targets_str = node_ids.join(" ");
-                let _ = self.publish("matrix", SMessage::Matrix(bandy::MatrixEvent::FocusSector(relative_targets_str)));
-                emit_ping = true;
+                let mut s = self.app_state.write().unwrap();
+                s.active_matrix_selection = node_ids;
+                // Do NOT fire the Matrix scanner here. Do NOT set emit_ping = true.
             }
             _ => {}
         }

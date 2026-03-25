@@ -15,7 +15,7 @@
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 use bandy::{MatrixEvent, SMessage, SpatialEdge, SpatialNode};
-use elessar::context::SkeletonGenerator;
+use crate::skeleton::SkeletonGenerator;
 use gneiss_pal::io::MemoryMappedRegion;
 use log::info;
 use std::collections::HashMap;
@@ -67,7 +67,7 @@ pub async fn run_indexer(root: PathBuf, synapse: bandy::Synapse) -> HashMap<Path
 async fn scan_workspace(root: &Path, synapse: &bandy::Synapse) -> HashMap<PathBuf, Arc<String>> {
     info!(":: CORTEX :: Indexing Workspace at {:?}", root);
 
-    let mut indexer = elessar::context::WorkspaceIndexer::new();
+    let mut indexer = matrix::indexer::WorkspaceIndexer::new();
     indexer.scan(root);
 
     let mut spatial_nodes = Vec::new();

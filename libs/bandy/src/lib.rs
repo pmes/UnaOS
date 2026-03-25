@@ -94,6 +94,8 @@ pub enum SMessage {
         id: String,
         content: String,
     },
+    NetworkLog(String),
+    NetworkState(String),
     // Vaire / Git Integration
     GetDiff {
         commit_a: String,
