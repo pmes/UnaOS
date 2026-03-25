@@ -371,13 +371,16 @@ impl VeinHandler {
                                                 let _ = synapse_loop.fire_async(SMessage::StateInvalidated).await;
                                             }
                                             bandy::MatrixEvent::SectorFocused { target, context } => {
-                                                let topology_str = format!("--- CURRENT SPATIAL TOPOLOGY (DAG) ---\nSECTOR: {}\n\n{}", target, context);
+                                                // Strip the duplicate header coming from matrix's semantic_dag
+                                                let clean_context = context.replace("--- SEMANTIC CODE TOPOLOGY ---\n", "");
+                                                let topology_str = format!("--- CURRENT SPATIAL TOPOLOGY (DAG) ---\nSECTOR: {}\n\n{}", target, clean_context.trim());
+
                                                 {
                                                     let mut s = state_bg.write().unwrap();
                                                     s.matrix_topology = topology_str.clone();
 
                                                     if let Some(ref mut payload) = s.review_payload {
-                                                        // HOT-SWAP: Slice off stale topology
+                                                        // HOT-SWAP: Slice off stale topology safely
                                                         if let Some(idx) = payload.system.find("--- SEMANTIC CODE TOPOLOGY") {
                                                             payload.system.truncate(idx);
                                                         }
