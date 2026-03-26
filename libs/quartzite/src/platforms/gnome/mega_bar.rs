@@ -85,6 +85,7 @@ impl MegaBar {
             .build();
 
         left_toolbar.add_top_bar(&left_header);
+        left_toolbar.add_top_bar(&gtk4::Separator::new(Orientation::Horizontal));
         left_toolbar.add_top_bar(left_tabs);
 
         // Wrap the content so we can apply the class reliably if needed,
@@ -108,6 +109,7 @@ impl MegaBar {
         right_header.pack_start(brain_icon);
 
         right_toolbar.add_top_bar(&right_header);
+        right_toolbar.add_top_bar(&gtk4::Separator::new(Orientation::Horizontal));
         right_toolbar.add_top_bar(right_tabs);
 
         let right_vbox = Box::new(Orientation::Vertical, 0);
@@ -121,6 +123,10 @@ impl MegaBar {
 
         main_h_paned.set_start_child(Some(&left_toolbar));
         main_h_paned.set_end_child(Some(&right_toolbar));
+
+        left_content.bind_property("visible", &left_toolbar, "visible")
+            .sync_create()
+            .build();
 
         main_h_paned.upcast::<gtk4::Widget>()
     }

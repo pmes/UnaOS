@@ -151,6 +151,10 @@ impl MegaBar {
             .flags(glib::BindingFlags::SYNC_CREATE | glib::BindingFlags::BIDIRECTIONAL)
             .build();
 
+        left_content.bind_property("visible", &left_vbox, "visible")
+            .sync_create()
+            .build();
+
         // 5. Return the Frame
         main_h_paned.upcast::<gtk4::Widget>()
     }

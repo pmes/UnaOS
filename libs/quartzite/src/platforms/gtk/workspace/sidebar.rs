@@ -98,6 +98,10 @@ pub fn build(window: &NativeWindow, tx_event: Sender<Event>, _workspace_tetra: &
     left_switcher.set_stack(Some(&left_stack));
     left_switcher.set_halign(Align::Center);
 
+    let left_stack_clone = left_stack.clone();
+    sidebar_toggle.connect_toggled(move |btn| {
+        left_stack_clone.set_visible(btn.is_active());
+    });
 
     // 1. Nodes Tab
     let store = gio::ListStore::new::<StringObject>();
@@ -565,6 +569,7 @@ pub fn build(window: &NativeWindow, tx_event: Sender<Event>, _workspace_tetra: &
     // --- END MATRIX TETRA ---
 
     let context_view = crate::widgets::telemetry::ContextView::new();
+    context_view.container.set_vexpand(false);
     telehud_box.append(&context_view.container);
 
     let page = left_stack.add_named(&telehud_box, Some("telehud"));

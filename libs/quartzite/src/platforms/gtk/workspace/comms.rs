@@ -610,12 +610,12 @@ fn setup_chat_view(tx_event: &Sender<Event>, tetra: &crate::tetra::StreamTetra) 
         // --- Standard Mode (Message View) ---
         let msg_label = Label::builder()
             .wrap(true)
-            .lines(5) // Default locked state
+            .lines(11) // Default locked state
             .selectable(true)
             .hexpand(true)
             .wrap_mode(gtk4::pango::WrapMode::WordChar)
+            .ellipsize(gtk4::pango::EllipsizeMode::End) // CRITICAL: Add this or clamping fails
             .build();
-        msg_label.set_ellipsize(gtk4::pango::EllipsizeMode::End);
         msg_label.add_css_class("view");
 
         bubble.append(&msg_label);
