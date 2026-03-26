@@ -72,7 +72,9 @@ pub fn build(window: &NativeWindow, tx_event: Sender<Event>, _workspace_tetra: &
 
     let network_btn = Button::builder()
         .icon_name("network-idle-symbolic")
+        .css_classes(vec!["flat", "icon-button"])
         .tooltip_text("Network Inspector")
+        .valign(gtk4::Align::Center)
         .build();
 
     let token_label = Label::new(Some("Tokens: IN: 0 | OUT: 0 | TOTAL: 0"));
@@ -356,8 +358,6 @@ pub fn build(window: &NativeWindow, tx_event: Sender<Event>, _workspace_tetra: &
 
     // 3. THE TeleHUD Tab
     let telehud_box = Box::new(Orientation::Vertical, 12);
-    telehud_box.set_margin_top(12);
-    telehud_box.set_margin_bottom(12);
     telehud_box.set_margin_start(12);
     telehud_box.set_margin_end(12);
 
@@ -397,18 +397,22 @@ pub fn build(window: &NativeWindow, tx_event: Sender<Event>, _workspace_tetra: &
         let label = child.first_child().unwrap().downcast::<Label>().unwrap();
         let obj = item.item().unwrap().downcast::<crate::widgets::model::MatrixNodeObject>().unwrap();
 
-        let depth = obj.depth();
-        let prefix = if depth == 0 {
-            String::new()
-        } else {
-            format!("{}├─ ", "  ".repeat(depth.saturating_sub(1) as usize))
-        };
-        let display_text = format!("{}{}", prefix, obj.label());
-        label.set_label(&display_text);
+        let depth = obj.depth() as i32;
+        label.set_margin_start(10 + (depth * 20));
+        label.add_css_class("monospace");
+        label.set_label(&obj.label());
     });
 
     let matrix_view = ColumnView::new(Some(matrix_selection.clone()));
     matrix_view.set_enable_rubberband(true);
+    matrix_view.set_single_click_activate(false);
+    matrix_view.set_show_row_separators(false);
+    matrix_view.set_show_column_separators(false);
+
+    // Fallback logic for GTK versions lacking `set_show_column_headers`.
+    // It is often accessible directly as a property setting:
+    matrix_view.set_property("show-column-headers", false);
+
     matrix_view.append_column(&ColumnViewColumn::new(None, Some(matrix_factory)));
 
     let tx_matrix_sel = tx_event.clone();
@@ -433,8 +437,6 @@ pub fn build(window: &NativeWindow, tx_event: Sender<Event>, _workspace_tetra: &
     let nav_box = Box::new(Orientation::Horizontal, 5);
     nav_box.set_margin_start(5);
     nav_box.set_margin_end(5);
-    nav_box.set_margin_top(5);
-    nav_box.set_margin_bottom(5);
 
     let btn_back = Button::from_icon_name("go-previous-symbolic");
     let btn_up = Button::from_icon_name("go-up-symbolic");

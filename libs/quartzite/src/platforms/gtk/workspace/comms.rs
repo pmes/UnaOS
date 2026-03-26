@@ -566,8 +566,12 @@ fn setup_chat_view(tx_event: &Sender<Event>, tetra: &crate::tetra::StreamTetra) 
         root.append(&left_spacer);
 
         let bubble = Box::new(Orientation::Vertical, 4);
+        bubble.add_css_class("card"); // <-- Native GTK background styling
         bubble.add_css_class("bubble-box");
-        bubble.set_hexpand(true);
+        bubble.set_margin_top(4);
+        bubble.set_margin_bottom(4);
+        bubble.set_margin_start(8);
+        bubble.set_margin_end(8);
 
         let header_box = Box::new(Orientation::Horizontal, 8);
 
@@ -644,19 +648,19 @@ fn setup_chat_view(tx_event: &Sender<Event>, tetra: &crate::tetra::StreamTetra) 
         // 3. The Toggle Logic
         let toggle_label = msg_label.clone();
         left_expand_btn.connect_clicked(move |_| {
-            if toggle_label.lines() == 5 {
+            if toggle_label.lines() == 11 {
                 toggle_label.set_lines(-1); // Expand fully
             } else {
-                toggle_label.set_lines(5);  // Collapse back
+                toggle_label.set_lines(11);  // Collapse back
             }
         });
 
         let toggle_label_right = msg_label.clone();
         right_expand_btn.connect_clicked(move |_| {
-            if toggle_label_right.lines() == 5 {
+            if toggle_label_right.lines() == 11 {
                 toggle_label_right.set_lines(-1); // Expand fully
             } else {
-                toggle_label_right.set_lines(5);  // Collapse back
+                toggle_label_right.set_lines(11);  // Collapse back
             }
         });
 
@@ -700,21 +704,20 @@ fn setup_chat_view(tx_event: &Sender<Event>, tetra: &crate::tetra::StreamTetra) 
             widgets.meta_label.remove_css_class("role-una");
             widgets.meta_label.remove_css_class("role-system");
 
-            let is_expanded = obj.is_expanded();
             let line_count = content.trim_end().lines().count();
             widgets.msg_label.set_label(&content);
 
             let is_user = sender == "Architect";
 
             if is_user {
-                widgets.bubble.set_halign(gtk4::Align::End);
+                widgets.bubble.set_halign(gtk4::Align::End); // Push to the right
                 widgets.bubble.add_css_class("bubble-user");
                 widgets.left_spacer.set_visible(true);
                 widgets.right_spacer.set_visible(false);
                 widgets.meta_label.set_halign(gtk4::Align::End);
                 widgets.meta_label.set_xalign(1.0);
             } else {
-                widgets.bubble.set_halign(gtk4::Align::Start);
+                widgets.bubble.set_halign(gtk4::Align::Start); // Push to the left
                 widgets.bubble.add_css_class("bubble-ai");
                 widgets.left_spacer.set_visible(false);
                 widgets.right_spacer.set_visible(true);
@@ -722,23 +725,25 @@ fn setup_chat_view(tx_event: &Sender<Event>, tetra: &crate::tetra::StreamTetra) 
                 widgets.meta_label.set_xalign(0.0);
             }
 
-            if line_count > 5 {
-                if is_user {
-                    widgets.left_expand_btn.set_visible(true);
-                    widgets.right_expand_btn.set_visible(false);
-                } else {
-                    widgets.left_expand_btn.set_visible(false);
-                    widgets.right_expand_btn.set_visible(true);
-                }
+            let should_expand = if is_user {
+                false // User posts always clamp
+            } else {
+                obj.is_expanded() // AI posts default to expanded
+            };
+
+            if should_expand {
+                widgets.msg_label.set_lines(-1); // Fully open
+            } else {
+                widgets.msg_label.set_lines(11); // Clamp to 11 lines
+            }
+
+            // Adjust toggle buttons
+            if line_count > 11 {
+                widgets.left_expand_btn.set_visible(is_user);
+                widgets.right_expand_btn.set_visible(!is_user);
             } else {
                 widgets.left_expand_btn.set_visible(false);
                 widgets.right_expand_btn.set_visible(false);
-            }
-
-            if is_expanded {
-                widgets.msg_label.set_lines(-1);
-            } else {
-                widgets.msg_label.set_lines(5);
             }
         } else {
             widgets.expander.set_visible(true);

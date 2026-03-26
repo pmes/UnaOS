@@ -234,12 +234,12 @@ pub fn spawn_listener(pointers: ReactorPointers, rx_gui: Receiver<GuiUpdate>) {
                         }
                     }
 
-                    // 2. Wipe and repopulate
-                    pointers.matrix_store.remove_all();
+                    // 2. ATOMIC SPLICE: Build new items and swap them in one move
+                    let mut new_items = Vec::new();
                     for (id, label, depth) in topology {
-                        let obj = crate::widgets::model::MatrixNodeObject::new(&id, &label, depth as u32);
-                        pointers.matrix_store.append(&obj);
+                        new_items.push(crate::widgets::model::MatrixNodeObject::new(&id, &label, depth as u32));
                     }
+                    pointers.matrix_store.splice(0, pointers.matrix_store.n_items(), &new_items);
 
                     // 3. Rebuild bitset and restore highlights
                     let new_bitset = gtk4::Bitset::new_empty();
