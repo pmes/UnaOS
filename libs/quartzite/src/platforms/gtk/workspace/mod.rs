@@ -10,6 +10,7 @@ use bandy::state::AppState;
 use std::sync::{Arc, RwLock};
 use crate::Event;
 use crate::NativeWindow;
+use sourceview5::prelude::*;
 
 pub struct WorkspaceWidgets {
     pub left_stack: gtk4::Stack,
@@ -18,8 +19,6 @@ pub struct WorkspaceWidgets {
     pub left_switcher: gtk4::StackSwitcher,
     pub right_switcher: gtk4::StackSwitcher,
 }
-
-use gtk4::prelude::*;
 
 // Why Broadcast? MPMC channels (`async_channel`) load-balance by consuming messages,
 // causing UI starvation if a background thread wins the race. `tokio::sync::broadcast`
@@ -77,6 +76,24 @@ pub fn build(
     sidebar_widgets.network_btn.connect_clicked(move |_| {
         net_window.present();
     });
+
+    if let Some(settings) = gtk4::Settings::default() {
+        let net_buf_clone = net_buffer.clone();
+
+        let update_theme = move |is_dark: bool| {
+            let manager = sourceview5::StyleSchemeManager::default();
+            let scheme_name = if is_dark { "Adwaita-dark" } else { "Adwaita" };
+            if let Some(scheme) = manager.scheme(scheme_name) {
+                net_buf_clone.set_style_scheme(Some(&scheme));
+            }
+        };
+
+        update_theme(settings.is_gtk_application_prefer_dark_theme());
+
+        settings.connect_gtk_application_prefer_dark_theme_notify(move |s| {
+            update_theme(s.is_gtk_application_prefer_dark_theme());
+        });
+    }
 
     // Reactor bindings
     let pointers = reactor::ReactorPointers {

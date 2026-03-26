@@ -72,9 +72,8 @@ pub fn build(window: &NativeWindow, tx_event: Sender<Event>, _workspace_tetra: &
 
     let network_btn = Button::builder()
         .icon_name("network-idle-symbolic")
-        .css_classes(vec!["flat", "icon-button"])
-        .tooltip_text("Network Inspector")
         .valign(gtk4::Align::Center)
+        .tooltip_text("Network Inspector")
         .build();
 
     let token_label = Label::new(Some("Tokens: IN: 0 | OUT: 0 | TOTAL: 0"));
@@ -379,6 +378,7 @@ pub fn build(window: &NativeWindow, tx_event: Sender<Event>, _workspace_tetra: &
 
         // Enable visual selection highlight (Fixes GTK Ghost Outline)
         item.set_selectable(true);
+        item.set_activatable(true);
 
         let row = Box::new(Orientation::Horizontal, 10);
         row.set_margin_start(10);

@@ -101,6 +101,10 @@ fn setup_preflight_stack(tx_event: &Sender<Event>) -> PreflightStackData {
         view.set_editable(true);
         view.set_monospace(true);
         view.set_vexpand(true);
+        view.set_left_margin(12);
+        view.set_right_margin(12);
+        view.set_top_margin(12);
+        view.set_bottom_margin(12);
         view.add_css_class("view");
 
         let scroll = ScrolledWindow::builder()
@@ -967,6 +971,10 @@ pub fn build(
     if let Some(settings) = gtk4::Settings::default() {
         let buf_chat = chat_input_buffer.clone();
         let buf_comp = body_buffer.clone();
+        let buf_sys = preflight_sys_buf.clone();
+        let buf_dir = preflight_dir_buf.clone();
+        let buf_eng = preflight_eng_buf.clone();
+        let buf_prm = preflight_prm_buf.clone();
 
         let update_theme = move |is_dark: bool| {
             let manager = sourceview5::StyleSchemeManager::default();
@@ -974,6 +982,10 @@ pub fn build(
             if let Some(scheme) = manager.scheme(scheme_name) {
                 buf_chat.set_style_scheme(Some(&scheme));
                 buf_comp.set_style_scheme(Some(&scheme));
+                buf_sys.set_style_scheme(Some(&scheme));
+                buf_dir.set_style_scheme(Some(&scheme));
+                buf_eng.set_style_scheme(Some(&scheme));
+                buf_prm.set_style_scheme(Some(&scheme));
             }
         };
 
