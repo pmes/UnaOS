@@ -37,6 +37,7 @@ pub struct SidebarPointers {
     pub context_view: crate::widgets::telemetry::ContextView,
     pub matrix_store: gio::ListStore,
     pub matrix_selection: gtk4::MultiSelection,
+    pub sidebar_toggle: ToggleButton,
 }
 
 // Helper to avoid circular dependencies in spline
@@ -75,6 +76,7 @@ pub fn build(window: &NativeWindow, tx_event: Sender<Event>, _workspace_tetra: &
         .valign(gtk4::Align::Center)
         .tooltip_text("Network Inspector")
         .build();
+    network_btn.add_css_class("raised");
 
     let token_label = Label::new(Some("Tokens: IN: 0 | OUT: 0 | TOTAL: 0"));
     token_label.set_margin_start(10);
@@ -96,10 +98,6 @@ pub fn build(window: &NativeWindow, tx_event: Sender<Event>, _workspace_tetra: &
     left_switcher.set_stack(Some(&left_stack));
     left_switcher.set_halign(Align::Center);
 
-    let left_stack_clone = left_stack.clone();
-    sidebar_toggle.connect_toggled(move |btn| {
-        left_stack_clone.set_visible(btn.is_active());
-    });
 
     // 1. Nodes Tab
     let store = gio::ListStore::new::<StringObject>();
@@ -387,6 +385,7 @@ pub fn build(window: &NativeWindow, tx_event: Sender<Event>, _workspace_tetra: &
         row.set_margin_bottom(5);
         let label = Label::new(None);
         label.set_xalign(0.0);
+        label.set_can_target(false); // ADD THIS LINE to let clicks pass through to the selection row
         row.append(&label);
         item.set_child(Some(&row));
     });
@@ -591,6 +590,7 @@ pub fn build(window: &NativeWindow, tx_event: Sender<Event>, _workspace_tetra: &
         context_view,
         matrix_store,
         matrix_selection,
+        sidebar_toggle,
     };
 
     (widgets, pointers)

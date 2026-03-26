@@ -18,6 +18,7 @@ pub struct WorkspaceWidgets {
     pub status_group: gtk4::Box,
     pub left_switcher: gtk4::StackSwitcher,
     pub right_switcher: gtk4::StackSwitcher,
+    pub sidebar_toggle: gtk4::ToggleButton,
 }
 
 // Why Broadcast? MPMC channels (`async_channel`) load-balance by consuming messages,
@@ -129,5 +130,6 @@ pub fn build(
         status_group: sidebar_widgets.status_group,
         left_switcher: sidebar_widgets.left_switcher,
         right_switcher: comms_widgets.right_switcher,
+        sidebar_toggle: sidebar_pointers.sidebar_toggle,
     }
 }

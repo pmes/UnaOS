@@ -80,9 +80,6 @@ impl MegaBar {
         // Maintain a minimum size instead of a hardcoded request to allow the paned to dictate width.
         left_toolbar.set_size_request((1024.0 * 0.15) as i32, -1); // Safe minimum fallback
 
-        // Strip native drop-shadows
-        left_toolbar.set_top_bar_style(adw::ToolbarStyle::Flat);
-
         let left_header = adw::HeaderBar::builder()
             .show_end_title_buttons(false)
             .build();
@@ -101,9 +98,6 @@ impl MegaBar {
         right_toolbar.set_widget_name("right");
         right_toolbar.add_css_class("builder-view");
         right_toolbar.set_hexpand(true);
-
-        // Strip native drop-shadows
-        right_toolbar.set_top_bar_style(adw::ToolbarStyle::Flat);
 
         let right_header = adw::HeaderBar::builder()
             .show_start_title_buttons(false) // Only show the window controls on the far right

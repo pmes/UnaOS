@@ -146,7 +146,7 @@ fn setup_preflight_stack(tx_event: &Sender<Event>) -> PreflightStackData {
     let cancel_btn = Button::builder()
         .icon_name("window-close-symbolic")
         .tooltip_text("Discard Payload")
-        .css_classes(vec!["flat", "destructive-action"])
+        .css_classes(vec!["raised", "destructive-action"])
         .build();
     let dispatch_btn = Button::builder()
         .icon_name("document-save-symbolic")
@@ -253,6 +253,11 @@ fn setup_input_area(tx_event: &Sender<Event>, window: &NativeWindow, active_targ
         .max_content_height(150)
         .build();
     input_scroll.set_hexpand(true);
+    input_scroll.add_css_class("card");
+    input_scroll.set_margin_top(8);
+    input_scroll.set_margin_bottom(8);
+    input_scroll.set_margin_start(8);
+    input_scroll.set_margin_end(8);
     let text_view = SourceView::builder()
         .wrap_mode(gtk4::WrapMode::WordChar)
         .show_line_numbers(false)
@@ -610,6 +615,7 @@ fn setup_chat_view(tx_event: &Sender<Event>, tetra: &crate::tetra::StreamTetra) 
             .hexpand(true)
             .wrap_mode(gtk4::pango::WrapMode::WordChar)
             .build();
+        msg_label.set_ellipsize(gtk4::pango::EllipsizeMode::End);
         msg_label.add_css_class("view");
 
         bubble.append(&msg_label);

@@ -109,7 +109,7 @@ fn build_gtk_ui(
         workspace_state,
     );
 
-    crate::platforms::gtk::mega_bar::MegaBar::build(
+    let main_frame = crate::platforms::gtk::mega_bar::MegaBar::build(
         window.upcast_ref::<gtk4::ApplicationWindow>(),
         "",
         workspace_widgets.status_group.upcast_ref::<gtk4::Widget>(),
@@ -119,5 +119,8 @@ fn build_gtk_ui(
         workspace_widgets.right_stack.upcast_ref::<gtk4::Widget>(),
         &brain_icon,
         &tetra,
-    )
+    );
+
+
+    main_frame
 }
