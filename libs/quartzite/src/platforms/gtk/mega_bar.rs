@@ -151,7 +151,12 @@ impl MegaBar {
             .flags(glib::BindingFlags::SYNC_CREATE | glib::BindingFlags::BIDIRECTIONAL)
             .build();
 
+        // Collapse both the content and the titlebar headers simultaneously
         left_content.bind_property("visible", &left_vbox, "visible")
+            .sync_create()
+            .build();
+
+        left_content.bind_property("visible", &left_title_vbox, "visible")
             .sync_create()
             .build();
 
