@@ -167,6 +167,8 @@ fn main() {
                                     }).collect();
                                     synapse_event_loop.fire(bandy::SMessage::Matrix(bandy::MatrixEvent::TopologyMutated(mapped_tree)));
 
+                                    // The silent scan trigger for AST drill-down:
+                                    synapse_event_loop.fire(bandy::SMessage::Matrix(bandy::MatrixEvent::FocusSector(id)));
                                 }
                             }
                             _ => {

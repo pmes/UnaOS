@@ -24,6 +24,7 @@ pub struct SidebarWidgets {
     pub status_group: Box,
     pub left_switcher: StackSwitcher,
     pub composer_btn: Button,
+    pub network_btn: Button,
 }
 
 pub struct SidebarPointers {
@@ -69,6 +70,11 @@ pub fn build(window: &NativeWindow, tx_event: Sender<Event>, _workspace_tetra: &
         .tooltip_text("Toggle Sidebar")
         .build();
 
+    let network_btn = Button::builder()
+        .icon_name("network-idle-symbolic")
+        .tooltip_text("Network Inspector")
+        .build();
+
     let token_label = Label::new(Some("Tokens: IN: 0 | OUT: 0 | TOTAL: 0"));
     token_label.set_margin_start(10);
     token_label.set_margin_end(10);
@@ -78,6 +84,7 @@ pub fn build(window: &NativeWindow, tx_event: Sender<Event>, _workspace_tetra: &
     let status_group = Box::new(Orientation::Horizontal, 8);
     status_group.set_valign(gtk4::Align::Center);
     status_group.append(&sidebar_toggle);
+    status_group.append(&network_btn);
     status_group.append(&token_label);
 
     let left_stack = Stack::new();
@@ -131,7 +138,7 @@ pub fn build(window: &NativeWindow, tx_event: Sender<Event>, _workspace_tetra: &
             }
         });
     let nodes_scroll = ScrolledWindow::builder()
-        .hscrollbar_policy(PolicyType::Never)
+        .hscrollbar_policy(PolicyType::Automatic)
         .child(&column_view)
         .min_content_height(200)
         .min_content_width(200)
@@ -556,7 +563,7 @@ pub fn build(window: &NativeWindow, tx_event: Sender<Event>, _workspace_tetra: &
     telehud_box.append(&nav_box);
 
     let matrix_scroll = ScrolledWindow::builder()
-        .hscrollbar_policy(PolicyType::Never)
+        .hscrollbar_policy(PolicyType::Automatic)
         .child(&matrix_view)
         .min_content_height(150)
         .vexpand(true)
@@ -579,6 +586,7 @@ pub fn build(window: &NativeWindow, tx_event: Sender<Event>, _workspace_tetra: &
         status_group,
         left_switcher,
         composer_btn,
+        network_btn,
     };
 
     let pointers = SidebarPointers {

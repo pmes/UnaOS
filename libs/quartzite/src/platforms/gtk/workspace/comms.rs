@@ -600,6 +600,7 @@ fn setup_chat_view(tx_event: &Sender<Event>, tetra: &crate::tetra::StreamTetra) 
             .lines(5) // Default locked state
             .selectable(true)
             .hexpand(true)
+            .wrap_mode(gtk4::pango::WrapMode::WordChar)
             .build();
         msg_label.add_css_class("view");
 

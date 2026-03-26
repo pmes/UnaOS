@@ -19,6 +19,8 @@ pub struct WorkspaceWidgets {
     pub right_switcher: gtk4::StackSwitcher,
 }
 
+use gtk4::prelude::*;
+
 // Why Broadcast? MPMC channels (`async_channel`) load-balance by consuming messages,
 // causing UI starvation if a background thread wins the race. `tokio::sync::broadcast`
 // enforces pub/sub physics, ensuring the UI and Backend independently observe the exact
@@ -55,6 +57,27 @@ pub fn build(
         sidebar_pointers.matrix_selection.clone(),
     );
 
+    // Network Inspector Window
+    let net_window = gtk4::Window::builder()
+        .title("Network Inspector")
+        .default_width(600)
+        .default_height(600)
+        .hide_on_close(true)
+        .build();
+    let net_buffer = sourceview5::Buffer::new(None);
+    let net_view = sourceview5::View::with_buffer(&net_buffer);
+    net_view.set_editable(false);
+    net_view.set_monospace(true);
+    let net_scroll = gtk4::ScrolledWindow::builder()
+        .child(&net_view)
+        .build();
+    net_window.set_child(Some(&net_scroll));
+
+    let net_btn = sidebar_widgets.network_btn.clone();
+    sidebar_widgets.network_btn.connect_clicked(move |_| {
+        net_window.present();
+    });
+
     // Reactor bindings
     let pointers = reactor::ReactorPointers {
         spinner_una: sidebar_pointers.spinner_una,
@@ -76,6 +99,9 @@ pub fn build(
         preflight_eng_buf: comms_pointers.preflight_eng_buf,
         preflight_prm_buf: comms_pointers.preflight_prm_buf,
         matrix_store: sidebar_pointers.matrix_store,
+        matrix_selection: sidebar_pointers.matrix_selection,
+        net_buffer,
+        network_btn: net_btn,
     };
 
     reactor::spawn_listener(pointers, rx_gui);

@@ -31,6 +31,9 @@ pub struct ReactorPointers {
     pub preflight_eng_buf: sourceview5::Buffer,
     pub preflight_prm_buf: sourceview5::Buffer,
     pub matrix_store: gtk4::gio::ListStore,
+    pub matrix_selection: gtk4::MultiSelection,
+    pub net_buffer: sourceview5::Buffer,
+    pub network_btn: gtk4::Button,
 }
 
 pub fn spawn_listener(pointers: ReactorPointers, rx_gui: Receiver<GuiUpdate>) {
@@ -219,11 +222,37 @@ pub fn spawn_listener(pointers: ReactorPointers, rx_gui: Receiver<GuiUpdate>) {
                     pointers.context_view.update(skeletons);
                 }
                 GuiUpdate::RefreshMatrix(topology) => {
+                    // 1. Cache the active selection IDs
+                    let mut saved_ids = std::collections::HashSet::new();
+                    let current_bitset = pointers.matrix_selection.selection();
+                    let size = current_bitset.size() as u32;
+                    for i in 0..size {
+                        if let Some(item) = pointers.matrix_store.item(current_bitset.nth(i)) {
+                            if let Ok(obj) = item.downcast::<crate::widgets::model::MatrixNodeObject>() {
+                                saved_ids.insert(obj.id());
+                            }
+                        }
+                    }
+
+                    // 2. Wipe and repopulate
                     pointers.matrix_store.remove_all();
                     for (id, label, depth) in topology {
                         let obj = crate::widgets::model::MatrixNodeObject::new(&id, &label, depth as u32);
                         pointers.matrix_store.append(&obj);
                     }
+
+                    // 3. Rebuild bitset and restore highlights
+                    let new_bitset = gtk4::Bitset::new_empty();
+                    for i in 0..pointers.matrix_store.n_items() {
+                        if let Some(item) = pointers.matrix_store.item(i) {
+                            if let Ok(obj) = item.downcast::<crate::widgets::model::MatrixNodeObject>() {
+                                if saved_ids.contains(&obj.id()) {
+                                    new_bitset.add(i);
+                                }
+                            }
+                        }
+                    }
+                    pointers.matrix_selection.set_selection(&new_bitset, &new_bitset);
                 }
                 GuiUpdate::IngestMatrixTopology(paths) => {
                     // Checkpoint Gamma: The Left Pane Model
@@ -240,6 +269,13 @@ pub fn spawn_listener(pointers: ReactorPointers, rx_gui: Receiver<GuiUpdate>) {
                         let obj = crate::widgets::model::MatrixNodeObject::new(&path, &label, depth);
                         pointers.matrix_store.append(&obj);
                     }
+                }
+                GuiUpdate::NetworkLog(log) => {
+                    let mut end_iter = pointers.net_buffer.end_iter();
+                    pointers.net_buffer.insert(&mut end_iter, &format!("{}\n", log));
+                }
+                GuiUpdate::NetworkState(state) => {
+                    pointers.network_btn.set_icon_name(&state);
                 }
                 _ => {}
             }
