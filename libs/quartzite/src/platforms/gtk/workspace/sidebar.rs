@@ -389,7 +389,6 @@ pub fn build(window: &NativeWindow, tx_event: Sender<Event>, _workspace_tetra: &
         row.set_margin_bottom(5);
         let label = Label::new(None);
         label.set_xalign(0.0);
-        label.set_can_target(false); // ADD THIS LINE to let clicks pass through to the selection row
         row.append(&label);
         item.set_child(Some(&row));
     });
@@ -408,6 +407,7 @@ pub fn build(window: &NativeWindow, tx_event: Sender<Event>, _workspace_tetra: &
 
     // A standard ListView natively has no headers, permanently destroying the void.
     let matrix_view = ListView::new(Some(matrix_selection.clone()), Some(matrix_factory));
+    matrix_view.add_css_class("navigation-sidebar");
     matrix_view.set_enable_rubberband(true);
     matrix_view.set_single_click_activate(false);
 

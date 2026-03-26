@@ -85,7 +85,6 @@ impl MegaBar {
             .build();
 
         left_toolbar.add_top_bar(&left_header);
-        left_toolbar.add_top_bar(&gtk4::Separator::new(Orientation::Horizontal));
         left_toolbar.add_top_bar(left_tabs);
 
         // Wrap the content so we can apply the class reliably if needed,
@@ -109,7 +108,6 @@ impl MegaBar {
         right_header.pack_start(brain_icon);
 
         right_toolbar.add_top_bar(&right_header);
-        right_toolbar.add_top_bar(&gtk4::Separator::new(Orientation::Horizontal));
         right_toolbar.add_top_bar(right_tabs);
 
         let right_vbox = Box::new(Orientation::Vertical, 0);

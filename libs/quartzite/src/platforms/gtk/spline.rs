@@ -55,6 +55,8 @@ fn build_gnome_ui(
 ) -> crate::NativeView {
     let tetra = crate::tetra::WorkspaceTetra::from_state(workspace_state);
     let brain_icon = gtk4::Image::from_icon_name("brain-symbolic");
+    brain_icon.add_css_class("una-brain");
+    brain_icon.add_css_class("pulse");
 
     let workspace_widgets = crate::platforms::gtk::workspace::build(
         window,
@@ -98,6 +100,8 @@ fn build_gtk_ui(
 ) -> crate::NativeView {
     let tetra = crate::tetra::WorkspaceTetra::from_state(workspace_state);
     let brain_icon = gtk4::Image::from_icon_name("brain-symbolic");
+    brain_icon.add_css_class("una-brain");
+    brain_icon.add_css_class("pulse");
 
     let workspace_widgets = crate::platforms::gtk::workspace::build(
         window,

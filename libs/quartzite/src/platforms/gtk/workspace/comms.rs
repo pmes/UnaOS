@@ -84,6 +84,11 @@ fn setup_preflight_stack(tx_event: &Sender<Event>) -> PreflightStackData {
     preflight_stack_container.set_vexpand(true);
     preflight_stack_container.set_hexpand(true);
     preflight_stack_container.add_css_class("background"); // Ensure opacity over chat
+    preflight_stack_container.add_css_class("card");
+    preflight_stack_container.set_margin_top(12);
+    preflight_stack_container.set_margin_bottom(12);
+    preflight_stack_container.set_margin_start(12);
+    preflight_stack_container.set_margin_end(12);
 
     let preflight_stack = Stack::new();
     preflight_stack.set_transition_type(StackTransitionType::SlideLeftRight);
@@ -681,6 +686,7 @@ fn setup_chat_view(tx_event: &Sender<Event>, tetra: &crate::tetra::StreamTetra) 
         item.set_child(Some(&root));
     });
 
+    let store_for_bind = console_store.clone();
     console_factory.connect_bind(move |_factory, item| {
         let Some(item) = item.downcast_ref::<ListItem>() else { return; };
         let Some(obj) = item.item().and_then(|c| c.downcast::<HistoryObject>().ok()) else { return; };
@@ -735,10 +741,13 @@ fn setup_chat_view(tx_event: &Sender<Event>, tetra: &crate::tetra::StreamTetra) 
                 widgets.meta_label.set_xalign(0.0);
             }
 
+            let is_newest = item.position() == store_for_bind.n_items() - 1;
             let should_expand = if is_user {
                 false // User posts always clamp
+            } else if !is_newest {
+                false // Historical AI posts ALWAYS clamp to 11
             } else {
-                obj.is_expanded() // AI posts default to expanded
+                obj.is_expanded() // Only the live generating response gets to expand
             };
 
             if should_expand {
@@ -818,7 +827,7 @@ pub fn build(
     workspace_stack.set_vexpand(true);
     workspace_stack.set_transition_type(StackTransitionType::SlideLeftRight);
 
-    let comms_page = Box::new(Orientation::Vertical, 0);
+    let comms_page = gtk4::Paned::new(Orientation::Vertical);
     comms_page.set_hexpand(true);
     comms_page.set_vexpand(true);
 
@@ -848,11 +857,13 @@ pub fn build(
     // Initially hide the PreFlight Stack
     preflight_stack_container.set_visible(false);
 
-    comms_page.append(&chat_overlay);
-
     let input_area_data = setup_input_area(&tx_event, window, &active_target, matrix_selection);
     let input_container = input_area_data.input_container;
     let chat_input_buffer = input_area_data.chat_input_buffer;
+
+    comms_page.set_start_child(Some(&chat_overlay));
+    comms_page.set_end_child(Some(&input_container));
+    comms_page.set_position(600);
 
     let active_directive = Rc::new(RefCell::new("Directive 055".to_string()));
 
@@ -960,15 +971,7 @@ pub fn build(
         popover_composer.popup();
     });
 
-    match tetra.input_anchor {
-        crate::tetra::ScrollAnchor::Top => {
-            comms_page.prepend(&input_container);
-        }
-        crate::tetra::ScrollAnchor::Bottom => {
-            comms_page.append(&input_container);
-        }
-    }
-
+    // The paned now controls the input orientation dynamically via start/end, removing the need for box prepending/appending
     workspace_stack.add_titled(&comms_page, Some("comms"), "Comms");
 
     let right_switcher = StackSwitcher::new();
