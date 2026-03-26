@@ -389,6 +389,8 @@ pub fn build(window: &NativeWindow, tx_event: Sender<Event>, _workspace_tetra: &
         row.set_margin_bottom(5);
         let label = Label::new(None);
         label.set_xalign(0.0);
+        label.set_can_target(false);
+        // This ensures the click passes completely through the text and hits the row itself.
         row.append(&label);
         item.set_child(Some(&row));
     });

@@ -219,6 +219,8 @@ fn setup_input_area(tx_event: &Sender<Event>, window: &NativeWindow, active_targ
     input_container.set_margin_end(16);
     input_container.set_margin_bottom(16);
     input_container.set_margin_top(16);
+    input_container.set_hexpand(true);
+    input_container.set_size_request(-1, 120); // Prevents the slider from crushing the input
 
     let attach_btn = Button::builder()
         .valign(Align::End)
@@ -663,19 +665,19 @@ fn setup_chat_view(tx_event: &Sender<Event>, tetra: &crate::tetra::StreamTetra) 
         // 3. The Toggle Logic
         let toggle_label = msg_label.clone();
         left_expand_btn.connect_clicked(move |_| {
-            if toggle_label.lines() == 11 {
-                toggle_label.set_lines(-1); // Expand fully
+            if toggle_label.lines() == -1 {
+                toggle_label.set_lines(11); // Collapse back
             } else {
-                toggle_label.set_lines(11);  // Collapse back
+                toggle_label.set_lines(-1);  // Expand fully
             }
         });
 
         let toggle_label_right = msg_label.clone();
         right_expand_btn.connect_clicked(move |_| {
-            if toggle_label_right.lines() == 11 {
-                toggle_label_right.set_lines(-1); // Expand fully
+            if toggle_label_right.lines() == -1 {
+                toggle_label_right.set_lines(11); // Collapse back
             } else {
-                toggle_label_right.set_lines(11);  // Collapse back
+                toggle_label_right.set_lines(-1);  // Expand fully
             }
         });
 
@@ -742,18 +744,12 @@ fn setup_chat_view(tx_event: &Sender<Event>, tetra: &crate::tetra::StreamTetra) 
             }
 
             let is_newest = item.position() == store_for_bind.n_items() - 1;
-            let should_expand = if is_user {
-                false // User posts always clamp
-            } else if !is_newest {
-                false // Historical AI posts ALWAYS clamp to 11
-            } else {
-                obj.is_expanded() // Only the live generating response gets to expand
-            };
 
-            if should_expand {
-                widgets.msg_label.set_lines(-1); // Fully open
+            if is_user || !is_newest {
+                widgets.msg_label.set_lines(11); // Lock all user and historical posts
             } else {
-                widgets.msg_label.set_lines(11); // Clamp to 11 lines
+                // Only the brand new, currently generating AI post gets to read the expanded state
+                widgets.msg_label.set_lines(if obj.is_expanded() { -1 } else { 11 });
             }
 
             // Adjust toggle buttons
