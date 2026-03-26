@@ -5,7 +5,7 @@ use async_channel::Sender;
 use gtk4::prelude::*;
 use gtk4::{
     Adjustment, Align, Box, Button, ColumnView, ColumnViewColumn, DropDown,
-    Image, Label, ListBox, ListItem, Orientation, PolicyType, Scale, ScrolledWindow,
+    Image, Label, ListBox, ListItem, ListView, Orientation, PolicyType, Scale, ScrolledWindow,
     SignalListItemFactory, SingleSelection, Spinner, Stack, StackSwitcher, StackTransitionType,
     StringList, StringObject, Switch, ToggleButton, Window, gio,
 };
@@ -403,17 +403,10 @@ pub fn build(window: &NativeWindow, tx_event: Sender<Event>, _workspace_tetra: &
         label.set_label(&obj.label());
     });
 
-    let matrix_view = ColumnView::new(Some(matrix_selection.clone()));
+    // A standard ListView natively has no headers, permanently destroying the void.
+    let matrix_view = ListView::new(Some(matrix_selection.clone()), Some(matrix_factory));
     matrix_view.set_enable_rubberband(true);
     matrix_view.set_single_click_activate(false);
-    matrix_view.set_show_row_separators(false);
-    matrix_view.set_show_column_separators(false);
-
-    // Fallback logic for GTK versions lacking `set_show_column_headers`.
-    // It is often accessible directly as a property setting:
-    matrix_view.set_property("show-column-headers", false);
-
-    matrix_view.append_column(&ColumnViewColumn::new(None, Some(matrix_factory)));
 
     let tx_matrix_sel = tx_event.clone();
     matrix_selection.connect_selection_changed(move |selection, _, _| {
@@ -498,7 +491,6 @@ pub fn build(window: &NativeWindow, tx_event: Sender<Event>, _workspace_tetra: &
         }
     });
 
-    let tx_back = tx_event.clone();
     let back_b = nav_history_back.clone();
     let back_f = nav_history_forward.clone();
     let back_c = current_matrix_path.clone();
@@ -517,7 +509,6 @@ pub fn build(window: &NativeWindow, tx_event: Sender<Event>, _workspace_tetra: &
         }
     });
 
-    let tx_fwd = tx_event.clone();
     let fwd_b = nav_history_back.clone();
     let fwd_f = nav_history_forward.clone();
     let fwd_c = current_matrix_path.clone();
@@ -536,7 +527,6 @@ pub fn build(window: &NativeWindow, tx_event: Sender<Event>, _workspace_tetra: &
         }
     });
 
-    let tx_up = tx_event.clone();
     let up_b = nav_history_back.clone();
     let up_f = nav_history_forward.clone();
     let up_c = current_matrix_path.clone();

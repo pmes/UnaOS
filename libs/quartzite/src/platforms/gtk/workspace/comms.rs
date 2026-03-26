@@ -5,7 +5,7 @@ use async_channel::Sender;
 use gtk4::prelude::*;
 use gtk4::{
     Align, Box, Button, CheckButton, Entry, EventControllerKey, Expander, FileDialog,
-    GestureClick, Label, ListItem, ListView, NoSelection, Orientation,
+    Label, ListItem, ListView, NoSelection, Orientation,
     PolicyType, Popover, PropagationPhase, ScrolledWindow, SignalListItemFactory, Stack,
     StackSwitcher, StackTransitionType, ToggleButton, Overlay,
     gdk::{Key, ModifierType},
