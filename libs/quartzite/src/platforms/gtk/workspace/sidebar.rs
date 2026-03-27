@@ -37,6 +37,7 @@ pub struct SidebarPointers {
     pub context_view: crate::widgets::telemetry::ContextView,
     pub matrix_store: gio::ListStore,
     pub matrix_selection: gtk4::MultiSelection,
+    pub matrix_scroll: ScrolledWindow,
     pub sidebar_toggle: ToggleButton,
 }
 
@@ -281,7 +282,7 @@ pub fn build(window: &NativeWindow, tx_event: Sender<Event>, _workspace_tetra: &
     nexus_box.set_margin_top(10);
 
     let nexus_list = ListBox::new();
-    nexus_list.add_css_class("shard-list");
+    nexus_list.add_css_class("boxed-list");
     nexus_list.set_selection_mode(gtk4::SelectionMode::Single);
 
     let active_target = Rc::new(RefCell::new("Una-Prime".to_string()));
@@ -387,6 +388,7 @@ pub fn build(window: &NativeWindow, tx_event: Sender<Event>, _workspace_tetra: &
         row.set_margin_end(10);
         row.set_margin_top(5);
         row.set_margin_bottom(5);
+        row.set_can_target(false); // This ensures the click passes completely through the row and hits the ListItem itself.
         let label = Label::new(None);
         label.set_xalign(0.0);
         label.set_can_target(false);
@@ -597,6 +599,7 @@ pub fn build(window: &NativeWindow, tx_event: Sender<Event>, _workspace_tetra: &
         context_view,
         matrix_store,
         matrix_selection,
+        matrix_scroll,
         sidebar_toggle,
     };
 

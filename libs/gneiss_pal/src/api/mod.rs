@@ -14,6 +14,8 @@
 // You should have received a copy of the GNU Lesser General Public License
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
+pub mod format;
+
 use log::warn;
 use log::{error, info};
 use reqwest::{Client, ClientBuilder, StatusCode};
@@ -116,14 +118,18 @@ struct PromptFeedback {
     block_reason: Option<String>,
 }
 
+use bandy::SMessage;
+use bandy::Synapse;
+
 pub struct ResilientClient {
     client: Client,
     model_url: String,
     token: String,
+    tx_event: Option<Synapse>,
 }
 
 impl ResilientClient {
-    pub async fn new() -> Result<Self, String> {
+    pub async fn new(tx_event: Option<Synapse>) -> Result<Self, String> {
         let token = Self::fetch_token()?;
 
         // 2. Hardcode to Experimental as requested
@@ -146,6 +152,7 @@ impl ResilientClient {
             client,
             model_url,
             token,
+            tx_event,
         })
     }
 
@@ -195,6 +202,13 @@ impl ResilientClient {
             contents: history.to_vec(),
             generation_config: GenerationConfig { temperature: 0.4 },
         };
+
+        if let Some(tx) = &self.tx_event {
+            if let Ok(json_string) = serde_json::to_string_pretty(&request_body.contents) {
+                let formatted = format::format_network_log(&json_string);
+                tx.fire_async(SMessage::NetworkLog(formatted)).await;
+            }
+        }
 
         let mut attempts = 0;
         loop {

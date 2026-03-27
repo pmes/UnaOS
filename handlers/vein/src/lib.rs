@@ -275,7 +275,8 @@ impl VeinHandler {
                 Err(_) => None,
             };
 
-            let client_res = ResilientClient::new().await;
+            let tx_clone = synapse_loop.clone();
+            let client_res = ResilientClient::new(Some(tx_clone)).await;
             match client_res {
                 Ok(mut client) => {
                     {
@@ -589,8 +590,9 @@ impl VeinHandler {
                                                 }
 
                                                 let ai_response_clone = response.clone();
+                                                let tx_inner = synapse_clone.clone();
                                                 tokio::spawn(async move {
-                                                    if let Ok(mut client_clone) = ResilientClient::new().await {
+                                                    if let Ok(mut client_clone) = ResilientClient::new(Some(tx_inner)).await {
                                                         if let Ok(engram) = crate::context::compress_into_engram(&mut client_clone, &raw_user_prompt, &ai_response_clone).await {
                                                             if let Ok(engram_embedding) = client_clone.embed_content(&engram).await {
                                                                 let timestamp = chrono::Local::now().format("%H:%M:%S").to_string();
