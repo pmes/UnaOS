@@ -537,9 +537,6 @@ impl VeinHandler {
                                         });
 
                                         let _ = synapse_loop.fire_async(SMessage::NetworkState("network-transmit-receive-symbolic".to_string())).await;
-                                        if let Ok(json_string) = serde_json::to_string_pretty(&context) {
-                                            let _ = synapse_loop.fire_async(SMessage::NetworkLog(json_string)).await;
-                                        }
 
                                         match client.generate_content(&context).await {
                                             Ok((response, metadata)) => {

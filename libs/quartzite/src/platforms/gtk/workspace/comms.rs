@@ -565,9 +565,7 @@ fn setup_chat_view(tx_event: &Sender<Event>, tetra: &crate::tetra::StreamTetra) 
     // Create a Rust struct to hold the precise pointers without DOM traversal
     #[derive(Clone)]
     struct BubbleWidgets {
-        left_spacer: Box,
         bubble: Box,
-        right_spacer: Box,
         left_expand_btn: Button,
         meta_label: Label,
         right_expand_btn: Button,
@@ -578,16 +576,14 @@ fn setup_chat_view(tx_event: &Sender<Event>, tetra: &crate::tetra::StreamTetra) 
     let console_factory = SignalListItemFactory::new();
     console_factory.connect_setup(move |_factory, item| {
         let item = item.downcast_ref::<ListItem>().unwrap();
-        let root = Box::new(Orientation::Horizontal, 0);
+
+        // CRITICAL: Vertical orientation allows native halign stagger without spacers
+        let root = Box::new(Orientation::Vertical, 0);
         root.set_hexpand(true);
         root.add_css_class("console-row");
 
-        let left_spacer = Box::new(Orientation::Horizontal, 0);
-        left_spacer.set_hexpand(true);
-        root.append(&left_spacer);
-
         let bubble = Box::new(Orientation::Vertical, 4);
-        bubble.add_css_class("card"); // <-- Native GTK background styling
+        bubble.add_css_class("card");
         bubble.add_css_class("bubble-box");
         bubble.set_margin_top(4);
         bubble.set_margin_bottom(4);
@@ -622,12 +618,12 @@ fn setup_chat_view(tx_event: &Sender<Event>, tetra: &crate::tetra::StreamTetra) 
         // --- Standard Mode (Message View) ---
         let msg_label = Label::builder()
             .wrap(true)
-            .lines(11) // Default locked state
+            .lines(11)
             .selectable(true)
-            .hexpand(false) // Allow shrinking for right-justify layout
-            .max_width_chars(85) // CRITICAL: Restricts Pango layout thrashing and forces the hexpand spacers to activate the stagger.
+            .hexpand(false)
+            .max_width_chars(85)
             .wrap_mode(gtk4::pango::WrapMode::WordChar)
-            .ellipsize(gtk4::pango::EllipsizeMode::End) // CRITICAL: Add this or clamping fails
+            // CRITICAL: ellipsize removed to prevent terminal layout stalling
             .build();
         msg_label.add_css_class("view");
 
@@ -652,15 +648,8 @@ fn setup_chat_view(tx_event: &Sender<Event>, tetra: &crate::tetra::StreamTetra) 
 
         root.append(&bubble);
 
-        let right_spacer = Box::new(Orientation::Horizontal, 0);
-        right_spacer.set_hexpand(true);
-        root.append(&right_spacer);
-
-        // Pack pointers securely into a struct and attach to the list item
         let widgets = BubbleWidgets {
-            left_spacer,
             bubble: bubble.clone(),
-            right_spacer,
             left_expand_btn: left_expand_btn.clone(),
             meta_label,
             right_expand_btn: right_expand_btn.clone(),
@@ -706,8 +695,8 @@ fn setup_chat_view(tx_event: &Sender<Event>, tetra: &crate::tetra::StreamTetra) 
 
         widgets.bubble.remove_css_class("architect-bubble");
         widgets.bubble.remove_css_class("una-bubble");
-        widgets.left_spacer.set_visible(false);
-        widgets.right_spacer.set_visible(false);
+        widgets.bubble.remove_css_class("bubble-user");
+        widgets.bubble.remove_css_class("bubble-ai");
 
         widgets.msg_label.set_visible(false);
         widgets.expander.set_visible(false);
@@ -734,17 +723,13 @@ fn setup_chat_view(tx_event: &Sender<Event>, tetra: &crate::tetra::StreamTetra) 
             let is_user = sender == "Architect";
 
             if is_user {
-                widgets.bubble.set_halign(gtk4::Align::End); // Push to the right
+                widgets.bubble.set_halign(gtk4::Align::End);
                 widgets.bubble.add_css_class("bubble-user");
-                widgets.left_spacer.set_visible(true);
-                widgets.right_spacer.set_visible(false);
                 widgets.meta_label.set_halign(gtk4::Align::End);
                 widgets.meta_label.set_xalign(1.0);
             } else {
-                widgets.bubble.set_halign(gtk4::Align::Start); // Push to the left
+                widgets.bubble.set_halign(gtk4::Align::Start);
                 widgets.bubble.add_css_class("bubble-ai");
-                widgets.left_spacer.set_visible(false);
-                widgets.right_spacer.set_visible(true);
                 widgets.meta_label.set_halign(gtk4::Align::Start);
                 widgets.meta_label.set_xalign(0.0);
             }
@@ -752,13 +737,11 @@ fn setup_chat_view(tx_event: &Sender<Event>, tetra: &crate::tetra::StreamTetra) 
             let is_newest = item.position() == store_for_bind.n_items() - 1;
 
             if is_user || !is_newest {
-                widgets.msg_label.set_lines(11); // Lock all user and historical posts
+                widgets.msg_label.set_lines(11);
             } else {
-                // Only the brand new, currently generating AI post gets to read the expanded state
                 widgets.msg_label.set_lines(if obj.is_expanded() { -1 } else { 11 });
             }
 
-            // Adjust toggle buttons
             if line_count > 11 {
                 widgets.left_expand_btn.set_visible(is_user);
                 widgets.right_expand_btn.set_visible(!is_user);
@@ -769,8 +752,7 @@ fn setup_chat_view(tx_event: &Sender<Event>, tetra: &crate::tetra::StreamTetra) 
         } else {
             widgets.expander.set_visible(true);
             widgets.bubble.add_css_class("una-bubble");
-            widgets.left_spacer.set_visible(false);
-            widgets.right_spacer.set_visible(true);
+            widgets.bubble.set_halign(gtk4::Align::Start);
             widgets.expander.set_label(Some(&format!("{} | {} | {}", sender, subject, timestamp)));
             // Direct access: No .child() traversal needed, we captured payload_content_view inside the BubbleWidgets if we want it, but wait, we didn't add payload_content_view to BubbleWidgets. I'll just use the traversal here since it's structurally fixed.
             if let Some(scroll) = widgets.expander.child().and_then(|c: gtk4::Widget| c.downcast::<ScrolledWindow>().ok()) {

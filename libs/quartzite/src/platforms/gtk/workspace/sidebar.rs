@@ -414,6 +414,8 @@ pub fn build(window: &NativeWindow, tx_event: Sender<Event>, _workspace_tetra: &
     matrix_view.add_css_class("navigation-sidebar");
     matrix_view.set_enable_rubberband(true);
     matrix_view.set_single_click_activate(false);
+    matrix_view.set_vexpand(true);
+    matrix_view.set_hexpand(true);
 
     // [NODE: UNA] - Real-time selection sync removed.
     // Selection state is now held locally and harvested by the Composer upon dispatch.
