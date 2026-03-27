@@ -168,6 +168,7 @@ fn setup_preflight_stack(tx_event: &Sender<Event>) -> PreflightStackData {
     let dir_buf_clone = preflight_dir_buf.clone();
     let eng_buf_clone = preflight_eng_buf.clone();
     let prm_buf_clone = preflight_prm_buf.clone();
+    let preflight_overlay_container_dispatch = preflight_stack_container.clone();
 
     dispatch_btn.connect_clicked(move |_| {
         let (s, e) = sys_buf_clone.bounds();
@@ -189,6 +190,8 @@ fn setup_preflight_stack(tx_event: &Sender<Event>) -> PreflightStackData {
             prompt: prompt_text,
         };
         let json = serde_json::to_string(&payload).unwrap();
+
+        preflight_overlay_container_dispatch.set_visible(false);
 
         let tx_async = tx_dispatch_preflight.clone();
         glib::MainContext::default().spawn_local(async move {
@@ -318,10 +321,12 @@ fn setup_input_area(tx_event: &Sender<Event>, window: &NativeWindow, active_targ
     let tx_clone_send = tx_event.clone();
     let buffer = text_view.buffer();
     let btn_send_clone = send_btn.clone();
+
     buffer.connect_changed(move |buf: &gtk4::TextBuffer| {
-        if buf.line_count() > 1 {
+        let has_class = btn_send_clone.has_css_class("suggested-action");
+        if buf.line_count() > 1 && has_class {
             btn_send_clone.remove_css_class("suggested-action");
-        } else {
+        } else if buf.line_count() <= 1 && !has_class {
             btn_send_clone.add_css_class("suggested-action");
         }
     });
@@ -620,6 +625,7 @@ fn setup_chat_view(tx_event: &Sender<Event>, tetra: &crate::tetra::StreamTetra) 
             .lines(11) // Default locked state
             .selectable(true)
             .hexpand(false) // Allow shrinking for right-justify layout
+            .max_width_chars(85) // CRITICAL: Restricts Pango layout thrashing and forces the hexpand spacers to activate the stagger.
             .wrap_mode(gtk4::pango::WrapMode::WordChar)
             .ellipsize(gtk4::pango::EllipsizeMode::End) // CRITICAL: Add this or clamping fails
             .build();

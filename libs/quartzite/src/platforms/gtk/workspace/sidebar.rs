@@ -415,20 +415,9 @@ pub fn build(window: &NativeWindow, tx_event: Sender<Event>, _workspace_tetra: &
     matrix_view.set_enable_rubberband(true);
     matrix_view.set_single_click_activate(false);
 
-    let tx_matrix_sel = tx_event.clone();
-    matrix_selection.connect_selection_changed(move |selection, _, _| {
-        let mut selected_ids = Vec::new();
-        for i in 0..selection.n_items() {
-            if selection.is_selected(i) {
-                if let Some(item) = selection.item(i) {
-                    if let Ok(obj) = item.downcast::<crate::widgets::model::MatrixNodeObject>() {
-                        selected_ids.push(obj.id());
-                    }
-                }
-            }
-        }
-        let _ = tx_matrix_sel.send_blocking(Event::UpdateMatrixSelection(selected_ids));
-    });
+    // [NODE: UNA] - Real-time selection sync removed.
+    // Selection state is now held locally and harvested by the Composer upon dispatch.
+    // This prevents the backend from rebuilding the tree and wiping the user's selection.
 
     let nav_history_back = std::rc::Rc::new(std::cell::RefCell::new(Vec::<String>::new()));
     let nav_history_forward = std::rc::Rc::new(std::cell::RefCell::new(Vec::<String>::new()));
