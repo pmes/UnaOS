@@ -114,6 +114,7 @@ pub fn build(window: &NativeWindow, tx_event: Sender<Event>) -> (SidebarWidgets,
     });
     let column_view = ColumnView::new(Some(selection_model));
     column_view.append_column(&ColumnViewColumn::new(None, Some(factory)));
+    column_view.set_vexpand(true);
     let tx_clone_nav = tx_event.clone();
     column_view
         .model()
@@ -191,6 +192,7 @@ pub fn build(window: &NativeWindow, tx_event: Sender<Event>) -> (SidebarWidgets,
         prompt_view.set_monospace(false);
         prompt_view.set_wrap_mode(gtk4::WrapMode::WordChar);
         enable_spelling(&prompt_view);
+        prompt_view.set_vexpand(true);
         let scroll = ScrolledWindow::builder()
             .child(&prompt_view)
             .vexpand(true)

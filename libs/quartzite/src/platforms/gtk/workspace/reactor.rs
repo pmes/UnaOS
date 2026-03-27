@@ -23,7 +23,6 @@ pub struct ReactorPointers {
     pub console_store: gtk4::gio::ListStore,
     pub is_fetching: Rc<RefCell<bool>>,
     pub is_prepending: Rc<RefCell<bool>>,
-    pub history_sync_cursor: Rc<RefCell<usize>>,
     pub preflight_overlay: Overlay,
     pub preflight_stack_container: gtk4::Box,
     pub preflight_stack: Stack,
@@ -37,34 +36,41 @@ pub fn spawn_listener(pointers: ReactorPointers, rx_gui: Receiver<GuiUpdate>) {
     gtk4::glib::MainContext::default().spawn_local(async move {
         while let Ok(update) = rx_gui.recv().await {
             match update {
-                GuiUpdate::ConsoleLog(text) => {
-                    let mut sender = "System".to_string();
-                    let mut is_chat = true;
-                    let content = text.clone();
-                    let mut subject = "Log".to_string();
+                GuiUpdate::ConsoleLogBatch(logs) => {
+                    let mut batch: Vec<gtk4::glib::Object> = Vec::new();
+                    for text in logs {
+                        let mut sender = "System".to_string();
+                        let mut is_chat = true;
+                        let content = text.clone();
+                        let mut subject = "Log".to_string();
 
-                    if text.trim().starts_with("[ARCHITECT]") {
-                        sender = "Architect".to_string();
-                        is_chat = true;
-                    } else if text.trim().starts_with("[UNA]") {
-                        sender = "Una-Prime".to_string();
-                        is_chat = true;
-                    } else if text.trim().starts_with("[S") {
-                        let after_s = &text.trim()[2..];
-                        if let Some(first_char) = after_s.chars().next() {
-                            if first_char.is_numeric() {
-                                sender = "Shard".to_string();
-                                is_chat = false;
-                                subject = "Wolfpack Output".to_string();
+                        if text.trim().starts_with("[ARCHITECT]") {
+                            sender = "Architect".to_string();
+                            is_chat = true;
+                        } else if text.trim().starts_with("[UNA]") {
+                            sender = "Una-Prime".to_string();
+                            is_chat = true;
+                        } else if text.trim().starts_with("[S") {
+                            let after_s = &text.trim()[2..];
+                            if let Some(first_char) = after_s.chars().next() {
+                                if first_char.is_numeric() {
+                                    sender = "Shard".to_string();
+                                    is_chat = false;
+                                    subject = "Wolfpack Output".to_string();
+                                }
                             }
                         }
-                    }
 
-                    let timestamp = chrono::Local::now().format("%H:%M:%S").to_string();
-                    let id = format!("{}", chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0));
-                    let obj = HistoryObject::new(&id, &sender, &subject, &timestamp, &content, is_chat);
-                    println!("Appending system log item: {}", content);
-                    pointers.console_store.append(&obj);
+                        let timestamp = chrono::Local::now().format("%H:%M:%S").to_string();
+                        let id = format!("{}", chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0));
+                        let obj = HistoryObject::new(&id, &sender, &subject, &timestamp, &content, is_chat);
+                        println!("Appending system log item: {}", content);
+                        batch.push(obj.upcast());
+                    }
+                    if !batch.is_empty() {
+                        let len = pointers.console_store.n_items();
+                        pointers.console_store.splice(len, 0, &batch);
+                    }
                 }
                 GuiUpdate::HistoryBatch(messages) => {
                     if messages.is_empty() {
@@ -73,31 +79,16 @@ pub fn spawn_listener(pointers: ReactorPointers, rx_gui: Receiver<GuiUpdate>) {
                         continue;
                     }
 
-                    let mut cursor = pointers.history_sync_cursor.borrow_mut();
-                    let new_len = messages.len();
-
-                    if new_len > *cursor {
-                        // Extract only the delta
-                        let delta = &messages[*cursor..];
-                        for msg in delta {
-                            let id = format!("{}-hist", chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0));
-                            let obj = HistoryObject::new(&id, &msg.sender, "History", &msg.timestamp, &msg.content, msg.is_chat);
-                            println!("Appending history item: {}", msg.content);
-                            pointers.console_store.append(&obj);
-                        }
-                        // Advance the cursor
-                        *cursor = new_len;
-                    } else if new_len < *cursor {
-                        // The state was hard-cleared or rolled back.
-                        // Reset the entire list and cursor.
-                        pointers.console_store.remove_all();
-                        for msg in messages {
-                            let id = format!("{}-hist", chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0));
-                            let obj = HistoryObject::new(&id, &msg.sender, "History", &msg.timestamp, &msg.content, msg.is_chat);
-                            println!("Appending history item: {}", msg.content);
-                            pointers.console_store.append(&obj);
-                        }
-                        *cursor = new_len;
+                    let mut batch: Vec<gtk4::glib::Object> = Vec::new();
+                    for msg in messages {
+                        let id = format!("{}-hist", chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0));
+                        let obj = HistoryObject::new(&id, &msg.sender, "History", &msg.timestamp, &msg.content, msg.is_chat);
+                        println!("Appending history item: {}", msg.content);
+                        batch.push(obj.upcast());
+                    }
+                    if !batch.is_empty() {
+                        let len = pointers.console_store.n_items();
+                        pointers.console_store.splice(len, 0, &batch);
                     }
 
                     let fetch_lock = pointers.is_fetching.clone();
@@ -111,7 +102,6 @@ pub fn spawn_listener(pointers: ReactorPointers, rx_gui: Receiver<GuiUpdate>) {
                 }
                 GuiUpdate::ClearConsole => {
                     pointers.console_store.remove_all();
-                    *pointers.history_sync_cursor.borrow_mut() = 0;
                 }
                 GuiUpdate::ShardStatusChanged { id, status } => {
                     if id == "una-prime" {

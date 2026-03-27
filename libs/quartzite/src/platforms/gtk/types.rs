@@ -7,7 +7,7 @@ use bandy::state::{HistoryItem, PreFlightPayload, WolfpackState, ShardStatus};
 pub enum GuiUpdate {
     HistoryBatch(Vec<HistoryItem>),
     ShardStatusChanged { id: String, status: ShardStatus },
-    ConsoleLog(String),
+    ConsoleLogBatch(Vec<String>),
     ClearConsole,
     AppendInput(String),
     EditorLoad(String),

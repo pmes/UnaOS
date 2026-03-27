@@ -30,7 +30,6 @@ pub struct CommsPointers {
     pub active_directive: Rc<RefCell<String>>,
     pub is_prepending: Rc<RefCell<bool>>,
     pub is_fetching: Rc<RefCell<bool>>,
-    pub history_sync_cursor: Rc<RefCell<usize>>,
     pub preflight_overlay: Overlay,
     pub preflight_stack_container: Box,
     pub preflight_stack: Stack,
@@ -84,6 +83,8 @@ pub fn build(
     let scrolled_window = ScrolledWindow::builder()
         .hscrollbar_policy(PolicyType::Never)
         .vscrollbar_policy(PolicyType::Automatic)
+        .vexpand(true)
+        .hexpand(true)
         .build();
 
     chat_overlay.set_child(Some(&scrolled_window));
@@ -607,6 +608,8 @@ pub fn build(
     body_view.set_monospace(false);
     body_view.set_wrap_mode(gtk4::WrapMode::WordChar);
     enable_spelling(&body_view);
+    body_view.set_vexpand(true);
+    body_view.set_size_request(-1, 150);
 
     let body_scroll = ScrolledWindow::builder()
         .child(&body_view)
@@ -845,7 +848,6 @@ pub fn build(
         active_directive,
         is_prepending,
         is_fetching,
-        history_sync_cursor: Rc::new(RefCell::new(0)),
         preflight_overlay: chat_overlay,
         preflight_stack_container,
         preflight_stack,
