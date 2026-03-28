@@ -417,9 +417,7 @@ struct ChatAreaData {
 
 #[derive(Clone)]
 struct BubbleWidgets {
-    left_spacer: Box,
     bubble: Box,
-    right_spacer: Box,
     left_expand_btn: Button,
     meta_label: Label,
     right_expand_btn: Button,
@@ -627,16 +625,13 @@ fn setup_chat_view(tx_event: &Sender<Event>, tetra: &crate::tetra::StreamTetra) 
     console_factory.connect_setup(move |_factory, item| {
         let item = item.downcast_ref::<ListItem>().unwrap();
 
-        let root = Box::new(Orientation::Horizontal, 0);
+        // 1. The Row: Vertical, spanning the full width of the ListView
+        let root = Box::new(Orientation::Vertical, 0);
         root.set_hexpand(true);
+        root.set_halign(gtk4::Align::Fill);
         root.add_css_class("console-row");
 
-        let left_spacer = Box::new(Orientation::Horizontal, 0);
-        left_spacer.set_hexpand(true);
-
-        let right_spacer = Box::new(Orientation::Horizontal, 0);
-        right_spacer.set_hexpand(true);
-
+        // 2. The Bubble: Rigid. Its width is dictated ONLY by the msg_label
         let bubble = Box::new(Orientation::Vertical, 4);
         bubble.add_css_class("card");
         bubble.add_css_class("bubble-box");
@@ -646,18 +641,15 @@ fn setup_chat_view(tx_event: &Sender<Event>, tetra: &crate::tetra::StreamTetra) 
 
         let header_box = Box::new(Orientation::Horizontal, 8);
         let left_expand_btn = Button::builder().icon_name("pan-down-symbolic").css_classes(vec!["flat"]).build();
+
+        // 3. The Meta Label: Infection killed.
         let meta_label = Label::builder()
             .xalign(0.0)
             .css_classes(vec!["dim-label"])
             .hexpand(false)
-            .halign(gtk4::Align::Fill)
             .build();
-        let right_expand_btn = Button::builder()
-            .icon_name("pan-down-symbolic")
-            .css_classes(vec!["flat"])
-            .halign(gtk4::Align::End)
-            .hexpand(true)
-            .build();
+
+        let right_expand_btn = Button::builder().icon_name("pan-down-symbolic").css_classes(vec!["flat"]).build();
 
         header_box.append(&left_expand_btn);
         header_box.append(&meta_label);
@@ -692,14 +684,10 @@ fn setup_chat_view(tx_event: &Sender<Event>, tetra: &crate::tetra::StreamTetra) 
         expander.set_child(Some(&payload_scroll));
         bubble.append(&expander);
 
-        root.append(&left_spacer);
         root.append(&bubble);
-        root.append(&right_spacer);
 
         let widgets = BubbleWidgets {
-            left_spacer,
             bubble: bubble.clone(),
-            right_spacer,
             left_expand_btn: left_expand_btn.clone(),
             meta_label,
             right_expand_btn: right_expand_btn.clone(),
@@ -768,22 +756,18 @@ fn setup_chat_view(tx_event: &Sender<Event>, tetra: &crate::tetra::StreamTetra) 
             let is_user = sender == "Architect";
 
             if is_user {
-                widgets.left_spacer.set_visible(true);
-                widgets.right_spacer.set_visible(false);
-
+                widgets.bubble.set_halign(gtk4::Align::End);
                 widgets.bubble.add_css_class("bubble-user");
-                widgets.bubble.set_margin_start(16);
+                widgets.bubble.set_margin_start(64);
                 widgets.bubble.set_margin_end(16);
 
                 widgets.meta_label.set_halign(gtk4::Align::End);
                 widgets.meta_label.set_xalign(1.0);
             } else {
-                widgets.left_spacer.set_visible(false);
-                widgets.right_spacer.set_visible(true);
-
+                widgets.bubble.set_halign(gtk4::Align::Start);
                 widgets.bubble.add_css_class("bubble-ai");
                 widgets.bubble.set_margin_start(16);
-                widgets.bubble.set_margin_end(16);
+                widgets.bubble.set_margin_end(64);
 
                 widgets.meta_label.set_halign(gtk4::Align::Start);
                 widgets.meta_label.set_xalign(0.0);
@@ -794,12 +778,11 @@ fn setup_chat_view(tx_event: &Sender<Event>, tetra: &crate::tetra::StreamTetra) 
         } else {
             widgets.left_expand_btn.set_visible(false);
             widgets.right_expand_btn.set_visible(false);
-            widgets.left_spacer.set_visible(false);
-            widgets.right_spacer.set_visible(true);
             widgets.expander.set_visible(true);
             widgets.bubble.add_css_class("una-bubble");
+            widgets.bubble.set_halign(gtk4::Align::Start);
             widgets.bubble.set_margin_start(16);
-            widgets.bubble.set_margin_end(16);
+            widgets.bubble.set_margin_end(64);
             widgets.expander.set_label(Some(&format!("{} | {} | {}", sender, subject, timestamp)));
 
             if let Some(scroll) = widgets.expander.child().and_then(|c: gtk4::Widget| c.downcast::<ScrolledWindow>().ok()) {
