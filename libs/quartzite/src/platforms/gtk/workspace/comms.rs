@@ -616,6 +616,9 @@ fn setup_chat_view(tx_event: &Sender<Event>, tetra: &crate::tetra::StreamTetra) 
 
         let msg_label = Label::builder()
             .wrap(true)
+            .lines(11) // MUST BE HERE AT BIRTH
+            .ellipsize(gtk4::pango::EllipsizeMode::End) // MUST BE HERE AT BIRTH
+            .selectable(false) // MUST BE HERE AT BIRTH
             .hexpand(false)
             .max_width_chars(85)
             .wrap_mode(gtk4::pango::WrapMode::WordChar)
@@ -724,13 +727,14 @@ fn setup_chat_view(tx_event: &Sender<Event>, tetra: &crate::tetra::StreamTetra) 
 
             // ENFORCE GEOMETRY BASED ON MODEL STATE
             if is_expanded {
-                widgets.msg_label.set_lines(-1);
-                widgets.msg_label.set_ellipsize(gtk4::pango::EllipsizeMode::None);
                 widgets.msg_label.set_selectable(true);
+                widgets.msg_label.set_ellipsize(gtk4::pango::EllipsizeMode::None);
+                widgets.msg_label.set_lines(-1);
             } else {
-                widgets.msg_label.set_lines(11);
-                widgets.msg_label.set_ellipsize(gtk4::pango::EllipsizeMode::End);
+                // ORDER IS CRITICAL. MUST DISABLE SELECTABLE FIRST.
                 widgets.msg_label.set_selectable(false);
+                widgets.msg_label.set_ellipsize(gtk4::pango::EllipsizeMode::End);
+                widgets.msg_label.set_lines(11);
             }
 
             if line_count > 11 {
