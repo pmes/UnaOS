@@ -258,12 +258,11 @@ fn setup_input_area(tx_event: &Sender<Event>, window: &NativeWindow, active_targ
     let input_scroll = ScrolledWindow::builder()
         .hscrollbar_policy(PolicyType::Never)
         .vscrollbar_policy(PolicyType::Automatic)
-        .has_frame(false)
+        .has_frame(true)
         .propagate_natural_height(true)
         .max_content_height(150)
         .build();
     input_scroll.set_hexpand(true);
-    input_scroll.add_css_class("card");
     input_scroll.set_margin_top(8);
     input_scroll.set_margin_bottom(8);
     input_scroll.set_margin_start(8);
@@ -638,18 +637,24 @@ fn setup_chat_view(tx_event: &Sender<Event>, tetra: &crate::tetra::StreamTetra) 
         let item_clone_left = item.clone();
         let store_clone_left = store_for_setup.clone();
         left_expand_btn.connect_clicked(move |_| {
-            if let Some(obj) = item_clone_left.item().and_then(|i| i.downcast::<HistoryObject>().ok()) {
-                obj.set_is_expanded(!obj.is_expanded());
-                store_clone_left.items_changed(item_clone_left.position(), 1, 1);
+            let pos = item_clone_left.position();
+            if pos != gtk4::INVALID_LIST_POSITION {
+                if let Some(obj) = item_clone_left.item().and_then(|i| i.downcast::<HistoryObject>().ok()) {
+                    obj.set_is_expanded(!obj.is_expanded());
+                    store_clone_left.items_changed(pos, 1, 1);
+                }
             }
         });
 
         let item_clone_right = item.clone();
         let store_clone_right = store_for_setup.clone();
         right_expand_btn.connect_clicked(move |_| {
-            if let Some(obj) = item_clone_right.item().and_then(|i| i.downcast::<HistoryObject>().ok()) {
-                obj.set_is_expanded(!obj.is_expanded());
-                store_clone_right.items_changed(item_clone_right.position(), 1, 1);
+            let pos = item_clone_right.position();
+            if pos != gtk4::INVALID_LIST_POSITION {
+                if let Some(obj) = item_clone_right.item().and_then(|i| i.downcast::<HistoryObject>().ok()) {
+                    obj.set_is_expanded(!obj.is_expanded());
+                    store_clone_right.items_changed(pos, 1, 1);
+                }
             }
         });
 
@@ -711,18 +716,16 @@ fn setup_chat_view(tx_event: &Sender<Event>, tetra: &crate::tetra::StreamTetra) 
             let is_long_message = content.len() > 800 || explicit_lines > 10;
 
             if is_expanded || !is_long_message {
-                // Expanded: Feed the entire string to the layout engine
                 widgets.msg_label.set_label(&content);
                 widgets.msg_label.set_selectable(true);
+                widgets.left_expand_btn.set_icon_name("pan-up-symbolic");
+                widgets.right_expand_btn.set_icon_name("pan-up-symbolic");
             } else {
-                // Collapsed: Hard guillotine at 800 chars or 10 lines
                 let mut byte_idx = 0;
                 let mut line_count = 0;
 
                 for (idx, c) in content.char_indices() {
-                    if c == '\n' {
-                        line_count += 1;
-                    }
+                    if c == '\n' { line_count += 1; }
                     if line_count >= 10 || idx >= 800 {
                         byte_idx = idx;
                         break;
@@ -733,16 +736,17 @@ fn setup_chat_view(tx_event: &Sender<Event>, tetra: &crate::tetra::StreamTetra) 
                 let mut truncated = String::with_capacity(850);
                 if byte_idx < content.len() {
                     truncated.push_str(&content[..byte_idx]);
-                    truncated.push_str("..."); // Simple ellipsis
+                    truncated.push_str("\n...");
                 } else {
                     truncated.push_str(&content);
                 }
 
                 widgets.msg_label.set_label(&truncated);
                 widgets.msg_label.set_selectable(false);
+                widgets.left_expand_btn.set_icon_name("pan-down-symbolic");
+                widgets.right_expand_btn.set_icon_name("pan-down-symbolic");
             }
 
-            // Rely entirely on the physical expander buttons
             if is_long_message {
                 widgets.left_expand_btn.set_visible(is_user);
                 widgets.right_expand_btn.set_visible(!is_user);
