@@ -646,9 +646,18 @@ fn setup_chat_view(tx_event: &Sender<Event>, tetra: &crate::tetra::StreamTetra) 
 
         let header_box = Box::new(Orientation::Horizontal, 8);
         let left_expand_btn = Button::builder().icon_name("pan-down-symbolic").css_classes(vec!["flat"]).build();
-        // Restored hexpand(true) to meta_label so it correctly fills the header box
-        let meta_label = Label::builder().xalign(0.0).css_classes(vec!["dim-label"]).hexpand(true).build();
-        let right_expand_btn = Button::builder().icon_name("pan-down-symbolic").css_classes(vec!["flat"]).build();
+        let meta_label = Label::builder()
+            .xalign(0.0)
+            .css_classes(vec!["dim-label"])
+            .hexpand(false)
+            .halign(gtk4::Align::Fill)
+            .build();
+        let right_expand_btn = Button::builder()
+            .icon_name("pan-down-symbolic")
+            .css_classes(vec!["flat"])
+            .halign(gtk4::Align::End)
+            .hexpand(true)
+            .build();
 
         header_box.append(&left_expand_btn);
         header_box.append(&meta_label);
