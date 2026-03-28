@@ -569,7 +569,9 @@ fn setup_chat_view(tx_event: &Sender<Event>, tetra: &crate::tetra::StreamTetra) 
         left_expand_btn: Button,
         meta_label: Label,
         right_expand_btn: Button,
-        msg_label: Label,
+        msg_stack: Stack,
+        msg_collapsed: Label,
+        msg_expanded: Label,
         expander: Expander,
     }
 
@@ -591,22 +593,10 @@ fn setup_chat_view(tx_event: &Sender<Event>, tetra: &crate::tetra::StreamTetra) 
         bubble.set_margin_end(8);
 
         let header_box = Box::new(Orientation::Horizontal, 8);
-
-        let left_expand_btn = Button::builder()
-            .icon_name("pan-down-symbolic")
-            .css_classes(vec!["flat"])
-            .build();
+        let left_expand_btn = Button::builder().icon_name("pan-down-symbolic").css_classes(vec!["flat"]).build();
         left_expand_btn.set_visible(false);
-
-        let meta_label = Label::new(None);
-        meta_label.set_xalign(0.0);
-        meta_label.add_css_class("dim-label");
-        meta_label.set_hexpand(true);
-
-        let right_expand_btn = Button::builder()
-            .icon_name("pan-down-symbolic")
-            .css_classes(vec!["flat"])
-            .build();
+        let meta_label = Label::builder().xalign(0.0).css_classes(vec!["dim-label"]).hexpand(true).build();
+        let right_expand_btn = Button::builder().icon_name("pan-down-symbolic").css_classes(vec!["flat"]).build();
         right_expand_btn.set_visible(false);
 
         header_box.append(&left_expand_btn);
@@ -614,18 +604,37 @@ fn setup_chat_view(tx_event: &Sender<Event>, tetra: &crate::tetra::StreamTetra) 
         header_box.append(&right_expand_btn);
         bubble.append(&header_box);
 
-        let msg_label = Label::builder()
+        // --- The Stack Architecture ---
+        let msg_stack = Stack::new();
+        msg_stack.set_vhomogeneous(false); // Let the stack resize cleanly on swap
+
+        // Born Strict: Never recalculates height
+        let msg_collapsed = Label::builder()
             .wrap(true)
-            .lines(11) // MUST BE HERE AT BIRTH
-            .ellipsize(gtk4::pango::EllipsizeMode::End) // MUST BE HERE AT BIRTH
-            .selectable(false) // MUST BE HERE AT BIRTH
+            .lines(11)
+            .ellipsize(gtk4::pango::EllipsizeMode::End)
+            .selectable(false)
             .hexpand(false)
             .max_width_chars(85)
             .wrap_mode(gtk4::pango::WrapMode::WordChar)
             .build();
-        msg_label.add_css_class("view");
-        bubble.append(&msg_label);
+        msg_collapsed.add_css_class("view");
 
+        // Born Unbounded: Ready for selection
+        let msg_expanded = Label::builder()
+            .wrap(true)
+            .selectable(true)
+            .hexpand(false)
+            .max_width_chars(85)
+            .wrap_mode(gtk4::pango::WrapMode::WordChar)
+            .build();
+        msg_expanded.add_css_class("view");
+
+        msg_stack.add_named(&msg_collapsed, Some("collapsed"));
+        msg_stack.add_named(&msg_expanded, Some("expanded"));
+        bubble.append(&msg_stack);
+
+        // --- Payload Expander ---
         let expander = Expander::new(None);
         let payload_content_buffer = gtk4::TextBuffer::new(None);
         let payload_content_view = gtk4::TextView::with_buffer(&payload_content_buffer);
@@ -635,10 +644,7 @@ fn setup_chat_view(tx_event: &Sender<Event>, tetra: &crate::tetra::StreamTetra) 
         payload_content_view.set_cursor_visible(false);
         payload_content_view.add_css_class("view");
         payload_content_view.set_size_request(-1, 300);
-
-        let payload_scroll = ScrolledWindow::builder()
-            .child(&payload_content_view)
-            .build();
+        let payload_scroll = ScrolledWindow::builder().child(&payload_content_view).build();
         expander.set_child(Some(&payload_scroll));
         bubble.append(&expander);
         root.append(&bubble);
@@ -648,16 +654,18 @@ fn setup_chat_view(tx_event: &Sender<Event>, tetra: &crate::tetra::StreamTetra) 
             left_expand_btn: left_expand_btn.clone(),
             meta_label,
             right_expand_btn: right_expand_btn.clone(),
-            msg_label: msg_label.clone(),
+            msg_stack,
+            msg_collapsed,
+            msg_expanded,
             expander,
         };
 
-        // CRITICAL FIX: Mutate the Model, Not the View
+        // --- Compile-Time Safe Model Mutation ---
         let item_clone_left = item.clone();
         let store_clone_left = store_for_setup.clone();
         left_expand_btn.connect_clicked(move |_| {
             if let Some(obj) = item_clone_left.item().and_then(|i| i.downcast::<HistoryObject>().ok()) {
-                obj.set_property("expanded", !obj.is_expanded());
+                obj.set_is_expanded(!obj.is_expanded());
                 store_clone_left.items_changed(item_clone_left.position(), 1, 1);
             }
         });
@@ -666,7 +674,7 @@ fn setup_chat_view(tx_event: &Sender<Event>, tetra: &crate::tetra::StreamTetra) 
         let store_clone_right = store_for_setup.clone();
         right_expand_btn.connect_clicked(move |_| {
             if let Some(obj) = item_clone_right.item().and_then(|i| i.downcast::<HistoryObject>().ok()) {
-                obj.set_property("expanded", !obj.is_expanded());
+                obj.set_is_expanded(!obj.is_expanded());
                 store_clone_right.items_changed(item_clone_right.position(), 1, 1);
             }
         });
@@ -690,7 +698,7 @@ fn setup_chat_view(tx_event: &Sender<Event>, tetra: &crate::tetra::StreamTetra) 
         widgets.bubble.remove_css_class("bubble-user");
         widgets.bubble.remove_css_class("bubble-ai");
 
-        widgets.msg_label.set_visible(false);
+        widgets.msg_stack.set_visible(false);
         widgets.expander.set_visible(false);
         widgets.left_expand_btn.set_visible(false);
         widgets.right_expand_btn.set_visible(false);
@@ -700,15 +708,17 @@ fn setup_chat_view(tx_event: &Sender<Event>, tetra: &crate::tetra::StreamTetra) 
         let timestamp = obj.timestamp();
         let content = obj.content();
         let subject = obj.subject();
-        let is_expanded = obj.is_expanded(); // Single Source of Truth
+        let is_expanded = obj.is_expanded();
 
         if is_chat {
-            widgets.msg_label.set_visible(true);
+            widgets.msg_stack.set_visible(true);
+            widgets.msg_collapsed.set_label(&content);
+            widgets.msg_expanded.set_label(&content);
+
             widgets.meta_label.set_text(&format!("{} • {}", sender, timestamp));
             widgets.meta_label.remove_css_class("role-architect");
             widgets.meta_label.remove_css_class("role-una");
             widgets.meta_label.remove_css_class("role-system");
-            widgets.msg_label.set_label(&content);
 
             let line_count = content.trim_end().lines().count();
             let is_user = sender == "Architect";
@@ -725,16 +735,11 @@ fn setup_chat_view(tx_event: &Sender<Event>, tetra: &crate::tetra::StreamTetra) 
                 widgets.meta_label.set_xalign(0.0);
             }
 
-            // ENFORCE GEOMETRY BASED ON MODEL STATE
+            // --- Enforce Layout via Stack Visibility ---
             if is_expanded {
-                widgets.msg_label.set_selectable(true);
-                widgets.msg_label.set_ellipsize(gtk4::pango::EllipsizeMode::None);
-                widgets.msg_label.set_lines(-1);
+                widgets.msg_stack.set_visible_child_name("expanded");
             } else {
-                // ORDER IS CRITICAL. MUST DISABLE SELECTABLE FIRST.
-                widgets.msg_label.set_selectable(false);
-                widgets.msg_label.set_ellipsize(gtk4::pango::EllipsizeMode::End);
-                widgets.msg_label.set_lines(11);
+                widgets.msg_stack.set_visible_child_name("collapsed");
             }
 
             if line_count > 11 {
