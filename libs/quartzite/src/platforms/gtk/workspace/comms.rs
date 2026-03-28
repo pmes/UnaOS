@@ -652,12 +652,13 @@ fn setup_chat_view(tx_event: &Sender<Event>, tetra: &crate::tetra::StreamTetra) 
         let msg_label = Label::builder()
             .wrap(true)
             .hexpand(false)
-            .max_width_chars(85)
+            .max_width_chars(65)
             .wrap_mode(gtk4::pango::WrapMode::WordChar)
             .margin_top(8)
             .margin_bottom(8)
             .margin_start(12)
             .margin_end(12)
+            .xalign(0.0)
             .build();
         msg_label.add_css_class("view");
 
@@ -752,11 +753,15 @@ fn setup_chat_view(tx_event: &Sender<Event>, tetra: &crate::tetra::StreamTetra) 
             if is_user {
                 widgets.bubble.set_halign(gtk4::Align::End);
                 widgets.bubble.add_css_class("bubble-user");
+                widgets.bubble.set_margin_start(64);
+                widgets.bubble.set_margin_end(8);
                 widgets.meta_label.set_halign(gtk4::Align::End);
                 widgets.meta_label.set_xalign(1.0);
             } else {
                 widgets.bubble.set_halign(gtk4::Align::Start);
                 widgets.bubble.add_css_class("bubble-ai");
+                widgets.bubble.set_margin_start(8);
+                widgets.bubble.set_margin_end(64);
                 widgets.meta_label.set_halign(gtk4::Align::Start);
                 widgets.meta_label.set_xalign(0.0);
             }
