@@ -706,35 +706,43 @@ fn setup_chat_view(tx_event: &Sender<Event>, tetra: &crate::tetra::StreamTetra) 
                 widgets.meta_label.set_xalign(0.0);
             }
 
-            // --- THE CAN-AM BYPASS: Data-Layer Truncation ---
+            // --- STRICT BYTE-BOUNDARY TRUNCATION ---
             let explicit_lines = content.trim_end().lines().count();
             let is_long_message = content.len() > 800 || explicit_lines > 10;
 
             if is_expanded || !is_long_message {
-                // Expanded: Feed it the whole string
+                // Expanded: Feed the entire string to the layout engine
                 widgets.msg_label.set_label(&content);
                 widgets.msg_label.set_selectable(true);
             } else {
-                // Collapsed: Physically cut the string so GTK cannot expand it
-                let mut truncated = String::with_capacity(850);
-                let mut lines_added = 0;
-                let mut chars_added = 0;
+                // Collapsed: Hard guillotine at 800 chars or 10 lines
+                let mut byte_idx = 0;
+                let mut line_count = 0;
 
-                for line in content.lines() {
-                    if lines_added >= 10 || chars_added >= 800 {
+                for (idx, c) in content.char_indices() {
+                    if c == '\n' {
+                        line_count += 1;
+                    }
+                    if line_count >= 10 || idx >= 800 {
+                        byte_idx = idx;
                         break;
                     }
-                    truncated.push_str(line);
-                    truncated.push('\n');
-                    lines_added += 1;
-                    chars_added += line.len();
+                    byte_idx = idx + c.len_utf8();
                 }
-                truncated.push_str("... [Expand to read more]");
+
+                let mut truncated = String::with_capacity(850);
+                if byte_idx < content.len() {
+                    truncated.push_str(&content[..byte_idx]);
+                    truncated.push_str("..."); // Simple ellipsis
+                } else {
+                    truncated.push_str(&content);
+                }
 
                 widgets.msg_label.set_label(&truncated);
                 widgets.msg_label.set_selectable(false);
             }
 
+            // Rely entirely on the physical expander buttons
             if is_long_message {
                 widgets.left_expand_btn.set_visible(is_user);
                 widgets.right_expand_btn.set_visible(!is_user);
