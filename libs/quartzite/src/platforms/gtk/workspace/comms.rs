@@ -263,6 +263,7 @@ fn setup_input_area(tx_event: &Sender<Event>, window: &NativeWindow, active_targ
         .max_content_height(150)
         .build();
     input_scroll.set_hexpand(true);
+    input_scroll.add_css_class("card");
     input_scroll.set_margin_top(8);
     input_scroll.set_margin_bottom(8);
     input_scroll.set_margin_start(8);
@@ -272,10 +273,6 @@ fn setup_input_area(tx_event: &Sender<Event>, window: &NativeWindow, active_targ
         .show_line_numbers(false)
         .auto_indent(true)
         .accepts_tab(false)
-        .top_margin(8)
-        .bottom_margin(8)
-        .left_margin(10)
-        .right_margin(10)
         .build();
     enable_spelling(&text_view);
     text_view.add_css_class("view");
@@ -606,6 +603,10 @@ fn setup_chat_view(tx_event: &Sender<Event>, tetra: &crate::tetra::StreamTetra) 
             .hexpand(false)
             .max_width_chars(85)
             .wrap_mode(gtk4::pango::WrapMode::WordChar)
+            .margin_top(8)
+            .margin_bottom(8)
+            .margin_start(12)
+            .margin_end(12)
             .build();
         msg_label.add_css_class("view");
 
@@ -852,7 +853,8 @@ pub fn build(
 
     comms_page.set_start_child(Some(&chat_overlay));
     comms_page.set_end_child(Some(&input_container));
-    comms_page.set_position(600);
+    comms_page.set_shrink_end_child(false);
+    comms_page.set_resize_end_child(false);
 
     let active_directive = Rc::new(RefCell::new("Directive 055".to_string()));
 
