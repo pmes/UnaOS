@@ -623,7 +623,8 @@ fn setup_chat_view(tx_event: &Sender<Event>, tetra: &crate::tetra::StreamTetra) 
             .hexpand(false)
             .max_width_chars(85)
             .wrap_mode(gtk4::pango::WrapMode::WordChar)
-            // CRITICAL: ellipsize removed to prevent terminal layout stalling
+            // Restore Geometric Authority to prevent infinite layout thrashing
+            .ellipsize(gtk4::pango::EllipsizeMode::End)
             .build();
         msg_label.add_css_class("view");
 
@@ -631,11 +632,11 @@ fn setup_chat_view(tx_event: &Sender<Event>, tetra: &crate::tetra::StreamTetra) 
 
         // --- Standard Mode (Expander) ---
         let expander = Expander::new(None);
-        let payload_content_buffer = sourceview5::Buffer::new(None);
-        let payload_content_view = SourceView::with_buffer(&payload_content_buffer);
+        // J25.02: Replace SourceView with a lightweight read-only TextView
+        let payload_content_buffer = gtk4::TextBuffer::new(None);
+        let payload_content_view = gtk4::TextView::with_buffer(&payload_content_buffer);
         payload_content_view.set_editable(false);
         payload_content_view.set_wrap_mode(gtk4::WrapMode::WordChar);
-        payload_content_view.set_show_line_numbers(true);
         payload_content_view.set_monospace(true);
         payload_content_view.set_cursor_visible(false);
         payload_content_view.add_css_class("view");
@@ -662,8 +663,10 @@ fn setup_chat_view(tx_event: &Sender<Event>, tetra: &crate::tetra::StreamTetra) 
         left_expand_btn.connect_clicked(move |_| {
             if toggle_label.lines() == -1 {
                 toggle_label.set_lines(11); // Collapse back
+                toggle_label.set_ellipsize(gtk4::pango::EllipsizeMode::End); // Restore bounds
             } else {
                 toggle_label.set_lines(-1);  // Expand fully
+                toggle_label.set_ellipsize(gtk4::pango::EllipsizeMode::None); // Unbound
             }
         });
 
@@ -671,8 +674,10 @@ fn setup_chat_view(tx_event: &Sender<Event>, tetra: &crate::tetra::StreamTetra) 
         right_expand_btn.connect_clicked(move |_| {
             if toggle_label_right.lines() == -1 {
                 toggle_label_right.set_lines(11); // Collapse back
+                toggle_label_right.set_ellipsize(gtk4::pango::EllipsizeMode::End); // Restore bounds
             } else {
                 toggle_label_right.set_lines(-1);  // Expand fully
+                toggle_label_right.set_ellipsize(gtk4::pango::EllipsizeMode::None); // Unbound
             }
         });
 
@@ -756,8 +761,8 @@ fn setup_chat_view(tx_event: &Sender<Event>, tetra: &crate::tetra::StreamTetra) 
             widgets.expander.set_label(Some(&format!("{} | {} | {}", sender, subject, timestamp)));
             // Direct access: No .child() traversal needed, we captured payload_content_view inside the BubbleWidgets if we want it, but wait, we didn't add payload_content_view to BubbleWidgets. I'll just use the traversal here since it's structurally fixed.
             if let Some(scroll) = widgets.expander.child().and_then(|c: gtk4::Widget| c.downcast::<ScrolledWindow>().ok()) {
-                if let Some(content_view) = scroll.child().and_then(|c: gtk4::Widget| c.downcast::<SourceView>().ok()) {
-                    content_view.buffer().downcast::<sourceview5::Buffer>().unwrap().set_text(&content);
+                if let Some(content_view) = scroll.child().and_then(|c: gtk4::Widget| c.downcast::<gtk4::TextView>().ok()) {
+                    content_view.buffer().set_text(&content);
                 }
             }
             widgets.expander.set_expanded(false);
