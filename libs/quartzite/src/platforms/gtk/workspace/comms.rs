@@ -632,6 +632,7 @@ fn setup_chat_view(tx_event: &Sender<Event>, tetra: &crate::tetra::StreamTetra) 
         let bubble = Box::new(Orientation::Vertical, 4);
         bubble.add_css_class("card");
         bubble.add_css_class("bubble-box");
+        bubble.set_hexpand(false); // NEW: Cures the width stretching
         bubble.set_margin_top(4);
         bubble.set_margin_bottom(4);
         bubble.set_margin_start(8);
@@ -640,7 +641,11 @@ fn setup_chat_view(tx_event: &Sender<Event>, tetra: &crate::tetra::StreamTetra) 
         let header_box = Box::new(Orientation::Horizontal, 8);
         let left_expand_btn = Button::builder().icon_name("pan-down-symbolic").css_classes(vec!["flat"]).build();
         left_expand_btn.set_visible(false);
-        let meta_label = Label::builder().xalign(0.0).css_classes(vec!["dim-label"]).hexpand(true).build();
+        let meta_label = Label::builder()
+            .xalign(0.0)
+            .css_classes(vec!["dim-label"])
+            .hexpand(false)
+            .build();
         let right_expand_btn = Button::builder().icon_name("pan-down-symbolic").css_classes(vec!["flat"]).build();
         right_expand_btn.set_visible(false);
 
