@@ -417,7 +417,9 @@ struct ChatAreaData {
 
 #[derive(Clone)]
 struct BubbleWidgets {
+    left_spacer: Box,
     bubble: Box,
+    right_spacer: Box,
     left_expand_btn: Button,
     meta_label: Label,
     right_expand_btn: Button,
@@ -625,15 +627,20 @@ fn setup_chat_view(tx_event: &Sender<Event>, tetra: &crate::tetra::StreamTetra) 
     console_factory.connect_setup(move |_factory, item| {
         let item = item.downcast_ref::<ListItem>().unwrap();
 
-        let root = Box::new(Orientation::Vertical, 0);
+        let root = Box::new(Orientation::Horizontal, 0);
         root.set_hexpand(true);
-        root.set_halign(gtk4::Align::Fill); // CRITICAL FIX: Forces the row to span 2880px
         root.add_css_class("console-row");
+
+        let left_spacer = Box::new(Orientation::Horizontal, 0);
+        left_spacer.set_hexpand(true);
+
+        let right_spacer = Box::new(Orientation::Horizontal, 0);
+        right_spacer.set_hexpand(true);
 
         let bubble = Box::new(Orientation::Vertical, 4);
         bubble.add_css_class("card");
         bubble.add_css_class("bubble-box");
-        bubble.set_hexpand(false); // CRITICAL FIX: Prevents the bubble from stretching
+        bubble.set_hexpand(false);
         bubble.set_margin_top(4);
         bubble.set_margin_bottom(4);
 
@@ -675,10 +682,15 @@ fn setup_chat_view(tx_event: &Sender<Event>, tetra: &crate::tetra::StreamTetra) 
         let payload_scroll = ScrolledWindow::builder().child(&payload_content_view).build();
         expander.set_child(Some(&payload_scroll));
         bubble.append(&expander);
+
+        root.append(&left_spacer);
         root.append(&bubble);
+        root.append(&right_spacer);
 
         let widgets = BubbleWidgets {
+            left_spacer,
             bubble: bubble.clone(),
+            right_spacer,
             left_expand_btn: left_expand_btn.clone(),
             meta_label,
             right_expand_btn: right_expand_btn.clone(),
@@ -747,17 +759,23 @@ fn setup_chat_view(tx_event: &Sender<Event>, tetra: &crate::tetra::StreamTetra) 
             let is_user = sender == "Architect";
 
             if is_user {
-                widgets.bubble.set_halign(gtk4::Align::End);
+                widgets.left_spacer.set_visible(true);
+                widgets.right_spacer.set_visible(false);
+
                 widgets.bubble.add_css_class("bubble-user");
-                widgets.bubble.set_margin_start(64);
-                widgets.bubble.set_margin_end(12);
+                widgets.bubble.set_margin_start(16);
+                widgets.bubble.set_margin_end(16);
+
                 widgets.meta_label.set_halign(gtk4::Align::End);
                 widgets.meta_label.set_xalign(1.0);
             } else {
-                widgets.bubble.set_halign(gtk4::Align::Start);
+                widgets.left_spacer.set_visible(false);
+                widgets.right_spacer.set_visible(true);
+
                 widgets.bubble.add_css_class("bubble-ai");
-                widgets.bubble.set_margin_start(12);
-                widgets.bubble.set_margin_end(64);
+                widgets.bubble.set_margin_start(16);
+                widgets.bubble.set_margin_end(16);
+
                 widgets.meta_label.set_halign(gtk4::Align::Start);
                 widgets.meta_label.set_xalign(0.0);
             }
@@ -767,11 +785,12 @@ fn setup_chat_view(tx_event: &Sender<Event>, tetra: &crate::tetra::StreamTetra) 
         } else {
             widgets.left_expand_btn.set_visible(false);
             widgets.right_expand_btn.set_visible(false);
+            widgets.left_spacer.set_visible(false);
+            widgets.right_spacer.set_visible(true);
             widgets.expander.set_visible(true);
             widgets.bubble.add_css_class("una-bubble");
-            widgets.bubble.set_halign(gtk4::Align::Start);
             widgets.bubble.set_margin_start(16);
-            widgets.bubble.set_margin_end(128);
+            widgets.bubble.set_margin_end(16);
             widgets.expander.set_label(Some(&format!("{} | {} | {}", sender, subject, timestamp)));
 
             if let Some(scroll) = widgets.expander.child().and_then(|c: gtk4::Widget| c.downcast::<ScrolledWindow>().ok()) {
