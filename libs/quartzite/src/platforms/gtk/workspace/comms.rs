@@ -417,7 +417,9 @@ struct ChatAreaData {
 
 #[derive(Clone)]
 struct BubbleWidgets {
+    flow_box_left: Box,
     bubble: Box,
+    flow_box_right: Box,
     left_expand_btn: Button,
     meta_label: Label,
     right_expand_btn: Button,
@@ -625,12 +627,18 @@ fn setup_chat_view(tx_event: &Sender<Event>, tetra: &crate::tetra::StreamTetra) 
     console_factory.connect_setup(move |_factory, item| {
         let item = item.downcast_ref::<ListItem>().unwrap();
 
-        // 1. The Row: Vertical
-        let root = Box::new(Orientation::Vertical, 0);
-        root.set_hexpand(true);
+        // 1. The outer bracket: Horizontal
+        let root = Box::new(Orientation::Horizontal, 0);
         root.add_css_class("console-row");
 
-        // 2. The Bubble: Rigid. Its width is dictated ONLY by the msg_label
+        // 2. The flow boxes
+        let flow_box_left = Box::new(Orientation::Horizontal, 0);
+        flow_box_left.set_hexpand(true);
+
+        let flow_box_right = Box::new(Orientation::Horizontal, 0);
+        flow_box_right.set_hexpand(true);
+
+        // 3. The Bubble: Rigid. Its width is dictated ONLY by the msg_label
         let bubble = Box::new(Orientation::Vertical, 4);
         bubble.add_css_class("card");
         bubble.add_css_class("bubble-box");
@@ -685,10 +693,14 @@ fn setup_chat_view(tx_event: &Sender<Event>, tetra: &crate::tetra::StreamTetra) 
         expander.set_child(Some(&payload_scroll));
         bubble.append(&expander);
 
+        root.append(&flow_box_left);
         root.append(&bubble);
+        root.append(&flow_box_right);
 
         let widgets = BubbleWidgets {
+            flow_box_left,
             bubble: bubble.clone(),
+            flow_box_right,
             left_expand_btn: left_expand_btn.clone(),
             meta_label,
             right_expand_btn: right_expand_btn.clone(),
@@ -757,19 +769,17 @@ fn setup_chat_view(tx_event: &Sender<Event>, tetra: &crate::tetra::StreamTetra) 
             let is_user = sender == "Architect";
 
             if is_user {
-                widgets.bubble.set_halign(gtk4::Align::End);
-                widgets.bubble.add_css_class("bubble-user");
-                widgets.bubble.set_margin_start(64);
-                widgets.bubble.set_margin_end(16);
+                widgets.flow_box_left.set_visible(true);
+                widgets.flow_box_right.set_visible(false);
 
+                widgets.bubble.add_css_class("bubble-user");
                 widgets.meta_label.set_halign(gtk4::Align::End);
                 widgets.meta_label.set_xalign(1.0);
             } else {
-                widgets.bubble.set_halign(gtk4::Align::Start);
-                widgets.bubble.add_css_class("bubble-ai");
-                widgets.bubble.set_margin_start(16);
-                widgets.bubble.set_margin_end(64);
+                widgets.flow_box_left.set_visible(false);
+                widgets.flow_box_right.set_visible(true);
 
+                widgets.bubble.add_css_class("bubble-ai");
                 widgets.meta_label.set_halign(gtk4::Align::Start);
                 widgets.meta_label.set_xalign(0.0);
             }
@@ -779,11 +789,10 @@ fn setup_chat_view(tx_event: &Sender<Event>, tetra: &crate::tetra::StreamTetra) 
         } else {
             widgets.left_expand_btn.set_visible(false);
             widgets.right_expand_btn.set_visible(false);
+            widgets.flow_box_left.set_visible(false);
+            widgets.flow_box_right.set_visible(true);
             widgets.expander.set_visible(true);
             widgets.bubble.add_css_class("una-bubble");
-            widgets.bubble.set_halign(gtk4::Align::Start);
-            widgets.bubble.set_margin_start(16);
-            widgets.bubble.set_margin_end(64);
             widgets.expander.set_label(Some(&format!("{} | {} | {}", sender, subject, timestamp)));
 
             if let Some(scroll) = widgets.expander.child().and_then(|c: gtk4::Widget| c.downcast::<ScrolledWindow>().ok()) {
