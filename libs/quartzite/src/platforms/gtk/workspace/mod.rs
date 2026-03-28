@@ -118,7 +118,9 @@ pub fn build(
         preflight_prm_buf: comms_pointers.preflight_prm_buf,
         matrix_store: sidebar_pointers.matrix_store,
         matrix_selection: sidebar_pointers.matrix_selection,
+        matrix_scroll: sidebar_pointers.matrix_scroll,
         net_buffer,
+        net_view,
         network_btn: net_btn,
     };
 

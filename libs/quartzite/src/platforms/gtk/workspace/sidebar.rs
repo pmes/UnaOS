@@ -37,6 +37,7 @@ pub struct SidebarPointers {
     pub context_view: crate::widgets::telemetry::ContextView,
     pub matrix_store: gio::ListStore,
     pub matrix_selection: gtk4::MultiSelection,
+    pub matrix_scroll: ScrolledWindow,
     pub sidebar_toggle: ToggleButton,
 }
 
@@ -281,7 +282,7 @@ pub fn build(window: &NativeWindow, tx_event: Sender<Event>, _workspace_tetra: &
     nexus_box.set_margin_top(10);
 
     let nexus_list = ListBox::new();
-    nexus_list.add_css_class("shard-list");
+    nexus_list.add_css_class("boxed-list");
     nexus_list.set_selection_mode(gtk4::SelectionMode::Single);
 
     let active_target = Rc::new(RefCell::new("Una-Prime".to_string()));
@@ -387,6 +388,7 @@ pub fn build(window: &NativeWindow, tx_event: Sender<Event>, _workspace_tetra: &
         row.set_margin_end(10);
         row.set_margin_top(5);
         row.set_margin_bottom(5);
+        row.set_can_target(false); // This ensures the click passes completely through the row and hits the ListItem itself.
         let label = Label::new(None);
         label.set_xalign(0.0);
         label.set_can_target(false);
@@ -412,21 +414,12 @@ pub fn build(window: &NativeWindow, tx_event: Sender<Event>, _workspace_tetra: &
     matrix_view.add_css_class("navigation-sidebar");
     matrix_view.set_enable_rubberband(true);
     matrix_view.set_single_click_activate(false);
+    matrix_view.set_vexpand(true);
+    matrix_view.set_hexpand(true);
 
-    let tx_matrix_sel = tx_event.clone();
-    matrix_selection.connect_selection_changed(move |selection, _, _| {
-        let mut selected_ids = Vec::new();
-        for i in 0..selection.n_items() {
-            if selection.is_selected(i) {
-                if let Some(item) = selection.item(i) {
-                    if let Ok(obj) = item.downcast::<crate::widgets::model::MatrixNodeObject>() {
-                        selected_ids.push(obj.id());
-                    }
-                }
-            }
-        }
-        let _ = tx_matrix_sel.send_blocking(Event::UpdateMatrixSelection(selected_ids));
-    });
+    // [NODE: UNA] - Real-time selection sync removed.
+    // Selection state is now held locally and harvested by the Composer upon dispatch.
+    // This prevents the backend from rebuilding the tree and wiping the user's selection.
 
     let nav_history_back = std::rc::Rc::new(std::cell::RefCell::new(Vec::<String>::new()));
     let nav_history_forward = std::rc::Rc::new(std::cell::RefCell::new(Vec::<String>::new()));
@@ -597,6 +590,7 @@ pub fn build(window: &NativeWindow, tx_event: Sender<Event>, _workspace_tetra: &
         context_view,
         matrix_store,
         matrix_selection,
+        matrix_scroll,
         sidebar_toggle,
     };
 

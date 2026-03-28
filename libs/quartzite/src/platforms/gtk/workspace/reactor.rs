@@ -32,7 +32,9 @@ pub struct ReactorPointers {
     pub preflight_prm_buf: sourceview5::Buffer,
     pub matrix_store: gtk4::gio::ListStore,
     pub matrix_selection: gtk4::MultiSelection,
+    pub matrix_scroll: gtk4::ScrolledWindow,
     pub net_buffer: sourceview5::Buffer,
+    pub net_view: sourceview5::View,
     pub network_btn: gtk4::Button,
 }
 
@@ -222,6 +224,10 @@ pub fn spawn_listener(pointers: ReactorPointers, rx_gui: Receiver<GuiUpdate>) {
                     pointers.context_view.update(skeletons);
                 }
                 GuiUpdate::RefreshMatrix(topology) => {
+                    // 0. Cache the VAdjustment value
+                    let adj = pointers.matrix_scroll.vadjustment();
+                    let current_scroll = adj.value();
+
                     // 1. Cache the active selection IDs
                     let mut saved_ids = std::collections::HashSet::new();
                     let current_bitset = pointers.matrix_selection.selection();
@@ -253,6 +259,12 @@ pub fn spawn_listener(pointers: ReactorPointers, rx_gui: Receiver<GuiUpdate>) {
                         }
                     }
                     pointers.matrix_selection.set_selection(&new_bitset, &new_bitset);
+
+                    // 4. Restore the VAdjustment value via idle add
+                    gtk4::glib::idle_add_local(move || {
+                        adj.set_value(current_scroll);
+                        gtk4::glib::ControlFlow::Break
+                    });
                 }
                 GuiUpdate::IngestMatrixTopology(paths) => {
                     // Checkpoint Gamma: The Left Pane Model
@@ -273,6 +285,10 @@ pub fn spawn_listener(pointers: ReactorPointers, rx_gui: Receiver<GuiUpdate>) {
                 GuiUpdate::NetworkLog(log) => {
                     let mut end_iter = pointers.net_buffer.end_iter();
                     pointers.net_buffer.insert(&mut end_iter, &format!("{}\n", log));
+
+                    // Auto-scroll to bottom
+                    let mark = pointers.net_buffer.create_mark(None, &pointers.net_buffer.end_iter(), false);
+                    pointers.net_view.scroll_to_mark(&mark, 0.0, false, 0.0, 0.0);
                 }
                 GuiUpdate::NetworkState(state) => {
                     pointers.network_btn.set_icon_name(&state);
