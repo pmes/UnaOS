@@ -570,7 +570,6 @@ fn setup_chat_view(tx_event: &Sender<Event>, tetra: &crate::tetra::StreamTetra) 
         meta_label: Label,
         right_expand_btn: Button,
         msg_label: Label,
-        msg_clipper: ScrolledWindow,
         expander: Expander,
     }
 
@@ -603,26 +602,19 @@ fn setup_chat_view(tx_event: &Sender<Event>, tetra: &crate::tetra::StreamTetra) 
         header_box.append(&right_expand_btn);
         bubble.append(&header_box);
 
-        // ALWAYS Unbounded and Selectable. Pango will never panic.
+        // Strict Birth Constraints. No ScrolledWindow clipper.
         let msg_label = Label::builder()
             .wrap(true)
-            .selectable(true)
+            .lines(11)
+            .selectable(false) // Must be false for ellipsize to hold
+            .ellipsize(gtk4::pango::EllipsizeMode::End)
             .hexpand(false)
             .max_width_chars(85)
             .wrap_mode(gtk4::pango::WrapMode::WordChar)
             .build();
         msg_label.add_css_class("view");
 
-        // The Physical Clipping Mask
-        let msg_clipper = ScrolledWindow::builder()
-            .hscrollbar_policy(PolicyType::Never)
-            .vscrollbar_policy(PolicyType::Never) // Disable internal scrolling entirely
-            .propagate_natural_height(true) // Grow to fit small messages
-            .max_content_height(220) // Hard clamp at ~11 lines of pixels
-            .child(&msg_label)
-            .build();
-
-        bubble.append(&msg_clipper);
+        bubble.append(&msg_label);
 
         let expander = Expander::new(None);
         let payload_content_buffer = gtk4::TextBuffer::new(None);
@@ -644,11 +636,9 @@ fn setup_chat_view(tx_event: &Sender<Event>, tetra: &crate::tetra::StreamTetra) 
             meta_label,
             right_expand_btn: right_expand_btn.clone(),
             msg_label,
-            msg_clipper,
             expander,
         };
 
-        // Strict Data Model Mutation
         let item_clone_left = item.clone();
         let store_clone_left = store_for_setup.clone();
         left_expand_btn.connect_clicked(move |_| {
@@ -679,6 +669,7 @@ fn setup_chat_view(tx_event: &Sender<Event>, tetra: &crate::tetra::StreamTetra) 
 
         let boxed_widgets = unsafe { item.data::<glib::BoxedAnyObject>("widgets") };
         let Some(boxed_ptr) = boxed_widgets else { return; };
+
         let widgets = unsafe { boxed_ptr.as_ref() }.borrow::<BubbleWidgets>();
 
         widgets.bubble.remove_css_class("architect-bubble");
@@ -686,7 +677,7 @@ fn setup_chat_view(tx_event: &Sender<Event>, tetra: &crate::tetra::StreamTetra) 
         widgets.bubble.remove_css_class("bubble-user");
         widgets.bubble.remove_css_class("bubble-ai");
 
-        widgets.msg_clipper.set_visible(false);
+        widgets.msg_label.set_visible(false);
         widgets.expander.set_visible(false);
         widgets.left_expand_btn.set_visible(false);
         widgets.right_expand_btn.set_visible(false);
@@ -699,14 +690,13 @@ fn setup_chat_view(tx_event: &Sender<Event>, tetra: &crate::tetra::StreamTetra) 
         let is_expanded = obj.is_expanded();
 
         if is_chat {
-            widgets.msg_clipper.set_visible(true);
+            widgets.msg_label.set_visible(true);
             widgets.msg_label.set_label(&content);
             widgets.meta_label.set_text(&format!("{} • {}", sender, timestamp));
             widgets.meta_label.remove_css_class("role-architect");
             widgets.meta_label.remove_css_class("role-una");
             widgets.meta_label.remove_css_class("role-system");
 
-            let line_count = content.trim_end().lines().count();
             let is_user = sender == "Architect";
 
             if is_user {
@@ -721,14 +711,23 @@ fn setup_chat_view(tx_event: &Sender<Event>, tetra: &crate::tetra::StreamTetra) 
                 widgets.meta_label.set_xalign(0.0);
             }
 
-            // BYPASS PANGO: Physically clamp or unclamp the Box
+            // CRITICAL ORDER OF OPERATIONS
             if is_expanded {
-                widgets.msg_clipper.set_max_content_height(-1); // Unbounded
+                widgets.msg_label.set_selectable(true);
+                widgets.msg_label.set_ellipsize(gtk4::pango::EllipsizeMode::None);
+                widgets.msg_label.set_lines(-1);
             } else {
-                widgets.msg_clipper.set_max_content_height(220); // Clipped at ~11 lines
+                widgets.msg_label.set_selectable(false);
+                widgets.msg_label.set_ellipsize(gtk4::pango::EllipsizeMode::End);
+                widgets.msg_label.set_lines(11);
             }
 
-            if line_count > 11 {
+            // The True Text Measurement Fix:
+            // 85 chars * 10 lines = 850 characters.
+            let explicit_lines = content.trim_end().lines().count();
+            let is_long_message = content.len() > 800 || explicit_lines > 10;
+
+            if is_long_message {
                 widgets.left_expand_btn.set_visible(is_user);
                 widgets.right_expand_btn.set_visible(!is_user);
             }
