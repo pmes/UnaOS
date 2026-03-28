@@ -569,9 +569,8 @@ fn setup_chat_view(tx_event: &Sender<Event>, tetra: &crate::tetra::StreamTetra) 
         left_expand_btn: Button,
         meta_label: Label,
         right_expand_btn: Button,
-        msg_stack: Stack,
-        msg_collapsed: Label,
-        msg_expanded: Label,
+        msg_label: Label,
+        msg_clipper: ScrolledWindow,
         expander: Expander,
     }
 
@@ -604,37 +603,27 @@ fn setup_chat_view(tx_event: &Sender<Event>, tetra: &crate::tetra::StreamTetra) 
         header_box.append(&right_expand_btn);
         bubble.append(&header_box);
 
-        // --- The Stack Architecture ---
-        let msg_stack = Stack::new();
-        msg_stack.set_vhomogeneous(false); // Let the stack resize cleanly on swap
-
-        // Born Strict: Never recalculates height
-        let msg_collapsed = Label::builder()
-            .wrap(true)
-            .lines(11)
-            .ellipsize(gtk4::pango::EllipsizeMode::End)
-            .selectable(false)
-            .hexpand(false)
-            .max_width_chars(85)
-            .wrap_mode(gtk4::pango::WrapMode::WordChar)
-            .build();
-        msg_collapsed.add_css_class("view");
-
-        // Born Unbounded: Ready for selection
-        let msg_expanded = Label::builder()
+        // ALWAYS Unbounded and Selectable. Pango will never panic.
+        let msg_label = Label::builder()
             .wrap(true)
             .selectable(true)
             .hexpand(false)
             .max_width_chars(85)
             .wrap_mode(gtk4::pango::WrapMode::WordChar)
             .build();
-        msg_expanded.add_css_class("view");
+        msg_label.add_css_class("view");
 
-        msg_stack.add_named(&msg_collapsed, Some("collapsed"));
-        msg_stack.add_named(&msg_expanded, Some("expanded"));
-        bubble.append(&msg_stack);
+        // The Physical Clipping Mask
+        let msg_clipper = ScrolledWindow::builder()
+            .hscrollbar_policy(PolicyType::Never)
+            .vscrollbar_policy(PolicyType::Never) // Disable internal scrolling entirely
+            .propagate_natural_height(true) // Grow to fit small messages
+            .max_content_height(220) // Hard clamp at ~11 lines of pixels
+            .child(&msg_label)
+            .build();
 
-        // --- Payload Expander ---
+        bubble.append(&msg_clipper);
+
         let expander = Expander::new(None);
         let payload_content_buffer = gtk4::TextBuffer::new(None);
         let payload_content_view = gtk4::TextView::with_buffer(&payload_content_buffer);
@@ -654,13 +643,12 @@ fn setup_chat_view(tx_event: &Sender<Event>, tetra: &crate::tetra::StreamTetra) 
             left_expand_btn: left_expand_btn.clone(),
             meta_label,
             right_expand_btn: right_expand_btn.clone(),
-            msg_stack,
-            msg_collapsed,
-            msg_expanded,
+            msg_label,
+            msg_clipper,
             expander,
         };
 
-        // --- Compile-Time Safe Model Mutation ---
+        // Strict Data Model Mutation
         let item_clone_left = item.clone();
         let store_clone_left = store_for_setup.clone();
         left_expand_btn.connect_clicked(move |_| {
@@ -698,7 +686,7 @@ fn setup_chat_view(tx_event: &Sender<Event>, tetra: &crate::tetra::StreamTetra) 
         widgets.bubble.remove_css_class("bubble-user");
         widgets.bubble.remove_css_class("bubble-ai");
 
-        widgets.msg_stack.set_visible(false);
+        widgets.msg_clipper.set_visible(false);
         widgets.expander.set_visible(false);
         widgets.left_expand_btn.set_visible(false);
         widgets.right_expand_btn.set_visible(false);
@@ -711,10 +699,8 @@ fn setup_chat_view(tx_event: &Sender<Event>, tetra: &crate::tetra::StreamTetra) 
         let is_expanded = obj.is_expanded();
 
         if is_chat {
-            widgets.msg_stack.set_visible(true);
-            widgets.msg_collapsed.set_label(&content);
-            widgets.msg_expanded.set_label(&content);
-
+            widgets.msg_clipper.set_visible(true);
+            widgets.msg_label.set_label(&content);
             widgets.meta_label.set_text(&format!("{} • {}", sender, timestamp));
             widgets.meta_label.remove_css_class("role-architect");
             widgets.meta_label.remove_css_class("role-una");
@@ -735,11 +721,11 @@ fn setup_chat_view(tx_event: &Sender<Event>, tetra: &crate::tetra::StreamTetra) 
                 widgets.meta_label.set_xalign(0.0);
             }
 
-            // --- Enforce Layout via Stack Visibility ---
+            // BYPASS PANGO: Physically clamp or unclamp the Box
             if is_expanded {
-                widgets.msg_stack.set_visible_child_name("expanded");
+                widgets.msg_clipper.set_max_content_height(-1); // Unbounded
             } else {
-                widgets.msg_stack.set_visible_child_name("collapsed");
+                widgets.msg_clipper.set_max_content_height(220); // Clipped at ~11 lines
             }
 
             if line_count > 11 {
