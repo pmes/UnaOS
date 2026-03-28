@@ -215,7 +215,7 @@ impl<D: BlockDevice> UnaFS<D> {
         Ok(block_id)
     }
 
-    fn sync_metadata(&mut self) -> Result<(), FileSystemError> {
+    pub fn sync_metadata(&mut self) -> Result<(), FileSystemError> {
         self.bitmap
             .save(&mut self.device, self.superblock.bitmap_start)?;
 
@@ -510,6 +510,7 @@ impl<D: BlockDevice> UnaFS<D> {
 
         self.write_inode(&inode)?;
         self.update_catalog(&key, &value, inode_id)?;
+        self.sync_metadata()?;
         self.journal
             .log(&mut self.device, JournalOp::EndOp { op_id: inode_id })?;
 
@@ -546,7 +547,7 @@ impl<D: BlockDevice> UnaFS<D> {
 
     // --- QUERY ENGINE ---
 
-    pub fn query(&mut self, query_str: &str) -> Result<Vec<Inode>, FileSystemError> {
+    pub fn query(&mut self, query_str: &str) -> Result<Vec<(Inode, f32)>, FileSystemError> {
         let query = Query::parse(query_str).map_err(|e| FileSystemError::Query(e))?;
 
         let catalog_id = self.superblock.catalog_inode;
@@ -598,8 +599,27 @@ impl<D: BlockDevice> UnaFS<D> {
             }
 
             if let Some(val) = val_opt {
-                if check_condition(&val, &query.op, &query.value) {
-                    results.push(inode);
+                if let Some(score) = check_condition(&val, &query.op, &query.value) {
+                    // Check secondary filters
+                    let mut pass_secondary = true;
+                    for (sec_key, sec_val) in &query.secondary_filters {
+                        let mut match_found = false;
+                        if let Some(v) = inode.attributes.get(sec_key) {
+                            if let AttributeValue::String(s) = v {
+                                if s == sec_val {
+                                    match_found = true;
+                                }
+                            }
+                        }
+                        if !match_found {
+                            pass_secondary = false;
+                            break;
+                        }
+                    }
+
+                    if pass_secondary {
+                        results.push((inode, score));
+                    }
                 }
             }
         }
@@ -698,21 +718,46 @@ pub fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
     dot / (mag_a * mag_b)
 }
 
-fn check_condition(val: &AttributeValue, op: &QueryOp, target: &AttributeValue) -> bool {
+fn check_condition(val: &AttributeValue, op: &QueryOp, target: &AttributeValue) -> Option<f32> {
     match op {
-        QueryOp::Eq => val == target,
-        QueryOp::Neq => val != target,
-        QueryOp::Gt => partial_cmp_attr(val, target)
-            .map(|o| o.is_gt())
-            .unwrap_or(false),
-        QueryOp::Lt => partial_cmp_attr(val, target)
-            .map(|o| o.is_lt())
-            .unwrap_or(false),
+        QueryOp::Eq => {
+            if val == target {
+                Some(1.0)
+            } else {
+                None
+            }
+        }
+        QueryOp::Neq => {
+            if val != target {
+                Some(1.0)
+            } else {
+                None
+            }
+        }
+        QueryOp::Gt => {
+            if partial_cmp_attr(val, target).map(|o| o.is_gt()).unwrap_or(false) {
+                Some(1.0)
+            } else {
+                None
+            }
+        }
+        QueryOp::Lt => {
+            if partial_cmp_attr(val, target).map(|o| o.is_lt()).unwrap_or(false) {
+                Some(1.0)
+            } else {
+                None
+            }
+        }
         QueryOp::SimilarityGt(threshold) => {
             if let (AttributeValue::Vector(v1), AttributeValue::Vector(v2)) = (val, target) {
-                cosine_similarity(v1, v2) > *threshold
+                let score = cosine_similarity(v1, v2);
+                if score > *threshold {
+                    Some(score)
+                } else {
+                    None
+                }
             } else {
-                false
+                None
             }
         }
     }

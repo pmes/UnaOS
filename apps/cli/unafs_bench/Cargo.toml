@@ -1,0 +1,10 @@
+[package]
+name = "unafs_bench"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+unafs = { path = "../../../libs/unafs" }
+anyhow = "1.0"
+rand = "0.8"
+dirs = "5.0"
