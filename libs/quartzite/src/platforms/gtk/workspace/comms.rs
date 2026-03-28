@@ -630,6 +630,7 @@ fn setup_chat_view(tx_event: &Sender<Event>, tetra: &crate::tetra::StreamTetra) 
         // 1. The outer bracket: Horizontal
         let root = Box::new(Orientation::Horizontal, 0);
         root.set_halign(gtk4::Align::Fill);
+        root.set_hexpand(true);
         root.add_css_class("console-row");
 
         // 2. The flow boxes
