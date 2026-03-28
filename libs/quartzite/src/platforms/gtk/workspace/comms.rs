@@ -417,7 +417,6 @@ struct ChatAreaData {
 
 #[derive(Clone)]
 struct BubbleWidgets {
-    root: Box,
     bubble: Box,
     left_expand_btn: Button,
     meta_label: Label,
@@ -628,6 +627,7 @@ fn setup_chat_view(tx_event: &Sender<Event>, tetra: &crate::tetra::StreamTetra) 
 
         // 1. The Row: Vertical
         let root = Box::new(Orientation::Vertical, 0);
+        root.set_hexpand(true);
         root.add_css_class("console-row");
 
         // 2. The Bubble: Rigid. Its width is dictated ONLY by the msg_label
@@ -646,6 +646,7 @@ fn setup_chat_view(tx_event: &Sender<Event>, tetra: &crate::tetra::StreamTetra) 
             .xalign(0.0)
             .css_classes(vec!["dim-label"])
             .hexpand(false)
+            .ellipsize(gtk4::pango::EllipsizeMode::End)
             .build();
 
         let right_expand_btn = Button::builder().icon_name("pan-down-symbolic").css_classes(vec!["flat"]).build();
@@ -658,6 +659,7 @@ fn setup_chat_view(tx_event: &Sender<Event>, tetra: &crate::tetra::StreamTetra) 
         let msg_label = Label::builder()
             .wrap(true)
             .hexpand(false)
+            .width_chars(30)
             .max_width_chars(85)
             .wrap_mode(gtk4::pango::WrapMode::WordChar)
             .margin_top(8)
@@ -686,7 +688,6 @@ fn setup_chat_view(tx_event: &Sender<Event>, tetra: &crate::tetra::StreamTetra) 
         root.append(&bubble);
 
         let widgets = BubbleWidgets {
-            root: root.clone(),
             bubble: bubble.clone(),
             left_expand_btn: left_expand_btn.clone(),
             meta_label,
@@ -756,7 +757,6 @@ fn setup_chat_view(tx_event: &Sender<Event>, tetra: &crate::tetra::StreamTetra) 
             let is_user = sender == "Architect";
 
             if is_user {
-                widgets.root.set_halign(gtk4::Align::End);
                 widgets.bubble.set_halign(gtk4::Align::End);
                 widgets.bubble.add_css_class("bubble-user");
                 widgets.bubble.set_margin_start(64);
@@ -765,7 +765,6 @@ fn setup_chat_view(tx_event: &Sender<Event>, tetra: &crate::tetra::StreamTetra) 
                 widgets.meta_label.set_halign(gtk4::Align::End);
                 widgets.meta_label.set_xalign(1.0);
             } else {
-                widgets.root.set_halign(gtk4::Align::Start);
                 widgets.bubble.set_halign(gtk4::Align::Start);
                 widgets.bubble.add_css_class("bubble-ai");
                 widgets.bubble.set_margin_start(16);
@@ -778,7 +777,6 @@ fn setup_chat_view(tx_event: &Sender<Event>, tetra: &crate::tetra::StreamTetra) 
             apply_expansion_state(&widgets, &obj);
 
         } else {
-            widgets.root.set_halign(gtk4::Align::Start);
             widgets.left_expand_btn.set_visible(false);
             widgets.right_expand_btn.set_visible(false);
             widgets.expander.set_visible(true);
