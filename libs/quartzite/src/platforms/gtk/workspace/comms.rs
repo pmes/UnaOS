@@ -415,6 +415,67 @@ struct ChatAreaData {
     is_fetching: Rc<RefCell<bool>>,
 }
 
+#[derive(Clone)]
+struct BubbleWidgets {
+    bubble: Box,
+    left_expand_btn: Button,
+    meta_label: Label,
+    right_expand_btn: Button,
+    msg_label: Label,
+    expander: Expander,
+}
+
+#[inline]
+fn apply_expansion_state(widgets: &BubbleWidgets, obj: &HistoryObject) {
+    let content = obj.content();
+    let is_expanded = obj.is_expanded();
+    let is_user = obj.sender() == "Architect";
+
+    // --- STRICT BYTE-BOUNDARY TRUNCATION ---
+    let explicit_lines = content.trim_end().lines().count();
+    let is_long_message = content.len() > 800 || explicit_lines > 10;
+
+    if is_expanded || !is_long_message {
+        widgets.msg_label.set_label(&content);
+        widgets.msg_label.set_selectable(true);
+        widgets.left_expand_btn.set_icon_name("pan-up-symbolic");
+        widgets.right_expand_btn.set_icon_name("pan-up-symbolic");
+    } else {
+        let mut byte_idx = 0;
+        let mut line_count = 0;
+
+        for (idx, c) in content.char_indices() {
+            if c == '\n' { line_count += 1; }
+            if line_count >= 10 || idx >= 800 {
+                byte_idx = idx;
+                break;
+            }
+            byte_idx = idx + c.len_utf8();
+        }
+
+        let mut truncated = String::with_capacity(850);
+        if byte_idx < content.len() {
+            truncated.push_str(&content[..byte_idx]);
+            truncated.push_str("\n...");
+        } else {
+            truncated.push_str(&content);
+        }
+
+        widgets.msg_label.set_label(&truncated);
+        widgets.msg_label.set_selectable(false);
+        widgets.left_expand_btn.set_icon_name("pan-down-symbolic");
+        widgets.right_expand_btn.set_icon_name("pan-down-symbolic");
+    }
+
+    if is_long_message {
+        widgets.left_expand_btn.set_visible(is_user);
+        widgets.right_expand_btn.set_visible(!is_user);
+    } else {
+        widgets.left_expand_btn.set_visible(false);
+        widgets.right_expand_btn.set_visible(false);
+    }
+}
+
 fn setup_chat_view(tx_event: &Sender<Event>, tetra: &crate::tetra::StreamTetra) -> ChatAreaData {
     let scrolled_window = ScrolledWindow::builder()
         .hscrollbar_policy(PolicyType::Never)
@@ -559,18 +620,8 @@ fn setup_chat_view(tx_event: &Sender<Event>, tetra: &crate::tetra::StreamTetra) 
     let console_selection = NoSelection::new(Some(console_store.clone()));
 
     // Create a Rust struct to hold the precise pointers without DOM traversal
-    #[derive(Clone)]
-    struct BubbleWidgets {
-        bubble: Box,
-        left_expand_btn: Button,
-        meta_label: Label,
-        right_expand_btn: Button,
-        msg_label: Label,
-        expander: Expander,
-    }
 
     let console_factory = SignalListItemFactory::new();
-    let store_for_setup = console_store.clone();
     console_factory.connect_setup(move |_factory, item| {
         let item = item.downcast_ref::<ListItem>().unwrap();
 
@@ -636,25 +687,23 @@ fn setup_chat_view(tx_event: &Sender<Event>, tetra: &crate::tetra::StreamTetra) 
         };
 
         let item_clone_left = item.clone();
-        let store_clone_left = store_for_setup.clone();
         left_expand_btn.connect_clicked(move |_| {
-            let pos = item_clone_left.position();
-            if pos != gtk4::INVALID_LIST_POSITION {
-                if let Some(obj) = item_clone_left.item().and_then(|i| i.downcast::<HistoryObject>().ok()) {
-                    obj.set_is_expanded(!obj.is_expanded());
-                    store_clone_left.items_changed(pos, 1, 1);
+            if let Some(obj) = item_clone_left.item().and_then(|i| i.downcast::<HistoryObject>().ok()) {
+                obj.set_is_expanded(!obj.is_expanded());
+                if let Some(boxed_ptr) = unsafe { item_clone_left.data::<glib::BoxedAnyObject>("widgets") } {
+                    let widgets = unsafe { boxed_ptr.as_ref() }.borrow::<BubbleWidgets>();
+                    apply_expansion_state(&widgets, &obj);
                 }
             }
         });
 
         let item_clone_right = item.clone();
-        let store_clone_right = store_for_setup.clone();
         right_expand_btn.connect_clicked(move |_| {
-            let pos = item_clone_right.position();
-            if pos != gtk4::INVALID_LIST_POSITION {
-                if let Some(obj) = item_clone_right.item().and_then(|i| i.downcast::<HistoryObject>().ok()) {
-                    obj.set_is_expanded(!obj.is_expanded());
-                    store_clone_right.items_changed(pos, 1, 1);
+            if let Some(obj) = item_clone_right.item().and_then(|i| i.downcast::<HistoryObject>().ok()) {
+                obj.set_is_expanded(!obj.is_expanded());
+                if let Some(boxed_ptr) = unsafe { item_clone_right.data::<glib::BoxedAnyObject>("widgets") } {
+                    let widgets = unsafe { boxed_ptr.as_ref() }.borrow::<BubbleWidgets>();
+                    apply_expansion_state(&widgets, &obj);
                 }
             }
         });
@@ -712,49 +761,9 @@ fn setup_chat_view(tx_event: &Sender<Event>, tetra: &crate::tetra::StreamTetra) 
                 widgets.meta_label.set_xalign(0.0);
             }
 
-            // --- STRICT BYTE-BOUNDARY TRUNCATION ---
-            let explicit_lines = content.trim_end().lines().count();
-            let is_long_message = content.len() > 800 || explicit_lines > 10;
+            // --- DELEGATE TO STATE HELPER ---
+            apply_expansion_state(&widgets, &obj);
 
-            if is_expanded || !is_long_message {
-                widgets.msg_label.set_label(&content);
-                widgets.msg_label.set_selectable(true);
-                widgets.left_expand_btn.set_icon_name("pan-up-symbolic");
-                widgets.right_expand_btn.set_icon_name("pan-up-symbolic");
-            } else {
-                let mut byte_idx = 0;
-                let mut line_count = 0;
-
-                for (idx, c) in content.char_indices() {
-                    if c == '\n' { line_count += 1; }
-                    if line_count >= 10 || idx >= 800 {
-                        byte_idx = idx;
-                        break;
-                    }
-                    byte_idx = idx + c.len_utf8();
-                }
-
-                let mut truncated = String::with_capacity(850);
-                if byte_idx < content.len() {
-                    truncated.push_str(&content[..byte_idx]);
-                    truncated.push_str("\n...");
-                } else {
-                    truncated.push_str(&content);
-                }
-
-                widgets.msg_label.set_label(&truncated);
-                widgets.msg_label.set_selectable(false);
-                widgets.left_expand_btn.set_icon_name("pan-down-symbolic");
-                widgets.right_expand_btn.set_icon_name("pan-down-symbolic");
-            }
-
-            if is_long_message {
-                widgets.left_expand_btn.set_visible(is_user);
-                widgets.right_expand_btn.set_visible(!is_user);
-            } else {
-                widgets.left_expand_btn.set_visible(false);
-                widgets.right_expand_btn.set_visible(false);
-            }
         } else {
             widgets.expander.set_visible(true);
             widgets.bubble.add_css_class("una-bubble");
