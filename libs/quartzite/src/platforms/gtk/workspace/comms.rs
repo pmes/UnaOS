@@ -619,7 +619,7 @@ fn setup_chat_view(tx_event: &Sender<Event>, tetra: &crate::tetra::StreamTetra) 
         let msg_label = Label::builder()
             .wrap(true)
             .lines(11)
-            .selectable(true)
+            .selectable(false)
             .hexpand(false)
             .max_width_chars(85)
             .wrap_mode(gtk4::pango::WrapMode::WordChar)
@@ -664,9 +664,11 @@ fn setup_chat_view(tx_event: &Sender<Event>, tetra: &crate::tetra::StreamTetra) 
             if toggle_label.lines() == -1 {
                 toggle_label.set_lines(11); // Collapse back
                 toggle_label.set_ellipsize(gtk4::pango::EllipsizeMode::End); // Restore bounds
+                toggle_label.set_selectable(false); // GTK4 ignores ellipsize if label is selectable
             } else {
                 toggle_label.set_lines(-1);  // Expand fully
                 toggle_label.set_ellipsize(gtk4::pango::EllipsizeMode::None); // Unbound
+                toggle_label.set_selectable(true);
             }
         });
 
@@ -675,9 +677,11 @@ fn setup_chat_view(tx_event: &Sender<Event>, tetra: &crate::tetra::StreamTetra) 
             if toggle_label_right.lines() == -1 {
                 toggle_label_right.set_lines(11); // Collapse back
                 toggle_label_right.set_ellipsize(gtk4::pango::EllipsizeMode::End); // Restore bounds
+                toggle_label_right.set_selectable(false); // GTK4 ignores ellipsize if label is selectable
             } else {
                 toggle_label_right.set_lines(-1);  // Expand fully
                 toggle_label_right.set_ellipsize(gtk4::pango::EllipsizeMode::None); // Unbound
+                toggle_label_right.set_selectable(true);
             }
         });
 
@@ -717,6 +721,8 @@ fn setup_chat_view(tx_event: &Sender<Event>, tetra: &crate::tetra::StreamTetra) 
 
         if is_chat {
             widgets.msg_label.set_visible(true);
+            widgets.msg_label.set_ellipsize(gtk4::pango::EllipsizeMode::End);
+            widgets.msg_label.set_selectable(false);
             widgets.meta_label.set_text(&format!("{} • {}", sender, timestamp));
             widgets.meta_label.remove_css_class("role-architect");
             widgets.meta_label.remove_css_class("role-una");
