@@ -629,6 +629,7 @@ fn setup_chat_view(tx_event: &Sender<Event>, tetra: &crate::tetra::StreamTetra) 
 
         // 1. The outer bracket: Horizontal
         let root = Box::new(Orientation::Horizontal, 0);
+        root.set_halign(gtk4::Align::Fill);
         root.add_css_class("console-row");
 
         // 2. The flow boxes
@@ -681,6 +682,8 @@ fn setup_chat_view(tx_event: &Sender<Event>, tetra: &crate::tetra::StreamTetra) 
         bubble.append(&msg_label);
 
         let expander = Expander::new(None);
+        expander.set_hexpand(false);
+
         let payload_content_buffer = gtk4::TextBuffer::new(None);
         let payload_content_view = gtk4::TextView::with_buffer(&payload_content_buffer);
         payload_content_view.set_editable(false);
@@ -689,7 +692,12 @@ fn setup_chat_view(tx_event: &Sender<Event>, tetra: &crate::tetra::StreamTetra) 
         payload_content_view.set_cursor_visible(false);
         payload_content_view.add_css_class("view");
         payload_content_view.set_size_request(-1, 300);
-        let payload_scroll = ScrolledWindow::builder().child(&payload_content_view).build();
+
+        let payload_scroll = ScrolledWindow::builder()
+            .child(&payload_content_view)
+            .hexpand(false)
+            .build();
+
         expander.set_child(Some(&payload_scroll));
         bubble.append(&expander);
 
