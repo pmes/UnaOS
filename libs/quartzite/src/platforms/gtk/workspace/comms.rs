@@ -99,11 +99,10 @@ pub fn build(
     let is_fetching_bind = is_fetching.clone();
 
     // Only connect the adjustments after the window is physically drawn
-    let was_at_bottom = Rc::new(RefCell::new(true));
     let was_at_top = Rc::new(RefCell::new(true));
     let last_upper = Rc::new(RefCell::new(0.0));
+    let last_page_size = Rc::new(RefCell::new(0.0));
 
-    let was_at_bottom_val = was_at_bottom.clone();
     let was_at_top_val = was_at_top.clone();
     let is_prepending_val = is_prepending_bind.clone();
     let is_fetching_val = is_fetching_bind.clone();
@@ -116,7 +115,6 @@ pub fn build(
 
         let val = a.value();
         let lower = a.lower();
-        *was_at_bottom_val.borrow_mut() = (val - (upper - page_size)).abs() < 10.0;
 
         let is_at_top = val <= lower + 10.0;
         let previously_at_top = *was_at_top_val.borrow();
@@ -134,77 +132,82 @@ pub fn build(
         }
     });
 
-    let was_at_bottom_upper = was_at_bottom.clone();
     let is_prepending_upper = is_prepending_bind.clone();
     let last_upper_ref = last_upper.clone();
-
+    let last_page_size_ref = last_page_size.clone();
     let is_fetching_for_upper = is_fetching_bind.clone();
 
-    adj_clone.connect_upper_notify(move |a| {
-        let upper = a.upper();
-        let page_size = a.page_size();
-        if upper <= page_size || upper == 0.0 { return; }
-
-        let old_upper = *last_upper_ref.borrow();
-        let delta = upper - old_upper;
-        *last_upper_ref.borrow_mut() = upper;
-
+    // Helper macro to handle layout recalculations on upper or page_size change
+    let handle_geometry_change = move |a: &gtk4::Adjustment| {
         let a_clone = a.clone();
-        let was_at_bottom = *was_at_bottom_upper.borrow();
-        let is_prepending = *is_prepending_upper.borrow();
-        let is_prepending_upper_clone = is_prepending_upper.clone();
 
+        let last_upper_idle = last_upper_ref.clone();
+        let last_page_size_idle = last_page_size_ref.clone();
+        let is_prepending_idle = is_prepending_upper.clone();
         let fetching_for_idle = is_fetching_for_upper.clone();
 
-        // Defer the adjustment value update to the GTK idle loop.
-        // By wrapping `vadjustment.set_value()` in `idle_add_local`, we yield
-        // to the GTK frame cycle, ensuring that layout and geometry allocation
-        // for the new list items are mathematically finalized before scrolling.
+        // Defer the entirety of the clamping logic to the GTK idle loop.
+        // This ensures the layout engine has completed its `gtk_adjustment_configure` pass
+        // before we query the bounds and attempt any manual viewport adjustments.
         glib::idle_add_local(move || {
             let current_upper = a_clone.upper();
             let current_page_size = a_clone.page_size();
             let current_lower = a_clone.lower();
+            let current_value = a_clone.value();
 
+            let old_upper = *last_upper_idle.borrow();
+            let old_page_size = *last_page_size_idle.borrow();
+            let is_prepending = *is_prepending_idle.borrow();
             let fetching = *fetching_for_idle.borrow();
 
+            let delta = current_upper - old_upper;
+
+            *last_upper_idle.borrow_mut() = current_upper;
+            *last_page_size_idle.borrow_mut() = current_page_size;
+
             // Add this guard to prevent layout assertion failures
-            if current_upper <= current_page_size || current_upper == 0.0 || fetching {
+            if current_upper == 0.0 || fetching {
                 return glib::ControlFlow::Break;
             }
 
-            // Calculate the absolute maximum valid scroll position
-            let max_valid_value = (current_upper - current_page_size).max(current_lower);
+            // Calculate physics logic based on J19 architecture rules
+            let is_at_bottom = current_value >= (old_upper - old_page_size - 1.0);
 
-            if was_at_bottom {
-                a_clone.set_value(max_valid_value);
-            } else if is_prepending && delta > 0.0 {
-                // Strictly clamp the new value so we never overshoot GTK's internal bounds
-                let target_val = a_clone.value() + delta;
-                a_clone.set_value(target_val.clamp(current_lower, max_valid_value));
-                *is_prepending_upper_clone.borrow_mut() = false;
+            if current_upper >= current_lower + current_page_size {
+                // The Clamp: Content is larger than viewport
+                if is_at_bottom {
+                    // Execute auto-scroll
+                    a_clone.set_value(current_upper - current_page_size);
+                } else if is_prepending && delta > 0.0 {
+                    // Strictly clamp the new value so we never overshoot GTK's internal bounds
+                    // when loading historical items at the top
+                    let max_valid_value = (current_upper - current_page_size).max(current_lower);
+                    let target_val = a_clone.value() + delta;
+                    a_clone.set_value(target_val.clamp(current_lower, max_valid_value));
+                    *is_prepending_idle.borrow_mut() = false;
+                } else {
+                    // Do nothing. Respect user's current adj.value()
+                }
+            } else {
+                // The Clamp: Content fits entirely on screen, ensure we rest cleanly at the top
+                a_clone.set_value(current_lower);
             }
             glib::ControlFlow::Break
         });
+    };
+
+    // Apply the same strict clamp logic to both notify::upper and notify::page-size
+    // to catch window resize events where the viewport outgrows the content.
+    let handler_clone = handle_geometry_change.clone();
+    adj_clone.connect_upper_notify(move |a| {
+        handler_clone(a);
+    });
+
+    adj_clone.connect_page_size_notify(move |a| {
+        handle_geometry_change(a);
     });
 
     let console_store = gio::ListStore::new::<HistoryObject>();
-
-    // Immediately seed the console_store with an initialization engram before UI render.
-    // By guaranteeing the ListView is never geometrically empty at boot, the GTK4 ScrolledWindow
-    // will calculate a valid `upper` bounds > 0. This mathematically prevents the
-    // `gtk_adjustment_configure` assertion (`lower + page_size <= upper`) from triggering
-    // without relying on layout hacks (like `gtk::Box` wrapping) that break the GtkScrollable interface.
-    let boot_id = format!("{}-boot", chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0));
-    let boot_timestamp = chrono::Local::now().format("%H:%M:%S").to_string();
-    let boot_obj = HistoryObject::new(
-        &boot_id,
-        "System",
-        "Boot",
-        &boot_timestamp,
-        "UnaOS Telemetry Link Established.",
-        true
-    );
-    console_store.append(&boot_obj);
 
     // REMOVED FilterListModel per Architect instructions
     let console_selection = NoSelection::new(Some(console_store.clone()));
