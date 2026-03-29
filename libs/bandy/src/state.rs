@@ -169,6 +169,9 @@ pub struct AppState {
     pub shard_statuses: HashMap<String, ShardStatus>,
 
     pub live_context: Vec<crate::WeightedSkeleton>,
+
+    // The active spatial map (Matrix DAG topology)
+    pub matrix_topology: String,
 }
 
 impl Default for AppState {
@@ -190,6 +193,7 @@ impl Default for AppState {
             synapse_error: None,
             shard_statuses: HashMap::new(),
             live_context: Vec::new(),
+            matrix_topology: String::new(),
         }
     }
 }

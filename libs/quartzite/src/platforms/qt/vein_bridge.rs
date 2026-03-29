@@ -219,7 +219,8 @@ impl qobject::VeinBridge {
 
     pub fn request_history(self: std::pin::Pin<&mut Self>) {
         if let Some(tx) = GLOBAL_TX.get() {
-            let _ = tx.try_send(Event::LoadHistory);
+            // Qt isn't handling pagination directly yet, pass 0 as safe default
+            let _ = tx.try_send(Event::LoadHistory { offset: 0 });
         }
     }
 

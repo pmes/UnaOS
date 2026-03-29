@@ -256,7 +256,7 @@ impl VeinHandler {
 
             tokio::time::sleep(Duration::from_millis(800)).await;
 
-            let _ = synapse_loop.fire_async(SMessage::StorageLoadAll { receipt_id: 0 }).await;
+            let _ = synapse_loop.fire_async(SMessage::StorageLoadPaged { receipt_id: 0, offset: 0, limit: 50 }).await;
 
             let forge_client = match ForgeClient::new() {
                 Ok(client) => {
@@ -307,8 +307,8 @@ impl VeinHandler {
                                             execute_upload(path, app_state_upload, synapse_upload).await;
                                         });
                                     }
-                                    SMessage::StorageLoadAllResult { records, receipt_id: _ } => {
-                                        println!(">>> [J13 TRACE] BACKEND: StorageLoadAllResult processed. Populating state with {} items.", records.len());
+                                    SMessage::StorageLoadPagedResult { records, receipt_id: _ } => {
+                                        println!(">>> [J13 TRACE] BACKEND: StorageLoadPagedResult processed. Populating state with {} items.", records.len());
                                         {
                                             let mut s = state_bg.write().unwrap();
                                             s.history = records.into_iter().map(|r| HistoryItem {
@@ -348,6 +348,35 @@ impl VeinHandler {
                                     SMessage::StateInvalidated => {
                                         println!(">>> [J13 TRACE] VEIN THIEF CAUGHT: VeinHandler caught SMessage::StateInvalidated. No longer a thief thanks to broadcast!");
                                     }
+                                    SMessage::Matrix(matrix_event) => {
+                                        match matrix_event {
+                                            bandy::MatrixEvent::IngestTopology { nodes, edges } => {
+                                                let mut topology_str = String::new();
+                                                for node in &nodes {
+                                                    topology_str.push_str(&format!("NODE: {} [{}]\n", node.id, node.kind));
+                                                }
+                                                topology_str.push_str("\n");
+                                                for edge in &edges {
+                                                    topology_str.push_str(&format!("EDGE: {} --{}--> {}\n", edge.from, edge.relation, edge.to));
+                                                }
+
+                                                {
+                                                    let mut s = state_bg.write().unwrap();
+                                                    s.matrix_topology = topology_str;
+                                                }
+                                                let _ = synapse_loop.fire_async(SMessage::StateInvalidated).await;
+                                            }
+                                            bandy::MatrixEvent::SectorFocused { target, context } => {
+                                                let topology_str = format!("SECTOR: {}\n\n{}", target, context);
+                                                {
+                                                    let mut s = state_bg.write().unwrap();
+                                                    s.matrix_topology = topology_str;
+                                                }
+                                                let _ = synapse_loop.fire_async(SMessage::StateInvalidated).await;
+                                            }
+                                            _ => {}
+                                        }
+                                    }
                                     _ => {}
                                     },
                                     Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
@@ -370,9 +399,15 @@ impl VeinHandler {
                                     None => break,
                                 };
 
-                                if user_input_text == "LOAD_HISTORY" {
-                                    receipt_counter += 1;
-                                    let _ = synapse_loop.fire_async(SMessage::StorageLoadAll { receipt_id: receipt_counter }).await;
+                                if user_input_text.starts_with("LOAD_HISTORY:") {
+                                    if let Ok(offset) = user_input_text["LOAD_HISTORY:".len()..].parse::<usize>() {
+                                        receipt_counter += 1;
+                                        let _ = synapse_loop.fire_async(SMessage::StorageLoadPaged {
+                                            receipt_id: receipt_counter,
+                                            offset,
+                                            limit: 50
+                                        }).await;
+                                    }
                                     continue;
                                 }
 
@@ -594,6 +629,16 @@ impl VeinHandler {
                                             system_builder.push_str(&retrieved_context);
                                         }
 
+                                        let matrix_topology = {
+                                            let s = state_bg.read().unwrap();
+                                            s.matrix_topology.clone()
+                                        };
+
+                                        if !matrix_topology.is_empty() {
+                                            system_builder.push_str("\n\n--- CURRENT SPATIAL TOPOLOGY (DAG) ---\n");
+                                            system_builder.push_str(&matrix_topology);
+                                        }
+
                                         let mut engrams_combined = String::new();
                                         if !retrieved_engrams.is_empty() {
                                             engrams_combined.push_str(&retrieved_engrams);
@@ -719,24 +764,30 @@ impl AppHandler for VeinHandler {
 
         match event {
             Event::Input { target: _, text } => {
+                let trimmed = text.trim();
+                let path = std::path::Path::new(trimmed);
+                if path.exists() {
+                    let _ = self.synapse.fire(SMessage::Matrix(bandy::MatrixEvent::FocusSector(trimmed.to_string())));
+                }
+
                 let _ = self.synapse.fire(SMessage::ContextTelemetry {
                     skeletons: vec![],
                 });
 
-                if text.trim() == "/wolf" {
+                if trimmed == "/wolf" {
                     {
                         let mut s = self.app_state.write().unwrap();
                         s.sidebar_status = WolfpackState::Idle;
                     }
                     self.append_to_console("\n[SYSTEM] :: Switching to Wolfpack Grid...\n");
                     emit_ping = true;
-                } else if text.trim() == "/comms" {
+                } else if trimmed == "/comms" {
                     self.append_to_console("\n[SYSTEM] :: Secure Comms Established.\n");
                     emit_ping = true;
-                } else if let Some(path_str) = text.trim().strip_prefix("/upload ") {
+                } else if let Some(path_str) = trimmed.strip_prefix("/upload ") {
                     let path = PathBuf::from(path_str.trim());
                     let _ = self.publish("upload", SMessage::TriggerUpload(path));
-                } else if let Some(dir_text) = text.trim().strip_prefix("/directive ") {
+                } else if let Some(dir_text) = trimmed.strip_prefix("/directive ") {
                     self.append_to_console("\n[SYSTEM] :: Burning Active Directive to Vault...\n");
                     let _ = self.tx.send(format!("SAVE_DIRECTIVE:{}", dir_text));
                 } else {
@@ -797,9 +848,9 @@ impl AppHandler for VeinHandler {
             Event::DispatchPayload(json_payload) => {
                 let _ = self.tx.send(format!("DISPATCH_PAYLOAD:{}", json_payload));
             }
-            Event::LoadHistory => {
-                println!(">>> [J13 TRACE] BACKEND: Received Event::LoadHistory. Attempting to fetch...");
-                let _ = self.tx.send("LOAD_HISTORY".to_string());
+            Event::LoadHistory { offset } => {
+                println!(">>> [J13 TRACE] BACKEND: Received Event::LoadHistory {{ offset: {} }}. Attempting to fetch...", offset);
+                let _ = self.tx.send(format!("LOAD_HISTORY:{}", offset));
             }
             _ => {}
         }

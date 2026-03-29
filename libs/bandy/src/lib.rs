@@ -138,10 +138,12 @@ pub enum SMessage {
         success: bool,
         error: Option<String>,
     },
-    StorageLoadAll {
+    StorageLoadPaged {
         receipt_id: u64,
+        offset: usize,
+        limit: usize,
     },
-    StorageLoadAllResult {
+    StorageLoadPagedResult {
         receipt_id: u64,
         records: Vec<DispatchRecord>,
     },
