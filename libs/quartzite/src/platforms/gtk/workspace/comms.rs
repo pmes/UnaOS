@@ -67,6 +67,7 @@ pub fn build(
     tx_event: Sender<Event>,
     active_target: Rc<RefCell<String>>,
     composer_btn: Button,
+    tetra: &crate::tetra::StreamTetra,
 ) -> (CommsWidgets, CommsPointers) {
     let workspace_stack = Stack::new();
     workspace_stack.set_vexpand(true);
@@ -143,6 +144,7 @@ pub fn build(
     let is_fetching_for_upper = is_fetching_bind.clone();
 
     // Helper macro to handle layout recalculations on upper or page_size change
+    let scroll_behavior = tetra.scroll_behavior.clone();
     let handle_geometry_change = move |a: &gtk4::Adjustment| {
         let a_clone = a.clone();
 
@@ -150,6 +152,7 @@ pub fn build(
         let last_page_size_idle = last_page_size_ref.clone();
         let is_prepending_idle = is_prepending_upper.clone();
         let fetching_for_idle = is_fetching_for_upper.clone();
+        let behavior = scroll_behavior.clone();
 
         // Defer the entirety of the clamping logic to the GTK idle loop.
         // This ensures the layout engine has completed its `gtk_adjustment_configure` pass
@@ -181,8 +184,15 @@ pub fn build(
             if current_upper >= current_lower + current_page_size {
                 // The Clamp: Content is larger than viewport
                 if is_at_bottom {
-                    // Execute auto-scroll
-                    a_clone.set_value(current_upper - current_page_size);
+                    // Execute auto-scroll based on StreamTetra policy
+                    match behavior {
+                        crate::tetra::ScrollBehavior::AutoScroll => {
+                            a_clone.set_value(current_upper - current_page_size);
+                        }
+                        crate::tetra::ScrollBehavior::Manual => {
+                            // Do nothing
+                        }
+                    }
                 } else if is_prepending && delta > 0.0 {
                     // Strictly clamp the new value so we never overshoot GTK's internal bounds
                     // when loading historical items at the top
@@ -229,6 +239,7 @@ pub fn build(
     }
 
     let console_factory = SignalListItemFactory::new();
+    let alignment_policy = tetra.alignment.clone();
     console_factory.connect_setup(move |_factory, item| {
         let item = item.downcast_ref::<ListItem>().unwrap();
         let root = Box::new(Orientation::Horizontal, 0);
@@ -320,6 +331,7 @@ pub fn build(
         let boxed_widgets = glib::BoxedAnyObject::new(widgets);
         unsafe {
             item.set_data("widgets", boxed_widgets);
+            item.set_data("alignment_policy", glib::BoxedAnyObject::new(alignment_policy.clone()));
         }
 
         let gesture = GestureClick::new();
@@ -375,6 +387,13 @@ pub fn build(
         let Some(boxed_ptr) = boxed_widgets else { return; };
         let widgets = unsafe { boxed_ptr.as_ref() }.borrow::<BubbleWidgets>();
 
+        let boxed_alignment = unsafe { item.data::<glib::BoxedAnyObject>("alignment_policy") };
+        let alignment = if let Some(boxed_align_ptr) = boxed_alignment {
+            unsafe { boxed_align_ptr.as_ref() }.borrow::<crate::tetra::StreamAlign>().clone()
+        } else {
+            crate::tetra::StreamAlign::Start
+        };
+
         widgets.bubble.remove_css_class("architect-bubble");
         widgets.bubble.remove_css_class("una-bubble");
         widgets.left_spacer.set_visible(false);
@@ -402,21 +421,10 @@ pub fn build(
             let is_expanded = obj.is_expanded();
             let line_count = content.trim_end().lines().count();
 
+            // Set styling based on role
             if sender == "Architect" {
                 widgets.meta_label.add_css_class("role-architect");
                 widgets.bubble.add_css_class("architect-bubble");
-                widgets.left_spacer.set_visible(true);
-                widgets.right_spacer.set_visible(false);
-                widgets.meta_label.set_halign(gtk4::Align::End);
-                widgets.meta_label.set_xalign(1.0);
-                if line_count > 11 {
-                    widgets.left_expand_btn.set_visible(true);
-                    widgets.right_expand_btn.set_visible(false);
-                    widgets.left_expand_btn.set_icon_name(if is_expanded { "pan-up-symbolic" } else { "pan-down-symbolic" });
-                } else {
-                    widgets.left_expand_btn.set_visible(false);
-                    widgets.right_expand_btn.set_visible(false);
-                }
             } else {
                 if sender == "Una-Prime" {
                     widgets.meta_label.add_css_class("role-una");
@@ -424,19 +432,49 @@ pub fn build(
                     widgets.meta_label.add_css_class("role-system");
                 }
                 widgets.bubble.add_css_class("una-bubble");
+            }
+
+            // Invert the physical layout orientation if StreamTetra asks us to align End, but typically
+            // sender determines alignment in standard chats. However, we'll apply alignment based on
+            // the `StreamAlign` policy + the sender role to keep the DMZ in charge.
+            let is_user = sender == "Architect";
+
+            // Default spacing based on standard roles if policy is start
+            let (align_right, meta_halign, meta_xalign) = match alignment {
+                crate::tetra::StreamAlign::Start => (is_user, if is_user { gtk4::Align::End } else { gtk4::Align::Start }, if is_user { 1.0 } else { 0.0 }),
+                crate::tetra::StreamAlign::End => (!is_user, if !is_user { gtk4::Align::End } else { gtk4::Align::Start }, if !is_user { 1.0 } else { 0.0 }),
+                crate::tetra::StreamAlign::Center => {
+                    widgets.bubble.set_halign(gtk4::Align::Center);
+                    (false, gtk4::Align::Center, 0.5)
+                }
+            };
+
+            if align_right {
+                widgets.left_spacer.set_visible(true);
+                widgets.right_spacer.set_visible(false);
+            } else if !matches!(alignment, crate::tetra::StreamAlign::Center) {
                 widgets.left_spacer.set_visible(false);
                 widgets.right_spacer.set_visible(true);
-                widgets.meta_label.set_halign(gtk4::Align::Start);
-                widgets.meta_label.set_xalign(0.0);
-                if line_count > 11 {
+            }
+
+            widgets.meta_label.set_halign(meta_halign);
+            widgets.meta_label.set_xalign(meta_xalign);
+
+            if line_count > 11 {
+                if align_right {
+                    widgets.left_expand_btn.set_visible(true);
+                    widgets.right_expand_btn.set_visible(false);
+                    widgets.left_expand_btn.set_icon_name(if is_expanded { "pan-up-symbolic" } else { "pan-down-symbolic" });
+                } else {
                     widgets.left_expand_btn.set_visible(false);
                     widgets.right_expand_btn.set_visible(true);
                     widgets.right_expand_btn.set_icon_name(if is_expanded { "pan-up-symbolic" } else { "pan-down-symbolic" });
-                } else {
-                    widgets.left_expand_btn.set_visible(false);
-                    widgets.right_expand_btn.set_visible(false);
                 }
+            } else {
+                widgets.left_expand_btn.set_visible(false);
+                widgets.right_expand_btn.set_visible(false);
             }
+
             if line_count > 11 && !is_expanded {
                 let truncated: String = content.trim_end().lines().take(11).collect::<Vec<&str>>().join("\n");
                 widgets.chat_content_view.buffer().set_text(&truncated);
@@ -872,7 +910,14 @@ pub fn build(
     input_container.append(&input_scroll);
     input_container.append(&send_btn);
 
-    comms_page.append(&input_container);
+    match tetra.input_anchor {
+        crate::tetra::ScrollAnchor::Top => {
+            comms_page.prepend(&input_container);
+        }
+        crate::tetra::ScrollAnchor::Bottom => {
+            comms_page.append(&input_container);
+        }
+    }
 
     workspace_stack.add_titled(&comms_page, Some("comms"), "Comms");
 

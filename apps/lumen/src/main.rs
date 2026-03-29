@@ -148,7 +148,7 @@ fn main() {
     // 7.5. Define the Workspace Layout via Declarative UI Engine
     let workspace_tetra = quartzite::tetra::WorkspaceTetra {
         left_pane: quartzite::tetra::TetraNode::Matrix,
-        right_pane: quartzite::tetra::TetraNode::Stream,
+        right_pane: quartzite::tetra::TetraNode::Stream(quartzite::tetra::StreamTetra::default()),
         split_ratio: 0.25,
     };
 

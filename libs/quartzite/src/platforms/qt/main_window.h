@@ -22,7 +22,7 @@
 
 class LumenMainWindow : public QMainWindow {
 public:
-    explicit LumenMainWindow(float split_ratio, QWidget *parent = nullptr);
+    explicit LumenMainWindow(float split_ratio, int input_anchor, int scroll_behavior, int alignment, QWidget *parent = nullptr);
     ~LumenMainWindow() override;
 
 private:
@@ -37,7 +37,7 @@ struct LumenQApp {
     int exec();
 };
 
-std::unique_ptr<LumenMainWindow> create_main_window(float split_ratio);
+std::unique_ptr<LumenMainWindow> create_main_window(float split_ratio, int input_anchor, int scroll_behavior, int alignment);
 void show_main_window(LumenMainWindow& window);
 
 std::unique_ptr<LumenQApp> create_qapplication();

@@ -70,8 +70,18 @@ impl Spline {
             // Spawn the tokio backend to listen to StateInvalidated pings from Vein/Cortex
             crate::platforms::qt::window::spawn_state_listener(_app_state, _rx_synapse);
 
+            let default_tetra = crate::tetra::StreamTetra::default();
+            let stream_tetra = match &_workspace_tetra.right_pane {
+                crate::tetra::TetraNode::Stream(tetra) => tetra,
+                _ => &default_tetra,
+            };
             return crate::NativeView {
-                ptr: ffi::create_main_window(_workspace_tetra.split_ratio),
+                ptr: ffi::create_main_window(
+                    _workspace_tetra.split_ratio,
+                    stream_tetra.input_anchor.clone() as i32,
+                    stream_tetra.scroll_behavior.clone() as i32,
+                    stream_tetra.alignment.clone() as i32
+                ),
             };
         }
 

@@ -29,6 +29,22 @@ Rectangle {
         anchors.fill: parent
         anchors.margins: 10
 
+        // Use a hidden item at the top or bottom depending on anchor
+        Item {
+            // Anchor to top if _tetraInputAnchor == 0 (Top)
+            Layout.fillWidth: true
+            height: _tetraInputAnchor === 0 ? inputRow.height : 0
+            visible: _tetraInputAnchor === 0
+
+            // Re-parent the inputRow here if it's supposed to be on top
+            Component.onCompleted: {
+                if (_tetraInputAnchor === 0) {
+                    inputRow.parent = this;
+                    inputRow.anchors.fill = this;
+                }
+            }
+        }
+
         // Chat / Message View natively scrolls via Flickable
         ListView {
             id: chatListView
@@ -56,10 +72,18 @@ Rectangle {
                     width: chatListView.isWideMode ? Math.min(parent.width * 0.7, messageText.implicitWidth + 32) : parent.width
                     height: parent.height
 
-                    // Anchoring logic for stagger
-                    anchors.left: chatListView.isWideMode && !model.toolTip ? parent.left : undefined
-                    anchors.right: chatListView.isWideMode && model.toolTip ? parent.right : undefined
-                    // Fallback to center if not staggered (though full width means it covers everything anyway)
+                    // Alignment mapping: 0 = Start, 1 = End, 2 = Center
+                    // If center, force horizontal center.
+                    // Otherwise, map "Start" to Left/Right based on role (model.toolTip is is_chat).
+                    // In a typical layout: User (Architect) on Right, System/Lumen on Left.
+                    // model.toolTip corresponds to `is_chat`. Wait, in history data: role 3 is is_chat.
+                    // Actually, let's keep it simple: model.edit corresponds to sender ("Architect").
+                    property bool isUser: model.edit === "Architect"
+                    property bool alignRight: (_tetraAlignment === 0 && isUser) || (_tetraAlignment === 1 && !isUser)
+
+                    anchors.left: chatListView.isWideMode && _tetraAlignment !== 2 && !alignRight ? parent.left : undefined
+                    anchors.right: chatListView.isWideMode && _tetraAlignment !== 2 && alignRight ? parent.right : undefined
+                    anchors.horizontalCenter: _tetraAlignment === 2 ? parent.horizontalCenter : undefined
 
                     border.width: 1
                     radius: 8
@@ -75,15 +99,32 @@ Rectangle {
             }
 
             onCountChanged: {
-                // Auto-scroll to bottom on new messages
-                chatListView.positionViewAtEnd()
+                if (_tetraScrollBehavior === 0) {
+                    // Auto-scroll to bottom on new messages (0 = AutoScroll, 1 = Manual)
+                    chatListView.positionViewAtEnd()
+                }
             }
         }
 
-        // Input Area
-        RowLayout {
+        Item {
+            // Anchor to bottom if _tetraInputAnchor == 1 (Bottom)
             Layout.fillWidth: true
-            Layout.alignment: Qt.AlignBottom
+            height: _tetraInputAnchor === 1 ? inputRow.height : 0
+            visible: _tetraInputAnchor === 1
+
+            // Re-parent the inputRow here if it's supposed to be on bottom
+            Component.onCompleted: {
+                if (_tetraInputAnchor === 1) {
+                    inputRow.parent = this;
+                    inputRow.anchors.fill = this;
+                }
+            }
+        }
+
+        // Input Area (initially created loose, reparented by the Items above)
+        RowLayout {
+            id: inputRow
+            width: parent.width
 
             TextField {
                 id: inputField

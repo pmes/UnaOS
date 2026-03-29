@@ -61,6 +61,7 @@ fn build_gnome_ui(
         app_state,
         rx_synapse,
         brain_icon.clone(),
+        workspace_tetra,
     );
 
     // Assemble the GNOME specific TabView for the workspace
@@ -101,6 +102,7 @@ fn build_gtk_ui(
         app_state,
         rx_synapse,
         brain_icon.clone(),
+        workspace_tetra,
     );
 
     crate::platforms::gtk::mega_bar::MegaBar::build(
