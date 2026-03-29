@@ -20,9 +20,7 @@ pub struct ReactorPointers {
     pub pulse_icon: Image,
     pub context_view: crate::widgets::telemetry::ContextView,
     pub active_directive: Rc<RefCell<String>>,
-    pub console_store: gtk4::gio::ListStore,
-    pub is_fetching: Rc<RefCell<bool>>,
-    pub is_prepending: Rc<RefCell<bool>>,
+    pub chat_manager: Rc<RefCell<super::chat_manager::ChatBoxManager>>,
     pub preflight_overlay: Overlay,
     pub preflight_stack_container: gtk4::Box,
     pub preflight_stack: Stack,
@@ -43,7 +41,7 @@ pub fn spawn_listener(pointers: ReactorPointers, rx_gui: Receiver<GuiUpdate>) {
         while let Ok(update) = rx_gui.recv().await {
             match update {
                 GuiUpdate::ConsoleLogBatch(logs) => {
-                    let mut batch: Vec<gtk4::glib::Object> = Vec::new();
+                    let mut batch: Vec<HistoryObject> = Vec::new();
                     for (i, text) in logs.into_iter().enumerate() {
                         let mut sender = "System".to_string();
                         let mut is_chat = true;
@@ -70,69 +68,68 @@ pub fn spawn_listener(pointers: ReactorPointers, rx_gui: Receiver<GuiUpdate>) {
                         let timestamp = chrono::Local::now().format("%H:%M:%S").to_string();
                         let id = format!("{}-sys-{}", chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0), i);
                         let obj = HistoryObject::new(&id, &sender, &subject, &timestamp, &content, is_chat);
-                        batch.push(obj.upcast());
+                        batch.push(obj);
                     }
                     if !batch.is_empty() {
-                        let len = pointers.console_store.n_items();
-                        pointers.console_store.splice(len, 0, &batch);
+                        pointers.chat_manager.borrow_mut().append_batch(batch);
                     }
                 }
                 GuiUpdate::HistorySeed(messages) => {
+                    let mut cm = pointers.chat_manager.borrow_mut();
                     if messages.is_empty() {
-                        *pointers.is_fetching.borrow_mut() = false;
-                        *pointers.is_prepending.borrow_mut() = false;
+                        cm.set_fetching(false);
+                        cm.set_prepending(false);
                         continue;
                     }
 
-                    let mut batch: Vec<gtk4::glib::Object> = Vec::new();
+                    let mut batch: Vec<HistoryObject> = Vec::new();
                     for (i, msg) in messages.into_iter().enumerate() {
                         let id = format!("{}-hist-{}", chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0), i);
                         let obj = HistoryObject::new(&id, &msg.sender, "History", &msg.timestamp, &msg.content, msg.is_chat);
-                        batch.push(obj.upcast());
+                        batch.push(obj);
                     }
                     if !batch.is_empty() {
-                        // Splice at index 0 to properly prepend history
-                        pointers.console_store.splice(0, 0, &batch);
+                        cm.prepend_history(batch);
                     }
 
-                    let fetch_lock = pointers.is_fetching.clone();
+                    let cm_clone = pointers.chat_manager.clone();
                     gtk4::glib::timeout_add_local(
                         std::time::Duration::from_millis(100),
                         move || {
-                            *fetch_lock.borrow_mut() = false;
+                            cm_clone.borrow_mut().set_fetching(false);
                             gtk4::glib::ControlFlow::Break
                         },
                     );
                 }
                 GuiUpdate::HistoryAppend(messages) => {
+                    let mut cm = pointers.chat_manager.borrow_mut();
                     if messages.is_empty() {
-                        *pointers.is_fetching.borrow_mut() = false;
-                        *pointers.is_prepending.borrow_mut() = false;
+                        cm.set_fetching(false);
+                        cm.set_prepending(false);
                         continue;
                     }
 
-                    let mut batch: Vec<gtk4::glib::Object> = Vec::new();
+                    let mut batch: Vec<HistoryObject> = Vec::new();
                     for (i, msg) in messages.into_iter().enumerate() {
                         let id = format!("{}-hist-{}", chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0), i);
                         let obj = HistoryObject::new(&id, &msg.sender, "History", &msg.timestamp, &msg.content, msg.is_chat);
-                        batch.push(obj.upcast());
+                        batch.push(obj);
                     }
                     if !batch.is_empty() {
-                        // Splice at index 0 to properly prepend older history
-                        pointers.console_store.splice(0, 0, &batch);
+                        cm.prepend_history(batch);
                     }
 
-                    let fetch_lock = pointers.is_fetching.clone();
+                    let cm_clone = pointers.chat_manager.clone();
                     gtk4::glib::timeout_add_local(
                         std::time::Duration::from_millis(100),
                         move || {
-                            *fetch_lock.borrow_mut() = false;
+                            cm_clone.borrow_mut().set_fetching(false);
                             gtk4::glib::ControlFlow::Break
                         },
                     );
                 }
                 GuiUpdate::ClearConsole => {
-                    pointers.console_store.remove_all();
+                    pointers.chat_manager.borrow_mut().clear();
                 }
                 GuiUpdate::ShardStatusChanged { id, status } => {
                     if id == "una-prime" {
@@ -218,7 +215,7 @@ pub fn spawn_listener(pointers: ReactorPointers, rx_gui: Receiver<GuiUpdate>) {
                     let id = format!("{}", chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0));
                     let err_obj =
                         HistoryObject::new(&id, "System Error", "Log", &timestamp, &err_msg, true);
-                    pointers.console_store.append(&err_obj);
+                    pointers.chat_manager.borrow_mut().append_batch(vec![err_obj]);
                 }
                 GuiUpdate::ContextTelemetry(skeletons) => {
                     pointers.context_view.update(skeletons);

@@ -1,3 +1,4 @@
+pub mod chat_manager;
 pub mod comms;
 pub mod reactor;
 pub mod sidebar;
@@ -106,9 +107,7 @@ pub fn build(
         pulse_icon: brain_icon,
         context_view: sidebar_pointers.context_view,
         active_directive: comms_pointers.active_directive,
-        console_store: comms_pointers.console_store,
-        is_fetching: comms_pointers.is_fetching,
-        is_prepending: comms_pointers.is_prepending,
+        chat_manager: comms_pointers.chat_manager,
         preflight_overlay: comms_pointers.preflight_overlay,
         preflight_stack_container: comms_pointers.preflight_stack_container,
         preflight_stack: comms_pointers.preflight_stack,
