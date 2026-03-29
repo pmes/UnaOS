@@ -62,23 +62,6 @@ impl ChatBoxManager {
 
             if upper <= page_size || upper == 0.0 { return; }
 
-            let is_at_top = val <= lower + 50.0; // Trigger load history when within 50px of top
-            let previously_at_top = *was_at_top.borrow();
-            *was_at_top.borrow_mut() = is_at_top;
-
-            // Trigger LoadHistory
-            if is_at_top && !previously_at_top && upper > page_size {
-                if !*is_fetching_bind.borrow() && !*history_exhausted_bind.borrow() {
-                    *is_fetching_bind.borrow_mut() = true;
-                    *is_prepending_bind.borrow_mut() = true;
-                    let tx_hist = tx_clone.clone();
-
-                    gtk4::glib::MainContext::default().spawn_local(async move {
-                        let _ = tx_hist.send(Event::LoadHistory { offset: 0 }).await;
-                    });
-                }
-            }
-
             // Decay timer logic
             let is_away_from_top = val > lower + 500.0;
             if is_away_from_top {
@@ -286,7 +269,8 @@ impl ChatBoxManager {
     }
 
     fn create_message_widget(obj: &HistoryObject) -> Box {
-        let root = Box::new(Orientation::Horizontal, 0);
+        let root = Box::new(Orientation::Vertical, 0);
+        root.set_halign(gtk4::Align::Fill);
         root.set_hexpand(true);
         root.add_css_class("console-row");
 
@@ -317,7 +301,6 @@ impl ChatBoxManager {
         let msg_label = Label::builder()
             .wrap(true)
             .hexpand(false)
-            .width_chars(30)
             .max_width_chars(85)
             .wrap_mode(gtk4::pango::WrapMode::WordChar)
             .margin_top(8)
@@ -338,7 +321,7 @@ impl ChatBoxManager {
         payload_content_view.set_editable(false);
         payload_content_view.set_wrap_mode(gtk4::WrapMode::WordChar);
         payload_content_view.set_monospace(true);
-        payload_content_view.set_cursor_visible(true); // Explicitly enable cursor for selection
+        payload_content_view.set_cursor_visible(false); // Disable ghost cursor
         payload_content_view.add_css_class("view");
         payload_content_view.set_size_request(-1, 300);
 
@@ -370,12 +353,12 @@ impl ChatBoxManager {
             let is_user = sender == "Architect";
 
             if is_user {
-                root.set_halign(gtk4::Align::End);
+                bubble.set_halign(gtk4::Align::End);
                 bubble.add_css_class("bubble-user");
                 meta_label.set_halign(gtk4::Align::End);
                 meta_label.set_xalign(1.0);
             } else {
-                root.set_halign(gtk4::Align::Start);
+                bubble.set_halign(gtk4::Align::Start);
                 bubble.add_css_class("bubble-ai");
                 meta_label.set_halign(gtk4::Align::Start);
                 meta_label.set_xalign(0.0);
@@ -456,7 +439,7 @@ impl ChatBoxManager {
             }
 
         } else {
-            root.set_halign(gtk4::Align::Start);
+            bubble.set_halign(gtk4::Align::Start);
             expander.set_visible(true);
             bubble.add_css_class("una-bubble");
             expander.set_label(Some(&format!("{} | {} | {}", sender, subject, timestamp)));
