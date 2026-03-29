@@ -77,6 +77,7 @@ pub fn spawn_listener(pointers: ReactorPointers, rx_gui: Receiver<GuiUpdate>) {
                 GuiUpdate::HistorySeed(messages) => {
                     let mut cm = pointers.chat_manager.borrow_mut();
                     if messages.is_empty() {
+                        cm.set_history_exhausted(true);
                         cm.set_fetching(false);
                         cm.set_prepending(false);
                         continue;
@@ -104,6 +105,7 @@ pub fn spawn_listener(pointers: ReactorPointers, rx_gui: Receiver<GuiUpdate>) {
                 GuiUpdate::HistoryAppend(messages) => {
                     let mut cm = pointers.chat_manager.borrow_mut();
                     if messages.is_empty() {
+                        cm.set_history_exhausted(true);
                         cm.set_fetching(false);
                         cm.set_prepending(false);
                         continue;

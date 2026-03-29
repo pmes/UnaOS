@@ -15,6 +15,7 @@ pub struct ChatBoxManager {
     decay_timer: Rc<RefCell<Option<gtk4::glib::SourceId>>>,
     is_prepending: Rc<RefCell<bool>>,
     is_fetching: Rc<RefCell<bool>>,
+    history_exhausted: Rc<RefCell<bool>>,
     scroll_behavior: crate::tetra::ScrollBehavior,
 }
 
@@ -39,12 +40,14 @@ impl ChatBoxManager {
         let node_count = Rc::new(RefCell::new(0));
         let is_prepending = Rc::new(RefCell::new(false));
         let is_fetching = Rc::new(RefCell::new(false));
+        let history_exhausted = Rc::new(RefCell::new(false));
 
         let adj = scrolled_window.vadjustment();
 
         let tx_clone = tx_event.clone();
         let is_fetching_bind = is_fetching.clone();
         let is_prepending_bind = is_prepending.clone();
+        let history_exhausted_bind = history_exhausted.clone();
         let decay_timer_bind = decay_timer.clone();
         let chat_box_bind = chat_box.clone();
         let node_count_bind = node_count.clone();
@@ -65,7 +68,7 @@ impl ChatBoxManager {
 
             // Trigger LoadHistory
             if is_at_top && !previously_at_top && upper > page_size {
-                if !*is_fetching_bind.borrow() {
+                if !*is_fetching_bind.borrow() && !*history_exhausted_bind.borrow() {
                     *is_fetching_bind.borrow_mut() = true;
                     *is_prepending_bind.borrow_mut() = true;
                     let tx_hist = tx_clone.clone();
@@ -213,6 +216,7 @@ impl ChatBoxManager {
             decay_timer,
             is_prepending,
             is_fetching,
+            history_exhausted,
             scroll_behavior: tetra.scroll_behavior.clone(),
         }))
     }
@@ -223,6 +227,10 @@ impl ChatBoxManager {
 
     pub fn set_prepending(&mut self, state: bool) {
         *self.is_prepending.borrow_mut() = state;
+    }
+
+    pub fn set_history_exhausted(&mut self, state: bool) {
+        *self.history_exhausted.borrow_mut() = state;
     }
 
     pub fn append_batch(&mut self, messages: Vec<HistoryObject>) {
@@ -279,15 +287,8 @@ impl ChatBoxManager {
 
     fn create_message_widget(obj: &HistoryObject) -> Box {
         let root = Box::new(Orientation::Horizontal, 0);
-        root.set_halign(gtk4::Align::Fill);
         root.set_hexpand(true);
         root.add_css_class("console-row");
-
-        let flow_box_left = Box::new(Orientation::Horizontal, 0);
-        flow_box_left.set_hexpand(true);
-
-        let flow_box_right = Box::new(Orientation::Horizontal, 0);
-        flow_box_right.set_hexpand(true);
 
         let bubble = Box::new(Orientation::Vertical, 4);
         bubble.add_css_class("card");
@@ -337,7 +338,7 @@ impl ChatBoxManager {
         payload_content_view.set_editable(false);
         payload_content_view.set_wrap_mode(gtk4::WrapMode::WordChar);
         payload_content_view.set_monospace(true);
-        payload_content_view.set_cursor_visible(false);
+        payload_content_view.set_cursor_visible(true); // Explicitly enable cursor for selection
         payload_content_view.add_css_class("view");
         payload_content_view.set_size_request(-1, 300);
 
@@ -349,9 +350,7 @@ impl ChatBoxManager {
         expander.set_child(Some(&payload_scroll));
         bubble.append(&expander);
 
-        root.append(&flow_box_left);
         root.append(&bubble);
-        root.append(&flow_box_right);
 
         let is_chat = obj.is_chat();
         let sender = obj.sender();
@@ -371,14 +370,12 @@ impl ChatBoxManager {
             let is_user = sender == "Architect";
 
             if is_user {
-                flow_box_left.set_visible(true);
-                flow_box_right.set_visible(false);
+                root.set_halign(gtk4::Align::End);
                 bubble.add_css_class("bubble-user");
                 meta_label.set_halign(gtk4::Align::End);
                 meta_label.set_xalign(1.0);
             } else {
-                flow_box_left.set_visible(false);
-                flow_box_right.set_visible(true);
+                root.set_halign(gtk4::Align::Start);
                 bubble.add_css_class("bubble-ai");
                 meta_label.set_halign(gtk4::Align::Start);
                 meta_label.set_xalign(0.0);
@@ -431,7 +428,8 @@ impl ChatBoxManager {
                             }
 
                             msg_lbl.set_label(&truncated);
-                            msg_lbl.set_selectable(false);
+                            // To prevent selection lockout when collapsed but still provide truncation:
+                            msg_lbl.set_selectable(true);
                         }
                     }
                 };
@@ -458,8 +456,7 @@ impl ChatBoxManager {
             }
 
         } else {
-            flow_box_left.set_visible(false);
-            flow_box_right.set_visible(true);
+            root.set_halign(gtk4::Align::Start);
             expander.set_visible(true);
             bubble.add_css_class("una-bubble");
             expander.set_label(Some(&format!("{} | {} | {}", sender, subject, timestamp)));
