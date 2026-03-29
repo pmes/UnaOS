@@ -17,11 +17,16 @@ pub fn spawn_translator(
         let mut history_cursor = 0;
         let mut console_cursor = 0;
 
+        println!(">>> [J13 TRACE] TRANSLATOR: Thread spawned. Waiting for Synapse messages...");
+
         while let Ok(msg) = rx_synapse.recv().await {
+            println!(">>> [J13 TRACE] TRANSLATOR: Received a Synapse message.");
             match msg {
                 SMessage::StateInvalidated => {
                     let (new_history_len, new_console_len) = {
+                        println!(">>> [J13 TRACE] TRANSLATOR: Processing StateInvalidated. Attempting to acquire read lock...");
                         let st = app_state.read().unwrap();
+                        println!(">>> [J13 TRACE] TRANSLATOR: Read lock acquired. history_len: {}, console_len: {}", st.history.len(), st.console_logs.len());
                         (st.history.len(), st.console_logs.len())
                     };
 
@@ -36,6 +41,8 @@ pub fn spawn_translator(
                         let st = app_state.read().unwrap();
 
                         let h_delta = if st.history.len() > history_cursor {
+                            // If cursor is 0 (initial boot or clear), grab everything.
+                            // Otherwise, only grab the delta.
                             st.history[history_cursor..].to_vec()
                         } else {
                             Vec::new()
@@ -60,6 +67,7 @@ pub fn spawn_translator(
                     };
 
                     if !history_delta.is_empty() {
+                        println!(">>> [J13 TRACE] TRANSLATOR: Sending HistoryBatch with {} items", history_delta.len());
                         let _ = tx_gui.send(GuiUpdate::HistoryBatch(history_delta)).await;
                         history_cursor = new_history_len;
                     }

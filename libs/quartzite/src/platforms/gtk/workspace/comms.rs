@@ -82,7 +82,7 @@ pub fn build(
 
     let scrolled_window = ScrolledWindow::builder()
         .hscrollbar_policy(PolicyType::Never)
-        .vscrollbar_policy(PolicyType::Always)
+        .vscrollbar_policy(PolicyType::Automatic)
         .vexpand(true)
         .hexpand(true)
         .build();
@@ -361,6 +361,8 @@ pub fn build(
     console_factory.connect_bind(move |_factory, item| {
         let Some(item) = item.downcast_ref::<ListItem>() else { return; };
         let Some(obj) = item.item().and_then(|c| c.downcast::<HistoryObject>().ok()) else { return; };
+
+        println!(">>> [J13 TRACE] COMMS: Binding item. Sender: {}, Subject: {}, Timestamp: {}", obj.sender(), obj.subject(), obj.timestamp());
 
         // Retrieve preserved absolute pointers securely
         let boxed_widgets = unsafe { item.data::<glib::BoxedAnyObject>("widgets") };
@@ -894,6 +896,7 @@ pub fn build(
 
             let tx_async = tx_clone_load_hist.clone();
             glib::MainContext::default().spawn_local(async move {
+                println!(">>> [J13 TRACE] COMMS: Dispatching Event::LoadHistory to Backend.");
                 let _ = tx_async.send(Event::LoadHistory).await;
             });
         }
