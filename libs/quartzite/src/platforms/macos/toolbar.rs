@@ -15,7 +15,7 @@
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 use objc2::{
-    declare_class, msg_send, msg_send_id, mutability, rc::Retained, ClassType, DeclaredClass, ProtocolType
+    define_class, msg_send, msg_send_id, mutability, rc::Retained, ClassType, DefinedClass, ProtocolType
 };
 use objc2_app_kit::{
     NSButton, NSControl, NSFont, NSImage, NSImageNameNetwork, NSProgressIndicator,
@@ -33,7 +33,7 @@ pub const DIAGNOSTICS_ITEM_ID: &str = "UnaOSDiagnosticsItem";
 // NATIVE TOOLBAR DELEGATE
 // -----------------------------------------------------------------------------
 
-declare_class!(
+define_class!(
     pub struct ToolbarDelegate;
 
     unsafe impl ClassType for ToolbarDelegate {
@@ -42,7 +42,7 @@ declare_class!(
         const NAME: &'static str = "UnaToolbarDelegate";
     }
 
-    impl DeclaredClass for ToolbarDelegate {}
+    impl DefinedClass for ToolbarDelegate {}
 
     unsafe impl NSToolbarDelegate for ToolbarDelegate {
         #[method_id(toolbar:itemForItemIdentifier:willBeInsertedIntoToolbar:)]

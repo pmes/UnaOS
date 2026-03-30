@@ -20,7 +20,7 @@ pub mod workspace;
 
 use crate::{NativeView, NativeWindow};
 use block2::RcBlock;
-use objc2::{declare_class, msg_send, msg_send_id, mutability, rc::Retained, ClassType, DeclaredClass};
+use objc2::{define_class, msg_send, msg_send_id, mutability, rc::Retained, ClassType, DefinedClass};
 use objc2_app_kit::{NSApplication, NSApplicationActivationPolicy, NSApplicationDelegate, NSWindow, NSWindowStyleMask};
 use objc2_foundation::{MainThreadMarker, NSObject, NSPoint, NSRect, NSSize, NSString};
 use std::cell::RefCell;
@@ -69,7 +69,7 @@ pub struct AppDelegateIvars {
     bootstrap: RefCell<Option<BootstrapFn>>,
 }
 
-declare_class!(
+define_class!(
     pub struct AppDelegate;
 
     unsafe impl ClassType for AppDelegate {
@@ -78,7 +78,7 @@ declare_class!(
         const NAME: &'static str = "UnaAppDelegate";
     }
 
-    impl DeclaredClass for AppDelegate {
+    impl DefinedClass for AppDelegate {
         type Ivars = AppDelegateIvars;
     }
 

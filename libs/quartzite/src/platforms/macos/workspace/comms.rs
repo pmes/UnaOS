@@ -15,7 +15,7 @@
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 use objc2::{
-    declare_class, msg_send, msg_send_id, mutability, rc::Retained, ClassType, DeclaredClass, ProtocolType
+    define_class, msg_send, msg_send_id, mutability, rc::Retained, ClassType, DefinedClass, ProtocolType
 };
 use objc2_app_kit::{
     NSScrollView, NSTextView, NSTextViewDelegate, NSView, NSVisualEffectView,
@@ -117,7 +117,7 @@ pub fn build_right_pane(mtm: MainThreadMarker) -> Retained<NSView> {
 // NATIVE TEXTVIEW DELEGATE (Input Capture)
 // -----------------------------------------------------------------------------
 
-declare_class!(
+define_class!(
     pub struct InputDelegate;
 
     unsafe impl ClassType for InputDelegate {
@@ -126,7 +126,7 @@ declare_class!(
         const NAME: &'static str = "UnaInputDelegate";
     }
 
-    impl DeclaredClass for InputDelegate {}
+    impl DefinedClass for InputDelegate {}
 
     unsafe impl NSTextViewDelegate for InputDelegate {
         #[method(textView:doCommandBySelector:)]

@@ -15,7 +15,7 @@
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 use objc2::{
-    declare_class, msg_send, msg_send_id, mutability, rc::Retained, ClassType, DeclaredClass, ProtocolType
+    define_class, msg_send, msg_send_id, mutability, rc::Retained, ClassType, DefinedClass, ProtocolType
 };
 use objc2_app_kit::{
     NSOutlineView, NSOutlineViewDataSource, NSOutlineViewDelegate, NSScrollView,
@@ -113,7 +113,7 @@ fn build_outline_tab(mtm: MainThreadMarker, title: &str) -> Retained<NSViewContr
     vc
 }
 
-declare_class!(
+define_class!(
     pub struct OutlineDataSource;
 
     unsafe impl ClassType for OutlineDataSource {
@@ -122,7 +122,7 @@ declare_class!(
         const NAME: &'static str = "UnaOutlineDataSource";
     }
 
-    impl DeclaredClass for OutlineDataSource {}
+    impl DefinedClass for OutlineDataSource {}
 
     unsafe impl NSOutlineViewDataSource for OutlineDataSource {
         #[method(outlineView:numberOfChildrenOfItem:)]
@@ -166,7 +166,7 @@ impl OutlineDataSource {
     }
 }
 
-declare_class!(
+define_class!(
     pub struct OutlineDelegate;
 
     unsafe impl ClassType for OutlineDelegate {
@@ -175,7 +175,7 @@ declare_class!(
         const NAME: &'static str = "UnaOutlineDelegate";
     }
 
-    impl DeclaredClass for OutlineDelegate {}
+    impl DefinedClass for OutlineDelegate {}
 
     unsafe impl NSOutlineViewDelegate for OutlineDelegate {
         #[method_id(outlineView:viewForTableColumn:item:)]
