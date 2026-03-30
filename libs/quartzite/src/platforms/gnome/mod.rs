@@ -25,7 +25,10 @@ use std::cell::RefCell;
 use std::rc::Rc;
 use std::time::Instant;
 
-use gneiss_pal::{AppHandler, Event, GuiUpdate};
+use gneiss_pal::{AppHandler, Event};
+use bandy::SMessage;
+use bandy::state::AppState;
+use std::sync::{Arc, RwLock};
 
 pub struct Backend<A: AppHandler> {
     #[allow(dead_code)]
@@ -36,12 +39,13 @@ pub struct Backend<A: AppHandler> {
 
 impl<A: AppHandler> Backend<A> {
     // S40: Updated signature to accept bootstrap_fn
-    pub fn new<F>(app_id: &str, app_handler: A, rx: Receiver<GuiUpdate>, bootstrap_fn: F) -> Self
+    pub fn new<F>(app_id: &str, app_handler: A, app_state: Arc<RwLock<AppState>>, rx_synapse: Receiver<SMessage>, bootstrap_fn: F) -> Self
     where
         F: Fn(
                 &ApplicationWindow,
                 async_channel::Sender<Event>,
-                Receiver<GuiUpdate>,
+                Arc<RwLock<AppState>>,
+                Receiver<SMessage>,
             ) -> gtk4::Widget
             + 'static,
     {
@@ -71,12 +75,15 @@ impl<A: AppHandler> Backend<A> {
         });
 
         let bootstrap_rc = Rc::new(bootstrap_fn);
-        let rx_clone = rx.clone(); // Clone channel receiver (async-channel is multi-consumer)
+
 
         app.connect_activate(move |app| {
+            let app_state_clone = app_state.clone();
+            let rx_synapse_clone = rx_synapse.clone();
             build_ui(
                 app,
-                rx_clone.clone(),
+                app_state_clone,
+                rx_synapse_clone,
                 bootstrap_rc.clone(),
                 tx_event.clone(),
             );
@@ -92,11 +99,12 @@ impl<A: AppHandler> Backend<A> {
 
 fn build_ui<F>(
     app: &Application,
-    rx: Receiver<GuiUpdate>,
+    app_state: Arc<RwLock<AppState>>,
+    rx_synapse: Receiver<SMessage>,
     bootstrap: Rc<F>,
     tx_event: async_channel::Sender<Event>,
 ) where
-    F: Fn(&ApplicationWindow, async_channel::Sender<Event>, Receiver<GuiUpdate>) -> gtk4::Widget
+    F: Fn(&ApplicationWindow, async_channel::Sender<Event>, Arc<RwLock<AppState>>, Receiver<SMessage>) -> gtk4::Widget
         + 'static,
 {
     let ui_build_start_time = Instant::now();
@@ -120,7 +128,7 @@ fn build_ui<F>(
 
     let gtk_window = window.upcast_ref::<gtk4::ApplicationWindow>();
 
-    let content = bootstrap(gtk_window, tx_event, rx);
+    let content = bootstrap(gtk_window, tx_event, app_state, rx_synapse);
 
     // AdwApplicationWindow content
     window.set_content(Some(&content));
