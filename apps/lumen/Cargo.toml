@@ -14,6 +14,7 @@ default = []
 gtk = ["quartzite/gtk"]
 gnome = ["quartzite/gnome"]
 qt = ["quartzite/qt"]
+macos = ["quartzite/macos"]
 
 [dependencies]
 # The Trinity Core

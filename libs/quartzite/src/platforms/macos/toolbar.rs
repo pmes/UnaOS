@@ -20,11 +20,11 @@ use objc2_foundation::{NSArray, NSString, MainThreadOnly};
 
 // Define our standard identifier constants
 fn network_diag_id() -> Retained<NSString> {
-    unsafe { NSString::from_id(msg_send![NSString::class(), alloc], msg_send![sel!(initWithUTF8String:), b"UnaNetworkDiagnostics\0".as_ptr()]) }
+    NSString::from_str("UnaNetworkDiagnostics")
 }
 
 fn token_telemetry_id() -> Retained<NSString> {
-    unsafe { NSString::from_id(msg_send![NSString::class(), alloc], msg_send![sel!(initWithUTF8String:), b"UnaTokenTelemetry\0".as_ptr()]) }
+    NSString::from_str("UnaTokenTelemetry")
 }
 
 define_class!(
