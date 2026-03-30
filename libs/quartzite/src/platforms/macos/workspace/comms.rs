@@ -12,13 +12,14 @@
 //! - Attach/Send buttons constrained adjacent to the input buffer.
 
 use objc2::rc::Retained;
-use objc2::{define_class, msg_send, sel};
-use objc2::runtime::ProtocolObject;
+use objc2::{define_class, msg_send, sel, MainThreadOnly};
+use objc2::runtime::{ProtocolObject, NSObjectProtocol, Sel};
 use objc2_app_kit::{
     NSButton, NSControl, NSResponder, NSScrollView, NSTextView, NSTextViewDelegate,
-    NSView, NSLayoutConstraint, NSStackView, NSUserInterfaceLayoutOrientation
+    NSView, NSLayoutConstraint, NSStackView, NSUserInterfaceLayoutOrientation,
+    NSTextDelegate
 };
-use objc2_foundation::{NSArray, NSString, MainThreadOnly, NSObject};
+use objc2_foundation::{NSArray, NSString, NSObject, NSRect};
 
 // In AppKit, we need to extract the string out of the NSTextView
 // and then dispatch it.
@@ -29,6 +30,7 @@ define_class!(
     pub struct CommsTextViewDelegate;
 
     unsafe impl NSObjectProtocol for CommsTextViewDelegate {}
+    unsafe impl NSTextDelegate for CommsTextViewDelegate {}
 
     unsafe impl NSTextViewDelegate for CommsTextViewDelegate {
         #[unsafe(method(textView:doCommandBySelector:))]
@@ -75,14 +77,14 @@ pub fn create_comms_pane() -> CommsRefs {
     let mtm = MainThreadOnly::new();
 
     let container: Retained<NSView> = unsafe { msg_send![NSView::class(), alloc] };
-    let container: Retained<NSView> = unsafe { msg_send![container, initWithFrame: foundation::NSRect::ZERO] };
+    let container: Retained<NSView> = unsafe { msg_send![container, initWithFrame: NSRect::ZERO] };
     unsafe {
         let _: () = msg_send![&container, setTranslatesAutoresizingMaskIntoConstraints: false];
     }
 
     // 1. Message History (Top)
     let history_scroll: Retained<NSScrollView> = unsafe { msg_send![NSScrollView::class(), alloc] };
-    let history_scroll: Retained<NSScrollView> = unsafe { msg_send![history_scroll, initWithFrame: foundation::NSRect::ZERO] };
+    let history_scroll: Retained<NSScrollView> = unsafe { msg_send![history_scroll, initWithFrame: NSRect::ZERO] };
     unsafe {
         let _: () = msg_send![&history_scroll, setTranslatesAutoresizingMaskIntoConstraints: false];
         let _: () = msg_send![&history_scroll, setHasVerticalScroller: true];
@@ -92,14 +94,14 @@ pub fn create_comms_pane() -> CommsRefs {
 
     // 2. Input Box (Bottom Left)
     let input_scroll: Retained<NSScrollView> = unsafe { msg_send![NSScrollView::class(), alloc] };
-    let input_scroll: Retained<NSScrollView> = unsafe { msg_send![input_scroll, initWithFrame: foundation::NSRect::ZERO] };
+    let input_scroll: Retained<NSScrollView> = unsafe { msg_send![input_scroll, initWithFrame: NSRect::ZERO] };
     unsafe {
         let _: () = msg_send![&input_scroll, setTranslatesAutoresizingMaskIntoConstraints: false];
         let _: () = msg_send![&input_scroll, setHasVerticalScroller: true];
     }
 
     let text_view: Retained<NSTextView> = unsafe { msg_send![NSTextView::class(), alloc] };
-    let text_view: Retained<NSTextView> = unsafe { msg_send![text_view, initWithFrame: foundation::NSRect::ZERO] };
+    let text_view: Retained<NSTextView> = unsafe { msg_send![text_view, initWithFrame: NSRect::ZERO] };
     unsafe {
         let _: () = msg_send![&text_view, setTranslatesAutoresizingMaskIntoConstraints: false];
         let _: () = msg_send![&text_view, setAllowsUndo: true];
@@ -117,14 +119,14 @@ pub fn create_comms_pane() -> CommsRefs {
 
     // 3. Buttons (Bottom Right)
     let attach_str = NSString::from_str("Attach");
-    let attach_btn: Retained<NSButton> = unsafe { msg_send![NSButton::class(), buttonWithTitle: &*attach_str, target: None::<&objc2::runtime::AnyObject>, action: core::ptr::null_mut::<objc2::sel::Sel>()] };
+    let attach_btn: Retained<NSButton> = unsafe { msg_send![NSButton::class(), buttonWithTitle: &*attach_str, target: None::<&objc2::runtime::AnyObject>, action: core::ptr::null_mut::<Sel>()] };
     unsafe {
         let _: () = msg_send![&attach_btn, setTranslatesAutoresizingMaskIntoConstraints: false];
         let _: () = msg_send![&attach_btn, setBezelStyle: 1_isize];
     }
 
     let send_str = NSString::from_str("Send");
-    let send_btn: Retained<NSButton> = unsafe { msg_send![NSButton::class(), buttonWithTitle: &*send_str, target: None::<&objc2::runtime::AnyObject>, action: core::ptr::null_mut::<objc2::sel::Sel>()] };
+    let send_btn: Retained<NSButton> = unsafe { msg_send![NSButton::class(), buttonWithTitle: &*send_str, target: None::<&objc2::runtime::AnyObject>, action: core::ptr::null_mut::<Sel>()] };
     unsafe {
         let _: () = msg_send![&send_btn, setTranslatesAutoresizingMaskIntoConstraints: false];
         let _: () = msg_send![&send_btn, setBezelStyle: 1_isize];

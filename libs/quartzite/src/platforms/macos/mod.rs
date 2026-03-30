@@ -6,13 +6,13 @@
 //! Absolutely no intermediate abstractions or UI frameworks beyond raw Apple libraries.
 
 use objc2::rc::Retained;
-use objc2::{define_class, msg_send, sel, DefinedClass};
-use objc2::runtime::ProtocolObject;
+use objc2::{define_class, msg_send, sel, DefinedClass, MainThreadOnly};
+use objc2::runtime::{ProtocolObject, NSObjectProtocol, Sel};
 use objc2_app_kit::{
     NSApplication, NSApplicationDelegate, NSResponder, NSWindow, NSWindowStyleMask,
     NSBackingStoreType, NSWindowDelegate, NSToolbar, NSView
 };
-use objc2_foundation::{NSObject, NSNotification, MainThreadOnly, NSString};
+use objc2_foundation::{NSObject, NSNotification, NSString, NSRect, NSPoint, NSSize};
 use std::cell::RefCell;
 
 use crate::platforms::macos::toolbar::{create_toolbar, ToolbarDelegate};
@@ -56,9 +56,9 @@ define_class!(
             let window: Retained<NSWindow> = unsafe {
                 msg_send![
                     window,
-                    initWithContentRect: foundation::NSRect {
-                        origin: foundation::NSPoint { x: 0.0, y: 0.0 },
-                        size: foundation::NSSize { width: 1024.0, height: 768.0 },
+                    initWithContentRect: NSRect {
+                        origin: NSPoint { x: 0.0, y: 0.0 },
+                        size: NSSize { width: 1024.0, height: 768.0 },
                     },
                     styleMask: (NSWindowStyleMask::Titled | NSWindowStyleMask::Closable | NSWindowStyleMask::Resizable | NSWindowStyleMask::Miniaturizable).bits(),
                     backing: NSBackingStoreType::Buffered.0 as u64, // NSBackingStoreBuffered
@@ -111,7 +111,7 @@ impl Backend {
 
     /// The definitive entry point for the macOS UI.
     /// Hijacks the main thread and hands control to NSApp.
-    pub fn execute(&self) -> anyhow::Result<()> {
+    pub fn execute(&self) -> Result<(), String> {
         let mtm = MainThreadOnly::new();
 
         let app: Retained<NSApplication> = unsafe { msg_send![NSApplication::class(), sharedApplication] };

@@ -9,9 +9,9 @@ pub mod sidebar;
 pub mod comms;
 
 use objc2::rc::Retained;
-use objc2::{msg_send};
+use objc2::{msg_send, MainThreadOnly};
 use objc2_app_kit::{NSSplitView, NSView};
-use objc2_foundation::MainThreadOnly;
+use objc2_foundation::NSRect;
 
 use crate::platforms::macos::workspace::sidebar::{create_sidebar, SidebarRefs};
 use crate::platforms::macos::workspace::comms::{create_comms_pane, CommsRefs};
@@ -29,7 +29,7 @@ pub fn create_workspace() -> WorkspaceRefs {
 
     // Create the Split View
     let split_view: Retained<NSSplitView> = unsafe { msg_send![NSSplitView::class(), alloc] };
-    let split_view: Retained<NSSplitView> = unsafe { msg_send![split_view, initWithFrame: foundation::NSRect::ZERO] };
+    let split_view: Retained<NSSplitView> = unsafe { msg_send![split_view, initWithFrame: NSRect::ZERO] };
 
     unsafe {
         let _: () = msg_send![&split_view, setTranslatesAutoresizingMaskIntoConstraints: false];

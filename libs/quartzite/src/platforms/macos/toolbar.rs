@@ -9,14 +9,14 @@
 //! 4. Token Telemetry
 
 use objc2::rc::Retained;
-use objc2::{define_class, msg_send, sel};
-use objc2::runtime::ProtocolObject;
+use objc2::{define_class, msg_send, sel, MainThreadOnly};
+use objc2::runtime::{ProtocolObject, NSObjectProtocol, Sel};
 use objc2_app_kit::{
     NSButton, NSProgressIndicator, NSResponder, NSStackView, NSTextField, NSToolbar,
     NSToolbarDelegate, NSToolbarItem, NSToolbarItemIdentifier, NSToolbarFlexibleSpaceItemIdentifier,
     NSToolbarToggleSidebarItemIdentifier
 };
-use objc2_foundation::{NSArray, NSString, MainThreadOnly};
+use objc2_foundation::{NSArray, NSString, NSRect};
 
 // Define our standard identifier constants
 fn network_diag_id() -> Retained<NSString> {
@@ -99,7 +99,7 @@ define_class!(
 
                     // Network Button
                     let title = NSString::from_str("0 ms");
-                    let btn: Retained<NSButton> = msg_send![NSButton::class(), buttonWithTitle: &*title, target: None::<&objc2::runtime::AnyObject>, action: core::ptr::null_mut::<objc2::sel::Sel>()];
+                    let btn: Retained<NSButton> = msg_send![NSButton::class(), buttonWithTitle: &*title, target: None::<&objc2::runtime::AnyObject>, action: core::ptr::null_mut::<Sel>()];
 
                     let _: () = msg_send![&btn, setBezelStyle: 1_isize]; // NSBezelStyleRounded
                     let _: () = msg_send![&btn, setTranslatesAutoresizingMaskIntoConstraints: false];

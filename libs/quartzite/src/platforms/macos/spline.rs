@@ -9,7 +9,27 @@
 
 use bandy::{SMessage, synapse::Synapse};
 use dispatch2::DispatchQueue;
-use tokio::runtime::Handle;
+
+pub struct MacOSSpline;
+
+impl MacOSSpline {
+    pub fn new() -> Self {
+        Self
+    }
+
+    pub fn bootstrap(
+        &self,
+        _window: &crate::NativeWindow,
+        _tx_event: async_channel::Sender<gneiss_pal::Event>,
+        _app_state: std::sync::Arc<std::sync::RwLock<bandy::state::AppState>>,
+        _rx_synapse: tokio::sync::broadcast::Receiver<SMessage>,
+        _workspace_tetra: &bandy::state::WorkspaceState,
+    ) -> crate::NativeView {
+        // macOS UI runs outside of this generic bootstrap function due to the AppKit lifecycle.
+        // It relies on the AppDelegate initializing the workspace.
+        crate::NativeView { ptr: std::ptr::null_mut() }
+    }
+}
 
 /// Starts a dedicated thread that blocks on the Synapse broadcast receiver,
 /// translating asynchronous SMessage events into main-thread AppKit mutations.

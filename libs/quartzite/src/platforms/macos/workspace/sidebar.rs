@@ -6,13 +6,13 @@
 //! Manages the workspace file tree / history tree.
 
 use objc2::rc::Retained;
-use objc2::{define_class, msg_send, sel};
-use objc2::runtime::ProtocolObject;
+use objc2::{define_class, msg_send, sel, MainThreadOnly};
+use objc2::runtime::{ProtocolObject, NSObjectProtocol, Sel};
 use objc2_app_kit::{
     NSResponder, NSScrollView, NSView, NSOutlineView, NSOutlineViewDataSource, NSOutlineViewDelegate,
-    NSTableColumn, NSTableCellView, NSTextField, NSLayoutConstraint
+    NSTableColumn, NSTableCellView, NSTextField, NSLayoutConstraint, NSControlTextEditingDelegate
 };
-use objc2_foundation::{NSArray, NSString, MainThreadOnly, NSObject};
+use objc2_foundation::{NSArray, NSString, NSObject, NSRect};
 
 define_class!(
     #[unsafe(super(NSResponder))]
@@ -20,6 +20,7 @@ define_class!(
     pub struct SidebarDelegate;
 
     unsafe impl NSObjectProtocol for SidebarDelegate {}
+    unsafe impl NSControlTextEditingDelegate for SidebarDelegate {}
 
     unsafe impl NSOutlineViewDelegate for SidebarDelegate {
         #[unsafe(method_id(outlineView:viewForTableColumn:item:))]
@@ -35,7 +36,7 @@ define_class!(
 
             unsafe {
                 let cell: Retained<NSTableCellView> = msg_send![NSTableCellView::class(), alloc];
-                let cell: Retained<NSTableCellView> = msg_send![cell, initWithFrame: foundation::NSRect::ZERO];
+                let cell: Retained<NSTableCellView> = msg_send![cell, initWithFrame: NSRect::ZERO];
 
                 let str = NSString::from_str(&text.to_string());
                 let text_field: Retained<NSTextField> = msg_send![NSTextField::class(), labelWithString: &*str];
