@@ -15,7 +15,7 @@
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 use objc2::{
-    define_class, msg_send, msg_send_id, mutability, rc::Retained, ClassType, DefinedClass, ProtocolType
+    define_class, msg_send, msg_send_id, mutability, rc::Retained, ProtocolType
 };
 use objc2_app_kit::{
     NSOutlineView, NSOutlineViewDataSource, NSOutlineViewDelegate, NSScrollView,
@@ -114,15 +114,9 @@ fn build_outline_tab(mtm: MainThreadMarker, title: &str) -> Retained<NSViewContr
 }
 
 define_class!(
+    #[unsafe(super(NSObject))]
+    #[name = "UnaOutlineDataSource"]
     pub struct OutlineDataSource;
-
-    unsafe impl ClassType for OutlineDataSource {
-        type Super = NSObject;
-        type Mutability = mutability::MainThreadOnly;
-        const NAME: &'static str = "UnaOutlineDataSource";
-    }
-
-    impl DefinedClass for OutlineDataSource {}
 
     unsafe impl NSOutlineViewDataSource for OutlineDataSource {
         #[method(outlineView:numberOfChildrenOfItem:)]
@@ -161,21 +155,16 @@ define_class!(
 
 impl OutlineDataSource {
     pub fn new(mtm: MainThreadMarker) -> Retained<Self> {
-        let this = mtm.alloc();
-        unsafe { msg_send_id![super(this), init] }
+        let this = mtm.alloc::<Self>();
+        let this: Retained<Self> = unsafe { msg_send_id![super(this), init] };
+        this
     }
 }
 
 define_class!(
+    #[unsafe(super(NSObject))]
+    #[name = "UnaOutlineDelegate"]
     pub struct OutlineDelegate;
-
-    unsafe impl ClassType for OutlineDelegate {
-        type Super = NSObject;
-        type Mutability = mutability::MainThreadOnly;
-        const NAME: &'static str = "UnaOutlineDelegate";
-    }
-
-    impl DefinedClass for OutlineDelegate {}
 
     unsafe impl NSOutlineViewDelegate for OutlineDelegate {
         #[method_id(outlineView:viewForTableColumn:item:)]
@@ -194,7 +183,8 @@ define_class!(
 
 impl OutlineDelegate {
     pub fn new(mtm: MainThreadMarker) -> Retained<Self> {
-        let this = mtm.alloc();
-        unsafe { msg_send_id![super(this), init] }
+        let this = mtm.alloc::<Self>();
+        let this: Retained<Self> = unsafe { msg_send_id![super(this), init] };
+        this
     }
 }

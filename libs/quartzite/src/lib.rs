@@ -44,7 +44,7 @@ pub use spline::Spline;
 #[cfg(target_os = "macos")]
 pub type NativeWindow = objc2_app_kit::NSWindow;
 #[cfg(target_os = "macos")]
-pub type NativeView = objc2::rc::Retained<objc2_app_kit::NSView>;
+pub type NativeView = platforms::macos::workspace::WorkspaceRefs;
 #[cfg(target_os = "macos")]
 pub use platforms::macos::Backend;
 

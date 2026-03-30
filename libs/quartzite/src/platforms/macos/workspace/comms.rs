@@ -15,7 +15,7 @@
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 use objc2::{
-    define_class, msg_send, msg_send_id, mutability, rc::Retained, ClassType, DefinedClass, ProtocolType
+    define_class, msg_send, msg_send_id, mutability, rc::Retained, ProtocolType
 };
 use objc2_app_kit::{
     NSScrollView, NSTextView, NSTextViewDelegate, NSView, NSVisualEffectView,
@@ -118,19 +118,13 @@ pub fn build_right_pane(mtm: MainThreadMarker) -> Retained<NSView> {
 // -----------------------------------------------------------------------------
 
 define_class!(
+    #[unsafe(super(NSObject))]
+    #[name = "UnaInputDelegate"]
     pub struct InputDelegate;
-
-    unsafe impl ClassType for InputDelegate {
-        type Super = NSObject;
-        type Mutability = mutability::MainThreadOnly;
-        const NAME: &'static str = "UnaInputDelegate";
-    }
-
-    impl DefinedClass for InputDelegate {}
 
     unsafe impl NSTextViewDelegate for InputDelegate {
         #[method(textView:doCommandBySelector:)]
-        fn text_view_do_command_by_selector(&self, _text_view: &NSTextView, command_selector: *const c_void) -> bool {
+        fn text_view_do_command_by_selector(&self, _text_view: &NSTextView, command_selector: objc2::sel::Sel) -> bool {
             // Translates the GTK shift+enter logic.
             // In AppKit, we intercept `insertNewline:` to send the payload,
             // and `insertNewlineIgnoringFieldEditor:` (Shift+Enter) to insert a literal newline.
@@ -142,7 +136,8 @@ define_class!(
 
 impl InputDelegate {
     pub fn new(mtm: MainThreadMarker) -> Retained<Self> {
-        let this = mtm.alloc();
-        unsafe { msg_send_id![super(this), init] }
+        let this = mtm.alloc::<Self>();
+        let this: Retained<Self> = unsafe { msg_send_id![super(this), init] };
+        this
     }
 }

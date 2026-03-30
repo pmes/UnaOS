@@ -15,7 +15,7 @@
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 use objc2::{
-    define_class, msg_send, msg_send_id, mutability, rc::Retained, ClassType, DefinedClass, ProtocolType
+    define_class, msg_send, msg_send_id, mutability, rc::Retained, ProtocolType
 };
 use objc2_app_kit::{
     NSButton, NSControl, NSFont, NSImage, NSImageNameNetwork, NSProgressIndicator,
@@ -34,15 +34,9 @@ pub const DIAGNOSTICS_ITEM_ID: &str = "UnaOSDiagnosticsItem";
 // -----------------------------------------------------------------------------
 
 define_class!(
+    #[unsafe(super(NSObject))]
+    #[name = "UnaToolbarDelegate"]
     pub struct ToolbarDelegate;
-
-    unsafe impl ClassType for ToolbarDelegate {
-        type Super = NSObject;
-        type Mutability = mutability::MainThreadOnly;
-        const NAME: &'static str = "UnaToolbarDelegate";
-    }
-
-    impl DefinedClass for ToolbarDelegate {}
 
     unsafe impl NSToolbarDelegate for ToolbarDelegate {
         #[method_id(toolbar:itemForItemIdentifier:willBeInsertedIntoToolbar:)]
@@ -141,7 +135,7 @@ define_class!(
 
 impl ToolbarDelegate {
     pub fn new(mtm: MainThreadMarker) -> Retained<Self> {
-        let this = mtm.alloc();
+        let this = mtm.alloc::<Self>();
         let this: Retained<Self> = unsafe { msg_send_id![super(this), init] };
         this
     }

@@ -20,7 +20,7 @@ pub mod workspace;
 
 use crate::{NativeView, NativeWindow};
 use block2::RcBlock;
-use objc2::{define_class, msg_send, msg_send_id, mutability, rc::Retained, ClassType, DefinedClass};
+use objc2::{define_class, msg_send, msg_send_id, mutability, rc::Retained};
 use objc2_app_kit::{NSApplication, NSApplicationActivationPolicy, NSApplicationDelegate, NSWindow, NSWindowStyleMask};
 use objc2_foundation::{MainThreadMarker, NSObject, NSPoint, NSRect, NSSize, NSString};
 use std::cell::RefCell;
@@ -64,22 +64,15 @@ impl Backend {
 // NATIVE DELEGATE DEFINITION
 // -----------------------------------------------------------------------------
 
-pub struct AppDelegateIvars {
-    // Stores the closure until applicationDidFinishLaunching: is called
-    bootstrap: RefCell<Option<BootstrapFn>>,
-}
-
 define_class!(
-    pub struct AppDelegate;
-
-    unsafe impl ClassType for AppDelegate {
-        type Super = NSObject;
-        type Mutability = mutability::MainThreadOnly;
-        const NAME: &'static str = "UnaAppDelegate";
-    }
-
-    impl DefinedClass for AppDelegate {
-        type Ivars = AppDelegateIvars;
+    #[unsafe(super(NSObject))]
+    #[name = "UnaAppDelegate"]
+    pub struct AppDelegate {
+        // Stores the closure until applicationDidFinishLaunching: is called
+        bootstrap: RefCell<Option<BootstrapFn>>,
+        // Stores the retained references to the UI hierarchy so they live
+        // for the lifetime of the application without leaking.
+        workspace_refs: RefCell<Option<crate::NativeView>>,
     }
 
     unsafe impl NSApplicationDelegate for AppDelegate {
@@ -106,14 +99,17 @@ define_class!(
             window.setTitle(&NSString::from_str("UnaOS - Lumen Workspace"));
 
             // Safely consume the bootstrap function
-            let bootstrap_fn = self.ivars().bootstrap.borrow_mut().take()
+            let bootstrap_fn = self.bootstrap.borrow_mut().take()
                 .expect("Bootstrap function was already consumed or not set");
 
             // Execute the bootstrap function, passing the window reference
-            let root_view = bootstrap_fn(&window);
+            let workspace_refs = bootstrap_fn(&window);
 
             // Set the view returned by the cross-platform bootstrap as the window's content
-            window.setContentView(Some(&root_view));
+            window.setContentView(Some(&workspace_refs.view));
+
+            // Store the references to keep them alive
+            *self.workspace_refs.borrow_mut() = Some(workspace_refs);
 
             // Bring the window to the front
             window.makeKeyAndOrderFront(None);
@@ -131,13 +127,15 @@ define_class!(
 
 impl AppDelegate {
     pub fn new(mtm: MainThreadMarker) -> Retained<Self> {
-        let this = mtm.alloc().set_ivars(AppDelegateIvars {
+        let this = mtm.alloc::<Self>();
+        let this = this.set_ivars(AppDelegate_ivars {
             bootstrap: RefCell::new(None),
+            workspace_refs: RefCell::new(None),
         });
         unsafe { msg_send_id![super(this), init] }
     }
 
     pub fn set_bootstrap(&self, f: BootstrapFn) {
-        *self.ivars().bootstrap.borrow_mut() = Some(f);
+        *self.bootstrap.borrow_mut() = Some(f);
     }
 }

@@ -55,9 +55,9 @@ where
         dispatch_async(queue, block_ptr);
     }
 
-    // We must `forget` the RcBlock here so Rust doesn't drop it. GCD will internally
-    // copy the block to the heap if necessary and release it when done executing.
-    std::mem::forget(block);
+    // `dispatch_async` inherently copies and retains the block for execution.
+    // The Rust side must drop its local `RcBlock` reference normally to maintain
+    // the correct retain count. Calling `std::mem::forget` here causes an unbounded leak.
 }
 
 /// The macOS native implementation of the Spline router.
