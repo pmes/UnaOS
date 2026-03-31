@@ -7,7 +7,7 @@
 // (at your option) any later version.
 
 use objc2::rc::{Allocated, Retained};
-use objc2::runtime::{AnyObject, ProtocolObject};
+use objc2::runtime::AnyObject;
 use objc2::{define_class, msg_send, ClassType, DeclaredClass};
 use objc2_app_kit::{
     NSResponder, NSOutlineView, NSOutlineViewDelegate, NSOutlineViewDataSource,

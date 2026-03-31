@@ -12,7 +12,7 @@ use std::sync::{Arc, RwLock, Mutex};
 use tokio::sync::broadcast::Receiver as BroadcastReceiver;
 use bandy::state::AppState;
 use bandy::SMessage;
-use objc2_app_kit::{NSView, NSWindow, NSColor};
+use objc2_app_kit::NSView;
 use objc2_foundation::{NSRect, NSSize};
 use objc2::{msg_send, ClassType};
 use objc2::rc::Retained;
@@ -40,14 +40,14 @@ impl MacOSSpline {
 
     pub fn bootstrap(
         &self,
-        window: &NativeWindow,
+        _window: &NativeWindow,
         tx_event: async_channel::Sender<Event>,
-        app_state: Arc<RwLock<AppState>>,
+        _app_state: Arc<RwLock<AppState>>,
         mut rx_synapse: BroadcastReceiver<SMessage>,
-        workspace_tetra: &bandy::state::WorkspaceState,
+        _workspace_tetra: &bandy::state::WorkspaceState,
     ) -> NativeView {
         // 1. Build the UI
-        let mtm = objc2_foundation::MainThreadMarker::new().unwrap();
+        let _mtm = objc2_foundation::MainThreadMarker::new().unwrap();
 
         let root_frame = NSRect::new(
             objc2_foundation::NSPoint::new(0.0, 0.0),
@@ -77,7 +77,7 @@ impl MacOSSpline {
                 match rx_synapse.recv().await {
                     Ok(msg) => {
                         // Dispatch to Main Thread to update AppKit UI
-                        dispatch2::Queue::main().exec_async(move || {
+                        dispatch2::DispatchQueue::main().exec_async(move || {
                             // Route the SMessage to native AppKit updates
                             // e.g., insertRowsAtIndexes:, NSTextView::setString:
                             match msg {

@@ -10,13 +10,10 @@ use objc2::rc::{Allocated, Retained};
 use objc2::runtime::{AnyObject, ProtocolObject};
 use objc2::{define_class, msg_send, ClassType, DeclaredClass, MainThreadOnly};
 use objc2_app_kit::{
-    NSResponder, NSWindow, NSWindowDelegate, NSToolbar, NSToolbarDelegate, NSView,
-    NSWindowStyleMask, NSBackingStoreType, NSToolbarItemIdentifier, NSToolbarItem,
-    NSTitlebarAccessoryViewController
+    NSResponder, NSWindow, NSWindowDelegate, NSToolbar, NSToolbarDelegate,
+    NSWindowStyleMask, NSBackingStoreType, NSToolbarItemIdentifier, NSToolbarItem
 };
 use objc2_foundation::{MainThreadMarker, NSObjectProtocol, NSRect, NSSize, NSString, NSArray};
-
-use crate::platforms::macos::workspace;
 
 // -----------------------------------------------------------------------------
 // WINDOW DELEGATE
@@ -98,13 +95,15 @@ pub fn create_window(mtm: MainThreadMarker) -> (Retained<NSWindow>, Retained<Win
         | NSWindowStyleMask::Miniaturizable
         | NSWindowStyleMask::FullSizeContentView;
 
-    let window = NSWindow::initWithContentRect_styleMask_backing_defer(
-        NSWindow::alloc(mtm),
-        frame,
-        style,
-        NSBackingStoreType::Buffered,
-        false,
-    );
+    let window = unsafe {
+        NSWindow::initWithContentRect_styleMask_backing_defer(
+            NSWindow::alloc(mtm),
+            frame,
+            style,
+            NSBackingStoreType::Buffered,
+            false,
+        )
+    };
 
     window.setTitle(&NSString::from_str("UnaOS: Lumen"));
     window.setTitlebarAppearsTransparent(true);
