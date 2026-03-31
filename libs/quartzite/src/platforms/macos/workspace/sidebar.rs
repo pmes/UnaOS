@@ -72,6 +72,14 @@ define_class!(
     }
 
     unsafe impl NSOutlineViewDelegate for SidebarDelegate {
+        #[unsafe(method(reloadSidebarNotification:))]
+        fn reloadSidebarNotification(&self, _notification: &objc2_foundation::NSNotification) {
+            // Trigger NSOutlineView to reload data when SMessage mutated core
+            if let Some(outline) = self.ivars().outline_view.borrow().as_ref() {
+                outline.reloadData();
+            }
+        }
+
         #[unsafe(method(outlineView:viewForTableColumn:item:))]
         fn outlineView_viewForTableColumn_item(
             &self,
@@ -121,7 +129,7 @@ impl SidebarDelegate {
 // UI BUILDER
 // -----------------------------------------------------------------------------
 
-pub fn build(_mtm: MainThreadOnly) -> Retained<NSView> {
+pub fn build(_mtm: MainThreadOnly) -> (Retained<NSView>, Retained<SidebarDelegate>) {
     unsafe {
         // Container
         let container: Retained<NSView> = msg_send![NSView::class(), alloc];
@@ -160,6 +168,12 @@ pub fn build(_mtm: MainThreadOnly) -> Retained<NSView> {
         // preventing deallocation at end of scope
         *delegate.ivars().outline_view.borrow_mut() = Some(outline_view.clone());
 
+        // Wire NSNotificationCenter
+        let center = objc2_foundation::NSNotificationCenter::defaultCenter();
+        let name = NSString::from_str("org.unaos.lumen.ReloadSidebar");
+        let sel = objc2::sel!(reloadSidebarNotification:);
+        center.addObserver_selector_name_object(&*delegate, sel, Some(&name), None::<&AnyObject>);
+
         scroll_view.setDocumentView(Some(&outline_view));
         container.addSubview(&scroll_view);
 
@@ -168,7 +182,7 @@ pub fn build(_mtm: MainThreadOnly) -> Retained<NSView> {
             &scroll_view,
             NSLayoutAttribute::Leading,
             NSLayoutRelation::Equal,
-            Some(&container),
+            Some(objc2::rc::Retained::as_super(&container)),
             NSLayoutAttribute::Leading,
             1.0,
             0.0,
@@ -177,7 +191,7 @@ pub fn build(_mtm: MainThreadOnly) -> Retained<NSView> {
             &scroll_view,
             NSLayoutAttribute::Trailing,
             NSLayoutRelation::Equal,
-            Some(&container),
+            Some(objc2::rc::Retained::as_super(&container)),
             NSLayoutAttribute::Trailing,
             1.0,
             0.0,
@@ -186,7 +200,7 @@ pub fn build(_mtm: MainThreadOnly) -> Retained<NSView> {
             &scroll_view,
             NSLayoutAttribute::Top,
             NSLayoutRelation::Equal,
-            Some(&container),
+            Some(objc2::rc::Retained::as_super(&container)),
             NSLayoutAttribute::Top,
             1.0,
             0.0,
@@ -195,7 +209,7 @@ pub fn build(_mtm: MainThreadOnly) -> Retained<NSView> {
             &scroll_view,
             NSLayoutAttribute::Bottom,
             NSLayoutRelation::Equal,
-            Some(&container),
+            Some(objc2::rc::Retained::as_super(&container)),
             NSLayoutAttribute::Bottom,
             1.0,
             0.0,
@@ -204,6 +218,6 @@ pub fn build(_mtm: MainThreadOnly) -> Retained<NSView> {
         let constraints = NSArray::from_slice(&[&*c1, &*c2, &*c3, &*c4]);
         NSLayoutConstraint::activateConstraints(&constraints);
 
-        container
+        (container, delegate)
     }
 }

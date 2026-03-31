@@ -11,9 +11,8 @@ pub mod toolbar;
 pub mod workspace;
 
 use crate::{NativeView, NativeWindow};
-use block2::RcBlock;
 use objc2::rc::Retained;
-use objc2::runtime::ProtocolObject;
+use objc2::runtime::{AnyObject, ProtocolObject};
 use objc2::{define_class, msg_send, ClassType, DefinedClass, MainThreadOnly};
 use objc2_app_kit::{NSApplication, NSApplicationActivationPolicyRegular, NSApplicationDelegate, NSResponder, NSWindow, NSWindowStyleMask};
 use objc2_foundation::{NSObjectProtocol, NSPoint, NSRect, NSSize, NSString};
@@ -26,6 +25,7 @@ type BootstrapFn = Box<dyn FnOnce(&NativeWindow) -> NativeView + 'static>;
 // We use a thread_local because UI initialization strictly happens on the main thread.
 thread_local! {
     static BOOTSTRAP_CLOSURE: RefCell<Option<BootstrapFn>> = RefCell::new(None);
+    pub static DELEGATES: RefCell<Option<(Retained<workspace::sidebar::SidebarDelegate>, Retained<workspace::comms::CommsTextViewDelegate>)>> = RefCell::new(None);
 }
 
 pub struct Backend;
@@ -67,6 +67,8 @@ impl Backend {
 pub struct AppDelegateIvars {
     pub window: RefCell<Option<Retained<NSWindow>>>,
     pub content_view: RefCell<Option<Retained<objc2_app_kit::NSView>>>,
+    pub sidebar_delegate: RefCell<Option<Retained<workspace::sidebar::SidebarDelegate>>>,
+    pub comms_delegate: RefCell<Option<Retained<workspace::comms::CommsTextViewDelegate>>>,
 }
 
 define_class!(
@@ -126,6 +128,14 @@ define_class!(
                 // Store retained pointers in ivars to prevent deallocation
                 *self.ivars().window.borrow_mut() = Some(window);
                 *self.ivars().content_view.borrow_mut() = Some(content_view);
+
+                // Transfer retained delegates from the spline thread_local to our application delegate
+                DELEGATES.with(|d| {
+                    if let Some((sidebar, comms)) = d.borrow_mut().take() {
+                        *self.ivars().sidebar_delegate.borrow_mut() = Some(sidebar);
+                        *self.ivars().comms_delegate.borrow_mut() = Some(comms);
+                    }
+                });
             }
         }
 
@@ -138,10 +148,12 @@ define_class!(
 
 impl AppDelegate {
     pub fn new() -> Retained<Self> {
-        let mtm = MainThreadOnly::new().unwrap();
+        let _mtm = MainThreadOnly::new().unwrap();
         let this = Self::alloc().set_ivars(AppDelegateIvars {
             window: RefCell::new(None),
             content_view: RefCell::new(None),
+            sidebar_delegate: RefCell::new(None),
+            comms_delegate: RefCell::new(None),
         });
         unsafe { msg_send![super(this), init] }
     }

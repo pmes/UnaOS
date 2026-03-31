@@ -40,6 +40,15 @@ define_class!(
     unsafe impl NSTextDelegate for CommsTextViewDelegate {}
 
     unsafe impl NSTextViewDelegate for CommsTextViewDelegate {
+        #[unsafe(method(scrollCommsToBottomNotification:))]
+        fn scrollCommsToBottomNotification(&self, _notification: &objc2_foundation::NSNotification) {
+            // Trigger NSScrollView to jump to the bottom when new message arrives
+            if let Some(view) = self.ivars().text_view.borrow().as_ref() {
+                let range = objc2_foundation::NSRange::new(view.string().len(), 0);
+                view.scrollRangeToVisible(range);
+            }
+        }
+
         #[unsafe(method(textView:doCommandBySelector:))]
         fn textView_doCommandBySelector(
             &self,
@@ -72,7 +81,7 @@ impl CommsTextViewDelegate {
 // UI BUILDER
 // -----------------------------------------------------------------------------
 
-pub fn build(_mtm: MainThreadOnly) -> Retained<NSView> {
+pub fn build(_mtm: MainThreadOnly) -> (Retained<NSView>, Retained<CommsTextViewDelegate>) {
     unsafe {
         // Root Container
         let container: Retained<NSView> = msg_send![NSView::class(), alloc];
@@ -121,6 +130,11 @@ pub fn build(_mtm: MainThreadOnly) -> Retained<NSView> {
         text_view.setDelegate(Some(delegate_obj));
         *delegate.ivars().text_view.borrow_mut() = Some(text_view.clone());
 
+        let center = objc2_foundation::NSNotificationCenter::defaultCenter();
+        let name = NSString::from_str("org.unaos.lumen.ScrollCommsToBottom");
+        let sel = objc2::sel!(scrollCommsToBottomNotification:);
+        center.addObserver_selector_name_object(&*delegate, sel, Some(&name), None::<&AnyObject>);
+
         input_scroll.setDocumentView(Some(&text_view));
 
         // 3. Send Button
@@ -145,7 +159,7 @@ pub fn build(_mtm: MainThreadOnly) -> Retained<NSView> {
             &history_scroll,
             NSLayoutAttribute::Leading,
             NSLayoutRelation::Equal,
-            Some(&container),
+            Some(objc2::rc::Retained::as_super(&container)),
             NSLayoutAttribute::Leading,
             1.0,
             0.0,
@@ -154,7 +168,7 @@ pub fn build(_mtm: MainThreadOnly) -> Retained<NSView> {
             &history_scroll,
             NSLayoutAttribute::Trailing,
             NSLayoutRelation::Equal,
-            Some(&container),
+            Some(objc2::rc::Retained::as_super(&container)),
             NSLayoutAttribute::Trailing,
             1.0,
             0.0,
@@ -163,7 +177,7 @@ pub fn build(_mtm: MainThreadOnly) -> Retained<NSView> {
             &history_scroll,
             NSLayoutAttribute::Top,
             NSLayoutRelation::Equal,
-            Some(&container),
+            Some(objc2::rc::Retained::as_super(&container)),
             NSLayoutAttribute::Top,
             1.0,
             0.0,
@@ -172,7 +186,7 @@ pub fn build(_mtm: MainThreadOnly) -> Retained<NSView> {
             &history_scroll,
             NSLayoutAttribute::Bottom,
             NSLayoutRelation::Equal,
-            Some(&input_scroll),
+            Some(objc2::rc::Retained::as_super(&input_scroll)),
             NSLayoutAttribute::Top,
             1.0,
             -12.0, // Space between history and input
@@ -183,7 +197,7 @@ pub fn build(_mtm: MainThreadOnly) -> Retained<NSView> {
             &attach_btn,
             NSLayoutAttribute::Leading,
             NSLayoutRelation::Equal,
-            Some(&container),
+            Some(objc2::rc::Retained::as_super(&container)),
             NSLayoutAttribute::Leading,
             1.0,
             12.0,
@@ -192,7 +206,7 @@ pub fn build(_mtm: MainThreadOnly) -> Retained<NSView> {
             &attach_btn,
             NSLayoutAttribute::Bottom,
             NSLayoutRelation::Equal,
-            Some(&container),
+            Some(objc2::rc::Retained::as_super(&container)),
             NSLayoutAttribute::Bottom,
             1.0,
             -12.0,
@@ -221,7 +235,7 @@ pub fn build(_mtm: MainThreadOnly) -> Retained<NSView> {
             &input_scroll,
             NSLayoutAttribute::Leading,
             NSLayoutRelation::Equal,
-            Some(&attach_btn),
+            Some(objc2::rc::Retained::as_super(&attach_btn)),
             NSLayoutAttribute::Trailing,
             1.0,
             8.0,
@@ -230,7 +244,7 @@ pub fn build(_mtm: MainThreadOnly) -> Retained<NSView> {
             &input_scroll,
             NSLayoutAttribute::Trailing,
             NSLayoutRelation::Equal,
-            Some(&send_btn),
+            Some(objc2::rc::Retained::as_super(&send_btn)),
             NSLayoutAttribute::Leading,
             1.0,
             -8.0,
@@ -239,7 +253,7 @@ pub fn build(_mtm: MainThreadOnly) -> Retained<NSView> {
             &input_scroll,
             NSLayoutAttribute::Bottom,
             NSLayoutRelation::Equal,
-            Some(&container),
+            Some(objc2::rc::Retained::as_super(&container)),
             NSLayoutAttribute::Bottom,
             1.0,
             -12.0,
@@ -268,7 +282,7 @@ pub fn build(_mtm: MainThreadOnly) -> Retained<NSView> {
             &text_view,
             NSLayoutAttribute::Width,
             NSLayoutRelation::Equal,
-            Some(&input_scroll),
+            Some(objc2::rc::Retained::as_super(&input_scroll)),
             NSLayoutAttribute::Width,
             1.0,
             0.0,
@@ -279,7 +293,7 @@ pub fn build(_mtm: MainThreadOnly) -> Retained<NSView> {
             &send_btn,
             NSLayoutAttribute::Trailing,
             NSLayoutRelation::Equal,
-            Some(&container),
+            Some(objc2::rc::Retained::as_super(&container)),
             NSLayoutAttribute::Trailing,
             1.0,
             -12.0,
@@ -288,7 +302,7 @@ pub fn build(_mtm: MainThreadOnly) -> Retained<NSView> {
             &send_btn,
             NSLayoutAttribute::Bottom,
             NSLayoutRelation::Equal,
-            Some(&container),
+            Some(objc2::rc::Retained::as_super(&container)),
             NSLayoutAttribute::Bottom,
             1.0,
             -12.0,
@@ -318,6 +332,6 @@ pub fn build(_mtm: MainThreadOnly) -> Retained<NSView> {
         ]);
         NSLayoutConstraint::activateConstraints(&constraints);
 
-        container
+        (container, delegate)
     }
 }

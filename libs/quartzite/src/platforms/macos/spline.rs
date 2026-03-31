@@ -12,7 +12,6 @@ use dispatch2::DispatchQueue;
 use objc2_app_kit::{NSView, NSWindow};
 use std::sync::{Arc, RwLock};
 use tokio::sync::broadcast::Receiver as BroadcastReceiver;
-use tokio::task;
 
 // The UI routing spine
 pub struct MacOSSpline;
@@ -32,33 +31,40 @@ impl MacOSSpline {
     ) -> NativeView {
 
         // Let's create our workspace UI here since this needs to be passed back to the app delegate
-        let workspace_view = crate::platforms::macos::workspace::build(
+        let (workspace_view, sidebar_delegate, comms_delegate) = crate::platforms::macos::workspace::build(
             tx_event.clone(),
             app_state.clone(),
             workspace_tetra
         );
 
-        // Spawn a background Tokio thread to listen for core SMessage events and dispatch to main thread
-        task::spawn(async move {
-            while let Ok(msg) = rx_synapse.recv().await {
+        // Store references in AppState or locally bound to the window for future routing.
+        // For strict AppKit, we pass these strongly retained objects up to the AppDelegate through thread locals
+        // to prevent deallocation.
+        crate::platforms::macos::DELEGATES.with(|d| {
+            let mut del_store = d.borrow_mut();
+            *del_store = Some((sidebar_delegate.clone(), comms_delegate.clone()));
+        });
+
+        let view_ptr = workspace_view.clone();
+
+        // Spawn a background OS thread to listen for core SMessage events and dispatch to main thread.
+        // We cannot use Tokio here as the AppKit `run` loop has no async context.
+        std::thread::spawn(move || {
+            while let Ok(msg) = rx_synapse.blocking_recv() {
+                let v = view_ptr.clone();
                 // To mutate AppKit, we must escape the Tokio thread into Grand Central Dispatch main
                 DispatchQueue::main().exec_async(move || {
                     match msg {
                         SMessage::StateInvalidated => {
-                            // Core state has mutated. Update entire UI context here.
-                            crate::platforms::macos::workspace::handle_state_invalidated(&workspace_view);
+                            crate::platforms::macos::workspace::handle_state_invalidated(&v);
                         }
                         SMessage::Matrix(MatrixEvent::TopologyMutated(_nodes)) => {
-                            // Update sidebar NSOutlineView here
-                            crate::platforms::macos::workspace::handle_topology_mutated(&workspace_view);
+                            crate::platforms::macos::workspace::handle_topology_mutated(&v);
                         }
                         SMessage::Workspace(WorkspaceEvent::StreamRenderComplete) => {
-                            // Scroll terminal view to bottom
-                            crate::platforms::macos::workspace::handle_stream_render(&workspace_view);
+                            crate::platforms::macos::workspace::handle_stream_render(&v);
                         }
-                        _ => {
-                            // Ignore other signals
-                        }
+                        _ => {}
                     }
                 });
             }
@@ -66,8 +72,8 @@ impl MacOSSpline {
 
         // Notify Core that UI is rendered and ready to receive matrix nodes
         let tx = tx_event.clone();
-        task::spawn(async move {
-            let _ = tx.send(Event::UiReady).await;
+        std::thread::spawn(move || {
+            let _ = tx.send_blocking(Event::UiReady);
         });
 
         workspace_view

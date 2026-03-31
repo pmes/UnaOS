@@ -25,7 +25,7 @@ pub fn build(
     _tx_event: async_channel::Sender<Event>,
     _app_state: Arc<RwLock<AppState>>,
     _workspace_tetra: &WorkspaceState,
-) -> NativeView {
+) -> (NativeView, Retained<sidebar::SidebarDelegate>, Retained<comms::CommsTextViewDelegate>) {
     let mtm = MainThreadOnly::new().unwrap();
 
     unsafe {
@@ -42,10 +42,10 @@ pub fn build(
         split_view.setTranslatesAutoresizingMaskIntoConstraints(false);
 
         // Build Left Pane (Sidebar)
-        let sidebar_view = sidebar::build(mtm);
+        let (sidebar_view, sidebar_delegate) = sidebar::build(mtm);
 
         // Build Right Pane (Comms / Reactor)
-        let comms_view = comms::build(mtm);
+        let (comms_view, comms_delegate) = comms::build(mtm);
 
         split_view.addArrangedSubview(&sidebar_view);
         split_view.addArrangedSubview(&comms_view);
@@ -57,7 +57,7 @@ pub fn build(
             &split_view,
             NSLayoutAttribute::Leading,
             NSLayoutRelation::Equal,
-            Some(&root_view),
+            Some(objc2::rc::Retained::as_super(&root_view)),
             NSLayoutAttribute::Leading,
             1.0,
             0.0,
@@ -66,7 +66,7 @@ pub fn build(
             &split_view,
             NSLayoutAttribute::Trailing,
             NSLayoutRelation::Equal,
-            Some(&root_view),
+            Some(objc2::rc::Retained::as_super(&root_view)),
             NSLayoutAttribute::Trailing,
             1.0,
             0.0,
@@ -75,7 +75,7 @@ pub fn build(
             &split_view,
             NSLayoutAttribute::Top,
             NSLayoutRelation::Equal,
-            Some(&root_view),
+            Some(objc2::rc::Retained::as_super(&root_view)),
             NSLayoutAttribute::Top,
             1.0,
             0.0,
@@ -84,7 +84,7 @@ pub fn build(
             &split_view,
             NSLayoutAttribute::Bottom,
             NSLayoutRelation::Equal,
-            Some(&root_view),
+            Some(objc2::rc::Retained::as_super(&root_view)),
             NSLayoutAttribute::Bottom,
             1.0,
             0.0,
@@ -102,7 +102,7 @@ pub fn build(
         let constraints = NSArray::from_slice(&[&*c1, &*c2, &*c3, &*c4, &*c5]);
         NSLayoutConstraint::activateConstraints(&constraints);
 
-        root_view
+        (root_view, sidebar_delegate, comms_delegate)
     }
 }
 
@@ -111,13 +111,30 @@ pub fn build(
 // -----------------------------------------------------------------------------
 
 pub fn handle_state_invalidated(_view: &NativeView) {
-    // Traverse the UI tree and update views.
+    // For now, state invalidation on macos requires a heavy reload.
+    // In Phase 3, this will be optimized to only reload changed nodes.
+    unsafe {
+        let center = objc2_foundation::NSNotificationCenter::defaultCenter();
+        let name = objc2_foundation::NSString::from_str("org.unaos.lumen.ReloadSidebar");
+        center.postNotificationName_object(&name, None::<&AnyObject>);
+    }
 }
 
 pub fn handle_topology_mutated(_view: &NativeView) {
-    // Notify the NSOutlineView data source that the matrix tree changed
+    // We notify the sidebar to refresh its NSOutlineView via NSNotificationCenter
+    // to strictly preserve thread boundaries and avoid passing raw pointers across dispatch queues.
+    unsafe {
+        let center = objc2_foundation::NSNotificationCenter::defaultCenter();
+        let name = objc2_foundation::NSString::from_str("org.unaos.lumen.ReloadSidebar");
+        center.postNotificationName_object(&name, None::<&AnyObject>);
+    }
 }
 
 pub fn handle_stream_render(_view: &NativeView) {
-    // Trigger scroll-to-bottom on the comms log NSScrollView
+    // Notify the comms pane to scroll to the bottom.
+    unsafe {
+        let center = objc2_foundation::NSNotificationCenter::defaultCenter();
+        let name = objc2_foundation::NSString::from_str("org.unaos.lumen.ScrollCommsToBottom");
+        center.postNotificationName_object(&name, None::<&AnyObject>);
+    }
 }
