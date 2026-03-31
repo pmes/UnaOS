@@ -15,7 +15,7 @@ use bandy::SMessage;
 use objc2_app_kit::{
     NSSplitViewController, NSSplitViewItem, NSViewController
 };
-use objc2_foundation::{NSRect, NSSize, MainThreadMarker};
+use objc2_foundation::MainThreadMarker;
 use objc2::{msg_send, ClassType};
 use objc2::rc::{Retained, Allocated};
 
@@ -32,20 +32,14 @@ pub struct MacOSSpline {
 }
 
 struct MacOSSplineInner {
-    // Store references to UI components we need to mutate.
-    split_view_controller: Option<Retained<NSSplitViewController>>,
-    sidebar_delegate: Option<Retained<sidebar::SidebarDelegate>>,
-    comms_delegate: Option<Retained<comms::CommsDelegate>>,
+    // Placeholder for thread-safe (Send/Sync) state. AppKit UI components MUST NOT
+    // be stored here because they cross the tokio async thread boundary.
 }
 
 impl MacOSSpline {
     pub fn new() -> Self {
         Self {
-            inner: Arc::new(Mutex::new(MacOSSplineInner {
-                split_view_controller: None,
-                sidebar_delegate: None,
-                comms_delegate: None,
-            })),
+            inner: Arc::new(Mutex::new(MacOSSplineInner {})),
         }
     }
 
@@ -97,15 +91,30 @@ impl MacOSSpline {
         svc.addSplitViewItem(&sidebar_item);
         svc.addSplitViewItem(&comms_item);
 
+        // Prevent AppKit components from deallocation by attaching them to the root Window/run loop.
+        unsafe {
+            // Anchor split_view_controller
+            _window.setContentViewController(Some(&svc));
+
+            // To ensure the delegates outlive the current scope, associate them dynamically with the window
+            // since MacOSSplineInner traverses thread boundaries and cannot hold MainThreadOnly components.
+            // Using associated objects for the stubs is standard practice to anchor memory without globals.
+            objc2::runtime::AnyObject::set_associated_object(
+                _window,
+                sidebar_delegate.as_ptr() as *const _,
+                &sidebar_delegate,
+                objc2::runtime::AssociationPolicy::Retain
+            );
+            objc2::runtime::AnyObject::set_associated_object(
+                _window,
+                comms_delegate.as_ptr() as *const _,
+                &comms_delegate,
+                objc2::runtime::AssociationPolicy::Retain
+            );
+        }
+
         // Extract the assembled root view
         let root_view = svc.view();
-
-        // Hold references to prevent deallocation
-        if let Ok(mut lock) = self.inner.lock() {
-            lock.split_view_controller = Some(svc.clone());
-            lock.sidebar_delegate = Some(sidebar_delegate);
-            lock.comms_delegate = Some(comms_delegate);
-        }
 
         // 2. Spawn the Main Thread Router
         // Using `dispatch2` for macOS GCD to cross the Tokio async/sync boundary natively

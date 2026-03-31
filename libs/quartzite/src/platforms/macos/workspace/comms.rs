@@ -67,7 +67,9 @@ pub fn create_comms(_mtm: MainThreadMarker) -> (Retained<NSView>, Retained<Comms
     let split_view: Allocated<NSSplitView> = unsafe { msg_send![NSSplitView::class(), alloc] };
     let split_view: Retained<NSSplitView> = unsafe { msg_send![split_view, initWithFrame: frame] };
     split_view.setVertical(false); // Horizontal divider, stacking vertically
-    split_view.setDelegate(Some(ProtocolObject::from_ref(&*delegate)));
+    unsafe {
+        split_view.setDelegate(Some(ProtocolObject::from_ref(&*delegate)));
+    }
 
     // Turn off automatic constraints on the root container
     unsafe {
@@ -101,8 +103,8 @@ pub fn create_comms(_mtm: MainThreadMarker) -> (Retained<NSView>, Retained<Comms
     let text_view: Retained<NSTextView> = unsafe { msg_send![text_view, initWithFrame: frame] };
     unsafe {
         let _: () = msg_send![&text_view, setTranslatesAutoresizingMaskIntoConstraints: objc2::runtime::Bool::NO];
+        text_view.setDelegate(Some(ProtocolObject::from_ref(&*delegate)));
     }
-    text_view.setDelegate(Some(ProtocolObject::from_ref(&*delegate)));
 
     // Let the text view size to its content width, and grow vertically
     text_view.setVerticallyResizable(true);
@@ -112,19 +114,18 @@ pub fn create_comms(_mtm: MainThreadMarker) -> (Retained<NSView>, Retained<Comms
     input_scroll.setDocumentView(Some(&text_view));
 
     // Anchor text view explicitly to the scroll view's content view
-    if let content_view = input_scroll.contentView() {
-        let cv = unsafe { Retained::cast_unchecked::<NSView>(content_view) };
-        let constraints = unsafe {
-            NSArray::from_slice(&[
-                &*NSLayoutConstraint::constraintWithItem_attribute_relatedBy_toItem_attribute_multiplier_constant(
-                    &text_view, NSLayoutAttribute::Width, NSLayoutRelation::Equal,
-                    Some(&cv), NSLayoutAttribute::Width, 1.0, 0.0
-                )
-            ])
-        };
-        unsafe {
-            let _: () = msg_send![&cv, addConstraints: &*constraints];
-        }
+    let content_view = input_scroll.contentView();
+    let cv = unsafe { Retained::cast_unchecked::<NSView>(content_view) };
+    let constraints = unsafe {
+        NSArray::from_slice(&[
+            &*NSLayoutConstraint::constraintWithItem_attribute_relatedBy_toItem_attribute_multiplier_constant(
+                &text_view, NSLayoutAttribute::Width, NSLayoutRelation::Equal,
+                Some(&cv), NSLayoutAttribute::Width, 1.0, 0.0
+            )
+        ])
+    };
+    unsafe {
+        let _: () = msg_send![&cv, addConstraints: &*constraints];
     }
 
     split_view.addSubview(&input_scroll);

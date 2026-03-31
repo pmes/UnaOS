@@ -112,18 +112,20 @@ pub fn create_sidebar(_mtm: MainThreadMarker) -> (Retained<NSView>, Retained<Sid
     let outline_view: Retained<NSOutlineView> = unsafe { msg_send![outline_view, initWithFrame: frame] };
 
     // Set the delegates wrapped as protocol objects
-    outline_view.setDelegate(Some(ProtocolObject::from_ref(&*delegate)));
-    outline_view.setDataSource(Some(ProtocolObject::from_ref(&*delegate)));
+    unsafe {
+        outline_view.setDelegate(Some(ProtocolObject::from_ref(&*delegate)));
+        outline_view.setDataSource(Some(ProtocolObject::from_ref(&*delegate)));
 
-    // Optional: Hide the header for a cleaner sidebar look
-    outline_view.setHeaderView(None);
+        // Optional: Hide the header for a cleaner sidebar look
+        outline_view.setHeaderView(None);
 
-    // Create the dummy column
-    let column: Allocated<NSTableColumn> = unsafe { msg_send![NSTableColumn::class(), alloc] };
-    let column_id = NSString::from_str("MainColumn");
-    let column: Retained<NSTableColumn> = unsafe { msg_send![column, initWithIdentifier: &*column_id] };
-    outline_view.addTableColumn(&column);
-    outline_view.setOutlineTableColumn(Some(&column));
+        // Create the dummy column
+        let column: Allocated<NSTableColumn> = msg_send![NSTableColumn::class(), alloc];
+        let column_id = NSString::from_str("MainColumn");
+        let column: Retained<NSTableColumn> = msg_send![column, initWithIdentifier: &*column_id];
+        outline_view.addTableColumn(&column);
+        outline_view.setOutlineTableColumn(Some(&column));
+    }
 
     // 3. Create the scroll view wrapper
     let scroll_view: Allocated<NSScrollView> = unsafe { msg_send![NSScrollView::class(), alloc] };
