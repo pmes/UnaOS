@@ -50,7 +50,11 @@ impl MacOSSpline {
         _app_state: Arc<RwLock<AppState>>,
         mut rx_synapse: BroadcastReceiver<SMessage>,
         _workspace_tetra: &bandy::state::WorkspaceState,
-    ) -> NativeView {
+    ) -> (
+        NativeView,
+        Retained<sidebar::SidebarDelegate>,
+        Retained<comms::CommsDelegate>,
+    ) {
         // 1. Build the UI
         let mtm = MainThreadMarker::new().unwrap();
 
@@ -95,22 +99,6 @@ impl MacOSSpline {
         unsafe {
             // Anchor split_view_controller
             _window.setContentViewController(Some(&svc));
-
-            // To ensure the delegates outlive the current scope, associate them dynamically with the window
-            // since MacOSSplineInner traverses thread boundaries and cannot hold MainThreadOnly components.
-            // Using associated objects for the stubs is standard practice to anchor memory without globals.
-            objc2::runtime::AnyObject::set_associated_object(
-                _window,
-                sidebar_delegate.as_ptr() as *const _,
-                &sidebar_delegate,
-                objc2::runtime::AssociationPolicy::Retain
-            );
-            objc2::runtime::AnyObject::set_associated_object(
-                _window,
-                comms_delegate.as_ptr() as *const _,
-                &comms_delegate,
-                objc2::runtime::AssociationPolicy::Retain
-            );
         }
 
         // Extract the assembled root view
@@ -149,6 +137,6 @@ impl MacOSSpline {
             }
         });
 
-        root_view
+        (root_view, sidebar_delegate, comms_delegate)
     }
 }
