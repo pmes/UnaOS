@@ -84,6 +84,11 @@ LumenMainWindow::LumenMainWindow(QWidget *parent) : QMainWindow(parent) {
 }
 
 LumenMainWindow::~LumenMainWindow() {
+    if (m_quickWidget) {
+        m_quickWidget->disconnect();
+        delete m_quickWidget;
+        m_quickWidget = nullptr;
+    }
 }
 
 std::unique_ptr<LumenMainWindow> create_main_window() {
@@ -117,4 +122,8 @@ std::unique_ptr<LumenQApp> create_qapplication() {
 
 int exec_qapplication(LumenQApp& app) {
     return app.exec();
+}
+
+void quit_qapplication() {
+    QMetaObject::invokeMethod(qApp, "quit", Qt::QueuedConnection);
 }

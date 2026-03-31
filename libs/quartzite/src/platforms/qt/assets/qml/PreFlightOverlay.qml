@@ -21,9 +21,12 @@ import com.unaos.lumen 1.0
 
 Rectangle {
     id: root
-    color: "#121212"
     visible: false
     opacity: 0.98
+
+    SystemPalette { id: sys; colorGroup: SystemPalette.Active }
+    color: sys.window
+
 
     property var backend: null
     property alias systemTextAreaText: systemTextArea.text
@@ -48,7 +51,7 @@ Rectangle {
 
         Text {
             text: "PRE-FLIGHT REVIEW"
-            color: "#FFFFFF"
+            color: sys.windowText
             font.pixelSize: 22
             font.bold: true
             Layout.alignment: Qt.AlignHCenter
@@ -57,55 +60,47 @@ Rectangle {
         TabBar {
             id: preflightTabBar
             Layout.fillWidth: true
-            background: Rectangle { color: "#1e1e1e" }
+            background: Rectangle { color: sys.base }
 
             TabButton {
                 text: "System"
                 contentItem: Text {
                     text: parent.text
-                    color: parent.checked ? "#FFFFFF" : "#888888"
+                    color: parent.checked ? sys.text : sys.windowText
                     horizontalAlignment: Text.AlignHCenter
                     verticalAlignment: Text.AlignVCenter
                 }
-                background: Rectangle {
-                    color: parent.checked ? "#333333" : "transparent"
-                }
+                background: Rectangle { color: parent.checked ? sys.mid : "transparent" }
             }
             TabButton {
                 text: "Directives"
                 contentItem: Text {
                     text: parent.text
-                    color: parent.checked ? "#FFFFFF" : "#888888"
+                    color: parent.checked ? sys.text : sys.windowText
                     horizontalAlignment: Text.AlignHCenter
                     verticalAlignment: Text.AlignVCenter
                 }
-                background: Rectangle {
-                    color: parent.checked ? "#333333" : "transparent"
-                }
+                background: Rectangle { color: parent.checked ? sys.mid : "transparent" }
             }
             TabButton {
                 text: "Engrams"
                 contentItem: Text {
                     text: parent.text
-                    color: parent.checked ? "#FFFFFF" : "#888888"
+                    color: parent.checked ? sys.text : sys.windowText
                     horizontalAlignment: Text.AlignHCenter
                     verticalAlignment: Text.AlignVCenter
                 }
-                background: Rectangle {
-                    color: parent.checked ? "#333333" : "transparent"
-                }
+                background: Rectangle { color: parent.checked ? sys.mid : "transparent" }
             }
             TabButton {
                 text: "Prompt"
                 contentItem: Text {
                     text: parent.text
-                    color: parent.checked ? "#FFFFFF" : "#888888"
+                    color: parent.checked ? sys.text : sys.windowText
                     horizontalAlignment: Text.AlignHCenter
                     verticalAlignment: Text.AlignVCenter
                 }
-                background: Rectangle {
-                    color: parent.checked ? "#333333" : "transparent"
-                }
+                background: Rectangle { color: parent.checked ? sys.mid : "transparent" }
             }
         }
 
@@ -117,60 +112,64 @@ Rectangle {
 
             // System Tab
             Rectangle {
-                color: "#1e1e1e"
-                border.color: "#333"
+                color: sys.base
+                border.color: sys.mid
                 ScrollView {
                     anchors.fill: parent
                     anchors.margins: 8
                     TextArea {
                         id: systemTextArea
-                        color: "#FFFFFF"
+                        color: sys.text
                         wrapMode: Text.WordWrap
+                        background: Item {}
                     }
                 }
             }
 
             // Directives Tab
             Rectangle {
-                color: "#1e1e1e"
-                border.color: "#333"
+                color: sys.base
+                border.color: sys.mid
                 ScrollView {
                     anchors.fill: parent
                     anchors.margins: 8
                     TextArea {
                         id: directivesTextArea
-                        color: "#FFFFFF"
+                        color: sys.text
                         wrapMode: Text.WordWrap
+                        background: Item {}
                     }
                 }
             }
 
             // Engrams Tab
             Rectangle {
-                color: "#1e1e1e"
-                border.color: "#333"
+                color: sys.base
+                border.color: sys.mid
                 ScrollView {
                     anchors.fill: parent
                     anchors.margins: 8
                     TextArea {
                         id: engramsTextArea
-                        color: "#FFFFFF"
+                        color: sys.text
                         wrapMode: Text.WordWrap
+                        background: Item {}
                     }
                 }
             }
 
             // Prompt Tab
             Rectangle {
-                color: "#1e1e1e"
-                border.color: "#333"
+                color: sys.base
+                border.color: sys.mid
                 ScrollView {
                     anchors.fill: parent
                     anchors.margins: 8
                     TextArea {
                         id: promptTextArea
-                        color: "#FFFFFF"
+                        color: sys.text
                         wrapMode: Text.WordWrap
+                        background: Item {}
                     }
                 }
             }
@@ -184,17 +183,15 @@ Rectangle {
 
             Button {
                 text: "Cancel"
-                background: Rectangle { color: "#555555"; radius: 4; implicitWidth: 100; implicitHeight: 36 }
+                background: Rectangle { color: "#D70000"; radius: 4; implicitWidth: 100; implicitHeight: 36 }
                 contentItem: Text { text: parent.text; color: "#FFFFFF"; horizontalAlignment: Text.AlignHCenter; verticalAlignment: Text.AlignVCenter }
                 onClicked: {
-                    cancelDialog.open()
+                    customCancelAlert.open();
                 }
             }
 
             Button {
                 text: "Send"
-                background: Rectangle { color: "#0078D7"; radius: 4; implicitWidth: 100; implicitHeight: 36 }
-                contentItem: Text { text: parent.text; color: "#FFFFFF"; font.bold: true; horizontalAlignment: Text.AlignHCenter; verticalAlignment: Text.AlignVCenter }
                 onClicked: {
                     if (backend && promptTextArea.text !== "") {
                         backend.dispatchPayload(
@@ -211,27 +208,34 @@ Rectangle {
         }
     }
 
-    // Use QtQuick.Controls Dialog instead of Qt.labs.platform to ensure
-    // the dialog anchors within the transient application window and properly
-    // blocks the parent UI (modal: true). Qt.labs.platform defaults to unparented
-    // native Wayland/Windows windows which can center arbitrarily.
-    Dialog {
-        id: cancelDialog
-        title: "Cancel Pre-Flight?"
-        standardButtons: Dialog.Yes | Dialog.No
-        anchors.centerIn: parent
-        modal: true
+    UnaDialog {
+        id: customCancelAlert
+        parent: Overlay.overlay
+        titleText: "Cancel Pre-Flight?"
+        bodyText: "Are you sure you want to abort the payload?\nThis will clear your current input."
+        buttons: [
+            { label: "No, Return", action: "return" },
+            { label: "Yes, Abort", action: "reject" }
+        ]
 
-        background: Rectangle { color: "#1e1e1e"; border.color: "#444"; radius: 6 }
+        onActionTriggered: function(action) {
+            if (action === "reject") {
+                customCancelAlert.close();
+                // Clear the exact TextAreas by ID
+                systemTextArea.text = "";
+                directivesTextArea.text = "";
+                engramsTextArea.text = "";
+                promptTextArea.text = "";
 
-        contentItem: Text {
-            text: "Are you sure you want to abort the payload?\nThis will clear your current input."
-            color: "#FFFFFF"
-        }
+                if (root.backend) {
+                    root.backend.abortPreFlight();
+                }
 
-        onAccepted: {
-            root.payloadCanceled();
-            root.visible = false;
+                root.payloadCanceled();
+                root.visible = false;
+            } else if (action === "return") {
+                customCancelAlert.close();
+            }
         }
     }
 }

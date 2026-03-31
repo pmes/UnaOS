@@ -146,6 +146,10 @@ pub mod qobject {
         #[cxx_name = "cancelPreFlight"]
         fn cancel_pre_flight(self: Pin<&mut VeinBridge>);
 
+        #[qinvokable]
+        #[cxx_name = "abortPreFlight"]
+        fn abort_pre_flight(self: Pin<&mut VeinBridge>);
+
         #[qsignal]
         #[cxx_name = "networkPayloadDispatched"]
         fn network_payload_dispatched(self: Pin<&mut VeinBridge>, payload: QString);
@@ -206,17 +210,26 @@ impl qobject::VeinBridge {
     }
 
     pub fn dispatch_payload(mut self: std::pin::Pin<&mut Self>, system: QString, directives: QString, engrams: QString, prompt: QString) {
-        // Construct the full payload string as it will go over the wire
-        let full_payload = format!(
-            "System:\n{}\n\nDirectives:\n{}\n\nEngrams:\n{}\n\nPrompt:\n{}",
-            system, directives, engrams, prompt
-        );
+        // Construct the struct the kernel actually expects
+        let payload = PreFlightPayload {
+            system: system.to_string(),
+            directives: directives.to_string(),
+            engrams: engrams.to_string(),
+            prompt: prompt.to_string(),
+        };
 
-        if let Some(tx) = GLOBAL_TX.get() {
-            // Emit the exact payload over the wire via signal to the Qt side (The Truth View)
-            self.as_mut().network_payload_dispatched(QString::from(&full_payload));
+        // Serialize to JSON for the core
+        if let Ok(json_payload) = serde_json::to_string(&payload) {
+            // Keep the formatted version for the Network Log visual
+            let display_payload = format!(
+                "System:\n{}\n\nDirectives:\n{}\n\nEngrams:\n{}\n\nPrompt:\n{}",
+                system, directives, engrams, prompt
+            );
 
-            let _ = tx.try_send(Event::DispatchPayload(full_payload));
+            if let Some(tx) = GLOBAL_TX.get() {
+                self.as_mut().network_payload_dispatched(QString::from(&display_payload));
+                let _ = tx.try_send(Event::DispatchPayload(json_payload));
+            }
         }
     }
 
@@ -234,6 +247,16 @@ impl qobject::VeinBridge {
         if let Some(tx) = GLOBAL_TX.get() {
             // Per the directive, fully discard Event::Input on cancel.
             // Sending ::CANCEL:: to the chat target will trigger the core to clear the state.
+            let event = Event::Input {
+                target: "chat".to_string(),
+                text: "::CANCEL::".to_string(),
+            };
+            let _ = tx.try_send(event);
+        }
+    }
+
+    pub fn abort_pre_flight(self: std::pin::Pin<&mut Self>) {
+        if let Some(tx) = GLOBAL_TX.get() {
             let event = Event::Input {
                 target: "chat".to_string(),
                 text: "::CANCEL::".to_string(),
@@ -355,7 +378,7 @@ pub fn route_history_batch(items: Vec<HistoryItem>) {
                     is_chat: false,
                 });
             }
-            qobj.add_items(rust_items);
+            qobj.as_mut().add_items(rust_items);
         }).unwrap();
     } else {
         eprintln!("DROPPED: QML failed to register the HistoryModel thread.");
@@ -373,6 +396,15 @@ pub fn route_review_payload(payload: PreFlightPayload) {
                 QString::from(&payload.engrams),
                 QString::from(&payload.prompt),
             );
+        }).unwrap();
+    }
+}
+
+pub fn route_console_log(log: String) {
+    if let Some(thread) = NETWORK_LOG_MODEL_THREAD.get() {
+        let thread = thread.clone();
+        thread.queue(move |mut qobj| {
+            qobj.as_mut().append_log(QString::from(&log));
         }).unwrap();
     }
 }

@@ -136,6 +136,17 @@ impl DiskManager {
             )
             .context("Failed to save embedding")?;
 
+        // CRITICAL FIX: The `create_inode` call does not update the catalog.
+        // We MUST explicitly call `set_attribute` on "type" so the query engine
+        // can find these records during `load_all_memories`.
+        self.fs
+            .set_attribute(
+                inode_id,
+                "type".to_string(),
+                AttributeValue::String(memory_type.to_string()),
+            )
+            .context("Failed to catalog memory type")?;
+
         Ok(())
     }
 

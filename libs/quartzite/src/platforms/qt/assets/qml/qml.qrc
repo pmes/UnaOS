@@ -6,5 +6,6 @@
         <file>NexusPanel.qml</file>
         <file>NetworkLogOverlay.qml</file>
         <file>PreFlightOverlay.qml</file>
+        <file>UnaDialog.qml</file>
     </qresource>
 </RCC>

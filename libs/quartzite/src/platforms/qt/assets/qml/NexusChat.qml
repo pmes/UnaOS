@@ -21,7 +21,7 @@ import com.unaos.lumen 1.0
 
 Rectangle {
     id: root
-    color: "#121212"
+
 
     property var backend: null
 
@@ -35,7 +35,7 @@ Rectangle {
             Layout.fillWidth: true
             Layout.fillHeight: true
             clip: true
-            model: typeof _historyModel !== "undefined" ? _historyModel : null
+            model: _historyModel
             spacing: 8
 
             // Fluid Geometry Constraints
@@ -61,15 +61,14 @@ Rectangle {
                     anchors.right: chatListView.isWideMode && model.toolTip ? parent.right : undefined
                     // Fallback to center if not staggered (though full width means it covers everything anyway)
 
-                    color: model.toolTip ? "#0078D7" : "#333333"
+                    border.width: 1
                     radius: 8
 
                     Text {
                         id: messageText
                         anchors.centerIn: parent
                         width: Math.max(parent.width - 32, 10)
-                        text: display !== undefined ? display : (model.display !== undefined ? model.display : "Awaiting Telemetry...")
-                        color: "#FFFFFF"
+                        text: model.display !== undefined ? model.display : (display !== undefined ? display : "Awaiting Telemetry...")
                         wrapMode: Text.WordWrap
                     }
                 }
@@ -90,9 +89,7 @@ Rectangle {
                 id: inputField
                 Layout.fillWidth: true
                 placeholderText: "Type a message..."
-                color: "white"
                 background: Rectangle {
-                    color: "#333333"
                     radius: 4
                 }
                 onAccepted: {
@@ -104,8 +101,6 @@ Rectangle {
 
             Button {
                 text: "Pre-Flight"
-                background: Rectangle { color: "#0078D7"; radius: 4 }
-                contentItem: Text { text: parent.text; color: "#FFF"; font.bold: true; horizontalAlignment: Text.AlignHCenter; verticalAlignment: Text.AlignVCenter }
                 onClicked: {
                     if (backend) {
                         if (inputField.text !== "") {
@@ -139,17 +134,17 @@ Rectangle {
     }
 
     Connections {
-        target: typeof root.backend !== "undefined" ? root.backend : null
+        target: root.backend
         function onNetworkPayloadDispatched(payload) {
             if (typeof _networkLogModel !== "undefined" && _networkLogModel !== null) {
                 _networkLogModel.appendLog(payload);
             }
         }
         function onPayloadReadyForReview(system, directives, engrams, prompt) {
-            preFlightOverlay.systemTextAreaText = system;
-            preFlightOverlay.directivesTextAreaText = directives;
-            preFlightOverlay.engramsTextAreaText = engrams;
-            preFlightOverlay.promptTextAreaText = prompt;
+            preFlightOverlay.systemTextAreaText = system.toString();
+            preFlightOverlay.directivesTextAreaText = directives.toString();
+            preFlightOverlay.engramsTextAreaText = engrams.toString();
+            preFlightOverlay.promptTextAreaText = prompt.toString();
             preFlightOverlay.visible = true;
         }
     }
