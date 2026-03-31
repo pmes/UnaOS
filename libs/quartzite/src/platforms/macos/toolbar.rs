@@ -2,7 +2,8 @@
 // Copyright (C) 2026 The Architect & Una
 
 use core::cell::RefCell;
-use objc2::{ProtocolObject,
+use objc2::runtime::ProtocolObject;
+use objc2::{
     define_class, msg_send,
     ClassType,
     DefinedClass,
@@ -38,14 +39,14 @@ define_class!(
 
     unsafe impl NSToolbarDelegate for ToolbarDelegate {
         #[unsafe(method_id(toolbarDefaultItemIdentifiers:))]
-        fn default_item_identifiers(&self, _toolbar: &NSToolbar) -> Retained<NSArray> {
+        fn default_item_identifiers(&self, _toolbar: &NSToolbar) -> Retained<NSArray<NSToolbarItemIdentifier>> {
             unsafe {
                 NSArray::from_slice(&[NSToolbarFlexibleSpaceItemIdentifier])
             }
         }
 
         #[unsafe(method_id(toolbarAllowedItemIdentifiers:))]
-        fn allowed_item_identifiers(&self, _toolbar: &NSToolbar) -> Retained<NSArray> {
+        fn allowed_item_identifiers(&self, _toolbar: &NSToolbar) -> Retained<NSArray<NSToolbarItemIdentifier>> {
             unsafe {
                 NSArray::from_slice(&[NSToolbarFlexibleSpaceItemIdentifier])
             }

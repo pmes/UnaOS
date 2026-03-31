@@ -6,7 +6,8 @@ pub mod comms;
 
 use std::sync::{Arc, RwLock};
 
-use objc2::{ProtocolObject,
+use objc2::runtime::ProtocolObject;
+use objc2::{
     msg_send,
     ClassType,
     rc::{Allocated, Retained},

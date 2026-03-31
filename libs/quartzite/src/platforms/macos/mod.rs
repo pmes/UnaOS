@@ -21,7 +21,8 @@ pub mod workspace;
 use core::cell::RefCell;
 use core::ptr;
 
-use objc2::{ProtocolObject,
+use objc2::runtime::ProtocolObject;
+use objc2::{
     define_class, msg_send,
     ClassType,
     DefinedClass,
@@ -42,14 +43,7 @@ use objc2_app_kit::{
     NSBackingStoreType,
     NSApplication,
     NSApplicationDelegate,
-    NSApplicationActivationPolicy::Regular,
     NSWindow,
-    NSWindowStyleMask::Titled,
-    NSWindowStyleMask::Closable,
-    NSWindowStyleMask::Resizable,
-    NSWindowStyleMask::Miniaturizable,
-    NSWindowStyleMask::FullSizeContentView,
-    NSBackingStoreType::Buffered,
     NSView,
     NSResponder,
 };
@@ -102,14 +96,14 @@ define_class!(
             if let Some(bootstrap) = bootstrap_opt.take() {
                 let root_view = bootstrap(&window);
                 unsafe {
-                    msg_send![&window, setContentView: root_view.as_ref()];
+                    let _: () = msg_send![&window, setContentView: Some(&*root_view)];
                 }
             }
 
             // Show window
             unsafe {
-                msg_send![&window, center];
-                msg_send![&window, makeKeyAndOrderFront: None::<&NSObject>];
+                let _: () = msg_send![&window, center];
+                let _: () = msg_send![&window, makeKeyAndOrderFront: None::<&NSObject>];
             }
 
             // Save window in ivars
@@ -143,12 +137,20 @@ pub fn run_macos_app(bootstrap: impl FnOnce(&NSWindow) -> Retained<NSView> + 'st
 
     // Set activation policy
     unsafe {
-        msg_send![&app, setActivationPolicy: NSApplicationActivationPolicy::Regular];
+        let _: () = msg_send![&app, setActivationPolicy: NSApplicationActivationPolicy::Regular];
     }
 
     let delegate = AppDelegate::new(bootstrap, mtm);
     unsafe {
         app.setDelegate(Some(ProtocolObject::from_ref(&*delegate)));
         app.run();
+    }
+}
+
+pub struct Backend;
+
+impl crate::platform::PlatformBackend for Backend {
+    fn run(bootstrap: impl FnOnce(&NSWindow) -> Retained<NSView> + 'static) {
+        run_macos_app(bootstrap);
     }
 }

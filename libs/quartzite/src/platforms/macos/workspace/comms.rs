@@ -3,7 +3,8 @@
 
 use core::cell::RefCell;
 
-use objc2::{ProtocolObject,
+use objc2::runtime::ProtocolObject;
+use objc2::{
     define_class, msg_send,
     ClassType,
     DefinedClass,

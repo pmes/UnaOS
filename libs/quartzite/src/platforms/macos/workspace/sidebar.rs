@@ -4,7 +4,8 @@
 use core::cell::RefCell;
 use std::sync::{Arc, Mutex};
 
-use objc2::{ProtocolObject,
+use objc2::runtime::ProtocolObject;
+use objc2::{
     define_class, msg_send,
     ClassType,
     DefinedClass,
@@ -121,7 +122,7 @@ define_class!(
         #[unsafe(method_id(outlineView:viewForTableColumn:item:))]
         fn outline_view_view_for_table_column_item(&self, _outline_view: &NSOutlineView, _table_column: Option<&NSTableColumn>, item: &NSObject) -> Option<Retained<NSView>> {
             // Reconstruct the text
-            let text = unsafe { Retained::cast_unchecked::<NSString>(item.retain()) };
+            let text = unsafe { Retained::cast_unchecked::<NSString>(msg_send![item, retain]) };
 
             // Generate NSTextField
             let tf_alloc: Allocated<NSTextField> = unsafe { msg_send![NSTextField::class(), alloc] };
@@ -139,7 +140,7 @@ define_class!(
                 tf.setDrawsBackground(false);
             }
 
-            Some(tf.into_super())
+            Some(unsafe { Retained::cast_unchecked::<NSView>(tf) })
         }
     }
 );
