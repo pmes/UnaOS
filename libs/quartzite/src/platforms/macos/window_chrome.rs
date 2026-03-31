@@ -11,9 +11,11 @@ use objc2::runtime::ProtocolObject;
 use objc2::{define_class, msg_send, ClassType, MainThreadOnly};
 use objc2_app_kit::{
     NSResponder, NSWindow, NSWindowDelegate, NSToolbar, NSToolbarDelegate,
-    NSWindowStyleMask, NSBackingStoreType, NSToolbarItemIdentifier, NSToolbarItem
+    NSWindowStyleMask, NSBackingStoreType, NSToolbarItemIdentifier, NSToolbarItem,
+    NSToolbarToggleSidebarItemIdentifier
 };
 use objc2_foundation::{MainThreadMarker, NSObjectProtocol, NSRect, NSSize, NSString, NSArray};
+use objc2::sel;
 
 // -----------------------------------------------------------------------------
 // WINDOW DELEGATE
@@ -61,22 +63,44 @@ define_class!(
     unsafe impl NSToolbarDelegate for ToolbarDelegate {
         #[unsafe(method_id(toolbarAllowedItemIdentifiers:))]
         fn toolbar_allowed_item_identifiers(&self, _toolbar: &NSToolbar) -> Retained<NSArray<NSToolbarItemIdentifier>> {
-            NSArray::new()
+            unsafe {
+                NSArray::from_slice(&[
+                    NSToolbarToggleSidebarItemIdentifier
+                ])
+            }
         }
 
         #[unsafe(method_id(toolbarDefaultItemIdentifiers:))]
         fn toolbar_default_item_identifiers(&self, _toolbar: &NSToolbar) -> Retained<NSArray<NSToolbarItemIdentifier>> {
-            NSArray::new()
+            unsafe {
+                NSArray::from_slice(&[
+                    NSToolbarToggleSidebarItemIdentifier
+                ])
+            }
         }
 
         #[unsafe(method_id(toolbar:itemForItemIdentifier:willBeInsertedIntoToolbar:))]
         fn toolbar_item_for_identifier(
             &self,
             _toolbar: &NSToolbar,
-            _item_identifier: &NSToolbarItemIdentifier,
+            item_identifier: &NSToolbarItemIdentifier,
             _flag: bool,
         ) -> Option<Retained<NSToolbarItem>> {
-            None
+            unsafe {
+                if item_identifier.isEqual(NSToolbarToggleSidebarItemIdentifier) {
+                    // Create the standard sidebar toggle item
+                    let item: Allocated<NSToolbarItem> = msg_send![NSToolbarItem::class(), alloc];
+                    let item: Retained<NSToolbarItem> = msg_send![item, initWithItemIdentifier: NSToolbarToggleSidebarItemIdentifier];
+
+                    // Wire the first responder action to toggle the sidebar
+                    item.setAction(Some(sel!(toggleSidebar:)));
+                    // Leave target as nil (None) to route down the responder chain to the window/splitviewcontroller
+
+                    Some(item)
+                } else {
+                    None
+                }
+            }
         }
     }
 );
