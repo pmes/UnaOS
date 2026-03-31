@@ -9,6 +9,7 @@ default = []
 gtk = ["dep:gtk4", "dep:glib", "dep:glib-sys", "dep:gobject-sys", "dep:sourceview5", "dep:libspelling", "dep:glib-build-tools"]
 gnome = ["dep:libadwaita", "gtk"]
 qt = ["dep:cxx", "dep:cxx-qt", "dep:cxx-qt-lib", "dep:cxx-qt-build"] # Reserves the Qt embassy feature flag for future *nix expansion
+macos = []
 
 [dependencies]
 gneiss_pal = { path = "../gneiss_pal" }
