@@ -25,16 +25,14 @@ define_class!(
     #[ivars = CommsDelegateIvars]
     pub struct CommsDelegate;
 
-    unsafe impl CommsDelegate {
+    // --- NSTextViewDelegate ---
+    unsafe impl NSTextViewDelegate for CommsDelegate {
         #[unsafe(method(init))]
-        pub fn init(this: Allocated<Self>) -> Retained<Self> {
+        fn init(this: Allocated<Self>) -> Retained<Self> {
             let this = this.set_ivars(CommsDelegateIvars {});
             unsafe { msg_send![super(this), init] }
         }
-    }
 
-    // --- NSTextViewDelegate ---
-    unsafe impl NSTextViewDelegate for CommsDelegate {
         #[unsafe(method(textView:doCommandBySelector:))]
         fn text_view_do_command_by_selector(
             &self,

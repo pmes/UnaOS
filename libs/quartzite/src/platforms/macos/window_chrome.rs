@@ -29,15 +29,13 @@ define_class!(
     #[ivars = WindowDelegateIvars]
     pub struct WindowDelegate;
 
-    unsafe impl WindowDelegate {
+    unsafe impl NSWindowDelegate for WindowDelegate {
         #[unsafe(method(init))]
-        pub fn init(this: Allocated<Self>) -> Retained<Self> {
+        fn init(this: Allocated<Self>) -> Retained<Self> {
             let this = this.set_ivars(WindowDelegateIvars {});
             unsafe { msg_send![super(this), init] }
         }
     }
-
-    unsafe impl NSWindowDelegate for WindowDelegate {}
 );
 
 unsafe impl NSObjectProtocol for WindowDelegate {}
@@ -53,15 +51,13 @@ define_class!(
     #[ivars = ToolbarDelegateIvars]
     pub struct ToolbarDelegate;
 
-    unsafe impl ToolbarDelegate {
+    unsafe impl NSToolbarDelegate for ToolbarDelegate {
         #[unsafe(method(init))]
-        pub fn init(this: Allocated<Self>) -> Retained<Self> {
+        fn init(this: Allocated<Self>) -> Retained<Self> {
             let this = this.set_ivars(ToolbarDelegateIvars {});
             unsafe { msg_send![super(this), init] }
         }
-    }
 
-    unsafe impl NSToolbarDelegate for ToolbarDelegate {
         #[unsafe(method_id(toolbarAllowedItemIdentifiers:))]
         fn toolbar_allowed_item_identifiers(&self, _toolbar: &NSToolbar) -> Retained<NSArray<NSToolbarItemIdentifier>> {
             NSArray::new()

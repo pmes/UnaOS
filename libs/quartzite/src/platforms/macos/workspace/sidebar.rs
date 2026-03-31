@@ -26,14 +26,6 @@ define_class!(
     #[ivars = SidebarDelegateIvars]
     pub struct SidebarDelegate;
 
-    unsafe impl SidebarDelegate {
-        #[unsafe(method(init))]
-        pub fn init(this: Allocated<Self>) -> Retained<Self> {
-            let this = this.set_ivars(SidebarDelegateIvars {});
-            unsafe { msg_send![super(this), init] }
-        }
-    }
-
     // --- Outline View Data Source ---
     unsafe impl NSOutlineViewDataSource for SidebarDelegate {
         #[unsafe(method(outlineView:numberOfChildrenOfItem:))]
@@ -78,6 +70,12 @@ define_class!(
 
     // --- Outline View Delegate ---
     unsafe impl NSOutlineViewDelegate for SidebarDelegate {
+        #[unsafe(method(init))]
+        fn init(this: Allocated<Self>) -> Retained<Self> {
+            let this = this.set_ivars(SidebarDelegateIvars {});
+            unsafe { msg_send![super(this), init] }
+        }
+
         #[unsafe(method_id(outlineView:viewForTableColumn:item:))]
         fn outline_view_view_for_table_column_item(
             &self,
