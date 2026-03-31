@@ -18,7 +18,7 @@ use objc2_foundation::{MainThreadMarker, NSObjectProtocol, NSRect, NSSize, NSStr
 // -----------------------------------------------------------------------------
 // WINDOW DELEGATE
 // -----------------------------------------------------------------------------
-struct WindowDelegateIvars {}
+pub struct WindowDelegateIvars {}
 
 define_class!(
     #[unsafe(super(NSResponder))]
@@ -40,7 +40,7 @@ unsafe impl NSObjectProtocol for WindowDelegate {}
 // -----------------------------------------------------------------------------
 // TOOLBAR DELEGATE
 // -----------------------------------------------------------------------------
-struct ToolbarDelegateIvars {}
+pub struct ToolbarDelegateIvars {}
 
 define_class!(
     #[unsafe(super(NSResponder))]

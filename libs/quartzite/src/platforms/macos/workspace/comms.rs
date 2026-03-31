@@ -16,7 +16,7 @@ use objc2_foundation::NSObjectProtocol;
 // -----------------------------------------------------------------------------
 // COMMS DELEGATE (LUMEN REACTOR CHAT)
 // -----------------------------------------------------------------------------
-struct CommsDelegateIvars {}
+pub struct CommsDelegateIvars {}
 
 define_class!(
     #[unsafe(super(NSResponder))]

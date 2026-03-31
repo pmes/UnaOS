@@ -18,7 +18,7 @@ use objc2_foundation::{NSObjectProtocol, NSInteger, NSString};
 // -----------------------------------------------------------------------------
 // SIDEBAR DELEGATE (LUMEN LEFT PANE)
 // -----------------------------------------------------------------------------
-struct SidebarDelegateIvars {}
+pub struct SidebarDelegateIvars {}
 
 define_class!(
     #[unsafe(super(NSResponder))]
