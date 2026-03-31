@@ -7,14 +7,14 @@
 // (at your option) any later version.
 
 use objc2::rc::Retained;
-use objc2::{define_class, msg_send, ClassType, DefinedClass};
+use objc2::{define_class, msg_send, ClassType, DefinedClass, MainThreadOnly};
 use objc2_app_kit::{
     NSButton, NSControl, NSFont, NSProgressIndicator, NSProgressIndicatorStyle, NSStackView,
     NSStackViewDistribution, NSTextField, NSToolbar, NSToolbarDelegate, NSToolbarDisplayMode,
     NSToolbarItem, NSToolbarItemIdentifier, NSToolbarSizeMode, NSView, NSWindow,
 };
 use objc2_foundation::{
-    NSArray, MainThreadOnly, NSObjectProtocol, NSString, NSPoint, NSSize, NSRect
+    NSArray, NSObjectProtocol, NSString, NSPoint, NSSize, NSRect
 };
 use std::cell::RefCell;
 

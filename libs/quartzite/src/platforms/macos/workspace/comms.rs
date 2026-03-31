@@ -7,13 +7,14 @@
 // (at your option) any later version.
 
 use objc2::rc::Retained;
-use objc2::{define_class, msg_send, ClassType, DefinedClass};
+use objc2::{define_class, msg_send, ClassType, DefinedClass, MainThreadOnly};
 use objc2_app_kit::{
     NSButton, NSControlTextEditingDelegate, NSFont, NSScrollView, NSStackView, NSStackViewDistribution,
     NSTextDelegate, NSTextView, NSTextViewDelegate, NSView, NSColor
 };
+use objc2::runtime::AnyObject;
 use objc2_foundation::{
-    NSArray, MainThreadOnly, NSLayoutAttribute, NSLayoutConstraint, NSLayoutRelation, NSObjectProtocol,
+    NSArray, NSLayoutAttribute, NSLayoutConstraint, NSLayoutRelation, NSObjectProtocol,
     NSPoint, NSRect, NSSize, NSString
 };
 use std::cell::RefCell;
@@ -90,20 +91,6 @@ pub fn build(_mtm: MainThreadOnly) -> Retained<NSView> {
         let history_content: Retained<NSView> = msg_send![history_content, initWithFrame: NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(800.0, 1000.0))];
         history_scroll.setDocumentView(Some(&history_content));
 
-        // Input Buffer Stack (Lower area)
-        let input_stack: Retained<NSStackView> = msg_send![NSStackView::class(), alloc];
-        let input_stack: Retained<NSStackView> = msg_send![input_stack, initWithFrame: NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(800.0, 60.0))];
-        input_stack.setTranslatesAutoresizingMaskIntoConstraints(false);
-        input_stack.setOrientation(objc2_app_kit::NSUserInterfaceLayoutOrientation::Horizontal);
-        input_stack.setSpacing(12.0);
-        input_stack.setDistribution(NSStackViewDistribution::Fill);
-        input_stack.setEdgeInsets(objc2_foundation::NSEdgeInsets {
-            top: 8.0,
-            left: 12.0,
-            bottom: 8.0,
-            right: 12.0,
-        });
-
         // 1. Attach Button
         let attach_btn: Retained<NSButton> = msg_send![NSButton::class(), alloc];
         let attach_btn: Retained<NSButton> = msg_send![attach_btn, initWithFrame: NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(32.0, 32.0))];
@@ -143,116 +130,191 @@ pub fn build(_mtm: MainThreadOnly) -> Retained<NSView> {
         send_btn.setTitle(&NSString::from_str("Send"));
         send_btn.setBezelStyle(objc2_app_kit::NSBezelStyle::Rounded);
 
-        // Assemble Stack
-        input_stack.addArrangedSubview(&attach_btn);
-        input_stack.addArrangedSubview(&input_scroll);
-        input_stack.addArrangedSubview(&send_btn);
-
         // Add to main container
         container.addSubview(&history_scroll);
-        container.addSubview(&input_stack);
+        container.addSubview(&attach_btn);
+        container.addSubview(&input_scroll);
+        container.addSubview(&send_btn);
 
         // ---------------------------------------------------------------------
         // CONSTRAINTS
         // ---------------------------------------------------------------------
+
+        // History Scroll
+        let c1 = NSLayoutConstraint::constraintWithItem_attribute_relatedBy_toItem_attribute_multiplier_constant(
+            &history_scroll,
+            NSLayoutAttribute::Leading,
+            NSLayoutRelation::Equal,
+            Some(&container),
+            NSLayoutAttribute::Leading,
+            1.0,
+            0.0,
+        );
+        let c2 = NSLayoutConstraint::constraintWithItem_attribute_relatedBy_toItem_attribute_multiplier_constant(
+            &history_scroll,
+            NSLayoutAttribute::Trailing,
+            NSLayoutRelation::Equal,
+            Some(&container),
+            NSLayoutAttribute::Trailing,
+            1.0,
+            0.0,
+        );
+        let c3 = NSLayoutConstraint::constraintWithItem_attribute_relatedBy_toItem_attribute_multiplier_constant(
+            &history_scroll,
+            NSLayoutAttribute::Top,
+            NSLayoutRelation::Equal,
+            Some(&container),
+            NSLayoutAttribute::Top,
+            1.0,
+            0.0,
+        );
+        let c4 = NSLayoutConstraint::constraintWithItem_attribute_relatedBy_toItem_attribute_multiplier_constant(
+            &history_scroll,
+            NSLayoutAttribute::Bottom,
+            NSLayoutRelation::Equal,
+            Some(&input_scroll),
+            NSLayoutAttribute::Top,
+            1.0,
+            -12.0, // Space between history and input
+        );
+
+        // Attach Button
+        let c5 = NSLayoutConstraint::constraintWithItem_attribute_relatedBy_toItem_attribute_multiplier_constant(
+            &attach_btn,
+            NSLayoutAttribute::Leading,
+            NSLayoutRelation::Equal,
+            Some(&container),
+            NSLayoutAttribute::Leading,
+            1.0,
+            12.0,
+        );
+        let c6 = NSLayoutConstraint::constraintWithItem_attribute_relatedBy_toItem_attribute_multiplier_constant(
+            &attach_btn,
+            NSLayoutAttribute::Bottom,
+            NSLayoutRelation::Equal,
+            Some(&container),
+            NSLayoutAttribute::Bottom,
+            1.0,
+            -12.0,
+        );
+        let c7 = NSLayoutConstraint::constraintWithItem_attribute_relatedBy_toItem_attribute_multiplier_constant(
+            &attach_btn,
+            NSLayoutAttribute::Width,
+            NSLayoutRelation::Equal,
+            None::<&AnyObject>,
+            NSLayoutAttribute::NotAnAttribute,
+            1.0,
+            32.0,
+        );
+        let c8 = NSLayoutConstraint::constraintWithItem_attribute_relatedBy_toItem_attribute_multiplier_constant(
+            &attach_btn,
+            NSLayoutAttribute::Height,
+            NSLayoutRelation::Equal,
+            None::<&AnyObject>,
+            NSLayoutAttribute::NotAnAttribute,
+            1.0,
+            32.0,
+        );
+
+        // Input Scroll
+        let c9 = NSLayoutConstraint::constraintWithItem_attribute_relatedBy_toItem_attribute_multiplier_constant(
+            &input_scroll,
+            NSLayoutAttribute::Leading,
+            NSLayoutRelation::Equal,
+            Some(&attach_btn),
+            NSLayoutAttribute::Trailing,
+            1.0,
+            8.0,
+        );
+        let c10 = NSLayoutConstraint::constraintWithItem_attribute_relatedBy_toItem_attribute_multiplier_constant(
+            &input_scroll,
+            NSLayoutAttribute::Trailing,
+            NSLayoutRelation::Equal,
+            Some(&send_btn),
+            NSLayoutAttribute::Leading,
+            1.0,
+            -8.0,
+        );
+        let c11 = NSLayoutConstraint::constraintWithItem_attribute_relatedBy_toItem_attribute_multiplier_constant(
+            &input_scroll,
+            NSLayoutAttribute::Bottom,
+            NSLayoutRelation::Equal,
+            Some(&container),
+            NSLayoutAttribute::Bottom,
+            1.0,
+            -12.0,
+        );
+        let c12 = NSLayoutConstraint::constraintWithItem_attribute_relatedBy_toItem_attribute_multiplier_constant(
+            &input_scroll,
+            NSLayoutAttribute::Height,
+            NSLayoutRelation::GreaterThanOrEqual,
+            None::<&AnyObject>,
+            NSLayoutAttribute::NotAnAttribute,
+            1.0,
+            40.0,
+        );
+        let c13 = NSLayoutConstraint::constraintWithItem_attribute_relatedBy_toItem_attribute_multiplier_constant(
+            &input_scroll,
+            NSLayoutAttribute::Height,
+            NSLayoutRelation::LessThanOrEqual,
+            None::<&AnyObject>,
+            NSLayoutAttribute::NotAnAttribute,
+            1.0,
+            150.0,
+        );
+
+        // Inner NSTextView Match Width to ScrollView
+        let c14 = NSLayoutConstraint::constraintWithItem_attribute_relatedBy_toItem_attribute_multiplier_constant(
+            &text_view,
+            NSLayoutAttribute::Width,
+            NSLayoutRelation::Equal,
+            Some(&input_scroll),
+            NSLayoutAttribute::Width,
+            1.0,
+            0.0,
+        );
+
+        // Send Button
+        let c15 = NSLayoutConstraint::constraintWithItem_attribute_relatedBy_toItem_attribute_multiplier_constant(
+            &send_btn,
+            NSLayoutAttribute::Trailing,
+            NSLayoutRelation::Equal,
+            Some(&container),
+            NSLayoutAttribute::Trailing,
+            1.0,
+            -12.0,
+        );
+        let c16 = NSLayoutConstraint::constraintWithItem_attribute_relatedBy_toItem_attribute_multiplier_constant(
+            &send_btn,
+            NSLayoutAttribute::Bottom,
+            NSLayoutRelation::Equal,
+            Some(&container),
+            NSLayoutAttribute::Bottom,
+            1.0,
+            -12.0,
+        );
+        let c17 = NSLayoutConstraint::constraintWithItem_attribute_relatedBy_toItem_attribute_multiplier_constant(
+            &send_btn,
+            NSLayoutAttribute::Width,
+            NSLayoutRelation::Equal,
+            None::<&AnyObject>,
+            NSLayoutAttribute::NotAnAttribute,
+            1.0,
+            60.0,
+        );
+        let c18 = NSLayoutConstraint::constraintWithItem_attribute_relatedBy_toItem_attribute_multiplier_constant(
+            &send_btn,
+            NSLayoutAttribute::Height,
+            NSLayoutRelation::Equal,
+            None::<&AnyObject>,
+            NSLayoutAttribute::NotAnAttribute,
+            1.0,
+            32.0,
+        );
+
         let constraints = NSArray::from_slice(&[
-            // History Scroll
-            NSLayoutConstraint::constraintWithItem_attribute_relatedBy_toItem_attribute_multiplier_constant(
-                &history_scroll,
-                NSLayoutAttribute::Leading,
-                NSLayoutRelation::Equal,
-                Some(&container),
-                NSLayoutAttribute::Leading,
-                1.0,
-                0.0,
-            ),
-            NSLayoutConstraint::constraintWithItem_attribute_relatedBy_toItem_attribute_multiplier_constant(
-                &history_scroll,
-                NSLayoutAttribute::Trailing,
-                NSLayoutRelation::Equal,
-                Some(&container),
-                NSLayoutAttribute::Trailing,
-                1.0,
-                0.0,
-            ),
-            NSLayoutConstraint::constraintWithItem_attribute_relatedBy_toItem_attribute_multiplier_constant(
-                &history_scroll,
-                NSLayoutAttribute::Top,
-                NSLayoutRelation::Equal,
-                Some(&container),
-                NSLayoutAttribute::Top,
-                1.0,
-                0.0,
-            ),
-            NSLayoutConstraint::constraintWithItem_attribute_relatedBy_toItem_attribute_multiplier_constant(
-                &history_scroll,
-                NSLayoutAttribute::Bottom,
-                NSLayoutRelation::Equal,
-                Some(&input_stack),
-                NSLayoutAttribute::Top,
-                1.0,
-                0.0,
-            ),
-
-            // Input Stack (Anchored to Bottom)
-            NSLayoutConstraint::constraintWithItem_attribute_relatedBy_toItem_attribute_multiplier_constant(
-                &input_stack,
-                NSLayoutAttribute::Leading,
-                NSLayoutRelation::Equal,
-                Some(&container),
-                NSLayoutAttribute::Leading,
-                1.0,
-                0.0,
-            ),
-            NSLayoutConstraint::constraintWithItem_attribute_relatedBy_toItem_attribute_multiplier_constant(
-                &input_stack,
-                NSLayoutAttribute::Trailing,
-                NSLayoutRelation::Equal,
-                Some(&container),
-                NSLayoutAttribute::Trailing,
-                1.0,
-                0.0,
-            ),
-            NSLayoutConstraint::constraintWithItem_attribute_relatedBy_toItem_attribute_multiplier_constant(
-                &input_stack,
-                NSLayoutAttribute::Bottom,
-                NSLayoutRelation::Equal,
-                Some(&container),
-                NSLayoutAttribute::Bottom,
-                1.0,
-                0.0,
-            ),
-
-            // Input Scroll Height Restrictions
-            NSLayoutConstraint::constraintWithItem_attribute_relatedBy_toItem_attribute_multiplier_constant(
-                &input_scroll,
-                NSLayoutAttribute::Height,
-                NSLayoutRelation::GreaterThanOrEqual,
-                None::<&objc2::runtime::AnyObject>,
-                NSLayoutAttribute::NotAnAttribute,
-                1.0,
-                40.0,
-            ),
-            NSLayoutConstraint::constraintWithItem_attribute_relatedBy_toItem_attribute_multiplier_constant(
-                &input_scroll,
-                NSLayoutAttribute::Height,
-                NSLayoutRelation::LessThanOrEqual,
-                None::<&objc2::runtime::AnyObject>,
-                NSLayoutAttribute::NotAnAttribute,
-                1.0,
-                150.0,
-            ),
-
-            // Inner NSTextView Match Width to ScrollView
-            NSLayoutConstraint::constraintWithItem_attribute_relatedBy_toItem_attribute_multiplier_constant(
-                &text_view,
-                NSLayoutAttribute::Width,
-                NSLayoutRelation::Equal,
-                Some(&input_scroll),
-                NSLayoutAttribute::Width,
-                1.0,
-                0.0,
-            ),
+            &*c1, &*c2, &*c3, &*c4, &*c5, &*c6, &*c7, &*c8,
+            &*c9, &*c10, &*c11, &*c12, &*c13, &*c14, &*c15, &*c16, &*c17, &*c18
         ]);
         NSLayoutConstraint::activateConstraints(&constraints);
 

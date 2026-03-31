@@ -12,12 +12,13 @@ pub mod sidebar;
 use crate::{NativeView, Event};
 use bandy::state::{AppState, WorkspaceState};
 use objc2::rc::Retained;
-use objc2::{msg_send, ClassType};
+use objc2::{msg_send, ClassType, MainThreadOnly};
+use objc2::runtime::AnyObject;
 use objc2_app_kit::{
     NSLayoutConstraint, NSLayoutAttribute, NSLayoutRelation, NSSplitView, NSSplitViewDividerStyle,
     NSView, NSWindow, NSColor
 };
-use objc2_foundation::{NSArray, MainThreadOnly, NSRect, NSPoint, NSSize};
+use objc2_foundation::{NSArray, NSRect, NSPoint, NSSize};
 use std::sync::{Arc, RwLock};
 
 pub fn build(
@@ -52,58 +53,53 @@ pub fn build(
         root_view.addSubview(&split_view);
 
         // Apply explicit constraints (No Autoresizing)
-        let constraints = NSArray::from_slice(&[
-            // split_view.leading == root_view.leading
-            NSLayoutConstraint::constraintWithItem_attribute_relatedBy_toItem_attribute_multiplier_constant(
-                &split_view,
-                NSLayoutAttribute::Leading,
-                NSLayoutRelation::Equal,
-                Some(&root_view),
-                NSLayoutAttribute::Leading,
-                1.0,
-                0.0,
-            ),
-            // split_view.trailing == root_view.trailing
-            NSLayoutConstraint::constraintWithItem_attribute_relatedBy_toItem_attribute_multiplier_constant(
-                &split_view,
-                NSLayoutAttribute::Trailing,
-                NSLayoutRelation::Equal,
-                Some(&root_view),
-                NSLayoutAttribute::Trailing,
-                1.0,
-                0.0,
-            ),
-            // split_view.top == root_view.top
-            NSLayoutConstraint::constraintWithItem_attribute_relatedBy_toItem_attribute_multiplier_constant(
-                &split_view,
-                NSLayoutAttribute::Top,
-                NSLayoutRelation::Equal,
-                Some(&root_view),
-                NSLayoutAttribute::Top,
-                1.0,
-                0.0,
-            ),
-            // split_view.bottom == root_view.bottom
-            NSLayoutConstraint::constraintWithItem_attribute_relatedBy_toItem_attribute_multiplier_constant(
-                &split_view,
-                NSLayoutAttribute::Bottom,
-                NSLayoutRelation::Equal,
-                Some(&root_view),
-                NSLayoutAttribute::Bottom,
-                1.0,
-                0.0,
-            ),
-            // Explicit sidebar width constraint to prevent crush
-            NSLayoutConstraint::constraintWithItem_attribute_relatedBy_toItem_attribute_multiplier_constant(
-                &sidebar_view,
-                NSLayoutAttribute::Width,
-                NSLayoutRelation::GreaterThanOrEqual,
-                None::<&objc2::runtime::AnyObject>,
-                NSLayoutAttribute::NotAnAttribute,
-                1.0,
-                200.0, // Minimum sidebar width
-            )
-        ]);
+        let c1 = NSLayoutConstraint::constraintWithItem_attribute_relatedBy_toItem_attribute_multiplier_constant(
+            &split_view,
+            NSLayoutAttribute::Leading,
+            NSLayoutRelation::Equal,
+            Some(&root_view),
+            NSLayoutAttribute::Leading,
+            1.0,
+            0.0,
+        );
+        let c2 = NSLayoutConstraint::constraintWithItem_attribute_relatedBy_toItem_attribute_multiplier_constant(
+            &split_view,
+            NSLayoutAttribute::Trailing,
+            NSLayoutRelation::Equal,
+            Some(&root_view),
+            NSLayoutAttribute::Trailing,
+            1.0,
+            0.0,
+        );
+        let c3 = NSLayoutConstraint::constraintWithItem_attribute_relatedBy_toItem_attribute_multiplier_constant(
+            &split_view,
+            NSLayoutAttribute::Top,
+            NSLayoutRelation::Equal,
+            Some(&root_view),
+            NSLayoutAttribute::Top,
+            1.0,
+            0.0,
+        );
+        let c4 = NSLayoutConstraint::constraintWithItem_attribute_relatedBy_toItem_attribute_multiplier_constant(
+            &split_view,
+            NSLayoutAttribute::Bottom,
+            NSLayoutRelation::Equal,
+            Some(&root_view),
+            NSLayoutAttribute::Bottom,
+            1.0,
+            0.0,
+        );
+        let c5 = NSLayoutConstraint::constraintWithItem_attribute_relatedBy_toItem_attribute_multiplier_constant(
+            &sidebar_view,
+            NSLayoutAttribute::Width,
+            NSLayoutRelation::GreaterThanOrEqual,
+            None::<&AnyObject>,
+            NSLayoutAttribute::NotAnAttribute,
+            1.0,
+            200.0,
+        );
+
+        let constraints = NSArray::from_slice(&[&*c1, &*c2, &*c3, &*c4, &*c5]);
         NSLayoutConstraint::activateConstraints(&constraints);
 
         root_view

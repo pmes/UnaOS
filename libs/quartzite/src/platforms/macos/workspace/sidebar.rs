@@ -7,13 +7,14 @@
 // (at your option) any later version.
 
 use objc2::rc::Retained;
-use objc2::{define_class, msg_send, ClassType, DefinedClass};
+use objc2::{define_class, msg_send, ClassType, DefinedClass, MainThreadOnly};
 use objc2_app_kit::{
     NSControlTextEditingDelegate, NSOutlineView, NSOutlineViewDataSource, NSOutlineViewDelegate,
     NSScrollView, NSTableColumn, NSTextField, NSView, NSColor
 };
+use objc2::runtime::AnyObject;
 use objc2_foundation::{
-    MainThreadOnly, NSObjectProtocol, NSString, NSPoint, NSSize, NSRect,
+    NSObjectProtocol, NSString, NSPoint, NSSize, NSRect,
     NSLayoutConstraint, NSLayoutAttribute, NSLayoutRelation, NSArray
 };
 use std::cell::RefCell;
@@ -43,7 +44,7 @@ define_class!(
         fn outlineView_numberOfChildrenOfItem(
             &self,
             _outline_view: &NSOutlineView,
-            _item: Option<&objc2::runtime::AnyObject>,
+            _item: Option<&AnyObject>,
         ) -> isize {
             // Returns 0 until the Core engine fires SMessage::Matrix(TopologyMutated)
             0
@@ -54,8 +55,8 @@ define_class!(
             &self,
             _outline_view: &NSOutlineView,
             _index: isize,
-            _item: Option<&objc2::runtime::AnyObject>,
-        ) -> Retained<objc2::runtime::AnyObject> {
+            _item: Option<&AnyObject>,
+        ) -> Retained<AnyObject> {
             // Return a dummy object if requested before population
             unsafe { msg_send![objc2_foundation::NSObject::class(), new] }
         }
@@ -64,7 +65,7 @@ define_class!(
         fn outlineView_isItemExpandable(
             &self,
             _outline_view: &NSOutlineView,
-            _item: &objc2::runtime::AnyObject,
+            _item: &AnyObject,
         ) -> bool {
             false
         }
@@ -76,7 +77,7 @@ define_class!(
             &self,
             outline_view: &NSOutlineView,
             _table_column: Option<&NSTableColumn>,
-            _item: &objc2::runtime::AnyObject,
+            _item: &AnyObject,
         ) -> Option<Retained<NSView>> {
             unsafe {
                 // Return a simple NSTextField as the view
@@ -163,44 +164,44 @@ pub fn build(_mtm: MainThreadOnly) -> Retained<NSView> {
         container.addSubview(&scroll_view);
 
         // Explicit Constraints
-        let constraints = NSArray::from_slice(&[
-            NSLayoutConstraint::constraintWithItem_attribute_relatedBy_toItem_attribute_multiplier_constant(
-                &scroll_view,
-                NSLayoutAttribute::Leading,
-                NSLayoutRelation::Equal,
-                Some(&container),
-                NSLayoutAttribute::Leading,
-                1.0,
-                0.0,
-            ),
-            NSLayoutConstraint::constraintWithItem_attribute_relatedBy_toItem_attribute_multiplier_constant(
-                &scroll_view,
-                NSLayoutAttribute::Trailing,
-                NSLayoutRelation::Equal,
-                Some(&container),
-                NSLayoutAttribute::Trailing,
-                1.0,
-                0.0,
-            ),
-            NSLayoutConstraint::constraintWithItem_attribute_relatedBy_toItem_attribute_multiplier_constant(
-                &scroll_view,
-                NSLayoutAttribute::Top,
-                NSLayoutRelation::Equal,
-                Some(&container),
-                NSLayoutAttribute::Top,
-                1.0,
-                0.0,
-            ),
-            NSLayoutConstraint::constraintWithItem_attribute_relatedBy_toItem_attribute_multiplier_constant(
-                &scroll_view,
-                NSLayoutAttribute::Bottom,
-                NSLayoutRelation::Equal,
-                Some(&container),
-                NSLayoutAttribute::Bottom,
-                1.0,
-                0.0,
-            ),
-        ]);
+        let c1 = NSLayoutConstraint::constraintWithItem_attribute_relatedBy_toItem_attribute_multiplier_constant(
+            &scroll_view,
+            NSLayoutAttribute::Leading,
+            NSLayoutRelation::Equal,
+            Some(&container),
+            NSLayoutAttribute::Leading,
+            1.0,
+            0.0,
+        );
+        let c2 = NSLayoutConstraint::constraintWithItem_attribute_relatedBy_toItem_attribute_multiplier_constant(
+            &scroll_view,
+            NSLayoutAttribute::Trailing,
+            NSLayoutRelation::Equal,
+            Some(&container),
+            NSLayoutAttribute::Trailing,
+            1.0,
+            0.0,
+        );
+        let c3 = NSLayoutConstraint::constraintWithItem_attribute_relatedBy_toItem_attribute_multiplier_constant(
+            &scroll_view,
+            NSLayoutAttribute::Top,
+            NSLayoutRelation::Equal,
+            Some(&container),
+            NSLayoutAttribute::Top,
+            1.0,
+            0.0,
+        );
+        let c4 = NSLayoutConstraint::constraintWithItem_attribute_relatedBy_toItem_attribute_multiplier_constant(
+            &scroll_view,
+            NSLayoutAttribute::Bottom,
+            NSLayoutRelation::Equal,
+            Some(&container),
+            NSLayoutAttribute::Bottom,
+            1.0,
+            0.0,
+        );
+
+        let constraints = NSArray::from_slice(&[&*c1, &*c2, &*c3, &*c4]);
         NSLayoutConstraint::activateConstraints(&constraints);
 
         container

@@ -14,9 +14,9 @@ use crate::{NativeView, NativeWindow};
 use block2::RcBlock;
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
-use objc2::{define_class, msg_send, ClassType, DefinedClass};
+use objc2::{define_class, msg_send, ClassType, DefinedClass, MainThreadOnly};
 use objc2_app_kit::{NSApplication, NSApplicationActivationPolicyRegular, NSApplicationDelegate, NSResponder, NSWindow, NSWindowStyleMask};
-use objc2_foundation::{MainThreadOnly, NSObjectProtocol, NSPoint, NSRect, NSSize, NSString};
+use objc2_foundation::{NSObjectProtocol, NSPoint, NSRect, NSSize, NSString};
 use std::cell::RefCell;
 
 // The UI Window Bootstrap Closure signature matching core expectations
@@ -121,7 +121,7 @@ define_class!(
                 });
 
                 window.setContentView(Some(&content_view));
-                window.makeKeyAndOrderFront(None::<&objc2::runtime::AnyObject>);
+                window.makeKeyAndOrderFront(None::<&AnyObject>);
 
                 // Store retained pointers in ivars to prevent deallocation
                 *self.ivars().window.borrow_mut() = Some(window);
