@@ -96,10 +96,8 @@ impl MacOSSpline {
         svc.addSplitViewItem(&comms_item);
 
         // Prevent AppKit components from deallocation by attaching them to the root Window/run loop.
-        unsafe {
-            // Anchor split_view_controller
-            _window.setContentViewController(Some(&svc));
-        }
+        // Anchor split_view_controller
+        _window.setContentViewController(Some(&svc));
 
         // Extract the assembled root view
         let root_view = svc.view();

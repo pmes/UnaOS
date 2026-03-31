@@ -15,6 +15,15 @@ use tokio::sync::broadcast::Receiver as BroadcastReceiver;
 use bandy::state::AppState;
 use bandy::SMessage;
 
+#[cfg(target_os = "macos")]
+use objc2::rc::Retained;
+
+#[cfg(target_os = "macos")]
+pub type BootstrapPayload = (NativeView, Retained<crate::platforms::macos::workspace::sidebar::SidebarDelegate>, Retained<crate::platforms::macos::workspace::comms::CommsDelegate>);
+
+#[cfg(not(target_os = "macos"))]
+pub type BootstrapPayload = NativeView;
+
 #[cfg(all(target_os = "linux", feature = "gtk"))]
 use crate::platforms::gtk::spline::CommsSpline;
 
@@ -54,7 +63,7 @@ impl Spline {
         _app_state: Arc<RwLock<AppState>>,
         _rx_synapse: BroadcastReceiver<SMessage>,
         _workspace_tetra: &bandy::state::WorkspaceState,
-    ) -> NativeView {
+    ) -> BootstrapPayload {
         #[cfg(any(all(target_os = "linux", feature = "gtk"), target_os = "macos"))]
         return self
             .inner
