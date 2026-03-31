@@ -87,7 +87,8 @@ define_class!(
             _flag: bool,
         ) -> Option<Retained<NSToolbarItem>> {
             unsafe {
-                if item_identifier.isEqual(NSToolbarToggleSidebarItemIdentifier) {
+                let is_sidebar_toggle = msg_send![item_identifier, isEqualToString: NSToolbarToggleSidebarItemIdentifier];
+                if is_sidebar_toggle {
                     // Create the standard sidebar toggle item
                     let item: Allocated<NSToolbarItem> = msg_send![NSToolbarItem::class(), alloc];
                     let item: Retained<NSToolbarItem> = msg_send![item, initWithItemIdentifier: NSToolbarToggleSidebarItemIdentifier];

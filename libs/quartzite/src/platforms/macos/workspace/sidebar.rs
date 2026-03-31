@@ -121,7 +121,7 @@ pub fn create_sidebar(_mtm: MainThreadMarker) -> (Retained<NSView>, Retained<Sid
     // Create the dummy column
     let column: Allocated<NSTableColumn> = unsafe { msg_send![NSTableColumn::class(), alloc] };
     let column_id = NSString::from_str("MainColumn");
-    let column: Retained<NSTableColumn> = unsafe { msg_send![column, initWithIdentifier: &column_id] };
+    let column: Retained<NSTableColumn> = unsafe { msg_send![column, initWithIdentifier: &*column_id] };
     outline_view.addTableColumn(&column);
     outline_view.setOutlineTableColumn(Some(&column));
 
@@ -142,5 +142,5 @@ pub fn create_sidebar(_mtm: MainThreadMarker) -> (Retained<NSView>, Retained<Sid
     scroll_view.setDocumentView(Some(&outline_view));
 
     // Return the scroll view as the root view of this component, and the delegate to hold state
-    (Retained::cast::<NSView>(scroll_view), delegate)
+    (unsafe { Retained::cast_unchecked::<NSView>(scroll_view) }, delegate)
 }

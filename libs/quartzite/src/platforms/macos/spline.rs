@@ -13,7 +13,7 @@ use tokio::sync::broadcast::Receiver as BroadcastReceiver;
 use bandy::state::AppState;
 use bandy::SMessage;
 use objc2_app_kit::{
-    NSView, NSSplitViewController, NSSplitViewItem, NSSplitViewItemBehavior
+    NSSplitViewController, NSSplitViewItem, NSViewController
 };
 use objc2_foundation::{NSRect, NSSize, MainThreadMarker};
 use objc2::{msg_send, ClassType};
@@ -59,11 +59,6 @@ impl MacOSSpline {
     ) -> NativeView {
         // 1. Build the UI
         let mtm = MainThreadMarker::new().unwrap();
-
-        let root_frame = NSRect::new(
-            objc2_foundation::NSPoint::new(0.0, 0.0),
-            NSSize::new(1024.0, 768.0),
-        );
 
         // Root NSSplitViewController is the master frame separating Left Pane (Sidebar) and Right Pane (Comms)
         let svc: Allocated<NSSplitViewController> = unsafe { msg_send![NSSplitViewController::class(), alloc] };

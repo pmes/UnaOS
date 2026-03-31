@@ -113,10 +113,10 @@ pub fn create_comms(_mtm: MainThreadMarker) -> (Retained<NSView>, Retained<Comms
 
     // Anchor text view explicitly to the scroll view's content view
     if let content_view = input_scroll.contentView() {
-        let cv = Retained::cast::<NSView>(content_view);
+        let cv = unsafe { Retained::cast_unchecked::<NSView>(content_view) };
         let constraints = unsafe {
             NSArray::from_slice(&[
-                NSLayoutConstraint::constraintWithItem_attribute_relatedBy_toItem_attribute_multiplier_constant(
+                &*NSLayoutConstraint::constraintWithItem_attribute_relatedBy_toItem_attribute_multiplier_constant(
                     &text_view, NSLayoutAttribute::Width, NSLayoutRelation::Equal,
                     Some(&cv), NSLayoutAttribute::Width, 1.0, 0.0
                 )
@@ -134,11 +134,11 @@ pub fn create_comms(_mtm: MainThreadMarker) -> (Retained<NSView>, Retained<Comms
     // Ensure the input scroll view doesn't collapse to 0:
     let constraints = unsafe {
         NSArray::from_slice(&[
-            NSLayoutConstraint::constraintWithItem_attribute_relatedBy_toItem_attribute_multiplier_constant(
+            &*NSLayoutConstraint::constraintWithItem_attribute_relatedBy_toItem_attribute_multiplier_constant(
                 &input_scroll, NSLayoutAttribute::Height, NSLayoutRelation::GreaterThanOrEqual,
                 None, NSLayoutAttribute::NotAnAttribute, 1.0, 50.0 // Minimum 50px input height
             ),
-            NSLayoutConstraint::constraintWithItem_attribute_relatedBy_toItem_attribute_multiplier_constant(
+            &*NSLayoutConstraint::constraintWithItem_attribute_relatedBy_toItem_attribute_multiplier_constant(
                 &matrix_scroll, NSLayoutAttribute::Height, NSLayoutRelation::GreaterThanOrEqual,
                 None, NSLayoutAttribute::NotAnAttribute, 1.0, 150.0 // Minimum 150px chat height
             )
@@ -148,5 +148,5 @@ pub fn create_comms(_mtm: MainThreadMarker) -> (Retained<NSView>, Retained<Comms
         let _: () = msg_send![&split_view, addConstraints: &*constraints];
     }
 
-    (Retained::cast::<NSView>(split_view), delegate)
+    (unsafe { Retained::cast_unchecked::<NSView>(split_view) }, delegate)
 }
