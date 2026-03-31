@@ -8,7 +8,7 @@
 
 use objc2::rc::{Allocated, Retained};
 use objc2::runtime::{AnyObject, ProtocolObject};
-use objc2::{define_class, msg_send, ClassType, DeclaredClass};
+use objc2::{define_class, msg_send, ClassType, DeclaredClass, MainThreadOnly};
 use objc2_app_kit::{
     NSResponder, NSWindow, NSWindowDelegate, NSToolbar, NSToolbarDelegate, NSView,
     NSWindowStyleMask, NSBackingStoreType, NSToolbarItemIdentifier, NSToolbarItem,
@@ -30,7 +30,7 @@ define_class!(
     pub struct WindowDelegate;
 
     unsafe impl NSWindowDelegate for WindowDelegate {
-        #[unsafe(method(init))]
+        #[unsafe(method_id(init))]
         fn init(this: Allocated<Self>) -> Retained<Self> {
             let this = this.set_ivars(WindowDelegateIvars {});
             unsafe { msg_send![super(this), init] }
@@ -52,7 +52,7 @@ define_class!(
     pub struct ToolbarDelegate;
 
     unsafe impl NSToolbarDelegate for ToolbarDelegate {
-        #[unsafe(method(init))]
+        #[unsafe(method_id(init))]
         fn init(this: Allocated<Self>) -> Retained<Self> {
             let this = this.set_ivars(ToolbarDelegateIvars {});
             unsafe { msg_send![super(this), init] }

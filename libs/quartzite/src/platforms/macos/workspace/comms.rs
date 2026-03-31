@@ -27,7 +27,7 @@ define_class!(
 
     // --- NSTextViewDelegate ---
     unsafe impl NSTextViewDelegate for CommsDelegate {
-        #[unsafe(method(init))]
+        #[unsafe(method_id(init))]
         fn init(this: Allocated<Self>) -> Retained<Self> {
             let this = this.set_ivars(CommsDelegateIvars {});
             unsafe { msg_send![super(this), init] }

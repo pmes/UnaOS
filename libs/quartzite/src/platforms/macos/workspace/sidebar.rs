@@ -54,7 +54,9 @@ define_class!(
             _item: Option<&AnyObject>,
         ) -> Retained<AnyObject> {
             // For stub purposes, return a generic NSString
-            Retained::cast_unchecked::<AnyObject>(NSString::from_str("StubNode"))
+            unsafe {
+                Retained::cast_unchecked::<AnyObject>(NSString::from_str("StubNode"))
+            }
         }
 
         #[unsafe(method_id(outlineView:objectValueForTableColumn:byItem:))]
@@ -70,7 +72,7 @@ define_class!(
 
     // --- Outline View Delegate ---
     unsafe impl NSOutlineViewDelegate for SidebarDelegate {
-        #[unsafe(method(init))]
+        #[unsafe(method_id(init))]
         fn init(this: Allocated<Self>) -> Retained<Self> {
             let this = this.set_ivars(SidebarDelegateIvars {});
             unsafe { msg_send![super(this), init] }

@@ -41,7 +41,7 @@ define_class!(
     struct AppDelegate;
 
     unsafe impl NSApplicationDelegate for AppDelegate {
-        #[unsafe(method(init))]
+        #[unsafe(method_id(init))]
         fn init(this: Allocated<Self>) -> Retained<Self> {
             let this = this.set_ivars(AppDelegateIvars {
                 bootstrap: RefCell::new(None),
@@ -72,7 +72,9 @@ define_class!(
 
             // 4. Show the window
             window.makeKeyAndOrderFront(None::<&AnyObject>);
-            let _: () = msg_send![&window, center];
+            unsafe {
+                let _: () = msg_send![&window, center];
+            }
         }
 
         #[unsafe(method(applicationShouldTerminateAfterLastWindowClosed:))]
@@ -117,6 +119,8 @@ impl Backend {
         app.setDelegate(Some(ProtocolObject::from_ref(&*self.delegate)));
 
         // Hand over control to AppKit
-        unsafe { msg_send![&app, run] };
+        unsafe {
+            let _: () = msg_send![&app, run];
+        }
     }
 }
