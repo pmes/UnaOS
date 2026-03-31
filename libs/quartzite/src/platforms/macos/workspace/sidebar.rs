@@ -7,13 +7,16 @@
 // (at your option) any later version.
 
 use objc2::rc::{Allocated, Retained};
-use objc2::runtime::AnyObject;
-use objc2::{define_class, msg_send};
+use objc2::runtime::{AnyObject, ProtocolObject};
+use objc2::{define_class, msg_send, ClassType};
 use objc2_app_kit::{
     NSResponder, NSOutlineView, NSOutlineViewDelegate, NSOutlineViewDataSource,
-    NSControlTextEditingDelegate, NSTableColumn, NSView
+    NSControlTextEditingDelegate, NSTableColumn, NSView, NSScrollView
 };
-use objc2_foundation::{NSObjectProtocol, NSInteger, NSString};
+use objc2_foundation::{
+    NSObjectProtocol, NSInteger, NSString, NSRect, NSPoint, NSSize,
+    MainThreadMarker
+};
 
 // -----------------------------------------------------------------------------
 // SIDEBAR DELEGATE (LUMEN LEFT PANE)
@@ -94,3 +97,52 @@ define_class!(
 
 unsafe impl NSObjectProtocol for SidebarDelegate {}
 unsafe impl NSControlTextEditingDelegate for SidebarDelegate {}
+
+// -----------------------------------------------------------------------------
+// ASSEMBLY
+// -----------------------------------------------------------------------------
+pub fn create_sidebar(_mtm: MainThreadMarker) -> (Retained<NSView>, Retained<SidebarDelegate>) {
+    // 1. Instantiate the delegate
+    let delegate: Allocated<SidebarDelegate> = unsafe { msg_send![SidebarDelegate::class(), alloc] };
+    let delegate: Retained<SidebarDelegate> = unsafe { msg_send![delegate, init] };
+
+    // 2. Create the outline view (the actual sidebar content)
+    let frame = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(250.0, 768.0));
+    let outline_view: Allocated<NSOutlineView> = unsafe { msg_send![NSOutlineView::class(), alloc] };
+    let outline_view: Retained<NSOutlineView> = unsafe { msg_send![outline_view, initWithFrame: frame] };
+
+    // Set the delegates wrapped as protocol objects
+    unsafe {
+        outline_view.setDelegate(Some(ProtocolObject::from_ref(&*delegate)));
+        outline_view.setDataSource(Some(ProtocolObject::from_ref(&*delegate)));
+
+        // Optional: Hide the header for a cleaner sidebar look
+        outline_view.setHeaderView(None);
+
+        // Create the dummy column
+        let column: Allocated<NSTableColumn> = msg_send![NSTableColumn::class(), alloc];
+        let column_id = NSString::from_str("MainColumn");
+        let column: Retained<NSTableColumn> = msg_send![column, initWithIdentifier: &*column_id];
+        outline_view.addTableColumn(&column);
+        outline_view.setOutlineTableColumn(Some(&column));
+    }
+
+    // 3. Create the scroll view wrapper
+    let scroll_view: Allocated<NSScrollView> = unsafe { msg_send![NSScrollView::class(), alloc] };
+    let scroll_view: Retained<NSScrollView> = unsafe { msg_send![scroll_view, initWithFrame: frame] };
+
+    // Turn off automatic layout constraints
+    unsafe {
+        let _: () = msg_send![&scroll_view, setTranslatesAutoresizingMaskIntoConstraints: objc2::runtime::Bool::NO];
+    }
+
+    scroll_view.setHasVerticalScroller(true);
+    scroll_view.setHasHorizontalScroller(false);
+    scroll_view.setAutohidesScrollers(true);
+
+    // Attach the outline view to the scroll view
+    scroll_view.setDocumentView(Some(&outline_view));
+
+    // Return the scroll view as the root view of this component, and the delegate to hold state
+    (unsafe { Retained::cast_unchecked::<NSView>(scroll_view) }, delegate)
+}

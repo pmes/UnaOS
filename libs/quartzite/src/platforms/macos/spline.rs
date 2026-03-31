@@ -12,10 +12,15 @@ use std::sync::{Arc, RwLock, Mutex};
 use tokio::sync::broadcast::Receiver as BroadcastReceiver;
 use bandy::state::AppState;
 use bandy::SMessage;
-use objc2_app_kit::NSView;
-use objc2_foundation::{NSRect, NSSize};
+use objc2_app_kit::{
+    NSSplitViewController, NSSplitViewItem, NSViewController
+};
+use objc2_foundation::MainThreadMarker;
 use objc2::{msg_send, ClassType};
-use objc2::rc::Retained;
+use objc2::rc::{Retained, Allocated};
+
+use super::workspace::sidebar;
+use super::workspace::comms;
 
 // -----------------------------------------------------------------------------
 // MAC OS SPLINE
@@ -27,8 +32,8 @@ pub struct MacOSSpline {
 }
 
 struct MacOSSplineInner {
-    // Future stub: Store references to UI components we need to mutate.
-    // e.g., text views, scroll views, sidebars.
+    // Placeholder for thread-safe (Send/Sync) state. AppKit UI components MUST NOT
+    // be stored here because they cross the tokio async thread boundary.
 }
 
 impl MacOSSpline {
@@ -47,48 +52,94 @@ impl MacOSSpline {
         _workspace_tetra: &bandy::state::WorkspaceState,
     ) -> NativeView {
         // 1. Build the UI
-        let _mtm = objc2_foundation::MainThreadMarker::new().unwrap();
+        let mtm = MainThreadMarker::new().unwrap();
 
-        let root_frame = NSRect::new(
-            objc2_foundation::NSPoint::new(0.0, 0.0),
-            NSSize::new(1024.0, 768.0),
-        );
-        let root_view = unsafe {
-            let view: objc2::rc::Allocated<NSView> = msg_send![NSView::class(), alloc];
-            let view: Retained<NSView> = msg_send![view, initWithFrame: root_frame];
-            view
-        };
-        // Explicitly set autoresizing masks to false per UnaOS guidelines for the root layout
+        // Root NSSplitViewController is the master frame separating Left Pane (Sidebar) and Right Pane (Comms)
+        let svc: Allocated<NSSplitViewController> = unsafe { msg_send![NSSplitViewController::class(), alloc] };
+        let svc: Retained<NSSplitViewController> = unsafe { msg_send![svc, init] };
+
+        // Ensure split view uses safe constraints
+        let split_view = svc.splitView();
         unsafe {
-            let _: () = msg_send![&root_view, setTranslatesAutoresizingMaskIntoConstraints: objc2::runtime::Bool::NO];
+            let _: () = msg_send![&split_view, setTranslatesAutoresizingMaskIntoConstraints: objc2::runtime::Bool::NO];
         }
+
+        // --- Lumen Left Pane (Sidebar) ---
+        let (sidebar_view, sidebar_delegate) = sidebar::create_sidebar(mtm);
+        let sidebar_vc: Allocated<NSViewController> = unsafe { msg_send![NSViewController::class(), alloc] };
+        let sidebar_vc: Retained<NSViewController> = unsafe { msg_send![sidebar_vc, init] };
+        sidebar_vc.setView(&sidebar_view);
+
+        // Define as a sidebar
+        let sidebar_item: Retained<NSSplitViewItem> = unsafe { msg_send![NSSplitViewItem::class(), sidebarWithViewController: &*sidebar_vc] };
+
+        // Enforce the 250px minimum width for the left pane
+        unsafe {
+            let _: () = msg_send![&sidebar_item, setMinimumThickness: 250.0f64];
+        }
+
+        // --- Reactor Right Pane (Comms) ---
+        let (comms_view, comms_delegate) = comms::create_comms(mtm);
+        let comms_vc: Allocated<NSViewController> = unsafe { msg_send![NSViewController::class(), alloc] };
+        let comms_vc: Retained<NSViewController> = unsafe { msg_send![comms_vc, init] };
+        comms_vc.setView(&comms_view);
+
+        // Define as main content item
+        let comms_item: Retained<NSSplitViewItem> = unsafe { msg_send![NSSplitViewItem::class(), splitViewItemWithViewController: &*comms_vc] };
+
+        // Assemble the split view controller
+        svc.addSplitViewItem(&sidebar_item);
+        svc.addSplitViewItem(&comms_item);
+
+        // Prevent AppKit components from deallocation by attaching them to the root Window/run loop.
+        unsafe {
+            // Anchor split_view_controller
+            _window.setContentViewController(Some(&svc));
+
+            // To ensure the delegates outlive the current scope, associate them dynamically with the window
+            // since MacOSSplineInner traverses thread boundaries and cannot hold MainThreadOnly components.
+            // Using associated objects for the stubs is standard practice to anchor memory without globals.
+            objc2::runtime::AnyObject::set_associated_object(
+                _window,
+                sidebar_delegate.as_ptr() as *const _,
+                &sidebar_delegate,
+                objc2::runtime::AssociationPolicy::Retain
+            );
+            objc2::runtime::AnyObject::set_associated_object(
+                _window,
+                comms_delegate.as_ptr() as *const _,
+                &comms_delegate,
+                objc2::runtime::AssociationPolicy::Retain
+            );
+        }
+
+        // Extract the assembled root view
+        let root_view = svc.view();
 
         // 2. Spawn the Main Thread Router
         // Using `dispatch2` for macOS GCD to cross the Tokio async/sync boundary natively
-        // without introducing memory leaks like `block2` does.
         let spline_inner_arc = self.inner.clone();
 
         tokio::spawn(async move {
             loop {
-                // Keep the compiler happy about the unused spline_inner_arc
-                let _inner = spline_inner_arc.clone();
+                // Keep the compiler happy about the unused tx_event
                 let _tx = tx_event.clone();
 
                 match rx_synapse.recv().await {
                     Ok(msg) => {
+                        let _inner = spline_inner_arc.clone();
                         // Dispatch to Main Thread to update AppKit UI
                         dispatch2::DispatchQueue::main().exec_async(move || {
-                            // Route the SMessage to native AppKit updates
-                            // e.g., insertRowsAtIndexes:, NSTextView::setString:
+                            // SMessage Routing - Logging the pipeline connection on the main thread
                             match msg {
-                                SMessage::Matrix(_m) => {
-                                    // Handle matrix changes
+                                SMessage::Matrix(_) => {
+                                    log::info!("[MacOSSpline] SMessage::Matrix routed to main thread - Bubble Matrix layout delegated.");
                                 },
-                                SMessage::NetworkLog(_log) => {
-                                    // Update network logs
+                                SMessage::NetworkLog(_) => {
+                                    log::info!("[MacOSSpline] SMessage::NetworkLog routed to main thread.");
                                 },
                                 _ => {
-                                    // Handle other SMessages
+                                    log::info!("[MacOSSpline] Generic SMessage routed to main thread.");
                                 }
                             }
                         });
