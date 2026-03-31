@@ -8,7 +8,7 @@
 
 use objc2::rc::{Allocated, Retained};
 use objc2::runtime::AnyObject;
-use objc2::{define_class, msg_send, ClassType, DeclaredClass};
+use objc2::{define_class, msg_send};
 use objc2_app_kit::{
     NSResponder, NSOutlineView, NSOutlineViewDelegate, NSOutlineViewDataSource,
     NSControlTextEditingDelegate, NSTableColumn, NSView
@@ -25,6 +25,14 @@ define_class!(
     #[name = "UnaSidebarDelegate"]
     #[ivars = SidebarDelegateIvars]
     pub struct SidebarDelegate;
+
+    unsafe impl SidebarDelegate {
+        #[unsafe(method_id(init))]
+        fn init(this: Allocated<Self>) -> Retained<Self> {
+            let this = this.set_ivars(SidebarDelegateIvars {});
+            unsafe { msg_send![super(this), init] }
+        }
+    }
 
     // --- Outline View Data Source ---
     unsafe impl NSOutlineViewDataSource for SidebarDelegate {
@@ -72,12 +80,6 @@ define_class!(
 
     // --- Outline View Delegate ---
     unsafe impl NSOutlineViewDelegate for SidebarDelegate {
-        #[unsafe(method_id(init))]
-        fn init(this: Allocated<Self>) -> Retained<Self> {
-            let this = this.set_ivars(SidebarDelegateIvars {});
-            unsafe { msg_send![super(this), init] }
-        }
-
         #[unsafe(method_id(outlineView:viewForTableColumn:item:))]
         fn outline_view_view_for_table_column_item(
             &self,

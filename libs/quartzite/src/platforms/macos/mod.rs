@@ -40,7 +40,7 @@ define_class!(
     #[ivars = AppDelegateIvars]
     struct AppDelegate;
 
-    unsafe impl NSApplicationDelegate for AppDelegate {
+    unsafe impl AppDelegate {
         #[unsafe(method_id(init))]
         fn init(this: Allocated<Self>) -> Retained<Self> {
             let this = this.set_ivars(AppDelegateIvars {
@@ -51,7 +51,9 @@ define_class!(
             });
             unsafe { msg_send![super(this), init] }
         }
+    }
 
+    unsafe impl NSApplicationDelegate for AppDelegate {
         #[unsafe(method(applicationDidFinishLaunching:))]
         fn application_did_finish_launching(&self, _notification: &AnyObject) {
             let mtm = MainThreadMarker::from(self);

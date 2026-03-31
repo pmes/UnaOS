@@ -7,8 +7,8 @@
 // (at your option) any later version.
 
 use objc2::rc::{Allocated, Retained};
-use objc2::runtime::{AnyObject, ProtocolObject};
-use objc2::{define_class, msg_send, ClassType, DeclaredClass, MainThreadOnly};
+use objc2::runtime::ProtocolObject;
+use objc2::{define_class, msg_send, ClassType, MainThreadOnly};
 use objc2_app_kit::{
     NSResponder, NSWindow, NSWindowDelegate, NSToolbar, NSToolbarDelegate,
     NSWindowStyleMask, NSBackingStoreType, NSToolbarItemIdentifier, NSToolbarItem
@@ -26,13 +26,15 @@ define_class!(
     #[ivars = WindowDelegateIvars]
     pub struct WindowDelegate;
 
-    unsafe impl NSWindowDelegate for WindowDelegate {
+    unsafe impl WindowDelegate {
         #[unsafe(method_id(init))]
         fn init(this: Allocated<Self>) -> Retained<Self> {
             let this = this.set_ivars(WindowDelegateIvars {});
             unsafe { msg_send![super(this), init] }
         }
     }
+
+    unsafe impl NSWindowDelegate for WindowDelegate {}
 );
 
 unsafe impl NSObjectProtocol for WindowDelegate {}
@@ -48,13 +50,15 @@ define_class!(
     #[ivars = ToolbarDelegateIvars]
     pub struct ToolbarDelegate;
 
-    unsafe impl NSToolbarDelegate for ToolbarDelegate {
+    unsafe impl ToolbarDelegate {
         #[unsafe(method_id(init))]
         fn init(this: Allocated<Self>) -> Retained<Self> {
             let this = this.set_ivars(ToolbarDelegateIvars {});
             unsafe { msg_send![super(this), init] }
         }
+    }
 
+    unsafe impl NSToolbarDelegate for ToolbarDelegate {
         #[unsafe(method_id(toolbarAllowedItemIdentifiers:))]
         fn toolbar_allowed_item_identifiers(&self, _toolbar: &NSToolbar) -> Retained<NSArray<NSToolbarItemIdentifier>> {
             NSArray::new()

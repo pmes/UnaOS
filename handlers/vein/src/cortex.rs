@@ -14,7 +14,7 @@
 // You should have received a copy of the GNU Lesser General Public License
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-use bandy::{MatrixEvent, SMessage, SpatialEdge, SpatialNode};
+use bandy::{SMessage, SpatialEdge, SpatialNode};
 use crate::skeleton::SkeletonGenerator;
 use gneiss_pal::io::MemoryMappedRegion;
 use log::info;

@@ -7,7 +7,7 @@
 // (at your option) any later version.
 
 use objc2::rc::{Allocated, Retained};
-use objc2::{define_class, msg_send, ClassType, DeclaredClass};
+use objc2::{define_class, msg_send};
 use objc2_app_kit::{
     NSResponder, NSTextView, NSTextViewDelegate, NSTextDelegate
 };
@@ -24,14 +24,16 @@ define_class!(
     #[ivars = CommsDelegateIvars]
     pub struct CommsDelegate;
 
-    // --- NSTextViewDelegate ---
-    unsafe impl NSTextViewDelegate for CommsDelegate {
+    unsafe impl CommsDelegate {
         #[unsafe(method_id(init))]
         fn init(this: Allocated<Self>) -> Retained<Self> {
             let this = this.set_ivars(CommsDelegateIvars {});
             unsafe { msg_send![super(this), init] }
         }
+    }
 
+    // --- NSTextViewDelegate ---
+    unsafe impl NSTextViewDelegate for CommsDelegate {
         #[unsafe(method(textView:doCommandBySelector:))]
         fn text_view_do_command_by_selector(
             &self,
