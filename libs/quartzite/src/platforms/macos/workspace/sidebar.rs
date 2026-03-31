@@ -26,7 +26,7 @@ define_class!(
     #[ivars = SidebarDelegateIvars]
     pub struct SidebarDelegate;
 
-    unsafe impl SidebarDelegate {
+    impl SidebarDelegate {
         #[unsafe(method_id(init))]
         fn init(this: Allocated<Self>) -> Retained<Self> {
             let this = this.set_ivars(SidebarDelegateIvars {});

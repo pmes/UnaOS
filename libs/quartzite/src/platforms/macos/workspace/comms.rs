@@ -24,7 +24,7 @@ define_class!(
     #[ivars = CommsDelegateIvars]
     pub struct CommsDelegate;
 
-    unsafe impl CommsDelegate {
+    impl CommsDelegate {
         #[unsafe(method_id(init))]
         fn init(this: Allocated<Self>) -> Retained<Self> {
             let this = this.set_ivars(CommsDelegateIvars {});

@@ -40,7 +40,7 @@ define_class!(
     #[ivars = AppDelegateIvars]
     struct AppDelegate;
 
-    unsafe impl AppDelegate {
+    impl AppDelegate {
         #[unsafe(method_id(init))]
         fn init(this: Allocated<Self>) -> Retained<Self> {
             let this = this.set_ivars(AppDelegateIvars {

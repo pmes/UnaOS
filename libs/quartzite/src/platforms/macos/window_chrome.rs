@@ -26,7 +26,7 @@ define_class!(
     #[ivars = WindowDelegateIvars]
     pub struct WindowDelegate;
 
-    unsafe impl WindowDelegate {
+    impl WindowDelegate {
         #[unsafe(method_id(init))]
         fn init(this: Allocated<Self>) -> Retained<Self> {
             let this = this.set_ivars(WindowDelegateIvars {});
@@ -50,7 +50,7 @@ define_class!(
     #[ivars = ToolbarDelegateIvars]
     pub struct ToolbarDelegate;
 
-    unsafe impl ToolbarDelegate {
+    impl ToolbarDelegate {
         #[unsafe(method_id(init))]
         fn init(this: Allocated<Self>) -> Retained<Self> {
             let this = this.set_ivars(ToolbarDelegateIvars {});
