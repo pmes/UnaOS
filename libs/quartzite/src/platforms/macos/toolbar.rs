@@ -2,13 +2,12 @@
 // Copyright (C) 2026 The Architect & Una
 
 use core::cell::RefCell;
-use objc2::{
+use objc2::{ProtocolObject,
     define_class, msg_send,
     ClassType,
     DefinedClass,
     MainThreadOnly,
-    Allocated,
-    rc::Retained,
+    rc::{Allocated, Retained},
 };
 use objc2_foundation::{
     NSString,
@@ -38,21 +37,21 @@ define_class!(
     unsafe impl NSObjectProtocol for ToolbarDelegate {}
 
     unsafe impl NSToolbarDelegate for ToolbarDelegate {
-        #[unsafe(method(toolbarDefaultItemIdentifiers:))]
+        #[unsafe(method_id(toolbarDefaultItemIdentifiers:))]
         fn default_item_identifiers(&self, _toolbar: &NSToolbar) -> Retained<NSArray> {
             unsafe {
                 NSArray::from_slice(&[NSToolbarFlexibleSpaceItemIdentifier])
             }
         }
 
-        #[unsafe(method(toolbarAllowedItemIdentifiers:))]
+        #[unsafe(method_id(toolbarAllowedItemIdentifiers:))]
         fn allowed_item_identifiers(&self, _toolbar: &NSToolbar) -> Retained<NSArray> {
             unsafe {
                 NSArray::from_slice(&[NSToolbarFlexibleSpaceItemIdentifier])
             }
         }
 
-        #[unsafe(method(toolbar:itemForItemIdentifier:willBeInsertedIntoToolbar:))]
+        #[unsafe(method_id(toolbar:itemForItemIdentifier:willBeInsertedIntoToolbar:))]
         fn toolbar_item(&self, _toolbar: &NSToolbar, item_identifier: &NSString, _flag: bool) -> Option<Retained<NSToolbarItem>> {
             let alloc: Allocated<NSToolbarItem> = unsafe { msg_send![NSToolbarItem::class(), alloc] };
             let item: Retained<NSToolbarItem> = unsafe { msg_send![alloc, initWithItemIdentifier: item_identifier] };
@@ -78,7 +77,7 @@ pub fn build_toolbar(window: &NSWindow, tx_event: async_channel::Sender<crate::E
 
     let delegate = ToolbarDelegate::new(tx_event);
     unsafe {
-        toolbar.setDelegate(Some(delegate.as_ref()));
+        toolbar.setDelegate(Some(ProtocolObject::from_ref(&*delegate)));
         window.setToolbar(Some(&toolbar));
     }
 

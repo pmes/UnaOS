@@ -14,9 +14,9 @@
 // You should have received a copy of the GNU Lesser General Public License
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, RwLock, Mutex};
 
-use objc2::rc::Retained;
+use objc2::rc::{Allocated, Retained};
 use objc2_app_kit::{NSView, NSWindow, NSSplitViewController};
 
 use async_channel;
@@ -37,22 +37,22 @@ use super::toolbar::ToolbarDelegate;
 pub struct MacOSSpline {
     // Keep alive references to our strong objects so they don't drop
     // and cause dangling pointers in AppKit delegates.
-    toolbar_delegate: Option<Retained<ToolbarDelegate>>,
-    split_controller: Option<Retained<NSSplitViewController>>,
+    toolbar_delegate: Mutex<Option<Retained<ToolbarDelegate>>>,
+    split_controller: Mutex<Option<Retained<NSSplitViewController>>>,
 }
 
 impl MacOSSpline {
     pub fn new() -> Self {
         Self {
-            toolbar_delegate: None,
-            split_controller: None,
+            toolbar_delegate: Mutex::new(None),
+            split_controller: Mutex::new(None),
         }
     }
 
     /// The single entry point to build the UI hierarchy on macOS.
     /// This is invoked inside `applicationDidFinishLaunching:`
     pub fn bootstrap(
-        &mut self,
+        &self,
         window: &NSWindow,
         tx_event: async_channel::Sender<Event>,
         app_state: Arc<RwLock<AppState>>,
@@ -68,11 +68,15 @@ impl MacOSSpline {
             rx_synapse,
             workspace_tetra,
         );
-        self.split_controller = Some(split_controller);
+        if let Ok(mut sc) = self.split_controller.lock() {
+            *sc = Some(split_controller);
+        }
 
         // 2. Build and attach the Toolbar
         let toolbar_delegate = build_toolbar(window, tx_event);
-        self.toolbar_delegate = Some(toolbar_delegate);
+        if let Ok(mut td) = self.toolbar_delegate.lock() {
+            *td = Some(toolbar_delegate);
+        }
 
         // 3. We return `root_view` to set as `contentView`.
 

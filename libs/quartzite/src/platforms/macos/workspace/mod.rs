@@ -6,11 +6,10 @@ pub mod comms;
 
 use std::sync::{Arc, RwLock};
 
-use objc2::{
+use objc2::{ProtocolObject,
     msg_send,
     ClassType,
-    Allocated,
-    rc::Retained,
+    rc::{Allocated, Retained},
 };
 use objc2_foundation::{NSRect, NSPoint, NSSize, NSArray};
 use objc2_app_kit::{

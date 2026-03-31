@@ -4,13 +4,12 @@
 use core::cell::RefCell;
 use std::sync::{Arc, Mutex};
 
-use objc2::{
+use objc2::{ProtocolObject,
     define_class, msg_send,
     ClassType,
     DefinedClass,
     MainThreadOnly,
-    Allocated,
-    rc::Retained,
+    rc::{Allocated, Retained},
 };
 use objc2_foundation::{
     NSString,
@@ -71,7 +70,7 @@ define_class!(
             }
         }
 
-        #[unsafe(method(outlineView:child:ofItem:))]
+        #[unsafe(method_id(outlineView:child:ofItem:))]
         fn outline_view_child_of_item(&self, _outline_view: &NSOutlineView, index: isize, item: Option<&NSObject>) -> Retained<NSObject> {
             if item.is_none() {
                 // Root item, return a dummy NSObject representing the item
@@ -119,7 +118,7 @@ define_class!(
     unsafe impl NSControlTextEditingDelegate for SidebarDelegate {}
 
     unsafe impl NSOutlineViewDelegate for SidebarDelegate {
-        #[unsafe(method(outlineView:viewForTableColumn:item:))]
+        #[unsafe(method_id(outlineView:viewForTableColumn:item:))]
         fn outline_view_view_for_table_column_item(&self, _outline_view: &NSOutlineView, _table_column: Option<&NSTableColumn>, item: &NSObject) -> Option<Retained<NSView>> {
             // Reconstruct the text
             let text = unsafe { Retained::cast_unchecked::<NSString>(item.retain()) };
@@ -222,15 +221,15 @@ pub fn build_sidebar(mut rx_synapse: BroadcastReceiver<SMessage>) -> (Retained<N
     let delegate = SidebarDelegate::new();
 
     unsafe {
-        outline_view.setDataSource(Some(data_source.as_ref()));
-        outline_view.setDelegate(Some(delegate.as_ref()));
+        outline_view.setDataSource(Some(ProtocolObject::from_ref(&*data_source)));
+        outline_view.setDelegate(Some(ProtocolObject::from_ref(&*delegate)));
     }
 
     let vc = SidebarViewController::new();
     *vc.ivars().outline_delegate.borrow_mut() = Some(delegate);
     *vc.ivars().outline_data_source.borrow_mut() = Some(data_source.clone());
     unsafe {
-        vc.setView(Some(&scroll_view));
+        vc.setView(&scroll_view);
     }
 
     // Keep an independent strong reference for the background task to use

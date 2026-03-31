@@ -21,13 +21,12 @@ pub mod workspace;
 use core::cell::RefCell;
 use core::ptr;
 
-use objc2::{
+use objc2::{ProtocolObject,
     define_class, msg_send,
     ClassType,
     DefinedClass,
     MainThreadOnly,
-    Allocated,
-    rc::Retained,
+    rc::{Allocated, Retained},
 };
 use objc2_foundation::{
     MainThreadMarker,
@@ -38,16 +37,19 @@ use objc2_foundation::{
     NSRect, NSSize, NSPoint,
 };
 use objc2_app_kit::{
+    NSApplicationActivationPolicy,
+    NSWindowStyleMask,
+    NSBackingStoreType,
     NSApplication,
     NSApplicationDelegate,
-    NSApplicationActivationPolicyRegular,
+    NSApplicationActivationPolicy::Regular,
     NSWindow,
-    NSWindowStyleMaskTitled,
-    NSWindowStyleMaskClosable,
-    NSWindowStyleMaskResizable,
-    NSWindowStyleMaskMiniaturizable,
-    NSWindowStyleMaskFullSizeContentView,
-    NSBackingStoreBuffered,
+    NSWindowStyleMask::Titled,
+    NSWindowStyleMask::Closable,
+    NSWindowStyleMask::Resizable,
+    NSWindowStyleMask::Miniaturizable,
+    NSWindowStyleMask::FullSizeContentView,
+    NSBackingStoreType::Buffered,
     NSView,
     NSResponder,
 };
@@ -73,11 +75,11 @@ define_class!(
 
             // Create window
             let window: Allocated<NSWindow> = unsafe { msg_send![NSWindow::class(), alloc] };
-            let style_mask = NSWindowStyleMaskTitled
-                | NSWindowStyleMaskClosable
-                | NSWindowStyleMaskResizable
-                | NSWindowStyleMaskMiniaturizable
-                | NSWindowStyleMaskFullSizeContentView;
+            let style_mask = NSWindowStyleMask::Titled
+                | NSWindowStyleMask::Closable
+                | NSWindowStyleMask::Resizable
+                | NSWindowStyleMask::Miniaturizable
+                | NSWindowStyleMask::FullSizeContentView;
 
             let rect = NSRect {
                 origin: NSPoint { x: 0.0, y: 0.0 },
@@ -89,7 +91,7 @@ define_class!(
                     window,
                     initWithContentRect: rect,
                     styleMask: style_mask,
-                    backing: NSBackingStoreBuffered,
+                    backing: NSBackingStoreType::Buffered,
                     defer: false
                 ]
             };
@@ -141,12 +143,12 @@ pub fn run_macos_app(bootstrap: impl FnOnce(&NSWindow) -> Retained<NSView> + 'st
 
     // Set activation policy
     unsafe {
-        msg_send![&app, setActivationPolicy: NSApplicationActivationPolicyRegular];
+        msg_send![&app, setActivationPolicy: NSApplicationActivationPolicy::Regular];
     }
 
     let delegate = AppDelegate::new(bootstrap, mtm);
     unsafe {
-        app.setDelegate(Some(delegate.as_ref()));
+        app.setDelegate(Some(ProtocolObject::from_ref(&*delegate)));
         app.run();
     }
 }

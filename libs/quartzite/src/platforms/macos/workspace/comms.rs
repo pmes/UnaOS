@@ -3,13 +3,12 @@
 
 use core::cell::RefCell;
 
-use objc2::{
+use objc2::{ProtocolObject,
     define_class, msg_send,
     ClassType,
     DefinedClass,
     MainThreadOnly,
-    Allocated,
-    rc::Retained,
+    rc::{Allocated, Retained},
 };
 use objc2_foundation::{
     NSObject,
@@ -97,7 +96,7 @@ pub fn build_comms_pane() -> (Retained<NSView>, Retained<CommsViewController>) {
         scroll_view.setHasVerticalScroller(true);
         scroll_view.setDocumentView(Some(&text_view));
 
-        text_view.setDelegate(Some(delegate.as_ref()));
+        text_view.setDelegate(Some(ProtocolObject::from_ref(&*delegate)));
 
         root_view.addSubview(&scroll_view);
 
@@ -151,7 +150,7 @@ pub fn build_comms_pane() -> (Retained<NSView>, Retained<CommsViewController>) {
     let vc = CommsViewController::new();
     *vc.ivars().comms_delegate.borrow_mut() = Some(delegate);
     unsafe {
-        vc.setView(Some(&root_view));
+        vc.setView(&root_view);
     }
 
     (root_view, vc)
