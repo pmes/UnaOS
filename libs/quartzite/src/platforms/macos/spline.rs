@@ -106,6 +106,10 @@ impl MacOSSpline {
         // Using `dispatch2` for macOS GCD to cross the Tokio async/sync boundary natively
         let spline_inner_arc = self.inner.clone();
 
+        // Wrap comms_delegate in MainThreadBound so it can cross thread boundaries safely.
+        // It strictly requires `Send` to be moved into tokio::spawn.
+        let comms_delegate_bound = Arc::new(objc2::MainThreadBound::new(comms_delegate.clone(), mtm));
+
         tokio::spawn(async move {
             loop {
                 // Keep the compiler happy about the unused tx_event
@@ -114,12 +118,28 @@ impl MacOSSpline {
                 match rx_synapse.recv().await {
                     Ok(msg) => {
                         let _inner = spline_inner_arc.clone();
+
+                        // MainThreadBound requires mutability or consuming it to get the inner value.
+                        // We clone the Arc around the bound instance.
+                        let comms_bound = comms_delegate_bound.clone();
+
                         // Dispatch to Main Thread to update AppKit UI
                         dispatch2::DispatchQueue::main().exec_async(move || {
                             // SMessage Routing - Logging the pipeline connection on the main thread
+                            let mtm = MainThreadMarker::new().unwrap();
+                            let comms_delegate = comms_bound.get(mtm);
+
                             match msg {
-                                SMessage::Matrix(_) => {
+                                SMessage::Matrix(item) => {
                                     log::info!("[MacOSSpline] SMessage::Matrix routed to main thread - Bubble Matrix layout delegated.");
+                                    use objc2::DefinedClass;
+                                    if let (Some(doc_view), Some(stack_view)) = (
+                                        comms_delegate.ivars().doc_view.borrow().as_ref(),
+                                        comms_delegate.ivars().stack_view.borrow().as_ref()
+                                    ) {
+                                        let is_user = item.sender == "Architect";
+                                        let _ = comms::append_bubble(doc_view, stack_view, &item.content, is_user);
+                                    }
                                 },
                                 SMessage::NetworkLog(_) => {
                                     log::info!("[MacOSSpline] SMessage::NetworkLog routed to main thread.");

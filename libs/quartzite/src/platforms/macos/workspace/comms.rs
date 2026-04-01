@@ -105,7 +105,10 @@ define_class!(
 // -----------------------------------------------------------------------------
 // COMMS DELEGATE (LUMEN REACTOR CHAT)
 // -----------------------------------------------------------------------------
-pub struct CommsDelegateIvars {}
+pub struct CommsDelegateIvars {
+    pub doc_view: RefCell<Option<Retained<FlippedDocumentView>>>,
+    pub stack_view: RefCell<Option<Retained<NSStackView>>>,
+}
 
 define_class!(
     #[unsafe(super(NSResponder))]
@@ -116,7 +119,10 @@ define_class!(
     impl CommsDelegate {
         #[unsafe(method_id(init))]
         fn init(this: Allocated<Self>) -> Retained<Self> {
-            let this = this.set_ivars(CommsDelegateIvars {});
+            let this = this.set_ivars(CommsDelegateIvars {
+                doc_view: RefCell::new(None),
+                stack_view: RefCell::new(None),
+            });
             unsafe { msg_send![super(this), init] }
         }
     }
@@ -321,6 +327,10 @@ pub fn create_comms(_mtm: MainThreadMarker, app_state: &Arc<RwLock<AppState>>) -
 
     doc_view.addSubview(&stack_view);
 
+    // Anchor views into delegate
+    *delegate.ivars().doc_view.borrow_mut() = Some(doc_view.clone());
+    *delegate.ivars().stack_view.borrow_mut() = Some(stack_view.clone());
+
     // Anchor NSStackView to FlippedDocumentView
     unsafe {
         let stack_constraints = NSArray::from_slice(&[
@@ -486,7 +496,7 @@ pub fn create_comms(_mtm: MainThreadMarker, app_state: &Arc<RwLock<AppState>>) -
             ),
         ])
     };
-        NSLayoutConstraint::activateConstraints(&symbol_constraints);
+    NSLayoutConstraint::activateConstraints(&symbol_constraints);
 
     // 6. The Input Horizontal Stack
     let input_stack: Allocated<NSStackView> = unsafe { msg_send![NSStackView::class(), alloc] };
