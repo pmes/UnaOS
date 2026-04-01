@@ -108,7 +108,14 @@ impl MacOSSpline {
 
         // Wrap comms_delegate in MainThreadBound so it can cross thread boundaries safely.
         // It strictly requires `Send` to be moved into tokio::spawn.
-        let comms_delegate_bound = Arc::new(objc2::MainThreadBound::new(comms_delegate.clone(), mtm));
+        let comms_delegate_bound = Arc::new(dispatch2::MainThreadBound::new(comms_delegate.clone(), mtm));
+
+        // Get initial history seq to calculate delta
+        let mut last_history_seq = {
+            let st = _app_state.read().unwrap();
+            st.history_seq
+        };
+        let app_state_clone = _app_state.clone();
 
         tokio::spawn(async move {
             loop {
@@ -118,37 +125,72 @@ impl MacOSSpline {
                 match rx_synapse.recv().await {
                     Ok(msg) => {
                         let _inner = spline_inner_arc.clone();
-
-                        // MainThreadBound requires mutability or consuming it to get the inner value.
-                        // We clone the Arc around the bound instance.
                         let comms_bound = comms_delegate_bound.clone();
 
-                        // Dispatch to Main Thread to update AppKit UI
-                        dispatch2::DispatchQueue::main().exec_async(move || {
-                            // SMessage Routing - Logging the pipeline connection on the main thread
-                            let mtm = MainThreadMarker::new().unwrap();
-                            let comms_delegate = comms_bound.get(mtm);
+                        match msg {
+                            SMessage::StateInvalidated => {
+                                // Extract the history delta from AppState safely
+                                let new_history_seq;
+                                let mut history_delta = Vec::new();
 
-                            match msg {
-                                SMessage::Matrix(item) => {
-                                    log::info!("[MacOSSpline] SMessage::Matrix routed to main thread - Bubble Matrix layout delegated.");
-                                    use objc2::DefinedClass;
-                                    if let (Some(doc_view), Some(stack_view)) = (
-                                        comms_delegate.ivars().doc_view.borrow().as_ref(),
-                                        comms_delegate.ivars().stack_view.borrow().as_ref()
-                                    ) {
-                                        let is_user = item.sender == "Architect";
-                                        let _ = comms::append_bubble(doc_view, stack_view, &item.content, is_user);
+                                {
+                                    let st = app_state_clone.read().unwrap();
+                                    new_history_seq = st.history_seq;
+
+                                    // Handle full state rollbacks/clears gracefully
+                                    if new_history_seq < last_history_seq {
+                                        last_history_seq = 0;
                                     }
-                                },
-                                SMessage::NetworkLog(_) => {
-                                    log::info!("[MacOSSpline] SMessage::NetworkLog routed to main thread.");
-                                },
-                                _ => {
-                                    log::info!("[MacOSSpline] Generic SMessage routed to main thread.");
+
+                                    let h_delta_count = st.history_seq.saturating_sub(last_history_seq);
+                                    if h_delta_count > 0 {
+                                        let delta_items = if h_delta_count >= st.history.len() {
+                                            st.history.iter().cloned().collect::<Vec<_>>()
+                                        } else {
+                                            st.history.iter().skip(st.history.len() - h_delta_count).cloned().collect::<Vec<_>>()
+                                        };
+
+                                        // Filter only chat items to render inside Comms
+                                        history_delta = delta_items.into_iter().filter(|item| item.is_chat).collect();
+                                    }
+                                } // Drop AppState read lock BEFORE hopping to the Main Thread
+
+                                last_history_seq = new_history_seq;
+                                if !history_delta.is_empty() {
+
+                                    dispatch2::DispatchQueue::main().exec_async(move || {
+                                        let mtm = MainThreadMarker::new().unwrap();
+                                        let comms_delegate = comms_bound.get(mtm);
+                                        use objc2::DefinedClass;
+
+                                        if let (Some(doc_view), Some(stack_view)) = (
+                                            comms_delegate.ivars().doc_view.borrow().as_ref(),
+                                            comms_delegate.ivars().stack_view.borrow().as_ref()
+                                        ) {
+                                            for item in history_delta {
+                                                let is_user = item.sender == "Architect";
+                                                let _ = comms::append_bubble(doc_view, stack_view, &item.content, is_user);
+                                            }
+                                        }
+                                    });
                                 }
+                            },
+                            SMessage::NetworkLog(_) => {
+                                dispatch2::DispatchQueue::main().exec_async(move || {
+                                    log::info!("[MacOSSpline] SMessage::NetworkLog routed to main thread.");
+                                });
+                            },
+                            SMessage::Matrix(_) => {
+                                dispatch2::DispatchQueue::main().exec_async(move || {
+                                    log::info!("[MacOSSpline] SMessage::Matrix routed to main thread.");
+                                });
+                            },
+                            _ => {
+                                dispatch2::DispatchQueue::main().exec_async(move || {
+                                    log::info!("[MacOSSpline] Generic SMessage routed to main thread.");
+                                });
                             }
-                        });
+                        }
                     }
                     Err(_) => break, // Channel closed or lagged
                 }
