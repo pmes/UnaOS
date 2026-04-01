@@ -188,10 +188,10 @@ pub fn append_bubble(
         } else {
             // System/Memory Payload (GTK Expander Port)
             display_text.push_str(&format!("▶ {} | {} | {}\n", sender, subject, timestamp));
-            let preview = if content.len() > 100 {
-                format!("{}...", &content[..100])
-            } else {
-                content.to_string()
+            // Safely find the byte index of the 100th character
+            let preview = match content.char_indices().nth(100) {
+                Some((idx, _)) => format!("{}...", &content[..idx]),
+                None => content.to_string(),
             };
             display_text.push_str(&preview);
         }
