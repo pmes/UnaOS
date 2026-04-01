@@ -136,7 +136,7 @@ impl MacOSSpline {
                                             // Porting your GTK chat filter
                                             let is_chat = record.subject.eq_ignore_ascii_case("chat") || record.subject.eq_ignore_ascii_case("comms");
 
-                                            let _ = comms::append_bubble(
+                                            let _ = crate::platforms::macos::workspace::matrix_bubble::append_bubble(
                                                 doc_view,
                                                 stack_view,
                                                 &record.content,
