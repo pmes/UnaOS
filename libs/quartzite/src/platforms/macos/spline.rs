@@ -185,9 +185,9 @@ impl MacOSSpline {
                                     log::info!("[MacOSSpline] SMessage::Matrix routed to main thread.");
                                 });
                             },
-                            _ => {
+                            msg => {
                                 dispatch2::DispatchQueue::main().exec_async(move || {
-                                    log::info!("[MacOSSpline] Generic SMessage routed to main thread.");
+                                    log::info!("[MacOSSpline] Unhandled SMessage variant: {:?}", msg);
                                 });
                             }
                         }
