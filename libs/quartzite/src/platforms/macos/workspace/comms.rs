@@ -150,22 +150,68 @@ unsafe impl NSSplitViewDelegate for CommsDelegate {}
 pub fn append_bubble(
     doc_view: &Retained<FlippedDocumentView>,
     stack_view: &Retained<NSStackView>,
-    text: &str,
+    content: &str,
+    sender: &str,
+    subject: &str,
+    timestamp: &str,
+    is_chat: bool,
     is_user: bool,
 ) -> Retained<NSView> {
     unsafe {
+        // --- GTK PATTERN PORT: TRUNCATION & FORMATTING ---
+        let mut display_text = String::new();
+
+        if is_chat {
+            let explicit_lines = content.trim_end().lines().count();
+            let is_long_message = content.len() > 500 || explicit_lines > 7;
+
+            if is_long_message {
+                let mut byte_idx = 0;
+                let mut line_count = 0;
+                for (idx, c) in content.char_indices() {
+                    if c == '\n' { line_count += 1; }
+                    if line_count >= 7 || idx >= 500 {
+                        byte_idx = idx;
+                        break;
+                    }
+                    byte_idx = idx + c.len_utf8();
+                }
+                if byte_idx < content.len() {
+                    display_text.push_str(&content[..byte_idx]);
+                    display_text.push_str("\n... [Truncated - Expansion Pending]");
+                } else {
+                    display_text.push_str(content);
+                }
+            } else {
+                display_text.push_str(content);
+            }
+        } else {
+            // System/Memory Payload (GTK Expander Port)
+            display_text.push_str(&format!("▶ {} | {} | {}\n", sender, subject, timestamp));
+            let preview = if content.len() > 100 {
+                format!("{}...", &content[..100])
+            } else {
+                content.to_string()
+            };
+            display_text.push_str(&preview);
+        }
+
         // 1. Create the Bubble Container (NSBox)
         let bubble: Allocated<NSBox> = msg_send![NSBox::class(), alloc];
         let bubble: Retained<NSBox> = msg_send![bubble, initWithFrame: NSRect::new(NSPoint::new(0., 0.), NSSize::new(100., 30.))];
         let _: () = msg_send![&bubble, setTranslatesAutoresizingMaskIntoConstraints: objc2::runtime::Bool::NO];
 
-        // NSBoxCustom = 4, NSNoBorder = 0
-        let _: () = msg_send![&bubble, setBoxType: 4isize];
-        let _: () = msg_send![&bubble, setBorderType: 0isize];
+        let _: () = msg_send![&bubble, setBoxType: 4isize]; // NSBoxCustom
+        let _: () = msg_send![&bubble, setBorderType: 0isize]; // NSNoBorder
         let _: () = msg_send![&bubble, setCornerRadius: 8.0f64];
         let _: () = msg_send![&bubble, setTitlePosition: 0isize]; // NSNoTitle
 
-        let color = if is_user { NSColor::systemBlueColor() } else { NSColor::systemGrayColor() };
+        // GTK Color Segregation
+        let color = if is_chat {
+            if is_user { NSColor::systemBlueColor() } else { NSColor::systemGrayColor() }
+        } else {
+            NSColor::windowBackgroundColor() // System messages get a dim/native background
+        };
         let _: () = msg_send![&bubble, setFillColor: &*color];
 
         // 2. Create the NSTextField
@@ -173,12 +219,13 @@ pub fn append_bubble(
         let text_field: Retained<NSTextField> = msg_send![text_field, initWithFrame: NSRect::new(NSPoint::new(0., 0.), NSSize::new(100., 30.))];
         let _: () = msg_send![&text_field, setTranslatesAutoresizingMaskIntoConstraints: objc2::runtime::Bool::NO];
 
-        text_field.setStringValue(&NSString::from_str(text));
+        text_field.setStringValue(&NSString::from_str(&display_text));
         let _: () = msg_send![&text_field, setEditable: objc2::runtime::Bool::NO];
         let _: () = msg_send![&text_field, setSelectable: objc2::runtime::Bool::YES];
         let _: () = msg_send![&text_field, setBordered: objc2::runtime::Bool::NO];
         let _: () = msg_send![&text_field, setDrawsBackground: objc2::runtime::Bool::NO];
-        let text_color = if is_user { NSColor::whiteColor() } else { NSColor::labelColor() };
+
+        let text_color = if is_chat && is_user { NSColor::whiteColor() } else { NSColor::labelColor() };
         text_field.setTextColor(Some(&text_color));
 
         // Enable word wrapping
@@ -214,21 +261,18 @@ pub fn append_bubble(
         stack_view.addView_inGravity(&bubble, NSStackViewGravity::Top);
 
         // 5. Build X-Axis Constraints (Matrix Staggered)
-        // 75% Max Width Constraint (relative to Document View width minus padding)
         let doc_view_nsview = Retained::cast_unchecked::<NSView>(doc_view.clone());
         let max_width = NSLayoutConstraint::constraintWithItem_attribute_relatedBy_toItem_attribute_multiplier_constant(
             &bubble, NSLayoutAttribute::Width, NSLayoutRelation::LessThanOrEqual,
-            Some(&doc_view_nsview), NSLayoutAttribute::Width, 0.75, -32.0 // minus 16pt left + 16pt right theoretical padding
+            Some(&doc_view_nsview), NSLayoutAttribute::Width, 0.75, -32.0
         );
 
         let stagger_x = if is_user {
-            // User: Anchor Trailing (Right side)
             NSLayoutConstraint::constraintWithItem_attribute_relatedBy_toItem_attribute_multiplier_constant(
                 &bubble, NSLayoutAttribute::Trailing, NSLayoutRelation::Equal,
                 Some(&doc_view_nsview), NSLayoutAttribute::Trailing, 1.0, -16.0
             )
         } else {
-            // AI: Anchor Leading (Left side)
             NSLayoutConstraint::constraintWithItem_attribute_relatedBy_toItem_attribute_multiplier_constant(
                 &bubble, NSLayoutAttribute::Leading, NSLayoutRelation::Equal,
                 Some(&doc_view_nsview), NSLayoutAttribute::Leading, 1.0, 16.0
@@ -238,14 +282,13 @@ pub fn append_bubble(
         let staggered_constraints = NSArray::from_slice(&[&*max_width, &*stagger_x]);
 
         // 6. Build X-Axis Constraints (Single-Column)
-        // Unified Leading Anchor for both User and AI
         let single_x = NSLayoutConstraint::constraintWithItem_attribute_relatedBy_toItem_attribute_multiplier_constant(
             &bubble, NSLayoutAttribute::Leading, NSLayoutRelation::Equal,
             Some(&doc_view_nsview), NSLayoutAttribute::Leading, 1.0, 16.0
         );
         let single_max_width = NSLayoutConstraint::constraintWithItem_attribute_relatedBy_toItem_attribute_multiplier_constant(
             &bubble, NSLayoutAttribute::Width, NSLayoutRelation::LessThanOrEqual,
-            Some(&doc_view_nsview), NSLayoutAttribute::Width, 1.0, -32.0 // Allow full width minus padding
+            Some(&doc_view_nsview), NSLayoutAttribute::Width, 1.0, -32.0
         );
         let single_column_constraints = NSArray::from_slice(&[&*single_max_width, &*single_x]);
 
@@ -384,7 +427,7 @@ pub fn create_comms(_mtm: MainThreadMarker, app_state: &Arc<RwLock<AppState>>) -
     // Inject historical bubbles into the Matrix
     for item in history_items {
         let is_user = item.sender == "Architect";
-        append_bubble(&doc_view, &stack_view, &item.content, is_user);
+        append_bubble(&doc_view, &stack_view, &item.content, &item.sender, "Chat", &item.timestamp, item.is_chat, is_user);
     }
 
     // Ensure the document view bounds the stack view at the bottom so it doesn't clip
