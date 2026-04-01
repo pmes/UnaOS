@@ -10,12 +10,73 @@ use objc2::rc::{Allocated, Retained};
 use objc2::{define_class, msg_send, ClassType, DefinedClass};
 use objc2_app_kit::{
     NSView, NSLayoutConstraint, NSLayoutAttribute, NSLayoutRelation,
-    NSTextField, NSColor, NSStackView, NSStackViewGravity, NSBox
+    NSTextField, NSColor, NSStackView, NSStackViewGravity, NSBox,
+    NSButton, NSCellImagePosition, NSImageScaling, NSImage
 };
 use objc2_foundation::{
-    NSRect, NSPoint, NSSize, NSArray, NSString
+    NSRect, NSPoint, NSSize, NSArray, NSString, NSObject, NSObjectProtocol
 };
 use std::cell::{Cell, RefCell};
+
+// -----------------------------------------------------------------------------
+// INTERACTIVE EXPANDER TARGET (TARGET-ACTION BRIDGE)
+// -----------------------------------------------------------------------------
+pub struct ExpanderIvars {
+    pub is_expanded: Cell<bool>,
+    pub full_text: RefCell<String>,
+    pub truncated_text: RefCell<String>,
+    pub text_field: RefCell<Option<Retained<NSTextField>>>,
+    pub button: RefCell<Option<Retained<NSButton>>>,
+}
+
+define_class!(
+    #[unsafe(super(NSObject))]
+    #[name = "UnaBubbleExpanderTarget"]
+    #[ivars = ExpanderIvars]
+    pub struct BubbleExpanderTarget;
+
+    impl BubbleExpanderTarget {
+        #[unsafe(method_id(init))]
+        fn init(this: Allocated<Self>) -> Retained<Self> {
+            let this = this.set_ivars(ExpanderIvars {
+                is_expanded: Cell::new(false),
+                full_text: RefCell::new(String::new()),
+                truncated_text: RefCell::new(String::new()),
+                text_field: RefCell::new(None),
+                button: RefCell::new(None),
+            });
+            unsafe { msg_send![super(this), init] }
+        }
+
+        #[unsafe(method(toggle:))]
+        fn toggle(&self, _sender: &objc2::runtime::AnyObject) {
+            let expanded = !self.ivars().is_expanded.get();
+            self.ivars().is_expanded.set(expanded);
+
+            let tf_ref = self.ivars().text_field.borrow();
+            let btn_ref = self.ivars().button.borrow();
+
+            if let (Some(tf), Some(btn)) = (tf_ref.as_ref(), btn_ref.as_ref()) {
+                unsafe {
+                    if expanded {
+                        tf.setStringValue(&NSString::from_str(&self.ivars().full_text.borrow()));
+                        let img = NSImage::imageWithSystemSymbolName_accessibilityDescription(
+                            &NSString::from_str("chevron.up"), None
+                        );
+                        let _: () = msg_send![btn, setImage: img.as_deref()];
+                    } else {
+                        tf.setStringValue(&NSString::from_str(&self.ivars().truncated_text.borrow()));
+                        let img = NSImage::imageWithSystemSymbolName_accessibilityDescription(
+                            &NSString::from_str("chevron.down"), None
+                        );
+                        let _: () = msg_send![btn, setImage: img.as_deref()];
+                    }
+                }
+            }
+        }
+    }
+);
+unsafe impl NSObjectProtocol for BubbleExpanderTarget {}
 
 // -----------------------------------------------------------------------------
 // BUBBLE LAYOUT STATE (MATRIX WEAVER)
@@ -25,6 +86,7 @@ pub struct BubbleLayoutState {
     pub is_user: bool,
     pub staggered_constraints: Retained<NSArray<NSLayoutConstraint>>,
     pub single_column_constraints: Retained<NSArray<NSLayoutConstraint>>,
+    pub expander_target: Option<Retained<BubbleExpanderTarget>>,
 }
 
 // -----------------------------------------------------------------------------
@@ -110,12 +172,14 @@ pub fn append_bubble(
     is_user: bool,
 ) -> Retained<NSView> {
     unsafe {
-        // --- GTK PATTERN PORT: TRUNCATION & FORMATTING ---
-        let mut display_text = String::new();
+        let mut full_text = String::new();
+        let mut truncated_text = String::new();
+        let mut is_long_message = false;
 
         if is_chat {
             let explicit_lines = content.trim_end().lines().count();
-            let is_long_message = content.len() > 500 || explicit_lines > 7;
+            is_long_message = content.len() > 500 || explicit_lines > 7;
+            full_text.push_str(content);
 
             if is_long_message {
                 let mut byte_idx = 0;
@@ -129,53 +193,51 @@ pub fn append_bubble(
                     byte_idx = idx + c.len_utf8();
                 }
                 if byte_idx < content.len() {
-                    display_text.push_str(&content[..byte_idx]);
-                    display_text.push_str("\n... [Truncated - Expansion Pending]");
+                    truncated_text.push_str(&content[..byte_idx]);
+                    truncated_text.push_str("\n...");
                 } else {
-                    display_text.push_str(content);
+                    truncated_text.push_str(content);
+                    is_long_message = false;
                 }
             } else {
-                display_text.push_str(content);
+                truncated_text.push_str(content);
             }
         } else {
-            // System/Memory Payload (GTK Expander Port)
-            display_text.push_str(&format!("▶ {} | {} | {}\n", sender, subject, timestamp));
-            // Safely find the byte index of the 100th character
+            is_long_message = true;
+            let header = format!("▶ {} | {} | {}\n", sender, subject, timestamp);
+            full_text.push_str(&header);
+            full_text.push_str(content);
+
+            truncated_text.push_str(&header);
             let preview = match content.char_indices().nth(100) {
                 Some((idx, _)) => format!("{}...", &content[..idx]),
                 None => content.to_string(),
             };
-            display_text.push_str(&preview);
+            truncated_text.push_str(&preview);
         }
 
-        // 1. Create the Bubble Container (NSBox)
         let bubble: Allocated<NSBox> = msg_send![NSBox::class(), alloc];
         let bubble: Retained<NSBox> = msg_send![bubble, initWithFrame: NSRect::new(NSPoint::new(0., 0.), NSSize::new(100., 30.))];
         let _: () = msg_send![&bubble, setTranslatesAutoresizingMaskIntoConstraints: objc2::runtime::Bool::NO];
-
-        let _: () = msg_send![&bubble, setBoxType: 4isize]; // NSBoxCustom
-        let _: () = msg_send![&bubble, setBorderType: 0isize]; // NSNoBorder
+        let _: () = msg_send![&bubble, setBoxType: 4isize];
+        let _: () = msg_send![&bubble, setBorderType: 0isize];
         let _: () = msg_send![&bubble, setCornerRadius: 8.0f64];
-        let _: () = msg_send![&bubble, setTitlePosition: 0isize]; // NSNoTitle
+        let _: () = msg_send![&bubble, setTitlePosition: 0isize];
 
-        // GTK Color Segregation
+        let _: () = msg_send![&bubble, setWantsLayer: objc2::runtime::Bool::YES];
+
         let color = if is_chat {
             if is_user { NSColor::systemBlueColor() } else { NSColor::systemGrayColor() }
         } else {
-            // FIXED: Use controlColor to provide actual contrast against the window background
             NSColor::controlColor()
         };
         let _: () = msg_send![&bubble, setFillColor: &*color];
 
-        // FIXED: Force CoreAnimation to guarantee the custom fill actually renders
-        let _: () = msg_send![&bubble, setWantsLayer: objc2::runtime::Bool::YES];
-
-        // 2. Create the NSTextField
         let text_field: Allocated<NSTextField> = msg_send![NSTextField::class(), alloc];
         let text_field: Retained<NSTextField> = msg_send![text_field, initWithFrame: NSRect::new(NSPoint::new(0., 0.), NSSize::new(100., 30.))];
         let _: () = msg_send![&text_field, setTranslatesAutoresizingMaskIntoConstraints: objc2::runtime::Bool::NO];
 
-        text_field.setStringValue(&NSString::from_str(&display_text));
+        text_field.setStringValue(&NSString::from_str(if is_long_message { &truncated_text } else { &full_text }));
         let _: () = msg_send![&text_field, setEditable: objc2::runtime::Bool::NO];
         let _: () = msg_send![&text_field, setSelectable: objc2::runtime::Bool::YES];
         let _: () = msg_send![&text_field, setBordered: objc2::runtime::Bool::NO];
@@ -184,7 +246,6 @@ pub fn append_bubble(
         let text_color = if is_chat && is_user { NSColor::whiteColor() } else { NSColor::labelColor() };
         text_field.setTextColor(Some(&text_color));
 
-        // Enable word wrapping
         let cell: *mut objc2::runtime::AnyObject = msg_send![&text_field, cell];
         if !cell.is_null() {
             let _: () = msg_send![cell, setWraps: objc2::runtime::Bool::YES];
@@ -192,7 +253,59 @@ pub fn append_bubble(
 
         bubble.addSubview(&text_field);
 
-        // 3. Anchor Text Field to Bubble (8pt Padding)
+        let mut expander_target: Option<Retained<BubbleExpanderTarget>> = None;
+        let trailing_padding = if is_long_message { -32.0 } else { -8.0 };
+
+        if is_long_message {
+            let btn: Allocated<NSButton> = msg_send![NSButton::class(), alloc];
+            let btn: Retained<NSButton> = msg_send![btn, initWithFrame: NSRect::new(NSPoint::new(0., 0.), NSSize::new(20., 20.))];
+            let _: () = msg_send![&btn, setTranslatesAutoresizingMaskIntoConstraints: objc2::runtime::Bool::NO];
+            let _: () = msg_send![&btn, setBordered: objc2::runtime::Bool::NO];
+            let _: () = msg_send![&btn, setImagePosition: NSCellImagePosition::ImageOnly];
+            let _: () = msg_send![&btn, setImageScaling: NSImageScaling::ScaleProportionallyUpOrDown];
+
+            let img = NSImage::imageWithSystemSymbolName_accessibilityDescription(
+                &NSString::from_str("chevron.down"), None
+            );
+            let _: () = msg_send![&btn, setImage: img.as_deref()];
+
+            let target: Allocated<BubbleExpanderTarget> = msg_send![BubbleExpanderTarget::class(), alloc];
+            let target: Retained<BubbleExpanderTarget> = msg_send![target, init];
+
+            *target.ivars().full_text.borrow_mut() = full_text.clone();
+            *target.ivars().truncated_text.borrow_mut() = truncated_text.clone();
+            *target.ivars().text_field.borrow_mut() = Some(text_field.clone());
+            *target.ivars().button.borrow_mut() = Some(btn.clone());
+
+            let sel = objc2::sel!(toggle:);
+            let _: () = msg_send![&btn, setTarget: &*target];
+            let _: () = msg_send![&btn, setAction: sel];
+
+            bubble.addSubview(&btn);
+
+            let btn_constraints = NSArray::from_slice(&[
+                &*NSLayoutConstraint::constraintWithItem_attribute_relatedBy_toItem_attribute_multiplier_constant(
+                    &btn, NSLayoutAttribute::Top, NSLayoutRelation::Equal,
+                    Some(&bubble), NSLayoutAttribute::Top, 1.0, 4.0
+                ),
+                &*NSLayoutConstraint::constraintWithItem_attribute_relatedBy_toItem_attribute_multiplier_constant(
+                    &btn, NSLayoutAttribute::Trailing, NSLayoutRelation::Equal,
+                    Some(&bubble), NSLayoutAttribute::Trailing, 1.0, -4.0
+                ),
+                &*NSLayoutConstraint::constraintWithItem_attribute_relatedBy_toItem_attribute_multiplier_constant(
+                    &btn, NSLayoutAttribute::Width, NSLayoutRelation::Equal,
+                    None, NSLayoutAttribute::NotAnAttribute, 1.0, 20.0
+                ),
+                &*NSLayoutConstraint::constraintWithItem_attribute_relatedBy_toItem_attribute_multiplier_constant(
+                    &btn, NSLayoutAttribute::Height, NSLayoutRelation::Equal,
+                    None, NSLayoutAttribute::NotAnAttribute, 1.0, 20.0
+                ),
+            ]);
+            let _: () = msg_send![&bubble, addConstraints: &*btn_constraints];
+
+            expander_target = Some(target);
+        }
+
         let internal_constraints = NSArray::from_slice(&[
             &*NSLayoutConstraint::constraintWithItem_attribute_relatedBy_toItem_attribute_multiplier_constant(
                 &text_field, NSLayoutAttribute::Top, NSLayoutRelation::Equal,
@@ -208,15 +321,13 @@ pub fn append_bubble(
             ),
             &*NSLayoutConstraint::constraintWithItem_attribute_relatedBy_toItem_attribute_multiplier_constant(
                 &text_field, NSLayoutAttribute::Trailing, NSLayoutRelation::Equal,
-                Some(&bubble), NSLayoutAttribute::Trailing, 1.0, -8.0
+                Some(&bubble), NSLayoutAttribute::Trailing, 1.0, trailing_padding
             ),
         ]);
         let _: () = msg_send![&bubble, addConstraints: &*internal_constraints];
 
-        // 4. Inject Bubble into StackView
         stack_view.addView_inGravity(&bubble, NSStackViewGravity::Top);
 
-        // 5. Build X-Axis Constraints (Matrix Staggered)
         let doc_view_nsview = Retained::cast_unchecked::<NSView>(doc_view.clone());
         let max_width = NSLayoutConstraint::constraintWithItem_attribute_relatedBy_toItem_attribute_multiplier_constant(
             &bubble, NSLayoutAttribute::Width, NSLayoutRelation::LessThanOrEqual,
@@ -237,7 +348,6 @@ pub fn append_bubble(
 
         let staggered_constraints = NSArray::from_slice(&[&*max_width, &*stagger_x]);
 
-        // 6. Build X-Axis Constraints (Single-Column)
         let single_x = NSLayoutConstraint::constraintWithItem_attribute_relatedBy_toItem_attribute_multiplier_constant(
             &bubble, NSLayoutAttribute::Leading, NSLayoutRelation::Equal,
             Some(&doc_view_nsview), NSLayoutAttribute::Leading, 1.0, 16.0
@@ -248,15 +358,14 @@ pub fn append_bubble(
         );
         let single_column_constraints = NSArray::from_slice(&[&*single_max_width, &*single_x]);
 
-        // 7. Inject state into Document Ivars
         let state = BubbleLayoutState {
             is_user,
             staggered_constraints,
             single_column_constraints,
+            expander_target,
         };
         doc_view.ivars().bubbles.borrow_mut().push(state);
 
-        // 8. Activate Initial Geometry Set
         let currently_single_column = doc_view.ivars().is_single_column.get();
         if currently_single_column {
             NSLayoutConstraint::activateConstraints(&doc_view.ivars().bubbles.borrow().last().unwrap().single_column_constraints);
@@ -264,7 +373,6 @@ pub fn append_bubble(
             NSLayoutConstraint::activateConstraints(&doc_view.ivars().bubbles.borrow().last().unwrap().staggered_constraints);
         }
 
-        let bubble_nsview = Retained::cast_unchecked::<NSView>(bubble);
-        bubble_nsview
+        Retained::cast_unchecked::<NSView>(bubble)
     }
 }
