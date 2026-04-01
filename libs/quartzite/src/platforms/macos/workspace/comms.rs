@@ -89,17 +89,13 @@ define_class!(
 
             if should_be_single_column {
                 for state in bubbles.iter() {
-                    unsafe {
-                        NSLayoutConstraint::deactivateConstraints(&state.staggered_constraints);
-                        NSLayoutConstraint::activateConstraints(&state.single_column_constraints);
-                    }
+                    NSLayoutConstraint::deactivateConstraints(&state.staggered_constraints);
+                    NSLayoutConstraint::activateConstraints(&state.single_column_constraints);
                 }
             } else {
                 for state in bubbles.iter() {
-                    unsafe {
-                        NSLayoutConstraint::deactivateConstraints(&state.single_column_constraints);
-                        NSLayoutConstraint::activateConstraints(&state.staggered_constraints);
-                    }
+                    NSLayoutConstraint::deactivateConstraints(&state.single_column_constraints);
+                    NSLayoutConstraint::activateConstraints(&state.staggered_constraints);
                 }
             }
         }
@@ -424,7 +420,7 @@ pub fn create_comms(_mtm: MainThreadMarker, app_state: &Arc<RwLock<AppState>>) -
     // Explicitly lower the horizontal hugging priority of the scroll view so it expands to fill the space
     unsafe {
         // NSLayoutPriorityDefaultLow is 250.0
-        let _: () = msg_send![&input_scroll, setContentHuggingPriority: 250.0f32 forOrientation: objc2_app_kit::NSLayoutConstraintOrientation::Horizontal];
+        let _: () = msg_send![&input_scroll, setContentHuggingPriority: 250.0f32, forOrientation: objc2_app_kit::NSLayoutConstraintOrientation::Horizontal];
     }
 
     // 5. The Symbols
@@ -433,7 +429,7 @@ pub fn create_comms(_mtm: MainThreadMarker, app_state: &Arc<RwLock<AppState>>) -
     unsafe {
         let _: () = msg_send![&attach_btn, setTranslatesAutoresizingMaskIntoConstraints: objc2::runtime::Bool::NO];
         let _: () = msg_send![&attach_btn, setBordered: objc2::runtime::Bool::NO];
-        let _: () = msg_send![&attach_btn, setImagePosition: objc2_app_kit::NSImagePosition::ImageOnly];
+        let _: () = msg_send![&attach_btn, setImagePosition: objc2_app_kit::NSCellImagePosition::ImageOnly];
         let img = objc2_app_kit::NSImage::imageWithSystemSymbolName_accessibilityDescription(
             &NSString::from_str("plus"),
             None
@@ -446,7 +442,7 @@ pub fn create_comms(_mtm: MainThreadMarker, app_state: &Arc<RwLock<AppState>>) -
     unsafe {
         let _: () = msg_send![&send_btn, setTranslatesAutoresizingMaskIntoConstraints: objc2::runtime::Bool::NO];
         let _: () = msg_send![&send_btn, setBordered: objc2::runtime::Bool::NO];
-        let _: () = msg_send![&send_btn, setImagePosition: objc2_app_kit::NSImagePosition::ImageOnly];
+        let _: () = msg_send![&send_btn, setImagePosition: objc2_app_kit::NSCellImagePosition::ImageOnly];
         let img = objc2_app_kit::NSImage::imageWithSystemSymbolName_accessibilityDescription(
             &NSString::from_str("arrow.up.message"),
             None
@@ -463,7 +459,7 @@ pub fn create_comms(_mtm: MainThreadMarker, app_state: &Arc<RwLock<AppState>>) -
     input_stack.setOrientation(objc2_app_kit::NSUserInterfaceLayoutOrientation::Horizontal);
     input_stack.setSpacing(8.0);
     unsafe {
-        let _: () = msg_send![&input_stack, setEdgeInsets: NSEdgeInsets::new(8.0, 8.0, 8.0, 8.0)];
+        let _: () = msg_send![&input_stack, setEdgeInsets: NSEdgeInsets { top: 8.0, left: 8.0, bottom: 8.0, right: 8.0 }];
     }
 
     // Order matters: Attachment Button, Input Buffer, Send Button
