@@ -13,7 +13,7 @@ use objc2_app_kit::{
     NSResponder, NSTextView, NSTextViewDelegate, NSTextDelegate,
     NSSplitView, NSSplitViewDelegate, NSScrollView, NSView,
     NSLayoutConstraint, NSLayoutAttribute, NSLayoutRelation,
-    NSTextField, NSColor, NSStackView, NSStackViewGravity
+    NSTextField, NSColor, NSStackView, NSStackViewGravity, NSBox
 };
 use objc2_foundation::{
     NSObjectProtocol, NSRect, NSPoint, NSSize, MainThreadMarker, NSArray,
@@ -150,20 +150,19 @@ pub fn append_bubble(
     is_user: bool,
 ) -> Retained<NSView> {
     unsafe {
-        // 1. Create the Bubble Container
-        let bubble: Allocated<NSView> = msg_send![NSView::class(), alloc];
-        let bubble: Retained<NSView> = msg_send![bubble, initWithFrame: NSRect::new(NSPoint::new(0., 0.), NSSize::new(100., 30.))];
+        // 1. Create the Bubble Container (NSBox)
+        let bubble: Allocated<NSBox> = msg_send![NSBox::class(), alloc];
+        let bubble: Retained<NSBox> = msg_send![bubble, initWithFrame: NSRect::new(NSPoint::new(0., 0.), NSSize::new(100., 30.))];
         let _: () = msg_send![&bubble, setTranslatesAutoresizingMaskIntoConstraints: objc2::runtime::Bool::NO];
 
-        // Ensure the bubble background is drawn natively (Core Animation backed, or just generic AppKit styling)
-        let _: () = msg_send![&bubble, setWantsLayer: objc2::runtime::Bool::YES];
-        let layer: *mut objc2::runtime::AnyObject = msg_send![&bubble, layer];
-        if !layer.is_null() {
-            let _: () = msg_send![layer, setCornerRadius: 10.0f64];
-            let color = if is_user { NSColor::systemBlueColor() } else { NSColor::systemGrayColor() };
-            let cg_color: *mut objc2::runtime::AnyObject = msg_send![&color, CGColor];
-            let _: () = msg_send![layer, setBackgroundColor: cg_color];
-        }
+        // NSBoxCustom = 4, NSNoBorder = 0
+        let _: () = msg_send![&bubble, setBoxType: 4isize];
+        let _: () = msg_send![&bubble, setBorderType: 0isize];
+        let _: () = msg_send![&bubble, setCornerRadius: 8.0f64];
+        let _: () = msg_send![&bubble, setTitlePosition: 0isize]; // NSNoTitle
+
+        let color = if is_user { NSColor::systemBlueColor() } else { NSColor::systemGrayColor() };
+        let _: () = msg_send![&bubble, setFillColor: &*color];
 
         // 2. Create the NSTextField
         let text_field: Allocated<NSTextField> = msg_send![NSTextField::class(), alloc];
@@ -262,7 +261,8 @@ pub fn append_bubble(
             NSLayoutConstraint::activateConstraints(&doc_view.ivars().bubbles.borrow().last().unwrap().staggered_constraints);
         }
 
-        bubble
+        let bubble_nsview = Retained::cast_unchecked::<NSView>(bubble);
+        bubble_nsview
     }
 }
 
@@ -291,13 +291,11 @@ pub fn create_comms(_mtm: MainThreadMarker) -> (Retained<NSView>, Retained<Comms
     let matrix_scroll: Retained<NSScrollView> = unsafe { msg_send![matrix_scroll, initWithFrame: frame] };
     unsafe {
         let _: () = msg_send![&matrix_scroll, setTranslatesAutoresizingMaskIntoConstraints: objc2::runtime::Bool::NO];
-    }
-    matrix_scroll.setHasVerticalScroller(true);
-    matrix_scroll.setHasHorizontalScroller(false);
-    matrix_scroll.setAutohidesScrollers(true);
+        matrix_scroll.setHasVerticalScroller(true);
+        matrix_scroll.setHasHorizontalScroller(false);
+        matrix_scroll.setAutohidesScrollers(true);
 
-    // Transparent Backgrounds for Comms
-    unsafe {
+        // Transparent Backgrounds for Comms
         let clear_color = NSColor::clearColor();
         let _: () = msg_send![&matrix_scroll, setBackgroundColor: &*clear_color];
         let _: () = msg_send![&matrix_scroll, setDrawsBackground: objc2::runtime::Bool::NO];
