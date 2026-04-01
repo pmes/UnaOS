@@ -210,9 +210,13 @@ pub fn append_bubble(
         let color = if is_chat {
             if is_user { NSColor::systemBlueColor() } else { NSColor::systemGrayColor() }
         } else {
-            NSColor::windowBackgroundColor() // System messages get a dim/native background
+            // FIXED: Use controlColor to provide actual contrast against the window background
+            NSColor::controlColor()
         };
         let _: () = msg_send![&bubble, setFillColor: &*color];
+
+        // FIXED: Force CoreAnimation to guarantee the custom fill actually renders
+        let _: () = msg_send![&bubble, setWantsLayer: objc2::runtime::Bool::YES];
 
         // 2. Create the NSTextField
         let text_field: Allocated<NSTextField> = msg_send![NSTextField::class(), alloc];
