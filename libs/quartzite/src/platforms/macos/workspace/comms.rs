@@ -486,9 +486,7 @@ pub fn create_comms(_mtm: MainThreadMarker, app_state: &Arc<RwLock<AppState>>) -
             ),
         ])
     };
-    unsafe {
         NSLayoutConstraint::activateConstraints(&symbol_constraints);
-    }
 
     // 6. The Input Horizontal Stack
     let input_stack: Allocated<NSStackView> = unsafe { msg_send![NSStackView::class(), alloc] };
