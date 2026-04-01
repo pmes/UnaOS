@@ -21,7 +21,13 @@ pub mod window_chrome;
 pub mod workspace;
 
 // The UI bootstrapping closure
-type BootstrapFn = Box<dyn FnOnce(&NSWindow) -> Retained<NSView> + 'static>;
+type BootstrapFn = Box<
+    dyn FnOnce(&NSWindow) -> (
+        Retained<NSView>,
+        Retained<workspace::sidebar::SidebarDelegate>,
+        Retained<workspace::comms::CommsDelegate>,
+    ) + 'static,
+>;
 
 // -----------------------------------------------------------------------------
 // APP DELEGATE
@@ -32,6 +38,8 @@ struct AppDelegateIvars {
     // Holding the delegate to prevent dropping
     window_delegate: RefCell<Option<Retained<window_chrome::WindowDelegate>>>,
     toolbar_delegate: RefCell<Option<Retained<window_chrome::ToolbarDelegate>>>,
+    sidebar_delegate: RefCell<Option<Retained<workspace::sidebar::SidebarDelegate>>>,
+    comms_delegate: RefCell<Option<Retained<workspace::comms::CommsDelegate>>>,
 }
 
 define_class!(
@@ -48,6 +56,8 @@ define_class!(
                 window: RefCell::new(None),
                 window_delegate: RefCell::new(None),
                 toolbar_delegate: RefCell::new(None),
+                sidebar_delegate: RefCell::new(None),
+                comms_delegate: RefCell::new(None),
             });
             unsafe { msg_send![super(this), init] }
         }
@@ -63,8 +73,12 @@ define_class!(
 
             // 2. Invoke the bootstrap closure to get the root view
             if let Some(bootstrap_fn) = self.ivars().bootstrap.borrow_mut().take() {
-                let root_view = bootstrap_fn(&window);
+                let (root_view, sidebar_delegate, comms_delegate) = bootstrap_fn(&window);
                 window.setContentView(Some(&root_view));
+
+                // Store the internal UI delegates to prevent them from dropping
+                *self.ivars().sidebar_delegate.borrow_mut() = Some(sidebar_delegate);
+                *self.ivars().comms_delegate.borrow_mut() = Some(comms_delegate);
             }
 
             // 3. Keep references alive
@@ -101,7 +115,11 @@ pub struct Backend {
 impl Backend {
     pub fn new<F>(_app_id: &str, bootstrap: F) -> Self
     where
-        F: FnOnce(&NSWindow) -> Retained<NSView> + 'static,
+        F: FnOnce(&NSWindow) -> (
+            Retained<NSView>,
+            Retained<workspace::sidebar::SidebarDelegate>,
+            Retained<workspace::comms::CommsDelegate>,
+        ) + 'static,
     {
         // Allocate and initialize the custom delegate
         let delegate: Allocated<AppDelegate> = unsafe { msg_send![AppDelegate::class(), alloc] };

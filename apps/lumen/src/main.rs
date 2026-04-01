@@ -23,7 +23,7 @@ use gneiss_pal::AppHandler;
 #[allow(unused_imports)]
 use std::sync::{Arc, RwLock};
 use gneiss_pal::paths::UnaPaths;
-use quartzite::{self, Backend, NativeView, NativeWindow};
+use quartzite::{self, Backend, NativeWindow};
 use std::rc::Rc;
 use vein::VeinHandler;
 
@@ -272,7 +272,7 @@ fn main() {
     }
 
     // THE FUSION
-    let bootstrap = move |window: &NativeWindow| -> NativeView {
+    let bootstrap = move |window: &NativeWindow| -> quartzite::BootstrapPayload {
         // 1. Get the Vein UI (The Command Center)
         let vein_widget = spline.bootstrap(
             window,

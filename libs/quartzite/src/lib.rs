@@ -31,7 +31,7 @@ pub mod widgets;
 // Re-export specific logic types that UI might need directly
 pub use gneiss_pal::shard::*;
 pub use gneiss_pal::types::*;
-pub use spline::Spline;
+pub use spline::{Spline, BootstrapPayload};
 
 // -----------------------------------------------------------------------------
 // THE DIPLOMAT'S BRIDGE: NATIVE ABSTRACTIONS

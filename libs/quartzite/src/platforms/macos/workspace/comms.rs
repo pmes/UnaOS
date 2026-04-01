@@ -67,9 +67,7 @@ pub fn create_comms(_mtm: MainThreadMarker) -> (Retained<NSView>, Retained<Comms
     let split_view: Allocated<NSSplitView> = unsafe { msg_send![NSSplitView::class(), alloc] };
     let split_view: Retained<NSSplitView> = unsafe { msg_send![split_view, initWithFrame: frame] };
     split_view.setVertical(false); // Horizontal divider, stacking vertically
-    unsafe {
-        split_view.setDelegate(Some(ProtocolObject::from_ref(&*delegate)));
-    }
+    split_view.setDelegate(Some(ProtocolObject::from_ref(&*delegate)));
 
     // Turn off automatic constraints on the root container
     unsafe {
