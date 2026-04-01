@@ -83,7 +83,7 @@ impl MacOSSpline {
         }
 
         // --- Reactor Right Pane (Comms) ---
-        let (comms_view, comms_delegate) = comms::create_comms(mtm);
+        let (comms_view, comms_delegate) = comms::create_comms(mtm, &_app_state);
         let comms_vc: Allocated<NSViewController> = unsafe { msg_send![NSViewController::class(), alloc] };
         let comms_vc: Retained<NSViewController> = unsafe { msg_send![comms_vc, init] };
         comms_vc.setView(&comms_view);
