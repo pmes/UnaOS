@@ -443,7 +443,7 @@ pub fn create_comms(_mtm: MainThreadMarker, app_state: &Arc<RwLock<AppState>>) -
         let _: () = msg_send![&attach_btn, setTranslatesAutoresizingMaskIntoConstraints: objc2::runtime::Bool::NO];
         let _: () = msg_send![&attach_btn, setBordered: objc2::runtime::Bool::NO];
         let _: () = msg_send![&attach_btn, setImagePosition: objc2_app_kit::NSCellImagePosition::ImageOnly];
-        let _: () = msg_send![&attach_btn, setImageScaling: objc2_app_kit::NSImageScaling::ProportionallyUpOrDown];
+        let _: () = msg_send![&attach_btn, setImageScaling: objc2_app_kit::NSImageScaling::ScaleProportionallyUpOrDown];
         let img = objc2_app_kit::NSImage::imageWithSystemSymbolName_accessibilityDescription(
             &NSString::from_str("plus"),
             None
@@ -457,7 +457,7 @@ pub fn create_comms(_mtm: MainThreadMarker, app_state: &Arc<RwLock<AppState>>) -
         let _: () = msg_send![&send_btn, setTranslatesAutoresizingMaskIntoConstraints: objc2::runtime::Bool::NO];
         let _: () = msg_send![&send_btn, setBordered: objc2::runtime::Bool::NO];
         let _: () = msg_send![&send_btn, setImagePosition: objc2_app_kit::NSCellImagePosition::ImageOnly];
-        let _: () = msg_send![&send_btn, setImageScaling: objc2_app_kit::NSImageScaling::ProportionallyUpOrDown];
+        let _: () = msg_send![&send_btn, setImageScaling: objc2_app_kit::NSImageScaling::ScaleProportionallyUpOrDown];
         let img = objc2_app_kit::NSImage::imageWithSystemSymbolName_accessibilityDescription(
             &NSString::from_str("arrow.up.message"),
             None

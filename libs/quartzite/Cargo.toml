@@ -32,7 +32,7 @@ cxx-qt-lib = { version = "0.8.1", features = ["qt_gui", "qt_qml"], optional = tr
 # ------------------------------------------------------------------------------
 # LINUX / GTK4 TARGETS
 # ------------------------------------------------------------------------------
-[target.'cfg(target_os = "linux")'.dependencies]
+[target.'cfg(any(target_os = "linux", target_os = "macos"))'.dependencies]
 gtk4 = { version = "0.10.3", features = ["v4_14"], optional = true }
 glib = { version = "0.21", optional = true }
 glib-sys = { version = "0.22", optional = true }
