@@ -369,10 +369,23 @@ pub fn create_comms(_mtm: MainThreadMarker, app_state: &Arc<RwLock<AppState>>) -
             .collect::<Vec<_>>()
     }; // Drop read lock immediately before heavy UI layout loops
 
+    println!("[MATRIX] Booting with {} historical messages", history_items.len());
+
     // Inject historical bubbles into the Matrix
     for item in history_items {
         let is_user = item.sender == "Architect";
         append_bubble(&doc_view, &stack_view, &item.content, is_user);
+    }
+
+    // Ensure the document view bounds the stack view at the bottom so it doesn't clip
+    unsafe {
+        let bottom_constraint = NSArray::from_slice(&[
+            &*NSLayoutConstraint::constraintWithItem_attribute_relatedBy_toItem_attribute_multiplier_constant(
+                &doc_view, NSLayoutAttribute::Bottom, NSLayoutRelation::Equal,
+                Some(&stack_view), NSLayoutAttribute::Bottom, 1.0, 16.0
+            )
+        ]);
+        let _: () = msg_send![&doc_view, addConstraints: &*bottom_constraint];
     }
 
     // Add it to the split view
@@ -430,6 +443,7 @@ pub fn create_comms(_mtm: MainThreadMarker, app_state: &Arc<RwLock<AppState>>) -
         let _: () = msg_send![&attach_btn, setTranslatesAutoresizingMaskIntoConstraints: objc2::runtime::Bool::NO];
         let _: () = msg_send![&attach_btn, setBordered: objc2::runtime::Bool::NO];
         let _: () = msg_send![&attach_btn, setImagePosition: objc2_app_kit::NSCellImagePosition::ImageOnly];
+        let _: () = msg_send![&attach_btn, setImageScaling: objc2_app_kit::NSImageScaling::ProportionallyUpOrDown];
         let img = objc2_app_kit::NSImage::imageWithSystemSymbolName_accessibilityDescription(
             &NSString::from_str("plus"),
             None
@@ -443,11 +457,37 @@ pub fn create_comms(_mtm: MainThreadMarker, app_state: &Arc<RwLock<AppState>>) -
         let _: () = msg_send![&send_btn, setTranslatesAutoresizingMaskIntoConstraints: objc2::runtime::Bool::NO];
         let _: () = msg_send![&send_btn, setBordered: objc2::runtime::Bool::NO];
         let _: () = msg_send![&send_btn, setImagePosition: objc2_app_kit::NSCellImagePosition::ImageOnly];
+        let _: () = msg_send![&send_btn, setImageScaling: objc2_app_kit::NSImageScaling::ProportionallyUpOrDown];
         let img = objc2_app_kit::NSImage::imageWithSystemSymbolName_accessibilityDescription(
             &NSString::from_str("arrow.up.message"),
             None
         );
         let _: () = msg_send![&send_btn, setImage: img.as_deref()];
+    }
+
+    // Force strict dimensions on the SF symbols so they don't shrink wrap
+    let symbol_constraints = unsafe {
+        NSArray::from_slice(&[
+            &*NSLayoutConstraint::constraintWithItem_attribute_relatedBy_toItem_attribute_multiplier_constant(
+                &attach_btn, NSLayoutAttribute::Width, NSLayoutRelation::Equal,
+                None, NSLayoutAttribute::NotAnAttribute, 1.0, 28.0
+            ),
+            &*NSLayoutConstraint::constraintWithItem_attribute_relatedBy_toItem_attribute_multiplier_constant(
+                &attach_btn, NSLayoutAttribute::Height, NSLayoutRelation::Equal,
+                None, NSLayoutAttribute::NotAnAttribute, 1.0, 28.0
+            ),
+            &*NSLayoutConstraint::constraintWithItem_attribute_relatedBy_toItem_attribute_multiplier_constant(
+                &send_btn, NSLayoutAttribute::Width, NSLayoutRelation::Equal,
+                None, NSLayoutAttribute::NotAnAttribute, 1.0, 28.0
+            ),
+            &*NSLayoutConstraint::constraintWithItem_attribute_relatedBy_toItem_attribute_multiplier_constant(
+                &send_btn, NSLayoutAttribute::Height, NSLayoutRelation::Equal,
+                None, NSLayoutAttribute::NotAnAttribute, 1.0, 28.0
+            ),
+        ])
+    };
+    unsafe {
+        NSLayoutConstraint::activateConstraints(&symbol_constraints);
     }
 
     // 6. The Input Horizontal Stack
