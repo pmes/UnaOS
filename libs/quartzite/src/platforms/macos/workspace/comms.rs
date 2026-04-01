@@ -8,7 +8,7 @@
 
 use objc2::rc::{Allocated, Retained};
 use objc2::runtime::ProtocolObject;
-use objc2::{define_class, msg_send, ClassType};
+use objc2::{define_class, msg_send, ClassType, DefinedClass};
 use objc2_app_kit::{
     NSResponder, NSTextView, NSTextViewDelegate, NSTextDelegate,
     NSSplitView, NSSplitViewDelegate, NSScrollView, NSView,
@@ -240,7 +240,11 @@ pub fn append_bubble(
             &bubble, NSLayoutAttribute::Leading, NSLayoutRelation::Equal,
             Some(&doc_view_nsview), NSLayoutAttribute::Leading, 1.0, 16.0
         );
-        let single_column_constraints = NSArray::from_slice(&[&*max_width, &*single_x]);
+        let single_max_width = NSLayoutConstraint::constraintWithItem_attribute_relatedBy_toItem_attribute_multiplier_constant(
+            &bubble, NSLayoutAttribute::Width, NSLayoutRelation::LessThanOrEqual,
+            Some(&doc_view_nsview), NSLayoutAttribute::Width, 1.0, -32.0 // Allow full width minus padding
+        );
+        let single_column_constraints = NSArray::from_slice(&[&*single_max_width, &*single_x]);
 
         // 7. Inject state into Document Ivars
         let state = BubbleLayoutState {
