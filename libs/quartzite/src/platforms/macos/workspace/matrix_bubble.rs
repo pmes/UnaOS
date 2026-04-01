@@ -219,17 +219,25 @@ pub fn append_bubble(
         let bubble: Allocated<NSBox> = msg_send![NSBox::class(), alloc];
         let bubble: Retained<NSBox> = msg_send![bubble, initWithFrame: NSRect::new(NSPoint::new(0., 0.), NSSize::new(100., 30.))];
         let _: () = msg_send![&bubble, setTranslatesAutoresizingMaskIntoConstraints: objc2::runtime::Bool::NO];
-        let _: () = msg_send![&bubble, setBoxType: 4isize];
-        let _: () = msg_send![&bubble, setBorderType: 0isize];
-        let _: () = msg_send![&bubble, setCornerRadius: 8.0f64];
-        let _: () = msg_send![&bubble, setTitlePosition: 0isize];
 
+        // Structure & Border
+        let _: () = msg_send![&bubble, setBoxType: 4isize]; // NSBoxCustom
+        let _: () = msg_send![&bubble, setBorderType: 1isize]; // NSLineBorder (Forces outline visibility)
+        let _: () = msg_send![&bubble, setBorderWidth: 1.0f64];
+        let border_color = NSColor::separatorColor();
+        let _: () = msg_send![&bubble, setBorderColor: &*border_color];
+
+        let _: () = msg_send![&bubble, setCornerRadius: 8.0f64];
+        let _: () = msg_send![&bubble, setTitlePosition: 0isize]; // NSNoTitle
+
+        // Critical Render Fixes
+        let _: () = msg_send![&bubble, setTransparent: objc2::runtime::Bool::NO]; // Forbid silent invisibility
         let _: () = msg_send![&bubble, setWantsLayer: objc2::runtime::Bool::YES];
 
         let color = if is_chat {
             if is_user { NSColor::systemBlueColor() } else { NSColor::systemGrayColor() }
         } else {
-            NSColor::controlColor()
+            NSColor::textBackgroundColor() // Provides high contrast against window background
         };
         let _: () = msg_send![&bubble, setFillColor: &*color];
 
@@ -246,10 +254,16 @@ pub fn append_bubble(
         let text_color = if is_chat && is_user { NSColor::whiteColor() } else { NSColor::labelColor() };
         text_field.setTextColor(Some(&text_color));
 
+        // Enforce word wrapping and shatter the intrinsic width resistance
         let cell: *mut objc2::runtime::AnyObject = msg_send![&text_field, cell];
         if !cell.is_null() {
             let _: () = msg_send![cell, setWraps: objc2::runtime::Bool::YES];
+            let _: () = msg_send![cell, setLineBreakMode: 0isize]; // NSLineBreakByWordWrapping
         }
+
+        // 250.0 is NSLayoutPriorityDefaultLow. 0isize is NSLayoutConstraintOrientationHorizontal.
+        // This explicitly forbids the text field from pushing its container outward.
+        let _: () = msg_send![&text_field, setContentCompressionResistancePriority: 250.0f32, forOrientation: 0isize];
 
         bubble.addSubview(&text_field);
 
