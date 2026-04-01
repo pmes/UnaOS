@@ -202,10 +202,20 @@ pub fn create_comms(_mtm: MainThreadMarker, app_state: &Arc<RwLock<AppState>>) -
     let input_scroll: Retained<NSScrollView> = unsafe { msg_send![input_scroll, initWithFrame: frame] };
     unsafe {
         let _: () = msg_send![&input_scroll, setTranslatesAutoresizingMaskIntoConstraints: objc2::runtime::Bool::NO];
+        let _: () = msg_send![&input_scroll, setBorderType: 2isize]; // NSBezelBorder
+        let _: () = msg_send![&input_scroll, setDrawsBackground: objc2::runtime::Bool::YES];
     }
     input_scroll.setHasVerticalScroller(true);
     input_scroll.setHasHorizontalScroller(false);
     input_scroll.setAutohidesScrollers(true);
+
+    let input_height_constraint = unsafe {
+        NSLayoutConstraint::constraintWithItem_attribute_relatedBy_toItem_attribute_multiplier_constant(
+            &input_scroll, NSLayoutAttribute::Height, NSLayoutRelation::Equal,
+            None, NSLayoutAttribute::NotAnAttribute, 1.0, 32.0
+        )
+    };
+    unsafe { NSLayoutConstraint::activateConstraints(&NSArray::from_slice(&[&*input_height_constraint])); }
 
     let text_view: Allocated<NSTextView> = unsafe { msg_send![NSTextView::class(), alloc] };
     let text_view: Retained<NSTextView> = unsafe { msg_send![text_view, initWithFrame: frame] };
@@ -304,6 +314,7 @@ pub fn create_comms(_mtm: MainThreadMarker, app_state: &Arc<RwLock<AppState>>) -
     input_stack.setSpacing(8.0);
     unsafe {
         let _: () = msg_send![&input_stack, setEdgeInsets: NSEdgeInsets { top: 8.0, left: 8.0, bottom: 8.0, right: 8.0 }];
+        let _: () = msg_send![&input_stack, setAlignment: NSLayoutAttribute::CenterY];
     }
 
     // Order matters: Attachment Button, Input Buffer, Send Button
@@ -314,14 +325,8 @@ pub fn create_comms(_mtm: MainThreadMarker, app_state: &Arc<RwLock<AppState>>) -
     split_view.addSubview(&input_stack);
 
     // The SplitView will manage sizing the two scroll views.
-    // The user can drag the horizontal divider.
-    // Ensure the input stack doesn't collapse to 0:
     let constraints = unsafe {
         NSArray::from_slice(&[
-            &*NSLayoutConstraint::constraintWithItem_attribute_relatedBy_toItem_attribute_multiplier_constant(
-                &input_stack, NSLayoutAttribute::Height, NSLayoutRelation::GreaterThanOrEqual,
-                None, NSLayoutAttribute::NotAnAttribute, 1.0, 50.0 // Minimum 50px input height
-            ),
             &*NSLayoutConstraint::constraintWithItem_attribute_relatedBy_toItem_attribute_multiplier_constant(
                 &matrix_scroll, NSLayoutAttribute::Height, NSLayoutRelation::GreaterThanOrEqual,
                 None, NSLayoutAttribute::NotAnAttribute, 1.0, 150.0 // Minimum 150px chat height
@@ -330,6 +335,9 @@ pub fn create_comms(_mtm: MainThreadMarker, app_state: &Arc<RwLock<AppState>>) -
     };
     unsafe {
         let _: () = msg_send![&split_view, addConstraints: &*constraints];
+
+        let _: () = msg_send![&split_view, setHoldingPriority: 250.0f32, forSubviewAtIndex: 0isize];
+        let _: () = msg_send![&split_view, setHoldingPriority: 750.0f32, forSubviewAtIndex: 1isize];
     }
 
     (unsafe { Retained::cast_unchecked::<NSView>(split_view) }, delegate)
