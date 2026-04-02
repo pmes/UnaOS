@@ -14,18 +14,16 @@ use objc2_app_kit::{
     NSResponder, NSTextView, NSTextViewDelegate, NSTextDelegate,
     NSSplitView, NSSplitViewDelegate, NSScrollView, NSView,
     NSLayoutConstraint, NSLayoutAttribute, NSLayoutRelation,
-    NSTextField, NSColor, NSStackView, NSStackViewGravity, NSBox,
-    NSTableView, NSTableViewDataSource, NSTableViewDelegate,
+    NSColor, NSTableView, NSTableViewDataSource, NSTableViewDelegate,
     NSTableColumn, NSTableCellView
 };
 use objc2_foundation::{
     NSObjectProtocol, NSRect, NSPoint, NSSize, MainThreadMarker, NSArray,
     NSString, NSEdgeInsets, NSInteger, NSAttributedString, NSRange
 };
-use std::cell::{Cell, RefCell};
+use std::cell::RefCell;
 use std::sync::{Arc, RwLock};
 use bandy::state::{AppState, HistoryItem};
-use super::matrix_bubble::{FlippedDocumentView, append_bubble};
 
 // -----------------------------------------------------------------------------
 // COMMS DELEGATE (LUMEN REACTOR CHAT)
@@ -51,27 +49,6 @@ define_class!(
                 active_text_view: RefCell::new(None),
             });
             unsafe { msg_send![super(this), init] }
-        }
-    }
-
-    impl CommsDelegate {
-        pub fn append_stream_token(&self, token: &str) {
-            if let Some(text_view) = self.ivars().active_text_view.borrow().as_ref() {
-                let text_storage = text_view.textStorage().unwrap();
-                let token_ns = NSString::from_str(token);
-
-                unsafe {
-                    let _: () = msg_send![&text_storage, beginEditing];
-                    let length: objc2_foundation::NSUInteger = msg_send![&text_storage, length];
-                    let range = NSRange { location: length, length: 0 };
-                    let _: () = msg_send![&text_storage, replaceCharactersInRange: range, withString: &*token_ns];
-                    let _: () = msg_send![&text_storage, endEditing];
-
-                    let new_length: objc2_foundation::NSUInteger = msg_send![&text_storage, length];
-                    let scroll_range = NSRange { location: new_length, length: 0 };
-                    let _: () = msg_send![&text_view, scrollRangeToVisible: scroll_range];
-                }
-            }
         }
     }
 
@@ -197,6 +174,27 @@ define_class!(
 unsafe impl NSObjectProtocol for CommsDelegate {}
 unsafe impl NSTextDelegate for CommsDelegate {}
 unsafe impl NSSplitViewDelegate for CommsDelegate {}
+
+impl CommsDelegate {
+    pub fn append_stream_token(&self, token: &str) {
+        if let Some(text_view) = self.ivars().active_text_view.borrow().as_ref() {
+            let text_storage = text_view.textStorage().unwrap();
+            let token_ns = NSString::from_str(token);
+
+            unsafe {
+                let _: () = msg_send![&text_storage, beginEditing];
+                let length: objc2_foundation::NSUInteger = msg_send![&text_storage, length];
+                let range = NSRange { location: length, length: 0 };
+                let _: () = msg_send![&text_storage, replaceCharactersInRange: range, withString: &*token_ns];
+                let _: () = msg_send![&text_storage, endEditing];
+
+                let new_length: objc2_foundation::NSUInteger = msg_send![&text_storage, length];
+                let scroll_range = NSRange { location: new_length, length: 0 };
+                let _: () = msg_send![&text_view, scrollRangeToVisible: scroll_range];
+            }
+        }
+    }
+}
 
 // -----------------------------------------------------------------------------
 // ASSEMBLY
@@ -387,24 +385,59 @@ pub fn create_comms(_mtm: MainThreadMarker, app_state: &Arc<RwLock<AppState>>) -
     NSLayoutConstraint::activateConstraints(&symbol_constraints);
 
     // 6. The Input Horizontal Stack
-    let input_stack: Allocated<NSStackView> = unsafe { msg_send![NSStackView::class(), alloc] };
-    let input_stack: Retained<NSStackView> = unsafe { msg_send![input_stack, initWithFrame: frame] };
+    let input_container: Allocated<NSView> = unsafe { msg_send![NSView::class(), alloc] };
+    let input_container: Retained<NSView> = unsafe { msg_send![input_container, initWithFrame: frame] };
     unsafe {
-        let _: () = msg_send![&input_stack, setTranslatesAutoresizingMaskIntoConstraints: objc2::runtime::Bool::NO];
-    }
-    input_stack.setOrientation(objc2_app_kit::NSUserInterfaceLayoutOrientation::Horizontal);
-    input_stack.setSpacing(8.0);
-    unsafe {
-        let _: () = msg_send![&input_stack, setEdgeInsets: NSEdgeInsets { top: 8.0, left: 8.0, bottom: 8.0, right: 8.0 }];
-        let _: () = msg_send![&input_stack, setAlignment: NSLayoutAttribute::CenterY];
+        let _: () = msg_send![&input_container, setTranslatesAutoresizingMaskIntoConstraints: objc2::runtime::Bool::NO];
     }
 
-    // Order matters: Attachment Button, Input Buffer, Send Button
-    input_stack.addView_inGravity(&attach_btn, NSStackViewGravity::Leading);
-    input_stack.addView_inGravity(&input_scroll, NSStackViewGravity::Leading);
-    input_stack.addView_inGravity(&send_btn, NSStackViewGravity::Leading);
+    input_container.addSubview(&attach_btn);
+    input_container.addSubview(&input_scroll);
+    input_container.addSubview(&send_btn);
 
-    split_view.addSubview(&input_stack);
+    // Convert NSStackView layout to standard auto layout constraints
+    let input_constraints = unsafe {
+        NSArray::from_slice(&[
+            // Attach button to the left
+            &*NSLayoutConstraint::constraintWithItem_attribute_relatedBy_toItem_attribute_multiplier_constant(
+                &attach_btn, NSLayoutAttribute::Leading, NSLayoutRelation::Equal,
+                Some(&input_container), NSLayoutAttribute::Leading, 1.0, 8.0
+            ),
+            &*NSLayoutConstraint::constraintWithItem_attribute_relatedBy_toItem_attribute_multiplier_constant(
+                &attach_btn, NSLayoutAttribute::CenterY, NSLayoutRelation::Equal,
+                Some(&input_container), NSLayoutAttribute::CenterY, 1.0, 0.0
+            ),
+            // Input scroll view next to attach button
+            &*NSLayoutConstraint::constraintWithItem_attribute_relatedBy_toItem_attribute_multiplier_constant(
+                &input_scroll, NSLayoutAttribute::Leading, NSLayoutRelation::Equal,
+                Some(&attach_btn), NSLayoutAttribute::Trailing, 1.0, 8.0
+            ),
+            &*NSLayoutConstraint::constraintWithItem_attribute_relatedBy_toItem_attribute_multiplier_constant(
+                &input_scroll, NSLayoutAttribute::Top, NSLayoutRelation::Equal,
+                Some(&input_container), NSLayoutAttribute::Top, 1.0, 8.0
+            ),
+            &*NSLayoutConstraint::constraintWithItem_attribute_relatedBy_toItem_attribute_multiplier_constant(
+                &input_scroll, NSLayoutAttribute::Bottom, NSLayoutRelation::Equal,
+                Some(&input_container), NSLayoutAttribute::Bottom, 1.0, -8.0
+            ),
+            // Send button next to input scroll view
+            &*NSLayoutConstraint::constraintWithItem_attribute_relatedBy_toItem_attribute_multiplier_constant(
+                &send_btn, NSLayoutAttribute::Leading, NSLayoutRelation::Equal,
+                Some(&input_scroll), NSLayoutAttribute::Trailing, 1.0, 8.0
+            ),
+            &*NSLayoutConstraint::constraintWithItem_attribute_relatedBy_toItem_attribute_multiplier_constant(
+                &send_btn, NSLayoutAttribute::Trailing, NSLayoutRelation::Equal,
+                Some(&input_container), NSLayoutAttribute::Trailing, 1.0, -8.0
+            ),
+            &*NSLayoutConstraint::constraintWithItem_attribute_relatedBy_toItem_attribute_multiplier_constant(
+                &send_btn, NSLayoutAttribute::CenterY, NSLayoutRelation::Equal,
+                Some(&input_container), NSLayoutAttribute::CenterY, 1.0, 0.0
+            ),
+        ])
+    };
+    NSLayoutConstraint::activateConstraints(&input_constraints);
+
+    split_view.addSubview(&input_container);
 
     // The SplitView will manage sizing the two scroll views.
     let constraints = unsafe {

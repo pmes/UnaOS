@@ -172,6 +172,7 @@ impl MacOSSpline {
                             },
                             SMessage::NetworkLog(_) => {
                                 dispatch2::DispatchQueue::main().exec_async(move || {
+                                    // SMessage::NetworkLog routed to main thread.
                                     log::info!("[MacOSSpline] SMessage::NetworkLog routed to main thread.");
                                 });
                             },
