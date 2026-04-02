@@ -9,27 +9,31 @@
 use objc2::rc::{Allocated, Retained};
 use objc2::runtime::ProtocolObject;
 use objc2::{define_class, msg_send, ClassType, DefinedClass};
+use objc2::runtime::AnyObject;
 use objc2_app_kit::{
     NSResponder, NSTextView, NSTextViewDelegate, NSTextDelegate,
     NSSplitView, NSSplitViewDelegate, NSScrollView, NSView,
     NSLayoutConstraint, NSLayoutAttribute, NSLayoutRelation,
-    NSTextField, NSColor, NSStackView, NSStackViewGravity, NSBox
+    NSTextField, NSColor, NSStackView, NSStackViewGravity, NSBox,
+    NSTableView, NSTableViewDataSource, NSTableViewDelegate,
+    NSTableColumn, NSTableCellView
 };
 use objc2_foundation::{
     NSObjectProtocol, NSRect, NSPoint, NSSize, MainThreadMarker, NSArray,
-    NSString, NSEdgeInsets
+    NSString, NSEdgeInsets, NSInteger, NSAttributedString, NSRange
 };
 use std::cell::{Cell, RefCell};
 use std::sync::{Arc, RwLock};
-use bandy::state::AppState;
+use bandy::state::{AppState, HistoryItem};
 use super::matrix_bubble::{FlippedDocumentView, append_bubble};
 
 // -----------------------------------------------------------------------------
 // COMMS DELEGATE (LUMEN REACTOR CHAT)
 // -----------------------------------------------------------------------------
 pub struct CommsDelegateIvars {
-    pub doc_view: RefCell<Option<Retained<FlippedDocumentView>>>,
-    pub stack_view: RefCell<Option<Retained<NSStackView>>>,
+    pub table_view: RefCell<Option<Retained<NSTableView>>>,
+    pub history: RefCell<Vec<HistoryItem>>,
+    pub active_text_view: RefCell<Option<Retained<NSTextView>>>,
 }
 
 define_class!(
@@ -42,10 +46,138 @@ define_class!(
         #[unsafe(method_id(init))]
         fn init(this: Allocated<Self>) -> Retained<Self> {
             let this = this.set_ivars(CommsDelegateIvars {
-                doc_view: RefCell::new(None),
-                stack_view: RefCell::new(None),
+                table_view: RefCell::new(None),
+                history: RefCell::new(Vec::new()),
+                active_text_view: RefCell::new(None),
             });
             unsafe { msg_send![super(this), init] }
+        }
+    }
+
+    impl CommsDelegate {
+        pub fn append_stream_token(&self, token: &str) {
+            if let Some(text_view) = self.ivars().active_text_view.borrow().as_ref() {
+                let text_storage = text_view.textStorage().unwrap();
+                let token_ns = NSString::from_str(token);
+
+                unsafe {
+                    let _: () = msg_send![&text_storage, beginEditing];
+                    let length: objc2_foundation::NSUInteger = msg_send![&text_storage, length];
+                    let range = NSRange { location: length, length: 0 };
+                    let _: () = msg_send![&text_storage, replaceCharactersInRange: range, withString: &*token_ns];
+                    let _: () = msg_send![&text_storage, endEditing];
+
+                    let new_length: objc2_foundation::NSUInteger = msg_send![&text_storage, length];
+                    let scroll_range = NSRange { location: new_length, length: 0 };
+                    let _: () = msg_send![&text_view, scrollRangeToVisible: scroll_range];
+                }
+            }
+        }
+    }
+
+    // --- NSTableViewDataSource ---
+    unsafe impl NSTableViewDataSource for CommsDelegate {
+        #[unsafe(method(numberOfRowsInTableView:))]
+        fn number_of_rows_in_table_view(&self, _table_view: &NSTableView) -> NSInteger {
+            self.ivars().history.borrow().len() as NSInteger
+        }
+    }
+
+    // --- NSTableViewDelegate ---
+    unsafe impl NSTableViewDelegate for CommsDelegate {
+        #[unsafe(method_id(tableView:viewForTableColumn:row:))]
+        fn table_view_view_for_table_column_row(
+            &self,
+            table_view: &NSTableView,
+            _table_column: Option<&NSTableColumn>,
+            row: NSInteger,
+        ) -> Option<Retained<NSView>> {
+            let history = self.ivars().history.borrow();
+            let item = history.get(row as usize)?;
+
+            let identifier = NSString::from_str("ChatBubbleCell");
+            let mut cell: Option<Retained<NSTableCellView>> = unsafe {
+                let recycled: *mut AnyObject = msg_send![table_view, makeViewWithIdentifier: &*identifier, owner: self];
+                if !recycled.is_null() {
+                    Some(Retained::cast_unchecked::<NSTableCellView>(Retained::retain(recycled).unwrap()))
+                } else {
+                    None
+                }
+            };
+
+            if cell.is_none() {
+                let frame = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(400.0, 50.0)); // Initial approximate size
+                let new_cell: Allocated<NSTableCellView> = unsafe { msg_send![NSTableCellView::class(), alloc] };
+                let new_cell: Retained<NSTableCellView> = unsafe { msg_send![new_cell, initWithFrame: frame] };
+                unsafe {
+                    let _: () = msg_send![&new_cell, setIdentifier: &*identifier];
+                }
+
+                // Create NSTextView for the bubble content
+                let text_view: Allocated<NSTextView> = unsafe { msg_send![NSTextView::class(), alloc] };
+                let text_view: Retained<NSTextView> = unsafe { msg_send![text_view, initWithFrame: frame] };
+                unsafe {
+                    let _: () = msg_send![&text_view, setTranslatesAutoresizingMaskIntoConstraints: objc2::runtime::Bool::NO];
+                    let _: () = msg_send![&text_view, setDrawsBackground: objc2::runtime::Bool::NO];
+                    let _: () = msg_send![&text_view, setEditable: objc2::runtime::Bool::NO];
+                    let _: () = msg_send![&text_view, setSelectable: objc2::runtime::Bool::YES];
+                    let _: () = msg_send![&text_view, setVerticallyResizable: objc2::runtime::Bool::YES];
+                    let _: () = msg_send![&text_view, setHorizontallyResizable: objc2::runtime::Bool::NO];
+                }
+
+                new_cell.addSubview(&text_view);
+
+                // Anchor text view to cell
+                let constraints = unsafe {
+                    NSArray::from_slice(&[
+                        &*NSLayoutConstraint::constraintWithItem_attribute_relatedBy_toItem_attribute_multiplier_constant(
+                            &text_view, NSLayoutAttribute::Top, NSLayoutRelation::Equal,
+                            Some(&new_cell), NSLayoutAttribute::Top, 1.0, 8.0
+                        ),
+                        &*NSLayoutConstraint::constraintWithItem_attribute_relatedBy_toItem_attribute_multiplier_constant(
+                            &text_view, NSLayoutAttribute::Bottom, NSLayoutRelation::Equal,
+                            Some(&new_cell), NSLayoutAttribute::Bottom, 1.0, -8.0
+                        ),
+                        &*NSLayoutConstraint::constraintWithItem_attribute_relatedBy_toItem_attribute_multiplier_constant(
+                            &text_view, NSLayoutAttribute::Leading, NSLayoutRelation::Equal,
+                            Some(&new_cell), NSLayoutAttribute::Leading, 1.0, 16.0
+                        ),
+                        &*NSLayoutConstraint::constraintWithItem_attribute_relatedBy_toItem_attribute_multiplier_constant(
+                            &text_view, NSLayoutAttribute::Trailing, NSLayoutRelation::Equal,
+                            Some(&new_cell), NSLayoutAttribute::Trailing, 1.0, -16.0
+                        ),
+                    ])
+                };
+                NSLayoutConstraint::activateConstraints(&constraints);
+
+                // Attach to view with tag 100 for easy retrieval
+                unsafe {
+                    let _: () = msg_send![&text_view, setTag: 100isize];
+                }
+
+                cell = Some(new_cell);
+            }
+
+            let cell = cell.unwrap();
+            let text_view_ptr: *mut AnyObject = unsafe { msg_send![&cell, viewWithTag: 100isize] };
+            let text_view = unsafe { Retained::retain(text_view_ptr).unwrap() };
+            let text_view = unsafe { Retained::cast_unchecked::<NSTextView>(text_view) };
+
+            // Keep track of the active text view for streaming if this is the last cell
+            if row == (history.len() - 1) as NSInteger {
+                *self.ivars().active_text_view.borrow_mut() = Some(text_view.clone());
+            }
+
+            // Format string appropriately based on sender
+            let prefix = if item.sender == "Architect" { "Architect:\n" } else { "Lumen:\n" };
+            let full_text = format!("{}{}", prefix, item.content);
+            let ns_text = NSString::from_str(&full_text);
+
+            unsafe {
+                let _: () = msg_send![&text_view, setString: &*ns_text];
+            }
+
+            Some(unsafe { Retained::cast_unchecked::<NSView>(cell) })
         }
     }
 
@@ -86,7 +218,7 @@ pub fn create_comms(_mtm: MainThreadMarker, app_state: &Arc<RwLock<AppState>>) -
         let _: () = msg_send![&split_view, setTranslatesAutoresizingMaskIntoConstraints: objc2::runtime::Bool::NO];
     }
 
-    // 3. Top Split: Bubble Matrix Placeholder (NSScrollView)
+    // 3. Top Split: Bubble Matrix Placeholder (NSScrollView & NSTableView)
     let matrix_scroll: Allocated<NSScrollView> = unsafe { msg_send![NSScrollView::class(), alloc] };
     let matrix_scroll: Retained<NSScrollView> = unsafe { msg_send![matrix_scroll, initWithFrame: frame] };
     unsafe {
@@ -101,97 +233,47 @@ pub fn create_comms(_mtm: MainThreadMarker, app_state: &Arc<RwLock<AppState>>) -
         let _: () = msg_send![&matrix_scroll, setDrawsBackground: objc2::runtime::Bool::NO];
     }
 
-    // Initialize FlippedDocumentView
-    let doc_view: Allocated<FlippedDocumentView> = unsafe { msg_send![FlippedDocumentView::class(), alloc] };
-    let doc_view: Retained<FlippedDocumentView> = unsafe { msg_send![doc_view, init] };
+    let table_view: Allocated<NSTableView> = unsafe { msg_send![NSTableView::class(), alloc] };
+    let table_view: Retained<NSTableView> = unsafe { msg_send![table_view, initWithFrame: frame] };
     unsafe {
-        let _: () = msg_send![&doc_view, setTranslatesAutoresizingMaskIntoConstraints: objc2::runtime::Bool::NO];
+        // Use automatic row heights to avoid clipping
+        let _: () = msg_send![&table_view, setUsesAutomaticRowHeights: objc2::runtime::Bool::YES];
+        let _: () = msg_send![&table_view, setSelectionHighlightStyle: -1isize]; // NSTableViewSelectionHighlightStyleNone
+        let _: () = msg_send![&table_view, setHeaderView: None::<&AnyObject>];
+        let clear_color = NSColor::clearColor();
+        let _: () = msg_send![&table_view, setBackgroundColor: &*clear_color];
+
+        table_view.setDataSource(Some(ProtocolObject::from_ref(&*delegate)));
+        table_view.setDelegate(Some(ProtocolObject::from_ref(&*delegate)));
+
+        // Create the main column
+        let column: Allocated<NSTableColumn> = msg_send![NSTableColumn::class(), alloc];
+        let column_id = NSString::from_str("ChatColumn");
+        let column: Retained<NSTableColumn> = msg_send![column, initWithIdentifier: &*column_id];
+        // Hide the column title since we disabled the header view
+        table_view.addTableColumn(&column);
     }
 
-    // Initialize NSStackView for Y-Axis
-    let stack_view: Allocated<NSStackView> = unsafe { msg_send![NSStackView::class(), alloc] };
-    let stack_view: Retained<NSStackView> = unsafe { msg_send![stack_view, initWithFrame: frame] };
-    unsafe {
-        let _: () = msg_send![&stack_view, setTranslatesAutoresizingMaskIntoConstraints: objc2::runtime::Bool::NO];
-    }
-    stack_view.setOrientation(objc2_app_kit::NSUserInterfaceLayoutOrientation::Vertical);
-    stack_view.setSpacing(16.0);
-    // Explicitly disable orthogonal alignment (X-axis) so our custom constraints don't collide
-    unsafe {
-        let _: () = msg_send![&stack_view, setAlignment: NSLayoutAttribute::NotAnAttribute];
-    }
-
-    doc_view.addSubview(&stack_view);
+    // Anchor NSTableView into NSScrollView
+    matrix_scroll.setDocumentView(Some(&table_view));
 
     // Anchor views into delegate
-    *delegate.ivars().doc_view.borrow_mut() = Some(doc_view.clone());
-    *delegate.ivars().stack_view.borrow_mut() = Some(stack_view.clone());
-
-    // Anchor NSStackView to FlippedDocumentView
-    unsafe {
-        let stack_constraints = NSArray::from_slice(&[
-            &*NSLayoutConstraint::constraintWithItem_attribute_relatedBy_toItem_attribute_multiplier_constant(
-                &stack_view, NSLayoutAttribute::Top, NSLayoutRelation::Equal,
-                Some(&doc_view), NSLayoutAttribute::Top, 1.0, 16.0
-            ),
-            &*NSLayoutConstraint::constraintWithItem_attribute_relatedBy_toItem_attribute_multiplier_constant(
-                &stack_view, NSLayoutAttribute::Bottom, NSLayoutRelation::Equal,
-                Some(&doc_view), NSLayoutAttribute::Bottom, 1.0, -16.0
-            ),
-            &*NSLayoutConstraint::constraintWithItem_attribute_relatedBy_toItem_attribute_multiplier_constant(
-                &stack_view, NSLayoutAttribute::Leading, NSLayoutRelation::Equal,
-                Some(&doc_view), NSLayoutAttribute::Leading, 1.0, 0.0
-            ),
-            &*NSLayoutConstraint::constraintWithItem_attribute_relatedBy_toItem_attribute_multiplier_constant(
-                &stack_view, NSLayoutAttribute::Trailing, NSLayoutRelation::Equal,
-                Some(&doc_view), NSLayoutAttribute::Trailing, 1.0, 0.0
-            ),
-        ]);
-        let _: () = msg_send![&doc_view, addConstraints: &*stack_constraints];
-    }
-
-    matrix_scroll.setDocumentView(Some(&doc_view));
-
-    // Anchor DocumentView width to the scroll view content view
-    let m_content_view = matrix_scroll.contentView();
-    let m_cv = unsafe { Retained::cast_unchecked::<NSView>(m_content_view) };
-    unsafe {
-        let doc_constraints = NSArray::from_slice(&[
-            &*NSLayoutConstraint::constraintWithItem_attribute_relatedBy_toItem_attribute_multiplier_constant(
-                &doc_view, NSLayoutAttribute::Width, NSLayoutRelation::Equal,
-                Some(&m_cv), NSLayoutAttribute::Width, 1.0, 0.0
-            )
-        ]);
-        let _: () = msg_send![&m_cv, addConstraints: &*doc_constraints];
-    }
+    *delegate.ivars().table_view.borrow_mut() = Some(table_view.clone());
 
     // Load historical messages from AppState
     let history_items = {
         let state = app_state.read().unwrap();
-        // Extract history items, filtering for chat messages to populate the matrix
         state.history.iter()
             .filter(|item| item.is_chat)
             .cloned()
             .collect::<Vec<_>>()
-    }; // Drop read lock immediately before heavy UI layout loops
+    };
 
     println!("[MATRIX] Booting with {} historical messages", history_items.len());
+    *delegate.ivars().history.borrow_mut() = history_items;
 
-    // Inject historical bubbles into the Matrix
-    for item in history_items {
-        let is_user = item.sender == "Architect";
-        append_bubble(&doc_view, &stack_view, &item.content, &item.sender, "Chat", &item.timestamp, item.is_chat, is_user);
-    }
-
-    // Ensure the document view bounds the stack view at the bottom so it doesn't clip
     unsafe {
-        let bottom_constraint = NSArray::from_slice(&[
-            &*NSLayoutConstraint::constraintWithItem_attribute_relatedBy_toItem_attribute_multiplier_constant(
-                &doc_view, NSLayoutAttribute::Bottom, NSLayoutRelation::Equal,
-                Some(&stack_view), NSLayoutAttribute::Bottom, 1.0, 16.0
-            )
-        ]);
-        let _: () = msg_send![&doc_view, addConstraints: &*bottom_constraint];
+        let _: () = msg_send![&table_view, reloadData];
     }
 
     // Add it to the split view

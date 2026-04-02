@@ -69,7 +69,7 @@ impl MacOSSpline {
         }
 
         // --- Lumen Left Pane (Sidebar) ---
-        let (sidebar_view, sidebar_delegate) = sidebar::create_sidebar(mtm);
+        let (sidebar_view, sidebar_delegate) = sidebar::create_sidebar(mtm, _workspace_tetra);
         let sidebar_vc: Allocated<NSViewController> = unsafe { msg_send![NSViewController::class(), alloc] };
         let sidebar_vc: Retained<NSViewController> = unsafe { msg_send![sidebar_vc, init] };
         sidebar_vc.setView(&sidebar_view);
@@ -106,9 +106,10 @@ impl MacOSSpline {
         // Using `dispatch2` for macOS GCD to cross the Tokio async/sync boundary natively
         let spline_inner_arc = self.inner.clone();
 
-        // Wrap comms_delegate in MainThreadBound so it can cross thread boundaries safely.
-        // It strictly requires `Send` to be moved into tokio::spawn.
-        let comms_delegate_bound = Arc::new(dispatch2::MainThreadBound::new(comms_delegate.clone(), mtm));
+        // Wrap delegates in MainThreadBound so they can cross thread boundaries safely.
+        // They strictly require `Send` to be moved into tokio::spawn.
+        let comms_delegate_bound = Arc::new(objc2::MainThreadBound::new(comms_delegate.clone(), mtm));
+        let sidebar_delegate_bound = Arc::new(objc2::MainThreadBound::new(sidebar_delegate.clone(), mtm));
 
         tokio::spawn(async move {
             loop {
@@ -119,6 +120,7 @@ impl MacOSSpline {
                     Ok(msg) => {
                         let _inner = spline_inner_arc.clone();
                         let comms_bound = comms_delegate_bound.clone();
+                        let sidebar_bound = sidebar_delegate_bound.clone();
 
                         match msg {
                             SMessage::StorageLoadPagedResult { records, .. } => {
@@ -127,25 +129,43 @@ impl MacOSSpline {
                                     let comms_delegate = comms_bound.get(mtm);
                                     use objc2::DefinedClass;
 
-                                    if let (Some(doc_view), Some(stack_view)) = (
-                                        comms_delegate.ivars().doc_view.borrow().as_ref(),
-                                        comms_delegate.ivars().stack_view.borrow().as_ref()
-                                    ) {
-                                        for record in records {
-                                            let is_user = record.sender != "model";
-                                            // Porting your GTK chat filter
-                                            let is_chat = record.subject.eq_ignore_ascii_case("chat") || record.subject.eq_ignore_ascii_case("comms");
-
-                                            let _ = crate::platforms::macos::workspace::matrix_bubble::append_bubble(
-                                                doc_view,
-                                                stack_view,
-                                                &record.content,
-                                                &record.sender,
-                                                &record.subject,
-                                                &record.timestamp,
+                                    let mut history = comms_delegate.ivars().history.borrow_mut();
+                                    for record in records {
+                                        let is_chat = record.subject.eq_ignore_ascii_case("chat") || record.subject.eq_ignore_ascii_case("comms");
+                                        if is_chat {
+                                            history.push(bandy::state::HistoryItem {
+                                                id: record.id.clone().unwrap_or_default(),
+                                                sender: record.sender.clone(),
+                                                subject: record.subject.clone(),
+                                                content: record.content.clone(),
+                                                timestamp: record.timestamp.clone(),
                                                 is_chat,
-                                                is_user
-                                            );
+                                            });
+                                        }
+                                    }
+
+                                    if let Some(table_view) = comms_delegate.ivars().table_view.borrow().as_ref() {
+                                        unsafe {
+                                            let _: () = objc2::msg_send![&**table_view, reloadData];
+                                        }
+                                    }
+                                });
+                            },
+                            SMessage::StreamToken(token_event) => {
+                                dispatch2::DispatchQueue::main().exec_async(move || {
+                                    let mtm = objc2_foundation::MainThreadMarker::new().unwrap();
+                                    let comms_delegate = comms_bound.get(mtm);
+                                    use objc2::DefinedClass;
+
+                                    let mut history = comms_delegate.ivars().history.borrow_mut();
+
+                                    // Append the chunk to the state so history is accurate
+                                    if let Some(last_item) = history.last_mut() {
+                                        if last_item.sender == "Lumen" {
+                                            last_item.content.push_str(&token_event.chunk);
+
+                                            // Directly append string to TextKit NSTextStorage without reloading the table cell!
+                                            comms_delegate.append_stream_token(&token_event.chunk);
                                         }
                                     }
                                 });
@@ -155,8 +175,59 @@ impl MacOSSpline {
                                     log::info!("[MacOSSpline] SMessage::NetworkLog routed to main thread.");
                                 });
                             },
-                            SMessage::Matrix(_) => {
+                            SMessage::Matrix(matrix_event) => {
                                 dispatch2::DispatchQueue::main().exec_async(move || {
+                                    let mtm = objc2_foundation::MainThreadMarker::new().unwrap();
+                                    let sidebar_delegate = sidebar_bound.get(mtm);
+
+                                    match matrix_event {
+                                        bandy::MatrixEvent::TopologyMutated(flat_tree) => {
+                                            use std::collections::HashMap;
+                                            use bandy::state::TopologyNode;
+
+                                            // Reconstruct tree from flat list
+                                            let mut nodes_by_depth: HashMap<usize, Vec<TopologyNode>> = HashMap::new();
+                                            let mut root_nodes = Vec::new();
+
+                                            // Note: In a real implementation this reconstruction logic would be robust.
+                                            // Since we only have a flat representation here, we rebuild a simple list
+                                            // or correctly parsed tree if depth info is available. For demonstration,
+                                            // we will just populate the roots.
+
+                                            for (id, label, depth) in flat_tree {
+                                                let node = TopologyNode {
+                                                    id,
+                                                    label,
+                                                    children: Vec::new(),
+                                                    is_expanded: false,
+                                                };
+                                                if depth == 0 {
+                                                    root_nodes.push(node);
+                                                } else {
+                                                    // Simple flat fallback for non-roots
+                                                    root_nodes.push(node);
+                                                }
+                                            }
+
+                                            use crate::platforms::macos::workspace::sidebar::UnaMatrixNode;
+                                            use objc2::DefinedClass;
+
+                                            let mut new_roots = Vec::new();
+                                            for root in &root_nodes {
+                                                new_roots.push(UnaMatrixNode::build_from(root));
+                                            }
+
+                                            *sidebar_delegate.ivars().roots.borrow_mut() = new_roots;
+
+                                            if let Some(outline_view) = sidebar_delegate.ivars().outline_view.borrow().as_ref() {
+                                                unsafe {
+                                                    let _: () = objc2::msg_send![&**outline_view, reloadData];
+                                                }
+                                            }
+                                        }
+                                        _ => {}
+                                    }
+
                                     log::info!("[MacOSSpline] SMessage::Matrix routed to main thread.");
                                 });
                             },

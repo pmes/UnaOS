@@ -272,8 +272,26 @@ fn main() {
     }
 
     // THE FUSION
+    #[cfg(target_os = "macos")]
+    let bootstrap = move |
+        window: &NativeWindow,
+        tx_event: async_channel::Sender<gneiss_pal::Event>,
+        app_state_ref: std::sync::Arc<std::sync::RwLock<bandy::state::AppState>>,
+        rx_synapse: tokio::sync::broadcast::Receiver<bandy::SMessage>,
+        workspace_state_ref: bandy::state::WorkspaceState,
+    | -> quartzite::BootstrapPayload {
+        let vein_widget = spline.bootstrap(
+            window,
+            tx_event,
+            app_state_ref,
+            rx_synapse,
+            &workspace_state_ref,
+        );
+        vein_widget
+    };
+
+    #[cfg(not(target_os = "macos"))]
     let bootstrap = move |window: &NativeWindow| -> quartzite::BootstrapPayload {
-        // 1. Get the Vein UI (The Command Center)
         let vein_widget = spline.bootstrap(
             window,
             event_tx.clone(),
@@ -281,13 +299,13 @@ fn main() {
             synapse.subscribe(),
             &workspace_state,
         );
-
-        // 2. Create the HUD (ContextView) - DEPRECATED (Phase 4)
-        // The "TeleHUD" sidebar tab is now the sole authorized telemetry view.
-        // We simply return the vein_widget directly.
         vein_widget
     };
 
+    #[cfg(target_os = "macos")]
+    Backend::new("org.unaos.lumen", event_tx.clone(), app_state.clone(), synapse.subscribe(), workspace_state.clone(), bootstrap).run();
+
+    #[cfg(not(target_os = "macos"))]
     Backend::new("org.unaos.lumen", bootstrap).run();
 
     // Broadcast shutdown in case GUI exited naturally instead of via SIGINT/SIGTERM
