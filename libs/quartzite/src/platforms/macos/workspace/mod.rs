@@ -8,4 +8,3 @@
 
 pub mod sidebar;
 pub mod comms;
-pub mod matrix_bubble;
