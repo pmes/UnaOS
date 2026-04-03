@@ -70,94 +70,94 @@ define_class!(
             row: NSInteger,
         ) -> Option<Retained<NSView>> {
             let history = self.ivars().history.borrow();
-            let item = match history.get(row as usize) {
-                Some(i) => i,
-                None => return None,
-            };
 
-            let identifier = NSString::from_str("ChatBubbleCell");
-            let mut cell: Option<Retained<NSTableCellView>> = unsafe {
-                let recycled: *mut AnyObject = msg_send![table_view, makeViewWithIdentifier: &*identifier, owner: self];
-                if !recycled.is_null() {
-                    Some(Retained::cast_unchecked::<NSTableCellView>(Retained::retain(recycled).unwrap()))
-                } else {
-                    None
-                }
-            };
-
-            if cell.is_none() {
-                let frame = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(400.0, 50.0)); // Initial approximate size
-                let new_cell: Allocated<NSTableCellView> = unsafe { msg_send![NSTableCellView::class(), alloc] };
-                let new_cell: Retained<NSTableCellView> = unsafe { msg_send![new_cell, initWithFrame: frame] };
-                unsafe {
-                    let _: () = msg_send![&new_cell, setIdentifier: &*identifier];
-                }
-
-                // Create NSTextView for the bubble content
-                let text_view: Allocated<NSTextView> = unsafe { msg_send![NSTextView::class(), alloc] };
-                let text_view: Retained<NSTextView> = unsafe { msg_send![text_view, initWithFrame: frame] };
-                unsafe {
-                    let _: () = msg_send![&text_view, setTranslatesAutoresizingMaskIntoConstraints: objc2::runtime::Bool::NO];
-                    let _: () = msg_send![&text_view, setDrawsBackground: objc2::runtime::Bool::NO];
-                    let _: () = msg_send![&text_view, setEditable: objc2::runtime::Bool::NO];
-                    let _: () = msg_send![&text_view, setSelectable: objc2::runtime::Bool::YES];
-                    let _: () = msg_send![&text_view, setVerticallyResizable: objc2::runtime::Bool::YES];
-                    let _: () = msg_send![&text_view, setHorizontallyResizable: objc2::runtime::Bool::NO];
-                }
-
-                new_cell.addSubview(&text_view);
-
-                // Anchor text view to cell
-                let constraints = unsafe {
-                    NSArray::from_slice(&[
-                        &*NSLayoutConstraint::constraintWithItem_attribute_relatedBy_toItem_attribute_multiplier_constant(
-                            &text_view, NSLayoutAttribute::Top, NSLayoutRelation::Equal,
-                            Some(&new_cell), NSLayoutAttribute::Top, 1.0, 8.0
-                        ),
-                        &*NSLayoutConstraint::constraintWithItem_attribute_relatedBy_toItem_attribute_multiplier_constant(
-                            &text_view, NSLayoutAttribute::Bottom, NSLayoutRelation::Equal,
-                            Some(&new_cell), NSLayoutAttribute::Bottom, 1.0, -8.0
-                        ),
-                        &*NSLayoutConstraint::constraintWithItem_attribute_relatedBy_toItem_attribute_multiplier_constant(
-                            &text_view, NSLayoutAttribute::Leading, NSLayoutRelation::Equal,
-                            Some(&new_cell), NSLayoutAttribute::Leading, 1.0, 16.0
-                        ),
-                        &*NSLayoutConstraint::constraintWithItem_attribute_relatedBy_toItem_attribute_multiplier_constant(
-                            &text_view, NSLayoutAttribute::Trailing, NSLayoutRelation::Equal,
-                            Some(&new_cell), NSLayoutAttribute::Trailing, 1.0, -16.0
-                        ),
-                    ])
+            if let Some(item) = history.get(row as usize) {
+                let identifier = NSString::from_str("ChatBubbleCell");
+                let mut cell: Option<Retained<NSTableCellView>> = unsafe {
+                    let recycled: *mut AnyObject = msg_send![table_view, makeViewWithIdentifier: &*identifier, owner: self];
+                    if !recycled.is_null() {
+                        Some(Retained::cast_unchecked::<NSTableCellView>(Retained::retain(recycled).unwrap()))
+                    } else {
+                        None
+                    }
                 };
-                NSLayoutConstraint::activateConstraints(&constraints);
 
-                // Attach to view with tag 100 for easy retrieval
-                unsafe {
-                    let _: () = msg_send![&text_view, setTag: 100isize];
+                if cell.is_none() {
+                    let frame = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(400.0, 50.0)); // Initial approximate size
+                    let new_cell: Allocated<NSTableCellView> = unsafe { msg_send![NSTableCellView::class(), alloc] };
+                    let new_cell: Retained<NSTableCellView> = unsafe { msg_send![new_cell, initWithFrame: frame] };
+                    unsafe {
+                        let _: () = msg_send![&new_cell, setIdentifier: &*identifier];
+                    }
+
+                    // Create NSTextView for the bubble content
+                    let text_view: Allocated<NSTextView> = unsafe { msg_send![NSTextView::class(), alloc] };
+                    let text_view: Retained<NSTextView> = unsafe { msg_send![text_view, initWithFrame: frame] };
+                    unsafe {
+                        let _: () = msg_send![&text_view, setTranslatesAutoresizingMaskIntoConstraints: objc2::runtime::Bool::NO];
+                        let _: () = msg_send![&text_view, setDrawsBackground: objc2::runtime::Bool::NO];
+                        let _: () = msg_send![&text_view, setEditable: objc2::runtime::Bool::NO];
+                        let _: () = msg_send![&text_view, setSelectable: objc2::runtime::Bool::YES];
+                        let _: () = msg_send![&text_view, setVerticallyResizable: objc2::runtime::Bool::YES];
+                        let _: () = msg_send![&text_view, setHorizontallyResizable: objc2::runtime::Bool::NO];
+                    }
+
+                    new_cell.addSubview(&text_view);
+
+                    // Anchor text view to cell
+                    let constraints = unsafe {
+                        NSArray::from_slice(&[
+                            &*NSLayoutConstraint::constraintWithItem_attribute_relatedBy_toItem_attribute_multiplier_constant(
+                                &text_view, NSLayoutAttribute::Top, NSLayoutRelation::Equal,
+                                Some(&new_cell), NSLayoutAttribute::Top, 1.0, 8.0
+                            ),
+                            &*NSLayoutConstraint::constraintWithItem_attribute_relatedBy_toItem_attribute_multiplier_constant(
+                                &text_view, NSLayoutAttribute::Bottom, NSLayoutRelation::Equal,
+                                Some(&new_cell), NSLayoutAttribute::Bottom, 1.0, -8.0
+                            ),
+                            &*NSLayoutConstraint::constraintWithItem_attribute_relatedBy_toItem_attribute_multiplier_constant(
+                                &text_view, NSLayoutAttribute::Leading, NSLayoutRelation::Equal,
+                                Some(&new_cell), NSLayoutAttribute::Leading, 1.0, 16.0
+                            ),
+                            &*NSLayoutConstraint::constraintWithItem_attribute_relatedBy_toItem_attribute_multiplier_constant(
+                                &text_view, NSLayoutAttribute::Trailing, NSLayoutRelation::Equal,
+                                Some(&new_cell), NSLayoutAttribute::Trailing, 1.0, -16.0
+                            ),
+                        ])
+                    };
+                    NSLayoutConstraint::activateConstraints(&constraints);
+
+                    // Attach to view with tag 100 for easy retrieval
+                    unsafe {
+                        let _: () = msg_send![&text_view, setTag: 100isize];
+                    }
+
+                    cell = Some(new_cell);
                 }
 
-                cell = Some(new_cell);
+                let cell = cell.unwrap();
+                let text_view_ptr: *mut AnyObject = unsafe { msg_send![&cell, viewWithTag: 100isize] };
+                let text_view = unsafe { Retained::retain(text_view_ptr).unwrap() };
+                let text_view = unsafe { Retained::cast_unchecked::<NSTextView>(text_view) };
+
+                // Keep track of the active text view for streaming if this is the last cell
+                if row == (history.len() - 1) as NSInteger {
+                    *self.ivars().active_text_view.borrow_mut() = Some(text_view.clone());
+                }
+
+                // Format string appropriately based on sender
+                let prefix = if item.sender == "Architect" { "Architect:\n" } else { "Lumen:\n" };
+                let full_text = format!("{}{}", prefix, item.content);
+                let ns_text = NSString::from_str(&full_text);
+
+                unsafe {
+                    let _: () = msg_send![&text_view, setString: &*ns_text];
+                }
+
+                Some(unsafe { Retained::cast_unchecked::<NSView>(cell) })
+            } else {
+                None
             }
-
-            let cell = cell.unwrap();
-            let text_view_ptr: *mut AnyObject = unsafe { msg_send![&cell, viewWithTag: 100isize] };
-            let text_view = unsafe { Retained::retain(text_view_ptr).unwrap() };
-            let text_view = unsafe { Retained::cast_unchecked::<NSTextView>(text_view) };
-
-            // Keep track of the active text view for streaming if this is the last cell
-            if row == (history.len() - 1) as NSInteger {
-                *self.ivars().active_text_view.borrow_mut() = Some(text_view.clone());
-            }
-
-            // Format string appropriately based on sender
-            let prefix = if item.sender == "Architect" { "Architect:\n" } else { "Lumen:\n" };
-            let full_text = format!("{}{}", prefix, item.content);
-            let ns_text = NSString::from_str(&full_text);
-
-            unsafe {
-                let _: () = msg_send![&text_view, setString: &*ns_text];
-            }
-
-            Some(unsafe { Retained::cast_unchecked::<NSView>(cell) })
         }
     }
 
@@ -182,7 +182,7 @@ unsafe impl NSControlTextEditingDelegate for CommsDelegate {}
 impl CommsDelegate {
     pub fn append_stream_token(&self, token: &str) {
         if let Some(text_view) = self.ivars().active_text_view.borrow().as_ref() {
-            let text_storage = text_view.textStorage().unwrap();
+            let text_storage = unsafe { text_view.textStorage().unwrap() };
             let token_ns = NSString::from_str(token);
 
             unsafe {

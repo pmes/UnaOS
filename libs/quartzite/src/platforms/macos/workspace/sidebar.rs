@@ -199,7 +199,7 @@ define_class!(
                 }
 
                 new_cell.addSubview(&text_field);
-                new_cell.setTextField(Some(&text_field));
+                unsafe { new_cell.setTextField(Some(&text_field)); }
 
                 let constraints = unsafe {
                     objc2_foundation::NSArray::from_slice(&[
@@ -225,7 +225,7 @@ define_class!(
             }
 
             let cell = cell.unwrap();
-            let text_field = cell.textField().unwrap();
+            let text_field = unsafe { cell.textField().unwrap() };
 
             let ns_text = NSString::from_str(&label_str);
             unsafe {

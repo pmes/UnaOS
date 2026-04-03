@@ -95,7 +95,7 @@ define_class!(
 
                 // App Menu
                 let app_menu_item: Allocated<NSMenuItem> = msg_send![NSMenuItem::class(), alloc];
-                let app_menu_item: Retained<NSMenuItem> = msg_send![app_menu_item, initWithTitle: &*NSString::from_str("App"), action: None, keyEquivalent: &*NSString::from_str("")];
+                let app_menu_item: Retained<NSMenuItem> = msg_send![app_menu_item, initWithTitle: &*NSString::from_str("App"), action: None::<objc2::runtime::Sel>, keyEquivalent: &*NSString::from_str("")];
                 let app_menu: Allocated<NSMenu> = msg_send![NSMenu::class(), alloc];
                 let app_menu: Retained<NSMenu> = msg_send![app_menu, initWithTitle: &*NSString::from_str("App")];
 
@@ -110,7 +110,7 @@ define_class!(
 
                 // Edit Menu
                 let edit_menu_item: Allocated<NSMenuItem> = msg_send![NSMenuItem::class(), alloc];
-                let edit_menu_item: Retained<NSMenuItem> = msg_send![edit_menu_item, initWithTitle: &*NSString::from_str("Edit"), action: None, keyEquivalent: &*NSString::from_str("")];
+                let edit_menu_item: Retained<NSMenuItem> = msg_send![edit_menu_item, initWithTitle: &*NSString::from_str("Edit"), action: None::<objc2::runtime::Sel>, keyEquivalent: &*NSString::from_str("")];
                 let edit_menu: Allocated<NSMenu> = msg_send![NSMenu::class(), alloc];
                 let edit_menu: Retained<NSMenu> = msg_send![edit_menu, initWithTitle: &*NSString::from_str("Edit")];
 
