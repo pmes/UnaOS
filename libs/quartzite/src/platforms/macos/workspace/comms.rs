@@ -19,7 +19,7 @@ use objc2_app_kit::{
 };
 use objc2_foundation::{
     NSObjectProtocol, NSRect, NSPoint, NSSize, MainThreadMarker, NSArray,
-    NSString, NSInteger, NSRange, NSMutableAttributedString, NSAttributedString, NSDictionary
+    NSString, NSInteger, NSRange, NSMutableAttributedString, NSAttributedString, NSAttributedStringKey
 };
 use std::cell::RefCell;
 use std::sync::{Arc, RwLock};
@@ -169,39 +169,21 @@ define_class!(
                     let attr_string: Allocated<NSMutableAttributedString> = msg_send![NSMutableAttributedString::class(), alloc];
                     let attr_string: Retained<NSMutableAttributedString> = msg_send![attr_string, initWithString: &*ns_text];
 
-                    let regular_font: Retained<objc2_app_kit::NSFont> = msg_send![objc2_app_kit::NSFont::class(), systemFontOfSize: 14.0 weight: objc2_app_kit::NSFontWeightRegular];
-                    let bold_font: Retained<objc2_app_kit::NSFont> = msg_send![objc2_app_kit::NSFont::class(), systemFontOfSize: 14.0 weight: objc2_app_kit::NSFontWeightBold];
+                    let regular_font: Retained<objc2_app_kit::NSFont> = msg_send![objc2_app_kit::NSFont::class(), systemFontOfSize: 14.0, weight: objc2_app_kit::NSFontWeightRegular];
+                    let bold_font: Retained<objc2_app_kit::NSFont> = msg_send![objc2_app_kit::NSFont::class(), systemFontOfSize: 14.0, weight: objc2_app_kit::NSFontWeightBold];
                     let text_color = NSColor::textColor();
 
-                    let bold_attrs: Retained<NSDictionary<objc2_app_kit::NSAttributedStringKey, AnyObject>> = NSDictionary::from_keys_and_objects(
-                        &[
-                            &*objc2_app_kit::NSFontAttributeName,
-                            &*objc2_app_kit::NSForegroundColorAttributeName
-                        ],
-                        &[
-                            &*Retained::cast::<AnyObject>(bold_font),
-                            &*Retained::cast::<AnyObject>(text_color.clone())
-                        ]
-                    );
-
-                    let regular_attrs: Retained<NSDictionary<objc2_app_kit::NSAttributedStringKey, AnyObject>> = NSDictionary::from_keys_and_objects(
-                        &[
-                            &*objc2_app_kit::NSFontAttributeName,
-                            &*objc2_app_kit::NSForegroundColorAttributeName
-                        ],
-                        &[
-                            &*Retained::cast::<AnyObject>(regular_font),
-                            &*Retained::cast::<AnyObject>(text_color)
-                        ]
-                    );
+                    let font_attr_name = &*objc2_app_kit::NSFontAttributeName;
+                    let color_attr_name = &*objc2_app_kit::NSForegroundColorAttributeName;
 
                     // Apply regular font to whole string
                     let full_range = NSRange::new(0, full_text.encode_utf16().count());
-                    let _: () = msg_send![&attr_string, setAttributes: &*regular_attrs range: full_range];
+                    let _: () = msg_send![&attr_string, addAttribute: font_attr_name, value: &*Retained::cast_unchecked::<AnyObject>(regular_font), range: full_range];
+                    let _: () = msg_send![&attr_string, addAttribute: color_attr_name, value: &*Retained::cast_unchecked::<AnyObject>(text_color.clone()), range: full_range];
 
                     // Apply bold font to sender
                     let prefix_range = NSRange::new(0, prefix.encode_utf16().count());
-                    let _: () = msg_send![&attr_string, setAttributes: &*bold_attrs range: prefix_range];
+                    let _: () = msg_send![&attr_string, addAttribute: font_attr_name, value: &*Retained::cast_unchecked::<AnyObject>(bold_font), range: prefix_range];
 
                     let _: () = msg_send![&text_field, setAttributedStringValue: &*attr_string];
                 }
@@ -242,24 +224,20 @@ impl CommsDelegate {
 
                 let token_ns = NSString::from_str(token);
 
-                let regular_font: Retained<objc2_app_kit::NSFont> = msg_send![objc2_app_kit::NSFont::class(), systemFontOfSize: 14.0 weight: objc2_app_kit::NSFontWeightRegular];
+                let regular_font: Retained<objc2_app_kit::NSFont> = msg_send![objc2_app_kit::NSFont::class(), systemFontOfSize: 14.0, weight: objc2_app_kit::NSFontWeightRegular];
                 let text_color = NSColor::textColor();
 
-                let regular_attrs: Retained<NSDictionary<objc2_app_kit::NSAttributedStringKey, AnyObject>> = NSDictionary::from_keys_and_objects(
-                    &[
-                        &*objc2_app_kit::NSFontAttributeName,
-                        &*objc2_app_kit::NSForegroundColorAttributeName
-                    ],
-                    &[
-                        &*Retained::cast::<AnyObject>(regular_font),
-                        &*Retained::cast::<AnyObject>(text_color)
-                    ]
-                );
+                let font_attr_name = &*objc2_app_kit::NSFontAttributeName;
+                let color_attr_name = &*objc2_app_kit::NSForegroundColorAttributeName;
 
-                let token_attr_string: Allocated<NSAttributedString> = msg_send![NSAttributedString::class(), alloc];
-                let token_attr_string: Retained<NSAttributedString> = msg_send![token_attr_string, initWithString: &*token_ns attributes: &*regular_attrs];
+                let token_mut_attr_string: Allocated<NSMutableAttributedString> = msg_send![NSMutableAttributedString::class(), alloc];
+                let token_mut_attr_string: Retained<NSMutableAttributedString> = msg_send![token_mut_attr_string, initWithString: &*token_ns];
 
-                let _: () = msg_send![&mutable_attr_string, appendAttributedString: &*token_attr_string];
+                let token_range = NSRange::new(0, token.encode_utf16().count());
+                let _: () = msg_send![&token_mut_attr_string, addAttribute: font_attr_name, value: &*Retained::cast_unchecked::<AnyObject>(regular_font), range: token_range];
+                let _: () = msg_send![&token_mut_attr_string, addAttribute: color_attr_name, value: &*Retained::cast_unchecked::<AnyObject>(text_color), range: token_range];
+
+                let _: () = msg_send![&mutable_attr_string, appendAttributedString: &*token_mut_attr_string];
 
                 let _: () = msg_send![&**text_field, setAttributedStringValue: &*mutable_attr_string];
 
