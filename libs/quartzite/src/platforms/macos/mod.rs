@@ -122,7 +122,7 @@ define_class!(
                 let redo_item: Retained<NSMenuItem> = msg_send![redo_item, initWithTitle: &*NSString::from_str("Redo"), action: Some(objc2::sel!(redo:)), keyEquivalent: &*NSString::from_str("Z")];
                 edit_menu.addItem(&redo_item);
 
-                edit_menu.addItem(&NSMenuItem::separatorItem());
+                edit_menu.addItem(&NSMenuItem::separatorItem(mtm));
 
                 let cut_item: Allocated<NSMenuItem> = msg_send![NSMenuItem::class(), alloc];
                 let cut_item: Retained<NSMenuItem> = msg_send![cut_item, initWithTitle: &*NSString::from_str("Cut"), action: Some(objc2::sel!(cut:)), keyEquivalent: &*NSString::from_str("x")];

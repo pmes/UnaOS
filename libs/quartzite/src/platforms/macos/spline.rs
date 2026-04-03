@@ -108,8 +108,8 @@ impl MacOSSpline {
 
         // Wrap delegates in MainThreadBound so they can cross thread boundaries safely.
         // They strictly require `Send` to be moved into tokio::spawn.
-        let comms_delegate_bound = Arc::new(objc2::MainThreadBound::new(comms_delegate.clone(), mtm));
-        let sidebar_delegate_bound = Arc::new(objc2::MainThreadBound::new(sidebar_delegate.clone(), mtm));
+        let comms_delegate_bound = Arc::new(dispatch2::MainThreadBound::new(comms_delegate.clone(), mtm));
+        let sidebar_delegate_bound = Arc::new(dispatch2::MainThreadBound::new(sidebar_delegate.clone(), mtm));
 
         tokio::spawn(async move {
             loop {
@@ -134,9 +134,7 @@ impl MacOSSpline {
                                         let is_chat = record.subject.eq_ignore_ascii_case("chat") || record.subject.eq_ignore_ascii_case("comms");
                                         if is_chat {
                                             history.push(bandy::state::HistoryItem {
-                                                id: record.id.clone().unwrap_or_default(),
                                                 sender: record.sender.clone(),
-                                                subject: record.subject.clone(),
                                                 content: record.content.clone(),
                                                 timestamp: record.timestamp.clone(),
                                                 is_chat,
@@ -151,7 +149,7 @@ impl MacOSSpline {
                                     }
                                 });
                             },
-                            SMessage::StreamToken(token_event) => {
+                            SMessage::AiToken(token_string) => {
                                 dispatch2::DispatchQueue::main().exec_async(move || {
                                     let mtm = objc2_foundation::MainThreadMarker::new().unwrap();
                                     let comms_delegate = comms_bound.get(mtm);
@@ -162,10 +160,10 @@ impl MacOSSpline {
                                     // Append the chunk to the state so history is accurate
                                     if let Some(last_item) = history.last_mut() {
                                         if last_item.sender == "Lumen" {
-                                            last_item.content.push_str(&token_event.chunk);
+                                            last_item.content.push_str(&token_string);
 
                                             // Directly append string to TextKit NSTextStorage without reloading the table cell!
-                                            comms_delegate.append_stream_token(&token_event.chunk);
+                                            comms_delegate.append_stream_token(&token_string);
                                         }
                                     }
                                 });

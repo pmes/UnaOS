@@ -70,7 +70,10 @@ define_class!(
             row: NSInteger,
         ) -> Option<Retained<NSView>> {
             let history = self.ivars().history.borrow();
-            let item = history.get(row as usize)?;
+            let item = match history.get(row as usize) {
+                Some(i) => i,
+                None => return None,
+            };
 
             let identifier = NSString::from_str("ChatBubbleCell");
             let mut cell: Option<Retained<NSTableCellView>> = unsafe {
@@ -174,6 +177,7 @@ define_class!(
 unsafe impl NSObjectProtocol for CommsDelegate {}
 unsafe impl NSTextDelegate for CommsDelegate {}
 unsafe impl NSSplitViewDelegate for CommsDelegate {}
+unsafe impl NSControlTextEditingDelegate for CommsDelegate {}
 
 impl CommsDelegate {
     pub fn append_stream_token(&self, token: &str) {
@@ -190,7 +194,7 @@ impl CommsDelegate {
 
                 let new_length: objc2_foundation::NSUInteger = msg_send![&text_storage, length];
                 let scroll_range = NSRange { location: new_length, length: 0 };
-                let _: () = msg_send![&text_view, scrollRangeToVisible: scroll_range];
+                let _: () = msg_send![&**text_view, scrollRangeToVisible: scroll_range];
             }
         }
     }
