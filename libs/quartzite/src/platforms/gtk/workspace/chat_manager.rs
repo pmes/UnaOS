@@ -390,20 +390,8 @@ impl ChatBoxManager {
                             msg_lbl.set_label(&cont);
                             msg_lbl.set_selectable(true);
                         } else {
-                            let mut byte_idx = 0;
-                            let mut line_count = 0;
-
-                            for (idx, c) in cont.char_indices() {
-                                if c == '\n' { line_count += 1; }
-                                if line_count >= 7 || idx >= 500 {
-                                    byte_idx = idx;
-                                    break;
-                                }
-                                byte_idx = idx + c.len_utf8();
-                            }
-
                             let mut truncated = String::with_capacity(550);
-                            if byte_idx < cont.len() {
+                            if let Some(byte_idx) = gneiss_pal::types::calculate_truncation(&cont, 7, 500) {
                                 truncated.push_str(&cont[..byte_idx]);
                                 truncated.push_str("\n...");
                             } else {
