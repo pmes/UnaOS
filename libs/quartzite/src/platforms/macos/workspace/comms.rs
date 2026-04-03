@@ -138,10 +138,8 @@ define_class!(
 
                 for i in 0..subviews.len() {
                     let subview = subviews.objectAtIndex(i);
-                    if subview.is_kind_of::<NSTextView>() {
-                        found_text_view = Some(unsafe {
-                            Retained::cast_unchecked::<NSTextView>(Retained::retain(subview as *const _ as *mut _).unwrap())
-                        });
+                    if let Ok(text_view) = subview.downcast::<NSTextView>() {
+                        found_text_view = Some(text_view);
                         break;
                     }
                 }
@@ -307,7 +305,7 @@ pub fn create_comms(_mtm: MainThreadMarker, app_state: &Arc<RwLock<AppState>>) -
             None, NSLayoutAttribute::NotAnAttribute, 1.0, 32.0
         )
     };
-    let input_height_array = unsafe { NSArray::from_slice(&[&*input_height_constraint]) };
+    let input_height_array = NSArray::from_slice(&[&*input_height_constraint]);
     NSLayoutConstraint::activateConstraints(&input_height_array);
 
     let text_view: Allocated<NSTextView> = unsafe { msg_send![NSTextView::class(), alloc] };
