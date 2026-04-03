@@ -160,6 +160,11 @@ pub fn create_comms(_mtm: MainThreadMarker, app_state: &Arc<RwLock<AppState>>) -
 
     unsafe {
         let _: () = msg_send![&table_view, reloadData];
+
+        let num_rows: objc2_foundation::NSInteger = msg_send![&table_view, numberOfRows];
+        if num_rows > 0 {
+            let _: () = msg_send![&table_view, scrollRowToVisible: num_rows - 1];
+        }
     }
 
     // Add it to the split view
@@ -342,6 +347,13 @@ pub fn create_comms(_mtm: MainThreadMarker, app_state: &Arc<RwLock<AppState>>) -
 
         let _: () = msg_send![&split_view, setHoldingPriority: 250.0f32, forSubviewAtIndex: 0isize];
         let _: () = msg_send![&split_view, setHoldingPriority: 750.0f32, forSubviewAtIndex: 1isize];
+    }
+
+    // Enforce Layout Integrity (Squeezing) - Comms minimum width
+    unsafe {
+        let width_anchor: Retained<objc2_app_kit::NSLayoutDimension> = objc2::msg_send_id![&split_view, widthAnchor];
+        let constraint: Retained<objc2_app_kit::NSLayoutConstraint> = objc2::msg_send_id![&width_anchor, constraintGreaterThanOrEqualToConstant: 300.0f64];
+        let _: () = msg_send![&constraint, setActive: objc2::runtime::Bool::YES];
     }
 
     (unsafe { Retained::cast_unchecked::<NSView>(split_view) }, delegate)
