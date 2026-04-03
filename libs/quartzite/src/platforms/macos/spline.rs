@@ -162,12 +162,13 @@ impl MacOSSpline {
 
                                     // Append the chunk to the state so history is accurate
                                     if let Some(last_item) = history.last_mut() {
-                                        if last_item.sender == "Lumen" {
-                                            last_item.content.push_str(&token_string);
+                                        // The token directly appends to the last item.
+                                        // We no longer rely on UI-side string checks ("Lumen"),
+                                        // as AiTokens naturally follow AiMessage beginnings.
+                                        last_item.content.push_str(&token_string);
 
-                                            // Directly append string to TextKit NSTextStorage without reloading the table cell!
-                                            comms_delegate.append_stream_token(&token_string);
-                                        }
+                                        // Directly append string to TextKit NSTextStorage without reloading the table cell!
+                                        comms_delegate.append_stream_token(&token_string);
                                     }
                                 });
                             },

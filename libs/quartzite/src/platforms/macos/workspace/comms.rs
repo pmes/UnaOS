@@ -11,7 +11,7 @@ use objc2::runtime::ProtocolObject;
 use objc2::{define_class, msg_send, ClassType, DefinedClass};
 use objc2::runtime::AnyObject;
 use objc2_app_kit::{
-    NSResponder, NSTextView, NSTextViewDelegate, NSTextDelegate,
+    NSResponder, NSTextView, NSTextField, NSTextViewDelegate, NSTextDelegate,
     NSSplitView, NSSplitViewDelegate, NSScrollView, NSView,
     NSLayoutConstraint, NSLayoutAttribute, NSLayoutRelation,
     NSColor, NSTableView, NSTableViewDataSource, NSTableViewDelegate,
@@ -19,7 +19,7 @@ use objc2_app_kit::{
 };
 use objc2_foundation::{
     NSObjectProtocol, NSRect, NSPoint, NSSize, MainThreadMarker, NSArray,
-    NSString, NSInteger, NSRange
+    NSString, NSInteger, NSRange, NSMutableAttributedString, NSAttributedString, NSAttributedStringKey
 };
 use std::cell::RefCell;
 use std::sync::{Arc, RwLock};
@@ -31,7 +31,7 @@ use bandy::state::{AppState, HistoryItem};
 pub struct CommsDelegateIvars {
     pub table_view: RefCell<Option<Retained<NSTableView>>>,
     pub history: RefCell<Vec<HistoryItem>>,
-    pub active_text_view: RefCell<Option<Retained<NSTextView>>>,
+    pub active_text_view: RefCell<Option<Retained<NSTextField>>>,
 }
 
 define_class!(
@@ -90,68 +90,102 @@ define_class!(
                         let _: () = msg_send![&new_cell, setIdentifier: &*identifier];
                     }
 
-                    // Create NSTextView for the bubble content
-                    let text_view: Allocated<NSTextView> = unsafe { msg_send![NSTextView::class(), alloc] };
-                    let text_view: Retained<NSTextView> = unsafe { msg_send![text_view, initWithFrame: frame] };
+                    // Create NSTextField for the bubble content to enable Auto Layout intrinsic sizing
+                    let text_field: Allocated<NSTextField> = unsafe { msg_send![NSTextField::class(), alloc] };
+                    let text_field: Retained<NSTextField> = unsafe { msg_send![text_field, initWithFrame: frame] };
                     unsafe {
-                        let _: () = msg_send![&text_view, setTranslatesAutoresizingMaskIntoConstraints: objc2::runtime::Bool::NO];
-                        let _: () = msg_send![&text_view, setDrawsBackground: objc2::runtime::Bool::NO];
-                        let _: () = msg_send![&text_view, setEditable: objc2::runtime::Bool::NO];
-                        let _: () = msg_send![&text_view, setSelectable: objc2::runtime::Bool::YES];
-                        let _: () = msg_send![&text_view, setVerticallyResizable: objc2::runtime::Bool::YES];
-                        let _: () = msg_send![&text_view, setHorizontallyResizable: objc2::runtime::Bool::NO];
+                        let _: () = msg_send![&text_field, setTranslatesAutoresizingMaskIntoConstraints: objc2::runtime::Bool::NO];
+                        let _: () = msg_send![&text_field, setDrawsBackground: objc2::runtime::Bool::NO];
+                        let _: () = msg_send![&text_field, setBordered: objc2::runtime::Bool::NO];
+                        let _: () = msg_send![&text_field, setEditable: objc2::runtime::Bool::NO];
+                        let _: () = msg_send![&text_field, setSelectable: objc2::runtime::Bool::YES];
+
+                        // Lower horizontal compression resistance to allow wrapping
+                        let _: () = msg_send![&text_field, setContentCompressionResistancePriority: 250.0f32, forOrientation: objc2_app_kit::NSLayoutConstraintOrientation::Horizontal];
+
+                        // Enable wrapping on its cell
+                        let cell_obj: *mut AnyObject = msg_send![&text_field, cell];
+                        if !cell_obj.is_null() {
+                            let _: () = msg_send![cell_obj, setWraps: objc2::runtime::Bool::YES];
+                            let _: () = msg_send![cell_obj, setLineBreakMode: 0isize]; // NSLineBreakByWordWrapping
+                        }
                     }
 
-                    new_cell.addSubview(&text_view);
+                    new_cell.addSubview(&text_field);
 
-                    // Anchor text view to cell
+                    // Anchor text field to cell
                     let constraints = unsafe {
                         NSArray::from_slice(&[
                             &*NSLayoutConstraint::constraintWithItem_attribute_relatedBy_toItem_attribute_multiplier_constant(
-                                &text_view, NSLayoutAttribute::Top, NSLayoutRelation::Equal,
+                                &text_field, NSLayoutAttribute::Top, NSLayoutRelation::Equal,
                                 Some(&new_cell), NSLayoutAttribute::Top, 1.0, 8.0
                             ),
                             &*NSLayoutConstraint::constraintWithItem_attribute_relatedBy_toItem_attribute_multiplier_constant(
-                                &text_view, NSLayoutAttribute::Bottom, NSLayoutRelation::Equal,
+                                &text_field, NSLayoutAttribute::Bottom, NSLayoutRelation::Equal,
                                 Some(&new_cell), NSLayoutAttribute::Bottom, 1.0, -8.0
                             ),
                             &*NSLayoutConstraint::constraintWithItem_attribute_relatedBy_toItem_attribute_multiplier_constant(
-                                &text_view, NSLayoutAttribute::Leading, NSLayoutRelation::Equal,
+                                &text_field, NSLayoutAttribute::Leading, NSLayoutRelation::Equal,
                                 Some(&new_cell), NSLayoutAttribute::Leading, 1.0, 16.0
                             ),
                             &*NSLayoutConstraint::constraintWithItem_attribute_relatedBy_toItem_attribute_multiplier_constant(
-                                &text_view, NSLayoutAttribute::Trailing, NSLayoutRelation::Equal,
+                                &text_field, NSLayoutAttribute::Trailing, NSLayoutRelation::Equal,
                                 Some(&new_cell), NSLayoutAttribute::Trailing, 1.0, -16.0
                             ),
                         ])
                     };
                     NSLayoutConstraint::activateConstraints(&constraints);
 
-                    // Attach to view with tag 100 for easy retrieval
-                    unsafe {
-                        let _: () = msg_send![&text_view, setTag: 100isize];
-                    }
-
                     cell = Some(new_cell);
                 }
 
                 let cell = cell.unwrap();
-                let text_view_ptr: *mut AnyObject = unsafe { msg_send![&cell, viewWithTag: 100isize] };
-                let text_view = unsafe { Retained::retain(text_view_ptr).unwrap() };
-                let text_view = unsafe { Retained::cast_unchecked::<NSTextView>(text_view) };
 
-                // Keep track of the active text view for streaming if this is the last cell
-                if row == (history.len() - 1) as NSInteger {
-                    *self.ivars().active_text_view.borrow_mut() = Some(text_view.clone());
+                // Safe subview iteration to find the NSTextField
+                let subviews: Retained<NSArray<NSView>> = cell.subviews();
+                let mut found_text_field = None;
+
+                for i in 0..subviews.len() {
+                    let subview = subviews.objectAtIndex(i);
+                    if let Ok(text_field) = subview.downcast::<NSTextField>() {
+                        found_text_field = Some(text_field);
+                        break;
+                    }
                 }
 
-                // Format string appropriately based on sender
-                let prefix = if item.sender == "Architect" { "Architect:\n" } else { "Lumen:\n" };
+                let text_field = found_text_field.expect("NSTextField must exist in ChatBubbleCell");
+
+                // Keep track of the active text field for streaming if this is the last cell
+                if row == (history.len() - 1) as NSInteger {
+                    *self.ivars().active_text_view.borrow_mut() = Some(text_field.clone());
+                }
+
+                // Format string appropriately based on sender using semantic typography
+                let prefix = format!("{}:\n", item.sender);
                 let full_text = format!("{}{}", prefix, item.content);
                 let ns_text = NSString::from_str(&full_text);
 
                 unsafe {
-                    let _: () = msg_send![&text_view, setString: &*ns_text];
+                    let attr_string: Allocated<NSMutableAttributedString> = msg_send![NSMutableAttributedString::class(), alloc];
+                    let attr_string: Retained<NSMutableAttributedString> = msg_send![attr_string, initWithString: &*ns_text];
+
+                    let regular_font: Retained<objc2_app_kit::NSFont> = msg_send![objc2_app_kit::NSFont::class(), systemFontOfSize: 14.0, weight: objc2_app_kit::NSFontWeightRegular];
+                    let bold_font: Retained<objc2_app_kit::NSFont> = msg_send![objc2_app_kit::NSFont::class(), systemFontOfSize: 14.0, weight: objc2_app_kit::NSFontWeightBold];
+                    let text_color = NSColor::textColor();
+
+                    let font_attr_name = &*objc2_app_kit::NSFontAttributeName;
+                    let color_attr_name = &*objc2_app_kit::NSForegroundColorAttributeName;
+
+                    // Apply regular font to whole string
+                    let full_range = NSRange::new(0, full_text.encode_utf16().count());
+                    let _: () = msg_send![&attr_string, addAttribute: font_attr_name, value: &*Retained::cast_unchecked::<AnyObject>(regular_font), range: full_range];
+                    let _: () = msg_send![&attr_string, addAttribute: color_attr_name, value: &*Retained::cast_unchecked::<AnyObject>(text_color.clone()), range: full_range];
+
+                    // Apply bold font to sender
+                    let prefix_range = NSRange::new(0, prefix.encode_utf16().count());
+                    let _: () = msg_send![&attr_string, addAttribute: font_attr_name, value: &*Retained::cast_unchecked::<AnyObject>(bold_font), range: prefix_range];
+
+                    let _: () = msg_send![&text_field, setAttributedStringValue: &*attr_string];
                 }
 
                 Some(unsafe { Retained::cast_unchecked::<NSView>(cell) })
@@ -181,20 +215,35 @@ unsafe impl NSControlTextEditingDelegate for CommsDelegate {}
 
 impl CommsDelegate {
     pub fn append_stream_token(&self, token: &str) {
-        if let Some(text_view) = self.ivars().active_text_view.borrow().as_ref() {
-            let text_storage = unsafe { text_view.textStorage().unwrap() };
-            let token_ns = NSString::from_str(token);
-
+        if let Some(text_field) = self.ivars().active_text_view.borrow().as_ref() {
             unsafe {
-                let _: () = msg_send![&text_storage, beginEditing];
-                let length: objc2_foundation::NSUInteger = msg_send![&text_storage, length];
-                let range = NSRange { location: length, length: 0 };
-                let _: () = msg_send![&text_storage, replaceCharactersInRange: range, withString: &*token_ns];
-                let _: () = msg_send![&text_storage, endEditing];
+                let current_attr_string: Retained<NSAttributedString> = msg_send![&**text_field, attributedStringValue];
 
-                let new_length: objc2_foundation::NSUInteger = msg_send![&text_storage, length];
-                let scroll_range = NSRange { location: new_length, length: 0 };
-                let _: () = msg_send![&**text_view, scrollRangeToVisible: scroll_range];
+                let mutable_attr_string: Allocated<NSMutableAttributedString> = msg_send![NSMutableAttributedString::class(), alloc];
+                let mutable_attr_string: Retained<NSMutableAttributedString> = msg_send![mutable_attr_string, initWithAttributedString: &*current_attr_string];
+
+                let token_ns = NSString::from_str(token);
+
+                let regular_font: Retained<objc2_app_kit::NSFont> = msg_send![objc2_app_kit::NSFont::class(), systemFontOfSize: 14.0, weight: objc2_app_kit::NSFontWeightRegular];
+                let text_color = NSColor::textColor();
+
+                let font_attr_name = &*objc2_app_kit::NSFontAttributeName;
+                let color_attr_name = &*objc2_app_kit::NSForegroundColorAttributeName;
+
+                let token_mut_attr_string: Allocated<NSMutableAttributedString> = msg_send![NSMutableAttributedString::class(), alloc];
+                let token_mut_attr_string: Retained<NSMutableAttributedString> = msg_send![token_mut_attr_string, initWithString: &*token_ns];
+
+                let token_range = NSRange::new(0, token.encode_utf16().count());
+                let _: () = msg_send![&token_mut_attr_string, addAttribute: font_attr_name, value: &*Retained::cast_unchecked::<AnyObject>(regular_font), range: token_range];
+                let _: () = msg_send![&token_mut_attr_string, addAttribute: color_attr_name, value: &*Retained::cast_unchecked::<AnyObject>(text_color), range: token_range];
+
+                let _: () = msg_send![&mutable_attr_string, appendAttributedString: &*token_mut_attr_string];
+
+                let _: () = msg_send![&**text_field, setAttributedStringValue: &*mutable_attr_string];
+
+                // If it's inside a scroll view or table, we might need to tell the table to update layouts
+                // But typically NSTableView with automatic row heights picks up intrinsic size changes
+                // on the next layout pass.
             }
         }
     }
@@ -248,10 +297,15 @@ pub fn create_comms(_mtm: MainThreadMarker, app_state: &Arc<RwLock<AppState>>) -
         table_view.setDataSource(Some(ProtocolObject::from_ref(&*delegate)));
         table_view.setDelegate(Some(ProtocolObject::from_ref(&*delegate)));
 
+        // Let table view handle column sizing uniformly
+        let _: () = msg_send![&table_view, setColumnAutoresizingStyle: 1isize]; // NSTableViewUniformColumnAutoresizingStyle
+
         // Create the main column
         let column: Allocated<NSTableColumn> = msg_send![NSTableColumn::class(), alloc];
         let column_id = NSString::from_str("ChatColumn");
         let column: Retained<NSTableColumn> = msg_send![column, initWithIdentifier: &*column_id];
+        // Ensure column stretches to width of table view
+        let _: () = msg_send![&column, setResizingMask: 1isize]; // NSTableColumnAutoresizingMask
         // Hide the column title since we disabled the header view
         table_view.addTableColumn(&column);
     }
@@ -299,7 +353,8 @@ pub fn create_comms(_mtm: MainThreadMarker, app_state: &Arc<RwLock<AppState>>) -
             None, NSLayoutAttribute::NotAnAttribute, 1.0, 32.0
         )
     };
-    unsafe { NSLayoutConstraint::activateConstraints(&NSArray::from_slice(&[&*input_height_constraint])); }
+    let input_height_array = NSArray::from_slice(&[&*input_height_constraint]);
+    NSLayoutConstraint::activateConstraints(&input_height_array);
 
     let text_view: Allocated<NSTextView> = unsafe { msg_send![NSTextView::class(), alloc] };
     let text_view: Retained<NSTextView> = unsafe { msg_send![text_view, initWithFrame: frame] };

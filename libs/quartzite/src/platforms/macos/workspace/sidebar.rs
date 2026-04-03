@@ -217,9 +217,7 @@ define_class!(
                         ),
                     ])
                 };
-                unsafe {
-                    objc2_app_kit::NSLayoutConstraint::activateConstraints(&constraints);
-                }
+                objc2_app_kit::NSLayoutConstraint::activateConstraints(&constraints);
 
                 cell = Some(new_cell);
             }
