@@ -19,7 +19,7 @@ use objc2_app_kit::{
 };
 use objc2_foundation::{
     NSObjectProtocol, NSRect, NSPoint, NSSize, MainThreadMarker, NSArray,
-    NSString, NSInteger, NSRange
+    NSString, NSInteger, NSRange, NSMutableAttributedString, NSAttributedString, NSDictionary
 };
 use std::cell::RefCell;
 use std::sync::{Arc, RwLock};
@@ -160,13 +160,50 @@ define_class!(
                     *self.ivars().active_text_view.borrow_mut() = Some(text_field.clone());
                 }
 
-                // Format string appropriately based on sender
-                let prefix = if item.sender == "Architect" { "Architect:\n" } else { "Lumen:\n" };
+                // Format string appropriately based on sender using semantic typography
+                let prefix = format!("{}:\n", item.sender);
                 let full_text = format!("{}{}", prefix, item.content);
                 let ns_text = NSString::from_str(&full_text);
 
                 unsafe {
-                    let _: () = msg_send![&text_field, setStringValue: &*ns_text];
+                    let attr_string: Allocated<NSMutableAttributedString> = msg_send![NSMutableAttributedString::class(), alloc];
+                    let attr_string: Retained<NSMutableAttributedString> = msg_send![attr_string, initWithString: &*ns_text];
+
+                    let regular_font: Retained<objc2_app_kit::NSFont> = msg_send![objc2_app_kit::NSFont::class(), systemFontOfSize: 14.0 weight: objc2_app_kit::NSFontWeightRegular];
+                    let bold_font: Retained<objc2_app_kit::NSFont> = msg_send![objc2_app_kit::NSFont::class(), systemFontOfSize: 14.0 weight: objc2_app_kit::NSFontWeightBold];
+                    let text_color = NSColor::textColor();
+
+                    let bold_attrs: Retained<NSDictionary<objc2_app_kit::NSAttributedStringKey, AnyObject>> = NSDictionary::from_keys_and_objects(
+                        &[
+                            &*objc2_app_kit::NSFontAttributeName,
+                            &*objc2_app_kit::NSForegroundColorAttributeName
+                        ],
+                        &[
+                            &*Retained::cast::<AnyObject>(bold_font),
+                            &*Retained::cast::<AnyObject>(text_color.clone())
+                        ]
+                    );
+
+                    let regular_attrs: Retained<NSDictionary<objc2_app_kit::NSAttributedStringKey, AnyObject>> = NSDictionary::from_keys_and_objects(
+                        &[
+                            &*objc2_app_kit::NSFontAttributeName,
+                            &*objc2_app_kit::NSForegroundColorAttributeName
+                        ],
+                        &[
+                            &*Retained::cast::<AnyObject>(regular_font),
+                            &*Retained::cast::<AnyObject>(text_color)
+                        ]
+                    );
+
+                    // Apply regular font to whole string
+                    let full_range = NSRange::new(0, full_text.encode_utf16().count());
+                    let _: () = msg_send![&attr_string, setAttributes: &*regular_attrs range: full_range];
+
+                    // Apply bold font to sender
+                    let prefix_range = NSRange::new(0, prefix.encode_utf16().count());
+                    let _: () = msg_send![&attr_string, setAttributes: &*bold_attrs range: prefix_range];
+
+                    let _: () = msg_send![&text_field, setAttributedStringValue: &*attr_string];
                 }
 
                 Some(unsafe { Retained::cast_unchecked::<NSView>(cell) })
@@ -197,14 +234,34 @@ unsafe impl NSControlTextEditingDelegate for CommsDelegate {}
 impl CommsDelegate {
     pub fn append_stream_token(&self, token: &str) {
         if let Some(text_field) = self.ivars().active_text_view.borrow().as_ref() {
-            let current_text_ns: Retained<NSString> = unsafe { msg_send![&**text_field, stringValue] };
-            let current_text = current_text_ns.to_string();
-
-            let new_text = format!("{}{}", current_text, token);
-            let new_text_ns = NSString::from_str(&new_text);
-
             unsafe {
-                let _: () = msg_send![&**text_field, setStringValue: &*new_text_ns];
+                let current_attr_string: Retained<NSAttributedString> = msg_send![&**text_field, attributedStringValue];
+
+                let mutable_attr_string: Allocated<NSMutableAttributedString> = msg_send![NSMutableAttributedString::class(), alloc];
+                let mutable_attr_string: Retained<NSMutableAttributedString> = msg_send![mutable_attr_string, initWithAttributedString: &*current_attr_string];
+
+                let token_ns = NSString::from_str(token);
+
+                let regular_font: Retained<objc2_app_kit::NSFont> = msg_send![objc2_app_kit::NSFont::class(), systemFontOfSize: 14.0 weight: objc2_app_kit::NSFontWeightRegular];
+                let text_color = NSColor::textColor();
+
+                let regular_attrs: Retained<NSDictionary<objc2_app_kit::NSAttributedStringKey, AnyObject>> = NSDictionary::from_keys_and_objects(
+                    &[
+                        &*objc2_app_kit::NSFontAttributeName,
+                        &*objc2_app_kit::NSForegroundColorAttributeName
+                    ],
+                    &[
+                        &*Retained::cast::<AnyObject>(regular_font),
+                        &*Retained::cast::<AnyObject>(text_color)
+                    ]
+                );
+
+                let token_attr_string: Allocated<NSAttributedString> = msg_send![NSAttributedString::class(), alloc];
+                let token_attr_string: Retained<NSAttributedString> = msg_send![token_attr_string, initWithString: &*token_ns attributes: &*regular_attrs];
+
+                let _: () = msg_send![&mutable_attr_string, appendAttributedString: &*token_attr_string];
+
+                let _: () = msg_send![&**text_field, setAttributedStringValue: &*mutable_attr_string];
 
                 // If it's inside a scroll view or table, we might need to tell the table to update layouts
                 // But typically NSTableView with automatic row heights picks up intrinsic size changes
@@ -262,10 +319,15 @@ pub fn create_comms(_mtm: MainThreadMarker, app_state: &Arc<RwLock<AppState>>) -
         table_view.setDataSource(Some(ProtocolObject::from_ref(&*delegate)));
         table_view.setDelegate(Some(ProtocolObject::from_ref(&*delegate)));
 
+        // Let table view handle column sizing uniformly
+        let _: () = msg_send![&table_view, setColumnAutoresizingStyle: 1isize]; // NSTableViewUniformColumnAutoresizingStyle
+
         // Create the main column
         let column: Allocated<NSTableColumn> = msg_send![NSTableColumn::class(), alloc];
         let column_id = NSString::from_str("ChatColumn");
         let column: Retained<NSTableColumn> = msg_send![column, initWithIdentifier: &*column_id];
+        // Ensure column stretches to width of table view
+        let _: () = msg_send![&column, setResizingMask: 1isize]; // NSTableColumnAutoresizingMask
         // Hide the column title since we disabled the header view
         table_view.addTableColumn(&column);
     }
