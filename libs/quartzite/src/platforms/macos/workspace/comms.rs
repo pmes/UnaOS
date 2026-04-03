@@ -19,7 +19,7 @@ use objc2_app_kit::{
 };
 use objc2_foundation::{
     NSObjectProtocol, NSRect, NSPoint, NSSize, MainThreadMarker, NSArray,
-    NSString, NSEdgeInsets, NSInteger, NSAttributedString, NSRange
+    NSString, NSInteger, NSRange
 };
 use std::cell::RefCell;
 use std::sync::{Arc, RwLock};
