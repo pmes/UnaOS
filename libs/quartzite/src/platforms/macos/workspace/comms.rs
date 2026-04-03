@@ -15,7 +15,7 @@ use objc2_app_kit::{
     NSSplitView, NSSplitViewDelegate, NSScrollView, NSView,
     NSLayoutConstraint, NSLayoutAttribute, NSLayoutRelation,
     NSColor, NSTableView, NSTableViewDataSource, NSTableViewDelegate,
-    NSTableColumn, NSTableCellView
+    NSTableColumn, NSTableCellView, NSControlTextEditingDelegate
 };
 use objc2_foundation::{
     NSObjectProtocol, NSRect, NSPoint, NSSize, MainThreadMarker, NSArray,
