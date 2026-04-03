@@ -11,7 +11,7 @@ use objc2::runtime::ProtocolObject;
 use objc2::{define_class, msg_send, ClassType, DefinedClass};
 use objc2::runtime::AnyObject;
 use objc2_app_kit::{
-    NSResponder, NSTextView, NSTextViewDelegate, NSTextDelegate,
+    NSResponder, NSTextView, NSTextField, NSTextViewDelegate, NSTextDelegate,
     NSSplitView, NSSplitViewDelegate, NSScrollView, NSView,
     NSLayoutConstraint, NSLayoutAttribute, NSLayoutRelation,
     NSColor, NSTableView, NSTableViewDataSource, NSTableViewDelegate,
@@ -31,7 +31,7 @@ use bandy::state::{AppState, HistoryItem};
 pub struct CommsDelegateIvars {
     pub table_view: RefCell<Option<Retained<NSTableView>>>,
     pub history: RefCell<Vec<HistoryItem>>,
-    pub active_text_view: RefCell<Option<Retained<NSTextView>>>,
+    pub active_text_view: RefCell<Option<Retained<NSTextField>>>,
 }
 
 define_class!(
@@ -90,37 +90,46 @@ define_class!(
                         let _: () = msg_send![&new_cell, setIdentifier: &*identifier];
                     }
 
-                    // Create NSTextView for the bubble content
-                    let text_view: Allocated<NSTextView> = unsafe { msg_send![NSTextView::class(), alloc] };
-                    let text_view: Retained<NSTextView> = unsafe { msg_send![text_view, initWithFrame: frame] };
+                    // Create NSTextField for the bubble content to enable Auto Layout intrinsic sizing
+                    let text_field: Allocated<NSTextField> = unsafe { msg_send![NSTextField::class(), alloc] };
+                    let text_field: Retained<NSTextField> = unsafe { msg_send![text_field, initWithFrame: frame] };
                     unsafe {
-                        let _: () = msg_send![&text_view, setTranslatesAutoresizingMaskIntoConstraints: objc2::runtime::Bool::NO];
-                        let _: () = msg_send![&text_view, setDrawsBackground: objc2::runtime::Bool::NO];
-                        let _: () = msg_send![&text_view, setEditable: objc2::runtime::Bool::NO];
-                        let _: () = msg_send![&text_view, setSelectable: objc2::runtime::Bool::YES];
-                        let _: () = msg_send![&text_view, setVerticallyResizable: objc2::runtime::Bool::YES];
-                        let _: () = msg_send![&text_view, setHorizontallyResizable: objc2::runtime::Bool::NO];
+                        let _: () = msg_send![&text_field, setTranslatesAutoresizingMaskIntoConstraints: objc2::runtime::Bool::NO];
+                        let _: () = msg_send![&text_field, setDrawsBackground: objc2::runtime::Bool::NO];
+                        let _: () = msg_send![&text_field, setBordered: objc2::runtime::Bool::NO];
+                        let _: () = msg_send![&text_field, setEditable: objc2::runtime::Bool::NO];
+                        let _: () = msg_send![&text_field, setSelectable: objc2::runtime::Bool::YES];
+
+                        // Lower horizontal compression resistance to allow wrapping
+                        let _: () = msg_send![&text_field, setContentCompressionResistancePriority: 250.0f32, forOrientation: objc2_app_kit::NSLayoutConstraintOrientation::Horizontal];
+
+                        // Enable wrapping on its cell
+                        let cell_obj: *mut AnyObject = msg_send![&text_field, cell];
+                        if !cell_obj.is_null() {
+                            let _: () = msg_send![cell_obj, setWraps: objc2::runtime::Bool::YES];
+                            let _: () = msg_send![cell_obj, setLineBreakMode: 0isize]; // NSLineBreakByWordWrapping
+                        }
                     }
 
-                    new_cell.addSubview(&text_view);
+                    new_cell.addSubview(&text_field);
 
-                    // Anchor text view to cell
+                    // Anchor text field to cell
                     let constraints = unsafe {
                         NSArray::from_slice(&[
                             &*NSLayoutConstraint::constraintWithItem_attribute_relatedBy_toItem_attribute_multiplier_constant(
-                                &text_view, NSLayoutAttribute::Top, NSLayoutRelation::Equal,
+                                &text_field, NSLayoutAttribute::Top, NSLayoutRelation::Equal,
                                 Some(&new_cell), NSLayoutAttribute::Top, 1.0, 8.0
                             ),
                             &*NSLayoutConstraint::constraintWithItem_attribute_relatedBy_toItem_attribute_multiplier_constant(
-                                &text_view, NSLayoutAttribute::Bottom, NSLayoutRelation::Equal,
+                                &text_field, NSLayoutAttribute::Bottom, NSLayoutRelation::Equal,
                                 Some(&new_cell), NSLayoutAttribute::Bottom, 1.0, -8.0
                             ),
                             &*NSLayoutConstraint::constraintWithItem_attribute_relatedBy_toItem_attribute_multiplier_constant(
-                                &text_view, NSLayoutAttribute::Leading, NSLayoutRelation::Equal,
+                                &text_field, NSLayoutAttribute::Leading, NSLayoutRelation::Equal,
                                 Some(&new_cell), NSLayoutAttribute::Leading, 1.0, 16.0
                             ),
                             &*NSLayoutConstraint::constraintWithItem_attribute_relatedBy_toItem_attribute_multiplier_constant(
-                                &text_view, NSLayoutAttribute::Trailing, NSLayoutRelation::Equal,
+                                &text_field, NSLayoutAttribute::Trailing, NSLayoutRelation::Equal,
                                 Some(&new_cell), NSLayoutAttribute::Trailing, 1.0, -16.0
                             ),
                         ])
@@ -132,23 +141,23 @@ define_class!(
 
                 let cell = cell.unwrap();
 
-                // Safe subview iteration to find the NSTextView
+                // Safe subview iteration to find the NSTextField
                 let subviews: Retained<NSArray<NSView>> = cell.subviews();
-                let mut found_text_view = None;
+                let mut found_text_field = None;
 
                 for i in 0..subviews.len() {
                     let subview = subviews.objectAtIndex(i);
-                    if let Ok(text_view) = subview.downcast::<NSTextView>() {
-                        found_text_view = Some(text_view);
+                    if let Ok(text_field) = subview.downcast::<NSTextField>() {
+                        found_text_field = Some(text_field);
                         break;
                     }
                 }
 
-                let text_view = found_text_view.expect("NSTextView must exist in ChatBubbleCell");
+                let text_field = found_text_field.expect("NSTextField must exist in ChatBubbleCell");
 
-                // Keep track of the active text view for streaming if this is the last cell
+                // Keep track of the active text field for streaming if this is the last cell
                 if row == (history.len() - 1) as NSInteger {
-                    *self.ivars().active_text_view.borrow_mut() = Some(text_view.clone());
+                    *self.ivars().active_text_view.borrow_mut() = Some(text_field.clone());
                 }
 
                 // Format string appropriately based on sender
@@ -157,7 +166,7 @@ define_class!(
                 let ns_text = NSString::from_str(&full_text);
 
                 unsafe {
-                    let _: () = msg_send![&text_view, setString: &*ns_text];
+                    let _: () = msg_send![&text_field, setStringValue: &*ns_text];
                 }
 
                 Some(unsafe { Retained::cast_unchecked::<NSView>(cell) })
@@ -187,20 +196,19 @@ unsafe impl NSControlTextEditingDelegate for CommsDelegate {}
 
 impl CommsDelegate {
     pub fn append_stream_token(&self, token: &str) {
-        if let Some(text_view) = self.ivars().active_text_view.borrow().as_ref() {
-            let text_storage = unsafe { text_view.textStorage().unwrap() };
-            let token_ns = NSString::from_str(token);
+        if let Some(text_field) = self.ivars().active_text_view.borrow().as_ref() {
+            let current_text_ns: Retained<NSString> = unsafe { msg_send![&**text_field, stringValue] };
+            let current_text = current_text_ns.to_string();
+
+            let new_text = format!("{}{}", current_text, token);
+            let new_text_ns = NSString::from_str(&new_text);
 
             unsafe {
-                let _: () = msg_send![&text_storage, beginEditing];
-                let length: objc2_foundation::NSUInteger = msg_send![&text_storage, length];
-                let range = NSRange { location: length, length: 0 };
-                let _: () = msg_send![&text_storage, replaceCharactersInRange: range, withString: &*token_ns];
-                let _: () = msg_send![&text_storage, endEditing];
+                let _: () = msg_send![&**text_field, setStringValue: &*new_text_ns];
 
-                let new_length: objc2_foundation::NSUInteger = msg_send![&text_storage, length];
-                let scroll_range = NSRange { location: new_length, length: 0 };
-                let _: () = msg_send![&**text_view, scrollRangeToVisible: scroll_range];
+                // If it's inside a scroll view or table, we might need to tell the table to update layouts
+                // But typically NSTableView with automatic row heights picks up intrinsic size changes
+                // on the next layout pass.
             }
         }
     }
