@@ -299,9 +299,9 @@ define_class!(
 
                 // Apply styles based on sender
                 let bg_color: Retained<NSColor> = if is_user {
-                    msg_send![NSColor::class(), controlAccentColor] // Blueish
+                    unsafe { msg_send![NSColor::class(), controlAccentColor] } // Blueish
                 } else {
-                    msg_send![NSColor::class(), windowBackgroundColor] // Darker grey
+                    unsafe { msg_send![NSColor::class(), windowBackgroundColor] } // Darker grey
                 };
                 unsafe { let _: () = msg_send![&bubble_box, setFillColor: &*bg_color]; }
 
