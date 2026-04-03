@@ -127,18 +127,26 @@ define_class!(
                     };
                     NSLayoutConstraint::activateConstraints(&constraints);
 
-                    // Attach to view with tag 100 for easy retrieval
-                    unsafe {
-                        let _: () = msg_send![&text_view, setTag: 100isize];
-                    }
-
                     cell = Some(new_cell);
                 }
 
                 let cell = cell.unwrap();
-                let text_view_ptr: *mut AnyObject = unsafe { msg_send![&cell, viewWithTag: 100isize] };
-                let text_view = unsafe { Retained::retain(text_view_ptr).unwrap() };
-                let text_view = unsafe { Retained::cast_unchecked::<NSTextView>(text_view) };
+
+                // Safe subview iteration to find the NSTextView
+                let subviews: Retained<NSArray<NSView>> = cell.subviews();
+                let mut found_text_view = None;
+
+                for i in 0..subviews.len() {
+                    let subview = subviews.objectAtIndex(i);
+                    if subview.is_kind_of::<NSTextView>() {
+                        found_text_view = Some(unsafe {
+                            Retained::cast_unchecked::<NSTextView>(Retained::retain(subview as *const _ as *mut _).unwrap())
+                        });
+                        break;
+                    }
+                }
+
+                let text_view = found_text_view.expect("NSTextView must exist in ChatBubbleCell");
 
                 // Keep track of the active text view for streaming if this is the last cell
                 if row == (history.len() - 1) as NSInteger {
@@ -299,7 +307,8 @@ pub fn create_comms(_mtm: MainThreadMarker, app_state: &Arc<RwLock<AppState>>) -
             None, NSLayoutAttribute::NotAnAttribute, 1.0, 32.0
         )
     };
-    unsafe { NSLayoutConstraint::activateConstraints(&NSArray::from_slice(&[&*input_height_constraint])); }
+    let input_height_array = unsafe { NSArray::from_slice(&[&*input_height_constraint]) };
+    NSLayoutConstraint::activateConstraints(&input_height_array);
 
     let text_view: Allocated<NSTextView> = unsafe { msg_send![NSTextView::class(), alloc] };
     let text_view: Retained<NSTextView> = unsafe { msg_send![text_view, initWithFrame: frame] };
