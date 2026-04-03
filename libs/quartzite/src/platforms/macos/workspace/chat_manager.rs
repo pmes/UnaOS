@@ -550,12 +550,14 @@ define_class!(
                 let row: NSInteger = msg_send![sender, tag];
                 let row_usize = row as usize;
 
-                let mut expanded = self.ivars().expanded_rows.borrow_mut();
-                if expanded.contains(&row_usize) {
-                    expanded.remove(&row_usize);
-                } else {
-                    expanded.insert(row_usize);
-                }
+                {
+                    let mut expanded = self.ivars().expanded_rows.borrow_mut();
+                    if expanded.contains(&row_usize) {
+                        expanded.remove(&row_usize);
+                    } else {
+                        expanded.insert(row_usize);
+                    }
+                } // The mutable borrow of `expanded_rows` is dropped here.
 
                 if let Some(tv) = self.ivars().table_view.borrow().as_ref() {
                     let index_set: Retained<objc2_foundation::NSIndexSet> = msg_send![objc2_foundation::NSIndexSet::class(), indexSetWithIndex: row as objc2_foundation::NSUInteger];
