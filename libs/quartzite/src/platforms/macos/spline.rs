@@ -129,16 +129,19 @@ impl MacOSSpline {
                                     let comms_delegate = comms_bound.get(mtm);
                                     use objc2::DefinedClass;
 
-                                    let mut history = comms_delegate.ivars().history.borrow_mut();
-                                    for record in records {
-                                        let is_chat = record.subject.eq_ignore_ascii_case("chat") || record.subject.eq_ignore_ascii_case("comms");
-                                        if is_chat {
-                                            history.push(bandy::state::HistoryItem {
-                                                sender: record.sender.clone(),
-                                                content: record.content.clone(),
-                                                timestamp: record.timestamp.clone(),
-                                                is_chat,
-                                            });
+                                    // Wrap the mutable borrow in a block so it drops when done
+                                    {
+                                        let mut history = comms_delegate.ivars().history.borrow_mut();
+                                        for record in records {
+                                            let is_chat = record.is_chat;
+                                            if is_chat {
+                                                history.push(bandy::state::HistoryItem {
+                                                    sender: record.sender.clone(),
+                                                    content: record.content.clone(),
+                                                    timestamp: record.timestamp.clone(),
+                                                    is_chat,
+                                                });
+                                            }
                                         }
                                     }
 
@@ -185,7 +188,7 @@ impl MacOSSpline {
                                             use bandy::state::TopologyNode;
 
                                             // Reconstruct tree from flat list
-                                            let mut nodes_by_depth: HashMap<usize, Vec<TopologyNode>> = HashMap::new();
+                                            let _nodes_by_depth: HashMap<usize, Vec<TopologyNode>> = HashMap::new();
                                             let mut root_nodes = Vec::new();
 
                                             // Note: In a real implementation this reconstruction logic would be robust.
