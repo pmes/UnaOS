@@ -130,24 +130,26 @@ impl MacOSSpline {
                                     use objc2::DefinedClass;
 
                                     // Wrap the mutable borrow in a block so it drops when done
-                                    {
-                                        let mut history = comms_delegate.ivars().history.borrow_mut();
-                                        for record in records {
-                                            let is_chat = record.is_chat;
-                                            if is_chat {
-                                                history.push(bandy::state::HistoryItem {
-                                                    sender: record.sender.clone(),
-                                                    content: record.content.clone(),
-                                                    timestamp: record.timestamp.clone(),
-                                                    is_chat,
-                                                });
+                                    if let Some(chat_manager) = comms_delegate.ivars().chat_manager.borrow().as_ref() {
+                                        {
+                                            let mut history = chat_manager.ivars().history.borrow_mut();
+                                            for record in records {
+                                                let is_chat = record.is_chat;
+                                                if is_chat {
+                                                    history.push(bandy::state::HistoryItem {
+                                                        sender: record.sender.clone(),
+                                                        content: record.content.clone(),
+                                                        timestamp: record.timestamp.clone(),
+                                                        is_chat,
+                                                    });
+                                                }
                                             }
                                         }
-                                    }
 
-                                    if let Some(table_view) = comms_delegate.ivars().table_view.borrow().as_ref() {
-                                        unsafe {
-                                            let _: () = objc2::msg_send![&**table_view, reloadData];
+                                        if let Some(table_view) = chat_manager.ivars().table_view.borrow().as_ref() {
+                                            unsafe {
+                                                let _: () = objc2::msg_send![&**table_view, reloadData];
+                                            }
                                         }
                                     }
                                 });
@@ -158,17 +160,19 @@ impl MacOSSpline {
                                     let comms_delegate = comms_bound.get(mtm);
                                     use objc2::DefinedClass;
 
-                                    let mut history = comms_delegate.ivars().history.borrow_mut();
+                                    if let Some(chat_manager) = comms_delegate.ivars().chat_manager.borrow().as_ref() {
+                                        let mut history = chat_manager.ivars().history.borrow_mut();
 
-                                    // Append the chunk to the state so history is accurate
-                                    if let Some(last_item) = history.last_mut() {
-                                        // The token directly appends to the last item.
-                                        // We no longer rely on UI-side string checks ("Lumen"),
-                                        // as AiTokens naturally follow AiMessage beginnings.
-                                        last_item.content.push_str(&token_string);
+                                        // Append the chunk to the state so history is accurate
+                                        if let Some(last_item) = history.last_mut() {
+                                            // The token directly appends to the last item.
+                                            // We no longer rely on UI-side string checks ("Lumen"),
+                                            // as AiTokens naturally follow AiMessage beginnings.
+                                            last_item.content.push_str(&token_string);
 
-                                        // Directly append string to TextKit NSTextStorage without reloading the table cell!
-                                        comms_delegate.append_stream_token(&token_string);
+                                            // Directly append string to TextKit NSTextStorage without reloading the table cell!
+                                            comms_delegate.append_stream_token(&token_string);
+                                        }
                                     }
                                 });
                             },

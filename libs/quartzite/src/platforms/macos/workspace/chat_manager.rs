@@ -377,7 +377,7 @@ define_class!(
                     let attr_string: Retained<NSMutableAttributedString> = msg_send![attr_string, initWithString: &*ns_text];
 
                     let regular_font: Retained<objc2_app_kit::NSFont> = msg_send![objc2_app_kit::NSFont::class(), systemFontOfSize: 14.0, weight: objc2_app_kit::NSFontWeightRegular];
-                    let text_color = if is_user {
+                    let text_color: Retained<NSColor> = if is_user {
                         msg_send![NSColor::class(), whiteColor] // White on accent color
                     } else {
                         msg_send![NSColor::class(), textColor]
@@ -440,7 +440,8 @@ define_class!(
                     let index_set: Retained<objc2_foundation::NSIndexSet> = msg_send![objc2_foundation::NSIndexSet::class(), indexSetWithIndex: row as objc2_foundation::NSUInteger];
                     let _: () = msg_send![tv, noteHeightOfRowsWithIndexesChanged: &*index_set];
                     // Also reload to update content and icon
-                    let _: () = msg_send![tv, reloadDataForRowIndexes: &*index_set, columnIndexes: &*msg_send![objc2_foundation::NSIndexSet::class(), indexSetWithIndex: 0]];
+                    let col_index_set: Retained<objc2_foundation::NSIndexSet> = msg_send![objc2_foundation::NSIndexSet::class(), indexSetWithIndex: 0isize as objc2_foundation::NSUInteger];
+                    let _: () = msg_send![tv, reloadDataForRowIndexes: &*index_set, columnIndexes: &*col_index_set];
                 }
             }
         }

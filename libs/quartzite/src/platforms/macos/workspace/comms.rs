@@ -11,15 +11,14 @@ use objc2::runtime::ProtocolObject;
 use objc2::{define_class, msg_send, ClassType, DefinedClass};
 use objc2::runtime::AnyObject;
 use objc2_app_kit::{
-    NSResponder, NSTextView, NSTextField, NSTextViewDelegate, NSTextDelegate,
+    NSResponder, NSTextView, NSTextViewDelegate, NSTextDelegate,
     NSSplitView, NSSplitViewDelegate, NSScrollView, NSView,
     NSLayoutConstraint, NSLayoutAttribute, NSLayoutRelation,
-    NSColor, NSTableView, NSTableViewDataSource, NSTableViewDelegate,
-    NSTableColumn, NSTableCellView, NSControlTextEditingDelegate
+    NSColor, NSTableView, NSTableColumn, NSControlTextEditingDelegate
 };
 use objc2_foundation::{
     NSObjectProtocol, NSRect, NSPoint, NSSize, MainThreadMarker, NSArray,
-    NSString, NSInteger, NSRange, NSMutableAttributedString, NSAttributedString, NSAttributedStringKey
+    NSString
 };
 use std::cell::RefCell;
 use std::sync::{Arc, RwLock};
