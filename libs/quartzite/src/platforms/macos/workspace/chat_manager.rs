@@ -113,6 +113,22 @@ define_class!(
                         let _: () = msg_send![&bubble_box, setFillColor: &*bg_color];
                     }
 
+                    let alignment_constraint = if is_user {
+                        unsafe {
+                            NSLayoutConstraint::constraintWithItem_attribute_relatedBy_toItem_attribute_multiplier_constant(
+                                &bubble_box, NSLayoutAttribute::Trailing, NSLayoutRelation::Equal,
+                                Some(&root_view), NSLayoutAttribute::Trailing, 1.0, 0.0
+                            )
+                        }
+                    } else {
+                        unsafe {
+                            NSLayoutConstraint::constraintWithItem_attribute_relatedBy_toItem_attribute_multiplier_constant(
+                                &bubble_box, NSLayoutAttribute::Leading, NSLayoutRelation::Equal,
+                                Some(&root_view), NSLayoutAttribute::Leading, 1.0, 0.0
+                            )
+                        }
+                    };
+
                     // Bubble content StackView
                     let content_stack: Allocated<NSStackView> = unsafe { msg_send![NSStackView::class(), alloc] };
                     let content_stack: Retained<NSStackView> = unsafe { msg_send![content_stack, initWithFrame: frame] };
@@ -225,17 +241,7 @@ define_class!(
                             ),
 
                             // Static bubble alignment constraint
-                            if is_user {
-                                &*NSLayoutConstraint::constraintWithItem_attribute_relatedBy_toItem_attribute_multiplier_constant(
-                                    &bubble_box, NSLayoutAttribute::Trailing, NSLayoutRelation::Equal,
-                                    Some(&root_view), NSLayoutAttribute::Trailing, 1.0, 0.0
-                                )
-                            } else {
-                                &*NSLayoutConstraint::constraintWithItem_attribute_relatedBy_toItem_attribute_multiplier_constant(
-                                    &bubble_box, NSLayoutAttribute::Leading, NSLayoutRelation::Equal,
-                                    Some(&root_view), NSLayoutAttribute::Leading, 1.0, 0.0
-                                )
-                            },
+                            &*alignment_constraint,
 
                             // Let the width be bounded by the root view
                             &*NSLayoutConstraint::constraintWithItem_attribute_relatedBy_toItem_attribute_multiplier_constant(
