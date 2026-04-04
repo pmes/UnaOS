@@ -152,6 +152,7 @@ define_class!(
                         let _: () = msg_send![&expander_btn, setBordered: objc2::runtime::Bool::NO];
                         let _: () = msg_send![&expander_btn, setImagePosition: NSCellImagePosition::ImageOnly];
                         let _: () = msg_send![&expander_btn, setImageScaling: NSImageScaling::ScaleProportionallyUpOrDown];
+                        let _: () = msg_send![&expander_btn, setTag: 1402isize];
 
                         // Target action to toggle expansion
                         let action = objc2::sel!(toggleExpansion:);
@@ -168,6 +169,7 @@ define_class!(
                         let _: () = msg_send![&meta_label, setDrawsBackground: objc2::runtime::Bool::NO];
                         let _: () = msg_send![&meta_label, setEditable: objc2::runtime::Bool::NO];
                         let _: () = msg_send![&meta_label, setSelectable: objc2::runtime::Bool::NO];
+                        let _: () = msg_send![&meta_label, setTag: 1401isize];
 
                         let dim_color: Retained<NSColor> = msg_send![NSColor::class(), secondaryLabelColor];
                         let _: () = msg_send![&meta_label, setTextColor: &*dim_color];
@@ -186,6 +188,7 @@ define_class!(
                         let _: () = msg_send![&text_field, setEditable: objc2::runtime::Bool::NO];
                         let _: () = msg_send![&text_field, setSelectable: objc2::runtime::Bool::YES];
                         let _: () = msg_send![&text_field, setAlignment: 0isize];
+                        let _: () = msg_send![&text_field, setTag: 1400isize]; // Lumen Chat Text
 
                         let cell_obj: *mut AnyObject = msg_send![&text_field, cell];
                         if !cell_obj.is_null() {
@@ -263,34 +266,28 @@ define_class!(
 
                 let cell = cell.unwrap();
 
-                // Safe subview iteration to find the components
-                let cell_views: Retained<NSArray<NSView>> = cell.subviews();
-                let mut found_bubble = None;
-                for i in 0..cell_views.len() {
-                    let subview = cell_views.objectAtIndex(i);
-                    if let Ok(b) = subview.downcast::<NSBox>() {
-                        found_bubble = Some(b);
-                        break;
+                // O(1) Component Retrieval via Native Lookup
+                let (text_field, meta_label, expander_btn) = unsafe {
+                    let found_text: *mut AnyObject = msg_send![&cell, viewWithTag: 1400isize];
+                    if found_text.is_null() {
+                        panic!("CRITICAL: Tagged NSTextField 1400 missing from NSTableCellView hierarchy.");
                     }
-                }
-                let bubble_box = found_bubble.unwrap();
+                    let text_field: Retained<NSTextField> = Retained::cast_unchecked(Retained::retain(found_text).unwrap());
 
-                let stack_views: Retained<NSArray<NSView>> = bubble_box.subviews();
-                let mut content_stack = None;
-                if stack_views.len() > 0 {
-                    if let Ok(stack) = stack_views.objectAtIndex(0).downcast::<NSStackView>() {
-                        content_stack = Some(stack);
+                    let found_meta: *mut AnyObject = msg_send![&cell, viewWithTag: 1401isize];
+                    if found_meta.is_null() {
+                        panic!("CRITICAL: Tagged NSTextField 1401 missing from NSTableCellView hierarchy.");
                     }
-                }
+                    let meta_label: Retained<NSTextField> = Retained::cast_unchecked(Retained::retain(found_meta).unwrap());
 
-                let content_stack = content_stack.unwrap();
-                let stack_subviews: Retained<NSArray<NSView>> = content_stack.subviews();
-                let header_box = stack_subviews.objectAtIndex(0).downcast::<NSStackView>().unwrap();
-                let text_field = stack_subviews.objectAtIndex(1).downcast::<NSTextField>().unwrap();
+                    let found_expander: *mut AnyObject = msg_send![&cell, viewWithTag: 1402isize];
+                    if found_expander.is_null() {
+                        panic!("CRITICAL: NSButton with tag 1402 missing from NSTableCellView hierarchy.");
+                    }
+                    let expander_btn: Retained<NSButton> = Retained::cast_unchecked(Retained::retain(found_expander).unwrap());
 
-                let header_subviews: Retained<NSArray<NSView>> = header_box.subviews();
-                let expander_btn = header_subviews.objectAtIndex(0).downcast::<NSButton>().unwrap();
-                let meta_label = header_subviews.objectAtIndex(1).downcast::<NSTextField>().unwrap();
+                    (text_field, meta_label, expander_btn)
+                };
 
                 // Keep track of the active text field for streaming if this is the last cell
                 if row == (history.len() - 1) as NSInteger {
@@ -344,9 +341,6 @@ define_class!(
                 let needs_expander = gneiss_pal::types::calculate_truncation(&item.content, 7, 500).is_some();
                 unsafe {
                     let _: () = msg_send![&expander_btn, setHidden: objc2::runtime::Bool::new(!needs_expander)];
-
-                    // Store the row in the button tag so action handler knows what to toggle
-                    let _: () = msg_send![&expander_btn, setTag: row];
                 }
 
                 if needs_expander {
@@ -373,7 +367,8 @@ define_class!(
         #[unsafe(method(toggleExpansion:))]
         fn toggle_expansion(&self, sender: &AnyObject) {
             unsafe {
-                let row: NSInteger = msg_send![sender, tag];
+                let tv = self.ivars().table_view.borrow().as_ref().unwrap().clone();
+                let row: NSInteger = msg_send![&tv, rowForView: sender];
                 let row_usize = row as usize;
 
                 {
