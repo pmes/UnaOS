@@ -166,8 +166,6 @@ define_class!(
                         let _: () = msg_send![&text_field, setEditable: objc2::runtime::Bool::NO];
                         let _: () = msg_send![&text_field, setSelectable: objc2::runtime::Bool::YES];
 
-                        let _: () = msg_send![&text_field, setContentCompressionResistancePriority: 250.0f32, forOrientation: objc2_app_kit::NSLayoutConstraintOrientation::Horizontal];
-
                         let cell_obj: *mut AnyObject = msg_send![&text_field, cell];
                         if !cell_obj.is_null() {
                             let _: () = msg_send![cell_obj, setWraps: objc2::runtime::Bool::YES];
@@ -354,8 +352,6 @@ define_class!(
                             let _: () = msg_send![&text_field, setBordered: objc2::runtime::Bool::NO];
                             let _: () = msg_send![&text_field, setEditable: objc2::runtime::Bool::NO];
                             let _: () = msg_send![&text_field, setSelectable: objc2::runtime::Bool::YES];
-
-                            let _: () = msg_send![&text_field, setContentCompressionResistancePriority: 250.0f32, forOrientation: objc2_app_kit::NSLayoutConstraintOrientation::Horizontal];
 
                             let cell_obj: *mut AnyObject = msg_send![&text_field, cell];
                             if !cell_obj.is_null() {

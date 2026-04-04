@@ -316,11 +316,6 @@ pub fn create_sidebar(_mtm: MainThreadMarker, workspace_state: &bandy::state::Wo
     let scroll_view: Allocated<NSScrollView> = unsafe { msg_send![NSScrollView::class(), alloc] };
     let scroll_view: Retained<NSScrollView> = unsafe { msg_send![scroll_view, initWithFrame: frame] };
 
-    // Turn off automatic layout constraints
-    unsafe {
-        let _: () = msg_send![&scroll_view, setTranslatesAutoresizingMaskIntoConstraints: objc2::runtime::Bool::NO];
-    }
-
     scroll_view.setHasVerticalScroller(true);
     scroll_view.setHasHorizontalScroller(false);
     scroll_view.setAutohidesScrollers(true);
@@ -335,8 +330,8 @@ pub fn create_sidebar(_mtm: MainThreadMarker, workspace_state: &bandy::state::Wo
 
     // Enforce Layout Integrity (Squeezing) - Sidebar minimum width
     unsafe {
-        let width_anchor: Retained<objc2_app_kit::NSLayoutDimension> = objc2::msg_send_id![&scroll_view, widthAnchor];
-        let constraint: Retained<objc2_app_kit::NSLayoutConstraint> = objc2::msg_send_id![&width_anchor, constraintGreaterThanOrEqualToConstant: 200.0f64];
+        let width_anchor: Retained<objc2_app_kit::NSLayoutDimension> = msg_send![&scroll_view, widthAnchor];
+        let constraint: Retained<objc2_app_kit::NSLayoutConstraint> = msg_send![&width_anchor, constraintGreaterThanOrEqualToConstant: 200.0f64];
         let _: () = msg_send![&constraint, setActive: objc2::runtime::Bool::YES];
     }
 
@@ -354,6 +349,12 @@ pub fn create_sidebar(_mtm: MainThreadMarker, workspace_state: &bandy::state::Wo
     }
     // Drop the borrow before returning
     drop(roots_ref);
+
+    // Respect the Safe Area (Traffic Light Overlap)
+    let insets = objc2_foundation::NSEdgeInsets { top: 38.0, left: 0.0, bottom: 0.0, right: 0.0 };
+    unsafe {
+        let _: () = msg_send![&scroll_view, setContentInsets: insets];
+    }
 
     // Return the scroll view as the root view of this component, and the delegate to hold state
     (unsafe { Retained::cast_unchecked::<NSView>(scroll_view) }, delegate)

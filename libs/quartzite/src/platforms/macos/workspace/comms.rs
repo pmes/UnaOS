@@ -94,11 +94,6 @@ pub fn create_comms(_mtm: MainThreadMarker, app_state: &Arc<RwLock<AppState>>) -
     split_view.setVertical(false); // Horizontal divider, stacking vertically
     split_view.setDelegate(Some(ProtocolObject::from_ref(&*delegate)));
 
-    // Turn off automatic constraints on the root container
-    unsafe {
-        let _: () = msg_send![&split_view, setTranslatesAutoresizingMaskIntoConstraints: objc2::runtime::Bool::NO];
-    }
-
     // 3. Top Split: Bubble Matrix Placeholder (NSScrollView & NSTableView)
     let matrix_scroll: Allocated<NSScrollView> = unsafe { msg_send![NSScrollView::class(), alloc] };
     let matrix_scroll: Retained<NSScrollView> = unsafe { msg_send![matrix_scroll, initWithFrame: frame] };
@@ -351,8 +346,8 @@ pub fn create_comms(_mtm: MainThreadMarker, app_state: &Arc<RwLock<AppState>>) -
 
     // Enforce Layout Integrity (Squeezing) - Comms minimum width
     unsafe {
-        let width_anchor: Retained<objc2_app_kit::NSLayoutDimension> = objc2::msg_send_id![&split_view, widthAnchor];
-        let constraint: Retained<objc2_app_kit::NSLayoutConstraint> = objc2::msg_send_id![&width_anchor, constraintGreaterThanOrEqualToConstant: 300.0f64];
+        let width_anchor: Retained<objc2_app_kit::NSLayoutDimension> = msg_send![&split_view, widthAnchor];
+        let constraint: Retained<objc2_app_kit::NSLayoutConstraint> = msg_send![&width_anchor, constraintGreaterThanOrEqualToConstant: 300.0f64];
         let _: () = msg_send![&constraint, setActive: objc2::runtime::Bool::YES];
     }
 
