@@ -67,7 +67,10 @@ define_class!(
             let history = self.ivars().history.borrow();
 
             if let Some(item) = history.get(row as usize) {
-                let identifier = NSString::from_str("ChatBubbleCell");
+                let is_user = item.sender == "Architect";
+                let identifier_str = if is_user { "ChatBubbleCellUser" } else { "ChatBubbleCellAI" };
+                let identifier = NSString::from_str(identifier_str);
+
                 let mut cell: Option<Retained<NSTableCellView>> = unsafe {
                     let recycled: *mut AnyObject = msg_send![table_view, makeViewWithIdentifier: &*identifier, owner: self];
                     if !recycled.is_null() {
@@ -76,8 +79,6 @@ define_class!(
                         None
                     }
                 };
-
-                let is_user = item.sender == "Architect";
 
                 if cell.is_none() {
                     let frame = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(400.0, 50.0)); // Initial approximate size
@@ -102,6 +103,14 @@ define_class!(
                         let _: () = msg_send![&bubble_box, setTransparent: objc2::runtime::Bool::NO];
                         let _: () = msg_send![&bubble_box, setWantsLayer: objc2::runtime::Bool::YES];
                         let _: () = msg_send![&bubble_box, setCornerRadius: 8.0f64];
+
+                        // Apply permanent styles based on sender
+                        let bg_color: Retained<NSColor> = if is_user {
+                            msg_send![NSColor::class(), controlAccentColor] // Blueish
+                        } else {
+                            msg_send![NSColor::class(), windowBackgroundColor] // Darker grey
+                        };
+                        let _: () = msg_send![&bubble_box, setFillColor: &*bg_color];
                     }
 
                     // Bubble content StackView
@@ -214,6 +223,19 @@ define_class!(
                                 &bubble_box, NSLayoutAttribute::Bottom, NSLayoutRelation::Equal,
                                 Some(&root_view), NSLayoutAttribute::Bottom, 1.0, 0.0
                             ),
+
+                            // Static bubble alignment constraint
+                            if is_user {
+                                &*NSLayoutConstraint::constraintWithItem_attribute_relatedBy_toItem_attribute_multiplier_constant(
+                                    &bubble_box, NSLayoutAttribute::Trailing, NSLayoutRelation::Equal,
+                                    Some(&root_view), NSLayoutAttribute::Trailing, 1.0, 0.0
+                                )
+                            } else {
+                                &*NSLayoutConstraint::constraintWithItem_attribute_relatedBy_toItem_attribute_multiplier_constant(
+                                    &bubble_box, NSLayoutAttribute::Leading, NSLayoutRelation::Equal,
+                                    Some(&root_view), NSLayoutAttribute::Leading, 1.0, 0.0
+                                )
+                            },
 
                             // Let the width be bounded by the root view
                             &*NSLayoutConstraint::constraintWithItem_attribute_relatedBy_toItem_attribute_multiplier_constant(
@@ -414,59 +436,6 @@ define_class!(
                     *self.ivars().active_text_view.borrow_mut() = Some(text_field.clone());
                 }
 
-                // Apply styles based on sender
-                let bg_color: Retained<NSColor> = if is_user {
-                    unsafe { msg_send![NSColor::class(), controlAccentColor] } // Blueish
-                } else {
-                    unsafe { msg_send![NSColor::class(), windowBackgroundColor] } // Darker grey
-                };
-                unsafe { let _: () = msg_send![&bubble_box, setFillColor: &*bg_color]; }
-
-                // Align Bubble Layout Left/Right
-                unsafe {
-                    // Remove old leading/trailing alignment constraints on bubble relative to root
-                    let existing_constraints: Retained<NSArray<NSLayoutConstraint>> = root_view.constraints();
-                    let mut constraints_to_keep = Vec::new();
-                    let mut old_align = None;
-
-                    for i in 0..existing_constraints.len() {
-                        let c = existing_constraints.objectAtIndex(i);
-                        let first_attr: NSLayoutAttribute = msg_send![&c, firstAttribute];
-                        if first_attr == NSLayoutAttribute::Leading || first_attr == NSLayoutAttribute::Trailing {
-                            // Check if it involves bubble_box and root_view
-                            let first_item: *mut AnyObject = msg_send![&c, firstItem];
-                            let second_item: *mut AnyObject = msg_send![&c, secondItem];
-                            let bubble_ptr = Retained::as_ptr(&bubble_box) as *mut AnyObject;
-
-                            if first_item == bubble_ptr || second_item == bubble_ptr {
-                                old_align = Some(c.clone());
-                                continue;
-                            }
-                        }
-                        constraints_to_keep.push(c.clone());
-                    }
-
-                    if let Some(old_c) = old_align {
-                        let old_array = NSArray::from_slice(&[&*old_c]);
-                        NSLayoutConstraint::deactivateConstraints(&old_array);
-                    }
-
-                    let new_align = if is_user {
-                        NSLayoutConstraint::constraintWithItem_attribute_relatedBy_toItem_attribute_multiplier_constant(
-                            &bubble_box, NSLayoutAttribute::Trailing, NSLayoutRelation::Equal,
-                            Some(&root_view), NSLayoutAttribute::Trailing, 1.0, 0.0
-                        )
-                    } else {
-                        NSLayoutConstraint::constraintWithItem_attribute_relatedBy_toItem_attribute_multiplier_constant(
-                            &bubble_box, NSLayoutAttribute::Leading, NSLayoutRelation::Equal,
-                            Some(&root_view), NSLayoutAttribute::Leading, 1.0, 0.0
-                        )
-                    };
-
-                    let new_array = NSArray::from_slice(&[&*new_align]);
-                    NSLayoutConstraint::activateConstraints(&new_array);
-                }
-
                 // Set Metadata
                 let meta_str = format!("{} • {}", item.sender, item.timestamp);
                 unsafe { let _: () = msg_send![&meta_label, setStringValue: &*NSString::from_str(&meta_str)]; }
@@ -612,9 +581,15 @@ impl ChatBoxManager {
 
                 let _: () = msg_send![&**text_field, setAttributedStringValue: &*mutable_attr_string];
 
-                // If it's inside a scroll view or table, we might need to tell the table to update layouts
-                // But typically NSTableView with automatic row heights picks up intrinsic size changes
-                // on the next layout pass.
+                // Force layout recalculation and evaluate truncation by invalidating the row height
+                let history_len = self.ivars().history.borrow().len();
+                if history_len > 0 {
+                    let last_row = (history_len - 1) as NSInteger;
+                    if let Some(tv) = self.ivars().table_view.borrow().as_ref() {
+                        let index_set: Retained<objc2_foundation::NSIndexSet> = msg_send![objc2_foundation::NSIndexSet::class(), indexSetWithIndex: last_row as objc2_foundation::NSUInteger];
+                        let _: () = msg_send![tv, noteHeightOfRowsWithIndexesChanged: &*index_set];
+                    }
+                }
             }
         }
     }
