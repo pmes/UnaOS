@@ -88,11 +88,6 @@ define_class!(
                         let _: () = msg_send![&new_cell, setIdentifier: &*identifier];
                     }
 
-                    // Root container (NSView)
-                    let root_view: Allocated<NSView> = unsafe { msg_send![NSView::class(), alloc] };
-                    let root_view: Retained<NSView> = unsafe { msg_send![root_view, initWithFrame: frame] };
-                    unsafe { let _: () = msg_send![&root_view, setTranslatesAutoresizingMaskIntoConstraints: objc2::runtime::Bool::NO]; }
-
                     // Bubble Box (NSBox)
                     let bubble_box: Allocated<NSBox> = unsafe { msg_send![NSBox::class(), alloc] };
                     let bubble_box: Retained<NSBox> = unsafe { msg_send![bubble_box, initWithFrame: frame] };
@@ -117,14 +112,14 @@ define_class!(
                         unsafe {
                             NSLayoutConstraint::constraintWithItem_attribute_relatedBy_toItem_attribute_multiplier_constant(
                                 &bubble_box, NSLayoutAttribute::Trailing, NSLayoutRelation::Equal,
-                                Some(&root_view), NSLayoutAttribute::Trailing, 1.0, 0.0
+                                Some(&new_cell), NSLayoutAttribute::Trailing, 1.0, -16.0
                             )
                         }
                     } else {
                         unsafe {
                             NSLayoutConstraint::constraintWithItem_attribute_relatedBy_toItem_attribute_multiplier_constant(
                                 &bubble_box, NSLayoutAttribute::Leading, NSLayoutRelation::Equal,
-                                Some(&root_view), NSLayoutAttribute::Leading, 1.0, 0.0
+                                Some(&new_cell), NSLayoutAttribute::Leading, 1.0, 16.0
                             )
                         }
                     };
@@ -208,46 +203,28 @@ define_class!(
                         let _: () = msg_send![&content_stack, addView: &*text_field, inGravity: 1isize];
 
                         bubble_box.addSubview(&content_stack);
-                        root_view.addSubview(&bubble_box);
-                        new_cell.addSubview(&root_view);
+                        new_cell.addSubview(&bubble_box);
                     }
 
                     let constraints = unsafe {
                         NSArray::from_slice(&[
+                            // Bubble constraints directly to the cell view
                             &*NSLayoutConstraint::constraintWithItem_attribute_relatedBy_toItem_attribute_multiplier_constant(
-                                &root_view, NSLayoutAttribute::Top, NSLayoutRelation::Equal,
+                                &bubble_box, NSLayoutAttribute::Top, NSLayoutRelation::Equal,
                                 Some(&new_cell), NSLayoutAttribute::Top, 1.0, 4.0
                             ),
                             &*NSLayoutConstraint::constraintWithItem_attribute_relatedBy_toItem_attribute_multiplier_constant(
-                                &root_view, NSLayoutAttribute::Bottom, NSLayoutRelation::Equal,
-                                Some(&new_cell), NSLayoutAttribute::Bottom, 1.0, -4.0
-                            ),
-                            &*NSLayoutConstraint::constraintWithItem_attribute_relatedBy_toItem_attribute_multiplier_constant(
-                                &root_view, NSLayoutAttribute::Leading, NSLayoutRelation::Equal,
-                                Some(&new_cell), NSLayoutAttribute::Leading, 1.0, 16.0
-                            ),
-                            &*NSLayoutConstraint::constraintWithItem_attribute_relatedBy_toItem_attribute_multiplier_constant(
-                                &root_view, NSLayoutAttribute::Trailing, NSLayoutRelation::Equal,
-                                Some(&new_cell), NSLayoutAttribute::Trailing, 1.0, -16.0
-                            ),
-
-                            // Bubble constraints inside root
-                            &*NSLayoutConstraint::constraintWithItem_attribute_relatedBy_toItem_attribute_multiplier_constant(
-                                &bubble_box, NSLayoutAttribute::Top, NSLayoutRelation::Equal,
-                                Some(&root_view), NSLayoutAttribute::Top, 1.0, 0.0
-                            ),
-                            &*NSLayoutConstraint::constraintWithItem_attribute_relatedBy_toItem_attribute_multiplier_constant(
                                 &bubble_box, NSLayoutAttribute::Bottom, NSLayoutRelation::Equal,
-                                Some(&root_view), NSLayoutAttribute::Bottom, 1.0, 0.0
+                                Some(&new_cell), NSLayoutAttribute::Bottom, 1.0, -4.0
                             ),
 
                             // Static bubble alignment constraint
                             &*alignment_constraint,
 
-                            // Let the width be bounded by the root view
+                            // Let the width be bounded by the cell view
                             &*NSLayoutConstraint::constraintWithItem_attribute_relatedBy_toItem_attribute_multiplier_constant(
                                 &bubble_box, NSLayoutAttribute::Width, NSLayoutRelation::LessThanOrEqual,
-                                Some(&root_view), NSLayoutAttribute::Width, 0.8, 0.0 // Max 80% width
+                                Some(&new_cell), NSLayoutAttribute::Width, 0.8, 0.0 // Max 80% width
                             ),
 
                             // Content Stack inside Bubble
@@ -287,20 +264,10 @@ define_class!(
                 let cell = cell.unwrap();
 
                 // Safe subview iteration to find the components
-                let root_views: Retained<NSArray<NSView>> = cell.subviews();
-                let mut found_root = None;
-                for i in 0..root_views.len() {
-                    let subview = root_views.objectAtIndex(i);
-                    // It's just NSView
-                    found_root = Some(subview);
-                    break;
-                }
-
-                let root_view = found_root.unwrap();
-                let bubble_views: Retained<NSArray<NSView>> = root_view.subviews();
+                let cell_views: Retained<NSArray<NSView>> = cell.subviews();
                 let mut found_bubble = None;
-                for i in 0..bubble_views.len() {
-                    let subview = bubble_views.objectAtIndex(i);
+                for i in 0..cell_views.len() {
+                    let subview = cell_views.objectAtIndex(i);
                     if let Ok(b) = subview.downcast::<NSBox>() {
                         found_bubble = Some(b);
                         break;
@@ -601,7 +568,8 @@ impl ChatBoxManager {
                     let last_row = (history_len - 1) as NSInteger;
                     if let Some(tv) = self.ivars().table_view.borrow().as_ref() {
                         let index_set: Retained<objc2_foundation::NSIndexSet> = msg_send![objc2_foundation::NSIndexSet::class(), indexSetWithIndex: last_row as objc2_foundation::NSUInteger];
-                        let _: () = msg_send![tv, noteHeightOfRowsWithIndexesChanged: &*index_set];
+                        let sel = objc2::sel!(noteHeightOfRowsWithIndexesChanged:);
+                        let _: () = msg_send![tv, performSelectorOnMainThread: sel, withObject: &*index_set, waitUntilDone: objc2::runtime::Bool::NO];
                     }
                 }
             }
