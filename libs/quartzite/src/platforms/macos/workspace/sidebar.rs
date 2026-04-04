@@ -28,6 +28,7 @@ pub struct UnaMatrixNodeIvars {
     pub node_id: RefCell<String>,
     pub label: RefCell<String>,
     pub children: RefCell<Vec<Retained<UnaMatrixNode>>>,
+    pub is_expanded: RefCell<bool>,
 }
 
 define_class!(
@@ -43,6 +44,7 @@ define_class!(
                 node_id: RefCell::new(String::new()),
                 label: RefCell::new(String::new()),
                 children: RefCell::new(Vec::new()),
+                is_expanded: RefCell::new(false),
             });
             unsafe { msg_send![super(this), init] }
         }
@@ -56,6 +58,7 @@ impl UnaMatrixNode {
 
         *node.ivars().node_id.borrow_mut() = rust_node.id.clone();
         *node.ivars().label.borrow_mut() = rust_node.label.clone();
+        *node.ivars().is_expanded.borrow_mut() = rust_node.is_expanded;
 
         let mut children = Vec::new();
         for child in &rust_node.children {
@@ -196,6 +199,12 @@ define_class!(
                     let _: () = msg_send![&text_field, setDrawsBackground: objc2::runtime::Bool::NO];
                     let _: () = msg_send![&text_field, setEditable: objc2::runtime::Bool::NO];
                     let _: () = msg_send![&text_field, setSelectable: objc2::runtime::Bool::NO];
+
+                    let cell_obj: *mut AnyObject = msg_send![&text_field, cell];
+                    if !cell_obj.is_null() {
+                        let _: () = msg_send![cell_obj, setWraps: objc2::runtime::Bool::NO];
+                        let _: () = msg_send![cell_obj, setLineBreakMode: 4isize]; // NSLineBreakByTruncatingTail
+                    }
                 }
 
                 new_cell.addSubview(&text_field);
@@ -210,10 +219,6 @@ define_class!(
                         &*objc2_app_kit::NSLayoutConstraint::constraintWithItem_attribute_relatedBy_toItem_attribute_multiplier_constant(
                             &text_field, objc2_app_kit::NSLayoutAttribute::Leading, objc2_app_kit::NSLayoutRelation::Equal,
                             Some(&new_cell), objc2_app_kit::NSLayoutAttribute::Leading, 1.0, 4.0
-                        ),
-                        &*objc2_app_kit::NSLayoutConstraint::constraintWithItem_attribute_relatedBy_toItem_attribute_multiplier_constant(
-                            &text_field, objc2_app_kit::NSLayoutAttribute::Trailing, objc2_app_kit::NSLayoutRelation::Equal,
-                            Some(&new_cell), objc2_app_kit::NSLayoutAttribute::Trailing, 1.0, -4.0
                         ),
                     ])
                 };
@@ -231,6 +236,36 @@ define_class!(
             }
 
             Some(unsafe { Retained::cast_unchecked::<NSView>(cell) })
+        }
+
+        #[unsafe(method(outlineViewItemDidExpand:))]
+        fn outline_view_item_did_expand(&self, notification: &objc2_foundation::NSNotification) {
+            unsafe {
+                if let Some(user_info) = notification.userInfo() {
+                    let key = NSString::from_str("NSObject"); // NSOutlineView's item key in userInfo is usually @"NSObject"
+                    let item: *mut AnyObject = msg_send![&user_info, objectForKey: &*key];
+
+                    if !item.is_null() {
+                        let node = Retained::cast_unchecked::<UnaMatrixNode>(Retained::retain(item).unwrap());
+                        *node.ivars().is_expanded.borrow_mut() = true;
+                    }
+                }
+            }
+        }
+
+        #[unsafe(method(outlineViewItemDidCollapse:))]
+        fn outline_view_item_did_collapse(&self, notification: &objc2_foundation::NSNotification) {
+            unsafe {
+                if let Some(user_info) = notification.userInfo() {
+                    let key = NSString::from_str("NSObject"); // NSOutlineView's item key in userInfo
+                    let item: *mut AnyObject = msg_send![&user_info, objectForKey: &*key];
+
+                    if !item.is_null() {
+                        let node = Retained::cast_unchecked::<UnaMatrixNode>(Retained::retain(item).unwrap());
+                        *node.ivars().is_expanded.borrow_mut() = false;
+                    }
+                }
+            }
         }
     }
 );
@@ -283,13 +318,8 @@ pub fn create_sidebar(_mtm: MainThreadMarker, workspace_state: &bandy::state::Wo
     let scroll_view: Allocated<NSScrollView> = unsafe { msg_send![NSScrollView::class(), alloc] };
     let scroll_view: Retained<NSScrollView> = unsafe { msg_send![scroll_view, initWithFrame: frame] };
 
-    // Turn off automatic layout constraints
-    unsafe {
-        let _: () = msg_send![&scroll_view, setTranslatesAutoresizingMaskIntoConstraints: objc2::runtime::Bool::NO];
-    }
-
     scroll_view.setHasVerticalScroller(true);
-    scroll_view.setHasHorizontalScroller(false);
+    scroll_view.setHasHorizontalScroller(true);
     scroll_view.setAutohidesScrollers(true);
 
     // Attach the outline view to the scroll view
@@ -298,6 +328,34 @@ pub fn create_sidebar(_mtm: MainThreadMarker, workspace_state: &bandy::state::Wo
     // Reload the outline view immediately so data renders on first frame
     unsafe {
         let _: () = msg_send![&outline_view, reloadData];
+    }
+
+    // Enforce Layout Integrity (Squeezing) - Sidebar minimum width
+    unsafe {
+        let width_anchor: Retained<objc2_app_kit::NSLayoutDimension> = msg_send![&scroll_view, widthAnchor];
+        let constraint: Retained<objc2_app_kit::NSLayoutConstraint> = msg_send![&width_anchor, constraintGreaterThanOrEqualToConstant: 200.0f64];
+        let _: () = msg_send![&constraint, setActive: objc2::runtime::Bool::YES];
+    }
+
+    // Enforce initial collapsed/expanded states natively based on Rust state
+    let roots_ref = delegate.ivars().roots.borrow();
+    for root in roots_ref.iter() {
+        let is_expanded = *root.ivars().is_expanded.borrow();
+        unsafe {
+            if is_expanded {
+                let _: () = msg_send![&outline_view, expandItem: &**root];
+            } else {
+                let _: () = msg_send![&outline_view, collapseItem: &**root];
+            }
+        }
+    }
+    // Drop the borrow before returning
+    drop(roots_ref);
+
+    // Respect the Safe Area (Traffic Light Overlap)
+    let insets = objc2_foundation::NSEdgeInsets { top: 38.0, left: 0.0, bottom: 0.0, right: 0.0 };
+    unsafe {
+        let _: () = msg_send![&scroll_view, setContentInsets: insets];
     }
 
     // Return the scroll view as the root view of this component, and the delegate to hold state

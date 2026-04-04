@@ -67,7 +67,10 @@ define_class!(
             let history = self.ivars().history.borrow();
 
             if let Some(item) = history.get(row as usize) {
-                let identifier = NSString::from_str("ChatBubbleCell");
+                let is_user = item.sender == "Architect";
+                let identifier_str = if is_user { "ChatBubbleCellUser" } else { "ChatBubbleCellAI" };
+                let identifier = NSString::from_str(identifier_str);
+
                 let mut cell: Option<Retained<NSTableCellView>> = unsafe {
                     let recycled: *mut AnyObject = msg_send![table_view, makeViewWithIdentifier: &*identifier, owner: self];
                     if !recycled.is_null() {
@@ -77,8 +80,6 @@ define_class!(
                     }
                 };
 
-                let is_user = item.sender == "Architect";
-
                 if cell.is_none() {
                     let frame = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(400.0, 50.0)); // Initial approximate size
                     let new_cell: Allocated<NSTableCellView> = unsafe { msg_send![NSTableCellView::class(), alloc] };
@@ -86,11 +87,6 @@ define_class!(
                     unsafe {
                         let _: () = msg_send![&new_cell, setIdentifier: &*identifier];
                     }
-
-                    // Root container (NSView)
-                    let root_view: Allocated<NSView> = unsafe { msg_send![NSView::class(), alloc] };
-                    let root_view: Retained<NSView> = unsafe { msg_send![root_view, initWithFrame: frame] };
-                    unsafe { let _: () = msg_send![&root_view, setTranslatesAutoresizingMaskIntoConstraints: objc2::runtime::Bool::NO]; }
 
                     // Bubble Box (NSBox)
                     let bubble_box: Allocated<NSBox> = unsafe { msg_send![NSBox::class(), alloc] };
@@ -102,7 +98,31 @@ define_class!(
                         let _: () = msg_send![&bubble_box, setTransparent: objc2::runtime::Bool::NO];
                         let _: () = msg_send![&bubble_box, setWantsLayer: objc2::runtime::Bool::YES];
                         let _: () = msg_send![&bubble_box, setCornerRadius: 8.0f64];
+
+                        // Apply permanent styles based on sender
+                        let bg_color: Retained<NSColor> = if is_user {
+                            msg_send![NSColor::class(), controlAccentColor] // Blueish
+                        } else {
+                            msg_send![NSColor::class(), windowBackgroundColor] // Darker grey
+                        };
+                        let _: () = msg_send![&bubble_box, setFillColor: &*bg_color];
                     }
+
+                    let alignment_constraint = if is_user {
+                        unsafe {
+                            NSLayoutConstraint::constraintWithItem_attribute_relatedBy_toItem_attribute_multiplier_constant(
+                                &bubble_box, NSLayoutAttribute::Trailing, NSLayoutRelation::Equal,
+                                Some(&new_cell), NSLayoutAttribute::Trailing, 1.0, -16.0
+                            )
+                        }
+                    } else {
+                        unsafe {
+                            NSLayoutConstraint::constraintWithItem_attribute_relatedBy_toItem_attribute_multiplier_constant(
+                                &bubble_box, NSLayoutAttribute::Leading, NSLayoutRelation::Equal,
+                                Some(&new_cell), NSLayoutAttribute::Leading, 1.0, 16.0
+                            )
+                        }
+                    };
 
                     // Bubble content StackView
                     let content_stack: Allocated<NSStackView> = unsafe { msg_send![NSStackView::class(), alloc] };
@@ -132,6 +152,7 @@ define_class!(
                         let _: () = msg_send![&expander_btn, setBordered: objc2::runtime::Bool::NO];
                         let _: () = msg_send![&expander_btn, setImagePosition: NSCellImagePosition::ImageOnly];
                         let _: () = msg_send![&expander_btn, setImageScaling: NSImageScaling::ScaleProportionallyUpOrDown];
+                        let _: () = msg_send![&expander_btn, setTag: 1402isize];
 
                         // Target action to toggle expansion
                         let action = objc2::sel!(toggleExpansion:);
@@ -148,6 +169,7 @@ define_class!(
                         let _: () = msg_send![&meta_label, setDrawsBackground: objc2::runtime::Bool::NO];
                         let _: () = msg_send![&meta_label, setEditable: objc2::runtime::Bool::NO];
                         let _: () = msg_send![&meta_label, setSelectable: objc2::runtime::Bool::NO];
+                        let _: () = msg_send![&meta_label, setTag: 1401isize];
 
                         let dim_color: Retained<NSColor> = msg_send![NSColor::class(), secondaryLabelColor];
                         let _: () = msg_send![&meta_label, setTextColor: &*dim_color];
@@ -165,8 +187,8 @@ define_class!(
                         let _: () = msg_send![&text_field, setBordered: objc2::runtime::Bool::NO];
                         let _: () = msg_send![&text_field, setEditable: objc2::runtime::Bool::NO];
                         let _: () = msg_send![&text_field, setSelectable: objc2::runtime::Bool::YES];
-
-                        let _: () = msg_send![&text_field, setContentCompressionResistancePriority: 250.0f32, forOrientation: objc2_app_kit::NSLayoutConstraintOrientation::Horizontal];
+                        let _: () = msg_send![&text_field, setAlignment: 0isize];
+                        let _: () = msg_send![&text_field, setTag: 1400isize]; // Lumen Chat Text
 
                         let cell_obj: *mut AnyObject = msg_send![&text_field, cell];
                         if !cell_obj.is_null() {
@@ -184,43 +206,28 @@ define_class!(
                         let _: () = msg_send![&content_stack, addView: &*text_field, inGravity: 1isize];
 
                         bubble_box.addSubview(&content_stack);
-                        root_view.addSubview(&bubble_box);
-                        new_cell.addSubview(&root_view);
+                        new_cell.addSubview(&bubble_box);
                     }
 
                     let constraints = unsafe {
                         NSArray::from_slice(&[
+                            // Bubble constraints directly to the cell view
                             &*NSLayoutConstraint::constraintWithItem_attribute_relatedBy_toItem_attribute_multiplier_constant(
-                                &root_view, NSLayoutAttribute::Top, NSLayoutRelation::Equal,
+                                &bubble_box, NSLayoutAttribute::Top, NSLayoutRelation::Equal,
                                 Some(&new_cell), NSLayoutAttribute::Top, 1.0, 4.0
                             ),
                             &*NSLayoutConstraint::constraintWithItem_attribute_relatedBy_toItem_attribute_multiplier_constant(
-                                &root_view, NSLayoutAttribute::Bottom, NSLayoutRelation::Equal,
+                                &bubble_box, NSLayoutAttribute::Bottom, NSLayoutRelation::Equal,
                                 Some(&new_cell), NSLayoutAttribute::Bottom, 1.0, -4.0
                             ),
-                            &*NSLayoutConstraint::constraintWithItem_attribute_relatedBy_toItem_attribute_multiplier_constant(
-                                &root_view, NSLayoutAttribute::Leading, NSLayoutRelation::Equal,
-                                Some(&new_cell), NSLayoutAttribute::Leading, 1.0, 16.0
-                            ),
-                            &*NSLayoutConstraint::constraintWithItem_attribute_relatedBy_toItem_attribute_multiplier_constant(
-                                &root_view, NSLayoutAttribute::Trailing, NSLayoutRelation::Equal,
-                                Some(&new_cell), NSLayoutAttribute::Trailing, 1.0, -16.0
-                            ),
 
-                            // Bubble constraints inside root
-                            &*NSLayoutConstraint::constraintWithItem_attribute_relatedBy_toItem_attribute_multiplier_constant(
-                                &bubble_box, NSLayoutAttribute::Top, NSLayoutRelation::Equal,
-                                Some(&root_view), NSLayoutAttribute::Top, 1.0, 0.0
-                            ),
-                            &*NSLayoutConstraint::constraintWithItem_attribute_relatedBy_toItem_attribute_multiplier_constant(
-                                &bubble_box, NSLayoutAttribute::Bottom, NSLayoutRelation::Equal,
-                                Some(&root_view), NSLayoutAttribute::Bottom, 1.0, 0.0
-                            ),
+                            // Static bubble alignment constraint
+                            &*alignment_constraint,
 
-                            // Let the width be bounded by the root view
+                            // Let the width be bounded by the cell view
                             &*NSLayoutConstraint::constraintWithItem_attribute_relatedBy_toItem_attribute_multiplier_constant(
                                 &bubble_box, NSLayoutAttribute::Width, NSLayoutRelation::LessThanOrEqual,
-                                Some(&root_view), NSLayoutAttribute::Width, 0.8, 0.0 // Max 80% width
+                                Some(&new_cell), NSLayoutAttribute::Width, 0.8, 0.0 // Max 80% width
                             ),
 
                             // Content Stack inside Bubble
@@ -259,216 +266,32 @@ define_class!(
 
                 let cell = cell.unwrap();
 
-                // Safe subview iteration to find the components
-                let root_views: Retained<NSArray<NSView>> = cell.subviews();
-                let mut found_root = None;
-                for i in 0..root_views.len() {
-                    let subview = root_views.objectAtIndex(i);
-                    // It's just NSView
-                    found_root = Some(subview);
-                    break;
-                }
-
-                let root_view = found_root.unwrap();
-                let bubble_views: Retained<NSArray<NSView>> = root_view.subviews();
-                let mut found_bubble = None;
-                for i in 0..bubble_views.len() {
-                    let subview = bubble_views.objectAtIndex(i);
-                    if let Ok(b) = subview.downcast::<NSBox>() {
-                        found_bubble = Some(b);
-                        break;
+                // O(1) Component Retrieval via Native Lookup
+                let (text_field, meta_label, expander_btn) = unsafe {
+                    let found_text: *mut AnyObject = msg_send![&cell, viewWithTag: 1400isize];
+                    if found_text.is_null() {
+                        panic!("CRITICAL: Tagged NSTextField 1400 missing from NSTableCellView hierarchy.");
                     }
-                }
-                let bubble_box = found_bubble.unwrap();
+                    let text_field: Retained<NSTextField> = Retained::cast_unchecked(Retained::retain(found_text).unwrap());
 
-                let stack_views: Retained<NSArray<NSView>> = bubble_box.subviews();
-                let mut content_stack = None;
-                if stack_views.len() > 0 {
-                    if let Ok(stack) = stack_views.objectAtIndex(0).downcast::<NSStackView>() {
-                        content_stack = Some(stack);
+                    let found_meta: *mut AnyObject = msg_send![&cell, viewWithTag: 1401isize];
+                    if found_meta.is_null() {
+                        panic!("CRITICAL: Tagged NSTextField 1401 missing from NSTableCellView hierarchy.");
                     }
-                }
+                    let meta_label: Retained<NSTextField> = Retained::cast_unchecked(Retained::retain(found_meta).unwrap());
 
-                let content_stack = match content_stack {
-                    Some(stack) => stack,
-                    None => {
-                        // The subview was not an NSStackView (e.g., _NSBoxCustomView or similar unexpected wrapper).
-                        // Discard the invalid contents and build a fresh NSStackView structure for this cell.
-                        let frame = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(400.0, 50.0));
-                        let new_stack: Allocated<NSStackView> = unsafe { msg_send![NSStackView::class(), alloc] };
-                        let new_stack: Retained<NSStackView> = unsafe { msg_send![new_stack, initWithFrame: frame] };
-
-                        unsafe {
-                            let _: () = msg_send![&new_stack, setTranslatesAutoresizingMaskIntoConstraints: objc2::runtime::Bool::NO];
-                            let _: () = msg_send![&new_stack, setOrientation: 1isize]; // Vertical
-                            let _: () = msg_send![&new_stack, setSpacing: 4.0f64];
-                            let _: () = msg_send![&new_stack, setAlignment: objc2_app_kit::NSLayoutAttribute::NotAnAttribute];
-
-                            // We must remove existing broken subviews to avoid conflicts
-                            let _: () = msg_send![&bubble_box, setContentView: &*new_stack];
-                        }
-
-                        // We also need to construct the header box and text field since they were lost.
-                        let header_box: Allocated<NSStackView> = unsafe { msg_send![NSStackView::class(), alloc] };
-                        let header_box: Retained<NSStackView> = unsafe { msg_send![header_box, initWithFrame: frame] };
-                        unsafe {
-                            let _: () = msg_send![&header_box, setTranslatesAutoresizingMaskIntoConstraints: objc2::runtime::Bool::NO];
-                            let _: () = msg_send![&header_box, setOrientation: 0isize]; // Horizontal
-                            let _: () = msg_send![&header_box, setSpacing: 8.0f64];
-                            let _: () = msg_send![&header_box, setAlignment: objc2_app_kit::NSLayoutAttribute::CenterY];
-                        }
-
-                        let expander_btn: Allocated<NSButton> = unsafe { msg_send![NSButton::class(), alloc] };
-                        let expander_btn: Retained<NSButton> = unsafe { msg_send![expander_btn, initWithFrame: frame] };
-                        unsafe {
-                            let _: () = msg_send![&expander_btn, setTranslatesAutoresizingMaskIntoConstraints: objc2::runtime::Bool::NO];
-                            let _: () = msg_send![&expander_btn, setBordered: objc2::runtime::Bool::NO];
-                            let _: () = msg_send![&expander_btn, setImagePosition: NSCellImagePosition::ImageOnly];
-                            let _: () = msg_send![&expander_btn, setImageScaling: NSImageScaling::ScaleProportionallyUpOrDown];
-                            let action = objc2::sel!(toggleExpansion:);
-                            let _: () = msg_send![&expander_btn, setTarget: self];
-                            let _: () = msg_send![&expander_btn, setAction: action];
-                        }
-
-                        let meta_label: Allocated<NSTextField> = unsafe { msg_send![NSTextField::class(), alloc] };
-                        let meta_label: Retained<NSTextField> = unsafe { msg_send![meta_label, initWithFrame: frame] };
-                        unsafe {
-                            let _: () = msg_send![&meta_label, setTranslatesAutoresizingMaskIntoConstraints: objc2::runtime::Bool::NO];
-                            let _: () = msg_send![&meta_label, setBordered: objc2::runtime::Bool::NO];
-                            let _: () = msg_send![&meta_label, setDrawsBackground: objc2::runtime::Bool::NO];
-                            let _: () = msg_send![&meta_label, setEditable: objc2::runtime::Bool::NO];
-                            let _: () = msg_send![&meta_label, setSelectable: objc2::runtime::Bool::NO];
-
-                            let dim_color: Retained<NSColor> = msg_send![NSColor::class(), secondaryLabelColor];
-                            let _: () = msg_send![&meta_label, setTextColor: &*dim_color];
-
-                            let font: Retained<objc2_app_kit::NSFont> = msg_send![objc2_app_kit::NSFont::class(), systemFontOfSize: 11.0, weight: objc2_app_kit::NSFontWeightRegular];
-                            let _: () = msg_send![&meta_label, setFont: &*font];
-                        }
-
-                        let text_field: Allocated<NSTextField> = unsafe { msg_send![NSTextField::class(), alloc] };
-                        let text_field: Retained<NSTextField> = unsafe { msg_send![text_field, initWithFrame: frame] };
-                        unsafe {
-                            let _: () = msg_send![&text_field, setTranslatesAutoresizingMaskIntoConstraints: objc2::runtime::Bool::NO];
-                            let _: () = msg_send![&text_field, setDrawsBackground: objc2::runtime::Bool::NO];
-                            let _: () = msg_send![&text_field, setBordered: objc2::runtime::Bool::NO];
-                            let _: () = msg_send![&text_field, setEditable: objc2::runtime::Bool::NO];
-                            let _: () = msg_send![&text_field, setSelectable: objc2::runtime::Bool::YES];
-
-                            let _: () = msg_send![&text_field, setContentCompressionResistancePriority: 250.0f32, forOrientation: objc2_app_kit::NSLayoutConstraintOrientation::Horizontal];
-
-                            let cell_obj: *mut AnyObject = msg_send![&text_field, cell];
-                            if !cell_obj.is_null() {
-                                let _: () = msg_send![cell_obj, setWraps: objc2::runtime::Bool::YES];
-                                let _: () = msg_send![cell_obj, setLineBreakMode: 0isize]; // NSLineBreakByWordWrapping
-                            }
-                        }
-
-                        unsafe {
-                            let _: () = msg_send![&header_box, addView: &*expander_btn, inGravity: 1isize];
-                            let _: () = msg_send![&header_box, addView: &*meta_label, inGravity: 1isize];
-                            let _: () = msg_send![&new_stack, addView: &*header_box, inGravity: 1isize];
-                            let _: () = msg_send![&new_stack, addView: &*text_field, inGravity: 1isize];
-                        }
-
-                        let constraints = unsafe {
-                            NSArray::from_slice(&[
-                                &*NSLayoutConstraint::constraintWithItem_attribute_relatedBy_toItem_attribute_multiplier_constant(
-                                    &new_stack, NSLayoutAttribute::Top, NSLayoutRelation::Equal,
-                                    Some(&bubble_box), NSLayoutAttribute::Top, 1.0, 8.0
-                                ),
-                                &*NSLayoutConstraint::constraintWithItem_attribute_relatedBy_toItem_attribute_multiplier_constant(
-                                    &new_stack, NSLayoutAttribute::Bottom, NSLayoutRelation::Equal,
-                                    Some(&bubble_box), NSLayoutAttribute::Bottom, 1.0, -8.0
-                                ),
-                                &*NSLayoutConstraint::constraintWithItem_attribute_relatedBy_toItem_attribute_multiplier_constant(
-                                    &new_stack, NSLayoutAttribute::Leading, NSLayoutRelation::Equal,
-                                    Some(&bubble_box), NSLayoutAttribute::Leading, 1.0, 12.0
-                                ),
-                                &*NSLayoutConstraint::constraintWithItem_attribute_relatedBy_toItem_attribute_multiplier_constant(
-                                    &new_stack, NSLayoutAttribute::Trailing, NSLayoutRelation::Equal,
-                                    Some(&bubble_box), NSLayoutAttribute::Trailing, 1.0, -12.0
-                                ),
-                                &*NSLayoutConstraint::constraintWithItem_attribute_relatedBy_toItem_attribute_multiplier_constant(
-                                    &expander_btn, NSLayoutAttribute::Width, NSLayoutRelation::Equal,
-                                    None, NSLayoutAttribute::NotAnAttribute, 1.0, 16.0
-                                ),
-                                &*NSLayoutConstraint::constraintWithItem_attribute_relatedBy_toItem_attribute_multiplier_constant(
-                                    &expander_btn, NSLayoutAttribute::Height, NSLayoutRelation::Equal,
-                                    None, NSLayoutAttribute::NotAnAttribute, 1.0, 16.0
-                                ),
-                            ])
-                        };
-                        NSLayoutConstraint::activateConstraints(&constraints);
-
-                        new_stack
+                    let found_expander: *mut AnyObject = msg_send![&cell, viewWithTag: 1402isize];
+                    if found_expander.is_null() {
+                        panic!("CRITICAL: NSButton with tag 1402 missing from NSTableCellView hierarchy.");
                     }
+                    let expander_btn: Retained<NSButton> = Retained::cast_unchecked(Retained::retain(found_expander).unwrap());
+
+                    (text_field, meta_label, expander_btn)
                 };
-
-                let stack_subviews: Retained<NSArray<NSView>> = content_stack.subviews();
-                let header_box = stack_subviews.objectAtIndex(0).downcast::<NSStackView>().unwrap();
-                let text_field = stack_subviews.objectAtIndex(1).downcast::<NSTextField>().unwrap();
-
-                let header_subviews: Retained<NSArray<NSView>> = header_box.subviews();
-                let expander_btn = header_subviews.objectAtIndex(0).downcast::<NSButton>().unwrap();
-                let meta_label = header_subviews.objectAtIndex(1).downcast::<NSTextField>().unwrap();
 
                 // Keep track of the active text field for streaming if this is the last cell
                 if row == (history.len() - 1) as NSInteger {
                     *self.ivars().active_text_view.borrow_mut() = Some(text_field.clone());
-                }
-
-                // Apply styles based on sender
-                let bg_color: Retained<NSColor> = if is_user {
-                    unsafe { msg_send![NSColor::class(), controlAccentColor] } // Blueish
-                } else {
-                    unsafe { msg_send![NSColor::class(), windowBackgroundColor] } // Darker grey
-                };
-                unsafe { let _: () = msg_send![&bubble_box, setFillColor: &*bg_color]; }
-
-                // Align Bubble Layout Left/Right
-                unsafe {
-                    // Remove old leading/trailing alignment constraints on bubble relative to root
-                    let existing_constraints: Retained<NSArray<NSLayoutConstraint>> = root_view.constraints();
-                    let mut constraints_to_keep = Vec::new();
-                    let mut old_align = None;
-
-                    for i in 0..existing_constraints.len() {
-                        let c = existing_constraints.objectAtIndex(i);
-                        let first_attr: NSLayoutAttribute = msg_send![&c, firstAttribute];
-                        if first_attr == NSLayoutAttribute::Leading || first_attr == NSLayoutAttribute::Trailing {
-                            // Check if it involves bubble_box and root_view
-                            let first_item: *mut AnyObject = msg_send![&c, firstItem];
-                            let second_item: *mut AnyObject = msg_send![&c, secondItem];
-                            let bubble_ptr = Retained::as_ptr(&bubble_box) as *mut AnyObject;
-
-                            if first_item == bubble_ptr || second_item == bubble_ptr {
-                                old_align = Some(c.clone());
-                                continue;
-                            }
-                        }
-                        constraints_to_keep.push(c.clone());
-                    }
-
-                    if let Some(old_c) = old_align {
-                        let old_array = NSArray::from_slice(&[&*old_c]);
-                        NSLayoutConstraint::deactivateConstraints(&old_array);
-                    }
-
-                    let new_align = if is_user {
-                        NSLayoutConstraint::constraintWithItem_attribute_relatedBy_toItem_attribute_multiplier_constant(
-                            &bubble_box, NSLayoutAttribute::Trailing, NSLayoutRelation::Equal,
-                            Some(&root_view), NSLayoutAttribute::Trailing, 1.0, 0.0
-                        )
-                    } else {
-                        NSLayoutConstraint::constraintWithItem_attribute_relatedBy_toItem_attribute_multiplier_constant(
-                            &bubble_box, NSLayoutAttribute::Leading, NSLayoutRelation::Equal,
-                            Some(&root_view), NSLayoutAttribute::Leading, 1.0, 0.0
-                        )
-                    };
-
-                    let new_array = NSArray::from_slice(&[&*new_align]);
-                    NSLayoutConstraint::activateConstraints(&new_array);
                 }
 
                 // Set Metadata
@@ -518,9 +341,6 @@ define_class!(
                 let needs_expander = gneiss_pal::types::calculate_truncation(&item.content, 7, 500).is_some();
                 unsafe {
                     let _: () = msg_send![&expander_btn, setHidden: objc2::runtime::Bool::new(!needs_expander)];
-
-                    // Store the row in the button tag so action handler knows what to toggle
-                    let _: () = msg_send![&expander_btn, setTag: row];
                 }
 
                 if needs_expander {
@@ -547,7 +367,8 @@ define_class!(
         #[unsafe(method(toggleExpansion:))]
         fn toggle_expansion(&self, sender: &AnyObject) {
             unsafe {
-                let row: NSInteger = msg_send![sender, tag];
+                let tv = self.ivars().table_view.borrow().as_ref().unwrap().clone();
+                let row: NSInteger = msg_send![&tv, rowForView: sender];
                 let row_usize = row as usize;
 
                 {
@@ -616,9 +437,16 @@ impl ChatBoxManager {
 
                 let _: () = msg_send![&**text_field, setAttributedStringValue: &*mutable_attr_string];
 
-                // If it's inside a scroll view or table, we might need to tell the table to update layouts
-                // But typically NSTableView with automatic row heights picks up intrinsic size changes
-                // on the next layout pass.
+                // Force layout recalculation and evaluate truncation by invalidating the row height
+                let history_len = self.ivars().history.borrow().len();
+                if history_len > 0 {
+                    let last_row = (history_len - 1) as NSInteger;
+                    if let Some(tv) = self.ivars().table_view.borrow().as_ref() {
+                        let index_set: Retained<objc2_foundation::NSIndexSet> = msg_send![objc2_foundation::NSIndexSet::class(), indexSetWithIndex: last_row as objc2_foundation::NSUInteger];
+                        let sel = objc2::sel!(noteHeightOfRowsWithIndexesChanged:);
+                        let _: () = msg_send![tv, performSelectorOnMainThread: sel, withObject: &*index_set, waitUntilDone: objc2::runtime::Bool::NO];
+                    }
+                }
             }
         }
     }
