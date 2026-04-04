@@ -220,10 +220,6 @@ define_class!(
                             &text_field, objc2_app_kit::NSLayoutAttribute::Leading, objc2_app_kit::NSLayoutRelation::Equal,
                             Some(&new_cell), objc2_app_kit::NSLayoutAttribute::Leading, 1.0, 4.0
                         ),
-                        &*objc2_app_kit::NSLayoutConstraint::constraintWithItem_attribute_relatedBy_toItem_attribute_multiplier_constant(
-                            &text_field, objc2_app_kit::NSLayoutAttribute::Trailing, objc2_app_kit::NSLayoutRelation::Equal,
-                            Some(&new_cell), objc2_app_kit::NSLayoutAttribute::Trailing, 1.0, -4.0
-                        ),
                     ])
                 };
                 objc2_app_kit::NSLayoutConstraint::activateConstraints(&constraints);
@@ -323,7 +319,7 @@ pub fn create_sidebar(_mtm: MainThreadMarker, workspace_state: &bandy::state::Wo
     let scroll_view: Retained<NSScrollView> = unsafe { msg_send![scroll_view, initWithFrame: frame] };
 
     scroll_view.setHasVerticalScroller(true);
-    scroll_view.setHasHorizontalScroller(false);
+    scroll_view.setHasHorizontalScroller(true);
     scroll_view.setAutohidesScrollers(true);
 
     // Attach the outline view to the scroll view

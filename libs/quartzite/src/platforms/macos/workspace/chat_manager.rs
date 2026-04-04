@@ -190,6 +190,8 @@ define_class!(
                         let _: () = msg_send![&text_field, setBordered: objc2::runtime::Bool::NO];
                         let _: () = msg_send![&text_field, setEditable: objc2::runtime::Bool::NO];
                         let _: () = msg_send![&text_field, setSelectable: objc2::runtime::Bool::YES];
+                        let _: () = msg_send![&text_field, setContentCompressionResistancePriority: 250.0f32, forOrientation: 0isize];
+                        let _: () = msg_send![&text_field, setAlignment: 0isize];
 
                         let cell_obj: *mut AnyObject = msg_send![&text_field, cell];
                         if !cell_obj.is_null() {
@@ -206,7 +208,7 @@ define_class!(
                         let _: () = msg_send![&content_stack, addView: &*header_box, inGravity: 1isize]; // Top
                         let _: () = msg_send![&content_stack, addView: &*text_field, inGravity: 1isize];
 
-                        bubble_box.addSubview(&content_stack);
+                        let _: () = msg_send![&bubble_box, setContentView: &*content_stack];
                         root_view.addSubview(&bubble_box);
                         new_cell.addSubview(&root_view);
                     }
@@ -380,6 +382,8 @@ define_class!(
                             let _: () = msg_send![&text_field, setBordered: objc2::runtime::Bool::NO];
                             let _: () = msg_send![&text_field, setEditable: objc2::runtime::Bool::NO];
                             let _: () = msg_send![&text_field, setSelectable: objc2::runtime::Bool::YES];
+                            let _: () = msg_send![&text_field, setContentCompressionResistancePriority: 250.0f32, forOrientation: 0isize];
+                            let _: () = msg_send![&text_field, setAlignment: 0isize];
 
                             let cell_obj: *mut AnyObject = msg_send![&text_field, cell];
                             if !cell_obj.is_null() {
