@@ -190,7 +190,6 @@ define_class!(
                         let _: () = msg_send![&text_field, setBordered: objc2::runtime::Bool::NO];
                         let _: () = msg_send![&text_field, setEditable: objc2::runtime::Bool::NO];
                         let _: () = msg_send![&text_field, setSelectable: objc2::runtime::Bool::YES];
-                        let _: () = msg_send![&text_field, setContentCompressionResistancePriority: 250.0f32, forOrientation: 0isize];
                         let _: () = msg_send![&text_field, setAlignment: 0isize];
 
                         let cell_obj: *mut AnyObject = msg_send![&text_field, cell];
@@ -208,7 +207,7 @@ define_class!(
                         let _: () = msg_send![&content_stack, addView: &*header_box, inGravity: 1isize]; // Top
                         let _: () = msg_send![&content_stack, addView: &*text_field, inGravity: 1isize];
 
-                        let _: () = msg_send![&bubble_box, setContentView: &*content_stack];
+                        bubble_box.addSubview(&content_stack);
                         root_view.addSubview(&bubble_box);
                         new_cell.addSubview(&root_view);
                     }
@@ -333,8 +332,14 @@ define_class!(
                             let _: () = msg_send![&new_stack, setAlignment: objc2_app_kit::NSLayoutAttribute::NotAnAttribute];
 
                             // We must remove existing broken subviews to avoid conflicts
-                            let _: () = msg_send![&bubble_box, setContentView: &*new_stack];
+                            // Wait, replacing subviews in a recycled box:
+                            let subviews: Retained<NSArray<NSView>> = msg_send![&bubble_box, subviews];
+                            for i in 0..subviews.len() {
+                                let subview = subviews.objectAtIndex(i);
+                                let _: () = msg_send![&subview, removeFromSuperview];
+                            }
                         }
+                        bubble_box.addSubview(&new_stack);
 
                         // We also need to construct the header box and text field since they were lost.
                         let header_box: Allocated<NSStackView> = unsafe { msg_send![NSStackView::class(), alloc] };
@@ -382,7 +387,6 @@ define_class!(
                             let _: () = msg_send![&text_field, setBordered: objc2::runtime::Bool::NO];
                             let _: () = msg_send![&text_field, setEditable: objc2::runtime::Bool::NO];
                             let _: () = msg_send![&text_field, setSelectable: objc2::runtime::Bool::YES];
-                            let _: () = msg_send![&text_field, setContentCompressionResistancePriority: 250.0f32, forOrientation: 0isize];
                             let _: () = msg_send![&text_field, setAlignment: 0isize];
 
                             let cell_obj: *mut AnyObject = msg_send![&text_field, cell];
