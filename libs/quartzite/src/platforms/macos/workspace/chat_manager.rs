@@ -450,10 +450,6 @@ define_class!(
 
                     let index_set: Retained<objc2_foundation::NSIndexSet> = msg_send![objc2_foundation::NSIndexSet::class(), indexSetWithIndex: row as objc2_foundation::NSUInteger];
                     let _: () = msg_send![tv, noteHeightOfRowsWithIndexesChanged: &*index_set];
-
-                    // Also reload to update content and icon
-                    let col_index_set: Retained<objc2_foundation::NSIndexSet> = msg_send![objc2_foundation::NSIndexSet::class(), indexSetWithIndex: 0isize as objc2_foundation::NSUInteger];
-                    let _: () = msg_send![tv, reloadDataForRowIndexes: &*index_set, columnIndexes: &*col_index_set];
                 }
             }
         }
@@ -478,44 +474,51 @@ unsafe impl NSControlTextEditingDelegate for ChatBoxManager {}
 
 impl ChatBoxManager {
     pub fn append_stream_token(&self, token: &str) {
-        if let Some(text_field) = self.ivars().active_text_view.borrow().as_ref() {
-            unsafe {
-                let current_attr_string: Retained<NSAttributedString> = msg_send![&**text_field, attributedStringValue];
+        let token_owned = token.to_string();
 
-                let mutable_attr_string: Allocated<NSMutableAttributedString> = msg_send![NSMutableAttributedString::class(), alloc];
-                let mutable_attr_string: Retained<NSMutableAttributedString> = msg_send![mutable_attr_string, initWithAttributedString: &*current_attr_string];
+        let text_field_opt = self.ivars().active_text_view.borrow().clone();
+        let history_len = self.ivars().history.borrow().len();
+        let tv_opt = self.ivars().table_view.borrow().clone();
 
-                let token_ns = NSString::from_str(token);
+        dispatch2::Queue::main().exec_async(move || {
+            if let Some(text_field) = text_field_opt.as_ref() {
+                unsafe {
+                    let current_attr_string: Retained<NSAttributedString> = msg_send![&**text_field, attributedStringValue];
 
-                let regular_font: Retained<objc2_app_kit::NSFont> = msg_send![objc2_app_kit::NSFont::class(), systemFontOfSize: 14.0, weight: objc2_app_kit::NSFontWeightRegular];
-                // Assuming stream token is AI response
-                let text_color: Retained<NSColor> = msg_send![NSColor::class(), textColor];
+                    let mutable_attr_string: Allocated<NSMutableAttributedString> = msg_send![NSMutableAttributedString::class(), alloc];
+                    let mutable_attr_string: Retained<NSMutableAttributedString> = msg_send![mutable_attr_string, initWithAttributedString: &*current_attr_string];
 
-                let font_attr_name = &*objc2_app_kit::NSFontAttributeName;
-                let color_attr_name = &*objc2_app_kit::NSForegroundColorAttributeName;
+                    let token_ns = NSString::from_str(&token_owned);
 
-                let token_mut_attr_string: Allocated<NSMutableAttributedString> = msg_send![NSMutableAttributedString::class(), alloc];
-                let token_mut_attr_string: Retained<NSMutableAttributedString> = msg_send![token_mut_attr_string, initWithString: &*token_ns];
+                    let regular_font: Retained<objc2_app_kit::NSFont> = msg_send![objc2_app_kit::NSFont::class(), systemFontOfSize: 14.0, weight: objc2_app_kit::NSFontWeightRegular];
+                    // Assuming stream token is AI response
+                    let text_color: Retained<NSColor> = msg_send![NSColor::class(), textColor];
 
-                let token_range = NSRange::new(0, token.encode_utf16().count());
-                let _: () = msg_send![&token_mut_attr_string, addAttribute: font_attr_name, value: &*Retained::cast_unchecked::<AnyObject>(regular_font), range: token_range];
-                let _: () = msg_send![&token_mut_attr_string, addAttribute: color_attr_name, value: &*Retained::cast_unchecked::<AnyObject>(text_color), range: token_range];
+                    let font_attr_name = &*objc2_app_kit::NSFontAttributeName;
+                    let color_attr_name = &*objc2_app_kit::NSForegroundColorAttributeName;
 
-                let _: () = msg_send![&mutable_attr_string, appendAttributedString: &*token_mut_attr_string];
+                    let token_mut_attr_string: Allocated<NSMutableAttributedString> = msg_send![NSMutableAttributedString::class(), alloc];
+                    let token_mut_attr_string: Retained<NSMutableAttributedString> = msg_send![token_mut_attr_string, initWithString: &*token_ns];
 
-                let _: () = msg_send![&**text_field, setAttributedStringValue: &*mutable_attr_string];
+                    let token_range = NSRange::new(0, token_owned.encode_utf16().count());
+                    let _: () = msg_send![&token_mut_attr_string, addAttribute: font_attr_name, value: &*Retained::cast_unchecked::<AnyObject>(regular_font), range: token_range];
+                    let _: () = msg_send![&token_mut_attr_string, addAttribute: color_attr_name, value: &*Retained::cast_unchecked::<AnyObject>(text_color), range: token_range];
 
-                // Force layout recalculation and evaluate truncation by invalidating the row height
-                let history_len = self.ivars().history.borrow().len();
-                if history_len > 0 {
-                    let last_row = (history_len - 1) as NSInteger;
-                    if let Some(tv) = self.ivars().table_view.borrow().as_ref() {
-                        let index_set: Retained<objc2_foundation::NSIndexSet> = msg_send![objc2_foundation::NSIndexSet::class(), indexSetWithIndex: last_row as objc2_foundation::NSUInteger];
-                        let sel = objc2::sel!(noteHeightOfRowsWithIndexesChanged:);
-                        let _: () = msg_send![tv, performSelectorOnMainThread: sel, withObject: &*index_set, waitUntilDone: objc2::runtime::Bool::NO];
+                    let _: () = msg_send![&mutable_attr_string, appendAttributedString: &*token_mut_attr_string];
+
+                    let _: () = msg_send![&**text_field, setAttributedStringValue: &*mutable_attr_string];
+
+                    // Force layout recalculation and evaluate truncation by invalidating the row height
+                    if history_len > 0 {
+                        let last_row = (history_len - 1) as NSInteger;
+                        if let Some(tv) = tv_opt.as_ref() {
+                            let index_set: Retained<objc2_foundation::NSIndexSet> = msg_send![objc2_foundation::NSIndexSet::class(), indexSetWithIndex: last_row as objc2_foundation::NSUInteger];
+                            let sel = objc2::sel!(noteHeightOfRowsWithIndexesChanged:);
+                            let _: () = msg_send![tv, performSelectorOnMainThread: sel, withObject: &*index_set, waitUntilDone: objc2::runtime::Bool::NO];
+                        }
                     }
                 }
             }
-        }
+        });
     }
 }
