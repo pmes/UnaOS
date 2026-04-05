@@ -15,7 +15,7 @@ use objc2_app_kit::{
     NSSplitViewController, NSSplitViewItem, NSViewController
 };
 use objc2_foundation::MainThreadMarker;
-use objc2::{msg_send, ClassType};
+use objc2::{msg_send, ClassType, DefinedClass};
 use objc2::rc::{Retained, Allocated};
 
 use super::workspace::sidebar;
