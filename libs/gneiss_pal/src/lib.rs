@@ -22,12 +22,12 @@ pub mod forge;
 pub mod io;
 pub mod paths;
 pub mod persistence;
-pub mod shard;
-pub mod types;
+pub mod utils;
+pub mod app_handler;
 
 // Re-export types so consumers see them at the root
-pub use shard::{Heartbeat, Shard, ShardRole, ShardStatus};
-pub use types::*;
+pub use utils::*;
+pub use app_handler::*;
 
 // --- LOGIC KERNEL ---
 // No GTK, No Assets, No UI.

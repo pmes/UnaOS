@@ -3,61 +3,9 @@
 
 use std::collections::{HashMap, VecDeque, HashSet};
 use serde::{Deserialize, Serialize};
+use crate::ontology::{Origin, Shard, ShardStatus, WeightedSkeleton};
 
 pub const MAX_STATE_CAPACITY: usize = 1000;
-
-// --- SHARD DOMAIN ---
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub enum ShardRole {
-    Root,    // Una-Prime (The Command Deck)
-    Builder, // S9 (CI/CD)
-    Storage, // The Mule (Big Data)
-    Kernel,  // Hardware Debugging
-    Unknown,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub enum ShardStatus {
-    Online,   // Green
-    OnCall,   // Teal
-    Active,   // Seafoam
-    Thinking, // Purple
-    Paused,   // Yellow
-    Error,    // Red
-    Offline,  // Grey
-}
-
-#[derive(Debug, Clone)]
-pub struct Shard {
-    pub id: String,
-    pub name: String,
-    pub role: ShardRole,
-    pub status: ShardStatus,
-    pub cpu_load: u8, // Percentage 0-100
-    pub children: Vec<Shard>,
-}
-
-#[derive(Debug, Clone)]
-pub struct Heartbeat {
-    pub id: String,
-    pub status: ShardStatus,
-    pub cpu_load: u8,
-}
-
-impl Shard {
-    pub fn new(id: &str, name: &str, role: ShardRole) -> Self {
-        Self {
-            id: id.to_string(),
-            name: name.to_string(),
-            role,
-            status: ShardStatus::Offline,
-            cpu_load: 0,
-            children: Vec::new(),
-        }
-    }
-}
-
 
 // --- PURE LOGIC TYPES ---
 
@@ -76,11 +24,38 @@ pub struct PreFlightPayload {
     pub prompt: String,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct HistoryItem {
-    pub sender: String,
+    pub origin: Origin,
+    pub display_name: Option<String>,
     pub content: String,
     pub timestamp: String,
+    pub is_chat: bool,
+}
+
+impl Default for HistoryItem {
+    fn default() -> Self {
+        Self {
+            origin: Origin::System("UnaOS".to_string()),
+            display_name: None,
+            content: String::new(),
+            timestamp: String::new(),
+            is_chat: false,
+        }
+    }
+}
+
+/// DispatchRecord
+/// Represents a semantic memory entry.
+/// Shared between Vein and Amber Bytes.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DispatchRecord {
+    pub id: String,
+    pub origin: Origin,
+    pub display_name: Option<String>,
+    pub subject: String,
+    pub timestamp: String,
+    pub content: String,
     pub is_chat: bool,
 }
 
@@ -168,7 +143,7 @@ pub struct AppState {
     // Status mapping for Shards
     pub shard_statuses: HashMap<String, ShardStatus>,
 
-    pub live_context: Vec<crate::WeightedSkeleton>,
+    pub live_context: Vec<WeightedSkeleton>,
 
     // The active spatial map (Matrix DAG topology)
     pub matrix_topology: String,
