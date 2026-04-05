@@ -121,6 +121,8 @@ define_class!(
 
                         // Enforce Content Hugging on Bubble Box
                         let _: () = msg_send![&bubble_box, setContentHuggingPriority: 1000.0f32, forOrientation: 0isize];
+                        let _: () = msg_send![&bubble_box, setContentHuggingPriority: 1000.0f32, forOrientation: 1isize];
+                        let _: () = msg_send![&bubble_box, setTag: 1403isize];
                     }
 
                     let mut alignment_constraints: Vec<Retained<NSLayoutConstraint>> = Vec::new();
@@ -165,6 +167,9 @@ define_class!(
 
                         let stack_alignment = if is_system { 9isize } else { 5isize }; // CenterX vs Leading
                         let _: () = msg_send![&content_stack, setAlignment: stack_alignment];
+                        let _: () = msg_send![&content_stack, setContentHuggingPriority: 1000.0f32, forOrientation: 0isize];
+                        let _: () = msg_send![&content_stack, setContentHuggingPriority: 1000.0f32, forOrientation: 1isize];
+                        let _: () = msg_send![&content_stack, setTag: 1404isize];
                     }
 
                     // Header Box
@@ -227,6 +232,7 @@ define_class!(
 
                         // Enforce Content Hugging on Text Field
                         let _: () = msg_send![&text_field, setContentHuggingPriority: 1000.0f32, forOrientation: 0isize];
+                        let _: () = msg_send![&text_field, setContentHuggingPriority: 1000.0f32, forOrientation: 1isize];
 
                         // Lower Compression Resistance to yield to 75% max width
                         let _: () = msg_send![&text_field, setContentCompressionResistancePriority: 250.0f32, forOrientation: 0isize];
@@ -447,6 +453,27 @@ define_class!(
                 if let Some(tv) = self.ivars().table_view.borrow().as_ref() {
                     let index_set: Retained<objc2_foundation::NSIndexSet> = msg_send![objc2_foundation::NSIndexSet::class(), indexSetWithIndex: row as objc2_foundation::NSUInteger];
                     let col_index_set: Retained<objc2_foundation::NSIndexSet> = msg_send![objc2_foundation::NSIndexSet::class(), indexSetWithIndex: 0isize as objc2_foundation::NSUInteger];
+
+                    // Deep layout invalidation for expand/collapse wrap resizing
+                    let cell_view: *mut AnyObject = msg_send![tv, viewAtColumn: 0isize, row: row, makeIfNecessary: objc2::runtime::Bool::NO];
+                    if !cell_view.is_null() {
+                        let cell_retained: Retained<NSTableCellView> = Retained::cast_unchecked(Retained::retain(cell_view).unwrap());
+
+                        let text_field_ptr: *mut AnyObject = msg_send![&cell_retained, viewWithTag: 1400isize];
+                        if !text_field_ptr.is_null() {
+                            let _: () = msg_send![text_field_ptr, invalidateIntrinsicContentSize];
+                        }
+
+                        let bubble_box_ptr: *mut AnyObject = msg_send![&cell_retained, viewWithTag: 1403isize];
+                        if !bubble_box_ptr.is_null() {
+                            let _: () = msg_send![bubble_box_ptr, invalidateIntrinsicContentSize];
+                        }
+
+                        let stack_ptr: *mut AnyObject = msg_send![&cell_retained, viewWithTag: 1404isize];
+                        if !stack_ptr.is_null() {
+                            let _: () = msg_send![stack_ptr, invalidateIntrinsicContentSize];
+                        }
+                    }
 
                     // Lock the table for an atomic update
                     let _: () = msg_send![tv, beginUpdates];
