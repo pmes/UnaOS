@@ -93,6 +93,8 @@ define_class!(
                     let new_cell: Allocated<NSTableCellView> = unsafe { msg_send![NSTableCellView::class(), alloc] };
                     let new_cell: Retained<NSTableCellView> = unsafe { msg_send![new_cell, initWithFrame: frame] };
                     unsafe {
+                        let _: () = msg_send![&new_cell, setWantsLayer: objc2::runtime::Bool::YES];
+                        let _: () = msg_send![&new_cell, setAutoresizingMask: 2isize]; // NSViewWidthSizable
                         let _: () = msg_send![&new_cell, setIdentifier: &*identifier];
                     }
 
@@ -160,7 +162,9 @@ define_class!(
                         let _: () = msg_send![&content_stack, setTranslatesAutoresizingMaskIntoConstraints: objc2::runtime::Bool::NO];
                         let _: () = msg_send![&content_stack, setOrientation: 1isize]; // Vertical
                         let _: () = msg_send![&content_stack, setSpacing: 4.0f64];
-                        let _: () = msg_send![&content_stack, setAlignment: objc2_app_kit::NSLayoutAttribute::NotAnAttribute]; // Handled by constraints
+
+                        let stack_alignment = if is_system { 9isize } else { 5isize }; // CenterX vs Leading
+                        let _: () = msg_send![&content_stack, setAlignment: stack_alignment];
                     }
 
                     // Header Box
@@ -223,6 +227,9 @@ define_class!(
 
                         // Enforce Content Hugging on Text Field
                         let _: () = msg_send![&text_field, setContentHuggingPriority: 1000.0f32, forOrientation: 0isize];
+
+                        // Lower Compression Resistance to yield to 75% max width
+                        let _: () = msg_send![&text_field, setContentCompressionResistancePriority: 250.0f32, forOrientation: 0isize];
 
 
                         let cell_obj: *mut AnyObject = msg_send![&text_field, cell];
