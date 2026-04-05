@@ -411,6 +411,13 @@ define_class!(
                     }
                 }
 
+                unsafe {
+                    let table_bounds: NSRect = msg_send![table_view, bounds];
+                    // 75% of the table width minus the 24pts of internal horizontal padding
+                    let max_text_width = (table_bounds.size.width * 0.75) - 24.0;
+
+                    let _: () = msg_send![&text_field, setPreferredMaxLayoutWidth: max_text_width];
+                }
 
                 Some(unsafe { Retained::cast_unchecked::<NSView>(cell) })
             } else {
@@ -438,18 +445,20 @@ define_class!(
                 } // The mutable borrow of `expanded_rows` is dropped here.
 
                 if let Some(tv) = self.ivars().table_view.borrow().as_ref() {
-                    // Fetch the cell view directly to force the layout system to recalculate
-                    let cell_view: *mut AnyObject = msg_send![tv, viewAtColumn: 0isize, row: row, makeIfNecessary: objc2::runtime::Bool::NO];
-                    if !cell_view.is_null() {
-                        let cell_retained: Retained<NSTableCellView> = Retained::cast_unchecked(Retained::retain(cell_view).unwrap());
-                        let text_field_ptr: *mut AnyObject = msg_send![&cell_retained, viewWithTag: 1400isize];
-                        if !text_field_ptr.is_null() {
-                            let _: () = msg_send![text_field_ptr, invalidateIntrinsicContentSize];
-                        }
-                    }
-
                     let index_set: Retained<objc2_foundation::NSIndexSet> = msg_send![objc2_foundation::NSIndexSet::class(), indexSetWithIndex: row as objc2_foundation::NSUInteger];
+                    let col_index_set: Retained<objc2_foundation::NSIndexSet> = msg_send![objc2_foundation::NSIndexSet::class(), indexSetWithIndex: 0isize as objc2_foundation::NSUInteger];
+
+                    // Lock the table for an atomic update
+                    let _: () = msg_send![tv, beginUpdates];
+
+                    // 1. Reload the data to swap the text and icon
+                    let _: () = msg_send![tv, reloadDataForRowIndexes: &*index_set, columnIndexes: &*col_index_set];
+
+                    // 2. Tell it the height changed based on the new data
                     let _: () = msg_send![tv, noteHeightOfRowsWithIndexesChanged: &*index_set];
+
+                    // Commit the layout pass
+                    let _: () = msg_send![tv, endUpdates];
                 }
             }
         }
