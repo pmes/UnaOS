@@ -275,7 +275,7 @@ fn main() {
     #[cfg(target_os = "macos")]
     let bootstrap = move |
         window: &NativeWindow,
-        tx_event: async_channel::Sender<gneiss_pal::Event>,
+        tx_event: async_channel::Sender<bandy::SMessage>,
         app_state_ref: std::sync::Arc<std::sync::RwLock<bandy::state::AppState>>,
         rx_synapse: tokio::sync::broadcast::Receiver<bandy::SMessage>,
         workspace_state_ref: bandy::state::WorkspaceState,
