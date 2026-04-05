@@ -476,12 +476,12 @@ impl ChatBoxManager {
     pub fn append_stream_token(&self, token: &str) {
         let token_owned = token.to_string();
 
-        let text_field_opt = self.ivars().active_text_view.borrow().clone();
-        let history_len = self.ivars().history.borrow().len();
-        let tv_opt = self.ivars().table_view.borrow().clone();
+        let self_ptr = self as *const _ as usize;
 
-        dispatch2::Queue::main().exec_async(move || {
-            if let Some(text_field) = text_field_opt.as_ref() {
+        dispatch2::DispatchQueue::main().exec_async(move || {
+            let this = unsafe { &*(self_ptr as *const Self) };
+
+            if let Some(text_field) = this.ivars().active_text_view.borrow().as_ref() {
                 unsafe {
                     let current_attr_string: Retained<NSAttributedString> = msg_send![&**text_field, attributedStringValue];
 
@@ -509,9 +509,10 @@ impl ChatBoxManager {
                     let _: () = msg_send![&**text_field, setAttributedStringValue: &*mutable_attr_string];
 
                     // Force layout recalculation and evaluate truncation by invalidating the row height
+                    let history_len = this.ivars().history.borrow().len();
                     if history_len > 0 {
                         let last_row = (history_len - 1) as NSInteger;
-                        if let Some(tv) = tv_opt.as_ref() {
+                        if let Some(tv) = this.ivars().table_view.borrow().as_ref() {
                             let index_set: Retained<objc2_foundation::NSIndexSet> = msg_send![objc2_foundation::NSIndexSet::class(), indexSetWithIndex: last_row as objc2_foundation::NSUInteger];
                             let sel = objc2::sel!(noteHeightOfRowsWithIndexesChanged:);
                             let _: () = msg_send![tv, performSelectorOnMainThread: sel, withObject: &*index_set, waitUntilDone: objc2::runtime::Bool::NO];

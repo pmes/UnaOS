@@ -103,8 +103,6 @@ impl MacOSSpline {
 
         // 2. Spawn the Main Thread Router
         // Using `dispatch2` for macOS GCD to cross the Tokio async/sync boundary natively
-        let spline_inner_arc = self.inner.clone();
-
         // 2. Spawn the Main Thread Router
         // To safely pass AppKit pointers into the background tokio closure, we must marshal them
         // into usize pointers, because AppKit items like `Retained<T>` are `!Send`.
@@ -124,7 +122,6 @@ impl MacOSSpline {
                         match msg {
                             SMessage::StorageLoadPagedResult { records, .. } => {
                                 dispatch2::DispatchQueue::main().exec_async(move || {
-                                    use objc2::DefinedClass;
                                     let comms_delegate = unsafe {
                                         Retained::retain(comms_ptr as *mut objc2::runtime::AnyObject).unwrap()
                                     };
@@ -160,7 +157,6 @@ impl MacOSSpline {
                             },
                             SMessage::AiToken(token_string) => {
                                 dispatch2::DispatchQueue::main().exec_async(move || {
-                                    use objc2::DefinedClass;
                                     let comms_delegate = unsafe {
                                         Retained::retain(comms_ptr as *mut objc2::runtime::AnyObject).unwrap()
                                     };
@@ -192,7 +188,6 @@ impl MacOSSpline {
                             },
                             SMessage::Matrix(matrix_event) => {
                                 dispatch2::DispatchQueue::main().exec_async(move || {
-                                    use objc2::DefinedClass;
                                     let sidebar_delegate = unsafe {
                                         Retained::retain(sidebar_ptr as *mut objc2::runtime::AnyObject).unwrap()
                                     };
@@ -230,7 +225,6 @@ impl MacOSSpline {
                                             }
 
                                             use crate::platforms::macos::workspace::sidebar::UnaMatrixNode;
-                                            use objc2::DefinedClass;
 
                                             let mut new_roots = Vec::new();
                                             for root in &root_nodes {
