@@ -27,7 +27,7 @@ use super::workspace::comms;
 pub struct MacOSSpline {
     // Wrap any inner mutable state in an Arc<Mutex> so that the async loops can
     // clone the Arc and move it into the thread without lifetime or borrow checker conflicts.
-    inner: Arc<Mutex<MacOSSplineInner>>,
+    _inner: Arc<Mutex<MacOSSplineInner>>,
 }
 
 struct MacOSSplineInner {
@@ -38,7 +38,7 @@ struct MacOSSplineInner {
 impl MacOSSpline {
     pub fn new() -> Self {
         Self {
-            inner: Arc::new(Mutex::new(MacOSSplineInner {})),
+            _inner: Arc::new(Mutex::new(MacOSSplineInner {})),
         }
     }
 

@@ -122,7 +122,6 @@ define_class!(
                         // Enforce Content Hugging on Bubble Box
                         let _: () = msg_send![&bubble_box, setContentHuggingPriority: 1000.0f32, forOrientation: 0isize];
                         let _: () = msg_send![&bubble_box, setContentHuggingPriority: 1000.0f32, forOrientation: 1isize];
-                        let _: () = msg_send![&bubble_box, setTag: 1403isize];
                     }
 
                     let mut alignment_constraints: Vec<Retained<NSLayoutConstraint>> = Vec::new();
@@ -169,7 +168,6 @@ define_class!(
                         let _: () = msg_send![&content_stack, setAlignment: stack_alignment];
                         let _: () = msg_send![&content_stack, setContentHuggingPriority: 1000.0f32, forOrientation: 0isize];
                         let _: () = msg_send![&content_stack, setContentHuggingPriority: 1000.0f32, forOrientation: 1isize];
-                        let _: () = msg_send![&content_stack, setTag: 1404isize];
                     }
 
                     // Header Box
@@ -462,16 +460,16 @@ define_class!(
                         let text_field_ptr: *mut AnyObject = msg_send![&cell_retained, viewWithTag: 1400isize];
                         if !text_field_ptr.is_null() {
                             let _: () = msg_send![text_field_ptr, invalidateIntrinsicContentSize];
-                        }
 
-                        let bubble_box_ptr: *mut AnyObject = msg_send![&cell_retained, viewWithTag: 1403isize];
-                        if !bubble_box_ptr.is_null() {
-                            let _: () = msg_send![bubble_box_ptr, invalidateIntrinsicContentSize];
-                        }
+                            let stack_ptr: *mut AnyObject = msg_send![text_field_ptr, superview];
+                            if !stack_ptr.is_null() {
+                                let _: () = msg_send![stack_ptr, invalidateIntrinsicContentSize];
 
-                        let stack_ptr: *mut AnyObject = msg_send![&cell_retained, viewWithTag: 1404isize];
-                        if !stack_ptr.is_null() {
-                            let _: () = msg_send![stack_ptr, invalidateIntrinsicContentSize];
+                                let bubble_box_ptr: *mut AnyObject = msg_send![stack_ptr, superview];
+                                if !bubble_box_ptr.is_null() {
+                                    let _: () = msg_send![bubble_box_ptr, invalidateIntrinsicContentSize];
+                                }
+                            }
                         }
                     }
 
