@@ -100,11 +100,11 @@ define_class!(
                     let bubble_box: Allocated<NSBox> = unsafe { msg_send![NSBox::class(), alloc] };
                     let bubble_box: Retained<NSBox> = unsafe { msg_send![bubble_box, initWithFrame: frame] };
                     unsafe {
+                        let _: () = msg_send![&bubble_box, setWantsLayer: objc2::runtime::Bool::YES];
                         let _: () = msg_send![&bubble_box, setTranslatesAutoresizingMaskIntoConstraints: objc2::runtime::Bool::NO];
                         let _: () = msg_send![&bubble_box, setBoxType: 4isize]; // NSBoxCustom
                         let _: () = msg_send![&bubble_box, setBorderType: 0isize]; // NSNoBorder
                         let _: () = msg_send![&bubble_box, setTransparent: objc2::runtime::Bool::NO];
-                        let _: () = msg_send![&bubble_box, setWantsLayer: objc2::runtime::Bool::YES];
                         let _: () = msg_send![&bubble_box, setCornerRadius: 8.0f64];
 
                         // Apply permanent styles based on sender
@@ -121,28 +121,37 @@ define_class!(
                         let _: () = msg_send![&bubble_box, setContentHuggingPriority: 1000.0f32, forOrientation: 0isize];
                     }
 
-                    let alignment_constraint = if is_user {
+                    let mut alignment_constraints: Vec<Retained<NSLayoutConstraint>> = Vec::new();
+                    if is_user {
                         unsafe {
-                            NSLayoutConstraint::constraintWithItem_attribute_relatedBy_toItem_attribute_multiplier_constant(
+                            alignment_constraints.push(NSLayoutConstraint::constraintWithItem_attribute_relatedBy_toItem_attribute_multiplier_constant(
                                 &bubble_box, NSLayoutAttribute::Trailing, NSLayoutRelation::Equal,
                                 Some(&new_cell), NSLayoutAttribute::Trailing, 1.0, -16.0
-                            )
+                            ));
+                            alignment_constraints.push(NSLayoutConstraint::constraintWithItem_attribute_relatedBy_toItem_attribute_multiplier_constant(
+                                &bubble_box, NSLayoutAttribute::Leading, NSLayoutRelation::GreaterThanOrEqual,
+                                Some(&new_cell), NSLayoutAttribute::Leading, 1.0, 60.0
+                            ));
                         }
                     } else if is_system {
                         unsafe {
-                            NSLayoutConstraint::constraintWithItem_attribute_relatedBy_toItem_attribute_multiplier_constant(
+                            alignment_constraints.push(NSLayoutConstraint::constraintWithItem_attribute_relatedBy_toItem_attribute_multiplier_constant(
                                 &bubble_box, NSLayoutAttribute::CenterX, NSLayoutRelation::Equal,
                                 Some(&new_cell), NSLayoutAttribute::CenterX, 1.0, 0.0
-                            )
+                            ));
                         }
                     } else {
                         unsafe {
-                            NSLayoutConstraint::constraintWithItem_attribute_relatedBy_toItem_attribute_multiplier_constant(
+                            alignment_constraints.push(NSLayoutConstraint::constraintWithItem_attribute_relatedBy_toItem_attribute_multiplier_constant(
                                 &bubble_box, NSLayoutAttribute::Leading, NSLayoutRelation::Equal,
                                 Some(&new_cell), NSLayoutAttribute::Leading, 1.0, 16.0
-                            )
+                            ));
+                            alignment_constraints.push(NSLayoutConstraint::constraintWithItem_attribute_relatedBy_toItem_attribute_multiplier_constant(
+                                &bubble_box, NSLayoutAttribute::Trailing, NSLayoutRelation::LessThanOrEqual,
+                                Some(&new_cell), NSLayoutAttribute::Trailing, 1.0, -60.0
+                            ));
                         }
-                    };
+                    }
 
                     // Bubble content StackView
                     let content_stack: Allocated<NSStackView> = unsafe { msg_send![NSStackView::class(), alloc] };
@@ -215,9 +224,6 @@ define_class!(
                         // Enforce Content Hugging on Text Field
                         let _: () = msg_send![&text_field, setContentHuggingPriority: 1000.0f32, forOrientation: 0isize];
 
-                        // Set preferred max layout width dynamically to 80% of cell width
-                        let frame_width = frame.size.width;
-                        let _: () = msg_send![&text_field, setPreferredMaxLayoutWidth: frame_width * 0.8];
 
                         let cell_obj: *mut AnyObject = msg_send![&text_field, cell];
                         if !cell_obj.is_null() {
@@ -238,56 +244,61 @@ define_class!(
                         new_cell.addSubview(&bubble_box);
                     }
 
-                    let constraints = unsafe {
-                        NSArray::from_slice(&[
+                    let mut constraint_list: Vec<Retained<NSLayoutConstraint>> = unsafe {
+                        vec![
                             // Bubble constraints directly to the cell view
-                            &*NSLayoutConstraint::constraintWithItem_attribute_relatedBy_toItem_attribute_multiplier_constant(
+                            NSLayoutConstraint::constraintWithItem_attribute_relatedBy_toItem_attribute_multiplier_constant(
                                 &bubble_box, NSLayoutAttribute::Top, NSLayoutRelation::Equal,
                                 Some(&new_cell), NSLayoutAttribute::Top, 1.0, 4.0
                             ),
-                            &*NSLayoutConstraint::constraintWithItem_attribute_relatedBy_toItem_attribute_multiplier_constant(
+                            NSLayoutConstraint::constraintWithItem_attribute_relatedBy_toItem_attribute_multiplier_constant(
                                 &bubble_box, NSLayoutAttribute::Bottom, NSLayoutRelation::Equal,
                                 Some(&new_cell), NSLayoutAttribute::Bottom, 1.0, -4.0
                             ),
 
-                            // Static bubble alignment constraint
-                            &*alignment_constraint,
-
                             // Let the width be bounded by the cell view
-                            &*NSLayoutConstraint::constraintWithItem_attribute_relatedBy_toItem_attribute_multiplier_constant(
+                            NSLayoutConstraint::constraintWithItem_attribute_relatedBy_toItem_attribute_multiplier_constant(
                                 &bubble_box, NSLayoutAttribute::Width, NSLayoutRelation::LessThanOrEqual,
-                                Some(&new_cell), NSLayoutAttribute::Width, 0.8, 0.0 // Max 80% width
+                                Some(&new_cell), NSLayoutAttribute::Width, 0.75, 0.0 // Max 75% width
                             ),
 
                             // Content Stack inside Bubble
-                            &*NSLayoutConstraint::constraintWithItem_attribute_relatedBy_toItem_attribute_multiplier_constant(
+                            NSLayoutConstraint::constraintWithItem_attribute_relatedBy_toItem_attribute_multiplier_constant(
                                 &content_stack, NSLayoutAttribute::Top, NSLayoutRelation::Equal,
                                 Some(&bubble_box), NSLayoutAttribute::Top, 1.0, 8.0
                             ),
-                            &*NSLayoutConstraint::constraintWithItem_attribute_relatedBy_toItem_attribute_multiplier_constant(
+                            NSLayoutConstraint::constraintWithItem_attribute_relatedBy_toItem_attribute_multiplier_constant(
                                 &content_stack, NSLayoutAttribute::Bottom, NSLayoutRelation::Equal,
                                 Some(&bubble_box), NSLayoutAttribute::Bottom, 1.0, -8.0
                             ),
-                            &*NSLayoutConstraint::constraintWithItem_attribute_relatedBy_toItem_attribute_multiplier_constant(
+                            NSLayoutConstraint::constraintWithItem_attribute_relatedBy_toItem_attribute_multiplier_constant(
                                 &content_stack, NSLayoutAttribute::Leading, NSLayoutRelation::Equal,
                                 Some(&bubble_box), NSLayoutAttribute::Leading, 1.0, 12.0
                             ),
-                            &*NSLayoutConstraint::constraintWithItem_attribute_relatedBy_toItem_attribute_multiplier_constant(
+                            NSLayoutConstraint::constraintWithItem_attribute_relatedBy_toItem_attribute_multiplier_constant(
                                 &content_stack, NSLayoutAttribute::Trailing, NSLayoutRelation::Equal,
                                 Some(&bubble_box), NSLayoutAttribute::Trailing, 1.0, -12.0
                             ),
 
                             // Expander button sizing
-                            &*NSLayoutConstraint::constraintWithItem_attribute_relatedBy_toItem_attribute_multiplier_constant(
+                            NSLayoutConstraint::constraintWithItem_attribute_relatedBy_toItem_attribute_multiplier_constant(
                                 &expander_btn, NSLayoutAttribute::Width, NSLayoutRelation::Equal,
                                 None, NSLayoutAttribute::NotAnAttribute, 1.0, 16.0
                             ),
-                            &*NSLayoutConstraint::constraintWithItem_attribute_relatedBy_toItem_attribute_multiplier_constant(
+                            NSLayoutConstraint::constraintWithItem_attribute_relatedBy_toItem_attribute_multiplier_constant(
                                 &expander_btn, NSLayoutAttribute::Height, NSLayoutRelation::Equal,
                                 None, NSLayoutAttribute::NotAnAttribute, 1.0, 16.0
                             ),
-                        ])
+                        ]
                     };
+                    constraint_list.extend(alignment_constraints);
+
+                    let mut constraint_refs: Vec<&NSLayoutConstraint> = Vec::new();
+                    for c in &constraint_list {
+                        constraint_refs.push(&**c);
+                    }
+
+                    let constraints = NSArray::from_slice(&constraint_refs);
                     NSLayoutConstraint::activateConstraints(&constraints);
 
                     cell = Some(new_cell);
@@ -420,8 +431,19 @@ define_class!(
                 } // The mutable borrow of `expanded_rows` is dropped here.
 
                 if let Some(tv) = self.ivars().table_view.borrow().as_ref() {
+                    // Fetch the cell view directly to force the layout system to recalculate
+                    let cell_view: *mut AnyObject = msg_send![tv, viewAtColumn: 0isize, row: row, makeIfNecessary: objc2::runtime::Bool::NO];
+                    if !cell_view.is_null() {
+                        let cell_retained: Retained<NSTableCellView> = Retained::cast_unchecked(Retained::retain(cell_view).unwrap());
+                        let text_field_ptr: *mut AnyObject = msg_send![&cell_retained, viewWithTag: 1400isize];
+                        if !text_field_ptr.is_null() {
+                            let _: () = msg_send![text_field_ptr, invalidateIntrinsicContentSize];
+                        }
+                    }
+
                     let index_set: Retained<objc2_foundation::NSIndexSet> = msg_send![objc2_foundation::NSIndexSet::class(), indexSetWithIndex: row as objc2_foundation::NSUInteger];
                     let _: () = msg_send![tv, noteHeightOfRowsWithIndexesChanged: &*index_set];
+
                     // Also reload to update content and icon
                     let col_index_set: Retained<objc2_foundation::NSIndexSet> = msg_send![objc2_foundation::NSIndexSet::class(), indexSetWithIndex: 0isize as objc2_foundation::NSUInteger];
                     let _: () = msg_send![tv, reloadDataForRowIndexes: &*index_set, columnIndexes: &*col_index_set];
