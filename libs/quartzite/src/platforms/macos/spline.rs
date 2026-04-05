@@ -105,10 +105,11 @@ impl MacOSSpline {
         // Using `dispatch2` for macOS GCD to cross the Tokio async/sync boundary natively
         let spline_inner_arc = self.inner.clone();
 
-        // Wrap delegates in MainThreadBound so they can cross thread boundaries safely.
-        // They strictly require `Send` to be moved into tokio::spawn.
-        let comms_delegate_bound = Arc::new(dispatch2::MainThreadBound::new(comms_delegate.clone(), mtm));
-        let sidebar_delegate_bound = Arc::new(dispatch2::MainThreadBound::new(sidebar_delegate.clone(), mtm));
+        // 2. Spawn the Main Thread Router
+        // To safely pass AppKit pointers into the background tokio closure, we must marshal them
+        // into usize pointers, because AppKit items like `Retained<T>` are `!Send`.
+        let comms_delegate_ptr = Retained::into_raw(comms_delegate.clone()) as usize;
+        let sidebar_delegate_ptr = Retained::into_raw(sidebar_delegate.clone()) as usize;
 
         tokio::spawn(async move {
             loop {
@@ -117,16 +118,19 @@ impl MacOSSpline {
 
                 match rx_synapse.recv().await {
                     Ok(msg) => {
-                        let _inner = spline_inner_arc.clone();
-                        let comms_bound = comms_delegate_bound.clone();
-                        let sidebar_bound = sidebar_delegate_bound.clone();
+                        let comms_ptr = comms_delegate_ptr;
+                        let sidebar_ptr = sidebar_delegate_ptr;
 
                         match msg {
                             SMessage::StorageLoadPagedResult { records, .. } => {
                                 dispatch2::DispatchQueue::main().exec_async(move || {
-                                    let mtm = objc2_foundation::MainThreadMarker::new().unwrap();
-                                    let comms_delegate = comms_bound.get(mtm);
                                     use objc2::DefinedClass;
+                                    let comms_delegate = unsafe {
+                                        Retained::retain(comms_ptr as *mut objc2::runtime::AnyObject).unwrap()
+                                    };
+                                    let comms_delegate = unsafe {
+                                        Retained::cast_unchecked::<comms::CommsDelegate>(comms_delegate)
+                                    };
 
                                     // Wrap the mutable borrow in a block so it drops when done
                                     if let Some(chat_manager) = comms_delegate.ivars().chat_manager.borrow().as_ref() {
@@ -156,9 +160,13 @@ impl MacOSSpline {
                             },
                             SMessage::AiToken(token_string) => {
                                 dispatch2::DispatchQueue::main().exec_async(move || {
-                                    let mtm = objc2_foundation::MainThreadMarker::new().unwrap();
-                                    let comms_delegate = comms_bound.get(mtm);
                                     use objc2::DefinedClass;
+                                    let comms_delegate = unsafe {
+                                        Retained::retain(comms_ptr as *mut objc2::runtime::AnyObject).unwrap()
+                                    };
+                                    let comms_delegate = unsafe {
+                                        Retained::cast_unchecked::<comms::CommsDelegate>(comms_delegate)
+                                    };
 
                                     if let Some(chat_manager) = comms_delegate.ivars().chat_manager.borrow().as_ref() {
                                         let mut history = chat_manager.ivars().history.borrow_mut();
@@ -171,7 +179,7 @@ impl MacOSSpline {
                                             last_item.content.push_str(&token_string);
 
                                             // Directly append string to TextKit NSTextStorage without reloading the table cell!
-                                            comms_delegate.append_stream_token(&token_string);
+                                            chat_manager.append_stream_token(&token_string);
                                         }
                                     }
                                 });
@@ -184,8 +192,13 @@ impl MacOSSpline {
                             },
                             SMessage::Matrix(matrix_event) => {
                                 dispatch2::DispatchQueue::main().exec_async(move || {
-                                    let mtm = objc2_foundation::MainThreadMarker::new().unwrap();
-                                    let sidebar_delegate = sidebar_bound.get(mtm);
+                                    use objc2::DefinedClass;
+                                    let sidebar_delegate = unsafe {
+                                        Retained::retain(sidebar_ptr as *mut objc2::runtime::AnyObject).unwrap()
+                                    };
+                                    let sidebar_delegate = unsafe {
+                                        Retained::cast_unchecked::<sidebar::SidebarDelegate>(sidebar_delegate)
+                                    };
 
                                     match matrix_event {
                                         bandy::MatrixEvent::TopologyMutated(flat_tree) => {
