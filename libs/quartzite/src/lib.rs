@@ -29,8 +29,7 @@ pub mod tetra;
 pub mod widgets;
 
 // Re-export specific logic types that UI might need directly
-pub use gneiss_pal::shard::*;
-pub use gneiss_pal::types::*;
+pub use bandy::ontology::Shard;
 pub use spline::{Spline, BootstrapPayload};
 
 // -----------------------------------------------------------------------------

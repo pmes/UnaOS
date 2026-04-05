@@ -17,7 +17,7 @@ use chrono::Local;
 use gneiss_pal::api::{Content, Part, ResilientClient};
 use gneiss_pal::forge::ForgeClient;
 use gneiss_pal::persistence::BrainManager;
-use gneiss_pal::{AppHandler, Event};
+use gneiss_pal::AppHandler;
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
@@ -25,9 +25,10 @@ use tokio::sync::mpsc;
 
 // All UI/High-level state types have been evacuated from gneiss_pal and now live in bandy::state
 use bandy::state::{
-    AppState, PreFlightPayload, ShardStatus, WolfpackState, HistoryItem, MAX_STATE_CAPACITY
+    AppState, PreFlightPayload, WolfpackState, HistoryItem, MAX_STATE_CAPACITY
 };
 use bandy::{BandyMember, SMessage, Synapse};
+use bandy::ontology::ShardStatus;
 
 fn get_mime_type(filename: &str) -> String {
     let lower = filename.to_lowercase();
@@ -275,8 +276,7 @@ impl VeinHandler {
                 Err(_) => None,
             };
 
-            let tx_clone = synapse_loop.clone();
-            let client_res = ResilientClient::new(Some(tx_clone)).await;
+            let client_res = ResilientClient::new().await;
             match client_res {
                 Ok(mut client) => {
                     {
@@ -313,7 +313,8 @@ impl VeinHandler {
                                         {
                                             let mut s = state_bg.write().unwrap();
                                             s.history = records.into_iter().map(|r| HistoryItem {
-                                                sender: r.sender,
+                                                origin: r.origin,
+                                                display_name: r.display_name,
                                                 content: r.content,
                                                 timestamp: r.timestamp,
                                                 is_chat: r.is_chat,
@@ -589,7 +590,7 @@ impl VeinHandler {
                                                 let ai_response_clone = response.clone();
                                                 let tx_inner = synapse_clone.clone();
                                                 tokio::spawn(async move {
-                                                    if let Ok(mut client_clone) = ResilientClient::new(Some(tx_inner)).await {
+                                                    if let Ok(mut client_clone) = ResilientClient::new().await {
                                                         if let Ok(engram) = crate::context::compress_into_engram(&mut client_clone, &raw_user_prompt, &ai_response_clone).await {
                                                             if let Ok(engram_embedding) = client_clone.embed_content(&engram).await {
                                                                 let timestamp = chrono::Local::now().format("%H:%M:%S").to_string();
@@ -814,11 +815,11 @@ impl BandyMember for VeinHandler {
 }
 
 impl AppHandler for VeinHandler {
-    fn handle_event(&mut self, event: Event) {
+    fn handle_event(&mut self, event: bandy::SMessage) {
         let mut emit_ping = false;
 
         match event {
-            Event::Input { target: _, text } => {
+            bandy::SMessage::Input { target: _, text } => {
                 let trimmed = text.trim();
 
                 if trimmed == "/wolf" {
@@ -846,7 +847,7 @@ impl AppHandler for VeinHandler {
                     }
                 }
             }
-            Event::TemplateAction(idx) => match idx {
+            bandy::SMessage::TemplateAction(idx) => match idx {
                 0 => {
                     self.append_to_console("\n[WOLFPACK] :: Deploying J-Series Unit...\n");
                 }
@@ -858,11 +859,11 @@ impl AppHandler for VeinHandler {
                 }
                 _ => {}
             },
-            Event::NavSelect(_idx) => {
+            bandy::SMessage::NavSelect(_idx) => {
                 self.append_to_console("\n[SYSTEM] :: Nav selection updated.\n");
                 emit_ping = true;
             }
-            Event::FileSelected(path) => {
+            bandy::SMessage::FileSelected(path) => {
                 let _ = self.publish("upload", SMessage::TriggerUpload(path.clone()));
 
                 let _ = self.synapse.fire(SMessage::ContextTelemetry {
@@ -870,11 +871,11 @@ impl AppHandler for VeinHandler {
                 });
                 emit_ping = true;
             }
-            Event::ToggleSidebar => {
+            bandy::SMessage::ToggleSidebar => {
                 // Assuming side bar toggle logic remains
                 emit_ping = true;
             }
-            Event::ComplexInput {
+            bandy::SMessage::ComplexInput {
                 target: _,
                 subject,
                 body,
@@ -892,13 +893,13 @@ impl AppHandler for VeinHandler {
                     self.append_to_console(&format!("\n[SYSTEM ERROR] :: Failed to send: {}\n", e));
                 }
             }
-            Event::DispatchPayload(json_payload) => {
+            bandy::SMessage::DispatchPayload(json_payload) => {
                 let _ = self.tx.send(format!("DISPATCH_PAYLOAD:{}", json_payload));
             }
-            Event::LoadHistory { offset } => {
+            bandy::SMessage::LoadHistory { offset } => {
                 let _ = self.tx.send(format!("LOAD_HISTORY:{}", offset));
             }
-            Event::UpdateMatrixSelection(node_ids) => {
+            bandy::SMessage::UpdateMatrixSelection(node_ids) => {
                 let mut s = self.app_state.write().unwrap();
                 s.active_matrix_selection = node_ids;
                 // Do NOT fire the Matrix scanner here. Do NOT set emit_ping = true.

@@ -7,7 +7,6 @@
 // (at your option) any later version.
 
 use crate::{NativeView, NativeWindow};
-use gneiss_pal::Event;
 use std::sync::{Arc, RwLock};
 use tokio::sync::broadcast::Receiver as BroadcastReceiver;
 
@@ -59,7 +58,7 @@ impl Spline {
     pub fn bootstrap(
         &self,
         _window: &NativeWindow,
-        _tx_event: async_channel::Sender<Event>,
+        _tx_event: async_channel::Sender<SMessage>,
         _app_state: Arc<RwLock<AppState>>,
         _rx_synapse: BroadcastReceiver<SMessage>,
         _workspace_tetra: &bandy::state::WorkspaceState,

@@ -7,7 +7,6 @@
 // (at your option) any later version.
 
 use crate::{NativeView, NativeWindow};
-use gneiss_pal::Event;
 use std::sync::{Arc, RwLock, Mutex};
 use tokio::sync::broadcast::Receiver as BroadcastReceiver;
 use bandy::state::AppState;
@@ -46,7 +45,7 @@ impl MacOSSpline {
     pub fn bootstrap(
         &self,
         _window: &NativeWindow,
-        tx_event: async_channel::Sender<Event>,
+        tx_event: async_channel::Sender<SMessage>,
         _app_state: Arc<RwLock<AppState>>,
         mut rx_synapse: BroadcastReceiver<SMessage>,
         _workspace_tetra: &bandy::state::WorkspaceState,

@@ -15,7 +15,8 @@
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 use anyhow::{Context, Result};
-use bandy::{DispatchRecord, SMessage, Synapse};
+use bandy::{SMessage, Synapse};
+use bandy::state::DispatchRecord;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use tokio::task;
@@ -222,9 +223,17 @@ impl DiskManager {
                 _ => "".to_string(),
             };
 
+            let origin = if sender == "Architect" {
+                bandy::ontology::Origin::LocalUser(sender.clone())
+            } else if sender == "System" || sender == "UnaOS" {
+                bandy::ontology::Origin::System(sender.clone())
+            } else {
+                bandy::ontology::Origin::Shard(sender.clone())
+            };
             records.push(DispatchRecord {
                 id: inode.id.to_string(),
-                sender,
+                origin,
+                display_name: Some(sender),
                 subject: "Memory".to_string(),
                 timestamp,
                 content,

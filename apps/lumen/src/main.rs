@@ -107,7 +107,7 @@ fn main() {
 
     let app_state = Arc::new(RwLock::new(default_state));
     // Channels for UI Events (Spline -> Vein)
-    let (event_tx, event_rx) = async_channel::unbounded::<quartzite::Event>();
+    let (event_tx, event_rx) = async_channel::unbounded::<bandy::SMessage>();
 
     // 7.5. Define the Workspace Layout via Declarative UI Engine
     let genesis_roots = matrix::MatrixScanner::build_genesis_tree(&absolute_workspace_root_arc, &absolute_workspace_root_arc);
@@ -148,7 +148,7 @@ fn main() {
                 event_res = event_rx.recv() => {
                     if let Ok(event) = event_res {
                         match event {
-                            quartzite::Event::UiReady => {
+                            bandy::SMessage::UiReady => {
                                 if let bandy::state::ViewEntity::Topology(ref mut matrix) = workspace_state.left_pane {
                                     let flat_tree = matrix.tree.flatten();
                                     let mapped_tree: Vec<(String, String, usize)> = flat_tree.into_iter().map(|(n, depth)| {
@@ -157,7 +157,7 @@ fn main() {
                                     synapse_event_loop.fire(bandy::SMessage::Matrix(bandy::MatrixEvent::TopologyMutated(mapped_tree)));
                                 }
                             }
-                            quartzite::Event::ToggleMatrixNode(id) => {
+                            bandy::SMessage::ToggleMatrixNode(id) => {
                                 if let bandy::state::ViewEntity::Topology(ref mut matrix) = workspace_state.left_pane {
                                     matrix.tree.toggle_node(&id);
                                     let flat_tree = matrix.tree.flatten();
