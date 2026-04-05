@@ -118,7 +118,7 @@ define_class!(
                         let _: () = msg_send![&bubble_box, setFillColor: &*bg_color];
 
                         // Enforce Content Hugging on Bubble Box
-                        let _: () = msg_send![&bubble_box, setContentHuggingPriority: 1000.0f32 forOrientation: 0isize];
+                        let _: () = msg_send![&bubble_box, setContentHuggingPriority: 1000.0f32, forOrientation: 0isize];
                     }
 
                     let alignment_constraint = if is_user {
@@ -213,7 +213,7 @@ define_class!(
                         let _: () = msg_send![&text_field, setAlignment: align];
 
                         // Enforce Content Hugging on Text Field
-                        let _: () = msg_send![&text_field, setContentHuggingPriority: 1000.0f32 forOrientation: 0isize];
+                        let _: () = msg_send![&text_field, setContentHuggingPriority: 1000.0f32, forOrientation: 0isize];
 
                         // Set preferred max layout width dynamically to 80% of cell width
                         let frame_width = frame.size.width;

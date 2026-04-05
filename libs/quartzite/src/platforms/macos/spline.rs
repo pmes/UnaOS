@@ -136,7 +136,8 @@ impl MacOSSpline {
                                                 let is_chat = record.is_chat;
                                                 if is_chat {
                                                     history.push(bandy::state::HistoryItem {
-                                                        sender: record.sender.clone(),
+                                                        origin: record.origin.clone(),
+                                                        display_name: record.display_name.clone(),
                                                         content: record.content.clone(),
                                                         timestamp: record.timestamp.clone(),
                                                         is_chat,
