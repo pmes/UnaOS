@@ -232,9 +232,6 @@ define_class!(
                         let _: () = msg_send![&text_field, setContentHuggingPriority: 1000.0f32, forOrientation: 0isize];
                         let _: () = msg_send![&text_field, setContentHuggingPriority: 1000.0f32, forOrientation: 1isize];
 
-                        // Lower Compression Resistance to yield to 75% max width
-                        let _: () = msg_send![&text_field, setContentCompressionResistancePriority: 250.0f32, forOrientation: 0isize];
-
 
                         let cell_obj: *mut AnyObject = msg_send![&text_field, cell];
                         if !cell_obj.is_null() {
@@ -413,14 +410,6 @@ define_class!(
                         );
                         let _: () = msg_send![&expander_btn, setImage: img.as_deref()];
                     }
-                }
-
-                unsafe {
-                    let table_bounds: NSRect = msg_send![table_view, bounds];
-                    // 75% of the table width minus the 24pts of internal horizontal padding
-                    let max_text_width = (table_bounds.size.width * 0.75) - 24.0;
-
-                    let _: () = msg_send![&text_field, setPreferredMaxLayoutWidth: max_text_width];
                 }
 
                 Some(unsafe { Retained::cast_unchecked::<NSView>(cell) })
