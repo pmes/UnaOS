@@ -1,0 +1,87 @@
+/* -- PANED HANDLE FIX -- */
+paned > separator { background-color: transparent; }
+
+/* === LIGHT MODE (DEFAULT) === */
+.builder-sidebar, .builder-sidebar > background {
+    background-color: #ebebed;
+    background-image: none;
+}
+.builder-sidebar:backdrop, .builder-sidebar:backdrop > background {
+    background-color: #fafafa;
+    background-image: none;
+}
+.builder-view, .builder-view > background {
+    background-color: #ffffff;
+    background-image: none;
+    border-left: 1px solid @borders;
+}
+.builder-view:backdrop, .builder-view:backdrop > background {
+    background-color: #fcfcfc;
+    background-image: none;
+    border-left: 1px solid @borders;
+}
+
+/* === DARK MODE (HARDWIRED RUST CLASS) === */
+.una-dark .builder-sidebar, .una-dark .builder-sidebar > background {
+    background-color: #2e2e32;
+    background-image: none;
+}
+.una-dark .builder-sidebar:backdrop, .una-dark .builder-sidebar:backdrop > background {
+    background-color: #26262a;
+    background-image: none;
+}
+.una-dark .builder-view, .una-dark .builder-view > background {
+    background-color: #1d1d20;
+    background-image: none;
+    border-left: 1px solid @borders;
+}
+.una-dark .builder-view:backdrop, .una-dark .builder-view:backdrop > background {
+    background-color: #18181a;
+    background-image: none;
+    border-left: 1px solid @borders;
+}
+
+/* -- CHILD TRANSPARENCY -- */
+.builder-sidebar box,
+.builder-sidebar scrolledwindow,
+.builder-sidebar listview,
+.builder-sidebar columnview,
+.builder-sidebar listbox,
+.builder-sidebar row,
+.builder-sidebar tabview,
+.builder-sidebar stack {
+    background-color: transparent;
+    background-image: none;
+    box-shadow: none;
+}
+
+/* -- UNIFIED HEADERS & TABS -- */
+headerbar {
+    background: transparent;
+    border: none;
+    box-shadow: none;
+    min-height: 46px;
+}
+tabbar {
+    background: transparent;
+    border-bottom: 1px solid @borders;
+}
+
+/* -- GTK FALLBACK MEGA BAR BORDERS -- */
+.title-vbox {
+    border-bottom: 1px solid @borders;
+}
+.title-vbox stackswitcher {
+    margin-left: 8px; margin-right: 8px; margin-bottom: 4px;
+}
+
+/* === SPLINE PULSE / CONSOLE === */
+.console { font-family: 'Monospace'; background: transparent; }
+.console-row { margin-bottom: 16px; padding: 0px; }
+.bubble-box { border-radius: 12px; padding: 12px; }
+.architect-bubble { background-color: alpha(currentColor, 0.08); }
+.una-bubble { background-color: alpha(currentColor, 0.05); }
+.nexus-header { font-weight: bold; margin-top: 12px; margin-bottom: 4px; opacity: 0.7; font-size: 0.9em; }
+.role-architect { color: #0078d4; font-weight: bold; }
+.role-una { color: #d40078; font-weight: bold; }
+.role-system { color: #888888; font-style: italic; }
