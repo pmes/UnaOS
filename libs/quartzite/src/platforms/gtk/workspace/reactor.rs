@@ -231,6 +231,22 @@ pub fn spawn_listener(pointers: ReactorPointers, rx_gui: Receiver<GuiUpdate>) {
                         pointers.matrix_store.append(&obj);
                     }
                 }
+                GuiUpdate::IngestMatrixTopology(paths) => {
+                    // Checkpoint Gamma: The Left Pane Model
+                    // We inject the extracted dictionary paths into the Matrix ListStore.
+                    pointers.matrix_store.remove_all();
+                    for path in paths {
+                        // Create a MatrixNodeObject with calculated depth.
+                        let depth = path.matches('/').count() as u32;
+
+                        // Extract just the filename to display, but keep the full path as the ID.
+                        let label = path.split('/').last().unwrap_or(&path).to_string();
+
+                        // Prevent visual indent underflow panics using saturating_sub or guards.
+                        let obj = crate::widgets::model::MatrixNodeObject::new(&path, &label, depth);
+                        pointers.matrix_store.append(&obj);
+                    }
+                }
                 _ => {}
             }
         }

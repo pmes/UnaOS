@@ -166,6 +166,11 @@ fn main() {
                                     synapse_event_loop.fire(bandy::SMessage::Matrix(bandy::MatrixEvent::TopologyMutated(mapped_tree)));
                                 }
                             }
+                            quartzite::Event::FocusMatrixSector(id) => {
+                                // Checkpoint Delta: The Interactive Trigger
+                                // Closes the loop: clicking an item fires FocusSector to `vein`/`matrix`.
+                                synapse_event_loop.fire(bandy::SMessage::Matrix(bandy::MatrixEvent::FocusSector(id)));
+                            }
                             _ => {
                                 vein.handle_event(event);
                             }
