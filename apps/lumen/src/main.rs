@@ -167,6 +167,12 @@ fn main() {
                                     }).collect();
                                     synapse_event_loop.fire(bandy::SMessage::Matrix(bandy::MatrixEvent::TopologyMutated(mapped_tree)));
 
+                                    // Only fire the AST Matrix scan if the ID looks like a file (has an extension).
+                                    // This prevents directories from vomiting their contents into the UI.
+                                    let is_file = std::fs::metadata(&id).map(|m| m.is_file()).unwrap_or(false);
+                                    if is_file {
+                                        synapse_event_loop.fire(bandy::SMessage::Matrix(bandy::MatrixEvent::FocusSector(id)));
+                                    }
                                 }
                             }
                             _ => {

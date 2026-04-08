@@ -10,6 +10,7 @@ use bandy::state::AppState;
 use std::sync::{Arc, RwLock};
 use crate::Event;
 use crate::NativeWindow;
+use sourceview5::prelude::*;
 
 pub struct WorkspaceWidgets {
     pub left_stack: gtk4::Stack,
@@ -17,6 +18,7 @@ pub struct WorkspaceWidgets {
     pub status_group: gtk4::Box,
     pub left_switcher: gtk4::StackSwitcher,
     pub right_switcher: gtk4::StackSwitcher,
+    pub sidebar_toggle: gtk4::ToggleButton,
 }
 
 // Why Broadcast? MPMC channels (`async_channel`) load-balance by consuming messages,
@@ -55,6 +57,45 @@ pub fn build(
         sidebar_pointers.matrix_selection.clone(),
     );
 
+    // Network Inspector Window
+    let net_window = gtk4::Window::builder()
+        .title("Network Inspector")
+        .default_width(600)
+        .default_height(600)
+        .hide_on_close(true)
+        .build();
+    let net_buffer = sourceview5::Buffer::new(None);
+    let net_view = sourceview5::View::with_buffer(&net_buffer);
+    net_view.set_editable(false);
+    net_view.set_monospace(true);
+    let net_scroll = gtk4::ScrolledWindow::builder()
+        .child(&net_view)
+        .build();
+    net_window.set_child(Some(&net_scroll));
+
+    let net_btn = sidebar_widgets.network_btn.clone();
+    sidebar_widgets.network_btn.connect_clicked(move |_| {
+        net_window.present();
+    });
+
+    if let Some(settings) = gtk4::Settings::default() {
+        let net_buf_clone = net_buffer.clone();
+
+        let update_theme = move |is_dark: bool| {
+            let manager = sourceview5::StyleSchemeManager::default();
+            let scheme_name = if is_dark { "Adwaita-dark" } else { "Adwaita" };
+            if let Some(scheme) = manager.scheme(scheme_name) {
+                net_buf_clone.set_style_scheme(Some(&scheme));
+            }
+        };
+
+        update_theme(settings.is_gtk_application_prefer_dark_theme());
+
+        settings.connect_gtk_application_prefer_dark_theme_notify(move |s| {
+            update_theme(s.is_gtk_application_prefer_dark_theme());
+        });
+    }
+
     // Reactor bindings
     let pointers = reactor::ReactorPointers {
         spinner_una: sidebar_pointers.spinner_una,
@@ -76,6 +117,9 @@ pub fn build(
         preflight_eng_buf: comms_pointers.preflight_eng_buf,
         preflight_prm_buf: comms_pointers.preflight_prm_buf,
         matrix_store: sidebar_pointers.matrix_store,
+        matrix_selection: sidebar_pointers.matrix_selection,
+        net_buffer,
+        network_btn: net_btn,
     };
 
     reactor::spawn_listener(pointers, rx_gui);
@@ -86,5 +130,6 @@ pub fn build(
         status_group: sidebar_widgets.status_group,
         left_switcher: sidebar_widgets.left_switcher,
         right_switcher: comms_widgets.right_switcher,
+        sidebar_toggle: sidebar_pointers.sidebar_toggle,
     }
 }

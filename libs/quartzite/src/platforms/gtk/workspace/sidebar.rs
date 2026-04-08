@@ -5,7 +5,7 @@ use async_channel::Sender;
 use gtk4::prelude::*;
 use gtk4::{
     Adjustment, Align, Box, Button, ColumnView, ColumnViewColumn, DropDown,
-    Image, Label, ListBox, ListItem, Orientation, PolicyType, Scale, ScrolledWindow,
+    Image, Label, ListBox, ListItem, ListView, Orientation, PolicyType, Scale, ScrolledWindow,
     SignalListItemFactory, SingleSelection, Spinner, Stack, StackSwitcher, StackTransitionType,
     StringList, StringObject, Switch, ToggleButton, Window, gio,
 };
@@ -24,6 +24,7 @@ pub struct SidebarWidgets {
     pub status_group: Box,
     pub left_switcher: StackSwitcher,
     pub composer_btn: Button,
+    pub network_btn: Button,
 }
 
 pub struct SidebarPointers {
@@ -36,6 +37,7 @@ pub struct SidebarPointers {
     pub context_view: crate::widgets::telemetry::ContextView,
     pub matrix_store: gio::ListStore,
     pub matrix_selection: gtk4::MultiSelection,
+    pub sidebar_toggle: ToggleButton,
 }
 
 // Helper to avoid circular dependencies in spline
@@ -69,6 +71,13 @@ pub fn build(window: &NativeWindow, tx_event: Sender<Event>, _workspace_tetra: &
         .tooltip_text("Toggle Sidebar")
         .build();
 
+    let network_btn = Button::builder()
+        .icon_name("network-idle-symbolic")
+        .valign(gtk4::Align::Center)
+        .tooltip_text("Network Inspector")
+        .build();
+    network_btn.add_css_class("raised");
+
     let token_label = Label::new(Some("Tokens: IN: 0 | OUT: 0 | TOTAL: 0"));
     token_label.set_margin_start(10);
     token_label.set_margin_end(10);
@@ -78,6 +87,7 @@ pub fn build(window: &NativeWindow, tx_event: Sender<Event>, _workspace_tetra: &
     let status_group = Box::new(Orientation::Horizontal, 8);
     status_group.set_valign(gtk4::Align::Center);
     status_group.append(&sidebar_toggle);
+    status_group.append(&network_btn);
     status_group.append(&token_label);
 
     let left_stack = Stack::new();
@@ -131,7 +141,7 @@ pub fn build(window: &NativeWindow, tx_event: Sender<Event>, _workspace_tetra: &
             }
         });
     let nodes_scroll = ScrolledWindow::builder()
-        .hscrollbar_policy(PolicyType::Never)
+        .hscrollbar_policy(PolicyType::Automatic)
         .child(&column_view)
         .min_content_height(200)
         .min_content_width(200)
@@ -349,8 +359,6 @@ pub fn build(window: &NativeWindow, tx_event: Sender<Event>, _workspace_tetra: &
 
     // 3. THE TeleHUD Tab
     let telehud_box = Box::new(Orientation::Vertical, 12);
-    telehud_box.set_margin_top(12);
-    telehud_box.set_margin_bottom(12);
     telehud_box.set_margin_start(12);
     telehud_box.set_margin_end(12);
 
@@ -372,6 +380,7 @@ pub fn build(window: &NativeWindow, tx_event: Sender<Event>, _workspace_tetra: &
 
         // Enable visual selection highlight (Fixes GTK Ghost Outline)
         item.set_selectable(true);
+        item.set_activatable(true);
 
         let row = Box::new(Orientation::Horizontal, 10);
         row.set_margin_start(10);
@@ -380,6 +389,8 @@ pub fn build(window: &NativeWindow, tx_event: Sender<Event>, _workspace_tetra: &
         row.set_margin_bottom(5);
         let label = Label::new(None);
         label.set_xalign(0.0);
+        label.set_can_target(false);
+        // This ensures the click passes completely through the text and hits the row itself.
         row.append(&label);
         item.set_child(Some(&row));
     });
@@ -390,19 +401,17 @@ pub fn build(window: &NativeWindow, tx_event: Sender<Event>, _workspace_tetra: &
         let label = child.first_child().unwrap().downcast::<Label>().unwrap();
         let obj = item.item().unwrap().downcast::<crate::widgets::model::MatrixNodeObject>().unwrap();
 
-        let depth = obj.depth();
-        let prefix = if depth == 0 {
-            String::new()
-        } else {
-            format!("{}├─ ", "  ".repeat(depth.saturating_sub(1) as usize))
-        };
-        let display_text = format!("{}{}", prefix, obj.label());
-        label.set_label(&display_text);
+        let depth = obj.depth() as i32;
+        label.set_margin_start(10 + (depth * 20));
+        label.add_css_class("monospace");
+        label.set_label(&obj.label());
     });
 
-    let matrix_view = ColumnView::new(Some(matrix_selection.clone()));
+    // A standard ListView natively has no headers, permanently destroying the void.
+    let matrix_view = ListView::new(Some(matrix_selection.clone()), Some(matrix_factory));
+    matrix_view.add_css_class("navigation-sidebar");
     matrix_view.set_enable_rubberband(true);
-    matrix_view.append_column(&ColumnViewColumn::new(None, Some(matrix_factory)));
+    matrix_view.set_single_click_activate(false);
 
     let tx_matrix_sel = tx_event.clone();
     matrix_selection.connect_selection_changed(move |selection, _, _| {
@@ -426,8 +435,6 @@ pub fn build(window: &NativeWindow, tx_event: Sender<Event>, _workspace_tetra: &
     let nav_box = Box::new(Orientation::Horizontal, 5);
     nav_box.set_margin_start(5);
     nav_box.set_margin_end(5);
-    nav_box.set_margin_top(5);
-    nav_box.set_margin_bottom(5);
 
     let btn_back = Button::from_icon_name("go-previous-symbolic");
     let btn_up = Button::from_icon_name("go-up-symbolic");
@@ -489,7 +496,6 @@ pub fn build(window: &NativeWindow, tx_event: Sender<Event>, _workspace_tetra: &
         }
     });
 
-    let tx_back = tx_event.clone();
     let back_b = nav_history_back.clone();
     let back_f = nav_history_forward.clone();
     let back_c = current_matrix_path.clone();
@@ -508,7 +514,6 @@ pub fn build(window: &NativeWindow, tx_event: Sender<Event>, _workspace_tetra: &
         }
     });
 
-    let tx_fwd = tx_event.clone();
     let fwd_b = nav_history_back.clone();
     let fwd_f = nav_history_forward.clone();
     let fwd_c = current_matrix_path.clone();
@@ -527,7 +532,6 @@ pub fn build(window: &NativeWindow, tx_event: Sender<Event>, _workspace_tetra: &
         }
     });
 
-    let tx_up = tx_event.clone();
     let up_b = nav_history_back.clone();
     let up_f = nav_history_forward.clone();
     let up_c = current_matrix_path.clone();
@@ -556,7 +560,7 @@ pub fn build(window: &NativeWindow, tx_event: Sender<Event>, _workspace_tetra: &
     telehud_box.append(&nav_box);
 
     let matrix_scroll = ScrolledWindow::builder()
-        .hscrollbar_policy(PolicyType::Never)
+        .hscrollbar_policy(PolicyType::Automatic)
         .child(&matrix_view)
         .min_content_height(150)
         .vexpand(true)
@@ -567,6 +571,7 @@ pub fn build(window: &NativeWindow, tx_event: Sender<Event>, _workspace_tetra: &
     // --- END MATRIX TETRA ---
 
     let context_view = crate::widgets::telemetry::ContextView::new();
+    context_view.container.set_vexpand(false);
     telehud_box.append(&context_view.container);
 
     let page = left_stack.add_named(&telehud_box, Some("telehud"));
@@ -579,6 +584,7 @@ pub fn build(window: &NativeWindow, tx_event: Sender<Event>, _workspace_tetra: &
         status_group,
         left_switcher,
         composer_btn,
+        network_btn,
     };
 
     let pointers = SidebarPointers {
@@ -591,6 +597,7 @@ pub fn build(window: &NativeWindow, tx_event: Sender<Event>, _workspace_tetra: &
         context_view,
         matrix_store,
         matrix_selection,
+        sidebar_toggle,
     };
 
     (widgets, pointers)

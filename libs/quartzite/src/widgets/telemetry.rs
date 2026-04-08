@@ -228,10 +228,11 @@ impl ContextView {
 
         // 5. The Container (ScrolledWindow)
         let scroll = ScrolledWindow::builder()
-            .hscrollbar_policy(PolicyType::Never)
+            .hscrollbar_policy(PolicyType::Automatic)
             .vscrollbar_policy(PolicyType::Automatic)
             .min_content_width(250) // HUD Sidebar width
             .child(&list_view)
+            .vexpand(true)
             .build();
 
         Self {

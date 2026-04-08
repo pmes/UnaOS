@@ -80,7 +80,6 @@ impl MegaBar {
         // Maintain a minimum size instead of a hardcoded request to allow the paned to dictate width.
         left_toolbar.set_size_request((1024.0 * 0.15) as i32, -1); // Safe minimum fallback
 
-        // Strip native drop-shadows
         left_toolbar.set_top_bar_style(adw::ToolbarStyle::Flat);
 
         let left_header = adw::HeaderBar::builder()
@@ -93,6 +92,7 @@ impl MegaBar {
         // Wrap the content so we can apply the class reliably if needed,
         // though ToolbarView with the class handles the background.
         let left_vbox = Box::new(Orientation::Vertical, 0);
+        left_vbox.append(&gtk4::Separator::new(Orientation::Horizontal)); // ADD THIS
         left_vbox.append(left_content);
         left_toolbar.set_content(Some(&left_vbox));
 
@@ -102,7 +102,6 @@ impl MegaBar {
         right_toolbar.add_css_class("builder-view");
         right_toolbar.set_hexpand(true);
 
-        // Strip native drop-shadows
         right_toolbar.set_top_bar_style(adw::ToolbarStyle::Flat);
 
         let right_header = adw::HeaderBar::builder()
@@ -117,6 +116,7 @@ impl MegaBar {
         right_toolbar.add_top_bar(right_tabs);
 
         let right_vbox = Box::new(Orientation::Vertical, 0);
+        right_vbox.append(&gtk4::Separator::new(Orientation::Horizontal)); // ADD THIS
         right_vbox.append(right_content);
         right_toolbar.set_content(Some(&right_vbox));
 
@@ -127,6 +127,10 @@ impl MegaBar {
 
         main_h_paned.set_start_child(Some(&left_toolbar));
         main_h_paned.set_end_child(Some(&right_toolbar));
+
+        left_content.bind_property("visible", &left_toolbar, "visible")
+            .sync_create()
+            .build();
 
         main_h_paned.upcast::<gtk4::Widget>()
     }

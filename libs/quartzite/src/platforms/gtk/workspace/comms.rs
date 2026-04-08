@@ -5,7 +5,7 @@ use async_channel::Sender;
 use gtk4::prelude::*;
 use gtk4::{
     Align, Box, Button, CheckButton, Entry, EventControllerKey, Expander, FileDialog,
-    GestureClick, Label, ListItem, ListView, NoSelection, Orientation,
+    Label, ListItem, ListView, NoSelection, Orientation,
     PolicyType, Popover, PropagationPhase, ScrolledWindow, SignalListItemFactory, Stack,
     StackSwitcher, StackTransitionType, ToggleButton, Overlay,
     gdk::{Key, ModifierType},
@@ -84,6 +84,11 @@ fn setup_preflight_stack(tx_event: &Sender<Event>) -> PreflightStackData {
     preflight_stack_container.set_vexpand(true);
     preflight_stack_container.set_hexpand(true);
     preflight_stack_container.add_css_class("background"); // Ensure opacity over chat
+    preflight_stack_container.add_css_class("card");
+    preflight_stack_container.set_margin_top(12);
+    preflight_stack_container.set_margin_bottom(12);
+    preflight_stack_container.set_margin_start(12);
+    preflight_stack_container.set_margin_end(12);
 
     let preflight_stack = Stack::new();
     preflight_stack.set_transition_type(StackTransitionType::SlideLeftRight);
@@ -101,6 +106,10 @@ fn setup_preflight_stack(tx_event: &Sender<Event>) -> PreflightStackData {
         view.set_editable(true);
         view.set_monospace(true);
         view.set_vexpand(true);
+        view.set_left_margin(12);
+        view.set_right_margin(12);
+        view.set_top_margin(12);
+        view.set_bottom_margin(12);
         view.add_css_class("view");
 
         let scroll = ScrolledWindow::builder()
@@ -142,7 +151,7 @@ fn setup_preflight_stack(tx_event: &Sender<Event>) -> PreflightStackData {
     let cancel_btn = Button::builder()
         .icon_name("window-close-symbolic")
         .tooltip_text("Discard Payload")
-        .css_classes(vec!["flat", "destructive-action"])
+        .css_classes(vec!["raised", "destructive-action"])
         .build();
     let dispatch_btn = Button::builder()
         .icon_name("document-save-symbolic")
@@ -210,6 +219,8 @@ fn setup_input_area(tx_event: &Sender<Event>, window: &NativeWindow, active_targ
     input_container.set_margin_end(16);
     input_container.set_margin_bottom(16);
     input_container.set_margin_top(16);
+    input_container.set_hexpand(true);
+    input_container.set_size_request(-1, 120); // Prevents the slider from crushing the input
 
     let attach_btn = Button::builder()
         .valign(Align::End)
@@ -249,6 +260,11 @@ fn setup_input_area(tx_event: &Sender<Event>, window: &NativeWindow, active_targ
         .max_content_height(150)
         .build();
     input_scroll.set_hexpand(true);
+    input_scroll.add_css_class("card");
+    input_scroll.set_margin_top(8);
+    input_scroll.set_margin_bottom(8);
+    input_scroll.set_margin_start(8);
+    input_scroll.set_margin_end(8);
     let text_view = SourceView::builder()
         .wrap_mode(gtk4::WrapMode::WordChar)
         .show_line_numbers(false)
@@ -566,8 +582,12 @@ fn setup_chat_view(tx_event: &Sender<Event>, tetra: &crate::tetra::StreamTetra) 
         root.append(&left_spacer);
 
         let bubble = Box::new(Orientation::Vertical, 4);
+        bubble.add_css_class("card"); // <-- Native GTK background styling
         bubble.add_css_class("bubble-box");
-        bubble.set_hexpand(true);
+        bubble.set_margin_top(4);
+        bubble.set_margin_bottom(4);
+        bubble.set_margin_start(8);
+        bubble.set_margin_end(8);
 
         let header_box = Box::new(Orientation::Horizontal, 8);
 
@@ -597,9 +617,11 @@ fn setup_chat_view(tx_event: &Sender<Event>, tetra: &crate::tetra::StreamTetra) 
         // --- Standard Mode (Message View) ---
         let msg_label = Label::builder()
             .wrap(true)
-            .lines(5) // Default locked state
+            .lines(11) // Default locked state
             .selectable(true)
             .hexpand(true)
+            .wrap_mode(gtk4::pango::WrapMode::WordChar)
+            .ellipsize(gtk4::pango::EllipsizeMode::End) // CRITICAL: Add this or clamping fails
             .build();
         msg_label.add_css_class("view");
 
@@ -643,19 +665,19 @@ fn setup_chat_view(tx_event: &Sender<Event>, tetra: &crate::tetra::StreamTetra) 
         // 3. The Toggle Logic
         let toggle_label = msg_label.clone();
         left_expand_btn.connect_clicked(move |_| {
-            if toggle_label.lines() == 5 {
-                toggle_label.set_lines(-1); // Expand fully
+            if toggle_label.lines() == -1 {
+                toggle_label.set_lines(11); // Collapse back
             } else {
-                toggle_label.set_lines(5);  // Collapse back
+                toggle_label.set_lines(-1);  // Expand fully
             }
         });
 
         let toggle_label_right = msg_label.clone();
         right_expand_btn.connect_clicked(move |_| {
-            if toggle_label_right.lines() == 5 {
-                toggle_label_right.set_lines(-1); // Expand fully
+            if toggle_label_right.lines() == -1 {
+                toggle_label_right.set_lines(11); // Collapse back
             } else {
-                toggle_label_right.set_lines(5);  // Collapse back
+                toggle_label_right.set_lines(-1);  // Expand fully
             }
         });
 
@@ -666,6 +688,7 @@ fn setup_chat_view(tx_event: &Sender<Event>, tetra: &crate::tetra::StreamTetra) 
         item.set_child(Some(&root));
     });
 
+    let store_for_bind = console_store.clone();
     console_factory.connect_bind(move |_factory, item| {
         let Some(item) = item.downcast_ref::<ListItem>() else { return; };
         let Some(obj) = item.item().and_then(|c| c.downcast::<HistoryObject>().ok()) else { return; };
@@ -699,21 +722,20 @@ fn setup_chat_view(tx_event: &Sender<Event>, tetra: &crate::tetra::StreamTetra) 
             widgets.meta_label.remove_css_class("role-una");
             widgets.meta_label.remove_css_class("role-system");
 
-            let is_expanded = obj.is_expanded();
             let line_count = content.trim_end().lines().count();
             widgets.msg_label.set_label(&content);
 
             let is_user = sender == "Architect";
 
             if is_user {
-                widgets.bubble.set_halign(gtk4::Align::End);
+                widgets.bubble.set_halign(gtk4::Align::End); // Push to the right
                 widgets.bubble.add_css_class("bubble-user");
                 widgets.left_spacer.set_visible(true);
                 widgets.right_spacer.set_visible(false);
                 widgets.meta_label.set_halign(gtk4::Align::End);
                 widgets.meta_label.set_xalign(1.0);
             } else {
-                widgets.bubble.set_halign(gtk4::Align::Start);
+                widgets.bubble.set_halign(gtk4::Align::Start); // Push to the left
                 widgets.bubble.add_css_class("bubble-ai");
                 widgets.left_spacer.set_visible(false);
                 widgets.right_spacer.set_visible(true);
@@ -721,23 +743,22 @@ fn setup_chat_view(tx_event: &Sender<Event>, tetra: &crate::tetra::StreamTetra) 
                 widgets.meta_label.set_xalign(0.0);
             }
 
-            if line_count > 5 {
-                if is_user {
-                    widgets.left_expand_btn.set_visible(true);
-                    widgets.right_expand_btn.set_visible(false);
-                } else {
-                    widgets.left_expand_btn.set_visible(false);
-                    widgets.right_expand_btn.set_visible(true);
-                }
+            let is_newest = item.position() == store_for_bind.n_items() - 1;
+
+            if is_user || !is_newest {
+                widgets.msg_label.set_lines(11); // Lock all user and historical posts
+            } else {
+                // Only the brand new, currently generating AI post gets to read the expanded state
+                widgets.msg_label.set_lines(if obj.is_expanded() { -1 } else { 11 });
+            }
+
+            // Adjust toggle buttons
+            if line_count > 11 {
+                widgets.left_expand_btn.set_visible(is_user);
+                widgets.right_expand_btn.set_visible(!is_user);
             } else {
                 widgets.left_expand_btn.set_visible(false);
                 widgets.right_expand_btn.set_visible(false);
-            }
-
-            if is_expanded {
-                widgets.msg_label.set_lines(-1);
-            } else {
-                widgets.msg_label.set_lines(5);
             }
         } else {
             widgets.expander.set_visible(true);
@@ -802,7 +823,7 @@ pub fn build(
     workspace_stack.set_vexpand(true);
     workspace_stack.set_transition_type(StackTransitionType::SlideLeftRight);
 
-    let comms_page = Box::new(Orientation::Vertical, 0);
+    let comms_page = gtk4::Paned::new(Orientation::Vertical);
     comms_page.set_hexpand(true);
     comms_page.set_vexpand(true);
 
@@ -832,11 +853,13 @@ pub fn build(
     // Initially hide the PreFlight Stack
     preflight_stack_container.set_visible(false);
 
-    comms_page.append(&chat_overlay);
-
     let input_area_data = setup_input_area(&tx_event, window, &active_target, matrix_selection);
     let input_container = input_area_data.input_container;
     let chat_input_buffer = input_area_data.chat_input_buffer;
+
+    comms_page.set_start_child(Some(&chat_overlay));
+    comms_page.set_end_child(Some(&input_container));
+    comms_page.set_position(600);
 
     let active_directive = Rc::new(RefCell::new("Directive 055".to_string()));
 
@@ -944,15 +967,7 @@ pub fn build(
         popover_composer.popup();
     });
 
-    match tetra.input_anchor {
-        crate::tetra::ScrollAnchor::Top => {
-            comms_page.prepend(&input_container);
-        }
-        crate::tetra::ScrollAnchor::Bottom => {
-            comms_page.append(&input_container);
-        }
-    }
-
+    // The paned now controls the input orientation dynamically via start/end, removing the need for box prepending/appending
     workspace_stack.add_titled(&comms_page, Some("comms"), "Comms");
 
     let right_switcher = StackSwitcher::new();
@@ -961,6 +976,10 @@ pub fn build(
     if let Some(settings) = gtk4::Settings::default() {
         let buf_chat = chat_input_buffer.clone();
         let buf_comp = body_buffer.clone();
+        let buf_sys = preflight_sys_buf.clone();
+        let buf_dir = preflight_dir_buf.clone();
+        let buf_eng = preflight_eng_buf.clone();
+        let buf_prm = preflight_prm_buf.clone();
 
         let update_theme = move |is_dark: bool| {
             let manager = sourceview5::StyleSchemeManager::default();
@@ -968,6 +987,10 @@ pub fn build(
             if let Some(scheme) = manager.scheme(scheme_name) {
                 buf_chat.set_style_scheme(Some(&scheme));
                 buf_comp.set_style_scheme(Some(&scheme));
+                buf_sys.set_style_scheme(Some(&scheme));
+                buf_dir.set_style_scheme(Some(&scheme));
+                buf_eng.set_style_scheme(Some(&scheme));
+                buf_prm.set_style_scheme(Some(&scheme));
             }
         };
 

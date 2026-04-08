@@ -21,4 +21,6 @@ pub enum GuiUpdate {
     ContextTelemetry(Vec<bandy::WeightedSkeleton>),
     RefreshMatrix(Vec<(String, String, usize)>),
     IngestMatrixTopology(Vec<String>), // Extracted dictionary paths for UI
+    NetworkLog(String),
+    NetworkState(String),
 }

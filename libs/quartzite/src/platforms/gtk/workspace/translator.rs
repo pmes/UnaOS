@@ -118,6 +118,12 @@ pub fn spawn_translator(
                                 }
                             }
                         }
+                        SMessage::NetworkLog(json) => {
+                            let _ = tx_gui.send(GuiUpdate::NetworkLog(json)).await;
+                        }
+                        SMessage::NetworkState(state) => {
+                            let _ = tx_gui.send(GuiUpdate::NetworkState(state)).await;
+                        }
                         _ => {}
                     }
                 }
