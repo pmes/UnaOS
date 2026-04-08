@@ -103,7 +103,7 @@ impl MatrixScanner {
         paths: &[std::path::PathBuf],
         absolute_workspace_root: &Path,
         depth: ScanDepth,
-    ) -> Result<String, String> {
+    ) -> Result<(String, String), String> {
         // Dictionary Engine
         let mut dict_map: HashMap<String, usize> = HashMap::new();
         let mut dict_list: Vec<String> = Vec::new();
@@ -151,7 +151,39 @@ impl MatrixScanner {
         let edges_str = topology_edges.join("|");
 
         let compressed_payload = format!("{}${}", dict_str, edges_str);
-        Ok(compressed_payload)
+
+        // Semantic code topology logic
+        let mut semantic_dag = String::from("--- SEMANTIC CODE TOPOLOGY ---\n");
+        let mut edges_map: HashMap<usize, Vec<usize>> = HashMap::new();
+
+        for edge in &topology_edges {
+            if let Some((node_str, deps_str)) = edge.split_once(':') {
+                if let Ok(node_id) = node_str.parse::<usize>() {
+                    let deps: Vec<usize> = deps_str
+                        .split(',')
+                        .filter_map(|d| d.parse::<usize>().ok())
+                        .collect();
+                    edges_map.insert(node_id, deps);
+                }
+            }
+        }
+
+        for (id, node_name) in dict_list.iter().enumerate() {
+            if let Some(deps) = edges_map.get(&id) {
+                if !deps.is_empty() {
+                    let dep_names: Vec<String> = deps.iter().map(|&d_id| {
+                        dict_list.get(d_id).unwrap_or(&d_id.to_string()).clone()
+                    }).collect();
+                    semantic_dag.push_str(&format!("[{}] relies on: {}\n", node_name, dep_names.join(", ")));
+                } else {
+                    semantic_dag.push_str(&format!("[{}] operates independently.\n", node_name));
+                }
+            } else {
+                semantic_dag.push_str(&format!("[{}] operates independently.\n", node_name));
+            }
+        }
+
+        Ok((compressed_payload, semantic_dag))
     }
 
     fn get_or_insert_id(token: &str, dict_map: &mut HashMap<String, usize>, dict_list: &mut Vec<String>) -> usize {
@@ -550,7 +582,7 @@ pub async fn ignite(synapse: Synapse, absolute_workspace_root: std::sync::Arc<Pa
                     .collect();
 
                 // Hardcode ScanDepth::Interface for now as per The Architect's instruction.
-                if let Ok(compressed_payload) = MatrixScanner::map_topology(&absolute_targets, &absolute_workspace_root, ScanDepth::Interface) {
+                if let Ok((compressed_payload, semantic_dag)) = MatrixScanner::map_topology(&absolute_targets, &absolute_workspace_root, ScanDepth::Interface) {
                     let is_single_file = absolute_targets.len() == 1 && absolute_targets[0].is_file();
 
                     if is_single_file {
@@ -563,7 +595,7 @@ pub async fn ignite(synapse: Synapse, absolute_workspace_root: std::sync::Arc<Pa
                     } else {
                         // J21 PATHFINDER: Fire the True DAG directly to `vein` via `IngestTopology`.
                         // This raw data structure fuels the instant UI payload mutation.
-                        let _ = synapse.fire_async(SMessage::Matrix(MatrixEvent::IngestTopology { payload: compressed_payload })).await;
+                        let _ = synapse.fire_async(SMessage::Matrix(MatrixEvent::IngestTopology { ui_dag: compressed_payload, semantic_dag })).await;
                     }
                 }
             }

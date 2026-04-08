@@ -172,7 +172,8 @@ pub enum PrincipiaCommand {
 pub enum MatrixEvent {
     /// Matrix broadcasts the entire topological map of the OS
     IngestTopology {
-        payload: String,
+        ui_dag: String,
+        semantic_dag: String,
     },
     /// Surgically appends extracted symbols to an existing node's children
     GraftTopology {

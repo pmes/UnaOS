@@ -343,22 +343,24 @@ impl VeinHandler {
                                     }
                                     SMessage::Matrix(matrix_event) => {
                                         match matrix_event {
-                                            bandy::MatrixEvent::IngestTopology { payload: compressed_payload } => {
+                                            bandy::MatrixEvent::IngestTopology { ui_dag: _, semantic_dag } => {
                                                 {
                                                     let mut s = state_bg.write().unwrap();
-                                                    s.matrix_topology = compressed_payload.clone();
 
-                                                    // J21 PATHFINDER: Instant Payload Mutation for full DAG
-                                                    // Resolving asynchronous UI blindness: Only inject the DAG if it doesn't already exist
-                                                    // to prevent exponential string duplication during rapid Matrix pings.
+                                                    // J24.13 PATHFINDER: The state variable used for LLM context construction
+                                                    // must hold the semantic string, not the compressed UI string.
+                                                    s.matrix_topology = semantic_dag.clone();
+
+                                                    // If a payload is actively pending review (the user has already typed a prompt),
+                                                    // instantly mutate it so the UI updates without requiring a new prompt.
                                                     if let Some(ref mut payload) = s.review_payload {
-                                                        if !payload.system.contains("--- CURRENT SPATIAL TOPOLOGY") {
-                                                            payload.system.push_str("\n\n--- CURRENT SPATIAL TOPOLOGY (DAG) ---\n");
-                                                            payload.system.push_str(&compressed_payload);
+                                                        if !payload.system.contains("--- SEMANTIC CODE TOPOLOGY") {
+                                                            payload.system.push_str("\n\n--- SEMANTIC CODE TOPOLOGY ---\n");
+                                                            payload.system.push_str(&semantic_dag);
                                                         }
                                                     }
                                                 }
-                                                // IMMEDIATELY fire StateInvalidated so the UI repaints with the DAG
+                                                // Ping the UI to repaint
                                                 let _ = synapse_loop.fire_async(SMessage::StateInvalidated).await;
                                             }
                                             bandy::MatrixEvent::SectorFocused { target, context } => {
@@ -640,7 +642,7 @@ impl VeinHandler {
                                         };
 
                                         if !matrix_topology.is_empty() {
-                                            system_builder.push_str("\n\n");
+                                            system_builder.push_str("\n\n--- SEMANTIC CODE TOPOLOGY ---\n");
                                             system_builder.push_str(&matrix_topology);
                                         }
 
@@ -846,36 +848,8 @@ impl AppHandler for VeinHandler {
                 let _ = self.tx.send(format!("LOAD_HISTORY:{}", offset));
             }
             Event::UpdateMatrixSelection(node_ids) => {
-                let mut synthesized_context = String::new();
-                let root = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
-
-                for id in &node_ids {
-                    let path = root.join(id);
-                    synthesized_context.push_str(&format!("// === NODE: {} ===\n", id));
-
-                    if path.is_file() {
-                        if let Ok(content) = std::fs::read_to_string(&path) {
-                            synthesized_context.push_str(&content);
-                        } else {
-                            synthesized_context.push_str("// [ERROR: UNREADABLE]");
-                        }
-                    } else {
-                        synthesized_context.push_str("// [VIRTUAL SYMBOL OR DIRECTORY]");
-                    }
-                    synthesized_context.push_str("\n\n");
-                }
-
-                let topology_str = if node_ids.is_empty() {
-                    String::new()
-                } else {
-                    format!("--- CURRENT SPATIAL TOPOLOGY (DAG) ---\n{}", synthesized_context)
-                };
-
-                {
-                    let mut s = self.app_state.write().unwrap();
-                    s.matrix_topology = topology_str;
-                }
-
+                let relative_targets_str = node_ids.join(" ");
+                let _ = self.publish("matrix", SMessage::Matrix(bandy::MatrixEvent::FocusSector(relative_targets_str)));
                 emit_ping = true;
             }
             _ => {}
