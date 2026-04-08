@@ -17,9 +17,11 @@ use objc2_app_kit::{
 };
 use objc2_foundation::{
     NSObjectProtocol, NSRect, NSPoint, NSSize, MainThreadMarker, NSArray,
-    NSString
+    NSString, NSEdgeInsets
 };
 use std::cell::{Cell, RefCell};
+use std::sync::{Arc, RwLock};
+use bandy::state::AppState;
 
 // -----------------------------------------------------------------------------
 // BUBBLE LAYOUT STATE (MATRIX WEAVER)
@@ -87,17 +89,13 @@ define_class!(
 
             if should_be_single_column {
                 for state in bubbles.iter() {
-                    unsafe {
-                        NSLayoutConstraint::deactivateConstraints(&state.staggered_constraints);
-                        NSLayoutConstraint::activateConstraints(&state.single_column_constraints);
-                    }
+                    NSLayoutConstraint::deactivateConstraints(&state.staggered_constraints);
+                    NSLayoutConstraint::activateConstraints(&state.single_column_constraints);
                 }
             } else {
                 for state in bubbles.iter() {
-                    unsafe {
-                        NSLayoutConstraint::deactivateConstraints(&state.single_column_constraints);
-                        NSLayoutConstraint::activateConstraints(&state.staggered_constraints);
-                    }
+                    NSLayoutConstraint::deactivateConstraints(&state.single_column_constraints);
+                    NSLayoutConstraint::activateConstraints(&state.staggered_constraints);
                 }
             }
         }
@@ -269,7 +267,7 @@ pub fn append_bubble(
 // -----------------------------------------------------------------------------
 // ASSEMBLY
 // -----------------------------------------------------------------------------
-pub fn create_comms(_mtm: MainThreadMarker) -> (Retained<NSView>, Retained<CommsDelegate>) {
+pub fn create_comms(_mtm: MainThreadMarker, app_state: &Arc<RwLock<AppState>>) -> (Retained<NSView>, Retained<CommsDelegate>) {
     // 1. Instantiate the delegate
     let delegate: Allocated<CommsDelegate> = unsafe { msg_send![CommsDelegate::class(), alloc] };
     let delegate: Retained<CommsDelegate> = unsafe { msg_send![delegate, init] };
@@ -361,11 +359,34 @@ pub fn create_comms(_mtm: MainThreadMarker) -> (Retained<NSView>, Retained<Comms
         let _: () = msg_send![&m_cv, addConstraints: &*doc_constraints];
     }
 
-    // Inject Test Bubbles to prove the Matrix
-    append_bubble(&doc_view, &stack_view, "Wake up, Neo...", false);
-    append_bubble(&doc_view, &stack_view, "Who are you?", true);
-    append_bubble(&doc_view, &stack_view, "The Matrix has you.", false);
-    append_bubble(&doc_view, &stack_view, "Follow the white rabbit.", false);
+    // Load historical messages from AppState
+    let history_items = {
+        let state = app_state.read().unwrap();
+        // Extract history items, filtering for chat messages to populate the matrix
+        state.history.iter()
+            .filter(|item| item.is_chat)
+            .cloned()
+            .collect::<Vec<_>>()
+    }; // Drop read lock immediately before heavy UI layout loops
+
+    println!("[MATRIX] Booting with {} historical messages", history_items.len());
+
+    // Inject historical bubbles into the Matrix
+    for item in history_items {
+        let is_user = item.sender == "Architect";
+        append_bubble(&doc_view, &stack_view, &item.content, is_user);
+    }
+
+    // Ensure the document view bounds the stack view at the bottom so it doesn't clip
+    unsafe {
+        let bottom_constraint = NSArray::from_slice(&[
+            &*NSLayoutConstraint::constraintWithItem_attribute_relatedBy_toItem_attribute_multiplier_constant(
+                &doc_view, NSLayoutAttribute::Bottom, NSLayoutRelation::Equal,
+                Some(&stack_view), NSLayoutAttribute::Bottom, 1.0, 16.0
+            )
+        ]);
+        let _: () = msg_send![&doc_view, addConstraints: &*bottom_constraint];
+    }
 
     // Add it to the split view
     split_view.addSubview(&matrix_scroll);
@@ -409,15 +430,90 @@ pub fn create_comms(_mtm: MainThreadMarker) -> (Retained<NSView>, Retained<Comms
         let _: () = msg_send![&cv, addConstraints: &*constraints];
     }
 
-    split_view.addSubview(&input_scroll);
+    // Explicitly lower the horizontal hugging priority of the scroll view so it expands to fill the space
+    unsafe {
+        // NSLayoutPriorityDefaultLow is 250.0
+        let _: () = msg_send![&input_scroll, setContentHuggingPriority: 250.0f32, forOrientation: objc2_app_kit::NSLayoutConstraintOrientation::Horizontal];
+    }
+
+    // 5. The Symbols
+    let attach_btn: Allocated<objc2_app_kit::NSButton> = unsafe { msg_send![objc2_app_kit::NSButton::class(), alloc] };
+    let attach_btn: Retained<objc2_app_kit::NSButton> = unsafe { msg_send![attach_btn, initWithFrame: frame] };
+    unsafe {
+        let _: () = msg_send![&attach_btn, setTranslatesAutoresizingMaskIntoConstraints: objc2::runtime::Bool::NO];
+        let _: () = msg_send![&attach_btn, setBordered: objc2::runtime::Bool::NO];
+        let _: () = msg_send![&attach_btn, setImagePosition: objc2_app_kit::NSCellImagePosition::ImageOnly];
+        let _: () = msg_send![&attach_btn, setImageScaling: objc2_app_kit::NSImageScaling::ScaleProportionallyUpOrDown];
+        let img = objc2_app_kit::NSImage::imageWithSystemSymbolName_accessibilityDescription(
+            &NSString::from_str("plus"),
+            None
+        );
+        let _: () = msg_send![&attach_btn, setImage: img.as_deref()];
+    }
+
+    let send_btn: Allocated<objc2_app_kit::NSButton> = unsafe { msg_send![objc2_app_kit::NSButton::class(), alloc] };
+    let send_btn: Retained<objc2_app_kit::NSButton> = unsafe { msg_send![send_btn, initWithFrame: frame] };
+    unsafe {
+        let _: () = msg_send![&send_btn, setTranslatesAutoresizingMaskIntoConstraints: objc2::runtime::Bool::NO];
+        let _: () = msg_send![&send_btn, setBordered: objc2::runtime::Bool::NO];
+        let _: () = msg_send![&send_btn, setImagePosition: objc2_app_kit::NSCellImagePosition::ImageOnly];
+        let _: () = msg_send![&send_btn, setImageScaling: objc2_app_kit::NSImageScaling::ScaleProportionallyUpOrDown];
+        let img = objc2_app_kit::NSImage::imageWithSystemSymbolName_accessibilityDescription(
+            &NSString::from_str("arrow.up.message"),
+            None
+        );
+        let _: () = msg_send![&send_btn, setImage: img.as_deref()];
+    }
+
+    // Force strict dimensions on the SF symbols so they don't shrink wrap
+    let symbol_constraints = unsafe {
+        NSArray::from_slice(&[
+            &*NSLayoutConstraint::constraintWithItem_attribute_relatedBy_toItem_attribute_multiplier_constant(
+                &attach_btn, NSLayoutAttribute::Width, NSLayoutRelation::Equal,
+                None, NSLayoutAttribute::NotAnAttribute, 1.0, 28.0
+            ),
+            &*NSLayoutConstraint::constraintWithItem_attribute_relatedBy_toItem_attribute_multiplier_constant(
+                &attach_btn, NSLayoutAttribute::Height, NSLayoutRelation::Equal,
+                None, NSLayoutAttribute::NotAnAttribute, 1.0, 28.0
+            ),
+            &*NSLayoutConstraint::constraintWithItem_attribute_relatedBy_toItem_attribute_multiplier_constant(
+                &send_btn, NSLayoutAttribute::Width, NSLayoutRelation::Equal,
+                None, NSLayoutAttribute::NotAnAttribute, 1.0, 28.0
+            ),
+            &*NSLayoutConstraint::constraintWithItem_attribute_relatedBy_toItem_attribute_multiplier_constant(
+                &send_btn, NSLayoutAttribute::Height, NSLayoutRelation::Equal,
+                None, NSLayoutAttribute::NotAnAttribute, 1.0, 28.0
+            ),
+        ])
+    };
+        NSLayoutConstraint::activateConstraints(&symbol_constraints);
+
+    // 6. The Input Horizontal Stack
+    let input_stack: Allocated<NSStackView> = unsafe { msg_send![NSStackView::class(), alloc] };
+    let input_stack: Retained<NSStackView> = unsafe { msg_send![input_stack, initWithFrame: frame] };
+    unsafe {
+        let _: () = msg_send![&input_stack, setTranslatesAutoresizingMaskIntoConstraints: objc2::runtime::Bool::NO];
+    }
+    input_stack.setOrientation(objc2_app_kit::NSUserInterfaceLayoutOrientation::Horizontal);
+    input_stack.setSpacing(8.0);
+    unsafe {
+        let _: () = msg_send![&input_stack, setEdgeInsets: NSEdgeInsets { top: 8.0, left: 8.0, bottom: 8.0, right: 8.0 }];
+    }
+
+    // Order matters: Attachment Button, Input Buffer, Send Button
+    input_stack.addView_inGravity(&attach_btn, NSStackViewGravity::Leading);
+    input_stack.addView_inGravity(&input_scroll, NSStackViewGravity::Leading);
+    input_stack.addView_inGravity(&send_btn, NSStackViewGravity::Leading);
+
+    split_view.addSubview(&input_stack);
 
     // The SplitView will manage sizing the two scroll views.
     // The user can drag the horizontal divider.
-    // Ensure the input scroll view doesn't collapse to 0:
+    // Ensure the input stack doesn't collapse to 0:
     let constraints = unsafe {
         NSArray::from_slice(&[
             &*NSLayoutConstraint::constraintWithItem_attribute_relatedBy_toItem_attribute_multiplier_constant(
-                &input_scroll, NSLayoutAttribute::Height, NSLayoutRelation::GreaterThanOrEqual,
+                &input_stack, NSLayoutAttribute::Height, NSLayoutRelation::GreaterThanOrEqual,
                 None, NSLayoutAttribute::NotAnAttribute, 1.0, 50.0 // Minimum 50px input height
             ),
             &*NSLayoutConstraint::constraintWithItem_attribute_relatedBy_toItem_attribute_multiplier_constant(
