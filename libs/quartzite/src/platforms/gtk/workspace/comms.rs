@@ -39,6 +39,15 @@ pub struct CommsPointers {
     pub preflight_prm_buf: sourceview5::Buffer,
 }
 
+struct PreflightStackData {
+    preflight_stack_container: Box,
+    preflight_stack: Stack,
+    preflight_sys_buf: sourceview5::Buffer,
+    preflight_dir_buf: sourceview5::Buffer,
+    preflight_eng_buf: sourceview5::Buffer,
+    preflight_prm_buf: sourceview5::Buffer,
+}
+
 // Helper to avoid circular dependencies
 fn enable_spelling(view: &SourceView) {
     if let Some(buffer) = view.buffer().downcast::<sourceview5::Buffer>().ok() {
@@ -59,6 +68,133 @@ fn enable_spelling(view: &SourceView) {
         unsafe {
             buffer.set_data("spell-adapter", SendWrapper(adapter));
         }
+    }
+}
+
+
+fn setup_preflight_stack(tx_event: &Sender<Event>) -> PreflightStackData {
+    let preflight_stack_container = Box::new(Orientation::Vertical, 0);
+    preflight_stack_container.set_halign(gtk4::Align::Fill);
+    preflight_stack_container.set_valign(gtk4::Align::Fill);
+    preflight_stack_container.set_vexpand(true);
+    preflight_stack_container.set_hexpand(true);
+    preflight_stack_container.add_css_class("background"); // Ensure opacity over chat
+
+    let preflight_stack = Stack::new();
+    preflight_stack.set_transition_type(StackTransitionType::SlideLeftRight);
+    preflight_stack.set_vexpand(true);
+    preflight_stack.set_hexpand(true);
+
+    let create_preflight_tab = |_title: &str| -> (Box, sourceview5::Buffer) {
+        let vbox = Box::new(Orientation::Vertical, 4);
+        vbox.set_vexpand(true);
+        vbox.set_hexpand(true);
+
+        let buffer = sourceview5::Buffer::new(None);
+        let view = SourceView::with_buffer(&buffer);
+        view.set_wrap_mode(gtk4::WrapMode::WordChar);
+        view.set_editable(true);
+        view.set_monospace(true);
+        view.set_vexpand(true);
+        view.add_css_class("view");
+
+        let scroll = ScrolledWindow::builder()
+            .child(&view)
+            .hscrollbar_policy(PolicyType::Never)
+            .vscrollbar_policy(PolicyType::Automatic)
+            .vexpand(true)
+            .build();
+
+        vbox.append(&scroll);
+        (vbox, buffer)
+    };
+
+    let (box_sys, preflight_sys_buf) = create_preflight_tab("SYSTEM");
+    let (box_dir, preflight_dir_buf) = create_preflight_tab("DIRECTIVES");
+    let (box_eng, preflight_eng_buf) = create_preflight_tab("ENGRAMS");
+    let (box_prm, preflight_prm_buf) = create_preflight_tab("PROMPT");
+
+    preflight_stack.add_titled(&box_sys, Some("sys"), "System");
+    preflight_stack.add_titled(&box_dir, Some("dir"), "Directives");
+    preflight_stack.add_titled(&box_eng, Some("eng"), "Engrams");
+    preflight_stack.add_titled(&box_prm, Some("prm"), "Prompt");
+
+    let preflight_switcher = StackSwitcher::new();
+    preflight_switcher.set_stack(Some(&preflight_stack));
+    preflight_switcher.set_halign(Align::Center);
+    preflight_switcher.set_margin_top(8);
+    preflight_switcher.set_margin_bottom(8);
+
+    preflight_stack_container.append(&preflight_switcher);
+    preflight_stack_container.append(&preflight_stack);
+
+    let dispatch_actions_box = Box::new(Orientation::Horizontal, 8);
+    dispatch_actions_box.set_halign(Align::End);
+    dispatch_actions_box.set_margin_top(8);
+    dispatch_actions_box.set_margin_bottom(8);
+    dispatch_actions_box.set_margin_end(16);
+
+    let cancel_btn = Button::builder()
+        .icon_name("window-close-symbolic")
+        .tooltip_text("Discard Payload")
+        .css_classes(vec!["flat", "destructive-action"])
+        .build();
+    let dispatch_btn = Button::builder()
+        .icon_name("document-save-symbolic")
+        .tooltip_text("Save and Send Payload")
+        .css_classes(vec!["suggested-action"])
+        .build();
+
+    dispatch_actions_box.append(&cancel_btn);
+    dispatch_actions_box.append(&dispatch_btn);
+    preflight_stack_container.append(&dispatch_actions_box);
+
+    let tx_dispatch_preflight = tx_event.clone();
+    let sys_buf_clone = preflight_sys_buf.clone();
+    let dir_buf_clone = preflight_dir_buf.clone();
+    let eng_buf_clone = preflight_eng_buf.clone();
+    let prm_buf_clone = preflight_prm_buf.clone();
+
+    dispatch_btn.connect_clicked(move |_| {
+        let (s, e) = sys_buf_clone.bounds();
+        let system_text = sys_buf_clone.text(&s, &e, false).to_string();
+
+        let (s, e) = dir_buf_clone.bounds();
+        let directives_text = dir_buf_clone.text(&s, &e, false).to_string();
+
+        let (s, e) = eng_buf_clone.bounds();
+        let engrams_text = eng_buf_clone.text(&s, &e, false).to_string();
+
+        let (s, e) = prm_buf_clone.bounds();
+        let prompt_text = prm_buf_clone.text(&s, &e, false).to_string();
+
+        let payload = bandy::state::PreFlightPayload {
+            system: system_text,
+            directives: directives_text,
+            engrams: engrams_text,
+            prompt: prompt_text,
+        };
+        let json = serde_json::to_string(&payload).unwrap();
+
+        let tx_async = tx_dispatch_preflight.clone();
+        glib::MainContext::default().spawn_local(async move {
+            let _ = tx_async.send(Event::DispatchPayload(json)).await;
+        });
+    });
+
+    let preflight_overlay_container = preflight_stack_container.clone();
+    cancel_btn.connect_clicked(move |_| {
+        // Here we just hide the overlay; the reactor will handle dropping it from AppState
+        preflight_overlay_container.set_visible(false);
+    });
+
+    PreflightStackData {
+        preflight_stack_container,
+        preflight_stack,
+        preflight_sys_buf,
+        preflight_dir_buf,
+        preflight_eng_buf,
+        preflight_prm_buf,
     }
 }
 
@@ -504,124 +640,17 @@ pub fn build(
     scrolled_window.set_child(Some(&console_list_view));
 
     // --- PRE-FLIGHT STACK (Layer 2) ---
-    let preflight_stack_container = Box::new(Orientation::Vertical, 0);
-    preflight_stack_container.set_halign(gtk4::Align::Fill);
-    preflight_stack_container.set_valign(gtk4::Align::Fill);
-    preflight_stack_container.set_vexpand(true);
-    preflight_stack_container.set_hexpand(true);
-    preflight_stack_container.add_css_class("background"); // Ensure opacity over chat
-
-    let preflight_stack = Stack::new();
-    preflight_stack.set_transition_type(StackTransitionType::SlideLeftRight);
-    preflight_stack.set_vexpand(true);
-    preflight_stack.set_hexpand(true);
-
-    let create_preflight_tab = |_title: &str| -> (Box, sourceview5::Buffer) {
-        let vbox = Box::new(Orientation::Vertical, 4);
-        vbox.set_vexpand(true);
-        vbox.set_hexpand(true);
-
-        let buffer = sourceview5::Buffer::new(None);
-        let view = SourceView::with_buffer(&buffer);
-        view.set_wrap_mode(gtk4::WrapMode::WordChar);
-        view.set_editable(true);
-        view.set_monospace(true);
-        view.set_vexpand(true);
-        view.add_css_class("view");
-
-        let scroll = ScrolledWindow::builder()
-            .child(&view)
-            .hscrollbar_policy(PolicyType::Never)
-            .vscrollbar_policy(PolicyType::Automatic)
-            .vexpand(true)
-            .build();
-
-        vbox.append(&scroll);
-        (vbox, buffer)
-    };
-
-    let (box_sys, preflight_sys_buf) = create_preflight_tab("SYSTEM");
-    let (box_dir, preflight_dir_buf) = create_preflight_tab("DIRECTIVES");
-    let (box_eng, preflight_eng_buf) = create_preflight_tab("ENGRAMS");
-    let (box_prm, preflight_prm_buf) = create_preflight_tab("PROMPT");
-
-    preflight_stack.add_titled(&box_sys, Some("sys"), "System");
-    preflight_stack.add_titled(&box_dir, Some("dir"), "Directives");
-    preflight_stack.add_titled(&box_eng, Some("eng"), "Engrams");
-    preflight_stack.add_titled(&box_prm, Some("prm"), "Prompt");
-
-    let preflight_switcher = StackSwitcher::new();
-    preflight_switcher.set_stack(Some(&preflight_stack));
-    preflight_switcher.set_halign(Align::Center);
-    preflight_switcher.set_margin_top(8);
-    preflight_switcher.set_margin_bottom(8);
-
-    preflight_stack_container.append(&preflight_switcher);
-    preflight_stack_container.append(&preflight_stack);
-
-    let dispatch_actions_box = Box::new(Orientation::Horizontal, 8);
-    dispatch_actions_box.set_halign(Align::End);
-    dispatch_actions_box.set_margin_top(8);
-    dispatch_actions_box.set_margin_bottom(8);
-    dispatch_actions_box.set_margin_end(16);
-
-    let cancel_btn = Button::builder()
-        .icon_name("window-close-symbolic")
-        .tooltip_text("Discard Payload")
-        .css_classes(vec!["flat", "destructive-action"])
-        .build();
-    let dispatch_btn = Button::builder()
-        .icon_name("document-save-symbolic")
-        .tooltip_text("Save and Send Payload")
-        .css_classes(vec!["suggested-action"])
-        .build();
-
-    dispatch_actions_box.append(&cancel_btn);
-    dispatch_actions_box.append(&dispatch_btn);
-    preflight_stack_container.append(&dispatch_actions_box);
+    let preflight_data = setup_preflight_stack(&tx_event);
+    let preflight_stack_container = preflight_data.preflight_stack_container;
+    let preflight_stack = preflight_data.preflight_stack;
+    let preflight_sys_buf = preflight_data.preflight_sys_buf;
+    let preflight_dir_buf = preflight_data.preflight_dir_buf;
+    let preflight_eng_buf = preflight_data.preflight_eng_buf;
+    let preflight_prm_buf = preflight_data.preflight_prm_buf;
 
     chat_overlay.add_overlay(&preflight_stack_container);
     // Initially hide the PreFlight Stack
     preflight_stack_container.set_visible(false);
-
-    let tx_dispatch_preflight = tx_event.clone();
-    let sys_buf_clone = preflight_sys_buf.clone();
-    let dir_buf_clone = preflight_dir_buf.clone();
-    let eng_buf_clone = preflight_eng_buf.clone();
-    let prm_buf_clone = preflight_prm_buf.clone();
-
-    dispatch_btn.connect_clicked(move |_| {
-        let (s, e) = sys_buf_clone.bounds();
-        let system_text = sys_buf_clone.text(&s, &e, false).to_string();
-
-        let (s, e) = dir_buf_clone.bounds();
-        let directives_text = dir_buf_clone.text(&s, &e, false).to_string();
-
-        let (s, e) = eng_buf_clone.bounds();
-        let engrams_text = eng_buf_clone.text(&s, &e, false).to_string();
-
-        let (s, e) = prm_buf_clone.bounds();
-        let prompt_text = prm_buf_clone.text(&s, &e, false).to_string();
-
-        let payload = bandy::state::PreFlightPayload {
-            system: system_text,
-            directives: directives_text,
-            engrams: engrams_text,
-            prompt: prompt_text,
-        };
-        let json = serde_json::to_string(&payload).unwrap();
-
-        let tx_async = tx_dispatch_preflight.clone();
-        glib::MainContext::default().spawn_local(async move {
-            let _ = tx_async.send(Event::DispatchPayload(json)).await;
-        });
-    });
-
-    let preflight_overlay_container = preflight_stack_container.clone();
-    cancel_btn.connect_clicked(move |_| {
-        // Here we just hide the overlay; the reactor will handle dropping it from AppState
-        preflight_overlay_container.set_visible(false);
-    });
 
     comms_page.append(&chat_overlay);
 
