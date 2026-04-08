@@ -106,6 +106,10 @@ impl MacOSSpline {
         // Using `dispatch2` for macOS GCD to cross the Tokio async/sync boundary natively
         let spline_inner_arc = self.inner.clone();
 
+        // Wrap comms_delegate in MainThreadBound so it can cross thread boundaries safely.
+        // It strictly requires `Send` to be moved into tokio::spawn.
+        let comms_delegate_bound = Arc::new(dispatch2::MainThreadBound::new(comms_delegate.clone(), mtm));
+
         tokio::spawn(async move {
             loop {
                 // Keep the compiler happy about the unused tx_event
@@ -114,21 +118,50 @@ impl MacOSSpline {
                 match rx_synapse.recv().await {
                     Ok(msg) => {
                         let _inner = spline_inner_arc.clone();
-                        // Dispatch to Main Thread to update AppKit UI
-                        dispatch2::DispatchQueue::main().exec_async(move || {
-                            // SMessage Routing - Logging the pipeline connection on the main thread
-                            match msg {
-                                SMessage::Matrix(_) => {
-                                    log::info!("[MacOSSpline] SMessage::Matrix routed to main thread - Bubble Matrix layout delegated.");
-                                },
-                                SMessage::NetworkLog(_) => {
+                        let comms_bound = comms_delegate_bound.clone();
+
+                        match msg {
+                            SMessage::StorageLoadPagedResult { records, .. } => {
+                                dispatch2::DispatchQueue::main().exec_async(move || {
+                                    let mtm = objc2_foundation::MainThreadMarker::new().unwrap();
+                                    let comms_delegate = comms_bound.get(mtm);
+                                    use objc2::DefinedClass;
+
+                                    if let (Some(doc_view), Some(stack_view)) = (
+                                        comms_delegate.ivars().doc_view.borrow().as_ref(),
+                                        comms_delegate.ivars().stack_view.borrow().as_ref()
+                                    ) {
+                                        for record in records {
+                                            let is_user = record.sender != "model";
+                                            // Porting your GTK chat filter
+                                            let is_chat = record.subject.eq_ignore_ascii_case("chat") || record.subject.eq_ignore_ascii_case("comms");
+
+                                            let _ = comms::append_bubble(
+                                                doc_view,
+                                                stack_view,
+                                                &record.content,
+                                                &record.sender,
+                                                &record.subject,
+                                                &record.timestamp,
+                                                is_chat,
+                                                is_user
+                                            );
+                                        }
+                                    }
+                                });
+                            },
+                            SMessage::NetworkLog(_) => {
+                                dispatch2::DispatchQueue::main().exec_async(move || {
                                     log::info!("[MacOSSpline] SMessage::NetworkLog routed to main thread.");
-                                },
-                                _ => {
-                                    log::info!("[MacOSSpline] Generic SMessage routed to main thread.");
-                                }
-                            }
-                        });
+                                });
+                            },
+                            SMessage::Matrix(_) => {
+                                dispatch2::DispatchQueue::main().exec_async(move || {
+                                    log::info!("[MacOSSpline] SMessage::Matrix routed to main thread.");
+                                });
+                            },
+                            _ => {}
+                        }
                     }
                     Err(_) => break, // Channel closed or lagged
                 }
