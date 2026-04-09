@@ -40,6 +40,7 @@ pub enum Event {
     ShardSelect(String),
     DispatchPayload(String),
     ToggleMatrixNode(String),
+    UiReady,
 }
 
 pub trait AppHandler: 'static {

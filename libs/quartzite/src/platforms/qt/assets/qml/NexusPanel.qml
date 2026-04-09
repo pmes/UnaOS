@@ -121,22 +121,21 @@ Rectangle {
                 Layout.fillWidth: true
                 Layout.fillHeight: true
 
+                Component.onCompleted: {
+                    if (root.backend) {
+                        root.backend.uiReady()
+                    }
+                }
+
                 ColumnLayout {
                     anchors.fill: parent
                     anchors.margins: 12
                     spacing: 12
 
-                    Text {
-                        text: "MATRIX TETRA"
-                        font.pixelSize: 14
-                        font.bold: true
-                        color: "#888888"
-                    }
-
                     ListView {
                         id: matrixListView
                         Layout.fillWidth: true
-                        Layout.preferredHeight: 150
+                        Layout.fillHeight: true
                         model: _matrixModel
                         clip: true
 
@@ -160,21 +159,6 @@ Rectangle {
                                 }
                             }
                         }
-                    }
-
-                    Text {
-                        text: "CONTEXT VECTOR"
-                        font.pixelSize: 14
-                        font.bold: true
-                        color: "#888888"
-                        Layout.topMargin: 20
-                    }
-
-                    Text {
-                        text: "[TeleHUD Context Vector Awaiting Signal]"
-                        font.italic: true
-                        color: "#666666"
-                        Layout.alignment: Qt.AlignHCenter
                     }
                 }
             }
