@@ -67,8 +67,16 @@ define_class!(
             let history = self.ivars().history.borrow();
 
             if let Some(item) = history.get(row as usize) {
-                let is_user = item.sender == "Architect";
-                let identifier_str = if is_user { "ChatBubbleCellUser" } else { "ChatBubbleCellAI" };
+                let is_user = matches!(item.origin, bandy::ontology::Origin::LocalUser(_));
+                let is_system = matches!(item.origin, bandy::ontology::Origin::System(_));
+
+                let identifier_str = if is_user {
+                    "ChatBubbleCellUser"
+                } else if is_system {
+                    "ChatBubbleCellSystem"
+                } else {
+                    "ChatBubbleCellAI"
+                };
                 let identifier = NSString::from_str(identifier_str);
 
                 let mut cell: Option<Retained<NSTableCellView>> = unsafe {
@@ -102,10 +110,15 @@ define_class!(
                         // Apply permanent styles based on sender
                         let bg_color: Retained<NSColor> = if is_user {
                             msg_send![NSColor::class(), controlAccentColor] // Blueish
+                        } else if is_system {
+                            msg_send![NSColor::class(), clearColor] // Transparent
                         } else {
                             msg_send![NSColor::class(), windowBackgroundColor] // Darker grey
                         };
                         let _: () = msg_send![&bubble_box, setFillColor: &*bg_color];
+
+                        // Enforce Content Hugging on Bubble Box
+                        let _: () = msg_send![&bubble_box, setContentHuggingPriority: 1000.0f32, forOrientation: 0isize];
                     }
 
                     let alignment_constraint = if is_user {
@@ -113,6 +126,13 @@ define_class!(
                             NSLayoutConstraint::constraintWithItem_attribute_relatedBy_toItem_attribute_multiplier_constant(
                                 &bubble_box, NSLayoutAttribute::Trailing, NSLayoutRelation::Equal,
                                 Some(&new_cell), NSLayoutAttribute::Trailing, 1.0, -16.0
+                            )
+                        }
+                    } else if is_system {
+                        unsafe {
+                            NSLayoutConstraint::constraintWithItem_attribute_relatedBy_toItem_attribute_multiplier_constant(
+                                &bubble_box, NSLayoutAttribute::CenterX, NSLayoutRelation::Equal,
+                                Some(&new_cell), NSLayoutAttribute::CenterX, 1.0, 0.0
                             )
                         }
                     } else {
@@ -187,8 +207,17 @@ define_class!(
                         let _: () = msg_send![&text_field, setBordered: objc2::runtime::Bool::NO];
                         let _: () = msg_send![&text_field, setEditable: objc2::runtime::Bool::NO];
                         let _: () = msg_send![&text_field, setSelectable: objc2::runtime::Bool::YES];
-                        let _: () = msg_send![&text_field, setAlignment: 0isize];
                         let _: () = msg_send![&text_field, setTag: 1400isize]; // Lumen Chat Text
+
+                        let align = if is_system { 2isize } else { 0isize }; // Center vs Left
+                        let _: () = msg_send![&text_field, setAlignment: align];
+
+                        // Enforce Content Hugging on Text Field
+                        let _: () = msg_send![&text_field, setContentHuggingPriority: 1000.0f32, forOrientation: 0isize];
+
+                        // Set preferred max layout width dynamically to 80% of cell width
+                        let frame_width = frame.size.width;
+                        let _: () = msg_send![&text_field, setPreferredMaxLayoutWidth: frame_width * 0.8];
 
                         let cell_obj: *mut AnyObject = msg_send![&text_field, cell];
                         if !cell_obj.is_null() {
@@ -295,7 +324,8 @@ define_class!(
                 }
 
                 // Set Metadata
-                let meta_str = format!("{} • {}", item.sender, item.timestamp);
+                let sender_str = item.display_name.clone().unwrap_or_else(|| "Unknown".to_string());
+                let meta_str = format!("{} • {}", sender_str, item.timestamp);
                 unsafe { let _: () = msg_send![&meta_label, setStringValue: &*NSString::from_str(&meta_str)]; }
 
                 // Text Content & Truncation
@@ -304,7 +334,7 @@ define_class!(
 
                 let mut truncation_idx = None;
                 if !is_expanded {
-                    truncation_idx = gneiss_pal::types::calculate_truncation(&item.content, 7, 500);
+                    truncation_idx = gneiss_pal::calculate_truncation(&item.content, 7, 500);
                 }
 
                 if let Some(idx) = truncation_idx {
@@ -320,9 +350,18 @@ define_class!(
                     let attr_string: Allocated<NSMutableAttributedString> = msg_send![NSMutableAttributedString::class(), alloc];
                     let attr_string: Retained<NSMutableAttributedString> = msg_send![attr_string, initWithString: &*ns_text];
 
-                    let regular_font: Retained<objc2_app_kit::NSFont> = msg_send![objc2_app_kit::NSFont::class(), systemFontOfSize: 14.0, weight: objc2_app_kit::NSFontWeightRegular];
+                    let is_system = matches!(item.origin, bandy::ontology::Origin::System(_));
+
+                    let regular_font: Retained<objc2_app_kit::NSFont> = if is_system {
+                        msg_send![objc2_app_kit::NSFont::class(), monospacedSystemFontOfSize: 12.0, weight: objc2_app_kit::NSFontWeightRegular]
+                    } else {
+                        msg_send![objc2_app_kit::NSFont::class(), systemFontOfSize: 14.0, weight: objc2_app_kit::NSFontWeightRegular]
+                    };
+
                     let text_color: Retained<NSColor> = if is_user {
                         msg_send![NSColor::class(), whiteColor] // White on accent color
+                    } else if is_system {
+                        msg_send![NSColor::class(), secondaryLabelColor] // Dimmed text formatting
                     } else {
                         msg_send![NSColor::class(), textColor]
                     };
@@ -338,7 +377,7 @@ define_class!(
                 }
 
                 // Handle Expander UI
-                let needs_expander = gneiss_pal::types::calculate_truncation(&item.content, 7, 500).is_some();
+                let needs_expander = gneiss_pal::calculate_truncation(&item.content, 7, 500).is_some();
                 unsafe {
                     let _: () = msg_send![&expander_btn, setHidden: objc2::runtime::Bool::new(!needs_expander)];
                 }

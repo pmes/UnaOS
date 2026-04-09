@@ -24,7 +24,7 @@ pub mod workspace;
 type BootstrapFn = Box<
     dyn FnOnce(
         &NSWindow,
-        async_channel::Sender<gneiss_pal::Event>,
+        async_channel::Sender<bandy::SMessage>,
         std::sync::Arc<std::sync::RwLock<bandy::state::AppState>>,
         tokio::sync::broadcast::Receiver<bandy::SMessage>,
         bandy::state::WorkspaceState,
@@ -40,7 +40,7 @@ type BootstrapFn = Box<
 // -----------------------------------------------------------------------------
 struct AppDelegateIvars {
     bootstrap: RefCell<Option<BootstrapFn>>,
-    tx_event: RefCell<Option<async_channel::Sender<gneiss_pal::Event>>>,
+    tx_event: RefCell<Option<async_channel::Sender<bandy::SMessage>>>,
     app_state: RefCell<Option<std::sync::Arc<std::sync::RwLock<bandy::state::AppState>>>>,
     rx_synapse: RefCell<Option<tokio::sync::broadcast::Receiver<bandy::SMessage>>>,
     workspace_state: RefCell<Option<bandy::state::WorkspaceState>>,
@@ -204,7 +204,7 @@ pub struct Backend {
 impl Backend {
     pub fn new<F>(
         _app_id: &str,
-        tx_event: async_channel::Sender<gneiss_pal::Event>,
+        tx_event: async_channel::Sender<bandy::SMessage>,
         app_state: std::sync::Arc<std::sync::RwLock<bandy::state::AppState>>,
         rx_synapse: tokio::sync::broadcast::Receiver<bandy::SMessage>,
         workspace_state: bandy::state::WorkspaceState,
@@ -213,7 +213,7 @@ impl Backend {
     where
         F: FnOnce(
             &NSWindow,
-            async_channel::Sender<gneiss_pal::Event>,
+            async_channel::Sender<bandy::SMessage>,
             std::sync::Arc<std::sync::RwLock<bandy::state::AppState>>,
             tokio::sync::broadcast::Receiver<bandy::SMessage>,
             bandy::state::WorkspaceState,
