@@ -49,8 +49,6 @@ mod imp_history {
         pub content: RefCell<String>,
         #[property(get, set)]
         pub is_chat: RefCell<bool>,
-        #[property(get, set)]
-        pub is_expanded: RefCell<bool>,
     }
 
     #[glib::object_subclass]
@@ -111,7 +109,6 @@ impl HistoryObject {
             .property("timestamp", timestamp)
             .property("content", content)
             .property("is-chat", is_chat)
-            .property("is-expanded", false)
             .build()
     }
 
