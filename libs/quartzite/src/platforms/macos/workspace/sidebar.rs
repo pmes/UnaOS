@@ -102,7 +102,7 @@ define_class!(
         ) -> NSInteger {
             if let Some(item_ptr) = item {
                 // It's a child node
-                let node = unsafe { Retained::cast_unchecked::<UnaMatrixNode>(Retained::retain(item_ptr as *const _ as *mut _).unwrap()) };
+                let node = unsafe { Retained::cast_unchecked::<UnaMatrixNode>(Retained::retain(item_ptr as *const AnyObject as *mut AnyObject).unwrap()) };
                 node.ivars().children.borrow().len() as NSInteger
             } else {
                 // It's the root level
@@ -116,7 +116,7 @@ define_class!(
             _outline_view: &NSOutlineView,
             item: &AnyObject,
         ) -> objc2::runtime::Bool {
-            let node = unsafe { Retained::cast_unchecked::<UnaMatrixNode>(Retained::retain(item as *const _ as *mut _).unwrap()) };
+            let node = unsafe { Retained::cast_unchecked::<UnaMatrixNode>(Retained::retain(item as *const AnyObject as *mut AnyObject).unwrap()) };
             if node.ivars().children.borrow().is_empty() {
                 objc2::runtime::Bool::NO
             } else {
@@ -132,7 +132,7 @@ define_class!(
             item: Option<&AnyObject>,
         ) -> Retained<AnyObject> {
             if let Some(item_ptr) = item {
-                let node = unsafe { Retained::cast_unchecked::<UnaMatrixNode>(Retained::retain(item_ptr as *const _ as *mut _).unwrap()) };
+                let node = unsafe { Retained::cast_unchecked::<UnaMatrixNode>(Retained::retain(item_ptr as *const AnyObject as *mut AnyObject).unwrap()) };
                 let child = &node.ivars().children.borrow()[index as usize];
                 unsafe { Retained::cast_unchecked::<AnyObject>(child.clone()) }
             } else {
@@ -149,7 +149,7 @@ define_class!(
             item: Option<&AnyObject>,
         ) -> Option<Retained<AnyObject>> {
             if let Some(item_ptr) = item {
-                let node = unsafe { Retained::cast_unchecked::<UnaMatrixNode>(Retained::retain(item_ptr as *const _ as *mut _).unwrap()) };
+                let node = unsafe { Retained::cast_unchecked::<UnaMatrixNode>(Retained::retain(item_ptr as *const AnyObject as *mut AnyObject).unwrap()) };
                 let label = node.ivars().label.borrow().clone();
                 Some(unsafe { Retained::cast_unchecked::<AnyObject>(NSString::from_str(&label)) })
             } else {
@@ -167,7 +167,7 @@ define_class!(
             _table_column: Option<&NSTableColumn>,
             item: &AnyObject,
         ) -> Option<Retained<NSView>> {
-            let node = unsafe { Retained::cast_unchecked::<UnaMatrixNode>(Retained::retain(item as *const _ as *mut _).unwrap()) };
+            let node = unsafe { Retained::cast_unchecked::<UnaMatrixNode>(Retained::retain(item as *const AnyObject as *mut AnyObject).unwrap()) };
             let label_str = node.ivars().label.borrow().clone();
 
             let identifier = NSString::from_str("SidebarCell");
@@ -199,7 +199,7 @@ define_class!(
                 }
 
                 new_cell.addSubview(&text_field);
-                new_cell.setTextField(Some(&text_field));
+                unsafe { new_cell.setTextField(Some(&text_field)); }
 
                 let constraints = unsafe {
                     objc2_foundation::NSArray::from_slice(&[
@@ -225,7 +225,7 @@ define_class!(
             }
 
             let cell = cell.unwrap();
-            let text_field = cell.textField().unwrap();
+            let text_field = unsafe { cell.textField().unwrap() };
 
             let ns_text = NSString::from_str(&label_str);
             unsafe {
