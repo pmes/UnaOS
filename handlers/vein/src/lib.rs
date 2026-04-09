@@ -28,61 +28,6 @@ use bandy::state::{
 };
 use bandy::{BandyMember, SMessage, Synapse};
 
-/// J24.7 "Eleven" :: The Context Translator
-/// Translates `DICTIONARY$TOPOLOGY` IPC payloads into a semantic, token-efficient dependency map.
-/// Example Input: `libs/matrix,libs/bandy,std$0:1,2|1:2`
-/// Example Output:
-/// `libs/matrix relies on: libs/bandy, std`
-/// `libs/bandy relies on: std`
-fn decompress_topology(raw: &str) -> String {
-    let mut parts = raw.splitn(2, '$');
-
-    let dict_str = match parts.next() {
-        Some(s) => s,
-        None => return "[SYSTEM ERROR: DAG Topology Malformed]".to_string(),
-    };
-
-    let topology_str = match parts.next() {
-        Some(s) => s,
-        None => return "[SYSTEM ERROR: DAG Topology Malformed]".to_string(),
-    };
-
-    if dict_str.is_empty() || topology_str.is_empty() {
-        return "[SYSTEM ERROR: DAG Topology Malformed]".to_string();
-    }
-
-    let dictionary: Vec<&str> = dict_str.split(',').collect();
-    let mut decompressed = String::new();
-
-    for edge in topology_str.split('|') {
-        if edge.is_empty() { continue; }
-
-        let mut edge_parts = edge.splitn(2, ':');
-        let source_id_str = edge_parts.next().unwrap_or("");
-        let deps_str = edge_parts.next().unwrap_or("");
-
-        if let Ok(source_id) = source_id_str.parse::<usize>() {
-            if let Some(source_name) = dictionary.get(source_id) {
-                let deps: Vec<&str> = deps_str
-                    .split(',')
-                    .filter_map(|d| d.parse::<usize>().ok())
-                    .filter_map(|id| dictionary.get(id).copied())
-                    .collect();
-
-                if !deps.is_empty() {
-                    decompressed.push_str(&format!("{} relies on: {}\n", source_name, deps.join(", ")));
-                }
-            }
-        }
-    }
-
-    if decompressed.is_empty() {
-        return "[SYSTEM ERROR: DAG Topology Malformed]".to_string();
-    }
-
-    decompressed.trim_end().to_string()
-}
-
 fn get_mime_type(filename: &str) -> String {
     let lower = filename.to_lowercase();
     if lower.ends_with(".pdf") {
@@ -695,8 +640,8 @@ impl VeinHandler {
                                         };
 
                                         if !matrix_topology.is_empty() {
-                                            system_builder.push_str("\n\n--- CURRENT SPATIAL TOPOLOGY (DAG) ---\n");
-                                            system_builder.push_str(&decompress_topology(&matrix_topology));
+                                            system_builder.push_str("\n\n");
+                                            system_builder.push_str(&matrix_topology);
                                         }
 
                                         let mut engrams_combined = String::new();
@@ -899,6 +844,39 @@ impl AppHandler for VeinHandler {
             }
             Event::LoadHistory { offset } => {
                 let _ = self.tx.send(format!("LOAD_HISTORY:{}", offset));
+            }
+            Event::UpdateMatrixSelection(node_ids) => {
+                let mut synthesized_context = String::new();
+                let root = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+
+                for id in &node_ids {
+                    let path = root.join(id);
+                    synthesized_context.push_str(&format!("// === NODE: {} ===\n", id));
+
+                    if path.is_file() {
+                        if let Ok(content) = std::fs::read_to_string(&path) {
+                            synthesized_context.push_str(&content);
+                        } else {
+                            synthesized_context.push_str("// [ERROR: UNREADABLE]");
+                        }
+                    } else {
+                        synthesized_context.push_str("// [VIRTUAL SYMBOL OR DIRECTORY]");
+                    }
+                    synthesized_context.push_str("\n\n");
+                }
+
+                let topology_str = if node_ids.is_empty() {
+                    String::new()
+                } else {
+                    format!("--- CURRENT SPATIAL TOPOLOGY (DAG) ---\n{}", synthesized_context)
+                };
+
+                {
+                    let mut s = self.app_state.write().unwrap();
+                    s.matrix_topology = topology_str;
+                }
+
+                emit_ping = true;
             }
             _ => {}
         }

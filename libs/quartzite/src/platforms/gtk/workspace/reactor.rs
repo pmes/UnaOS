@@ -65,13 +65,11 @@ pub fn spawn_listener(pointers: ReactorPointers, rx_gui: Receiver<GuiUpdate>) {
                         let timestamp = chrono::Local::now().format("%H:%M:%S").to_string();
                         let id = format!("{}-sys-{}", chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0), i);
                         let obj = HistoryObject::new(&id, &sender, &subject, &timestamp, &content, is_chat);
-                        println!("Appending system log item: {}", content);
                         batch.push(obj.upcast());
                     }
                     if !batch.is_empty() {
                         let len = pointers.console_store.n_items();
                         pointers.console_store.splice(len, 0, &batch);
-                        println!(">>> [J13 TRACE] REACTOR: Splice executed for {} items (ConsoleLogBatch)", batch.len());
                     }
                 }
                 GuiUpdate::HistorySeed(messages) => {
@@ -85,13 +83,11 @@ pub fn spawn_listener(pointers: ReactorPointers, rx_gui: Receiver<GuiUpdate>) {
                     for (i, msg) in messages.into_iter().enumerate() {
                         let id = format!("{}-hist-{}", chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0), i);
                         let obj = HistoryObject::new(&id, &msg.sender, "History", &msg.timestamp, &msg.content, msg.is_chat);
-                        println!("Seeding history item: {}", msg.content);
                         batch.push(obj.upcast());
                     }
                     if !batch.is_empty() {
                         // Splice at index 0 to properly prepend history
                         pointers.console_store.splice(0, 0, &batch);
-                        println!(">>> [J16 TRACE] REACTOR: Splice executed for {} items (HistorySeed)", batch.len());
                     }
 
                     let fetch_lock = pointers.is_fetching.clone();
@@ -114,13 +110,11 @@ pub fn spawn_listener(pointers: ReactorPointers, rx_gui: Receiver<GuiUpdate>) {
                     for (i, msg) in messages.into_iter().enumerate() {
                         let id = format!("{}-hist-{}", chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0), i);
                         let obj = HistoryObject::new(&id, &msg.sender, "History", &msg.timestamp, &msg.content, msg.is_chat);
-                        println!("Appending history item: {}", msg.content);
                         batch.push(obj.upcast());
                     }
                     if !batch.is_empty() {
                         // Splice at index 0 to properly prepend older history
                         pointers.console_store.splice(0, 0, &batch);
-                        println!(">>> [J16 TRACE] REACTOR: Splice executed for {} items (HistoryAppend)", batch.len());
                     }
 
                     let fetch_lock = pointers.is_fetching.clone();
