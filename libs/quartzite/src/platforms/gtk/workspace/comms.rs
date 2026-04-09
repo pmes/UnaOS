@@ -258,7 +258,7 @@ fn setup_input_area(tx_event: &Sender<Event>, window: &NativeWindow, active_targ
     let input_scroll = ScrolledWindow::builder()
         .hscrollbar_policy(PolicyType::Never)
         .vscrollbar_policy(PolicyType::Automatic)
-        .has_frame(false)
+        .has_frame(true)
         .propagate_natural_height(true)
         .max_content_height(150)
         .build();
@@ -273,10 +273,6 @@ fn setup_input_area(tx_event: &Sender<Event>, window: &NativeWindow, active_targ
         .show_line_numbers(false)
         .auto_indent(true)
         .accepts_tab(false)
-        .top_margin(8)
-        .bottom_margin(8)
-        .left_margin(10)
-        .right_margin(10)
         .build();
     enable_spelling(&text_view);
     text_view.add_css_class("view");
@@ -574,10 +570,10 @@ fn setup_chat_view(tx_event: &Sender<Event>, tetra: &crate::tetra::StreamTetra) 
     }
 
     let console_factory = SignalListItemFactory::new();
+    let store_for_setup = console_store.clone();
     console_factory.connect_setup(move |_factory, item| {
         let item = item.downcast_ref::<ListItem>().unwrap();
 
-        // CRITICAL: Vertical orientation allows native halign stagger without spacers
         let root = Box::new(Orientation::Vertical, 0);
         root.set_hexpand(true);
         root.add_css_class("console-row");
@@ -591,61 +587,43 @@ fn setup_chat_view(tx_event: &Sender<Event>, tetra: &crate::tetra::StreamTetra) 
         bubble.set_margin_end(8);
 
         let header_box = Box::new(Orientation::Horizontal, 8);
-
-        let left_expand_btn = Button::builder()
-            .icon_name("pan-down-symbolic")
-            .css_classes(vec!["flat"])
-            .build();
+        let left_expand_btn = Button::builder().icon_name("pan-down-symbolic").css_classes(vec!["flat"]).build();
         left_expand_btn.set_visible(false);
-
-        let meta_label = Label::new(None);
-        meta_label.set_xalign(0.0);
-        meta_label.add_css_class("dim-label");
-        meta_label.set_hexpand(true);
-
-        let right_expand_btn = Button::builder()
-            .icon_name("pan-down-symbolic")
-            .css_classes(vec!["flat"])
-            .build();
+        let meta_label = Label::builder().xalign(0.0).css_classes(vec!["dim-label"]).hexpand(true).build();
+        let right_expand_btn = Button::builder().icon_name("pan-down-symbolic").css_classes(vec!["flat"]).build();
         right_expand_btn.set_visible(false);
 
         header_box.append(&left_expand_btn);
         header_box.append(&meta_label);
         header_box.append(&right_expand_btn);
-
         bubble.append(&header_box);
 
-        // --- Standard Mode (Message View) ---
         let msg_label = Label::builder()
             .wrap(true)
-            .lines(11)
-            .selectable(true)
             .hexpand(false)
             .max_width_chars(85)
             .wrap_mode(gtk4::pango::WrapMode::WordChar)
-            // CRITICAL: ellipsize removed to prevent terminal layout stalling
+            .margin_top(8)
+            .margin_bottom(8)
+            .margin_start(12)
+            .margin_end(12)
             .build();
         msg_label.add_css_class("view");
 
         bubble.append(&msg_label);
 
-        // --- Standard Mode (Expander) ---
         let expander = Expander::new(None);
-        let payload_content_buffer = sourceview5::Buffer::new(None);
-        let payload_content_view = SourceView::with_buffer(&payload_content_buffer);
+        let payload_content_buffer = gtk4::TextBuffer::new(None);
+        let payload_content_view = gtk4::TextView::with_buffer(&payload_content_buffer);
         payload_content_view.set_editable(false);
         payload_content_view.set_wrap_mode(gtk4::WrapMode::WordChar);
-        payload_content_view.set_show_line_numbers(true);
         payload_content_view.set_monospace(true);
         payload_content_view.set_cursor_visible(false);
         payload_content_view.add_css_class("view");
         payload_content_view.set_size_request(-1, 300);
-        let payload_scroll = ScrolledWindow::builder()
-            .child(&payload_content_view)
-            .build();
+        let payload_scroll = ScrolledWindow::builder().child(&payload_content_view).build();
         expander.set_child(Some(&payload_scroll));
         bubble.append(&expander);
-
         root.append(&bubble);
 
         let widgets = BubbleWidgets {
@@ -653,33 +631,36 @@ fn setup_chat_view(tx_event: &Sender<Event>, tetra: &crate::tetra::StreamTetra) 
             left_expand_btn: left_expand_btn.clone(),
             meta_label,
             right_expand_btn: right_expand_btn.clone(),
-            msg_label: msg_label.clone(),
+            msg_label,
             expander,
         };
 
-        // 3. The Toggle Logic
-        let toggle_label = msg_label.clone();
+        let item_clone_left = item.clone();
+        let store_clone_left = store_for_setup.clone();
         left_expand_btn.connect_clicked(move |_| {
-            if toggle_label.lines() == -1 {
-                toggle_label.set_lines(11); // Collapse back
-            } else {
-                toggle_label.set_lines(-1);  // Expand fully
+            let pos = item_clone_left.position();
+            if pos != gtk4::INVALID_LIST_POSITION {
+                if let Some(obj) = item_clone_left.item().and_then(|i| i.downcast::<HistoryObject>().ok()) {
+                    obj.set_is_expanded(!obj.is_expanded());
+                    store_clone_left.items_changed(pos, 1, 1);
+                }
             }
         });
 
-        let toggle_label_right = msg_label.clone();
+        let item_clone_right = item.clone();
+        let store_clone_right = store_for_setup.clone();
         right_expand_btn.connect_clicked(move |_| {
-            if toggle_label_right.lines() == -1 {
-                toggle_label_right.set_lines(11); // Collapse back
-            } else {
-                toggle_label_right.set_lines(-1);  // Expand fully
+            let pos = item_clone_right.position();
+            if pos != gtk4::INVALID_LIST_POSITION {
+                if let Some(obj) = item_clone_right.item().and_then(|i| i.downcast::<HistoryObject>().ok()) {
+                    obj.set_is_expanded(!obj.is_expanded());
+                    store_clone_right.items_changed(pos, 1, 1);
+                }
             }
         });
 
         let boxed_widgets = glib::BoxedAnyObject::new(widgets);
-        unsafe {
-            item.set_data("widgets", boxed_widgets);
-        }
+        unsafe { item.set_data("widgets", boxed_widgets); }
         item.set_child(Some(&root));
     });
 
@@ -688,9 +669,9 @@ fn setup_chat_view(tx_event: &Sender<Event>, tetra: &crate::tetra::StreamTetra) 
         let Some(item) = item.downcast_ref::<ListItem>() else { return; };
         let Some(obj) = item.item().and_then(|c| c.downcast::<HistoryObject>().ok()) else { return; };
 
-        // Retrieve preserved absolute pointers securely
         let boxed_widgets = unsafe { item.data::<glib::BoxedAnyObject>("widgets") };
         let Some(boxed_ptr) = boxed_widgets else { return; };
+
         let widgets = unsafe { boxed_ptr.as_ref() }.borrow::<BubbleWidgets>();
 
         widgets.bubble.remove_css_class("architect-bubble");
@@ -703,12 +684,12 @@ fn setup_chat_view(tx_event: &Sender<Event>, tetra: &crate::tetra::StreamTetra) 
         widgets.left_expand_btn.set_visible(false);
         widgets.right_expand_btn.set_visible(false);
 
-        // STANDARD MODE
         let is_chat = obj.is_chat();
         let sender = obj.sender();
         let timestamp = obj.timestamp();
         let content = obj.content();
         let subject = obj.subject();
+        let is_expanded = obj.is_expanded();
 
         if is_chat {
             widgets.msg_label.set_visible(true);
@@ -716,9 +697,6 @@ fn setup_chat_view(tx_event: &Sender<Event>, tetra: &crate::tetra::StreamTetra) 
             widgets.meta_label.remove_css_class("role-architect");
             widgets.meta_label.remove_css_class("role-una");
             widgets.meta_label.remove_css_class("role-system");
-
-            let line_count = content.trim_end().lines().count();
-            widgets.msg_label.set_label(&content);
 
             let is_user = sender == "Architect";
 
@@ -734,15 +712,43 @@ fn setup_chat_view(tx_event: &Sender<Event>, tetra: &crate::tetra::StreamTetra) 
                 widgets.meta_label.set_xalign(0.0);
             }
 
-            let is_newest = item.position() == store_for_bind.n_items() - 1;
+            // --- STRICT BYTE-BOUNDARY TRUNCATION ---
+            let explicit_lines = content.trim_end().lines().count();
+            let is_long_message = content.len() > 800 || explicit_lines > 10;
 
-            if is_user || !is_newest {
-                widgets.msg_label.set_lines(11);
+            if is_expanded || !is_long_message {
+                widgets.msg_label.set_label(&content);
+                widgets.msg_label.set_selectable(true);
+                widgets.left_expand_btn.set_icon_name("pan-up-symbolic");
+                widgets.right_expand_btn.set_icon_name("pan-up-symbolic");
             } else {
-                widgets.msg_label.set_lines(if obj.is_expanded() { -1 } else { 11 });
+                let mut byte_idx = 0;
+                let mut line_count = 0;
+
+                for (idx, c) in content.char_indices() {
+                    if c == '\n' { line_count += 1; }
+                    if line_count >= 10 || idx >= 800 {
+                        byte_idx = idx;
+                        break;
+                    }
+                    byte_idx = idx + c.len_utf8();
+                }
+
+                let mut truncated = String::with_capacity(850);
+                if byte_idx < content.len() {
+                    truncated.push_str(&content[..byte_idx]);
+                    truncated.push_str("\n...");
+                } else {
+                    truncated.push_str(&content);
+                }
+
+                widgets.msg_label.set_label(&truncated);
+                widgets.msg_label.set_selectable(false);
+                widgets.left_expand_btn.set_icon_name("pan-down-symbolic");
+                widgets.right_expand_btn.set_icon_name("pan-down-symbolic");
             }
 
-            if line_count > 11 {
+            if is_long_message {
                 widgets.left_expand_btn.set_visible(is_user);
                 widgets.right_expand_btn.set_visible(!is_user);
             } else {
@@ -754,10 +760,10 @@ fn setup_chat_view(tx_event: &Sender<Event>, tetra: &crate::tetra::StreamTetra) 
             widgets.bubble.add_css_class("una-bubble");
             widgets.bubble.set_halign(gtk4::Align::Start);
             widgets.expander.set_label(Some(&format!("{} | {} | {}", sender, subject, timestamp)));
-            // Direct access: No .child() traversal needed, we captured payload_content_view inside the BubbleWidgets if we want it, but wait, we didn't add payload_content_view to BubbleWidgets. I'll just use the traversal here since it's structurally fixed.
+
             if let Some(scroll) = widgets.expander.child().and_then(|c: gtk4::Widget| c.downcast::<ScrolledWindow>().ok()) {
-                if let Some(content_view) = scroll.child().and_then(|c: gtk4::Widget| c.downcast::<SourceView>().ok()) {
-                    content_view.buffer().downcast::<sourceview5::Buffer>().unwrap().set_text(&content);
+                if let Some(content_view) = scroll.child().and_then(|c: gtk4::Widget| c.downcast::<gtk4::TextView>().ok()) {
+                    content_view.buffer().set_text(&content);
                 }
             }
             widgets.expander.set_expanded(false);
@@ -847,7 +853,8 @@ pub fn build(
 
     comms_page.set_start_child(Some(&chat_overlay));
     comms_page.set_end_child(Some(&input_container));
-    comms_page.set_position(600);
+    comms_page.set_shrink_end_child(false);
+    comms_page.set_resize_end_child(false);
 
     let active_directive = Rc::new(RefCell::new("Directive 055".to_string()));
 
