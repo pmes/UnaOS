@@ -588,7 +588,7 @@ impl VeinHandler {
                                                 }
 
                                                 let ai_response_clone = response.clone();
-                                                let tx_inner = synapse_clone.clone();
+                                                let _tx_inner = synapse_clone.clone();
                                                 tokio::spawn(async move {
                                                     if let Ok(mut client_clone) = ResilientClient::new().await {
                                                         if let Ok(engram) = crate::context::compress_into_engram(&mut client_clone, &raw_user_prompt, &ai_response_clone).await {
