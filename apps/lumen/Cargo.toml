@@ -5,6 +5,11 @@ edition = "2024"
 
 [dependencies]
 quartzite = { path = "../../libs/quartzite" }
+bandy = { path = "../../libs/bandy" }
+dirs = "5.0"
+gneiss_pal = { path = "../../libs/gneiss_pal" }
+serde_json = "1.0.149"
+serde = { version = "1.0.228", features = ["derive"] }
 
 [features]
 macos = ["quartzite/macos"]

@@ -65,10 +65,18 @@ fn generate_node_tokens(node: &Node) -> proc_macro2::TokenStream {
             while let Some(start) = template_string.find("{{") {
                 if let Some(end) = template_string[start..].find("}}") {
                     let var_name = template_string[start + 2..start + end].to_string();
+
                     // Replace {{var}} with {}
                     template_string.replace_range(start..start + end + 2, "{}");
 
-                    let var_access = format!("item.{}", var_name);
+                    // Specific mapping for display_name, which is an Option<String> in HistoryItem
+                    // We need to safely unwrap or fallback so it can be formatted natively
+                    let var_access = if var_name == "display_name" {
+                        format!("item.{}.as_deref().unwrap_or(\"Unknown\")", var_name)
+                    } else {
+                        format!("item.{}", var_name)
+                    };
+
                     let var_expr: proc_macro2::TokenStream = var_access.parse().expect("Failed to parse label variable");
                     variables.push(var_expr);
                 } else {
