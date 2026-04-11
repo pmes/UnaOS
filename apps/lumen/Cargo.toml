@@ -1,42 +1,10 @@
-# =====================================================================
-# CRATE: apps/lumen/Cargo.toml
-# DESCRIPTION: The Companion (AI-First). The Master Switchboard.
-# =====================================================================
-
 [package]
 name = "lumen"
 version = "0.1.0"
 edition = "2024"
-license = "GPL-3.0-or-later"
-
-[features]
-default = []
-gtk = ["quartzite/gtk"]
-gnome = ["quartzite/gnome"]
-qt = ["quartzite/qt"]
-macos = ["quartzite/macos"]
 
 [dependencies]
-# The Trinity Core
-elessar = { path = "../../libs/elessar" }
-amber_bytes = { path = "../../handlers/amber_bytes" }
-matrix = { path = "../../handlers/matrix" }
-vein = { path = "../../handlers/vein", default-features = false }
-quartzite = { path = "../../libs/quartzite", default-features = false }
-bandy = { path = "../../libs/bandy" }
-gneiss_pal = { path = "../../libs/gneiss_pal" }
-unafs = { path = "../../libs/unafs" }
-junct = { path = "../../handlers/junct" }
+quartzite = { path = "../../libs/quartzite" }
 
-# Host UI & System (Platform Agnostic Imports)
-async-channel = "2.5"
-log = "0.4"
-dotenvy = "0.15"
-rustls = { version = "0.23", features = ["ring"] }
-chrono = "0.4"
-tokio = { version = "1.49", features = ["sync", "rt", "macros"] }
-serde = { version = "1.0.228", features = ["derive"] }
-wincode = "0.4.5"
-
-[target.'cfg(target_os = "linux")'.dependencies]
-libadwaita = { version = "0.8.1", features = ["v1_4"], optional = true }
+[features]
+macos = ["quartzite/macos"]

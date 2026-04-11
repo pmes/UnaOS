@@ -1,0 +1,21 @@
+{
+  "node_type": "WindowFrame",
+  "props": {
+    "id": "history_dump_window",
+    "children": [
+      {
+        "node_type": "Iterator",
+        "props": {
+          "bind": "app_state.history",
+          "filter": "is_chat == true",
+          "item_template": {
+            "node_type": "Label",
+            "props": {
+              "value": "[{{timestamp}}] {{display_name}}: {{content}}"
+            }
+          }
+        }
+      }
+    ]
+  }
+}
