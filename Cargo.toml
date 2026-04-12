@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "libs/gneiss_pal",
     "libs/quartzite",
+    "libs/quartzite/macros",
     "libs/elessar",
     "libs/resonance",
     "libs/unafs",
