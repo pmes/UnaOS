@@ -5,18 +5,19 @@ edition = "2024"
 license = "GPL-3.0-or-later"
 
 [dependencies]
-# CORE
-bootloader_api = "0.11.14"
-
 # FIX: Use 'spin_no_std' to explicitly disable Standard Library usage
 lazy_static = { version = "1.5.0", features = ["spin_no_std"] }
 
 # HARDWARE
 spin = "0.12.0"
 volatile = "0.6.1"
-x86_64 = "0.15.4"
-uart_16550 = "0.6.0"
-pic8259 = "0.11.0"
-pc-keyboard = "0.9.0"
 linked_list_allocator = "0.10.6"
 font8x8 = { version = "0.3.1", default-features = false, features = ["unicode"] }
+cfg-if = "1.0.0"
+unaos-boot-info = { path = "../boot-info" }
+
+[target.'cfg(target_arch = "x86_64")'.dependencies]
+x86_64 = "0.15.4"
+pic8259 = "0.11.0"
+pc-keyboard = "0.9.0"
+uart_16550 = "0.6.0"

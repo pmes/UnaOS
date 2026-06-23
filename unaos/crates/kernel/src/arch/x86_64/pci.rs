@@ -222,8 +222,14 @@ impl PciScanner {
         addr_port.write(address);
 
         // Write to Data Port
-        let port_offset = (offset & 2) as u16;
         let mut data = Port::<u16>::new(data_port + port_offset);
         data.write(value);
+    }
+}
+
+pub fn init() {
+    if let Some(xhci_phys_addr) = PciScanner::scan() {
+        crate::serial_println!(":: x86_64 PCI Init: Found xHCI at {:#x} ::", xhci_phys_addr);
+        // Note: Full xHCI init with virtual memory mapping will be handled by the upcoming generic device manager.
     }
 }

@@ -1,72 +1,43 @@
 #![no_std]
+#![no_main]
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2026 The Architect & Una
-//
-// This program is free software: you can redistribute it and/or modify
-// it under the terms of the GNU General Public License as published by
-// the Free Software Foundation, either version 3 of the License, or
-// (at your option) any later version.
-//
-// This program is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-// GNU General Public License for more details.
-//
-// You should have received a copy of the GNU General Public License
-// along with this program.  If not, see <https://www.gnu.org/licenses/>.
-
-#![no_main]
 
 extern crate alloc;
 
-use bootloader_api::{entry_point, BootInfo, config::Mapping};
 use core::panic::PanicInfo;
-use x86_64::VirtAddr;
 use unaos_kernel::serial_println;
+use unaos_boot_info::BootInfo;
 
-pub static BOOTLOADER_CONFIG: bootloader_api::BootloaderConfig = {
-    let mut config = bootloader_api::BootloaderConfig::new_default();
-    config.mappings.physical_memory = Some(Mapping::Dynamic);
-    config
-};
-
-// ENTRY POINT
-entry_point!(kernel_main, config = &BOOTLOADER_CONFIG);
-
-fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
-    // 1. Core Hardware Init (GDT, IDT, PICS)
+#[unsafe(no_mangle)]
+pub extern "C" fn _start(boot_info: &'static mut BootInfo) -> ! {
+    // 1. Core Hardware Init (GDT, IDT, PICS for x86_64, GIC for aarch64)
     unaos_kernel::init();
 
-    // 2. Serial Verification
-    serial_println!(":: UNAOS KERNEL AWAKE ::");
+    // 3. Framebuffer Info Extraction
+    // Extract info before memory initialization consumes the BootInfo reference
+    let framebuffer_addr = boot_info.framebuffer_addr;
+    let framebuffer_size = boot_info.framebuffer_size;
+    let info = boot_info.framebuffer_info;
 
-    // 3. Global Heap Allocation (Phase 3 Memory Translation)
-    let physical_memory_offset = boot_info.physical_memory_offset.into_option().unwrap();
-    let phys_offset = VirtAddr::new(physical_memory_offset);
-
-    let mut mapper = unsafe { unaos_kernel::memory::init(phys_offset) };
-    let mut frame_allocator = unsafe { unaos_kernel::memory::BootInfoFrameAllocator::init(&boot_info.memory_regions) };
-
-    unaos_kernel::allocator::init_heap(&mut mapper, &mut frame_allocator)
-        .expect("Heap initialization failed");
+    // 4. Global Heap Allocation (Phase 3 Memory Translation)
+    // Architecture-specific initialization handles reading the memory map
+    // and setting up the page tables and allocator.
+    unaos_kernel::arch::memory::init(boot_info);
     serial_println!(":: KERNEL HEAP ALLOCATED ::");
 
-    // 4. Motherboard Hardware Interconnects
-    if let Some(xhci_phys_addr) = unaos_kernel::pci::PciScanner::scan() {
-        let xhci_virt_addr = phys_offset + xhci_phys_addr;
-        unaos_kernel::xhci::init(xhci_virt_addr, &mut mapper);
-    }
+    // 5. Motherboard Hardware Interconnects
+    unaos_kernel::arch::pci::init();
 
-    // 5. Framebuffer Init
-    if let Some(framebuffer) = boot_info.framebuffer.as_mut() {
-        let info = framebuffer.info();
-        let buffer = framebuffer.buffer_mut();
+    if framebuffer_addr != 0 {
+        // Safety: We assume the bootloader passed a valid framebuffer physical address
+        let buffer = unsafe {
+            core::slice::from_raw_parts_mut(framebuffer_addr as *mut u8, framebuffer_size)
+        };
         
         unaos_kernel::vug::init(&mut *buffer, info);
         
-        // Safety: buffer is from the static boot_info, so it has a static lifetime.
-        let static_buffer: &'static mut [u8] = unsafe { core::mem::transmute(buffer) };
-        unaos_kernel::writer::WRITER.lock().init(static_buffer, info);
+        unaos_kernel::writer::WRITER.lock().init(buffer, info);
     } else {
         serial_println!(":: WARNING: No framebuffer detected ::");
     }
@@ -97,12 +68,12 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
             }
             _ => {}
         }
-        x86_64::instructions::hlt();
+        unaos_kernel::arch::hlt_loop();
     }
 }
 
 #[panic_handler]
 fn panic(info: &PanicInfo) -> ! {
     serial_println!("{}", info);
-    unaos_kernel::hlt_loop();
+    unaos_kernel::arch::hlt_loop();
 }

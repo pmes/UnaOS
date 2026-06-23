@@ -1,6 +1,6 @@
 [workspace]
 members = [
-    "builder",
+    "builder", "crates/boot-info", "crates/bootloader",
     "crates/compat",
     "crates/kernel",
     "crates/loader",

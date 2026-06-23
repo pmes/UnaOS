@@ -14,12 +14,7 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-use bootloader_api::info::{MemoryRegionKind, MemoryRegions};
-use x86_64::{
-    registers::control::Cr3,
-    structures::paging::{FrameAllocator, OffsetPageTable, PageTable, PhysFrame, Size4KiB},
-    PhysAddr, VirtAddr,
-};
+
 
 /// Initialize a new OffsetPageTable.
 ///

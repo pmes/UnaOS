@@ -16,7 +16,7 @@
 
 use lazy_static::lazy_static;
 use spin::Mutex;
-use bootloader_api::info::{FrameBufferInfo, PixelFormat};
+use unaos_boot_info::{FrameBufferInfo, PixelFormat};
 
 lazy_static! {
     pub static ref WRITER: Mutex<Writer> = Mutex::new(Writer::new());

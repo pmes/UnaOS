@@ -110,13 +110,13 @@ lazy_static! {
 }
 
 pub fn push_event(event: Event) {
-    x86_64::instructions::interrupts::without_interrupts(|| {
+    crate::arch::without_interrupts(|| {
         EVENT_QUEUE.lock().push(event);
     });
 }
 
 fn pop_event() -> Option<Event> {
-    x86_64::instructions::interrupts::without_interrupts(|| EVENT_QUEUE.lock().pop())
+    crate::arch::without_interrupts(|| EVENT_QUEUE.lock().pop())
 }
 
 // --- PAL IMPLEMENTATION ---

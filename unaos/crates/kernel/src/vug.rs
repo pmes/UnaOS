@@ -15,7 +15,7 @@
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 // FIX: Use crate:: instead of unaos_kernel::
-use bootloader_api::info::{FrameBufferInfo, PixelFormat};
+use unaos_boot_info::{FrameBufferInfo, PixelFormat};
 
 use crate::pal::TargetPal;
 use crate::pal::GneissPal;
@@ -31,9 +31,9 @@ pub fn init(framebuffer: &mut [u8], info: FrameBufferInfo) {
     let stride = info.stride;
     let format = info.pixel_format;
 
-    crate::serial_println!(":: VUG Init ::");
-    crate::serial_println!(":: FB Size: {}x{} (stride {}) ::", width, height, stride);
-    crate::serial_println!(":: FB Format: {:?} ::", format);
+    serial_println!(":: VUG Init ::");
+    serial_println!(":: FB Size: {}x{} (stride {}) ::", width, height, stride);
+    serial_println!(":: FB Format: {:?} ::", format);
 
     // Can-Am dark grey: #1E1E1E
     let r_val = 0x1E;
@@ -70,7 +70,7 @@ pub fn init(framebuffer: &mut [u8], info: FrameBufferInfo) {
         }
     }
 
-    crate::serial_println!(":: Framebuffer painted #1E1E1E ::");
+    serial_println!(":: Framebuffer painted #1E1E1E ::");
 }
 
 pub fn draw_vug_stats(pal: &mut TargetPal, tick: u64) {

@@ -16,7 +16,6 @@
 
 use alloc::vec::Vec;
 use alloc::string::String;
-use x86_64::instructions::port::Port;
 use crate::console::Console;
 use crate::vug;
 use crate::pal::TargetPal;
@@ -88,11 +87,9 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
              }
         },
         "shutdown" | "off" => {
-             console.println("Shutting down...");
-             unsafe {
-                 let mut port = Port::<u32>::new(0xf4);
-                 port.write(0x10);
-             }
+             // TODO: Create arch::shutdown()
+             serial_println!("Shutdown requested");
+             crate::hlt_loop();
              crate::hlt_loop();
         },
         "" => {}, // Ignore empty enter

@@ -18,12 +18,7 @@ use core::alloc::{GlobalAlloc, Layout};
 use core::ptr::null_mut;
 use linked_list_allocator::Heap;
 use spin::Mutex;
-use x86_64::{
-    structures::paging::{
-        mapper::MapToError, FrameAllocator, Mapper, Page, PageTableFlags, Size4KiB,
-    },
-    VirtAddr,
-};
+use crate::arch;
 
 pub const HEAP_START: usize = 0x_4444_4444_0000;
 pub const HEAP_SIZE: usize = 100 * 1024; // 100 KiB
@@ -47,7 +42,7 @@ impl<A> Locked<A> {
 unsafe impl GlobalAlloc for Locked<Heap> {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         let mut result = null_mut();
-        x86_64::instructions::interrupts::without_interrupts(|| {
+        arch::without_interrupts(|| {
             let mut heap = self.inner.lock();
             match heap.allocate_first_fit(layout) {
                 Ok(ptr) => result = ptr.as_ptr(),
@@ -58,9 +53,11 @@ unsafe impl GlobalAlloc for Locked<Heap> {
     }
 
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-        x86_64::instructions::interrupts::without_interrupts(|| {
+        arch::without_interrupts(|| {
             let mut heap = self.inner.lock();
-            heap.deallocate(core::ptr::NonNull::new(ptr).unwrap(), layout);
+            unsafe {
+                heap.deallocate(core::ptr::NonNull::new(ptr).unwrap(), layout);
+            }
         });
     }
 }
@@ -68,31 +65,6 @@ unsafe impl GlobalAlloc for Locked<Heap> {
 #[global_allocator]
 static ALLOCATOR: Locked<Heap> = Locked::new(Heap::empty());
 
-pub fn init_heap(
-    mapper: &mut impl Mapper<Size4KiB>,
-    frame_allocator: &mut impl FrameAllocator<Size4KiB>,
-) -> Result<(), MapToError<Size4KiB>> {
-    let page_range = {
-        let heap_start = VirtAddr::new(HEAP_START as u64);
-        let heap_end = heap_start + (HEAP_SIZE as u64) - 1u64;
-        let heap_start_page = Page::containing_address(heap_start);
-        let heap_end_page = Page::containing_address(heap_end);
-        Page::range_inclusive(heap_start_page, heap_end_page)
-    };
-
-    for page in page_range {
-        let frame = frame_allocator
-            .allocate_frame()
-            .ok_or(MapToError::FrameAllocationFailed)?;
-        let flags = PageTableFlags::PRESENT | PageTableFlags::WRITABLE;
-        unsafe {
-            mapper.map_to(page, frame, flags, frame_allocator)?.flush();
-        }
-    }
-
-    unsafe {
-        ALLOCATOR.lock().init(HEAP_START as *mut u8, HEAP_SIZE);
-    }
-
-    Ok(())
+pub unsafe fn init_heap_raw(heap_start: *mut u8, heap_size: usize) {
+    unsafe { ALLOCATOR.lock().init(heap_start, heap_size) };
 }
