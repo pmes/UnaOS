@@ -19,7 +19,7 @@ use alloc::string::String;
 use x86_64::instructions::port::Port;
 use crate::console::Console;
 use crate::vug;
-use unaos_kernel::pal::TargetPal;
+use crate::pal::TargetPal;
 
 pub struct History {
     entries: Vec<String>,
@@ -93,7 +93,7 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
                  let mut port = Port::<u32>::new(0xf4);
                  port.write(0x10);
              }
-             unaos_kernel::hlt_loop();
+             crate::hlt_loop();
         },
         "" => {}, // Ignore empty enter
         _ => {

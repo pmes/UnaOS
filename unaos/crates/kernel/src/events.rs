@@ -16,7 +16,7 @@
 
 use alloc::collections::VecDeque;
 use spin::Mutex;
-use gneiss_pal::Event;
+use crate::pal::Event;
 use crate::pal::RAW_FRAMEBUFFER_PTR;
 
 fn write_dye(offset: isize, color: u32) {

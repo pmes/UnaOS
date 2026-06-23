@@ -18,7 +18,7 @@
 use bootloader_api::info::{FrameBufferInfo, PixelFormat};
 
 use crate::pal::TargetPal;
-use gneiss_pal::GneissPal;
+use crate::pal::GneissPal;
 
 const METER_SEGMENTS: usize = 10;
 const SEG_HEIGHT: u32 = 10;
@@ -101,5 +101,17 @@ pub fn draw_vug_stats(pal: &mut TargetPal, tick: u64) {
     // Draw "VUG" heartbeat
     if (tick / 30) % 2 == 0 {
         pal.draw_rect((pal.width() / 2) as usize - 10, 20, 20, 20, 0xFF0000);
+    }
+}
+
+pub fn run_bebox_mode(pal: &mut TargetPal) {
+    pal.clear_screen(0x111111);
+    pal.draw_text(100, 100, "BeBox Mode Simulated", 0xFFFFFF);
+}
+
+pub fn run_test_pattern(pal: &mut TargetPal) {
+    pal.clear_screen(0x000000);
+    for i in 0..255 {
+        pal.draw_rect(i * 4, 100, 4, 100, (i as u32) << 16 | (i as u32) << 8 | (i as u32));
     }
 }

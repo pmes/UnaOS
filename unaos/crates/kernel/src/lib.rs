@@ -33,6 +33,7 @@ pub mod writer;
 pub mod console;
 pub mod user;
 pub mod vug;
+pub mod shell;
 
 pub mod pci;
 pub mod xhci;
