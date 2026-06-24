@@ -9,7 +9,7 @@ license = "GPL-3.0-or-later"
 lazy_static = { version = "1.5.0", features = ["spin_no_std"] }
 
 # HARDWARE
-spin = "0.12.0"
+spin = "0.12.1"
 volatile = "0.6.1"
 linked_list_allocator = "0.10.6"
 font8x8 = { version = "0.3.1", default-features = false }
