@@ -4,6 +4,7 @@ pub mod gdt;
 pub mod interrupts;
 pub mod apic;
 pub mod acpi;
+pub mod smp;
 pub mod pci;
 pub mod memory;
 

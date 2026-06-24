@@ -48,6 +48,11 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     #[cfg(target_arch = "x86_64")]
     unaos_kernel::arch::acpi::init(rsdp_addr);
 
+    // 4c. SMP: start the application processors (INIT-SIPI-SIPI). Each AP brings up its own
+    // per-CPU GDT/TSS + local APIC and idles; the BSP continues to drive everything below.
+    #[cfg(target_arch = "x86_64")]
+    unaos_kernel::arch::smp::start_aps();
+
     // 5. Motherboard Hardware Interconnects
     unaos_kernel::arch::pci::init(dtb_addr, dtb_size);
 
