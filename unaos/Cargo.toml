@@ -1,11 +1,8 @@
 [workspace]
 members = [
     "builder", "crates/boot-info", "crates/bootloader",
-    "crates/compat",
     "crates/kernel",
-    "crates/loader",
     "crates/net",
-    "crates/userspace",
 ]
 resolver = "2"
 

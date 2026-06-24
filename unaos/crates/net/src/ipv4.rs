@@ -14,6 +14,56 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
+/// Protocol number for ICMP (IPv4 header `protocol` field).
+pub const PROTO_ICMP: u8 = 1;
+
+/// Standard 1's-complement checksum over `data` (even length expected for an IPv4
+/// header). Returns the value to store in the checksum field.
+fn ones_complement_sum(data: &[u8]) -> u16 {
+    let mut sum: u32 = 0;
+    let mut i = 0;
+    while i + 1 < data.len() {
+        sum += u16::from_be_bytes([data[i], data[i + 1]]) as u32;
+        i += 2;
+    }
+    if i < data.len() {
+        sum += (data[i] as u32) << 8; // trailing odd byte in the high position
+    }
+    while (sum >> 16) != 0 {
+        sum = (sum & 0xFFFF) + (sum >> 16);
+    }
+    !(sum as u16)
+}
+
+/// Write a minimal 20-byte IPv4 header into `out` for a packet carrying `payload_len`
+/// bytes of `protocol` from `src` to `dst`. Sets TTL=64, DF, and the header checksum.
+/// The payload is expected to follow at `out[20..]`. Returns 20, or `None` if too small.
+pub fn write_header(
+    out: &mut [u8],
+    src: [u8; 4],
+    dst: [u8; 4],
+    protocol: u8,
+    payload_len: usize,
+) -> Option<usize> {
+    if out.len() < 20 {
+        return None;
+    }
+    let total = (20 + payload_len) as u16;
+    out[0] = 0x45; // version 4, IHL 5 (20 bytes)
+    out[1] = 0; // DSCP/ECN
+    out[2..4].copy_from_slice(&total.to_be_bytes());
+    out[4..6].copy_from_slice(&0u16.to_be_bytes()); // identification
+    out[6..8].copy_from_slice(&0x4000u16.to_be_bytes()); // flags=DF, fragment offset 0
+    out[8] = 64; // TTL
+    out[9] = protocol;
+    out[10..12].copy_from_slice(&0u16.to_be_bytes()); // checksum (zero before computing)
+    out[12..16].copy_from_slice(&src);
+    out[16..20].copy_from_slice(&dst);
+    let csum = ones_complement_sum(&out[0..20]);
+    out[10..12].copy_from_slice(&csum.to_be_bytes());
+    Some(20)
+}
+
 /// A zero-copy parser for an IPv4 header.
 pub struct Ipv4Header<'a> {
     buffer: &'a [u8],
@@ -34,7 +84,14 @@ impl<'a> Ipv4Header<'a> {
             return None;
         }
 
+        // RFC 791: IHL counts 32-bit words and must be >= 5 (a 20-byte minimum
+        // header). Reject sub-minimum values up front — otherwise header_length
+        // would be < 20 and verify_checksum()/payload() would read the wrong
+        // byte ranges (under-summing the checksum, mislabeling header as payload).
         let ihl = buffer[0] & 0x0F;
+        if ihl < 5 {
+            return None;
+        }
         let header_length = (ihl as usize) * 4;
 
         // Ensure we have enough bytes for the reported header length

@@ -54,6 +54,7 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
         "help" => {
             console.println("COMMANDS: ver, help, clear, echo, panic, gneiss");
             console.println("STORAGE:  diskinfo, read <lba>, write <lba> <byte>");
+            console.println("NETWORK:  netinfo");
         },
         "clear" => {
             // Clear both the screen and the console buffer?
@@ -118,6 +119,22 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
                     }
                 }
                 _ => console.println("usage: write <lba> <byte>"),
+            }
+        },
+        "netinfo" => {
+            match crate::drivers::e1000::info() {
+                Some(n) => {
+                    console.println(&alloc::format!(
+                        "NIC: MAC {}  link {}",
+                        crate::drivers::e1000::fmt_mac(&n.mac),
+                        if n.link_up { "UP" } else { "DOWN" }
+                    ));
+                    console.println(&alloc::format!(
+                        "BAR0 {:#x}  RX frames: {}  TX frames: {}",
+                        n.mmio_base, n.rx_count, n.tx_count
+                    ));
+                }
+                None => console.println("No network device ready."),
             }
         },
         "vug" => {

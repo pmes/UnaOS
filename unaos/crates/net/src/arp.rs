@@ -120,6 +120,16 @@ impl ArpStateMachine {
         Self { our_ip, our_mac }
     }
 
+    /// Our configured MAC address.
+    pub fn our_mac(&self) -> [u8; 6] {
+        self.our_mac
+    }
+
+    /// Our configured IPv4 address.
+    pub fn our_ip(&self) -> [u8; 4] {
+        self.our_ip
+    }
+
     /// Processes an incoming ARP packet and optionally generates an ARP reply payload (for the ethernet frame).
     /// Returns `Some(reply_bytes)` if a reply is needed, where `reply_bytes` contains the generated ARP payload and the destination MAC.
     /// The generated payload requires an Ethernet frame wrapper.
@@ -165,4 +175,28 @@ impl ArpStateMachine {
 
         None
     }
+}
+
+/// Build a 28-byte ARP request ("who-has `target_ip` tell `our_ip`") into `buf`.
+/// Returns the number of bytes written (28), or `None` if `buf` is too small.
+/// Used to probe/announce on the link (the Ethernet wrapper carries a broadcast dst).
+pub fn build_request(
+    buf: &mut [u8],
+    our_mac: [u8; 6],
+    our_ip: [u8; 4],
+    target_ip: [u8; 4],
+) -> Option<usize> {
+    if buf.len() < 28 {
+        return None;
+    }
+    buf[0..2].copy_from_slice(&1u16.to_be_bytes()); // Hardware Type: Ethernet
+    buf[2..4].copy_from_slice(&0x0800u16.to_be_bytes()); // Protocol Type: IPv4
+    buf[4] = 6; // Hardware address length
+    buf[5] = 4; // Protocol address length
+    buf[6..8].copy_from_slice(&1u16.to_be_bytes()); // Operation: Request
+    buf[8..14].copy_from_slice(&our_mac); // Sender hardware address
+    buf[14..18].copy_from_slice(&our_ip); // Sender protocol address
+    buf[18..24].copy_from_slice(&[0u8; 6]); // Target hardware address (unknown)
+    buf[24..28].copy_from_slice(&target_ip); // Target protocol address
+    Some(28)
 }

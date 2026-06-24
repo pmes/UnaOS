@@ -19,7 +19,7 @@ name = "bootloader"
 version = "0.1.0"
 dependencies = [
  "log",
- "uefi 0.38.0",
+ "uefi",
  "unaos-boot-info",
  "xmas-elf",
 ]
@@ -96,31 +96,11 @@ dependencies = [
 
 [[package]]
 name = "ptr_meta"
-version = "0.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bcada80daa06c42ed5f48c9a043865edea5dc44cbf9ac009fda3b89526e28607"
-dependencies = [
- "ptr_meta_derive 0.2.0",
-]
-
-[[package]]
-name = "ptr_meta"
 version = "0.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0b9a0cf95a1196af61d4f1cbdab967179516d9a4a4312af1f31948f8f6224a79"
 dependencies = [
- "ptr_meta_derive 0.3.1",
-]
-
-[[package]]
-name = "ptr_meta_derive"
-version = "0.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bca9224df2e20e7c5548aeb5f110a0f3b77ef05f8585139b7148b59056168ed2"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn 1.0.109",
+ "ptr_meta_derive",
 ]
 
 [[package]]
@@ -131,7 +111,7 @@ checksum = "7347867d0a7e1208d93b46767be83e2b8f978c3dad35f775ac8d8847551d6fe1"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn 2.0.118",
+ "syn",
 ]
 
 [[package]]
@@ -181,17 +161,6 @@ dependencies = [
 
 [[package]]
 name = "syn"
-version = "1.0.109"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "72b64191b275b66ffe2469e8af2c1cfe3bafa67b529ead792a6d0160888b4237"
-dependencies = [
- "proc-macro2",
- "quote",
- "unicode-ident",
-]
-
-[[package]]
-name = "syn"
 version = "2.0.118"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1b9ae57f904213ebb649ce6895b8a66c66f0203b9319718f69a5612a065b1422"
@@ -221,22 +190,6 @@ dependencies = [
 
 [[package]]
 name = "uefi"
-version = "0.28.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a9c0a56dc9fed2589aad6ddca11c2584968fc21f227b5d7083bb8961d26a69fa"
-dependencies = [
- "bitflags",
- "cfg-if",
- "log",
- "ptr_meta 0.2.0",
- "ucs2",
- "uefi-macros 0.13.0",
- "uefi-raw 0.5.2",
- "uguid",
-]
-
-[[package]]
-name = "uefi"
 version = "0.38.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d8f2e1b4a439d82899da4dc0ee8ac742db07a9ff493bc4f31d345c24e12e17e9"
@@ -244,22 +197,11 @@ dependencies = [
  "bitflags",
  "cfg-if",
  "log",
- "ptr_meta 0.3.1",
+ "ptr_meta",
  "ucs2",
- "uefi-macros 0.19.0",
- "uefi-raw 0.15.0",
+ "uefi-macros",
+ "uefi-raw",
  "uguid",
-]
-
-[[package]]
-name = "uefi-macros"
-version = "0.13.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "26a7b1c2c808c3db854a54d5215e3f7e7aaf5dcfbce095598cba6af29895695d"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn 2.0.118",
 ]
 
 [[package]]
@@ -270,18 +212,7 @@ checksum = "4687412b5ac74d245d5bfb1733ede50c31be19bf8a4b6a967a29b451bab49e67"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn 2.0.118",
-]
-
-[[package]]
-name = "uefi-raw"
-version = "0.5.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "efa8716f52e8cab8bcedfd5052388a0f263b69fe5cc2561548dc6a530678333c"
-dependencies = [
- "bitflags",
- "ptr_meta 0.2.0",
- "uguid",
+ "syn",
 ]
 
 [[package]]
@@ -292,15 +223,6 @@ checksum = "8868c2fb03f31e55ccf9b47f72e17097bb88c45306cb82f5a2258935520c72d6"
 dependencies = [
  "bitflags",
  "uguid",
-]
-
-[[package]]
-name = "uefi-services"
-version = "0.25.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "62d502e54e05da57380e0b6f3cb1baa89860e4ae314afb5a17080ed14379b6e2"
-dependencies = [
- "uefi 0.28.0",
 ]
 
 [[package]]
@@ -318,10 +240,6 @@ name = "unaos-builder"
 version = "0.1.0"
 
 [[package]]
-name = "unaos-compat"
-version = "0.1.0"
-
-[[package]]
 name = "unaos-kernel"
 version = "0.1.0"
 dependencies = [
@@ -330,24 +248,13 @@ dependencies = [
  "font8x8",
  "lazy_static",
  "linked_list_allocator",
+ "net",
  "spin 0.12.1",
  "uart_16550",
  "unaos-boot-info",
  "volatile 0.6.1",
  "x86_64",
 ]
-
-[[package]]
-name = "unaos-loader"
-version = "0.1.0"
-dependencies = [
- "uefi 0.28.0",
- "uefi-services",
-]
-
-[[package]]
-name = "unaos-userspace"
-version = "0.1.0"
 
 [[package]]
 name = "unicode-ident"

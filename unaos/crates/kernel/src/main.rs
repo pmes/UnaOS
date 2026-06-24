@@ -73,6 +73,10 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
             xhci.service_storage();
         }
 
+        // Drain any frames the NIC has received into the network stack (no-op when
+        // no NIC is present, e.g. on aarch64).
+        unaos_kernel::drivers::e1000::service_net();
+
         #[cfg(target_arch = "aarch64")]
         if let Some(byte) = unaos_kernel::arch::poll_input() {
             unaos_kernel::pal::push_event(unaos_kernel::pal::Event::Key(byte));
