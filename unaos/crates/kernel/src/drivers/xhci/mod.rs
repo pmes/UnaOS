@@ -160,6 +160,76 @@ fn wait_until<F: Fn() -> bool>(pred: F, max_spins: u64, what: &str) -> Result<()
     Ok(())
 }
 
+/// xHCI BIOS-to-OS handoff (USB Legacy Support, xHCI spec 7.1.1).
+///
+/// On real x86 hardware the firmware/SMM owns the controller at boot (for legacy USB keyboard
+/// emulation) and will keep generating SMIs and fighting the OS for it unless we explicitly
+/// claim ownership. We walk the xHCI Extended Capability list for the USB Legacy Support cap
+/// (ID 1), set the "HC OS Owned" semaphore, wait for the firmware to drop "HC BIOS Owned", and
+/// disable the firmware's legacy SMIs. QEMU does not expose this capability, so this is a clean
+/// no-op there — but it is mandatory on metal. Mirrors Linux's `quirk_usb_handoff_xhci`.
+fn bios_handoff(base_address: u64) {
+    const CAP_ID_LEGACY: u8 = 1;
+    const HC_BIOS_OWNED: u32 = 1 << 16;
+    const HC_OS_OWNED: u32 = 1 << 24;
+    // USBLEGCTLSTS: SMI *enable* bits to clear, and RW1C SMI *status* bits to acknowledge.
+    const LEGCTL_DISABLE_SMI: u32 = (0x7 << 1) | (0xff << 5) | (0x7 << 17);
+    const LEGCTL_SMI_EVENTS: u32 = 0x7 << 29;
+
+    unsafe {
+        // HCCPARAMS1 (CapBase + 0x10): bits 31:16 = xECP, the first extended cap in dword units.
+        let hccparams1 = core::ptr::read_volatile((base_address + 0x10) as *const u32);
+        let xecp = (hccparams1 >> 16) & 0xFFFF;
+        if xecp == 0 {
+            return; // no extended capabilities (e.g. QEMU)
+        }
+
+        let mut cap = base_address + (xecp as u64) * 4;
+        // Bound the walk so a malformed list can't loop forever.
+        for _ in 0..256 {
+            let val = core::ptr::read_volatile(cap as *const u32);
+            let id = (val & 0xFF) as u8;
+            let next = ((val >> 8) & 0xFF) as u8;
+
+            if id == CAP_ID_LEGACY {
+                let usblegsup = cap;
+                let usblegctlsts = cap + 4;
+                let legsup = core::ptr::read_volatile(usblegsup as *const u32);
+                if legsup & HC_BIOS_OWNED != 0 {
+                    serial_println!("xHCI: claiming controller from BIOS (USBLEGSUP)...");
+                }
+                // Request OS ownership, then wait (bounded) for the BIOS to release it.
+                core::ptr::write_volatile(usblegsup as *mut u32, legsup | HC_OS_OWNED);
+                let released = wait_until(
+                    || unsafe { core::ptr::read_volatile(usblegsup as *const u32) } & HC_BIOS_OWNED == 0,
+                    HW_WAIT_SPINS,
+                    "BIOS to release xHCI (USBLEGSUP.BIOS_OWNED=0)",
+                )
+                .is_ok();
+                if !released {
+                    // Firmware stuck — force ownership: keep OS-owned, clear BIOS-owned.
+                    let v = core::ptr::read_volatile(usblegsup as *const u32);
+                    core::ptr::write_volatile(usblegsup as *mut u32, (v | HC_OS_OWNED) & !HC_BIOS_OWNED);
+                    serial_println!("xHCI: BIOS did not release ownership; forced OS ownership.");
+                }
+                // Disable the firmware's legacy SMIs and acknowledge any pending SMI status.
+                let legctl = core::ptr::read_volatile(usblegctlsts as *const u32);
+                core::ptr::write_volatile(
+                    usblegctlsts as *mut u32,
+                    (legctl & !LEGCTL_DISABLE_SMI) | LEGCTL_SMI_EVENTS,
+                );
+                serial_println!("xHCI: BIOS->OS handoff complete.");
+                return;
+            }
+
+            if next == 0 {
+                return; // end of list; no legacy cap (nothing to do)
+            }
+            cap += (next as u64) * 4;
+        }
+    }
+}
+
 pub fn init(base_address: u64) {
     serial_println!("xHCI: Virtual Handoff. Base Address: {:#x}", base_address);
 
@@ -169,6 +239,9 @@ pub fn init(base_address: u64) {
 
     let op_base = base_address + cap_length as u64;
     serial_println!("xHCI: CapLength: {}, Operational Base: {:#x}", cap_length, op_base);
+
+    // Claim the controller from the firmware (real hardware) before we touch it.
+    bios_handoff(base_address);
 
     let usbcmd_ptr = op_base as *mut u32;
     let usbsts_ptr = (op_base + 0x04) as *const u32;
