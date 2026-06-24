@@ -94,6 +94,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         if let Some(xhci) = &mut *unaos_kernel::drivers::xhci::XHCI_CONTROLLER.lock() {
             xhci.poll_events();
             xhci.service_storage();
+            xhci.service_hubs();
         }
 
         #[cfg(target_arch = "aarch64")]

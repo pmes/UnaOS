@@ -377,6 +377,18 @@ struct BotPending {
     completion_code: u8,
 }
 
+/// In-flight SYNCHRONOUS EP0 control transfer, used during hub bring-up (a main-loop, non-event
+/// context). Like `BotPending` but for EP0: the awaited Status TRB is matched by its physical
+/// address so the sync pump claims exactly its own completion before the async descriptor FSM
+/// runs. Inert (None) during normal root-port enumeration, so that path is untouched.
+#[derive(Clone, Copy)]
+struct Ep0Pending {
+    slot_id: u8,
+    wait_trb_phys: u64,
+    done: bool,
+    completion_code: u8,
+}
+
 pub struct DeviceSlot {
     pub active: bool,
     pub port_id: u8,
@@ -472,6 +484,11 @@ pub struct XhciController {
     pub bot_tag: u32,
     /// In-flight BOT transaction, populated by the event handler.
     bot_pending: Option<BotPending>,
+
+    /// In-flight synchronous EP0 control transfer (hub bring-up). See `Ep0Pending`.
+    ep0_pending: Option<Ep0Pending>,
+    /// Slots of hubs detected during enumeration, awaiting (main-loop) bring-up.
+    hubs_pending: Vec<u8>,
 }
 
 unsafe impl Send for XhciController {}
@@ -518,6 +535,8 @@ impl XhciController {
             storage_pending_bringup: false,
             bot_tag: 1,
             bot_pending: None,
+            ep0_pending: None,
+            hubs_pending: Vec::new(),
         }
     }
 
@@ -751,6 +770,25 @@ impl XhciController {
                         xdbg!("xHCI DEBUG: [Transfer Event] Slot={}, EP={}, Code={}, Len={}",
                             slot_id, endpoint_id, completion_code, transfer_len);
 
+                        // Synchronous EP0 control transfer (hub bring-up) claims its OWN Status-TRB
+                        // completion here, before the async descriptor FSM below — matched by TRB
+                        // address (or any error), so it never disturbs other slots' enumeration.
+                        if endpoint_id == 1 && slot_id > 0 {
+                            if let Some(p) = self.ep0_pending {
+                                if p.slot_id == slot_id as u8 {
+                                    let is_match = param == p.wait_trb_phys;
+                                    let is_error = completion_code != 1 && completion_code != 13;
+                                    if is_match || is_error {
+                                        if let Some(ep) = self.ep0_pending.as_mut() {
+                                            ep.completion_code = completion_code as u8;
+                                            ep.done = true;
+                                        }
+                                    }
+                                    return; // consumed by the sync EP0 pump
+                                }
+                            }
+                        }
+
                         // UNA-19-REVEAL: If success or short packet, check buffer
                         if completion_code == 1 || completion_code == 13 {
                             // UNA-21-DEBUG: Force Transition based on Endpoint ID
@@ -797,6 +835,12 @@ impl XhciController {
                                         // Route through the config-descriptor parser so the
                                         // real bulk endpoint addresses + MPS drive configure_endpoints.
                                         self.request_configuration_descriptor(slot_id as u8);
+                                    } else if class_code == 0x09 {
+                                        // USB Hub. Defer the (multi-step, synchronous) hub
+                                        // bring-up to the main loop and continue root enumeration.
+                                        serial_println!("xHCI: >>> HUB DETECTED (slot {}) <<<", slot_id);
+                                        self.hubs_pending.push(slot_id as u8);
+                                        self.start_next_port();
                                     } else if class_code == 0x00 {
                                         // Class 0 means "Look at Interface Descriptor" (Common for Flash Drives too)
                                         serial_println!("xHCI: Composite Device. Requesting Configuration Descriptor...");
@@ -1837,6 +1881,131 @@ impl XhciController {
                 }
             }
             Err(e) => serial_println!("xHCI: READ(10) LBA0 failed: {:?}", e),
+        }
+    }
+
+    /// Synchronous EP0 control transfer: queue Setup/[Data]/Status on the slot's EP0 ring, ring
+    /// the doorbell, and pump the event ring until the Status TRB retires (matched by address).
+    /// Used for hub-class requests during hub bring-up (a safe, main-loop, non-event context —
+    /// like the synchronous BOT pump). Returns the completion code (1 = success).
+    fn sync_control(&mut self, slot_id: u8, bm_req: u8, b_req: u8, w_value: u16, w_index: u16,
+                    w_length: u16, data_phys: u64, dir_in: bool) -> Result<u8, ()> {
+        let setup: u64 = (bm_req as u64)
+            | ((b_req as u64) << 8)
+            | ((w_value as u64) << 16)
+            | ((w_index as u64) << 32)
+            | ((w_length as u64) << 48);
+
+        // Setup stage. TRT: 0 = no data, 2 = OUT data, 3 = IN data.
+        let trt: u32 = if w_length == 0 { 0 } else if dir_in { 3 } else { 2 };
+        self.push_ep0(slot_id, Trb { parameter: setup, status: 8, control: (2 << 10) | (1 << 6) | (trt << 16) });
+
+        // Data stage (if any).
+        if w_length > 0 {
+            let dir: u32 = if dir_in { 1 } else { 0 };
+            self.push_ep0(slot_id, Trb { parameter: data_phys, status: w_length as u32, control: (3 << 10) | (dir << 16) });
+        }
+
+        // Status stage (IOC). Direction is opposite the data stage; with no data it is IN.
+        let status_dir: u32 = if w_length == 0 { 1 } else if dir_in { 0 } else { 1 };
+        let status_phys = {
+            let ring = self.slots[slot_id as usize].ep0_ring.as_mut().ok_or(())?;
+            let base = ring.get_ptr();
+            let idx = ring.push(Trb { parameter: 0, status: 0, control: (4 << 10) | (1 << 5) | (status_dir << 16) }).unwrap_or(0);
+            base + (idx as u64) * 16
+        };
+
+        self.ep0_pending = Some(Ep0Pending { slot_id, wait_trb_phys: status_phys, done: false, completion_code: 0 });
+        self.ring_doorbell(slot_id, 1);
+
+        let pump = self.pump_until_ep0_done(2000);
+        let pending = self.ep0_pending.take();
+        pump?;
+        Ok(pending.ok_or(())?.completion_code)
+    }
+
+    /// Pump the event ring until the in-flight synchronous EP0 transfer reports done (or the
+    /// iteration budget is exhausted). Unrelated events are dispatched normally during the wait.
+    fn pump_until_ep0_done(&mut self, max_iters: u64) -> Result<(), ()> {
+        let mut iters: u64 = 0;
+        loop {
+            match &self.ep0_pending {
+                Some(p) if p.done => return Ok(()),
+                None => return Ok(()),
+                _ => {}
+            }
+            if self.drain_event_ring_once() {
+                continue;
+            }
+            crate::hlt(); // yield to QEMU so it can DMA the completion into the event ring
+            iters += 1;
+            if iters >= max_iters {
+                serial_println!("xHCI: EP0 sync pump TIMEOUT after {} yields", iters);
+                return Err(());
+            }
+        }
+    }
+
+    /// Main-loop hook: bring up any hubs discovered during enumeration. Synchronous (runs in the
+    /// safe polled context, like storage bring-up): SET_CONFIGURATION, read the hub descriptor for
+    /// the downstream port count, power every port, then scan port status to find attached
+    /// devices. (Downstream device enumeration is the next step.) Additive: only runs when a hub
+    /// was detected; the root-port path is untouched.
+    pub fn service_hubs(&mut self) {
+        while let Some(hub_slot) = self.hubs_pending.pop() {
+            self.bring_up_hub(hub_slot);
+        }
+    }
+
+    fn bring_up_hub(&mut self, hub_slot: u8) {
+        if hub_slot == 0 || self.slots[hub_slot as usize].ep0_ring.is_none() {
+            return;
+        }
+        serial_println!("xHCI: === HUB BRING-UP (slot {}) ===", hub_slot);
+        let buf = self.slots[hub_slot as usize].descriptor_buffer as u64;
+
+        // 1. SET_CONFIGURATION(1) so the hub's ports become controllable.
+        //    bmRequestType 0x00 (H2D, standard, device), bRequest 9 (SET_CONFIGURATION).
+        match self.sync_control(hub_slot, 0x00, 0x09, 1, 0, 0, 0, false) {
+            Ok(1) => {}
+            Ok(c) => serial_println!("xHCI: HUB set-config returned code {}", c),
+            Err(_) => { serial_println!("xHCI: HUB set-config timed out"); return; }
+        }
+
+        // 2. GET_DESCRIPTOR (HUB, type 0x29) -> downstream port count + characteristics.
+        //    bmRequestType 0xA0 (D2H, class, device), wValue = type<<8.
+        if self.sync_control(hub_slot, 0xA0, 0x06, (0x29u16) << 8, 0, 64, buf, true).is_err() {
+            serial_println!("xHCI: HUB descriptor request timed out");
+            return;
+        }
+        let (nbr_ports, characteristics) = unsafe {
+            let p = buf as *const u8;
+            (*p.add(2), (*p.add(3) as u16) | ((*p.add(4) as u16) << 8))
+        };
+        serial_println!("xHCI: HUB slot {} has {} downstream ports (characteristics {:#06x})",
+            hub_slot, nbr_ports, characteristics);
+
+        // 3. Power on every downstream port (SET_FEATURE PORT_POWER = feature 8).
+        for port in 1..=nbr_ports {
+            let _ = self.sync_control(hub_slot, 0x23, 0x03, 8, port as u16, 0, 0, false);
+        }
+        // Let the ports settle (bPwrOn2PwrGood); pump any events meanwhile.
+        for _ in 0..200 { if !self.drain_event_ring_once() { crate::hlt(); } }
+
+        // 4. Read each port's status (GET_STATUS, recipient Other) and report attached devices.
+        for port in 1..=nbr_ports {
+            if self.sync_control(hub_slot, 0xA3, 0x00, 0, port as u16, 4, buf, true).is_err() {
+                continue;
+            }
+            let pstatus = unsafe {
+                let p = buf as *const u8;
+                (*p.add(0) as u32) | ((*p.add(1) as u32) << 8)
+                    | ((*p.add(2) as u32) << 16) | ((*p.add(3) as u32) << 24)
+            };
+            if pstatus & 1 != 0 {
+                serial_println!("xHCI: HUB slot {} port {}: device connected (status {:#x})",
+                    hub_slot, port, pstatus);
+            }
         }
     }
 
