@@ -55,6 +55,29 @@ def icmp_echo(ident, seq, data):
     return bytes(msg)
 
 
+def udp_checksum(src_ip, dst_ip, seg):
+    # IPv4 pseudo-header (src, dst, proto=17, udp len) + the UDP segment.
+    s = 0
+    for ip in (src_ip, dst_ip):
+        s += (ip[0] << 8) | ip[1]
+        s += (ip[2] << 8) | ip[3]
+    s += 17 + len(seg)
+    for i in range(0, len(seg) - 1, 2):
+        s += (seg[i] << 8) | seg[i + 1]
+    if len(seg) % 2:
+        s += seg[-1] << 8
+    while s >> 16:
+        s = (s & 0xFFFF) + (s >> 16)
+    return (~s) & 0xFFFF
+
+
+def udp(sport, dport, src_ip, dst_ip, payload):
+    seg = bytearray(struct.pack(">HHHH", sport, dport, 8 + len(payload), 0) + payload)
+    c = udp_checksum(src_ip, dst_ip, seg) or 0xFFFF
+    seg[6:8] = struct.pack(">H", c)
+    return bytes(seg)
+
+
 def send_frame(s, frame):
     s.sendall(struct.pack(">I", len(frame)) + frame)
 
@@ -125,6 +148,7 @@ def main():
     ident, seq, data = 0x1234, 1, b"unaos-ping-test!"
     send_frame(s, eth(guest_mac, MY_MAC, 0x0800, ipv4(MY_IP, GUEST_IP, 1, icmp_echo(ident, seq, data))))
     print("-> ICMP echo request to 10.0.2.15")
+    icmp_ok = False
     deadline = time.time() + 8
     while time.time() < deadline:
         try:
@@ -151,11 +175,49 @@ def main():
             if match and ip_ck_ok and icmp_ck_ok:
                 print("<- ICMP echo reply id=0x%04x seq=%d data=%r  ip_cksum=OK icmp_cksum=OK   [ICMP ECHO OK]"
                       % (rident, rseq, rdata))
-                print("ALL CHECKS PASSED")
-                return 0
+                icmp_ok = True
+                break
             print("<- ICMP echo reply: id/seq/data match=%s ip_cksum_ok=%s icmp_cksum_ok=%s"
                   % (match, ip_ck_ok, icmp_ck_ok))
-    print("FAIL: no valid ICMP echo reply from guest")
+    if not icmp_ok:
+        print("FAIL: no valid ICMP echo reply from guest")
+        return 1
+
+    # --- UDP echo to 10.0.2.15:9999 (tests the Phase 4 UDP echo responder) ---
+    sport, dport, udata = 4321, 9999, b"unaos-udp-echo!"
+    send_frame(s, eth(guest_mac, MY_MAC, 0x0800,
+                      ipv4(MY_IP, GUEST_IP, 17, udp(sport, dport, MY_IP, GUEST_IP, udata))))
+    print("-> UDP datagram %d->%d to 10.0.2.15 data=%r" % (sport, dport, udata))
+    deadline = time.time() + 8
+    while time.time() < deadline:
+        try:
+            f = recv_frame(s)
+        except socket.timeout:
+            break
+        if not f or len(f) < 42:
+            continue
+        if struct.unpack(">H", f[12:14])[0] != 0x0800 or (f[14] >> 4) != 4 or f[23] != 17:
+            continue
+        ihl = (f[14] & 0x0F) * 4
+        total = struct.unpack(">H", f[16:18])[0]
+        src_ip, dst_ip = f[26:30], f[30:34]
+        ip_ck_ok = cksum(f[14:14 + ihl]) == 0
+        seg = f[14 + ihl:14 + total]  # exact UDP segment (exclude L2 padding)
+        if len(seg) < 8:
+            continue
+        rsport = struct.unpack(">H", seg[0:2])[0]
+        rdport = struct.unpack(">H", seg[2:4])[0]
+        rpayload = seg[8:]
+        udp_ck_ok = udp_checksum(src_ip, dst_ip, seg) == 0
+        # Echo swaps ports: reply src=our dst port, reply dst=our src port.
+        if rsport == dport and rdport == sport and rpayload == udata and ip_ck_ok and udp_ck_ok:
+            print("<- UDP echo %d->%d data=%r  ip_cksum=OK udp_cksum=OK   [UDP ECHO OK]"
+                  % (rsport, rdport, rpayload))
+            print("ALL CHECKS PASSED")
+            return 0
+        print("<- UDP reply: ports %d->%d data_match=%s ip_ck=%s udp_ck=%s"
+              % (rsport, rdport, rpayload == udata, ip_ck_ok, udp_ck_ok))
+    print("FAIL: no valid UDP echo reply from guest")
     return 1
 
 

@@ -21,6 +21,7 @@ pub mod ethernet;
 pub mod icmp;
 pub mod interface;
 pub mod ipv4;
+pub mod udp;
 
 use arp::ArpStateMachine;
 use ethernet::{EtherType, EthernetFrame};
@@ -56,19 +57,37 @@ pub fn ingress(buffer: &[u8], arp_state: &ArpStateMachine, tx_buf: &mut [u8]) ->
             if !ip.verify_checksum() || ip.destination_ip() != arp_state.our_ip() {
                 return None;
             }
-            if ip.protocol() != ipv4::PROTO_ICMP {
-                return None; // UDP/TCP dispatch arrives in later phases.
-            }
 
-            // Reply to ICMP echo requests (ping). Build the response bottom-up directly
-            // into tx_buf: Ethernet[0..14] | IPv4[14..34] | ICMP[34..].
-            let icmp_len = icmp::write_echo_reply(tx_buf.get_mut(34..)?, ip.payload())?;
+            // Build the L4 reply into tx_buf[34..], then wrap it bottom-up:
+            // Ethernet[0..14] | IPv4[14..34] | L4[34..]. The (protocol, length) pair
+            // drives the common IPv4 + Ethernet framing below.
+            let (proto, l4_len) = match ip.protocol() {
+                // ICMP echo request -> echo reply (ping).
+                ipv4::PROTO_ICMP => (
+                    ipv4::PROTO_ICMP,
+                    icmp::write_echo_reply(tx_buf.get_mut(34..)?, ip.payload())?,
+                ),
+                // UDP -> echo the datagram back with the ports swapped.
+                udp::PROTO_UDP => {
+                    let dg = udp::UdpDatagram::new(ip.payload())?;
+                    let n = udp::write_datagram(
+                        tx_buf.get_mut(34..)?,
+                        dg.dest_port(),
+                        dg.source_port(),
+                        arp_state.our_ip(),
+                        ip.source_ip(),
+                        dg.payload(),
+                    )?;
+                    (udp::PROTO_UDP, n)
+                }
+                _ => return None, // TCP and others arrive in later phases.
+            };
             ipv4::write_header(
                 tx_buf.get_mut(14..34)?,
                 arp_state.our_ip(),
                 ip.source_ip(),
-                ipv4::PROTO_ICMP,
-                icmp_len,
+                proto,
+                l4_len,
             )?;
             ethernet::write_header(
                 tx_buf.get_mut(0..14)?,
@@ -76,7 +95,7 @@ pub fn ingress(buffer: &[u8], arp_state: &ArpStateMachine, tx_buf: &mut [u8]) ->
                 arp_state.our_mac(),
                 EtherType::Ipv4.as_u16(),
             )?;
-            Some(14 + 20 + icmp_len)
+            Some(14 + 20 + l4_len)
         }
         _ => None, // Drop unsupported protocols.
     }
