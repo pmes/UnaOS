@@ -29,8 +29,5 @@
     "kcfi",
     "kernel-address"
   ],
-  "target-pointer-width": 64,
-  "dynamic-linking": true,
-  "executables": true,
-  "relocation-model": "pie"
+  "target-pointer-width": 64
 }

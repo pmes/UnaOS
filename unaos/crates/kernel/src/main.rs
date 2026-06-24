@@ -10,7 +10,18 @@ use unaos_kernel::serial_println;
 use unaos_boot_info::BootInfo;
 
 #[unsafe(no_mangle)]
+#[cfg(target_arch = "x86_64")]
+pub extern "sysv64" fn _start(boot_info: &'static mut BootInfo) -> ! {
+    kernel_main(boot_info)
+}
+
+#[unsafe(no_mangle)]
+#[cfg(target_arch = "aarch64")]
 pub extern "C" fn _start(boot_info: &'static mut BootInfo) -> ! {
+    kernel_main(boot_info)
+}
+
+fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     // 1. Core Hardware Init (GDT, IDT, PICS for x86_64, GIC for aarch64)
     unaos_kernel::init();
 
@@ -20,14 +31,16 @@ pub extern "C" fn _start(boot_info: &'static mut BootInfo) -> ! {
     let framebuffer_size = boot_info.framebuffer_size;
     let info = boot_info.framebuffer_info;
 
+    // Extract DTB info before memory init consumes boot_info
+    let dtb_addr = boot_info.dtb_addr;
+    let dtb_size = boot_info.dtb_size;
+
     // 4. Global Heap Allocation (Phase 3 Memory Translation)
-    // Architecture-specific initialization handles reading the memory map
-    // and setting up the page tables and allocator.
     unaos_kernel::arch::memory::init(boot_info);
     serial_println!(":: KERNEL HEAP ALLOCATED ::");
 
     // 5. Motherboard Hardware Interconnects
-    unaos_kernel::arch::pci::init();
+    unaos_kernel::arch::pci::init(dtb_addr, dtb_size);
 
     if framebuffer_addr != 0 {
         // Safety: We assume the bootloader passed a valid framebuffer physical address
@@ -48,8 +61,21 @@ pub extern "C" fn _start(boot_info: &'static mut BootInfo) -> ! {
     
     console.draw(&mut pal);
 
+    use unaos_kernel::pal::GneissPal;
+    let mut mouse_px: i32 = (pal.width() / 2) as i32;
+    let mut mouse_py: i32 = (pal.height() / 2) as i32;
+
     loop {
-        use unaos_kernel::pal::GneissPal;
+        // Poll xHCI Controller
+        if let Some(xhci) = &mut *unaos_kernel::drivers::xhci::XHCI_CONTROLLER.lock() {
+            xhci.poll_events();
+        }
+
+        #[cfg(target_arch = "aarch64")]
+        if let Some(byte) = unaos_kernel::arch::poll_input() {
+            unaos_kernel::pal::push_event(unaos_kernel::pal::Event::Key(byte));
+        }
+
         let event = pal.poll_event();
         match event {
             unaos_kernel::pal::Event::Key(c) => {
@@ -66,9 +92,44 @@ pub extern "C" fn _start(boot_info: &'static mut BootInfo) -> ! {
                     console.draw(&mut pal);
                 }
             }
-            _ => {}
+            unaos_kernel::pal::Event::Mouse { x, y } => {
+                // Erase old cursor (draw background color over it)
+                pal.draw_rect(mouse_px as usize, mouse_py as usize, 10, 10, 0x1E1E1E);
+
+                // Update position with deltas
+                mouse_px += x;
+                mouse_py += y;
+
+                // Clamp to screen bounds
+                if mouse_px < 0 { mouse_px = 0; }
+                if mouse_py < 0 { mouse_py = 0; }
+                if mouse_px as u32 >= pal.width() { mouse_px = pal.width() as i32 - 10; }
+                if mouse_py as u32 >= pal.height() { mouse_py = pal.height() as i32 - 10; }
+
+                // Draw new cursor (a bright red 10x10 square)
+                pal.draw_rect(mouse_px as usize, mouse_py as usize, 10, 10, 0xFF0000);
+            }
+            unaos_kernel::pal::Event::MouseAbsolute { x, y } => {
+                // Erase old cursor
+                pal.draw_rect(mouse_px as usize, mouse_py as usize, 10, 10, 0x1E1E1E);
+
+                // Scale 0-32767 coordinate space to screen bounds
+                mouse_px = ((x as i64 * pal.width() as i64) / 32767) as i32;
+                mouse_py = ((y as i64 * pal.height() as i64) / 32767) as i32;
+
+                // Clamp just in case
+                if mouse_px < 0 { mouse_px = 0; }
+                if mouse_py < 0 { mouse_py = 0; }
+                if mouse_px as u32 >= pal.width() { mouse_px = pal.width() as i32 - 10; }
+                if mouse_py as u32 >= pal.height() { mouse_py = pal.height() as i32 - 10; }
+
+                // Draw new cursor
+                pal.draw_rect(mouse_px as usize, mouse_py as usize, 10, 10, 0xFF0000);
+            }
+            _ => {
+                unaos_kernel::hlt();
+            }
         }
-        unaos_kernel::arch::hlt_loop();
     }
 }
 

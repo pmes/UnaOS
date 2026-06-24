@@ -17,11 +17,14 @@
 
 #![cfg_attr(test, no_main)]
 #![feature(abi_x86_interrupt)]
+#![allow(unsafe_op_in_unsafe_fn)]
 
 extern crate alloc;
 
 #[macro_use]
 pub mod arch;
+
+pub mod drivers;
 
 pub mod allocator;
 pub mod shell;
@@ -40,4 +43,8 @@ pub fn init() {
 
 pub fn hlt_loop() -> ! {
     arch::hlt_loop()
+}
+
+pub fn hlt() {
+    arch::hlt()
 }

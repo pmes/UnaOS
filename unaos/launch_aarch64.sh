@@ -3,12 +3,12 @@ set -e
 
 WORKSPACE_DIR=$(pwd)
 ESP_DIR="${WORKSPACE_DIR}/target/aarch64_esp"
-KERNEL_BIN="${WORKSPACE_DIR}/target/aarch64-unknown-none/release/unaos-kernel"
+KERNEL_BIN="${WORKSPACE_DIR}/target/aarch64-unaos/release/unaos-kernel"
 BOOTLOADER_BIN="${WORKSPACE_DIR}/target/aarch64-unknown-uefi/release/bootloader.efi"
 
 echo "🔹 Building aarch64 Kernel..."
 cd crates/kernel
-cargo +nightly build --release --target aarch64-unknown-none -Z build-std=core,compiler_builtins,alloc -Z build-std-features=compiler-builtins-mem
+cargo +nightly build --release --target ../../aarch64-unaos.json -Z build-std=core,compiler_builtins,alloc -Z build-std-features=compiler-builtins-mem -Z json-target-spec
 cd ../..
 
 echo "🔹 Building aarch64 UEFI Bootloader..."

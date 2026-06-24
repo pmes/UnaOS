@@ -14,7 +14,7 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-use crate::gdt;
+use crate::arch::gdt;
 use crate::pal::Event;
 use lazy_static::lazy_static;
 use pic8259::ChainedPics;
@@ -22,7 +22,7 @@ use spin::Mutex;
 use x86_64::structures::idt::{InterruptDescriptorTable, InterruptStackFrame, PageFaultErrorCode};
 
 // FIX: Only import what we use to kill warnings
-use crate::serial_println;
+
 
 pub const PIC_1_OFFSET: u8 = 32;
 pub const PIC_2_OFFSET: u8 = PIC_1_OFFSET + 8;
@@ -53,7 +53,40 @@ pub fn init_idt() {
 }
 
 pub fn init_pics() {
-    unsafe { PICS.lock().initialize() };
+    unsafe {
+        let mut pics = PICS.lock();
+        pics.initialize();
+        // Unmask IRQ0 (Timer) and IRQ1 (Keyboard) on PIC1, mask all on PIC2
+        pics.write_masks(0b1111_1100, 0b1111_1111);
+    }
+
+    // Re-enable and flush 8042 PS/2 Controller (UEFI may leave it disabled/full)
+    unsafe {
+        use x86_64::instructions::port::Port;
+        let mut cmd_port = Port::<u8>::new(0x64);
+        let mut data_port = Port::<u8>::new(0x60);
+
+        // 1. Flush any pending data
+        while (cmd_port.read() & 1) != 0 {
+            data_port.read();
+        }
+
+        // 2. Read Configuration Byte
+        cmd_port.write(0x20);
+        let mut config = data_port.read();
+
+        // 3. Enable First PS/2 Port Interrupt (bit 0)
+        config |= 0b0000_0001;
+
+        // 4. Write Configuration Byte
+        cmd_port.write(0x60);
+        data_port.write(config);
+
+        // 5. Flush any pending data again
+        while (cmd_port.read() & 1) != 0 {
+            data_port.read();
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -117,8 +150,9 @@ extern "x86-interrupt" fn timer_interrupt_handler(_stack_frame: InterruptStackFr
 extern "x86-interrupt" fn keyboard_interrupt_handler(_stack_frame: InterruptStackFrame) {
     use x86_64::instructions::port::Port;
 
-    let mut port = Port::new(0x60);
+    let mut port = Port::<u8>::new(0x60);
     let scancode: u8 = unsafe { port.read() };
+    serial_println!("KEY: {:#X}", scancode);
 
     let character = match scancode {
         0x02..=0x0B => Some(b"1234567890"[scancode as usize - 0x02]),

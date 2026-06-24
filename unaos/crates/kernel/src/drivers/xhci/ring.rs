@@ -16,7 +16,7 @@
 
 use core::alloc::Layout;
 use super::trb::Trb;
-use crate::serial_println;
+
 
 const RING_SIZE: usize = 16;
 
@@ -55,7 +55,7 @@ impl CommandRing {
         // FLUSH CACHE (Directive J11:FLUSH-01)
         let trb_ptr = &self.trbs[index] as *const Trb;
         unsafe {
-            core::arch::x86_64::_mm_clflush(trb_ptr as *const u8);
+            core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
             let control_val = (*trb_ptr).control;
             serial_println!("xHCI DEBUG: CMD TRB = {:#x}", control_val);
         }
@@ -73,6 +73,26 @@ impl CommandRing {
     }
 
     pub fn push(&mut self, mut trb: Trb) -> Result<usize, &'static str> {
+        if self.enqueue_index == RING_SIZE - 1 {
+            // Need to insert Link TRB to wrap around
+            let mut link_trb = Trb::new();
+            link_trb.parameter = self.get_ptr();
+            // Type 6 (Link TRB), TC=1 (Toggle Cycle)
+            let mut control = (6 << 10) | (1 << 1);
+            if self.cycle_bit {
+                control |= 1;
+            }
+            link_trb.control = control;
+            
+            self.trbs[self.enqueue_index] = link_trb;
+            unsafe {
+                core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+            }
+            
+            self.enqueue_index = 0;
+            self.cycle_bit = !self.cycle_bit;
+        }
+
         let index = self.enqueue_index;
 
         // 1. Set the Cycle Bit on the TRB
@@ -88,18 +108,11 @@ impl CommandRing {
 
         // 3. Flush Cache (Safety)
         unsafe {
-            let trb_ptr = &self.trbs[index] as *const Trb;
-            core::arch::x86_64::_mm_clflush(trb_ptr as *const u8);
+            core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
         }
 
         // 4. Advance
         self.enqueue_index += 1;
-        if self.enqueue_index >= RING_SIZE {
-            // UNA-18-SLOT: Naive wrap. We are not using Link TRBs yet.
-            // This is safe ONLY because we are sending < 16 commands.
-            self.enqueue_index = 0;
-            self.cycle_bit = !self.cycle_bit;
-        }
 
         Ok(index)
     }

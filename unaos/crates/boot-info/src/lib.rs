@@ -44,6 +44,9 @@ pub struct BootInfo {
     /// Offset where physical memory is mapped in the virtual address space
     pub physical_memory_offset: u64,
 
+    pub dtb_addr: u64,
+    pub dtb_size: usize,
+
     /// Pointer to the array of memory regions
     pub memory_regions_addr: u64,
     pub memory_regions_len: usize,

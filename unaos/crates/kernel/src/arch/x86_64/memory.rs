@@ -15,55 +15,41 @@
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 
+use unaos_boot_info::{BootInfo, MemoryRegionKind};
 
-/// Initialize a new OffsetPageTable.
-///
-/// This function is unsafe because the caller must guarantee that the
-/// complete physical memory is mapped to virtual memory at the passed
-/// `physical_memory_offset`.
-pub unsafe fn init(physical_memory_offset: VirtAddr) -> OffsetPageTable<'static> {
-    let level_4_table = active_level_4_table(physical_memory_offset);
-    OffsetPageTable::new(level_4_table, physical_memory_offset)
-}
-
-unsafe fn active_level_4_table(physical_memory_offset: VirtAddr) -> &'static mut PageTable {
-    let (level_4_table_frame, _) = Cr3::read();
-    let phys = level_4_table_frame.start_address().as_u64();
-    let virt = physical_memory_offset + phys;
-    let page_table_ptr: *mut PageTable = virt.as_mut_ptr();
-
-    &mut *page_table_ptr
-}
-
-pub struct BootInfoFrameAllocator {
-    memory_map: &'static MemoryRegions,
-    next: usize,
-}
-
-impl BootInfoFrameAllocator {
-    pub unsafe fn init(memory_map: &'static MemoryRegions) -> Self {
-        BootInfoFrameAllocator {
-            memory_map,
-            next: 0,
+pub fn init(boot_info: &'static mut BootInfo) {
+    serial_println!(":: X86_64 Memory Init ::");
+    
+    let regions = unsafe {
+        core::slice::from_raw_parts(
+            boot_info.memory_regions_addr as *const unaos_boot_info::MemoryRegion,
+            boot_info.memory_regions_len,
+        )
+    };
+    
+    let mut heap_start = 0;
+    let mut heap_size = 0;
+    
+    for region in regions {
+        if region.kind == MemoryRegionKind::Usable && region.phys_start > 0x100000 {
+            let size = (region.page_count * 4096) as usize;
+            if size >= crate::allocator::HEAP_SIZE {
+                heap_start = region.phys_start;
+                heap_size = crate::allocator::HEAP_SIZE;
+                break;
+            }
         }
     }
-
-    fn usable_frames(&self) -> impl Iterator<Item = PhysFrame> {
-        let regions = self.memory_map.iter();
-        let usable_regions = regions.filter(|r| r.kind == MemoryRegionKind::Usable);
-
-        let addr_ranges = usable_regions.map(|r| r.start..r.end);
-        let frame_addresses = addr_ranges.flat_map(|r| r.step_by(4096));
-
-        frame_addresses.map(|addr| PhysFrame::containing_address(PhysAddr::new(addr)))
-    }
-}
-
-// FIX: Added 'unsafe' to the trait implementation
-unsafe impl FrameAllocator<Size4KiB> for BootInfoFrameAllocator {
-    fn allocate_frame(&mut self) -> Option<PhysFrame> {
-        let frame = self.usable_frames().nth(self.next);
-        self.next += 1;
-        frame
+    
+    if heap_size > 0 {
+        unsafe {
+            crate::allocator::init_heap_raw(heap_start as *mut u8, heap_size);
+        }
+    } else {
+        serial_println!("Available memory regions: {}", regions.len());
+        for region in regions.iter().take(15) {
+            serial_println!("Kind: {:?}, Start: {:#x}, Pages: {}", region.kind, region.phys_start, region.page_count);
+        }
+        panic!("Failed to find usable memory for heap");
     }
 }

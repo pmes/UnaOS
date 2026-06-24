@@ -24,21 +24,21 @@ use self::trb::Trb;
 use self::event::{EventRing, ErstEntry, ErstTable};
 use self::context::{InputContext, DeviceContext};
 use spin::Mutex;
-use crate::serial_println;
-use x86_64::{structures::paging::{OffsetPageTable, Translate}, VirtAddr, PhysAddr};
 
-pub fn init(base_address: VirtAddr, mapper: &mut OffsetPageTable<'static>) {
-    serial_println!("xHCI: Virtual Handoff. Base Address: {:#x}", base_address.as_u64());
 
-    let cap_ptr = base_address.as_u64() as *const u32;
+
+pub fn init(base_address: u64) {
+    serial_println!("xHCI: Virtual Handoff. Base Address: {:#x}", base_address);
+
+    let cap_ptr = base_address as *const u32;
     let cap_word = unsafe { core::ptr::read_volatile(cap_ptr) };
     let cap_length = (cap_word & 0xFF) as u8;
 
     let op_base = base_address + cap_length as u64;
-    serial_println!("xHCI: CapLength: {}, Operational Base: {:#x}", cap_length, op_base.as_u64());
+    serial_println!("xHCI: CapLength: {}, Operational Base: {:#x}", cap_length, op_base);
 
-    let usbcmd_ptr = op_base.as_u64() as *mut u32;
-    let usbsts_ptr = (op_base.as_u64() + 0x04) as *const u32;
+    let usbcmd_ptr = op_base as *mut u32;
+    let usbsts_ptr = (op_base + 0x04) as *const u32;
 
     unsafe {
         // Halt Controller
@@ -78,19 +78,17 @@ pub fn init(base_address: VirtAddr, mapper: &mut OffsetPageTable<'static>) {
     }
 
     let command_ring_ptr = ring::allocate_command_ring();
-    let ring_virt = VirtAddr::from_ptr(command_ring_ptr);
+    let ring_phys = command_ring_ptr as u64;
 
-    if let Some(phys_addr) = mapper.translate_addr(ring_virt) {
-        let crcr_reg = (op_base.as_u64() + 0x18) as *mut u64;
-        let crcr_value = phys_addr.as_u64() | 1; // Bit 0 (RCS) = 1
-        unsafe {
-            core::ptr::write_volatile(crcr_reg, crcr_value);
-        }
-        serial_println!("[XHCI] CONTROLLER RESET AND COMMAND RING ALLOCATED.");
-    } else {
-        panic!("xHCI: Failed to translate Command Ring virtual address!");
+    let crcr_reg = (op_base + 0x18) as *mut u64;
+    let crcr_value = ring_phys | 1; // Bit 0 (RCS) = 1
+    unsafe {
+        core::ptr::write_volatile(crcr_reg, crcr_value);
     }
+    serial_println!("[XHCI] CONTROLLER RESET AND COMMAND RING ALLOCATED.");
 }
+
+pub static XHCI_CONTROLLER: spin::Mutex<Option<XhciController>> = spin::Mutex::new(None);
 
 pub static COMMAND_RING: Mutex<CommandRing> = Mutex::new(CommandRing::new());
 pub static EVENT_RING: Mutex<EventRing> = Mutex::new(EventRing::new());
@@ -140,22 +138,22 @@ static mut EVENT_RING_PHYS_BASE: u64 = 0;
 /// Direct MMIO write. The address must be valid.
 #[inline(always)]
 pub unsafe fn ring_doorbell_asm(doorbell_addr: u64, target: u32) {
-    serial_println!("xHCI [ASM]: Ringing Doorbell at {:#x} with Target {}", doorbell_addr, target);
-    core::arch::asm!("mfence", options(nostack, preserves_flags));
-    core::arch::asm!(
-        "mov [{0}], {1:e}",
-        in(reg) doorbell_addr,
-        in(reg) target,
-        options(nostack, preserves_flags)
-    );
-    core::arch::asm!("mfence", options(nostack, preserves_flags));
+    serial_println!("xHCI: Ringing Doorbell at {:#x} with Target {}", doorbell_addr, target);
+    core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+    core::ptr::write_volatile(doorbell_addr as *mut u32, target);
+    core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
 }
 
 pub struct XhciController {
     base_addr: usize,
     op_base: usize,
-    pending_port_id: u8,
-    configuring_slot: u8, // UNA-21: Track which slot is being configured
+    pub irq_vector: u8,
+    pub configuring_slot: u8,
+    pub pending_port_id: u8,
+    pub mouse_state: u8,
+    pub mouse_slot: u8,
+    pub mouse_ep: u8,
+    pub mouse_mps: u16,
     // Physical Addresses for Contexts (provided by main.rs via init_contexts)
     input_context_phys: u64,
     output_context_phys: u64,
@@ -187,8 +185,13 @@ impl XhciController {
         XhciController {
             base_addr,
             op_base,
+            irq_vector: 0,
             pending_port_id: 0,
             configuring_slot: 0,
+            mouse_state: 0,
+            mouse_slot: 0,
+            mouse_ep: 0,
+            mouse_mps: 0,
             input_context_phys: 0,
             output_context_phys: 0,
             ep0_ring_phys: 0,
@@ -280,26 +283,22 @@ impl XhciController {
     pub fn poll_events(&mut self) -> bool {
         let mut ring = EVENT_RING.lock(); // Lock the static ring
         let mut command_completed = false;
-        let mut retries = 0;
 
-        // UNA-19-POLLING: Loop with timeout to catch events in Polling Mode
-        loop {
-            // Check for event
-            if ring.has_event() {
-                retries = 0; // Reset timeout if we find an event (chaining)
-                serial_println!("xHCI: Event Detected!");
+        // Check for event
+        while ring.has_event() {
+            serial_println!("xHCI: Event Detected!");
 
-                if let Some(trb) = ring.pop() {
-                    let param = trb.parameter;
-                    let status = trb.status;
-                    let control = trb.control;
+            if let Some(trb) = ring.pop() {
+                let param = trb.parameter;
+                let status = trb.status;
+                let control = trb.control;
 
-                    // UNA-21-VERBOSE: Dump Raw TRB
-                    serial_println!("xHCI RAW: Param={:#x} Status={:#x} Control={:#x}", param, status, control);
+                // UNA-21-VERBOSE: Dump Raw TRB
+                serial_println!("xHCI RAW: Param={:#x} Status={:#x} Control={:#x}", param, status, control);
 
-                    // 1. EXTRACT THE TYPE
-                    // Control Field: Bits 15:10 = TRB Type
-                    let trb_type = (control >> 10) & 0x3F;
+                // 1. EXTRACT THE TYPE
+                // Control Field: Bits 15:10 = TRB Type
+                let trb_type = (control >> 10) & 0x3F;
 
                 // 2. DISPATCH
                 match trb_type {
@@ -331,6 +330,12 @@ impl XhciController {
                                     self.configuring_slot = 0;
                                     self.send_scsi_read(slot_id as u8);
                                 }
+                                else if self.mouse_state == 1 {
+                                    serial_println!("xHCI: Mouse Endpoints Configured (Slot {}). Proceeding to Set Configuration...", slot_id);
+                                    self.mouse_state = 2;
+                                    self.mouse_slot = slot_id as u8;
+                                    self.send_set_configuration(slot_id as u8, 1);
+                                }
                                 else {
                                     // UNA-19-IDENTITY: If pending_port_id is 0, we assume Address Device just finished.
                                     serial_println!("xHCI: >>> SLOT {} ENABLED & ADDRESSED <<<", slot_id);
@@ -341,8 +346,7 @@ impl XhciController {
                             serial_println!("xHCI: >>> COMMAND FAILED (Code {}) <<<", completion_code);
                             // UNA-19-HALT: Stop on Code 5
                             if completion_code == 5 {
-                                serial_println!("xHCI: CRITICAL FAILURE: TRB ERROR (CODE 5). SYSTEM HALTED.");
-                                loop { core::hint::spin_loop(); }
+                                serial_println!("xHCI: CRITICAL FAILURE: TRB ERROR (CODE 5).");
                             }
                         }
                         command_completed = true;
@@ -386,16 +390,21 @@ impl XhciController {
                         serial_println!("xHCI DEBUG: [Transfer Event] Slot={}, EP={}, Code={}, Len={}",
                             slot_id, endpoint_id, completion_code, transfer_len);
 
-                        // UNA-19-REVEAL: If success, check buffer
-                        if completion_code == 1 {
+                        // UNA-19-REVEAL: If success or short packet, check buffer
+                        if completion_code == 1 || completion_code == 13 {
                             // UNA-21-DEBUG: Force Transition based on Endpoint ID
                             // EP1 = Control (Device Descriptor)
                             // EP3 = Bulk IN (SCSI Read)
 
                             if endpoint_id == 1 && slot_id == 1 { // EP0 (Control) -> Device Descriptor
-                                serial_println!("xHCI: >>> INTERCEPTED DESCRIPTOR EVENT (Slot 1 EP 1) <<<");
-                                unsafe {
-                                    let vid = (DESCRIPTOR_BUFFER.data[8] as u16) | ((DESCRIPTOR_BUFFER.data[9] as u16) << 8);
+                                if self.mouse_state == 2 {
+                                    serial_println!("xHCI: >>> MOUSE SET_CONFIGURATION COMPLETE <<<");
+                                    self.mouse_state = 3;
+                                    self.queue_mouse_read(slot_id as u8);
+                                } else {
+                                    serial_println!("xHCI: >>> INTERCEPTED DESCRIPTOR EVENT (Slot 1 EP 1) <<<");
+                                    unsafe {
+                                        let vid = (DESCRIPTOR_BUFFER.data[8] as u16) | ((DESCRIPTOR_BUFFER.data[9] as u16) << 8);
                                     let pid = (DESCRIPTOR_BUFFER.data[10] as u16) | ((DESCRIPTOR_BUFFER.data[11] as u16) << 8);
 
                                     serial_println!(">>> SYSTEM ALERT: NEW HARDWARE DETECTED <<<");
@@ -420,25 +429,99 @@ impl XhciController {
                                         self.configure_endpoints(slot_id as u8);
                                     } else if class_code == 0x00 {
                                         // Class 0 means "Look at Interface Descriptor" (Common for Flash Drives too)
-                                        serial_println!("xHCI: Composite Device. checking Interface...");
+                                        serial_println!("xHCI: Composite Device. Requesting Configuration Descriptor...");
+                                        self.request_configuration_descriptor(slot_id as u8);
+                                    } else if DESCRIPTOR_BUFFER.data[1] == 0x02 { // Configuration Descriptor Response
+                                        serial_println!("xHCI: >>> CONFIGURATION DESCRIPTOR RECEIVED <<<");
+                                        // Parse Configuration Descriptor to find HID Interface
+                                        let mut offset = 0;
+                                        let total_length = (DESCRIPTOR_BUFFER.data[2] as u16) | ((DESCRIPTOR_BUFFER.data[3] as u16) << 8);
+                                        serial_println!("xHCI: Configuration Descriptor Total Length: {}", total_length);
+                                        serial_println!("xHCI: First 16 bytes: {:02x?} {:02x?} {:02x?} {:02x?} {:02x?} {:02x?} {:02x?} {:02x?} {:02x?} {:02x?} {:02x?} {:02x?} {:02x?} {:02x?} {:02x?} {:02x?}", 
+                                            DESCRIPTOR_BUFFER.data[0], DESCRIPTOR_BUFFER.data[1], DESCRIPTOR_BUFFER.data[2], DESCRIPTOR_BUFFER.data[3],
+                                            DESCRIPTOR_BUFFER.data[4], DESCRIPTOR_BUFFER.data[5], DESCRIPTOR_BUFFER.data[6], DESCRIPTOR_BUFFER.data[7],
+                                            DESCRIPTOR_BUFFER.data[8], DESCRIPTOR_BUFFER.data[9], DESCRIPTOR_BUFFER.data[10], DESCRIPTOR_BUFFER.data[11],
+                                            DESCRIPTOR_BUFFER.data[12], DESCRIPTOR_BUFFER.data[13], DESCRIPTOR_BUFFER.data[14], DESCRIPTOR_BUFFER.data[15]
+                                        );
+                                        
+                                        let mut found_mouse = false;
+                                        let mut ep_addr = 0;
+                                        let mut ep_mps = 0;
+                                        let mut ep_interval = 0;
+                                        
+                                        while offset < total_length as usize && offset < 64 {
+                                            let length = DESCRIPTOR_BUFFER.data[offset] as usize;
+                                            if length == 0 { break; } // Prevent infinite loop on bad data
+                                            let desc_type = DESCRIPTOR_BUFFER.data[offset + 1];
+                                            
+                                            if desc_type == 0x04 { // Interface Descriptor
+                                                let intf_class = DESCRIPTOR_BUFFER.data[offset + 5];
+                                                let intf_subclass = DESCRIPTOR_BUFFER.data[offset + 6];
+                                                let intf_protocol = DESCRIPTOR_BUFFER.data[offset + 7];
+                                                serial_println!("xHCI: Device Found. Class={:#x} Sub={:#x} Proto={:#x}", intf_class, intf_subclass, intf_protocol);
+                                                
+                                                // 0x03 is HID. We accept Mouse (0x02) or Tablet/None (0x00)
+                                                if intf_class == 0x03 {
+                                                    serial_println!("xHCI: >>> USB HID INTERFACE FOUND <<<");
+                                                    found_mouse = true;
+                                                }
+                                            } else if desc_type == 0x05 && found_mouse { // Endpoint Descriptor
+                                                ep_addr = DESCRIPTOR_BUFFER.data[offset + 2];
+                                                let ep_attr = DESCRIPTOR_BUFFER.data[offset + 3];
+                                                if (ep_attr & 0x03) == 0x03 && (ep_addr & 0x80) != 0 { // Interrupt IN
+                                                    ep_mps = (DESCRIPTOR_BUFFER.data[offset + 4] as u16) | ((DESCRIPTOR_BUFFER.data[offset + 5] as u16) << 8);
+                                                    ep_interval = DESCRIPTOR_BUFFER.data[offset + 6];
+                                                    serial_println!("xHCI: >>> MOUSE INTERRUPT IN EP FOUND: {:#x}, MPS: {}, Interval: {} <<<", ep_addr, ep_mps, ep_interval);
+                                                    break;
+                                                }
+                                            }
+                                            offset += length;
+                                        }
+                                        
+                                        if found_mouse && ep_addr != 0 {
+                                            serial_println!("xHCI: Configuring Mouse Endpoints...");
+                                            self.mouse_ep = ep_addr;
+                                            self.mouse_mps = ep_mps;
+                                            self.configure_mouse_endpoints(slot_id as u8, ep_addr, ep_mps, ep_interval);
+                                        }
                                     }
                                 }
-                            } else if endpoint_id == 3 { // EP1 IN (Bulk IN) -> SCSI Read
+                                }
+                            } else if endpoint_id == 3 { // EP1 IN (Bulk IN) -> SCSI Read / Mouse Interrupt IN
                                 unsafe {
-                                    serial_println!("xHCI: >>> BULK IN TRANSFER COMPLETE (SCSI Read) <<<");
-                                    // Check Signature
-                                    let sig = core::str::from_utf8(&DATA_BUFFER.data[0..21]).unwrap_or("INVALID");
-                                    serial_println!("xHCI: SECTOR 0 SIGNATURE: {}", sig);
+                                    let bytes_transferred = self.mouse_mps as u32 - transfer_len;
+                                    if bytes_transferred > 0 || DATA_BUFFER.data[0] < 0x08 {
+                                        // Print all 8 bytes for debugging the tablet payload
+                                        serial_println!("xHCI: Tablet Raw: {:02x?} {:02x?} {:02x?} {:02x?} {:02x?} {:02x?} {:02x?} {:02x?}", 
+                                            DATA_BUFFER.data[0], DATA_BUFFER.data[1], DATA_BUFFER.data[2], DATA_BUFFER.data[3],
+                                            DATA_BUFFER.data[4], DATA_BUFFER.data[5], DATA_BUFFER.data[6], DATA_BUFFER.data[7]
+                                        );
 
-                                    if sig == "UNA-OS-DISK-001-ALPHA" {
-                                        serial_println!("xHCI: >>> MISSION SUCCESS. TARGET ACQUIRED. <<<");
+                                        // For usb-tablet, coordinates are 15-bit absolute (0..32767).
+                                        let buttons = DATA_BUFFER.data[0];
+                                        let x = (DATA_BUFFER.data[1] as u16) | ((DATA_BUFFER.data[2] as u16) << 8);
+                                        let y = (DATA_BUFFER.data[3] as u16) | ((DATA_BUFFER.data[4] as u16) << 8);
+                                        
+                                        // Only push an event if there's actual movement or button change
+                                        if x != 0 || y != 0 {
+                                            crate::pal::push_event(crate::pal::Event::MouseAbsolute { x: x as i32, y: y as i32 });
+                                        }
+                                        
+                                        // Re-queue the read
+                                        self.queue_mouse_read(slot_id as u8);
                                     } else {
-                                        serial_println!("xHCI: >>> SIGNATURE MISMATCH <<<");
-                                    }
+                                        serial_println!("xHCI: >>> BULK IN TRANSFER COMPLETE (SCSI Read) <<<");
+                                        // Check Signature
+                                        let sig = core::str::from_utf8(&DATA_BUFFER.data[0..21]).unwrap_or("INVALID");
+                                        serial_println!("xHCI: SECTOR 0 SIGNATURE: {}", sig);
 
-                                    // UNA-19-STABILIZE: The Parking Brake
-                                    serial_println!(">>> SYSTEM STABILIZED. HALTING. <<<");
-                                    loop { x86_64::instructions::hlt(); }
+                                        if sig == "UNA-OS-DISK-001-ALPHA" {
+                                            serial_println!("xHCI: >>> MISSION SUCCESS. TARGET ACQUIRED. <<<");
+                                        } else {
+                                            serial_println!("xHCI: >>> SIGNATURE MISMATCH <<<");
+                                        }
+                                        serial_println!(">>> DISK READ COMPLETE <<<");
+                                    }
                                 }
                             }
                         }
@@ -483,15 +566,7 @@ impl XhciController {
 
                     serial_println!("xHCI: ERDP Advanced to {:#x}", new_dequeue_ptr);
                 }
-                } // Close if let Some(trb)
-            } else {
-                // No event found. Spin and retry.
-                retries += 1;
-                if retries > 1_000_000 {
-                    break;
-                }
-                core::hint::spin_loop();
-            }
+            } // Close if let Some(trb)
         }
         command_completed
     }
@@ -537,29 +612,29 @@ impl XhciController {
         }
     }
 
-    pub fn init_pointers(&mut self, ring_phys_addr: PhysAddr, dcbaap_phys: PhysAddr) {
+    pub unsafe fn init_pointers(&mut self, ring_phys_addr: u64, dcbaap_phys: u64) {
         unsafe {
             // 1. Set DCBAAP
             // (In a real driver, we'd read HCSPARAMS1 to check max slots, but 256 covers all)
             let dcbaap_reg = (self.op_base + 0x30) as *mut u64;
-            core::ptr::write_volatile(dcbaap_reg, dcbaap_phys.as_u64());
+            core::ptr::write_volatile(dcbaap_reg, dcbaap_phys);
             serial_println!("xHCI: DCBAAP set to {:#x}", dcbaap_phys);
 
             // 2. Set Command Ring Control Register (CRCR)
             // OpBase + 0x18.
             // MUST set Bit 0 (RCS - Ring Cycle State) to 1 to match our initial Ring state.
             let crcr_reg = (self.op_base + 0x18) as *mut u64;
-            let crcr_value = ring_phys_addr.as_u64() | 1;
+            let crcr_value = ring_phys_addr | 1;
             core::ptr::write_volatile(crcr_reg, crcr_value);
             serial_println!("xHCI: CRCR set to {:#x}", crcr_value);
         }
     }
 
     // Call this AFTER init_pointers but BEFORE run
-    pub fn init_interrupter(&mut self, event_ring_phys: PhysAddr, erst_table_phys: PhysAddr) {
+    pub fn init_interrupter(&mut self, event_ring_phys: u64, erst_table_phys: u64) {
         unsafe {
             // SAVE THIS for later use in the interrupt/event loop (ERDP updates)
-            EVENT_RING_PHYS_BASE = event_ring_phys.as_u64();
+            EVENT_RING_PHYS_BASE = event_ring_phys;
 
             // 1. Calculate Runtime Base
             // Read RTSOFF (Offset 0x18 in Capability Regs)
@@ -577,7 +652,7 @@ impl XhciController {
 
             // We use 1 segment, pointing to our static EVENT_RING
             ERST_TABLE.entries[0] = ErstEntry {
-                ring_address: event_ring_phys.as_u64(),
+                ring_address: event_ring_phys,
                 size: 16, // Must match EVENT_RING_SIZE
                 _rsvd: 0,
                 _rsvd2: 0,
@@ -590,13 +665,13 @@ impl XhciController {
 
             // 4. Write ERSTBA (Segment Table Base Address) - Offset 0x10
             let erstba_ptr = (ir0_base + 0x10) as *mut u64;
-            core::ptr::write_volatile(erstba_ptr, erst_table_phys.as_u64());
+            core::ptr::write_volatile(erstba_ptr, erst_table_phys);
 
             // 5. Write ERDP (Event Ring Dequeue Pointer) - Offset 0x18
             // Initialize to the start of the ring.
             // PRESERVE BIT 3 (EHB - Event Handler Busy)? No, clear it initially.
             let erdp_ptr = (ir0_base + 0x18) as *mut u64;
-            core::ptr::write_volatile(erdp_ptr, event_ring_phys.as_u64()); // Pointer to the RING, not the table
+            core::ptr::write_volatile(erdp_ptr, event_ring_phys); // Pointer to the RING, not the table
 
             // 6. GAG the Interrupter (IMAN - Interrupter Management) - Offset 0x00
             // Bit 0 = IP (Interrupt Pending), Bit 1 = IE (Interrupt Enable)
@@ -606,6 +681,58 @@ impl XhciController {
             core::ptr::write_volatile(iman_ptr, iman & !0x3);
 
             serial_println!("xHCI: Interrupter 0 GAGGED (IMAN.IE Cleared).");
+        }
+    }
+
+    pub fn start(&mut self) {
+        unsafe {
+            // Write 1 to USBCMD.RS (Run/Stop)
+            let usbcmd_ptr = self.op_base as *mut u32;
+            let cmd = core::ptr::read_volatile(usbcmd_ptr);
+            core::ptr::write_volatile(usbcmd_ptr, cmd | 1);
+
+            // Wait until USBSTS.HCH (Halted) is 0
+            let usbsts_ptr = (self.op_base + 0x04) as *const u32;
+            loop {
+                let status = core::ptr::read_volatile(usbsts_ptr);
+                if (status & 1) == 0 {
+                    break;
+                }
+                core::hint::spin_loop();
+            }
+            serial_println!("xHCI: Controller Started!");
+
+            // Power on all ports
+            // MaxPorts is in HCSPARAMS1 (Offset 0x04 from CapBase)
+            let hcsparams1_ptr = (self.base_addr + 0x04) as *const u32;
+            let max_ports = (core::ptr::read_volatile(hcsparams1_ptr) & 0xFF) as u8;
+            serial_println!("xHCI: Max Ports = {}", max_ports);
+
+            for i in 1..=max_ports {
+                let port_offset = 0x400 + (i as usize - 1) * 0x10;
+                let portsc_ptr = (self.op_base + port_offset) as *mut u32;
+                let status = core::ptr::read_volatile(portsc_ptr);
+                
+                // Bit 9: PP (Port Power)
+                if (status & (1 << 9)) == 0 {
+                    serial_println!("xHCI: Powering on Port {}", i);
+                    core::ptr::write_volatile(portsc_ptr, status | (1 << 9));
+                } else {
+                    serial_println!("xHCI: Port {} already powered. Status: {:#x}", i, status);
+                }
+            }
+
+            // After powering on, manually trigger handle_port_change for any already connected devices
+            for i in 1..=max_ports {
+                let port_offset = 0x400 + (i as usize - 1) * 0x10;
+                let portsc_ptr = (self.op_base + port_offset) as *const u32;
+                let status = core::ptr::read_volatile(portsc_ptr);
+                
+                if (status & 1) != 0 || (status & (1 << 17)) != 0 {
+                    serial_println!("xHCI DEBUG: Port {} matched! Calling handle_port_change. Status: {:#x}", i, status);
+                    self.handle_port_change(i);
+                }
+            }
         }
     }
 
@@ -798,8 +925,8 @@ impl XhciController {
             }
 
             // 2. THE WRITE
-            // UNA-22-POINTER: Reduced size to 2048 to prevent BSS overflow
-            core::ptr::write_bytes(base_ptr as *mut u8, 0, 2048);
+            // Clear Input Context (33 * 32 = 1056 bytes)
+            core::ptr::write_bytes(base_ptr as *mut u8, 0, 1056);
 
             // 3a. INPUT CONTROL CONTEXT (Offset 0x00)
             // DW1 (Offset 0x04): Add Context Flags
@@ -864,20 +991,28 @@ impl XhciController {
             let base_ptr = input_ctx_virt as *mut u32;
 
             // 2. CLEAR INPUT CONTEXT (Safety first)
-            core::ptr::write_bytes(base_ptr as *mut u8, 0, 2048);
+            // Clear Input Context (33 * 32 = 1056 bytes)
+            core::ptr::write_bytes(base_ptr as *mut u8, 0, 1056);
 
             // 3. INPUT CONTROL CONTEXT (Offset 0x00)
             // Add Context Flags (DW1, Offset 0x04)
             // We are modifying the device to ADD contexts.
-            // Slot Context (Bit 0) + EP1 IN (Bit 3) + EP2 OUT (Bit 4)
-            // Val = 1 | 8 | 16 = 25 (0x19)
-            base_ptr.add(1).write_volatile(0x19);
+            // DO NOT SET Bit 0 (Slot Context) in Add Context flags for Configure Endpoint!
+            // EP1 IN (Bit 3) + EP2 OUT (Bit 4)
+            // Val = 8 | 16 = 24 (0x18)
+            base_ptr.add(1).write_volatile(0x18);
 
             // 4. SLOT CONTEXT (Offset 0x20 -> Index 8)
             let slot_ctx_ptr = base_ptr.add(8);
-            // DW0: Context Entries = 5 (Covering up to Index 5/EP2 IN, though we use 4/EP2 OUT)
-            // We set it to 5 just to be safe.
-            slot_ctx_ptr.add(0).write_volatile(5 << 27);
+            // Copy from OUTPUT_CONTEXT
+            for i in 0..8 {
+                let val = core::ptr::read_volatile(&OUTPUT_CONTEXT.slot[i]);
+                slot_ctx_ptr.add(i).write_volatile(val);
+            }
+            // Update Context Entries = 5 (Bits 27:31)
+            let old_dw0 = slot_ctx_ptr.add(0).read_volatile();
+            let new_dw0 = (old_dw0 & !(0x1F << 27)) | (5 << 27);
+            slot_ctx_ptr.add(0).write_volatile(new_dw0);
 
             // 5. ENDPOINT 1 IN (Index 3) -> Offset 0x60
             // 0x60 / 4 = 24 (Index)
@@ -1033,6 +1168,25 @@ impl XhciController {
     fn push_ep0(&mut self, mut trb: Trb) {
         unsafe {
             let ring_ptr = &raw mut EP0_RING;
+            
+            if self.ep0_enqueue_index == 15 {
+                let mut link_trb = Trb::new();
+                link_trb.parameter = self.ep0_ring_phys;
+                let mut control = (6 << 10) | (1 << 1);
+                if self.ep0_cycle_state {
+                    control |= 1;
+                }
+                link_trb.control = control;
+                
+                (*ring_ptr)[15] = link_trb;
+                core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+                let ptr = self.ep0_ring_phys as *mut Trb;
+                ptr.add(15).write_volatile(link_trb);
+                
+                self.ep0_enqueue_index = 0;
+                self.ep0_cycle_state = !self.ep0_cycle_state;
+            }
+
             let index = self.ep0_enqueue_index;
 
             // 1. Set Cycle Bit
@@ -1044,17 +1198,17 @@ impl XhciController {
 
             // 2. Write
             (*ring_ptr)[index] = trb;
-
             // 3. Flush
-            let trb_ptr = &(*ring_ptr)[index] as *const Trb;
-            core::arch::x86_64::_mm_clflush(trb_ptr as *const u8);
+            core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
 
             // 4. Advance
+            let ptr = self.ep0_ring_phys as *mut Trb;
+            ptr.add(index).write_volatile(trb);
+
+            let control_val = trb.control;
+            serial_println!("xHCI: push_ep0 -> Index: {}, Cycle: {}, Phys: {:#x}, Final Control: {:#x}", index, self.ep0_cycle_state, self.ep0_ring_phys + (index as u64 * 16), control_val);
+
             self.ep0_enqueue_index += 1;
-            if self.ep0_enqueue_index >= 16 {
-                self.ep0_enqueue_index = 0;
-                self.ep0_cycle_state = !self.ep0_cycle_state;
-            }
         }
     }
 
@@ -1099,5 +1253,191 @@ impl XhciController {
 
         // 4. Ring Doorbell (Slot 1, Target 1 for EP0)
         self.ring_doorbell(slot_id, 1);
+    }
+
+    pub fn request_configuration_descriptor(&mut self, slot_id: u8) {
+        serial_println!("xHCI: Requesting Configuration Descriptor for Slot {}...", slot_id);
+
+        if self.descriptor_phys == 0 {
+            serial_println!("xHCI: CRITICAL ERROR - Descriptor Buffer Phys Addr is 0!");
+            return;
+        }
+
+        // 1. Setup Stage
+        // bmRequestType = 0x80 (Device to Host, Standard, Device)
+        // bRequest = 0x06 (GET_DESCRIPTOR)
+        // wValue = 0x0200 (Descriptor Type = 2 for Configuration, Index = 0)
+        // wIndex = 0x0000
+        // wLength = 0x0040 (64 bytes)
+        // Little Endian u64: 0x0040000002000680
+        let setup_trb = Trb {
+            parameter: 0x0040000002000680,
+            status: 8, // Transfer Length
+            control: (2 << 10) | (1 << 6) | (3 << 16), // Type 2 | IDT | TRT (IN)
+        };
+        self.push_ep0(setup_trb);
+
+        // 2. Data Stage
+        let data_trb = Trb {
+            parameter: self.descriptor_phys,
+            status: 64, // Length 64 bytes
+            control: (3 << 10) | (1 << 16), // Type 3 | DIR (IN)
+        };
+        self.push_ep0(data_trb);
+
+        // 3. Status Stage
+        let status_trb = Trb {
+            parameter: 0,
+            status: 0,
+            control: (4 << 10) | (1 << 5) | (0 << 16), // Type 4 | IOC | DIR (OUT)
+        };
+        self.push_ep0(status_trb);
+
+        // 4. Ring Doorbell
+        self.ring_doorbell(slot_id, 1);
+    }
+
+    pub fn configure_mouse_endpoints(&mut self, slot_id: u8, ep_addr: u8, mps: u16, interval: u8) {
+        unsafe {
+            serial_println!("xHCI: Configuring Mouse Endpoints for Slot {}, EP Addr {:#x}...", slot_id, ep_addr);
+
+            // 1. GET POINTERS
+            let input_ctx_virt = &raw mut INPUT_CONTEXT;
+            let base_ptr = input_ctx_virt as *mut u32;
+
+            // 2. CLEAR INPUT CONTEXT
+            core::ptr::write_bytes(base_ptr as *mut u8, 0, 1056);
+
+            // The DCI (Device Context Index) for an endpoint is:
+            // DCI = (Endpoint Number * 2) + Direction
+            // Where Direction is 1 for IN, 0 for OUT
+            let ep_num = ep_addr & 0x0F;
+            let dir_in = (ep_addr & 0x80) != 0;
+            let dci = (ep_num * 2) + if dir_in { 1 } else { 0 };
+
+            // Input Control Context
+            // Specific EP Context (Bit DCI)
+            // AND Bit 0 (Slot Context) because we are modifying Context Entries in the Slot Context!
+            base_ptr.add(1).write_volatile((1 << dci) | 1);
+
+            // Slot Context
+            let slot_ctx_ptr = base_ptr.add(8);
+            // Copy from OUTPUT_CONTEXT
+            for i in 0..8 {
+                let val = core::ptr::read_volatile(&OUTPUT_CONTEXT.slot[i]);
+                slot_ctx_ptr.add(i).write_volatile(val);
+            }
+            // Update Context Entries = DCI (Bits 27:31)
+            let old_dw0 = slot_ctx_ptr.add(0).read_volatile();
+            let new_dw0 = (old_dw0 & !(0x1F << 27)) | ((dci as u32) << 27);
+            slot_ctx_ptr.add(0).write_volatile(new_dw0);
+
+            // Endpoint Context (Index = DCI)
+            // Note: Output_Context layout:
+            // DeviceContext starts at offset 0 of Output_Context.
+            // But for Input_Context, DeviceContext starts at offset 0x20.
+            // Ep0 is at DeviceContext + 0x20.
+            // Eps[0] (which is DCI=2) is at DeviceContext + 0x40.
+            // So EpContext offset in InputContext = 0x20 (ICC) + 0x20 (Slot) + (DCI - 1) * 0x20
+            // Since DCI for EP 1 IN is 3, offset is 0x40 + 2 * 0x20 = 0x80.
+            // For u32 pointer, index = 0x80 / 4 = 32.
+            // General formula for u32 index: 8 (ICC) + 8 (Slot) + (dci - 1) * 8
+            let ep_ctx_ptr = base_ptr.add(16 + ((dci - 1) * 8) as usize);
+            
+            // Read Speed from OUTPUT_CONTEXT Slot Context DW0 (Bits 20:23)
+            let out_dw0 = core::ptr::read_volatile(&OUTPUT_CONTEXT.slot[0]);
+            let speed = (out_dw0 >> 20) & 0x0F;
+
+            // Interval Calculation depends on Speed
+            let interval_xhci = if speed == 3 || speed >= 4 {
+                // High-Speed (3) and SuperSpeed (4+): bInterval - 1
+                (interval.saturating_sub(1)) as u32
+            } else {
+                // Low-Speed / Full-Speed: RoundDown(log2(bInterval)) + 3
+                if interval > 0 {
+                    (31 - (interval as u32).leading_zeros()) + 3
+                } else {
+                    0
+                }
+            };
+
+            // DW0: Interval (16:23) | Max ESIT Payload (24:31)
+            // SPEC: For Periodic endpoints, Max ESIT Payload shall be set to the Max Packet Size.
+            ep_ctx_ptr.add(0).write_volatile((interval_xhci << 16) | ((mps as u32) << 24));
+
+            // DW1: MPS=mps, EP Type=7 (Interrupt IN), CErr=3
+            ep_ctx_ptr.add(1).write_volatile((7 << 3) | (3 << 1) | ((mps as u32) << 16));
+
+            // DW2: Dequeue Pointer Lo | DCS (Cycle Bit = 1)
+            // For now, we will reuse the bulk_in_ring_phys for the mouse interrupt IN ring
+            ep_ctx_ptr.add(2).write_volatile((self.bulk_in_ring_phys as u32) | 1);
+            // DW3: Dequeue Pointer Hi
+            ep_ctx_ptr.add(3).write_volatile((self.bulk_in_ring_phys >> 32) as u32);
+            // DW4: Avg TRB Len
+            // SPEC: Average TRB Length shall not be greater than Max Packet Size.
+            ep_ctx_ptr.add(4).write_volatile(mps as u32);
+
+            serial_println!("xHCI: Input Context Configured for Mouse Interrupt IN (DCI {}).", dci);
+
+            // SEND CONFIGURE ENDPOINT COMMAND
+            let trb = Trb {
+                parameter: self.input_context_phys,
+                status: 0,
+                control: (12 << 10) | ((slot_id as u32) << 24),
+            };
+
+            if let Err(e) = self.send_command(trb) {
+                serial_println!("xHCI: Failed to send Configure Endpoint command: {}", e);
+            } else {
+                self.mouse_state = 1; // Waiting for Configure Endpoint completion
+                self.ring_doorbell(0, 0); // Ring doorbell for Command Ring
+            }
+        }
+    }
+
+    pub fn send_set_configuration(&mut self, slot_id: u8, config_val: u8) {
+        unsafe {
+            serial_println!("xHCI: Sending SET_CONFIGURATION({}) to Slot {}", config_val, slot_id);
+            let setup_trb = Trb {
+                parameter: 0x0000000000000900 | ((config_val as u64) << 16), // bmRequestType=0, bRequest=9 (SET_CONFIGURATION), wValue=config_val
+                status: 8, // Length 8
+                control: (2 << 10) | (0 << 16) | (1 << 6), // Type 2 (Setup Stage), TRT=0 (No Data Stage), IDT=1
+            };
+            let s_param = setup_trb.parameter;
+            let s_status = setup_trb.status;
+            let s_ctrl = setup_trb.control;
+            serial_println!("xHCI: Setup TRB -> Param: {:#x}, Status: {:#x}, Control: {:#x}", s_param, s_status, s_ctrl);
+            self.push_ep0(setup_trb);
+
+            let status_trb = Trb {
+                parameter: 0,
+                status: 0,
+                control: (4 << 10) | (1 << 5) | (1 << 16), // Type 4 (Status Stage), IOC=1, DIR=1 (IN)
+            };
+            let st_param = status_trb.parameter;
+            let st_status = status_trb.status;
+            let st_ctrl = status_trb.control;
+            serial_println!("xHCI: Status TRB -> Param: {:#x}, Status: {:#x}, Control: {:#x}", st_param, st_status, st_ctrl);
+            self.push_ep0(status_trb);
+
+            self.ring_doorbell(slot_id, 1);
+        }
+    }
+
+    pub fn queue_mouse_read(&mut self, slot_id: u8) {
+        unsafe {
+            let ep_num = self.mouse_ep & 0x0F;
+            let dir_in = (self.mouse_ep & 0x80) != 0;
+            let dci = (ep_num * 2) + if dir_in { 1 } else { 0 };
+
+            let in_trb = Trb {
+                parameter: self.data_buffer_phys,
+                status: self.mouse_mps as u32, // Length
+                control: (1 << 10) | (1 << 5), // Type 1 | IOC. Removed ISP (Interrupt on Short Packet) to reduce spam
+            };
+            BULK_IN_RING.lock().push(in_trb).unwrap();
+            self.ring_doorbell(slot_id, dci as u32);
+            serial_println!("xHCI: Initial Mouse Read Queued.");
+        }
     }
 }

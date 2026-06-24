@@ -9,10 +9,19 @@ pub fn init() {
 
 pub fn hlt_loop() -> ! {
     loop {
-        unsafe {
-            core::arch::asm!("wfe");
-        }
+        hlt();
     }
+}
+
+pub fn hlt() {
+    unsafe {
+        // Polling mode for now, no WFE so we don't hang without interrupts
+        core::arch::asm!("nop");
+    }
+}
+
+pub fn poll_input() -> Option<u8> {
+    serial::SERIAL_PORT.lock().read_byte()
 }
 
 pub fn without_interrupts<F, R>(f: F) -> R

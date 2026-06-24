@@ -23,6 +23,7 @@ pub enum Event {
     Timer,
     Key(u8),
     Mouse { x: i32, y: i32 },
+    MouseAbsolute { x: i32, y: i32 },
     None,
     Unknown,
 }
@@ -52,11 +53,10 @@ pub trait GneissPal {
     }
 
     fn draw_text(&mut self, x: usize, y: usize, text: &str, color: u32) {
-        use font8x8::UnicodeFonts;
-        
         let mut curr_x = x;
         for ch in text.chars() {
-            if let Some(glyph) = font8x8::BASIC_FONTS.get(ch) {
+            if ch.is_ascii() {
+                let glyph = font8x8::legacy::BASIC_LEGACY[ch as usize];
                 for (row, byte) in glyph.iter().enumerate() {
                     for col in 0..8 {
                         if (byte & (1 << col)) != 0 {
