@@ -78,6 +78,61 @@ def udp(sport, dport, src_ip, dst_ip, payload):
     return bytes(seg)
 
 
+# TCP flag bits.
+FIN, SYN, RST, PSH, ACK = 0x01, 0x02, 0x04, 0x08, 0x10
+
+
+def tcp_checksum(src_ip, dst_ip, seg):
+    s = 0
+    for ip in (src_ip, dst_ip):
+        s += (ip[0] << 8) | ip[1]
+        s += (ip[2] << 8) | ip[3]
+    s += 6 + len(seg)
+    for i in range(0, len(seg) - 1, 2):
+        s += (seg[i] << 8) | seg[i + 1]
+    if len(seg) % 2:
+        s += seg[-1] << 8
+    while s >> 16:
+        s = (s & 0xFFFF) + (s >> 16)
+    return (~s) & 0xFFFF
+
+
+def tcp(sport, dport, seq, ack, flags, window, src_ip, dst_ip, payload):
+    seg = bytearray(struct.pack(">HHIIBBHHH", sport, dport, seq, ack, 5 << 4, flags, window, 0, 0) + payload)
+    seg[16:18] = struct.pack(">H", tcp_checksum(src_ip, dst_ip, seg))
+    return bytes(seg)
+
+
+def recv_tcp(s, my_port):
+    """Wait for a TCP segment from the guest addressed to our client port. Returns
+    (flags, seq, ack, payload, ip_ck_ok, tcp_ck_ok) or None on timeout."""
+    deadline = time.time() + 8
+    while time.time() < deadline:
+        try:
+            f = recv_frame(s)
+        except socket.timeout:
+            break
+        if not f or len(f) < 34:
+            continue
+        if struct.unpack(">H", f[12:14])[0] != 0x0800 or (f[14] >> 4) != 4 or f[23] != 6:
+            continue
+        ihl = (f[14] & 0x0F) * 4
+        total = struct.unpack(">H", f[16:18])[0]
+        src_ip, dst_ip = f[26:30], f[30:34]
+        ip_ck_ok = cksum(f[14:14 + ihl]) == 0
+        seg = f[14 + ihl:14 + total]
+        if len(seg) < 20 or struct.unpack(">H", seg[2:4])[0] != my_port:
+            continue
+        seq = struct.unpack(">I", seg[4:8])[0]
+        ack = struct.unpack(">I", seg[8:12])[0]
+        doff = (seg[12] >> 4) * 4
+        flags = seg[13]
+        payload = seg[doff:]
+        tcp_ck_ok = tcp_checksum(src_ip, dst_ip, seg) == 0
+        return (flags, seq, ack, payload, ip_ck_ok, tcp_ck_ok)
+    return None
+
+
 def send_frame(s, frame):
     s.sendall(struct.pack(">I", len(frame)) + frame)
 
@@ -188,6 +243,7 @@ def main():
     send_frame(s, eth(guest_mac, MY_MAC, 0x0800,
                       ipv4(MY_IP, GUEST_IP, 17, udp(sport, dport, MY_IP, GUEST_IP, udata))))
     print("-> UDP datagram %d->%d to 10.0.2.15 data=%r" % (sport, dport, udata))
+    udp_ok = False
     deadline = time.time() + 8
     while time.time() < deadline:
         try:
@@ -213,12 +269,50 @@ def main():
         if rsport == dport and rdport == sport and rpayload == udata and ip_ck_ok and udp_ck_ok:
             print("<- UDP echo %d->%d data=%r  ip_cksum=OK udp_cksum=OK   [UDP ECHO OK]"
                   % (rsport, rdport, rpayload))
-            print("ALL CHECKS PASSED")
-            return 0
+            udp_ok = True
+            break
         print("<- UDP reply: ports %d->%d data_match=%s ip_ck=%s udp_ck=%s"
               % (rsport, rdport, rpayload == udata, ip_ck_ok, udp_ck_ok))
-    print("FAIL: no valid UDP echo reply from guest")
-    return 1
+    if not udp_ok:
+        print("FAIL: no valid UDP echo reply from guest")
+        return 1
+
+    # --- TCP echo: handshake + data echo + teardown (tests the hand-rolled TCP) ---
+    c_isn, cport = 0x2000, 5555
+    send_frame(s, eth(guest_mac, MY_MAC, 0x0800,
+                      ipv4(MY_IP, GUEST_IP, 6, tcp(cport, 7, c_isn, 0, SYN, 4096, MY_IP, GUEST_IP, b""))))
+    print("-> TCP SYN to 10.0.2.15:7")
+    sa = recv_tcp(s, cport)
+    if sa is None or (sa[0] & (SYN | ACK)) != (SYN | ACK) or sa[2] != (c_isn + 1):
+        print("FAIL: no/invalid SYN-ACK (%s)" % (sa,))
+        return 1
+    s_isn = sa[1]
+    print("<- TCP SYN-ACK seq=%d ack=%d   [TCP HANDSHAKE OK]" % (s_isn, sa[2]))
+    send_frame(s, eth(guest_mac, MY_MAC, 0x0800,
+                      ipv4(MY_IP, GUEST_IP, 6, tcp(cport, 7, c_isn + 1, s_isn + 1, ACK, 4096, MY_IP, GUEST_IP, b""))))
+    tdata = b"tcp-echo-test"
+    send_frame(s, eth(guest_mac, MY_MAC, 0x0800,
+                      ipv4(MY_IP, GUEST_IP, 6, tcp(cport, 7, c_isn + 1, s_isn + 1, PSH | ACK, 4096, MY_IP, GUEST_IP, tdata))))
+    print("-> TCP data %r" % tdata)
+    echo = recv_tcp(s, cport)
+    if echo is None or echo[3] != tdata or not echo[4] or not echo[5]:
+        print("FAIL: no/invalid TCP echo (got %s)" % (echo,))
+        return 1
+    print("<- TCP echo %r  ip_cksum=OK tcp_cksum=OK   [TCP ECHO OK]" % (echo[3],))
+    n = len(tdata)
+    send_frame(s, eth(guest_mac, MY_MAC, 0x0800,
+                      ipv4(MY_IP, GUEST_IP, 6, tcp(cport, 7, c_isn + 1 + n, s_isn + 1 + n, FIN | ACK, 4096, MY_IP, GUEST_IP, b""))))
+    print("-> TCP FIN")
+    fin = recv_tcp(s, cport)
+    if fin is None or (fin[0] & FIN) == 0:
+        print("FAIL: no FIN-ACK from guest (%s)" % (fin,))
+        return 1
+    print("<- TCP FIN-ACK   [TCP CLOSE OK]")
+    send_frame(s, eth(guest_mac, MY_MAC, 0x0800,
+                      ipv4(MY_IP, GUEST_IP, 6, tcp(cport, 7, c_isn + 2 + n, s_isn + 2 + n, ACK, 4096, MY_IP, GUEST_IP, b""))))
+
+    print("ALL CHECKS PASSED")
+    return 0
 
 
 if __name__ == "__main__":

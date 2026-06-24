@@ -121,6 +121,8 @@ const OUR_IP: [u8; 4] = [10, 0, 2, 15];
 const GATEWAY_IP: [u8; 4] = [10, 0, 2, 2];
 /// DHCP transaction ID (fixed — a single client doing a one-shot DISCOVER). ASCII "UNAO".
 const DHCP_XID: u32 = 0x554E_414F;
+/// TCP port the built-in echo listener accepts connections on (RFC 862 echo service).
+const TCP_ECHO_PORT: u16 = 7;
 
 /// Legacy receive descriptor (16 bytes). Written by hardware via DMA, so every
 /// access goes through `read_volatile`/`write_volatile` on whole-struct copies —
@@ -163,6 +165,7 @@ pub struct E1000 {
     tx_count: u64,
     arp_state: ArpStateMachine,
     dhcp: net::dhcp::DhcpClient,
+    tcp: net::tcp::TcpEcho,
 }
 
 // The driver owns raw DMA pointers; it is only ever touched behind `NET_DEVICE`'s
@@ -437,7 +440,9 @@ impl E1000 {
 
             // DHCP client traffic (UDP 67->68) drives the lease state machine; everything
             // else goes to the responder stack (ARP / ICMP echo / UDP echo).
-            let mut tx_scratch = [0u8; 1518];
+            // Sized to RX_BUF_SIZE so a reply (e.g. a TCP/UDP echo) of any frame we can
+            // receive always fits — never a silent serialization failure.
+            let mut tx_scratch = [0u8; RX_BUF_SIZE];
             let reply = if let Some(dr) = net::dhcp::parse_reply(frame) {
                 let out = self.dhcp.on_reply(&dr, &mut tx_scratch);
                 if out.is_some() {
@@ -457,6 +462,11 @@ impl E1000 {
                     }
                 }
                 out
+            } else if let Some(n) =
+                self.tcp.handle(frame, self.arp_state.our_ip(), self.mac, &mut tx_scratch)
+            {
+                // TCP echo listener (stateful) handled it.
+                Some(n)
             } else {
                 net::ingress(frame, &self.arp_state, &mut tx_scratch)
             };
@@ -543,6 +553,7 @@ pub fn init(bus: u8, slot: u8, func: u8) {
         tx_count: 0,
         arp_state: ArpStateMachine::new(OUR_IP, [0; 6]),
         dhcp: net::dhcp::DhcpClient::new([0; 6], DHCP_XID),
+        tcp: net::tcp::TcpEcho::new(TCP_ECHO_PORT),
     };
     nic.reset_and_init();
     // Re-arm the ARP state machine + DHCP client now that the MAC is known.

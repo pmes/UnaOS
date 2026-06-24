@@ -22,6 +22,7 @@ pub mod ethernet;
 pub mod icmp;
 pub mod interface;
 pub mod ipv4;
+pub mod tcp;
 pub mod udp;
 
 use arp::ArpStateMachine;
