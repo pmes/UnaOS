@@ -119,6 +119,8 @@ const OUR_IP: [u8; 4] = [10, 0, 2, 15];
 /// slirp's virtual gateway. We ARP-probe it at bring-up to exercise TX and provoke a
 /// real inbound frame (slirp answers ARP for its gateway), proving the RX path too.
 const GATEWAY_IP: [u8; 4] = [10, 0, 2, 2];
+/// DHCP transaction ID (fixed — a single client doing a one-shot DISCOVER). ASCII "UNAO".
+const DHCP_XID: u32 = 0x554E_414F;
 
 /// Legacy receive descriptor (16 bytes). Written by hardware via DMA, so every
 /// access goes through `read_volatile`/`write_volatile` on whole-struct copies —
@@ -160,6 +162,7 @@ pub struct E1000 {
     tx_cur: usize,
     tx_count: u64,
     arp_state: ArpStateMachine,
+    dhcp: net::dhcp::DhcpClient,
 }
 
 // The driver owns raw DMA pointers; it is only ever touched behind `NET_DEVICE`'s
@@ -432,10 +435,31 @@ impl E1000 {
                 serial_println!("[e1000] RX #{} len={} (runt/unparseable)", self.rx_count, len);
             }
 
-            // Route the frame up the stack; ingress writes any reply (e.g. an ARP
-            // reply) into tx_scratch and returns its length.
+            // DHCP client traffic (UDP 67->68) drives the lease state machine; everything
+            // else goes to the responder stack (ARP / ICMP echo / UDP echo).
             let mut tx_scratch = [0u8; 1518];
-            let reply = net::ingress(frame, &self.arp_state, &mut tx_scratch);
+            let reply = if let Some(dr) = net::dhcp::parse_reply(frame) {
+                let out = self.dhcp.on_reply(&dr, &mut tx_scratch);
+                if out.is_some() {
+                    serial_println!(
+                        "[dhcp] OFFER {}.{}.{}.{} from {}.{}.{}.{} -> REQUEST",
+                        dr.your_ip[0], dr.your_ip[1], dr.your_ip[2], dr.your_ip[3],
+                        dr.server_ip[0], dr.server_ip[1], dr.server_ip[2], dr.server_ip[3]
+                    );
+                }
+                // Apply a fresh lease to our IP / ARP identity.
+                if self.dhcp.state == net::dhcp::DhcpState::Bound {
+                    if let Some(ip) = self.dhcp.leased_ip {
+                        if self.arp_state.our_ip() != ip {
+                            self.arp_state = ArpStateMachine::new(ip, self.mac);
+                            serial_println!("[dhcp] bound: IP {}.{}.{}.{}", ip[0], ip[1], ip[2], ip[3]);
+                        }
+                    }
+                }
+                out
+            } else {
+                net::ingress(frame, &self.arp_state, &mut tx_scratch)
+            };
 
             // Recycle: clear DD and hand the descriptor back via RDT.
             let mut d = desc;
@@ -518,10 +542,12 @@ pub fn init(bus: u8, slot: u8, func: u8) {
         tx_cur: 0,
         tx_count: 0,
         arp_state: ArpStateMachine::new(OUR_IP, [0; 6]),
+        dhcp: net::dhcp::DhcpClient::new([0; 6], DHCP_XID),
     };
     nic.reset_and_init();
-    // Re-arm the ARP state machine now that the MAC is known.
+    // Re-arm the ARP state machine + DHCP client now that the MAC is known.
     nic.arp_state = ArpStateMachine::new(OUR_IP, nic.mac);
+    nic.dhcp = net::dhcp::DhcpClient::new(nic.mac, DHCP_XID);
 
     serial_println!(
         "[e1000] up: MAC={} link={} ip={}.{}.{}.{} (RX {} / TX {} desc, promiscuous)",
@@ -534,6 +560,17 @@ pub fn init(bus: u8, slot: u8, func: u8) {
     // Probe the gateway: exercises TX end-to-end and provokes an inbound ARP reply
     // (proving RX) since slirp answers ARP for its own gateway address.
     nic.send_arp_request(GATEWAY_IP);
+
+    // Kick off DHCP (best effort): broadcast a DISCOVER now; the OFFER/ACK are handled in
+    // poll(), which applies the lease. If no server answers (socket / vmnet-host modes), we
+    // keep the static OUR_IP so the ARP/ICMP/UDP responders still work.
+    {
+        let mut frame = [0u8; 400];
+        if let Some(n) = nic.dhcp.discover(&mut frame) {
+            nic.transmit(&frame[..n]);
+            serial_println!("[dhcp] DISCOVER sent (xid {:#010x})", DHCP_XID);
+        }
+    }
 
     // Publish the MMIO base so the lock-free MSI handler can read/clear ICR. Interrupts
     // themselves are wired by `enable_interrupts`, called from the arch-specific PCI init.

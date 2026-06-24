@@ -163,7 +163,9 @@ fn main() {
         // ARP/ICMP responder testing without privileges. QEMU listens; injector connects.
         cmd.arg("-netdev").arg("socket,id=n0,listen=127.0.0.1:5555");
     } else {
-        cmd.arg("-netdev").arg("user,id=n0");
+        // dhcpstart shifts slirp's DHCP pool so a successful lease (10.0.2.20) is visibly
+        // distinct from the guest's static fallback (10.0.2.15) — makes DHCP easy to confirm.
+        cmd.arg("-netdev").arg("user,id=n0,dhcpstart=10.0.2.20");
     }
     cmd.arg("-device").arg("e1000e,netdev=n0,mac=52:54:00:12:34:56");
 
