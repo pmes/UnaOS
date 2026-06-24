@@ -165,7 +165,7 @@ fn main() {
     } else {
         cmd.arg("-netdev").arg("user,id=n0");
     }
-    cmd.arg("-device").arg("e1000,netdev=n0,mac=52:54:00:12:34:56");
+    cmd.arg("-device").arg("e1000e,netdev=n0,mac=52:54:00:12:34:56");
 
     // DIAGNOSTIC: append arbitrary QEMU args from UNAOS_QEMU_EXTRA (whitespace-split), e.g.
     // `-d guest_errors -trace usb_xhci_* -trace usb_msd_*`, so we can capture QEMU's own

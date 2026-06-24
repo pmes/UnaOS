@@ -230,6 +230,68 @@ impl PciScanner {
         }
     }
 
+    /// Enable MSI (single message) on a device, delivering interrupt `vector` to the
+    /// interrupt controller at `msg_addr`. Used when the MSI-X table is not in BAR0 (e.g.
+    /// the e1000e keeps its MSI-X table in BAR3, which `enable_msix` doesn't map) — plain MSI
+    /// needs no BAR: the address/data live in PCI config space. Programs the capability fully
+    /// before setting the Enable bit. Returns true on success. Lock-free: config-space only.
+    pub fn enable_msi(bus: u8, slot: u8, func: u8, msg_addr: u32, vector: u32) -> bool {
+        unsafe {
+            let status = (crate::arch::pci::read_config_32(bus, slot, func, 0x04) >> 16) as u16;
+            if (status & (1 << 4)) == 0 {
+                serial_println!("[MSI] {}:{}.{} has no capability list.", bus, slot, func);
+                return false;
+            }
+
+            // Walk the capability list for the MSI capability (id 0x05).
+            let mut cap_ptr = (crate::arch::pci::read_config_32(bus, slot, func, 0x34) & 0xFF) as u8;
+            let mut msi_cap = 0u8;
+            let mut guard = 0u8;
+            while cap_ptr != 0 && cap_ptr != 0xFF && guard < 32 {
+                let cap = crate::arch::pci::read_config_32(bus, slot, func, cap_ptr);
+                if (cap & 0xFF) as u8 == 0x05 {
+                    msi_cap = cap_ptr;
+                    break;
+                }
+                cap_ptr = ((cap >> 8) & 0xFF) as u8;
+                guard += 1;
+            }
+            if msi_cap == 0 {
+                serial_println!("[MSI] {}:{}.{} has no MSI capability (id 0x05).", bus, slot, func);
+                return false;
+            }
+
+            // Message Control at cap+0x02: bit 7 = 64-bit address capable.
+            let msg_ctl = crate::arch::pci::read_config_16(bus, slot, func, msi_cap + 2);
+            let is_64bit = (msg_ctl & (1 << 7)) != 0;
+
+            // Message Address (low 32 bits) at cap+0x04, written as two 16-bit halves
+            // (only read/write_config_16 + read_config_32 exist).
+            crate::arch::pci::write_config_16(bus, slot, func, msi_cap + 4, (msg_addr & 0xFFFF) as u16);
+            crate::arch::pci::write_config_16(bus, slot, func, msi_cap + 6, (msg_addr >> 16) as u16);
+            let data_off = if is_64bit {
+                // Upper 32 bits of the message address are 0 (local APIC is below 4 GiB).
+                crate::arch::pci::write_config_16(bus, slot, func, msi_cap + 8, 0);
+                crate::arch::pci::write_config_16(bus, slot, func, msi_cap + 10, 0);
+                msi_cap + 0x0C
+            } else {
+                msi_cap + 0x08
+            };
+            crate::arch::pci::write_config_16(bus, slot, func, data_off, vector as u16);
+
+            // Message Control: Multiple Message Enable (bits 6:4) = 0 (one vector), Enable bit 0 = 1.
+            let msg_ctl = (msg_ctl & !(0x7u16 << 4)) | 1;
+            crate::arch::pci::write_config_16(bus, slot, func, msi_cap + 2, msg_ctl);
+
+            serial_println!(
+                "[MSI] Enabled on {}:{}.{}: cap@{:#04x} addr={:#x} data={:#x} ({}-bit) MsgCtl={:#06x}",
+                bus, slot, func, msi_cap, msg_addr, vector,
+                if is_64bit { 64 } else { 32 }, msg_ctl
+            );
+            true
+        }
+    }
+
     pub fn disable_interrupts(bus: u8, slot: u8, func: u8) {
         let command_reg_offset = 0x04;
         let current_val = unsafe { crate::arch::pci::read_config_16(bus, slot, func, command_reg_offset) };

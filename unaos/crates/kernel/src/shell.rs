@@ -130,8 +130,8 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
                         if n.link_up { "UP" } else { "DOWN" }
                     ));
                     console.println(&alloc::format!(
-                        "BAR0 {:#x}  RX frames: {}  TX frames: {}",
-                        n.mmio_base, n.rx_count, n.tx_count
+                        "BAR0 {:#x}  RX frames: {}  TX frames: {}  IRQs: {}",
+                        n.mmio_base, n.rx_count, n.tx_count, n.irq_count
                     ));
                 }
                 None => console.println("No network device ready."),

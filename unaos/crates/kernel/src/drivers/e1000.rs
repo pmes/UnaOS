@@ -14,20 +14,22 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 //
-// Intel 8254x (e1000 / QEMU 82540EM) network driver — Phase 1: receive only,
-// polled. Mirrors the xHCI/`drivers/block.rs` patterns: a global `NET_DEVICE`
-// registry populated during PCI init, drained from the main loop via
-// `service_net()`. DMA structures use the same "heap pointer == physical
-// address" identity-map invariant the xHCI rings rely on (the heap is initialised
-// directly at `region.phys_start`, and the kernel runs on UEFI's 1:1 page tables).
+// Intel 8254x / e1000e (QEMU `-device e1000e` = 82574L) network driver. Mirrors the
+// xHCI/`drivers/block.rs` patterns: a global `NET_DEVICE` registry populated during PCI
+// init, drained from the main loop via `service_net()`. DMA structures use the same "heap
+// pointer == physical address" identity-map invariant the xHCI rings rely on (the heap is
+// initialised directly at `region.phys_start`, and the kernel runs on UEFI's 1:1 page tables).
 //
-// Phase 1 scope: PCI BAR map, software reset, MAC read (RAL/RAH, EEPROM fallback),
-// RX legacy-descriptor ring + buffers, promiscuous receive, link up, polled drain
-// into `net::ingress`. Transmit (the `NetworkDevice::transmit` half) and the
-// interrupt-driven RX path arrive in later phases.
+// Scope: PCI BAR map, software reset, MAC read (RAL/RAH, EEPROM fallback), RX + TX
+// legacy-descriptor rings (DMA), promiscuous receive, link up, and a polled drain into
+// `net::ingress` (which answers ARP / ICMP echo / UDP echo). RX is also interrupt-driven:
+// the e1000e's RX interrupt is delivered as an MSI to the local APIC (IDT vector 0x41) to
+// wake the CPU from `hlt`; the lock-free handler only ACKs + EOIs, the main loop does the work.
+// (We use MSI rather than MSI-X because the e1000e keeps its MSI-X table in BAR3.)
 
 use core::alloc::Layout;
 use core::ptr::{read_volatile, write_volatile};
+use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use spin::Mutex;
 
 use crate::drivers::pci::PciScanner;
@@ -38,7 +40,8 @@ use net::ethernet::EthernetFrame;
 const REG_CTRL: u32 = 0x0000; // Device Control
 const REG_STATUS: u32 = 0x0008; // Device Status
 const REG_EERD: u32 = 0x0014; // EEPROM Read
-const REG_ICR: u32 = 0x00C0; // Interrupt Cause Read
+const REG_ICR: u32 = 0x00C0; // Interrupt Cause Read (reading clears the causes)
+const REG_IMS: u32 = 0x00D0; // Interrupt Mask Set
 const REG_IMC: u32 = 0x00D8; // Interrupt Mask Clear
 const REG_RCTL: u32 = 0x0100; // Receive Control
 const REG_RDBAL: u32 = 0x2800; // RX Descriptor Base Low
@@ -89,6 +92,9 @@ const TX_CMD_EOP: u8 = 1 << 0; // End Of Packet
 const TX_CMD_IFCS: u8 = 1 << 1; // Insert FCS (CRC)
 const TX_CMD_RS: u8 = 1 << 3; // Report Status (sets DD when done)
 const TX_STATUS_DD: u8 = 1 << 0; // Descriptor Done
+
+// --- Interrupt cause/mask bits ---
+const IMS_RXT0: u32 = 1 << 7; // Receiver Timer Interrupt (fires when a packet is received)
 
 // --- EEPROM (EERD) bits, 82540EM layout ---
 const EERD_START: u32 = 1 << 0;
@@ -389,6 +395,12 @@ impl E1000 {
         self.reg_read(REG_STATUS) & STATUS_LU != 0
     }
 
+    /// Unmask the receiver-timer interrupt (RXT0) so received packets raise the MSI.
+    fn enable_rx_interrupt(&self) {
+        let _ = self.reg_read(REG_ICR); // clear any stale causes first
+        self.reg_write(REG_IMS, IMS_RXT0);
+    }
+
     /// Drain all completed RX descriptors, handing each frame to `net::ingress`.
     /// Recycles descriptors back to hardware by advancing RDT, following the
     /// standard 8254x head/tail protocol.
@@ -408,12 +420,13 @@ impl E1000 {
             self.rx_count += 1;
             if let Some(eth) = EthernetFrame::new(frame) {
                 serial_println!(
-                    "[e1000] RX #{} len={} src={} dst={} type={:?}",
+                    "[e1000] RX #{} len={} src={} dst={} type={:?} irqs={}",
                     self.rx_count,
                     len,
                     fmt_mac(&eth.source_mac()),
                     fmt_mac(&eth.destination_mac()),
-                    eth.ethertype()
+                    eth.ethertype(),
+                    IRQ_COUNT.load(Ordering::Relaxed)
                 );
             } else {
                 serial_println!("[e1000] RX #{} len={} (runt/unparseable)", self.rx_count, len);
@@ -446,6 +459,7 @@ impl E1000 {
             link_up: self.link_up(),
             rx_count: self.rx_count,
             tx_count: self.tx_count,
+            irq_count: IRQ_COUNT.load(Ordering::Relaxed),
             mmio_base: self.mmio_base,
         }
     }
@@ -458,11 +472,32 @@ pub struct NetInfo {
     pub link_up: bool,
     pub rx_count: u64,
     pub tx_count: u64,
+    pub irq_count: u64,
     pub mmio_base: usize,
 }
 
 /// The one registered network device (populated by [`init`]).
 pub static NET_DEVICE: Mutex<Option<E1000>> = Mutex::new(None);
+
+/// MMIO base of the NIC, published for the lock-free MSI handler (which must not take the
+/// NET_DEVICE lock). Set during [`init`]; 0 means no NIC / interrupts not wired.
+static MMIO_BASE: AtomicUsize = AtomicUsize::new(0);
+
+/// Count of NIC interrupts taken (RX MSI). Proves interrupt delivery; bumped from the handler.
+pub static IRQ_COUNT: AtomicU64 = AtomicU64::new(0);
+
+/// Lock-free MSI acknowledgement, called from the IDT vector 0x41 handler. Reads ICR (which
+/// clears the e1000e's interrupt causes so it can raise again) and bumps the IRQ counter. Must
+/// not touch NET_DEVICE — frame processing happens in the polled `service_net`.
+pub fn interrupt_ack() {
+    let base = MMIO_BASE.load(Ordering::Acquire);
+    if base != 0 {
+        unsafe {
+            let _ = read_volatile((base + REG_ICR as usize) as *const u32);
+        }
+        IRQ_COUNT.fetch_add(1, Ordering::Relaxed);
+    }
+}
 
 /// Probe + bring up an Intel 8254x NIC at the given PCI address. Called from the
 /// (x86_64) PCI init after the BAR has been located.
@@ -489,7 +524,7 @@ pub fn init(bus: u8, slot: u8, func: u8) {
     nic.arp_state = ArpStateMachine::new(OUR_IP, nic.mac);
 
     serial_println!(
-        "[e1000] up: MAC={} link={} ip={}.{}.{}.{} (RX {} / TX {} desc, promiscuous, polled)",
+        "[e1000] up: MAC={} link={} ip={}.{}.{}.{} (RX {} / TX {} desc, promiscuous)",
         fmt_mac(&nic.mac),
         if nic.link_up() { "UP" } else { "DOWN" },
         OUR_IP[0], OUR_IP[1], OUR_IP[2], OUR_IP[3],
@@ -500,7 +535,29 @@ pub fn init(bus: u8, slot: u8, func: u8) {
     // (proving RX) since slirp answers ARP for its own gateway address.
     nic.send_arp_request(GATEWAY_IP);
 
+    // Publish the MMIO base so the lock-free MSI handler can read/clear ICR. Interrupts
+    // themselves are wired by `enable_interrupts`, called from the arch-specific PCI init.
+    MMIO_BASE.store(nic.mmio_base, Ordering::Release);
     *NET_DEVICE.lock() = Some(nic);
+}
+
+/// Wire the NIC's RX interrupt: enable MSI (delivering `vector` to `msg_addr` — the interrupt
+/// controller) then unmask the receiver interrupt. Arch-neutral: the caller supplies the
+/// arch-specific message address (on x86, the local APIC) and IDT vector, so this module never
+/// references the APIC/IDT directly. Returns true if MSI was enabled (else the NIC stays polled).
+pub fn enable_interrupts(bus: u8, slot: u8, func: u8, msg_addr: u32, vector: u32) -> bool {
+    let ok = PciScanner::enable_msi(bus, slot, func, msg_addr, vector);
+    if ok {
+        if let Some(nic) = NET_DEVICE.lock().as_ref() {
+            nic.enable_rx_interrupt();
+        }
+    }
+    serial_println!(
+        "[e1000] RX interrupt (MSI vector {:#x}): {}",
+        vector,
+        if ok { "enabled" } else { "unavailable (polled only)" }
+    );
+    ok
 }
 
 /// Main-loop hook: poll the NIC for received frames. No-op if no NIC is present
