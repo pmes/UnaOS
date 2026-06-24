@@ -139,6 +139,13 @@ fn main() {
        .arg("-device").arg("usb-tablet,bus=xhci.0")
        .arg("-m").arg("1G");
 
+    // SMP: bring up multiple CPUs so the kernel's AP-startup path has application
+    // processors to discover (ACPI MADT) and boot (INIT-SIPI-SIPI). Override the core
+    // count with UNAOS_SMP (e.g. `UNAOS_SMP=1` to force uniprocessor). The BSP still
+    // drives xHCI/console/storage; APs idle until the scheduler work lands.
+    let smp = std::env::var("UNAOS_SMP").unwrap_or_else(|_| "4".into());
+    cmd.arg("-smp").arg(smp);
+
     // DIAGNOSTIC: append arbitrary QEMU args from UNAOS_QEMU_EXTRA (whitespace-split), e.g.
     // `-d guest_errors -trace usb_xhci_* -trace usb_msd_*`, so we can capture QEMU's own
     // tracing of the xHCI/SCSI path. In test mode QEMU's stderr is redirected to a file.
