@@ -100,6 +100,15 @@ prepare_aarch64() {
         echo -e "${COLOR_RED}CRITICAL: AAVMF Firmware not found.${COLOR_RESET}"
         exit 1
     fi
+
+    # Ensure the USB mass-storage backing image exists (64 MiB, signed) — mirrors the x86
+    # builder (builder/src/main.rs) so `usb-storage` has something to enumerate on aarch64 too.
+    local USB_IMG="${WORKSPACE_DIR}/builder/usb.img"
+    if [ ! -f "$USB_IMG" ]; then
+        echo -e "${COLOR_YELLOW}⚡ Creating usb.img (64 MiB, signed)...${COLOR_RESET}"
+        dd if=/dev/zero of="$USB_IMG" bs=1m count=0 seek=64 2>/dev/null
+        printf 'UNA-OS-DISK-001-ALPHA' | dd of="$USB_IMG" conv=notrunc 2>/dev/null
+    fi
 }
 
 launch_aarch64() {
@@ -121,6 +130,8 @@ launch_aarch64() {
         -serial stdio \
         -device ramfb \
         -device qemu-xhci,id=xhci \
+        -drive if=none,id=stick,format=raw,file="${WORKSPACE_DIR}/builder/usb.img" \
+        -device usb-storage,bus=xhci.0,drive=stick \
         -device usb-kbd,bus=xhci.0 \
         -device usb-tablet,bus=xhci.0 \
         -no-reboot \
@@ -141,7 +152,10 @@ test_aarch64() {
         -drive if=pflash,format=raw,readonly=on,file="$AAVMF_PATH" \
         -drive format=raw,file=fat:rw:"$ESP_DIR_ARM" \
         -serial "file:${logf}" -device ramfb -display none \
-        -device qemu-xhci,id=xhci -device usb-kbd,bus=xhci.0 -device usb-tablet,bus=xhci.0 \
+        -device qemu-xhci,id=xhci \
+        -drive if=none,id=stick,format=raw,file="${WORKSPACE_DIR}/builder/usb.img" \
+        -device usb-storage,bus=xhci.0,drive=stick \
+        -device usb-kbd,bus=xhci.0 -device usb-tablet,bus=xhci.0 \
         -no-reboot -no-shutdown &
     local qpid=$!
     sleep "$secs"
