@@ -389,6 +389,17 @@ struct Ep0Pending {
     completion_code: u8,
 }
 
+/// In-flight SYNCHRONOUS command (ENABLE_SLOT / ADDRESS_DEVICE / CONFIGURE_ENDPOINT) issued
+/// during hub bring-up. The completion is matched by the command TRB's physical address, so the
+/// sync pump claims exactly its own command and the async enumeration FSM is left untouched.
+#[derive(Clone, Copy)]
+struct CmdPending {
+    cmd_trb_phys: u64,
+    done: bool,
+    completion_code: u8,
+    slot_id: u8,
+}
+
 pub struct DeviceSlot {
     pub active: bool,
     pub port_id: u8,
@@ -487,6 +498,8 @@ pub struct XhciController {
 
     /// In-flight synchronous EP0 control transfer (hub bring-up). See `Ep0Pending`.
     ep0_pending: Option<Ep0Pending>,
+    /// In-flight synchronous command (hub bring-up). See `CmdPending`.
+    cmd_pending: Option<CmdPending>,
     /// Slots of hubs detected during enumeration, awaiting (main-loop) bring-up.
     hubs_pending: Vec<u8>,
 }
@@ -536,6 +549,7 @@ impl XhciController {
             bot_tag: 1,
             bot_pending: None,
             ep0_pending: None,
+            cmd_pending: None,
             hubs_pending: Vec::new(),
         }
     }
@@ -681,6 +695,20 @@ impl XhciController {
                         let command_ptr = param;
                         let completion_code = (status >> 24) & 0xFF;
                         let slot_id = (control >> 24) & 0xFF;
+
+                        // A synchronous command (hub bring-up) claims its OWN completion here,
+                        // matched by command-TRB address, before the async enumeration FSM below.
+                        // Inert (None) during normal enumeration, so that path is untouched.
+                        if let Some(p) = self.cmd_pending {
+                            if command_ptr == p.cmd_trb_phys {
+                                if let Some(cp) = self.cmd_pending.as_mut() {
+                                    cp.completion_code = completion_code as u8;
+                                    cp.slot_id = slot_id as u8;
+                                    cp.done = true;
+                                }
+                                return; // consumed by the sync command pump
+                            }
+                        }
 
                         serial_println!("xHCI: [Event] Command Completion. Ptr={:#x}, Slot={}, Code={}",
                             command_ptr, slot_id, completion_code);
@@ -1946,11 +1974,50 @@ impl XhciController {
         }
     }
 
+    /// Synchronous xHCI command (ENABLE_SLOT / ADDRESS_DEVICE / CONFIGURE_ENDPOINT): push the TRB
+    /// to the command ring, ring the command doorbell, and pump until the completion arrives
+    /// (matched by command-TRB address). Returns (completion_code, slot_id). Used for hub bring-up
+    /// so downstream devices are enumerated without threading new states through the async FSM.
+    fn run_command_sync(&mut self, trb: Trb) -> Result<(u8, u8), ()> {
+        let cmd_phys = {
+            let mut g = COMMAND_RING.lock();
+            let ring = g.as_mut().ok_or(())?;
+            let base = ring.get_ptr();
+            let idx = ring.push(trb).map_err(|_| ())?;
+            base + (idx as u64) * 16
+        };
+        self.ring_doorbell(0, 0);
+        self.cmd_pending = Some(CmdPending { cmd_trb_phys: cmd_phys, done: false, completion_code: 0, slot_id: 0 });
+        let pump = self.pump_until_cmd_done(2000);
+        let pending = self.cmd_pending.take();
+        pump?;
+        let p = pending.ok_or(())?;
+        Ok((p.completion_code, p.slot_id))
+    }
+
+    fn pump_until_cmd_done(&mut self, max_iters: u64) -> Result<(), ()> {
+        let mut iters: u64 = 0;
+        loop {
+            match &self.cmd_pending {
+                Some(p) if p.done => return Ok(()),
+                None => return Ok(()),
+                _ => {}
+            }
+            if self.drain_event_ring_once() {
+                continue;
+            }
+            crate::hlt();
+            iters += 1;
+            if iters >= max_iters {
+                serial_println!("xHCI: command sync pump TIMEOUT after {} yields", iters);
+                return Err(());
+            }
+        }
+    }
+
     /// Main-loop hook: bring up any hubs discovered during enumeration. Synchronous (runs in the
-    /// safe polled context, like storage bring-up): SET_CONFIGURATION, read the hub descriptor for
-    /// the downstream port count, power every port, then scan port status to find attached
-    /// devices. (Downstream device enumeration is the next step.) Additive: only runs when a hub
-    /// was detected; the root-port path is untouched.
+    /// safe polled context, like storage bring-up). Additive: only runs when a hub was detected;
+    /// the root-port path is untouched.
     pub fn service_hubs(&mut self) {
         while let Some(hub_slot) = self.hubs_pending.pop() {
             self.bring_up_hub(hub_slot);
@@ -1985,14 +2052,20 @@ impl XhciController {
         serial_println!("xHCI: HUB slot {} has {} downstream ports (characteristics {:#06x})",
             hub_slot, nbr_ports, characteristics);
 
-        // 3. Power on every downstream port (SET_FEATURE PORT_POWER = feature 8).
+        let root_hub_port = self.slots[hub_slot as usize].port_id;
+        let ttt = ((characteristics >> 5) & 0x3) as u32; // TT Think Time (wHubCharacteristics bits 5-6)
+
+        // 3. Mark the slot as a hub (Hub bit + Number of Ports + TTT) so the controller will route
+        //    transactions through it to downstream devices.
+        self.set_hub_slot_context(hub_slot, nbr_ports, ttt);
+
+        // 4. Power on every downstream port (SET_FEATURE PORT_POWER = feature 8), then settle.
         for port in 1..=nbr_ports {
             let _ = self.sync_control(hub_slot, 0x23, 0x03, 8, port as u16, 0, 0, false);
         }
-        // Let the ports settle (bPwrOn2PwrGood); pump any events meanwhile.
         for _ in 0..200 { if !self.drain_event_ring_once() { crate::hlt(); } }
 
-        // 4. Read each port's status (GET_STATUS, recipient Other) and report attached devices.
+        // 5. For each connected downstream port: reset it, then enumerate the device behind it.
         for port in 1..=nbr_ports {
             if self.sync_control(hub_slot, 0xA3, 0x00, 0, port as u16, 4, buf, true).is_err() {
                 continue;
@@ -2002,10 +2075,215 @@ impl XhciController {
                 (*p.add(0) as u32) | ((*p.add(1) as u32) << 8)
                     | ((*p.add(2) as u32) << 16) | ((*p.add(3) as u32) << 24)
             };
-            if pstatus & 1 != 0 {
-                serial_println!("xHCI: HUB slot {} port {}: device connected (status {:#x})",
-                    hub_slot, port, pstatus);
+            if pstatus & 1 == 0 {
+                continue; // nothing connected
             }
+            serial_println!("xHCI: HUB slot {} port {}: device connected; enumerating...", hub_slot, port);
+            if let Some(speed) = self.reset_downstream_port(hub_slot, port, buf) {
+                self.enumerate_downstream(hub_slot, port, root_hub_port, speed);
+            }
+        }
+        serial_println!("xHCI: === HUB slot {} bring-up complete ===", hub_slot);
+    }
+
+    /// Mark a slot as a USB hub in its slot context (Hub bit, Number of Ports, TT Think Time) via
+    /// a Configure-Endpoint command updating only the slot context. Required before the controller
+    /// will route to the hub's downstream devices.
+    fn set_hub_slot_context(&mut self, hub_slot: u8, nbr_ports: u8, ttt: u32) {
+        unsafe {
+            let input_ctx_virt = self.slots[hub_slot as usize].input_context;
+            let output_ctx_virt = self.slots[hub_slot as usize].output_context;
+            let base_ptr = input_ctx_virt as *mut u32;
+            core::ptr::write_bytes(base_ptr as *mut u8, 0, 1056);
+            base_ptr.add(1).write_volatile(1); // Input Control: A0 (slot context) only
+
+            let slot_ctx = base_ptr.add(8);
+            for i in 0..8 {
+                slot_ctx.add(i).write_volatile(core::ptr::read_volatile((output_ctx_virt as *const u32).add(i)));
+            }
+            // DW0 bit 26 = Hub. DW1 bits 24:31 = Number of Ports. DW2 bits 16:17 = TT Think Time.
+            slot_ctx.add(0).write_volatile(slot_ctx.add(0).read_volatile() | (1 << 26));
+            slot_ctx.add(1).write_volatile((slot_ctx.add(1).read_volatile() & 0x00FF_FFFF) | ((nbr_ports as u32) << 24));
+            slot_ctx.add(2).write_volatile((slot_ctx.add(2).read_volatile() & !(0x3 << 16)) | (ttt << 16));
+        }
+        let trb = Trb {
+            parameter: self.slots[hub_slot as usize].input_context as u64,
+            status: 0,
+            control: (12 << 10) | ((hub_slot as u32) << 24),
+        };
+        match self.run_command_sync(trb) {
+            Ok((1, _)) => serial_println!("xHCI: HUB slot {} marked as hub ({} ports)", hub_slot, nbr_ports),
+            Ok((c, _)) => serial_println!("xHCI: HUB slot {} configure-endpoint code {}", hub_slot, c),
+            Err(_) => serial_println!("xHCI: HUB slot {} configure-endpoint timed out", hub_slot),
+        }
+    }
+
+    /// Reset a downstream hub port; return the attached device's xHCI speed code (1=FS, 2=LS, 3=HS)
+    /// or None if the port did not enable. Uses hub-class port requests (CLEAR/SET_FEATURE,
+    /// GET_STATUS).
+    fn reset_downstream_port(&mut self, hub_slot: u8, port: u8, buf: u64) -> Option<u32> {
+        let _ = self.sync_control(hub_slot, 0x23, 0x01, 16, port as u16, 0, 0, false); // CLEAR C_PORT_CONNECTION
+        let _ = self.sync_control(hub_slot, 0x23, 0x03, 4, port as u16, 0, 0, false); // SET PORT_RESET
+
+        let mut pstatus = 0u32;
+        for _ in 0..50 {
+            for _ in 0..20 { if !self.drain_event_ring_once() { crate::hlt(); } }
+            if self.sync_control(hub_slot, 0xA3, 0x00, 0, port as u16, 4, buf, true).is_err() {
+                return None;
+            }
+            pstatus = unsafe {
+                let p = buf as *const u8;
+                (*p.add(0) as u32) | ((*p.add(1) as u32) << 8)
+                    | ((*p.add(2) as u32) << 16) | ((*p.add(3) as u32) << 24)
+            };
+            if pstatus & (1 << 20) != 0 { break; } // C_PORT_RESET set
+        }
+        let _ = self.sync_control(hub_slot, 0x23, 0x01, 20, port as u16, 0, 0, false); // CLEAR C_PORT_RESET
+
+        if pstatus & (1 << 1) == 0 {
+            serial_println!("xHCI: HUB port {} did not enable after reset (status {:#x})", port, pstatus);
+            return None;
+        }
+        // Hub port status: bit 9 = Low Speed, bit 10 = High Speed; otherwise Full Speed.
+        let speed = if pstatus & (1 << 9) != 0 { 2u32 } else if pstatus & (1 << 10) != 0 { 3 } else { 1 };
+        serial_println!("xHCI: HUB port {} reset OK (status {:#x}, xHCI speed {})", port, pstatus, speed);
+        Some(speed)
+    }
+
+    /// Address a device behind a hub: like `address_device` but the slot context carries a
+    /// non-zero Route String (the downstream port number, tier 1), the chain's Root Hub Port
+    /// Number, and the device Speed. Synchronous. Returns true on success.
+    fn address_downstream(&mut self, slot_id: u8, root_hub_port: u8, route_string: u32, speed: u32) -> bool {
+        unsafe {
+            let input_layout = core::alloc::Layout::from_size_align(core::mem::size_of::<InputContext>(), 64).unwrap();
+            let output_layout = core::alloc::Layout::from_size_align(core::mem::size_of::<DeviceContext>(), 64).unwrap();
+            let input_ctx_virt = alloc::alloc::alloc_zeroed(input_layout) as *mut InputContext;
+            let output_ctx_virt = alloc::alloc::alloc_zeroed(output_layout) as *mut DeviceContext;
+            let ep0_ring = ring::TransferRing::new(16);
+            let ep0_ring_phys = ep0_ring.get_ptr();
+
+            let slot = &mut self.slots[slot_id as usize];
+            slot.input_context = input_ctx_virt;
+            slot.output_context = output_ctx_virt;
+            slot.ep0_ring = Some(ep0_ring);
+            slot.port_id = root_hub_port;
+            slot.active = true;
+
+            *self.dcbaap.add(slot_id as usize) = output_ctx_virt as u64;
+
+            let base_ptr = input_ctx_virt as *mut u32;
+            core::ptr::write_bytes(base_ptr as *mut u8, 0, 1056);
+            base_ptr.add(1).write_volatile(3); // A0 (slot) + A1 (EP0)
+
+            let slot_ctx = base_ptr.add(8);
+            // DW0: Context Entries = 1 | Route String (bits 19:0) | Speed (bits 23:20).
+            slot_ctx.add(0).write_volatile((1 << 27) | (route_string & 0xFFFFF) | ((speed & 0xF) << 20));
+            // DW1: Root Hub Port Number (bits 23:16) — the root port the hub chain starts at.
+            slot_ctx.add(1).write_volatile((root_hub_port as u32) << 16);
+
+            // EP0 control context. MPS: 8 for Low Speed; 64 otherwise (QEMU is lenient about the
+            // Full-Speed initial 8-byte read).
+            let mps0: u32 = if speed == 2 { 8 } else { 64 };
+            let ep0_ctx = base_ptr.add(16);
+            ep0_ctx.add(1).write_volatile((4 << 3) | (3 << 1) | (mps0 << 16));
+            ep0_ctx.add(2).write_volatile((ep0_ring_phys as u32) | 1);
+            ep0_ctx.add(3).write_volatile((ep0_ring_phys >> 32) as u32);
+            ep0_ctx.add(4).write_volatile(8);
+        }
+        let trb = Trb {
+            parameter: self.slots[slot_id as usize].input_context as u64,
+            status: 0,
+            control: (11 << 10) | ((slot_id as u32) << 24),
+        };
+        match self.run_command_sync(trb) {
+            Ok((1, _)) => true,
+            Ok((c, _)) => { serial_println!("xHCI: downstream ADDRESS_DEVICE code {}", c); false }
+            Err(_) => { serial_println!("xHCI: downstream ADDRESS_DEVICE timed out"); false }
+        }
+    }
+
+    /// Enumerate one device behind a hub: ENABLE_SLOT, ADDRESS_DEVICE (with route string), read the
+    /// device + configuration descriptors, and — for an HID keyboard/mouse — hand off to the
+    /// existing endpoint-configuration path (which finishes set-config + arms the interrupt read
+    /// via the normal async completion). Storage / non-HID behind a hub is not yet handled.
+    fn enumerate_downstream(&mut self, _hub_slot: u8, port: u8, root_hub_port: u8, speed: u32) {
+        // ENABLE_SLOT.
+        let slot_id = match self.run_command_sync(Trb { parameter: 0, status: 0, control: 9 << 10 }) {
+            Ok((1, sid)) if sid > 0 => sid,
+            other => { serial_println!("xHCI: downstream ENABLE_SLOT failed ({:?})", other); return; }
+        };
+
+        // ADDRESS_DEVICE with route string = downstream port number (tier 1).
+        if !self.address_downstream(slot_id, root_hub_port, port as u32, speed) {
+            return;
+        }
+        let buf = self.slots[slot_id as usize].descriptor_buffer as u64;
+
+        // GET device descriptor (18 bytes).
+        if self.sync_control(slot_id, 0x80, 0x06, 0x0100, 0, 18, buf, true).is_err() {
+            serial_println!("xHCI: downstream slot {} device-descriptor failed", slot_id);
+            return;
+        }
+        let (class, vid, pid) = unsafe {
+            let p = buf as *const u8;
+            (*p.add(4), (*p.add(8) as u16) | ((*p.add(9) as u16) << 8), (*p.add(10) as u16) | ((*p.add(11) as u16) << 8))
+        };
+        serial_println!("xHCI: HUB downstream slot {} device class={:#x} vid={:04x} pid={:04x}", slot_id, class, vid, pid);
+
+        // GET configuration descriptor (first 64 bytes) and look for an HID interrupt-IN endpoint.
+        if self.sync_control(slot_id, 0x80, 0x06, 0x0200, 0, 64, buf, true).is_err() {
+            serial_println!("xHCI: downstream slot {} config-descriptor failed", slot_id);
+            return;
+        }
+        match self.parse_hid_config(buf) {
+            Some((is_kbd, ep_addr, mps, interval)) => {
+                serial_println!("xHCI: HUB downstream slot {} is {} (ep {:#x} mps {})",
+                    slot_id, if is_kbd { "KEYBOARD" } else { "MOUSE/TABLET" }, ep_addr, mps);
+                if is_kbd {
+                    self.slots[slot_id as usize].is_keyboard = true;
+                    self.slots[slot_id as usize].keyboard_ep = ep_addr;
+                    self.slots[slot_id as usize].keyboard_mps = mps;
+                    self.configure_keyboard_endpoints(slot_id, ep_addr, mps, interval);
+                } else {
+                    self.slots[slot_id as usize].is_mouse = true;
+                    self.slots[slot_id as usize].mouse_ep = ep_addr;
+                    self.slots[slot_id as usize].mouse_mps = mps;
+                    self.configure_mouse_endpoints(slot_id, ep_addr, mps, interval);
+                }
+            }
+            None => serial_println!("xHCI: HUB downstream slot {}: no HID interrupt endpoint", slot_id),
+        }
+    }
+
+    /// Parse a configuration descriptor (in `buf`) for the first HID interrupt-IN endpoint.
+    /// Returns (is_keyboard, ep_addr, max_packet_size, interval) or None.
+    fn parse_hid_config(&self, buf: u64) -> Option<(bool, u8, u16, u8)> {
+        unsafe {
+            let p = buf as *const u8;
+            let total = (((*p.add(2) as usize) | ((*p.add(3) as usize) << 8))).min(64);
+            let mut off = 0usize;
+            let mut in_hid = false;
+            let mut is_kbd = false;
+            while off + 2 <= total {
+                let len = *p.add(off) as usize;
+                let dtype = *p.add(off + 1);
+                if len == 0 { break; }
+                if dtype == 0x04 && off + 8 <= total {
+                    // Interface descriptor: class at +5, protocol at +7. HID = 0x03; proto 1 = kbd.
+                    in_hid = *p.add(off + 5) == 0x03;
+                    is_kbd = *p.add(off + 7) == 1;
+                } else if dtype == 0x05 && in_hid && off + 7 <= total {
+                    // Endpoint descriptor: address +2, attributes +3, MPS +4..6, interval +6.
+                    let ep_addr = *p.add(off + 2);
+                    let attr = *p.add(off + 3);
+                    if (ep_addr & 0x80) != 0 && (attr & 0x3) == 3 {
+                        let mps = ((*p.add(off + 4) as u16) | ((*p.add(off + 5) as u16) << 8)) & 0x7FF;
+                        return Some((is_kbd, ep_addr, mps, *p.add(off + 6)));
+                    }
+                }
+                off += len;
+            }
+            None
         }
     }
 
