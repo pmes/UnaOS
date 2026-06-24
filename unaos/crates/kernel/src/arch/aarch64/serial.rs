@@ -39,24 +39,26 @@ pub fn _print(args: fmt::Arguments) {
     SERIAL_PORT.lock().write_fmt(args).unwrap();
 }
 
+// Expression-style (parentheses, no trailing semicolon) so the macros work in both
+// statement and expression position — matching the x86_64 serial macros.
 #[macro_export]
 macro_rules! serial_print {
-    ($($arg:tt)*) => {
-        $crate::arch::aarch64::serial::_print(format_args!($($arg)*));
-    };
+    ($($arg:tt)*) => (
+        $crate::arch::aarch64::serial::_print(format_args!($($arg)*))
+    );
 }
 
 #[macro_export]
 macro_rules! serial_println {
-    () => {
-        $crate::arch::aarch64::serial::_print(format_args!("\n"));
-    };
-    ($fmt:expr) => {
-        $crate::arch::aarch64::serial::_print(format_args!(concat!($fmt, "\n")));
-    };
-    ($fmt:expr, $($arg:tt)*) => {
-        $crate::arch::aarch64::serial::_print(format_args!(concat!($fmt, "\n"), $($arg)*));
-    };
+    () => (
+        $crate::arch::aarch64::serial::_print(format_args!("\n"))
+    );
+    ($fmt:expr) => (
+        $crate::arch::aarch64::serial::_print(format_args!(concat!($fmt, "\n")))
+    );
+    ($fmt:expr, $($arg:tt)*) => (
+        $crate::arch::aarch64::serial::_print(format_args!(concat!($fmt, "\n"), $($arg)*))
+    );
 }
 
 impl SerialPort {

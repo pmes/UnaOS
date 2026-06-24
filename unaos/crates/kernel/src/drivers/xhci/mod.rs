@@ -25,7 +25,6 @@ use self::event::{EventRing, ErstEntry, ErstTable};
 use self::context::{InputContext, DeviceContext};
 use spin::Mutex;
 use alloc::vec::Vec;
-use alloc::boxed::Box;
 
 /// USB HID Boot Keyboard Scancode to ASCII mapping.
 /// Index is the HID usage ID (0x00..0x67). Returns (unshifted, shifted).

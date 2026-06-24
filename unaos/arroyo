@@ -7,6 +7,7 @@
 #   ./arroyo x86           Build & boot x86_64 (GUI window + serial on stdio)
 #   ./arroyo arm           Build & boot aarch64
 #   ./arroyo test [secs]   Headless x86_64 run; serial captured to target/serial.log
+#   ./arroyo test-arm [s]  Headless aarch64 run; serial -> target/serial-arm.log
 #   ./arroyo check         Quick syntax check (both targets)
 #   ./arroyo build         Build both targets (no QEMU)
 #   ./arroyo clean         Purge all build artifacts
@@ -59,10 +60,14 @@ launch_x86_64() {
     cd "$WORKSPACE_DIR"
 }
 
-launch_aarch64() {
+ESP_DIR_ARM="${WORKSPACE_DIR}/target/aarch64_esp"
+AAVMF_PATH=""
+
+# Build the aarch64 kernel + bootloader, pack the ESP, and resolve AAVMF firmware
+# (sets the global AAVMF_PATH). Shared by launch_aarch64 and test_aarch64.
+prepare_aarch64() {
     build_kernel_aarch64
 
-    local ESP_DIR="${WORKSPACE_DIR}/target/aarch64_esp"
     local KERNEL_BIN="${WORKSPACE_DIR}/target/aarch64-unaos/release/unaos-kernel"
     local BOOTLOADER_BIN="${WORKSPACE_DIR}/target/aarch64-unknown-uefi/release/bootloader.efi"
 
@@ -74,38 +79,36 @@ launch_aarch64() {
     cd "$WORKSPACE_DIR"
 
     echo -e "${COLOR_CYAN}⚡ Packaging ESP (EFI System Partition)...${COLOR_RESET}"
-    rm -rf "$ESP_DIR"
-    mkdir -p "$ESP_DIR/EFI/BOOT"
-    cp "$BOOTLOADER_BIN" "$ESP_DIR/EFI/BOOT/BOOTAA64.EFI"
-    cp "$KERNEL_BIN" "$ESP_DIR/kernel.elf"
+    rm -rf "$ESP_DIR_ARM"
+    mkdir -p "$ESP_DIR_ARM/EFI/BOOT"
+    cp "$BOOTLOADER_BIN" "$ESP_DIR_ARM/EFI/BOOT/BOOTAA64.EFI"
+    cp "$KERNEL_BIN" "$ESP_DIR_ARM/kernel.elf"
 
-    # Locate AAVMF firmware
-    AAVMF_PATHS=(
+    # Locate AAVMF firmware (macOS/Homebrew + Linux locations)
+    local AAVMF_PATHS=(
+        "/usr/local/share/qemu/edk2-aarch64-code.fd"
+        "/opt/homebrew/share/qemu/edk2-aarch64-code.fd"
         "/usr/share/AAVMF/AAVMF_CODE.fd"
         "/usr/share/edk2/aarch64/QEMU_EFI.fd"
         "/usr/share/qemu-efi-aarch64/QEMU_EFI.fd"
-        "/usr/local/share/qemu/edk2-aarch64-code.fd"
-        "/opt/homebrew/share/qemu/edk2-aarch64-code.fd"
     )
-
     AAVMF_PATH=""
     for path in "${AAVMF_PATHS[@]}"; do
-        if [ -f "$path" ]; then
-            AAVMF_PATH="$path"
-            break
-        fi
+        if [ -f "$path" ]; then AAVMF_PATH="$path"; break; fi
     done
-
     if [ -z "$AAVMF_PATH" ]; then
         echo -e "${COLOR_RED}CRITICAL: AAVMF Firmware not found.${COLOR_RESET}"
         exit 1
     fi
+}
+
+launch_aarch64() {
+    prepare_aarch64
 
     echo -e "${COLOR_GREEN}⚡ Launching QEMU (aarch64)...${COLOR_RESET}"
     echo -e "${COLOR_PURPLE}--- EXPECTED BEHAVIOR ---${COLOR_RESET}"
-    echo -e "  • Serial output shows PCI scan and xHCI init"
-    echo -e "  • Framebuffer shows UnaOS boot screen"
-    echo -e "  • No USB devices attached (virt machine has no xHCI by default)"
+    echo -e "  • Serial: PCI scan ('XHCI CONTROLLER NOT FOUND' is normal — no USB on virt)"
+    echo -e "  • Framebuffer shows UnaOS boot screen / shell"
     echo -e "${COLOR_PURPLE}-------------------------${COLOR_RESET}"
 
     qemu-system-aarch64 \
@@ -114,12 +117,37 @@ launch_aarch64() {
         -smp 4 \
         -m 1G \
         -drive if=pflash,format=raw,readonly=on,file="$AAVMF_PATH" \
-        -drive format=raw,file=fat:rw:"$ESP_DIR" \
+        -drive format=raw,file=fat:rw:"$ESP_DIR_ARM" \
         -serial stdio \
         -device ramfb \
         -no-reboot \
         -no-shutdown \
         -d guest_errors
+}
+
+# Headless aarch64 run: serial -> target/serial-arm.log, self-terminates after N secs.
+test_aarch64() {
+    local secs="${1:-20}"
+    prepare_aarch64
+
+    local logf="${WORKSPACE_DIR}/target/serial-arm.log"
+    rm -f "$logf"
+    echo -e "${COLOR_CYAN}⚡ Headless aarch64 test (${secs}s). Serial -> ${logf}${COLOR_RESET}"
+    qemu-system-aarch64 \
+        -machine virt,virtualization=on -cpu cortex-a72 -smp 4 -m 1G \
+        -drive if=pflash,format=raw,readonly=on,file="$AAVMF_PATH" \
+        -drive format=raw,file=fat:rw:"$ESP_DIR_ARM" \
+        -serial "file:${logf}" -device ramfb -display none -no-reboot -no-shutdown &
+    local qpid=$!
+    sleep "$secs"
+    kill "$qpid" 2>/dev/null || true
+    wait "$qpid" 2>/dev/null || true
+
+    echo ""
+    echo -e "${COLOR_PURPLE}════════════ SERIAL LOG (${logf}) ════════════${COLOR_RESET}"
+    cat "$logf" 2>/dev/null || echo -e "${COLOR_RED}(no serial log produced)${COLOR_RESET}"
+    echo -e "${COLOR_PURPLE}═══════════════════════════════════════════════════${COLOR_RESET}"
+    echo -e "${COLOR_GREEN}✅ aarch64 test complete. Log at ${logf}${COLOR_RESET}"
 }
 
 # --- Headless Test (capture serial to a file) ---
@@ -248,6 +276,9 @@ case "${1:-}" in
     test|test-x86|test_x86)
         test_x86_64 "${2:-20}"
         ;;
+    test-arm|test-aarch64)
+        test_aarch64 "${2:-20}"
+        ;;
     check)
         check_both
         ;;
@@ -264,7 +295,7 @@ case "${1:-}" in
         ;;
     *)
         echo -e "${COLOR_RED}Unknown command: $1${COLOR_RESET}"
-        echo "Usage: ./arroyo [x86|arm|test [secs]|check|build|clean]"
+        echo "Usage: ./arroyo [x86|arm|test [secs]|test-arm [secs]|check|build|clean]"
         exit 1
         ;;
 esac
