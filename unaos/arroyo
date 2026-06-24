@@ -2,116 +2,234 @@
 # ARROYO: The Stream that Feeds the River
 # "Ad Astra Per Aspera"
 #
-# Usage: ./arroyo [command]
-# If no command is provided, interactive mode is engaged.
+# Usage:
+#   ./arroyo              Interactive menu
+#   ./arroyo x86           Build & boot x86_64
+#   ./arroyo arm           Build & boot aarch64
+#   ./arroyo check         Quick syntax check (both targets)
+#   ./arroyo build         Build both targets (no QEMU)
+#   ./arroyo clean         Purge all build artifacts
+
+set -e
 
 # --- Configuration ---
 COLOR_RESET="\033[0m"
-COLOR_PURPLE="\033[0;35m" # Moonstone Purple
+COLOR_PURPLE="\033[0;35m"
 COLOR_CYAN="\033[0;36m"
 COLOR_GREEN="\033[0;32m"
 COLOR_YELLOW="\033[0;33m"
+COLOR_RED="\033[0;31m"
 
-verify_mission() {
-    echo -e "\n${COLOR_YELLOW}--- MISSION CHECKLIST [J9:VS-23] ---${COLOR_RESET}"
-    echo -e "1. [ ] Prompt: ${COLOR_CYAN}root@unaOS / # ${COLOR_RESET} (Identity check)"
-    echo -e "2. [ ] Scroll: Fill screen with text. (Panic/Bounds check)"
-    echo -e "3. [ ] Command: 'vug' -> Full screen gradient. (Graphics check)"
-    echo -e "4. [ ] Exit: 'shutdown' -> CPU Halt. (Control check)"
-    echo -e "5. [ ] PCI SCAN: Check terminal for '${COLOR_GREEN}TARGET LOCKED: USB xHCI${COLOR_RESET}'"
-    echo -e "${COLOR_YELLOW}-------------------------------------${COLOR_RESET}"
-    read -p "Press [Enter] to launch..."
+WORKSPACE_DIR="$(cd "$(dirname "$0")" && pwd)"
+
+# Build flags shared by both targets
+NIGHTLY_FLAGS="-Z build-std=core,compiler_builtins,alloc -Z build-std-features=compiler-builtins-mem -Z json-target-spec"
+
+# --- Build Functions ---
+
+build_kernel_x86_64() {
+    echo -e "${COLOR_YELLOW}⚡ Building x86_64 Kernel...${COLOR_RESET}"
+    cd "$WORKSPACE_DIR/crates/kernel"
+    cargo +nightly build --release \
+      --target ../../x86_64-unaos.json \
+      $NIGHTLY_FLAGS
+    cd "$WORKSPACE_DIR"
+    echo -e "${COLOR_GREEN}✅ x86_64 Kernel Built.${COLOR_RESET}"
 }
 
-# --- The Interface ---
+build_kernel_aarch64() {
+    echo -e "${COLOR_YELLOW}⚡ Building aarch64 Kernel...${COLOR_RESET}"
+    cd "$WORKSPACE_DIR/crates/kernel"
+    cargo +nightly build --release \
+      --target ../../aarch64-unaos.json \
+      $NIGHTLY_FLAGS
+    cd "$WORKSPACE_DIR"
+    echo -e "${COLOR_GREEN}✅ aarch64 Kernel Built.${COLOR_RESET}"
+}
+
+# --- Launch Functions ---
+
+launch_x86_64() {
+    build_kernel_x86_64
+
+    echo -e "${COLOR_CYAN}⚡ Launching x86_64 via Builder (kernel + bootloader + QEMU)...${COLOR_RESET}"
+    cd "$WORKSPACE_DIR/builder"
+    cargo +nightly run --release
+    cd "$WORKSPACE_DIR"
+}
+
+launch_aarch64() {
+    build_kernel_aarch64
+
+    local ESP_DIR="${WORKSPACE_DIR}/target/aarch64_esp"
+    local KERNEL_BIN="${WORKSPACE_DIR}/target/aarch64-unaos/release/unaos-kernel"
+    local BOOTLOADER_BIN="${WORKSPACE_DIR}/target/aarch64-unknown-uefi/release/bootloader.efi"
+
+    echo -e "${COLOR_YELLOW}⚡ Building aarch64 UEFI Bootloader...${COLOR_RESET}"
+    cd "$WORKSPACE_DIR/crates/bootloader"
+    cargo +nightly build --release --target aarch64-unknown-uefi \
+      -Z build-std=core,compiler_builtins,alloc \
+      -Z build-std-features=compiler-builtins-mem
+    cd "$WORKSPACE_DIR"
+
+    echo -e "${COLOR_CYAN}⚡ Packaging ESP (EFI System Partition)...${COLOR_RESET}"
+    rm -rf "$ESP_DIR"
+    mkdir -p "$ESP_DIR/EFI/BOOT"
+    cp "$BOOTLOADER_BIN" "$ESP_DIR/EFI/BOOT/BOOTAA64.EFI"
+    cp "$KERNEL_BIN" "$ESP_DIR/kernel.elf"
+
+    # Locate AAVMF firmware
+    AAVMF_PATHS=(
+        "/usr/share/AAVMF/AAVMF_CODE.fd"
+        "/usr/share/edk2/aarch64/QEMU_EFI.fd"
+        "/usr/share/qemu-efi-aarch64/QEMU_EFI.fd"
+        "/usr/local/share/qemu/edk2-aarch64-code.fd"
+        "/opt/homebrew/share/qemu/edk2-aarch64-code.fd"
+    )
+
+    AAVMF_PATH=""
+    for path in "${AAVMF_PATHS[@]}"; do
+        if [ -f "$path" ]; then
+            AAVMF_PATH="$path"
+            break
+        fi
+    done
+
+    if [ -z "$AAVMF_PATH" ]; then
+        echo -e "${COLOR_RED}CRITICAL: AAVMF Firmware not found.${COLOR_RESET}"
+        exit 1
+    fi
+
+    echo -e "${COLOR_GREEN}⚡ Launching QEMU (aarch64)...${COLOR_RESET}"
+    echo -e "${COLOR_PURPLE}--- EXPECTED BEHAVIOR ---${COLOR_RESET}"
+    echo -e "  • Serial output shows PCI scan and xHCI init"
+    echo -e "  • Framebuffer shows UnaOS boot screen"
+    echo -e "  • No USB devices attached (virt machine has no xHCI by default)"
+    echo -e "${COLOR_PURPLE}-------------------------${COLOR_RESET}"
+
+    qemu-system-aarch64 \
+        -machine virt,virtualization=on \
+        -cpu cortex-a72 \
+        -smp 4 \
+        -m 1G \
+        -drive if=pflash,format=raw,readonly=on,file="$AAVMF_PATH" \
+        -drive format=raw,file=fat:rw:"$ESP_DIR" \
+        -serial stdio \
+        -device ramfb \
+        -no-reboot \
+        -no-shutdown \
+        -d guest_errors
+}
+
+# --- Utility Functions ---
+
+check_both() {
+    echo -e "${COLOR_YELLOW}⚡ Syntax Check: x86_64...${COLOR_RESET}"
+    cd "$WORKSPACE_DIR/crates/kernel"
+    cargo +nightly check --release \
+      --target ../../x86_64-unaos.json \
+      $NIGHTLY_FLAGS
+    echo -e "${COLOR_GREEN}✅ x86_64 OK${COLOR_RESET}"
+
+    echo -e "${COLOR_YELLOW}⚡ Syntax Check: aarch64...${COLOR_RESET}"
+    cargo +nightly check --release \
+      --target ../../aarch64-unaos.json \
+      $NIGHTLY_FLAGS
+    cd "$WORKSPACE_DIR"
+    echo -e "${COLOR_GREEN}✅ aarch64 OK${COLOR_RESET}"
+}
+
+build_both() {
+    build_kernel_x86_64
+    build_kernel_aarch64
+}
+
+clean_all() {
+    echo -e "${COLOR_YELLOW}⚡ Purging build artifacts...${COLOR_RESET}"
+    cd "$WORKSPACE_DIR"
+    cargo clean
+    echo -e "${COLOR_GREEN}✅ Clean.${COLOR_RESET}"
+}
+
+# --- Mission Briefing ---
+
+show_expectations_x86() {
+    echo ""
+    echo -e "${COLOR_PURPLE}═══════════════════════════════════════════════${COLOR_RESET}"
+    echo -e "${COLOR_PURPLE}  MISSION BRIEFING: x86_64 Boot${COLOR_RESET}"
+    echo -e "${COLOR_PURPLE}═══════════════════════════════════════════════${COLOR_RESET}"
+    echo -e "  ${COLOR_CYAN}QEMU will launch with:${COLOR_RESET}"
+    echo -e "    • qemu-xhci controller"
+    echo -e "    • usb-storage (64MB disk with UNA-OS signature)"
+    echo -e "    • usb-tablet  (absolute mouse)"
+    echo ""
+    echo -e "  ${COLOR_GREEN}EXPECTED serial output:${COLOR_RESET}"
+    echo -e "    1. PCI scan finds xHCI controller"
+    echo -e "    2. xHCI reset, command ring, event ring init"
+    echo -e "    3. Port scan detects USB devices"
+    echo -e "    4. Slot allocation, address device, descriptor read"
+    echo -e "    5. Mass storage: SCSI Read → 'MISSION SUCCESS'"
+    echo -e "    6. Tablet: mouse events dispatched"
+    echo ""
+    echo -e "  ${COLOR_YELLOW}TO ADD KEYBOARD: relaunch builder with usb-kbd${COLOR_RESET}"
+    echo -e "    (builder/src/main.rs line 110, add usb-kbd device)"
+    echo -e "${COLOR_PURPLE}═══════════════════════════════════════════════${COLOR_RESET}"
+    echo ""
+}
+
+# --- Interactive Menu ---
+
 show_menu() {
-    echo -e "${COLOR_PURPLE}=== ARROYO CONSOLE ===${COLOR_RESET}"
-    echo -e "${COLOR_CYAN}Select a directive:${COLOR_RESET}"
-    echo "1) Check (Quick Syntax)"
-    echo "2) Build (Debug)"
-    echo "3) Build (Release)"
-    echo "4) Test (All Crates)"
-    echo "5) Clean (Purge Artifacts)"
-    echo "6) PAL (Moonstone Verification)"
-    echo "7) SIM (Launch unaOS Kernel)"
-    echo "q) Quit"
-    echo -e "${COLOR_PURPLE}======================${COLOR_RESET}"
-    read -p "Command: " choice
+    echo ""
+    echo -e "${COLOR_PURPLE}═══════════════════════════════${COLOR_RESET}"
+    echo -e "${COLOR_PURPLE}     A R R O Y O   v2.0${COLOR_RESET}"
+    echo -e "${COLOR_PURPLE}═══════════════════════════════${COLOR_RESET}"
+    echo -e "  ${COLOR_CYAN}1)${COLOR_RESET} Boot x86_64   (Build + QEMU)"
+    echo -e "  ${COLOR_CYAN}2)${COLOR_RESET} Boot aarch64   (Build + QEMU)"
+    echo -e "  ${COLOR_CYAN}3)${COLOR_RESET} Check          (Both targets)"
+    echo -e "  ${COLOR_CYAN}4)${COLOR_RESET} Build          (Both targets)"
+    echo -e "  ${COLOR_CYAN}5)${COLOR_RESET} Clean"
+    echo -e "  ${COLOR_CYAN}q)${COLOR_RESET} Quit"
+    echo -e "${COLOR_PURPLE}═══════════════════════════════${COLOR_RESET}"
+    read -p "  Command: " choice
     case $choice in
-        1) run_task "check";;
-        2) run_task "build";;
-        3) run_task "release";;
-        4) run_task "test";;
-        5) run_task "clean";;
-        6) run_task "pal";;
-        7) run_task "kernel";;
+        1) show_expectations_x86; launch_x86_64;;
+        2) launch_aarch64;;
+        3) check_both;;
+        4) build_both;;
+        5) clean_all;;
         q) exit 0;;
-        *) echo "Invalid option.";;
-    esac
-}
-
-# --- The Engine ---
-run_task() {
-    case $1 in
-        "check")
-            echo -e "${COLOR_YELLOW}Running Syntax Check...${COLOR_RESET}"
-            cargo check --workspace
-            ;;
-        "build")
-            echo -e "${COLOR_YELLOW}Building Workspace (Debug)...${COLOR_RESET}"
-            cargo build --workspace
-            ;;
-        "release")
-            echo -e "${COLOR_YELLOW}Building Workspace (Release)...${COLOR_RESET}"
-            cargo build --workspace --release
-            ;;
-        "test")
-            echo -e "${COLOR_YELLOW}Running Unit Tests...${COLOR_RESET}"
-            cargo test --workspace
-            ;;
-        "clean")
-            echo -e "${COLOR_YELLOW}Purging Target Directory...${COLOR_RESET}"
-            cargo clean
-            ;;
-        "pal")
-            echo -e "${COLOR_PURPLE}Targeting Gneiss PAL (Moonstone)...${COLOR_RESET}"
-            # Targeted run for the graphical check
-            cargo run -p gneiss_pal --example moonstone_check --features std
-            ;;
-        "kernel")
-            verify_mission
-            echo -e "${COLOR_GREEN}Booting unaOS (Jules 1)...${COLOR_RESET}"
-            # Building Kernel with correct flags
-            cd crates/kernel
-            cargo +nightly build \
-              --release \
-              --target x86_64-unknown-none \
-              -Z build-std=core,compiler_builtins,alloc \
-              -Z build-std-features=compiler-builtins-mem
-            cd ../..
-
-            # Running Builder
-            echo -e "${COLOR_CYAN}Launching Builder...${COLOR_RESET}"
-            cd builder
-            cargo +nightly run --release
-            cd ..
-            ;;
-        *)
-            # Passthrough for direct cargo commands
-            echo -e "${COLOR_CYAN}Executing custom command: cargo $@${COLOR_RESET}"
-            cargo "$@"
-            ;;
+        *) echo -e "${COLOR_RED}Invalid option.${COLOR_RESET}";;
     esac
 }
 
 # --- Entry Point ---
-if [ -z "$1" ]; then
-    # No arguments? Be the Guide (Novice Mode)
-    while true; do
-        show_menu
-        echo ""
-    done
-else
-    # Arguments present? Be the Tool (Expert Mode)
-    run_task "$@"
-fi
+
+case "${1:-}" in
+    x86|x86_64)
+        show_expectations_x86
+        launch_x86_64
+        ;;
+    arm|aarch64)
+        launch_aarch64
+        ;;
+    check)
+        check_both
+        ;;
+    build)
+        build_both
+        ;;
+    clean)
+        clean_all
+        ;;
+    "")
+        while true; do
+            show_menu
+        done
+        ;;
+    *)
+        echo -e "${COLOR_RED}Unknown command: $1${COLOR_RESET}"
+        echo "Usage: ./arroyo [x86|arm|check|build|clean]"
+        exit 1
+        ;;
+esac

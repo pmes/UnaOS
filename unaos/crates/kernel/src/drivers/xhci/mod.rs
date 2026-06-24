@@ -27,6 +27,105 @@ use spin::Mutex;
 use alloc::vec::Vec;
 use alloc::boxed::Box;
 
+/// USB HID Boot Keyboard Scancode to ASCII mapping.
+/// Index is the HID usage ID (0x00..0x67). Returns (unshifted, shifted).
+/// 0 means no printable character.
+const HID_SCANCODE_TO_ASCII: [(u8, u8); 104] = [
+    (0, 0),       // 0x00: Reserved
+    (0, 0),       // 0x01: ErrorRollOver
+    (0, 0),       // 0x02: POSTFail
+    (0, 0),       // 0x03: ErrorUndefined
+    (b'a', b'A'), // 0x04
+    (b'b', b'B'), // 0x05
+    (b'c', b'C'), // 0x06
+    (b'd', b'D'), // 0x07
+    (b'e', b'E'), // 0x08
+    (b'f', b'F'), // 0x09
+    (b'g', b'G'), // 0x0A
+    (b'h', b'H'), // 0x0B
+    (b'i', b'I'), // 0x0C
+    (b'j', b'J'), // 0x0D
+    (b'k', b'K'), // 0x0E
+    (b'l', b'L'), // 0x0F
+    (b'm', b'M'), // 0x10
+    (b'n', b'N'), // 0x11
+    (b'o', b'O'), // 0x12
+    (b'p', b'P'), // 0x13
+    (b'q', b'Q'), // 0x14
+    (b'r', b'R'), // 0x15
+    (b's', b'S'), // 0x16
+    (b't', b'T'), // 0x17
+    (b'u', b'U'), // 0x18
+    (b'v', b'V'), // 0x19
+    (b'w', b'W'), // 0x1A
+    (b'x', b'X'), // 0x1B
+    (b'y', b'Y'), // 0x1C
+    (b'z', b'Z'), // 0x1D
+    (b'1', b'!'), // 0x1E
+    (b'2', b'@'), // 0x1F
+    (b'3', b'#'), // 0x20
+    (b'4', b'$'), // 0x21
+    (b'5', b'%'), // 0x22
+    (b'6', b'^'), // 0x23
+    (b'7', b'&'), // 0x24
+    (b'8', b'*'), // 0x25
+    (b'9', b'('), // 0x26
+    (b'0', b')'), // 0x27
+    (b'\n', b'\n'), // 0x28: Return/Enter
+    (0x1B, 0x1B), // 0x29: Escape
+    (0x08, 0x08), // 0x2A: Backspace
+    (b'\t', b'\t'), // 0x2B: Tab
+    (b' ', b' '), // 0x2C: Space
+    (b'-', b'_'), // 0x2D
+    (b'=', b'+'), // 0x2E
+    (b'[', b'{'), // 0x2F
+    (b']', b'}'), // 0x30
+    (b'\\', b'|'), // 0x31
+    (0, 0),       // 0x32: Non-US # and ~
+    (b';', b':'), // 0x33
+    (b'\'', b'"'), // 0x34
+    (b'`', b'~'), // 0x35
+    (b',', b'<'), // 0x36
+    (b'.', b'>'), // 0x37
+    (b'/', b'?'), // 0x38
+    (0, 0),       // 0x39: Caps Lock
+    (0, 0), (0, 0), (0, 0), (0, 0), (0, 0), (0, 0), // 0x3A-0x3F: F1-F6
+    (0, 0), (0, 0), (0, 0), (0, 0), (0, 0), (0, 0), // 0x40-0x45: F7-F12
+    (0, 0), // 0x46: PrintScreen
+    (0, 0), // 0x47: ScrollLock
+    (0, 0), // 0x48: Pause
+    (0, 0), // 0x49: Insert
+    (0, 0), // 0x4A: Home
+    (0, 0), // 0x4B: PageUp
+    (0x7F, 0x7F), // 0x4C: Delete
+    (0, 0), // 0x4D: End
+    (0, 0), // 0x4E: PageDown
+    (0, 0), // 0x4F: Right Arrow
+    (0, 0), // 0x50: Left Arrow
+    (0, 0), // 0x51: Down Arrow
+    (0, 0), // 0x52: Up Arrow
+    (0, 0), // 0x53: Num Lock
+    (b'/', b'/'), // 0x54: Keypad /
+    (b'*', b'*'), // 0x55: Keypad *
+    (b'-', b'-'), // 0x56: Keypad -
+    (b'+', b'+'), // 0x57: Keypad +
+    (b'\n', b'\n'), // 0x58: Keypad Enter
+    (b'1', b'1'), // 0x59: Keypad 1
+    (b'2', b'2'), // 0x5A: Keypad 2
+    (b'3', b'3'), // 0x5B: Keypad 3
+    (b'4', b'4'), // 0x5C: Keypad 4
+    (b'5', b'5'), // 0x5D: Keypad 5
+    (b'6', b'6'), // 0x5E: Keypad 6
+    (b'7', b'7'), // 0x5F: Keypad 7
+    (b'8', b'8'), // 0x60: Keypad 8
+    (b'9', b'9'), // 0x61: Keypad 9
+    (b'0', b'0'), // 0x62: Keypad 0
+    (b'.', b'.'), // 0x63: Keypad .
+    (0, 0),       // 0x64: Non-US \ and |
+    (0, 0),       // 0x65: Application
+    (0, 0),       // 0x66: Power
+    (b'=', b'='), // 0x67: Keypad =
+];
 
 
 pub fn init(base_address: u64) {
@@ -331,6 +430,11 @@ impl XhciController {
                                     self.slots[slot_id as usize].mouse_state = 2;
                                     self.send_set_configuration(slot_id as u8, 1);
                                 }
+                                else if self.slots[slot_id as usize].keyboard_state == 1 {
+                                    serial_println!("xHCI: Keyboard Endpoints Configured (Slot {}). Proceeding to Set Configuration...", slot_id);
+                                    self.slots[slot_id as usize].keyboard_state = 2;
+                                    self.send_set_configuration(slot_id as u8, 1);
+                                }
                                 else {
                                     // UNA-19-IDENTITY: If pending_ports is empty, we assume Address Device just finished.
                                     serial_println!("xHCI: >>> SLOT {} ENABLED & ADDRESSED <<<", slot_id);
@@ -396,6 +500,10 @@ impl XhciController {
                                     serial_println!("xHCI: >>> MOUSE SET_CONFIGURATION COMPLETE <<<");
                                     self.slots[slot_id as usize].mouse_state = 3;
                                     self.queue_mouse_read(slot_id as u8);
+                                } else if self.slots[slot_id as usize].keyboard_state == 2 {
+                                    serial_println!("xHCI: >>> KEYBOARD SET_CONFIGURATION COMPLETE <<<");
+                                    self.slots[slot_id as usize].keyboard_state = 3;
+                                    self.queue_keyboard_read(slot_id as u8);
                                 } else {
                                     serial_println!("xHCI: >>> INTERCEPTED DESCRIPTOR EVENT (Slot 1 EP 1) <<<");
                                     unsafe {
@@ -430,90 +538,128 @@ impl XhciController {
                                         self.request_configuration_descriptor(slot_id as u8);
                                     } else if desc_data[1] == 0x02 { // Configuration Descriptor Response
                                         serial_println!("xHCI: >>> CONFIGURATION DESCRIPTOR RECEIVED <<<");
-                                        // Parse Configuration Descriptor to find HID Interface
+                                        // Parse Configuration Descriptor to find HID Interfaces
                                         let mut offset = 0;
                                         let total_length = (desc_data[2] as u16) | ((desc_data[3] as u16) << 8);
                                         serial_println!("xHCI: Configuration Descriptor Total Length: {}", total_length);
-                                        serial_println!("xHCI: First 16 bytes: {:02x?} {:02x?} {:02x?} {:02x?} {:02x?} {:02x?} {:02x?} {:02x?} {:02x?} {:02x?} {:02x?} {:02x?} {:02x?} {:02x?} {:02x?} {:02x?}", 
-                                            desc_data[0], desc_data[1], desc_data[2], desc_data[3],
-                                            desc_data[4], desc_data[5], desc_data[6], desc_data[7],
-                                            desc_data[8], desc_data[9], desc_data[10], desc_data[11],
-                                            desc_data[12], desc_data[13], desc_data[14], desc_data[15]
-                                        );
                                         
-                                        let mut found_mouse = false;
-                                        let mut ep_addr = 0;
-                                        let mut ep_mps = 0;
-                                        let mut ep_interval = 0;
+                                        // Track current interface state while parsing
+                                        let mut current_intf_class: u8 = 0;
+                                        let mut current_intf_protocol: u8 = 0;
+                                        let mut found_hid = false;
                                         
-                                        while offset < total_length as usize && offset < 64 {
+                                        while offset < total_length as usize && offset < 256 {
+                                            if offset + 1 >= 256 { break; }
                                             let length = desc_data[offset] as usize;
-                                            if length == 0 { break; } // Prevent infinite loop on bad data
+                                            if length == 0 { break; }
                                             let desc_type = desc_data[offset + 1];
                                             
                                             if desc_type == 0x04 { // Interface Descriptor
-                                                let intf_class = desc_data[offset + 5];
+                                                if offset + 7 >= 256 { break; }
+                                                current_intf_class = desc_data[offset + 5];
                                                 let intf_subclass = desc_data[offset + 6];
-                                                let intf_protocol = desc_data[offset + 7];
-                                                serial_println!("xHCI: Device Found. Class={:#x} Sub={:#x} Proto={:#x}", intf_class, intf_subclass, intf_protocol);
+                                                current_intf_protocol = desc_data[offset + 7];
+                                                serial_println!("xHCI: Interface: Class={:#x} Sub={:#x} Proto={:#x}", 
+                                                    current_intf_class, intf_subclass, current_intf_protocol);
                                                 
-                                                // 0x03 is HID. We accept Mouse (0x02) or Tablet/None (0x00)
-                                                if intf_class == 0x03 {
-                                                    serial_println!("xHCI: >>> USB HID INTERFACE FOUND <<<");
-                                                    found_mouse = true;
-                                                }
-                                            } else if desc_type == 0x05 && found_mouse { // Endpoint Descriptor
-                                                ep_addr = desc_data[offset + 2];
+                                                found_hid = current_intf_class == 0x03; // HID class
+                                            } else if desc_type == 0x05 && found_hid { // Endpoint Descriptor
+                                                if offset + 6 >= 256 { break; }
+                                                let ep_addr = desc_data[offset + 2];
                                                 let ep_attr = desc_data[offset + 3];
                                                 if (ep_attr & 0x03) == 0x03 && (ep_addr & 0x80) != 0 { // Interrupt IN
-                                                    ep_mps = (desc_data[offset + 4] as u16) | ((desc_data[offset + 5] as u16) << 8);
-                                                    ep_interval = desc_data[offset + 6];
-                                                    serial_println!("xHCI: >>> MOUSE INTERRUPT IN EP FOUND: {:#x}, MPS: {}, Interval: {} <<<", ep_addr, ep_mps, ep_interval);
-                                                    break;
+                                                    let ep_mps = (desc_data[offset + 4] as u16) | ((desc_data[offset + 5] as u16) << 8);
+                                                    let ep_interval = desc_data[offset + 6];
+                                                    
+                                                    if current_intf_protocol == 1 {
+                                                        // USB HID Boot Keyboard
+                                                        serial_println!("xHCI: >>> KEYBOARD INTERRUPT IN EP FOUND: {:#x}, MPS: {}, Interval: {} <<<", ep_addr, ep_mps, ep_interval);
+                                                        self.slots[slot_id as usize].keyboard_ep = ep_addr;
+                                                        self.slots[slot_id as usize].keyboard_mps = ep_mps;
+                                                        self.slots[slot_id as usize].is_keyboard = true;
+                                                        self.configure_keyboard_endpoints(slot_id as u8, ep_addr, ep_mps, ep_interval);
+                                                        found_hid = false; // Don't double-match
+                                                    } else {
+                                                        // Mouse, Tablet, or generic HID (protocol 2 or 0)
+                                                        serial_println!("xHCI: >>> MOUSE/TABLET INTERRUPT IN EP FOUND: {:#x}, MPS: {}, Interval: {} <<<", ep_addr, ep_mps, ep_interval);
+                                                        self.slots[slot_id as usize].mouse_ep = ep_addr;
+                                                        self.slots[slot_id as usize].mouse_mps = ep_mps;
+                                                        self.slots[slot_id as usize].is_mouse = true;
+                                                        self.configure_mouse_endpoints(slot_id as u8, ep_addr, ep_mps, ep_interval);
+                                                        found_hid = false; // Don't double-match
+                                                    }
                                                 }
                                             }
                                             offset += length;
                                         }
-                                        
-                                        if found_mouse && ep_addr != 0 {
-                                            serial_println!("xHCI: Configuring Mouse Endpoints...");
-                                            self.slots[slot_id as usize].mouse_ep = ep_addr;
-                                            self.slots[slot_id as usize].mouse_mps = ep_mps;
-                                            self.configure_mouse_endpoints(slot_id as u8, ep_addr, ep_mps, ep_interval);
-                                        }
                                     }
                                 }
                                 }
-                            } else if endpoint_id == 3 { // EP1 IN (Bulk IN) -> SCSI Read / Mouse Interrupt IN
+                            } else if endpoint_id > 1 && slot_id > 0 { // Non-EP0 Transfer Event
                                 unsafe {
-                                    if let Some(data_buf_ptr) = self.slots[slot_id as usize].data_buffer {
-                                        let data_data = core::slice::from_raw_parts(data_buf_ptr, 512);
-                                        let mps = self.slots[slot_id as usize].mouse_mps as u32;
-                                        let bytes_transferred = mps.saturating_sub(transfer_len);
-                                        if bytes_transferred > 0 || data_data[0] < 0x08 {
-                                            // Print all 8 bytes for debugging the tablet payload
-                                            serial_println!("xHCI: Tablet Raw: {:02x?} {:02x?} {:02x?} {:02x?} {:02x?} {:02x?} {:02x?} {:02x?}", 
-                                                data_data[0], data_data[1], data_data[2], data_data[3],
-                                                data_data[4], data_data[5], data_data[6], data_data[7]
-                                            );
-
-                                            // For usb-tablet, coordinates are 15-bit absolute (0..32767).
-                                            let buttons = data_data[0];
+                                    let slot = &self.slots[slot_id as usize];
+                                    
+                                    // Compute expected DCI for mouse and keyboard
+                                    let mouse_dci = if slot.is_mouse && slot.mouse_ep != 0 {
+                                        let ep_num = slot.mouse_ep & 0x0F;
+                                        let dir_in = (slot.mouse_ep & 0x80) != 0;
+                                        Some((ep_num * 2) + if dir_in { 1 } else { 0 })
+                                    } else { None };
+                                    
+                                    let keyboard_dci = if slot.is_keyboard && slot.keyboard_ep != 0 {
+                                        let ep_num = slot.keyboard_ep & 0x0F;
+                                        let dir_in = (slot.keyboard_ep & 0x80) != 0;
+                                        Some((ep_num * 2) + if dir_in { 1 } else { 0 })
+                                    } else { None };
+                                    
+                                    if mouse_dci == Some(endpoint_id as u8) {
+                                        // --- MOUSE / TABLET ---
+                                        if let Some(data_buf_ptr) = slot.data_buffer {
+                                            let data_data = core::slice::from_raw_parts(data_buf_ptr, 512);
+                                            let _buttons = data_data[0];
                                             let x = (data_data[1] as u16) | ((data_data[2] as u16) << 8);
                                             let y = (data_data[3] as u16) | ((data_data[4] as u16) << 8);
                                             
-                                            // Only push an event if there's actual movement or button change
                                             if x != 0 || y != 0 {
                                                 crate::pal::push_event(crate::pal::Event::MouseAbsolute { x: x as i32, y: y as i32 });
                                             }
                                             
-                                            // Re-queue the read
                                             self.queue_mouse_read(slot_id as u8);
-                                        } else {
-                                            serial_println!("xHCI: >>> BULK IN TRANSFER COMPLETE (SCSI Read) <<<");
-                                            // Check Signature
-                                            let sig = core::str::from_utf8(&data_data[0..21]).unwrap_or("INVALID");
-                                            serial_println!("xHCI: SECTOR 0 SIGNATURE: {}", sig);
+                                        }
+                                    } else if keyboard_dci == Some(endpoint_id as u8) {
+                                        // --- KEYBOARD ---
+                                        if let Some(data_buf_ptr) = slot.data_buffer {
+                                            let report = core::slice::from_raw_parts(data_buf_ptr, 8);
+                                            // USB HID Boot Keyboard Report Format:
+                                            // Byte 0: Modifier keys (bit 1 = L-Shift, bit 5 = R-Shift)
+                                            // Byte 1: Reserved
+                                            // Bytes 2-7: Key codes (up to 6 simultaneous keys)
+                                            let modifiers = report[0];
+                                            let shift = (modifiers & 0x22) != 0; // L-Shift (bit 1) or R-Shift (bit 5)
+                                            
+                                            for i in 2..8 {
+                                                let keycode = report[i];
+                                                if keycode == 0 { continue; } // No key
+                                                if keycode == 1 { continue; } // ErrorRollOver
+                                                
+                                                if (keycode as usize) < HID_SCANCODE_TO_ASCII.len() {
+                                                    let (unshifted, shifted) = HID_SCANCODE_TO_ASCII[keycode as usize];
+                                                    let ascii = if shift { shifted } else { unshifted };
+                                                    if ascii != 0 {
+                                                        serial_println!("xHCI: KEY: '{}' (scancode {:#x})", ascii as char, keycode);
+                                                        crate::pal::push_event(crate::pal::Event::Key(ascii));
+                                                    }
+                                                }
+                                            }
+                                            
+                                            self.queue_keyboard_read(slot_id as u8);
+                                        }
+                                    } else if let Some(data_buf_ptr) = slot.data_buffer {
+                                        // --- BULK IN (Mass Storage SCSI Read) ---
+                                        let data_data = core::slice::from_raw_parts(data_buf_ptr, 512);
+                                        serial_println!("xHCI: >>> BULK IN TRANSFER COMPLETE (SCSI Read) <<<");
+                                        let sig = core::str::from_utf8(&data_data[0..21]).unwrap_or("INVALID");
+                                        serial_println!("xHCI: SECTOR 0 SIGNATURE: {}", sig);
 
                                         if sig == "UNA-OS-DISK-001-ALPHA" {
                                             serial_println!("xHCI: >>> MISSION SUCCESS. TARGET ACQUIRED. <<<");
@@ -521,7 +667,6 @@ impl XhciController {
                                             serial_println!("xHCI: >>> SIGNATURE MISMATCH <<<");
                                         }
                                         serial_println!(">>> DISK READ COMPLETE <<<");
-                                    }
                                     }
                                 }
                             }
@@ -652,17 +797,15 @@ impl XhciController {
             serial_println!("xHCI: RuntimeBase={:#x}, IR0 Base={:#x}", runtime_base, ir0_base);
 
             // 2. Setup the Segment Table (ERST)
-            let mut evt_guard = EVENT_RING.lock();
-            let evt_ring = evt_guard.as_mut().unwrap();
-            evt_ring.clear();
-            
+            // NOTE: Caller holds the EVENT_RING lock and passes us the phys addr.
+            // Do NOT lock EVENT_RING here or we deadlock.
             ERST_TABLE.entries[0] = ErstEntry {
-                ring_address: evt_ring.get_ptr(),
-                size: 256,
+                ring_address: event_ring_phys,
+                size: 16, // Must match EVENT_RING_SIZE in event.rs
                 _rsvd: 0,
                 _rsvd2: 0,
             };
-            EVENT_RING_PHYS_BASE = evt_ring.get_ptr();
+            EVENT_RING_PHYS_BASE = event_ring_phys;
 
             // 3. Write ERSTSZ (Segment Table Size) - Offset 0x08
             // Value = 1 (We have 1 segment)
@@ -1318,11 +1461,120 @@ impl XhciController {
             let in_trb = Trb {
                 parameter: data_phys,
                 status: self.slots[slot_id as usize].mouse_mps as u32, // Length
-                control: (1 << 10) | (1 << 5), // Type 1 | IOC. Removed ISP (Interrupt on Short Packet) to reduce spam
+                control: (1 << 10) | (1 << 5), // Type 1 | IOC
             };
             self.slots[slot_id as usize].mouse_ring.as_mut().unwrap().push(in_trb).unwrap();
             self.ring_doorbell(slot_id, dci as u32);
-            serial_println!("xHCI: Initial Mouse Read Queued.");
+            serial_println!("xHCI: Mouse Read Queued.");
+        }
+    }
+
+    pub fn configure_keyboard_endpoints(&mut self, slot_id: u8, ep_addr: u8, mps: u16, interval: u8) {
+        unsafe {
+            serial_println!("xHCI: Configuring Keyboard Endpoints for Slot {}, EP Addr {:#x}...", slot_id, ep_addr);
+
+            // 1. GET POINTERS
+            let slot = &mut self.slots[slot_id as usize];
+            let input_ctx_virt = slot.input_context;
+            let output_ctx_virt = slot.output_context;
+            let base_ptr = input_ctx_virt as *mut u32;
+
+            let keyboard_ring = ring::TransferRing::new(16);
+            let keyboard_ring_phys = keyboard_ring.get_ptr();
+            slot.keyboard_ring = Some(keyboard_ring);
+
+            // Allocate data buffer if not already allocated
+            if slot.data_buffer.is_none() {
+                let data_layout = core::alloc::Layout::from_size_align(512, 64).unwrap();
+                slot.data_buffer = Some(alloc::alloc::alloc_zeroed(data_layout));
+            }
+
+            // 2. CLEAR INPUT CONTEXT
+            core::ptr::write_bytes(base_ptr as *mut u8, 0, 1056);
+
+            // Compute DCI: DCI = (Endpoint Number * 2) + Direction (1=IN, 0=OUT)
+            let ep_num = ep_addr & 0x0F;
+            let dir_in = (ep_addr & 0x80) != 0;
+            let dci = (ep_num * 2) + if dir_in { 1 } else { 0 };
+
+            // Input Control Context: Add flag for this DCI + Slot Context
+            base_ptr.add(1).write_volatile((1 << dci) | 1);
+
+            // Slot Context: Copy from Output Context
+            let slot_ctx_ptr = base_ptr.add(8);
+            for i in 0..8 {
+                let val = core::ptr::read_volatile((output_ctx_virt as *const u32).add(i));
+                slot_ctx_ptr.add(i).write_volatile(val);
+            }
+            // Update Context Entries = DCI
+            let old_dw0 = slot_ctx_ptr.add(0).read_volatile();
+            let new_dw0 = (old_dw0 & !(0x1F << 27)) | ((dci as u32) << 27);
+            slot_ctx_ptr.add(0).write_volatile(new_dw0);
+
+            // Endpoint Context at offset for this DCI
+            let ep_ctx_ptr = base_ptr.add(16 + ((dci - 1) * 8) as usize);
+
+            // Read Speed from Output Context Slot Context DW0 (Bits 20:23)
+            let out_dw0 = core::ptr::read_volatile((output_ctx_virt as *const u32).add(0));
+            let speed = (out_dw0 >> 20) & 0x0F;
+
+            // Interval depends on speed
+            let interval_xhci = if speed == 3 || speed >= 4 {
+                (interval.saturating_sub(1)) as u32
+            } else {
+                if interval > 0 {
+                    (31 - (interval as u32).leading_zeros()) + 3
+                } else {
+                    0
+                }
+            };
+
+            // DW0: Interval | Max ESIT Payload
+            ep_ctx_ptr.add(0).write_volatile((interval_xhci << 16) | ((mps as u32) << 24));
+
+            // DW1: MPS=mps, EP Type=7 (Interrupt IN), CErr=3
+            ep_ctx_ptr.add(1).write_volatile((7 << 3) | (3 << 1) | ((mps as u32) << 16));
+
+            // DW2: Dequeue Pointer Lo | DCS (Cycle Bit = 1)
+            ep_ctx_ptr.add(2).write_volatile((keyboard_ring_phys as u32) | 1);
+            // DW3: Dequeue Pointer Hi
+            ep_ctx_ptr.add(3).write_volatile((keyboard_ring_phys >> 32) as u32);
+            // DW4: Avg TRB Len
+            ep_ctx_ptr.add(4).write_volatile(mps as u32);
+
+            serial_println!("xHCI: Input Context Configured for Keyboard Interrupt IN (DCI {}).", dci);
+
+            let trb = Trb {
+                parameter: input_ctx_virt as u64,
+                status: 0,
+                control: (12 << 10) | ((slot_id as u32) << 24),
+            };
+
+            if let Err(e) = self.send_command(trb) {
+                serial_println!("xHCI: Failed to send Configure Endpoint command: {}", e);
+            } else {
+                self.slots[slot_id as usize].keyboard_state = 1;
+                self.ring_doorbell(0, 0);
+            }
+        }
+    }
+
+    pub fn queue_keyboard_read(&mut self, slot_id: u8) {
+        unsafe {
+            let ep_num = self.slots[slot_id as usize].keyboard_ep & 0x0F;
+            let dir_in = (self.slots[slot_id as usize].keyboard_ep & 0x80) != 0;
+            let dci = (ep_num * 2) + if dir_in { 1 } else { 0 };
+
+            let data_phys = self.slots[slot_id as usize].data_buffer.unwrap() as u64;
+
+            let in_trb = Trb {
+                parameter: data_phys,
+                status: self.slots[slot_id as usize].keyboard_mps as u32,
+                control: (1 << 10) | (1 << 5), // Type 1 (Normal) | IOC
+            };
+            self.slots[slot_id as usize].keyboard_ring.as_mut().unwrap().push(in_trb).unwrap();
+            self.ring_doorbell(slot_id, dci as u32);
+            serial_println!("xHCI: Keyboard Read Queued.");
         }
     }
 }
