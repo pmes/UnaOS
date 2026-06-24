@@ -15,25 +15,15 @@
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 use crate::arch::gdt;
-use crate::pal::Event;
 use lazy_static::lazy_static;
-use pic8259::ChainedPics;
-use spin::Mutex;
 use x86_64::structures::idt::{InterruptDescriptorTable, InterruptStackFrame, PageFaultErrorCode};
 
-// FIX: Only import what we use to kill warnings
-
-
-pub const PIC_1_OFFSET: u8 = 32;
-pub const PIC_2_OFFSET: u8 = PIC_1_OFFSET + 8;
-
-/// IDT vectors delivered straight to the local APIC (no 8259/PIC offset).
-/// xHCI MSI-X (interrupter 0) and the APIC spurious-interrupt vector (== APIC SVR low byte).
+/// IDT vectors. This is a pure local-APIC system — there is no 8259 PIC, hence no PIC vector
+/// offset. The APIC timer fires `TIMER_VECTOR`, the xHCI MSI-X interrupter (interrupter 0)
+/// fires `XHCI_MSI_VECTOR`, and `SPURIOUS_VECTOR` == the APIC SVR low byte.
+pub const TIMER_VECTOR: u8 = 0x20;
 pub const XHCI_MSI_VECTOR: u8 = 0x40;
 pub const SPURIOUS_VECTOR: u8 = 0xFF;
-
-pub static PICS: Mutex<ChainedPics> =
-    Mutex::new(unsafe { ChainedPics::new(PIC_1_OFFSET, PIC_2_OFFSET) });
 
 lazy_static! {
     static ref IDT: InterruptDescriptorTable = {
@@ -46,11 +36,9 @@ lazy_static! {
         }
         idt.page_fault.set_handler_fn(page_fault_handler);
         idt.general_protection_fault.set_handler_fn(general_protection_fault_handler);
-        idt[InterruptIndex::Timer.as_u8()].set_handler_fn(timer_interrupt_handler);
-        idt[InterruptIndex::Keyboard.as_u8()].set_handler_fn(keyboard_interrupt_handler);
-        idt[InterruptIndex::Mouse.as_u8()].set_handler_fn(mouse_interrupt_handler);
-        // xHCI MSI-X (interrupter 0) delivered directly to the local APIC at vector 0x40 —
-        // no 8259/INTx involvement. Spurious-interrupt vector 0xFF matches APIC SVR.
+        // All interrupts are delivered directly by the local APIC: the timer (heartbeat),
+        // the xHCI MSI-X interrupter, and the APIC spurious-interrupt vector.
+        idt[TIMER_VECTOR].set_handler_fn(timer_interrupt_handler);
         idt[XHCI_MSI_VECTOR].set_handler_fn(xhci_msi_handler);
         idt[SPURIOUS_VECTOR].set_handler_fn(spurious_handler);
         idt
@@ -61,64 +49,17 @@ pub fn init_idt() {
     IDT.load();
 }
 
-pub fn init_pics() {
+/// Disable the legacy 8259 PIC by masking every IRQ line, so it can never assert. This is a
+/// pure local-APIC system (APIC timer + xHCI MSI-X), and LINT0 is no longer wired as ExtINT
+/// (see `apic::init`), so nothing should ever arrive via the PIC. We don't trust firmware to
+/// have masked it — we silence it explicitly with raw OCW1 writes to the data ports
+/// (0x21 = PIC1, 0xA1 = PIC2). The PS/2 8042 controller is likewise left untouched and silent
+/// (its IRQs are masked here and undeliverable). No legacy ISA interrupt source reaches the CPU.
+pub fn disable_legacy_pic() {
+    use x86_64::instructions::port::Port;
     unsafe {
-        let mut pics = PICS.lock();
-        pics.initialize();
-        // The 8254 PIT (IRQ0) is now replaced by the local APIC timer, so mask it here; keep
-        // IRQ1 (PS/2 keyboard) unmasked for now — it goes away with the rest of the legacy
-        // stack in Phase 3. PIC2 stays fully masked.
-        pics.write_masks(0b1111_1101, 0b1111_1111);
-    }
-
-    // Re-enable and flush 8042 PS/2 Controller (UEFI may leave it disabled/full)
-    unsafe {
-        use x86_64::instructions::port::Port;
-        let mut cmd_port = Port::<u8>::new(0x64);
-        let mut data_port = Port::<u8>::new(0x60);
-
-        // 1. Flush any pending data (bounded: a wedged 8042 must not hang boot)
-        let mut flush_guard = 0u32;
-        while (cmd_port.read() & 1) != 0 && flush_guard < 256 {
-            data_port.read();
-            flush_guard += 1;
-        }
-
-        // 2. Read Configuration Byte
-        cmd_port.write(0x20);
-        let mut config = data_port.read();
-
-        // 3. Enable First PS/2 Port Interrupt (bit 0)
-        config |= 0b0000_0001;
-
-        // 4. Write Configuration Byte
-        cmd_port.write(0x60);
-        data_port.write(config);
-
-        // 5. Flush any pending data again (bounded, same rationale as above)
-        let mut flush_guard2 = 0u32;
-        while (cmd_port.read() & 1) != 0 && flush_guard2 < 256 {
-            data_port.read();
-            flush_guard2 += 1;
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy)]
-#[repr(u8)]
-pub enum InterruptIndex {
-    Timer = PIC_1_OFFSET,
-    Keyboard = PIC_1_OFFSET + 1,
-    Mouse = PIC_2_OFFSET + 12,
-}
-
-impl InterruptIndex {
-    fn as_u8(self) -> u8 {
-        self as u8
-    }
-
-    fn as_usize(self) -> usize {
-        self as usize
+        Port::<u8>::new(0x21).write(0xFF); // mask all IRQs on PIC1
+        Port::<u8>::new(0xA1).write(0xFF); // mask all IRQs on PIC2
     }
 }
 
@@ -156,38 +97,9 @@ extern "x86-interrupt" fn double_fault_handler(
 }
 
 extern "x86-interrupt" fn timer_interrupt_handler(_stack_frame: InterruptStackFrame) {
-    // Local APIC timer tick (the 8254 PIT's IRQ0 is masked at the 8259). Lock-free: bump the
-    // heartbeat counter and issue an APIC EOI (NOT a PIC EOI — this arrives via the local
-    // APIC LVT, not the PIC).
+    // Local APIC timer tick. Lock-free: bump the heartbeat counter and issue an APIC EOI.
     crate::arch::apic::APIC_TICKS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     crate::arch::apic::eoi();
-}
-
-extern "x86-interrupt" fn keyboard_interrupt_handler(_stack_frame: InterruptStackFrame) {
-    use x86_64::instructions::port::Port;
-
-    let mut port = Port::<u8>::new(0x60);
-    let scancode: u8 = unsafe { port.read() };
-    serial_println!("KEY: {:#X}", scancode);
-
-    let character = match scancode {
-        0x02..=0x0B => Some(b"1234567890"[scancode as usize - 0x02]),
-        0x10..=0x19 => Some(b"qwertyuiop"[scancode as usize - 0x10]),
-        0x1E..=0x26 => Some(b"asdfghjkl"[scancode as usize - 0x1E]),
-        0x2C..=0x32 => Some(b"zxcvbnm"[scancode as usize - 0x2C]),
-        0x39 => Some(b' '),
-        0x1C => Some(b'\n'),
-        _ => None,
-    };
-
-    if let Some(character) = character {
-        crate::pal::push_event(Event::Key(character));
-    }
-
-    unsafe {
-        PICS.lock()
-            .notify_end_of_interrupt(InterruptIndex::Keyboard.as_u8());
-    }
 }
 
 /// xHCI MSI-X handler (interrupter 0, IDT vector 0x40). Minimal and lock-free: it
@@ -206,18 +118,3 @@ extern "x86-interrupt" fn xhci_msi_handler(_stack_frame: InterruptStackFrame) {
 /// Local APIC spurious-interrupt handler (vector 0xFF, == APIC SVR low byte). By definition
 /// the APIC did not actually deliver an interrupt here, so we must NOT send an EOI.
 extern "x86-interrupt" fn spurious_handler(_stack_frame: InterruptStackFrame) {}
-
-extern "x86-interrupt" fn mouse_interrupt_handler(_stack_frame: InterruptStackFrame) {
-    use x86_64::instructions::port::Port;
-
-    let mut port = Port::new(0x60);
-    let _packet: u8 = unsafe { port.read() };
-
-    // Using a safe coordinate for now
-    crate::pal::push_event(Event::Mouse { x: 100, y: 100 });
-
-    unsafe {
-        PICS.lock()
-            .notify_end_of_interrupt(InterruptIndex::Mouse.as_u8());
-    }
-}

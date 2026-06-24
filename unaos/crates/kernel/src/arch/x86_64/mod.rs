@@ -9,10 +9,10 @@ pub mod memory;
 pub fn init() {
     gdt::init();
     interrupts::init_idt();
-    interrupts::init_pics();
-    // Software-enable the local APIC. Must come after init_pics() (which sets up the 8259)
-    // because enabling the APIC reroutes the PIC's INTR through LINT0 (ExtINT); apic::init()
-    // programs that LVT entry so the legacy timer/keyboard keep working during transition.
+    // Pure local-APIC system: silence the legacy 8259 PIC, then software-enable the local
+    // APIC (timer heartbeat + spurious vector; LINT0 masked, LINT1=NMI) before enabling
+    // interrupts. Input is USB-HID via the xHCI MSI-X path — no PS/2, no PIT, no I/O APIC.
+    interrupts::disable_legacy_pic();
     apic::init();
     x86_64::instructions::interrupts::enable();
 }

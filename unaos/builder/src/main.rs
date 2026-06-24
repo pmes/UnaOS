@@ -135,6 +135,7 @@ fn main() {
        .arg("-device").arg("qemu-xhci,id=xhci")
        .arg("-drive").arg(format!("if=none,id=stick,format=raw,file={}", usb_image.display()))
        .arg("-device").arg("usb-storage,bus=xhci.0,drive=stick")
+       .arg("-device").arg("usb-kbd,bus=xhci.0")
        .arg("-device").arg("usb-tablet,bus=xhci.0")
        .arg("-m").arg("1G");
 

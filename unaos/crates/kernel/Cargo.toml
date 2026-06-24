@@ -19,6 +19,4 @@ fdt = "0.1.5"
 
 [target.'cfg(target_arch = "x86_64")'.dependencies]
 x86_64 = "0.15.4"
-pic8259 = "0.11.0"
-pc-keyboard = "0.9.0"
 uart_16550 = "0.6.0"

@@ -22,7 +22,7 @@ pub extern "C" fn _start(boot_info: &'static mut BootInfo) -> ! {
 }
 
 fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
-    // 1. Core Hardware Init (GDT, IDT, PICS for x86_64, GIC for aarch64)
+    // 1. Core Hardware Init (GDT, IDT, local APIC for x86_64, GIC for aarch64)
     unaos_kernel::init();
 
     // 3. Framebuffer Info Extraction
