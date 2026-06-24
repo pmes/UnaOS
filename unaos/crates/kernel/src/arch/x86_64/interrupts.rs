@@ -65,8 +65,10 @@ pub fn init_pics() {
     unsafe {
         let mut pics = PICS.lock();
         pics.initialize();
-        // Unmask IRQ0 (Timer) and IRQ1 (Keyboard) on PIC1, mask all on PIC2
-        pics.write_masks(0b1111_1100, 0b1111_1111);
+        // The 8254 PIT (IRQ0) is now replaced by the local APIC timer, so mask it here; keep
+        // IRQ1 (PS/2 keyboard) unmasked for now — it goes away with the rest of the legacy
+        // stack in Phase 3. PIC2 stays fully masked.
+        pics.write_masks(0b1111_1101, 0b1111_1111);
     }
 
     // Re-enable and flush 8042 PS/2 Controller (UEFI may leave it disabled/full)
@@ -154,10 +156,11 @@ extern "x86-interrupt" fn double_fault_handler(
 }
 
 extern "x86-interrupt" fn timer_interrupt_handler(_stack_frame: InterruptStackFrame) {
-    unsafe {
-        PICS.lock()
-            .notify_end_of_interrupt(InterruptIndex::Timer.as_u8());
-    }
+    // Local APIC timer tick (the 8254 PIT's IRQ0 is masked at the 8259). Lock-free: bump the
+    // heartbeat counter and issue an APIC EOI (NOT a PIC EOI — this arrives via the local
+    // APIC LVT, not the PIC).
+    crate::arch::apic::APIC_TICKS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    crate::arch::apic::eoi();
 }
 
 extern "x86-interrupt" fn keyboard_interrupt_handler(_stack_frame: InterruptStackFrame) {
