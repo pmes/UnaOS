@@ -806,13 +806,16 @@ impl XhciController {
                                 if p.slot_id == slot_id as u8 {
                                     let is_match = param == p.wait_trb_phys;
                                     let is_error = completion_code != 1 && completion_code != 13;
+                                    // Only consume the event if it is actually ours (the awaited
+                                    // Status TRB, or an error). A same-slot non-matching success
+                                    // must fall through to the async FSM rather than be dropped.
                                     if is_match || is_error {
                                         if let Some(ep) = self.ep0_pending.as_mut() {
                                             ep.completion_code = completion_code as u8;
                                             ep.done = true;
                                         }
+                                        return; // consumed by the sync EP0 pump
                                     }
-                                    return; // consumed by the sync EP0 pump
                                 }
                             }
                         }
