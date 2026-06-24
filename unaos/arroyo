@@ -120,6 +120,9 @@ launch_aarch64() {
         -drive format=raw,file=fat:rw:"$ESP_DIR_ARM" \
         -serial stdio \
         -device ramfb \
+        -device qemu-xhci,id=xhci \
+        -device usb-kbd,bus=xhci.0 \
+        -device usb-tablet,bus=xhci.0 \
         -no-reboot \
         -no-shutdown \
         -d guest_errors
@@ -137,7 +140,9 @@ test_aarch64() {
         -machine virt,virtualization=on -cpu cortex-a72 -smp 4 -m 1G \
         -drive if=pflash,format=raw,readonly=on,file="$AAVMF_PATH" \
         -drive format=raw,file=fat:rw:"$ESP_DIR_ARM" \
-        -serial "file:${logf}" -device ramfb -display none -no-reboot -no-shutdown &
+        -serial "file:${logf}" -device ramfb -display none \
+        -device qemu-xhci,id=xhci -device usb-kbd,bus=xhci.0 -device usb-tablet,bus=xhci.0 \
+        -no-reboot -no-shutdown &
     local qpid=$!
     sleep "$secs"
     kill "$qpid" 2>/dev/null || true
