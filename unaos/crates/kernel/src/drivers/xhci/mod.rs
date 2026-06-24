@@ -26,6 +26,17 @@ use self::context::{InputContext, DeviceContext};
 use spin::Mutex;
 use alloc::vec::Vec;
 
+/// Flip to `true` to restore the very verbose per-doorbell / per-event xHCI tracing.
+/// Left `false` so the serial log shows only milestones and errors.
+const XHCI_VERBOSE: bool = true;
+
+/// Verbose xHCI trace: compiles to nothing (optimized out) unless XHCI_VERBOSE is true.
+macro_rules! xdbg {
+    ($($arg:tt)*) => {
+        if XHCI_VERBOSE { serial_println!($($arg)*); }
+    };
+}
+
 /// USB HID Boot Keyboard Scancode to ASCII mapping.
 /// Index is the HID usage ID (0x00..0x67). Returns (unshifted, shifted).
 /// 0 means no printable character.
@@ -208,7 +219,7 @@ static mut EVENT_RING_PHYS_BASE: u64 = 0;
 /// Direct MMIO write. The address must be valid.
 #[inline(always)]
 pub unsafe fn ring_doorbell_asm(doorbell_addr: u64, target: u32) {
-    serial_println!("xHCI: Ringing Doorbell at {:#x} with Target {}", doorbell_addr, target);
+    xdbg!("xHCI: Ringing Doorbell at {:#x} with Target {}", doorbell_addr, target);
     core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
     core::ptr::write_volatile(doorbell_addr as *mut u32, target);
     core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
@@ -462,11 +473,11 @@ impl XhciController {
             ring_doorbell_asm(db_addr as u64, target);
 
             // DEBUG: DOORBELL ADDRESS VERIFICATION
-            serial_println!("xHCI DEBUG: DBOFF Register = {:#x}", core::ptr::read_volatile(dboff_ptr));
-            serial_println!("xHCI DEBUG: Calculated DB[0] Addr = {:#x}", self.base_addr + dboff as usize);
-            serial_println!("xHCI DEBUG: Actual Write Addr    = {:#x}", db_ptr as usize);
+            xdbg!("xHCI DEBUG: DBOFF Register = {:#x}", core::ptr::read_volatile(dboff_ptr));
+            xdbg!("xHCI DEBUG: Calculated DB[0] Addr = {:#x}", self.base_addr + dboff as usize);
+            xdbg!("xHCI DEBUG: Actual Write Addr    = {:#x}", db_ptr as usize);
 
-            serial_println!("xHCI: DOORBELL RUNG (Slot {}, Target {}).", slot_id, target);
+            xdbg!("xHCI: DOORBELL RUNG (Slot {}, Target {}).", slot_id, target);
         }
     }
 
@@ -493,7 +504,7 @@ impl XhciController {
             (trb, ring.dequeue_index)
         }; // EVENT_RING lock released BEFORE dispatch
 
-        serial_println!("xHCI: Event Detected!");
+        xdbg!("xHCI: Event Detected!");
         self.handle_event_trb(trb);
         self.advance_erdp(dequeue_index);
         true
@@ -508,10 +519,19 @@ impl XhciController {
             }
             let rtsoff = core::ptr::read_volatile((self.base_addr + 0x18) as *const u32) & !0x1F;
             let ir0_base = self.base_addr + rtsoff as usize + 0x20;
+
+            // Acknowledge the interrupter: clear IMAN.IP (bit 0, RW1C) and USBSTS.EINT
+            // (bit 3, RW1C). QEMU's xHC will not post the next event until the prior
+            // Interrupt Pending is acknowledged, so a tight poll loop can otherwise stall
+            // after one event even though the transfer completed.
+            let iman = core::ptr::read_volatile(ir0_base as *const u32);
+            core::ptr::write_volatile(ir0_base as *mut u32, iman | 1);
+            core::ptr::write_volatile((self.op_base + 0x04) as *mut u32, 1 << 3);
+
             let new_dequeue_ptr = EVENT_RING_PHYS_BASE + (dequeue_index as u64 * 16);
             // Bit 3 (EHB) is write-1-to-clear.
             core::ptr::write_volatile((ir0_base + 0x18) as *mut u64, new_dequeue_ptr | 8);
-            serial_println!("xHCI: ERDP Advanced to {:#x}", new_dequeue_ptr);
+            xdbg!("xHCI: ERDP Advanced to {:#x}", new_dequeue_ptr);
         }
     }
 
@@ -521,7 +541,7 @@ impl XhciController {
         let status = trb.status;
         let control = trb.control;
 
-        serial_println!("xHCI RAW: Param={:#x} Status={:#x} Control={:#x}", param, status, control);
+        xdbg!("xHCI RAW: Param={:#x} Status={:#x} Control={:#x}", param, status, control);
 
         // Control Field: Bits 15:10 = TRB Type
         let trb_type = (control >> 10) & 0x3F;
@@ -618,8 +638,7 @@ impl XhciController {
                         let slot_id = (control >> 24) & 0xFF; // Slot ID is in Control Bits 31:24
                         let endpoint_id = (control >> 16) & 0x1F; // Endpoint ID in Control Bits 16:20
 
-                        // UNA-21-VERBOSE: SCREAMING DETAILS
-                        serial_println!("xHCI DEBUG: [Transfer Event] Slot={}, EP={}, Code={}, Len={}",
+                        xdbg!("xHCI DEBUG: [Transfer Event] Slot={}, EP={}, Code={}, Len={}",
                             slot_id, endpoint_id, completion_code, transfer_len);
 
                         // UNA-19-REVEAL: If success or short packet, check buffer
@@ -944,7 +963,7 @@ impl XhciController {
             // Do NOT lock EVENT_RING here or we deadlock.
             ERST_TABLE.entries[0] = ErstEntry {
                 ring_address: event_ring_phys,
-                size: 16, // Must match EVENT_RING_SIZE in event.rs
+                size: event::EVENT_RING_SIZE as u16, // Must match EVENT_RING_SIZE in event.rs
                 _rsvd: 0,
                 _rsvd2: 0,
             };
@@ -965,14 +984,14 @@ impl XhciController {
             let erdp_ptr = (ir0_base + 0x18) as *mut u64;
             core::ptr::write_volatile(erdp_ptr, event_ring_phys); // Pointer to the RING, not the table
 
-            // 6. GAG the Interrupter (IMAN - Interrupter Management) - Offset 0x00
-            // Bit 0 = IP (Interrupt Pending), Bit 1 = IE (Interrupt Enable)
-            // UNA-19-SILENCE: Clear Bit 1 (IE) and Bit 0 (IP)
+            // 6. GAG the Interrupter (IMAN - Interrupter Management) - Offset 0x00.
+            // Bit 0 = IP (Interrupt Pending, RW1C), Bit 1 = IE (Interrupt Enable).
+            // Clear both: we poll the event ring rather than taking interrupts.
             let iman_ptr = (ir0_base + 0x00) as *mut u32;
             let iman = core::ptr::read_volatile(iman_ptr);
             core::ptr::write_volatile(iman_ptr, iman & !0x3);
 
-            serial_println!("xHCI: Interrupter 0 GAGGED (IMAN.IE Cleared).");
+            serial_println!("xHCI: Interrupter 0 gagged (IMAN.IE cleared, polling).");
         }
     }
 
@@ -1441,7 +1460,9 @@ impl XhciController {
             slot_id, in_dci, out_dci, csw_trb_phys,
             done: false, completion_code: 0, transfer_len: 0,
         });
-        let pump = self.pump_until_bot_done(50_000_000);
+        // Budget is in hlt/timer-tick yields now (not raw spins); a transfer normally
+        // completes in 1-2 ticks.
+        let pump = self.pump_until_bot_done(2000);
         let pending = self.bot_pending.take();
         pump?;
         let p = pending.ok_or(BotError::Timeout)?;
@@ -1490,13 +1511,17 @@ impl XhciController {
                 None => return Ok(()),
                 _ => {}
             }
-            self.drain_event_ring_once();
+            if self.drain_event_ring_once() {
+                continue; // processed an event; drain any more immediately
+            }
+            // Yield to QEMU's main loop so it can run the xHC bottom-half / async block-I/O
+            // completion and DMA the event into the ring; a pure spin never exits TCG.
+            crate::hlt();
             iters += 1;
             if iters >= max_iters {
                 serial_println!("xHCI: BOT pump TIMEOUT");
                 return Err(BotError::Timeout);
             }
-            core::hint::spin_loop();
         }
     }
 
@@ -1922,7 +1947,7 @@ impl XhciController {
             let s_param = setup_trb.parameter;
             let s_status = setup_trb.status;
             let s_ctrl = setup_trb.control;
-            serial_println!("xHCI: Setup TRB -> Param: {:#x}, Status: {:#x}, Control: {:#x}", s_param, s_status, s_ctrl);
+            xdbg!("xHCI: Setup TRB -> Param: {:#x}, Status: {:#x}, Control: {:#x}", s_param, s_status, s_ctrl);
             self.push_ep0(slot_id, setup_trb);
 
             let status_trb = Trb {
@@ -1933,7 +1958,7 @@ impl XhciController {
             let st_param = status_trb.parameter;
             let st_status = status_trb.status;
             let st_ctrl = status_trb.control;
-            serial_println!("xHCI: Status TRB -> Param: {:#x}, Status: {:#x}, Control: {:#x}", st_param, st_status, st_ctrl);
+            xdbg!("xHCI: Status TRB -> Param: {:#x}, Status: {:#x}, Control: {:#x}", st_param, st_status, st_ctrl);
             self.push_ep0(slot_id, status_trb);
 
             self.ring_doorbell(slot_id, 1);
@@ -1955,7 +1980,7 @@ impl XhciController {
             };
             self.slots[slot_id as usize].mouse_ring.as_mut().unwrap().push(in_trb).unwrap();
             self.ring_doorbell(slot_id, dci as u32);
-            serial_println!("xHCI: Mouse Read Queued.");
+            xdbg!("xHCI: Mouse Read Queued.");
         }
     }
 
@@ -2064,7 +2089,7 @@ impl XhciController {
             };
             self.slots[slot_id as usize].keyboard_ring.as_mut().unwrap().push(in_trb).unwrap();
             self.ring_doorbell(slot_id, dci as u32);
-            serial_println!("xHCI: Keyboard Read Queued.");
+            xdbg!("xHCI: Keyboard Read Queued.");
         }
     }
 }

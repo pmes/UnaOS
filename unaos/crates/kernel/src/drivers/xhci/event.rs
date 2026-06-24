@@ -30,7 +30,11 @@ pub struct ErstTable {
     pub entries: [ErstEntry; 1],
 }
 
-const EVENT_RING_SIZE: usize = 16;
+// Sized generously: the controller cannot post a completion event while the ring is
+// full, and a synchronous bring-up burst (plus interleaved HID events) can fill a tiny
+// ring before the main loop drains it. Must match the ERST segment size in
+// init_interrupter().
+pub const EVENT_RING_SIZE: usize = 256;
 
 #[repr(C, align(64))]
 pub struct EventRing {
@@ -51,9 +55,14 @@ impl EventRing {
         }
     }
 
-    // Check if the current TRB at dequeue_index is fresh
+    // Check if the current TRB at dequeue_index is fresh.
+    // The event ring is written by the controller via DMA, so the control field MUST be
+    // read with a volatile load — a plain read can be hoisted/cached by the compiler,
+    // making a tight poll loop spin forever on a stale value.
     pub fn has_event(&self) -> bool {
-        let trb = &self.trbs[self.dequeue_index];
+        // Read the whole (aligned) TRB volatile — Trb is `packed`, so taking a reference
+        // to an individual field is unaligned/illegal; copy it out, then read the field.
+        let trb = unsafe { core::ptr::read_volatile(&self.trbs[self.dequeue_index]) };
         let cycle_state = (trb.control & 1) != 0;
         cycle_state == self.cycle_bit
     }
@@ -63,7 +72,8 @@ impl EventRing {
             return None;
         }
 
-        let trb = self.trbs[self.dequeue_index];
+        // Volatile read of the DMA-written TRB (see has_event).
+        let trb = unsafe { core::ptr::read_volatile(&self.trbs[self.dequeue_index]) };
 
         // Advance
         self.dequeue_index += 1;
