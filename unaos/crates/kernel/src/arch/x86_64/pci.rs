@@ -61,6 +61,10 @@ pub fn init(_dtb_addr: u64, _dtb_size: usize) {
     if let Some((xhci_phys_addr, bus, dev, func)) = crate::drivers::pci::PciScanner::scan() {
         serial_println!(":: x86_64 PCI Init: Found xHCI at {:#x} ::", xhci_phys_addr);
 
+        // DIAGNOSTIC (read-only): dump interrupt line/pin + capability list to plan
+        // interrupt-driven bring-up (INTx IRQ vs MSI-X).
+        crate::drivers::pci::PciScanner::probe_irq_caps(bus, dev, func);
+
         // Enable PCI Memory Space + Bus Master (DMA) for the controller. Without Bus
         // Master the xHCI can never fetch command TRBs or write event TRBs.
         crate::drivers::pci::PciScanner::enable_bus_master(bus, dev, func);
@@ -87,6 +91,17 @@ pub fn init(_dtb_addr: u64, _dtb_size: usize) {
 
             let erst_table_phys = &raw mut crate::drivers::xhci::ERST_TABLE as u64;
             xhci.init_interrupter(event_ring_phys, erst_table_phys);
+
+            // Route the controller's interrupts via MSI-X straight to the local APIC (no
+            // 8259, no I/O APIC). init_interrupter just published the IR0/OP MMIO bases the
+            // handler needs; IMAN.IE is set there and USBCMD.INTE in start(). The MSI message
+            // targets the BSP local APIC (0xFEE00000 | dest_id<<12) at IDT vector 0x40.
+            let msg_addr = 0xFEE0_0000u32 | ((crate::arch::apic::apic_id() as u32) << 12);
+            crate::drivers::pci::PciScanner::enable_msix(
+                bus, dev, func, xhci_phys_addr, msg_addr,
+                crate::arch::interrupts::XHCI_MSI_VECTOR as u32,
+            );
+
             xhci.init_pointers(command_ring_phys);
             xhci.start();
 

@@ -27,6 +27,11 @@ use x86_64::structures::idt::{InterruptDescriptorTable, InterruptStackFrame, Pag
 pub const PIC_1_OFFSET: u8 = 32;
 pub const PIC_2_OFFSET: u8 = PIC_1_OFFSET + 8;
 
+/// IDT vectors delivered straight to the local APIC (no 8259/PIC offset).
+/// xHCI MSI-X (interrupter 0) and the APIC spurious-interrupt vector (== APIC SVR low byte).
+pub const XHCI_MSI_VECTOR: u8 = 0x40;
+pub const SPURIOUS_VECTOR: u8 = 0xFF;
+
 pub static PICS: Mutex<ChainedPics> =
     Mutex::new(unsafe { ChainedPics::new(PIC_1_OFFSET, PIC_2_OFFSET) });
 
@@ -44,6 +49,10 @@ lazy_static! {
         idt[InterruptIndex::Timer.as_u8()].set_handler_fn(timer_interrupt_handler);
         idt[InterruptIndex::Keyboard.as_u8()].set_handler_fn(keyboard_interrupt_handler);
         idt[InterruptIndex::Mouse.as_u8()].set_handler_fn(mouse_interrupt_handler);
+        // xHCI MSI-X (interrupter 0) delivered directly to the local APIC at vector 0x40 —
+        // no 8259/INTx involvement. Spurious-interrupt vector 0xFF matches APIC SVR.
+        idt[XHCI_MSI_VECTOR].set_handler_fn(xhci_msi_handler);
+        idt[SPURIOUS_VECTOR].set_handler_fn(spurious_handler);
         idt
     };
 }
@@ -177,6 +186,23 @@ extern "x86-interrupt" fn keyboard_interrupt_handler(_stack_frame: InterruptStac
             .notify_end_of_interrupt(InterruptIndex::Keyboard.as_u8());
     }
 }
+
+/// xHCI MSI-X handler (interrupter 0, IDT vector 0x40). Minimal and lock-free: it
+/// acknowledges the controller (clears IMAN.IP / USBSTS.EINT via raw MMIO) so the
+/// interrupter can raise again, then EOIs the local APIC. It does NOT drain the event ring
+/// — that happens in the polled context (main loop / BOT pump), which owns the controller +
+/// event-ring locks. Touching those locks here would self-deadlock (the main loop holds
+/// XHCI_CONTROLLER across the synchronous BOT pump). The interrupt's purpose is to wake the
+/// CPU from `hlt` so QEMU's main loop runs the async completion and the pump promptly drains
+/// the resulting event.
+extern "x86-interrupt" fn xhci_msi_handler(_stack_frame: InterruptStackFrame) {
+    crate::drivers::xhci::interrupt_ack();
+    crate::arch::apic::eoi();
+}
+
+/// Local APIC spurious-interrupt handler (vector 0xFF, == APIC SVR low byte). By definition
+/// the APIC did not actually deliver an interrupt here, so we must NOT send an EOI.
+extern "x86-interrupt" fn spurious_handler(_stack_frame: InterruptStackFrame) {}
 
 extern "x86-interrupt" fn mouse_interrupt_handler(_stack_frame: InterruptStackFrame) {
     use x86_64::instructions::port::Port;

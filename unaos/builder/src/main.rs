@@ -117,6 +117,12 @@ fn main() {
     println!("🔹 Launching QEMU...");
     let mut cmd = Command::new("qemu-system-x86_64");
 
+    // Q35/ICH9 chipset: PCIe-based, closer to real modern hardware (e.g. a 2012 MacBook
+    // Pro) than the legacy i440FX default. Note: on Q35 the qemu-xhci PCIe INTx routes to
+    // an APIC GSI the 8259 PIC cannot service, so interrupt-driven xHCI uses MSI-X (local
+    // APIC) rather than legacy INTx.
+    cmd.arg("-machine").arg("pc-q35-10.0");
+
     // Firmware: read-only code pflash (unit 0) + writable vars pflash (unit 1) when a
     // vars store exists; otherwise a single read-only code pflash (legacy behavior).
     cmd.arg("-drive").arg(format!("if=pflash,unit=0,format=raw,readonly=on,file={}", ovmf_code));
@@ -132,6 +138,14 @@ fn main() {
        .arg("-device").arg("usb-tablet,bus=xhci.0")
        .arg("-m").arg("1G");
 
+    // DIAGNOSTIC: append arbitrary QEMU args from UNAOS_QEMU_EXTRA (whitespace-split), e.g.
+    // `-d guest_errors -trace usb_xhci_* -trace usb_msd_*`, so we can capture QEMU's own
+    // tracing of the xHCI/SCSI path. In test mode QEMU's stderr is redirected to a file.
+    let qemu_extra = std::env::var("UNAOS_QEMU_EXTRA").unwrap_or_default();
+    for a in qemu_extra.split_whitespace() {
+        cmd.arg(a);
+    }
+
     // Test mode: set UNAOS_SERIAL_LOG to run headless, redirect serial to that file, and
     // self-terminate after UNAOS_TEST_SECS (default 20s). Keeps automated boot-log capture
     // portable (no `timeout` binary needed). Normal runs keep the GUI + serial on stdio.
@@ -141,6 +155,12 @@ fn main() {
         println!("   [test mode] headless, serial -> {log_path}, auto-kill after {secs}s");
         cmd.arg("-display").arg("none")
            .arg("-serial").arg(format!("file:{log_path}"));
+        // Capture QEMU's own stderr (where -d / -trace output goes) next to the serial log.
+        if let Ok(dbg_path) = std::env::var("UNAOS_QEMU_DEBUG_LOG") {
+            if let Ok(f) = std::fs::File::create(&dbg_path) {
+                cmd.stderr(Stdio::from(f));
+            }
+        }
         let mut child = cmd.spawn().unwrap();
         std::thread::sleep(std::time::Duration::from_secs(secs));
         let _ = child.kill();

@@ -16,7 +16,9 @@
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 #![cfg_attr(test, no_main)]
-#![feature(abi_x86_interrupt)]
+// abi_x86_interrupt is only used by the x86_64 interrupt handlers; gating it keeps the
+// aarch64 build free of the "unused feature" warning.
+#![cfg_attr(target_arch = "x86_64", feature(abi_x86_interrupt))]
 #![allow(unsafe_op_in_unsafe_fn)]
 
 extern crate alloc;

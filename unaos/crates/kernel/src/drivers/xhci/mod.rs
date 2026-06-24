@@ -28,7 +28,7 @@ use alloc::vec::Vec;
 
 /// Flip to `true` to restore the very verbose per-doorbell / per-event xHCI tracing.
 /// Left `false` so the serial log shows only milestones and errors.
-const XHCI_VERBOSE: bool = true;
+const XHCI_VERBOSE: bool = false;
 
 /// Verbose xHCI trace: compiles to nothing (optimized out) unless XHCI_VERBOSE is true.
 macro_rules! xdbg {
@@ -211,6 +211,45 @@ pub static mut ERST_TABLE: ErstTable = ErstTable { entries: [ErstEntry { ring_ad
 // Store Physical Address of the Event Ring for Runtime ERDP updates
 static mut EVENT_RING_PHYS_BASE: u64 = 0;
 
+use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+
+// --- Interrupt-driven xHCI (MSI-X via the local APIC) ---
+// These let the interrupt handler acknowledge the interrupter using ONLY raw MMIO and
+// lock-free atomics — it must NOT take the XHCI_CONTROLLER / EVENT_RING spin-locks (the
+// main loop holds XHCI_CONTROLLER across the synchronous BOT pump, so locking here would
+// self-deadlock). The actual event-ring drain stays in the polled context.
+/// MMIO address of Interrupter 0's register set (IMAN at +0x00). 0 = not yet initialized.
+pub static XHCI_IR0_BASE: AtomicUsize = AtomicUsize::new(0);
+/// MMIO address of the operational registers (USBSTS at +0x04). 0 = not yet initialized.
+pub static XHCI_OP_BASE: AtomicUsize = AtomicUsize::new(0);
+/// Count of xHCI interrupts taken — a diagnostic to confirm the MSI-X path is live.
+pub static XHCI_IRQ_COUNT: AtomicU64 = AtomicU64::new(0);
+
+/// Acknowledge an xHCI interrupt at the hardware level so the interrupter can raise again.
+/// Safe to call from interrupt context: it takes NO locks and does NO allocation — it clears
+/// IMAN.IP (bit 0, RW1C) preserving IMAN.IE, and USBSTS.EINT (bit 3, RW1C). It does NOT drain
+/// the event ring; the main loop / BOT pump owns that (and the controller lock). A spurious
+/// interrupt (IP not set) is harmless — clearing an already-clear RW1C bit is a no-op. The
+/// caller (the MSI-X handler) issues the local-APIC EOI; this function does not.
+pub fn interrupt_ack() {
+    let ir0 = XHCI_IR0_BASE.load(Ordering::Acquire);
+    if ir0 != 0 {
+        unsafe {
+            let iman = core::ptr::read_volatile(ir0 as *const u32);
+            // Write 1 to IP (clear, RW1C) while preserving IE — never blind-write 0x1,
+            // which would clear IE and silence all future interrupts.
+            core::ptr::write_volatile(ir0 as *mut u32, iman | 1);
+        }
+    }
+    let op = XHCI_OP_BASE.load(Ordering::Acquire);
+    if op != 0 {
+        unsafe {
+            core::ptr::write_volatile((op + 0x04) as *mut u32, 1 << 3); // USBSTS.EINT
+        }
+    }
+    XHCI_IRQ_COUNT.fetch_add(1, Ordering::Relaxed);
+}
+
 /// THE GREAT UNIFICATION
 /// Rings the xHCI Doorbell using raw assembly to ensure
 /// strict ordering and immediate execution.
@@ -251,18 +290,18 @@ pub struct BotResult {
     pub residue: u32,
 }
 
-/// In-flight BOT transaction state. The event handler records the CSW (or an error)
-/// here while the synchronous pump waits. The CSW completion is matched by the TRB
-/// physical address so it is never confused with a data-stage event.
+/// In-flight BOT stage state. BOT phases (CBW -> [DATA] -> CSW) are pumped one at a time;
+/// the event handler records the completion (or an error) here while the synchronous pump
+/// waits. The stage's TRB is matched by its physical address so it is never confused with
+/// an unrelated transfer event.
 #[derive(Clone, Copy)]
 struct BotPending {
     slot_id: u8,
     in_dci: u8,
     out_dci: u8,
-    csw_trb_phys: u64,
+    wait_trb_phys: u64,
     done: bool,
     completion_code: u8,
-    transfer_len: u32,
 }
 
 pub struct DeviceSlot {
@@ -338,7 +377,6 @@ impl DeviceSlot {
 pub struct XhciController {
     base_addr: usize,
     op_base: usize,
-    pub irq_vector: u8,
     pub max_slots: u8,
     pub max_ports: u8,
     pub dcbaap: *mut u64,
@@ -395,7 +433,6 @@ impl XhciController {
         XhciController {
             base_addr,
             op_base,
-            irq_vector: 0,
             max_slots,
             max_ports,
             dcbaap: core::ptr::null_mut(),
@@ -803,12 +840,11 @@ impl XhciController {
                                     if p.slot_id == slot_id as u8
                                         && (endpoint_id as u8 == p.in_dci || endpoint_id as u8 == p.out_dci)
                                     {
-                                        let is_csw = param == p.csw_trb_phys;
+                                        let is_match = param == p.wait_trb_phys;
                                         let is_error = completion_code != 1 && completion_code != 13;
-                                        if is_csw || is_error {
+                                        if is_match || is_error {
                                             if let Some(bp) = self.bot_pending.as_mut() {
                                                 bp.completion_code = completion_code as u8;
-                                                bp.transfer_len = transfer_len;
                                                 bp.done = true;
                                             }
                                         }
@@ -984,14 +1020,27 @@ impl XhciController {
             let erdp_ptr = (ir0_base + 0x18) as *mut u64;
             core::ptr::write_volatile(erdp_ptr, event_ring_phys); // Pointer to the RING, not the table
 
-            // 6. GAG the Interrupter (IMAN - Interrupter Management) - Offset 0x00.
+            // 5b. IMOD (Interrupter Moderation, +0x04): 0 = no moderation, fire ASAP.
+            // (QEMU ignores moderation timing, but set it explicitly for clarity / real HW.)
+            core::ptr::write_volatile((ir0_base + 0x04) as *mut u32, 0);
+
+            // Publish the MMIO bases BEFORE enabling the interrupter, so the lock-free MSI-X
+            // handler can never load an un-initialized (0) base if an interrupt fires. (Both
+            // IMAN.IE here and USBCMD.INTE in start() gate delivery, but publish-before-enable
+            // is the correct-by-design ordering regardless of those gates.)
+            XHCI_IR0_BASE.store(ir0_base, Ordering::Release);
+            XHCI_OP_BASE.store(self.op_base, Ordering::Release);
+
+            // 6. ENABLE the Interrupter (IMAN - Interrupter Management) - Offset 0x00.
             // Bit 0 = IP (Interrupt Pending, RW1C), Bit 1 = IE (Interrupt Enable).
-            // Clear both: we poll the event ring rather than taking interrupts.
+            // Set IE (bit 1); leave IP (bit 0) clear so we don't acknowledge a stale event.
+            // QEMU only asserts the IRQ when IMAN.IP & IMAN.IE & USBCMD.INTE all hold, so
+            // USBCMD.INTE must also be set (done in start()).
             let iman_ptr = (ir0_base + 0x00) as *mut u32;
             let iman = core::ptr::read_volatile(iman_ptr);
-            core::ptr::write_volatile(iman_ptr, iman & !0x3);
+            core::ptr::write_volatile(iman_ptr, (iman & !0x1) | 0x2);
 
-            serial_println!("xHCI: Interrupter 0 gagged (IMAN.IE cleared, polling).");
+            serial_println!("xHCI: Interrupter 0 enabled (IMAN.IE set, interrupt-driven).");
         }
     }
 
@@ -1005,10 +1054,12 @@ impl XhciController {
             core::ptr::write_volatile(config_ptr, (config & !0xFF) | (self.max_slots as u32));
             serial_println!("xHCI: CONFIG register set to {} (MaxSlotsEn).", self.max_slots);
 
-            // Write 1 to USBCMD.RS (Run/Stop)
+            // Write USBCMD: bit 0 = RS (Run/Stop), bit 2 = INTE (Interrupter Enable).
+            // INTE is the global gate for host-system interrupts; without it QEMU never
+            // asserts the IRQ regardless of IMAN.IE (xhci_intr_raise requires both).
             let usbcmd_ptr = self.op_base as *mut u32;
             let cmd = core::ptr::read_volatile(usbcmd_ptr);
-            core::ptr::write_volatile(usbcmd_ptr, cmd | 1);
+            core::ptr::write_volatile(usbcmd_ptr, cmd | 0b101);
 
             // Wait until USBSTS.HCH (Halted) is 0
             let usbsts_ptr = (self.op_base + 0x04) as *const u32;
@@ -1425,58 +1476,69 @@ impl XhciController {
         let tag = self.build_cbw(cbw_phys as *mut u8, data_len, dir, cdb);
         unsafe { core::ptr::write_bytes(csw_phys as *mut u8, 0, 13); }
 
-        // 1) CBW on bulk OUT (Normal TRB, 31 bytes, no IOC).
+        // BOT phases are SERIALIZED: CBW -> [DATA] -> CSW, each transfer completing before
+        // the next is queued — mirroring the Linux usb-storage bulk transport. We must NOT
+        // pipeline the CSW TRB behind an async data stage: QEMU's usb-storage is a single-
+        // packet device, so a CSW IN token arriving while the DATA transfer is still async
+        // is never serviced and the transfer hangs with no completion event. The CBW is
+        // fire-and-forget (the device consumes it before it can respond); the DATA and CSW
+        // stages each carry IOC (1<<5) so their completion posts a Transfer Event (-> MSI ->
+        // the pump wakes). We await the DATA stage, then the CSW — never the CBW directly.
+
+        // 1) CBW on bulk OUT (Normal TRB, 31 bytes).
         self.slots[slot_id as usize].bulk_out_ring.as_mut().unwrap()
             .push(Trb { parameter: cbw_phys, status: 31, control: 1 << 10 }).ok();
 
-        // 2) Data stage (no IOC; a short packet is reflected in the CSW residue).
-        match dir {
-            Direction::In if data_len > 0 => {
-                self.slots[slot_id as usize].bulk_in_ring.as_mut().unwrap()
-                    .push(Trb { parameter: data_phys, status: data_len, control: 1 << 10 }).ok();
+        // 2) Data stage (IN or OUT), if any. IOC + ISP (1<<2) so both full and short-packet
+        //    completions post an event; wait for it to retire BEFORE queuing the CSW.
+        if data_len > 0 {
+            let data_out = matches!(dir, Direction::Out);
+            let (data_dci, data_trb_phys) = {
+                let ring = if data_out {
+                    self.slots[slot_id as usize].bulk_out_ring.as_mut().unwrap()
+                } else {
+                    self.slots[slot_id as usize].bulk_in_ring.as_mut().unwrap()
+                };
+                let base = ring.get_ptr();
+                let idx = ring.push(Trb { parameter: data_phys, status: data_len,
+                    control: (1 << 10) | (1 << 5) | (1 << 2) }).unwrap_or(0);
+                (if data_out { out_dci } else { in_dci }, base + (idx as u64) * 16)
+            };
+
+            // Ring OUT to fetch+send the CBW; for an IN data stage also ring the IN ring.
+            // (An OUT data stage rides the same OUT ring as the CBW, in order.)
+            self.ring_doorbell(slot_id, out_dci as u32);
+            if data_dci != out_dci { self.ring_doorbell(slot_id, data_dci as u32); }
+
+            let code = self.run_bot_stage(slot_id, in_dci, out_dci, data_trb_phys)?;
+            if code != 1 && code != 13 {
+                serial_println!("xHCI: BOT data stage error, completion code {}", code);
+                return if code == 4 || code == 6 { Err(BotError::Stall) }
+                       else { Err(BotError::TransferError(code)) };
             }
-            Direction::Out if data_len > 0 => {
-                self.slots[slot_id as usize].bulk_out_ring.as_mut().unwrap()
-                    .push(Trb { parameter: data_phys, status: data_len, control: 1 << 10 }).ok();
-            }
-            _ => {}
+        } else {
+            // No data stage: fetch+send the CBW now; the CSW is queued next.
+            self.ring_doorbell(slot_id, out_dci as u32);
         }
 
-        // 3) CSW on bulk IN (13 bytes, IOC). Capture its TRB physical address so the
-        //    completion event is matched unambiguously.
+        // 3) CSW on bulk IN (13 bytes, IOC). The data stage (if any) has fully retired, so
+        //    usb-storage is in its CSW state and services this token immediately.
         let csw_trb_phys = {
             let ring = self.slots[slot_id as usize].bulk_in_ring.as_mut().unwrap();
             let base = ring.get_ptr();
             let idx = ring.push(Trb { parameter: csw_phys, status: 13, control: (1 << 10) | (1 << 5) }).unwrap_or(0);
             base + (idx as u64) * 16
         };
-
-        // 4) Doorbells: OUT first (fetch CBW), then IN (data + CSW).
-        self.ring_doorbell(slot_id, out_dci as u32);
         self.ring_doorbell(slot_id, in_dci as u32);
 
-        // 5) Arm pending state and pump the event ring until the CSW arrives.
-        self.bot_pending = Some(BotPending {
-            slot_id, in_dci, out_dci, csw_trb_phys,
-            done: false, completion_code: 0, transfer_len: 0,
-        });
-        // Budget is in hlt/timer-tick yields now (not raw spins); a transfer normally
-        // completes in 1-2 ticks.
-        let pump = self.pump_until_bot_done(2000);
-        let pending = self.bot_pending.take();
-        pump?;
-        let p = pending.ok_or(BotError::Timeout)?;
-
-        if p.completion_code != 1 && p.completion_code != 13 {
-            serial_println!("xHCI: BOT transfer error, completion code {}", p.completion_code);
-            return if p.completion_code == 4 || p.completion_code == 6 {
-                Err(BotError::Stall)
-            } else {
-                Err(BotError::TransferError(p.completion_code))
-            };
+        let code = self.run_bot_stage(slot_id, in_dci, out_dci, csw_trb_phys)?;
+        if code != 1 && code != 13 {
+            serial_println!("xHCI: BOT transfer error, completion code {}", code);
+            return if code == 4 || code == 6 { Err(BotError::Stall) }
+                   else { Err(BotError::TransferError(code)) };
         }
 
-        // 6) Validate the CSW.
+        // 4) Validate the CSW.
         unsafe {
             let csw = core::slice::from_raw_parts(csw_phys as *const u8, 13);
             let sig = (csw[0] as u32) | ((csw[1] as u32) << 8) | ((csw[2] as u32) << 16) | ((csw[3] as u32) << 24);
@@ -1500,6 +1562,23 @@ impl XhciController {
         }
     }
 
+    /// Arm the BOT pending state for one stage (waiting on `wait_trb_phys`'s completion
+    /// event), pump the event ring until it arrives, and return its completion code. The
+    /// caller queues the stage's TRB(s) and rings the doorbell(s) before calling this.
+    fn run_bot_stage(&mut self, slot_id: u8, in_dci: u8, out_dci: u8, wait_trb_phys: u64)
+        -> Result<u8, BotError>
+    {
+        self.bot_pending = Some(BotPending {
+            slot_id, in_dci, out_dci, wait_trb_phys,
+            done: false, completion_code: 0,
+        });
+        let pump = self.pump_until_bot_done(2000);
+        let pending = self.bot_pending.take();
+        pump?;
+        let p = pending.ok_or(BotError::Timeout)?;
+        Ok(p.completion_code)
+    }
+
     /// Pump the event ring until the in-flight BOT transaction reports done, or the
     /// iteration budget is exhausted. Unrelated events (HID input, command completions)
     /// are dispatched normally during the wait.
@@ -1519,7 +1598,15 @@ impl XhciController {
             crate::hlt();
             iters += 1;
             if iters >= max_iters {
-                serial_println!("xHCI: BOT pump TIMEOUT");
+                unsafe {
+                    let ir0 = XHCI_IR0_BASE.load(Ordering::Acquire);
+                    let op = XHCI_OP_BASE.load(Ordering::Acquire);
+                    let iman = if ir0 != 0 { core::ptr::read_volatile(ir0 as *const u32) } else { 0 };
+                    let usbsts = if op != 0 { core::ptr::read_volatile((op + 0x04) as *const u32) } else { 0 };
+                    serial_println!(
+                        "xHCI: BOT pump TIMEOUT after {} yields (IRQ_COUNT={} IMAN={:#x} USBSTS={:#x})",
+                        iters, XHCI_IRQ_COUNT.load(Ordering::Relaxed), iman, usbsts);
+                }
                 return Err(BotError::Timeout);
             }
         }
@@ -1671,6 +1758,8 @@ impl XhciController {
                         if sig == "UNA-OS-DISK-001-ALPHA" {
                             serial_println!("xHCI: >>> MISSION SUCCESS (BOT + CSW). TARGET ACQUIRED. <<<");
                         }
+                        serial_println!("xHCI: [IRQ] xHCI interrupts taken so far: {}",
+                            XHCI_IRQ_COUNT.load(Ordering::Relaxed));
                     }
                 }
             }
