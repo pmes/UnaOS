@@ -3,6 +3,7 @@ pub mod serial;
 pub mod gdt;
 pub mod interrupts;
 pub mod apic;
+pub mod acpi;
 pub mod pci;
 pub mod memory;
 

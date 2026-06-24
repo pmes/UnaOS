@@ -35,9 +35,18 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     let dtb_addr = boot_info.dtb_addr;
     let dtb_size = boot_info.dtb_size;
 
+    // ACPI RSDP (x86_64) before memory init consumes boot_info
+    #[cfg(target_arch = "x86_64")]
+    let rsdp_addr = boot_info.rsdp_addr;
+
     // 4. Global Heap Allocation (Phase 3 Memory Translation)
     unaos_kernel::arch::memory::init(boot_info);
     serial_println!(":: KERNEL HEAP ALLOCATED ::");
+
+    // 4b. ACPI: discover the CPU topology (MADT) for SMP bring-up. x86_64 only — aarch64
+    // discovers CPUs via the DTB. Degrades gracefully to uniprocessor if ACPI is absent.
+    #[cfg(target_arch = "x86_64")]
+    unaos_kernel::arch::acpi::init(rsdp_addr);
 
     // 5. Motherboard Hardware Interconnects
     unaos_kernel::arch::pci::init(dtb_addr, dtb_size);
