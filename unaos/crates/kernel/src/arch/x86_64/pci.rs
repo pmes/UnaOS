@@ -67,26 +67,19 @@ pub fn init(_dtb_addr: u64, _dtb_size: usize) {
         unsafe {
             let mut xhci = crate::drivers::xhci::XhciController::new(xhci_phys_addr as usize);
             
-            let event_ring_phys = crate::drivers::xhci::EVENT_RING.lock().get_ptr();
+            // Initialize globals
+            let mut cmd_ring_guard = crate::drivers::xhci::COMMAND_RING.lock();
+            let mut evt_ring_guard = crate::drivers::xhci::EVENT_RING.lock();
+
+            *cmd_ring_guard = Some(crate::drivers::xhci::ring::TransferRing::new(256));
+            *evt_ring_guard = Some(crate::drivers::xhci::event::EventRing::new());
+
+            let event_ring_phys = evt_ring_guard.as_mut().unwrap().get_ptr();
             let erst_table_phys = &raw mut crate::drivers::xhci::ERST_TABLE as u64;
             xhci.init_interrupter(event_ring_phys, erst_table_phys);
-
-            let input_phys = &raw mut crate::drivers::xhci::INPUT_CONTEXT as u64;
-            let output_phys = &raw mut crate::drivers::xhci::OUTPUT_CONTEXT as u64;
-            let ep0_phys = &raw mut crate::drivers::xhci::EP0_RING as u64;
-            let desc_phys = &raw mut crate::drivers::xhci::DESCRIPTOR_BUFFER as u64;
             
-            let data_phys = &raw mut crate::drivers::xhci::DATA_BUFFER as u64;
-            
-            let event_ring_phys = crate::drivers::xhci::EVENT_RING.lock().get_ptr();
-            let bulk_in_phys = crate::drivers::xhci::BULK_IN_RING.lock().get_ptr();
-            let bulk_out_phys = crate::drivers::xhci::BULK_OUT_RING.lock().get_ptr();
-            
-            xhci.init_contexts(input_phys, output_phys, ep0_phys, desc_phys, event_ring_phys, bulk_in_phys, bulk_out_phys, data_phys);
-            
-            let command_ring_phys = crate::drivers::xhci::COMMAND_RING.lock().get_ptr();
-            let dcbaap_phys = &raw mut crate::drivers::xhci::DCBAAP_TABLE as u64;
-            xhci.init_pointers(command_ring_phys, dcbaap_phys);
+            let command_ring_phys = cmd_ring_guard.as_mut().unwrap().get_ptr();
+            xhci.init_pointers(command_ring_phys);
             xhci.start();
             
             // Store globally

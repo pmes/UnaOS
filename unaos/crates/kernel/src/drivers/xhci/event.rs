@@ -39,6 +39,9 @@ pub struct EventRing {
     pub cycle_bit: bool, // What we expect the hardware to write
 }
 
+unsafe impl Send for EventRing {}
+unsafe impl Sync for EventRing {}
+
 impl EventRing {
     pub const fn new() -> Self {
         Self {
