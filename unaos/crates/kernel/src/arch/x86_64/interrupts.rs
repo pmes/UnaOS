@@ -98,7 +98,12 @@ extern "x86-interrupt" fn double_fault_handler(
 
 extern "x86-interrupt" fn timer_interrupt_handler(_stack_frame: InterruptStackFrame) {
     // Local APIC timer tick. Lock-free: bump the heartbeat counter and issue an APIC EOI.
-    crate::arch::apic::APIC_TICKS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    let prev = crate::arch::apic::APIC_TICKS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    // One-shot breadcrumb the very first time the timer fires — confirms the local-APIC timer
+    // path (xAPIC MMIO or x2APIC MSR LVT) is actually delivering, without spamming every tick.
+    if prev == 0 {
+        serial_println!("APIC: heartbeat live (first timer tick).");
+    }
     crate::arch::apic::eoi();
 }
 

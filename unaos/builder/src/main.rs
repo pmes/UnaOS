@@ -123,6 +123,12 @@ fn main() {
     // APIC) rather than legacy INTx.
     cmd.arg("-machine").arg("pc-q35-10.0");
 
+    // CPU model: advertise x2APIC (the default qemu64 model does not), so the kernel exercises
+    // the MSR-based local-APIC path that the target hardware (2012 MacBook, Zenbook S16) uses.
+    // Override with UNAOS_CPU — e.g. `UNAOS_CPU=qemu64` drops x2APIC to test the xAPIC fallback.
+    let cpu = std::env::var("UNAOS_CPU").unwrap_or_else(|_| "qemu64,+x2apic".into());
+    cmd.arg("-cpu").arg(cpu);
+
     // Firmware: read-only code pflash (unit 0) + writable vars pflash (unit 1) when a
     // vars store exists; otherwise a single read-only code pflash (legacy behavior).
     cmd.arg("-drive").arg(format!("if=pflash,unit=0,format=raw,readonly=on,file={}", ovmf_code));
