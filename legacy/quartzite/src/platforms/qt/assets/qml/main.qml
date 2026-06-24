@@ -1,0 +1,85 @@
+// SPDX-License-Identifier: LGPL-3.0-or-later
+// Copyright (C) 2026 The Architect & Una
+//
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU Lesser General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// GNU Lesser General Public License for more details.
+//
+// You should have received a copy of the GNU Lesser General Public License
+// along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
+import QtQuick 2.15
+import QtQuick.Controls 2.15
+import QtQuick.Layouts 1.15
+import com.unaos.lumen 1.0
+
+Item {
+    id: root
+    width: 800
+    height: 600
+
+
+    // Core Window Logic & Routing Registration
+    LumenWindow {
+        id: lumenWindow
+        Component.onCompleted: {
+            lumenWindow.registerThread();
+        }
+    }
+
+    // Handler Facade: Vein
+    VeinBridge {
+        id: veinBridge
+        Component.onCompleted: {
+            veinBridge.registerThread();
+            veinBridge.requestHistory();
+        }
+    }
+
+    // Models are now uncreatable and injected via the context property from C++ or acquired via singleton
+
+    SplitView {
+        anchors.fill: parent
+        orientation: Qt.Horizontal
+
+        // Nodes Email List (Sidebar)
+        NexusPanel {
+            SplitView.preferredWidth: parent.width * (typeof _splitRatio !== "undefined" ? _splitRatio : 0.25)
+            SplitView.fillHeight: true
+            SplitView.minimumWidth: 150
+            historyModel: typeof _historyModel !== "undefined" ? _historyModel : null
+            backend: veinBridge // Uses the VeinBridge defined above in main.qml
+
+            onViewNetworkLog: {
+                networkLogOverlay.visible = true;
+            }
+        }
+
+        // Main Area Container (Isolates chat and overlays to the right pane)
+        Rectangle {
+            SplitView.fillWidth: true
+            SplitView.fillHeight: true
+
+            // Nexus Chat (Main Area)
+            NexusChat {
+                id: mainChatView
+                anchors.fill: parent
+                backend: veinBridge
+            }
+
+            // Network Log Overlay Component (Contained within the right pane)
+            NetworkLogOverlay {
+                id: networkLogOverlay
+                anchors.fill: parent
+                z: 100 // Ensure it's above the chat view, but bound to this pane
+                visible: false
+            }
+        }
+    }
+}

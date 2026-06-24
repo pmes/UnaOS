@@ -15,9 +15,60 @@
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 use crate::writer::Writer;
-use gneiss_pal::{Event, GneissPal};
 use lazy_static::lazy_static;
 use spin::Mutex;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Event {
+    Timer,
+    Key(u8),
+    Mouse { x: i32, y: i32 },
+    MouseAbsolute { x: i32, y: i32 },
+    None,
+    Unknown,
+}
+
+pub trait GneissPal {
+    fn draw_pixel(&mut self, x: u32, y: u32, color: u32);
+    fn poll_event(&mut self) -> Event;
+    fn render(&mut self);
+
+    fn width(&self) -> u32;
+    fn height(&self) -> u32;
+
+    fn clear_screen(&mut self, color: u32) {
+        for y in 0..self.height() {
+            for x in 0..self.width() {
+                self.draw_pixel(x, y, color);
+            }
+        }
+    }
+
+    fn draw_rect(&mut self, x: usize, y: usize, w: usize, h: usize, color: u32) {
+        for row in 0..h {
+            for col in 0..w {
+                self.draw_pixel((x + col) as u32, (y + row) as u32, color);
+            }
+        }
+    }
+
+    fn draw_text(&mut self, x: usize, y: usize, text: &str, color: u32) {
+        let mut curr_x = x;
+        for ch in text.chars() {
+            if ch.is_ascii() {
+                let glyph = font8x8::legacy::BASIC_LEGACY[ch as usize];
+                for (row, byte) in glyph.iter().enumerate() {
+                    for col in 0..8 {
+                        if (byte & (1 << col)) != 0 {
+                            self.draw_pixel((curr_x + col) as u32, (y + row) as u32, color);
+                        }
+                    }
+                }
+            }
+            curr_x += 8;
+        }
+    }
+}
 
 // --- EVENT QUEUE ---
 const QUEUE_SIZE: usize = 64;
@@ -59,13 +110,13 @@ lazy_static! {
 }
 
 pub fn push_event(event: Event) {
-    x86_64::instructions::interrupts::without_interrupts(|| {
+    crate::arch::without_interrupts(|| {
         EVENT_QUEUE.lock().push(event);
     });
 }
 
 fn pop_event() -> Option<Event> {
-    x86_64::instructions::interrupts::without_interrupts(|| EVENT_QUEUE.lock().pop())
+    crate::arch::without_interrupts(|| EVENT_QUEUE.lock().pop())
 }
 
 // --- PAL IMPLEMENTATION ---

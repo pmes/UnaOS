@@ -210,7 +210,10 @@ async fn main() -> Result<()> {
 
             println!("Found {} results:", results.len());
             for (inode, score) in results {
-                println!("  Inode {} (Size: {} bytes) [Score: {:.4}]", inode.id, inode.size, score);
+                println!(
+                    "  Inode {} (Size: {} bytes) [Score: {:.4}]",
+                    inode.id, inode.size, score
+                );
             }
         }
     }

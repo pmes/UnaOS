@@ -14,15 +14,14 @@
 // You should have received a copy of the GNU Lesser General Public License
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-use unafs::io::MappedFile;
-use elessar::context::SkeletonGenerator;
+use bandy::{SMessage, SpatialEdge, SpatialNode};
+use crate::skeleton::SkeletonGenerator;
 use gneiss_pal::io::MemoryMappedRegion;
-use bandy::{SMessage, MatrixEvent, SpatialNode, SpatialEdge};
+use log::info;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use tokio::sync::broadcast;
-use log::info;
+use unafs::io::MappedFile;
 
 /// Ingests a source file into the AI Cortex's memory matrix.
 ///
@@ -42,7 +41,8 @@ pub fn ingest_for_lumen(file_path: &Path) -> Result<String, String> {
     // We extract the UTF-8 slice using the pure-Rust trait.
     // Vein doesn't care that this is a memory-mapped file; it only
     // cares that the contract is fulfilled.
-    let source_code = mapped_region.as_str()
+    let source_code = mapped_region
+        .as_str()
         .map_err(|_| "Cortex encountered invalid UTF-8".to_string())?;
 
     // 3. THE MIND (Elessar)
@@ -58,16 +58,16 @@ pub fn ingest_for_lumen(file_path: &Path) -> Result<String, String> {
 }
 
 // Update the signature to return the HashMap
-pub async fn run_indexer(root: PathBuf, tx: broadcast::Sender<SMessage>) -> HashMap<PathBuf, Arc<String>> {
-    let payload = scan_workspace(&root, &tx).await;
+pub async fn run_indexer(root: PathBuf, synapse: bandy::Synapse) -> HashMap<PathBuf, Arc<String>> {
+    let payload = scan_workspace(&root, &synapse).await;
     payload
 }
 
 // Rename and update return type
-async fn scan_workspace(root: &Path, tx: &broadcast::Sender<SMessage>) -> HashMap<PathBuf, Arc<String>> {
+async fn scan_workspace(root: &Path, synapse: &bandy::Synapse) -> HashMap<PathBuf, Arc<String>> {
     info!(":: CORTEX :: Indexing Workspace at {:?}", root);
 
-    let mut indexer = elessar::context::WorkspaceIndexer::new();
+    let mut indexer = matrix::indexer::WorkspaceIndexer::new();
     indexer.scan(root);
 
     let mut spatial_nodes = Vec::new();
@@ -118,15 +118,33 @@ async fn scan_workspace(root: &Path, tx: &broadcast::Sender<SMessage>) -> HashMa
                         // REMOVED: The hardcoded bandy focus
                     }
                     Err(e) => {
-                        let _ = tx.send(SMessage::Log { level: "WARN".into(), source: "Cortex".into(), content: e });
+                        synapse
+                            .fire_async(SMessage::Log {
+                                level: "WARN".into(),
+                                source: "Cortex".into(),
+                                content: e,
+                            })
+                            .await;
                     }
                 }
             }
         }
     }
 
-    let _ = tx.send(SMessage::Matrix(MatrixEvent::IngestTopology { nodes: spatial_nodes, edges: spatial_edges }));
-    let _ = tx.send(SMessage::Log { level: "INFO".into(), source: "Cortex".into(), content: format!("Workspace Indexed. Generated {} AST Skeletons.", total_skeletons) });
+    // J21 PATHFINDER: The true IngestTopology has been replaced with the AI-readable
+    // DICTIONARY$TOPOLOGY serialization format driven entirely by the `matrix` scanner.
+    // The previous implementation is effectively a no-op, but we avoid breaking changes
+    // in the Cortex sequence by skipping the deprecated telemetry injection.
+    synapse
+        .fire_async(SMessage::Log {
+            level: "INFO".into(),
+            source: "Cortex".into(),
+            content: format!(
+                "Workspace Indexed. Generated {} AST Skeletons.",
+                total_skeletons
+            ),
+        })
+        .await;
 
     // Return the raw cache
     skeleton_cache

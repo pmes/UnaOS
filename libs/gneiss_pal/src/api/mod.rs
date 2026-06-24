@@ -14,6 +14,8 @@
 // You should have received a copy of the GNU Lesser General Public License
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
+pub mod format;
+
 use log::warn;
 use log::{error, info};
 use reqwest::{Client, ClientBuilder, StatusCode};

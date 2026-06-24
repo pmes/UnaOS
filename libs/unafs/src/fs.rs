@@ -714,6 +714,13 @@ impl<D: BlockDevice> UnaFS<D> {
     }
 }
 
+impl<D: BlockDevice> Drop for UnaFS<D> {
+    fn drop(&mut self) {
+        let _ = self.sync_metadata();
+        let _ = self.device.flush();
+    }
+}
+
 impl<D: BlockDevice> BandyMember for UnaFS<D> {
     fn publish(&self, topic: &str, msg: SMessage) -> anyhow::Result<()> {
         println!("[UNAFS] Broadcasting event to '{}': {:?}", topic, msg);
@@ -751,14 +758,20 @@ fn check_condition(val: &AttributeValue, op: &QueryOp, target: &AttributeValue) 
             }
         }
         QueryOp::Gt => {
-            if partial_cmp_attr(val, target).map(|o| o.is_gt()).unwrap_or(false) {
+            if partial_cmp_attr(val, target)
+                .map(|o| o.is_gt())
+                .unwrap_or(false)
+            {
                 Some(1.0)
             } else {
                 None
             }
         }
         QueryOp::Lt => {
-            if partial_cmp_attr(val, target).map(|o| o.is_lt()).unwrap_or(false) {
+            if partial_cmp_attr(val, target)
+                .map(|o| o.is_lt())
+                .unwrap_or(false)
+            {
                 Some(1.0)
             } else {
                 None

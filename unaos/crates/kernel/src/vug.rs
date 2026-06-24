@@ -15,10 +15,10 @@
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 // FIX: Use crate:: instead of unaos_kernel::
-use bootloader_api::info::{FrameBufferInfo, PixelFormat};
+use unaos_boot_info::{FrameBufferInfo, PixelFormat};
 
 use crate::pal::TargetPal;
-use gneiss_pal::GneissPal;
+use crate::pal::GneissPal;
 
 const METER_SEGMENTS: usize = 10;
 const SEG_HEIGHT: u32 = 10;
@@ -31,9 +31,9 @@ pub fn init(framebuffer: &mut [u8], info: FrameBufferInfo) {
     let stride = info.stride;
     let format = info.pixel_format;
 
-    crate::serial_println!(":: VUG Init ::");
-    crate::serial_println!(":: FB Size: {}x{} (stride {}) ::", width, height, stride);
-    crate::serial_println!(":: FB Format: {:?} ::", format);
+    serial_println!(":: VUG Init ::");
+    serial_println!(":: FB Size: {}x{} (stride {}) ::", width, height, stride);
+    serial_println!(":: FB Format: {:?} ::", format);
 
     // Can-Am dark grey: #1E1E1E
     let r_val = 0x1E;
@@ -70,7 +70,7 @@ pub fn init(framebuffer: &mut [u8], info: FrameBufferInfo) {
         }
     }
 
-    crate::serial_println!(":: Framebuffer painted #1E1E1E ::");
+    serial_println!(":: Framebuffer painted #1E1E1E ::");
 }
 
 pub fn draw_vug_stats(pal: &mut TargetPal, tick: u64) {
@@ -101,5 +101,17 @@ pub fn draw_vug_stats(pal: &mut TargetPal, tick: u64) {
     // Draw "VUG" heartbeat
     if (tick / 30) % 2 == 0 {
         pal.draw_rect((pal.width() / 2) as usize - 10, 20, 20, 20, 0xFF0000);
+    }
+}
+
+pub fn run_bebox_mode(pal: &mut TargetPal) {
+    pal.clear_screen(0x111111);
+    pal.draw_text(100, 100, "BeBox Mode Simulated", 0xFFFFFF);
+}
+
+pub fn run_test_pattern(pal: &mut TargetPal) {
+    pal.clear_screen(0x000000);
+    for i in 0..255 {
+        pal.draw_rect(i * 4, 100, 4, 100, (i as u32) << 16 | (i as u32) << 8 | (i as u32));
     }
 }

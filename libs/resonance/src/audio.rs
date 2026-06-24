@@ -167,10 +167,7 @@ fn write_output_f32(
 }
 
 /// Consumes commands from the ring buffer and applies them to the graph.
-fn process_commands(
-    _graph: &mut AudioGraph,
-    consumer: &mut impl Consumer<Item = AudioCommand>,
-) {
+fn process_commands(_graph: &mut AudioGraph, consumer: &mut impl Consumer<Item = AudioCommand>) {
     while let Some(cmd) = consumer.try_pop() {
         match cmd {
             AudioCommand::SetMasterFrequency(_freq) => {

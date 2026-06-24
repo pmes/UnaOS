@@ -5,22 +5,18 @@ edition = "2024"
 license = "GPL-3.0-or-later"
 
 [dependencies]
-# CORE
-bootloader = "0.11.14"
-bootloader_api = "0.11.14"
-serde = { version = "1.0", default-features = false, features = ["derive"] }
-
 # FIX: Use 'spin_no_std' to explicitly disable Standard Library usage
-lazy_static = { version = "=1.4.0", features = ["spin_no_std"] }
+lazy_static = { version = "1.5.0", features = ["spin_no_std"] }
 
 # HARDWARE
-spin = "0.9"
-volatile = "0.2"
-x86_64 = "0.14"
-uart_16550 = "0.2"
-pic8259 = "0.10"
-pc-keyboard = "0.7"
-linked_list_allocator = "=0.10.5"
+spin = "0.12.1"
+volatile = "0.6.1"
+linked_list_allocator = "0.10.6"
+font8x8 = { version = "0.3.1", default-features = false }
+cfg-if = "1.0.0"
+unaos-boot-info = { path = "../boot-info" }
+fdt = "0.1.5"
 
-# INTERNAL
-gneiss_pal = { path = "../../../libs/gneiss_pal", default-features = false }
+[target.'cfg(target_arch = "x86_64")'.dependencies]
+x86_64 = "0.15.4"
+uart_16550 = "0.6.0"

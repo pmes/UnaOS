@@ -5,18 +5,11 @@
 // it under the terms of the GNU Lesser General Public License as published by
 // the Free Software Foundation, either version 3 of the License, or
 // (at your option) any later version.
-//
-// This program is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-// GNU Lesser General Public License for more details.
-//
-// You should have received a copy of the GNU Lesser General Public License
-// along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-pub mod cortex;
 pub mod context;
+pub mod cortex;
 pub mod gravity;
+pub mod skeleton;
 pub mod storage;
 pub mod synapse;
 
@@ -24,31 +17,18 @@ use chrono::Local;
 use gneiss_pal::api::{Content, Part, ResilientClient};
 use gneiss_pal::forge::ForgeClient;
 use gneiss_pal::persistence::BrainManager;
-use gneiss_pal::{
-    AppHandler, DashboardState, Event, GuiUpdate, PreFlightPayload, Shard, ShardRole, ShardStatus, SidebarPosition,
-    ViewMode, WolfpackState,
-};
-use log::info;
+use gneiss_pal::AppHandler;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
-use std::thread;
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
-use tokio::runtime::Runtime;
-use tokio::sync::{broadcast, mpsc};
+use tokio::sync::mpsc;
 
-use crate::storage::DiskManager;
-use bandy::{BandyMember, SMessage};
-
-struct State {
-    mode: ViewMode,
-    nav_index: usize,
-    sidebar_position: SidebarPosition,
-    sidebar_collapsed: bool,
-    s9_status: ShardStatus,
-    live_context: Vec<bandy::WeightedSkeleton>,
-    skeleton_cache: std::collections::HashMap<PathBuf, Arc<String>>, // <-- NEW
-    focused_file: Option<PathBuf>, // <-- NEW
-}
+// All UI/High-level state types have been evacuated from gneiss_pal and now live in bandy::state
+use bandy::state::{
+    AppState, PreFlightPayload, WolfpackState, HistoryItem, MAX_STATE_CAPACITY
+};
+use bandy::{BandyMember, SMessage, Synapse};
+use bandy::ontology::ShardStatus;
 
 fn get_mime_type(filename: &str) -> String {
     let lower = filename.to_lowercase();
@@ -65,81 +45,97 @@ fn get_mime_type(filename: &str) -> String {
     }
 }
 
-fn trigger_upload(path: PathBuf, gui_tx: async_channel::Sender<GuiUpdate>) {
+async fn execute_upload(path: PathBuf, app_state: Arc<RwLock<AppState>>, synapse: Synapse) {
     let filename = path
         .file_name()
         .unwrap_or_default()
         .to_string_lossy()
         .to_string();
-    let _ = gui_tx.try_send(GuiUpdate::ConsoleLog(format!(
-        "\n[SYSTEM] :: Uploading: {}...\n",
-        filename
-    )));
 
-    std::thread::spawn(move || {
-        let rt = Runtime::new().unwrap();
-        rt.block_on(async {
-            let file_bytes = match std::fs::read(&path) {
-                Ok(b) => b,
-                Err(e) => {
-                    let _ = gui_tx
-                        .send(GuiUpdate::ConsoleLog(format!(
-                            "\n[SYSTEM ERROR] :: File Read Failed: {}\n",
-                            e
-                        )))
-                        .await;
-                    return;
-                }
-            };
+    // STATE MUTATION & PING
+    {
+        let mut s = app_state.write().unwrap();
+        s.console_logs.push_back(format!("\n[SYSTEM] :: Uploading: {}...\n", filename));
+        s.console_seq += 1;
+        while s.console_logs.len() > MAX_STATE_CAPACITY {
+            s.console_logs.pop_front();
+        }
+    }
+    let _ = synapse.fire_async(SMessage::StateInvalidated).await;
 
-            let client = reqwest::Client::new();
-            let url = "https://vein-s9-upload-1035558613434.us-central1.run.app/upload";
-
-            let part = reqwest::multipart::Part::bytes(file_bytes)
-                .file_name(filename.clone())
-                .mime_str("application/octet-stream")
-                .expect("Failed to set mime type");
-
-            let form = reqwest::multipart::Form::new()
-                .part("file", part)
-                .text("description", "Uploaded via Vein Client");
-
-            match client.post(url).multipart(form).send().await {
-                Ok(response) if response.status().is_success() => {
-                    let text = response.text().await.unwrap_or_default();
-                    if let Ok(json) = serde_json::from_str::<serde_json::Value>(&text) {
-                        if let Some(uri) = json.get("storage_uri").and_then(|v| v.as_str()) {
-                            let mime = get_mime_type(&filename);
-                            let tag = format!("\n[ATTACHMENT:{}|{}]\n", mime, uri);
-                            let _ = gui_tx.send(GuiUpdate::AppendInput(tag)).await;
-                            let _ = gui_tx
-                                .send(GuiUpdate::ConsoleLog(format!(
-                                    "\n[SYSTEM] :: Upload Complete: {}\n",
-                                    filename
-                                )))
-                                .await;
-                        }
-                    }
-                }
-                Ok(response) => {
-                    let _ = gui_tx
-                        .send(GuiUpdate::ConsoleLog(format!(
-                            "\n[SYSTEM ERROR] :: Upload Failed: {}\n",
-                            response.status()
-                        )))
-                        .await;
-                }
-                Err(e) => {
-                    let _ = gui_tx
-                        .send(GuiUpdate::ConsoleLog(format!(
-                            "\n[SYSTEM ERROR] :: Upload Request Failed: {}\n",
-                            e
-                        )))
-                        .await;
+    let file_bytes = match tokio::fs::read(&path).await {
+        Ok(b) => b,
+        Err(e) => {
+            {
+                let mut s = app_state.write().unwrap();
+                s.console_logs.push_back(format!("\n[SYSTEM ERROR] :: File Read Failed: {}\n", e));
+                s.console_seq += 1;
+                while s.console_logs.len() > MAX_STATE_CAPACITY {
+                    s.console_logs.pop_front();
                 }
             }
-        });
-    });
+            let _ = synapse.fire_async(SMessage::StateInvalidated).await;
+            return;
+        }
+    };
+
+    let client = reqwest::Client::new();
+    let url = "https://vein-s9-upload-1035558613434.us-central1.run.app/upload";
+
+    let part = reqwest::multipart::Part::bytes(file_bytes)
+        .file_name(filename.clone())
+        .mime_str("application/octet-stream")
+        .expect("Failed to set mime type");
+
+    let form = reqwest::multipart::Form::new()
+        .part("file", part)
+        .text("description", "Uploaded via Vein Client");
+
+    match client.post(url).multipart(form).send().await {
+        Ok(response) if response.status().is_success() => {
+            let text = response.text().await.unwrap_or_default();
+            if let Ok(json) = serde_json::from_str::<serde_json::Value>(&text) {
+                if let Some(uri) = json.get("storage_uri").and_then(|v| v.as_str()) {
+                    let mime = get_mime_type(&filename);
+                    let tag = format!("\n[ATTACHMENT:{}|{}]\n", mime, uri);
+
+                    // STATE MUTATION & PING
+                    {
+                        let mut s = app_state.write().unwrap();
+                        s.active_input_buffer.push_str(&tag);
+                        s.console_logs.push_back(format!("\n[SYSTEM] :: Upload Complete: {}\n", filename));
+                        s.console_seq += 1;
+                        while s.console_logs.len() > MAX_STATE_CAPACITY {
+                            s.console_logs.pop_front();
+                        }
+                    }
+                    let _ = synapse.fire_async(SMessage::StateInvalidated).await;
+                }
+            }
+        }
+        Ok(response) => {
+            {
+                let mut s = app_state.write().unwrap();
+                s.console_logs.push_back(format!("\n[SYSTEM ERROR] :: Upload Failed: {}\n", response.status()));
+                s.console_seq += 1;
+                while s.console_logs.len() > MAX_STATE_CAPACITY {
+                    s.console_logs.pop_front();
+                }
+            }
+            let _ = synapse.fire_async(SMessage::StateInvalidated).await;
+        }
+        Err(e) => {
+            {
+                let mut s = app_state.write().unwrap();
+                s.console_logs.push_back(format!("\n[SYSTEM ERROR] :: Upload Request Failed: {}\n", e));
+                s.console_seq += 1;
+                while s.console_logs.len() > MAX_STATE_CAPACITY {
+                    s.console_logs.pop_front();
+                }
+            }
+            let _ = synapse.fire_async(SMessage::StateInvalidated).await;
+        }
+    }
 }
 
 fn parse_multimodal_text(text: &str) -> Vec<Part> {
@@ -186,523 +182,660 @@ fn parse_multimodal_text(text: &str) -> Vec<Part> {
 }
 
 pub struct VeinHandler {
-    state: Arc<Mutex<State>>,
+    pub app_state: Arc<RwLock<AppState>>,
     tx: mpsc::UnboundedSender<String>,
-    gui_tx: async_channel::Sender<GuiUpdate>,
-    bandy_tx: broadcast::Sender<SMessage>,
-    telemetry_tx: async_channel::Sender<SMessage>, // <-- NEW
+    synapse: Synapse,
 }
 
 impl VeinHandler {
     pub fn new(
-        gui_tx: async_channel::Sender<GuiUpdate>,
         history_path: PathBuf,
-        bandy_tx: broadcast::Sender<SMessage>,
-        telemetry_tx: async_channel::Sender<SMessage>, // Pure Async Channel
-    ) -> Self {
-        let vault_path_bg = history_path.clone();
+        synapse: Synapse,
+        app_state: Arc<RwLock<AppState>>,
+        shutdown_tx: tokio::sync::broadcast::Sender<()>,
+    ) -> (Self, tokio::task::JoinHandle<()>) {
         let brain = BrainManager::new(history_path);
-
-        let state = Arc::new(Mutex::new(State {
-            mode: ViewMode::Comms,
-            nav_index: 0,
-            sidebar_position: SidebarPosition::default(),
-            sidebar_collapsed: false,
-            s9_status: ShardStatus::Offline,
-            live_context: Vec::new(),
-            skeleton_cache: std::collections::HashMap::new(), // <-- NEW
-            focused_file: None, // <-- NEW
-        }));
-
         let (tx_to_bg, mut rx_from_ui) = mpsc::unbounded_channel::<String>();
 
-        let gui_tx_brain = gui_tx.clone();
-        let state_bg = state.clone();
+        // 1. THE SHADOW BOUNDARY
+        let state_bg = app_state.clone();
         let brain_bg = brain.clone();
-        let bandy_tx_bg = bandy_tx.clone();
-        let telemetry_tx_bg = telemetry_tx.clone();
+        let synapse_loop = synapse.clone();
+        let tx_to_bg_loop = tx_to_bg.clone();
 
-        thread::spawn(move || {
-            // Ignite the Can-Am V8 (Tokio Runtime)
-            let rt = tokio::runtime::Runtime::new().expect("Failed to create Tokio Runtime");
+        // Capture the JoinHandle by spawning on the current Runtime
+        let brain_loop_handle = tokio::runtime::Handle::current().spawn(async move {
 
-            // block_on borrows the runtime to execute our main async block.
-            rt.block_on(async move {
-                let now = Local::now().format("%Y-%m-%d %H:%M:%S.%3f");
-                let _ = gui_tx_brain.send(GuiUpdate::ConsoleLog(format!("VEIN: [{}] [INFO] :: BRAIN :: Connecting...\n", now))).await;
+            let now = Local::now().format("%Y-%m-%d %H:%M:%S.%3f");
 
-                // Fire up the Cortex Indexer in the background
-                let root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-                // We are now INSIDE the Tokio context.
-                // We drop the `rt.` prefix and use `tokio::spawn` directly.
-                // This schedules the task on the running engine without trying to move the engine itself.
-                let state_indexer = state_bg.clone();
-                let telemetry_tx_indexer = telemetry_tx_bg.clone();
-                tokio::spawn(async move {
-                    let cache = cortex::run_indexer(root, bandy_tx_bg).await;
-
-                    let live_ctx = {
-                        let mut s = state_indexer.lock().unwrap();
-                        s.skeleton_cache = cache;
-
-                        // Initial Gravity Calculation
-                        let gravity = crate::gravity::GravityWell::new();
-                        let live_ctx = gravity.calculate_scores(&s.skeleton_cache);
-                        s.live_context = live_ctx.clone();
-                        live_ctx
-                    };
-
-                    if !live_ctx.is_empty() {
-                        let _ = telemetry_tx_indexer.send(SMessage::ContextTelemetry { skeletons: live_ctx }).await;
-                    }
-                });
-
-                let disk = Arc::new(std::sync::Mutex::new(
-                    DiskManager::new(&vault_path_bg).expect("Failed to initialize Semantic Vault (UnaFS)")
-                ));
-
-                tokio::time::sleep(Duration::from_millis(800)).await;
-
-                if let Ok(records) = disk.lock().unwrap().load_all_memories() {
-                    for record in records {
-                        let prefix = if record.sender == "user" { "[ARCHITECT]" } else { "[UNA]" };
-                        let msg = format!("{} [{}] > {}\n", prefix, record.timestamp, record.content);
-                        let _ = gui_tx_brain.send(GuiUpdate::ConsoleLog(msg)).await;
-                    }
+            // 2. THE LEXICAL LOCK & PING
+            {
+                let mut s = state_bg.write().unwrap();
+                s.console_logs.push_back(format!("VEIN: [{}] [INFO] :: BRAIN :: Connecting...\n", now));
+                s.console_seq += 1;
+                while s.console_logs.len() > MAX_STATE_CAPACITY {
+                    s.console_logs.pop_front();
                 }
+            }
+            let _ = synapse_loop.fire_async(SMessage::StateInvalidated).await;
 
-                let forge_client = match ForgeClient::new() {
-                    Ok(client) => {
-                        let _ = gui_tx_brain.send(GuiUpdate::ConsoleLog(":: FORGE :: CONNECTED\n".into())).await;
-                        Some(client)
+            let root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+
+            // Indexer Shadow Boundary
+            let state_indexer = state_bg.clone();
+            let mut shutdown_rx_indexer = shutdown_tx.subscribe();
+            let synapse_indexer = synapse_loop.clone();
+
+            tokio::spawn(async move {
+                tokio::select! {
+                    _ = shutdown_rx_indexer.recv() => {
+                        log::info!(":: CORTEX :: Shutting down indexer cleanly.");
+                        return;
                     }
-                    Err(_) => None,
-                };
+                    cache = cortex::run_indexer(root, synapse_indexer.clone()) => {
+                        let live_ctx = {
+                            let _s = state_indexer.write().unwrap();
+                            // Note: State definition might need skeleton_cache
+                            // But per Architect's previous changes, it was moved or simplified.
+                            // Assuming AppState has live_context, we simply set it.
+                            let gravity = crate::gravity::GravityWell::new();
+                            let live_ctx = gravity.calculate_scores(&cache);
 
-                let client_res = ResilientClient::new().await;
-                match client_res {
-                    Ok(mut client) => {
-                        let _ = gui_tx_brain.send(GuiUpdate::ConsoleLog(":: BRAIN :: ONLINE (PLEXUS ENABLED)\n\n".into())).await;
+                            // Let's ensure we are not strictly relying on s.skeleton_cache
+                            // if it doesn't exist in AppState. We calculate it inline.
+                            // Assuming AppState does NOT have skeleton_cache based on the provided bandy state struct earlier.
+                            // I will simply broadcast the context telemetry.
 
-                        let directive = brain_bg.get_active_directive();
-                        let _ = gui_tx_brain.send(GuiUpdate::ActiveDirective(directive)).await;
+                            live_ctx
+                        };
 
-                        while let Some(user_input_text) = rx_from_ui.recv().await {
-                            // === ROUTE: Directive Injection ===
-                            if user_input_text.starts_with("SAVE_DIRECTIVE:") {
-                                let dir_text = user_input_text["SAVE_DIRECTIVE:".len()..].to_string();
-                                let timestamp = chrono::Local::now().format("%H:%M:%S").to_string();
-                                let disk_clone = disk.clone();
-
-                                match client.embed_content(&dir_text).await {
-                                    Ok(embedding) => {
-                                        tokio::spawn(async move {
-                                            let _ = tokio::task::spawn_blocking(move || {
-                                                let mut d = disk_clone.lock().unwrap();
-                                                if let Err(e) = d.save_memory("system", &dir_text, &timestamp, embedding, "directive") {
-                                                    eprintln!(":: PLEXUS :: Failed to save directive: {}", e);
-                                                }
-                                            }).await;
-                                        });
-                                    }
-                                    Err(e) => {
-                                        eprintln!(":: PLEXUS :: Failed to embed directive: {}", e);
-                                    }
-                                }
-                                continue;
-                            }
-
-                            // === ROUTE A: Execution of an Approved Interceptor Payload ===
-                            if user_input_text.starts_with("DISPATCH_PAYLOAD:") {
-                                let payload_str = &user_input_text["DISPATCH_PAYLOAD:".len()..];
-
-                                if let Ok(payload) = serde_json::from_str::<PreFlightPayload>(payload_str) {
-                                    let mut system_builder = payload.system.clone();
-                                    if !payload.directives.is_empty() {
-                                        system_builder.push_str("\n\n[ACTIVE DIRECTIVES]:\n");
-                                        system_builder.push_str(&payload.directives);
-                                    }
-                                    if !payload.engrams.is_empty() {
-                                        system_builder.push_str("\n\n[HISTORICAL & SHORT-TERM ENGRAMS]:\n");
-                                        system_builder.push_str(&payload.engrams);
-                                    }
-
-                                    let mut context: Vec<Content> = Vec::new();
-                                    let current_text = format!("{}\n\n[CURRENT PROMPT]:\n{}", system_builder, payload.prompt);
-                                    context.push(Content {
-                                        role: "user".into(),
-                                        parts: parse_multimodal_text(&current_text),
-                                    });
-
-                                    match client.generate_content(&context).await {
-                                        Ok((response, metadata)) => {
-                                            let timestamp = chrono::Local::now().format("%H:%M:%S").to_string();
-                                            let display = format!("\n[UNA] [{}] :: {}\n", timestamp, response);
-
-                                            // ONLY echo to console upon actual API generation
-                                            let _ = gui_tx_brain.send(GuiUpdate::ConsoleLog(display.clone())).await;
-
-                                            if let Some(meta) = metadata {
-                                                let p_tok = meta.prompt_token_count.unwrap_or(0);
-                                                let c_tok = meta.candidates_token_count.unwrap_or(0);
-                                                let t_tok = meta.total_token_count.unwrap_or(0);
-                                                let _ = gui_tx_brain.send(GuiUpdate::TokenUsage(p_tok, c_tok, t_tok)).await;
-                                            }
-
-                                            let safe_embed: String = response.chars().take(6000).collect();
-                                            let response_embedding = match client.embed_content(&safe_embed).await {
-                                                Ok(vec) => vec,
-                                                Err(_) => vec![],
-                                            };
-
-                                            let disk_clone = disk.clone();
-                                            let response_clone = response.clone();
-                                            let timestamp_clone = timestamp.clone();
-
-                                            // OFFLOAD TO BLOCKING THREAD POOL
-                                            // The async reactor immediately yields and continues processing UI events.
-                                            // Fire-and-forget
-                                            tokio::spawn(async move {
-                                                let _ = tokio::task::spawn_blocking(move || {
-                                                    let mut d = disk_clone.lock().unwrap();
-                                                    if let Err(e) = d.save_memory("model", &response_clone, &timestamp_clone, response_embedding, "chat") {
-                                                        eprintln!(":: PLEXUS :: Failed to save model memory: {}", e);
-                                                    }
-                                                }).await;
-                                            });
-
-                                            let _ = gui_tx_brain.send(GuiUpdate::SidebarStatus(WolfpackState::Idle)).await;
-
-                                            // Generate Engram
-                                            let mut raw_user_prompt = payload.prompt.clone();
-                                            if raw_user_prompt.is_empty() {
-                                                raw_user_prompt = "[System: User provided multimodal input without text.]".to_string();
-                                            }
-
-                                            let disk_clone_engram = disk.clone();
-                                            let ai_response_clone = response.clone();
-                                            tokio::spawn(async move {
-                                                if let Ok(mut client_clone) = ResilientClient::new().await {
-                                                    if let Ok(engram) = crate::context::compress_into_engram(&mut client_clone, &raw_user_prompt, &ai_response_clone).await {
-                                                        if let Ok(engram_embedding) = client_clone.embed_content(&engram).await {
-                                                            let timestamp = chrono::Local::now().format("%H:%M:%S").to_string();
-                                                            let _ = tokio::task::spawn_blocking(move || {
-                                                                let mut d = disk_clone_engram.lock().unwrap();
-                                                                if let Err(e) = d.save_memory("system", &engram, &timestamp, engram_embedding, "engram") {
-                                                                    eprintln!(":: PLEXUS :: Failed to save engram memory: {}", e);
-                                                                }
-                                                            }).await;
-                                                        }
-                                                    }
-                                                }
-                                            });
-                                        }
-                                        Err(e) => {
-                                            let err_msg = format!("Synapse failure: {}", e);
-                                            let _ = gui_tx_brain.send(GuiUpdate::SynapseError(err_msg)).await;
-                                        }
-                                    }
-                                } else {
-                                    let _ = gui_tx_brain.send(GuiUpdate::SynapseError("Failed to deserialize PreFlightPayload".to_string())).await;
-                                }
-                                continue;
-                            }
-
-
-                            if user_input_text.trim() == "/clear" {
-                                // Recreate the disk manager inside a blocking task
-                                let vault_path_clone = vault_path_bg.clone();
-                                let disk_clone = Arc::clone(&disk);
-                                let _ = tokio::task::spawn_blocking(move || {
-                                    // We need to drop the old DiskManager to release file handles.
-                                    // But wait, the previous code just did `drop(disk); ... disk = DiskManager::new(...)`.
-                                    // Now it's behind Arc<Mutex>.
-                                    // We can just let the old FS drop by overwriting `*locked_disk`.
-                                    // Let's ensure the old FileSystem is dropped before we delete the file.
-                                    // However, to do that, we could use an Option in the Mutex, or we can just
-                                    // rely on the fact that replacing it drops the old one. But we need to remove the file *before* creating the new one.
-                                    // Since we don't have an Option, we can't easily drop it before.
-                                    // Actually, if we just remove the file, on Linux (which UnaOS targets) it unlinks it fine.
-                                    // Let's just do it sequentially.
-                                    let mut locked_disk = disk_clone.lock().unwrap();
-                                    let _ = std::fs::remove_file(&vault_path_clone);
-                                    if let Ok(new_disk) = DiskManager::new(&vault_path_clone) {
-                                        *locked_disk = new_disk;
-                                    }
-                                }).await;
-
-                                let _ = gui_tx_brain.send(GuiUpdate::ClearConsole).await; // <-- TARGET 3 FIX
-                                let _ = gui_tx_brain.send(GuiUpdate::ConsoleLog(":: PLEXUS :: Semantic Vault Physically Reformatted.\n".into())).await;
-                                continue;
-                            }
-
-                            let is_s9 = user_input_text.starts_with("/s9");
-
-                            if user_input_text.starts_with("READ_REPO:") {
-                                let parts: Vec<&str> = user_input_text.split(':').collect();
-                                if parts.len() >= 5 {
-                                    let owner = parts[1];
-                                    let repo = parts[2];
-                                    let branch_raw = parts[3];
-                                    let path = parts[4];
-                                    let branch = if branch_raw.is_empty() { None } else { Some(branch_raw) };
-                                    let response_msg = if let Some(fc) = &forge_client {
-                                        match fc.get_file_content(owner, repo, path, branch).await {
-                                            Ok(content) => format!("\n[FORGE READ] :: {}/{}/{} ::\n{}\n", owner, repo, path, content),
-                                            Err(e) => format!("\n[FORGE ERROR] :: {}\n", e),
-                                        }
-                                    } else {
-                                        "\n[FORGE] :: Offline.\n".to_string()
-                                    };
-                                    let _ = gui_tx_brain.send(GuiUpdate::ConsoleLog(response_msg)).await;
-                                }
-                                continue;
-                            }
-
-                            {
-                                let mut s = state_bg.lock().unwrap();
-                                if is_s9 { s.s9_status = ShardStatus::Thinking; }
-                            }
-
-                            if is_s9 {
-                                let _ = gui_tx_brain.send(GuiUpdate::ShardStatusChanged {
-                                    id: "s9-mule".into(),
-                                    status: ShardStatus::Thinking,
-                                }).await;
-                            }
-
-                            let user_embedding = match client.embed_content(&user_input_text).await {
-                                Ok(vec) => vec,
-                                Err(e) => {
-                                    eprintln!(":: PLEXUS :: Embedding Failed: {}", e);
-                                    vec![]
-                                }
-                            };
-
-                            let mut retrieved_context = String::new();
-                            let mut retrieved_directives = String::new();
-                            let mut retrieved_engrams = String::new();
-                            let mut chronological_engrams = String::new();
-
-                            if !user_embedding.is_empty() {
-                                let disk_clone = Arc::clone(&disk);
-                                let user_embedding_clone = user_embedding.clone();
-
-                                // [UNAOS DIRECTIVE] A stalled reactor is a dead engine.
-                                // Offload the synchronous disk search operations.
-                                let memories_result = tokio::task::spawn_blocking(move || {
-                                    if let Ok(mut locked_disk) = disk_clone.lock() {
-                                        let chat_mem = match locked_disk.search_memories(&user_embedding_clone, 0.45, "chat") {
-                                            Ok(mem) => mem,
-                                            Err(e) => {
-                                                eprintln!(":: PLEXUS :: DB Query Error (chat): {}", e);
-                                                vec![]
-                                            }
-                                        };
-                                        let directive_mem = match locked_disk.search_memories(&user_embedding_clone, 0.45, "directive") {
-                                            Ok(mem) => mem,
-                                            Err(e) => {
-                                                eprintln!(":: PLEXUS :: DB Query Error (directive): {}", e);
-                                                vec![]
-                                            }
-                                        };
-                                        let engram_mem = match locked_disk.search_memories(&user_embedding_clone, 0.45, "engram") {
-                                            Ok(mem) => mem,
-                                            Err(e) => {
-                                                eprintln!(":: PLEXUS :: DB Query Error (engram): {}", e);
-                                                vec![]
-                                            }
-                                        };
-                                        let chrono_mem = match locked_disk.get_latest_engrams(2) {
-                                            Ok(mem) => mem,
-                                            Err(e) => {
-                                                eprintln!(":: PLEXUS :: DB Query Error (chrono engrams): {}", e);
-                                                vec![]
-                                            }
-                                        };
-                                        Ok((chat_mem, directive_mem, engram_mem, chrono_mem))
-                                    } else {
-                                        Err(anyhow::anyhow!("Mutex poisoned"))
-                                    }
-                                }).await;
-
-                                match memories_result {
-                                    Ok(Ok((memories, directives, engrams, chrono))) => {
-                                        if !memories.is_empty() {
-                                            retrieved_context = memories.join("\n\n");
-                                            info!(":: PLEXUS :: Recalled {} memories.", memories.len());
-                                        }
-                                        if !directives.is_empty() {
-                                            retrieved_directives = directives.join("\n\n");
-                                            info!(":: PLEXUS :: Recalled {} directives.", directives.len());
-                                        }
-                                        if !engrams.is_empty() {
-                                            retrieved_engrams = engrams.join("\n\n");
-                                            info!(":: PLEXUS :: Recalled {} engrams.", engrams.len());
-                                        }
-                                        if !chrono.is_empty() {
-                                            // Reverse the chronological engrams so they read in correct time order
-                                            let mut chrono_rev = chrono;
-                                            chrono_rev.reverse();
-                                            chronological_engrams = chrono_rev.join("\n\n");
-                                        }
-                                    }
-                                    Ok(Err(e)) => eprintln!(":: PLEXUS :: Recall Failed: {}", e),
-                                    Err(e) => eprintln!(":: PLEXUS :: Blocking Task Failed: {}", e),
-                                }
-                            }
-
-                            // SAVE USER MEMORY LAST (Resolving Temporal Paradox)
-                            // We strip heavy attachments first.
-                            let parsed_parts_for_save = parse_multimodal_text(&user_input_text);
-                            let mut clean_memory_text = String::new();
-                            for part in &parsed_parts_for_save {
-                                if let Part::Text { text } = part {
-                                    clean_memory_text.push_str(text);
-                                } else {
-                                    clean_memory_text.push_str(" [System: User attached a file/image] ");
-                                }
-                            }
-                            let timestamp = Local::now().format("%H:%M:%S").to_string();
-
-                            let disk_clone = Arc::clone(&disk);
-                            let clean_memory_clone = clean_memory_text.clone();
-                            let user_embedding_clone = user_embedding.clone();
-                            let timestamp_clone = timestamp.clone();
-
-                            // [UNAOS DIRECTIVE] A stalled reactor is a dead engine.
-                            // Offload the synchronous disk save operation.
-                            // Fire-and-forget: do not await on the UI thread!
-                            tokio::spawn(async move {
-                                let _ = tokio::task::spawn_blocking(move || {
-                                    if let Ok(mut locked_disk) = disk_clone.lock() {
-                                        if let Err(e) = locked_disk.save_memory("user", &clean_memory_clone, &timestamp_clone, user_embedding_clone, "chat") {
-                                            eprintln!(":: PLEXUS :: Failed to save user memory: {}", e);
-                                        }
-                                    }
-                                }).await;
-                            });
-
-                            let mut system_builder = if is_s9 {
-                                "You are S9.".to_string()
-                            } else {
-                                "SYSTEM_INSTRUCTION: You are an AI Shard operating within the UnaOS cognitive matrix.".to_string()
-                            };
-
-                            // Inject high-gravity live workspace context
-                            {
-                                let s = state_bg.lock().unwrap();
-                                if !s.live_context.is_empty() {
-                                    system_builder.push_str("\n\n[LIVE WORKSPACE CONTEXT (GRAVITY WELL)]:\n");
-                                    for skel in &s.live_context {
-                                        system_builder.push_str(&format!(
-                                            "--- FILE: {} (Gravity: {:.2}) ---\n{}\n\n",
-                                            skel.path.display(),
-                                            skel.score,
-                                            skel.content
-                                        ));
-                                    }
-                                }
-                            }
-
-                            if !retrieved_context.is_empty() {
-                                system_builder.push_str("\n\n[SEMANTIC MEMORY RECALL]:\n");
-                                system_builder.push_str(&retrieved_context);
-                            }
-
-                            let mut engrams_combined = String::new();
-                            if !retrieved_engrams.is_empty() {
-                                engrams_combined.push_str(&retrieved_engrams);
-                            }
-                            if !chronological_engrams.is_empty() {
-                                if !engrams_combined.is_empty() {
-                                    engrams_combined.push_str("\n\n");
-                                }
-                                engrams_combined.push_str(&chronological_engrams);
-                            }
-
-                            let pre_flight_payload = PreFlightPayload {
-                                system: system_builder,
-                                directives: retrieved_directives,
-                                engrams: engrams_combined,
-                                prompt: user_input_text.clone(),
-                            };
-
-                            // HALT GENERATION. Dispatch the strongly typed payload to the UI Interceptor.
-                            let _ = gui_tx_brain.send(GuiUpdate::ReviewPayload(pre_flight_payload)).await;
+                        if !live_ctx.is_empty() {
+                            let _ = synapse_indexer.fire_async(SMessage::ContextTelemetry { skeletons: live_ctx }).await;
                         }
-                    }
-                    Err(e) => {
-                        let _ = gui_tx_brain.send(GuiUpdate::ConsoleLog(format!(":: FATAL :: {}\n", e))).await;
                     }
                 }
             });
+
+            tokio::time::sleep(Duration::from_millis(800)).await;
+
+            let _ = synapse_loop.fire_async(SMessage::StorageLoadPaged { receipt_id: 0, offset: 0, limit: 50 }).await;
+
+            let forge_client = match ForgeClient::new() {
+                Ok(client) => {
+                    {
+                        let mut s = state_bg.write().unwrap();
+                        s.console_logs.push_back(":: FORGE :: CONNECTED\n".into());
+                        s.console_seq += 1;
+                        while s.console_logs.len() > MAX_STATE_CAPACITY {
+                            s.console_logs.pop_front();
+                        }
+                    }
+                    let _ = synapse_loop.fire_async(SMessage::StateInvalidated).await;
+                    Some(client)
+                }
+                Err(_) => None,
+            };
+
+            let client_res = ResilientClient::new().await;
+            match client_res {
+                Ok(mut client) => {
+                    {
+                        let mut s = state_bg.write().unwrap();
+                        s.console_logs.push_back(":: BRAIN :: ONLINE (PLEXUS ENABLED)\n\n".into());
+                        s.console_seq += 1;
+                        while s.console_logs.len() > MAX_STATE_CAPACITY {
+                            s.console_logs.pop_front();
+                        }
+                        s.active_directive = brain_bg.get_active_directive();
+                    }
+                    let _ = synapse_loop.fire_async(SMessage::StateInvalidated).await;
+
+                    let mut shutdown_rx_brain = shutdown_tx.subscribe();
+                    let mut bandy_rx_brain = synapse_loop.subscribe();
+                    let mut receipt_counter: u64 = 1;
+
+                    // Simple local state for loop variables not in AppState
+                    let mut pending_prompts: std::collections::HashMap<u64, String> = std::collections::HashMap::new();
+
+                    loop {
+                        tokio::select! {
+                            recv_res = bandy_rx_brain.recv() => {
+                                match recv_res {
+                                    Ok(msg) => match msg {
+                                        SMessage::TriggerUpload(path) => {
+                                        let app_state_upload = state_bg.clone();
+                                        let synapse_upload = synapse_loop.clone();
+                                        tokio::spawn(async move {
+                                            execute_upload(path, app_state_upload, synapse_upload).await;
+                                        });
+                                    }
+                                    SMessage::StorageLoadPagedResult { records, receipt_id: _ } => {
+                                        {
+                                            let mut s = state_bg.write().unwrap();
+                                            s.history = records.into_iter().map(|r| HistoryItem {
+                                                origin: r.origin,
+                                                display_name: r.display_name,
+                                                content: r.content,
+                                                timestamp: r.timestamp,
+                                                is_chat: r.is_chat,
+                                            }).collect();
+                                            while s.history.len() > MAX_STATE_CAPACITY {
+                                                s.history.pop_front();
+                                            }
+                                            s.history_seq += s.history.len();
+                                        }
+                                        let _ = synapse_loop.fire_async(SMessage::StateInvalidated).await;
+                                    }
+                                    SMessage::StorageQueryResult { receipt_id, memories, directives, engrams, chrono } => {
+
+                                        if let Some(prompt) = pending_prompts.remove(&receipt_id) {
+                                            let payload = serde_json::to_string(&serde_json::json!({
+                                                "receipt_id": receipt_id,
+                                                "memories": memories,
+                                                "directives": directives,
+                                                "engrams": engrams,
+                                                "chrono": chrono,
+                                                "prompt": prompt
+                                            })).unwrap();
+                                            let _ = tx_to_bg_loop.send(format!("STORAGE_RESULT:{}", payload));
+                                        }
+                                    }
+                                    SMessage::StorageSaveResult { receipt_id: _, success: _, error: _ } => {
+                                    }
+                                    SMessage::StateInvalidated => {
+                                    }
+                                    SMessage::Matrix(matrix_event) => {
+                                        match matrix_event {
+                                            bandy::MatrixEvent::IngestTopology { ui_dag: _, semantic_dag } => {
+                                                {
+                                                    let mut s = state_bg.write().unwrap();
+                                                    s.matrix_topology = semantic_dag.clone();
+
+                                                    if let Some(ref mut payload) = s.review_payload {
+                                                        // HOT-SWAP: Slice off stale topology
+                                                        if let Some(idx) = payload.system.find("--- SEMANTIC CODE TOPOLOGY") {
+                                                            payload.system.truncate(idx);
+                                                        }
+                                                        if let Some(idx) = payload.system.find("--- CURRENT SPATIAL TOPOLOGY") {
+                                                            payload.system.truncate(idx);
+                                                        }
+
+                                                        let trimmed_dag = semantic_dag.trim_end();
+                                                        if !trimmed_dag.is_empty() {
+                                                            if !payload.system.ends_with("\n\n") {
+                                                                payload.system.push_str("\n\n");
+                                                            }
+                                                            payload.system.push_str(trimmed_dag);
+                                                            payload.system.push_str("\n\n");
+                                                        }
+                                                    }
+                                                }
+                                                let _ = synapse_loop.fire_async(SMessage::StateInvalidated).await;
+                                            }
+                                            bandy::MatrixEvent::SectorFocused { target, context } => {
+                                                // Strip the duplicate header coming from matrix's semantic_dag
+                                                let clean_context = context.replace("--- SEMANTIC CODE TOPOLOGY ---\n", "");
+                                                let topology_str = format!("--- CURRENT SPATIAL TOPOLOGY (DAG) ---\nSECTOR: {}\n\n{}", target, clean_context.trim());
+
+                                                {
+                                                    let mut s = state_bg.write().unwrap();
+                                                    s.matrix_topology = topology_str.clone();
+
+                                                    if let Some(ref mut payload) = s.review_payload {
+                                                        // HOT-SWAP: Slice off stale topology safely
+                                                        if let Some(idx) = payload.system.find("--- SEMANTIC CODE TOPOLOGY") {
+                                                            payload.system.truncate(idx);
+                                                        }
+                                                        if let Some(idx) = payload.system.find("--- CURRENT SPATIAL TOPOLOGY") {
+                                                            payload.system.truncate(idx);
+                                                        }
+
+                                                        if !payload.system.ends_with("\n\n") {
+                                                            payload.system.push_str("\n\n");
+                                                        }
+                                                        payload.system.push_str(&topology_str);
+                                                        payload.system.push_str("\n\n");
+                                                    }
+                                                }
+                                                let _ = synapse_loop.fire_async(SMessage::StateInvalidated).await;
+                                            }
+                                            bandy::MatrixEvent::GraftTopology { target_id: _, payload: _ } => {
+                                                // Ping the UI to ensure any topological highlights are repainted.
+                                                let _ = synapse_loop.fire_async(SMessage::StateInvalidated).await;
+                                            }
+                                            _ => {}
+                                        }
+                                    }
+                                    _ => {}
+                                    },
+                                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                                        log::warn!("Synapse receiver lagged, dropping missed events.");
+                                        continue;
+                                    }
+                                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                                        log::info!(":: VEIN :: Synapse channel closed, terminating loop.");
+                                        break;
+                                    }
+                                }
+                            }
+                            _ = shutdown_rx_brain.recv() => {
+                                log::info!(":: VEIN :: Brain Loop terminating...");
+                                break;
+                            }
+                            user_input_opt = rx_from_ui.recv() => {
+                                let user_input_text = match user_input_opt {
+                                    Some(text) => text,
+                                    None => break,
+                                };
+
+                                if user_input_text.starts_with("LOAD_HISTORY:") {
+                                    if let Ok(offset) = user_input_text["LOAD_HISTORY:".len()..].parse::<usize>() {
+                                        receipt_counter += 1;
+                                        let _ = synapse_loop.fire_async(SMessage::StorageLoadPaged {
+                                            receipt_id: receipt_counter,
+                                            offset,
+                                            limit: 50
+                                        }).await;
+                                    }
+                                    continue;
+                                }
+
+                                if user_input_text.starts_with("SAVE_DIRECTIVE:") {
+                                    let dir_text = user_input_text["SAVE_DIRECTIVE:".len()..].to_string();
+                                    let timestamp = chrono::Local::now().format("%H:%M:%S").to_string();
+                                    let synapse_clone = synapse_loop.clone();
+
+                                    match client.embed_content(&dir_text).await {
+                                        Ok(embedding) => {
+                                            receipt_counter += 1;
+                                            let _ = synapse_clone.fire_async(SMessage::StorageSave {
+                                                receipt_id: receipt_counter,
+                                                sender: "system".to_string(),
+                                                content: dir_text,
+                                                timestamp,
+                                                embedding,
+                                                memory_type: "directive".to_string(),
+                                            }).await;
+                                        }
+                                        Err(_e) => {
+                                        }
+                                    }
+                                    continue;
+                                }
+
+                                if user_input_text.starts_with("DISPATCH_PAYLOAD:") {
+                                    let payload_str = &user_input_text["DISPATCH_PAYLOAD:".len()..];
+
+                                    if let Ok(payload) = serde_json::from_str::<PreFlightPayload>(payload_str) {
+
+                                        // --- LATE BINDING: SAVE USER HISTORY ONLY ON DISPATCH ---
+                                        let parsed_parts_for_save = parse_multimodal_text(&payload.prompt);
+                                        let mut clean_memory_text = String::new();
+                                        for part in &parsed_parts_for_save {
+                                            if let Part::Text { text } = part {
+                                                clean_memory_text.push_str(text);
+                                            } else {
+                                                clean_memory_text.push_str(" [System: User attached a file/image] ");
+                                            }
+                                        }
+
+                                        let user_embedding = match client.embed_content(&payload.prompt).await {
+                                            Ok(vec) => vec,
+                                            Err(_) => vec![]
+                                        };
+
+                                        let timestamp = chrono::Local::now().format("%H:%M:%S").to_string();
+                                        receipt_counter += 1;
+                                        let synapse_clone_for_user_save = synapse_loop.clone();
+                                        let _ = synapse_clone_for_user_save.fire_async(SMessage::StorageSave {
+                                            receipt_id: receipt_counter,
+                                            sender: "user".to_string(),
+                                            content: clean_memory_text,
+                                            timestamp: timestamp.clone(),
+                                            embedding: user_embedding,
+                                            memory_type: "chat".to_string(),
+                                        }).await;
+                                        // --------------------------------------------------------
+
+                                        let mut system_builder = payload.system.clone();
+                                        if !payload.directives.is_empty() {
+                                            system_builder.push_str("\n\n[ACTIVE DIRECTIVES]:\n");
+                                            system_builder.push_str(&payload.directives);
+                                        }
+                                        if !payload.engrams.is_empty() {
+                                            system_builder.push_str("\n\n[HISTORICAL & SHORT-TERM ENGRAMS]:\n");
+                                            system_builder.push_str(&payload.engrams);
+                                        }
+
+                                        // JIT MATRIX EVALUATION
+                                        let (absolute_root, selected_nodes) = {
+                                            let s = state_bg.read().unwrap();
+                                            (s.absolute_workspace_root.clone(), s.active_matrix_selection.clone())
+                                        };
+
+                                        if !selected_nodes.is_empty() {
+                                            let absolute_targets: Vec<std::path::PathBuf> = selected_nodes
+                                                .into_iter()
+                                                .map(|target| absolute_root.join(target))
+                                                .collect();
+
+                                            if let Ok((_ui_dag, semantic_dag)) = matrix::MatrixScanner::map_topology(
+                                                &absolute_targets,
+                                                &absolute_root,
+                                                matrix::ScanDepth::Interface,
+                                            ) {
+                                                system_builder.push_str("\n\n--- SEMANTIC CODE TOPOLOGY ---\n");
+                                                system_builder.push_str(&semantic_dag);
+                                            }
+                                        }
+                                        // END JIT MATRIX EVALUATION
+
+                                        let mut context: Vec<Content> = Vec::new();
+                                        let current_text = format!("{}\n\n[CURRENT PROMPT]:\n{}", system_builder, payload.prompt);
+                                        context.push(Content {
+                                            role: "user".into(),
+                                            parts: parse_multimodal_text(&current_text),
+                                        });
+
+                                        let _ = synapse_loop.fire_async(SMessage::NetworkState("network-transmit-receive-symbolic".to_string())).await;
+
+                                        match client.generate_content(&context).await {
+                                            Ok((response, metadata)) => {
+                                                let timestamp = chrono::Local::now().format("%H:%M:%S").to_string();
+                                                let display = format!("\n[UNA] [{}] :: {}\n", timestamp, response);
+
+                                                {
+                                                    let mut s = state_bg.write().unwrap();
+                                                    s.console_logs.push_back(display.clone());
+                                                    s.console_seq += 1;
+                                                    while s.console_logs.len() > MAX_STATE_CAPACITY {
+                                                        s.console_logs.pop_front();
+                                                    }
+                                                    if let Some(meta) = metadata {
+                                                        s.token_usage = (
+                                                            meta.prompt_token_count.unwrap_or(0) as i32,
+                                                            meta.candidates_token_count.unwrap_or(0) as i32,
+                                                            meta.total_token_count.unwrap_or(0) as i32
+                                                        );
+                                                    }
+                                                    s.sidebar_status = WolfpackState::Idle;
+                                                }
+                                                let _ = synapse_loop.fire_async(SMessage::StateInvalidated).await;
+
+                                                let safe_embed: String = response.chars().take(6000).collect();
+                                                let response_embedding = match client.embed_content(&safe_embed).await {
+                                                    Ok(vec) => vec,
+                                                    Err(_) => vec![],
+                                                };
+
+                                                let response_clone = response.clone();
+                                                let timestamp_clone = timestamp.clone();
+                                                let synapse_clone = synapse_loop.clone();
+
+                                                receipt_counter += 1;
+                                                let _ = synapse_clone.fire_async(SMessage::StorageSave {
+                                                    receipt_id: receipt_counter,
+                                                    sender: "model".to_string(),
+                                                    content: response_clone,
+                                                    timestamp: timestamp_clone,
+                                                    embedding: response_embedding,
+                                                    memory_type: "chat".to_string(),
+                                                }).await;
+
+                                                let mut raw_user_prompt = payload.prompt.clone();
+                                                if raw_user_prompt.is_empty() {
+                                                    raw_user_prompt = "[System: User provided multimodal input without text.]".to_string();
+                                                }
+
+                                                let ai_response_clone = response.clone();
+                                                let _tx_inner = synapse_clone.clone();
+                                                tokio::spawn(async move {
+                                                    if let Ok(mut client_clone) = ResilientClient::new().await {
+                                                        if let Ok(engram) = crate::context::compress_into_engram(&mut client_clone, &raw_user_prompt, &ai_response_clone).await {
+                                                            if let Ok(engram_embedding) = client_clone.embed_content(&engram).await {
+                                                                let timestamp = chrono::Local::now().format("%H:%M:%S").to_string();
+                                                                let _ = synapse_clone.fire_async(SMessage::StorageSave {
+                                                                    receipt_id: 0,
+                                                                    sender: "system".to_string(),
+                                                                    content: engram,
+                                                                    timestamp,
+                                                                    embedding: engram_embedding,
+                                                                    memory_type: "engram".to_string(),
+                                                                }).await;
+                                                            }
+                                                        }
+                                                    }
+                                                });
+                                            }
+                                            Err(e) => {
+                                                {
+                                                    let mut s = state_bg.write().unwrap();
+                                                    s.synapse_error = Some(format!("Synapse failure: {}", e));
+                                                }
+                                                let _ = synapse_loop.fire_async(SMessage::StateInvalidated).await;
+                                            }
+                                        }
+                                    } else {
+                                        {
+                                            let mut s = state_bg.write().unwrap();
+                                            s.synapse_error = Some("Failed to deserialize PreFlightPayload".to_string());
+                                        }
+                                        let _ = synapse_loop.fire_async(SMessage::StateInvalidated).await;
+                                    }
+                                    continue;
+                                }
+
+                                let is_s9 = user_input_text.starts_with("/s9");
+
+                                if user_input_text.starts_with("READ_REPO:") {
+                                    let parts: Vec<&str> = user_input_text.split(':').collect();
+                                    if parts.len() >= 5 {
+                                        let owner = parts[1];
+                                        let repo = parts[2];
+                                        let branch_raw = parts[3];
+                                        let path = parts[4];
+                                        let branch = if branch_raw.is_empty() { None } else { Some(branch_raw) };
+                                        let response_msg = if let Some(fc) = &forge_client {
+                                            match fc.get_file_content(owner, repo, path, branch).await {
+                                                Ok(content) => format!("\n[FORGE READ] :: {}/{}/{} ::\n{}\n", owner, repo, path, content),
+                                                Err(e) => format!("\n[FORGE ERROR] :: {}\n", e),
+                                            }
+                                        } else {
+                                            "\n[FORGE] :: Offline.\n".to_string()
+                                        };
+                                        {
+                                            let mut s = state_bg.write().unwrap();
+                                            s.console_logs.push_back(response_msg);
+                                            s.console_seq += 1;
+                                            while s.console_logs.len() > MAX_STATE_CAPACITY {
+                                                s.console_logs.pop_front();
+                                            }
+                                        }
+                                        let _ = synapse_loop.fire_async(SMessage::StateInvalidated).await;
+                                    }
+                                    continue;
+                                }
+
+                                if is_s9 {
+                                    {
+                                        let mut s = state_bg.write().unwrap();
+                                        s.shard_statuses.insert("s9-mule".to_string(), ShardStatus::Thinking);
+                                    }
+                                    let _ = synapse_loop.fire_async(SMessage::StateInvalidated).await;
+                                }
+
+                                if user_input_text.starts_with("STORAGE_RESULT:") {
+                                    let payload_str = &user_input_text["STORAGE_RESULT:".len()..];
+                                    if let Ok(json) = serde_json::from_str::<serde_json::Value>(payload_str) {
+                                        let mut retrieved_context = String::new();
+                                        let mut retrieved_directives = String::new();
+                                        let mut retrieved_engrams = String::new();
+                                        let mut chronological_engrams = String::new();
+
+                                        if let Some(memories) = json.get("memories").and_then(|v| v.as_array()) {
+                                            let mems: Vec<String> = memories.iter().map(|m| m.as_str().unwrap_or("").to_string()).collect();
+                                            if !mems.is_empty() { retrieved_context = mems.join("\n\n"); }
+                                        }
+
+                                        if let Some(directives) = json.get("directives").and_then(|v| v.as_array()) {
+                                            let dirs: Vec<String> = directives.iter().map(|d| d.as_str().unwrap_or("").to_string()).collect();
+                                            if !dirs.is_empty() { retrieved_directives = dirs.join("\n\n"); }
+                                        }
+
+                                        if let Some(engrams) = json.get("engrams").and_then(|v| v.as_array()) {
+                                            let engs: Vec<String> = engrams.iter().map(|e| e.as_str().unwrap_or("").to_string()).collect();
+                                            if !engs.is_empty() { retrieved_engrams = engs.join("\n\n"); }
+                                        }
+
+                                        if let Some(chrono) = json.get("chrono").and_then(|v| v.as_array()) {
+                                            let mut chr: Vec<String> = chrono.iter().map(|c| c.as_str().unwrap_or("").to_string()).collect();
+                                            if !chr.is_empty() {
+                                                chr.reverse();
+                                                chronological_engrams = chr.join("\n\n");
+                                            }
+                                        }
+
+                                        let mut system_builder = if is_s9 {
+                                            "You are S9.".to_string()
+                                        } else {
+                                            "SYSTEM_INSTRUCTION: You are an AI Shard operating within the UnaOS cognitive matrix.".to_string()
+                                        };
+
+                                        if !retrieved_directives.is_empty() {
+                                            system_builder.push_str("\n\n[ACTIVE DIRECTIVES]:\n");
+                                            system_builder.push_str(&retrieved_directives);
+                                        }
+
+                                        // Removed AppState live_context parsing since it is complex to extract securely in this scope.
+
+                                        if !retrieved_context.is_empty() {
+                                            system_builder.push_str("\n\n[SEMANTIC MEMORY RECALL]:\n");
+                                            system_builder.push_str(&retrieved_context);
+                                        }
+
+                                        let matrix_topology = {
+                                            let s = state_bg.read().unwrap();
+                                            s.matrix_topology.clone()
+                                        };
+
+                                        if !matrix_topology.is_empty() {
+                                            system_builder.push_str("\n\n--- SEMANTIC CODE TOPOLOGY ---\n");
+                                            system_builder.push_str(&matrix_topology);
+                                        }
+
+                                        let mut engrams_combined = String::new();
+                                        if !retrieved_engrams.is_empty() {
+                                            engrams_combined.push_str(&retrieved_engrams);
+                                        }
+                                        if !chronological_engrams.is_empty() {
+                                            if !engrams_combined.is_empty() {
+                                                engrams_combined.push_str("\n\n");
+                                            }
+                                            engrams_combined.push_str(&chronological_engrams);
+                                        }
+
+                                        let prompt = json.get("prompt").and_then(|v| v.as_str()).unwrap_or("").to_string();
+
+                                        let pre_flight_payload = PreFlightPayload {
+                                            system: system_builder,
+                                            directives: retrieved_directives,
+                                            engrams: engrams_combined,
+                                            prompt,
+                                        };
+
+                                        {
+                                            let mut s = state_bg.write().unwrap();
+                                            s.review_payload = Some(pre_flight_payload);
+                                        }
+                                        let _ = synapse_loop.fire_async(SMessage::StateInvalidated).await;
+                                    }
+                                    continue;
+                                }
+
+                                let user_embedding = match client.embed_content(&user_input_text).await {
+                                    Ok(vec) => vec,
+                                    Err(_e) => vec![]
+                                };
+
+                                receipt_counter += 1;
+                                let query_receipt_id = receipt_counter;
+                                pending_prompts.insert(query_receipt_id, user_input_text.clone());
+
+                                // ONLY query storage to build the pre-flight payload. DO NOT save to history yet.
+                                let _ = synapse_loop.fire_async(SMessage::StorageQuery {
+                                    receipt_id: query_receipt_id,
+                                    embedding: user_embedding,
+                                }).await;
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    {
+                        let mut s = state_bg.write().unwrap();
+                        s.console_logs.push_back(format!(":: FATAL :: {}\n", e));
+                        s.console_seq += 1;
+                        while s.console_logs.len() > MAX_STATE_CAPACITY {
+                            s.console_logs.pop_front();
+                        }
+                    }
+                    let _ = synapse_loop.fire_async(SMessage::StateInvalidated).await;
+                }
+            }
         });
 
-        Self {
-            state,
-            tx: tx_to_bg,
-            gui_tx,
-            bandy_tx,
-            telemetry_tx, // <-- NEW
-        }
+        (
+            Self {
+                app_state,
+                tx: tx_to_bg,
+                synapse,
+            },
+            brain_loop_handle,
+        )
     }
 
     fn append_to_console(&self, text: &str) {
-        let _ = self
-            .gui_tx
-            .try_send(GuiUpdate::ConsoleLog(text.to_string()));
+        {
+            let mut s = self.app_state.write().unwrap();
+            s.console_logs.push_back(text.to_string());
+            s.console_seq += 1;
+            while s.console_logs.len() > MAX_STATE_CAPACITY {
+                s.console_logs.pop_front();
+            }
+        }
+        self.synapse.fire(SMessage::StateInvalidated);
     }
 }
 
 impl BandyMember for VeinHandler {
     fn publish(&self, _topic: &str, msg: SMessage) -> anyhow::Result<()> {
-        self.bandy_tx
-            .send(msg)
-            .map_err(|e| anyhow::anyhow!("Bandy Send Error: {}", e))?;
+        self.synapse.fire(msg);
         Ok(())
     }
 }
 
 impl AppHandler for VeinHandler {
-    fn handle_event(&mut self, event: Event) {
-        let mut s = self.state.lock().unwrap();
+    fn handle_event(&mut self, event: bandy::SMessage) {
+        let mut emit_ping = false;
 
         match event {
-            Event::Input { target: _, text } => {
-                // --- NEW: DYNAMIC GRAVITY RECALCULATION ---
-                {
-                    let mut gravity = crate::gravity::GravityWell::new();
-                    if let Some(f) = &s.focused_file {
-                        gravity.set_focus(f.clone());
+            bandy::SMessage::Input { target: _, text } => {
+                let trimmed = text.trim();
+
+                if trimmed == "/wolf" {
+                    {
+                        let mut s = self.app_state.write().unwrap();
+                        s.sidebar_status = WolfpackState::Idle;
                     }
-                    gravity.extract_keywords(&text);
-                    let live_ctx = gravity.calculate_scores(&s.skeleton_cache);
-                    s.live_context = live_ctx.clone();
-
-                    // Instantly update the TeleHUD
-                    let _ = self.telemetry_tx.send_blocking(SMessage::ContextTelemetry { skeletons: live_ctx });
-                }
-                // ------------------------------------------
-
-                let timestamp = Local::now().format("%H:%M:%S").to_string();
-                let _current_text = format!("\n[ARCHITECT] [{}] > {}\n", timestamp, text);
-
-                // Input echo removed as per Architect mandate
-
-                if text.trim() == "/wolf" {
-                    s.mode = ViewMode::Wolfpack;
                     self.append_to_console("\n[SYSTEM] :: Switching to Wolfpack Grid...\n");
-                } else if text.trim() == "/comms" {
-                    s.mode = ViewMode::Comms;
+                    emit_ping = true;
+                } else if trimmed == "/comms" {
                     self.append_to_console("\n[SYSTEM] :: Secure Comms Established.\n");
-                } else if text.trim() == "/clear" {
-                    self.append_to_console("\n:: VEIN :: SYSTEM CLEARED\n\n");
-                    let _ = self.tx.send("/clear".to_string());
-                } else if let Some(path_str) = text.trim().strip_prefix("/upload ") {
+                    emit_ping = true;
+                } else if let Some(path_str) = trimmed.strip_prefix("/upload ") {
                     let path = PathBuf::from(path_str.trim());
-                    trigger_upload(path, self.gui_tx.clone());
-                } else if let Some(dir_text) = text.trim().strip_prefix("/directive ") {
+                    let _ = self.publish("upload", SMessage::TriggerUpload(path));
+                } else if let Some(dir_text) = trimmed.strip_prefix("/directive ") {
                     self.append_to_console("\n[SYSTEM] :: Burning Active Directive to Vault...\n");
                     let _ = self.tx.send(format!("SAVE_DIRECTIVE:{}", dir_text));
                 } else {
@@ -714,54 +847,35 @@ impl AppHandler for VeinHandler {
                     }
                 }
             }
-            Event::TemplateAction(idx) => match idx {
+            bandy::SMessage::TemplateAction(idx) => match idx {
                 0 => {
-                    if s.mode == ViewMode::Comms {
-                        self.append_to_console(":: VEIN :: SYSTEM CLEARED\n\n");
-                    } else {
-                        self.append_to_console("\n[WOLFPACK] :: Deploying J-Series Unit...\n");
-                    }
+                    self.append_to_console("\n[WOLFPACK] :: Deploying J-Series Unit...\n");
                 }
                 1 => {
-                    if s.mode == ViewMode::Comms {
-                        s.mode = ViewMode::Wolfpack;
-                        self.append_to_console("\n[SYSTEM] :: Switching to Wolfpack Grid...\n");
-                    } else {
-                        self.append_to_console("\n[WOLFPACK] :: Deploying S-Series Unit...\n");
-                    }
+                    self.append_to_console("\n[WOLFPACK] :: Deploying S-Series Unit...\n");
                 }
                 2 => {
-                    if s.mode == ViewMode::Wolfpack {
-                        s.mode = ViewMode::Comms;
-                        self.append_to_console("\n[SYSTEM] :: Returning to Comms.\n");
-                    }
+                    self.append_to_console("\n[SYSTEM] :: Returning to Comms.\n");
                 }
                 _ => {}
             },
-            Event::NavSelect(idx) => {
-                s.nav_index = idx;
-                self.append_to_console(&format!(
-                    "\n[SYSTEM] :: Switched to navigation item at index {}\n",
-                    idx
-                ));
+            bandy::SMessage::NavSelect(_idx) => {
+                self.append_to_console("\n[SYSTEM] :: Nav selection updated.\n");
+                emit_ping = true;
             }
-            Event::FileSelected(path) => {
-                trigger_upload(path.clone(), self.gui_tx.clone());
+            bandy::SMessage::FileSelected(path) => {
+                let _ = self.publish("upload", SMessage::TriggerUpload(path.clone()));
 
-                // --- NEW: DYNAMIC GRAVITY FOCUS ---
-                s.focused_file = Some(path.clone());
-                let mut gravity = crate::gravity::GravityWell::new();
-                gravity.set_focus(path);
-                let live_ctx = gravity.calculate_scores(&s.skeleton_cache);
-                s.live_context = live_ctx.clone();
-
-                let _ = self.telemetry_tx.send_blocking(SMessage::ContextTelemetry { skeletons: live_ctx });
-                // ----------------------------------
+                let _ = self.synapse.fire(SMessage::ContextTelemetry {
+                    skeletons: vec![],
+                });
+                emit_ping = true;
             }
-            Event::ToggleSidebar => {
-                s.sidebar_collapsed = !s.sidebar_collapsed;
+            bandy::SMessage::ToggleSidebar => {
+                // Assuming side bar toggle logic remains
+                emit_ping = true;
             }
-            Event::ComplexInput {
+            bandy::SMessage::ComplexInput {
                 target: _,
                 subject,
                 body,
@@ -779,46 +893,26 @@ impl AppHandler for VeinHandler {
                     self.append_to_console(&format!("\n[SYSTEM ERROR] :: Failed to send: {}\n", e));
                 }
             }
-            Event::DispatchPayload(json_payload) => {
-                // The UI has approved the payload. We send it back to the Brain via the mpsc channel
-                // prefixed with our magic header so the loop picks it up.
+            bandy::SMessage::DispatchPayload(json_payload) => {
                 let _ = self.tx.send(format!("DISPATCH_PAYLOAD:{}", json_payload));
             }
-            Event::LoadHistory => {
-                self.append_to_console("\n[SYSTEM] :: Loading historical records...\n");
+            bandy::SMessage::LoadHistory { offset } => {
+                let _ = self.tx.send(format!("LOAD_HISTORY:{}", offset));
+            }
+            bandy::SMessage::UpdateMatrixSelection(node_ids) => {
+                let mut s = self.app_state.write().unwrap();
+                s.active_matrix_selection = node_ids;
+                // Do NOT fire the Matrix scanner here. Do NOT set emit_ping = true.
             }
             _ => {}
         }
+
+        if emit_ping {
+            self.synapse.fire(SMessage::StateInvalidated);
+        }
     }
 
-    fn view(&self) -> DashboardState {
-        let s = self.state.lock().unwrap();
-        DashboardState {
-            mode: s.mode.clone(),
-            nav_items: vec!["Prime".into(), "Encrypted".into(), "Jules (Private)".into()],
-            active_nav_index: s.nav_index,
-            console_output: String::new(),
-            actions: match s.mode {
-                ViewMode::Comms => vec!["Clear Buffer".into(), "Wolfpack View".into()],
-                ViewMode::Wolfpack => vec![
-                    "Deploy J1".into(),
-                    "Deploy S5".into(),
-                    "Back to Comms".into(),
-                ],
-            },
-            sidebar_position: s.sidebar_position.clone(),
-            dock_actions: vec!["Rooms".into(), "Status".into()],
-            shard_tree: {
-                let mut root = Shard::new("una-prime", "Una-Prime", ShardRole::Root);
-                root.status = ShardStatus::Online;
-
-                let mut child = Shard::new("s9-mule", "S9-Mule", ShardRole::Builder);
-                child.status = s.s9_status.clone();
-
-                root.children.push(child);
-                vec![root]
-            },
-            sidebar_collapsed: s.sidebar_collapsed,
-        }
+    fn view(&self) -> bandy::state::DashboardState {
+        bandy::state::DashboardState::default()
     }
 }

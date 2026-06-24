@@ -20,11 +20,12 @@ use alloc::format;
 
 use crate::pal::TargetPal;
 use crate::user::UserSession;
-use gneiss_pal::GneissPal;
+use crate::pal::GneissPal;
 
 pub struct Console {
     pub current_input: String,
     pub session: UserSession,
+    history: alloc::vec::Vec<String>,
 }
 
 impl Console {
@@ -32,6 +33,18 @@ impl Console {
         Self {
             current_input: String::new(),
             session: UserSession::new(),
+            history: alloc::vec::Vec::new(),
+        }
+    }
+
+    pub fn clear(&mut self) {
+        self.history.clear();
+    }
+
+    pub fn println(&mut self, text: &str) {
+        self.history.push(String::from(text));
+        if self.history.len() > 25 {
+            self.history.remove(0);
         }
     }
 
@@ -41,7 +54,7 @@ impl Console {
         let line_height = 20;
         let mut y = 20;
 
-        for line in &self.session.history {
+        for line in &self.history {
             if y + line_height > pal.height() as usize {
                 break;
             }

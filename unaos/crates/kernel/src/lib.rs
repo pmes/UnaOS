@@ -16,55 +16,37 @@
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 #![cfg_attr(test, no_main)]
-#![feature(abi_x86_interrupt)]
+// abi_x86_interrupt is only used by the x86_64 interrupt handlers; gating it keeps the
+// aarch64 build free of the "unused feature" warning.
+#![cfg_attr(target_arch = "x86_64", feature(abi_x86_interrupt))]
+#![allow(unsafe_op_in_unsafe_fn)]
 
 extern crate alloc;
 
 #[macro_use]
-pub mod serial;
+pub mod arch;
+
+pub mod drivers;
 
 pub mod allocator;
-pub mod gdt;
-pub mod interrupts;
-pub mod memory;
+pub mod shell;
+
 pub mod pal;
 pub mod writer;
-
 pub mod console;
 pub mod user;
 pub mod vug;
 
-pub mod pci;
-pub mod xhci;
-
 pub fn init() {
-    gdt::init();
-    interrupts::init_idt();
-    unsafe { interrupts::PICS.lock().initialize() };
-
-    enable_sse();
-
-    x86_64::instructions::interrupts::enable();
+    arch::init();
 }
 
-fn enable_sse() {
-    use x86_64::registers::control::{Cr0, Cr0Flags, Cr4, Cr4Flags};
-    unsafe {
-        let mut cr0 = Cr0::read();
-        // FIX: Correct flag name
-        cr0.remove(Cr0Flags::EMULATE_COPROCESSOR);
-        cr0.insert(Cr0Flags::MONITOR_COPROCESSOR);
-        Cr0::write(cr0);
 
-        let mut cr4 = Cr4::read();
-        cr4.insert(Cr4Flags::OSFXSR);
-        cr4.insert(Cr4Flags::OSXMMEXCPT_ENABLE);
-        Cr4::write(cr4);
-    }
-}
 
 pub fn hlt_loop() -> ! {
-    loop {
-        x86_64::instructions::hlt();
-    }
+    arch::hlt_loop()
+}
+
+pub fn hlt() {
+    arch::hlt()
 }

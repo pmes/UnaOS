@@ -58,6 +58,9 @@ pub trait BlockDevice {
 
     /// Return the total number of blocks in the device.
     fn block_count(&self) -> u64;
+
+    /// Flush any buffered data to the underlying storage.
+    fn flush(&mut self) -> Result<(), Error>;
 }
 
 /// A block device backed by a file on the host OS.
@@ -122,6 +125,10 @@ impl BlockDevice for FileDevice {
             .metadata()
             .map(|m| m.len() / BLOCK_SIZE)
             .unwrap_or(0)
+    }
+
+    fn flush(&mut self) -> Result<(), Error> {
+        self.file.sync_all().map_err(|e| Error::Io(e.to_string()))
     }
 }
 
@@ -200,5 +207,9 @@ impl BlockDevice for MemDevice {
 
     fn block_count(&self) -> u64 {
         (self.data.len() as u64) / BLOCK_SIZE
+    }
+
+    fn flush(&mut self) -> Result<(), Error> {
+        Ok(())
     }
 }

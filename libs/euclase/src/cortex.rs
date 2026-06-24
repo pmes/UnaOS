@@ -55,14 +55,12 @@ impl<'a> Cortex<'a> {
 
         // We demand PolygonMode::Line for Vug's wireframes.
         let (device, queue) = adapter
-            .request_device(
-                &DeviceDescriptor {
-                    label: Some("Euclase_Primary_Cortex"),
-                    required_features: Features::POLYGON_MODE_LINE,
-                    required_limits: Limits::default(),
-                    ..Default::default()
-                }
-            )
+            .request_device(&DeviceDescriptor {
+                label: Some("Euclase_Primary_Cortex"),
+                required_features: Features::POLYGON_MODE_LINE,
+                required_limits: Limits::default(),
+                ..Default::default()
+            })
             .await
             .expect("Device request failed. Insufficient GPU authority.");
 

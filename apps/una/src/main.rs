@@ -18,15 +18,19 @@ use anyhow::Result;
 #[cfg(target_os = "linux")]
 use gtk4::prelude::*;
 #[cfg(target_os = "linux")]
-use gtk4::{Box, HeaderBar, Orientation, Paned, Stack, StackSwitcher, StackTransitionType, Separator};
+use gtk4::{
+    Box, HeaderBar, Orientation, Paned, Separator, Stack, StackSwitcher, StackTransitionType,
+};
 #[cfg(all(target_os = "linux", feature = "gnome"))]
 use libadwaita as adw;
 use std::cell::RefCell;
 use std::env;
-use std::rc::Rc;
 use std::path::PathBuf;
+use std::rc::Rc;
 
-use gneiss_pal::{Event, GuiUpdate};
+use gneiss_pal::Event;
+#[cfg(all(target_os = "linux", feature = "gtk"))]
+use quartzite::platforms::gtk::types::GuiUpdate;
 use quartzite::{Backend, NativeView, NativeWindow};
 
 #[cfg(target_os = "linux")]
@@ -45,7 +49,10 @@ fn main() -> Result<()> {
 
     // 1. Establish async_channel pairs
     let (tx_brain, rx_brain) = async_channel::unbounded::<Event>();
+    #[cfg(all(target_os = "linux", feature = "gtk"))]
     let (tx_gui, rx_gui) = async_channel::unbounded::<GuiUpdate>();
+    #[cfg(not(all(target_os = "linux", feature = "gtk")))]
+    let (tx_gui, rx_gui) = async_channel::unbounded::<()>();
     let (_tx_telemetry, rx_telemetry) = async_channel::unbounded::<bandy::SMessage>();
 
     // 2. Spawn central background task (Tokio)
@@ -55,6 +62,7 @@ fn main() -> Result<()> {
                 Event::FileSelected(path) => {
                     println!("[UNA CORE] 🧠 Routing Impulse: {:?}", path);
                     // Bouncing it as EditorLoad to trigger tabula
+                    #[cfg(all(target_os = "linux", feature = "gtk"))]
                     let _ = tx_gui.send(GuiUpdate::EditorLoad(path.to_string_lossy().to_string())).await;
                 }
                 _ => {}
@@ -71,7 +79,12 @@ fn main() -> Result<()> {
     let bootstrap = move |window: &NativeWindow| -> NativeView {
         #[cfg(target_os = "macos")]
         let view = {
-            spline.bootstrap(window, tx_brain.clone(), rx_gui.clone(), rx_telemetry.clone())
+            spline.bootstrap(
+                window,
+                tx_brain.clone(),
+                std::sync::Arc::new(std::sync::RwLock::new(bandy::state::AppState::default())),
+                rx_telemetry.clone(),
+            )
         };
 
         #[cfg(target_os = "linux")]
@@ -102,7 +115,6 @@ fn main() -> Result<()> {
             left_toolbar.add_top_bar(&left_header);
             left_toolbar.add_top_bar(&left_tab_bar);
             left_toolbar.set_content(Some(&left_tab_view));
-
 
             // 4. THE WORKSPACE (Right Pane)
             let right_toolbar = adw::ToolbarView::new();
@@ -206,13 +218,13 @@ fn main() -> Result<()> {
             #[cfg(all(target_os = "linux", feature = "gtk"))]
             let ret = main_paned.upcast::<gtk4::Widget>();
             #[cfg(not(all(target_os = "linux", feature = "gtk")))]
-            let ret = ();
+            let ret = NativeView { ptr: quartzite::platforms::qt::ffi::LumenMainWindow::null_ptr() };
 
             ret
         };
 
         #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-        let view: NativeView = ();
+        let view = NativeView { ptr: quartzite::platforms::qt::ffi::LumenMainWindow::null_ptr() };
 
         // 6. WIRE THE REFLEX ARC (UI Receiver Loop)
         #[cfg(target_os = "linux")]
@@ -221,6 +233,7 @@ fn main() -> Result<()> {
         glib::MainContext::default().spawn_local(async move {
             while let Ok(update) = rx_gui.recv().await {
                 match update {
+                    #[cfg(all(target_os = "linux", feature = "gtk"))]
                     GuiUpdate::EditorLoad(path_str) => {
                         let path = PathBuf::from(path_str);
                         println!("[UNA UI] ⚡ Loading into Tabula: {:?}", path);

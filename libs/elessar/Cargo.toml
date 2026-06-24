@@ -11,8 +11,3 @@ default = []
 gneiss_pal = { path = "../gneiss_pal" }
 log = "0.4"
 async-channel = "2.5"
-serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
-syn = { version = "2.0", features = ["full", "extra-traits"] }
-quote = "1.0"
-proc-macro2 = "1.0"

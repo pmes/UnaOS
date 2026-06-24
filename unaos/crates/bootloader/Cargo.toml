@@ -1,0 +1,10 @@
+[package]
+name = "bootloader"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+uefi = { version = "0.38.0", features = ["alloc", "global_allocator", "logger", "panic_handler"] }
+log = "0.4.21"
+xmas-elf = "0.10.0"
+unaos-boot-info = { path = "../boot-info" }

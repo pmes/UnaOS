@@ -1,73 +1,142 @@
 #![no_std]
+#![no_main]
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2026 The Architect & Una
-//
-// This program is free software: you can redistribute it and/or modify
-// it under the terms of the GNU General Public License as published by
-// the Free Software Foundation, either version 3 of the License, or
-// (at your option) any later version.
-//
-// This program is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-// GNU General Public License for more details.
-//
-// You should have received a copy of the GNU General Public License
-// along with this program.  If not, see <https://www.gnu.org/licenses/>.
-
-#![no_main]
 
 extern crate alloc;
 
-use bootloader_api::{entry_point, BootInfo};
 use core::panic::PanicInfo;
-use x86_64::VirtAddr;
 use unaos_kernel::serial_println;
+use unaos_boot_info::BootInfo;
 
-// ENTRY POINT
-entry_point!(kernel_main);
+#[unsafe(no_mangle)]
+#[cfg(target_arch = "x86_64")]
+pub extern "sysv64" fn _start(boot_info: &'static mut BootInfo) -> ! {
+    kernel_main(boot_info)
+}
+
+#[unsafe(no_mangle)]
+#[cfg(target_arch = "aarch64")]
+pub extern "C" fn _start(boot_info: &'static mut BootInfo) -> ! {
+    kernel_main(boot_info)
+}
 
 fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
-    // 1. Core Hardware Init (GDT, IDT, PICS)
+    // 1. Core Hardware Init (GDT, IDT, local APIC for x86_64, GIC for aarch64)
     unaos_kernel::init();
 
-    // 2. Serial Verification
-    serial_println!(":: UNAOS KERNEL AWAKE ::");
+    // 3. Framebuffer Info Extraction
+    // Extract info before memory initialization consumes the BootInfo reference
+    let framebuffer_addr = boot_info.framebuffer_addr;
+    let framebuffer_size = boot_info.framebuffer_size;
+    let info = boot_info.framebuffer_info;
 
-    // 3. Global Heap Allocation (Phase 3 Memory Translation)
-    let physical_memory_offset = boot_info.physical_memory_offset.into_option().unwrap();
-    let phys_offset = VirtAddr::new(physical_memory_offset);
+    // Extract DTB info before memory init consumes boot_info
+    let dtb_addr = boot_info.dtb_addr;
+    let dtb_size = boot_info.dtb_size;
 
-    let mut mapper = unsafe { unaos_kernel::memory::init(phys_offset) };
-    let mut frame_allocator = unsafe { unaos_kernel::memory::BootInfoFrameAllocator::init(&boot_info.memory_regions) };
-
-    unaos_kernel::allocator::init_heap(&mut mapper, &mut frame_allocator)
-        .expect("Heap initialization failed");
+    // 4. Global Heap Allocation (Phase 3 Memory Translation)
+    unaos_kernel::arch::memory::init(boot_info);
     serial_println!(":: KERNEL HEAP ALLOCATED ::");
 
-    // 4. Motherboard Hardware Interconnects
-    if let Some(xhci_phys_addr) = unaos_kernel::pci::PciScanner::scan() {
-        let xhci_virt_addr = phys_offset + xhci_phys_addr;
-        unaos_kernel::xhci::init(xhci_virt_addr, &mut mapper);
-    }
+    // 5. Motherboard Hardware Interconnects
+    unaos_kernel::arch::pci::init(dtb_addr, dtb_size);
 
-    // 5. Framebuffer Init
-    if let Some(framebuffer) = boot_info.framebuffer.as_mut() {
-        let info = framebuffer.info();
-        let buffer = framebuffer.buffer_mut();
-        unaos_kernel::vug::init(buffer, info);
+    if framebuffer_addr != 0 {
+        // Safety: We assume the bootloader passed a valid framebuffer physical address
+        let buffer = unsafe {
+            core::slice::from_raw_parts_mut(framebuffer_addr as *mut u8, framebuffer_size)
+        };
+        
+        unaos_kernel::vug::init(&mut *buffer, info);
+        
+        unaos_kernel::writer::WRITER.lock().init(buffer, info);
     } else {
         serial_println!(":: WARNING: No framebuffer detected ::");
     }
 
+    let mut console = unaos_kernel::console::Console::new();
+    let mut writer_guard = unaos_kernel::writer::WRITER.lock();
+    let mut pal = unaos_kernel::pal::TargetPal::new(&mut *writer_guard);
+    
+    console.draw(&mut pal);
+
+    use unaos_kernel::pal::GneissPal;
+    let mut mouse_px: i32 = (pal.width() / 2) as i32;
+    let mut mouse_py: i32 = (pal.height() / 2) as i32;
+
     loop {
-        // Halt the CPU until the next interrupt
-        x86_64::instructions::hlt();
+        // Poll xHCI Controller, then run any deferred storage work (synchronous BOT
+        // transactions run here, in a safe non-event context).
+        if let Some(xhci) = &mut *unaos_kernel::drivers::xhci::XHCI_CONTROLLER.lock() {
+            xhci.poll_events();
+            xhci.service_storage();
+        }
+
+        #[cfg(target_arch = "aarch64")]
+        if let Some(byte) = unaos_kernel::arch::poll_input() {
+            unaos_kernel::pal::push_event(unaos_kernel::pal::Event::Key(byte));
+        }
+
+        let event = pal.poll_event();
+        match event {
+            unaos_kernel::pal::Event::Key(c) => {
+                if c == b'\n' || c == b'\r' {
+                    let cmd = console.current_input.clone();
+                    console.current_input.clear();
+                    unaos_kernel::shell::dispatch_command(&cmd, &mut console, &mut pal);
+                    console.draw(&mut pal);
+                } else if c == 8 || c == 0x7F {
+                    console.current_input.pop();
+                    console.draw(&mut pal);
+                } else if c >= 32 && c <= 126 {
+                    console.current_input.push(c as char);
+                    console.draw(&mut pal);
+                }
+            }
+            unaos_kernel::pal::Event::Mouse { x, y } => {
+                // Erase old cursor (draw background color over it)
+                pal.draw_rect(mouse_px as usize, mouse_py as usize, 10, 10, 0x1E1E1E);
+
+                // Update position with deltas
+                mouse_px += x;
+                mouse_py += y;
+
+                // Clamp to screen bounds
+                if mouse_px < 0 { mouse_px = 0; }
+                if mouse_py < 0 { mouse_py = 0; }
+                if mouse_px as u32 >= pal.width() { mouse_px = pal.width() as i32 - 10; }
+                if mouse_py as u32 >= pal.height() { mouse_py = pal.height() as i32 - 10; }
+
+                // Draw new cursor (a bright red 10x10 square)
+                pal.draw_rect(mouse_px as usize, mouse_py as usize, 10, 10, 0xFF0000);
+            }
+            unaos_kernel::pal::Event::MouseAbsolute { x, y } => {
+                // Erase old cursor
+                pal.draw_rect(mouse_px as usize, mouse_py as usize, 10, 10, 0x1E1E1E);
+
+                // Scale 0-32767 coordinate space to screen bounds
+                mouse_px = ((x as i64 * pal.width() as i64) / 32767) as i32;
+                mouse_py = ((y as i64 * pal.height() as i64) / 32767) as i32;
+
+                // Clamp just in case
+                if mouse_px < 0 { mouse_px = 0; }
+                if mouse_py < 0 { mouse_py = 0; }
+                if mouse_px as u32 >= pal.width() { mouse_px = pal.width() as i32 - 10; }
+                if mouse_py as u32 >= pal.height() { mouse_py = pal.height() as i32 - 10; }
+
+                // Draw new cursor
+                pal.draw_rect(mouse_px as usize, mouse_py as usize, 10, 10, 0xFF0000);
+            }
+            _ => {
+                unaos_kernel::hlt();
+            }
+        }
     }
 }
 
 #[panic_handler]
 fn panic(info: &PanicInfo) -> ! {
     serial_println!("{}", info);
-    unaos_kernel::hlt_loop();
+    unaos_kernel::arch::hlt_loop();
 }

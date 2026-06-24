@@ -19,15 +19,20 @@
 
 pub mod api;
 pub mod forge;
+#[cfg(feature = "std")]
 pub mod io;
+#[cfg(feature = "std")]
 pub mod paths;
+#[cfg(feature = "std")]
 pub mod persistence;
-pub mod shard;
-pub mod types;
+pub mod utils;
+#[cfg(feature = "std")]
+pub mod app_handler;
 
 // Re-export types so consumers see them at the root
-pub use shard::{Heartbeat, Shard, ShardRole, ShardStatus};
-pub use types::*;
+pub use utils::*;
+#[cfg(feature = "std")]
+pub use app_handler::*;
 
 // --- LOGIC KERNEL ---
 // No GTK, No Assets, No UI.
