@@ -6,17 +6,21 @@
 pub struct PciScanner;
 
 impl PciScanner {
-    pub fn scan() -> Option<u64> {
-        if let Some(addr) = Self::enumerate_buses() {
-            serial_println!("[PCI] FOUND XHCI CONTROLLER AT PHYSICAL ADDRESS: 0x{:X}", addr);
-            Some(addr)
+    /// Scan for the xHCI controller. Returns `(bar_phys_addr, bus, device, function)`
+    /// so callers can both map the BAR and reach the device's config space (e.g. to
+    /// enable Bus Master).
+    pub fn scan() -> Option<(u64, u8, u8, u8)> {
+        if let Some(found) = Self::enumerate_buses() {
+            serial_println!("[PCI] FOUND XHCI CONTROLLER AT PHYSICAL ADDRESS: 0x{:X} (bus {} dev {} fn {})",
+                found.0, found.1, found.2, found.3);
+            Some(found)
         } else {
             serial_println!("[PCI] WARNING: XHCI CONTROLLER NOT FOUND");
             None
         }
     }
 
-    pub fn enumerate_buses() -> Option<u64> {
+    pub fn enumerate_buses() -> Option<(u64, u8, u8, u8)> {
         serial_println!("PCI: Commencing motherboard scan...");
 
         for bus in 0..=255 {
@@ -48,7 +52,7 @@ impl PciScanner {
 
                     if class_code == 0x0C && subclass == 0x03 && prog_if == 0x30 {
                         // Found XHCI
-                        return Some(Self::get_bar_address(bus, device, func));
+                        return Some((Self::get_bar_address(bus, device, func), bus, device, func));
                     }
                 }
             }

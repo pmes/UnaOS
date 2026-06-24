@@ -4,8 +4,9 @@
 #
 # Usage:
 #   ./arroyo              Interactive menu
-#   ./arroyo x86           Build & boot x86_64
+#   ./arroyo x86           Build & boot x86_64 (GUI window + serial on stdio)
 #   ./arroyo arm           Build & boot aarch64
+#   ./arroyo test [secs]   Headless x86_64 run; serial captured to target/serial.log
 #   ./arroyo check         Quick syntax check (both targets)
 #   ./arroyo build         Build both targets (no QEMU)
 #   ./arroyo clean         Purge all build artifacts
@@ -121,6 +122,31 @@ launch_aarch64() {
         -d guest_errors
 }
 
+# --- Headless Test (capture serial to a file) ---
+# Boots x86_64 in QEMU with no display, redirects the serial console to
+# target/serial.log, and auto-terminates after N seconds (default 20). Use this for
+# fast iteration / sharing boot logs — the log lands at a fixed path every time.
+#   ./arroyo test          # 20s headless run, then prints the serial log
+#   ./arroyo test 30       # 30s run
+SERIAL_LOG="${WORKSPACE_DIR}/target/serial.log"
+
+test_x86_64() {
+    local secs="${1:-20}"
+    build_kernel_x86_64
+
+    echo -e "${COLOR_CYAN}⚡ Headless x86_64 test (${secs}s). Serial -> ${SERIAL_LOG}${COLOR_RESET}"
+    rm -f "$SERIAL_LOG"
+    cd "$WORKSPACE_DIR/builder"
+    UNAOS_SERIAL_LOG="$SERIAL_LOG" UNAOS_TEST_SECS="$secs" cargo +nightly run --release
+    cd "$WORKSPACE_DIR"
+
+    echo ""
+    echo -e "${COLOR_PURPLE}════════════ SERIAL LOG (${SERIAL_LOG}) ════════════${COLOR_RESET}"
+    cat "$SERIAL_LOG" 2>/dev/null || echo -e "${COLOR_RED}(no serial log produced)${COLOR_RESET}"
+    echo -e "${COLOR_PURPLE}═══════════════════════════════════════════════════${COLOR_RESET}"
+    echo -e "${COLOR_GREEN}✅ Test run complete. Full log saved at ${SERIAL_LOG}${COLOR_RESET}"
+}
+
 # --- Utility Functions ---
 
 check_both() {
@@ -164,15 +190,19 @@ show_expectations_x86() {
     echo -e "    • usb-tablet  (absolute mouse)"
     echo ""
     echo -e "  ${COLOR_GREEN}EXPECTED serial output:${COLOR_RESET}"
-    echo -e "    1. PCI scan finds xHCI controller"
-    echo -e "    2. xHCI reset, command ring, event ring init"
-    echo -e "    3. Port scan detects USB devices"
-    echo -e "    4. Slot allocation, address device, descriptor read"
-    echo -e "    5. Mass storage: SCSI Read → 'MISSION SUCCESS'"
-    echo -e "    6. Tablet: mouse events dispatched"
+    echo -e "    1. PCI scan finds xHCI; Bus Master enabled; CONFIG.MaxSlotsEn set"
+    echo -e "    2. Ports enumerated one at a time (storage=USB3, tablet=USB2)"
+    echo -e "    3. Mass storage interface detected → bulk endpoints configured"
+    echo -e "    4. SCSI bring-up: INQUIRY + READ CAPACITY → 'Disk ... 64 MiB'"
+    echo -e "    5. BOT READ(10) LBA0 CSW Passed → 'MISSION SUCCESS'"
+    echo -e "    6. Tablet: mouse cursor tracks"
     echo ""
-    echo -e "  ${COLOR_YELLOW}TO ADD KEYBOARD: relaunch builder with usb-kbd${COLOR_RESET}"
-    echo -e "    (builder/src/main.rs line 110, add usb-kbd device)"
+    echo -e "  ${COLOR_CYAN}IN THE SHELL (type in the QEMU window):${COLOR_RESET}"
+    echo -e "    diskinfo            show vendor/product, block size, capacity"
+    echo -e "    read <lba>          read a sector and hexdump it"
+    echo -e "    write <lba> <byte>  fill a sector with a byte (mutates usb.img)"
+    echo ""
+    echo -e "  ${COLOR_YELLOW}For a headless capture of all this: ./arroyo test${COLOR_RESET}"
     echo -e "${COLOR_PURPLE}═══════════════════════════════════════════════${COLOR_RESET}"
     echo ""
 }
@@ -184,20 +214,22 @@ show_menu() {
     echo -e "${COLOR_PURPLE}═══════════════════════════════${COLOR_RESET}"
     echo -e "${COLOR_PURPLE}     A R R O Y O   v2.0${COLOR_RESET}"
     echo -e "${COLOR_PURPLE}═══════════════════════════════${COLOR_RESET}"
-    echo -e "  ${COLOR_CYAN}1)${COLOR_RESET} Boot x86_64   (Build + QEMU)"
+    echo -e "  ${COLOR_CYAN}1)${COLOR_RESET} Boot x86_64    (Build + QEMU GUI)"
     echo -e "  ${COLOR_CYAN}2)${COLOR_RESET} Boot aarch64   (Build + QEMU)"
-    echo -e "  ${COLOR_CYAN}3)${COLOR_RESET} Check          (Both targets)"
-    echo -e "  ${COLOR_CYAN}4)${COLOR_RESET} Build          (Both targets)"
-    echo -e "  ${COLOR_CYAN}5)${COLOR_RESET} Clean"
+    echo -e "  ${COLOR_CYAN}3)${COLOR_RESET} Test x86_64    (Headless, capture serial -> target/serial.log)"
+    echo -e "  ${COLOR_CYAN}4)${COLOR_RESET} Check          (Both targets)"
+    echo -e "  ${COLOR_CYAN}5)${COLOR_RESET} Build          (Both targets)"
+    echo -e "  ${COLOR_CYAN}6)${COLOR_RESET} Clean"
     echo -e "  ${COLOR_CYAN}q)${COLOR_RESET} Quit"
     echo -e "${COLOR_PURPLE}═══════════════════════════════${COLOR_RESET}"
     read -p "  Command: " choice
     case $choice in
         1) show_expectations_x86; launch_x86_64;;
         2) launch_aarch64;;
-        3) check_both;;
-        4) build_both;;
-        5) clean_all;;
+        3) test_x86_64;;
+        4) check_both;;
+        5) build_both;;
+        6) clean_all;;
         q) exit 0;;
         *) echo -e "${COLOR_RED}Invalid option.${COLOR_RESET}";;
     esac
@@ -212,6 +244,9 @@ case "${1:-}" in
         ;;
     arm|aarch64)
         launch_aarch64
+        ;;
+    test|test-x86|test_x86)
+        test_x86_64 "${2:-20}"
         ;;
     check)
         check_both
@@ -229,7 +264,7 @@ case "${1:-}" in
         ;;
     *)
         echo -e "${COLOR_RED}Unknown command: $1${COLOR_RESET}"
-        echo "Usage: ./arroyo [x86|arm|check|build|clean]"
+        echo "Usage: ./arroyo [x86|arm|test [secs]|check|build|clean]"
         exit 1
         ;;
 esac

@@ -66,9 +66,11 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     let mut mouse_py: i32 = (pal.height() / 2) as i32;
 
     loop {
-        // Poll xHCI Controller
+        // Poll xHCI Controller, then run any deferred storage work (synchronous BOT
+        // transactions run here, in a safe non-event context).
         if let Some(xhci) = &mut *unaos_kernel::drivers::xhci::XHCI_CONTROLLER.lock() {
             xhci.poll_events();
+            xhci.service_storage();
         }
 
         #[cfg(target_arch = "aarch64")]

@@ -128,6 +128,28 @@ const HID_SCANCODE_TO_ASCII: [(u8, u8); 104] = [
 ];
 
 
+/// Default spin budget for hardware handshakes. Correctness only requires this be
+/// finite; it is sized generously so a healthy controller never trips it, while a
+/// wedged bit logs and bails instead of hanging the CPU forever.
+const HW_WAIT_SPINS: u64 = 50_000_000;
+
+/// Spin until `pred()` returns true or `max_spins` iterations elapse.
+/// On timeout it logs `what` and returns `Err(())` so the caller can bail.
+/// This replaces every bare `loop { spin_loop() }` hardware wait so a
+/// never-flipping status bit can no longer freeze boot silently.
+fn wait_until<F: Fn() -> bool>(pred: F, max_spins: u64, what: &str) -> Result<(), ()> {
+    let mut spins: u64 = 0;
+    while !pred() {
+        spins += 1;
+        if spins >= max_spins {
+            serial_println!("xHCI: TIMEOUT waiting for {}", what);
+            return Err(());
+        }
+        core::hint::spin_loop();
+    }
+    Ok(())
+}
+
 pub fn init(base_address: u64) {
     serial_println!("xHCI: Virtual Handoff. Base Address: {:#x}", base_address);
 
@@ -146,35 +168,23 @@ pub fn init(base_address: u64) {
         let cmd = core::ptr::read_volatile(usbcmd_ptr);
         core::ptr::write_volatile(usbcmd_ptr, cmd & !1);
 
-        loop {
-            let status = core::ptr::read_volatile(usbsts_ptr);
-            if (status & 1) != 0 {
-                break;
-            }
-            core::hint::spin_loop();
-        }
+        let _ = wait_until(
+            || (core::ptr::read_volatile(usbsts_ptr) & 1) != 0,
+            HW_WAIT_SPINS, "USBSTS.HCH=1 (halt)");
         serial_println!("xHCI: Controller Halted.");
 
         // Reset Controller
         let cmd = core::ptr::read_volatile(usbcmd_ptr);
         core::ptr::write_volatile(usbcmd_ptr, cmd | 2);
 
-        loop {
-            let current_cmd = core::ptr::read_volatile(usbcmd_ptr);
-            if (current_cmd & 2) == 0 {
-                break;
-            }
-            core::hint::spin_loop();
-        }
+        let _ = wait_until(
+            || (core::ptr::read_volatile(usbcmd_ptr) & 2) == 0,
+            HW_WAIT_SPINS, "USBCMD.HCRST=0 (reset)");
 
         // Wait for Controller Not Ready (CNR) to clear
-        loop {
-            let status = core::ptr::read_volatile(usbsts_ptr);
-            if (status & (1 << 11)) == 0 {
-                break;
-            }
-            core::hint::spin_loop();
-        }
+        let _ = wait_until(
+            || (core::ptr::read_volatile(usbsts_ptr) & (1 << 11)) == 0,
+            HW_WAIT_SPINS, "USBSTS.CNR=0");
         serial_println!("xHCI: Controller Reset Complete.");
     }
 
@@ -205,6 +215,46 @@ pub unsafe fn ring_doorbell_asm(doorbell_addr: u64, target: u32) {
     core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
 }
 
+/// Direction of a Bulk-Only Transport data stage.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Direction { In, Out, None }
+
+/// Result status decoded from a Command Status Wrapper (CSW).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum CswStatus { Passed, Failed, PhaseError, Unknown }
+
+/// Error outcomes from a Bulk-Only Transport transaction.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum BotError {
+    Timeout,
+    Stall,
+    BadCswSignature,
+    TagMismatch,
+    TransferError(u8),
+    NoDevice,
+}
+
+/// A successful BOT transaction result (CSW decoded).
+#[derive(Clone, Copy, Debug)]
+pub struct BotResult {
+    pub status: CswStatus,
+    pub residue: u32,
+}
+
+/// In-flight BOT transaction state. The event handler records the CSW (or an error)
+/// here while the synchronous pump waits. The CSW completion is matched by the TRB
+/// physical address so it is never confused with a data-stage event.
+#[derive(Clone, Copy)]
+struct BotPending {
+    slot_id: u8,
+    in_dci: u8,
+    out_dci: u8,
+    csw_trb_phys: u64,
+    done: bool,
+    completion_code: u8,
+    transfer_len: u32,
+}
+
 pub struct DeviceSlot {
     pub active: bool,
     pub port_id: u8,
@@ -227,8 +277,16 @@ pub struct DeviceSlot {
     pub keyboard_mps: u16,
     pub keyboard_state: u8,
     pub keyboard_ring: Option<TransferRing>,
-    
+
     pub descriptor_buffer: *mut u8,
+
+    // Dedicated DMA buffers for Bulk-Only Transport (mass storage). Kept separate from
+    // descriptor_buffer / data_buffer so a CBW can't clobber descriptors or HID reports.
+    pub cbw_buffer: Option<*mut u8>,       // 31-byte Command Block Wrapper
+    pub csw_buffer: Option<*mut u8>,       // 13-byte Command Status Wrapper
+    pub scsi_data_buffer: Option<*mut u8>, // data-stage buffer (>= one block)
+    pub bulk_in_ep: u8,                    // bulk IN endpoint address (e.g. 0x81)
+    pub bulk_out_ep: u8,                   // bulk OUT endpoint address (e.g. 0x02)
 }
 
 unsafe impl Send for DeviceSlot {}
@@ -258,6 +316,11 @@ impl DeviceSlot {
             keyboard_state: 0,
             keyboard_ring: None,
             descriptor_buffer: desc_buffer,
+            cbw_buffer: None,
+            csw_buffer: None,
+            scsi_data_buffer: None,
+            bulk_in_ep: 0,
+            bulk_out_ep: 0,
         }
     }
 }
@@ -271,9 +334,23 @@ pub struct XhciController {
     pub dcbaap: *mut u64,
     pub slots: Vec<DeviceSlot>,
     pub pending_ports: Vec<u8>,
-    
+    /// Connected ports discovered at boot but not yet enumerated. Drained one at a
+    /// time (serialized) so the shared enable-slot / configuring-slot state can never
+    /// be clobbered by two devices resetting simultaneously.
+    pub ports_to_enumerate: Vec<u8>,
+
     pub configuring_slot: u8,
     pub event_ring_phys_base: u64,
+
+    /// Slot id of the enumerated mass-storage device (0 = none).
+    pub storage_slot: u8,
+    /// Set once the storage bulk endpoints are configured; the main loop performs the
+    /// (synchronous) SCSI bring-up + first read in a safe, non-event context.
+    pub storage_pending_bringup: bool,
+    /// Monotonic CBW tag.
+    pub bot_tag: u32,
+    /// In-flight BOT transaction, populated by the event handler.
+    bot_pending: Option<BotPending>,
 }
 
 unsafe impl Send for XhciController {}
@@ -314,8 +391,13 @@ impl XhciController {
             dcbaap: core::ptr::null_mut(),
             slots,
             pending_ports: Vec::new(),
+            ports_to_enumerate: Vec::new(),
             configuring_slot: 0,
             event_ring_phys_base: 0,
+            storage_slot: 0,
+            storage_pending_bringup: false,
+            bot_tag: 1,
+            bot_pending: None,
         }
     }
 
@@ -351,6 +433,19 @@ impl XhciController {
         }
     }
 
+    /// Safely clear one or more PORTSC change bits (all RW1C). PORTSC has dangerous
+    /// write-1 semantics: bit 1 (PED) is write-1-to-DISABLE and bit 4 (PR) is
+    /// write-1-to-RESET. A naive `read | change_bit` write-back can therefore disable
+    /// or reset the port if those bits read back as 1. This masks off PED, PR, and all
+    /// RW1C change bits, then writes 1 only to the requested change bit(s).
+    fn clear_port_change(&self, port_id: u8, change_bits: u32) {
+        const ALL_CHANGE: u32 =
+            (1 << 17) | (1 << 18) | (1 << 20) | (1 << 21) | (1 << 22) | (1 << 23);
+        let portsc = self.read_portsc(port_id);
+        let preserved = portsc & !(ALL_CHANGE | (1 << 1) | (1 << 4));
+        self.write_portsc(port_id, preserved | (change_bits & ALL_CHANGE));
+    }
+
     pub fn ring_doorbell(&mut self, slot_id: u8, target: u32) {
         unsafe {
             // 1. Find Doorbell Offset (Offset 0x14 in Cap Regs)
@@ -377,25 +472,60 @@ impl XhciController {
     }
 
     pub fn poll_events(&mut self) -> bool {
-        let mut ring_guard = EVENT_RING.lock();
-        let ring = ring_guard.as_mut().unwrap();
-        let mut command_completed = false;
+        let mut any = false;
+        while self.drain_event_ring_once() {
+            any = true;
+        }
+        any
+    }
 
-        // Check for event
-        while ring.has_event() {
-            serial_println!("xHCI: Event Detected!");
+    /// Pop and dispatch a single event TRB, then advance the ERDP. Returns false when
+    /// the event ring is empty. This is the SINGLE entry point for consuming events —
+    /// used by both poll_events() and the synchronous BOT pump — so there is exactly one
+    /// ERDP owner and the EVENT_RING lock is never held across dispatch.
+    fn drain_event_ring_once(&mut self) -> bool {
+        let (trb, dequeue_index) = {
+            let mut guard = EVENT_RING.lock();
+            let ring = guard.as_mut().unwrap();
+            if !ring.has_event() {
+                return false;
+            }
+            let trb = ring.pop().unwrap();
+            (trb, ring.dequeue_index)
+        }; // EVENT_RING lock released BEFORE dispatch
 
-            if let Some(trb) = ring.pop() {
-                let param = trb.parameter;
-                let status = trb.status;
-                let control = trb.control;
+        serial_println!("xHCI: Event Detected!");
+        self.handle_event_trb(trb);
+        self.advance_erdp(dequeue_index);
+        true
+    }
 
-                // UNA-21-VERBOSE: Dump Raw TRB
-                serial_println!("xHCI RAW: Param={:#x} Status={:#x} Control={:#x}", param, status, control);
+    /// Update the Event Ring Dequeue Pointer to `dequeue_index`, clearing Event Handler Busy.
+    fn advance_erdp(&self, dequeue_index: usize) {
+        unsafe {
+            if EVENT_RING_PHYS_BASE == 0 {
+                serial_println!("xHCI: WARNING - EVENT_RING_PHYS_BASE is 0, skipping ERDP update!");
+                return;
+            }
+            let rtsoff = core::ptr::read_volatile((self.base_addr + 0x18) as *const u32) & !0x1F;
+            let ir0_base = self.base_addr + rtsoff as usize + 0x20;
+            let new_dequeue_ptr = EVENT_RING_PHYS_BASE + (dequeue_index as u64 * 16);
+            // Bit 3 (EHB) is write-1-to-clear.
+            core::ptr::write_volatile((ir0_base + 0x18) as *mut u64, new_dequeue_ptr | 8);
+            serial_println!("xHCI: ERDP Advanced to {:#x}", new_dequeue_ptr);
+        }
+    }
 
-                // 1. EXTRACT THE TYPE
-                // Control Field: Bits 15:10 = TRB Type
-                let trb_type = (control >> 10) & 0x3F;
+    /// Dispatch a single event TRB (command completion / port status change / transfer).
+    fn handle_event_trb(&mut self, trb: Trb) {
+        let param = trb.parameter;
+        let status = trb.status;
+        let control = trb.control;
+
+        serial_println!("xHCI RAW: Param={:#x} Status={:#x} Control={:#x}", param, status, control);
+
+        // Control Field: Bits 15:10 = TRB Type
+        let trb_type = (control >> 10) & 0x3F;
 
                 // 2. DISPATCH
                 match trb_type {
@@ -421,9 +551,15 @@ impl XhciController {
                                 }
                                 // UNA-21-ACCELERATE: Check if we were configuring endpoints
                                 else if self.configuring_slot == slot_id as u8 {
-                                    serial_println!("xHCI: Endpoints Configured (Slot {}). Proceeding to SCSI Read...", slot_id);
+                                    serial_println!("xHCI: Endpoints Configured (Slot {}). Storage ready.", slot_id);
                                     self.configuring_slot = 0;
-                                    self.send_scsi_read(slot_id as u8);
+                                    // Cache the storage slot and defer the SCSI bring-up + read
+                                    // to the main loop (a safe, non-event context where the
+                                    // synchronous BOT pump can run without re-entrancy).
+                                    self.storage_slot = slot_id as u8;
+                                    self.storage_pending_bringup = true;
+                                    // Storage setup is done; move on to the next connected port.
+                                    self.start_next_port();
                                 }
                                 else if self.slots[slot_id as usize].mouse_state == 1 {
                                     serial_println!("xHCI: Mouse Endpoints Configured (Slot {}). Proceeding to Set Configuration...", slot_id);
@@ -448,36 +584,34 @@ impl XhciController {
                                 serial_println!("xHCI: CRITICAL FAILURE: TRB ERROR (CODE 5).");
                             }
                         }
-                        command_completed = true;
                     },
                     34 => { // PORT STATUS CHANGE EVENT
                         let port_id = ((param >> 24) & 0xFF) as u8;
                         serial_println!("xHCI: [Event] Port Status Change. Port={}", port_id);
 
-                        // UNA-18-SLOT: Handle Reset Complete & Enable Slot
-                        // 1. Read the register to see WHAT changed
                         let port_sc = self.read_portsc(port_id);
 
-                        // 2. Check for PRC (Port Reset Change - Bit 21)
+                        // PRC (Port Reset Change, bit 21): a reset we initiated has
+                        // completed. Acknowledge it and, if the port is now enabled,
+                        // request a device slot.
                         if (port_sc & (1 << 21)) != 0 {
-                            serial_println!("xHCI: [Port {}] Reset Complete. Clearing Change Bit...", port_id);
+                            serial_println!("xHCI: [Port {}] Reset Complete. Clearing PRC...", port_id);
+                            self.clear_port_change(port_id, 1 << 21);
 
-                            // Write 1 to Bit 21 to clear the change notification
-                            // Preserve other bits (read-modify-write)
-                            self.write_portsc(port_id, port_sc | (1 << 21));
-
-                            // 3. Check if Port is now ENABLED (Bit 1)
-                            // Re-read or just check the value we had (though clearing bit might be needed first?
-                            // Standard practice: Read again to be sure, or check the value we just read.
-                            // If PRC is set, PED (Bit 1) should be valid now.
+                            // Bit 1: PED (Port Enabled).
                             if (port_sc & (1 << 1)) != 0 {
                                 serial_println!("xHCI: [Port {}] is ENABLED. Requesting Slot...", port_id);
                                 self.enable_slot(port_id);
                             }
                         }
 
-                        // Also run the old handler for other changes (Connects)
-                        self.handle_port_change(port_id);
+                        // CSC (Connect Status Change, bit 17): acknowledge only. Resets
+                        // are driven solely by start_next_port() so enumeration stays
+                        // serialized; we must NOT auto-reset here.
+                        if (port_sc & (1 << 17)) != 0 {
+                            serial_println!("xHCI: [Port {}] Connect Status Change; acknowledging.", port_id);
+                            self.clear_port_change(port_id, 1 << 17);
+                        }
                     },
                     32 => { // TRANSFER EVENT
                         let transfer_len = status & 0xFFFFFF;
@@ -500,10 +634,14 @@ impl XhciController {
                                     serial_println!("xHCI: >>> MOUSE SET_CONFIGURATION COMPLETE <<<");
                                     self.slots[slot_id as usize].mouse_state = 3;
                                     self.queue_mouse_read(slot_id as u8);
+                                    // Mouse/tablet is live; move on to the next connected port.
+                                    self.start_next_port();
                                 } else if self.slots[slot_id as usize].keyboard_state == 2 {
                                     serial_println!("xHCI: >>> KEYBOARD SET_CONFIGURATION COMPLETE <<<");
                                     self.slots[slot_id as usize].keyboard_state = 3;
                                     self.queue_keyboard_read(slot_id as u8);
+                                    // Keyboard is live; move on to the next connected port.
+                                    self.start_next_port();
                                 } else {
                                     serial_println!("xHCI: >>> INTERCEPTED DESCRIPTOR EVENT (Slot 1 EP 1) <<<");
                                     unsafe {
@@ -525,13 +663,12 @@ impl XhciController {
                                     serial_println!("xHCI: Device Found. Class={:#x} Sub={:#x} Proto={:#x}",
                                         class_code, subclass, protocol);
 
-                                    if class_code == 0x08 { // 0x08 = Mass Storage
+                                    if class_code == 0x08 { // 0x08 = Mass Storage (device-level)
                                         serial_println!("xHCI: >>> CARGO DETECTED (MASS STORAGE) <<<");
-                                        serial_println!("xHCI: Initiating Bulk Transport Setup...");
-
-                                        // UNA-21-CONFIG: Initiate Endpoint Configuration
-                                        self.configuring_slot = slot_id as u8;
-                                        self.configure_endpoints(slot_id as u8);
+                                        serial_println!("xHCI: Requesting Configuration Descriptor for bulk endpoints...");
+                                        // Route through the config-descriptor parser so the
+                                        // real bulk endpoint addresses + MPS drive configure_endpoints.
+                                        self.request_configuration_descriptor(slot_id as u8);
                                     } else if class_code == 0x00 {
                                         // Class 0 means "Look at Interface Descriptor" (Common for Flash Drives too)
                                         serial_println!("xHCI: Composite Device. Requesting Configuration Descriptor...");
@@ -547,30 +684,44 @@ impl XhciController {
                                         let mut current_intf_class: u8 = 0;
                                         let mut current_intf_protocol: u8 = 0;
                                         let mut found_hid = false;
-                                        
+                                        // Mass-storage tracking: collect the bulk IN/OUT
+                                        // endpoints during the walk, configure once after.
+                                        let mut is_mass_storage = false;
+                                        let mut bulk_in: Option<(u8, u16)> = None;
+                                        let mut bulk_out: Option<(u8, u16)> = None;
+
                                         while offset < total_length as usize && offset < 256 {
                                             if offset + 1 >= 256 { break; }
                                             let length = desc_data[offset] as usize;
                                             if length == 0 { break; }
                                             let desc_type = desc_data[offset + 1];
-                                            
+
                                             if desc_type == 0x04 { // Interface Descriptor
                                                 if offset + 7 >= 256 { break; }
                                                 current_intf_class = desc_data[offset + 5];
                                                 let intf_subclass = desc_data[offset + 6];
                                                 current_intf_protocol = desc_data[offset + 7];
-                                                serial_println!("xHCI: Interface: Class={:#x} Sub={:#x} Proto={:#x}", 
+                                                serial_println!("xHCI: Interface: Class={:#x} Sub={:#x} Proto={:#x}",
                                                     current_intf_class, intf_subclass, current_intf_protocol);
-                                                
+
                                                 found_hid = current_intf_class == 0x03; // HID class
-                                            } else if desc_type == 0x05 && found_hid { // Endpoint Descriptor
+
+                                                if current_intf_class == 0x08 {
+                                                    // Mass Storage interface (SCSI Bulk-Only, 0x08/0x06/0x50).
+                                                    // This device reports class 0 at the device level, so the
+                                                    // interface descriptor is the only place to detect it. We
+                                                    // collect its bulk endpoints below and configure after the walk.
+                                                    serial_println!("xHCI: >>> MASS STORAGE INTERFACE DETECTED (Class 0x08) <<<");
+                                                    is_mass_storage = true;
+                                                }
+                                            } else if desc_type == 0x05 && found_hid { // HID Endpoint
                                                 if offset + 6 >= 256 { break; }
                                                 let ep_addr = desc_data[offset + 2];
                                                 let ep_attr = desc_data[offset + 3];
                                                 if (ep_attr & 0x03) == 0x03 && (ep_addr & 0x80) != 0 { // Interrupt IN
                                                     let ep_mps = (desc_data[offset + 4] as u16) | ((desc_data[offset + 5] as u16) << 8);
                                                     let ep_interval = desc_data[offset + 6];
-                                                    
+
                                                     if current_intf_protocol == 1 {
                                                         // USB HID Boot Keyboard
                                                         serial_println!("xHCI: >>> KEYBOARD INTERRUPT IN EP FOUND: {:#x}, MPS: {}, Interval: {} <<<", ep_addr, ep_mps, ep_interval);
@@ -589,16 +740,66 @@ impl XhciController {
                                                         found_hid = false; // Don't double-match
                                                     }
                                                 }
+                                            } else if desc_type == 0x05 && is_mass_storage { // Bulk Endpoint
+                                                if offset + 6 >= 256 { break; }
+                                                let ep_addr = desc_data[offset + 2];
+                                                let ep_attr = desc_data[offset + 3];
+                                                // wMaxPacketSize bits 10:0 (mask off HS mult bits 12:11).
+                                                let ep_mps = ((desc_data[offset + 4] as u16) | ((desc_data[offset + 5] as u16) << 8)) & 0x07FF;
+                                                if (ep_attr & 0x03) == 0x02 { // Bulk transfer type
+                                                    if (ep_addr & 0x80) != 0 {
+                                                        serial_println!("xHCI: >>> BULK IN EP FOUND: {:#x}, MPS: {} <<<", ep_addr, ep_mps);
+                                                        bulk_in = Some((ep_addr, ep_mps));
+                                                    } else {
+                                                        serial_println!("xHCI: >>> BULK OUT EP FOUND: {:#x}, MPS: {} <<<", ep_addr, ep_mps);
+                                                        bulk_out = Some((ep_addr, ep_mps));
+                                                    }
+                                                }
                                             }
                                             offset += length;
+                                        }
+
+                                        // Once both bulk directions are known, configure them.
+                                        if is_mass_storage {
+                                            match (bulk_in, bulk_out) {
+                                                (Some((ia, im)), Some((oa, om))) => {
+                                                    self.configuring_slot = slot_id as u8;
+                                                    self.configure_endpoints(slot_id as u8, ia, im, oa, om);
+                                                }
+                                                _ => {
+                                                    serial_println!("xHCI: Mass storage missing bulk endpoints (in={:?}, out={:?}); skipping device.", bulk_in, bulk_out);
+                                                    self.start_next_port();
+                                                }
+                                            }
                                         }
                                     }
                                 }
                                 }
                             } else if endpoint_id > 1 && slot_id > 0 { // Non-EP0 Transfer Event
+                                // Bulk-Only Transport routing: if a BOT transaction is in
+                                // flight on this slot's bulk endpoints, hand the completion to
+                                // the synchronous pump. The CSW is matched by its TRB address so
+                                // it is never confused with a data-stage event; any error
+                                // completion also finishes the transaction (for stall handling).
+                                if let Some(p) = self.bot_pending {
+                                    if p.slot_id == slot_id as u8
+                                        && (endpoint_id as u8 == p.in_dci || endpoint_id as u8 == p.out_dci)
+                                    {
+                                        let is_csw = param == p.csw_trb_phys;
+                                        let is_error = completion_code != 1 && completion_code != 13;
+                                        if is_csw || is_error {
+                                            if let Some(bp) = self.bot_pending.as_mut() {
+                                                bp.completion_code = completion_code as u8;
+                                                bp.transfer_len = transfer_len;
+                                                bp.done = true;
+                                            }
+                                        }
+                                        return; // consumed by the BOT pump
+                                    }
+                                }
                                 unsafe {
                                     let slot = &self.slots[slot_id as usize];
-                                    
+
                                     // Compute expected DCI for mouse and keyboard
                                     let mouse_dci = if slot.is_mouse && slot.mouse_ep != 0 {
                                         let ep_num = slot.mouse_ep & 0x0F;
@@ -654,20 +855,9 @@ impl XhciController {
                                             
                                             self.queue_keyboard_read(slot_id as u8);
                                         }
-                                    } else if let Some(data_buf_ptr) = slot.data_buffer {
-                                        // --- BULK IN (Mass Storage SCSI Read) ---
-                                        let data_data = core::slice::from_raw_parts(data_buf_ptr, 512);
-                                        serial_println!("xHCI: >>> BULK IN TRANSFER COMPLETE (SCSI Read) <<<");
-                                        let sig = core::str::from_utf8(&data_data[0..21]).unwrap_or("INVALID");
-                                        serial_println!("xHCI: SECTOR 0 SIGNATURE: {}", sig);
-
-                                        if sig == "UNA-OS-DISK-001-ALPHA" {
-                                            serial_println!("xHCI: >>> MISSION SUCCESS. TARGET ACQUIRED. <<<");
-                                        } else {
-                                            serial_println!("xHCI: >>> SIGNATURE MISMATCH <<<");
-                                        }
-                                        serial_println!(">>> DISK READ COMPLETE <<<");
                                     }
+                                    // Bulk (mass storage) completions are handled above via
+                                    // bot_pending and never reach here.
                                 }
                             }
                         }
@@ -677,44 +867,6 @@ impl XhciController {
                             trb_type, param, status);
                     }
                 }
-
-                // --- THE ACKNOWLEDGEMENT ---
-                // We must update the ERDP (Event Ring Dequeue Pointer) to the NEW index.
-                // ERDP Register is at RuntimeBase + 0x20 (IR0) + 0x18.
-                // Note: We calculated IR0 Base in init_interrupter, but we need it here.
-                // For now, re-calculate or store it. Let's re-calc for safety/statelessness.
-                unsafe {
-                    let rtsoff_ptr = (self.base_addr + 0x18) as *const u32;
-                    let rtsoff = core::ptr::read_volatile(rtsoff_ptr) & !0x1F;
-                    let ir0_base = self.base_addr + rtsoff as usize + 0x20;
-
-                    // Calculate physical address of the current Dequeue Pointer
-                    // We need the address of the *next* slot (which ring.dequeue_index now points to)
-                    // Assumption: ring.get_ptr() returns the base address of the array.
-                    // Each TRB is 16 bytes.
-                    // We explicitly cast to u64 to avoid overflow.
-
-                    if EVENT_RING_PHYS_BASE == 0 {
-                        serial_println!("xHCI: PANIC - EVENT_RING_PHYS_BASE is 0!");
-                        loop { core::hint::spin_loop(); }
-                    }
-
-                    // UNA-19-MATH: Ensure we add the physical base to the offset!
-                    let segment_base = EVENT_RING_PHYS_BASE;
-                    let offset = ring.dequeue_index as u64 * 16;
-                    let new_dequeue_ptr = segment_base + offset;
-
-                    // Write ERDP.
-                    // Bit 3 is "Event Handler Busy" (EHB). Writing 1 clears it.
-                    // We OR in 8 (1000 binary) to clear the busy flag.
-                    let erdp_reg = (ir0_base + 0x18) as *mut u64;
-                    core::ptr::write_volatile(erdp_reg, new_dequeue_ptr | 8);
-
-                    serial_println!("xHCI: ERDP Advanced to {:#x}", new_dequeue_ptr);
-                }
-            } // Close if let Some(trb)
-        }
-        command_completed
     }
 
     pub fn read_version(&self) -> u16 {
@@ -736,24 +888,16 @@ impl XhciController {
             core::ptr::write_volatile(usbcmd_ptr, cmd | 2);
 
             // POLL: Wait for HCRST (Bit 1) to clear (hardware clears it when done)
-            loop {
-                let current_cmd = core::ptr::read_volatile(usbcmd_ptr);
-                if (current_cmd & 2) == 0 {
-                    break;
-                }
-                core::hint::spin_loop();
-            }
+            let _ = wait_until(
+                || (core::ptr::read_volatile(usbcmd_ptr) & 2) == 0,
+                HW_WAIT_SPINS, "USBCMD.HCRST=0 (reset)");
             serial_println!("xHCI: Reset Complete.");
 
             // POLL: Wait for CNR (Controller Not Ready, Bit 11 in USBSTS) to clear
             // The controller needs time to re-initialize after reset.
-            loop {
-                let status = core::ptr::read_volatile(usbsts_ptr);
-                if (status & (1 << 11)) == 0 {
-                    break;
-                }
-                core::hint::spin_loop();
-            }
+            let _ = wait_until(
+                || (core::ptr::read_volatile(usbsts_ptr) & (1 << 11)) == 0,
+                HW_WAIT_SPINS, "USBSTS.CNR=0");
             serial_println!("xHCI: Controller Ready.");
         }
     }
@@ -835,6 +979,14 @@ impl XhciController {
 
     pub fn start(&mut self) {
         unsafe {
+            // Program CONFIG.MaxSlotsEn (op_base + 0x38, bits 7:0) BEFORE Run, while the
+            // controller is still halted. Without this the controller has zero usable
+            // device slots and every Enable Slot command fails.
+            let config_ptr = (self.op_base + 0x38) as *mut u32;
+            let config = core::ptr::read_volatile(config_ptr);
+            core::ptr::write_volatile(config_ptr, (config & !0xFF) | (self.max_slots as u32));
+            serial_println!("xHCI: CONFIG register set to {} (MaxSlotsEn).", self.max_slots);
+
             // Write 1 to USBCMD.RS (Run/Stop)
             let usbcmd_ptr = self.op_base as *mut u32;
             let cmd = core::ptr::read_volatile(usbcmd_ptr);
@@ -842,26 +994,22 @@ impl XhciController {
 
             // Wait until USBSTS.HCH (Halted) is 0
             let usbsts_ptr = (self.op_base + 0x04) as *const u32;
-            loop {
-                let status = core::ptr::read_volatile(usbsts_ptr);
-                if (status & 1) == 0 {
-                    break;
-                }
-                core::hint::spin_loop();
-            }
+            let _ = wait_until(
+                || (core::ptr::read_volatile(usbsts_ptr) & 1) == 0,
+                HW_WAIT_SPINS, "USBSTS.HCH=0 (run)");
             serial_println!("xHCI: Controller Started!");
 
-            // Power on all ports
-            // MaxPorts is in HCSPARAMS1 (Offset 0x04 from CapBase)
-            let hcsparams1_ptr = (self.base_addr + 0x04) as *const u32;
-            let max_ports = (core::ptr::read_volatile(hcsparams1_ptr) & 0xFF) as u8;
+            // Power on all ports. Use the REAL MaxPorts (HCSPARAMS1 bits 24:31),
+            // captured as self.max_ports. The previous code read bits 0:7, which is
+            // MaxSlots (64 here) — powering 64 nonexistent ports.
+            let max_ports = self.max_ports;
             serial_println!("xHCI: Max Ports = {}", max_ports);
 
             for i in 1..=max_ports {
                 let port_offset = 0x400 + (i as usize - 1) * 0x10;
                 let portsc_ptr = (self.op_base + port_offset) as *mut u32;
                 let status = core::ptr::read_volatile(portsc_ptr);
-                
+
                 // Bit 9: PP (Port Power)
                 if (status & (1 << 9)) == 0 {
                     serial_println!("xHCI: Powering on Port {}", i);
@@ -871,18 +1019,49 @@ impl XhciController {
                 }
             }
 
-            // After powering on, manually trigger handle_port_change for any already connected devices
-            for i in 1..=max_ports {
+            // Collect every connected port and enumerate them ONE AT A TIME. Push in
+            // reverse so the queue pops in ascending port order.
+            self.ports_to_enumerate.clear();
+            for i in (1..=max_ports).rev() {
                 let port_offset = 0x400 + (i as usize - 1) * 0x10;
                 let portsc_ptr = (self.op_base + port_offset) as *const u32;
                 let status = core::ptr::read_volatile(portsc_ptr);
-                
-                if (status & 1) != 0 || (status & (1 << 17)) != 0 {
-                    serial_println!("xHCI DEBUG: Port {} matched! Calling handle_port_change. Status: {:#x}", i, status);
-                    self.handle_port_change(i);
+
+                // Bit 0: CCS (Current Connect Status)
+                if (status & 1) != 0 {
+                    serial_println!("xHCI: Port {} connected (Status: {:#x}); queued for enumeration.", i, status);
+                    self.ports_to_enumerate.push(i);
                 }
             }
         }
+
+        // Kick off enumeration of the first connected port (outside the unsafe block).
+        self.start_next_port();
+    }
+
+    /// Begin enumerating the next queued connected port. Called at boot and again each
+    /// time a device finishes its setup, so at most one port is mid-enumeration.
+    fn start_next_port(&mut self) {
+        while let Some(port) = self.ports_to_enumerate.pop() {
+            let portsc = self.read_portsc(port);
+            if (portsc & 1) == 0 {
+                serial_println!("xHCI: Port {} no longer connected; skipping.", port);
+                continue;
+            }
+            serial_println!("xHCI: === Enumerating Port {} (PORTSC={:#x}) ===", port, portsc);
+            // Bit 1: PED (Port Enabled/Disabled).
+            if (portsc & 2) != 0 {
+                // Already enabled (typical for SuperSpeed): request a slot directly.
+                serial_println!("xHCI: Port {} already enabled; requesting slot.", port);
+                self.enable_slot(port);
+            } else {
+                // Needs a USB reset first; the Port Reset Change event drives enable_slot.
+                serial_println!("xHCI: Port {} requires reset before enable.", port);
+                self.handle_port_change(port);
+            }
+            return;
+        }
+        serial_println!("xHCI: Port enumeration queue drained.");
     }
 
     fn handle_port_change(&self, port_id: u8) {
@@ -1004,13 +1183,9 @@ impl XhciController {
 
             // POLL: Wait for HCHalted (Bit 0 in Status) to CLEAR.
             // This confirms the hardware is executing.
-            loop {
-                let status = core::ptr::read_volatile(usbsts_ptr);
-                if (status & 1) == 0 {
-                    break;
-                }
-                core::hint::spin_loop();
-            }
+            let _ = wait_until(
+                || (core::ptr::read_volatile(usbsts_ptr) & 1) == 0,
+                HW_WAIT_SPINS, "USBSTS.HCH=0 (run)");
             serial_println!("xHCI: ENGINE RUNNING (HCHalted cleared).");
         }
     }
@@ -1094,15 +1269,23 @@ impl XhciController {
 
             if let Err(e) = self.send_command(trb) {
                 serial_println!("xHCI: Failed to send Address Device command: {}", e);
-            } else {
-                self.configuring_slot = slot_id;
             }
+            // NOTE: do NOT set `configuring_slot` here. That field marks an in-flight
+            // Configure-Endpoint command; setting it on Address Device made the Address
+            // Device completion be misdispatched as "endpoints configured", which jumped
+            // straight to SCSI read (skipping device-descriptor + endpoint setup) and
+            // panicked on an unallocated data_buffer. The Address Device completion now
+            // correctly falls through to request_device_descriptor().
         }
     }
 
-    pub fn configure_endpoints(&mut self, slot_id: u8) {
+    pub fn configure_endpoints(&mut self, slot_id: u8, in_addr: u8, in_mps: u16, out_addr: u8, out_mps: u16) {
         unsafe {
-            serial_println!("xHCI: UNA-21 Configuring Endpoints for Slot {}...", slot_id);
+            // DCI = endpoint_number * 2 + (1 for IN, 0 for OUT).
+            let in_dci = ((in_addr & 0x0F) * 2) + 1;
+            let out_dci = (out_addr & 0x0F) * 2;
+            serial_println!("xHCI: Configuring Bulk Endpoints for Slot {} (IN {:#x} dci{} mps{}, OUT {:#x} dci{} mps{})...",
+                slot_id, in_addr, in_dci, in_mps, out_addr, out_dci, out_mps);
 
             // 1. GET POINTERS
             let slot = &mut self.slots[slot_id as usize];
@@ -1118,14 +1301,21 @@ impl XhciController {
             let bulk_out_phys = bulk_out_ring.get_ptr();
             slot.bulk_out_ring = Some(bulk_out_ring);
 
+            // Dedicated DMA buffers for Bulk-Only Transport (CBW / data / CSW).
+            let cbw_layout = core::alloc::Layout::from_size_align(64, 64).unwrap();
+            slot.cbw_buffer = Some(alloc::alloc::alloc_zeroed(cbw_layout));
+            let csw_layout = core::alloc::Layout::from_size_align(64, 64).unwrap();
+            slot.csw_buffer = Some(alloc::alloc::alloc_zeroed(csw_layout));
             let data_layout = core::alloc::Layout::from_size_align(512, 64).unwrap();
-            slot.data_buffer = Some(alloc::alloc::alloc_zeroed(data_layout));
+            slot.scsi_data_buffer = Some(alloc::alloc::alloc_zeroed(data_layout));
+            slot.bulk_in_ep = in_addr;
+            slot.bulk_out_ep = out_addr;
 
             // 2. CLEAR INPUT CONTEXT (Safety first)
             core::ptr::write_bytes(base_ptr as *mut u8, 0, 1056);
 
-            // 3. INPUT CONTROL CONTEXT (Offset 0x00)
-            base_ptr.add(1).write_volatile(0x18);
+            // 3. INPUT CONTROL CONTEXT (Offset 0x00): A0 (slot context) + both bulk DCIs.
+            base_ptr.add(1).write_volatile(1u32 | (1 << in_dci) | (1 << out_dci));
 
             // 4. SLOT CONTEXT (Offset 0x20 -> Index 8)
             let slot_ctx_ptr = base_ptr.add(8);
@@ -1134,24 +1324,26 @@ impl XhciController {
                 let val = core::ptr::read_volatile((output_ctx_virt as *const u32).add(i));
                 slot_ctx_ptr.add(i).write_volatile(val);
             }
-            // Update Context Entries = 5 (Bits 27:31)
+            // Update Context Entries (Bits 27:31) to the highest DCI in use.
+            let max_dci = in_dci.max(out_dci) as u32;
             let old_dw0 = slot_ctx_ptr.add(0).read_volatile();
-            let new_dw0 = (old_dw0 & !(0x1F << 27)) | (5 << 27);
+            let new_dw0 = (old_dw0 & !(0x1F << 27)) | (max_dci << 27);
             slot_ctx_ptr.add(0).write_volatile(new_dw0);
 
-            // 5. ENDPOINT 1 IN (Index 3) -> Offset 0x60
-            let ep1_in_ptr = base_ptr.add(24);
-            ep1_in_ptr.add(1).write_volatile((6 << 3) | (3 << 1) | (512 << 16));
-            ep1_in_ptr.add(2).write_volatile((bulk_in_phys as u32) | 1);
-            ep1_in_ptr.add(3).write_volatile((bulk_in_phys >> 32) as u32);
-            ep1_in_ptr.add(4).write_volatile(512);
+            // 5. BULK IN endpoint context. The DCI-th endpoint context lives at u32
+            //    index 16 + (DCI - 1) * 8 in the input context.
+            let ep_in_ptr = base_ptr.add(16 + ((in_dci as usize - 1) * 8));
+            ep_in_ptr.add(1).write_volatile((6 << 3) | (3 << 1) | ((in_mps as u32) << 16)); // EP Type 6 (Bulk IN), CErr 3
+            ep_in_ptr.add(2).write_volatile((bulk_in_phys as u32) | 1);
+            ep_in_ptr.add(3).write_volatile((bulk_in_phys >> 32) as u32);
+            ep_in_ptr.add(4).write_volatile(in_mps as u32);
 
-            // 6. ENDPOINT 2 OUT (Index 4) -> Offset 0x80
-            let ep2_out_ptr = base_ptr.add(32);
-            ep2_out_ptr.add(1).write_volatile((2 << 3) | (3 << 1) | (512 << 16));
-            ep2_out_ptr.add(2).write_volatile((bulk_out_phys as u32) | 1);
-            ep2_out_ptr.add(3).write_volatile((bulk_out_phys >> 32) as u32);
-            ep2_out_ptr.add(4).write_volatile(512);
+            // 6. BULK OUT endpoint context.
+            let ep_out_ptr = base_ptr.add(16 + ((out_dci as usize - 1) * 8));
+            ep_out_ptr.add(1).write_volatile((2 << 3) | (3 << 1) | ((out_mps as u32) << 16)); // EP Type 2 (Bulk OUT), CErr 3
+            ep_out_ptr.add(2).write_volatile((bulk_out_phys as u32) | 1);
+            ep_out_ptr.add(3).write_volatile((bulk_out_phys >> 32) as u32);
+            ep_out_ptr.add(4).write_volatile(out_mps as u32);
 
             serial_println!("xHCI: Input Context Configured for Bulk Transport.");
 
@@ -1167,13 +1359,312 @@ impl XhciController {
             }
         }
     }
+    /// Build a 31-byte CBW into `cbw_buf` for a Bulk-Only Transport command; returns the tag.
+    fn build_cbw(&mut self, cbw_buf: *mut u8, data_len: u32, dir: Direction, cdb: &[u8]) -> u32 {
+        unsafe {
+            let tag = self.bot_tag;
+            self.bot_tag = self.bot_tag.wrapping_add(1);
+            core::ptr::write_bytes(cbw_buf, 0, 31);
+            // dCBWSignature = "USBC" (0x43425355), little-endian on the wire.
+            *cbw_buf.add(0) = 0x55; *cbw_buf.add(1) = 0x53; *cbw_buf.add(2) = 0x42; *cbw_buf.add(3) = 0x43;
+            // dCBWTag
+            *cbw_buf.add(4) = tag as u8;
+            *cbw_buf.add(5) = (tag >> 8) as u8;
+            *cbw_buf.add(6) = (tag >> 16) as u8;
+            *cbw_buf.add(7) = (tag >> 24) as u8;
+            // dCBWDataTransferLength
+            *cbw_buf.add(8) = data_len as u8;
+            *cbw_buf.add(9) = (data_len >> 8) as u8;
+            *cbw_buf.add(10) = (data_len >> 16) as u8;
+            *cbw_buf.add(11) = (data_len >> 24) as u8;
+            // bmCBWFlags: 0x80 = device->host (IN), else 0x00
+            *cbw_buf.add(12) = if dir == Direction::In { 0x80 } else { 0x00 };
+            *cbw_buf.add(13) = 0; // bCBWLUN
+            *cbw_buf.add(14) = cdb.len() as u8; // bCBWCBLength
+            for (i, b) in cdb.iter().enumerate().take(16) {
+                *cbw_buf.add(15 + i) = *b;
+            }
+            tag
+        }
+    }
+
+    /// Execute a synchronous Bulk-Only Transport transaction: CBW -> (optional data) -> CSW.
+    /// MUST be called from a non-event context (controller lock held, event ring free) such
+    /// as the main loop or a shell command — never from inside handle_event_trb.
+    pub fn bot_transfer(&mut self, slot_id: u8, cdb: &[u8], data_phys: u64, data_len: u32, dir: Direction)
+        -> Result<BotResult, BotError>
+    {
+        let (cbw_phys, csw_phys, in_addr, out_addr) = {
+            let slot = &self.slots[slot_id as usize];
+            let cbw = match slot.cbw_buffer { Some(p) => p as u64, None => return Err(BotError::NoDevice) };
+            let csw = match slot.csw_buffer { Some(p) => p as u64, None => return Err(BotError::NoDevice) };
+            (cbw, csw, slot.bulk_in_ep, slot.bulk_out_ep)
+        };
+        if in_addr == 0 || out_addr == 0 { return Err(BotError::NoDevice); }
+        let in_dci = ((in_addr & 0x0F) * 2) + 1;
+        let out_dci = (out_addr & 0x0F) * 2;
+
+        let tag = self.build_cbw(cbw_phys as *mut u8, data_len, dir, cdb);
+        unsafe { core::ptr::write_bytes(csw_phys as *mut u8, 0, 13); }
+
+        // 1) CBW on bulk OUT (Normal TRB, 31 bytes, no IOC).
+        self.slots[slot_id as usize].bulk_out_ring.as_mut().unwrap()
+            .push(Trb { parameter: cbw_phys, status: 31, control: 1 << 10 }).ok();
+
+        // 2) Data stage (no IOC; a short packet is reflected in the CSW residue).
+        match dir {
+            Direction::In if data_len > 0 => {
+                self.slots[slot_id as usize].bulk_in_ring.as_mut().unwrap()
+                    .push(Trb { parameter: data_phys, status: data_len, control: 1 << 10 }).ok();
+            }
+            Direction::Out if data_len > 0 => {
+                self.slots[slot_id as usize].bulk_out_ring.as_mut().unwrap()
+                    .push(Trb { parameter: data_phys, status: data_len, control: 1 << 10 }).ok();
+            }
+            _ => {}
+        }
+
+        // 3) CSW on bulk IN (13 bytes, IOC). Capture its TRB physical address so the
+        //    completion event is matched unambiguously.
+        let csw_trb_phys = {
+            let ring = self.slots[slot_id as usize].bulk_in_ring.as_mut().unwrap();
+            let base = ring.get_ptr();
+            let idx = ring.push(Trb { parameter: csw_phys, status: 13, control: (1 << 10) | (1 << 5) }).unwrap_or(0);
+            base + (idx as u64) * 16
+        };
+
+        // 4) Doorbells: OUT first (fetch CBW), then IN (data + CSW).
+        self.ring_doorbell(slot_id, out_dci as u32);
+        self.ring_doorbell(slot_id, in_dci as u32);
+
+        // 5) Arm pending state and pump the event ring until the CSW arrives.
+        self.bot_pending = Some(BotPending {
+            slot_id, in_dci, out_dci, csw_trb_phys,
+            done: false, completion_code: 0, transfer_len: 0,
+        });
+        let pump = self.pump_until_bot_done(50_000_000);
+        let pending = self.bot_pending.take();
+        pump?;
+        let p = pending.ok_or(BotError::Timeout)?;
+
+        if p.completion_code != 1 && p.completion_code != 13 {
+            serial_println!("xHCI: BOT transfer error, completion code {}", p.completion_code);
+            return if p.completion_code == 4 || p.completion_code == 6 {
+                Err(BotError::Stall)
+            } else {
+                Err(BotError::TransferError(p.completion_code))
+            };
+        }
+
+        // 6) Validate the CSW.
+        unsafe {
+            let csw = core::slice::from_raw_parts(csw_phys as *const u8, 13);
+            let sig = (csw[0] as u32) | ((csw[1] as u32) << 8) | ((csw[2] as u32) << 16) | ((csw[3] as u32) << 24);
+            let csw_tag = (csw[4] as u32) | ((csw[5] as u32) << 8) | ((csw[6] as u32) << 16) | ((csw[7] as u32) << 24);
+            let residue = (csw[8] as u32) | ((csw[9] as u32) << 8) | ((csw[10] as u32) << 16) | ((csw[11] as u32) << 24);
+            let bstatus = csw[12];
+
+            if sig != 0x53425355 {
+                serial_println!("xHCI: BOT bad CSW signature {:#x}", sig);
+                return Err(BotError::BadCswSignature);
+            }
+            if csw_tag != tag {
+                serial_println!("xHCI: BOT CSW tag mismatch (got {:#x}, want {:#x})", csw_tag, tag);
+                return Err(BotError::TagMismatch);
+            }
+            let status = match bstatus {
+                0 => CswStatus::Passed, 1 => CswStatus::Failed,
+                2 => CswStatus::PhaseError, _ => CswStatus::Unknown,
+            };
+            Ok(BotResult { status, residue })
+        }
+    }
+
+    /// Pump the event ring until the in-flight BOT transaction reports done, or the
+    /// iteration budget is exhausted. Unrelated events (HID input, command completions)
+    /// are dispatched normally during the wait.
+    fn pump_until_bot_done(&mut self, max_iters: u64) -> Result<(), BotError> {
+        let mut iters: u64 = 0;
+        loop {
+            match &self.bot_pending {
+                Some(p) if p.done => return Ok(()),
+                None => return Ok(()),
+                _ => {}
+            }
+            self.drain_event_ring_once();
+            iters += 1;
+            if iters >= max_iters {
+                serial_println!("xHCI: BOT pump TIMEOUT");
+                return Err(BotError::Timeout);
+            }
+            core::hint::spin_loop();
+        }
+    }
+
+    /// Physical address of the storage slot's SCSI data buffer.
+    fn storage_data_phys(&self, slot: u8) -> Result<u64, BotError> {
+        self.slots[slot as usize].scsi_data_buffer.map(|p| p as u64).ok_or(BotError::NoDevice)
+    }
+
+    /// SCSI TEST UNIT READY (0x00), no data.
+    fn scsi_test_unit_ready(&mut self, slot: u8) -> Result<CswStatus, BotError> {
+        let cdb = [0u8; 6];
+        Ok(self.bot_transfer(slot, &cdb, 0, 0, Direction::None)?.status)
+    }
+
+    /// SCSI REQUEST SENSE (0x03), 18 bytes — used to clear a CHECK CONDITION.
+    fn scsi_request_sense(&mut self, slot: u8) -> Result<(), BotError> {
+        let data_phys = self.storage_data_phys(slot)?;
+        let cdb = [0x03, 0, 0, 0, 18, 0];
+        self.bot_transfer(slot, &cdb, data_phys, 18, Direction::In)?;
+        Ok(())
+    }
+
+    /// SCSI INQUIRY (0x12), 36 bytes. Returns (vendor[8], product[16]).
+    fn scsi_inquiry(&mut self, slot: u8) -> Result<([u8; 8], [u8; 16]), BotError> {
+        let data_phys = self.storage_data_phys(slot)?;
+        let cdb = [0x12, 0, 0, 0, 36, 0];
+        self.bot_transfer(slot, &cdb, data_phys, 36, Direction::In)?;
+        let mut vendor = [0u8; 8];
+        let mut product = [0u8; 16];
+        unsafe {
+            let d = core::slice::from_raw_parts(data_phys as *const u8, 36);
+            vendor.copy_from_slice(&d[8..16]);
+            product.copy_from_slice(&d[16..32]);
+        }
+        Ok((vendor, product))
+    }
+
+    /// SCSI READ CAPACITY(10) (0x25), 8 bytes BE. Returns (block_size, last_lba).
+    fn scsi_read_capacity10(&mut self, slot: u8) -> Result<(u32, u32), BotError> {
+        let data_phys = self.storage_data_phys(slot)?;
+        let cdb = [0x25, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        self.bot_transfer(slot, &cdb, data_phys, 8, Direction::In)?;
+        unsafe {
+            let d = core::slice::from_raw_parts(data_phys as *const u8, 8);
+            let last_lba = ((d[0] as u32) << 24) | ((d[1] as u32) << 16) | ((d[2] as u32) << 8) | (d[3] as u32);
+            let block_size = ((d[4] as u32) << 24) | ((d[5] as u32) << 16) | ((d[6] as u32) << 8) | (d[7] as u32);
+            Ok((block_size, last_lba))
+        }
+    }
+
+    /// SCSI READ(10) (0x28) of `blocks` blocks at `lba` into the storage data buffer.
+    fn scsi_read10(&mut self, slot: u8, lba: u32, blocks: u16) -> Result<BotResult, BotError> {
+        let data_phys = self.storage_data_phys(slot)?;
+        let len = (blocks as u32) * 512;
+        let cdb = [0x28, 0,
+            (lba >> 24) as u8, (lba >> 16) as u8, (lba >> 8) as u8, lba as u8,
+            0, (blocks >> 8) as u8, blocks as u8, 0];
+        self.bot_transfer(slot, &cdb, data_phys, len, Direction::In)
+    }
+
+    /// SCSI WRITE(10) (0x2A) of `blocks` blocks at `lba` from the storage data buffer.
+    fn scsi_write10(&mut self, slot: u8, lba: u32, blocks: u16) -> Result<BotResult, BotError> {
+        let data_phys = self.storage_data_phys(slot)?;
+        let len = (blocks as u32) * 512;
+        let cdb = [0x2A, 0,
+            (lba >> 24) as u8, (lba >> 16) as u8, (lba >> 8) as u8, lba as u8,
+            0, (blocks >> 8) as u8, blocks as u8, 0];
+        self.bot_transfer(slot, &cdb, data_phys, len, Direction::Out)
+    }
+
+    // ---- Public storage API used by the block layer / shell ----
+
+    /// Pointer to the storage slot's data buffer (one block).
+    pub fn storage_data_ptr(&self) -> Option<*mut u8> {
+        if self.storage_slot == 0 { return None; }
+        self.slots[self.storage_slot as usize].scsi_data_buffer
+    }
+
+    /// READ(10) into the storage data buffer for the cached storage slot.
+    pub fn storage_read10(&mut self, lba: u32, blocks: u16) -> Result<BotResult, BotError> {
+        let slot = self.storage_slot;
+        if slot == 0 { return Err(BotError::NoDevice); }
+        self.scsi_read10(slot, lba, blocks)
+    }
+
+    /// WRITE(10) from the storage data buffer for the cached storage slot.
+    pub fn storage_write10(&mut self, lba: u32, blocks: u16) -> Result<BotResult, BotError> {
+        let slot = self.storage_slot;
+        if slot == 0 { return Err(BotError::NoDevice); }
+        self.scsi_write10(slot, lba, blocks)
+    }
+
+    /// Full SCSI bring-up: TEST UNIT READY (with retry) -> INQUIRY -> READ CAPACITY,
+    /// then publish geometry to the block-device registry.
+    fn bring_up_storage(&mut self) -> Result<(), BotError> {
+        let slot = self.storage_slot;
+        if slot == 0 { return Err(BotError::NoDevice); }
+
+        // TEST UNIT READY — USB sticks often report "becoming ready" a few times.
+        for attempt in 0..16 {
+            match self.scsi_test_unit_ready(slot) {
+                Ok(CswStatus::Passed) => break,
+                Ok(_) => { let _ = self.scsi_request_sense(slot); }
+                Err(e) => { serial_println!("xHCI: TUR error {:?} (attempt {})", e, attempt); }
+            }
+        }
+
+        let (vendor, product) = self.scsi_inquiry(slot)?;
+        let (block_size, last_lba) = self.scsi_read_capacity10(slot)?;
+        let num_blocks = last_lba as u64 + 1;
+
+        let vendor_s = core::str::from_utf8(&vendor).unwrap_or("?").trim_end();
+        let product_s = core::str::from_utf8(&product).unwrap_or("?").trim_end();
+        serial_println!("xHCI: Disk '{}' '{}' block_size={} num_blocks={} ({} MiB)",
+            vendor_s, product_s, block_size, num_blocks,
+            (num_blocks * block_size as u64) / (1024 * 1024));
+
+        *crate::drivers::block::BLOCK_DEVICE.lock() = Some(crate::drivers::block::BlockDeviceInfo {
+            slot_id: slot, block_size, num_blocks, vendor, product,
+        });
+        Ok(())
+    }
+
+    /// Main-loop hook: once storage finishes configuring, run the SCSI bring-up (in a
+    /// safe, non-event context) and publish the block device. Also does a one-time
+    /// sanity read of LBA 0.
+    pub fn service_storage(&mut self) {
+        if !self.storage_pending_bringup { return; }
+        self.storage_pending_bringup = false;
+        if self.storage_slot == 0 { return; }
+
+        serial_println!("xHCI: === STORAGE BRING-UP (TUR/INQUIRY/READ CAPACITY) ===");
+        match self.bring_up_storage() {
+            Ok(()) => serial_println!("xHCI: storage ready."),
+            Err(e) => { serial_println!("xHCI: storage bring-up failed: {:?}", e); return; }
+        }
+
+        // Sanity read of LBA 0.
+        match self.storage_read10(0, 1) {
+            Ok(res) => {
+                serial_println!("xHCI: READ(10) LBA0 CSW status={:?} residue={}", res.status, res.residue);
+                if let Some(p) = self.storage_data_ptr() {
+                    unsafe {
+                        let data = core::slice::from_raw_parts(p as *const u8, 512);
+                        let sig = core::str::from_utf8(&data[0..21]).unwrap_or("INVALID");
+                        serial_println!("xHCI: SECTOR 0 SIGNATURE: {}", sig);
+                        if sig == "UNA-OS-DISK-001-ALPHA" {
+                            serial_println!("xHCI: >>> MISSION SUCCESS (BOT + CSW). TARGET ACQUIRED. <<<");
+                        }
+                    }
+                }
+            }
+            Err(e) => serial_println!("xHCI: READ(10) LBA0 failed: {:?}", e),
+        }
+    }
+
     pub fn send_scsi_read(&mut self, slot_id: u8) {
         unsafe {
             serial_println!("xHCI: UNA-21 Initiating SCSI Read (Sector 0)...");
 
             let (desc_phys, data_phys, cbw_ptr) = {
                 let slot = &self.slots[slot_id as usize];
-                (slot.descriptor_buffer as u64, slot.data_buffer.unwrap() as u64, slot.descriptor_buffer)
+                let Some(data_buf) = slot.data_buffer else {
+                    serial_println!("xHCI: send_scsi_read: slot {} has no data_buffer (endpoints not configured); aborting read", slot_id);
+                    return;
+                };
+                (slot.descriptor_buffer as u64, data_buf as u64, slot.descriptor_buffer)
             };
 
             core::ptr::write_bytes(cbw_ptr, 0, 64);

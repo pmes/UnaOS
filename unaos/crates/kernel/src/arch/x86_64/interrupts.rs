@@ -66,9 +66,11 @@ pub fn init_pics() {
         let mut cmd_port = Port::<u8>::new(0x64);
         let mut data_port = Port::<u8>::new(0x60);
 
-        // 1. Flush any pending data
-        while (cmd_port.read() & 1) != 0 {
+        // 1. Flush any pending data (bounded: a wedged 8042 must not hang boot)
+        let mut flush_guard = 0u32;
+        while (cmd_port.read() & 1) != 0 && flush_guard < 256 {
             data_port.read();
+            flush_guard += 1;
         }
 
         // 2. Read Configuration Byte
@@ -82,9 +84,11 @@ pub fn init_pics() {
         cmd_port.write(0x60);
         data_port.write(config);
 
-        // 5. Flush any pending data again
-        while (cmd_port.read() & 1) != 0 {
+        // 5. Flush any pending data again (bounded, same rationale as above)
+        let mut flush_guard2 = 0u32;
+        while (cmd_port.read() & 1) != 0 && flush_guard2 < 256 {
             data_port.read();
+            flush_guard2 += 1;
         }
     }
 }

@@ -67,22 +67,39 @@ fn main() {
     std::fs::copy(&kernel_bin, esp_dir.join("kernel.elf")).unwrap();
 
     println!("🔹 Locating OVMF (x86_64 UEFI Firmware)...");
-    let ovmf_paths = [
+    // Search is additive across platforms: macOS/Homebrew first (where this may run
+    // for fast iteration), then the original Linux locations (unchanged behavior).
+    let ovmf_code_paths = [
+        "/usr/local/share/qemu/edk2-x86_64-code.fd",   // macOS Homebrew (Intel)
+        "/opt/homebrew/share/qemu/edk2-x86_64-code.fd", // macOS Homebrew (Apple Silicon)
         "/usr/share/OVMF/OVMF_CODE.fd",
         "/usr/share/edk2/ovmf/OVMF_CODE.fd",
         "/usr/share/edk2-ovmf/x64/OVMF_CODE.fd",
         "/usr/share/qemu/OVMF.fd",
     ];
+    // Matching writable variable store. Split-firmware setups (macOS Homebrew, modern
+    // Linux) need this as a second pflash unit; if none is found we fall back to a
+    // single read-only code pflash (the original behavior).
+    let ovmf_vars_paths = [
+        "/usr/local/share/qemu/edk2-i386-vars.fd",
+        "/opt/homebrew/share/qemu/edk2-i386-vars.fd",
+        "/usr/share/OVMF/OVMF_VARS.fd",
+        "/usr/share/edk2/ovmf/OVMF_VARS.fd",
+        "/usr/share/edk2-ovmf/x64/OVMF_VARS.fd",
+    ];
 
-    let mut ovmf_path = None;
-    for path in &ovmf_paths {
-        if std::path::Path::new(path).exists() {
-            ovmf_path = Some(*path);
-            break;
-        }
-    }
+    let ovmf_code = ovmf_code_paths.iter().find(|p| std::path::Path::new(p).exists())
+        .copied().expect("CRITICAL ERROR: OVMF code firmware not found.");
 
-    let ovmf_path = ovmf_path.expect("CRITICAL ERROR: OVMF Firmware not found.");
+    // Copy the vars template to a writable per-run location (never write the template).
+    let ovmf_vars = ovmf_vars_paths.iter().find(|p| std::path::Path::new(p).exists()).copied();
+    let vars_writable = ovmf_vars.map(|template| {
+        let dst = target_dir.join("OVMF_VARS.fd");
+        std::fs::copy(template, &dst).expect("Failed to copy OVMF vars template");
+        dst
+    });
+    println!("   code: {}  vars: {}", ovmf_code,
+        vars_writable.as_ref().map(|p| p.display().to_string()).unwrap_or_else(|| "<none>".into()));
 
     // UNA-22-HAUL: Create a phantom drive (64MB)
     let usb_image = workspace_dir.join("builder/usb.img");
@@ -99,10 +116,15 @@ fn main() {
 
     println!("🔹 Launching QEMU...");
     let mut cmd = Command::new("qemu-system-x86_64");
-    
-    cmd.arg("-drive").arg(format!("if=pflash,format=raw,readonly=on,file={}", ovmf_path))
-       .arg("-drive").arg(format!("format=raw,file=fat:rw:{}", esp_dir.display()))
-       .arg("-serial").arg("stdio")
+
+    // Firmware: read-only code pflash (unit 0) + writable vars pflash (unit 1) when a
+    // vars store exists; otherwise a single read-only code pflash (legacy behavior).
+    cmd.arg("-drive").arg(format!("if=pflash,unit=0,format=raw,readonly=on,file={}", ovmf_code));
+    if let Some(ref vars) = vars_writable {
+        cmd.arg("-drive").arg(format!("if=pflash,unit=1,format=raw,file={}", vars.display()));
+    }
+
+    cmd.arg("-drive").arg(format!("format=raw,file=fat:rw:{}", esp_dir.display()))
        .arg("-device").arg("isa-debug-exit,iobase=0xf4,iosize=0x04")
        .arg("-device").arg("qemu-xhci,id=xhci")
        .arg("-drive").arg(format!("if=none,id=stick,format=raw,file={}", usb_image.display()))
@@ -110,6 +132,22 @@ fn main() {
        .arg("-device").arg("usb-tablet,bus=xhci.0")
        .arg("-m").arg("1G");
 
-    let mut child = cmd.spawn().unwrap();
-    child.wait().unwrap();
+    // Test mode: set UNAOS_SERIAL_LOG to run headless, redirect serial to that file, and
+    // self-terminate after UNAOS_TEST_SECS (default 20s). Keeps automated boot-log capture
+    // portable (no `timeout` binary needed). Normal runs keep the GUI + serial on stdio.
+    if let Ok(log_path) = std::env::var("UNAOS_SERIAL_LOG") {
+        let secs: u64 = std::env::var("UNAOS_TEST_SECS").ok()
+            .and_then(|s| s.parse().ok()).unwrap_or(20);
+        println!("   [test mode] headless, serial -> {log_path}, auto-kill after {secs}s");
+        cmd.arg("-display").arg("none")
+           .arg("-serial").arg(format!("file:{log_path}"));
+        let mut child = cmd.spawn().unwrap();
+        std::thread::sleep(std::time::Duration::from_secs(secs));
+        let _ = child.kill();
+        let _ = child.wait();
+    } else {
+        cmd.arg("-serial").arg("stdio");
+        let mut child = cmd.spawn().unwrap();
+        child.wait().unwrap();
+    }
 }
