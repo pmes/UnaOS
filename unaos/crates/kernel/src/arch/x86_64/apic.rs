@@ -200,7 +200,6 @@ pub fn apic_id_u32() -> u32 {
 /// x2APIC issues the whole thing as one 64-bit MSR write (no delivery-status poll exists). xAPIC
 /// writes the destination into ICR-high, then the command into ICR-low (which triggers the
 /// send), then spins on the delivery-status bit.
-#[allow(dead_code)] // used from Phase D (AP startup) onward
 pub fn send_ipi(dest: u32, icr_low: u32) {
     unsafe {
         if x2apic() {

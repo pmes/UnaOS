@@ -17,7 +17,7 @@
 
 use core::sync::atomic::{AtomicU32, Ordering};
 
-use crate::arch::{acpi, apic, gdt, interrupts};
+use crate::arch::{acpi, apic, gdt, interrupts, percpu};
 
 /// Physical page the trampoline is copied to and the AP starts executing at. Must be page-aligned
 /// and < 1 MiB (the SIPI vector is 8 bits: start address = vector << 12). 0x8000 is free
@@ -158,6 +158,10 @@ pub extern "C" fn ap_entry(cpu_index: u64) -> ! {
     apic::init();
 
     let apic_id = apic::apic_id_u32();
+    // Per-CPU data + GS base before enabling interrupts, so this AP's timer/IPI handlers can
+    // resolve `this_cpu()`.
+    percpu::init_cpu(idx, apic_id);
+
     AP_ONLINE.fetch_add(1, Ordering::SeqCst);
     serial_println!("SMP: AP {} online (apic id {}).", idx, apic_id);
 
@@ -231,6 +235,10 @@ pub fn start_aps() {
         apic_ids.len()
     );
 
+    // Logical indices of APs that reported online (BSP is 0, handled separately).
+    let mut online_aps: [usize; gdt::MAX_CPUS] = [0; gdt::MAX_CPUS];
+    let mut n_online = 0usize;
+
     let mut index = 1usize; // logical CPU 0 is the BSP
     for &id in apic_ids {
         if id == bsp_id {
@@ -256,15 +264,18 @@ pub fn start_aps() {
         init_sipi_sipi(id);
 
         // Wait (bounded) for this AP to report in before reusing the handoff slot.
-        let mut online = false;
+        let mut came_online = false;
         for _ in 0..50_000_000u64 {
             if AP_ONLINE.load(Ordering::SeqCst) >= target {
-                online = true;
+                came_online = true;
                 break;
             }
             core::hint::spin_loop();
         }
-        if !online {
+        if came_online {
+            online_aps[n_online] = index;
+            n_online += 1;
+        } else {
             serial_println!("SMP: WARNING: AP apic id {} did not come online (timeout).", id);
         }
 
@@ -276,4 +287,62 @@ pub fn start_aps() {
         AP_ONLINE.load(Ordering::SeqCst) + 1,
         apic_ids.len()
     );
+
+    verify_smp(&online_aps[..n_online]);
+}
+
+/// Post-bring-up smoke test: prove the SMP plumbing actually works. Confirms every core's local
+/// APIC timer is ticking (each CPU has its own per-CPU tick counter) and that each AP answers a
+/// fixed IPI (the cross-CPU wakeup primitive a scheduler will use).
+fn verify_smp(online_aps: &[usize]) {
+    // Let real time pass by waiting for the BSP's own timer to advance several ticks, so the APs'
+    // (earlier-armed) timers have certainly ticked too.
+    let bsp_ticks = percpu::this_cpu();
+    let base = bsp_ticks.ticks.load(Ordering::Relaxed);
+    for _ in 0..200_000_000u64 {
+        if bsp_ticks.ticks.load(Ordering::Relaxed) >= base + 5 {
+            break;
+        }
+        core::hint::spin_loop();
+    }
+
+    // Per-CPU timer: BSP first, then each online AP.
+    serial_println!(
+        "SMP: per-CPU timer — cpu 0 (apic {}) ticks={}",
+        bsp_ticks.apic_id,
+        bsp_ticks.ticks.load(Ordering::Relaxed)
+    );
+    for &i in online_aps {
+        if let Some(c) = percpu::cpu(i) {
+            serial_println!(
+                "SMP: per-CPU timer — cpu {} (apic {}) ticks={}",
+                i,
+                c.apic_id,
+                c.ticks.load(Ordering::Relaxed)
+            );
+        }
+    }
+
+    // IPI round-trip: knock each AP with a fixed IPI and confirm its handler ran.
+    let icr_low = 0x0000_4000 | interrupts::IPI_VECTOR as u32; // fixed delivery, assert, vector
+    for &i in online_aps {
+        let Some(c) = percpu::cpu(i) else { continue };
+        let before = c.ipis.load(Ordering::SeqCst);
+        apic::send_ipi(c.apic_id, icr_low);
+
+        let mut acked = false;
+        for _ in 0..20_000_000u64 {
+            if c.ipis.load(Ordering::SeqCst) > before {
+                acked = true;
+                break;
+            }
+            core::hint::spin_loop();
+        }
+        serial_println!(
+            "SMP: IPI -> cpu {} (apic {}): {}",
+            i,
+            c.apic_id,
+            if acked { "ack" } else { "NO ACK" }
+        );
+    }
 }

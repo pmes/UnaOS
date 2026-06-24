@@ -23,6 +23,9 @@ use x86_64::structures::idt::{InterruptDescriptorTable, InterruptStackFrame, Pag
 /// fires `XHCI_MSI_VECTOR`, and `SPURIOUS_VECTOR` == the APIC SVR low byte.
 pub const TIMER_VECTOR: u8 = 0x20;
 pub const XHCI_MSI_VECTOR: u8 = 0x40;
+/// Inter-processor interrupt vector (reschedule/wake; scheduler foundation). 0x41 is reserved
+/// for the NIC, so IPIs use 0x42.
+pub const IPI_VECTOR: u8 = 0x42;
 pub const SPURIOUS_VECTOR: u8 = 0xFF;
 
 lazy_static! {
@@ -40,6 +43,7 @@ lazy_static! {
         // the xHCI MSI-X interrupter, and the APIC spurious-interrupt vector.
         idt[TIMER_VECTOR].set_handler_fn(timer_interrupt_handler);
         idt[XHCI_MSI_VECTOR].set_handler_fn(xhci_msi_handler);
+        idt[IPI_VECTOR].set_handler_fn(ipi_handler);
         idt[SPURIOUS_VECTOR].set_handler_fn(spurious_handler);
         idt
     };
@@ -97,13 +101,23 @@ extern "x86-interrupt" fn double_fault_handler(
 }
 
 extern "x86-interrupt" fn timer_interrupt_handler(_stack_frame: InterruptStackFrame) {
-    // Local APIC timer tick. Lock-free: bump the heartbeat counter and issue an APIC EOI.
+    // Local APIC timer tick. Lock-free: bump the global heartbeat plus this CPU's own tick
+    // counter (each core's timer fires independently), then issue an APIC EOI.
     let prev = crate::arch::apic::APIC_TICKS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-    // One-shot breadcrumb the very first time the timer fires — confirms the local-APIC timer
-    // path (xAPIC MMIO or x2APIC MSR LVT) is actually delivering, without spamming every tick.
+    crate::arch::percpu::note_tick();
+    // One-shot breadcrumb the very first time any CPU's timer fires — confirms the local-APIC
+    // timer path (xAPIC MMIO or x2APIC MSR LVT) is delivering, without spamming every tick.
     if prev == 0 {
         serial_println!("APIC: heartbeat live (first timer tick).");
     }
+    crate::arch::apic::eoi();
+}
+
+/// Inter-processor interrupt handler (IDT vector `IPI_VECTOR`). Lock-free: record the IPI on
+/// this CPU and EOI. This is the scheduler-wakeup primitive — an IPI knocks a core out of `hlt`
+/// so it can re-check its run queue; for now it just proves cross-CPU signalling works.
+extern "x86-interrupt" fn ipi_handler(_stack_frame: InterruptStackFrame) {
+    crate::arch::percpu::note_ipi();
     crate::arch::apic::eoi();
 }
 
