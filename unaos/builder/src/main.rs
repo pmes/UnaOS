@@ -23,7 +23,8 @@ fn main() {
     let esp_dir = target_dir.join("x86_64_esp");
 
     println!("🔹 Building x86_64 Kernel...");
-    let kernel_status = Command::new("cargo")
+    let mut kernel_cmd = Command::new("cargo");
+    kernel_cmd
         .current_dir(workspace_dir.join("crates/kernel"))
         .arg("+nightly")
         .arg("build")
@@ -31,9 +32,14 @@ fn main() {
         .arg("--target").arg("../../x86_64-unaos.json")
         .arg("-Z").arg("build-std=core,compiler_builtins,alloc")
         .arg("-Z").arg("build-std-features=compiler-builtins-mem")
-        .arg("-Z").arg("json-target-spec")
-        .status()
-        .unwrap();
+        .arg("-Z").arg("json-target-spec");
+    // UNAOS_SKIP_XHCI=1 -> build the kernel with xHCI/USB bring-up disabled (video-only boot
+    // media for real hardware where firmware may still own the controller).
+    if std::env::var("UNAOS_SKIP_XHCI").is_ok() {
+        kernel_cmd.arg("--features").arg("skip_xhci");
+        println!("   (UNAOS_SKIP_XHCI) xHCI bring-up disabled in this build");
+    }
+    let kernel_status = kernel_cmd.status().unwrap();
 
     if !kernel_status.success() {
         panic!("Kernel build failed");

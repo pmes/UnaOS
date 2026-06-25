@@ -4,6 +4,15 @@ version = "0.1.0"
 edition = "2024"
 license = "GPL-3.0-or-later"
 
+[features]
+default = []
+# Skip xHCI/USB bring-up entirely (`pci::init`). For real-hardware video bring-up where the
+# firmware/SMM may still own the xHCI controller (this branch has no BIOS->OS handoff) and wedge
+# its reset handshake — the controller's status bits never flip, so the bounded-but-slow timeout
+# loops stall boot for many seconds before the GUI paints. With this feature the GUI comes up
+# immediately; USB is simply absent (no keyboard). Enable via `UNAOS_SKIP_XHCI=1 ./arroyo ...`.
+skip_xhci = []
+
 [dependencies]
 # FIX: Use 'spin_no_std' to explicitly disable Standard Library usage
 lazy_static = { version = "1.5.0", features = ["spin_no_std"] }

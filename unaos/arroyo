@@ -27,6 +27,15 @@ WORKSPACE_DIR="$(cd "$(dirname "$0")" && pwd)"
 # Build flags shared by both targets
 NIGHTLY_FLAGS="-Z build-std=core,compiler_builtins,alloc -Z build-std-features=compiler-builtins-mem -Z json-target-spec"
 
+# Optional kernel cargo features. UNAOS_SKIP_XHCI=1 builds the kernel with xHCI/USB bring-up
+# disabled — video-only boot for real hardware where firmware may still own the USB controller
+# and stall its reset handshake before the GUI paints. Empty by default (full bring-up).
+KERNEL_FEATURES=""
+if [ -n "${UNAOS_SKIP_XHCI:-}" ]; then
+    KERNEL_FEATURES="--features skip_xhci"
+    echo -e "${COLOR_YELLOW}⚡ UNAOS_SKIP_XHCI set — building kernel WITHOUT xHCI/USB bring-up${COLOR_RESET}"
+fi
+
 # --- Build Functions ---
 
 build_kernel_x86_64() {
@@ -34,7 +43,7 @@ build_kernel_x86_64() {
     cd "$WORKSPACE_DIR/crates/kernel"
     cargo +nightly build --release \
       --target ../../x86_64-unaos.json \
-      $NIGHTLY_FLAGS
+      $NIGHTLY_FLAGS $KERNEL_FEATURES
     cd "$WORKSPACE_DIR"
     echo -e "${COLOR_GREEN}✅ x86_64 Kernel Built.${COLOR_RESET}"
 }
@@ -44,7 +53,7 @@ build_kernel_aarch64() {
     cd "$WORKSPACE_DIR/crates/kernel"
     cargo +nightly build --release \
       --target ../../aarch64-unaos.json \
-      $NIGHTLY_FLAGS
+      $NIGHTLY_FLAGS $KERNEL_FEATURES
     cd "$WORKSPACE_DIR"
     echo -e "${COLOR_GREEN}✅ aarch64 Kernel Built.${COLOR_RESET}"
 }
@@ -184,13 +193,13 @@ check_both() {
     cd "$WORKSPACE_DIR/crates/kernel"
     cargo +nightly check --release \
       --target ../../x86_64-unaos.json \
-      $NIGHTLY_FLAGS
+      $NIGHTLY_FLAGS $KERNEL_FEATURES
     echo -e "${COLOR_GREEN}✅ x86_64 OK${COLOR_RESET}"
 
     echo -e "${COLOR_YELLOW}⚡ Syntax Check: aarch64...${COLOR_RESET}"
     cargo +nightly check --release \
       --target ../../aarch64-unaos.json \
-      $NIGHTLY_FLAGS
+      $NIGHTLY_FLAGS $KERNEL_FEATURES
     cd "$WORKSPACE_DIR"
     echo -e "${COLOR_GREEN}✅ aarch64 OK${COLOR_RESET}"
 }

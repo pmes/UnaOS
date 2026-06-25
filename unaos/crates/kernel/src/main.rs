@@ -48,8 +48,18 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     unaos_kernel::arch::memory::init(boot_info);
     serial_println!(":: KERNEL HEAP ALLOCATED ::");
 
-    // 5. Motherboard Hardware Interconnects
+    // 5. Motherboard Hardware Interconnects (xHCI/USB bring-up).
+    //    Skippable via the `skip_xhci` Cargo feature (UNAOS_SKIP_XHCI=1) so the video stack still
+    //    comes up promptly on real hardware where firmware/SMM may still own the xHCI controller
+    //    (no BIOS->OS handoff on this branch) and never reflect our reset writes — which would
+    //    otherwise stall boot in the bounded timeout loops before the first GUI frame paints.
+    #[cfg(not(feature = "skip_xhci"))]
     unaos_kernel::arch::pci::init(dtb_addr, dtb_size);
+    #[cfg(feature = "skip_xhci")]
+    {
+        let _ = (dtb_addr, dtb_size);
+        serial_println!(":: xHCI bring-up SKIPPED (skip_xhci feature): video only, no USB ::");
+    }
 
     if framebuffer_addr != 0 {
         // Safety: the bootloader passed a valid, identity-mapped framebuffer base address
