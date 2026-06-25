@@ -44,6 +44,37 @@ fn checksum(data: &[u8]) -> u16 {
     !(sum as u16)
 }
 
+/// Write an ICMP echo *request* (type 8) into `out`: type, code, checksum(2),
+/// identifier(2), sequence(2), then `data`. Returns the total length, or `None` if
+/// `out` is too small. The outbound counterpart of [`write_echo_reply`] — used by the
+/// `ping` client to initiate traffic.
+pub fn write_echo_request(out: &mut [u8], ident: u16, seq: u16, data: &[u8]) -> Option<usize> {
+    let len = 8 + data.len();
+    if out.len() < len {
+        return None;
+    }
+    out[0] = ICMP_ECHO_REQUEST; // type 8
+    out[1] = 0; // code
+    out[2..4].copy_from_slice(&0u16.to_be_bytes()); // checksum (zero before computing)
+    out[4..6].copy_from_slice(&ident.to_be_bytes());
+    out[6..8].copy_from_slice(&seq.to_be_bytes());
+    out[8..len].copy_from_slice(data);
+    let csum = checksum(&out[..len]);
+    out[2..4].copy_from_slice(&csum.to_be_bytes());
+    Some(len)
+}
+
+/// Parse an ICMP echo *reply*: returns `(identifier, sequence)` if `msg` is a type-0
+/// echo reply, else `None`. Lets a `ping` client match a reply to a request it sent.
+pub fn parse_echo_reply(msg: &[u8]) -> Option<(u16, u16)> {
+    if msg.len() < 8 || msg[0] != ICMP_ECHO_REPLY {
+        return None;
+    }
+    let ident = u16::from_be_bytes([msg[4], msg[5]]);
+    let seq = u16::from_be_bytes([msg[6], msg[7]]);
+    Some((ident, seq))
+}
+
 /// If `request` is an ICMP echo request, write the corresponding echo reply into
 /// `out` and return its length (same size as the request). Returns `None` if the
 /// message is not an echo request or `out` is too small.

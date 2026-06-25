@@ -54,7 +54,7 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
         "help" => {
             console.println("COMMANDS: ver, help, clear, echo, panic, gneiss");
             console.println("STORAGE:  diskinfo, read <lba>, write <lba> <byte>");
-            console.println("NETWORK:  netinfo");
+            console.println("NETWORK:  netinfo, ping <ip> [count], arp <ip>");
         },
         "clear" => {
             // Clear both the screen and the console buffer?
@@ -137,6 +137,42 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
                 None => console.println("No network device ready."),
             }
         },
+        "ping" => {
+            match args.first().and_then(|s| parse_ipv4(s)) {
+                Some(ip) => {
+                    let count = args.get(1)
+                        .and_then(|s| s.parse::<u16>().ok())
+                        .unwrap_or(4)
+                        .clamp(1, 16);
+                    console.println(&alloc::format!(
+                        "PING {}.{}.{}.{} ({} requests)", ip[0], ip[1], ip[2], ip[3], count));
+                    // Blocks while it ARP-resolves the target and waits for each reply.
+                    match crate::drivers::e1000::ping(ip, count) {
+                        Some(o) if o.resolved => {
+                            let peer = o.mac
+                                .map(|m| crate::drivers::e1000::fmt_mac(&m))
+                                .unwrap_or_default();
+                            console.println(&alloc::format!(
+                                "{}/{} replies received (peer {})", o.received, o.sent, peer));
+                        }
+                        Some(_) => console.println("host unreachable (no ARP reply)"),
+                        None => console.println("No network device ready."),
+                    }
+                }
+                None => console.println("usage: ping <a.b.c.d> [count]"),
+            }
+        },
+        "arp" => {
+            match args.first().and_then(|s| parse_ipv4(s)) {
+                Some(ip) => match crate::drivers::e1000::arp_resolve(ip) {
+                    Some(mac) => console.println(&alloc::format!(
+                        "{}.{}.{}.{} is-at {}",
+                        ip[0], ip[1], ip[2], ip[3], crate::drivers::e1000::fmt_mac(&mac))),
+                    None => console.println("no ARP reply (host unreachable / no NIC)"),
+                },
+                None => console.println("usage: arp <a.b.c.d>"),
+            }
+        },
         "vug" => {
              if args.len() > 0 && args[0] == "bebox" {
                  console.println("Initializing GeekPort Simulation...");
@@ -173,6 +209,25 @@ fn hexdump(console: &mut Console, data: &[u8]) {
         }
         line.push('|');
         console.println(&line);
+    }
+}
+
+/// Parse a dotted-quad IPv4 address (`a.b.c.d`) into 4 octets. Rejects anything that
+/// isn't exactly four decimal octets in 0..=255.
+fn parse_ipv4(s: &str) -> Option<[u8; 4]> {
+    let mut octets = [0u8; 4];
+    let mut count = 0usize;
+    for part in s.split('.') {
+        if count >= 4 {
+            return None;
+        }
+        octets[count] = part.parse::<u8>().ok()?;
+        count += 1;
+    }
+    if count == 4 {
+        Some(octets)
+    } else {
+        None
     }
 }
 

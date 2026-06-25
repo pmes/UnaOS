@@ -33,8 +33,9 @@ use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use spin::Mutex;
 
 use crate::drivers::pci::PciScanner;
-use net::arp::ArpStateMachine;
-use net::ethernet::EthernetFrame;
+use net::arp::{ArpCache, ArpStateMachine};
+use net::ethernet::{EtherType, EthernetFrame};
+use net::ipv4::Ipv4Header;
 
 // --- Register offsets (bytes from BAR0) ---
 const REG_CTRL: u32 = 0x0000; // Device Control
@@ -124,6 +125,32 @@ const DHCP_XID: u32 = 0x554E_414F;
 /// TCP port the built-in echo listener accepts connections on (RFC 862 echo service).
 const TCP_ECHO_PORT: u16 = 7;
 
+/// ICMP identifier stamped on every echo request we originate (the boot self-test and the
+/// `ping` shell command). ASCII "UN". Lets us recognise our own replies.
+const PING_IDENT: u16 = 0x554E;
+/// Payload carried in the echo requests we originate.
+const PING_PAYLOAD: &[u8] = b"unaos-ping";
+
+/// Boot connectivity self-test cadence: act every Nth `service_net` call. The main loop
+/// runs at roughly the APIC-timer rate, so this only needs to be coarse — it spreads probes
+/// out over time so a host responder (slirp gateway, or the socket injector once it
+/// connects) has a chance to answer between them.
+const SELFTEST_STRIDE: u32 = 16;
+/// Give up resolving the gateway after this many ARP attempts (only reached on a truly dead
+/// link — a real responder answers the first request). Bounds dead-network broadcast noise.
+const SELFTEST_ARP_TRIES: u16 = 150;
+/// After the gateway is resolved, send at most this many echo requests before concluding the
+/// link has no ICMP responder (e.g. some slirp configs) and disarming the self-test.
+const SELFTEST_PING_TRIES: u16 = 24;
+
+/// Iterations of `poll()` to pump while a blocking `resolve`/`ping` waits for a reply.
+/// Iteration-bounded rather than wall-clock-bounded to keep this driver arch-neutral (no
+/// clock dependency); a reply on a local link lands long before this is exhausted, and the
+/// bound only caps how long an unreachable target stalls the shell.
+const PUMP_ITERS: u32 = 2_000_000;
+/// ARP requests / per-sequence echo requests a blocking `resolve`/`ping` will attempt.
+const RESOLVE_TRIES: u32 = 3;
+
 /// Legacy receive descriptor (16 bytes). Written by hardware via DMA, so every
 /// access goes through `read_volatile`/`write_volatile` on whole-struct copies —
 /// the struct is `packed`, so taking a reference to a field would be unaligned UB.
@@ -166,6 +193,18 @@ pub struct E1000 {
     arp_state: ArpStateMachine,
     dhcp: net::dhcp::DhcpClient,
     tcp: net::tcp::TcpEcho,
+    /// IP→MAC mappings learned from inbound ARP (and IP frames) — the resolver for outbound.
+    arp_cache: ArpCache,
+    /// `(source IP, identifier, sequence)` of the most recent ICMP echo reply addressed to
+    /// us. Set by [`observe`](Self::observe); consumed by the blocking `ping` and the boot
+    /// self-test, both of which match on the source so a reply from one host can never be
+    /// counted against a probe to a different host (or the gateway).
+    pong: Option<([u8; 4], u16, u16)>,
+    /// Boot connectivity self-test state, driven from `service_net` (gateway ARP + ping).
+    selftest_armed: bool,
+    selftest_counter: u32,
+    selftest_arp_tries: u16,
+    selftest_ping_tries: u16,
 }
 
 // The driver owns raw DMA pointers; it is only ever touched behind `NET_DEVICE`'s
@@ -376,17 +415,19 @@ impl E1000 {
 
     /// Broadcast an ARP request ("who-has `target_ip`"). Exercises the TX path and,
     /// for a target the peer answers (e.g. the slirp gateway), provokes an inbound reply.
+    /// Uses our *current* IP as the sender (which DHCP may have changed from the static one).
     fn send_arp_request(&mut self, target_ip: [u8; 4]) {
+        let our_ip = self.arp_state.our_ip();
         let mut arp = [0u8; 28];
         let mut frame = [0u8; 64];
-        if net::arp::build_request(&mut arp, self.mac, OUR_IP, target_ip).is_none() {
+        if net::arp::build_request(&mut arp, self.mac, our_ip, target_ip).is_none() {
             return;
         }
         if let Some(len) = net::ethernet::write_frame(
             &mut frame,
             [0xFF; 6], // broadcast
             self.mac,
-            net::ethernet::EtherType::Arp.as_u16(),
+            EtherType::Arp.as_u16(),
             &arp,
         ) {
             self.transmit(&frame[..len]);
@@ -394,6 +435,180 @@ impl E1000 {
                 "[e1000] TX ARP request who-has {}.{}.{}.{} (len {})",
                 target_ip[0], target_ip[1], target_ip[2], target_ip[3], len
             );
+        }
+    }
+
+    /// Build + transmit an ICMP echo request to `dst_ip` (its already-resolved `dst_mac`).
+    /// Lays the frame out bottom-up — Ethernet[0..14] | IPv4[14..34] | ICMP[34..] — like the
+    /// responder path in `net::ingress`. Returns false if serialization failed.
+    fn send_echo_request(
+        &mut self,
+        dst_ip: [u8; 4],
+        dst_mac: [u8; 6],
+        ident: u16,
+        seq: u16,
+        data: &[u8],
+    ) -> bool {
+        let our_ip = self.arp_state.our_ip();
+        let our_mac = self.mac;
+        let mut frame = [0u8; 128];
+        let icmp_len = match net::icmp::write_echo_request(&mut frame[34..], ident, seq, data) {
+            Some(n) => n,
+            None => return false,
+        };
+        if net::ipv4::write_header(&mut frame[14..34], our_ip, dst_ip, net::ipv4::PROTO_ICMP, icmp_len)
+            .is_none()
+        {
+            return false;
+        }
+        if net::ethernet::write_header(&mut frame[0..14], dst_mac, our_mac, EtherType::Ipv4.as_u16())
+            .is_none()
+        {
+            return false;
+        }
+        let total = 14 + 20 + icmp_len;
+        self.transmit(&frame[..total]);
+        true
+    }
+
+    /// Resolve `ip` to a MAC, consulting the ARP cache first; otherwise broadcast ARP
+    /// requests and pump RX until a reply lands (bounded). Blocking — for the shell.
+    fn resolve(&mut self, ip: [u8; 4]) -> Option<[u8; 6]> {
+        if let Some(mac) = self.arp_cache.lookup(ip) {
+            return Some(mac);
+        }
+        for _ in 0..RESOLVE_TRIES {
+            self.send_arp_request(ip);
+            for _ in 0..PUMP_ITERS {
+                self.poll();
+                if let Some(mac) = self.arp_cache.lookup(ip) {
+                    return Some(mac);
+                }
+                core::hint::spin_loop();
+            }
+        }
+        None
+    }
+
+    /// Send `count` ICMP echo requests to `ip`, pumping RX for each reply (bounded). Resolves
+    /// the destination MAC via ARP first. Blocking — for the `ping` shell command.
+    fn ping(&mut self, ip: [u8; 4], count: u16) -> PingOutcome {
+        let mac = match self.resolve(ip) {
+            Some(m) => m,
+            None => return PingOutcome { resolved: false, mac: None, sent: 0, received: 0 },
+        };
+        let mut sent = 0u16;
+        let mut received = 0u16;
+        for seq in 1..=count {
+            self.pong = None;
+            if !self.send_echo_request(ip, mac, PING_IDENT, seq, PING_PAYLOAD) {
+                break;
+            }
+            sent += 1;
+            for _ in 0..PUMP_ITERS {
+                self.poll();
+                // Count only a reply from the host we pinged (source-scoped).
+                if self.pong == Some((ip, PING_IDENT, seq)) {
+                    received += 1;
+                    break;
+                }
+                core::hint::spin_loop();
+            }
+        }
+        PingOutcome { resolved: true, mac: Some(mac), sent, received }
+    }
+
+    /// One step of the boot connectivity self-test, called from `service_net` after `poll`.
+    /// First ARP-resolves the gateway, then sends ICMP echo requests to it, until either a
+    /// reply arrives (success) or the per-phase attempt budget is exhausted. Non-blocking:
+    /// a little state advances each call, paced by `SELFTEST_STRIDE`.
+    fn selftest_tick(&mut self) {
+        if !self.selftest_armed {
+            return;
+        }
+        self.selftest_counter = self.selftest_counter.wrapping_add(1);
+        if self.selftest_counter % SELFTEST_STRIDE != 0 {
+            return;
+        }
+
+        // Success: `observe` saw an echo reply from the gateway stamped with our identifier.
+        if let Some((src, id, seq)) = self.pong {
+            if src == GATEWAY_IP && id == PING_IDENT {
+                serial_println!(
+                    "[selftest] gateway {} reachable — ICMP echo reply seq={} (outbound path OK)",
+                    fmt_ip(&GATEWAY_IP), seq
+                );
+                self.selftest_armed = false;
+                return;
+            }
+        }
+
+        match self.arp_cache.lookup(GATEWAY_IP) {
+            None => {
+                // Phase 1: resolve the gateway's MAC.
+                self.send_arp_request(GATEWAY_IP);
+                self.selftest_arp_tries += 1;
+                if self.selftest_arp_tries >= SELFTEST_ARP_TRIES {
+                    serial_println!(
+                        "[selftest] gateway {} did not answer ARP — link self-test aborted",
+                        fmt_ip(&GATEWAY_IP)
+                    );
+                    self.selftest_armed = false;
+                }
+            }
+            Some(mac) => {
+                // Phase 2: ping the resolved gateway.
+                self.selftest_ping_tries += 1;
+                self.send_echo_request(GATEWAY_IP, mac, PING_IDENT, self.selftest_ping_tries, PING_PAYLOAD);
+                if self.selftest_ping_tries >= SELFTEST_PING_TRIES {
+                    serial_println!(
+                        "[selftest] gateway {} is-at {} but no ICMP reply (ok if the backend has no responder)",
+                        fmt_ip(&GATEWAY_IP), fmt_mac(&mac)
+                    );
+                    self.selftest_armed = false;
+                }
+            }
+        }
+    }
+
+    /// Passively learn from a received frame before the responder dispatch: cache the
+    /// sender's IP→MAC, and capture ICMP echo replies addressed to us (so an outbound
+    /// `ping` / the boot self-test can match them). Produces no reply.
+    fn observe(&mut self, frame: &[u8]) {
+        let eth = match EthernetFrame::new(frame) {
+            Some(e) => e,
+            None => return,
+        };
+        match eth.ethertype() {
+            EtherType::Arp => {
+                if let Some((ip, mac)) = net::arp::learn(eth.payload()) {
+                    self.arp_cache.insert(ip, mac);
+                }
+            }
+            EtherType::Ipv4 => {
+                let ip = match Ipv4Header::new(eth.payload()) {
+                    Some(h) => h,
+                    None => return,
+                };
+                // Require a valid header addressed to us — mirrors the responder path in
+                // `net::ingress`, so we never learn from / act on a corrupt IPv4 header.
+                if !ip.verify_checksum() || ip.destination_ip() != self.arp_state.our_ip() {
+                    return;
+                }
+                if ip.protocol() == net::ipv4::PROTO_ICMP {
+                    if let Some((id, seq)) = net::icmp::parse_echo_reply(ip.payload()) {
+                        let src = ip.source_ip();
+                        self.pong = Some((src, id, seq));
+                        // Learn the responder's MAC from the IP frame too.
+                        self.arp_cache.insert(src, eth.source_mac());
+                        serial_println!(
+                            "[icmp] echo reply id={:#06x} seq={} from {}.{}.{}.{}",
+                            id, seq, src[0], src[1], src[2], src[3]
+                        );
+                    }
+                }
+            }
+            _ => {}
         }
     }
 
@@ -437,6 +652,10 @@ impl E1000 {
             } else {
                 serial_println!("[e1000] RX #{} len={} (runt/unparseable)", self.rx_count, len);
             }
+
+            // Learn IP→MAC mappings and capture ICMP echo replies addressed to us before the
+            // responder dispatch — the outbound `ping` / boot self-test consume these.
+            self.observe(frame);
 
             // DHCP client traffic (UDP 67->68) drives the lease state machine; everything
             // else goes to the responder stack (ARP / ICMP echo / UDP echo).
@@ -554,6 +773,12 @@ pub fn init(bus: u8, slot: u8, func: u8) {
         arp_state: ArpStateMachine::new(OUR_IP, [0; 6]),
         dhcp: net::dhcp::DhcpClient::new([0; 6], DHCP_XID),
         tcp: net::tcp::TcpEcho::new(TCP_ECHO_PORT),
+        arp_cache: ArpCache::new(),
+        pong: None,
+        selftest_armed: false,
+        selftest_counter: 0,
+        selftest_arp_tries: 0,
+        selftest_ping_tries: 0,
     };
     nic.reset_and_init();
     // Re-arm the ARP state machine + DHCP client now that the MAC is known.
@@ -568,9 +793,11 @@ pub fn init(bus: u8, slot: u8, func: u8) {
         NUM_RX, NUM_TX
     );
 
-    // Probe the gateway: exercises TX end-to-end and provokes an inbound ARP reply
-    // (proving RX) since slirp answers ARP for its own gateway address.
-    nic.send_arp_request(GATEWAY_IP);
+    // Arm the boot connectivity self-test: from the main loop it ARP-resolves the gateway
+    // and pings it (ICMP echo request), exercising the full *outbound* build path end-to-end
+    // and provoking inbound RX. It runs a bounded number of attempts, then disarms — see
+    // `selftest_tick`. (Supersedes the old one-shot gateway ARP probe.)
+    nic.selftest_armed = true;
 
     // Kick off DHCP (best effort): broadcast a DISCOVER now; the OFFER/ACK are handled in
     // poll(), which applies the lease. If no server answers (socket / vmnet-host modes), we
@@ -608,12 +835,37 @@ pub fn enable_interrupts(bus: u8, slot: u8, func: u8, msg_addr: u32, vector: u32
     ok
 }
 
-/// Main-loop hook: poll the NIC for received frames. No-op if no NIC is present
-/// (e.g. on aarch64 / when no e1000 was found).
+/// Main-loop hook: poll the NIC for received frames, then advance the boot connectivity
+/// self-test. No-op if no NIC is present (e.g. on aarch64 / when no e1000 was found).
 pub fn service_net() {
     if let Some(nic) = NET_DEVICE.lock().as_mut() {
         nic.poll();
+        nic.selftest_tick();
     }
+}
+
+/// Outcome of a blocking [`ping`] (rendered by the `ping` shell command).
+#[derive(Clone, Copy)]
+pub struct PingOutcome {
+    /// Whether the destination MAC was resolved (an unreachable host fails here).
+    pub resolved: bool,
+    /// The resolved peer MAC, if any.
+    pub mac: Option<[u8; 6]>,
+    /// Echo requests sent and replies received.
+    pub sent: u16,
+    pub received: u16,
+}
+
+/// Blocking ICMP ping from the shell: resolve `ip` then send `count` echo requests,
+/// returning a summary. `None` if no NIC is present.
+pub fn ping(ip: [u8; 4], count: u16) -> Option<PingOutcome> {
+    NET_DEVICE.lock().as_mut().map(|nic| nic.ping(ip, count))
+}
+
+/// Blocking ARP resolve from the shell. Returns the peer MAC, or `None` if unresolved /
+/// no NIC is present.
+pub fn arp_resolve(ip: [u8; 4]) -> Option<[u8; 6]> {
+    NET_DEVICE.lock().as_mut().and_then(|nic| nic.resolve(ip))
 }
 
 /// Snapshot of the current NIC state, if any (used by the `netinfo` shell command).
@@ -627,4 +879,9 @@ pub fn fmt_mac(mac: &[u8; 6]) -> alloc::string::String {
         "{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
         mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]
     )
+}
+
+/// Format an IPv4 address as `a.b.c.d`.
+pub fn fmt_ip(ip: &[u8; 4]) -> alloc::string::String {
+    alloc::format!("{}.{}.{}.{}", ip[0], ip[1], ip[2], ip[3])
 }

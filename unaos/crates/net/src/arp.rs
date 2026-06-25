@@ -177,6 +177,85 @@ impl ArpStateMachine {
     }
 }
 
+/// Extract the sender `(IP, MAC)` pair from an ARP packet for cache learning, validating
+/// it is Ethernet/IPv4. Works for both requests and replies — both carry a meaningful
+/// sender. Skips the unspecified address `0.0.0.0` (used by ARP probes / DHCP-time clients),
+/// which must never be cached as a peer.
+pub fn learn(buffer: &[u8]) -> Option<([u8; 4], [u8; 6])> {
+    let packet = ArpPacket::new(buffer)?;
+    if packet.hardware_type() != 1
+        || packet.protocol_type() != 0x0800
+        || packet.hardware_address_length() != 6
+        || packet.protocol_address_length() != 4
+    {
+        return None;
+    }
+    let ip = packet.sender_protocol_address();
+    if ip == [0, 0, 0, 0] {
+        return None;
+    }
+    // A sender MAC must be a real unicast address: never cache the all-zero placeholder,
+    // the broadcast address, or any multicast/group MAC (low bit of the first octet set) —
+    // resolve() would otherwise hand the NIC a nonsensical unicast destination.
+    let mac = packet.sender_hardware_address();
+    if mac == [0; 6] || mac[0] & 0x01 != 0 {
+        return None;
+    }
+    Some((ip, mac))
+}
+
+/// Number of IP→MAC entries the ARP cache holds (round-robin replacement once full).
+pub const ARP_CACHE_SIZE: usize = 8;
+
+#[derive(Clone, Copy)]
+struct ArpEntry {
+    ip: [u8; 4],
+    mac: [u8; 6],
+    valid: bool,
+}
+
+/// A tiny fixed-size ARP cache (IP → MAC). No allocation; entries are replaced
+/// round-robin once full. Sufficient for the handful of on-link peers an outbound
+/// client talks to (gateway, a test host, …).
+pub struct ArpCache {
+    entries: [ArpEntry; ARP_CACHE_SIZE],
+    next: usize,
+}
+
+impl ArpCache {
+    pub const fn new() -> Self {
+        Self {
+            entries: [ArpEntry { ip: [0; 4], mac: [0; 6], valid: false }; ARP_CACHE_SIZE],
+            next: 0,
+        }
+    }
+
+    /// Insert or refresh an IP→MAC mapping.
+    pub fn insert(&mut self, ip: [u8; 4], mac: [u8; 6]) {
+        // Refresh in place if we already know this IP.
+        for e in self.entries.iter_mut() {
+            if e.valid && e.ip == ip {
+                e.mac = mac;
+                return;
+            }
+        }
+        // Otherwise take the next round-robin slot.
+        self.entries[self.next] = ArpEntry { ip, mac, valid: true };
+        self.next = (self.next + 1) % ARP_CACHE_SIZE;
+    }
+
+    /// Look up the MAC for `ip`, if cached.
+    pub fn lookup(&self, ip: [u8; 4]) -> Option<[u8; 6]> {
+        self.entries.iter().find(|e| e.valid && e.ip == ip).map(|e| e.mac)
+    }
+}
+
+impl Default for ArpCache {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Build a 28-byte ARP request ("who-has `target_ip` tell `our_ip`") into `buf`.
 /// Returns the number of bytes written (28), or `None` if `buf` is too small.
 /// Used to probe/announce on the link (the Ethernet wrapper carries a broadcast dst).

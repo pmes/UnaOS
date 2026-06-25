@@ -22,6 +22,16 @@ MY_IP = bytes([10, 0, 2, 1])
 MY_MAC = bytes([0x52, 0x54, 0x00, 0xAA, 0xBB, 0xCC])
 BCAST = b"\xff" * 6
 
+# When testing the guest's OUTBOUND path we impersonate the gateway 10.0.2.2 (the address the
+# guest's boot self-test / `ping` probes) and answer its ARP + ICMP echo requests.
+GW_IP = bytes([10, 0, 2, 2])
+GW_MAC = bytes([0x52, 0x55, 0x0A, 0x00, 0x02, 0x02])
+# Protocol-level fields the kernel is contracted to stamp on its echo requests (PING_IDENT /
+# PING_PAYLOAD in drivers/e1000.rs). The outbound test asserts these, not just the checksums,
+# so a well-formed-but-wrong request can't false-pass. Source must be the guest's static IP.
+GUEST_PING_IDENT = 0x554E  # ASCII "UN"
+GUEST_PING_PAYLOAD = b"unaos-ping"
+
 
 def cksum(data):
     s = 0
@@ -40,6 +50,11 @@ def eth(dst, src, etype, payload):
 
 def arp_request(target_ip):
     return struct.pack(">HHBBH", 1, 0x0800, 6, 4, 1) + MY_MAC + MY_IP + (b"\x00" * 6) + target_ip
+
+
+def arp_reply(sender_mac, sender_ip, target_mac, target_ip):
+    # op=2 (reply): "sender_ip is-at sender_mac", addressed to (target_mac, target_ip).
+    return struct.pack(">HHBBH", 1, 0x0800, 6, 4, 2) + sender_mac + sender_ip + target_mac + target_ip
 
 
 def ipv4(src, dst, proto, payload):
@@ -161,6 +176,88 @@ def macstr(b):
     return ":".join("%02x" % x for x in b)
 
 
+def ipstr(b):
+    return ".".join("%d" % x for x in b)
+
+
+def respond_to_guest_probes(s, t0, budget_s=18.0, want_pings=1):
+    """Validate the guest's OUTBOUND path. We impersonate the gateway 10.0.2.2: answer the
+    guest's ARP who-has 10.0.2.2 and reply to its ICMP echo *requests* (checking the requests'
+    checksums). The guest originates these via its boot connectivity self-test (and `ping`).
+    Returns True once we've answered an ARP and >= want_pings valid echo requests."""
+    print("--- outbound test: impersonating gateway %s (answering guest ARP+ICMP) ---" % ipstr(GW_IP))
+    arped = False
+    pings = 0
+    deadline = time.time() + budget_s
+    while time.time() < deadline and not (arped and pings >= want_pings):
+        try:
+            f = recv_frame(s)
+        except socket.timeout:
+            continue
+        if f is None:  # EOF / bad framing — peer gone; stop rather than busy-spin to the deadline
+            print("connection closed by QEMU (EOF) during outbound test")
+            break
+        if len(f) < 14:
+            continue
+        etype = struct.unpack(">H", f[12:14])[0]
+        guest_mac = f[6:12]
+
+        if etype == 0x0806 and len(f) >= 42:  # ARP
+            op = struct.unpack(">H", f[20:22])[0]
+            spa, tpa = f[28:32], f[38:42]  # sender / target protocol address
+            if op == 1 and tpa == GW_IP:  # who-has the gateway?
+                send_frame(s, eth(guest_mac, GW_MAC, 0x0806, arp_reply(GW_MAC, GW_IP, guest_mac, spa)))
+                if not arped:
+                    print("[%5.1fs] <- guest ARP who-has %s tell %s  -> replied is-at %s   [GUEST ARP OK]"
+                          % (time.time() - t0, ipstr(GW_IP), ipstr(spa), macstr(GW_MAC)))
+                    arped = True
+            continue
+
+        if etype == 0x0800 and len(f) >= 34:  # IPv4
+            if (f[14] >> 4) != 4 or f[23] != 1:  # IPv4 + proto ICMP
+                continue
+            ihl = (f[14] & 0x0F) * 4
+            total = struct.unpack(">H", f[16:18])[0]
+            src_ip, dst_ip = f[26:30], f[30:34]
+            if dst_ip != GW_IP:
+                continue
+            icmp = f[14 + ihl:14 + total]  # exact ICMP message (exclude L2 padding)
+            if len(icmp) < 8 or icmp[0] != 8:  # echo request only
+                continue
+            ip_ck_ok = cksum(f[14:14 + ihl]) == 0
+            icmp_ck_ok = cksum(icmp) == 0
+            ident = struct.unpack(">H", icmp[4:6])[0]
+            seq = struct.unpack(">H", icmp[6:8])[0]
+            data = icmp[8:]
+            # Build the echo reply: same body, type 8 -> 0, recompute checksum, swap src/dst.
+            reply_icmp = bytearray(icmp)
+            reply_icmp[0] = 0
+            reply_icmp[2:4] = b"\x00\x00"
+            reply_icmp[2:4] = struct.pack(">H", cksum(reply_icmp))
+            send_frame(s, eth(guest_mac, GW_MAC, 0x0800, ipv4(GW_IP, src_ip, 1, bytes(reply_icmp))))
+            # Count it only if BOTH checksums validate AND the protocol fields are exactly what
+            # the kernel is contracted to emit (identifier, payload, source IP) — not merely a
+            # well-formed packet. (We still replied above so the guest's path can complete.)
+            fields_ok = (ident == GUEST_PING_IDENT and data == GUEST_PING_PAYLOAD and src_ip == GUEST_IP)
+            if ip_ck_ok and icmp_ck_ok and fields_ok:
+                pings += 1
+                print("[%5.1fs] <- guest ICMP echo request id=0x%04x seq=%d data=%r ip_cksum=OK icmp_cksum=OK -> replied   [GUEST PING %d]"
+                      % (time.time() - t0, ident, seq, data, pings))
+            else:
+                print("[%5.1fs] <- guest ICMP echo request REJECTED ip_ck=%s icmp_ck=%s id=0x%04x(exp 0x%04x) data=%r(exp %r) src=%s(exp %s)"
+                      % (time.time() - t0, ip_ck_ok, icmp_ck_ok, ident, GUEST_PING_IDENT,
+                         data, GUEST_PING_PAYLOAD, ipstr(src_ip), ipstr(GUEST_IP)))
+
+    if not arped:
+        print("FAIL: guest never ARP-resolved the gateway %s" % ipstr(GW_IP))
+        return False
+    if pings < want_pings:
+        print("FAIL: guest sent %d/%d valid ICMP echo requests" % (pings, want_pings))
+        return False
+    print("<- guest outbound verified: ARP-resolved gateway + %d valid echo requests   [GUEST OUTBOUND OK]" % pings)
+    return True
+
+
 def main():
     s = None
     for _ in range(80):
@@ -173,9 +270,16 @@ def main():
         print("FAIL: could not connect to QEMU socket netdev at %s:%d" % (HOST, PORT))
         return 1
     print("connected to %s:%d" % (HOST, PORT))
-    time.sleep(4)  # let the guest finish e1000 bring-up
-    s.settimeout(8)
+    t0 = time.time()
+    time.sleep(3)  # let the guest finish e1000 bring-up + arm its boot self-test
 
+    # --- OUTBOUND: the guest initiates (boot self-test ARP-resolves + pings the gateway). We
+    #     impersonate gateway 10.0.2.2 and answer, proving the kernel's outbound build path. ---
+    s.settimeout(2)
+    if not respond_to_guest_probes(s, t0):
+        return 1
+
+    s.settimeout(8)
     # --- ARP: who-has 10.0.2.15 (tests the ARP responder) ---
     send_frame(s, eth(BCAST, MY_MAC, 0x0806, arp_request(GUEST_IP)))
     print("-> ARP request who-has 10.0.2.15")
