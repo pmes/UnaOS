@@ -717,6 +717,66 @@ impl<T> Drop for MutexGuard<'_, T> {
 }
 
 // ---------------------------------------------------------------------------------------------
+// Channel<T> — a bounded blocking channel, composed from a Mutex + two Semaphores
+// ---------------------------------------------------------------------------------------------
+
+/// A fixed-capacity blocking channel (the classic slots/items bounded buffer). `send` blocks while
+/// full, `recv` blocks while empty; both can cross-CPU-wake the other side. Multiple producers and
+/// multiple consumers are safe — the semaphores and the buffer mutex serialise all of them — though
+/// the demo only drives one of each. Demonstrates that the scheduler's `Mutex` and `Semaphore`
+/// compose into higher-level concurrency without new unsafe:
+/// `slots` counts free slots (send waits on it), `items` counts buffered values (recv waits on it),
+/// and a `Mutex` serialises the buffer itself. Each `wait()` corresponds to a real produced/consumed
+/// item, so the buffer push/pop is never starved or raced (standard bounded-buffer invariant).
+///
+/// Like the primitives it is built from, a Channel that tasks block on must be `'static`; call
+/// `init()` once on the BSP before use. `Channel<T>` is `Sync` (auto-derived) exactly when `T: Send`.
+pub struct Channel<T> {
+    /// Free slots; initial permits = capacity. `send` waits (blocks when full).
+    slots: Semaphore,
+    /// Buffered items; initial 0. `recv` waits (blocks when empty).
+    items: Semaphore,
+    /// The buffer, serialised by a sleeping mutex (held only across a single push/pop).
+    buffer: Mutex<VecDeque<T>>,
+}
+
+impl<T> Channel<T> {
+    /// Construct an empty channel with `capacity` slots. `const` so it can initialise a `static`.
+    pub const fn new(capacity: usize) -> Self {
+        Channel {
+            slots: Semaphore::new(capacity as i64),
+            items: Semaphore::new(0),
+            buffer: Mutex::new(VecDeque::new()),
+        }
+    }
+
+    /// Reserve the underlying primitives' waiter capacity. Call once on the BSP before use. (Does
+    /// not lock the buffer — `Mutex::lock` requires a scheduler context, which the BSP is not.)
+    pub fn init(&self) {
+        self.slots.init();
+        self.items.init();
+        self.buffer.init();
+    }
+
+    /// Send a value, blocking while the channel is full. Must be called from a scheduled task.
+    pub fn send(&self, value: T) {
+        assert!(self.slots.wait(), "Channel::send() called off a scheduled task");
+        self.buffer.lock().push_back(value); // mutex held only across the push (never across a wait)
+        self.items.post();
+    }
+
+    /// Receive a value, blocking while the channel is empty. Must be called from a scheduled task.
+    pub fn recv(&self) -> T {
+        assert!(self.items.wait(), "Channel::recv() called off a scheduled task");
+        // A permit from `items` guarantees a value was pushed before its matching `post`, and pops
+        // are serialised by the mutex, so the buffer is non-empty here.
+        let value = self.buffer.lock().pop_front().expect("channel buffer empty after items.wait");
+        self.slots.post();
+        value
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
 // Preemption hook (called from the timer interrupt) — the single involuntary switch site
 // ---------------------------------------------------------------------------------------------
 
@@ -933,13 +993,16 @@ pub fn current_task_id(cpu: usize) -> Option<u64> {
 /// Count of demo tasks that have run to completion (so a test can confirm exit/free works).
 static DEMO_DONE: AtomicUsize = AtomicUsize::new(0);
 
-/// The low-priority demo task's current round. The high-priority task samples it before and after
-/// its busy run to prove the low task made NO progress while the high task ran (strict priority).
-static LO_ROUND: AtomicU32 = AtomicU32::new(0);
+/// Bounded channel the producer/consumer demo exchanges values over. Small capacity so the producer
+/// genuinely BLOCKS when full (and the consumer when empty). `'static`, as a blockable channel must
+/// be. Tasks run at NORMAL priority, so this also exercises the multilevel run queue at one level.
+static CHAN: Channel<u64> = Channel::new(4);
+/// Number of values the producer/consumer demo exchanges.
+const CHAN_ITEMS: u64 = 20;
 
-/// Turn scheduling on and spawn the demo workload across the online APs, exercising the scheduler:
-/// equal-priority round-robin + timer preemption (the busy pair), and FIXED-PRIORITY preemption (a
-/// LOW long-runner that a HIGH task preempts and starves until it exits). Called once on the BSP
+/// Turn scheduling on and spawn the demo workload across the online APs: equal-priority round-robin
+/// + timer preemption (the busy pair), and a cross-core bounded `Channel` (producer + consumer on
+/// different APs) that composes the Mutex + Semaphores and blocks both ways. Called once on the BSP
 /// after `smp::start_aps` (hence after `verify_smp`). No-op with no APs.
 pub fn start_demo(online_aps: &[usize]) {
     if online_aps.is_empty() {
@@ -947,6 +1010,7 @@ pub fn start_demo(online_aps: &[usize]) {
         return;
     }
 
+    CHAN.init(); // reserve the channel's primitives' waiter capacity before any task can block
     SCHED_ACTIVE.store(true, Ordering::Release);
     SCHED_GO.store(true, Ordering::Release);
 
@@ -962,12 +1026,14 @@ pub fn start_demo(online_aps: &[usize]) {
     spawn("busy-A", demo_busy, encode(cpu_busy, b'A'), cpu_busy, PRIO_NORMAL);
     spawn("busy-B", demo_busy, encode(cpu_busy, b'B'), cpu_busy, PRIO_NORMAL);
 
-    // Fixed-priority preemption: on a second AP, a LOW long-runner plus a HIGH task that briefly
-    // sleeps (letting LOW start), then wakes and runs busy. The wake must PREEMPT the running LOW
-    // task and starve it (strict priority) until HIGH exits — HIGH verifies LOW didn't advance.
-    if let Some(&cpu_prio) = online_aps.get(1) {
-        spawn("lo", demo_prio_low, cpu_prio, cpu_prio, PRIO_LOW);
-        spawn("hi", demo_prio_high, cpu_prio, cpu_prio, PRIO_HIGH);
+    // Cross-core bounded channel: a consumer on one AP and a producer on another (or the same, if
+    // only one extra AP). The capacity-4 channel forces the producer to block when full and the
+    // consumer when empty; the consumer verifies the received sum. Exercises Mutex + Semaphore
+    // composition + cross-CPU wake both directions.
+    if let Some(&cpu_rx) = online_aps.get(1) {
+        spawn("rx", demo_consumer, cpu_rx, cpu_rx, PRIO_NORMAL);
+        let cpu_tx = online_aps.get(2).copied().unwrap_or(cpu_rx);
+        spawn("tx", demo_producer, cpu_tx, cpu_tx, PRIO_NORMAL);
     }
 }
 
@@ -996,46 +1062,32 @@ fn demo_busy(arg: usize) {
     DEMO_DONE.fetch_add(1, Ordering::Relaxed);
 }
 
-/// Burn a fixed chunk of CPU without yielding (so the timer is the only thing that can preempt us).
-fn burn(seed: u64) {
-    let mut acc: u64 = 0;
-    for i in 0..20_000_000u64 {
-        acc = acc.wrapping_add(i ^ seed);
+/// Producer: sends 1..=CHAN_ITEMS into the bounded channel, blocking whenever it is full (the
+/// capacity-4 channel can't hold all 20 at once, so the consumer must drain to let it proceed).
+fn demo_producer(cpu: usize) {
+    for value in 1..=CHAN_ITEMS {
+        CHAN.send(value);
+        serial_println!("SCHED: [cpu{cpu} tx] sent {value}");
     }
-    core::hint::black_box(acc);
-}
-
-/// LOW-priority long-runner: many non-yielding rounds, publishing its round number. It runs while
-/// the HIGH task sleeps, then must be PREEMPTED and frozen while HIGH runs, then resume after.
-fn demo_prio_low(cpu: usize) {
-    for round in 0..14u32 {
-        LO_ROUND.store(round, Ordering::Relaxed);
-        serial_println!("SCHED: [cpu{cpu} lo LOW] round {round}");
-        burn(round as u64);
-    }
-    serial_println!("SCHED: [cpu{cpu} lo LOW] done");
+    serial_println!("SCHED: [cpu{cpu} tx] done");
     DEMO_DONE.fetch_add(1, Ordering::Relaxed);
 }
 
-/// HIGH-priority task: sleeps briefly so LOW gets going, then wakes and runs busy. Its wake must
-/// preempt the running LOW task; while HIGH runs (non-yielding, strict priority) LOW cannot, so
-/// LO_ROUND must be unchanged across HIGH's run — which HIGH asserts as PASS/FAIL.
-fn demo_prio_high(cpu: usize) {
-    sleep_ticks(15); // let LOW start running
-    let lo_before = LO_ROUND.load(Ordering::Relaxed);
-    serial_println!("SCHED: [cpu{cpu} hi HIGH] woke and preempted LOW (at round {lo_before})");
-    for round in 0..5u32 {
-        serial_println!("SCHED: [cpu{cpu} hi HIGH] round {round}");
-        burn(round as u64);
+/// Consumer: receives CHAN_ITEMS values (blocking while empty) and verifies their sum — proving no
+/// value was lost or duplicated across the cross-core, blocking channel.
+fn demo_consumer(cpu: usize) {
+    let mut sum = 0u64;
+    for _ in 0..CHAN_ITEMS {
+        sum += CHAN.recv();
     }
-    let lo_after = LO_ROUND.load(Ordering::Relaxed);
+    let expected = CHAN_ITEMS * (CHAN_ITEMS + 1) / 2;
     serial_println!(
-        "PRIORITY: LOW round {} -> {} across HIGH's run => {}",
-        lo_before,
-        lo_after,
-        if lo_after == lo_before { "PASS (LOW starved by HIGH)" } else { "FAIL (LOW ran under HIGH)" }
+        "CHANNEL: [cpu{cpu} rx] received {} values, sum {} (expected {}) => {}",
+        CHAN_ITEMS,
+        sum,
+        expected,
+        if sum == expected { "PASS" } else { "FAIL" }
     );
-    serial_println!("SCHED: [cpu{cpu} hi HIGH] done");
     DEMO_DONE.fetch_add(1, Ordering::Relaxed);
 }
 
