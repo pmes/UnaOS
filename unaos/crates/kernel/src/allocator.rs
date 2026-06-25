@@ -21,11 +21,13 @@ use spin::Mutex;
 use crate::arch;
 
 pub const HEAP_START: usize = 0x_4444_4444_0000;
-// 16 MiB. The video back buffer (double-buffering, Phase 3) is heap-allocated and sized to the
-// framebuffer: 1280x800x4 = 4 MiB in QEMU, with room to spare for the xHCI/console/block
-// allocations. NOTE: a real Retina panel (2880x1800x4 ~= 20 MiB) will need a larger heap when
-// Phase 2 brings up that hardware.
-pub const HEAP_SIZE: usize = 16 * 1024 * 1024; // 16 MiB
+// 32 MiB. The video back buffer (double-buffering) is heap-allocated and sized to the chosen
+// framebuffer mode. The bootloader now selects the largest GOP mode it can (native resolution),
+// so the heap must hold a large back buffer plus the xHCI/console/block allocations: QEMU's
+// biggest mode (2048x2048x4 = 16 MiB) and a real Retina panel (2880x1800x4 ~= 20 MiB) both fit
+// here with margin. The bootloader caps mode selection so the back buffer can never exceed what
+// this heap can hold (see MAX_BACKBUF_BYTES in crates/bootloader).
+pub const HEAP_SIZE: usize = 32 * 1024 * 1024; // 32 MiB
 
 pub struct Locked<A> {
     inner: Mutex<A>,

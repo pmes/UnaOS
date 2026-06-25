@@ -37,9 +37,64 @@ fn main() -> Status {
             }
         };
         
+        // The display resolution is auto-detected from the firmware's GOP, not hard-coded — and the
+        // firmware's *default* mode is usually not the panel's native/maximum. So enumerate the
+        // modes and select the largest *linear-framebuffer* (Rgb/Bgr) one we can drive. The full
+        // list is logged because on real hardware (no serial) it's the only way to see what the
+        // panel offers.
+        //
+        // The pick is capped to what the kernel can back-buffer: the double-buffer back buffer is
+        // stride*height*4 bytes and must fit the kernel heap alongside its other allocations.
+        // MAX_BACKBUF_BYTES is tied to crates/kernel allocator::HEAP_SIZE (32 MiB) — keep in sync;
+        // 24 MiB leaves headroom for the xHCI/console/block allocations.
+        const MAX_BACKBUF_BYTES: usize = 24 * 1024 * 1024;
+
+        let cur = gop.current_mode_info().resolution();
+        log::info!("GOP: {} modes (firmware default {}x{}):", gop.modes().len(), cur.0, cur.1);
+        for mode in gop.modes() {
+            let mi = mode.info();
+            let (w, h) = mi.resolution();
+            log::info!("  GOP mode: {}x{} stride={} fmt={:?}", w, h, mi.stride(), mi.pixel_format());
+        }
+
+        // Linear-framebuffer modes within the back-buffer budget, largest area first. (BltOnly /
+        // Bitmask modes have no usable linear framebuffer, so they're excluded.)
+        let mut candidates: alloc::vec::Vec<uefi::proto::console::gop::Mode> = gop
+            .modes()
+            .filter(|m| {
+                matches!(
+                    m.info().pixel_format(),
+                    uefi::proto::console::gop::PixelFormat::Rgb
+                        | uefi::proto::console::gop::PixelFormat::Bgr
+                )
+            })
+            .filter(|m| {
+                let mi = m.info();
+                mi.stride() * mi.resolution().1 * 4 <= MAX_BACKBUF_BYTES
+            })
+            .collect();
+        candidates.sort_unstable_by_key(|m| {
+            let (w, h) = m.info().resolution();
+            core::cmp::Reverse(w * h)
+        });
+
+        // Set the largest mode the firmware accepts (fall through to smaller ones if set_mode
+        // fails, e.g. not enough video memory). If none work, the current mode is left untouched.
+        for mode in &candidates {
+            let (w, h) = mode.info().resolution();
+            match gop.set_mode(mode) {
+                Ok(()) => {
+                    log::info!("GOP: selected {}x{}", w, h);
+                    break;
+                }
+                Err(e) => log::warn!("GOP: set_mode {}x{} failed ({:?}); trying smaller", w, h, e),
+            }
+        }
+
+        // Read the active mode + framebuffer *after* set_mode (it invalidates the old framebuffer).
         let mode_info = gop.current_mode_info();
         let mut fb = gop.frame_buffer();
-        
+
         let pixel_format = match mode_info.pixel_format() {
             uefi::proto::console::gop::PixelFormat::Rgb => PixelFormat::Rgb,
             uefi::proto::console::gop::PixelFormat::Bgr => PixelFormat::Bgr,
