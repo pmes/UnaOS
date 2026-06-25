@@ -20,8 +20,13 @@ use uart_16550::backend::PioBackend;
 use uart_16550::Uart16550Tty;
 
 lazy_static! {
-    pub static ref SERIAL1: Mutex<Uart16550Tty<PioBackend>> = {
-        let serial_port = unsafe { Uart16550Tty::new_port(0x3F8, uart_16550::Config::default()).unwrap() };
+    // `None` when there is no 16550 at 0x3F8. `new_port` runs init() + a loopback self-test and
+    // returns Err on real laptops / the Pi (no UART there) — we must treat that as "no serial",
+    // NEVER panic. The original bug: `.unwrap()` here panicked on metal, then the panic handler
+    // called serial_println! which re-ran this initializer and recursed — a red screen with no
+    // message and a freeze. fbcon mirrors all output to the framebuffer regardless.
+    pub static ref SERIAL1: Mutex<Option<Uart16550Tty<PioBackend>>> = {
+        let serial_port = unsafe { Uart16550Tty::new_port(0x3F8, uart_16550::Config::default()).ok() };
         Mutex::new(serial_port)
     };
 }
@@ -31,11 +36,14 @@ pub fn _print(args: ::core::fmt::Arguments) {
     use core::fmt::Write;
     use x86_64::instructions::interrupts;
 
+    // Best-effort, never-panic: skip the UART if absent (None) or if its lock is already held
+    // (a panic mid-print would otherwise self-deadlock here). Output is dropped, not fatal.
     interrupts::without_interrupts(|| {
-        SERIAL1
-            .lock()
-            .write_fmt(args)
-            .expect("Printing to serial failed");
+        if let Some(mut guard) = SERIAL1.try_lock() {
+            if let Some(uart) = guard.as_mut() {
+                let _ = uart.write_fmt(args);
+            }
+        }
     });
     // Mirror to the framebuffer console so diagnostics/panics are visible on hardware that has
     // no serial port. `Arguments` is Copy; fbcon self-guards (try_lock + interrupts off).
