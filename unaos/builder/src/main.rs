@@ -38,6 +38,7 @@ fn main() {
     let mut feats: Vec<&str> = Vec::new();
     if std::env::var("UNAOS_SKIP_XHCI").is_ok() { feats.push("skip_xhci"); }
     if std::env::var("UNAOS_BOOTLOG").is_ok() { feats.push("bootlog"); }
+    if std::env::var("UNAOS_PI").is_ok() { feats.push("pi"); }
     if !feats.is_empty() {
         let list = feats.join(",");
         kernel_cmd.arg("--features").arg(&list);

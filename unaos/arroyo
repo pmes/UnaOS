@@ -34,6 +34,7 @@ KERNEL_FEATURES=""
 _feats=""
 [ -n "${UNAOS_SKIP_XHCI:-}" ] && _feats="${_feats}skip_xhci,"
 [ -n "${UNAOS_BOOTLOG:-}" ] && _feats="${_feats}bootlog,"
+[ -n "${UNAOS_PI:-}" ] && _feats="${_feats}pi,"
 if [ -n "$_feats" ]; then
     KERNEL_FEATURES="--features ${_feats%,}"
     echo -e "${COLOR_YELLOW}⚡ kernel features: ${_feats%,}${COLOR_RESET}"
