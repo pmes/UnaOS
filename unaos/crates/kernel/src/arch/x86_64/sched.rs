@@ -70,6 +70,17 @@ const INITIAL_RFLAGS: u64 = 0x0000_0002;
 const STATE_READY: u8 = 0;
 const STATE_RUNNING: u8 = 1;
 const STATE_FINISHED: u8 = 2;
+/// Parked: off every run queue, waiting in a semaphore's waiter list or the per-CPU sleeper list
+/// until woken (`Semaphore::post` / a sleep deadline). The scheduler parks the Box per the
+/// blocking task's "park action" (below) instead of requeuing it.
+const STATE_BLOCKED: u8 = 3;
+
+// What the scheduler should do with a task that switched back in the BLOCKED state — set by the
+// blocking primitive (under IF=0) just before it switches, read-and-cleared by `run()` after the
+// switch (same CPU, sequential; `switch_context` is the barrier).
+const PARK_NONE: u8 = 0;
+const PARK_WAITQ: u8 = 1; // hand the Box to a wait queue, then release that queue's lock
+const PARK_SLEEP: u8 = 2; // push the Box onto this CPU's sleeper list with a wake deadline
 
 /// A kernel thread. Owned as `Box<Task>`: it lives in exactly one place at a time — a run queue
 /// (`Box` in the `VecDeque`), or "running" (the `Box` leaked to a raw pointer in `current`).
@@ -110,6 +121,17 @@ struct SchedCpu {
     /// Set when the running task should be preempted at the next safe point (quantum expiry, or
     /// an explicit reschedule request). Single preempt signal.
     need_resched: AtomicBool,
+    /// "Park action" for a task switching back BLOCKED: `PARK_*`. Set by the blocking primitive
+    /// before its switch, read-and-cleared by `run()` after. Same-CPU sequential, so `Relaxed`
+    /// is sufficient (`switch_context` is the memory barrier between writer and reader).
+    park_kind: AtomicU8,
+    /// PARK_WAITQ: the wait queue's `*mut VecDeque<Box<Task>>` (the scheduler pushes the Box here).
+    park_waiters: AtomicU64,
+    /// PARK_WAITQ: the wait queue's `*const AtomicBool` lock (the scheduler releases it after the
+    /// push — the lock-handoff that makes the wakeup lost-proof).
+    park_lock: AtomicU64,
+    /// PARK_SLEEP: the wake deadline, in this CPU's local timer ticks.
+    park_deadline: AtomicU64,
 }
 
 impl SchedCpu {
@@ -119,6 +141,10 @@ impl SchedCpu {
             current: AtomicU64::new(0),
             quantum: AtomicU32::new(0),
             need_resched: AtomicBool::new(false),
+            park_kind: AtomicU8::new(PARK_NONE),
+            park_waiters: AtomicU64::new(0),
+            park_lock: AtomicU64::new(0),
+            park_deadline: AtomicU64::new(0),
         }
     }
 }
@@ -142,6 +168,19 @@ lazy_static! {
     /// are touched solely by the CPU that owns it. Cross-CPU `spawn` pushes here under the lock.
     static ref RUN_QUEUES: [Mutex<VecDeque<Box<Task>>>; MAX_CPUS] =
         core::array::from_fn(|_| Mutex::new(VecDeque::with_capacity(RUNQ_CAPACITY)));
+
+    /// Per-CPU sleeper lists: tasks blocked in `sleep_ticks`, with their wake deadline (this CPU's
+    /// tick count). Touched ONLY by `run()` on the owning CPU (parked there on switch-back, drained
+    /// at the loop top), so the lock is always uncontended — it exists only so the field is
+    /// interior-mutable, not for cross-CPU synchronisation.
+    static ref SLEEPERS: [Mutex<VecDeque<Sleeper>>; MAX_CPUS] =
+        core::array::from_fn(|_| Mutex::new(VecDeque::with_capacity(RUNQ_CAPACITY)));
+}
+
+/// A parked sleeper: its wake deadline (owning CPU's tick count) and the task.
+struct Sleeper {
+    deadline: u64,
+    task: Box<Task>,
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -258,16 +297,32 @@ pub fn spawn(name: &'static str, entry: fn(usize), arg: usize, target_cpu: usize
     });
 
     RUN_QUEUES[target_cpu].lock().push_back(task);
+    poke_cpu(target_cpu);
+}
 
-    // Poke the target so an idle CPU re-checks its queue. Skip a self-poke (we'd just be
-    // interrupting ourselves). The IPI is wake-only — it never context-switches.
+/// Send the wake-only reschedule IPI (vector `IPI_VECTOR`) to `target` so an idle CPU breaks its
+/// `hlt` and re-checks its run queue. Skips a self-poke (no point interrupting ourselves). The IPI
+/// never context-switches; the target's scheduler loop picks the work up.
+fn poke_cpu(target: usize) {
     let this = percpu::this_cpu().cpu_index as usize;
-    if target_cpu != this {
-        if let Some(c) = percpu::cpu(target_cpu) {
+    if target != this {
+        if let Some(c) = percpu::cpu(target) {
             let icr_low = 0x0000_4000 | crate::arch::interrupts::IPI_VECTOR as u32; // fixed, assert
             apic::send_ipi(c.apic_id, icr_low);
         }
     }
+}
+
+/// Mark a parked/just-woken task READY, push it onto its PINNED CPU's run queue, and poke that CPU.
+/// Used by the sleeper drain (same CPU → no IPI) and `Semaphore::post` (cross-CPU wake). The task
+/// always returns to `task.cpu`, so its GS base stays correct on resume (tasks don't migrate).
+/// Caller runs with IF=0; mirrors `spawn`'s enqueue+poke, so the same lost-wake-free argument holds.
+fn make_ready(task: Box<Task>) {
+    let target = task.cpu as usize;
+    debug_assert!(target < MAX_CPUS, "make_ready: cpu out of range");
+    task.state.store(STATE_READY, Ordering::Release);
+    RUN_QUEUES[target].lock().push_back(task);
+    poke_cpu(target);
 }
 
 /// Cooperatively give up the CPU. The current task is marked ready and rotated to the back of its
@@ -275,22 +330,28 @@ pub fn spawn(name: &'static str, entry: fn(usize), arg: usize, target_cpu: usize
 /// rescheduled. No-op if called outside a scheduled task (e.g. on the BSP main loop).
 pub fn yield_now() {
     // Critical section with IF=0: nothing may preempt us between marking ready and switching.
+    // Save the caller's IF and restore exactly that on exit (don't blindly re-enable — a caller
+    // could be in its own interrupts-off region).
+    let was_enabled = x86_64::instructions::interrupts::are_enabled();
     x86_64::instructions::interrupts::disable();
     let cpu = percpu::this_cpu().cpu_index as usize;
     let raw = SCHED[cpu].current.load(Ordering::Acquire) as *mut Task;
-    if raw.is_null() {
+    if !raw.is_null() {
+        unsafe {
+            debug_assert_eq!((*raw).cpu as usize, cpu, "task ran on the wrong CPU");
+            (*raw).state.store(STATE_READY, Ordering::Release);
+            // Switch back to the scheduler; it requeues us and runs the next task. We resume here
+            // (IF=0, carried by popfq) when rescheduled. `was_enabled` lives on our stack and
+            // survives the switch.
+            switch_context(
+                &raw mut (*raw).ctx_rsp,
+                SCHED[cpu].scheduler_rsp.load(Ordering::Acquire),
+            );
+        }
+    }
+    if was_enabled {
         x86_64::instructions::interrupts::enable();
-        return;
     }
-    unsafe {
-        debug_assert_eq!((*raw).cpu as usize, cpu, "task ran on the wrong CPU");
-        (*raw).state.store(STATE_READY, Ordering::Release);
-        // Switch back to the scheduler; it requeues us and runs the next task. We resume here
-        // (IF=0, carried by popfq) when rescheduled.
-        switch_context(&raw mut (*raw).ctx_rsp, SCHED[cpu].scheduler_rsp.load(Ordering::Acquire));
-    }
-    // Re-enable interrupts for the task body (we entered with them on; the fresh frame carried 0).
-    x86_64::instructions::interrupts::enable();
 }
 
 /// Terminate the current task. Marks it finished and switches to the scheduler, which frees its
@@ -310,6 +371,36 @@ pub fn exit() -> ! {
         switch_context(&raw mut discard, SCHED[cpu].scheduler_rsp.load(Ordering::Acquire));
     }
     unreachable!("scheduler resumed a finished task")
+}
+
+/// Block the current task for `ticks` of THIS CPU's local-APIC timer, then become runnable again.
+/// Timer-driven (no waker), so it cannot lose a wakeup: the scheduler drains due sleepers at its
+/// loop top, and the free-running periodic timer re-enters that loop every tick (granularity and
+/// worst-case wake latency are one tick). `ticks == 0` wakes on the next loop pass (~0–1 tick).
+/// No-op outside a scheduled task (e.g. the unscheduled BSP), like `yield_now`.
+pub fn sleep_ticks(ticks: u64) {
+    let was_enabled = x86_64::instructions::interrupts::are_enabled();
+    x86_64::instructions::interrupts::disable();
+    let cpu = percpu::this_cpu().cpu_index as usize;
+    let raw = SCHED[cpu].current.load(Ordering::Acquire) as *mut Task;
+    if !raw.is_null() {
+        let deadline = percpu::this_cpu().ticks.load(Ordering::Relaxed) + ticks;
+        unsafe {
+            debug_assert_eq!((*raw).cpu as usize, cpu, "task ran on the wrong CPU");
+            (*raw).state.store(STATE_BLOCKED, Ordering::Release);
+            // Tell the scheduler to park us on this CPU's sleeper list with this deadline.
+            SCHED[cpu].park_deadline.store(deadline, Ordering::Relaxed);
+            SCHED[cpu].park_kind.store(PARK_SLEEP, Ordering::Relaxed);
+            switch_context(
+                &raw mut (*raw).ctx_rsp,
+                SCHED[cpu].scheduler_rsp.load(Ordering::Acquire),
+            );
+        }
+        // Resumed (IF=0, carried) once the deadline passed and the scheduler re-dispatched us.
+    }
+    if was_enabled {
+        x86_64::instructions::interrupts::enable();
+    }
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -381,6 +472,12 @@ fn run() -> ! {
         // ABI-clean DF regardless of what the last switch inherited.
         unsafe { core::arch::asm!("cld", options(nomem, nostack, preserves_flags)) };
 
+        // Wake any sleepers whose deadline has passed. The wake source is the free-running
+        // periodic LVT timer (every tick breaks the idle `hlt` below and re-enters this loop), so
+        // an idle CPU with only a pending sleeper makes progress; worst-case wake latency is one
+        // tick. Same CPU, no IPI — `make_ready` pushes onto this CPU's own run queue.
+        drain_due_sleepers(cpu);
+
         let next = RUN_QUEUES[cpu].lock().pop_front(); // lock dropped immediately
         match next {
             Some(task) => {
@@ -399,24 +496,82 @@ fn run() -> ! {
                     switch_context(SCHED[cpu].scheduler_rsp.as_ptr(), entry_rsp);
                 }
 
-                // --- The task switched back to us (yield / preempt / exit). IF=0 (carried). ---
+                // --- The task switched back to us (yield / preempt / block / exit). IF=0. ---
                 SCHED[cpu].current.store(0, Ordering::Release);
+                // Consume the park action exactly once: read it and immediately reset to NONE, so a
+                // stale action can never leak into the next task's switch-back. Only a task that
+                // switched back BLOCKED has a meaningful action.
+                let park = SCHED[cpu].park_kind.swap(PARK_NONE, Ordering::Relaxed);
                 let task = unsafe { Box::from_raw(raw) };
                 match task.state.load(Ordering::Acquire) {
                     STATE_FINISHED => drop(task), // frees the stack
+                    STATE_BLOCKED => park_blocked(cpu, park, task),
                     _ => {
+                        // READY (yielded or preempted): rotate to the back of the run queue.
+                        debug_assert_eq!(park, PARK_NONE, "non-blocked task carried a park action");
                         task.state.store(STATE_READY, Ordering::Release);
                         RUN_QUEUES[cpu].lock().push_back(task);
                     }
                 }
             }
             None => {
-                // Nothing to run: sleep until an interrupt (timer or a `spawn` IPI). The `sti;
+                // Nothing to run: sleep until an interrupt (timer or a `spawn`/wake IPI). The `sti;
                 // hlt` pair is atomic — an interrupt latched before the `sti` still fires and
                 // returns past the `hlt`, so a wake that arrived in the empty-check window is not
-                // lost. On wake we loop back to the top (which `cli`s) and re-check the queue.
+                // lost. On wake we loop back to the top (which `cli`s) and re-check the queue +
+                // sleepers.
                 x86_64::instructions::interrupts::enable_and_hlt();
             }
+        }
+    }
+}
+
+/// Park a task that switched back in the BLOCKED state, per the action it set before switching.
+/// Runs in the scheduler context with IF=0 (so it cannot be preempted) and owns `task`.
+fn park_blocked(cpu: usize, park: u8, task: Box<Task>) {
+    match park {
+        PARK_WAITQ => {
+            // Lock-handoff: the blocking task acquired the wait queue's lock and held it across the
+            // switch; WE push its Box into the waiter list and then release that lock — strictly in
+            // that order. Releasing only AFTER the push is what makes the wakeup lost-proof: a
+            // `post()` on another CPU spins on the lock and so cannot observe the queue until the
+            // Box is in it. The waiter list is pre-reserved (see `Semaphore::wait`), so this
+            // `push_back` never reallocates and so never takes the heap lock under the held lock.
+            let waiters = SCHED[cpu].park_waiters.load(Ordering::Relaxed) as *mut VecDeque<Box<Task>>;
+            let lock = SCHED[cpu].park_lock.load(Ordering::Relaxed) as *const AtomicBool;
+            unsafe {
+                (*waiters).push_back(task);
+                (*lock).store(false, Ordering::Release); // release the handed-off lock, LAST
+            }
+        }
+        PARK_SLEEP => {
+            let deadline = SCHED[cpu].park_deadline.load(Ordering::Relaxed);
+            SLEEPERS[cpu].lock().push_back(Sleeper { deadline, task });
+        }
+        _ => {
+            // A BLOCKED task with no valid park action is a bug; don't leak it — drop it.
+            debug_assert!(false, "BLOCKED task with no park action");
+            drop(task);
+        }
+    }
+}
+
+/// Move every sleeper on this CPU whose deadline has passed back onto the run queue. Called at the
+/// scheduler loop top with IF=0. The sleeper lock is released before `make_ready` so we never nest
+/// it under the run-queue lock.
+fn drain_due_sleepers(cpu: usize) {
+    let now = percpu::this_cpu().ticks.load(Ordering::Relaxed);
+    loop {
+        let due = {
+            let mut sleepers = SLEEPERS[cpu].lock();
+            match sleepers.iter().position(|s| s.deadline <= now) {
+                Some(i) => sleepers.remove(i).map(|s| s.task),
+                None => None,
+            }
+        }; // sleeper lock dropped here
+        match due {
+            Some(task) => make_ready(task),
+            None => break,
         }
     }
 }
@@ -492,10 +647,12 @@ pub fn start_demo(online_aps: &[usize]) {
         spawn("coop-D", demo_coop, encode(cpu_coop, b'D'), cpu_coop);
     }
 
-    // A short-lived worker on the next AP, if present — proves exit + stack reclamation, after
-    // which that AP returns to idle.
+    // A short-lived worker plus a sleeper on the next AP, if present — the worker proves exit +
+    // stack reclamation; the sleeper proves timer-driven blocking (it parks off the run queue and
+    // wakes after a real tick delay, freeing the core meanwhile).
     if let Some(&cpu_worker) = online_aps.get(2) {
         spawn("worker-E", demo_worker, encode(cpu_worker, b'E'), cpu_worker);
+        spawn("sleep-S", demo_sleeper, encode(cpu_worker, b'S'), cpu_worker);
     }
 }
 
@@ -548,6 +705,24 @@ fn demo_worker(arg: usize) {
         yield_now();
     }
     serial_println!("SCHED: [cpu{cpu} worker-{tag}] exiting");
+    DEMO_DONE.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Sleeper: blocks for a fixed number of timer ticks each round. Printing the elapsed tick count
+/// proves it actually parked and woke (not busy-waited), and that the core was free meanwhile.
+fn demo_sleeper(arg: usize) {
+    let (cpu, tag) = decode(arg);
+    for round in 0..4u32 {
+        let before = percpu::this_cpu().ticks.load(Ordering::Relaxed);
+        serial_println!("SCHED: [cpu{cpu} sleep-{tag}] round {round}: sleeping 20 ticks (t={before})");
+        sleep_ticks(20);
+        let after = percpu::this_cpu().ticks.load(Ordering::Relaxed);
+        serial_println!(
+            "SCHED: [cpu{cpu} sleep-{tag}] round {round}: awoke after {} ticks",
+            after - before
+        );
+    }
+    serial_println!("SCHED: [cpu{cpu} sleep-{tag}] done");
     DEMO_DONE.fetch_add(1, Ordering::Relaxed);
 }
 
