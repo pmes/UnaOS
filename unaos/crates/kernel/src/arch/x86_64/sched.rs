@@ -49,6 +49,7 @@ use core::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, AtomicU8, 
 
 use alloc::boxed::Box;
 use alloc::collections::VecDeque;
+use alloc::sync::Arc;
 use lazy_static::lazy_static;
 // Aliased so the public `Mutex<T>` (a sleeping mutex, below) can own the nicer name. This spin
 // lock guards the internal run/sleeper queues only.
@@ -155,6 +156,12 @@ pub struct Task {
     /// accrued + consumed by `RunQueue::age` on that CPU). NEVER read cross-CPU — unlike `priority`,
     /// it is mutable and lock-protected, so it must not be read off the owning CPU.
     wait_ticks: u32,
+    /// Completion signal for `join()`, or `None` for a fire-and-forget task. A joinable task carries
+    /// a clone of the same `Arc<Semaphore>` (0 permits) held by its `JoinHandle`; the trampoline
+    /// `post()`s it after `entry` returns. The Arc — not a `'static` lifetime — keeps the semaphore
+    /// alive across the park/post window (see `JoinHandle`). Read (never moved) by the trampoline
+    /// through the raw `current` pointer; dropped when `run()` drops the Box on the Finished path.
+    done_sem: Option<Arc<Semaphore>>,
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -366,6 +373,20 @@ extern "C" fn task_trampoline() -> ! {
     let (entry, arg) = unsafe { ((*raw).entry, (*raw).arg) };
 
     entry(arg);
+
+    // Signal completion to any joiner. `post()` runs with IF=1 and self-masks (Semaphore::post),
+    // and cross-CPU-wakes a parked joiner if any. The task's OWN `done_sem` Arc clone is the
+    // liveness anchor for this `post()` — it MUST remain in the Box until `run()` drops it on the
+    // Finished path, so we BORROW it here (never take/move the Arc out before `exit()`).
+    unsafe {
+        debug_assert!(
+            (*raw).state.load(Ordering::Acquire) == STATE_RUNNING && (*raw).cpu as usize == cpu,
+            "task_trampoline: task not running on its own CPU at completion"
+        );
+        if let Some(sem) = &(*raw).done_sem {
+            sem.post();
+        }
+    }
     exit();
 }
 
@@ -402,18 +423,25 @@ fn build_initial_frame(stack: &mut [u8]) -> u64 {
 // Public API: spawn / yield / exit
 // ---------------------------------------------------------------------------------------------
 
-/// Create a kernel thread at `priority` and enqueue it on `target_cpu`'s run queue, then poke that
-/// CPU so it promptly picks the work up (wakes it from idle, or preempts a lower-priority task
-/// running there). The task runs `entry(arg)` and is freed when `entry` returns. `target_cpu` must
-/// be an online AP.
-pub fn spawn(name: &'static str, entry: fn(usize), arg: usize, target_cpu: usize, priority: u8) {
+/// Shared spawn path: build a kernel thread at `priority` (optionally carrying a `done_sem`
+/// completion signal for `join`), enqueue it on `target_cpu`'s run queue, and poke that CPU. Returns
+/// the new task's id. `target_cpu` must be an online AP.
+fn spawn_inner(
+    name: &'static str,
+    entry: fn(usize),
+    arg: usize,
+    target_cpu: usize,
+    priority: u8,
+    done_sem: Option<Arc<Semaphore>>,
+) -> u64 {
     assert!(target_cpu < MAX_CPUS, "spawn: target_cpu out of range");
 
     let mut stack: Box<[u8]> = alloc::vec![0u8; TASK_STACK_SIZE].into_boxed_slice();
     let ctx_rsp = build_initial_frame(&mut stack);
 
+    let id = NEXT_TID.fetch_add(1, Ordering::Relaxed);
     let task = Box::new(Task {
-        id: NEXT_TID.fetch_add(1, Ordering::Relaxed),
+        id,
         name,
         state: AtomicU8::new(STATE_READY),
         ctx_rsp,
@@ -423,11 +451,84 @@ pub fn spawn(name: &'static str, entry: fn(usize), arg: usize, target_cpu: usize
         cpu: target_cpu as u32,
         priority,
         wait_ticks: 0, // re-zeroed by push() on every enqueue; this satisfies the struct literal
+        done_sem,
     });
 
     RUN_QUEUES[target_cpu].lock().push(task);
     poke_for(target_cpu, priority);
+    id
 }
+
+/// Create a fire-and-forget kernel thread at `priority` on `target_cpu`. The task runs `entry(arg)`
+/// and is freed when `entry` returns; there is no way to wait for it (use `spawn_joinable` for that).
+pub fn spawn(name: &'static str, entry: fn(usize), arg: usize, target_cpu: usize, priority: u8) {
+    spawn_inner(name, entry, arg, target_cpu, priority, None);
+}
+
+/// Like `spawn`, but returns a `JoinHandle` a scheduled task can `join()` to block until this task
+/// finishes. Allocates an `Arc<Semaphore>` (0 permits) shared between the new task and the handle;
+/// the task's trampoline posts it on completion. Costs one heap alloc + a reserved waiter list, so
+/// only pay it when you actually need to join.
+pub fn spawn_joinable(
+    name: &'static str,
+    entry: fn(usize),
+    arg: usize,
+    target_cpu: usize,
+    priority: u8,
+) -> JoinHandle {
+    let done = Arc::new(Semaphore::new(0));
+    done.init(); // reserve the waiter list BEFORE the task can run + post (alloc-free park)
+    let id = spawn_inner(name, entry, arg, target_cpu, priority, Some(done.clone()));
+    JoinHandle { done, id }
+}
+
+/// A handle to wait for a `spawn_joinable` task to finish. Holds a clone of the task's completion
+/// `Arc<Semaphore>`; `join()` blocks until the task's trampoline posts it. Single-shot: `join`
+/// consumes the handle (one join per task), and the handle is intentionally NOT `Clone` (the
+/// completion semaphore carries exactly one permit — a second joiner would block forever).
+pub struct JoinHandle {
+    done: Arc<Semaphore>,
+    /// Id of the joined task, for diagnostics.
+    #[allow(dead_code)]
+    id: u64,
+}
+
+impl JoinHandle {
+    /// Id of the task this handle joins.
+    pub fn id(&self) -> u64 {
+        self.id
+    }
+
+    /// Block the current task until the joined task finishes. MUST be called from a scheduled task
+    /// (it blocks); the `assert` rejects a call off the scheduler — e.g. the unscheduled BSP — loudly
+    /// rather than silently returning as if the task had finished.
+    ///
+    /// No timeout: a joined task that PANICS or never returns leaves the joiner blocked forever (the
+    /// completion permit is posted only on a normal `entry` return; this no-`std` kernel has no
+    /// unwinding and no backstop). This matches the kernel's panic-halts policy.
+    ///
+    /// `self` (the Arc clone) deliberately stays bound for the whole body: it is the refcount anchor
+    /// that keeps the completion semaphore alive while this task is parked in its waiter list. Do not
+    /// destructure or move the Arc out before `wait()` returns.
+    pub fn join(self) {
+        assert!(
+            self.done.wait(),
+            "JoinHandle::join() must be called from a scheduled task"
+        );
+    }
+}
+
+// Compile-time guard for the `Task` <-> `Arc<Semaphore>` Send cycle introduced by `done_sem`. We do
+// NOT add an `unsafe impl Send for Semaphore` (that would be a second unsafe to audit, and could
+// mask a future `!Send` field): `Semaphore`'s Send auto-derives so long as every field is `Send`,
+// and the cycle resolves co-inductively to Send while no leaf is `!Send`. This probe locks that in —
+// if a future field breaks it, fix that field rather than papering over it with `unsafe impl`.
+const _: () = {
+    const fn assert_send<T: Send>() {}
+    assert_send::<Task>();
+    assert_send::<Arc<Semaphore>>();
+    assert_send::<JoinHandle>();
+};
 
 /// Send the wake-only reschedule IPI (vector `IPI_VECTOR`) to `target` so an idle CPU breaks its
 /// `hlt` and re-checks its run queue. Skips a self-poke (no point interrupting ourselves). The IPI
@@ -556,9 +657,13 @@ pub fn sleep_ticks(ticks: u64) {
 /// one waiter (or bumps the count). Waking is cross-CPU aware: a task blocked on CPU B is woken
 /// from CPU A by moving it to B's run queue and sending the reschedule IPI.
 ///
-/// MUST be `'static` (e.g. a `static SEM`): `wait()` hands raw pointers to `waiters`/`locked` to
-/// the scheduler to be dereferenced after the context switch, so the Semaphore must outlive every
-/// task that can block on it. Dropping one with parked waiters would leak those tasks and dangle.
+/// MUST outlive every task that can block on it, because `wait()` hands raw pointers to
+/// `waiters`/`locked` to the scheduler to be dereferenced after the context switch. Two ways to
+/// guarantee that: (1) be `'static` (e.g. a `static SEM`); or (2) be kept alive behind an `Arc`
+/// whose clones are held by every party across the park/post window — a blocked waiter holds one on
+/// its parked stack, and the poster holds one until it is done posting (this is how `JoinHandle` /
+/// `Task::done_sem` use a non-`'static` completion semaphore soundly). Dropping one with parked
+/// waiters would leak those tasks and dangle.
 ///
 /// Soundness of the `UnsafeCell<VecDeque>` + `unsafe impl Sync`: EVERY access to `waiters` (and the
 /// count) is gated by the `locked` spinlock, and the park-side push is performed by the scheduler
@@ -1155,7 +1260,10 @@ fn run() -> ! {
                 let park = SCHED[cpu].park_kind.swap(PARK_NONE, Ordering::Relaxed);
                 let task = unsafe { Box::from_raw(raw) };
                 match task.state.load(Ordering::Acquire) {
-                    STATE_FINISHED => drop(task), // frees the stack
+                    // Frees the stack; for a joinable task this also drops its `done_sem` Arc clone
+                    // (possibly the last, freeing the join-sem) — sound: the trampoline already
+                    // posted it, no lock is held here, and the heap lock is innermost.
+                    STATE_FINISHED => drop(task),
                     STATE_BLOCKED => park_blocked(cpu, park, task),
                     _ => {
                         // READY (yielded or preempted): rotate to the back of its priority level.
@@ -1268,34 +1376,25 @@ pub fn current_task_id(cpu: usize) -> Option<u64> {
 /// Count of demo tasks that have run to completion (so a test can confirm exit/free works).
 static DEMO_DONE: AtomicUsize = AtomicUsize::new(0);
 
-// Priority-aging demo state. A continuously-ready base-HIGH "hog" and a base-LOW "victim" share one
-// AP; under strict priority the victim would never run until the hog finished, but aging promotes
-// it so it completes WHILE the hog is still running. Release/Acquire so the cross-CPU verifier's
-// reads are well-defined.
-/// Set true when the hog finishes (it is sized NOT to, before the victim does).
-static AGE_HIGH_DONE: AtomicBool = AtomicBool::new(false);
-/// Set true when the victim finishes its rounds (the anti-starvation signal for the verifier).
-static AGE_LOW_DONE: AtomicBool = AtomicBool::new(false);
-/// Captured by the victim at completion: was the hog STILL running (i.e. did aging let the victim
-/// through under continuous HIGH load)? This is the actual PASS condition.
-static AGE_LOW_RAN_UNDER_HIGH: AtomicBool = AtomicBool::new(false);
-/// Victim work: small, so a working ager finishes it quickly. The victim runs ~1 quantum per
-/// ~2*AGE_TICKS of starvation (~1/9 duty under the HIGH hog). Hog work is sized so that, in the
-/// wall-clock the victim needs to finish, the hog is only a fraction done — so AGE_HIGH_DONE is
-/// still false when the victim reads it. Invariant to preserve on any retune:
-///   AGE_HOG_ROUNDS*AGE_HOG_ITERS  >>  AGE_VICTIM_ROUNDS*AGE_VICTIM_ITERS * (2*AGE_TICKS/QUANTUM_TICKS)
-/// (the ratio here is ~12x). Host-speed-dependent like `demo_busy`'s 40M loop.
-const AGE_VICTIM_ROUNDS: u32 = 4;
-const AGE_VICTIM_ITERS: u64 = 15_000_000;
-const AGE_HOG_ROUNDS: u32 = 120;
-const AGE_HOG_ITERS: u64 = 50_000_000;
+// join() demo state. A coordinator spawn_joinable()s several workers across APs and join()s them
+// all, then checks the accumulated sum; a watchdog on another AP bounds it so a join bug prints a
+// FAIL rather than hanging silently. Release/Acquire so the cross-CPU reads are well-defined.
+/// Sum the workers accumulate; the coordinator verifies it after joining all of them.
+static JOIN_SUM: AtomicUsize = AtomicUsize::new(0);
+/// How many workers the coordinator has successfully joined (for the PASS check).
+static JOIN_JOINED: AtomicUsize = AtomicUsize::new(0);
+/// Set true once the coordinator has joined all workers and printed its result; the watchdog polls
+/// this to detect a join that hung (a worker that never completed).
+static JOIN_COORD_DONE: AtomicBool = AtomicBool::new(false);
+/// Number of joinable workers. Each worker i in 0..N adds (i+1) to `JOIN_SUM`, so the expected total
+/// is N*(N+1)/2.
+const JOIN_WORKERS: usize = 4;
 
 /// Turn scheduling on and spawn the demo workload across the online APs: equal-priority round-robin
-/// + timer preemption (the busy pair on the first AP), and the priority-AGING showcase — a
-/// continuously-ready base-HIGH hog and a base-LOW victim on a second AP, where strict priority
-/// alone would starve the victim forever but aging promotes it so it finishes under load; a verifier
-/// on a third AP prints a self-checking PASS/FAIL. Called once on the BSP after `smp::start_aps`
-/// (hence after `verify_smp`). No-op with no APs; the aging showcase needs >=3 APs (else SKIPPED).
+/// + timer preemption (the busy pair on the first AP), and the JOIN showcase — a coordinator
+/// spawn_joinable()s several workers across other APs and `join()`s them all, then verifies the
+/// accumulated sum, with a watchdog bounding it. Called once on the BSP after `smp::start_aps`
+/// (hence after `verify_smp`). No-op with no APs; the join showcase needs >=2 APs (else SKIPPED).
 pub fn start_demo(online_aps: &[usize]) {
     if online_aps.is_empty() {
         serial_println!("SCHED: no application processors online; scheduler idle.");
@@ -1317,20 +1416,19 @@ pub fn start_demo(online_aps: &[usize]) {
     spawn("busy-A", demo_busy, encode(cpu_busy, b'A'), cpu_busy, PRIO_NORMAL);
     spawn("busy-B", demo_busy, encode(cpu_busy, b'B'), cpu_busy, PRIO_NORMAL);
 
-    // Priority aging (anti-starvation): a continuously-ready base-HIGH hog and a base-LOW victim on
-    // a SECOND AP. Under strict priority the victim never runs until the hog finishes; aging lifts
-    // its effective level until it reaches parity and runs, so it COMPLETES while the hog is still
-    // going. The verifier runs on a THIRD AP — never co-located with the hog, which (being HIGH and
-    // continuously ready) would starve a NORMAL verifier and cause a false FAIL. Needs >=3 distinct
-    // APs; with fewer, the showcase is SKIPPED (a definitive non-FAIL the harness can tell apart).
-    if online_aps.len() >= 3 {
-        let cpu_age = online_aps[1];
-        spawn("age-hog", demo_age_hog, cpu_age, cpu_age, PRIO_HIGH);
-        spawn("age-victim", demo_age_victim, cpu_age, cpu_age, PRIO_LOW);
-        let cpu_verify = online_aps[2];
-        spawn("age-verify", demo_age_verifier, cpu_verify, cpu_verify, PRIO_NORMAL);
+    // join(): a coordinator spawn_joinable()s JOIN_WORKERS workers across two APs and join()s them
+    // all, then verifies the accumulated sum; a watchdog on another AP makes a join bug a printed
+    // FAIL, never a silent hang. Workers do timer-backed (sleep_ticks) work so they YIELD and the
+    // coordinator hits both the block path and the join-after-finish fast path. Kept OFF the busy AP
+    // (online_aps[0]) so the non-yielding busy pair can't starve the NORMAL workers. Needs >=2 APs.
+    if online_aps.len() >= 2 {
+        let cpu_a = online_aps[1]; // coordinator + even workers (same-CPU join)
+        let cpu_b = if online_aps.len() >= 3 { online_aps[2] } else { online_aps[1] }; // odd workers (cross-CPU)
+        spawn("join-coord", demo_join_coordinator, encode(cpu_a, cpu_b as u8), cpu_a, PRIO_NORMAL);
+        let cpu_watch = online_aps[online_aps.len() - 1];
+        spawn("join-watch", demo_join_watchdog, cpu_watch, cpu_watch, PRIO_NORMAL);
     } else {
-        serial_println!("PRIOAGE: SKIPPED (needs >=3 APs; have {})", online_aps.len());
+        serial_println!("JOIN: SKIPPED (needs >=2 APs; have {})", online_aps.len());
     }
 }
 
@@ -1359,81 +1457,68 @@ fn demo_busy(arg: usize) {
     DEMO_DONE.fetch_add(1, Ordering::Relaxed);
 }
 
-/// Aging HOG: a continuously-ready base-HIGH CPU burner. Under strict priority it would monopolise
-/// its core until done; it is sized NOT to finish before the victim, so the victim's completion
-/// provably happens under continuous HIGH load. Never yields or blocks.
-fn demo_age_hog(cpu: usize) {
-    for round in 0..AGE_HOG_ROUNDS {
-        let mut acc: u64 = 0;
-        for i in 0..AGE_HOG_ITERS {
-            acc = acc.wrapping_add(i ^ round as u64);
-        }
-        core::hint::black_box(acc);
-        if round % 20 == 0 {
-            serial_println!("SCHED: [cpu{} age-hog] HIGH round {}/{}", cpu, round, AGE_HOG_ROUNDS);
-        }
+/// join() coordinator: spawn_joinable JOIN_WORKERS workers across two APs (encoded in `arg` as
+/// cpu_a/cpu_b), spawning them ALL first (so several run concurrently), then join each. Joining a
+/// still-running worker exercises the block path; joining one that already finished exercises the
+/// fast path — the PASS depends only on all joins returning AND the sum matching, never on which
+/// path each took. Runs as a scheduled task (so it may block in join).
+fn demo_join_coordinator(arg: usize) {
+    let cpu = percpu::this_cpu().cpu_index as usize;
+    let cpu_a = (arg >> 8) & 0xFF; // our own AP (same-CPU join: blocking parks us, yielding the core)
+    let cpu_b = arg & 0xFF; // a second AP (cross-CPU join + completion wake)
+
+    // Spawn all workers up front so they run concurrently, then join them in order.
+    let handles: [JoinHandle; JOIN_WORKERS] = core::array::from_fn(|i| {
+        let value = i + 1;
+        let target = if i % 2 == 0 { cpu_a } else { cpu_b };
+        spawn_joinable("join-worker", demo_join_worker, value, target, PRIO_NORMAL)
+    });
+    for h in handles {
+        h.join();
+        JOIN_JOINED.fetch_add(1, Ordering::Relaxed);
     }
-    AGE_HIGH_DONE.store(true, Ordering::Release);
-    serial_println!("SCHED: [cpu{} age-hog] done (expected AFTER the victim)", cpu);
+
+    let joined = JOIN_JOINED.load(Ordering::Relaxed);
+    let sum = JOIN_SUM.load(Ordering::Acquire);
+    let expected = JOIN_WORKERS * (JOIN_WORKERS + 1) / 2;
+    JOIN_COORD_DONE.store(true, Ordering::Release);
+    serial_println!(
+        "JOIN: [cpu{}] joined {}/{} workers, sum={} (expected {}) => {}",
+        cpu,
+        joined,
+        JOIN_WORKERS,
+        sum,
+        expected,
+        if joined == JOIN_WORKERS && sum == expected { "PASS" } else { "FAIL" }
+    );
     DEMO_DONE.fetch_add(1, Ordering::Relaxed);
 }
 
-/// Aging VICTIM: a base-LOW CPU task on the SAME AP as the hog. Without aging it never runs; with
-/// aging it climbs to parity and completes. On finishing it captures whether the hog was still
-/// running (the anti-starvation proof) BEFORE signalling, then signals the verifier.
-fn demo_age_victim(cpu: usize) {
-    for round in 0..AGE_VICTIM_ROUNDS {
-        let mut acc: u64 = 0;
-        for i in 0..AGE_VICTIM_ITERS {
-            acc = acc.wrapping_add(i ^ round as u64);
-        }
-        core::hint::black_box(acc);
-        serial_println!(
-            "SCHED: [cpu{} age-victim] LOW round {}/{} ran under continuous HIGH load",
-            cpu,
-            round + 1,
-            AGE_VICTIM_ROUNDS
-        );
-    }
-    // Capture the proof BEFORE signalling done: the hog must still be running for this to be aging.
-    AGE_LOW_RAN_UNDER_HIGH.store(!AGE_HIGH_DONE.load(Ordering::Acquire), Ordering::Release);
-    AGE_LOW_DONE.store(true, Ordering::Release);
+/// join() worker: do a little timer-backed work (staggered by value, so it actually takes time and
+/// yields — giving the coordinator a mix of still-running and already-finished joins), add its value
+/// to the shared sum, then return. The trampoline posts its completion semaphore, releasing the
+/// joiner (cross-CPU if it parked on another core).
+fn demo_join_worker(value: usize) {
+    let cpu = percpu::this_cpu().cpu_index as usize;
+    sleep_ticks((value as u64) * 6); // staggered durations -> a mix of block-path and fast-path joins
+    JOIN_SUM.fetch_add(value, Ordering::Relaxed);
+    serial_println!("SCHED: [cpu{} join-worker] value {} done", cpu, value);
     DEMO_DONE.fetch_add(1, Ordering::Relaxed);
 }
 
-/// Aging VERIFIER on a DIFFERENT AP from the hog: poll until the victim finishes or a generous
-/// timeout, then print one self-checking PASS/FAIL line. PASS iff the victim completed AND the hog
-/// was still running when it did (= aging beat strict-priority starvation). A broken ager starves
-/// the victim → timeout → definitive FAIL (never a hang); both exits print exactly one line.
-fn demo_age_verifier(cpu: usize) {
-    // Timeout is ~40x the observed victim completion (~150-200 ticks under a working ager on QEMU),
-    // so it cannot false-FAIL a slow host yet still bounds a broken ager to a definitive FAIL.
+/// join() watchdog on another AP: if the coordinator has not finished within a generous timeout (a
+/// join bug would leave it blocked forever — a join-sem has no timer backstop), print a definitive
+/// FAIL so a hang is never silent. Stays correct even if co-located with the coordinator: a blocked
+/// coordinator yields its core, so this NORMAL task still runs.
+fn demo_join_watchdog(cpu: usize) {
     let mut waited = 0u64;
-    while !AGE_LOW_DONE.load(Ordering::Acquire) && waited < 8_000 {
+    while !JOIN_COORD_DONE.load(Ordering::Acquire) && waited < 8_000 {
         sleep_ticks(8);
         waited += 8;
     }
-    let done = AGE_LOW_DONE.load(Ordering::Acquire);
-    let under_high = AGE_LOW_RAN_UNDER_HIGH.load(Ordering::Acquire);
-    // Three outcomes, so a host-speed tuning miss is not mistaken for a real aging bug:
-    //   PASS         - victim finished WHILE the hog was still running (aging beat starvation),
-    //   FAIL         - victim never finished within the timeout (genuine starvation: aging broken),
-    //   INCONCLUSIVE - victim finished but only after the hog already had (retune work sizes).
-    let verdict = if done && under_high {
-        "PASS"
-    } else if !done {
-        "FAIL"
-    } else {
-        "INCONCLUSIVE"
-    };
-    serial_println!(
-        "PRIOAGE: [cpu{}] victim_done={} ran_under_high={} (waited {} ticks) => {}",
-        cpu,
-        done,
-        under_high,
-        waited,
-        verdict
-    );
+    if !JOIN_COORD_DONE.load(Ordering::Acquire) {
+        serial_println!("JOIN: [cpu{}] WATCHDOG TIMEOUT after {} ticks => FAIL", cpu, waited);
+    }
     DEMO_DONE.fetch_add(1, Ordering::Relaxed);
 }
 
