@@ -39,6 +39,16 @@ const RST: u8 = 0x04;
 const PSH: u8 = 0x08;
 const ACK: u8 = 0x10;
 
+/// Wraparound-safe TCP sequence comparison: is `a` strictly before `b` in sequence space?
+/// (RFC 1982 serial-number arithmetic — compares the signed 32-bit difference.)
+fn seq_lt(a: u32, b: u32) -> bool {
+    (a.wrapping_sub(b) as i32) < 0
+}
+/// Wraparound-safe: is `a` strictly after `b`?
+fn seq_gt(a: u32, b: u32) -> bool {
+    seq_lt(b, a)
+}
+
 /// Zero-copy parser for a TCP segment.
 pub struct TcpSegment<'a> {
     buffer: &'a [u8],
@@ -179,6 +189,13 @@ struct TcpConn {
     un_buf: [u8; RETX_CAP],
     rto_deadline: u64, // tick at which to retransmit if still unacked
     retries: u8,
+    // Reassembly of a single out-of-order segment (one extent ahead of rcv_nxt). Buffered on
+    // arrival and delivered (echoed) once the gap fills and the send window is free.
+    ooo: bool,
+    ooo_seq: u32,
+    ooo_len: usize,
+    ooo_fin: bool,
+    ooo_buf: [u8; RETX_CAP],
 }
 
 impl TcpConn {
@@ -187,6 +204,7 @@ impl TcpConn {
             state, remote_ip, remote_mac, remote_port, snd_nxt, rcv_nxt,
             unacked: false, un_seq: 0, un_flags: 0, un_paylen: 0, un_buf: [0; RETX_CAP],
             rto_deadline: 0, retries: 0,
+            ooo: false, ooo_seq: 0, ooo_len: 0, ooo_fin: false, ooo_buf: [0; RETX_CAP],
         }
     }
 
@@ -277,13 +295,23 @@ impl TcpConn {
                 // Expect the ACK completing the handshake (it may already carry data).
                 if flags & ACK != 0 && their_ack == self.snd_nxt {
                     self.state = ConnState::Established;
-                    (self.on_data(out, our_ip, our_mac, local_port, window, now, their_seq, flags, payload), false)
+                    let resp = self.on_data(out, our_ip, our_mac, local_port, window, now, their_seq, flags, payload);
+                    (resp, false)
                 } else {
                     (None, false)
                 }
             }
             ConnState::Established => {
-                (self.on_data(out, our_ip, our_mac, local_port, window, now, their_seq, flags, payload), false)
+                // Process this segment, then — if the cumulative ACK above just freed our
+                // one-segment send window — deliver a buffered out-of-order segment that has
+                // become in-order. We must NOT gate this on on_data() returning None: a normal
+                // peer's window-freeing ACK sits at SND.NXT (past the buffered extent), which
+                // on_data() sees as "future" and answers with a dup-ACK. So attempt drain()
+                // regardless and PREFER its echo over a dup-ACK (only one reply per RX frame);
+                // if drain has nothing to deliver it returns None and we keep on_data's response.
+                let resp = self.on_data(out, our_ip, our_mac, local_port, window, now, their_seq, flags, payload);
+                let resp = self.drain(out, our_ip, our_mac, local_port, window, now).or(resp);
+                (resp, false)
             }
             ConnState::LastAck => {
                 // Our FIN is acknowledged — connection closed; free the slot.
@@ -311,12 +339,30 @@ impl TcpConn {
         flags: u8,
         payload: &[u8],
     ) -> Option<usize> {
-        // Out-of-order: duplicate-ACK what we have, without consuming/echoing (not retransmitted).
-        if their_seq != self.rcv_nxt {
+        let has_fin = flags & FIN != 0;
+
+        // Future segment (a gap ahead of rcv_nxt): buffer it as the single out-of-order extent
+        // for later reassembly, then duplicate-ACK rcv_nxt to signal the gap. We hold only one
+        // extent — a second, different future segment is dropped (the peer retransmits it).
+        if seq_gt(their_seq, self.rcv_nxt) {
+            if (!payload.is_empty() || has_fin)
+                && payload.len() <= RETX_CAP
+                && (!self.ooo || self.ooo_seq == their_seq)
+            {
+                self.ooo = true;
+                self.ooo_seq = their_seq;
+                self.ooo_len = payload.len();
+                self.ooo_fin = has_fin;
+                self.ooo_buf[..payload.len()].copy_from_slice(payload);
+            }
             return self.emit(out, our_ip, our_mac, local_port, window, ACK, self.snd_nxt, self.rcv_nxt, &[]);
         }
+        // Old / already-received (a retransmit below rcv_nxt): duplicate-ACK.
+        if seq_lt(their_seq, self.rcv_nxt) {
+            return self.emit(out, our_ip, our_mac, local_port, window, ACK, self.snd_nxt, self.rcv_nxt, &[]);
+        }
+        // Otherwise their_seq == rcv_nxt: this segment is in order.
 
-        let has_fin = flags & FIN != 0;
         if payload.is_empty() && !has_fin {
             return None; // a bare ACK — nothing to send
         }
@@ -350,6 +396,45 @@ impl TcpConn {
         self.rcv_nxt = new_rcv;
         self.snd_nxt = self.snd_nxt.wrapping_add(seqlen);
         self.arm(now, seq, resp_flags, payload);
+        if has_fin {
+            self.state = ConnState::LastAck;
+        }
+        Some(n)
+    }
+
+    /// Deliver a buffered out-of-order segment that has become in-order, now that the send
+    /// window is free (an ACK cleared the outstanding segment). Echoes it exactly like fresh
+    /// in-order data. Returns the echo response, or `None` if there is nothing to deliver.
+    #[allow(clippy::too_many_arguments)]
+    fn drain(&mut self, out: &mut [u8], our_ip: [u8; 4], our_mac: [u8; 6], local_port: u16, window: u16, now: u64) -> Option<usize> {
+        // Discard a buffered extent already covered by rcv_nxt (stale).
+        if self.ooo && seq_lt(self.ooo_seq, self.rcv_nxt) {
+            self.ooo = false;
+        }
+        if self.unacked || !self.ooo || self.ooo_seq != self.rcv_nxt {
+            return None;
+        }
+        let len = self.ooo_len;
+        let has_fin = self.ooo_fin;
+        let mut tmp = [0u8; RETX_CAP];
+        tmp[..len].copy_from_slice(&self.ooo_buf[..len]);
+
+        let mut resp_flags = ACK | PSH;
+        if has_fin {
+            resp_flags |= FIN;
+        }
+        let mut new_rcv = self.rcv_nxt.wrapping_add(len as u32);
+        if has_fin {
+            new_rcv = new_rcv.wrapping_add(1);
+        }
+        let seq = self.snd_nxt;
+        let seqlen = len as u32 + if has_fin { 1 } else { 0 };
+        // Serialize first; commit + clear the extent only on success (no-desync).
+        let n = self.emit(out, our_ip, our_mac, local_port, window, resp_flags, seq, new_rcv, &tmp[..len])?;
+        self.rcv_nxt = new_rcv;
+        self.snd_nxt = self.snd_nxt.wrapping_add(seqlen);
+        self.arm(now, seq, resp_flags, &tmp[..len]);
+        self.ooo = false;
         if has_fin {
             self.state = ConnState::LastAck;
         }

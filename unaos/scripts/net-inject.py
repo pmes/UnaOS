@@ -534,6 +534,67 @@ def test_tcp_retransmit(s, guest_mac):
     return True
 
 
+def test_tcp_out_of_order(s, guest_mac):
+    """Reordering: send two data segments OUT OF ORDER (B before A). The listener must buffer B,
+    echo A when it arrives, then — once A's echo is acked and the send window frees — deliver the
+    buffered B. So the echoes come back in order: A's data, then B's data."""
+    print("--- TCP out-of-order reassembly ---")
+    MASK = 0xFFFFFFFF
+    cport, c_isn = 40070, 0x7000
+
+    def cs(seq, ack, flags, payload=b""):
+        send_frame(s, eth(guest_mac, MY_MAC, 0x0800,
+                          ipv4(MY_IP, GUEST_IP, 6, tcp(cport, 7, seq, ack, flags, 4096, MY_IP, GUEST_IP, payload))))
+
+    def recv_echo(want):  # next segment carrying exactly `want` (skip dup-ACKs / unrelated)
+        for _ in range(20):
+            r = recv_tcp(s, cport)
+            if r is None:
+                return None
+            if r[3] == want:
+                return r
+        return None
+
+    cs(c_isn, 0, SYN)
+    sa = recv_tcp(s, cport)
+    if sa is None or (sa[0] & (SYN | ACK)) != (SYN | ACK):
+        print("FAIL: no SYN-ACK for OOO test (%s)" % (sa,)); return False
+    s_isn = sa[1]
+    cs(c_isn + 1, s_isn + 1, ACK)
+
+    data_a, data_b = b"AAAA-first", b"BBBB-second"
+    seg_b_seq = (c_isn + 1 + len(data_a)) & MASK
+    # Send B (the SECOND segment) FIRST, then A — the listener must reorder.
+    cs(seg_b_seq, s_isn + 1, PSH | ACK, data_b)
+    cs(c_isn + 1, s_isn + 1, PSH | ACK, data_a)
+    print("-> sent B (seq=%d) before A (seq=%d)" % (seg_b_seq, c_isn + 1))
+
+    ea = recv_echo(data_a)
+    if ea is None:
+        print("FAIL: A was not echoed first"); return False
+    print("<- echo A %r seq=%d" % (ea[3], ea[1]))
+    # ACK A's echo -> frees the send window -> the buffered B must be delivered. Use the REAL
+    # peer SND.NXT for this bare ACK's seq (past B = c_isn+1+lenA+lenB), exactly what an RFC-793
+    # stack sends, so we exercise the real-peer drain path (not a crafted seq == our rcv_nxt).
+    cs((c_isn + 1 + len(data_a) + len(data_b)) & MASK, (s_isn + 1 + len(data_a)) & MASK, ACK)
+    eb = recv_echo(data_b)
+    if eb is None:
+        print("FAIL: buffered B was not delivered after A"); return False
+    if eb[1] != (s_isn + 1 + len(data_a)) & MASK:
+        print("FAIL: B echo seq=%d, expected %d (must follow A)" % (eb[1], (s_isn + 1 + len(data_a)) & MASK))
+        return False
+    print("<- echo B %r seq=%d (delivered in order, after A)   [TCP OUT-OF-ORDER OK]" % (eb[3], eb[1]))
+
+    nb = len(data_a) + len(data_b)
+    cs((c_isn + 1 + nb) & MASK, (s_isn + 1 + nb) & MASK, ACK)
+    cs((c_isn + 1 + nb) & MASK, (s_isn + 1 + nb) & MASK, FIN | ACK)
+    fin = recv_tcp(s, cport)
+    if fin is None or (fin[0] & FIN) == 0:
+        print("FAIL: no FIN-ACK after OOO test (%s)" % (fin,)); return False
+    cs((c_isn + 2 + nb) & MASK, (s_isn + 2 + nb) & MASK, ACK)
+    return True
+
+
 def main():
     s = None
     for _ in range(80):
@@ -665,6 +726,10 @@ def main():
 
     # --- TCP retransmission / RTO (loss injection: withhold ACKs, expect resends) ---
     if not test_tcp_retransmit(s, guest_mac):
+        return 1
+
+    # --- TCP out-of-order reassembly (send segments swapped, expect in-order echoes) ---
+    if not test_tcp_out_of_order(s, guest_mac):
         return 1
 
     print("ALL CHECKS PASSED")
