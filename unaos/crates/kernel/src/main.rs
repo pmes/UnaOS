@@ -46,6 +46,16 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     let dtb_addr = boot_info.dtb_addr;
     let dtb_size = boot_info.dtb_size;
 
+    // EDID/mode-selection diagnostics (read before memory::init consumes boot_info); only the
+    // bootlog build uses them, so gate the extraction to avoid unused-field warnings elsewhere.
+    #[cfg(feature = "bootlog")]
+    let (edid_native_w, edid_native_h, edid_source, mode_action) = (
+        boot_info.edid_native_width,
+        boot_info.edid_native_height,
+        boot_info.edid_source,
+        boot_info.mode_action,
+    );
+
     // 4. Global Heap Allocation (Phase 3 Memory Translation)
     unaos_kernel::arch::memory::init(boot_info);
     serial_println!(":: KERNEL HEAP ALLOCATED ::");
@@ -85,6 +95,19 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
             framebuffer_size,
             info.stride * info.height * info.bytes_per_pixel
         );
+        let edid_src = match edid_source {
+            1 => "ACTIVE-protocol",
+            2 => "DISCOVERED-protocol",
+            _ => "none",
+        };
+        let action = match mode_action {
+            1 => "set EDID-native mode",
+            2 => "set fallback linear mode",
+            3 => "headless (no linear fb)",
+            _ => "kept firmware current mode",
+        };
+        serial_println!(":: EDID read: source={}  native={}x{} ::", edid_src, edid_native_w, edid_native_h);
+        serial_println!(":: mode selection: {} ::", action);
         serial_println!(":: GUI suppressed; boot log held on screen. Power off when done. ::");
         unaos_kernel::arch::hlt_loop();
     }

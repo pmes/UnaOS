@@ -58,22 +58,23 @@ fn parse_edid_native(bytes: &[u8]) -> Option<(usize, usize)> {
 
 /// Read the monitor's native resolution from EDID on `handle`, trying the ACTIVE then DISCOVERED
 /// protocol. `None` if no EDID is exposed — callers then fall back to the firmware's current mode.
-fn edid_native_resolution(handle: uefi::Handle) -> Option<(usize, usize)> {
+/// Returns `(width, height, source)` where source is 1 = ACTIVE protocol, 2 = DISCOVERED protocol.
+fn edid_native_resolution(handle: uefi::Handle) -> Option<(usize, usize, u32)> {
     // Safety: the firmware owns the EDID buffer; it's valid while boot services are live (we read
     // it now, before exit_boot_services). `size_of_edid` is the firmware-reported length.
     if let Ok(p) = boot::open_protocol_exclusive::<EdidActiveProtocol>(handle) {
         if !p.edid.is_null() && p.size_of_edid >= 128 {
             let bytes = unsafe { core::slice::from_raw_parts(p.edid, p.size_of_edid as usize) };
-            if let Some(r) = parse_edid_native(bytes) {
-                return Some(r);
+            if let Some((w, h)) = parse_edid_native(bytes) {
+                return Some((w, h, 1));
             }
         }
     }
     if let Ok(p) = boot::open_protocol_exclusive::<EdidDiscoveredProtocol>(handle) {
         if !p.edid.is_null() && p.size_of_edid >= 128 {
             let bytes = unsafe { core::slice::from_raw_parts(p.edid, p.size_of_edid as usize) };
-            if let Some(r) = parse_edid_native(bytes) {
-                return Some(r);
+            if let Some((w, h)) = parse_edid_native(bytes) {
+                return Some((w, h, 2));
             }
         }
     }
@@ -102,7 +103,12 @@ fn main() -> Status {
     let fb_addr: u64;
     let fb_size: usize;
     let fb_info: FrameBufferInfo;
-    
+    // Display mode-selection diagnostics, surfaced to the kernel via BootInfo (bootlog readout).
+    let mut edid_native_w: u32 = 0;
+    let mut edid_native_h: u32 = 0;
+    let mut edid_source: u32 = 0;
+    let mut mode_action: u32 = 0;
+
     {
         let gop_handle = match boot::get_handle_for_protocol::<GraphicsOutput>() {
             Ok(handle) => handle,
@@ -145,9 +151,15 @@ fn main() -> Status {
         }
 
         // The monitor's native resolution from EDID, if the firmware exposes it.
-        let native = edid_native_resolution(gop_handle);
-        match native {
-            Some((w, h)) => log::info!("EDID: monitor native resolution {}x{}", w, h),
+        let edid = edid_native_resolution(gop_handle);
+        let native = edid.map(|(w, h, _)| (w, h));
+        match edid {
+            Some((w, h, s)) => {
+                edid_native_w = w as u32;
+                edid_native_h = h as u32;
+                edid_source = s;
+                log::info!("EDID: monitor native resolution {}x{} (source {})", w, h, s);
+            }
             None => log::info!("EDID: not available; using the firmware's current mode"),
         }
 
@@ -165,23 +177,22 @@ fn main() -> Status {
         //   2. if the current mode is already linear, keep it (firmware set it, usually from EDID); else
         //   3. the current mode is BltOnly/Bitmask (no linear framebuffer) so we MUST switch: prefer a
         //      linear mode at the firmware's chosen resolution, else the largest linear within budget.
-        let target: Option<uefi::proto::console::gop::Mode> = {
-            let by_native = native
-                .and_then(|res| gop.modes().find(|m| m.info().resolution() == res && usable(m.info())));
-            if by_native.is_some() {
-                by_native
-            } else if cur_linear {
-                None
-            } else {
-                gop.modes()
-                    .find(|m| m.info().resolution() == cur && usable(m.info()))
-                    .or_else(|| {
-                        gop.modes().filter(|m| usable(m.info())).max_by_key(|m| {
-                            let (w, h) = m.info().resolution();
-                            w * h
-                        })
+        let by_native = native
+            .and_then(|res| gop.modes().find(|m| m.info().resolution() == res && usable(m.info())));
+        let target_is_native = by_native.is_some();
+        let target: Option<uefi::proto::console::gop::Mode> = if by_native.is_some() {
+            by_native
+        } else if cur_linear {
+            None
+        } else {
+            gop.modes()
+                .find(|m| m.info().resolution() == cur && usable(m.info()))
+                .or_else(|| {
+                    gop.modes().filter(|m| usable(m.info())).max_by_key(|m| {
+                        let (w, h) = m.info().resolution();
+                        w * h
                     })
-            }
+                })
         };
 
         match target {
@@ -190,7 +201,11 @@ fn main() -> Status {
                 // Switch when the resolution changes or the current mode lacks a linear framebuffer.
                 if (w, h) != cur || !cur_linear {
                     match gop.set_mode(&mode) {
-                        Ok(()) => log::info!("GOP: set linear mode {}x{}", w, h),
+                        Ok(()) => {
+                            // 1 = drove the panel to its EDID-native res; 2 = fallback linear mode.
+                            mode_action = if target_is_native { 1 } else { 2 };
+                            log::info!("GOP: set linear mode {}x{}", w, h);
+                        }
                         Err(e) => log::warn!(
                             "GOP: set_mode {}x{} failed ({:?}); current {}x{}", w, h, e, cur.0, cur.1
                         ),
@@ -217,6 +232,7 @@ fn main() -> Status {
             let mut fb = gop.frame_buffer();
             (fb.as_mut_ptr() as u64, fb.size())
         } else {
+            mode_action = 3; // headless: no linear framebuffer available
             log::warn!("GOP: active mode has no linear framebuffer; booting without a display");
             (0u64, 0usize)
         };
@@ -443,6 +459,10 @@ fn main() -> Status {
         dtb_size,
         memory_regions_addr: 0,
         memory_regions_len: 0,
+        edid_native_width: edid_native_w,
+        edid_native_height: edid_native_h,
+        edid_source,
+        mode_action,
     });
     let boot_info_static = alloc::boxed::Box::leak(boot_info);
 
