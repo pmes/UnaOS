@@ -36,7 +36,13 @@ lazy_static! {
 
 #[doc(hidden)]
 pub fn _print(args: fmt::Arguments) {
-    SERIAL_PORT.lock().write_fmt(args).unwrap();
+    // Guard the serial lock with interrupts masked (matching x86) so an interrupt handler that
+    // logs can't deadlock against an in-progress print holding the same lock.
+    crate::arch::without_interrupts(|| {
+        SERIAL_PORT.lock().write_fmt(args).unwrap();
+    });
+    // Mirror to the framebuffer console (visible without a serial port). fbcon self-guards.
+    crate::fbcon::_print(args);
 }
 
 // Expression-style (parentheses, no trailing semicolon) so the macros work in both

@@ -37,6 +37,9 @@ pub fn _print(args: ::core::fmt::Arguments) {
             .write_fmt(args)
             .expect("Printing to serial failed");
     });
+    // Mirror to the framebuffer console so diagnostics/panics are visible on hardware that has
+    // no serial port. `Arguments` is Copy; fbcon self-guards (try_lock + interrupts off).
+    crate::fbcon::_print(args);
 }
 
 #[macro_export]

@@ -122,7 +122,8 @@ launch_aarch64() {
         -device ramfb \
         -no-reboot \
         -no-shutdown \
-        -d guest_errors
+        -d guest_errors \
+        ${UNAOS_QEMU_EXTRA:-}
 }
 
 # Headless aarch64 run: serial -> target/serial-arm.log, self-terminates after N secs.
@@ -137,7 +138,8 @@ test_aarch64() {
         -machine virt,virtualization=on -cpu cortex-a72 -smp 4 -m 1G \
         -drive if=pflash,format=raw,readonly=on,file="$AAVMF_PATH" \
         -drive format=raw,file=fat:rw:"$ESP_DIR_ARM" \
-        -serial "file:${logf}" -device ramfb -display none -no-reboot -no-shutdown &
+        -serial "file:${logf}" -device ramfb -display none -no-reboot -no-shutdown \
+        ${UNAOS_QEMU_EXTRA:-} &
     local qpid=$!
     sleep "$secs"
     kill "$qpid" 2>/dev/null || true

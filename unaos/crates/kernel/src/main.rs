@@ -22,6 +22,15 @@ pub extern "C" fn _start(boot_info: &'static mut BootInfo) -> ! {
 }
 
 fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
+    // 0. Framebuffer log sink FIRST — mirror every serial_println! (and panics) to the screen,
+    //    so boot diagnostics are visible on real hardware that has no serial port. No-op if the
+    //    firmware gave us no framebuffer. The GUI repaints over it later on a successful boot.
+    unaos_kernel::fbcon::init(
+        boot_info.framebuffer_addr,
+        boot_info.framebuffer_size,
+        boot_info.framebuffer_info,
+    );
+
     // 1. Core Hardware Init (GDT, IDT, local APIC for x86_64, GIC for aarch64)
     unaos_kernel::init();
 
@@ -137,6 +146,10 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
 
 #[panic_handler]
 fn panic(info: &PanicInfo) -> ! {
+    // Paint a red panic backdrop on the framebuffer (visible on hardware with no serial), then
+    // print the message — serial_println! mirrors it onto that backdrop via fbcon.
+    unaos_kernel::fbcon::panic_screen();
+    serial_println!("=== KERNEL PANIC ===");
     serial_println!("{}", info);
     unaos_kernel::arch::hlt_loop();
 }
