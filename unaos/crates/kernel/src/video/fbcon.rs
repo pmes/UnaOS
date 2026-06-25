@@ -18,8 +18,16 @@
 // log (or a red panic screen) stays up.
 
 use crate::video::FrameBuffer;
+use core::sync::atomic::{AtomicBool, Ordering};
 use spin::Mutex;
 use unaos_boot_info::FrameBufferInfo;
+
+/// Once the GUI takes ownership of the screen (the double-buffered `Screen`), fbcon must stop
+/// mirroring serial output onto the framebuffer — otherwise post-boot diagnostics (e.g. the
+/// xHCI enumeration the main loop drives) would scribble over the GUI, and the damage-tracked
+/// flush would not repaint over them. Set by `detach()`; cleared by `panic_screen()` so a panic
+/// is still drawn on hardware with no serial port. Serial output itself is unaffected.
+static GUI_ACTIVE: AtomicBool = AtomicBool::new(false);
 
 const CELL_W: usize = 8;
 const CELL_H: usize = 8;
@@ -126,6 +134,10 @@ pub fn init(fb_addr: u64, fb_len: usize, info: FrameBufferInfo) {
 /// deadlock: interrupts are masked and the lock is `try_lock`ed, so a contended line just skips
 /// the screen (serial still has it) rather than spinning.
 pub fn _print(args: core::fmt::Arguments) {
+    // Once the GUI owns the screen, don't mirror to the framebuffer (serial still gets it).
+    if GUI_ACTIVE.load(Ordering::Relaxed) {
+        return;
+    }
     crate::arch::without_interrupts(|| {
         if let Some(mut c) = FBCON.try_lock() {
             if c.ready {
@@ -148,10 +160,18 @@ impl core::fmt::Write for Sink<'_> {
     }
 }
 
+/// Hand the framebuffer to the GUI: stop mirroring serial output onto it. Call once the GUI has
+/// painted its first frame. Serial output is unaffected; panics re-enable the mirror.
+pub fn detach() {
+    GUI_ACTIVE.store(true, Ordering::Relaxed);
+}
+
 /// Repaint the screen as a panic backdrop (dark red) and home the cursor, so the panic message
 /// that follows is unmissable on hardware. Best-effort: `try_lock` to avoid hanging if the lock
-/// was held when the panic fired.
+/// was held when the panic fired. Re-enables the serial mirror first (the GUI may have detached
+/// it) so the panic text that `serial_println!` emits next lands on this red backdrop.
 pub fn panic_screen() {
+    GUI_ACTIVE.store(false, Ordering::Relaxed);
     crate::arch::without_interrupts(|| {
         if let Some(mut c) = FBCON.try_lock() {
             if c.ready {

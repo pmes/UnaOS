@@ -14,7 +14,7 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-use crate::video::FrameBuffer;
+use crate::video::Screen;
 use lazy_static::lazy_static;
 use spin::Mutex;
 
@@ -121,18 +121,28 @@ fn pop_event() -> Option<Event> {
 
 // --- PAL IMPLEMENTATION ---
 pub struct TargetPal<'a> {
-    pub fb: &'a mut FrameBuffer,
+    pub surface: &'a mut Screen,
 }
 
 impl<'a> TargetPal<'a> {
-    pub fn new(fb: &'a mut FrameBuffer) -> Self {
-        Self { fb }
+    pub fn new(surface: &'a mut Screen) -> Self {
+        Self { surface }
     }
 }
 
 impl<'a> GneissPal for TargetPal<'a> {
     fn draw_pixel(&mut self, x: u32, y: u32, color: u32) {
-        self.fb.put_pixel(x as usize, y as usize, color);
+        self.surface.put_pixel(x as usize, y as usize, color);
+    }
+
+    // Override the trait defaults to use the surface's bulk ops: one back-buffer fill + one
+    // damage union, instead of a per-pixel loop that unions a 1x1 rect a million times.
+    fn clear_screen(&mut self, color: u32) {
+        self.surface.fill_screen(color);
+    }
+
+    fn draw_rect(&mut self, x: usize, y: usize, w: usize, h: usize, color: u32) {
+        self.surface.fill_rect(x, y, w, h, color);
     }
 
     fn poll_event(&mut self) -> Event {
@@ -142,13 +152,16 @@ impl<'a> GneissPal for TargetPal<'a> {
         }
     }
 
-    fn render(&mut self) {}
+    /// Present the frame: flush the damaged region of the back buffer to the framebuffer.
+    fn render(&mut self) {
+        self.surface.flush();
+    }
 
     fn width(&self) -> u32 {
-        self.fb.width() as u32
+        self.surface.width() as u32
     }
 
     fn height(&self) -> u32 {
-        self.fb.height() as u32
+        self.surface.height() as u32
     }
 }

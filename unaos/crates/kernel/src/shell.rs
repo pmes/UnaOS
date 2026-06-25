@@ -41,11 +41,16 @@ impl History {
     }
 }
 
-pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetPal) {
+/// Run one command. Returns `true` if the command took over the whole screen with its own
+/// graphics (e.g. `vug`), so the caller should NOT repaint the console over it.
+pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetPal) -> bool {
     // Split command and args (simple whitespace split)
     let mut parts = cmd_line.trim().split_whitespace();
     let command = parts.next().unwrap_or("");
     let args: Vec<&str> = parts.collect();
+
+    // The `vug` command paints a full-screen demo; everything else leaves the console visible.
+    let took_screen = command == "vug";
 
     match command {
         "ver" | "version" => {
@@ -140,6 +145,8 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
             console.println("Unknown command. Type 'help' for assistance.");
         }
     }
+
+    took_screen
 }
 
 /// Print `data` as a classic hex dump (offset, 16 hex bytes, ASCII gutter) to the console.

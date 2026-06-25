@@ -64,10 +64,20 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     }
 
     let mut console = unaos_kernel::console::Console::new();
-    let mut fb_guard = unaos_kernel::video::WRITER.lock();
-    let mut pal = unaos_kernel::pal::TargetPal::new(&mut *fb_guard);
-    
+
+    // Build the double-buffered screen over the framebuffer. FrameBuffer is Copy, so we take a
+    // handle and release the WRITER lock immediately. All GUI drawing now goes to a cached-RAM
+    // back buffer; render() flushes only the damaged region to the (slow) framebuffer.
+    let front_fb = *unaos_kernel::video::WRITER.lock();
+    let mut screen = unaos_kernel::video::Screen::new(front_fb);
+    let mut pal = unaos_kernel::pal::TargetPal::new(&mut screen);
+
     console.draw(&mut pal);
+    pal.render();
+
+    // The GUI now owns the screen — stop fbcon mirroring serial output onto the framebuffer
+    // (a panic re-enables it). Boot diagnostics up to this first frame stay on screen until now.
+    unaos_kernel::video::fbcon::detach();
 
     use unaos_kernel::pal::GneissPal;
     let mut mouse_px: i32 = (pal.width() / 2) as i32;
@@ -92,8 +102,13 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
                 if c == b'\n' || c == b'\r' {
                     let cmd = console.current_input.clone();
                     console.current_input.clear();
-                    unaos_kernel::shell::dispatch_command(&cmd, &mut console, &mut pal);
-                    console.draw(&mut pal);
+                    // A command may take over the whole screen (e.g. `vug`); don't repaint the
+                    // console over it in that case — leave it up until the next keypress.
+                    let took_screen =
+                        unaos_kernel::shell::dispatch_command(&cmd, &mut console, &mut pal);
+                    if !took_screen {
+                        console.draw(&mut pal);
+                    }
                 } else if c == 8 || c == 0x7F {
                     console.current_input.pop();
                     console.draw(&mut pal);
@@ -140,6 +155,10 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
                 unaos_kernel::hlt();
             }
         }
+
+        // Present this frame: flush the damaged region of the back buffer to the framebuffer.
+        // No-op when nothing was drawn this iteration, so the idle (hlt) path stays cheap.
+        pal.render();
     }
 }
 

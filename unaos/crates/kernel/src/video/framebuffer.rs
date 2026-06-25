@@ -70,6 +70,18 @@ impl FrameBuffer {
         self.base != 0 && self.len != 0 && self.info.width != 0 && self.info.height != 0
     }
 
+    /// The byte length of the attached framebuffer (the firmware-reported size). The flush target
+    /// and the double-buffer back store are both sized from this, so they cannot disagree.
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
     #[inline]
     pub fn width(&self) -> usize {
         self.info.width
@@ -142,6 +154,23 @@ impl FrameBuffer {
             for col in 0..w {
                 self.put_pixel(x + col, y + row, color);
             }
+        }
+    }
+
+    /// Copy `src` bytes into the framebuffer starting at `byte_offset` (bounds-checked, no-op if
+    /// it would overrun). This is the double-buffer flush primitive: a bulk sequential copy onto
+    /// the framebuffer, which on real hardware is slow/write-combining — sequential bulk copies
+    /// are far friendlier to it than the per-pixel pokes drawing uses on the cached back buffer.
+    pub fn blit(&self, byte_offset: usize, src: &[u8]) {
+        if self.base == 0 || byte_offset + src.len() > self.len {
+            return;
+        }
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                src.as_ptr(),
+                (self.base + byte_offset) as *mut u8,
+                src.len(),
+            );
         }
     }
 

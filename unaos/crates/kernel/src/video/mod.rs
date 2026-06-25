@@ -18,19 +18,22 @@
 //!
 //! - [`framebuffer::FrameBuffer`] — the one pixel-format-aware drawing surface; every pixel on
 //!   screen goes through it.
+//! - [`screen::Screen`] — a double-buffered surface with damage tracking, built on two
+//!   `FrameBuffer`s (the framebuffer + a cached-RAM back buffer). The steady-state GUI renderer.
 //! - [`fbcon`] — the boot/panic text console (a log sink for hardware with no serial port),
-//!   built on its own `FrameBuffer` handle.
-//! - [`WRITER`] — the primary display surface the GUI renderer draws to (via `pal`/`console`).
+//!   drawn straight to its own `FrameBuffer` handle (it runs pre-heap, so no back buffer).
+//! - [`WRITER`] — the framebuffer the GUI's `Screen` flushes to and that fbcon mirrors onto.
 //!
-//! Both `WRITER` and `fbcon` are handles to the *same* physical framebuffer; they are used at
+//! `WRITER` and `fbcon` are handles to the *same* physical framebuffer; they are used at
 //! different times (fbcon during boot, the GUI after a successful boot repaints over it) and
-//! each is serialised by its own lock. Phase 3 (double-buffering / a compositor) is where this
-//! grows a back buffer and a single flush path.
+//! each is serialised by its own lock.
 
 pub mod fbcon;
 pub mod framebuffer;
+pub mod screen;
 
 pub use framebuffer::FrameBuffer;
+pub use screen::Screen;
 
 use spin::Mutex;
 

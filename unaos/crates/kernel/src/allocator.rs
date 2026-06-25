@@ -21,7 +21,11 @@ use spin::Mutex;
 use crate::arch;
 
 pub const HEAP_START: usize = 0x_4444_4444_0000;
-pub const HEAP_SIZE: usize = 2 * 1024 * 1024; // 2 MiB
+// 16 MiB. The video back buffer (double-buffering, Phase 3) is heap-allocated and sized to the
+// framebuffer: 1280x800x4 = 4 MiB in QEMU, with room to spare for the xHCI/console/block
+// allocations. NOTE: a real Retina panel (2880x1800x4 ~= 20 MiB) will need a larger heap when
+// Phase 2 brings up that hardware.
+pub const HEAP_SIZE: usize = 16 * 1024 * 1024; // 16 MiB
 
 pub struct Locked<A> {
     inner: Mutex<A>,
