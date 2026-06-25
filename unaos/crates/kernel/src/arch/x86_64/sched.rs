@@ -528,6 +528,12 @@ const _: () = {
     assert_send::<Task>();
     assert_send::<Arc<Semaphore>>();
     assert_send::<JoinHandle>();
+    // Smoke-test that `RwLock<T>: Sync` holds for a `Send + Sync` T (i.e. the unsafe impl exists and
+    // compiles with the intended bound). The correctness of REQUIRING `T: Sync` — not Mutex's weaker
+    // `T: Send` — is upheld by the explicit `where T: Send + Sync` on the impl + its SAFETY comment;
+    // stable Rust can't mechanically negative-assert that `RwLock<NotSync>` is `!Sync`.
+    const fn assert_sync<T: Sync>() {}
+    assert_sync::<RwLock<u64>>();
 };
 
 /// Send the wake-only reschedule IPI (vector `IPI_VECTOR`) to `target` so an idle CPU breaks its
@@ -1136,6 +1142,199 @@ impl<T> Channel<T> {
 }
 
 // ---------------------------------------------------------------------------------------------
+// RwLock<T> — a writer-preferring reader-writer lock, composed from a Mutex + two Condvars
+// ---------------------------------------------------------------------------------------------
+
+/// Internal counters of an `RwLock`, guarded by its inner `Mutex`. The invariant
+/// `(readers > 0) XOR writer` is maintained under that mutex; while it holds, readers share `&T` and
+/// a writer has an exclusive `&mut T`, so no `&mut T` ever aliases another reference.
+struct RwState {
+    /// Number of read locks currently held.
+    readers: u32,
+    /// True while the single write lock is held.
+    writer: bool,
+    /// Writers currently blocked in `write()` (drives writer-preference: new readers yield to them).
+    waiting_writers: u32,
+}
+
+/// A sleeping reader-writer lock: many concurrent readers OR one exclusive writer. Composed from the
+/// existing primitives (no new unsafe blocking machinery): an inner `Mutex<RwState>` serialises the
+/// counters and two `Condvar`s park waiters — exactly the way `Channel` composes a Mutex + Semaphores.
+///
+/// WRITER-PREFERRING: a new reader yields to any waiting writer, so writers as a CLASS are not
+/// starved by readers. This is NOT strict per-writer FIFO, though — a writer woken from `writer_ok`
+/// can be leapfrogged by another writer that barges in (takes the just-freed lock before the woken
+/// one re-acquires `inner`, sending it back to the queue tail), so an individual writer's progress
+/// is guaranteed only against a FINITE writer population, not an unbounded barging stream. On the
+/// reader side the cost is heavier: **reader starvation is UNBOUNDED** under sustained write load —
+/// a reader blocked on the condvar is `STATE_BLOCKED`, off every run queue, so it accrues NO
+/// priority-aging credit (the `AGE_TICKS` anti-starvation mechanism bounds only run-queue waiting,
+/// not condvar blocking). Do not use this lock where readers must make progress against a continuous
+/// writer stream.
+///
+/// MUST be `'static` (or Arc-kept-alive) like its parts; call `init()` once on the BSP before use.
+///
+/// PRECONDITION (load-bearing): at most `WAIT_CAPACITY` (32) tasks may be simultaneously blocked on
+/// the reader condvar — or on the writer condvar — of a single `RwLock`. The underlying `Condvar`
+/// asserts its waiter list never exceeds that and PANICS otherwise. Unlike the other primitives
+/// (whose waiter counts are naturally bounded by producer/consumer/holder count), an `RwLock`'s
+/// reader queue is unbounded BY DESIGN, so a caller MUST bound its concurrent-reader population. A
+/// lock needing >32 simultaneous blocked readers would require a larger-capacity Condvar (not here).
+///
+/// NOT REENTRANT. A task must hold AT MOST ONE guard (read or write) on a given `RwLock` at a time,
+/// and must never call `read()`/`write()` while already holding a guard on it. All four re-entries
+/// DEADLOCK PERMANENTLY (the condvars have no timer backstop — a never-coming notify sleeps forever):
+///   * read-then-read — the 2nd `read()` yields to a queued writer that waits for `readers == 0`,
+///     which the 1st guard prevents. DANGEROUS: this deadlocks ONLY when a writer also happens to be
+///     waiting, so it passes tests and then hangs in production.
+///   * read-then-write — `write()` waits for `readers == 0`, but the caller is that reader.
+///   * write-then-read — `read()` blocks on `writer == true`, which the caller holds.
+///   * write-then-write — the 2nd `write()` blocks on `writer == true`.
+pub struct RwLock<T> {
+    inner: Mutex<RwState>,
+    /// Parks readers waiting out a writer; woken (all at once) when the lock clears with no writer
+    /// queued.
+    readers_ok: Condvar,
+    /// Parks writers waiting out readers/a writer; woken one-at-a-time on each release (FIFO within
+    /// the condvar queue, though a barging writer may still grab the freed lock first).
+    writer_ok: Condvar,
+    data: UnsafeCell<T>,
+}
+
+// SAFETY: `&T` is handed to MULTIPLE readers on different CPUs at once, so `T: Sync` is REQUIRED
+// (this is the key difference from `Mutex<T>`, which needs only `T: Send` because it hands out one
+// `&mut T`); a writer's `&mut T` is the data's sole accessor but migrates across CPUs over time, so
+// `T: Send`. The `(readers > 0) XOR writer` invariant under `inner` guarantees no `&mut T` aliases.
+unsafe impl<T: Send + Sync> Sync for RwLock<T> {}
+
+impl<T> RwLock<T> {
+    /// Construct an unlocked `RwLock`. `const` so it can initialise a `static`.
+    pub const fn new(value: T) -> Self {
+        RwLock {
+            inner: Mutex::new(RwState { readers: 0, writer: false, waiting_writers: 0 }),
+            readers_ok: Condvar::new(),
+            writer_ok: Condvar::new(),
+            data: UnsafeCell::new(value),
+        }
+    }
+
+    /// Reserve all three sub-primitives' waiter capacity. Call once on the BSP before use.
+    pub fn init(&self) {
+        self.inner.init();
+        self.readers_ok.init();
+        self.writer_ok.init();
+    }
+
+    /// Acquire a shared read lock, blocking until no writer holds OR is waiting (writer-preference).
+    /// Returns an RAII guard giving `&T`; releases on drop. MUST be called from a scheduled task (it
+    /// may block). NOT reentrant (see the type docs).
+    pub fn read(&self) -> RwLockReadGuard<'_, T> {
+        {
+            let mut g = self.inner.lock();
+            while g.writer || g.waiting_writers > 0 {
+                g = self.readers_ok.wait(g); // re-checks the predicate on every (possibly spurious) wake
+            }
+            g.readers += 1;
+        } // inner guard dropped; our read lock is now recorded in `readers`
+        RwLockReadGuard { lock: self, _not_send: PhantomData }
+    }
+
+    /// Acquire the exclusive write lock, blocking until no readers and no writer. Returns an RAII
+    /// guard giving `&mut T`; releases on drop. MUST be called from a scheduled task. NOT reentrant.
+    pub fn write(&self) -> RwLockWriteGuard<'_, T> {
+        {
+            let mut g = self.inner.lock();
+            g.waiting_writers += 1; // announce ourselves so new readers yield to us (writer-preference)
+            while g.writer || g.readers > 0 {
+                g = self.writer_ok.wait(g);
+            }
+            g.waiting_writers -= 1;
+            g.writer = true;
+        } // inner guard dropped; our write lock is now recorded in `writer`
+        RwLockWriteGuard { lock: self, _not_send: PhantomData }
+    }
+}
+
+/// Shared-read RAII guard from `RwLock::read`. `Deref`s to `&T`; on drop, decrements the reader
+/// count and (when it reaches zero) hands the lock to a waiting writer.
+pub struct RwLockReadGuard<'a, T> {
+    lock: &'a RwLock<T>,
+    /// `!Send` like `MutexGuard`: a held lock belongs to the task that took it.
+    _not_send: PhantomData<*const ()>,
+}
+
+impl<T> Deref for RwLockReadGuard<'_, T> {
+    type Target = T;
+    fn deref(&self) -> &T {
+        // SAFETY: we hold a read lock, so `readers > 0` hence `writer == false`: no `&mut T` exists.
+        unsafe { &*self.lock.data.get() }
+    }
+}
+
+impl<T> Drop for RwLockReadGuard<'_, T> {
+    fn drop(&mut self) {
+        // Dropping re-acquires the inner sleeping Mutex and therefore MAY BLOCK (park + switch) if it
+        // is momentarily contended — sound because the dropping task is a normal scheduled task; but
+        // it means a guard must be dropped only from a scheduled task (interrupts on, no spinlock
+        // held), the same contexts where `read()`/`write()` may be called.
+        debug_assert!(
+            SCHED[percpu::this_cpu().cpu_index as usize].current.load(Ordering::Acquire) != 0,
+            "RwLockReadGuard dropped off a scheduled task (Drop re-acquires a sleeping Mutex)"
+        );
+        let wake = {
+            let mut g = self.lock.inner.lock();
+            g.readers -= 1;
+            g.readers == 0
+        }; // inner guard dropped BEFORE the notify (keeps the condvar lock strictly inside the inner
+           // mutex's critical section and avoids waking readers that would just re-park on `inner`)
+        if wake {
+            self.lock.writer_ok.notify_one(); // hand off to one waiting writer (no-op if none)
+        }
+    }
+}
+
+/// Exclusive-write RAII guard from `RwLock::write`. `Deref`/`DerefMut` to `&mut T`; on drop, clears
+/// the writer flag and wakes the next writer (FIFO) or, if none waits, all parked readers.
+pub struct RwLockWriteGuard<'a, T> {
+    lock: &'a RwLock<T>,
+    _not_send: PhantomData<*const ()>,
+}
+
+impl<T> Deref for RwLockWriteGuard<'_, T> {
+    type Target = T;
+    fn deref(&self) -> &T {
+        // SAFETY: we hold the exclusive write lock; no other accessor exists.
+        unsafe { &*self.lock.data.get() }
+    }
+}
+
+impl<T> DerefMut for RwLockWriteGuard<'_, T> {
+    fn deref_mut(&mut self) -> &mut T {
+        // SAFETY: we hold the exclusive write lock; this is the only live reference to the data.
+        unsafe { &mut *self.lock.data.get() }
+    }
+}
+
+impl<T> Drop for RwLockWriteGuard<'_, T> {
+    fn drop(&mut self) {
+        debug_assert!(
+            SCHED[percpu::this_cpu().cpu_index as usize].current.load(Ordering::Acquire) != 0,
+            "RwLockWriteGuard dropped off a scheduled task (Drop re-acquires a sleeping Mutex)"
+        );
+        let wake_writer = {
+            let mut g = self.lock.inner.lock();
+            g.writer = false;
+            g.waiting_writers > 0
+        }; // inner guard dropped BEFORE the notify (see RwLockReadGuard::drop)
+        if wake_writer {
+            self.lock.writer_ok.notify_one(); // FIFO hand-off to the next writer (writer-preference)
+        } else {
+            self.lock.readers_ok.notify_all(); // no writer waiting: release every parked reader
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
 // Preemption hook (called from the timer interrupt) — the single involuntary switch site
 // ---------------------------------------------------------------------------------------------
 
@@ -1376,25 +1575,31 @@ pub fn current_task_id(cpu: usize) -> Option<u64> {
 /// Count of demo tasks that have run to completion (so a test can confirm exit/free works).
 static DEMO_DONE: AtomicUsize = AtomicUsize::new(0);
 
-// join() demo state. A coordinator spawn_joinable()s several workers across APs and join()s them
-// all, then checks the accumulated sum; a watchdog on another AP bounds it so a join bug prints a
-// FAIL rather than hanging silently. Release/Acquire so the cross-CPU reads are well-defined.
-/// Sum the workers accumulate; the coordinator verifies it after joining all of them.
-static JOIN_SUM: AtomicUsize = AtomicUsize::new(0);
-/// How many workers the coordinator has successfully joined (for the PASS check).
-static JOIN_JOINED: AtomicUsize = AtomicUsize::new(0);
-/// Set true once the coordinator has joined all workers and printed its result; the watchdog polls
-/// this to detect a join that hung (a worker that never completed).
-static JOIN_COORD_DONE: AtomicBool = AtomicBool::new(false);
-/// Number of joinable workers. Each worker i in 0..N adds (i+1) to `JOIN_SUM`, so the expected total
-/// is N*(N+1)/2.
-const JOIN_WORKERS: usize = 4;
+// RwLock demo state. A writer bumps a shared (u64,u64) NON-atomically (store .0, gap, store .1)
+// while readers across APs read-share it and assert the two halves match — a torn (.0 != .1) read
+// would prove the lock let a reader in during a write. Writer-preference; RW_READERS is small so at
+// most 4 readers ever block on the reader condvar (<< WAIT_CAPACITY=32).
+/// Shared data with the invariant .0 == .1, mutated only under the write lock.
+static RWL: RwLock<(u64, u64)> = RwLock::new((0, 0));
+/// Set true if any reader ever observed a torn (.0 != .1) value — the lock failing to exclude a writer.
+static RW_TORN: AtomicBool = AtomicBool::new(false);
+/// Readers currently inside the read section (used to witness that reads actually OVERLAP = sharing).
+static RW_CUR_READERS: AtomicUsize = AtomicUsize::new(0);
+/// High-water mark of `RW_CUR_READERS` (a soft witness that read-sharing happened).
+static RW_MAX_READERS: AtomicUsize = AtomicUsize::new(0);
+/// Count of reader + writer tasks that have finished (the verifier waits for all of them).
+static RW_DONE: AtomicUsize = AtomicUsize::new(0);
+/// Number of reader tasks. Kept small so blocked readers stay well under `WAIT_CAPACITY`.
+const RW_READERS: usize = 4;
+/// Read iterations per reader; write iterations by the single writer.
+const RW_READS: u32 = 8;
+const RW_WRITES: u64 = 8;
 
 /// Turn scheduling on and spawn the demo workload across the online APs: equal-priority round-robin
-/// + timer preemption (the busy pair on the first AP), and the JOIN showcase — a coordinator
-/// spawn_joinable()s several workers across other APs and `join()`s them all, then verifies the
-/// accumulated sum, with a watchdog bounding it. Called once on the BSP after `smp::start_aps`
-/// (hence after `verify_smp`). No-op with no APs; the join showcase needs >=2 APs (else SKIPPED).
+/// + timer preemption (the busy pair on the first AP), and the RWLOCK showcase — a writer mutates a
+/// shared value under the write lock while readers across other APs read-share it and check for torn
+/// reads, with a verifier bounding it. Called once on the BSP after `smp::start_aps` (hence after
+/// `verify_smp`). No-op with no APs; the rwlock showcase needs >=2 APs (else SKIPPED).
 pub fn start_demo(online_aps: &[usize]) {
     if online_aps.is_empty() {
         serial_println!("SCHED: no application processors online; scheduler idle.");
@@ -1416,19 +1621,27 @@ pub fn start_demo(online_aps: &[usize]) {
     spawn("busy-A", demo_busy, encode(cpu_busy, b'A'), cpu_busy, PRIO_NORMAL);
     spawn("busy-B", demo_busy, encode(cpu_busy, b'B'), cpu_busy, PRIO_NORMAL);
 
-    // join(): a coordinator spawn_joinable()s JOIN_WORKERS workers across two APs and join()s them
-    // all, then verifies the accumulated sum; a watchdog on another AP makes a join bug a printed
-    // FAIL, never a silent hang. Workers do timer-backed (sleep_ticks) work so they YIELD and the
-    // coordinator hits both the block path and the join-after-finish fast path. Kept OFF the busy AP
-    // (online_aps[0]) so the non-yielding busy pair can't starve the NORMAL workers. Needs >=2 APs.
+    // RwLock (writer-preferring, composed from Mutex + 2 Condvars): a writer bumps a shared (u64,u64)
+    // non-atomically while RW_READERS readers read-share it and assert the two halves match. A torn
+    // read would prove the lock let a reader in during a write. Each reader holds the read section
+    // across a short sleep, so co-located OR cross-AP readers get admitted concurrently (reader
+    // overlap, max>1, is the soft sharing witness; readers spread across the non-busy APs when >=3
+    // exist). PASS = all done AND no torn read. A verifier on the last AP polls with a
+    // timeout, so a self-deadlock / lost wakeup is a printed FAIL, never a silent hang. Readers stay
+    // OFF the busy AP and are few (<=4 ever blocked << WAIT_CAPACITY=32). Needs >=2 APs.
     if online_aps.len() >= 2 {
-        let cpu_a = online_aps[1]; // coordinator + even workers (same-CPU join)
-        let cpu_b = if online_aps.len() >= 3 { online_aps[2] } else { online_aps[1] }; // odd workers (cross-CPU)
-        spawn("join-coord", demo_join_coordinator, encode(cpu_a, cpu_b as u8), cpu_a, PRIO_NORMAL);
-        let cpu_watch = online_aps[online_aps.len() - 1];
-        spawn("join-watch", demo_join_watchdog, cpu_watch, cpu_watch, PRIO_NORMAL);
+        RWL.init(); // reserve the inner mutex + both condvars' waiter lists before anyone can block
+        let cpu_w = online_aps[1];
+        spawn("rw-writer", demo_rw_writer, cpu_w, cpu_w, PRIO_NORMAL);
+        let n = online_aps.len();
+        for i in 0..RW_READERS {
+            let cpu_r = online_aps[1 + (i % (n - 1))]; // spread readers across the non-busy APs
+            spawn("rw-reader", demo_rw_reader, i, cpu_r, PRIO_NORMAL);
+        }
+        let cpu_verify = online_aps[n - 1];
+        spawn("rw-verify", demo_rw_verifier, cpu_verify, cpu_verify, PRIO_NORMAL);
     } else {
-        serial_println!("JOIN: SKIPPED (needs >=2 APs; have {})", online_aps.len());
+        serial_println!("RWLOCK: SKIPPED (needs >=2 APs; have {})", online_aps.len());
     }
 }
 
@@ -1457,68 +1670,79 @@ fn demo_busy(arg: usize) {
     DEMO_DONE.fetch_add(1, Ordering::Relaxed);
 }
 
-/// join() coordinator: spawn_joinable JOIN_WORKERS workers across two APs (encoded in `arg` as
-/// cpu_a/cpu_b), spawning them ALL first (so several run concurrently), then join each. Joining a
-/// still-running worker exercises the block path; joining one that already finished exercises the
-/// fast path — the PASS depends only on all joins returning AND the sum matching, never on which
-/// path each took. Runs as a scheduled task (so it may block in join).
-fn demo_join_coordinator(arg: usize) {
+/// RwLock writer: take the exclusive write lock and bump the shared (u64,u64) to an incrementing
+/// value NON-atomically — store .0, sleep one tick, then store .1 — so a reader admitted mid-write
+/// (a broken lock) would observe a torn .0 != .1. Holding the write lock across the sleep keeps it
+/// exclusive throughout, so a correct lock lets NO reader see the torn state.
+fn demo_rw_writer(_arg: usize) {
     let cpu = percpu::this_cpu().cpu_index as usize;
-    let cpu_a = (arg >> 8) & 0xFF; // our own AP (same-CPU join: blocking parks us, yielding the core)
-    let cpu_b = arg & 0xFF; // a second AP (cross-CPU join + completion wake)
-
-    // Spawn all workers up front so they run concurrently, then join them in order.
-    let handles: [JoinHandle; JOIN_WORKERS] = core::array::from_fn(|i| {
-        let value = i + 1;
-        let target = if i % 2 == 0 { cpu_a } else { cpu_b };
-        spawn_joinable("join-worker", demo_join_worker, value, target, PRIO_NORMAL)
-    });
-    for h in handles {
-        h.join();
-        JOIN_JOINED.fetch_add(1, Ordering::Relaxed);
+    for v in 1..=RW_WRITES {
+        {
+            let mut g = RWL.write();
+            g.0 = v;
+            sleep_ticks(1); // straddle the two stores, still holding the exclusive write lock
+            g.1 = v;
+        } // write guard dropped -> wakes the next writer, or all parked readers
+        sleep_ticks(1); // give readers a turn between writes
     }
-
-    let joined = JOIN_JOINED.load(Ordering::Relaxed);
-    let sum = JOIN_SUM.load(Ordering::Acquire);
-    let expected = JOIN_WORKERS * (JOIN_WORKERS + 1) / 2;
-    JOIN_COORD_DONE.store(true, Ordering::Release);
-    serial_println!(
-        "JOIN: [cpu{}] joined {}/{} workers, sum={} (expected {}) => {}",
-        cpu,
-        joined,
-        JOIN_WORKERS,
-        sum,
-        expected,
-        if joined == JOIN_WORKERS && sum == expected { "PASS" } else { "FAIL" }
-    );
-    DEMO_DONE.fetch_add(1, Ordering::Relaxed);
+    serial_println!("SCHED: [cpu{} rw-writer] {} writes done", cpu, RW_WRITES);
+    RW_DONE.fetch_add(1, Ordering::Release);
 }
 
-/// join() worker: do a little timer-backed work (staggered by value, so it actually takes time and
-/// yields — giving the coordinator a mix of still-running and already-finished joins), add its value
-/// to the shared sum, then return. The trampoline posts its completion semaphore, releasing the
-/// joiner (cross-CPU if it parked on another core).
-fn demo_join_worker(value: usize) {
+/// RwLock reader: repeatedly take a shared read lock, witness reader overlap (CUR/MAX), hold the read
+/// section across a short sleep so a co-located reader is admitted concurrently, and assert the two
+/// halves match (a torn read => the lock failed to exclude the writer). Read-sharing lets many of
+/// these be in their section at once.
+fn demo_rw_reader(idx: usize) {
     let cpu = percpu::this_cpu().cpu_index as usize;
-    sleep_ticks((value as u64) * 6); // staggered durations -> a mix of block-path and fast-path joins
-    JOIN_SUM.fetch_add(value, Ordering::Relaxed);
-    serial_println!("SCHED: [cpu{} join-worker] value {} done", cpu, value);
-    DEMO_DONE.fetch_add(1, Ordering::Relaxed);
+    for _ in 0..RW_READS {
+        {
+            let g = RWL.read();
+            let cur = RW_CUR_READERS.fetch_add(1, Ordering::AcqRel) + 1;
+            RW_MAX_READERS.fetch_max(cur, Ordering::AcqRel);
+            sleep_ticks(2); // hold the read section so another reader overlaps (the sharing witness)
+            if g.0 != g.1 {
+                RW_TORN.store(true, Ordering::Release); // torn read: the lock admitted us mid-write
+            }
+            RW_CUR_READERS.fetch_sub(1, Ordering::AcqRel);
+        } // read guard dropped
+        sleep_ticks(1);
+    }
+    serial_println!("SCHED: [cpu{} rw-reader {}] {} reads done", cpu, idx, RW_READS);
+    RW_DONE.fetch_add(1, Ordering::Release);
 }
 
-/// join() watchdog on another AP: if the coordinator has not finished within a generous timeout (a
-/// join bug would leave it blocked forever — a join-sem has no timer backstop), print a definitive
-/// FAIL so a hang is never silent. Stays correct even if co-located with the coordinator: a blocked
-/// coordinator yields its core, so this NORMAL task still runs.
-fn demo_join_watchdog(cpu: usize) {
+/// RwLock verifier on the last AP: poll until all readers + the writer finish (or a generous timeout
+/// = the watchdog), then print one self-checking line. PASS = all done AND no torn read ever seen; a
+/// timeout (self-deadlock / lost wakeup) => FAIL. Reader overlap (max>1) is a soft witness that
+/// read-sharing happened — its absence is reported as INCONCLUSIVE, not a FAIL, since CPU-pinned
+/// scheduling can serialise readers without the lock being wrong.
+fn demo_rw_verifier(cpu: usize) {
+    let total = RW_READERS + 1; // RW_READERS readers + the one writer
     let mut waited = 0u64;
-    while !JOIN_COORD_DONE.load(Ordering::Acquire) && waited < 8_000 {
+    while RW_DONE.load(Ordering::Acquire) < total && waited < 8_000 {
         sleep_ticks(8);
         waited += 8;
     }
-    if !JOIN_COORD_DONE.load(Ordering::Acquire) {
-        serial_println!("JOIN: [cpu{}] WATCHDOG TIMEOUT after {} ticks => FAIL", cpu, waited);
-    }
+    let done = RW_DONE.load(Ordering::Acquire);
+    let torn = RW_TORN.load(Ordering::Acquire);
+    let maxr = RW_MAX_READERS.load(Ordering::Acquire);
+    let pass = done == total && !torn;
+    let witness = if pass && maxr <= 1 {
+        " (INCONCLUSIVE overlap: readers did not visibly overlap)"
+    } else {
+        ""
+    };
+    serial_println!(
+        "RWLOCK: [cpu{}] done {}/{}, torn={}, max_concurrent_readers={} => {}{}",
+        cpu,
+        done,
+        total,
+        torn,
+        maxr,
+        if pass { "PASS" } else { "FAIL" },
+        witness
+    );
     DEMO_DONE.fetch_add(1, Ordering::Relaxed);
 }
 
