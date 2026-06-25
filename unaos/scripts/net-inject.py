@@ -537,6 +537,41 @@ def test_multi_tcp(s, guest_mac, n=3):
     return True
 
 
+def collect_stream(s, cport, start_seq, nbytes, timeout=8):
+    """Accumulate echoed payload bytes (skipping pure/dup ACKs) until `nbytes` are collected,
+    verifying the data segments are contiguous from `start_seq`. Robust to the byte-stream
+    listener COALESCING reassembled data into one segment (TCP does not preserve boundaries) or
+    sending several contiguous segments. Returns the concatenated bytes, or None."""
+    buf = b""
+    expect = start_seq & 0xFFFFFFFF
+    for _ in range(40):
+        r = recv_tcp(s, cport, timeout=timeout)
+        if r is None:
+            return None
+        flags, seq, payload = r[0], r[1], r[3]
+        if not payload:
+            continue  # pure / duplicate ACK
+        if seq != expect:
+            print("  (stream gap: got seq=%d expected %d)" % (seq, expect))
+            return None
+        buf += payload
+        expect = (expect + len(payload)) & 0xFFFFFFFF
+        if len(buf) >= nbytes:
+            return buf
+    return None
+
+
+def recv_fin(s, cport, timeout=8):
+    """Receive the next segment carrying FIN (skipping pure ACKs / data echoes)."""
+    for _ in range(20):
+        r = recv_tcp(s, cport, timeout=timeout)
+        if r is None:
+            return None
+        if r[0] & FIN:
+            return r
+    return None
+
+
 def test_tcp_retransmit(s, guest_mac):
     """Loss injection: prove the listener retransmits an unacknowledged segment after its RTO.
     (1) Data path: send data, receive the echo, then WITHHOLD the ACK -> the guest must
@@ -596,9 +631,10 @@ def test_tcp_retransmit(s, guest_mac):
 
 
 def test_tcp_out_of_order(s, guest_mac):
-    """Reordering: send two data segments OUT OF ORDER (B before A). The listener must buffer B,
-    echo A when it arrives, then — once A's echo is acked and the send window frees — deliver the
-    buffered B. So the echoes come back in order: A's data, then B's data."""
+    """Reordering: send two data segments OUT OF ORDER (B before A). The listener buffers B, then
+    reassembles A+B into its byte-stream send buffer when A arrives and echoes the bytes in order
+    — typically COALESCED into one segment (a real byte stream does not preserve segment
+    boundaries). We verify the reassembled STREAM equals A then B, not per-segment boundaries."""
     print("--- TCP out-of-order reassembly ---")
     MASK = 0xFFFFFFFF
     cport, c_isn = 40070, 0x7000
@@ -606,15 +642,6 @@ def test_tcp_out_of_order(s, guest_mac):
     def cs(seq, ack, flags, payload=b""):
         send_frame(s, eth(guest_mac, MY_MAC, 0x0800,
                           ipv4(MY_IP, GUEST_IP, 6, tcp(cport, 7, seq, ack, flags, 4096, MY_IP, GUEST_IP, payload))))
-
-    def recv_echo(want):  # next segment carrying exactly `want` (skip dup-ACKs / unrelated)
-        for _ in range(20):
-            r = recv_tcp(s, cport)
-            if r is None:
-                return None
-            if r[3] == want:
-                return r
-        return None
 
     cs(c_isn, 0, SYN)
     sa = recv_tcp(s, cport)
@@ -630,37 +657,25 @@ def test_tcp_out_of_order(s, guest_mac):
     cs(c_isn + 1, s_isn + 1, PSH | ACK, data_a)
     print("-> sent B (seq=%d) before A (seq=%d)" % (seg_b_seq, c_isn + 1))
 
-    ea = recv_echo(data_a)
-    if ea is None:
-        print("FAIL: A was not echoed first"); return False
-    print("<- echo A %r seq=%d" % (ea[3], ea[1]))
-    # ACK A's echo -> frees the send window -> the buffered B must be delivered. Use the REAL
-    # peer SND.NXT for this bare ACK's seq (past B = c_isn+1+lenA+lenB), exactly what an RFC-793
-    # stack sends, so we exercise the real-peer drain path (not a crafted seq == our rcv_nxt).
-    cs((c_isn + 1 + len(data_a) + len(data_b)) & MASK, (s_isn + 1 + len(data_a)) & MASK, ACK)
-    eb = recv_echo(data_b)
-    if eb is None:
-        print("FAIL: buffered B was not delivered after A"); return False
-    if eb[1] != (s_isn + 1 + len(data_a)) & MASK:
-        print("FAIL: B echo seq=%d, expected %d (must follow A)" % (eb[1], (s_isn + 1 + len(data_a)) & MASK))
-        return False
-    print("<- echo B %r seq=%d (delivered in order, after A)   [TCP OUT-OF-ORDER OK]" % (eb[3], eb[1]))
-
     nb = len(data_a) + len(data_b)
+    got = collect_stream(s, cport, (s_isn + 1) & MASK, nb)
+    if got != data_a + data_b:
+        print("FAIL: reassembled stream %r != %r" % (got, data_a + data_b)); return False
+    print("<- reassembled stream %r in order (A then B)   [TCP OUT-OF-ORDER OK]" % got)
+
     cs((c_isn + 1 + nb) & MASK, (s_isn + 1 + nb) & MASK, ACK)
     cs((c_isn + 1 + nb) & MASK, (s_isn + 1 + nb) & MASK, FIN | ACK)
-    fin = recv_tcp(s, cport)
-    if fin is None or (fin[0] & FIN) == 0:
-        print("FAIL: no FIN-ACK after OOO test (%s)" % (fin,)); return False
+    if recv_fin(s, cport) is None:
+        print("FAIL: no FIN-ACK after OOO test"); return False
     cs((c_isn + 2 + nb) & MASK, (s_isn + 2 + nb) & MASK, ACK)
     return True
 
 
 def test_tcp_multi_ooo(s, guest_mac):
-    """Multi-extent reassembly: send TWO future segments (C then B) so the listener must buffer
-    BOTH out of order at once, then the gap-filler A. Echoes must come back in order A, B, C. A
-    single-extent listener would drop one of B/C and never echo it — so this distinguishes the
-    multi-extent buffer from the old one-extent behavior."""
+    """Multi-extent reassembly: buffer TWO future segments (C then B) at once, then send the
+    gap-filler A. The listener reassembles all three into its byte stream and echoes them in order
+    (coalesced). The pre-rewrite single-extent listener could hold only one of B/C and would never
+    echo the full A+B+C stream, so this still exercises holding multiple extents simultaneously."""
     print("--- TCP multi-extent out-of-order reassembly ---")
     MASK = 0xFFFFFFFF
     cport, c_isn = 40071, 0x9000
@@ -668,15 +683,6 @@ def test_tcp_multi_ooo(s, guest_mac):
     def cs(seq, ack, flags, payload=b""):
         send_frame(s, eth(guest_mac, MY_MAC, 0x0800,
                           ipv4(MY_IP, GUEST_IP, 6, tcp(cport, 7, seq, ack, flags, 4096, MY_IP, GUEST_IP, payload))))
-
-    def recv_echo(want):  # next segment carrying exactly `want` (skip dup-ACKs / unrelated)
-        for _ in range(20):
-            r = recv_tcp(s, cport)
-            if r is None:
-                return None
-            if r[3] == want:
-                return r
-        return None
 
     cs(c_isn, 0, SYN)
     sa = recv_tcp(s, cport)
@@ -689,7 +695,6 @@ def test_tcp_multi_ooo(s, guest_mac):
     seq_a = (c_isn + 1) & MASK
     seq_b = (seq_a + len(data_a)) & MASK
     seq_c = (seq_b + len(data_b)) & MASK
-    snd_nxt = (seq_c + len(data_c)) & MASK  # the peer's real SND.NXT once all three are sent
 
     # Send C and B first (both ahead of the gap -> two buffered extents), then A (fills the gap).
     cs(seq_c, s_isn + 1, PSH | ACK, data_c)
@@ -697,35 +702,60 @@ def test_tcp_multi_ooo(s, guest_mac):
     cs(seq_a, s_isn + 1, PSH | ACK, data_a)
     print("-> sent C (seq=%d) and B (seq=%d) before A (seq=%d)" % (seq_c, seq_b, seq_a))
 
-    ea = recv_echo(data_a)
-    if ea is None:
-        print("FAIL: A was not echoed"); return False
-    # ACK A's echo at the REAL peer SND.NXT (past C) -> frees the window -> the buffered B drains.
-    cs(snd_nxt, (s_isn + 1 + len(data_a)) & MASK, ACK)
-    eb = recv_echo(data_b)
-    if eb is None:
-        print("FAIL: buffered B was not delivered after A (single-extent would drop it here)"); return False
-    # ACK B's echo -> the buffered C drains.
-    cs(snd_nxt, (s_isn + 1 + len(data_a) + len(data_b)) & MASK, ACK)
-    ec = recv_echo(data_c)
-    if ec is None:
-        print("FAIL: buffered C was not delivered after B"); return False
-
-    exp_b = (ea[1] + len(data_a)) & MASK
-    exp_c = (exp_b + len(data_b)) & MASK
-    if eb[1] != exp_b or ec[1] != exp_c:
-        print("FAIL: echo seqs out of order A=%d B=%d(exp %d) C=%d(exp %d)"
-              % (ea[1], eb[1], exp_b, ec[1], exp_c)); return False
-    print("<- echoes A,B,C in order (seqs %d,%d,%d); two extents held at once   [TCP MULTI-OOO OK]"
-          % (ea[1], eb[1], ec[1]))
-
     nb = len(data_a) + len(data_b) + len(data_c)
+    got = collect_stream(s, cport, (s_isn + 1) & MASK, nb)
+    if got != data_a + data_b + data_c:
+        print("FAIL: reassembled stream %r != %r" % (got, data_a + data_b + data_c)); return False
+    print("<- reassembled stream %r in order (A,B,C; two extents buffered at once)   [TCP MULTI-OOO OK]" % got)
+
     cs((c_isn + 1 + nb) & MASK, (s_isn + 1 + nb) & MASK, ACK)
     cs((c_isn + 1 + nb) & MASK, (s_isn + 1 + nb) & MASK, FIN | ACK)
-    fin = recv_tcp(s, cport)
-    if fin is None or (fin[0] & FIN) == 0:
-        print("FAIL: no FIN-ACK after multi-OOO test (%s)" % (fin,)); return False
+    if recv_fin(s, cport) is None:
+        print("FAIL: no FIN-ACK after multi-OOO test"); return False
     cs((c_isn + 2 + nb) & MASK, (s_isn + 2 + nb) & MASK, ACK)
+    return True
+
+
+def test_tcp_pipeline(s, guest_mac):
+    """Pipelining: send several data segments back-to-back WITHOUT acking the echoes. The
+    byte-stream send buffer holds them all, so every segment is echoed (multiple in flight at
+    once) — the pre-rewrite one-segment model would dup-ACK all but the first. Verify the whole
+    stream comes back, then ack and close. Each segment advertises a large window so the listener
+    is free to pipeline up to its send-buffer capacity."""
+    print("--- TCP pipelined send window (multiple segments in flight) ---")
+    MASK = 0xFFFFFFFF
+    cport, c_isn = 40072, 0xB000
+
+    def cs(seq, ack, flags, payload=b""):
+        send_frame(s, eth(guest_mac, MY_MAC, 0x0800,
+                          ipv4(MY_IP, GUEST_IP, 6, tcp(cport, 7, seq, ack, flags, 8192, MY_IP, GUEST_IP, payload))))
+
+    cs(c_isn, 0, SYN)
+    sa = recv_tcp(s, cport)
+    if sa is None or (sa[0] & (SYN | ACK)) != (SYN | ACK):
+        print("FAIL: no SYN-ACK for pipeline test (%s)" % (sa,)); return False
+    s_isn = sa[1]
+    cs(c_isn + 1, s_isn + 1, ACK)
+
+    parts = [b"pipe-seg-%02d." % i for i in range(6)]  # 6 distinct in-order segments
+    cseq = (c_isn + 1) & MASK
+    for p in parts:
+        cs(cseq, s_isn + 1, PSH | ACK, p)  # send the whole burst before reading any echo
+        cseq = (cseq + len(p)) & MASK
+    total = sum(len(p) for p in parts)
+    expected = b"".join(parts)
+    print("-> sent a burst of %d segments (%d bytes) without acking" % (len(parts), total))
+
+    got = collect_stream(s, cport, (s_isn + 1) & MASK, total)
+    if got != expected:
+        print("FAIL: pipelined stream mismatch: got %r" % (got,)); return False
+    print("<- whole %d-byte stream echoed back (segments pipelined in flight)   [TCP PIPELINE OK]" % len(got))
+
+    cs((c_isn + 1 + total) & MASK, (s_isn + 1 + total) & MASK, ACK)
+    cs((c_isn + 1 + total) & MASK, (s_isn + 1 + total) & MASK, FIN | ACK)
+    if recv_fin(s, cport) is None:
+        print("FAIL: no FIN-ACK after pipeline test"); return False
+    cs((c_isn + 2 + total) & MASK, (s_isn + 2 + total) & MASK, ACK)
     return True
 
 
@@ -868,6 +898,10 @@ def main():
 
     # --- TCP multi-extent reassembly (buffer two future segments at once, expect in-order) ---
     if not test_tcp_multi_ooo(s, guest_mac):
+        return 1
+
+    # --- TCP pipelining (burst of segments, multiple echoes in flight at once) ---
+    if not test_tcp_pipeline(s, guest_mac):
         return 1
 
     print("ALL CHECKS PASSED")
