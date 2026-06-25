@@ -42,7 +42,7 @@ pub fn _print(args: fmt::Arguments) {
         SERIAL_PORT.lock().write_fmt(args).unwrap();
     });
     // Mirror to the framebuffer console (visible without a serial port). fbcon self-guards.
-    crate::fbcon::_print(args);
+    crate::video::fbcon::_print(args);
 }
 
 // Expression-style (parentheses, no trailing semicolon) so the macros work in both

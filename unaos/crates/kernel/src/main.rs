@@ -25,7 +25,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     // 0. Framebuffer log sink FIRST — mirror every serial_println! (and panics) to the screen,
     //    so boot diagnostics are visible on real hardware that has no serial port. No-op if the
     //    firmware gave us no framebuffer. The GUI repaints over it later on a successful boot.
-    unaos_kernel::fbcon::init(
+    unaos_kernel::video::fbcon::init(
         boot_info.framebuffer_addr,
         boot_info.framebuffer_size,
         boot_info.framebuffer_info,
@@ -52,21 +52,20 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     unaos_kernel::arch::pci::init(dtb_addr, dtb_size);
 
     if framebuffer_addr != 0 {
-        // Safety: We assume the bootloader passed a valid framebuffer physical address
-        let buffer = unsafe {
-            core::slice::from_raw_parts_mut(framebuffer_addr as *mut u8, framebuffer_size)
-        };
-        
-        unaos_kernel::vug::init(&mut *buffer, info);
-        
-        unaos_kernel::writer::WRITER.lock().init(buffer, info);
+        // Safety: the bootloader passed a valid, identity-mapped framebuffer base address
+        // (physical_memory_offset == 0). The video surface addresses it directly.
+        unaos_kernel::video::WRITER
+            .lock()
+            .init(framebuffer_addr as usize, framebuffer_size, info);
+
+        unaos_kernel::vug::init(framebuffer_addr as usize, framebuffer_size, info);
     } else {
         serial_println!(":: WARNING: No framebuffer detected ::");
     }
 
     let mut console = unaos_kernel::console::Console::new();
-    let mut writer_guard = unaos_kernel::writer::WRITER.lock();
-    let mut pal = unaos_kernel::pal::TargetPal::new(&mut *writer_guard);
+    let mut fb_guard = unaos_kernel::video::WRITER.lock();
+    let mut pal = unaos_kernel::pal::TargetPal::new(&mut *fb_guard);
     
     console.draw(&mut pal);
 
@@ -148,7 +147,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
 fn panic(info: &PanicInfo) -> ! {
     // Paint a red panic backdrop on the framebuffer (visible on hardware with no serial), then
     // print the message — serial_println! mirrors it onto that backdrop via fbcon.
-    unaos_kernel::fbcon::panic_screen();
+    unaos_kernel::video::fbcon::panic_screen();
     serial_println!("=== KERNEL PANIC ===");
     serial_println!("{}", info);
     unaos_kernel::arch::hlt_loop();

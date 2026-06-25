@@ -39,7 +39,7 @@ pub fn _print(args: ::core::fmt::Arguments) {
     });
     // Mirror to the framebuffer console so diagnostics/panics are visible on hardware that has
     // no serial port. `Arguments` is Copy; fbcon self-guards (try_lock + interrupts off).
-    crate::fbcon::_print(args);
+    crate::video::fbcon::_print(args);
 }
 
 #[macro_export]

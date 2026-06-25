@@ -14,7 +14,7 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-use crate::writer::Writer;
+use crate::video::FrameBuffer;
 use lazy_static::lazy_static;
 use spin::Mutex;
 
@@ -121,19 +121,18 @@ fn pop_event() -> Option<Event> {
 
 // --- PAL IMPLEMENTATION ---
 pub struct TargetPal<'a> {
-    pub writer: &'a mut Writer,
+    pub fb: &'a mut FrameBuffer,
 }
 
 impl<'a> TargetPal<'a> {
-    // NEW: The constructor main.rs was looking for
-    pub fn new(writer: &'a mut Writer) -> Self {
-        Self { writer }
+    pub fn new(fb: &'a mut FrameBuffer) -> Self {
+        Self { fb }
     }
 }
 
 impl<'a> GneissPal for TargetPal<'a> {
     fn draw_pixel(&mut self, x: u32, y: u32, color: u32) {
-        self.writer.write_pixel(x as usize, y as usize, color);
+        self.fb.put_pixel(x as usize, y as usize, color);
     }
 
     fn poll_event(&mut self) -> Event {
@@ -146,10 +145,10 @@ impl<'a> GneissPal for TargetPal<'a> {
     fn render(&mut self) {}
 
     fn width(&self) -> u32 {
-        self.writer.width() as u32
+        self.fb.width() as u32
     }
 
     fn height(&self) -> u32 {
-        self.writer.height() as u32
+        self.fb.height() as u32
     }
 }

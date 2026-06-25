@@ -14,61 +14,27 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-// FIX: Use crate:: instead of unaos_kernel::
-use unaos_boot_info::{FrameBufferInfo, PixelFormat};
+use unaos_boot_info::FrameBufferInfo;
 
 use crate::pal::TargetPal;
 use crate::pal::GneissPal;
+use crate::video::FrameBuffer;
 
 const METER_SEGMENTS: usize = 10;
 const SEG_HEIGHT: u32 = 10;
 const SEG_SPACING: u32 = 2;
 const SEG_WIDTH: u32 = 40;
 
-pub fn init(framebuffer: &mut [u8], info: FrameBufferInfo) {
-    let width = info.width;
-    let height = info.height;
-    let stride = info.stride;
-    let format = info.pixel_format;
-
+pub fn init(base: usize, len: usize, info: FrameBufferInfo) {
     serial_println!(":: VUG Init ::");
-    serial_println!(":: FB Size: {}x{} (stride {}) ::", width, height, stride);
-    serial_println!(":: FB Format: {:?} ::", format);
+    serial_println!(":: FB Size: {}x{} (stride {}) ::", info.width, info.height, info.stride);
+    serial_println!(":: FB Format: {:?} ::", info.pixel_format);
 
-    // Can-Am dark grey: #1E1E1E
-    let r_val = 0x1E;
-    let g_val = 0x1E;
-    let b_val = 0x1E;
-
-    let bytes_per_pixel = info.bytes_per_pixel;
-
-    for y in 0..height {
-        for x in 0..width {
-            let offset = (y * stride + x) * bytes_per_pixel;
-            if offset + bytes_per_pixel <= framebuffer.len() {
-                match format {
-                    PixelFormat::Rgb => {
-                        framebuffer[offset] = r_val;
-                        framebuffer[offset + 1] = g_val;
-                        framebuffer[offset + 2] = b_val;
-                        // Alpha/Reserved byte is unmodified or set to 0
-                    }
-                    PixelFormat::Bgr => {
-                        framebuffer[offset] = b_val;
-                        framebuffer[offset + 1] = g_val;
-                        framebuffer[offset + 2] = r_val;
-                    }
-                    PixelFormat::U8 => {
-                        // Greyscale approximation
-                        framebuffer[offset] = 0x1E;
-                    }
-                    _ => {
-                        // Unknown format, do not write
-                    }
-                }
-            }
-        }
-    }
+    // Paint the background through the shared surface (format/bounds handled in one place).
+    // Can-Am dark grey: #1E1E1E.
+    let mut surface = FrameBuffer::new();
+    surface.init(base, len, info);
+    surface.fill_screen(0x001E_1E1E);
 
     serial_println!(":: Framebuffer painted #1E1E1E ::");
 }
