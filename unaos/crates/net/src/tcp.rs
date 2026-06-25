@@ -142,10 +142,28 @@ enum ConnState {
     LastAck,
 }
 
+/// Largest payload a connection will accept / echo / buffer for retransmission. Also the
+/// advertised receive window, so a conforming peer never sends more than fits the buffer.
+const RETX_CAP: usize = 512;
+/// Base retransmission timeout, in monotonic ticks. The APIC-timer tick is ~1 ms on QEMU
+/// (empirically), so this is ~200 ms — conservative enough not to fire before a normal ACK on
+/// any reasonable link, yet quick to recover. Doubled per retry (capped) for exponential
+/// backoff. The absolute rate is uncalibrated, so these are coarse, not exact, durations.
+const RTO_BASE_TICKS: u64 = 200;
+/// Upper bound on a single backoff interval (~2 s).
+const RTO_MAX_TICKS: u64 = 2000;
+/// Cap on the backoff left-shift so it can't overflow.
+const RTO_BACKOFF_SHIFT_CAP: u8 = 5;
+/// Give up (free the connection) after this many retransmissions — this also bounds a half-open
+/// (SynRcvd) connection whose handshake ACK never arrives, so it can't wedge a slot forever.
+/// With the backoff above this is ~7 s to fully abandon a dead/half-open connection.
+const MAX_RETRIES: u8 = 6;
+
 /// One accepted connection's control block. The listener holds a small fixed table of these
 /// and demultiplexes inbound segments to them by the remote `(IP, port)` 2-tuple (the local
-/// IP/port are fixed by the listener).
-#[derive(Clone, Copy)]
+/// IP/port are fixed by the listener). Each connection keeps a single outstanding (unacked)
+/// segment for retransmission — the echo is naturally lockstep, so a one-segment send window
+/// suffices.
 struct TcpConn {
     state: ConnState,
     remote_ip: [u8; 4],
@@ -153,17 +171,34 @@ struct TcpConn {
     remote_port: u16,
     snd_nxt: u32, // next sequence number we will send
     rcv_nxt: u32, // next sequence number we expect to receive
+    // Retransmission of the single outstanding segment.
+    unacked: bool,
+    un_seq: u32,      // sequence number of the outstanding segment
+    un_flags: u8,     // its flags (SYN-ACK / data echo / FIN)
+    un_paylen: usize, // payload bytes buffered in un_buf
+    un_buf: [u8; RETX_CAP],
+    rto_deadline: u64, // tick at which to retransmit if still unacked
+    retries: u8,
 }
 
 impl TcpConn {
+    fn new(state: ConnState, remote_ip: [u8; 4], remote_mac: [u8; 6], remote_port: u16, snd_nxt: u32, rcv_nxt: u32) -> Self {
+        Self {
+            state, remote_ip, remote_mac, remote_port, snd_nxt, rcv_nxt,
+            unacked: false, un_seq: 0, un_flags: 0, un_paylen: 0, un_buf: [0; RETX_CAP],
+            rto_deadline: 0, retries: 0,
+        }
+    }
+
     fn matches(&self, ip: [u8; 4], port: u16) -> bool {
         self.remote_ip == ip && self.remote_port == port
     }
 
-    /// Emit one segment for this connection, building the full Eth/IPv4/TCP frame into `out`.
-    /// `ack` is passed explicitly (rather than read from `self.rcv_nxt`) so a data echo can
-    /// acknowledge the very bytes it carries while the `rcv_nxt` advance is still committed
-    /// only *after* serialization succeeds (the no-desync invariant).
+    /// Emit one segment, building the full Eth/IPv4/TCP frame into `out`. `seq` and `ack` are
+    /// passed explicitly (rather than read from `self`) so a data echo can ACK the bytes it
+    /// carries — and a retransmission can re-send the *original* seq — while the `rcv_nxt`/
+    /// `snd_nxt` advance is committed only *after* serialization succeeds (the no-desync
+    /// invariant).
     #[allow(clippy::too_many_arguments)]
     fn emit(
         &self,
@@ -173,6 +208,7 @@ impl TcpConn {
         local_port: u16,
         window: u16,
         flags: u8,
+        seq: u32,
         ack: u32,
         payload: &[u8],
     ) -> Option<usize> {
@@ -180,7 +216,7 @@ impl TcpConn {
             out.get_mut(34..)?,
             local_port,
             self.remote_port,
-            self.snd_nxt,
+            seq,
             ack,
             flags,
             window,
@@ -191,6 +227,28 @@ impl TcpConn {
         ipv4::write_header(out.get_mut(14..34)?, our_ip, self.remote_ip, PROTO_TCP, tcp_len)?;
         ethernet::write_header(out.get_mut(0..14)?, self.remote_mac, our_mac, EtherType::Ipv4.as_u16())?;
         Some(14 + 20 + tcp_len)
+    }
+
+    /// Record a just-sent seq-consuming segment as the outstanding one and arm its RTO timer.
+    fn arm(&mut self, now: u64, seq: u32, flags: u8, payload: &[u8]) {
+        self.un_seq = seq;
+        self.un_flags = flags;
+        let n = payload.len().min(RETX_CAP);
+        self.un_buf[..n].copy_from_slice(&payload[..n]);
+        self.un_paylen = n;
+        self.unacked = true;
+        self.retries = 0;
+        self.rto_deadline = now + RTO_BASE_TICKS;
+    }
+
+    /// Re-send the outstanding segment on RTO expiry, with exponential backoff. Returns the
+    /// frame length, or `None` if it could not be serialized.
+    fn retransmit(&mut self, out: &mut [u8], our_ip: [u8; 4], our_mac: [u8; 6], local_port: u16, window: u16, now: u64) -> Option<usize> {
+        self.retries = self.retries.saturating_add(1);
+        let backoff = (RTO_BASE_TICKS << self.retries.min(RTO_BACKOFF_SHIFT_CAP)).min(RTO_MAX_TICKS);
+        self.rto_deadline = now + backoff;
+        let (flags, seq, ack, paylen) = (self.un_flags, self.un_seq, self.rcv_nxt, self.un_paylen);
+        self.emit(out, our_ip, our_mac, local_port, window, flags, seq, ack, &self.un_buf[..paylen])
     }
 
     /// Drive this connection with one received segment. Returns `(response, done)`: `response`
@@ -204,23 +262,28 @@ impl TcpConn {
         our_mac: [u8; 6],
         local_port: u16,
         window: u16,
+        now: u64,
         flags: u8,
         their_seq: u32,
         their_ack: u32,
         payload: &[u8],
     ) -> (Option<usize>, bool) {
+        // Cumulative ACK: if the peer acknowledges our outstanding segment, stop retransmitting.
+        if flags & ACK != 0 && self.unacked && their_ack == self.snd_nxt {
+            self.unacked = false;
+        }
         match self.state {
             ConnState::SynRcvd => {
                 // Expect the ACK completing the handshake (it may already carry data).
                 if flags & ACK != 0 && their_ack == self.snd_nxt {
                     self.state = ConnState::Established;
-                    (self.on_data(out, our_ip, our_mac, local_port, window, their_seq, flags, payload), false)
+                    (self.on_data(out, our_ip, our_mac, local_port, window, now, their_seq, flags, payload), false)
                 } else {
                     (None, false)
                 }
             }
             ConnState::Established => {
-                (self.on_data(out, our_ip, our_mac, local_port, window, their_seq, flags, payload), false)
+                (self.on_data(out, our_ip, our_mac, local_port, window, now, their_seq, flags, payload), false)
             }
             ConnState::LastAck => {
                 // Our FIN is acknowledged — connection closed; free the slot.
@@ -243,14 +306,14 @@ impl TcpConn {
         our_mac: [u8; 6],
         local_port: u16,
         window: u16,
+        now: u64,
         their_seq: u32,
         flags: u8,
         payload: &[u8],
     ) -> Option<usize> {
-        // Only process in-order segments. A retransmit / out-of-order segment gets a
-        // duplicate ACK of what we have, without re-echoing.
+        // Out-of-order: duplicate-ACK what we have, without consuming/echoing (not retransmitted).
         if their_seq != self.rcv_nxt {
-            return self.emit(out, our_ip, our_mac, local_port, window, ACK, self.rcv_nxt, &[]);
+            return self.emit(out, our_ip, our_mac, local_port, window, ACK, self.snd_nxt, self.rcv_nxt, &[]);
         }
 
         let has_fin = flags & FIN != 0;
@@ -258,24 +321,36 @@ impl TcpConn {
             return None; // a bare ACK — nothing to send
         }
 
+        // One outstanding segment at a time (a one-segment send window), and only accept what
+        // fits our advertised window / retransmit buffer. Otherwise dup-ACK and let the peer
+        // retry once the in-flight segment is acknowledged — no data is consumed, so nothing is
+        // lost. NOTE: we keep advertising a constant non-zero window even while `unacked`, so a
+        // *pipelining* peer's extra segment is dropped+dup-ACKed (then retransmitted) rather
+        // than withheld. That's safe but not optimal; honest zero-window flow control (window
+        // updates, a persist timer) is deferred to the window-management work. The echo workload
+        // is lockstep, so this path is essentially never hit in practice.
+        if self.unacked || payload.len() > RETX_CAP {
+            return self.emit(out, our_ip, our_mac, local_port, window, ACK, self.snd_nxt, self.rcv_nxt, &[]);
+        }
+
         // Echo the data back; set FIN if the peer is closing (we have nothing more to send).
         let mut resp_flags = ACK | PSH;
         if has_fin {
             resp_flags |= FIN;
         }
-        // The response must acknowledge the data (and FIN) it is responding to, so compute the
-        // post-consume rcv_nxt and ACK with that. Serialize FIRST, then commit the sequence
-        // advance only on success: an unserializable segment is dropped cleanly (the peer
-        // retransmits, handled identically) rather than desynchronizing the connection.
+        // ACK the data (and FIN) being responded to: compute the post-consume rcv_nxt. Serialize
+        // FIRST, commit the sequence advance only on success (no-desync), then arm retransmission.
         let mut new_rcv = self.rcv_nxt.wrapping_add(payload.len() as u32);
         if has_fin {
             new_rcv = new_rcv.wrapping_add(1); // a FIN consumes one sequence number
         }
-        let n = self.emit(out, our_ip, our_mac, local_port, window, resp_flags, new_rcv, payload)?;
+        let seq = self.snd_nxt;
+        let seqlen = payload.len() as u32 + if has_fin { 1 } else { 0 };
+        let n = self.emit(out, our_ip, our_mac, local_port, window, resp_flags, seq, new_rcv, payload)?;
         self.rcv_nxt = new_rcv;
-        self.snd_nxt = self.snd_nxt.wrapping_add(payload.len() as u32);
+        self.snd_nxt = self.snd_nxt.wrapping_add(seqlen);
+        self.arm(now, seq, resp_flags, payload);
         if has_fin {
-            self.snd_nxt = self.snd_nxt.wrapping_add(1); // our FIN consumes one on our side
             self.state = ConnState::LastAck;
         }
         Some(n)
@@ -287,8 +362,9 @@ pub const MAX_CONNS: usize = 4;
 
 /// A multi-connection TCP echo listener (RFC 862). Accepts up to [`MAX_CONNS`] passive-open
 /// connections at once, demultiplexing inbound segments to a fixed table of [`TcpConn`] slots
-/// by the remote `(IP, port)`. Same per-connection scope as before: in-order data, no
-/// retransmission, no options, lenient receiver. No allocation (fixed table).
+/// by the remote `(IP, port)`. Per-connection scope: in-order data, a one-segment send window
+/// with retransmission ([`tick`](Self::tick) drives the RTO timers), no options, lenient
+/// receiver. No allocation (fixed table).
 pub struct TcpListener {
     listen_port: u16,
     window: u16,
@@ -300,9 +376,9 @@ impl TcpListener {
     pub fn new(listen_port: u16) -> Self {
         Self {
             listen_port,
-            window: 4096,
+            window: RETX_CAP as u16,
             isn: 0x0001_0000,
-            conns: [None; MAX_CONNS],
+            conns: core::array::from_fn(|_| None),
         }
     }
 
@@ -311,10 +387,33 @@ impl TcpListener {
         self.conns.iter().filter(|c| c.is_some()).count()
     }
 
+    /// Drive retransmission timers. Call periodically with the current monotonic `now`. If a
+    /// connection's outstanding segment has passed its RTO, retransmit ONE such segment (with
+    /// exponential backoff) and return its frame; after [`MAX_RETRIES`] the connection is
+    /// abandoned (slot freed), which also bounds stuck half-open (SynRcvd) connections.
+    pub fn tick(&mut self, now: u64, our_ip: [u8; 4], our_mac: [u8; 6], out: &mut [u8]) -> Option<usize> {
+        let (local_port, window) = (self.listen_port, self.window);
+        for slot in self.conns.iter_mut() {
+            let conn = match slot {
+                Some(c) => c,
+                None => continue,
+            };
+            if !conn.unacked || now < conn.rto_deadline {
+                continue;
+            }
+            if conn.retries >= MAX_RETRIES {
+                *slot = None; // give up — frees half-open or stuck connections
+                continue;
+            }
+            return conn.retransmit(out, our_ip, our_mac, local_port, window, now);
+        }
+        None
+    }
+
     /// Handle a received frame. Returns `Some(len)` with a response frame in `out`, or `None`
     /// if the frame isn't a TCP segment for our listener (so the caller falls back to ingress)
-    /// or no response is warranted.
-    pub fn handle(&mut self, frame: &[u8], our_ip: [u8; 4], our_mac: [u8; 6], out: &mut [u8]) -> Option<usize> {
+    /// or no response is warranted. `now` is the current monotonic tick (for arming RTO).
+    pub fn handle(&mut self, frame: &[u8], now: u64, our_ip: [u8; 4], our_mac: [u8; 6], out: &mut [u8]) -> Option<usize> {
         let eth = EthernetFrame::new(frame)?;
         if eth.ethertype() != EtherType::Ipv4 {
             return None;
@@ -339,7 +438,7 @@ impl TcpListener {
         let existing = self
             .conns
             .iter()
-            .position(|c| c.map_or(false, |c| c.matches(src_ip, src_port)));
+            .position(|c| c.as_ref().map_or(false, |c| c.matches(src_ip, src_port)));
 
         // RST tears down the matching connection (if any).
         if flags & RST != 0 {
@@ -353,7 +452,7 @@ impl TcpListener {
             let (local_port, window) = (self.listen_port, self.window);
             let conn = self.conns[idx].as_mut().unwrap();
             let (resp, done) =
-                conn.on_segment(out, our_ip, our_mac, local_port, window, flags, their_seq, their_ack, payload);
+                conn.on_segment(out, our_ip, our_mac, local_port, window, now, flags, their_seq, their_ack, payload);
             if done {
                 self.conns[idx] = None;
             }
@@ -363,19 +462,17 @@ impl TcpListener {
             // is free (table full -> drop the SYN; the peer retransmits).
             let slot = self.conns.iter().position(|c| c.is_none())?;
             self.isn = self.isn.wrapping_add(0x0001_0000);
-            let mut conn = TcpConn {
-                state: ConnState::SynRcvd,
-                remote_ip: src_ip,
-                remote_mac: src_mac,
-                remote_port: src_port,
-                snd_nxt: self.isn,
-                rcv_nxt: their_seq.wrapping_add(1), // SYN consumes one sequence number
-            };
+            let mut conn = TcpConn::new(
+                ConnState::SynRcvd, src_ip, src_mac, src_port,
+                self.isn, their_seq.wrapping_add(1), // SYN consumes one sequence number
+            );
             let (local_port, window) = (self.listen_port, self.window);
-            // Emit first; only commit the slot once the SYN-ACK serialized. The SYN-ACK acks
-            // the peer's SYN (rcv_nxt = their_seq + 1).
-            let n = conn.emit(out, our_ip, our_mac, local_port, window, SYN | ACK, conn.rcv_nxt, &[])?;
+            // Emit first; only commit the slot once the SYN-ACK serialized. SYN-ACK seq is our
+            // ISN, ack is the peer's SYN + 1; then arm it for retransmission (half-open timeout).
+            let seq = conn.snd_nxt;
+            let n = conn.emit(out, our_ip, our_mac, local_port, window, SYN | ACK, seq, conn.rcv_nxt, &[])?;
             conn.snd_nxt = conn.snd_nxt.wrapping_add(1); // our SYN consumes one
+            conn.arm(now, seq, SYN | ACK, &[]);
             self.conns[slot] = Some(conn);
             Some(n)
         } else {

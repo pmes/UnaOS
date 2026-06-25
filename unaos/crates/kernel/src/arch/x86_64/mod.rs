@@ -27,6 +27,13 @@ pub fn hlt() {
     x86_64::instructions::hlt();
 }
 
+/// Monotonic tick counter since boot (the local-APIC timer heartbeat). Arch-neutral entry
+/// point used by drivers for coarse timing (e.g. TCP retransmission RTO); the absolute rate
+/// is uncalibrated but steady.
+pub fn ticks() -> u64 {
+    apic::ticks()
+}
+
 pub fn without_interrupts<F, R>(f: F) -> R
 where
     F: FnOnce() -> R,

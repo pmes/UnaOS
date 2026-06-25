@@ -821,6 +821,19 @@ impl E1000 {
         }
     }
 
+    /// Service the TCP listener's retransmission timers: if a connection's outstanding segment
+    /// has passed its RTO, retransmit it. Called each main-loop pass from `service_net`.
+    fn tcp_tick(&mut self) {
+        let now = crate::arch::ticks();
+        let our_ip = self.arp_state.our_ip();
+        let our_mac = self.mac;
+        let mut out = [0u8; RX_BUF_SIZE];
+        if let Some(n) = self.tcp.tick(now, our_ip, our_mac, &mut out) {
+            self.transmit(&out[..n]);
+            serial_println!("[tcp] retransmit ({} bytes)", n);
+        }
+    }
+
     fn link_up(&self) -> bool {
         self.reg_read(REG_STATUS) & STATUS_LU != 0
     }
@@ -894,7 +907,7 @@ impl E1000 {
                 // Outbound connection (active open) handled it.
                 Some(n)
             } else if let Some(n) =
-                self.tcp.handle(frame, self.arp_state.our_ip(), self.mac, &mut tx_scratch)
+                self.tcp.handle(frame, crate::arch::ticks(), self.arp_state.our_ip(), self.mac, &mut tx_scratch)
             {
                 // TCP echo listener (stateful) handled it.
                 Some(n)
@@ -1059,12 +1072,14 @@ pub fn enable_interrupts(bus: u8, slot: u8, func: u8, msg_addr: u32, vector: u32
     ok
 }
 
-/// Main-loop hook: poll the NIC for received frames, then advance the boot connectivity
-/// self-test. No-op if no NIC is present (e.g. on aarch64 / when no e1000 was found).
+/// Main-loop hook: poll the NIC for received frames, advance the boot connectivity self-test,
+/// then service TCP retransmission timers. No-op if no NIC is present (e.g. on aarch64 / when
+/// no e1000 was found).
 pub fn service_net() {
     if let Some(nic) = NET_DEVICE.lock().as_mut() {
         nic.poll();
         nic.selftest_tick();
+        nic.tcp_tick();
     }
 }
 

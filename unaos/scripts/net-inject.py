@@ -126,10 +126,11 @@ def tcp(sport, dport, seq, ack, flags, window, src_ip, dst_ip, payload):
     return bytes(seg)
 
 
-def recv_tcp(s, my_port):
+def recv_tcp(s, my_port, timeout=8):
     """Wait for a TCP segment from the guest addressed to our client port. Returns
-    (flags, seq, ack, payload, ip_ck_ok, tcp_ck_ok) or None on timeout."""
-    deadline = time.time() + 8
+    (flags, seq, ack, payload, ip_ck_ok, tcp_ck_ok) or None on timeout. (The socket's own
+    timeout must be >= `timeout`, else recv_frame raises first and this returns early.)"""
+    deadline = time.time() + timeout
     while time.time() < deadline:
         try:
             f = recv_frame(s)
@@ -438,6 +439,9 @@ def test_multi_tcp(s, guest_mac, n=3):
                 and ack == (c["c_isn"] + 1 + len(c["data"])) & MASK
                 and ipok and tcpok):
             c["echoed"] = True
+            # ACK the echo promptly (well-behaved peer) so the guest clears its retransmit timer.
+            nb = len(c["data"])
+            send(c["cport"], (c["c_isn"] + 1 + nb) & MASK, (c["s_isn"] + 1 + nb) & MASK, ACK)
             need -= 1
         elif payload:
             print("   conn :%d echo mismatch payload=%r (want %r)" % (dport, payload, c["data"]))
@@ -469,6 +473,64 @@ def test_multi_tcp(s, guest_mac, n=3):
         print("FAIL: not all connections closed")
         return False
     print("<- all %d connections closed independently   [MULTI-CONN CLOSE OK]" % n)
+    return True
+
+
+def test_tcp_retransmit(s, guest_mac):
+    """Loss injection: prove the listener retransmits an unacknowledged segment after its RTO.
+    (1) Data path: send data, receive the echo, then WITHHOLD the ACK -> the guest must
+        retransmit the SAME echo. (2) Half-open path: a SYN-ACK whose handshake ACK is withheld
+        must also be retransmitted (the mechanism that eventually times out half-open slots)."""
+    print("--- TCP retransmission (loss injection) ---")
+    s.settimeout(12)  # the retransmit RTO is coarse; allow a generous wait
+
+    def cs(cport, seq, ack, flags, payload=b""):
+        send_frame(s, eth(guest_mac, MY_MAC, 0x0800,
+                          ipv4(MY_IP, GUEST_IP, 6, tcp(cport, 7, seq, ack, flags, 4096, MY_IP, GUEST_IP, payload))))
+
+    # (1) Data retransmission.
+    cport, c_isn = 40060, 0x6000
+    cs(cport, c_isn, 0, SYN)
+    sa = recv_tcp(s, cport)
+    if sa is None or (sa[0] & (SYN | ACK)) != (SYN | ACK):
+        print("FAIL: no SYN-ACK for retransmit test (%s)" % (sa,)); return False
+    s_isn = sa[1]
+    cs(cport, c_isn + 1, s_isn + 1, ACK)
+    data = b"retransmit-me"
+    cs(cport, c_isn + 1, s_isn + 1, PSH | ACK, data)
+    e1 = recv_tcp(s, cport)
+    if e1 is None or e1[3] != data:
+        print("FAIL: no initial echo (%s)" % (e1,)); return False
+    t0 = time.time()
+    print("-> sent data, got echo seq=%d; WITHHOLDING ack to force retransmission" % e1[1])
+    rx = recv_tcp(s, cport, timeout=10)  # the same segment must come again
+    if rx is None or rx[3] != data or rx[1] != e1[1]:
+        print("FAIL: echo was not retransmitted (got %s)" % (rx,)); return False
+    print("<- echo RETRANSMITTED after %.2fs (same seq=%d data=%r)   [TCP RETRANSMIT OK]"
+          % (time.time() - t0, rx[1], rx[3]))
+    nb = len(data)
+    cs(cport, c_isn + 1 + nb, s_isn + 1 + nb, ACK)            # finally ack it
+    cs(cport, c_isn + 1 + nb, s_isn + 1 + nb, FIN | ACK)      # and close
+    fin = recv_tcp(s, cport)
+    if fin is None or (fin[0] & FIN) == 0:
+        print("FAIL: no FIN-ACK after retransmit test (%s)" % (fin,)); return False
+    cs(cport, c_isn + 2 + nb, s_isn + 2 + nb, ACK)
+
+    # (2) Half-open SYN-ACK retransmission (the half-open / SYN-flood timeout mechanism).
+    hport, h_isn = 40061, 0x6100
+    cs(hport, h_isn, 0, SYN)
+    sa1 = recv_tcp(s, hport)
+    if sa1 is None or (sa1[0] & (SYN | ACK)) != (SYN | ACK):
+        print("FAIL: no SYN-ACK for half-open test (%s)" % (sa1,)); return False
+    th = time.time()
+    print("-> half-open: got SYN-ACK seq=%d; WITHHOLDING the handshake ACK" % sa1[1])
+    sa2 = recv_tcp(s, hport, timeout=10)
+    if sa2 is None or (sa2[0] & (SYN | ACK)) != (SYN | ACK) or sa2[1] != sa1[1]:
+        print("FAIL: SYN-ACK was not retransmitted (got %s)" % (sa2,)); return False
+    print("<- SYN-ACK RETRANSMITTED after %.2fs (same seq=%d)   [TCP HALF-OPEN RETRANSMIT OK]"
+          % (time.time() - th, sa2[1]))
+    cs(hport, sa1[1] + 1, 0, RST)  # free the guest's slot promptly
+    s.settimeout(8)
     return True
 
 
@@ -599,6 +661,10 @@ def main():
     #     exercises the hand-rolled TCP (handshake / data echo / teardown) AND proves the new
     #     connection table demuxes several concurrent connections by 4-tuple. ---
     if not test_multi_tcp(s, guest_mac, n=3):
+        return 1
+
+    # --- TCP retransmission / RTO (loss injection: withhold ACKs, expect resends) ---
+    if not test_tcp_retransmit(s, guest_mac):
         return 1
 
     print("ALL CHECKS PASSED")

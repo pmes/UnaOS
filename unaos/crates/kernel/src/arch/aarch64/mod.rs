@@ -24,6 +24,13 @@ pub fn poll_input() -> Option<u8> {
     serial::SERIAL_PORT.lock().read_byte()
 }
 
+/// Monotonic tick counter. Arch-neutral entry point (mirrors x86_64). aarch64 has no timer
+/// heartbeat wired yet, so this is a stub returning 0 — the NIC (its only consumer) never runs
+/// on aarch64 anyway (NET_DEVICE stays None), so no timing depends on it here.
+pub fn ticks() -> u64 {
+    0
+}
+
 pub fn without_interrupts<F, R>(f: F) -> R
 where
     F: FnOnce() -> R,
