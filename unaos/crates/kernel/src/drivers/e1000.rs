@@ -163,6 +163,15 @@ const TCP_SELFTEST_PORT: u16 = 7777;
 /// One-shot payload the connect self-test / `connect` (no message) sends after the handshake.
 const TCP_PROBE_PAYLOAD: &[u8] = b"unaos-tcp";
 
+/// First ephemeral local port for outbound UDP datagrams (incremented per send).
+const UDP_LOCAL_PORT_BASE: u16 = 49152;
+/// Largest outbound UDP payload `udp_send` will transmit.
+const UDP_TX_CAP: usize = 256;
+/// Gateway UDP port the boot self-test sends to (the socket injector serves an echo here).
+const UDP_SELFTEST_PORT: u16 = 9998;
+/// Payload the UDP self-test / `udpsend` (no message) emits.
+const UDP_PROBE_PAYLOAD: &[u8] = b"unaos-udp";
+
 /// Legacy receive descriptor (16 bytes). Written by hardware via DMA, so every
 /// access goes through `read_volatile`/`write_volatile` on whole-struct copies —
 /// the struct is `packed`, so taking a reference to a field would be unaligned UB.
@@ -211,6 +220,14 @@ pub struct E1000 {
     /// Next ephemeral local port + initial sequence ramp for outbound connections.
     tcp_local_port: u16,
     tcp_client_isn: u32,
+    /// While an outbound UDP exchange is in flight, the `(peer IP, our ephemeral port)` we
+    /// expect the reply from/on; `poll()` routes a matching datagram into `udp_rx` instead of
+    /// the inbound UDP-echo responder (which would otherwise bounce our reply back — a loop).
+    /// Source-scoped (peer IP), like the ICMP `pong` slot.
+    udp_client: Option<([u8; 4], u16)>,
+    /// Payload length of the captured reply (set by the capture path; consumed by `udp_send`).
+    udp_rx: Option<usize>,
+    udp_local_port: u16,
     /// IP→MAC mappings learned from inbound ARP (and IP frames) — the resolver for outbound.
     arp_cache: ArpCache,
     /// `(source IP, identifier, sequence)` of the most recent ICMP echo reply addressed to
@@ -595,6 +612,94 @@ impl E1000 {
         outcome
     }
 
+    /// Capture an inbound UDP datagram that is the reply to an in-flight outbound exchange
+    /// (destined to our IP on the active `udp_client_port`). Returns true when consumed, so
+    /// `poll()` does NOT also hand it to the inbound UDP-echo responder (which would bounce
+    /// our reply back to the peer and, against an echo server, loop).
+    fn udp_client_capture(&mut self, frame: &[u8]) -> bool {
+        let (peer, port) = match self.udp_client {
+            Some(x) => x,
+            None => return false,
+        };
+        let eth = match EthernetFrame::new(frame) {
+            Some(e) => e,
+            None => return false,
+        };
+        if eth.ethertype() != EtherType::Ipv4 {
+            return false;
+        }
+        let ip = match Ipv4Header::new(eth.payload()) {
+            Some(h) => h,
+            None => return false,
+        };
+        if !ip.verify_checksum()
+            || ip.destination_ip() != self.arp_state.our_ip()
+            || ip.source_ip() != peer
+            || ip.protocol() != net::udp::PROTO_UDP
+        {
+            return false;
+        }
+        let dg = match net::udp::UdpDatagram::new(ip.payload()) {
+            Some(d) => d,
+            None => return false,
+        };
+        if dg.dest_port() != port {
+            return false;
+        }
+        self.udp_rx = Some(dg.payload().len());
+        true
+    }
+
+    /// Blocking outbound UDP send for the shell / boot self-test: resolve `ip`, send one
+    /// datagram from an ephemeral port, then pump RX briefly for a reply (UDP is best-effort,
+    /// so no reply is not an error). Returns an outcome summary.
+    fn udp_send(&mut self, ip: [u8; 4], port: u16, payload: &[u8]) -> UdpOutcome {
+        let mac = match self.resolve(ip) {
+            Some(m) => m,
+            None => return UdpOutcome { resolved: false, sent: false, replied: false, rx_len: 0 },
+        };
+        let local = self.udp_local_port;
+        self.udp_local_port = self.udp_local_port.checked_add(1).unwrap_or(UDP_LOCAL_PORT_BASE);
+        if self.udp_local_port < UDP_LOCAL_PORT_BASE {
+            self.udp_local_port = UDP_LOCAL_PORT_BASE;
+        }
+
+        let our_ip = self.arp_state.our_ip();
+        let our_mac = self.mac;
+        let pl = &payload[..payload.len().min(UDP_TX_CAP)];
+        let mut frame = [0u8; 14 + 20 + 8 + UDP_TX_CAP];
+        let udp_len = match net::udp::write_datagram(&mut frame[34..], local, port, our_ip, ip, pl) {
+            Some(n) => n,
+            None => return UdpOutcome { resolved: true, sent: false, replied: false, rx_len: 0 },
+        };
+        if net::ipv4::write_header(&mut frame[14..34], our_ip, ip, net::udp::PROTO_UDP, udp_len).is_none() {
+            return UdpOutcome { resolved: true, sent: false, replied: false, rx_len: 0 };
+        }
+        if net::ethernet::write_header(&mut frame[0..14], mac, our_mac, EtherType::Ipv4.as_u16()).is_none() {
+            return UdpOutcome { resolved: true, sent: false, replied: false, rx_len: 0 };
+        }
+        let total = 14 + 20 + udp_len;
+
+        self.udp_client = Some((ip, local));
+        self.udp_rx = None;
+        self.transmit(&frame[..total]);
+
+        for _ in 0..PUMP_ITERS {
+            self.poll();
+            if self.udp_rx.is_some() {
+                break;
+            }
+            core::hint::spin_loop();
+        }
+
+        let (replied, rx_len) = match self.udp_rx {
+            Some(n) => (true, n),
+            None => (false, 0),
+        };
+        self.udp_client = None;
+        UdpOutcome { resolved: true, sent: true, replied, rx_len }
+    }
+
     /// One step of the boot connectivity self-test, called from `service_net` after `poll`.
     /// First ARP-resolves the gateway, then sends ICMP echo requests to it, until either a
     /// reply arrives (success) or the per-phase attempt budget is exhausted. Non-blocking:
@@ -627,6 +732,19 @@ impl E1000 {
                     serial_println!(
                         "[selftest] TCP connect to {}:{} — no server (ok if the backend has none)",
                         fmt_ip(&GATEWAY_IP), TCP_SELFTEST_PORT
+                    );
+                }
+                // And the outbound UDP path: send a datagram to the gateway echo port, await echo.
+                let u = self.udp_send(GATEWAY_IP, UDP_SELFTEST_PORT, UDP_PROBE_PAYLOAD);
+                if u.replied {
+                    serial_println!(
+                        "[selftest] UDP echo from {}:{} OK — {} bytes",
+                        fmt_ip(&GATEWAY_IP), UDP_SELFTEST_PORT, u.rx_len
+                    );
+                } else {
+                    serial_println!(
+                        "[selftest] UDP send to {}:{} — no echo (ok if the backend has none)",
+                        fmt_ip(&GATEWAY_IP), UDP_SELFTEST_PORT
                     );
                 }
                 self.selftest_armed = false;
@@ -780,6 +898,9 @@ impl E1000 {
             {
                 // TCP echo listener (stateful) handled it.
                 Some(n)
+            } else if self.udp_client_capture(frame) {
+                // Reply to an in-flight outbound UDP send — captured, never re-echoed.
+                None
             } else {
                 net::ingress(frame, &self.arp_state, &mut tx_scratch)
             };
@@ -870,6 +991,9 @@ pub fn init(bus: u8, slot: u8, func: u8) {
         tcp_client: None,
         tcp_local_port: TCP_LOCAL_PORT_BASE,
         tcp_client_isn: 0x00A0_0000,
+        udp_client: None,
+        udp_rx: None,
+        udp_local_port: UDP_LOCAL_PORT_BASE,
         arp_cache: ArpCache::new(),
         pong: None,
         selftest_armed: false,
@@ -982,6 +1106,25 @@ pub struct ConnectOutcome {
 /// (empty = connect then immediately close), read the response, and close. `None` if no NIC.
 pub fn connect(ip: [u8; 4], port: u16, payload: &[u8]) -> Option<ConnectOutcome> {
     NET_DEVICE.lock().as_mut().map(|nic| nic.connect(ip, port, payload))
+}
+
+/// Outcome of a blocking [`udp_send`] (rendered by the `udpsend` shell command).
+#[derive(Clone, Copy)]
+pub struct UdpOutcome {
+    /// Whether the destination MAC resolved (an unreachable host fails here).
+    pub resolved: bool,
+    /// Whether the datagram was transmitted.
+    pub sent: bool,
+    /// Whether a reply datagram arrived (UDP is best-effort — no reply is not an error).
+    pub replied: bool,
+    /// Bytes of reply payload received.
+    pub rx_len: usize,
+}
+
+/// Blocking outbound UDP send from the shell: resolve `ip`, send one datagram to `port`, and
+/// briefly await a reply. `None` if no NIC is present.
+pub fn udp_send(ip: [u8; 4], port: u16, payload: &[u8]) -> Option<UdpOutcome> {
+    NET_DEVICE.lock().as_mut().map(|nic| nic.udp_send(ip, port, payload))
 }
 
 /// Snapshot of the current NIC state, if any (used by the `netinfo` shell command).

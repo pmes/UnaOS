@@ -35,6 +35,10 @@ GUEST_PING_PAYLOAD = b"unaos-ping"
 # this probe; we run a tiny gateway-side TCP echo server on this port to complete it.
 SELFTEST_TCP_PORT = 7777
 GUEST_TCP_PROBE = b"unaos-tcp"
+# The guest's boot self-test also sends one outbound UDP datagram to the gateway here; we run a
+# gateway-side UDP echo server to complete it.
+SELFTEST_UDP_PORT = 9998
+GUEST_UDP_PROBE = b"unaos-udp"
 
 
 def cksum(data):
@@ -190,15 +194,16 @@ def respond_to_guest_probes(s, t0, budget_s=22.0, want_pings=1):
     connection to 10.0.2.2:7777 (handshake -> data echo -> teardown). Every guest packet is
     checked (checksums + the protocol fields the kernel is contracted to emit). Returns True
     once ARP + >= want_pings pings + one complete TCP echo exchange have all been observed."""
-    print("--- outbound test: impersonating gateway %s (ARP + ICMP + TCP echo :%d) ---"
-          % (ipstr(GW_IP), SELFTEST_TCP_PORT))
+    print("--- outbound test: impersonating gateway %s (ARP + ICMP + TCP echo :%d + UDP echo :%d) ---"
+          % (ipstr(GW_IP), SELFTEST_TCP_PORT, SELFTEST_UDP_PORT))
     arped = False
     pings = 0
     conn = None       # gateway-side TCP server state for the one expected connection
     s_isn = 0x9000
     tcp_ok = False    # set once a SINGLE connection completes handshake + valid echo + close
+    udp_ok = False    # set once a valid outbound UDP datagram is received + echoed
     deadline = time.time() + budget_s
-    while time.time() < deadline and not (arped and pings >= want_pings and tcp_ok):
+    while time.time() < deadline and not (arped and pings >= want_pings and tcp_ok and udp_ok):
         try:
             f = recv_frame(s)
         except socket.timeout:
@@ -255,6 +260,23 @@ def respond_to_guest_probes(s, t0, budget_s=22.0, want_pings=1):
                 print("[%5.1fs] <- guest ICMP echo request REJECTED ip_ck=%s icmp_ck=%s id=0x%04x(exp 0x%04x) data=%r(exp %r) src=%s(exp %s)"
                       % (time.time() - t0, ip_ck_ok, icmp_ck_ok, ident, GUEST_PING_IDENT,
                          data, GUEST_PING_PAYLOAD, ipstr(src_ip), ipstr(GUEST_IP)))
+            continue
+
+        if proto == 17 and len(l4) >= 8:  # UDP (gateway-side echo server)
+            sport = struct.unpack(">H", l4[0:2])[0]
+            dport = struct.unpack(">H", l4[2:4])[0]
+            if dport != SELFTEST_UDP_PORT:
+                continue
+            udp_len = struct.unpack(">H", l4[4:6])[0]
+            data = l4[8:udp_len] if 8 <= udp_len <= len(l4) else l4[8:]
+            udp_ck_ok = udp_checksum(src_ip, dst_ip, l4) == 0
+            # Echo back, swapping ports (src=our port, dst=guest's ephemeral port).
+            send_frame(s, eth(guest_mac, GW_MAC, 0x0800,
+                              ipv4(GW_IP, src_ip, 17, udp(SELFTEST_UDP_PORT, sport, GW_IP, src_ip, data))))
+            ok = (data == GUEST_UDP_PROBE and udp_ck_ok and ip_ck_ok and src_ip == GUEST_IP)
+            udp_ok = udp_ok or ok
+            print("[%5.1fs] <- guest UDP %r ip_ck=%s udp_ck=%s src=%s -> echoed   [GUEST UDP %s]"
+                  % (time.time() - t0, data, ip_ck_ok, udp_ck_ok, ipstr(src_ip), "OK" if ok else "REJECTED"))
             continue
 
         if proto == 6 and len(l4) >= 20:  # TCP (gateway-side echo server)
@@ -319,7 +341,10 @@ def respond_to_guest_probes(s, t0, budget_s=22.0, want_pings=1):
     if not tcp_ok:
         print("FAIL: guest did not complete one full TCP handshake + valid echo + close")
         return False
-    print("<- guest outbound verified: ARP + %d ping(s) + TCP connect/echo/close   [GUEST OUTBOUND OK]" % pings)
+    if not udp_ok:
+        print("FAIL: guest did not send a valid outbound UDP datagram")
+        return False
+    print("<- guest outbound verified: ARP + %d ping(s) + TCP connect/echo/close + UDP send/echo   [GUEST OUTBOUND OK]" % pings)
     return True
 
 
