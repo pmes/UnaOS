@@ -11,6 +11,75 @@ use unaos_boot_info::{BootInfo, FrameBufferInfo, PixelFormat, MemoryRegion, Memo
 
 use uefi::proto::media::file::{File, FileAttribute, FileMode};
 use uefi::proto::media::fs::SimpleFileSystem;
+use uefi::proto::unsafe_protocol;
+
+// EDID — how a monitor reports its own native/preferred resolution. The first Detailed Timing
+// Descriptor in the EDID block is the preferred (native) mode. UEFI exposes EDID via two protocols
+// (UEFI 2.x spec 12.9), neither in the `uefi` crate, so we declare both. Both have the same layout:
+// { UINT32 SizeOfEdid; UINT8 *Edid; }. We try ACTIVE (the EDID the firmware is actually using)
+// first, then DISCOVERED (the raw block read from the monitor) — different firmware publishes one,
+// the other, or neither.
+#[repr(C)]
+#[unsafe_protocol("bd8c1056-9f36-44ec-92a8-a6337f817986")]
+struct EdidActiveProtocol {
+    size_of_edid: u32,
+    edid: *const u8,
+}
+
+#[repr(C)]
+#[unsafe_protocol("1c0c34f6-d380-41fa-a049-8ad06c1a66aa")]
+struct EdidDiscoveredProtocol {
+    size_of_edid: u32,
+    edid: *const u8,
+}
+
+/// Parse the monitor's native (preferred) resolution from a raw EDID block: the first Detailed
+/// Timing Descriptor (offset 54). `None` if the block is too short/malformed or that descriptor is
+/// actually a monitor descriptor (zero pixel clock) rather than a timing.
+fn parse_edid_native(bytes: &[u8]) -> Option<(usize, usize)> {
+    if bytes.len() < 128 {
+        return None;
+    }
+    // EDID 1.x fixed header pattern.
+    if bytes[0..8] != [0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x00] {
+        return None;
+    }
+    let d = &bytes[54..72];
+    if d[0] == 0 && d[1] == 0 {
+        return None; // monitor descriptor, not a timing
+    }
+    // Horizontal/vertical active pixels: low 8 bits + high 4 bits packed in the upper nibble.
+    let w = (d[2] as usize) | (((d[4] as usize) >> 4) << 8);
+    let h = (d[5] as usize) | (((d[7] as usize) >> 4) << 8);
+    if w == 0 || h == 0 {
+        return None;
+    }
+    Some((w, h))
+}
+
+/// Read the monitor's native resolution from EDID on `handle`, trying the ACTIVE then DISCOVERED
+/// protocol. `None` if no EDID is exposed — callers then fall back to the firmware's current mode.
+fn edid_native_resolution(handle: uefi::Handle) -> Option<(usize, usize)> {
+    // Safety: the firmware owns the EDID buffer; it's valid while boot services are live (we read
+    // it now, before exit_boot_services). `size_of_edid` is the firmware-reported length.
+    if let Ok(p) = boot::open_protocol_exclusive::<EdidActiveProtocol>(handle) {
+        if !p.edid.is_null() && p.size_of_edid >= 128 {
+            let bytes = unsafe { core::slice::from_raw_parts(p.edid, p.size_of_edid as usize) };
+            if let Some(r) = parse_edid_native(bytes) {
+                return Some(r);
+            }
+        }
+    }
+    if let Ok(p) = boot::open_protocol_exclusive::<EdidDiscoveredProtocol>(handle) {
+        if !p.edid.is_null() && p.size_of_edid >= 128 {
+            let bytes = unsafe { core::slice::from_raw_parts(p.edid, p.size_of_edid as usize) };
+            if let Some(r) = parse_edid_native(bytes) {
+                return Some(r);
+            }
+        }
+    }
+    None
+}
 
 #[entry]
 fn main() -> Status {
@@ -37,68 +106,106 @@ fn main() -> Status {
             }
         };
         
-        // The display resolution is auto-detected from the firmware's GOP, not hard-coded — and the
-        // firmware's *default* mode is usually not the panel's native/maximum. So enumerate the
-        // modes and select the largest *linear-framebuffer* (Rgb/Bgr) one we can drive. The full
-        // list is logged because on real hardware (no serial) it's the only way to see what the
-        // panel offers.
+        // Choose the display mode. Resolution is auto-detected (never hard-coded). We target the
+        // monitor's NATIVE resolution — read from its EDID — not the GPU's largest advertised mode:
+        // a non-native mode on a real panel means scaling/blur, or one the monitor can't display.
+        // The fallback is the firmware's current mode (which firmware usually already sets from
+        // EDID). The full mode list is logged because on serial-less hardware it's the only way to
+        // see what the panel offers.
         //
-        // The pick is capped to what the kernel can back-buffer: the double-buffer back buffer is
-        // stride*height*4 bytes and must fit the kernel heap alongside its other allocations.
-        // MAX_BACKBUF_BYTES is tied to crates/kernel allocator::HEAP_SIZE (32 MiB) — keep in sync;
-        // 24 MiB leaves headroom for the xHCI/console/block allocations.
-        const MAX_BACKBUF_BYTES: usize = 24 * 1024 * 1024;
+        // Capped to what the kernel can back-buffer: the double-buffer back buffer is
+        // stride*height*4 bytes and must fit the kernel heap. MAX_BACKBUF_BYTES is tied to
+        // crates/kernel allocator::HEAP_SIZE (48 MiB) — keep in sync; 40 MiB leaves headroom.
+        const MAX_BACKBUF_BYTES: usize = 40 * 1024 * 1024;
 
-        let cur = gop.current_mode_info().resolution();
-        log::info!("GOP: {} modes (firmware default {}x{}):", gop.modes().len(), cur.0, cur.1);
+        let cur_info = gop.current_mode_info();
+        let cur = cur_info.resolution();
+        let cur_linear = matches!(
+            cur_info.pixel_format(),
+            uefi::proto::console::gop::PixelFormat::Rgb | uefi::proto::console::gop::PixelFormat::Bgr
+        );
+        log::info!("GOP: {} modes (firmware current {}x{}):", gop.modes().len(), cur.0, cur.1);
         for mode in gop.modes() {
             let mi = mode.info();
             let (w, h) = mi.resolution();
             log::info!("  GOP mode: {}x{} stride={} fmt={:?}", w, h, mi.stride(), mi.pixel_format());
         }
 
-        // Linear-framebuffer modes within the back-buffer budget, largest area first. (BltOnly /
-        // Bitmask modes have no usable linear framebuffer, so they're excluded.)
-        let mut candidates: alloc::vec::Vec<uefi::proto::console::gop::Mode> = gop
-            .modes()
-            .filter(|m| {
-                matches!(
-                    m.info().pixel_format(),
-                    uefi::proto::console::gop::PixelFormat::Rgb
-                        | uefi::proto::console::gop::PixelFormat::Bgr
-                )
-            })
-            .filter(|m| {
-                let mi = m.info();
-                mi.stride() * mi.resolution().1 * 4 <= MAX_BACKBUF_BYTES
-            })
-            .collect();
-        candidates.sort_unstable_by_key(|m| {
-            let (w, h) = m.info().resolution();
-            core::cmp::Reverse(w * h)
-        });
-
-        // Set the largest mode the firmware accepts (fall through to smaller ones if set_mode
-        // fails, e.g. not enough video memory). If none work, the current mode is left untouched.
-        for mode in &candidates {
-            let (w, h) = mode.info().resolution();
-            match gop.set_mode(mode) {
-                Ok(()) => {
-                    log::info!("GOP: selected {}x{}", w, h);
-                    break;
-                }
-                Err(e) => log::warn!("GOP: set_mode {}x{} failed ({:?}); trying smaller", w, h, e),
-            }
+        // The monitor's native resolution from EDID, if the firmware exposes it.
+        let native = edid_native_resolution(gop_handle);
+        match native {
+            Some((w, h)) => log::info!("EDID: monitor native resolution {}x{}", w, h),
+            None => log::info!("EDID: not available; using the firmware's current mode"),
         }
 
-        // Read the active mode + framebuffer *after* set_mode (it invalidates the old framebuffer).
-        let mode_info = gop.current_mode_info();
-        let mut fb = gop.frame_buffer();
+        // A "usable" mode has a linear (Rgb/Bgr) framebuffer within the back-buffer budget. BltOnly
+        // and Bitmask modes have no directly-addressable framebuffer, so they're never usable here.
+        let usable = |mi: &uefi::proto::console::gop::ModeInfo| -> bool {
+            matches!(
+                mi.pixel_format(),
+                uefi::proto::console::gop::PixelFormat::Rgb | uefi::proto::console::gop::PixelFormat::Bgr
+            ) && mi.stride() * mi.resolution().1 * 4 <= MAX_BACKBUF_BYTES
+        };
 
+        // Decide the target mode (None = the current mode is already what we want):
+        //   1. the EDID-native resolution as a linear mode — drive the panel at native res; else
+        //   2. if the current mode is already linear, keep it (firmware set it, usually from EDID); else
+        //   3. the current mode is BltOnly/Bitmask (no linear framebuffer) so we MUST switch: prefer a
+        //      linear mode at the firmware's chosen resolution, else the largest linear within budget.
+        let target: Option<uefi::proto::console::gop::Mode> = {
+            let by_native = native
+                .and_then(|res| gop.modes().find(|m| m.info().resolution() == res && usable(m.info())));
+            if by_native.is_some() {
+                by_native
+            } else if cur_linear {
+                None
+            } else {
+                gop.modes()
+                    .find(|m| m.info().resolution() == cur && usable(m.info()))
+                    .or_else(|| {
+                        gop.modes().filter(|m| usable(m.info())).max_by_key(|m| {
+                            let (w, h) = m.info().resolution();
+                            w * h
+                        })
+                    })
+            }
+        };
+
+        match target {
+            Some(mode) => {
+                let (w, h) = mode.info().resolution();
+                // Switch when the resolution changes or the current mode lacks a linear framebuffer.
+                if (w, h) != cur || !cur_linear {
+                    match gop.set_mode(&mode) {
+                        Ok(()) => log::info!("GOP: set linear mode {}x{}", w, h),
+                        Err(e) => log::warn!(
+                            "GOP: set_mode {}x{} failed ({:?}); current {}x{}", w, h, e, cur.0, cur.1
+                        ),
+                    }
+                } else {
+                    log::info!("GOP: current mode {}x{} already native + linear", w, h);
+                }
+            }
+            None => log::info!("GOP: keeping firmware current mode {}x{}", cur.0, cur.1),
+        }
+
+        // Read the active mode *after* any set_mode (it invalidates the old framebuffer).
+        let mode_info = gop.current_mode_info();
         let pixel_format = match mode_info.pixel_format() {
             uefi::proto::console::gop::PixelFormat::Rgb => PixelFormat::Rgb,
             uefi::proto::console::gop::PixelFormat::Bgr => PixelFormat::Bgr,
             _ => PixelFormat::Unknown,
+        };
+
+        // Only access the linear framebuffer if the active mode actually has one. A BltOnly/Bitmask
+        // mode has no direct framebuffer (gop.frame_buffer() would panic); rather than die in the
+        // bootloader we boot without a display (the kernel falls back to serial-only).
+        let (fb_ptr, fb_bytes) = if matches!(pixel_format, PixelFormat::Rgb | PixelFormat::Bgr) {
+            let mut fb = gop.frame_buffer();
+            (fb.as_mut_ptr() as u64, fb.size())
+        } else {
+            log::warn!("GOP: active mode has no linear framebuffer; booting without a display");
+            (0u64, 0usize)
         };
 
         fb_info = FrameBufferInfo {
@@ -108,9 +215,8 @@ fn main() -> Status {
             bytes_per_pixel: 4,
             pixel_format,
         };
-        
-        fb_addr = fb.as_mut_ptr() as u64;
-        fb_size = fb.size();
+        fb_addr = fb_ptr;
+        fb_size = fb_bytes;
     }
 
     let sfs_handle = match boot::get_handle_for_protocol::<SimpleFileSystem>() {
