@@ -94,6 +94,18 @@ const PARK_NONE: u8 = 0;
 const PARK_WAITQ: u8 = 1; // hand the Box to a wait queue, then release that queue's lock
 const PARK_SLEEP: u8 = 2; // push the Box onto this CPU's sleeper list with a wake deadline
 
+/// Number of scheduling priority levels. A CPU always runs a ready task of the HIGHEST non-empty
+/// level; within a level scheduling is round-robin (FIFO). Higher number = higher priority.
+pub const NUM_PRIORITIES: usize = 4;
+/// Convenience priority levels (any `0..NUM_PRIORITIES` is valid; out-of-range is clamped).
+pub const PRIO_LOW: u8 = 0;
+pub const PRIO_NORMAL: u8 = 1;
+pub const PRIO_HIGH: u8 = 2;
+pub const PRIO_RT: u8 = 3;
+/// Sentinel for `SchedCpu::current_prio` meaning "no task running" (CPU idle). Compares below any
+/// real priority so a newly-ready task always wakes an idle core.
+const PRIO_IDLE: u8 = u8::MAX;
+
 /// A kernel thread. Owned as `Box<Task>`: it lives in exactly one place at a time — a run queue
 /// (`Box` in the `VecDeque`), or "running" (the `Box` leaked to a raw pointer in `current`).
 pub struct Task {
@@ -113,6 +125,9 @@ pub struct Task {
     /// Logical CPU this task is pinned to (only read by a `debug_assert`, hence the allow).
     #[allow(dead_code)]
     cpu: u32,
+    /// Scheduling priority (`0..NUM_PRIORITIES`, higher = more urgent). Immutable after spawn, so
+    /// it is safe to read from any CPU (used for the preemption decision when waking/spawning).
+    priority: u8,
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -131,8 +146,12 @@ struct SchedCpu {
     /// Ticks remaining in the current task's quantum.
     quantum: AtomicU32,
     /// Set when the running task should be preempted at the next safe point (quantum expiry, or
-    /// an explicit reschedule request). Single preempt signal.
+    /// an explicit reschedule request — e.g. a higher-priority task became ready). Single signal.
     need_resched: AtomicBool,
+    /// Priority of the task currently running here, or `PRIO_IDLE` if none. Set on dispatch, reset
+    /// on switch-back. Read (best-effort, Acquire) by a waker/spawner on another CPU to decide
+    /// whether the newly-ready task outranks what's running and should preempt it.
+    current_prio: AtomicU8,
     /// "Park action" for a task switching back BLOCKED: `PARK_*`. Set by the blocking primitive
     /// before its switch, read-and-cleared by `run()` after. Same-CPU sequential, so `Relaxed`
     /// is sufficient (`switch_context` is the memory barrier between writer and reader).
@@ -153,6 +172,7 @@ impl SchedCpu {
             current: AtomicU64::new(0),
             quantum: AtomicU32::new(0),
             need_resched: AtomicBool::new(false),
+            current_prio: AtomicU8::new(PRIO_IDLE),
             park_kind: AtomicU8::new(PARK_NONE),
             park_waiters: AtomicU64::new(0),
             park_lock: AtomicU64::new(0),
@@ -175,11 +195,41 @@ static SCHED_GO: AtomicBool = AtomicBool::new(false);
 /// Monotonic task-id source.
 static NEXT_TID: AtomicU64 = AtomicU64::new(1);
 
+/// A CPU's ready tasks, bucketed by priority. One spinlock (in `RUN_QUEUES`) guards all levels;
+/// it is held only briefly (push is O(1); pop/len are O(NUM_PRIORITIES)) and always with IF=0.
+struct RunQueue {
+    levels: [VecDeque<Box<Task>>; NUM_PRIORITIES],
+}
+
+impl RunQueue {
+    fn with_capacity(cap: usize) -> Self {
+        RunQueue { levels: core::array::from_fn(|_| VecDeque::with_capacity(cap)) }
+    }
+    /// Enqueue at the task's priority level (FIFO within the level). Priority is clamped in range.
+    fn push(&mut self, task: Box<Task>) {
+        let level = (task.priority as usize).min(NUM_PRIORITIES - 1);
+        self.levels[level].push_back(task);
+    }
+    /// Dequeue the front of the HIGHEST non-empty level (strict priority, round-robin within).
+    fn pop_highest(&mut self) -> Option<Box<Task>> {
+        for level in self.levels.iter_mut().rev() {
+            if let Some(task) = level.pop_front() {
+                return Some(task);
+            }
+        }
+        None
+    }
+    fn len(&self) -> usize {
+        self.levels.iter().map(VecDeque::len).sum()
+    }
+}
+
 lazy_static! {
-    /// Per-CPU run queues. The lock protects only the `VecDeque` structure; a `Task`'s own fields
-    /// are touched solely by the CPU that owns it. Cross-CPU `spawn` pushes here under the lock.
-    static ref RUN_QUEUES: [SpinMutex<VecDeque<Box<Task>>>; MAX_CPUS] =
-        core::array::from_fn(|_| SpinMutex::new(VecDeque::with_capacity(RUNQ_CAPACITY)));
+    /// Per-CPU multilevel run queues. The lock protects only the queue structure; a `Task`'s own
+    /// fields are touched solely by the CPU that owns it. Cross-CPU `spawn`/wake pushes under the
+    /// lock. Each level is pre-reserved so `push` never reallocates under the lock.
+    static ref RUN_QUEUES: [SpinMutex<RunQueue>; MAX_CPUS] =
+        core::array::from_fn(|_| SpinMutex::new(RunQueue::with_capacity(RUNQ_CAPACITY)));
 
     /// Per-CPU sleeper lists: tasks blocked in `sleep_ticks`, with their wake deadline (this CPU's
     /// tick count). Touched ONLY by `run()` on the owning CPU (parked there on switch-back, drained
@@ -288,10 +338,11 @@ fn build_initial_frame(stack: &mut [u8]) -> u64 {
 // Public API: spawn / yield / exit
 // ---------------------------------------------------------------------------------------------
 
-/// Create a kernel thread and enqueue it on `target_cpu`'s run queue, then poke that CPU so it
-/// promptly picks the work up (wakes it from idle `hlt`; harmless if it is already running). The
-/// task runs `entry(arg)` and is freed when `entry` returns. `target_cpu` must be an online AP.
-pub fn spawn(name: &'static str, entry: fn(usize), arg: usize, target_cpu: usize) {
+/// Create a kernel thread at `priority` and enqueue it on `target_cpu`'s run queue, then poke that
+/// CPU so it promptly picks the work up (wakes it from idle, or preempts a lower-priority task
+/// running there). The task runs `entry(arg)` and is freed when `entry` returns. `target_cpu` must
+/// be an online AP.
+pub fn spawn(name: &'static str, entry: fn(usize), arg: usize, target_cpu: usize, priority: u8) {
     assert!(target_cpu < MAX_CPUS, "spawn: target_cpu out of range");
 
     let mut stack: Box<[u8]> = alloc::vec![0u8; TASK_STACK_SIZE].into_boxed_slice();
@@ -306,10 +357,11 @@ pub fn spawn(name: &'static str, entry: fn(usize), arg: usize, target_cpu: usize
         entry,
         arg,
         cpu: target_cpu as u32,
+        priority,
     });
 
-    RUN_QUEUES[target_cpu].lock().push_back(task);
-    poke_cpu(target_cpu);
+    RUN_QUEUES[target_cpu].lock().push(task);
+    poke_for(target_cpu, priority);
 }
 
 /// Send the wake-only reschedule IPI (vector `IPI_VECTOR`) to `target` so an idle CPU breaks its
@@ -325,16 +377,32 @@ fn poke_cpu(target: usize) {
     }
 }
 
-/// Mark a parked/just-woken task READY, push it onto its PINNED CPU's run queue, and poke that CPU.
-/// Used by the sleeper drain (same CPU → no IPI) and `Semaphore::post` (cross-CPU wake). The task
-/// always returns to `task.cpu`, so its GS base stays correct on resume (tasks don't migrate).
-/// Caller runs with IF=0; mirrors `spawn`'s enqueue+poke, so the same lost-wake-free argument holds.
+/// After enqueuing a newly-ready task of `prio` on `target`, decide whether to disturb that CPU:
+/// wake it if idle, or ask it to reschedule (so it preempts a strictly-lower-priority running task
+/// at its next tick). If the new task ranks at or below what's running, it simply waits its turn.
+/// Best-effort: the read of `current_prio` may be momentarily stale, but the free-running periodic
+/// timer always re-evaluates the run queue, so no work is lost — only the preemption latency varies.
+fn poke_for(target: usize, prio: u8) {
+    let running = SCHED[target].current_prio.load(Ordering::Acquire);
+    if running == PRIO_IDLE {
+        poke_cpu(target); // idle core: wake it to pick up the task (self-poke is a no-op)
+    } else if prio > running {
+        SCHED[target].need_resched.store(true, Ordering::Release);
+        poke_cpu(target); // running a lower-priority task: preempt it at the next tick
+    }
+}
+
+/// Mark a parked/just-woken task READY, push it onto its PINNED CPU's run queue, and poke that CPU
+/// (waking it or preempting a lower-priority task). Used by the sleeper drain (same CPU) and
+/// `Semaphore::post` (cross-CPU wake). The task always returns to `task.cpu`, so its GS base stays
+/// correct on resume (tasks don't migrate). Caller runs with IF=0.
 fn make_ready(task: Box<Task>) {
     let target = task.cpu as usize;
+    let prio = task.priority;
     debug_assert!(target < MAX_CPUS, "make_ready: cpu out of range");
     task.state.store(STATE_READY, Ordering::Release);
-    RUN_QUEUES[target].lock().push_back(task);
-    poke_cpu(target);
+    RUN_QUEUES[target].lock().push(task);
+    poke_for(target, prio);
 }
 
 /// Cooperatively give up the CPU. The current task is marked ready and rotated to the back of its
@@ -723,13 +791,15 @@ fn run() -> ! {
         // tick. Same CPU, no IPI — `make_ready` pushes onto this CPU's own run queue.
         drain_due_sleepers(cpu);
 
-        let next = RUN_QUEUES[cpu].lock().pop_front(); // lock dropped immediately
+        let next = RUN_QUEUES[cpu].lock().pop_highest(); // highest-priority ready task; lock dropped
         match next {
             Some(task) => {
                 task.state.store(STATE_RUNNING, Ordering::Release);
-                // Fresh quantum + clear the reschedule signal for the task we're about to run.
+                // Fresh quantum + clear the reschedule signal, and publish the running priority so a
+                // remote waker/spawner can tell whether a newly-ready task should preempt us.
                 SCHED[cpu].quantum.store(QUANTUM_TICKS, Ordering::Relaxed);
                 SCHED[cpu].need_resched.store(false, Ordering::Relaxed);
+                SCHED[cpu].current_prio.store(task.priority, Ordering::Release);
 
                 let raw = Box::into_raw(task);
                 let entry_rsp = unsafe { (*raw).ctx_rsp };
@@ -743,6 +813,7 @@ fn run() -> ! {
 
                 // --- The task switched back to us (yield / preempt / block / exit). IF=0. ---
                 SCHED[cpu].current.store(0, Ordering::Release);
+                SCHED[cpu].current_prio.store(PRIO_IDLE, Ordering::Release);
                 // Consume the park action exactly once: read it and immediately reset to NONE, so a
                 // stale action can never leak into the next task's switch-back. Only a task that
                 // switched back BLOCKED has a meaningful action.
@@ -752,10 +823,10 @@ fn run() -> ! {
                     STATE_FINISHED => drop(task), // frees the stack
                     STATE_BLOCKED => park_blocked(cpu, park, task),
                     _ => {
-                        // READY (yielded or preempted): rotate to the back of the run queue.
+                        // READY (yielded or preempted): rotate to the back of its priority level.
                         debug_assert_eq!(park, PARK_NONE, "non-blocked task carried a park action");
                         task.state.store(STATE_READY, Ordering::Release);
-                        RUN_QUEUES[cpu].lock().push_back(task);
+                        RUN_QUEUES[cpu].lock().push(task);
                     }
                 }
             }
@@ -825,11 +896,12 @@ fn drain_due_sleepers(cpu: usize) {
 // Bring-up + introspection
 // ---------------------------------------------------------------------------------------------
 
-/// Touch the run queues so they are initialised on the BSP before any AP can reach them, and
-/// reserve their capacity. Call once on the BSP after the heap is up and after SMP verification.
+/// Touch the run queues so the lazy_static is initialised on the BSP (each level already
+/// pre-reserved by `RunQueue::with_capacity`) before any AP can reach them. Call once on the BSP
+/// after the heap is up and after SMP verification.
 pub fn init() {
     for q in RUN_QUEUES.iter() {
-        q.lock().reserve(RUNQ_CAPACITY);
+        let _ = q.lock().len();
     }
 }
 
@@ -861,30 +933,20 @@ pub fn current_task_id(cpu: usize) -> Option<u64> {
 /// Count of demo tasks that have run to completion (so a test can confirm exit/free works).
 static DEMO_DONE: AtomicUsize = AtomicUsize::new(0);
 
-/// Shared counter the Mutex demo hammers from every participating AP. `'static`, as a Mutex that
-/// tasks block on must be. A correct mutex yields exactly `MX_NWORKERS * MX_ITERS`.
-static MX_COUNTER: Mutex<u64> = Mutex::new(0);
-/// Locked increments each Mutex-demo worker performs.
-const MX_ITERS: u64 = 1000;
-/// Number of Mutex-demo workers, and how many have finished (the last prints the PASS/FAIL check).
-static MX_NWORKERS: AtomicUsize = AtomicUsize::new(0);
-static MX_DONE: AtomicUsize = AtomicUsize::new(0);
+/// The low-priority demo task's current round. The high-priority task samples it before and after
+/// its busy run to prove the low task made NO progress while the high task ran (strict priority).
+static LO_ROUND: AtomicU32 = AtomicU32::new(0);
 
-/// Turn scheduling on and spawn the demo workload across the online APs: timer preemption (the busy
-/// pair) plus a cross-core sleeping-`Mutex` stress test (one worker per other AP hammering a shared
-/// counter — the final value proves mutual exclusion, and the contention exercises the underlying
-/// semaphore's block + CROSS-CPU wake hard). Called once on the BSP after `smp::start_aps` (hence
-/// after `verify_smp`). No-op with no APs.
+/// Turn scheduling on and spawn the demo workload across the online APs, exercising the scheduler:
+/// equal-priority round-robin + timer preemption (the busy pair), and FIXED-PRIORITY preemption (a
+/// LOW long-runner that a HIGH task preempts and starves until it exits). Called once on the BSP
+/// after `smp::start_aps` (hence after `verify_smp`). No-op with no APs.
 pub fn start_demo(online_aps: &[usize]) {
     if online_aps.is_empty() {
         serial_println!("SCHED: no application processors online; scheduler idle.");
         return;
     }
 
-    // Reserve the mutex's waiter capacity FIRST — before the APs are released or any task is
-    // spawned — so no task can block on it before its waiter list is sized (B2's no-realloc proof
-    // then holds unconditionally, not by spawn-ordering).
-    MX_COUNTER.init();
     SCHED_ACTIVE.store(true, Ordering::Release);
     SCHED_GO.store(true, Ordering::Release);
 
@@ -894,19 +956,18 @@ pub fn start_demo(online_aps: &[usize]) {
         online_aps
     );
 
-    // Preemption proof: two non-yielding threads on the first AP must INTERLEAVE (without
-    // preemption the first would monopolise the core until it exits).
+    // Equal-priority round-robin + preemption: two non-yielding NORMAL threads on the first AP must
+    // INTERLEAVE (without preemption the first would monopolise the core until it exits).
     let cpu_busy = online_aps[0];
-    spawn("busy-A", demo_busy, encode(cpu_busy, b'A'), cpu_busy);
-    spawn("busy-B", demo_busy, encode(cpu_busy, b'B'), cpu_busy);
+    spawn("busy-A", demo_busy, encode(cpu_busy, b'A'), cpu_busy, PRIO_NORMAL);
+    spawn("busy-B", demo_busy, encode(cpu_busy, b'B'), cpu_busy, PRIO_NORMAL);
 
-    // Sleeping-Mutex stress: one worker per OTHER AP, all incrementing MX_COUNTER under the lock.
-    // They contend across cores, so the lock genuinely blocks and cross-CPU-wakes; the final count
-    // proves no read-modify-write was lost. (With a single AP there are no mutex workers.)
-    let mx_cpus = &online_aps[1..];
-    MX_NWORKERS.store(mx_cpus.len(), Ordering::Release);
-    for &cpu in mx_cpus {
-        spawn("mx", demo_mutex_worker, cpu, cpu);
+    // Fixed-priority preemption: on a second AP, a LOW long-runner plus a HIGH task that briefly
+    // sleeps (letting LOW start), then wakes and runs busy. The wake must PREEMPT the running LOW
+    // task and starve it (strict priority) until HIGH exits — HIGH verifies LOW didn't advance.
+    if let Some(&cpu_prio) = online_aps.get(1) {
+        spawn("lo", demo_prio_low, cpu_prio, cpu_prio, PRIO_LOW);
+        spawn("hi", demo_prio_high, cpu_prio, cpu_prio, PRIO_HIGH);
     }
 }
 
@@ -935,29 +996,46 @@ fn demo_busy(arg: usize) {
     DEMO_DONE.fetch_add(1, Ordering::Relaxed);
 }
 
-/// Mutex worker: performs MX_ITERS locked increments of the shared counter. Cross-core contention
-/// forces real blocking/waking through the mutex's semaphore; the last worker to finish verifies
-/// the final count equals workers * MX_ITERS — any lost read-modify-write means broken exclusion.
-fn demo_mutex_worker(cpu: usize) {
-    for _ in 0..MX_ITERS {
-        let mut counter = MX_COUNTER.lock();
-        *counter += 1;
+/// Burn a fixed chunk of CPU without yielding (so the timer is the only thing that can preempt us).
+fn burn(seed: u64) {
+    let mut acc: u64 = 0;
+    for i in 0..20_000_000u64 {
+        acc = acc.wrapping_add(i ^ seed);
     }
-    serial_println!("SCHED: [cpu{cpu} mx] {} locked increments done", MX_ITERS);
+    core::hint::black_box(acc);
+}
 
-    let finished = MX_DONE.fetch_add(1, Ordering::AcqRel) + 1;
-    if finished == MX_NWORKERS.load(Ordering::Acquire) {
-        // Last worker done: every increment is now visible (the final lock() acquires after the
-        // last unlock()'s release). Verify mutual exclusion held.
-        let total = *MX_COUNTER.lock();
-        let expected = MX_NWORKERS.load(Ordering::Acquire) as u64 * MX_ITERS;
-        serial_println!(
-            "MUTEX: final counter = {} (expected {}) => {}",
-            total,
-            expected,
-            if total == expected { "PASS" } else { "FAIL" }
-        );
+/// LOW-priority long-runner: many non-yielding rounds, publishing its round number. It runs while
+/// the HIGH task sleeps, then must be PREEMPTED and frozen while HIGH runs, then resume after.
+fn demo_prio_low(cpu: usize) {
+    for round in 0..14u32 {
+        LO_ROUND.store(round, Ordering::Relaxed);
+        serial_println!("SCHED: [cpu{cpu} lo LOW] round {round}");
+        burn(round as u64);
     }
+    serial_println!("SCHED: [cpu{cpu} lo LOW] done");
+    DEMO_DONE.fetch_add(1, Ordering::Relaxed);
+}
+
+/// HIGH-priority task: sleeps briefly so LOW gets going, then wakes and runs busy. Its wake must
+/// preempt the running LOW task; while HIGH runs (non-yielding, strict priority) LOW cannot, so
+/// LO_ROUND must be unchanged across HIGH's run — which HIGH asserts as PASS/FAIL.
+fn demo_prio_high(cpu: usize) {
+    sleep_ticks(15); // let LOW start running
+    let lo_before = LO_ROUND.load(Ordering::Relaxed);
+    serial_println!("SCHED: [cpu{cpu} hi HIGH] woke and preempted LOW (at round {lo_before})");
+    for round in 0..5u32 {
+        serial_println!("SCHED: [cpu{cpu} hi HIGH] round {round}");
+        burn(round as u64);
+    }
+    let lo_after = LO_ROUND.load(Ordering::Relaxed);
+    serial_println!(
+        "PRIORITY: LOW round {} -> {} across HIGH's run => {}",
+        lo_before,
+        lo_after,
+        if lo_after == lo_before { "PASS (LOW starved by HIGH)" } else { "FAIL (LOW ran under HIGH)" }
+    );
+    serial_println!("SCHED: [cpu{cpu} hi HIGH] done");
     DEMO_DONE.fetch_add(1, Ordering::Relaxed);
 }
 
