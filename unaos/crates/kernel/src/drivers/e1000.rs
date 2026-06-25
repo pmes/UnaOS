@@ -213,7 +213,7 @@ pub struct E1000 {
     tx_count: u64,
     arp_state: ArpStateMachine,
     dhcp: net::dhcp::DhcpClient,
-    tcp: net::tcp::TcpEcho,
+    tcp: net::tcp::TcpListener,
     /// The single in-flight outbound TCP connection (active open), if any. Driven by `poll()`
     /// and the blocking `connect`; `None` when idle.
     tcp_client: Option<net::tcp::TcpClient>,
@@ -929,6 +929,7 @@ impl E1000 {
             tx_count: self.tx_count,
             irq_count: IRQ_COUNT.load(Ordering::Relaxed),
             mmio_base: self.mmio_base,
+            tcp_conns: self.tcp.active_conns(),
         }
     }
 }
@@ -942,6 +943,8 @@ pub struct NetInfo {
     pub tx_count: u64,
     pub irq_count: u64,
     pub mmio_base: usize,
+    /// Active TCP echo-listener connections right now.
+    pub tcp_conns: usize,
 }
 
 /// The one registered network device (populated by [`init`]).
@@ -987,7 +990,7 @@ pub fn init(bus: u8, slot: u8, func: u8) {
         tx_count: 0,
         arp_state: ArpStateMachine::new(OUR_IP, [0; 6]),
         dhcp: net::dhcp::DhcpClient::new([0; 6], DHCP_XID),
-        tcp: net::tcp::TcpEcho::new(TCP_ECHO_PORT),
+        tcp: net::tcp::TcpListener::new(TCP_ECHO_PORT),
         tcp_client: None,
         tcp_local_port: TCP_LOCAL_PORT_BASE,
         tcp_client_isn: 0x00A0_0000,

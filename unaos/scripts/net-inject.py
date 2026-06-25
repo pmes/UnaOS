@@ -156,6 +156,38 @@ def recv_tcp(s, my_port):
     return None
 
 
+def recv_tcp_any(s, timeout=8):
+    """Receive the next TCP segment from the guest addressed to ANY of our client ports.
+    Returns (dport, flags, seq, ack, payload, ip_ok, tcp_ok) or None on timeout. Used by the
+    multi-connection test, which must demultiplex replies for several connections at once."""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            f = recv_frame(s)
+        except socket.timeout:
+            break
+        if not f or len(f) < 34:
+            continue
+        if struct.unpack(">H", f[12:14])[0] != 0x0800 or (f[14] >> 4) != 4 or f[23] != 6:
+            continue
+        ihl = (f[14] & 0x0F) * 4
+        total = struct.unpack(">H", f[16:18])[0]
+        src_ip, dst_ip = f[26:30], f[30:34]
+        ip_ck_ok = cksum(f[14:14 + ihl]) == 0
+        seg = f[14 + ihl:14 + total]
+        if len(seg) < 20:
+            continue
+        dport = struct.unpack(">H", seg[2:4])[0]
+        seq = struct.unpack(">I", seg[4:8])[0]
+        ack = struct.unpack(">I", seg[8:12])[0]
+        doff = (seg[12] >> 4) * 4
+        flags = seg[13]
+        payload = seg[doff:]
+        tcp_ck_ok = tcp_checksum(src_ip, dst_ip, seg) == 0
+        return (dport, flags, seq, ack, payload, ip_ck_ok, tcp_ck_ok)
+    return None
+
+
 def send_frame(s, frame):
     s.sendall(struct.pack(">I", len(frame)) + frame)
 
@@ -348,6 +380,98 @@ def respond_to_guest_probes(s, t0, budget_s=22.0, want_pings=1):
     return True
 
 
+def test_multi_tcp(s, guest_mac, n=3):
+    """Open n SIMULTANEOUS TCP connections to the guest echo listener (:7), interleaved, and
+    verify each handshakes, echoes its OWN distinct data, and closes independently — proving
+    the connection table demultiplexes by 4-tuple with correct per-connection seq/ack."""
+    print("--- multi-conn TCP: %d simultaneous connections to %s:7 ---" % (n, ipstr(GUEST_IP)))
+    MASK = 0xFFFFFFFF
+    conns = {}
+    for i in range(n):
+        cport = 40001 + i
+        conns[cport] = {"cport": cport, "c_isn": 0x3000 + 0x100 * i,
+                        "data": ("conn%d-data!" % i).encode(),
+                        "s_isn": None, "echoed": False, "finned": False}
+
+    def send(cport, seq, ack, flags, payload=b""):
+        send_frame(s, eth(guest_mac, MY_MAC, 0x0800,
+                          ipv4(MY_IP, GUEST_IP, 6, tcp(cport, 7, seq, ack, flags, 4096, MY_IP, GUEST_IP, payload))))
+
+    # Phase 1: SYN all (interleaved), then collect SYN-ACKs in any order.
+    for c in conns.values():
+        send(c["cport"], c["c_isn"], 0, SYN)
+    print("-> %d SYNs sent (interleaved)" % n)
+    need = n
+    while need > 0:
+        r = recv_tcp_any(s)
+        if r is None:
+            break
+        dport, flags, seq, ack, payload, ipok, tcpok = r
+        c = conns.get(dport)
+        if not c or c["s_isn"] is not None:
+            continue
+        if (flags & (SYN | ACK)) == (SYN | ACK) and ack == (c["c_isn"] + 1) & MASK and ipok and tcpok:
+            c["s_isn"] = seq
+            send(c["cport"], (c["c_isn"] + 1) & MASK, (seq + 1) & MASK, ACK)  # complete handshake
+            need -= 1
+    if any(c["s_isn"] is None for c in conns.values()):
+        print("FAIL: only %d/%d connections handshook" % (sum(c["s_isn"] is not None for c in conns.values()), n))
+        return False
+    print("<- %d/%d SYN-ACKs (all connections open at once)   [MULTI-CONN HANDSHAKE OK]" % (n, n))
+
+    # Phase 2: distinct data on every (concurrently-open) connection, collect echoes.
+    for c in conns.values():
+        send(c["cport"], (c["c_isn"] + 1) & MASK, (c["s_isn"] + 1) & MASK, PSH | ACK, c["data"])
+    print("-> distinct data on all %d connections" % n)
+    need = n
+    while need > 0:
+        r = recv_tcp_any(s)
+        if r is None:
+            break
+        dport, flags, seq, ack, payload, ipok, tcpok = r
+        c = conns.get(dport)
+        if not c or c["echoed"]:
+            continue
+        # Validate the echo carries THIS connection's data with correct per-connection seq/ack.
+        if (payload == c["data"]
+                and seq == (c["s_isn"] + 1) & MASK
+                and ack == (c["c_isn"] + 1 + len(c["data"])) & MASK
+                and ipok and tcpok):
+            c["echoed"] = True
+            need -= 1
+        elif payload:
+            print("   conn :%d echo mismatch payload=%r (want %r)" % (dport, payload, c["data"]))
+    if any(not c["echoed"] for c in conns.values()):
+        print("FAIL: not every connection echoed its own data with correct seq/ack")
+        return False
+    print("<- all %d connections echoed their OWN data (per-conn seq/ack verified)   [MULTI-CONN ECHO OK]" % n)
+
+    # Phase 3: FIN every connection, collect FIN-ACKs, send the final ACKs.
+    for c in conns.values():
+        nb = len(c["data"])
+        send(c["cport"], (c["c_isn"] + 1 + nb) & MASK, (c["s_isn"] + 1 + nb) & MASK, FIN | ACK)
+    print("-> FIN on all %d connections" % n)
+    need = n
+    while need > 0:
+        r = recv_tcp_any(s)
+        if r is None:
+            break
+        dport, flags, seq, ack, payload, ipok, tcpok = r
+        c = conns.get(dport)
+        if not c or c["finned"]:
+            continue
+        if flags & FIN:
+            c["finned"] = True
+            nb = len(c["data"])
+            send(c["cport"], (c["c_isn"] + 2 + nb) & MASK, (c["s_isn"] + 2 + nb) & MASK, ACK)
+            need -= 1
+    if any(not c["finned"] for c in conns.values()):
+        print("FAIL: not all connections closed")
+        return False
+    print("<- all %d connections closed independently   [MULTI-CONN CLOSE OK]" % n)
+    return True
+
+
 def main():
     s = None
     for _ in range(80):
@@ -471,39 +595,11 @@ def main():
         print("FAIL: no valid UDP echo reply from guest")
         return 1
 
-    # --- TCP echo: handshake + data echo + teardown (tests the hand-rolled TCP) ---
-    c_isn, cport = 0x2000, 5555
-    send_frame(s, eth(guest_mac, MY_MAC, 0x0800,
-                      ipv4(MY_IP, GUEST_IP, 6, tcp(cport, 7, c_isn, 0, SYN, 4096, MY_IP, GUEST_IP, b""))))
-    print("-> TCP SYN to 10.0.2.15:7")
-    sa = recv_tcp(s, cport)
-    if sa is None or (sa[0] & (SYN | ACK)) != (SYN | ACK) or sa[2] != (c_isn + 1):
-        print("FAIL: no/invalid SYN-ACK (%s)" % (sa,))
+    # --- TCP: multiple simultaneous connections to the echo listener (port 7). This both
+    #     exercises the hand-rolled TCP (handshake / data echo / teardown) AND proves the new
+    #     connection table demuxes several concurrent connections by 4-tuple. ---
+    if not test_multi_tcp(s, guest_mac, n=3):
         return 1
-    s_isn = sa[1]
-    print("<- TCP SYN-ACK seq=%d ack=%d   [TCP HANDSHAKE OK]" % (s_isn, sa[2]))
-    send_frame(s, eth(guest_mac, MY_MAC, 0x0800,
-                      ipv4(MY_IP, GUEST_IP, 6, tcp(cport, 7, c_isn + 1, s_isn + 1, ACK, 4096, MY_IP, GUEST_IP, b""))))
-    tdata = b"tcp-echo-test"
-    send_frame(s, eth(guest_mac, MY_MAC, 0x0800,
-                      ipv4(MY_IP, GUEST_IP, 6, tcp(cport, 7, c_isn + 1, s_isn + 1, PSH | ACK, 4096, MY_IP, GUEST_IP, tdata))))
-    print("-> TCP data %r" % tdata)
-    echo = recv_tcp(s, cport)
-    if echo is None or echo[3] != tdata or not echo[4] or not echo[5]:
-        print("FAIL: no/invalid TCP echo (got %s)" % (echo,))
-        return 1
-    print("<- TCP echo %r  ip_cksum=OK tcp_cksum=OK   [TCP ECHO OK]" % (echo[3],))
-    n = len(tdata)
-    send_frame(s, eth(guest_mac, MY_MAC, 0x0800,
-                      ipv4(MY_IP, GUEST_IP, 6, tcp(cport, 7, c_isn + 1 + n, s_isn + 1 + n, FIN | ACK, 4096, MY_IP, GUEST_IP, b""))))
-    print("-> TCP FIN")
-    fin = recv_tcp(s, cport)
-    if fin is None or (fin[0] & FIN) == 0:
-        print("FAIL: no FIN-ACK from guest (%s)" % (fin,))
-        return 1
-    print("<- TCP FIN-ACK   [TCP CLOSE OK]")
-    send_frame(s, eth(guest_mac, MY_MAC, 0x0800,
-                      ipv4(MY_IP, GUEST_IP, 6, tcp(cport, 7, c_isn + 2 + n, s_isn + 2 + n, ACK, 4096, MY_IP, GUEST_IP, b""))))
 
     print("ALL CHECKS PASSED")
     return 0

@@ -14,14 +14,17 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-//! Minimal hand-rolled TCP — just enough for a single-connection echo listener.
+//! Minimal hand-rolled TCP: a multi-connection passive echo listener ([`TcpListener`]) plus a
+//! single active-open client ([`TcpClient`]).
 //!
-//! Scope (deliberately small): one connection at a time, passive open only, in-order
-//! data, no retransmission (relies on the peer over a reliable local link), no window
-//! scaling/options, lenient receiver (incoming TCP checksum not verified; outgoing is).
-//! State: Listen -> SynRcvd -> Established -> LastAck -> Listen. Each received segment
-//! produces at most one response segment (the driver sends one reply per RX frame), which
-//! is sufficient because we ACK/echo/FIN can each be folded into a single segment.
+//! Scope (deliberately small): the listener accepts up to [`MAX_CONNS`] simultaneous
+//! connections, demultiplexed by the remote `(IP, port)` into a fixed table of [`TcpConn`]
+//! slots (a free slot is `None`; there is no `Listen` state). Per connection: passive open,
+//! in-order data only, no retransmission (relies on the peer over a reliable local link), no
+//! window scaling/options, lenient receiver (incoming TCP checksum not verified; outgoing is).
+//! Per-connection states: SynRcvd -> Established -> LastAck, then the slot is freed. Each
+//! received segment produces at most one response segment (the driver sends one reply per RX
+//! frame), which suffices because the ACK/echo/FIN can be folded into a single segment.
 
 use crate::ethernet::{self, EthernetFrame, EtherType};
 use crate::ipv4::{self, Ipv4Header};
@@ -130,20 +133,21 @@ fn write_segment(
     Some(total)
 }
 
+/// Per-connection state for the multi-connection listener. There is no `Listen` state —
+/// the *existence* of a `TcpConn` slot is the connection; a free slot is `None`.
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum State {
-    Listen,
+enum ConnState {
     SynRcvd,
     Established,
     LastAck,
 }
 
-/// A single-connection TCP echo listener.
-pub struct TcpEcho {
-    listen_port: u16,
-    state: State,
-    window: u16,
-    isn: u32,        // ramps per connection to avoid TIME_WAIT collisions
+/// One accepted connection's control block. The listener holds a small fixed table of these
+/// and demultiplexes inbound segments to them by the remote `(IP, port)` 2-tuple (the local
+/// IP/port are fixed by the listener).
+#[derive(Clone, Copy)]
+struct TcpConn {
+    state: ConnState,
     remote_ip: [u8; 4],
     remote_mac: [u8; 6],
     remote_port: u16,
@@ -151,35 +155,35 @@ pub struct TcpEcho {
     rcv_nxt: u32, // next sequence number we expect to receive
 }
 
-impl TcpEcho {
-    pub fn new(listen_port: u16) -> Self {
-        Self {
-            listen_port,
-            state: State::Listen,
-            window: 4096,
-            isn: 0x0001_0000,
-            remote_ip: [0; 4],
-            remote_mac: [0; 6],
-            remote_port: 0,
-            snd_nxt: 0,
-            rcv_nxt: 0,
-        }
-    }
-
-    fn is_current_peer(&self, ip: [u8; 4], port: u16) -> bool {
+impl TcpConn {
+    fn matches(&self, ip: [u8; 4], port: u16) -> bool {
         self.remote_ip == ip && self.remote_port == port
     }
 
-    /// Emit one segment to the current peer, building the full Eth/IPv4/TCP frame into `out`.
-    fn emit(&self, out: &mut [u8], our_ip: [u8; 4], our_mac: [u8; 6], flags: u8, payload: &[u8]) -> Option<usize> {
+    /// Emit one segment for this connection, building the full Eth/IPv4/TCP frame into `out`.
+    /// `ack` is passed explicitly (rather than read from `self.rcv_nxt`) so a data echo can
+    /// acknowledge the very bytes it carries while the `rcv_nxt` advance is still committed
+    /// only *after* serialization succeeds (the no-desync invariant).
+    #[allow(clippy::too_many_arguments)]
+    fn emit(
+        &self,
+        out: &mut [u8],
+        our_ip: [u8; 4],
+        our_mac: [u8; 6],
+        local_port: u16,
+        window: u16,
+        flags: u8,
+        ack: u32,
+        payload: &[u8],
+    ) -> Option<usize> {
         let tcp_len = write_segment(
             out.get_mut(34..)?,
-            self.listen_port,
+            local_port,
             self.remote_port,
             self.snd_nxt,
-            self.rcv_nxt,
+            ack,
             flags,
-            self.window,
+            window,
             our_ip,
             self.remote_ip,
             payload,
@@ -189,9 +193,127 @@ impl TcpEcho {
         Some(14 + 20 + tcp_len)
     }
 
+    /// Drive this connection with one received segment. Returns `(response, done)`: `response`
+    /// is the segment to transmit (if any), and `done == true` means the connection has fully
+    /// closed and the listener should free its slot.
+    #[allow(clippy::too_many_arguments)]
+    fn on_segment(
+        &mut self,
+        out: &mut [u8],
+        our_ip: [u8; 4],
+        our_mac: [u8; 6],
+        local_port: u16,
+        window: u16,
+        flags: u8,
+        their_seq: u32,
+        their_ack: u32,
+        payload: &[u8],
+    ) -> (Option<usize>, bool) {
+        match self.state {
+            ConnState::SynRcvd => {
+                // Expect the ACK completing the handshake (it may already carry data).
+                if flags & ACK != 0 && their_ack == self.snd_nxt {
+                    self.state = ConnState::Established;
+                    (self.on_data(out, our_ip, our_mac, local_port, window, their_seq, flags, payload), false)
+                } else {
+                    (None, false)
+                }
+            }
+            ConnState::Established => {
+                (self.on_data(out, our_ip, our_mac, local_port, window, their_seq, flags, payload), false)
+            }
+            ConnState::LastAck => {
+                // Our FIN is acknowledged — connection closed; free the slot.
+                if flags & ACK != 0 && their_ack == self.snd_nxt {
+                    (None, true)
+                } else {
+                    (None, false)
+                }
+            }
+        }
+    }
+
+    /// Established-state handling of an in-order segment that may carry data and/or FIN.
+    /// Folds the data echo, its ACK, and (if present) our FIN into a single response segment.
+    #[allow(clippy::too_many_arguments)]
+    fn on_data(
+        &mut self,
+        out: &mut [u8],
+        our_ip: [u8; 4],
+        our_mac: [u8; 6],
+        local_port: u16,
+        window: u16,
+        their_seq: u32,
+        flags: u8,
+        payload: &[u8],
+    ) -> Option<usize> {
+        // Only process in-order segments. A retransmit / out-of-order segment gets a
+        // duplicate ACK of what we have, without re-echoing.
+        if their_seq != self.rcv_nxt {
+            return self.emit(out, our_ip, our_mac, local_port, window, ACK, self.rcv_nxt, &[]);
+        }
+
+        let has_fin = flags & FIN != 0;
+        if payload.is_empty() && !has_fin {
+            return None; // a bare ACK — nothing to send
+        }
+
+        // Echo the data back; set FIN if the peer is closing (we have nothing more to send).
+        let mut resp_flags = ACK | PSH;
+        if has_fin {
+            resp_flags |= FIN;
+        }
+        // The response must acknowledge the data (and FIN) it is responding to, so compute the
+        // post-consume rcv_nxt and ACK with that. Serialize FIRST, then commit the sequence
+        // advance only on success: an unserializable segment is dropped cleanly (the peer
+        // retransmits, handled identically) rather than desynchronizing the connection.
+        let mut new_rcv = self.rcv_nxt.wrapping_add(payload.len() as u32);
+        if has_fin {
+            new_rcv = new_rcv.wrapping_add(1); // a FIN consumes one sequence number
+        }
+        let n = self.emit(out, our_ip, our_mac, local_port, window, resp_flags, new_rcv, payload)?;
+        self.rcv_nxt = new_rcv;
+        self.snd_nxt = self.snd_nxt.wrapping_add(payload.len() as u32);
+        if has_fin {
+            self.snd_nxt = self.snd_nxt.wrapping_add(1); // our FIN consumes one on our side
+            self.state = ConnState::LastAck;
+        }
+        Some(n)
+    }
+}
+
+/// Number of simultaneous connections the echo listener accepts.
+pub const MAX_CONNS: usize = 4;
+
+/// A multi-connection TCP echo listener (RFC 862). Accepts up to [`MAX_CONNS`] passive-open
+/// connections at once, demultiplexing inbound segments to a fixed table of [`TcpConn`] slots
+/// by the remote `(IP, port)`. Same per-connection scope as before: in-order data, no
+/// retransmission, no options, lenient receiver. No allocation (fixed table).
+pub struct TcpListener {
+    listen_port: u16,
+    window: u16,
+    isn: u32, // ramps per accepted connection to avoid TIME_WAIT collisions
+    conns: [Option<TcpConn>; MAX_CONNS],
+}
+
+impl TcpListener {
+    pub fn new(listen_port: u16) -> Self {
+        Self {
+            listen_port,
+            window: 4096,
+            isn: 0x0001_0000,
+            conns: [None; MAX_CONNS],
+        }
+    }
+
+    /// Number of currently-active connections (for diagnostics).
+    pub fn active_conns(&self) -> usize {
+        self.conns.iter().filter(|c| c.is_some()).count()
+    }
+
     /// Handle a received frame. Returns `Some(len)` with a response frame in `out`, or `None`
     /// if the frame isn't a TCP segment for our listener (so the caller falls back to ingress)
-    /// or no response is warranted. Runs the echo state machine.
+    /// or no response is warranted.
     pub fn handle(&mut self, frame: &[u8], our_ip: [u8; 4], our_mac: [u8; 6], out: &mut [u8]) -> Option<usize> {
         let eth = EthernetFrame::new(frame)?;
         if eth.ethertype() != EtherType::Ipv4 {
@@ -214,109 +336,51 @@ impl TcpEcho {
         let their_ack = seg.ack();
         let payload = seg.payload();
 
-        // RST from the current peer tears the connection down.
+        let existing = self
+            .conns
+            .iter()
+            .position(|c| c.map_or(false, |c| c.matches(src_ip, src_port)));
+
+        // RST tears down the matching connection (if any).
         if flags & RST != 0 {
-            if self.state != State::Listen && self.is_current_peer(src_ip, src_port) {
-                self.state = State::Listen;
+            if let Some(idx) = existing {
+                self.conns[idx] = None;
             }
             return None;
         }
 
-        match self.state {
-            State::Listen => {
-                // Passive open: a bare SYN starts a connection.
-                if flags & SYN != 0 && flags & ACK == 0 {
-                    self.remote_ip = src_ip;
-                    self.remote_mac = src_mac;
-                    self.remote_port = src_port;
-                    self.rcv_nxt = their_seq.wrapping_add(1); // SYN consumes one sequence number
-                    self.isn = self.isn.wrapping_add(0x0001_0000);
-                    self.snd_nxt = self.isn;
-                    // Emit first; only advance state once the SYN-ACK serialized (defensive —
-                    // an empty-payload SYN-ACK always fits, but keep the no-desync invariant).
-                    let n = self.emit(out, our_ip, our_mac, SYN | ACK, &[])?;
-                    self.snd_nxt = self.snd_nxt.wrapping_add(1); // our SYN consumes one
-                    self.state = State::SynRcvd;
-                    Some(n)
-                } else {
-                    None
-                }
+        if let Some(idx) = existing {
+            let (local_port, window) = (self.listen_port, self.window);
+            let conn = self.conns[idx].as_mut().unwrap();
+            let (resp, done) =
+                conn.on_segment(out, our_ip, our_mac, local_port, window, flags, their_seq, their_ack, payload);
+            if done {
+                self.conns[idx] = None;
             }
-
-            State::SynRcvd => {
-                if !self.is_current_peer(src_ip, src_port) {
-                    return None;
-                }
-                // Expect the ACK completing the handshake.
-                if flags & ACK != 0 && their_ack == self.snd_nxt {
-                    self.state = State::Established;
-                    // The handshake ACK may already carry data — process it.
-                    self.on_data(out, our_ip, our_mac, their_seq, flags, payload)
-                } else {
-                    None
-                }
-            }
-
-            State::Established => {
-                if !self.is_current_peer(src_ip, src_port) {
-                    return None;
-                }
-                self.on_data(out, our_ip, our_mac, their_seq, flags, payload)
-            }
-
-            State::LastAck => {
-                if self.is_current_peer(src_ip, src_port)
-                    && flags & ACK != 0
-                    && their_ack == self.snd_nxt
-                {
-                    // Our FIN is acknowledged — connection closed, ready for the next.
-                    self.state = State::Listen;
-                }
-                None
-            }
+            resp
+        } else if flags & SYN != 0 && flags & ACK == 0 {
+            // Passive open: a bare SYN to a fresh 4-tuple starts a new connection if a slot
+            // is free (table full -> drop the SYN; the peer retransmits).
+            let slot = self.conns.iter().position(|c| c.is_none())?;
+            self.isn = self.isn.wrapping_add(0x0001_0000);
+            let mut conn = TcpConn {
+                state: ConnState::SynRcvd,
+                remote_ip: src_ip,
+                remote_mac: src_mac,
+                remote_port: src_port,
+                snd_nxt: self.isn,
+                rcv_nxt: their_seq.wrapping_add(1), // SYN consumes one sequence number
+            };
+            let (local_port, window) = (self.listen_port, self.window);
+            // Emit first; only commit the slot once the SYN-ACK serialized. The SYN-ACK acks
+            // the peer's SYN (rcv_nxt = their_seq + 1).
+            let n = conn.emit(out, our_ip, our_mac, local_port, window, SYN | ACK, conn.rcv_nxt, &[])?;
+            conn.snd_nxt = conn.snd_nxt.wrapping_add(1); // our SYN consumes one
+            self.conns[slot] = Some(conn);
+            Some(n)
+        } else {
+            None
         }
-    }
-
-    /// Established-state handling of an in-order segment that may carry data and/or FIN.
-    /// Folds the data echo, its ACK, and (if present) our FIN into a single response segment.
-    fn on_data(
-        &mut self,
-        out: &mut [u8],
-        our_ip: [u8; 4],
-        our_mac: [u8; 6],
-        their_seq: u32,
-        flags: u8,
-        payload: &[u8],
-    ) -> Option<usize> {
-        // Only process in-order segments. A retransmit / out-of-order segment gets a
-        // duplicate ACK of what we have, without re-echoing.
-        if their_seq != self.rcv_nxt {
-            return self.emit(out, our_ip, our_mac, ACK, &[]);
-        }
-
-        let has_fin = flags & FIN != 0;
-        if payload.is_empty() && !has_fin {
-            return None; // a bare ACK — nothing to send
-        }
-
-        // Echo the data back; set FIN if the peer is closing (we have nothing more to send).
-        let mut resp_flags = ACK | PSH;
-        if has_fin {
-            resp_flags |= FIN;
-        }
-        // Serialize the response FIRST and only advance the sequence/state once it succeeds:
-        // a segment too large to echo into the TX buffer is then dropped cleanly (the peer
-        // retransmits and is handled identically) rather than desynchronizing the connection.
-        let n = self.emit(out, our_ip, our_mac, resp_flags, payload)?;
-        self.rcv_nxt = self.rcv_nxt.wrapping_add(payload.len() as u32);
-        self.snd_nxt = self.snd_nxt.wrapping_add(payload.len() as u32);
-        if has_fin {
-            // A FIN consumes one sequence number on each side.
-            self.rcv_nxt = self.rcv_nxt.wrapping_add(1);
-            self.snd_nxt = self.snd_nxt.wrapping_add(1);
-            self.state = State::LastAck;
-        }
-        Some(n)
     }
 }
 
@@ -341,7 +405,7 @@ pub const CLIENT_TX_CAP: usize = 64;
 pub const CLIENT_RX_CAP: usize = 256;
 
 /// A minimal single-connection **active-open** TCP client: the outbound counterpart of
-/// [`TcpEcho`]. It connects (SYN → SYN-ACK → ACK), optionally sends one payload, records the
+/// [`TcpListener`]. It connects (SYN → SYN-ACK → ACK), optionally sends one payload, records the
 /// peer's response, then performs an active close (FIN). Same deliberate limits as the echo
 /// listener: one connection, in-order only, no retransmission, no options, lenient receiver
 /// (incoming TCP checksum unchecked; outgoing computed). Each received segment yields at most
@@ -526,7 +590,7 @@ impl TcpClient {
                     consumed = n == payload.len();
                 }
                 // Honor a FIN only when this segment was fully in-order (rcv_nxt reached the
-                // FIN's sequence position) — matches TcpEcho's defensive in-order handling.
+                // FIN's sequence position) — matches the listener's defensive in-order handling.
                 let fin_in_order =
                     flags & FIN != 0 && their_seq.wrapping_add(payload.len() as u32) == self.rcv_nxt;
                 if fin_in_order {

@@ -134,6 +134,7 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
                         "BAR0 {:#x}  RX frames: {}  TX frames: {}  IRQs: {}",
                         n.mmio_base, n.rx_count, n.tx_count, n.irq_count
                     ));
+                    console.println(&alloc::format!("TCP listener (:7) active conns: {}", n.tcp_conns));
                 }
                 None => console.println("No network device ready."),
             }
