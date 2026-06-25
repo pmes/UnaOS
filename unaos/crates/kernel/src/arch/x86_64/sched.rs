@@ -34,7 +34,8 @@
 //     was latched before the `sti` still fires the handler and returns past the `hlt`, and the
 //     loop then re-checks the queue — so a `spawn`+IPI landing in the idle window is never lost.
 
-use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering};
+use core::cell::UnsafeCell;
+use core::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 
 use alloc::boxed::Box;
 use alloc::collections::VecDeque;
@@ -56,6 +57,13 @@ const QUANTUM_TICKS: u32 = 4;
 /// (which would take the heap lock while the run-queue lock is held). Exceeding it is still
 /// correct — the heap lock is always innermost — but avoid it.
 const RUNQ_CAPACITY: usize = 64;
+
+/// Pre-reserved waiter capacity per `Semaphore`. The scheduler pushes a blocked task's Box into the
+/// waiter list WHILE holding the semaphore's spinlock (the lock-handoff); if that push reallocated
+/// it would take the heap lock UNDER the semaphore lock — a lock-ordering inversion that can
+/// deadlock a concurrent `post()`. So the waiter list is pre-reserved and `wait()` asserts it never
+/// exceeds this, making the park-side push provably allocation-free.
+const WAIT_CAPACITY: usize = 32;
 
 /// RFLAGS planted in a fresh task's initial frame: reserved bit 1 set (always 1), IF=0, DF=0.
 /// The task starts masked; its trampoline enables interrupts explicitly.
@@ -404,6 +412,146 @@ pub fn sleep_ticks(ticks: u64) {
 }
 
 // ---------------------------------------------------------------------------------------------
+// Semaphore — the inter-thread blocking primitive (counting; FIFO waiters)
+// ---------------------------------------------------------------------------------------------
+
+/// A counting semaphore for kernel threads. `wait()` blocks when the count is zero; `post()` wakes
+/// one waiter (or bumps the count). Waking is cross-CPU aware: a task blocked on CPU B is woken
+/// from CPU A by moving it to B's run queue and sending the reschedule IPI.
+///
+/// MUST be `'static` (e.g. a `static SEM`): `wait()` hands raw pointers to `waiters`/`locked` to
+/// the scheduler to be dereferenced after the context switch, so the Semaphore must outlive every
+/// task that can block on it. Dropping one with parked waiters would leak those tasks and dangle.
+///
+/// Soundness of the `UnsafeCell<VecDeque>` + `unsafe impl Sync`: EVERY access to `waiters` (and the
+/// count) is gated by the `locked` spinlock, and the park-side push is performed by the scheduler
+/// while the blocker's lock is still held — before the scheduler releases it — which establishes
+/// happens-before with the next `post()` that acquires the lock. The lock-handoff (hold `locked`
+/// across the switch into the scheduler; the scheduler pushes the Box then releases it) is what
+/// makes the wakeup lost-proof: a `post()` on another CPU spins on `locked` and so cannot observe
+/// the waiter list until the blocked Box is in it.
+pub struct Semaphore {
+    /// Raw spinlock guarding `count` and `waiters`. Acquire on lock, Release on unlock.
+    locked: AtomicBool,
+    /// Permit count; touched only under `locked` (Relaxed — the lock provides ordering). Always >= 0.
+    count: AtomicI64,
+    /// FIFO waiter list; touched only under `locked`. Pre-reserved to `WAIT_CAPACITY` by `init()`.
+    waiters: UnsafeCell<VecDeque<Box<Task>>>,
+}
+
+// SAFETY: every access to the interior `waiters` is serialized by the `locked` spinlock; see the
+// type's doc comment for the full happens-before argument.
+unsafe impl Sync for Semaphore {}
+
+impl Semaphore {
+    /// Construct a semaphore with `initial` permits. `const` so it can initialise a `static`.
+    pub const fn new(initial: i64) -> Self {
+        Semaphore {
+            locked: AtomicBool::new(false),
+            count: AtomicI64::new(initial),
+            waiters: UnsafeCell::new(VecDeque::new()),
+        }
+    }
+
+    /// Reserve the waiter list's capacity so the scheduler's park-side push never reallocates under
+    /// the held lock. Call once on the BSP before any task can block on this semaphore.
+    pub fn init(&self) {
+        self.lock_raw();
+        unsafe { (*self.waiters.get()).reserve(WAIT_CAPACITY) };
+        self.unlock_raw();
+    }
+
+    #[inline]
+    fn lock_raw(&self) {
+        while self.locked.swap(true, Ordering::Acquire) {
+            core::hint::spin_loop();
+        }
+    }
+
+    #[inline]
+    fn unlock_raw(&self) {
+        self.locked.store(false, Ordering::Release);
+    }
+
+    /// Acquire a permit, blocking the current task until one is available. No-op (returns
+    /// immediately) if called outside a scheduled task (e.g. the unscheduled BSP).
+    pub fn wait(&self) {
+        let was_enabled = x86_64::instructions::interrupts::are_enabled();
+        x86_64::instructions::interrupts::disable(); // IF=0 for the whole critical section
+        self.lock_raw();
+
+        if self.count.load(Ordering::Relaxed) > 0 {
+            self.count.fetch_sub(1, Ordering::Relaxed);
+            self.unlock_raw();
+            if was_enabled {
+                x86_64::instructions::interrupts::enable();
+            }
+            return;
+        }
+
+        // No permit: block. Only a scheduled task can park; on the BSP/idle context just bail (the
+        // lock-handoff requires a real `current` to switch away from).
+        let cpu = percpu::this_cpu().cpu_index as usize;
+        let raw = SCHED[cpu].current.load(Ordering::Acquire) as *mut Task;
+        if raw.is_null() {
+            self.unlock_raw();
+            if was_enabled {
+                x86_64::instructions::interrupts::enable();
+            }
+            return;
+        }
+
+        // Capacity guard: the lock is held continuously until the scheduler pushes, so the length
+        // cannot change before then; asserting it here proves the park-side push won't reallocate.
+        assert!(
+            unsafe { (*self.waiters.get()).len() } < WAIT_CAPACITY,
+            "Semaphore waiter overflow (raise WAIT_CAPACITY)"
+        );
+
+        unsafe {
+            (*raw).state.store(STATE_BLOCKED, Ordering::Release);
+            // Tell the scheduler to push us into THIS semaphore's waiter list and release THIS
+            // semaphore's lock after the push (the lock-handoff). We keep `locked` held across the
+            // switch; the scheduler releases it.
+            SCHED[cpu].park_waiters.store(self.waiters.get() as u64, Ordering::Relaxed);
+            SCHED[cpu].park_lock.store(&self.locked as *const AtomicBool as u64, Ordering::Relaxed);
+            SCHED[cpu].park_kind.store(PARK_WAITQ, Ordering::Relaxed);
+            switch_context(
+                &raw mut (*raw).ctx_rsp,
+                SCHED[cpu].scheduler_rsp.load(Ordering::Acquire),
+            );
+        }
+        // Resumed (IF=0, carried) once `post()` moved us back to our run queue. The lock was
+        // already released by the scheduler that parked us — we must not touch it here.
+        if was_enabled {
+            x86_64::instructions::interrupts::enable();
+        }
+    }
+
+    /// Release a permit: wake one FIFO waiter if any, else increment the count. Wakes across CPUs.
+    pub fn post(&self) {
+        let was_enabled = x86_64::instructions::interrupts::are_enabled();
+        x86_64::instructions::interrupts::disable();
+        self.lock_raw();
+        let waiter = unsafe { (*self.waiters.get()).pop_front() };
+        match waiter {
+            // Release the lock BEFORE make_ready so its run-queue lock is never nested under ours.
+            Some(task) => {
+                self.unlock_raw();
+                make_ready(task);
+            }
+            None => {
+                self.count.fetch_add(1, Ordering::Relaxed);
+                self.unlock_raw();
+            }
+        }
+        if was_enabled {
+            x86_64::instructions::interrupts::enable();
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
 // Preemption hook (called from the timer interrupt) — the single involuntary switch site
 // ---------------------------------------------------------------------------------------------
 
@@ -616,15 +764,26 @@ pub fn current_task_id(cpu: usize) -> Option<u64> {
 /// Count of demo tasks that have run to completion (so a test can confirm exit/free works).
 static DEMO_DONE: AtomicUsize = AtomicUsize::new(0);
 
-/// Turn scheduling on and spawn a small demo workload across the online APs, proving the three
-/// mechanisms a scheduler must have: timer preemption, cooperative yield, and task exit/free.
-/// Called once on the BSP after `smp::start_aps` (hence after `verify_smp`). No-op with no APs.
+/// Semaphore the producer/consumer demo blocks on. `'static`, as a blocking semaphore must be.
+static DEMO_SEM: Semaphore = Semaphore::new(0);
+
+/// Number of items the producer/consumer demo exchanges (waits and posts must match).
+const DEMO_ITEMS: u32 = 5;
+
+/// Turn scheduling on and spawn a small demo workload across the online APs, exercising every
+/// scheduler mechanism: timer preemption, cooperative yield, task exit/free, timer-driven sleep,
+/// and semaphore block + CROSS-CPU wake. Called once on the BSP after `smp::start_aps` (hence after
+/// `verify_smp`). No-op with no APs.
 pub fn start_demo(online_aps: &[usize]) {
     if online_aps.is_empty() {
         serial_println!("SCHED: no application processors online; scheduler idle.");
         return;
     }
 
+    // Reserve the semaphore's waiter capacity FIRST — before the APs are released or any task is
+    // spawned — so no task can ever block on it before its waiter list is sized (B2's no-realloc
+    // proof then holds unconditionally, not by spawn-ordering).
+    DEMO_SEM.init();
     // Release the APs into their scheduler loops, and arm the timer-preempt path.
     SCHED_ACTIVE.store(true, Ordering::Release);
     SCHED_GO.store(true, Ordering::Release);
@@ -641,18 +800,15 @@ pub fn start_demo(online_aps: &[usize]) {
     spawn("busy-A", demo_busy, encode(cpu_busy, b'A'), cpu_busy);
     spawn("busy-B", demo_busy, encode(cpu_busy, b'B'), cpu_busy);
 
-    // Two cooperative (yielding) threads on the next AP, if present — proves voluntary yield.
-    if let Some(&cpu_coop) = online_aps.get(1) {
-        spawn("coop-C", demo_coop, encode(cpu_coop, b'C'), cpu_coop);
-        spawn("coop-D", demo_coop, encode(cpu_coop, b'D'), cpu_coop);
-    }
-
-    // A short-lived worker plus a sleeper on the next AP, if present — the worker proves exit +
-    // stack reclamation; the sleeper proves timer-driven blocking (it parks off the run queue and
-    // wakes after a real tick delay, freeing the core meanwhile).
-    if let Some(&cpu_worker) = online_aps.get(2) {
-        spawn("worker-E", demo_worker, encode(cpu_worker, b'E'), cpu_worker);
-        spawn("sleep-S", demo_sleeper, encode(cpu_worker, b'S'), cpu_worker);
+    // Producer/consumer over DEMO_SEM. The consumer blocks in wait(); the producer sleeps (proving
+    // sleep_ticks), then posts — waking the consumer. With a third AP the producer runs on a
+    // DIFFERENT core than the consumer, so post() exercises the CROSS-CPU wake (move the blocked
+    // task to its own core's run queue + reschedule IPI). The worker proves yield + exit/free.
+    if let Some(&cpu_cons) = online_aps.get(1) {
+        spawn("cons-C", demo_consumer, encode(cpu_cons, b'C'), cpu_cons);
+        let cpu_prod = online_aps.get(2).copied().unwrap_or(cpu_cons);
+        spawn("prod-P", demo_producer, encode(cpu_prod, b'P'), cpu_prod);
+        spawn("worker-E", demo_worker, encode(cpu_prod, b'E'), cpu_prod);
     }
 }
 
@@ -681,19 +837,29 @@ fn demo_busy(arg: usize) {
     DEMO_DONE.fetch_add(1, Ordering::Relaxed);
 }
 
-/// Cooperative thread: does a little work, then voluntarily yields each round.
-fn demo_coop(arg: usize) {
+/// Consumer: blocks on the semaphore for each item. It cannot make progress until the producer
+/// posts — so its "GOT item N" lines prove the block actually suspended it and a `post()` woke it.
+fn demo_consumer(arg: usize) {
     let (cpu, tag) = decode(arg);
-    for round in 0..6u32 {
-        serial_println!("SCHED: [cpu{cpu} coop-{tag}] round {round} (yields)");
-        let mut acc: u64 = 0;
-        for i in 0..5_000_000u64 {
-            acc = acc.wrapping_add(i);
-        }
-        core::hint::black_box(acc);
-        yield_now();
+    for round in 0..DEMO_ITEMS {
+        serial_println!("SCHED: [cpu{cpu} cons-{tag}] waiting for item {round}");
+        DEMO_SEM.wait();
+        serial_println!("SCHED: [cpu{cpu} cons-{tag}] GOT item {round}");
     }
-    serial_println!("SCHED: [cpu{cpu} coop-{tag}] done");
+    serial_println!("SCHED: [cpu{cpu} cons-{tag}] done");
+    DEMO_DONE.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Producer: sleeps (timer-driven block), then posts an item — waking the consumer (cross-CPU when
+/// they are on different cores).
+fn demo_producer(arg: usize) {
+    let (cpu, tag) = decode(arg);
+    for round in 0..DEMO_ITEMS {
+        sleep_ticks(12);
+        serial_println!("SCHED: [cpu{cpu} prod-{tag}] posting item {round}");
+        DEMO_SEM.post();
+    }
+    serial_println!("SCHED: [cpu{cpu} prod-{tag}] done");
     DEMO_DONE.fetch_add(1, Ordering::Relaxed);
 }
 
@@ -705,24 +871,6 @@ fn demo_worker(arg: usize) {
         yield_now();
     }
     serial_println!("SCHED: [cpu{cpu} worker-{tag}] exiting");
-    DEMO_DONE.fetch_add(1, Ordering::Relaxed);
-}
-
-/// Sleeper: blocks for a fixed number of timer ticks each round. Printing the elapsed tick count
-/// proves it actually parked and woke (not busy-waited), and that the core was free meanwhile.
-fn demo_sleeper(arg: usize) {
-    let (cpu, tag) = decode(arg);
-    for round in 0..4u32 {
-        let before = percpu::this_cpu().ticks.load(Ordering::Relaxed);
-        serial_println!("SCHED: [cpu{cpu} sleep-{tag}] round {round}: sleeping 20 ticks (t={before})");
-        sleep_ticks(20);
-        let after = percpu::this_cpu().ticks.load(Ordering::Relaxed);
-        serial_println!(
-            "SCHED: [cpu{cpu} sleep-{tag}] round {round}: awoke after {} ticks",
-            after - before
-        );
-    }
-    serial_println!("SCHED: [cpu{cpu} sleep-{tag}] done");
     DEMO_DONE.fetch_add(1, Ordering::Relaxed);
 }
 
