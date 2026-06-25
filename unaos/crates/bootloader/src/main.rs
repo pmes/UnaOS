@@ -10,7 +10,6 @@ use uefi::proto::console::gop::GraphicsOutput;
 use unaos_boot_info::{BootInfo, FrameBufferInfo, PixelFormat, MemoryRegion, MemoryRegionKind};
 
 use uefi::proto::media::file::{File, FileAttribute, FileMode};
-use uefi::proto::media::fs::SimpleFileSystem;
 use uefi::proto::unsafe_protocol;
 
 // EDID — how a monitor reports its own native/preferred resolution. The first Detailed Timing
@@ -79,6 +78,20 @@ fn edid_native_resolution(handle: uefi::Handle) -> Option<(usize, usize)> {
         }
     }
     None
+}
+
+/// Surface a fatal boot error on a serial-less machine. A returned error Status just bounces the
+/// firmware back to its boot picker — invisible (the "select EFI Boot -> black flash -> back to the
+/// picker" symptom). If a linear framebuffer is already up, paint it solid white (0xFF in every
+/// channel, so format-independent) and pause ~30s so the failure can be seen/photographed, then
+/// return the Status for the caller to propagate.
+fn boot_fail(fb_addr: u64, fb_size: usize, status: Status, what: &str) -> Status {
+    log::error!("BOOT FATAL: {} ({:?})", what, status);
+    if fb_addr != 0 && fb_size != 0 {
+        unsafe { core::ptr::write_bytes(fb_addr as *mut u8, 0xFF, fb_size); }
+    }
+    boot::stall(core::time::Duration::from_secs(30));
+    status
 }
 
 #[entry]
@@ -219,40 +232,27 @@ fn main() -> Status {
         fb_size = fb_bytes;
     }
 
-    let sfs_handle = match boot::get_handle_for_protocol::<SimpleFileSystem>() {
-        Ok(handle) => handle,
-        Err(e) => {
-            log::error!("Failed to get SimpleFileSystem handle: {:?}", e);
-            return Status::LOAD_ERROR;
-        }
-    };
-    let mut sfs = match boot::open_protocol_exclusive::<SimpleFileSystem>(sfs_handle) {
+    // Open the filesystem on the SAME device this bootloader image was loaded from. A real machine
+    // exposes many SimpleFileSystem volumes (internal ESP, recovery, our USB stick, ...), and the
+    // old `get_handle_for_protocol::<SimpleFileSystem>()` returned an arbitrary one — on the Mac it
+    // picked the wrong volume, kernel.elf wasn't there, and we returned NOT_FOUND so the firmware
+    // silently bounced back to the boot picker. get_image_file_system resolves the loaded-image
+    // device handle, so we always read kernel.elf from our own ESP (QEMU has one volume, unaffected).
+    let mut sfs = match boot::get_image_file_system(boot::image_handle()) {
         Ok(sfs) => sfs,
-        Err(e) => {
-            log::error!("Failed to open SimpleFileSystem protocol: {:?}", e);
-            return Status::LOAD_ERROR;
-        }
+        Err(e) => return boot_fail(fb_addr, fb_size, e.status(), "open boot-volume filesystem"),
     };
     let mut root = match sfs.open_volume() {
         Ok(root) => root,
-        Err(e) => {
-            log::error!("Failed to open root volume: {:?}", e);
-            return Status::LOAD_ERROR;
-        }
+        Err(e) => return boot_fail(fb_addr, fb_size, e.status(), "open root volume"),
     };
 
     let mut kernel_file = match root.open(cstr16!("kernel.elf"), FileMode::Read, FileAttribute::empty()) {
         Ok(file) => match file.into_regular_file() {
             Some(f) => f,
-            None => {
-                log::error!("kernel.elf is not a regular file");
-                return Status::LOAD_ERROR;
-            }
+            None => return boot_fail(fb_addr, fb_size, Status::LOAD_ERROR, "kernel.elf is not a regular file"),
         },
-        Err(e) => {
-            log::error!("Failed to open kernel.elf: {:?}", e);
-            return Status::NOT_FOUND;
-        }
+        Err(e) => return boot_fail(fb_addr, fb_size, e.status(), "open kernel.elf (missing on our volume?)"),
     };
 
     let mut file_info_buf = [0u8; 128];
