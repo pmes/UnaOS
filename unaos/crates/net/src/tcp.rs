@@ -693,10 +693,13 @@ pub enum ClientState {
     Done,
 }
 
-/// Maximum one-shot payload an outbound connection sends after the handshake.
-pub const CLIENT_TX_CAP: usize = 64;
-/// Maximum bytes of peer response an outbound connection records.
-pub const CLIENT_RX_CAP: usize = 256;
+/// Maximum one-shot payload an outbound connection sends after the handshake (large enough for
+/// a minimal HTTP request line + a `Host:` header).
+pub const CLIENT_TX_CAP: usize = 128;
+/// Maximum bytes of peer response an outbound connection records. Sized so a streaming fetch
+/// (e.g. an HTTP response) captures a useful prefix; the buffer also caps how far ahead a peer
+/// may send (it is the advertised receive window).
+pub const CLIENT_RX_CAP: usize = 2048;
 
 /// A minimal single-connection **active-open** TCP client: the outbound counterpart of
 /// [`TcpListener`]. It connects (SYN → SYN-ACK → ACK), optionally sends one payload, records the
@@ -720,6 +723,22 @@ pub struct TcpClient {
     tx_sent: bool,
     rx_buf: [u8; CLIENT_RX_CAP],
     rx_len: usize,
+    /// Set once we have consumed the peer's FIN. Distinguishes active close (we FIN first, the
+    /// peer's FIN arrives later in `FinWait`) from passive/simultaneous close (we already saw the
+    /// peer's FIN, so a bare ACK of our FIN completes the teardown) — the latter is the common
+    /// case for a server that closes after sending its response (e.g. HTTP).
+    peer_fin: bool,
+    /// Set when streaming closes because the receive buffer filled (a bounded capture) rather than
+    /// because the peer FIN'd. We have deliberately stopped reading, so our `rcv_nxt` may sit
+    /// mid-stream; the peer's later data/FIN will never line up with it. The teardown therefore
+    /// completes on a bare ACK of our FIN (the peer will ACK it), not on an in-order peer FIN —
+    /// without this the connection would wedge in `FinWait` until the pump budget drained.
+    closed_on_full: bool,
+    /// One-shot (false) vs. streaming (true). One-shot closes as soon as it has received back at
+    /// least as many bytes as it sent (the echo workload). Streaming keeps ACKing and recording
+    /// in-order data until the peer closes (FIN) or the receive buffer fills — for request/
+    /// response protocols (e.g. HTTP) whose reply spans many segments and exceeds the request.
+    linger: bool,
 }
 
 impl TcpClient {
@@ -751,7 +770,21 @@ impl TcpClient {
             tx_sent: false,
             rx_buf: [0u8; CLIENT_RX_CAP],
             rx_len: 0,
+            peer_fin: false,
+            closed_on_full: false,
+            linger: false,
         }
+    }
+
+    /// Switch this client to streaming/linger receive: after sending the request it keeps
+    /// ACKing and recording in-order data until the peer closes (FIN) or the receive buffer
+    /// fills, rather than closing as soon as the request has been answered. Use for request/
+    /// response protocols (e.g. an HTTP GET) where the reply spans many segments. The request
+    /// payload should be non-empty (an empty payload still closes immediately after the
+    /// handshake, as in one-shot mode).
+    pub fn streaming(mut self) -> Self {
+        self.linger = true;
+        self
     }
 
     pub fn state(&self) -> ClientState {
@@ -889,10 +922,23 @@ impl TcpClient {
                     flags & FIN != 0 && their_seq.wrapping_add(payload.len() as u32) == self.rcv_nxt;
                 if fin_in_order {
                     self.rcv_nxt = self.rcv_nxt.wrapping_add(1); // FIN consumes one
+                    self.peer_fin = true; // the peer closed first (passive close from here)
                 }
-                // Close once we've received at least our payload back (the echo) or the peer
-                // is closing in-order; otherwise just ACK and keep waiting.
-                if self.rx_len >= self.tx_len || fin_in_order {
+                // Decide whether we are done receiving. Streaming keeps going until the peer
+                // closes (FIN) or our receive buffer is full (a bounded capture — advertising a
+                // zero window would otherwise stall the peer with no app to drain it). One-shot
+                // closes as soon as we've received back at least what we sent (the echo).
+                let done_receiving = if self.linger {
+                    fin_in_order || self.rx_len >= CLIENT_RX_CAP
+                } else {
+                    self.rx_len >= self.tx_len || fin_in_order
+                };
+                if done_receiving {
+                    // Closing because the bounded buffer filled (not a peer FIN) means we stop
+                    // reading mid-stream — remember that so FinWait can finish on a bare ACK.
+                    if self.linger && !fin_in_order {
+                        self.closed_on_full = true;
+                    }
                     let n = self.emit(out, our_ip, our_mac, FIN | ACK, &[])?;
                     self.snd_nxt = self.snd_nxt.wrapping_add(1);
                     self.state = ClientState::FinWait;
@@ -905,18 +951,27 @@ impl TcpClient {
             }
 
             ClientState::FinWait => {
-                // The peer's FIN completes the teardown — only in-order. Record any data the
-                // peer coalesced with its FIN before acking, so it isn't silently dropped.
+                // Active close: the peer's FIN now completes the teardown (only in-order). Record
+                // any data the peer coalesced with its FIN before acking, so it isn't dropped.
                 if flags & FIN != 0 && their_seq == self.rcv_nxt {
                     if !payload.is_empty() {
                         let n = self.record(payload);
                         self.rcv_nxt = self.rcv_nxt.wrapping_add(n as u32);
                     }
                     self.rcv_nxt = self.rcv_nxt.wrapping_add(1); // FIN consumes one
+                    self.peer_fin = true;
                     self.state = ClientState::Done;
                     self.emit(out, our_ip, our_mac, ACK, &[])
+                } else if (self.peer_fin || self.closed_on_full) && flags & ACK != 0 && their_ack == self.snd_nxt {
+                    // A bare ACK of our FIN finishes the teardown when either: we already consumed
+                    // the peer's FIN (passive/simultaneous close — server closed first), or we
+                    // closed because our buffer filled (bounded capture; the peer's remaining data
+                    // and FIN sit past our rcv_nxt and would never match Case A). The peer always
+                    // ACKs our FIN, so this completes promptly instead of wedging in FinWait.
+                    self.state = ClientState::Done;
+                    None
                 } else {
-                    // A bare ACK of our FIN, or an out-of-order/duplicate FIN — nothing to send.
+                    // A duplicate/out-of-order FIN, or an ACK that doesn't yet cover our FIN.
                     None
                 }
             }
@@ -1103,5 +1158,114 @@ mod tests {
         let mut out = [0u8; 1500];
         assert!(c.drain(&mut out, OUR_IP, OUR_MAC, 7, 512, 1000).is_none());
         assert_eq!(used_extents(&c), 0);
+    }
+
+    // --- TcpClient streaming/linger receive ---
+
+    /// Build the Ethernet/IPv4/TCP frame a peer would send to `c` (src = remote, dst = us). The
+    /// client verifies the IPv4 checksum (computed here) but not the TCP checksum.
+    fn peer_seg(c: &TcpClient, flags: u8, seq: u32, ack: u32, payload: &[u8]) -> ([u8; 1600], usize) {
+        let mut buf = [0u8; 1600];
+        let tcp_len = write_segment(
+            &mut buf[34..], c.remote_port, c.local_port, seq, ack, flags, 4096, c.remote_ip, OUR_IP, payload,
+        )
+        .unwrap();
+        ipv4::write_header(&mut buf[14..34], c.remote_ip, OUR_IP, PROTO_TCP, tcp_len).unwrap();
+        ethernet::write_header(&mut buf[0..14], OUR_MAC, c.remote_mac, EtherType::Ipv4.as_u16()).unwrap();
+        (buf, 14 + 20 + tcp_len)
+    }
+
+    #[test]
+    fn client_streaming_captures_multi_segment_then_closes_on_fin() {
+        // Streaming mode keeps recording across many segments and closes cleanly when the SERVER
+        // closes first (passive close) — the common request/response (e.g. HTTP) pattern.
+        let mut c = TcpClient::new(40000, [10, 0, 2, 2], [1, 2, 3, 4, 5, 6], 7778, 0x5000, b"REQ").streaming();
+        let mut out = [0u8; 1600];
+        assert!(c.open(&mut out, OUR_IP, OUR_MAC).is_some());
+        assert_eq!(c.state(), ClientState::SynSent);
+        // SYN-ACK acking our SYN (snd_nxt = 0x5001) -> client sends the request "REQ".
+        let pisn = 0x8000u32;
+        let (f, n) = peer_seg(&c, SYN | ACK, pisn, 0x5001, b"");
+        assert!(c.handle(&f[..n], OUR_IP, OUR_MAC, &mut out).is_some());
+        assert_eq!(c.state(), ClientState::Established);
+        let our_snd = 0x5004u32; // 0x5001 + 3 (the request)
+
+        // Peer streams three in-order segments; the client ACKs each and keeps receiving.
+        let parts: [&[u8]; 3] = [b"AAAA", b"BBBBBB", b"CC"];
+        let mut pseq = pisn.wrapping_add(1);
+        for part in parts {
+            let (f, n) = peer_seg(&c, PSH | ACK, pseq, our_snd, part);
+            assert!(c.handle(&f[..n], OUR_IP, OUR_MAC, &mut out).is_some());
+            assert_eq!(c.state(), ClientState::Established);
+            pseq = pseq.wrapping_add(part.len() as u32);
+        }
+        assert_eq!(c.rx_data(), b"AAAABBBBBBCC");
+
+        // Peer FIN -> client consumes it and sends its own FIN (FinWait).
+        let (f, n) = peer_seg(&c, FIN | ACK, pseq, our_snd, b"");
+        assert!(c.handle(&f[..n], OUR_IP, OUR_MAC, &mut out).is_some());
+        assert_eq!(c.state(), ClientState::FinWait);
+        // Peer's bare ACK of our FIN (our snd_nxt = 0x5005) completes the passive close -> Done.
+        let (f, n) = peer_seg(&c, ACK, pseq.wrapping_add(1), 0x5005, b"");
+        assert!(c.handle(&f[..n], OUR_IP, OUR_MAC, &mut out).is_none());
+        assert_eq!(c.state(), ClientState::Done);
+        assert!(c.is_done());
+    }
+
+    #[test]
+    fn client_streaming_closes_when_buffer_full() {
+        // A response larger than the receive buffer is captured up to the cap, then we close
+        // (rather than advertising a zero window and stalling with no app to drain it). Uses
+        // 500-byte segments so the one crossing the 2048 cap is TRUNCATED (rcv_nxt lands
+        // mid-segment) — then drives the teardown to Done, which would wedge in FinWait if the
+        // buffer-full close didn't relax its completion condition (the bug this guards).
+        let mut c = TcpClient::new(40000, [10, 0, 2, 2], [1, 2, 3, 4, 5, 6], 7778, 0x5000, b"R").streaming();
+        let mut out = [0u8; 4096];
+        assert!(c.open(&mut out, OUR_IP, OUR_MAC).is_some());
+        let pisn = 0x8000u32;
+        let (f, n) = peer_seg(&c, SYN | ACK, pisn, 0x5001, b""); // acks our SYN -> sends "R", snd_nxt 0x5002
+        assert!(c.handle(&f[..n], OUR_IP, OUR_MAC, &mut out).is_some());
+        let chunk = [0x41u8; 500];
+        let mut pseq = pisn.wrapping_add(1);
+        let mut hit_full = false;
+        for _ in 0..6 {
+            let (f, n) = peer_seg(&c, PSH | ACK, pseq, 0x5002, &chunk);
+            c.handle(&f[..n], OUR_IP, OUR_MAC, &mut out);
+            pseq = pseq.wrapping_add(500);
+            if c.state() == ClientState::FinWait {
+                hit_full = true;
+                break;
+            }
+        }
+        assert!(hit_full);
+        assert_eq!(c.rx_data().len(), CLIENT_RX_CAP); // captured exactly the cap (4*500 + 48)
+        // The peer ACKs our FIN (snd_nxt = "R"(1)+FIN(1) past SYN => 0x5003). This previously
+        // wedged: the peer's FIN sits past our mid-stream rcv_nxt, so only a bare-ACK completion
+        // reaches Done.
+        let (f, n) = peer_seg(&c, ACK, pseq, 0x5003, b"");
+        assert!(c.handle(&f[..n], OUR_IP, OUR_MAC, &mut out).is_none());
+        assert_eq!(c.state(), ClientState::Done);
+        assert!(c.is_done());
+    }
+
+    #[test]
+    fn client_oneshot_closes_after_echo() {
+        // Regression: the default one-shot client still closes once it has received its echo back
+        // (active close), completing on the peer's FIN — unchanged by the streaming additions.
+        let mut c = TcpClient::new(40000, [10, 0, 2, 2], [1, 2, 3, 4, 5, 6], 7, 0x5000, b"hello");
+        let mut out = [0u8; 1600];
+        assert!(c.open(&mut out, OUR_IP, OUR_MAC).is_some());
+        let pisn = 0x8000u32;
+        let (f, n) = peer_seg(&c, SYN | ACK, pisn, 0x5001, b""); // -> sends "hello", snd_nxt 0x5006
+        assert!(c.handle(&f[..n], OUR_IP, OUR_MAC, &mut out).is_some());
+        assert_eq!(c.state(), ClientState::Established);
+        // Echo of "hello": rx_len(5) >= tx_len(5) -> client closes (FIN), FinWait.
+        let (f, n) = peer_seg(&c, PSH | ACK, pisn.wrapping_add(1), 0x5006, b"hello");
+        assert!(c.handle(&f[..n], OUR_IP, OUR_MAC, &mut out).is_some());
+        assert_eq!(c.state(), ClientState::FinWait);
+        // Peer FIN|ACK (active-close completion, Case A) -> Done.
+        let (f, n) = peer_seg(&c, FIN | ACK, pisn.wrapping_add(6), 0x5007, b"");
+        assert!(c.handle(&f[..n], OUR_IP, OUR_MAC, &mut out).is_some());
+        assert_eq!(c.state(), ClientState::Done);
     }
 }

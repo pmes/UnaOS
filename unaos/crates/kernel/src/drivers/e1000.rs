@@ -162,6 +162,12 @@ const TCP_LOCAL_PORT_BASE: u16 = 49152;
 const TCP_SELFTEST_PORT: u16 = 7777;
 /// One-shot payload the connect self-test / `connect` (no message) sends after the handshake.
 const TCP_PROBE_PAYLOAD: &[u8] = b"unaos-tcp";
+/// Gateway TCP port the boot self-test does a STREAMING fetch from (the socket injector serves a
+/// multi-segment response then closes here) — exercises the outbound client's linger receive.
+const TCP_STREAM_PORT: u16 = 7778;
+/// Request the streaming self-test sends; the injector ignores its content and replies with a
+/// fixed multi-segment response, so the exact bytes don't matter.
+const STREAM_PROBE_PAYLOAD: &[u8] = b"GET /unaos\r\n";
 
 /// First ephemeral local port for outbound UDP datagrams (incremented per send).
 const UDP_LOCAL_PORT_BASE: u16 = 49152;
@@ -562,12 +568,15 @@ impl E1000 {
     }
 
     /// Blocking active-open TCP connect for the shell / boot self-test: resolve `ip`, send a
-    /// SYN, then pump RX until the connection settles (handshake + optional `payload` echo +
-    /// active close) or the bounded budget is exhausted. Returns an outcome summary.
-    fn connect(&mut self, ip: [u8; 4], port: u16, payload: &[u8]) -> ConnectOutcome {
+    /// SYN, then pump RX until the connection settles (handshake + optional `payload` exchange +
+    /// close) or the bounded budget is exhausted. With `linger`, the client keeps receiving until
+    /// the peer closes (a streaming fetch) instead of closing after the first response. Returns
+    /// the outcome summary and the bytes of peer response captured (bounded by `CLIENT_RX_CAP`).
+    fn connect_inner(&mut self, ip: [u8; 4], port: u16, payload: &[u8], linger: bool) -> (ConnectOutcome, alloc::vec::Vec<u8>) {
+        let fail = |resolved| (ConnectOutcome { resolved, established: false, rx_len: 0, closed: false }, alloc::vec::Vec::new());
         let mac = match self.resolve(ip) {
             Some(m) => m,
-            None => return ConnectOutcome { resolved: false, established: false, rx_len: 0, closed: false },
+            None => return fail(false),
         };
 
         // Pick an ephemeral local port and a fresh ISN per connection.
@@ -582,10 +591,13 @@ impl E1000 {
         let our_ip = self.arp_state.our_ip();
         let our_mac = self.mac;
         let mut client = net::tcp::TcpClient::new(local_port, ip, mac, port, isn, payload);
+        if linger {
+            client = client.streaming();
+        }
         let mut syn = [0u8; 64];
         let n = match client.open(&mut syn, our_ip, our_mac) {
             Some(n) => n,
-            None => return ConnectOutcome { resolved: true, established: false, rx_len: 0, closed: false },
+            None => return fail(true),
         };
         self.tcp_client = Some(client);
         self.transmit(&syn[..n]);
@@ -599,17 +611,31 @@ impl E1000 {
             core::hint::spin_loop();
         }
 
-        let outcome = match self.tcp_client.as_ref() {
-            Some(c) => ConnectOutcome {
-                resolved: true,
-                established: c.established(),
-                rx_len: c.rx_data().len(),
-                closed: c.state() == net::tcp::ClientState::Done,
-            },
-            None => ConnectOutcome { resolved: true, established: false, rx_len: 0, closed: false },
+        let result = match self.tcp_client.as_ref() {
+            Some(c) => (
+                ConnectOutcome {
+                    resolved: true,
+                    established: c.established(),
+                    rx_len: c.rx_data().len(),
+                    closed: c.state() == net::tcp::ClientState::Done,
+                },
+                c.rx_data().to_vec(),
+            ),
+            None => fail(true),
         };
         self.tcp_client = None; // free the slot for the next connection
-        outcome
+        result
+    }
+
+    /// One-shot connect (resolve, handshake, optional `payload` echo, active close).
+    fn connect(&mut self, ip: [u8; 4], port: u16, payload: &[u8]) -> ConnectOutcome {
+        self.connect_inner(ip, port, payload, false).0
+    }
+
+    /// Streaming fetch: send `payload` as a request, then read the full response until the peer
+    /// closes (or the receive buffer fills). Returns the outcome and the captured response bytes.
+    fn fetch(&mut self, ip: [u8; 4], port: u16, payload: &[u8]) -> (ConnectOutcome, alloc::vec::Vec<u8>) {
+        self.connect_inner(ip, port, payload, true)
     }
 
     /// Capture an inbound UDP datagram that is the reply to an in-flight outbound exchange
@@ -728,6 +754,20 @@ impl E1000 {
                         "[selftest] TCP connect to {}:{} OK — established, {} bytes echoed, closed={}",
                         fmt_ip(&GATEWAY_IP), TCP_SELFTEST_PORT, o.rx_len, o.closed
                     );
+                    // A server is present, so also exercise the streaming/linger receive path:
+                    // fetch a multi-segment response and read it all until the peer closes.
+                    let (sf, _body) = self.fetch(GATEWAY_IP, TCP_STREAM_PORT, STREAM_PROBE_PAYLOAD);
+                    if sf.established {
+                        serial_println!(
+                            "[selftest] TCP stream from {}:{} OK — {} bytes received, closed={}",
+                            fmt_ip(&GATEWAY_IP), TCP_STREAM_PORT, sf.rx_len, sf.closed
+                        );
+                    } else {
+                        serial_println!(
+                            "[selftest] TCP stream to {}:{} — no streaming server",
+                            fmt_ip(&GATEWAY_IP), TCP_STREAM_PORT
+                        );
+                    }
                 } else {
                     serial_println!(
                         "[selftest] TCP connect to {}:{} — no server (ok if the backend has none)",
@@ -1124,6 +1164,13 @@ pub struct ConnectOutcome {
 /// (empty = connect then immediately close), read the response, and close. `None` if no NIC.
 pub fn connect(ip: [u8; 4], port: u16, payload: &[u8]) -> Option<ConnectOutcome> {
     NET_DEVICE.lock().as_mut().map(|nic| nic.connect(ip, port, payload))
+}
+
+/// Blocking streaming fetch from the shell (e.g. an HTTP GET): connect, send `payload` as the
+/// request, then read the whole response until the peer closes. Returns the outcome plus the
+/// captured response bytes (bounded by `CLIENT_RX_CAP`). `None` if no NIC is present.
+pub fn fetch(ip: [u8; 4], port: u16, payload: &[u8]) -> Option<(ConnectOutcome, alloc::vec::Vec<u8>)> {
+    NET_DEVICE.lock().as_mut().map(|nic| nic.fetch(ip, port, payload))
 }
 
 /// Outcome of a blocking [`udp_send`] (rendered by the `udpsend` shell command).

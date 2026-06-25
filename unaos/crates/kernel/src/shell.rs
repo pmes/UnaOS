@@ -56,6 +56,7 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
             console.println("STORAGE:  diskinfo, read <lba>, write <lba> <byte>");
             console.println("NETWORK:  netinfo, ping <ip> [count], arp <ip>");
             console.println("          connect <ip> <port> [message], udpsend <ip> <port> [message]");
+            console.println("          get <ip> [port] [path]  (HTTP/1.0 GET)");
         },
         "clear" => {
             // Clear both the screen and the console buffer?
@@ -219,6 +220,41 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
                     }
                 }
                 _ => console.println("usage: udpsend <a.b.c.d> <port> [message]"),
+            }
+        },
+        "get" => {
+            // Minimal HTTP/1.0 GET over the streaming TCP client: connect, send the request,
+            // read the whole response until the server closes, and print it.
+            match args.first().and_then(|s| parse_ipv4(s)) {
+                Some(ip) => {
+                    let port = args.get(1).and_then(|s| s.parse::<u16>().ok()).unwrap_or(80);
+                    let path = if args.len() > 2 { String::from(args[2]) } else { String::from("/") };
+                    let req = alloc::format!(
+                        "GET {} HTTP/1.0\r\nHost: {}.{}.{}.{}\r\nConnection: close\r\n\r\n",
+                        path, ip[0], ip[1], ip[2], ip[3]);
+                    console.println(&alloc::format!(
+                        "GET http://{}.{}.{}.{}:{}{}", ip[0], ip[1], ip[2], ip[3], port, path));
+                    match crate::drivers::e1000::fetch(ip, port, req.as_bytes()) {
+                        Some((o, body)) if o.established => {
+                            console.println(&alloc::format!(
+                                "--- {} bytes received; closed={} ---", o.rx_len, o.closed));
+                            // Render printable ASCII; drop CR, keep LF as line breaks.
+                            let text: String = body.iter().filter_map(|&b| match b {
+                                b'\n' => Some('\n'),
+                                b'\r' => None,
+                                0x20..=0x7e => Some(b as char),
+                                _ => Some('.'),
+                            }).collect();
+                            for line in text.split('\n') {
+                                console.println(line);
+                            }
+                        }
+                        Some((o, _)) if !o.resolved => console.println("host unreachable (no ARP reply)"),
+                        Some(_) => console.println("connection refused / no response"),
+                        None => console.println("No network device ready."),
+                    }
+                }
+                None => console.println("usage: get <a.b.c.d> [port] [path]"),
             }
         },
         "vug" => {

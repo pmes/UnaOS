@@ -35,6 +35,17 @@ GUEST_PING_PAYLOAD = b"unaos-ping"
 # this probe; we run a tiny gateway-side TCP echo server on this port to complete it.
 SELFTEST_TCP_PORT = 7777
 GUEST_TCP_PROBE = b"unaos-tcp"
+# The guest's boot self-test then does a STREAMING fetch to the gateway here: it active-opens,
+# sends a request, and reads the whole response until we close. We run a gateway-side server that
+# replies with a fixed multi-segment response then FINs, exercising the client's linger receive.
+SELFTEST_STREAM_PORT = 7778
+# The fixed multi-segment response the streaming server sends (one TCP segment per part).
+STREAM_RESPONSE_PARTS = [
+    b"HTTP/1.0 200 OK\r\n",
+    b"Content-Type: text/plain\r\n\r\n",
+    b"hello from the unaos streaming server\n",
+    b"second segment of the body\n",
+]
 # The guest's boot self-test also sends one outbound UDP datagram to the gateway here; we run a
 # gateway-side UDP echo server to complete it.
 SELFTEST_UDP_PORT = 9998
@@ -235,8 +246,11 @@ def respond_to_guest_probes(s, t0, budget_s=22.0, want_pings=1):
     s_isn = 0x9000
     tcp_ok = False    # set once a SINGLE connection completes handshake + valid echo + close
     udp_ok = False    # set once a valid outbound UDP datagram is received + echoed
+    stream_conn = None  # gateway-side state for the streaming-fetch connection (port 7778)
+    stream_isn = 0xA000
+    stream_ok = False   # set once the guest completes a multi-segment streaming receive + close
     deadline = time.time() + budget_s
-    while time.time() < deadline and not (arped and pings >= want_pings and tcp_ok and udp_ok):
+    while time.time() < deadline and not (arped and pings >= want_pings and tcp_ok and stream_ok and udp_ok):
         try:
             f = recv_frame(s)
         except socket.timeout:
@@ -312,16 +326,60 @@ def respond_to_guest_probes(s, t0, budget_s=22.0, want_pings=1):
                   % (time.time() - t0, data, ip_ck_ok, udp_ck_ok, ipstr(src_ip), "OK" if ok else "REJECTED"))
             continue
 
-        if proto == 6 and len(l4) >= 20:  # TCP (gateway-side echo server)
+        if proto == 6 and len(l4) >= 20:  # TCP (gateway-side servers)
             sport = struct.unpack(">H", l4[0:2])[0]
             dport = struct.unpack(">H", l4[2:4])[0]
-            if dport != SELFTEST_TCP_PORT:
-                continue
             seq = struct.unpack(">I", l4[4:8])[0]
             doff = (l4[12] >> 4) * 4
             flags = l4[13]
             payload = l4[doff:]
             tcp_ck_ok = tcp_checksum(src_ip, dst_ip, l4) == 0
+
+            if dport == SELFTEST_STREAM_PORT:  # streaming server: multi-segment response then close
+                def stm_send(seq_n, ack_n, fl, data=b""):
+                    seg = tcp(SELFTEST_STREAM_PORT, sport, seq_n, ack_n, fl, 4096, GW_IP, src_ip, data)
+                    send_frame(s, eth(guest_mac, GW_MAC, 0x0800, ipv4(GW_IP, src_ip, 6, seg)))
+
+                if flags & RST:
+                    stream_conn = None
+                    continue
+                if (flags & SYN) and not (flags & ACK):  # active-open SYN
+                    stream_conn = {"cport": sport, "cseq": (seq + 1) & 0xFFFFFFFF,
+                                   "sseq": (stream_isn + 1) & 0xFFFFFFFF, "sent": False}
+                    stm_send(stream_isn, stream_conn["cseq"], SYN | ACK)
+                    print("[%5.1fs] <- guest TCP STREAM SYN -> SYN-ACK" % (time.time() - t0))
+                    continue
+                if stream_conn is None or sport != stream_conn["cport"]:
+                    continue
+                if payload and not stream_conn["sent"]:  # the request -> stream the response + FIN
+                    stream_conn["cseq"] = (seq + len(payload)) & 0xFFFFFFFF
+                    for part in STREAM_RESPONSE_PARTS:
+                        stm_send(stream_conn["sseq"], stream_conn["cseq"], PSH | ACK, part)
+                        stream_conn["sseq"] = (stream_conn["sseq"] + len(part)) & 0xFFFFFFFF
+                    stm_send(stream_conn["sseq"], stream_conn["cseq"], FIN | ACK)
+                    stream_conn["sseq"] = (stream_conn["sseq"] + 1) & 0xFFFFFFFF
+                    stream_conn["sent"] = True
+                    total = sum(len(p) for p in STREAM_RESPONSE_PARTS)
+                    print("[%5.1fs] -> streamed %d-byte response in %d segments + FIN to guest"
+                          % (time.time() - t0, total, len(STREAM_RESPONSE_PARTS)))
+                    continue
+                if flags & FIN:  # the guest closes after receiving the response
+                    gack = struct.unpack(">I", l4[8:12])[0]  # how much of our send the guest ACKed
+                    stream_conn["cseq"] = (stream_conn["cseq"] + 1) & 0xFFFFFFFF
+                    stm_send(stream_conn["sseq"], stream_conn["cseq"], ACK)
+                    # Pass ONLY if the guest acknowledged the ENTIRE multi-segment response + our
+                    # FIN (cumulative ACK == our final send seq). A one-shot client that closed
+                    # after the first segment would ACK far less and must NOT pass — this keeps the
+                    # check specific to the streaming/linger feature, not "any FIN".
+                    full = (gack == stream_conn["sseq"])
+                    stream_ok = stream_ok or full
+                    print("[%5.1fs] <- guest TCP STREAM FIN (acked %d of %d) -> ACK   [GUEST TCP STREAM %s]"
+                          % (time.time() - t0, gack, stream_conn["sseq"], "OK" if full else "PARTIAL/REJECTED"))
+                    continue
+                continue  # the guest's bare ACKs of our response segments
+
+            if dport != SELFTEST_TCP_PORT:
+                continue
 
             def gw_send(seq_n, ack_n, fl, data=b""):
                 seg = tcp(SELFTEST_TCP_PORT, sport, seq_n, ack_n, fl, 4096, GW_IP, src_ip, data)
@@ -374,10 +432,13 @@ def respond_to_guest_probes(s, t0, budget_s=22.0, want_pings=1):
     if not tcp_ok:
         print("FAIL: guest did not complete one full TCP handshake + valid echo + close")
         return False
+    if not stream_ok:
+        print("FAIL: guest did not complete the streaming fetch (multi-segment receive + close)")
+        return False
     if not udp_ok:
         print("FAIL: guest did not send a valid outbound UDP datagram")
         return False
-    print("<- guest outbound verified: ARP + %d ping(s) + TCP connect/echo/close + UDP send/echo   [GUEST OUTBOUND OK]" % pings)
+    print("<- guest outbound verified: ARP + %d ping(s) + TCP echo + TCP stream + UDP   [GUEST OUTBOUND OK]" % pings)
     return True
 
 
