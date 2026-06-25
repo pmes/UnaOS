@@ -71,19 +71,30 @@ which then loads our bootloader → GOP → reuses the whole video path.
 ### 1. Build the boot media
 ```sh
 cd unaos
-./arroyo esp-arm      # packages target/aarch64_esp/ (BOOTAA64.EFI + kernel.elf)
+UNAOS_SKIP_XHCI=1 ./arroyo esp-arm   # packages target/aarch64_esp/ (BOOTAA64.EFI + kernel.elf)
 ```
+Use `skip_xhci` for the video bring-up (same as the Mac): video is pure GOP and needs no USB/PCIe,
+and skipping xHCI avoids any controller stall and keeps the (still-buggy) aarch64 DTB/ECAM path out
+of the picture. Add `UNAOS_BOOTLOG=1` to hold the boot log on screen and read the EDID/mode line.
 
-### 2. SD card (FAT32)
-1. Get the RPi4 UEFI firmware release (Tianocore EDK2 `RPi4` build): `RPI_EFI.fd`, `config.txt`,
-   and the Raspberry Pi `start4.elf`/`fixup4.dat`/DTBs. Copy those to the SD card root.
-2. Copy our ESP onto the same card: `target/aarch64_esp/EFI/BOOT/BOOTAA64.EFI` and `kernel.elf`.
+### 2. SD card (FAT32, tested against pftf/RPi4 **v1.52** — https://github.com/pftf/RPi4/releases)
+1. **Extract the ENTIRE firmware zip to the FAT32 root and rename nothing** — everything is bundled
+   (`RPI_EFI.fd`, `config.txt`, `start4.elf`, `fixup4.dat`, `bcm2711-rpi-4-b.dtb`, `overlays/`,
+   `firmware/`). Nothing needs fetching separately from raspberrypi/firmware.
+2. Copy our ESP onto the same partition: `target/aarch64_esp/EFI/BOOT/BOOTAA64.EFI` (the firmware
+   auto-launches the removable-media default path `\EFI\BOOT\BOOTAA64.EFI`) and `kernel.elf` at the
+   SD root (our bootloader opens `kernel.elf` from its own boot volume).
 
 ### 3. Boot
-- HDMI + (optionally) a USB keyboard. The Pi firmware → EDK2 UEFI → our `BOOTAA64.EFI` → GOP at the
-  HDMI monitor's **EDID native** resolution → GUI.
-- USB keyboard *should* work on aarch64 (the USB stack is arch-portable) if the EDK2 firmware hands
-  off cleanly; aarch64 runs polled (no GIC/timer on this branch).
+- HDMI + power. The Pi firmware → EDK2 UEFI → our `BOOTAA64.EFI` → GOP at the HDMI monitor's native
+  resolution → GUI (dark-blue, green prompt). Photograph the screen (no serial, same as the Mac).
+- **For video you do NOT need to change any firmware setting** — the default **ACPI** mode is fine
+  (GOP/HDMI is independent of the DeviceTree). The firmware's EDID-over-HDMI may actually feed our
+  EDID parser here (it didn't on Apple EFI); a `UNAOS_BOOTLOG=1` build will show `EDID read: source=…`.
+- **No USB keyboard** on this `skip_xhci` build (expected). Enabling USB later needs a full build,
+  the firmware switched to **Devicetree** mode (Device Manager → Raspberry Pi Configuration →
+  Advanced), and the bootloader **DTB-GUID fix** (the hardcoded `EFI_DTB_TABLE_GUID` is currently
+  wrong, so `dtb_addr` is never found) — all deferred to the USB/PCIe phase, none needed for video.
 
 ### Path B (later)
 Bare-metal `kernel8.img` + the BCM2711 VideoCore mailbox framebuffer driver — not built yet; needs
