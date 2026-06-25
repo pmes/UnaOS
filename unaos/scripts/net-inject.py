@@ -595,6 +595,79 @@ def test_tcp_out_of_order(s, guest_mac):
     return True
 
 
+def test_tcp_multi_ooo(s, guest_mac):
+    """Multi-extent reassembly: send TWO future segments (C then B) so the listener must buffer
+    BOTH out of order at once, then the gap-filler A. Echoes must come back in order A, B, C. A
+    single-extent listener would drop one of B/C and never echo it — so this distinguishes the
+    multi-extent buffer from the old one-extent behavior."""
+    print("--- TCP multi-extent out-of-order reassembly ---")
+    MASK = 0xFFFFFFFF
+    cport, c_isn = 40071, 0x9000
+
+    def cs(seq, ack, flags, payload=b""):
+        send_frame(s, eth(guest_mac, MY_MAC, 0x0800,
+                          ipv4(MY_IP, GUEST_IP, 6, tcp(cport, 7, seq, ack, flags, 4096, MY_IP, GUEST_IP, payload))))
+
+    def recv_echo(want):  # next segment carrying exactly `want` (skip dup-ACKs / unrelated)
+        for _ in range(20):
+            r = recv_tcp(s, cport)
+            if r is None:
+                return None
+            if r[3] == want:
+                return r
+        return None
+
+    cs(c_isn, 0, SYN)
+    sa = recv_tcp(s, cport)
+    if sa is None or (sa[0] & (SYN | ACK)) != (SYN | ACK):
+        print("FAIL: no SYN-ACK for multi-OOO test (%s)" % (sa,)); return False
+    s_isn = sa[1]
+    cs(c_isn + 1, s_isn + 1, ACK)
+
+    data_a, data_b, data_c = b"AAAA", b"BBBB", b"CCCC"
+    seq_a = (c_isn + 1) & MASK
+    seq_b = (seq_a + len(data_a)) & MASK
+    seq_c = (seq_b + len(data_b)) & MASK
+    snd_nxt = (seq_c + len(data_c)) & MASK  # the peer's real SND.NXT once all three are sent
+
+    # Send C and B first (both ahead of the gap -> two buffered extents), then A (fills the gap).
+    cs(seq_c, s_isn + 1, PSH | ACK, data_c)
+    cs(seq_b, s_isn + 1, PSH | ACK, data_b)
+    cs(seq_a, s_isn + 1, PSH | ACK, data_a)
+    print("-> sent C (seq=%d) and B (seq=%d) before A (seq=%d)" % (seq_c, seq_b, seq_a))
+
+    ea = recv_echo(data_a)
+    if ea is None:
+        print("FAIL: A was not echoed"); return False
+    # ACK A's echo at the REAL peer SND.NXT (past C) -> frees the window -> the buffered B drains.
+    cs(snd_nxt, (s_isn + 1 + len(data_a)) & MASK, ACK)
+    eb = recv_echo(data_b)
+    if eb is None:
+        print("FAIL: buffered B was not delivered after A (single-extent would drop it here)"); return False
+    # ACK B's echo -> the buffered C drains.
+    cs(snd_nxt, (s_isn + 1 + len(data_a) + len(data_b)) & MASK, ACK)
+    ec = recv_echo(data_c)
+    if ec is None:
+        print("FAIL: buffered C was not delivered after B"); return False
+
+    exp_b = (ea[1] + len(data_a)) & MASK
+    exp_c = (exp_b + len(data_b)) & MASK
+    if eb[1] != exp_b or ec[1] != exp_c:
+        print("FAIL: echo seqs out of order A=%d B=%d(exp %d) C=%d(exp %d)"
+              % (ea[1], eb[1], exp_b, ec[1], exp_c)); return False
+    print("<- echoes A,B,C in order (seqs %d,%d,%d); two extents held at once   [TCP MULTI-OOO OK]"
+          % (ea[1], eb[1], ec[1]))
+
+    nb = len(data_a) + len(data_b) + len(data_c)
+    cs((c_isn + 1 + nb) & MASK, (s_isn + 1 + nb) & MASK, ACK)
+    cs((c_isn + 1 + nb) & MASK, (s_isn + 1 + nb) & MASK, FIN | ACK)
+    fin = recv_tcp(s, cport)
+    if fin is None or (fin[0] & FIN) == 0:
+        print("FAIL: no FIN-ACK after multi-OOO test (%s)" % (fin,)); return False
+    cs((c_isn + 2 + nb) & MASK, (s_isn + 2 + nb) & MASK, ACK)
+    return True
+
+
 def main():
     s = None
     for _ in range(80):
@@ -730,6 +803,10 @@ def main():
 
     # --- TCP out-of-order reassembly (send segments swapped, expect in-order echoes) ---
     if not test_tcp_out_of_order(s, guest_mac):
+        return 1
+
+    # --- TCP multi-extent reassembly (buffer two future segments at once, expect in-order) ---
+    if not test_tcp_multi_ooo(s, guest_mac):
         return 1
 
     print("ALL CHECKS PASSED")

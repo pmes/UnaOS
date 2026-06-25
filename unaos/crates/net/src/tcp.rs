@@ -20,7 +20,7 @@
 //! Scope (deliberately small): the listener accepts up to [`MAX_CONNS`] simultaneous
 //! connections, demultiplexed by the remote `(IP, port)` into a fixed table of [`TcpConn`]
 //! slots (a free slot is `None`; there is no `Listen` state). Per connection: passive open,
-//! in-order delivery with one buffered out-of-order extent for reassembly, a one-segment send
+//! in-order delivery with a few buffered out-of-order extents for reassembly, a one-segment send
 //! window with retransmission on an adaptive RTO (RFC 6298 + Karn's algorithm), no window
 //! scaling/options, lenient receiver (incoming TCP checksum not verified; outgoing is).
 //! Per-connection states: SynRcvd -> Established -> LastAck, then the slot is freed. Each
@@ -204,6 +204,28 @@ fn rfc6298_step(srtt: u32, rttvar: u32, valid: bool, r: u32) -> (u32, u32, u32) 
     (srtt, rttvar, rto)
 }
 
+/// Number of out-of-order extents a connection buffers for reassembly. A small ring of slots
+/// (vs. a single extent) lets the listener hold several distinct reordered segments at once and
+/// deliver them in order as the gaps fill, instead of dropping all but one. Independent of the
+/// advertised window (which is a constant pending honest flow control); buffering past the
+/// window is bounded and harmless on the trusted link.
+const OOO_EXTENTS: usize = 4;
+
+/// One buffered out-of-order segment: payload (and/or a FIN) that arrived ahead of `rcv_nxt`,
+/// held until the gap before it fills. A free slot has `used == false`.
+#[derive(Clone, Copy)]
+struct OooExtent {
+    used: bool,
+    seq: u32,
+    len: usize,
+    fin: bool,
+    buf: [u8; RETX_CAP],
+}
+
+impl OooExtent {
+    const EMPTY: Self = Self { used: false, seq: 0, len: 0, fin: false, buf: [0; RETX_CAP] };
+}
+
 /// One accepted connection's control block. The listener holds a small fixed table of these
 /// and demultiplexes inbound segments to them by the remote `(IP, port)` 2-tuple (the local
 /// IP/port are fixed by the listener). Each connection keeps a single outstanding (unacked)
@@ -232,13 +254,10 @@ struct TcpConn {
     rttvar: u32,     // round-trip time variation
     rto: u32,        // current retransmission timeout
     rtt_valid: bool, // whether srtt/rttvar hold a real measurement yet
-    // Reassembly of a single out-of-order segment (one extent ahead of rcv_nxt). Buffered on
-    // arrival and delivered (echoed) once the gap fills and the send window is free.
-    ooo: bool,
-    ooo_seq: u32,
-    ooo_len: usize,
-    ooo_fin: bool,
-    ooo_buf: [u8; RETX_CAP],
+    // Reassembly of out-of-order segments (up to OOO_EXTENTS extents ahead of rcv_nxt). Each is
+    // buffered on arrival and delivered (echoed) once the gap before it fills and the send
+    // window is free; extents drain in sequence order, one per freed window.
+    ooo: [OooExtent; OOO_EXTENTS],
 }
 
 impl TcpConn {
@@ -249,7 +268,7 @@ impl TcpConn {
             un_sent_at: 0, un_retx: false,
             rto_deadline: 0, retries: 0,
             srtt: 0, rttvar: 0, rto: RTO_INIT_TICKS as u32, rtt_valid: false,
-            ooo: false, ooo_seq: 0, ooo_len: 0, ooo_fin: false, ooo_buf: [0; RETX_CAP],
+            ooo: [OooExtent::EMPTY; OOO_EXTENTS],
         }
     }
 
@@ -411,20 +430,12 @@ impl TcpConn {
     ) -> Option<usize> {
         let has_fin = flags & FIN != 0;
 
-        // Future segment (a gap ahead of rcv_nxt): buffer it as the single out-of-order extent
-        // for later reassembly, then duplicate-ACK rcv_nxt to signal the gap. We hold only one
-        // extent — a second, different future segment is dropped (the peer retransmits it).
+        // Future segment (a gap ahead of rcv_nxt): buffer it as an out-of-order extent for later
+        // reassembly, then duplicate-ACK rcv_nxt to signal the gap. We hold up to OOO_EXTENTS
+        // distinct extents — once they are all full a further, different future segment is
+        // dropped (the peer retransmits it).
         if seq_gt(their_seq, self.rcv_nxt) {
-            if (!payload.is_empty() || has_fin)
-                && payload.len() <= RETX_CAP
-                && (!self.ooo || self.ooo_seq == their_seq)
-            {
-                self.ooo = true;
-                self.ooo_seq = their_seq;
-                self.ooo_len = payload.len();
-                self.ooo_fin = has_fin;
-                self.ooo_buf[..payload.len()].copy_from_slice(payload);
-            }
+            self.buffer_ooo(their_seq, payload, has_fin);
             return self.emit(out, our_ip, our_mac, local_port, window, ACK, self.snd_nxt, self.rcv_nxt, &[]);
         }
         // Old / already-received (a retransmit below rcv_nxt): duplicate-ACK.
@@ -472,22 +483,53 @@ impl TcpConn {
         Some(n)
     }
 
-    /// Deliver a buffered out-of-order segment that has become in-order, now that the send
+    /// Buffer a future segment (data and/or FIN that arrived ahead of `rcv_nxt`) into a free
+    /// out-of-order extent for later reassembly. A segment whose `seq` already occupies a slot
+    /// refreshes that slot (a duplicate); otherwise the first free slot is used. With all slots
+    /// full, the segment is dropped (the peer will retransmit it). Empty, FIN-less segments and
+    /// oversized payloads (> RETX_CAP) are ignored.
+    fn buffer_ooo(&mut self, seq: u32, payload: &[u8], has_fin: bool) {
+        if (payload.is_empty() && !has_fin) || payload.len() > RETX_CAP {
+            return;
+        }
+        let idx = self
+            .ooo
+            .iter()
+            .position(|e| e.used && e.seq == seq)
+            .or_else(|| self.ooo.iter().position(|e| !e.used));
+        if let Some(i) = idx {
+            let e = &mut self.ooo[i];
+            e.used = true;
+            e.seq = seq;
+            e.len = payload.len();
+            e.fin = has_fin;
+            e.buf[..payload.len()].copy_from_slice(payload);
+        }
+    }
+
+    /// Deliver the buffered out-of-order extent that has become in-order, now that the send
     /// window is free (an ACK cleared the outstanding segment). Echoes it exactly like fresh
-    /// in-order data. Returns the echo response, or `None` if there is nothing to deliver.
+    /// in-order data and frees its slot. At most one extent is delivered per call (one reply per
+    /// RX frame / one-segment send window); successive extents drain in sequence order across
+    /// successive freed windows. Returns the echo response, or `None` if there is nothing to
+    /// deliver.
     #[allow(clippy::too_many_arguments)]
     fn drain(&mut self, out: &mut [u8], our_ip: [u8; 4], our_mac: [u8; 6], local_port: u16, window: u16, now: u64) -> Option<usize> {
-        // Discard a buffered extent already covered by rcv_nxt (stale).
-        if self.ooo && seq_lt(self.ooo_seq, self.rcv_nxt) {
-            self.ooo = false;
+        // Discard extents already covered by rcv_nxt (stale / superseded by a retransmission).
+        for e in self.ooo.iter_mut() {
+            if e.used && seq_lt(e.seq, self.rcv_nxt) {
+                e.used = false;
+            }
         }
-        if self.unacked || !self.ooo || self.ooo_seq != self.rcv_nxt {
+        if self.unacked {
             return None;
         }
-        let len = self.ooo_len;
-        let has_fin = self.ooo_fin;
+        // Find the extent that exactly fills the current gap (seq == rcv_nxt).
+        let idx = self.ooo.iter().position(|e| e.used && e.seq == self.rcv_nxt)?;
+        let len = self.ooo[idx].len;
+        let has_fin = self.ooo[idx].fin;
         let mut tmp = [0u8; RETX_CAP];
-        tmp[..len].copy_from_slice(&self.ooo_buf[..len]);
+        tmp[..len].copy_from_slice(&self.ooo[idx].buf[..len]);
 
         let mut resp_flags = ACK | PSH;
         if has_fin {
@@ -499,12 +541,12 @@ impl TcpConn {
         }
         let seq = self.snd_nxt;
         let seqlen = len as u32 + if has_fin { 1 } else { 0 };
-        // Serialize first; commit + clear the extent only on success (no-desync).
+        // Serialize first; commit + free the extent only on success (no-desync).
         let n = self.emit(out, our_ip, our_mac, local_port, window, resp_flags, seq, new_rcv, &tmp[..len])?;
         self.rcv_nxt = new_rcv;
         self.snd_nxt = self.snd_nxt.wrapping_add(seqlen);
         self.arm(now, seq, resp_flags, &tmp[..len]);
-        self.ooo = false;
+        self.ooo[idx].used = false;
         if has_fin {
             self.state = ConnState::LastAck;
         }
@@ -986,5 +1028,80 @@ mod tests {
         c.update_rtt(10); // first real measurement
         assert!(c.rtt_valid);
         assert_eq!(c.rto, RTO_MIN_TICKS as u32);
+    }
+
+    // Reassembly tests use a fixed local identity; the values are irrelevant to the logic.
+    const OUR_IP: [u8; 4] = [10, 0, 2, 15];
+    const OUR_MAC: [u8; 6] = [9, 9, 9, 9, 9, 9];
+
+    fn used_extents(c: &TcpConn) -> usize {
+        c.ooo.iter().filter(|e| e.used).count()
+    }
+
+    #[test]
+    fn ooo_buffers_multiple_extents_and_drains_in_order() {
+        // rcv_nxt starts at 0x2000. Buffer B/C/D (the gap-filler A is missing), then deliver A
+        // (by advancing rcv_nxt) and confirm B, C, D drain in sequence order, one per freed window.
+        let mut c = test_conn();
+        let mut out = [0u8; 1500];
+        c.buffer_ooo(0x2004, b"BBBB", false);
+        c.buffer_ooo(0x2008, b"CCCC", false);
+        c.buffer_ooo(0x200C, b"DDDD", false);
+        assert_eq!(used_extents(&c), 3);
+        // No extent fills the gap at rcv_nxt yet.
+        assert!(c.drain(&mut out, OUR_IP, OUR_MAC, 7, 512, 1000).is_none());
+
+        // A arrives in order -> rcv_nxt reaches B's seq, window free.
+        c.rcv_nxt = 0x2004;
+        c.unacked = false;
+        assert!(c.drain(&mut out, OUR_IP, OUR_MAC, 7, 512, 1000).is_some()); // B
+        assert_eq!(c.rcv_nxt, 0x2008);
+        assert!(c.unacked); // one-segment window now occupied by B's echo
+        assert!(c.drain(&mut out, OUR_IP, OUR_MAC, 7, 512, 1000).is_none()); // window busy
+
+        c.unacked = false;
+        assert!(c.drain(&mut out, OUR_IP, OUR_MAC, 7, 512, 1000).is_some()); // C
+        assert_eq!(c.rcv_nxt, 0x200C);
+        c.unacked = false;
+        assert!(c.drain(&mut out, OUR_IP, OUR_MAC, 7, 512, 1000).is_some()); // D
+        assert_eq!(c.rcv_nxt, 0x2010);
+        assert_eq!(used_extents(&c), 0); // all extents delivered
+    }
+
+    #[test]
+    fn ooo_drops_when_full() {
+        let mut c = test_conn();
+        for s in [0x2010u32, 0x2020, 0x2030, 0x2040] {
+            c.buffer_ooo(s, b"data", false);
+        }
+        assert_eq!(used_extents(&c), OOO_EXTENTS);
+        // All slots full -> a further distinct future segment is dropped (peer retransmits).
+        c.buffer_ooo(0x2050, b"late", false);
+        assert_eq!(used_extents(&c), OOO_EXTENTS);
+        assert!(!c.ooo.iter().any(|e| e.used && e.seq == 0x2050));
+    }
+
+    #[test]
+    fn ooo_duplicate_seq_overwrites_slot() {
+        let mut c = test_conn();
+        c.buffer_ooo(0x2010, b"AAAA", false);
+        c.buffer_ooo(0x2010, b"BBBBBB", false); // same seq -> refresh, not a new slot
+        assert_eq!(used_extents(&c), 1);
+        let e = c.ooo.iter().find(|e| e.used && e.seq == 0x2010).unwrap();
+        assert_eq!(e.len, 6);
+        assert_eq!(&e.buf[..6], b"BBBBBB");
+    }
+
+    #[test]
+    fn ooo_drain_discards_stale() {
+        let mut c = test_conn();
+        c.buffer_ooo(0x2004, b"BBBB", false);
+        assert_eq!(used_extents(&c), 1);
+        // rcv_nxt advanced past the buffered extent (e.g. it was superseded) -> drain discards it.
+        c.rcv_nxt = 0x2010;
+        c.unacked = false;
+        let mut out = [0u8; 1500];
+        assert!(c.drain(&mut out, OUR_IP, OUR_MAC, 7, 512, 1000).is_none());
+        assert_eq!(used_extents(&c), 0);
     }
 }
