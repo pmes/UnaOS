@@ -58,9 +58,22 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     unaos_kernel::arch::acpi::init(rsdp_addr);
 
     // 4c. SMP: start the application processors (INIT-SIPI-SIPI). Each AP brings up its own
-    // per-CPU GDT/TSS + local APIC and idles; the BSP continues to drive everything below.
+    // per-CPU GDT/TSS + local APIC, then waits to enter its scheduler loop; the BSP continues to
+    // drive everything below. `start_aps` also runs the post-bring-up SMP smoke test while the
+    // APs are still idle.
     #[cfg(target_arch = "x86_64")]
     unaos_kernel::arch::smp::start_aps();
+
+    // 4d. Scheduler: now that SMP verification has run against idle APs, initialise the per-CPU
+    // run queues, turn scheduling on, and spawn a small demo workload across the APs to exercise
+    // preemption / cooperative yield / task exit. The BSP itself is never scheduled — it stays
+    // the hardware-service core in the loop below.
+    #[cfg(target_arch = "x86_64")]
+    {
+        unaos_kernel::arch::sched::init();
+        let online = unaos_kernel::arch::smp::online_aps();
+        unaos_kernel::arch::sched::start_demo(&online);
+    }
 
     // 5. Motherboard Hardware Interconnects
     unaos_kernel::arch::pci::init(dtb_addr, dtb_size);

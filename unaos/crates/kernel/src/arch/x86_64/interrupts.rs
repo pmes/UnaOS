@@ -32,6 +32,10 @@ lazy_static! {
     static ref IDT: InterruptDescriptorTable = {
         let mut idt = InterruptDescriptorTable::new();
         idt.breakpoint.set_handler_fn(breakpoint_handler);
+        // Minimal, lock-free NMI handler. LINT1 is wired as NMI (see `apic::init`), and NMIs
+        // ignore IF — so one can land mid-context-switch. This handler must never touch run
+        // queues, scheduler state, or any spin lock; it just counts and returns.
+        idt.non_maskable_interrupt.set_handler_fn(nmi_handler);
         unsafe {
             idt.double_fault
                 .set_handler_fn(double_fault_handler)
@@ -110,15 +114,33 @@ extern "x86-interrupt" fn timer_interrupt_handler(_stack_frame: InterruptStackFr
     if prev == 0 {
         serial_println!("APIC: heartbeat live (first timer tick).");
     }
+    // EOI BEFORE any context switch: otherwise the in-service bit would block this CPU's
+    // subsequent timer ticks for the whole descheduled lifetime of a preempted task.
     crate::arch::apic::eoi();
+    // Preemption point. No-op unless a scheduled task is running on THIS cpu and its quantum
+    // expired; runs with IF=0 (interrupt gate) and the preempted task's `iretq` restores its IF.
+    crate::arch::sched::timer_preempt();
 }
 
-/// Inter-processor interrupt handler (IDT vector `IPI_VECTOR`). Lock-free: record the IPI on
-/// this CPU and EOI. This is the scheduler-wakeup primitive — an IPI knocks a core out of `hlt`
-/// so it can re-check its run queue; for now it just proves cross-CPU signalling works.
+/// Inter-processor interrupt handler (IDT vector `IPI_VECTOR`). Lock-free and WAKE-ONLY: record
+/// the IPI on this CPU and EOI. It deliberately does NOT context-switch — its whole job is that
+/// returning from the interrupt breaks the scheduler's idle `hlt`, so the per-CPU scheduler loop
+/// re-checks its run queue and picks up work a `spawn` just enqueued. Keeping it switch-free is
+/// what makes the running task's `current` pointer single-owner (only the scheduler loop and the
+/// timer preempt site ever switch).
 extern "x86-interrupt" fn ipi_handler(_stack_frame: InterruptStackFrame) {
     crate::arch::percpu::note_ipi();
     crate::arch::apic::eoi();
+}
+
+/// Count of NMIs taken (lock-free introspection; see the NMI handler below).
+pub static NMI_COUNT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// Non-maskable interrupt handler. NMIs ignore IF, so this can interrupt a context switch in
+/// progress; it must stay leaf and lock-free (no run queues, no `current`, no spin locks). We
+/// only count and return — that keeps `switch_context` NMI-reentrant-safe.
+extern "x86-interrupt" fn nmi_handler(_stack_frame: InterruptStackFrame) {
+    NMI_COUNT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
 }
 
 /// xHCI MSI-X handler (interrupter 0, IDT vector 0x40). Minimal and lock-free: it

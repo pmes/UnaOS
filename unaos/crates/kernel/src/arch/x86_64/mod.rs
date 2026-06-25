@@ -6,6 +6,7 @@ pub mod apic;
 pub mod acpi;
 pub mod percpu;
 pub mod smp;
+pub mod sched;
 pub mod pci;
 pub mod memory;
 

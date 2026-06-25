@@ -17,7 +17,10 @@
 
 use core::sync::atomic::{AtomicU32, Ordering};
 
-use crate::arch::{acpi, apic, gdt, interrupts, percpu};
+use alloc::vec::Vec;
+use spin::Mutex;
+
+use crate::arch::{acpi, apic, gdt, interrupts, percpu, sched};
 
 /// Physical page the trampoline is copied to and the AP starts executing at. Must be page-aligned
 /// and < 1 MiB (the SIPI vector is 8 bits: start address = vector << 12). 0x8000 is free
@@ -39,6 +42,15 @@ static mut AP_STACKS: [ApStack; gdt::MAX_CPUS] =
 /// Count of APs that have reached `ap_entry` and finished their own bring-up. The BSP waits on
 /// this between SIPIs so the shared trampoline handoff slot (stack/index) is reused safely.
 static AP_ONLINE: AtomicU32 = AtomicU32::new(0);
+
+/// Logical indices of the APs that came online, published by `start_aps` for the scheduler to
+/// spawn work onto. Written once on the BSP after bring-up; read on the BSP.
+static ONLINE_APS: Mutex<Vec<usize>> = Mutex::new(Vec::new());
+
+/// Snapshot of the online application-processor logical indices (excludes the BSP).
+pub fn online_aps() -> Vec<usize> {
+    ONLINE_APS.lock().clone()
+}
 
 // The real-mode -> long-mode trampoline. AT&T syntax; see the module comment for the design.
 // Every absolute reference is `TRAMP + (label - ap_trampoline_start)` so the assembled bytes
@@ -166,7 +178,10 @@ pub extern "C" fn ap_entry(cpu_index: u64) -> ! {
     serial_println!("SMP: AP {} online (apic id {}).", idx, apic_id);
 
     x86_64::instructions::interrupts::enable();
-    crate::arch::hlt_loop();
+    // Wait until the BSP has run SMP verification and turned scheduling on, then run this AP's
+    // scheduler loop forever (replacing the old idle `hlt_loop`). The BSP keeps driving
+    // xHCI/console/storage; APs run scheduled kernel threads.
+    sched::wait_and_run();
 }
 
 /// Patch one 8-byte field of the (already-copied) trampoline parameter block at TRAMPOLINE_ADDR.
@@ -287,6 +302,10 @@ pub fn start_aps() {
         AP_ONLINE.load(Ordering::SeqCst) + 1,
         apic_ids.len()
     );
+
+    // Publish the online AP indices so the scheduler can spawn work onto exactly the cores that
+    // actually came up (not just "1..cpu_count").
+    *ONLINE_APS.lock() = online_aps[..n_online].to_vec();
 
     verify_smp(&online_aps[..n_online]);
 }
