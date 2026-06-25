@@ -27,13 +27,16 @@ WORKSPACE_DIR="$(cd "$(dirname "$0")" && pwd)"
 # Build flags shared by both targets
 NIGHTLY_FLAGS="-Z build-std=core,compiler_builtins,alloc -Z build-std-features=compiler-builtins-mem -Z json-target-spec"
 
-# Optional kernel cargo features. UNAOS_SKIP_XHCI=1 builds the kernel with xHCI/USB bring-up
-# disabled — video-only boot for real hardware where firmware may still own the USB controller
-# and stall its reset handshake before the GUI paints. Empty by default (full bring-up).
+# Optional kernel cargo features (composable). UNAOS_SKIP_XHCI=1 disables xHCI/USB bring-up
+# (video-only boot for real HW where firmware may still own the controller and stall its reset);
+# UNAOS_BOOTLOG=1 holds the boot log on screen instead of handing off to the GUI. Empty by default.
 KERNEL_FEATURES=""
-if [ -n "${UNAOS_SKIP_XHCI:-}" ]; then
-    KERNEL_FEATURES="--features skip_xhci"
-    echo -e "${COLOR_YELLOW}⚡ UNAOS_SKIP_XHCI set — building kernel WITHOUT xHCI/USB bring-up${COLOR_RESET}"
+_feats=""
+[ -n "${UNAOS_SKIP_XHCI:-}" ] && _feats="${_feats}skip_xhci,"
+[ -n "${UNAOS_BOOTLOG:-}" ] && _feats="${_feats}bootlog,"
+if [ -n "$_feats" ]; then
+    KERNEL_FEATURES="--features ${_feats%,}"
+    echo -e "${COLOR_YELLOW}⚡ kernel features: ${_feats%,}${COLOR_RESET}"
 fi
 
 # --- Build Functions ---

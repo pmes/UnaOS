@@ -21,6 +21,8 @@ pub extern "C" fn _start(boot_info: &'static mut BootInfo) -> ! {
     kernel_main(boot_info)
 }
 
+// The `bootlog` feature halts before the GUI, making the GUI/main-loop code below unreachable.
+#[cfg_attr(feature = "bootlog", allow(unreachable_code))]
 fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     // 0. Framebuffer log sink FIRST — mirror every serial_println! (and panics) to the screen,
     //    so boot diagnostics are visible on real hardware that has no serial port. No-op if the
@@ -59,6 +61,32 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     {
         let _ = (dtb_addr, dtb_size);
         serial_println!(":: xHCI bring-up SKIPPED (skip_xhci feature): video only, no USB ::");
+    }
+
+    // Boot-log mode: hold the fbcon boot log on screen (no GUI takeover, no background paint) so
+    // it can be photographed on serial-less hardware. Dump the effective framebuffer geometry and
+    // pixel format — i.e. the result of the bootloader's EDID/GOP mode selection — then halt.
+    #[cfg(feature = "bootlog")]
+    {
+        let fmt = match info.pixel_format {
+            unaos_boot_info::PixelFormat::Rgb => "Rgb",
+            unaos_boot_info::PixelFormat::Bgr => "Bgr",
+            unaos_boot_info::PixelFormat::U8 => "U8",
+            _ => "Unknown",
+        };
+        serial_println!(":: ============== BOOT LOG MODE ============== ::");
+        serial_println!(
+            ":: framebuffer {}x{}  stride={}px  bpp={}  fmt={} ::",
+            info.width, info.height, info.stride, info.bytes_per_pixel, fmt
+        );
+        serial_println!(
+            ":: fb_addr={:#x}  fb_size={}  stride*h*bpp={} ::",
+            framebuffer_addr,
+            framebuffer_size,
+            info.stride * info.height * info.bytes_per_pixel
+        );
+        serial_println!(":: GUI suppressed; boot log held on screen. Power off when done. ::");
+        unaos_kernel::arch::hlt_loop();
     }
 
     if framebuffer_addr != 0 {

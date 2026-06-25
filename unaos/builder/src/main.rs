@@ -33,11 +33,15 @@ fn main() {
         .arg("-Z").arg("build-std=core,compiler_builtins,alloc")
         .arg("-Z").arg("build-std-features=compiler-builtins-mem")
         .arg("-Z").arg("json-target-spec");
-    // UNAOS_SKIP_XHCI=1 -> build the kernel with xHCI/USB bring-up disabled (video-only boot
-    // media for real hardware where firmware may still own the controller).
-    if std::env::var("UNAOS_SKIP_XHCI").is_ok() {
-        kernel_cmd.arg("--features").arg("skip_xhci");
-        println!("   (UNAOS_SKIP_XHCI) xHCI bring-up disabled in this build");
+    // Optional kernel features from env knobs: UNAOS_SKIP_XHCI=1 (disable xHCI/USB bring-up),
+    // UNAOS_BOOTLOG=1 (hold the boot log on screen instead of the GUI). Composable.
+    let mut feats: Vec<&str> = Vec::new();
+    if std::env::var("UNAOS_SKIP_XHCI").is_ok() { feats.push("skip_xhci"); }
+    if std::env::var("UNAOS_BOOTLOG").is_ok() { feats.push("bootlog"); }
+    if !feats.is_empty() {
+        let list = feats.join(",");
+        kernel_cmd.arg("--features").arg(&list);
+        println!("   kernel features: {list}");
     }
     let kernel_status = kernel_cmd.status().unwrap();
 

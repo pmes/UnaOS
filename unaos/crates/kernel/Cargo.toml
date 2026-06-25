@@ -12,6 +12,10 @@ default = []
 # loops stall boot for many seconds before the GUI paints. With this feature the GUI comes up
 # immediately; USB is simply absent (no keyboard). Enable via `UNAOS_SKIP_XHCI=1 ./arroyo ...`.
 skip_xhci = []
+# Hold the fbcon boot log on screen instead of handing the framebuffer to the GUI: dumps the
+# effective framebuffer geometry/format (the result of EDID/GOP mode selection) and halts, so the
+# whole boot log can be photographed on serial-less hardware. Enable via `UNAOS_BOOTLOG=1`.
+bootlog = []
 
 [dependencies]
 # FIX: Use 'spin_no_std' to explicitly disable Standard Library usage
