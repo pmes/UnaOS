@@ -33,6 +33,14 @@
 //   * The idle sleep is the atomic `sti; hlt` pair (`enable_and_hlt`); a wake (timer or IPI) that
 //     was latched before the `sti` still fires the handler and returns past the `hlt`, and the
 //     loop then re-checks the queue — so a `spawn`+IPI landing in the idle window is never lost.
+//   * `Condvar::wait` holds the ONE sanctioned "release a sibling lock while holding a wait-queue
+//     lock": it calls the user `Mutex`'s `Semaphore::post` while still holding the condvar's own
+//     spin lock, immediately before the switch — inherent to atomically releasing the mutex and
+//     blocking. The lock order is therefore `cv.locked -> mutex.sem.locked -> run-queue lock ->
+//     heap`, and it is acyclic (nothing ever takes a wait-queue lock while holding a run-queue
+//     lock). `notify_one`/`notify_all` must NOT add a second such nesting: they pop a waiter under
+//     the condvar lock but call `make_ready` only AFTER releasing it (the `Semaphore::post`
+//     discipline), so `notify_all` drains one waiter per lock acquisition.
 
 use core::cell::UnsafeCell;
 use core::marker::PhantomData;
@@ -717,6 +725,195 @@ impl<T> Drop for MutexGuard<'_, T> {
 }
 
 // ---------------------------------------------------------------------------------------------
+// Condvar — a Mesa-semantics condition variable (the count-less companion to Semaphore)
+// ---------------------------------------------------------------------------------------------
+
+/// A condition variable for kernel threads, paired with the sleeping `Mutex<T>`. `wait(guard)`
+/// atomically releases the mutex and blocks the calling task; `notify_one`/`notify_all` wake parked
+/// waiter(s). It is the count-LESS sibling of `Semaphore`: a notification with no waiter is a no-op
+/// (it is NOT stored), which is the defining condition-variable semantics.
+///
+/// Callers MUST re-check their predicate in a `while` loop. Wakeups are permitted to be spurious,
+/// and — unlike `sleep_ticks` — a cv waiter has NO timer backstop: it sits only in this queue with
+/// no deadline, so a `notify` is its SOLE wake source and a missed notify is a permanent hang, not
+/// a one-tick latency blip. That raises the stakes on the lost-wakeup proof below; it is the same
+/// lock-handoff that makes `Semaphore` safe.
+///
+/// MUST be `'static` (e.g. a `static CV`): like `Semaphore`, `wait()` hands raw pointers to
+/// `waiters`/`locked` to the scheduler to be dereferenced after the context switch, so the Condvar
+/// must outlive every task that can block on it. Call `init()` once on the BSP before use.
+///
+/// Lost-wakeup safety (Mesa semantics). A correct notifier changes the predicate under the mutex,
+/// then notifies. `wait()` acquires the condvar's `locked` BEFORE releasing the mutex, and keeps it
+/// held — handed off to the scheduler, released only after the blocked Box is enqueued — across the
+/// switch. A notifier must take `locked` to pop a waiter, so it cannot run a notify between the
+/// mutex-release and the enqueue; it always observes the waiter. This is exactly `Semaphore`'s
+/// lock-handoff with the protected resource (the mutex) released explicitly inside the handoff.
+pub struct Condvar {
+    /// Raw spinlock guarding `waiters`. Acquire on lock, Release on unlock. Same role as
+    /// `Semaphore::locked`; there is no count (notifications are not stored).
+    locked: AtomicBool,
+    /// FIFO waiter list; touched only under `locked`. Pre-reserved to `WAIT_CAPACITY` by `init()`
+    /// so the scheduler's park-side `push_back` never reallocates under the held lock.
+    waiters: UnsafeCell<VecDeque<Box<Task>>>,
+}
+
+// SAFETY: every access to `waiters` is serialized by `locked`; the park-side push happens while the
+// blocker's lock is still held (released by the scheduler after the push), establishing
+// happens-before with the next notify — identical to `Semaphore`.
+unsafe impl Sync for Condvar {}
+
+impl Condvar {
+    /// Construct an empty condition variable. `const` so it can initialise a `static`.
+    pub const fn new() -> Self {
+        Condvar {
+            locked: AtomicBool::new(false),
+            waiters: UnsafeCell::new(VecDeque::new()),
+        }
+    }
+
+    /// Reserve the waiter list's capacity so the scheduler's park-side push never reallocates under
+    /// the held lock. Call once on the BSP before any task can block on this condvar.
+    pub fn init(&self) {
+        self.lock_raw();
+        unsafe { (*self.waiters.get()).reserve(WAIT_CAPACITY) };
+        self.unlock_raw();
+    }
+
+    #[inline]
+    fn lock_raw(&self) {
+        while self.locked.swap(true, Ordering::Acquire) {
+            core::hint::spin_loop();
+        }
+    }
+
+    #[inline]
+    fn unlock_raw(&self) {
+        self.locked.store(false, Ordering::Release);
+    }
+
+    /// Atomically release `guard`'s mutex and block the current task on this condvar; when later
+    /// notified, re-acquire the mutex and return a fresh guard. MUST be called from a scheduled
+    /// task holding `guard`. Spurious wakeups are allowed — the caller must re-test its predicate.
+    ///
+    /// The lettered step order below is load-bearing for lost-wakeup safety and the lock-ordering
+    /// invariant; do not reorder it (see the type doc and the module header).
+    pub fn wait<'a, T>(&self, guard: MutexGuard<'a, T>) -> MutexGuard<'a, T> {
+        // (a) Mask interrupts for the whole critical section; remember the caller's IF to restore.
+        let was_enabled = x86_64::instructions::interrupts::are_enabled();
+        x86_64::instructions::interrupts::disable();
+
+        // (b) Must be on a scheduled task. Assert BEFORE consuming the guard: were we to forget the
+        //     guard first and then panic, the mutex would be permanently locked — the explicit
+        //     release in (h) never runs, and the guard's Drop is already gone.
+        let cpu = percpu::this_cpu().cpu_index as usize;
+        let raw = SCHED[cpu].current.load(Ordering::Acquire) as *mut Task;
+        assert!(
+            !raw.is_null(),
+            "Condvar::wait() called off a scheduled task (needs a scheduler context)"
+        );
+
+        // (c) Extract the mutex and DISARM the guard's Drop. `forget` is the deliberate dual of the
+        //     explicit `mutex.sem.post()` in (h): exactly one release per acquire, mirroring the
+        //     mutex's single-permit invariant.
+        let mutex = guard.mutex;
+        core::mem::forget(guard);
+
+        // (d) Acquire the condvar lock BEFORE releasing the mutex — closing the lost-wakeup window.
+        //     A notifier that flips the predicate after our release still cannot notify an empty
+        //     queue, because notify needs this lock, which we now hold across the switch.
+        self.lock_raw();
+
+        // (e) Prove the park-side push stays allocation-free: the lock is held continuously through
+        //     the switch, so this length cannot change before park_blocked pushes.
+        assert!(
+            unsafe { (*self.waiters.get()).len() } < WAIT_CAPACITY,
+            "Condvar waiter overflow (raise WAIT_CAPACITY)"
+        );
+
+        unsafe {
+            // (f) Block, and (g) install the PARK_WAITQ hand-off onto THIS condvar's queue + lock.
+            (*raw).state.store(STATE_BLOCKED, Ordering::Release);
+            SCHED[cpu].park_waiters.store(self.waiters.get() as u64, Ordering::Relaxed);
+            SCHED[cpu].park_lock.store(&self.locked as *const AtomicBool as u64, Ordering::Relaxed);
+            SCHED[cpu].park_kind.store(PARK_WAITQ, Ordering::Relaxed);
+
+            // (h) Release the user mutex while still holding the condvar lock. This RAW
+            //     `Semaphore::post`, called with IF=0, sees `was_enabled == false` and does NOT
+            //     re-enable interrupts — preserving "every switch-away is IF=0" into (j). It is the
+            //     one sanctioned post-under-another-primitive-lock (cv.locked -> mutex.sem.locked);
+            //     see the module header.
+            mutex.sem.post();
+            debug_assert!(
+                !x86_64::instructions::interrupts::are_enabled(),
+                "Condvar::wait must switch with interrupts disabled"
+            );
+
+            // (j) Switch to the scheduler; park_blocked(PARK_WAITQ) pushes our Box into
+            //     self.waiters and releases self.locked LAST (the lock-handoff).
+            switch_context(
+                &raw mut (*raw).ctx_rsp,
+                SCHED[cpu].scheduler_rsp.load(Ordering::Acquire),
+            );
+        }
+
+        // Resumed (IF=0, carried) by a notify that moved us back to our pinned run queue; the
+        // condvar lock was already released by the scheduler that parked us. Restore the caller's
+        // IF, then re-acquire the mutex and return a fresh guard. We restore IF ourselves rather
+        // than leaning on the inner `lock()`: its `Semaphore::wait` snapshots the CURRENT IF — the
+        // carried 0, not the caller's original — so it alone would strand the task interrupts-off.
+        // The re-acquire may legitimately block again on a contended mutex via the mutex's own
+        // disjoint PARK_WAITQ handoff; the task stays CPU-pinned throughout, so rebuilding the
+        // `!Send` guard on the same CPU upholds its unlock-from-owner-context intent.
+        if was_enabled {
+            x86_64::instructions::interrupts::enable();
+        }
+        mutex.lock()
+    }
+
+    /// Wake one waiter if any; a no-op if none are waiting (the notification is NOT stored — the
+    /// defining difference from `Semaphore::post`). May be called from any context (a task or the
+    /// unscheduled BSP). `make_ready` is called only AFTER releasing the condvar lock, so the lock
+    /// is never nested over a run-queue lock.
+    pub fn notify_one(&self) {
+        let was_enabled = x86_64::instructions::interrupts::are_enabled();
+        x86_64::instructions::interrupts::disable();
+        self.lock_raw();
+        let waiter = unsafe { (*self.waiters.get()).pop_front() };
+        self.unlock_raw();
+        if let Some(task) = waiter {
+            make_ready(task);
+        }
+        if was_enabled {
+            x86_64::instructions::interrupts::enable();
+        }
+    }
+
+    /// Wake EVERY currently-queued waiter. Drains one waiter per lock acquisition and calls
+    /// `make_ready` outside the lock (the `Semaphore::post` discipline), so the condvar lock is
+    /// never held across a run-queue lock. May be called from any context. A waiter that arrives
+    /// mid-drain may also be woken — harmless under Mesa semantics (the caller re-tests its
+    /// predicate); a correct notifier holds the mutex across the notify, so in practice no new
+    /// waiter arrives during the drain, and each iteration removes exactly one Box (no livelock).
+    pub fn notify_all(&self) {
+        let was_enabled = x86_64::instructions::interrupts::are_enabled();
+        x86_64::instructions::interrupts::disable();
+        loop {
+            self.lock_raw();
+            let waiter = unsafe { (*self.waiters.get()).pop_front() };
+            self.unlock_raw();
+            match waiter {
+                Some(task) => make_ready(task),
+                None => break,
+            }
+        }
+        if was_enabled {
+            x86_64::instructions::interrupts::enable();
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
 // Channel<T> — a bounded blocking channel, composed from a Mutex + two Semaphores
 // ---------------------------------------------------------------------------------------------
 
@@ -993,24 +1190,40 @@ pub fn current_task_id(cpu: usize) -> Option<u64> {
 /// Count of demo tasks that have run to completion (so a test can confirm exit/free works).
 static DEMO_DONE: AtomicUsize = AtomicUsize::new(0);
 
-/// Bounded channel the producer/consumer demo exchanges values over. Small capacity so the producer
-/// genuinely BLOCKS when full (and the consumer when empty). `'static`, as a blockable channel must
-/// be. Tasks run at NORMAL priority, so this also exercises the multilevel run queue at one level.
-static CHAN: Channel<u64> = Channel::new(4);
-/// Number of values the producer/consumer demo exchanges.
-const CHAN_ITEMS: u64 = 20;
+/// Shared predicate state for the condvar demo, guarded by `COND_MUTEX`.
+struct CondState {
+    /// Flipped true by the coordinator; the workers block until it is set.
+    ready: bool,
+}
+/// The mutex the condvar demo pairs with (guards `CondState`). `'static`, as a blockable mutex
+/// must be.
+static COND_MUTEX: Mutex<CondState> = Mutex::new(CondState { ready: false });
+/// The condition variable the demo exercises (one `notify_all` waking several blocked workers).
+static COND_CV: Condvar = Condvar::new();
+/// How many workers have woken from the condvar and observed the predicate (for the PASS check).
+static COND_WOKEN: AtomicUsize = AtomicUsize::new(0);
+/// How many workers have entered `CV.wait` (incremented under the mutex, just before waiting). The
+/// coordinator waits for this to reach `COND_WORKERS` so it signals only once every worker is
+/// provably blocked — making the demo deterministic rather than timing-dependent.
+static COND_WAITING: AtomicUsize = AtomicUsize::new(0);
+/// Number of worker tasks the condvar demo blocks on one `notify_all`.
+const COND_WORKERS: usize = 3;
 
 /// Turn scheduling on and spawn the demo workload across the online APs: equal-priority round-robin
-/// + timer preemption (the busy pair), and a cross-core bounded `Channel` (producer + consumer on
-/// different APs) that composes the Mutex + Semaphores and blocks both ways. Called once on the BSP
-/// after `smp::start_aps` (hence after `verify_smp`). No-op with no APs.
+/// + timer preemption (the busy pair), and the `Condvar` demo — several workers block on a
+/// predicate via `CV.wait` (releasing the `Mutex`), a coordinator flips the predicate under the
+/// mutex and `notify_all`s (holding the mutex past the notify to force a contended re-acquire), and
+/// a verifier confirms every worker woke. Exercises notify_all, the atomic release + re-acquire, and
+/// cross-CPU wake. Called once on the BSP after `smp::start_aps` (hence after `verify_smp`). No-op
+/// with no APs.
 pub fn start_demo(online_aps: &[usize]) {
     if online_aps.is_empty() {
         serial_println!("SCHED: no application processors online; scheduler idle.");
         return;
     }
 
-    CHAN.init(); // reserve the channel's primitives' waiter capacity before any task can block
+    COND_MUTEX.init(); // reserve the mutex + condvar waiter capacity before any task can block
+    COND_CV.init();
     SCHED_ACTIVE.store(true, Ordering::Release);
     SCHED_GO.store(true, Ordering::Release);
 
@@ -1026,15 +1239,23 @@ pub fn start_demo(online_aps: &[usize]) {
     spawn("busy-A", demo_busy, encode(cpu_busy, b'A'), cpu_busy, PRIO_NORMAL);
     spawn("busy-B", demo_busy, encode(cpu_busy, b'B'), cpu_busy, PRIO_NORMAL);
 
-    // Cross-core bounded channel: a consumer on one AP and a producer on another (or the same, if
-    // only one extra AP). The capacity-4 channel forces the producer to block when full and the
-    // consumer when empty; the consumer verifies the received sum. Exercises Mutex + Semaphore
-    // composition + cross-CPU wake both directions.
-    if let Some(&cpu_rx) = online_aps.get(1) {
-        spawn("rx", demo_consumer, cpu_rx, cpu_rx, PRIO_NORMAL);
-        let cpu_tx = online_aps.get(2).copied().unwrap_or(cpu_rx);
-        spawn("tx", demo_producer, cpu_tx, cpu_tx, PRIO_NORMAL);
+    // Condition variable: COND_WORKERS workers each block on a predicate via `CV.wait` (which
+    // releases the mutex), a coordinator flips the predicate under the mutex and `notify_all`s, and
+    // a verifier confirms ALL workers woke. Workers are spread across the APs so the single
+    // notify_all performs both same-core and cross-core wakes; the coordinator holds the mutex a
+    // few ticks past the notify so the woken workers must re-block on it (contended re-acquire).
+    // Exercises notify_all, the atomic release + re-acquire, cross-CPU wake, and the recheck loop.
+    // Each worker pins to a (round-robin) AP; a worker landing on `cpu_busy` shares with busy-A/B
+    // and still makes progress via preemption before it blocks.
+    let n = online_aps.len();
+    for i in 0..COND_WORKERS {
+        let cpu = online_aps[i % n];
+        spawn("cond-worker", demo_cond_worker, cpu, cpu, PRIO_NORMAL);
     }
+    let cpu_coord = online_aps[1 % n];
+    spawn("cond-coord", demo_cond_coordinator, cpu_coord, cpu_coord, PRIO_NORMAL);
+    let cpu_verify = online_aps[2 % n];
+    spawn("cond-verify", demo_cond_verifier, cpu_verify, cpu_verify, PRIO_NORMAL);
 }
 
 /// Pack a (cpu, tag-letter) pair into the single `usize` arg the task entry receives.
@@ -1062,31 +1283,60 @@ fn demo_busy(arg: usize) {
     DEMO_DONE.fetch_add(1, Ordering::Relaxed);
 }
 
-/// Producer: sends 1..=CHAN_ITEMS into the bounded channel, blocking whenever it is full (the
-/// capacity-4 channel can't hold all 20 at once, so the consumer must drain to let it proceed).
-fn demo_producer(cpu: usize) {
-    for value in 1..=CHAN_ITEMS {
-        CHAN.send(value);
-        serial_println!("SCHED: [cpu{cpu} tx] sent {value}");
+/// Condvar worker: block on the predicate until the coordinator sets it, then count the wake. The
+/// `while` loop re-tests the predicate on every (possibly spurious) wakeup, as Mesa semantics
+/// require. The `COND_WAITING` bump sits UNDER the mutex, immediately before the first `CV.wait`,
+/// so the coordinator can detect "all workers blocked" precisely: a worker holds the mutex from the
+/// bump until `wait` releases it, so `COND_WAITING == COND_WORKERS` implies every worker has entered
+/// `wait` (and any still mid-park holds the condvar lock, which the coordinator's notify waits for).
+fn demo_cond_worker(cpu: usize) {
+    let mut guard = COND_MUTEX.lock();
+    COND_WAITING.fetch_add(1, Ordering::Relaxed);
+    while !guard.ready {
+        guard = COND_CV.wait(guard);
     }
-    serial_println!("SCHED: [cpu{cpu} tx] done");
+    drop(guard);
+    let n = COND_WOKEN.fetch_add(1, Ordering::Relaxed) + 1;
+    serial_println!("SCHED: [cpu{} cond-worker] woke ({}/{})", cpu, n, COND_WORKERS);
     DEMO_DONE.fetch_add(1, Ordering::Relaxed);
 }
 
-/// Consumer: receives CHAN_ITEMS values (blocking while empty) and verifies their sum — proving no
-/// value was lost or duplicated across the cross-core, blocking channel.
-fn demo_consumer(cpu: usize) {
-    let mut sum = 0u64;
-    for _ in 0..CHAN_ITEMS {
-        sum += CHAN.recv();
+/// Condvar coordinator: wait until all workers are blocked on the condvar, then flip the predicate
+/// under the mutex and wake them all with one `notify_all`. It deliberately holds the mutex a few
+/// ticks AFTER the notify so every woken worker must re-block on the mutex (contended re-acquire),
+/// exercising `CV.wait`'s re-acquire handoff. The bounded poll means a bug surfaces as FAIL, never
+/// a hang.
+fn demo_cond_coordinator(cpu: usize) {
+    let mut waited = 0u64;
+    while COND_WAITING.load(Ordering::Relaxed) < COND_WORKERS && waited < 4000 {
+        sleep_ticks(2);
+        waited += 2;
     }
-    let expected = CHAN_ITEMS * (CHAN_ITEMS + 1) / 2;
+    let mut guard = COND_MUTEX.lock();
+    guard.ready = true;
+    COND_CV.notify_all();
+    sleep_ticks(4); // hold the mutex past the notify -> force a contended re-acquire in the workers
+    drop(guard);
+    serial_println!("SCHED: [cpu{} cond-coord] predicate set + notify_all woke {}", cpu, COND_WORKERS);
+    DEMO_DONE.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Condvar verifier: poll until every worker has woken (or a generous timeout), then print a single
+/// self-checking PASS/FAIL line for headless verification — proving the one `notify_all` released
+/// all blocked workers across cores.
+fn demo_cond_verifier(cpu: usize) {
+    let mut waited = 0u64;
+    while COND_WOKEN.load(Ordering::Relaxed) < COND_WORKERS && waited < 6000 {
+        sleep_ticks(4);
+        waited += 4;
+    }
+    let woke = COND_WOKEN.load(Ordering::Relaxed);
     serial_println!(
-        "CHANNEL: [cpu{cpu} rx] received {} values, sum {} (expected {}) => {}",
-        CHAN_ITEMS,
-        sum,
-        expected,
-        if sum == expected { "PASS" } else { "FAIL" }
+        "CONDVAR: [cpu{}] woke {}/{} workers via notify_all => {}",
+        cpu,
+        woke,
+        COND_WORKERS,
+        if woke == COND_WORKERS { "PASS" } else { "FAIL" }
     );
     DEMO_DONE.fetch_add(1, Ordering::Relaxed);
 }
