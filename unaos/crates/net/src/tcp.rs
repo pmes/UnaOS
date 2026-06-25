@@ -242,10 +242,6 @@ impl SendRing {
     fn flight_len(&self) -> usize {
         self.nxt.wrapping_sub(self.una) as usize
     }
-    /// Are any sent bytes still unacknowledged?
-    fn in_flight(&self) -> bool {
-        self.nxt != self.una
-    }
     /// Have all buffered bytes been sent (nothing left queued)?
     fn fully_sent(&self) -> bool {
         self.nxt == self.una.wrapping_add(self.len as u32)
@@ -389,11 +385,19 @@ impl TcpConn {
         self.remote_ip == ip && self.remote_port == port
     }
 
+    /// Our honestly-advertised receive window: the free space in the echo send buffer — i.e. how
+    /// many more bytes we can currently accept and echo. Shrinks as the buffer fills and reaches 0
+    /// when full, so a conforming peer pauses instead of overrunning us. (`SND_BUF` <= u16::MAX, so
+    /// the cast cannot truncate.)
+    fn adv_window(&self) -> u16 {
+        self.snd.free() as u16
+    }
+
     /// Emit one segment, building the full Eth/IPv4/TCP frame into `out`. `seq` and `ack` are
     /// passed explicitly (rather than read from `self`) so a data echo can ACK the bytes it
     /// carries — and a retransmission can re-send the *original* seq — while the `rcv_nxt`/
     /// `snd_nxt` advance is committed only *after* serialization succeeds (the no-desync
-    /// invariant).
+    /// invariant). The advertised window is always our current honest receive capacity.
     #[allow(clippy::too_many_arguments)]
     fn emit(
         &self,
@@ -401,7 +405,6 @@ impl TcpConn {
         our_ip: [u8; 4],
         our_mac: [u8; 6],
         local_port: u16,
-        window: u16,
         flags: u8,
         seq: u32,
         ack: u32,
@@ -414,7 +417,7 @@ impl TcpConn {
             seq,
             ack,
             flags,
-            window,
+            self.adv_window(),
             our_ip,
             self.remote_ip,
             payload,
@@ -481,13 +484,13 @@ impl TcpConn {
     /// retransmitted (so its ACK isn't RTT-sampled) and back the RTO off by doubling, capped at
     /// [`RTO_MAX_TICKS`] (RFC 6298 §5.5). Go-Back-N for data — rewind the send buffer so the whole
     /// in-flight window re-sends over subsequent passes. Returns the frame, or `None`.
-    fn retransmit(&mut self, out: &mut [u8], our_ip: [u8; 4], our_mac: [u8; 6], local_port: u16, window: u16, now: u64) -> Option<usize> {
+    fn retransmit(&mut self, out: &mut [u8], our_ip: [u8; 4], our_mac: [u8; 6], local_port: u16, now: u64) -> Option<usize> {
         self.retries = self.retries.saturating_add(1);
         self.un_retx = true;
         self.rto = ((self.rto as u64 * 2).min(RTO_MAX_TICKS)) as u32;
         self.rto_deadline = now + self.rto as u64;
         if !self.syn_acked {
-            return self.emit(out, our_ip, our_mac, local_port, window, SYN | ACK, self.iss, self.rcv_nxt, &[]);
+            return self.emit(out, our_ip, our_mac, local_port, SYN | ACK, self.iss, self.rcv_nxt, &[]);
         }
         if self.snd.len > 0 {
             self.snd.rewind();
@@ -495,12 +498,12 @@ impl TcpConn {
             // Resend [una, una+MSS): already within the peer's window when first sent.
             let n = self.snd.peek_seg(u16::MAX, &mut tmp);
             let seq = self.snd.una;
-            let frame = self.emit(out, our_ip, our_mac, local_port, window, PSH | ACK, seq, self.rcv_nxt, &tmp[..n])?;
+            let frame = self.emit(out, our_ip, our_mac, local_port, PSH | ACK, seq, self.rcv_nxt, &tmp[..n])?;
             self.snd.mark_sent(n);
             return Some(frame);
         }
         if self.fin_sent {
-            return self.emit(out, our_ip, our_mac, local_port, window, FIN | ACK, self.fin_seq, self.rcv_nxt, &[]);
+            return self.emit(out, our_ip, our_mac, local_port, FIN | ACK, self.fin_seq, self.rcv_nxt, &[]);
         }
         None
     }
@@ -509,12 +512,12 @@ impl TcpConn {
     /// `snd_wnd`), or — once all data is sent and the peer has closed — our FIN. Arms the RTO. One
     /// segment per call (the driver transmits one frame per event); the send buffer drains across
     /// successive `handle`/`tick` calls. Returns `None` when nothing is sendable now.
-    fn send_next(&mut self, out: &mut [u8], our_ip: [u8; 4], our_mac: [u8; 6], local_port: u16, window: u16, now: u64) -> Option<usize> {
+    fn send_next(&mut self, out: &mut [u8], our_ip: [u8; 4], our_mac: [u8; 6], local_port: u16, now: u64) -> Option<usize> {
         let mut tmp = [0u8; MSS];
         let n = self.snd.peek_seg(self.snd_wnd, &mut tmp);
         if n > 0 {
             let seq = self.snd.nxt;
-            let frame = self.emit(out, our_ip, our_mac, local_port, window, PSH | ACK, seq, self.rcv_nxt, &tmp[..n])?;
+            let frame = self.emit(out, our_ip, our_mac, local_port, PSH | ACK, seq, self.rcv_nxt, &tmp[..n])?;
             self.snd.mark_sent(n);
             self.arm_rto(now);
             return Some(frame);
@@ -523,7 +526,7 @@ impl TcpConn {
             // The FIN consumes one sequence number after the last echoed byte. Sent even if the
             // peer's window is momentarily zero (it is one byte, and withholding it would stall the
             // close; honest zero-window probing via a persist timer is a separate item).
-            let frame = self.emit(out, our_ip, our_mac, local_port, window, FIN | ACK, self.fin_seq, self.rcv_nxt, &[])?;
+            let frame = self.emit(out, our_ip, our_mac, local_port, FIN | ACK, self.fin_seq, self.rcv_nxt, &[])?;
             self.fin_sent = true;
             self.state = ConnState::LastAck;
             self.arm_rto(now);
@@ -542,7 +545,6 @@ impl TcpConn {
         our_ip: [u8; 4],
         our_mac: [u8; 6],
         local_port: u16,
-        window: u16,
         now: u64,
         flags: u8,
         their_seq: u32,
@@ -558,14 +560,14 @@ impl TcpConn {
                     self.syn_acked = true;
                     self.note_ack(now); // sample the SYN-ACK RTT; nothing else is in flight yet
                     self.state = ConnState::Established;
-                    let resp = self.on_established(out, our_ip, our_mac, local_port, window, now, flags, their_seq, their_ack, payload);
+                    let resp = self.on_established(out, our_ip, our_mac, local_port, now, flags, their_seq, their_ack, payload);
                     (resp, false)
                 } else {
                     (None, false)
                 }
             }
             ConnState::Established => {
-                let resp = self.on_established(out, our_ip, our_mac, local_port, window, now, flags, their_seq, their_ack, payload);
+                let resp = self.on_established(out, our_ip, our_mac, local_port, now, flags, their_seq, their_ack, payload);
                 (resp, false)
             }
             ConnState::LastAck => {
@@ -594,13 +596,16 @@ impl TcpConn {
         our_ip: [u8; 4],
         our_mac: [u8; 6],
         local_port: u16,
-        window: u16,
         now: u64,
         flags: u8,
         their_seq: u32,
         their_ack: u32,
         payload: &[u8],
     ) -> Option<usize> {
+        // Our advertised window before this segment: if it was 0 (send buffer full) the peer has
+        // paused, and a later ACK that frees space must trigger a window-update or we deadlock.
+        let window_was_closed = self.adv_window() == 0;
+
         // (1) Acknowledgement: free echo data the peer has now received.
         if flags & ACK != 0 && self.snd.ack(their_ack) > 0 {
             self.note_ack(now);
@@ -639,13 +644,17 @@ impl TcpConn {
             self.fin_seq = self.snd.end_seq();
         }
 
-        // (5) Respond: a queued data/FIN segment (whose ACK field covers rcv_nxt) takes
-        // precedence; otherwise a (dup-)ACK if the inbound carried sequence space; else nothing.
-        if let Some(n) = self.send_next(out, our_ip, our_mac, local_port, window, now) {
+        // (5) Respond: a queued data/FIN segment (whose ACK field carries the now-current window)
+        // takes precedence; otherwise a (dup-)ACK if the inbound carried sequence space; otherwise
+        // a WINDOW UPDATE if our window just reopened (was 0, now > 0) so a paused peer resumes —
+        // without this, advertising a zero window deadlocks. Else nothing.
+        if let Some(n) = self.send_next(out, our_ip, our_mac, local_port, now) {
             return Some(n);
         }
-        if !payload.is_empty() || has_fin {
-            return self.emit(out, our_ip, our_mac, local_port, window, ACK, self.snd.nxt, self.rcv_nxt, &[]);
+        let owe_ack = !payload.is_empty() || has_fin;
+        let window_reopened = window_was_closed && self.adv_window() > 0;
+        if owe_ack || window_reopened {
+            return self.emit(out, our_ip, our_mac, local_port, ACK, self.snd.nxt, self.rcv_nxt, &[]);
         }
         None
     }
@@ -720,7 +729,6 @@ pub const MAX_CONNS: usize = 4;
 /// queued echo data), no options, lenient receiver. No allocation (fixed tables).
 pub struct TcpListener {
     listen_port: u16,
-    window: u16,
     isn: u32, // ramps per accepted connection to avoid TIME_WAIT collisions
     conns: [Option<TcpConn>; MAX_CONNS],
 }
@@ -729,7 +737,6 @@ impl TcpListener {
     pub fn new(listen_port: u16) -> Self {
         Self {
             listen_port,
-            window: SND_BUF as u16, // advertised receive window = our echo send-buffer capacity
             isn: 0x0001_0000,
             conns: core::array::from_fn(|_| None),
         }
@@ -746,7 +753,7 @@ impl TcpListener {
     /// the next queued echo segment as the peer's window allows, returning that frame. Driving
     /// this every main-loop pass drains each send buffer across passes (one frame per pass).
     pub fn tick(&mut self, now: u64, our_ip: [u8; 4], our_mac: [u8; 6], out: &mut [u8]) -> Option<usize> {
-        let (local_port, window) = (self.listen_port, self.window);
+        let local_port = self.listen_port;
         for slot in self.conns.iter_mut() {
             let conn = match slot {
                 Some(c) => c,
@@ -757,9 +764,9 @@ impl TcpListener {
                     *slot = None; // give up — frees half-open or stuck connections
                     continue;
                 }
-                return conn.retransmit(out, our_ip, our_mac, local_port, window, now);
+                return conn.retransmit(out, our_ip, our_mac, local_port, now);
             }
-            if let Some(n) = conn.send_next(out, our_ip, our_mac, local_port, window, now) {
+            if let Some(n) = conn.send_next(out, our_ip, our_mac, local_port, now) {
                 return Some(n);
             }
         }
@@ -806,10 +813,10 @@ impl TcpListener {
         }
 
         if let Some(idx) = existing {
-            let (local_port, window) = (self.listen_port, self.window);
+            let local_port = self.listen_port;
             let conn = self.conns[idx].as_mut().unwrap();
             let (resp, done) =
-                conn.on_segment(out, our_ip, our_mac, local_port, window, now, flags, their_seq, their_ack, their_wnd, payload);
+                conn.on_segment(out, our_ip, our_mac, local_port, now, flags, their_seq, their_ack, their_wnd, payload);
             if done {
                 self.conns[idx] = None;
             }
@@ -824,10 +831,10 @@ impl TcpListener {
                 self.isn, their_seq.wrapping_add(1), // SYN consumes one sequence number
             );
             conn.snd_wnd = their_wnd; // the peer's initial advertised window
-            let (local_port, window) = (self.listen_port, self.window);
+            let local_port = self.listen_port;
             // Emit the SYN-ACK first; only commit the slot once it serialized (no-desync). The
             // SYN-ACK occupies `iss`; arming the RTO covers the half-open retransmission timeout.
-            let n = conn.emit(out, our_ip, our_mac, local_port, window, SYN | ACK, conn.iss, conn.rcv_nxt, &[])?;
+            let n = conn.emit(out, our_ip, our_mac, local_port, SYN | ACK, conn.iss, conn.rcv_nxt, &[])?;
             conn.arm_rto(now);
             self.conns[slot] = Some(conn);
             Some(n)
@@ -1278,6 +1285,7 @@ mod tests {
         flags: u8,
         seq: u32,
         ack: u32,
+        window: u16,
         payload: Vec<u8>,
     }
 
@@ -1292,6 +1300,7 @@ mod tests {
             flags: seg[13],
             seq: u32::from_be_bytes([seg[4], seg[5], seg[6], seg[7]]),
             ack: u32::from_be_bytes([seg[8], seg[9], seg[10], seg[11]]),
+            window: u16::from_be_bytes([seg[14], seg[15]]),
             payload: seg[doff..].to_vec(),
         }
     }
@@ -1480,6 +1489,53 @@ mod tests {
         assert_eq!(l.active_conns(), 0, "a silent zero-window peer must be reaped, not leak a slot");
     }
 
+    #[test]
+    fn listener_advertises_honest_window() {
+        // The advertised window shrinks as the echo send buffer fills with unacked data.
+        let c_isn = 0x100;
+        let (mut l, s_isn) = handshake(c_isn);
+        let mut inb = [0u8; 1600];
+        let mut out = [0u8; 1600];
+        let chunk = [0x5a_u8; 512];
+        let n = lframe(7, c_isn + 1, s_isn + 1, PSH | ACK, 60000, &chunk, &mut inb);
+        let e1 = feed(&mut l, &inb[..n], 1000, &mut out).unwrap();
+        assert_eq!(e1.window, (SND_BUF - 512) as u16); // honest: free space after buffering 512
+        let n = lframe(7, c_isn + 1 + 512, s_isn + 1, PSH | ACK, 60000, &chunk, &mut inb);
+        let e2 = feed(&mut l, &inb[..n], 1000, &mut out).unwrap();
+        assert_eq!(e2.window, (SND_BUF - 1024) as u16);
+    }
+
+    #[test]
+    fn listener_window_update_on_reopen() {
+        // Fill the echo send buffer (advertise window 0), then ACK it: the listener must emit a
+        // WINDOW-UPDATE ACK so a peer that paused on the zero window resumes. Without it, deadlock.
+        let c_isn = 0x100;
+        let (mut l, s_isn) = handshake(c_isn);
+        let mut inb = [0u8; 1600];
+        let mut out = [0u8; 1600];
+        let chunk = [0x5a_u8; 512];
+        let mut cseq = c_isn + 1;
+        let mut last = None;
+        for _ in 0..8 {
+            let n = lframe(7, cseq, s_isn + 1, PSH | ACK, 60000, &chunk, &mut inb);
+            let e = feed(&mut l, &inb[..n], 1000, &mut out).unwrap();
+            cseq += 512;
+            let w = e.window;
+            last = Some(e);
+            if w == 0 {
+                break;
+            }
+        }
+        assert_eq!(last.unwrap().window, 0, "send buffer fills -> advertised window reaches 0");
+        let buffered = SND_BUF as u32; // 2048 bytes echoed and unacked
+        // Peer (paused on the zero window) now ACKs everything echoed; nothing else is pending.
+        let n = lframe(7, c_isn + 1 + buffered, s_isn + 1 + buffered, ACK, 60000, &[], &mut inb);
+        let upd = feed(&mut l, &inb[..n], 1001, &mut out).unwrap();
+        assert!(upd.payload.is_empty(), "window-update is a pure ACK");
+        assert!(upd.window > 0, "window reopened");
+        assert_eq!(upd.ack, c_isn + 1 + buffered, "acks the data we received");
+    }
+
     // --- TcpClient streaming/linger receive ---
 
     /// Build the Ethernet/IPv4/TCP frame a peer would send to `c` (src = remote, dst = us). The
@@ -1597,7 +1653,6 @@ mod tests {
         assert_eq!(r.free(), SND_BUF);
         assert_eq!(r.push(b"hello"), 5);
         assert_eq!((r.free(), r.len, r.flight_len()), (SND_BUF - 5, 5, 0));
-        assert!(!r.in_flight());
         assert!(!r.fully_sent()); // 5 bytes queued, none sent
         assert_eq!(r.end_seq(), 105);
     }
@@ -1630,7 +1685,6 @@ mod tests {
         assert_eq!(n1, MSS); // 512
         r.mark_sent(n1);
         assert_eq!((r.nxt, r.flight_len()), (1512, 512));
-        assert!(r.in_flight());
         let n2 = r.peek_seg(700, &mut out); // remaining window 700-512 = 188
         assert_eq!(n2, 188);
         r.mark_sent(n2);
@@ -1652,7 +1706,7 @@ mod tests {
         assert_eq!(r.ack(1200), 0); // old
         assert_eq!(r.ack(1601), 300); // ack past data (e.g. FIN ack) clamps to the 300 data bytes
         assert_eq!((r.una, r.len), (1600, 0));
-        assert!(!r.in_flight());
+        assert_eq!(r.flight_len(), 0);
     }
 
     #[test]

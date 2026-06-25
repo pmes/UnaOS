@@ -139,7 +139,7 @@ def tcp(sport, dport, seq, ack, flags, window, src_ip, dst_ip, payload):
 
 def recv_tcp(s, my_port, timeout=8):
     """Wait for a TCP segment from the guest addressed to our client port. Returns
-    (flags, seq, ack, payload, ip_ck_ok, tcp_ck_ok) or None on timeout. (The socket's own
+    (flags, seq, ack, payload, ip_ck_ok, tcp_ck_ok, window) or None on timeout. (The socket's own
     timeout must be >= `timeout`, else recv_frame raises first and this returns early.)"""
     deadline = time.time() + timeout
     while time.time() < deadline:
@@ -162,9 +162,10 @@ def recv_tcp(s, my_port, timeout=8):
         ack = struct.unpack(">I", seg[8:12])[0]
         doff = (seg[12] >> 4) * 4
         flags = seg[13]
+        window = struct.unpack(">H", seg[14:16])[0]
         payload = seg[doff:]
         tcp_ck_ok = tcp_checksum(src_ip, dst_ip, seg) == 0
-        return (flags, seq, ack, payload, ip_ck_ok, tcp_ck_ok)
+        return (flags, seq, ack, payload, ip_ck_ok, tcp_ck_ok, window)
     return None
 
 
@@ -759,6 +760,63 @@ def test_tcp_pipeline(s, guest_mac):
     return True
 
 
+def test_tcp_flow_control(s, guest_mac):
+    """Honest flow control + window-update: send 512-byte segments that the guest echoes but we do
+    NOT ack, so its echo send buffer (== advertised receive window) fills and it advertises window
+    0. Then ACK it all: the guest must emit a WINDOW-UPDATE ACK (window > 0) so a peer that paused
+    on the zero window would resume — without it a zero window deadlocks."""
+    print("--- TCP honest window + window-update ---")
+    MASK = 0xFFFFFFFF
+    cport, c_isn = 40073, 0xD000
+
+    def cs(seq, ack, flags, payload=b""):
+        send_frame(s, eth(guest_mac, MY_MAC, 0x0800,
+                          ipv4(MY_IP, GUEST_IP, 6, tcp(cport, 7, seq, ack, flags, 60000, MY_IP, GUEST_IP, payload))))
+
+    cs(c_isn, 0, SYN)
+    sa = recv_tcp(s, cport)
+    if sa is None or (sa[0] & (SYN | ACK)) != (SYN | ACK):
+        print("FAIL: no SYN-ACK for flow-control test (%s)" % (sa,)); return False
+    s_isn = sa[1]
+    cs(c_isn + 1, s_isn + 1, ACK)
+
+    # Fill the guest's receive window: 512-byte chunks it echoes but we never ACK, so its echo
+    # send buffer fills and the advertised window (carried in each echo) drops to 0.
+    chunk = b"Z" * 512
+    cseq = (c_isn + 1) & MASK
+    adv = None
+    for _ in range(8):
+        cs(cseq, s_isn + 1, PSH | ACK, chunk)
+        cseq = (cseq + 512) & MASK
+        r = recv_tcp(s, cport)  # the echo (or, once full, a dup-ACK) carries the advertised window
+        if r is None:
+            print("FAIL: no response while filling the window"); return False
+        adv = r[6]
+        if adv == 0:
+            break
+    if adv != 0:
+        print("FAIL: advertised window never reached 0 (last=%s)" % adv); return False
+    print("-> filled the guest's receive window to 0 (echo buffer full)")
+
+    # The guest accepted SND_BUF == 2048 bytes of echoes; still paused, ACK them all.
+    buffered = 2048
+    acked = (s_isn + 1 + buffered) & MASK
+    cseq2 = (c_isn + 1 + buffered) & MASK
+    cs(cseq2, acked, ACK)
+    upd = recv_tcp(s, cport)
+    if upd is None or not (upd[0] & ACK) or upd[3] or upd[6] == 0:
+        print("FAIL: no window-update ACK after reopen (%s)" % (upd,)); return False
+    if upd[2] != cseq2:
+        print("FAIL: window-update acks %d, expected %d" % (upd[2], cseq2)); return False
+    print("<- window-update ACK (window=%d, no payload) -> a paused peer would resume   [TCP WINDOW-UPDATE OK]" % upd[6])
+
+    cs(cseq2, acked, FIN | ACK)
+    if recv_fin(s, cport) is None:
+        print("FAIL: no FIN-ACK after flow-control test"); return False
+    cs((cseq2 + 1) & MASK, (acked + 1) & MASK, ACK)
+    return True
+
+
 def main():
     s = None
     for _ in range(80):
@@ -902,6 +960,10 @@ def main():
 
     # --- TCP pipelining (burst of segments, multiple echoes in flight at once) ---
     if not test_tcp_pipeline(s, guest_mac):
+        return 1
+
+    # --- TCP honest window + window-update (fill the window to 0, then reopen) ---
+    if not test_tcp_flow_control(s, guest_mac):
         return 1
 
     print("ALL CHECKS PASSED")
