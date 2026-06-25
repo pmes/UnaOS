@@ -111,10 +111,10 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
                     }
                 } else if c == 8 || c == 0x7F {
                     console.current_input.pop();
-                    console.draw(&mut pal);
+                    console.draw_input_line(&mut pal);
                 } else if c >= 32 && c <= 126 {
                     console.current_input.push(c as char);
-                    console.draw(&mut pal);
+                    console.draw_input_line(&mut pal);
                 }
             }
             unaos_kernel::pal::Event::Mouse { x, y } => {
