@@ -200,6 +200,27 @@ build_both() {
     build_kernel_aarch64
 }
 
+# --- Real-hardware boot media (build + package an ESP, no QEMU) ---
+
+# x86_64 ESP for the MacBook (UEFI). Copy the packaged directory's contents onto a FAT32 USB
+# stick (so it has /EFI/BOOT/BOOTX64.EFI and /kernel.elf), then boot the Mac holding Option.
+esp_x86() {
+    echo -e "${COLOR_CYAN}⚡ Building x86_64 kernel + bootloader and packaging the ESP (no QEMU)...${COLOR_RESET}"
+    cd "$WORKSPACE_DIR/builder"
+    UNAOS_PACKAGE_ONLY=1 cargo +nightly run --release
+    cd "$WORKSPACE_DIR"
+    echo -e "${COLOR_GREEN}✅ x86 ESP: ${WORKSPACE_DIR}/target/x86_64_esp/${COLOR_RESET}"
+    echo -e "   Copy its contents to a FAT32 USB root, then boot the Mac holding ⌥ Option → 'EFI Boot'."
+}
+
+# aarch64 ESP for the Raspberry Pi 4 (UEFI / Path A). Copy onto a FAT32 SD card alongside the
+# Tianocore RPi4 EDK2 firmware (RPI_EFI.fd + the Pi firmware blobs).
+esp_arm() {
+    prepare_aarch64
+    echo -e "${COLOR_GREEN}✅ aarch64 ESP: ${ESP_DIR_ARM}${COLOR_RESET}"
+    echo -e "   Copy its contents to a FAT32 SD card together with the RPi4 EDK2 UEFI firmware."
+}
+
 clean_all() {
     echo -e "${COLOR_YELLOW}⚡ Purging build artifacts...${COLOR_RESET}"
     cd "$WORKSPACE_DIR"
@@ -287,6 +308,12 @@ case "${1:-}" in
     build)
         build_both
         ;;
+    esp-x86|esp_x86)
+        esp_x86
+        ;;
+    esp-arm|esp_arm)
+        esp_arm
+        ;;
     clean)
         clean_all
         ;;
@@ -297,7 +324,7 @@ case "${1:-}" in
         ;;
     *)
         echo -e "${COLOR_RED}Unknown command: $1${COLOR_RESET}"
-        echo "Usage: ./arroyo [x86|arm|test [secs]|test-arm [secs]|check|build|clean]"
+        echo "Usage: ./arroyo [x86|arm|test [secs]|test-arm [secs]|check|build|esp-x86|esp-arm|clean]"
         exit 1
         ;;
 esac
