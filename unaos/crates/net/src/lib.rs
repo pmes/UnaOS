@@ -1,4 +1,7 @@
-#![no_std]
+// `no_std` for every real (cross-compiled) build; `std` is linked only under `cargo test` so
+// the host test harness (e.g. the RFC 6298 estimator unit tests in `tcp`) can run. The crate
+// itself uses only `core`, so this changes nothing about the kernel build.
+#![cfg_attr(not(test), no_std)]
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2026 The Architect & Una
 //

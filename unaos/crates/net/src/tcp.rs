@@ -20,8 +20,9 @@
 //! Scope (deliberately small): the listener accepts up to [`MAX_CONNS`] simultaneous
 //! connections, demultiplexed by the remote `(IP, port)` into a fixed table of [`TcpConn`]
 //! slots (a free slot is `None`; there is no `Listen` state). Per connection: passive open,
-//! in-order data only, no retransmission (relies on the peer over a reliable local link), no
-//! window scaling/options, lenient receiver (incoming TCP checksum not verified; outgoing is).
+//! in-order delivery with one buffered out-of-order extent for reassembly, a one-segment send
+//! window with retransmission on an adaptive RTO (RFC 6298 + Karn's algorithm), no window
+//! scaling/options, lenient receiver (incoming TCP checksum not verified; outgoing is).
 //! Per-connection states: SynRcvd -> Established -> LastAck, then the slot is freed. Each
 //! received segment produces at most one response segment (the driver sends one reply per RX
 //! frame), which suffices because the ACK/echo/FIN can be folded into a single segment.
@@ -155,19 +156,53 @@ enum ConnState {
 /// Largest payload a connection will accept / echo / buffer for retransmission. Also the
 /// advertised receive window, so a conforming peer never sends more than fits the buffer.
 const RETX_CAP: usize = 512;
-/// Base retransmission timeout, in monotonic ticks. The APIC-timer tick is ~1 ms on QEMU
-/// (empirically), so this is ~200 ms — conservative enough not to fire before a normal ACK on
-/// any reasonable link, yet quick to recover. Doubled per retry (capped) for exponential
-/// backoff. The absolute rate is uncalibrated, so these are coarse, not exact, durations.
-const RTO_BASE_TICKS: u64 = 200;
-/// Upper bound on a single backoff interval (~2 s).
+// Adaptive retransmission timer (RFC 6298), in monotonic ticks. The APIC-timer tick is ~1 ms on
+// QEMU (empirically), so these durations are coarse, not exact. Each connection measures the RTT
+// of cleanly-acknowledged segments and maintains a smoothed estimate (SRTT) and its variation
+// (RTTVAR), deriving the RTO as `SRTT + max(G, K*RTTVAR)` (§2). Karn's algorithm excludes
+// retransmitted segments from RTT sampling and backs the RTO off (doubling) on each timeout.
+//
+/// Initial RTO before any RTT sample exists. RFC 6298 §2.1 suggests 1 s; we use ~200 ms — the
+/// previous fixed base — which is conservative enough not to fire before a normal ACK on this
+/// link yet recovers quickly (it sets the half-open / first-retransmit timing).
+const RTO_INIT_TICKS: u64 = 200;
+/// Lower bound on the computed RTO (~200 ms, matching Linux's `TCP_RTO_MIN`). On the
+/// sub-millisecond QEMU link the estimate floors here, so observed timing matches the old fixed
+/// base and we are never *more* aggressive than before; adaptation only raises the RTO above the
+/// floor on a slower or higher-variance link.
+const RTO_MIN_TICKS: u64 = 200;
+/// Upper bound on the RTO / any single backoff interval (~2 s).
 const RTO_MAX_TICKS: u64 = 2000;
-/// Cap on the backoff left-shift so it can't overflow.
-const RTO_BACKOFF_SHIFT_CAP: u8 = 5;
+/// Clock granularity G (one tick): the floor of the variance term in the RTO formula, so a
+/// near-zero measured RTT still yields a non-zero margin before the [`RTO_MIN_TICKS`] clamp.
+const RTO_CLOCK_GRANULARITY: u32 = 1;
 /// Give up (free the connection) after this many retransmissions — this also bounds a half-open
 /// (SynRcvd) connection whose handshake ACK never arrives, so it can't wedge a slot forever.
 /// With the backoff above this is ~7 s to fully abandon a dead/half-open connection.
 const MAX_RETRIES: u8 = 6;
+
+/// One step of the RFC 6298 §2 RTT estimator. Given the current smoothed estimate and whether it
+/// already holds a measurement (`valid`), fold in a new RTT sample `r` (ticks) and return the
+/// updated `(srtt, rttvar, rto)` — the RTO already clamped to `[RTO_MIN_TICKS, RTO_MAX_TICKS]`.
+/// Pure (no `self`) so it is unit-testable in isolation. Uses alpha = 1/8, beta = 1/4, K = 4 via
+/// integer shifts; all intermediates stay small (each of `srtt`/`rttvar` is bounded by the
+/// `RTO_MAX_TICKS` cap on `r`), so the `u32` arithmetic cannot overflow.
+fn rfc6298_step(srtt: u32, rttvar: u32, valid: bool, r: u32) -> (u32, u32, u32) {
+    let (srtt, rttvar) = if !valid {
+        // First measurement (§2 (2.2)): SRTT = R, RTTVAR = R/2.
+        (r, r / 2)
+    } else {
+        // Subsequent (§2 (2.3)): RTTVAR uses the OLD SRTT, so update RTTVAR *before* SRTT.
+        let delta = if srtt > r { srtt - r } else { r - srtt };
+        let rttvar = (rttvar * 3 + delta) / 4; // (1 - beta)*RTTVAR + beta*|SRTT - R|
+        let srtt = (srtt * 7 + r) / 8; //          (1 - alpha)*SRTT + alpha*R
+        (srtt, rttvar)
+    };
+    // RTO = SRTT + max(G, K*RTTVAR), clamped (§2 (2.4)).
+    let variance = (4 * rttvar).max(RTO_CLOCK_GRANULARITY);
+    let rto = (srtt.saturating_add(variance) as u64).clamp(RTO_MIN_TICKS, RTO_MAX_TICKS) as u32;
+    (srtt, rttvar, rto)
+}
 
 /// One accepted connection's control block. The listener holds a small fixed table of these
 /// and demultiplexes inbound segments to them by the remote `(IP, port)` 2-tuple (the local
@@ -187,8 +222,16 @@ struct TcpConn {
     un_flags: u8,     // its flags (SYN-ACK / data echo / FIN)
     un_paylen: usize, // payload bytes buffered in un_buf
     un_buf: [u8; RETX_CAP],
+    un_sent_at: u64, // tick the outstanding segment was first sent (for RTT sampling)
+    un_retx: bool,   // it was retransmitted — Karn's algorithm excludes it from RTT sampling
     rto_deadline: u64, // tick at which to retransmit if still unacked
     retries: u8,
+    // Adaptive RTO state (RFC 6298), in ticks. `rto` carries over between segments and only
+    // collapses back toward the floor when a clean (non-retransmitted) RTT sample arrives.
+    srtt: u32,       // smoothed round-trip time
+    rttvar: u32,     // round-trip time variation
+    rto: u32,        // current retransmission timeout
+    rtt_valid: bool, // whether srtt/rttvar hold a real measurement yet
     // Reassembly of a single out-of-order segment (one extent ahead of rcv_nxt). Buffered on
     // arrival and delivered (echoed) once the gap fills and the send window is free.
     ooo: bool,
@@ -203,7 +246,9 @@ impl TcpConn {
         Self {
             state, remote_ip, remote_mac, remote_port, snd_nxt, rcv_nxt,
             unacked: false, un_seq: 0, un_flags: 0, un_paylen: 0, un_buf: [0; RETX_CAP],
+            un_sent_at: 0, un_retx: false,
             rto_deadline: 0, retries: 0,
+            srtt: 0, rttvar: 0, rto: RTO_INIT_TICKS as u32, rtt_valid: false,
             ooo: false, ooo_seq: 0, ooo_len: 0, ooo_fin: false, ooo_buf: [0; RETX_CAP],
         }
     }
@@ -247,7 +292,9 @@ impl TcpConn {
         Some(14 + 20 + tcp_len)
     }
 
-    /// Record a just-sent seq-consuming segment as the outstanding one and arm its RTO timer.
+    /// Record a just-sent seq-consuming segment as the outstanding one and arm its RTO timer at
+    /// the connection's current (adaptive) `rto`. Stamps the send time and clears the
+    /// retransmitted flag so a clean ACK can later sample this segment's RTT (Karn's algorithm).
     fn arm(&mut self, now: u64, seq: u32, flags: u8, payload: &[u8]) {
         self.un_seq = seq;
         self.un_flags = flags;
@@ -256,15 +303,33 @@ impl TcpConn {
         self.un_paylen = n;
         self.unacked = true;
         self.retries = 0;
-        self.rto_deadline = now + RTO_BASE_TICKS;
+        self.un_sent_at = now;
+        self.un_retx = false;
+        self.rto_deadline = now + self.rto as u64;
     }
 
-    /// Re-send the outstanding segment on RTO expiry, with exponential backoff. Returns the
-    /// frame length, or `None` if it could not be serialized.
+    /// Fold one RTT measurement `r` (ticks) into this connection's smoothed estimate and
+    /// recompute the RTO (RFC 6298 §2). Called only for a clean — non-retransmitted — ACK.
+    fn update_rtt(&mut self, r: u64) {
+        // Coarse tick clock; bound the sample so a pathologically delayed ACK can't blow up the
+        // estimate (and keeps the estimator's u32 arithmetic in range).
+        let r = r.min(RTO_MAX_TICKS) as u32;
+        let (srtt, rttvar, rto) = rfc6298_step(self.srtt, self.rttvar, self.rtt_valid, r);
+        self.srtt = srtt;
+        self.rttvar = rttvar;
+        self.rto = rto;
+        self.rtt_valid = true;
+    }
+
+    /// Re-send the outstanding segment on RTO expiry. Applies Karn's algorithm: marks the
+    /// segment as retransmitted (so its eventual ACK won't be sampled as RTT) and backs the RTO
+    /// off by doubling, capped at [`RTO_MAX_TICKS`] (RFC 6298 §5.5). Returns the frame length, or
+    /// `None` if it could not be serialized.
     fn retransmit(&mut self, out: &mut [u8], our_ip: [u8; 4], our_mac: [u8; 6], local_port: u16, window: u16, now: u64) -> Option<usize> {
         self.retries = self.retries.saturating_add(1);
-        let backoff = (RTO_BASE_TICKS << self.retries.min(RTO_BACKOFF_SHIFT_CAP)).min(RTO_MAX_TICKS);
-        self.rto_deadline = now + backoff;
+        self.un_retx = true;
+        self.rto = ((self.rto as u64 * 2).min(RTO_MAX_TICKS)) as u32;
+        self.rto_deadline = now + self.rto as u64;
         let (flags, seq, ack, paylen) = (self.un_flags, self.un_seq, self.rcv_nxt, self.un_paylen);
         self.emit(out, our_ip, our_mac, local_port, window, flags, seq, ack, &self.un_buf[..paylen])
     }
@@ -287,7 +352,12 @@ impl TcpConn {
         payload: &[u8],
     ) -> (Option<usize>, bool) {
         // Cumulative ACK: if the peer acknowledges our outstanding segment, stop retransmitting.
+        // Karn's algorithm: only the ACK of a segment that was *not* retransmitted gives an
+        // unambiguous RTT sample (otherwise we can't tell which transmission it acknowledges).
         if flags & ACK != 0 && self.unacked && their_ack == self.snd_nxt {
+            if !self.un_retx {
+                self.update_rtt(now.saturating_sub(self.un_sent_at));
+            }
             self.unacked = false;
         }
         match self.state {
@@ -811,5 +881,110 @@ impl TcpClient {
 
             ClientState::Closed | ClientState::Done => None,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! Host-side unit tests for the adaptive RTO machinery. These run under `cargo test -p net`
+    //! (the crate is `no_std` only for real cross builds — see `lib.rs`). They are deterministic:
+    //! the estimator is pure integer arithmetic and the backoff is a fixed doubling sequence.
+    use super::*;
+
+    #[test]
+    fn rfc6298_first_sample() {
+        // First measurement: SRTT = R, RTTVAR = R/2, RTO = SRTT + 4*RTTVAR (above the floor).
+        assert_eq!(rfc6298_step(0, 0, false, 100), (100, 50, 300));
+    }
+
+    #[test]
+    fn rfc6298_subsequent_stable() {
+        // A repeat of the same RTT: RTTVAR shrinks (delta 0), SRTT holds, RTO eases toward floor.
+        assert_eq!(rfc6298_step(100, 50, true, 100), (100, 37, 248));
+    }
+
+    #[test]
+    fn rfc6298_large_jump_raises_rto() {
+        // A sudden much larger RTT inflates RTTVAR, so the RTO jumps well above the floor.
+        let (srtt, rttvar, rto) = rfc6298_step(100, 50, true, 1000);
+        assert_eq!((srtt, rttvar), (212, 262));
+        assert_eq!(rto, 212 + 4 * 262); // 1260
+        assert!(rto > RTO_MIN_TICKS as u32 && rto < RTO_MAX_TICKS as u32);
+    }
+
+    #[test]
+    fn rfc6298_floors_at_min() {
+        // Near-zero RTT (sub-tick link): the clock-granularity term keeps the margin non-zero,
+        // and the RTO clamps up to the floor — never more aggressive than the fixed base.
+        assert_eq!(rfc6298_step(0, 0, false, 0).2, RTO_MIN_TICKS as u32);
+        assert_eq!(rfc6298_step(0, 0, false, 5).2, RTO_MIN_TICKS as u32);
+    }
+
+    #[test]
+    fn rfc6298_clamps_at_max() {
+        // A pathologically large/variable RTT clamps at the cap, not unbounded.
+        assert_eq!(rfc6298_step(2000, 2000, true, 2000).2, RTO_MAX_TICKS as u32);
+    }
+
+    #[test]
+    fn rfc6298_steady_low_rtt_converges_to_floor() {
+        // Feeding a steady small RTT drives the RTO down to the floor and holds it there.
+        let (mut srtt, mut rttvar, mut valid, mut rto) = (0u32, 0u32, false, 0u32);
+        for _ in 0..20 {
+            let s = rfc6298_step(srtt, rttvar, valid, 50);
+            srtt = s.0;
+            rttvar = s.1;
+            rto = s.2;
+            valid = true;
+        }
+        assert_eq!(rto, RTO_MIN_TICKS as u32);
+    }
+
+    fn test_conn() -> TcpConn {
+        TcpConn::new(ConnState::Established, [10, 0, 2, 2], [1, 2, 3, 4, 5, 6], 40000, 0x1000, 0x2000)
+    }
+
+    #[test]
+    fn arm_uses_adaptive_rto_and_clears_retx() {
+        let mut c = test_conn();
+        c.arm(1000, 0x1000, ACK | PSH, b"hi");
+        assert!(c.unacked);
+        assert!(!c.un_retx);
+        assert_eq!(c.un_sent_at, 1000);
+        assert_eq!(c.rto, RTO_INIT_TICKS as u32);
+        assert_eq!(c.rto_deadline, 1000 + RTO_INIT_TICKS);
+    }
+
+    #[test]
+    fn retransmit_applies_karn_backoff() {
+        let mut c = test_conn();
+        let mut out = [0u8; 1500];
+        let (ip, mac) = ([10, 0, 2, 15], [9, 9, 9, 9, 9, 9]);
+        c.arm(1000, 0x1000, ACK | PSH, b"hi");
+        // Exponential backoff by doubling, capped at RTO_MAX_TICKS; each retransmit marks the
+        // segment ambiguous so its ACK won't be RTT-sampled (Karn).
+        let mut now = 1300;
+        for expect in [400u64, 800, 1600, 2000, 2000] {
+            assert!(c.retransmit(&mut out, ip, mac, 7, 512, now).is_some());
+            assert!(c.un_retx);
+            assert_eq!(c.rto as u64, expect);
+            assert_eq!(c.rto_deadline, now + expect);
+            now += expect;
+        }
+        assert_eq!(c.retries, 5);
+    }
+
+    #[test]
+    fn clean_sample_collapses_backed_off_rto() {
+        // After backoff has inflated the RTO, the first clean RTT sample recomputes it from the
+        // measurement (here: small RTT -> back to the floor), proving the timer self-corrects.
+        let mut c = test_conn();
+        let mut out = [0u8; 1500];
+        c.arm(1000, 0x1000, ACK | PSH, b"hi");
+        c.retransmit(&mut out, [10, 0, 2, 15], [9; 6], 7, 512, 1300);
+        assert_eq!(c.rto, 400);
+        c.update_rtt(10); // first real measurement
+        assert!(c.rtt_valid);
+        assert_eq!(c.rto, RTO_MIN_TICKS as u32);
     }
 }
