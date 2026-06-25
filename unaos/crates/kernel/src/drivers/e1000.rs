@@ -151,6 +151,18 @@ const PUMP_ITERS: u32 = 2_000_000;
 /// ARP requests / per-sequence echo requests a blocking `resolve`/`ping` will attempt.
 const RESOLVE_TRIES: u32 = 3;
 
+/// Iterations of `poll()` to pump while a blocking `connect` drives the handshake/echo/close.
+/// Larger than PUMP_ITERS because a connection is several round-trips; bounds how long an
+/// unanswered SYN (no server, no RST) stalls the caller.
+const CONNECT_PUMP_ITERS: u32 = 8_000_000;
+/// First ephemeral local port for outbound connections (incremented per connect, wrapped back
+/// into the ephemeral range).
+const TCP_LOCAL_PORT_BASE: u16 = 49152;
+/// Gateway TCP port the boot self-test connects to (the socket injector serves an echo here).
+const TCP_SELFTEST_PORT: u16 = 7777;
+/// One-shot payload the connect self-test / `connect` (no message) sends after the handshake.
+const TCP_PROBE_PAYLOAD: &[u8] = b"unaos-tcp";
+
 /// Legacy receive descriptor (16 bytes). Written by hardware via DMA, so every
 /// access goes through `read_volatile`/`write_volatile` on whole-struct copies —
 /// the struct is `packed`, so taking a reference to a field would be unaligned UB.
@@ -193,6 +205,12 @@ pub struct E1000 {
     arp_state: ArpStateMachine,
     dhcp: net::dhcp::DhcpClient,
     tcp: net::tcp::TcpEcho,
+    /// The single in-flight outbound TCP connection (active open), if any. Driven by `poll()`
+    /// and the blocking `connect`; `None` when idle.
+    tcp_client: Option<net::tcp::TcpClient>,
+    /// Next ephemeral local port + initial sequence ramp for outbound connections.
+    tcp_local_port: u16,
+    tcp_client_isn: u32,
     /// IP→MAC mappings learned from inbound ARP (and IP frames) — the resolver for outbound.
     arp_cache: ArpCache,
     /// `(source IP, identifier, sequence)` of the most recent ICMP echo reply addressed to
@@ -518,6 +536,65 @@ impl E1000 {
         PingOutcome { resolved: true, mac: Some(mac), sent, received }
     }
 
+    /// Route a received frame to the in-flight outbound connection, if it matches. Reads our
+    /// IP/MAC first so the `&mut self.tcp_client` borrow doesn't conflict.
+    fn client_handle(&mut self, frame: &[u8], out: &mut [u8]) -> Option<usize> {
+        let our_ip = self.arp_state.our_ip();
+        let our_mac = self.mac;
+        self.tcp_client.as_mut()?.handle(frame, our_ip, our_mac, out)
+    }
+
+    /// Blocking active-open TCP connect for the shell / boot self-test: resolve `ip`, send a
+    /// SYN, then pump RX until the connection settles (handshake + optional `payload` echo +
+    /// active close) or the bounded budget is exhausted. Returns an outcome summary.
+    fn connect(&mut self, ip: [u8; 4], port: u16, payload: &[u8]) -> ConnectOutcome {
+        let mac = match self.resolve(ip) {
+            Some(m) => m,
+            None => return ConnectOutcome { resolved: false, established: false, rx_len: 0, closed: false },
+        };
+
+        // Pick an ephemeral local port and a fresh ISN per connection.
+        let local_port = self.tcp_local_port;
+        self.tcp_local_port = self.tcp_local_port.checked_add(1).unwrap_or(TCP_LOCAL_PORT_BASE);
+        if self.tcp_local_port < TCP_LOCAL_PORT_BASE {
+            self.tcp_local_port = TCP_LOCAL_PORT_BASE;
+        }
+        self.tcp_client_isn = self.tcp_client_isn.wrapping_add(0x0001_0000);
+        let isn = self.tcp_client_isn;
+
+        let our_ip = self.arp_state.our_ip();
+        let our_mac = self.mac;
+        let mut client = net::tcp::TcpClient::new(local_port, ip, mac, port, isn, payload);
+        let mut syn = [0u8; 64];
+        let n = match client.open(&mut syn, our_ip, our_mac) {
+            Some(n) => n,
+            None => return ConnectOutcome { resolved: true, established: false, rx_len: 0, closed: false },
+        };
+        self.tcp_client = Some(client);
+        self.transmit(&syn[..n]);
+
+        // Pump RX; poll() routes matching segments to the client (which emits the next segment).
+        for _ in 0..CONNECT_PUMP_ITERS {
+            self.poll();
+            if self.tcp_client.as_ref().map(|c| c.is_done()).unwrap_or(true) {
+                break;
+            }
+            core::hint::spin_loop();
+        }
+
+        let outcome = match self.tcp_client.as_ref() {
+            Some(c) => ConnectOutcome {
+                resolved: true,
+                established: c.established(),
+                rx_len: c.rx_data().len(),
+                closed: c.state() == net::tcp::ClientState::Done,
+            },
+            None => ConnectOutcome { resolved: true, established: false, rx_len: 0, closed: false },
+        };
+        self.tcp_client = None; // free the slot for the next connection
+        outcome
+    }
+
     /// One step of the boot connectivity self-test, called from `service_net` after `poll`.
     /// First ARP-resolves the gateway, then sends ICMP echo requests to it, until either a
     /// reply arrives (success) or the per-phase attempt budget is exhausted. Non-blocking:
@@ -538,6 +615,20 @@ impl E1000 {
                     "[selftest] gateway {} reachable — ICMP echo reply seq={} (outbound path OK)",
                     fmt_ip(&GATEWAY_IP), seq
                 );
+                // Also exercise the outbound TCP path: connect to the gateway's echo port,
+                // send a probe, read the echo, and close. Graceful if nothing listens there.
+                let o = self.connect(GATEWAY_IP, TCP_SELFTEST_PORT, TCP_PROBE_PAYLOAD);
+                if o.established {
+                    serial_println!(
+                        "[selftest] TCP connect to {}:{} OK — established, {} bytes echoed, closed={}",
+                        fmt_ip(&GATEWAY_IP), TCP_SELFTEST_PORT, o.rx_len, o.closed
+                    );
+                } else {
+                    serial_println!(
+                        "[selftest] TCP connect to {}:{} — no server (ok if the backend has none)",
+                        fmt_ip(&GATEWAY_IP), TCP_SELFTEST_PORT
+                    );
+                }
                 self.selftest_armed = false;
                 return;
             }
@@ -681,6 +772,9 @@ impl E1000 {
                     }
                 }
                 out
+            } else if let Some(n) = self.client_handle(frame, &mut tx_scratch) {
+                // Outbound connection (active open) handled it.
+                Some(n)
             } else if let Some(n) =
                 self.tcp.handle(frame, self.arp_state.our_ip(), self.mac, &mut tx_scratch)
             {
@@ -773,6 +867,9 @@ pub fn init(bus: u8, slot: u8, func: u8) {
         arp_state: ArpStateMachine::new(OUR_IP, [0; 6]),
         dhcp: net::dhcp::DhcpClient::new([0; 6], DHCP_XID),
         tcp: net::tcp::TcpEcho::new(TCP_ECHO_PORT),
+        tcp_client: None,
+        tcp_local_port: TCP_LOCAL_PORT_BASE,
+        tcp_client_isn: 0x00A0_0000,
         arp_cache: ArpCache::new(),
         pong: None,
         selftest_armed: false,
@@ -866,6 +963,25 @@ pub fn ping(ip: [u8; 4], count: u16) -> Option<PingOutcome> {
 /// no NIC is present.
 pub fn arp_resolve(ip: [u8; 4]) -> Option<[u8; 6]> {
     NET_DEVICE.lock().as_mut().and_then(|nic| nic.resolve(ip))
+}
+
+/// Outcome of a blocking [`connect`] (rendered by the `connect` shell command).
+#[derive(Clone, Copy)]
+pub struct ConnectOutcome {
+    /// Whether the destination MAC resolved (an unreachable host fails here).
+    pub resolved: bool,
+    /// Whether the TCP handshake completed.
+    pub established: bool,
+    /// Bytes of peer response received.
+    pub rx_len: usize,
+    /// Whether the connection closed cleanly (FIN exchange completed).
+    pub closed: bool,
+}
+
+/// Blocking outbound TCP connect from the shell: resolve `ip`, open to `port`, send `payload`
+/// (empty = connect then immediately close), read the response, and close. `None` if no NIC.
+pub fn connect(ip: [u8; 4], port: u16, payload: &[u8]) -> Option<ConnectOutcome> {
+    NET_DEVICE.lock().as_mut().map(|nic| nic.connect(ip, port, payload))
 }
 
 /// Snapshot of the current NIC state, if any (used by the `netinfo` shell command).

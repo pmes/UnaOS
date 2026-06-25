@@ -55,6 +55,7 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
             console.println("COMMANDS: ver, help, clear, echo, panic, gneiss");
             console.println("STORAGE:  diskinfo, read <lba>, write <lba> <byte>");
             console.println("NETWORK:  netinfo, ping <ip> [count], arp <ip>");
+            console.println("          connect <ip> <port> [message]");
         },
         "clear" => {
             // Clear both the screen and the console buffer?
@@ -171,6 +172,29 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
                     None => console.println("no ARP reply (host unreachable / no NIC)"),
                 },
                 None => console.println("usage: arp <a.b.c.d>"),
+            }
+        },
+        "connect" => {
+            let ip = args.first().and_then(|s| parse_ipv4(s));
+            let port = args.get(1).and_then(|s| s.parse::<u16>().ok());
+            match (ip, port) {
+                (Some(ip), Some(port)) => {
+                    // Optional message; if omitted, just open and immediately close.
+                    let msg = if args.len() > 2 { args[2..].join(" ") } else { String::new() };
+                    console.println(&alloc::format!(
+                        "CONNECT {}.{}.{}.{}:{}", ip[0], ip[1], ip[2], ip[3], port));
+                    // Blocks while it ARP-resolves, handshakes, exchanges, and closes.
+                    match crate::drivers::e1000::connect(ip, port, msg.as_bytes()) {
+                        Some(o) if o.established => {
+                            console.println(&alloc::format!(
+                                "established; {} bytes received; closed={}", o.rx_len, o.closed));
+                        }
+                        Some(o) if !o.resolved => console.println("host unreachable (no ARP reply)"),
+                        Some(_) => console.println("connection refused / no response"),
+                        None => console.println("No network device ready."),
+                    }
+                }
+                _ => console.println("usage: connect <a.b.c.d> <port> [message]"),
             }
         },
         "vug" => {

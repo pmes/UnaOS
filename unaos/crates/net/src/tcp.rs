@@ -319,3 +319,251 @@ impl TcpEcho {
         Some(n)
     }
 }
+
+/// State of an active-open (outbound) TCP connection.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ClientState {
+    /// Initial, or torn down by a RST / refused — connection failed.
+    Closed,
+    /// SYN sent, awaiting the SYN-ACK.
+    SynSent,
+    /// Handshake complete; data may flow.
+    Established,
+    /// Our FIN sent, awaiting the peer's FIN/ACK.
+    FinWait,
+    /// Cleanly closed.
+    Done,
+}
+
+/// Maximum one-shot payload an outbound connection sends after the handshake.
+pub const CLIENT_TX_CAP: usize = 64;
+/// Maximum bytes of peer response an outbound connection records.
+pub const CLIENT_RX_CAP: usize = 256;
+
+/// A minimal single-connection **active-open** TCP client: the outbound counterpart of
+/// [`TcpEcho`]. It connects (SYN → SYN-ACK → ACK), optionally sends one payload, records the
+/// peer's response, then performs an active close (FIN). Same deliberate limits as the echo
+/// listener: one connection, in-order only, no retransmission, no options, lenient receiver
+/// (incoming TCP checksum unchecked; outgoing computed). Each received segment yields at most
+/// one response segment, matching the driver's one-reply-per-RX-frame model.
+pub struct TcpClient {
+    state: ClientState,
+    local_port: u16,
+    remote_ip: [u8; 4],
+    remote_mac: [u8; 6],
+    remote_port: u16,
+    snd_nxt: u32,
+    rcv_nxt: u32,
+    /// Latched once the handshake completes, so a later RST (which moves us to `Closed`)
+    /// doesn't make `established()` retroactively report the connection as never-up.
+    was_established: bool,
+    tx_payload: [u8; CLIENT_TX_CAP],
+    tx_len: usize,
+    tx_sent: bool,
+    rx_buf: [u8; CLIENT_RX_CAP],
+    rx_len: usize,
+}
+
+impl TcpClient {
+    /// Create a client that will connect to `remote_ip:remote_port` (MAC already resolved)
+    /// from `local_port`, using `isn` as the initial send sequence, and send `payload` after
+    /// the handshake (truncated to `CLIENT_TX_CAP`; empty = connect then immediately close).
+    pub fn new(
+        local_port: u16,
+        remote_ip: [u8; 4],
+        remote_mac: [u8; 6],
+        remote_port: u16,
+        isn: u32,
+        payload: &[u8],
+    ) -> Self {
+        let mut tx_payload = [0u8; CLIENT_TX_CAP];
+        let tx_len = payload.len().min(CLIENT_TX_CAP);
+        tx_payload[..tx_len].copy_from_slice(&payload[..tx_len]);
+        Self {
+            state: ClientState::Closed,
+            local_port,
+            remote_ip,
+            remote_mac,
+            remote_port,
+            snd_nxt: isn,
+            rcv_nxt: 0,
+            was_established: false,
+            tx_payload,
+            tx_len,
+            tx_sent: false,
+            rx_buf: [0u8; CLIENT_RX_CAP],
+            rx_len: 0,
+        }
+    }
+
+    pub fn state(&self) -> ClientState {
+        self.state
+    }
+    /// True once the handshake completed — latched, so it stays true even after a later RST
+    /// resets the live state to `Closed`.
+    pub fn established(&self) -> bool {
+        self.was_established
+    }
+    /// True once the connection has settled — nothing more to pump. Meaningful only after
+    /// [`open`](Self::open) has run (which moves out of the initial `Closed`); thereafter
+    /// `Closed` means the peer refused/reset and `Done` means a clean close.
+    pub fn is_done(&self) -> bool {
+        matches!(self.state, ClientState::Done | ClientState::Closed)
+    }
+    /// Bytes of peer response recorded so far.
+    pub fn rx_data(&self) -> &[u8] {
+        &self.rx_buf[..self.rx_len]
+    }
+
+    fn emit(&self, out: &mut [u8], our_ip: [u8; 4], our_mac: [u8; 6], flags: u8, payload: &[u8]) -> Option<usize> {
+        // Advertise only the receive-buffer space we actually have, so a conforming peer never
+        // sends more than we can record (which would otherwise force us to ACK dropped bytes).
+        let window = (CLIENT_RX_CAP - self.rx_len) as u16;
+        let tcp_len = write_segment(
+            out.get_mut(34..)?,
+            self.local_port,
+            self.remote_port,
+            self.snd_nxt,
+            self.rcv_nxt,
+            flags,
+            window,
+            our_ip,
+            self.remote_ip,
+            payload,
+        )?;
+        ipv4::write_header(out.get_mut(14..34)?, our_ip, self.remote_ip, PROTO_TCP, tcp_len)?;
+        ethernet::write_header(out.get_mut(0..14)?, self.remote_mac, our_mac, EtherType::Ipv4.as_u16())?;
+        Some(14 + 20 + tcp_len)
+    }
+
+    /// Begin the active open: write the SYN into `out` and return its length.
+    pub fn open(&mut self, out: &mut [u8], our_ip: [u8; 4], our_mac: [u8; 6]) -> Option<usize> {
+        let n = self.emit(out, our_ip, our_mac, SYN, &[])?;
+        self.snd_nxt = self.snd_nxt.wrapping_add(1); // our SYN consumes one sequence number
+        self.state = ClientState::SynSent;
+        Some(n)
+    }
+
+    /// Append peer payload to the receive buffer (bounded), returning how many bytes were kept.
+    fn record(&mut self, payload: &[u8]) -> usize {
+        let space = CLIENT_RX_CAP - self.rx_len;
+        let n = payload.len().min(space);
+        self.rx_buf[self.rx_len..self.rx_len + n].copy_from_slice(&payload[..n]);
+        self.rx_len += n;
+        n
+    }
+
+    /// Feed a received frame. Returns `Some(len)` with a response segment in `out`, or `None`
+    /// if the frame isn't a segment for this connection (caller falls through) or no response
+    /// is warranted. Drives the active-open → established → close state machine.
+    pub fn handle(&mut self, frame: &[u8], our_ip: [u8; 4], our_mac: [u8; 6], out: &mut [u8]) -> Option<usize> {
+        let eth = EthernetFrame::new(frame)?;
+        if eth.ethertype() != EtherType::Ipv4 {
+            return None;
+        }
+        let ip = Ipv4Header::new(eth.payload())?;
+        if ip.protocol() != PROTO_TCP
+            || ip.source_ip() != self.remote_ip
+            || ip.destination_ip() != our_ip
+            || !ip.verify_checksum()
+        {
+            return None;
+        }
+        let seg = TcpSegment::new(ip.payload())?;
+        if seg.source_port() != self.remote_port || seg.dest_port() != self.local_port {
+            return None; // not this connection
+        }
+
+        let flags = seg.flags();
+        let their_seq = seg.seq();
+        let their_ack = seg.ack();
+        let payload = seg.payload();
+
+        // A RST aborts the connection.
+        if flags & RST != 0 {
+            self.state = ClientState::Closed;
+            return None;
+        }
+
+        match self.state {
+            ClientState::SynSent => {
+                if flags & SYN != 0 && flags & ACK != 0 && their_ack != self.snd_nxt {
+                    // A SYN-ACK acknowledging the wrong sequence is a failed handshake — fail
+                    // fast (so the connect pump stops) rather than spinning the whole budget.
+                    self.state = ClientState::Closed;
+                    return None;
+                }
+                // Expect SYN-ACK acknowledging our SYN.
+                if flags & SYN != 0 && flags & ACK != 0 && their_ack == self.snd_nxt {
+                    self.rcv_nxt = their_seq.wrapping_add(1); // their SYN consumes one
+                    self.state = ClientState::Established;
+                    self.was_established = true;
+                    if self.tx_len > 0 && !self.tx_sent {
+                        // Piggyback the one-shot payload on the handshake-completing ACK.
+                        let n = self.emit(out, our_ip, our_mac, PSH | ACK, &self.tx_payload[..self.tx_len])?;
+                        self.snd_nxt = self.snd_nxt.wrapping_add(self.tx_len as u32);
+                        self.tx_sent = true;
+                        Some(n)
+                    } else {
+                        // Nothing to send: ACK the SYN and immediately begin the active close.
+                        let n = self.emit(out, our_ip, our_mac, FIN | ACK, &[])?;
+                        self.snd_nxt = self.snd_nxt.wrapping_add(1);
+                        self.state = ClientState::FinWait;
+                        Some(n)
+                    }
+                } else {
+                    None
+                }
+            }
+
+            ClientState::Established => {
+                // Consume in-order payload (the echo); ignore out-of-order. Advance rcv_nxt by
+                // the bytes we actually recorded, never by more (so we never ACK dropped data).
+                let mut consumed = false;
+                if !payload.is_empty() && their_seq == self.rcv_nxt {
+                    let n = self.record(payload);
+                    self.rcv_nxt = self.rcv_nxt.wrapping_add(n as u32);
+                    consumed = n == payload.len();
+                }
+                // Honor a FIN only when this segment was fully in-order (rcv_nxt reached the
+                // FIN's sequence position) — matches TcpEcho's defensive in-order handling.
+                let fin_in_order =
+                    flags & FIN != 0 && their_seq.wrapping_add(payload.len() as u32) == self.rcv_nxt;
+                if fin_in_order {
+                    self.rcv_nxt = self.rcv_nxt.wrapping_add(1); // FIN consumes one
+                }
+                // Close once we've received at least our payload back (the echo) or the peer
+                // is closing in-order; otherwise just ACK and keep waiting.
+                if self.rx_len >= self.tx_len || fin_in_order {
+                    let n = self.emit(out, our_ip, our_mac, FIN | ACK, &[])?;
+                    self.snd_nxt = self.snd_nxt.wrapping_add(1);
+                    self.state = ClientState::FinWait;
+                    Some(n)
+                } else if consumed {
+                    self.emit(out, our_ip, our_mac, ACK, &[])
+                } else {
+                    None
+                }
+            }
+
+            ClientState::FinWait => {
+                // The peer's FIN completes the teardown — only in-order. Record any data the
+                // peer coalesced with its FIN before acking, so it isn't silently dropped.
+                if flags & FIN != 0 && their_seq == self.rcv_nxt {
+                    if !payload.is_empty() {
+                        let n = self.record(payload);
+                        self.rcv_nxt = self.rcv_nxt.wrapping_add(n as u32);
+                    }
+                    self.rcv_nxt = self.rcv_nxt.wrapping_add(1); // FIN consumes one
+                    self.state = ClientState::Done;
+                    self.emit(out, our_ip, our_mac, ACK, &[])
+                } else {
+                    // A bare ACK of our FIN, or an out-of-order/duplicate FIN — nothing to send.
+                    None
+                }
+            }
+
+            ClientState::Closed | ClientState::Done => None,
+        }
+    }
+}

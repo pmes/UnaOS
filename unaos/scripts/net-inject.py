@@ -31,6 +31,10 @@ GW_MAC = bytes([0x52, 0x55, 0x0A, 0x00, 0x02, 0x02])
 # so a well-formed-but-wrong request can't false-pass. Source must be the guest's static IP.
 GUEST_PING_IDENT = 0x554E  # ASCII "UN"
 GUEST_PING_PAYLOAD = b"unaos-ping"
+# The guest's boot self-test also active-opens a TCP connection to the gateway here and sends
+# this probe; we run a tiny gateway-side TCP echo server on this port to complete it.
+SELFTEST_TCP_PORT = 7777
+GUEST_TCP_PROBE = b"unaos-tcp"
 
 
 def cksum(data):
@@ -180,16 +184,21 @@ def ipstr(b):
     return ".".join("%d" % x for x in b)
 
 
-def respond_to_guest_probes(s, t0, budget_s=18.0, want_pings=1):
-    """Validate the guest's OUTBOUND path. We impersonate the gateway 10.0.2.2: answer the
-    guest's ARP who-has 10.0.2.2 and reply to its ICMP echo *requests* (checking the requests'
-    checksums). The guest originates these via its boot connectivity self-test (and `ping`).
-    Returns True once we've answered an ARP and >= want_pings valid echo requests."""
-    print("--- outbound test: impersonating gateway %s (answering guest ARP+ICMP) ---" % ipstr(GW_IP))
+def respond_to_guest_probes(s, t0, budget_s=22.0, want_pings=1):
+    """Validate the guest's OUTBOUND path. We impersonate the gateway 10.0.2.2 and answer the
+    guest's boot self-test in full: ARP who-has, ICMP echo *requests*, and an active-open TCP
+    connection to 10.0.2.2:7777 (handshake -> data echo -> teardown). Every guest packet is
+    checked (checksums + the protocol fields the kernel is contracted to emit). Returns True
+    once ARP + >= want_pings pings + one complete TCP echo exchange have all been observed."""
+    print("--- outbound test: impersonating gateway %s (ARP + ICMP + TCP echo :%d) ---"
+          % (ipstr(GW_IP), SELFTEST_TCP_PORT))
     arped = False
     pings = 0
+    conn = None       # gateway-side TCP server state for the one expected connection
+    s_isn = 0x9000
+    tcp_ok = False    # set once a SINGLE connection completes handshake + valid echo + close
     deadline = time.time() + budget_s
-    while time.time() < deadline and not (arped and pings >= want_pings):
+    while time.time() < deadline and not (arped and pings >= want_pings and tcp_ok):
         try:
             f = recv_frame(s)
         except socket.timeout:
@@ -213,31 +222,30 @@ def respond_to_guest_probes(s, t0, budget_s=18.0, want_pings=1):
                     arped = True
             continue
 
-        if etype == 0x0800 and len(f) >= 34:  # IPv4
-            if (f[14] >> 4) != 4 or f[23] != 1:  # IPv4 + proto ICMP
+        if etype != 0x0800 or len(f) < 34 or (f[14] >> 4) != 4:  # IPv4 only
+            continue
+        proto = f[23]
+        ihl = (f[14] & 0x0F) * 4
+        total = struct.unpack(">H", f[16:18])[0]
+        src_ip, dst_ip = f[26:30], f[30:34]
+        if dst_ip != GW_IP:
+            continue
+        ip_ck_ok = cksum(f[14:14 + ihl]) == 0
+        l4 = f[14 + ihl:14 + total]  # exact L4 message (exclude L2 padding)
+
+        if proto == 1:  # ICMP echo request
+            icmp = l4
+            if len(icmp) < 8 or icmp[0] != 8:
                 continue
-            ihl = (f[14] & 0x0F) * 4
-            total = struct.unpack(">H", f[16:18])[0]
-            src_ip, dst_ip = f[26:30], f[30:34]
-            if dst_ip != GW_IP:
-                continue
-            icmp = f[14 + ihl:14 + total]  # exact ICMP message (exclude L2 padding)
-            if len(icmp) < 8 or icmp[0] != 8:  # echo request only
-                continue
-            ip_ck_ok = cksum(f[14:14 + ihl]) == 0
             icmp_ck_ok = cksum(icmp) == 0
             ident = struct.unpack(">H", icmp[4:6])[0]
             seq = struct.unpack(">H", icmp[6:8])[0]
             data = icmp[8:]
-            # Build the echo reply: same body, type 8 -> 0, recompute checksum, swap src/dst.
             reply_icmp = bytearray(icmp)
-            reply_icmp[0] = 0
+            reply_icmp[0] = 0  # type 8 -> 0
             reply_icmp[2:4] = b"\x00\x00"
             reply_icmp[2:4] = struct.pack(">H", cksum(reply_icmp))
             send_frame(s, eth(guest_mac, GW_MAC, 0x0800, ipv4(GW_IP, src_ip, 1, bytes(reply_icmp))))
-            # Count it only if BOTH checksums validate AND the protocol fields are exactly what
-            # the kernel is contracted to emit (identifier, payload, source IP) — not merely a
-            # well-formed packet. (We still replied above so the guest's path can complete.)
             fields_ok = (ident == GUEST_PING_IDENT and data == GUEST_PING_PAYLOAD and src_ip == GUEST_IP)
             if ip_ck_ok and icmp_ck_ok and fields_ok:
                 pings += 1
@@ -247,6 +255,60 @@ def respond_to_guest_probes(s, t0, budget_s=18.0, want_pings=1):
                 print("[%5.1fs] <- guest ICMP echo request REJECTED ip_ck=%s icmp_ck=%s id=0x%04x(exp 0x%04x) data=%r(exp %r) src=%s(exp %s)"
                       % (time.time() - t0, ip_ck_ok, icmp_ck_ok, ident, GUEST_PING_IDENT,
                          data, GUEST_PING_PAYLOAD, ipstr(src_ip), ipstr(GUEST_IP)))
+            continue
+
+        if proto == 6 and len(l4) >= 20:  # TCP (gateway-side echo server)
+            sport = struct.unpack(">H", l4[0:2])[0]
+            dport = struct.unpack(">H", l4[2:4])[0]
+            if dport != SELFTEST_TCP_PORT:
+                continue
+            seq = struct.unpack(">I", l4[4:8])[0]
+            doff = (l4[12] >> 4) * 4
+            flags = l4[13]
+            payload = l4[doff:]
+            tcp_ck_ok = tcp_checksum(src_ip, dst_ip, l4) == 0
+
+            def gw_send(seq_n, ack_n, fl, data=b""):
+                seg = tcp(SELFTEST_TCP_PORT, sport, seq_n, ack_n, fl, 4096, GW_IP, src_ip, data)
+                send_frame(s, eth(guest_mac, GW_MAC, 0x0800, ipv4(GW_IP, src_ip, 6, seg)))
+
+            if flags & RST:
+                conn = None
+                continue
+            if (flags & SYN) and not (flags & ACK):  # active-open SYN
+                # Per-connection state — the pass evidence (data_ok/closed) lives here, so two
+                # separate partial connections can't jointly satisfy the test.
+                conn = {"cport": sport, "cseq": (seq + 1) & 0xFFFFFFFF, "sseq": (s_isn + 1) & 0xFFFFFFFF,
+                        "finned": False, "data_ok": False, "closed": False}
+                gw_send(s_isn, conn["cseq"], SYN | ACK)
+                print("[%5.1fs] <- guest TCP SYN -> SYN-ACK   [GUEST TCP HANDSHAKE OK]" % (time.time() - t0))
+                continue
+            if conn is None or sport != conn["cport"]:
+                continue
+            if payload:  # data segment -> ack + echo it back
+                # Accept as valid only if in-order (seq == expected), exact probe, checksums OK.
+                in_order = (seq == conn["cseq"])
+                conn["cseq"] = (seq + len(payload)) & 0xFFFFFFFF
+                gw_send(conn["sseq"], conn["cseq"], PSH | ACK, payload)
+                conn["sseq"] = (conn["sseq"] + len(payload)) & 0xFFFFFFFF
+                ok = (in_order and payload == GUEST_TCP_PROBE and tcp_ck_ok and ip_ck_ok)
+                conn["data_ok"] = conn["data_ok"] or ok
+                print("[%5.1fs] <- guest TCP data %r seq_ok=%s ip_ck=%s tcp_ck=%s -> echoed   [GUEST TCP ECHO %s]"
+                      % (time.time() - t0, payload, in_order, ip_ck_ok, tcp_ck_ok, "OK" if ok else "REJECTED"))
+            if flags & FIN:  # active close -> ack the FIN and send our own
+                conn["cseq"] = (conn["cseq"] + 1) & 0xFFFFFFFF
+                gw_send(conn["sseq"], conn["cseq"], FIN | ACK)
+                conn["sseq"] = (conn["sseq"] + 1) & 0xFFFFFFFF
+                conn["finned"] = True
+                print("[%5.1fs] <- guest TCP FIN -> FIN-ACK" % (time.time() - t0))
+                continue
+            if (flags & ACK) and conn.get("finned"):  # final ACK of our FIN
+                conn["closed"] = True
+                if conn["data_ok"] and conn["closed"]:  # this ONE connection did everything
+                    tcp_ok = True
+                print("[%5.1fs] <- guest TCP final ACK   [GUEST TCP CLOSE %s]"
+                      % (time.time() - t0, "OK" if tcp_ok else "(no valid data)"))
+            continue
 
     if not arped:
         print("FAIL: guest never ARP-resolved the gateway %s" % ipstr(GW_IP))
@@ -254,7 +316,10 @@ def respond_to_guest_probes(s, t0, budget_s=18.0, want_pings=1):
     if pings < want_pings:
         print("FAIL: guest sent %d/%d valid ICMP echo requests" % (pings, want_pings))
         return False
-    print("<- guest outbound verified: ARP-resolved gateway + %d valid echo requests   [GUEST OUTBOUND OK]" % pings)
+    if not tcp_ok:
+        print("FAIL: guest did not complete one full TCP handshake + valid echo + close")
+        return False
+    print("<- guest outbound verified: ARP + %d ping(s) + TCP connect/echo/close   [GUEST OUTBOUND OK]" % pings)
     return True
 
 
