@@ -65,6 +65,19 @@ const TASK_STACK_SIZE: usize = 16 * 1024;
 /// preempted and rotated to the back of its run queue. Small so round-robin sharing is visible.
 const QUANTUM_TICKS: u32 = 4;
 
+/// Priority aging (anti-starvation). A ready task that has WAITED in the run queue this many local
+/// ticks without being dispatched is promoted one effective level toward the top (its base priority
+/// is unchanged). Repeated, a low task under continuous higher-priority load climbs to parity with
+/// the load and runs, then drops back to base on dispatch — bounding starvation to ~`AGE_TICKS` per
+/// level it must climb. (Bound is exact when no level between base and the contended level drains;
+/// finite-but-larger under bursty mixed load, since a dispatch at an intermediate level re-bases.)
+const AGE_TICKS: u32 = 16;
+
+/// How often the scheduler runs the aging sweep, in local ticks. Kept well below `AGE_TICKS` so the
+/// one-promotion-per-sweep cap never binds in steady state (a sweep accrues elapsed credit and
+/// carries any surplus past `AGE_TICKS` to the next sweep, so coarse/late sweeps lose no credit).
+const AGING_INTERVAL: u64 = 4;
+
 /// Pre-reserved run-queue capacity per CPU. Sized so steady-state `push_back` never reallocates
 /// (which would take the heap lock while the run-queue lock is held). Exceeding it is still
 /// correct — the heap lock is always innermost — but avoid it.
@@ -133,9 +146,15 @@ pub struct Task {
     /// Logical CPU this task is pinned to (only read by a `debug_assert`, hence the allow).
     #[allow(dead_code)]
     cpu: u32,
-    /// Scheduling priority (`0..NUM_PRIORITIES`, higher = more urgent). Immutable after spawn, so
-    /// it is safe to read from any CPU (used for the preemption decision when waking/spawning).
+    /// BASE scheduling priority (`0..NUM_PRIORITIES`, higher = more urgent). IMMUTABLE after spawn,
+    /// so it is safe to read lock-free from any CPU (the preemption decision when waking/spawning).
+    /// Aging never touches this — it only transiently raises the *level* a task sits in (below).
     priority: u8,
+    /// Ticks this task has WAITED in a run queue since its last enqueue, for priority aging. Touched
+    /// ONLY under the owning CPU's run-queue spinlock (zeroed by `RunQueue::push` on every enqueue,
+    /// accrued + consumed by `RunQueue::age` on that CPU). NEVER read cross-CPU — unlike `priority`,
+    /// it is mutable and lock-protected, so it must not be read off the owning CPU.
+    wait_ticks: u32,
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -203,8 +222,16 @@ static SCHED_GO: AtomicBool = AtomicBool::new(false);
 /// Monotonic task-id source.
 static NEXT_TID: AtomicU64 = AtomicU64::new(1);
 
-/// A CPU's ready tasks, bucketed by priority. One spinlock (in `RUN_QUEUES`) guards all levels;
-/// it is held only briefly (push is O(1); pop/len are O(NUM_PRIORITIES)) and always with IF=0.
+/// A CPU's ready tasks, bucketed by EFFECTIVE level. A task normally sits at its base priority
+/// level, but the aging sweep (`age`) may transiently lift a long-waiting task to a higher level so
+/// strict priority does not starve it; on its next enqueue it re-bases. One spinlock (in
+/// `RUN_QUEUES`) guards all levels; held only briefly (push/pop are O(NUM_PRIORITIES); `age` is
+/// O(ready tasks)) and always with IF=0.
+///
+/// Two distinct placement operations share these levels: ENQUEUE (`push`) re-bases a task to its
+/// base-priority level and ZEROES its aging clock; RELOCATE (`age`) moves a task one level UP
+/// without touching its base priority. They must not be confused (relocating via `push` would be a
+/// no-op promotion that leaves starvation intact).
 struct RunQueue {
     levels: [VecDeque<Box<Task>>; NUM_PRIORITIES],
 }
@@ -213,12 +240,16 @@ impl RunQueue {
     fn with_capacity(cap: usize) -> Self {
         RunQueue { levels: core::array::from_fn(|_| VecDeque::with_capacity(cap)) }
     }
-    /// Enqueue at the task's priority level (FIFO within the level). Priority is clamped in range.
-    fn push(&mut self, task: Box<Task>) {
+    /// ENQUEUE a task at its BASE priority level (FIFO within the level), clamped in range, and
+    /// reset its aging clock — every enqueue (spawn / wake / re-enqueue after preempt/yield) zeroes
+    /// `wait_ticks`, so a task only ages while it sits WAITING and re-bases the moment it is requeued.
+    fn push(&mut self, mut task: Box<Task>) {
+        task.wait_ticks = 0;
         let level = (task.priority as usize).min(NUM_PRIORITIES - 1);
         self.levels[level].push_back(task);
     }
-    /// Dequeue the front of the HIGHEST non-empty level (strict priority, round-robin within).
+    /// Dequeue the front of the HIGHEST non-empty level (strict priority over the effective level,
+    /// round-robin within).
     fn pop_highest(&mut self) -> Option<Box<Task>> {
         for level in self.levels.iter_mut().rev() {
             if let Some(task) = level.pop_front() {
@@ -226,6 +257,31 @@ impl RunQueue {
             }
         }
         None
+    }
+    /// Priority-aging sweep (anti-starvation): RELOCATE every ready task that has now waited at
+    /// least `AGE_TICKS` one level UP, carrying any surplus credit to the next sweep. `elapsed` is
+    /// the local ticks since the previous sweep. Run on the OWNING CPU under the run-queue lock.
+    ///
+    /// Iterating HIGH→LOW is load-bearing: a task promoted from `level` into `level + 1` lands in a
+    /// level that was ALREADY processed this sweep, so it is never revisited (exactly-once per
+    /// sweep, no runaway multi-level jump). Within a level, popping exactly `n = len()` from the
+    /// front and pushing kept tasks to the back rotates the deque full-circle, preserving FIFO.
+    /// Relocation is a raw `VecDeque` move that leaves `priority` (base) untouched — NOT `push`.
+    fn age(&mut self, elapsed: u32) {
+        for level in (0..NUM_PRIORITIES - 1).rev() {
+            let n = self.levels[level].len();
+            for _ in 0..n {
+                let mut task = self.levels[level].pop_front().expect("age: len/pop mismatch");
+                task.wait_ticks = task.wait_ticks.saturating_add(elapsed);
+                if task.wait_ticks >= AGE_TICKS {
+                    task.wait_ticks -= AGE_TICKS; // carry surplus credit, don't discard it
+                    debug_assert!(level + 1 < NUM_PRIORITIES, "age: promotion above top level");
+                    self.levels[level + 1].push_back(task); // RELOCATE up one level (base unchanged)
+                } else {
+                    self.levels[level].push_back(task);
+                }
+            }
+        }
     }
     fn len(&self) -> usize {
         self.levels.iter().map(VecDeque::len).sum()
@@ -366,6 +422,7 @@ pub fn spawn(name: &'static str, entry: fn(usize), arg: usize, target_cpu: usize
         arg,
         cpu: target_cpu as u32,
         priority,
+        wait_ticks: 0, // re-zeroed by push() on every enqueue; this satisfies the struct literal
     });
 
     RUN_QUEUES[target_cpu].lock().push(task);
@@ -1035,6 +1092,11 @@ pub fn wait_and_run() -> ! {
 /// when the queue is empty.
 fn run() -> ! {
     let cpu = percpu::this_cpu().cpu_index as usize;
+    // Aging sweep cadence, kept as a stack local (run() is `-> !`, entered once per CPU, so this
+    // survives the CPU's whole lifetime — no SchedCpu field needed). Seed from the LIVE tick count:
+    // by now the AP burned ticks in `wait_and_run`'s hlt loop / the BSP during verify_smp, so a 0
+    // seed would make the first `elapsed` huge and promote everything on the first sweep.
+    let mut last_age = percpu::this_cpu().ticks.load(Ordering::Relaxed);
     loop {
         // From here through the switch we keep IF=0 so no handler can re-enter the scheduler on
         // its own stack or be caught mid-requeue holding the run-queue lock.
@@ -1048,7 +1110,23 @@ fn run() -> ! {
         // tick. Same CPU, no IPI — `make_ready` pushes onto this CPU's own run queue.
         drain_due_sleepers(cpu);
 
-        let next = RUN_QUEUES[cpu].lock().pop_highest(); // highest-priority ready task; lock dropped
+        // Age then pick, under ONE run-queue lock acquisition: run the anti-starvation sweep (gated
+        // to ~every AGING_INTERVAL ticks) AFTER the sleeper drain (so freshly-woken sleepers, pushed
+        // at base with a fresh clock, are visible to it) and BEFORE the pop, so a task cannot be
+        // dispatched before it is aged in the same pass.
+        let next = {
+            let mut q = RUN_QUEUES[cpu].lock();
+            let now = percpu::this_cpu().ticks.load(Ordering::Relaxed);
+            let elapsed = now.wrapping_sub(last_age);
+            if elapsed >= AGING_INTERVAL {
+                // Saturate the cast so even an absurd (>2^32-tick) inter-sweep gap loses no aging
+                // credit (`age` carries surplus past AGE_TICKS forward). In steady state `elapsed`
+                // ~= AGING_INTERVAL, so this min is a no-op.
+                q.age(elapsed.min(u32::MAX as u64) as u32);
+                last_age = now;
+            }
+            q.pop_highest() // highest-priority ready task; lock dropped here
+        };
         match next {
             Some(task) => {
                 task.state.store(STATE_RUNNING, Ordering::Release);
@@ -1190,40 +1268,40 @@ pub fn current_task_id(cpu: usize) -> Option<u64> {
 /// Count of demo tasks that have run to completion (so a test can confirm exit/free works).
 static DEMO_DONE: AtomicUsize = AtomicUsize::new(0);
 
-/// Shared predicate state for the condvar demo, guarded by `COND_MUTEX`.
-struct CondState {
-    /// Flipped true by the coordinator; the workers block until it is set.
-    ready: bool,
-}
-/// The mutex the condvar demo pairs with (guards `CondState`). `'static`, as a blockable mutex
-/// must be.
-static COND_MUTEX: Mutex<CondState> = Mutex::new(CondState { ready: false });
-/// The condition variable the demo exercises (one `notify_all` waking several blocked workers).
-static COND_CV: Condvar = Condvar::new();
-/// How many workers have woken from the condvar and observed the predicate (for the PASS check).
-static COND_WOKEN: AtomicUsize = AtomicUsize::new(0);
-/// How many workers have entered `CV.wait` (incremented under the mutex, just before waiting). The
-/// coordinator waits for this to reach `COND_WORKERS` so it signals only once every worker is
-/// provably blocked — making the demo deterministic rather than timing-dependent.
-static COND_WAITING: AtomicUsize = AtomicUsize::new(0);
-/// Number of worker tasks the condvar demo blocks on one `notify_all`.
-const COND_WORKERS: usize = 3;
+// Priority-aging demo state. A continuously-ready base-HIGH "hog" and a base-LOW "victim" share one
+// AP; under strict priority the victim would never run until the hog finished, but aging promotes
+// it so it completes WHILE the hog is still running. Release/Acquire so the cross-CPU verifier's
+// reads are well-defined.
+/// Set true when the hog finishes (it is sized NOT to, before the victim does).
+static AGE_HIGH_DONE: AtomicBool = AtomicBool::new(false);
+/// Set true when the victim finishes its rounds (the anti-starvation signal for the verifier).
+static AGE_LOW_DONE: AtomicBool = AtomicBool::new(false);
+/// Captured by the victim at completion: was the hog STILL running (i.e. did aging let the victim
+/// through under continuous HIGH load)? This is the actual PASS condition.
+static AGE_LOW_RAN_UNDER_HIGH: AtomicBool = AtomicBool::new(false);
+/// Victim work: small, so a working ager finishes it quickly. The victim runs ~1 quantum per
+/// ~2*AGE_TICKS of starvation (~1/9 duty under the HIGH hog). Hog work is sized so that, in the
+/// wall-clock the victim needs to finish, the hog is only a fraction done — so AGE_HIGH_DONE is
+/// still false when the victim reads it. Invariant to preserve on any retune:
+///   AGE_HOG_ROUNDS*AGE_HOG_ITERS  >>  AGE_VICTIM_ROUNDS*AGE_VICTIM_ITERS * (2*AGE_TICKS/QUANTUM_TICKS)
+/// (the ratio here is ~12x). Host-speed-dependent like `demo_busy`'s 40M loop.
+const AGE_VICTIM_ROUNDS: u32 = 4;
+const AGE_VICTIM_ITERS: u64 = 15_000_000;
+const AGE_HOG_ROUNDS: u32 = 120;
+const AGE_HOG_ITERS: u64 = 50_000_000;
 
 /// Turn scheduling on and spawn the demo workload across the online APs: equal-priority round-robin
-/// + timer preemption (the busy pair), and the `Condvar` demo — several workers block on a
-/// predicate via `CV.wait` (releasing the `Mutex`), a coordinator flips the predicate under the
-/// mutex and `notify_all`s (holding the mutex past the notify to force a contended re-acquire), and
-/// a verifier confirms every worker woke. Exercises notify_all, the atomic release + re-acquire, and
-/// cross-CPU wake. Called once on the BSP after `smp::start_aps` (hence after `verify_smp`). No-op
-/// with no APs.
+/// + timer preemption (the busy pair on the first AP), and the priority-AGING showcase — a
+/// continuously-ready base-HIGH hog and a base-LOW victim on a second AP, where strict priority
+/// alone would starve the victim forever but aging promotes it so it finishes under load; a verifier
+/// on a third AP prints a self-checking PASS/FAIL. Called once on the BSP after `smp::start_aps`
+/// (hence after `verify_smp`). No-op with no APs; the aging showcase needs >=3 APs (else SKIPPED).
 pub fn start_demo(online_aps: &[usize]) {
     if online_aps.is_empty() {
         serial_println!("SCHED: no application processors online; scheduler idle.");
         return;
     }
 
-    COND_MUTEX.init(); // reserve the mutex + condvar waiter capacity before any task can block
-    COND_CV.init();
     SCHED_ACTIVE.store(true, Ordering::Release);
     SCHED_GO.store(true, Ordering::Release);
 
@@ -1233,29 +1311,27 @@ pub fn start_demo(online_aps: &[usize]) {
         online_aps
     );
 
-    // Equal-priority round-robin + preemption: two non-yielding NORMAL threads on the first AP must
-    // INTERLEAVE (without preemption the first would monopolise the core until it exits).
+    // Equal-priority round-robin + preemption regression: two non-yielding NORMAL threads on the
+    // first AP must INTERLEAVE (without preemption the first would monopolise the core until exit).
     let cpu_busy = online_aps[0];
     spawn("busy-A", demo_busy, encode(cpu_busy, b'A'), cpu_busy, PRIO_NORMAL);
     spawn("busy-B", demo_busy, encode(cpu_busy, b'B'), cpu_busy, PRIO_NORMAL);
 
-    // Condition variable: COND_WORKERS workers each block on a predicate via `CV.wait` (which
-    // releases the mutex), a coordinator flips the predicate under the mutex and `notify_all`s, and
-    // a verifier confirms ALL workers woke. Workers are spread across the APs so the single
-    // notify_all performs both same-core and cross-core wakes; the coordinator holds the mutex a
-    // few ticks past the notify so the woken workers must re-block on it (contended re-acquire).
-    // Exercises notify_all, the atomic release + re-acquire, cross-CPU wake, and the recheck loop.
-    // Each worker pins to a (round-robin) AP; a worker landing on `cpu_busy` shares with busy-A/B
-    // and still makes progress via preemption before it blocks.
-    let n = online_aps.len();
-    for i in 0..COND_WORKERS {
-        let cpu = online_aps[i % n];
-        spawn("cond-worker", demo_cond_worker, cpu, cpu, PRIO_NORMAL);
+    // Priority aging (anti-starvation): a continuously-ready base-HIGH hog and a base-LOW victim on
+    // a SECOND AP. Under strict priority the victim never runs until the hog finishes; aging lifts
+    // its effective level until it reaches parity and runs, so it COMPLETES while the hog is still
+    // going. The verifier runs on a THIRD AP — never co-located with the hog, which (being HIGH and
+    // continuously ready) would starve a NORMAL verifier and cause a false FAIL. Needs >=3 distinct
+    // APs; with fewer, the showcase is SKIPPED (a definitive non-FAIL the harness can tell apart).
+    if online_aps.len() >= 3 {
+        let cpu_age = online_aps[1];
+        spawn("age-hog", demo_age_hog, cpu_age, cpu_age, PRIO_HIGH);
+        spawn("age-victim", demo_age_victim, cpu_age, cpu_age, PRIO_LOW);
+        let cpu_verify = online_aps[2];
+        spawn("age-verify", demo_age_verifier, cpu_verify, cpu_verify, PRIO_NORMAL);
+    } else {
+        serial_println!("PRIOAGE: SKIPPED (needs >=3 APs; have {})", online_aps.len());
     }
-    let cpu_coord = online_aps[1 % n];
-    spawn("cond-coord", demo_cond_coordinator, cpu_coord, cpu_coord, PRIO_NORMAL);
-    let cpu_verify = online_aps[2 % n];
-    spawn("cond-verify", demo_cond_verifier, cpu_verify, cpu_verify, PRIO_NORMAL);
 }
 
 /// Pack a (cpu, tag-letter) pair into the single `usize` arg the task entry receives.
@@ -1283,60 +1359,80 @@ fn demo_busy(arg: usize) {
     DEMO_DONE.fetch_add(1, Ordering::Relaxed);
 }
 
-/// Condvar worker: block on the predicate until the coordinator sets it, then count the wake. The
-/// `while` loop re-tests the predicate on every (possibly spurious) wakeup, as Mesa semantics
-/// require. The `COND_WAITING` bump sits UNDER the mutex, immediately before the first `CV.wait`,
-/// so the coordinator can detect "all workers blocked" precisely: a worker holds the mutex from the
-/// bump until `wait` releases it, so `COND_WAITING == COND_WORKERS` implies every worker has entered
-/// `wait` (and any still mid-park holds the condvar lock, which the coordinator's notify waits for).
-fn demo_cond_worker(cpu: usize) {
-    let mut guard = COND_MUTEX.lock();
-    COND_WAITING.fetch_add(1, Ordering::Relaxed);
-    while !guard.ready {
-        guard = COND_CV.wait(guard);
+/// Aging HOG: a continuously-ready base-HIGH CPU burner. Under strict priority it would monopolise
+/// its core until done; it is sized NOT to finish before the victim, so the victim's completion
+/// provably happens under continuous HIGH load. Never yields or blocks.
+fn demo_age_hog(cpu: usize) {
+    for round in 0..AGE_HOG_ROUNDS {
+        let mut acc: u64 = 0;
+        for i in 0..AGE_HOG_ITERS {
+            acc = acc.wrapping_add(i ^ round as u64);
+        }
+        core::hint::black_box(acc);
+        if round % 20 == 0 {
+            serial_println!("SCHED: [cpu{} age-hog] HIGH round {}/{}", cpu, round, AGE_HOG_ROUNDS);
+        }
     }
-    drop(guard);
-    let n = COND_WOKEN.fetch_add(1, Ordering::Relaxed) + 1;
-    serial_println!("SCHED: [cpu{} cond-worker] woke ({}/{})", cpu, n, COND_WORKERS);
+    AGE_HIGH_DONE.store(true, Ordering::Release);
+    serial_println!("SCHED: [cpu{} age-hog] done (expected AFTER the victim)", cpu);
     DEMO_DONE.fetch_add(1, Ordering::Relaxed);
 }
 
-/// Condvar coordinator: wait until all workers are blocked on the condvar, then flip the predicate
-/// under the mutex and wake them all with one `notify_all`. It deliberately holds the mutex a few
-/// ticks AFTER the notify so every woken worker must re-block on the mutex (contended re-acquire),
-/// exercising `CV.wait`'s re-acquire handoff. The bounded poll means a bug surfaces as FAIL, never
-/// a hang.
-fn demo_cond_coordinator(cpu: usize) {
-    let mut waited = 0u64;
-    while COND_WAITING.load(Ordering::Relaxed) < COND_WORKERS && waited < 4000 {
-        sleep_ticks(2);
-        waited += 2;
+/// Aging VICTIM: a base-LOW CPU task on the SAME AP as the hog. Without aging it never runs; with
+/// aging it climbs to parity and completes. On finishing it captures whether the hog was still
+/// running (the anti-starvation proof) BEFORE signalling, then signals the verifier.
+fn demo_age_victim(cpu: usize) {
+    for round in 0..AGE_VICTIM_ROUNDS {
+        let mut acc: u64 = 0;
+        for i in 0..AGE_VICTIM_ITERS {
+            acc = acc.wrapping_add(i ^ round as u64);
+        }
+        core::hint::black_box(acc);
+        serial_println!(
+            "SCHED: [cpu{} age-victim] LOW round {}/{} ran under continuous HIGH load",
+            cpu,
+            round + 1,
+            AGE_VICTIM_ROUNDS
+        );
     }
-    let mut guard = COND_MUTEX.lock();
-    guard.ready = true;
-    COND_CV.notify_all();
-    sleep_ticks(4); // hold the mutex past the notify -> force a contended re-acquire in the workers
-    drop(guard);
-    serial_println!("SCHED: [cpu{} cond-coord] predicate set + notify_all woke {}", cpu, COND_WORKERS);
+    // Capture the proof BEFORE signalling done: the hog must still be running for this to be aging.
+    AGE_LOW_RAN_UNDER_HIGH.store(!AGE_HIGH_DONE.load(Ordering::Acquire), Ordering::Release);
+    AGE_LOW_DONE.store(true, Ordering::Release);
     DEMO_DONE.fetch_add(1, Ordering::Relaxed);
 }
 
-/// Condvar verifier: poll until every worker has woken (or a generous timeout), then print a single
-/// self-checking PASS/FAIL line for headless verification — proving the one `notify_all` released
-/// all blocked workers across cores.
-fn demo_cond_verifier(cpu: usize) {
+/// Aging VERIFIER on a DIFFERENT AP from the hog: poll until the victim finishes or a generous
+/// timeout, then print one self-checking PASS/FAIL line. PASS iff the victim completed AND the hog
+/// was still running when it did (= aging beat strict-priority starvation). A broken ager starves
+/// the victim → timeout → definitive FAIL (never a hang); both exits print exactly one line.
+fn demo_age_verifier(cpu: usize) {
+    // Timeout is ~40x the observed victim completion (~150-200 ticks under a working ager on QEMU),
+    // so it cannot false-FAIL a slow host yet still bounds a broken ager to a definitive FAIL.
     let mut waited = 0u64;
-    while COND_WOKEN.load(Ordering::Relaxed) < COND_WORKERS && waited < 6000 {
-        sleep_ticks(4);
-        waited += 4;
+    while !AGE_LOW_DONE.load(Ordering::Acquire) && waited < 8_000 {
+        sleep_ticks(8);
+        waited += 8;
     }
-    let woke = COND_WOKEN.load(Ordering::Relaxed);
+    let done = AGE_LOW_DONE.load(Ordering::Acquire);
+    let under_high = AGE_LOW_RAN_UNDER_HIGH.load(Ordering::Acquire);
+    // Three outcomes, so a host-speed tuning miss is not mistaken for a real aging bug:
+    //   PASS         - victim finished WHILE the hog was still running (aging beat starvation),
+    //   FAIL         - victim never finished within the timeout (genuine starvation: aging broken),
+    //   INCONCLUSIVE - victim finished but only after the hog already had (retune work sizes).
+    let verdict = if done && under_high {
+        "PASS"
+    } else if !done {
+        "FAIL"
+    } else {
+        "INCONCLUSIVE"
+    };
     serial_println!(
-        "CONDVAR: [cpu{}] woke {}/{} workers via notify_all => {}",
+        "PRIOAGE: [cpu{}] victim_done={} ran_under_high={} (waited {} ticks) => {}",
         cpu,
-        woke,
-        COND_WORKERS,
-        if woke == COND_WORKERS { "PASS" } else { "FAIL" }
+        done,
+        under_high,
+        waited,
+        verdict
     );
     DEMO_DONE.fetch_add(1, Ordering::Relaxed);
 }
