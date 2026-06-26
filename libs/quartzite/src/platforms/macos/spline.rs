@@ -16,6 +16,7 @@ use objc2_app_kit::{
 };
 use objc2_foundation::MainThreadMarker;
 use objc2::{msg_send, ClassType, DefinedClass};
+use dispatch2::MainThreadBound;
 use objc2::rc::{Retained, Allocated};
 
 use super::workspace::sidebar;
@@ -101,33 +102,29 @@ impl MacOSSpline {
         // Extract the assembled root view
         let root_view = svc.view();
 
-        // 2. Spawn the Main Thread Router
-        // Using `dispatch2` for macOS GCD to cross the Tokio async/sync boundary natively
-        // 2. Spawn the Main Thread Router
-        // To safely pass AppKit pointers into the background tokio closure, we must marshal them
-        // into usize pointers, because AppKit items like `Retained<T>` are `!Send`.
-        let comms_delegate_ptr = Retained::into_raw(comms_delegate.clone()) as usize;
-        let sidebar_delegate_ptr = Retained::into_raw(sidebar_delegate.clone()) as usize;
+        // 2. Spawn the main-thread router.
+        //
+        // The AppKit delegates are `!Send`, so the background tokio task cannot capture them
+        // directly. `MainThreadBound` is the idiomatic bridge: it is `Send + Sync` but only
+        // yields the delegate back on the main thread — which is exactly where the `dispatch2`
+        // main-queue closures below run their UI work. This replaces the previous
+        // `Retained::into_raw` → `usize` → `Retained::retain`/`cast_unchecked` round-trip
+        // (which leaked a retain and reconstituted the object from a raw pointer each message).
+        let comms_bound = Arc::new(MainThreadBound::new(comms_delegate.clone(), mtm));
+        let sidebar_bound = Arc::new(MainThreadBound::new(sidebar_delegate.clone(), mtm));
 
         tokio::spawn(async move {
+            // Keep `tx_event` owned by the task even though the current routes don't send on it.
+            let _tx_event = tx_event;
             loop {
-                // Keep the compiler happy about the unused tx_event
-                let _tx = tx_event.clone();
-
                 match rx_synapse.recv().await {
                     Ok(msg) => {
-                        let comms_ptr = comms_delegate_ptr;
-                        let sidebar_ptr = sidebar_delegate_ptr;
-
                         match msg {
                             SMessage::StorageLoadPagedResult { records, .. } => {
+                                let comms_bound = comms_bound.clone();
                                 dispatch2::DispatchQueue::main().exec_async(move || {
-                                    let comms_delegate = unsafe {
-                                        Retained::retain(comms_ptr as *mut objc2::runtime::AnyObject).unwrap()
-                                    };
-                                    let comms_delegate = unsafe {
-                                        Retained::cast_unchecked::<comms::CommsDelegate>(comms_delegate)
-                                    };
+                                    let mtm = MainThreadMarker::new().unwrap();
+                                    let comms_delegate = comms_bound.get(mtm);
 
                                     // Wrap the mutable borrow in a block so it drops when done
                                     if let Some(chat_manager) = comms_delegate.ivars().chat_manager.borrow().as_ref() {
@@ -156,13 +153,10 @@ impl MacOSSpline {
                                 });
                             },
                             SMessage::AiToken(token_string) => {
+                                let comms_bound = comms_bound.clone();
                                 dispatch2::DispatchQueue::main().exec_async(move || {
-                                    let comms_delegate = unsafe {
-                                        Retained::retain(comms_ptr as *mut objc2::runtime::AnyObject).unwrap()
-                                    };
-                                    let comms_delegate = unsafe {
-                                        Retained::cast_unchecked::<comms::CommsDelegate>(comms_delegate)
-                                    };
+                                    let mtm = MainThreadMarker::new().unwrap();
+                                    let comms_delegate = comms_bound.get(mtm);
 
                                     if let Some(chat_manager) = comms_delegate.ivars().chat_manager.borrow().as_ref() {
                                         let mut history = chat_manager.ivars().history.borrow_mut();
@@ -187,13 +181,10 @@ impl MacOSSpline {
                                 });
                             },
                             SMessage::Matrix(matrix_event) => {
+                                let sidebar_bound = sidebar_bound.clone();
                                 dispatch2::DispatchQueue::main().exec_async(move || {
-                                    let sidebar_delegate = unsafe {
-                                        Retained::retain(sidebar_ptr as *mut objc2::runtime::AnyObject).unwrap()
-                                    };
-                                    let sidebar_delegate = unsafe {
-                                        Retained::cast_unchecked::<sidebar::SidebarDelegate>(sidebar_delegate)
-                                    };
+                                    let mtm = MainThreadMarker::new().unwrap();
+                                    let sidebar_delegate = sidebar_bound.get(mtm);
 
                                     match matrix_event {
                                         bandy::MatrixEvent::TopologyMutated(flat_tree) => {

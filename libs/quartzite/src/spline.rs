@@ -29,6 +29,9 @@ use crate::platforms::gtk::spline::CommsSpline;
 #[cfg(target_os = "macos")]
 use crate::platforms::macos::spline::MacOSSpline;
 
+/// The platform-neutral entry point to Quartzite's GUI. [`Spline::bootstrap`] is the stable seam
+/// between a workspace snapshot and native rendering; it dispatches to the compile-time-selected
+/// backend under `platforms/`.
 pub struct Spline {
     #[cfg(all(target_os = "linux", feature = "gtk"))]
     inner: CommsSpline,
@@ -55,6 +58,12 @@ impl Spline {
         return Self {};
     }
 
+    /// The platform seam: render a workspace snapshot (`bandy::state::WorkspaceState`) into a
+    /// native view tree, wire it to the message bus, and return the platform's
+    /// [`BootstrapPayload`]. Each backend under `platforms/` implements this for its host toolkit
+    /// (macOS AppKit, GTK, Qt). This is the single point a future native `platforms/unaos` backend
+    /// would target — rendering a workspace directly onto the kernel framebuffer
+    /// (`Screen` / `FrameBuffer`) with USB HID input — without changing any caller.
     pub fn bootstrap(
         &self,
         _window: &NativeWindow,
