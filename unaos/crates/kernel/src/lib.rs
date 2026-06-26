@@ -32,8 +32,7 @@ pub mod allocator;
 pub mod shell;
 
 pub mod pal;
-pub mod writer;
-pub mod fbcon;
+pub mod video;
 pub mod console;
 pub mod user;
 pub mod vug;

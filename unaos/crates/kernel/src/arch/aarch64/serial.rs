@@ -2,6 +2,10 @@ use core::fmt::{self, Write};
 use spin::Mutex;
 use lazy_static::lazy_static;
 
+// QEMU `virt` PL011 base. The real Pi 4 (BCM2711) PL011 is at 0xFE201000 — a different address —
+// so the `pi` build does NOT touch this UART at all (writing here would land in RAM and the TXFF
+// wait could spin forever); it relies on fbcon for on-screen output, exactly like the Mac.
+#[cfg_attr(feature = "pi", allow(dead_code))]
 const UART0_ADDR: usize = 0x0900_0000;
 
 pub struct SerialPort;
@@ -12,10 +16,20 @@ impl SerialPort {
     }
 
     pub fn write_byte(&self, byte: u8) {
-        let uart = UART0_ADDR as *mut u8;
+        #[cfg(feature = "pi")]
+        let _ = byte; // no UART on the Pi build — fbcon carries output
+        #[cfg(not(feature = "pi"))]
         unsafe {
-            // Wait until UART is ready to transmit
-            while (core::ptr::read_volatile(uart.add(0x18)) & (1 << 5)) != 0 {}
+            let uart = UART0_ADDR as *mut u8;
+            // Bounded TXFF wait: never spin forever if the UART is absent/misaddressed.
+            let mut spins: u32 = 0;
+            while (core::ptr::read_volatile(uart.add(0x18)) & (1 << 5)) != 0 {
+                spins += 1;
+                if spins > 1_000_000 {
+                    break;
+                }
+                core::hint::spin_loop();
+            }
             core::ptr::write_volatile(uart, byte);
         }
     }
@@ -39,10 +53,11 @@ pub fn _print(args: fmt::Arguments) {
     // Guard the serial lock with interrupts masked (matching x86) so an interrupt handler that
     // logs can't deadlock against an in-progress print holding the same lock.
     crate::arch::without_interrupts(|| {
-        SERIAL_PORT.lock().write_fmt(args).unwrap();
+        // Best-effort, never panic (write_byte is a no-op on the `pi` build).
+        let _ = SERIAL_PORT.lock().write_fmt(args);
     });
     // Mirror to the framebuffer console (visible without a serial port). fbcon self-guards.
-    crate::fbcon::_print(args);
+    crate::video::fbcon::_print(args);
 }
 
 // Expression-style (parentheses, no trailing semicolon) so the macros work in both
@@ -69,8 +84,15 @@ macro_rules! serial_println {
 
 impl SerialPort {
     pub fn read_byte(&self) -> Option<u8> {
-        let uart = UART0_ADDR as *mut u8;
+        // No UART input on the Pi build — reading the QEMU address would be RAM and inject phantom
+        // keystrokes. Video-only; there's no serial console on the Pi anyway.
+        #[cfg(feature = "pi")]
+        {
+            None
+        }
+        #[cfg(not(feature = "pi"))]
         unsafe {
+            let uart = UART0_ADDR as *mut u8;
             if (core::ptr::read_volatile(uart.add(0x18)) & (1 << 4)) == 0 {
                 Some(core::ptr::read_volatile(uart))
             } else {

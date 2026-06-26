@@ -56,4 +56,15 @@ pub struct BootInfo {
     /// Pointer to the array of memory regions
     pub memory_regions_addr: u64,
     pub memory_regions_len: usize,
+
+    /// Display mode-selection diagnostics, filled by the bootloader (for the `bootlog` readout):
+    /// the monitor's EDID-native resolution it parsed (0 if no EDID was readable), which EDID
+    /// protocol provided it, and which mode-selection branch ran.
+    pub edid_native_width: u32,
+    pub edid_native_height: u32,
+    /// 0 = no EDID read, 1 = EFI_EDID_ACTIVE_PROTOCOL, 2 = EFI_EDID_DISCOVERED_PROTOCOL.
+    pub edid_source: u32,
+    /// 0 = kept firmware current mode, 1 = set the EDID-native mode, 2 = set a fallback linear
+    /// mode (current was BltOnly), 3 = headless (no linear framebuffer available).
+    pub mode_action: u32,
 }

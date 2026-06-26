@@ -4,6 +4,23 @@ version = "0.1.0"
 edition = "2024"
 license = "GPL-3.0-or-later"
 
+[features]
+default = []
+# Skip xHCI/USB bring-up entirely (`pci::init`). For real-hardware video bring-up where the
+# firmware/SMM may still own the xHCI controller (this branch has no BIOS->OS handoff) and wedge
+# its reset handshake — the controller's status bits never flip, so the bounded-but-slow timeout
+# loops stall boot for many seconds before the GUI paints. With this feature the GUI comes up
+# immediately; USB is simply absent (no keyboard). Enable via `UNAOS_SKIP_XHCI=1 ./arroyo ...`.
+skip_xhci = []
+# Hold the fbcon boot log on screen instead of handing the framebuffer to the GUI: dumps the
+# effective framebuffer geometry/format (the result of EDID/GOP mode selection) and halts, so the
+# whole boot log can be photographed on serial-less hardware. Enable via `UNAOS_BOOTLOG=1`.
+bootlog = []
+# Raspberry Pi 4 build: the BCM2711 PL011 is not at the QEMU `virt` MMIO address the aarch64 serial
+# hardcodes, so don't touch that UART (it would be RAM on the Pi) — rely on fbcon for on-screen
+# output, like the Mac. Enable via `UNAOS_PI=1`.
+pi = []
+
 [dependencies]
 # FIX: Use 'spin_no_std' to explicitly disable Standard Library usage
 lazy_static = { version = "1.5.0", features = ["spin_no_std"] }

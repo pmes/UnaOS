@@ -22,7 +22,8 @@ fn main() {
     let esp_dir = target_dir.join("x86_64_esp");
 
     println!("🔹 Building x86_64 Kernel...");
-    let kernel_status = Command::new("cargo")
+    let mut kernel_cmd = Command::new("cargo");
+    kernel_cmd
         .current_dir(workspace_dir.join("crates/kernel"))
         .arg("+nightly")
         .arg("build")
@@ -30,9 +31,19 @@ fn main() {
         .arg("--target").arg("../../x86_64-unaos.json")
         .arg("-Z").arg("build-std=core,compiler_builtins,alloc")
         .arg("-Z").arg("build-std-features=compiler-builtins-mem")
-        .arg("-Z").arg("json-target-spec")
-        .status()
-        .unwrap();
+        .arg("-Z").arg("json-target-spec");
+    // Optional kernel features from env knobs: UNAOS_SKIP_XHCI=1 (disable xHCI/USB bring-up),
+    // UNAOS_BOOTLOG=1 (hold the boot log on screen instead of the GUI). Composable.
+    let mut feats: Vec<&str> = Vec::new();
+    if std::env::var("UNAOS_SKIP_XHCI").is_ok() { feats.push("skip_xhci"); }
+    if std::env::var("UNAOS_BOOTLOG").is_ok() { feats.push("bootlog"); }
+    if std::env::var("UNAOS_PI").is_ok() { feats.push("pi"); }
+    if !feats.is_empty() {
+        let list = feats.join(",");
+        kernel_cmd.arg("--features").arg(&list);
+        println!("   kernel features: {list}");
+    }
+    let kernel_status = kernel_cmd.status().unwrap();
 
     if !kernel_status.success() {
         panic!("Kernel build failed");
@@ -64,6 +75,16 @@ fn main() {
     
     std::fs::copy(&bootloader_bin, boot_dir.join("BOOTX64.EFI")).unwrap();
     std::fs::copy(&kernel_bin, esp_dir.join("kernel.elf")).unwrap();
+
+    // Package-only mode: build + pack the ESP, then stop (no QEMU). Used to produce real-hardware
+    // boot media — copy this directory's contents onto a FAT32 USB and boot the Mac via Option.
+    if std::env::var("UNAOS_PACKAGE_ONLY").is_ok() {
+        println!(
+            "✅ x86_64 ESP packaged at {} (EFI/BOOT/BOOTX64.EFI + kernel.elf)",
+            esp_dir.display()
+        );
+        return;
+    }
 
     println!("🔹 Locating OVMF (x86_64 UEFI Firmware)...");
     // Search is additive across platforms: macOS/Homebrew first (where this may run

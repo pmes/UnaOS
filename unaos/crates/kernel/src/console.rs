@@ -74,4 +74,24 @@ impl Console {
             pal.draw_rect(cursor_x, prompt_y, 8, 16, 0xFFFFFF);
         }
     }
+
+    /// Repaint ONLY the prompt/input line. This is the per-keystroke path: typing changes just
+    /// that line, so we clear its strip and redraw it instead of repainting the whole screen.
+    /// With damage tracking that means each keystroke flushes ~one text row, not the full frame —
+    /// the difference between snappy and unusable at native resolution. Use `draw()` for the full
+    /// repaint after command output (history changes).
+    pub fn draw_input_line(&self, pal: &mut TargetPal) {
+        let prompt_y = pal.height() as usize - 40;
+        // Clear the input-line strip (cursor cells are 16px tall) back to the background.
+        pal.draw_rect(0, prompt_y, pal.width() as usize, 16, 0x2D2B55);
+
+        let prompt = format!("{}@unaos:~$ ", self.session.username);
+        pal.draw_text(20, prompt_y, &prompt, 0x00FF00);
+
+        let input_x = 20 + (prompt.len() * 8);
+        pal.draw_text(input_x, prompt_y, &self.current_input, 0xFFFFFF);
+
+        let cursor_x = input_x + (self.current_input.len() * 8);
+        pal.draw_rect(cursor_x, prompt_y, 8, 16, 0xFFFFFF);
+    }
 }

@@ -21,7 +21,13 @@ use spin::Mutex;
 use crate::arch;
 
 pub const HEAP_START: usize = 0x_4444_4444_0000;
-pub const HEAP_SIZE: usize = 2 * 1024 * 1024; // 2 MiB
+// 48 MiB. The video back buffer (double-buffering) is heap-allocated and sized to the chosen
+// framebuffer mode, so the heap must hold it plus the xHCI/console/block allocations. The
+// bootloader drives the panel at its native (EDID) resolution: a Retina panel is 2880x1800x4 ~=
+// 20 MiB, and Apple GOP often pads the stride, so the back buffer can approach ~30 MiB. 48 MiB
+// covers that with margin. The bootloader caps mode selection so the back buffer can never exceed
+// what this heap can hold (see MAX_BACKBUF_BYTES in crates/bootloader).
+pub const HEAP_SIZE: usize = 48 * 1024 * 1024; // 48 MiB
 
 pub struct Locked<A> {
     inner: Mutex<A>,

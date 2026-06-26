@@ -10,7 +10,90 @@ use uefi::proto::console::gop::GraphicsOutput;
 use unaos_boot_info::{BootInfo, FrameBufferInfo, PixelFormat, MemoryRegion, MemoryRegionKind};
 
 use uefi::proto::media::file::{File, FileAttribute, FileMode};
-use uefi::proto::media::fs::SimpleFileSystem;
+use uefi::proto::unsafe_protocol;
+
+// EDID — how a monitor reports its own native/preferred resolution. The first Detailed Timing
+// Descriptor in the EDID block is the preferred (native) mode. UEFI exposes EDID via two protocols
+// (UEFI 2.x spec 12.9), neither in the `uefi` crate, so we declare both. Both have the same layout:
+// { UINT32 SizeOfEdid; UINT8 *Edid; }. We try ACTIVE (the EDID the firmware is actually using)
+// first, then DISCOVERED (the raw block read from the monitor) — different firmware publishes one,
+// the other, or neither.
+#[repr(C)]
+#[unsafe_protocol("bd8c1056-9f36-44ec-92a8-a6337f817986")]
+struct EdidActiveProtocol {
+    size_of_edid: u32,
+    edid: *const u8,
+}
+
+#[repr(C)]
+#[unsafe_protocol("1c0c34f6-d380-41fa-a049-8ad06c1a66aa")]
+struct EdidDiscoveredProtocol {
+    size_of_edid: u32,
+    edid: *const u8,
+}
+
+/// Parse the monitor's native (preferred) resolution from a raw EDID block: the first Detailed
+/// Timing Descriptor (offset 54). `None` if the block is too short/malformed or that descriptor is
+/// actually a monitor descriptor (zero pixel clock) rather than a timing.
+fn parse_edid_native(bytes: &[u8]) -> Option<(usize, usize)> {
+    if bytes.len() < 128 {
+        return None;
+    }
+    // EDID 1.x fixed header pattern.
+    if bytes[0..8] != [0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x00] {
+        return None;
+    }
+    let d = &bytes[54..72];
+    if d[0] == 0 && d[1] == 0 {
+        return None; // monitor descriptor, not a timing
+    }
+    // Horizontal/vertical active pixels: low 8 bits + high 4 bits packed in the upper nibble.
+    let w = (d[2] as usize) | (((d[4] as usize) >> 4) << 8);
+    let h = (d[5] as usize) | (((d[7] as usize) >> 4) << 8);
+    if w == 0 || h == 0 {
+        return None;
+    }
+    Some((w, h))
+}
+
+/// Read the monitor's native resolution from EDID on `handle`, trying the ACTIVE then DISCOVERED
+/// protocol. `None` if no EDID is exposed — callers then fall back to the firmware's current mode.
+/// Returns `(width, height, source)` where source is 1 = ACTIVE protocol, 2 = DISCOVERED protocol.
+fn edid_native_resolution(handle: uefi::Handle) -> Option<(usize, usize, u32)> {
+    // Safety: the firmware owns the EDID buffer; it's valid while boot services are live (we read
+    // it now, before exit_boot_services). `size_of_edid` is the firmware-reported length.
+    if let Ok(p) = boot::open_protocol_exclusive::<EdidActiveProtocol>(handle) {
+        if !p.edid.is_null() && p.size_of_edid >= 128 {
+            let bytes = unsafe { core::slice::from_raw_parts(p.edid, p.size_of_edid as usize) };
+            if let Some((w, h)) = parse_edid_native(bytes) {
+                return Some((w, h, 1));
+            }
+        }
+    }
+    if let Ok(p) = boot::open_protocol_exclusive::<EdidDiscoveredProtocol>(handle) {
+        if !p.edid.is_null() && p.size_of_edid >= 128 {
+            let bytes = unsafe { core::slice::from_raw_parts(p.edid, p.size_of_edid as usize) };
+            if let Some((w, h)) = parse_edid_native(bytes) {
+                return Some((w, h, 2));
+            }
+        }
+    }
+    None
+}
+
+/// Surface a fatal boot error on a serial-less machine. A returned error Status just bounces the
+/// firmware back to its boot picker — invisible (the "select EFI Boot -> black flash -> back to the
+/// picker" symptom). If a linear framebuffer is already up, paint it solid white (0xFF in every
+/// channel, so format-independent) and pause ~30s so the failure can be seen/photographed, then
+/// return the Status for the caller to propagate.
+fn boot_fail(fb_addr: u64, fb_size: usize, status: Status, what: &str) -> Status {
+    log::error!("BOOT FATAL: {} ({:?})", what, status);
+    if fb_addr != 0 && fb_size != 0 {
+        unsafe { core::ptr::write_bytes(fb_addr as *mut u8, 0xFF, fb_size); }
+    }
+    boot::stall(core::time::Duration::from_secs(30));
+    status
+}
 
 #[entry]
 fn main() -> Status {
@@ -20,7 +103,12 @@ fn main() -> Status {
     let fb_addr: u64;
     let fb_size: usize;
     let fb_info: FrameBufferInfo;
-    
+    // Display mode-selection diagnostics, surfaced to the kernel via BootInfo (bootlog readout).
+    let mut edid_native_w: u32 = 0;
+    let mut edid_native_h: u32 = 0;
+    let mut edid_source: u32 = 0;
+    let mut mode_action: u32 = 0;
+
     {
         let gop_handle = match boot::get_handle_for_protocol::<GraphicsOutput>() {
             Ok(handle) => handle,
@@ -37,13 +125,116 @@ fn main() -> Status {
             }
         };
         
+        // Choose the display mode. Resolution is auto-detected (never hard-coded). We target the
+        // monitor's NATIVE resolution — read from its EDID — not the GPU's largest advertised mode:
+        // a non-native mode on a real panel means scaling/blur, or one the monitor can't display.
+        // The fallback is the firmware's current mode (which firmware usually already sets from
+        // EDID). The full mode list is logged because on serial-less hardware it's the only way to
+        // see what the panel offers.
+        //
+        // Capped to what the kernel can back-buffer: the double-buffer back buffer is
+        // stride*height*4 bytes and must fit the kernel heap. MAX_BACKBUF_BYTES is tied to
+        // crates/kernel allocator::HEAP_SIZE (48 MiB) — keep in sync; 40 MiB leaves headroom.
+        const MAX_BACKBUF_BYTES: usize = 40 * 1024 * 1024;
+
+        let cur_info = gop.current_mode_info();
+        let cur = cur_info.resolution();
+        let cur_linear = matches!(
+            cur_info.pixel_format(),
+            uefi::proto::console::gop::PixelFormat::Rgb | uefi::proto::console::gop::PixelFormat::Bgr
+        );
+        log::info!("GOP: {} modes (firmware current {}x{}):", gop.modes().len(), cur.0, cur.1);
+        for mode in gop.modes() {
+            let mi = mode.info();
+            let (w, h) = mi.resolution();
+            log::info!("  GOP mode: {}x{} stride={} fmt={:?}", w, h, mi.stride(), mi.pixel_format());
+        }
+
+        // The monitor's native resolution from EDID, if the firmware exposes it.
+        let edid = edid_native_resolution(gop_handle);
+        let native = edid.map(|(w, h, _)| (w, h));
+        match edid {
+            Some((w, h, s)) => {
+                edid_native_w = w as u32;
+                edid_native_h = h as u32;
+                edid_source = s;
+                log::info!("EDID: monitor native resolution {}x{} (source {})", w, h, s);
+            }
+            None => log::info!("EDID: not available; using the firmware's current mode"),
+        }
+
+        // A "usable" mode has a linear (Rgb/Bgr) framebuffer within the back-buffer budget. BltOnly
+        // and Bitmask modes have no directly-addressable framebuffer, so they're never usable here.
+        let usable = |mi: &uefi::proto::console::gop::ModeInfo| -> bool {
+            matches!(
+                mi.pixel_format(),
+                uefi::proto::console::gop::PixelFormat::Rgb | uefi::proto::console::gop::PixelFormat::Bgr
+            ) && mi.stride() * mi.resolution().1 * 4 <= MAX_BACKBUF_BYTES
+        };
+
+        // Decide the target mode (None = the current mode is already what we want):
+        //   1. the EDID-native resolution as a linear mode — drive the panel at native res; else
+        //   2. if the current mode is already linear, keep it (firmware set it, usually from EDID); else
+        //   3. the current mode is BltOnly/Bitmask (no linear framebuffer) so we MUST switch: prefer a
+        //      linear mode at the firmware's chosen resolution, else the largest linear within budget.
+        let by_native = native
+            .and_then(|res| gop.modes().find(|m| m.info().resolution() == res && usable(m.info())));
+        let target_is_native = by_native.is_some();
+        let target: Option<uefi::proto::console::gop::Mode> = if by_native.is_some() {
+            by_native
+        } else if cur_linear {
+            None
+        } else {
+            gop.modes()
+                .find(|m| m.info().resolution() == cur && usable(m.info()))
+                .or_else(|| {
+                    gop.modes().filter(|m| usable(m.info())).max_by_key(|m| {
+                        let (w, h) = m.info().resolution();
+                        w * h
+                    })
+                })
+        };
+
+        match target {
+            Some(mode) => {
+                let (w, h) = mode.info().resolution();
+                // Switch when the resolution changes or the current mode lacks a linear framebuffer.
+                if (w, h) != cur || !cur_linear {
+                    match gop.set_mode(&mode) {
+                        Ok(()) => {
+                            // 1 = drove the panel to its EDID-native res; 2 = fallback linear mode.
+                            mode_action = if target_is_native { 1 } else { 2 };
+                            log::info!("GOP: set linear mode {}x{}", w, h);
+                        }
+                        Err(e) => log::warn!(
+                            "GOP: set_mode {}x{} failed ({:?}); current {}x{}", w, h, e, cur.0, cur.1
+                        ),
+                    }
+                } else {
+                    log::info!("GOP: current mode {}x{} already native + linear", w, h);
+                }
+            }
+            None => log::info!("GOP: keeping firmware current mode {}x{}", cur.0, cur.1),
+        }
+
+        // Read the active mode *after* any set_mode (it invalidates the old framebuffer).
         let mode_info = gop.current_mode_info();
-        let mut fb = gop.frame_buffer();
-        
         let pixel_format = match mode_info.pixel_format() {
             uefi::proto::console::gop::PixelFormat::Rgb => PixelFormat::Rgb,
             uefi::proto::console::gop::PixelFormat::Bgr => PixelFormat::Bgr,
             _ => PixelFormat::Unknown,
+        };
+
+        // Only access the linear framebuffer if the active mode actually has one. A BltOnly/Bitmask
+        // mode has no direct framebuffer (gop.frame_buffer() would panic); rather than die in the
+        // bootloader we boot without a display (the kernel falls back to serial-only).
+        let (fb_ptr, fb_bytes) = if matches!(pixel_format, PixelFormat::Rgb | PixelFormat::Bgr) {
+            let mut fb = gop.frame_buffer();
+            (fb.as_mut_ptr() as u64, fb.size())
+        } else {
+            mode_action = 3; // headless: no linear framebuffer available
+            log::warn!("GOP: active mode has no linear framebuffer; booting without a display");
+            (0u64, 0usize)
         };
 
         fb_info = FrameBufferInfo {
@@ -53,45 +244,31 @@ fn main() -> Status {
             bytes_per_pixel: 4,
             pixel_format,
         };
-        
-        fb_addr = fb.as_mut_ptr() as u64;
-        fb_size = fb.size();
+        fb_addr = fb_ptr;
+        fb_size = fb_bytes;
     }
 
-    let sfs_handle = match boot::get_handle_for_protocol::<SimpleFileSystem>() {
-        Ok(handle) => handle,
-        Err(e) => {
-            log::error!("Failed to get SimpleFileSystem handle: {:?}", e);
-            return Status::LOAD_ERROR;
-        }
-    };
-    let mut sfs = match boot::open_protocol_exclusive::<SimpleFileSystem>(sfs_handle) {
+    // Open the filesystem on the SAME device this bootloader image was loaded from. A real machine
+    // exposes many SimpleFileSystem volumes (internal ESP, recovery, our USB stick, ...), and the
+    // old `get_handle_for_protocol::<SimpleFileSystem>()` returned an arbitrary one — on the Mac it
+    // picked the wrong volume, kernel.elf wasn't there, and we returned NOT_FOUND so the firmware
+    // silently bounced back to the boot picker. get_image_file_system resolves the loaded-image
+    // device handle, so we always read kernel.elf from our own ESP (QEMU has one volume, unaffected).
+    let mut sfs = match boot::get_image_file_system(boot::image_handle()) {
         Ok(sfs) => sfs,
-        Err(e) => {
-            log::error!("Failed to open SimpleFileSystem protocol: {:?}", e);
-            return Status::LOAD_ERROR;
-        }
+        Err(e) => return boot_fail(fb_addr, fb_size, e.status(), "open boot-volume filesystem"),
     };
     let mut root = match sfs.open_volume() {
         Ok(root) => root,
-        Err(e) => {
-            log::error!("Failed to open root volume: {:?}", e);
-            return Status::LOAD_ERROR;
-        }
+        Err(e) => return boot_fail(fb_addr, fb_size, e.status(), "open root volume"),
     };
 
     let mut kernel_file = match root.open(cstr16!("kernel.elf"), FileMode::Read, FileAttribute::empty()) {
         Ok(file) => match file.into_regular_file() {
             Some(f) => f,
-            None => {
-                log::error!("kernel.elf is not a regular file");
-                return Status::LOAD_ERROR;
-            }
+            None => return boot_fail(fb_addr, fb_size, Status::LOAD_ERROR, "kernel.elf is not a regular file"),
         },
-        Err(e) => {
-            log::error!("Failed to open kernel.elf: {:?}", e);
-            return Status::NOT_FOUND;
-        }
+        Err(e) => return boot_fail(fb_addr, fb_size, e.status(), "open kernel.elf (missing on our volume?)"),
     };
 
     let mut file_info_buf = [0u8; 128];
@@ -306,6 +483,10 @@ fn main() -> Status {
         rsdp_addr,
         memory_regions_addr: 0,
         memory_regions_len: 0,
+        edid_native_width: edid_native_w,
+        edid_native_height: edid_native_h,
+        edid_source,
+        mode_action,
     });
     let boot_info_static = alloc::boxed::Box::leak(boot_info);
 
