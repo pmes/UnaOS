@@ -54,6 +54,7 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
         "help" => {
             console.println("COMMANDS: ver, help, clear, echo, panic, gneiss");
             console.println("STORAGE:  diskinfo, read <lba>, write <lba> <byte>");
+            console.println("SMP:      sched (per-CPU run queues)");
         },
         "clear" => {
             // Clear both the screen and the console buffer?
@@ -128,6 +129,31 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
                  console.println("Initiating Vug: Standard Spectrum...");
                  vug::run_test_pattern(pal);
              }
+        },
+        "sched" | "ps" => {
+            #[cfg(target_arch = "x86_64")]
+            {
+                let count = core::cmp::min(
+                    crate::arch::acpi::cpu_count().max(1),
+                    crate::arch::gdt::MAX_CPUS,
+                );
+                console.println("CPU  role  current  run-queue");
+                for cpu in 0..count {
+                    let role = if cpu == 0 { "bsp" } else { "ap " };
+                    let cur = match crate::arch::sched::current_task_id(cpu) {
+                        Some(id) => alloc::format!("tid {}", id),
+                        None => "-".into(),
+                    };
+                    console.println(&alloc::format!(
+                        "{:>3}  {}   {:<8} {}",
+                        cpu, role, cur, crate::arch::sched::run_queue_len(cpu)
+                    ));
+                }
+                console.println(&alloc::format!(
+                    "demo tasks finished: {}", crate::arch::sched::demo_done()));
+            }
+            #[cfg(not(target_arch = "x86_64"))]
+            console.println("sched: x86_64 only");
         },
         "shutdown" | "off" => {
              // TODO: Create arch::shutdown()

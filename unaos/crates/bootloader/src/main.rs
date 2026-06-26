@@ -273,6 +273,29 @@ fn main() -> Status {
         });
     }
 
+    // ACPI RSDP (x86_64): the firmware hands us the Root System Description Pointer via a UEFI
+    // configuration-table entry. Prefer the ACPI 2.0 entry (XSDT, 64-bit pointers); fall back to
+    // the legacy ACPI 1.0 entry (RSDT). The kernel walks it to find the MADT (CPU topology) for
+    // SMP bring-up. (aarch64 uses the DTB instead, handled above.)
+    #[allow(unused_mut)]
+    let mut rsdp_addr = 0u64;
+    #[cfg(target_arch = "x86_64")]
+    {
+        use uefi::table::cfg::ConfigTableEntry;
+        uefi::system::with_config_table(|config_table| {
+            for entry in config_table {
+                if entry.guid == ConfigTableEntry::ACPI2_GUID {
+                    rsdp_addr = entry.address as u64;
+                    break; // ACPI 2.0 preferred; stop on first match
+                }
+                if entry.guid == ConfigTableEntry::ACPI_GUID && rsdp_addr == 0 {
+                    rsdp_addr = entry.address as u64; // 1.0 fallback, keep scanning for 2.0
+                }
+            }
+        });
+        log::info!("ACPI RSDP at {:#x}", rsdp_addr);
+    }
+
     let boot_info = alloc::boxed::Box::new(BootInfo {
         framebuffer_addr: fb_addr,
         framebuffer_size: fb_size,
@@ -280,6 +303,7 @@ fn main() -> Status {
         physical_memory_offset: 0,
         dtb_addr,
         dtb_size,
+        rsdp_addr,
         memory_regions_addr: 0,
         memory_regions_len: 0,
     });

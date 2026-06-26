@@ -57,6 +57,63 @@ pub unsafe fn write_config_16(bus: u8, slot: u8, func: u8, offset: u8, value: u1
     data.write(value);
 }
 
+pub unsafe fn write_config_32(bus: u8, slot: u8, func: u8, offset: u8, value: u32) {
+    let address = 0x8000_0000
+        | ((bus as u32) << 16)
+        | ((slot as u32) << 11)
+        | ((func as u32) << 8)
+        | ((offset as u32) & 0xFC);
+
+    let mut addr_port = Port::<u32>::new(0xCF8);
+    addr_port.write(address);
+    let mut data = Port::<u32>::new(0xCFC);
+    data.write(value);
+}
+
+/// Intel PCH xHCI port routing. On Intel chipsets (e.g. Panther Point in the 2012 MacBook Pro
+/// Retina) the USB2 ports are physically shared with an EHCI companion controller and default to
+/// EHCI; the SuperSpeed lanes likewise need enabling. We route every *switchable* port to xHCI by
+/// copying the routing-MASK registers (USB2PRM @ 0xD4 / USB3PRM @ 0xDC = "which ports CAN switch")
+/// into the routing-SELECT registers (XUSB2PR @ 0xD0 / USB3_PSSEN @ 0xD8). Without this the xHCI
+/// sees no devices on the shared ports. Gated to the specific Intel xHCI device ids that have an
+/// EHCI companion; a clean no-op on everything else (QEMU's qemu-xhci is vendor 0x1b36, not Intel).
+/// Mirrors Linux's `usb_enable_intel_xhci_ports`. Must run while the controller is halted, before
+/// it starts.
+fn enable_intel_xhci_ports(bus: u8, dev: u8, func: u8) {
+    const XUSB2PR: u8 = 0xD0;
+    const USB2PRM: u8 = 0xD4;
+    const USB3_PSSEN: u8 = 0xD8;
+    const USB3PRM: u8 = 0xDC;
+    // Intel xHCI controllers whose USB2 ports are shared with an EHCI companion.
+    const SWITCHABLE: &[u16] = &[
+        0x1E31, // Panther Point (7-series — 2012 MacBook Pro Retina)
+        0x8C31, // Lynx Point
+        0x9C31, // Lynx Point-LP
+        0x9CB1, // Wildcat Point-LP
+        0x22B5, // Cherry View / Braswell
+    ];
+
+    unsafe {
+        if read_config_16(bus, dev, func, 0x00) != 0x8086 {
+            return; // not Intel
+        }
+        let device = read_config_16(bus, dev, func, 0x02);
+        if !SWITCHABLE.contains(&device) {
+            return; // Intel, but not a shared-port xHCI
+        }
+
+        let ss = read_config_32(bus, dev, func, USB3PRM);
+        write_config_32(bus, dev, func, USB3_PSSEN, ss); // enable SuperSpeed on supported ports
+        let usb2 = read_config_32(bus, dev, func, USB2PRM);
+        write_config_32(bus, dev, func, XUSB2PR, usb2); // route USB2 ports to xHCI
+
+        serial_println!(
+            ":: Intel xHCI port routing applied (dev {:#06x}): USB3_PSSEN={:#010x} XUSB2PR={:#010x} ::",
+            device, ss, usb2
+        );
+    }
+}
+
 pub fn init(_dtb_addr: u64, _dtb_size: usize) {
     if let Some((xhci_phys_addr, bus, dev, func)) = crate::drivers::pci::PciScanner::scan() {
         serial_println!(":: x86_64 PCI Init: Found xHCI at {:#x} ::", xhci_phys_addr);
@@ -68,6 +125,10 @@ pub fn init(_dtb_addr: u64, _dtb_size: usize) {
         // Enable PCI Memory Space + Bus Master (DMA) for the controller. Without Bus
         // Master the xHCI can never fetch command TRBs or write event TRBs.
         crate::drivers::pci::PciScanner::enable_bus_master(bus, dev, func);
+
+        // Intel PCH quirk: route USB2/USB3 ports from the EHCI companion to xHCI before the
+        // controller starts (else it sees no devices on shared ports). No-op on non-Intel (QEMU).
+        enable_intel_xhci_ports(bus, dev, func);
 
         // Initialize xHCI
         crate::drivers::xhci::init(xhci_phys_addr); // Reset and command ring

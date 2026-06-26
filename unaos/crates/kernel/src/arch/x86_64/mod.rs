@@ -3,6 +3,10 @@ pub mod serial;
 pub mod gdt;
 pub mod interrupts;
 pub mod apic;
+pub mod acpi;
+pub mod percpu;
+pub mod smp;
+pub mod sched;
 pub mod pci;
 pub mod memory;
 
@@ -14,6 +18,9 @@ pub fn init() {
     // interrupts. Input is USB-HID via the xHCI MSI-X path — no PS/2, no PIT, no I/O APIC.
     interrupts::disable_legacy_pic();
     apic::init();
+    // Per-CPU data for the BSP (logical CPU 0). Must precede `sti` so the timer/IPI handlers
+    // can resolve `this_cpu()` via the GS base.
+    percpu::init_cpu(0, apic::apic_id_u32());
     x86_64::instructions::interrupts::enable();
 }
 

@@ -47,6 +47,12 @@ pub struct BootInfo {
     pub dtb_addr: u64,
     pub dtb_size: usize,
 
+    /// Physical address of the ACPI RSDP (Root System Description Pointer), found by the
+    /// bootloader in the UEFI configuration table (x86_64). 0 if not present. The kernel walks
+    /// it (RSDP -> XSDT -> MADT) to discover the CPU topology for SMP bring-up. On aarch64 the
+    /// equivalent discovery comes from the DTB, so this stays 0 there.
+    pub rsdp_addr: u64,
+
     /// Pointer to the array of memory regions
     pub memory_regions_addr: u64,
     pub memory_regions_len: usize,

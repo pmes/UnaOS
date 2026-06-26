@@ -22,6 +22,15 @@ pub extern "C" fn _start(boot_info: &'static mut BootInfo) -> ! {
 }
 
 fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
+    // 0. Framebuffer log sink FIRST — mirror every serial_println! (and panics) to the screen,
+    //    so boot diagnostics are visible on real hardware that has no serial port. No-op if the
+    //    firmware gave us no framebuffer. The GUI repaints over it later on a successful boot.
+    unaos_kernel::fbcon::init(
+        boot_info.framebuffer_addr,
+        boot_info.framebuffer_size,
+        boot_info.framebuffer_info,
+    );
+
     // 1. Core Hardware Init (GDT, IDT, local APIC for x86_64, GIC for aarch64)
     unaos_kernel::init();
 
@@ -35,9 +44,36 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     let dtb_addr = boot_info.dtb_addr;
     let dtb_size = boot_info.dtb_size;
 
+    // ACPI RSDP (x86_64) before memory init consumes boot_info
+    #[cfg(target_arch = "x86_64")]
+    let rsdp_addr = boot_info.rsdp_addr;
+
     // 4. Global Heap Allocation (Phase 3 Memory Translation)
     unaos_kernel::arch::memory::init(boot_info);
     serial_println!(":: KERNEL HEAP ALLOCATED ::");
+
+    // 4b. ACPI: discover the CPU topology (MADT) for SMP bring-up. x86_64 only — aarch64
+    // discovers CPUs via the DTB. Degrades gracefully to uniprocessor if ACPI is absent.
+    #[cfg(target_arch = "x86_64")]
+    unaos_kernel::arch::acpi::init(rsdp_addr);
+
+    // 4c. SMP: start the application processors (INIT-SIPI-SIPI). Each AP brings up its own
+    // per-CPU GDT/TSS + local APIC, then waits to enter its scheduler loop; the BSP continues to
+    // drive everything below. `start_aps` also runs the post-bring-up SMP smoke test while the
+    // APs are still idle.
+    #[cfg(target_arch = "x86_64")]
+    unaos_kernel::arch::smp::start_aps();
+
+    // 4d. Scheduler: now that SMP verification has run against idle APs, initialise the per-CPU
+    // run queues, turn scheduling on, and spawn a small demo workload across the APs to exercise
+    // preemption / cooperative yield / task exit. The BSP itself is never scheduled — it stays
+    // the hardware-service core in the loop below.
+    #[cfg(target_arch = "x86_64")]
+    {
+        unaos_kernel::arch::sched::init();
+        let online = unaos_kernel::arch::smp::online_aps();
+        unaos_kernel::arch::sched::start_demo(&online);
+    }
 
     // 5. Motherboard Hardware Interconnects
     unaos_kernel::arch::pci::init(dtb_addr, dtb_size);
@@ -71,6 +107,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         if let Some(xhci) = &mut *unaos_kernel::drivers::xhci::XHCI_CONTROLLER.lock() {
             xhci.poll_events();
             xhci.service_storage();
+            xhci.service_hubs();
         }
 
         #[cfg(target_arch = "aarch64")]
@@ -137,6 +174,10 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
 
 #[panic_handler]
 fn panic(info: &PanicInfo) -> ! {
+    // Paint a red panic backdrop on the framebuffer (visible on hardware with no serial), then
+    // print the message — serial_println! mirrors it onto that backdrop via fbcon.
+    unaos_kernel::fbcon::panic_screen();
+    serial_println!("=== KERNEL PANIC ===");
     serial_println!("{}", info);
     unaos_kernel::arch::hlt_loop();
 }
