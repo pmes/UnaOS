@@ -1,39 +1,63 @@
-# 📡 Comscan: The Radar
+# Comscan
 
-> *"The air is not empty. It is screaming with data, if you have the ears to hear it."*
+The hardware I/O and signal handler for UnaOS: a bridge between the workspace
+and external hardware over serial, GPIO, Bluetooth, and software-defined radio.
 
-**Comscan** is the signal analysis and hardware I/O suite of **UnaOS**. It rejects the passive "Settings Menu" approach to connectivity. Instead, it visualizes the electromagnetic spectrum and the raw hardware interfaces around you.
+**Status: design-stage (not yet implemented).** This document describes the
+intended design. There is no implementation crate yet — no `Cargo.toml`, no
+`ignite(...)` entry point, no source. The behavior below is a specification, not
+a description of working code.
 
-We do not just "pair" devices. We interrogate them.
+## Responsibility
 
-## 🌌 The Philosophy: Active Scanning
+Comscan owns direct communication with hardware interfaces. Where most of the
+system deals in files, workspaces, and rendered views, Comscan deals in raw byte
+streams, link parameters, and wireless device discovery. It is the handler other
+parts of the system use when they need to talk to a physical device — for
+example, streaming a generated CNC/3D toolpath to a controller over USB serial.
 
-Modern OSs hide the complexity of wireless protocols behind friendly names and loading spinners. **Comscan** exposes the raw signal strength (RSSI), the MAC addresses, and the handshake protocols.
+## Scope (planned)
 
-### 1. The Spectrum (Wireless)
-Comscan treats Bluetooth and WiFi as hostile environments first, and utilities second.
-*   **The Waterfall:** A real-time visualizer of the 2.4GHz and 5GHz spectrum. See interference before you blame the router.
-*   **The Interceptor:** View raw advertisement packets from BLE (Bluetooth Low Energy) devices. Debug your IoT hardware without a phone app.
+- **Serial / UART** — a terminal and byte pipe for microcontrollers and
+  controllers (Arduino, ESP32, STM32, 3D-printer/CNC firmware), with baud-rate
+  detection and a hex/ASCII view of raw traffic.
+- **GPIO** — read/write of general-purpose I/O lines on supported hardware.
+- **Bluetooth** — discovery and inspection of BLE devices, including raw
+  advertisement data; pairing key material is delegated to the `holocron`
+  secrets handler rather than stored by Comscan.
+- **Software-defined radio (SDR)** — spectrum capture and demodulation for
+  diagnostic and sub-GHz protocol work.
 
-### 2. The Hardline (Wired)
-For the hardware hacker, Comscan is the ultimate serial terminal.
-*   **UART / Serial:** A high-speed, low-latency terminal for talking to microcontrollers (Arduino, ESP32, STM32).
-*   **Baud Rate Auto-Detect:** It guesses the speed so you don't see garbage text.
-*   **Hex Dump Mode:** See the raw bytes coming over the wire alongside the ASCII interpretation.
+Comscan is intended to build on the serial/signal stack in `gneiss_pal`
+(`src/net`) rather than re-implement host transport itself.
 
-## 🎛️ The Mechanics
+## Integration with the Synapse / SMessage bus
 
-### The Tuner
-Comscan integrates Software Defined Radio (SDR) capabilities directly into the OS.
-*   **FM/AM Demodulation:** Listen to radio.
-*   **Protocol Sniffing:** Analyze sub-GHz remotes and sensors.
+Like every UnaOS handler, Comscan is a self-contained crate that will expose an
+async entry point (by convention `ignite(...)`), subscribe to the `Synapse`
+broadcast bus, and react to `SMessage` variants. It does not call other handlers
+directly. The planned message flow:
 
-### The Handshake
-When connecting to a device (keyboard, mouse, headphones), Comscan handles the cryptographic keys and stores them securely in **Holocron**. It ensures no Man-in-the-Middle attacks are occurring during pairing.
+- **Inbound** — Comscan subscribes via `Synapse::subscribe()` and acts on
+  commands addressed to it: open/close a port, set link parameters, write a byte
+  stream to a device, start/stop a scan.
+- **Outbound** — Comscan publishes via `Synapse::fire(msg)`: device-discovery
+  results, received serial/wireless data, and link-status changes, for the GUI
+  and other handlers to observe.
 
-## 🛑 The Kill List
-Comscan replaces:
-*   **System Settings > Bluetooth / WiFi**
-*   **PuTTY / Screen / Minicom** (Serial Terminals)
-*   **Wireshark** (for Bluetooth/WiFi packet capture)
-*   **GQRX / SDR#** (Software Defined Radio tools)
+Dedicated `SMessage` variants for Comscan's commands and events are not yet
+defined; adding them is a deliberate, reviewed change to the shared `bandy`
+enum.
+
+## Relationship to other handlers
+
+- **Vug** (3D/CAD/CAM) generates toolpaths; Comscan streams them to the machine.
+  This is the "design → make" path with no intermediate slicer or export step.
+- **Holocron** holds pairing keys and other secrets; Comscan defers all key
+  storage to it.
+
+## See also
+
+- [`docs/dev/USERLAND/ARCHITECTURE.md`](../../docs/dev/USERLAND/ARCHITECTURE.md)
+  — the handler / Synapse / SMessage model.
+- [`docs/CODEX.md`](../../docs/CODEX.md) — the full handler manifest.

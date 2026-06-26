@@ -1,91 +1,72 @@
-# 💎 Vug: The Visual Cortex
+# Vug — 3D / CAD handler
 
-> *"To the machine, a pixel is just data. To Vug, a pixel is depth."*
+Vug is the UnaOS handler responsible for 3D geometry: CAD-style viewing and
+editing, and (longer term) CAM / slicing. In the handler manifest it is the
+"3D" domain service — the counterpart to tools such as Fusion 360 or Cura.
 
-**Vug** (named after the small, crystal-lined cavities inside rocks) is the **Geometry Kernel** and **perception engine** of **UnaOS**.
+## Status
 
-It is far more than a 3D demo or a window manager. It is a **Spatial Interpreter** that bridges the gap between 2D imagery and 3D understanding.
-Where other systems see a "JPEG," Vug sees a **Heightmap**. Where others see a "Window," Vug sees a **Plane**.
+**Design-stage / early prototype.** The crate today contains standalone
+rendering experiments, not a wired handler. There is no `ignite(...)` entry
+point, no `Synapse` subscription, and no `SMessage` handling yet; `main.rs` is a
+placeholder. The pieces below are building blocks toward the handler described
+in [`docs/CODEX.md`](../../docs/CODEX.md), not the handler itself.
 
----
+## What exists today
 
-## 👁 The Philosophy
+- **`renderer.rs` — `Renderer`** (declared via `lib.rs`). A GTK4 `GLArea`
+  OpenGL renderer that draws an animated, indexed colored cube with a
+  perspective camera. Public surface:
+  - `Renderer::new()` / `Default`
+  - `load_gl_functions()` — loads GL symbols via `epoxy::get_proc_addr`
+  - `init_gl()` — compiles the shaders and uploads the cube's VAO/VBO/EBO
+  - `draw(&GLArea, &GLContext)` — renders one frame and requests continuous
+    redraw
+  - `update_spectrum(Vec<f32>)` — feeds an audio spectrum that scales the
+    geometry (an early audio-reactive hook)
 
-### 1. The Calibration (The Benchmark is the Setting)
-When you first run UnaOS, Vug launches a "Demo"—a spinning, ray-traced crystal.
-*   **The Myth:** This is just eye candy.
-*   **The Reality:** This is a **System Calibration**. Vug measures the exact frame timing, memory bandwidth, and compute shader performance of your hardware.
-*   **The Result:** It sets a global "Snappiness Profile" for the entire OS. If you are on a 10-year-old laptop, Vug disables the heavy blur shaders to ensure the UI remains instantly responsive (60fps locked).
+  Vector and matrix math (`Mat4`, `Vec3`, `Vec4`, look-at and perspective
+  projections) come from the shared `euclase` library.
 
-### 2. The Perception (2D to 3D)
-Vug rejects the flat world.
-*   **Standard Viewer:** Opens a photo. It is a flat rectangle.
-*   **Vug Viewer:** Opens a photo. It analyzes luminance, color, and edge contrast to generate a **Depth Map** in real-time.
-    *   It allows you to tilt, pan, and "look around" a static image.
-    *   It detects "Assemblies"—distinct objects within the image—and offers to break them apart into layers.
+- **`viewport.rs` — `VugViewport`** (`forge` / `render`). A separate WGPU
+  prototype that draws an RGB origin triad as a wireframe through the `euclase`
+  `Cortex` (device / queue / surface) and the `vug_wireframe.wgsl` shader. Note
+  this module is **not** yet referenced from `lib.rs` and pulls in `wgpu` /
+  `bytemuck`, which are not in `Cargo.toml`; it is an exploratory file rather
+  than a compiled part of the crate.
 
-### 3. The Handoff (From Viewer to Editor)
-Vug is the gateway to **Elessar**.
-*   You are looking at a photo of a mechanical part in Vug.
-*   You click "Extrude."
-*   Vug instantly converts the depth map into a **Mesh**, hands the object to **Elessar**, and suddenly—without a loading screen—you are in a CAD environment, editing the geometry of what was just a flat picture moments ago.
+Two rendering backends are therefore present in parallel (GTK4 + raw OpenGL, and
+WGPU); converging on one is part of the work remaining.
 
----
+## How it will plug into the bus
 
-## 🧱 The Architecture
+UnaOS handlers are domain-service crates that expose an async entry point
+(by convention `ignite(...)`), subscribe to the **Synapse** message bus, and
+react to **`SMessage`** variants. The bus is defined in `libs/bandy`: `Synapse`
+wraps a Tokio broadcast channel (`fire` to publish, `subscribe` to receive) and
+`SMessage` is the single enum of every message type in the system. Handlers do
+not call each other directly — they communicate only through `SMessage` on the
+Synapse.
 
-### 1. The Ray Marcher (SDF)
-Vug does not use triangles for its UI. It uses **Signed Distance Functions (SDFs)**.
-*   **Mathematics:** Every button, window, and icon is defined by a mathematical formula, not a texture.
-*   **Infinite Resolution:** You can zoom in on a Vug interface until you see the sub-pixels, and the curve will remain perfectly smooth.
-*   **Tiny Footprint:** The entire UI code fits in the CPU L1 Cache.
+Vug does not yet implement this surface. The intended shape is an
+`ignite(synapse)` task that subscribes to the bus, renders the active 3D model,
+and publishes results (view state, generated geometry, and eventually CAM
+toolpaths) back as `SMessage`s. The specific variants are not yet defined.
 
-### 2. The "Vug Protocol" (Graphics Shard)
-Vug communicates with the **Gneiss PAL** to request the raw framebuffer.
-*   **Direct Mode:** It bypasses standard compositors to write directly to video memory.
-*   **Latency:** By owning the pixel pipeline, Vug guarantees "Photon-to-Motion" latency lower than any standard desktop compositor (Wayland/X11).
+## Dependencies
 
----
+- `gtk4`, `glib`, `epoxy`, `gl` — GTK4 windowing and the OpenGL path
+- `euclase` (`libs/euclase`) — shared GPU rendering and vector/matrix math
 
-## 🛠 Developer Information
+## Build
 
-**Vug** is a high-performance graphics shard.
-
-**Prerequisites:**
-*   `vulkan` or `metal` support (Host Mode).
-*   **UEFI GOP** (Target Mode - UnaOS).
-
-**Build Targets:**
 ```bash
-# Run the Vug Calibration Demo (Host)
-cargo run -p vug --release
-
-# Run the Unit Tests (Math Verification)
-cargo test -p vug
+cargo build -p vug
+cargo test  -p vug
 ```
 
----
+## See also
 
-## 🤖 Directives for Agents (The Wolfpack)
-
-**ATTENTION:** If you are an AI agent (J1-J20) contributing to this repository, you must adhere to the following **Vug Protocol**:
-
-### 1. The "Math First" Rule
-**DO NOT** use large texture assets or heavy meshes.
-*   **Rule:** If a shape can be defined by an equation (Sphere, Box, Torus), use the **SDF primitive**.
-*   **Why:** We are building a system that fits on a floppy disk but looks like a AAA game. Math is lighter than textures.
-
-### 2. The "60Hz" Mandate
-Vug is the UI. If the UI drops a frame, the illusion breaks.
-*   **Constraint:** All rendering logic must complete within **16.6ms**.
-*   **Enforcement:** The build server will fail if any Vug shader exceeds the complexity budget.
-
----
-
-## 🔮 Roadmap
-
-*   [ ] **Phase 1: The Crystal** - Implement the SDF Ray Marcher and the Calibration Scene.
-*   [ ] **Phase 2: The Viewer** - Implement the 2D-to-3D depth estimation shader for images.
-*   [ ] **Phase 3: The Bridge** - Create the "Handoff Protocol" to send geometry from Vug to **Elessar**.
-
-> *"The world is not flat. Neither is your data."*
+- [`docs/CODEX.md`](../../docs/CODEX.md) — handler manifest (Vug = "The Sculptor").
+- [`docs/dev/USERLAND/ARCHITECTURE.md`](../../docs/dev/USERLAND/ARCHITECTURE.md) —
+  vessels / handlers / Bandy / Synapse / SMessage.

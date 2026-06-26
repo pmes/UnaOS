@@ -78,3 +78,11 @@ The Kernel (`unaos`) is divided into strict safety zones.
 *   **Zone 3: The Scream.** Interrupt Descriptor Table (IDT). Handling hardware exceptions and panics.
 *   **Zone 4: The Pulse.** The Scheduler. Context switching logic.
 *   **Zone 5: The Fence.** **`MmioDoorbell` Trait**. All hardware IO must be fenced (`mfence`) to prevent race conditions.
+
+## 7. Engineering Documentation
+
+The Codex is the canon. For the *implementation* — written as professional technical reference — see:
+
+*   **Kernel subsystems:** [`docs/dev/OS/`](dev/OS) — boot/HAL, the SMP scheduler, the network stack, USB/xHCI, and video.
+*   **Userspace architecture:** [`docs/dev/USERLAND/ARCHITECTURE.md`](dev/USERLAND/ARCHITECTURE.md) — vessels, handlers, the Bandy message bus, and the Quartzite GUI API.
+*   **Per-crate detail:** the `README.md` in each crate under `libs/`, `handlers/`, and `apps/`.

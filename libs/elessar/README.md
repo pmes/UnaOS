@@ -1,37 +1,74 @@
-# ❇️ Elessar: The Lens
+# Elessar
 
-**Elessar** is a polymorphic editor for **UnaOS**. Known as the "Vision Stone," it does not merely display files; it transmutes its entire existence to match the substance of the asset it holds. 
+Workspace and context detection for UnaOS userspace. Given a directory, Elessar
+locates the workspace root and classifies the project type.
 
-In a world of fragmented, single-purpose applications, Elessar is the unified aperture through which one views, shapes, and heals the world.
+## Responsibilities
 
-## 🌈 The Philosophy of Polymorphism
+Elessar is pure logic with no user-interface dependencies. It answers two
+questions about a filesystem location:
 
-Elessar is not a "text editor." It is a dynamic interface that adapts its state based on the metadata of the target asset. It is a single tool with infinite faces.
+1. **Where is the workspace root?** Starting from the current working directory,
+   it walks up the directory tree looking for a project anchor.
+2. **What kind of project is this?** It inspects a directory for well-known
+   marker files and reports a classification.
 
-### 1. The Transmutation (Adaptive UI)
-Elessar shifts its interface to provide the correct tools for the task:
-* **Code Mode:** A high-performance, low-latency development environment with deep LSP integration, repo management, etc.
-* **CAD Mode:** A 3D-aware spatial interface that translates **Vug** syntheses into structural geometry.
-* **NLE Mode (Non-Linear Editor):** A time-bound interface for weaving the grooves of **Stria** media streams.
-* **Document Mode:** A minimalist, focused environment for serious writing.
+The classification — called a **Spline**, the project's type or trajectory — is
+the input other userspace components use to decide how to present a workspace
+(for example, which handlers and views a vessel should bind for a given project).
 
-### 2. The Vision Stone (Visual Integrity)
-Elessar is built on the belief that the interface should never stand between one and their work.
-* **Zero-Friction Transitions:** Shift from editing a configuration file to modifying a 3D component without ever leaving the Lens.
-* **Universal Context:** Because Elessar is aware of the **Vairë** workspace, it understands the relationship between your code, your assets, and your history. Have the power of a Valar over your projects.
+## Public API
 
+- `enum Spline` — the project classification, one of:
+  - `Spline::UnaOS` — the UnaOS repository itself (anchored by `MEMORIA.md`).
+  - `Spline::Rust` — a Rust crate or workspace (`Cargo.toml`).
+  - `Spline::Web` — a Node/web project (`package.json`).
+  - `Spline::Python` — a Python project (`requirements.txt` or `pyproject.toml`).
+  - `Spline::Void` — no recognized marker; unclassified.
+- `fn find_workspace_root() -> std::path::PathBuf` — walks up from the current
+  directory until it finds `MEMORIA.md`, `Cargo.toml`, or `package.json`. If no
+  anchor is found it falls back to the current working directory and logs a
+  warning.
+- `struct Context { path: PathBuf, spline: Spline }` — a resolved location paired
+  with its classification.
+- `Context::new(path: &Path) -> Context` — classifies `path` and returns the
+  `Context`.
 
-## 🔮 The Rites (Capabilities)
+Detection is order-sensitive: `MEMORIA.md` is checked first, then `Cargo.toml`,
+then `package.json`, then the Python markers. The first match wins.
 
-### 1. INVOKE (Open/Switch)
-Elessar does not "load" files; it invokes the correct state for the asset. 
-* It queries **Gneiss PAL** for the asset's requirements.
-* It realigns its rendering engine (Vulkan/WGPU) to match the required visual fidelity.
+The internal `detect_spline(path: &Path) -> Spline` helper performs the marker
+checks; `Context::new` is the public entry point that wraps it.
 
-### 2. HEAL (Refactor/Repair)
-Drawing on the lore of the Elfstone, Elessar includes built-in "healing" protocols for broken logic and fragmented data.
-* **Logic Stitching:** Reassembling orphaned code blocks.
-* **Structural Alignment:** Ensuring CAD geometry adheres to the **Elemental Forge** tolerances.
+## How it fits into UnaOS
 
-### 3. FORGE (Commit/Export)
-Elessar interfaces directly with **Vairë** to ensure that once a vision is realized, it is seamlessly archived.
+Elessar is one of the shared libraries in `libs/`, alongside `gneiss_pal`
+(platform abstraction), `bandy` (the `SMessage`/`Synapse` message bus), and
+`quartzite` (the GUI layer). Vessels in `apps/` use Elessar to identify the
+workspace they have been pointed at; the resulting `Spline` informs how the
+workspace is assembled and rendered. See
+[`docs/dev/USERLAND/ARCHITECTURE.md`](../../docs/dev/USERLAND/ARCHITECTURE.md)
+(section 4) and [`docs/CODEX.md`](../../docs/CODEX.md) for the broader context
+model.
+
+## Status
+
+**Partial — detection only.** Workspace-root resolution and Spline
+classification are implemented and unit-tested. The broader intent of capturing
+a workspace as a serializable snapshot for compilation and packaging into a
+native app is **not yet implemented**; that pipeline is expected to be owned by
+the `aule` handler.
+
+## Dependencies
+
+`gneiss_pal` (platform abstraction layer), `log`, and `async-channel`.
+
+## Testing
+
+```sh
+cargo test -p elessar
+```
+
+The bundled test confirms self-recognition: run from inside the UnaOS tree, the
+crate classifies the repository root as `Spline::UnaOS` (falling back to a
+`Cargo.toml`-based check in bare CI checkouts).

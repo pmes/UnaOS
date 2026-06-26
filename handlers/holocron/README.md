@@ -1,40 +1,55 @@
-# 🗝️ Holocron: The Key
+# Holocron — Secrets and Identity Handler
 
-> *"A secret is only as safe as the one who guards it."*
+**Status: design-stage (not yet implemented).** This directory currently contains
+only this design document; there is no crate, entry point, or working code yet.
 
-**Holocron** is the cryptographic heart and secrets manager of **UnaOS**. It rejects the insecure, password-manager-as-an-app model. Instead, it integrates identity and encryption directly into the kernel.
+Holocron is the UnaOS handler responsible for **secrets management and identity**:
+a keyring for passwords, SSH keys, API tokens, and signing identities, together
+with the authentication agents that present those credentials to other
+components. It is the planned replacement for the role filled today by tools such
+as 1Password, the system keychain, `ssh-agent`, and `gpg-agent`.
 
-**Holocron** is the only place where trust exists.
+Like every UnaOS handler, Holocron is intended to be a self-contained domain
+service crate that exposes an async entry point (by convention `ignite(...)`),
+subscribes to the message bus, and reacts to messages — it does not call other
+handlers directly. See [`docs/dev/USERLAND/ARCHITECTURE.md`](../../docs/dev/USERLAND/ARCHITECTURE.md)
+for the handler/vessel model and [`docs/CODEX.md`](../../docs/CODEX.md) for the
+full handler manifest.
 
-## 🛡️ The Philosophy: Zero-Knowledge
+## Planned responsibilities
 
-Modern systems leak secrets through memory dumps, swap files, and insecure clipboards. **Holocron** is designed to keep secrets in a dedicated, protected memory space that never touches the disk.
+- **Vault** — a single encrypted store for passwords, SSH keys, API tokens, and
+  signing identities, with hardware-backed protection (TPM / Secure Enclave)
+  where available and a software cryptography backend otherwise.
+- **Memory hygiene** — secret material is zeroized as soon as it is no longer
+  needed and is never written to disk in plaintext.
+- **Unified agent** — one unlock action makes SSH, signing, and web credentials
+  available for the session, replacing the separate `ssh-agent` / `gpg-agent`
+  daemons.
+- **Context-aware authorization** — when another handler requests a credential
+  (for example a shell `sudo` from the Midden handler, or a Git push from the
+  Vairë handler), Holocron prompts for explicit confirmation out-of-band rather
+  than releasing keys automatically.
+- **Key lifecycle** — generation of modern keys (e.g. Ed25519) without raw
+  OpenSSL invocations, plus policy-driven rotation reminders.
+- **Credential injection** — supplies credentials to consumers without exposing
+  the underlying secret (e.g. bounded-lifetime clipboard entries, form fill via
+  the web handler) so the requesting component never sees the raw store.
 
-### 1. The Enclave (Secure Storage)
-Holocron uses hardware-backed security (TPM / Secure Enclave) when available, and pure Rust cryptography (Ring / Sodium) as the bedrock.
-*   **The Vault:** A single, encrypted database for all your passwords, SSH keys, API tokens, and GPG identities.
-*   **Memory Hygiene:** Secrets are wiped from RAM the instant they are no longer needed. No lingering strings.
+## Integration with the Synapse / SMessage bus
 
-### 2. The Agent (Authentication)
-Holocron replaces the fragmented mess of `ssh-agent`, `gpg-agent`, and browser autofill.
-*   **Unified Identity:** One master key unlocks your SSH, GPG, and Web credentials for the session.
-*   **Context-Aware Auth:** When **Midden** asks for `sudo` or **Vairë** pushes to GitHub, Holocron prompts for confirmation via a secure, out-of-band UI. It never blindly hands over keys.
+Holocron is planned to follow the standard handler contract defined by `bandy`:
 
-## ⚙️ The Mechanics
+- It subscribes to the **Synapse** (the broadcast message bus) and reacts to
+  **`SMessage`** variants rather than being invoked directly.
+- Credential requests from other handlers and authorization
+  prompts/results are expected to be modeled as dedicated `SMessage` variants.
+  Adding such variants is a deliberate, reviewed change to the shared `SMessage`
+  enum and is **not yet defined**.
 
-### The Keyring
-Holocron manages the lifecycle of your keys.
-*   **Key Generation:** Create strong, modern keys (Ed25519) with a single command. No more confusing OpenSSL flags.
-*   **Key Rotation:** Automatically remind you to rotate keys based on policy.
+## Scope notes
 
-### The Bridge
-Holocron securely injects credentials into applications without exposing the raw secret.
-*   **Clipboard Protection:** If you must copy a password, Holocron clears the clipboard after 10 seconds.
-*   **Browser Integration:** Safely fills forms in **Aether** without the browser ever seeing the database.
-
-## 🛑 The Kill List
-Holocron replaces:
-*   **1Password / LastPass / Bitwarden**
-*   **GPG Keychain / GPG Suite**
-*   **ssh-agent**
-*   **macOS Keychain Access / Windows Credential Manager**
+This document describes intended behavior only. None of the cryptographic
+storage, agent, or bus integration described above exists in code yet; the
+specific `SMessage` variants, crate layout, and `ignite(...)` signature will be
+defined when implementation begins.

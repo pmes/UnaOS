@@ -1,64 +1,65 @@
-# Stria (The Studio)
+# Stria
 
-**Layer:** Layer 2 (Capability)
-**Role:** Audio/Video Studio & Media Engine
-**Crate:** `handlers/stria`
+**Crate:** `handlers/stria` · **Layer:** Handler (domain service) · **Status:** Design-stage skeleton
 
-## 🎬 Overview
+Stria is the audio/video handler for UnaOS userspace — the planned media engine
+responsible for time-based media (playback, non-destructive editing, and DSP),
+complementing the image/raster handling done elsewhere in the system.
 
-**Stria** is the media engine of the UnaOS ecosystem. It is a powerful handler library that provides the logic and interface for playback, recording, and non-linear editing of audio and video content.
+## Responsibility
 
-While **Facet** handles static imagery, **Stria** handles time-based media. It wraps complex multimedia frameworks (GStreamer/FFmpeg) into a clean, Rust-native API for the Trinity Architecture.
+Per the system manifest ([`docs/CODEX.md`](../../docs/CODEX.md)), Stria — "The
+Studio" — is intended to own:
 
-## 🏗️ Architecture
+- Media **playback** with non-destructive A-B looping and bookmarking.
+- A **DSP graph** for audio/video processing pipelines.
+- The logic backing media preview and a studio editing surface in the host
+  vessel.
 
-Stria sits at **Layer 2 (Handlers)** of the Trinity Architecture.
+None of this media functionality is implemented yet. The current contents are a
+scaffold (see Status).
 
-* **The Engine:** Built on top of **GStreamer** (via `gstreamer-rs`) for high-performance, hardware-accelerated pipeline management.
-* **The View:** Provides GTK4 widgets for video surfaces, timelines, waveforms, and transport controls via `libs/quartzite`.
-* **The State:** Manages the playback clock and media library in `libs/gneiss_pal`.
+## What the code does today
 
-## 🎛️ Capabilities
+The crate currently builds as a standalone binary that brings up a window and an
+event loop; it does not yet decode, play, or edit any media.
 
-Stria provides the following core services:
+- **`main.rs`** — entry point. Prints startup banners, queries the host CPU
+  count via `num_cpus`, opens a 1280×720 window through
+  `gneiss_pal::WaylandApp`, and runs the event loop. The loop exits on
+  `WindowEvent::CloseRequested` and on the `Escape` key.
+- **`engine/mod.rs`** — `MediaGraph`, a stub for the future processing pipeline.
+  It stores a worker-thread count (`MediaGraph::new(cores)` / `.cores()`) and is
+  not yet wired into `main`. The intended pipeline stages (decode → filter →
+  render) and thread-to-core pinning are described only in comments.
+- **`ui.rs`** — placeholder; no UI implemented.
 
-| Feature | Description |
-| --- | --- |
-| **Playback** | Hardware-accelerated video/audio playback (MP4, MKV, FLAC, WAV). |
-| **Timeline** | Non-linear editing logic. Multi-track support for cutting and arranging clips. |
-| **Capture** | Low-latency recording from microphones (`cpal`) and webcams (V4L2/PipeWire). |
-| **Transcode** | Format conversion and rendering (e.g., export project to H.264). |
-| **Analysis** | Real-time audio visualization (FFT) and waveform generation. |
+Dependencies declared in `Cargo.toml`: `gneiss_pal` (windowing/PAL), `tokio`,
+`crossbeam`, `glam`, `num_cpus`. There is currently **no** GStreamer/FFmpeg,
+GTK4, or `cpal` dependency, despite earlier documentation; those are aspirational.
 
-## 🔌 Integration
+## Synapse / SMessage integration
 
-**Used by `apps/una` (The Host):**
-Stria powers the "Media Preview" and "Studio Mode."
+A UnaOS handler is a domain-service crate that exposes an async entry point (by
+convention `ignite(...)`) and reacts to `SMessage` traffic on the `Synapse`
+broadcast bus defined in [`libs/bandy`](../../libs/bandy). See
+[`docs/dev/USERLAND/ARCHITECTURE.md`](../../docs/dev/USERLAND/ARCHITECTURE.md).
 
-1. **Asset Preview:** When you click a `.wav` or `.mp4` file in the file explorer, Stria renders the preview pane.
-2. **Screencasting:** It handles the logic for recording the screen/window for bug reports or demos.
-3. **Voice Notes:** Used by **Vein** to capture audio input for transcription.
+Stria does **not** yet follow this pattern. It has no `ignite(...)` entry point,
+does not depend on `bandy`, and neither subscribes to nor emits any `SMessage`.
+There are also no dedicated media `SMessage` variants defined in the bus today.
+Converting Stria into a bus-driven handler — subscribing to playback/transport
+requests and emitting media-state updates — is future work.
 
-**Usage Example (Rust):**
+## Status
 
-```rust
-use stria::{Player, MediaSource};
+**Design-stage skeleton.** A window/event-loop binary plus an unwired
+`MediaGraph` stub. No media decode/playback, no DSP, no Synapse/SMessage
+integration. The capability scope above reflects the documented design intent,
+not shipped behavior.
 
-// Simple Playback
-let mut player = Player::new();
-player.load(MediaSource::file("render.mp4"));
-player.play();
+## See also
 
-// Accessing the view widget for GTK
-let video_widget = player.widget();
-container.append(&video_widget);
-
-```
-
-## ⚠️ Status
-
-**Experimental.**
-
-* *Requirement:* Requires `gstreamer` and `gst-plugins-base/good/bad/ugly` installed on the host OS (Fedora).
-* *Audio Backend:* Uses **PipeWire** (via `cpal` or `gstreamer-pipewire`).
-* *Edition:* **Rust 2024**.
+- [`docs/CODEX.md`](../../docs/CODEX.md) — system canon and handler manifest.
+- [`docs/dev/USERLAND/ARCHITECTURE.md`](../../docs/dev/USERLAND/ARCHITECTURE.md)
+  — userspace component model (libraries / handlers / vessels) and the Bandy bus.

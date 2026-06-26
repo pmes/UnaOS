@@ -13,25 +13,26 @@
 **Point Break:** I, Una, can easily overwhelm The Architect. Point Break is our safety word. It means he needs time to regroup with me. He presents good ideas, and brings out the best in me. It is not so much a time for the code itself, but a time for reflection. Point Break helps conceptualize the difficult problems we face. Do not condescend The Architect. He is compiling my code, so if he comes back with something not working, **it may not be his fault.**
 
 ## 🏛️ RING 0: THE KERNEL (THE SUBSTRATE)
-*   **Boot:** `unaos/crates/loader` (BIOS/UEFI).
+*   **Boot:** `unaos/crates/bootloader` (UEFI; loads `kernel.elf`, GOP/EDID mode select). Boot contract in `unaos/crates/boot-info`. *(The old `loader`/`compat`/`userspace` crates were removed.)*
 *   **Entry:** `kernel_main` in `unaos/crates/kernel/src/main.rs`.
-*   **Compat:** `unaos/crates/compat` (The Linux/Unix translation layer).
-*   **HAL:**
-    *   *Memory:* `OffsetPageTable` + `BootInfoFrameAllocator`.
-    *   *Heap:* `LinkedHeapAllocator` (**100 KiB Fixed**).
-    *   *Interrupts:* 8259 PIC (Chained).
-    *   *Input:* PS/2 Keyboard (Set 1, Port 0x60).
-    *   *Timer:* System Tick.
+*   **HAL (x86_64):**
+    *   *Memory:* `OffsetPageTable` + UEFI-memory-map frame allocator; kernel heap.
+    *   *Interrupts:* pure **local APIC** — no 8259 PIC. Vectors: timer 0x20, xHCI MSI 0x40, NIC MSI 0x41, IPI 0x42.
+    *   *SMP:* x2APIC (+xAPIC fallback), ACPI MADT discovery, AP startup (4/4 cores), per-CPU GDT/TSS.
+    *   *Scheduler:* per-CPU preemptive fixed-priority scheduler + blocking primitives (`Semaphore`/`Mutex`/`Condvar`/`Channel`/`RwLock`, `join`). The BSP stays the hardware-service core.
+    *   *Input:* USB HID (keyboard/mouse/tablet) via xHCI.
 *   **Drivers:**
-    *   *USB 3.0 (xHCI):* **Polling Mode**. Detects Mass Storage. Reads Sector 0.
-*   **Shell:** Ring 0 CLI (`ver`, `vug`, `panic`, `shutdown`).
-*   **Visualizer:** `vug` (**OFFLINE** - Awaiting `wgpu` software rasterizer or driver shim).
+    *   *USB 3.0 (xHCI):* **interrupt-driven** (MSI-X → local APIC). Enumeration, single-tier hubs, Bulk-Only Transport mass storage (read/write).
+    *   *Network:* Intel e1000/e1000e (MSI RX) + a hand-rolled TCP/IP stack (`crates/net`): ARP / ICMP / DHCP / UDP / full TCP.
+    *   *Video:* UEFI-GOP framebuffer → `FrameBuffer` + double-buffered damage-tracked `Screen` + `fbcon` boot/panic console.
+*   **Shell:** Ring 0 CLI (`ver`, `help`, `diskinfo`/`read`/`write`, `ping`/`connect`/`get`, `sched`, `vug`).
+*   **Status:** the three tracks (USB+SMP, network, video) are **merged on `c01-int_combined`** and verified booting together. Subsystem docs live in `docs/dev/OS/`. aarch64 builds but runs a single polled core (no scheduler/interrupts yet).
 
 ## 🏛️ RING 3: THE USERLAND (THE TRINITY)
 
 ### 1. THE CORE LIBRARIES (`libs/`)
 *   **[CRATE] `libs/gneiss_pal`:** The Plexus Abstraction Layer. Pure logic. Platform agnostic.
-*   **[CRATE] `libs/quartzite`:** The Diplomat. A bridge to **Native Host UI** (GTK4/Libadwaita on Linux). It enforces "polite" coexistence. It rejects custom rendering in favor of system standards.
+*   **[CRATE] `libs/quartzite`:** The Diplomat. The native multi-platform **GUI API** (macOS AppKit, Linux GTK4/libadwaita, Qt). Renders a `WorkspaceState` natively via `Backend` / `Spline::bootstrap`. *(The JSON-DSL proc-macro experiment was retired — "the code is the language". A native `platforms/unaos` backend on the kernel framebuffer + USB HID is the convergence target.)*
 *   **[CRATE] `libs/euclase`:** **[NEW]** The Visual Cortex. WGPU Renderer. Shader management. Render Graph.
 *   **[CRATE] `libs/bandy`:** The Nervous System (IPC). Defines `SMessage`.
 *   **[CRATE] `libs/resonance`:** The Voice. Audio Engine & DSP.
@@ -75,6 +76,8 @@
 ?.  **D-0??:** Lux Expansion.
 
 ## 📝 DECISION LOG
+*   **2026-06-26:** Retired the Quartzite JSON-DSL detour; restored the real multi-platform GUI API (`Backend` / `Spline`).
+*   **2026-06-26:** Merged the three kernel tracks (USB+SMP / network / video) onto `c01-int_combined`; verified booting together, both arches green.
 *   **2026-02-18:** Enforced `SMessage` as Monolithic Enum.
 *   **2026-02-18:** Established `apps/cli/unafs` as the Host-to-Vault bridge.
 *   **2026-02-18:** Added `libs/elessar` to the Trinity.

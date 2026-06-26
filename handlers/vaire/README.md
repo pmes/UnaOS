@@ -1,46 +1,65 @@
-# 🧶 Vairë: The Storied Webs
+# Vaire
 
-> *"The thread does not choose its place in the tapestry. The Weaver ensures the pattern is True."*
+Version-control handler for UnaOS. Vaire exposes Git repository state and
+inter-commit diffs to the rest of userspace, built entirely on the pure-Rust
+`gix` (gitoxide) library — no `libgit2` / `git2` dependency.
 
-**Vairë** is the workspace manager for **UnaOS**. It is designed to weave the story of your world.
+## Responsibility
 
-While Git is excellent for single repositories, it fractures under the weight of an Operating System composed of multiple interdependent Shards (`UnaOS`, `Stria`, `Vug`, `Midden`). Vairë wraps the chaos of Git in a layer of **Iron Logic**, ensuring that the entire ecosystem moves in perfect, crystalline lockstep.
+Vaire is the version-control (Git) domain service in the handler layer
+described in [`docs/dev/USERLAND/ARCHITECTURE.md`](../../docs/dev/USERLAND/ARCHITECTURE.md).
+It owns the project's relationship to its Git repository: reporting current
+HEAD state and computing the set of changes between two revisions. It locates
+the repository by walking up from the working directory (`gix::discover`), so
+callers do not pass a repo path.
 
-We want you to be you—Git can be run by you in Midden.
+## What it does today
 
-## 🧱 The Philosophy
+- **`Vaire::look() -> Result<GitStatus>`** — inspects the repository at (or
+  above) the current directory and returns a `GitStatus { branch, commit,
+  is_dirty }`: the symbolic branch name (or `"DETACHED"`), the abbreviated
+  7-character HEAD commit hash, and a dirty flag.
+- **`Vaire::handle_message(&SMessage) -> Option<SMessage>`** — the bus-facing
+  entry point. It pattern-matches a request message and returns a response
+  message (or `None` if the message is not for Vaire).
+- **`create_view() -> gtk4::Widget`** — an optional status widget rendering the
+  current branch/commit/dirty state. Compiled only under the `gtk4` feature.
 
-### 1. The Loom (One Truth)
-Vairë treats the `UnaOS/` directory not as a loose collection of folders, but as a **Single Truth**.
-* **The Old Way:** You traverse directories, pulling and merging, hoping the Kernel matches the Bootloader.
-* **The Vairë Way:** You invoke the Weaver. Vairë aligns every Shard defined in the workspace, ensuring the **Gneiss PAL** dependency is mathematically synchronized across the entire nervous system.
+The diff itself is a tree-to-tree comparison via `gix`: revisions are resolved
+with `rev_parse_single`, peeled to trees, and walked to produce a line per
+changed path (`+ Added`, `- Deleted`, `~ Modified`, `* Rewritten`).
 
-### 2. The Tapestry (The Fossil Record)
-Vairë introduces the concept of a **"Snap"**—an atomic crystallization of the entire OS state.
-* When we release **Moonstone v0.1**, Vairë does not just tag a commit. It captures the exact vibrational state of the Kernel, the PAL, and the Shell simultaneously.
-* It generates a **Manifest** that guarantees you can rebuild the exact state of the OS 10 years from now, regardless of how the internet changes.
+## Bus integration (Synapse / SMessage)
 
-### 3. The Future: UnaFS Native
-Currently, Vairë acts as a "Supervisor" for Git.
-**The Destiny:** Vairë will eventually bypass `.git` folders entirely and interface directly with **UnaFS**.
-* **Database-Driven:** Version control becomes a metadata query. "Show me the Kernel as it existed on Tuesday."
-* **Backwards Compatible:** Vairë will still push/pull to standard Git remotes (GitHub/GitLab) for collaboration, but the local "Source of Truth" will be the **UnaFS Database**, not a loose collection of text files.
+Vaire participates in the Bandy message bus through a single request/response
+pair on `SMessage`:
 
-## ⚒️ The Rites (Capabilities)
+| Direction | Variant | Notes |
+| --- | --- | --- |
+| In | `GetDiff { commit_a, commit_b }` | Request a diff between two revisions. |
+| Out | `DiffPayload { diff }` | The computed change summary, on success. |
+| Out | `Log { level, source, content }` | Emitted with `level = "ERROR"`, `source = "Vaire"` when the diff fails. |
 
-Vairë is not run; it is invoked.
+`handle_message` is a pure function: given an `SMessage`, it returns the
+response `SMessage` to publish. It does **not** itself subscribe to the Synapse
+or spawn a task; the hosting vessel is responsible for receiving messages and
+firing the returned response onto the bus.
 
-### 1. SYNC (The Alignment)
-* **Purpose:** To bring order to the local workspace.
-* **Action:** Iterates through the Shard list. Pulls upstream changes. Verifies that local modifications (The "Dirty" State) are safe. Re-links local paths to ensure the OS compiles as one unit.
+## Status
 
-### 2. STATUS (The God View)
-* **Purpose:** To see the layout of the land.
-* **Action:** Reports the branch, commit hash, and "Crystal Color" of every shard.
-    * **Green:** Clean, Synced, Ready.
-    * **Amber:** Local changes present.
-    * **Red:** Detached Head or Conflict.
+**Partial / in development.**
 
-### 3. SNAP (The Forging)
-* **Purpose:** To create history.
-* **Action:** Creates a unified tag across the entire ecosystem. It locks the version numbers in `Cargo.toml` and stamps the "Moonstone" seal onto the code.
+- Implemented: `look()` (branch + short HEAD), `get_diff` over `gix`, the
+  `GetDiff` → `DiffPayload` / `Log` message contract, and the optional GTK
+  status view.
+- Not yet implemented:
+  - The dirty-state check in `look()` is a stub and always reports
+    `is_dirty = false`.
+  - No async `ignite(...)` entry point or Synapse subscription loop yet; Vaire
+    is driven synchronously through `handle_message`, unlike handlers that own
+    their own task.
+  - The diff is a per-path change summary, not a unified line-level diff.
+
+Workspace-wide synchronization, multi-repository orchestration, snapshot/tag
+release flows, and any UnaFS-native version control are prospective design
+directions and are **not** present in this crate.

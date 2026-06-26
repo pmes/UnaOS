@@ -1,40 +1,69 @@
-# 🕸️ Matrix: The Grid
+# Matrix
 
-**Matrix** is the spatial asset manager of **UnaOS**. It rejects the folder-tree hierarchy of the 1970s (Finder, Explorer). Files do not live in drawers; they live in a web of relationships.
+Matrix is the UnaOS workspace-topology handler. It scans a project's source
+tree, derives the dependency structure between files, and publishes that
+structure on the message bus so the GUI can render a navigable map of the
+workspace and the AI handler (Vein) can use it as context.
 
-**Matrix** is the graph that connects your data.
+**Status: implemented (focused scope).** The lexical scanner, workspace
+indexer, and async event loop are working and wired into the `lumen` vessel and
+the `vein` handler. The scope is intentionally narrow: Matrix currently models
+Rust source topology. Richer asset/preview features described in earlier design
+notes (3D model preview, media scrubbing, tag-based smart collections) are not
+implemented.
 
-## 🌌 The Philosophy: Context over Container
+## What it does
 
-Modern file systems force you to put a file in *one* place. **Matrix** allows a file to exist in *many* contexts simultaneously.
+- **Topology scan** — `MatrixScanner::map_topology(paths, root, depth)` walks one
+  or more target paths, parses each `.rs` file lexically (comment stripping plus
+  `use` / `mod` / symbol extraction; no full AST), and builds a deduplicated
+  dependency graph. It returns two artifacts: a compact `DICTIONARY$EDGES`
+  payload for the UI, and a human-readable "semantic code topology" string for
+  LLM context. `ScanDepth::Interface` captures public symbols; `ScanDepth::DeepAST`
+  captures all definitions including `impl` blocks.
+- **Genesis tree** — `MatrixScanner::build_genesis_tree(dir, root)` produces the
+  nested `bandy::state::TopologyNode` tree the GUI renders, pruning `target`,
+  `.git`, `node_modules`, and any directory containing no `.rs` files.
+- **Workspace indexing** — `indexer::WorkspaceIndexer` recursively scans for
+  `Cargo.toml` files and builds a crate-level dependency DAG (`CrateNode`), used
+  by Vein's workspace cortex.
 
-### 1. The Graph (Navigation)
-Matrix visualizes your project as a node graph.
-*   **The Hub:** A central project node connects to code, assets, docs, and references.
-*   **Dynamic Links:** A texture file used in three different 3D models shows lines connecting to all of them. Delete it, and you see exactly what breaks.
-*   **Tag-Based Logic:** Folders are just saved search queries (smart collections). "All Rust files modified today" is a view, not a location.
+## How it plugs into the bus
 
-### 2. The Preview (Inspection)
-Matrix enables you to preview any file instantly.
-*   **3D Rotation:** Spin a `.obj` or `.gltf` model right in the file browser.
-*   **Code Peek:** See the first 50 lines of a script without opening an editor.
-*   **Media Scrub:** Hover over a video to scrub through it.
+Matrix is a domain handler in the sense of the userspace architecture: a crate
+exposing an async entry point that subscribes to the Synapse and reacts to
+`SMessage`.
 
-## ⚙️ The Mechanics
+`ignite(synapse, absolute_workspace_root)` subscribes to the Synapse and runs an
+event loop keyed on the workspace root (shared as an `Arc<PathBuf>`):
 
-### The Indexer
-Matrix runs a background daemon that indexes metadata, not just filenames.
-*   **Content Search:** Find a function definition inside a code file, or a specific hex string inside a binary.
-*   **Speed:** Built on the same search technology as **Vein**, results are instant.
+**Consumes**
+- `SMessage::Matrix(MatrixEvent::FocusSector(targets))` — a space-separated list
+  of workspace-relative targets to scan.
 
-### The Workspace
-Matrix allows you to save your "mental state."
-*   **Session Restore:** When you close a project, Matrix remembers exactly which nodes were expanded and which files were selected.
-*   **The Desktop:** Your desktop is just a temporary, visual holding area for active nodes. It is not a folder full of clutter.
+**Emits** (via `Synapse::fire_async`)
+- `MatrixEvent::GraftTopology { target_id, payload }` — for a single-file scan,
+  the symbol payload to graft onto an existing UI node.
+- `MatrixEvent::SectorFocused { target, context }` — the semantic topology for a
+  single file, for LLM context.
+- `MatrixEvent::IngestTopology { ui_dag, semantic_dag }` — for a multi-target
+  scan, the full UI payload plus semantic graph (consumed by Vein/the GUI).
 
-## 🛑 The Kill List
-Matrix replaces:
-*   **macOS Finder / Windows Explorer**
-*   **Trello / Jira** (for simple project organization)
-*   **Obsidian Graph View** (integrated directly into the file system)
-*   **Adobe Bridge**
+The handler does not call other handlers directly; all interaction is through
+`SMessage` on the Synapse. `MatrixScanner` and `WorkspaceIndexer` are also used
+synchronously by `vein` (workspace cortex) and `lumen` (initial genesis tree).
+
+## Entry points
+
+| Item | Role |
+| --- | --- |
+| `ignite(synapse, root)` | Async handler loop; subscribes and reacts to `FocusSector`. |
+| `MatrixScanner::map_topology(...)` | Lexical dependency scan → `(ui_payload, semantic_dag)`. |
+| `MatrixScanner::build_genesis_tree(...)` | Build the `TopologyNode` tree for the UI. |
+| `indexer::WorkspaceIndexer` | Crate-level dependency DAG from `Cargo.toml` files. |
+
+## Dependencies
+
+`bandy` (bus + shared topology state), `elessar` (workspace-root detection),
+`gneiss_pal` (platform services). An optional `gtk` feature pulls in `gtk4` /
+`glib` for the Linux view layer.

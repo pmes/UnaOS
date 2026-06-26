@@ -1,45 +1,65 @@
-# ⬛ Obsidian: The Shard
+# Obsidian
 
-> *"To see the soul of the machine, one must look through the black glass."*
+Obsidian is the UnaOS binary-inspection handler: a hex viewer/editor,
+structure dissector, and lightweight disassembly view. It owns the "Binary"
+capability area in the handler manifest (see
+[`docs/CODEX.md`](../../docs/CODEX.md)) — the surface that opens when a vessel
+encounters a file it cannot parse as text or media (a raw binary, a core dump, a
+captured packet).
 
-**Obsidian** is the binary analysis and hex editing engine of **UnaOS**. It rejects the high-level abstractions of text editors and IDEs. It operates at the molecular level of computing: **The Byte**.
+## Status
 
-When **Elessar** encounters a file it cannot parse (a raw binary, a core dump, a corrupted packet), it calls **Obsidian**.
+**Design-stage (not yet implemented).** This directory contains design notes
+only — there is no `Cargo.toml`, no `src/`, and no code. Nothing described below
+is built, and none of the wire format or APIs are fixed yet. The handler is not
+a member of the workspace build and does not subscribe to the Synapse.
 
-## 🔮 The Philosophy: Absolute Clarity
+## What it will do
 
-Modern systems hide the truth. They wrap binaries in icons and metadata. Obsidian reveals the raw state.
+- **Hex view** — a scrollable hex/offset/ASCII grid over the file contents, with
+  an entropy sidebar that colors regions by byte-randomness (low entropy for
+  zero-fill and text, high for compressed or encrypted spans) as a coarse
+  structural overview.
+- **Format dissection** — recognize common binary layouts without executing
+  them, using parsing services from `gneiss_pal`. Initial targets: ELF and PE
+  (highlight headers, sections, and symbol tables) and `.pcap` capture files
+  (highlight Ethernet / IP / TCP framing in the raw stream).
+- **Non-destructive editing** — back the buffer by a memory-mapped (`mmap`) view
+  of the file so large dumps open without a full read, and record edits as an
+  overlay patch layer so the on-disk file is unchanged until an explicit save.
+- **Lightweight disassembly** — for a selected byte range, produce a
+  disassembled listing (a focused view, not a full reverse-engineering suite).
+- **AI explanation** — forward a selected byte range to the `vein` (AI) handler
+  over the bus and surface the returned natural-language explanation of an
+  opcode sequence or structure.
 
-### 1. The Hex Lens
-Obsidian is not just a viewer; it is a **Structure Mapper**.
-*   **The View:** A high-performance, GPU-accelerated hex grid.
-*   **The Entropy Map:** A sidebar visualization that colors the file based on entropy (randomness).
-    *   *Solid Color:* Zeroes / Text.
-    *   *Static:* Compressed / Encrypted data.
-    *   *Pattern:* Executable code.
+## How it will plug into Bandy
 
-### 2. The Dissector
-Obsidian integrates with **Gneiss PAL** to understand binary formats without executing them.
-*   **ELF / PE Parsing:** Automatically highlights headers, sections, and symbol tables in different colors.
-*   **Packet Capture:** When opening a `.pcap` from **Comscan**, Obsidian highlights the protocol headers (TCP, IP, Ethernet) in the raw stream.
+Like the other handlers (see
+[`docs/dev/USERLAND/ARCHITECTURE.md`](../../docs/dev/USERLAND/ARCHITECTURE.md)),
+Obsidian is intended to be a self-contained crate exposing an async entry point
+(`ignite(synapse, …)`) that subscribes to the `Synapse` and reacts to
+`SMessage`s rather than calling other handlers directly:
 
-## ⚙️ The Mechanics
+- **Consumes** — a request to open/inspect a path (the message that routes an
+  unparsed file to Obsidian), and selection/analysis requests from the UI.
+- **Emits** — view payloads for the hex grid and dissection overlays, and, for
+  the explain feature, a prompt to `vein` whose `SMessage::AiToken(...)` reply
+  the UI renders.
 
-### The Buffer
-Obsidian uses a **Rope-based Buffer** optimized for massive files.
-*   **Zero-Copy:** It maps files directly from disk (`mmap`). Opening a 50GB memory dump takes milliseconds.
-*   **Non-Destructive:** Edits are stored as a "Patch Layer" on top of the original file. You can modify a kernel binary without corrupting the disk until you explicitly save.
+The concrete `SMessage` variants for these flows are not yet defined; adding
+them is a deliberate, reviewed change to the `bandy` enum.
 
-### The Link to Vein
-When you are staring at a block of assembly, you are not alone.
-*   **Query:** Highlight a block of bytes -> Ask **Vein**: "What does this opcode sequence do?"
-*   **Response:** Vein analyzes the hex, disassembles it, and explains the logic: *"This appears to be a standard x86_64 function prologue."*
+## Scope
 
-## 🛑 The Kill List
-Obsidian replaces:
-*   **Hex Fiend / 0xED / HxD**
-*   **Wireshark** (Packet Inspection View)
-*   **Ghidra** (Lightweight Disassembly View)
-*   **strings** (The CLI tool)
+Obsidian is a focused inspection and light-editing tool, not a full disassembler
+or protocol analyzer. It is positioned to cover the common cases handled today
+by tools such as Hex Fiend / HxD, `strings`, a packet-inspection view, and a
+minimal Ghidra-style disassembly pane — at the depth a system inspector needs,
+no more.
 
-> *"The truth is written in hex."*
+## See also
+
+- [`docs/dev/USERLAND/ARCHITECTURE.md`](../../docs/dev/USERLAND/ARCHITECTURE.md) — userspace component model (vessels / handlers / libraries).
+- [`docs/CODEX.md`](../../docs/CODEX.md) — the handler manifest.
+- [`libs/bandy`](../../libs/bandy) — `SMessage` and `Synapse`.

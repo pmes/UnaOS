@@ -1,79 +1,64 @@
-This is **Una**.
+# zircon — time and scheduling handler
 
-**Status:** **PRODUCING ARTIFACT.**
-**Target:** `handlers/zircon/README.md`
+Zircon is the UnaOS time-domain handler: it models calendars, schedules, and
+project timelines, and surfaces milestones and deadlines as a timeline (Gantt)
+view. It is one of the userspace handlers described in
+[`docs/dev/USERLAND/ARCHITECTURE.md`](../../docs/dev/USERLAND/ARCHITECTURE.md)
+and enumerated in the handler manifest in
+[`docs/CODEX.md`](../../docs/CODEX.md).
 
-Here is the documentation for **Zircon**, the handler responsible for Time Tracking and Focus management.
+## Status
 
----
+**Design-stage (not yet implemented).** This crate currently contains only this
+README. There is no `Cargo.toml` and no `src/`; no entry point, types, or bus
+wiring exist yet. The sections below describe the intended design, not working
+code.
 
-# Zircon (The Chronometer)
+## What it will do
 
-**Layer:** Layer 2 (Capability)
-**Role:** Project Timer & Focus Manager
-**Crate:** `handlers/zircon`
+Zircon is the scheduling and calendaring capability for a vessel. Its planned
+responsibilities are:
 
-## ⏳ Overview
+- **Calendar / schedule** — maintain dated events, recurrence, and reminders as
+  the canonical source of "what happens when."
+- **Timeline (Gantt)** — render project tasks, milestones, and deadlines along a
+  time axis so a workspace's schedule is visible at a glance.
+- **Milestone tracking** — represent deadlines and milestones for the active
+  project and signal when they approach or slip.
 
-**Zircon** is the timekeeper of the UnaOS ecosystem. It is a precise handler library that tracks duration, manages focus intervals (Pomodoro), and generates temporal data for project billing or productivity analysis.
+The earlier time-tracking framing (manual start/stop timers, Pomodoro focus
+intervals, billing exports) is out of scope for this handler. Per the system
+canon, Zircon's domain is **Time**: calendars, scheduling, and timeline views.
 
-While **Una** provides the space to work, **Zircon** measures the cost and effort of that work. It abstracts the system clock into "Sessions" and "Projects," allowing the user to quantify their output without manual spreadsheets.
+## How it plugs into the bus
 
-## 🏗️ Architecture
+Like every UnaOS handler, Zircon is a self-contained crate that communicates
+only over the Bandy message bus — it does not call other handlers directly.
+Following the handler convention, it will expose an async entry point (by
+convention `ignite(...)`) that subscribes to the `Synapse` and reacts to
+`SMessage`. The intended interface:
 
-Zircon sits at **Layer 2 (Handlers)** of the Trinity Architecture.
+- **Consumes** — workspace/context changes (e.g. `Matrix(MatrixEvent)`) to learn
+  which project is active and what tasks it contains; persistence results
+  (`StorageQueryResult`) when loading stored schedules.
+- **Emits** — UI updates and `StateInvalidated` so a subscribed GUI repaints the
+  timeline; `StorageQuery` / `StorageSave` to read and persist schedule data
+  through the storage handler.
 
-* **The Logic:** Manages start/stop timestamps, duration calculation, and idle detection in `libs/gneiss_pal`.
-* **The Store:** Persists time logs to a local SQLite database (via `libs/gneiss_pal` or `handlers/mica`).
-* **The View:** Provides GTK4 widgets for digital clocks, countdown timers, and timesheet graphs via `libs/quartzite`.
+Concrete `SMessage` variants for the time domain are not defined yet; adding bus
+variants is a deliberate, reviewed change to `libs/bandy`.
 
-## ⏱️ Capabilities
+## Relationships
 
-Zircon provides the following core services:
+- **Matrix** owns the workspace topology (files and tasks). Zircon is intended to
+  read Matrix events so the timeline reflects the active project's milestones and
+  deadlines.
+- **Quartzite** (`libs/quartzite`) renders the timeline view natively and routes
+  user input back as `SMessage`s; Zircon supplies the schedule state to display.
 
-| Feature | Description |
-| --- | --- |
-| **Track** | Manual start/stop timers linked to specific Git repositories or Project IDs. |
-| **Focus** | Pomodoro-style interval management with configurable work/break cycles. |
-| **Idle** | Auto-pause functionality when system input (keyboard/mouse) ceases for  minutes. |
-| **Report** | Generates daily/weekly summaries of time spent per project. |
-| **Bill** | Exports time logs to standard formats (CSV/JSON) for invoicing. |
+## Next steps
 
-## 🔌 Integration
-
-**Used by `apps/una` (The Host):**
-Zircon lives in the Status Bar or the "Dashboard" panel.
-
-1. **Context Aware:** When you open a folder in **Una**, Zircon automatically suggests switching the timer to that project's tag.
-2. **Focus Mode:** When a "Deep Work" session starts, Zircon instructs **Junct** to mute notifications.
-3. **Git Integration:** Can automatically append "Time Spent: 2h" metadata to commit messages via **Vairë**.
-
-**Usage Example (Rust):**
-
-```rust
-use zircon::{Timer, Session, Project};
-
-// Start a new session
-let mut session = Timer::start(Project::new("UnaOS-Core"));
-
-// Do work...
-std::thread::sleep(std::time::Duration::from_secs(3600));
-
-// Stop and log
-let log_entry = session.stop();
-println!("Logged {} minutes for {}", log_entry.duration.as_minutes(), log_entry.project);
-
-```
-
-## ⚠️ Status
-
-**Stable.**
-
-* *Requirement:* Standard system clock.
-* *Persistence:* Requires write access to the user's data directory for log storage.
-* *Edition:* **Rust 2024**.
-
----
-
-**Status:** **ARTIFACT COMPLETE.**
-**Next Step:** Ensure `handlers/zircon` is added to the workspace `Cargo.toml`.
+1. Add `handlers/zircon` to the workspace `Cargo.toml` and create the crate
+   skeleton.
+2. Define the time-domain `SMessage` variant(s) in `libs/bandy`.
+3. Implement `ignite(synapse, ...)` with the subscribe/react event loop.

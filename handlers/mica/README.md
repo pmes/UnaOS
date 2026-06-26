@@ -1,88 +1,70 @@
-# 📊 Mica: The Crystalline Grid
+# Mica — structured-data handler
 
-> *"The world is data. Mica is the lens."*
+Mica is the UnaOS handler for structured, tabular data: a spreadsheet and
+data-grid engine for editing and querying CSV, Parquet, and SQL-backed tables.
 
-**Mica** is the **High-Performance Data Grid** and **Spreadsheet** for the **UnaOS** ecosystem.
+**Status: design-stage (not yet implemented).** This document describes the
+intended design. There is no working code in this crate yet; nothing below
+should be read as a description of shipped behavior.
 
-It rejects the bloated legacy of Excel and the limitations of CSV. Mica treats data as a **reactive surface**. It is not just rows and columns; it is a multi-dimensional array of logic.
+## Responsibility
 
----
+Mica owns the "structured data" capability area within UnaOS — the role played
+by spreadsheets and lightweight SQL tools elsewhere. It is responsible for
+loading tabular data, presenting it as an editable grid, evaluating cell
+formulas, and keeping derived views consistent as the underlying data changes.
 
-## 💎 The Philosophy
+## Scope (planned)
 
-### 1. The Infinite Sheet
-Traditional spreadsheets choke on 100,000 rows.
-**Mica** uses **Virtualization** and **Rust-native memory mapping**.
-*   **Capacity:** 100 Million rows? No problem.
-*   **Scrolling:** 120fps, always.
-*   **Loading:** Instant. We map the file directly from disk; we don't load the whole thing into RAM until you look at it.
+- **Large-table grid.** Virtualized rendering and memory-mapped file access so
+  that large CSV/Parquet files can be browsed without loading the entire file
+  into memory. Capacity and frame-rate targets are design goals, not measured
+  results.
+- **Formula engine.** A spreadsheet-style formula language (`=SUM(A1:B2)`, etc.)
+  evaluated over a dependency graph. Cell dependencies form a directed acyclic
+  graph (DAG); updating a source cell cascades to its dependents rather than
+  requiring a manual recompute. Monetary and precise values use a decimal type
+  rather than binary floating point.
+- **Derived views.** Non-duplicating views over a source table (filters, pivots,
+  charts) that update when the source updates.
+- **Headless mode.** A non-interactive path for processing a file from the
+  command line, for use in scripts and pipelines.
 
-### 2. Logic, Not Just Math
-Mica supports standard formulas (`=SUM(A1:B2)`), but it exposes the **Una Scripting Runtime**.
-*   You can write Rust snippets directly in cells.
-*   You can pipe data from **Matrix** (File System) directly into a grid.
-    *   `=Matrix::list_files("/projects").filter(|f| f.size > 1GB)`
-*   The grid updates in real-time as the file system changes.
+## Integration: the Synapse / SMessage bus
 
-### 3. The "Cleavage" (Views)
-Mica allows you to "cleave" data into different views without duplicating it.
-*   **Sheet 1:** Raw Data (The Source).
-*   **Sheet 2:** A pivot table of Sheet 1 (The View).
-*   **Sheet 3:** A visual graph of Sheet 2 (The Insight).
+Like other UnaOS handlers, Mica is a self-contained crate exposing an async
+entry point (by convention `ignite(...)`). It does not call other handlers
+directly. Instead it participates in the `bandy` message bus:
 
-If you update a cell in Sheet 1, Sheet 3 updates instantly. No "Refresh Data" button required.
+- It subscribes to the **Synapse** (a Tokio broadcast channel) via
+  `subscribe()` and reacts to relevant **`SMessage`** variants.
+- It publishes results back onto the Synapse with `fire(msg)`, where the GUI
+  layer (`quartzite`) and other handlers can observe them.
 
----
+Concretely, Mica is expected to consume storage and file-system messages
+(e.g. `StorageQuery` / `StorageQueryResult`, and `Matrix` topology events) to
+locate and load data, and to emit grid state and query results as `SMessage`s
+for the GUI to render. The exact set of variants Mica produces and consumes
+will be defined when the message contract is implemented; adding an `SMessage`
+variant is a deliberate, reviewed change.
 
-## 🛠️ Usage
+## Dependencies (intended)
 
-Mica is designed for **Speed** and **Precision**.
+- `bandy` — `SMessage` / `Synapse` and shared state types.
+- `gneiss_pal` — host services (filesystem, paths, persistence) used to read
+  and durably write table files.
 
-```rust
-// The Mica Data Model (Concept)
-struct Cell {
-    raw: String,        // "100" or "=A1+B1"
-    computed: Value,    // 100 or 200
-    dependencies: Vec<CellRef>, // Who do I listen to?
-    dependents: Vec<CellRef>,   // Who listens to me?
-}
-```
+## Roadmap
 
-### The Interface
-*   **Visual:** A clean, minimal grid. No "Ribbon" toolbar taking up 20% of the screen. Contextual tools appear only when you select data.
-*   **Headless:** You can run Mica from the CLI to process data without a UI.
-    *   `mica process sales.csv --script "sum(col('Revenue'))"`
+1. Virtualized grid over large CSV/Parquet files.
+2. Core formula engine (`+ - * /`, `SUM`, decimal arithmetic, the dependency DAG).
+3. Embedded scripting for complex transforms.
+4. Charts and visualization views.
 
----
+## See also
 
-## 🔗 Integration (The Ecosystem)
-
-Mica is not an island.
-*   **Tabula:** You can embed a live Mica sheet inside a Tabula document. It isn't a screenshot; it's fully editable.
-*   **Vug:** You can use Mica to sequence audio events (tracker style).
-*   **Gneiss:** Mica uses the Gneiss file system traits to ensure data integrity, even if the power fails.
-
----
-
-## 🤖 Directives for Agents
-
-**ATTENTION:** If you are coding logic for Mica:
-
-### 1. No Floating Point Errors
-We do not use `f64` for currency or precise data.
-*   **Rule:** Use `Decimal` types.
-*   **Why:** `0.1 + 0.2 != 0.3` in standard float math. In Mica, it must equal `0.3`.
-
-### 2. Dependency Graph
-Every cell update must propagate through the **Directed Acyclic Graph (DAG)**.
-*   Do not manually update dependent cells.
-*   Update the *Source*, and let the *Engine* cascade the changes.
-
----
-
-## 🔮 Roadmap
-
-*   [ ] **Phase 1: The Grid** - Virtualized rendering of massive CSVs.
-*   [ ] **Phase 2: The Formula** - Basic math engine (`+`, `-`, `*`, `/`, `SUM`).
-*   [ ] **Phase 3: The Script** - Embedded Rust/Lua scripting for complex logic.
-*   [ ] **Phase 4: The Graph** - Charts and visualization rendering.
+- [`docs/dev/USERLAND/ARCHITECTURE.md`](../../docs/dev/USERLAND/ARCHITECTURE.md)
+  — userspace component model (libraries / handlers / vessels) and the
+  Bandy bus.
+- [`docs/CODEX.md`](../../docs/CODEX.md) — system canon and the full handler
+  manifest.

@@ -1,42 +1,59 @@
-# 💎 Facet: The Prism
+# Facet
 
-> *"Light is information. Color is code. We do not just look; we inspect."*
+Facet is the UnaOS **vessel** for viewing and inspecting raster images.
 
-**Facet** is the high-performance raster graphics app of **UnaOS**. It rejects the slow, bloated "Photo Viewers" of legacy systems that blur images to hide the pixels.
+## Overview
 
-**Facet** embraces the pixel. It is a tool for precision inspection, texture manipulation, and instant visual feedback.
+A vessel is an executable a user runs: it wires together a Tokio runtime, the
+message bus, a selection of handlers, and a native GUI window (see
+[`docs/dev/USERLAND/ARCHITECTURE.md`](../../docs/dev/USERLAND/ARCHITECTURE.md)).
+Facet is the vessel scoped to images — decoding a file, presenting it on screen,
+and supporting close inspection (zoom, pan, per-pixel and per-channel readout).
 
-## 🌈 The Philosophy: The Raw Pixel
+It is intended to compose existing userspace libraries rather than implement its
+own stack:
 
-Modern image viewers lie to you. They apply smoothing, color correction, and compression artifacts. **Facet** shows you the raw buffer.
+- **`libs/lux`** — image decoding, including camera RAW. Facet's source of pixel
+  data.
+- **`libs/euclase`** — GPU rendering (WGPU): shaders and render graph. The
+  intended path for presenting and scaling large images on the GPU.
+- **`libs/quartzite`** — the GUI layer. Renders the workspace natively on the
+  host and routes input back as messages.
+- **`libs/bandy`** — the in-process message bus (`SMessage`, `Synapse`).
+  Facet publishes and subscribes here rather than calling other components
+  directly.
 
-### 1. The Loupe (Inspection)
-Facet is designed for the Game Developer and the Digital Artist.
-*   **Infinite Zoom:** Zoom in until a single pixel fills the screen. See the exact RGBA values.
-*   **The Grid:** Toggle a pixel grid to count spacing perfectly. No more guessing.
-*   **Channel Splitting:** Isolate the Alpha channel instantly to check transparency masks. View Red, Green, and Blue independently to debug compression artifacts.
+## Responsibilities (intended)
 
-### 2. The Shader (Processing)
-Facet is not just a viewer; it is a GPU-accelerated processor.
-*   **WGPU Core:** All rendering and adjustments happen on the metal. 0ms latency on filters.
-*   **Instant LUTs:** Apply Color Look-Up Tables (LUTs) to preview grading without altering the source file.
-*   **Texture Ops:** Automatically detect Normal Maps and Roughness Maps. Visualize them on a 3D sphere with one keystroke (via **Vug** integration).
+- Open an image file and decode it via `lux`.
+- Display it in a Quartzite window with pan and zoom.
+- Support inspection: per-pixel RGBA readout and isolation of individual
+  channels.
+- Participate in the userspace bus: a file opened elsewhere (for example in the
+  Matrix file model) can be routed to Facet for viewing.
 
-## ⚙️ The Mechanics
+## Public API
 
-### The Buffer
-Facet loads images directly into GPU memory. It bypasses the CPU bottleneck for massive 8K textures and RAW photos.
-*   **Format Agnostic:** Reads PNG, JPG, QOI, KTX2, and DDS (DirectDraw Surface) natively.
-*   **Sprite Sheet Slicing:** Automatically detects grid boundaries in sprite sheets for quick animation previews.
+Facet exposes no Rust API yet. As a vessel it is expected to follow the
+established pattern: a `main` that constructs a `Synapse`, bootstraps a
+`WorkspaceState` through `Spline::bootstrap`, and runs the Quartzite
+`Backend::run` event loop — mirroring the `lumen` vessel
+([`apps/lumen`](../lumen)).
 
-### The Crop
-Non-destructive editing.
-*   **Region of Interest:** Select a box, get the coordinates, export the slice.
-*   **Batch Convert:** Select 100 images in **Matrix**, drag them to **Facet**, and convert them to optimized web formats instantly.
+## How it fits into UnaOS
 
-## 🛑 The Kill List
-Facet replaces:
-*   **macOS Preview / Windows Photos**
-*   **Adobe Photoshop** (for cropping, resizing, and inspection)
-*   **PureRef** (for reference boards)
-*   **Texture Packers / Viewers**
+Facet is one of the vessels under `apps/`, alongside `lumen` (the reference GUI
+vessel) and the `apps/cli/*` tools. It does not own image infrastructure; that
+lives in the shared libraries (`lux`, `euclase`) so capabilities are not
+duplicated across vessels. See
+[`docs/dev/USERLAND/ARCHITECTURE.md`](../../docs/dev/USERLAND/ARCHITECTURE.md)
+for the full component model and [`docs/CODEX.md`](../../docs/CODEX.md) for the
+system canon.
+
+## Status
+
+**Design-stage.** This crate currently contains only this README — there is no
+`Cargo.toml` or `src/`, and it is not part of the workspace build. The
+description above states intent, derived from the architecture documents and the
+available libraries, not shipped behavior. The supporting libraries it would
+build on (`lux`, `euclase`, `quartzite`, `bandy`) exist independently.

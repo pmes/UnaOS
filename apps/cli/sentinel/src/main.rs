@@ -27,8 +27,6 @@ use std::process;
 use std::time::Instant;
 use unafs::{BLOCK_SIZE, BlockDevice, FileDevice, Superblock};
 
-const MEMORIA_FILENAME: &str = "UNA_MEMORIA.md"; // Adjusted to match standard UnaOS naming, fallback to MEMORIA.md if needed.
-
 fn main() -> Result<()> {
     let start = Instant::now();
     println!("🛡️  SENTINEL: SYSTEMS ONLINE.\n");
@@ -45,11 +43,7 @@ fn main() -> Result<()> {
 
     // --- PHASE 1: PHYSICAL REPO VERIFICATION ---
     println!(">> PHASE 1: STRUCTURAL VERIFICATION");
-    let memoria_path = if Path::new("UNA_MEMORIA.md").exists() {
-        "UNA_MEMORIA.md"
-    } else {
-        "MEMORIA.md"
-    };
+    let memoria_path = "MEMORIA.md";
 
     if let Ok(content) = fs::read_to_string(memoria_path) {
         let re = Regex::new(r"\*\s+\*\*\[(CRATE|BIN|SHELL)\]\s+`(.*?)`:\*\*").unwrap();

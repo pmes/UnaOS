@@ -1,68 +1,79 @@
-# Junct (The Communications Hub)
+# junct
 
-**Layer:** Layer 2 (Capability)
-**Role:** Communications Aggregator & Protocol Bridge
-**Crate:** `handlers/junct`
+**Canonical role (per [CODEX](../../docs/CODEX.md)): "The Receiver" — the
+communications aggregation handler**, unifying messaging, email, IRC, and RSS
+into a single stream. **This role is not yet implemented.**
 
-## 📡 Overview
+`junct` is a UnaOS **handler** — a domain-service crate that owns one capability
+area and communicates over the Bandy message bus.
 
-**Junct** is the central nervous system for human-to-human interaction within UnaOS. It acts as a universal adapter for communication protocols, aggregating distinct streams (Matrix, Signal, IRC, SIP, WebRTC) into a single, unified state model.
+> **Status note:** the only code in this crate today is an unrelated placeholder —
+> a microphone-capture + live-FFT path (described below) that publishes an audio
+> spectrum onto the bus. It does not reflect junct's intended communications role
+> and is expected to be replaced.
 
-Where **Vein** handles Human-AI interaction, **Junct** handles Human-Human interaction. It abstracts the complexity of connection management, encryption, and media negotiation so that Vessels can present a unified "Inbox" or "Conference Room."
+## Current code (placeholder: mic capture + FFT)
 
-## 🏗️ Architecture
+On construction, `JunctHandler`:
 
-Junct sits at **Layer 2 (Handlers)** of the Trinity Architecture.
+1. Acquires the default input device and stream configuration from the host
+   audio backend via [`cpal`].
+2. Opens a live input stream. In the audio callback it reads the first channel
+   of each frame and accumulates samples into a fixed-size buffer of
+   `resonance::BLOCK_SIZE` (currently 64).
+3. When a block fills, it runs an in-place FFT (`resonance::dsp::FftContext`),
+   computes the magnitude of the first `BLOCK_SIZE / 2` bins (the usable half of
+   the real-input spectrum), and resets the buffer.
+4. Publishes the magnitudes as `SMessage::Spectrum { magnitude }`.
 
-* **The Core:** Maintains a unified `Contact` and `Message` model in `libs/gneiss_pal`.
-* **The Bridges:** Implements or wraps protocol-specific clients (The "Spokes").
-* **The View:** Provides GTK4 widgets for chat lists, video grids, and call controls via `libs/quartzite`.
+The stream runs for the lifetime of the handler; the `cpal::Stream` is held in
+the returned struct and stops when it is dropped.
 
-## 🔗 Capabilities
+## Bus integration
 
-Junct harmonizes the following protocols:
+`junct` is a **producer** on the Synapse, the Bandy broadcast bus.
 
-| Protocol | Implementation | Role |
-| --- | --- | --- |
-| **Matrix** | Native Rust SDK | The backbone of UnaOS messaging. End-to-End Encrypted. |
-| **WebRTC** | Native / GStreamer | Video/Audio conferencing. Compatible with Jitsi/Zoom web wrappers. |
-| **SIP** | VoIP Stack | Legacy telephony and standard voice calls. |
-| **IRC** | Text Protocol | Developer chat and legacy channels. |
-| **ActivityPub** | Fediverse | Social stream aggregation (Mastodon/Lemmy). |
+- **Entry point:** `JunctHandler::new(bandy_tx: broadcast::Sender<SMessage>) ->
+  anyhow::Result<Self>`. The caller passes a sender cloned from the shared
+  Synapse; the handler keeps it and emits from the audio callback thread.
+- **Emits:** `SMessage::Spectrum { magnitude: Vec<f32> }` — one message per
+  completed block, where `magnitude` holds `BLOCK_SIZE / 2` frequency-bin
+  magnitudes.
+- **Subscribes to:** nothing. `junct` is currently output-only; it does not
+  react to inbound messages.
+- **Failure mode:** returns `Err` if no default input device is available.
+  Sends are best-effort (a full or closed channel is ignored), so the handler
+  never blocks or panics on bus backpressure.
 
-## 🔌 Integration
+Note that this handler exposes `JunctHandler::new` rather than the `ignite(...)`
+entry point used by most handlers, because it must hand back a live stream
+object to keep capture running.
 
-**Used by `apps/una` (The Workspace):**
-Junct powers the "Team View" or "Comms Panel."
+## Key types
 
-1. **Unified Inbox:** Aggregates notifications from GitHub, Matrix, and Email (via `handlers/holocron`).
-2. **Presence:** Broadcasts "Coding" or "Busy" status based on **Tabula** activity.
-3. **Quick Calls:** Initiates WebRTC sessions directly from the editor context.
+| Item | Description |
+| --- | --- |
+| `JunctHandler` | Owns the live `cpal::Stream`. Construct with `new`; capture runs until dropped. |
+| `SMessage::Spectrum { magnitude }` | The only message variant emitted (defined in `libs/bandy`). |
 
-**Usage Example (Rust):**
+## Dependencies
 
-```rust
-use junct::{Client, Protocol, Message};
+- [`cpal`] — cross-platform audio host/device access.
+- `resonance` — provides `BLOCK_SIZE` and the `dsp` FFT primitives
+  (`Complex`, `FftContext`).
+- `bandy` — `SMessage` and the broadcast bus.
+- `tokio` — `broadcast::Sender` for publishing.
 
-let client = Client::connect(Protocol::Matrix, credentials).await?;
+## Status
 
-// Sending a message
-client.send(target_room, Message::text("Deploying S60 now.")).await?;
+**Partial — implemented for spectrum capture only.**
 
-// Handling incoming streams
-while let Some(event) = client.next_event().await {
-    match event {
-        Event::Message(msg) => println!("New msg from {}: {}", msg.sender, msg.content),
-        Event::CallInvite(call) => junct::webrtc::accept(call),
-    }
-}
+The microphone-to-spectrum path described above is implemented and functional.
+It is declared as a dependency of the `lumen` vessel but is not yet instantiated
+there. The broader communications role implied by the crate's place in the
+handler set (messaging, email, RSS) is **not implemented**; only audio input and
+FFT spectrum publishing exist today.
 
-```
+Edition: Rust 2024. License: LGPL-3.0-or-later.
 
-## ⚠️ Status
-
-**Experimental.**
-
-* *Requirement:* Heavy reliance on `async-std` / `tokio` for stream management.
-* *Security:* Handles sensitive credentials. Must interface strictly with `handlers/holocron` for key storage.
-* *Edition:* **Rust 2024**.
+[`cpal`]: https://crates.io/crates/cpal

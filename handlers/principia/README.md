@@ -1,51 +1,68 @@
-# 🏛️ Principia: The Law
+# Principia
 
-> *"Order is not accidental. It is engineered."*
+**System configuration and policy handler for UnaOS.** Principia is the
+domain service responsible for persistent system settings — owning where they
+live, validating changes, and broadcasting the results to the rest of userspace.
 
-**Principia** is the unified configuration and policy engine for **UnaOS**. It rejects the chaotic "Settings Sprawl" of traditional operating systems, where every application reinvents its own preferences window.
+## What it does today
 
-In UnaOS, **Settings are a System Service.**
+The current implementation is a single capability: managing the **UnaOS system
+root** (the workspace path the rest of the system operates against).
 
-## ⚙️ The Philosophy: Schema is UI
+`src/lib.rs` exposes a `Principia` struct:
 
-Principia does not have hard-coded menus. It generates its GUI dynamically based on **Configuration Schemas** exposed by the Shards.
+- `Principia::new()` — loads the persisted system root from
+  `~/.config/unaos/principia.toml` (resolved via `dirs::config_dir()`),
+  creating the config directory if needed.
+- `process_impulse(&mut self, &SMessage) -> Option<SMessage>` — the inbound
+  message handler. It reacts to a single command, validates it, persists the
+  change, and returns an outbound message to be published on the bus.
+- `validate_root(&Path) -> bool` — accepts a path only if it is an existing
+  directory containing a `crates/` or `libs/` subdirectory (i.e. a plausible
+  UnaOS source tree).
 
-## 🌍 Host Mode: The Dotfile Sovereign
+When a valid root is set, Principia writes it to `principia.toml` so the choice
+survives a restart.
 
-When running on **Linux, macOS, or Windows**, Principia acts as a universal configuration manager for your environment. It unifies the fragmented settings of the host OS.
+## Bus integration
 
-### The "Meta-Config"
-Principia can map its schemas to external config files.
-*   **Unified Theme:** Toggle "Dark Mode" in Principia -> Updates GTK, Qt, macOS System Appearance, and VS Code simultaneously.
-*   **Unified Typography:** Set "Monospace Font" -> Updates Terminal, Editor, and IDE.
+UnaOS handlers communicate over **Bandy**, the userspace message bus
+(`libs/bandy`): a single `SMessage` enum carried on the **Synapse**, a
+multi-producer/multi-consumer broadcast channel. Handlers do not call each other
+directly — they publish and subscribe to `SMessage`.
 
-### The Safety Net
-Principia wraps your local config files (`~/.config`, `.bashrc`, `.gitconfig`) in a **Vairë** safety layer.
-*   **Automatic Backups:** Before writing to an external file, Principia snapshots it.
-*   **Drift Detection:** If an external app modifies a file Principia is watching, it alerts you to the conflict.
+Principia uses two variants of `SMessage::Principia(PrincipiaCommand)`
+(`libs/bandy/src/signals.rs`):
 
-**Principia makes your Linux/Mac environment reproducible.**
+| Direction | Message | Behaviour |
+| --- | --- | --- |
+| In  | `PrincipiaCommand::SetSystemRoot(PathBuf)` | Validate the path; if valid, persist it and emit the change below. |
+| Out | `PrincipiaCommand::SystemRootChanged(PathBuf)` | Confirms the new root to any subscriber (e.g. the GUI, Matrix). |
 
-### 1. The Universal Registry
-When you install a Shard (e.g., **Facet**), it registers a `schema.toml` with Principia.
-*   **The Facet Schema:** Defines "Brush Sensitivity" (Float: 0.0-1.0), "Dark Mode" (Bool), and "Cache Path" (Path).
-*   **The Principia Action:** It instantly renders a standardized, accessible Settings Page for Facet within the main System Config.
+`process_impulse` returns the `SystemRootChanged` message on success and `None`
+otherwise; the caller is responsible for publishing the returned message on the
+Synapse.
 
-### 2. The Authoritative Writer (Vairë Integration)
-Principia is the only component allowed to write to the `/config` directory.
-*   **Versioned Settings:** Every time you toggle a switch, Principia commits the change to **Vairë**.
-*   **Time Travel:** Broken config? You can roll back your entire system's preferences (Kernel *and* Apps) to "Yesterday at 4:00 PM."
+## Status
 
-### 3. The Guard Rails (Vein Integration)
-Principia validates inputs against the **Laws of Physics**.
-*   **Static Validation:** It prevents you from setting a resolution your monitor cannot support.
-*   **Semantic Validation (Vein):** Before applying a dangerous change, it consults the AI.
-    *   *User:* Sets `voltage_offset = +1.5V` on the CPU.
-    *   *Principia (via Vein):* **"ALERT: This setting exceeds thermal safety limits. You are likely to physically damage the hardware. Proceed?"**
+**Partial — design-stage beyond the system-root capability.**
 
-## 🛑 The Kill List
-Principia replaces:
-*   **Windows Registry / macOS Defaults**
-*   **Application-specific "Preferences" Windows** (Unified into one place)
-*   **NVIDIA Control Panel**
-*   **`ethtool` / `sysctl`** (GUI frontends)
+- The system-root logic above is implemented and self-contained.
+- This crate currently has **no `Cargo.toml`** and is **not a workspace member**,
+  so it does not build as part of `cargo build`. It also does not yet expose the
+  conventional async entry point (`ignite(synapse: Synapse, …)`) or a subscribe
+  loop that drives `process_impulse` from live Synapse traffic; integrating it
+  into a vessel is outstanding work.
+- The broader vision for Principia — a schema-driven settings UI generated from
+  per-handler configuration schemas, versioned config via the Vairë handler,
+  semantic validation of risky settings via the Vein handler, and host
+  (Linux/macOS/Windows) dotfile management — is **not implemented**. It is
+  recorded as the intended direction in `docs/CODEX.md`, where Principia is the
+  System "Policy Engine."
+
+## See also
+
+- `docs/dev/USERLAND/ARCHITECTURE.md` — userspace component model (libs /
+  handlers / vessels) and the Bandy/Synapse bus.
+- `docs/CODEX.md` — handler manifest and the long-term role of Principia.
+- `libs/bandy/src/signals.rs` — `SMessage` and `PrincipiaCommand` definitions.

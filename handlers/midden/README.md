@@ -1,89 +1,85 @@
-# 🧠 Midden: The System Archivist
+# midden — shell / command interpreter
 
-> *"We do not pipe text. We compile intent."*
+Midden is the UnaOS shell handler: it parses command-line input and turns it
+into `SMessage`s on the Bandy bus. It is the terminal capability in the
+userspace handler set described in
+[`docs/dev/USERLAND/ARCHITECTURE.md`](../../docs/dev/USERLAND/ARCHITECTURE.md).
 
-**Midden** is the context-aware shell environment for **UnaOS**. It rejects the POSIX philosophy of spawning heavy, clumsy legacy binaries (`grep`, `find`, `ls`) in favor of **Direct System Execution**.
+## Status
 
-Instead of chaining black-box tools together with fragile string manipulation, Midden compiles your intent into specialized Rust artifacts called **Shards**, executes them directly via **Gneiss PAL** (Plexus Abstraction Layer), and stores the result in a semantic **Knowledge Pile**.
+**Design-stage / early stub.** The command surface exists and produces real
+messages, but most commands return placeholder output and the handler is not yet
+wired into the Synapse. See [Implemented](#implemented-today) vs.
+[Planned](#planned) below.
 
-### The Illusion of Legacy
-In **Expert Mode** (Default), Midden does not rely on standard executables. When you type `ls`, you are not calling a binary from 1987; you are triggering a Gneiss enumerator.
+## What it does
 
-*If you engage the **Manual Override** (AI Off), UnaOS can hydrate a compatibility layer of POSIX binaries, but the true Architect relies on the Shard.*
+The crate exposes two pieces:
 
----
+- **`create_view() -> (Widget, TextBuffer)`** — builds a read-only, monospaced
+  GTK4 console (`ScrolledWindow` + `TextView`) and returns the widget plus its
+  `TextBuffer`. A vessel embeds the widget in its window and appends terminal
+  output to the buffer.
+- **`Midden`** — the interpreter. It holds the current working path and a
+  filesystem handle placeholder. Its core method is:
 
-## 🏗 Architecture
+  ```rust
+  pub fn execute(&mut self, command: &str) -> Result<SMessage>
+  ```
 
-### 1. The Crystal (Visual Status)
-Midden communicates the emotional state of the system via the **Crystal Indicator** in the prompt. It doesn't just wait for input; it reports health.
+  `execute` tokenizes the input and dispatches on the first word, returning an
+  `SMessage` that the caller publishes or renders. Recognized commands:
 
-*   🟢 **GREEN:** Stable. Last command successful (Exit Code 0). Git tree clean.
-*   🟠 **AMBER:** Caution. Background jobs active, or working in a "Dirty" git state (Uncommitted changes tracked by **Vairë**).
-*   🔴 **RED:** Critical. Last command failed, or system invariant violated.
-*   🔵 **BLUE:** Una Mode. The AI Interface is active and listening.
+  | Command  | Result message            | Notes                          |
+  | -------- | ------------------------- | ------------------------------ |
+  | `ls`     | `TerminalOutput`          | stub — does not yet read a dir |
+  | `pwd`    | `TerminalOutput`          | returns the tracked path       |
+  | `touch`  | `FileSystemEvent`         | emits intent; no write yet     |
+  | `help`   | `TerminalOutput`          | lists available commands       |
+  | (empty)  | `NoOp`                    |                                |
+  | (other)  | `TerminalOutput`          | "Unknown command"              |
+  | `touch` w/o arg | `TerminalError`    | usage message                  |
 
-### 2. The Knowledge Pile (The Archive)
-Midden maintains a persistent, indexed state of the system.
-*   **Traditional Shell:** Runs `ls -R` to find a file, forgetting the result immediately.
-*   **Midden:** Queries the internal Archive. If the Archive is stale, it updates the index via direct kernel calls, then answers the query instantly.
-*   **Context:** It remembers *why* you are in a directory. If you open a project, Midden loads the relevant **Elessar** context automatically.
+## How it plugs into Bandy
 
-### 3. The Shard (The Execution Unit)
-For complex tasks, Midden creates **Shards**.
-*   **Concept:** A Shard is a transient, hyper-specialized Rust binary compiled on-the-fly.
-*   **Example:** Instead of `grep "impl" ./src | wc -l`, Midden generates a minimal Rust struct that opens the directory, reads the bytes, and counts the matches using zero-copy memory mapping.
-*   **Benefit:** Zero process-spawning overhead, type-safe data handling, and maximum speed.
+Midden communicates by value, not by direct calls. `execute` returns one of the
+terminal `SMessage` variants defined in
+[`libs/bandy`](../../libs/bandy/src/signals.rs):
+`NoOp`, `TerminalOutput(String)`, `TerminalError(String)`, and
+`FileSystemEvent(String)`. The containing vessel is responsible for publishing
+these on the `Synapse` and feeding `TerminalOutput`/`TerminalError` back into the
+console `TextBuffer`.
 
----
+`Midden` also implements `bandy::BandyMember`, whose `publish(topic, msg)` is
+currently a debug `println!` placeholder.
 
-## 🛠 Developer Information
+## Implemented today
 
-**Status:** "Princess" Phase (Pre-Alpha).
-*Midden is delicate, strict, and currently requires precise handling.*
+- GTK4 console view (`create_view`).
+- Command tokenizer and dispatch over `ls`, `pwd`, `touch`, `help`.
+- `pwd` returns the tracked current path; `touch` emits a `FileSystemEvent`.
+- `BandyMember` impl (stub).
 
-**Prerequisites:**
-*   Rust Toolchain: `nightly` (Strictly enforced via `rust-toolchain.toml`)
-*   **Vairë:** Must be present in the workspace to handle version control status.
+## Planned
 
-**Build & Run:**
-Midden is part of the `UnaOS` workspace.
+- Real filesystem access through the `unafs` dependency (currently imported but
+  unused): `ls` enumerating directories, `touch` creating files.
+- Subscribing to and firing on the `Synapse` rather than returning a single
+  message and logging via `println!`.
+- Command history, working-directory navigation (`cd`), and integration with the
+  `elessar` workspace-context detection (also a dependency).
+
+## Build
+
+Midden is a member of the UnaOS workspace and builds host-native (it depends on
+GTK4):
+
 ```bash
-# Build Midden (Host Mode - Runs on Linux/macOS)
-cargo build -p midden --release
-
-# Run the Midden REPL
-cargo run -p midden
+cargo build -p midden
 ```
 
----
+## See also
 
-## 🤖 Directives for Agents (The Wolfpack)
-
-**ATTENTION:** If you are an AI agent (J1-J20) contributing to this repository, you must adhere to the following **Shard Protocol**:
-
-### 1. The "Anti-Legacy" Rule
-**DO NOT** use `std::process::Command` to invoke system tools like `git`, `grep`, or `gcc` unless absolutely unavoidable (e.g., the bootstrap compiler).
-*   ❌ **Incorrect:** Spawning `ls` to list files.
-*   ✅ **Correct:** Using `std::fs::read_dir` or **Gneiss PAL** primitives.
-
-### 2. The "No Unwind" Constraint
-Midden must be compatible with the `no_std` kernel environment of UnaOS.
-*   Avoid `panic!`. Use `Result<T, E>` for all control flow.
-*   Do not pull in dependencies that require `libc` unless they are behind a `feature = "std"` flag.
-
-### 3. The "Moonstone" Visual Standard
-Visual Output must respect the UnaOS identity.
-*   **Color:** Moonstone Purple (Approx `0x2C003E` background).
-*   **Feedback:** Midden does not speak unless spoken to, or when reporting a `[SHARD FAILURE]`.
-
----
-
-## 🔮 Roadmap
-
-*   [ ] **Phase 1: The Indexer** - Implement the file walker and "Knowledge Pile" database (Vairë integration).
-*   [ ] **Phase 2: The Crystal** - Implement the Status Line and Git/Vairë state detection.
-*   [ ] **Phase 3: The Compiler** - Implement the on-the-fly `rustc` invocation to build simple Shards.
-*   [ ] **Phase 4: The Sovereign** - Port Midden to run as `PID 1` inside UnaOS (replacing the kernel init).
-
-> *"Midden remembers."*
+- [`docs/dev/USERLAND/ARCHITECTURE.md`](../../docs/dev/USERLAND/ARCHITECTURE.md) — userspace component model (vessels / handlers / libraries).
+- [`docs/CODEX.md`](../../docs/CODEX.md) — the handler manifest.
+- [`libs/bandy`](../../libs/bandy) — `SMessage`, `Synapse`, `BandyMember`.

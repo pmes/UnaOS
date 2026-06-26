@@ -1,40 +1,62 @@
-# ☁️ Aether: The Void
+# Aether — documentation and web retrieval handler
 
-> *"The sky is not empty. It is the medium through which the light travels."*
+Aether is the UnaOS handler responsible for reading and rendering documents:
+HTML, Markdown, and PDF, plus local system documentation. It is a read-only
+viewer, not a general-purpose browser.
 
-**Aether** is the documentation and web retrieval engine of **UnaOS**. It rejects the "Browser" paradigm of the modern internet—a bloated, ad-ridden, tracking-heavy operating system within an operating system.
+**Status:** design-stage (not yet implemented). This document describes the
+intended design. The crate currently contains no working code; the entry point
+and message contract below are the planned interface, not a shipped one.
 
-Instead, **Aether** is a precision instrument designed for one purpose: **The extraction of pure information.**
+## Responsibility
 
-## 💠 The Philosophy: Signal over Noise
+Render documents and retrieve reference material — local manuals and remote web
+pages — as plain, readable content. Aether is the "Reader": it presents a
+document's text and structure and deliberately omits the dynamic application
+layer of the modern web.
 
-Modern web browsers are designed to capture your attention. **Aether** is designed to respect it.
+## Scope
 
-### 1. The Reader First
-Aether defaults to a "Reader Mode" state. It aggressively strips advertisements, trackers, and non-semantic layout elements. It presents the web as it was intended: **Hypertext**.
-*   **Typography Engine:** Renders all content using the system's high-performance font stack.
-*   **Zero-Distraction:** No pop-ups. No newsletter modals. Just the data.
+- **Read-only rendering.** Aether parses and lays out HTML, Markdown, and PDF.
+  It supports the subset of CSS needed for clean document layout and does not
+  execute page JavaScript (no JIT). Any scripting, if added later, is expected
+  to run sandboxed and only on explicit user authorization.
+- **Reader-first presentation.** Content is rendered as hypertext: body text,
+  headings, links, and images, with advertising and non-semantic layout
+  elements stripped.
+- **Unified local + remote search.** Aether is intended to treat local
+  documentation (the `principia` system manuals, `gneiss_pal` API docs, man
+  pages) and the remote web as one searchable corpus, resolving local sources
+  before reaching the network.
+- **Snapshots.** A retrieved page can be frozen and stored for offline reference
+  in a `geode` archive.
 
-### 2. The Offline Archive
-Aether treats the local documentation (man pages, Rust docs, system manuals) and the remote web as a single continuum.
-*   **Local First:** Search queries hit the local **Principia** manuals and **Gneiss** API docs before reaching out to the network.
-*   **Snapshots:** Pages can be instantly frozen and stored in **Geode** archives for offline reference.
+Network fetches and filesystem access are expected to go through `gneiss_pal`
+(its `net` and `fs` modules) rather than being re-implemented in the handler.
 
-## ⚡ The Mechanics
+## Integration with the message bus
 
-### The Engine
-Aether runs on a custom, lightweight layout engine written in Rust. It does not carry the weight of legacy Chromium.
-*   **CSS Subset:** It supports the subset of CSS required for clean layout, ignoring bloatware features used for tracking.
-*   **WASM Sandbox:** Scripts run in strict isolation, only when explicitly authorized by the user.
+Like every UnaOS handler, Aether is a self-contained crate exposing an async
+entry point (by convention `ignite(...)`) and communicates only over the
+**Bandy** message bus (`libs/bandy`); it does not call other handlers directly.
 
-### The Link to Vein
-Aether is the eyes for **Vein** (the AI).
-*   When you ask Vein a question, Aether retrieves the source material.
-*   Vein summarizes the content; Aether displays the citations.
+- It subscribes to the **Synapse** — the shared Tokio broadcast channel — via
+  `subscribe()` and reacts to relevant **SMessage** variants (e.g. a request to
+  open or fetch a document).
+- It publishes results back onto the Synapse with `fire(msg)` — rendered content
+  and metadata for the GUI (Quartzite) to display.
+- A new SMessage variant for Aether's request/response traffic is a deliberate,
+  reviewed addition to the shared `SMessage` enum.
 
-## 🛑 The Kill List
-Aether replaces:
-*   **Google Chrome / Firefox** (for general browsing)
-*   **Adobe Acrobat** (for PDF/Manual reading)
-*   **Dash / Zeal** (for offline API docs)
-*   **macOS Help Viewer**
+## Relationship to Vein
+
+Aether is intended to serve as the retrieval layer for the **Vein** handler (AI
+integration). When Vein answers a query, Aether fetches the underlying source
+material; Vein summarizes it and Aether supplies the citations and the full
+document for inspection.
+
+## See also
+
+- [`docs/dev/USERLAND/ARCHITECTURE.md`](../../docs/dev/USERLAND/ARCHITECTURE.md)
+  — the handler/vessel/Bandy component model.
+- [`docs/CODEX.md`](../../docs/CODEX.md) — the full handler manifest.
