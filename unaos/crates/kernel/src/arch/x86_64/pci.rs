@@ -170,4 +170,24 @@ pub fn init(_dtb_addr: u64, _dtb_size: usize) {
             *crate::drivers::xhci::XHCI_CONTROLLER.lock() = Some(xhci);
         }
     }
+
+    // Network controller (PCI class 0x02 = Network, subclass 0x00 = Ethernet).
+    // QEMU's e1000 (82540EM) lands here; bring it up for polled RX.
+    if let Some((bus, slot, func)) = crate::drivers::pci::PciScanner::find_device(0x02, 0x00) {
+        serial_println!(
+            ":: x86_64 PCI: Found network controller (class 0x02) at {}:{}.{} ::",
+            bus, slot, func
+        );
+        crate::drivers::e1000::init(bus, slot, func);
+        // Route the NIC's RX interrupt to the BSP local APIC via MSI (IDT vector 0x41),
+        // the same local-APIC delivery the xHCI uses. The e1000e keeps its MSI-X table in
+        // BAR3 (not mappable by enable_msix), so plain MSI is used.
+        let msg_addr = 0xFEE0_0000u32 | ((crate::arch::apic::apic_id() as u32) << 12);
+        crate::drivers::e1000::enable_interrupts(
+            bus, slot, func, msg_addr,
+            crate::arch::interrupts::NIC_MSI_VECTOR as u32,
+        );
+    } else {
+        serial_println!(":: x86_64 PCI: No network controller (class 0x02) found ::");
+    }
 }

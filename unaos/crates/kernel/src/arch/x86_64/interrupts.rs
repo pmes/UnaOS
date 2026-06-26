@@ -23,6 +23,7 @@ use x86_64::structures::idt::{InterruptDescriptorTable, InterruptStackFrame, Pag
 /// fires `XHCI_MSI_VECTOR`, and `SPURIOUS_VECTOR` == the APIC SVR low byte.
 pub const TIMER_VECTOR: u8 = 0x20;
 pub const XHCI_MSI_VECTOR: u8 = 0x40;
+pub const NIC_MSI_VECTOR: u8 = 0x41;
 /// Inter-processor interrupt vector (reschedule/wake; scheduler foundation). 0x41 is reserved
 /// for the NIC, so IPIs use 0x42.
 pub const IPI_VECTOR: u8 = 0x42;
@@ -47,6 +48,7 @@ lazy_static! {
         // the xHCI MSI-X interrupter, and the APIC spurious-interrupt vector.
         idt[TIMER_VECTOR].set_handler_fn(timer_interrupt_handler);
         idt[XHCI_MSI_VECTOR].set_handler_fn(xhci_msi_handler);
+        idt[NIC_MSI_VECTOR].set_handler_fn(nic_msi_handler);
         idt[IPI_VECTOR].set_handler_fn(ipi_handler);
         idt[SPURIOUS_VECTOR].set_handler_fn(spurious_handler);
         idt
@@ -153,6 +155,16 @@ extern "x86-interrupt" fn nmi_handler(_stack_frame: InterruptStackFrame) {
 /// the resulting event.
 extern "x86-interrupt" fn xhci_msi_handler(_stack_frame: InterruptStackFrame) {
     crate::drivers::xhci::interrupt_ack();
+    crate::arch::apic::eoi();
+}
+
+/// e1000e MSI handler (IDT vector 0x41). Lock-free, mirroring the xHCI handler: acknowledge
+/// the NIC (read ICR to clear its interrupt causes via raw MMIO) so it can raise again, then
+/// EOI the local APIC. It does NOT drain the RX ring — that happens in the polled main loop
+/// (`e1000::service_net`), which owns the NET_DEVICE lock; taking that lock here could
+/// deadlock. The interrupt's purpose is to wake the CPU from `hlt` so RX is serviced promptly.
+extern "x86-interrupt" fn nic_msi_handler(_stack_frame: InterruptStackFrame) {
+    crate::drivers::e1000::interrupt_ack();
     crate::arch::apic::eoi();
 }
 

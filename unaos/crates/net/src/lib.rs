@@ -1,4 +1,7 @@
-#![no_std]
+// `no_std` for every real (cross-compiled) build; `std` is linked only under `cargo test` so
+// the host test harness (e.g. the RFC 6298 estimator unit tests in `tcp`) can run. The crate
+// itself uses only `core`, so this changes nothing about the kernel build.
+#![cfg_attr(not(test), no_std)]
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2026 The Architect & Una
 //
@@ -17,9 +20,13 @@
 
 
 pub mod arp;
+pub mod dhcp;
 pub mod ethernet;
+pub mod icmp;
 pub mod interface;
 pub mod ipv4;
+pub mod tcp;
+pub mod udp;
 
 use arp::ArpStateMachine;
 use ethernet::{EtherType, EthernetFrame};
@@ -27,38 +34,74 @@ use ipv4::Ipv4Header;
 
 /// The central ingress router.
 ///
-/// Takes a raw Ethernet frame `&[u8]` and routes it up the OSI stack.
-/// It reads the Ethernet II EtherType to determine the next layer.
-pub fn ingress(buffer: &[u8], arp_state: &ArpStateMachine) {
-    let frame = match EthernetFrame::new(buffer) {
-        Some(f) => f,
-        None => return, // Drop invalid/undersized frames
-    };
+/// Takes a raw Ethernet frame `&[u8]`, routes it up the stack, and — when a reply
+/// is warranted — writes a complete outgoing Ethernet frame into `tx_buf` and
+/// returns its length. The caller (the NIC driver) transmits `tx_buf[..len]`.
+/// Returns `None` when nothing should be sent (dropped/unsupported/no reply).
+pub fn ingress(buffer: &[u8], arp_state: &ArpStateMachine, tx_buf: &mut [u8]) -> Option<usize> {
+    let frame = EthernetFrame::new(buffer)?; // Drop invalid/undersized frames
 
     let payload = frame.payload();
 
     match frame.ethertype() {
         EtherType::Arp => {
-            // Hands the payload to the ARP module.
-            // A higher-level handler or device abstraction would actually transmit the reply.
-            // This satisfies the routing logic requirement for now.
-            if let Some((_reply_bytes, _dest_mac)) = arp_state.process_packet(payload) {
-                // Here, we would construct a new EthernetFrame using _dest_mac,
-                // our own MAC as source, and EtherType::Arp, then call `device.transmit(...)`.
-                // For the scope of `ingress`, routing to the module is sufficient.
-            }
+            // Build and return an ARP reply (wrapped in an Ethernet frame) when the
+            // request targets our IP; the driver transmits it.
+            let (reply, dest_mac) = arp_state.process_packet(payload)?;
+            ethernet::write_frame(
+                tx_buf,
+                dest_mac,
+                arp_state.our_mac(),
+                EtherType::Arp.as_u16(),
+                &reply,
+            )
         }
         EtherType::Ipv4 => {
-            // Hands the payload to the IPv4 module.
-            if let Some(ipv4_header) = Ipv4Header::new(payload) {
-                if ipv4_header.verify_checksum() {
-                    // Valid IPv4 packet.
-                    // Further routing (e.g., to TCP, UDP, ICMP) would happen here based on `ipv4_header.protocol()`.
-                }
+            let ip = Ipv4Header::new(payload)?;
+            // Only handle valid packets addressed to us.
+            if !ip.verify_checksum() || ip.destination_ip() != arp_state.our_ip() {
+                return None;
             }
+
+            // Build the L4 reply into tx_buf[34..], then wrap it bottom-up:
+            // Ethernet[0..14] | IPv4[14..34] | L4[34..]. The (protocol, length) pair
+            // drives the common IPv4 + Ethernet framing below.
+            let (proto, l4_len) = match ip.protocol() {
+                // ICMP echo request -> echo reply (ping).
+                ipv4::PROTO_ICMP => (
+                    ipv4::PROTO_ICMP,
+                    icmp::write_echo_reply(tx_buf.get_mut(34..)?, ip.payload())?,
+                ),
+                // UDP -> echo the datagram back with the ports swapped.
+                udp::PROTO_UDP => {
+                    let dg = udp::UdpDatagram::new(ip.payload())?;
+                    let n = udp::write_datagram(
+                        tx_buf.get_mut(34..)?,
+                        dg.dest_port(),
+                        dg.source_port(),
+                        arp_state.our_ip(),
+                        ip.source_ip(),
+                        dg.payload(),
+                    )?;
+                    (udp::PROTO_UDP, n)
+                }
+                _ => return None, // TCP and others arrive in later phases.
+            };
+            ipv4::write_header(
+                tx_buf.get_mut(14..34)?,
+                arp_state.our_ip(),
+                ip.source_ip(),
+                proto,
+                l4_len,
+            )?;
+            ethernet::write_header(
+                tx_buf.get_mut(0..14)?,
+                frame.source_mac(),
+                arp_state.our_mac(),
+                EtherType::Ipv4.as_u16(),
+            )?;
+            Some(14 + 20 + l4_len)
         }
-        _ => {
-            // Drop unsupported protocols.
-        }
+        _ => None, // Drop unsupported protocols.
     }
 }

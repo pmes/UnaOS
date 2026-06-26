@@ -14,7 +14,6 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-use std::path::PathBuf;
 use std::process::{Command, Stdio};
 
 fn main() {
@@ -114,8 +113,21 @@ fn main() {
         println!("Created usb.img (64MB) with Signature.");
     }
 
-    println!("🔹 Launching QEMU...");
-    let mut cmd = Command::new("qemu-system-x86_64");
+    // Network backend selector. Default is user-mode (slirp): zero privileges, link
+    // comes up, but the host cannot arping/ping the guest (it's NAT). UNAOS_NET=vmnet
+    // switches to a vmnet-host netdev so host and guest share an L2 segment — enabling
+    // `ping`/`arping 10.0.2.15` from the host. vmnet needs root, so QEMU runs under sudo.
+    let net_mode = std::env::var("UNAOS_NET").unwrap_or_default();
+    let use_vmnet = net_mode == "vmnet";
+
+    println!("🔹 Launching QEMU{}...", if use_vmnet { " (vmnet-host, via sudo)" } else { "" });
+    let mut cmd = if use_vmnet {
+        let mut c = Command::new("sudo");
+        c.arg("qemu-system-x86_64");
+        c
+    } else {
+        Command::new("qemu-system-x86_64")
+    };
 
     // Q35/ICH9 chipset: PCIe-based, closer to real modern hardware (e.g. a 2012 MacBook
     // Pro) than the legacy i440FX default. Note: on Q35 the qemu-xhci PCIe INTx routes to
@@ -152,12 +164,55 @@ fn main() {
     let smp = std::env::var("UNAOS_SMP").unwrap_or_else(|_| "4".into());
     cmd.arg("-smp").arg(smp);
 
+    // Network: Intel e1000 (82540EM). slirp (default) brings the link up but the host
+    // can't reach the guest (NAT). vmnet-host shares an L2 segment on 10.0.2.0/24
+    // (host = 10.0.2.1) so `ping`/`arping` of the guest's static 10.0.2.15 works.
+    // For slirp wire debugging add UNAOS_QEMU_EXTRA="-object filter-dump,id=d0,netdev=n0,file=target/net.pcap".
+    if use_vmnet {
+        cmd.arg("-netdev")
+            .arg("vmnet-host,id=n0,start-address=10.0.2.1,end-address=10.0.2.254,subnet-mask=255.255.255.0");
+    } else if net_mode == "socket" {
+        // Rootless L2 link to a host injector (scripts/net-inject.py) for automated
+        // ARP/ICMP responder testing without privileges. QEMU listens; injector connects.
+        cmd.arg("-netdev").arg("socket,id=n0,listen=127.0.0.1:5555");
+    } else {
+        // dhcpstart shifts slirp's DHCP pool so a successful lease (10.0.2.20) is visibly
+        // distinct from the guest's static fallback (10.0.2.15) — makes DHCP easy to confirm.
+        cmd.arg("-netdev").arg("user,id=n0,dhcpstart=10.0.2.20");
+    }
+    cmd.arg("-device").arg("e1000e,netdev=n0,mac=52:54:00:12:34:56");
+
     // DIAGNOSTIC: append arbitrary QEMU args from UNAOS_QEMU_EXTRA (whitespace-split), e.g.
     // `-d guest_errors -trace usb_xhci_* -trace usb_msd_*`, so we can capture QEMU's own
     // tracing of the xHCI/SCSI path. In test mode QEMU's stderr is redirected to a file.
     let qemu_extra = std::env::var("UNAOS_QEMU_EXTRA").unwrap_or_default();
     for a in qemu_extra.split_whitespace() {
         cmd.arg(a);
+    }
+
+    // vmnet runs under sudo; signal-based self-kill does not propagate through sudo, so
+    // run interactively (GUI) with serial -> file and a wire pcap, and let the user quit
+    // QEMU (Ctrl-C in this terminal / close the window) when done testing.
+    if use_vmnet {
+        let log_path = std::env::var("UNAOS_SERIAL_LOG")
+            .unwrap_or_else(|_| target_dir.join("serial.log").display().to_string());
+        let pcap = target_dir.join("net.pcap");
+        // Headless (GUI-under-sudo is unreliable on macOS); serial + wire pcap to files.
+        // Stop with Ctrl-C in this terminal (SIGINT reaches QEMU via the process group).
+        cmd.arg("-display").arg("none")
+            .arg("-serial").arg(format!("file:{log_path}"))
+            .arg("-object")
+            .arg(format!("filter-dump,id=d0,netdev=n0,file={}", pcap.display()));
+        println!("   [vmnet] headless; serial -> {log_path}");
+        println!("   [vmnet] wire pcap -> {}", pcap.display());
+        println!("   [vmnet] guest IP 10.0.2.15. In another terminal, find the host vmnet iface IP:");
+        println!("   [vmnet]   ifconfig | grep -B3 10.0.2     (expect a bridge/vmnet iface at 10.0.2.1)");
+        println!("   [vmnet] then:  ping -c3 10.0.2.15        (ping does ARP first, so it tests ARP + ICMP)");
+        println!("   [vmnet] watch replies in {log_path}  and  tcpdump -r {} -nne", pcap.display());
+        println!("   [vmnet] Ctrl-C here to stop QEMU when done.");
+        let mut child = cmd.spawn().unwrap();
+        child.wait().unwrap();
+        return;
     }
 
     // Test mode: set UNAOS_SERIAL_LOG to run headless, redirect serial to that file, and

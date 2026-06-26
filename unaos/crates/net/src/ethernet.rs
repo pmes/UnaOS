@@ -32,6 +32,48 @@ impl EtherType {
             _ => EtherType::Unknown(value),
         }
     }
+
+    /// The 16-bit on-the-wire value for this EtherType.
+    pub fn as_u16(self) -> u16 {
+        match self {
+            EtherType::Ipv4 => 0x0800,
+            EtherType::Arp => 0x0806,
+            EtherType::Ipv6 => 0x86DD,
+            EtherType::Unknown(v) => v,
+        }
+    }
+}
+
+/// Write just the 14-byte Ethernet II header into `buf`. Returns 14, or `None` if
+/// `buf` is too small. Used when the payload is already laid out after the header
+/// (e.g. an IPv4 packet built in place).
+pub fn write_header(buf: &mut [u8], dst: [u8; 6], src: [u8; 6], ethertype: u16) -> Option<usize> {
+    if buf.len() < 14 {
+        return None;
+    }
+    buf[0..6].copy_from_slice(&dst);
+    buf[6..12].copy_from_slice(&src);
+    buf[12..14].copy_from_slice(&ethertype.to_be_bytes());
+    Some(14)
+}
+
+/// Build an Ethernet II frame (14-byte header + `payload`) into `buf`. Returns the
+/// total frame length written, or `None` if `buf` is too small. Caller-provided
+/// buffer keeps this `no_std` and allocation-free; the NIC driver pads short frames.
+pub fn write_frame(
+    buf: &mut [u8],
+    dst: [u8; 6],
+    src: [u8; 6],
+    ethertype: u16,
+    payload: &[u8],
+) -> Option<usize> {
+    let total = 14 + payload.len();
+    if buf.len() < total {
+        return None;
+    }
+    write_header(buf, dst, src, ethertype)?;
+    buf[14..total].copy_from_slice(payload);
+    Some(total)
 }
 
 /// A zero-copy parser for an Ethernet II frame.

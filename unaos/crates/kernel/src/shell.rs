@@ -55,6 +55,9 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
             console.println("COMMANDS: ver, help, clear, echo, panic, gneiss");
             console.println("STORAGE:  diskinfo, read <lba>, write <lba> <byte>");
             console.println("SMP:      sched (per-CPU run queues)");
+            console.println("NETWORK:  netinfo, ping <ip> [count], arp <ip>");
+            console.println("          connect <ip> <port> [message], udpsend <ip> <port> [message]");
+            console.println("          get <ip> [port] [path]  (HTTP/1.0 GET)");
         },
         "clear" => {
             // Clear both the screen and the console buffer?
@@ -121,6 +124,140 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
                 _ => console.println("usage: write <lba> <byte>"),
             }
         },
+        "netinfo" => {
+            match crate::drivers::e1000::info() {
+                Some(n) => {
+                    console.println(&alloc::format!(
+                        "NIC: MAC {}  link {}",
+                        crate::drivers::e1000::fmt_mac(&n.mac),
+                        if n.link_up { "UP" } else { "DOWN" }
+                    ));
+                    console.println(&alloc::format!(
+                        "BAR0 {:#x}  RX frames: {}  TX frames: {}  IRQs: {}",
+                        n.mmio_base, n.rx_count, n.tx_count, n.irq_count
+                    ));
+                    console.println(&alloc::format!("TCP listener (:7) active conns: {}", n.tcp_conns));
+                }
+                None => console.println("No network device ready."),
+            }
+        },
+        "ping" => {
+            match args.first().and_then(|s| parse_ipv4(s)) {
+                Some(ip) => {
+                    let count = args.get(1)
+                        .and_then(|s| s.parse::<u16>().ok())
+                        .unwrap_or(4)
+                        .clamp(1, 16);
+                    console.println(&alloc::format!(
+                        "PING {}.{}.{}.{} ({} requests)", ip[0], ip[1], ip[2], ip[3], count));
+                    // Blocks while it ARP-resolves the target and waits for each reply.
+                    match crate::drivers::e1000::ping(ip, count) {
+                        Some(o) if o.resolved => {
+                            let peer = o.mac
+                                .map(|m| crate::drivers::e1000::fmt_mac(&m))
+                                .unwrap_or_default();
+                            console.println(&alloc::format!(
+                                "{}/{} replies received (peer {})", o.received, o.sent, peer));
+                        }
+                        Some(_) => console.println("host unreachable (no ARP reply)"),
+                        None => console.println("No network device ready."),
+                    }
+                }
+                None => console.println("usage: ping <a.b.c.d> [count]"),
+            }
+        },
+        "arp" => {
+            match args.first().and_then(|s| parse_ipv4(s)) {
+                Some(ip) => match crate::drivers::e1000::arp_resolve(ip) {
+                    Some(mac) => console.println(&alloc::format!(
+                        "{}.{}.{}.{} is-at {}",
+                        ip[0], ip[1], ip[2], ip[3], crate::drivers::e1000::fmt_mac(&mac))),
+                    None => console.println("no ARP reply (host unreachable / no NIC)"),
+                },
+                None => console.println("usage: arp <a.b.c.d>"),
+            }
+        },
+        "connect" => {
+            let ip = args.first().and_then(|s| parse_ipv4(s));
+            let port = args.get(1).and_then(|s| s.parse::<u16>().ok());
+            match (ip, port) {
+                (Some(ip), Some(port)) => {
+                    // Optional message; if omitted, just open and immediately close.
+                    let msg = if args.len() > 2 { args[2..].join(" ") } else { String::new() };
+                    console.println(&alloc::format!(
+                        "CONNECT {}.{}.{}.{}:{}", ip[0], ip[1], ip[2], ip[3], port));
+                    // Blocks while it ARP-resolves, handshakes, exchanges, and closes.
+                    match crate::drivers::e1000::connect(ip, port, msg.as_bytes()) {
+                        Some(o) if o.established => {
+                            console.println(&alloc::format!(
+                                "established; {} bytes received; closed={}", o.rx_len, o.closed));
+                        }
+                        Some(o) if !o.resolved => console.println("host unreachable (no ARP reply)"),
+                        Some(_) => console.println("connection refused / no response"),
+                        None => console.println("No network device ready."),
+                    }
+                }
+                _ => console.println("usage: connect <a.b.c.d> <port> [message]"),
+            }
+        },
+        "udpsend" => {
+            let ip = args.first().and_then(|s| parse_ipv4(s));
+            let port = args.get(1).and_then(|s| s.parse::<u16>().ok());
+            match (ip, port) {
+                (Some(ip), Some(port)) => {
+                    let msg = if args.len() > 2 { args[2..].join(" ") } else { String::from("unaos-udp") };
+                    console.println(&alloc::format!(
+                        "UDP {}.{}.{}.{}:{} <- {:?}", ip[0], ip[1], ip[2], ip[3], port, msg));
+                    match crate::drivers::e1000::udp_send(ip, port, msg.as_bytes()) {
+                        Some(o) if o.sent => {
+                            if o.replied {
+                                console.println(&alloc::format!("reply: {} bytes", o.rx_len));
+                            } else {
+                                console.println("sent; no reply (UDP is best-effort)");
+                            }
+                        }
+                        Some(_) => console.println("host unreachable (no ARP reply)"),
+                        None => console.println("No network device ready."),
+                    }
+                }
+                _ => console.println("usage: udpsend <a.b.c.d> <port> [message]"),
+            }
+        },
+        "get" => {
+            // Minimal HTTP/1.0 GET over the streaming TCP client: connect, send the request,
+            // read the whole response until the server closes, and print it.
+            match args.first().and_then(|s| parse_ipv4(s)) {
+                Some(ip) => {
+                    let port = args.get(1).and_then(|s| s.parse::<u16>().ok()).unwrap_or(80);
+                    let path = if args.len() > 2 { String::from(args[2]) } else { String::from("/") };
+                    let req = alloc::format!(
+                        "GET {} HTTP/1.0\r\nHost: {}.{}.{}.{}\r\nConnection: close\r\n\r\n",
+                        path, ip[0], ip[1], ip[2], ip[3]);
+                    console.println(&alloc::format!(
+                        "GET http://{}.{}.{}.{}:{}{}", ip[0], ip[1], ip[2], ip[3], port, path));
+                    match crate::drivers::e1000::fetch(ip, port, req.as_bytes()) {
+                        Some((o, body)) if o.established => {
+                            console.println(&alloc::format!(
+                                "--- {} bytes received; closed={} ---", o.rx_len, o.closed));
+                            // Render printable ASCII; drop CR, keep LF as line breaks.
+                            let text: String = body.iter().filter_map(|&b| match b {
+                                b'\n' => Some('\n'),
+                                b'\r' => None,
+                                0x20..=0x7e => Some(b as char),
+                                _ => Some('.'),
+                            }).collect();
+                            for line in text.split('\n') {
+                                console.println(line);
+                            }
+                        }
+                        Some((o, _)) if !o.resolved => console.println("host unreachable (no ARP reply)"),
+                        Some(_) => console.println("connection refused / no response"),
+                        None => console.println("No network device ready."),
+                    }
+                }
+                None => console.println("usage: get <a.b.c.d> [port] [path]"),
+            }
+        },
         "vug" => {
              if args.len() > 0 && args[0] == "bebox" {
                  console.println("Initializing GeekPort Simulation...");
@@ -182,6 +319,25 @@ fn hexdump(console: &mut Console, data: &[u8]) {
         }
         line.push('|');
         console.println(&line);
+    }
+}
+
+/// Parse a dotted-quad IPv4 address (`a.b.c.d`) into 4 octets. Rejects anything that
+/// isn't exactly four decimal octets in 0..=255.
+fn parse_ipv4(s: &str) -> Option<[u8; 4]> {
+    let mut octets = [0u8; 4];
+    let mut count = 0usize;
+    for part in s.split('.') {
+        if count >= 4 {
+            return None;
+        }
+        octets[count] = part.parse::<u8>().ok()?;
+        count += 1;
+    }
+    if count == 4 {
+        Some(octets)
+    } else {
+        None
     }
 }
 
