@@ -20,6 +20,11 @@ bootlog = []
 # hardcodes, so don't touch that UART (it would be RAM on the Pi) — rely on fbcon for on-screen
 # output, like the Mac. Enable via `UNAOS_PI=1`.
 pi = []
+# Bare-metal Raspberry Pi 4 boot: build a flat `kernel8.img` the GPU ROM loads directly from the
+# microSD slot (no UEFI/EDK2 — which can't read the SD post-handoff). Swaps the UEFI `_start(boot_info)`
+# entry for a raw `_start` that sets up a stack, zeroes BSS, enables a minimal MMU (so atomics work),
+# builds a BootInfo, and calls kernel_main. Implies `pi`. Enable via `UNAOS_BAREMETAL=1`.
+baremetal = ["pi"]
 
 [dependencies]
 # FIX: Use 'spin_no_std' to explicitly disable Standard Library usage

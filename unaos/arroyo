@@ -253,6 +253,40 @@ esp_arm() {
     echo -e "   Copy its contents to a FAT32 SD card together with the RPi4 EDK2 UEFI firmware."
 }
 
+# Bare-metal Raspberry Pi 4: build a flat kernel8.img the GPU ROM loads directly from the microSD
+# SLOT (no UEFI/EDK2 — the native Pi boot path), stage the Pi firmware blobs + config.txt around it,
+# and build a flashable .img for Raspberry Pi Imager. Links non-PIE at 0x80000 (aarch64-base.json,
+# relocation-model=static) with pi-baremetal.ld, then objcopy to a raw binary.
+KERNEL8_DIR="${WORKSPACE_DIR}/target/pi_baremetal"
+FW_ZIP="${WORKSPACE_DIR}/target/RPi4_UEFI_Firmware_v1.52.zip"
+kernel8() {
+    echo -e "${COLOR_YELLOW}⚡ Building bare-metal kernel8.img (Pi 4, microSD-slot boot)...${COLOR_RESET}"
+    cd "$WORKSPACE_DIR/crates/kernel"
+    RUSTFLAGS="-C link-arg=-T${WORKSPACE_DIR}/crates/kernel/pi-baremetal.ld" \
+      cargo +nightly build --release --target ../../aarch64-base.json \
+      $NIGHTLY_FLAGS --features baremetal,skip_xhci
+    cd "$WORKSPACE_DIR"
+
+    local TOOLBIN; TOOLBIN="$(rustc +nightly --print sysroot)/lib/rustlib/$(rustc +nightly -vV | awk '/host/{print $2}')/bin"
+    rm -rf "$KERNEL8_DIR"; mkdir -p "$KERNEL8_DIR/overlays"
+    "$TOOLBIN/llvm-objcopy" -O binary \
+      "${WORKSPACE_DIR}/target/aarch64-base/release/unaos-kernel" "$KERNEL8_DIR/kernel8.img"
+    cp "${WORKSPACE_DIR}/scripts/pi-baremetal-config.txt" "$KERNEL8_DIR/config.txt"
+
+    # Standard Pi GPU firmware blobs (start4.elf/fixup4.dat) + base DTB + the miniuart-bt overlay,
+    # pulled from the cached pftf release zip (we use only its stock firmware files here).
+    if [ ! -f "$FW_ZIP" ]; then
+        echo -e "${COLOR_CYAN}⚡ Fetching Pi firmware (pftf v1.52)...${COLOR_RESET}"
+        curl -sL -o "$FW_ZIP" https://github.com/pftf/RPi4/releases/download/v1.52/RPi4_UEFI_Firmware_v1.52.zip
+    fi
+    unzip -o -j "$FW_ZIP" start4.elf fixup4.dat bcm2711-rpi-4-b.dtb -d "$KERNEL8_DIR" >/dev/null
+    unzip -o -j "$FW_ZIP" "overlays/miniuart-bt.dtbo" -d "$KERNEL8_DIR/overlays" >/dev/null
+    echo -e "${COLOR_GREEN}✅ Boot files: ${KERNEL8_DIR}${COLOR_RESET}"
+
+    bash "${WORKSPACE_DIR}/scripts/make-pi-img.sh" "$KERNEL8_DIR" "${WORKSPACE_DIR}/target/UnaOS-pi4-baremetal.img" 64
+    echo -e "${COLOR_GREEN}✅ Flashable image: target/UnaOS-pi4-baremetal.img — Imager → Use custom → microSD → SD slot.${COLOR_RESET}"
+}
+
 clean_all() {
     echo -e "${COLOR_YELLOW}⚡ Purging build artifacts...${COLOR_RESET}"
     cd "$WORKSPACE_DIR"
@@ -345,6 +379,9 @@ case "${1:-}" in
         ;;
     esp-arm|esp_arm)
         esp_arm
+        ;;
+    kernel8|baremetal)
+        kernel8
         ;;
     clean)
         clean_all

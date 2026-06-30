@@ -15,14 +15,64 @@ pub extern "sysv64" fn _start(boot_info: &'static mut BootInfo) -> ! {
     kernel_main(boot_info)
 }
 
+// UEFI aarch64 entry (default): the bootloader hands us a BootInfo with the MMU already on.
 #[unsafe(no_mangle)]
-#[cfg(target_arch = "aarch64")]
+#[cfg(all(target_arch = "aarch64", not(feature = "baremetal")))]
 pub extern "C" fn _start(boot_info: &'static mut BootInfo) -> ! {
     kernel_main(boot_info)
 }
 
-// The `bootlog` feature halts before the GUI, making the GUI/main-loop code below unreachable.
+// Bare-metal aarch64 entry (`baremetal` feature): the Raspberry Pi GPU ROM loads our flat
+// kernel8.img to 0x80000 and jumps to `_start` at EL2 with x0 = DTB pointer, MMU off, no stack.
+// `.text.boot` is placed first by pi-baremetal.ld so `_start` is at the load address. It parks
+// secondary cores (the firmware starts only core 0 at the kernel, but guard anyway), zeroes BSS,
+// sets SP to the linker-reserved stack, and tail-calls `__rust_boot` with the DTB pointer.
+#[cfg(all(target_arch = "aarch64", feature = "baremetal"))]
+core::arch::global_asm!(
+    r#"
+    .section .text.boot, "ax", %progbits
+    .globl _start
+_start:
+    mrs   x1, mpidr_el1
+    and   x1, x1, #0xff          // Aff0 = core id (Pi 4 is a single cluster)
+    cbnz  x1, .Lpark             // only core 0 proceeds
+    mov   x19, x0                // save the DTB pointer across the BSS clear
+    // zero BSS: [__bss_start, __bss_end)
+    adrp  x0, __bss_start
+    add   x0, x0, #:lo12:__bss_start
+    adrp  x2, __bss_end
+    add   x2, x2, #:lo12:__bss_end
+.Lbss:
+    cmp   x0, x2
+    b.hs  .Lstack
+    str   xzr, [x0], #8
+    b     .Lbss
+.Lstack:
+    adrp  x0, __stack_top
+    add   x0, x0, #:lo12:__stack_top
+    mov   sp, x0
+    mov   x0, x19                // DTB pointer as the first argument
+    bl    __rust_boot
+.Lpark:
+    wfe
+    b     .Lpark
+"#
+);
+
+#[unsafe(no_mangle)]
+#[cfg(all(target_arch = "aarch64", feature = "baremetal"))]
+pub extern "C" fn __rust_boot(dtb: u64) -> ! {
+    // SP is set and BSS is zeroed (by _start). Enable the MMU before anything touches a lock/atomic,
+    // then synthesize the BootInfo UEFI would normally provide and enter the shared kernel path.
+    unsafe { unaos_kernel::arch::boot::mmu_init() };
+    let boot_info = unaos_kernel::arch::boot::build_boot_info(dtb);
+    kernel_main(boot_info)
+}
+
+// The `bootlog` feature halts before the GUI, and `baremetal` enters a serial-only loop instead —
+// both make the GUI/main-loop code below unreachable.
 #[cfg_attr(feature = "bootlog", allow(unreachable_code))]
+#[cfg_attr(feature = "baremetal", allow(unreachable_code))]
 fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     // 0. Framebuffer log sink FIRST — mirror every serial_println! (and panics) to the screen,
     //    so boot diagnostics are visible on real hardware that has no serial port. No-op if the
@@ -137,6 +187,30 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         serial_println!(":: mode selection: {} ::", action);
         serial_println!(":: GUI suppressed; boot log held on screen. Power off when done. ::");
         unaos_kernel::arch::hlt_loop();
+    }
+
+    // Bare-metal Pi 4 (Phase 1): booted straight from the microSD slot via the GPU ROM, no UEFI, no
+    // framebuffer (that comes later via the VideoCore mailbox). Run a serial-only console: arch::init
+    // above already streamed EL/GIC/timer-LIVE to the PL011, proving the slot boot + interrupts on
+    // metal; here we just echo serial input so the Debug Probe is a live console. The timer heartbeat
+    // keeps WFI waking, so input is serviced promptly. Never returns — the GUI code below is for the
+    // UEFI/framebuffer build.
+    #[cfg(feature = "baremetal")]
+    {
+        let _ = (framebuffer_addr, framebuffer_size, info); // unused without the framebuffer/GUI path
+        serial_println!(":: UnaOS bare-metal — Pi 4 microSD-slot boot, serial console ::");
+        serial_println!(":: heartbeat live; type and I echo. (no framebuffer yet — Phase 1) ::");
+        loop {
+            while let Some(b) = unaos_kernel::arch::poll_input() {
+                // Echo; map CR to CRLF so a serial terminal advances lines.
+                if b == b'\r' {
+                    unaos_kernel::serial_print!("\r\n");
+                } else {
+                    unaos_kernel::serial_print!("{}", b as char);
+                }
+            }
+            unaos_kernel::hlt();
+        }
     }
 
     if framebuffer_addr != 0 {

@@ -5,6 +5,8 @@ pub mod pci;
 pub mod exceptions;
 pub mod gic;
 pub mod timer;
+#[cfg(feature = "baremetal")]
+pub mod boot;
 
 pub fn init() {
     serial_println!(":: AARCH64 Core Hardware Init ::");
