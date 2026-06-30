@@ -31,6 +31,24 @@ pub fn ticks() -> u64 {
     0
 }
 
+/// Free-running virtual cycle counter (CNTVCT_EL0). Monotonic and interrupt-flag-independent, like
+/// x86 rdtsc — the portable timebase for bounding hardware busy-waits (see `now_cycles` on x86_64).
+/// Runs at CNTFRQ_EL0 (~62.5 MHz under QEMU virt), NOT GHz, so its budget is in its own units.
+/// NOTE: assumes the generic-timer counter is enabled at boot. That holds under QEMU virt (where
+/// xHCI is exercised), but no GIC/timer is wired up for bare-metal ARM yet, so this must be
+/// re-verified there before any metal xHCI path relies on it.
+#[inline]
+pub fn now_cycles() -> u64 {
+    let v: u64;
+    unsafe {
+        core::arch::asm!("mrs {}, cntvct_el0", out(reg) v, options(nomem, nostack, preserves_flags));
+    }
+    v
+}
+
+/// Busy-wait budget in `now_cycles()` (CNTVCT) units. ~2.5 s at a ~60 MHz generic-timer rate.
+pub const HW_WAIT_BUDGET: u64 = 150_000_000;
+
 pub fn without_interrupts<F, R>(f: F) -> R
 where
     F: FnOnce() -> R,

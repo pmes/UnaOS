@@ -138,26 +138,42 @@ const HID_SCANCODE_TO_ASCII: [(u8, u8); 104] = [
 ];
 
 
-/// Default spin budget for hardware handshakes. Correctness only requires this be
-/// finite; it is sized generously so a healthy controller never trips it, while a
-/// wedged bit logs and bails instead of hanging the CPU forever.
-const HW_WAIT_SPINS: u64 = 50_000_000;
+/// Wall-clock budget for hardware handshakes, in `crate::arch::now_cycles()` units (rdtsc cycles on
+/// x86_64, CNTVCT ticks on aarch64). Resolved per-arch so the same ~wall-clock window holds despite
+/// the very different counter rates. ~0.5–2.5 s on real x86 silicon; ~2.5 s under QEMU/TCG.
+///
+/// Why a cycle budget and not an iteration count: the previous `50_000_000`-*iteration* budget
+/// assumed cheap loop turns, but each turn does an uncached MMIO read (~0.5–1 µs on real silicon),
+/// so a wedged status bit took ~25 s–3.5 min to time out — indistinguishable from a hang on a
+/// serial-less laptop. A free-running counter makes the timeout a real wall-clock bound,
+/// independent of MMIO-read latency and of EFLAGS.IF.
+const HW_WAIT_BUDGET: u64 = crate::arch::HW_WAIT_BUDGET;
 
-/// Spin until `pred()` returns true or `max_spins` iterations elapse.
-/// On timeout it logs `what` and returns `Err(())` so the caller can bail.
-/// This replaces every bare `loop { spin_loop() }` hardware wait so a
-/// never-flipping status bit can no longer freeze boot silently.
-fn wait_until<F: Fn() -> bool>(pred: F, max_spins: u64, what: &str) -> Result<(), ()> {
-    let mut spins: u64 = 0;
-    while !pred() {
-        spins += 1;
-        if spins >= max_spins {
-            serial_println!("xHCI: TIMEOUT waiting for {}", what);
+/// Spin until `pred()` returns true or `budget` cycles (of `crate::arch::now_cycles()`) elapse.
+/// On timeout it logs `what` and returns `Err(())` so the caller can bail. A throttled "still
+/// waiting" breadcrumb shows progress on the (serial-less) framebuffer console so a slow or wedged
+/// handshake reads as in-progress rather than frozen. This bounds every hardware wait so a
+/// never-flipping status bit can no longer freeze boot silently or for minutes.
+fn wait_until<F: Fn() -> bool>(pred: F, budget: u64, what: &str) -> Result<(), ()> {
+    let start = crate::arch::now_cycles();
+    let progress = budget / 10; // at most ~10 breadcrumb lines across the whole budget
+    let mut last_report = start;
+    loop {
+        if pred() {
+            return Ok(());
+        }
+        let now = crate::arch::now_cycles();
+        // wrapping_sub so a 64-bit counter wrap mid-wait cannot prematurely trip the deadline.
+        if now.wrapping_sub(start) >= budget {
+            serial_println!("xHCI: TIMEOUT (~{} cyc) waiting for {}", budget, what);
             return Err(());
+        }
+        if progress != 0 && now.wrapping_sub(last_report) >= progress {
+            serial_println!("xHCI: still waiting for {} ...", what);
+            last_report = now;
         }
         core::hint::spin_loop();
     }
-    Ok(())
 }
 
 /// xHCI BIOS-to-OS handoff (USB Legacy Support, xHCI spec 7.1.1).
@@ -202,7 +218,7 @@ fn bios_handoff(base_address: u64) {
                 core::ptr::write_volatile(usblegsup as *mut u32, legsup | HC_OS_OWNED);
                 let released = wait_until(
                     || unsafe { core::ptr::read_volatile(usblegsup as *const u32) } & HC_BIOS_OWNED == 0,
-                    HW_WAIT_SPINS,
+                    HW_WAIT_BUDGET,
                     "BIOS to release xHCI (USBLEGSUP.BIOS_OWNED=0)",
                 )
                 .is_ok();
@@ -253,7 +269,7 @@ pub fn init(base_address: u64) {
 
         let _ = wait_until(
             || (core::ptr::read_volatile(usbsts_ptr) & 1) != 0,
-            HW_WAIT_SPINS, "USBSTS.HCH=1 (halt)");
+            HW_WAIT_BUDGET, "USBSTS.HCH=1 (halt)");
         serial_println!("xHCI: Controller Halted.");
 
         // Reset Controller
@@ -262,12 +278,12 @@ pub fn init(base_address: u64) {
 
         let _ = wait_until(
             || (core::ptr::read_volatile(usbcmd_ptr) & 2) == 0,
-            HW_WAIT_SPINS, "USBCMD.HCRST=0 (reset)");
+            HW_WAIT_BUDGET, "USBCMD.HCRST=0 (reset)");
 
         // Wait for Controller Not Ready (CNR) to clear
         let _ = wait_until(
             || (core::ptr::read_volatile(usbsts_ptr) & (1 << 11)) == 0,
-            HW_WAIT_SPINS, "USBSTS.CNR=0");
+            HW_WAIT_BUDGET, "USBSTS.CNR=0");
         serial_println!("xHCI: Controller Reset Complete.");
     }
 
@@ -1092,14 +1108,14 @@ impl XhciController {
             // POLL: Wait for HCRST (Bit 1) to clear (hardware clears it when done)
             let _ = wait_until(
                 || (core::ptr::read_volatile(usbcmd_ptr) & 2) == 0,
-                HW_WAIT_SPINS, "USBCMD.HCRST=0 (reset)");
+                HW_WAIT_BUDGET, "USBCMD.HCRST=0 (reset)");
             serial_println!("xHCI: Reset Complete.");
 
             // POLL: Wait for CNR (Controller Not Ready, Bit 11 in USBSTS) to clear
             // The controller needs time to re-initialize after reset.
             let _ = wait_until(
                 || (core::ptr::read_volatile(usbsts_ptr) & (1 << 11)) == 0,
-                HW_WAIT_SPINS, "USBSTS.CNR=0");
+                HW_WAIT_BUDGET, "USBSTS.CNR=0");
             serial_println!("xHCI: Controller Ready.");
         }
     }
@@ -1213,7 +1229,7 @@ impl XhciController {
             let usbsts_ptr = (self.op_base + 0x04) as *const u32;
             let _ = wait_until(
                 || (core::ptr::read_volatile(usbsts_ptr) & 1) == 0,
-                HW_WAIT_SPINS, "USBSTS.HCH=0 (run)");
+                HW_WAIT_BUDGET, "USBSTS.HCH=0 (run)");
             serial_println!("xHCI: Controller Started!");
 
             // Power on all ports. Use the REAL MaxPorts (HCSPARAMS1 bits 24:31),
@@ -1402,7 +1418,7 @@ impl XhciController {
             // This confirms the hardware is executing.
             let _ = wait_until(
                 || (core::ptr::read_volatile(usbsts_ptr) & 1) == 0,
-                HW_WAIT_SPINS, "USBSTS.HCH=0 (run)");
+                HW_WAIT_BUDGET, "USBSTS.HCH=0 (run)");
             serial_println!("xHCI: ENGINE RUNNING (HCHalted cleared).");
         }
     }

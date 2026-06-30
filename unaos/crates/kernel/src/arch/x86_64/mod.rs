@@ -41,6 +41,25 @@ pub fn ticks() -> u64 {
     apic::ticks()
 }
 
+/// Free-running CPU cycle counter (rdtsc). Invariant on Nehalem and later (incl. the Ivy Bridge
+/// MacBookPro10,1): a constant rate across P-/C-/T-states, and — unlike `ticks()` — it advances
+/// regardless of EFLAGS.IF or whether the APIC-timer ISR runs. The absolute rate is unknown (no
+/// CPUID leaf 0x15/0x16 before Skylake), so callers compare against a fixed cycle budget
+/// (`HW_WAIT_BUDGET`) instead of converting to seconds. Used to bound hardware busy-waits with a
+/// real wall-clock deadline rather than an iteration count.
+#[inline]
+pub fn now_cycles() -> u64 {
+    // SAFETY: RDTSC has no preconditions at ring 0; it is gated only by CR4.TSD (a ring-3
+    // restriction we never set), never by the interrupt flag.
+    unsafe { core::arch::x86_64::_rdtsc() }
+}
+
+/// Busy-wait budget in `now_cycles()` (rdtsc) units. 2.5e9 cycles ≈ [0.5 s, 2.5 s] across 1–5 GHz
+/// parts (~1.1 s at a 2.3 GHz Ivy Bridge base) and ≈2.5 s under QEMU/TCG (default 1 GHz vCPU TSC):
+/// long enough that a healthy controller's µs-scale handshakes never trip it, short enough that a
+/// wedged status bit fails fast instead of looking frozen on a serial-less laptop.
+pub const HW_WAIT_BUDGET: u64 = 2_500_000_000;
+
 pub fn without_interrupts<F, R>(f: F) -> R
 where
     F: FnOnce() -> R,
