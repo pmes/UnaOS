@@ -1212,6 +1212,44 @@ impl XhciController {
             core::ptr::write_volatile(dcbaap_reg, dcbaap_ptr as u64);
             serial_println!("xHCI: DCBAAP set to {:#x}", dcbaap_ptr as u64);
 
+            // 1b. SCRATCHPAD BUFFERS (xHCI spec 4.20). If the controller advertises Max Scratchpad
+            // Buffers > 0 in HCSPARAMS2, the OS MUST allocate that many page-sized buffers + a
+            // Scratchpad Buffer Array of their physical addresses, and point DCBAA[0] at that array
+            // — this is the controller's private working memory. Skip it and the controller faults
+            // with a Host System Error (USBSTS.HSE) the moment it processes its first command.
+            // QEMU's qemu-xhci requests 0 (so this is a clean no-op there); real Intel xHCI (Panther
+            // Point / 2012 MacBook Pro) requests several — without them ENABLE_SLOT raised HSE on
+            // metal while the command ring was running (CRR=1). DCBAA[0] is otherwise reserved/zero.
+            let hcsparams2 = core::ptr::read_volatile((self.base_addr + 0x08) as *const u32);
+            let max_scratchpad =
+                ((((hcsparams2 >> 21) & 0x1F) << 5) | ((hcsparams2 >> 27) & 0x1F)) as usize;
+            if max_scratchpad > 0 {
+                // PAGESIZE (op_base + 0x08): bit n set => the controller supports 2^(n+12)-byte
+                // pages; the scratchpad buffers must be that size and aligned. Use the smallest
+                // supported page size (lowest set bit).
+                let pagesize = core::ptr::read_volatile((self.op_base + 0x08) as *const u32) & 0xFFFF;
+                let page_bytes = 1usize << (pagesize.trailing_zeros() + 12);
+
+                // The Scratchpad Buffer Array: one u64 physical pointer per buffer, page-aligned.
+                let arr_layout =
+                    core::alloc::Layout::from_size_align(max_scratchpad * 8, page_bytes).unwrap();
+                let arr = alloc::alloc::alloc_zeroed(arr_layout) as *mut u64;
+                for i in 0..max_scratchpad {
+                    let buf_layout =
+                        core::alloc::Layout::from_size_align(page_bytes, page_bytes).unwrap();
+                    let buf = alloc::alloc::alloc_zeroed(buf_layout);
+                    // Identity-mapped heap: the allocation's virtual address IS its bus/phys address.
+                    *arr.add(i) = buf as u64;
+                }
+                *dcbaap_ptr.add(0) = arr as u64;
+                serial_println!(
+                    "xHCI: scratchpad: {} buffer(s) x {} bytes; DCBAA[0]={:#x}",
+                    max_scratchpad, page_bytes, arr as u64
+                );
+            } else {
+                serial_println!("xHCI: scratchpad: controller requests 0 buffers (none needed).");
+            }
+
             // 2. Set Command Ring Control Register (CRCR)
             // OpBase + 0x18.
             // MUST set Bit 0 (RCS - Ring Cycle State) to 1 to match our initial Ring state.
