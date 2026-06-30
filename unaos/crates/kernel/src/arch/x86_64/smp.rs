@@ -233,6 +233,19 @@ pub fn start_aps() {
 
     let bsp_id = apic::apic_id_u32();
 
+    // Validate the fixed trampoline page against the real UEFI map. 0x8000 is free conventional RAM
+    // on QEMU/OVMF, but Apple EFI fragments low memory and may mark it Reserved/Bootloader — in
+    // which case writing the trampoline there (or the AP executing it) is unsound and APs may
+    // silently fail to start. This turns that into a visible breadcrumb on the (serial-less) Mac;
+    // the fix if it fires is to scan the map for a free low page and retarget the SIPI vector.
+    if !crate::arch::memory::region_is_usable(TRAMPOLINE_ADDR as u64, 0x1000) {
+        serial_println!(
+            "SMP: WARNING: trampoline page {:#x} is NOT Usable in the UEFI map — APs may fail to \
+             start (firmware may reclaim/clobber it).",
+            TRAMPOLINE_ADDR
+        );
+    }
+
     // Copy the trampoline to its low page and patch the fields common to every AP.
     let cr3 = x86_64::registers::control::Cr3::read().0.start_address().as_u64();
     unsafe {
