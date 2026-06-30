@@ -22,6 +22,10 @@ pub fn init() {
     // serial-less Pi where this rides the fbcon boot log).
     timer::diagnose();
     exceptions::enable_irq();
+    // Confirm the timer IRQ actually delivers before committing the idle path to WFI. On hardware
+    // where it doesn't (an unverified GIC routing), this leaves `hlt()` on its poll-spin fallback so
+    // the GUI stays responsive instead of freezing in a wake-less WFI.
+    timer::verify_live();
 }
 
 /// Read-only boot probe: dump the Exception Level we were handed off at, the generic-timer
@@ -66,12 +70,16 @@ pub fn hlt_loop() -> ! {
 }
 
 pub fn hlt() {
-    unsafe {
-        // Interrupt-driven idle: wait for an interrupt. The generic-timer heartbeat (and any future
-        // GIC source) wakes us; WFI wakes on a pending physical interrupt even if PSTATE.I is set,
-        // so a panic-time hlt_loop still halts cleanly. This replaces the old busy `nop` spin now
-        // that there's a real interrupt source.
-        core::arch::asm!("wfi", options(nomem, nostack, preserves_flags));
+    // Interrupt-driven idle WHEN the timer IRQ is confirmed delivering (`timer::verify_live`): WFI
+    // parks the core until the next tick (it wakes on a pending physical interrupt even with
+    // PSTATE.I set, so a panic-time hlt_loop still halts cleanly). If liveness was NOT confirmed —
+    // an untested GIC path where the PPI never reaches the CPU — WFI would have no wake source and
+    // sleep forever, freezing the polled main loop; fall back to a light poll-spin so input keeps
+    // being serviced (the pre-interrupt behavior, trading idle power for liveness).
+    if timer::is_live() {
+        unsafe { core::arch::asm!("wfi", options(nomem, nostack, preserves_flags)) };
+    } else {
+        core::hint::spin_loop();
     }
 }
 

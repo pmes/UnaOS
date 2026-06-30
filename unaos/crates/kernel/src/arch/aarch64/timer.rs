@@ -16,11 +16,16 @@
 // is fine for a heartbeat / wake source — exactness isn't needed, the same simplification the x86
 // APIC-timer path makes.)
 
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 /// Generic-timer PPI. INTID 30 = the non-secure EL1 physical timer (PPI 14, +16 base) on both the
 /// QEMU `virt` irqmap and the Pi 4 `arm,armv8-timer` binding.
 pub const TIMER_INTID: u32 = 30;
+
+/// Set once `verify_live` has confirmed the timer IRQ is actually being *delivered* (ticks advance
+/// after unmasking), not merely that the timer counts. The idle path (`arch::hlt`) consults this:
+/// true => WFI (park until the next tick); false => poll-spin (no wake source, so WFI would hang).
+static LIVE: AtomicBool = AtomicBool::new(false);
 
 /// Target tick rate. 250 Hz gives a 4 ms heartbeat — frequent enough to be a responsive wake
 /// source, coarse enough that the per-tick handler cost is negligible.
@@ -93,6 +98,44 @@ pub fn on_tick() {
 #[inline]
 pub fn ticks() -> u64 {
     TICKS.load(Ordering::Relaxed)
+}
+
+/// Whether the timer IRQ was confirmed delivering (see `verify_live`). The idle path branches on it.
+#[inline]
+pub fn is_live() -> bool {
+    LIVE.load(Ordering::Relaxed)
+}
+
+/// Post-unmask liveness gate: watch the tick counter actually advance over a bounded wall-clock
+/// window (timed off the always-running CNTPCT, which doesn't depend on the IRQ). Call ONCE right
+/// after IRQs are unmasked.
+///
+/// This guards a serial-less metal failure mode: if the timer counts and the GIC latches its PPI
+/// but the CPU interface never *delivers* the IRQ — e.g. the Pi's security-extensions GIC routes the
+/// PPI differently than the Non-secure Group-1 model assumes — then `ticks()` stays frozen, and a
+/// WFI idle would sleep forever with no wake source, leaving the GUI painted-but-frozen (input never
+/// re-polled). Confirming delivery here lets `arch::hlt` fall back to a poll-spin so the system stays
+/// responsive (the pre-interrupt behavior) instead of hanging. On QEMU / a correctly-wired Pi the
+/// first tick lands within one period (~4 ms) and this returns immediately.
+pub fn verify_live() {
+    let freq = cntfrq();
+    let budget = (if freq == 0 { 62_500_000 } else { freq }) / 10; // ~100 ms ceiling
+    let start_ticks = ticks();
+    let start_ct = cntpct();
+    let mut live = false;
+    while cntpct().wrapping_sub(start_ct) < budget {
+        if ticks() != start_ticks {
+            live = true;
+            break;
+        }
+        core::hint::spin_loop();
+    }
+    LIVE.store(live, Ordering::Relaxed);
+    if live {
+        serial_println!(":: AARCH64 timer LIVE: IRQ delivery confirmed; idle = WFI ::");
+    } else {
+        serial_println!(":: AARCH64 timer NOT live: no IRQ in ~100 ms; idle = poll-spin fallback ::");
+    }
 }
 
 /// Raw CNTP_CTL_EL0 (ENABLE=0, IMASK=1, ISTATUS=2). Diagnostic only.
