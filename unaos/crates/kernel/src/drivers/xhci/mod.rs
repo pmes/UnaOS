@@ -604,6 +604,36 @@ impl XhciController {
         res
     }
 
+    /// One-shot host-controller health snapshot for metal bring-up (gated to the usbdebug build):
+    /// the first ENABLE_SLOT command froze on the real 2012 rMBP — port (event-ring) events arrive
+    /// but the command completion never does — so surface the load-bearing registers to tell a
+    /// command-ring/doorbell fault (HCE/HSE/CRR) apart from an event-delivery stall. All reads, no
+    /// side effects.
+    #[cfg(feature = "usbdebug")]
+    pub fn dump_hc_health(&self, label: &str) {
+        unsafe {
+            let usbcmd = core::ptr::read_volatile(self.op_base as *const u32);
+            let usbsts = core::ptr::read_volatile((self.op_base + 0x04) as *const u32);
+            let crcr = core::ptr::read_volatile((self.op_base + 0x18) as *const u32);
+            let dboff = core::ptr::read_volatile((self.base_addr + 0x14) as *const u32) & !0x3;
+            serial_println!(
+                "xHCI HEALTH [{}]: USBCMD={:#x}(RS={} INTE={}) USBSTS={:#x}(HCH={} HSE={} EINT={} CNR={} HCE={}) CRCR.CRR={} DBOFF={:#x}",
+                label, usbcmd, usbcmd & 1, (usbcmd >> 2) & 1,
+                usbsts, usbsts & 1, (usbsts >> 2) & 1, (usbsts >> 3) & 1, (usbsts >> 11) & 1, (usbsts >> 12) & 1,
+                (crcr >> 3) & 1, dboff
+            );
+            let ir0 = XHCI_IR0_BASE.load(Ordering::Acquire);
+            if ir0 != 0 {
+                let iman = core::ptr::read_volatile(ir0 as *const u32);
+                let erdp = core::ptr::read_volatile((ir0 + 0x18) as *const u32);
+                serial_println!(
+                    "xHCI HEALTH [{}]: IMAN={:#x}(IP={} IE={}) ERDP_lo={:#x}(EHB={})",
+                    label, iman, iman & 1, (iman >> 1) & 1, erdp, (erdp >> 3) & 1
+                );
+            }
+        }
+    }
+
     fn read_portsc(&self, port_id: u8) -> u32 {
         unsafe {
             let port_offset = 0x400 + (port_id as usize - 1) * 0x10;
@@ -1490,6 +1520,42 @@ impl XhciController {
 
         if let Err(e) = self.send_command(trb) {
             serial_println!("xHCI: Failed to send Enable Slot command: {}", e);
+        }
+
+        // Metal diagnostic (usbdebug only): a healthy controller consumes ENABLE_SLOT in
+        // microseconds and writes a completion TRB to our event ring. Wait briefly (bounded by the
+        // wall-clock deadline so it can't hang) to see whether the controller responded AT ALL,
+        // then snapshot health. This turns the silent first-ENABLE_SLOT freeze on the real rMBP
+        // into a diagnosable screen: posted=false + clean USBSTS => command/doorbell never reached
+        // the controller; HCE/HSE set => it faulted on the command ring; posted=true => the
+        // completion is there and the stall is in our drain.
+        #[cfg(feature = "usbdebug")]
+        {
+            let start = crate::arch::now_cycles();
+            let budget = crate::arch::HW_WAIT_BUDGET / 4;
+            let mut posted = false;
+            let mut errored = false;
+            loop {
+                let has = { EVENT_RING.lock().as_ref().map(|r| r.has_event()).unwrap_or(false) };
+                if has {
+                    posted = true;
+                    break;
+                }
+                let usbsts = unsafe { core::ptr::read_volatile((self.op_base + 0x04) as *const u32) };
+                if (usbsts & ((1 << 2) | (1 << 12))) != 0 {
+                    errored = true;
+                    break;
+                }
+                if crate::arch::now_cycles().wrapping_sub(start) >= budget {
+                    break;
+                }
+                core::hint::spin_loop();
+            }
+            serial_println!(
+                "xHCI: after ENABLE_SLOT — completion posted to event ring={} controller-error={}",
+                posted, errored
+            );
+            self.dump_hc_health("post ENABLE_SLOT");
         }
     }
     pub fn address_device(&mut self, slot_id: u8, port_id: u8) {
