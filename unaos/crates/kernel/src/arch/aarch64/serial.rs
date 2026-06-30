@@ -2,10 +2,16 @@ use core::fmt::{self, Write};
 use spin::Mutex;
 use lazy_static::lazy_static;
 
-// QEMU `virt` PL011 base. The real Pi 4 (BCM2711) PL011 is at 0xFE201000 — a different address —
-// so the `pi` build does NOT touch this UART at all (writing here would land in RAM and the TXFF
-// wait could spin forever); it relies on fbcon for on-screen output, exactly like the Mac.
-#[cfg_attr(feature = "pi", allow(dead_code))]
+// PL011 UART base. QEMU `virt` puts the PL011 at 0x09000000; the real Pi 4 (BCM2711, low-peripheral
+// mode) puts UART0/PL011 at 0xFE201000 — identical register layout, different address. The Pi
+// firmware (config.txt `enable_uart=1`, with the PL011 routed to GPIO14/15 via the `miniuart-bt`
+// overlay) leaves it initialised at 115200 8N1, and UEFI uses it as its console, so we INHERIT that
+// setup and just push bytes through the data register — no baud/line reprogramming. With the
+// official Debug Probe on GPIO14/15 this is the Pi's real serial console (replacing the earlier
+// `pi`=fbcon-only path, which only existed because the address was hardcoded to the QEMU one).
+#[cfg(feature = "pi")]
+const UART0_ADDR: usize = 0xFE20_1000;
+#[cfg(not(feature = "pi"))]
 const UART0_ADDR: usize = 0x0900_0000;
 
 pub struct SerialPort;
@@ -16,12 +22,10 @@ impl SerialPort {
     }
 
     pub fn write_byte(&self, byte: u8) {
-        #[cfg(feature = "pi")]
-        let _ = byte; // no UART on the Pi build — fbcon carries output
-        #[cfg(not(feature = "pi"))]
         unsafe {
             let uart = UART0_ADDR as *mut u8;
-            // Bounded TXFF wait: never spin forever if the UART is absent/misaddressed.
+            // Bounded TXFF wait (FR bit 5 = TX FIFO full): never spin forever if the UART is
+            // absent/misaddressed — fbcon still carries output, so a wrong base degrades, not hangs.
             let mut spins: u32 = 0;
             while (core::ptr::read_volatile(uart.add(0x18)) & (1 << 5)) != 0 {
                 spins += 1;
@@ -84,15 +88,11 @@ macro_rules! serial_println {
 
 impl SerialPort {
     pub fn read_byte(&self) -> Option<u8> {
-        // No UART input on the Pi build — reading the QEMU address would be RAM and inject phantom
-        // keystrokes. Video-only; there's no serial console on the Pi anyway.
-        #[cfg(feature = "pi")]
-        {
-            None
-        }
-        #[cfg(not(feature = "pi"))]
         unsafe {
             let uart = UART0_ADDR as *mut u8;
+            // RXFE (FR bit 4) clear => a byte is waiting. On the real PL011 (Pi 0xFE201000 or QEMU
+            // 0x09000000) this is a true RX-empty flag, so it gives a serial-console keyboard rather
+            // than the phantom keystrokes the old hardcoded-QEMU-address `pi` path had to avoid.
             if (core::ptr::read_volatile(uart.add(0x18)) & (1 << 4)) == 0 {
                 Some(core::ptr::read_volatile(uart))
             } else {
