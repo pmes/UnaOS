@@ -90,8 +90,14 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     #[cfg(target_arch = "x86_64")]
     {
         unaos_kernel::arch::sched::init();
-        let online = unaos_kernel::arch::smp::online_aps();
-        unaos_kernel::arch::sched::start_demo(&online);
+        // The demo workload (incl. the RwLock self-test) uses tick-based timing; with the
+        // uncalibrated APIC timer it stretches into a long pause on real hardware, which only slows
+        // the USB bring-up loop. Skip it in usbdebug builds — the scheduler itself still inits.
+        #[cfg(not(feature = "usbdebug"))]
+        {
+            let online = unaos_kernel::arch::smp::online_aps();
+            unaos_kernel::arch::sched::start_demo(&online);
+        }
     }
 
     // 5. Motherboard Hardware Interconnects (xHCI/USB bring-up).
