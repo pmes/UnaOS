@@ -93,6 +93,17 @@ pub fn init(boot_info: &'static mut BootInfo) {
         }
         serial_println!("HEAP: total usable RAM {} MiB", total_usable / (1024 * 1024));
 
+        // The xHCI rings/buffers and e1000 descriptors are allocated from this heap and handed to
+        // devices as physical==bus addresses (identity map). The brief mandates DMA buffers < 4 GiB;
+        // warn if the chosen window crosses 4 GiB so a 32-bit-only DMA path can't fail mysteriously.
+        // In practice the first >=16 MiB Usable region is low, so this should not fire.
+        if heap_start + heap_size as u64 > 0x1_0000_0000 {
+            serial_println!(
+                "HEAP: WARNING: heap ends above 4 GiB ({:#x}) — 32-bit-only device DMA may be unreachable.",
+                heap_start + heap_size as u64
+            );
+        }
+
         // The kernel runs on the firmware's identity map (physical_memory_offset == 0), so the
         // chosen physical base must be directly addressable. Write+read a sentinel at both ends of
         // the window before handing it to the allocator: a mismatch (or a fault) localizes a bad

@@ -225,3 +225,93 @@ unsafe fn parse_madt(madt_addr: u64) -> Topology {
     }
     topo
 }
+
+// --- DMA Remapping (Intel VT-d) detection (F5) ---
+
+/// DMAR remapping-structure type for a DRHD (DMA Remapping Hardware Unit Definition).
+const DMAR_DRHD: u16 = 0;
+/// First remapping structure offset within the DMAR table: after the 12-byte body that follows the
+/// SDT header (Host Address Width(1) + Flags(1) + Reserved(10)).
+const DMAR_STRUCTS_OFFSET: usize = SDT_HEADER_LEN + 12; // 48
+/// Global Status Register offset within a DRHD's register set.
+const DMAR_GSTS: u64 = 0x1C;
+/// GSTS.TES — Translation Enable Status (bit 31): 1 = DMA remapping is actively translating.
+const DMAR_GSTS_TES: u32 = 1 << 31;
+
+/// Detect Intel VT-d DMA remapping and report whether it would block the kernel's device DMA.
+///
+/// The kernel programs no DMA-remapping domains and DMAs physical==bus addresses to identity-mapped
+/// heap buffers (xHCI rings/transfer buffers, the e1000 descriptors). If firmware has an IOMMU with
+/// translation ENABLED, untranslated device DMA is faulted/blocked — a hard, silent boot failure on
+/// metal. This is read-only detection: walk RSDP -> XSDT/RSDT -> "DMAR", and for the first DRHD read
+/// GSTS.TES to see whether translation is actively on. Surfaced on the (serial-less) framebuffer so a
+/// metal boot can see it; the fix is to disable VT-d in firmware (or add DMAR passthrough — a larger
+/// follow-up). Clean "absent" report when there is no DMAR table (QEMU default; Macs that ship VT-d
+/// off). 2012 rMBP firmware typically leaves VT-d disabled, but this turns a maybe-blocker into a
+/// visible fact instead of a mystery.
+pub fn dmar_report(rsdp_addr: u64) {
+    if rsdp_addr == 0 {
+        return; // no ACPI at all; acpi::init already warned
+    }
+    unsafe {
+        let rsdp = (rsdp_addr as *const Rsdp).read_unaligned();
+        if &rsdp.signature != b"RSD PTR " {
+            return;
+        }
+        let (sdt_addr, entry_size): (u64, usize) = if rsdp.revision >= 2 && rsdp.xsdt_addr != 0 {
+            (rsdp.xsdt_addr, 8)
+        } else {
+            (rsdp.rsdt_addr as u64, 4)
+        };
+
+        let dmar_addr = match find_table(sdt_addr, entry_size, b"DMAR") {
+            Some(a) => a,
+            None => {
+                serial_println!("DMAR: no IOMMU table (VT-d absent or disabled in firmware) — direct device DMA OK.");
+                return;
+            }
+        };
+
+        let hdr = (dmar_addr as *const SdtHeader).read_unaligned();
+        let total_len = hdr.length as usize;
+        let flags = ((dmar_addr as usize + SDT_HEADER_LEN + 1) as *const u8).read_unaligned();
+
+        // Walk the remapping structures; for the first DRHD read GSTS.TES from its register set.
+        let mut off = DMAR_STRUCTS_OFFSET;
+        let mut drhd_count = 0u32;
+        let mut first_reg_base = 0u64;
+        let mut translation_on = false;
+        while off + 4 <= total_len {
+            let base = dmar_addr as usize + off;
+            let stype = (base as *const u16).read_unaligned();
+            let slen = ((base + 2) as *const u16).read_unaligned() as usize;
+            if slen < 4 || off + slen > total_len {
+                break; // malformed / truncated — stop rather than read past the table
+            }
+            if stype == DMAR_DRHD {
+                drhd_count += 1;
+                // DRHD: type(2) len(2) flags(1) rsvd(1) segment(2) register_base(8 @ offset 8).
+                let reg_base = ((base + 8) as *const u64).read_unaligned();
+                if first_reg_base == 0 && reg_base != 0 {
+                    first_reg_base = reg_base;
+                    let gsts = ((reg_base + DMAR_GSTS) as *const u32).read_volatile();
+                    translation_on = (gsts & DMAR_GSTS_TES) != 0;
+                }
+            }
+            off += slen;
+        }
+
+        if translation_on {
+            serial_println!(
+                "DMAR: *** VT-d translation ENABLED *** ({} DRHD, reg @ {:#x}, flags {:#x}) — device \
+                 DMA to identity-mapped heap may be BLOCKED. Disable VT-d in firmware (or add DMAR passthrough).",
+                drhd_count, first_reg_base, flags
+            );
+        } else {
+            serial_println!(
+                "DMAR: IOMMU present ({} DRHD, reg @ {:#x}, flags {:#x}) but translation OFF — direct device DMA OK.",
+                drhd_count, first_reg_base, flags
+            );
+        }
+    }
+}

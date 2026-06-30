@@ -69,6 +69,12 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     #[cfg(target_arch = "x86_64")]
     unaos_kernel::arch::acpi::init(rsdp_addr);
 
+    // 4b'. VT-d / IOMMU check (F5): the kernel DMAs untranslated, identity-mapped heap buffers to
+    // xHCI/e1000. If firmware has DMA remapping ENABLED, that DMA is blocked — report it before USB
+    // bring-up so a metal boot sees the cause instead of a silent xHCI failure.
+    #[cfg(target_arch = "x86_64")]
+    unaos_kernel::arch::acpi::dmar_report(rsdp_addr);
+
     // 4c. SMP: start the application processors (INIT-SIPI-SIPI). Each AP brings up its own
     // per-CPU GDT/TSS + local APIC, then waits to enter its scheduler loop; the BSP continues to
     // drive everything below. `start_aps` also runs the post-bring-up SMP smoke test while the
