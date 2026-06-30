@@ -531,6 +531,10 @@ pub struct XhciController {
     cmd_pending: Option<CmdPending>,
     /// Slots of hubs detected during enumeration, awaiting (main-loop) bring-up.
     hubs_pending: Vec<u8>,
+    /// True while a port is mid-enumeration. Enumeration is serialized (one port at a time);
+    /// this lets a hot-plug Connect Status Change event know whether to kick `start_next_port`
+    /// immediately or just queue the port (the in-flight device's completion will drain it).
+    enum_active: bool,
 }
 
 unsafe impl Send for XhciController {}
@@ -580,6 +584,7 @@ impl XhciController {
             ep0_pending: None,
             cmd_pending: None,
             hubs_pending: Vec::new(),
+            enum_active: false,
         }
     }
 
@@ -810,12 +815,27 @@ impl XhciController {
                             }
                         }
 
-                        // CSC (Connect Status Change, bit 17): acknowledge only. Resets
-                        // are driven solely by start_next_port() so enumeration stays
-                        // serialized; we must NOT auto-reset here.
+                        // CSC (Connect Status Change, bit 17): acknowledge, then drive HOT-PLUG.
+                        // At boot, connected ports are caught by the initial scan; this handles a
+                        // device plugged in AFTER boot (the common case on real hardware, where QEMU
+                        // never exercised it). We queue the port and let the serialized
+                        // start_next_port() reset/enumerate it — only kicking it here if no
+                        // enumeration is already in flight (else the in-flight device's completion
+                        // drains the queue), so the one-at-a-time invariant holds.
                         if (port_sc & (1 << 17)) != 0 {
-                            serial_println!("xHCI: [Port {}] Connect Status Change; acknowledging.", port_id);
                             self.clear_port_change(port_id, 1 << 17);
+                            // Bit 0: CCS (Current Connect Status) — 1 = a device is now attached.
+                            if (port_sc & 1) != 0 {
+                                serial_println!("xHCI: [Port {}] device connected (hot-plug); queuing for enumeration.", port_id);
+                                if !self.ports_to_enumerate.contains(&port_id) {
+                                    self.ports_to_enumerate.push(port_id);
+                                }
+                                if !self.enum_active {
+                                    self.start_next_port();
+                                }
+                            } else {
+                                serial_println!("xHCI: [Port {}] device disconnected.", port_id);
+                            }
                         }
                     },
                     32 => { // TRANSFER EVENT
@@ -1311,6 +1331,7 @@ impl XhciController {
                 serial_println!("xHCI: Port {} no longer connected; skipping.", port);
                 continue;
             }
+            self.enum_active = true;
             serial_println!("xHCI: === Enumerating Port {} (PORTSC={:#x}) ===", port, portsc);
             // Bit 1: PED (Port Enabled/Disabled).
             if (portsc & 2) != 0 {
@@ -1324,6 +1345,7 @@ impl XhciController {
             }
             return;
         }
+        self.enum_active = false;
         serial_println!("xHCI: Port enumeration queue drained.");
     }
 
