@@ -431,6 +431,14 @@ pub struct DeviceSlot {
     /// True for a HID BOOT mouse (bInterfaceProtocol == 2): its report is RELATIVE signed deltas
     /// (button, dx:i8, dy:i8[, wheel]). False for the usb-tablet / absolute pointer (protocol 0),
     /// whose report is a 16-bit absolute X/Y. Selects the report decode in `poll_events`.
+    ///
+    /// LIMITATION: the relative-vs-absolute decision keys only on bInterfaceProtocol, which cleanly
+    /// covers boot mice (proto 2 → relative) and the usb-tablet (proto 0 → absolute) — i.e. nearly
+    /// every external mouse you'd plug into the Mac. A *non-boot* relative mouse that declares
+    /// protocol 0 (report format defined solely by its HID Report Descriptor) is indistinguishable
+    /// from an absolute tablet by protocol alone and falls through to the absolute path (same as
+    /// before this field existed — not a regression). The robust fix is to parse the HID Report
+    /// Descriptor's Input item Relative/Absolute flag; that's a scoped follow-up.
     pub mouse_is_relative: bool,
     pub mouse_ep: u8,
     pub mouse_mps: u16,
