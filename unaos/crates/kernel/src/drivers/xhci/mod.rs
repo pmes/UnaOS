@@ -428,6 +428,10 @@ pub struct DeviceSlot {
     pub data_buffer: Option<*mut u8>,
 
     pub is_mouse: bool,
+    /// True for a HID BOOT mouse (bInterfaceProtocol == 2): its report is RELATIVE signed deltas
+    /// (button, dx:i8, dy:i8[, wheel]). False for the usb-tablet / absolute pointer (protocol 0),
+    /// whose report is a 16-bit absolute X/Y. Selects the report decode in `poll_events`.
+    pub mouse_is_relative: bool,
     pub mouse_ep: u8,
     pub mouse_mps: u16,
     pub mouse_state: u8,
@@ -467,6 +471,7 @@ impl DeviceSlot {
             bulk_out_ring: None,
             data_buffer: None,
             is_mouse: false,
+            mouse_is_relative: false,
             mouse_ep: 0,
             mouse_mps: 0,
             mouse_state: 0,
@@ -950,11 +955,16 @@ impl XhciController {
                                                         self.configure_keyboard_endpoints(slot_id as u8, ep_addr, ep_mps, ep_interval);
                                                         found_hid = false; // Don't double-match
                                                     } else {
-                                                        // Mouse, Tablet, or generic HID (protocol 2 or 0)
-                                                        serial_println!("xHCI: >>> MOUSE/TABLET INTERRUPT IN EP FOUND: {:#x}, MPS: {}, Interval: {} <<<", ep_addr, ep_mps, ep_interval);
+                                                        // Mouse, Tablet, or generic HID (protocol 2 = boot mouse / relative;
+                                                        // protocol 0 = tablet / absolute).
+                                                        let is_rel = current_intf_protocol == 2;
+                                                        serial_println!("xHCI: >>> POINTER INTERRUPT IN EP FOUND: {:#x}, MPS: {}, Interval: {}, {} (proto {}) <<<",
+                                                            ep_addr, ep_mps, ep_interval,
+                                                            if is_rel { "RELATIVE boot-mouse" } else { "ABSOLUTE tablet" }, current_intf_protocol);
                                                         self.slots[slot_id as usize].mouse_ep = ep_addr;
                                                         self.slots[slot_id as usize].mouse_mps = ep_mps;
                                                         self.slots[slot_id as usize].is_mouse = true;
+                                                        self.slots[slot_id as usize].mouse_is_relative = is_rel;
                                                         self.configure_mouse_endpoints(slot_id as u8, ep_addr, ep_mps, ep_interval);
                                                         found_hid = false; // Don't double-match
                                                     }
@@ -1032,17 +1042,29 @@ impl XhciController {
                                     } else { None };
                                     
                                     if mouse_dci == Some(endpoint_id as u8) {
-                                        // --- MOUSE / TABLET ---
+                                        // --- POINTER (mouse / tablet) ---
                                         if let Some(data_buf_ptr) = slot.data_buffer {
                                             let data_data = core::slice::from_raw_parts(data_buf_ptr, 512);
                                             let _buttons = data_data[0];
-                                            let x = (data_data[1] as u16) | ((data_data[2] as u16) << 8);
-                                            let y = (data_data[3] as u16) | ((data_data[4] as u16) << 8);
-                                            
-                                            if x != 0 || y != 0 {
-                                                crate::pal::push_event(crate::pal::Event::MouseAbsolute { x: x as i32, y: y as i32 });
+
+                                            if slot.mouse_is_relative {
+                                                // HID BOOT mouse: byte0 = buttons, byte1 = dx:i8, byte2 = dy:i8
+                                                // (byte3 = wheel, ignored). Signed relative deltas — sign-extend
+                                                // i8 -> i32 and emit only on actual motion.
+                                                let dx = data_data[1] as i8 as i32;
+                                                let dy = data_data[2] as i8 as i32;
+                                                if dx != 0 || dy != 0 {
+                                                    crate::pal::push_event(crate::pal::Event::Mouse { x: dx, y: dy });
+                                                }
+                                            } else {
+                                                // usb-tablet / absolute pointer: byte1-2 = X, byte3-4 = Y (0..32767).
+                                                let x = (data_data[1] as u16) | ((data_data[2] as u16) << 8);
+                                                let y = (data_data[3] as u16) | ((data_data[4] as u16) << 8);
+                                                if x != 0 || y != 0 {
+                                                    crate::pal::push_event(crate::pal::Event::MouseAbsolute { x: x as i32, y: y as i32 });
+                                                }
                                             }
-                                            
+
                                             self.queue_mouse_read(slot_id as u8);
                                         }
                                     } else if keyboard_dci == Some(endpoint_id as u8) {
@@ -2255,9 +2277,11 @@ impl XhciController {
             return;
         }
         match self.parse_hid_config(buf) {
-            Some((is_kbd, ep_addr, mps, interval)) => {
+            Some((is_kbd, is_rel, ep_addr, mps, interval)) => {
                 serial_println!("xHCI: HUB downstream slot {} is {} (ep {:#x} mps {})",
-                    slot_id, if is_kbd { "KEYBOARD" } else { "MOUSE/TABLET" }, ep_addr, mps);
+                    slot_id,
+                    if is_kbd { "KEYBOARD" } else if is_rel { "MOUSE (relative)" } else { "TABLET (absolute)" },
+                    ep_addr, mps);
                 if is_kbd {
                     self.slots[slot_id as usize].is_keyboard = true;
                     self.slots[slot_id as usize].keyboard_ep = ep_addr;
@@ -2265,6 +2289,7 @@ impl XhciController {
                     self.configure_keyboard_endpoints(slot_id, ep_addr, mps, interval);
                 } else {
                     self.slots[slot_id as usize].is_mouse = true;
+                    self.slots[slot_id as usize].mouse_is_relative = is_rel;
                     self.slots[slot_id as usize].mouse_ep = ep_addr;
                     self.slots[slot_id as usize].mouse_mps = mps;
                     self.configure_mouse_endpoints(slot_id, ep_addr, mps, interval);
@@ -2275,29 +2300,34 @@ impl XhciController {
     }
 
     /// Parse a configuration descriptor (in `buf`) for the first HID interrupt-IN endpoint.
-    /// Returns (is_keyboard, ep_addr, max_packet_size, interval) or None.
-    fn parse_hid_config(&self, buf: u64) -> Option<(bool, u8, u16, u8)> {
+    /// Returns (is_keyboard, is_relative_mouse, ep_addr, max_packet_size, interval) or None.
+    /// `is_relative_mouse` = bInterfaceProtocol == 2 (HID boot mouse; relative deltas) vs an
+    /// absolute pointer (protocol 0). Only meaningful when `is_keyboard` is false.
+    fn parse_hid_config(&self, buf: u64) -> Option<(bool, bool, u8, u16, u8)> {
         unsafe {
             let p = buf as *const u8;
             let total = (((*p.add(2) as usize) | ((*p.add(3) as usize) << 8))).min(64);
             let mut off = 0usize;
             let mut in_hid = false;
             let mut is_kbd = false;
+            let mut is_rel = false;
             while off + 2 <= total {
                 let len = *p.add(off) as usize;
                 let dtype = *p.add(off + 1);
                 if len == 0 { break; }
                 if dtype == 0x04 && off + 8 <= total {
-                    // Interface descriptor: class at +5, protocol at +7. HID = 0x03; proto 1 = kbd.
+                    // Interface descriptor: class at +5, protocol at +7. HID = 0x03;
+                    // proto 1 = boot keyboard, proto 2 = boot mouse (relative).
                     in_hid = *p.add(off + 5) == 0x03;
                     is_kbd = *p.add(off + 7) == 1;
+                    is_rel = *p.add(off + 7) == 2;
                 } else if dtype == 0x05 && in_hid && off + 7 <= total {
                     // Endpoint descriptor: address +2, attributes +3, MPS +4..6, interval +6.
                     let ep_addr = *p.add(off + 2);
                     let attr = *p.add(off + 3);
                     if (ep_addr & 0x80) != 0 && (attr & 0x3) == 3 {
                         let mps = ((*p.add(off + 4) as u16) | ((*p.add(off + 5) as u16) << 8)) & 0x7FF;
-                        return Some((is_kbd, ep_addr, mps, *p.add(off + 6)));
+                        return Some((is_kbd, is_rel, ep_addr, mps, *p.add(off + 6)));
                     }
                 }
                 off += len;
