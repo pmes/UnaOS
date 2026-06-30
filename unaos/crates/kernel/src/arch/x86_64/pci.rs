@@ -100,11 +100,22 @@ fn enable_intel_xhci_ports(bus: u8, dev: u8, func: u8) {
     ];
 
     unsafe {
-        if read_config_16(bus, dev, func, 0x00) != 0x8086 {
+        let vendor = read_config_16(bus, dev, func, 0x00);
+        let device = read_config_16(bus, dev, func, 0x02);
+        // Always log the controller's identity (and the routing decision) so a serial-less metal
+        // boot can SEE which xHCI this is and why routing did or didn't apply — the live test of
+        // whether the rMBP's Panther Point id (0x1e31) is the one we gate on.
+        serial_println!(":: xHCI PCI id {:04x}:{:04x} @ {}:{}.{} ::", vendor, device, bus, dev, func);
+        if vendor != 0x8086 {
+            serial_println!(":: xHCI not Intel — no PCH port routing applies ::");
             return; // not Intel
         }
-        let device = read_config_16(bus, dev, func, 0x02);
         if !SWITCHABLE.contains(&device) {
+            serial_println!(
+                ":: xHCI Intel {:04x} not in the shared-port list — no routing applied (firmware may \
+                 have already routed the ports, or there's no EHCI companion) ::",
+                device
+            );
             return; // Intel, but not a shared-port xHCI
         }
 

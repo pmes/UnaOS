@@ -33,11 +33,15 @@ fn main() {
         .arg("-Z").arg("build-std-features=compiler-builtins-mem")
         .arg("-Z").arg("json-target-spec");
     // Optional kernel features from env knobs: UNAOS_SKIP_XHCI=1 (disable xHCI/USB bring-up),
-    // UNAOS_BOOTLOG=1 (hold the boot log on screen instead of the GUI). Composable.
+    // UNAOS_BOOTLOG=1 (hold the boot log on screen instead of the GUI), UNAOS_USBDEBUG=1 (run the
+    // USB main loop but keep the boot log on screen + print input events). Composable. NOTE: keep
+    // this list in sync with arroyo's feature mapping — the builder rebuilds the kernel, so a knob
+    // missing here is silently dropped even if arroyo set it.
     let mut feats: Vec<&str> = Vec::new();
     if std::env::var("UNAOS_SKIP_XHCI").is_ok() { feats.push("skip_xhci"); }
     if std::env::var("UNAOS_BOOTLOG").is_ok() { feats.push("bootlog"); }
     if std::env::var("UNAOS_PI").is_ok() { feats.push("pi"); }
+    if std::env::var("UNAOS_USBDEBUG").is_ok() { feats.push("usbdebug"); }
     if !feats.is_empty() {
         let list = feats.join(",");
         kernel_cmd.arg("--features").arg(&list);

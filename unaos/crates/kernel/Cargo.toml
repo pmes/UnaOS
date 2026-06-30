@@ -20,6 +20,11 @@ bootlog = []
 # hardcodes, so don't touch that UART (it would be RAM on the Pi) — rely on fbcon for on-screen
 # output, like the Mac. Enable via `UNAOS_PI=1`.
 pi = []
+# USB bring-up debug view for serial-less hardware: run the full main-loop USB path (enumeration +
+# storage + hubs) but KEEP the boot log on the framebuffer (no GUI takeover, no fbcon detach) and
+# print each input event, so external USB storage/keyboard/mouse enumeration AND live keypresses /
+# mouse deltas are visible and photographable on metal. Enable via `UNAOS_USBDEBUG=1`.
+usbdebug = []
 
 [dependencies]
 # FIX: Use 'spin_no_std' to explicitly disable Standard Library usage

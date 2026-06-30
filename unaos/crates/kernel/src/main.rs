@@ -21,8 +21,9 @@ pub extern "C" fn _start(boot_info: &'static mut BootInfo) -> ! {
     kernel_main(boot_info)
 }
 
-// The `bootlog` feature halts before the GUI, making the GUI/main-loop code below unreachable.
-#[cfg_attr(feature = "bootlog", allow(unreachable_code))]
+// The `bootlog` feature halts before the GUI, and `usbdebug` loops forever before it, making the
+// GUI/main-loop code below unreachable in those builds.
+#[cfg_attr(any(feature = "bootlog", feature = "usbdebug"), allow(unreachable_code))]
 fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     // 0. Framebuffer log sink FIRST — mirror every serial_println! (and panics) to the screen,
     //    so boot diagnostics are visible on real hardware that has no serial port. No-op if the
@@ -143,6 +144,40 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         serial_println!(":: mode selection: {} ::", action);
         serial_println!(":: GUI suppressed; boot log held on screen. Power off when done. ::");
         unaos_kernel::arch::hlt_loop();
+    }
+
+    // USB bring-up debug view (serial-less hardware): keep the boot log on the framebuffer (no GUI
+    // takeover, no fbcon detach) and run the full main-loop USB path, printing each input event.
+    // So external USB storage/keyboard/mouse enumeration AND live input are visible + photographable
+    // on metal. (Net service is intentionally skipped here so a non-e1000 NIC isn't poked.)
+    #[cfg(feature = "usbdebug")]
+    {
+        serial_println!(":: ============== USB DEBUG MODE ============== ::");
+        serial_println!(":: Enumerating USB. Plug in a stick / keyboard / mouse, then type or move the mouse. ::");
+        serial_println!(":: Watch for: 'MISSION SUCCESS' (storage), 'POINTER ... ABSOLUTE/RELATIVE', 'KEY', and the USB-DEBUG lines below. ::");
+        loop {
+            if let Some(xhci) = &mut *unaos_kernel::drivers::xhci::XHCI_CONTROLLER.lock() {
+                xhci.poll_events();
+                xhci.service_storage();
+                xhci.service_hubs();
+            }
+            while let Some(event) = unaos_kernel::pal::next_event() {
+                match event {
+                    unaos_kernel::pal::Event::Key(c) => {
+                        let ch = c as char;
+                        serial_println!("USB-DEBUG: KEY {:#04x} '{}'", c, if c >= 32 && c < 127 { ch } else { '.' });
+                    }
+                    unaos_kernel::pal::Event::Mouse { x, y } => {
+                        serial_println!("USB-DEBUG: MOUSE relative dx={} dy={}", x, y);
+                    }
+                    unaos_kernel::pal::Event::MouseAbsolute { x, y } => {
+                        serial_println!("USB-DEBUG: MOUSE absolute x={} y={}", x, y);
+                    }
+                    _ => {}
+                }
+            }
+            unaos_kernel::hlt();
+        }
     }
 
     if framebuffer_addr != 0 {
