@@ -134,7 +134,7 @@ launch_aarch64() {
     echo -e "${COLOR_PURPLE}-------------------------${COLOR_RESET}"
 
     qemu-system-aarch64 \
-        -machine virt,virtualization=on \
+        -machine virt,virtualization=on,gic-version=2 \
         -cpu cortex-a72 \
         -smp 4 \
         -m 1G \
@@ -162,7 +162,7 @@ test_aarch64() {
     rm -f "$logf"
     echo -e "${COLOR_CYAN}⚡ Headless aarch64 test (${secs}s). Serial -> ${logf}${COLOR_RESET}"
     qemu-system-aarch64 \
-        -machine virt,virtualization=on -cpu cortex-a72 -smp 4 -m 1G \
+        -machine virt,virtualization=on,gic-version=2 -cpu cortex-a72 -smp 4 -m 1G \
         -drive if=pflash,format=raw,readonly=on,file="$AAVMF_PATH" \
         -drive format=raw,file=fat:rw:"$ESP_DIR_ARM" \
         -serial "file:${logf}" -device ramfb -display none \
