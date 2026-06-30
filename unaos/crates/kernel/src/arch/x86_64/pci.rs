@@ -77,8 +77,14 @@ pub unsafe fn write_config_32(bus: u8, slot: u8, func: u8, offset: u8, value: u3
 /// into the routing-SELECT registers (XUSB2PR @ 0xD0 / USB3_PSSEN @ 0xD8). Without this the xHCI
 /// sees no devices on the shared ports. Gated to the specific Intel xHCI device ids that have an
 /// EHCI companion; a clean no-op on everything else (QEMU's qemu-xhci is vendor 0x1b36, not Intel).
-/// Mirrors Linux's `usb_enable_intel_xhci_ports`. Must run while the controller is halted, before
-/// it starts.
+///
+/// VERIFIED BY REFERENCE against Linux `drivers/usb/host/pci-quirks.c usb_enable_intel_xhci_ports()`:
+/// the offsets (XUSB2PR 0xD0 / USB2PRM 0xD4 / USB3_PSSEN 0xD8 / USB3PRM 0xDC), the straight
+/// PRM(mask)->SELECT copy with no masking, and the order (enable SuperSpeed before routing USB2)
+/// all match. Linux applies the quirk before the controller enumerates, which this does (it runs
+/// in `init` before `xhci::init` resets+starts the controller). 0x1E31 is the Panther Point part
+/// on the MacBookPro10,1. NOT yet confirmed on metal — the config-space read-back below is what
+/// lets a real-HW boot tell whether the mux actually toggled or firmware locked the bits.
 fn enable_intel_xhci_ports(bus: u8, dev: u8, func: u8) {
     const XUSB2PR: u8 = 0xD0;
     const USB2PRM: u8 = 0xD4;
@@ -107,9 +113,15 @@ fn enable_intel_xhci_ports(bus: u8, dev: u8, func: u8) {
         let usb2 = read_config_32(bus, dev, func, USB2PRM);
         write_config_32(bus, dev, func, XUSB2PR, usb2); // route USB2 ports to xHCI
 
+        // Read the SELECT registers back. On metal this is the proof the mux toggled: a read-back
+        // that equals the mask we wrote confirms routing took; a smaller/zero value means firmware
+        // locked some port bits (Apple EFI may pre-own or refuse to release shared ports). Linux
+        // logs the same via dev_dbg. Harmless plain reads.
+        let ss_rb = read_config_32(bus, dev, func, USB3_PSSEN);
+        let usb2_rb = read_config_32(bus, dev, func, XUSB2PR);
         serial_println!(
-            ":: Intel xHCI port routing applied (dev {:#06x}): USB3_PSSEN={:#010x} XUSB2PR={:#010x} ::",
-            device, ss, usb2
+            ":: Intel xHCI port routing applied (dev {:#06x}): USB3_PSSEN {:#010x}->{:#010x} XUSB2PR {:#010x}->{:#010x} ::",
+            device, ss, ss_rb, usb2, usb2_rb
         );
     }
 }
