@@ -35,6 +35,12 @@ sched_demo = []
 # print each input event, so external USB storage/keyboard/mouse enumeration AND live keypresses /
 # mouse deltas are visible and photographable on metal. Enable via `UNAOS_USBDEBUG=1`.
 usbdebug = []
+# Jetson Orin Nano (Tegra234) build: point the aarch64 serial at the Tegra UART — a 16550-style
+# controller at a Tegra MMIO base (NOT the QEMU `virt` PL011) — so the board has a real serial
+# console from boot #1 over the carrier's button-header USB-TTL (115200 8N1). Mutually exclusive
+# with `pi`. Enable via `UNAOS_TEGRA=1`. See arch/aarch64/serial.rs for the base address (TO VERIFY
+# on the board) and register layout.
+tegra = []
 
 [dependencies]
 # FIX: Use 'spin_no_std' to explicitly disable Standard Library usage

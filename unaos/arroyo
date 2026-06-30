@@ -29,7 +29,9 @@ NIGHTLY_FLAGS="-Z build-std=core,compiler_builtins,alloc -Z build-std-features=c
 
 # Optional kernel cargo features (composable). UNAOS_SKIP_XHCI=1 disables xHCI/USB bring-up
 # (video-only boot for real HW where firmware may still own the controller and stall its reset);
-# UNAOS_BOOTLOG=1 holds the boot log on screen instead of handing off to the GUI. Empty by default.
+# UNAOS_BOOTLOG=1 holds the boot log on screen instead of handing off to the GUI;
+# UNAOS_PI=1 (Raspberry Pi 4) and UNAOS_TEGRA=1 (Jetson Orin Nano / Tegra234) select the aarch64
+# UART — `pi` touches no UART (fbcon only), `tegra` points serial at the Tegra 16550. Empty by default.
 KERNEL_FEATURES=""
 _feats=""
 [ -n "${UNAOS_SKIP_XHCI:-}" ] && _feats="${_feats}skip_xhci,"
@@ -37,6 +39,7 @@ _feats=""
 [ -n "${UNAOS_PI:-}" ] && _feats="${_feats}pi,"
 [ -n "${UNAOS_USBDEBUG:-}" ] && _feats="${_feats}usbdebug,"
 [ -n "${UNAOS_SCHED_DEMO:-}" ] && _feats="${_feats}sched_demo,"
+[ -n "${UNAOS_TEGRA:-}" ] && _feats="${_feats}tegra,"
 if [ -n "$_feats" ]; then
     KERNEL_FEATURES="--features ${_feats%,}"
     echo -e "${COLOR_YELLOW}⚡ kernel features: ${_feats%,}${COLOR_RESET}"
