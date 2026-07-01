@@ -270,7 +270,21 @@ fat_img() {
     bash "${WORKSPACE_DIR}/scripts/make-fat-img.sh" part
     bash "${WORKSPACE_DIR}/scripts/make-fat-img.sh" sf
     echo -e "${COLOR_GREEN}✅ FAT images: builder/fat.img (partitioned), builder/fat-sf.img (superfloppy)${COLOR_RESET}"
-    echo -e "   Test:  UNAOS_FATIMG=1 ./arroyo test 25   |   UNAOS_FATIMG=sf ./arroyo test 25"
+    echo -e "   Test:  ./arroyo test-fat part 30   |   ./arroyo test-fat sf 30"
+}
+
+# Headless FAT test the right way: package a FRESH ESP, rebuild the FAT image from it (so the
+# usb-storage backing -- which OVMF may boot, since it carries EFI/BOOT/BOOTX64.EFI -- runs the
+# SAME kernel under test, not a stale one), then boot with that FAT image as the block device.
+# `./arroyo test-fat [part|sf] [secs]`. Mirrors a single-stick metal boot (boot + block are one FAT).
+test_fat() {
+    local layout="${1:-part}"
+    local secs="${2:-30}"
+    case "$layout" in part|sf) ;; *) echo "usage: ./arroyo test-fat [part|sf] [secs]"; exit 1;; esac
+    esp_x86
+    bash "${WORKSPACE_DIR}/scripts/make-fat-img.sh" "$layout"
+    export UNAOS_FATIMG="$layout"
+    test_x86_64 "$secs"
 }
 
 # aarch64 ESP for the Raspberry Pi 4 (UEFI / Path A). Copy onto a FAT32 SD card alongside the
@@ -376,6 +390,9 @@ case "${1:-}" in
         ;;
     fat-img|fat_img|fatimg)
         fat_img
+        ;;
+    test-fat|test_fat)
+        test_fat "${2:-part}" "${3:-30}"
         ;;
     clean)
         clean_all

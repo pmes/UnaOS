@@ -87,6 +87,15 @@ else
     printf 'placeholder BOOTX64.EFI\n' > "${MNT}/EFI/BOOT/BOOTX64.EFI"
     printf 'placeholder kernel.elf\n'   > "${MNT}/kernel.elf"
 fi
+# Make this image NON-bootable: rename the UEFI removable-media fallback (\EFI\BOOT\BOOTX64.EFI) so
+# OVMF boots the separate fat:rw ESP drive (which always carries the freshly built kernel under
+# test) instead of this usb-storage image. That leaves the usb-storage as a pristine data disk the
+# kernel enumerates cleanly -- avoiding the OVMF-USB-boot-then-kernel-re-enumerate flakiness -- and
+# means the image only needs rebuilding when its *file contents* change, not on every kernel edit.
+# (`ls` lists the root only, so EFI/ + kernel.elf still show; a real metal stick keeps BOOTX64.EFI.)
+if [ -f "${MNT}/EFI/BOOT/BOOTX64.EFI" ]; then
+    mv "${MNT}/EFI/BOOT/BOOTX64.EFI" "${MNT}/EFI/BOOT/BOOTX64.REM"
+fi
 # A small text file for the `cat` milestone.
 printf 'hello from the UnaOS FAT reader\nthis file lives on a real FAT32 volume\n' > "${MNT}/hello.txt"
 printf 'UnaOS read-only FAT32/16 reader test volume (%s layout).\n' "$LAYOUT" > "${MNT}/readme.txt"

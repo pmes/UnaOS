@@ -196,6 +196,8 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
                 xhci.service_hubs();
                 xhci.service_hid_setproto();
             }
+            // Once storage is up, mount + log the FAT volume geometry (one-shot).
+            unaos_kernel::fs::fat::probe_once();
             while let Some(event) = unaos_kernel::pal::next_event() {
                 match event {
                     unaos_kernel::pal::Event::Key(c) => {
@@ -256,6 +258,10 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
             xhci.service_hubs();
             xhci.service_hid_setproto();
         }
+
+        // Once storage is up, mount + log the FAT volume geometry (one-shot). Runs with the xHCI
+        // lock released; read_block re-locks it briefly, so there is no nested-lock hazard.
+        unaos_kernel::fs::fat::probe_once();
 
         // Drain any frames the NIC has received into the network stack (no-op when
         // no NIC is present, e.g. on aarch64).

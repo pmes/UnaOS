@@ -192,11 +192,18 @@ fn main() {
         cmd.arg("-drive").arg(format!("if=pflash,unit=1,format=raw,file={}", vars.display()));
     }
 
-    cmd.arg("-drive").arg(format!("format=raw,file=fat:rw:{}", esp_dir.display()))
+    // Boot the ESP first, explicitly (bootindex=0). When UNAOS_FATIMG points the usb-storage at a
+    // FAT image (which also carries an EFI/ tree), OVMF would otherwise sometimes *attempt* the USB
+    // drive before the ESP; that boot-time USB touch destabilizes the kernel's later BOT reads of
+    // the same device (flaky FAT mounts). Pinning the ESP to bootindex=0 (and the stick to a lower
+    // priority) makes OVMF go straight to the ESP, leaving the usb-storage pristine for the kernel —
+    // the raw usb.img default already behaved this way (OVMF never boots a non-FAT device).
+    cmd.arg("-drive").arg(format!("if=none,id=esp,format=raw,file=fat:rw:{}", esp_dir.display()))
+       .arg("-device").arg("ide-hd,drive=esp,bootindex=0")
        .arg("-device").arg("isa-debug-exit,iobase=0xf4,iosize=0x04")
        .arg("-device").arg("qemu-xhci,id=xhci")
        .arg("-drive").arg(format!("if=none,id=stick,format=raw,file={}", stick_image.display()))
-       .arg("-device").arg("usb-storage,bus=xhci.0,drive=stick")
+       .arg("-device").arg("usb-storage,bus=xhci.0,drive=stick,bootindex=1")
        .arg("-device").arg("usb-kbd,bus=xhci.0")
        .arg("-device").arg("usb-tablet,bus=xhci.0")
        .arg("-m").arg("1G");
