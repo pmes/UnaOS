@@ -174,6 +174,11 @@ fn u32le(b: &[u8], off: usize) -> u32 {
         | ((b[off + 3] as u32) << 24)
 }
 
+#[inline]
+fn u64le(b: &[u8], off: usize) -> u64 {
+    (u32le(b, off) as u64) | ((u32le(b, off + 4) as u64) << 32)
+}
+
 /// Read one 512-byte sector at absolute `lba` into `buf`. Treats a short copy as I/O error, so
 /// callers can assume a full sector on success.
 fn read_sector(lba: u64, buf: &mut [u8; SECTOR_SIZE]) -> Result<(), FatError> {
@@ -256,10 +261,32 @@ fn parse_bpb(sec: &[u8; SECTOR_SIZE], part_lba: u64, dev_blocks: u64) -> Result<
         FatKind::Fat32
     };
 
+    // Cap FAT32 at its architectural maximum: cluster numbers are 28-bit and >= 0x0FFFFFF6 are
+    // reserved for EOC/bad, so a valid volume has at most 0x0FFFFFF4 data clusters. This rejects a
+    // corrupt BPB claiming a cluster count near u32::MAX and keeps every chain hop count far below
+    // u32::MAX, so the `hops` loop guards below can never wrap. (FAT16 is already < 65525.)
+    if kind == FatKind::Fat32 && count_of_clusters > 0x0FFF_FFF4 {
+        return Err(FatError::NotFat);
+    }
+
+    // The FAT must be large enough to hold an entry (2 bytes FAT16 / 4 FAT32) for every cluster —
+    // the 2 reserved entries plus count_of_clusters. A BPB whose data region implies more clusters
+    // than its FAT can address is corrupt; reject it so fat_entry() can never index past the FAT.
+    let entry_bytes: u64 = if kind == FatKind::Fat32 { 4 } else { 2 };
+    if (count_of_clusters as u64 + 2) * entry_bytes > fat_sz as u64 * bytes_per_sec as u64 {
+        return Err(FatError::NotFat);
+    }
+
     // Consistency vs the physical device: the whole volume must fit on the disk. This is the final
     // gate that makes an MBR boot sector (or random data) passing as a superfloppy essentially
     // impossible.
     if part_lba.saturating_add(tot_sec as u64) > dev_blocks {
+        return Err(FatError::NotFat);
+    }
+    // The block layer addresses sectors with a 32-bit LBA (SCSI READ(10)), so the whole volume must
+    // live within the 32-bit LBA space. This guarantees every derived LBA (FAT / data / cluster)
+    // fits in u32, so no LBA computation (e.g. cluster_lba) can overflow u64.
+    if part_lba.saturating_add(tot_sec as u64) > u32::MAX as u64 + 1 {
         return Err(FatError::NotFat);
     }
 
@@ -294,8 +321,9 @@ fn parse_bpb(sec: &[u8; SECTOR_SIZE], part_lba: u64, dev_blocks: u64) -> Result<
     })
 }
 
-/// Mount the FAT volume on the registered block device. Detects a superfloppy (BPB at LBA 0)
-/// first; failing that, an MBR at LBA 0 whose first FAT-typed partition entry points at the BPB.
+/// Mount the FAT volume on the registered block device. Tries, in order: a superfloppy (BPB at
+/// LBA 0), a GPT (an `EFI PART` header at LBA 1 → partition entry → BPB), then a classic MBR at
+/// LBA 0 whose first FAT-typed partition entry points at the BPB.
 pub fn mount() -> Result<FatFs, FatError> {
     let dev = crate::drivers::block::info().ok_or(FatError::NoDisk)?;
     if dev.block_size != SECTOR_SIZE as u32 {
@@ -311,7 +339,14 @@ pub fn mount() -> Result<FatFs, FatError> {
         return Ok(fs);
     }
 
-    // 2) MBR-partitioned: 0x55AA signature + a partition table at offset 446. Scan the four
+    // 2) GPT: an "EFI PART" header at LBA 1 (LBA 0 is a protective MBR). Checked BEFORE the MBR scan
+    //    because a GPT disk's protective MBR entry (type 0xEE, start LBA 1) would otherwise be
+    //    misread as a classic partition and send us to parse a BPB at the GPT header sector.
+    if let Ok(fs) = scan_gpt(dev_blocks) {
+        return Ok(fs);
+    }
+
+    // 3) MBR-partitioned: 0x55AA signature + a partition table at offset 446. Scan the four
     //    primary entries; for each non-empty, non-extended entry, try to parse a BPB at its start
     //    LBA. First one that validates wins.
     if sec[510] == 0x55 && sec[511] == 0xAA {
@@ -336,6 +371,60 @@ pub fn mount() -> Result<FatFs, FatError> {
         }
     }
 
+    Err(FatError::NotFat)
+}
+
+/// Look for a GUID Partition Table: a header at LBA 1 with the `EFI PART` signature, then walk its
+/// partition entry array for the first entry whose start LBA holds a valid FAT BPB. Returns NotFat
+/// if there is no GPT or no FAT partition. Read-only; the scan is bounded (≤128 entries), and only
+/// entry sizes that divide a 512-byte sector (128 / 256) are handled so no entry straddles a read.
+fn scan_gpt(dev_blocks: u64) -> Result<FatFs, FatError> {
+    if dev_blocks < 3 {
+        return Err(FatError::NotFat);
+    }
+    let mut hdr = [0u8; SECTOR_SIZE];
+    read_sector(1, &mut hdr)?;
+    if &hdr[0..8] != b"EFI PART" {
+        return Err(FatError::NotFat);
+    }
+    let entries_lba = u64le(&hdr, 72);
+    let num_entries = u32le(&hdr, 80);
+    let entry_size = u32le(&hdr, 84);
+    if !(entry_size == 128 || entry_size == 256) || entries_lba == 0 || entries_lba >= dev_blocks {
+        return Err(FatError::NotFat);
+    }
+    let num = num_entries.min(128); // bound the scan regardless of a corrupt count
+    let per_sec = SECTOR_SIZE as u32 / entry_size; // 4 or 2 — exact, no straddle
+    let mut buf = [0u8; SECTOR_SIZE];
+    let mut cur_sec = u64::MAX;
+    for i in 0..num {
+        let sec = entries_lba + (i / per_sec) as u64;
+        if sec >= dev_blocks {
+            break;
+        }
+        if sec != cur_sec {
+            if read_sector(sec, &mut buf).is_err() {
+                break;
+            }
+            cur_sec = sec;
+        }
+        let off = ((i % per_sec) * entry_size) as usize;
+        // Unused entry: all-zero partition type GUID.
+        if buf[off..off + 16].iter().all(|&b| b == 0) {
+            continue;
+        }
+        let first_lba = u64le(&buf, off + 32);
+        if first_lba == 0 || first_lba >= dev_blocks {
+            continue;
+        }
+        let mut pbs = [0u8; SECTOR_SIZE];
+        if read_sector(first_lba, &mut pbs).is_err() {
+            continue;
+        }
+        if let Ok(fs) = parse_bpb(&pbs, first_lba, dev_blocks) {
+            return Ok(fs);
+        }
+    }
     Err(FatError::NotFat)
 }
 
@@ -403,6 +492,12 @@ impl FatFs {
             FatKind::Fat32 => cluster as u64 * 4,
         };
         let sec = offset / SECTOR_SIZE as u64;
+        // The entry must lie within the FAT region. parse_bpb already gates the FAT size against the
+        // cluster count, but re-check here so a stray out-of-range cluster can never read a sector
+        // outside the FAT (defense in depth on untrusted media).
+        if sec >= self.fat_sz as u64 {
+            return Err(FatError::BadChain);
+        }
         let within = (offset % SECTOR_SIZE as u64) as usize;
         let mut buf = [0u8; SECTOR_SIZE];
         read_sector(self.fat_start + sec, &mut buf)?;
@@ -460,8 +555,8 @@ impl FatFs {
             }
             cluster = next;
             hops += 1;
-            if hops > self.count_of_clusters + 1 {
-                return Err(FatError::BadChain);
+            if hops > self.count_of_clusters {
+                return Err(FatError::BadChain); // chain longer than the volume has clusters -> loop
             }
         }
     }
@@ -521,8 +616,8 @@ impl FatFs {
             }
             cluster = next;
             hops += 1;
-            if hops > self.count_of_clusters + 1 {
-                return Err(FatError::BadChain);
+            if hops > self.count_of_clusters {
+                return Err(FatError::BadChain); // chain longer than the volume has clusters -> loop
             }
         }
         Ok(())

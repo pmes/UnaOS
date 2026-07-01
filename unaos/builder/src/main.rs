@@ -148,6 +148,7 @@ fn main() {
     let stick_image = match std::env::var("UNAOS_FATIMG").ok().as_deref() {
         None | Some("") => usb_image.clone(),
         Some("1") | Some("part") => workspace_dir.join("builder/fat.img"),
+        Some("gpt") => workspace_dir.join("builder/fat-gpt.img"),
         Some("sf") => workspace_dir.join("builder/fat-sf.img"),
         Some(path) => std::path::PathBuf::from(path),
     };

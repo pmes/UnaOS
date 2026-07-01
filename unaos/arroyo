@@ -49,6 +49,7 @@ STICK_IMG="${WORKSPACE_DIR}/builder/usb.img"
 case "${UNAOS_FATIMG:-}" in
     "") ;;
     1|part) STICK_IMG="${WORKSPACE_DIR}/builder/fat.img";;
+    gpt) STICK_IMG="${WORKSPACE_DIR}/builder/fat-gpt.img";;
     sf) STICK_IMG="${WORKSPACE_DIR}/builder/fat-sf.img";;
     *) STICK_IMG="${UNAOS_FATIMG}";;
 esac
@@ -266,11 +267,12 @@ fat_img() {
         echo -e "${COLOR_YELLOW}⚡ Packaging the x86 ESP first (payload for the FAT image)...${COLOR_RESET}"
         esp_x86
     fi
-    echo -e "${COLOR_CYAN}⚡ Building FAT32 test images (partitioned + superfloppy)...${COLOR_RESET}"
+    echo -e "${COLOR_CYAN}⚡ Building FAT32 test images (MBR + GPT + superfloppy)...${COLOR_RESET}"
     bash "${WORKSPACE_DIR}/scripts/make-fat-img.sh" part
+    bash "${WORKSPACE_DIR}/scripts/make-fat-img.sh" gpt
     bash "${WORKSPACE_DIR}/scripts/make-fat-img.sh" sf
-    echo -e "${COLOR_GREEN}✅ FAT images: builder/fat.img (partitioned), builder/fat-sf.img (superfloppy)${COLOR_RESET}"
-    echo -e "   Test:  ./arroyo test-fat part 30   |   ./arroyo test-fat sf 30"
+    echo -e "${COLOR_GREEN}✅ FAT images: builder/fat.img (MBR), builder/fat-gpt.img (GPT), builder/fat-sf.img (superfloppy)${COLOR_RESET}"
+    echo -e "   Test:  ./arroyo test-fat part 30  |  ./arroyo test-fat gpt 30  |  ./arroyo test-fat sf 30"
 }
 
 # Headless FAT test the right way: package a FRESH ESP, rebuild the FAT image from it (so the
@@ -280,7 +282,7 @@ fat_img() {
 test_fat() {
     local layout="${1:-part}"
     local secs="${2:-30}"
-    case "$layout" in part|sf) ;; *) echo "usage: ./arroyo test-fat [part|sf] [secs]"; exit 1;; esac
+    case "$layout" in part|gpt|sf) ;; *) echo "usage: ./arroyo test-fat [part|gpt|sf] [secs]"; exit 1;; esac
     esp_x86
     bash "${WORKSPACE_DIR}/scripts/make-fat-img.sh" "$layout"
     export UNAOS_FATIMG="$layout"
