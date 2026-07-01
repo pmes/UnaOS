@@ -23,8 +23,12 @@
 use alloc::boxed::Box;
 use alloc::collections::VecDeque;
 use core::cell::UnsafeCell;
+use core::marker::PhantomData;
+use core::ops::{Deref, DerefMut};
 use core::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, AtomicU8, Ordering};
-use spin::Mutex;
+// spin's Mutex is the low-level SPINLOCK guarding the run queues / sleeper lists; alias it so this
+// module's own sleeping `Mutex<T>` (below) owns the bare name — same split as x86's sched.rs.
+use spin::Mutex as SpinMutex;
 
 use super::percpu::{self, NUM_CPUS};
 use super::timer;
@@ -135,16 +139,16 @@ static SCHED: [SchedCpu; NUM_CPUS] = [const { SchedCpu::new() }; NUM_CPUS];
 
 /// Per-CPU ready queues. `VecDeque::new` is const, so no lazy_static; a `push` may allocate, but
 /// only at `spawn` (never under the switch), so the brief lock is realloc-free in the hot path.
-static RUN_QUEUES: [Mutex<VecDeque<Box<Task>>>; NUM_CPUS] =
-    [const { Mutex::new(VecDeque::new()) }; NUM_CPUS];
+static RUN_QUEUES: [SpinMutex<VecDeque<Box<Task>>>; NUM_CPUS] =
+    [const { SpinMutex::new(VecDeque::new()) }; NUM_CPUS];
 
 /// Per-CPU sleeper lists: tasks blocked in `sleep_ticks`, tagged with their wake deadline (this
 /// CPU's `percpu.ticks`). Touched ONLY by the scheduler on the OWNING CPU (parked there on the
 /// switch-back, drained at the loop top), so the lock is always uncontended — it exists solely to
 /// make the field interior-mutable, not for cross-CPU synchronisation. Being single-CPU, a
 /// `push_back` that reallocates only ever nests the (innermost) heap lock, never another sched lock.
-static SLEEPERS: [Mutex<VecDeque<Sleeper>>; NUM_CPUS] =
-    [const { Mutex::new(VecDeque::new()) }; NUM_CPUS];
+static SLEEPERS: [SpinMutex<VecDeque<Sleeper>>; NUM_CPUS] =
+    [const { SpinMutex::new(VecDeque::new()) }; NUM_CPUS];
 
 /// A parked sleeper: its wake deadline (owning CPU's `percpu.ticks`) and the task it belongs to.
 struct Sleeper {
@@ -680,6 +684,88 @@ impl Semaphore {
 }
 
 // ---------------------------------------------------------------------------------------------
+// Mutex<T> — a sleeping mutual-exclusion lock (a binary semaphore guarding owned data)
+// ---------------------------------------------------------------------------------------------
+
+/// A sleeping mutex: `lock()` BLOCKS the calling task (it does not spin) until the lock is free,
+/// then hands back exclusive access to the protected data through an RAII guard that unlocks on
+/// drop. Built on `Semaphore` with a single permit, so it inherits the lost-wakeup-safe, cross-CPU
+/// block/wake — and, unlike the run-queue spinlock, a task may safely hold it across preemption and
+/// yields.
+///
+/// Like `Semaphore`, a Mutex that tasks block on must be `'static` (the underlying semaphore hands
+/// raw pointers to its internals across the context switch). Call `init()` once before use.
+///
+/// NOT re-entrant: a task that locks the same Mutex twice deadlocks (it blocks waiting on itself).
+pub struct Mutex<T> {
+    sem: Semaphore,
+    data: UnsafeCell<T>,
+}
+
+// SAFETY: the single semaphore permit guarantees at most one task holds the guard — hence at most
+// one live `&mut T` — at a time, across all cores. `T: Send` because the data is accessed from
+// whichever core currently holds the lock (which varies over time).
+unsafe impl<T: Send> Sync for Mutex<T> {}
+unsafe impl<T: Send> Send for Mutex<T> {}
+
+impl<T> Mutex<T> {
+    /// Construct an unlocked mutex (one permit). `const` so it can initialise a `static`.
+    pub const fn new(value: T) -> Self {
+        Mutex { sem: Semaphore::new(1), data: UnsafeCell::new(value) }
+    }
+
+    /// Reserve the underlying semaphore's waiter capacity. Call once on the BSP before use.
+    pub fn init(&self) {
+        self.sem.init();
+    }
+
+    /// Acquire the lock, blocking the current task until it is free. Returns a guard that unlocks on
+    /// drop.
+    ///
+    /// MUST be called from a scheduled task. A guard may be issued ONLY when a real permit was taken
+    /// — otherwise two callers could hold guards at once (aliased `&mut T` = UB). Off a scheduled
+    /// task `wait()` cannot block and so does not acquire, so we panic rather than hand out an
+    /// unbacked guard (a sleeping mutex is meaningless off a scheduler context anyway).
+    pub fn lock(&self) -> MutexGuard<'_, T> {
+        assert!(
+            self.sem.wait(),
+            "Mutex::lock() called off a scheduled task (a sleeping mutex needs a scheduler context)"
+        );
+        MutexGuard { mutex: self, _not_send: PhantomData }
+    }
+}
+
+/// RAII guard returned by `Mutex::lock`: dereferences to the protected data and releases the lock
+/// (`sem.post()`) when dropped.
+pub struct MutexGuard<'a, T> {
+    mutex: &'a Mutex<T>,
+    /// Make the guard `!Send`: the lock is owned by the task that took it, so a held guard must not
+    /// be moved to another task/core (which would unlock from the wrong context).
+    _not_send: PhantomData<*const ()>,
+}
+
+impl<T> Deref for MutexGuard<'_, T> {
+    type Target = T;
+    fn deref(&self) -> &T {
+        // SAFETY: we hold the only permit, so no other task aliases the data.
+        unsafe { &*self.mutex.data.get() }
+    }
+}
+
+impl<T> DerefMut for MutexGuard<'_, T> {
+    fn deref_mut(&mut self) -> &mut T {
+        // SAFETY: we hold the only permit, so this is the only live reference to the data.
+        unsafe { &mut *self.mutex.data.get() }
+    }
+}
+
+impl<T> Drop for MutexGuard<'_, T> {
+    fn drop(&mut self) {
+        self.mutex.sem.post();
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
 // Demos
 // ---------------------------------------------------------------------------------------------
 
@@ -754,52 +840,53 @@ fn sleep_demo_body(arg: usize) {
     );
 }
 
-/// Shared demo semaphore for the M4b producer/consumer (initialised in `start_aps`). A `static`, so
-/// it satisfies the `'static` requirement for a cross-thread semaphore.
-static DEMO_SEM: Semaphore = Semaphore::new(0);
-/// Items the producer posts / the consumer waits for.
-const SEM_ITEMS: usize = 5;
+/// Shared state for the M4c Mutex demo (all `static` for the `'static` requirement; initialised in
+/// `start_aps`). Two incrementers on different APs each do `MTX_INCRS` locked increments of the same
+/// `Mutex<u64>`; a verifier waits (via a completion `Semaphore`) for both, then checks no update was
+/// lost — i.e. cross-core mutual exclusion held.
+static MTX_DEMO: Mutex<u64> = Mutex::new(0);
+static MTX_DONE: Semaphore = Semaphore::new(0);
+const MTX_INCRS: u64 = 1000;
 
-/// M4b producer: post the demo semaphore `SEM_ITEMS` times, with a short busy-delay before each post
-/// so the consumer reaches its blocking `wait()` first and is woken cross-core (rather than the
-/// consumer racing ahead on the fast path). Runs on a different AP than the consumer.
-fn sem_producer_body(core: usize) {
-    for i in 0..SEM_ITEMS {
-        busy_delay_ms(2); // give the consumer time to block on the empty semaphore
-        DEMO_SEM.post();
-        serial_println!(":: SCHED: core {} SEM post #{} ::", core, i + 1);
+/// M4c incrementer: `MTX_INCRS` locked increments of the shared `Mutex<u64>`, then post completion.
+/// On metal two of these run on different cores and genuinely contend the sleeping mutex (each
+/// contended `lock()` blocks + is cross-core woken on the holder's `unlock`); the final total proves
+/// no lost read-modify-write, i.e. mutual exclusion held across cores.
+fn mtx_incrementer_body(core: usize) {
+    for _ in 0..MTX_INCRS {
+        let mut g = MTX_DEMO.lock();
+        *g += 1;
     }
-    serial_println!(":: SCHED: core {} SEM producer done ({} posts) ::", core, SEM_ITEMS);
+    MTX_DONE.post();
+    serial_println!(":: SCHED: core {} MUTEX incrementer done ({} incrs) ::", core, MTX_INCRS);
 }
 
-/// M4b consumer: `wait()` on the demo semaphore `SEM_ITEMS` times and report. Each `wait()` when the
-/// semaphore is empty BLOCKS the task; the producer's `post()` on another AP re-readies it — on
-/// metal via the reschedule SGI breaking WFI, in QEMU via this core's run() busy-poll. Receiving all
-/// `SEM_ITEMS` proves no wakeup was lost.
-fn sem_consumer_body(core: usize) {
-    let mut got = 0usize;
-    for _ in 0..SEM_ITEMS {
-        assert!(DEMO_SEM.wait(), "SEM consumer ran off a scheduled task");
-        got += 1;
+/// M4c verifier: wait for `workers` incrementers to finish (each `MTX_DONE.post()` wakes us — at
+/// least one cross-core), then read the mutex and check the total. PASS iff every increment landed.
+fn mtx_verifier_body(workers: usize) {
+    for _ in 0..workers {
+        assert!(MTX_DONE.wait(), "MUTEX verifier ran off a scheduled task");
     }
+    let total = *MTX_DEMO.lock();
+    let expected = workers as u64 * MTX_INCRS;
     serial_println!(
-        ":: SCHED: core {} SEM consumer got {}/{} => {} ::",
-        core,
-        got,
-        SEM_ITEMS,
-        if got == SEM_ITEMS { "PASS" } else { "FAIL" },
+        ":: SCHED: MUTEX total {} (expected {}) => {} ::",
+        total,
+        expected,
+        if total == expected { "PASS" } else { "FAIL" },
     );
 }
 
-/// M3b/M4a/M4b: turn on preemptive scheduling and put a workload on the APs, then flip SCHED_ACTIVE
+/// M3b/M4a/M4c: turn on preemptive scheduling and put a workload on the APs, then flip SCHED_ACTIVE
 /// (enables `timer_preempt`) and SCHED_GO (releases the APs into `run`). The workload:
 ///   * first online AP — a busy-pair (preemption regression) + the M4a `sleep_ticks` sleeper;
-///   * (with >= 3 online APs) a counting-`Semaphore` producer/consumer across two OTHER APs.
+///   * (with >= 3 online APs) an M4c `Mutex<u64>` contended by two incrementers on the 2nd + 3rd APs
+///     plus a verifier woken by a completion `Semaphore`.
 /// On metal the busy-pair INTERLEAVES under the timer, the sleeper parks-then-wakes on its own tick,
-/// and the consumer is woken cross-core by the producer's reschedule SGI. In QEMU (no Group-1 IRQ
-/// delivery) the busy tasks run sequentially, the sleeper self-skips, and the consumer is woken by
-/// its core's run() busy-poll (SGI delivery being the metal-only half). Call AFTER the BSP's
-/// cooperative demo so it stays un-preempted.
+/// the two incrementers contend the sleeping mutex ACROSS cores and the total comes out exact, and
+/// the verifier is woken cross-core. In QEMU (no Group-1 IRQ delivery) the busy tasks run
+/// sequentially, the sleeper self-skips, and every block/wake is carried by the run() busy-poll (SGI
+/// delivery being the metal-only half). Call AFTER the BSP's cooperative demo so it stays un-preempted.
 pub fn start_aps(online: &[usize]) {
     if let Some(&c) = online.first() {
         spawn("busy-a", preempt_body, c * 10, c);
@@ -807,17 +894,19 @@ pub fn start_aps(online: &[usize]) {
         spawn("sleeper", sleep_demo_body, c, c);
     }
     if online.len() >= 3 {
-        DEMO_SEM.init(); // reserve waiter capacity on the BSP before any task can block on it
-        let (consumer, producer) = (online[1], online[2]);
-        spawn("sem-consumer", sem_consumer_body, consumer, consumer);
-        spawn("sem-producer", sem_producer_body, producer, producer);
+        MTX_DEMO.init(); // reserve the mutex's internal semaphore waiters on the BSP before use
+        MTX_DONE.init();
+        let (a, b) = (online[1], online[2]);
+        spawn("mtx-inc-a", mtx_incrementer_body, a, a);
+        spawn("mtx-inc-b", mtx_incrementer_body, b, b);
+        spawn("mtx-verify", mtx_verifier_body, 2, b);
     } else {
-        serial_println!(":: AARCH64 SCHED: Semaphore demo skipped (needs >= 3 online APs) ::");
+        serial_println!(":: AARCH64 SCHED: Mutex demo skipped (needs >= 3 online APs) ::");
     }
     SCHED_ACTIVE.store(true, Ordering::Release);
     SCHED_GO.store(true, Ordering::Release);
     serial_println!(
-        ":: AARCH64 SCHED: preemption ON; busy-pair + sleep + Semaphore demo on APs {:?} ::",
+        ":: AARCH64 SCHED: preemption ON; busy-pair + sleep + Mutex demo on APs {:?} ::",
         online
     );
 }
