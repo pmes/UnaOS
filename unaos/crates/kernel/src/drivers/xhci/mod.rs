@@ -431,6 +431,12 @@ pub struct DeviceSlot {
     pub bulk_out_ring: Option<TransferRing>,
     pub data_buffer: Option<*mut u8>,
 
+    /// Dedicated DMA buffer for pointer (mouse/tablet) interrupt-IN reports. Separate from the
+    /// keyboard's `data_buffer` so a composite device (keyboard + mouse in ONE unit, e.g. a wireless
+    /// dongle) can have BOTH interrupt endpoints armed at once without their transfers racing into
+    /// the same buffer.
+    pub mouse_data_buffer: Option<*mut u8>,
+
     pub is_mouse: bool,
     /// True for a HID BOOT mouse (bInterfaceProtocol == 2): its report is RELATIVE signed deltas
     /// (button, dx:i8, dy:i8[, wheel]). False for the usb-tablet / absolute pointer (protocol 0),
@@ -446,12 +452,14 @@ pub struct DeviceSlot {
     pub mouse_is_relative: bool,
     pub mouse_ep: u8,
     pub mouse_mps: u16,
+    pub mouse_interval: u8,
     pub mouse_state: u8,
     pub mouse_ring: Option<TransferRing>,
 
     pub is_keyboard: bool,
     pub keyboard_ep: u8,
     pub keyboard_mps: u16,
+    pub keyboard_interval: u8,
     pub keyboard_state: u8,
     pub keyboard_ring: Option<TransferRing>,
 
@@ -482,15 +490,18 @@ impl DeviceSlot {
             bulk_in_ring: None,
             bulk_out_ring: None,
             data_buffer: None,
+            mouse_data_buffer: None,
             is_mouse: false,
             mouse_is_relative: false,
             mouse_ep: 0,
             mouse_mps: 0,
+            mouse_interval: 0,
             mouse_state: 0,
             mouse_ring: None,
             is_keyboard: false,
             keyboard_ep: 0,
             keyboard_mps: 0,
+            keyboard_interval: 0,
             keyboard_state: 0,
             keyboard_ring: None,
             descriptor_buffer: desc_buffer,
@@ -805,14 +816,18 @@ impl XhciController {
                                     // Storage setup is done; move on to the next connected port.
                                     self.start_next_port();
                                 }
-                                else if self.slots[slot_id as usize].mouse_state == 1 {
-                                    serial_println!("xHCI: Mouse Endpoints Configured (Slot {}). Proceeding to Set Configuration...", slot_id);
-                                    self.slots[slot_id as usize].mouse_state = 2;
-                                    self.send_set_configuration(slot_id as u8, 1);
-                                }
-                                else if self.slots[slot_id as usize].keyboard_state == 1 {
-                                    serial_println!("xHCI: Keyboard Endpoints Configured (Slot {}). Proceeding to Set Configuration...", slot_id);
-                                    self.slots[slot_id as usize].keyboard_state = 2;
+                                else if self.slots[slot_id as usize].mouse_state == 1
+                                    || self.slots[slot_id as usize].keyboard_state == 1 {
+                                    // The single Configure-Endpoint that programmed this device's HID
+                                    // interface(s) completed. Advance whichever endpoints it covered,
+                                    // then issue ONE device-level SET_CONFIGURATION for the whole device.
+                                    serial_println!("xHCI: HID Endpoints Configured (Slot {}). Proceeding to Set Configuration...", slot_id);
+                                    if self.slots[slot_id as usize].keyboard_state == 1 {
+                                        self.slots[slot_id as usize].keyboard_state = 2;
+                                    }
+                                    if self.slots[slot_id as usize].mouse_state == 1 {
+                                        self.slots[slot_id as usize].mouse_state = 2;
+                                    }
                                     self.send_set_configuration(slot_id as u8, 1);
                                 }
                                 else {
@@ -910,17 +925,21 @@ impl XhciController {
                             // EP3 = Bulk IN (SCSI Read)
 
                             if endpoint_id == 1 && slot_id > 0 { // EP0 (Control) -> Device Descriptor
-                                if self.slots[slot_id as usize].mouse_state == 2 {
-                                    serial_println!("xHCI: >>> MOUSE SET_CONFIGURATION COMPLETE <<<");
-                                    self.slots[slot_id as usize].mouse_state = 3;
-                                    self.queue_mouse_read(slot_id as u8);
-                                    // Mouse/tablet is live; move on to the next connected port.
-                                    self.start_next_port();
-                                } else if self.slots[slot_id as usize].keyboard_state == 2 {
-                                    serial_println!("xHCI: >>> KEYBOARD SET_CONFIGURATION COMPLETE <<<");
-                                    self.slots[slot_id as usize].keyboard_state = 3;
-                                    self.queue_keyboard_read(slot_id as u8);
-                                    // Keyboard is live; move on to the next connected port.
+                                if self.slots[slot_id as usize].mouse_state == 2
+                                    || self.slots[slot_id as usize].keyboard_state == 2 {
+                                    // One device-level SET_CONFIGURATION covered every HID interface; arm
+                                    // a read on each endpoint that was configured (keyboard into
+                                    // data_buffer, pointer into mouse_data_buffer — separate buffers so a
+                                    // composite device's two endpoints don't race), then advance ports.
+                                    serial_println!("xHCI: >>> HID SET_CONFIGURATION COMPLETE <<<");
+                                    if self.slots[slot_id as usize].keyboard_state == 2 {
+                                        self.slots[slot_id as usize].keyboard_state = 3;
+                                        self.queue_keyboard_read(slot_id as u8);
+                                    }
+                                    if self.slots[slot_id as usize].mouse_state == 2 {
+                                        self.slots[slot_id as usize].mouse_state = 3;
+                                        self.queue_mouse_read(slot_id as u8);
+                                    }
                                     self.start_next_port();
                                 } else {
                                     serial_println!("xHCI: >>> INTERCEPTED DESCRIPTOR EVENT (Slot 1 EP 1) <<<");
@@ -970,13 +989,14 @@ impl XhciController {
                                         let mut current_intf_class: u8 = 0;
                                         let mut current_intf_protocol: u8 = 0;
                                         let mut found_hid = false;
-                                        // Configure only the FIRST HID interrupt-IN endpoint, then stop. A composite
-                                        // keyboard (real hardware, unlike QEMU's single-interface usb-kbd) has TWO HID
-                                        // interfaces; configuring both issues two Configure-Endpoint commands against the
-                                        // one shared input context, and the second zeroes+overwrites the first before it
-                                        // commits — leaving the keyboard endpoint unconfigured (no key events). The driver's
-                                        // state machine is single-endpoint by design, so one HID EP per device is correct.
-                                        let mut configured_hid = false;
+                                        // COLLECT every HID interrupt-IN endpoint (recording it into the
+                                        // slot), then configure them all together after the walk via one
+                                        // Configure-Endpoint (see `configure_hid_endpoints`). A composite
+                                        // device — most wireless kbd+mouse dongles, and real keyboards with
+                                        // a second consumer-control interface — has more than one HID
+                                        // interface; the earlier "first interface only" workaround left the
+                                        // pointer (interface 1) unconfigured, so the mouse never worked.
+                                        let mut found_hid_ep = false;
                                         // Mass-storage tracking: collect the bulk IN/OUT
                                         // endpoints during the walk, configure once after.
                                         let mut is_mass_storage = false;
@@ -1007,7 +1027,7 @@ impl XhciController {
                                                     serial_println!("xHCI: >>> MASS STORAGE INTERFACE DETECTED (Class 0x08) <<<");
                                                     is_mass_storage = true;
                                                 }
-                                            } else if desc_type == 0x05 && found_hid && !configured_hid { // HID Endpoint (first only)
+                                            } else if desc_type == 0x05 && found_hid { // HID Endpoint
                                                 if offset + 6 >= 256 { break; }
                                                 let ep_addr = desc_data[offset + 2];
                                                 let ep_attr = desc_data[offset + 3];
@@ -1016,29 +1036,27 @@ impl XhciController {
                                                     let ep_interval = desc_data[offset + 6];
 
                                                     if current_intf_protocol == 1 {
-                                                        // USB HID Boot Keyboard
+                                                        // USB HID Boot Keyboard interface: record it (configured after the walk).
                                                         serial_println!("xHCI: >>> KEYBOARD INTERRUPT IN EP FOUND: {:#x}, MPS: {}, Interval: {} <<<", ep_addr, ep_mps, ep_interval);
                                                         self.slots[slot_id as usize].keyboard_ep = ep_addr;
                                                         self.slots[slot_id as usize].keyboard_mps = ep_mps;
+                                                        self.slots[slot_id as usize].keyboard_interval = ep_interval;
                                                         self.slots[slot_id as usize].is_keyboard = true;
-                                                        self.configure_keyboard_endpoints(slot_id as u8, ep_addr, ep_mps, ep_interval);
-                                                        found_hid = false; // Don't double-match
-                                                        configured_hid = true; // one HID EP per device (see above)
                                                     } else {
                                                         // Mouse, Tablet, or generic HID (protocol 2 = boot mouse / relative;
-                                                        // protocol 0 = tablet / absolute).
+                                                        // protocol 0 = tablet / absolute). Record it (configured after the walk).
                                                         let is_rel = current_intf_protocol == 2;
                                                         serial_println!("xHCI: >>> POINTER INTERRUPT IN EP FOUND: {:#x}, MPS: {}, Interval: {}, {} (proto {}) <<<",
                                                             ep_addr, ep_mps, ep_interval,
                                                             if is_rel { "RELATIVE boot-mouse" } else { "ABSOLUTE tablet" }, current_intf_protocol);
                                                         self.slots[slot_id as usize].mouse_ep = ep_addr;
                                                         self.slots[slot_id as usize].mouse_mps = ep_mps;
+                                                        self.slots[slot_id as usize].mouse_interval = ep_interval;
                                                         self.slots[slot_id as usize].is_mouse = true;
                                                         self.slots[slot_id as usize].mouse_is_relative = is_rel;
-                                                        self.configure_mouse_endpoints(slot_id as u8, ep_addr, ep_mps, ep_interval);
-                                                        found_hid = false; // Don't double-match
-                                                        configured_hid = true; // one HID EP per device (see above)
                                                     }
+                                                    found_hid_ep = true;
+                                                    found_hid = false; // one interrupt-IN EP per interface; next iface re-arms
                                                 }
                                             } else if desc_type == 0x05 && is_mass_storage { // Bulk Endpoint
                                                 if offset + 6 >= 256 { break; }
@@ -1057,6 +1075,12 @@ impl XhciController {
                                                 }
                                             }
                                             offset += length;
+                                        }
+
+                                        // Configure ALL collected HID interrupt-IN endpoints (keyboard
+                                        // and/or pointer) in one Configure-Endpoint command.
+                                        if found_hid_ep {
+                                            self.configure_hid_endpoints(slot_id as u8);
                                         }
 
                                         // Once both bulk directions are known, configure them.
@@ -1113,10 +1137,19 @@ impl XhciController {
                                     } else { None };
                                     
                                     if mouse_dci == Some(endpoint_id as u8) {
-                                        // --- POINTER (mouse / tablet) ---
-                                        if let Some(data_buf_ptr) = slot.data_buffer {
+                                        // --- POINTER (mouse / tablet) --- reads into its own buffer.
+                                        if let Some(data_buf_ptr) = slot.mouse_data_buffer {
                                             let data_data = core::slice::from_raw_parts(data_buf_ptr, 512);
                                             let _buttons = data_data[0];
+                                            // Metal diagnostic (parallels the keyboard dump): show the raw
+                                            // pointer report so a serial-less boot can confirm pointer
+                                            // transfers are arriving and see whether the layout decodes.
+                                            #[cfg(feature = "usbdebug")]
+                                            serial_println!(
+                                                "USB-DEBUG: ptr report ({}) {:02x} {:02x} {:02x} {:02x}",
+                                                if slot.mouse_is_relative { "rel" } else { "abs" },
+                                                data_data[0], data_data[1], data_data[2], data_data[3]
+                                            );
 
                                             if slot.mouse_is_relative {
                                                 // HID BOOT mouse: byte0 = buttons, byte1 = dx:i8, byte2 = dy:i8
@@ -2457,14 +2490,18 @@ impl XhciController {
                     self.slots[slot_id as usize].is_keyboard = true;
                     self.slots[slot_id as usize].keyboard_ep = ep_addr;
                     self.slots[slot_id as usize].keyboard_mps = mps;
-                    self.configure_keyboard_endpoints(slot_id, ep_addr, mps, interval);
+                    self.slots[slot_id as usize].keyboard_interval = interval;
                 } else {
                     self.slots[slot_id as usize].is_mouse = true;
                     self.slots[slot_id as usize].mouse_is_relative = is_rel;
                     self.slots[slot_id as usize].mouse_ep = ep_addr;
                     self.slots[slot_id as usize].mouse_mps = mps;
-                    self.configure_mouse_endpoints(slot_id, ep_addr, mps, interval);
+                    self.slots[slot_id as usize].mouse_interval = interval;
                 }
+                // Configure the (single, behind-a-hub) HID endpoint via the shared path.
+                // parse_hid_config surfaces one interface, so this arms exactly that endpoint;
+                // a composite device behind a hub keeps the single-interface limitation for now.
+                self.configure_hid_endpoints(slot_id);
             }
             None => serial_println!("xHCI: HUB downstream slot {}: no HID interrupt endpoint", slot_id),
         }
@@ -2674,94 +2711,140 @@ impl XhciController {
         self.ring_doorbell(slot_id, 1);
     }
 
-    pub fn configure_mouse_endpoints(&mut self, slot_id: u8, ep_addr: u8, mps: u16, interval: u8) {
-        unsafe {
-            serial_println!("xHCI: Configuring Mouse Endpoints for Slot {}, EP Addr {:#x}...", slot_id, ep_addr);
+    /// Configure ALL of a device's HID interrupt-IN endpoints (keyboard and/or pointer) in ONE
+    /// Configure-Endpoint command, reading their addresses/MPS/interval from the slot fields recorded
+    /// during enumeration. Then the state machine issues one device-level SET_CONFIGURATION and arms a
+    /// read on each (see the command/transfer completion handlers).
+    ///
+    /// Why a single command: a composite HID device — most wireless kbd+mouse dongles, and real
+    /// keyboards with a second consumer-control interface — has more than one HID interface. Issuing a
+    /// separate Configure-Endpoint per interface fails, because each rebuilds the shared input context
+    /// naming only its own endpoint (and sets Context Entries to only its own DCI), so the second
+    /// commits over the first and the earlier endpoint goes unconfigured. Mirroring the mass-storage
+    /// bulk-IN+OUT path, we add every endpoint to one input context and set Context Entries to the
+    /// highest DCI. The keyboard reads into `data_buffer`, the pointer into its own `mouse_data_buffer`,
+    /// so two live endpoints never DMA into the same buffer.
+    pub fn configure_hid_endpoints(&mut self, slot_id: u8) {
+        let (has_kbd, has_mouse, mouse_rel) = {
+            let s = &self.slots[slot_id as usize];
+            (
+                s.is_keyboard && s.keyboard_ep != 0,
+                s.is_mouse && s.mouse_ep != 0,
+                s.mouse_is_relative,
+            )
+        };
+        if !has_kbd && !has_mouse {
+            serial_println!("xHCI: configure_hid_endpoints(slot {}): no HID endpoints; skipping.", slot_id);
+            self.start_next_port();
+            return;
+        }
 
-            // 1. GET POINTERS
+        let input_ctx_virt;
+        let max_dci;
+        unsafe {
             let slot = &mut self.slots[slot_id as usize];
-            let input_ctx_virt = slot.input_context;
+            input_ctx_virt = slot.input_context;
             let output_ctx_virt = slot.output_context;
             let base_ptr = input_ctx_virt as *mut u32;
 
-            let mouse_ring = ring::TransferRing::new(16);
-            let mouse_ring_phys = mouse_ring.get_ptr();
-            slot.mouse_ring = Some(mouse_ring);
-
-            let data_layout = core::alloc::Layout::from_size_align(512, 64).unwrap();
-            slot.data_buffer = Some(alloc::alloc::alloc_zeroed(data_layout));
-
-            // 2. CLEAR INPUT CONTEXT
-            core::ptr::write_bytes(base_ptr as *mut u8, 0, 1056);
-
-            // The DCI (Device Context Index) for an endpoint is:
-            // DCI = (Endpoint Number * 2) + Direction
-            // Where Direction is 1 for IN, 0 for OUT
-            let ep_num = ep_addr & 0x0F;
-            let dir_in = (ep_addr & 0x80) != 0;
-            let dci = (ep_num * 2) + if dir_in { 1 } else { 0 };
-
-            // Input Control Context
-            base_ptr.add(1).write_volatile((1 << dci) | 1);
-
-            // Slot Context
-            let slot_ctx_ptr = base_ptr.add(8);
-            // Copy from OUTPUT_CONTEXT
-            for i in 0..8 {
-                let val = core::ptr::read_volatile((output_ctx_virt as *const u32).add(i));
-                slot_ctx_ptr.add(i).write_volatile(val);
-            }
-            // Update Context Entries = DCI (Bits 27:31)
-            let old_dw0 = slot_ctx_ptr.add(0).read_volatile();
-            let new_dw0 = (old_dw0 & !(0x1F << 27)) | ((dci as u32) << 27);
-            slot_ctx_ptr.add(0).write_volatile(new_dw0);
-
-            let ep_ctx_ptr = base_ptr.add(16 + ((dci - 1) * 8) as usize);
-            
-            // Read Speed from OUTPUT_CONTEXT Slot Context DW0 (Bits 20:23)
+            // Speed (from the output slot context) governs the interval encoding for both endpoints.
             let out_dw0 = core::ptr::read_volatile((output_ctx_virt as *const u32).add(0));
             let speed = (out_dw0 >> 20) & 0x0F;
-
-            // Interval Calculation depends on Speed
-            let interval_xhci = if speed == 3 || speed >= 4 {
-                // High-Speed (3) and SuperSpeed (4+): bInterval - 1
-                (interval.saturating_sub(1)) as u32
-            } else {
-                // Low-Speed / Full-Speed: RoundDown(log2(bInterval)) + 3
-                if interval > 0 {
-                    (31 - (interval as u32).leading_zeros()) + 3
+            let encode_interval = |interval: u8| -> u32 {
+                if speed == 3 || speed >= 4 {
+                    (interval.saturating_sub(1)) as u32 // HS / SS: bInterval - 1
+                } else if interval > 0 {
+                    (31 - (interval as u32).leading_zeros()) + 3 // LS / FS: floor(log2(bInterval)) + 3
                 } else {
                     0
                 }
             };
 
-            // DW0: Interval (16:23) | Max ESIT Payload (24:31)
-            ep_ctx_ptr.add(0).write_volatile((interval_xhci << 16) | ((mps as u32) << 24));
+            // Clear the whole input context, then add the slot context (A0) + each endpoint.
+            core::ptr::write_bytes(base_ptr as *mut u8, 0, 1056);
+            let mut add_flags: u32 = 1; // A0 = slot context
+            let mut mdci: u32 = 0;
 
-            // DW1: MPS=mps, EP Type=7 (Interrupt IN), CErr=3
-            ep_ctx_ptr.add(1).write_volatile((7 << 3) | (3 << 1) | ((mps as u32) << 16));
+            // Helper writes one Interrupt-IN endpoint context at its DCI.
+            // (Inlined per-endpoint below; kept as a closure would need &mut base_ptr aliasing care.)
 
-            // DW2: Dequeue Pointer Lo | DCS (Cycle Bit = 1)
-            ep_ctx_ptr.add(2).write_volatile((mouse_ring_phys as u32) | 1);
-            // DW3: Dequeue Pointer Hi
-            ep_ctx_ptr.add(3).write_volatile((mouse_ring_phys >> 32) as u32);
-            // DW4: Avg TRB Len
-            ep_ctx_ptr.add(4).write_volatile(mps as u32);
-
-            serial_println!("xHCI: Input Context Configured for Mouse Interrupt IN (DCI {}).", dci);
-
-            let trb = Trb {
-                parameter: input_ctx_virt as u64,
-                status: 0,
-                control: (12 << 10) | ((slot_id as u32) << 24),
-            };
-
-            if let Err(e) = self.send_command(trb) {
-                serial_println!("xHCI: Failed to send Configure Endpoint command: {}", e);
-            } else {
-                self.slots[slot_id as usize].mouse_state = 1; // Waiting for Configure Endpoint completion
-                self.ring_doorbell(0, 0); // Ring doorbell for Command Ring
+            if has_kbd {
+                let ep_addr = slot.keyboard_ep;
+                let mps = slot.keyboard_mps as u32;
+                let interval = slot.keyboard_interval;
+                let dci = (((ep_addr & 0x0F) * 2) + if (ep_addr & 0x80) != 0 { 1 } else { 0 }) as u32;
+                let ring = ring::TransferRing::new(16);
+                let phys = ring.get_ptr();
+                slot.keyboard_ring = Some(ring);
+                if slot.data_buffer.is_none() {
+                    let l = core::alloc::Layout::from_size_align(512, 64).unwrap();
+                    slot.data_buffer = Some(alloc::alloc::alloc_zeroed(l));
+                }
+                let ep = base_ptr.add(16 + ((dci as usize - 1) * 8));
+                ep.add(0).write_volatile((encode_interval(interval) << 16) | (mps << 24));
+                ep.add(1).write_volatile((7 << 3) | (3 << 1) | (mps << 16)); // EP Type 7 (Interrupt IN), CErr 3
+                ep.add(2).write_volatile((phys as u32) | 1);
+                ep.add(3).write_volatile((phys >> 32) as u32);
+                ep.add(4).write_volatile(mps);
+                add_flags |= 1 << dci;
+                mdci = mdci.max(dci);
+                slot.keyboard_state = 1;
             }
+
+            if has_mouse {
+                let ep_addr = slot.mouse_ep;
+                let mps = slot.mouse_mps as u32;
+                let interval = slot.mouse_interval;
+                let dci = (((ep_addr & 0x0F) * 2) + if (ep_addr & 0x80) != 0 { 1 } else { 0 }) as u32;
+                let ring = ring::TransferRing::new(16);
+                let phys = ring.get_ptr();
+                slot.mouse_ring = Some(ring);
+                if slot.mouse_data_buffer.is_none() {
+                    let l = core::alloc::Layout::from_size_align(512, 64).unwrap();
+                    slot.mouse_data_buffer = Some(alloc::alloc::alloc_zeroed(l));
+                }
+                let ep = base_ptr.add(16 + ((dci as usize - 1) * 8));
+                ep.add(0).write_volatile((encode_interval(interval) << 16) | (mps << 24));
+                ep.add(1).write_volatile((7 << 3) | (3 << 1) | (mps << 16)); // EP Type 7 (Interrupt IN), CErr 3
+                ep.add(2).write_volatile((phys as u32) | 1);
+                ep.add(3).write_volatile((phys >> 32) as u32);
+                ep.add(4).write_volatile(mps);
+                add_flags |= 1 << dci;
+                mdci = mdci.max(dci);
+                slot.mouse_state = 1;
+            }
+
+            // Input Control Context (A-flags), then the slot context copied from the output context
+            // with Context Entries updated to the highest DCI in use.
+            base_ptr.add(1).write_volatile(add_flags);
+            let slot_ctx_ptr = base_ptr.add(8);
+            for i in 0..8 {
+                let val = core::ptr::read_volatile((output_ctx_virt as *const u32).add(i));
+                slot_ctx_ptr.add(i).write_volatile(val);
+            }
+            let old_dw0 = slot_ctx_ptr.add(0).read_volatile();
+            slot_ctx_ptr.add(0).write_volatile((old_dw0 & !(0x1F << 27)) | (mdci << 27));
+            max_dci = mdci;
+        }
+
+        serial_println!(
+            "xHCI: Configuring HID Endpoints for Slot {} ({}{}{}) in one Configure-Endpoint (max DCI {}).",
+            slot_id,
+            if has_kbd { "keyboard" } else { "" },
+            if has_kbd && has_mouse { "+" } else { "" },
+            if has_mouse { if mouse_rel { "mouse(rel)" } else { "pointer(abs)" } } else { "" },
+            max_dci
+        );
+
+        let trb = Trb {
+            parameter: input_ctx_virt as u64,
+            status: 0,
+            control: (12 << 10) | ((slot_id as u32) << 24),
+        };
+        if let Err(e) = self.send_command(trb) {
+            serial_println!("xHCI: Failed to send HID Configure Endpoint command: {}", e);
+        } else {
+            self.ring_doorbell(0, 0); // Ring the command-ring doorbell.
         }
     }
 
@@ -2800,7 +2883,7 @@ impl XhciController {
             let dir_in = (self.slots[slot_id as usize].mouse_ep & 0x80) != 0;
             let dci = (ep_num * 2) + if dir_in { 1 } else { 0 };
 
-            let data_phys = self.slots[slot_id as usize].data_buffer.unwrap() as u64;
+            let data_phys = self.slots[slot_id as usize].mouse_data_buffer.unwrap() as u64;
 
             let in_trb = Trb {
                 parameter: data_phys,
@@ -2810,96 +2893,6 @@ impl XhciController {
             self.slots[slot_id as usize].mouse_ring.as_mut().unwrap().push(in_trb).unwrap();
             self.ring_doorbell(slot_id, dci as u32);
             xdbg!("xHCI: Mouse Read Queued.");
-        }
-    }
-
-    pub fn configure_keyboard_endpoints(&mut self, slot_id: u8, ep_addr: u8, mps: u16, interval: u8) {
-        unsafe {
-            serial_println!("xHCI: Configuring Keyboard Endpoints for Slot {}, EP Addr {:#x}...", slot_id, ep_addr);
-
-            // 1. GET POINTERS
-            let slot = &mut self.slots[slot_id as usize];
-            let input_ctx_virt = slot.input_context;
-            let output_ctx_virt = slot.output_context;
-            let base_ptr = input_ctx_virt as *mut u32;
-
-            let keyboard_ring = ring::TransferRing::new(16);
-            let keyboard_ring_phys = keyboard_ring.get_ptr();
-            slot.keyboard_ring = Some(keyboard_ring);
-
-            // Allocate data buffer if not already allocated
-            if slot.data_buffer.is_none() {
-                let data_layout = core::alloc::Layout::from_size_align(512, 64).unwrap();
-                slot.data_buffer = Some(alloc::alloc::alloc_zeroed(data_layout));
-            }
-
-            // 2. CLEAR INPUT CONTEXT
-            core::ptr::write_bytes(base_ptr as *mut u8, 0, 1056);
-
-            // Compute DCI: DCI = (Endpoint Number * 2) + Direction (1=IN, 0=OUT)
-            let ep_num = ep_addr & 0x0F;
-            let dir_in = (ep_addr & 0x80) != 0;
-            let dci = (ep_num * 2) + if dir_in { 1 } else { 0 };
-
-            // Input Control Context: Add flag for this DCI + Slot Context
-            base_ptr.add(1).write_volatile((1 << dci) | 1);
-
-            // Slot Context: Copy from Output Context
-            let slot_ctx_ptr = base_ptr.add(8);
-            for i in 0..8 {
-                let val = core::ptr::read_volatile((output_ctx_virt as *const u32).add(i));
-                slot_ctx_ptr.add(i).write_volatile(val);
-            }
-            // Update Context Entries = DCI
-            let old_dw0 = slot_ctx_ptr.add(0).read_volatile();
-            let new_dw0 = (old_dw0 & !(0x1F << 27)) | ((dci as u32) << 27);
-            slot_ctx_ptr.add(0).write_volatile(new_dw0);
-
-            // Endpoint Context at offset for this DCI
-            let ep_ctx_ptr = base_ptr.add(16 + ((dci - 1) * 8) as usize);
-
-            // Read Speed from Output Context Slot Context DW0 (Bits 20:23)
-            let out_dw0 = core::ptr::read_volatile((output_ctx_virt as *const u32).add(0));
-            let speed = (out_dw0 >> 20) & 0x0F;
-
-            // Interval depends on speed
-            let interval_xhci = if speed == 3 || speed >= 4 {
-                (interval.saturating_sub(1)) as u32
-            } else {
-                if interval > 0 {
-                    (31 - (interval as u32).leading_zeros()) + 3
-                } else {
-                    0
-                }
-            };
-
-            // DW0: Interval | Max ESIT Payload
-            ep_ctx_ptr.add(0).write_volatile((interval_xhci << 16) | ((mps as u32) << 24));
-
-            // DW1: MPS=mps, EP Type=7 (Interrupt IN), CErr=3
-            ep_ctx_ptr.add(1).write_volatile((7 << 3) | (3 << 1) | ((mps as u32) << 16));
-
-            // DW2: Dequeue Pointer Lo | DCS (Cycle Bit = 1)
-            ep_ctx_ptr.add(2).write_volatile((keyboard_ring_phys as u32) | 1);
-            // DW3: Dequeue Pointer Hi
-            ep_ctx_ptr.add(3).write_volatile((keyboard_ring_phys >> 32) as u32);
-            // DW4: Avg TRB Len
-            ep_ctx_ptr.add(4).write_volatile(mps as u32);
-
-            serial_println!("xHCI: Input Context Configured for Keyboard Interrupt IN (DCI {}).", dci);
-
-            let trb = Trb {
-                parameter: input_ctx_virt as u64,
-                status: 0,
-                control: (12 << 10) | ((slot_id as u32) << 24),
-            };
-
-            if let Err(e) = self.send_command(trb) {
-                serial_println!("xHCI: Failed to send Configure Endpoint command: {}", e);
-            } else {
-                self.slots[slot_id as usize].keyboard_state = 1;
-                self.ring_doorbell(0, 0);
-            }
         }
     }
 
