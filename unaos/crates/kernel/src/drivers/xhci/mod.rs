@@ -1171,17 +1171,36 @@ impl XhciController {
                                             let data_data = core::slice::from_raw_parts(data_buf_ptr, 512);
                                             let _buttons = data_data[0];
                                             // Metal diagnostic (parallels the keyboard dump): show the raw
-                                            // pointer report so a serial-less boot can confirm pointer
-                                            // transfers are arriving and see whether the layout decodes.
-                                            // Skip idle all-zero reports (a composite dongle polls its
-                                            // endpoints continuously) so only real movement/clicks print.
+                                            // pointer report AND the values our boot-layout decode extracts,
+                                            // so a serial-less boot can tell whether the deltas are where we
+                                            // read them. Skip idle all-zero reports (only real movement/clicks
+                                            // print) and throttle via the calibrated ms clock so continuous
+                                            // motion yields a few readable lines instead of an unreadable flood.
                                             #[cfg(feature = "usbdebug")]
-                                            if data_data[0] != 0 || data_data[1] != 0 || data_data[2] != 0 || data_data[3] != 0 {
-                                                serial_println!(
-                                                    "USB-DEBUG: ptr report ({}) {:02x} {:02x} {:02x} {:02x}",
-                                                    if slot.mouse_is_relative { "rel" } else { "abs" },
-                                                    data_data[0], data_data[1], data_data[2], data_data[3]
-                                                );
+                                            {
+                                                static LAST_PTR_LOG_MS: core::sync::atomic::AtomicU64 =
+                                                    core::sync::atomic::AtomicU64::new(0);
+                                                let non_idle = (data_data[0] | data_data[1] | data_data[2] | data_data[3]) != 0;
+                                                let now = crate::arch::ticks();
+                                                if non_idle
+                                                    && now.wrapping_sub(LAST_PTR_LOG_MS.load(core::sync::atomic::Ordering::Relaxed)) >= 150
+                                                {
+                                                    LAST_PTR_LOG_MS.store(now, core::sync::atomic::Ordering::Relaxed);
+                                                    if slot.mouse_is_relative {
+                                                        serial_println!(
+                                                            "USB-DEBUG: ptr report (rel) {:02x} {:02x} {:02x} {:02x} -> dx={} dy={}",
+                                                            data_data[0], data_data[1], data_data[2], data_data[3],
+                                                            data_data[1] as i8, data_data[2] as i8
+                                                        );
+                                                    } else {
+                                                        serial_println!(
+                                                            "USB-DEBUG: ptr report (abs) {:02x} {:02x} {:02x} {:02x} -> x={} y={}",
+                                                            data_data[0], data_data[1], data_data[2], data_data[3],
+                                                            (data_data[1] as u16) | ((data_data[2] as u16) << 8),
+                                                            (data_data[3] as u16) | ((data_data[4] as u16) << 8)
+                                                        );
+                                                    }
+                                                }
                                             }
 
                                             if slot.mouse_is_relative {
