@@ -456,6 +456,63 @@ struct CmdPending {
     slot_id: u8,
 }
 
+/// One xHCI Supported Protocol Capability (extended cap ID 2): declares that root ports
+/// `port_offset .. port_offset + port_count - 1` (1-based) speak USB `major.minor`. This is the
+/// authoritative USB2-vs-USB3 port map — until now the driver inferred port type from the
+/// current PORTSC speed, which is only valid while a device is attached and trained. Needed to
+/// know which ports may take a SuperSpeed WARM reset (WPR is USB3-only) and to label `usbinfo`.
+#[derive(Clone, Copy)]
+pub struct PortProtocol {
+    pub major: u8,
+    pub minor: u8,
+    pub port_offset: u8,
+    pub port_count: u8,
+}
+
+/// Walk the xHCI Extended Capability list (same walk as `bios_handoff`) and collect every
+/// Supported Protocol capability (ID 2). Layout per xHCI 7.2: dword0 = CapID | Next<<8 |
+/// MinorRev<<16 | MajorRev<<24; dword1 = name string ("USB "); dword2 = Compatible Port
+/// Offset (7:0) | Compatible Port Count (15:8). QEMU and real hardware both expose these.
+fn parse_supported_protocols(base_address: usize) -> Vec<PortProtocol> {
+    const CAP_ID_SUPPORTED_PROTOCOL: u8 = 2;
+    let mut out = Vec::new();
+    unsafe {
+        let hccparams1 = core::ptr::read_volatile((base_address + 0x10) as *const u32);
+        let xecp = (hccparams1 >> 16) & 0xFFFF;
+        if xecp == 0 {
+            return out;
+        }
+        let mut cap = base_address + (xecp as usize) * 4;
+        for _ in 0..256 {
+            let val = core::ptr::read_volatile(cap as *const u32);
+            let id = (val & 0xFF) as u8;
+            let next = ((val >> 8) & 0xFF) as u8;
+            if id == CAP_ID_SUPPORTED_PROTOCOL {
+                let dw2 = core::ptr::read_volatile((cap + 8) as *const u32);
+                let p = PortProtocol {
+                    major: (val >> 24) as u8,
+                    minor: (val >> 16) as u8,
+                    port_offset: (dw2 & 0xFF) as u8,
+                    port_count: ((dw2 >> 8) & 0xFF) as u8,
+                };
+                serial_println!(
+                    "xHCI: Supported Protocol: USB {}.{} ports {}..{}",
+                    p.major, p.minor >> 4, p.port_offset,
+                    p.port_offset as u32 + p.port_count.saturating_sub(1) as u32);
+                out.push(p);
+            }
+            if next == 0 {
+                break;
+            }
+            cap += (next as usize) * 4;
+        }
+    }
+    if out.is_empty() {
+        serial_println!("xHCI: no Supported Protocol capabilities found (port types unknown).");
+    }
+    out
+}
+
 pub struct DeviceSlot {
     pub active: bool,
     pub port_id: u8,
@@ -608,6 +665,39 @@ pub struct XhciController {
     /// handler would treat that as a fresh connect and re-queue the same port, double-enumerating it
     /// and starving the ports queued behind it. CSC for `enumerating_port` is a reset side-effect.
     enumerating_port: u8,
+    /// USB protocol map of the root ports (Supported Protocol ext-caps, ID 2) — which ports are
+    /// USB2 vs USB3. Empty if the controller exposes none (port types then unknown).
+    port_protocols: Vec<PortProtocol>,
+
+    /// Which step of root enumeration `enumerating_port` is at ("await-reset", "enable-slot",
+    /// "address-device", "dev-desc", "cfg-desc", "configure-eps", "set-config", "idle").
+    /// On the serial-less rMBP `enum_active=true` alone says "stuck somewhere"; this + `usbinfo`
+    /// says WHERE, which is the difference between guessing and fixing.
+    enum_stage: &'static str,
+    /// `now_cycles()` when `enum_stage` was last changed — the watchdog's per-stage deadline base.
+    enum_stage_set_at: u64,
+    /// Physical address of the enum FSM's in-flight command TRB (ENABLE_SLOT / ADDRESS_DEVICE /
+    /// Configure-Endpoint), 0 when none. Lets completion dispatch (and failure recovery) match
+    /// the root FSM's own command exactly instead of guessing from shared state — the hub path's
+    /// sync commands (`cmd_pending`) and any stale/late completions no longer alias.
+    enum_cmd_phys: u64,
+    /// Number of port resets issued for the current enumeration attempt (retry budget).
+    enum_resets: u8,
+    /// The most recent enumeration stall (for `usbinfo`): where a port's enumeration died.
+    last_stall: Option<EnumStall>,
+    /// Total enumeration stalls since boot.
+    stall_count: u32,
+}
+
+/// A recorded enumeration stall: which port died, at which stage, why (completion error /
+/// watchdog timeout), the completion code if any, and the PORTSC snapshot at stall time.
+#[derive(Clone, Copy)]
+struct EnumStall {
+    port: u8,
+    stage: &'static str,
+    why: &'static str,
+    code: u8,
+    portsc: u32,
 }
 
 unsafe impl Send for XhciController {}
@@ -633,6 +723,8 @@ impl XhciController {
         let max_ports = ((hcsparams1 >> 24) & 0xFF) as u8;
 
         serial_println!("xHCI: MaxSlots={}, MaxPorts={}", max_slots, max_ports);
+
+        let port_protocols = parse_supported_protocols(base_addr);
 
         let mut slots = Vec::new();
         for _ in 0..=max_slots {
@@ -661,7 +753,55 @@ impl XhciController {
             hid_setproto_pending: Vec::new(),
             enum_active: false,
             enumerating_port: 0,
+            port_protocols,
+            enum_stage: "idle",
+            enum_stage_set_at: 0,
+            enum_cmd_phys: 0,
+            enum_resets: 0,
+            last_stall: None,
+            stall_count: 0,
         }
+    }
+
+    /// Record an enumeration-stage transition (and its wall-clock timestamp, the watchdog's
+    /// deadline base). One line of serial per step — on a metal bootlog photo this is the
+    /// step-by-step trace of how far a port got.
+    fn set_enum_stage(&mut self, stage: &'static str) {
+        self.enum_stage = stage;
+        self.enum_stage_set_at = crate::arch::now_cycles();
+        if self.enumerating_port != 0 {
+            serial_println!("xHCI: [enum port {}] stage -> {}", self.enumerating_port, stage);
+        }
+    }
+
+    /// Track a command TRB just issued on behalf of the root enumeration FSM for `slot_id`, so
+    /// its completion (success OR failure) can be matched by address. Gated to the slot of the
+    /// port currently being enumerated: `configure_hid_endpoints` is also called from the hub
+    /// bring-up path (hub-downstream slots carry port_id 0), whose completions must not be
+    /// claimed by — or clobber the tracking of — a concurrently-enumerating root port.
+    fn track_enum_cmd(&mut self, slot_id: u8, phys: u64, stage: &'static str) {
+        if self.enumerating_port != 0
+            && self.slots[slot_id as usize].port_id == self.enumerating_port
+        {
+            self.enum_cmd_phys = phys;
+            self.set_enum_stage(stage);
+        }
+    }
+
+    /// USB protocol major revision of a root port: 3, 2, or 0 (unknown). From the Supported
+    /// Protocol ext-caps; falls back to the live PORTSC speed field (SS speed IDs are >= 4) when
+    /// the controller exposes no protocol capabilities — that fallback only identifies a USB3
+    /// port while a SuperSpeed device is attached and trained, but it is better than nothing.
+    fn port_major(&self, port_id: u8) -> u8 {
+        for p in &self.port_protocols {
+            if p.port_count > 0
+                && port_id >= p.port_offset
+                && (port_id as u32) < p.port_offset as u32 + p.port_count as u32
+            {
+                return p.major;
+            }
+        }
+        if (self.read_portsc(port_id) >> 10) & 0xF >= 4 { 3 } else { 0 }
     }
 
 
@@ -670,14 +810,21 @@ impl XhciController {
         COMMAND_RING.lock().as_mut().unwrap().push_noop()
     }
 
-    pub fn send_command(&mut self, trb: Trb) -> Result<usize, &'static str> {
-        let res = COMMAND_RING.lock().as_mut().unwrap().push(trb);
-        if res.is_ok() {
-            // Ring the Doorbell for the Host Controller (Slot 0)
-            // Target 0 = Command Ring
-            self.ring_doorbell(0, 0);
-        }
-        res
+    /// Push a command TRB and ring the host-controller doorbell. Returns the PHYSICAL address of
+    /// the pushed TRB — the Command Completion event echoes it, so callers can match their own
+    /// completion exactly (the root enumeration FSM tracks it in `enum_cmd_phys`; the sync hub
+    /// path computes the same address in `run_command_sync`).
+    pub fn send_command(&mut self, trb: Trb) -> Result<u64, &'static str> {
+        let phys = {
+            let mut g = COMMAND_RING.lock();
+            let ring = g.as_mut().ok_or("command ring not initialised")?;
+            let base = ring.get_ptr();
+            let idx = ring.push(trb)?;
+            base + (idx as u64) * 16
+        };
+        // Ring the Doorbell for the Host Controller (Slot 0). Target 0 = Command Ring.
+        self.ring_doorbell(0, 0);
+        Ok(phys)
     }
 
     /// One-shot host-controller health snapshot for metal bring-up (gated to the usbdebug build):
@@ -1611,7 +1758,10 @@ impl XhciController {
             }
             self.enum_active = true;
             self.enumerating_port = port;
+            self.enum_cmd_phys = 0;
+            self.enum_resets = 1;
             serial_println!("xHCI: === Enumerating Port {} (PORTSC={:#x}) ===", port, portsc);
+            self.set_enum_stage("await-reset");
             // Always USB-reset the port before addressing the device, whether or not PED is already
             // set. A device the firmware enumerated (our USB stick / SD reader IS the UEFI boot
             // device) — and every SuperSpeed device, whose link auto-trains to PED=1 — keeps its old
@@ -1633,6 +1783,9 @@ impl XhciController {
         }
         self.enum_active = false;
         self.enumerating_port = 0;
+        self.enum_cmd_phys = 0;
+        self.enum_resets = 0;
+        self.set_enum_stage("idle");
         serial_println!("xHCI: Port enumeration queue drained.");
     }
 
@@ -1788,8 +1941,15 @@ impl XhciController {
             control: (9 << 10),
         };
 
-        if let Err(e) = self.send_command(trb) {
-            serial_println!("xHCI: Failed to send Enable Slot command: {}", e);
+        match self.send_command(trb) {
+            // ENABLE_SLOT is issued only by the root enumeration FSM (the hub path uses the
+            // sync-command primitive), so track it unconditionally — there is no slot id yet
+            // to route through track_enum_cmd.
+            Ok(phys) => {
+                self.enum_cmd_phys = phys;
+                self.set_enum_stage("enable-slot");
+            }
+            Err(e) => serial_println!("xHCI: Failed to send Enable Slot command: {}", e),
         }
 
         // Metal diagnostic (usbdebug only): a healthy controller consumes ENABLE_SLOT in
@@ -1903,8 +2063,9 @@ impl XhciController {
                 control: (11 << 10) | ((slot_id as u32) << 24),
             };
 
-            if let Err(e) = self.send_command(trb) {
-                serial_println!("xHCI: Failed to send Address Device command: {}", e);
+            match self.send_command(trb) {
+                Ok(phys) => self.track_enum_cmd(slot_id, phys, "address-device"),
+                Err(e) => serial_println!("xHCI: Failed to send Address Device command: {}", e),
             }
             // NOTE: do NOT set `configuring_slot` here. That field marks an in-flight
             // Configure-Endpoint command; setting it on Address Device made the Address
@@ -1990,8 +2151,9 @@ impl XhciController {
                 control: (12 << 10) | ((slot_id as u32) << 24),
             };
 
-            if let Err(e) = self.send_command(trb) {
-                serial_println!("xHCI: Failed to send Configure Endpoint command: {}", e);
+            match self.send_command(trb) {
+                Ok(phys) => self.track_enum_cmd(slot_id, phys, "configure-eps"),
+                Err(e) => serial_println!("xHCI: Failed to send Configure Endpoint command: {}", e),
             }
         }
     }
@@ -2341,13 +2503,30 @@ impl XhciController {
             "xHCI ports={} storage_slot={} enum_active={} queued={} note='{}'",
             self.max_ports, self.storage_slot, self.enum_active,
             self.ports_to_enumerate.len(), self.storage_note));
+        if self.enum_active {
+            // The stall-localizer: WHICH port is in flight and at WHICH step, and for how long
+            // (ms via the calibrated TSC) — a photo of this line replaces a debugger.
+            let age_ms = crate::arch::now_cycles()
+                .wrapping_sub(self.enum_stage_set_at)
+                / (crate::arch::hw_wait_budget() / 2000).max(1);
+            out.push(alloc::format!(
+                "  enumerating port {}: stage={} for {} ms (resets={} cmd={:#x})",
+                self.enumerating_port, self.enum_stage, age_ms, self.enum_resets,
+                self.enum_cmd_phys));
+        }
+        if let Some(st) = &self.last_stall {
+            out.push(alloc::format!(
+                "  last stall: port {} @ {} ({}, code {}) PORTSC={:#010x}  [{} total]",
+                st.port, st.stage, st.why, st.code, st.portsc, self.stall_count));
+        }
         // Show ALL ports (not just connected ones), so an empty-but-present SuperSpeed port's link
         // state is visible — the whole point when a USB3 device isn't showing up as connected.
         for p in 1..=self.max_ports {
             let s = self.read_portsc(p);
+            let proto = match self.port_major(p) { 3 => "usb3", 2 => "usb2", _ => "usb?" };
             out.push(alloc::format!(
-                "  port {}: {:#010x} CCS={} PED={} PP={} PR={} PLS={}({}) sp={}({})",
-                p, s, s & 1, (s >> 1) & 1, (s >> 9) & 1, (s >> 4) & 1,
+                "  port {} [{}]: {:#010x} CCS={} PED={} PP={} PR={} PLS={}({}) sp={}({})",
+                p, proto, s, s & 1, (s >> 1) & 1, (s >> 9) & 1, (s >> 4) & 1,
                 (s >> 5) & 0xF, pls_name((s >> 5) & 0xF),
                 (s >> 10) & 0xF, speed_name((s >> 10) & 0xF)));
         }
@@ -2932,6 +3111,13 @@ impl XhciController {
 
     pub fn request_device_descriptor(&mut self, slot_id: u8) {
         serial_println!("xHCI: Requesting Device Descriptor for Slot {}...", slot_id);
+        // An EP0 transfer, not a command — clear the command tracking, note the stage.
+        if self.enumerating_port != 0
+            && self.slots[slot_id as usize].port_id == self.enumerating_port
+        {
+            self.enum_cmd_phys = 0;
+            self.set_enum_stage("dev-desc");
+        }
 
         let desc_phys = self.slots[slot_id as usize].descriptor_buffer as u64;
         if desc_phys == 0 {
@@ -2976,6 +3162,12 @@ impl XhciController {
 
     pub fn request_configuration_descriptor(&mut self, slot_id: u8) {
         serial_println!("xHCI: Requesting Configuration Descriptor for Slot {}...", slot_id);
+        if self.enumerating_port != 0
+            && self.slots[slot_id as usize].port_id == self.enumerating_port
+        {
+            self.enum_cmd_phys = 0;
+            self.set_enum_stage("cfg-desc");
+        }
 
         let desc_phys = self.slots[slot_id as usize].descriptor_buffer as u64;
         if desc_phys == 0 {
@@ -3147,14 +3339,22 @@ impl XhciController {
             status: 0,
             control: (12 << 10) | ((slot_id as u32) << 24),
         };
-        if let Err(e) = self.send_command(trb) {
-            serial_println!("xHCI: Failed to send HID Configure Endpoint command: {}", e);
-        } else {
-            self.ring_doorbell(0, 0); // Ring the command-ring doorbell.
+        match self.send_command(trb) {
+            // Root-FSM call sites track the command (send_command already rang the doorbell);
+            // the hub bring-up path also lands here with a port_id-0 slot, which
+            // track_enum_cmd correctly ignores.
+            Ok(phys) => self.track_enum_cmd(slot_id, phys, "configure-eps"),
+            Err(e) => serial_println!("xHCI: Failed to send HID Configure Endpoint command: {}", e),
         }
     }
 
     pub fn send_set_configuration(&mut self, slot_id: u8, config_val: u8) {
+        if self.enumerating_port != 0
+            && self.slots[slot_id as usize].port_id == self.enumerating_port
+        {
+            self.enum_cmd_phys = 0;
+            self.set_enum_stage("set-config");
+        }
         unsafe {
             serial_println!("xHCI: Sending SET_CONFIGURATION({}) to Slot {}", config_val, slot_id);
             let setup_trb = Trb {
