@@ -152,24 +152,46 @@ pub fn init() {
     init_timer();
 }
 
+/// Target heartbeat rate: 1000 Hz => one tick per millisecond, so `ticks()`/`sleep_ticks` become
+/// real wall-clock once the timer is calibrated.
+const TICK_HZ: u64 = 1000;
+
+/// Fixed fallback initial count, used before/without calibration (steady but ~0.8 ms/tick on QEMU,
+/// unknown on metal — the original empirical value).
+const FIXED_INITCNT: u32 = 50_000;
+
 /// Start the local APIC timer in periodic mode at the IDT timer vector, as the system heartbeat
 /// / hlt wake source (replacing the retired 8254 PIT).
 ///
-/// The initial count is a fixed empirical value: the APIC timer counts at the (unknown,
-/// per-machine) core-crystal frequency, so this gives some convenient rate on QEMU but NOT a
-/// precise tick. Exact timing is not needed yet (the tick is only a wake source). Real hardware
-/// will need calibration (CPUID leaf 0x15 / TSC-deadline) — deferred.
+/// The initial count comes from calibration when available: `APIC_TIMER_HZ` (the post-÷16 count
+/// rate, measured against the ACPI PM timer in `calibrate`) divided by `TICK_HZ` gives a real
+/// 1 kHz tick on any machine. Before calibration — the BSP's first arm, in `arch::init`, runs
+/// before ACPI is parsed — it uses the fixed empirical count. Callable by the BSP and each AP;
+/// APs come up after `calibrate` has stored the rate, so they inherit the calibrated count.
 pub fn init_timer() {
     let vector = crate::arch::interrupts::TIMER_VECTOR as u32;
+    let hz = APIC_TIMER_HZ.load(Ordering::Relaxed);
+    let (initcnt, calibrated) = if hz != 0 {
+        // hz is counts/sec after the ÷16 divider; INITCNT reloads each period, so period = INITCNT
+        // / hz and rate = hz / INITCNT. .max(1) guards a degenerate rate (0 would halt the timer).
+        (((hz / TICK_HZ) as u32).max(1), true)
+    } else {
+        (FIXED_INITCNT, false)
+    };
     unsafe {
         // Divide the input clock by 16 (encoding 0b0011).
         lapic_write(REG_TIMER_DIVIDE, X2_TIMER_DIVIDE, 0x3);
         // LVT Timer: vector, bit 17 = periodic mode, bit 16 (mask) = 0.
         lapic_write(REG_LVT_TIMER, X2_LVT_TIMER, vector | (1 << 17));
         // Writing the initial count (last) arms the countdown; it reloads each period.
-        lapic_write(REG_TIMER_INITCNT, X2_TIMER_INITCNT, 50_000);
+        lapic_write(REG_TIMER_INITCNT, X2_TIMER_INITCNT, initcnt);
     }
-    serial_println!("APIC: timer armed (vector {:#x}, periodic, ÷16).", vector);
+    serial_println!(
+        "APIC: timer armed (vector {:#x}, periodic, ÷16, initcnt={} [{}]).",
+        vector,
+        initcnt,
+        if calibrated { "1 kHz calibrated" } else { "fixed" }
+    );
 }
 
 /// Calibrate the invariant TSC and the local-APIC timer against the fixed-frequency ACPI PM timer.

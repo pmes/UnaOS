@@ -140,14 +140,18 @@ const HID_SCANCODE_TO_ASCII: [(u8, u8); 104] = [
 
 /// Wall-clock budget for hardware handshakes, in `crate::arch::now_cycles()` units (rdtsc cycles on
 /// x86_64, CNTVCT ticks on aarch64). Resolved per-arch so the same ~wall-clock window holds despite
-/// the very different counter rates. ~0.5–2.5 s on real x86 silicon; ~2.5 s under QEMU/TCG.
+/// the very different counter rates. On x86 it is an honest ~2 s once the TSC is calibrated against
+/// the ACPI PM timer (see `arch::hw_wait_budget`); a fixed guess otherwise. ~2.5 s under QEMU/TCG.
 ///
 /// Why a cycle budget and not an iteration count: the previous `50_000_000`-*iteration* budget
 /// assumed cheap loop turns, but each turn does an uncached MMIO read (~0.5–1 µs on real silicon),
 /// so a wedged status bit took ~25 s–3.5 min to time out — indistinguishable from a hang on a
 /// serial-less laptop. A free-running counter makes the timeout a real wall-clock bound,
 /// independent of MMIO-read latency and of EFLAGS.IF.
-const HW_WAIT_BUDGET: u64 = crate::arch::HW_WAIT_BUDGET;
+#[inline]
+fn hw_wait_budget() -> u64 {
+    crate::arch::hw_wait_budget()
+}
 
 /// Spin until `pred()` returns true or `budget` cycles (of `crate::arch::now_cycles()`) elapse.
 /// On timeout it logs `what` and returns `Err(())` so the caller can bail. A throttled "still
@@ -218,7 +222,7 @@ fn bios_handoff(base_address: u64) {
                 core::ptr::write_volatile(usblegsup as *mut u32, legsup | HC_OS_OWNED);
                 let released = wait_until(
                     || unsafe { core::ptr::read_volatile(usblegsup as *const u32) } & HC_BIOS_OWNED == 0,
-                    HW_WAIT_BUDGET,
+                    hw_wait_budget(),
                     "BIOS to release xHCI (USBLEGSUP.BIOS_OWNED=0)",
                 )
                 .is_ok();
@@ -269,7 +273,7 @@ pub fn init(base_address: u64) {
 
         let _ = wait_until(
             || (core::ptr::read_volatile(usbsts_ptr) & 1) != 0,
-            HW_WAIT_BUDGET, "USBSTS.HCH=1 (halt)");
+            hw_wait_budget(), "USBSTS.HCH=1 (halt)");
         serial_println!("xHCI: Controller Halted.");
 
         // Reset Controller
@@ -278,12 +282,12 @@ pub fn init(base_address: u64) {
 
         let _ = wait_until(
             || (core::ptr::read_volatile(usbcmd_ptr) & 2) == 0,
-            HW_WAIT_BUDGET, "USBCMD.HCRST=0 (reset)");
+            hw_wait_budget(), "USBCMD.HCRST=0 (reset)");
 
         // Wait for Controller Not Ready (CNR) to clear
         let _ = wait_until(
             || (core::ptr::read_volatile(usbsts_ptr) & (1 << 11)) == 0,
-            HW_WAIT_BUDGET, "USBSTS.CNR=0");
+            hw_wait_budget(), "USBSTS.CNR=0");
         serial_println!("xHCI: Controller Reset Complete.");
     }
 
@@ -1206,14 +1210,14 @@ impl XhciController {
             // POLL: Wait for HCRST (Bit 1) to clear (hardware clears it when done)
             let _ = wait_until(
                 || (core::ptr::read_volatile(usbcmd_ptr) & 2) == 0,
-                HW_WAIT_BUDGET, "USBCMD.HCRST=0 (reset)");
+                hw_wait_budget(), "USBCMD.HCRST=0 (reset)");
             serial_println!("xHCI: Reset Complete.");
 
             // POLL: Wait for CNR (Controller Not Ready, Bit 11 in USBSTS) to clear
             // The controller needs time to re-initialize after reset.
             let _ = wait_until(
                 || (core::ptr::read_volatile(usbsts_ptr) & (1 << 11)) == 0,
-                HW_WAIT_BUDGET, "USBSTS.CNR=0");
+                hw_wait_budget(), "USBSTS.CNR=0");
             serial_println!("xHCI: Controller Ready.");
         }
     }
@@ -1365,7 +1369,7 @@ impl XhciController {
             let usbsts_ptr = (self.op_base + 0x04) as *const u32;
             let _ = wait_until(
                 || (core::ptr::read_volatile(usbsts_ptr) & 1) == 0,
-                HW_WAIT_BUDGET, "USBSTS.HCH=0 (run)");
+                hw_wait_budget(), "USBSTS.HCH=0 (run)");
             serial_println!("xHCI: Controller Started!");
 
             // Power on all ports. Use the REAL MaxPorts (HCSPARAMS1 bits 24:31),
@@ -1556,7 +1560,7 @@ impl XhciController {
             // This confirms the hardware is executing.
             let _ = wait_until(
                 || (core::ptr::read_volatile(usbsts_ptr) & 1) == 0,
-                HW_WAIT_BUDGET, "USBSTS.HCH=0 (run)");
+                hw_wait_budget(), "USBSTS.HCH=0 (run)");
             serial_println!("xHCI: ENGINE RUNNING (HCHalted cleared).");
         }
     }
@@ -1588,7 +1592,7 @@ impl XhciController {
         #[cfg(feature = "usbdebug")]
         {
             let start = crate::arch::now_cycles();
-            let budget = crate::arch::HW_WAIT_BUDGET / 4;
+            let budget = crate::arch::hw_wait_budget() / 4;
             let mut posted = false;
             let mut errored = false;
             loop {

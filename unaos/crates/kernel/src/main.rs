@@ -105,10 +105,11 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     #[cfg(target_arch = "x86_64")]
     {
         unaos_kernel::arch::sched::init();
-        // The demo workload (incl. the RwLock self-test) uses tick-based timing; with the
-        // uncalibrated APIC timer it stretches into a multi-minute pause on real hardware. It's a
-        // QEMU-verified smoke test, so make it opt-in (UNAOS_SCHED_DEMO=1 -> `sched_demo` feature);
-        // by default the scheduler still initializes but the boot doesn't stall. Never in usbdebug.
+        // The demo workload (incl. the RwLock self-test) uses tick-based timing. The APIC timer is
+        // now calibrated to a real 1 kHz (see step 4b'''), so it runs at normal speed on metal —
+        // no more multi-minute stall. It's still just a QEMU-verified smoke test, so keep it opt-in
+        // (UNAOS_SCHED_DEMO=1 -> `sched_demo` feature); by default the scheduler initializes but no
+        // demo threads spawn. Never in usbdebug.
         #[cfg(all(feature = "sched_demo", not(feature = "usbdebug")))]
         {
             let online = unaos_kernel::arch::smp::online_aps();

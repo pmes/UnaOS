@@ -31,6 +31,13 @@ pub fn ticks() -> u64 {
     0
 }
 
+/// Milliseconds since boot. Arch-neutral mirror of x86_64's `ms`; aarch64 has no timer heartbeat
+/// wired yet (like `ticks`), so it returns 0 for now.
+#[inline]
+pub fn ms() -> u64 {
+    0
+}
+
 /// Free-running virtual cycle counter (CNTVCT_EL0). Monotonic and interrupt-flag-independent, like
 /// x86 rdtsc — the portable timebase for bounding hardware busy-waits (see `now_cycles` on x86_64).
 /// Runs at CNTFRQ_EL0 (~62.5 MHz under QEMU virt), NOT GHz, so its budget is in its own units.
@@ -48,6 +55,14 @@ pub fn now_cycles() -> u64 {
 
 /// Busy-wait budget in `now_cycles()` (CNTVCT) units. ~2.5 s at a ~60 MHz generic-timer rate.
 pub const HW_WAIT_BUDGET: u64 = 150_000_000;
+
+/// Busy-wait budget in `now_cycles()` (CNTVCT) units. Arch-neutral mirror of x86_64's
+/// `hw_wait_budget`; aarch64 has no PM-timer calibration path, so it returns the fixed budget.
+/// (CNTFRQ_EL0 gives the exact CNTVCT rate and could refine this later.)
+#[inline]
+pub fn hw_wait_budget() -> u64 {
+    HW_WAIT_BUDGET
+}
 
 pub fn without_interrupts<F, R>(f: F) -> R
 where
