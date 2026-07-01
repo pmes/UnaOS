@@ -995,6 +995,193 @@ impl Condvar {
 }
 
 // ---------------------------------------------------------------------------------------------
+// RwLock<T> — a writer-preferring reader-writer lock, composed from a Mutex + two Condvars
+// ---------------------------------------------------------------------------------------------
+
+/// Internal counters of an `RwLock`, guarded by its inner `Mutex`. The invariant
+/// `(readers > 0) XOR writer` is maintained under that mutex; while it holds, readers share `&T` and
+/// a writer has an exclusive `&mut T`, so no `&mut T` ever aliases another reference.
+struct RwState {
+    /// Number of read locks currently held.
+    readers: u32,
+    /// True while the single write lock is held.
+    writer: bool,
+    /// Writers currently blocked in `write()` (drives writer-preference: new readers yield to them).
+    waiting_writers: u32,
+}
+
+/// A sleeping reader-writer lock: many concurrent readers OR one exclusive writer. Composed from the
+/// existing primitives (no new unsafe blocking machinery): an inner `Mutex<RwState>` serialises the
+/// counters and two `Condvar`s park waiters — exactly the way `Channel` composes a Mutex + Semaphores.
+///
+/// WRITER-PREFERRING: a new reader yields to any waiting writer, so writers as a CLASS are not
+/// starved by readers. This is NOT strict per-writer FIFO — a writer woken from `writer_ok` can be
+/// leapfrogged by another writer that barges in (takes the just-freed lock before the woken one
+/// re-acquires `inner`), so an individual writer's progress is guaranteed only against a FINITE
+/// writer population, not an unbounded barging stream. On the reader side the cost is heavier:
+/// **reader starvation is UNBOUNDED** under sustained write load — a reader blocked on the condvar is
+/// `STATE_BLOCKED`, off every run queue. (This aarch64 scheduler has NO priority aging at all — the
+/// run queue is flat round-robin — so, even more than on x86, nothing bounds condvar-blocked
+/// waiting.) Do not use this lock where readers must make progress against a continuous writer stream.
+///
+/// MUST be `'static` (or Arc-kept-alive) like its parts; call `init()` once on the BSP before use.
+///
+/// PRECONDITION (load-bearing): at most `WAIT_CAPACITY` (32) tasks may be simultaneously blocked on
+/// the reader condvar — or on the writer condvar — of a single `RwLock`. Unlike the other primitives
+/// (whose waiter counts are naturally bounded by producer/consumer/holder count), an `RwLock`'s
+/// reader queue is unbounded BY DESIGN, so a caller MUST bound its concurrent-reader population.
+///
+/// NOT REENTRANT. A task must hold AT MOST ONE guard (read or write) on a given `RwLock` at a time.
+/// All four re-entries DEADLOCK PERMANENTLY (the condvars have no timer backstop):
+///   * read-then-read — the 2nd `read()` yields to a queued writer that waits for `readers == 0`,
+///     which the 1st guard prevents. DANGEROUS: deadlocks ONLY when a writer is also waiting, so it
+///     passes tests and then hangs in production.
+///   * read-then-write — `write()` waits for `readers == 0`, but the caller is that reader.
+///   * write-then-read — `read()` blocks on `writer == true`, which the caller holds.
+///   * write-then-write — the 2nd `write()` blocks on `writer == true`.
+pub struct RwLock<T> {
+    inner: Mutex<RwState>,
+    /// Parks readers waiting out a writer; woken (all at once) when the lock clears with no writer queued.
+    readers_ok: Condvar,
+    /// Parks writers waiting out readers/a writer; woken one-at-a-time on each release.
+    writer_ok: Condvar,
+    data: UnsafeCell<T>,
+}
+
+// SAFETY: `&T` is handed to MULTIPLE readers on different cores at once, so `T: Sync` is REQUIRED
+// (the key difference from `Mutex<T>`, which needs only `T: Send` because it hands out one `&mut T`);
+// a writer's `&mut T` is the data's sole accessor but migrates across cores over time, so `T: Send`.
+// The `(readers > 0) XOR writer` invariant under `inner` guarantees no `&mut T` aliases.
+unsafe impl<T: Send + Sync> Sync for RwLock<T> {}
+
+impl<T> RwLock<T> {
+    /// Construct an unlocked `RwLock`. `const` so it can initialise a `static`.
+    pub const fn new(value: T) -> Self {
+        RwLock {
+            inner: Mutex::new(RwState { readers: 0, writer: false, waiting_writers: 0 }),
+            readers_ok: Condvar::new(),
+            writer_ok: Condvar::new(),
+            data: UnsafeCell::new(value),
+        }
+    }
+
+    /// Reserve all three sub-primitives' waiter capacity. Call once on the BSP before use.
+    pub fn init(&self) {
+        self.inner.init();
+        self.readers_ok.init();
+        self.writer_ok.init();
+    }
+
+    /// Acquire a shared read lock, blocking until no writer holds OR is waiting (writer-preference).
+    /// Returns an RAII guard giving `&T`; releases on drop. MUST be called from a scheduled task.
+    /// NOT reentrant (see the type docs).
+    pub fn read(&self) -> RwLockReadGuard<'_, T> {
+        {
+            let mut g = self.inner.lock();
+            while g.writer || g.waiting_writers > 0 {
+                g = self.readers_ok.wait(g); // re-checks the predicate on every (possibly spurious) wake
+            }
+            g.readers += 1;
+        } // inner guard dropped; our read lock is now recorded in `readers`
+        RwLockReadGuard { lock: self, _not_send: PhantomData }
+    }
+
+    /// Acquire the exclusive write lock, blocking until no readers and no writer. Returns an RAII
+    /// guard giving `&mut T`; releases on drop. MUST be called from a scheduled task. NOT reentrant.
+    pub fn write(&self) -> RwLockWriteGuard<'_, T> {
+        {
+            let mut g = self.inner.lock();
+            g.waiting_writers += 1; // announce ourselves so new readers yield to us (writer-preference)
+            while g.writer || g.readers > 0 {
+                g = self.writer_ok.wait(g);
+            }
+            g.waiting_writers -= 1;
+            g.writer = true;
+        } // inner guard dropped; our write lock is now recorded in `writer`
+        RwLockWriteGuard { lock: self, _not_send: PhantomData }
+    }
+}
+
+/// Shared-read RAII guard from `RwLock::read`. `Deref`s to `&T`; on drop, decrements the reader count
+/// and (when it reaches zero) hands the lock to a waiting writer.
+pub struct RwLockReadGuard<'a, T> {
+    lock: &'a RwLock<T>,
+    /// `!Send` like `MutexGuard`: a held lock belongs to the task that took it.
+    _not_send: PhantomData<*const ()>,
+}
+
+impl<T> Deref for RwLockReadGuard<'_, T> {
+    type Target = T;
+    fn deref(&self) -> &T {
+        // SAFETY: we hold a read lock, so `readers > 0` hence `writer == false`: no `&mut T` exists.
+        unsafe { &*self.lock.data.get() }
+    }
+}
+
+impl<T> Drop for RwLockReadGuard<'_, T> {
+    fn drop(&mut self) {
+        // Dropping re-acquires the inner sleeping Mutex and therefore MAY BLOCK (park + switch) if it
+        // is momentarily contended — sound because the dropping task is a normal scheduled task, but
+        // it means a guard must be dropped only from a scheduled task (the same contexts where
+        // `read()`/`write()` may be called).
+        debug_assert!(
+            SCHED[percpu::this_cpu().cpu_index as usize].current.load(Ordering::Acquire) != 0,
+            "RwLockReadGuard dropped off a scheduled task (Drop re-acquires a sleeping Mutex)"
+        );
+        let wake = {
+            let mut g = self.lock.inner.lock();
+            g.readers -= 1;
+            g.readers == 0
+        }; // inner guard dropped BEFORE the notify (keeps the condvar lock strictly inside the inner
+           // mutex's critical section and avoids waking readers that would just re-park on `inner`)
+        if wake {
+            self.lock.writer_ok.notify_one(); // hand off to one waiting writer (no-op if none)
+        }
+    }
+}
+
+/// Exclusive-write RAII guard from `RwLock::write`. `Deref`/`DerefMut` to `&mut T`; on drop, clears
+/// the writer flag and wakes the next writer or, if none waits, all parked readers.
+pub struct RwLockWriteGuard<'a, T> {
+    lock: &'a RwLock<T>,
+    _not_send: PhantomData<*const ()>,
+}
+
+impl<T> Deref for RwLockWriteGuard<'_, T> {
+    type Target = T;
+    fn deref(&self) -> &T {
+        // SAFETY: we hold the exclusive write lock; no other accessor exists.
+        unsafe { &*self.lock.data.get() }
+    }
+}
+
+impl<T> DerefMut for RwLockWriteGuard<'_, T> {
+    fn deref_mut(&mut self) -> &mut T {
+        // SAFETY: we hold the exclusive write lock; this is the only live reference to the data.
+        unsafe { &mut *self.lock.data.get() }
+    }
+}
+
+impl<T> Drop for RwLockWriteGuard<'_, T> {
+    fn drop(&mut self) {
+        debug_assert!(
+            SCHED[percpu::this_cpu().cpu_index as usize].current.load(Ordering::Acquire) != 0,
+            "RwLockWriteGuard dropped off a scheduled task (Drop re-acquires a sleeping Mutex)"
+        );
+        let wake_writer = {
+            let mut g = self.lock.inner.lock();
+            g.writer = false;
+            g.waiting_writers > 0
+        }; // inner guard dropped BEFORE the notify (see RwLockReadGuard::drop)
+        if wake_writer {
+            self.lock.writer_ok.notify_one(); // FIFO-ish hand-off to the next writer (writer-preference)
+        } else {
+            self.lock.readers_ok.notify_all(); // no writer waiting: release every parked reader
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
 // Demos
 // ---------------------------------------------------------------------------------------------
 
@@ -1069,54 +1256,82 @@ fn sleep_demo_body(arg: usize) {
     );
 }
 
-/// Shared state for the M4e Condvar demo (all `static` for the `'static` requirement; initialised in
-/// `start_aps`). `CV_WORKERS` workers block on a predicate guarded by `CV_MUTEX` + `CV_COND`; a
-/// coordinator flips the predicate under the mutex and `notify_all`s them; a completion `Semaphore`
-/// (`CV_DONE`) lets the coordinator confirm every worker was released.
-static CV_MUTEX: Mutex<bool> = Mutex::new(false); // the predicate: "go"
-static CV_COND: Condvar = Condvar::new();
-static CV_DONE: Semaphore = Semaphore::new(0);
-const CV_WORKERS: usize = 3;
+/// Shared state for the M4f RwLock demo (all `static` for the `'static` requirement; initialised in
+/// `start_aps`). A writer repeatedly updates a `(u64, u64)` pair NON-atomically (store `.0`, delay,
+/// store `.1`) under the write lock; readers hold the read section across a delay and assert
+/// `.0 == .1` — a torn read would mean the write lock failed to exclude them. `RW_MAX_CONCURRENT`
+/// witnesses that readers actually SHARE the section (what distinguishes an RwLock from a Mutex).
+static RW_DEMO: RwLock<(u64, u64)> = RwLock::new((0, 0));
+static RW_DONE: Semaphore = Semaphore::new(0);
+static RW_TORN: AtomicBool = AtomicBool::new(false);
+static RW_CONCURRENT: AtomicU32 = AtomicU32::new(0);
+static RW_MAX_CONCURRENT: AtomicU32 = AtomicU32::new(0);
+const RW_READERS: usize = 4;
+const RW_WRITES: u64 = 6;
+const RW_READ_ROUNDS: usize = 8;
 
-/// M4e worker: block on the condvar until the predicate is set (the classic `while !pred { wait }`
-/// Mesa loop), then post completion. Most workers reach `CV_COND.wait()` and are woken by the
-/// coordinator's `notify_all`; one may see the predicate already set and take the fast path — both
-/// are correct under Mesa semantics.
-fn cv_worker_body(id: usize) {
-    {
-        let mut go = CV_MUTEX.lock();
-        while !*go {
-            go = CV_COND.wait(go); // atomically releases the mutex + blocks; re-acquires on wake
-        }
-    } // mutex released here
-    CV_DONE.post();
-    serial_println!(":: SCHED: CONDVAR worker {} released ::", id);
-}
-
-/// M4e coordinator: let the workers reach `wait()`, then flip the predicate under the mutex and
-/// `notify_all` (holding the mutex PAST the notify forces each woken worker into a contended mutex
-/// re-acquire). Then collect all `CV_WORKERS` completions and report.
-fn cv_coordinator_body(_arg: usize) {
-    busy_delay_ms(10); // give the workers time to block on the condvar first
-    {
-        let mut go = CV_MUTEX.lock();
-        *go = true;
-        CV_COND.notify_all();
-    } // mutex released here (woken workers now re-acquire it in turn)
-    for _ in 0..CV_WORKERS {
-        assert!(CV_DONE.wait(), "CONDVAR coordinator ran off a scheduled task");
+/// M4f writer: `RW_WRITES` rounds of a deliberately non-atomic two-field update under the write lock.
+/// If mutual exclusion holds, no reader ever observes the intermediate `(.0=v, .1=old)` state.
+fn rw_writer_body(_arg: usize) {
+    for v in 1..=RW_WRITES {
+        {
+            let mut w = RW_DEMO.write();
+            w.0 = v;
+            busy_delay_ms(1); // widen the non-atomic update window
+            w.1 = v;
+        } // write lock released
+        busy_delay_ms(1); // give readers a window between writes
     }
-    serial_println!(":: SCHED: CONDVAR notify_all released {} workers => PASS ::", CV_WORKERS);
+    RW_DONE.post();
+    serial_println!(":: SCHED: RWLOCK writer done ({} writes) ::", RW_WRITES);
 }
 
-/// M3b/M4a/M4e: turn on preemptive scheduling and put a workload on the APs, then flip SCHED_ACTIVE
+/// M4f reader: hold the read section across a delay and check the pair is self-consistent. Also bump
+/// a concurrent-reader counter so the verifier can witness that reads genuinely overlapped.
+fn rw_reader_body(id: usize) {
+    for _ in 0..RW_READ_ROUNDS {
+        {
+            let r = RW_DEMO.read();
+            let n = RW_CONCURRENT.fetch_add(1, Ordering::Relaxed) + 1;
+            RW_MAX_CONCURRENT.fetch_max(n, Ordering::Relaxed);
+            let a = r.0;
+            busy_delay_ms(1); // hold the read section open
+            let b = r.1;
+            if a != b {
+                RW_TORN.store(true, Ordering::Relaxed); // a writer's half-update leaked in
+            }
+            RW_CONCURRENT.fetch_sub(1, Ordering::Relaxed);
+        } // read lock released
+    }
+    RW_DONE.post();
+    serial_println!(":: SCHED: RWLOCK reader {} done ::", id);
+}
+
+/// M4f verifier: wait for the writer + all readers, then report torn (must be false) + the max
+/// concurrent readers seen (>1 witnesses real sharing; ==1 is INCONCLUSIVE, not a failure).
+fn rw_verifier_body(_arg: usize) {
+    for _ in 0..(1 + RW_READERS) {
+        assert!(RW_DONE.wait(), "RWLOCK verifier ran off a scheduled task");
+    }
+    let torn = RW_TORN.load(Ordering::Relaxed);
+    let maxc = RW_MAX_CONCURRENT.load(Ordering::Relaxed);
+    serial_println!(
+        ":: SCHED: RWLOCK torn={} max_concurrent_readers={} => {} ::",
+        torn,
+        maxc,
+        if !torn { "PASS" } else { "FAIL" },
+    );
+}
+
+/// M3b/M4a/M4f: turn on preemptive scheduling and put a workload on the APs, then flip SCHED_ACTIVE
 /// (enables `timer_preempt`) and SCHED_GO (releases the APs into `run`). The workload:
-///   * first online AP — a busy-pair (preemption regression) + the M4a `sleep_ticks` sleeper;
-///   * (with >= 3 online APs) an M4e `Condvar` demo: 2 workers on the 2nd AP + 1 worker on the 3rd,
-///     all blocked on a predicate, released by a coordinator's `notify_all` on the 3rd AP.
-/// On metal the busy-pair INTERLEAVES under the timer, the sleeper parks-then-wakes on its own tick,
-/// and one `notify_all` wakes the blocked workers cross-core. In QEMU (no Group-1 IRQ delivery) the
-/// busy tasks run sequentially, the sleeper self-skips, and every block/wake is carried by the run()
+///   * first online AP — a busy-pair (preemption regression) + the M4a `sleep_ticks` sleeper + the
+///     RwLock verifier (which mostly blocks);
+///   * (with >= 3 online APs) an M4f `RwLock<(u64,u64)>` with 4 readers + 1 writer spread across the
+///     2nd + 3rd APs, so cross-core readers genuinely share the read section.
+/// On metal the busy-pair INTERLEAVES, the sleeper parks-then-wakes on its own tick, and the RwLock's
+/// reader/writer condvars wake blocked waiters cross-core. In QEMU (no Group-1 IRQ delivery) the busy
+/// tasks run sequentially, the sleeper self-skips, and every block/wake is carried by the run()
 /// busy-poll (SGI delivery being the metal-only half). Call AFTER the BSP's cooperative demo.
 pub fn start_aps(online: &[usize]) {
     if let Some(&c) = online.first() {
@@ -1125,21 +1340,22 @@ pub fn start_aps(online: &[usize]) {
         spawn("sleeper", sleep_demo_body, c, c);
     }
     if online.len() >= 3 {
-        CV_MUTEX.init();
-        CV_COND.init();
-        CV_DONE.init();
-        let (w, coord) = (online[1], online[2]);
-        spawn("cv-work-0", cv_worker_body, 0, w); // two workers on the 2nd AP (block cleanly there)
-        spawn("cv-work-1", cv_worker_body, 1, w);
-        spawn("cv-work-2", cv_worker_body, 2, coord); // + one sharing the coordinator's AP
-        spawn("cv-coord", cv_coordinator_body, 0, coord);
+        RW_DEMO.init();
+        RW_DONE.init();
+        let (v, b, c) = (online[0], online[1], online[2]);
+        spawn("rw-verify", rw_verifier_body, 0, v); // on the 1st AP (mostly blocked, behind busy-pair)
+        spawn("rw-rd-0", rw_reader_body, 0, b);
+        spawn("rw-rd-1", rw_reader_body, 1, b);
+        spawn("rw-writer", rw_writer_body, 0, b);
+        spawn("rw-rd-2", rw_reader_body, 2, c);
+        spawn("rw-rd-3", rw_reader_body, 3, c);
     } else {
-        serial_println!(":: AARCH64 SCHED: Condvar demo skipped (needs >= 3 online APs) ::");
+        serial_println!(":: AARCH64 SCHED: RwLock demo skipped (needs >= 3 online APs) ::");
     }
     SCHED_ACTIVE.store(true, Ordering::Release);
     SCHED_GO.store(true, Ordering::Release);
     serial_println!(
-        ":: AARCH64 SCHED: preemption ON; busy-pair + sleep + Condvar demo on APs {:?} ::",
+        ":: AARCH64 SCHED: preemption ON; busy-pair + sleep + RwLock demo on APs {:?} ::",
         online
     );
 }
