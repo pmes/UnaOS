@@ -358,6 +358,14 @@ impl PmTimer {
         self.port
     }
 
+    /// Ticks elapsed from `start` to `now`, correct across a single counter wrap. Valid only when
+    /// the true elapsed count is < `mask + 1` (keep any measurement window well under the wrap
+    /// period: ~4.687 s for a 24-bit counter).
+    #[inline]
+    pub fn delta(&self, start: u32, now: u32) -> u32 {
+        now.wrapping_sub(start) & self.mask
+    }
+
     /// Significant width in bits (24 or 32) — for the wrap mask and diagnostics.
     pub fn bits(&self) -> u32 {
         if self.mask == 0xFFFF_FFFF {

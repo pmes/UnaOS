@@ -82,6 +82,15 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     #[cfg(target_arch = "x86_64")]
     unaos_kernel::arch::acpi::pm_timer_report(rsdp_addr);
 
+    // 4b'''. Calibrate the TSC and the local-APIC timer against the PM timer, so tick-based timing
+    // (scheduler sleeps, net RTO) and cycle-based busy-wait budgets become real wall-clock on this
+    // machine's unknown Ivy Bridge crystal. Must precede SMP/scheduler bring-up so the APs inherit
+    // the calibrated timer. No-op (fixed fallbacks) if the PM timer is absent.
+    #[cfg(target_arch = "x86_64")]
+    if let Some(pm) = unaos_kernel::arch::acpi::pm_timer(rsdp_addr) {
+        unaos_kernel::arch::apic::calibrate(&pm);
+    }
+
     // 4c. SMP: start the application processors (INIT-SIPI-SIPI). Each AP brings up its own
     // per-CPU GDT/TSS + local APIC, then waits to enter its scheduler loop; the BSP continues to
     // drive everything below. `start_aps` also runs the post-bring-up SMP smoke test while the
