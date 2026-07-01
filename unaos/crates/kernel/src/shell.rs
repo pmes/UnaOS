@@ -59,7 +59,7 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
         "help" => {
             console.println("COMMANDS: ver, help, clear, echo, panic, gneiss");
             console.println("STORAGE:  diskinfo, read <lba>, write <lba> <byte>");
-            console.println("FILES:    fatinfo (FAT geometry)");
+            console.println("FILES:    fatinfo (FAT geometry), ls");
             console.println("SMP:      sched (per-CPU run queues)");
             console.println("NETWORK:  netinfo, ping <ip> [count], arp <ip>");
             console.println("          connect <ip> <port> [message], udpsend <ip> <port> [message]");
@@ -92,6 +92,27 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
             match crate::fs::fat::mount() {
                 Ok(fs) => console.println(&fs.describe()),
                 Err(e) => console.println(&alloc::format!("fatinfo: no FAT filesystem ({:?})", e)),
+            }
+        },
+        "ls" | "dir" => {
+            match crate::fs::fat::mount() {
+                Ok(fs) => match fs.read_root() {
+                    Ok(entries) => {
+                        let (mut files, mut dirs) = (0u32, 0u32);
+                        for de in &entries {
+                            if de.is_dir {
+                                dirs += 1;
+                                console.println(&alloc::format!("  <DIR>         {}", de.name()));
+                            } else {
+                                files += 1;
+                                console.println(&alloc::format!("  {:>10}  {}", de.size, de.name()));
+                            }
+                        }
+                        console.println(&alloc::format!("{} file(s), {} dir(s)", files, dirs));
+                    }
+                    Err(e) => console.println(&alloc::format!("ls: {:?}", e)),
+                },
+                Err(e) => console.println(&alloc::format!("ls: no FAT filesystem ({:?})", e)),
             }
         },
         "diskinfo" => {

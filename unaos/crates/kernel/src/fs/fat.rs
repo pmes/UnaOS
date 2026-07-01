@@ -55,6 +55,77 @@ pub enum FatKind {
     Fat32,
 }
 
+/// A parsed short (8.3) directory entry. Long-file-name (LFN) entries are skipped, so the name is
+/// the on-disk short name (uppercase, e.g. `KERNEL.ELF`).
+#[derive(Clone, Copy)]
+pub struct DirEntry {
+    name: [u8; 12], // "NAME.EXT", NUL-padded (max 8 + '.' + 3 = 12)
+    name_len: u8,
+    pub is_dir: bool,
+    pub size: u32,
+    #[allow(dead_code)] // read by `cat` (read_file); populated here so ls and cat share the parse
+    first_cluster: u32,
+}
+
+impl DirEntry {
+    /// The 8.3 name as text (e.g. `"KERNEL.ELF"`).
+    pub fn name(&self) -> &str {
+        core::str::from_utf8(&self.name[..self.name_len as usize]).unwrap_or("?")
+    }
+}
+
+/// Parse one 512-byte directory sector, appending real file/dir entries to `out`. Returns `true`
+/// if a 0x00 (end-of-directory) marker was reached, telling the caller to stop scanning.
+fn scan_dir_sector(sec: &[u8; SECTOR_SIZE], out: &mut alloc::vec::Vec<DirEntry>) -> bool {
+    for i in 0..(SECTOR_SIZE / 32) {
+        let e = &sec[i * 32..i * 32 + 32];
+        match e[0] {
+            0x00 => return true, // no more entries in this directory
+            0xE5 => continue,    // deleted entry
+            _ => {}
+        }
+        let attr = e[11];
+        if attr & 0x0F == 0x0F {
+            continue; // long-file-name component
+        }
+        if attr & 0x08 != 0 {
+            continue; // volume label
+        }
+        // 8.3 name: base (8) '.' ext (3), each with trailing spaces trimmed. 0x05 in byte 0 is an
+        // escaped 0xE5 (a legitimate leading byte, distinct from the deleted marker).
+        let mut name = [0u8; 12];
+        let mut n = 0usize;
+        let mut base = 8usize;
+        while base > 0 && e[base - 1] == b' ' {
+            base -= 1;
+        }
+        for k in 0..base {
+            name[n] = if k == 0 && e[0] == 0x05 { 0xE5 } else { e[k] };
+            n += 1;
+        }
+        let mut ext = 3usize;
+        while ext > 0 && e[8 + ext - 1] == b' ' {
+            ext -= 1;
+        }
+        if ext > 0 {
+            name[n] = b'.';
+            n += 1;
+            for k in 0..ext {
+                name[n] = e[8 + k];
+                n += 1;
+            }
+        }
+        out.push(DirEntry {
+            name,
+            name_len: n as u8,
+            is_dir: attr & 0x10 != 0,
+            size: u32le(e, 28),
+            first_cluster: ((u16le(e, 20) as u32) << 16) | u16le(e, 26) as u32,
+        });
+    }
+    false
+}
+
 /// A mounted FAT volume: the fully-resolved geometry needed to walk the FAT, the root directory,
 /// and cluster chains. All LBAs are **absolute** (device-relative), already offset by the
 /// partition start, so callers pass them straight to `block::read_block`.
@@ -291,6 +362,102 @@ impl FatFs {
             }
         }
     }
+
+    // --- cluster / FAT-chain helpers ---
+
+    fn valid_cluster(&self, c: u32) -> bool {
+        c >= 2 && c < self.count_of_clusters + 2
+    }
+
+    /// Absolute LBA of the first sector of a data cluster (`cluster` >= 2).
+    fn cluster_lba(&self, cluster: u32) -> u64 {
+        self.data_start + (cluster as u64 - 2) * self.sec_per_clus as u64
+    }
+
+    fn is_eoc(&self, e: u32) -> bool {
+        match self.kind {
+            FatKind::Fat16 => e >= 0xFFF8,
+            FatKind::Fat32 => e >= 0x0FFF_FFF8,
+        }
+    }
+
+    fn is_bad(&self, e: u32) -> bool {
+        match self.kind {
+            FatKind::Fat16 => e == 0xFFF7,
+            FatKind::Fat32 => e == 0x0FFF_FFF7,
+        }
+    }
+
+    /// Read the FAT entry for `cluster` (the next cluster in the chain). A 2- or 4-byte entry never
+    /// straddles a 512-byte sector boundary (2 and 4 both divide 512), so one sector read suffices.
+    fn fat_entry(&self, cluster: u32) -> Result<u32, FatError> {
+        let offset = match self.kind {
+            FatKind::Fat16 => cluster as u64 * 2,
+            FatKind::Fat32 => cluster as u64 * 4,
+        };
+        let sec = offset / SECTOR_SIZE as u64;
+        let within = (offset % SECTOR_SIZE as u64) as usize;
+        let mut buf = [0u8; SECTOR_SIZE];
+        read_sector(self.fat_start + sec, &mut buf)?;
+        Ok(match self.kind {
+            FatKind::Fat16 => u16le(&buf, within) as u32,
+            FatKind::Fat32 => u32le(&buf, within) & 0x0FFF_FFFF,
+        })
+    }
+
+    /// List the root directory. FAT32 follows the root cluster chain; FAT16 reads its fixed region.
+    pub fn read_root(&self) -> Result<alloc::vec::Vec<DirEntry>, FatError> {
+        match self.kind {
+            FatKind::Fat32 => self.read_dir_chain(self.root_cluster),
+            FatKind::Fat16 => self.read_fixed_root16(),
+        }
+    }
+
+    /// FAT16 fixed root directory: a contiguous run of sectors, no cluster chain.
+    fn read_fixed_root16(&self) -> Result<alloc::vec::Vec<DirEntry>, FatError> {
+        let mut out = alloc::vec::Vec::new();
+        let mut buf = [0u8; SECTOR_SIZE];
+        for s in 0..self.root_dir_sectors as u64 {
+            read_sector(self.root_dir_lba + s, &mut buf)?;
+            if scan_dir_sector(&buf, &mut out) {
+                break;
+            }
+        }
+        Ok(out)
+    }
+
+    /// Walk a directory stored as a cluster chain (the FAT32 root, or any subdirectory), collecting
+    /// its entries. Stops at the 0x00 terminator or end-of-chain; guards against bad/free clusters
+    /// and a chain longer than the whole volume (loop protection).
+    fn read_dir_chain(&self, start: u32) -> Result<alloc::vec::Vec<DirEntry>, FatError> {
+        let mut out = alloc::vec::Vec::new();
+        let mut cluster = start;
+        let mut hops = 0u32;
+        let mut buf = [0u8; SECTOR_SIZE];
+        loop {
+            if !self.valid_cluster(cluster) {
+                return Err(FatError::BadChain);
+            }
+            for s in 0..self.sec_per_clus as u64 {
+                read_sector(self.cluster_lba(cluster) + s, &mut buf)?;
+                if scan_dir_sector(&buf, &mut out) {
+                    return Ok(out);
+                }
+            }
+            let next = self.fat_entry(cluster)?;
+            if self.is_eoc(next) {
+                return Ok(out);
+            }
+            if self.is_bad(next) || next < 2 {
+                return Err(FatError::BadChain);
+            }
+            cluster = next;
+            hops += 1;
+            if hops > self.count_of_clusters + 1 {
+                return Err(FatError::BadChain);
+            }
+        }
+    }
 }
 
 /// One-shot boot probe: the first time a block device is present, mount the FAT volume and log its
@@ -308,7 +475,22 @@ pub fn probe_once() {
     PROBED.store(true, Ordering::Relaxed);
 
     match mount() {
-        Ok(fs) => serial_println!("FS: FAT mounted: {}", fs.describe()),
+        Ok(fs) => {
+            serial_println!("FS: FAT mounted: {}", fs.describe());
+            match fs.read_root() {
+                Ok(entries) => {
+                    serial_println!("FS: root directory ({} entries):", entries.len());
+                    for de in &entries {
+                        if de.is_dir {
+                            serial_println!("FS:   <DIR>              {}", de.name());
+                        } else {
+                            serial_println!("FS:   {:>12}       {}", de.size, de.name());
+                        }
+                    }
+                }
+                Err(e) => serial_println!("FS: root directory read error ({:?})", e),
+            }
+        }
         Err(e) => serial_println!("FS: no FAT filesystem ({:?})", e),
     }
 }
