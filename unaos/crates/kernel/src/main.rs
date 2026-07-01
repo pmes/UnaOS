@@ -265,7 +265,20 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         let online = unaos_kernel::arch::smp::online_secondaries();
         if let (Some(&render_cpu), Some(&input_cpu)) = (online.first(), online.last()) {
             GUI_CHANNEL.init(); // reserve waiter capacity on the BSP before the tasks block on it
+            unaos_kernel::arch::serial::RX_READY.init(); // M5c: the RX-wake semaphore's waiter list
             unaos_kernel::video::fbcon::detach();
+            // M5c: on metal, route + enable the PL011 RX interrupt (SPI 153) to the input core so the
+            // input task is woken by the UART instead of polling. GICD config stays BSP-only (this is
+            // global distributor state). A backstop task also periodically wakes the input service so
+            // input still works (degraded to polling) if the SPI never delivers on some board. QEMU
+            // raspi4b delivers no Group-1 IRQ (is_live() false) → skip both; the input task polls.
+            if unaos_kernel::arch::timer::is_live() {
+                unaos_kernel::arch::gic::enable_spi(
+                    unaos_kernel::arch::serial::PL011_RX_INTID,
+                    input_cpu,
+                );
+                unaos_kernel::arch::sched::spawn("rx-backstop", rx_backstop, 0, input_cpu);
+            }
             unaos_kernel::arch::sched::spawn("input", input_service, 0, input_cpu);
             unaos_kernel::arch::sched::spawn("render", render_service, 0, render_cpu);
             serial_println!(
@@ -402,27 +415,67 @@ fn handle_key(
 static GUI_CHANNEL: unaos_kernel::arch::sched::Channel<unaos_kernel::pal::Event> =
     unaos_kernel::arch::sched::Channel::new(64);
 
-/// M5 (bare-metal aarch64): keyboard input as a scheduled kernel service.
+/// One-shot guard: log "RX interrupt live" exactly once, from the input task (never the ISR).
+#[cfg(all(target_arch = "aarch64", feature = "baremetal"))]
+static RX_LOGGED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// M5 (bare-metal aarch64): keyboard input as a scheduled kernel service. The OS runs its own input
+/// on the scheduler: instead of the BSP polling the PL011 inline, this kernel thread on a secondary
+/// core drains bytes from the UART RX FIFO and `send`s each as a Key event over GUI_CHANNEL to the
+/// render service (M5b). Never returns (a service task).
 ///
-/// The OS runs its own input on the scheduler: instead of the BSP polling the PL011 inline, this
-/// kernel thread on a secondary core drains every byte waiting in the UART RX FIFO and `send`s each as
-/// a Key event over GUI_CHANNEL to the render service (M5b). Never returns (a service task).
-///
-/// Between polls it naps so it does not pin its core: on metal the per-core generic-timer tick wakes
-/// it every tick (~4 ms at 250 Hz — imperceptible for typing), and the core WFI-idles in between. In
-/// QEMU raspi4b the timer IRQ is not delivered, so `sleep_ticks` would park forever (`is_live()` is
-/// false there); yield cooperatively instead so this core's `run()` keeps re-dispatching us.
+/// M5c: on metal it is INTERRUPT-DRIVEN — the PL011 RX interrupt (routed to this core by the BSP)
+/// wakes it via `serial::RX_READY`, so the core WFI-idles until a keystroke instead of tick-polling.
+/// In QEMU raspi4b no Group-1 IRQ is delivered (`is_live()` false), so it falls back to a cooperative
+/// poll loop (the RX ISR never fires there). The two paths differ only in how the drain is woken.
 #[cfg(all(target_arch = "aarch64", feature = "baremetal"))]
 fn input_service(_: usize) {
-    loop {
-        while let Some(byte) = unaos_kernel::arch::poll_input() {
-            GUI_CHANNEL.send(unaos_kernel::pal::Event::Key(byte));
+    use core::sync::atomic::Ordering;
+    use unaos_kernel::arch::serial;
+
+    if unaos_kernel::arch::timer::is_live() {
+        // Interrupt-driven (metal). The BSP already enabled + routed the GIC SPI to this core; arm
+        // the PL011's own RX interrupts, then block until the ISR posts RX_READY.
+        serial::enable_rx_interrupt();
+        loop {
+            assert!(serial::RX_READY.wait(), "input service ran off a scheduled task");
+            // Confirm (once, off the ISR) that a real RX interrupt actually fired on this board —
+            // distinguishes an interrupt wake from a backstop poll.
+            if serial::RX_IRQ_SEEN.load(Ordering::Relaxed) && !RX_LOGGED.swap(true, Ordering::Relaxed)
+            {
+                serial_println!(":: INPUT: PL011 RX interrupt live — keyboard is interrupt-driven ::");
+            }
+            while let Some(byte) = unaos_kernel::arch::poll_input() {
+                GUI_CHANNEL.send(unaos_kernel::pal::Event::Key(byte));
+            }
+            serial::rearm_rx_interrupt(); // re-enable IMSC (no ICR — keeps a straggler's timeout)
+            // Close the drain/re-arm gap: if a byte landed meanwhile, wake ourselves to drain it
+            // rather than wait for the next receive-timeout.
+            if serial::rx_pending() {
+                serial::RX_READY.post();
+            }
         }
-        if unaos_kernel::arch::timer::is_live() {
-            unaos_kernel::arch::sched::sleep_ticks(1);
-        } else {
+    } else {
+        // Poll-nap fallback (QEMU raspi4b: the RX ISR never fires). Cooperative — the AP's run() keeps
+        // re-dispatching us; sleep_ticks would park forever with no timer IRQ to wake it.
+        loop {
+            while let Some(byte) = unaos_kernel::arch::poll_input() {
+                GUI_CHANNEL.send(unaos_kernel::pal::Event::Key(byte));
+            }
             unaos_kernel::arch::sched::yield_now();
         }
+    }
+}
+
+/// M5c liveness backstop (metal only): periodically wake the input service so keyboard input keeps
+/// working — degraded to ~200 ms polling — even if the PL011 RX interrupt never delivers on some
+/// board. On a working GIC the RX ISR wakes the input task at interrupt latency and this just
+/// redundantly pokes an empty FIFO (cheap). Never returns.
+#[cfg(all(target_arch = "aarch64", feature = "baremetal"))]
+fn rx_backstop(_: usize) {
+    loop {
+        unaos_kernel::arch::sched::sleep_ticks(50); // ~200 ms at the 250 Hz per-core tick
+        unaos_kernel::arch::serial::RX_READY.post();
     }
 }
 

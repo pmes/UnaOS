@@ -33,7 +33,7 @@ const GICD_TYPER: usize = 0x004; // type: ITLinesNumber etc.
 const GICD_IGROUPR: usize = 0x080; // group select, 1 bit / INTID (32 per word)
 const GICD_ISENABLER: usize = 0x100; // set-enable, 1 bit / INTID (32 per word)
 const GICD_IPRIORITYR: usize = 0x400; // priority, 1 byte / INTID
-#[allow(dead_code)] // reserved for SPI edge/level config when shared peripherals are wired
+const GICD_ITARGETSR: usize = 0x800; // SPI CPU-interface routing, 1 byte / INTID (SPIs only)
 const GICD_ICFGR: usize = 0xC00; // config (edge/level), 2 bits / INTID
 const GICD_SGIR: usize = 0xF00; // software-generated-interrupt trigger (write-only)
 
@@ -136,6 +136,44 @@ pub fn enable_sgi(intid: u32) {
     enable_banked(intid);
 }
 
+/// Enable a shared peripheral interrupt (SPI, INTID >= 32) and route it to `target_cpu`. Unlike the
+/// banked SGI/PPI path, SPIs live in WORD-indexed distributor registers (the enable_banked single-word
+/// `ISENABLER0 | (1<<intid)` form is only valid for INTID < 32) and need explicit CPU routing via
+/// ITARGETSR. This is GLOBAL distributor state, so call it once on the BSP (the same place the timer
+/// PPI is brought up). Used for the PL011 RX interrupt (scheduler-driven input); level-sensitive.
+///
+/// Register math (word = intid/32, bit = intid%32; e.g. INTID 153 -> word 4, bit 25):
+///   * IGROUPR[word]    |= 1<<bit    — Group 1 (Non-secure deliverability on the Pi), RMW.
+///   * ICFGR[intid/16]  clear the 2-bit field at (intid%16)*2 -> 0b00 = level-sensitive, RMW so the
+///     other 15 INTIDs in that word keep their config (on GIC-400 bit0 of each field is RAO/WI, so
+///     clearing the edge bit is what selects level).
+///   * IPRIORITYR[intid] = 0x00      — highest priority (byte; same level as the timer PPI, and with
+///     BPR=0 there is no preemption nesting — acceptable).
+///   * ITARGETSR[intid]  = 1<<cpu    — CPU-interface bitmask (byte; on the Pi 4 the interface bit
+///     equals the core index, as `send_sgi` documents).
+///   * ISENABLER[word]   = 1<<bit    — set-enable (word-indexed).
+/// A closing `dsb sy` publishes every write before the caller unmasks the peripheral's own interrupt.
+pub fn enable_spi(intid: u32, target_cpu: usize) {
+    debug_assert!(intid >= 32, "enable_spi expects an SPI (>= 32)");
+    debug_assert!(target_cpu < 8, "ITARGETSR is an 8-bit CPU-interface bitmask");
+    let word = (intid / 32) as usize;
+    let bit = intid % 32;
+    unsafe {
+        #[cfg(feature = "pi")]
+        {
+            let goff = GICD_IGROUPR + word * 4;
+            gicd_write(goff, gicd_read(goff) | (1 << bit));
+        }
+        let coff = GICD_ICFGR + (intid as usize / 16) * 4;
+        let cshift = (intid % 16) * 2;
+        gicd_write(coff, gicd_read(coff) & !(0b11 << cshift)); // level-sensitive, RMW
+        core::ptr::write_volatile((GICD_BASE + GICD_IPRIORITYR + intid as usize) as *mut u8, 0x00);
+        core::ptr::write_volatile((GICD_BASE + GICD_ITARGETSR + intid as usize) as *mut u8, 1 << target_cpu);
+        gicd_write(GICD_ISENABLER + word * 4, 1 << bit);
+        core::arch::asm!("dsb sy", options(nostack, preserves_flags));
+    }
+}
+
 /// Send SGI `intid` (0-15) to core `target_cpu` (its GIC CPU-interface number, which equals the
 /// core index on the Pi 4). The `DSB` publishes any memory the target will read on wake before the
 /// interrupt is raised. TargetListFilter=0b00 => use the CPUTargetList bitmask in bits[23:16].
@@ -173,6 +211,15 @@ pub fn handle_irq() {
     } else if intid == crate::arch::timer::TIMER_INTID {
         // The handler re-arms the timer (clearing its level-sensitive line) before we EOI.
         crate::arch::timer::on_tick();
+    } else {
+        // Other SPIs. So far the only one is the PL011 RX interrupt (M5c scheduler-driven input,
+        // bare-metal Pi only). Its handler MASKS the RX interrupt (deasserting the level to the GIC,
+        // with a `dsb` so that is visible before the EOI below — else this level-sensitive SPI would
+        // re-pend) and wakes the input task; it never reads the FIFO or logs (the task drains it).
+        #[cfg(feature = "baremetal")]
+        if intid == crate::arch::serial::PL011_RX_INTID {
+            crate::arch::serial::on_rx_interrupt();
+        }
     }
 
     // EOI with the full acked value (preserves the source-CPU field for SGIs; a no-op for PPIs).
