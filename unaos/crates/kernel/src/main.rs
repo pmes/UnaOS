@@ -120,6 +120,12 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     #[cfg(all(target_arch = "aarch64", feature = "baremetal"))]
     unaos_kernel::arch::smp::start_secondaries();
 
+    // 4b. aarch64 scheduler (M3a): a cooperative round-robin smoke test on the boot core — spawn a
+    // few kernel threads that yield to each other and exit, proving the context switch + run queue.
+    // No interrupts required, so it runs in QEMU too (AP scheduling + preemption arrive in M3b).
+    #[cfg(all(target_arch = "aarch64", feature = "baremetal"))]
+    unaos_kernel::arch::sched::demo_cooperative();
+
     // 4b. ACPI: discover the CPU topology (MADT) for SMP bring-up. x86_64 only — aarch64
     // discovers CPUs via the DTB. Degrades gracefully to uniprocessor if ACPI is absent.
     #[cfg(target_arch = "x86_64")]

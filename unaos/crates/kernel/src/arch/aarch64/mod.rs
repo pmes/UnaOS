@@ -13,6 +13,8 @@ pub mod boot;
 pub mod mailbox;
 #[cfg(feature = "baremetal")]
 pub mod smp;
+#[cfg(feature = "baremetal")]
+pub mod sched;
 
 pub fn init() {
     serial_println!(":: AARCH64 Core Hardware Init ::");
