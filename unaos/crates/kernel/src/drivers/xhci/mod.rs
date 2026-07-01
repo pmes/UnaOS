@@ -1173,12 +1173,16 @@ impl XhciController {
                                             // Metal diagnostic (parallels the keyboard dump): show the raw
                                             // pointer report so a serial-less boot can confirm pointer
                                             // transfers are arriving and see whether the layout decodes.
+                                            // Skip idle all-zero reports (a composite dongle polls its
+                                            // endpoints continuously) so only real movement/clicks print.
                                             #[cfg(feature = "usbdebug")]
-                                            serial_println!(
-                                                "USB-DEBUG: ptr report ({}) {:02x} {:02x} {:02x} {:02x}",
-                                                if slot.mouse_is_relative { "rel" } else { "abs" },
-                                                data_data[0], data_data[1], data_data[2], data_data[3]
-                                            );
+                                            if data_data[0] != 0 || data_data[1] != 0 || data_data[2] != 0 || data_data[3] != 0 {
+                                                serial_println!(
+                                                    "USB-DEBUG: ptr report ({}) {:02x} {:02x} {:02x} {:02x}",
+                                                    if slot.mouse_is_relative { "rel" } else { "abs" },
+                                                    data_data[0], data_data[1], data_data[2], data_data[3]
+                                                );
+                                            }
 
                                             if slot.mouse_is_relative {
                                                 // HID BOOT mouse: byte0 = buttons, byte1 = dx:i8, byte2 = dy:i8
@@ -1208,11 +1212,16 @@ impl XhciController {
                                             // interrupt-IN transfer arrives but decodes to nothing (e.g. the device is
                                             // in HID report protocol rather than boot protocol, which needs
                                             // SET_PROTOCOL(boot)), we still SEE that reports are flowing.
+                                            // Skip idle all-zero reports (a composite dongle's keyboard
+                                            // interface polls continuously and floods the view) so only
+                                            // real keypresses print.
                                             #[cfg(feature = "usbdebug")]
-                                            serial_println!(
-                                                "USB-DEBUG: kbd report {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x}",
-                                                report[0], report[1], report[2], report[3], report[4], report[5], report[6], report[7]
-                                            );
+                                            if report[..8].iter().any(|&b| b != 0) {
+                                                serial_println!(
+                                                    "USB-DEBUG: kbd report {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x}",
+                                                    report[0], report[1], report[2], report[3], report[4], report[5], report[6], report[7]
+                                                );
+                                            }
                                             // USB HID Boot Keyboard Report Format:
                                             // Byte 0: Modifier keys (bit 1 = L-Shift, bit 5 = R-Shift)
                                             // Byte 1: Reserved
