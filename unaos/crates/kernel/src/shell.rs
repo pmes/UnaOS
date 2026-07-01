@@ -59,7 +59,7 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
         "help" => {
             console.println("COMMANDS: ver, help, clear, echo, panic, gneiss");
             console.println("STORAGE:  diskinfo, read <lba>, write <lba> <byte>");
-            console.println("FILES:    fatinfo (FAT geometry), ls");
+            console.println("FILES:    fatinfo (FAT geometry), ls, cat <name>");
             console.println("SMP:      sched (per-CPU run queues)");
             console.println("NETWORK:  netinfo, ping <ip> [count], arp <ip>");
             console.println("          connect <ip> <port> [message], udpsend <ip> <port> [message]");
@@ -113,6 +113,43 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
                     Err(e) => console.println(&alloc::format!("ls: {:?}", e)),
                 },
                 Err(e) => console.println(&alloc::format!("ls: no FAT filesystem ({:?})", e)),
+            }
+        },
+        "cat" | "type" => {
+            match args.first() {
+                None => console.println("usage: cat <name>"),
+                Some(name) => match crate::fs::fat::mount() {
+                    Ok(fs) => match fs.find_in_root(name) {
+                        Ok(de) => {
+                            // Bound the read so a huge file (e.g. kernel.elf) can't flood the console.
+                            const CAP: usize = 8192;
+                            let mut data: Vec<u8> = Vec::new();
+                            match fs.read_file(&de, &mut data, CAP) {
+                                Ok(()) => {
+                                    // Render printable ASCII; keep LF, drop CR, others -> '.'.
+                                    let text: String = data.iter().filter_map(|&b| match b {
+                                        b'\n' => Some('\n'),
+                                        b'\r' => None,
+                                        0x20..=0x7e => Some(b as char),
+                                        _ => Some('.'),
+                                    }).collect();
+                                    for line in text.split('\n') {
+                                        console.println(line);
+                                    }
+                                    if (de.size as usize) > data.len() {
+                                        console.println(&alloc::format!(
+                                            "[... {} of {} bytes shown]", data.len(), de.size));
+                                    }
+                                }
+                                Err(crate::fs::fat::FatError::IsDirectory) =>
+                                    console.println(&alloc::format!("cat: {}: is a directory", name)),
+                                Err(e) => console.println(&alloc::format!("cat: {:?}", e)),
+                            }
+                        }
+                        Err(_) => console.println(&alloc::format!("cat: {}: not found", name)),
+                    },
+                    Err(e) => console.println(&alloc::format!("cat: no FAT filesystem ({:?})", e)),
+                },
             }
         },
         "diskinfo" => {

@@ -63,7 +63,6 @@ pub struct DirEntry {
     name_len: u8,
     pub is_dir: bool,
     pub size: u32,
-    #[allow(dead_code)] // read by `cat` (read_file); populated here so ls and cat share the parse
     first_cluster: u32,
 }
 
@@ -71,6 +70,14 @@ impl DirEntry {
     /// The 8.3 name as text (e.g. `"KERNEL.ELF"`).
     pub fn name(&self) -> &str {
         core::str::from_utf8(&self.name[..self.name_len as usize]).unwrap_or("?")
+    }
+
+    /// Case-insensitive match against an 8.3 name (short names are stored uppercase on disk, so
+    /// `cat hello.txt` finds `HELLO.TXT`).
+    fn eq_name(&self, other: &str) -> bool {
+        let me = &self.name[..self.name_len as usize];
+        me.len() == other.len()
+            && me.iter().zip(other.bytes()).all(|(a, b)| a.eq_ignore_ascii_case(&b))
     }
 }
 
@@ -458,6 +465,68 @@ impl FatFs {
             }
         }
     }
+
+    /// Find a top-level entry by 8.3 name (case-insensitive).
+    pub fn find_in_root(&self, name: &str) -> Result<DirEntry, FatError> {
+        for de in self.read_root()? {
+            if de.eq_name(name) {
+                return Ok(de);
+            }
+        }
+        Err(FatError::NotFound)
+    }
+
+    /// Read up to `max_bytes` of a file into `out` by following its cluster chain. Stops at
+    /// `de.size`, `max_bytes`, or end-of-chain (whichever comes first). Guards against bad/free
+    /// clusters and chain loops. Rejects a directory. A file whose chain ends before `de.size` (a
+    /// malformed volume) yields a short read rather than an error — `out.len()` tells the caller.
+    pub fn read_file(
+        &self,
+        de: &DirEntry,
+        out: &mut alloc::vec::Vec<u8>,
+        max_bytes: usize,
+    ) -> Result<(), FatError> {
+        if de.is_dir {
+            return Err(FatError::IsDirectory);
+        }
+        let mut remaining = core::cmp::min(de.size as usize, max_bytes);
+        if remaining == 0 {
+            return Ok(()); // empty file (or nothing requested) — no clusters to read
+        }
+        if !self.valid_cluster(de.first_cluster) {
+            return Err(FatError::BadChain);
+        }
+        let mut cluster = de.first_cluster;
+        let mut hops = 0u32;
+        let mut buf = [0u8; SECTOR_SIZE];
+        'chain: loop {
+            if !self.valid_cluster(cluster) {
+                return Err(FatError::BadChain);
+            }
+            for s in 0..self.sec_per_clus as u64 {
+                read_sector(self.cluster_lba(cluster) + s, &mut buf)?;
+                let take = core::cmp::min(remaining, SECTOR_SIZE);
+                out.extend_from_slice(&buf[..take]);
+                remaining -= take;
+                if remaining == 0 {
+                    break 'chain;
+                }
+            }
+            let next = self.fat_entry(cluster)?;
+            if self.is_eoc(next) {
+                break; // chain ended before de.size (malformed) — return the short read
+            }
+            if self.is_bad(next) || next < 2 {
+                return Err(FatError::BadChain);
+            }
+            cluster = next;
+            hops += 1;
+            if hops > self.count_of_clusters + 1 {
+                return Err(FatError::BadChain);
+            }
+        }
+        Ok(())
+    }
 }
 
 /// One-shot boot probe: the first time a block device is present, mount the FAT volume and log its
@@ -485,6 +554,25 @@ pub fn probe_once() {
                             serial_println!("FS:   <DIR>              {}", de.name());
                         } else {
                             serial_println!("FS:   {:>12}       {}", de.size, de.name());
+                        }
+                    }
+                    // Demonstrate cat: dump the first small file found (headless evidence).
+                    if let Some(de) = entries.iter().find(|d| !d.is_dir && d.size > 0 && d.size <= 512) {
+                        let mut data = alloc::vec::Vec::new();
+                        if fs.read_file(de, &mut data, 512).is_ok() {
+                            serial_println!("FS: cat {} ({} bytes):", de.name(), de.size);
+                            let text: String = data
+                                .iter()
+                                .filter_map(|&b| match b {
+                                    b'\n' => Some('\n'),
+                                    b'\r' => None,
+                                    0x20..=0x7e => Some(b as char),
+                                    _ => Some('.'),
+                                })
+                                .collect();
+                            for line in text.split('\n') {
+                                serial_println!("FS:  | {}", line);
+                            }
                         }
                     }
                 }
