@@ -42,6 +42,7 @@ fn main() {
     if std::env::var("UNAOS_BOOTLOG").is_ok() { feats.push("bootlog"); }
     if std::env::var("UNAOS_PI").is_ok() { feats.push("pi"); }
     if std::env::var("UNAOS_USBDEBUG").is_ok() { feats.push("usbdebug"); }
+    if std::env::var("UNAOS_SCHED_DEMO").is_ok() { feats.push("sched_demo"); }
     if !feats.is_empty() {
         let list = feats.join(",");
         kernel_cmd.arg("--features").arg(&list);

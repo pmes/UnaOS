@@ -20,6 +20,11 @@ bootlog = []
 # hardcodes, so don't touch that UART (it would be RAM on the Pi) — rely on fbcon for on-screen
 # output, like the Mac. Enable via `UNAOS_PI=1`.
 pi = []
+# Run the SMP scheduler demo/self-test at boot (spawns demo threads across the APs, incl. the RwLock
+# torn-read check). Opt-in via `UNAOS_SCHED_DEMO=1`: it's a QEMU-verified smoke test whose tick-based
+# timing stalls boot for minutes on real hardware (uncalibrated APIC timer). Off => scheduler still
+# inits, boot doesn't pause.
+sched_demo = []
 # USB bring-up debug view for serial-less hardware: run the full main-loop USB path (enumeration +
 # storage + hubs) but KEEP the boot log on the framebuffer (no GUI takeover, no fbcon detach) and
 # print each input event, so external USB storage/keyboard/mouse enumeration AND live keypresses /

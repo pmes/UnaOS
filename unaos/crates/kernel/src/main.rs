@@ -91,9 +91,10 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     {
         unaos_kernel::arch::sched::init();
         // The demo workload (incl. the RwLock self-test) uses tick-based timing; with the
-        // uncalibrated APIC timer it stretches into a long pause on real hardware, which only slows
-        // the USB bring-up loop. Skip it in usbdebug builds — the scheduler itself still inits.
-        #[cfg(not(feature = "usbdebug"))]
+        // uncalibrated APIC timer it stretches into a multi-minute pause on real hardware. It's a
+        // QEMU-verified smoke test, so make it opt-in (UNAOS_SCHED_DEMO=1 -> `sched_demo` feature);
+        // by default the scheduler still initializes but the boot doesn't stall. Never in usbdebug.
+        #[cfg(all(feature = "sched_demo", not(feature = "usbdebug")))]
         {
             let online = unaos_kernel::arch::smp::online_aps();
             unaos_kernel::arch::sched::start_demo(&online);
