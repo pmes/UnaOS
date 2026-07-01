@@ -42,6 +42,17 @@ if [ -n "$_feats" ]; then
     echo -e "${COLOR_YELLOW}⚡ kernel features: ${_feats%,}${COLOR_RESET}"
 fi
 
+# UNAOS_FATIMG swaps the usb-storage backing to a FAT image (scripts/make-fat-img.sh) so the
+# kernel's read-only FAT reader can be exercised on aarch64 QEMU too. Mirrors the x86 builder knob
+# (builder/src/main.rs). Unset -> usb.img (the raw UNA-OS pattern image). Build with `./arroyo fat-img`.
+STICK_IMG="${WORKSPACE_DIR}/builder/usb.img"
+case "${UNAOS_FATIMG:-}" in
+    "") ;;
+    1|part) STICK_IMG="${WORKSPACE_DIR}/builder/fat.img";;
+    sf) STICK_IMG="${WORKSPACE_DIR}/builder/fat-sf.img";;
+    *) STICK_IMG="${UNAOS_FATIMG}";;
+esac
+
 # --- Build Functions ---
 
 build_kernel_x86_64() {
@@ -145,7 +156,7 @@ launch_aarch64() {
         -serial stdio \
         -device ramfb \
         -device qemu-xhci,id=xhci \
-        -drive if=none,id=stick,format=raw,file="${WORKSPACE_DIR}/builder/usb.img" \
+        -drive if=none,id=stick,format=raw,file="${STICK_IMG}" \
         -device usb-storage,bus=xhci.0,drive=stick \
         -device usb-kbd,bus=xhci.0 \
         -device usb-tablet,bus=xhci.0 \
@@ -169,7 +180,7 @@ test_aarch64() {
         -drive format=raw,file=fat:rw:"$ESP_DIR_ARM" \
         -serial "file:${logf}" -device ramfb -display none \
         -device qemu-xhci,id=xhci \
-        -drive if=none,id=stick,format=raw,file="${WORKSPACE_DIR}/builder/usb.img" \
+        -drive if=none,id=stick,format=raw,file="${STICK_IMG}" \
         -device usb-storage,bus=xhci.0,drive=stick \
         -device usb-kbd,bus=xhci.0 -device usb-tablet,bus=xhci.0 \
         -no-reboot -no-shutdown \
@@ -245,6 +256,21 @@ esp_x86() {
     cd "$WORKSPACE_DIR"
     echo -e "${COLOR_GREEN}✅ x86 ESP: ${WORKSPACE_DIR}/target/x86_64_esp/${COLOR_RESET}"
     echo -e "   Copy its contents to a FAT32 USB root, then boot the Mac holding ⌥ Option → 'EFI Boot'."
+}
+
+# Build the FAT32 test image(s) the kernel's read-only FAT reader parses (ls/cat). Ensures the x86
+# ESP is packaged first (so EFI/ + kernel.elf populate the volume), then builds a partitioned image
+# (MBR@LBA0 -> BPB) and a superfloppy (BPB@LBA0). Test with `UNAOS_FATIMG=1 ./arroyo test`.
+fat_img() {
+    if [ ! -d "${WORKSPACE_DIR}/target/x86_64_esp" ]; then
+        echo -e "${COLOR_YELLOW}⚡ Packaging the x86 ESP first (payload for the FAT image)...${COLOR_RESET}"
+        esp_x86
+    fi
+    echo -e "${COLOR_CYAN}⚡ Building FAT32 test images (partitioned + superfloppy)...${COLOR_RESET}"
+    bash "${WORKSPACE_DIR}/scripts/make-fat-img.sh" part
+    bash "${WORKSPACE_DIR}/scripts/make-fat-img.sh" sf
+    echo -e "${COLOR_GREEN}✅ FAT images: builder/fat.img (partitioned), builder/fat-sf.img (superfloppy)${COLOR_RESET}"
+    echo -e "   Test:  UNAOS_FATIMG=1 ./arroyo test 25   |   UNAOS_FATIMG=sf ./arroyo test 25"
 }
 
 # aarch64 ESP for the Raspberry Pi 4 (UEFI / Path A). Copy onto a FAT32 SD card alongside the
@@ -348,6 +374,9 @@ case "${1:-}" in
     esp-arm|esp_arm)
         esp_arm
         ;;
+    fat-img|fat_img|fatimg)
+        fat_img
+        ;;
     clean)
         clean_all
         ;;
@@ -358,7 +387,7 @@ case "${1:-}" in
         ;;
     *)
         echo -e "${COLOR_RED}Unknown command: $1${COLOR_RESET}"
-        echo "Usage: ./arroyo [x86|arm|test [secs]|test-arm [secs]|check|build|esp-x86|esp-arm|clean]"
+        echo "Usage: ./arroyo [x86|arm|test [secs]|test-arm [secs]|check|build|esp-x86|esp-arm|fat-img|clean]"
         exit 1
         ;;
 esac

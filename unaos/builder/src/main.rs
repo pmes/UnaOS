@@ -139,6 +139,24 @@ fn main() {
         println!("Created usb.img (64MB) with Signature.");
     }
 
+    // UNAOS_FATIMG selects a FAT filesystem image (built by scripts/make-fat-img.sh) as the
+    // usb-storage backing instead of the raw UNA-OS pattern image, giving the kernel's read-only
+    // FAT reader (`ls`/`cat`) a real FAT32 volume to parse. `1`/`part` -> builder/fat.img,
+    // `sf` -> builder/fat-sf.img, or an explicit path. Unset (the default) keeps usb.img so the
+    // BOT "MISSION SUCCESS" pattern test is unchanged. block::info() registers this single device,
+    // mirroring a real single-stick metal boot where the FAT32 ESP stick *is* the block device.
+    let stick_image = match std::env::var("UNAOS_FATIMG").ok().as_deref() {
+        None | Some("") => usb_image.clone(),
+        Some("1") | Some("part") => workspace_dir.join("builder/fat.img"),
+        Some("sf") => workspace_dir.join("builder/fat-sf.img"),
+        Some(path) => std::path::PathBuf::from(path),
+    };
+    if stick_image != usb_image && !stick_image.exists() {
+        panic!("UNAOS_FATIMG set but {} is missing — run `./arroyo fat-img` first",
+            stick_image.display());
+    }
+    println!("   usb-storage backing: {}", stick_image.display());
+
     // Network backend selector. Default is user-mode (slirp): zero privileges, link
     // comes up, but the host cannot arping/ping the guest (it's NAT). UNAOS_NET=vmnet
     // switches to a vmnet-host netdev so host and guest share an L2 segment — enabling
@@ -177,7 +195,7 @@ fn main() {
     cmd.arg("-drive").arg(format!("format=raw,file=fat:rw:{}", esp_dir.display()))
        .arg("-device").arg("isa-debug-exit,iobase=0xf4,iosize=0x04")
        .arg("-device").arg("qemu-xhci,id=xhci")
-       .arg("-drive").arg(format!("if=none,id=stick,format=raw,file={}", usb_image.display()))
+       .arg("-drive").arg(format!("if=none,id=stick,format=raw,file={}", stick_image.display()))
        .arg("-device").arg("usb-storage,bus=xhci.0,drive=stick")
        .arg("-device").arg("usb-kbd,bus=xhci.0")
        .arg("-device").arg("usb-tablet,bus=xhci.0")
