@@ -194,6 +194,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
                 xhci.poll_events();
                 xhci.service_storage();
                 xhci.service_hubs();
+                xhci.service_hid_setproto();
             }
             while let Some(event) = unaos_kernel::pal::next_event() {
                 match event {
@@ -253,6 +254,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
             xhci.poll_events();
             xhci.service_storage();
             xhci.service_hubs();
+            xhci.service_hid_setproto();
         }
 
         // Drain any frames the NIC has received into the network stack (no-op when

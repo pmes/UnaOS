@@ -453,6 +453,8 @@ pub struct DeviceSlot {
     pub mouse_ep: u8,
     pub mouse_mps: u16,
     pub mouse_interval: u8,
+    /// bInterfaceNumber of the pointer's HID interface — SET_PROTOCOL(boot) wIndex.
+    pub mouse_intf: u8,
     pub mouse_state: u8,
     pub mouse_ring: Option<TransferRing>,
 
@@ -460,6 +462,8 @@ pub struct DeviceSlot {
     pub keyboard_ep: u8,
     pub keyboard_mps: u16,
     pub keyboard_interval: u8,
+    /// bInterfaceNumber of the keyboard's HID interface — SET_PROTOCOL(boot) wIndex.
+    pub keyboard_intf: u8,
     pub keyboard_state: u8,
     pub keyboard_ring: Option<TransferRing>,
 
@@ -496,12 +500,14 @@ impl DeviceSlot {
             mouse_ep: 0,
             mouse_mps: 0,
             mouse_interval: 0,
+            mouse_intf: 0,
             mouse_state: 0,
             mouse_ring: None,
             is_keyboard: false,
             keyboard_ep: 0,
             keyboard_mps: 0,
             keyboard_interval: 0,
+            keyboard_intf: 0,
             keyboard_state: 0,
             keyboard_ring: None,
             descriptor_buffer: desc_buffer,
@@ -546,6 +552,12 @@ pub struct XhciController {
     cmd_pending: Option<CmdPending>,
     /// Slots of hubs detected during enumeration, awaiting (main-loop) bring-up.
     hubs_pending: Vec<u8>,
+    /// Slots whose HID interfaces are configured + reads armed, awaiting a (main-loop, synchronous)
+    /// SET_PROTOCOL(boot). A boot-capable HID interface (bInterfaceSubClass 1) powers up in REPORT
+    /// protocol, whose reports carry a report ID and a device-defined layout we don't parse; boot
+    /// protocol is the fixed [buttons, dx, dy] / [mods, resv, keys..] the decoders expect. Deferred
+    /// to the main loop because it is a synchronous EP0 transfer (must not run in the event handler).
+    hid_setproto_pending: Vec<u8>,
     /// True while a port is mid-enumeration. Enumeration is serialized (one port at a time);
     /// this lets a hot-plug Connect Status Change event know whether to kick `start_next_port`
     /// immediately or just queue the port (the in-flight device's completion will drain it).
@@ -599,6 +611,7 @@ impl XhciController {
             ep0_pending: None,
             cmd_pending: None,
             hubs_pending: Vec::new(),
+            hid_setproto_pending: Vec::new(),
             enum_active: false,
         }
     }
@@ -940,6 +953,13 @@ impl XhciController {
                                         self.slots[slot_id as usize].mouse_state = 3;
                                         self.queue_mouse_read(slot_id as u8);
                                     }
+                                    // Boot-capable HID interfaces power up in REPORT protocol (report
+                                    // IDs + device-defined layout the decoders don't parse). Queue a
+                                    // main-loop SET_PROTOCOL(boot) so this device reports the fixed boot
+                                    // layout our keyboard/mouse decoders expect.
+                                    if !self.hid_setproto_pending.contains(&(slot_id as u8)) {
+                                        self.hid_setproto_pending.push(slot_id as u8);
+                                    }
                                     self.start_next_port();
                                 } else {
                                     serial_println!("xHCI: >>> INTERCEPTED DESCRIPTOR EVENT (Slot 1 EP 1) <<<");
@@ -988,6 +1008,7 @@ impl XhciController {
                                         // Track current interface state while parsing
                                         let mut current_intf_class: u8 = 0;
                                         let mut current_intf_protocol: u8 = 0;
+                                        let mut current_intf_number: u8 = 0;
                                         let mut found_hid = false;
                                         // COLLECT every HID interrupt-IN endpoint (recording it into the
                                         // slot), then configure them all together after the walk via one
@@ -1011,6 +1032,7 @@ impl XhciController {
 
                                             if desc_type == 0x04 { // Interface Descriptor
                                                 if offset + 7 >= 256 { break; }
+                                                current_intf_number = desc_data[offset + 2]; // bInterfaceNumber
                                                 current_intf_class = desc_data[offset + 5];
                                                 let intf_subclass = desc_data[offset + 6];
                                                 current_intf_protocol = desc_data[offset + 7];
@@ -1054,6 +1076,7 @@ impl XhciController {
                                                             self.slots[slot_id as usize].keyboard_ep = ep_addr;
                                                             self.slots[slot_id as usize].keyboard_mps = ep_mps;
                                                             self.slots[slot_id as usize].keyboard_interval = ep_interval;
+                                                            self.slots[slot_id as usize].keyboard_intf = current_intf_number;
                                                             self.slots[slot_id as usize].is_keyboard = true;
                                                             found_hid_ep = true;
                                                         } else {
@@ -1066,6 +1089,7 @@ impl XhciController {
                                                         self.slots[slot_id as usize].mouse_ep = ep_addr;
                                                         self.slots[slot_id as usize].mouse_mps = ep_mps;
                                                         self.slots[slot_id as usize].mouse_interval = ep_interval;
+                                                        self.slots[slot_id as usize].mouse_intf = current_intf_number;
                                                         self.slots[slot_id as usize].is_mouse = true;
                                                         self.slots[slot_id as usize].mouse_is_relative = true;
                                                         found_hid_ep = true;
@@ -1079,6 +1103,7 @@ impl XhciController {
                                                         self.slots[slot_id as usize].mouse_ep = ep_addr;
                                                         self.slots[slot_id as usize].mouse_mps = ep_mps;
                                                         self.slots[slot_id as usize].mouse_interval = ep_interval;
+                                                        self.slots[slot_id as usize].mouse_intf = current_intf_number;
                                                         self.slots[slot_id as usize].is_mouse = true;
                                                         self.slots[slot_id as usize].mouse_is_relative = false;
                                                         found_hid_ep = true;
@@ -2323,6 +2348,44 @@ impl XhciController {
     pub fn service_hubs(&mut self) {
         while let Some(hub_slot) = self.hubs_pending.pop() {
             self.bring_up_hub(hub_slot);
+        }
+    }
+
+    /// Main-loop hook: send SET_PROTOCOL(boot) to the HID interfaces of any freshly-enumerated slot,
+    /// so a boot-capable device that powered up in REPORT protocol (report IDs + a device-defined
+    /// layout the decoders don't parse — e.g. the Logitech receiver's `[reportID, buttons, dx, dy]`)
+    /// switches to the fixed BOOT layout the keyboard/mouse decoders expect. Synchronous, like hub
+    /// bring-up (safe polled context); the interrupt reads are already armed and keep delivering —
+    /// the device just changes report format once this completes.
+    pub fn service_hid_setproto(&mut self) {
+        while let Some(slot) = self.hid_setproto_pending.pop() {
+            // Only BOOT interfaces accept SET_PROTOCOL: proto 1 (keyboard) and proto 2 (relative
+            // boot mouse). The absolute-pointer path (proto 0, e.g. usb-tablet / consumer-control)
+            // is NOT a boot interface and would STALL the request, so skip it.
+            let (kbd, kbd_intf, boot_mouse, mouse_intf) = {
+                let s = &self.slots[slot as usize];
+                (s.is_keyboard, s.keyboard_intf, s.is_mouse && s.mouse_is_relative, s.mouse_intf)
+            };
+            if kbd {
+                self.set_hid_boot_protocol(slot, kbd_intf, "keyboard");
+            }
+            if boot_mouse {
+                self.set_hid_boot_protocol(slot, mouse_intf, "boot-mouse");
+            }
+        }
+    }
+
+    /// HID class request SET_PROTOCOL(boot) for one interface: bmRequestType 0x21 (host->device,
+    /// class, interface recipient), bRequest 0x0B, wValue 0 (0 = Boot, 1 = Report), wIndex = the
+    /// interface number, no data stage.
+    fn set_hid_boot_protocol(&mut self, slot: u8, intf: u8, what: &str) {
+        match self.sync_control(slot, 0x21, 0x0B, 0x0000, intf as u16, 0, 0, false) {
+            Ok(1) => serial_println!("xHCI: SET_PROTOCOL(boot) OK for {} (slot {}, iface {}).", what, slot, intf),
+            Ok(code) => serial_println!(
+                "xHCI: SET_PROTOCOL(boot) for {} (slot {}, iface {}) returned code {} (device may lack boot protocol).",
+                what, slot, intf, code
+            ),
+            Err(()) => serial_println!("xHCI: SET_PROTOCOL(boot) for {} (slot {}, iface {}) FAILED (EP0 pump timeout).", what, slot, intf),
         }
     }
 
