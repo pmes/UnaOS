@@ -113,11 +113,80 @@ __exception_vectors:
     ldp x0,  x1,  [sp], #256
     .endm
 
+    // ---- FP/SIMD save/restore: v0-v31 (512 B) + FPSR/FPCR (16 B), a 528-byte 16-aligned frame ----
+    // Used by the IRQ stub only. The kernel is built `+neon`, so ordinary Rust (memcpy, VecDeque,
+    // fmt) autovectorizes; an ASYNC interrupt can land while the interrupted task has live vector
+    // state, and the handler tree — plus, once the scheduler preempts, the NEXT task's code —
+    // clobbers v0-v31 before this task is resumed. GPR-only save was sound only while the dispatch
+    // tree stayed FP-free; preemption (which runs a whole other task between save and eret) breaks
+    // that, so we save the full FP file here. Uses x0/x1 as scratch — call only AFTER SAVE_GPRS has
+    // spilled them. (FP access is already enabled: the GUI does NEON framebuffer work.)
+    .macro SAVE_FP
+    sub sp, sp, #528
+    mrs x0, fpsr
+    mrs x1, fpcr
+    stp x0, x1, [sp, #0]
+    stp q0,  q1,  [sp, #16]
+    stp q2,  q3,  [sp, #48]
+    stp q4,  q5,  [sp, #80]
+    stp q6,  q7,  [sp, #112]
+    stp q8,  q9,  [sp, #144]
+    stp q10, q11, [sp, #176]
+    stp q12, q13, [sp, #208]
+    stp q14, q15, [sp, #240]
+    stp q16, q17, [sp, #272]
+    stp q18, q19, [sp, #304]
+    stp q20, q21, [sp, #336]
+    stp q22, q23, [sp, #368]
+    stp q24, q25, [sp, #400]
+    stp q26, q27, [sp, #432]
+    stp q28, q29, [sp, #464]
+    stp q30, q31, [sp, #496]
+    .endm
+
+    .macro RESTORE_FP
+    ldp x0, x1, [sp, #0]
+    msr fpsr, x0
+    msr fpcr, x1
+    ldp q0,  q1,  [sp, #16]
+    ldp q2,  q3,  [sp, #48]
+    ldp q4,  q5,  [sp, #80]
+    ldp q6,  q7,  [sp, #112]
+    ldp q8,  q9,  [sp, #144]
+    ldp q10, q11, [sp, #176]
+    ldp q12, q13, [sp, #208]
+    ldp q14, q15, [sp, #240]
+    ldp q16, q17, [sp, #272]
+    ldp q18, q19, [sp, #304]
+    ldp q20, q21, [sp, #336]
+    ldp q22, q23, [sp, #368]
+    ldp q24, q25, [sp, #400]
+    ldp q26, q27, [sp, #432]
+    ldp q28, q29, [sp, #464]
+    ldp q30, q31, [sp, #496]
+    add sp, sp, #528
+    .endm
+
     // ---- IRQ: save, dispatch in Rust, restore, return ----
+    // Beyond the GPRs, save ELR_EL2/SPSR_EL2 (the return PC + PSTATE the CPU banked on entry).
+    // These are SYSTEM registers, not stacked like x86's interrupt frame, so they are per-*core*,
+    // not per-*context*. The scheduler's timer preemption (timer::on_tick -> sched::timer_preempt)
+    // does a context switch INSIDE this handler; the task resumed in its place takes its own IRQs,
+    // which overwrite ELR/SPSR. Without saving+restoring them here, a preempted task would later
+    // `eret` to another task's PC. (The cooperative path never touches these — no IRQ, no eret.)
+    // EL2 is hardcoded: both the bare-metal and UEFI aarch64 paths are handed off at EL2.
     .globl __vec_irq
 __vec_irq:
     SAVE_GPRS
+    SAVE_FP
+    mrs x0, ELR_EL2
+    mrs x1, SPSR_EL2
+    stp x0, x1, [sp, #-16]!
     bl aarch64_irq_handler
+    ldp x0, x1, [sp], #16
+    msr ELR_EL2, x0
+    msr SPSR_EL2, x1
+    RESTORE_FP
     RESTORE_GPRS
     eret
 

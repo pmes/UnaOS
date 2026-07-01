@@ -122,9 +122,19 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
 
     // 4b. aarch64 scheduler (M3a): a cooperative round-robin smoke test on the boot core — spawn a
     // few kernel threads that yield to each other and exit, proving the context switch + run queue.
-    // No interrupts required, so it runs in QEMU too (AP scheduling + preemption arrive in M3b).
+    // No interrupts required, so it runs in QEMU too. Runs BEFORE preemption is on (stays cooperative).
     #[cfg(all(target_arch = "aarch64", feature = "baremetal"))]
     unaos_kernel::arch::sched::demo_cooperative();
+
+    // 4c. aarch64 scheduler (M3b): turn on preemption and put a workload on the secondary cores.
+    // On metal each AP's tasks are timer-preempted (they interleave); in QEMU there is no Group-1
+    // delivery, so the APs run their tasks to completion sequentially. The BSP is never scheduled —
+    // it continues below as the GUI/hardware-service core.
+    #[cfg(all(target_arch = "aarch64", feature = "baremetal"))]
+    {
+        let online = unaos_kernel::arch::smp::online_secondaries();
+        unaos_kernel::arch::sched::start_aps(&online);
+    }
 
     // 4b. ACPI: discover the CPU topology (MADT) for SMP bring-up. x86_64 only — aarch64
     // discovers CPUs via the DTB. Degrades gracefully to uniprocessor if ACPI is absent.

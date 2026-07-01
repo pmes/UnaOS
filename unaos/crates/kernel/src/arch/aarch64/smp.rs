@@ -20,7 +20,7 @@
 
 use core::sync::atomic::{AtomicBool, Ordering};
 
-use super::{boot, cache, exceptions, gic, percpu, timer};
+use super::{boot, cache, exceptions, gic, percpu, sched, timer};
 
 /// The Pi 4 is a single cluster of 4 Cortex-A72s (MPIDR Aff0 = 0..3).
 const NUM_CORES: usize = 4;
@@ -96,16 +96,23 @@ extern "C" fn __secondary_rust(core_raw: u64) -> ! {
     gic::init_cpu_interface();
     gic::enable_sgi(IPI_RESCHED);
     exceptions::enable_irq();
+    // This core's own periodic tick, for scheduler preemption (`INTERVAL` was set by the BSP's
+    // timer::init). Also wakes this core's WFI in the scheduler's wait/idle loops.
+    timer::arm_this_core();
 
-    serial_println!(":: AARCH64 SMP: core {} online (EL2, MMU on, GIC+IPI ready) ::", core);
+    serial_println!(":: AARCH64 SMP: core {} online (EL2, MMU on, GIC+IPI+timer ready) ::", core);
     // Publish readiness AFTER everything above (Release pairs with the BSP's Acquire), so the BSP
     // only sends an SGI once this core can actually take it.
     CORE_READY[core].store(true, Ordering::Release);
 
-    // Idle: WFE parks until an interrupt (the IPI) wakes us; the handler runs, we loop back to WFE.
-    loop {
-        unsafe { core::arch::asm!("wfe", options(nomem, nostack, preserves_flags)) };
-    }
+    // Enter the scheduler: wait for the BSP to turn scheduling on, then run this core's run queue
+    // forever (idling in WFI when empty). Never returns.
+    sched::wait_and_run(core)
+}
+
+/// The secondary cores that came online (MPIDR Aff0), for the BSP to place a scheduler workload on.
+pub fn online_secondaries() -> alloc::vec::Vec<usize> {
+    (1..NUM_CORES).filter(|&c| CORE_READY[c].load(Ordering::Acquire)).collect()
 }
 
 /// Busy-wait until `deadline` (a CNTPCT value) for `cond` to hold; returns whether it did. Bounds

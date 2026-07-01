@@ -177,4 +177,13 @@ pub fn handle_irq() {
 
     // EOI with the full acked value (preserves the source-CPU field for SGIs; a no-op for PPIs).
     unsafe { gicc_write(GICC_EOIR, iar) };
+
+    // Scheduler preemption runs AFTER EOI: timer_preempt may context-switch away, and doing so
+    // before deactivating the interrupt would leave it active on this CPU interface across the
+    // switch (blocking equal/lower-priority interrupts until this context is resumed and returns).
+    // Ordering is on_tick (re-arm, deassert the level) -> EOI (deactivate) -> preempt (switch).
+    #[cfg(feature = "baremetal")]
+    if intid == crate::arch::timer::TIMER_INTID {
+        crate::arch::sched::timer_preempt();
+    }
 }

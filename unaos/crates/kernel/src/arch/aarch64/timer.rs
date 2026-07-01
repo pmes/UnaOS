@@ -61,19 +61,26 @@ pub fn init() {
     let interval = freq / TICK_HZ;
     INTERVAL.store(interval, Ordering::Relaxed);
 
-    super::gic::enable_ppi(TIMER_INTID);
+    arm_this_core();
+    serial_println!(
+        ":: AARCH64 generic timer armed (CNTFRQ={} Hz, {} Hz tick, INTID {}) ::",
+        freq, TICK_HZ, TIMER_INTID
+    );
+}
 
-    write_tval(interval);
+/// Arm THIS core's generic timer + enable its (banked) PPI at the GIC. The BSP reaches this via
+/// `init` (which first computes the shared `INTERVAL`); each secondary calls it directly once its
+/// GIC CPU interface is up, so every core gets its own periodic tick for scheduler preemption.
+/// `INTERVAL` must already be set (the BSP's `init` ran first).
+pub fn arm_this_core() {
+    super::gic::enable_ppi(TIMER_INTID);
+    write_tval(INTERVAL.load(Ordering::Relaxed));
     unsafe {
         // CNTP_CTL_EL0: ENABLE=bit0=1, IMASK=bit1=0 (unmasked). The timer now counts down and will
         // assert its PPI when TVAL hits 0.
         core::arch::asm!("msr CNTP_CTL_EL0, {}", in(reg) 1u64, options(nomem, nostack, preserves_flags));
         core::arch::asm!("isb", options(nomem, nostack, preserves_flags));
     }
-    serial_println!(
-        ":: AARCH64 generic timer armed (CNTFRQ={} Hz, {} Hz tick, INTID {}) ::",
-        freq, TICK_HZ, TIMER_INTID
-    );
 }
 
 /// Per-tick handler, called from the GIC IRQ dispatch when INTID 30 fires. Re-arm first (which
