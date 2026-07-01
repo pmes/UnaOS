@@ -1035,27 +1035,56 @@ impl XhciController {
                                                     let ep_mps = (desc_data[offset + 4] as u16) | ((desc_data[offset + 5] as u16) << 8);
                                                     let ep_interval = desc_data[offset + 6];
 
+                                                    // A composite device can expose several HID interrupt-IN
+                                                    // interfaces (keyboard, mouse, and consumer/system-control).
+                                                    // The driver handles ONE keyboard + ONE pointer, so choose
+                                                    // carefully — a proto-0 consumer-control interface must NOT be
+                                                    // mistaken for a pointer and clobber the real mouse:
+                                                    //   proto 1 = boot keyboard (record the first),
+                                                    //   proto 2 = boot mouse: the DEFINITIVE pointer — always wins,
+                                                    //   proto 0 = ambiguous (usb-tablet OR consumer-control): accept
+                                                    //             as an absolute pointer ONLY if no pointer yet, so a
+                                                    //             later proto-0 can't overwrite, and a real proto-2
+                                                    //             mouse (below) still overrides it.
+                                                    let already_kbd = self.slots[slot_id as usize].is_keyboard;
+                                                    let already_ptr = self.slots[slot_id as usize].is_mouse;
                                                     if current_intf_protocol == 1 {
-                                                        // USB HID Boot Keyboard interface: record it (configured after the walk).
-                                                        serial_println!("xHCI: >>> KEYBOARD INTERRUPT IN EP FOUND: {:#x}, MPS: {}, Interval: {} <<<", ep_addr, ep_mps, ep_interval);
-                                                        self.slots[slot_id as usize].keyboard_ep = ep_addr;
-                                                        self.slots[slot_id as usize].keyboard_mps = ep_mps;
-                                                        self.slots[slot_id as usize].keyboard_interval = ep_interval;
-                                                        self.slots[slot_id as usize].is_keyboard = true;
-                                                    } else {
-                                                        // Mouse, Tablet, or generic HID (protocol 2 = boot mouse / relative;
-                                                        // protocol 0 = tablet / absolute). Record it (configured after the walk).
-                                                        let is_rel = current_intf_protocol == 2;
-                                                        serial_println!("xHCI: >>> POINTER INTERRUPT IN EP FOUND: {:#x}, MPS: {}, Interval: {}, {} (proto {}) <<<",
-                                                            ep_addr, ep_mps, ep_interval,
-                                                            if is_rel { "RELATIVE boot-mouse" } else { "ABSOLUTE tablet" }, current_intf_protocol);
+                                                        if !already_kbd {
+                                                            serial_println!("xHCI: >>> KEYBOARD INTERRUPT IN EP FOUND: {:#x}, MPS: {}, Interval: {} <<<", ep_addr, ep_mps, ep_interval);
+                                                            self.slots[slot_id as usize].keyboard_ep = ep_addr;
+                                                            self.slots[slot_id as usize].keyboard_mps = ep_mps;
+                                                            self.slots[slot_id as usize].keyboard_interval = ep_interval;
+                                                            self.slots[slot_id as usize].is_keyboard = true;
+                                                            found_hid_ep = true;
+                                                        } else {
+                                                            serial_println!("xHCI: (ignoring extra keyboard HID interface, ep {:#x})", ep_addr);
+                                                        }
+                                                    } else if current_intf_protocol == 2 {
+                                                        // Boot mouse: the real pointer. Record it, overriding any
+                                                        // earlier ambiguous proto-0 pointer on the same device.
+                                                        serial_println!("xHCI: >>> POINTER INTERRUPT IN EP FOUND: {:#x}, MPS: {}, Interval: {}, RELATIVE boot-mouse (proto 2) <<<", ep_addr, ep_mps, ep_interval);
                                                         self.slots[slot_id as usize].mouse_ep = ep_addr;
                                                         self.slots[slot_id as usize].mouse_mps = ep_mps;
                                                         self.slots[slot_id as usize].mouse_interval = ep_interval;
                                                         self.slots[slot_id as usize].is_mouse = true;
-                                                        self.slots[slot_id as usize].mouse_is_relative = is_rel;
+                                                        self.slots[slot_id as usize].mouse_is_relative = true;
+                                                        found_hid_ep = true;
+                                                    } else if !already_ptr {
+                                                        // Protocol 0, no pointer yet: treat as an absolute pointer
+                                                        // (usb-tablet). If this is actually a consumer-control
+                                                        // interface, decoding it as absolute is the known proto-0
+                                                        // limitation — but at least it can't clobber a real mouse.
+                                                        serial_println!("xHCI: >>> POINTER INTERRUPT IN EP FOUND: {:#x}, MPS: {}, Interval: {}, ABSOLUTE tablet (proto {}) <<<",
+                                                            ep_addr, ep_mps, ep_interval, current_intf_protocol);
+                                                        self.slots[slot_id as usize].mouse_ep = ep_addr;
+                                                        self.slots[slot_id as usize].mouse_mps = ep_mps;
+                                                        self.slots[slot_id as usize].mouse_interval = ep_interval;
+                                                        self.slots[slot_id as usize].is_mouse = true;
+                                                        self.slots[slot_id as usize].mouse_is_relative = false;
+                                                        found_hid_ep = true;
+                                                    } else {
+                                                        serial_println!("xHCI: (ignoring extra non-pointer HID interface, proto {}, ep {:#x})", current_intf_protocol, ep_addr);
                                                     }
-                                                    found_hid_ep = true;
                                                     found_hid = false; // one interrupt-IN EP per interface; next iface re-arms
                                                 }
                                             } else if desc_type == 0x05 && is_mass_storage { // Bulk Endpoint
