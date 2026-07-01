@@ -96,6 +96,12 @@ pub fn on_tick() {
     write_tval(INTERVAL.load(Ordering::Relaxed));
     unsafe { core::arch::asm!("isb", options(nomem, nostack, preserves_flags)) };
     let prev = TICKS.fetch_add(1, Ordering::Relaxed);
+    // Per-CPU tick, bumped by THIS core's timer only (each core arms its own periodic tick). It is
+    // the scheduler's local clock: `sched::sleep_ticks` computes a wake deadline against this core's
+    // count and the scheduler drains due sleepers against it, so a sleeper wakes on the core it
+    // parked on regardless of the other cores' tick pace. Advances only on metal (QEMU raspi4b never
+    // delivers the timer IRQ, so `on_tick` never runs there — hence tick-driven sleep is metal-only).
+    super::percpu::this_cpu().ticks.fetch_add(1, Ordering::Relaxed);
     if prev == 0 {
         serial_println!("AARCH64: timer heartbeat live (first tick).");
     }

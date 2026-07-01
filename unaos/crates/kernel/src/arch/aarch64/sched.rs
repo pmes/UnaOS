@@ -39,6 +39,18 @@ const QUANTUM_TICKS: u32 = 3;
 const STATE_READY: u8 = 0;
 const STATE_RUNNING: u8 = 1;
 const STATE_FINISHED: u8 = 2;
+/// Parked: off every run queue, waiting on the per-CPU sleeper list (`sleep_ticks`) until a
+/// deadline passes. The scheduler parks the Box per the blocking task's "park action" (below)
+/// instead of requeuing it, and re-readies it when the wake condition holds. Mirrors x86's
+/// STATE_BLOCKED; M4b extends it to semaphore wait queues.
+const STATE_BLOCKED: u8 = 3;
+
+// What the scheduler should do with a task that switched back in the BLOCKED state — set by the
+// blocking primitive (under IRQ-masked) just before it switches, read-and-cleared by the scheduler
+// after the switch (same CPU, sequential; `switch_context` is the memory barrier between them).
+const PARK_NONE: u8 = 0;
+const PARK_SLEEP: u8 = 2; // push the Box onto this CPU's sleeper list with a wake deadline
+                          // (PARK_WAITQ = 1 is added with the Semaphore in M4b)
 
 /// Initial DAIF planted in a fresh task's frame: IRQ masked (I bit). The task starts masked so the
 /// switch-in is atomic; `task_trampoline` unmasks before running the body (so the timer can preempt
@@ -70,6 +82,10 @@ pub struct Task {
     stack: Box<[u8]>,
     entry: fn(usize),
     arg: usize,
+    /// Logical CPU this task is pinned to. Tasks never migrate, so a woken task always returns to
+    /// this core's run queue — which keeps its TPIDR_EL2 (per-CPU) view correct on resume, exactly
+    /// as x86 relies on the GS base staying put. Read by `make_ready` when re-readying a woken task.
+    cpu: u32,
 }
 
 /// One CPU's scheduler bookkeeping (interior-mutable atomics, so the array is a plain static).
@@ -81,6 +97,12 @@ struct SchedCpu {
     current: AtomicU64,
     /// Timer ticks left in the running task's quantum (set on dispatch, counted down in `timer_preempt`).
     quantum: AtomicU32,
+    /// "Park action" for a task switching back BLOCKED: `PARK_*`. Set by the blocking primitive
+    /// before its switch, read-and-cleared by the scheduler after. Same-CPU sequential, so `Relaxed`
+    /// suffices (`switch_context` is the barrier between the writer and the reader).
+    park_kind: AtomicU8,
+    /// PARK_SLEEP: the wake deadline, in THIS CPU's local timer ticks (`percpu.ticks`).
+    park_deadline: AtomicU64,
 }
 
 impl SchedCpu {
@@ -89,6 +111,8 @@ impl SchedCpu {
             scheduler_sp: AtomicU64::new(0),
             current: AtomicU64::new(0),
             quantum: AtomicU32::new(0),
+            park_kind: AtomicU8::new(PARK_NONE),
+            park_deadline: AtomicU64::new(0),
         }
     }
 }
@@ -99,6 +123,20 @@ static SCHED: [SchedCpu; NUM_CPUS] = [const { SchedCpu::new() }; NUM_CPUS];
 /// only at `spawn` (never under the switch), so the brief lock is realloc-free in the hot path.
 static RUN_QUEUES: [Mutex<VecDeque<Box<Task>>>; NUM_CPUS] =
     [const { Mutex::new(VecDeque::new()) }; NUM_CPUS];
+
+/// Per-CPU sleeper lists: tasks blocked in `sleep_ticks`, tagged with their wake deadline (this
+/// CPU's `percpu.ticks`). Touched ONLY by the scheduler on the OWNING CPU (parked there on the
+/// switch-back, drained at the loop top), so the lock is always uncontended — it exists solely to
+/// make the field interior-mutable, not for cross-CPU synchronisation. Being single-CPU, a
+/// `push_back` that reallocates only ever nests the (innermost) heap lock, never another sched lock.
+static SLEEPERS: [Mutex<VecDeque<Sleeper>>; NUM_CPUS] =
+    [const { Mutex::new(VecDeque::new()) }; NUM_CPUS];
+
+/// A parked sleeper: its wake deadline (owning CPU's `percpu.ticks`) and the task it belongs to.
+struct Sleeper {
+    deadline: u64,
+    task: Box<Task>,
+}
 
 // --- Interrupt-state helpers (the scheduler's critical sections run with IRQ masked). ---
 #[inline]
@@ -207,16 +245,38 @@ pub fn spawn(name: &'static str, entry: fn(usize), arg: usize, cpu: usize) -> u6
         stack,
         entry,
         arg,
+        cpu: cpu as u32,
     });
     RUN_QUEUES[cpu].lock().push_back(task);
-    // Wake the target if it's a different, possibly-idle core: its scheduler re-polls its queue on
-    // any IRQ, so an SGI turns cross-core spawn latency from "up to one timer tick" into ~immediate
-    // and removes the reliance on the periodic tick as the only wake source. Same-core needs no poke.
-    let this = percpu::this_cpu().cpu_index as usize;
-    if cpu != this {
-        super::gic::send_sgi(cpu, super::smp::IPI_RESCHED);
-    }
+    // Wake the target if it's a different, possibly-idle core (same-core needs no poke).
+    poke_cpu(cpu);
     id
+}
+
+/// Send the wake/reschedule SGI (IPI_RESCHED) to `target` so, if it is idle in WFI, it breaks out
+/// and its scheduler loop re-polls its run queue. Skips a self-poke. The IPI never context-switches
+/// — it just has to interrupt WFI; the target's `run()` picks the queued work up. On metal the SGI
+/// turns cross-core spawn/wake latency from "up to one timer tick" into ~immediate and is the ONLY
+/// wake source for a genuinely idle core; in QEMU raspi4b the SGI is not delivered, but the idle
+/// path there is a poll-spin (the timer isn't live), so `run()` still re-polls the queue and picks
+/// the task up — cross-core delivery is thus the QEMU-invisible half, validated on metal.
+fn poke_cpu(target: usize) {
+    let this = percpu::this_cpu().cpu_index as usize;
+    if target != this {
+        super::gic::send_sgi(target, super::smp::IPI_RESCHED);
+    }
+}
+
+/// Mark a parked/just-woken task READY, push it onto its PINNED CPU's run queue, and poke that CPU.
+/// Used by the sleeper drain (same CPU) and, from M4b, `Semaphore::post` (cross-CPU wake). The task
+/// always returns to `task.cpu`, so its per-CPU (TPIDR_EL2) view stays correct on resume — tasks do
+/// not migrate. Caller runs with IRQ masked.
+fn make_ready(task: Box<Task>) {
+    let target = task.cpu as usize;
+    debug_assert!(target < NUM_CPUS, "make_ready: cpu out of range");
+    task.state.store(STATE_READY, Ordering::Release);
+    RUN_QUEUES[target].lock().push_back(task);
+    poke_cpu(target);
 }
 
 /// Cooperatively give up the CPU: mark this task ready and switch back to the scheduler, which
@@ -253,6 +313,42 @@ pub fn exit() -> ! {
         switch_context(&raw mut discard, SCHED[cpu].scheduler_sp.load(Ordering::Acquire));
     }
     unreachable!("scheduler resumed a finished task")
+}
+
+/// Block the current task for `n` of THIS CPU's local timer ticks, then become runnable again.
+/// Timer-driven with no waker, so it cannot lose a wakeup: the scheduler drains due sleepers at its
+/// loop top and the free-running periodic timer re-enters that loop every tick, so granularity and
+/// worst-case wake latency are one tick. `n == 0` wakes on the next scheduler pass. No-op outside a
+/// scheduled task (the unscheduled BSP / idle context), like `yield_now`.
+///
+/// METAL-ONLY WAKE (QEMU-invisible): the wake source is the per-CPU generic-timer tick, and QEMU
+/// raspi4b never delivers the timer IRQ (`percpu.ticks` stays frozen at 0 there), so a sleeper
+/// parked in QEMU never wakes. The *parking* machinery is exercised in QEMU; the *wake* is validated
+/// on the real Pi 4 (each core's timer is LIVE). Callers must not depend on it completing where
+/// `timer::is_live()` is false. Interrupts are masked across the state flip + switch (like
+/// `yield_now`) and unmasked on resume — task bodies always run with IRQ unmasked.
+pub fn sleep_ticks(n: u64) {
+    let cpu = percpu::this_cpu().cpu_index as usize;
+    mask_irq();
+    let raw = SCHED[cpu].current.load(Ordering::Acquire) as *mut Task;
+    if !raw.is_null() {
+        let deadline = percpu::this_cpu().ticks.load(Ordering::Relaxed) + n;
+        unsafe {
+            debug_assert_eq!((*raw).cpu as usize, cpu, "sleep_ticks: task on the wrong CPU");
+            (*raw).state.store(STATE_BLOCKED, Ordering::Release);
+            // Ask the scheduler to park us on this CPU's sleeper list with this deadline (consumed in
+            // `dispatch_next`'s switch-back via `park_blocked`).
+            SCHED[cpu].park_deadline.store(deadline, Ordering::Relaxed);
+            SCHED[cpu].park_kind.store(PARK_SLEEP, Ordering::Relaxed);
+            switch_context(
+                &raw mut (*raw).ctx_sp,
+                SCHED[cpu].scheduler_sp.load(Ordering::Acquire),
+            );
+        }
+        // Resumed (IRQ masked, carried by the switch) once the deadline passed and the scheduler
+        // re-dispatched us.
+    }
+    unmask_irq();
 }
 
 /// Preempt the running task at quantum expiry. Called from the timer IRQ path (`gic::handle_irq`,
@@ -309,17 +405,66 @@ fn dispatch_next(cpu: usize) -> bool {
     // future switch-in path could leave enabled.
     mask_irq();
     SCHED[cpu].current.store(0, Ordering::Release);
+    // Consume the park action exactly once: read it and immediately reset to NONE, so a stale action
+    // can never leak into the next task's switch-back. Only a task that switched back BLOCKED carries
+    // a meaningful action.
+    let park = SCHED[cpu].park_kind.swap(PARK_NONE, Ordering::Relaxed);
     let task = unsafe { Box::from_raw(raw) };
     match task.state.load(Ordering::Acquire) {
-        STATE_READY => RUN_QUEUES[cpu].lock().push_back(task),
-        _ => drop(task), // FINISHED (or unexpected) — free the stack
+        STATE_FINISHED => drop(task), // free the stack
+        STATE_BLOCKED => park_blocked(cpu, park, task), // sleeper list / (M4b) a wait queue
+        _ => {
+            // READY (yielded or preempted): rotate to the back of the run queue.
+            debug_assert_eq!(park, PARK_NONE, "non-blocked task carried a park action");
+            task.state.store(STATE_READY, Ordering::Release);
+            RUN_QUEUES[cpu].lock().push_back(task);
+        }
     }
     true
 }
 
+/// Park a task that switched back BLOCKED, per the action it set before switching. Runs in the
+/// scheduler context with IRQ masked and owns `task`.
+fn park_blocked(cpu: usize, park: u8, task: Box<Task>) {
+    match park {
+        PARK_SLEEP => {
+            let deadline = SCHED[cpu].park_deadline.load(Ordering::Relaxed);
+            SLEEPERS[cpu].lock().push_back(Sleeper { deadline, task });
+        }
+        _ => {
+            // A BLOCKED task with no valid park action is a bug; don't leak it — drop it (frees the
+            // stack). M4b adds PARK_WAITQ here.
+            debug_assert!(false, "BLOCKED task with no park action");
+            drop(task);
+        }
+    }
+}
+
+/// Move every sleeper on this CPU whose deadline has passed back onto the run queue. Called at the
+/// scheduler loop top with IRQ masked. The sleeper lock is released before `make_ready` so its
+/// run-queue lock is never nested under the sleeper lock.
+fn drain_due_sleepers(cpu: usize) {
+    let now = percpu::this_cpu().ticks.load(Ordering::Relaxed);
+    loop {
+        let due = {
+            let mut sleepers = SLEEPERS[cpu].lock();
+            match sleepers.iter().position(|s| s.deadline <= now) {
+                Some(i) => sleepers.remove(i).map(|s| s.task),
+                None => None,
+            }
+        }; // sleeper lock dropped here
+        match due {
+            Some(task) => make_ready(task),
+            None => break,
+        }
+    }
+}
+
 /// Run `cpu`'s run queue to completion, cooperatively (the M3a demo driver on the BSP): dispatch
 /// tasks until the queue drains, then return. Used before preemption is enabled, so tasks only
-/// switch via `yield_now`/`exit`.
+/// switch via `yield_now`/`exit`. It does NOT drain the sleeper list, so a task that `sleep_ticks`
+/// (or otherwise blocks) here would be parked and never re-dispatched — the blocking primitives are
+/// exercised on the APs' `run()` loop, which does service sleepers.
 pub fn run_until_empty(cpu: usize) {
     while dispatch_next(cpu) {}
 }
@@ -328,6 +473,14 @@ pub fn run_until_empty(cpu: usize) {
 /// `arch::hlt`) when the queue is empty until the timer/an IPI makes work. Never returns.
 fn run(cpu: usize) -> ! {
     loop {
+        // Wake any sleepers whose deadline has passed (IRQ masked, matching the switch-back critical
+        // section); `make_ready` pushes them onto THIS CPU's own run queue so the dispatch below
+        // picks them up. The wake source is the free-running periodic timer — each tick breaks the
+        // idle WFI and re-enters this loop — so an idle core with only a pending sleeper still makes
+        // progress; worst-case wake latency is one tick. `dispatch_next` re-masks (redundant here),
+        // then either switches into a task or, on an empty queue, unmasks and returns false to idle.
+        mask_irq();
+        drain_due_sleepers(cpu);
         if !dispatch_next(cpu) {
             crate::arch::hlt();
         }
@@ -395,17 +548,52 @@ fn preempt_body(arg: usize) {
     serial_println!(":: SCHED: core {} task {} done ::", core, task);
 }
 
-/// M3b: turn on preemptive scheduling and put a workload on the APs. Spawn two CPU-bound (non-
-/// yielding) tasks on each online secondary, then flip SCHED_ACTIVE (enables `timer_preempt`) and
-/// SCHED_GO (releases the APs into `run`). On metal each core's two tasks INTERLEAVE (timer
-/// preemption); in QEMU (no Group-1 delivery) they run to completion sequentially. Call AFTER the
-/// BSP's cooperative demo so that one stays un-preempted.
+/// M4a demo: prove `sleep_ticks` parks a task and this core's timer tick wakes it. Metal-only wake —
+/// in QEMU raspi4b the timer IRQ is never delivered (`timer::is_live()` is false), so a real sleep
+/// would park forever; there we skip the sleep and just report, keeping the AP's queue draining.
+fn sleep_demo_body(arg: usize) {
+    let core = arg;
+    if !timer::is_live() {
+        serial_println!(
+            ":: SCHED: core {} SLEEP demo skipped — timer not delivered (QEMU); sleep-wake is metal-only ::",
+            core
+        );
+        return;
+    }
+    const NAP: u64 = 25; // ticks (~100 ms at the 250 Hz per-core tick)
+    let before = percpu::this_cpu().ticks.load(Ordering::Relaxed);
+    serial_println!(":: SCHED: core {} SLEEP {} ticks (at tick {}) ::", core, NAP, before);
+    sleep_ticks(NAP);
+    let after = percpu::this_cpu().ticks.load(Ordering::Relaxed);
+    serial_println!(
+        ":: SCHED: core {} WOKE at tick {} (slept {} ticks; sleep_ticks OK) ::",
+        core,
+        after,
+        after.wrapping_sub(before),
+    );
+}
+
+/// M3b/M4a: turn on preemptive scheduling and put a workload on the APs. Spawn two CPU-bound (non-
+/// yielding) tasks on each online secondary (the preemption regression), plus — for M4a — a
+/// `sleep_ticks` demo on the first online AP, then flip SCHED_ACTIVE (enables `timer_preempt`) and
+/// SCHED_GO (releases the APs into `run`). On metal each core's two busy tasks INTERLEAVE (timer
+/// preemption) and the sleeper parks-then-wakes on its own tick; in QEMU (no Group-1 delivery) the
+/// busy tasks run to completion sequentially and the sleeper self-skips. Call AFTER the BSP's
+/// cooperative demo so that one stays un-preempted.
 pub fn start_aps(online: &[usize]) {
     for &cpu in online {
         spawn("ap-a", preempt_body, cpu * 10, cpu);
         spawn("ap-b", preempt_body, cpu * 10 + 1, cpu);
     }
+    // Sleep demo on the first online AP: parks on that core's sleeper list, woken by its own timer
+    // tick (metal-only; the body self-skips in QEMU so it can never hang the core).
+    if let Some(&c) = online.first() {
+        spawn("sleeper", sleep_demo_body, c, c);
+    }
     SCHED_ACTIVE.store(true, Ordering::Release);
     SCHED_GO.store(true, Ordering::Release);
-    serial_println!(":: AARCH64 SCHED: preemption ON; 2 tasks/core spawned on APs {:?} ::", online);
+    serial_println!(
+        ":: AARCH64 SCHED: preemption ON; 2 tasks/core on APs {:?} + a sleep_ticks demo ::",
+        online
+    );
 }
