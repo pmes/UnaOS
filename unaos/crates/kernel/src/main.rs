@@ -114,6 +114,12 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     unaos_kernel::arch::memory::init(boot_info);
     serial_println!(":: KERNEL HEAP ALLOCATED ::");
 
+    // 4a. aarch64 SMP (bare-metal Pi 4): release the 3 parked Cortex-A72 secondary cores from the
+    // firmware spin-table. Each brings up its own MMU + exception vectors and (Milestone 1) reports
+    // in over serial, then idles. The BSP continues below as the hardware-service core.
+    #[cfg(all(target_arch = "aarch64", feature = "baremetal"))]
+    unaos_kernel::arch::smp::start_secondaries();
+
     // 4b. ACPI: discover the CPU topology (MADT) for SMP bring-up. x86_64 only — aarch64
     // discovers CPUs via the DTB. Degrades gracefully to uniprocessor if ACPI is absent.
     #[cfg(target_arch = "x86_64")]

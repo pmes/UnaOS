@@ -65,14 +65,29 @@ const fn device_block(pa: u64) -> u64 {
 /// after BSS has been zeroed. Plain volatile writes + system-register moves only — no atomics, no
 /// locks, nothing that needs the MMU we're about to enable.
 pub unsafe fn mmu_init() {
-    let table = &raw mut L1 as *mut u64;
-    // 0–1 GiB and 1–3 GiB: RAM (Normal). On an 8 GiB Pi there is RAM above 3 GiB too, but the kernel
-    // never uses it (heap is in low RAM), so the top GiB is given to the peripherals as Device.
-    table.add(0).write_volatile(ram_block(0x0000_0000));
-    table.add(1).write_volatile(ram_block(0x4000_0000));
-    table.add(2).write_volatile(ram_block(0x8000_0000));
-    table.add(3).write_volatile(device_block(0xC000_0000));
+    build_l1();
+    unsafe { enable_mmu() };
+}
 
+/// Populate the single L1 translation table. BSP-only: the secondaries reuse this same table (they
+/// call `enable_mmu` alone), so it must be built exactly once, before any core turns its MMU on.
+fn build_l1() {
+    let table = &raw mut L1 as *mut u64;
+    unsafe {
+        // 0–1 GiB and 1–3 GiB: RAM (Normal). On an 8 GiB Pi there is RAM above 3 GiB too, but the
+        // kernel never uses it (heap is in low RAM), so the top GiB is peripherals as Device.
+        table.add(0).write_volatile(ram_block(0x0000_0000));
+        table.add(1).write_volatile(ram_block(0x4000_0000));
+        table.add(2).write_volatile(ram_block(0x8000_0000));
+        table.add(3).write_volatile(device_block(0xC000_0000));
+    }
+}
+
+/// Point this core's TTBR0_EL2 at the (already-built) L1 table and turn the MMU + caches on. Run on
+/// EACH core with its MMU still off — the BSP after `build_l1`, every secondary after the spin-table
+/// release (`arch::aarch64::smp`). System-register moves only; no atomics/locks (the very thing the
+/// MMU is being enabled to make sound). The table is shared, so no per-core state here.
+pub unsafe fn enable_mmu() {
     let ttbr0 = &raw const L1 as u64;
     unsafe {
         core::arch::asm!(
