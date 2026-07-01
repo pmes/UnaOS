@@ -1,5 +1,6 @@
 #[macro_use]
 pub mod serial;
+pub mod cache;
 pub mod memory;
 pub mod pci;
 pub mod exceptions;
@@ -7,6 +8,8 @@ pub mod gic;
 pub mod timer;
 #[cfg(feature = "baremetal")]
 pub mod boot;
+#[cfg(feature = "baremetal")]
+pub mod mailbox;
 
 pub fn init() {
     serial_println!(":: AARCH64 Core Hardware Init ::");
@@ -87,6 +90,17 @@ pub fn hlt() {
 
 pub fn poll_input() -> Option<u8> {
     serial::SERIAL_PORT.lock().read_byte()
+}
+
+/// Make CPU writes to `[addr, addr+len)` visible to a non-coherent scan-out engine — the Pi 4's
+/// VideoCore HVS reads the framebuffer straight from RAM and does not snoop the A72 data cache, so
+/// after the GUI flushes pixels into a (cacheable) framebuffer they must be cleaned to the Point of
+/// Coherency or the display shows stale rows. Called from the shared video path (`FrameBuffer`/
+/// `fbcon`); a `DC CVAC` sweep on aarch64, a no-op on the cache-coherent x86 framebuffer and inert
+/// in QEMU. See arch/aarch64/cache.rs for why this is mandatory on metal but invisible in QEMU.
+#[inline]
+pub fn flush_framebuffer_range(addr: usize, len: usize) {
+    cache::clean_range(addr, len);
 }
 
 /// Monotonic tick counter since boot. Arch-neutral entry point (mirrors x86_64); now backed by the

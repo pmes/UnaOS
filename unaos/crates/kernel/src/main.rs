@@ -189,17 +189,18 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         unaos_kernel::arch::hlt_loop();
     }
 
-    // Bare-metal Pi 4 (Phase 1): booted straight from the microSD slot via the GPU ROM, no UEFI, no
-    // framebuffer (that comes later via the VideoCore mailbox). Run a serial-only console: arch::init
-    // above already streamed EL/GIC/timer-LIVE to the PL011, proving the slot boot + interrupts on
-    // metal; here we just echo serial input so the Debug Probe is a live console. The timer heartbeat
-    // keeps WFI waking, so input is serviced promptly. Never returns — the GUI code below is for the
-    // UEFI/framebuffer build.
+    // Bare-metal Pi 4: booted straight from the microSD slot via the GPU ROM, no UEFI. Phase 2 asks
+    // the VideoCore GPU for a framebuffer over the mailbox (in build_boot_info), so on a Pi with HDMI
+    // `framebuffer_addr` is now non-zero and we fall through to the full GUI path below — the PL011
+    // serves as the keyboard (the main loop polls it on aarch64). If the mailbox allocation failed
+    // (or a headless config), fall back to the Phase-1 serial-only console: arch::init already
+    // streamed EL/GIC/timer-LIVE to the PL011, so this just echoes input. The timer heartbeat keeps
+    // WFI waking, so input is serviced promptly.
     #[cfg(feature = "baremetal")]
-    {
-        let _ = (framebuffer_addr, framebuffer_size, info); // unused without the framebuffer/GUI path
-        serial_println!(":: UnaOS bare-metal — Pi 4 microSD-slot boot, serial console ::");
-        serial_println!(":: heartbeat live; type and I echo. (no framebuffer yet — Phase 1) ::");
+    if framebuffer_addr == 0 {
+        let _ = (framebuffer_size, info); // unused on the serial-only path
+        serial_println!(":: UnaOS bare-metal — Pi 4 microSD-slot boot, serial console (no framebuffer) ::");
+        serial_println!(":: heartbeat live; type and I echo. ::");
         loop {
             while let Some(b) = unaos_kernel::arch::poll_input() {
                 // Echo; map CR to CRLF so a serial terminal advances lines.
@@ -211,6 +212,8 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
             }
             unaos_kernel::hlt();
         }
+    } else {
+        serial_println!(":: UnaOS bare-metal — Pi 4, VideoCore framebuffer up; starting GUI ::");
     }
 
     if framebuffer_addr != 0 {

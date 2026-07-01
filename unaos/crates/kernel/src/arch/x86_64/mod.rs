@@ -34,6 +34,13 @@ pub fn hlt() {
     x86_64::instructions::hlt();
 }
 
+/// Counterpart to aarch64's framebuffer cache-clean. On x86 the UEFI framebuffer is presented
+/// through a cache-coherent path (write-combining set up by firmware, snooped by the display
+/// engine), so no explicit maintenance is needed — a no-op that keeps the shared video code
+/// arch-agnostic.
+#[inline]
+pub fn flush_framebuffer_range(_addr: usize, _len: usize) {}
+
 /// Monotonic tick counter since boot (the local-APIC timer heartbeat). Arch-neutral entry
 /// point used by drivers for coarse timing (e.g. TCP retransmission RTO); the absolute rate
 /// is uncalibrated but steady.

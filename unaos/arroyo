@@ -287,6 +287,44 @@ kernel8() {
     echo -e "${COLOR_GREEN}✅ Flashable image: target/UnaOS-pi4-baremetal.img — Imager → Use custom → microSD → SD slot.${COLOR_RESET}"
 }
 
+# Boot the bare-metal kernel8.img on QEMU's `raspi4b` (emulated BCM2711) — the same flat binary the
+# real Pi GPU ROM loads from the microSD slot. raspi4b loads `-kernel` to 0x80000 and enters at EL2,
+# and faithfully models the VideoCore mailbox + framebuffer (the buffer is scanned out to the
+# display), so this exercises the Phase-2 mailbox framebuffer end to end. Our PL011 (UART0) is the
+# FIRST `-serial`; the mini-UART is second. (No EDID in QEMU → the firmware's default 640×480.)
+run_kernel8() {
+    kernel8 # always rebuild from current source (incremental; ~seconds) so we never run a stale image
+    echo -e "${COLOR_GREEN}⚡ Launching QEMU raspi4b (bare-metal kernel8.img)...${COLOR_RESET}"
+    echo -e "  • PL011 serial (UART0) on stdio; mailbox framebuffer on the display"
+    qemu-system-aarch64 \
+        -machine raspi4b \
+        -kernel "$KERNEL8_DIR/kernel8.img" \
+        -serial mon:stdio -serial null \
+        ${UNAOS_QEMU_EXTRA:-}
+}
+
+# Headless raspi4b test: boot kernel8.img, capture PL011 -> target/serial-pi.log and a QMP
+# screendump of the mailbox framebuffer -> target/pi-screen.png, then self-terminate.
+test_kernel8() {
+    local secs="${1:-8}"
+    kernel8 # always rebuild from current source (incremental; ~seconds) so we never test a stale image
+    local logf="${WORKSPACE_DIR}/target/serial-pi.log"
+    local png="${WORKSPACE_DIR}/target/pi-screen.png"
+    rm -f "$logf"
+    echo -e "${COLOR_CYAN}⚡ Headless raspi4b test (${secs}s). Serial -> ${logf}, screen -> ${png}${COLOR_RESET}"
+    qemu-system-aarch64 \
+        -machine raspi4b \
+        -kernel "$KERNEL8_DIR/kernel8.img" \
+        -serial "file:${logf}" -serial null -display none \
+        -qmp tcp:127.0.0.1:4463,server,nowait \
+        ${UNAOS_QEMU_EXTRA:-} &
+    local qpid=$!
+    python3 "${WORKSPACE_DIR}/scripts/qmp_shoot.py" --port 4463 --wait "$((secs - 1))" --out "$png" 2>/dev/null || sleep "$secs"
+    kill "$qpid" 2>/dev/null || true
+    wait "$qpid" 2>/dev/null || true
+    echo -e "${COLOR_GREEN}✅ Serial:${COLOR_RESET} ${logf}    ${COLOR_GREEN}Screen:${COLOR_RESET} ${png}"
+}
+
 clean_all() {
     echo -e "${COLOR_YELLOW}⚡ Purging build artifacts...${COLOR_RESET}"
     cd "$WORKSPACE_DIR"
@@ -383,6 +421,12 @@ case "${1:-}" in
     kernel8|baremetal)
         kernel8
         ;;
+    kernel8-run|run-pi)
+        run_kernel8
+        ;;
+    kernel8-test|test-pi)
+        test_kernel8 "${2:-8}"
+        ;;
     clean)
         clean_all
         ;;
@@ -393,7 +437,7 @@ case "${1:-}" in
         ;;
     *)
         echo -e "${COLOR_RED}Unknown command: $1${COLOR_RESET}"
-        echo "Usage: ./arroyo [x86|arm|test [secs]|test-arm [secs]|check|build|esp-x86|esp-arm|clean]"
+        echo "Usage: ./arroyo [x86|arm|test [secs]|test-arm [secs]|check|build|esp-x86|esp-arm|kernel8|kernel8-run|kernel8-test [secs]|clean]"
         exit 1
         ;;
 esac

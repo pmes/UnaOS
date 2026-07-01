@@ -165,5 +165,13 @@ impl Screen {
                 self.front.blit(off, &self.back_store[off..off + seg]);
             }
         }
+        // Present to a non-coherent scan-out (the Pi 4 HVS) with a single cache clean over the
+        // whole damaged span — one `DC CVAC` sweep + one `DSB`, not one per scanline. The span is a
+        // contiguous byte range covering every blitted row (its interior may include undamaged
+        // left/right margins of middle rows, but cleaning already-clean lines is harmless). No-op on
+        // cache-coherent targets (x86, and QEMU which models no caches).
+        let span_start = (d.y0 * stride + d.x0) * bpp;
+        let span_end = ((y1 - 1) * stride + x1) * bpp;
+        self.front.flush_range(span_start, span_end - span_start);
     }
 }

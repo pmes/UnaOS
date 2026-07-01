@@ -161,6 +161,11 @@ impl FrameBuffer {
     /// it would overrun). This is the double-buffer flush primitive: a bulk sequential copy onto
     /// the framebuffer, which on real hardware is slow/write-combining — sequential bulk copies
     /// are far friendlier to it than the per-pixel pokes drawing uses on the cached back buffer.
+    ///
+    /// Does **not** clean the cache: callers that present to a non-coherent scan-out (the Pi 4 HVS)
+    /// must call [`flush_range`](Self::flush_range) over the region they wrote. `Screen::flush`
+    /// blits row-by-row and then cleans the whole damaged span once, so the (no-op-on-coherent)
+    /// `DC CVAC` sweep + `DSB` happen a single time per frame rather than per scanline.
     pub fn blit(&self, byte_offset: usize, src: &[u8]) {
         if self.base == 0 || byte_offset + src.len() > self.len {
             return;
@@ -172,6 +177,27 @@ impl FrameBuffer {
                 src.len(),
             );
         }
+    }
+
+    /// Make CPU writes to `[byte_offset, byte_offset+len)` of this framebuffer visible to a
+    /// non-coherent display controller (the Pi 4 HVS). Bounds-clamped; delegates to the arch
+    /// cache-clean (a no-op on cache-coherent targets).
+    pub fn flush_range(&self, byte_offset: usize, len: usize) {
+        if self.base == 0 {
+            return;
+        }
+        let end = (byte_offset + len).min(self.len);
+        if end <= byte_offset {
+            return;
+        }
+        crate::arch::flush_framebuffer_range(self.base + byte_offset, end - byte_offset);
+    }
+
+    /// Flush the whole framebuffer to RAM. Used by the boot console (`fbcon`), which pokes scattered
+    /// glyph pixels rather than going through `blit`, so a single whole-surface clean after each
+    /// update is the simplest way to keep the on-screen boot log coherent on the Pi.
+    pub fn flush_all(&self) {
+        self.flush_range(0, self.len);
     }
 
     /// Scroll the whole frame up by `dy` pixel rows, clearing the freed bottom band to `fill`.

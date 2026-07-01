@@ -131,9 +131,10 @@ static mut BOOT_INFO: BootInfo = BootInfo {
     mode_action: 0,
 };
 
-/// Synthesize the BootInfo the kernel expects. Phase 1 is serial-only: `framebuffer_addr = 0` makes
-/// `kernel_main` skip the video bring-up and run headless on the PL011 console (the framebuffer comes
-/// later via the VideoCore mailbox). `dtb_addr` carries the pointer the GPU ROM passed in x0.
+/// Synthesize the BootInfo the kernel expects. `dtb_addr` carries the pointer the GPU ROM passed in
+/// x0. Phase 2 asks the VideoCore GPU for a framebuffer over the mailbox and, on success, fills the
+/// framebuffer fields so `kernel_main` brings up the full GUI on HDMI; if the mailbox call fails the
+/// fields stay 0 and the kernel falls back to the serial-only console (Phase 1 behaviour).
 pub fn build_boot_info(dtb: u64) -> &'static mut BootInfo {
     unsafe {
         let regions = &raw const MEM_REGIONS as u64;
@@ -141,6 +142,16 @@ pub fn build_boot_info(dtb: u64) -> &'static mut BootInfo {
         (*bi).dtb_addr = dtb;
         (*bi).memory_regions_addr = regions;
         (*bi).memory_regions_len = 1;
+
+        // VideoCore mailbox framebuffer. Safe to call here: mmu_init() has run, so the mailbox MMIO
+        // (Device-mapped at 0xFE00B880) and the cache maintenance the driver does both work. Serial
+        // is up (PL011), so the driver's diagnostics reach the Debug Probe even though fbcon — which
+        // it's about to make possible — isn't online yet.
+        if let Some(fb) = super::mailbox::init_framebuffer() {
+            (*bi).framebuffer_addr = fb.base;
+            (*bi).framebuffer_size = fb.size;
+            (*bi).framebuffer_info = fb.info;
+        }
         &mut *bi
     }
 }
