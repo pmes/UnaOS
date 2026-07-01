@@ -90,11 +90,12 @@ __vec_svc:
     RESTORE_FP
     RESTORE_GPRS
     eret
-    // Non-SVC lower-EL synchronous exception: log + halt for M6a (M6b makes this a task-kill). The
-    // `b .` guarantees we never fall into the eret tail with a half-restored frame.
+    // Non-SVC lower-EL synchronous exception (M6b): an EL0 abort/alignment/UNDEF/trapped-sysreg
+    // KILLS the offending task, not the kernel — aarch64_el0_fault_handler logs, records, and
+    // sched::exit()s (never returns; the frame is abandoned with the task's stack). The `b .`
+    // guarantees we never fall into the eret tail with a half-restored frame.
 __vec_svc_fault:
-    mov x0, #4
-    bl aarch64_fault_handler
+    bl aarch64_el0_fault_handler
     b .
 "#
     };
@@ -383,7 +384,9 @@ extern "C" fn aarch64_fault_handler(kind: u64) -> ! {
         0 => "SYNCHRONOUS",
         2 => "FIQ",
         3 => "SERROR",
-        4 => "EL0-SYNC (non-SVC)", // M6a: a lower-EL sync exception that wasn't an SVC (see __vec_svc_fault)
+        // M6b: only reached if an EL0 fault arrives with NO current task — 0x400 should be
+        // unreachable outside a dispatched user task, so this is a kernel bug, not a user one.
+        4 => "EL0-SYNC (no current task)",
         _ => "UNKNOWN",
     };
     // ESR EC field (bits 31:26) classifies the exception — the single most useful number here.
@@ -391,4 +394,63 @@ extern "C" fn aarch64_fault_handler(kind: u64) -> ! {
     serial_println!("=== AARCH64 EXCEPTION: {} ===", what);
     serial_println!("ESR={:#x} (EC={:#04x})  ELR={:#x}  FAR={:#x}", esr, ec, elr, far);
     crate::arch::hlt_loop();
+}
+
+/// M6b: a non-SVC synchronous exception from EL0 — data/instruction abort, alignment, UNDEF, a
+/// trapped EL0 sysreg access (SCTLR_EL1.UCT/UCI/DZE are 0, so CTR_EL0 reads / DC ops / WFI from
+/// EL0 trap too) — KILLS the offending task instead of halting the kernel. Every non-0x15 EC at
+/// the 0x400 vector routes here unconditionally: none may be swallowed or re-executed, and a
+/// Current-EL fault (a genuine kernel bug) still takes the fatal `__vec_sync` path.
+///
+/// Reached from `__vec_svc_fault` at EL1 on the task's own kernel stack with DAIF masked — the
+/// exact context the metal-proven sys_exit path runs in — so `sched::exit()` is safe: it marks the
+/// task FINISHED and switches to the scheduler, which frees the Box (the exception frame is
+/// abandoned with the stack; nothing unwinds).
+///
+/// Logging here is safe (unlike the RX ISR): the interrupted context is EL0, which cannot hold
+/// SERIAL_PORT or any kernel lock; a holder on ANOTHER core either holds it IRQ-masked (bounded
+/// critical section) or — poll_input's single-register read — unmasked-but-preemptible, so the
+/// worst case is spinning until that core re-dispatches the holder. Bounded, no cycle.
+///
+/// FAR_EL1 is architecturally valid only for instruction/data aborts (EC 0x20/0x24) with ISS.FnV=0
+/// and for PC-alignment faults (0x22); for every other EC it holds a stale value, so print `--`.
+#[cfg(feature = "baremetal")]
+#[unsafe(no_mangle)]
+extern "C" fn aarch64_el0_fault_handler() -> ! {
+    let (esr, elr, far): (u64, u64, u64);
+    unsafe {
+        core::arch::asm!("mrs {}, ESR_EL1", out(reg) esr, options(nomem, nostack, preserves_flags));
+        core::arch::asm!("mrs {}, ELR_EL1", out(reg) elr, options(nomem, nostack, preserves_flags));
+        core::arch::asm!("mrs {}, FAR_EL1", out(reg) far, options(nomem, nostack, preserves_flags));
+    }
+    let ec = (esr >> 26) & 0x3F;
+    let iss = esr & 0x1FF_FFFF;
+    let far_valid = match ec {
+        0x20 | 0x24 => (iss >> 10) & 1 == 0, // aborts: valid unless ISS.FnV (external abort)
+        0x22 => true,                        // PC alignment fault
+        _ => false,
+    };
+    let Some(name) = super::sched::current_name() else {
+        aarch64_fault_handler(4); // no current task: a kernel bug — fatal, never a kill
+    };
+    if far_valid {
+        serial_println!(
+            ":: EL0 FAULT: task '{}' KILLED — EC={:#04x} ISS={:#x} ELR={:#x} FAR={:#x} ::",
+            name,
+            ec,
+            iss,
+            elr,
+            far
+        );
+    } else {
+        serial_println!(
+            ":: EL0 FAULT: task '{}' KILLED — EC={:#04x} ISS={:#x} ELR={:#x} FAR=-- ::",
+            name,
+            ec,
+            iss,
+            elr
+        );
+    }
+    super::syscall::record_el0_kill(name, ec, far, far_valid);
+    super::sched::exit()
 }

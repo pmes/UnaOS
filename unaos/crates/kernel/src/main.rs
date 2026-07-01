@@ -138,16 +138,51 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         let online = unaos_kernel::arch::smp::online_secondaries();
         unaos_kernel::arch::sched::start_aps(&online);
 
-        // M6a: the first EL0 (userspace) drop. Copy the baked-in user program into the EL0 window and
-        // make it executable, then spawn it as a user task on a secondary core (NOT the unscheduled
-        // BSP — its scheduler `current` is null). It `eret`s to EL0, does sys_write("hello from EL0")
-        // + sys_exit via `svc`, and the EL1 kernel services both at VBAR_EL1+0x400. A synchronous SVC
-        // IS delivered by QEMU raspi4b, so — unlike the timer/SGI paths — this round trip is fully
-        // QEMU-verifiable, not metal-only.
+        // M6b: EL0 fault isolation + per-page user permissions. Four EL0 programs on one AP (never
+        // the unscheduled BSP): hello (must still work — the code page is EL0-RX), then three that
+        // each provoke a specific fault the kernel must answer by KILLING THE TASK, not halting —
+        // a write to kernel RAM, a write to the now-read-only code page, a jump into the UXN stack
+        // page. A verdict task on a DIFFERENT core (a wedged demo core must still produce a FAIL
+        // line — the guarantee needs >= 2 online APs; the spawn log below discloses the cores, so
+        // a degraded single-AP boot is visible) demands the exact outcome split. Flow: copy the blob (code page still RW) -> warm
+        // the demo core's TLB with the OLD mapping (so a broken broadcast TLBI is deterministically
+        // visible on metal instead of silently passing) -> protect (the kernel's first live
+        // page-table update + TLBI) -> spawn. All synchronous exceptions: fully QEMU-verifiable.
         if let Some(&cpu) = online.first() {
-            let (entry, sp) = unaos_kernel::arch::syscall::setup();
-            unaos_kernel::arch::sched::spawn_user("el0-demo", entry, sp, cpu);
-            serial_println!(":: M6a: EL0 user task spawned on core {} (entry={:#x}) ::", cpu, entry);
+            let demo = unaos_kernel::arch::syscall::setup();
+            unaos_kernel::arch::sched::spawn(
+                "tlb-warm",
+                unaos_kernel::arch::syscall::tlb_warm,
+                0,
+                cpu,
+            );
+            // Bounded BSP wait for the warm-up (~500 ms; QEMU: microseconds). Proceed on timeout —
+            // the demo still runs; only the deterministic TLBI detection is degraded.
+            let t0 = unaos_kernel::arch::timer::cntpct();
+            let budget = unaos_kernel::arch::timer::cntfrq() / 2;
+            while !unaos_kernel::arch::syscall::TLB_WARMED
+                .load(core::sync::atomic::Ordering::Acquire)
+                && unaos_kernel::arch::timer::cntpct().wrapping_sub(t0) < budget
+            {
+                core::hint::spin_loop();
+            }
+            unaos_kernel::arch::syscall::protect();
+            unaos_kernel::arch::sched::spawn_user("el0-hello", demo.hello, demo.sp, cpu);
+            unaos_kernel::arch::sched::spawn_user("el0-wild-write", demo.wild_write, demo.sp, cpu);
+            unaos_kernel::arch::sched::spawn_user("el0-code-write", demo.code_write, demo.sp, cpu);
+            unaos_kernel::arch::sched::spawn_user("el0-stack-exec", demo.stack_exec, demo.sp, cpu);
+            let vcpu = online.get(1).copied().unwrap_or(cpu);
+            unaos_kernel::arch::sched::spawn(
+                "m6b-verdict",
+                unaos_kernel::arch::syscall::verdict,
+                0,
+                vcpu,
+            );
+            serial_println!(
+                ":: M6b: EL0 fault-isolation demo — 4 programs on core {}, verdict on core {} ::",
+                cpu,
+                vcpu
+            );
         }
     }
 

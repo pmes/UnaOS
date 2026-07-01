@@ -83,8 +83,7 @@ static NEXT_TID: AtomicU64 = AtomicU64::new(1);
 pub struct Task {
     #[allow(dead_code)] // read by the future `sched`/`ps` command + join handles
     id: u64,
-    #[allow(dead_code)]
-    name: &'static str,
+    name: &'static str, // read by `current_name` (the M6b EL0 fault-kill log)
     /// `STATE_*`, written by the owning CPU only.
     state: AtomicU8,
     /// Saved stack pointer — the whole callee-saved context `switch_context` built lives on the stack.
@@ -500,6 +499,16 @@ pub fn yield_now() {
         }
     }
     unmask_irq();
+}
+
+/// The name of the task currently dispatched on THIS core, or None outside a scheduled task (the
+/// scheduler/idle context, or the unscheduled BSP). Reads the same `current` slot the trampolines
+/// use; the `&'static str` stays valid even after the Box is reclaimed. Used by the M6b EL0
+/// fault-kill path to label its log line.
+pub fn current_name() -> Option<&'static str> {
+    let cpu = percpu::this_cpu().cpu_index as usize;
+    let raw = SCHED[cpu].current.load(Ordering::Acquire) as *const Task;
+    if raw.is_null() { None } else { Some(unsafe { (*raw).name }) }
 }
 
 /// Terminate the current task: mark it finished and switch to the scheduler for good (which frees

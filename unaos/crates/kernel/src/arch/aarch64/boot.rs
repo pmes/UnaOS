@@ -39,11 +39,19 @@ static mut L1: PageTable = PageTable([0; 512]);
 static mut L2_USER: PageTable = PageTable([0; 512]);
 static mut L3_USER: PageTable = PageTable([0; 512]);
 
-/// The EL0 user window, identity-mapped (VA == PA): the M6a routine is copied to the bottom and the
-/// user stack grows down from the top. 16 KiB in BSS (zeroed by `_start`), 4 KiB-aligned so it maps
-/// to whole L3 pages. Deliberately small — only these pages are ever exposed to EL0.
+/// The EL0 user window, identity-mapped (VA == PA): the user program is copied to the bottom (the
+/// CODE page) and the user stack grows down from the top (the DATA pages). 16 KiB in BSS (zeroed by
+/// `_start`), aligned to its own SIZE so it can never straddle a 16 KiB — a fortiori 2 MiB —
+/// boundary: all four pages are structurally guaranteed to fall inside the single L3_USER-covered
+/// block, whatever BSS layout future milestones produce. Deliberately small — only these pages are
+/// ever exposed to EL0.
+///
+/// M6b permission split: page 0 = CODE (EL0-RX/EL1-RO after `protect_user_code`; RW during the blob
+/// copy), pages 1–3 = DATA/STACK (EL0+EL1 RW, never executable at any EL).
 const USER_REGION_SIZE: usize = 0x4000; // 16 KiB = 4 pages
-#[repr(C, align(4096))]
+/// The CODE page(s) at the bottom of USER_REGION — the only EL0-executable memory in the system.
+pub const USER_CODE_SIZE: usize = 0x1000;
+#[repr(C, align(0x4000))]
 struct UserRegion([u8; USER_REGION_SIZE]);
 static mut USER_REGION: UserRegion = UserRegion([0; USER_REGION_SIZE]);
 
@@ -97,21 +105,31 @@ const fn device_block(pa: u64) -> u64 {
     pa | DESC_XN | DESC_AF | ATTR_DEVICE | DESC_BLOCK
 }
 
-// --- EL0 user-window descriptor bits (M6a). ---
+// --- EL0 user-window descriptor bits (M6a/M6b). ---
 const DESC_TABLE: u64 = 0b11; // L1/L2 table descriptor (points at the next-level table)
 const DESC_PAGE: u64 = 0b11; // L3 page descriptor — note 0b01 is INVALID at L3, unlike a block
-const AP_EL0: u64 = 1 << 6; // AP[6]=1 with AP[7]=0 → EL0+EL1 read-write (AP=0b00 is EL1-only)
+const AP_EL0: u64 = 1 << 6; // AP[7:6]=0b01 → EL0+EL1 read-write (AP=0b00 is EL1-only)
+const AP_RO_ALL: u64 = 0b11 << 6; // AP[7:6]=0b11 → read-only at BOTH EL1 and EL0
 const DESC_PXN: u64 = 1 << 53; // privileged execute-never (EL1 can't execute the page)
+const DESC_UXN: u64 = 1 << 54; // unprivileged execute-never (EL0 can't execute the page)
 
 /// L3 4 KiB page, Normal cacheable, EL1-only (AP=0b00), executable at EL1 — the default identity page.
 const fn ram_page(pa: u64) -> u64 {
     pa | DESC_AF | SH_INNER | ATTR_NORMAL | DESC_PAGE
 }
-/// L3 4 KiB USER page: Normal cacheable, EL0+EL1 read-write (AP=0b01), EL0-executable (UXN=0),
-/// EL1-non-executable (PXN=1). M6a maps the whole `USER_REGION` (code + stack) as one RWX-at-EL0
-/// region; M6b will split code (EL0 RX) from stack (EL0 RW, XN).
-const fn user_page(pa: u64) -> u64 {
-    pa | DESC_PXN | AP_EL0 | DESC_AF | SH_INNER | ATTR_NORMAL | DESC_PAGE
+/// L3 4 KiB USER DATA/STACK page: Normal cacheable, EL0+EL1 read-write (AP=0b01), never executable
+/// at any EL (UXN=1, PXN=1). The build_l1 state of ALL user pages — the CODE page starts this way
+/// too so `syscall::setup` can copy the program in at EL1; `protect_user_code` then flips it.
+const fn user_data_page(pa: u64) -> u64 {
+    pa | DESC_UXN | DESC_PXN | AP_EL0 | DESC_AF | SH_INNER | ATTR_NORMAL | DESC_PAGE
+}
+/// L3 4 KiB USER CODE page (M6b, the final shape written by `protect_user_code`): Normal cacheable,
+/// read-only at BOTH ELs (AP=0b11), EL0-executable (UXN=0), EL1-non-executable (PXN=1). EL0 can run
+/// but not modify its program; EL1 can read it (sys_write's message bytes — fine on the PAN-less
+/// A72) but a kernel write is now a Current-EL permission fault, so any future loader (M6c) must
+/// re-open the page before writing.
+const fn user_code_page(pa: u64) -> u64 {
+    pa | DESC_PXN | AP_RO_ALL | DESC_AF | SH_INNER | ATTR_NORMAL | DESC_PAGE
 }
 /// A table descriptor pointing at the next-level table. Mask to bits[47:12] so no stray bits land in
 /// the table-attribute fields [63:59] (NSTable/APTable/UXNTable/PXNTable); leaving them 0 adds no
@@ -143,6 +161,12 @@ fn build_l1() {
     // USER_REGION must be 4 KiB-aligned (whole L3 pages) and in the first 1 GiB (under L1[0]).
     debug_assert!(user_pa & 0xFFF == 0, "USER_REGION not 4 KiB aligned");
     debug_assert!(user_pa >> 30 == 0, "USER_REGION not in the first 1 GiB");
+    // Structurally guaranteed by align(0x4000) == the region size; documents that every page falls
+    // inside the ONE 2 MiB block L3_USER covers (a straddling tail would silently stay EL1-only).
+    debug_assert!(
+        user_pa >> 21 == (user_pa + USER_REGION_SIZE as u64 - 1) >> 21,
+        "USER_REGION straddles a 2 MiB block"
+    );
     let l2_idx = (user_pa >> 21) as usize; // the 2 MiB block of 0–1 GiB that holds USER_REGION
     let l3_base = (l2_idx as u64) << 21; // that block's base PA
     let user_end = user_pa + USER_REGION_SIZE as u64;
@@ -150,10 +174,13 @@ fn build_l1() {
     unsafe {
         // L3_USER: 512 × 4 KiB pages tiling [l3_base, l3_base + 2 MiB). Pages inside USER_REGION are
         // EL0-accessible; every other page stays EL1-only (identical to the old 1 GiB RAM block).
+        // ALL user pages start as data pages (EL0+EL1 RW, XN) — the CODE page must be EL1-writable
+        // for the blob copy; `protect_user_code` flips it to EL0-RX/EL1-RO afterwards.
         let l3 = &raw mut L3_USER as *mut u64;
         for j in 0..512 {
             let pa = l3_base | ((j as u64) << 12);
-            let desc = if pa >= user_pa && pa < user_end { user_page(pa) } else { ram_page(pa) };
+            let desc =
+                if pa >= user_pa && pa < user_end { user_data_page(pa) } else { ram_page(pa) };
             l3.add(j).write_volatile(desc);
         }
         // L2_USER: 512 × 2 MiB blocks tiling [0, 1 GiB). Block `l2_idx` points at L3_USER; the other
@@ -204,6 +231,74 @@ pub unsafe fn enable_mmu() {
             sctlr = in(reg) SCTLR_EL1_VAL,
             options(nostack, preserves_flags),
         );
+    }
+}
+
+/// M6b: flip the user CODE pages [va, va + len) from their build_l1 state (EL0+EL1 RW, XN — so the
+/// blob could be copied in) to their final EL0-RX / EL1-RO shape (`user_code_page`), and make the
+/// change visible to all four cores. This is the kernel's FIRST live page-table update. The
+/// descriptor rewrite is a permission-only change on a valid same-size leaf (same output address,
+/// attributes, shareability), which DDI0487 (D8.16 "break-before-make") exempts from BBM — a
+/// concurrent walk may transiently use either permission set, harmless because no EL0 task exists
+/// yet (the caller protects strictly before the first `spawn_user`). The maintenance sequence is
+/// the canonical set_pte one (DDI0487 D8.13/D8.14; the walker reads descriptors cache-coherently
+/// under TCR IRGN0/ORGN0=WB, so no DC CVAC is needed):
+///   dsb ishst              descriptor stores visible to every Inner-Shareable table walker
+///   tlbi vaae1is (per pg)  broadcast-invalidate the VA for ALL ASIDs (entries are global, nG=0);
+///                          Xt = VA[55:12] in bits [43:0], upper bits RES0 on Armv8.0 (no FEAT_TTL)
+///   dsb ish                the invalidate has completed on every core in the domain
+///   isb                    this core refetches translation state
+///
+/// Returns the AT-probe verdicts `(el0_read_ok, el1_write_denied)` taken through this core's
+/// post-TLBI translation state: `at s1e0r` must translate (AP=0b11 grants EL0 read) and `at s1e1w`
+/// must fault (PAR_EL1.F=1 — the EL1 write permission the blob copy used is now gone). The calling
+/// BSP is the one core that deterministically walked these pages pre-flip (the copy), so a stale RW
+/// TLB entry here is exactly what a broken TLBI leaves. AT is architecturally allowed to re-walk
+/// instead of consulting the TLB, so a good probe is best-effort evidence — the demo's TLB-warmed
+/// test core is the deterministic detector; a bad probe is always a loud, real failure.
+pub unsafe fn protect_user_code(va: u64, len: usize) -> (bool, bool) {
+    let user_pa = &raw const USER_REGION as u64;
+    debug_assert!(va & 0xFFF == 0, "protect_user_code: unaligned va");
+    debug_assert!(
+        va >= user_pa && va + len as u64 <= user_pa + USER_REGION_SIZE as u64,
+        "protect_user_code: range outside USER_REGION"
+    );
+    unsafe {
+        let l3 = &raw mut L3_USER as *mut u64;
+        let mut page = va;
+        while page < va + len as u64 {
+            l3.add(((page >> 12) & 0x1FF) as usize).write_volatile(user_code_page(page));
+            page += 0x1000;
+        }
+        core::arch::asm!("dsb ishst", options(nostack, preserves_flags));
+        let mut page = va;
+        while page < va + len as u64 {
+            core::arch::asm!("tlbi vaae1is, {}", in(reg) (page >> 12), options(nostack, preserves_flags));
+            page += 0x1000;
+        }
+        core::arch::asm!("dsb ish", "isb", options(nostack, preserves_flags));
+
+        // PAR_EL1 is per-core state clobbered by any AT instruction; the BSP runs this with IRQs
+        // live (250 Hz on metal), so mask across each at->mrs pair rather than resting the probe
+        // on a "no interrupt path ever executes AT" invariant nobody enforces.
+        let (par_r, par_w, daif): (u64, u64, u64);
+        core::arch::asm!(
+            "mrs {daif}, DAIF",
+            "msr DAIFSet, #2",
+            "at s1e0r, {va}",
+            "isb",
+            "mrs {par_r}, PAR_EL1",
+            "at s1e1w, {va}",
+            "isb",
+            "mrs {par_w}, PAR_EL1",
+            "msr DAIF, {daif}",
+            va = in(reg) va,
+            par_r = out(reg) par_r,
+            par_w = out(reg) par_w,
+            daif = out(reg) daif,
+            options(nostack, preserves_flags),
+        );
+        ((par_r & 1) == 0, (par_w & 1) == 1)
     }
 }
 
