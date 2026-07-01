@@ -2362,30 +2362,53 @@ impl XhciController {
             // Only BOOT interfaces accept SET_PROTOCOL: proto 1 (keyboard) and proto 2 (relative
             // boot mouse). The absolute-pointer path (proto 0, e.g. usb-tablet / consumer-control)
             // is NOT a boot interface and would STALL the request, so skip it.
-            let (kbd, kbd_intf, boot_mouse, mouse_intf) = {
+            let (kbd, kbd_intf, boot_mouse, mouse_intf, port) = {
                 let s = &self.slots[slot as usize];
-                (s.is_keyboard, s.keyboard_intf, s.is_mouse && s.mouse_is_relative, s.mouse_intf)
+                (s.is_keyboard, s.keyboard_intf, s.is_mouse && s.mouse_is_relative, s.mouse_intf, s.port_id)
             };
+            // Skip a device that unplugged between enumeration and now (root PORTSC.CCS=0): sending
+            // to a gone device rings a doorbell for a completion that never arrives and burns the
+            // EP0 pump budget, stalling the main loop. (Hub-downstream slots carry port_id 0 -> no
+            // root PORTSC to consult -> treat as present.)
+            if port != 0 && (self.read_portsc(port) & 1) == 0 {
+                serial_println!("xHCI: SET_PROTOCOL(boot) skipped for slot {} (device disconnected).", slot);
+                continue;
+            }
+            // All HID interfaces of one device share a single control endpoint (EP0). A STALL on one
+            // SET_PROTOCOL halts EP0 (we do not Reset-Endpoint-recover it), so any following request
+            // on the same EP0 would just time out — stop after the first failure. Send the boot mouse
+            // FIRST: it is the interface that provably needs the boot layout (a boot keyboard already
+            // reports boot-style, so losing its SET_PROTOCOL is harmless).
+            if boot_mouse && !self.set_hid_boot_protocol(slot, mouse_intf, "boot-mouse") {
+                continue;
+            }
             if kbd {
                 self.set_hid_boot_protocol(slot, kbd_intf, "keyboard");
-            }
-            if boot_mouse {
-                self.set_hid_boot_protocol(slot, mouse_intf, "boot-mouse");
             }
         }
     }
 
     /// HID class request SET_PROTOCOL(boot) for one interface: bmRequestType 0x21 (host->device,
     /// class, interface recipient), bRequest 0x0B, wValue 0 (0 = Boot, 1 = Report), wIndex = the
-    /// interface number, no data stage.
-    fn set_hid_boot_protocol(&mut self, slot: u8, intf: u8, what: &str) {
+    /// interface number, no data stage. Returns true on success (completion code 1); a STALL/other
+    /// code or an EP0 pump timeout returns false (the caller stops touching this device's EP0).
+    fn set_hid_boot_protocol(&mut self, slot: u8, intf: u8, what: &str) -> bool {
         match self.sync_control(slot, 0x21, 0x0B, 0x0000, intf as u16, 0, 0, false) {
-            Ok(1) => serial_println!("xHCI: SET_PROTOCOL(boot) OK for {} (slot {}, iface {}).", what, slot, intf),
-            Ok(code) => serial_println!(
-                "xHCI: SET_PROTOCOL(boot) for {} (slot {}, iface {}) returned code {} (device may lack boot protocol).",
-                what, slot, intf, code
-            ),
-            Err(()) => serial_println!("xHCI: SET_PROTOCOL(boot) for {} (slot {}, iface {}) FAILED (EP0 pump timeout).", what, slot, intf),
+            Ok(1) => {
+                serial_println!("xHCI: SET_PROTOCOL(boot) OK for {} (slot {}, iface {}).", what, slot, intf);
+                true
+            }
+            Ok(code) => {
+                serial_println!(
+                    "xHCI: SET_PROTOCOL(boot) for {} (slot {}, iface {}) returned code {} (device may lack boot protocol / EP0 halted).",
+                    what, slot, intf, code
+                );
+                false
+            }
+            Err(()) => {
+                serial_println!("xHCI: SET_PROTOCOL(boot) for {} (slot {}, iface {}) FAILED (EP0 pump timeout).", what, slot, intf);
+                false
+            }
         }
     }
 
@@ -2601,22 +2624,24 @@ impl XhciController {
             return;
         }
         match self.parse_hid_config(buf) {
-            Some((is_kbd, is_rel, ep_addr, mps, interval)) => {
-                serial_println!("xHCI: HUB downstream slot {} is {} (ep {:#x} mps {})",
+            Some((is_kbd, is_rel, ep_addr, mps, interval, intf_num)) => {
+                serial_println!("xHCI: HUB downstream slot {} is {} (ep {:#x} mps {} iface {})",
                     slot_id,
                     if is_kbd { "KEYBOARD" } else if is_rel { "MOUSE (relative)" } else { "TABLET (absolute)" },
-                    ep_addr, mps);
+                    ep_addr, mps, intf_num);
                 if is_kbd {
                     self.slots[slot_id as usize].is_keyboard = true;
                     self.slots[slot_id as usize].keyboard_ep = ep_addr;
                     self.slots[slot_id as usize].keyboard_mps = mps;
                     self.slots[slot_id as usize].keyboard_interval = interval;
+                    self.slots[slot_id as usize].keyboard_intf = intf_num;
                 } else {
                     self.slots[slot_id as usize].is_mouse = true;
                     self.slots[slot_id as usize].mouse_is_relative = is_rel;
                     self.slots[slot_id as usize].mouse_ep = ep_addr;
                     self.slots[slot_id as usize].mouse_mps = mps;
                     self.slots[slot_id as usize].mouse_interval = interval;
+                    self.slots[slot_id as usize].mouse_intf = intf_num;
                 }
                 // Configure the (single, behind-a-hub) HID endpoint via the shared path.
                 // parse_hid_config surfaces one interface, so this arms exactly that endpoint;
@@ -2628,10 +2653,11 @@ impl XhciController {
     }
 
     /// Parse a configuration descriptor (in `buf`) for the first HID interrupt-IN endpoint.
-    /// Returns (is_keyboard, is_relative_mouse, ep_addr, max_packet_size, interval) or None.
-    /// `is_relative_mouse` = bInterfaceProtocol == 2 (HID boot mouse; relative deltas) vs an
-    /// absolute pointer (protocol 0). Only meaningful when `is_keyboard` is false.
-    fn parse_hid_config(&self, buf: u64) -> Option<(bool, bool, u8, u16, u8)> {
+    /// Returns (is_keyboard, is_relative_mouse, ep_addr, max_packet_size, interval, intf_number) or
+    /// None. `is_relative_mouse` = bInterfaceProtocol == 2 (HID boot mouse; relative deltas) vs an
+    /// absolute pointer (protocol 0). Only meaningful when `is_keyboard` is false. `intf_number` is
+    /// the owning bInterfaceNumber (SET_PROTOCOL wIndex) — must NOT be assumed 0.
+    fn parse_hid_config(&self, buf: u64) -> Option<(bool, bool, u8, u16, u8, u8)> {
         unsafe {
             let p = buf as *const u8;
             let total = (((*p.add(2) as usize) | ((*p.add(3) as usize) << 8))).min(64);
@@ -2639,13 +2665,15 @@ impl XhciController {
             let mut in_hid = false;
             let mut is_kbd = false;
             let mut is_rel = false;
+            let mut intf_num = 0u8;
             while off + 2 <= total {
                 let len = *p.add(off) as usize;
                 let dtype = *p.add(off + 1);
                 if len == 0 { break; }
                 if dtype == 0x04 && off + 8 <= total {
-                    // Interface descriptor: class at +5, protocol at +7. HID = 0x03;
+                    // Interface descriptor: number at +2, class at +5, protocol at +7. HID = 0x03;
                     // proto 1 = boot keyboard, proto 2 = boot mouse (relative).
+                    intf_num = *p.add(off + 2);
                     in_hid = *p.add(off + 5) == 0x03;
                     is_kbd = *p.add(off + 7) == 1;
                     is_rel = *p.add(off + 7) == 2;
@@ -2655,7 +2683,7 @@ impl XhciController {
                     let attr = *p.add(off + 3);
                     if (ep_addr & 0x80) != 0 && (attr & 0x3) == 3 {
                         let mps = ((*p.add(off + 4) as u16) | ((*p.add(off + 5) as u16) << 8)) & 0x7FF;
-                        return Some((is_kbd, is_rel, ep_addr, mps, *p.add(off + 6)));
+                        return Some((is_kbd, is_rel, ep_addr, mps, *p.add(off + 6), intf_num));
                     }
                 }
                 off += len;
