@@ -1550,6 +1550,18 @@ impl XhciController {
                 }
             }
 
+            // Settle before sampling CCS. A boot-owned USB3 device whose SuperSpeed link dropped on
+            // the controller reset (HCRST) needs time to re-train (RxDetect -> Polling -> U0) after
+            // its port is powered; the old code read CCS immediately, so a still-training SS link was
+            // missed and the device never queued/enumerated. USB2 keyboard/mouse re-detect fast
+            // enough to be caught without this — a real USB3 stick was not. Wall-clock, ~0.5 s.
+            let settle_start = crate::arch::now_cycles();
+            let settle = hw_wait_budget() / 4;
+            while crate::arch::now_cycles().wrapping_sub(settle_start) < settle {
+                core::hint::spin_loop();
+            }
+            serial_println!("xHCI: port settle complete before CCS scan");
+
             // Collect every connected port and enumerate them ONE AT A TIME. Push in
             // reverse so the queue pops in ascending port order.
             self.ports_to_enumerate.clear();
@@ -2275,18 +2287,28 @@ impl XhciController {
         fn speed_name(s: u32) -> &'static str {
             match s { 1 => "FS", 2 => "LS", 3 => "HS", 4 => "SS", 0 => "-", _ => "?" }
         }
+        // Port Link State — for an empty USB3 SuperSpeed port this shows why a device isn't seen
+        // (RxDetect / Polling / Disabled / Inactive) vs an idle USB2 port.
+        fn pls_name(p: u32) -> &'static str {
+            match p {
+                0 => "U0", 1 => "U1", 2 => "U2", 3 => "U3", 4 => "Disabled", 5 => "RxDetect",
+                6 => "Inactive", 7 => "Polling", 8 => "Recovery", 9 => "HotReset",
+                10 => "Compliance", 11 => "TestMode", 15 => "Resume", _ => "?",
+            }
+        }
         let mut out = Vec::new();
         out.push(alloc::format!(
             "xHCI ports={} storage_slot={} enum_active={} queued={} note='{}'",
             self.max_ports, self.storage_slot, self.enum_active,
             self.ports_to_enumerate.len(), self.storage_note));
+        // Show ALL ports (not just connected ones), so an empty-but-present SuperSpeed port's link
+        // state is visible — the whole point when a USB3 device isn't showing up as connected.
         for p in 1..=self.max_ports {
             let s = self.read_portsc(p);
-            // Show any port that is connected (CCS) or enabled (PED) — the rest are empty.
-            if (s & 1) == 0 && (s & 2) == 0 { continue; }
             out.push(alloc::format!(
-                "  port {}: {:#010x} CCS={} PED={} PR={} PLS={} speed={}({})",
-                p, s, s & 1, (s >> 1) & 1, (s >> 4) & 1, (s >> 5) & 0xF,
+                "  port {}: {:#010x} CCS={} PED={} PP={} PR={} PLS={}({}) sp={}({})",
+                p, s, s & 1, (s >> 1) & 1, (s >> 9) & 1, (s >> 4) & 1,
+                (s >> 5) & 0xF, pls_name((s >> 5) & 0xF),
                 (s >> 10) & 0xF, speed_name((s >> 10) & 0xF)));
         }
         for (i, slot) in self.slots.iter().enumerate() {
