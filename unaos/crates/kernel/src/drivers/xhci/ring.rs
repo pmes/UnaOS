@@ -140,4 +140,46 @@ impl TransferRing {
     pub fn get_ptr(&self) -> u64 {
         self.trbs as u64
     }
+
+    /// Ring index of the TRB at physical address `phys`, if it lies inside this ring.
+    fn index_of(&self, phys: u64) -> Option<usize> {
+        let base = self.trbs as u64;
+        if phys < base {
+            return None;
+        }
+        let off = phys - base;
+        let idx = (off / 16) as usize;
+        if off % 16 != 0 || idx >= self.num_trbs {
+            return None;
+        }
+        Some(idx)
+    }
+
+    /// The cycle bit currently stored in the TRB at `phys` (1 if out of range — a safe
+    /// default for composing a CRCR RCS). Used by the command-abort handshake.
+    pub fn trb_cycle(&self, phys: u64) -> u32 {
+        match self.index_of(phys) {
+            Some(idx) => unsafe { core::ptr::read_volatile(self.trbs.add(idx)).control & 1 },
+            None => 1,
+        }
+    }
+
+    /// Overwrite the TRB at `phys` IN PLACE with a Command No-Op (TRB type 23), preserving
+    /// its cycle bit. Command-abort recovery: after CRCR.CA stops the ring, the controller's
+    /// dequeue pointer still references the aborted command, and restarting the ring would
+    /// re-execute it — Linux's trb_to_noop does exactly this defusal. Returns false if
+    /// `phys` is not inside this ring.
+    pub fn replace_with_noop(&mut self, phys: u64) -> bool {
+        let idx = match self.index_of(phys) {
+            Some(i) => i,
+            None => return false,
+        };
+        unsafe {
+            let p = self.trbs.add(idx);
+            let cycle = core::ptr::read_volatile(p).control & 1;
+            core::ptr::write_volatile(p, Trb { parameter: 0, status: 0, control: (23 << 10) | cycle });
+            core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+        }
+        true
+    }
 }
