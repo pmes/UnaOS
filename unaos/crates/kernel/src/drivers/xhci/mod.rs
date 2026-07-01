@@ -611,6 +611,45 @@ impl DeviceSlot {
             bulk_out_ep: 0,
         }
     }
+
+    /// Clear the device-personality fields so a REUSED slot id (a later ENABLE_SLOT may hand out
+    /// the same id after DISABLE_SLOT) cannot inherit a dead device's state machine — a stale
+    /// `keyboard_state`/`mouse_state` would misroute the new device's EP0 completions. The
+    /// transfer rings, DMA buffers and contexts are intentionally LEAKED (forget / pointer drop
+    /// without free): the controller may still reference them until its DISABLE_SLOT completes,
+    /// so freeing invites use-after-free DMA. Recovery is rare; the leak is bounded and safe.
+    /// `descriptor_buffer` is kept — it is allocated once per slot and reused.
+    pub fn reset_soft_state(&mut self) {
+        self.active = false;
+        self.port_id = 0;
+        if let Some(r) = self.ep0_ring.take() { core::mem::forget(r); }
+        if let Some(r) = self.bulk_in_ring.take() { core::mem::forget(r); }
+        if let Some(r) = self.bulk_out_ring.take() { core::mem::forget(r); }
+        if let Some(r) = self.keyboard_ring.take() { core::mem::forget(r); }
+        if let Some(r) = self.mouse_ring.take() { core::mem::forget(r); }
+        self.input_context = core::ptr::null_mut();
+        self.output_context = core::ptr::null_mut();
+        self.data_buffer = None;
+        self.mouse_data_buffer = None;
+        self.cbw_buffer = None;
+        self.csw_buffer = None;
+        self.scsi_data_buffer = None;
+        self.is_mouse = false;
+        self.mouse_is_relative = false;
+        self.mouse_ep = 0;
+        self.mouse_mps = 0;
+        self.mouse_interval = 0;
+        self.mouse_intf = 0;
+        self.mouse_state = 0;
+        self.is_keyboard = false;
+        self.keyboard_ep = 0;
+        self.keyboard_mps = 0;
+        self.keyboard_interval = 0;
+        self.keyboard_intf = 0;
+        self.keyboard_state = 0;
+        self.bulk_in_ep = 0;
+        self.bulk_out_ep = 0;
+    }
 }
 
 pub struct XhciController {
@@ -687,6 +726,9 @@ pub struct XhciController {
     last_stall: Option<EnumStall>,
     /// Total enumeration stalls since boot.
     stall_count: u32,
+    /// Slots torn down by enumeration recovery, awaiting a (main-loop, synchronous)
+    /// DISABLE_SLOT — the command must not be issued from the event handler.
+    slots_to_disable: Vec<u8>,
 }
 
 /// A recorded enumeration stall: which port died, at which stage, why (completion error /
@@ -760,6 +802,7 @@ impl XhciController {
             enum_resets: 0,
             last_stall: None,
             stall_count: 0,
+            slots_to_disable: Vec::new(),
         }
     }
 
@@ -1000,15 +1043,26 @@ impl XhciController {
                         serial_println!("xHCI: [Event] Command Completion. Ptr={:#x}, Slot={}, Code={}",
                             command_ptr, slot_id, completion_code);
 
+                        // Does this completion answer the root enumeration FSM's own in-flight
+                        // command? Matched by TRB address — a hub-path async Configure-Endpoint
+                        // or a stale/late completion can no longer alias into the FSM's
+                        // positional guesswork (pop-a-pending-port / assume-address-finished).
+                        let ours = self.enum_cmd_phys != 0 && command_ptr == self.enum_cmd_phys;
+                        if ours {
+                            self.enum_cmd_phys = 0; // consumed (success or failure)
+                        }
+
                         // Completion Code 1 = Success
                         if completion_code == 1 {
                             serial_println!("xHCI: >>> COMMAND SUCCESS <<<");
                             if slot_id > 0 {
                                 serial_println!("xHCI: SLOT ID ALLOCATED: {}", slot_id);
 
-                                // UNA-18-ADDRESS: If we have a pending port ID, this is likely the result of Enable Slot.
+                                // UNA-18-ADDRESS: our ENABLE_SLOT completed — the controller
+                                // allocated `slot_id` for the port we are enumerating.
                                 // Proceed to Address Device.
-                                if let Some(port_to_map) = self.pending_ports.pop() {
+                                if ours && !self.pending_ports.is_empty() {
+                                    let port_to_map = self.pending_ports.pop().unwrap();
                                     serial_println!("xHCI: Proceeding to Address Device (Slot {}, Port {})...", slot_id, port_to_map);
                                     self.address_device(slot_id as u8, port_to_map);
                                 }
@@ -1028,8 +1082,10 @@ impl XhciController {
                                 else if self.slots[slot_id as usize].mouse_state == 1
                                     || self.slots[slot_id as usize].keyboard_state == 1 {
                                     // The single Configure-Endpoint that programmed this device's HID
-                                    // interface(s) completed. Advance whichever endpoints it covered,
-                                    // then issue ONE device-level SET_CONFIGURATION for the whole device.
+                                    // interface(s) completed (root FSM or hub bring-up — keyed on the
+                                    // slot's own state, not on enum_cmd_phys, so the hub path keeps
+                                    // working). Advance whichever endpoints it covered, then issue
+                                    // ONE device-level SET_CONFIGURATION for the whole device.
                                     serial_println!("xHCI: HID Endpoints Configured (Slot {}). Proceeding to Set Configuration...", slot_id);
                                     if self.slots[slot_id as usize].keyboard_state == 1 {
                                         self.slots[slot_id as usize].keyboard_state = 2;
@@ -1039,10 +1095,24 @@ impl XhciController {
                                     }
                                     self.send_set_configuration(slot_id as u8, 1);
                                 }
+                                else if ours {
+                                    // UNA-19-IDENTITY: our ADDRESS_DEVICE finished. Guard against a
+                                    // slot recovery already tore down (late completion): touching a
+                                    // dead slot's EP0 ring would be use-after-dispose.
+                                    if self.slots[slot_id as usize].active
+                                        && self.slots[slot_id as usize].ep0_ring.is_some() {
+                                        serial_println!("xHCI: >>> SLOT {} ENABLED & ADDRESSED <<<", slot_id);
+                                        self.request_device_descriptor(slot_id as u8);
+                                    } else {
+                                        serial_println!("xHCI: completion for disposed slot {}; ignoring.", slot_id);
+                                    }
+                                }
                                 else {
-                                    // UNA-19-IDENTITY: If pending_ports is empty, we assume Address Device just finished.
-                                    serial_println!("xHCI: >>> SLOT {} ENABLED & ADDRESSED <<<", slot_id);
-                                    self.request_device_descriptor(slot_id as u8);
+                                    // Not our tracked command, no state machine claims it: a stale
+                                    // completion (e.g. from a port recovery already gave up on).
+                                    // Before enum_cmd_phys existed this fell into the positional
+                                    // dispatch above and corrupted the FSM.
+                                    serial_println!("xHCI: untracked command completion (slot {}); ignoring.", slot_id);
                                 }
                             }
                         } else {
@@ -1050,6 +1120,20 @@ impl XhciController {
                             // UNA-19-HALT: Stop on Code 5
                             if completion_code == 5 {
                                 serial_println!("xHCI: CRITICAL FAILURE: TRB ERROR (CODE 5).");
+                            }
+                            // Command Ring Stopped (25): posted after a command abort (watchdog)
+                            // once the ring halts. Restart command processing; the ring resumes
+                            // after the aborted entry.
+                            if completion_code == 25 {
+                                serial_println!("xHCI: command ring stopped; restarting (doorbell 0).");
+                                self.ring_doorbell(0, 0);
+                            }
+                            // THE deadlock fix: a failed enum command (ADDRESS_DEVICE completing
+                            // with USB Transaction Error on silicon, an aborted command, ...) used
+                            // to be logged and dropped, leaving enum_active=true and every queued
+                            // port starved — the exact state photographed on the rMBP. Recover.
+                            if ours {
+                                self.recover_enumeration("command-failed", completion_code as u8);
                             }
                         }
                     },
@@ -1137,6 +1221,47 @@ impl XhciController {
                                     }
                                 }
                             }
+                        }
+
+                        // Bulk-Only Transport routing: if a BOT transaction is in flight on this
+                        // slot's bulk endpoints, hand the completion to the synchronous pump.
+                        // The CSW is matched by its TRB address so it is never confused with a
+                        // data-stage event; any ERROR completion also finishes the transaction —
+                        // which is why this claim must sit BEFORE the success-only gate below
+                        // (it used to live inside it, so a bulk STALL was never delivered to the
+                        // pump and every stalled SCSI command burned the full pump timeout).
+                        if endpoint_id > 1 && slot_id > 0 {
+                            if let Some(p) = self.bot_pending {
+                                if p.slot_id == slot_id as u8
+                                    && (endpoint_id as u8 == p.in_dci || endpoint_id as u8 == p.out_dci)
+                                {
+                                    let is_match = param == p.wait_trb_phys;
+                                    let is_error = completion_code != 1 && completion_code != 13;
+                                    if is_match || is_error {
+                                        if let Some(bp) = self.bot_pending.as_mut() {
+                                            bp.completion_code = completion_code as u8;
+                                            bp.done = true;
+                                        }
+                                        return; // consumed by the BOT pump
+                                    }
+                                }
+                            }
+                        }
+
+                        // An EP0 transfer for the port being ENUMERATED failed (STALL on a
+                        // descriptor fetch / SET_CONFIGURATION, babble, transaction error...).
+                        // This was silently dropped before — the enumeration FSM then deadlocked
+                        // exactly like a failed command. Recover (retry the port, else advance).
+                        if completion_code != 1 && completion_code != 13
+                            && endpoint_id == 1 && slot_id > 0
+                            && self.enumerating_port != 0
+                            && self.slots[slot_id as usize].port_id == self.enumerating_port
+                        {
+                            serial_println!(
+                                "xHCI: EP0 transfer FAILED (slot {}, code {}) during enumeration.",
+                                slot_id, completion_code);
+                            self.recover_enumeration("ep0-transfer-failed", completion_code as u8);
+                            return;
                         }
 
                         // UNA-19-REVEAL: If success or short packet, check buffer
@@ -1362,26 +1487,8 @@ impl XhciController {
                                 }
                                 }
                             } else if endpoint_id > 1 && slot_id > 0 { // Non-EP0 Transfer Event
-                                // Bulk-Only Transport routing: if a BOT transaction is in
-                                // flight on this slot's bulk endpoints, hand the completion to
-                                // the synchronous pump. The CSW is matched by its TRB address so
-                                // it is never confused with a data-stage event; any error
-                                // completion also finishes the transaction (for stall handling).
-                                if let Some(p) = self.bot_pending {
-                                    if p.slot_id == slot_id as u8
-                                        && (endpoint_id as u8 == p.in_dci || endpoint_id as u8 == p.out_dci)
-                                    {
-                                        let is_match = param == p.wait_trb_phys;
-                                        let is_error = completion_code != 1 && completion_code != 13;
-                                        if is_match || is_error {
-                                            if let Some(bp) = self.bot_pending.as_mut() {
-                                                bp.completion_code = completion_code as u8;
-                                                bp.done = true;
-                                            }
-                                        }
-                                        return; // consumed by the BOT pump
-                                    }
-                                }
+                                // (BOT completions were already claimed above, before the
+                                // success gate, so only HID interrupt reads arrive here.)
                                 unsafe {
                                     let slot = &self.slots[slot_id as usize];
 
@@ -1787,6 +1894,136 @@ impl XhciController {
         self.enum_resets = 0;
         self.set_enum_stage("idle");
         serial_println!("xHCI: Port enumeration queue drained.");
+    }
+
+    /// Unwedge and advance the enumeration FSM after the current port's enumeration FAILED —
+    /// a command completed with an error, an EP0 transfer errored/STALLed, or the watchdog
+    /// expired with no completion at all. Before this existed, ANY of those silently deadlocked
+    /// the whole queue (`enum_active=true queued=N` forever — the exact state photographed on
+    /// the rMBP when the SuperSpeed SD reader stalls). Records the stall for `usbinfo`, cleans
+    /// every piece of in-flight bookkeeping so late completions can't alias into the FSM,
+    /// disposes any half-built slot, then either RETRIES the port with a fresh reset (bounded)
+    /// or gives up and starts the next queued port.
+    ///
+    /// Safe from both event context and the main loop: it issues no synchronous commands
+    /// (slot disposal is deferred to `service_slot_disposal`) and only writes PORTSC.
+    fn recover_enumeration(&mut self, why: &'static str, code: u8) {
+        let port = self.enumerating_port;
+        if port == 0 {
+            return;
+        }
+        let portsc = self.read_portsc(port);
+        serial_println!(
+            "xHCI: !!! ENUM RECOVERY: port {} failed at '{}' ({}, code {}) PORTSC={:#010x} !!!",
+            port, self.enum_stage, why, code, portsc);
+        self.last_stall = Some(EnumStall { port, stage: self.enum_stage, why, code, portsc });
+        self.stall_count += 1;
+
+        // Clean the in-flight bookkeeping.
+        self.pending_ports.retain(|p| *p != port);
+        self.enum_cmd_phys = 0;
+
+        // Dispose any slot allocated for this port. Mid-enumeration it is by definition not
+        // fully configured — but never touch a published, ready storage slot (paranoia guard).
+        for i in 1..self.slots.len() {
+            if !self.slots[i].active || self.slots[i].port_id != port {
+                continue;
+            }
+            if self.storage_slot == i as u8 && self.storage_note == "ready" {
+                continue;
+            }
+            if self.configuring_slot == i as u8 {
+                self.configuring_slot = 0;
+            }
+            if self.storage_slot == i as u8 {
+                self.storage_slot = 0;
+                self.storage_pending_bringup = false;
+                self.storage_note = "storage slot disposed after an enumeration stall";
+            }
+            self.hid_setproto_pending.retain(|s| *s != i as u8);
+            self.hubs_pending.retain(|s| *s != i as u8);
+            self.slots[i].reset_soft_state();
+            if !self.slots_to_disable.contains(&(i as u8)) {
+                self.slots_to_disable.push(i as u8);
+            }
+            serial_println!("xHCI: [recovery] slot {} (port {}) queued for DISABLE_SLOT.", i, port);
+        }
+
+        // Retry with a fresh reset (bounded), or give up and advance the queue. A device that
+        // vanished (CCS=0) is not retried; if it re-trains later, CSC hot-plug re-queues it.
+        if (portsc & 1) != 0 && self.enum_resets < 3 {
+            self.enum_resets += 1;
+            serial_println!(
+                "xHCI: [recovery] retrying port {} (reset {} of 3).", port, self.enum_resets);
+            self.issue_enum_reset(port);
+        } else {
+            serial_println!("xHCI: [recovery] giving up on port {}; advancing the queue.", port);
+            self.enumerating_port = 0;
+            self.start_next_port();
+        }
+    }
+
+    /// Reset `port_id` (again) on behalf of the enumeration FSM and rewind the stage tracking.
+    fn issue_enum_reset(&mut self, port: u8) {
+        self.enum_cmd_phys = 0;
+        self.set_enum_stage("await-reset");
+        self.reset_port(port);
+    }
+
+    /// Main-loop hook: DISABLE_SLOT any slots torn down by enumeration recovery (synchronous —
+    /// must run in the safe polled context, like storage/hub bring-up). A failure is logged and
+    /// the slot id dropped anyway: the slot then stays leaked inside the controller, which is
+    /// harmless (MaxSlots is 32+ and recovery is rare).
+    pub fn service_slot_disposal(&mut self) {
+        while let Some(slot) = self.slots_to_disable.pop() {
+            let trb = Trb {
+                parameter: 0,
+                status: 0,
+                control: (10 << 10) | ((slot as u32) << 24), // TRB type 10 = Disable Slot
+            };
+            match self.run_command_sync(trb) {
+                Ok((code, _)) => serial_println!("xHCI: DISABLE_SLOT slot {} -> code {}.", slot, code),
+                Err(()) => serial_println!("xHCI: DISABLE_SLOT slot {} timed out.", slot),
+            }
+            unsafe {
+                if !self.dcbaap.is_null() {
+                    *self.dcbaap.add(slot as usize) = 0;
+                }
+            }
+        }
+    }
+
+    /// Main-loop hook: bounded watchdog on the root enumeration FSM. Every stage transition
+    /// stamps `enum_stage_set_at`; if the FSM then sits in one stage past the deadline (~1 s —
+    /// each real step completes in milliseconds), the port is declared stalled and recovered.
+    /// Before this, `enable_slot`/`address_device`/descriptor fetches were fire-and-forget: one
+    /// device that never answered deadlocked every port queued behind it, invisibly.
+    pub fn service_enum_watchdog(&mut self) {
+        if !self.enum_active || self.enumerating_port == 0 {
+            return;
+        }
+        let budget = hw_wait_budget() / 2;
+        if crate::arch::now_cycles().wrapping_sub(self.enum_stage_set_at) < budget {
+            return;
+        }
+        serial_println!(
+            "xHCI: WATCHDOG: port {} stuck at '{}' (cmd={:#x}); recovering.",
+            self.enumerating_port, self.enum_stage, self.enum_cmd_phys);
+        // If an enum command is in flight and never completed, the command ring itself may be
+        // wedged behind it (the xHC executes commands in order). Abort it: set CRCR.CA (bit 2);
+        // the xHC terminates the stuck command (Command Completion, code 24 "Command Aborted"),
+        // stops the ring (code 25 "Command Ring Stopped" event), and the failure dispatch
+        // restarts the ring via the doorbell. Our enum_cmd_phys is cleared by the recovery
+        // below, so those late events are logged-and-ignored rather than double-recovered.
+        if self.enum_cmd_phys != 0 {
+            unsafe {
+                let crcr_ptr = (self.op_base + 0x18) as *mut u64;
+                let crcr = core::ptr::read_volatile(crcr_ptr);
+                core::ptr::write_volatile(crcr_ptr, crcr | (1 << 2));
+            }
+            serial_println!("xHCI: WATCHDOG: command abort (CRCR.CA) issued.");
+        }
+        self.recover_enumeration("watchdog-timeout", 0);
     }
 
     /// Issue a USB hot reset on `port_id` with a clean PORTSC write: set PR (bit 4) and keep PP

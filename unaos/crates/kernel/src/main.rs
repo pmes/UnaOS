@@ -195,6 +195,8 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
                 xhci.service_storage();
                 xhci.service_hubs();
                 xhci.service_hid_setproto();
+                xhci.service_slot_disposal();
+                xhci.service_enum_watchdog();
             }
             // Once storage is up, mount + log the FAT volume geometry (one-shot).
             unaos_kernel::fs::fat::probe_once();
@@ -258,6 +260,8 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
             xhci.service_storage();
             xhci.service_hubs();
             xhci.service_hid_setproto();
+            xhci.service_slot_disposal();
+            xhci.service_enum_watchdog();
         }
 
         // Once storage is up, mount + log the FAT volume geometry (one-shot). Runs with the xHCI
