@@ -1969,6 +1969,14 @@ impl XhciController {
     /// (not just the bits we act on) is load-bearing: see PORT_CHANGE_BITS — one latched
     /// OCC/PLC/CEC starves all future events for the port on real hardware.
     fn handle_port_status(&mut self, port_id: u8) {
+        // Bounds: the id may come straight from a Port Status Change event TRB (controller-
+        // provided, same trust model as the slot-id guards). port 0 would underflow the
+        // PORTSC offset math AND collide with the "no port" sentinel in enumerating_port;
+        // port > MaxPorts would read/W1C-write MMIO beyond the port register array.
+        if port_id == 0 || port_id > self.max_ports {
+            serial_println!("xHCI: port status change with bogus port {}; ignoring.", port_id);
+            return;
+        }
         let portsc = self.read_portsc(port_id);
         let changes = portsc & PORT_CHANGE_BITS;
         if changes == 0 {
@@ -2235,6 +2243,14 @@ impl XhciController {
         }
         let work = core::mem::take(&mut self.slots_to_disable);
         for (slot, attempts) in work {
+            // The slot id may have been re-issued to a LIVE device since this entry was
+            // queued (a timed-out DISABLE_SLOT can still have executed in hardware, freeing
+            // the id for the retry enumeration). Never disable a slot that is active again;
+            // if it truly needs tearing down, recovery will re-queue it.
+            if self.slots[slot as usize].active {
+                serial_println!("xHCI: DISABLE_SLOT slot {} skipped (id re-allocated and live).", slot);
+                continue;
+            }
             let trb = Trb {
                 parameter: 0,
                 status: 0,
@@ -2287,7 +2303,11 @@ impl XhciController {
 
         match self.enum_stage {
             "reset-settle" => {
-                if age >= 50 * per_ms {
+                if age >= hw_wait_budget() {
+                    // Backstop: nothing should sit here (enable_slot either advances the
+                    // stage or recovers on failure) — but NO stage may age unwatched.
+                    self.recover_enumeration("watchdog-timeout", 0);
+                } else if age >= 50 * per_ms {
                     serial_println!("xHCI: [enum port {}] settle done; requesting slot.", port);
                     self.enable_slot(port);
                 }
@@ -2329,7 +2349,13 @@ impl XhciController {
                     self.recover_enumeration("watchdog-timeout", 0);
                 }
             }
-            _ => {}
+            // Invariant: with enum_active set, EVERY stage has a deadline. An unknown stage
+            // here would be a bug — don't let it become an unwatchable parked state.
+            _ => {
+                if age >= hw_wait_budget() {
+                    self.recover_enumeration("watchdog-timeout", 0);
+                }
+            }
         }
     }
 
@@ -2492,7 +2518,6 @@ impl XhciController {
 
     pub fn enable_slot(&mut self, port_id: u8) {
         serial_println!("xHCI: Sending ENABLE_SLOT command for Port {}...", port_id);
-        self.pending_ports.push(port_id);
 
         // TRB Type 9 = Enable Slot
         // Control: (Type 9 << 10)
@@ -2506,12 +2531,23 @@ impl XhciController {
         match self.send_command(trb) {
             // ENABLE_SLOT is issued only by the root enumeration FSM (the hub path uses the
             // sync-command primitive), so track it unconditionally — there is no slot id yet
-            // to route through track_enum_cmd.
+            // to route through track_enum_cmd. pending_ports is pushed ONLY on a successful
+            // send: this is called every service_enum tick from "reset-settle", so a
+            // persistent send failure (dead/stopped command ring) would otherwise push one
+            // stale entry per main-loop iteration forever.
             Ok(phys) => {
+                self.pending_ports.push(port_id);
                 self.enum_cmd_phys = phys;
                 self.set_enum_stage("enable-slot");
             }
-            Err(e) => serial_println!("xHCI: Failed to send Enable Slot command: {}", e),
+            Err(e) => {
+                // A refused/failed send means the command ring is unusable — treat it as an
+                // enumeration stall NOW (bounded retry, then give-up) rather than leaving
+                // the FSM parked in a stage the watchdog can't see out of.
+                serial_println!("xHCI: Failed to send Enable Slot command: {}", e);
+                self.recover_enumeration("command-send-failed", 0);
+                return;
+            }
         }
 
         // Metal diagnostic (usbdebug only): a healthy controller consumes ENABLE_SLOT in
@@ -2628,7 +2664,10 @@ impl XhciController {
             match self.send_command(trb) {
                 // Root-FSM-only (the hub path addresses via run_command_sync).
                 Ok(phys) => self.track_enum_cmd(phys, "address-device"),
-                Err(e) => serial_println!("xHCI: Failed to send Address Device command: {}", e),
+                Err(e) => {
+                    serial_println!("xHCI: Failed to send Address Device command: {}", e);
+                    self.recover_enumeration("command-send-failed", 0);
+                }
             }
             // NOTE: do NOT set `configuring_slot` here. That field marks an in-flight
             // Configure-Endpoint command; setting it on Address Device made the Address
@@ -2717,7 +2756,10 @@ impl XhciController {
             match self.send_command(trb) {
                 // Root-FSM-only (storage bulk endpoints; no storage-behind-hub support).
                 Ok(phys) => self.track_enum_cmd(phys, "configure-eps"),
-                Err(e) => serial_println!("xHCI: Failed to send Configure Endpoint command: {}", e),
+                Err(e) => {
+                    serial_println!("xHCI: Failed to send Configure Endpoint command: {}", e);
+                    self.recover_enumeration("command-send-failed", 0);
+                }
             }
         }
     }
@@ -3926,7 +3968,12 @@ impl XhciController {
                     self.track_enum_cmd(phys, "configure-eps");
                 }
             }
-            Err(e) => serial_println!("xHCI: Failed to send HID Configure Endpoint command: {}", e),
+            Err(e) => {
+                serial_println!("xHCI: Failed to send HID Configure Endpoint command: {}", e);
+                if root_fsm {
+                    self.recover_enumeration("command-send-failed", 0);
+                }
+            }
         }
     }
 
