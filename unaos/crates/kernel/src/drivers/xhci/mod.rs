@@ -1653,14 +1653,29 @@ impl XhciController {
             // 3a. INPUT CONTROL CONTEXT (Offset 0x00)
             base_ptr.add(1).write_volatile(3); // Enable Slot (Bit 0) and EP0 (Bit 1)
 
-            // 3b. SLOT CONTEXT (Offset 0x20 -> Index 8 in u32)
+            // 3b. SLOT CONTEXT (Offset 0x20 -> Index 8 in u32).
+            // Read the port's speed (PORTSC bits 13:10 = Port Speed ID: 1=FS 2=LS 3=HS 4=SS),
+            // program it into the slot context, and pick the matching EP0 Max Packet Size. Real
+            // xHCI ENFORCES the EP0 MPS: a Low-Speed keyboard (MPS0=8) with the old hardcoded MPS=64
+            // truncates every control read at the first 8-byte packet (garbage vid/pid, empty config
+            // descriptor walk, no keyboard) — QEMU is lenient about this, which is why 64 "worked"
+            // only in emulation. Mirrors the downstream (hub) path.
+            let speed = (self.read_portsc(port_id) >> 10) & 0xF;
+            let mps0: u32 = match speed {
+                2 => 8,   // Low Speed  (bMaxPacketSize0 always 8)
+                3 => 64,  // High Speed (always 64)
+                4 => 512, // SuperSpeed (always 512)
+                _ => 8,   // Full Speed / unknown: 8 is always valid for FS control transfers (a
+                          // larger FS MPS0 would be refined from bMaxPacketSize0 — a follow-up).
+            };
+            serial_println!("xHCI: Port {} speed {} -> EP0 MPS {}", port_id, speed, mps0);
             let slot_ctx_ptr = base_ptr.add(8);
-            slot_ctx_ptr.add(0).write_volatile(1 << 27); // Context Entries (Bits 27-31) = 1
+            slot_ctx_ptr.add(0).write_volatile((1 << 27) | ((speed & 0xF) << 20)); // Context Entries=1 + Speed
             slot_ctx_ptr.add(1).write_volatile((port_id as u32) << 16); // Root Hub Port Number
 
             // 3c. ENDPOINT 0 CONTEXT (Offset 0x40 -> Index 16 in u32)
             let ep0_ctx_ptr = base_ptr.add(16);
-            ep0_ctx_ptr.add(1).write_volatile((4 << 3) | (3 << 1) | (64 << 16)); // EP Type = 4, CErr = 3, MPS = 64
+            ep0_ctx_ptr.add(1).write_volatile((4 << 3) | (3 << 1) | (mps0 << 16)); // EP Type = 4, CErr = 3, MPS
             ep0_ctx_ptr.add(2).write_volatile((ep0_ring_phys as u32) | 1); // Bit 0 must match Cycle Bit (1)
             ep0_ctx_ptr.add(3).write_volatile((ep0_ring_phys >> 32) as u32);
             ep0_ctx_ptr.add(4).write_volatile(8); // Average TRB Length = 8
