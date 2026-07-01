@@ -296,6 +296,16 @@ pub fn init(base_address: u64) {
 
 pub static XHCI_CONTROLLER: spin::Mutex<Option<XhciController>> = spin::Mutex::new(None);
 
+/// Human-readable mass-storage enumeration/bring-up state, for the shell `diskinfo` command when no
+/// block device is published. Lets a metal storage failure be diagnosed from the interactive shell
+/// (the boot enumeration log is wiped once the GUI takes over on the serial-less rMBP).
+pub fn storage_diag() -> alloc::string::String {
+    match &*XHCI_CONTROLLER.lock() {
+        Some(x) => alloc::format!("storage: slot {} — {}", x.storage_slot, x.storage_note),
+        None => alloc::string::String::from("storage: xHCI not initialised (USB bring-up skipped?)"),
+    }
+}
+
 pub static COMMAND_RING: Mutex<Option<TransferRing>> = Mutex::new(None);
 pub static EVENT_RING: Mutex<Option<EventRing>> = Mutex::new(None);
 
@@ -541,6 +551,11 @@ pub struct XhciController {
     /// Set once the storage bulk endpoints are configured; the main loop performs the
     /// (synchronous) SCSI bring-up + first read in a safe, non-event context.
     pub storage_pending_bringup: bool,
+    /// Human-readable progress of the mass-storage bring-up, surfaced by the shell `diskinfo`
+    /// command. On the serial-less rMBP the boot enumeration log is wiped when the GUI takes over,
+    /// so a failed bring-up would otherwise be a silent "no device"; this makes the stall point
+    /// (SET_CONFIGURATION / INQUIRY / READ CAPACITY / ...) visible from the interactive shell.
+    pub storage_note: &'static str,
     /// Monotonic CBW tag.
     pub bot_tag: u32,
     /// In-flight BOT transaction, populated by the event handler.
@@ -606,6 +621,7 @@ impl XhciController {
             event_ring_phys_base: 0,
             storage_slot: 0,
             storage_pending_bringup: false,
+            storage_note: "no mass-storage device enumerated",
             bot_tag: 1,
             bot_pending: None,
             ep0_pending: None,
@@ -826,6 +842,7 @@ impl XhciController {
                                     // synchronous BOT pump can run without re-entrancy).
                                     self.storage_slot = slot_id as u8;
                                     self.storage_pending_bringup = true;
+                                    self.storage_note = "endpoints configured; SCSI bring-up pending";
                                     // Storage setup is done; move on to the next connected port.
                                     self.start_next_port();
                                 }
@@ -2179,7 +2196,23 @@ impl XhciController {
         let slot = self.storage_slot;
         if slot == 0 { return Err(BotError::NoDevice); }
 
+        // Put the device in the USB CONFIGURED state before touching its bulk endpoints. Real USB
+        // Mass-Storage requires a SET_CONFIGURATION before its bulk IN/OUT endpoints become active;
+        // QEMU's usb-storage tolerates its absence — which is why BOT "worked" in emulation while on
+        // real silicon the endpoints stay inactive and every SCSI command fails (device never becomes
+        // a block device). The HID and hub paths already SET_CONFIGURATION; storage did not.
+        self.storage_note = "SET_CONFIGURATION";
+        match self.sync_control(slot, 0x00, 0x09, 1, 0, 0, 0, false) {
+            Ok(1) => serial_println!("xHCI: storage SET_CONFIGURATION(1) OK (slot {})", slot),
+            other => {
+                serial_println!("xHCI: storage SET_CONFIGURATION unexpected {:?} (slot {})", other, slot);
+                self.storage_note = "SET_CONFIGURATION failed";
+                return Err(BotError::Stall);
+            }
+        }
+
         // TEST UNIT READY — USB sticks often report "becoming ready" a few times.
+        self.storage_note = "TEST UNIT READY";
         for attempt in 0..16 {
             match self.scsi_test_unit_ready(slot) {
                 Ok(CswStatus::Passed) => break,
@@ -2188,7 +2221,9 @@ impl XhciController {
             }
         }
 
+        self.storage_note = "INQUIRY";
         let (vendor, product) = self.scsi_inquiry(slot)?;
+        self.storage_note = "READ CAPACITY";
         let (block_size, last_lba) = self.scsi_read_capacity10(slot)?;
         let num_blocks = last_lba as u64 + 1;
 
@@ -2201,6 +2236,7 @@ impl XhciController {
         *crate::drivers::block::BLOCK_DEVICE.lock() = Some(crate::drivers::block::BlockDeviceInfo {
             slot_id: slot, block_size, num_blocks, vendor, product,
         });
+        self.storage_note = "ready";
         Ok(())
     }
 

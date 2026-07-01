@@ -162,7 +162,11 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
                     console.println(&alloc::format!("Block size: {}  Blocks: {}  Capacity: {} MiB",
                         d.block_size, d.num_blocks, cap_mib));
                 }
-                None => console.println("No block device ready."),
+                None => {
+                    console.println("No block device ready.");
+                    // Surface how far USB mass-storage enumeration/bring-up got (metal diagnosis).
+                    console.println(&crate::drivers::xhci::storage_diag());
+                }
             }
         },
         "read" => {
