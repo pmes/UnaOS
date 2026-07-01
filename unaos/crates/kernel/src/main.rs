@@ -117,6 +117,15 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         }
     }
 
+    // 4e. Prove the global ms-clock is real: with every core now online and ticking at 1 kHz, the
+    // shared `ticks()` clock must still advance at ~1000 Hz (only the BSP drives it). This is the
+    // wall-clock assertion the calibration hinges on — a reading of ~N×1000 would betray an SMP
+    // over-count. Surfaced on the framebuffer for the serial-less metal boot.
+    #[cfg(target_arch = "x86_64")]
+    if let Some(pm) = unaos_kernel::arch::acpi::pm_timer(rsdp_addr) {
+        unaos_kernel::arch::apic::report_tick_rate(&pm);
+    }
+
     // 5. Motherboard Hardware Interconnects (xHCI/USB bring-up).
     //    Skippable via the `skip_xhci` Cargo feature (UNAOS_SKIP_XHCI=1) so the video stack still
     //    comes up promptly on real hardware where firmware/SMM may still own the xHCI controller

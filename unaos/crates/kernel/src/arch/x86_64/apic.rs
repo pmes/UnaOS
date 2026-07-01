@@ -54,8 +54,11 @@ const X2_TIMER_DIVIDE: u32 = 0x83E;
 /// from interrupt context (the hot path `eoi` reads it).
 static X2APIC: AtomicBool = AtomicBool::new(false);
 
-/// Monotonic count of local-APIC timer ticks since boot. A periodic heartbeat / hlt wake source
-/// (and the basis for a future scheduler tick / uptime).
+/// Monotonic global timebase: milliseconds since boot once the timer is calibrated to 1 kHz.
+/// Advanced by the BSP's timer ISR ONLY (see `timer_interrupt_handler`) so it stays single-rate
+/// regardless of how many cores are online — every core ticks at 1 kHz, so summing them would run
+/// this clock at (core-count) kHz. Read via `ticks()` / `arch::ms()`. Per-CPU `sleep_ticks`
+/// deadlines use the per-CPU counter instead (each core's own timer), not this global.
 pub static APIC_TICKS: AtomicU64 = AtomicU64::new(0);
 
 /// Calibrated invariant-TSC frequency in Hz, or 0 until `calibrate` succeeds. rdtsc is invariant
@@ -311,10 +314,59 @@ pub fn apic_timer_hz() -> u64 {
     APIC_TIMER_HZ.load(Ordering::Relaxed)
 }
 
-/// Number of local-APIC timer ticks since boot.
+/// Milliseconds since boot (the global 1 kHz timebase; see `APIC_TICKS`).
 #[inline]
 pub fn ticks() -> u64 {
     APIC_TICKS.load(Ordering::Relaxed)
+}
+
+/// One-time diagnostic: measure the *global* ms-clock rate (`ticks()`) against the PM timer over a
+/// short window and log it. Run AFTER calibration and SMP bring-up (all APs online + ticking).
+///
+/// The assertion that matters is CORE-COUNT INDEPENDENCE: only the BSP advances the global, so this
+/// must read ~1 kHz whether 1 or 8 cores are online. A reading near N×1000 would mean the per-core
+/// tick leaked back into the global — the exact SMP over-count this timebase is built to avoid — so
+/// this is the wall-clock check that catches it on the serial-less metal boot (QEMU's other checks
+/// never look at absolute ms). The ABSOLUTE rate reads a bit low under QEMU/TCG because a busy-poll
+/// loop makes the emulator coalesce periodic timer interrupts (the interrupt-*delivery* rate drops
+/// even though the programmed period, measured by the one-shot in `calibrate`, is exactly 1 ms); a
+/// precise APIC timer on metal doesn't drop ticks, so it should read ~1000 there.
+pub fn report_tick_rate(pm: &crate::arch::acpi::PmTimer) {
+    const WINDOW_MS: u64 = 50;
+    /// rdtsc-cycle backstop (~4–20 s across 1–5 GHz) so a wedged PM timer can't hang the report.
+    const MAX_TSC: u64 = 20_000_000_000;
+
+    let pm_hz = crate::arch::acpi::PM_TIMER_HZ;
+    let target_pm = (pm_hz * WINDOW_MS / 1000) as u32;
+    let pm_start = pm.read();
+    let tsc_start = crate::arch::now_cycles();
+    let ticks_start = ticks();
+
+    // Busy-wait a real PM-timer window with interrupts ENABLED, so the periodic timer ISR advances
+    // the global clock while we watch. (Not `without_interrupts` — the whole point is to count ticks.)
+    let mut elapsed_pm = 0u32;
+    loop {
+        elapsed_pm = pm.delta(pm_start, pm.read());
+        if elapsed_pm >= target_pm {
+            break;
+        }
+        if crate::arch::now_cycles().wrapping_sub(tsc_start) > MAX_TSC {
+            break;
+        }
+        core::hint::spin_loop();
+    }
+    if elapsed_pm == 0 {
+        return;
+    }
+
+    let ticks_delta = ticks().wrapping_sub(ticks_start);
+    let observed_hz = (ticks_delta as u128 * pm_hz as u128 / elapsed_pm as u128) as u64;
+    serial_println!(
+        "APIC: global ms-clock {} ticks / {} ms => {} Hz (single-rate; want ~1000 on metal, lower under QEMU/TCG timer coalescing).",
+        ticks_delta,
+        elapsed_pm as u64 * 1000 / pm_hz,
+        observed_hz
+    );
 }
 
 /// Signal End-Of-Interrupt to the local APIC. Called from every APIC-delivered handler (the
