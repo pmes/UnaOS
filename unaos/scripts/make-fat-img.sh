@@ -7,6 +7,7 @@
 #
 #   ./scripts/make-fat-img.sh part [out.img]   MBR-partitioned FAT32 (MBR@LBA0 -> BPB)   [default]
 #   ./scripts/make-fat-img.sh gpt  [out.img]   GPT-partitioned FAT32 (EFI PART@LBA1 -> BPB)
+#   ./scripts/make-fat-img.sh p16  [out.img]   MBR-partitioned FAT16 (fixed root dir, 16-bit FAT)
 #   ./scripts/make-fat-img.sh sf   [out.img]   superfloppy FAT32     (BPB@LBA0, no MBR)
 #
 # macOS only (uses hdiutil / diskutil / newfs_msdos — no mtools dependency). The image is a
@@ -16,15 +17,18 @@ set -euo pipefail
 
 WORKSPACE_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 LAYOUT="${1:-part}"
-SIZE_MB="${FAT_IMG_MB:-96}"
 ESP_DIR="${WORKSPACE_DIR}/target/x86_64_esp"
+FSTYPE="MS-DOS FAT32"   # p16 overrides to FAT16
+DEFAULT_MB=96
 
 case "$LAYOUT" in
-    part) OUT="${2:-${WORKSPACE_DIR}/builder/fat.img}";     DESC="MBR-partitioned"; SCHEME=MBR;;
-    gpt)  OUT="${2:-${WORKSPACE_DIR}/builder/fat-gpt.img}"; DESC="GPT-partitioned"; SCHEME=GPT;;
-    sf)   OUT="${2:-${WORKSPACE_DIR}/builder/fat-sf.img}";  DESC="superfloppy";;
-    *) echo "usage: $0 [part|gpt|sf] [out.img]" >&2; exit 1;;
+    part) OUT="${2:-${WORKSPACE_DIR}/builder/fat.img}";     DESC="MBR FAT32"; SCHEME=MBR;;
+    gpt)  OUT="${2:-${WORKSPACE_DIR}/builder/fat-gpt.img}"; DESC="GPT FAT32"; SCHEME=GPT;;
+    p16)  OUT="${2:-${WORKSPACE_DIR}/builder/fat16.img}";   DESC="MBR FAT16"; SCHEME=MBR; FSTYPE="MS-DOS FAT16"; DEFAULT_MB=32;;
+    sf)   OUT="${2:-${WORKSPACE_DIR}/builder/fat-sf.img}";  DESC="superfloppy FAT32";;
+    *) echo "usage: $0 [part|gpt|p16|sf] [out.img]" >&2; exit 1;;
 esac
+SIZE_MB="${FAT_IMG_MB:-$DEFAULT_MB}"
 
 if [ "$(uname)" != "Darwin" ]; then
     echo "make-fat-img.sh: this helper uses macOS hdiutil/diskutil/newfs_msdos." >&2
@@ -64,10 +68,10 @@ if [ "$LAYOUT" = "sf" ]; then
     diskutil mount "$DISK" >/dev/null
     VOLDEV="$DISK"
 else
-    # MBR or GPT scheme + one FAT32 partition spanning the disk. MBR writes a partition table at
-    # LBA0 pointing at the BPB (typically LBA63); GPT writes a protective MBR at LBA0, an "EFI PART"
+    # MBR or GPT scheme + one FAT partition spanning the disk. MBR writes a partition table at LBA0
+    # pointing at the BPB (typically LBA63); GPT writes a protective MBR at LBA0, an "EFI PART"
     # header at LBA1, and an entry array pointing at the BPB (typically LBA2048).
-    diskutil partitionDisk "$DISK" "$SCHEME" "MS-DOS FAT32" UNAOS 100% >/dev/null
+    diskutil partitionDisk "$DISK" "$SCHEME" "$FSTYPE" UNAOS 100% >/dev/null
     VOLDEV="${DISK}s1"
 fi
 
