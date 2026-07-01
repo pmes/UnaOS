@@ -104,6 +104,11 @@ pub struct Task {
     /// alive across the park/post window (see `JoinHandle`). Read (never moved) by the trampoline
     /// through the raw `current` pointer; dropped when the scheduler drops the Box on the Finished path.
     done_sem: Option<Arc<Semaphore>>,
+    /// EL0 user-mode entry point + initial SP_EL0 (M6a). Non-zero only for `is_user` tasks made via
+    /// `spawn_user`: such a task's initial frame lands in `user_task_trampoline`, which `eret`s to EL0
+    /// at `user_entry` with SP_EL0 = `user_sp`. 0 / unused for ordinary kernel tasks.
+    user_entry: u64,
+    user_sp: u64,
 }
 
 /// One CPU's scheduler bookkeeping (interior-mutable atomics, so the array is a plain static).
@@ -263,11 +268,52 @@ extern "C" fn task_trampoline() -> ! {
     exit();
 }
 
+/// Placeholder `entry` for user tasks: `spawn_user` sets `Task.entry` to this, but `user_task_trampoline`
+/// never calls it (it `eret`s to EL0 instead). Panics loudly if a path ever reaches it.
+fn user_never(_: usize) {
+    unreachable!("user task's kernel `entry` was called");
+}
+
+/// First code an EL0 (user) task runs at EL1, reached when `switch_context` `ret`s into its freshly
+/// built frame (with I MASKED, from INITIAL_DAIF). Unlike `task_trampoline`, it does NOT unmask: EL0
+/// must stay non-preemptible for M6a because `__vec_irq` does not yet bank SP_EL0, so a timer preempt
+/// of EL0 would lose the user stack pointer. It reads the task's EL0 entry/SP, then drops to EL0.
+///
+/// The current SP_EL1 (this task's Box kernel stack) is retained across the `eret` to EL0 and becomes
+/// the stack the later `svc` re-entry (`__vec_svc`) runs on, so the 16 KiB Box must have headroom for
+/// the SVC frame (256 GPR + 528 FP + 32 banked + the Rust handler) — it does; this trampoline uses only
+/// a shallow prologue. The msr+eret are one `noreturn` asm block so nothing runs after the drop.
+extern "C" fn user_task_trampoline() -> ! {
+    let cpu = percpu::this_cpu().cpu_index as usize;
+    let raw = SCHED[cpu].current.load(Ordering::Acquire) as *const Task;
+    debug_assert!(!raw.is_null(), "user_task_trampoline: current is null");
+    let (entry, sp) = unsafe { ((*raw).user_entry, (*raw).user_sp) };
+    // SPSR_EL1 = 0x2C0: M[3:0]=0b0000 (EL0t — a dedicated SP_EL0; EL0h/0b0001 is an illegal return from
+    // EL1 -> PSTATE.IL), M[4]=0 (AArch64), DAIF = D,I,F masked with A (SError) CLEAR — matching the
+    // kernel's baremetal SError policy so an EL0-provoked external abort is delivered promptly at the
+    // Lower-EL SError vector rather than held pending into kernel context. I masked => EL0 is
+    // non-preemptible for M6a.
+    unsafe {
+        core::arch::asm!(
+            "msr SP_EL0, {sp}",
+            "msr ELR_EL1, {entry}",
+            "msr SPSR_EL1, {spsr}",
+            "isb",
+            "eret",
+            sp = in(reg) sp,
+            entry = in(reg) entry,
+            spsr = in(reg) 0x2C0u64,
+            options(noreturn, nostack),
+        );
+    }
+}
+
 /// Build a fresh task's initial stack frame so the first `switch_context` into it lands in
-/// `task_trampoline`. Returns the value to store in `ctx_sp`. The 176-byte frame (matching
-/// `switch_context`) sits below a 16-aligned top; x30's slot holds the trampoline, DAIF's slot holds
-/// IRQ-masked, the rest (x19-x29, pad, d8-d15) zero.
-fn build_initial_frame(stack: &mut [u8]) -> u64 {
+/// `trampoline` (`task_trampoline` for kernel threads, `user_task_trampoline` for EL0 tasks). Returns
+/// the value to store in `ctx_sp`. The 176-byte frame (matching `switch_context`) sits below a
+/// 16-aligned top; x30's slot holds the trampoline, DAIF's slot holds IRQ-masked, the rest (x19-x29,
+/// pad, d8-d15) zero.
+fn build_initial_frame(stack: &mut [u8], trampoline: extern "C" fn() -> !) -> u64 {
     let base = stack.as_mut_ptr() as usize;
     let top = (base + stack.len()) & !0xF;
     let sp = top - 176;
@@ -276,7 +322,7 @@ fn build_initial_frame(stack: &mut [u8]) -> u64 {
         for i in 0..22 {
             p.add(i).write(0); // x19..x29, pad, d8..d15
         }
-        p.add(11).write(task_trampoline as usize as u64); // x30 (lr) slot -> ret lands in trampoline
+        p.add(11).write(trampoline as usize as u64); // x30 (lr) slot -> ret lands in the trampoline
         p.add(12).write(INITIAL_DAIF); // DAIF slot (offset 96)
     }
     sp as u64
@@ -293,7 +339,7 @@ fn spawn_inner(
 ) -> u64 {
     assert!(cpu < NUM_CPUS, "spawn: cpu out of range");
     let mut stack: Box<[u8]> = alloc::vec![0u8; TASK_STACK_SIZE].into_boxed_slice();
-    let ctx_sp = build_initial_frame(&mut stack);
+    let ctx_sp = build_initial_frame(&mut stack, task_trampoline);
     let id = NEXT_TID.fetch_add(1, Ordering::Relaxed);
     let task = Box::new(Task {
         id,
@@ -305,6 +351,8 @@ fn spawn_inner(
         arg,
         cpu: cpu as u32,
         done_sem,
+        user_entry: 0,
+        user_sp: 0,
     });
     RUN_QUEUES[cpu].lock().push_back(task);
     // Wake the target if it's a different, possibly-idle core (same-core needs no poke).
@@ -317,6 +365,34 @@ fn spawn_inner(
 /// the task id.
 pub fn spawn(name: &'static str, entry: fn(usize), arg: usize, cpu: usize) -> u64 {
     spawn_inner(name, entry, arg, cpu, None)
+}
+
+/// Create a ready EL0 (user-mode) task on `cpu`'s run queue (M6a): when dispatched it drops to EL0 at
+/// `user_entry` with SP_EL0 = `user_sp` (both from `syscall::setup`) and calls back into the kernel via
+/// `svc`. MUST be spawned on a SCHEDULED core (an AP), never the unscheduled BSP — `user_task_trampoline`
+/// reads `SCHED[cpu].current`, which is null on a core that never runs the scheduler loop. Fire-and-
+/// forget: `sys_exit` marks it FINISHED and the scheduler reclaims it. Returns the task id.
+pub fn spawn_user(name: &'static str, user_entry: u64, user_sp: u64, cpu: usize) -> u64 {
+    assert!(cpu < NUM_CPUS, "spawn_user: cpu out of range");
+    let mut stack: Box<[u8]> = alloc::vec![0u8; TASK_STACK_SIZE].into_boxed_slice();
+    let ctx_sp = build_initial_frame(&mut stack, user_task_trampoline);
+    let id = NEXT_TID.fetch_add(1, Ordering::Relaxed);
+    let task = Box::new(Task {
+        id,
+        name,
+        state: AtomicU8::new(STATE_READY),
+        ctx_sp,
+        stack,
+        entry: user_never, // never called — the user trampoline erets to EL0 instead
+        arg: 0,
+        cpu: cpu as u32,
+        done_sem: None,
+        user_entry,
+        user_sp,
+    });
+    RUN_QUEUES[cpu].lock().push_back(task);
+    poke_cpu(cpu);
+    id
 }
 
 /// Like `spawn`, but returns a `JoinHandle` a scheduled task can `join()` to block until this task

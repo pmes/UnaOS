@@ -31,6 +31,22 @@ use unaos_boot_info::{BootInfo, FrameBufferInfo, MemoryRegion, MemoryRegionKind,
 struct PageTable([u64; 512]);
 static mut L1: PageTable = PageTable([0; 512]);
 
+/// Second- and third-level tables for the EL0 user window (M6a). To grant EL0 access at 4 KiB
+/// granularity — not the 2 MiB or 1 GiB of a block — the kernel's L1[0] (0–1 GiB) is demoted from a
+/// 1 GiB block to a table: L1[0] → L2_USER (512 × 2 MiB) → (for the one 2 MiB block containing
+/// `USER_REGION`) L3_USER (512 × 4 KiB). ONLY the pages backing `USER_REGION` are EL0-accessible;
+/// every other page of 0–1 GiB stays EL1-only, exactly as the old 1 GiB block was. Both in BSS.
+static mut L2_USER: PageTable = PageTable([0; 512]);
+static mut L3_USER: PageTable = PageTable([0; 512]);
+
+/// The EL0 user window, identity-mapped (VA == PA): the M6a routine is copied to the bottom and the
+/// user stack grows down from the top. 16 KiB in BSS (zeroed by `_start`), 4 KiB-aligned so it maps
+/// to whole L3 pages. Deliberately small — only these pages are ever exposed to EL0.
+const USER_REGION_SIZE: usize = 0x4000; // 16 KiB = 4 pages
+#[repr(C, align(4096))]
+struct UserRegion([u8; USER_REGION_SIZE]);
+static mut USER_REGION: UserRegion = UserRegion([0; USER_REGION_SIZE]);
+
 // --- Translation attributes (ARM ARM DDI0487). We drop to EL1 (see `drop_to_el1`) before enabling
 // the MMU, so these program the EL1&0 regime (TTBR0_EL1/TCR_EL1/MAIR_EL1/SCTLR_EL1). ---
 // MAIR: AttrIdx 0 = Normal Inner/Outer Write-Back non-transient (0xFF); AttrIdx 1 = Device-nGnRnE
@@ -81,6 +97,35 @@ const fn device_block(pa: u64) -> u64 {
     pa | DESC_XN | DESC_AF | ATTR_DEVICE | DESC_BLOCK
 }
 
+// --- EL0 user-window descriptor bits (M6a). ---
+const DESC_TABLE: u64 = 0b11; // L1/L2 table descriptor (points at the next-level table)
+const DESC_PAGE: u64 = 0b11; // L3 page descriptor — note 0b01 is INVALID at L3, unlike a block
+const AP_EL0: u64 = 1 << 6; // AP[6]=1 with AP[7]=0 → EL0+EL1 read-write (AP=0b00 is EL1-only)
+const DESC_PXN: u64 = 1 << 53; // privileged execute-never (EL1 can't execute the page)
+
+/// L3 4 KiB page, Normal cacheable, EL1-only (AP=0b00), executable at EL1 — the default identity page.
+const fn ram_page(pa: u64) -> u64 {
+    pa | DESC_AF | SH_INNER | ATTR_NORMAL | DESC_PAGE
+}
+/// L3 4 KiB USER page: Normal cacheable, EL0+EL1 read-write (AP=0b01), EL0-executable (UXN=0),
+/// EL1-non-executable (PXN=1). M6a maps the whole `USER_REGION` (code + stack) as one RWX-at-EL0
+/// region; M6b will split code (EL0 RX) from stack (EL0 RW, XN).
+const fn user_page(pa: u64) -> u64 {
+    pa | DESC_PXN | AP_EL0 | DESC_AF | SH_INNER | ATTR_NORMAL | DESC_PAGE
+}
+/// A table descriptor pointing at the next-level table. Mask to bits[47:12] so no stray bits land in
+/// the table-attribute fields [63:59] (NSTable/APTable/UXNTable/PXNTable); leaving them 0 adds no
+/// restriction at this level, so the leaf page's own AP/XN govern.
+const fn table_desc(table_pa: u64) -> u64 {
+    (table_pa & 0x0000_FFFF_FFFF_F000) | DESC_TABLE
+}
+
+/// The EL0 user window as (base PA == VA, size in bytes). The M6a routine is copied to the base and
+/// run at EL0 (identity map); the caller sets SP_EL0 to the 16-aligned top. Baremetal-only.
+pub fn user_region() -> (u64, usize) {
+    (&raw const USER_REGION as u64, USER_REGION_SIZE)
+}
+
 /// Build the identity map and turn the MMU on. Called (with the MMU still off, at EL1 after
 /// `drop_to_el1`) from `__rust_boot` after BSS has been zeroed. Plain volatile writes + system-
 /// register moves only — no atomics, no locks, nothing that needs the MMU we're about to enable.
@@ -89,17 +134,46 @@ pub unsafe fn mmu_init() {
     unsafe { enable_mmu() };
 }
 
-/// Populate the single L1 translation table. BSP-only: the secondaries reuse this same table (they
-/// call `enable_mmu` alone), so it must be built exactly once, before any core turns its MMU on.
+/// Populate the translation tables. BSP-only, MMU OFF (before `enable_mmu` and before the secondaries
+/// are released), so the secondaries reuse the finished tables and no TLB/cache publication is needed
+/// (the `tlbi vmalle1` in `enable_mmu` covers each core's cold start). Builds the EL0 user window as a
+/// 3-level walk under L1[0] so EL0 permission is carved at 4 KiB granularity (see `L2_USER`/`L3_USER`).
 fn build_l1() {
-    let table = &raw mut L1 as *mut u64;
+    let user_pa = &raw const USER_REGION as u64;
+    // USER_REGION must be 4 KiB-aligned (whole L3 pages) and in the first 1 GiB (under L1[0]).
+    debug_assert!(user_pa & 0xFFF == 0, "USER_REGION not 4 KiB aligned");
+    debug_assert!(user_pa >> 30 == 0, "USER_REGION not in the first 1 GiB");
+    let l2_idx = (user_pa >> 21) as usize; // the 2 MiB block of 0–1 GiB that holds USER_REGION
+    let l3_base = (l2_idx as u64) << 21; // that block's base PA
+    let user_end = user_pa + USER_REGION_SIZE as u64;
+
     unsafe {
-        // 0–1 GiB and 1–3 GiB: RAM (Normal). On an 8 GiB Pi there is RAM above 3 GiB too, but the
-        // kernel never uses it (heap is in low RAM), so the top GiB is peripherals as Device.
-        table.add(0).write_volatile(ram_block(0x0000_0000));
-        table.add(1).write_volatile(ram_block(0x4000_0000));
-        table.add(2).write_volatile(ram_block(0x8000_0000));
-        table.add(3).write_volatile(device_block(0xC000_0000));
+        // L3_USER: 512 × 4 KiB pages tiling [l3_base, l3_base + 2 MiB). Pages inside USER_REGION are
+        // EL0-accessible; every other page stays EL1-only (identical to the old 1 GiB RAM block).
+        let l3 = &raw mut L3_USER as *mut u64;
+        for j in 0..512 {
+            let pa = l3_base | ((j as u64) << 12);
+            let desc = if pa >= user_pa && pa < user_end { user_page(pa) } else { ram_page(pa) };
+            l3.add(j).write_volatile(desc);
+        }
+        // L2_USER: 512 × 2 MiB blocks tiling [0, 1 GiB). Block `l2_idx` points at L3_USER; the other
+        // 511 are plain RAM blocks (same attributes as the old 1 GiB block, just at 2 MiB).
+        let l2 = &raw mut L2_USER as *mut u64;
+        for i in 0..512 {
+            let desc = if i == l2_idx {
+                table_desc(&raw const L3_USER as u64)
+            } else {
+                ram_block((i as u64) << 21)
+            };
+            l2.add(i).write_volatile(desc);
+        }
+        // L1: [0] → L2_USER (0–1 GiB, now paged for the EL0 window); [1],[2] plain 1 GiB RAM; [3] the
+        // Device peripheral window. (Was: L1[0] a 1 GiB RAM block.)
+        let l1 = &raw mut L1 as *mut u64;
+        l1.add(0).write_volatile(table_desc(&raw const L2_USER as u64));
+        l1.add(1).write_volatile(ram_block(0x4000_0000));
+        l1.add(2).write_volatile(ram_block(0x8000_0000));
+        l1.add(3).write_volatile(device_block(0xC000_0000));
     }
 }
 

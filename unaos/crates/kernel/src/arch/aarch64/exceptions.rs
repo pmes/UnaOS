@@ -40,6 +40,72 @@ macro_rules! irq_el {
     };
 }
 
+// M6a: the Lower-EL-AArch64 synchronous vector (0x400) routes to __vec_svc on baremetal (EL0 syscalls
+// land there since the kernel is at EL1), but stays the halting __vec_sync on the UEFI/EL2 build (no
+// EL0 there). svc_stub!() emits the __vec_svc body only on baremetal (empty otherwise), so the UEFI
+// build has no reference to the baremetal-only aarch64_svc_handler.
+#[cfg(feature = "baremetal")]
+macro_rules! svc_vec {
+    () => {
+        "__vec_svc"
+    };
+}
+#[cfg(not(feature = "baremetal"))]
+macro_rules! svc_vec {
+    () => {
+        "__vec_sync"
+    };
+}
+#[cfg(feature = "baremetal")]
+macro_rules! svc_stub {
+    () => {
+        r#"
+    // ---- SVC (EL0 syscall): save, decode EC, dispatch in Rust on the task's kernel stack, return ----
+    // Reached from VBAR_EL1 + 0x400 (Lower EL AArch64, Synchronous): the kernel is at EL1, so an EL0
+    // `svc #0` lands here. Bank ELR_EL1/SPSR_EL1/SP_EL0 (per-core, and a blocking syscall would clobber
+    // them), then check ESR_EL1.EC == 0x15 (SVC/AArch64). Anything else at this vector (EL0 data/instr
+    // abort 0x24/0x20/0x21, alignment 0x22/0x26, unknown 0x00) is routed to the fault dead-end BEFORE
+    // x8 is read, so a buggy EL0 program can never wild-dispatch on a garbage syscall number.
+    .globl __vec_svc
+__vec_svc:
+    SAVE_GPRS
+    SAVE_FP
+    mrs x0, ELR_EL1
+    mrs x1, SPSR_EL1
+    mrs x2, SP_EL0
+    stp x0, x1, [sp, #-32]!
+    str x2, [sp, #16]
+    mrs x0, ESR_EL1
+    lsr x0, x0, #26
+    cmp x0, #0x15
+    b.ne __vec_svc_fault
+    add x0, sp, #560            // -> the SAVE_GPRS base (256 GPR + 528 FP + 32 banked sit below it)
+    bl aarch64_svc_handler
+    ldp x0, x1, [sp]
+    ldr x2, [sp, #16]
+    add sp, sp, #32
+    msr ELR_EL1, x0
+    msr SPSR_EL1, x1
+    msr SP_EL0, x2
+    RESTORE_FP
+    RESTORE_GPRS
+    eret
+    // Non-SVC lower-EL synchronous exception: log + halt for M6a (M6b makes this a task-kill). The
+    // `b .` guarantees we never fall into the eret tail with a half-restored frame.
+__vec_svc_fault:
+    mov x0, #4
+    bl aarch64_fault_handler
+    b .
+"#
+    };
+}
+#[cfg(not(feature = "baremetal"))]
+macro_rules! svc_stub {
+    () => {
+        ""
+    };
+}
+
 core::arch::global_asm!(concat!(
     r#"
     // ---- The vector table: 16 entries x 0x80 bytes, 2 KiB aligned (VBAR requirement) ----
@@ -65,9 +131,9 @@ __exception_vectors:
     b __vec_fiq           // 0x300 FIQ
     .balign 0x80
     b __vec_serror        // 0x380 SError
-    // Lower EL using AArch64 (we run nothing below us yet; trap to the fault logger)
+    // Lower EL using AArch64 (baremetal: EL0 tasks — 0x400 SVC -> __vec_svc; UEFI/EL2: fault logger)
     .balign 0x80
-    b __vec_sync          // 0x400 Synchronous
+    b "#, svc_vec!(), r#"          // 0x400 Synchronous (EL0 SVC on baremetal)
     .balign 0x80
     b __vec_irq           // 0x480 IRQ
     .balign 0x80
@@ -229,7 +295,8 @@ __vec_serror:
     mov x0, #3
     bl aarch64_fault_handler
     b .
-"#
+"#,
+    svc_stub!()
 ));
 
 unsafe extern "C" {
@@ -316,6 +383,7 @@ extern "C" fn aarch64_fault_handler(kind: u64) -> ! {
         0 => "SYNCHRONOUS",
         2 => "FIQ",
         3 => "SERROR",
+        4 => "EL0-SYNC (non-SVC)", // M6a: a lower-EL sync exception that wasn't an SVC (see __vec_svc_fault)
         _ => "UNKNOWN",
     };
     // ESR EC field (bits 31:26) classifies the exception — the single most useful number here.

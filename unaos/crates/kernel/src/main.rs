@@ -137,6 +137,18 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     {
         let online = unaos_kernel::arch::smp::online_secondaries();
         unaos_kernel::arch::sched::start_aps(&online);
+
+        // M6a: the first EL0 (userspace) drop. Copy the baked-in user program into the EL0 window and
+        // make it executable, then spawn it as a user task on a secondary core (NOT the unscheduled
+        // BSP — its scheduler `current` is null). It `eret`s to EL0, does sys_write("hello from EL0")
+        // + sys_exit via `svc`, and the EL1 kernel services both at VBAR_EL1+0x400. A synchronous SVC
+        // IS delivered by QEMU raspi4b, so — unlike the timer/SGI paths — this round trip is fully
+        // QEMU-verifiable, not metal-only.
+        if let Some(&cpu) = online.first() {
+            let (entry, sp) = unaos_kernel::arch::syscall::setup();
+            unaos_kernel::arch::sched::spawn_user("el0-demo", entry, sp, cpu);
+            serial_println!(":: M6a: EL0 user task spawned on core {} (entry={:#x}) ::", cpu, entry);
+        }
     }
 
     // 4b. ACPI: discover the CPU topology (MADT) for SMP bring-up. x86_64 only — aarch64

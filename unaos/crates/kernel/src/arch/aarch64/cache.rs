@@ -92,3 +92,48 @@ pub fn clean_invalidate_range(addr: usize, len: usize) {
     }
     unsafe { asm!("dsb sy", options(nostack, preserves_flags)) };
 }
+
+/// Instruction-cache line size in bytes, from CTR_EL0.IminLine (bits[3:0], log2 of the line size in
+/// 32-bit words). This is a SEPARATE field from DminLine — they can differ on other Armv8 cores (e.g.
+/// the Jetson's Cortex-A78), so the I-cache invalidate loop must NOT reuse `dcache_line_size`.
+/// Cortex-A72 reports 64 B for both.
+#[inline]
+fn icache_line_size() -> usize {
+    let ctr: u64;
+    unsafe { asm!("mrs {}, CTR_EL0", out(reg) ctr, options(nomem, nostack, preserves_flags)) };
+    let imin_line = ctr & 0xF;
+    4usize << imin_line
+}
+
+/// Make CPU-written bytes in `[addr, addr+len)` executable — the freshly-loaded/self-modifying-code
+/// maintenance the ARM ARM (DDI0487 B2.7.4) requires. We wrote the bytes through the (cacheable) EL1
+/// data side; a later instruction fetch (here, EL0 over the same identity VA) can miss them unless we
+/// clean the D-cache to the Point of Unification (DC CVAU) and invalidate the stale I-cache lines
+/// (IC IVAU). The order is load-bearing and needs BOTH barriers: DC CVAU → `dsb ish` → IC IVAU →
+/// `dsb ish` → `isb`. Without the interior `dsb ish`, IC IVAU may retire against a not-yet-cleaned
+/// line and the fetch pulls old bytes; the closing `isb` flushes the fetched-ahead pipeline. IVAU/CVAU
+/// broadcast Inner-Shareable, so the code is coherent even when it later runs on another core. A no-op
+/// in QEMU (no caches) but mandatory on real silicon.
+#[inline]
+pub fn icache_sync_range(addr: usize, len: usize) {
+    if len == 0 {
+        return;
+    }
+    let end = addr + len;
+    // 1. Clean the D-cache to the PoU, strided by the D-cache line size.
+    let dline = dcache_line_size();
+    let mut p = addr & !(dline - 1);
+    while p < end {
+        unsafe { asm!("dc cvau, {}", in(reg) p, options(nostack, preserves_flags)) };
+        p += dline;
+    }
+    unsafe { asm!("dsb ish", options(nostack, preserves_flags)) };
+    // 2. Invalidate the I-cache to the PoU, strided by the I-cache line size (IminLine, not DminLine).
+    let iline = icache_line_size();
+    let mut p = addr & !(iline - 1);
+    while p < end {
+        unsafe { asm!("ic ivau, {}", in(reg) p, options(nostack, preserves_flags)) };
+        p += iline;
+    }
+    unsafe { asm!("dsb ish", "isb", options(nostack, preserves_flags)) };
+}
