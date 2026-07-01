@@ -1065,6 +1065,14 @@ impl XhciController {
                         let completion_code = (status >> 24) & 0xFF;
                         let slot_id = (control >> 24) & 0xFF;
 
+                        // Bounds: slot_id comes from the controller. A confused/flaky xHC
+                        // (exactly what recovery runs against) must not be able to panic the
+                        // kernel with an out-of-range slot index.
+                        if slot_id as usize >= self.slots.len() {
+                            serial_println!("xHCI: command completion with bogus slot {}; ignoring.", slot_id);
+                            return;
+                        }
+
                         // Code 24 = Command Ring Stopped (xHCI Table 6-90 — NOT "aborted";
                         // 25 is Command Aborted). A pure ring-state signal: its param is the
                         // ring DEQUEUE pointer, not any command's TRB, so it must never be
@@ -1210,6 +1218,12 @@ impl XhciController {
 
                         xdbg!("xHCI DEBUG: [Transfer Event] Slot={}, EP={}, Code={}, Len={}",
                             slot_id, endpoint_id, completion_code, transfer_len);
+
+                        // Bounds: slot_id comes from the controller (see the type-33 guard).
+                        if slot_id as usize >= self.slots.len() {
+                            serial_println!("xHCI: transfer event with bogus slot {}; ignoring.", slot_id);
+                            return;
+                        }
 
                         // Synchronous EP0 control transfer (hub bring-up) claims its OWN Status-TRB
                         // completion here, before the async descriptor FSM below — matched by TRB
