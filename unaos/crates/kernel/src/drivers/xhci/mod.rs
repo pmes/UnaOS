@@ -603,6 +603,11 @@ pub struct XhciController {
     /// this lets a hot-plug Connect Status Change event know whether to kick `start_next_port`
     /// immediately or just queue the port (the in-flight device's completion will drain it).
     enum_active: bool,
+    /// The root port currently being enumerated (0 = none). The USB reset we issue at the start of
+    /// enumerating a port can itself assert CSC (Connect Status Change); without this the hot-plug
+    /// handler would treat that as a fresh connect and re-queue the same port, double-enumerating it
+    /// and starving the ports queued behind it. CSC for `enumerating_port` is a reset side-effect.
+    enumerating_port: u8,
 }
 
 unsafe impl Send for XhciController {}
@@ -655,6 +660,7 @@ impl XhciController {
             hubs_pending: Vec::new(),
             hid_setproto_pending: Vec::new(),
             enum_active: false,
+            enumerating_port: 0,
         }
     }
 
@@ -931,12 +937,24 @@ impl XhciController {
                             self.clear_port_change(port_id, 1 << 17);
                             // Bit 0: CCS (Current Connect Status) — 1 = a device is now attached.
                             if (port_sc & 1) != 0 {
-                                serial_println!("xHCI: [Port {}] device connected (hot-plug); queuing for enumeration.", port_id);
-                                if !self.ports_to_enumerate.contains(&port_id) {
-                                    self.ports_to_enumerate.push(port_id);
-                                }
-                                if !self.enum_active {
-                                    self.start_next_port();
+                                // Ignore a CSC that is the side-effect of the USB reset we issue when
+                                // enumerating a port: it is not a fresh hot-plug. That's the case if
+                                // this is the port we're currently enumerating, or one that already
+                                // has an active slot. Re-queuing it would double-enumerate the device
+                                // and starve the ports queued behind it.
+                                let mid_enum = port_id == self.enumerating_port;
+                                let has_slot = self.slots.iter().enumerate()
+                                    .any(|(i, s)| i != 0 && s.active && s.port_id == port_id);
+                                if mid_enum || has_slot {
+                                    serial_println!("xHCI: [Port {}] CSC during enumeration (reset side-effect); not re-queuing.", port_id);
+                                } else {
+                                    serial_println!("xHCI: [Port {}] device connected (hot-plug); queuing for enumeration.", port_id);
+                                    if !self.ports_to_enumerate.contains(&port_id) {
+                                        self.ports_to_enumerate.push(port_id);
+                                    }
+                                    if !self.enum_active {
+                                        self.start_next_port();
+                                    }
                                 }
                             } else {
                                 serial_println!("xHCI: [Port {}] device disconnected.", port_id);
@@ -1592,21 +1610,43 @@ impl XhciController {
                 continue;
             }
             self.enum_active = true;
+            self.enumerating_port = port;
             serial_println!("xHCI: === Enumerating Port {} (PORTSC={:#x}) ===", port, portsc);
-            // Bit 1: PED (Port Enabled/Disabled).
+            // Always USB-reset the port before addressing the device, whether or not PED is already
+            // set. A device the firmware enumerated (our USB stick / SD reader IS the UEFI boot
+            // device) — and every SuperSpeed device, whose link auto-trains to PED=1 — keeps its old
+            // USB address across our controller reset (HCRST resets the controller, not the device).
+            // ADDRESS_DEVICE issues SET_ADDRESS to the Default address (0), so it only works from the
+            // Default state, which a USB port reset restores. The old code skipped the reset for
+            // PED=1 ports and addressed them directly: QEMU tolerates that, but real xHCI stalls
+            // ADDRESS_DEVICE (no completion) and the whole enumeration deadlocks. Route both cases
+            // through a reset; the Port Reset Change event then drives enable_slot from Default.
+            // (Bit 1: PED. USB2 devices arrive here PED=0; SS / boot-owned devices PED=1.)
             if (portsc & 2) != 0 {
-                // Already enabled (typical for SuperSpeed): request a slot directly.
-                serial_println!("xHCI: Port {} already enabled; requesting slot.", port);
-                self.enable_slot(port);
+                serial_println!("xHCI: Port {} already enabled; resetting to Default before addressing.", port);
+                self.reset_port(port);
             } else {
-                // Needs a USB reset first; the Port Reset Change event drives enable_slot.
                 serial_println!("xHCI: Port {} requires reset before enable.", port);
                 self.handle_port_change(port);
             }
             return;
         }
         self.enum_active = false;
+        self.enumerating_port = 0;
         serial_println!("xHCI: Port enumeration queue drained.");
+    }
+
+    /// Issue a USB hot reset on `port_id` with a clean PORTSC write: set PR (bit 4) and keep PP
+    /// (bit 9), while writing 0 to PED (bit 1, W1C-to-disable) and to the RW1C change bits (17-23),
+    /// so we neither accidentally disable the port nor clear pending change events, and we do not
+    /// strobe a Port Link State write (LWS/bit 16 stays 0). The resulting Port Reset Change event
+    /// (handled in the type-34 event branch) then enables the slot from a fresh Default state. Used
+    /// to reset an already-enabled port (SuperSpeed / firmware-owned boot device) back to Default.
+    fn reset_port(&self, port_id: u8) {
+        unsafe {
+            let portsc_ptr = (self.op_base + 0x400 + (port_id as usize - 1) * 0x10) as *mut u32;
+            core::ptr::write_volatile(portsc_ptr, (1 << 9) | (1 << 4));
+        }
     }
 
     fn handle_port_change(&self, port_id: u8) {
