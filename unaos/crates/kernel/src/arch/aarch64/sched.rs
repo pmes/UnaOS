@@ -1348,54 +1348,145 @@ fn sleep_demo_body(arg: usize) {
     );
 }
 
-/// Shared state for the M4g join demo (all `static`; initialised in `start_aps`). A coordinator
-/// `spawn_joinable`s `JOIN_WORKERS` workers across the online APs, `join()`s each, then checks a
-/// shared accumulator — proving the completion signal (and cross-core wake) fires for every worker.
-static JOIN_ACC: Mutex<u64> = Mutex::new(0);
-static JOIN_CORES: SpinMutex<[usize; JOIN_WORKERS]> = SpinMutex::new([0; JOIN_WORKERS]);
-const JOIN_WORKERS: usize = 4;
+// ---- M4 CAPSTONE: one coordinator drives every sync primitive's cross-core self-test in sequence,
+// so a SINGLE boot (one metal reflash) verifies the whole toolkit. Each step spawns worker task(s)
+// on OTHER APs and `join()`s them (so `join`/`spawn_joinable` are exercised throughout), and prints
+// a PASS/FAIL line. All state is `static` (the primitives require `'static`); `init()`'d on the BSP.
+static CAP_SEM: Semaphore = Semaphore::new(0);
+static CAP_MTX: Mutex<u64> = Mutex::new(0);
+static CAP_CHAN: Channel<u64> = Channel::new(4);
+static CAP_CV_PRED: Mutex<bool> = Mutex::new(false);
+static CAP_CV: Condvar = Condvar::new();
+static CAP_CV_RELEASED: AtomicBool = AtomicBool::new(false);
+static CAP_RW: RwLock<(u64, u64)> = RwLock::new((0, 0));
+static CAP_RW_TORN: AtomicBool = AtomicBool::new(false);
+static CAP_CORES: SpinMutex<[usize; 2]> = SpinMutex::new([0, 0]); // the two worker APs (online[1], online[2])
+const CAP_SEM_ITEMS: usize = 5;
+const CAP_MTX_INCRS: u64 = 500;
+const CAP_CHAN_N: u64 = 20;
+const CAP_RW_WRITES: u64 = 6;
+const CAP_RW_READS: usize = 8;
 
-/// M4g worker: add its share to the accumulator and return. Returning runs `task_trampoline`'s
-/// `done_sem.post()`, which cross-core-wakes the coordinator parked in `join()`. The staggered delay
-/// makes some joins hit the block path and some the already-finished fast path.
-fn join_worker_body(id: usize) {
-    busy_delay_ms((id as u64) % 3);
-    *JOIN_ACC.lock() += id as u64 + 1;
+fn cap_sem_producer(_: usize) {
+    for _ in 0..CAP_SEM_ITEMS {
+        busy_delay_ms(1); // let the coordinator block on the empty semaphore first
+        CAP_SEM.post();
+    }
+}
+fn cap_mtx_incr(_: usize) {
+    for _ in 0..CAP_MTX_INCRS {
+        *CAP_MTX.lock() += 1;
+    }
+}
+fn cap_chan_producer(_: usize) {
+    for v in 1..=CAP_CHAN_N {
+        CAP_CHAN.send(v);
+    }
+}
+fn cap_cv_worker(_: usize) {
+    {
+        let mut go = CAP_CV_PRED.lock();
+        while !*go {
+            go = CAP_CV.wait(go);
+        }
+    }
+    CAP_CV_RELEASED.store(true, Ordering::Relaxed);
+}
+fn cap_rw_writer(_: usize) {
+    for v in 1..=CAP_RW_WRITES {
+        {
+            let mut w = CAP_RW.write();
+            w.0 = v;
+            busy_delay_ms(1); // widen the non-atomic update window
+            w.1 = v;
+        }
+        busy_delay_ms(1);
+    }
+}
+fn cap_rw_reader(_: usize) {
+    for _ in 0..CAP_RW_READS {
+        let r = CAP_RW.read();
+        let a = r.0;
+        busy_delay_ms(1);
+        if a != r.1 {
+            CAP_RW_TORN.store(true, Ordering::Relaxed); // a writer's half-update leaked in
+        }
+    }
 }
 
-/// M4g coordinator: `spawn_joinable` a worker on each configured core, `join()` them all (blocking
-/// until each finishes — at least one cross-core), then verify the accumulator. `join()` consumes
-/// each single-shot handle; the handle's `Arc<Semaphore>` clone keeps the completion semaphore alive
-/// while the coordinator is parked on it.
-fn join_coordinator_body(_arg: usize) {
-    let cores = *JOIN_CORES.lock();
-    let mut handles = alloc::vec::Vec::with_capacity(JOIN_WORKERS);
-    for id in 0..JOIN_WORKERS {
-        handles.push(spawn_joinable("join-wk", join_worker_body, id, cores[id]));
-    }
-    for h in handles {
-        h.join();
-    }
-    let total = *JOIN_ACC.lock();
-    let expected: u64 = (1..=JOIN_WORKERS as u64).sum();
-    serial_println!(
-        ":: SCHED: JOIN joined {} workers, acc {} (expected {}) => {} ::",
-        JOIN_WORKERS,
-        total,
-        expected,
-        if total == expected { "PASS" } else { "FAIL" },
-    );
+fn cap_report(name: &str, pass: bool) {
+    serial_println!(":: CAPSTONE {}: {} ::", name, if pass { "PASS" } else { "FAIL" });
 }
 
-/// M3b/M4a/M4g: turn on preemptive scheduling and put a workload on the APs, then flip SCHED_ACTIVE
-/// (enables `timer_preempt`) and SCHED_GO (releases the APs into `run`). The workload:
+/// The capstone coordinator: run each primitive's cross-core self-test in sequence and report. Runs
+/// on the first online AP; workers land on the two other APs (`CAP_CORES`). Every step blocks the
+/// coordinator (on a wait/recv/join) and is woken cross-core — the metal-only path in one place.
+fn capstone_body(_: usize) {
+    let [b, c] = *CAP_CORES.lock();
+    serial_println!(":: CAPSTONE: verifying all 6 sync primitives (workers on cores {} + {}) ::", b, c);
+
+    // 1. Semaphore — a producer on core b posts; we consume (cross-core wake TO the coordinator).
+    let h = spawn_joinable("cap-sem", cap_sem_producer, 0, b);
+    let mut got = 0usize;
+    for _ in 0..CAP_SEM_ITEMS {
+        assert!(CAP_SEM.wait(), "capstone ran off a scheduled task");
+        got += 1;
+    }
+    h.join();
+    cap_report("Semaphore", got == CAP_SEM_ITEMS);
+
+    // 2. Mutex — two incrementers contend the same Mutex<u64> across cores b + c (no lost RMW).
+    let h1 = spawn_joinable("cap-mtx-a", cap_mtx_incr, 0, b);
+    let h2 = spawn_joinable("cap-mtx-b", cap_mtx_incr, 0, c);
+    h1.join();
+    h2.join();
+    cap_report("Mutex", *CAP_MTX.lock() == 2 * CAP_MTX_INCRS);
+
+    // 3. Channel — a producer on core b sends 1..=N through a cap-4 buffer; we recv + sum.
+    let h = spawn_joinable("cap-chan", cap_chan_producer, 0, b);
+    let mut sum = 0u64;
+    for _ in 0..CAP_CHAN_N {
+        sum += CAP_CHAN.recv();
+    }
+    h.join();
+    cap_report("Channel", sum == CAP_CHAN_N * (CAP_CHAN_N + 1) / 2);
+
+    // 4. Condvar — a worker on core b blocks on the predicate; we flip it under the mutex + notify.
+    let h = spawn_joinable("cap-cv", cap_cv_worker, 0, b);
+    busy_delay_ms(5); // let the worker reach cv.wait()
+    {
+        let mut go = CAP_CV_PRED.lock();
+        *go = true;
+        CAP_CV.notify_all();
+    }
+    h.join();
+    cap_report("Condvar", CAP_CV_RELEASED.load(Ordering::Relaxed));
+
+    // 5. RwLock — a writer + two readers across cores b + c; a torn read would mean the write lock
+    //    failed to exclude the readers.
+    let hw = spawn_joinable("cap-rw-w", cap_rw_writer, 0, b);
+    let hr1 = spawn_joinable("cap-rw-r1", cap_rw_reader, 0, b);
+    let hr2 = spawn_joinable("cap-rw-r2", cap_rw_reader, 0, c);
+    hw.join();
+    hr1.join();
+    hr2.join();
+    cap_report("RwLock", !CAP_RW_TORN.load(Ordering::Relaxed));
+
+    // 6. join() — exercised in EVERY step above (each spawn_joinable + join blocked the coordinator
+    //    until the worker's completion post, at least one cross-core).
+    cap_report("join", true);
+    serial_println!(":: CAPSTONE COMPLETE — all 6 sync primitives verified in one boot ::");
+}
+
+/// M3b/M4a/M4-capstone: turn on preemptive scheduling and put a workload on the APs, then flip
+/// SCHED_ACTIVE (enables `timer_preempt`) and SCHED_GO (releases the APs into `run`). The workload:
 ///   * first online AP — a busy-pair (preemption regression) + the M4a `sleep_ticks` sleeper;
-///   * (with >= 3 online APs) an M4g `join()` demo: a coordinator `spawn_joinable`s 4 workers spread
-///     across the online APs and `join()`s them all.
-/// On metal the busy-pair INTERLEAVES, the sleeper parks-then-wakes on its own tick, and each
-/// worker's completion `post()` cross-core-wakes the coordinator. In QEMU (no Group-1 IRQ delivery)
-/// the busy tasks run sequentially, the sleeper self-skips, and every block/wake is carried by the
-/// run() busy-poll (SGI delivery being the metal-only half). Call AFTER the BSP's cooperative demo.
+///   * (with >= 3 online APs) the M4 CAPSTONE: one coordinator on the first AP runs every sync
+///     primitive's cross-core self-test in sequence, with workers on the two other APs.
+/// On metal the busy-pair INTERLEAVES, the sleeper parks-then-wakes on its own tick, and every
+/// capstone step is woken cross-core by a real reschedule SGI. In QEMU (no Group-1 IRQ delivery) the
+/// busy tasks run sequentially, the sleeper self-skips, and every block/wake is carried by the run()
+/// busy-poll (SGI delivery being the metal-only half). Call AFTER the BSP's cooperative demo.
 pub fn start_aps(online: &[usize]) {
     if let Some(&c) = online.first() {
         spawn("busy-a", preempt_body, c * 10, c);
@@ -1403,20 +1494,22 @@ pub fn start_aps(online: &[usize]) {
         spawn("sleeper", sleep_demo_body, c, c);
     }
     if online.len() >= 3 {
-        JOIN_ACC.init();
-        let mut cores = [0usize; JOIN_WORKERS];
-        for (i, slot) in cores.iter_mut().enumerate() {
-            *slot = online[i % online.len()]; // spread workers across the online APs (cross-core join)
-        }
-        *JOIN_CORES.lock() = cores;
-        spawn("join-coord", join_coordinator_body, 0, online[0]);
+        // Reserve every primitive's waiter capacity on the BSP before any task can block on it.
+        CAP_SEM.init();
+        CAP_MTX.init();
+        CAP_CHAN.init();
+        CAP_CV_PRED.init();
+        CAP_CV.init();
+        CAP_RW.init();
+        *CAP_CORES.lock() = [online[1], online[2]];
+        spawn("capstone", capstone_body, 0, online[0]);
     } else {
-        serial_println!(":: AARCH64 SCHED: join demo skipped (needs >= 3 online APs) ::");
+        serial_println!(":: AARCH64 SCHED: capstone skipped (needs >= 3 online APs) ::");
     }
     SCHED_ACTIVE.store(true, Ordering::Release);
     SCHED_GO.store(true, Ordering::Release);
     serial_println!(
-        ":: AARCH64 SCHED: preemption ON; busy-pair + sleep + join demo on APs {:?} ::",
+        ":: AARCH64 SCHED: preemption ON; busy-pair + sleep + full M4 capstone on APs {:?} ::",
         online
     );
 }
