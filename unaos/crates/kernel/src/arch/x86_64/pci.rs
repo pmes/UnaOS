@@ -77,8 +77,14 @@ pub unsafe fn write_config_32(bus: u8, slot: u8, func: u8, offset: u8, value: u3
 /// into the routing-SELECT registers (XUSB2PR @ 0xD0 / USB3_PSSEN @ 0xD8). Without this the xHCI
 /// sees no devices on the shared ports. Gated to the specific Intel xHCI device ids that have an
 /// EHCI companion; a clean no-op on everything else (QEMU's qemu-xhci is vendor 0x1b36, not Intel).
-/// Mirrors Linux's `usb_enable_intel_xhci_ports`. Must run while the controller is halted, before
-/// it starts.
+///
+/// VERIFIED BY REFERENCE against Linux `drivers/usb/host/pci-quirks.c usb_enable_intel_xhci_ports()`:
+/// the offsets (XUSB2PR 0xD0 / USB2PRM 0xD4 / USB3_PSSEN 0xD8 / USB3PRM 0xDC), the straight
+/// PRM(mask)->SELECT copy with no masking, and the order (enable SuperSpeed before routing USB2)
+/// all match. Linux applies the quirk before the controller enumerates, which this does (it runs
+/// in `init` before `xhci::init` resets+starts the controller). 0x1E31 is the Panther Point part
+/// on the MacBookPro10,1. NOT yet confirmed on metal — the config-space read-back below is what
+/// lets a real-HW boot tell whether the mux actually toggled or firmware locked the bits.
 fn enable_intel_xhci_ports(bus: u8, dev: u8, func: u8) {
     const XUSB2PR: u8 = 0xD0;
     const USB2PRM: u8 = 0xD4;
@@ -94,11 +100,22 @@ fn enable_intel_xhci_ports(bus: u8, dev: u8, func: u8) {
     ];
 
     unsafe {
-        if read_config_16(bus, dev, func, 0x00) != 0x8086 {
+        let vendor = read_config_16(bus, dev, func, 0x00);
+        let device = read_config_16(bus, dev, func, 0x02);
+        // Always log the controller's identity (and the routing decision) so a serial-less metal
+        // boot can SEE which xHCI this is and why routing did or didn't apply — the live test of
+        // whether the rMBP's Panther Point id (0x1e31) is the one we gate on.
+        serial_println!(":: xHCI PCI id {:04x}:{:04x} @ {}:{}.{} ::", vendor, device, bus, dev, func);
+        if vendor != 0x8086 {
+            serial_println!(":: xHCI not Intel — no PCH port routing applies ::");
             return; // not Intel
         }
-        let device = read_config_16(bus, dev, func, 0x02);
         if !SWITCHABLE.contains(&device) {
+            serial_println!(
+                ":: xHCI Intel {:04x} not in the shared-port list — no routing applied (firmware may \
+                 have already routed the ports, or there's no EHCI companion) ::",
+                device
+            );
             return; // Intel, but not a shared-port xHCI
         }
 
@@ -107,9 +124,15 @@ fn enable_intel_xhci_ports(bus: u8, dev: u8, func: u8) {
         let usb2 = read_config_32(bus, dev, func, USB2PRM);
         write_config_32(bus, dev, func, XUSB2PR, usb2); // route USB2 ports to xHCI
 
+        // Read the SELECT registers back. On metal this is the proof the mux toggled: a read-back
+        // that equals the mask we wrote confirms routing took; a smaller/zero value means firmware
+        // locked some port bits (Apple EFI may pre-own or refuse to release shared ports). Linux
+        // logs the same via dev_dbg. Harmless plain reads.
+        let ss_rb = read_config_32(bus, dev, func, USB3_PSSEN);
+        let usb2_rb = read_config_32(bus, dev, func, XUSB2PR);
         serial_println!(
-            ":: Intel xHCI port routing applied (dev {:#06x}): USB3_PSSEN={:#010x} XUSB2PR={:#010x} ::",
-            device, ss, usb2
+            ":: Intel xHCI port routing applied (dev {:#06x}): USB3_PSSEN {:#010x}->{:#010x} XUSB2PR {:#010x}->{:#010x} ::",
+            device, ss, ss_rb, usb2, usb2_rb
         );
     }
 }
@@ -174,10 +197,18 @@ pub fn init(_dtb_addr: u64, _dtb_size: usize) {
     // Network controller (PCI class 0x02 = Network, subclass 0x00 = Ethernet).
     // QEMU's e1000 (82540EM) lands here; bring it up for polled RX.
     if let Some((bus, slot, func)) = crate::drivers::pci::PciScanner::find_device(0x02, 0x00) {
+        let vendor = unsafe { read_config_16(bus, slot, func, 0x00) };
         serial_println!(
-            ":: x86_64 PCI: Found network controller (class 0x02) at {}:{}.{} ::",
-            bus, slot, func
+            ":: x86_64 PCI: Found network controller (class 0x02) vendor {:#06x} at {}:{}.{} ::",
+            vendor, bus, slot, func
         );
+        // Only the Intel e1000/e1000e family is supported. On a real 2012 MacBook Pro the NIC is a
+        // Broadcom Wi-Fi part (vendor 0x14e4) that also reports class 0x02 — poking it with e1000
+        // register writes is wrong and its RX/TX bring-up (+ DHCP) just stalls. Gate to Intel.
+        if vendor != 0x8086 {
+            serial_println!(":: x86_64 PCI: non-Intel NIC ({:#06x}) — no e1000 driver, skipping ::", vendor);
+            return;
+        }
         crate::drivers::e1000::init(bus, slot, func);
         // Route the NIC's RX interrupt to the BSP local APIC via MSI (IDT vector 0x41),
         // the same local-APIC delivery the xHCI uses. The e1000e keeps its MSI-X table in

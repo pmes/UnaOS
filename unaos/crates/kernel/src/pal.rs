@@ -119,6 +119,13 @@ fn pop_event() -> Option<Event> {
     crate::arch::without_interrupts(|| EVENT_QUEUE.lock().pop())
 }
 
+/// Drain one queued input event without a GUI surface. Used by the `usbdebug` boot mode to print
+/// live keypresses / mouse deltas straight to the framebuffer console (the normal path consumes
+/// events through `TargetPal::poll_event`).
+pub fn next_event() -> Option<Event> {
+    pop_event()
+}
+
 // --- PAL IMPLEMENTATION ---
 pub struct TargetPal<'a> {
     pub surface: &'a mut Screen,

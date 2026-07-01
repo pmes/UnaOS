@@ -69,10 +69,10 @@ pub extern "C" fn __rust_boot(dtb: u64) -> ! {
     kernel_main(boot_info)
 }
 
-// The `bootlog` feature halts before the GUI, and `baremetal` enters a serial-only loop instead —
-// both make the GUI/main-loop code below unreachable.
-#[cfg_attr(feature = "bootlog", allow(unreachable_code))]
-#[cfg_attr(feature = "baremetal", allow(unreachable_code))]
+// `bootlog` halts before the GUI, `usbdebug` loops forever before it, and `baremetal` enters a
+// serial-only loop (or hands the GUI to scheduled tasks) instead — all make the GUI/main-loop code
+// below unreachable in those builds.
+#[cfg_attr(any(feature = "bootlog", feature = "usbdebug", feature = "baremetal"), allow(unreachable_code))]
 fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     // 0. Framebuffer log sink FIRST — mirror every serial_println! (and panics) to the screen,
     //    so boot diagnostics are visible on real hardware that has no serial port. No-op if the
@@ -141,6 +141,27 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     #[cfg(target_arch = "x86_64")]
     unaos_kernel::arch::acpi::init(rsdp_addr);
 
+    // 4b'. VT-d / IOMMU check (F5): the kernel DMAs untranslated, identity-mapped heap buffers to
+    // xHCI/e1000. If firmware has DMA remapping ENABLED, that DMA is blocked — report it before USB
+    // bring-up so a metal boot sees the cause instead of a silent xHCI failure.
+    #[cfg(target_arch = "x86_64")]
+    unaos_kernel::arch::acpi::dmar_report(rsdp_addr);
+
+    // 4b''. Timebase reference: prove the ACPI PM timer (fixed 3.579545 MHz) is live before we
+    // calibrate the TSC / APIC timer against it. On a serial-less laptop this line is the evidence
+    // the calibration clock works; "STUCK?" or "not found" means the timebase stays uncalibrated.
+    #[cfg(target_arch = "x86_64")]
+    unaos_kernel::arch::acpi::pm_timer_report(rsdp_addr);
+
+    // 4b'''. Calibrate the TSC and the local-APIC timer against the PM timer, so tick-based timing
+    // (scheduler sleeps, net RTO) and cycle-based busy-wait budgets become real wall-clock on this
+    // machine's unknown Ivy Bridge crystal. Must precede SMP/scheduler bring-up so the APs inherit
+    // the calibrated timer. No-op (fixed fallbacks) if the PM timer is absent.
+    #[cfg(target_arch = "x86_64")]
+    if let Some(pm) = unaos_kernel::arch::acpi::pm_timer(rsdp_addr) {
+        unaos_kernel::arch::apic::calibrate(&pm);
+    }
+
     // 4c. SMP: start the application processors (INIT-SIPI-SIPI). Each AP brings up its own
     // per-CPU GDT/TSS + local APIC, then waits to enter its scheduler loop; the BSP continues to
     // drive everything below. `start_aps` also runs the post-bring-up SMP smoke test while the
@@ -155,8 +176,25 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     #[cfg(target_arch = "x86_64")]
     {
         unaos_kernel::arch::sched::init();
-        let online = unaos_kernel::arch::smp::online_aps();
-        unaos_kernel::arch::sched::start_demo(&online);
+        // The demo workload (incl. the RwLock self-test) uses tick-based timing. The APIC timer is
+        // now calibrated to a real 1 kHz (see step 4b'''), so it runs at normal speed on metal —
+        // no more multi-minute stall. It's still just a QEMU-verified smoke test, so keep it opt-in
+        // (UNAOS_SCHED_DEMO=1 -> `sched_demo` feature); by default the scheduler initializes but no
+        // demo threads spawn. Never in usbdebug.
+        #[cfg(all(feature = "sched_demo", not(feature = "usbdebug")))]
+        {
+            let online = unaos_kernel::arch::smp::online_aps();
+            unaos_kernel::arch::sched::start_demo(&online);
+        }
+    }
+
+    // 4e. Prove the global ms-clock is real: with every core now online and ticking at 1 kHz, the
+    // shared `ticks()` clock must still advance at ~1000 Hz (only the BSP drives it). This is the
+    // wall-clock assertion the calibration hinges on — a reading of ~N×1000 would betray an SMP
+    // over-count. Surfaced on the framebuffer for the serial-less metal boot.
+    #[cfg(target_arch = "x86_64")]
+    if let Some(pm) = unaos_kernel::arch::acpi::pm_timer(rsdp_addr) {
+        unaos_kernel::arch::apic::report_tick_rate(&pm);
     }
 
     // 5. Motherboard Hardware Interconnects (xHCI/USB bring-up).
@@ -213,11 +251,9 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
 
     // Bare-metal Pi 4: booted straight from the microSD slot via the GPU ROM, no UEFI. Phase 2 asks
     // the VideoCore GPU for a framebuffer over the mailbox (in build_boot_info), so on a Pi with HDMI
-    // `framebuffer_addr` is now non-zero and we fall through to the full GUI path below — the PL011
-    // serves as the keyboard (the main loop polls it on aarch64). If the mailbox allocation failed
-    // (or a headless config), fall back to the Phase-1 serial-only console: arch::init already
-    // streamed EL/GIC/timer-LIVE to the PL011, so this just echoes input. The timer heartbeat keeps
-    // WFI waking, so input is serviced promptly.
+    // `framebuffer_addr` is now non-zero and we fall through to the GUI path below (which, with APs
+    // online, is handed to the scheduled input+render tasks; the BSP idles). If the mailbox
+    // allocation failed (or a headless config), fall back to the Phase-1 serial-only console.
     #[cfg(feature = "baremetal")]
     if framebuffer_addr == 0 {
         let _ = (framebuffer_size, info); // unused on the serial-only path
@@ -236,6 +272,43 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         }
     } else {
         serial_println!(":: UnaOS bare-metal — Pi 4, VideoCore framebuffer up; starting GUI ::");
+    }
+
+    // USB bring-up debug view (serial-less hardware): keep the boot log on the framebuffer (no GUI
+    // takeover, no fbcon detach) and run the full main-loop USB path, printing each input event.
+    // So external USB storage/keyboard/mouse enumeration AND live input are visible + photographable
+    // on metal. (Net service is intentionally skipped here so a non-e1000 NIC isn't poked.)
+    #[cfg(feature = "usbdebug")]
+    {
+        // Clear the boot spam so the (post-boot) hot-plug enumeration + live input own the screen.
+        unaos_kernel::video::fbcon::clear();
+        serial_println!(":: ============== USB DEBUG MODE ============== ::");
+        serial_println!(":: Enumerating USB. Plug in a stick / keyboard / mouse, then type or move the mouse. ::");
+        serial_println!(":: Watch for: 'MISSION SUCCESS' (storage), 'POINTER ... ABSOLUTE/RELATIVE', 'KEY', and the USB-DEBUG lines below. ::");
+        loop {
+            if let Some(xhci) = &mut *unaos_kernel::drivers::xhci::XHCI_CONTROLLER.lock() {
+                xhci.poll_events();
+                xhci.service_storage();
+                xhci.service_hubs();
+                xhci.service_hid_setproto();
+            }
+            while let Some(event) = unaos_kernel::pal::next_event() {
+                match event {
+                    unaos_kernel::pal::Event::Key(c) => {
+                        let ch = c as char;
+                        serial_println!("USB-DEBUG: KEY {:#04x} '{}'", c, if c >= 32 && c < 127 { ch } else { '.' });
+                    }
+                    unaos_kernel::pal::Event::Mouse { x, y } => {
+                        serial_println!("USB-DEBUG: MOUSE relative dx={} dy={}", x, y);
+                    }
+                    unaos_kernel::pal::Event::MouseAbsolute { x, y } => {
+                        serial_println!("USB-DEBUG: MOUSE absolute x={} y={}", x, y);
+                    }
+                    _ => {}
+                }
+            }
+            unaos_kernel::hlt();
+        }
     }
 
     if framebuffer_addr != 0 {
@@ -316,6 +389,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
             xhci.poll_events();
             xhci.service_storage();
             xhci.service_hubs();
+            xhci.service_hid_setproto();
         }
 
         // Drain any frames the NIC has received into the network stack (no-op when
@@ -331,48 +405,69 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
             unaos_kernel::pal::push_event(unaos_kernel::pal::Event::Key(byte));
         }
 
-        let event = pal.poll_event();
-        match event {
-            unaos_kernel::pal::Event::Key(c) => {
-                handle_key(c, &mut console, &mut pal);
+        // Drain ALL queued input events this iteration, then present ONE frame below. A burst of
+        // mouse-move reports (or fast typing) must not back up one-event-per-iteration behind the
+        // framebuffer flush — at native resolution that flush is slow, so processing a single event
+        // per loop made input lag badly (the cursor never caught up; typed text appeared seconds
+        // late). Apply every pending event to the back buffer here; `render()` coalesces them.
+        let mut had_event = false;
+        loop {
+            match pal.poll_event() {
+                unaos_kernel::pal::Event::None => break,
+                unaos_kernel::pal::Event::Key(c) => {
+                    had_event = true;
+                    // `handle_key` returns true if the command took over the whole screen (e.g.
+                    // `vug`); stop draining this frame so a keystroke already queued behind Enter
+                    // can't paint the console back over the full-screen output — present it alone,
+                    // handle the rest next frame. (Shared with the scheduled render service.)
+                    if handle_key(c, &mut console, &mut pal) {
+                        break;
+                    }
+                }
+                unaos_kernel::pal::Event::Mouse { x, y } => {
+                    had_event = true;
+                    // Erase old cursor (draw background color over it)
+                    pal.draw_rect(mouse_px as usize, mouse_py as usize, 10, 10, 0x1E1E1E);
+
+                    // Update position with deltas
+                    mouse_px += x;
+                    mouse_py += y;
+
+                    // Clamp to screen bounds
+                    if mouse_px < 0 { mouse_px = 0; }
+                    if mouse_py < 0 { mouse_py = 0; }
+                    if mouse_px as u32 >= pal.width() { mouse_px = pal.width() as i32 - 10; }
+                    if mouse_py as u32 >= pal.height() { mouse_py = pal.height() as i32 - 10; }
+
+                    // Draw new cursor (a bright red 10x10 square)
+                    pal.draw_rect(mouse_px as usize, mouse_py as usize, 10, 10, 0xFF0000);
+                }
+                unaos_kernel::pal::Event::MouseAbsolute { x, y } => {
+                    had_event = true;
+                    // Erase old cursor
+                    pal.draw_rect(mouse_px as usize, mouse_py as usize, 10, 10, 0x1E1E1E);
+
+                    // Scale 0-32767 coordinate space to screen bounds
+                    mouse_px = ((x as i64 * pal.width() as i64) / 32767) as i32;
+                    mouse_py = ((y as i64 * pal.height() as i64) / 32767) as i32;
+
+                    // Clamp just in case
+                    if mouse_px < 0 { mouse_px = 0; }
+                    if mouse_py < 0 { mouse_py = 0; }
+                    if mouse_px as u32 >= pal.width() { mouse_px = pal.width() as i32 - 10; }
+                    if mouse_py as u32 >= pal.height() { mouse_py = pal.height() as i32 - 10; }
+
+                    // Draw new cursor
+                    pal.draw_rect(mouse_px as usize, mouse_py as usize, 10, 10, 0xFF0000);
+                }
+                // Timer / Unknown: nothing to do.
+                _ => {}
             }
-            unaos_kernel::pal::Event::Mouse { x, y } => {
-                // Erase old cursor (draw background color over it)
-                pal.draw_rect(mouse_px as usize, mouse_py as usize, 10, 10, 0x1E1E1E);
+        }
 
-                // Update position with deltas
-                mouse_px += x;
-                mouse_py += y;
-
-                // Clamp to screen bounds
-                if mouse_px < 0 { mouse_px = 0; }
-                if mouse_py < 0 { mouse_py = 0; }
-                if mouse_px as u32 >= pal.width() { mouse_px = pal.width() as i32 - 10; }
-                if mouse_py as u32 >= pal.height() { mouse_py = pal.height() as i32 - 10; }
-
-                // Draw new cursor (a bright red 10x10 square)
-                pal.draw_rect(mouse_px as usize, mouse_py as usize, 10, 10, 0xFF0000);
-            }
-            unaos_kernel::pal::Event::MouseAbsolute { x, y } => {
-                // Erase old cursor
-                pal.draw_rect(mouse_px as usize, mouse_py as usize, 10, 10, 0x1E1E1E);
-
-                // Scale 0-32767 coordinate space to screen bounds
-                mouse_px = ((x as i64 * pal.width() as i64) / 32767) as i32;
-                mouse_py = ((y as i64 * pal.height() as i64) / 32767) as i32;
-
-                // Clamp just in case
-                if mouse_px < 0 { mouse_px = 0; }
-                if mouse_py < 0 { mouse_py = 0; }
-                if mouse_px as u32 >= pal.width() { mouse_px = pal.width() as i32 - 10; }
-                if mouse_py as u32 >= pal.height() { mouse_py = pal.height() as i32 - 10; }
-
-                // Draw new cursor
-                pal.draw_rect(mouse_px as usize, mouse_py as usize, 10, 10, 0xFF0000);
-            }
-            _ => {
-                unaos_kernel::hlt();
-            }
+        // Nothing queued — sleep until the next interrupt (timer/xHCI) rather than busy-spin.
+        if !had_event {
+            unaos_kernel::hlt();
         }
 
         // Present this frame: flush the damaged region of the back buffer to the framebuffer.
@@ -382,15 +477,16 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
 }
 
 /// Handle one keyboard byte against the console: printable ASCII extends the input line, backspace
-/// (BS/DEL) erases, and CR/LF dispatches the line as a shell command — a command that takes over the
-/// whole screen (e.g. `vug`) is left up until the next keypress. Shared by the BSP GUI loop (x86 /
-/// aarch64-UEFI / the no-AP fallback) and the M5b scheduled render service, so both drive the console
-/// identically.
+/// (BS/DEL) erases, and CR/LF dispatches the line as a shell command. Returns `true` iff the command
+/// took over the whole screen (e.g. `vug`) — in which case the console is NOT repainted over it, and
+/// a drain-loop caller should stop draining this frame so a queued keystroke can't paint the console
+/// back over the full-screen output. Shared by the BSP GUI loop (x86 / aarch64-UEFI / the no-AP
+/// fallback) and the scheduled render service, so both drive the console identically.
 fn handle_key(
     c: u8,
     console: &mut unaos_kernel::console::Console,
     pal: &mut unaos_kernel::pal::TargetPal<'_>,
-) {
+) -> bool {
     if c == b'\n' || c == b'\r' {
         let cmd = console.current_input.clone();
         console.current_input.clear();
@@ -398,6 +494,7 @@ fn handle_key(
         if !took_screen {
             console.draw(pal);
         }
+        return took_screen;
     } else if c == 8 || c == 0x7F {
         console.current_input.pop();
         console.draw_input_line(pal);
@@ -405,6 +502,7 @@ fn handle_key(
         console.current_input.push(c as char);
         console.draw_input_line(pal);
     }
+    false
 }
 
 /// M5b: the keyboard-event channel from the input service to the render service (bare-metal aarch64).

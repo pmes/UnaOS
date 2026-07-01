@@ -107,14 +107,20 @@ extern "x86-interrupt" fn double_fault_handler(
 }
 
 extern "x86-interrupt" fn timer_interrupt_handler(_stack_frame: InterruptStackFrame) {
-    // Local APIC timer tick. Lock-free: bump the global heartbeat plus this CPU's own tick
-    // counter (each core's timer fires independently), then issue an APIC EOI.
-    let prev = crate::arch::apic::APIC_TICKS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    // Local APIC timer tick. Lock-free. This CPU's own tick counter (each core's timer fires
+    // independently at the calibrated 1 kHz) drives the per-CPU `sleep_ticks` deadlines.
     crate::arch::percpu::note_tick();
-    // One-shot breadcrumb the very first time any CPU's timer fires — confirms the local-APIC
-    // timer path (xAPIC MMIO or x2APIC MSR LVT) is delivering, without spamming every tick.
-    if prev == 0 {
-        serial_println!("APIC: heartbeat live (first timer tick).");
+    // The GLOBAL millisecond clock (`APIC_TICKS`, read by `ticks()`/`ms()`) is advanced by ONE core
+    // only — the BSP (logical cpu 0). Every core ticks at 1 kHz, so summing all of them would run
+    // the "ms since boot" clock at (core-count) kHz — 8× fast on the 8-core rMBP. The BSP is always
+    // online and services the main loop, so its 1 kHz tick is the single-rate wall-clock heartbeat.
+    if crate::arch::percpu::this_cpu().cpu_index == 0 {
+        let prev = crate::arch::apic::APIC_TICKS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        // One-shot breadcrumb the first time the BSP's timer fires — confirms the local-APIC timer
+        // path (xAPIC MMIO or x2APIC MSR LVT) is delivering, without spamming every tick.
+        if prev == 0 {
+            serial_println!("APIC: heartbeat live (first timer tick).");
+        }
     }
     // EOI BEFORE any context switch: otherwise the in-service bit would block this CPU's
     // subsequent timer ticks for the whole descheduled lifetime of a preempted task.

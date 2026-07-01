@@ -31,6 +31,7 @@ const REG_LVT_TIMER: usize = 0x320; // LVT Timer entry
 const REG_LVT_LINT0: usize = 0x350; // LVT LINT0 entry
 const REG_LVT_LINT1: usize = 0x360; // LVT LINT1 entry
 const REG_TIMER_INITCNT: usize = 0x380; // Timer Initial Count
+const REG_TIMER_CURRCNT: usize = 0x390; // Timer Current Count (read-only, counts down)
 const REG_TIMER_DIVIDE: usize = 0x3E0; // Timer Divide Configuration
 
 // x2APIC MSR indices (the same registers, addressed as MSRs).
@@ -45,6 +46,7 @@ const X2_LVT_TIMER: u32 = 0x832;
 const X2_LVT_LINT0: u32 = 0x835;
 const X2_LVT_LINT1: u32 = 0x836;
 const X2_TIMER_INITCNT: u32 = 0x838;
+const X2_TIMER_CURRCNT: u32 = 0x839;
 const X2_TIMER_DIVIDE: u32 = 0x83E;
 
 /// True once any CPU has switched to x2APIC. Set on the BSP in `init`; the APs read it (in their
@@ -52,9 +54,21 @@ const X2_TIMER_DIVIDE: u32 = 0x83E;
 /// from interrupt context (the hot path `eoi` reads it).
 static X2APIC: AtomicBool = AtomicBool::new(false);
 
-/// Monotonic count of local-APIC timer ticks since boot. A periodic heartbeat / hlt wake source
-/// (and the basis for a future scheduler tick / uptime).
+/// Monotonic global timebase: milliseconds since boot once the timer is calibrated to 1 kHz.
+/// Advanced by the BSP's timer ISR ONLY (see `timer_interrupt_handler`) so it stays single-rate
+/// regardless of how many cores are online — every core ticks at 1 kHz, so summing them would run
+/// this clock at (core-count) kHz. Read via `ticks()` / `arch::ms()`. Per-CPU `sleep_ticks`
+/// deadlines use the per-CPU counter instead (each core's own timer), not this global.
 pub static APIC_TICKS: AtomicU64 = AtomicU64::new(0);
+
+/// Calibrated invariant-TSC frequency in Hz, or 0 until `calibrate` succeeds. rdtsc is invariant
+/// on Nehalem+ (incl. the Ivy Bridge rMBP), so this is a stable per-machine constant once measured.
+static TSC_HZ: AtomicU64 = AtomicU64::new(0);
+
+/// Calibrated local-APIC timer rate in Hz *after* the ÷16 divider — i.e. how fast the LVT-timer
+/// down-counter actually decrements — or 0 until `calibrate` succeeds. The initial count for an
+/// N-Hz periodic tick is `APIC_TIMER_HZ / N`.
+static APIC_TIMER_HZ: AtomicU64 = AtomicU64::new(0);
 
 #[inline]
 fn x2apic() -> bool {
@@ -141,30 +155,218 @@ pub fn init() {
     init_timer();
 }
 
+/// Target heartbeat rate: 1000 Hz => one tick per millisecond, so `ticks()`/`sleep_ticks` become
+/// real wall-clock once the timer is calibrated.
+const TICK_HZ: u64 = 1000;
+
+/// Fixed fallback initial count, used before/without calibration (steady but ~0.8 ms/tick on QEMU,
+/// unknown on metal — the original empirical value).
+const FIXED_INITCNT: u32 = 50_000;
+
 /// Start the local APIC timer in periodic mode at the IDT timer vector, as the system heartbeat
 /// / hlt wake source (replacing the retired 8254 PIT).
 ///
-/// The initial count is a fixed empirical value: the APIC timer counts at the (unknown,
-/// per-machine) core-crystal frequency, so this gives some convenient rate on QEMU but NOT a
-/// precise tick. Exact timing is not needed yet (the tick is only a wake source). Real hardware
-/// will need calibration (CPUID leaf 0x15 / TSC-deadline) — deferred.
+/// The initial count comes from calibration when available: `APIC_TIMER_HZ` (the post-÷16 count
+/// rate, measured against the ACPI PM timer in `calibrate`) divided by `TICK_HZ` gives a real
+/// 1 kHz tick on any machine. Before calibration — the BSP's first arm, in `arch::init`, runs
+/// before ACPI is parsed — it uses the fixed empirical count. Callable by the BSP and each AP;
+/// APs come up after `calibrate` has stored the rate, so they inherit the calibrated count.
 pub fn init_timer() {
     let vector = crate::arch::interrupts::TIMER_VECTOR as u32;
+    let hz = APIC_TIMER_HZ.load(Ordering::Relaxed);
+    let (initcnt, calibrated) = if hz != 0 {
+        // hz is counts/sec after the ÷16 divider; INITCNT reloads each period, so period = INITCNT
+        // / hz and rate = hz / INITCNT. .max(1) guards a degenerate rate (0 would halt the timer).
+        (((hz / TICK_HZ) as u32).max(1), true)
+    } else {
+        (FIXED_INITCNT, false)
+    };
     unsafe {
         // Divide the input clock by 16 (encoding 0b0011).
         lapic_write(REG_TIMER_DIVIDE, X2_TIMER_DIVIDE, 0x3);
         // LVT Timer: vector, bit 17 = periodic mode, bit 16 (mask) = 0.
         lapic_write(REG_LVT_TIMER, X2_LVT_TIMER, vector | (1 << 17));
         // Writing the initial count (last) arms the countdown; it reloads each period.
-        lapic_write(REG_TIMER_INITCNT, X2_TIMER_INITCNT, 50_000);
+        lapic_write(REG_TIMER_INITCNT, X2_TIMER_INITCNT, initcnt);
     }
-    serial_println!("APIC: timer armed (vector {:#x}, periodic, ÷16).", vector);
+    serial_println!(
+        "APIC: timer armed (vector {:#x}, periodic, ÷16, initcnt={} [{}]).",
+        vector,
+        initcnt,
+        if calibrated { "1 kHz calibrated" } else { "fixed" }
+    );
 }
 
-/// Number of local-APIC timer ticks since boot.
+/// Calibrate the invariant TSC and the local-APIC timer against the fixed-frequency ACPI PM timer.
+///
+/// Ivy Bridge predates CPUID leaf 0x15/0x16, so neither the TSC nor the APIC-timer crystal rate is
+/// discoverable — we *measure* them. Over one known PM-timer window (`CALIB_MS`) we count both how
+/// many rdtsc cycles and how many APIC-timer counts elapse, then scale by the PM timer's spec
+/// frequency to get each in Hz. rdtsc is invariant (constant rate across P-/C-/T-states), so its
+/// measured Hz is a durable machine constant; the APIC rate lets us later pick an initial count
+/// for an exact tick (commit 3 wires both into the timebase).
+///
+/// Runs with interrupts masked: the APIC timer is briefly repurposed as a free-running one-shot
+/// down-counter (masked, so it never raises its IRQ) to be sampled, then the periodic heartbeat is
+/// re-armed via `init_timer` before returning. On any failure (no PM advance, insane result) it
+/// re-arms the timer and leaves the calibrated values at 0 so callers keep the fixed fallbacks.
+pub fn calibrate(pm: &crate::arch::acpi::PmTimer) {
+    /// Measurement window. 100 ms is long enough to average out I/O-read jitter yet only ~2% of a
+    /// 24-bit PM timer's ~4.687 s wrap period, so the single-wrap `delta` stays valid.
+    const CALIB_MS: u64 = 100;
+    /// Hard ceiling on the calibration spin in rdtsc cycles (~4–20 s across 1–5 GHz): a backstop so
+    /// a wedged/absent PM timer aborts instead of hanging the serial-less boot.
+    const CALIB_MAX_TSC: u64 = 20_000_000_000;
+
+    let pm_hz = crate::arch::acpi::PM_TIMER_HZ;
+    let target_pm = (pm_hz * CALIB_MS / 1000) as u32; // ~357_954 ticks, << 2^24
+
+    let (tsc_delta, apic_counts, elapsed_pm) = crate::arch::without_interrupts(|| unsafe {
+        // Repurpose the APIC timer as a masked one-shot down-counter from the max initial count.
+        // Masking (bit 16) stops IRQ delivery but NOT the counting, so we sample it freely; one-shot
+        // (bits 18:17 = 00) means it counts toward 0 and stops — and 0xFFFF_FFFF counts at the ÷16
+        // rate take many seconds to reach 0, far longer than the window, so it never underflows.
+        let vector = crate::arch::interrupts::TIMER_VECTOR as u32;
+        lapic_write(REG_TIMER_DIVIDE, X2_TIMER_DIVIDE, 0x3); // ÷16, same divider as the heartbeat
+        lapic_write(REG_LVT_TIMER, X2_LVT_TIMER, vector | (1 << 16)); // masked, one-shot
+        lapic_write(REG_TIMER_INITCNT, X2_TIMER_INITCNT, 0xFFFF_FFFF); // arm; starts counting down
+
+        let pm_start = pm.read();
+        let tsc_start = crate::arch::now_cycles();
+
+        // Spin until the PM timer has advanced the target, bailing if it never does.
+        let mut aborted = false;
+        loop {
+            if pm.delta(pm_start, pm.read()) >= target_pm {
+                break;
+            }
+            if crate::arch::now_cycles().wrapping_sub(tsc_start) > CALIB_MAX_TSC {
+                aborted = true;
+                break;
+            }
+            core::hint::spin_loop();
+        }
+
+        // Sample all three clocks as close together as possible at the window's end.
+        let apic_curr = lapic_read(REG_TIMER_CURRCNT, X2_TIMER_CURRCNT);
+        let tsc_end = crate::arch::now_cycles();
+        let pm_end = pm.read();
+
+        if aborted {
+            (0u64, 0u64, 0u64)
+        } else {
+            (
+                tsc_end.wrapping_sub(tsc_start),
+                0xFFFF_FFFFu32.wrapping_sub(apic_curr) as u64,
+                pm.delta(pm_start, pm_end) as u64,
+            )
+        }
+    });
+
+    // Re-arm the periodic heartbeat we borrowed for the measurement, regardless of outcome.
+    init_timer();
+
+    if elapsed_pm == 0 {
+        serial_println!("APIC: calibration ABORTED (PM timer did not advance) — timebase stays uncalibrated.");
+        return;
+    }
+
+    // Scale each count to Hz by the PM timer's fixed frequency. u128 intermediates: at 5 GHz a
+    // 100 ms window is ~5e8 cycles, and 5e8 * 3.58e6 ≈ 1.8e15 — fine for u128, tight for u64 only
+    // if the window grew, so keep the widening explicit.
+    let tsc_hz = ((tsc_delta as u128) * (pm_hz as u128) / (elapsed_pm as u128)) as u64;
+    let apic_hz = ((apic_counts as u128) * (pm_hz as u128) / (elapsed_pm as u128)) as u64;
+
+    // Sanity gate: a plausible TSC is 0.2–20 GHz and the ÷16 APIC rate is a few MHz to ~1 GHz.
+    // Anything outside that is a bad measurement (SMI storm, wrong port) — discard and stay fixed.
+    let sane = (200_000_000..=20_000_000_000).contains(&tsc_hz) && (100_000..=2_000_000_000).contains(&apic_hz);
+    if !sane {
+        serial_println!(
+            "APIC: calibration REJECTED (implausible: TSC {} Hz, APIC ÷16 {} Hz over {} PM ticks) — staying uncalibrated.",
+            tsc_hz, apic_hz, elapsed_pm
+        );
+        return;
+    }
+
+    TSC_HZ.store(tsc_hz, Ordering::Relaxed);
+    APIC_TIMER_HZ.store(apic_hz, Ordering::Relaxed);
+    serial_println!(
+        "APIC: calibrated over {} PM ticks ({} ms) — TSC {}.{:03} GHz, APIC timer {}.{:03} MHz (÷16); 1 kHz tick => initcnt {}.",
+        elapsed_pm,
+        elapsed_pm * 1000 / pm_hz,
+        tsc_hz / 1_000_000_000,
+        (tsc_hz % 1_000_000_000) / 1_000_000,
+        apic_hz / 1_000_000,
+        (apic_hz % 1_000_000) / 1_000,
+        apic_hz / 1_000
+    );
+}
+
+/// Calibrated invariant-TSC frequency in Hz, or 0 if calibration has not run / failed.
+#[inline]
+pub fn tsc_hz() -> u64 {
+    TSC_HZ.load(Ordering::Relaxed)
+}
+
+/// Calibrated post-÷16 APIC-timer rate in Hz, or 0 if calibration has not run / failed.
+#[inline]
+pub fn apic_timer_hz() -> u64 {
+    APIC_TIMER_HZ.load(Ordering::Relaxed)
+}
+
+/// Milliseconds since boot (the global 1 kHz timebase; see `APIC_TICKS`).
 #[inline]
 pub fn ticks() -> u64 {
     APIC_TICKS.load(Ordering::Relaxed)
+}
+
+/// One-time diagnostic: measure the *global* ms-clock rate (`ticks()`) against the PM timer over a
+/// short window and log it. Run AFTER calibration and SMP bring-up (all APs online + ticking).
+///
+/// The assertion that matters is CORE-COUNT INDEPENDENCE: only the BSP advances the global, so this
+/// must read ~1 kHz whether 1 or 8 cores are online. A reading near N×1000 would mean the per-core
+/// tick leaked back into the global — the exact SMP over-count this timebase is built to avoid — so
+/// this is the wall-clock check that catches it on the serial-less metal boot (QEMU's other checks
+/// never look at absolute ms). The ABSOLUTE rate reads a bit low under QEMU/TCG because a busy-poll
+/// loop makes the emulator coalesce periodic timer interrupts (the interrupt-*delivery* rate drops
+/// even though the programmed period, measured by the one-shot in `calibrate`, is exactly 1 ms); a
+/// precise APIC timer on metal doesn't drop ticks, so it should read ~1000 there.
+pub fn report_tick_rate(pm: &crate::arch::acpi::PmTimer) {
+    const WINDOW_MS: u64 = 50;
+    /// rdtsc-cycle backstop (~4–20 s across 1–5 GHz) so a wedged PM timer can't hang the report.
+    const MAX_TSC: u64 = 20_000_000_000;
+
+    let pm_hz = crate::arch::acpi::PM_TIMER_HZ;
+    let target_pm = (pm_hz * WINDOW_MS / 1000) as u32;
+    let pm_start = pm.read();
+    let tsc_start = crate::arch::now_cycles();
+    let ticks_start = ticks();
+
+    // Busy-wait a real PM-timer window with interrupts ENABLED, so the periodic timer ISR advances
+    // the global clock while we watch. (Not `without_interrupts` — the whole point is to count ticks.)
+    let mut elapsed_pm = 0u32;
+    loop {
+        elapsed_pm = pm.delta(pm_start, pm.read());
+        if elapsed_pm >= target_pm {
+            break;
+        }
+        if crate::arch::now_cycles().wrapping_sub(tsc_start) > MAX_TSC {
+            break;
+        }
+        core::hint::spin_loop();
+    }
+    if elapsed_pm == 0 {
+        return;
+    }
+
+    let ticks_delta = ticks().wrapping_sub(ticks_start);
+    let observed_hz = (ticks_delta as u128 * pm_hz as u128 / elapsed_pm as u128) as u64;
+    serial_println!(
+        "APIC: global ms-clock {} ticks / {} ms => {} Hz (single-rate; want ~1000 on metal, lower under QEMU/TCG timer coalescing).",
+        ticks_delta,
+        elapsed_pm as u64 * 1000 / pm_hz,
+        observed_hz
+    );
 }
 
 /// Signal End-Of-Interrupt to the local APIC. Called from every APIC-delivered handler (the
