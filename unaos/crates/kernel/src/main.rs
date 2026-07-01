@@ -131,31 +131,10 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     // delivery, so the APs run their tasks to completion sequentially. The BSP is never scheduled —
     // it continues below as the GUI/hardware-service core.
     #[cfg(all(target_arch = "aarch64", feature = "baremetal"))]
-    let input_on_scheduler = {
+    {
         let online = unaos_kernel::arch::smp::online_secondaries();
         unaos_kernel::arch::sched::start_aps(&online);
-        // M5: hand keyboard input to a scheduled kernel thread on a secondary core, so the main loop
-        // below only drains events + renders instead of polling the UART itself — the OS servicing
-        // its own input via the scheduler. Only on the GUI path: the serial-only fallback (no
-        // framebuffer) echoes input on the BSP, and two readers of the one UART would steal each
-        // other's bytes. Needs an online AP to host it; if none came up, the BSP keeps polling.
-        let host = if framebuffer_addr != 0 { online.last().copied() } else { None };
-        if let Some(cpu) = host {
-            unaos_kernel::arch::sched::spawn("input", input_service, 0, cpu);
-            serial_println!(":: INPUT: keyboard service scheduled on core {} (BSP stops polling) ::", cpu);
-            true
-        } else {
-            false
-        }
-    };
-    // aarch64-UEFI (and any non-baremetal aarch64) has no scheduler: the BSP polls input itself.
-    #[cfg(all(target_arch = "aarch64", not(feature = "baremetal")))]
-    let input_on_scheduler = false;
-    // `bootlog` halts (hlt_loop) before the GUI main loop that reads this flag, so its only reader is
-    // unreachable in that build — acknowledge the binding here (reachable, before the halt) to avoid
-    // an unused-variable warning without weakening the flag on the normal GUI path.
-    #[cfg(all(target_arch = "aarch64", feature = "bootlog"))]
-    let _ = input_on_scheduler;
+    }
 
     // 4b. ACPI: discover the CPU topology (MADT) for SMP bring-up. x86_64 only — aarch64
     // discovers CPUs via the DTB. Degrades gracefully to uniprocessor if ACPI is absent.
@@ -271,6 +250,32 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         serial_println!(":: WARNING: No framebuffer detected ::");
     }
 
+    // M5 (bare-metal aarch64): run the interactive OS on its own scheduler. Keyboard input and GUI
+    // render become scheduled kernel threads on secondary cores, communicating over GUI_CHANNEL; the
+    // BSP hands the framebuffer off (globals set above) and idles. Spawn BOTH here, together and only
+    // once the framebuffer is ready, so the input producer never runs without its render consumer
+    // (else a keystroke burst could fill the channel, block send(), and stall UART draining). Host
+    // them on DIFFERENT APs (render on online.first(), input on online.last()) so the Channel
+    // send/recv wakes cross-core — the metal-only path; with a single AP they coincide and cooperate.
+    // Detach fbcon HERE (before the render task paints) so exactly one core writes the framebuffer.
+    // If no AP came up (or the serial-only fallback took the early return), fall through to the shared
+    // BSP loop below, which polls input + renders itself.
+    #[cfg(all(target_arch = "aarch64", feature = "baremetal"))]
+    if framebuffer_addr != 0 {
+        let online = unaos_kernel::arch::smp::online_secondaries();
+        if let (Some(&render_cpu), Some(&input_cpu)) = (online.first(), online.last()) {
+            GUI_CHANNEL.init(); // reserve waiter capacity on the BSP before the tasks block on it
+            unaos_kernel::video::fbcon::detach();
+            unaos_kernel::arch::sched::spawn("input", input_service, 0, input_cpu);
+            unaos_kernel::arch::sched::spawn("render", render_service, 0, render_cpu);
+            serial_println!(
+                ":: INPUT on core {} + RENDER on core {} scheduled (OS on its own scheduler; BSP idle) ::",
+                input_cpu, render_cpu
+            );
+            unaos_kernel::arch::hlt_loop();
+        }
+    }
+
     let mut console = unaos_kernel::console::Console::new();
 
     // Build the double-buffered screen over the framebuffer. FrameBuffer is Copy, so we take a
@@ -304,35 +309,19 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         // no NIC is present, e.g. on aarch64).
         unaos_kernel::drivers::e1000::service_net();
 
-        // aarch64: unless a scheduled input service owns the UART (M5), poll it here and feed the
-        // event queue. Drain all pending bytes so a burst isn't spread one-per-frame.
+        // aarch64 (UEFI, or the bare-metal no-AP fallback): poll the UART here and feed the event
+        // queue, draining all pending bytes so a burst isn't spread one-per-frame. On bare-metal with
+        // APs this loop is never reached — the scheduled input+render services own input and the BSP
+        // idles above — so no two-readers-of-one-UART hazard.
         #[cfg(target_arch = "aarch64")]
-        if !input_on_scheduler {
-            while let Some(byte) = unaos_kernel::arch::poll_input() {
-                unaos_kernel::pal::push_event(unaos_kernel::pal::Event::Key(byte));
-            }
+        while let Some(byte) = unaos_kernel::arch::poll_input() {
+            unaos_kernel::pal::push_event(unaos_kernel::pal::Event::Key(byte));
         }
 
         let event = pal.poll_event();
         match event {
             unaos_kernel::pal::Event::Key(c) => {
-                if c == b'\n' || c == b'\r' {
-                    let cmd = console.current_input.clone();
-                    console.current_input.clear();
-                    // A command may take over the whole screen (e.g. `vug`); don't repaint the
-                    // console over it in that case — leave it up until the next keypress.
-                    let took_screen =
-                        unaos_kernel::shell::dispatch_command(&cmd, &mut console, &mut pal);
-                    if !took_screen {
-                        console.draw(&mut pal);
-                    }
-                } else if c == 8 || c == 0x7F {
-                    console.current_input.pop();
-                    console.draw_input_line(&mut pal);
-                } else if c >= 32 && c <= 126 {
-                    console.current_input.push(c as char);
-                    console.draw_input_line(&mut pal);
-                }
+                handle_key(c, &mut console, &mut pal);
             }
             unaos_kernel::pal::Event::Mouse { x, y } => {
                 // Erase old cursor (draw background color over it)
@@ -379,13 +368,45 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     }
 }
 
+/// Handle one keyboard byte against the console: printable ASCII extends the input line, backspace
+/// (BS/DEL) erases, and CR/LF dispatches the line as a shell command — a command that takes over the
+/// whole screen (e.g. `vug`) is left up until the next keypress. Shared by the BSP GUI loop (x86 /
+/// aarch64-UEFI / the no-AP fallback) and the M5b scheduled render service, so both drive the console
+/// identically.
+fn handle_key(
+    c: u8,
+    console: &mut unaos_kernel::console::Console,
+    pal: &mut unaos_kernel::pal::TargetPal<'_>,
+) {
+    if c == b'\n' || c == b'\r' {
+        let cmd = console.current_input.clone();
+        console.current_input.clear();
+        let took_screen = unaos_kernel::shell::dispatch_command(&cmd, console, pal);
+        if !took_screen {
+            console.draw(pal);
+        }
+    } else if c == 8 || c == 0x7F {
+        console.current_input.pop();
+        console.draw_input_line(pal);
+    } else if c >= 32 && c <= 126 {
+        console.current_input.push(c as char);
+        console.draw_input_line(pal);
+    }
+}
+
+/// M5b: the keyboard-event channel from the input service to the render service (bare-metal aarch64).
+/// The input thread `send`s Key events; the render thread `recv`s them — a cross-core handoff (the two
+/// run on different APs), dogfooding the M4 `Channel`. Capacity 64 matches the old event ring; a full
+/// channel applies backpressure to the input thread rather than dropping keystrokes.
+#[cfg(all(target_arch = "aarch64", feature = "baremetal"))]
+static GUI_CHANNEL: unaos_kernel::arch::sched::Channel<unaos_kernel::pal::Event> =
+    unaos_kernel::arch::sched::Channel::new(64);
+
 /// M5 (bare-metal aarch64): keyboard input as a scheduled kernel service.
 ///
-/// This is the first step of "the OS runs on its own scheduler" — instead of the BSP polling the
-/// PL011 inline in its GUI loop, keyboard input is a kernel thread on a secondary core. It drains
-/// every byte waiting in the UART RX FIFO into the shared `pal` event queue (a cross-core
-/// `spin::Mutex`), which the BSP's render loop pops and dispatches. Only the byte *source* moves off
-/// the BSP; the console behaves identically. Never returns (a service task).
+/// The OS runs its own input on the scheduler: instead of the BSP polling the PL011 inline, this
+/// kernel thread on a secondary core drains every byte waiting in the UART RX FIFO and `send`s each as
+/// a Key event over GUI_CHANNEL to the render service (M5b). Never returns (a service task).
 ///
 /// Between polls it naps so it does not pin its core: on metal the per-core generic-timer tick wakes
 /// it every tick (~4 ms at 250 Hz — imperceptible for typing), and the core WFI-idles in between. In
@@ -395,13 +416,46 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
 fn input_service(_: usize) {
     loop {
         while let Some(byte) = unaos_kernel::arch::poll_input() {
-            unaos_kernel::pal::push_event(unaos_kernel::pal::Event::Key(byte));
+            GUI_CHANNEL.send(unaos_kernel::pal::Event::Key(byte));
         }
         if unaos_kernel::arch::timer::is_live() {
             unaos_kernel::arch::sched::sleep_ticks(1);
         } else {
             unaos_kernel::arch::sched::yield_now();
         }
+    }
+}
+
+/// M5b (bare-metal aarch64): the GUI/render service — the interactive OS as a scheduled kernel task.
+///
+/// Runs on a secondary core (NOT the BSP): builds the double-buffered `Screen` + `Console` over the
+/// framebuffer the BSP initialised in `WRITER` (and detached fbcon from), paints the first frame, then
+/// blocks on GUI_CHANNEL for keyboard events from the input service (a cross-core `recv`) and
+/// dispatches each through the shared `handle_key`, presenting the damaged region after each. Never
+/// returns. Together with `input_service` this is "the OS runs on its own scheduler": input + render
+/// are scheduled kernel threads communicating over a Channel, and the BSP is freed from the GUI loop.
+///
+/// Blocking on `recv` (vs a poll-nap) means whenever there is no input this task is off the run queue
+/// entirely and its core WFI-idles; it wakes only when the input service sends, via the reschedule SGI.
+#[cfg(all(target_arch = "aarch64", feature = "baremetal"))]
+fn render_service(_: usize) {
+    use unaos_kernel::pal::GneissPal; // for pal.render()
+    // FrameBuffer is Copy: take a handle and build the back-buffered surface. All drawing goes to
+    // cached RAM; render() flushes only the damaged span to the framebuffer, cleaning the cache so
+    // the (non-snooping) VideoCore scan-out sees it.
+    let front_fb = *unaos_kernel::video::WRITER.lock();
+    let mut screen = unaos_kernel::video::Screen::new(front_fb);
+    let mut pal = unaos_kernel::pal::TargetPal::new(&mut screen);
+    let mut console = unaos_kernel::console::Console::new();
+
+    console.draw(&mut pal);
+    pal.render();
+
+    loop {
+        if let unaos_kernel::pal::Event::Key(c) = GUI_CHANNEL.recv() {
+            handle_key(c, &mut console, &mut pal);
+        }
+        pal.render();
     }
 }
 
