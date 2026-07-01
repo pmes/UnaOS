@@ -166,6 +166,21 @@ pub fn detach() {
     GUI_ACTIVE.store(true, Ordering::Relaxed);
 }
 
+/// Clear the framebuffer console to the default background and home the cursor. Used to give the
+/// USB-debug boot mode a clean screen so the (post-boot) hot-plug enumeration and live input aren't
+/// buried under the boot spam on serial-less hardware. No-op if the console isn't ready.
+pub fn clear() {
+    crate::arch::without_interrupts(|| {
+        if let Some(mut c) = FBCON.try_lock() {
+            if c.ready {
+                c.col = 0;
+                c.row = 0;
+                c.fb.fill_screen(BG_DEFAULT);
+            }
+        }
+    });
+}
+
 /// Repaint the screen as a panic backdrop (dark red) and home the cursor, so the panic message
 /// that follows is unmissable on hardware. Best-effort: `try_lock` to avoid hanging if the lock
 /// was held when the panic fired. Re-enables the serial mirror first (the GUI may have detached

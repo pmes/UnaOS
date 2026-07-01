@@ -966,6 +966,13 @@ impl XhciController {
                                         let mut current_intf_class: u8 = 0;
                                         let mut current_intf_protocol: u8 = 0;
                                         let mut found_hid = false;
+                                        // Configure only the FIRST HID interrupt-IN endpoint, then stop. A composite
+                                        // keyboard (real hardware, unlike QEMU's single-interface usb-kbd) has TWO HID
+                                        // interfaces; configuring both issues two Configure-Endpoint commands against the
+                                        // one shared input context, and the second zeroes+overwrites the first before it
+                                        // commits — leaving the keyboard endpoint unconfigured (no key events). The driver's
+                                        // state machine is single-endpoint by design, so one HID EP per device is correct.
+                                        let mut configured_hid = false;
                                         // Mass-storage tracking: collect the bulk IN/OUT
                                         // endpoints during the walk, configure once after.
                                         let mut is_mass_storage = false;
@@ -996,7 +1003,7 @@ impl XhciController {
                                                     serial_println!("xHCI: >>> MASS STORAGE INTERFACE DETECTED (Class 0x08) <<<");
                                                     is_mass_storage = true;
                                                 }
-                                            } else if desc_type == 0x05 && found_hid { // HID Endpoint
+                                            } else if desc_type == 0x05 && found_hid && !configured_hid { // HID Endpoint (first only)
                                                 if offset + 6 >= 256 { break; }
                                                 let ep_addr = desc_data[offset + 2];
                                                 let ep_attr = desc_data[offset + 3];
@@ -1012,6 +1019,7 @@ impl XhciController {
                                                         self.slots[slot_id as usize].is_keyboard = true;
                                                         self.configure_keyboard_endpoints(slot_id as u8, ep_addr, ep_mps, ep_interval);
                                                         found_hid = false; // Don't double-match
+                                                        configured_hid = true; // one HID EP per device (see above)
                                                     } else {
                                                         // Mouse, Tablet, or generic HID (protocol 2 = boot mouse / relative;
                                                         // protocol 0 = tablet / absolute).
@@ -1025,6 +1033,7 @@ impl XhciController {
                                                         self.slots[slot_id as usize].mouse_is_relative = is_rel;
                                                         self.configure_mouse_endpoints(slot_id as u8, ep_addr, ep_mps, ep_interval);
                                                         found_hid = false; // Don't double-match
+                                                        configured_hid = true; // one HID EP per device (see above)
                                                     }
                                                 }
                                             } else if desc_type == 0x05 && is_mass_storage { // Bulk Endpoint
@@ -1129,6 +1138,15 @@ impl XhciController {
                                         // --- KEYBOARD ---
                                         if let Some(data_buf_ptr) = slot.data_buffer {
                                             let report = core::slice::from_raw_parts(data_buf_ptr, 8);
+                                            // Metal diagnostic: dump the raw report bytes so that if a keyboard
+                                            // interrupt-IN transfer arrives but decodes to nothing (e.g. the device is
+                                            // in HID report protocol rather than boot protocol, which needs
+                                            // SET_PROTOCOL(boot)), we still SEE that reports are flowing.
+                                            #[cfg(feature = "usbdebug")]
+                                            serial_println!(
+                                                "USB-DEBUG: kbd report {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x}",
+                                                report[0], report[1], report[2], report[3], report[4], report[5], report[6], report[7]
+                                            );
                                             // USB HID Boot Keyboard Report Format:
                                             // Byte 0: Modifier keys (bit 1 = L-Shift, bit 5 = R-Shift)
                                             // Byte 1: Reserved

@@ -158,6 +158,8 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     // on metal. (Net service is intentionally skipped here so a non-e1000 NIC isn't poked.)
     #[cfg(feature = "usbdebug")]
     {
+        // Clear the boot spam so the (post-boot) hot-plug enumeration + live input own the screen.
+        unaos_kernel::video::fbcon::clear();
         serial_println!(":: ============== USB DEBUG MODE ============== ::");
         serial_println!(":: Enumerating USB. Plug in a stick / keyboard / mouse, then type or move the mouse. ::");
         serial_println!(":: Watch for: 'MISSION SUCCESS' (storage), 'POINTER ... ABSOLUTE/RELATIVE', 'KEY', and the USB-DEBUG lines below. ::");
