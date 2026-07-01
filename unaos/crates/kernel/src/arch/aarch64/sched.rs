@@ -22,6 +22,7 @@
 
 use alloc::boxed::Box;
 use alloc::collections::VecDeque;
+use alloc::sync::Arc;
 use core::cell::UnsafeCell;
 use core::marker::PhantomData;
 use core::ops::{Deref, DerefMut};
@@ -97,6 +98,12 @@ pub struct Task {
     /// this core's run queue — which keeps its TPIDR_EL2 (per-CPU) view correct on resume, exactly
     /// as x86 relies on the GS base staying put. Read by `make_ready` when re-readying a woken task.
     cpu: u32,
+    /// Completion signal for `join()`, or `None` for a fire-and-forget task. A joinable task carries
+    /// a clone of the same `Arc<Semaphore>` (0 permits) held by its `JoinHandle`; the trampoline
+    /// `post()`s it after `entry` returns. The Arc — not a `'static` lifetime — keeps the semaphore
+    /// alive across the park/post window (see `JoinHandle`). Read (never moved) by the trampoline
+    /// through the raw `current` pointer; dropped when the scheduler drops the Box on the Finished path.
+    done_sem: Option<Arc<Semaphore>>,
 }
 
 /// One CPU's scheduler bookkeeping (interior-mutable atomics, so the array is a plain static).
@@ -244,6 +251,15 @@ extern "C" fn task_trampoline() -> ! {
     debug_assert!(!raw.is_null(), "task_trampoline: current is null");
     let (entry, arg) = unsafe { ((*raw).entry, (*raw).arg) };
     entry(arg);
+    // Signal completion to any joiner. `post()` cross-core-wakes a parked joiner if there is one.
+    // BORROW `done_sem` (never move it): the Box's own Arc clone is this `post()`'s liveness anchor
+    // and must remain in the Box until the scheduler drops it on the Finished path — strictly AFTER
+    // this post (exit() switches away; the scheduler then reclaims and drops the Box).
+    unsafe {
+        if let Some(sem) = &(*raw).done_sem {
+            sem.post();
+        }
+    }
     exit();
 }
 
@@ -266,9 +282,15 @@ fn build_initial_frame(stack: &mut [u8]) -> u64 {
     sp as u64
 }
 
-/// Create a ready kernel thread on `cpu`'s run queue. Fire-and-forget: it runs `entry(arg)` and is
-/// freed when `entry` returns. Returns the task id.
-pub fn spawn(name: &'static str, entry: fn(usize), arg: usize, cpu: usize) -> u64 {
+/// Shared spawn path: build a kernel thread on `cpu`'s run queue (optionally carrying a `done_sem`
+/// completion signal for `join`), enqueue it, and poke that CPU. Returns the new task's id.
+fn spawn_inner(
+    name: &'static str,
+    entry: fn(usize),
+    arg: usize,
+    cpu: usize,
+    done_sem: Option<Arc<Semaphore>>,
+) -> u64 {
     assert!(cpu < NUM_CPUS, "spawn: cpu out of range");
     let mut stack: Box<[u8]> = alloc::vec![0u8; TASK_STACK_SIZE].into_boxed_slice();
     let ctx_sp = build_initial_frame(&mut stack);
@@ -282,12 +304,82 @@ pub fn spawn(name: &'static str, entry: fn(usize), arg: usize, cpu: usize) -> u6
         entry,
         arg,
         cpu: cpu as u32,
+        done_sem,
     });
     RUN_QUEUES[cpu].lock().push_back(task);
     // Wake the target if it's a different, possibly-idle core (same-core needs no poke).
     poke_cpu(cpu);
     id
 }
+
+/// Create a ready, fire-and-forget kernel thread on `cpu`'s run queue: it runs `entry(arg)` and is
+/// freed when `entry` returns, with no way to wait for it (use `spawn_joinable` for that). Returns
+/// the task id.
+pub fn spawn(name: &'static str, entry: fn(usize), arg: usize, cpu: usize) -> u64 {
+    spawn_inner(name, entry, arg, cpu, None)
+}
+
+/// Like `spawn`, but returns a `JoinHandle` a scheduled task can `join()` to block until this task
+/// finishes. Allocates an `Arc<Semaphore>` (0 permits) shared between the new task and the handle;
+/// the task's trampoline posts it on completion. Costs one heap alloc + a reserved waiter list, so
+/// only pay it when you actually need to join.
+pub fn spawn_joinable(name: &'static str, entry: fn(usize), arg: usize, cpu: usize) -> JoinHandle {
+    let done = Arc::new(Semaphore::new(0));
+    done.init(); // reserve the waiter list BEFORE the task can run + post (alloc-free park)
+    let id = spawn_inner(name, entry, arg, cpu, Some(done.clone()));
+    JoinHandle { done, id }
+}
+
+/// A handle to wait for a `spawn_joinable` task to finish. Holds a clone of the task's completion
+/// `Arc<Semaphore>`; `join()` blocks until the task's trampoline posts it. Single-shot: `join`
+/// consumes the handle (one join per task), and the handle is intentionally NOT `Clone` (the
+/// completion semaphore carries exactly one permit — a second joiner would block forever).
+pub struct JoinHandle {
+    done: Arc<Semaphore>,
+    /// Id of the joined task, for diagnostics.
+    #[allow(dead_code)]
+    id: u64,
+}
+
+impl JoinHandle {
+    /// Id of the task this handle joins.
+    pub fn id(&self) -> u64 {
+        self.id
+    }
+
+    /// Block the current task until the joined task finishes. MUST be called from a scheduled task
+    /// (it blocks); the `assert` rejects a call off the scheduler (e.g. the unscheduled BSP) loudly
+    /// rather than silently returning as if the task had finished.
+    ///
+    /// No timeout: a joined task that PANICS or never returns leaves the joiner blocked forever (the
+    /// completion permit is posted only on a normal `entry` return; this no-`std` kernel has no
+    /// unwinding). This matches the kernel's panic-halts policy.
+    ///
+    /// `self` (the Arc clone) deliberately stays bound for the whole body: it is the refcount anchor
+    /// that keeps the completion semaphore alive while this task is parked in its waiter list. In
+    /// every window where a raw pointer to the semaphore internals is live (the parked joiner's
+    /// park_waiters/park_lock, or a waiter Box in the list), >= 1 Arc clone is provably held — the
+    /// parked joiner holds its handle on its frozen stack, and the posting task holds its `done_sem`
+    /// clone until the Box is dropped on the Finished path, strictly after the post. So the Arc
+    /// refcount substitutes for the `Semaphore`'s `'static` requirement: no UAF, no leak.
+    pub fn join(self) {
+        assert!(
+            self.done.wait(),
+            "JoinHandle::join() must be called from a scheduled task"
+        );
+    }
+}
+
+// Compile-time guard for the `Task` <-> `Arc<Semaphore>` Send cycle introduced by `done_sem`. No
+// `unsafe impl Send` is added: `Semaphore`'s Send auto-derives while every field is `Send`, and the
+// cycle resolves co-inductively. This probe locks that in — if a future field breaks it, fix that
+// field rather than papering over it with an `unsafe impl`.
+const _: () = {
+    const fn assert_send<T: Send>() {}
+    assert_send::<Task>();
+    assert_send::<Arc<Semaphore>>();
+    assert_send::<JoinHandle>();
+};
 
 /// Send the wake/reschedule SGI (IPI_RESCHED) to `target` so, if it is idle in WFI, it breaks out
 /// and its scheduler loop re-polls its run queue. Skips a self-poke. The IPI never context-switches
@@ -1256,83 +1348,54 @@ fn sleep_demo_body(arg: usize) {
     );
 }
 
-/// Shared state for the M4f RwLock demo (all `static` for the `'static` requirement; initialised in
-/// `start_aps`). A writer repeatedly updates a `(u64, u64)` pair NON-atomically (store `.0`, delay,
-/// store `.1`) under the write lock; readers hold the read section across a delay and assert
-/// `.0 == .1` — a torn read would mean the write lock failed to exclude them. `RW_MAX_CONCURRENT`
-/// witnesses that readers actually SHARE the section (what distinguishes an RwLock from a Mutex).
-static RW_DEMO: RwLock<(u64, u64)> = RwLock::new((0, 0));
-static RW_DONE: Semaphore = Semaphore::new(0);
-static RW_TORN: AtomicBool = AtomicBool::new(false);
-static RW_CONCURRENT: AtomicU32 = AtomicU32::new(0);
-static RW_MAX_CONCURRENT: AtomicU32 = AtomicU32::new(0);
-const RW_READERS: usize = 4;
-const RW_WRITES: u64 = 6;
-const RW_READ_ROUNDS: usize = 8;
+/// Shared state for the M4g join demo (all `static`; initialised in `start_aps`). A coordinator
+/// `spawn_joinable`s `JOIN_WORKERS` workers across the online APs, `join()`s each, then checks a
+/// shared accumulator — proving the completion signal (and cross-core wake) fires for every worker.
+static JOIN_ACC: Mutex<u64> = Mutex::new(0);
+static JOIN_CORES: SpinMutex<[usize; JOIN_WORKERS]> = SpinMutex::new([0; JOIN_WORKERS]);
+const JOIN_WORKERS: usize = 4;
 
-/// M4f writer: `RW_WRITES` rounds of a deliberately non-atomic two-field update under the write lock.
-/// If mutual exclusion holds, no reader ever observes the intermediate `(.0=v, .1=old)` state.
-fn rw_writer_body(_arg: usize) {
-    for v in 1..=RW_WRITES {
-        {
-            let mut w = RW_DEMO.write();
-            w.0 = v;
-            busy_delay_ms(1); // widen the non-atomic update window
-            w.1 = v;
-        } // write lock released
-        busy_delay_ms(1); // give readers a window between writes
-    }
-    RW_DONE.post();
-    serial_println!(":: SCHED: RWLOCK writer done ({} writes) ::", RW_WRITES);
+/// M4g worker: add its share to the accumulator and return. Returning runs `task_trampoline`'s
+/// `done_sem.post()`, which cross-core-wakes the coordinator parked in `join()`. The staggered delay
+/// makes some joins hit the block path and some the already-finished fast path.
+fn join_worker_body(id: usize) {
+    busy_delay_ms((id as u64) % 3);
+    *JOIN_ACC.lock() += id as u64 + 1;
 }
 
-/// M4f reader: hold the read section across a delay and check the pair is self-consistent. Also bump
-/// a concurrent-reader counter so the verifier can witness that reads genuinely overlapped.
-fn rw_reader_body(id: usize) {
-    for _ in 0..RW_READ_ROUNDS {
-        {
-            let r = RW_DEMO.read();
-            let n = RW_CONCURRENT.fetch_add(1, Ordering::Relaxed) + 1;
-            RW_MAX_CONCURRENT.fetch_max(n, Ordering::Relaxed);
-            let a = r.0;
-            busy_delay_ms(1); // hold the read section open
-            let b = r.1;
-            if a != b {
-                RW_TORN.store(true, Ordering::Relaxed); // a writer's half-update leaked in
-            }
-            RW_CONCURRENT.fetch_sub(1, Ordering::Relaxed);
-        } // read lock released
+/// M4g coordinator: `spawn_joinable` a worker on each configured core, `join()` them all (blocking
+/// until each finishes — at least one cross-core), then verify the accumulator. `join()` consumes
+/// each single-shot handle; the handle's `Arc<Semaphore>` clone keeps the completion semaphore alive
+/// while the coordinator is parked on it.
+fn join_coordinator_body(_arg: usize) {
+    let cores = *JOIN_CORES.lock();
+    let mut handles = alloc::vec::Vec::with_capacity(JOIN_WORKERS);
+    for id in 0..JOIN_WORKERS {
+        handles.push(spawn_joinable("join-wk", join_worker_body, id, cores[id]));
     }
-    RW_DONE.post();
-    serial_println!(":: SCHED: RWLOCK reader {} done ::", id);
-}
-
-/// M4f verifier: wait for the writer + all readers, then report torn (must be false) + the max
-/// concurrent readers seen (>1 witnesses real sharing; ==1 is INCONCLUSIVE, not a failure).
-fn rw_verifier_body(_arg: usize) {
-    for _ in 0..(1 + RW_READERS) {
-        assert!(RW_DONE.wait(), "RWLOCK verifier ran off a scheduled task");
+    for h in handles {
+        h.join();
     }
-    let torn = RW_TORN.load(Ordering::Relaxed);
-    let maxc = RW_MAX_CONCURRENT.load(Ordering::Relaxed);
+    let total = *JOIN_ACC.lock();
+    let expected: u64 = (1..=JOIN_WORKERS as u64).sum();
     serial_println!(
-        ":: SCHED: RWLOCK torn={} max_concurrent_readers={} => {} ::",
-        torn,
-        maxc,
-        if !torn { "PASS" } else { "FAIL" },
+        ":: SCHED: JOIN joined {} workers, acc {} (expected {}) => {} ::",
+        JOIN_WORKERS,
+        total,
+        expected,
+        if total == expected { "PASS" } else { "FAIL" },
     );
 }
 
-/// M3b/M4a/M4f: turn on preemptive scheduling and put a workload on the APs, then flip SCHED_ACTIVE
+/// M3b/M4a/M4g: turn on preemptive scheduling and put a workload on the APs, then flip SCHED_ACTIVE
 /// (enables `timer_preempt`) and SCHED_GO (releases the APs into `run`). The workload:
-///   * first online AP — a busy-pair (preemption regression) + the M4a `sleep_ticks` sleeper + the
-///     RwLock verifier (which mostly blocks);
-///   * (with >= 3 online APs) an M4f `RwLock<(u64,u64)>` with 4 readers + 1 writer spread across the
-///     2nd + 3rd APs, so cross-core readers genuinely share the read section.
-/// On metal the busy-pair INTERLEAVES, the sleeper parks-then-wakes on its own tick, and the RwLock's
-/// reader/writer condvars wake blocked waiters cross-core. In QEMU (no Group-1 IRQ delivery) the busy
-/// tasks run sequentially, the sleeper self-skips, and every block/wake is carried by the run()
-/// busy-poll (SGI delivery being the metal-only half). Call AFTER the BSP's cooperative demo.
+///   * first online AP — a busy-pair (preemption regression) + the M4a `sleep_ticks` sleeper;
+///   * (with >= 3 online APs) an M4g `join()` demo: a coordinator `spawn_joinable`s 4 workers spread
+///     across the online APs and `join()`s them all.
+/// On metal the busy-pair INTERLEAVES, the sleeper parks-then-wakes on its own tick, and each
+/// worker's completion `post()` cross-core-wakes the coordinator. In QEMU (no Group-1 IRQ delivery)
+/// the busy tasks run sequentially, the sleeper self-skips, and every block/wake is carried by the
+/// run() busy-poll (SGI delivery being the metal-only half). Call AFTER the BSP's cooperative demo.
 pub fn start_aps(online: &[usize]) {
     if let Some(&c) = online.first() {
         spawn("busy-a", preempt_body, c * 10, c);
@@ -1340,22 +1403,20 @@ pub fn start_aps(online: &[usize]) {
         spawn("sleeper", sleep_demo_body, c, c);
     }
     if online.len() >= 3 {
-        RW_DEMO.init();
-        RW_DONE.init();
-        let (v, b, c) = (online[0], online[1], online[2]);
-        spawn("rw-verify", rw_verifier_body, 0, v); // on the 1st AP (mostly blocked, behind busy-pair)
-        spawn("rw-rd-0", rw_reader_body, 0, b);
-        spawn("rw-rd-1", rw_reader_body, 1, b);
-        spawn("rw-writer", rw_writer_body, 0, b);
-        spawn("rw-rd-2", rw_reader_body, 2, c);
-        spawn("rw-rd-3", rw_reader_body, 3, c);
+        JOIN_ACC.init();
+        let mut cores = [0usize; JOIN_WORKERS];
+        for (i, slot) in cores.iter_mut().enumerate() {
+            *slot = online[i % online.len()]; // spread workers across the online APs (cross-core join)
+        }
+        *JOIN_CORES.lock() = cores;
+        spawn("join-coord", join_coordinator_body, 0, online[0]);
     } else {
-        serial_println!(":: AARCH64 SCHED: RwLock demo skipped (needs >= 3 online APs) ::");
+        serial_println!(":: AARCH64 SCHED: join demo skipped (needs >= 3 online APs) ::");
     }
     SCHED_ACTIVE.store(true, Ordering::Release);
     SCHED_GO.store(true, Ordering::Release);
     serial_println!(
-        ":: AARCH64 SCHED: preemption ON; busy-pair + sleep + RwLock demo on APs {:?} ::",
+        ":: AARCH64 SCHED: preemption ON; busy-pair + sleep + join demo on APs {:?} ::",
         online
     );
 }
