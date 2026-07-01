@@ -58,7 +58,7 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
         },
         "help" => {
             console.println("COMMANDS: ver, help, clear, echo, panic, gneiss");
-            console.println("STORAGE:  diskinfo, read <lba>, write <lba> <byte>");
+            console.println("STORAGE:  diskinfo, usbinfo, read <lba>, write <lba> <byte>");
             console.println("FILES:    fatinfo (FAT geometry), ls, cat <name>");
             console.println("SMP:      sched (per-CPU run queues)");
             console.println("NETWORK:  netinfo, ping <ip> [count], arp <ip>");
@@ -87,6 +87,11 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
         },
         "gneiss" => {
              console.println("Gneiss is Home.");
+        },
+        "usbinfo" => {
+            for line in crate::drivers::xhci::usb_summary() {
+                console.println(&line);
+            }
         },
         "fatinfo" => {
             match crate::fs::fat::mount() {

@@ -306,6 +306,32 @@ pub fn storage_diag() -> alloc::string::String {
     }
 }
 
+/// Live port + slot summary for the shell `usbinfo` command (metal enumeration diagnosis).
+pub fn usb_summary() -> alloc::vec::Vec<alloc::string::String> {
+    match &*XHCI_CONTROLLER.lock() {
+        Some(x) => x.port_slot_summary(),
+        None => alloc::vec::Vec::from([alloc::string::String::from("xHCI not initialised")]),
+    }
+}
+
+/// Log the USB topology summary to serial exactly once, a short while into the main loop (after boot
+/// enumeration has had time to run or stall) — captured in QEMU serial and a metal bootlog/usbdebug
+/// build. Fires unconditionally so a stalled enumeration is recorded too; the interactive `usbinfo`
+/// shell command reports the same on the serial-less GUI.
+pub fn log_summary_once() {
+    use core::sync::atomic::{AtomicU32, Ordering};
+    static N: AtomicU32 = AtomicU32::new(0);
+    if N.fetch_add(1, Ordering::Relaxed) != 2000 {
+        return;
+    }
+    if let Some(x) = XHCI_CONTROLLER.lock().as_ref() {
+        serial_println!("xHCI: === USB topology summary ===");
+        for line in x.port_slot_summary() {
+            serial_println!("xHCI: {}", line);
+        }
+    }
+}
+
 pub static COMMAND_RING: Mutex<Option<TransferRing>> = Mutex::new(None);
 pub static EVENT_RING: Mutex<Option<EventRing>> = Mutex::new(None);
 
@@ -2243,6 +2269,40 @@ impl XhciController {
     /// Main-loop hook: once storage finishes configuring, run the SCSI bring-up (in a
     /// safe, non-event context) and publish the block device. Also does a one-time
     /// sanity read of LBA 0.
+    /// Multi-line dump of the live port + slot state for the shell `usbinfo` command — the metal
+    /// diagnostic for "which USB devices enumerated, at what speed, and how far". Read-only.
+    pub fn port_slot_summary(&self) -> Vec<alloc::string::String> {
+        fn speed_name(s: u32) -> &'static str {
+            match s { 1 => "FS", 2 => "LS", 3 => "HS", 4 => "SS", 0 => "-", _ => "?" }
+        }
+        let mut out = Vec::new();
+        out.push(alloc::format!(
+            "xHCI ports={} storage_slot={} enum_active={} queued={} note='{}'",
+            self.max_ports, self.storage_slot, self.enum_active,
+            self.ports_to_enumerate.len(), self.storage_note));
+        for p in 1..=self.max_ports {
+            let s = self.read_portsc(p);
+            // Show any port that is connected (CCS) or enabled (PED) — the rest are empty.
+            if (s & 1) == 0 && (s & 2) == 0 { continue; }
+            out.push(alloc::format!(
+                "  port {}: {:#010x} CCS={} PED={} PR={} PLS={} speed={}({})",
+                p, s, s & 1, (s >> 1) & 1, (s >> 4) & 1, (s >> 5) & 0xF,
+                (s >> 10) & 0xF, speed_name((s >> 10) & 0xF)));
+        }
+        for (i, slot) in self.slots.iter().enumerate() {
+            if !slot.active { continue; }
+            let role = if i as u8 == self.storage_slot { "STORAGE" }
+                       else if slot.is_keyboard && slot.is_mouse { "kbd+mouse" }
+                       else if slot.is_keyboard { "keyboard" }
+                       else if slot.is_mouse { "mouse" }
+                       else { "other/unconfigured" };
+            out.push(alloc::format!(
+                "  slot {}: port {} {} bulk_in={:#x} bulk_out={:#x}",
+                i, slot.port_id, role, slot.bulk_in_ep, slot.bulk_out_ep));
+        }
+        out
+    }
+
     pub fn service_storage(&mut self) {
         if !self.storage_pending_bringup { return; }
         self.storage_pending_bringup = false;
