@@ -86,6 +86,9 @@ unsafe extern "C" {
 #[unsafe(no_mangle)]
 extern "C" fn __secondary_rust(core_raw: u64) -> ! {
     let core = core_raw as usize;
+    // Drop this core EL2 -> EL1 (matching the BSP) BEFORE the MMU, so its locks/atomics run at EL1.
+    // Each core must do its own drop: VMPIDR/CNTHCTL/CPTR/CPACR/SP_EL1 are all banked per-core.
+    unsafe { boot::drop_to_el1() };
     // MMU on, using the L1 table the BSP already built (`enable_mmu` touches no per-core state).
     unsafe { boot::enable_mmu() };
     // Per-core VBAR_EL2 so a fault on this core is caught rather than jumping to a stale vector.
@@ -100,7 +103,7 @@ extern "C" fn __secondary_rust(core_raw: u64) -> ! {
     // timer::init). Also wakes this core's WFI in the scheduler's wait/idle loops.
     timer::arm_this_core();
 
-    serial_println!(":: AARCH64 SMP: core {} online (EL2, MMU on, GIC+IPI+timer ready) ::", core);
+    serial_println!(":: AARCH64 SMP: core {} online (EL1, MMU on, GIC+IPI+timer ready) ::", core);
     // Publish readiness AFTER everything above (Release pairs with the BSP's Acquire), so the BSP
     // only sends an SGI once this core can actually take it.
     CORE_READY[core].store(true, Ordering::Release);

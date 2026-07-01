@@ -24,7 +24,23 @@ use core::sync::atomic::{AtomicU8, Ordering};
 // EL-uniform, but VBAR install and fault decoding need the right banked-register names.
 static BOOT_EL: AtomicU8 = AtomicU8::new(0);
 
-core::arch::global_asm!(
+// The IRQ stub banks ELR/SPSR for the EL we run at. Baremetal drops to EL1 (see `boot::drop_to_el1`);
+// the UEFI/QEMU-virt build stays at EL2. A single `global_asm!` can't `#[cfg]` individual lines, so
+// select the "1"/"2" EL suffix here and splice it into __vec_irq below via `concat!`.
+#[cfg(feature = "baremetal")]
+macro_rules! irq_el {
+    () => {
+        "1"
+    };
+}
+#[cfg(not(feature = "baremetal"))]
+macro_rules! irq_el {
+    () => {
+        "2"
+    };
+}
+
+core::arch::global_asm!(concat!(
     r#"
     // ---- The vector table: 16 entries x 0x80 bytes, 2 KiB aligned (VBAR requirement) ----
     .section .text.exception_vectors, "ax", %progbits
@@ -168,24 +184,25 @@ __exception_vectors:
     .endm
 
     // ---- IRQ: save, dispatch in Rust, restore, return ----
-    // Beyond the GPRs, save ELR_EL2/SPSR_EL2 (the return PC + PSTATE the CPU banked on entry).
+    // Beyond the GPRs, save ELR/SPSR (the return PC + PSTATE the CPU banked on entry; the EL suffix is
+    // _EL1 on the baremetal build, _EL2 on UEFI — see the irq_el! selector above).
     // These are SYSTEM registers, not stacked like x86's interrupt frame, so they are per-*core*,
     // not per-*context*. The scheduler's timer preemption (timer::on_tick -> sched::timer_preempt)
     // does a context switch INSIDE this handler; the task resumed in its place takes its own IRQs,
     // which overwrite ELR/SPSR. Without saving+restoring them here, a preempted task would later
     // `eret` to another task's PC. (The cooperative path never touches these — no IRQ, no eret.)
-    // EL2 is hardcoded: both the bare-metal and UEFI aarch64 paths are handed off at EL2.
+    // The EL is compile-time: baremetal drops to EL1 (irq_el!() = "1"), UEFI stays at EL2 ("2").
     .globl __vec_irq
 __vec_irq:
     SAVE_GPRS
     SAVE_FP
-    mrs x0, ELR_EL2
-    mrs x1, SPSR_EL2
+    mrs x0, ELR_EL"#, irq_el!(), r#"
+    mrs x1, SPSR_EL"#, irq_el!(), r#"
     stp x0, x1, [sp, #-16]!
     bl aarch64_irq_handler
     ldp x0, x1, [sp], #16
-    msr ELR_EL2, x0
-    msr SPSR_EL2, x1
+    msr ELR_EL"#, irq_el!(), r#", x0
+    msr SPSR_EL"#, irq_el!(), r#", x1
     RESTORE_FP
     RESTORE_GPRS
     eret
@@ -213,7 +230,7 @@ __vec_serror:
     bl aarch64_fault_handler
     b .
 "#
-);
+));
 
 unsafe extern "C" {
     static __exception_vectors: u8;
@@ -263,6 +280,12 @@ pub fn current_el() -> u8 {
 #[inline]
 pub fn enable_irq() {
     unsafe { core::arch::asm!("msr daifclr, #2", options(nomem, nostack, preserves_flags)) };
+    // Baremetal drops to EL1 (boot::drop_to_el1) with DAIF fully masked; now that the vectors are
+    // installed, also unmask SError (PSTATE.A, daifclr #4) so a genuine external-abort SError reaches
+    // the fault logger (__vec_serror) instead of being held pending forever. The UEFI/EL2 path
+    // inherits the firmware DAIF, so leave its A bit alone.
+    #[cfg(feature = "baremetal")]
+    unsafe { core::arch::asm!("msr daifclr, #4", options(nomem, nostack, preserves_flags)) };
 }
 
 /// Rust IRQ dispatcher (called from the IRQ vector stub). EL-agnostic: acknowledge at the GIC CPU

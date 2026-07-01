@@ -9,10 +9,23 @@
 // per-core IPI and timer counters so we can prove each core answers its own SGIs and ticks.
 //
 // The blocks live in a static array (no heap — set up on each core before it enables IRQs, so the
-// IRQ/SGI handlers can always resolve `this_cpu()`). TPIDR_EL2 (not EL1/EL0) because the kernel
-// runs at EL2 on this platform; `msr TPIDR_EL2` and `mrs …, TPIDR_EL2` are the EL2 thread pointer.
+// IRQ/SGI handlers can always resolve `this_cpu()`). The thread-pointer register is TPIDR_EL1 on the
+// baremetal build (each core drops to EL1 at boot) and TPIDR_EL2 on the UEFI/QEMU-virt build (which
+// stays at EL2) — see the `tpidr_reg!` selector below.
 
 use core::sync::atomic::{AtomicU64, Ordering};
+
+// The per-CPU thread pointer register. Baremetal drops to EL1 (see `boot::drop_to_el1`), so it uses
+// TPIDR_EL1; the UEFI/QEMU-virt build stays at EL2 and uses TPIDR_EL2. A single `asm!` template can't
+// `#[cfg]` a register name, so select the register here and splice it in via `concat!`.
+#[cfg(all(target_arch = "aarch64", feature = "baremetal"))]
+macro_rules! tpidr_reg {
+    () => { "TPIDR_EL1" };
+}
+#[cfg(not(all(target_arch = "aarch64", feature = "baremetal")))]
+macro_rules! tpidr_reg {
+    () => { "TPIDR_EL2" };
+}
 
 /// The Pi 4 is 4× Cortex-A72. Index by MPIDR Aff0 (0..3).
 pub const NUM_CPUS: usize = 4;
@@ -43,7 +56,7 @@ pub fn init(cpu_index: usize) {
     unsafe {
         let p = &raw mut PERCPU[cpu_index];
         (*p).cpu_index = cpu_index as u32;
-        core::arch::asm!("msr TPIDR_EL2, {}", in(reg) p as u64, options(nomem, nostack, preserves_flags));
+        core::arch::asm!(concat!("msr ", tpidr_reg!(), ", {}"), in(reg) p as u64, options(nomem, nostack, preserves_flags));
     }
 }
 
@@ -53,7 +66,7 @@ pub fn init(cpu_index: usize) {
 pub fn this_cpu() -> &'static PerCpuData {
     let p: u64;
     unsafe {
-        core::arch::asm!("mrs {}, TPIDR_EL2", out(reg) p, options(nomem, nostack, preserves_flags));
+        core::arch::asm!(concat!("mrs {}, ", tpidr_reg!()), out(reg) p, options(nomem, nostack, preserves_flags));
         &*(p as *const PerCpuData)
     }
 }

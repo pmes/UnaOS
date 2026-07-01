@@ -44,9 +44,10 @@ pub fn init() {
 
 /// Read-only boot probe: dump the Exception Level we were handed off at, the generic-timer
 /// frequency, the MMU state, and DAIF — all from system registers (zero MMIO, so it cannot fault
-/// before exception vectors exist). This grounded the GIC/timer bring-up: UEFI hands us off at EL2
-/// (so vectors install at VBAR_EL2 and async exceptions are routed to EL2), and CNTFRQ differs by
-/// board (QEMU 62.5 MHz vs Pi 4 54 MHz), so the tick interval is computed from it at runtime.
+/// before exception vectors exist). This grounded the GIC/timer bring-up. Firmware hands every core
+/// off at EL2; the bare-metal build then drops to EL1 (see `boot::drop_to_el1`) before this runs, so
+/// it prints EL=1, while the UEFI/QEMU-virt build stays at EL2. CNTFRQ differs by board (QEMU
+/// 62.5 MHz vs Pi 4 54 MHz), so the tick interval is computed from it at runtime.
 fn boot_diagnostics() {
     let current_el: u64;
     let cntfrq: u64;
@@ -118,19 +119,18 @@ pub fn ticks() -> u64 {
     timer::ticks()
 }
 
-/// Milliseconds since boot. Arch-neutral mirror of x86_64's `ms`; aarch64 has no timer heartbeat
-/// wired yet (like `ticks`), so it returns 0 for now.
+/// Milliseconds since boot. Arch-neutral mirror of x86_64's `ms`, derived from the generic-timer
+/// heartbeat: `ticks()` advances at `timer::TICK_HZ` (250 Hz = 4 ms/tick), so ms = ticks * 4.
 #[inline]
 pub fn ms() -> u64 {
-    0
+    ticks() * 4
 }
 
 /// Free-running virtual cycle counter (CNTVCT_EL0). Monotonic and interrupt-flag-independent, like
 /// x86 rdtsc — the portable timebase for bounding hardware busy-waits (see `now_cycles` on x86_64).
-/// Runs at CNTFRQ_EL0 (~62.5 MHz under QEMU virt), NOT GHz, so its budget is in its own units.
-/// NOTE: assumes the generic-timer counter is enabled at boot. That holds under QEMU virt (where
-/// xHCI is exercised), but no GIC/timer is wired up for bare-metal ARM yet, so this must be
-/// re-verified there before any metal xHCI path relies on it.
+/// Runs at CNTFRQ_EL0 (~62.5 MHz under QEMU virt, 54 MHz on the Pi 4), NOT GHz, so its budget is in
+/// its own units. The generic timer is up and delivery-confirmed on both paths (`timer::verify_live`),
+/// and the bare-metal EL1 drop sets CNTVOFF_EL2=0 so CNTVCT shares the physical timebase (CNTPCT).
 #[inline]
 pub fn now_cycles() -> u64 {
     let v: u64;

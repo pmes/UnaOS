@@ -62,8 +62,11 @@ _start:
 #[unsafe(no_mangle)]
 #[cfg(all(target_arch = "aarch64", feature = "baremetal"))]
 pub extern "C" fn __rust_boot(dtb: u64) -> ! {
-    // SP is set and BSS is zeroed (by _start). Enable the MMU before anything touches a lock/atomic,
-    // then synthesize the BootInfo UEFI would normally provide and enter the shared kernel path.
+    // SP is set and BSS is zeroed (by _start). The firmware handed us off at EL2; drop the boot core
+    // to EL1 (the standard OS level) BEFORE the MMU, so enable_mmu and every lock/atomic below run in
+    // the EL1&0 regime on Normal-cacheable memory. Then enable the MMU, synthesize the BootInfo UEFI
+    // would normally provide, and enter the shared kernel path.
+    unsafe { unaos_kernel::arch::boot::drop_to_el1() };
     unsafe { unaos_kernel::arch::boot::mmu_init() };
     let boot_info = unaos_kernel::arch::boot::build_boot_info(dtb);
     kernel_main(boot_info)
