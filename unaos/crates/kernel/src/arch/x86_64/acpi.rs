@@ -13,6 +13,7 @@
 // so every access goes through `read_unaligned` / per-field byte reads.
 
 use crate::arch::gdt::MAX_CPUS;
+use x86_64::instructions::port::Port;
 
 /// Root System Description Pointer. Revision 0 = ACPI 1.0 (only the first 20 bytes are valid,
 /// use `rsdt_addr`); revision >= 2 = ACPI 2.0+ (the full struct is valid, use `xsdt_addr`).
@@ -313,5 +314,154 @@ pub fn dmar_report(rsdp_addr: u64) {
                 drhd_count, first_reg_base, flags
             );
         }
+    }
+}
+
+// --- ACPI Power Management Timer (timebase calibration reference) ---
+
+/// The ACPI PM timer's fixed, spec-mandated frequency (ACPI §4.8.3.3). It is the same 3.579545 MHz
+/// on every PC regardless of CPU speed / P-states / the (unknown, per-machine) local-APIC timer
+/// crystal, so it is the reference clock we calibrate the TSC and APIC timer against on real
+/// hardware — where no CPUID leaf 0x15/0x16 exists before Skylake to hand us those rates. See
+/// `apic::calibrate`.
+pub const PM_TIMER_HZ: u64 = 3_579_545;
+
+/// FADT ("FACP") field offsets (ACPI spec; stable since 1.0 — later revisions only append fields).
+const FADT_PM_TMR_BLK: usize = 76; // u32: I/O port of the PM timer counter (legacy 32-bit field)
+const FADT_FLAGS: usize = 112; // u32: fixed-feature flags
+const FADT_X_PM_TMR_BLK: usize = 208; // 12-byte Generic Address Structure (ACPI 2.0+); preferred
+/// FADT flags bit 8 (TMR_VAL_EXT): 1 = the counter is 32-bit, 0 = 24-bit (top 8 bits reserved).
+const FADT_FLAG_TMR_VAL_EXT: u32 = 1 << 8;
+/// Generic Address Structure `AddressSpaceId` for System I/O space.
+const GAS_SPACE_SYSTEM_IO: u8 = 1;
+
+/// A discovered ACPI PM timer: the I/O port of its counter register and a mask selecting the
+/// significant bits (24- or 32-bit per the FADT flags). The counter increments at `PM_TIMER_HZ`
+/// and wraps at `mask + 1` (24-bit wraps every ~4.687 s; 32-bit every ~20 min).
+#[derive(Clone, Copy)]
+pub struct PmTimer {
+    port: u16,
+    mask: u32,
+}
+
+impl PmTimer {
+    /// Current counter value, masked to its significant width. Monotonic modulo `mask + 1`.
+    #[inline]
+    pub fn read(&self) -> u32 {
+        // SAFETY: reading the ACPI PM timer I/O port is side-effect-free (a free-running counter).
+        // The port is the one firmware advertised in the FADT.
+        let raw: u32 = unsafe { Port::<u32>::new(self.port).read() };
+        raw & self.mask
+    }
+
+    pub fn port(&self) -> u16 {
+        self.port
+    }
+
+    /// Significant width in bits (24 or 32) — for the wrap mask and diagnostics.
+    pub fn bits(&self) -> u32 {
+        if self.mask == 0xFFFF_FFFF {
+            32
+        } else {
+            24
+        }
+    }
+}
+
+/// Discover the ACPI PM timer by parsing the FADT ("FACP"). Returns `None` if there is no
+/// ACPI/FADT or the firmware advertises no PM timer (then the timebase stays uncalibrated).
+///
+/// Prefers the ACPI 2.0+ extended `X_PM_TMR_BLK` GAS when it is present, populated, and in System
+/// I/O space; otherwise falls back to the legacy 32-bit `PM_TMR_BLK` field. The 24-vs-32-bit width
+/// comes from FADT flags bit 8 (TMR_VAL_EXT).
+pub fn pm_timer(rsdp_addr: u64) -> Option<PmTimer> {
+    if rsdp_addr == 0 {
+        return None;
+    }
+    unsafe {
+        let rsdp = (rsdp_addr as *const Rsdp).read_unaligned();
+        if &rsdp.signature != b"RSD PTR " {
+            return None;
+        }
+        let (sdt_addr, entry_size): (u64, usize) = if rsdp.revision >= 2 && rsdp.xsdt_addr != 0 {
+            (rsdp.xsdt_addr, 8)
+        } else {
+            (rsdp.rsdt_addr as u64, 4)
+        };
+
+        let fadt = find_table(sdt_addr, entry_size, b"FACP")?;
+        let hdr = (fadt as *const SdtHeader).read_unaligned();
+        let len = hdr.length as usize;
+
+        // Prefer the extended GAS if the table is long enough to contain it and it names a
+        // non-zero System-I/O port (a real port fits in 16 bits).
+        let mut port: Option<u16> = None;
+        if len >= FADT_X_PM_TMR_BLK + 12 {
+            let gas = fadt as usize + FADT_X_PM_TMR_BLK;
+            let space = (gas as *const u8).read_unaligned();
+            let addr = ((gas + 4) as *const u64).read_unaligned();
+            if space == GAS_SPACE_SYSTEM_IO && addr != 0 && addr <= 0xFFFF {
+                port = Some(addr as u16);
+            }
+        }
+        // Fall back to the legacy 32-bit PM_TMR_BLK field.
+        if port.is_none() && len >= FADT_PM_TMR_BLK + 4 {
+            let legacy = ((fadt as usize + FADT_PM_TMR_BLK) as *const u32).read_unaligned();
+            if legacy != 0 && legacy <= 0xFFFF {
+                port = Some(legacy as u16);
+            }
+        }
+        let port = port?;
+
+        let flags = if len >= FADT_FLAGS + 4 {
+            ((fadt as usize + FADT_FLAGS) as *const u32).read_unaligned()
+        } else {
+            0
+        };
+        let mask = if flags & FADT_FLAG_TMR_VAL_EXT != 0 {
+            0xFFFF_FFFF
+        } else {
+            0x00FF_FFFF
+        };
+
+        Some(PmTimer { port, mask })
+    }
+}
+
+/// One-time diagnostic: discover the PM timer and prove it advances (three reads separated by a
+/// short rdtsc-bounded spin). Surfaced on the framebuffer so a serial-less metal boot can confirm
+/// the calibration reference clock is live *before* trusting any TSC/APIC frequency derived from
+/// it. A "STUCK?" verdict means the port is wrong or the counter is dead — calibration must then
+/// fall back to the fixed timer values.
+pub fn pm_timer_report(rsdp_addr: u64) {
+    match pm_timer(rsdp_addr) {
+        Some(pm) => {
+            // Short spins between reads. now_cycles() (rdtsc) is uncalibrated here, but ~1e6 cycles
+            // is well under a millisecond on any part yet long enough for the 3.58 MHz PM counter
+            // to tick — enough to witness advance, not to measure anything.
+            let spin = |cycles: u64| {
+                let start = crate::arch::now_cycles();
+                while crate::arch::now_cycles().wrapping_sub(start) < cycles {
+                    core::hint::spin_loop();
+                }
+            };
+            let a = pm.read();
+            spin(1_000_000);
+            let b = pm.read();
+            spin(1_000_000);
+            let c = pm.read();
+            serial_println!(
+                "ACPI PM timer: port {:#x}, {}-bit; {:#x} -> {:#x} -> {:#x} ({})",
+                pm.port(),
+                pm.bits(),
+                a,
+                b,
+                c,
+                if b != a || c != b { "advancing" } else { "STUCK?" }
+            );
+        }
+        None => serial_println!(
+            "ACPI PM timer: not found (no FADT / no PM_TMR_BLK) — timebase stays uncalibrated."
+        ),
     }
 }

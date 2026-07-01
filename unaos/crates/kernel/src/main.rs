@@ -76,6 +76,12 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     #[cfg(target_arch = "x86_64")]
     unaos_kernel::arch::acpi::dmar_report(rsdp_addr);
 
+    // 4b''. Timebase reference: prove the ACPI PM timer (fixed 3.579545 MHz) is live before we
+    // calibrate the TSC / APIC timer against it. On a serial-less laptop this line is the evidence
+    // the calibration clock works; "STUCK?" or "not found" means the timebase stays uncalibrated.
+    #[cfg(target_arch = "x86_64")]
+    unaos_kernel::arch::acpi::pm_timer_report(rsdp_addr);
+
     // 4c. SMP: start the application processors (INIT-SIPI-SIPI). Each AP brings up its own
     // per-CPU GDT/TSS + local APIC, then waits to enter its scheduler loop; the BSP continues to
     // drive everything below. `start_aps` also runs the post-bring-up SMP smoke test while the
