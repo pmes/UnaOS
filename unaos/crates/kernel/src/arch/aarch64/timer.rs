@@ -40,7 +40,7 @@ static INTERVAL: AtomicU64 = AtomicU64::new(0);
 /// firmware programs it (19.2 MHz crystal-derived). Reading it instead of assuming keeps the tick
 /// rate correct on both.
 #[inline]
-fn cntfrq() -> u64 {
+pub fn cntfrq() -> u64 {
     let v: u64;
     unsafe { core::arch::asm!("mrs {}, CNTFRQ_EL0", out(reg) v, options(nomem, nostack, preserves_flags)) };
     v

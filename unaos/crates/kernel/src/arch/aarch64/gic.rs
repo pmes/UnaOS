@@ -35,6 +35,7 @@ const GICD_ISENABLER: usize = 0x100; // set-enable, 1 bit / INTID (32 per word)
 const GICD_IPRIORITYR: usize = 0x400; // priority, 1 byte / INTID
 #[allow(dead_code)] // reserved for SPI edge/level config when shared peripherals are wired
 const GICD_ICFGR: usize = 0xC00; // config (edge/level), 2 bits / INTID
+const GICD_SGIR: usize = 0xF00; // software-generated-interrupt trigger (write-only)
 
 // CPU interface register offsets.
 const GICC_CTLR: usize = 0x00; // control (enable signalling)
@@ -63,56 +64,53 @@ unsafe fn gicc_write(off: usize, val: u32) {
     core::ptr::write_volatile((GICC_BASE + off) as *mut u32, val);
 }
 
-/// Bring up the GICv2: enable the distributor, open the CPU interface, and drop the priority mask
-/// so every priority can preempt the (interrupt-free) idle. Per-interrupt enabling happens later
-/// (`enable_ppi`), once each source — currently just the generic timer — is configured.
+/// Bring up the GICv2 on the boot core: the (global) distributor, then this core's CPU interface.
+/// Per-interrupt enabling happens later (`enable_ppi`/`enable_sgi`), once each source is configured.
+/// Secondary cores skip the distributor and call `init_cpu_interface` alone.
 pub fn init() {
+    let num_intids = init_distributor();
+    init_cpu_interface();
+    serial_println!(
+        ":: AARCH64 GICv2 init (GICD={:#x}, GICC={:#x}, {} INTIDs) ::",
+        GICD_BASE, GICC_BASE, num_intids
+    );
+}
+
+/// Enable the distributor — GLOBAL state, done once by the BSP. Returns the max INTID range for the
+/// boot log. The Security-Extensions group model is the QEMU-vs-Pi gotcha (see `enable_ppi`): either
+/// way GICD_CTLR bit0 = enable (Group 0 on QEMU / EnableGrp1 in the Non-secure alias on the Pi).
+fn init_distributor() -> u32 {
     unsafe {
         let typer = gicd_read(GICD_TYPER);
-        // (ITLinesNumber+1)*32 = the max INTID range the distributor supports — informational only
-        // (logged below). No INTID guard is needed: our only source, the timer PPI 30, is always
-        // present on any GICv2 regardless of ITLinesNumber (which bounds SPIs, not PPIs).
+        // (ITLinesNumber+1)*32 = the max INTID range the distributor supports — informational only.
         let num_intids = ((typer & 0x1F) + 1) * 32;
-
-        // The two targets differ in the GIC's Security Extensions, which changes the group model:
-        //
-        //  * QEMU `virt` (secure=off) models a GICv2 WITHOUT Security Extensions: interrupts default
-        //    to Group 0, GICD_CTLR bit0 = Enable, GICC_CTLR bit0 = Enable, and with FIQ-enable left
-        //    0 a Group 0 interrupt is signalled as IRQ. So we leave the PPI in its default group and
-        //    just enable the single group.
-        //
-        //  * BCM2711 GIC-400 (real Pi 4) HAS the Security Extensions, and pftf firmware hands off in
-        //    Non-secure state. A non-secure CPU interface only sees Group 1; Group 0 is secure-only.
-        //    So the timer PPI must be moved to Group 1 (done in `enable_ppi`), and the non-secure
-        //    GICD_CTLR/GICC_CTLR bit0 (= EnableGrp1 in that alias) enables its delivery as IRQ.
-        //
-        // Either way the bit we write is 0x1; the difference is the PPI's group, gated by `pi`.
         gicd_write(GICD_CTLR, 0);
         gicd_write(GICD_CTLR, 0x1);
-
-        // CPU interface: lowest-possible priority threshold (0xFF passes everything), no sub-priority
-        // grouping (BPR 0), then enable signalling. FIQ-enable left 0 so interrupts arrive as IRQ.
-        gicc_write(GICC_PMR, 0xFF);
-        gicc_write(GICC_BPR, 0x0);
-        gicc_write(GICC_CTLR, 0x1);
-
-        serial_println!(
-            ":: AARCH64 GICv2 init (GICD={:#x}, GICC={:#x}, {} INTIDs) ::",
-            GICD_BASE, GICC_BASE, num_intids
-        );
+        num_intids
     }
 }
 
-/// Enable a private peripheral interrupt (PPI, INTID 16-31) on this core: (on the Pi) move it to
-/// Group 1, give it the highest priority, and set its enable bit. PPIs are banked per-core, so
-/// ISENABLER0 / the low IGROUPR/IPRIORITYR words address *this* core's copy.
-pub fn enable_ppi(intid: u32) {
-    debug_assert!(intid < 32, "enable_ppi expects an SGI/PPI (INTID < 32)");
+/// Open THIS core's CPU interface (GICC) — banked per-core, so every core (BSP and each AP) must run
+/// it before it can take interrupts. Lowest priority threshold (0xFF passes everything), no
+/// sub-priority grouping, then enable signalling as IRQ (FIQ-enable left 0).
+pub fn init_cpu_interface() {
+    unsafe {
+        gicc_write(GICC_PMR, 0xFF);
+        gicc_write(GICC_BPR, 0x0);
+        gicc_write(GICC_CTLR, 0x1);
+    }
+}
+
+/// Enable a banked interrupt (SGI 0-15 or PPI 16-31) on THIS core: (on the Pi) move it to Group 1,
+/// give it the highest priority, and set its enable bit. INTIDs < 32 are banked per-core, so
+/// ISENABLER0 / the low IGROUPR/IPRIORITYR words address *this* core's copy — each core must call
+/// this for the sources it wants.
+fn enable_banked(intid: u32) {
     unsafe {
         // On the Pi's security-extensions GIC accessed from Non-secure, the interrupt must be
-        // Group 1 to be deliverable; on QEMU's no-security GIC the PPI stays in its default Group 0
+        // Group 1 to be deliverable; on QEMU's no-security GIC it stays in its default Group 0
         // (touching IGROUPR there is unnecessary and, paired with a Group-0-only enable, would mask
-        // it). So only the Pi build reassigns the group.
+        // it). So only the Pi build reassigns the group. SGIs and PPIs share IGROUPR0 (bits 0-31).
         #[cfg(feature = "pi")]
         {
             let grp = gicd_read(GICD_IGROUPR);
@@ -122,6 +120,30 @@ pub fn enable_ppi(intid: u32) {
         core::ptr::write_volatile((GICD_BASE + GICD_IPRIORITYR + intid as usize) as *mut u8, 0x00);
         // Set-enable: write-1-to-set, other bits unaffected.
         gicd_write(GICD_ISENABLER, 1 << intid);
+    }
+}
+
+/// Enable a private peripheral interrupt (PPI, INTID 16-31) on this core — e.g. the generic timer.
+pub fn enable_ppi(intid: u32) {
+    debug_assert!((16..32).contains(&intid), "enable_ppi expects a PPI (16-31)");
+    enable_banked(intid);
+}
+
+/// Enable a software-generated interrupt (SGI, INTID 0-15) on this core — the IPI channel. Every
+/// core that should RECEIVE this SGI must enable it (banked).
+pub fn enable_sgi(intid: u32) {
+    debug_assert!(intid < 16, "enable_sgi expects an SGI (0-15)");
+    enable_banked(intid);
+}
+
+/// Send SGI `intid` (0-15) to core `target_cpu` (its GIC CPU-interface number, which equals the
+/// core index on the Pi 4). The `DSB` publishes any memory the target will read on wake before the
+/// interrupt is raised. TargetListFilter=0b00 => use the CPUTargetList bitmask in bits[23:16].
+pub fn send_sgi(target_cpu: usize, intid: u32) {
+    unsafe {
+        core::arch::asm!("dsb ish", options(nostack, preserves_flags));
+        let val = ((1u32 << target_cpu) << 16) | (intid & 0xF);
+        gicd_write(GICD_SGIR, val);
     }
 }
 
@@ -142,7 +164,13 @@ pub fn handle_irq() {
         return; // spurious / special — no EOI
     }
 
-    if intid == crate::arch::timer::TIMER_INTID {
+    if intid < 16 {
+        // SGI (inter-processor interrupt). INTID = the IPI channel, bits[12:10] = source core.
+        // For now the only IPI is a wake/reschedule ping, which just needs to have interrupted the
+        // idle WFE — count it (per-core) as proof of cross-core delivery. M3 hangs the scheduler
+        // reschedule off this.
+        crate::arch::percpu::count_ipi();
+    } else if intid == crate::arch::timer::TIMER_INTID {
         // The handler re-arms the timer (clearing its level-sensitive line) before we EOI.
         crate::arch::timer::on_tick();
     }

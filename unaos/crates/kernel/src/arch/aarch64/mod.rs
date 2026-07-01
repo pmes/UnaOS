@@ -1,6 +1,7 @@
 #[macro_use]
 pub mod serial;
 pub mod cache;
+pub mod percpu;
 pub mod memory;
 pub mod pci;
 pub mod exceptions;
@@ -16,6 +17,10 @@ pub mod smp;
 pub fn init() {
     serial_println!(":: AARCH64 Core Hardware Init ::");
     boot_diagnostics();
+    // Per-CPU data for the boot core (TPIDR_EL2) before anything can take an interrupt, so an IRQ
+    // handler that resolves `percpu::this_cpu()` (the SGI path) always has a valid block. Secondary
+    // cores do their own `percpu::init` in `smp::__secondary_rust`.
+    percpu::init(0);
     // Bring up interrupts, mirroring the x86 init order (IDT -> APIC -> timer -> sti):
     //   1. install the exception vectors (and, at EL2, route async exceptions to EL2);
     //   2. bring up the GICv2 (distributor + this core's CPU interface);
