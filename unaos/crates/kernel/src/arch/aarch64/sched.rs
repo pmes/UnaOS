@@ -766,6 +766,65 @@ impl<T> Drop for MutexGuard<'_, T> {
 }
 
 // ---------------------------------------------------------------------------------------------
+// Channel<T> — a bounded blocking channel, composed from a Mutex + two Semaphores
+// ---------------------------------------------------------------------------------------------
+
+/// A fixed-capacity blocking channel (the classic slots/items bounded buffer). `send` blocks while
+/// full, `recv` blocks while empty; both can cross-CPU-wake the other side. Multiple producers and
+/// multiple consumers are safe — the semaphores and the buffer mutex serialise all of them.
+/// Demonstrates that the scheduler's `Mutex` and `Semaphore` COMPOSE into higher-level concurrency
+/// with no new unsafe: `slots` counts free slots (send waits on it), `items` counts buffered values
+/// (recv waits on it), and a `Mutex` serialises the buffer. Each `wait()` corresponds to a real
+/// produced/consumed item, so the buffer push/pop is never starved or raced (bounded-buffer invariant).
+///
+/// Like the primitives it is built from, a Channel that tasks block on must be `'static`; call
+/// `init()` once on the BSP before use. `Channel<T>` is `Sync` (auto-derived) exactly when `T: Send`.
+pub struct Channel<T> {
+    /// Free slots; initial permits = capacity. `send` waits (blocks when full).
+    slots: Semaphore,
+    /// Buffered items; initial 0. `recv` waits (blocks when empty).
+    items: Semaphore,
+    /// The buffer, serialised by a sleeping mutex (held only across a single push/pop).
+    buffer: Mutex<VecDeque<T>>,
+}
+
+impl<T> Channel<T> {
+    /// Construct an empty channel with `capacity` slots. `const` so it can initialise a `static`.
+    pub const fn new(capacity: usize) -> Self {
+        Channel {
+            slots: Semaphore::new(capacity as i64),
+            items: Semaphore::new(0),
+            buffer: Mutex::new(VecDeque::new()),
+        }
+    }
+
+    /// Reserve the underlying primitives' waiter capacity. Call once on the BSP before use. (Does
+    /// not lock the buffer — `Mutex::lock` requires a scheduler context, which the BSP is not.)
+    pub fn init(&self) {
+        self.slots.init();
+        self.items.init();
+        self.buffer.init();
+    }
+
+    /// Send a value, blocking while the channel is full. Must be called from a scheduled task.
+    pub fn send(&self, value: T) {
+        assert!(self.slots.wait(), "Channel::send() called off a scheduled task");
+        self.buffer.lock().push_back(value); // mutex held only across the push (never across a wait)
+        self.items.post();
+    }
+
+    /// Receive a value, blocking while the channel is empty. Must be called from a scheduled task.
+    pub fn recv(&self) -> T {
+        assert!(self.items.wait(), "Channel::recv() called off a scheduled task");
+        // A permit from `items` guarantees a value was pushed before its matching `post`, and pops
+        // are serialised by the mutex, so the buffer is non-empty here.
+        let value = self.buffer.lock().pop_front().expect("channel buffer empty after items.wait");
+        self.slots.post();
+        value
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
 // Demos
 // ---------------------------------------------------------------------------------------------
 
@@ -840,53 +899,47 @@ fn sleep_demo_body(arg: usize) {
     );
 }
 
-/// Shared state for the M4c Mutex demo (all `static` for the `'static` requirement; initialised in
-/// `start_aps`). Two incrementers on different APs each do `MTX_INCRS` locked increments of the same
-/// `Mutex<u64>`; a verifier waits (via a completion `Semaphore`) for both, then checks no update was
-/// lost — i.e. cross-core mutual exclusion held.
-static MTX_DEMO: Mutex<u64> = Mutex::new(0);
-static MTX_DONE: Semaphore = Semaphore::new(0);
-const MTX_INCRS: u64 = 1000;
+/// Shared bounded channel for the M4d demo (a `static` for the `'static` requirement; initialised in
+/// `start_aps`). A producer on one AP sends 1..=`CHAN_N` through a small (cap-4) channel to a
+/// consumer on another AP; the capacity forces both send-blocks-when-full and recv-blocks-when-empty,
+/// exercising cross-core wake in BOTH directions. Composed from Mutex + 2 Semaphores (no new unsafe).
+static CHAN_DEMO: Channel<u64> = Channel::new(4);
+const CHAN_N: u64 = 20;
 
-/// M4c incrementer: `MTX_INCRS` locked increments of the shared `Mutex<u64>`, then post completion.
-/// On metal two of these run on different cores and genuinely contend the sleeping mutex (each
-/// contended `lock()` blocks + is cross-core woken on the holder's `unlock`); the final total proves
-/// no lost read-modify-write, i.e. mutual exclusion held across cores.
-fn mtx_incrementer_body(core: usize) {
-    for _ in 0..MTX_INCRS {
-        let mut g = MTX_DEMO.lock();
-        *g += 1;
+/// M4d producer: send 1..=CHAN_N; blocks whenever the 4-slot buffer fills (woken by the consumer).
+fn chan_producer_body(core: usize) {
+    for v in 1..=CHAN_N {
+        CHAN_DEMO.send(v);
     }
-    MTX_DONE.post();
-    serial_println!(":: SCHED: core {} MUTEX incrementer done ({} incrs) ::", core, MTX_INCRS);
+    serial_println!(":: SCHED: core {} CHANNEL sent 1..={} ::", core, CHAN_N);
 }
 
-/// M4c verifier: wait for `workers` incrementers to finish (each `MTX_DONE.post()` wakes us — at
-/// least one cross-core), then read the mutex and check the total. PASS iff every increment landed.
-fn mtx_verifier_body(workers: usize) {
-    for _ in 0..workers {
-        assert!(MTX_DONE.wait(), "MUTEX verifier ran off a scheduled task");
+/// M4d consumer: recv CHAN_N values and sum them; blocks whenever the buffer is empty (woken by the
+/// producer). Sum == N(N+1)/2 proves every value crossed the channel intact with no lost wakeup.
+fn chan_consumer_body(core: usize) {
+    let mut sum = 0u64;
+    for _ in 0..CHAN_N {
+        sum += CHAN_DEMO.recv();
     }
-    let total = *MTX_DEMO.lock();
-    let expected = workers as u64 * MTX_INCRS;
+    let expected = CHAN_N * (CHAN_N + 1) / 2;
     serial_println!(
-        ":: SCHED: MUTEX total {} (expected {}) => {} ::",
-        total,
+        ":: SCHED: core {} CHANNEL sum {} (expected {}) => {} ::",
+        core,
+        sum,
         expected,
-        if total == expected { "PASS" } else { "FAIL" },
+        if sum == expected { "PASS" } else { "FAIL" },
     );
 }
 
-/// M3b/M4a/M4c: turn on preemptive scheduling and put a workload on the APs, then flip SCHED_ACTIVE
+/// M3b/M4a/M4d: turn on preemptive scheduling and put a workload on the APs, then flip SCHED_ACTIVE
 /// (enables `timer_preempt`) and SCHED_GO (releases the APs into `run`). The workload:
 ///   * first online AP — a busy-pair (preemption regression) + the M4a `sleep_ticks` sleeper;
-///   * (with >= 3 online APs) an M4c `Mutex<u64>` contended by two incrementers on the 2nd + 3rd APs
-///     plus a verifier woken by a completion `Semaphore`.
+///   * (with >= 3 online APs) an M4d bounded `Channel<u64>` producer (2nd AP) / consumer (3rd AP).
 /// On metal the busy-pair INTERLEAVES under the timer, the sleeper parks-then-wakes on its own tick,
-/// the two incrementers contend the sleeping mutex ACROSS cores and the total comes out exact, and
-/// the verifier is woken cross-core. In QEMU (no Group-1 IRQ delivery) the busy tasks run
-/// sequentially, the sleeper self-skips, and every block/wake is carried by the run() busy-poll (SGI
-/// delivery being the metal-only half). Call AFTER the BSP's cooperative demo so it stays un-preempted.
+/// and the channel blocks/wakes both ends cross-core (the cap-4 buffer forces full+empty stalls). In
+/// QEMU (no Group-1 IRQ delivery) the busy tasks run sequentially, the sleeper self-skips, and every
+/// block/wake is carried by the run() busy-poll (SGI delivery being the metal-only half). Call AFTER
+/// the BSP's cooperative demo so it stays un-preempted.
 pub fn start_aps(online: &[usize]) {
     if let Some(&c) = online.first() {
         spawn("busy-a", preempt_body, c * 10, c);
@@ -894,19 +947,17 @@ pub fn start_aps(online: &[usize]) {
         spawn("sleeper", sleep_demo_body, c, c);
     }
     if online.len() >= 3 {
-        MTX_DEMO.init(); // reserve the mutex's internal semaphore waiters on the BSP before use
-        MTX_DONE.init();
-        let (a, b) = (online[1], online[2]);
-        spawn("mtx-inc-a", mtx_incrementer_body, a, a);
-        spawn("mtx-inc-b", mtx_incrementer_body, b, b);
-        spawn("mtx-verify", mtx_verifier_body, 2, b);
+        CHAN_DEMO.init(); // reserve the channel's sub-primitive waiters on the BSP before use
+        let (producer, consumer) = (online[1], online[2]);
+        spawn("chan-prod", chan_producer_body, producer, producer);
+        spawn("chan-cons", chan_consumer_body, consumer, consumer);
     } else {
-        serial_println!(":: AARCH64 SCHED: Mutex demo skipped (needs >= 3 online APs) ::");
+        serial_println!(":: AARCH64 SCHED: Channel demo skipped (needs >= 3 online APs) ::");
     }
     SCHED_ACTIVE.store(true, Ordering::Release);
     SCHED_GO.store(true, Ordering::Release);
     serial_println!(
-        ":: AARCH64 SCHED: preemption ON; busy-pair + sleep + Mutex demo on APs {:?} ::",
+        ":: AARCH64 SCHED: preemption ON; busy-pair + sleep + Channel demo on APs {:?} ::",
         online
     );
 }
