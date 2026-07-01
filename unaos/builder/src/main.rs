@@ -81,6 +81,14 @@ fn main() {
     std::fs::copy(&bootloader_bin, boot_dir.join("BOOTX64.EFI")).unwrap();
     std::fs::copy(&kernel_bin, esp_dir.join("kernel.elf")).unwrap();
 
+    // A small text file so the in-kernel FAT reader has something to `cat` on the real boot stick:
+    // after boot, `ls` shows EFI/ + kernel.elf + hello.txt and `cat hello.txt` reads it back off the
+    // FAT32 volume — proving USB mass-storage block I/O + FAT parsing on metal.
+    std::fs::write(
+        esp_dir.join("hello.txt"),
+        "Hello from UnaOS on real hardware!\nThis file was read off the FAT32 boot stick by the in-kernel FAT reader.\n",
+    ).unwrap();
+
     // Package-only mode: build + pack the ESP, then stop (no QEMU). Used to produce real-hardware
     // boot media — copy this directory's contents onto a FAT32 USB and boot the Mac via Option.
     if std::env::var("UNAOS_PACKAGE_ONLY").is_ok() {
