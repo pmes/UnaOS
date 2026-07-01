@@ -284,9 +284,13 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
                         // console over it in that case — leave it up until the next keypress.
                         let took_screen =
                             unaos_kernel::shell::dispatch_command(&cmd, &mut console, &mut pal);
-                        if !took_screen {
-                            console.draw(&mut pal);
+                        if took_screen {
+                            // Stop draining this frame so a keystroke already queued behind Enter
+                            // can't paint the console back over the full-screen output; present it
+                            // alone. Remaining queued events are handled next iteration.
+                            break;
                         }
+                        console.draw(&mut pal);
                     } else if c == 8 || c == 0x7F {
                         console.current_input.pop();
                         console.draw_input_line(&mut pal);
