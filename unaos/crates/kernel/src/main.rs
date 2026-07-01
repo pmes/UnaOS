@@ -131,10 +131,31 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     // delivery, so the APs run their tasks to completion sequentially. The BSP is never scheduled —
     // it continues below as the GUI/hardware-service core.
     #[cfg(all(target_arch = "aarch64", feature = "baremetal"))]
-    {
+    let input_on_scheduler = {
         let online = unaos_kernel::arch::smp::online_secondaries();
         unaos_kernel::arch::sched::start_aps(&online);
-    }
+        // M5: hand keyboard input to a scheduled kernel thread on a secondary core, so the main loop
+        // below only drains events + renders instead of polling the UART itself — the OS servicing
+        // its own input via the scheduler. Only on the GUI path: the serial-only fallback (no
+        // framebuffer) echoes input on the BSP, and two readers of the one UART would steal each
+        // other's bytes. Needs an online AP to host it; if none came up, the BSP keeps polling.
+        let host = if framebuffer_addr != 0 { online.last().copied() } else { None };
+        if let Some(cpu) = host {
+            unaos_kernel::arch::sched::spawn("input", input_service, 0, cpu);
+            serial_println!(":: INPUT: keyboard service scheduled on core {} (BSP stops polling) ::", cpu);
+            true
+        } else {
+            false
+        }
+    };
+    // aarch64-UEFI (and any non-baremetal aarch64) has no scheduler: the BSP polls input itself.
+    #[cfg(all(target_arch = "aarch64", not(feature = "baremetal")))]
+    let input_on_scheduler = false;
+    // `bootlog` halts (hlt_loop) before the GUI main loop that reads this flag, so its only reader is
+    // unreachable in that build — acknowledge the binding here (reachable, before the halt) to avoid
+    // an unused-variable warning without weakening the flag on the normal GUI path.
+    #[cfg(all(target_arch = "aarch64", feature = "bootlog"))]
+    let _ = input_on_scheduler;
 
     // 4b. ACPI: discover the CPU topology (MADT) for SMP bring-up. x86_64 only — aarch64
     // discovers CPUs via the DTB. Degrades gracefully to uniprocessor if ACPI is absent.
@@ -283,9 +304,13 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         // no NIC is present, e.g. on aarch64).
         unaos_kernel::drivers::e1000::service_net();
 
+        // aarch64: unless a scheduled input service owns the UART (M5), poll it here and feed the
+        // event queue. Drain all pending bytes so a burst isn't spread one-per-frame.
         #[cfg(target_arch = "aarch64")]
-        if let Some(byte) = unaos_kernel::arch::poll_input() {
-            unaos_kernel::pal::push_event(unaos_kernel::pal::Event::Key(byte));
+        if !input_on_scheduler {
+            while let Some(byte) = unaos_kernel::arch::poll_input() {
+                unaos_kernel::pal::push_event(unaos_kernel::pal::Event::Key(byte));
+            }
         }
 
         let event = pal.poll_event();
@@ -351,6 +376,32 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         // Present this frame: flush the damaged region of the back buffer to the framebuffer.
         // No-op when nothing was drawn this iteration, so the idle (hlt) path stays cheap.
         pal.render();
+    }
+}
+
+/// M5 (bare-metal aarch64): keyboard input as a scheduled kernel service.
+///
+/// This is the first step of "the OS runs on its own scheduler" — instead of the BSP polling the
+/// PL011 inline in its GUI loop, keyboard input is a kernel thread on a secondary core. It drains
+/// every byte waiting in the UART RX FIFO into the shared `pal` event queue (a cross-core
+/// `spin::Mutex`), which the BSP's render loop pops and dispatches. Only the byte *source* moves off
+/// the BSP; the console behaves identically. Never returns (a service task).
+///
+/// Between polls it naps so it does not pin its core: on metal the per-core generic-timer tick wakes
+/// it every tick (~4 ms at 250 Hz — imperceptible for typing), and the core WFI-idles in between. In
+/// QEMU raspi4b the timer IRQ is not delivered, so `sleep_ticks` would park forever (`is_live()` is
+/// false there); yield cooperatively instead so this core's `run()` keeps re-dispatching us.
+#[cfg(all(target_arch = "aarch64", feature = "baremetal"))]
+fn input_service(_: usize) {
+    loop {
+        while let Some(byte) = unaos_kernel::arch::poll_input() {
+            unaos_kernel::pal::push_event(unaos_kernel::pal::Event::Key(byte));
+        }
+        if unaos_kernel::arch::timer::is_live() {
+            unaos_kernel::arch::sched::sleep_ticks(1);
+        } else {
+            unaos_kernel::arch::sched::yield_now();
+        }
     }
 }
 
