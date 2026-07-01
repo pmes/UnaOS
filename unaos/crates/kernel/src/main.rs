@@ -264,64 +264,79 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
             unaos_kernel::pal::push_event(unaos_kernel::pal::Event::Key(byte));
         }
 
-        let event = pal.poll_event();
-        match event {
-            unaos_kernel::pal::Event::Key(c) => {
-                if c == b'\n' || c == b'\r' {
-                    let cmd = console.current_input.clone();
-                    console.current_input.clear();
-                    // A command may take over the whole screen (e.g. `vug`); don't repaint the
-                    // console over it in that case — leave it up until the next keypress.
-                    let took_screen =
-                        unaos_kernel::shell::dispatch_command(&cmd, &mut console, &mut pal);
-                    if !took_screen {
-                        console.draw(&mut pal);
+        // Drain ALL queued input events this iteration, then present ONE frame below. A burst of
+        // mouse-move reports (or fast typing) must not back up one-event-per-iteration behind the
+        // framebuffer flush — at native resolution that flush is slow, so processing a single event
+        // per loop made input lag badly (the cursor never caught up; typed text appeared seconds
+        // late). Apply every pending event to the back buffer here; `render()` coalesces them.
+        let mut had_event = false;
+        loop {
+            match pal.poll_event() {
+                unaos_kernel::pal::Event::None => break,
+                unaos_kernel::pal::Event::Key(c) => {
+                    had_event = true;
+                    if c == b'\n' || c == b'\r' {
+                        let cmd = console.current_input.clone();
+                        console.current_input.clear();
+                        // A command may take over the whole screen (e.g. `vug`); don't repaint the
+                        // console over it in that case — leave it up until the next keypress.
+                        let took_screen =
+                            unaos_kernel::shell::dispatch_command(&cmd, &mut console, &mut pal);
+                        if !took_screen {
+                            console.draw(&mut pal);
+                        }
+                    } else if c == 8 || c == 0x7F {
+                        console.current_input.pop();
+                        console.draw_input_line(&mut pal);
+                    } else if c >= 32 && c <= 126 {
+                        console.current_input.push(c as char);
+                        console.draw_input_line(&mut pal);
                     }
-                } else if c == 8 || c == 0x7F {
-                    console.current_input.pop();
-                    console.draw_input_line(&mut pal);
-                } else if c >= 32 && c <= 126 {
-                    console.current_input.push(c as char);
-                    console.draw_input_line(&mut pal);
                 }
+                unaos_kernel::pal::Event::Mouse { x, y } => {
+                    had_event = true;
+                    // Erase old cursor (draw background color over it)
+                    pal.draw_rect(mouse_px as usize, mouse_py as usize, 10, 10, 0x1E1E1E);
+
+                    // Update position with deltas
+                    mouse_px += x;
+                    mouse_py += y;
+
+                    // Clamp to screen bounds
+                    if mouse_px < 0 { mouse_px = 0; }
+                    if mouse_py < 0 { mouse_py = 0; }
+                    if mouse_px as u32 >= pal.width() { mouse_px = pal.width() as i32 - 10; }
+                    if mouse_py as u32 >= pal.height() { mouse_py = pal.height() as i32 - 10; }
+
+                    // Draw new cursor (a bright red 10x10 square)
+                    pal.draw_rect(mouse_px as usize, mouse_py as usize, 10, 10, 0xFF0000);
+                }
+                unaos_kernel::pal::Event::MouseAbsolute { x, y } => {
+                    had_event = true;
+                    // Erase old cursor
+                    pal.draw_rect(mouse_px as usize, mouse_py as usize, 10, 10, 0x1E1E1E);
+
+                    // Scale 0-32767 coordinate space to screen bounds
+                    mouse_px = ((x as i64 * pal.width() as i64) / 32767) as i32;
+                    mouse_py = ((y as i64 * pal.height() as i64) / 32767) as i32;
+
+                    // Clamp just in case
+                    if mouse_px < 0 { mouse_px = 0; }
+                    if mouse_py < 0 { mouse_py = 0; }
+                    if mouse_px as u32 >= pal.width() { mouse_px = pal.width() as i32 - 10; }
+                    if mouse_py as u32 >= pal.height() { mouse_py = pal.height() as i32 - 10; }
+
+                    // Draw new cursor
+                    pal.draw_rect(mouse_px as usize, mouse_py as usize, 10, 10, 0xFF0000);
+                }
+                // Timer / Unknown: nothing to do.
+                _ => {}
             }
-            unaos_kernel::pal::Event::Mouse { x, y } => {
-                // Erase old cursor (draw background color over it)
-                pal.draw_rect(mouse_px as usize, mouse_py as usize, 10, 10, 0x1E1E1E);
+        }
 
-                // Update position with deltas
-                mouse_px += x;
-                mouse_py += y;
-
-                // Clamp to screen bounds
-                if mouse_px < 0 { mouse_px = 0; }
-                if mouse_py < 0 { mouse_py = 0; }
-                if mouse_px as u32 >= pal.width() { mouse_px = pal.width() as i32 - 10; }
-                if mouse_py as u32 >= pal.height() { mouse_py = pal.height() as i32 - 10; }
-
-                // Draw new cursor (a bright red 10x10 square)
-                pal.draw_rect(mouse_px as usize, mouse_py as usize, 10, 10, 0xFF0000);
-            }
-            unaos_kernel::pal::Event::MouseAbsolute { x, y } => {
-                // Erase old cursor
-                pal.draw_rect(mouse_px as usize, mouse_py as usize, 10, 10, 0x1E1E1E);
-
-                // Scale 0-32767 coordinate space to screen bounds
-                mouse_px = ((x as i64 * pal.width() as i64) / 32767) as i32;
-                mouse_py = ((y as i64 * pal.height() as i64) / 32767) as i32;
-
-                // Clamp just in case
-                if mouse_px < 0 { mouse_px = 0; }
-                if mouse_py < 0 { mouse_py = 0; }
-                if mouse_px as u32 >= pal.width() { mouse_px = pal.width() as i32 - 10; }
-                if mouse_py as u32 >= pal.height() { mouse_py = pal.height() as i32 - 10; }
-
-                // Draw new cursor
-                pal.draw_rect(mouse_px as usize, mouse_py as usize, 10, 10, 0xFF0000);
-            }
-            _ => {
-                unaos_kernel::hlt();
-            }
+        // Nothing queued — sleep until the next interrupt (timer/xHCI) rather than busy-spin.
+        if !had_event {
+            unaos_kernel::hlt();
         }
 
         // Present this frame: flush the damaged region of the back buffer to the framebuffer.
