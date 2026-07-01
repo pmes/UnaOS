@@ -197,10 +197,18 @@ pub fn init(_dtb_addr: u64, _dtb_size: usize) {
     // Network controller (PCI class 0x02 = Network, subclass 0x00 = Ethernet).
     // QEMU's e1000 (82540EM) lands here; bring it up for polled RX.
     if let Some((bus, slot, func)) = crate::drivers::pci::PciScanner::find_device(0x02, 0x00) {
+        let vendor = unsafe { read_config_16(bus, slot, func, 0x00) };
         serial_println!(
-            ":: x86_64 PCI: Found network controller (class 0x02) at {}:{}.{} ::",
-            bus, slot, func
+            ":: x86_64 PCI: Found network controller (class 0x02) vendor {:#06x} at {}:{}.{} ::",
+            vendor, bus, slot, func
         );
+        // Only the Intel e1000/e1000e family is supported. On a real 2012 MacBook Pro the NIC is a
+        // Broadcom Wi-Fi part (vendor 0x14e4) that also reports class 0x02 — poking it with e1000
+        // register writes is wrong and its RX/TX bring-up (+ DHCP) just stalls. Gate to Intel.
+        if vendor != 0x8086 {
+            serial_println!(":: x86_64 PCI: non-Intel NIC ({:#06x}) — no e1000 driver, skipping ::", vendor);
+            return;
+        }
         crate::drivers::e1000::init(bus, slot, func);
         // Route the NIC's RX interrupt to the BSP local APIC via MSI (IDT vector 0x41),
         // the same local-APIC delivery the xHCI uses. The e1000e keeps its MSI-X table in
