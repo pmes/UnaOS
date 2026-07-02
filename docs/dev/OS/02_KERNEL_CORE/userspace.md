@@ -89,7 +89,12 @@
   no core can ever cache a writable mapping of it — W^X enforced across cores by
   construction, replacing the U1a single-core `invlpg` flip. QEMU-verified
   (2026-07-02): U1a still `PASS`, `exited=1 killed=3 (all expected vecs) -> PASS`,
-  full boot/SMP/xHCI regression intact, 0 unexpected fault lines. Metal pending.
+  full boot/SMP/xHCI regression intact, 0 unexpected fault lines. **Metal-confirmed
+  the same day on the real 2012 rMBP**: `:: SMEP on ::` (the one line TCG can't
+  show), the 3 kills at `vec=14 err=0x7/0x7/0x15` (the `0x15` = the NX
+  instruction-fetch bit, enforced by the real MMU), both U1a+U1b `PASS`, and the
+  kernel continuing past all three kills — proving the `swapgs`/GS-restore, NMI-IST,
+  and fault→`sched::exit()` paths work on silicon, not just under emulation.
 - Not yet: full user-GPR preservation across a syscall, validated user pointers
   (`copy_from_user`), per-process address spaces (U3).
 
