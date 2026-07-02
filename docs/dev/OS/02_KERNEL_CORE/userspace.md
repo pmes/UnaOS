@@ -76,10 +76,15 @@
   **EL0 stack write/readback** (the capability this arc unlocks — a program pushes/pops
   its own stack, impossible on the old shared window), and **SP-relative sentinel
   readback**. QEMU-verified (2026-07-02): all three `-> PASS`, with M6c/M6b/M6e all
-  unchanged and CAPSTONE 6/6. Metal-verify pending — the ASID/TLB/`nG` discipline and
-  the SP-sentinel-under-preemption are exactly what QEMU (no TLB, no caches, no Group-1
-  IRQ) cannot exercise; note that on metal `IRQs-taken-at-EL0` grows (four more
-  preemptible EL0 tasks), which is expected and metal-variable.
+  unchanged and CAPSTONE 6/6. **★ METAL-CONFIRMED on the real Pi 4 (2026-07-02, EL=1,
+  CNTFRQ=54 MHz):** all three M6d lines `-> PASS` on real A72 caches/TLB — the same-VA
+  isolation + the TTBR0-swap `nG` probe prove the ASID/`nG` discipline discriminates on
+  silicon (QEMU can only re-walk), and `M6e: … IRQs-taken-at-EL0=21` (QEMU=0) proves the
+  four M6d EL0 tasks ran under **real timer preemption** and resumed correctly — i.e.
+  per-task `TTBR0`/ASID switching in `dispatch_next` + SP_EL0 banking are correct across
+  preemption. M6b `exited=1 killed=3 -> PASS` (same 3 ECs), CAPSTONE 6/6, 0 unexpected
+  faults. (`IRQs-taken-at-EL0` grew 18→21 vs M6e — the extra preemptible tasks, expected
+  and metal-variable.) M6d METAL-COMPLETE.
 - Not yet: validated user pointers (M6f).
 
 ### x86_64 (branch `hw-rmbp`)
