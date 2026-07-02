@@ -35,6 +35,20 @@ Tracks are **independent**: no synchronized rounds, no track waits for another.
 Fable integrates each track's arc as it lands and rebases only that track. Cap:
 **one unmerged arc per track**.
 
+### The landing ping (end-of-round message, executor → integrator)
+
+An arc round ends with a **cross-session message from the executor to the
+integrator session** (Claude Code cross-session messaging; Peter relays if the
+seat is cold). Timing rule: **the ping goes out AFTER the operator's metal
+attempt** when the arc has a metal half and the flash is imminent — the ping is
+the "review me now" signal, and a merge should carry the silicon verdict (and
+any metal-only fix) inside the arc, not trailing it. If metal is genuinely
+deferred (no hardware day planned), send the ping with an explicit
+**METAL PENDING + why + when**. Content: commit hash(es), DONE-gate results,
+metal verdict or the pending marker, any lane flags to ratify, and next-arc
+input for the re-brief. The integrator holds the merge for an imminent metal
+verdict; review can start immediately either way.
+
 ## Integrator procedure (step by step)
 
 ### 0. Cold-start — assess reality before trusting memory
