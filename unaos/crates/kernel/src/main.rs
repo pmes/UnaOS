@@ -183,6 +183,24 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
                 cpu,
                 vcpu
             );
+
+            // M6e: preemptible EL0. `spawn_user` now starts the task with IRQ UNMASKED (SPSR 0x240)
+            // and `__vec_irq` banks SP_EL0, so the generic timer can preempt a running EL0 task. The
+            // spinner is a long, register-only, syscall-free EL0 loop on the demo core; on metal the
+            // timer preempts it mid-loop — it interleaves with the co-located capstone/kernel tasks
+            // and `aarch64_irq_handler` counts each EL0 IRQ; the m6e-verdict on the sibling core
+            // reports the count. Metal-only: QEMU raspi4b delivers no Group-1 timer IRQ, so the
+            // spinner runs its bounded loop uninterrupted there (count stays 0), never hanging the
+            // regression. The verdict shares `vcpu` with the M6b verdict / capstone workers and polls
+            // via `yield_now`.
+            serial_println!(":: M6e: EL0 preemptible (SP_EL0 banked; spawn_user I-unmasked) ::");
+            unaos_kernel::arch::sched::spawn_user("el0-spin", demo.spin, demo.sp, cpu);
+            unaos_kernel::arch::sched::spawn(
+                "m6e-verdict",
+                unaos_kernel::arch::syscall::m6e_verdict,
+                0,
+                vcpu,
+            );
         }
     }
 

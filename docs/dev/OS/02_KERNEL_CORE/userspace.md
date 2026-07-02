@@ -35,8 +35,22 @@
   verified (2026-07-02): `:: M6c: user blob loaded (51 bytes) ::`, `hello from EL0`,
   the M6b verdict still `PASS`, capstone 6/6. Metal-verify pending — the D-cache/
   I-cache copy path is a no-op in QEMU.
-- Not yet: per-task address spaces/ASIDs (M6d), preemptible EL0 (M6e), validated
-  user pointers (M6f).
+- **M6e** — preemptible EL0 (metal-only preemption): `__vec_irq` now banks **SP_EL0**
+  (the user stack pointer) onto the preempted task's own kernel stack alongside
+  ELR_EL1/SPSR_EL1/FP, and `spawn_user` starts the EL0 task with **IRQ unmasked**
+  (SPSR `0x2C0 → 0x240`), so the generic timer preempts a running EL0 task and it
+  resumes with the correct user SP. The shared user stack is retained — no EL0 demo
+  program writes it (hello and the new spinner are register-only; the fault fixtures
+  fault before any push) — so a stack-writing program would need per-task stacks (M6d).
+  Demo: a long register-only EL0 spinner (`el0-spin`) on the demo core + an
+  `m6e-verdict` that reports `spinner completed` and `IRQs-taken-at-EL0` (counted in
+  `aarch64_irq_handler` when the banked SPSR shows an EL0t return). QEMU-verified
+  (2026-07-02): the `:: M6e: EL0 preemptible … ::` setup + verdict lines, the M6b
+  verdict still `PASS`, capstone 6/6, no regression. **Metal-only:** QEMU raspi4b
+  delivers no Group-1 timer IRQ, so `IRQs-taken-at-EL0 = 0` there and EL0 is not
+  actually preempted; the real preemption (`IRQs > 0`, the spinner interleaving with
+  capstone) is confirmed later on the real Pi 4.
+- Not yet: per-task address spaces/ASIDs (M6d), validated user pointers (M6f).
 
 ### x86_64 (branch `hw-rmbp`)
 

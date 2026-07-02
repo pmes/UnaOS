@@ -21,24 +21,30 @@
 // faulting inline fixtures) and a verdict task that demands the EXACT outcome split — see `verdict`
 // and main.rs. M6f adds a real copy_from_user and a wider surface.
 
-use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
 // --- Syscall numbers (a tiny subset for M6a/M6b). ---
 const SYS_WRITE: u64 = 1;
 const SYS_EXIT: u64 = 2;
 
-// --- The inline EL0 FAULT FIXTURES (M6b). These are fault-SHAPE fixtures, not programs, so they stay
-// inline in the kernel image; only the well-behaved `hello` routine moved out to a separately linked
-// blob in M6c (see `USER_BLOB` below). Fully position-independent — every reference is a PC-relative
-// `adr` and there are only svc + mov-immediate + register ops — so they run correctly wherever the
-// copy lands. `__fault_blob_{start,end}` bound the copy; the `__user_prog_*` labels are the per-fixture
-// entries.
+/// M6e demo: the sentinel `sys_exit` status the preemption spinner uses so its exit is accounted to
+/// `EL0_SPIN_DONE` and never perturbs the M6b `exited/killed` counters. Demo-only — there is no real
+/// userspace yet, so overloading one status value for demo bookkeeping is safe and documented here.
+const M6E_SPIN_STATUS: u64 = 0x6E;
+
+// --- The inline EL0 FIXTURES: three fault-SHAPE fixtures (M6b) + one preemption spinner (M6e). These
+// are fixtures, not programs, so they stay inline in the kernel image; only the well-behaved `hello`
+// routine moved out to a separately linked blob in M6c (see `USER_BLOB` below). Fully
+// position-independent — every reference is a PC-relative `adr` and there are only svc + mov-immediate
+// + register ops — so they run correctly wherever the copy lands. `__fault_blob_{start,end}` bound the
+// copy; the `__user_prog_*` labels are the per-fixture entries.
 //
-// Each provokes ONE specific fault the kernel must answer with a task-kill. If the fault DOESN'T
-// happen (broken permissions / stale TLB), the fixture falls through to sys_exit(1) — the SURVIVOR
-// protocol: a self-reported, greppable FAIL instead of an EL0 wedge (EL0 runs I-masked until M6e, so
-// a `b .` survivor would hang its core forever and silence the same-core verdict the failure is
-// supposed to reach). ---
+// The three fault fixtures each provoke ONE specific fault the kernel must answer with a task-kill. If
+// the fault DOESN'T happen (broken permissions / stale TLB), the fixture falls through to sys_exit(1)
+// — the SURVIVOR protocol: a self-reported, greppable FAIL. The tail self-exits rather than `b .`
+// because QEMU raspi4b delivers no timer IRQ, so an EL0 spin is UNpreemptible THERE regardless of M6e
+// (on metal, M6e now WOULD preempt it) — a `b .` survivor would wedge its core for the full
+// kernel8-test window and silence the same-core verdict the failure is supposed to reach. ---
 core::arch::global_asm!(
     r#"
     .globl __fault_blob_start
@@ -79,6 +85,24 @@ __user_prog_stack_exec:
     br x0
 1:  b 1b
 
+    // M6e preemption spinner: a long, register-only, syscall-free EL0 loop, then sys_exit with the
+    // M6E sentinel status. With I unmasked at EL0 (spawn_user, M6e) the ONLY thing that can switch it
+    // away is a timer IRQ, so on metal it is preempted mid-loop and interleaves with the co-located
+    // capstone/kernel tasks (aarch64_irq_handler counts the EL0 IRQs; see `m6e_verdict`). It writes
+    // NO memory (register-only), so it shares the demo user stack safely under preemptive interleave.
+    // Count 0x0200_0000 (~33.5M) ≈ a few timer quanta on a 1.5 GHz A72 (>=1 preempt on metal), and
+    // bounded (~sub-second under QEMU TCG, which never preempts it — so it never hangs the regression).
+    .balign 4
+    .globl __user_prog_spin
+__user_prog_spin:
+    movz x9, #0x0200, lsl #16              // loop count = 0x0200_0000
+1:  subs x9, x9, #1
+    b.ne 1b
+    mov x8, #2                             // SYS_EXIT
+    movz x0, #0x6E                         // M6E sentinel status -> EL0_SPIN_DONE (M6b counters stay pure)
+    svc #0
+2:  b 2b                                   // sys_exit never returns; belt-and-braces guard
+
     .balign 4
     .globl __fault_blob_end
 __fault_blob_end:
@@ -91,6 +115,7 @@ unsafe extern "C" {
     static __user_prog_wild_write: u8;
     static __user_prog_code_write: u8;
     static __user_prog_stack_exec: u8;
+    static __user_prog_spin: u8;
 }
 
 /// The `hello` EL0 program (M6c), built as a SEPARATE link product (`crates/user-blob`) and baked in
@@ -120,15 +145,45 @@ static EL0_KILLED_UNEXPECTED: AtomicU32 = AtomicU32::new(0);
 /// Set by `tlb_warm` once the demo core has cached the pre-protect code-page mapping.
 pub static TLB_WARMED: AtomicBool = AtomicBool::new(false);
 
-/// The M6b demo's entry points (EL0 VAs inside the code page) and the shared initial SP_EL0. The
-/// four programs may share one user stack: EL0 is non-preemptible (SPSR I-masked until M6e) and the
-/// tasks are FIFO on one core, so each runs to death before the next is dispatched.
+// --- M6e demo accounting (decoupled from M6b so `exited=1 killed=3` stays byte-identical). ---
+/// The preemption spinner reached its `sys_exit` (via the M6E sentinel status). 1 = it ran to
+/// completion — under QEMU WITHOUT being preempted; on metal having been preempted (see below) and
+/// then correctly resumed (the proof SP_EL0 banking works). Read by `m6e_verdict`.
+static EL0_SPIN_DONE: AtomicU32 = AtomicU32::new(0);
+/// IRQs taken while an EL0 task was the interrupted context (counted in `aarch64_irq_handler`, any
+/// INTID — the timer, or any SPI such as the PL011 RX — and demo-WIDE: the spinner AND any of the four
+/// M6b programs that a tick catches at EL0, since M6e makes them all preemptible). The crisp metal-only
+/// proof that EL0 is preemptible: >0 on the real Pi 4, exactly 0 under QEMU raspi4b (no Group-1 IRQ is
+/// ever delivered). The spinner's own resume-correctness proof is carried separately by
+/// `EL0_SPIN_DONE == 1` (it completed after being interrupted). Read by `m6e_verdict`.
+static EL0_IRQS_AT_EL0: AtomicU64 = AtomicU64::new(0);
+
+/// M6e: count an IRQ taken while EL0 was running — called from `aarch64_irq_handler` when the banked
+/// SPSR shows an EL0t return. Relaxed: a monotonic demo counter read once at the verdict, not a
+/// synchronization point.
+#[inline]
+pub fn note_el0_irq() {
+    EL0_IRQS_AT_EL0.fetch_add(1, Ordering::Relaxed);
+}
+
+/// The EL0 demo entry points (EL0 VAs inside the code page) and the shared initial SP_EL0.
+///
+/// All programs SHARE one user stack (`sp`). Through M6a–M6c that was safe because EL0 was
+/// non-preemptible; under M6e EL0 IS preemptible (SP_EL0 banked in `__vec_irq`), so the shared stack
+/// is now safe for a DIFFERENT, load-bearing reason: **no EL0 demo program writes its user stack** —
+/// hello (`USER_BLOB`) and the spinner are register-only, and the fault fixtures fault or exit before
+/// any push. With SP_EL0 banked per-task, preemptive interleave cannot corrupt a stack nobody writes.
+/// STOP TRIPWIRE: the first EL0 program that actually WRITES its user stack needs per-task user stacks
+/// (extend the user window in `boot.rs`) — that is M6d-adjacent and OUT of this lane; stop and hand it
+/// to the integrator rather than growing the window here.
 pub struct El0Demo {
     pub sp: u64,
     pub hello: u64,
     pub wild_write: u64,
     pub code_write: u64,
     pub stack_exec: u64,
+    /// M6e preemption spinner (`__user_prog_spin`).
+    pub spin: u64,
 }
 
 /// Copy the EL0 programs into the user window (`boot::user_region`) and do the I-cache maintenance;
@@ -188,6 +243,7 @@ pub fn setup() -> El0Demo {
         wild_write: fentry(&raw const __user_prog_wild_write),
         code_write: fentry(&raw const __user_prog_code_write),
         stack_exec: fentry(&raw const __user_prog_stack_exec),
+        spin: fentry(&raw const __user_prog_spin),
     }
 }
 
@@ -252,12 +308,13 @@ pub fn record_el0_kill(name: &str, ec: u64, far: u64, far_valid: bool) {
     }
 }
 
-/// M6b verdict task: wait (bounded) for all four EL0 demo programs to terminate, then print one
-/// PASS/FAIL line with the full accounting. Spawned on a DIFFERENT core than the demo tasks so a
-/// wedged demo core (the fingerprint of a broken TLBI: a survivor spinning at EL0 with I masked,
-/// unpreemptable until M6e) still produces a verdict — a timeout FAIL with the counts — instead of
-/// a silent half-dead boot. Time-bounded via CNTPCT (which advances in QEMU even though the timer
-/// IRQ never fires there), not a yield count (meaningless on a core with other work).
+/// M6b verdict task: wait (bounded) for all four M6b EL0 programs (hello + three fault fixtures) to
+/// terminate, then print one PASS/FAIL line with the full accounting. Spawned on a DIFFERENT core than
+/// the demo tasks so a wedged demo core (the fingerprint of a broken TLBI) still produces a verdict —
+/// a timeout FAIL with the counts — instead of a silent half-dead boot. (The M6e spinner accounts
+/// separately, via `EL0_SPIN_DONE`, so it does not perturb this verdict's `done >= 4`.) Time-bounded
+/// via CNTPCT (which advances in QEMU even though the timer IRQ never fires there), not a yield count
+/// (meaningless on a core with other work).
 pub fn verdict(_: usize) {
     let start = super::timer::cntpct();
     let deadline = 5 * super::timer::cntfrq(); // ~5 s; the whole demo completes in well under 1 s
@@ -292,6 +349,31 @@ pub fn verdict(_: usize) {
     }
 }
 
+/// M6e verdict task: wait (bounded, CNTPCT) for the preemption spinner to finish, then report whether
+/// EL0 was actually preempted. Spawned like the M6b verdict on a scheduled core that co-tenants the
+/// capstone workers, so it polls with `yield_now` (never monopolizes the core). The line is
+/// deterministic under QEMU (the spinner completes its bounded loop -> completed=1; no timer IRQ ->
+/// IRQs=0) and carries the metal-only signal in `IRQs`: on the real Pi 4 the timer (and any other SPI)
+/// preempts running EL0 tasks, so `IRQs > 0` (demo-wide) — and the spinner STILL completes, which is
+/// the distinct proof that SP_EL0 banking resumed it with the right user stack pointer. Time-bounded
+/// via CNTPCT (advances in QEMU even without the timer IRQ), matching the M6b verdict.
+pub fn m6e_verdict(_: usize) {
+    let start = super::timer::cntpct();
+    let deadline = 5 * super::timer::cntfrq(); // ~5 s; the spinner finishes in well under 1 s either way
+    while EL0_SPIN_DONE.load(Ordering::Acquire) == 0
+        && super::timer::cntpct().wrapping_sub(start) <= deadline
+    {
+        super::sched::yield_now();
+    }
+    let done = EL0_SPIN_DONE.load(Ordering::Acquire);
+    let irqs = EL0_IRQS_AT_EL0.load(Ordering::Relaxed);
+    serial_println!(
+        ":: M6e: EL0 preemptible — spinner completed={} IRQs-taken-at-EL0={} (metal: completed=1 & IRQs>0; QEMU: completed=1 & IRQs=0) ::",
+        done,
+        irqs
+    );
+}
+
 /// One-shot: the first syscall proves the EL0→EL1 path is live end to end (logged off the ISR-free SVC
 /// path, so `serial_println!` is safe here — unlike the RX ISR, nothing on this core holds SERIAL_PORT).
 static SVC_LOGGED: AtomicBool = AtomicBool::new(false);
@@ -315,9 +397,13 @@ extern "C" fn aarch64_svc_handler(frame: *mut u64) {
     let ret: i64 = match nr {
         SYS_WRITE => sys_write(a0, a1, a2),
         SYS_EXIT => {
-            // Demo accounting BEFORE the no-return exit: status 0 = normal completion; nonzero = a
-            // fault-test program self-reporting that its intended fault never happened (survivor).
-            if a0 == 0 {
+            // Demo accounting BEFORE the no-return exit. The M6e spinner exits with the M6E sentinel
+            // status -> EL0_SPIN_DONE (kept OUT of the M6b counters so `exited=1 killed=3` is
+            // byte-identical). Otherwise: status 0 = normal completion (hello); nonzero = a fault-test
+            // program self-reporting that its intended fault never happened (the survivor protocol).
+            if a0 == M6E_SPIN_STATUS {
+                EL0_SPIN_DONE.fetch_add(1, Ordering::AcqRel);
+            } else if a0 == 0 {
                 EL0_EXITED_OK.fetch_add(1, Ordering::AcqRel);
             } else {
                 EL0_EXITED_ERR.fetch_add(1, Ordering::AcqRel);
