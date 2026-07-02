@@ -1657,6 +1657,20 @@ pub fn run_queue_len(cpu: usize) -> usize {
     RUN_QUEUES[cpu].lock().len()
 }
 
+/// Name of the task currently running on THIS CPU, or `None` if the CPU is idle. `name` is a
+/// `&'static str`, so it stays valid even after the Box is reclaimed. Used by the U1b ring-3
+/// fault-kill log (`interrupts::ring3_fault_kill`), which runs on this CPU with GS already
+/// restored to `PerCpuData` — the same lookup shape as `current_task_id`, keyed to the current CPU.
+pub fn current_name() -> Option<&'static str> {
+    let cpu = percpu::this_cpu().cpu_index as usize;
+    let raw = SCHED[cpu].current.load(Ordering::Acquire) as *const Task;
+    if raw.is_null() {
+        None
+    } else {
+        Some(unsafe { (*raw).name })
+    }
+}
+
 /// Id of the task currently running on a CPU, if any (best-effort; for introspection only).
 pub fn current_task_id(cpu: usize) -> Option<u64> {
     if cpu >= MAX_CPUS {

@@ -260,8 +260,23 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
                 unaos_kernel::arch::sched::enable();
                 let demo = unaos_kernel::arch::syscall::setup();
                 serial_println!(":: U1a: ring-3 demo — user task on core {} ::", cpu);
-                unaos_kernel::arch::sched::spawn_user("u1a-hello", demo.entry, demo.sp, cpu);
+                unaos_kernel::arch::sched::spawn_user("u1a-hello", demo.hello, demo.sp, cpu);
                 unaos_kernel::arch::syscall::await_verdict();
+
+                // U1b: fault isolation. Drop three fault fixtures to ring 3 on the same core — each
+                // provokes a specific fault (write to a kernel VA, write to the RO code page, exec
+                // from the NX stack) the fault handler must answer with a task-KILL, not a kernel
+                // halt. Ring 3 is cooperative (IF-masked), so they run FIFO to death one after
+                // another; the BSP then waits (bounded, BSP-quiet) and prints the verdict. This is
+                // the x86 mirror of aarch64 M6b.
+                serial_println!(
+                    ":: U1b: fault-isolation demo — 3 fault fixtures on core {} ::",
+                    cpu
+                );
+                unaos_kernel::arch::sched::spawn_user("u1b-wild-write", demo.wild_write, demo.sp, cpu);
+                unaos_kernel::arch::sched::spawn_user("u1b-code-write", demo.code_write, demo.sp, cpu);
+                unaos_kernel::arch::sched::spawn_user("u1b-stack-exec", demo.stack_exec, demo.sp, cpu);
+                unaos_kernel::arch::syscall::await_u1b_verdict();
             } else {
                 serial_println!(":: U1a: no application processors online — ring-3 demo SKIPPED ::");
             }
