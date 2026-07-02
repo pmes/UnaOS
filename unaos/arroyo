@@ -45,6 +45,17 @@ if [ -n "$_feats" ]; then
     echo -e "${COLOR_YELLOW}⚡ kernel features: ${_feats%,}${COLOR_RESET}"
 fi
 
+# UNAOS_BOOTDIAG=1 turns on the BOOTLOADER's `bootdiag` feature — an additive UEFI boot-time
+# diagnostics block (firmware vendor/rev, GOP handle count, ConOut device path, DTB stdout-path +
+# serial aliases: the Jetson Orin UART/GOP truth). It gates the bootloader build only (the kernel is
+# untouched); OFF by default => byte-identical boot logs. Only the aarch64 bootloader build reads it
+# (esp-jetson / the Orin); the x86 bootloader is built by the `builder` crate and is unaffected.
+BOOTLOADER_FEATURES=""
+if [ -n "${UNAOS_BOOTDIAG:-}" ]; then
+    BOOTLOADER_FEATURES="--features bootdiag"
+    echo -e "${COLOR_YELLOW}⚡ bootloader features: bootdiag${COLOR_RESET}"
+fi
+
 # UNAOS_GICV3=1 selects the GICv3 model on the aarch64 `virt` board. A trailing `-machine
 # gic-version=3` overrides the default gic-version=2 (QEMU keeps the last value of a repeated machine
 # property). Only affects the `arm`/`test-arm` (virt) runs; the Pi paths (raspi4b) are always GICv2.
@@ -116,6 +127,7 @@ prepare_aarch64() {
     echo -e "${COLOR_YELLOW}⚡ Building aarch64 UEFI Bootloader...${COLOR_RESET}"
     cd "$WORKSPACE_DIR/crates/bootloader"
     cargo +nightly build --release --target aarch64-unknown-uefi \
+      $BOOTLOADER_FEATURES \
       -Z build-std=core,compiler_builtins,alloc \
       -Z build-std-features=compiler-builtins-mem
     cd "$WORKSPACE_DIR"
