@@ -76,7 +76,9 @@ ports, Jetson joins — full table in `ROADMAP.md` §1).
 - [x] Kernel W^X / WXN audit (SCTLR_EL1.WXN feasibility) — audit complete; WXN enable pending review (M6c/H1; table below)
 - [ ] PAN (Privileged Access Never) where silicon supports it
 - [ ] Validated user-pointer access (M6f)
-- [ ] Per-task address spaces + ASIDs (M6d)
+- [x] Per-task address-space isolation via ASIDs (M6d, 2026-07-02, QEMU-verified + **★ metal-confirmed** real Pi 4) — each EL0 task runs in its own translation-table branch with its own 16 KiB backing mapped at the same VAs; user-window leaves are non-global (`nG=1`, ASID-tagged 1..8), kernel leaves stay Global; `TTBR0_EL1` is switched (root + ASID) on dispatch and the slot is broadcast-`TLBI ASIDE1IS`'d and repointed off at exit. A task can no longer see or corrupt another task's user memory at a shared VA. **Metal proof (2026-07-02, EL=1/54 MHz — the class of thing QEMU cannot test):** `same-VA isolation A=0xa5a5…1 B=0x5a5a…2 distinct -> PASS` on real A72 TLB/caches (backed by a deterministic kernel-side TTBR0-swap `nG` probe), EL0 stack write/readback + SP-sentinel `-> PASS`, and with EL0 preemption live in the same boot (aggregate `IRQs-taken-at-EL0=21`, QEMU=0 — a demo-wide counter with no per-task attribution) all four slot tasks reported correct sentinel/stack values across interleaved per-task `TTBR0`/ASID dispatches; M6b `exited=1 killed=3 -> PASS` unchanged, 0 unexpected faults.
+- [x] EL0 first-entry GPR scrub (M6d, 2026-07-02) — `user_task_trampoline` zeroes x0–x30 before the first `eret` to EL0, so no live kernel value (the raw `Task` pointer, kernel x29/x30, ...) reaches EL0 **in the general-purpose file** at entry. The FP/SIMD file is NOT yet covered (next item). The aarch64 twin of the x86 SYSRET GPR scrub (merged with U1b).
+- [ ] EL0 first-entry FP/SIMD scrub — `CPACR_EL1.FPEN=0b11` makes `v0-v31`/FPSR/FPCR EL0-readable, and the `+neon` kernel can leave live data in `v0-v7`/`v16-v31` at first entry (`v8-v15` are provably zero via the boot context frame); also initialize `TPIDR_EL0`/`TPIDRRO_EL0` (firmware-residue UNKNOWN today). Slotted for M6f.
 
 #### aarch64 W^X map audit (H1, M6c — report only; WXN not enabled)
 
@@ -96,6 +98,12 @@ ELs. `UXN` = bit 54 (EL0 execute-never), `PXN` = bit 53 (EL1 execute-never).
 
 Transient: the code page is a data page (`0b01`, UXN=PXN=1, RW no-X) during the blob copy, then
 `protect_user_code` flips it to the row above — so it is never W∧X, at either EL, at any point.
+
+Since M6d the two `USER_REGION` rows are also **non-global (`nG=1`)** and replicated per task: the shared
+window is the ASID-0 boot context, and up to 8 per-task slots (`boot::alloc_user_slot`, ASID 1..8) map the
+same two VAs to their own frames with identical AP/UXN/PXN. The W^X properties of both rows are unchanged
+(nG affects only TLB ASID-tagging, not access permission); the VAs shown are illustrative and shift with
+the kernel image size (the pool adds ~224 KiB BSS). Kernel rows stay Global (`nG=0`).
 
 **Every EL0-reachable page already satisfies W^X**: the user code page is R+X but read-only, and the
 data/stack pages are RW but execute-never. The only W∧X coincidences are in the **kernel's own coarse

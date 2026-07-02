@@ -155,12 +155,14 @@ __exception_vectors:
     b __vec_serror        // 0x780 SError
 
     // ---- Save/restore macros: the full GP register file (x0-x30), 256-byte 16-aligned frame ----
-    // NOTE: GPRs ONLY — v0-v31/FPSR/FPCR are intentionally NOT saved. This is sound only while the
-    // IRQ dispatch tree (aarch64_irq_handler -> gic::handle_irq -> timer::on_tick + the first-tick
-    // log) emits no FP/NEON. The target is built `+neon`, so the compiler MAY autovectorize: a
-    // future handler that touches a framebuffer blit/fill or formats a float through fmt's dispatch
-    // would silently clobber the interrupted thread's FP state. Add v-register save/restore (or
-    // build the dispatch path no-vector) before adding any FP work to an interrupt handler.
+    // SAVE_GPRS saves GPRs ONLY. The IRQ and SVC stubs (__vec_irq/__vec_svc) pair it with SAVE_FP
+    // (below), so they DO preserve the full v0-v31/FPSR/FPCR — mandatory since the scheduler's
+    // preemption runs a whole other task (which clobbers the vector file) between save and eret.
+    // The "FP is intentionally NOT saved" caveat therefore applies ONLY to the FAULT stubs
+    // (__vec_sync/__vec_fiq/__vec_serror), which use SAVE_GPRS ALONE: each is a dead-end that logs
+    // ESR/ELR/FAR and halts (aarch64_fault_handler is typed `-> !`), so it never resumes the
+    // interrupted context and never needs its FP state. If a fault stub is ever made to RETURN, it
+    // must add SAVE_FP/RESTORE_FP first, or it will silently clobber the interrupted thread's NEON.
     .macro SAVE_GPRS
     stp x0,  x1,  [sp, #-256]!
     stp x2,  x3,  [sp, #16]
@@ -279,6 +281,13 @@ __vec_irq:
     stp x0, x1, [sp, #-32]!
     str x2, [sp, #16]
     bl aarch64_irq_handler
+    // INVARIANT: this epilogue (the ELR/SPSR/SP_EL0 restore -> RESTORE_FP/GPRS -> eret) MUST run with
+    // IRQ masked. It restores per-core banked registers from THIS task's stack frame; a nested IRQ
+    // between the msr's and the eret would re-bank ELR/SPSR/SP_EL0 and corrupt the return. The mask is
+    // currently guaranteed for free: exception ENTRY masked all of DAIF, and when the handler
+    // context-switched (timer preempt), `switch_context` banked/restored DAIF so the resumed task lands
+    // back here still I-masked. Do NOT add any in-handler unmask on this path (e.g. to run a longer
+    // bottom-half) without first re-masking before this epilogue.
     ldp x0, x1, [sp]
     ldr x2, [sp, #16]
     add sp, sp, #32

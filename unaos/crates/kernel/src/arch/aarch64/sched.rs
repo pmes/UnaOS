@@ -109,6 +109,13 @@ pub struct Task {
     /// at `user_entry` with SP_EL0 = `user_sp`. 0 / unused for ordinary kernel tasks.
     user_entry: u64,
     user_sp: u64,
+    /// M6d: the TTBR0_EL1 value (`root_pa | asid << 48`) that installs this task's address space, or 0
+    /// for a kernel task (no switch — kernel mappings are Global and byte-identical in every root, so a
+    /// kernel task runs correctly on whatever root is live). A shared-window EL0 task (M6b/M6e) carries
+    /// the boot root `&L1 | ASID 0`; a per-task-slot EL0 task carries its slot root `slot_l1 | asid<<48`.
+    /// `dispatch_next` installs it (only if it differs from the live TTBR0); `exit` tears the slot down
+    /// (when `asid = user_ttbr0 >> 48` is non-zero).
+    user_ttbr0: u64,
 }
 
 /// One CPU's scheduler bookkeeping (interior-mutable atomics, so the array is a plain static).
@@ -298,16 +305,31 @@ extern "C" fn user_task_trampoline() -> ! {
     // `__vec_irq` banks SP_EL0). A stays clear (baremetal SError policy: an EL0-provoked external
     // abort is delivered promptly at the Lower-EL SError vector, not held pending into kernel
     // context). Was 0x2C0 (I masked, non-preemptible) through M6a–M6c.
+    //
+    // M6d hardening — GPR scrub at the FIRST eret to EL0. Zero x0-x30 after the three msr consume their
+    // inputs, so no live kernel value (the raw `Task` pointer, kernel x29/x30, the entry/SP/SPSR just
+    // loaded, ...) is architecturally readable at EL0 on entry. The three inputs are PINNED to x0/x1/x2
+    // and already written to their system registers before the scrub, so zeroing x0-x30 is safe. This is
+    // the aarch64 twin of the x86 SYSRET GPR scrub; the preempt-RESUME path is already clean (it restores
+    // from the task's own saved frame in `__vec_irq`, not through this trampoline).
     unsafe {
         core::arch::asm!(
-            "msr SP_EL0, {sp}",
-            "msr ELR_EL1, {entry}",
-            "msr SPSR_EL1, {spsr}",
+            "msr SP_EL0, x0",
+            "msr ELR_EL1, x1",
+            "msr SPSR_EL1, x2",
+            "mov x0, xzr",  "mov x1, xzr",  "mov x2, xzr",  "mov x3, xzr",
+            "mov x4, xzr",  "mov x5, xzr",  "mov x6, xzr",  "mov x7, xzr",
+            "mov x8, xzr",  "mov x9, xzr",  "mov x10, xzr", "mov x11, xzr",
+            "mov x12, xzr", "mov x13, xzr", "mov x14, xzr", "mov x15, xzr",
+            "mov x16, xzr", "mov x17, xzr", "mov x18, xzr", "mov x19, xzr",
+            "mov x20, xzr", "mov x21, xzr", "mov x22, xzr", "mov x23, xzr",
+            "mov x24, xzr", "mov x25, xzr", "mov x26, xzr", "mov x27, xzr",
+            "mov x28, xzr", "mov x29, xzr", "mov x30, xzr",
             "isb",
             "eret",
-            sp = in(reg) sp,
-            entry = in(reg) entry,
-            spsr = in(reg) 0x240u64,
+            in("x0") sp,
+            in("x1") entry,
+            in("x2") 0x240u64,
             options(noreturn, nostack),
         );
     }
@@ -358,6 +380,7 @@ fn spawn_inner(
         done_sem,
         user_entry: 0,
         user_sp: 0,
+        user_ttbr0: 0, // kernel task: no root switch (kernel mappings are Global in every root)
     });
     RUN_QUEUES[cpu].lock().push_back(task);
     // Wake the target if it's a different, possibly-idle core (same-core needs no poke).
@@ -380,9 +403,37 @@ pub fn spawn(name: &'static str, entry: fn(usize), arg: usize, cpu: usize) -> u6
 ///
 /// Since M6e EVERY EL0 task starts I-unmasked (preemptible) — `user_task_trampoline` plants SPSR 0x240
 /// — so on metal the timer may preempt any of them mid-EL0; `__vec_irq` banks SP_EL0 so that is safe.
-/// Tasks that share a user stack (the M6 demo does) must therefore not WRITE it (see `El0Demo`'s STOP
-/// tripwire); a stack-writing EL0 program needs per-task stacks (M6d).
+///
+/// M6d: this variant runs the task on the SHARED user window under the boot root (`&L1 | ASID 0`) — the
+/// path the M6b/M6e demo tasks take (they don't write their shared stack). A task carrying its OWN
+/// address space (a private slot) is created with `spawn_user_slot` instead. Setting `user_ttbr0` to the
+/// boot root (rather than 0) is load-bearing: if a per-slot task last ran on this core, `dispatch_next`
+/// must switch TTBR0 back to the boot root before this task's EL0 access hits the shared window VA.
 pub fn spawn_user(name: &'static str, user_entry: u64, user_sp: u64, cpu: usize) -> u64 {
+    spawn_user_inner(name, user_entry, user_sp, super::boot::boot_ttbr0(), cpu)
+}
+
+/// Like `spawn_user`, but the task runs in its OWN per-task address space (M6d): `user_ttbr0` is the
+/// slot root `slot_l1_pa | (asid << 48)` from `boot::slot_ttbr0`. `dispatch_next` installs it on
+/// dispatch; `exit` tears the slot down. This is what lets an EL0 program write its own (slot-private)
+/// stack without disturbing any other task.
+pub fn spawn_user_slot(
+    name: &'static str,
+    user_entry: u64,
+    user_sp: u64,
+    user_ttbr0: u64,
+    cpu: usize,
+) -> u64 {
+    spawn_user_inner(name, user_entry, user_sp, user_ttbr0, cpu)
+}
+
+fn spawn_user_inner(
+    name: &'static str,
+    user_entry: u64,
+    user_sp: u64,
+    user_ttbr0: u64,
+    cpu: usize,
+) -> u64 {
     assert!(cpu < NUM_CPUS, "spawn_user: cpu out of range");
     let mut stack: Box<[u8]> = alloc::vec![0u8; TASK_STACK_SIZE].into_boxed_slice();
     let ctx_sp = build_initial_frame(&mut stack, user_task_trampoline);
@@ -399,6 +450,7 @@ pub fn spawn_user(name: &'static str, user_entry: u64, user_sp: u64, cpu: usize)
         done_sem: None,
         user_entry,
         user_sp,
+        user_ttbr0,
     });
     RUN_QUEUES[cpu].lock().push_back(task);
     poke_cpu(cpu);
@@ -530,6 +582,16 @@ pub fn exit() -> ! {
     let raw = SCHED[cpu].current.load(Ordering::Acquire) as *mut Task;
     assert!(!raw.is_null(), "exit: no current task");
     unsafe {
+        // M6d: if this task owns a private address-space slot (ASID != 0), tear it down HERE — repoint
+        // this core's TTBR0 off the dead slot root and broadcast-invalidate its ASID (see
+        // `boot::teardown_user_slot`). Done before the switch-away, on the task's own kernel stack, which
+        // is a Global identity mapping present in the boot root too — so repointing TTBR0 to the boot
+        // root does not pull the stack out from under us. Shared-window (ASID 0) and kernel (ttbr0 = 0)
+        // tasks skip it.
+        let asid = (*raw).user_ttbr0 >> 48;
+        if asid != 0 {
+            super::boot::teardown_user_slot(asid);
+        }
         (*raw).state.store(STATE_FINISHED, Ordering::Release);
         // `old_sp` is a throwaway on the dying stack — the scheduler never reads it back and never
         // switches into a finished task.
@@ -620,6 +682,28 @@ fn dispatch_next(cpu: usize) -> bool {
     let entry_sp = unsafe { (*raw).ctx_sp };
     // Publish `current` (Release) strictly before switching in — the trampoline reads it Acquire.
     SCHED[cpu].current.store(raw as u64, Ordering::Release);
+    // M6d: install the incoming task's address space. A user task carries `user_ttbr0` (`root | asid`);
+    // a kernel task carries 0 (no switch — kernel mappings are Global and byte-identical in every root).
+    // Read the live TTBR0 and write only if the FULL 64-bit value (root AND ASID) differs, so an ASID-0
+    // shared-window task always switches away from a live non-zero slot ASID even if a base coincided.
+    // Runs I-masked (dispatch masks IRQ) and BEFORE the eret, so EL0 always executes under the right
+    // root. It is here — not in `user_task_trampoline` — because a preempted user task RESUMED through
+    // `__vec_irq`'s restore tail (not the trampoline) must also get its root reinstalled every dispatch.
+    let want_ttbr0 = unsafe { (*raw).user_ttbr0 };
+    if want_ttbr0 != 0 {
+        unsafe {
+            let live: u64;
+            core::arch::asm!("mrs {}, TTBR0_EL1", out(reg) live, options(nomem, nostack, preserves_flags));
+            if live != want_ttbr0 {
+                core::arch::asm!(
+                    "msr TTBR0_EL1, {}",
+                    "isb",
+                    in(reg) want_ttbr0,
+                    options(nostack, preserves_flags),
+                );
+            }
+        }
+    }
     unsafe {
         switch_context(SCHED[cpu].scheduler_sp.as_ptr(), entry_sp);
     }

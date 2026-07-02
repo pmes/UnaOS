@@ -21,6 +21,8 @@
 // SCTLR_EL1). The drop is purely additive — it configures the EL1-facing controls that would otherwise
 // trap or read UNKNOWN, and leaves the (now-unused-for-translation) EL2 regime alone.
 
+use core::sync::atomic::{AtomicBool, Ordering};
+
 use unaos_boot_info::{BootInfo, FrameBufferInfo, MemoryRegion, MemoryRegionKind, PixelFormat};
 
 /// A single Level-1 translation table: 512 entries × 8 bytes = one 4 KiB page. With a 4 KiB granule
@@ -112,24 +114,32 @@ const AP_EL0: u64 = 1 << 6; // AP[7:6]=0b01 → EL0+EL1 read-write (AP=0b00 is E
 const AP_RO_ALL: u64 = 0b11 << 6; // AP[7:6]=0b11 → read-only at BOTH EL1 and EL0
 const DESC_PXN: u64 = 1 << 53; // privileged execute-never (EL1 can't execute the page)
 const DESC_UXN: u64 = 1 << 54; // unprivileged execute-never (EL0 can't execute the page)
+// nG (not-Global), descriptor bit 11. A leaf with nG=1 is tagged by the active ASID (TTBR0.ASID); one
+// with nG=0 is Global — it matches in EVERY ASID. M6d makes ALL user-window leaves nG (the shared window
+// becomes the ASID-0 boot context; each per-task slot is ASID 1..8) so the SAME user VA can map DIFFERENT
+// frames per task with no same-VA global+non-global TLB conflict (which is CONSTRAINED UNPREDICTABLE).
+// Kernel-only leaves (ram_page/ram_block/device_block) stay Global — ASID-agnostic, so a TTBR0/ASID switch
+// needs no kernel-mapping flush and no per-slot duplication.
+const DESC_NG: u64 = 1 << 11;
 
 /// L3 4 KiB page, Normal cacheable, EL1-only (AP=0b00), executable at EL1 — the default identity page.
 const fn ram_page(pa: u64) -> u64 {
     pa | DESC_AF | SH_INNER | ATTR_NORMAL | DESC_PAGE
 }
 /// L3 4 KiB USER DATA/STACK page: Normal cacheable, EL0+EL1 read-write (AP=0b01), never executable
-/// at any EL (UXN=1, PXN=1). The build_l1 state of ALL user pages — the CODE page starts this way
-/// too so `syscall::setup` can copy the program in at EL1; `protect_user_code` then flips it.
+/// at any EL (UXN=1, PXN=1), **non-global (nG=1)** so it is ASID-tagged (M6d). The build_l1 state of
+/// ALL user pages — the CODE page starts this way too so `syscall::setup` can copy the program in at
+/// EL1; `protect_user_code` then flips it.
 const fn user_data_page(pa: u64) -> u64 {
-    pa | DESC_UXN | DESC_PXN | AP_EL0 | DESC_AF | SH_INNER | ATTR_NORMAL | DESC_PAGE
+    pa | DESC_NG | DESC_UXN | DESC_PXN | AP_EL0 | DESC_AF | SH_INNER | ATTR_NORMAL | DESC_PAGE
 }
 /// L3 4 KiB USER CODE page (M6b, the final shape written by `protect_user_code`): Normal cacheable,
 /// read-only at BOTH ELs (AP=0b11), EL0-executable (UXN=0), EL1-non-executable (PXN=1). EL0 can run
 /// but not modify its program; EL1 can read it (sys_write's message bytes — fine on the PAN-less
 /// A72) but a kernel write is now a Current-EL permission fault, so any future loader (M6c) must
-/// re-open the page before writing.
+/// re-open the page before writing. **Non-global (nG=1)** so it is ASID-tagged (M6d).
 const fn user_code_page(pa: u64) -> u64 {
-    pa | DESC_PXN | AP_RO_ALL | DESC_AF | SH_INNER | ATTR_NORMAL | DESC_PAGE
+    pa | DESC_NG | DESC_PXN | AP_RO_ALL | DESC_AF | SH_INNER | ATTR_NORMAL | DESC_PAGE
 }
 /// A table descriptor pointing at the next-level table. Mask to bits[47:12] so no stray bits land in
 /// the table-attribute fields [63:59] (NSTable/APTable/UXNTable/PXNTable); leaving them 0 adds no
@@ -244,8 +254,11 @@ pub unsafe fn enable_mmu() {
 /// the canonical set_pte one (DDI0487 D8.13/D8.14; the walker reads descriptors cache-coherently
 /// under TCR IRGN0/ORGN0=WB, so no DC CVAC is needed):
 ///   dsb ishst              descriptor stores visible to every Inner-Shareable table walker
-///   tlbi vaae1is (per pg)  broadcast-invalidate the VA for ALL ASIDs (entries are global, nG=0);
-///                          Xt = VA[55:12] in bits [43:0], upper bits RES0 on Armv8.0 (no FEAT_TTL)
+///   tlbi vaae1is (per pg)  broadcast-invalidate the VA for ALL ASIDs. VAAE1IS is all-ASID, so it drops
+///                          BOTH global and non-global entries for the VA — since M6d the shared code
+///                          page is nG (ASID-0-tagged), and VAAE1IS still covers it (all-ASID). The
+///                          Xt operand is VA[55:12] in bits [43:0] (i.e. `va >> 12`, NOT a byte or PA),
+///                          upper bits RES0 on Armv8.0 (no FEAT_TTL).
 ///   dsb ish                the invalidate has completed on every core in the domain
 ///   isb                    this core refetches translation state
 ///
@@ -300,6 +313,232 @@ pub unsafe fn protect_user_code(va: u64, len: usize) -> (bool, bool) {
         );
         ((par_r & 1) == 0, (par_w & 1) == 1)
     }
+}
+
+// =============================================================================================
+// M6d: per-task address spaces (ASIDs) + per-task user stacks
+// =============================================================================================
+//
+// Through M6c each EL0 task shared the ONE `USER_REGION` window mapped by the single static chain
+// `L1 -> L2_USER -> L3_USER`. That is safe only while no EL0 program writes its stack. M6d gives each
+// task its OWN translation-table branch and its OWN 16 KiB backing at the SAME virtual addresses, tagged
+// by a distinct ASID, so a task can write its stack without disturbing any other and a task switch needs
+// no TLB flush (ASID-tagged non-global entries coexist; global kernel entries are ASID-agnostic).
+//
+// Layout: 8 slots (a deliberate cap — STOP if a demo needs more), each a private L1/L2/L3 + a 16 KiB
+// backing. ASID = slot + 1 (1..=8); ASID 0 is the shared/boot context (`L1`). Parallel arrays (not a
+// struct-of-slot array) keep every PageTable 4 KiB-aligned and every UserRegion 16 KiB-aligned (a packed
+// 28 KiB slot would misalign the backing on slots >= 1). ~224 KiB BSS, zeroed by `_start`.
+
+/// Number of per-task user address-space slots (STOP tripwire: this cap is deliberate — do not raise it
+/// to satisfy a demo; a real allocator/paged user memory is a later arc).
+pub const USER_SLOTS: usize = 8;
+
+static mut SLOT_L1: [PageTable; USER_SLOTS] = [const { PageTable([0; 512]) }; USER_SLOTS];
+static mut SLOT_L2: [PageTable; USER_SLOTS] = [const { PageTable([0; 512]) }; USER_SLOTS];
+static mut SLOT_L3: [PageTable; USER_SLOTS] = [const { PageTable([0; 512]) }; USER_SLOTS];
+static mut SLOT_BACKING: [UserRegion; USER_SLOTS] =
+    [const { UserRegion([0; USER_REGION_SIZE]) }; USER_SLOTS];
+/// Allocation state, one flag per slot. Atomic so `alloc`/`teardown` are race-free across cores.
+static SLOT_USED: [AtomicBool; USER_SLOTS] = [const { AtomicBool::new(false) }; USER_SLOTS];
+
+/// The boot/shared context TTBR0 value: `&L1 | (ASID 0 << 48)` == `&L1` (identity-mapped, so PA == VA).
+/// Kernel tasks and the shared-window (M6b/M6e) EL0 tasks run under this root.
+pub fn boot_ttbr0() -> u64 {
+    &raw const L1 as u64
+}
+
+/// ASID assigned to slot `s` (1..=USER_SLOTS; ASID 0 is reserved for the boot/shared context).
+#[inline]
+fn slot_asid(s: usize) -> u64 {
+    (s + 1) as u64
+}
+
+/// The TTBR0 value that installs slot `s`'s address space: `slot_l1_pa | (asid << 48)`.
+pub fn slot_ttbr0(s: usize) -> u64 {
+    debug_assert!(s < USER_SLOTS);
+    let l1_pa = unsafe { (&raw const SLOT_L1).cast::<PageTable>().add(s) as u64 };
+    l1_pa | (slot_asid(s) << 48)
+}
+
+/// Kernel-side identity pointer into slot `s`'s 16 KiB backing. The kernel copies the program and plants
+/// data sentinels through THIS pointer — a Global, EL1-RW identity mapping reachable under any root —
+/// never through the (ASID-tagged, EL0) user-window VA. A72 L1 caches are PIPT, so writes here are
+/// coherent with the EL0 fetch/read of the same frame at the aliased user VA.
+pub fn slot_backing_ptr(s: usize) -> *mut u8 {
+    debug_assert!(s < USER_SLOTS);
+    unsafe { (&raw mut SLOT_BACKING).cast::<UserRegion>().add(s).cast::<u8>() }
+}
+
+/// Claim a free slot and build its private translation tables, returning the slot id. Pool-only (no heap),
+/// so it is safe to call off the dispatch path. Returns `None` if all 8 slots are in use (STOP tripwire).
+pub fn alloc_user_slot() -> Option<usize> {
+    for s in 0..USER_SLOTS {
+        if SLOT_USED[s]
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            unsafe { build_slot(s) };
+            return Some(s);
+        }
+    }
+    None
+}
+
+/// Build slot `s`'s L1/L2/L3 by COPYING the finished boot tables (511/512 L1 entries, and every kernel
+/// identity leaf, are byte-identical — so kernel code that runs while this root is live resolves its
+/// .text/heap/stack/device mappings exactly) then patching the user branch: the slot's user-window L3
+/// leaves point at the slot's OWN backing frames (nG, starting as RW data pages for the code copy), and
+/// `L1[0] -> slot L2 -> slot L3`. The user pages have never been walked under this slot's ASID (fresh
+/// tables; any prior tenant's ASID was flushed at its teardown), so a `dsb ishst` to publish the stores
+/// to the Inner-Shareable walkers is all that is needed before a TTBR0 points here — no TLBI.
+unsafe fn build_slot(s: usize) {
+    let user_pa = &raw const USER_REGION as u64; // the shared user VA every slot re-maps to its backing
+    let user_end = user_pa + USER_REGION_SIZE as u64;
+    let l2_idx = (user_pa >> 21) as usize;
+    let backing = slot_backing_ptr(s) as u64; // this slot's backing PA (identity-mapped)
+
+    let boot_l1 = &raw const L1 as *const u64;
+    let boot_l2 = &raw const L2_USER as *const u64;
+    let boot_l3 = &raw const L3_USER as *const u64;
+    let sl1 = unsafe { (&raw mut SLOT_L1).cast::<PageTable>().add(s).cast::<u64>() };
+    let sl2 = unsafe { (&raw mut SLOT_L2).cast::<PageTable>().add(s).cast::<u64>() };
+    let sl3 = unsafe { (&raw mut SLOT_L3).cast::<PageTable>().add(s).cast::<u64>() };
+    unsafe {
+        for i in 0..512 {
+            sl1.add(i).write_volatile(boot_l1.add(i).read_volatile());
+            sl2.add(i).write_volatile(boot_l2.add(i).read_volatile());
+            sl3.add(i).write_volatile(boot_l3.add(i).read_volatile());
+        }
+        // Point the slot's user-window L3 leaves at the slot's own backing (nG data pages — RW so the
+        // caller can copy the program in; `protect_user_slot_code` flips page 0 to EL0-RX/EL1-RO).
+        let mut va = user_pa;
+        while va < user_end {
+            let pa = backing + (va - user_pa);
+            sl3.add(((va >> 12) & 0x1FF) as usize).write_volatile(user_data_page(pa));
+            va += 0x1000;
+        }
+        // Redirect the table branch into the slot's own L2/L3.
+        sl2.add(l2_idx).write_volatile(table_desc(unsafe {
+            (&raw const SLOT_L3).cast::<PageTable>().add(s) as u64
+        }));
+        sl1.add(0).write_volatile(table_desc(unsafe {
+            (&raw const SLOT_L2).cast::<PageTable>().add(s) as u64
+        }));
+        // Publish the descriptors to every Inner-Shareable table walker before any core's TTBR0 walks
+        // them (a slot built on the BSP is first used by a task on an AP). No TLBI: fresh ASID, no stale.
+        core::arch::asm!("dsb ishst", "isb", options(nostack, preserves_flags));
+    }
+}
+
+/// Flip slot `s`'s CODE page(s) `[user_va, user_va+len)` from RW data pages to their final EL0-RX/EL1-RO
+/// shape (`user_code_page`), mirroring `protect_user_code`'s maintenance (descriptor write -> `dsb ishst`
+/// -> per-page broadcast `tlbi vaae1is` (all-ASID; operand `va >> 12`) -> `dsb ish` -> `isb`). No AT probe
+/// (unlike the shared-window `protect_user_code`): the slot's mapping is not live under the BSP's current
+/// TTBR0, so an AT here would translate the shared window, not this slot. The flip precedes the slot's
+/// task ever running, so no concurrent walk under this ASID -> the permission-only leaf rewrite is
+/// break-before-make-exempt.
+pub unsafe fn protect_user_slot_code(s: usize, len: usize) {
+    debug_assert!(s < USER_SLOTS);
+    let user_pa = &raw const USER_REGION as u64;
+    let backing = slot_backing_ptr(s) as u64;
+    let sl3 = unsafe { (&raw mut SLOT_L3).cast::<PageTable>().add(s).cast::<u64>() };
+    unsafe {
+        let mut va = user_pa;
+        while va < user_pa + len as u64 {
+            let pa = backing + (va - user_pa);
+            sl3.add(((va >> 12) & 0x1FF) as usize).write_volatile(user_code_page(pa));
+            va += 0x1000;
+        }
+        core::arch::asm!("dsb ishst", options(nostack, preserves_flags));
+        let mut va = user_pa;
+        while va < user_pa + len as u64 {
+            core::arch::asm!("tlbi vaae1is, {}", in(reg) (va >> 12), options(nostack, preserves_flags));
+            va += 0x1000;
+        }
+        core::arch::asm!("dsb ish", "isb", options(nostack, preserves_flags));
+    }
+}
+
+/// Tear down the slot owning `asid` (1..=USER_SLOTS) at task exit / slot release. Order is load-bearing
+/// (this is the exact class of bug QEMU cannot see): FIRST repoint the exiting core's TTBR0 off the dead
+/// slot root to the boot root (`&L1 | ASID 0`) + `isb`, so the retired ASID's tables are no longer the
+/// live root and speculative TLB refill cannot silently re-cache under it; THEN broadcast-invalidate that
+/// ASID (`dsb ishst; tlbi aside1is,(asid<<48); dsb ish; isb`) — broadcast because a reused slot may next
+/// run on ANOTHER core. Tasks are core-pinned, so only this core ever had this root live. Finally free the
+/// slot for reuse.
+pub unsafe fn teardown_user_slot(asid: u64) {
+    debug_assert!(asid >= 1 && asid as usize <= USER_SLOTS, "teardown: asid out of range");
+    // The ASIDE1IS operand carries the ASID in Xt[63:48]; assert `asid << 48` round-trips (a mis-encoded
+    // operand would flush the wrong ASID — silent on QEMU, a stale-entry bug on metal).
+    debug_assert_eq!((asid << 48) >> 48, asid, "teardown: ASID does not fit Xt[63:48]");
+    let boot = &raw const L1 as u64; // boot root, ASID 0
+    unsafe {
+        core::arch::asm!(
+            "msr TTBR0_EL1, {boot}",
+            "isb",
+            "dsb ishst",
+            "tlbi aside1is, {asidreg}",
+            "dsb ish",
+            "isb",
+            boot = in(reg) boot,
+            asidreg = in(reg) (asid << 48),
+            options(nostack, preserves_flags),
+        );
+    }
+    SLOT_USED[(asid - 1) as usize].store(false, Ordering::Release);
+}
+
+/// Deterministic, on-metal detector for the nG discipline (the arc's #1 metal risk) — the M6d analogue
+/// of M6b's `tlb_warm`. IRQ-masked on the calling core, it swaps TTBR0 between slot `a`'s and slot `b`'s
+/// roots and does REAL EL1 loads of the SAME user VA (`user_region + off`, an AP=0b01 data page readable
+/// at EL1 on this PAN-less A72). Real loads consult the TLB, so if the user leaf were Global (nG bug) the
+/// first load caches a global entry for the VA and the second (different ASID) HITS it -> returns slot
+/// `a`'s frame under both -> `false`. With correct nG the second load misses the ASID-`a` entry, re-walks
+/// slot `b`, and returns slot `b`'s frame. QEMU models no TLB (re-walks every access) so it always sees
+/// the right frame -> `true`. Returns whether both reads matched their planted sentinels (and the two
+/// differ). Cleans up its cached entries with an all-ASID broadcast TLBI of the probe VA.
+pub unsafe fn probe_slot_isolation(a: usize, b: usize, off: u64, expect_a: u64, expect_b: u64) -> bool {
+    debug_assert!(a < USER_SLOTS && b < USER_SLOTS);
+    let va = (&raw const USER_REGION as u64) + off;
+    let root_a = slot_ttbr0(a);
+    let root_b = slot_ttbr0(b);
+    let (r_a, r_b): (u64, u64);
+    unsafe {
+        core::arch::asm!(
+            "mrs {daif}, DAIF",
+            "msr DAIFSet, #2",          // mask IRQ: no preempt may reswap TTBR0 mid-probe
+            "mrs {saved}, TTBR0_EL1",
+            "msr TTBR0_EL1, {ra}",
+            "isb",
+            "ldr {ra_out}, [{va}]",     // caches (VA -> slot a frame) under ASID a
+            "msr TTBR0_EL1, {rb}",
+            "isb",
+            "ldr {rb_out}, [{va}]",     // correct nG: misses ASID a, re-walks slot b; global nG-bug: hits a
+            "msr TTBR0_EL1, {saved}",
+            "isb",
+            "msr DAIF, {daif}",
+            va = in(reg) va,
+            ra = in(reg) root_a,
+            rb = in(reg) root_b,
+            ra_out = out(reg) r_a,
+            rb_out = out(reg) r_b,
+            saved = out(reg) _,
+            daif = out(reg) _,
+            options(nostack, preserves_flags),
+        );
+        // Hygiene: drop the probe's cached entries for this VA across the domain (they are nG/ASID-tagged
+        // and this core never revisits the VA, but keep the TLB clean of probe artifacts).
+        core::arch::asm!(
+            "dsb ishst",
+            "tlbi vaae1is, {}",
+            "dsb ish",
+            "isb",
+            in(reg) (va >> 12),
+            options(nostack, preserves_flags),
+        );
+    }
+    r_a == expect_a && r_b == expect_b && expect_a != expect_b
 }
 
 // --- EL2 -> EL1 drop. Every core is handed off at EL2; a normal OS runs at EL1, so we drop each core
