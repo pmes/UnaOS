@@ -45,6 +45,17 @@ if [ -n "$_feats" ]; then
     echo -e "${COLOR_YELLOW}⚡ kernel features: ${_feats%,}${COLOR_RESET}"
 fi
 
+# UNAOS_GICV3=1 selects the GICv3 model on the aarch64 `virt` board. A trailing `-machine
+# gic-version=3` overrides the default gic-version=2 (QEMU keeps the last value of a repeated machine
+# property). Only affects the `arm`/`test-arm` (virt) runs; the Pi paths (raspi4b) are always GICv2.
+# Default (unset) stays GICv2. This is a build-time nop — it changes only the QEMU invocation, not
+# the kernel binary (the driver runtime-detects the version at boot).
+GICV3_ARG=""
+if [ -n "${UNAOS_GICV3:-}" ]; then
+    GICV3_ARG="-machine gic-version=3"
+    echo -e "${COLOR_YELLOW}⚡ aarch64 virt: GICv3 (gic-version=3)${COLOR_RESET}"
+fi
+
 # UNAOS_FATIMG swaps the usb-storage backing to a FAT image (scripts/make-fat-img.sh) so the
 # kernel's read-only FAT reader can be exercised on aarch64 QEMU too. Mirrors the x86 builder knob
 # (builder/src/main.rs). Unset -> usb.img (the raw UNA-OS pattern image). Build with `./arroyo fat-img`.
@@ -152,7 +163,7 @@ launch_aarch64() {
     echo -e "${COLOR_PURPLE}-------------------------${COLOR_RESET}"
 
     qemu-system-aarch64 \
-        -machine virt,virtualization=on,gic-version=2 \
+        -machine virt,virtualization=on,gic-version=2 ${GICV3_ARG} \
         -cpu cortex-a72 \
         -smp 4 \
         -m 1G \
@@ -180,7 +191,7 @@ test_aarch64() {
     rm -f "$logf"
     echo -e "${COLOR_CYAN}⚡ Headless aarch64 test (${secs}s). Serial -> ${logf}${COLOR_RESET}"
     qemu-system-aarch64 \
-        -machine virt,virtualization=on,gic-version=2 -cpu cortex-a72 -smp 4 -m 1G \
+        -machine virt,virtualization=on,gic-version=2 ${GICV3_ARG} -cpu cortex-a72 -smp 4 -m 1G \
         -drive if=pflash,format=raw,readonly=on,file="$AAVMF_PATH" \
         -drive format=raw,file=fat:rw:"$ESP_DIR_ARM" \
         -serial "file:${logf}" -device ramfb -display none \
