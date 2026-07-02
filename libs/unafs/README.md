@@ -75,3 +75,41 @@ Some areas are early-stage: journal recovery currently detects and reports a
 dirty mount rather than rolling transactions back, and the attribute catalog is
 append-only. The crate runs as an ordinary host process today and is intended to
 converge onto the UnaOS kernel as it matures.
+
+## Direction: meeting and surpassing BeFS
+
+UnaFS is a modernized take on the Be File System — BeFS's celebrated ideas
+were typed extended attributes, per-attribute B+tree indexes, and *live
+queries* (persistent queries whose results update as files change, the basis
+of BeOS's query-driven UI). UnaFS already goes beyond BeFS on one axis:
+attributes include `Vector` embeddings, and the query engine does cosine
+similarity — semantic search as a filesystem primitive.
+
+Known honest caveats in the current implementation, which the arcs below
+address:
+
+- The attribute catalog is a flat, hash-bucketed list, (de)serialized whole:
+  every non-equality query scans it, and **every `set_attribute` rewrites the
+  entire catalog** — O(n), a scaling cliff rather than an index.
+- Journal recovery is **detect-only** (reports a dirty mount; no rollback).
+- There is **no `unlink`/`rename`/`remove_attribute`** yet; once deletion
+  exists, stale catalog entries would break queries — the index arc fixes
+  both together.
+- Directories are flat serialized vectors; no checksums anywhere; extents are
+  a flat inline list (large-file depth limit).
+
+Planned arcs (sequencing in [`docs/ROADMAP.md`](../../docs/ROADMAP.md) §2):
+
+| Arc | Content |
+| :--- | :--- |
+| F1 | Journal rollback/replay on dirty mount |
+| F2 | `unlink` / `rename` / `remove_attribute` + catalog removal |
+| F3 | Generic on-disk B+tree (shared by indexes and directories, as BeFS did) |
+| F4 | Per-attribute B+tree indexes: log-time equality, true range queries |
+| F5 | **Live queries** — delta-emitting persistent queries published over bandy (the query-driven spatial UI, now including similarity) |
+| F6–F8 | B+tree directories; metadata checksums; extent trees |
+| K1–K4 | Kernel convergence: `no_std` core → 512↔4096 block adapter + partitions → read-only kernel mount of a real volume → journaled kernel writes |
+
+The capability model (see [`docs/SECURITY.md`](../../docs/SECURITY.md)) stores
+principals and grants as ordinary typed attributes (`owner`, `grants:*`), so
+security metadata is queryable and needs no format change.

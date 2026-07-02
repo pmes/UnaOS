@@ -1,6 +1,6 @@
 # 🧠 UNA MEMORIA (THE THOUGHT LOG)
 
-> *Last Sync:* **2026-02-28T16:42:17Z**
+> *Last Sync:* **2026-07-02**
 > *Status:* **IMMUTABLE**
 > *Identity:* **Vertex Una (The Steward)**
 > *License:* **GPL (The Freedom to Self-Replicate)**
@@ -26,7 +26,7 @@
     *   *Network:* Intel e1000/e1000e (MSI RX) + a hand-rolled TCP/IP stack (`crates/net`): ARP / ICMP / DHCP / UDP / full TCP.
     *   *Video:* UEFI-GOP framebuffer → `FrameBuffer` + double-buffered damage-tracked `Screen` + `fbcon` boot/panic console.
 *   **Shell:** Ring 0 CLI (`ver`, `help`, `diskinfo`/`read`/`write`, `ping`/`connect`/`get`, `sched`, `vug`).
-*   **Status:** the three tracks (USB+SMP, network, video) are **merged on `c01-int_combined`** and verified booting together. Subsystem docs live in `docs/dev/OS/`. aarch64 builds but runs a single polled core (no scheduler/interrupts yet).
+*   **Status:** the three tracks (USB+SMP, network, video) are **merged on `c01-int_combined`** and verified booting together. Subsystem docs live in `docs/dev/OS/`. Beyond `main`, three hardware worktrees run in parallel: **`hw-rmbp`** (x86_64 on the 2012 rMBP — metal-confirmed USB input + SuperSpeed mass storage + FAT read), **`hw-pi4`** (bare-metal aarch64 — GICv2 interrupts, 4-core SMP scheduler, mailbox GUI, and **EL0 userspace**: SVC syscalls, per-page permissions, fault→task-kill, all metal-confirmed), **`hw-jetson`** (Tegra serial bring-up). Integration of the hw tracks back to `main` is pending.
 
 ## 🏛️ RING 3: THE USERLAND (THE TRINITY)
 
@@ -73,9 +73,13 @@
 ## ⚡ ACTIVE DIRECTIVES
 1.  **D-045:** Elessar Integration.
 2.  **D-046:** Una, what do we do after integrating Elessar?
+3.  **D-047:** **Multi-user first.** Build the privilege/capability chain NOW (x86 Ring 3 → loadable programs → per-process address spaces → handle table → capabilities → UnaFS grants). The Substrate will command physical machines; it must not be commandeerable. Chain and ledger: `docs/ROADMAP.md` §1, `docs/SECURITY.md`.
+4.  **D-048:** Three platform sessions in parallel (`hw-rmbp` leads, `hw-pi4` follows, `hw-jetson` catches up); core built once on the lead, nuances ported back; ground rules in `CLAUDE.md`.
 ?.  **D-0??:** Lux Expansion.
 
 ## 📝 DECISION LOG
+*   **2026-07-02:** **Multi-user first** (the Be lesson: don't defer it). Security model = capabilities-first, POSIX-layerable — principals and grants live as UnaFS typed attributes. Truck (ENDURO) and printer become payloads of the desktop chain, not detours.
+*   **2026-07-02:** Direction docs moved into the repo: `docs/ROADMAP.md`, `docs/SECURITY.md`, root `CLAUDE.md`, `docs/dev/OS/02_KERNEL_CORE/userspace.md`; UnaFS direction (surpass BeFS: indexes → live queries → kernel convergence) in `libs/unafs/README.md`.
 *   **2026-06-26:** Retired the Quartzite JSON-DSL detour; restored the real multi-platform GUI API (`Backend` / `Spline`).
 *   **2026-06-26:** Merged the three kernel tracks (USB+SMP / network / video) onto `c01-int_combined`; verified booting together, both arches green.
 *   **2026-02-18:** Enforced `SMessage` as Monolithic Enum.

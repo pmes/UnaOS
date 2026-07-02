@@ -73,7 +73,22 @@ The userspace architecture is documented in
 
 The USB+scheduler, network, and video tracks were developed in parallel and are
 **integrated and verified booting together** on the `c01-int_combined` branch.
-aarch64 builds and renders, but currently runs a single polled core.
+
+Beyond `main`, development runs on three hardware tracks in parallel:
+**`hw-rmbp`** (2012 MacBook Pro, x86_64 — boots on metal with USB input and
+mass storage, native video, FAT read), **`hw-pi4`** (Raspberry Pi 4,
+bare-metal aarch64 — SMP scheduler, GUI, and the project's first privilege
+boundary: EL0 userspace with syscalls, per-page permissions, and
+fault→task-kill), and **`hw-jetson`** (Jetson Orin Nano — early bring-up).
+
+**Current direction — multi-user first.** UnaOS is designed to hold direct
+authority over physical hardware (printers, vehicles, GPIO), so privilege
+separation and a capability-based security model are being built *now*, not
+retrofitted: a per-process handle table where handles are capabilities, with
+principals and grants stored as UnaFS typed attributes. The near-term goal is
+a functioning desktop — a shell that spawns capability-scoped programs loaded
+from disk into isolated address spaces. See [`docs/ROADMAP.md`](docs/ROADMAP.md)
+and [`docs/SECURITY.md`](docs/SECURITY.md).
 
 Per-subsystem detail: [`docs/dev/OS/`](docs/dev/OS).
 
