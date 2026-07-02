@@ -11,12 +11,15 @@
 // IRQ" entry at offset 0x280. We wire every entry anyway: IRQ entries -> the IRQ stub; everything
 // else -> a fault stub that logs ESR/ELR/FAR and halts (the equivalent of the x86 fault handlers).
 //
-// The IRQ stub saves the full general-purpose register file, calls the Rust handler, restores, and
-// `eret`s — which returns to the interrupted context using the banked ELR_ELx/SPSR_ELx the CPU
-// captured on entry (untouched here, and IRQs are auto-masked on entry, so the handler is never
-// re-entered and those banked registers stay valid). The timer/GIC work the handler does is all
-// MMIO + EL0-accessible system registers, so the IRQ path itself is EL-agnostic; only installing
-// VBAR and decoding a fault differ by EL.
+// The IRQ stub saves the full general-purpose register file + FP/SIMD, banks ELR_ELx/SPSR_ELx and
+// (M6e) SP_EL0 onto the interrupted task's own kernel stack, calls the Rust handler, restores all of
+// it, and `eret`s. Banking ELR/SPSR/SP_EL0 (rather than trusting the CPU's entry-banked copies to
+// survive) is what makes preemption sound: the scheduler may context-switch INSIDE the handler, so
+// the task resumed in our place takes its own IRQs and overwrites those per-core sysregs — see the
+// __vec_irq comment. SP_EL0 is the user stack pointer, live only when the interrupted context was EL0
+// (a preemptible EL0 task); banking it lets a timer preempt of EL0 resume with the right user SP. The
+// timer/GIC work the handler does is all MMIO + EL0-accessible system registers, so the IRQ path
+// itself is EL-agnostic; only installing VBAR and decoding a fault differ by EL.
 
 use core::sync::atomic::{AtomicU8, Ordering};
 
@@ -251,25 +254,37 @@ __exception_vectors:
     .endm
 
     // ---- IRQ: save, dispatch in Rust, restore, return ----
-    // Beyond the GPRs, save ELR/SPSR (the return PC + PSTATE the CPU banked on entry; the EL suffix is
-    // _EL1 on the baremetal build, _EL2 on UEFI — see the irq_el! selector above).
-    // These are SYSTEM registers, not stacked like x86's interrupt frame, so they are per-*core*,
-    // not per-*context*. The scheduler's timer preemption (timer::on_tick -> sched::timer_preempt)
-    // does a context switch INSIDE this handler; the task resumed in its place takes its own IRQs,
-    // which overwrite ELR/SPSR. Without saving+restoring them here, a preempted task would later
-    // `eret` to another task's PC. (The cooperative path never touches these — no IRQ, no eret.)
-    // The EL is compile-time: baremetal drops to EL1 (irq_el!() = "1"), UEFI stays at EL2 ("2").
+    // Beyond the GPRs + FP, bank ELR/SPSR (the return PC + PSTATE the CPU banked on entry; the EL
+    // suffix is _EL1 on the baremetal build, _EL2 on UEFI — see the irq_el! selector above) and
+    // (M6e) SP_EL0, into a 32-byte 16-aligned frame. These are SYSTEM registers, not stacked like
+    // x86's interrupt frame, so they are per-*core*, not per-*context*. The scheduler's timer
+    // preemption (timer::on_tick -> sched::timer_preempt) does a context switch INSIDE this handler;
+    // the task resumed in its place takes its own IRQs, which overwrite ELR/SPSR/SP_EL0. Without
+    // saving+restoring them here, a preempted task would later `eret` to another task's PC — or, for
+    // a preemptible EL0 task, resume at EL0 with another task's user stack pointer in SP_EL0. The
+    // banked copies live on THIS task's kernel stack, which survives the switch, so the epilogue
+    // restores the right values. (The cooperative path never touches these — no IRQ, no eret.)
+    // SP_EL0 is banked UNCONDITIONALLY: for a Current-EL (EL1/EL2 kernel) preempt it is a harmless
+    // same-value round-trip (SP_EL0 is not the active stack there); only a Lower-EL (EL0) preempt
+    // carries a live user SP. Do NOT read "the SP_EL0 msr ran" as "the interrupted context was EL0" —
+    // test SPSR.M[3:0] for that (see aarch64_irq_handler's M6e counter). The EL is compile-time:
+    // baremetal drops to EL1 (irq_el!() = "1"), UEFI stays at EL2 ("2").
     .globl __vec_irq
 __vec_irq:
     SAVE_GPRS
     SAVE_FP
     mrs x0, ELR_EL"#, irq_el!(), r#"
     mrs x1, SPSR_EL"#, irq_el!(), r#"
-    stp x0, x1, [sp, #-16]!
+    mrs x2, SP_EL0
+    stp x0, x1, [sp, #-32]!
+    str x2, [sp, #16]
     bl aarch64_irq_handler
-    ldp x0, x1, [sp], #16
+    ldp x0, x1, [sp]
+    ldr x2, [sp, #16]
+    add sp, sp, #32
     msr ELR_EL"#, irq_el!(), r#", x0
     msr SPSR_EL"#, irq_el!(), r#", x1
+    msr SP_EL0, x2
     RESTORE_FP
     RESTORE_GPRS
     eret
@@ -360,6 +375,24 @@ pub fn enable_irq() {
 /// interface, route by INTID, and signal EOI. Lock-free in the common (timer) case.
 #[unsafe(no_mangle)]
 extern "C" fn aarch64_irq_handler() {
+    // M6e (baremetal only): if this IRQ interrupted an EL0 task, count it — the crisp, metal-only
+    // proof that EL0 is now preemptible (I-unmasked). Read the banked SPSR_EL1 BEFORE gic::handle_irq
+    // (which may context-switch and thus clobber the per-core SPSR_EL1). Its value here is THIS
+    // entry's, and it stays valid because exception ENTRY masks ALL of DAIF (D,A,I,F=1): no nested
+    // IRQ/FIQ/SError can be taken to overwrite SPSR_EL1 before this read — even though enable_irq
+    // unmasks SError (PSTATE.A) globally, that clear does not survive exception entry. SPSR.M[4:0]==0
+    // is EL0t (an AArch64 EL0 return); any kernel-EL preempt has M != 0. `syscall` is baremetal-only,
+    // so the whole block is cfg-gated (the EL2/UEFI/jetson build has no EL0 and no `syscall` module).
+    #[cfg(feature = "baremetal")]
+    {
+        let spsr: u64;
+        unsafe {
+            core::arch::asm!("mrs {}, SPSR_EL1", out(reg) spsr, options(nomem, nostack, preserves_flags))
+        };
+        if spsr & 0b1_1111 == 0 {
+            super::syscall::note_el0_irq();
+        }
+    }
     super::gic::handle_irq();
 }
 

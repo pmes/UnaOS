@@ -15,8 +15,9 @@
 //     withholds Group-1 IRQs on the `pi` build — same reason the timer poll-spins there).
 //   * M3b — PREEMPTION + the APs: each secondary enters its own `run()` loop; the per-core generic
 //     timer preempts the running task at quantum expiry (`timer_preempt`, from the IRQ handler
-//     AFTER EOI). Preemption from an interrupt requires the IRQ stub to now save ELR/SPSR
-//     (exceptions.rs) — those are per-core system registers, not a per-context stacked frame.
+//     AFTER EOI). Preemption from an interrupt requires the IRQ stub to bank ELR/SPSR — and, once EL0
+//     is preemptible (M6e), SP_EL0 — (exceptions.rs); those are per-core system registers, not a
+//     per-context stacked frame.
 //     Like the SGI IPIs, timer delivery is metal-only (QEMU won't deliver it), so on QEMU the APs
 //     run their demo tasks to completion sequentially and on the Pi they interleave (preemption).
 
@@ -274,24 +275,29 @@ fn user_never(_: usize) {
 }
 
 /// First code an EL0 (user) task runs at EL1, reached when `switch_context` `ret`s into its freshly
-/// built frame (with I MASKED, from INITIAL_DAIF). Unlike `task_trampoline`, it does NOT unmask: EL0
-/// must stay non-preemptible for M6a because `__vec_irq` does not yet bank SP_EL0, so a timer preempt
-/// of EL0 would lose the user stack pointer. It reads the task's EL0 entry/SP, then drops to EL0.
+/// built frame (with I MASKED, from INITIAL_DAIF). The EL1 prologue stays I-masked (no preempt during
+/// the drop); the eret plants an EL0 PSTATE with I UNMASKED (M6e: SPSR 0x240), so the generic timer
+/// preempts the running EL0 task. That is sound because `__vec_irq` now banks SP_EL0 (M6e) — a timer
+/// preempt of EL0 saves/restores the user stack pointer across the scheduler switch. (This is a
+/// metal-only effect: QEMU raspi4b delivers no Group-1 timer IRQ, so EL0 there runs to its next
+/// syscall/fault uninterrupted.) It reads the task's EL0 entry/SP, then drops to EL0.
 ///
 /// The current SP_EL1 (this task's Box kernel stack) is retained across the `eret` to EL0 and becomes
-/// the stack the later `svc` re-entry (`__vec_svc`) runs on, so the 16 KiB Box must have headroom for
-/// the SVC frame (256 GPR + 528 FP + 32 banked + the Rust handler) — it does; this trampoline uses only
-/// a shallow prologue. The msr+eret are one `noreturn` asm block so nothing runs after the drop.
+/// the stack the later `svc`/IRQ re-entry (`__vec_svc`/`__vec_irq`) runs on, so the 16 KiB Box must
+/// have headroom for the SVC/IRQ frame (256 GPR + 528 FP + 32 banked + the Rust handler) — it does;
+/// this trampoline uses only a shallow prologue. The msr+eret are one `noreturn` asm block so nothing
+/// runs after the drop.
 extern "C" fn user_task_trampoline() -> ! {
     let cpu = percpu::this_cpu().cpu_index as usize;
     let raw = SCHED[cpu].current.load(Ordering::Acquire) as *const Task;
     debug_assert!(!raw.is_null(), "user_task_trampoline: current is null");
     let (entry, sp) = unsafe { ((*raw).user_entry, (*raw).user_sp) };
-    // SPSR_EL1 = 0x2C0: M[3:0]=0b0000 (EL0t — a dedicated SP_EL0; EL0h/0b0001 is an illegal return from
-    // EL1 -> PSTATE.IL), M[4]=0 (AArch64), DAIF = D,I,F masked with A (SError) CLEAR — matching the
-    // kernel's baremetal SError policy so an EL0-provoked external abort is delivered promptly at the
-    // Lower-EL SError vector rather than held pending into kernel context. I masked => EL0 is
-    // non-preemptible for M6a.
+    // SPSR_EL1 = 0x240 (M6e): M[3:0]=0b0000 (EL0t — a dedicated SP_EL0; EL0h/0b0001 is an illegal
+    // return from EL1 -> PSTATE.IL), M[4]=0 (AArch64), DAIF = D,F masked with A (SError) and I (IRQ)
+    // CLEAR. I unmasked => the generic timer preempts a running EL0 task (M6e; safe now that
+    // `__vec_irq` banks SP_EL0). A stays clear (baremetal SError policy: an EL0-provoked external
+    // abort is delivered promptly at the Lower-EL SError vector, not held pending into kernel
+    // context). Was 0x2C0 (I masked, non-preemptible) through M6a–M6c.
     unsafe {
         core::arch::asm!(
             "msr SP_EL0, {sp}",
@@ -301,7 +307,7 @@ extern "C" fn user_task_trampoline() -> ! {
             "eret",
             sp = in(reg) sp,
             entry = in(reg) entry,
-            spsr = in(reg) 0x2C0u64,
+            spsr = in(reg) 0x240u64,
             options(noreturn, nostack),
         );
     }
@@ -371,6 +377,11 @@ pub fn spawn(name: &'static str, entry: fn(usize), arg: usize, cpu: usize) -> u6
 /// `svc`. MUST be spawned on a SCHEDULED core (an AP), never the unscheduled BSP — `user_task_trampoline`
 /// reads `SCHED[cpu].current`, which is null on a core that never runs the scheduler loop. Fire-and-
 /// forget: `sys_exit` marks it FINISHED and the scheduler reclaims it. Returns the task id.
+///
+/// Since M6e EVERY EL0 task starts I-unmasked (preemptible) — `user_task_trampoline` plants SPSR 0x240
+/// — so on metal the timer may preempt any of them mid-EL0; `__vec_irq` banks SP_EL0 so that is safe.
+/// Tasks that share a user stack (the M6 demo does) must therefore not WRITE it (see `El0Demo`'s STOP
+/// tripwire); a stack-writing EL0 program needs per-task stacks (M6d).
 pub fn spawn_user(name: &'static str, user_entry: u64, user_sp: u64, cpu: usize) -> u64 {
     assert!(cpu < NUM_CPUS, "spawn_user: cpu out of range");
     let mut stack: Box<[u8]> = alloc::vec![0u8; TASK_STACK_SIZE].into_boxed_slice();
