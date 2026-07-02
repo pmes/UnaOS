@@ -306,6 +306,38 @@ esp_arm() {
 KERNEL8_DIR="${WORKSPACE_DIR}/target/pi_baremetal"
 FW_ZIP="${WORKSPACE_DIR}/target/RPi4_UEFI_Firmware_v1.52.zip"
 kernel8() {
+    local TOOLBIN; TOOLBIN="$(rustc +nightly --print sysroot)/lib/rustlib/$(rustc +nightly -vV | awk '/host/{print $2}')/bin"
+
+    # M6c: build the EL0 user program as a SEPARATE link product (out of the kernel's .text) and
+    # objcopy it to a flat binary the kernel include_bytes!s (crates/kernel/src/arch/aarch64/
+    # syscall.rs). Built for the SAME bare aarch64 target as the kernel, with its own tiny linker
+    # script (crates/user-blob/user-blob.ld); the routine is position-independent (byte-granular `adr`
+    # + an inline message), so it runs wherever the kernel copies it. This MUST run BEFORE the kernel
+    # build: include_bytes! needs target/user_blob.bin to exist, and its (always-fresh) mtime is what
+    # drives the kernel's rebuild when the routine changes. (build-std/target come from the crate's
+    # own .cargo/config.toml; it is its own workspace, so `./arroyo check`/`build` never touch it —
+    # the blob is validated only here at kernel8-build time, not at `check`.)
+    echo -e "${COLOR_YELLOW}⚡ Building EL0 user blob (crates/user-blob → target/user_blob.bin)...${COLOR_RESET}"
+    mkdir -p "${WORKSPACE_DIR}/target"
+    cd "$WORKSPACE_DIR/crates/user-blob"
+    RUSTFLAGS="-C link-arg=-T${WORKSPACE_DIR}/crates/user-blob/user-blob.ld" \
+      cargo +nightly build --release -Z json-target-spec
+    cd "$WORKSPACE_DIR"
+    "$TOOLBIN/llvm-objcopy" -O binary --only-section=.text \
+      "${WORKSPACE_DIR}/crates/user-blob/target/aarch64-base/release/user-blob" \
+      "${WORKSPACE_DIR}/target/user_blob.bin"
+    # The flat blob must exist and begin EXACTLY at _start's first instruction — the kernel enters the
+    # copy at offset 0, so a stray byte ahead of _start (a future toolchain reordering objcopy output)
+    # would be a metal-only wrong-entry fault QEMU wouldn't reliably catch. _start = `mov x8, #1` =
+    # 0xD2800028 = little-endian bytes 28 00 80 d2. Assert both.
+    [ -f "${WORKSPACE_DIR}/target/user_blob.bin" ] || { echo -e "${COLOR_RED}ERROR: user_blob.bin missing — blob build failed${COLOR_RESET}"; exit 1; }
+    local head4; head4="$(head -c 4 "${WORKSPACE_DIR}/target/user_blob.bin" | od -An -tx1 | tr -d ' \n')"
+    if [ "$head4" != "280080d2" ]; then
+        echo -e "${COLOR_RED}ERROR: user_blob.bin does not start with _start (mov x8,#1); first 4 bytes = ${head4}${COLOR_RESET}"
+        exit 1
+    fi
+    echo -e "${COLOR_GREEN}✅ EL0 user blob: $(wc -c < "${WORKSPACE_DIR}/target/user_blob.bin" | tr -d ' ') bytes${COLOR_RESET}"
+
     echo -e "${COLOR_YELLOW}⚡ Building bare-metal kernel8.img (Pi 4, microSD-slot boot)...${COLOR_RESET}"
     cd "$WORKSPACE_DIR/crates/kernel"
     RUSTFLAGS="-C link-arg=-T${WORKSPACE_DIR}/crates/kernel/pi-baremetal.ld" \
@@ -313,7 +345,6 @@ kernel8() {
       $NIGHTLY_FLAGS --features baremetal,skip_xhci
     cd "$WORKSPACE_DIR"
 
-    local TOOLBIN; TOOLBIN="$(rustc +nightly --print sysroot)/lib/rustlib/$(rustc +nightly -vV | awk '/host/{print $2}')/bin"
     rm -rf "$KERNEL8_DIR"; mkdir -p "$KERNEL8_DIR/overlays"
     "$TOOLBIN/llvm-objcopy" -O binary \
       "${WORKSPACE_DIR}/target/aarch64-base/release/unaos-kernel" "$KERNEL8_DIR/kernel8.img"

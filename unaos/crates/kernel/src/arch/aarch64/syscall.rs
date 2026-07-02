@@ -2,7 +2,8 @@
 // Copyright (C) 2026 The Architect & Una
 //
 // aarch64 EL0 userspace + the SVC syscall interface (M6a: the first privilege boundary; M6b: fault
-// isolation + per-page user permissions).
+// isolation + per-page user permissions; M6c: the well-behaved `hello` program moved OUT of kernel
+// `.text` into a separately linked, baked-in flat blob — `USER_BLOB` below).
 //
 // The kernel runs at EL1 (see boot::drop_to_el1). A user task drops to EL0 (sched::spawn_user) and
 // calls back in with `svc #0`; because the kernel is at EL1 and HCR_EL2.TGE=0, that SVC is taken to
@@ -16,9 +17,9 @@
 // and exits the task; the kernel survives. The user window is permission-split: the CODE page is
 // EL0-RX/EL1-RO (flipped by boot::protect_user_code after the blob copy — the kernel's first live
 // page-table update), the DATA/STACK pages are EL0-RW and never executable. The M6b demo proves all
-// of it with four EL0 programs (one well-behaved, three deliberately faulting) and a verdict task
-// that demands the EXACT outcome split — see `verdict` and main.rs. M6f adds a real copy_from_user
-// and a wider surface.
+// of it with four EL0 programs (one well-behaved — the M6c loaded blob — and three deliberately
+// faulting inline fixtures) and a verdict task that demands the EXACT outcome split — see `verdict`
+// and main.rs. M6f adds a real copy_from_user and a wider surface.
 
 use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
@@ -26,32 +27,22 @@ use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 const SYS_WRITE: u64 = 1;
 const SYS_EXIT: u64 = 2;
 
-// --- The baked-in EL0 programs. Fully position-independent — `adr` is PC-relative and there are
-// only svc + mov-immediate + register ops — so they run correctly wherever the blob is copied.
-// `__user_blob_{start,end}` bound the copy; the `__user_prog_*` labels are the per-program entries.
+// --- The inline EL0 FAULT FIXTURES (M6b). These are fault-SHAPE fixtures, not programs, so they stay
+// inline in the kernel image; only the well-behaved `hello` routine moved out to a separately linked
+// blob in M6c (see `USER_BLOB` below). Fully position-independent — every reference is a PC-relative
+// `adr` and there are only svc + mov-immediate + register ops — so they run correctly wherever the
+// copy lands. `__fault_blob_{start,end}` bound the copy; the `__user_prog_*` labels are the per-fixture
+// entries.
 //
-// M6b fault-test programs: each provokes ONE specific fault the kernel must answer with a task-kill.
-// If the fault DOESN'T happen (broken permissions / stale TLB), the program falls through to
-// sys_exit(1) — the SURVIVOR protocol: a self-reported, greppable FAIL instead of an EL0 wedge
-// (EL0 runs I-masked until M6e, so a `b .` survivor would hang its core forever and silence the
-// same-core verdict the failure is supposed to reach). ---
+// Each provokes ONE specific fault the kernel must answer with a task-kill. If the fault DOESN'T
+// happen (broken permissions / stale TLB), the fixture falls through to sys_exit(1) — the SURVIVOR
+// protocol: a self-reported, greppable FAIL instead of an EL0 wedge (EL0 runs I-masked until M6e, so
+// a `b .` survivor would hang its core forever and silence the same-core verdict the failure is
+// supposed to reach). ---
 core::arch::global_asm!(
     r#"
-    .globl __user_blob_start
-__user_blob_start:
-    mov x8, #1                              // SYS_WRITE
-    mov x0, #1                              // fd = 1 (stdout)
-    adr x1, __user_msg                      // buf (PC-relative -> the EL0 VA at run time)
-    mov x2, #(__user_msg_end - __user_msg)  // len
-    svc #0
-    mov x8, #2                              // SYS_EXIT
-    mov x0, #0                              // status = 0
-    svc #0
-1:  b 1b                                    // sys_exit never returns; spin as a belt-and-braces guard
-__user_msg:
-    .ascii "hello from EL0\n"
-__user_msg_end:
-
+    .globl __fault_blob_start
+__fault_blob_start:
     // Write to PA 0x0 — EL1-only RAM (AP=0b00) -> EL0 data abort, EC=0x24, FAR=0x0. `str xzr` so
     // even a bug that lets the store through writes zeros, not garbage, over the dead spin-table.
     .balign 4
@@ -89,18 +80,31 @@ __user_prog_stack_exec:
 1:  b 1b
 
     .balign 4
-    .globl __user_blob_end
-__user_blob_end:
+    .globl __fault_blob_end
+__fault_blob_end:
 "#
 );
 
 unsafe extern "C" {
-    static __user_blob_start: u8;
-    static __user_blob_end: u8;
+    static __fault_blob_start: u8;
+    static __fault_blob_end: u8;
     static __user_prog_wild_write: u8;
     static __user_prog_code_write: u8;
     static __user_prog_stack_exec: u8;
 }
+
+/// The `hello` EL0 program (M6c), built as a SEPARATE link product (`crates/user-blob`) and baked in
+/// as a flat binary instead of living in the kernel's `.text`. `arroyo kernel8` builds it — a naked,
+/// position-independent `sys_write("hello from EL0\n") + sys_exit(0)` routine — for the bare aarch64
+/// target and `llvm-objcopy -O binary`s it to `target/user_blob.bin` BEFORE the kernel build; here we
+/// `include_bytes!` it and copy it into the user CODE page at `setup()`, where it runs at EL0 exactly
+/// like the old inline routine. The path is relative to this crate's manifest dir
+/// (`unaos/crates/kernel`) → `unaos/target/user_blob.bin`; `include_bytes!` registers the file as a
+/// rebuild dependency, so a changed routine re-triggers the kernel compile. Only ever compiled in the
+/// baremetal build (this whole module is `#[cfg(feature = "baremetal")]`), so `./arroyo check`/`build`
+/// — which do not build the blob — never need the file to exist.
+static USER_BLOB: &[u8] =
+    include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../target/user_blob.bin"));
 
 // --- M6b demo accounting. Written by the syscall/kill paths, read by `verdict`. ---
 /// EL0 tasks that exited with status 0 (normal completion — the demo expects exactly 1: hello).
@@ -127,37 +131,63 @@ pub struct El0Demo {
     pub stack_exec: u64,
 }
 
-/// Copy the EL0 program blob into the user window (`boot::user_region`) and do the I-cache
-/// maintenance; return the demo entry points. Call once, after `mmu_init`. Does NOT protect the
-/// code page — the caller warms the demo core's TLB first, then calls `protect()` (the copy here is
-/// exactly why the page must still be EL1-writable). The window is identity-mapped, so entries are
-/// base + link-time label offsets and the blobs' PC-relative `adr`s resolve in place.
+/// Copy the EL0 programs into the user window (`boot::user_region`) and do the I-cache maintenance;
+/// return the demo entry points. Call once, after `mmu_init`. Does NOT protect the code page — the
+/// caller warms the demo core's TLB first, then calls `protect()` (the copies here are exactly why
+/// the page must still be EL1-writable). The window is identity-mapped, so entries are base + copy
+/// offsets and each program's PC-relative `adr`s resolve in place.
+///
+/// M6c: two blobs share the ONE code page. The loaded `hello` program (`USER_BLOB`, out of kernel
+/// `.text`) goes at offset 0 — the kernel enters it at the base — and the inline fault fixtures
+/// (`__fault_blob_*`) go right after it. Both must fit in `USER_CODE_SIZE`.
 pub fn setup() -> El0Demo {
     let (base, size) = super::boot::user_region();
-    let start = &raw const __user_blob_start as usize;
-    let end = &raw const __user_blob_end as usize;
-    let blob_len = end - start;
-    // The whole blob must fit in the CODE page — the only page protect_user_code makes
-    // EL0-executable; a program straddling into the data pages would abort mid-run.
-    assert!(blob_len <= super::boot::USER_CODE_SIZE, "user blob does not fit in the code page");
+    let hello_len = USER_BLOB.len();
+    // 16-align the fixtures' start so their first instruction is 4-aligned (an eret/exec into a
+    // misaligned entry is EC 0x22) and the icache maintenance below covers whole cache lines.
+    let fault_off = (hello_len + 0xF) & !0xF;
+    let fstart = &raw const __fault_blob_start as usize;
+    let fend = &raw const __fault_blob_end as usize;
+    let fault_len = fend - fstart;
+    let total = fault_off + fault_len;
+    // Everything must fit in the CODE page — the only page protect_user_code makes EL0-executable; a
+    // program straddling into the data pages would abort mid-run.
+    assert!(
+        total <= super::boot::USER_CODE_SIZE,
+        "user code (hello blob + fault fixtures) does not fit in the code page"
+    );
     unsafe {
-        core::ptr::copy_nonoverlapping(start as *const u8, base as *mut u8, blob_len);
+        // hello (the loaded blob) at the base; the inline fault fixtures at base + fault_off.
+        core::ptr::copy_nonoverlapping(USER_BLOB.as_ptr(), base as *mut u8, hello_len);
+        core::ptr::copy_nonoverlapping(
+            fstart as *const u8,
+            (base + fault_off as u64) as *mut u8,
+            fault_len,
+        );
     }
     // Freshly-written code: clean D to the PoU + invalidate the I-cache so the EL0 fetch (possibly on
-    // another core — IC IVAU broadcasts Inner-Shareable) sees the new bytes. Metal-only; QEMU no-op.
-    super::cache::icache_sync_range(base as usize, blob_len);
-    // An eret to a misaligned entry is EC 0x22 (PC alignment) — assert each entry came out 4-aligned.
-    let entry = |label: *const u8| -> u64 {
-        let va = base + (label as usize - start) as u64;
+    // another core — IC IVAU broadcasts Inner-Shareable) sees the new bytes across BOTH copies. This
+    // is the DC CVAU/IC IVAU sequence M6a/M6b rely on; KEEP it for the M6c loaded-blob copy — it is
+    // exactly what makes the copied program executable on real caches. Metal-only; QEMU no-op.
+    super::cache::icache_sync_range(base as usize, total);
+    serial_println!(":: M6c: user blob loaded ({} bytes) ::", hello_len);
+    // An eret to a misaligned entry is EC 0x22 (PC alignment) — assert every entry came out
+    // 4-aligned. Each fixture VA = base + fault_off + its offset within the fault blob.
+    let fentry = |label: *const u8| -> u64 {
+        let va = base + fault_off as u64 + (label as usize - fstart) as u64;
         assert!(va & 3 == 0, "user program entry misaligned");
         va
     };
+    // `hello` enters at the copy's offset 0 (base). base is structurally 16 KiB-aligned (the region's
+    // `#[repr(align(0x4000))]`), but assert it here too so it gets the same guard as the fixtures —
+    // a future USER_REGION relocation can't silently produce a misaligned EL0 entry.
+    assert!(base & 3 == 0, "hello entry misaligned");
     El0Demo {
         sp: (base + size as u64) & !0xF, // 16-aligned top of the window = initial user stack pointer
-        hello: entry(&raw const __user_blob_start),
-        wild_write: entry(&raw const __user_prog_wild_write),
-        code_write: entry(&raw const __user_prog_code_write),
-        stack_exec: entry(&raw const __user_prog_stack_exec),
+        hello: base, // the loaded blob's `_start` is at offset 0 of the copy (base is 16 KiB-aligned)
+        wild_write: fentry(&raw const __user_prog_wild_write),
+        code_write: fentry(&raw const __user_prog_code_write),
+        stack_exec: fentry(&raw const __user_prog_stack_exec),
     }
 }
 
