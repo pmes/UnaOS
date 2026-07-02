@@ -29,7 +29,9 @@ NIGHTLY_FLAGS="-Z build-std=core,compiler_builtins,alloc -Z build-std-features=c
 
 # Optional kernel cargo features (composable). UNAOS_SKIP_XHCI=1 disables xHCI/USB bring-up
 # (video-only boot for real HW where firmware may still own the controller and stall its reset);
-# UNAOS_BOOTLOG=1 holds the boot log on screen instead of handing off to the GUI. Empty by default.
+# UNAOS_BOOTLOG=1 holds the boot log on screen instead of handing off to the GUI;
+# UNAOS_PI=1 (Raspberry Pi 4) and UNAOS_TEGRA=1 (Jetson Orin Nano / Tegra234) select the aarch64
+# UART — `pi` touches no UART (fbcon only), `tegra` points serial at the Tegra 16550. Empty by default.
 KERNEL_FEATURES=""
 _feats=""
 [ -n "${UNAOS_SKIP_XHCI:-}" ] && _feats="${_feats}skip_xhci,"
@@ -37,9 +39,21 @@ _feats=""
 [ -n "${UNAOS_PI:-}" ] && _feats="${_feats}pi,"
 [ -n "${UNAOS_USBDEBUG:-}" ] && _feats="${_feats}usbdebug,"
 [ -n "${UNAOS_SCHED_DEMO:-}" ] && _feats="${_feats}sched_demo,"
+[ -n "${UNAOS_TEGRA:-}" ] && _feats="${_feats}tegra,"
 if [ -n "$_feats" ]; then
     KERNEL_FEATURES="--features ${_feats%,}"
     echo -e "${COLOR_YELLOW}⚡ kernel features: ${_feats%,}${COLOR_RESET}"
+fi
+
+# UNAOS_GICV3=1 selects the GICv3 model on the aarch64 `virt` board. A trailing `-machine
+# gic-version=3` overrides the default gic-version=2 (QEMU keeps the last value of a repeated machine
+# property). Only affects the `arm`/`test-arm` (virt) runs; the Pi paths (raspi4b) are always GICv2.
+# Default (unset) stays GICv2. This is a build-time nop — it changes only the QEMU invocation, not
+# the kernel binary (the driver runtime-detects the version at boot).
+GICV3_ARG=""
+if [ -n "${UNAOS_GICV3:-}" ]; then
+    GICV3_ARG="-machine gic-version=3"
+    echo -e "${COLOR_YELLOW}⚡ aarch64 virt: GICv3 (gic-version=3)${COLOR_RESET}"
 fi
 
 # UNAOS_FATIMG swaps the usb-storage backing to a FAT image (scripts/make-fat-img.sh) so the
@@ -149,7 +163,7 @@ launch_aarch64() {
     echo -e "${COLOR_PURPLE}-------------------------${COLOR_RESET}"
 
     qemu-system-aarch64 \
-        -machine virt,virtualization=on,gic-version=2 \
+        -machine virt,virtualization=on,gic-version=2 ${GICV3_ARG} \
         -cpu cortex-a72 \
         -smp 4 \
         -m 1G \
@@ -177,7 +191,7 @@ test_aarch64() {
     rm -f "$logf"
     echo -e "${COLOR_CYAN}⚡ Headless aarch64 test (${secs}s). Serial -> ${logf}${COLOR_RESET}"
     qemu-system-aarch64 \
-        -machine virt,virtualization=on,gic-version=2 -cpu cortex-a72 -smp 4 -m 1G \
+        -machine virt,virtualization=on,gic-version=2 ${GICV3_ARG} -cpu cortex-a72 -smp 4 -m 1G \
         -drive if=pflash,format=raw,readonly=on,file="$AAVMF_PATH" \
         -drive format=raw,file=fat:rw:"$ESP_DIR_ARM" \
         -serial "file:${logf}" -device ramfb -display none \

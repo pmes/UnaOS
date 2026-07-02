@@ -34,7 +34,8 @@ fn main() {
         .arg("-Z").arg("json-target-spec");
     // Optional kernel features from env knobs: UNAOS_SKIP_XHCI=1 (disable xHCI/USB bring-up),
     // UNAOS_BOOTLOG=1 (hold the boot log on screen instead of the GUI), UNAOS_USBDEBUG=1 (run the
-    // USB main loop but keep the boot log on screen + print input events). Composable. NOTE: keep
+    // USB main loop but keep the boot log on screen + print input events), UNAOS_PI=1 (Pi 4,
+    // fbcon-only serial) and UNAOS_TEGRA=1 (Jetson Orin / Tegra234 UART). Composable. NOTE: keep
     // this list in sync with arroyo's feature mapping — the builder rebuilds the kernel, so a knob
     // missing here is silently dropped even if arroyo set it.
     let mut feats: Vec<&str> = Vec::new();
@@ -43,6 +44,9 @@ fn main() {
     if std::env::var("UNAOS_PI").is_ok() { feats.push("pi"); }
     if std::env::var("UNAOS_USBDEBUG").is_ok() { feats.push("usbdebug"); }
     if std::env::var("UNAOS_SCHED_DEMO").is_ok() { feats.push("sched_demo"); }
+    // `tegra` (Jetson Orin / Tegra234 UART) is an aarch64 board feature; mapped here for parity with
+    // the `pi` knob, though this x86_64 builder never produces aarch64 media (the `arroyo` script does).
+    if std::env::var("UNAOS_TEGRA").is_ok() { feats.push("tegra"); }
     if !feats.is_empty() {
         let list = feats.join(",");
         kernel_cmd.arg("--features").arg(&list);
