@@ -71,8 +71,46 @@ core sends a free SGI (INTID 15) to itself and confirms it is delivered through
 the IRQ vector, printing `:: GIC self-SGI delivered (v2) ::` /
 `(v3) ::`. It runs before the timer is armed and before IRQs are globally
 unmasked, so it briefly unmasks `PSTATE.I` itself, then restores `DAIF`. This is
-the only IPI exercise available until SMP reaches the `virt`/Orin path
-(single-core UEFI today).
+the boot-core IPI smoke; cross-*core* SGI delivery is proven once the secondaries
+are up (see SMP below).
+
+### SMP (multi-core bring-up)
+
+Two release mechanisms, selected by platform:
+
+* **QEMU `virt` / UEFI — PSCI `CPU_ON` (Arc JC2).** UEFI starts only the boot
+  core; the other three sit in PSCI-off state. The kernel starts them with the
+  standardized **PSCI `CPU_ON`** call (function ID `0xC400_0003`) over the **SMC**
+  conduit — the conduit that reaches QEMU's emulated PSCI from an EL2 guest
+  (`virt,virtualization=on` advertises `method = "smc"` in the generated `/psci`
+  node, confirmed via `qemu-system-aarch64 … -machine …,dumpdtb=…`; an `hvc` from
+  EL2 would instead target our own EL2 vector). A woken core comes up through a
+  CPU reset — MMU off, caches off, DAIF masked, at **EL2** — so it does not
+  inherit the BSP's live registers. Rather than build fresh tables, the BSP
+  **captures its live EL2 state** — `MAIR_EL2`/`TCR_EL2`/`TTBR0_EL2`/`SCTLR_EL2`
+  plus `CPTR_EL2` (the FP-enable a PSCI-reset core does not inherit) — and each
+  secondary **replays** it to join UEFI's identity map
+  (`arch/aarch64/smp_virt.rs::enable_mmu_virt`, the EL2 analogue of the baremetal
+  `boot::enable_mmu`). It then runs its own per-core GICv3 bring-up
+  (`gic::init_secondary_v3` — redistributor wake + the system-register CPU
+  interface, both banked) and **parks in WFI with IRQs unmasked**. The arc's
+  verdict is cross-core SGI (`ICC_SGI1R_EL1`): BSP → each AP and AP → BSP, logged
+  as `:: AARCH64 SMP: AP <n> online ::` plus the `BSP -> AP` / `AP -> BSP` SGI
+  lines. GICv3 only, runtime-gated on `gic::is_v3()`; the GICv2 `virt` run stays
+  single-core and byte-identical to baseline.
+* **Raspberry Pi 4 bare-metal — spin-table (`arch/aarch64/smp.rs`).** The GPU
+  firmware parks cores 1-3 in a spin-table; the kernel releases each by writing
+  its entry into that core's release slot and `SEV`. Unchanged by JC2 — the whole
+  PSCI path is `#[cfg(not(feature = "pi"))]`, so every Pi image compiles it out.
+
+**No scheduler on the `virt` path yet.** The aarch64 scheduler is
+`#[cfg(feature = "baremetal")]`-gated and coupled to EL1 (`ELR_EL1`/`SPSR_EL1`
+eret paths), while the `virt` kernel runs at EL2. Un-gating it needs a `virt`
+**EL2 → EL1 drop** mirroring the Pi's `boot::drop_to_el1`, after which the
+scheduler un-gates as-is and CAPSTONE can run there — the **JC3** candidate. So
+the JC2 secondaries only receive SGIs; they run no scheduled work. The per-core
+generic-timer tick is likewise deferred: arming it on a secondary would
+double-count the shared `ticks()` clock the xHCI/e1000 timeout budgets read.
 
 ### Build knob
 
@@ -83,8 +121,12 @@ the Pi bare-metal paths (`kernel8*`, QEMU `raspi4b`) are always GICv2.
 
 ### Orin metal pending
 
-All GICv3 work to date is **QEMU `virt` (`gic-version=3`) only**. The Jetson
-Orin Nano's on-silicon GICv3 (real Redistributor frames, PSCI-woken secondary
-cores, cluster affinities) is **not yet brought up** — that is a later,
-operator-attended arc. Nothing here should be read as a metal claim: QEMU
-models no Tegra machine, and QEMU-green does not imply Orin-correct.
+All GICv3 **and PSCI SMP** work to date is **QEMU `virt` (`gic-version=3`)
+only**. The Jetson Orin Nano's on-silicon GICv3 + PSCI — real Redistributor
+frames at the Tegra234 base, cluster affinities in the target MPIDR, and the
+board firmware's own PSCI conduit re-confirmed against its DTB — is **not yet
+brought up**; that is a later, operator-attended arc. The `virt` PSCI `CPU_ON`
+bring-up above is written to make it a small delta (swap the GICR base + confirm
+the conduit; the capture/replay and per-core GICv3 init carry over). Nothing here
+should be read as a metal claim: QEMU models no Tegra machine, and QEMU-green
+does not imply Orin-correct.

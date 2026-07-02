@@ -13,6 +13,11 @@ pub mod boot;
 pub mod mailbox;
 #[cfg(feature = "baremetal")]
 pub mod smp;
+// JC2: PSCI CPU_ON SMP on the QEMU `virt` GICv3 path (the non-Pi sibling of `smp`). Compiled out of
+// every Pi image (baremetal implies pi); the kick-off in `main.rs` is additionally runtime-gated on
+// `gic::is_v3()`, so the GICv2 virt run stays single-core.
+#[cfg(not(feature = "pi"))]
+pub mod smp_virt;
 #[cfg(feature = "baremetal")]
 pub mod sched;
 #[cfg(feature = "baremetal")]

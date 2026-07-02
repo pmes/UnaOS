@@ -123,6 +123,17 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     #[cfg(all(target_arch = "aarch64", feature = "baremetal"))]
     unaos_kernel::arch::smp::start_secondaries();
 
+    // 4a'. aarch64 SMP on the QEMU `virt` GICv3 path (JC2): bring the 3 PSCI-parked secondaries online
+    // via PSCI CPU_ON + per-core GICv3 bring-up, proven by cross-core SGI. Compile-gated off every Pi
+    // image (baremetal implies pi), and runtime-gated on GICv3 detection so the plain GICv2 virt run
+    // stays single-core (byte-identical to baseline). The APs park in WFI; there is no scheduler on the
+    // virt path (it is baremetal-gated + EL1-coupled — see the JC2 brief). Uses only static state (no
+    // heap). dtb_addr/dtb_size (captured above) let it confirm the PSCI conduit from the live DTB.
+    #[cfg(all(target_arch = "aarch64", not(feature = "pi")))]
+    if unaos_kernel::arch::gic::is_v3() {
+        unaos_kernel::arch::smp_virt::start_secondaries(dtb_addr, dtb_size);
+    }
+
     // 4b. aarch64 scheduler (M3a): a cooperative round-robin smoke test on the boot core — spawn a
     // few kernel threads that yield to each other and exit, proving the context switch + run queue.
     // No interrupts required, so it runs in QEMU too. Runs BEFORE preemption is on (stays cooperative).
