@@ -313,6 +313,37 @@ esp_arm() {
     echo -e "   Copy its contents to a FAT32 SD card together with the RPi4 EDK2 UEFI firmware."
 }
 
+# Jetson Orin Nano boot media: the aarch64 UEFI ESP (BOOTAA64.EFI + kernel.elf) built with the
+# `tegra` UART feature forced on (= UNAOS_TEGRA=1), so the kernel drives the Tegra 16550 at UARTC
+# (0x0C28_0000) rather than the QEMU-virt PL011. Boots from NVIDIA's on-board UEFI (JetPack 6 / L4T
+# r36) off a single-partition FAT32 USB stick. See docs/dev/OS/01_BOOT_HAL/arch_arm64.md (Orin).
+esp_jetson() {
+    # Force `tegra` on top of whatever features were already selected (idempotent).
+    case ",${_feats}" in
+        *",tegra,"*) ;;
+        *) _feats="${_feats}tegra,"; KERNEL_FEATURES="--features ${_feats%,}" ;;
+    esac
+    echo -e "${COLOR_YELLOW}⚡ kernel features (jetson): ${_feats%,}${COLOR_RESET}"
+    prepare_aarch64
+    echo -e "${COLOR_GREEN}✅ Jetson ESP (tegra): ${ESP_DIR_ARM}${COLOR_RESET}"
+    cat <<EOF
+
+  Make Orin boot media (macOS), then boot it:
+    1. Format a USB stick as ONE FAT32 partition — ERASES it, pick the right diskN:
+         diskutil list                                      # find your USB (external, physical)
+         diskutil eraseDisk "MS-DOS FAT32" UNAOS MBRFormat /dev/diskN
+    2. Copy the ESP on (no macOS AppleDouble junk), then eject:
+         COPYFILE_DISABLE=1 cp -R "${ESP_DIR_ARM}/EFI" "${ESP_DIR_ARM}/kernel.elf" /Volumes/UNAOS/
+         sync && diskutil eject /dev/diskN
+    3. Plug into an Orin USB-A port, attach a DisplayPort monitor at power-on, then power on.
+    4. In the UEFI Shell (tap ESC during boot if it does not drop there):
+         connect -r                      # bind FAT drivers — card readers need this
+         map -r                           # find the stick's FSx:  (HD(1,MBR,...) on USB/Unit)
+         FSx:\\EFI\\BOOT\\BOOTAA64.EFI     # launch UnaOS  (x = the number map showed)
+  Serial console: Raspberry Pi Debug Probe on the board TTL header (pin 3 = RX, pin 4 = TX), 115200.
+EOF
+}
+
 # Bare-metal Raspberry Pi 4: build a flat kernel8.img the GPU ROM loads directly from the microSD
 # SLOT (no UEFI/EDK2 — the native Pi boot path), stage the Pi firmware blobs + config.txt around it,
 # and build a flashable .img for Raspberry Pi Imager. Links non-PIE at 0x80000 (aarch64-base.json,
@@ -509,6 +540,9 @@ case "${1:-}" in
     esp-arm|esp_arm)
         esp_arm
         ;;
+    esp-jetson|esp_jetson|jetson)
+        esp_jetson
+        ;;
     fat-img|fat_img|fatimg)
         fat_img
         ;;
@@ -534,7 +568,7 @@ case "${1:-}" in
         ;;
     *)
         echo -e "${COLOR_RED}Unknown command: $1${COLOR_RESET}"
-        echo "Usage: ./arroyo [x86|arm|test [secs]|test-arm [secs]|check|build|esp-x86|esp-arm|fat-img|test-fat [part|gpt|p16|sf] [secs]|kernel8|kernel8-run|kernel8-test [secs]|clean]"
+        echo "Usage: ./arroyo [x86|arm|test [secs]|test-arm [secs]|check|build|esp-x86|esp-arm|esp-jetson|fat-img|test-fat [part|gpt|p16|sf] [secs]|kernel8|kernel8-run|kernel8-test [secs]|clean]"
         exit 1
         ;;
 esac
