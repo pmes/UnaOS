@@ -1,0 +1,415 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 The Architect & Una
+//
+// Bare-metal Raspberry Pi 4 boot (the `baremetal` feature). The VideoCore GPU ROM reads the microSD
+// slot perfectly (it loads start4.elf/RPI_EFI.fd from it) — it's only EDK2/UEFI's own SD driver that
+// can't, which is why the UEFI path needs USB. So here we cut UEFI out: the GPU ROM loads our flat
+// `kernel8.img` directly to 0x80000 and jumps to `_start` (in main.rs's .text.boot) at EL2 with x0 =
+// DTB, MMU off, caches off. `_start` (asm) parks secondary cores, zeroes BSS, sets the stack, and
+// calls `__rust_boot`, which calls the two functions here — `mmu_init` then `build_boot_info` — and
+// then enters the normal `kernel_main`.
+//
+// Why the MMU is mandatory (not just nice): the GPU hands off with the MMU OFF, where all memory is
+// treated as Device/Strongly-ordered. AArch64 exclusive accesses (`ldxr`/`stxr`) — which every
+// spinlock and atomic in this kernel rely on — are CONSTRAINED UNPREDICTABLE on non-Normal-cacheable
+// memory. So before any of the kernel's locks run we must enable the MMU with at least RAM mapped
+// Normal cacheable. We use the simplest possible map: a single L1 table of 1 GiB identity blocks.
+//
+// EL: the firmware hands every core off at EL2 (the hypervisor level — incidental, not for isolation).
+// A normal OS runs at EL1, so each core calls `drop_to_el1` (below) BEFORE `mmu_init`/`enable_mmu`; the
+// MMU and everything after it therefore run in the EL1&0 translation regime (TTBR0_EL1/TCR_EL1/
+// SCTLR_EL1). The drop is purely additive — it configures the EL1-facing controls that would otherwise
+// trap or read UNKNOWN, and leaves the (now-unused-for-translation) EL2 regime alone.
+
+use unaos_boot_info::{BootInfo, FrameBufferInfo, MemoryRegion, MemoryRegionKind, PixelFormat};
+
+/// A single Level-1 translation table: 512 entries × 8 bytes = one 4 KiB page. With a 4 KiB granule
+/// and a 39-bit VA (TCR T0SZ=25) the top lookup level is L1 and each entry maps a 1 GiB block, so
+/// these 512 entries cover the whole 512 GiB VA — we only fill the first four (0–4 GiB). Lives in
+/// BSS (zeroed by `_start` before we fill it).
+#[repr(C, align(4096))]
+struct PageTable([u64; 512]);
+static mut L1: PageTable = PageTable([0; 512]);
+
+/// Second- and third-level tables for the EL0 user window (M6a). To grant EL0 access at 4 KiB
+/// granularity — not the 2 MiB or 1 GiB of a block — the kernel's L1[0] (0–1 GiB) is demoted from a
+/// 1 GiB block to a table: L1[0] → L2_USER (512 × 2 MiB) → (for the one 2 MiB block containing
+/// `USER_REGION`) L3_USER (512 × 4 KiB). ONLY the pages backing `USER_REGION` are EL0-accessible;
+/// every other page of 0–1 GiB stays EL1-only, exactly as the old 1 GiB block was. Both in BSS.
+static mut L2_USER: PageTable = PageTable([0; 512]);
+static mut L3_USER: PageTable = PageTable([0; 512]);
+
+/// The EL0 user window, identity-mapped (VA == PA): the user program is copied to the bottom (the
+/// CODE page) and the user stack grows down from the top (the DATA pages). 16 KiB in BSS (zeroed by
+/// `_start`), aligned to its own SIZE so it can never straddle a 16 KiB — a fortiori 2 MiB —
+/// boundary: all four pages are structurally guaranteed to fall inside the single L3_USER-covered
+/// block, whatever BSS layout future milestones produce. Deliberately small — only these pages are
+/// ever exposed to EL0.
+///
+/// M6b permission split: page 0 = CODE (EL0-RX/EL1-RO after `protect_user_code`; RW during the blob
+/// copy), pages 1–3 = DATA/STACK (EL0+EL1 RW, never executable at any EL).
+const USER_REGION_SIZE: usize = 0x4000; // 16 KiB = 4 pages
+/// The CODE page(s) at the bottom of USER_REGION — the only EL0-executable memory in the system.
+pub const USER_CODE_SIZE: usize = 0x1000;
+#[repr(C, align(0x4000))]
+struct UserRegion([u8; USER_REGION_SIZE]);
+static mut USER_REGION: UserRegion = UserRegion([0; USER_REGION_SIZE]);
+
+// --- Translation attributes (ARM ARM DDI0487). We drop to EL1 (see `drop_to_el1`) before enabling
+// the MMU, so these program the EL1&0 regime (TTBR0_EL1/TCR_EL1/MAIR_EL1/SCTLR_EL1). ---
+// MAIR: AttrIdx 0 = Normal Inner/Outer Write-Back non-transient (0xFF); AttrIdx 1 = Device-nGnRnE
+// (0x00). Regime-independent — same layout at EL1 and EL2.
+const MAIR_VAL: u64 = 0xFF;
+
+// TCR_EL1 (NOT TCR_EL2 — the field layout differs). T0SZ=25 (39-bit VA → L1 top level, 1 GiB blocks),
+// IRGN0=ORGN0=WB, SH0=Inner-shareable, TG0=4 KiB. The TTBR1 (high) half is unused, so EPD1=1 disables
+// its table walk (TTBR1_EL1 stays 0); T1SZ/TG1 are given legal values regardless. Note the two traps
+// for anyone copying TCR_EL2: PS is IPS at bits [34:32] (not [18:16]), and bits 23/31 are EPD1/TG1
+// here, NOT the RES1 bits the non-VHE TCR_EL2 short format has.
+const TCR_EL1_VAL: u64 = 25            // T0SZ  [5:0]
+    | (0b01 << 8)                      // IRGN0 = WB
+    | (0b01 << 10)                     // ORGN0 = WB
+    | (0b11 << 12)                     // SH0   = inner shareable
+    | (0b00 << 14)                     // TG0   = 4 KiB
+    | (25 << 16)                       // T1SZ  [21:16] (TTBR1 unused; legal value)
+    | (1 << 23)                        // EPD1  = disable the TTBR1 table walk
+    | (0b10 << 30)                     // TG1   = 4 KiB (legal encoding; TTBR1 unused)
+    | (0b001 << 32);                   // IPS   = 36-bit / 64 GiB, at [34:32]
+
+// SCTLR_EL1 built as an ABSOLUTE value, not read-modify-write. SCTLR_EL1 resets to an architecturally
+// UNKNOWN value (unlike SCTLR_EL2, which firmware initialised before handing off — which is why the
+// old EL2 path could RMW it safely). An RMW here could read the RES1 bits as 0 and leave them cleared
+// → CONSTRAINED UNPREDICTABLE translation/execution. So OR the Armv8.0 Cortex-A72 SCTLR_EL1 RES1 mask
+// (0x30D00800 = bits 29,28,23,22,20,11) with M (MMU), C (data cache), I (instruction cache).
+const SCTLR_EL1_VAL: u64 = 0x30D0_0800 | (1 << 0) | (1 << 2) | (1 << 12);
+
+// L1 block descriptor lower attributes: bits[1:0]=0b01 (block), AttrIndx[4:2], AP[7:6]=0b00
+// (privileged RW, no EL0 access — the EL1&0 regime), SH[9:8], AF=bit10.
+const DESC_BLOCK: u64 = 0b01;
+const DESC_AF: u64 = 1 << 10;
+const SH_INNER: u64 = 0b11 << 8;
+const ATTR_NORMAL: u64 = 0 << 2; // AttrIdx 0
+const ATTR_DEVICE: u64 = 1 << 2; // AttrIdx 1
+// Execute-never. The EL1&0 translation regime splits execute-never into UXN (bit 54, EL0) and PXN
+// (bit 53, EL1); a Device/peripheral block must set PXN to be non-executable by the EL1 kernel (the
+// old EL2 regime had only bit 54 = XN). Set both so peripheral memory is never executable at any EL.
+const DESC_XN: u64 = (1 << 54) | (1 << 53);
+
+/// Normal, cacheable, inner-shareable, executable block (RAM where the kernel/heap/stack live).
+const fn ram_block(pa: u64) -> u64 {
+    pa | DESC_AF | SH_INNER | ATTR_NORMAL | DESC_BLOCK
+}
+/// Device-nGnRnE, execute-never block (the peripheral window: PL011 0xFE201000, GIC 0xFF841000,
+/// mailbox 0xFE00B880 all sit in the 0xC000_0000–0xFFFF_FFFF GiB).
+const fn device_block(pa: u64) -> u64 {
+    pa | DESC_XN | DESC_AF | ATTR_DEVICE | DESC_BLOCK
+}
+
+// --- EL0 user-window descriptor bits (M6a/M6b). ---
+const DESC_TABLE: u64 = 0b11; // L1/L2 table descriptor (points at the next-level table)
+const DESC_PAGE: u64 = 0b11; // L3 page descriptor — note 0b01 is INVALID at L3, unlike a block
+const AP_EL0: u64 = 1 << 6; // AP[7:6]=0b01 → EL0+EL1 read-write (AP=0b00 is EL1-only)
+const AP_RO_ALL: u64 = 0b11 << 6; // AP[7:6]=0b11 → read-only at BOTH EL1 and EL0
+const DESC_PXN: u64 = 1 << 53; // privileged execute-never (EL1 can't execute the page)
+const DESC_UXN: u64 = 1 << 54; // unprivileged execute-never (EL0 can't execute the page)
+
+/// L3 4 KiB page, Normal cacheable, EL1-only (AP=0b00), executable at EL1 — the default identity page.
+const fn ram_page(pa: u64) -> u64 {
+    pa | DESC_AF | SH_INNER | ATTR_NORMAL | DESC_PAGE
+}
+/// L3 4 KiB USER DATA/STACK page: Normal cacheable, EL0+EL1 read-write (AP=0b01), never executable
+/// at any EL (UXN=1, PXN=1). The build_l1 state of ALL user pages — the CODE page starts this way
+/// too so `syscall::setup` can copy the program in at EL1; `protect_user_code` then flips it.
+const fn user_data_page(pa: u64) -> u64 {
+    pa | DESC_UXN | DESC_PXN | AP_EL0 | DESC_AF | SH_INNER | ATTR_NORMAL | DESC_PAGE
+}
+/// L3 4 KiB USER CODE page (M6b, the final shape written by `protect_user_code`): Normal cacheable,
+/// read-only at BOTH ELs (AP=0b11), EL0-executable (UXN=0), EL1-non-executable (PXN=1). EL0 can run
+/// but not modify its program; EL1 can read it (sys_write's message bytes — fine on the PAN-less
+/// A72) but a kernel write is now a Current-EL permission fault, so any future loader (M6c) must
+/// re-open the page before writing.
+const fn user_code_page(pa: u64) -> u64 {
+    pa | DESC_PXN | AP_RO_ALL | DESC_AF | SH_INNER | ATTR_NORMAL | DESC_PAGE
+}
+/// A table descriptor pointing at the next-level table. Mask to bits[47:12] so no stray bits land in
+/// the table-attribute fields [63:59] (NSTable/APTable/UXNTable/PXNTable); leaving them 0 adds no
+/// restriction at this level, so the leaf page's own AP/XN govern.
+const fn table_desc(table_pa: u64) -> u64 {
+    (table_pa & 0x0000_FFFF_FFFF_F000) | DESC_TABLE
+}
+
+/// The EL0 user window as (base PA == VA, size in bytes). The M6a routine is copied to the base and
+/// run at EL0 (identity map); the caller sets SP_EL0 to the 16-aligned top. Baremetal-only.
+pub fn user_region() -> (u64, usize) {
+    (&raw const USER_REGION as u64, USER_REGION_SIZE)
+}
+
+/// Build the identity map and turn the MMU on. Called (with the MMU still off, at EL1 after
+/// `drop_to_el1`) from `__rust_boot` after BSS has been zeroed. Plain volatile writes + system-
+/// register moves only — no atomics, no locks, nothing that needs the MMU we're about to enable.
+pub unsafe fn mmu_init() {
+    build_l1();
+    unsafe { enable_mmu() };
+}
+
+/// Populate the translation tables. BSP-only, MMU OFF (before `enable_mmu` and before the secondaries
+/// are released), so the secondaries reuse the finished tables and no TLB/cache publication is needed
+/// (the `tlbi vmalle1` in `enable_mmu` covers each core's cold start). Builds the EL0 user window as a
+/// 3-level walk under L1[0] so EL0 permission is carved at 4 KiB granularity (see `L2_USER`/`L3_USER`).
+fn build_l1() {
+    let user_pa = &raw const USER_REGION as u64;
+    // USER_REGION must be 4 KiB-aligned (whole L3 pages) and in the first 1 GiB (under L1[0]).
+    debug_assert!(user_pa & 0xFFF == 0, "USER_REGION not 4 KiB aligned");
+    debug_assert!(user_pa >> 30 == 0, "USER_REGION not in the first 1 GiB");
+    // Structurally guaranteed by align(0x4000) == the region size; documents that every page falls
+    // inside the ONE 2 MiB block L3_USER covers (a straddling tail would silently stay EL1-only).
+    debug_assert!(
+        user_pa >> 21 == (user_pa + USER_REGION_SIZE as u64 - 1) >> 21,
+        "USER_REGION straddles a 2 MiB block"
+    );
+    let l2_idx = (user_pa >> 21) as usize; // the 2 MiB block of 0–1 GiB that holds USER_REGION
+    let l3_base = (l2_idx as u64) << 21; // that block's base PA
+    let user_end = user_pa + USER_REGION_SIZE as u64;
+
+    unsafe {
+        // L3_USER: 512 × 4 KiB pages tiling [l3_base, l3_base + 2 MiB). Pages inside USER_REGION are
+        // EL0-accessible; every other page stays EL1-only (identical to the old 1 GiB RAM block).
+        // ALL user pages start as data pages (EL0+EL1 RW, XN) — the CODE page must be EL1-writable
+        // for the blob copy; `protect_user_code` flips it to EL0-RX/EL1-RO afterwards.
+        let l3 = &raw mut L3_USER as *mut u64;
+        for j in 0..512 {
+            let pa = l3_base | ((j as u64) << 12);
+            let desc =
+                if pa >= user_pa && pa < user_end { user_data_page(pa) } else { ram_page(pa) };
+            l3.add(j).write_volatile(desc);
+        }
+        // L2_USER: 512 × 2 MiB blocks tiling [0, 1 GiB). Block `l2_idx` points at L3_USER; the other
+        // 511 are plain RAM blocks (same attributes as the old 1 GiB block, just at 2 MiB).
+        let l2 = &raw mut L2_USER as *mut u64;
+        for i in 0..512 {
+            let desc = if i == l2_idx {
+                table_desc(&raw const L3_USER as u64)
+            } else {
+                ram_block((i as u64) << 21)
+            };
+            l2.add(i).write_volatile(desc);
+        }
+        // L1: [0] → L2_USER (0–1 GiB, now paged for the EL0 window); [1],[2] plain 1 GiB RAM; [3] the
+        // Device peripheral window. (Was: L1[0] a 1 GiB RAM block.)
+        let l1 = &raw mut L1 as *mut u64;
+        l1.add(0).write_volatile(table_desc(&raw const L2_USER as u64));
+        l1.add(1).write_volatile(ram_block(0x4000_0000));
+        l1.add(2).write_volatile(ram_block(0x8000_0000));
+        l1.add(3).write_volatile(device_block(0xC000_0000));
+    }
+}
+
+/// Point this core's TTBR0_EL1 at the (already-built) L1 table and turn the MMU + caches on. Run on
+/// EACH core with its MMU still off, AFTER `drop_to_el1` has put it at EL1 — the BSP after `build_l1`,
+/// every secondary after the spin-table release (`arch::aarch64::smp`). System-register moves only;
+/// no atomics/locks (the very thing the MMU is being enabled to make sound). The table is shared, so
+/// no per-core state here.
+pub unsafe fn enable_mmu() {
+    let ttbr0 = &raw const L1 as u64;
+    unsafe {
+        core::arch::asm!(
+            "msr MAIR_EL1, {mair}",
+            "msr TCR_EL1,  {tcr}",
+            "msr TTBR0_EL1, {ttbr}",
+            "msr TTBR1_EL1, xzr", // high half unused (EPD1=1 disables its walk); zero it defensively
+            "tlbi vmalle1",       // drop any stale EL1&0 TLB entries before translation is enabled
+            "dsb sy",
+            "isb",
+            // Enable MMU (M=bit0), data cache (C=bit2), instruction cache (I=bit12) via an ABSOLUTE
+            // SCTLR_EL1 write (SCTLR_EL1 resets UNKNOWN, so no RMW — SCTLR_EL1_VAL carries the A72
+            // RES1 bits). See the const's comment.
+            "msr SCTLR_EL1, {sctlr}",
+            "isb",
+            mair = in(reg) MAIR_VAL,
+            tcr = in(reg) TCR_EL1_VAL,
+            ttbr = in(reg) ttbr0,
+            sctlr = in(reg) SCTLR_EL1_VAL,
+            options(nostack, preserves_flags),
+        );
+    }
+}
+
+/// M6b: flip the user CODE pages [va, va + len) from their build_l1 state (EL0+EL1 RW, XN — so the
+/// blob could be copied in) to their final EL0-RX / EL1-RO shape (`user_code_page`), and make the
+/// change visible to all four cores. This is the kernel's FIRST live page-table update. The
+/// descriptor rewrite is a permission-only change on a valid same-size leaf (same output address,
+/// attributes, shareability), which DDI0487 (D8.16 "break-before-make") exempts from BBM — a
+/// concurrent walk may transiently use either permission set, harmless because no EL0 task exists
+/// yet (the caller protects strictly before the first `spawn_user`). The maintenance sequence is
+/// the canonical set_pte one (DDI0487 D8.13/D8.14; the walker reads descriptors cache-coherently
+/// under TCR IRGN0/ORGN0=WB, so no DC CVAC is needed):
+///   dsb ishst              descriptor stores visible to every Inner-Shareable table walker
+///   tlbi vaae1is (per pg)  broadcast-invalidate the VA for ALL ASIDs (entries are global, nG=0);
+///                          Xt = VA[55:12] in bits [43:0], upper bits RES0 on Armv8.0 (no FEAT_TTL)
+///   dsb ish                the invalidate has completed on every core in the domain
+///   isb                    this core refetches translation state
+///
+/// Returns the AT-probe verdicts `(el0_read_ok, el1_write_denied)` taken through this core's
+/// post-TLBI translation state: `at s1e0r` must translate (AP=0b11 grants EL0 read) and `at s1e1w`
+/// must fault (PAR_EL1.F=1 — the EL1 write permission the blob copy used is now gone). The calling
+/// BSP is the one core that deterministically walked these pages pre-flip (the copy), so a stale RW
+/// TLB entry here is exactly what a broken TLBI leaves. AT is architecturally allowed to re-walk
+/// instead of consulting the TLB, so a good probe is best-effort evidence — the demo's TLB-warmed
+/// test core is the deterministic detector; a bad probe is always a loud, real failure.
+pub unsafe fn protect_user_code(va: u64, len: usize) -> (bool, bool) {
+    let user_pa = &raw const USER_REGION as u64;
+    debug_assert!(va & 0xFFF == 0, "protect_user_code: unaligned va");
+    debug_assert!(
+        va >= user_pa && va + len as u64 <= user_pa + USER_REGION_SIZE as u64,
+        "protect_user_code: range outside USER_REGION"
+    );
+    unsafe {
+        let l3 = &raw mut L3_USER as *mut u64;
+        let mut page = va;
+        while page < va + len as u64 {
+            l3.add(((page >> 12) & 0x1FF) as usize).write_volatile(user_code_page(page));
+            page += 0x1000;
+        }
+        core::arch::asm!("dsb ishst", options(nostack, preserves_flags));
+        let mut page = va;
+        while page < va + len as u64 {
+            core::arch::asm!("tlbi vaae1is, {}", in(reg) (page >> 12), options(nostack, preserves_flags));
+            page += 0x1000;
+        }
+        core::arch::asm!("dsb ish", "isb", options(nostack, preserves_flags));
+
+        // PAR_EL1 is per-core state clobbered by any AT instruction; the BSP runs this with IRQs
+        // live (250 Hz on metal), so mask across each at->mrs pair rather than resting the probe
+        // on a "no interrupt path ever executes AT" invariant nobody enforces.
+        let (par_r, par_w, daif): (u64, u64, u64);
+        core::arch::asm!(
+            "mrs {daif}, DAIF",
+            "msr DAIFSet, #2",
+            "at s1e0r, {va}",
+            "isb",
+            "mrs {par_r}, PAR_EL1",
+            "at s1e1w, {va}",
+            "isb",
+            "mrs {par_w}, PAR_EL1",
+            "msr DAIF, {daif}",
+            va = in(reg) va,
+            par_r = out(reg) par_r,
+            par_w = out(reg) par_w,
+            daif = out(reg) daif,
+            options(nostack, preserves_flags),
+        );
+        ((par_r & 1) == 0, (par_w & 1) == 1)
+    }
+}
+
+// --- EL2 -> EL1 drop. Every core is handed off at EL2; a normal OS runs at EL1, so we drop each core
+// before it enables its MMU. MUST be naked asm: an ordinary Rust fn's prologue/epilogue would spill/
+// reload x30 and adjust SP around the `eret`, and the eret skips the epilogue — corrupting the frame.
+// Runs at EL2, MMU OFF, no stack traffic, x30 untouched; `eret`s back to the caller now at EL1 (same
+// SP/frame — the standard "return to x30" drop trick). ---
+core::arch::global_asm!(
+    r#"
+    .globl drop_to_el1
+drop_to_el1:
+    // MPIDR_EL1/MIDR_EL1 read at EL1 return VMPIDR_EL2/VPIDR_EL2 — seed them with the real values so
+    // the SMP core-id read (smp.rs) stays correct at EL1.
+    mrs   x0, mpidr_el1
+    msr   vmpidr_el2, x0
+    mrs   x0, midr_el1
+    msr   vpidr_el2, x0
+    // CPTR_EL2 = 0x33FF: clear TFP (bit 10) so EL1/EL0 FP/SIMD does NOT trap to EL2 (the kernel is
+    // +neon; the GUI blits NEON, memcpy/fmt autovectorize). CPTR_EL2.TFP takes precedence over
+    // CPACR_EL1.FPEN and resets UNKNOWN, so this must be explicit; 0x33FF keeps the non-VHE RES1 bits
+    // set (do NOT 'msr cptr_el2, xzr').
+    mov   x0, #0x33ff
+    msr   cptr_el2, x0
+    // MDCR_EL2 = 0: don't route EL1 debug/PMU exceptions to the (now abandoned) EL2 vectors.
+    msr   mdcr_el2, xzr
+    // CNTHCTL_EL2 EL1PCTEN+EL1PCEN=1: let EL1 read CNTPCT / use CNTP_* without trapping to EL2
+    // (timer.rs touches these every tick). CNTVOFF_EL2=0 so CNTVCT shares the physical timebase.
+    mrs   x0, cnthctl_el2
+    orr   x0, x0, #0x3
+    msr   cnthctl_el2, x0
+    msr   cntvoff_el2, xzr
+    // CPACR_EL1.FPEN=0b11 (bits [21:20]): the EL1-side FP/SIMD enable.
+    mov   x0, #(0b11 << 20)
+    msr   cpacr_el1, x0
+    // HCR_EL2 = RW only (bit 31): EL1 executes AArch64; IMO/FMO/AMO cleared so a physical IRQ taken at
+    // EL1 targets EL1 natively (no EL2 routing). Bare write (HCR_EL2 resets 0 on A72), not an RMW.
+    mov   x0, #(1 << 31)
+    msr   hcr_el2, x0
+    // Land at EL1h (SPx = SP_EL1) with DAIF masked; SP_EL1 = current SP so the stack is continuous;
+    // ELR_EL2 = the return address (x30), so the eret returns to our caller now running at EL1.
+    mov   x0, sp
+    msr   sp_el1, x0
+    mov   x0, #0x3c5
+    msr   spsr_el2, x0
+    msr   elr_el2, x30
+    isb
+    eret
+"#
+);
+
+unsafe extern "C" {
+    /// Drop this core EL2 -> EL1 and return to the caller now executing at EL1. Call at EL2 with the
+    /// MMU OFF, before `enable_mmu`. See the naked asm above for the full sequence and rationale.
+    pub fn drop_to_el1();
+}
+
+// --- BootInfo for the bare-metal path (no UEFI to provide one). ---
+
+/// A usable RAM region for the kernel heap. Placed at 32 MiB, 64 MiB long (≥ the 48 MiB HEAP_SIZE),
+/// which clears the kernel image + stack (at 0x80000, a few MiB) and the firmware/DTB structures in
+/// low memory. The Pi 4 has ≥ 1 GiB, so this is always backed.
+static mut MEM_REGIONS: [MemoryRegion; 1] = [MemoryRegion {
+    phys_start: 0x0200_0000,
+    page_count: 0x4000, // 64 MiB / 4 KiB
+    kind: MemoryRegionKind::Usable,
+}];
+
+static mut BOOT_INFO: BootInfo = BootInfo {
+    framebuffer_addr: 0,
+    framebuffer_size: 0,
+    framebuffer_info: FrameBufferInfo {
+        width: 0,
+        height: 0,
+        stride: 0,
+        bytes_per_pixel: 4,
+        pixel_format: PixelFormat::Unknown,
+    },
+    physical_memory_offset: 0,
+    dtb_addr: 0,
+    dtb_size: 0,
+    rsdp_addr: 0,
+    memory_regions_addr: 0,
+    memory_regions_len: 0,
+    edid_native_width: 0,
+    edid_native_height: 0,
+    edid_source: 0,
+    mode_action: 0,
+};
+
+/// Synthesize the BootInfo the kernel expects. `dtb_addr` carries the pointer the GPU ROM passed in
+/// x0. Phase 2 asks the VideoCore GPU for a framebuffer over the mailbox and, on success, fills the
+/// framebuffer fields so `kernel_main` brings up the full GUI on HDMI; if the mailbox call fails the
+/// fields stay 0 and the kernel falls back to the serial-only console (Phase 1 behaviour).
+pub fn build_boot_info(dtb: u64) -> &'static mut BootInfo {
+    unsafe {
+        let regions = &raw const MEM_REGIONS as u64;
+        let bi = &raw mut BOOT_INFO;
+        (*bi).dtb_addr = dtb;
+        (*bi).memory_regions_addr = regions;
+        (*bi).memory_regions_len = 1;
+
+        // VideoCore mailbox framebuffer. Safe to call here: mmu_init() has run, so the mailbox MMIO
+        // (Device-mapped at 0xFE00B880) and the cache maintenance the driver does both work. Serial
+        // is up (PL011), so the driver's diagnostics reach the Debug Probe even though fbcon — which
+        // it's about to make possible — isn't online yet.
+        if let Some(fb) = super::mailbox::init_framebuffer() {
+            (*bi).framebuffer_addr = fb.base;
+            (*bi).framebuffer_size = fb.size;
+            (*bi).framebuffer_info = fb.info;
+        }
+        &mut *bi
+    }
+}

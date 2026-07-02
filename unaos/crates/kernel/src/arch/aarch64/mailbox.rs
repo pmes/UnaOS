@@ -1,0 +1,314 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 The Architect & Una
+//
+// BCM2711 VideoCore "mailbox" property-channel driver — the bare-metal Pi 4's framebuffer.
+//
+// Booting from the microSD slot (arch/aarch64/boot.rs) there is no UEFI, so there is no GOP to
+// hand us a framebuffer. Instead we ask the VideoCore GPU for one directly over its mailbox: a
+// pair of FIFO registers at peripheral offset 0xB880 through which the ARM posts a 16-byte-aligned
+// "property tag" buffer on channel 8 and the GPU fills in the reply in place. One request here
+// sets the display size/depth/pixel-order, allocates the framebuffer, and reads back its base
+// address + pitch; the result becomes the BootInfo framebuffer the normal video stack draws on.
+//
+// Two BCM-specific subtleties, both handled below:
+//   * Addresses across the mailbox are *VideoCore bus* addresses, not ARM physical. We post the
+//     buffer through the uncached bus alias (`| 0xC000_0000`) so the GPU reads coherent RAM, and
+//     mask the returned framebuffer base (`& 0x3FFF_FFFF`) back to an ARM physical address.
+//   * The CPU's data cache is not snooped by the GPU, so the request buffer is cleaned to RAM
+//     before posting and invalidated after the reply (arch::aarch64::cache). No-ops in QEMU.
+//
+// The GPU/DMA mutates the `MBOX` static behind the compiler's back, so every reply word is read
+// with `read_volatile` *after* `mbox_call` returns — never through a `&mut` held across the call,
+// which the optimiser could satisfy from a stale register.
+
+use unaos_boot_info::{FrameBufferInfo, PixelFormat};
+
+use super::cache;
+
+// --- MMIO: peripheral base + mailbox registers (Pi 4 low-peripheral mode). ---
+// 0xFE00_0000 is the BCM2711 peripheral base; the mailbox sits at +0xB880. These all land in the
+// Device-mapped 0xC000_0000–0xFFFF_FFFF window of the boot page table, so reads/writes are
+// strongly ordered (no caching) as MMIO requires.
+const PERI_BASE: usize = 0xFE00_0000;
+const MBOX_BASE: usize = PERI_BASE + 0xB880;
+const MBOX_READ: usize = MBOX_BASE + 0x00;
+const MBOX_STATUS: usize = MBOX_BASE + 0x18;
+const MBOX_WRITE: usize = MBOX_BASE + 0x20;
+
+const MBOX_FULL: u32 = 0x8000_0000; // STATUS: write FIFO full  -> can't post
+const MBOX_EMPTY: u32 = 0x4000_0000; // STATUS: read FIFO empty -> nothing to read
+const MBOX_RESPONSE: u32 = 0x8000_0000; // request-code reply: success
+
+const CH_PROP: u32 = 8; // ARM -> VC property tags
+
+/// Uncached VideoCore bus alias. ARM physical RAM is visible to the GPU at `phys | 0xC000_0000`
+/// without going through the VC L2 — pairing it with a CPU cache-clean gives the GPU a coherent
+/// view of our request. (QEMU aliases all four GiB windows to RAM, so this also resolves there.)
+const BUS_UNCACHED: u32 = 0xC000_0000;
+/// Mask to convert a returned VC bus address back to an ARM physical address (strip the alias).
+const BUS_TO_PHYS: u32 = 0x3FFF_FFFF;
+
+// --- Property tags (RPi firmware mailbox interface). ---
+const TAG_GET_PHYS_WH: u32 = 0x0004_0003; // get current physical (display) width/height
+const TAG_SET_PHYS_WH: u32 = 0x0004_8003;
+const TAG_SET_VIRT_WH: u32 = 0x0004_8004;
+const TAG_SET_VIRT_OFFSET: u32 = 0x0004_8009;
+const TAG_SET_DEPTH: u32 = 0x0004_8005;
+const TAG_SET_PIXEL_ORDER: u32 = 0x0004_8006;
+const TAG_ALLOCATE_FB: u32 = 0x0004_0001;
+const TAG_GET_PITCH: u32 = 0x0004_0008;
+const TAG_END: u32 = 0x0000_0000;
+
+const PIXEL_ORDER_BGR: u32 = 0; // firmware: 0 = BGR, 1 = RGB. We request BGR to match the rest of
+                                // the stack's default (and the GOP path's observed Bgr); put_pixel
+                                // writes B,G,R for PixelFormat::Bgr, which is what the HVS then
+                                // scans out. If colours come out swapped on metal, flip both.
+const DEPTH_BITS: u32 = 32;
+const BYTES_PER_PIXEL: u32 = DEPTH_BITS / 8;
+
+/// Fallback display size if the firmware reports no current mode (it normally does — it sets HDMI
+/// to the monitor's preferred mode at boot). 1920×1080 is the safe ubiquitous HDMI mode.
+const FALLBACK_W: u32 = 1920;
+const FALLBACK_H: u32 = 1080;
+
+/// The property message buffer. One static buffer, used only during single-core boot
+/// (build_boot_info, before SMP/interrupts), so no locking is needed. The framebuffer message is
+/// 35 words; 48 words (192 bytes) rounds the allocation up to whole 64-byte cache lines so the
+/// clean/invalidate over it can't touch a neighbouring static's lines. **64-byte aligned** for the
+/// same reason — `DC IVAC/CIVAC` operate on whole lines, so a sub-line-aligned buffer would let a
+/// maintenance op clobber adjacent data; a line-aligned, line-padded buffer is self-contained. The
+/// mailbox ABI's own 16-byte alignment requirement is subsumed by this.
+#[repr(C, align(64))]
+struct MboxBuf {
+    words: [u32; 48],
+}
+static mut MBOX: MboxBuf = MboxBuf { words: [0; 48] };
+
+#[inline]
+fn mmio_read(addr: usize) -> u32 {
+    unsafe { core::ptr::read_volatile(addr as *const u32) }
+}
+#[inline]
+fn mmio_write(addr: usize, val: u32) {
+    unsafe { core::ptr::write_volatile(addr as *mut u32, val) }
+}
+
+/// Base address of the `MBOX` static as a `usize` (for cache ranges and the post address).
+#[inline]
+fn mbox_phys() -> usize {
+    &raw const MBOX as usize
+}
+/// Read reply word `idx` straight from RAM. Use only after `mbox_call`: the GPU wrote the reply
+/// and `mbox_call` invalidated our cached copy, so this volatile load re-fetches the fresh value.
+#[inline]
+fn reply(idx: usize) -> u32 {
+    unsafe { core::ptr::read_volatile(&raw const MBOX.words[idx]) }
+}
+/// Write request word `idx`. Volatile so the store is committed to memory before `mbox_call`'s
+/// cache-clean pushes it to the GPU (no reliance on the optimiser ordering plain stores).
+#[inline]
+fn request(idx: usize, val: u32) {
+    unsafe { core::ptr::write_volatile(&raw mut MBOX.words[idx], val) }
+}
+
+/// What `init_framebuffer` resolved: an ARM-physical framebuffer the video stack can draw on.
+pub struct FbAlloc {
+    pub base: u64,
+    pub size: usize,
+    pub info: FrameBufferInfo,
+}
+
+/// Generic-timer frequency (Hz), read from CNTFRQ_EL0. Available with no init at this single-core
+/// boot point; used only to size the mailbox timeout below.
+#[inline]
+fn cntfrq() -> u64 {
+    let v: u64;
+    unsafe { core::arch::asm!("mrs {}, CNTFRQ_EL0", out(reg) v, options(nomem, nostack, preserves_flags)) };
+    v
+}
+
+/// Post `MBOX.words[0..len]` to the property channel and wait for the reply in place. Returns
+/// whether the GPU reported success. `len` is the number of valid u32 words (word 0 = total byte
+/// size). Handles the cache maintenance and the bus-address conversion.
+///
+/// Every wait is bounded by a wall-clock deadline off the free-running CNTPCT: a real VideoCore
+/// always replies in microseconds, but if it never does (an unsupported/malformed tag the firmware
+/// silently drops, an HDMI/firmware quirk) an unbounded spin here would hang boot forever — and the
+/// serial-only fallback in main.rs (`framebuffer_addr == 0`) would be unreachable. On timeout we
+/// return false so init_framebuffer yields None and the kernel degrades to the serial console,
+/// mirroring the x86 xHCI wall-clock-deadline discipline. (QEMU always replies, so this never
+/// fires there.)
+fn mbox_call(len: usize) -> bool {
+    let buf_phys = mbox_phys() as u32;
+
+    // Clean our request out to RAM so the GPU (which doesn't snoop our cache) sees it.
+    cache::clean_range(mbox_phys(), len * 4);
+
+    // ~500 ms budget — generous vs the microseconds a real reply takes. CNTPCT is monotonic and
+    // won't wrap within any boot window, so a plain `>=` compare is sound.
+    let deadline = super::timer::cntpct() + cntfrq() / 2;
+    let timed_out = || super::timer::cntpct() >= deadline;
+
+    // Post: VC bus address of the buffer in the high 28 bits, channel in the low 4. Match Circle's
+    // BUS_ADDRESS exactly — strip any alias bits then OR the uncached alias — so a buffer that
+    // happened to sit above 1 GiB still resolves (it can't here; the kernel is in low RAM). The
+    // 64-byte alignment guarantees the low 4 bits are clear for the channel.
+    let msg = ((buf_phys & BUS_TO_PHYS) | BUS_UNCACHED) | CH_PROP;
+    while mmio_read(MBOX_STATUS) & MBOX_FULL != 0 {
+        if timed_out() {
+            serial_println!(":: MAILBOX: timeout waiting for write FIFO ::");
+            return false;
+        }
+        core::hint::spin_loop();
+    }
+    mmio_write(MBOX_WRITE, msg);
+
+    // Spin for *our* channel's reply (the property channel is the only one we use, but the FIFO is
+    // shared, so match the channel and discard anything else).
+    loop {
+        while mmio_read(MBOX_STATUS) & MBOX_EMPTY != 0 {
+            if timed_out() {
+                serial_println!(":: MAILBOX: timeout waiting for reply ::");
+                return false;
+            }
+            core::hint::spin_loop();
+        }
+        let resp = mmio_read(MBOX_READ);
+        if resp & 0xF == CH_PROP {
+            break;
+        }
+        if timed_out() {
+            serial_println!(":: MAILBOX: timeout (only other-channel replies) ::");
+            return false;
+        }
+    }
+
+    // The GPU wrote its reply straight to RAM; drop our stale cached copy before reading it back.
+    // Clean+invalidate (not bare invalidate) is the always-safe choice — if any line were still
+    // dirty it's written back rather than discarded over the GPU's reply.
+    cache::clean_invalidate_range(mbox_phys(), len * 4);
+    reply(1) == MBOX_RESPONSE
+}
+
+/// Ask the firmware for the current physical (display) resolution — the mode it auto-set from the
+/// monitor at boot. Returns `None` if the call fails or the size is implausible, so the caller
+/// falls back to a fixed mode.
+fn query_display_size() -> Option<(u32, u32)> {
+    request(0, 8 * 4); // total size (8 words used)
+    request(1, 0); // request
+    request(2, TAG_GET_PHYS_WH);
+    request(3, 8); // value buffer size
+    request(4, 0); // request code
+    request(5, 0); // width  (reply)
+    request(6, 0); // height (reply)
+    request(7, TAG_END);
+    if !mbox_call(8) {
+        return None;
+    }
+    let (width, height) = (reply(5), reply(6));
+    // Reject 0 (no mode) and absurd sizes; the back buffer must fit the 48 MiB heap.
+    if (640..=3840).contains(&width) && (480..=2160).contains(&height) {
+        Some((width, height))
+    } else {
+        None
+    }
+}
+
+/// Bring up the VideoCore framebuffer: pick a resolution (the firmware's current mode if sane,
+/// else 1920×1080), then set size/depth/pixel-order, allocate the buffer, and read back its base
+/// and pitch. Returns the ARM-physical framebuffer for BootInfo, or `None` on any failure (the
+/// caller then boots serial-only).
+pub fn init_framebuffer() -> Option<FbAlloc> {
+    let (width, height) = query_display_size().unwrap_or((FALLBACK_W, FALLBACK_H));
+
+    // A single message carrying every framebuffer tag. Layout per tag: id, value-buffer-size,
+    // request-code(0), value words… A local macro (not a closure) appends words so we can still
+    // read `i` between tags to capture the reply slots.
+    let mut i = 0usize;
+    macro_rules! put {
+        ($val:expr) => {{
+            request(i, $val);
+            i += 1;
+        }};
+    }
+    put!(0); // [0] total size, patched below
+    put!(0); // [1] request
+
+    put!(TAG_SET_PHYS_WH);
+    put!(8);
+    put!(0);
+    put!(width);
+    put!(height);
+
+    put!(TAG_SET_VIRT_WH);
+    put!(8);
+    put!(0);
+    put!(width);
+    put!(height);
+
+    put!(TAG_SET_VIRT_OFFSET);
+    put!(8);
+    put!(0);
+    put!(0); // x
+    put!(0); // y
+
+    put!(TAG_SET_DEPTH);
+    put!(4);
+    put!(0);
+    put!(DEPTH_BITS);
+
+    put!(TAG_SET_PIXEL_ORDER);
+    put!(4);
+    put!(0);
+    put!(PIXEL_ORDER_BGR);
+
+    put!(TAG_ALLOCATE_FB);
+    put!(8);
+    put!(0);
+    let alloc_base_idx = i; // reply: base then size land here
+    put!(4096); // alignment (reply overwrites with base)
+    put!(0); //          (reply overwrites with size)
+
+    put!(TAG_GET_PITCH);
+    put!(4);
+    put!(0);
+    let pitch_idx = i;
+    put!(0); // reply: pitch (bytes per line)
+
+    put!(TAG_END);
+
+    let total = i;
+    request(0, (total * 4) as u32);
+
+    if !mbox_call(total) {
+        serial_println!(":: MAILBOX: framebuffer allocate FAILED ::");
+        return None;
+    }
+
+    let fb_bus = reply(alloc_base_idx);
+    let fb_size = reply(alloc_base_idx + 1);
+    let pitch = reply(pitch_idx);
+    if fb_bus == 0 || fb_size == 0 || pitch == 0 {
+        serial_println!(
+            ":: MAILBOX: bad framebuffer reply (base={:#x} size={} pitch={}) ::",
+            fb_bus, fb_size, pitch
+        );
+        return None;
+    }
+
+    // The reply base is a VC bus address; mask the alias to get the ARM physical address.
+    let base = (fb_bus & BUS_TO_PHYS) as u64;
+    let stride_px = (pitch / BYTES_PER_PIXEL) as usize; // pitch is in bytes; stride in pixels
+    let info = FrameBufferInfo {
+        width: width as usize,
+        height: height as usize,
+        stride: stride_px,
+        bytes_per_pixel: BYTES_PER_PIXEL as usize,
+        pixel_format: PixelFormat::Bgr,
+    };
+    serial_println!(
+        ":: MAILBOX: framebuffer {}x{} pitch={}B stride={}px base={:#x} size={} ::",
+        width, height, pitch, stride_px, base, fb_size
+    );
+    Some(FbAlloc { base, size: fb_size as usize, info })
+}

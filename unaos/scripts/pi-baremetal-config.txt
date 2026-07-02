@@ -1,0 +1,16 @@
+# UnaOS bare-metal boot — Raspberry Pi 4 (BCM2711).
+# The GPU ROM loads kernel8.img directly from the microSD slot and jumps to it (no UEFI/EDK2, which
+# can't read the SD post-handoff). This is the native Pi boot path Linux/RPi-OS use.
+arm_64bit=1
+kernel=kernel8.img
+# Pin the flat-binary load address (matches pi-baremetal.ld); the firmware's built-in EL3->EL2 stub
+# then branches to 0x80000. (No `armstub=` line — that's the UEFI path.)
+kernel_address=0x80000
+# PL011 UART on GPIO14/15 at 115200 for the Debug Probe: enable it, move Bluetooth to the mini-UART
+# (frees the PL011 for the console), and have the 2nd-stage firmware log there too.
+enable_uart=1
+uart_2ndstage=1
+dtoverlay=miniuart-bt
+# Route peripheral interrupts through the GIC-400 (our driver targets GICD 0xFF841000 / GICC 0xFF842000).
+enable_gic=1
+disable_overscan=1

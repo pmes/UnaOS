@@ -20,6 +20,11 @@ bootlog = []
 # hardcodes, so don't touch that UART (it would be RAM on the Pi) — rely on fbcon for on-screen
 # output, like the Mac. Enable via `UNAOS_PI=1`.
 pi = []
+# Bare-metal Raspberry Pi 4 boot: build a flat `kernel8.img` the GPU ROM loads directly from the
+# microSD slot (no UEFI/EDK2 — which can't read the SD post-handoff). Swaps the UEFI `_start(boot_info)`
+# entry for a raw `_start` that sets up a stack, zeroes BSS, enables a minimal MMU (so atomics work),
+# builds a BootInfo, and calls kernel_main. Implies `pi`. Enable via `UNAOS_BAREMETAL=1`.
+baremetal = ["pi"]
 # Run the SMP scheduler demo/self-test at boot (spawns demo threads across the APs, incl. the RwLock
 # torn-read check). Opt-in via `UNAOS_SCHED_DEMO=1`: it's a QEMU-verified smoke test whose tick-based
 # timing stalls boot for minutes on real hardware (uncalibrated APIC timer). Off => scheduler still

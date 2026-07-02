@@ -1,0 +1,1600 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 The Architect & Una
+//
+// aarch64 preemptive kernel-thread scheduler — the ARM counterpart of arch/x86_64/sched.rs.
+//
+// It mirrors the proven x86 design (per-CPU run queues, a stack-swapping `switch_context`, an
+// initial frame that lands a fresh task in a trampoline) but is written fresh for aarch64 rather
+// than sharing the mature 1700-line x86 module — the only genuinely arch-specific pieces are the
+// context switch, the per-CPU access (TPIDR_EL2, via `percpu`), and the interrupt-state save
+// (DAIF instead of RFLAGS); the rest is small enough to keep parallel and leaves the x86 code
+// untouched.
+//
+//   * M3a — the COOPERATIVE core: a task runs until it `yield_now`s (round-robin) or returns
+//     (`exit`). No interrupt delivery needed, so it's fully exercisable in QEMU raspi4b (which
+//     withholds Group-1 IRQs on the `pi` build — same reason the timer poll-spins there).
+//   * M3b — PREEMPTION + the APs: each secondary enters its own `run()` loop; the per-core generic
+//     timer preempts the running task at quantum expiry (`timer_preempt`, from the IRQ handler
+//     AFTER EOI). Preemption from an interrupt requires the IRQ stub to now save ELR/SPSR
+//     (exceptions.rs) — those are per-core system registers, not a per-context stacked frame.
+//     Like the SGI IPIs, timer delivery is metal-only (QEMU won't deliver it), so on QEMU the APs
+//     run their demo tasks to completion sequentially and on the Pi they interleave (preemption).
+
+use alloc::boxed::Box;
+use alloc::collections::VecDeque;
+use alloc::sync::Arc;
+use core::cell::UnsafeCell;
+use core::marker::PhantomData;
+use core::ops::{Deref, DerefMut};
+use core::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, AtomicU8, Ordering};
+// spin's Mutex is the low-level SPINLOCK guarding the run queues / sleeper lists; alias it so this
+// module's own sleeping `Mutex<T>` (below) owns the bare name — same split as x86's sched.rs.
+use spin::Mutex as SpinMutex;
+
+use super::percpu::{self, NUM_CPUS};
+use super::timer;
+
+/// Per-thread kernel stack. 16 KiB matches the x86 scheduler.
+const TASK_STACK_SIZE: usize = 16 * 1024;
+
+/// Timer ticks a task runs before preemption (~4 ms/tick × 3 = 12 ms quantum).
+const QUANTUM_TICKS: u32 = 3;
+
+// Task lifecycle. A `u8` behind an atomic: the running task writes it (yield/exit/preempt) and the
+// scheduler reads it after the switch-back to decide requeue-vs-free.
+const STATE_READY: u8 = 0;
+const STATE_RUNNING: u8 = 1;
+const STATE_FINISHED: u8 = 2;
+/// Parked: off every run queue, waiting on the per-CPU sleeper list (`sleep_ticks`) until a
+/// deadline passes. The scheduler parks the Box per the blocking task's "park action" (below)
+/// instead of requeuing it, and re-readies it when the wake condition holds. Mirrors x86's
+/// STATE_BLOCKED; M4b extends it to semaphore wait queues.
+const STATE_BLOCKED: u8 = 3;
+
+// What the scheduler should do with a task that switched back in the BLOCKED state — set by the
+// blocking primitive (under IRQ-masked) just before it switches, read-and-cleared by the scheduler
+// after the switch (same CPU, sequential; `switch_context` is the memory barrier between them).
+const PARK_NONE: u8 = 0;
+const PARK_WAITQ: u8 = 1; // hand the Box to a wait queue, then release that queue's lock (M4b+)
+const PARK_SLEEP: u8 = 2; // push the Box onto this CPU's sleeper list with a wake deadline
+
+/// Pre-reserved waiter capacity per `Semaphore`. The scheduler pushes a blocked task's Box into the
+/// waiter list WHILE holding the semaphore's spinlock (the lock-handoff); a reallocating push there
+/// would take the heap lock UNDER the semaphore lock. So the list is pre-reserved (`Semaphore::init`)
+/// and `wait()` asserts it never exceeds this, making the park-side push provably allocation-free.
+const WAIT_CAPACITY: usize = 32;
+
+/// Initial DAIF planted in a fresh task's frame: IRQ masked (I bit). The task starts masked so the
+/// switch-in is atomic; `task_trampoline` unmasks before running the body (so the timer can preempt
+/// it). Matches x86's INITIAL_RFLAGS-with-IF=0.
+const INITIAL_DAIF: u64 = 1 << 7;
+
+/// Turns preemption on. Gated so the BSP's cooperative demo (which runs BEFORE this is set) is
+/// provably un-preempted, matching x86's SCHED_ACTIVE. `timer_preempt` no-ops until it's true.
+static SCHED_ACTIVE: AtomicBool = AtomicBool::new(false);
+/// Releases the APs from their wait loop into `run()`. Set once the AP run queues are populated.
+static SCHED_GO: AtomicBool = AtomicBool::new(false);
+
+/// Monotonic task-id source.
+static NEXT_TID: AtomicU64 = AtomicU64::new(1);
+
+/// A kernel thread. Owned as `Box<Task>`: it lives in exactly one place — a run queue, or "running"
+/// (the Box leaked to a raw pointer in `SchedCpu::current`).
+pub struct Task {
+    #[allow(dead_code)] // read by the future `sched`/`ps` command + join handles
+    id: u64,
+    name: &'static str, // read by `current_name` (the M6b EL0 fault-kill log)
+    /// `STATE_*`, written by the owning CPU only.
+    state: AtomicU8,
+    /// Saved stack pointer — the whole callee-saved context `switch_context` built lives on the stack.
+    ctx_sp: u64,
+    /// Owns the stack memory; freed when the Box is dropped on the Finished path.
+    #[allow(dead_code)]
+    stack: Box<[u8]>,
+    entry: fn(usize),
+    arg: usize,
+    /// Logical CPU this task is pinned to. Tasks never migrate, so a woken task always returns to
+    /// this core's run queue — which keeps its TPIDR_EL2 (per-CPU) view correct on resume, exactly
+    /// as x86 relies on the GS base staying put. Read by `make_ready` when re-readying a woken task.
+    cpu: u32,
+    /// Completion signal for `join()`, or `None` for a fire-and-forget task. A joinable task carries
+    /// a clone of the same `Arc<Semaphore>` (0 permits) held by its `JoinHandle`; the trampoline
+    /// `post()`s it after `entry` returns. The Arc — not a `'static` lifetime — keeps the semaphore
+    /// alive across the park/post window (see `JoinHandle`). Read (never moved) by the trampoline
+    /// through the raw `current` pointer; dropped when the scheduler drops the Box on the Finished path.
+    done_sem: Option<Arc<Semaphore>>,
+    /// EL0 user-mode entry point + initial SP_EL0 (M6a). Non-zero only for `is_user` tasks made via
+    /// `spawn_user`: such a task's initial frame lands in `user_task_trampoline`, which `eret`s to EL0
+    /// at `user_entry` with SP_EL0 = `user_sp`. 0 / unused for ordinary kernel tasks.
+    user_entry: u64,
+    user_sp: u64,
+}
+
+/// One CPU's scheduler bookkeeping (interior-mutable atomics, so the array is a plain static).
+struct SchedCpu {
+    /// Saved SP of this CPU's scheduler/idle context — written by the first `switch_context` INTO a
+    /// task (the save side), read to switch back. Write-before-read, so the initial 0 is never loaded.
+    scheduler_sp: AtomicU64,
+    /// Raw `*mut Task` currently running here, or 0. Owned by the scheduler loop.
+    current: AtomicU64,
+    /// Timer ticks left in the running task's quantum (set on dispatch, counted down in `timer_preempt`).
+    quantum: AtomicU32,
+    /// "Park action" for a task switching back BLOCKED: `PARK_*`. Set by the blocking primitive
+    /// before its switch, read-and-cleared by the scheduler after. Same-CPU sequential, so `Relaxed`
+    /// suffices (`switch_context` is the barrier between the writer and the reader).
+    park_kind: AtomicU8,
+    /// PARK_SLEEP: the wake deadline, in THIS CPU's local timer ticks (`percpu.ticks`).
+    park_deadline: AtomicU64,
+    /// PARK_WAITQ: the wait queue's `*mut VecDeque<Box<Task>>` (the scheduler pushes the Box here).
+    park_waiters: AtomicU64,
+    /// PARK_WAITQ: the wait queue's `*const AtomicBool` lock (the scheduler releases it AFTER the
+    /// push — the lock-handoff that makes the wakeup lost-proof).
+    park_lock: AtomicU64,
+}
+
+impl SchedCpu {
+    const fn new() -> Self {
+        SchedCpu {
+            scheduler_sp: AtomicU64::new(0),
+            current: AtomicU64::new(0),
+            quantum: AtomicU32::new(0),
+            park_kind: AtomicU8::new(PARK_NONE),
+            park_deadline: AtomicU64::new(0),
+            park_waiters: AtomicU64::new(0),
+            park_lock: AtomicU64::new(0),
+        }
+    }
+}
+
+static SCHED: [SchedCpu; NUM_CPUS] = [const { SchedCpu::new() }; NUM_CPUS];
+
+/// Per-CPU ready queues. `VecDeque::new` is const, so no lazy_static; a `push` may allocate, but
+/// only at `spawn` (never under the switch), so the brief lock is realloc-free in the hot path.
+static RUN_QUEUES: [SpinMutex<VecDeque<Box<Task>>>; NUM_CPUS] =
+    [const { SpinMutex::new(VecDeque::new()) }; NUM_CPUS];
+
+/// Per-CPU sleeper lists: tasks blocked in `sleep_ticks`, tagged with their wake deadline (this
+/// CPU's `percpu.ticks`). Touched ONLY by the scheduler on the OWNING CPU (parked there on the
+/// switch-back, drained at the loop top), so the lock is always uncontended — it exists solely to
+/// make the field interior-mutable, not for cross-CPU synchronisation. Being single-CPU, a
+/// `push_back` that reallocates only ever nests the (innermost) heap lock, never another sched lock.
+static SLEEPERS: [SpinMutex<VecDeque<Sleeper>>; NUM_CPUS] =
+    [const { SpinMutex::new(VecDeque::new()) }; NUM_CPUS];
+
+/// A parked sleeper: its wake deadline (owning CPU's `percpu.ticks`) and the task it belongs to.
+struct Sleeper {
+    deadline: u64,
+    task: Box<Task>,
+}
+
+// --- Interrupt-state helpers (the scheduler's critical sections run with IRQ masked). ---
+#[inline]
+fn mask_irq() {
+    unsafe { core::arch::asm!("msr daifset, #2", options(nomem, nostack, preserves_flags)) };
+}
+#[inline]
+fn unmask_irq() {
+    unsafe { core::arch::asm!("msr daifclr, #2", options(nomem, nostack, preserves_flags)) };
+}
+/// Snapshot DAIF then mask IRQ. The blocking primitives (`Semaphore`, and from M4d the `Condvar`
+/// that releases a mutex mid-critical-section) restore the SNAPSHOT rather than unconditionally
+/// unmasking, so they nest correctly: a `post()` invoked with IRQ already masked leaves it masked.
+/// (`yield_now`/`exit`/`sleep_ticks` are only ever entered from an unmasked task body, so they use
+/// the simpler unconditional mask/unmask.)
+#[inline]
+fn irq_save_mask() -> u64 {
+    let daif: u64;
+    unsafe {
+        core::arch::asm!("mrs {}, daif", out(reg) daif, options(nomem, nostack, preserves_flags));
+        core::arch::asm!("msr daifset, #2", options(nomem, nostack, preserves_flags));
+    }
+    daif
+}
+#[inline]
+fn irq_restore(daif: u64) {
+    unsafe { core::arch::asm!("msr daif, {}", in(reg) daif, options(nomem, nostack, preserves_flags)) };
+}
+
+// `switch_context(old_sp: *mut u64, new_sp: u64)` — AAPCS64: x0 = old_sp, x1 = new_sp. Saves DAIF +
+// the callee-saved registers (x19-x30 and d8-d15) of the current context onto the current stack,
+// stores the resulting SP through `old_sp`, loads `new_sp`, restores that context's registers +
+// DAIF, and `ret`s into it (x30 = the restored return address). Caller-saved registers need no
+// saving — this is a normal C-ABI call, so the compiler already treats them as clobbered — but the
+// AAPCS64 CALLEE-saved FP lanes d8-d15 must be preserved here, or a cooperative task holding a live
+// float across `yield_now` would resume with it clobbered by the task it yielded to (the preemptive
+// path additionally saves the FULL v0-v31 in the IRQ stub, since an async interrupt can catch any
+// v-register live). 176-byte frame (12 GPRs + DAIF + pad + 8 doubles), 16-aligned:
+//   [+0..88] x19..x30  [+96] DAIF  [+104] pad  [+112..168] d8..d15
+core::arch::global_asm!(
+    "
+    .globl switch_context
+    switch_context:
+        mrs   x9, daif
+        sub   sp, sp, #176
+        stp   x19, x20, [sp, #0]
+        stp   x21, x22, [sp, #16]
+        stp   x23, x24, [sp, #32]
+        stp   x25, x26, [sp, #48]
+        stp   x27, x28, [sp, #64]
+        stp   x29, x30, [sp, #80]
+        str   x9, [sp, #96]
+        stp   d8,  d9,  [sp, #112]
+        stp   d10, d11, [sp, #128]
+        stp   d12, d13, [sp, #144]
+        stp   d14, d15, [sp, #160]
+        mov   x9, sp
+        str   x9, [x0]
+        mov   sp, x1
+        ldr   x9, [sp, #96]
+        msr   daif, x9
+        ldp   x19, x20, [sp, #0]
+        ldp   x21, x22, [sp, #16]
+        ldp   x23, x24, [sp, #32]
+        ldp   x25, x26, [sp, #48]
+        ldp   x27, x28, [sp, #64]
+        ldp   x29, x30, [sp, #80]
+        ldp   d8,  d9,  [sp, #112]
+        ldp   d10, d11, [sp, #128]
+        ldp   d12, d13, [sp, #144]
+        ldp   d14, d15, [sp, #160]
+        add   sp, sp, #176
+        ret
+    "
+);
+
+unsafe extern "C" {
+    fn switch_context(old_sp: *mut u64, new_sp: u64);
+}
+
+/// First code every kernel thread runs, reached when `switch_context` `ret`s into a freshly-built
+/// frame. Unmasks IRQ (the fresh frame started masked), runs the task body, then exits.
+extern "C" fn task_trampoline() -> ! {
+    unmask_irq();
+    let cpu = percpu::this_cpu().cpu_index as usize;
+    let raw = SCHED[cpu].current.load(Ordering::Acquire) as *const Task;
+    debug_assert!(!raw.is_null(), "task_trampoline: current is null");
+    let (entry, arg) = unsafe { ((*raw).entry, (*raw).arg) };
+    entry(arg);
+    // Signal completion to any joiner. `post()` cross-core-wakes a parked joiner if there is one.
+    // BORROW `done_sem` (never move it): the Box's own Arc clone is this `post()`'s liveness anchor
+    // and must remain in the Box until the scheduler drops it on the Finished path — strictly AFTER
+    // this post (exit() switches away; the scheduler then reclaims and drops the Box).
+    unsafe {
+        if let Some(sem) = &(*raw).done_sem {
+            sem.post();
+        }
+    }
+    exit();
+}
+
+/// Placeholder `entry` for user tasks: `spawn_user` sets `Task.entry` to this, but `user_task_trampoline`
+/// never calls it (it `eret`s to EL0 instead). Panics loudly if a path ever reaches it.
+fn user_never(_: usize) {
+    unreachable!("user task's kernel `entry` was called");
+}
+
+/// First code an EL0 (user) task runs at EL1, reached when `switch_context` `ret`s into its freshly
+/// built frame (with I MASKED, from INITIAL_DAIF). Unlike `task_trampoline`, it does NOT unmask: EL0
+/// must stay non-preemptible for M6a because `__vec_irq` does not yet bank SP_EL0, so a timer preempt
+/// of EL0 would lose the user stack pointer. It reads the task's EL0 entry/SP, then drops to EL0.
+///
+/// The current SP_EL1 (this task's Box kernel stack) is retained across the `eret` to EL0 and becomes
+/// the stack the later `svc` re-entry (`__vec_svc`) runs on, so the 16 KiB Box must have headroom for
+/// the SVC frame (256 GPR + 528 FP + 32 banked + the Rust handler) — it does; this trampoline uses only
+/// a shallow prologue. The msr+eret are one `noreturn` asm block so nothing runs after the drop.
+extern "C" fn user_task_trampoline() -> ! {
+    let cpu = percpu::this_cpu().cpu_index as usize;
+    let raw = SCHED[cpu].current.load(Ordering::Acquire) as *const Task;
+    debug_assert!(!raw.is_null(), "user_task_trampoline: current is null");
+    let (entry, sp) = unsafe { ((*raw).user_entry, (*raw).user_sp) };
+    // SPSR_EL1 = 0x2C0: M[3:0]=0b0000 (EL0t — a dedicated SP_EL0; EL0h/0b0001 is an illegal return from
+    // EL1 -> PSTATE.IL), M[4]=0 (AArch64), DAIF = D,I,F masked with A (SError) CLEAR — matching the
+    // kernel's baremetal SError policy so an EL0-provoked external abort is delivered promptly at the
+    // Lower-EL SError vector rather than held pending into kernel context. I masked => EL0 is
+    // non-preemptible for M6a.
+    unsafe {
+        core::arch::asm!(
+            "msr SP_EL0, {sp}",
+            "msr ELR_EL1, {entry}",
+            "msr SPSR_EL1, {spsr}",
+            "isb",
+            "eret",
+            sp = in(reg) sp,
+            entry = in(reg) entry,
+            spsr = in(reg) 0x2C0u64,
+            options(noreturn, nostack),
+        );
+    }
+}
+
+/// Build a fresh task's initial stack frame so the first `switch_context` into it lands in
+/// `trampoline` (`task_trampoline` for kernel threads, `user_task_trampoline` for EL0 tasks). Returns
+/// the value to store in `ctx_sp`. The 176-byte frame (matching `switch_context`) sits below a
+/// 16-aligned top; x30's slot holds the trampoline, DAIF's slot holds IRQ-masked, the rest (x19-x29,
+/// pad, d8-d15) zero.
+fn build_initial_frame(stack: &mut [u8], trampoline: extern "C" fn() -> !) -> u64 {
+    let base = stack.as_mut_ptr() as usize;
+    let top = (base + stack.len()) & !0xF;
+    let sp = top - 176;
+    unsafe {
+        let p = sp as *mut u64;
+        for i in 0..22 {
+            p.add(i).write(0); // x19..x29, pad, d8..d15
+        }
+        p.add(11).write(trampoline as usize as u64); // x30 (lr) slot -> ret lands in the trampoline
+        p.add(12).write(INITIAL_DAIF); // DAIF slot (offset 96)
+    }
+    sp as u64
+}
+
+/// Shared spawn path: build a kernel thread on `cpu`'s run queue (optionally carrying a `done_sem`
+/// completion signal for `join`), enqueue it, and poke that CPU. Returns the new task's id.
+fn spawn_inner(
+    name: &'static str,
+    entry: fn(usize),
+    arg: usize,
+    cpu: usize,
+    done_sem: Option<Arc<Semaphore>>,
+) -> u64 {
+    assert!(cpu < NUM_CPUS, "spawn: cpu out of range");
+    let mut stack: Box<[u8]> = alloc::vec![0u8; TASK_STACK_SIZE].into_boxed_slice();
+    let ctx_sp = build_initial_frame(&mut stack, task_trampoline);
+    let id = NEXT_TID.fetch_add(1, Ordering::Relaxed);
+    let task = Box::new(Task {
+        id,
+        name,
+        state: AtomicU8::new(STATE_READY),
+        ctx_sp,
+        stack,
+        entry,
+        arg,
+        cpu: cpu as u32,
+        done_sem,
+        user_entry: 0,
+        user_sp: 0,
+    });
+    RUN_QUEUES[cpu].lock().push_back(task);
+    // Wake the target if it's a different, possibly-idle core (same-core needs no poke).
+    poke_cpu(cpu);
+    id
+}
+
+/// Create a ready, fire-and-forget kernel thread on `cpu`'s run queue: it runs `entry(arg)` and is
+/// freed when `entry` returns, with no way to wait for it (use `spawn_joinable` for that). Returns
+/// the task id.
+pub fn spawn(name: &'static str, entry: fn(usize), arg: usize, cpu: usize) -> u64 {
+    spawn_inner(name, entry, arg, cpu, None)
+}
+
+/// Create a ready EL0 (user-mode) task on `cpu`'s run queue (M6a): when dispatched it drops to EL0 at
+/// `user_entry` with SP_EL0 = `user_sp` (both from `syscall::setup`) and calls back into the kernel via
+/// `svc`. MUST be spawned on a SCHEDULED core (an AP), never the unscheduled BSP — `user_task_trampoline`
+/// reads `SCHED[cpu].current`, which is null on a core that never runs the scheduler loop. Fire-and-
+/// forget: `sys_exit` marks it FINISHED and the scheduler reclaims it. Returns the task id.
+pub fn spawn_user(name: &'static str, user_entry: u64, user_sp: u64, cpu: usize) -> u64 {
+    assert!(cpu < NUM_CPUS, "spawn_user: cpu out of range");
+    let mut stack: Box<[u8]> = alloc::vec![0u8; TASK_STACK_SIZE].into_boxed_slice();
+    let ctx_sp = build_initial_frame(&mut stack, user_task_trampoline);
+    let id = NEXT_TID.fetch_add(1, Ordering::Relaxed);
+    let task = Box::new(Task {
+        id,
+        name,
+        state: AtomicU8::new(STATE_READY),
+        ctx_sp,
+        stack,
+        entry: user_never, // never called — the user trampoline erets to EL0 instead
+        arg: 0,
+        cpu: cpu as u32,
+        done_sem: None,
+        user_entry,
+        user_sp,
+    });
+    RUN_QUEUES[cpu].lock().push_back(task);
+    poke_cpu(cpu);
+    id
+}
+
+/// Like `spawn`, but returns a `JoinHandle` a scheduled task can `join()` to block until this task
+/// finishes. Allocates an `Arc<Semaphore>` (0 permits) shared between the new task and the handle;
+/// the task's trampoline posts it on completion. Costs one heap alloc + a reserved waiter list, so
+/// only pay it when you actually need to join.
+pub fn spawn_joinable(name: &'static str, entry: fn(usize), arg: usize, cpu: usize) -> JoinHandle {
+    let done = Arc::new(Semaphore::new(0));
+    done.init(); // reserve the waiter list BEFORE the task can run + post (alloc-free park)
+    let id = spawn_inner(name, entry, arg, cpu, Some(done.clone()));
+    JoinHandle { done, id }
+}
+
+/// A handle to wait for a `spawn_joinable` task to finish. Holds a clone of the task's completion
+/// `Arc<Semaphore>`; `join()` blocks until the task's trampoline posts it. Single-shot: `join`
+/// consumes the handle (one join per task), and the handle is intentionally NOT `Clone` (the
+/// completion semaphore carries exactly one permit — a second joiner would block forever).
+pub struct JoinHandle {
+    done: Arc<Semaphore>,
+    /// Id of the joined task, for diagnostics.
+    #[allow(dead_code)]
+    id: u64,
+}
+
+impl JoinHandle {
+    /// Id of the task this handle joins.
+    pub fn id(&self) -> u64 {
+        self.id
+    }
+
+    /// Block the current task until the joined task finishes. MUST be called from a scheduled task
+    /// (it blocks); the `assert` rejects a call off the scheduler (e.g. the unscheduled BSP) loudly
+    /// rather than silently returning as if the task had finished.
+    ///
+    /// No timeout: a joined task that PANICS or never returns leaves the joiner blocked forever (the
+    /// completion permit is posted only on a normal `entry` return; this no-`std` kernel has no
+    /// unwinding). This matches the kernel's panic-halts policy.
+    ///
+    /// `self` (the Arc clone) deliberately stays bound for the whole body: it is the refcount anchor
+    /// that keeps the completion semaphore alive while this task is parked in its waiter list. In
+    /// every window where a raw pointer to the semaphore internals is live (the parked joiner's
+    /// park_waiters/park_lock, or a waiter Box in the list), >= 1 Arc clone is provably held — the
+    /// parked joiner holds its handle on its frozen stack, and the posting task holds its `done_sem`
+    /// clone until the Box is dropped on the Finished path, strictly after the post. So the Arc
+    /// refcount substitutes for the `Semaphore`'s `'static` requirement: no UAF, no leak.
+    pub fn join(self) {
+        assert!(
+            self.done.wait(),
+            "JoinHandle::join() must be called from a scheduled task"
+        );
+    }
+}
+
+// Compile-time guard for the `Task` <-> `Arc<Semaphore>` Send cycle introduced by `done_sem`. No
+// `unsafe impl Send` is added: `Semaphore`'s Send auto-derives while every field is `Send`, and the
+// cycle resolves co-inductively. This probe locks that in — if a future field breaks it, fix that
+// field rather than papering over it with an `unsafe impl`.
+const _: () = {
+    const fn assert_send<T: Send>() {}
+    assert_send::<Task>();
+    assert_send::<Arc<Semaphore>>();
+    assert_send::<JoinHandle>();
+};
+
+/// Send the wake/reschedule SGI (IPI_RESCHED) to `target` so, if it is idle in WFI, it breaks out
+/// and its scheduler loop re-polls its run queue. Skips a self-poke. The IPI never context-switches
+/// — it just has to interrupt WFI; the target's `run()` picks the queued work up. On metal the SGI
+/// turns cross-core spawn/wake latency from "up to one timer tick" into ~immediate and is the ONLY
+/// wake source for a genuinely idle core; in QEMU raspi4b the SGI is not delivered, but the idle
+/// path there is a poll-spin (the timer isn't live), so `run()` still re-polls the queue and picks
+/// the task up — cross-core delivery is thus the QEMU-invisible half, validated on metal.
+fn poke_cpu(target: usize) {
+    let this = percpu::this_cpu().cpu_index as usize;
+    if target != this {
+        super::gic::send_sgi(target, super::smp::IPI_RESCHED);
+    }
+}
+
+/// Mark a parked/just-woken task READY, push it onto its PINNED CPU's run queue, and poke that CPU.
+/// Used by the sleeper drain (same CPU) and, from M4b, `Semaphore::post` (cross-CPU wake). The task
+/// always returns to `task.cpu`, so its per-CPU (TPIDR_EL2) view stays correct on resume — tasks do
+/// not migrate. Caller runs with IRQ masked.
+fn make_ready(task: Box<Task>) {
+    let target = task.cpu as usize;
+    debug_assert!(target < NUM_CPUS, "make_ready: cpu out of range");
+    task.state.store(STATE_READY, Ordering::Release);
+    RUN_QUEUES[target].lock().push_back(task);
+    poke_cpu(target);
+}
+
+/// Cooperatively give up the CPU: mark this task ready and switch back to the scheduler, which
+/// requeues us and runs the next task. We resume here (IRQ masked, carried by the switch) when
+/// re-dispatched. No-op if called outside a scheduled task.
+pub fn yield_now() {
+    let cpu = percpu::this_cpu().cpu_index as usize;
+    mask_irq();
+    let raw = SCHED[cpu].current.load(Ordering::Acquire) as *mut Task;
+    if !raw.is_null() {
+        unsafe {
+            (*raw).state.store(STATE_READY, Ordering::Release);
+            switch_context(
+                &raw mut (*raw).ctx_sp,
+                SCHED[cpu].scheduler_sp.load(Ordering::Acquire),
+            );
+        }
+    }
+    unmask_irq();
+}
+
+/// The name of the task currently dispatched on THIS core, or None outside a scheduled task (the
+/// scheduler/idle context, or the unscheduled BSP). Reads the same `current` slot the trampolines
+/// use; the `&'static str` stays valid even after the Box is reclaimed. Used by the M6b EL0
+/// fault-kill path to label its log line.
+pub fn current_name() -> Option<&'static str> {
+    let cpu = percpu::this_cpu().cpu_index as usize;
+    let raw = SCHED[cpu].current.load(Ordering::Acquire) as *const Task;
+    if raw.is_null() { None } else { Some(unsafe { (*raw).name }) }
+}
+
+/// Terminate the current task: mark it finished and switch to the scheduler for good (which frees
+/// its stack). Never returns; called automatically when a task's entry returns.
+pub fn exit() -> ! {
+    let cpu = percpu::this_cpu().cpu_index as usize;
+    mask_irq();
+    let raw = SCHED[cpu].current.load(Ordering::Acquire) as *mut Task;
+    assert!(!raw.is_null(), "exit: no current task");
+    unsafe {
+        (*raw).state.store(STATE_FINISHED, Ordering::Release);
+        // `old_sp` is a throwaway on the dying stack — the scheduler never reads it back and never
+        // switches into a finished task.
+        let mut discard: u64 = 0;
+        switch_context(&raw mut discard, SCHED[cpu].scheduler_sp.load(Ordering::Acquire));
+    }
+    unreachable!("scheduler resumed a finished task")
+}
+
+/// Block the current task for `n` of THIS CPU's local timer ticks, then become runnable again.
+/// Timer-driven with no waker, so it cannot lose a wakeup: the scheduler drains due sleepers at its
+/// loop top and the free-running periodic timer re-enters that loop every tick, so granularity and
+/// worst-case wake latency are one tick. `n == 0` wakes on the next scheduler pass. No-op outside a
+/// scheduled task (the unscheduled BSP / idle context), like `yield_now`.
+///
+/// METAL-ONLY WAKE (QEMU-invisible): the wake source is the per-CPU generic-timer tick, and QEMU
+/// raspi4b never delivers the timer IRQ (`percpu.ticks` stays frozen at 0 there), so a sleeper
+/// parked in QEMU never wakes. The *parking* machinery is exercised in QEMU; the *wake* is validated
+/// on the real Pi 4 (each core's timer is LIVE). Callers must not depend on it completing where
+/// `timer::is_live()` is false. Interrupts are masked across the state flip + switch (like
+/// `yield_now`) and unmasked on resume — task bodies always run with IRQ unmasked.
+pub fn sleep_ticks(n: u64) {
+    let cpu = percpu::this_cpu().cpu_index as usize;
+    mask_irq();
+    let raw = SCHED[cpu].current.load(Ordering::Acquire) as *mut Task;
+    if !raw.is_null() {
+        let deadline = percpu::this_cpu().ticks.load(Ordering::Relaxed) + n;
+        unsafe {
+            debug_assert_eq!((*raw).cpu as usize, cpu, "sleep_ticks: task on the wrong CPU");
+            (*raw).state.store(STATE_BLOCKED, Ordering::Release);
+            // Ask the scheduler to park us on this CPU's sleeper list with this deadline (consumed in
+            // `dispatch_next`'s switch-back via `park_blocked`).
+            SCHED[cpu].park_deadline.store(deadline, Ordering::Relaxed);
+            SCHED[cpu].park_kind.store(PARK_SLEEP, Ordering::Relaxed);
+            switch_context(
+                &raw mut (*raw).ctx_sp,
+                SCHED[cpu].scheduler_sp.load(Ordering::Acquire),
+            );
+        }
+        // Resumed (IRQ masked, carried by the switch) once the deadline passed and the scheduler
+        // re-dispatched us.
+    }
+    unmask_irq();
+}
+
+/// Preempt the running task at quantum expiry. Called from the timer IRQ path (`gic::handle_irq`,
+/// AFTER EOI) on the core that ticked. Counts the quantum down; when it runs out, marks the task
+/// ready and switches to the scheduler, which requeues it and runs the next task. We resume here
+/// (IRQ masked, carried) once re-dispatched, then unwind back through the IRQ stub — which restores
+/// this task's ELR/SPSR and `eret`s it. No-op unless a scheduled task is running on this core.
+pub fn timer_preempt() {
+    if !SCHED_ACTIVE.load(Ordering::Acquire) {
+        return;
+    }
+    let cpu = percpu::this_cpu().cpu_index as usize;
+    let raw = SCHED[cpu].current.load(Ordering::Acquire) as *mut Task;
+    if raw.is_null() {
+        return; // scheduler/idle context, or an unscheduled core (the BSP)
+    }
+    let remaining = SCHED[cpu].quantum.load(Ordering::Relaxed);
+    if remaining > 1 {
+        SCHED[cpu].quantum.store(remaining - 1, Ordering::Relaxed);
+        return;
+    }
+    SCHED[cpu].quantum.store(0, Ordering::Relaxed);
+    unsafe {
+        (*raw).state.store(STATE_READY, Ordering::Release);
+        switch_context(
+            &raw mut (*raw).ctx_sp,
+            SCHED[cpu].scheduler_sp.load(Ordering::Acquire),
+        );
+    }
+}
+
+/// Dispatch the front task of `cpu`'s queue: switch into it, and when it switches back (yield /
+/// preempt / exit) requeue it (READY) or free it (FINISHED). Returns whether a task ran. The caller
+/// runs on this CPU's scheduler stack. IRQ is masked across pop+switch (nothing may re-enter the
+/// scheduler on its own stack); on an empty queue IRQ is left UNMASKED for the caller to idle.
+fn dispatch_next(cpu: usize) -> bool {
+    mask_irq();
+    let Some(task) = RUN_QUEUES[cpu].lock().pop_front() else {
+        unmask_irq();
+        return false;
+    };
+    task.state.store(STATE_RUNNING, Ordering::Release);
+    SCHED[cpu].quantum.store(QUANTUM_TICKS, Ordering::Relaxed);
+    let raw = Box::into_raw(task);
+    let entry_sp = unsafe { (*raw).ctx_sp };
+    // Publish `current` (Release) strictly before switching in — the trampoline reads it Acquire.
+    SCHED[cpu].current.store(raw as u64, Ordering::Release);
+    unsafe {
+        switch_context(SCHED[cpu].scheduler_sp.as_ptr(), entry_sp);
+    }
+    // The switch-back always lands IRQ-masked (yield_now/exit mask first; timer_preempt runs in the
+    // auto-masked IRQ handler), so the Box reclaim below can't race a re-entrant preempt on this
+    // core. Re-assert the mask explicitly so that safety doesn't rest on an inherited DAIF that a
+    // future switch-in path could leave enabled.
+    mask_irq();
+    SCHED[cpu].current.store(0, Ordering::Release);
+    // Consume the park action exactly once: read it and immediately reset to NONE, so a stale action
+    // can never leak into the next task's switch-back. Only a task that switched back BLOCKED carries
+    // a meaningful action.
+    let park = SCHED[cpu].park_kind.swap(PARK_NONE, Ordering::Relaxed);
+    let task = unsafe { Box::from_raw(raw) };
+    match task.state.load(Ordering::Acquire) {
+        STATE_FINISHED => drop(task), // free the stack
+        STATE_BLOCKED => park_blocked(cpu, park, task), // sleeper list / (M4b) a wait queue
+        _ => {
+            // READY (yielded or preempted): rotate to the back of the run queue.
+            debug_assert_eq!(park, PARK_NONE, "non-blocked task carried a park action");
+            task.state.store(STATE_READY, Ordering::Release);
+            RUN_QUEUES[cpu].lock().push_back(task);
+        }
+    }
+    true
+}
+
+/// Park a task that switched back BLOCKED, per the action it set before switching. Runs in the
+/// scheduler context with IRQ masked and owns `task`.
+fn park_blocked(cpu: usize, park: u8, task: Box<Task>) {
+    match park {
+        PARK_WAITQ => {
+            // Lock-handoff: the blocking task acquired the wait queue's lock and held it ACROSS the
+            // switch; WE push its Box into the waiter list and THEN release that lock — strictly in
+            // that order. Releasing only AFTER the push is what makes the wakeup lost-proof: a
+            // `post()` on another core spins on the lock and so cannot observe the queue until the
+            // Box is in it. The waiter list is pre-reserved (see `Semaphore::wait`), so this
+            // `push_back` never reallocates and so never takes the heap lock under the held lock.
+            let waiters = SCHED[cpu].park_waiters.load(Ordering::Relaxed) as *mut VecDeque<Box<Task>>;
+            let lock = SCHED[cpu].park_lock.load(Ordering::Relaxed) as *const AtomicBool;
+            unsafe {
+                (*waiters).push_back(task);
+                (*lock).store(false, Ordering::Release); // release the handed-off lock, LAST
+            }
+        }
+        PARK_SLEEP => {
+            let deadline = SCHED[cpu].park_deadline.load(Ordering::Relaxed);
+            SLEEPERS[cpu].lock().push_back(Sleeper { deadline, task });
+        }
+        _ => {
+            // A BLOCKED task with no valid park action is a bug; don't leak it — drop it (frees the stack).
+            debug_assert!(false, "BLOCKED task with no park action");
+            drop(task);
+        }
+    }
+}
+
+/// Move every sleeper on this CPU whose deadline has passed back onto the run queue. Called at the
+/// scheduler loop top with IRQ masked. The sleeper lock is released before `make_ready` so its
+/// run-queue lock is never nested under the sleeper lock.
+fn drain_due_sleepers(cpu: usize) {
+    let now = percpu::this_cpu().ticks.load(Ordering::Relaxed);
+    loop {
+        let due = {
+            let mut sleepers = SLEEPERS[cpu].lock();
+            match sleepers.iter().position(|s| s.deadline <= now) {
+                Some(i) => sleepers.remove(i).map(|s| s.task),
+                None => None,
+            }
+        }; // sleeper lock dropped here
+        match due {
+            Some(task) => make_ready(task),
+            None => break,
+        }
+    }
+}
+
+/// Run `cpu`'s run queue to completion, cooperatively (the M3a demo driver on the BSP): dispatch
+/// tasks until the queue drains, then return. Used before preemption is enabled, so tasks only
+/// switch via `yield_now`/`exit`. It does NOT drain the sleeper list, so a task that `sleep_ticks`
+/// (or otherwise blocks) here would be parked and never re-dispatched — the blocking primitives are
+/// exercised on the APs' `run()` loop, which does service sleepers.
+pub fn run_until_empty(cpu: usize) {
+    while dispatch_next(cpu) {}
+}
+
+/// The APs' scheduler loop: dispatch ready tasks forever, idling (WFI on metal / poll in QEMU, via
+/// `arch::hlt`) when the queue is empty until the timer/an IPI makes work. Never returns.
+fn run(cpu: usize) -> ! {
+    loop {
+        // Wake any sleepers whose deadline has passed (IRQ masked, matching the switch-back critical
+        // section); `make_ready` pushes them onto THIS CPU's own run queue so the dispatch below
+        // picks them up. The wake source is the free-running periodic timer — each tick breaks the
+        // idle WFI and re-enters this loop — so an idle core with only a pending sleeper still makes
+        // progress; worst-case wake latency is one tick. `dispatch_next` re-masks (redundant here),
+        // then either switches into a task or, on an empty queue, unmasks and returns false to idle.
+        mask_irq();
+        drain_due_sleepers(cpu);
+        if !dispatch_next(cpu) {
+            crate::arch::hlt();
+        }
+    }
+}
+
+/// AP entry into scheduling (called from `smp::__secondary_rust` in place of the idle park). Waits
+/// until the BSP populates the run queues and flips `SCHED_GO`, then runs this core's scheduler
+/// loop. `arch::hlt` in the wait loop wakes on this core's own timer (metal) or spins (QEMU) to
+/// re-check the flag. Never returns.
+pub fn wait_and_run(cpu: usize) -> ! {
+    while !SCHED_GO.load(Ordering::Acquire) {
+        crate::arch::hlt();
+    }
+    run(cpu)
+}
+
+// ---------------------------------------------------------------------------------------------
+// Semaphore — the inter-thread blocking primitive (counting; FIFO waiters)
+// ---------------------------------------------------------------------------------------------
+
+/// A counting semaphore for kernel threads. `wait()` blocks when the count is zero; `post()` wakes
+/// one FIFO waiter (or bumps the count). Waking is cross-CPU aware: a task blocked on core B is
+/// woken from core A by moving it to B's run queue and sending the reschedule SGI (IPI_RESCHED).
+///
+/// MUST outlive every task that can block on it: `wait()` hands raw pointers to `waiters`/`locked`
+/// to the scheduler to be dereferenced after the context switch. Be `'static` (a `static SEM`), or
+/// (from the join work) kept alive behind an `Arc` whose clones every party holds across the
+/// park/post window.
+///
+/// Soundness of `UnsafeCell<VecDeque>` + `unsafe impl Sync`: EVERY access to `waiters` (and `count`)
+/// is gated by the `locked` spinlock, and the park-side push is performed by the scheduler while the
+/// blocker's lock is still held — before it releases it — establishing happens-before with the next
+/// `post()`. The lock-handoff (hold `locked` across the switch into the scheduler; the scheduler
+/// pushes the Box then releases it) is what makes the wakeup lost-proof: a `post()` on another core
+/// spins on `locked` and so cannot observe the waiter list until the blocked Box is in it.
+pub struct Semaphore {
+    /// Raw spinlock guarding `count` and `waiters`. Acquire on lock, Release on unlock.
+    locked: AtomicBool,
+    /// Permit count; touched only under `locked` (Relaxed — the lock provides ordering). Always >= 0.
+    count: AtomicI64,
+    /// FIFO waiter list; touched only under `locked`. Pre-reserved to `WAIT_CAPACITY` by `init()`.
+    waiters: UnsafeCell<VecDeque<Box<Task>>>,
+}
+
+// SAFETY: every access to the interior `waiters`/`count` is serialised by the `locked` spinlock; see
+// the type doc for the full happens-before argument.
+unsafe impl Sync for Semaphore {}
+
+impl Semaphore {
+    /// Construct a semaphore with `initial` permits. `const` so it can initialise a `static`.
+    pub const fn new(initial: i64) -> Self {
+        Semaphore {
+            locked: AtomicBool::new(false),
+            count: AtomicI64::new(initial),
+            waiters: UnsafeCell::new(VecDeque::new()),
+        }
+    }
+
+    /// Reserve the waiter list's capacity so the scheduler's park-side push never reallocates under
+    /// the held lock. Call once on the BSP before any task can block on this semaphore.
+    pub fn init(&self) {
+        self.lock_raw();
+        unsafe { (*self.waiters.get()).reserve(WAIT_CAPACITY) };
+        self.unlock_raw();
+    }
+
+    #[inline]
+    fn lock_raw(&self) {
+        while self.locked.swap(true, Ordering::Acquire) {
+            core::hint::spin_loop();
+        }
+    }
+
+    #[inline]
+    fn unlock_raw(&self) {
+        self.locked.store(false, Ordering::Release);
+    }
+
+    /// Acquire a permit, blocking the current task until one is available. Returns `true` once a
+    /// permit is held. Returns `false` WITHOUT acquiring if called off a scheduled task (there is no
+    /// `current` to block). A caller that hands out a resource on success (e.g. `Mutex::lock`) MUST
+    /// check the return: `false` means NO permit was taken, so no resource may be issued.
+    #[must_use]
+    pub fn wait(&self) -> bool {
+        let daif = irq_save_mask(); // IRQ masked for the whole critical section; restored on exit
+        self.lock_raw();
+
+        if self.count.load(Ordering::Relaxed) > 0 {
+            self.count.fetch_sub(1, Ordering::Relaxed);
+            self.unlock_raw();
+            irq_restore(daif);
+            return true; // fast path: acquired a permit without blocking
+        }
+
+        // No permit: block — but only a scheduled task can park. Off a scheduled task (the
+        // unscheduled BSP / idle context) bail WITHOUT acquiring, so the count stays consistent.
+        let cpu = percpu::this_cpu().cpu_index as usize;
+        let raw = SCHED[cpu].current.load(Ordering::Acquire) as *mut Task;
+        if raw.is_null() {
+            self.unlock_raw();
+            irq_restore(daif);
+            return false;
+        }
+
+        // The lock is held continuously until the scheduler pushes, so the length cannot change
+        // before then; asserting it here proves the park-side push won't reallocate.
+        assert!(
+            unsafe { (*self.waiters.get()).len() } < WAIT_CAPACITY,
+            "Semaphore waiter overflow (raise WAIT_CAPACITY)"
+        );
+
+        unsafe {
+            debug_assert_eq!((*raw).cpu as usize, cpu, "Semaphore::wait: task on the wrong CPU");
+            (*raw).state.store(STATE_BLOCKED, Ordering::Release);
+            // Hand the scheduler this semaphore's waiter list + lock: it pushes our Box, then
+            // releases the lock AFTER the push (the lock-handoff). We keep `locked` held across the
+            // switch; the scheduler releases it.
+            SCHED[cpu].park_waiters.store(self.waiters.get() as u64, Ordering::Relaxed);
+            SCHED[cpu].park_lock.store(&self.locked as *const AtomicBool as u64, Ordering::Relaxed);
+            SCHED[cpu].park_kind.store(PARK_WAITQ, Ordering::Relaxed);
+            switch_context(
+                &raw mut (*raw).ctx_sp,
+                SCHED[cpu].scheduler_sp.load(Ordering::Acquire),
+            );
+        }
+        // Resumed once `post()` moved us back to our run queue. The scheduler already released the
+        // lock (we must not touch it). We were handed the permit (post did NOT re-increment count),
+        // so we now hold one.
+        irq_restore(daif);
+        true
+    }
+
+    /// Release a permit: wake one FIFO waiter if any, else increment the count. Wakes across cores.
+    pub fn post(&self) {
+        let daif = irq_save_mask();
+        self.lock_raw();
+        let waiter = unsafe { (*self.waiters.get()).pop_front() };
+        match waiter {
+            // Release the lock BEFORE make_ready so its run-queue lock is never nested under ours.
+            Some(task) => {
+                self.unlock_raw();
+                make_ready(task);
+            }
+            None => {
+                self.count.fetch_add(1, Ordering::Relaxed);
+                self.unlock_raw();
+            }
+        }
+        irq_restore(daif);
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Mutex<T> — a sleeping mutual-exclusion lock (a binary semaphore guarding owned data)
+// ---------------------------------------------------------------------------------------------
+
+/// A sleeping mutex: `lock()` BLOCKS the calling task (it does not spin) until the lock is free,
+/// then hands back exclusive access to the protected data through an RAII guard that unlocks on
+/// drop. Built on `Semaphore` with a single permit, so it inherits the lost-wakeup-safe, cross-CPU
+/// block/wake — and, unlike the run-queue spinlock, a task may safely hold it across preemption and
+/// yields.
+///
+/// Like `Semaphore`, a Mutex that tasks block on must be `'static` (the underlying semaphore hands
+/// raw pointers to its internals across the context switch). Call `init()` once before use.
+///
+/// NOT re-entrant: a task that locks the same Mutex twice deadlocks (it blocks waiting on itself).
+pub struct Mutex<T> {
+    sem: Semaphore,
+    data: UnsafeCell<T>,
+}
+
+// SAFETY: the single semaphore permit guarantees at most one task holds the guard — hence at most
+// one live `&mut T` — at a time, across all cores. `T: Send` because the data is accessed from
+// whichever core currently holds the lock (which varies over time).
+unsafe impl<T: Send> Sync for Mutex<T> {}
+unsafe impl<T: Send> Send for Mutex<T> {}
+
+impl<T> Mutex<T> {
+    /// Construct an unlocked mutex (one permit). `const` so it can initialise a `static`.
+    pub const fn new(value: T) -> Self {
+        Mutex { sem: Semaphore::new(1), data: UnsafeCell::new(value) }
+    }
+
+    /// Reserve the underlying semaphore's waiter capacity. Call once on the BSP before use.
+    pub fn init(&self) {
+        self.sem.init();
+    }
+
+    /// Acquire the lock, blocking the current task until it is free. Returns a guard that unlocks on
+    /// drop.
+    ///
+    /// MUST be called from a scheduled task. A guard may be issued ONLY when a real permit was taken
+    /// — otherwise two callers could hold guards at once (aliased `&mut T` = UB). Off a scheduled
+    /// task `wait()` cannot block and so does not acquire, so we panic rather than hand out an
+    /// unbacked guard (a sleeping mutex is meaningless off a scheduler context anyway).
+    pub fn lock(&self) -> MutexGuard<'_, T> {
+        assert!(
+            self.sem.wait(),
+            "Mutex::lock() called off a scheduled task (a sleeping mutex needs a scheduler context)"
+        );
+        MutexGuard { mutex: self, _not_send: PhantomData }
+    }
+}
+
+/// RAII guard returned by `Mutex::lock`: dereferences to the protected data and releases the lock
+/// (`sem.post()`) when dropped.
+pub struct MutexGuard<'a, T> {
+    mutex: &'a Mutex<T>,
+    /// Make the guard `!Send`: the lock is owned by the task that took it, so a held guard must not
+    /// be moved to another task/core (which would unlock from the wrong context).
+    _not_send: PhantomData<*const ()>,
+}
+
+impl<T> Deref for MutexGuard<'_, T> {
+    type Target = T;
+    fn deref(&self) -> &T {
+        // SAFETY: we hold the only permit, so no other task aliases the data.
+        unsafe { &*self.mutex.data.get() }
+    }
+}
+
+impl<T> DerefMut for MutexGuard<'_, T> {
+    fn deref_mut(&mut self) -> &mut T {
+        // SAFETY: we hold the only permit, so this is the only live reference to the data.
+        unsafe { &mut *self.mutex.data.get() }
+    }
+}
+
+impl<T> Drop for MutexGuard<'_, T> {
+    fn drop(&mut self) {
+        self.mutex.sem.post();
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Channel<T> — a bounded blocking channel, composed from a Mutex + two Semaphores
+// ---------------------------------------------------------------------------------------------
+
+/// A fixed-capacity blocking channel (the classic slots/items bounded buffer). `send` blocks while
+/// full, `recv` blocks while empty; both can cross-CPU-wake the other side. Multiple producers and
+/// multiple consumers are safe — the semaphores and the buffer mutex serialise all of them.
+/// Demonstrates that the scheduler's `Mutex` and `Semaphore` COMPOSE into higher-level concurrency
+/// with no new unsafe: `slots` counts free slots (send waits on it), `items` counts buffered values
+/// (recv waits on it), and a `Mutex` serialises the buffer. Each `wait()` corresponds to a real
+/// produced/consumed item, so the buffer push/pop is never starved or raced (bounded-buffer invariant).
+///
+/// Like the primitives it is built from, a Channel that tasks block on must be `'static`; call
+/// `init()` once on the BSP before use. `Channel<T>` is `Sync` (auto-derived) exactly when `T: Send`.
+pub struct Channel<T> {
+    /// Free slots; initial permits = capacity. `send` waits (blocks when full).
+    slots: Semaphore,
+    /// Buffered items; initial 0. `recv` waits (blocks when empty).
+    items: Semaphore,
+    /// The buffer, serialised by a sleeping mutex (held only across a single push/pop).
+    buffer: Mutex<VecDeque<T>>,
+}
+
+impl<T> Channel<T> {
+    /// Construct an empty channel with `capacity` slots. `const` so it can initialise a `static`.
+    pub const fn new(capacity: usize) -> Self {
+        Channel {
+            slots: Semaphore::new(capacity as i64),
+            items: Semaphore::new(0),
+            buffer: Mutex::new(VecDeque::new()),
+        }
+    }
+
+    /// Reserve the underlying primitives' waiter capacity. Call once on the BSP before use. (Does
+    /// not lock the buffer — `Mutex::lock` requires a scheduler context, which the BSP is not.)
+    pub fn init(&self) {
+        self.slots.init();
+        self.items.init();
+        self.buffer.init();
+    }
+
+    /// Send a value, blocking while the channel is full. Must be called from a scheduled task.
+    pub fn send(&self, value: T) {
+        assert!(self.slots.wait(), "Channel::send() called off a scheduled task");
+        self.buffer.lock().push_back(value); // mutex held only across the push (never across a wait)
+        self.items.post();
+    }
+
+    /// Receive a value, blocking while the channel is empty. Must be called from a scheduled task.
+    pub fn recv(&self) -> T {
+        assert!(self.items.wait(), "Channel::recv() called off a scheduled task");
+        // A permit from `items` guarantees a value was pushed before its matching `post`, and pops
+        // are serialised by the mutex, so the buffer is non-empty here.
+        let value = self.buffer.lock().pop_front().expect("channel buffer empty after items.wait");
+        self.slots.post();
+        value
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Condvar — a Mesa-semantics condition variable (the count-less companion to Semaphore)
+// ---------------------------------------------------------------------------------------------
+
+/// A condition variable for kernel threads, paired with the sleeping `Mutex<T>`. `wait(guard)`
+/// atomically releases the mutex and blocks the calling task; `notify_one`/`notify_all` wake parked
+/// waiter(s). It is the count-LESS sibling of `Semaphore`: a notification with no waiter is a no-op
+/// (it is NOT stored), which is the defining condition-variable semantics.
+///
+/// Callers MUST re-check their predicate in a `while` loop. Wakeups are permitted to be spurious,
+/// and — unlike `sleep_ticks` — a cv waiter has NO timer backstop: it sits only in this queue with
+/// no deadline, so a `notify` is its SOLE wake source and a missed notify is a permanent hang, not a
+/// one-tick latency blip. That raises the stakes on the lost-wakeup proof below; it is the same
+/// lock-handoff that makes `Semaphore` safe.
+///
+/// MUST be `'static` (e.g. a `static CV`): like `Semaphore`, `wait()` hands raw pointers to
+/// `waiters`/`locked` to the scheduler to be dereferenced after the context switch. Call `init()`
+/// once on the BSP before use.
+///
+/// Lost-wakeup safety (Mesa semantics). A correct notifier changes the predicate under the mutex,
+/// then notifies. `wait()` acquires the condvar's `locked` BEFORE releasing the mutex, and keeps it
+/// held — handed off to the scheduler, released only after the blocked Box is enqueued — across the
+/// switch. A notifier must take `locked` to pop a waiter, so it cannot run a notify between the
+/// mutex-release and the enqueue; it always observes the waiter. This is exactly `Semaphore`'s
+/// lock-handoff, with the protected resource (the mutex) released explicitly inside the handoff.
+pub struct Condvar {
+    /// Raw spinlock guarding `waiters`. Same role as `Semaphore::locked`; no count (notifications
+    /// are not stored).
+    locked: AtomicBool,
+    /// FIFO waiter list; touched only under `locked`. Pre-reserved to `WAIT_CAPACITY` by `init()`.
+    waiters: UnsafeCell<VecDeque<Box<Task>>>,
+}
+
+// SAFETY: every access to `waiters` is serialized by `locked`; the park-side push happens while the
+// blocker's lock is still held (released by the scheduler after the push), establishing
+// happens-before with the next notify — identical to `Semaphore`.
+unsafe impl Sync for Condvar {}
+
+impl Condvar {
+    /// Construct an empty condition variable. `const` so it can initialise a `static`.
+    pub const fn new() -> Self {
+        Condvar { locked: AtomicBool::new(false), waiters: UnsafeCell::new(VecDeque::new()) }
+    }
+
+    /// Reserve the waiter list so the scheduler's park-side push never reallocates under the held
+    /// lock. Call once on the BSP before any task can block on this condvar.
+    pub fn init(&self) {
+        self.lock_raw();
+        unsafe { (*self.waiters.get()).reserve(WAIT_CAPACITY) };
+        self.unlock_raw();
+    }
+
+    #[inline]
+    fn lock_raw(&self) {
+        while self.locked.swap(true, Ordering::Acquire) {
+            core::hint::spin_loop();
+        }
+    }
+
+    #[inline]
+    fn unlock_raw(&self) {
+        self.locked.store(false, Ordering::Release);
+    }
+
+    /// Atomically release `guard`'s mutex and block the current task on this condvar; when later
+    /// notified, re-acquire the mutex and return a fresh guard. MUST be called from a scheduled task
+    /// holding `guard`. Spurious wakeups are allowed — the caller must re-test its predicate.
+    ///
+    /// The lettered step order below is load-bearing for lost-wakeup safety and the lock-ordering
+    /// invariant; do not reorder it.
+    pub fn wait<'a, T>(&self, guard: MutexGuard<'a, T>) -> MutexGuard<'a, T> {
+        // (a) Mask IRQ for the whole critical section; remember the caller's DAIF to restore.
+        let daif = irq_save_mask();
+
+        // (b) Must be on a scheduled task. Assert BEFORE consuming the guard: were we to forget the
+        //     guard first and then panic, the mutex would be permanently locked (its explicit
+        //     release in (h) never runs, and the guard's Drop is already gone).
+        let cpu = percpu::this_cpu().cpu_index as usize;
+        let raw = SCHED[cpu].current.load(Ordering::Acquire) as *mut Task;
+        assert!(
+            !raw.is_null(),
+            "Condvar::wait() called off a scheduled task (needs a scheduler context)"
+        );
+
+        // (c) Extract the mutex and DISARM the guard's Drop. `forget` is the deliberate dual of the
+        //     explicit `mutex.sem.post()` in (h): exactly one release per acquire.
+        let mutex = guard.mutex;
+        core::mem::forget(guard);
+
+        // (d) Acquire the condvar lock BEFORE releasing the mutex — closing the lost-wakeup window.
+        //     A notifier that flips the predicate after our release still cannot notify an empty
+        //     queue, because notify needs this lock, which we now hold across the switch.
+        self.lock_raw();
+
+        // (e) Prove the park-side push stays allocation-free: the lock is held continuously through
+        //     the switch, so this length cannot change before park_blocked pushes.
+        assert!(
+            unsafe { (*self.waiters.get()).len() } < WAIT_CAPACITY,
+            "Condvar waiter overflow (raise WAIT_CAPACITY)"
+        );
+
+        unsafe {
+            // (f) Block, and (g) install the PARK_WAITQ hand-off onto THIS condvar's queue + lock.
+            (*raw).state.store(STATE_BLOCKED, Ordering::Release);
+            SCHED[cpu].park_waiters.store(self.waiters.get() as u64, Ordering::Relaxed);
+            SCHED[cpu].park_lock.store(&self.locked as *const AtomicBool as u64, Ordering::Relaxed);
+            SCHED[cpu].park_kind.store(PARK_WAITQ, Ordering::Relaxed);
+
+            // (h) Release the user mutex while still holding the condvar lock. This RAW
+            //     `Semaphore::post` runs with IRQ masked; `post` snapshots+restores DAIF, so it
+            //     STAYS masked — preserving "every switch-away is IRQ-masked" into (j). It is the one
+            //     sanctioned post-under-another-primitive-lock (cv.locked -> mutex.sem.locked ->
+            //     run-queue -> heap, acyclic across this module).
+            mutex.sem.post();
+
+            // (j) Switch to the scheduler; park_blocked(PARK_WAITQ) pushes our Box into self.waiters
+            //     and releases self.locked LAST (the lock-handoff).
+            switch_context(
+                &raw mut (*raw).ctx_sp,
+                SCHED[cpu].scheduler_sp.load(Ordering::Acquire),
+            );
+        }
+
+        // Resumed (IRQ masked, carried) by a notify that moved us back to our pinned run queue; the
+        // condvar lock was already released by the scheduler that parked us. Restore the caller's
+        // DAIF FIRST, then re-acquire the mutex: the inner `lock()`'s `Semaphore::wait` snapshots the
+        // CURRENT DAIF — the carried masked one, not the caller's — so a bare re-acquire would strand
+        // the task IRQ-masked. The re-acquire may legitimately block again on a contended mutex via
+        // the mutex's own disjoint PARK_WAITQ handoff; the task stays CPU-pinned, so rebuilding the
+        // `!Send` guard on the same core upholds its unlock-from-owner intent.
+        irq_restore(daif);
+        mutex.lock()
+    }
+
+    /// Wake one waiter if any; a no-op if none are waiting (the notification is NOT stored — the
+    /// defining difference from `Semaphore::post`). May be called from any context (a task or the
+    /// unscheduled BSP). `make_ready` runs only AFTER releasing the condvar lock, so the lock is
+    /// never nested over a run-queue lock.
+    pub fn notify_one(&self) {
+        let daif = irq_save_mask();
+        self.lock_raw();
+        let waiter = unsafe { (*self.waiters.get()).pop_front() };
+        self.unlock_raw();
+        if let Some(task) = waiter {
+            make_ready(task);
+        }
+        irq_restore(daif);
+    }
+
+    /// Wake EVERY currently-queued waiter. Drains one waiter per lock acquisition and calls
+    /// `make_ready` outside the lock (the `Semaphore::post` discipline), so the condvar lock is never
+    /// held across a run-queue lock. May be called from any context. A waiter that arrives mid-drain
+    /// may also be woken — harmless under Mesa semantics (the caller re-tests its predicate); a
+    /// correct notifier holds the mutex across the notify, so in practice no new waiter arrives
+    /// during the drain, and each iteration removes exactly one Box (no livelock).
+    pub fn notify_all(&self) {
+        let daif = irq_save_mask();
+        loop {
+            self.lock_raw();
+            let waiter = unsafe { (*self.waiters.get()).pop_front() };
+            self.unlock_raw();
+            match waiter {
+                Some(task) => make_ready(task),
+                None => break,
+            }
+        }
+        irq_restore(daif);
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// RwLock<T> — a writer-preferring reader-writer lock, composed from a Mutex + two Condvars
+// ---------------------------------------------------------------------------------------------
+
+/// Internal counters of an `RwLock`, guarded by its inner `Mutex`. The invariant
+/// `(readers > 0) XOR writer` is maintained under that mutex; while it holds, readers share `&T` and
+/// a writer has an exclusive `&mut T`, so no `&mut T` ever aliases another reference.
+struct RwState {
+    /// Number of read locks currently held.
+    readers: u32,
+    /// True while the single write lock is held.
+    writer: bool,
+    /// Writers currently blocked in `write()` (drives writer-preference: new readers yield to them).
+    waiting_writers: u32,
+}
+
+/// A sleeping reader-writer lock: many concurrent readers OR one exclusive writer. Composed from the
+/// existing primitives (no new unsafe blocking machinery): an inner `Mutex<RwState>` serialises the
+/// counters and two `Condvar`s park waiters — exactly the way `Channel` composes a Mutex + Semaphores.
+///
+/// WRITER-PREFERRING: a new reader yields to any waiting writer, so writers as a CLASS are not
+/// starved by readers. This is NOT strict per-writer FIFO — a writer woken from `writer_ok` can be
+/// leapfrogged by another writer that barges in (takes the just-freed lock before the woken one
+/// re-acquires `inner`), so an individual writer's progress is guaranteed only against a FINITE
+/// writer population, not an unbounded barging stream. On the reader side the cost is heavier:
+/// **reader starvation is UNBOUNDED** under sustained write load — a reader blocked on the condvar is
+/// `STATE_BLOCKED`, off every run queue. (This aarch64 scheduler has NO priority aging at all — the
+/// run queue is flat round-robin — so, even more than on x86, nothing bounds condvar-blocked
+/// waiting.) Do not use this lock where readers must make progress against a continuous writer stream.
+///
+/// MUST be `'static` (or Arc-kept-alive) like its parts; call `init()` once on the BSP before use.
+///
+/// PRECONDITION (load-bearing): at most `WAIT_CAPACITY` (32) tasks may be simultaneously blocked on
+/// the reader condvar — or on the writer condvar — of a single `RwLock`. Unlike the other primitives
+/// (whose waiter counts are naturally bounded by producer/consumer/holder count), an `RwLock`'s
+/// reader queue is unbounded BY DESIGN, so a caller MUST bound its concurrent-reader population.
+///
+/// NOT REENTRANT. A task must hold AT MOST ONE guard (read or write) on a given `RwLock` at a time.
+/// All four re-entries DEADLOCK PERMANENTLY (the condvars have no timer backstop):
+///   * read-then-read — the 2nd `read()` yields to a queued writer that waits for `readers == 0`,
+///     which the 1st guard prevents. DANGEROUS: deadlocks ONLY when a writer is also waiting, so it
+///     passes tests and then hangs in production.
+///   * read-then-write — `write()` waits for `readers == 0`, but the caller is that reader.
+///   * write-then-read — `read()` blocks on `writer == true`, which the caller holds.
+///   * write-then-write — the 2nd `write()` blocks on `writer == true`.
+pub struct RwLock<T> {
+    inner: Mutex<RwState>,
+    /// Parks readers waiting out a writer; woken (all at once) when the lock clears with no writer queued.
+    readers_ok: Condvar,
+    /// Parks writers waiting out readers/a writer; woken one-at-a-time on each release.
+    writer_ok: Condvar,
+    data: UnsafeCell<T>,
+}
+
+// SAFETY: `&T` is handed to MULTIPLE readers on different cores at once, so `T: Sync` is REQUIRED
+// (the key difference from `Mutex<T>`, which needs only `T: Send` because it hands out one `&mut T`);
+// a writer's `&mut T` is the data's sole accessor but migrates across cores over time, so `T: Send`.
+// The `(readers > 0) XOR writer` invariant under `inner` guarantees no `&mut T` aliases.
+unsafe impl<T: Send + Sync> Sync for RwLock<T> {}
+
+impl<T> RwLock<T> {
+    /// Construct an unlocked `RwLock`. `const` so it can initialise a `static`.
+    pub const fn new(value: T) -> Self {
+        RwLock {
+            inner: Mutex::new(RwState { readers: 0, writer: false, waiting_writers: 0 }),
+            readers_ok: Condvar::new(),
+            writer_ok: Condvar::new(),
+            data: UnsafeCell::new(value),
+        }
+    }
+
+    /// Reserve all three sub-primitives' waiter capacity. Call once on the BSP before use.
+    pub fn init(&self) {
+        self.inner.init();
+        self.readers_ok.init();
+        self.writer_ok.init();
+    }
+
+    /// Acquire a shared read lock, blocking until no writer holds OR is waiting (writer-preference).
+    /// Returns an RAII guard giving `&T`; releases on drop. MUST be called from a scheduled task.
+    /// NOT reentrant (see the type docs).
+    pub fn read(&self) -> RwLockReadGuard<'_, T> {
+        {
+            let mut g = self.inner.lock();
+            while g.writer || g.waiting_writers > 0 {
+                g = self.readers_ok.wait(g); // re-checks the predicate on every (possibly spurious) wake
+            }
+            g.readers += 1;
+        } // inner guard dropped; our read lock is now recorded in `readers`
+        RwLockReadGuard { lock: self, _not_send: PhantomData }
+    }
+
+    /// Acquire the exclusive write lock, blocking until no readers and no writer. Returns an RAII
+    /// guard giving `&mut T`; releases on drop. MUST be called from a scheduled task. NOT reentrant.
+    pub fn write(&self) -> RwLockWriteGuard<'_, T> {
+        {
+            let mut g = self.inner.lock();
+            g.waiting_writers += 1; // announce ourselves so new readers yield to us (writer-preference)
+            while g.writer || g.readers > 0 {
+                g = self.writer_ok.wait(g);
+            }
+            g.waiting_writers -= 1;
+            g.writer = true;
+        } // inner guard dropped; our write lock is now recorded in `writer`
+        RwLockWriteGuard { lock: self, _not_send: PhantomData }
+    }
+}
+
+/// Shared-read RAII guard from `RwLock::read`. `Deref`s to `&T`; on drop, decrements the reader count
+/// and (when it reaches zero) hands the lock to a waiting writer.
+pub struct RwLockReadGuard<'a, T> {
+    lock: &'a RwLock<T>,
+    /// `!Send` like `MutexGuard`: a held lock belongs to the task that took it.
+    _not_send: PhantomData<*const ()>,
+}
+
+impl<T> Deref for RwLockReadGuard<'_, T> {
+    type Target = T;
+    fn deref(&self) -> &T {
+        // SAFETY: we hold a read lock, so `readers > 0` hence `writer == false`: no `&mut T` exists.
+        unsafe { &*self.lock.data.get() }
+    }
+}
+
+impl<T> Drop for RwLockReadGuard<'_, T> {
+    fn drop(&mut self) {
+        // Dropping re-acquires the inner sleeping Mutex and therefore MAY BLOCK (park + switch) if it
+        // is momentarily contended — sound because the dropping task is a normal scheduled task, but
+        // it means a guard must be dropped only from a scheduled task (the same contexts where
+        // `read()`/`write()` may be called).
+        debug_assert!(
+            SCHED[percpu::this_cpu().cpu_index as usize].current.load(Ordering::Acquire) != 0,
+            "RwLockReadGuard dropped off a scheduled task (Drop re-acquires a sleeping Mutex)"
+        );
+        let wake = {
+            let mut g = self.lock.inner.lock();
+            g.readers -= 1;
+            g.readers == 0
+        }; // inner guard dropped BEFORE the notify (keeps the condvar lock strictly inside the inner
+           // mutex's critical section and avoids waking readers that would just re-park on `inner`)
+        if wake {
+            self.lock.writer_ok.notify_one(); // hand off to one waiting writer (no-op if none)
+        }
+    }
+}
+
+/// Exclusive-write RAII guard from `RwLock::write`. `Deref`/`DerefMut` to `&mut T`; on drop, clears
+/// the writer flag and wakes the next writer or, if none waits, all parked readers.
+pub struct RwLockWriteGuard<'a, T> {
+    lock: &'a RwLock<T>,
+    _not_send: PhantomData<*const ()>,
+}
+
+impl<T> Deref for RwLockWriteGuard<'_, T> {
+    type Target = T;
+    fn deref(&self) -> &T {
+        // SAFETY: we hold the exclusive write lock; no other accessor exists.
+        unsafe { &*self.lock.data.get() }
+    }
+}
+
+impl<T> DerefMut for RwLockWriteGuard<'_, T> {
+    fn deref_mut(&mut self) -> &mut T {
+        // SAFETY: we hold the exclusive write lock; this is the only live reference to the data.
+        unsafe { &mut *self.lock.data.get() }
+    }
+}
+
+impl<T> Drop for RwLockWriteGuard<'_, T> {
+    fn drop(&mut self) {
+        debug_assert!(
+            SCHED[percpu::this_cpu().cpu_index as usize].current.load(Ordering::Acquire) != 0,
+            "RwLockWriteGuard dropped off a scheduled task (Drop re-acquires a sleeping Mutex)"
+        );
+        let wake_writer = {
+            let mut g = self.lock.inner.lock();
+            g.writer = false;
+            g.waiting_writers > 0
+        }; // inner guard dropped BEFORE the notify (see RwLockReadGuard::drop)
+        if wake_writer {
+            self.lock.writer_ok.notify_one(); // FIFO-ish hand-off to the next writer (writer-preference)
+        } else {
+            self.lock.readers_ok.notify_all(); // no writer waiting: release every parked reader
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Demos
+// ---------------------------------------------------------------------------------------------
+
+/// M3a smoke test: spawn a few cooperative kernel threads on the boot core and run them to
+/// completion. Proves `switch_context` + the run queue + `spawn`/`yield_now`/`exit` — round-robin,
+/// no interrupts required (so it runs identically in QEMU raspi4b and on metal). Runs BEFORE
+/// preemption is enabled, so it is provably cooperative. Returns once every demo task has exited.
+pub fn demo_cooperative() {
+    const ROUNDS: usize = 3;
+    const NTASKS: usize = 3;
+
+    fn body(arg: usize) {
+        for round in 0..ROUNDS {
+            serial_println!(":: SCHED: task {} round {} (cpu 0) ::", arg, round);
+            yield_now();
+        }
+        serial_println!(":: SCHED: task {} done ::", arg);
+    }
+
+    serial_println!(":: AARCH64 SCHED: cooperative demo — {} tasks x {} rounds on cpu 0 ::", NTASKS, ROUNDS);
+    for t in 0..NTASKS {
+        spawn("demo", body, t, 0);
+    }
+    run_until_empty(0);
+    serial_println!(":: AARCH64 SCHED: cooperative demo complete (context switch + round-robin OK) ::");
+}
+
+/// Busy-wait `ms` milliseconds off the free-running CNTPCT (works even where the timer IRQ isn't
+/// delivered, i.e. QEMU). Used by the preemption demo so each task holds the CPU long enough to be
+/// preempted on metal.
+fn busy_delay_ms(ms: u64) {
+    let freq = timer::cntfrq();
+    let deadline = timer::cntpct() + freq * ms / 1000;
+    while timer::cntpct() < deadline {
+        core::hint::spin_loop();
+    }
+}
+
+/// The preemption-demo task body: print a few lines with a busy-delay between them and NO yield, so
+/// the only thing that can switch away is the timer. `arg` encodes core*10 + task.
+fn preempt_body(arg: usize) {
+    let (core, task) = (arg / 10, arg % 10);
+    for i in 0..5 {
+        serial_println!(":: SCHED: core {} task {} iter {} ::", core, task, i);
+        busy_delay_ms(3);
+    }
+    serial_println!(":: SCHED: core {} task {} done ::", core, task);
+}
+
+/// M4a demo: prove `sleep_ticks` parks a task and this core's timer tick wakes it. Metal-only wake —
+/// in QEMU raspi4b the timer IRQ is never delivered (`timer::is_live()` is false), so a real sleep
+/// would park forever; there we skip the sleep and just report, keeping the AP's queue draining.
+fn sleep_demo_body(arg: usize) {
+    let core = arg;
+    if !timer::is_live() {
+        serial_println!(
+            ":: SCHED: core {} SLEEP demo skipped — timer not delivered (QEMU); sleep-wake is metal-only ::",
+            core
+        );
+        return;
+    }
+    const NAP: u64 = 25; // ticks (~100 ms at the 250 Hz per-core tick)
+    let before = percpu::this_cpu().ticks.load(Ordering::Relaxed);
+    serial_println!(":: SCHED: core {} SLEEP {} ticks (at tick {}) ::", core, NAP, before);
+    sleep_ticks(NAP);
+    let after = percpu::this_cpu().ticks.load(Ordering::Relaxed);
+    serial_println!(
+        ":: SCHED: core {} WOKE at tick {} (slept {} ticks; sleep_ticks OK) ::",
+        core,
+        after,
+        after.wrapping_sub(before),
+    );
+}
+
+// ---- M4 CAPSTONE: one coordinator drives every sync primitive's cross-core self-test in sequence,
+// so a SINGLE boot (one metal reflash) verifies the whole toolkit. Each step spawns worker task(s)
+// on OTHER APs and `join()`s them (so `join`/`spawn_joinable` are exercised throughout), and prints
+// a PASS/FAIL line. All state is `static` (the primitives require `'static`); `init()`'d on the BSP.
+static CAP_SEM: Semaphore = Semaphore::new(0);
+static CAP_MTX: Mutex<u64> = Mutex::new(0);
+static CAP_CHAN: Channel<u64> = Channel::new(4);
+static CAP_CV_PRED: Mutex<bool> = Mutex::new(false);
+static CAP_CV: Condvar = Condvar::new();
+static CAP_CV_RELEASED: AtomicBool = AtomicBool::new(false);
+static CAP_RW: RwLock<(u64, u64)> = RwLock::new((0, 0));
+static CAP_RW_TORN: AtomicBool = AtomicBool::new(false);
+static CAP_CORES: SpinMutex<[usize; 2]> = SpinMutex::new([0, 0]); // the two worker APs (online[1], online[2])
+const CAP_SEM_ITEMS: usize = 5;
+const CAP_MTX_INCRS: u64 = 500;
+const CAP_CHAN_N: u64 = 20;
+const CAP_RW_WRITES: u64 = 6;
+const CAP_RW_READS: usize = 8;
+
+fn cap_sem_producer(_: usize) {
+    for _ in 0..CAP_SEM_ITEMS {
+        busy_delay_ms(1); // let the coordinator block on the empty semaphore first
+        CAP_SEM.post();
+    }
+}
+fn cap_mtx_incr(_: usize) {
+    for _ in 0..CAP_MTX_INCRS {
+        *CAP_MTX.lock() += 1;
+    }
+}
+fn cap_chan_producer(_: usize) {
+    for v in 1..=CAP_CHAN_N {
+        CAP_CHAN.send(v);
+    }
+}
+fn cap_cv_worker(_: usize) {
+    {
+        let mut go = CAP_CV_PRED.lock();
+        while !*go {
+            go = CAP_CV.wait(go);
+        }
+    }
+    CAP_CV_RELEASED.store(true, Ordering::Relaxed);
+}
+fn cap_rw_writer(_: usize) {
+    for v in 1..=CAP_RW_WRITES {
+        {
+            let mut w = CAP_RW.write();
+            w.0 = v;
+            busy_delay_ms(1); // widen the non-atomic update window
+            w.1 = v;
+        }
+        busy_delay_ms(1);
+    }
+}
+fn cap_rw_reader(_: usize) {
+    for _ in 0..CAP_RW_READS {
+        let r = CAP_RW.read();
+        let a = r.0;
+        busy_delay_ms(1);
+        if a != r.1 {
+            CAP_RW_TORN.store(true, Ordering::Relaxed); // a writer's half-update leaked in
+        }
+    }
+}
+
+fn cap_report(name: &str, pass: bool) {
+    serial_println!(":: CAPSTONE {}: {} ::", name, if pass { "PASS" } else { "FAIL" });
+}
+
+/// The capstone coordinator: run each primitive's cross-core self-test in sequence and report. Runs
+/// on the first online AP; workers land on the two other APs (`CAP_CORES`). Every step blocks the
+/// coordinator (on a wait/recv/join) and is woken cross-core — the metal-only path in one place.
+fn capstone_body(_: usize) {
+    let [b, c] = *CAP_CORES.lock();
+    serial_println!(":: CAPSTONE: verifying all 6 sync primitives (workers on cores {} + {}) ::", b, c);
+
+    // 1. Semaphore — a producer on core b posts; we consume (cross-core wake TO the coordinator).
+    let h = spawn_joinable("cap-sem", cap_sem_producer, 0, b);
+    let mut got = 0usize;
+    for _ in 0..CAP_SEM_ITEMS {
+        assert!(CAP_SEM.wait(), "capstone ran off a scheduled task");
+        got += 1;
+    }
+    h.join();
+    cap_report("Semaphore", got == CAP_SEM_ITEMS);
+
+    // 2. Mutex — two incrementers contend the same Mutex<u64> across cores b + c (no lost RMW).
+    let h1 = spawn_joinable("cap-mtx-a", cap_mtx_incr, 0, b);
+    let h2 = spawn_joinable("cap-mtx-b", cap_mtx_incr, 0, c);
+    h1.join();
+    h2.join();
+    cap_report("Mutex", *CAP_MTX.lock() == 2 * CAP_MTX_INCRS);
+
+    // 3. Channel — a producer on core b sends 1..=N through a cap-4 buffer; we recv + sum.
+    let h = spawn_joinable("cap-chan", cap_chan_producer, 0, b);
+    let mut sum = 0u64;
+    for _ in 0..CAP_CHAN_N {
+        sum += CAP_CHAN.recv();
+    }
+    h.join();
+    cap_report("Channel", sum == CAP_CHAN_N * (CAP_CHAN_N + 1) / 2);
+
+    // 4. Condvar — a worker on core b blocks on the predicate; we flip it under the mutex + notify.
+    let h = spawn_joinable("cap-cv", cap_cv_worker, 0, b);
+    busy_delay_ms(5); // let the worker reach cv.wait()
+    {
+        let mut go = CAP_CV_PRED.lock();
+        *go = true;
+        CAP_CV.notify_all();
+    }
+    h.join();
+    cap_report("Condvar", CAP_CV_RELEASED.load(Ordering::Relaxed));
+
+    // 5. RwLock — a writer + two readers across cores b + c; a torn read would mean the write lock
+    //    failed to exclude the readers.
+    let hw = spawn_joinable("cap-rw-w", cap_rw_writer, 0, b);
+    let hr1 = spawn_joinable("cap-rw-r1", cap_rw_reader, 0, b);
+    let hr2 = spawn_joinable("cap-rw-r2", cap_rw_reader, 0, c);
+    hw.join();
+    hr1.join();
+    hr2.join();
+    cap_report("RwLock", !CAP_RW_TORN.load(Ordering::Relaxed));
+
+    // 6. join() — exercised in EVERY step above (each spawn_joinable + join blocked the coordinator
+    //    until the worker's completion post, at least one cross-core).
+    cap_report("join", true);
+    serial_println!(":: CAPSTONE COMPLETE — all 6 sync primitives verified in one boot ::");
+}
+
+/// M3b/M4a/M4-capstone: turn on preemptive scheduling and put a workload on the APs, then flip
+/// SCHED_ACTIVE (enables `timer_preempt`) and SCHED_GO (releases the APs into `run`). The workload:
+///   * first online AP — a busy-pair (preemption regression) + the M4a `sleep_ticks` sleeper;
+///   * (with >= 3 online APs) the M4 CAPSTONE: one coordinator on the first AP runs every sync
+///     primitive's cross-core self-test in sequence, with workers on the two other APs.
+/// On metal the busy-pair INTERLEAVES, the sleeper parks-then-wakes on its own tick, and every
+/// capstone step is woken cross-core by a real reschedule SGI. In QEMU (no Group-1 IRQ delivery) the
+/// busy tasks run sequentially, the sleeper self-skips, and every block/wake is carried by the run()
+/// busy-poll (SGI delivery being the metal-only half). Call AFTER the BSP's cooperative demo.
+pub fn start_aps(online: &[usize]) {
+    if let Some(&c) = online.first() {
+        spawn("busy-a", preempt_body, c * 10, c);
+        spawn("busy-b", preempt_body, c * 10 + 1, c);
+        spawn("sleeper", sleep_demo_body, c, c);
+    }
+    if online.len() >= 3 {
+        // Reserve every primitive's waiter capacity on the BSP before any task can block on it.
+        CAP_SEM.init();
+        CAP_MTX.init();
+        CAP_CHAN.init();
+        CAP_CV_PRED.init();
+        CAP_CV.init();
+        CAP_RW.init();
+        *CAP_CORES.lock() = [online[1], online[2]];
+        spawn("capstone", capstone_body, 0, online[0]);
+    } else {
+        serial_println!(":: AARCH64 SCHED: capstone skipped (needs >= 3 online APs) ::");
+    }
+    SCHED_ACTIVE.store(true, Ordering::Release);
+    SCHED_GO.store(true, Ordering::Release);
+    serial_println!(
+        ":: AARCH64 SCHED: preemption ON; busy-pair + sleep + full M4 capstone on APs {:?} ::",
+        online
+    );
+}

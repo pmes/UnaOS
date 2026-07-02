@@ -45,6 +45,11 @@ struct FbCon {
     fg: u32,
     bg: u32,
     ready: bool,
+    /// Accumulated dirty pixel-row band `[dirty_y0, dirty_y1)` since the last flush; empty when
+    /// `dirty_y0 >= dirty_y1`. Lets a print clean only the rows it drew, instead of sweeping the
+    /// whole surface each line (a real cost on the Pi's cacheable framebuffer; a no-op elsewhere).
+    dirty_y0: usize,
+    dirty_y1: usize,
 }
 
 impl FbCon {
@@ -58,7 +63,36 @@ impl FbCon {
             fg: FG_DEFAULT,
             bg: BG_DEFAULT,
             ready: false,
+            dirty_y0: 0,
+            dirty_y1: 0,
         }
+    }
+
+    /// Grow the dirty band to include pixel rows `[y0, y1)`.
+    fn mark_rows(&mut self, y0: usize, y1: usize) {
+        if self.dirty_y0 >= self.dirty_y1 {
+            self.dirty_y0 = y0;
+            self.dirty_y1 = y1;
+        } else {
+            self.dirty_y0 = self.dirty_y0.min(y0);
+            self.dirty_y1 = self.dirty_y1.max(y1);
+        }
+    }
+
+    /// Clean just the dirtied rows out to RAM (for the HVS), then reset the band. No-op when
+    /// nothing was drawn or on cache-coherent targets.
+    fn flush_dirty(&mut self) {
+        if self.dirty_y0 >= self.dirty_y1 {
+            return;
+        }
+        let info = self.fb.info();
+        let row_bytes = info.stride * info.bytes_per_pixel;
+        let y1 = self.dirty_y1.min(info.height);
+        if y1 > self.dirty_y0 {
+            self.fb.flush_range(self.dirty_y0 * row_bytes, (y1 - self.dirty_y0) * row_bytes);
+        }
+        self.dirty_y0 = 0;
+        self.dirty_y1 = 0;
     }
 
     /// Draw a glyph at pixel (cx, cy). Cells are background-clean when first reached (initial
@@ -77,6 +111,8 @@ impl FbCon {
     /// Scroll the whole framebuffer up by one text row and clear the freed bottom row.
     fn scroll(&mut self) {
         self.fb.scroll_up(CELL_H, self.bg);
+        // A scroll moves the entire surface — the whole visible frame is now dirty.
+        self.mark_rows(0, self.fb.info().height);
     }
 
     fn newline(&mut self) {
@@ -96,7 +132,9 @@ impl FbCon {
                 if self.col >= self.cols {
                     self.newline();
                 }
-                self.glyph(b, self.col * CELL_W, self.row * CELL_H);
+                let cy = self.row * CELL_H;
+                self.glyph(b, self.col * CELL_W, cy);
+                self.mark_rows(cy, cy + CELL_H);
                 self.col += 1;
             }
             _ => {} // ignore other control bytes
@@ -127,6 +165,7 @@ pub fn init(fb_addr: u64, fb_len: usize, info: FrameBufferInfo) {
         c.bg = BG_DEFAULT;
         c.ready = true;
         c.fb.fill_screen(BG_DEFAULT);
+        c.fb.flush_all();
     });
 }
 
@@ -142,6 +181,10 @@ pub fn _print(args: core::fmt::Arguments) {
         if let Some(mut c) = FBCON.try_lock() {
             if c.ready {
                 let _ = core::fmt::Write::write_fmt(&mut Sink { con: &mut c }, args);
+                // Clean just the freshly-drawn rows out to RAM (no-op off the Pi). fbcon pokes
+                // pixels directly rather than via `blit`, so this is what keeps the boot log visible
+                // on the HVS-scanned framebuffer — but only the touched rows, not the whole surface.
+                c.flush_dirty();
             }
         }
     });
@@ -195,6 +238,7 @@ pub fn panic_screen() {
                 c.col = 0;
                 c.row = 0;
                 c.fb.fill_screen(PANIC_BG);
+                c.fb.flush_all();
             }
         }
     });

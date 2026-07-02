@@ -149,7 +149,7 @@ launch_aarch64() {
     echo -e "${COLOR_PURPLE}-------------------------${COLOR_RESET}"
 
     qemu-system-aarch64 \
-        -machine virt,virtualization=on \
+        -machine virt,virtualization=on,gic-version=2 \
         -cpu cortex-a72 \
         -smp 4 \
         -m 1G \
@@ -177,7 +177,7 @@ test_aarch64() {
     rm -f "$logf"
     echo -e "${COLOR_CYAN}⚡ Headless aarch64 test (${secs}s). Serial -> ${logf}${COLOR_RESET}"
     qemu-system-aarch64 \
-        -machine virt,virtualization=on -cpu cortex-a72 -smp 4 -m 1G \
+        -machine virt,virtualization=on,gic-version=2 -cpu cortex-a72 -smp 4 -m 1G \
         -drive if=pflash,format=raw,readonly=on,file="$AAVMF_PATH" \
         -drive format=raw,file=fat:rw:"$ESP_DIR_ARM" \
         -serial "file:${logf}" -device ramfb -display none \
@@ -299,6 +299,78 @@ esp_arm() {
     echo -e "   Copy its contents to a FAT32 SD card together with the RPi4 EDK2 UEFI firmware."
 }
 
+# Bare-metal Raspberry Pi 4: build a flat kernel8.img the GPU ROM loads directly from the microSD
+# SLOT (no UEFI/EDK2 — the native Pi boot path), stage the Pi firmware blobs + config.txt around it,
+# and build a flashable .img for Raspberry Pi Imager. Links non-PIE at 0x80000 (aarch64-base.json,
+# relocation-model=static) with pi-baremetal.ld, then objcopy to a raw binary.
+KERNEL8_DIR="${WORKSPACE_DIR}/target/pi_baremetal"
+FW_ZIP="${WORKSPACE_DIR}/target/RPi4_UEFI_Firmware_v1.52.zip"
+kernel8() {
+    echo -e "${COLOR_YELLOW}⚡ Building bare-metal kernel8.img (Pi 4, microSD-slot boot)...${COLOR_RESET}"
+    cd "$WORKSPACE_DIR/crates/kernel"
+    RUSTFLAGS="-C link-arg=-T${WORKSPACE_DIR}/crates/kernel/pi-baremetal.ld" \
+      cargo +nightly build --release --target ../../aarch64-base.json \
+      $NIGHTLY_FLAGS --features baremetal,skip_xhci
+    cd "$WORKSPACE_DIR"
+
+    local TOOLBIN; TOOLBIN="$(rustc +nightly --print sysroot)/lib/rustlib/$(rustc +nightly -vV | awk '/host/{print $2}')/bin"
+    rm -rf "$KERNEL8_DIR"; mkdir -p "$KERNEL8_DIR/overlays"
+    "$TOOLBIN/llvm-objcopy" -O binary \
+      "${WORKSPACE_DIR}/target/aarch64-base/release/unaos-kernel" "$KERNEL8_DIR/kernel8.img"
+    cp "${WORKSPACE_DIR}/scripts/pi-baremetal-config.txt" "$KERNEL8_DIR/config.txt"
+
+    # Standard Pi GPU firmware blobs (start4.elf/fixup4.dat) + base DTB + the miniuart-bt overlay,
+    # pulled from the cached pftf release zip (we use only its stock firmware files here).
+    if [ ! -f "$FW_ZIP" ]; then
+        echo -e "${COLOR_CYAN}⚡ Fetching Pi firmware (pftf v1.52)...${COLOR_RESET}"
+        curl -sL -o "$FW_ZIP" https://github.com/pftf/RPi4/releases/download/v1.52/RPi4_UEFI_Firmware_v1.52.zip
+    fi
+    unzip -o -j "$FW_ZIP" start4.elf fixup4.dat bcm2711-rpi-4-b.dtb -d "$KERNEL8_DIR" >/dev/null
+    unzip -o -j "$FW_ZIP" "overlays/miniuart-bt.dtbo" -d "$KERNEL8_DIR/overlays" >/dev/null
+    echo -e "${COLOR_GREEN}✅ Boot files: ${KERNEL8_DIR}${COLOR_RESET}"
+
+    bash "${WORKSPACE_DIR}/scripts/make-pi-img.sh" "$KERNEL8_DIR" "${WORKSPACE_DIR}/target/UnaOS-pi4-baremetal.img" 64
+    echo -e "${COLOR_GREEN}✅ Flashable image: target/UnaOS-pi4-baremetal.img — Imager → Use custom → microSD → SD slot.${COLOR_RESET}"
+}
+
+# Boot the bare-metal kernel8.img on QEMU's `raspi4b` (emulated BCM2711) — the same flat binary the
+# real Pi GPU ROM loads from the microSD slot. raspi4b loads `-kernel` to 0x80000 and enters at EL2,
+# and faithfully models the VideoCore mailbox + framebuffer (the buffer is scanned out to the
+# display), so this exercises the Phase-2 mailbox framebuffer end to end. Our PL011 (UART0) is the
+# FIRST `-serial`; the mini-UART is second. (No EDID in QEMU → the firmware's default 640×480.)
+run_kernel8() {
+    kernel8 # always rebuild from current source (incremental; ~seconds) so we never run a stale image
+    echo -e "${COLOR_GREEN}⚡ Launching QEMU raspi4b (bare-metal kernel8.img)...${COLOR_RESET}"
+    echo -e "  • PL011 serial (UART0) on stdio; mailbox framebuffer on the display"
+    qemu-system-aarch64 \
+        -machine raspi4b \
+        -kernel "$KERNEL8_DIR/kernel8.img" \
+        -serial mon:stdio -serial null \
+        ${UNAOS_QEMU_EXTRA:-}
+}
+
+# Headless raspi4b test: boot kernel8.img, capture PL011 -> target/serial-pi.log and a QMP
+# screendump of the mailbox framebuffer -> target/pi-screen.png, then self-terminate.
+test_kernel8() {
+    local secs="${1:-8}"
+    kernel8 # always rebuild from current source (incremental; ~seconds) so we never test a stale image
+    local logf="${WORKSPACE_DIR}/target/serial-pi.log"
+    local png="${WORKSPACE_DIR}/target/pi-screen.png"
+    rm -f "$logf"
+    echo -e "${COLOR_CYAN}⚡ Headless raspi4b test (${secs}s). Serial -> ${logf}, screen -> ${png}${COLOR_RESET}"
+    qemu-system-aarch64 \
+        -machine raspi4b \
+        -kernel "$KERNEL8_DIR/kernel8.img" \
+        -serial "file:${logf}" -serial null -display none \
+        -qmp tcp:127.0.0.1:4463,server,nowait \
+        ${UNAOS_QEMU_EXTRA:-} &
+    local qpid=$!
+    python3 "${WORKSPACE_DIR}/scripts/qmp_shoot.py" --port 4463 --wait "$((secs - 1))" --out "$png" 2>/dev/null || sleep "$secs"
+    kill "$qpid" 2>/dev/null || true
+    wait "$qpid" 2>/dev/null || true
+    echo -e "${COLOR_GREEN}✅ Serial:${COLOR_RESET} ${logf}    ${COLOR_GREEN}Screen:${COLOR_RESET} ${png}"
+}
+
 clean_all() {
     echo -e "${COLOR_YELLOW}⚡ Purging build artifacts...${COLOR_RESET}"
     cd "$WORKSPACE_DIR"
@@ -398,6 +470,15 @@ case "${1:-}" in
     test-fat|test_fat)
         test_fat "${2:-part}" "${3:-30}"
         ;;
+    kernel8|baremetal)
+        kernel8
+        ;;
+    kernel8-run|run-pi)
+        run_kernel8
+        ;;
+    kernel8-test|test-pi)
+        test_kernel8 "${2:-8}"
+        ;;
     clean)
         clean_all
         ;;
@@ -408,7 +489,7 @@ case "${1:-}" in
         ;;
     *)
         echo -e "${COLOR_RED}Unknown command: $1${COLOR_RESET}"
-        echo "Usage: ./arroyo [x86|arm|test [secs]|test-arm [secs]|check|build|esp-x86|esp-arm|fat-img|clean]"
+        echo "Usage: ./arroyo [x86|arm|test [secs]|test-arm [secs]|check|build|esp-x86|esp-arm|fat-img|test-fat [part|gpt|p16|sf] [secs]|kernel8|kernel8-run|kernel8-test [secs]|clean]"
         exit 1
         ;;
 esac
