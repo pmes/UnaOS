@@ -68,10 +68,43 @@ ports, Jetson joins — full table in `ROADMAP.md` §1).
 - [x] EL0/EL1 privilege split (M6a-0/M6a, 2026-07-01, metal-confirmed)
 - [x] Per-page user permissions: user code EL0-RX, stacks RW-XN; UXN/PXN on user pages (M6b)
 - [x] EL0 fault → task kill with syndrome-matched accounting (M6b)
-- [ ] Kernel W^X / WXN audit (SCTLR_EL1.WXN feasibility)
+- [x] Kernel W^X / WXN audit (SCTLR_EL1.WXN feasibility) — audit complete; WXN enable pending review (M6c/H1; table below)
 - [ ] PAN (Privileged Access Never) where silicon supports it
 - [ ] Validated user-pointer access (M6f)
 - [ ] Per-task address spaces + ASIDs (M6d)
+
+#### aarch64 W^X map audit (H1, M6c — report only; WXN not enabled)
+
+Walk of the EL1&0 boot page tables as built in `arch/aarch64/boot.rs` (`build_l1`,
+`protect_user_code`; TTBR0_EL1 → one L1 of 1 GiB blocks, with L1[0] demoted to L2_USER/L3_USER for
+the 4 KiB EL0 window). `AP[7:6]`: `0b00` = EL1-RW/EL0-none, `0b01` = EL1+EL0 RW, `0b11` = RO at both
+ELs. `UXN` = bit 54 (EL0 execute-never), `PXN` = bit 53 (EL1 execute-never).
+
+| Region (VA == PA) | Descriptor | Attr | AP | EL1 | EL0 | UXN/PXN | W∧X? |
+| :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
+| 0–1 GiB general RAM (L2_USER blocks + L3_USER pages outside `USER_REGION`) | 2 MiB block / 4 KiB page | Normal | `0b00` | RW+X | — | 0/0 | **yes (EL1 RWX)** |
+| `USER_REGION` code page `[0x100000,0x101000)` after `protect_user_code` | 4 KiB page | Normal | `0b11` | RO, no-X | R+X | 0/1 | no |
+| `USER_REGION` data/stack `[0x101000,0x104000)` | 4 KiB page | Normal | `0b01` | RW, no-X | RW, no-X | 1/1 | no |
+| 1–2 GiB RAM (L1[1]) | 1 GiB block | Normal | `0b00` | RW+X | — | 0/0 | **yes (EL1 RWX)** |
+| 2–3 GiB RAM (L1[2]) | 1 GiB block | Normal | `0b00` | RW+X | — | 0/0 | **yes (EL1 RWX)** |
+| 3–4 GiB Device (L1[3]) | 1 GiB block | Device | `0b00` | RW, no-X | — | 1/1 | no |
+
+Transient: the code page is a data page (`0b01`, UXN=PXN=1, RW no-X) during the blob copy, then
+`protect_user_code` flips it to the row above — so it is never W∧X, at either EL, at any point.
+
+**Every EL0-reachable page already satisfies W^X**: the user code page is R+X but read-only, and the
+data/stack pages are RW but execute-never. The only W∧X coincidences are in the **kernel's own coarse
+RWX identity RAM** (0–3 GiB, `AP=0b00`, PXN=0): the kernel image `.text` (which must be executable)
+shares one RWX attribute set with the heap/stack/BSS/data (which must be writable).
+
+**SCTLR_EL1.WXN feasibility.** With `WXN=1` the EL1&0 regime forces "writable ⇒ execute-never":
+EL1-writable regions become PXN, EL0-writable regions become UXN. The EL0 window is unaffected (the
+code page is not writable at either EL; data/stack are already XN). But the kernel executes from the
+`AP=0b00`, PXN=0 identity RAM above — under WXN that RAM becomes EL1-non-executable and the next
+kernel instruction fetch faults, so the kernel cannot boot. Enabling WXN therefore requires FIRST
+splitting the identity map into a read-only-executable kernel text/rodata region and RW-execute-never
+data/heap/stack/BSS regions (a linker-symbol-driven map, mirroring the 4 KiB EL0 code/data split M6b
+already performs). That refactor is a separate, review-gated change; **WXN is not enabled in M6c.**
 
 ### Ring-0 parser audits (today's practical attack surface)
 - [ ] Network stack: header-length/bounds audit (Ethernet/ARP/IP/TCP options/DHCP options)

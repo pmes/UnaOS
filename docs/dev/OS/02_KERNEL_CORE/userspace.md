@@ -26,8 +26,17 @@
   the scheduler — with `(task, EC, FAR)`-matched accounting and a
   cross-core verdict — instead of halting the kernel. Metal-confirmed
   (2026-07-01), including the stale-TLB case QEMU cannot test.
-- Not yet: loadable programs (M6c), per-task address spaces/ASIDs (M6d),
-  preemptible EL0 (M6e), validated user pointers (M6f).
+- **M6c** — loadable user program: the well-behaved `hello` routine moved OUT of
+  the kernel's `.text` into a separately linked crate (`crates/user-blob`),
+  `llvm-objcopy`'d to a flat `target/user_blob.bin`, `include_bytes!`'d and copied
+  into the EL0 code page at boot (the `DC CVAU`/`IC IVAU` maintenance is kept for
+  the copy). Position-independent (byte-granular `adr`, inline message), so it runs
+  wherever it lands — no ELF loader yet. The M6b fault fixtures stay inline. QEMU-
+  verified (2026-07-02): `:: M6c: user blob loaded (51 bytes) ::`, `hello from EL0`,
+  the M6b verdict still `PASS`, capstone 6/6. Metal-verify pending — the D-cache/
+  I-cache copy path is a no-op in QEMU.
+- Not yet: per-task address spaces/ASIDs (M6d), preemptible EL0 (M6e), validated
+  user pointers (M6f).
 
 ### x86_64 (branch `hw-rmbp`) — starting from ~10–15 %
 
@@ -45,7 +54,7 @@ and fault handlers that kill a user task instead of `hlt_loop()`.
 | :--- | :--- | :--- |
 | Privilege round-trip | U1a | M6a ✅ |
 | Per-page perms + fault→kill | U1b | M6b ✅ |
-| Loadable programs | U2 (from FAT storage) | M6c (embedded blob) |
+| Loadable programs | U2 (from FAT storage) | M6c ✅ (embedded blob) |
 | Per-process address space | U3 (per-process PML4/CR3) | M6d (TTBR0 + ASID) |
 | Process model, PIDs, handle table | U4 (arch-neutral) | U4 |
 | Capabilities at the syscall boundary | U5 (arch-neutral) | U5 |
