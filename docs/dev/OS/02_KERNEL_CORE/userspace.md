@@ -113,8 +113,52 @@
   fault→`sched::exit()` paths work on silicon, not just under emulation. (The
   NMI-IST slot is installed on both, but its fire path is untested — no NMI
   fixture yet — so it is not part of the silicon-proven set.)
+- **U2** — loadable ring-3 program from FAT + boundary preconditions (the x86
+  analogue of aarch64 M6c, but loaded FROM DISK rather than `include_bytes!`d).
+  - **The loader** (`syscall::u2_probe_once`, one-shot from the main loop once a
+    block device is present — mirroring `fat::probe_once`'s gate, since
+    `fat::mount()` needs the asynchronously-enumerated usb-storage device):
+    mount the FAT volume, `find_in_root("HELLO.BIN")`, `read_file` capped at one
+    code page, validate the size, copy the bytes into the RO-from-start code
+    page at `USER_BASE` **through the identity alias** (the U1b B4 W^X discipline
+    — the ring-3 mapping is never writable, so W^X holds across cores by
+    construction), and `spawn_user` it on a scheduled AP. The loaded bytes are
+    **untrusted**: nothing about them is trusted beyond the size bound — the
+    program runs only under ring-3 + NX + W^X + SMEP + the U1b fault-kill net.
+    A missing volume / file / oversize logs one clean line and skips (the earlier
+    U1a/U1b demos are unaffected). `HELLO.BIN` is a separate flat link product
+    (`crates/user-blob-x86`, `llvm-objcopy --only-section=.text` → `target/hello.bin`,
+    position-independent, entry at byte 0), copied onto the FAT image and the ESP
+    by the build. QEMU-verified (2026-07-02): `:: U2: HELLO.BIN loaded from FAT
+    (72 bytes) -> ring 3 ::`, `hello from disk`, `:: U2: loaded program exited ok
+    -> PASS ::`, across MBR-FAT32 and superfloppy layouts; U1a/U1b unchanged.
+  - **Part-0 boundary preconditions** (they become live the moment ring 3 can run
+    arbitrary loaded code): **(0a)** #DB (vector 1) and #MC (vector 18) each get
+    their own IST stack. #DB closes a DoS — `RFLAGS.TF` is writable at any CPL, so
+    ring 3 can `popfq` TF then `SYSCALL`; the pending single-step trap lands on the
+    first `LSTAR` instruction at CPL 0 with GS/RSP still ring-3. Without a #DB gate
+    that escalates to #NP whose frame lands on the user stack → a user-triggerable
+    halt. The GS-free #DB handler: a ring-3 #DB kills the task; a CPL-0 #DB whose
+    RIP is inside the syscall-entry stub clears TF and `iretq`s (resumes the
+    syscall — long-mode `iretq` restores RSP/SS unconditionally); any other CPL-0
+    #DB is fatal. #MC is fatal on its IST. **(0b)** first-entry GPR scrub in
+    `user_task_trampoline` — every GPR but `rsp` is zeroed after the five iretq
+    frame words are pushed and before `iretq`, so no live kernel value (the Task
+    Box pointer, kernel-stack top, entry VA) reaches ring 3 in a register at first
+    entry (the x86 twin of the aarch64 M6d first-`eret` scrub; the U1b SYSRET scrub
+    covered only the return half). **(0c)** two closed caveats: a real self-NMI
+    (`apic::send_ipi(own_id, 0x4400)`) is confirmed **taken on the NMI IST** (the
+    handler checks its RSP against the IST bounds), and the canonical-`rcx` guard's
+    refusal logic is unit-exercised kernel-side (`rcx_canonical` refuses
+    `0x8000_0000_0000_0000`). QEMU-verified: `:: U2-0a: TF+SYSCALL survived -> PASS
+    ::` (kernel not halted; `db_resumed=0` — QEMU TCG does not model the
+    TF-on-`SYSCALL` trap, so the #DB *resume* fire path is metal-only), `:: U2-0c:
+    self-NMI taken on IST -> PASS ::`, `:: U2-0c: canonical-rcx guard refuses … ->
+    PASS ::`.
 - Not yet: full user-GPR preservation across a syscall, validated user pointers
-  (`copy_from_user`), per-process address spaces (U3).
+  (`copy_from_user`), per-process address spaces (U3), a self-vs-non-self loader
+  check (signatures / allowlist — U2 loads unverified bytes today, safe only
+  because ring-3 isolation contains them).
 
 ## The chain
 
@@ -122,7 +166,7 @@
 | :--- | :--- | :--- |
 | Privilege round-trip | U1a ✅ | M6a ✅ |
 | Per-page perms + fault→kill | U1b ✅ | M6b ✅ |
-| Loadable programs | U2 (from FAT storage) | M6c ✅ (embedded blob) |
+| Loadable programs | U2 ✅ (from FAT storage) | M6c ✅ (embedded blob) |
 | Per-process address space | U3 (per-process PML4/CR3) | M6d (TTBR0 + ASID) |
 | Process model, PIDs, handle table | U4 (arch-neutral) | U4 |
 | Capabilities at the syscall boundary | U5 (arch-neutral) | U5 |

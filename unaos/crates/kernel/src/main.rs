@@ -245,6 +245,13 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     {
         unaos_kernel::arch::sched::init();
 
+        // U2 Part-0c: kernel-side boundary fixtures (no ring 3). Fire a self-NMI through the real
+        // IPI path and confirm it was taken on the dedicated NMI IST stack (the honest B3 evidence),
+        // and unit-exercise the canonical-`rcx` guard's refusal logic. Both need only the local APIC
+        // + IDT/GDT (all up by now), not the scheduler, so they run here before the ring-3 demos.
+        unaos_kernel::arch::syscall::nmi_self_fire();
+        unaos_kernel::arch::syscall::canonical_guard_selftest();
+
         // U1a: x86 ring-3 round-trip (the aarch64 M6a equivalent). Turn scheduling on (the default
         // test build never enables the feature-gated demo below, so the APs would otherwise idle in
         // `wait_and_run`), map the ring-3 window, then drop a scheduled task to ring 3 on an AP: it
@@ -277,6 +284,16 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
                 unaos_kernel::arch::sched::spawn_user("u1b-code-write", demo.code_write, demo.sp, cpu);
                 unaos_kernel::arch::sched::spawn_user("u1b-stack-exec", demo.stack_exec, demo.sp, cpu);
                 unaos_kernel::arch::syscall::await_u1b_verdict();
+
+                // U2 Part-0a: the TF+SYSCALL DoS fixture (becomes live the moment ring 3 can run
+                // arbitrary loaded code). A ring-3 program arms `RFLAGS.TF` then `SYSCALL`; the
+                // pending single-step #DB lands on the syscall-entry stub at CPL 0 (or, on some
+                // platforms, in ring 3). The dedicated #DB IST + resume-or-kill policy neutralizes
+                // it — the kernel must NOT halt. Runs after the U1b verdict so its (resumed/killed)
+                // accounting can't perturb the U1b split; BSP-quiet verdict, kernel alive after.
+                serial_println!(":: U2-0a: TF+SYSCALL DoS fixture on core {} ::", cpu);
+                unaos_kernel::arch::sched::spawn_user("u2-tf-syscall", demo.tf_syscall, demo.sp, cpu);
+                unaos_kernel::arch::syscall::await_u2_0a_verdict();
             } else {
                 serial_println!(":: U1a: no application processors online — ring-3 demo SKIPPED ::");
             }
@@ -508,6 +525,12 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         // Once storage is up, mount + log the FAT volume geometry (one-shot). Runs with the xHCI
         // lock released; read_block re-locks it briefly, so there is no nested-lock hazard.
         unaos_kernel::fs::fat::probe_once();
+        // U2 (x86): once a block device is present, load HELLO.BIN off the FAT volume and run it in
+        // ring 3 (one-shot, gated like probe_once). Must live HERE, in the main loop — not with the
+        // pre-xHCI U1a/U1b demo — because `fat::mount()` needs the usb-storage block device that
+        // enumerates asynchronously above. No-op on aarch64 / when no FAT volume is present.
+        #[cfg(target_arch = "x86_64")]
+        unaos_kernel::arch::syscall::u2_probe_once();
         // One-shot USB topology dump to serial (enumeration diagnosis; `usbinfo` shows it live).
         unaos_kernel::drivers::xhci::log_summary_once();
 

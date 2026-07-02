@@ -1,0 +1,31 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (C) 2026 The Architect & Una
+#
+# The x86_64 ring-3 "hello from disk" user program (U2) — built as a SEPARATE link product so the
+# user routine lives OUT of the kernel's .text and is loaded FROM DISK. `arroyo`/`builder` build this
+# for a bare x86_64 target and `llvm-objcopy -O binary --only-section=.text` it to `target/hello.bin`,
+# which lands on the FAT image (and the ESP) as HELLO.BIN. The kernel's U2 FAT loader reads it off
+# the volume and runs it in ring 3 (arch/x86_64/syscall.rs::u2_probe_once). x86 twin of the aarch64
+# M6c `crates/user-blob`.
+#
+# The empty [workspace] table makes this crate its OWN workspace root, so the parent UnaOS workspace
+# (unaos/Cargo.toml) never tries to build this no_std/no_main ring-3 blob for the host toolchain
+# during `cargo build`/`./arroyo check`. It is built explicitly, for a custom target, only by the
+# x86 arroyo/builder steps.
+[workspace]
+
+[package]
+name = "user-blob-x86"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "user-blob-x86"
+path = "src/main.rs"
+
+# opt-level "s" (size): a tiny flat blob. panic=abort (no unwinder in a no_std ring-3 program); lto
+# folds the single routine. No dependencies.
+[profile.release]
+opt-level = "s"
+panic = "abort"
+lto = true

@@ -16,11 +16,13 @@
 
 use crate::arch::gdt;
 use lazy_static::lazy_static;
+use x86_64::registers::rflags::RFlags;
 use x86_64::structures::idt::{InterruptDescriptorTable, InterruptStackFrame, PageFaultErrorCode};
 
 // x86 exception vector numbers (Intel SDM Vol.3 Table 6-1). Reported in the U1b kill line so the
 // verdict can match each fixture to the exact fault it was built to provoke.
 const VEC_DE: u8 = 0; // divide error
+const VEC_DB: u8 = 1; // debug (single-step / hardware breakpoint)
 const VEC_BR: u8 = 5; // BOUND range exceeded
 const VEC_UD: u8 = 6; // invalid opcode
 const VEC_NP: u8 = 11; // segment not present
@@ -28,6 +30,7 @@ const VEC_SS: u8 = 12; // stack-segment fault
 const VEC_GP: u8 = 13; // general protection
 const VEC_PF: u8 = 14; // page fault
 const VEC_AC: u8 = 17; // alignment check
+const VEC_MC: u8 = 18; // machine check
 
 /// IDT vectors. This is a pure local-APIC system — there is no 8259 PIC, hence no PIC vector
 /// offset. The APIC timer fires `TIMER_VECTOR`, the xHCI MSI-X interrupter (interrupter 0)
@@ -58,6 +61,24 @@ lazy_static! {
             idt.double_fault
                 .set_handler_fn(double_fault_handler)
                 .set_stack_index(gdt::DOUBLE_FAULT_IST_INDEX);
+        }
+        // #DB (vector 1) on its OWN IST (U2 Part-0a). Without an entry here #DB was absent from the
+        // IDT: ring 3 can set RFLAGS.TF (`popfq`) then SYSCALL, and the pending single-step trap
+        // fires on the FIRST instruction at LSTAR — CPL 0, GS still user, RSP still the ring-3
+        // stack. A missing gate escalates that to #NP (same-CPL, no IST) whose frame lands on the
+        // user-writable stack → misread as a kernel fault → halt: a user-triggerable AP DoS. The
+        // dedicated IST makes the CPU switch stacks unconditionally; the handler stays GS-free.
+        unsafe {
+            idt.debug
+                .set_handler_fn(debug_handler)
+                .set_stack_index(gdt::DB_IST_INDEX);
+        }
+        // #MC (vector 18) on its own IST (U2 Part-0a): always fatal, but on a guaranteed-valid
+        // kernel stack so it logs and halts cleanly instead of triple-faulting from a bad window.
+        unsafe {
+            idt.machine_check
+                .set_handler_fn(machine_check_handler)
+                .set_stack_index(gdt::MC_IST_INDEX);
         }
         // Fault vectors that a ring-3 task can provoke. Each kills the offending task when the
         // fault was taken from CPL 3 and stays fatal (halts) from CPL 0 (a kernel bug); see the
@@ -274,6 +295,49 @@ extern "x86-interrupt" fn alignment_check_handler(
     fatal_fault("ALIGNMENT CHECK", VEC_AC, error_code, &stack_frame);
 }
 
+/// U2 Part-0a: count of #DB traps that hit the SYSCALL-entry TF window and were neutralized by
+/// clearing TF and resuming (rather than halting). Nonzero means the DoS path was actually
+/// exercised — the honest evidence the ledger wants; on platforms whose SYSCALL clears TF before the
+/// trap point (so no #DB is delivered) this stays 0 and the fixture simply exits normally.
+pub static DB_TF_RESUMED: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// #DB (debug, vector 1) handler on a dedicated IST (U2 Part-0a). GS-FREE body — it consults only
+/// the interrupt frame until a ring-3 kill performs its own (CPL-3-correct) `swapgs`. Policy:
+///   * frame `CS.RPL == 3` — a ring-3 program single-stepped itself: kill the task (a user fault).
+///   * frame `CS.RPL == 0` AND RIP inside the `unaos_syscall_entry` stub — the TF-armed-`SYSCALL`
+///     case: the pending single-step trap landed on the entry stub at CPL 0 with GS/RSP possibly
+///     still the ring-3 ones. Clear TF in the saved RFLAGS and `iretq` to resume the syscall — no
+///     GS access, no kill. (Long-mode `iretq` restores RSP/SS unconditionally, so control returns
+///     to the stub on the correct stack.)
+///   * any other CPL-0 #DB — a genuine kernel debug event we didn't arm: fatal, unchanged policy.
+extern "x86-interrupt" fn debug_handler(mut stack_frame: InterruptStackFrame) {
+    if from_ring3(&stack_frame) {
+        unsafe {
+            core::arch::asm!("swapgs", options(nostack, preserves_flags));
+            ring3_fault_kill(VEC_DB, 0, stack_frame.instruction_pointer.as_u64(), 0);
+        }
+    }
+    if crate::arch::syscall::rip_in_entry_stub(stack_frame.instruction_pointer.as_u64()) {
+        // Clear TF in the frame's RFLAGS so the resumed stub does not immediately re-trap, then
+        // return: the compiler-emitted `iretq` restores the (mutated) frame. GS is never touched.
+        unsafe {
+            stack_frame.as_mut().update(|f| f.cpu_flags.remove(RFlags::TRAP_FLAG));
+        }
+        DB_TF_RESUMED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        return;
+    }
+    fatal_fault("DEBUG (#DB)", VEC_DB, 0, &stack_frame);
+}
+
+/// #MC (machine check, vector 18) handler on a dedicated IST (U2 Part-0a). Always fatal. GS-free:
+/// it only prints (no GS-relative access) and halts; the IST stack guarantees it never triple-faults
+/// even if the check lands in the pre-`swapgs`/pre-stack-switch syscall-entry window.
+extern "x86-interrupt" fn machine_check_handler(stack_frame: InterruptStackFrame) -> ! {
+    serial_println!("EXCEPTION: MACHINE CHECK (#MC, vec={})", VEC_MC);
+    serial_println!("{:#?}", stack_frame);
+    crate::hlt_loop();
+}
+
 extern "x86-interrupt" fn double_fault_handler(
     stack_frame: InterruptStackFrame,
     _error_code: u64,
@@ -319,11 +383,25 @@ extern "x86-interrupt" fn ipi_handler(_stack_frame: InterruptStackFrame) {
 /// Count of NMIs taken (lock-free introspection; see the NMI handler below).
 pub static NMI_COUNT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
+/// U2 Part-0c: set once an NMI is observed running on its dedicated NMI IST stack — i.e. the CPU
+/// actually *switched stacks* on delivery, not merely that an NMI arrived. This is what upgrades the
+/// B3 ledger claim from "IST slot installed" to "NMI taken on IST" (see `syscall::nmi_self_fire`).
+pub static NMI_ON_IST: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
 /// Non-maskable interrupt handler. NMIs ignore IF, so this can interrupt a context switch in
 /// progress; it must stay leaf and lock-free (no run queues, no `current`, no spin locks). We
-/// only count and return — that keeps `switch_context` NMI-reentrant-safe.
+/// only count, witness the IST switch, and return — that keeps `switch_context` NMI-reentrant-safe.
 extern "x86-interrupt" fn nmi_handler(_stack_frame: InterruptStackFrame) {
     NMI_COUNT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    // Read the handler's own RSP and check it against the NMI IST bounds (GS-free — no per-CPU
+    // lookup). If it falls inside a CPU's NMI IST stack, the unconditional IST switch happened.
+    let rsp: u64;
+    unsafe {
+        core::arch::asm!("mov {}, rsp", out(reg) rsp, options(nomem, nostack, preserves_flags));
+    }
+    if crate::arch::gdt::rsp_in_nmi_ist(rsp) {
+        NMI_ON_IST.store(true, core::sync::atomic::Ordering::Relaxed);
+    }
 }
 
 /// xHCI MSI-X handler (interrupter 0, IDT vector 0x40). Minimal and lock-free: it

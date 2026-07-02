@@ -81,6 +81,37 @@ build_kernel_x86_64() {
     echo -e "${COLOR_GREEN}✅ x86_64 Kernel Built.${COLOR_RESET}"
 }
 
+# U2: build the x86 ring-3 "hello from disk" user program as a SEPARATE flat link product (out of the
+# kernel's .text) and objcopy it to target/hello.bin — the artifact the builder copies onto the ESP
+# and make-fat-img.sh copies onto the FAT images as HELLO.BIN; the kernel's U2 FAT loader reads it
+# off the volume and runs it in ring 3. Mirrors the aarch64 M6c user-blob objcopy step (see kernel8).
+# Its own workspace + bare x86_64 target + tiny linker script; the routine is position-independent
+# (RIP-relative + inline message), so it runs wherever the kernel copies it. Fast/incremental — safe
+# to call at the start of every x86 build path.
+build_user_hello_x86() {
+    local TOOLBIN; TOOLBIN="$(rustc +nightly --print sysroot)/lib/rustlib/$(rustc +nightly -vV | awk '/host/{print $2}')/bin"
+    echo -e "${COLOR_YELLOW}⚡ Building x86 ring-3 user blob (crates/user-blob-x86 → target/hello.bin)...${COLOR_RESET}"
+    mkdir -p "${WORKSPACE_DIR}/target"
+    cd "$WORKSPACE_DIR/crates/user-blob-x86"
+    RUSTFLAGS="-C link-arg=-T${WORKSPACE_DIR}/crates/user-blob-x86/user-blob-x86.ld" \
+      cargo +nightly build --release -Z json-target-spec
+    cd "$WORKSPACE_DIR"
+    "$TOOLBIN/llvm-objcopy" -O binary --only-section=.text \
+      "${WORKSPACE_DIR}/crates/user-blob-x86/target/x86_64-unknown-none/release/user-blob-x86" \
+      "${WORKSPACE_DIR}/target/hello.bin"
+    # The flat blob must exist and begin EXACTLY at _start's first instruction — the kernel enters the
+    # copy at offset 0, so a stray byte ahead of _start (a future toolchain reordering objcopy output)
+    # would be a metal-only wrong-entry fault QEMU wouldn't reliably catch. _start = `mov rax, 1` =
+    # 48 c7 c0 01 00 00 00; assert the leading 4 bytes.
+    [ -f "${WORKSPACE_DIR}/target/hello.bin" ] || { echo -e "${COLOR_RED}ERROR: hello.bin missing — blob build failed${COLOR_RESET}"; exit 1; }
+    local head4; head4="$(head -c 4 "${WORKSPACE_DIR}/target/hello.bin" | od -An -tx1 | tr -d ' \n')"
+    if [ "$head4" != "48c7c001" ]; then
+        echo -e "${COLOR_RED}ERROR: hello.bin does not start with _start (mov rax,#1); first 4 bytes = ${head4}${COLOR_RESET}"
+        exit 1
+    fi
+    echo -e "${COLOR_GREEN}✅ x86 user blob: $(wc -c < "${WORKSPACE_DIR}/target/hello.bin" | tr -d ' ') bytes${COLOR_RESET}"
+}
+
 build_kernel_aarch64() {
     echo -e "${COLOR_YELLOW}⚡ Building aarch64 Kernel...${COLOR_RESET}"
     cd "$WORKSPACE_DIR/crates/kernel"
@@ -94,6 +125,7 @@ build_kernel_aarch64() {
 # --- Launch Functions ---
 
 launch_x86_64() {
+    build_user_hello_x86   # U2: target/hello.bin — the builder copies it onto the ESP
     build_kernel_x86_64
 
     echo -e "${COLOR_CYAN}⚡ Launching x86_64 via Builder (kernel + bootloader + QEMU)...${COLOR_RESET}"
@@ -223,6 +255,7 @@ SERIAL_LOG="${WORKSPACE_DIR}/target/serial.log"
 
 test_x86_64() {
     local secs="${1:-20}"
+    build_user_hello_x86   # U2: target/hello.bin — the builder copies it onto the ESP
     build_kernel_x86_64
 
     echo -e "${COLOR_CYAN}⚡ Headless x86_64 test (${secs}s). Serial -> ${SERIAL_LOG}${COLOR_RESET}"
@@ -267,10 +300,11 @@ build_both() {
 # stick (so it has /EFI/BOOT/BOOTX64.EFI and /kernel.elf), then boot the Mac holding Option.
 esp_x86() {
     echo -e "${COLOR_CYAN}⚡ Building x86_64 kernel + bootloader and packaging the ESP (no QEMU)...${COLOR_RESET}"
+    build_user_hello_x86   # U2: target/hello.bin — the builder copies it onto the ESP as HELLO.BIN
     cd "$WORKSPACE_DIR/builder"
     UNAOS_PACKAGE_ONLY=1 cargo +nightly run --release
     cd "$WORKSPACE_DIR"
-    echo -e "${COLOR_GREEN}✅ x86 ESP: ${WORKSPACE_DIR}/target/x86_64_esp/${COLOR_RESET}"
+    echo -e "${COLOR_GREEN}✅ x86 ESP: ${WORKSPACE_DIR}/target/x86_64_esp/ (incl. HELLO.BIN for the U2 loader)${COLOR_RESET}"
     echo -e "   Copy its contents to a FAT32 USB root, then boot the Mac holding ⌥ Option → 'EFI Boot'."
 }
 
@@ -278,6 +312,7 @@ esp_x86() {
 # ESP is packaged first (so EFI/ + kernel.elf populate the volume), then builds a partitioned image
 # (MBR@LBA0 -> BPB) and a superfloppy (BPB@LBA0). Test with `UNAOS_FATIMG=1 ./arroyo test`.
 fat_img() {
+    build_user_hello_x86   # U2: ensure target/hello.bin is fresh even if the ESP is reused below
     if [ ! -d "${WORKSPACE_DIR}/target/x86_64_esp" ]; then
         echo -e "${COLOR_YELLOW}⚡ Packaging the x86 ESP first (payload for the FAT image)...${COLOR_RESET}"
         esp_x86
