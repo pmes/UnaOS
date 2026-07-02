@@ -50,9 +50,37 @@
   raspi4b delivers no Group-1 timer IRQ, so `IRQs-taken-at-EL0 = 0` there and EL0 is not
   actually preempted — but on the real Pi 4 (2026-07-02) the run shows `spinner
   completed=1 IRQs-taken-at-EL0=18` (EL=1, CNTFRQ=54 MHz): the timer preempted the
-  spinning EL0 task 18 times AND it resumed correctly (SP_EL0 banking works on real
-  registers), with the M6b verdict still `PASS`, capstone 6/6, and zero fault lines.
-- Not yet: per-task address spaces/ASIDs (M6d), validated user pointers (M6f).
+  spinning EL0 task 18 times AND it resumed correctly (`completed=1` after the
+  preempts proves the banked SP_EL0 restored a usable user stack), with the M6b
+  verdict still `PASS`, capstone 6/6, and zero fault lines. (The spinner is register-
+  only, so it demonstrates *resume-correctness* but cannot observe the banked SP_EL0
+  *value*; the M6d `SP-relative sentinel readback` fixture below is what proves value
+  fidelity — a preempted EL0 task reads its own stack sentinel through SP after the
+  preempts. Metal re-confirm of that fixture pending.)
+- **M6d** — per-task address spaces (ASIDs) + per-task user stacks. Each EL0 task gets
+  its own translation-table branch (private `L1`/`L2_USER`/`L3_USER` copied from the
+  boot tables, only entry 0 differs) and its own 16 KiB backing mapped at the *same*
+  virtual addresses, from a static pool of 8 slots (`boot::alloc_user_slot`, no heap in
+  the switch path). ASID = slot + 1 (1..8); ASID 0 is the shared/boot context. **All
+  user-window leaves are now non-global (`nG=1`)** so the same VA maps different frames
+  per task with no same-VA global/non-global TLB conflict; kernel leaves stay Global
+  (ASID-agnostic — a task switch needs no kernel-mapping flush). `dispatch_next`
+  installs the incoming task's `TTBR0_EL1 = root | asid<<48` only when the live root
+  differs; `exit` tears a slot down (repoint TTBR0 off the dead root → broadcast
+  `TLBI ASIDE1IS` → free the slot). First-entry to EL0 also scrubs x0–x30 (hardening;
+  the aarch64 twin of the x86 SYSRET scrub). Demos (QEMU-provable — isolation is visible
+  without interrupts): `:: M6d: per-task address spaces (8 slots, ASID 1-8, nG user /
+  global kernel) ::`, **same-VA isolation** (two tasks read distinct slot-private
+  sentinels at the identical VA — `A=0xa5a5…1 B=0x5a5a…2 distinct -> PASS`, backed by a
+  deterministic kernel-side TTBR0-swap nG probe that catches a broken `nG` on metal),
+  **EL0 stack write/readback** (the capability this arc unlocks — a program pushes/pops
+  its own stack, impossible on the old shared window), and **SP-relative sentinel
+  readback**. QEMU-verified (2026-07-02): all three `-> PASS`, with M6c/M6b/M6e all
+  unchanged and CAPSTONE 6/6. Metal-verify pending — the ASID/TLB/`nG` discipline and
+  the SP-sentinel-under-preemption are exactly what QEMU (no TLB, no caches, no Group-1
+  IRQ) cannot exercise; note that on metal `IRQs-taken-at-EL0` grows (four more
+  preemptible EL0 tasks), which is expected and metal-variable.
+- Not yet: validated user pointers (M6f).
 
 ### x86_64 (branch `hw-rmbp`)
 
@@ -95,7 +123,7 @@
 | Privilege round-trip | U1a ✅ | M6a ✅ |
 | Per-page perms + fault→kill | U1b | M6b ✅ |
 | Loadable programs | U2 (from FAT storage) | M6c ✅ (embedded blob) |
-| Per-process address space | U3 (per-process PML4/CR3) | M6d (TTBR0 + ASID) |
+| Per-process address space | U3 (per-process PML4/CR3) | M6d ✅ (TTBR0 + ASID) |
 | Process model, PIDs, handle table | U4 (arch-neutral) | U4 |
 | Capabilities at the syscall boundary | U5 (arch-neutral) | U5 |
 | FS-backed grants | U6 (UnaFS attributes) | U6 |

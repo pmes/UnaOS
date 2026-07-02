@@ -201,6 +201,38 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
                 0,
                 vcpu,
             );
+
+            // M6d: per-task address spaces (ASIDs) + per-task user stacks. Allocate four PRIVATE
+            // address-space slots (own translation-table branch + own 16 KiB backing at the SAME VAs,
+            // ASID-tagged) and drop four EL0 tasks onto them via `spawn_user_slot`: two read distinct
+            // slot-private sentinels at the identical VA (same-VA isolation), one WRITES and reads back
+            // its own stack (the capability this arc unlocks — impossible on the shared window), one
+            // spins-then-reads through SP (SP_EL0 fidelity across preemption on metal). Unlike M6b/M6e,
+            // isolation is visible WITHOUT interrupts, so the same-VA/stack lines are fully QEMU-provable;
+            // a deterministic kernel-side nG probe (folded into the same-VA PASS) is the metal detector.
+            // The verdict shares `vcpu` with the M6b/M6e verdicts.
+            if let Some(m6d) = unaos_kernel::arch::syscall::m6d_setup() {
+                unaos_kernel::arch::sched::spawn_user_slot(
+                    "el0-samevaA", m6d.same_va, m6d.sp, m6d.ttbr0_a, cpu,
+                );
+                unaos_kernel::arch::sched::spawn_user_slot(
+                    "el0-samevaB", m6d.same_va, m6d.sp, m6d.ttbr0_b, cpu,
+                );
+                unaos_kernel::arch::sched::spawn_user_slot(
+                    "el0-stackwrite", m6d.stack_write, m6d.sp, m6d.ttbr0_stack, cpu,
+                );
+                unaos_kernel::arch::sched::spawn_user_slot(
+                    "el0-spsentinel", m6d.sp_sentinel, m6d.sp, m6d.ttbr0_sp, cpu,
+                );
+                unaos_kernel::arch::sched::spawn(
+                    "m6d-verdict",
+                    unaos_kernel::arch::syscall::m6d_verdict,
+                    0,
+                    vcpu,
+                );
+            } else {
+                serial_println!(":: M6d: slot allocation failed — per-task address-space demo SKIPPED ::");
+            }
         }
     }
 
