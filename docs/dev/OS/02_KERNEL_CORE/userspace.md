@@ -46,10 +46,12 @@
   `m6e-verdict` that reports `spinner completed` and `IRQs-taken-at-EL0` (counted in
   `aarch64_irq_handler` when the banked SPSR shows an EL0t return). QEMU-verified
   (2026-07-02): the `:: M6e: EL0 preemptible … ::` setup + verdict lines, the M6b
-  verdict still `PASS`, capstone 6/6, no regression. **Metal-only:** QEMU raspi4b
-  delivers no Group-1 timer IRQ, so `IRQs-taken-at-EL0 = 0` there and EL0 is not
-  actually preempted; the real preemption (`IRQs > 0`, the spinner interleaving with
-  capstone) is confirmed later on the real Pi 4.
+  verdict still `PASS`, capstone 6/6, no regression. **Metal-only, now confirmed:** QEMU
+  raspi4b delivers no Group-1 timer IRQ, so `IRQs-taken-at-EL0 = 0` there and EL0 is not
+  actually preempted — but on the real Pi 4 (2026-07-02) the run shows `spinner
+  completed=1 IRQs-taken-at-EL0=18` (EL=1, CNTFRQ=54 MHz): the timer preempted the
+  spinning EL0 task 18 times AND it resumed correctly (SP_EL0 banking works on real
+  registers), with the M6b verdict still `PASS`, capstone 6/6, and zero fault lines.
 - Not yet: per-task address spaces/ASIDs (M6d), validated user pointers (M6f).
 
 ### x86_64 (branch `hw-rmbp`)

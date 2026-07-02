@@ -68,7 +68,7 @@ ports, Jetson joins — full table in `ROADMAP.md` §1).
 - [x] EL0/EL1 privilege split (M6a-0/M6a, 2026-07-01, metal-confirmed)
 - [x] Per-page user permissions: user code EL0-RX, stacks RW-XN; UXN/PXN on user pages (M6b)
 - [x] EL0 fault → task kill with syndrome-matched accounting (M6b)
-- [x] Preemptible EL0 — SP_EL0 banked in the IRQ frame; `spawn_user` starts I-unmasked (M6e, 2026-07-02, QEMU-verified; metal preemption pending). W^X map **unchanged**: the shared user stack is retained (no EL0 program writes its stack), so no new user page and no permission change — the audit table below still holds.
+- [x] Preemptible EL0 — SP_EL0 banked in the IRQ frame; `spawn_user` starts I-unmasked (M6e, 2026-07-02, QEMU-verified + **metal-confirmed** real Pi 4: `IRQs-taken-at-EL0=18`, spinner resumed correctly, no faults). W^X map **unchanged**: the shared user stack is retained (no EL0 program writes its stack), so no new user page and no permission change — the audit table below still holds.
 - [x] Kernel W^X / WXN audit (SCTLR_EL1.WXN feasibility) — audit complete; WXN enable pending review (M6c/H1; table below)
 - [ ] PAN (Privileged Access Never) where silicon supports it
 - [ ] Validated user-pointer access (M6f)
