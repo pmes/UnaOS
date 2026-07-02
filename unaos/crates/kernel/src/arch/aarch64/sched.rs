@@ -312,6 +312,16 @@ extern "C" fn user_task_trampoline() -> ! {
     // and already written to their system registers before the scrub, so zeroing x0-x30 is safe. This is
     // the aarch64 twin of the x86 SYSRET GPR scrub; the preempt-RESUME path is already clean (it restores
     // from the task's own saved frame in `__vec_irq`, not through this trampoline).
+    //
+    // M6f hardening (Part 0) — FP/SIMD + thread-pointer scrub, immediately after the GPR scrub and before
+    // the eret. `CPACR_EL1.FPEN=0b11` (drop_to_el1) makes the WHOLE v0-v31/FPSR/FPCR file EL0-readable, and
+    // the `+neon` kernel autovectorizes (memcpy/fmt/GUI blits) so it leaves live kernel data in the vector
+    // file; the GPR scrub alone is not the no-leak property the ledger wanted, so zero v0-v31 (`movi
+    // vN.2d,#0` needs no GPR) and reset FPSR/FPCR. Also zero-init TPIDR_EL0/TPIDRRO_EL0 (EL0-readable thread
+    // pointers, firmware-residue UNKNOWN; the kernel uses TPIDR_EL2 for per-CPU, never these). All use only
+    // `movi`/xzr, so they run after x0-x30 are already zeroed. FP is enabled at EL1 here (the GUI does NEON),
+    // so `movi` executes without trapping. Like the GPR scrub this covers only FIRST entry; the preempt-
+    // RESUME path restores the task's own saved v0-v31/FPSR/FPCR from its `__vec_irq` frame.
     unsafe {
         core::arch::asm!(
             "msr SP_EL0, x0",
@@ -325,6 +335,19 @@ extern "C" fn user_task_trampoline() -> ! {
             "mov x20, xzr", "mov x21, xzr", "mov x22, xzr", "mov x23, xzr",
             "mov x24, xzr", "mov x25, xzr", "mov x26, xzr", "mov x27, xzr",
             "mov x28, xzr", "mov x29, xzr", "mov x30, xzr",
+            // FP/SIMD file: zero all 32 vector registers (each `.2d,#0` clears both 64-bit lanes).
+            "movi v0.2d, #0",  "movi v1.2d, #0",  "movi v2.2d, #0",  "movi v3.2d, #0",
+            "movi v4.2d, #0",  "movi v5.2d, #0",  "movi v6.2d, #0",  "movi v7.2d, #0",
+            "movi v8.2d, #0",  "movi v9.2d, #0",  "movi v10.2d, #0", "movi v11.2d, #0",
+            "movi v12.2d, #0", "movi v13.2d, #0", "movi v14.2d, #0", "movi v15.2d, #0",
+            "movi v16.2d, #0", "movi v17.2d, #0", "movi v18.2d, #0", "movi v19.2d, #0",
+            "movi v20.2d, #0", "movi v21.2d, #0", "movi v22.2d, #0", "movi v23.2d, #0",
+            "movi v24.2d, #0", "movi v25.2d, #0", "movi v26.2d, #0", "movi v27.2d, #0",
+            "movi v28.2d, #0", "movi v29.2d, #0", "movi v30.2d, #0", "movi v31.2d, #0",
+            "msr FPSR, xzr",        // clear cumulative FP exception flags
+            "msr FPCR, xzr",        // default control (round-to-nearest, no FTZ, no traps)
+            "msr TPIDR_EL0, xzr",   // EL0 RW thread pointer — no kernel residue reaches EL0
+            "msr TPIDRRO_EL0, xzr", // EL0 RO thread pointer (EL1-writable)
             "isb",
             "eret",
             in("x0") sp,

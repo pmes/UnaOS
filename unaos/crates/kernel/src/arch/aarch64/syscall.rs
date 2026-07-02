@@ -557,11 +557,14 @@ pub fn m6d_setup() -> Option<M6dDemo> {
         va
     };
 
-    let slot_a = super::boot::alloc_user_slot()?;
-    let slot_b = super::boot::alloc_user_slot()?;
-    let slot_c = super::boot::alloc_user_slot()?;
-    let slot_d = super::boot::alloc_user_slot()?;
-    let slots = [slot_a, slot_b, slot_c, slot_d];
+    // Multi-alloc with partial-failure unwind (M6d review fold): the old four sequential `alloc_user_slot()?`
+    // calls leaked earlier-claimed slots when a later one failed. `alloc_user_slots` releases what it got and
+    // returns false on exhaustion, so a failed M6d setup frees the whole request.
+    let mut slots = [0usize; 4];
+    if !super::boot::alloc_user_slots(&mut slots) {
+        return None;
+    }
+    let [slot_a, slot_b, slot_c, slot_d] = slots;
 
     // Copy the blob into each slot's code page (identity VA) + I-cache sync (DC CVAU/IC IVAU by the
     // identity VA; A72 caches are PIPT, so the code is fetchable at the aliased EL0 window VA).

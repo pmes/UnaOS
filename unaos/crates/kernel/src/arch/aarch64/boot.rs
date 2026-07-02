@@ -270,6 +270,12 @@ pub unsafe fn enable_mmu() {
 /// instead of consulting the TLB, so a good probe is best-effort evidence — the demo's TLB-warmed
 /// test core is the deterministic detector; a bad probe is always a loud, real failure.
 pub unsafe fn protect_user_code(va: u64, len: usize) -> (bool, bool) {
+    // STOP TRIPWIRE (per-slot tables freeze the boot kernel mappings at COPY time): this edits the SHARED
+    // L3_USER in place — the table each slot COPIED at build time (see `build_slot`), so a slot does NOT
+    // observe this flip on its own copy (per-slot code pages are protected separately via
+    // `protect_user_slot_code`). More generally: any post-boot edit to a KERNEL mapping must be mirrored into
+    // all live slot L1/L2/L3 copies (or force a slot rebuild + TLBI) — per-slot tables freeze the boot kernel
+    // mappings at copy time. This routine touches only USER leaves (in-lane), so no mirroring is owed today.
     let user_pa = &raw const USER_REGION as u64;
     debug_assert!(va & 0xFFF == 0, "protect_user_code: unaligned va");
     debug_assert!(
@@ -385,6 +391,34 @@ pub fn alloc_user_slot() -> Option<usize> {
     None
 }
 
+/// Claim `out.len()` slots at once, filling `out` with their ids; return whether ALL were obtained. On a
+/// partial failure (the pool exhausts mid-request) this RELEASES the slots already claimed in this call and
+/// returns `false`, so a multi-slot request never leaks earlier-claimed slots — the M6d review fold: the
+/// four sequential `alloc_user_slot()?` calls in `m6d_setup` leaked earlier slots when a later one failed
+/// (latent at 4/8, real once a demo allocates near the cap). A slot released here was never installed in any
+/// core's `TTBR0` (a slot goes live only when a task is dispatched onto it), so no core cached a translation
+/// under its ASID — clearing the used-flag is the whole unwind, NO `TLBI` needed (unlike `teardown_user_slot`,
+/// which retires a slot whose ASID went live). STOP tripwire: a request larger than `USER_SLOTS` must FAIL
+/// here, never grow the pool — raising the cap is a later arc (a real user-memory allocator).
+pub fn alloc_user_slots(out: &mut [usize]) -> bool {
+    let mut n = 0;
+    while n < out.len() {
+        match alloc_user_slot() {
+            Some(s) => {
+                out[n] = s;
+                n += 1;
+            }
+            None => {
+                for &s in &out[..n] {
+                    SLOT_USED[s].store(false, Ordering::Release); // never installed -> no TLBI
+                }
+                return false;
+            }
+        }
+    }
+    true
+}
+
 /// Build slot `s`'s L1/L2/L3 by COPYING the finished boot tables (511/512 L1 entries, and every kernel
 /// identity leaf, are byte-identical — so kernel code that runs while this root is live resolves its
 /// .text/heap/stack/device mappings exactly) then patching the user branch: the slot's user-window L3
@@ -393,6 +427,12 @@ pub fn alloc_user_slot() -> Option<usize> {
 /// tables; any prior tenant's ASID was flushed at its teardown), so a `dsb ishst` to publish the stores
 /// to the Inner-Shareable walkers is all that is needed before a TTBR0 points here — no TLBI.
 unsafe fn build_slot(s: usize) {
+    // STOP TRIPWIRE (per-slot tables freeze the boot kernel mappings at COPY time): the loop below COPIES
+    // the boot L1/L2/L3 into this slot, so the slot holds a FROZEN snapshot of every kernel mapping as it
+    // stood when the slot was built. Any post-boot edit to a KERNEL mapping (a new device window, a kernel
+    // W^X/permission flip, a heap remap) is INVISIBLE to already-built slots — it MUST be mirrored into all
+    // live slot L1/L2/L3 copies (or force a slot rebuild + TLBI). Today this holds because M6b/M6d/M6f only
+    // ever edit USER leaves, which are per-slot by construction; a kernel-mapping edit is out of that lane.
     let user_pa = &raw const USER_REGION as u64; // the shared user VA every slot re-maps to its backing
     let user_end = user_pa + USER_REGION_SIZE as u64;
     let l2_idx = (user_pa >> 21) as usize;
@@ -500,6 +540,11 @@ pub unsafe fn teardown_user_slot(asid: u64) {
 /// differ). Cleans up its cached entries with an all-ASID broadcast TLBI of the probe VA.
 pub unsafe fn probe_slot_isolation(a: usize, b: usize, off: u64, expect_a: u64, expect_b: u64) -> bool {
     debug_assert!(a < USER_SLOTS && b < USER_SLOTS);
+    // The no-TLBI TTBR0 swap between the two roots is architecturally legal ONLY because they carry
+    // DISTINCT ASIDs: that is what lets the second (ASID-b) load miss the ASID-a entry the first load
+    // cached and re-walk to slot b. Two equal slots would share an ASID and the probe would read slot a's
+    // frame under both roots — silently "passing" the isolation check it exists to make fail on a bug.
+    debug_assert!(a != b, "probe_slot_isolation requires distinct slots (distinct ASIDs)");
     let va = (&raw const USER_REGION as u64) + off;
     let root_a = slot_ttbr0(a);
     let root_b = slot_ttbr0(b);
