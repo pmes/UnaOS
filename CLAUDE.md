@@ -25,11 +25,19 @@ several sessions can work in parallel without stepping on each other.
   `hw-jetson` (`../UnaOS-jetson`, Jetson Orin Nano).
 - Track sessions commit **only to their own track branch**. Never merge or
   push to `main` — the integrator session does that after review.
+- **Tracks run independently, at their own pace.** No track waits for another.
+  When a track's arc lands and passes review, the integrator merges *that* arc
+  to `main` and rebases *that* track for its next arc; the other tracks keep
+  running on their current base and rebase at their own next landing. The only
+  standing cap: **one unmerged arc per track** — a fresh session per arc; don't
+  stack a second arc on an unreviewed one within the same track.
 - While parallel arcs are in flight: the rmbp session owns shared kernel-core
   files; the pi and jetson sessions touch only the files their brief names
   (pi: its `arch/aarch64` arc files; jetson: GIC/timer + `tegra`-feature
   files). If your arc needs a file outside your lane: **stop and report** —
-  the integrator updates the briefs.
+  the integrator updates the briefs. (Lanes are why independent merges stay
+  conflict-free: x86 vs aarch64 rarely collide; docs/`arroyo` the integrator
+  reconciles at merge.)
 
 ## Arc discipline
 
