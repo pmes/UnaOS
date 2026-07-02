@@ -82,8 +82,7 @@ static NEXT_TID: AtomicU64 = AtomicU64::new(1);
 /// A kernel thread. Owned as `Box<Task>`: it lives in exactly one place — a run queue, or "running"
 /// (the Box leaked to a raw pointer in `SchedCpu::current`).
 pub struct Task {
-    #[allow(dead_code)] // read by the future `sched`/`ps` command + join handles
-    id: u64,
+    id: u64, // read by `current_id` (M6f SYS_GETPID/GETINFO) + join handles
     name: &'static str, // read by `current_name` (the M6b EL0 fault-kill log)
     /// `STATE_*`, written by the owning CPU only.
     state: AtomicU8,
@@ -595,6 +594,15 @@ pub fn current_name() -> Option<&'static str> {
     let cpu = percpu::this_cpu().cpu_index as usize;
     let raw = SCHED[cpu].current.load(Ordering::Acquire) as *const Task;
     if raw.is_null() { None } else { Some(unsafe { (*raw).name }) }
+}
+
+/// The id (pid) of the task currently dispatched on THIS core, or None outside a scheduled task.
+/// The aarch64 twin of `current_name`; backs the M6f `SYS_GETPID`/`SYS_GETINFO` syscalls (a syscall
+/// always runs with its EL0 task current, so it always resolves to a real id there).
+pub fn current_id() -> Option<u64> {
+    let cpu = percpu::this_cpu().cpu_index as usize;
+    let raw = SCHED[cpu].current.load(Ordering::Acquire) as *const Task;
+    if raw.is_null() { None } else { Some(unsafe { (*raw).id }) }
 }
 
 /// Terminate the current task: mark it finished and switch to the scheduler for good (which frees

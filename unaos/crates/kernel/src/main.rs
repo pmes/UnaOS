@@ -244,6 +244,38 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
             } else {
                 serial_println!(":: M6d: slot allocation failed — per-task address-space demo SKIPPED ::");
             }
+
+            // M6f: validated user pointers (copy_from_user/copy_to_user) + a wider syscall surface
+            // (YIELD/SLEEP_MS/GETPID/GETINFO). Four EL0 fixtures on PRIVATE slots (the getinfo fixture
+            // writes its stack via copy_to_user, forbidden on the shared window): a well-behaved getinfo
+            // round-trip (copy_to_user then read-back matches SYS_GETPID), a hostile-pointer fixture whose
+            // four bad pointers must each ERROR-RETURN -EFAULT (never a kill), and a yield/sleep pair that
+            // cooperatively interleaves on `cpu` (the two must share a core to interleave under QEMU, which
+            // has no preemption). Verdict on the sibling `vcpu`. M6d holds 4 slots, M6f takes the other 4 —
+            // exactly the 8-slot cap. Essentially QEMU-provable (validation + copies under ASIDs the metal
+            // already proved); the per-task preempt counter goes > 0 on metal (rides along with M6g).
+            if let Some(m6f) = unaos_kernel::arch::syscall::m6f_setup() {
+                unaos_kernel::arch::sched::spawn_user_slot(
+                    "el0-getinfo", m6f.getinfo, m6f.sp, m6f.ttbr0_getinfo, cpu,
+                );
+                unaos_kernel::arch::sched::spawn_user_slot(
+                    "el0-hostile", m6f.hostile, m6f.sp, m6f.ttbr0_hostile, cpu,
+                );
+                unaos_kernel::arch::sched::spawn_user_slot(
+                    "el0-yield", m6f.yield_prog, m6f.sp, m6f.ttbr0_yield, cpu,
+                );
+                unaos_kernel::arch::sched::spawn_user_slot(
+                    "el0-sleep", m6f.sleep_prog, m6f.sp, m6f.ttbr0_sleep, cpu,
+                );
+                unaos_kernel::arch::sched::spawn(
+                    "m6f-verdict",
+                    unaos_kernel::arch::syscall::m6f_verdict,
+                    0,
+                    vcpu,
+                );
+            } else {
+                serial_println!(":: M6f: slot allocation failed — validated-user-pointer demo SKIPPED ::");
+            }
         }
     }
 
