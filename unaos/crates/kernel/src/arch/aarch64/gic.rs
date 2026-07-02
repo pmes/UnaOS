@@ -118,9 +118,10 @@ static GIC_IS_V3: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBoo
 /// Whether the runtime GIC is a GICv3. Compile-time `false` under `pi` (the GIC-400 is always v2),
 /// so all v3 dispatch arms in this file are dead-code-eliminated from the Pi image (where every
 /// caller of this helper is itself `#[cfg(not(feature = "pi"))]`, hence the pi-only dead_code allow).
+/// `pub` so the JC2 virt-SMP kick-off in `main.rs` can gate PSCI bring-up on GICv3 at runtime.
 #[inline]
 #[cfg_attr(feature = "pi", allow(dead_code))]
-fn is_v3() -> bool {
+pub fn is_v3() -> bool {
     #[cfg(feature = "pi")]
     {
         false
@@ -288,12 +289,16 @@ fn mpidr_affinity() -> u32 {
 /// Find THIS core's redistributor frame by walking the GICR frames and matching GICR_TYPER's
 /// affinity against MPIDR_EL1. On QEMU virt's UEFI single-core path it's the first frame; the walk
 /// is factored (not cached in a BSP-only static) so JC2's APs each resolve their own. Panics — a
-/// loud STOP+report — if the `Last` frame is reached without a match (a malformed GIC / wrong base).
+/// loud STOP+report — if the `Last` frame is reached without a match, OR if the walk runs past a
+/// bounded frame cap without seeing `Last` (JC1 review hardening: a GIC that never reports Last, or a
+/// wrong stride, must fail loudly here rather than walk unbounded MMIO off the end of the region).
 #[cfg(not(feature = "pi"))]
 fn this_cpu_redistributor() -> usize {
     let target = mpidr_affinity();
+    // 8 >> the 4 frames QEMU virt `-smp 4` exposes; an Orin cluster count would raise this.
+    const MAX_FRAMES: usize = 8;
     let mut frame = GICR_BASE;
-    loop {
+    for _ in 0..MAX_FRAMES {
         let typer = unsafe { gicr_read64(frame, GICR_TYPER) };
         if (typer >> 32) as u32 == target {
             return frame;
@@ -303,6 +308,10 @@ fn this_cpu_redistributor() -> usize {
         }
         frame += GICR_STRIDE;
     }
+    panic!(
+        "GICv3: redistributor walk exceeded {} frames (no Last bit / wrong stride) for affinity {:#010x}",
+        MAX_FRAMES, target
+    );
 }
 
 /// Wake this core's redistributor and put all its banked INTIDs (SGIs + PPIs) into Group 1, then
@@ -365,6 +374,17 @@ fn init_cpu_interface_v3() {
         core::arch::asm!("msr S3_0_C12_C12_7, {}", in(reg) 1u64, options(nomem, nostack, preserves_flags));
         core::arch::asm!("isb", options(nomem, nostack, preserves_flags));
     }
+}
+
+/// GICv3 per-core bring-up for a secondary CPU (JC2): wake THIS core's redistributor (banked SGI/PPI
+/// state → Group 1) and open THIS core's system-register CPU interface. Both are banked per-core, so
+/// the BSP's `init_v3` covers only the boot core; each AP calls this once (after its MMU + VBAR are
+/// up, before it enables its own SGIs). The (global) distributor is already enabled by the BSP and is
+/// left untouched. QEMU `virt` only — the redistributors this walks do not exist on a GICv2.
+#[cfg(not(feature = "pi"))]
+pub fn init_secondary_v3() {
+    init_redistributor_v3();
+    init_cpu_interface_v3();
 }
 
 /// Boot-time self-SGI smoke (QEMU virt path, both GIC versions). Sends a free SGI to this core and
