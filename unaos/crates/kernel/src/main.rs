@@ -231,28 +231,19 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         // test build never enables the feature-gated demo below, so the APs would otherwise idle in
         // `wait_and_run`), map the ring-3 window, then drop a scheduled task to ring 3 on an AP: it
         // runs an embedded routine that does `sys_write("hello from ring 3\n")` then `sys_exit(0)`
-        // via SYSCALL/SYSRET, and the scheduler reclaims it. A verdict task on a DIFFERENT core (so
-        // a wedged demo core still yields a line) demands the exact "exited ok" outcome. All
-        // synchronous + QEMU-verifiable; metal verification is a later arc boundary.
+        // via SYSCALL/SYSRET, and the scheduler reclaims it. The BSP then waits (bounded) for the
+        // round-trip and prints the verdict itself — see `await_verdict`: BSP-quiet so the AP's
+        // SYSCALL/hello lines reach the (serial-less) framebuffer console uncontended and the demo
+        // lands contiguously in the photographed boot log. All synchronous + QEMU-verifiable; metal
+        // verification is a later arc boundary.
         {
             let online = unaos_kernel::arch::smp::online_aps();
             if let Some(&cpu) = online.first() {
                 unaos_kernel::arch::sched::enable();
                 let demo = unaos_kernel::arch::syscall::setup();
+                serial_println!(":: U1a: ring-3 demo — user task on core {} ::", cpu);
                 unaos_kernel::arch::sched::spawn_user("u1a-hello", demo.entry, demo.sp, cpu);
-                let vcpu = online.get(1).copied().unwrap_or(cpu);
-                unaos_kernel::arch::sched::spawn(
-                    "u1a-verdict",
-                    unaos_kernel::arch::syscall::verdict,
-                    0,
-                    vcpu,
-                    unaos_kernel::arch::sched::PRIO_NORMAL,
-                );
-                serial_println!(
-                    ":: U1a: ring-3 demo — user task on core {}, verdict on core {} ::",
-                    cpu,
-                    vcpu
-                );
+                unaos_kernel::arch::syscall::await_verdict();
             } else {
                 serial_println!(":: U1a: no application processors online — ring-3 demo SKIPPED ::");
             }

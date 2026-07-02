@@ -170,11 +170,13 @@ extern "C" fn syscall_dispatch(nr: u64, a0: u64, a1: u64, a2: u64) -> i64 {
 ///
 /// The pointer is a ring-3 VA that (identity map) equals the kernel VA, so the kernel reads it
 /// directly — BUT it is UNTRUSTED, so it is bound-checked against the user window before the deref:
-/// a ring-3 caller must not be able to point `buf` at kernel RAM (exfiltration out the serial port)
-/// or at unmapped memory (a ring-0 fault). Full copy_from_user is a later arc; this closes the hole
-/// cheaply. Emitted under a BLOCKING 16550 lock (not the best-effort `try_lock` in `_print`) so the
-/// demo evidence is never dropped under cross-core print contention; IF is masked here, so the
-/// cross-core spin cannot self-deadlock.
+/// a ring-3 caller must not be able to point `buf` at kernel RAM (exfiltration out the console) or
+/// at unmapped memory (a ring-0 fault). Full copy_from_user is a later arc; this closes the hole
+/// cheaply. Emitted through the standard console path (`serial_print!` -> UART **and** framebuffer
+/// mirror) so the line is visible on a serial-less machine (fbcon) too, not only in QEMU's
+/// serial.log — the rMBP has no 16550, so a UART-only write would vanish. The demo runs in a
+/// BSP-quiet window (see `await_verdict`), so the best-effort console lock is uncontended here and
+/// the line is not dropped.
 fn sys_write(fd: u64, buf: u64, len: u64) -> i64 {
     if fd != 1 {
         return -9; // -EBADF (only stdout for U1a)
@@ -186,8 +188,8 @@ fn sys_write(fd: u64, buf: u64, len: u64) -> i64 {
         return -14; // -EFAULT
     }
     let bytes = unsafe { core::slice::from_raw_parts(buf as *const u8, len as usize) };
-    // The console sink is UTF-8 (fmt::Write). U1a output is ASCII; for any non-UTF-8 tail, write the
-    // valid prefix and report that many bytes (an honest partial write) rather than mangling bytes.
+    // The console sink is UTF-8. U1a output is ASCII; for any non-UTF-8 tail, write the valid prefix
+    // and report that many bytes (an honest partial write) rather than mangling bytes.
     let (text, written) = match core::str::from_utf8(bytes) {
         Ok(s) => (s, len),
         Err(e) => {
@@ -195,10 +197,7 @@ fn sys_write(fd: u64, buf: u64, len: u64) -> i64 {
             (unsafe { core::str::from_utf8_unchecked(&bytes[..v]) }, v as u64)
         }
     };
-    use core::fmt::Write;
-    if let Some(uart) = crate::arch::serial::SERIAL1.lock().as_mut() {
-        let _ = uart.write_str(text);
-    }
+    serial_print!("{}", text);
     written as i64
 }
 
@@ -315,18 +314,21 @@ pub fn setup() -> UserDemo {
     }
 }
 
-/// U1a verdict task: wait (bounded on the ms-clock) for the ring-3 program to terminate, then print
-/// one PASS/FAIL line. Spawned on a DIFFERENT core than the demo so a wedged demo core still yields
-/// a verdict. `ticks()` advances under QEMU (BSP-driven), so the bound is real.
-pub fn verdict(_: usize) {
+/// U1a verdict, run on the BSP right after `spawn_user`: block (bounded on the ms-clock) until the
+/// ring-3 task terminates, then print one PASS/FAIL line. Deliberately BSP-side rather than a task
+/// on another core: the BSP prints nothing while it waits, so the ring-3 task's `SYSCALL` + `hello`
+/// lines (printed from its AP) reach the console UNCONTENDED and the whole demo lands contiguously
+/// in the boot log — decisive on the serial-less metal target, where the log is photographed off
+/// the framebuffer and the best-effort fbcon lock silently drops lines under cross-core contention.
+/// `ticks()` advances on the BSP (its timer ISR drives the global ms-clock), so the bound is real
+/// even though the BSP is not scheduled; a timeout FAIL (`0/0`) means the round-trip never returned.
+pub fn await_verdict() {
     let start = crate::arch::ticks();
-    let deadline = start + 5000; // ~5 s at the calibrated 1 kHz; the demo completes in well under 1 s
-    loop {
-        let done = U1A_EXITED_OK.load(Ordering::Acquire) + U1A_EXITED_ERR.load(Ordering::Acquire);
-        if done >= 1 || crate::arch::ticks() > deadline {
-            break;
-        }
-        crate::arch::sched::yield_now();
+    let deadline = start + 2000; // ~2 s at the calibrated 1 kHz; the round-trip is sub-millisecond
+    while U1A_EXITED_OK.load(Ordering::Acquire) + U1A_EXITED_ERR.load(Ordering::Acquire) == 0
+        && crate::arch::ticks() < deadline
+    {
+        core::hint::spin_loop();
     }
     let ok = U1A_EXITED_OK.load(Ordering::Acquire);
     let err = U1A_EXITED_ERR.load(Ordering::Acquire);
@@ -334,7 +336,7 @@ pub fn verdict(_: usize) {
         serial_println!(":: U1a: user exited ok (sys_exit 0) -> PASS ::");
     } else {
         serial_println!(
-            ":: U1a: FAIL — exited_ok={} exited_err={} (want 1/0) ::",
+            ":: U1a: FAIL — exited_ok={} exited_err={} (want 1/0; 0/0 = ring-3 task never returned) ::",
             ok,
             err
         );

@@ -51,7 +51,14 @@
   entry), **CR4.SMEP** (CPUID-gated — set on Ivy Bridge metal; TCG `qemu64`
   lacks it, logged), and **TSS.RSP0** so a ring-3 fault lands on a kernel stack
   instead of triple-faulting. QEMU-verified (2026-07-02: `hello from ring 3` +
-  `U1a … PASS`, no faults, full boot/SMP/USB regression intact); metal pending.
+  `U1a … PASS`, no faults, full boot/SMP/USB regression intact). **Partial metal
+  evidence (real 2012 rMBP, 2026-07-02):** `:: SMEP on ::` (the one thing QEMU/TCG
+  cannot show — real supervisor-execute protection active), the 1 TiB window
+  mapped on the real firmware map (the `CR0.WP` page-table write succeeds on
+  silicon), 8 CPUs online. The round-trip's own lines needed a console-output fix
+  first — `sys_write` now mirrors to the framebuffer (the rMBP has no 16550) and
+  the verdict prints from a BSP-quiet window so the AP's lines aren't dropped by
+  fbcon lock contention; round-trip metal re-photograph pending.
 - x86-specific shape (adapted from the aarch64 reference, which assumes infra
   x86 lacks): the SYSCALL stack-switch anchors are folded into `PerCpuData`
   (reached via `IA32_GS_BASE`; `KERNEL_GS_BASE` holds that pointer while ring 3
