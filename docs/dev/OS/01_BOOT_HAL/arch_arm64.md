@@ -130,3 +130,108 @@ bring-up above is written to make it a small delta (swap the GICR base + confirm
 the conduit; the capture/replay and per-core GICv3 init carry over). Nothing here
 should be read as a metal claim: QEMU models no Tegra machine, and QEMU-green
 does not imply Orin-correct.
+
+## 4. Jetson Orin Nano headless bring-up (Arc JM2)
+
+The Orin is brought up **headless over serial**. The only console that has ever
+worked on the board is a Raspberry Pi Debug Probe on the carrier's TTL header
+(pin 3 = RX, pin 4 = TX, 115200 8N1); the USB-C port never enumerated, and the
+only display adapter on hand (a passive DP→mini-HDMI) drives nothing (the Orin's
+DisplayPort needs a native or active sink). So the boot path must reach a live
+serial console with **no framebuffer** — which is what JM2 makes true end to end.
+
+### Boot flow (esp-jetson media)
+
+`UNAOS_TEGRA=1 ./arroyo esp-jetson` builds a single-FAT32 USB stick
+(`EFI/BOOT/BOOTAA64.EFI` + `kernel.elf`) that NVIDIA's on-board UEFI (JetPack 6 /
+L4T r36) launches from the UEFI Shell (`connect -r`, `map -r`, then
+`FSx:\EFI\BOOT\BOOTAA64.EFI`). From power-on:
+
+1. **Bootloader** runs — confirmed on silicon at the JM1 bench (`UnaOS UEFI
+   Bootloader Started`). With `UNAOS_BOOTDIAG=1` it first prints the `BOOTDIAG:`
+   block (below).
+2. **GOP lookup** now boots **headless** instead of returning `UNSUPPORTED` —
+   JM1's dead end (`Failed to get GraphicsOutput handle: NOT_FOUND`). See
+   "Headless bootloader" below.
+3. Kernel load + relocation + `ExitBootServices`, then `_start(boot_info)` at
+   whatever EL the firmware hands off (the kernel boot-diag line reports it).
+4. **`tegra` early platform stop** (`crates/kernel/src/main.rs::tegra_early_stop`):
+   the kernel prints its banner + boot-diag line + `:: tegra: early platform stop
+   (gic/timer discovery = JM3) ::`, then a serial-alive heartbeat loop
+   (`:: tegra: heartbeat <n> ::`). It does **not** bring up the GIC or generic
+   timer — those walk QEMU-`virt` MMIO bases unmapped on Tegra234 (JM3's job).
+   With no timer IRQ there is no `WFI`; the plain spin's climbing heartbeat is the
+   arc's liveness verdict.
+
+### Headless bootloader (`fb_addr == 0`)
+
+`crates/bootloader/src/main.rs` used to `return Status::UNSUPPORTED` when the
+firmware published no `GraphicsOutput` protocol — invisible on a serial-less box,
+and the JM1 stop. Both GOP-acquisition `Err` arms now join the existing headless
+path: `fb_addr = 0`, `fb_size = 0`, `FrameBufferInfo` zeroed with
+`PixelFormat::Unknown`, `mode_action = 4`. The kernel already treats
+`framebuffer_addr == 0` as serial-only (fbcon no-ops, the GUI is skipped), so a
+GOP-less platform boots to a serial console instead of bouncing back to the
+firmware boot picker. `mode_action = 4` reads out as `headless (no GOP protocol)`
+in the boot-log mode-action match. This is the **shared** bootloader, so the x86
+rMBP boots through it too — but in QEMU (x86 and aarch64 `virt`) a GOP is always
+present, so the headless arms are never taken and boot logs stay byte-identical.
+
+### `BOOTDIAG` block (`UNAOS_BOOTDIAG=1`)
+
+An additive, knob-gated diagnostics block (`bootdiag` cargo feature) prints,
+before the GOP lookup: firmware vendor + revision + UEFI spec revision; the
+**GraphicsOutput handle count** via `locate_handle_buffer` (so a truly headless
+SoC reads 0, rather than JM1's ambiguous `get_handle_for_protocol` NOT_FOUND);
+**ConOut's device path**; and — the UART truth — the DTB `/chosen` `stdout-path`,
+the node it resolves to, `bootargs`, and the `serial*`/`uart*` `/aliases` (whose
+node names carry the physical MMIO base). OFF by default ⇒ byte-identical boot
+logs. This is what names the Orin's real console UART for JM3. Only the aarch64
+bootloader build reads the knob; the x86 bootloader (built by the `builder` crate)
+is unaffected.
+
+### UART / GOP truth table
+
+The `tegra` serial driver's assumptions vs. what the attended boot must confirm.
+**Nothing below is a metal claim** — the right-hand column is filled from the
+`BOOTDIAG` serial capture at the operator-attended boot (R4).
+
+| Aspect            | Driver assumption (pre-metal)                            | Confirm at attended boot (BOOTDIAG / kernel banner) |
+|-------------------|----------------------------------------------------------|-----------------------------------------------------|
+| Console UART base | UARTC `0x0C28_0000`, NS16550, reg-shift 2 (AON/SPE TCU)  | `/chosen stdout-path` + resolved `serial*` alias node |
+| UART reset/clock  | inherited from firmware (no baud/divisor reprogramming)  | LSR readback (0x00 ⇒ held in reset; 0xFFFF_FFFF ⇒ open-bus / wrong base) |
+| GOP               | none published (headless)                                | `BOOTDIAG: GraphicsOutput handles = N` (expect 0)   |
+| Handoff EL        | unknown (EL2 on QEMU `virt`, EL2 on Pi UEFI)             | kernel boot-diag `EL=` line                         |
+| Generic-timer Hz  | unknown on silicon (62.5 MHz QEMU `virt`, 54 MHz Pi 4)  | kernel boot-diag `CNTFRQ=` line                     |
+
+(Values filled at the JM2 attended boot: _pending — see the JM2 landing report._)
+
+### Orin-metal delta list (feeds JM3 + the cable-day graphical arc)
+
+The `virt` GICv3 + PSCI SMP (JC2) is written to be a small delta to Orin silicon,
+but the following must change and are **not** covered by QEMU:
+
+* **GICR base *and* frame stride.** The redistributor walk (`smp_virt.rs`)
+  hardcodes the QEMU-`virt` `GICR_BASE` (`0x080A_0000`) and a `0x2_0000` per-core
+  stride (two 64 KiB frames: RD + SGI). Tegra234's GIC-600 is a **4-frame** class
+  (RD + SGI + VLPI + reserved) — derive the stride from `GICR_TYPER.VLPIS` instead
+  of assuming virt's two-frame layout, and point the base at the Tegra234
+  redistributor. Widen the target MPIDR to real cluster affinities (Aff1-3) for
+  `IROUTER`/`ICC_SGI1R` while here.
+* **PSCI conduit from the real DTB.** JC2 confirmed QEMU's conduit is **SMC** via
+  `dumpdtb`, but the DTB **parse path is latent** — only the SMC-assumed fallback
+  has ever run (the `virt` log prints `method not in FDT, assumed`). On the Orin,
+  parse `/psci method` from the firmware DTB and honor it (`smc` vs `hvc`).
+* **`SEC_CTX` must add `HCR_EL2`.** The capture/replay of the BSP's live EL2 state
+  omits `HCR_EL2`; `E2H` is not guaranteed 0 on all silicon, and a reset AP coming
+  up with a different `E2H`/`TGE` than the BSP would interpret the replayed
+  `TCR`/`TTBR`/`SCTLR` under the wrong translation regime. Add `HCR_EL2` to the
+  captured set.
+* **`CPTR_EL2` replay + AP pre-MMU stack spill → asm stub.** Both currently rely on
+  compiler fortune (the `CPTR_EL2` replay runs in Rust before the first FP/NEON
+  instruction; the pre-MMU stack spill assumes the compiler doesn't touch the stack
+  first). On real silicon make these **structural** — do the `CPTR_EL2` write and
+  the stack setup in the AP entry asm stub, before any compiler-generated code runs.
+* **Per-AP SGI attribution via distinct INTIDs.** The cross-core SGI proof is "at
+  least once" (GICv3 coalesces) because every AP uses one INTID; on metal, give each
+  AP a distinct SGI INTID so per-core delivery is individually attributable.
