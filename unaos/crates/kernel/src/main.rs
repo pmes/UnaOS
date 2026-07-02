@@ -419,6 +419,12 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
             }
             // Once storage is up, mount + log the FAT volume geometry (one-shot).
             unaos_kernel::fs::fat::probe_once();
+            // U2 (x86): also run the FAT loader HERE so its lines are VISIBLE on the serial-less
+            // metal boot — the usbdebug view keeps fbcon attached (unlike the GUI loop, which detaches
+            // it before U2 runs). Same one-shot gate; loads HELLO.BIN + prints `hello from disk` + the
+            // U2 PASS line onto the framebuffer.
+            #[cfg(target_arch = "x86_64")]
+            unaos_kernel::arch::syscall::u2_probe_once();
             unaos_kernel::drivers::xhci::log_summary_once();
             while let Some(event) = unaos_kernel::pal::next_event() {
                 match event {
