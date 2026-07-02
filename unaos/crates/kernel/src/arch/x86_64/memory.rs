@@ -272,17 +272,10 @@ pub unsafe fn map_user_page(va: u64, phys: u64, writable: bool, nx: bool) {
     *pte = (phys & PTE_ADDR) | flags;
 }
 
-/// Drop WRITABLE on an already-mapped user page (the code page's W^X flip) and invalidate this
-/// CPU's TLB for it. The window is never touched before this runs, so no other CPU can hold a
-/// stale entry; the local `invlpg` is belt-and-suspenders.
-pub unsafe fn protect_user_page_ro(va: u64) {
-    let pml4e = *cr3_table().add(pml4_index(va));
-    let pdpt = (pml4e & PTE_ADDR) as *mut u64;
-    let pdpte = *pdpt.add(pdpt_index(va));
-    let pd = (pdpte & PTE_ADDR) as *mut u64;
-    let pde = *pd.add(pd_index(va));
-    let pt = (pde & PTE_ADDR) as *mut u64;
-    let pte = pt.add(pt_index(va));
-    *pte &= !PTE_WRITABLE;
-    core::arch::asm!("invlpg [{}]", in(reg) va, options(nostack, preserves_flags));
-}
+// U1b B4: the user code page is now mapped READ-ONLY at USER_BASE from the start (`syscall::setup`
+// passes `writable=false`), so there is no writable→read-only "flip" and thus no cross-core stale
+// writable mapping to shoot down. The blob is copied through the identity alias (a distinct kernel
+// VA), never through USER_BASE, so the ring-3 mapping never needs the WRITABLE bit. The old
+// `protect_user_page_ro` (a BSP-only `invlpg` after a live W-drop) is gone with the hole it left: a
+// PTE that was never writable cannot be cached writable on any core. W^X is enforced across cores
+// by construction — see `docs/SECURITY.md`.

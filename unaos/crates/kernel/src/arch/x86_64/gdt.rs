@@ -33,6 +33,15 @@ use x86_64::structures::tss::TaskStateSegment;
 use x86_64::VirtAddr;
 
 pub const DOUBLE_FAULT_IST_INDEX: u16 = 0;
+/// IST slot for the NMI vector (U1b B3). An NMI ignores IF and can land in the pre-`swapgs`,
+/// pre-stack-switch window of `unaos_syscall_entry` — where rsp still points at the ring-3
+/// (user-writable) stack. Giving the NMI its own IST stack makes the CPU switch to a dedicated
+/// kernel stack on every NMI regardless of CPL, so its frame can never be pushed onto (or read
+/// from) the user stack. The handler stays GS-free (see `interrupts::nmi_handler`), so it needs
+/// nothing but a valid stack — which the IST guarantees.
+pub const NMI_IST_INDEX: u16 = 1;
+/// Number of per-CPU IST stacks we reserve: [0] double fault, [1] NMI.
+const NUM_IST: usize = 2;
 
 // Fixed selectors for the per-CPU GDT layout built by `init_cpu` (identical on every CPU). The
 // APPEND ORDER below is load-bearing for SYSCALL/SYSRET: SYSCALL loads CS = STAR[47:32] and
@@ -83,9 +92,11 @@ impl PerCpu {
 /// which static storage guarantees.
 static mut CPUS: [PerCpu; MAX_CPUS] = [const { PerCpu::new() }; MAX_CPUS];
 
-/// Per-CPU double-fault IST stacks, one per CPU (kept out of `PerCpu` so that struct stays
-/// small). 8 KiB × MAX_CPUS in `.bss`.
-static mut IST_STACKS: [[u8; IST_STACK_SIZE]; MAX_CPUS] = [[0; IST_STACK_SIZE]; MAX_CPUS];
+/// Per-CPU IST stacks: `NUM_IST` per CPU (kept out of `PerCpu` so that struct stays small).
+/// Index 0 = double fault, index 1 = NMI (see `DOUBLE_FAULT_IST_INDEX` / `NMI_IST_INDEX`).
+/// 8 KiB × NUM_IST × MAX_CPUS in `.bss`.
+static mut IST_STACKS: [[[u8; IST_STACK_SIZE]; NUM_IST]; MAX_CPUS] =
+    [[[0; IST_STACK_SIZE]; NUM_IST]; MAX_CPUS];
 
 /// Build and load this CPU's GDT + TSS. `cpu_index` selects the per-CPU block: the BSP passes
 /// 0; each AP passes the logical index it was assigned at discovery. Runs once per CPU, early
@@ -106,11 +117,16 @@ pub fn init_cpu(cpu_index: usize) {
         // `static mut` itself (edition 2024 forbids that); the addresses are stable for the
         // CPU's lifetime, which is exactly what `lgdt`/`ltr` require.
         let cpu = &raw mut CPUS[cpu_index];
-        let ist_stack = &raw const IST_STACKS[cpu_index];
 
-        // 1. Point this CPU's double-fault IST entry at its own IST stack (top = base + size).
-        let stack_top = VirtAddr::from_ptr(ist_stack) + IST_STACK_SIZE as u64;
-        (*cpu).tss.interrupt_stack_table[DOUBLE_FAULT_IST_INDEX as usize] = stack_top;
+        // 1. Point this CPU's IST entries at its own dedicated IST stacks (top = base + size).
+        //    Slot 0 = double fault, slot 1 = NMI — separate stacks so an NMI taken while the
+        //    double-fault handler runs (or vice versa) cannot scribble the other's frame.
+        let df_stack = &raw const IST_STACKS[cpu_index][DOUBLE_FAULT_IST_INDEX as usize];
+        let nmi_stack = &raw const IST_STACKS[cpu_index][NMI_IST_INDEX as usize];
+        (*cpu).tss.interrupt_stack_table[DOUBLE_FAULT_IST_INDEX as usize] =
+            VirtAddr::from_ptr(df_stack) + IST_STACK_SIZE as u64;
+        (*cpu).tss.interrupt_stack_table[NMI_IST_INDEX as usize] =
+            VirtAddr::from_ptr(nmi_stack) + IST_STACK_SIZE as u64;
 
         // 2. Build the GDT in the order the SYSCALL/SYSRET selector consts above require:
         //    kernel code (0x08), kernel data (0x10), user data (0x18, DPL3), user code (0x20, DPL3),

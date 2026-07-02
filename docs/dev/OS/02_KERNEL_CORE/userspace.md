@@ -68,16 +68,37 @@
   built by a minimal mapper (`memory.rs`: `translate` + `map_user_page`) over
   the firmware identity map — there is no `OffsetPageTable`; `CR0.WP` is toggled
   around the entry writes (the firmware maps its page tables read-only).
-- Not yet (arc U1b): user fault → task kill (today a ring-3 fault is fatal but
-  lands cleanly on RSP0), full user-GPR preservation across a syscall,
-  validated user pointers (`copy_from_user`).
+- **U1b** — per-fixture fault→task-kill + boundary hardening (the x86 mirror of
+  aarch64 M6b). A ring-3 fault (`CS.RPL == 3`) on any user-provokable vector
+  (#PF/#GP/#UD/#SS/#NP/#DE/#BR/#AC) now KILLS the offending task via the
+  scheduler instead of halting the kernel; a CPL-0 fault stays fatal. The fault
+  handler `swapgs`es to restore per-CPU GS (a ring-3 fault does not, unlike the
+  SYSCALL stub), logs `:: EL0-equiv FAULT: task '…' KILLED — vec=… err=… rip=…
+  cr2=… ::`, records `(task, vector, CR2)`-matched accounting, then reuses
+  `sched::exit()` (same context `sys_exit` runs in). Three inline fixtures prove
+  it — write to a kernel VA (#PF U+W), write to the RO code page (#PF U+W), exec
+  from the NX stack (#PF U+I) — each KILLED at the expected vector while a
+  well-behaved task still exits 0. Four boundary-hardening gaps from the U1a
+  review closed alongside: **(1)** SYSRET GPR scrub (zero `rdi/rsi/rdx/r8/r9/r10`
+  before `sysretq` so no kernel-dispatcher pointer leaks to ring 3); **(2)**
+  canonical-`rcx` guard before `sysretq` (refuse a non-canonical return RIP —
+  the CVE-2012-0217 shape — and kill instead); **(3)** a dedicated NMI IST stack
+  so an NMI in the pre-swapgs syscall-entry window can't push onto the ring-3
+  stack; **(4)** the user code page is mapped **read-only from the start** at
+  `USER_BASE` (copied through the identity alias, never through `USER_BASE`), so
+  no core can ever cache a writable mapping of it — W^X enforced across cores by
+  construction, replacing the U1a single-core `invlpg` flip. QEMU-verified
+  (2026-07-02): U1a still `PASS`, `exited=1 killed=3 (all expected vecs) -> PASS`,
+  full boot/SMP/xHCI regression intact, 0 unexpected fault lines. Metal pending.
+- Not yet: full user-GPR preservation across a syscall, validated user pointers
+  (`copy_from_user`), per-process address spaces (U3).
 
 ## The chain
 
 | Arc | x86_64 (lead) | aarch64 (port) |
 | :--- | :--- | :--- |
 | Privilege round-trip | U1a ✅ | M6a ✅ |
-| Per-page perms + fault→kill | U1b | M6b ✅ |
+| Per-page perms + fault→kill | U1b ✅ | M6b ✅ |
 | Loadable programs | U2 (from FAT storage) | M6c ✅ (embedded blob) |
 | Per-process address space | U3 (per-process PML4/CR3) | M6d (TTBR0 + ASID) |
 | Process model, PIDs, handle table | U4 (arch-neutral) | U4 |

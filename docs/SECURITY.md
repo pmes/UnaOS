@@ -25,9 +25,11 @@ Exposure classes, honestly stated:
    bytes with full kernel privilege on both architectures. Until the privilege
    boundary exists everywhere, these are the practical attack surface, and
    they remain kernel-resident even after.
-2. **Missing privilege boundary (x86).** Everything on x86_64 runs in ring 0
-   today. aarch64 has the project's first real boundary (EL0 + per-page
-   permissions + fault→task-kill, arcs M6a/M6b).
+2. **Privilege boundary not yet load-bearing (both arches).** The ring-3/EL0
+   boundary now exists on BOTH architectures (x86 U1a/U1b: ring-3 round-trip +
+   per-page perms + fault→task-kill; aarch64 M6a/M6b, the pioneer), but it is
+   still exercised only by the in-kernel demo — real programs (U2+) do not run
+   in it yet, and the kernel's own subsystems (drivers, FS, net) remain ring-0.
 3. **No identity or authorization layer yet** — no principals, no grants;
    any code that runs can do anything. This is what the U-chain builds.
 
@@ -57,10 +59,12 @@ ports, Jetson joins — full table in `ROADMAP.md` §1).
 
 ### x86_64
 - [x] Ring-3 boundary: user GDT segments (DPL-3 code/data, SYSRET-compatible STAR), `TSS.RSP0`, SYSCALL/SYSRET path (`EFER.SCE`, `LSTAR`, `STAR`, `FMASK`) (U1a, 2026-07-02, **QEMU-verified; metal pending**)
-- [x] EFER.NXE enabled; NX on all user data/stack pages; user **code page W^X** (mapped ring3-RX, WRITABLE dropped before first entry) (U1a, 2026-07-02, **QEMU-verified; metal pending**)
+- [x] EFER.NXE enabled; NX on all user data/stack pages; user **code page W^X enforced across cores** — mapped ring3-RX **read-only from the start** at `USER_BASE` (the blob is copied through the identity alias, never through `USER_BASE`), so no core can ever cache a writable mapping of it; supersedes the U1a single-core `invlpg` flip (U1a/**U1b B4**, 2026-07-02, **QEMU-verified; metal pending**)
+- [x] User fault → task kill, never kernel halt — a ring-3 fault (`CS.RPL == 3`) on #PF/#GP/#UD/#SS/#NP/#DE/#BR/#AC `swapgs`es, logs `(task, vector, cr2)`, and kills the task via `sched::exit()`; a CPL-0 fault stays fatal (kernel bug never hidden). Three fixtures QEMU-verified: `exited=1 killed=3 (all expected vecs) -> PASS` (**U1b A**, 2026-07-02, **QEMU-verified; metal pending**)
+- [x] SYSRET boundary hardening: caller-saved GPR scrub (`rdi/rsi/rdx/r8/r9/r10` zeroed before `sysretq` — no kernel-dispatcher pointer leaks to ring 3) + canonical-`rcx` guard (a non-canonical return RIP — the CVE-2012-0217 shape — is refused and the task killed, never `sysret`ed with the user rsp loaded) (**U1b B1/B2**, 2026-07-02, **QEMU-verified; metal pending**)
+- [x] NMI on a dedicated IST stack — an NMI landing in the pre-`swapgs`/pre-stack-switch window of `unaos_syscall_entry` switches to a kernel stack unconditionally, so its frame can never be pushed onto the ring-3 stack; the handler stays GS-free (**U1b B3**, 2026-07-02, **QEMU-verified; metal pending**)
 - [ ] CR4.SMEP — code gates it on `CPUID.7:EBX.SMEP` and sets it when present (so it activates on Ivy Bridge metal); TCG `qemu64` does **not** expose SMEP, logged `SMEP unsupported`, so it is **not exercisable under QEMU** (metal pending). **SMAP unavailable pre-Broadwell** — compensate with explicit `copy_from_user` discipline
-- [ ] W^X audit of kernel mappings (no page both writable and executable) — note: `CR0.WP` is briefly cleared around the U1a page-table edits (firmware maps its tables read-only) and restored; scope is the mapper only
-- [ ] User fault → task kill, never kernel halt (U1b) — today a ring-3 fault is fatal but lands on the RSP0 kernel stack (no triple-fault)
+- [ ] W^X audit of kernel mappings (no page both writable and executable) — note: `CR0.WP` is briefly cleared around the U1a/U1b page-table edits (firmware maps its tables read-only) and restored; scope is the mapper only
 - [ ] Validated user-pointer access (`copy_from_user`/`copy_to_user`)
 - [ ] Per-process address spaces — no shared user window (U3)
 
