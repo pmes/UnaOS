@@ -72,10 +72,11 @@ pub extern "C" fn __rust_boot(dtb: u64) -> ! {
     kernel_main(boot_info)
 }
 
-// `bootlog` halts before the GUI, `usbdebug` loops forever before it, and `baremetal` enters a
-// serial-only loop (or hands the GUI to scheduled tasks) instead — all make the GUI/main-loop code
+// `bootlog` halts before the GUI, `usbdebug` loops forever before it, `baremetal` enters a
+// serial-only loop (or hands the GUI to scheduled tasks) instead, and `tegra` stops at the early
+// platform stop below (Jetson Orin has no GIC/timer driver yet) — all make the GUI/main-loop code
 // below unreachable in those builds.
-#[cfg_attr(any(feature = "bootlog", feature = "usbdebug", feature = "baremetal"), allow(unreachable_code))]
+#[cfg_attr(any(feature = "bootlog", feature = "usbdebug", feature = "baremetal", feature = "tegra"), allow(unreachable_code))]
 fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     // 0. Framebuffer log sink FIRST — mirror every serial_println! (and panics) to the screen,
     //    so boot diagnostics are visible on real hardware that has no serial port. No-op if the
@@ -85,6 +86,16 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         boot_info.framebuffer_size,
         boot_info.framebuffer_info,
     );
+
+    // 0b. Jetson Orin Nano (tegra): the shared `arch::init()` below brings up the GIC + generic
+    //     timer at the QEMU-`virt` MMIO bases, which are unmapped on Tegra234 — touching them would
+    //     abort. The Orin has no UnaOS GIC/timer driver yet (that is JM3), so on the `tegra` build we
+    //     stop platform bring-up cleanly HERE, before any interrupt-controller/timer init, and prove
+    //     the kernel is alive over the Tegra UART with a periodic heartbeat. Diverges, so everything
+    //     below is unreachable on tegra (covered by the fn's `allow(unreachable_code)`). `tegra` is
+    //     off in every QEMU build, so this is inert there and the regression logs are byte-identical.
+    #[cfg(feature = "tegra")]
+    tegra_early_stop();
 
     // 1. Core Hardware Init (GDT, IDT, local APIC for x86_64, GIC for aarch64)
     unaos_kernel::init();
@@ -129,7 +140,14 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     // stays single-core (byte-identical to baseline). The APs park in WFI; there is no scheduler on the
     // virt path (it is baremetal-gated + EL1-coupled — see the JC2 brief). Uses only static state (no
     // heap). dtb_addr/dtb_size (captured above) let it confirm the PSCI conduit from the live DTB.
-    #[cfg(all(target_arch = "aarch64", not(feature = "pi")))]
+    //
+    // Additionally gated OFF for the `tegra` build. An esp-jetson kernel is a not-baremetal build
+    // whose `ID_AA64PFR0_EL1.GIC` reads v3 on Orin silicon, so without this gate the kick-off would
+    // run and walk the hardcoded QEMU-`virt` `GICR_BASE` (0x080A_0000) — unmapped MMIO on Tegra234.
+    // (The tegra early stop above already diverges before reaching here, but this compile-time gate
+    // is the load-bearing guarantee: even if that stop later moves, the tegra image never touches the
+    // virt GICR. JM3 brings up the real Orin redistributor.)
+    #[cfg(all(target_arch = "aarch64", not(feature = "pi"), not(feature = "tegra")))]
     if unaos_kernel::arch::gic::is_v3() {
         unaos_kernel::arch::smp_virt::start_secondaries(dtb_addr, dtb_size);
     }
@@ -390,6 +408,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
             1 => "set EDID-native mode",
             2 => "set fallback linear mode",
             3 => "headless (no linear fb)",
+            4 => "headless (no GOP protocol)",
             _ => "kept firmware current mode",
         };
         serial_println!(":: EDID read: source={}  native={}x{} ::", edid_src, edid_native_w, edid_native_h);
@@ -635,6 +654,60 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         // Present this frame: flush the damaged region of the back buffer to the framebuffer.
         // No-op when nothing was drawn this iteration, so the idle (hlt) path stays cheap.
         pal.render();
+    }
+}
+
+/// Jetson Orin Nano (Tegra234) early platform stop — the `tegra` build's terminus for this arc
+/// (JM2). The Orin has no UnaOS GIC/timer driver yet (JM3); the shared `arch::init()` would walk the
+/// QEMU-`virt` GICD/GICR bases, which are unmapped MMIO on Tegra234 and would abort. So we stop
+/// platform bring-up cleanly BEFORE any interrupt-controller/timer init, print an honest banner +
+/// stop line, and prove the kernel is alive over the Tegra UART with a periodic heartbeat.
+///
+/// Diverges (so `kernel_main` is `!` on tegra and everything after the call site is unreachable —
+/// covered by that fn's `allow(unreachable_code)`). There is no timer IRQ to wake a `WFI`, so this
+/// is a plain spin: the heartbeat cadence climbing IS the liveness proof. `tegra` is off in every
+/// QEMU build, so this is never compiled into a regression run.
+#[cfg(feature = "tegra")]
+fn tegra_early_stop() -> ! {
+    // Boot banner: the same EL / CNTFRQ / MMU / DAIF snapshot `arch::boot_diagnostics` prints, read
+    // straight from system registers (zero MMIO — cannot fault before we have a GIC/timer). This is
+    // the Orin's first kernel line over the Tegra UART and feeds JM3: are we handed off at EL2 or
+    // EL1 on this firmware, and what is the generic-timer frequency on real Tegra silicon?
+    let (el, cntfrq, sctlr, daif): (u64, u64, u64, u64);
+    unsafe {
+        let current_el: u64;
+        core::arch::asm!("mrs {}, CurrentEL", out(reg) current_el, options(nomem, nostack, preserves_flags));
+        el = (current_el >> 2) & 0b11;
+        core::arch::asm!("mrs {}, CNTFRQ_EL0", out(reg) cntfrq, options(nomem, nostack, preserves_flags));
+        core::arch::asm!("mrs {}, DAIF", out(reg) daif, options(nomem, nostack, preserves_flags));
+        if el == 2 {
+            core::arch::asm!("mrs {}, SCTLR_EL2", out(reg) sctlr, options(nomem, nostack, preserves_flags));
+        } else {
+            core::arch::asm!("mrs {}, SCTLR_EL1", out(reg) sctlr, options(nomem, nostack, preserves_flags));
+        }
+    }
+    serial_println!(":: UnaOS aarch64 kernel — Jetson Orin Nano (Tegra234), headless serial console ::");
+    serial_println!(
+        ":: AARCH64 boot diag: EL={}  CNTFRQ={} Hz  MMU={}  DAIF(DAIF)={:#06b} ::",
+        el,
+        cntfrq,
+        if sctlr & 1 != 0 { "on" } else { "off" },
+        (daif >> 6) & 0b1111,
+    );
+    serial_println!(":: tegra: early platform stop (gic/timer discovery = JM3) ::");
+
+    // Serial-alive idle loop: no GIC ⇒ no timer IRQ ⇒ no WFI (it would sleep forever with no wake
+    // source); a plain spin with a heartbeat every ~10^8 iterations. The heartbeat number climbing
+    // proves the kernel is alive and the Tegra UART TX path works from the kernel — the arc verdict.
+    let mut hb: u64 = 0;
+    loop {
+        let mut i: u64 = 0;
+        while i < 100_000_000 {
+            core::hint::spin_loop();
+            i += 1;
+        }
+        serial_println!(":: tegra: heartbeat {} ::", hb);
+        hb = hb.wrapping_add(1);
     }
 }
 
