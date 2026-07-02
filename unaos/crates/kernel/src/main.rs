@@ -226,6 +226,38 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     #[cfg(target_arch = "x86_64")]
     {
         unaos_kernel::arch::sched::init();
+
+        // U1a: x86 ring-3 round-trip (the aarch64 M6a equivalent). Turn scheduling on (the default
+        // test build never enables the feature-gated demo below, so the APs would otherwise idle in
+        // `wait_and_run`), map the ring-3 window, then drop a scheduled task to ring 3 on an AP: it
+        // runs an embedded routine that does `sys_write("hello from ring 3\n")` then `sys_exit(0)`
+        // via SYSCALL/SYSRET, and the scheduler reclaims it. A verdict task on a DIFFERENT core (so
+        // a wedged demo core still yields a line) demands the exact "exited ok" outcome. All
+        // synchronous + QEMU-verifiable; metal verification is a later arc boundary.
+        {
+            let online = unaos_kernel::arch::smp::online_aps();
+            if let Some(&cpu) = online.first() {
+                unaos_kernel::arch::sched::enable();
+                let demo = unaos_kernel::arch::syscall::setup();
+                unaos_kernel::arch::sched::spawn_user("u1a-hello", demo.entry, demo.sp, cpu);
+                let vcpu = online.get(1).copied().unwrap_or(cpu);
+                unaos_kernel::arch::sched::spawn(
+                    "u1a-verdict",
+                    unaos_kernel::arch::syscall::verdict,
+                    0,
+                    vcpu,
+                    unaos_kernel::arch::sched::PRIO_NORMAL,
+                );
+                serial_println!(
+                    ":: U1a: ring-3 demo — user task on core {}, verdict on core {} ::",
+                    cpu,
+                    vcpu
+                );
+            } else {
+                serial_println!(":: U1a: no application processors online — ring-3 demo SKIPPED ::");
+            }
+        }
+
         // The demo workload (incl. the RwLock self-test) uses tick-based timing. The APIC timer is
         // now calibrated to a real 1 kHz (see step 4b'''), so it runs at normal speed on metal —
         // no more multi-minute stall. It's still just a QEMU-verified smoke test, so keep it opt-in
