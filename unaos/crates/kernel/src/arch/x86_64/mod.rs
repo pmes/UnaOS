@@ -7,6 +7,7 @@ pub mod acpi;
 pub mod percpu;
 pub mod smp;
 pub mod sched;
+pub mod syscall;
 pub mod pci;
 pub mod memory;
 
@@ -21,6 +22,9 @@ pub fn init() {
     // Per-CPU data for the BSP (logical CPU 0). Must precede `sti` so the timer/IPI handlers
     // can resolve `this_cpu()` via the GS base.
     percpu::init_cpu(0, apic::apic_id_u32());
+    // U1a: SYSCALL/SYSRET MSRs + NX/SMEP for the BSP. After gdt (STAR needs the selectors) and
+    // percpu (GS base + KERNEL_GS_BASE); before `sti`.
+    syscall::init();
     x86_64::instructions::interrupts::enable();
 }
 

@@ -56,11 +56,11 @@ ports, Jetson joins — full table in `ROADMAP.md` §1).
 ## Hardening ledger
 
 ### x86_64
-- [ ] Ring-3 boundary: user GDT segments, TSS.RSP0, syscall path (U1a)
-- [ ] EFER.NXE enabled; NX on all user data/stack pages (U1a)
-- [ ] CR4.SMEP (Ivy Bridge supports SMEP; **SMAP unavailable pre-Broadwell** — compensate with explicit `copy_from_user` discipline)
-- [ ] W^X audit of kernel mappings (no page both writable and executable)
-- [ ] User fault → task kill, never kernel halt (U1b)
+- [x] Ring-3 boundary: user GDT segments (DPL-3 code/data, SYSRET-compatible STAR), `TSS.RSP0`, SYSCALL/SYSRET path (`EFER.SCE`, `LSTAR`, `STAR`, `FMASK`) (U1a, 2026-07-02, **QEMU-verified; metal pending**)
+- [x] EFER.NXE enabled; NX on all user data/stack pages; user **code page W^X** (mapped ring3-RX, WRITABLE dropped before first entry) (U1a, 2026-07-02, **QEMU-verified; metal pending**)
+- [ ] CR4.SMEP — code gates it on `CPUID.7:EBX.SMEP` and sets it when present (so it activates on Ivy Bridge metal); TCG `qemu64` does **not** expose SMEP, logged `SMEP unsupported`, so it is **not exercisable under QEMU** (metal pending). **SMAP unavailable pre-Broadwell** — compensate with explicit `copy_from_user` discipline
+- [ ] W^X audit of kernel mappings (no page both writable and executable) — note: `CR0.WP` is briefly cleared around the U1a page-table edits (firmware maps its tables read-only) and restored; scope is the mapper only
+- [ ] User fault → task kill, never kernel halt (U1b) — today a ring-3 fault is fatal but lands on the RSP0 kernel stack (no triple-fault)
 - [ ] Validated user-pointer access (`copy_from_user`/`copy_to_user`)
 - [ ] Per-process address spaces — no shared user window (U3)
 

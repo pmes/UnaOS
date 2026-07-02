@@ -162,6 +162,11 @@ pub struct Task {
     /// alive across the park/post window (see `JoinHandle`). Read (never moved) by the trampoline
     /// through the raw `current` pointer; dropped when `run()` drops the Box on the Finished path.
     done_sem: Option<Arc<Semaphore>>,
+    /// U1a: ring-3 entry point + initial user rsp. Non-zero only for `is_user` tasks made via
+    /// `spawn_user`: such a task's initial frame lands in `user_task_trampoline`, which `iretq`s to
+    /// ring 3 at `user_entry` with rsp = `user_rsp`. 0 / unused for ordinary kernel tasks.
+    user_entry: u64,
+    user_rsp: u64,
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -391,13 +396,14 @@ extern "C" fn task_trampoline() -> ! {
 }
 
 /// Build a fresh task's initial stack frame so the first `switch_context` into it lands in
-/// `task_trampoline` with an ABI-correct stack. Returns the value to store in `ctx_rsp`.
+/// `trampoline` (`task_trampoline` for kernel threads, `user_task_trampoline` for ring-3 tasks)
+/// with an ABI-correct stack. Returns the value to store in `ctx_rsp`.
 ///
 /// SysV requires rsp ≡ 8 (mod 16) at a function's first instruction (a `call` pushes an 8-byte
 /// return address onto a 16-aligned rsp). After `switch_context` pops 6 regs + RFLAGS and `ret`s,
 /// the trampoline sees rsp = (rip slot) + 8, so the rip slot must be 16-aligned — equivalently
 /// `new_rsp ≡ 8 (mod 16)`. We CONSTRUCT that (don't merely assume it) and assert it.
-fn build_initial_frame(stack: &mut [u8]) -> u64 {
+fn build_initial_frame(stack: &mut [u8], trampoline: extern "C" fn() -> !) -> u64 {
     let base = stack.as_mut_ptr() as usize;
     // Align the frame top DOWN to 16. The 8 frame qwords sit below it; the slot at `top` itself
     // is left unused padding.
@@ -414,7 +420,7 @@ fn build_initial_frame(stack: &mut [u8]) -> u64 {
             p.add(i).write(0);
         }
         p.add(6).write(INITIAL_RFLAGS); // consumed by popfq
-        p.add(7).write(task_trampoline as *const () as u64); // consumed by ret
+        p.add(7).write(trampoline as *const () as u64); // consumed by ret
     }
     new_rsp as u64
 }
@@ -437,7 +443,7 @@ fn spawn_inner(
     assert!(target_cpu < MAX_CPUS, "spawn: target_cpu out of range");
 
     let mut stack: Box<[u8]> = alloc::vec![0u8; TASK_STACK_SIZE].into_boxed_slice();
-    let ctx_rsp = build_initial_frame(&mut stack);
+    let ctx_rsp = build_initial_frame(&mut stack, task_trampoline);
 
     let id = NEXT_TID.fetch_add(1, Ordering::Relaxed);
     let task = Box::new(Task {
@@ -452,6 +458,8 @@ fn spawn_inner(
         priority,
         wait_ticks: 0, // re-zeroed by push() on every enqueue; this satisfies the struct literal
         done_sem,
+        user_entry: 0,
+        user_rsp: 0,
     });
 
     RUN_QUEUES[target_cpu].lock().push(task);
@@ -463,6 +471,100 @@ fn spawn_inner(
 /// and is freed when `entry` returns; there is no way to wait for it (use `spawn_joinable` for that).
 pub fn spawn(name: &'static str, entry: fn(usize), arg: usize, target_cpu: usize, priority: u8) {
     spawn_inner(name, entry, arg, target_cpu, priority, None);
+}
+
+/// Placeholder `entry` for ring-3 tasks: `spawn_user` stores this in `Task.entry`, but
+/// `user_task_trampoline` never calls it (it `iretq`s to ring 3 instead). Panics if ever reached.
+fn user_never(_: usize) {
+    unreachable!("user task's kernel `entry` was called");
+}
+
+/// First code a ring-3 task runs at ring 0, reached when `switch_context` `ret`s into its freshly
+/// built frame (IF masked, from INITIAL_RFLAGS). Unlike `task_trampoline` it does NOT enable
+/// interrupts: ring 3 stays non-preemptible for U1a (the `iretq` frame carries IF clear — the M6a
+/// mirror; preemptible ring 3 is a later arc). It records this task's kernel-stack top for the
+/// syscall + fault paths, then drops to ring 3.
+///
+/// The task's Box kernel stack is abandoned across the `iretq`; the SYSCALL stub re-enters on it at
+/// `syscall_kernel_rsp` = the stack TOP, so the shallow frame this trampoline used is simply
+/// overwritten (control never returns to it — ring 3 leaves only via `syscall` or a fault, both of
+/// which reset rsp to the top). The Box therefore needs headroom for the syscall handler; it has it.
+extern "C" fn user_task_trampoline() -> ! {
+    let cpu = percpu::this_cpu().cpu_index as usize;
+    let raw = SCHED[cpu].current.load(Ordering::Acquire) as *const Task;
+    debug_assert!(!raw.is_null(), "user_task_trampoline: current is null");
+    let (entry, user_rsp, ktop) = unsafe {
+        let s = &(*raw).stack;
+        let ktop = ((s.as_ptr() as usize + s.len()) & !0xF) as u64;
+        ((*raw).user_entry, (*raw).user_rsp, ktop)
+    };
+    // TSS.RSP0 (used by the CPU on a ring-3 FAULT) and the per-CPU SYSCALL kernel-rsp anchor (used
+    // by the SYSCALL stub — SYSCALL does not switch stacks itself) both point at this task's kernel
+    // stack top, so a syscall or a fault from ring 3 lands on a valid kernel stack, never a
+    // triple-fault.
+    crate::arch::gdt::set_privilege_stack0(cpu, ktop);
+    percpu::set_syscall_kernel_rsp(ktop);
+
+    // Drop to ring 3. `swapgs` parks this CPU's PerCpuData pointer in the GS shadow for the syscall
+    // path; the `iretq` frame is [SS, RSP, RFLAGS(IF clear), CS, RIP] (RIP pushed LAST so `iretq`
+    // pops it first). Interrupts are masked here, so the swapgs/iretq window can't take an IRQ.
+    unsafe {
+        core::arch::asm!(
+            "swapgs",
+            "push {ss}",
+            "push {ursp}",
+            "push {rflags}",
+            "push {cs}",
+            "push {entry}",
+            "iretq",
+            ss = in(reg) crate::arch::gdt::USER_DATA_SEL as u64,
+            ursp = in(reg) user_rsp,
+            rflags = in(reg) INITIAL_RFLAGS, // reserved bit set, IF clear -> cooperative ring 3
+            cs = in(reg) crate::arch::gdt::USER_CODE_SEL as u64,
+            entry = in(reg) entry,
+            options(noreturn),
+        );
+    }
+}
+
+/// Create a ready ring-3 (user-mode) task on `target_cpu`'s run queue (U1a): when dispatched it
+/// drops to ring 3 at `user_entry` with rsp = `user_rsp` (both from `syscall::setup`) and calls
+/// back into the kernel via `syscall`. MUST be spawned on a SCHEDULED core (an AP), never the
+/// unscheduled BSP — `user_task_trampoline` reads `SCHED[cpu].current`, which is null on a core
+/// that never runs the scheduler loop. Fire-and-forget: `sys_exit` marks it FINISHED and the
+/// scheduler reclaims it. Returns the task id.
+pub fn spawn_user(name: &'static str, user_entry: u64, user_rsp: u64, target_cpu: usize) -> u64 {
+    assert!(target_cpu < MAX_CPUS, "spawn_user: target_cpu out of range");
+    let mut stack: Box<[u8]> = alloc::vec![0u8; TASK_STACK_SIZE].into_boxed_slice();
+    let ctx_rsp = build_initial_frame(&mut stack, user_task_trampoline);
+    let id = NEXT_TID.fetch_add(1, Ordering::Relaxed);
+    let task = Box::new(Task {
+        id,
+        name,
+        state: AtomicU8::new(STATE_READY),
+        ctx_rsp,
+        stack,
+        entry: user_never, // never called — the trampoline iretq's to ring 3 instead
+        arg: 0,
+        cpu: target_cpu as u32,
+        priority: PRIO_NORMAL,
+        wait_ticks: 0,
+        done_sem: None,
+        user_entry,
+        user_rsp,
+    });
+    RUN_QUEUES[target_cpu].lock().push(task);
+    poke_for(target_cpu, PRIO_NORMAL);
+    id
+}
+
+/// Turn scheduling on (idempotent): release the APs from their post-online wait loop into `run()`
+/// and enable timer preemption. `start_demo` does the same, but only under the `sched_demo`
+/// feature; the default build's U1a ring-3 demo needs scheduling live too, so it calls this. Safe
+/// to call in addition to `start_demo` — both merely set these two release flags.
+pub fn enable() {
+    SCHED_ACTIVE.store(true, Ordering::Release);
+    SCHED_GO.store(true, Ordering::Release);
 }
 
 /// Like `spawn`, but returns a `JoinHandle` a scheduled task can `join()` to block until this task

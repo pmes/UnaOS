@@ -15,6 +15,7 @@
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 
+use alloc::alloc::{alloc_zeroed, Layout};
 use unaos_boot_info::{BootInfo, MemoryRegion, MemoryRegionKind};
 
 /// The UEFI memory map (as converted by the bootloader), published once at `init` so later
@@ -129,4 +130,159 @@ pub fn init(boot_info: &'static mut BootInfo) {
         }
         panic!("Failed to find usable memory for heap");
     }
+}
+
+// ---------------------------------------------------------------------------------------------
+// U1a: minimal 4 KiB user-page mapper.
+//
+// The kernel runs on the firmware's 4-level identity map (physical_memory_offset == 0), so there
+// is no `OffsetPageTable` / frame allocator to lean on. To hand ring 3 a permission-split window
+// we walk the live CR3 tables directly. Two facts make this cheap and safe:
+//   * identity map => a page-table frame's physical address equals its (virtual) address, so a
+//     heap `alloc_zeroed(4 KiB, 4 KiB)` doubles as a frame we can both write through and name in a
+//     parent entry; and
+//   * the window sits at a FRESH top-level slot (`syscall::USER_BASE` = 1 TiB = PML4[2]), so the
+//     only pre-existing table we edit is the PML4 (one new entry) — every lower table is newly
+//     allocated from the heap. `translate` proves each target page is unmapped before we map it.
+// This is the x86 analogue of the aarch64 identity-mapped USER_REGION; the security boundary is
+// the ring-3 (USER_BASE) mapping's per-page U / W / NX bits, not the kernel's identity alias.
+// ---------------------------------------------------------------------------------------------
+
+const PTE_PRESENT: u64 = 1 << 0;
+const PTE_WRITABLE: u64 = 1 << 1;
+const PTE_USER: u64 = 1 << 2;
+const PTE_HUGE: u64 = 1 << 7;
+const PTE_NX: u64 = 1 << 63;
+/// Physical-address field of a page-table entry (bits 51:12).
+const PTE_ADDR: u64 = 0x000F_FFFF_FFFF_F000;
+
+#[inline]
+fn pml4_index(va: u64) -> usize { ((va >> 39) & 0x1FF) as usize }
+#[inline]
+fn pdpt_index(va: u64) -> usize { ((va >> 30) & 0x1FF) as usize }
+#[inline]
+fn pd_index(va: u64) -> usize { ((va >> 21) & 0x1FF) as usize }
+#[inline]
+fn pt_index(va: u64) -> usize { ((va >> 12) & 0x1FF) as usize }
+
+/// Root of the live page-table hierarchy (identity-mapped, so the physical CR3 value is directly
+/// addressable).
+fn cr3_table() -> *mut u64 {
+    x86_64::registers::control::Cr3::read().0.start_address().as_u64() as *mut u64
+}
+
+/// Walk the live CR3 tables and return the physical address `va` maps to, or `None` if any level
+/// on the path is not present. Honors 1 GiB / 2 MiB huge pages. Read-only — used to prove the user
+/// window is unmapped before we create it (so USER_BASE can never silently alias kernel memory).
+pub fn translate(va: u64) -> Option<u64> {
+    unsafe {
+        let pml4e = *cr3_table().add(pml4_index(va));
+        if pml4e & PTE_PRESENT == 0 {
+            return None;
+        }
+        let pdpte = *((pml4e & PTE_ADDR) as *const u64).add(pdpt_index(va));
+        if pdpte & PTE_PRESENT == 0 {
+            return None;
+        }
+        if pdpte & PTE_HUGE != 0 {
+            return Some((pdpte & PTE_ADDR) | (va & 0x3FFF_FFFF));
+        }
+        let pde = *((pdpte & PTE_ADDR) as *const u64).add(pd_index(va));
+        if pde & PTE_PRESENT == 0 {
+            return None;
+        }
+        if pde & PTE_HUGE != 0 {
+            return Some((pde & PTE_ADDR) | (va & 0x1F_FFFF));
+        }
+        let pte = *((pde & PTE_ADDR) as *const u64).add(pt_index(va));
+        if pte & PTE_PRESENT == 0 {
+            return None;
+        }
+        Some((pte & PTE_ADDR) | (va & 0xFFF))
+    }
+}
+
+/// Run `f` with CR0.WP momentarily cleared, so supervisor writes to the firmware's read-only
+/// page-table pages land. The firmware identity map marks its PML4/PDPT/... pages read-only and
+/// CR0.WP=1, so writing our new PML4 entry #PFs (PROTECTION_VIOLATION) otherwise. This is the
+/// standard page-table-edit sequence — it does NOT touch any arc protection (SMEP/NXE live in
+/// CR4/EFER, per-page U/W/NX live in the PTEs); WP governs only whether ring 0 honours the RO bit,
+/// and it is restored before returning. Interrupts are held off across the window so nothing else
+/// runs while WP is clear.
+pub fn with_page_tables_writable<F: FnOnce()>(f: F) {
+    use x86_64::registers::control::Cr0;
+    const CR0_WP: u64 = 1 << 16;
+    crate::arch::without_interrupts(|| {
+        let cr0 = Cr0::read_raw();
+        let had_wp = cr0 & CR0_WP != 0;
+        if had_wp {
+            unsafe { Cr0::write_raw(cr0 & !CR0_WP) };
+        }
+        f();
+        if had_wp {
+            unsafe { Cr0::write_raw(cr0) };
+        }
+    });
+}
+
+/// Allocate one zeroed, 4 KiB-aligned page from the identity-mapped heap; return its physical
+/// address (== its virtual address, offset 0). Deliberately leaked: it becomes a live page-table
+/// frame or a user page for the whole life of the kernel.
+pub fn alloc_page_frame() -> u64 {
+    let layout = Layout::from_size_align(4096, 4096).expect("U1a: bad page-frame layout");
+    let p = unsafe { alloc_zeroed(layout) };
+    assert!(!p.is_null(), "U1a: out of memory for a user page frame");
+    p as u64
+}
+
+/// Descend one page-table level, creating the next table (PRESENT|WRITABLE|USER) if the entry is
+/// empty. The USER bit on EVERY intermediate level is mandatory: ring-3 reachability is the AND of
+/// the U/S bits along the whole path (a supervisor-only parent would make the leaf inaccessible to
+/// ring 3). WRITABLE on a parent does not make leaves writable — the leaf's own W bit governs that,
+/// so the code page can still be dropped read-only below. Panics on a huge-page slot (our fresh
+/// PML4[2] window never overlaps one).
+unsafe fn next_table(entry: *mut u64) -> *mut u64 {
+    let e = *entry;
+    if e & PTE_PRESENT == 0 {
+        let frame = alloc_page_frame();
+        *entry = (frame & PTE_ADDR) | PTE_PRESENT | PTE_WRITABLE | PTE_USER;
+        frame as *mut u64
+    } else {
+        assert!(e & PTE_HUGE == 0, "U1a: user window overlaps a huge page");
+        (e & PTE_ADDR) as *mut u64
+    }
+}
+
+/// Map a single fresh 4 KiB user page `va -> phys`, leaf flags PRESENT|USER plus `writable` / `nx`
+/// as requested. Asserts the leaf was previously empty (caller must `translate` it first). NX
+/// requires EFER.NXE, enabled in `syscall::init` before any mapping.
+pub unsafe fn map_user_page(va: u64, phys: u64, writable: bool, nx: bool) {
+    let pdpt = next_table(cr3_table().add(pml4_index(va)));
+    let pd = next_table(pdpt.add(pdpt_index(va)));
+    let pt = next_table(pd.add(pd_index(va)));
+    let pte = pt.add(pt_index(va));
+    assert!(*pte & PTE_PRESENT == 0, "U1a: user page already mapped");
+    let mut flags = PTE_PRESENT | PTE_USER;
+    if writable {
+        flags |= PTE_WRITABLE;
+    }
+    if nx {
+        flags |= PTE_NX;
+    }
+    *pte = (phys & PTE_ADDR) | flags;
+}
+
+/// Drop WRITABLE on an already-mapped user page (the code page's W^X flip) and invalidate this
+/// CPU's TLB for it. The window is never touched before this runs, so no other CPU can hold a
+/// stale entry; the local `invlpg` is belt-and-suspenders.
+pub unsafe fn protect_user_page_ro(va: u64) {
+    let pml4e = *cr3_table().add(pml4_index(va));
+    let pdpt = (pml4e & PTE_ADDR) as *mut u64;
+    let pdpte = *pdpt.add(pdpt_index(va));
+    let pd = (pdpte & PTE_ADDR) as *mut u64;
+    let pde = *pd.add(pd_index(va));
+    let pt = (pde & PTE_ADDR) as *mut u64;
+    let pte = pt.add(pt_index(va));
+    *pte &= !PTE_WRITABLE;
+    core::arch::asm!("invlpg [{}]", in(reg) va, options(nostack, preserves_flags));
 }

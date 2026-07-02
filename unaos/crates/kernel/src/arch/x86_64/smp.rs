@@ -20,7 +20,7 @@ use core::sync::atomic::{AtomicU32, Ordering};
 use alloc::vec::Vec;
 use spin::Mutex;
 
-use crate::arch::{acpi, apic, gdt, interrupts, percpu, sched};
+use crate::arch::{acpi, apic, gdt, interrupts, percpu, sched, syscall};
 
 /// Physical page the trampoline is copied to and the AP starts executing at. Must be page-aligned
 /// and < 1 MiB (the SIPI vector is 8 bits: start address = vector << 12). 0x8000 is free
@@ -173,6 +173,9 @@ pub extern "C" fn ap_entry(cpu_index: u64) -> ! {
     // Per-CPU data + GS base before enabling interrupts, so this AP's timer/IPI handlers can
     // resolve `this_cpu()`.
     percpu::init_cpu(idx, apic_id);
+    // U1a: this AP's SYSCALL/SYSRET MSRs + NX/SMEP (after its GDT + per-CPU data, before `sti`), so
+    // a ring-3 task dispatched onto this AP can trap back in.
+    syscall::init();
 
     AP_ONLINE.fetch_add(1, Ordering::SeqCst);
     serial_println!("SMP: AP {} online (apic id {}).", idx, apic_id);

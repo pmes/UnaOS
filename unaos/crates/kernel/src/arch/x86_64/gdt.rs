@@ -34,6 +34,19 @@ use x86_64::VirtAddr;
 
 pub const DOUBLE_FAULT_IST_INDEX: u16 = 0;
 
+// Fixed selectors for the per-CPU GDT layout built by `init_cpu` (identical on every CPU). The
+// APPEND ORDER below is load-bearing for SYSCALL/SYSRET: SYSCALL loads CS = STAR[47:32] and
+// SS = that + 8, SYSRET64 loads CS = STAR[63:48] + 16 and SS = that + 8. With STAR[47:32]=0x08
+// and STAR[63:48]=0x13 (see `syscall::init`) the segments resolve to the four selectors here.
+/// Kernel code (idx 1) — SYSCALL target CS.
+pub const KERNEL_CODE_SEL: u16 = 0x08;
+/// Kernel data (idx 2) — SYSCALL loads this as SS.
+pub const KERNEL_DATA_SEL: u16 = 0x10;
+/// User data (idx 3, DPL 3) — SYSRET loads (0x18 | RPL 3) as SS; also the `iretq` first-entry SS.
+pub const USER_DATA_SEL: u16 = 0x1B;
+/// User code (idx 4, DPL 3) — SYSRET loads (0x20 | RPL 3) as CS; also the `iretq` first-entry CS.
+pub const USER_CODE_SEL: u16 = 0x23;
+
 /// Upper bound on CPUs we reserve per-CPU control blocks for. QEMU `-smp` and the target
 /// laptops sit well under this; bump it (and re-check the `.bss` cost below) if a machine has
 /// more cores.
@@ -99,12 +112,22 @@ pub fn init_cpu(cpu_index: usize) {
         let stack_top = VirtAddr::from_ptr(ist_stack) + IST_STACK_SIZE as u64;
         (*cpu).tss.interrupt_stack_table[DOUBLE_FAULT_IST_INDEX as usize] = stack_top;
 
-        // 2. Build the GDT: kernel code segment, then a TSS descriptor for THIS CPU's TSS.
-        //    `tss_segment_unchecked` only reads the pointer's value (it encodes the base
-        //    address); it does not dereference, so aliasing the `&raw mut cpu` is fine.
+        // 2. Build the GDT in the order the SYSCALL/SYSRET selector consts above require:
+        //    kernel code (0x08), kernel data (0x10), user data (0x18, DPL3), user code (0x20, DPL3),
+        //    then a TSS descriptor (two slots, 0x28) for THIS CPU's TSS. `tss_segment_unchecked`
+        //    only reads the pointer's value (it encodes the base address); it does not dereference,
+        //    so aliasing the `&raw mut cpu` is fine.
         let tss_ptr: *const TaskStateSegment = &raw const (*cpu).tss;
         let code_selector = (*cpu).gdt.append(Descriptor::kernel_code_segment());
+        let kernel_data = (*cpu).gdt.append(Descriptor::kernel_data_segment());
+        let user_data = (*cpu).gdt.append(Descriptor::user_data_segment());
+        let user_code = (*cpu).gdt.append(Descriptor::user_code_segment());
         let tss_selector = (*cpu).gdt.append(Descriptor::tss_segment_unchecked(tss_ptr));
+        // Lock the layout: the naked SYSCALL/SYSRET paths hard-code these selector values.
+        assert_eq!(code_selector.0, KERNEL_CODE_SEL, "gdt: kernel code selector moved");
+        assert_eq!(kernel_data.0, KERNEL_DATA_SEL, "gdt: kernel data selector moved");
+        assert_eq!(user_data.0 | 3, USER_DATA_SEL, "gdt: user data selector moved");
+        assert_eq!(user_code.0 | 3, USER_CODE_SEL, "gdt: user code selector moved");
         (*cpu).code_selector = code_selector;
         (*cpu).tss_selector = tss_selector;
 
@@ -129,4 +152,19 @@ pub fn init_cpu(cpu_index: usize) {
 /// BSP entry point, called from `arch::init` before the heap exists. The BSP is logical CPU 0.
 pub fn init() {
     init_cpu(0);
+}
+
+/// U1a: set `cpu_index`'s TSS.RSP0 — the kernel stack the CPU switches to when an interrupt or
+/// exception is taken FROM ring 3 (a CPL 3→0 transition). Written by `user_task_trampoline` before
+/// it drops a task to ring 3, so a fault in that task lands on the task's own kernel stack instead
+/// of triple-faulting. (SYSCALL does not consult RSP0 — it uses the per-CPU `syscall_kernel_rsp`
+/// anchor instead — so this only covers the fault/interrupt path.) The IST double-fault entry is
+/// untouched. Writing the loaded TSS's RSP0 field is a plain memory store the CPU re-reads on the
+/// next privilege-change; no `ltr` reload is needed.
+pub fn set_privilege_stack0(cpu_index: usize, rsp: u64) {
+    assert!(cpu_index < MAX_CPUS, "gdt::set_privilege_stack0: cpu_index out of range");
+    unsafe {
+        let cpu = &raw mut CPUS[cpu_index];
+        (*cpu).tss.privilege_stack_table[0] = VirtAddr::new(rsp);
+    }
 }

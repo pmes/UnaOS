@@ -23,6 +23,14 @@ const IA32_GS_BASE: u32 = 0xC000_0101;
 
 /// One CPU's private data. `self_ptr` MUST stay first (offset 0): `gs:[0]` reads it to recover
 /// the block's address. `#[repr(C)]` pins that layout.
+///
+/// `syscall_kernel_rsp` / `syscall_user_rsp` are the SYSCALL/SYSRET stack-switch anchors (U1a).
+/// SYSCALL does not switch stacks itself, so the `unaos_syscall_entry` stub (see `syscall.rs`)
+/// `swapgs`es to bring THIS block into GS, saves the user rsp into `syscall_user_rsp`, and loads
+/// the per-task kernel-stack top from `syscall_kernel_rsp`. They are reached from the naked stub
+/// by fixed gs-relative offsets (`{KERNEL,USER}_RSP_OFFSET`), asserted below — do not reorder the
+/// fields above them without updating the offsets. Both are plain `u64` (single-CPU, IRQ-masked
+/// syscall path — no cross-CPU access), written by `set_syscall_kernel_rsp` and the stub.
 #[repr(C)]
 pub struct PerCpuData {
     self_ptr: u64,
@@ -32,7 +40,16 @@ pub struct PerCpuData {
     pub ticks: AtomicU64,
     /// IPIs handled on THIS CPU.
     pub ipis: AtomicU64,
+    /// U1a: per-task kernel-stack top the SYSCALL stub switches to on entry from ring 3.
+    syscall_kernel_rsp: u64,
+    /// U1a: scratch slot the SYSCALL stub saves the user rsp into across a syscall.
+    syscall_user_rsp: u64,
 }
+
+/// gs-relative offset of `syscall_kernel_rsp`, baked into the naked SYSCALL stub.
+pub const KERNEL_RSP_OFFSET: usize = core::mem::offset_of!(PerCpuData, syscall_kernel_rsp);
+/// gs-relative offset of `syscall_user_rsp`, baked into the naked SYSCALL stub.
+pub const USER_RSP_OFFSET: usize = core::mem::offset_of!(PerCpuData, syscall_user_rsp);
 
 impl PerCpuData {
     const fn new() -> Self {
@@ -42,6 +59,8 @@ impl PerCpuData {
             apic_id: 0,
             ticks: AtomicU64::new(0),
             ipis: AtomicU64::new(0),
+            syscall_kernel_rsp: 0,
+            syscall_user_rsp: 0,
         }
     }
 }
@@ -70,6 +89,19 @@ pub fn this_cpu() -> &'static PerCpuData {
     unsafe {
         core::arch::asm!("mov {}, gs:[0]", out(reg) ptr, options(nostack, preserves_flags));
         &*ptr
+    }
+}
+
+/// U1a: record THIS CPU's per-task kernel-stack top for the SYSCALL entry stub. Called by
+/// `user_task_trampoline` (IRQ-masked, on the CPU that is about to drop to ring 3) just before the
+/// `swapgs`/`iretq`, so the stub's `mov rsp, gs:[KERNEL_RSP_OFFSET]` lands on this task's kernel
+/// stack. Written through the self-pointer (`gs:[0]`); no other CPU touches this field.
+#[inline]
+pub fn set_syscall_kernel_rsp(rsp: u64) {
+    let ptr: *mut PerCpuData;
+    unsafe {
+        core::arch::asm!("mov {}, gs:[0]", out(reg) ptr, options(nostack, preserves_flags));
+        (*ptr).syscall_kernel_rsp = rsp;
     }
 }
 

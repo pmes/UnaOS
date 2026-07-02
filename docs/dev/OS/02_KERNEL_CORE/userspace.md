@@ -29,21 +29,38 @@
 - Not yet: loadable programs (M6c), per-task address spaces/ASIDs (M6d),
   preemptible EL0 (M6e), validated user pointers (M6f).
 
-### x86_64 (branch `hw-rmbp`) — starting from ~10–15 %
+### x86_64 (branch `hw-rmbp`)
 
-What exists: per-CPU GDT/TSS with descriptor slots reserved for user segments
-(`arch/x86_64/gdt.rs`), IST double-fault stacks, the full SMP scheduler.
-
-What is missing (arcs U1a/U1b): user code/data descriptors (SYSRET-compatible
-STAR layout), `TSS.RSP0`, the SYSCALL MSRs (`EFER.SCE`, `LSTAR`, `STAR`,
-`FMASK`), any U/S or NX bit in the inherited UEFI identity map, `CR4.SMEP`,
-and fault handlers that kill a user task instead of `hlt_loop()`.
+- **U1a** — first ring-3 round-trip (the x86 mirror of aarch64 M6a). A
+  scheduled task drops to **ring 3** via `iretq` (`sched::spawn_user` /
+  `user_task_trampoline`), runs an embedded position-independent blob that does
+  `sys_write("hello from ring 3\n")` then `sys_exit(0)` via **SYSCALL/SYSRET**,
+  and the scheduler reclaims it. Syscall ABI mirrors aarch64: number in `rax`
+  (`SYS_WRITE = 1`, `SYS_EXIT = 2`), args `rdi, rsi, rdx`, return in `rax`.
+  Hardening landed with it: **EFER.NXE**, **NX** on the user data/stack pages,
+  W^X on the user code page (mapped ring3-RX, kernel drops WRITABLE before first
+  entry), **CR4.SMEP** (CPUID-gated — set on Ivy Bridge metal; TCG `qemu64`
+  lacks it, logged), and **TSS.RSP0** so a ring-3 fault lands on a kernel stack
+  instead of triple-faulting. QEMU-verified (2026-07-02: `hello from ring 3` +
+  `U1a … PASS`, no faults, full boot/SMP/USB regression intact); metal pending.
+- x86-specific shape (adapted from the aarch64 reference, which assumes infra
+  x86 lacks): the SYSCALL stack-switch anchors are folded into `PerCpuData`
+  (reached via `IA32_GS_BASE`; `KERNEL_GS_BASE` holds that pointer while ring 3
+  runs, restored by the entry `swapgs`) rather than a separate struct — the
+  scheduler's `this_cpu()` dependency requires GS to stay `&PerCpuData` in the
+  handler. The 4 KiB user window at `USER_BASE = 1 TiB` (fresh `PML4[2]`) is
+  built by a minimal mapper (`memory.rs`: `translate` + `map_user_page`) over
+  the firmware identity map — there is no `OffsetPageTable`; `CR0.WP` is toggled
+  around the entry writes (the firmware maps its page tables read-only).
+- Not yet (arc U1b): user fault → task kill (today a ring-3 fault is fatal but
+  lands cleanly on RSP0), full user-GPR preservation across a syscall,
+  validated user pointers (`copy_from_user`).
 
 ## The chain
 
 | Arc | x86_64 (lead) | aarch64 (port) |
 | :--- | :--- | :--- |
-| Privilege round-trip | U1a | M6a ✅ |
+| Privilege round-trip | U1a ✅ | M6a ✅ |
 | Per-page perms + fault→kill | U1b | M6b ✅ |
 | Loadable programs | U2 (from FAT storage) | M6c (embedded blob) |
 | Per-process address space | U3 (per-process PML4/CR3) | M6d (TTBR0 + ASID) |
