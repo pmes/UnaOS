@@ -94,7 +94,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     //     the kernel is alive over the Tegra UART with a periodic heartbeat. Diverges, so everything
     //     below is unreachable on tegra (covered by the fn's `allow(unreachable_code)`). `tegra` is
     //     off in every QEMU build, so this is inert there and the regression logs are byte-identical.
-    #[cfg(feature = "tegra")]
+    #[cfg(all(feature = "tegra", target_arch = "aarch64"))]
     tegra_early_stop();
 
     // 1. Core Hardware Init (GDT, IDT, local APIC for x86_64, GIC for aarch64)
@@ -667,7 +667,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
 /// covered by that fn's `allow(unreachable_code)`). There is no timer IRQ to wake a `WFI`, so this
 /// is a plain spin: the heartbeat cadence climbing IS the liveness proof. `tegra` is off in every
 /// QEMU build, so this is never compiled into a regression run.
-#[cfg(feature = "tegra")]
+#[cfg(all(feature = "tegra", target_arch = "aarch64"))]
 fn tegra_early_stop() -> ! {
     // Boot banner: the same EL / CNTFRQ / MMU / DAIF snapshot `arch::boot_diagnostics` prints, read
     // straight from system registers (zero MMIO — cannot fault before we have a GIC/timer). This is
