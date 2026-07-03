@@ -175,10 +175,11 @@ fn bootdiag_conout() {
 /// truncated DTB is skipped rather than faulting (a well-formed firmware DTB is otherwise assumed).
 #[cfg(all(feature = "bootdiag", target_arch = "aarch64"))]
 fn bootdiag_dtb() {
-    // Same DEVICE_TREE_GUID the kernel handoff uses (uefi::table::cfg::DEVICE_TREE_GUID).
-    let dtb_guid = uefi::Guid::from_bytes([
-        0xb1, 0xb6, 0x21, 0xb1, 0x59, 0xc1, 0x4a, 0x4f, 0x93, 0x20, 0xd0, 0x04, 0x67, 0xe4, 0x8a, 0xe9,
-    ]);
+    // EFI_DTB_TABLE_GUID (UEFI spec / EDK2 gFdtTableGuid), the same GUID the kernel handoff scan
+    // uses. The uefi 0.38 crate ships no named constant for it (ConfigTableEntry exposes only
+    // ACPI/SMBIOS/... GUIDs), so define it by string via the mistake-proof `guid!` macro rather
+    // than a hand-laid mixed-endian byte array.
+    let dtb_guid = uefi::guid!("b1b621d5-f19c-41a5-830b-d9152c69aae0");
     let mut dtb_addr: u64 = 0;
     uefi::system::with_config_table(|entries| {
         for entry in entries {
@@ -637,10 +638,10 @@ fn main() -> Status {
     // AArch64 DTB logic
     #[cfg(target_arch = "aarch64")]
     {
-        // uefi::table::cfg::DEVICE_TREE_GUID
-        let dtb_guid = uefi::Guid::from_bytes([
-            0xb1, 0xb6, 0x21, 0xb1, 0x59, 0xc1, 0x4a, 0x4f, 0x93, 0x20, 0xd0, 0x04, 0x67, 0xe4, 0x8a, 0xe9,
-        ]);
+        // EFI_DTB_TABLE_GUID (UEFI spec / EDK2 gFdtTableGuid). The uefi 0.38 crate ships no named
+        // constant for it (ConfigTableEntry exposes only ACPI/SMBIOS/... GUIDs), so define it by
+        // string via the mistake-proof `guid!` macro rather than a hand-laid mixed-endian byte array.
+        let dtb_guid = uefi::guid!("b1b621d5-f19c-41a5-830b-d9152c69aae0");
         
         uefi::system::with_config_table(|config_table| {
             for config_entry in config_table {

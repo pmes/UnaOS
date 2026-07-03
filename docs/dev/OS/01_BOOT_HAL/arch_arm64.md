@@ -203,7 +203,7 @@ result — a claim only where the serial capture shows it.
 |-------------------|----------------------------------------------------------|-----------------------------------------------------|
 | GOP               | none published (headless)                                | **CONFIRMED: `GraphicsOutput handles = 0 (NOT_FOUND)`** — genuinely headless |
 | Firmware          | —                                                        | **EDK II, fw-rev `0x00010000`, UEFI 2.7**           |
-| DTB config table  | firmware publishes its FDT                               | **NONE — `no DTB configuration table published by firmware`**; the `/chosen stdout-path` UART-truth path is unavailable this way (the kernel's `dtb_addr` is 0 too) |
+| DTB config table  | firmware publishes its FDT                               | **UNVERIFIED** — R4 printed `no DTB configuration table published by firmware`, but that scan used a **wrong `EFI_DTB_TABLE_GUID`** (it matched no firmware GUID either way), so the "no DTB table" result is an artifact of the bug, not a measured fact. Re-measured with the corrected constant at the next attended boot (JM3 Part D); the `/chosen stdout-path` UART-truth path and the kernel's `dtb_addr` being 0 are UNVERIFIED for the same reason. |
 | Console UART base | UARTC `0x0C28_0000`, NS16550, reg-shift 2 (AON/SPE TCU)  | **UNRESOLVED + BLOCKED** — the first UARTC access (`LSR @ 0x0C28_0014`) *faults*: the region is unmapped in the UEFI-handoff tables (see R4 result). The base cannot be validated until the kernel maps device memory (JM3). |
 | Handoff EL        | EL2 (QEMU `virt` / Pi UEFI)                              | unknown — the kernel crashed *inside* the first `serial_println!`, before its `EL=` line printed |
 | Generic-timer Hz  | unknown on silicon (62.5 MHz QEMU `virt`, 54 MHz Pi 4)  | unknown — same (crashed before the `CNTFRQ=` line) |
@@ -217,7 +217,11 @@ order:
 
 - **BOOTDIAG runs on metal:** `firmware vendor='EDK II' fw-revision=0x00010000
   uefi-revision=2.7`; `GraphicsOutput handles = 0 (NOT_FOUND)`; `ConOut has no
-  DevicePath (UNSUPPORTED)`; `no DTB configuration table published by firmware`.
+  DevicePath (UNSUPPORTED)`. The `no DTB configuration table published by firmware`
+  line also printed but is **UNVERIFIED**: that scan used a wrong `EFI_DTB_TABLE_GUID`
+  (fixed in JM3 Part 0), so it would report "no DTB table" whether or not the firmware
+  actually published one — re-measured with the corrected GUID at the next attended
+  boot (JM3 Part D).
 - **R3 headless boot works on metal:** `No GraphicsOutput handle (…NOT_FOUND);
   booting headless (serial only)` — the bootloader proceeds PAST the old JM1 GOP
   stop, parses + loads the kernel (53 pages @ `0x25e5b4000`), and enters it.
@@ -256,9 +260,11 @@ but the following must change and are **not** covered by QEMU:
   mapping RAM (Normal) + the Tegra device windows (Device-nGnRE) — the EL2 analogue
   of the Pi bare-metal `boot::mmu_init`/`enable_mmu`. Only then can `serial::tegra`
   drive UARTC and the early stop's banner/heartbeats reach the console. (Confirm
-  the console UART base at the same time — the DTB path is unavailable: the Orin
-  firmware publishes no DTB configuration table, so BOOTDIAG's `/chosen stdout-path`
-  came up empty and `dtb_addr` is 0.)
+  the console UART base at the same time. Whether the DTB `/chosen stdout-path` path
+  is available is **UNVERIFIED**: R4's "no DTB table" reading used a wrong
+  `EFI_DTB_TABLE_GUID`, so `dtb_addr` being 0 was an artifact of that bug, not a
+  measured absence — re-measured with the corrected GUID at the next attended boot
+  (JM3 Part D).)
 * **GICR base *and* frame stride.** The redistributor walk (`smp_virt.rs`)
   hardcodes the QEMU-`virt` `GICR_BASE` (`0x080A_0000`) and a `0x2_0000` per-core
   stride (two 64 KiB frames: RD + SGI). Tegra234's GIC-600 is a **4-frame** class
