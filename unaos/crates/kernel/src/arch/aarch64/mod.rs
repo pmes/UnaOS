@@ -22,6 +22,10 @@ pub mod smp_virt;
 pub mod sched;
 #[cfg(feature = "baremetal")]
 pub mod syscall;
+// JM3: Jetson Orin Nano (Tegra234) kernel-owned MMU. The tegra/UEFI build maps RAM Normal-WB + the
+// Tegra device windows Device-nGnRE before touching any peripheral MMIO (the R4 UARTC-fault fix).
+#[cfg(feature = "tegra")]
+pub mod mmu_tegra;
 
 pub fn init() {
     serial_println!(":: AARCH64 Core Hardware Init ::");

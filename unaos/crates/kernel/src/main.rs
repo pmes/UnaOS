@@ -87,15 +87,17 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         boot_info.framebuffer_info,
     );
 
-    // 0b. Jetson Orin Nano (tegra): the shared `arch::init()` below brings up the GIC + generic
-    //     timer at the QEMU-`virt` MMIO bases, which are unmapped on Tegra234 — touching them would
-    //     abort. The Orin has no UnaOS GIC/timer driver yet (that is JM3), so on the `tegra` build we
-    //     stop platform bring-up cleanly HERE, before any interrupt-controller/timer init, and prove
-    //     the kernel is alive over the Tegra UART with a periodic heartbeat. Diverges, so everything
-    //     below is unreachable on tegra (covered by the fn's `allow(unreachable_code)`). `tegra` is
-    //     off in every QEMU build, so this is inert there and the regression logs are byte-identical.
+    // 0b. Jetson Orin Nano (tegra): install the kernel's own MMU, then stop before GIC/timer. The
+    //     UEFI-handoff translation tables map RAM but NOT the Tegra peripheral MMIO (JM2 R4: the
+    //     kernel faulted on its first UARTC read), so `tegra_early_stop` first calls `mmu_tegra::init`
+    //     to map RAM Normal-WB + the Tegra device window Device-nGnRE (JM3 — the R4 UARTC-fault fix),
+    //     which is what finally lets the serial path drive UARTC. It still stops before the shared
+    //     `arch::init()` GIC + generic-timer bring-up, which walks QEMU-`virt` MMIO bases unmapped on
+    //     Tegra234 (that driver work is JM4). Diverges, so everything below is unreachable on tegra
+    //     (covered by the fn's `allow(unreachable_code)`). `tegra` is off in every QEMU build, so this
+    //     is inert there and the regression logs are byte-identical.
     #[cfg(all(feature = "tegra", target_arch = "aarch64"))]
-    tegra_early_stop();
+    tegra_early_stop(boot_info);
 
     // 1. Core Hardware Init (GDT, IDT, local APIC for x86_64, GIC for aarch64)
     unaos_kernel::init();
@@ -657,22 +659,41 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     }
 }
 
-/// Jetson Orin Nano (Tegra234) early platform stop — the `tegra` build's terminus for this arc
-/// (JM2). The Orin has no UnaOS GIC/timer driver yet (JM3); the shared `arch::init()` would walk the
-/// QEMU-`virt` GICD/GICR bases, which are unmapped MMIO on Tegra234 and would abort. So we stop
-/// platform bring-up cleanly BEFORE any interrupt-controller/timer init, print an honest banner +
-/// stop line, and prove the kernel is alive over the Tegra UART with a periodic heartbeat.
+/// Jetson Orin Nano (Tegra234) MMU bring-up + early platform stop — the `tegra` build's terminus.
+/// JM3: the UEFI-handoff translation tables map RAM but NOT the Tegra peripheral MMIO (JM2 R4: the
+/// kernel faulted on its first UARTC read), so this first installs the kernel's OWN regime via
+/// `mmu_tegra::init` — RAM Normal-WB + the Tegra device window Device-nGnRE + a fault vector — which is
+/// what finally lets the serial path drive UARTC. It then stops BEFORE the shared `arch::init()` GIC +
+/// generic-timer bring-up (those walk QEMU-`virt` GICD/GICR bases unmapped on Tegra234 — JM4) and
+/// proves the kernel is alive over the now-mapped Tegra UART with a periodic heartbeat.
 ///
 /// Diverges (so `kernel_main` is `!` on tegra and everything after the call site is unreachable —
 /// covered by that fn's `allow(unreachable_code)`). There is no timer IRQ to wake a `WFI`, so this
 /// is a plain spin: the heartbeat cadence climbing IS the liveness proof. `tegra` is off in every
 /// QEMU build, so this is never compiled into a regression run.
 #[cfg(all(feature = "tegra", target_arch = "aarch64"))]
-fn tegra_early_stop() -> ! {
-    // Boot banner: the same EL / CNTFRQ / MMU / DAIF snapshot `arch::boot_diagnostics` prints, read
-    // straight from system registers (zero MMIO — cannot fault before we have a GIC/timer). This is
-    // the Orin's first kernel line over the Tegra UART and feeds JM3: are we handed off at EL2 or
-    // EL1 on this firmware, and what is the generic-timer frequency on real Tegra silicon?
+fn tegra_early_stop(boot_info: &BootInfo) -> ! {
+    // 1. Install the kernel's own MMU FIRST — SILENT. Nothing has printed yet (fbcon::init is
+    //    print-free when fb_addr == 0), and the serial path cannot touch UARTC until this maps the
+    //    Tegra device window. The FIRST serial byte of the whole kernel is the `mmu live` line below.
+    let mmu = unaos_kernel::arch::mmu_tegra::init(boot_info);
+    serial_println!(
+        ":: tegra: mmu live (EL{}) — RAM Normal-WB + Tegra Device-nGnRE mapped ::",
+        mmu.el
+    );
+    serial_println!(
+        ":: tegra: mmu regs — SCTLR {:#x}->{:#x} TCR={:#x} MAIR={:#x} TTBR0={:#x} RAM-GiB-mask={:#x} ::",
+        mmu.sctlr_old,
+        mmu.sctlr_new,
+        mmu.tcr,
+        mmu.mair,
+        mmu.ttbr0,
+        mmu.ram_gib_mask,
+    );
+
+    // 2. Boot banner: the same EL / CNTFRQ / MMU / DAIF snapshot `arch::boot_diagnostics` prints, read
+    // straight from system registers (zero MMIO — cannot fault). Now the first REAL EL/CNTFRQ values
+    // from Orin silicon (R4 crashed before this line); MMU reads `on` — our regime is live.
     let (el, cntfrq, sctlr, daif): (u64, u64, u64, u64);
     unsafe {
         let current_el: u64;
@@ -694,7 +715,7 @@ fn tegra_early_stop() -> ! {
         if sctlr & 1 != 0 { "on" } else { "off" },
         (daif >> 6) & 0b1111,
     );
-    serial_println!(":: tegra: early platform stop (gic/timer discovery = JM3) ::");
+    serial_println!(":: tegra: early platform stop (gic/timer discovery = JM4) ::");
 
     // Serial-alive idle loop: no GIC ⇒ no timer IRQ ⇒ no WFI (it would sleep forever with no wake
     // source); a plain spin with a heartbeat every ~10^8 iterations. The heartbeat number climbing
