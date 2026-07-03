@@ -132,6 +132,16 @@
     by the build. QEMU-verified (2026-07-02): `:: U2: HELLO.BIN loaded from FAT
     (72 bytes) -> ring 3 ::`, `hello from disk`, `:: U2: loaded program exited ok
     -> PASS ::`, across MBR-FAT32 and superfloppy layouts; U1a/U1b unchanged.
+    **Metal-confirmed on the real 2012 rMBP (2026-07-03)**: a Realtek USB3 SD
+    reader (`VID 0x0bda PID 0x0326`) enumerated a **FAT16** SD card, the loader
+    read `HELLO.BIN` (72 B) off it, copied it into the RO-from-start `USER_BASE`
+    code page, and ran it in ring 3 — `hello from disk` + `:: U2: loaded program
+    exited ok -> PASS ::` photographed on the framebuffer via the USBDEBUG view
+    (which keeps fbcon attached; the plain GUI build detaches it before the main
+    loop). The **first disk-loaded ring-3 program to run on UnaOS silicon**; the
+    first-entry GPR scrub (0b) is in this path, so ring-3 entry works with it on
+    metal. (The 0a #DB-resume and #MC *fire* paths are not exercised here and
+    remain metal-untested — see `SECURITY.md`.)
   - **Part-0 boundary preconditions** (they become live the moment ring 3 can run
     arbitrary loaded code): **(0a)** #DB (vector 1) and #MC (vector 18) each get
     their own IST stack. #DB closes a DoS — `RFLAGS.TF` is writable at any CPL, so

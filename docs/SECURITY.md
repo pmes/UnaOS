@@ -29,9 +29,11 @@ Exposure classes, honestly stated:
    boundary now exists on BOTH architectures (x86 U1a/U1b: ring-3 round-trip +
    per-page perms + fault→task-kill; aarch64 M6a/M6b, the pioneer). x86 U2 runs
    the FIRST real program loaded FROM DISK in it (a flat ring-3 binary read off
-   the FAT volume), but that program is still trusted only by ring-3 isolation
-   (no signature/allowlist check yet — U2's untrusted-loader note below), and the
-   kernel's own subsystems (drivers, FS, net) remain ring-0.
+   the FAT volume) — **metal-confirmed on the real 2012 rMBP (2026-07-03): a
+   Realtek USB3 SD reader → FAT16 card → `HELLO.BIN` (72 B) read + executed in
+   ring 3 (`hello from disk` -> PASS)**. But that program is still trusted only by
+   ring-3 isolation (no signature/allowlist check yet — U2's untrusted-loader note
+   below), and the kernel's own subsystems (drivers, FS, net) remain ring-0.
 3. **No identity or authorization layer yet** — no principals, no grants;
    any code that runs can do anything. This is what the U-chain builds.
 
