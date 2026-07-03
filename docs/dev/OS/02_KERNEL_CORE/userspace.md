@@ -86,7 +86,33 @@
   preemption (a per-task preempt counter would make the attribution exact; M6f). M6b `exited=1 killed=3 -> PASS` (same 3 ECs), CAPSTONE 6/6, 0 unexpected
   faults. (`IRQs-taken-at-EL0` grew 18→21 vs M6e — the extra preemptible tasks, expected
   and metal-variable.) M6d METAL-COMPLETE.
-- Not yet: validated user pointers (M6f).
+- **M6f** — validated user pointers + a wider syscall surface. `copy_from_user`/
+  `copy_to_user` are factored, range-checked primitives: a user pointer is
+  rejected (`-EFAULT`, an error RETURN — never a task-kill) unless `[va, va+len)`
+  lies fully inside the caller's EL0 window with a non-wrapping length; the
+  to-user direction additionally excludes the read-only code page, so a write
+  aimed there is refused *before* the store instead of faulting the kernel.
+  SYS_WRITE now streams through `copy_from_user` (validate-whole-range then
+  chunk, so a bad pointer yields `-EFAULT` with no partial output). New syscalls,
+  all thin over existing scheduler/timer primitives: `SYS_YIELD = 4`
+  (`sched::yield_now`), `SYS_SLEEP_MS = 5` (`sched::sleep_ticks`, ms→ticks at the
+  250 Hz tick, round up; a cooperative yield under QEMU where the timer IRQ isn't
+  delivered), `SYS_GETPID = 6`, `SYS_GETINFO = 7` (writes a fixed {pid, ticks}
+  struct via `copy_to_user`). Four EL0 fixtures on private slots (the getinfo
+  fixture writes its stack, so it needs its own): a well-behaved getinfo
+  round-trip, a hostile-pointer fixture (four bad pointers, each must EFAULT and
+  not kill), and a yield/sleep pair that cooperatively interleaves on one core.
+  Also lands the M6d review folds: an FP/SIMD first-entry scrub (zero `v0-v31`
+  + FPSR/FPCR + TPIDR_EL0/RO in `user_task_trampoline`), a slot-alloc unwind
+  (`boot::alloc_user_slots` releases on partial failure), and a per-task EL0
+  preempt counter (refining M6d's aggregate `IRQs-taken-at-EL0`). QEMU-verified
+  (2026-07-02): `:: M6f: validated user pointers … ::`, `getinfo/copy_to_user
+  round-trip -> PASS`, `4 hostile pointers refused (EFAULT), 0 kills -> PASS`,
+  `yield/sleep interleave -> PASS`, the per-task preempt line (all 0 under QEMU;
+  > 0 on metal), with M6c/M6b/M6d/M6e + CAPSTONE all unchanged and 0 unexpected
+  faults. Metal rides along with M6g's reflash (validation + copies run under the
+  ASIDs the metal already proved; the preempt counter goes > 0 there).
+- Not yet: loadable programs from storage + a process/handle model (M6g/U2, U4).
 
 ### x86_64 (branch `hw-rmbp`)
 
@@ -218,9 +244,22 @@
 
 Conventions shared across arches:
 
-- **Syscall numbering is common** (`SYS_WRITE = 1`, `SYS_EXIT = 2`, …);
-  register conventions per-arch (aarch64: `x8`/`x0..x5`; x86_64:
-  `rax`/`rdi,rsi,rdx,r10,r8,r9`).
+- **Syscall numbering is common** (register conventions are per-arch — aarch64:
+  number in `x8`, args `x0..x5`, return `x0`; x86_64: number in `rax`, args
+  `rdi,rsi,rdx,r10,r8,r9`, return `rax`). The number space so far:
+
+  | # | Name | Args | Returns | Notes |
+  | :--- | :--- | :--- | :--- | :--- |
+  | 1 | `SYS_WRITE` | fd, buf, len | byte count / `-errno` | fd 1 (stdout) only; buf validated via `copy_from_user` (aarch64 M6f) |
+  | 2 | `SYS_EXIT` | status | — (no return) | scheduler reclaims the task |
+  | 3 | `SYS_REPORT` | value | 0 | **demo-only** accounting channel (aarch64 M6d/M6f); not a real syscall |
+  | 4 | `SYS_YIELD` | — | 0 | aarch64 M6f — thin over `yield_now` |
+  | 5 | `SYS_SLEEP_MS` | ms | 0 | aarch64 M6f — `sleep_ticks` (cooperative yield where no timer IRQ) |
+  | 6 | `SYS_GETPID` | — | task id | aarch64 M6f |
+  | 7 | `SYS_GETINFO` | ptr | 0 / `-EFAULT` | aarch64 M6f — writes {pid, ticks} via `copy_to_user` |
+
+  aarch64 leads 4–7 (M6f); the x86 U-side port adopts the same numbers so the
+  arches stay aligned (x86 adds SMAP considerations aarch64's PAN-less A72 lacks).
 - **User faults kill the task, kernel faults stay fatal.** Fault accounting
   is matched (task, vector/EC, address) so demos assert exact outcomes.
 - **User pages are never executable-and-writable**; code pages are read-only

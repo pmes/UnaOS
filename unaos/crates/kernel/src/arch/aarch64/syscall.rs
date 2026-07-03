@@ -23,13 +23,24 @@
 
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
-// --- Syscall numbers (a tiny subset for M6a/M6b; SYS_REPORT added for the M6d demo). ---
+// --- Syscall numbers. WRITE/EXIT are the M6a/M6b core; REPORT is the M6d demo channel; YIELD/SLEEP_MS/
+// GETPID/GETINFO are the M6f "real" surface (all thin over existing scheduler/timer primitives). The
+// numbering is common across arches (documented in userspace.md) so the x86 U-side port stays aligned. ---
 const SYS_WRITE: u64 = 1;
 const SYS_EXIT: u64 = 2;
 /// M6d demo: report a u64 value to the kernel, keyed by the calling task's name (see `m6d_report`).
 /// Demo-only accounting channel — a real OS would not have this; it lets an EL0 program hand the kernel
 /// the value it read from its own (slot-private) address space so the verdict can check isolation.
 const SYS_REPORT: u64 = 3;
+/// M6f: cooperatively give up the CPU — thin over `sched::yield_now()`. Returns 0.
+const SYS_YIELD: u64 = 4;
+/// M6f: sleep ~`a0` milliseconds — thin over `sched::sleep_ticks()` (ms→ticks at the 250 Hz tick, round
+/// up). Returns 0. QEMU has no delivered timer IRQ, so it falls back to a cooperative yield there.
+const SYS_SLEEP_MS: u64 = 5;
+/// M6f: return the calling task's id (pid) in x0.
+const SYS_GETPID: u64 = 6;
+/// M6f: write a fixed {pid, ticks} struct to the user pointer in x0 via `copy_to_user`. Returns 0 or -EFAULT.
+const SYS_GETINFO: u64 = 7;
 
 /// M6e demo: the sentinel `sys_exit` status the preemption spinner uses so its exit is accounted to
 /// `EL0_SPIN_DONE` and never perturbs the M6b `exited/killed` counters. Demo-only — there is no real
@@ -39,6 +50,9 @@ const M6E_SPIN_STATUS: u64 = 0x6E;
 /// never touches the M6b (`EL0_EXITED_OK/ERR`) or M6e (`EL0_SPIN_DONE`) counters — keeping those verdicts
 /// byte-identical. The SYS_EXIT dispatch MUST test this BEFORE the catch-all `else` (see the handler).
 const M6D_EXIT_STATUS: u64 = 0x6D;
+/// M6f demo: the sentinel `sys_exit` status every M6f fixture uses so its exit lands in `EL0_M6F_DONE` and
+/// never perturbs the M6b/M6d/M6e counters (same discipline as M6D/M6E). Tested BEFORE the catch-all `else`.
+const M6F_EXIT_STATUS: u64 = 0x6F;
 
 // --- The inline EL0 FIXTURES: three fault-SHAPE fixtures (M6b) + one preemption spinner (M6e). These
 // are fixtures, not programs, so they stay inline in the kernel image; only the well-behaved `hello`
@@ -201,6 +215,158 @@ unsafe extern "C" {
     static __m6d_prog_sp_sentinel: u8;
 }
 
+// --- M6f inline EL0 fixtures (validated user pointers + wider syscall surface). Position-independent,
+// register/stack-only, so they run wherever the kernel copies them into a slot's code page. Each runs on its
+// OWN private slot (`spawn_user_slot`) — the getinfo fixture WRITES its stack (copy_to_user target), which
+// the shared window forbids (the M6e stack STOP tripwire) — and exits with `M6F_EXIT_STATUS` (0x6F) so it
+// lands in `EL0_M6F_DONE`, never perturbing the M6b/M6d/M6e counters. `adr xN, __m6f_blob_start` recovers
+// the window base (the blob is copied at code-page offset 0 in each slot), used to synthesize hostile VAs.
+// ABI: x8=nr, args x0-x2, ret x0. Numbers: WRITE=1, EXIT=2, REPORT=3, YIELD=4, SLEEP_MS=5, GETPID=6,
+// GETINFO=7. `sys_write(fd,buf,len)` = (x0,x1,x2). ---
+core::arch::global_asm!(
+    r#"
+    .globl __m6f_blob_start
+__m6f_blob_start:
+    // getinfo/copy_to_user round-trip (well-behaved): getpid -> x19; sys_getinfo(&info on our slot stack)
+    // -> the kernel writes the pid+ticks struct there via copy_to_user; read info.pid back -> x21; witness is
+    // the pid iff (info.pid == getpid && != 0), else 0 (so a mismatched/zero round-trip fails the verdict).
+    // Then sys_write a short summary from the code page (the validated copy_from_user read path), report the
+    // witness, exit. Writes ONLY its slot-private stack (sp-0x40, a data page), safe under preemption.
+    .balign 4
+    .globl __m6f_prog_getinfo
+__m6f_prog_getinfo:
+    mov  x8, #6                            // SYS_GETPID
+    svc  #0
+    mov  x19, x0                           // x19 = pid (P)
+    sub  x20, sp, #0x40                    // x20 = &info (slot-private, writable data page)
+    mov  x0, x20
+    mov  x8, #7                            // SYS_GETINFO(&info) -> copy_to_user writes the pid+ticks struct
+    svc  #0
+    ldr  x21, [x20]                        // x21 = info.pid (S), round-tripped through copy_to_user
+    mov  x22, xzr                          // witness = 0
+    cmp  x21, x19
+    b.ne 1f
+    cbz  x19, 1f
+    mov  x22, x19                          // matched & non-zero -> witness = pid
+1:  mov  x0, #1                            // sys_write summary: fd=stdout
+    adr  x1, __m6f_getinfo_msg
+    mov  x2, #16                           // "el0: getinfo ok\n"
+    mov  x8, #1                            // SYS_WRITE (routed through copy_from_user)
+    svc  #0
+    mov  x0, x22                           // SYS_REPORT(witness)
+    mov  x8, #3
+    svc  #0
+    mov  x8, #2                            // SYS_EXIT(M6F_EXIT_STATUS)
+    movz x0, #0x6F
+    svc  #0
+2:  b 2b
+
+    // hostile pointers (each must ERROR-RETURN -EFAULT, NOT kill the task): count the -14 returns in x19.
+    //   1) sys_write to kernel RAM VA (0x4000_0000, L1[1] EL1-only) — exfiltration attempt
+    //   2) sys_write to the unmapped page just past the window (base + 0x4000)
+    //   3) sys_write whose length wraps the address space (base + ~0 overflows)
+    //   4) sys_getinfo targeting the RO code page (base) — copy_to_user must refuse the write target
+    // A stray store or a kill would prevent the report (count != 4 -> verdict FAIL); a copy_to_user that
+    // actually wrote the RO page would fault the KERNEL (halt) -> no verdict at all. Report the count, exit.
+    .balign 4
+    .globl __m6f_prog_hostile
+__m6f_prog_hostile:
+    mov  x19, xzr                          // count of EFAULT (-14) returns
+    adr  x9, __m6f_blob_start              // x9 = user window base (code page)
+    mov  x0, #1                            // (1) kernel/MMIO VA
+    movz x1, #0x4000, lsl #16              // x1 = 0x4000_0000
+    mov  x2, #8
+    mov  x8, #1
+    svc  #0
+    cmn  x0, #14                           // x0 == -14 ?  (x0 + 14 == 0 -> Z)
+    cinc x19, x19, eq
+    mov  x0, #1                            // (2) unmapped page just past the window
+    add  x1, x9, #0x4000
+    mov  x2, #8
+    mov  x8, #1
+    svc  #0
+    cmn  x0, #14
+    cinc x19, x19, eq
+    mov  x0, #1                            // (3) length wraps (base + ~0)
+    mov  x1, x9
+    movn x2, #0xFF                         // x2 = 0xFFFF_FFFF_FFFF_FF00
+    mov  x8, #1
+    svc  #0
+    cmn  x0, #14
+    cinc x19, x19, eq
+    mov  x0, x9                            // (4) sys_getinfo(RO code-page VA) — copy_to_user must refuse
+    mov  x8, #7
+    svc  #0
+    cmn  x0, #14
+    cinc x19, x19, eq
+    mov  x0, x19                           // SYS_REPORT(count of refusals; want 4)
+    mov  x8, #3
+    svc  #0
+    mov  x8, #2
+    movz x0, #0x6F
+    svc  #0
+2:  b 2b
+
+    // yield fixture: SYS_YIELD in a loop, then report the completed iteration count. Co-located with the
+    // sleep fixture on one core; the two cooperatively interleave (the kernel counts the yield<->sleep
+    // switches). Register-only, so preemption cannot corrupt anything.
+    .balign 4
+    .globl __m6f_prog_yield
+__m6f_prog_yield:
+    mov  x19, #8                           // iterations
+    mov  x20, xzr
+1:  mov  x8, #4                            // SYS_YIELD
+    svc  #0
+    add  x20, x20, #1
+    cmp  x20, x19
+    b.lt 1b
+    mov  x0, x20                           // SYS_REPORT(completed count; want 8)
+    mov  x8, #3
+    svc  #0
+    mov  x8, #2
+    movz x0, #0x6F
+    svc  #0
+2:  b 2b
+
+    // sleep fixture: SYS_SLEEP_MS in a loop (a real timed sleep on metal; a cooperative yield under QEMU,
+    // where the timer IRQ is not delivered), then report the completed iteration count.
+    .balign 4
+    .globl __m6f_prog_sleep
+__m6f_prog_sleep:
+    mov  x19, #8
+    mov  x20, xzr
+1:  mov  x0, #2                            // sleep 2 ms
+    mov  x8, #5                            // SYS_SLEEP_MS(a0 = ms)
+    svc  #0
+    add  x20, x20, #1
+    cmp  x20, x19
+    b.lt 1b
+    mov  x0, x20                           // SYS_REPORT(completed count; want 8)
+    mov  x8, #3
+    svc  #0
+    mov  x8, #2
+    movz x0, #0x6F
+    svc  #0
+2:  b 2b
+
+    .balign 4
+__m6f_getinfo_msg:
+    .ascii "el0: getinfo ok\n"
+    .balign 4
+    .globl __m6f_blob_end
+__m6f_blob_end:
+"#
+);
+
+unsafe extern "C" {
+    static __m6f_blob_start: u8;
+    static __m6f_blob_end: u8;
+    static __m6f_prog_getinfo: u8;
+    static __m6f_prog_hostile: u8;
+    static __m6f_prog_yield: u8;
+    static __m6f_prog_sleep: u8;
+}
+
 /// The `hello` EL0 program (M6c), built as a SEPARATE link product (`crates/user-blob`) and baked in
 /// as a flat binary instead of living in the kernel's `.text`. `arroyo kernel8` builds it — a naked,
 /// position-independent `sys_write("hello from EL0\n") + sys_exit(0)` routine — for the bare aarch64
@@ -250,6 +416,26 @@ static EL0_IRQS_AT_EL0: AtomicU64 = AtomicU64::new(0);
 #[inline]
 pub fn note_el0_irq() {
     EL0_IRQS_AT_EL0.fetch_add(1, Ordering::Relaxed);
+    // Part 0 fold #5: also bump the current (preempted) task's OWN counter. At IRQ time this core's
+    // `current` is the preempted EL0 task, so `current_name` names it; the aggregate above stays for the
+    // M6e verdict, this refines it to exact per-task attribution for the M6f verdict.
+    if let Some(ctr) = task_preempt_counter(super::sched::current_name()) {
+        ctr.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// Map a demo EL0 task name to its per-task preempt counter (Part 0 fold #5), or None for any other task
+/// (kernel tasks, the M6b/M6c fault fixtures + hello + spinner — not individually attributed).
+fn task_preempt_counter(name: Option<&str>) -> Option<&'static AtomicU64> {
+    Some(match name? {
+        "el0-samevaA" => &PRE_SAMEVA_A,
+        "el0-samevaB" => &PRE_SAMEVA_B,
+        "el0-stackwrite" => &PRE_STACKWRITE,
+        "el0-spsentinel" => &PRE_SPSENTINEL,
+        "el0-yield" => &PRE_YIELD,
+        "el0-sleep" => &PRE_SLEEP,
+        _ => return None,
+    })
 }
 
 // --- M6d demo accounting (per-task address spaces). Decoupled from the M6b/M6e counters — M6d tasks exit
@@ -276,6 +462,43 @@ const M6D_SENTINEL_A: u64 = 0xA5A5_0000_0000_0001; // slot A (ASID 1)
 const M6D_SENTINEL_B: u64 = 0x5A5A_0000_0000_0002; // slot B (ASID 2)
 const M6D_SENTINEL_SP: u64 = 0x5EED_0000_0000_0004; // slot D (ASID 4)
 const M6D_STACK_PATTERN: u64 = 0xABCD_1234; // the in-program pattern el0-stackwrite pushes/pops
+
+// --- M6f demo accounting (validated user pointers + wider syscall surface). Decoupled from the
+// M6b/M6d/M6e counters exactly like M6d: M6f tasks exit with `M6F_EXIT_STATUS` -> `EL0_M6F_DONE`, and any
+// M6f kill routes to `EL0_M6F_KILLED` (see `record_el0_kill`), so `exited=1 killed=3` (M6b), `completed=1`
+// (M6e), and the M6d lines all stay byte-identical. Read by `m6f_verdict`. ---
+/// M6f fixtures that reached their sentinel `sys_exit` (the demo's completion signal; want 4).
+static EL0_M6F_DONE: AtomicU32 = AtomicU32::new(0);
+/// M6f fixtures KILLED by a fault — a real bug (the hostile fixture's whole point is EFAULT returns, NOT
+/// kills). Kept OFF the M6b counter so an M6f failure surfaces as its own FAIL, not a phantom M6b regression.
+static EL0_M6F_KILLED: AtomicU32 = AtomicU32::new(0);
+/// getinfo fixture witness: the pid it read back from the copy_to_user'd struct iff it matched SYS_GETPID
+/// (and was non-zero), else 0. Non-zero == the to-user round-trip carried the correct value.
+static M6F_GETINFO_WITNESS: AtomicU64 = AtomicU64::new(0);
+/// hostile fixture: how many of its 4 bad pointers the kernel refused with -EFAULT (want 4).
+static M6F_HOSTILE_REFUSED: AtomicU32 = AtomicU32::new(0);
+/// yield / sleep fixtures: the loop iteration count each completed (want `M6F_ITERS` each — proof both ran).
+static M6F_YIELD_DONE: AtomicU32 = AtomicU32::new(0);
+static M6F_SLEEP_DONE: AtomicU32 = AtomicU32::new(0);
+/// Observed yield<->sleep runner switches (see `note_interleave`); > 0 proves the two fixtures interleaved.
+static M6F_INTERLEAVE_SWITCHES: AtomicU32 = AtomicU32::new(0);
+/// Interleave witness state: 0 = no yielding M6f task has run yet; 1 = el0-yield last; 2 = el0-sleep last.
+static M6F_INTERLEAVE_LAST: AtomicU32 = AtomicU32::new(0);
+/// Iterations each interleave fixture loops (must match the `mov x19, #8` in the two inline programs).
+const M6F_ITERS: u32 = 8;
+
+// Per-task EL0 preempt counters (Part 0 review fold #5). `note_el0_irq` bumps the CURRENT (preempted)
+// task's own counter, keyed by name, in addition to the demo-wide `EL0_IRQS_AT_EL0` aggregate — so the M6f
+// verdict attributes preemption per slot task EXACTLY, refining the aggregate the M6d ledger called out as
+// coarse. Name-keyed statics (not a `Task` field) so the count survives the task's teardown for the verdict
+// to read. Metal-only signal: QEMU delivers no timer IRQ, so `note_el0_irq` is never called and all stay 0;
+// on the real Pi 4 the timer preempts running EL0 tasks and these go > 0.
+static PRE_SAMEVA_A: AtomicU64 = AtomicU64::new(0);
+static PRE_SAMEVA_B: AtomicU64 = AtomicU64::new(0);
+static PRE_STACKWRITE: AtomicU64 = AtomicU64::new(0);
+static PRE_SPSENTINEL: AtomicU64 = AtomicU64::new(0);
+static PRE_YIELD: AtomicU64 = AtomicU64::new(0);
+static PRE_SLEEP: AtomicU64 = AtomicU64::new(0);
 
 /// M6d: record a value an EL0 task reported via SYS_REPORT, keyed by the reporting task's name. Called on
 /// the reporting task's own kernel stack (from the SVC handler), IRQ-masked.
@@ -436,6 +659,12 @@ pub fn record_el0_kill(name: &str, ec: u64, far: u64, far_valid: bool) {
         EL0_M6D_KILLED.fetch_add(1, Ordering::AcqRel);
         return;
     }
+    // M6f fixtures likewise: a kill among them is a real bug (they must EFAULT-return, never fault) and
+    // must land in its own counter, never inflating the M6b `killed_unexpected` count.
+    if matches!(name, "el0-getinfo" | "el0-hostile" | "el0-yield" | "el0-sleep") {
+        EL0_M6F_KILLED.fetch_add(1, Ordering::AcqRel);
+        return;
+    }
     let (base, size) = super::boot::user_region();
     let code = super::boot::USER_CODE_SIZE as u64;
     let expected = far_valid
@@ -557,11 +786,14 @@ pub fn m6d_setup() -> Option<M6dDemo> {
         va
     };
 
-    let slot_a = super::boot::alloc_user_slot()?;
-    let slot_b = super::boot::alloc_user_slot()?;
-    let slot_c = super::boot::alloc_user_slot()?;
-    let slot_d = super::boot::alloc_user_slot()?;
-    let slots = [slot_a, slot_b, slot_c, slot_d];
+    // Multi-alloc with partial-failure unwind (M6d review fold): the old four sequential `alloc_user_slot()?`
+    // calls leaked earlier-claimed slots when a later one failed. `alloc_user_slots` releases what it got and
+    // returns false on exhaustion, so a failed M6d setup frees the whole request.
+    let mut slots = [0usize; 4];
+    if !super::boot::alloc_user_slots(&mut slots) {
+        return None;
+    }
+    let [slot_a, slot_b, slot_c, slot_d] = slots;
 
     // Copy the blob into each slot's code page (identity VA) + I-cache sync (DC CVAU/IC IVAU by the
     // identity VA; A72 caches are PIPT, so the code is fetchable at the aliased EL0 window VA).
@@ -650,6 +882,134 @@ pub fn m6d_verdict(_: usize) {
     }
 }
 
+/// The M6f demo's per-fixture entry points (EL0 VAs inside each slot's code page) + the per-fixture slot
+/// roots (`TTBR0` from `boot::slot_ttbr0`). One shared initial SP_EL0 (every slot's window has the same VA
+/// layout; only the frames differ). Each fixture runs on its OWN private slot because the getinfo fixture
+/// WRITES its stack (copy_to_user target) — forbidden on the shared window by the M6e stack STOP tripwire.
+pub struct M6fDemo {
+    pub sp: u64,
+    pub getinfo: u64,
+    pub hostile: u64,
+    pub yield_prog: u64,
+    pub sleep_prog: u64,
+    pub ttbr0_getinfo: u64,
+    pub ttbr0_hostile: u64,
+    pub ttbr0_yield: u64,
+    pub ttbr0_sleep: u64,
+}
+
+/// M6f setup: allocate four private slots (via the unwinding `alloc_user_slots`), copy the M6f blob into
+/// each slot's code page (through the Global identity backing VA, never the EL0 window VA), I-cache-sync,
+/// and protect the code pages. Emits the M6f setup line; returns the per-fixture entries + slot roots.
+/// Called once on the BSP after the M6d demo. `None` if slot allocation fails (the whole request is
+/// released, not leaked). Plants no sentinel — the getinfo fixture writes its own struct via copy_to_user.
+pub fn m6f_setup() -> Option<M6fDemo> {
+    let (base, size) = super::boot::user_region();
+    let sp = (base + size as u64) & !0xF; // shared initial SP_EL0 (16-aligned top of the window)
+
+    let bstart = &raw const __m6f_blob_start as usize;
+    let bend = &raw const __m6f_blob_end as usize;
+    let blen = bend - bstart;
+    assert!(blen <= super::boot::USER_CODE_SIZE, "M6f blob does not fit in a code page");
+    let entry = |label: *const u8| -> u64 {
+        let off = label as usize - bstart;
+        let va = base + off as u64;
+        assert!(va & 3 == 0, "M6f program entry misaligned"); // an eret to a misaligned entry is EC 0x22
+        va
+    };
+
+    let mut slots = [0usize; 4];
+    if !super::boot::alloc_user_slots(&mut slots) {
+        return None;
+    }
+    // Copy the blob into each slot's code page (identity VA) + I-cache sync (DC CVAU/IC IVAU by the identity
+    // VA; A72 caches are PIPT, so the code is fetchable at the aliased EL0 window VA), then protect it.
+    for &s in &slots {
+        let backing = super::boot::slot_backing_ptr(s);
+        unsafe { core::ptr::copy_nonoverlapping(bstart as *const u8, backing, blen) };
+        super::cache::icache_sync_range(backing as usize, blen);
+    }
+    for &s in &slots {
+        unsafe { super::boot::protect_user_slot_code(s, super::boot::USER_CODE_SIZE) };
+    }
+
+    serial_println!(
+        ":: M6f: validated user pointers — copy_from_user/copy_to_user + syscall surface (4 EL0 fixtures) ::"
+    );
+
+    Some(M6fDemo {
+        sp,
+        getinfo: entry(&raw const __m6f_prog_getinfo),
+        hostile: entry(&raw const __m6f_prog_hostile),
+        yield_prog: entry(&raw const __m6f_prog_yield),
+        sleep_prog: entry(&raw const __m6f_prog_sleep),
+        ttbr0_getinfo: super::boot::slot_ttbr0(slots[0]),
+        ttbr0_hostile: super::boot::slot_ttbr0(slots[1]),
+        ttbr0_yield: super::boot::slot_ttbr0(slots[2]),
+        ttbr0_sleep: super::boot::slot_ttbr0(slots[3]),
+    })
+}
+
+/// M6f verdict task: wait (bounded, CNTPCT) for the four M6f fixtures to exit, then print the three PASS/
+/// FAIL lines + the per-task EL0 preempt breakdown (Part 0 fold #5). Spawned on a sibling core like the
+/// other verdicts. Lines: (1) getinfo/copy_to_user round-trip — the witness is non-zero iff the pid read
+/// back from the struct copy_to_user wrote equalled SYS_GETPID; (2) 4 hostile pointers refused (EFAULT), 0
+/// kills — the hostile fixture counted 4 EFAULT returns and was NOT killed (a kill, or a kernel halt from a
+/// stray store, would have prevented the report); (3) yield/sleep interleave — both fixtures completed all
+/// iterations AND the kernel observed > 0 runner switches between them. The preempt line is QEMU-0 /
+/// metal->0, so the next reflash reads exact per-slot-task preemption (the M6d ledger's aggregate refined).
+pub fn m6f_verdict(_: usize) {
+    let start = super::timer::cntpct();
+    let deadline = 5 * super::timer::cntfrq(); // ~5 s; the whole demo completes well under 1 s
+    while EL0_M6F_DONE.load(Ordering::Acquire) < 4
+        && super::timer::cntpct().wrapping_sub(start) <= deadline
+    {
+        super::sched::yield_now();
+    }
+    let getinfo = M6F_GETINFO_WITNESS.load(Ordering::Acquire);
+    let hostile = M6F_HOSTILE_REFUSED.load(Ordering::Acquire);
+    let ydone = M6F_YIELD_DONE.load(Ordering::Acquire);
+    let sdone = M6F_SLEEP_DONE.load(Ordering::Acquire);
+    let switches = M6F_INTERLEAVE_SWITCHES.load(Ordering::Acquire);
+    let killed = EL0_M6F_KILLED.load(Ordering::Acquire);
+
+    if getinfo != 0 && killed == 0 {
+        serial_println!(":: M6f: getinfo/copy_to_user round-trip -> PASS ::");
+    } else {
+        serial_println!(
+            ":: M6f: getinfo/copy_to_user round-trip (witness={:#x} killed={}) -> FAIL ::",
+            getinfo, killed
+        );
+    }
+    if hostile == 4 && killed == 0 {
+        serial_println!(":: M6f: 4 hostile pointers refused (EFAULT), 0 kills -> PASS ::");
+    } else {
+        serial_println!(
+            ":: M6f: hostile pointers refused={} killed={} (want 4/0) -> FAIL ::",
+            hostile, killed
+        );
+    }
+    if ydone == M6F_ITERS && sdone == M6F_ITERS && switches > 0 {
+        serial_println!(":: M6f: yield/sleep interleave -> PASS ::");
+    } else {
+        serial_println!(
+            ":: M6f: yield/sleep interleave (yield={} sleep={} switches={}) -> FAIL ::",
+            ydone, sdone, switches
+        );
+    }
+    // Per-task EL0 preempt breakdown (Part 0 fold #5): the exact per-slot-task attribution the M6d ledger's
+    // aggregate `IRQs-taken-at-EL0` lacked. QEMU: all 0 (no timer IRQ). Metal: > 0 for the tasks a tick caught.
+    serial_println!(
+        ":: M6f: per-task EL0 preempts — samevaA={} samevaB={} stackwrite={} spsentinel={} yield={} sleep={} (metal >0; QEMU 0) ::",
+        PRE_SAMEVA_A.load(Ordering::Relaxed),
+        PRE_SAMEVA_B.load(Ordering::Relaxed),
+        PRE_STACKWRITE.load(Ordering::Relaxed),
+        PRE_SPSENTINEL.load(Ordering::Relaxed),
+        PRE_YIELD.load(Ordering::Relaxed),
+        PRE_SLEEP.load(Ordering::Relaxed),
+    );
+}
+
 /// One-shot: the first syscall proves the EL0→EL1 path is live end to end (logged off the ISR-free SVC
 /// path, so `serial_println!` is safe here — unlike the RX ISR, nothing on this core holds SERIAL_PORT).
 static SVC_LOGGED: AtomicBool = AtomicBool::new(false);
@@ -673,20 +1033,30 @@ extern "C" fn aarch64_svc_handler(frame: *mut u64) {
     let ret: i64 = match nr {
         SYS_WRITE => sys_write(a0, a1, a2),
         SYS_REPORT => {
+            // Route by the reporting task's name: M6d names land in m6d_report, M6f names in m6f_report;
+            // each ignores the other's names, so calling both is safe and additive.
             m6d_report(a0);
+            m6f_report(a0);
             0
         }
+        SYS_YIELD => sys_yield(),
+        SYS_SLEEP_MS => sys_sleep_ms(a0),
+        SYS_GETPID => super::sched::current_id().map(|id| id as i64).unwrap_or(-1),
+        SYS_GETINFO => sys_getinfo(a0),
         SYS_EXIT => {
             // Demo accounting BEFORE the no-return exit. The sentinel statuses are routed to their own
             // counters so the M6b (`exited=1 killed=3`) and M6e (`completed=1`) verdicts stay byte-
-            // identical: M6E_SPIN_STATUS -> EL0_SPIN_DONE, M6D_EXIT_STATUS -> EL0_M6D_DONE. Both sentinel
-            // arms MUST precede the catch-all `else` (a mis-ordered M6d exit would land in EL0_EXITED_ERR
-            // and FAIL the M6b verdict). Otherwise: status 0 = normal completion (hello); nonzero = a
-            // fault-test program self-reporting that its intended fault never happened (survivor protocol).
+            // identical: M6E_SPIN_STATUS -> EL0_SPIN_DONE, M6D_EXIT_STATUS -> EL0_M6D_DONE, M6F_EXIT_STATUS
+            // -> EL0_M6F_DONE. All three sentinel arms MUST precede the catch-all `else` (a mis-ordered
+            // sentinel exit would land in EL0_EXITED_ERR and FAIL the M6b verdict). Otherwise: status 0 =
+            // normal completion (hello); nonzero = a fault-test program self-reporting that its intended
+            // fault never happened (survivor protocol).
             if a0 == M6E_SPIN_STATUS {
                 EL0_SPIN_DONE.fetch_add(1, Ordering::AcqRel);
             } else if a0 == M6D_EXIT_STATUS {
                 EL0_M6D_DONE.fetch_add(1, Ordering::AcqRel);
+            } else if a0 == M6F_EXIT_STATUS {
+                EL0_M6F_DONE.fetch_add(1, Ordering::AcqRel);
             } else if a0 == 0 {
                 EL0_EXITED_OK.fetch_add(1, Ordering::AcqRel);
             } else {
@@ -699,34 +1069,202 @@ extern "C" fn aarch64_svc_handler(frame: *mut u64) {
     unsafe { *frame.add(0) = ret as u64 }; // return value in x0
 }
 
-/// SYS_WRITE(fd, buf, len): write `len` bytes from the EL0 buffer to the serial console; returns the
-/// count, or a negative errno.
-///
-/// The buffer pointer is an EL0 VA == PA == the EL1 identity VA, so the kernel can read it directly at
-/// EL1 — BUT it is UNTRUSTED, so it is bound-checked against USER_REGION before the deref: an EL0
-/// caller must not be able to point `buf` at kernel RAM (exfiltration out the serial port), at the
-/// Device window (a side-effecting EL1 MMIO read), or at unmapped memory (an EL1 abort that
-/// `aarch64_fault_handler` would turn into a core halt). Full copy_from_user is M6f; this closes both
-/// holes cheaply. NOTE (A72/Armv8.0): the direct EL1 read of an EL0-accessible (AP=0b01 or 0b11)
-/// page is permitted because this core lacks FEAT_PAN; on a PAN-capable core (the Jetson A78 port)
-/// this must become an unprivileged load (LDTR) or a validated copy first, else it Permission-faults
-/// (EC 0x25).
+// =============================================================================================
+// M6f: validated user-pointer copies (copy_from_user / copy_to_user) + the wider syscall surface
+// =============================================================================================
+
+/// The single error `copy_from_user`/`copy_to_user` return: a user pointer/length failed validation
+/// (outside the task's window, a wrapping range, or — to-user only — the read-only code page). Mapped to
+/// `-EFAULT` (`EFAULT`) at the syscall boundary. A bad pointer ARG is an error RETURN, never a task-kill:
+/// kills are reserved for faults the HARDWARE raises (M6b), not a syscall arg the kernel can reject cheaply.
+pub struct Efault;
+
+/// `-EFAULT`, the errno a rejected user pointer returns to EL0.
+const EFAULT: i64 = -14;
+
+/// Validate that `[user_va, user_va+len)` lies entirely inside the calling task's EL0 window. `writable`
+/// additionally excludes the read-only CODE page (page 0, `[base, base+USER_CODE_SIZE)`), so `copy_to_user`
+/// refuses a write aimed there (an EL1 store to an AP=0b11 page Permission-faults -> the kernel-fault path
+/// halts the core; we reject BEFORE any deref instead of taking that fault). Checks, in order: `len == 0`
+/// is handled by the callers' fast path; `checked_add` rejects a length that wraps; the range must sit
+/// fully in `[lo, base+size)`. A syscall executes with the caller's TTBR0/ASID live (M6d), so a user VA in
+/// this window can only reach that task's OWN frames — validation + that guarantee is the PAN-less software
+/// discipline (A72 is Armv8.0, no FEAT_PAN; on a PAN-capable port this must become an LDTR/unprivileged copy).
+fn user_range_ok(user_va: u64, len: usize, writable: bool) -> bool {
+    let (base, size) = super::boot::user_region();
+    let Some(end) = user_va.checked_add(len as u64) else {
+        return false; // length wraps the address space
+    };
+    let lo = if writable { base + super::boot::USER_CODE_SIZE as u64 } else { base };
+    user_va >= lo && end <= base + size as u64
+}
+
+/// Copy `len` bytes from the EL0 buffer at `user_va` into `kdst`, after validating the whole SOURCE range
+/// is inside the caller's user window. Never dereferences the pointer until all checks pass. `Err(Efault)`
+/// on a bad pointer/length. Factored out of the M6b SYS_WRITE bound-check; `kdst.len() >= len` is a
+/// kernel-side contract (debug-asserted).
+pub fn copy_from_user(kdst: &mut [u8], user_va: u64, len: usize) -> Result<(), Efault> {
+    if len == 0 {
+        return Ok(());
+    }
+    debug_assert!(kdst.len() >= len, "copy_from_user: kdst smaller than len (kernel bug)");
+    if !user_range_ok(user_va, len, false) {
+        return Err(Efault);
+    }
+    // SAFETY: range validated inside the user window; the syscall runs with the caller's TTBR0 live, so the
+    // VA resolves to the caller's own frames, readable at EL1 (AP=0b01/0b11) on this PAN-less A72.
+    unsafe { core::ptr::copy_nonoverlapping(user_va as *const u8, kdst.as_mut_ptr(), len) };
+    Ok(())
+}
+
+/// Copy `len` bytes from `ksrc` to the EL0 buffer at `user_va`, after validating the whole DESTINATION
+/// range is inside the caller's WRITABLE user window (the RO code page is excluded, so a write aimed there
+/// is refused with `Efault`, never a faulting EL1 store). The to-user twin of `copy_from_user`.
+pub fn copy_to_user(user_va: u64, ksrc: &[u8], len: usize) -> Result<(), Efault> {
+    if len == 0 {
+        return Ok(());
+    }
+    debug_assert!(ksrc.len() >= len, "copy_to_user: ksrc smaller than len (kernel bug)");
+    if !user_range_ok(user_va, len, true) {
+        return Err(Efault);
+    }
+    // SAFETY: range validated inside the writable user window (code page excluded); caller's TTBR0 live.
+    unsafe { core::ptr::copy_nonoverlapping(ksrc.as_ptr(), user_va as *mut u8, len) };
+    Ok(())
+}
+
+/// SYS_WRITE(fd, buf, len): write `len` bytes from the EL0 buffer to the serial console; returns the count,
+/// or a negative errno. Routed through `copy_from_user` (M6f): validate the WHOLE range up front so a
+/// hostile pointer yields `-EFAULT` with NO partial output (byte-identical to the pre-M6f all-or-nothing
+/// behaviour), then stream to the console in bounded stack chunks THROUGH the validated copy primitive.
 fn sys_write(fd: u64, buf: u64, len: u64) -> i64 {
     if fd != 1 {
         return -9; // -EBADF (only stdout for M6a/M6b)
     }
-    let (base, size) = super::boot::user_region();
-    let end = buf.wrapping_add(len);
-    // Reject overflow and any range not fully inside USER_REGION.
-    if end < buf || buf < base || end > base + size as u64 {
-        return -14; // -EFAULT
+    let total = len as usize;
+    if !user_range_ok(buf, total, false) {
+        return EFAULT; // reject before ANY output (matches the old all-or-nothing semantics)
     }
-    let bytes = unsafe { core::slice::from_raw_parts(buf as *const u8, len as usize) };
-    // Byte loop (not fmt) keeps the syscall path FP-light and handles non-UTF-8 bytes. Held IRQ-masked
-    // at EL1, so the SERIAL_PORT lock can't be re-entered by an interrupt on this core.
+    let mut chunk = [0u8; 256];
+    let mut off = 0usize;
+    // Byte loop (not fmt) keeps the syscall path FP-light and handles non-UTF-8 bytes. Held IRQ-masked at
+    // EL1 (exception entry), so the SERIAL_PORT lock can't be re-entered by an interrupt on this core;
+    // copy_from_user does a plain memcpy (no serial, no block) under the lock.
     let port = super::serial::SERIAL_PORT.lock();
-    for &b in bytes {
-        port.write_byte(b);
+    while off < total {
+        let n = core::cmp::min(chunk.len(), total - off);
+        // A subrange of the already-validated range, so copy_from_user's re-check always passes here.
+        if copy_from_user(&mut chunk[..n], buf + off as u64, n).is_err() {
+            return EFAULT;
+        }
+        for &b in &chunk[..n] {
+            port.write_byte(b);
+        }
+        off += n;
     }
     len as i64
+}
+
+/// The fixed struct SYS_GETINFO writes to EL0. `#[repr(C)]` so the byte layout is stable for the user
+/// program that reads it back: `pid` at offset 0, `ticks` at offset 8 (16 bytes total).
+#[repr(C)]
+struct UserInfo {
+    pid: u64,
+    ticks: u64,
+}
+
+/// SYS_GETINFO(user_ptr): write a small fixed {pid, ticks} struct to the caller's buffer via
+/// `copy_to_user` — the to-user direction's exerciser. Returns 0, or `-EFAULT` if the pointer/length fails
+/// validation (e.g. aimed at the RO code page) — an error RETURN, never a task-kill.
+fn sys_getinfo(user_ptr: u64) -> i64 {
+    let info = UserInfo {
+        pid: super::sched::current_id().unwrap_or(0),
+        ticks: super::timer::ticks(),
+    };
+    // SAFETY: view `info` as its raw bytes for the copy; `UserInfo` is `#[repr(C)]` plain-old-data.
+    let bytes = unsafe {
+        core::slice::from_raw_parts(
+            &info as *const UserInfo as *const u8,
+            core::mem::size_of::<UserInfo>(),
+        )
+    };
+    match copy_to_user(user_ptr, bytes, bytes.len()) {
+        Ok(()) => 0,
+        Err(Efault) => EFAULT,
+    }
+}
+
+/// SYS_YIELD: cooperatively give up the CPU — thin over `sched::yield_now()`. `yield_now` unmasks IRQ on
+/// return, but the `__vec_svc` epilogue that runs after this handler restores per-core banked
+/// ELR/SPSR/SP_EL0 and MUST be I-masked, so re-mask before returning (see `remask_irq`). Records one
+/// interleave observation for the M6f yield/sleep witness. Returns 0.
+fn sys_yield() -> i64 {
+    note_interleave();
+    super::sched::yield_now();
+    remask_irq();
+    0
+}
+
+/// SYS_SLEEP_MS(ms): block the calling EL0 task ~`ms` milliseconds — thin over `sched::sleep_ticks`
+/// (ms→ticks at the 250 Hz per-core tick, rounding UP so a sub-tick sleep still waits >= 1 tick; M6f adds
+/// no scheduler primitive). QEMU delivers no timer IRQ, so `sleep_ticks` (whose only waker is the tick)
+/// would park the task FOREVER; when the timer is not live, fall back to a cooperative `yield_now` — the
+/// same guard `input_service`/`rx_backstop` use — so the interleave demo makes progress and the regression
+/// never hangs. The real timed sleep rides along on metal. Both `sleep_ticks` and `yield_now` unmask IRQ,
+/// so re-mask before returning to the I-masked `__vec_svc` epilogue. Returns 0.
+fn sys_sleep_ms(ms: u64) -> i64 {
+    /// The scheduler tick rate; mirrors `timer::TICK_HZ` (private there). Only used for the ms→ticks
+    /// conversion — no timer register is touched (the STOP tripwire on timer timing stands).
+    const TICK_HZ: u64 = 250;
+    let ticks = (ms.saturating_mul(TICK_HZ) + 999) / 1000; // round up
+    note_interleave();
+    if super::timer::is_live() {
+        super::sched::sleep_ticks(ticks);
+    } else {
+        super::sched::yield_now();
+    }
+    remask_irq();
+    0
+}
+
+/// Re-mask IRQ (set PSTATE.I). `yield_now`/`sleep_ticks` unmask on return, but the `__vec_svc` epilogue
+/// after this handler restores the per-core banked ELR_EL1/SPSR_EL1/SP_EL0 and MUST be I-masked — a nested
+/// IRQ between those `msr`s and the `eret` would re-bank them and corrupt the EL0 return (the same
+/// invariant the `__vec_irq` epilogue documents). Exception entry masks DAIF, so the handler is entered
+/// I-masked; the two syscalls that unmask (via a scheduler switch) re-mask here before returning.
+#[inline]
+fn remask_irq() {
+    unsafe { core::arch::asm!("msr daifset, #2", options(nomem, nostack, preserves_flags)) };
+}
+
+/// M6f: record one yield/sleep interleave observation. Called from the SYS_YIELD/SYS_SLEEP_MS handlers
+/// with the reporting task current; the two interleave fixtures run on one core, so a change of runner
+/// since the previous yielding syscall is one observed switch (`M6F_INTERLEAVE_SWITCHES > 0` proves both
+/// ran and the scheduler passed control back and forth). Only the two named M6f interleave tasks
+/// participate (kernel `yield_now` callers don't come through the syscall path; other EL0 tasks aren't
+/// named these). Under QEMU the interleave is purely the SYS_YIELD round-robin; on metal the timer also
+/// preempts them.
+fn note_interleave() {
+    let tag = match super::sched::current_name() {
+        Some("el0-yield") => 1u32,
+        Some("el0-sleep") => 2u32,
+        _ => return,
+    };
+    let last = M6F_INTERLEAVE_LAST.swap(tag, Ordering::AcqRel);
+    if last != 0 && last != tag {
+        M6F_INTERLEAVE_SWITCHES.fetch_add(1, Ordering::AcqRel);
+    }
+}
+
+/// M6f: record a value an M6f EL0 fixture reported via SYS_REPORT, keyed by the reporting task's name.
+/// (M6d names fall through to `m6d_report`, which the SYS_REPORT arm also calls; the name spaces are
+/// disjoint, so each function ignores the other's tasks.)
+fn m6f_report(value: u64) {
+    match super::sched::current_name() {
+        Some("el0-getinfo") => M6F_GETINFO_WITNESS.store(value, Ordering::Release),
+        Some("el0-hostile") => M6F_HOSTILE_REFUSED.store(value as u32, Ordering::Release),
+        Some("el0-yield") => M6F_YIELD_DONE.store(value as u32, Ordering::Release),
+        Some("el0-sleep") => M6F_SLEEP_DONE.store(value as u32, Ordering::Release),
+        _ => {} // a stray report from any other task is ignored (never happens in the demo)
+    }
 }
