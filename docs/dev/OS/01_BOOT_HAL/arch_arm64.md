@@ -156,12 +156,15 @@ L4T r36) launches from the UEFI Shell (`connect -r`, `map -r`, then
 3. Kernel load + relocation + `ExitBootServices`, then `_start(boot_info)` at
    whatever EL the firmware hands off (the kernel boot-diag line reports it).
 4. **`tegra` early platform stop** (`crates/kernel/src/main.rs::tegra_early_stop`):
-   the kernel prints its banner + boot-diag line + `:: tegra: early platform stop
-   (gic/timer discovery = JM3) ::`, then a serial-alive heartbeat loop
-   (`:: tegra: heartbeat <n> ::`). It does **not** bring up the GIC or generic
-   timer — those walk QEMU-`virt` MMIO bases unmapped on Tegra234 (JM3's job).
-   With no timer IRQ there is no `WFI`; the plain spin's climbing heartbeat is the
-   arc's liveness verdict.
+   the kernel is *designed* to print its banner + boot-diag line + `:: tegra: early
+   platform stop (gic/timer discovery = JM3) ::`, then a serial-alive heartbeat loop
+   (`:: tegra: heartbeat <n> ::`). It does **not** bring up the GIC or generic timer
+   — those walk QEMU-`virt` MMIO bases unmapped on Tegra234 (JM3's job). With no
+   timer IRQ there is no `WFI`; the plain spin's climbing heartbeat is the intended
+   liveness verdict. **On metal (R4, below) this does not print**: the first
+   `serial_println!` faults on the UARTC MMIO read, because the UEFI-handoff page
+   tables do not map the Tegra peripherals — the kernel must set up its own MMU
+   first (JM3).
 
 ### Headless bootloader (`fb_addr == 0`)
 
@@ -192,25 +195,70 @@ is unaffected.
 
 ### UART / GOP truth table
 
-The `tegra` serial driver's assumptions vs. what the attended boot must confirm.
-**Nothing below is a metal claim** — the right-hand column is filled from the
-`BOOTDIAG` serial capture at the operator-attended boot (R4).
+The `tegra` serial driver's assumptions vs. what the operator-attended R4 boot
+(2026-07-03, real Orin Nano) actually showed. The right-hand column is the metal
+result — a claim only where the serial capture shows it.
 
-| Aspect            | Driver assumption (pre-metal)                            | Confirm at attended boot (BOOTDIAG / kernel banner) |
+| Aspect            | Driver assumption (pre-metal)                            | R4 metal result (2026-07-03, real Orin)             |
 |-------------------|----------------------------------------------------------|-----------------------------------------------------|
-| Console UART base | UARTC `0x0C28_0000`, NS16550, reg-shift 2 (AON/SPE TCU)  | `/chosen stdout-path` + resolved `serial*` alias node |
-| UART reset/clock  | inherited from firmware (no baud/divisor reprogramming)  | LSR readback (0x00 ⇒ held in reset; 0xFFFF_FFFF ⇒ open-bus / wrong base) |
-| GOP               | none published (headless)                                | `BOOTDIAG: GraphicsOutput handles = N` (expect 0)   |
-| Handoff EL        | unknown (EL2 on QEMU `virt`, EL2 on Pi UEFI)             | kernel boot-diag `EL=` line                         |
-| Generic-timer Hz  | unknown on silicon (62.5 MHz QEMU `virt`, 54 MHz Pi 4)  | kernel boot-diag `CNTFRQ=` line                     |
+| GOP               | none published (headless)                                | **CONFIRMED: `GraphicsOutput handles = 0 (NOT_FOUND)`** — genuinely headless |
+| Firmware          | —                                                        | **EDK II, fw-rev `0x00010000`, UEFI 2.7**           |
+| DTB config table  | firmware publishes its FDT                               | **NONE — `no DTB configuration table published by firmware`**; the `/chosen stdout-path` UART-truth path is unavailable this way (the kernel's `dtb_addr` is 0 too) |
+| Console UART base | UARTC `0x0C28_0000`, NS16550, reg-shift 2 (AON/SPE TCU)  | **UNRESOLVED + BLOCKED** — the first UARTC access (`LSR @ 0x0C28_0014`) *faults*: the region is unmapped in the UEFI-handoff tables (see R4 result). The base cannot be validated until the kernel maps device memory (JM3). |
+| Handoff EL        | EL2 (QEMU `virt` / Pi UEFI)                              | unknown — the kernel crashed *inside* the first `serial_println!`, before its `EL=` line printed |
+| Generic-timer Hz  | unknown on silicon (62.5 MHz QEMU `virt`, 54 MHz Pi 4)  | unknown — same (crashed before the `CNTFRQ=` line) |
 
-(Values filled at the JM2 attended boot: _pending — see the JM2 landing report._)
+### R4 metal result (2026-07-03, operator-attended)
+
+The Orin booted the `UNAOS_BOOTDIAG=1 UNAOS_TEGRA=1 ./arroyo esp-jetson` media
+over a Raspberry Pi Debug Probe on the board's TTL header (pin 3 = RX, pin 4 = TX,
+115200; the USB-C port does not enumerate a console). Confirmed on silicon, in
+order:
+
+- **BOOTDIAG runs on metal:** `firmware vendor='EDK II' fw-revision=0x00010000
+  uefi-revision=2.7`; `GraphicsOutput handles = 0 (NOT_FOUND)`; `ConOut has no
+  DevicePath (UNSUPPORTED)`; `no DTB configuration table published by firmware`.
+- **R3 headless boot works on metal:** `No GraphicsOutput handle (…NOT_FOUND);
+  booting headless (serial only)` — the bootloader proceeds PAST the old JM1 GOP
+  stop, parses + loads the kernel (53 pages @ `0x25e5b4000`), and enters it.
+  **R1–R3 are metal-confirmed.**
+- **The kernel faults on its first Tegra UART access.** UEFI's still-resident
+  handler catches it:
+  ```
+  Synchronous Exception at 0x25E5C52FC   (kernel_base 0x25e5b4000 + 0x112fc)
+  ASSERT [ArmCpuDxe] …/DefaultExceptionHandler.c(345)  ->  Resetting
+  ```
+  Disassembly at that offset (in `serial::__print` → `tegra::write_byte`) shows
+  the faulting instruction is `ldr w13, [x9]` with `x9 = 0x0C28_0014` — the
+  `read_volatile(LSR)` of the THRE-wait, i.e. the **first MMIO read of UARTC**.
+  **Root cause: the Tegra UARTC device region is not mapped in the page tables
+  UEFI hands off.** The kernel runs on that map until it installs its own MMU
+  (which the `tegra` early-stop build never does — it stops before `arch::init`),
+  so any Tegra peripheral MMIO faults. This is an MMIO *translation* fault, not a
+  wrong-base *silence*: even the correct UART base faults identically until the
+  kernel maps device memory. (Full capture: `unaos/target/serial-orin-jm2.log`.)
+
+**JM3 hand-off:** the Orin kernel needs its own MMU bring-up mapping the Tegra
+peripherals (UARTC, then GIC/timer) as device memory before touching them — the
+EL2 analogue of the Pi bare-metal `boot::mmu_init`. Until then `serial::tegra`
+cannot drive UARTC, and the tegra early-stop's banner/heartbeats never reach the
+console. This is the first item on the delta list below.
 
 ### Orin-metal delta list (feeds JM3 + the cable-day graphical arc)
 
 The `virt` GICv3 + PSCI SMP (JC2) is written to be a small delta to Orin silicon,
 but the following must change and are **not** covered by QEMU:
 
+* **Kernel MMU that maps the Tegra peripherals (the R4 blocker — do this FIRST).**
+  The UEFI-handoff page tables do not map UARTC (nor, presumably, the GIC/timer),
+  so the `tegra` kernel faults on its first UARTC MMIO read (R4, §above). Before
+  any Tegra peripheral MMIO, the kernel must install its own translation regime
+  mapping RAM (Normal) + the Tegra device windows (Device-nGnRE) — the EL2 analogue
+  of the Pi bare-metal `boot::mmu_init`/`enable_mmu`. Only then can `serial::tegra`
+  drive UARTC and the early stop's banner/heartbeats reach the console. (Confirm
+  the console UART base at the same time — the DTB path is unavailable: the Orin
+  firmware publishes no DTB configuration table, so BOOTDIAG's `/chosen stdout-path`
+  came up empty and `dtb_addr` is 0.)
 * **GICR base *and* frame stride.** The redistributor walk (`smp_virt.rs`)
   hardcodes the QEMU-`virt` `GICR_BASE` (`0x080A_0000`) and a `0x2_0000` per-core
   stride (two 64 KiB frames: RD + SGI). Tegra234's GIC-600 is a **4-frame** class
