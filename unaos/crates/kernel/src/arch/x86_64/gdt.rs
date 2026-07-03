@@ -40,8 +40,21 @@ pub const DOUBLE_FAULT_IST_INDEX: u16 = 0;
 /// from) the user stack. The handler stays GS-free (see `interrupts::nmi_handler`), so it needs
 /// nothing but a valid stack — which the IST guarantees.
 pub const NMI_IST_INDEX: u16 = 1;
-/// Number of per-CPU IST stacks we reserve: [0] double fault, [1] NMI.
-const NUM_IST: usize = 2;
+/// IST slot for the #DB (debug, vector 1) handler (U2 Part-0a). `RFLAGS.TF` is writable at any CPL
+/// (`popfq`), so ring 3 can arm single-step and then `SYSCALL`: the pending trap is delivered on the
+/// FIRST instruction at `LSTAR` — CPL 0, GS still user, RSP still the ring-3 stack (SFMASK's TF bit
+/// only suppresses traps on *subsequent* instructions). A same-CPL #DB (no IST) would push its frame
+/// onto that user-writable stack; its own dedicated IST stack makes the CPU switch unconditionally,
+/// so the frame is never on the user stack. The handler stays GS-free (see `interrupts::debug_handler`).
+/// Must NOT reuse the NMI or #DF stacks — a #DB while one of those handlers runs would scribble it.
+pub const DB_IST_INDEX: u16 = 2;
+/// IST slot for the #MC (machine check, vector 18) handler (U2 Part-0a). #MC is always fatal here,
+/// but wiring it on its own IST guarantees it can still take its frame onto a valid kernel stack even
+/// if it lands in the same pre-`swapgs`/pre-stack-switch window, so it logs and halts cleanly instead
+/// of escalating to a triple fault. GS-free handler body.
+pub const MC_IST_INDEX: u16 = 3;
+/// Number of per-CPU IST stacks we reserve: [0] double fault, [1] NMI, [2] #DB, [3] #MC.
+const NUM_IST: usize = 4;
 
 // Fixed selectors for the per-CPU GDT layout built by `init_cpu` (identical on every CPU). The
 // APPEND ORDER below is load-bearing for SYSCALL/SYSRET: SYSCALL loads CS = STAR[47:32] and
@@ -119,14 +132,20 @@ pub fn init_cpu(cpu_index: usize) {
         let cpu = &raw mut CPUS[cpu_index];
 
         // 1. Point this CPU's IST entries at its own dedicated IST stacks (top = base + size).
-        //    Slot 0 = double fault, slot 1 = NMI — separate stacks so an NMI taken while the
-        //    double-fault handler runs (or vice versa) cannot scribble the other's frame.
+        //    Slot 0 = double fault, slot 1 = NMI, slot 2 = #DB, slot 3 = #MC — separate stacks so a
+        //    fault taken while another IST handler runs cannot scribble the other's frame.
         let df_stack = &raw const IST_STACKS[cpu_index][DOUBLE_FAULT_IST_INDEX as usize];
         let nmi_stack = &raw const IST_STACKS[cpu_index][NMI_IST_INDEX as usize];
+        let db_stack = &raw const IST_STACKS[cpu_index][DB_IST_INDEX as usize];
+        let mc_stack = &raw const IST_STACKS[cpu_index][MC_IST_INDEX as usize];
         (*cpu).tss.interrupt_stack_table[DOUBLE_FAULT_IST_INDEX as usize] =
             VirtAddr::from_ptr(df_stack) + IST_STACK_SIZE as u64;
         (*cpu).tss.interrupt_stack_table[NMI_IST_INDEX as usize] =
             VirtAddr::from_ptr(nmi_stack) + IST_STACK_SIZE as u64;
+        (*cpu).tss.interrupt_stack_table[DB_IST_INDEX as usize] =
+            VirtAddr::from_ptr(db_stack) + IST_STACK_SIZE as u64;
+        (*cpu).tss.interrupt_stack_table[MC_IST_INDEX as usize] =
+            VirtAddr::from_ptr(mc_stack) + IST_STACK_SIZE as u64;
 
         // 2. Build the GDT in the order the SYSCALL/SYSRET selector consts above require:
         //    kernel code (0x08), kernel data (0x10), user data (0x18, DPL3), user code (0x20, DPL3),
@@ -183,4 +202,19 @@ pub fn set_privilege_stack0(cpu_index: usize, rsp: u64) {
         let cpu = &raw mut CPUS[cpu_index];
         (*cpu).tss.privilege_stack_table[0] = VirtAddr::new(rsp);
     }
+}
+
+/// U2 Part-0c: true iff `rsp` lies within ANY CPU's dedicated NMI IST stack. The self-NMI fixture
+/// uses this to prove the NMI was actually *taken on its IST* (the CPU switched stacks), not merely
+/// delivered — the honest "taken on IST" claim the B3 ledger line asks for. Deliberately GS-free:
+/// it scans the static `IST_STACKS` addresses directly (the NMI handler has no per-CPU GS to name
+/// its own CPU), so checking membership in any CPU's NMI stack is enough to witness the IST switch.
+pub fn rsp_in_nmi_ist(rsp: u64) -> bool {
+    for cpu in 0..MAX_CPUS {
+        let base = unsafe { &raw const IST_STACKS[cpu][NMI_IST_INDEX as usize] } as u64;
+        if rsp > base && rsp <= base + IST_STACK_SIZE as u64 {
+            return true;
+        }
+    }
+    false
 }

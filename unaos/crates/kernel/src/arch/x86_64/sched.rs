@@ -508,6 +508,15 @@ extern "C" fn user_task_trampoline() -> ! {
     // Drop to ring 3. `swapgs` parks this CPU's PerCpuData pointer in the GS shadow for the syscall
     // path; the `iretq` frame is [SS, RSP, RFLAGS(IF clear), CS, RIP] (RIP pushed LAST so `iretq`
     // pops it first). Interrupts are masked here, so the swapgs/iretq window can't take an IRQ.
+    //
+    // U2 Part-0b: FIRST-ENTRY GPR SCRUB — the x86 twin of the aarch64 M6d first-`eret` scrub (and of
+    // the U1b SYSRET-return scrub, which only covers the return half). Before this, the trampoline's
+    // live kernel values reached ring 3 in registers at first entry (the Task Box pointer `raw`, the
+    // kernel-stack top, the entry VA, ...). Zero every GPR except `rsp` (which must keep pointing at
+    // the iretq frame) AFTER the five frame words are pushed and BEFORE `iretq`, so the user program
+    // starts from an all-zero register file. The user entry ABI takes no register arguments — the
+    // U1a blob and the U2 loaded HELLO.BIN both load their own registers — so this leaks nothing the
+    // program needs.
     unsafe {
         core::arch::asm!(
             "swapgs",
@@ -516,6 +525,23 @@ extern "C" fn user_task_trampoline() -> ! {
             "push {rflags}",
             "push {cs}",
             "push {entry}",
+            // Scrub every GPR but rsp. The five inputs above are dead after their pushes, so zeroing
+            // the registers that carried them is safe; iretq reads only the pushed frame.
+            "xor eax, eax",
+            "xor ebx, ebx",
+            "xor ecx, ecx",
+            "xor edx, edx",
+            "xor esi, esi",
+            "xor edi, edi",
+            "xor ebp, ebp",
+            "xor r8d, r8d",
+            "xor r9d, r9d",
+            "xor r10d, r10d",
+            "xor r11d, r11d",
+            "xor r12d, r12d",
+            "xor r13d, r13d",
+            "xor r14d, r14d",
+            "xor r15d, r15d",
             "iretq",
             ss = in(reg) crate::arch::gdt::USER_DATA_SEL as u64,
             ursp = in(reg) user_rsp,

@@ -93,6 +93,19 @@ fn main() {
         "Hello from UnaOS on real hardware!\nThis file was read off the FAT32 boot stick by the in-kernel FAT reader.\n",
     ).unwrap();
 
+    // U2: the x86 ring-3 "hello from disk" program (crates/user-blob-x86, built by arroyo's
+    // build_user_hello_x86 to target/hello.bin). Copy it onto the ESP as HELLO.BIN so the metal boot
+    // media carries it; the kernel's U2 FAT loader reads it off the volume and runs it in ring 3.
+    // (make-fat-img.sh copies the same target/hello.bin onto the QEMU FAT stick images.) Absent when
+    // the blob wasn't built (a bare `cargo run` in builder/) — then U2 simply NoFile-skips, harmless.
+    let hello_bin = target_dir.join("hello.bin");
+    if hello_bin.exists() {
+        std::fs::copy(&hello_bin, esp_dir.join("HELLO.BIN")).unwrap();
+        println!("   U2: copied HELLO.BIN onto the ESP");
+    } else {
+        println!("   U2: target/hello.bin absent — ESP has no HELLO.BIN (run via ./arroyo esp-x86)");
+    }
+
     // Package-only mode: build + pack the ESP, then stop (no QEMU). Used to produce real-hardware
     // boot media — copy this directory's contents onto a FAT32 USB and boot the Mac via Option.
     if std::env::var("UNAOS_PACKAGE_ONLY").is_ok() {

@@ -107,6 +107,18 @@ fi
 printf 'hello from the UnaOS FAT reader\nthis file lives on a real FAT32 volume\n' > "${MNT}/hello.txt"
 printf 'UnaOS read-only FAT32/16 reader test volume (%s layout).\n' "$LAYOUT" > "${MNT}/readme.txt"
 
+# U2: the x86 ring-3 "hello from disk" program (crates/user-blob-x86 → target/hello.bin, built by
+# arroyo's build_user_hello_x86). Copy it onto the image as HELLO.BIN so the kernel's U2 FAT loader
+# finds + runs it in ring 3. Read straight from target/hello.bin (fresh — every x86 build path builds
+# it before make-fat-img runs), independent of whether the ESP payload carried it.
+HELLO_BIN="${WORKSPACE_DIR}/target/hello.bin"
+if [ -f "$HELLO_BIN" ]; then
+    COPYFILE_DISABLE=1 cp "$HELLO_BIN" "${MNT}/HELLO.BIN"
+    echo "    added HELLO.BIN ($(wc -c < "$HELLO_BIN" | tr -d ' ') bytes) for the U2 loader"
+else
+    echo "    WARNING: ${HELLO_BIN} absent — image has no HELLO.BIN (run './arroyo fat-img' via arroyo, not make-fat-img.sh directly)"
+fi
+
 # Strip macOS metadata (AppleDouble ._ files, Spotlight/fseventsd) so `ls` shows a clean tree.
 sync
 find "$MNT" -name '._*' -delete 2>/dev/null || true
