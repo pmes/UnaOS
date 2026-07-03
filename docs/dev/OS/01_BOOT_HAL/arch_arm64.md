@@ -155,16 +155,23 @@ L4T r36) launches from the UEFI Shell (`connect -r`, `map -r`, then
    "Headless bootloader" below.
 3. Kernel load + relocation + `ExitBootServices`, then `_start(boot_info)` at
    whatever EL the firmware hands off (the kernel boot-diag line reports it).
-4. **`tegra` early platform stop** (`crates/kernel/src/main.rs::tegra_early_stop`):
-   the kernel is *designed* to print its banner + boot-diag line + `:: tegra: early
-   platform stop (gic/timer discovery = JM3) ::`, then a serial-alive heartbeat loop
-   (`:: tegra: heartbeat <n> ::`). It does **not** bring up the GIC or generic timer
-   — those walk QEMU-`virt` MMIO bases unmapped on Tegra234 (JM3's job). With no
-   timer IRQ there is no `WFI`; the plain spin's climbing heartbeat is the intended
-   liveness verdict. **On metal (R4, below) this does not print**: the first
-   `serial_println!` faults on the UARTC MMIO read, because the UEFI-handoff page
-   tables do not map the Tegra peripherals — the kernel must set up its own MMU
-   first (JM3).
+4. **`tegra` kernel MMU + early platform stop** (`crates/kernel/src/main.rs::
+   tegra_early_stop` → `arch::aarch64::mmu_tegra`): **JM3.** The UEFI-handoff tables
+   map RAM but **not** the Tegra peripheral MMIO (JM2 R4: the kernel faulted on its
+   first UARTC read), so the kernel FIRST installs its **own** translation regime via
+   `mmu_tegra::init` — a single L1 of 1 GiB blocks mapping RAM Normal-WB (the GiBs
+   derived from the firmware memory map, not hardcoded) + the low-1-GiB Tegra device
+   window Device-nGnRE, plus a bounded fault vector — programmed for the handoff EL
+   (EL2 primary / EL1 fallback, chosen from `CurrentEL`). Only once that switch lands
+   (`SCTLR` M|C|I on) can the serial path reach UARTC. The kernel then prints the two
+   `:: tegra: mmu … ::` lines, its banner + boot-diag line, `:: tegra: early platform
+   stop (gic/timer discovery = JM4) ::`, and a serial-alive heartbeat loop
+   (`:: tegra: heartbeat <n> ::`). It still does **not** bring up the GIC or generic
+   timer — those walk QEMU-`virt` MMIO bases unmapped on Tegra234 (**JM4's** job).
+   With no timer IRQ there is no `WFI`; the plain spin's climbing heartbeat is the
+   liveness verdict. (Before JM3 the first `serial_println!` faulted on the UARTC read
+   because the handoff tables did not map the Tegra peripherals — the R4 blocker this
+   step removes.)
 
 ### Headless bootloader (`fb_addr == 0`)
 
@@ -248,23 +255,66 @@ EL2 analogue of the Pi bare-metal `boot::mmu_init`. Until then `serial::tegra`
 cannot drive UARTC, and the tegra early-stop's banner/heartbeats never reach the
 console. This is the first item on the delta list below.
 
+### JM3 result — kernel-owned Tegra MMU (QEMU-green; **metal PENDING**)
+
+JM3 builds and installs that regime. New module
+`arch/aarch64/mmu_tegra.rs` (`#[cfg(feature = "tegra")]`): a single L1 translation
+table (4 KiB granule, T0SZ=25 → 1 GiB blocks) where `L1[0]` is a **Device-nGnRE,
+execute-never** block covering the low 1 GiB (UARTC `0x0C28_0000` and the Tegra234
+GIC region `0x0F00_0000` for JM4), and every GiB the **firmware memory map** calls
+RAM (`Usable`/`Bootloader`) is a **Normal-WB** block (belt-and-braces: the live
+code and SP GiBs are marked too, so the first post-switch fetch/stack access cannot
+fault). It reads `CurrentEL` and programs the regime for the EL it is actually at —
+**EL2 primary** (`MAIR_EL2=0x04FF`, `TCR_EL2=0x8081_3519` non-VHE short format,
+`SCTLR_EL2` read-modify-write M|C|I), **EL1 fallback**. The switch is one
+cache-off `asm!` block (clean L1 to PoC → MMU off → reprogram MAIR/TCR/TTBR0 →
+`tlbi alle2` → MMU+caches on), after which it installs a bounded 16-entry EL2/EL1
+fault vector (Part C: prints `:: tegra: FAULT — ESR/FAR/ELR ::` then spins, turning
+a dark post-switch hang into a recorded syndrome). `tegra_early_stop` calls this
+FIRST, silently, so the first serial byte of the whole kernel is the post-switch
+`:: tegra: mmu live (EL…) … ::` line.
+
+**QEMU cannot model the Orin** (`tegra` is off in every QEMU build — it drives the
+QEMU-`virt` PL011, not UARTC), so the QEMU gate here is **byte-stability + compile
+only**, and the arc verdict is metal (below). Landed evidence:
+
+- `./arroyo check` green both arches; `UNAOS_TEGRA=1 ./arroyo build` green both legs
+  (full codegen — lowers all of `mmu_tegra`'s inline/global asm); `./arroyo
+  esp-jetson` links `kernel.elf` (the vector tables land 2 KiB-aligned at the
+  expected 0x80 entry stride; `tegra_fault_handler` resolves).
+- Full QEMU regression battery byte-stable: `test` (x86 U1a/U1b PASS + MISSION
+  SUCCESS), `test-arm` GICv2 (**byte-identical** to the pre-JM3 baseline — all JM3
+  code is `tegra`-gated), `UNAOS_GICV3=1 test-arm` (JC2 SMP 3/3, modulo the known
+  cross-core SGI-coalescing nondeterminism), `kernel8-test` (Pi M6b/M6d PASS + M6e
+  verdict + CAPSTONE 6/6).
+
+**Metal PENDING (Part D, operator-attended):** the attended Orin boot over the RPi
+Debug Probe is the verdict. Expected in order: the `BOOTDIAG` block (now with the
+**corrected `EFI_DTB_TABLE_GUID`** — this re-measures the "DTB config table" truth
+either way), headless handoff, the two `:: tegra: mmu … ::` lines, the banner with
+the **first real `EL=` / `CNTFRQ=` from Orin silicon**, the early-stop line, and ≥3
+climbing heartbeats → save as `unaos/target/serial-orin-jm3.log`. The UART/GOP
+truth-table rows (console UART base, handoff EL, CNTFRQ, DTB table) and delta-list
+item 1 are filled from **that capture** — no metal claim is recorded here until the
+serial log shows it. If the kernel is dark after the `SCTLR` write, the honest
+landing is this QEMU-green code + the capture + a written diagnosis (STOP tripwire).
+
 ### Orin-metal delta list (feeds JM3 + the cable-day graphical arc)
 
 The `virt` GICv3 + PSCI SMP (JC2) is written to be a small delta to Orin silicon,
 but the following must change and are **not** covered by QEMU:
 
 * **Kernel MMU that maps the Tegra peripherals (the R4 blocker — do this FIRST).**
-  The UEFI-handoff page tables do not map UARTC (nor, presumably, the GIC/timer),
-  so the `tegra` kernel faults on its first UARTC MMIO read (R4, §above). Before
-  any Tegra peripheral MMIO, the kernel must install its own translation regime
-  mapping RAM (Normal) + the Tegra device windows (Device-nGnRE) — the EL2 analogue
-  of the Pi bare-metal `boot::mmu_init`/`enable_mmu`. Only then can `serial::tegra`
-  drive UARTC and the early stop's banner/heartbeats reach the console. (Confirm
-  the console UART base at the same time. Whether the DTB `/chosen stdout-path` path
-  is available is **UNVERIFIED**: R4's "no DTB table" reading used a wrong
-  `EFI_DTB_TABLE_GUID`, so `dtb_addr` being 0 was an artifact of that bug, not a
-  measured absence — re-measured with the corrected GUID at the next attended boot
-  (JM3 Part D).)
+  ✅ **CODE COMPLETE (JM3) — metal PENDING.** `arch/aarch64/mmu_tegra.rs` installs a
+  kernel-owned regime (RAM Normal-WB from the firmware map + the Tegra device window
+  Device-nGnRE, EL2 primary / EL1 fallback), the EL2 analogue of the Pi bare-metal
+  `boot::mmu_init`/`enable_mmu`; wired into `tegra_early_stop` before the banner. See
+  the "JM3 result" section above. QEMU cannot exercise it (metal-only); the attended
+  Orin boot (Part D) is the verdict and re-measures the console UART base at the same
+  time — the DTB `/chosen stdout-path` truth is re-read there with the corrected
+  `EFI_DTB_TABLE_GUID` (R4's "no DTB table" was an artifact of the old wrong GUID,
+  not a measured absence). This entry is marked *measured* only once the JM3 capture
+  shows the banner + heartbeats.
 * **GICR base *and* frame stride.** The redistributor walk (`smp_virt.rs`)
   hardcodes the QEMU-`virt` `GICR_BASE` (`0x080A_0000`) and a `0x2_0000` per-core
   stride (two 64 KiB frames: RD + SGI). Tegra234's GIC-600 is a **4-frame** class
