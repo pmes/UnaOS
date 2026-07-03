@@ -38,7 +38,7 @@ Legend: **✅ metal-confirmed** · **🔬 QEMU-green, metal pending** · dates I
   (getinfo round-trip; four hostile pointers all refused with no kills;
   yield/sleep interleave) with every prior milestone still green. Metal rides
   the next Pi reflash (M6g).
-- **Commit:** *(pending this round's merge)* · arcs `71ed153` + `e65ffc0`.
+- **Commit:** `ee21e30` (merge) · arcs `71ed153` + `e65ffc0`.
 
 ### JM2 — Orin headless first light (aarch64/Jetson) 🔬 `hw-jetson`
 - **What:** makes the Jetson build boot headless and safe. Gates the QEMU-virt
@@ -49,10 +49,19 @@ Legend: **✅ metal-confirmed** · **🔬 QEMU-green, metal pending** · dates I
 - **Tested — QEMU:** full battery byte-stable — `./arroyo check` both arches;
   x86 U1a/U1b PASS; aarch64 virt v2 + GICv3 SMP lines intact; Pi `kernel8-test`
   unchanged. The Tegra feature is off in all of these, so nothing regresses.
-- **Tested — metal:** operator-attended over the Debug Probe serial console —
-  **pending** (the display verdict waits on a native DP cable; serial bring-up
-  continues now).
-- **Commit:** *(pending this round's merge)* · arcs `811259c` `d382677` `0bd0dae`.
+- **Tested — metal (real Orin Nano, 2026-07-03):** the boot diagnostics ran on
+  silicon (genuinely headless firmware: 0 display handles) and the headless
+  path **entered the kernel for the first time on Orin** — which then faulted
+  on its first Tegra UART register read because the firmware-handoff page
+  tables don't map Tegra device memory. That diagnosis is the next arc (JM3:
+  kernel-owned MMU).
+- **Held at integration review:** the merge is waiting on a small must-fix —
+  the boot-diagnostics DTB table scan compares against a wrong GUID constant
+  (it can never match), so the captured "firmware publishes no DTB" line is
+  withdrawn as unverified until a re-run with the corrected constant. Fix
+  rides at the head of the JM3 arc.
+- **Commit:** *(merge pending the fix)* · arcs `811259c` `d382677` `0bd0dae`
+  `d0835c0` `27bf835`.
 
 ---
 

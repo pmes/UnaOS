@@ -99,8 +99,10 @@ Beyond `main`, development runs on three hardware tracks in parallel:
 mass storage, native video, FAT read, and now a disk-loaded ring-3 program),
 **`hw-pi4`** (Raspberry Pi 4, bare-metal aarch64 — SMP scheduler, GUI, and the
 furthest-along privilege boundary: per-task address spaces with ASIDs), and
-**`hw-jetson`** (Jetson Orin Nano — GICv3 + PSCI SMP on QEMU virt; headless
-metal bring-up over serial in progress). Per-platform debugging setup:
+**`hw-jetson`** (Jetson Orin Nano — GICv3 + PSCI SMP on QEMU virt; on real Orin
+silicon the headless boot path now loads and enters the kernel, with a
+kernel-owned MMU for the Tegra peripherals as the next step). Per-platform
+debugging setup:
 [`docs/dev/DEBUGGING.md`](docs/dev/DEBUGGING.md).
 
 **Current direction — multi-user first.** UnaOS is designed to hold direct
