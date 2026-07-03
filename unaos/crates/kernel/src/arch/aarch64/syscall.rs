@@ -263,7 +263,9 @@ __m6f_prog_getinfo:
 
     // hostile pointers (each must ERROR-RETURN -EFAULT, NOT kill the task): count the -14 returns in x19.
     //   1) sys_write to kernel RAM VA (0x4000_0000, L1[1] EL1-only) — exfiltration attempt
-    //   2) sys_write to the unmapped page just past the window (base + 0x4000)
+    //   2) sys_write just past the window (base + 0x4000); EL1-only under the slot root (copied kernel
+    //      mapping), so only the range check refuses it — NOT a translation fault
+
     //   3) sys_write whose length wraps the address space (base + ~0 overflows)
     //   4) sys_getinfo targeting the RO code page (base) — copy_to_user must refuse the write target
     // A stray store or a kill would prevent the report (count != 4 -> verdict FAIL); a copy_to_user that
@@ -280,7 +282,8 @@ __m6f_prog_hostile:
     svc  #0
     cmn  x0, #14                           // x0 == -14 ?  (x0 + 14 == 0 -> Z)
     cinc x19, x19, eq
-    mov  x0, #1                            // (2) unmapped page just past the window
+    mov  x0, #1                            // (2) just past the window (base+0x4000): EL1-only under the
+                                           //     slot root (copied kernel mapping) -> range check refuses it
     add  x1, x9, #0x4000
     mov  x2, #8
     mov  x8, #1
