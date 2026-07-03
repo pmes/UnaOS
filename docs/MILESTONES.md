@@ -12,6 +12,27 @@ Legend: **✅ metal-confirmed** · **🔬 QEMU-green, metal pending** · dates I
 
 ## Round 5 — 2026-07-03
 
+### U2.5 — FTDI USB-serial console (x86) 🔬 `hw-rmbp`
+- **What:** a captured console for the serial-less 2012 rMBP. The kernel
+  enumerates an FTDI FT232 (0403:6001) on the xHCI bus, configures it
+  (115200 8N1), and drains a 64 KiB boot-capture ring — fed by every
+  `serial_print!` since the first — out its bulk-OUT endpoint, so the whole early
+  boot log replays out the cable. Also folds three U2-review hardening items
+  (first-entry x87/MMX scrub, per-CPU `DR7` clear, whole-ring-3-window zero before
+  a load) and fixes the APIC ms-clock: the BSP heartbeat now re-arms *after* the
+  calibrated rate is stored (it was pinned to the fixed fallback → metal read
+  ~119 Hz instead of ~1000).
+- **Tested — QEMU:** `UNAOS_USBSERIAL=1 ./arroyo test 25` → `FTDI USB-SERIAL
+  DETECTED (0403:6001)`, `FTDI console up`, `FTDI TX mirror -> PASS (~17 KB
+  replayed)`, `target/ftdi.log` carries the boot log; coexists with the U2 disk
+  loader (`UNAOS_USBSERIAL=1 UNAOS_FATIMG=1` → both PASS) and the usbdebug view.
+  No-knob boot log byte-identical but for the `DR7 cleared` line and the APIC
+  re-arm. FAT regression (`test-fat part`/`sf`) green; `./arroyo check` both arches.
+- **Metal — PENDING (~2026-07-08):** rides the physical FTDI cable (B0CJVC19CF).
+  QEMU-only until then; the APIC ~1000 Hz truth and the FTDI console verify on the
+  real rMBP on cable day (`UNAOS_USBDEBUG=1` boot, FTDI in a root USB-A port).
+- **Commits:** `229d675` (Part 0 folds) · `ab0f975` (APIC re-arm) · `f7c929e` (FTDI console).
+
 ### U2 — loadable ring-3 programs from FAT (x86) ✅ `hw-rmbp`
 - **What:** the first *real program loaded from disk* into the x86 privilege
   boundary. A flat ring-3 binary (`HELLO.BIN`) is read off a FAT volume,
