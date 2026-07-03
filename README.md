@@ -74,12 +74,34 @@ The userspace architecture is documented in
 The USB+scheduler, network, and video tracks were developed in parallel and are
 **integrated and verified booting together** on the `c01-int_combined` branch.
 
+### Privilege & security chain — the current focus
+
+The near-term work is a capability-isolated userspace (see *Current direction*
+below). It advances arc-by-arc, x86 leading and aarch64 (the pioneer) porting;
+each row is metal-confirmed on real hardware unless noted. **✅ done · 🔬
+QEMU-green, metal pending · ⬜ next.**
+
+| Arc | What it lands | x86 (`hw-rmbp`) | aarch64 (`hw-pi4`) |
+| :--- | :--- | :---: | :---: |
+| Privilege round-trip | ring 3 / EL0 with syscalls | ✅ U1a | ✅ M6a |
+| Per-page perms + fault→kill | W^X/NX, faults kill the task not the kernel | ✅ U1b | ✅ M6b |
+| Loadable program | a program run from an embedded/on-disk blob | ✅ U2 *(from FAT disk)* | ✅ M6c |
+| Preemptible userspace | timer preempts a running user task | ⬜ | ✅ M6e |
+| Per-process address space | isolated per-task page tables | ⬜ U3 | ✅ M6d *(TTBR0+ASID)* |
+| Validated user pointers | `copy_from_user`/`copy_to_user` + syscall surface | ⬜ | 🔬 M6f |
+| Process model → capabilities → FS grants | handle table, principals, UnaFS grants | ⬜ U4–U6 | ⬜ |
+
+Milestone-by-milestone history with test evidence:
+[`docs/MILESTONES.md`](docs/MILESTONES.md).
+
 Beyond `main`, development runs on three hardware tracks in parallel:
 **`hw-rmbp`** (2012 MacBook Pro, x86_64 — boots on metal with USB input and
-mass storage, native video, FAT read), **`hw-pi4`** (Raspberry Pi 4,
-bare-metal aarch64 — SMP scheduler, GUI, and the project's first privilege
-boundary: EL0 userspace with syscalls, per-page permissions, and
-fault→task-kill), and **`hw-jetson`** (Jetson Orin Nano — early bring-up).
+mass storage, native video, FAT read, and now a disk-loaded ring-3 program),
+**`hw-pi4`** (Raspberry Pi 4, bare-metal aarch64 — SMP scheduler, GUI, and the
+furthest-along privilege boundary: per-task address spaces with ASIDs), and
+**`hw-jetson`** (Jetson Orin Nano — GICv3 + PSCI SMP on QEMU virt; headless
+metal bring-up over serial in progress). Per-platform debugging setup:
+[`docs/dev/DEBUGGING.md`](docs/dev/DEBUGGING.md).
 
 **Current direction — multi-user first.** UnaOS is designed to hold direct
 authority over physical hardware (printers, vehicles, GPIO), so privilege
