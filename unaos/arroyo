@@ -56,6 +56,12 @@ if [ -n "${UNAOS_GICV3:-}" ]; then
     echo -e "${COLOR_YELLOW}⚡ aarch64 virt: GICv3 (gic-version=3)${COLOR_RESET}"
 fi
 
+# UNAOS_SDIMG (kernel8-run / kernel8-test): the microSD image QEMU raspi4b attaches via `if=sd`.
+# Unset -> target/UnaOS-pi4-baremetal.img (the freshly-built flashable image, HELLO.BIN in its FAT32
+# root — so QEMU's card IS the boot image). UNAOS_SDIMG=0 omits the drive (the M6g no-SD control);
+# any other value is a path override. QEMU attaches the card to the LEGACY SDHCI (the driver's fallback
+# base); real Pi 4 silicon routes the slot to EMMC2 (the driver's first-tried base).
+#
 # UNAOS_FATIMG swaps the usb-storage backing to a FAT image (scripts/make-fat-img.sh) so the
 # kernel's read-only FAT reader can be exercised on aarch64 QEMU too. Mirrors the x86 builder knob
 # (builder/src/main.rs). Unset -> usb.img (the raw UNA-OS pattern image). Build with `./arroyo fat-img`.
@@ -440,6 +446,12 @@ kernel8() {
     unzip -o -j "$FW_ZIP" "overlays/miniuart-bt.dtbo" -d "$KERNEL8_DIR/overlays" >/dev/null
     echo -e "${COLOR_GREEN}✅ Boot files: ${KERNEL8_DIR}${COLOR_RESET}"
 
+    # M6g: carry the EL0 user blob onto the boot media as HELLO.BIN, next to kernel8.img in the FAT32
+    # root (make-pi-img.sh ditto's the whole staging dir). On metal the kernel's M6g loader reads this
+    # very file back off the microSD it booted from; in QEMU it rides the same image attached via if=sd.
+    # Mirror of the x86 carry (make-fat-img.sh's HELLO_BIN block).
+    cp "${WORKSPACE_DIR}/target/user_blob.bin" "$KERNEL8_DIR/HELLO.BIN"
+
     bash "${WORKSPACE_DIR}/scripts/make-pi-img.sh" "$KERNEL8_DIR" "${WORKSPACE_DIR}/target/UnaOS-pi4-baremetal.img" 64
     echo -e "${COLOR_GREEN}✅ Flashable image: target/UnaOS-pi4-baremetal.img — Imager → Use custom → microSD → SD slot.${COLOR_RESET}"
 }
@@ -453,10 +465,17 @@ run_kernel8() {
     kernel8 # always rebuild from current source (incremental; ~seconds) so we never run a stale image
     echo -e "${COLOR_GREEN}⚡ Launching QEMU raspi4b (bare-metal kernel8.img)...${COLOR_RESET}"
     echo -e "  • PL011 serial (UART0) on stdio; mailbox framebuffer on the display"
+    # M6g: attach the freshly-built flashable image as the SD card (the same bytes that get flashed, so
+    # QEMU's card IS the boot image, HELLO.BIN in its FAT32 root). UNAOS_SDIMG=0 omits it (regression
+    # control); any other value overrides the path. The `if=sd` card lands on QEMU's LEGACY SDHCI.
+    local SDIMG="${UNAOS_SDIMG:-${WORKSPACE_DIR}/target/UnaOS-pi4-baremetal.img}"
+    local SD_DRIVE=""
+    [ "$SDIMG" != "0" ] && SD_DRIVE="-drive if=sd,format=raw,file=${SDIMG}"
     qemu-system-aarch64 \
         -machine raspi4b \
         -kernel "$KERNEL8_DIR/kernel8.img" \
         -serial mon:stdio -serial null \
+        ${SD_DRIVE} \
         ${UNAOS_QEMU_EXTRA:-}
 }
 
@@ -469,10 +488,16 @@ test_kernel8() {
     local png="${WORKSPACE_DIR}/target/pi-screen.png"
     rm -f "$logf"
     echo -e "${COLOR_CYAN}⚡ Headless raspi4b test (${secs}s). Serial -> ${logf}, screen -> ${png}${COLOR_RESET}"
+    # M6g: attach the flashable image as the SD card (UNAOS_SDIMG=0 omits it for the no-SD control; any
+    # other value overrides the path). Same bytes as the flash image, so HELLO.BIN is in its FAT32 root.
+    local SDIMG="${UNAOS_SDIMG:-${WORKSPACE_DIR}/target/UnaOS-pi4-baremetal.img}"
+    local SD_DRIVE=""
+    [ "$SDIMG" != "0" ] && SD_DRIVE="-drive if=sd,format=raw,file=${SDIMG}"
     qemu-system-aarch64 \
         -machine raspi4b \
         -kernel "$KERNEL8_DIR/kernel8.img" \
         -serial "file:${logf}" -serial null -display none \
+        ${SD_DRIVE} \
         -qmp tcp:127.0.0.1:4463,server,nowait \
         ${UNAOS_QEMU_EXTRA:-} &
     local qpid=$!

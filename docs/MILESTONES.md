@@ -12,6 +12,30 @@ Legend: **✅ metal-confirmed** · **🔬 QEMU-green, metal pending** · dates I
 
 ## Round 5 — 2026-07-03
 
+### M6g — load a program from storage (aarch64) 🔬 `hw-pi4`
+- **What:** the Pi twin of x86 U2 — the first *program loaded from the microSD the
+  Pi booted from* into the EL0 boundary. A block-layer backend seam lets the
+  read-only path dispatch to a new BCM2711 EMMC2/SDHCI microSD driver (PIO,
+  single-block CMD17, polled, no writes) beside the untouched xHCI path; the driver
+  probes **EMMC2 first, legacy Arasan second** (the reverse of QEMU, so the metal
+  base is the first tried). The loader mounts the card's FAT volume, reads
+  `HELLO.BIN`, size-checks it, copies it into a fresh per-task M6d slot (EL0-RX/EL1-RO
+  before the task exists), and runs it at EL0 (`hello from EL0`). The loaded bytes are
+  untrusted — bounded only by size, contained by EL0 + per-page perms + the M6b
+  fault-kill net.
+- **Tested — QEMU:** `./arroyo kernel8-test 30` → `SD card @0xfe300000 identified —
+  131072 blocks (64 MiB, CSD v1)`, `FAT mounted from SD (Fat32)`, `HELLO.BIN loaded
+  from SD (51 bytes) -> EL0`, second `hello from EL0`, `disk-loaded EL0 program exited
+  ok -> PASS`, with every prior milestone byte-identical and 0 unexpected faults; the
+  `UNAOS_SDIMG=0` no-SD control adds exactly the two no-card lines + the loader-skipped
+  line. x86 (`test` + `UNAOS_FATIMG=1 test`) byte-identical (seam inert); `check` both
+  arches; aarch64 virt v2 + GICv3 JC2 SMP 3/3 unchanged.
+- **Metal — pending the M6g reflash** (carries M6f's pending metal too): the EMMC2 base
+  actually carrying the card (QEMU only exercises the fallback base), the mailbox
+  clock-rate query against real firmware, real card timing, and the M6f per-task
+  preempt counters going > 0.
+- **Commit:** *(merge pending)* · arcs *(this session's hw-pi4 commits)*.
+
 ### U2 — loadable ring-3 programs from FAT (x86) ✅ `hw-rmbp`
 - **What:** the first *real program loaded from disk* into the x86 privilege
   boundary. A flat ring-3 binary (`HELLO.BIN`) is read off a FAT volume,

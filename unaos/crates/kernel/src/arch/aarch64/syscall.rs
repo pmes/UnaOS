@@ -503,6 +503,21 @@ static PRE_SPSENTINEL: AtomicU64 = AtomicU64::new(0);
 static PRE_YIELD: AtomicU64 = AtomicU64::new(0);
 static PRE_SLEEP: AtomicU64 = AtomicU64::new(0);
 
+// --- M6g accounting (load a program FROM STORAGE — the disk-loaded EL0 program). Decoupled from every
+// prior counter: the disk blob (the M6c `hello` bytes, read off the SD card's FAT volume) calls
+// `sys_exit(0)`, which would otherwise land in the M6b `EL0_EXITED_OK` and corrupt `exited=1`. The
+// SYS_EXIT / kill paths route by task NAME ("m6g-hello") into these counters instead, so every M6b/M6d/
+// M6e/M6f verdict stays byte-identical. Read by the M6g loader (which doubles as its own verdict). ---
+/// The disk-loaded EL0 program exited with status 0 (the expected outcome; want 1).
+static EL0_M6G_DONE: AtomicU32 = AtomicU32::new(0);
+/// The disk-loaded EL0 program exited nonzero — a self-reported failure (survivor protocol). Any is a FAIL.
+static EL0_M6G_ERR: AtomicU32 = AtomicU32::new(0);
+/// The disk-loaded EL0 program was KILLED by a fault (the untrusted bytes tripped the M6b fault-kill net).
+static EL0_M6G_KILLED: AtomicU32 = AtomicU32::new(0);
+/// Set by `m6f_verdict` as its last act: the M6g loader waits on this so every LOADER M6g line lands after
+/// the M6b/M6e/M6d/M6f verdict lines (the Part-B probe's two early M6g lines land before the demo).
+static M6F_VERDICT_PRINTED: AtomicBool = AtomicBool::new(false);
+
 /// M6d: record a value an EL0 task reported via SYS_REPORT, keyed by the reporting task's name. Called on
 /// the reporting task's own kernel stack (from the SVC handler), IRQ-masked.
 fn m6d_report(value: u64) {
@@ -666,6 +681,12 @@ pub fn record_el0_kill(name: &str, ec: u64, far: u64, far_valid: bool) {
     // must land in its own counter, never inflating the M6b `killed_unexpected` count.
     if matches!(name, "el0-getinfo" | "el0-hostile" | "el0-yield" | "el0-sleep") {
         EL0_M6F_KILLED.fetch_add(1, Ordering::AcqRel);
+        return;
+    }
+    // M6g: the untrusted disk-loaded program. A kill here is contained (the whole point) and reported by
+    // the loader's own verdict — route it to its own counter, never the M6b `killed_unexpected` count.
+    if name == "m6g-hello" {
+        EL0_M6G_KILLED.fetch_add(1, Ordering::AcqRel);
         return;
     }
     let (base, size) = super::boot::user_region();
@@ -1011,6 +1032,9 @@ pub fn m6f_verdict(_: usize) {
         PRE_YIELD.load(Ordering::Relaxed),
         PRE_SLEEP.load(Ordering::Relaxed),
     );
+    // Release so the M6g loader (which polls this Acquire) sees every M6f verdict line published first —
+    // its own late lines then land strictly after the M6f verdict.
+    M6F_VERDICT_PRINTED.store(true, Ordering::Release);
 }
 
 /// One-shot: the first syscall proves the EL0→EL1 path is live end to end (logged off the ISR-free SVC
@@ -1054,7 +1078,16 @@ extern "C" fn aarch64_svc_handler(frame: *mut u64) {
             // sentinel exit would land in EL0_EXITED_ERR and FAIL the M6b verdict). Otherwise: status 0 =
             // normal completion (hello); nonzero = a fault-test program self-reporting that its intended
             // fault never happened (survivor protocol).
-            if a0 == M6E_SPIN_STATUS {
+            // M6g: the disk-loaded program (the M6c `hello` bytes off the SD card) exits with status 0.
+            // Route by NAME, BEFORE the sentinel-status checks, so its exit lands in the M6g counters and
+            // never corrupts the M6b `EL0_EXITED_OK` accounting (which `exited=1` depends on).
+            if super::sched::current_name() == Some("m6g-hello") {
+                if a0 == 0 {
+                    EL0_M6G_DONE.fetch_add(1, Ordering::AcqRel);
+                } else {
+                    EL0_M6G_ERR.fetch_add(1, Ordering::AcqRel);
+                }
+            } else if a0 == M6E_SPIN_STATUS {
                 EL0_SPIN_DONE.fetch_add(1, Ordering::AcqRel);
             } else if a0 == M6D_EXIT_STATUS {
                 EL0_M6D_DONE.fetch_add(1, Ordering::AcqRel);
@@ -1269,5 +1302,147 @@ fn m6f_report(value: u64) {
         Some("el0-yield") => M6F_YIELD_DONE.store(value as u32, Ordering::Release),
         Some("el0-sleep") => M6F_SLEEP_DONE.store(value as u32, Ordering::Release),
         _ => {} // a stray report from any other task is ignored (never happens in the demo)
+    }
+}
+
+// =============================================================================================
+// M6g: load a program FROM STORAGE and run it at EL0 (the Pi twin of x86 U2)
+// =============================================================================================
+
+/// M6g loader (also its own verdict). A kernel task spawned once on a scheduled AP AFTER the M6f verdict
+/// spawn. On the bare-metal Pi the program comes off the very microSD card the Pi booted from: the
+/// Part-B EMMC2/SDHCI probe (on the BSP) already registered the SD block backend, so here we mount its
+/// FAT volume, read `HELLO.BIN` (the same `USER_BLOB` bytes M6c bakes in — carried onto the boot media as
+/// `HELLO.BIN`), size-check it, copy it into a fresh M6d per-task slot's code page, protect the page
+/// (EL0-RX/EL1-RO) BEFORE the task exists, and drop it to EL0. The loaded bytes are UNTRUSTED: nothing
+/// about them is trusted beyond the size bound — the program runs only under EL0 + per-page permissions +
+/// the M6b fault-kill net (size-bounded only; no signature, no allowlist). That containment is the point.
+///
+/// Ordering: it first waits (bounded) for `M6F_VERDICT_PRINTED` so every LOADER line lands AFTER the
+/// M6b/M6e/M6d/M6f verdict lines (the Part-B probe's two lines already printed early, on the BSP). A
+/// missing SD device / FAT volume / file / oversize logs one clean skip line and returns.
+pub fn m6g_loader(_: usize) {
+    // 1. Wait (bounded ~8 s CNTPCT, yielding — the m6d_verdict idiom) for the M6f verdict to publish, so
+    //    the loader's lines follow every prior verdict line rather than racing into the middle of them.
+    let wstart = super::timer::cntpct();
+    let wdeadline = 8 * super::timer::cntfrq();
+    while !M6F_VERDICT_PRINTED.load(Ordering::Acquire)
+        && super::timer::cntpct().wrapping_sub(wstart) <= wdeadline
+    {
+        super::sched::yield_now();
+    }
+
+    // One-shot from here (spawned once, but guard defensively like u2_probe_once).
+    static DONE: AtomicBool = AtomicBool::new(false);
+    if DONE.swap(true, Ordering::Relaxed) {
+        return;
+    }
+
+    // 2. Gate: the Part-B probe registered an SD block device (the empty gate is the no-SD control path).
+    if crate::drivers::block::info().is_none() {
+        serial_println!(":: M6g: no SD card found — loader skipped ::");
+        return;
+    }
+
+    // 3. Mount the FAT volume off the SD card and locate + size-check HELLO.BIN.
+    let fs = match crate::fs::fat::mount() {
+        Ok(fs) => fs,
+        Err(e) => {
+            serial_println!(":: M6g: no FAT volume ({:?}) — loader skipped ::", e);
+            return;
+        }
+    };
+    serial_println!(":: M6g: FAT mounted from SD ({:?}) ::", fs.kind());
+    let de = match fs.find_in_root("HELLO.BIN") {
+        Ok(de) => de,
+        Err(_) => {
+            serial_println!(":: M6g: HELLO.BIN not found on the FAT volume — loader skipped ::");
+            return;
+        }
+    };
+    // Reject up-front from the ON-DISK directory size (the U2 truncation lesson): `read_file` caps the
+    // copy at min(de.size, cap), so a post-read length check could never SEE an oversize file — it would
+    // silently truncate then run it. Gate on `de.size` against the single code page instead.
+    let cap = super::boot::USER_CODE_SIZE;
+    if de.size == 0 || de.size as u64 > cap as u64 {
+        serial_println!(
+            ":: M6g: HELLO.BIN bad size {} bytes (must be 1..={}) — loader skipped ::",
+            de.size, cap
+        );
+        return;
+    }
+    let mut bytes: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
+    if let Err(e) = fs.read_file(&de, &mut bytes, cap) {
+        serial_println!(":: M6g: HELLO.BIN read error ({:?}) — loader skipped ::", e);
+        return;
+    }
+    if bytes.is_empty() {
+        serial_println!(":: M6g: HELLO.BIN read empty — loader skipped ::");
+        return;
+    }
+
+    // 4. Claim a private address-space slot (bounded poll: M6d/M6f free their 8 slots as their fixtures
+    //    exit, so after the step-1 wait at least 4 are free). Never grow the pool if it won't free (STOP).
+    let sstart = super::timer::cntpct();
+    let sdeadline = 2 * super::timer::cntfrq();
+    let slot = loop {
+        if let Some(s) = super::boot::alloc_user_slot() {
+            break s;
+        }
+        if super::timer::cntpct().wrapping_sub(sstart) > sdeadline {
+            serial_println!(":: M6g: no free address-space slot — loader skipped ::");
+            return;
+        }
+        super::sched::yield_now();
+    };
+
+    // 5. Copy the UNTRUSTED bytes into the slot's code page through the Global identity backing VA (never
+    //    the EL0 window VA), I-cache-sync, then protect the page EL0-RX/EL1-RO BEFORE the task exists —
+    //    the M6d copy discipline. From here the bytes are contained only by EL0 + per-page perms + the
+    //    M6b fault-kill net; nothing about them is otherwise trusted.
+    let (base, size) = super::boot::user_region();
+    let backing = super::boot::slot_backing_ptr(slot);
+    unsafe { core::ptr::copy_nonoverlapping(bytes.as_ptr(), backing, bytes.len()) };
+    super::cache::icache_sync_range(backing as usize, bytes.len());
+    unsafe { super::boot::protect_user_slot_code(slot, super::boot::USER_CODE_SIZE) };
+
+    // 6. Drop it to EL0 in the slot: entry = the window base (blob offset 0), SP = 16-aligned window top.
+    //    Run it on THIS core (the loader's), so the verdict's cooperative `yield_now` below guarantees it
+    //    is dispatched (render/input own the other APs) — the x86 "same AP, FIFO after the program" idiom.
+    let ttbr0 = super::boot::slot_ttbr0(slot);
+    let asid = ttbr0 >> 48;
+    let sp = (base + size as u64) & !0xF;
+    let run_cpu = super::percpu::this_cpu().cpu_index as usize;
+    serial_println!(
+        ":: M6g: HELLO.BIN loaded from SD ({} bytes) -> EL0 (slot {}, ASID {}) ::",
+        bytes.len(),
+        slot,
+        asid
+    );
+    super::sched::spawn_user_slot("m6g-hello", base, sp, ttbr0, run_cpu);
+
+    // 7. Verdict (folded in — no extra task): wait (bounded ~2 s, yielding so m6g-hello runs on this core)
+    //    for the disk program to terminate, then print PASS/FAIL. The disk blob's `sys_exit(0)` is routed
+    //    by name into EL0_M6G_DONE; a fault into EL0_M6G_KILLED; a nonzero exit into EL0_M6G_ERR.
+    let vstart = super::timer::cntpct();
+    let vdeadline = 2 * super::timer::cntfrq();
+    while EL0_M6G_DONE.load(Ordering::Acquire)
+        + EL0_M6G_ERR.load(Ordering::Acquire)
+        + EL0_M6G_KILLED.load(Ordering::Acquire)
+        == 0
+        && super::timer::cntpct().wrapping_sub(vstart) <= vdeadline
+    {
+        super::sched::yield_now();
+    }
+    let done = EL0_M6G_DONE.load(Ordering::Acquire);
+    let err = EL0_M6G_ERR.load(Ordering::Acquire);
+    let killed = EL0_M6G_KILLED.load(Ordering::Acquire);
+    if done == 1 && err == 0 && killed == 0 {
+        serial_println!(":: M6g: disk-loaded EL0 program exited ok -> PASS ::");
+    } else {
+        serial_println!(
+            ":: M6g: disk-loaded EL0 program FAIL — done={} err={} killed={} (want 1/0/0) ::",
+            done, err, killed
+        );
     }
 }

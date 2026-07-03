@@ -112,7 +112,36 @@
   > 0 on metal), with M6c/M6b/M6d/M6e + CAPSTONE all unchanged and 0 unexpected
   faults. Metal rides along with M6g's reflash (validation + copies run under the
   ASIDs the metal already proved; the preempt counter goes > 0 there).
-- Not yet: loadable programs from storage + a process/handle model (M6g/U2, U4).
+- **M6g** — load a program FROM STORAGE and run it at EL0 (the Pi twin of x86 U2).
+  The block layer (`drivers::block`) now dispatches over a registered backend: the
+  default xHCI USB-MSC path is untouched, and a new `register_sd` (cfg-gated to
+  `aarch64 + baremetal`) flips it to a BCM2711 EMMC2/SDHCI microSD driver
+  (`drivers::emmc2`) — so the x86 read/write path stays byte-identical (a nonempty
+  x86 diff would be a STOP). The driver is deliberately minimal (PIO, single-block
+  CMD17 reads, polled, no DMA, no writes; every wait CNTPCT-bounded so a dead/absent
+  controller fails cleanly instead of hanging boot) and probes TWO candidate bases:
+  **EMMC2 @0xFE34_0000 first (the real microSD slot on silicon), then the legacy
+  Arasan SDHCI @0xFE30_0000** — the reverse of QEMU, whose `if=sd` card lands on the
+  legacy base. So QEMU exercises the fallback leg and the **EMMC2 success leg runs on
+  metal only**. On a successful init ladder (CMD0/CMD8/ACMD41/CMD2/CMD3/CMD9 →
+  capacity from the CSD, remembering the R2 off-by-8 / CMD7/CMD16, then a clock bump)
+  it registers the SD geometry; the M6g loader — a kernel task spawned after the M6f
+  verdict — mounts the FAT volume off that card, reads `HELLO.BIN` (the M6c blob
+  bytes, carried onto the boot media next to `kernel8.img`), size-checks it against
+  one code page from the on-disk directory entry, copies it into a fresh M6d slot,
+  protects the page EL0-RX/EL1-RO *before the task exists*, and drops it to EL0. The
+  loaded bytes are UNTRUSTED — bounded only by size and contained by EL0 + per-page
+  perms + the M6b fault-kill net (no signature/allowlist; that is the U-chain's
+  code-signing item). QEMU-verified (`./arroyo kernel8-test 30`): `:: M6g: SD card
+  @0xfe300000 identified — 131072 blocks (64 MiB, CSD v1) ::`, `FAT mounted from SD
+  (Fat32)`, `HELLO.BIN loaded from SD (51 bytes) -> EL0`, a second `hello from EL0`,
+  `disk-loaded EL0 program exited ok -> PASS`, with M6b/M6c/M6d/M6e/M6f + CAPSTONE
+  all unchanged and 0 unexpected faults; the `UNAOS_SDIMG=0` control adds exactly the
+  two no-card lines + the loader-skipped line. Metal-only: the EMMC2 base actually
+  carrying the card, the mailbox clock-rate query against real firmware, real card
+  timing, and the M6f preempt-counter riders (all pending the M6g reflash).
+- Not yet: a process/handle model (U4) and a code-signing / allowlist gate on the
+  loader (`SECURITY.md`).
 
 ### x86_64 (branch `hw-rmbp`)
 
