@@ -525,6 +525,21 @@ extern "C" fn user_task_trampoline() -> ! {
             "push {rflags}",
             "push {cs}",
             "push {entry}",
+            // U2.5 Part 0-i: FIRST-ENTRY x87/MMX SCRUB — the x86 twin of the aarch64 M6f FP/SIMD
+            // first-entry scrub. x87/MMX state is ring-3-reachable (CR0.EM/TS are 0 out of INIT
+            // reset, and neither the AP trampoline nor UEFI sets them), yet nothing zeros it, so
+            // firmware/kernel-era residue would reach ring 3 in the FP register file. `fninit`
+            // empties only the x87 TAGS; the physical mantissa bits survive and an MMX move reads
+            // them regardless of tag. So `fninit` first, then push eight 0.0's (fldz) — overwriting
+            // all eight physical registers R0..R7 — then pop them all (fstp st(0)), which stores 0.0
+            // and re-marks every register empty. Safe at CPL 0: the kernel target is `+soft-float`
+            // with SIMD/MMX disabled, so no kernel value lives in the FP file. SSE stays fenced
+            // separately by CR4.OSFXSR=0 (#UD in ring 3) — untouched here. These touch no GPR/rsp,
+            // so their placement before the GPR scrub is immaterial to the frame.
+            "fninit",
+            "fldz", "fldz", "fldz", "fldz", "fldz", "fldz", "fldz", "fldz",
+            "fstp st(0)", "fstp st(0)", "fstp st(0)", "fstp st(0)",
+            "fstp st(0)", "fstp st(0)", "fstp st(0)", "fstp st(0)",
             // Scrub every GPR but rsp. The five inputs above are dead after their pushes, so zeroing
             // the registers that carried them is safe; iretq reads only the pushed frame.
             "xor eax, eax",

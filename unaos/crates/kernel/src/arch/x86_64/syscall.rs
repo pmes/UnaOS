@@ -260,6 +260,8 @@ static RING3_KILLED_UNEXPECTED: AtomicU32 = AtomicU32::new(0);
 static SYSCALL_LOGGED: AtomicBool = AtomicBool::new(false);
 /// One-shot guard for the SMEP status line (identical across the homogeneous CPUs).
 static SMEP_LOGGED: AtomicBool = AtomicBool::new(false);
+/// One-shot guard for the U2.5 Part 0-ii DR7-cleared status line (the DR7 clear itself is per-CPU).
+static DR7_LOGGED: AtomicBool = AtomicBool::new(false);
 /// U2 Part-0a: the TF+SYSCALL fixture terminating cleanly. `EXITED_OK` = it reached `sys_exit(0)`
 /// (the #DB was neutralized at the entry stub and the syscall resumed); `KILLED` = a platform
 /// delivered the #DB in ring 3 and the task was killed. Either is an acceptable "survived" outcome
@@ -460,6 +462,19 @@ pub fn init() {
         } else {
             serial_println!(":: SMEP unsupported (TCG?) — metal Ivy Bridge has it ::");
         }
+    }
+
+    // U2.5 Part 0-ii: clear DR7 once per CPU. The U2 #DB policy (interrupts.rs) resumes a CPL-0 #DB
+    // whose RIP lands in the syscall-entry stub, on the assumption that RFLAGS.TF is the ONLY #DB
+    // source there. A firmware-left hardware breakpoint (DR7 armed at boot) would violate that and
+    // wedge the resume-or-kill logic. Zeroing DR7 per-CPU (here, at syscall init) makes the
+    // "TF is the only #DB source" assumption enforced rather than merely assumed. Plain asm, no
+    // crate API: `mov dr7, r64` is privileged, touches no memory/stack, and preserves flags.
+    unsafe {
+        core::arch::asm!("mov dr7, {0}", in(reg) 0u64, options(nomem, nostack, preserves_flags));
+    }
+    if !DR7_LOGGED.swap(true, Ordering::Relaxed) {
+        serial_println!(":: U2.5-0: DR7 cleared ::");
     }
 }
 
@@ -776,16 +791,29 @@ pub fn u2_probe_once() {
         return;
     }
     // The USER_BASE window was mapped by `setup()` during the U1a/U1b demo (code page RO-from-start).
-    // Resolve the code frame's identity alias and overwrite it with the loaded bytes — never writing
-    // through USER_BASE, so the ring-3 mapping stays read-only (W^X across cores by construction).
-    let Some(frame) = crate::arch::memory::translate(USER_BASE) else {
-        serial_println!(":: U2: USER_BASE window not mapped — loader skipped ::");
-        return;
-    };
+    // U2.5 Part 0-iii: zero the ENTIRE window — code, data, and both stack pages — before copying the
+    // program in, so a second loaded program can never read U1a/U1b fixture residue left in the
+    // data/stack pages (the earlier code zeroed only the code page). The four frames are NOT
+    // physically contiguous, so translate each page's VA to its own frame; a None on any page takes
+    // the existing "window not mapped" skip. Zero (and later copy) go through the identity alias —
+    // never through USER_BASE — so the ring-3 code mapping stays read-only (W^X across cores by
+    // construction). Page 0 (== USER_BASE) is the code page; its frame is captured for the copy below.
+    let mut code_frame: u64 = 0;
+    for i in 0..USER_WINDOW_PAGES {
+        let va = USER_BASE + i * PAGE_SIZE;
+        let Some(frame) = crate::arch::memory::translate(va) else {
+            serial_println!(":: U2: USER_BASE window not mapped — loader skipped ::");
+            return;
+        };
+        unsafe {
+            core::ptr::write_bytes(frame as *mut u8, 0, PAGE_SIZE as usize);
+        }
+        if i == 0 {
+            code_frame = frame;
+        }
+    }
     unsafe {
-        // Zero the page first so no leftover U1a/U1b instruction bytes trail the loaded program.
-        core::ptr::write_bytes(frame as *mut u8, 0, PAGE_SIZE as usize);
-        core::ptr::copy_nonoverlapping(bytes.as_ptr(), frame as *mut u8, bytes.len());
+        core::ptr::copy_nonoverlapping(bytes.as_ptr(), code_frame as *mut u8, bytes.len());
     }
     let sp = USER_BASE + USER_WINDOW_PAGES * PAGE_SIZE - 16;
     serial_println!(":: U2: HELLO.BIN loaded from FAT ({} bytes) -> ring 3 ::", bytes.len());
