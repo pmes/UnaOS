@@ -225,15 +225,36 @@ fn main() {
     // the same device (flaky FAT mounts). Pinning the ESP to bootindex=0 (and the stick to a lower
     // priority) makes OVMF go straight to the ESP, leaving the usb-storage pristine for the kernel —
     // the raw usb.img default already behaved this way (OVMF never boots a non-FAT device).
+    // qemu-xhci defaults to p2=4 USB2 ports. With the FTDI attached (U2.5) there are four full/high-
+    // speed USB2 devices — storage + kbd + tablet + serial — and QEMU overflows the 4th onto an
+    // AUTO-INSERTED usb-hub, putting the FTDI behind a hub. Hub-downstream enumeration is HID-only
+    // this arc, so a hubbed FTDI is never configured. Widen the root-port count so every device lands
+    // on a root port — but ONLY when the FTDI is attached, so the default (no-knob) runs keep the
+    // exact 4/4 controller shape and a byte-identical boot log.
+    let usbserial = std::env::var("UNAOS_USBSERIAL").is_ok();
+    let xhci_dev = if usbserial { "qemu-xhci,id=xhci,p2=8,p3=8" } else { "qemu-xhci,id=xhci" };
     cmd.arg("-drive").arg(format!("if=none,id=esp,format=raw,file=fat:rw:{}", esp_dir.display()))
        .arg("-device").arg("ide-hd,drive=esp,bootindex=0")
        .arg("-device").arg("isa-debug-exit,iobase=0xf4,iosize=0x04")
-       .arg("-device").arg("qemu-xhci,id=xhci")
+       .arg("-device").arg(xhci_dev)
        .arg("-drive").arg(format!("if=none,id=stick,format=raw,file={}", stick_image.display()))
        .arg("-device").arg("usb-storage,bus=xhci.0,drive=stick,bootindex=1")
        .arg("-device").arg("usb-kbd,bus=xhci.0")
        .arg("-device").arg("usb-tablet,bus=xhci.0")
        .arg("-m").arg("1G");
+
+    // U2.5 (UNAOS_USBSERIAL): attach an FTDI FT232 usb-serial device on the xHCI bus. QEMU's
+    // `-device usb-serial` emulates an FT232 (VID 0x0403 PID 0x6001, bulk IN 0x81 / OUT 0x02); its
+    // chardev is a file at target/ftdi.log, so the kernel's FTDI console driver enumerates it and
+    // replays the boot log out bulk-OUT — the metal cable (arriving ~2026-07-08) behaves the same.
+    // NOTE: `is_ok()` treats an EMPTY value as SET (the known knob trap) — `UNAOS_USBSERIAL=` is ON.
+    if usbserial {
+        let ftdi_log = target_dir.join("ftdi.log");
+        let _ = std::fs::remove_file(&ftdi_log); // start each run with a fresh capture file
+        cmd.arg("-chardev").arg(format!("file,id=ftdi0,path={}", ftdi_log.display()))
+           .arg("-device").arg("usb-serial,bus=xhci.0,chardev=ftdi0");
+        println!("   U2.5: FTDI usb-serial attached; console capture -> {}", ftdi_log.display());
+    }
 
     // SMP: bring up multiple CPUs so the kernel's AP-startup path has application
     // processors to discover (ACPI MADT) and boot (INIT-SIPI-SIPI). Override the core
