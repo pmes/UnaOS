@@ -48,6 +48,11 @@ pub fn _print(args: ::core::fmt::Arguments) {
     // Mirror to the framebuffer console so diagnostics/panics are visible on hardware that has
     // no serial port. `Arguments` is Copy; fbcon self-guards (try_lock + interrupts off).
     crate::video::fbcon::_print(args);
+    // U2.5: mirror into the FTDI console boot-capture ring — ALWAYS, from the very first print, so
+    // when the USB-serial console comes up mid-boot the whole early log replays out the cable. The
+    // ring self-guards (try_lock only, never blocks, drop-oldest on overflow); it never takes the
+    // XHCI_CONTROLLER lock or allocates, so this is safe from any print context.
+    crate::drivers::xhci::ftdi::mirror(args);
 }
 
 #[macro_export]

@@ -32,6 +32,10 @@ NIGHTLY_FLAGS="-Z build-std=core,compiler_builtins,alloc -Z build-std-features=c
 # UNAOS_BOOTLOG=1 holds the boot log on screen instead of handing off to the GUI;
 # UNAOS_PI=1 (Raspberry Pi 4) and UNAOS_TEGRA=1 (Jetson Orin Nano / Tegra234) select the aarch64
 # UART — `pi` touches no UART (fbcon only), `tegra` points serial at the Tegra 16550. Empty by default.
+# UNAOS_USBSERIAL=1 is a BUILDER/QEMU knob (not a kernel feature): the builder attaches an FTDI FT232
+# usb-serial device (VID 0403 PID 6001) whose chardev is target/ftdi.log, so the x86 kernel's U2.5
+# FTDI console driver enumerates it and replays the boot log out the (emulated) cable. `is_ok()`
+# semantics — an EMPTY value counts as SET.
 KERNEL_FEATURES=""
 _feats=""
 [ -n "${UNAOS_SKIP_XHCI:-}" ] && _feats="${_feats}skip_xhci,"

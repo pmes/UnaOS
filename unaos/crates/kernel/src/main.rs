@@ -531,6 +531,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
                 xhci.service_storage();
                 xhci.service_hubs();
                 xhci.service_hid_setproto();
+                xhci.service_ftdi();
                 xhci.service_slot_disposal();
                 xhci.service_enum();
             }
@@ -641,6 +642,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
             xhci.service_storage();
             xhci.service_hubs();
             xhci.service_hid_setproto();
+            xhci.service_ftdi();
             xhci.service_slot_disposal();
             xhci.service_enum();
         }

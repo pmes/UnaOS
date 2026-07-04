@@ -263,10 +263,17 @@ pub fn calibrate(pm: &crate::arch::acpi::PmTimer) {
         }
     });
 
-    // Re-arm the periodic heartbeat we borrowed for the measurement, regardless of outcome.
-    init_timer();
+    // The periodic heartbeat we borrowed for the measurement (left masked + one-shot) must be
+    // re-armed on EVERY path out of here — but on the SUCCESS path we re-arm LAST, after the
+    // calibrated rate is stored, so the BSP's own heartbeat runs at the calibrated 1 kHz count
+    // (`APIC_TICKS`, the global ms-clock, is advanced by the BSP ISR alone). The previous ordering
+    // re-armed here, BEFORE the stores below, so `init_timer` read `APIC_TIMER_HZ == 0` and pinned
+    // the BSP to `FIXED_INITCNT` forever while the APs (initialising after the stores) ran
+    // calibrated — the metal ms-clock read ~119 Hz. Each FAILURE path re-arms with the fallback
+    // just before returning (nothing was stored).
 
     if elapsed_pm == 0 {
+        init_timer(); // fallback re-arm (calibration aborted; APIC_TIMER_HZ still 0)
         serial_println!("APIC: calibration ABORTED (PM timer did not advance) — timebase stays uncalibrated.");
         return;
     }
@@ -281,6 +288,7 @@ pub fn calibrate(pm: &crate::arch::acpi::PmTimer) {
     // Anything outside that is a bad measurement (SMI storm, wrong port) — discard and stay fixed.
     let sane = (200_000_000..=20_000_000_000).contains(&tsc_hz) && (100_000..=2_000_000_000).contains(&apic_hz);
     if !sane {
+        init_timer(); // fallback re-arm (measurement rejected; nothing stored)
         serial_println!(
             "APIC: calibration REJECTED (implausible: TSC {} Hz, APIC ÷16 {} Hz over {} PM ticks) — staying uncalibrated.",
             tsc_hz, apic_hz, elapsed_pm
@@ -300,6 +308,11 @@ pub fn calibrate(pm: &crate::arch::acpi::PmTimer) {
         (apic_hz % 1_000_000) / 1_000,
         apic_hz / 1_000
     );
+    // SUCCESS re-arm, LAST: now that APIC_TIMER_HZ is stored, the BSP's heartbeat arms at the
+    // calibrated 1 kHz count (initcnt ≈ APIC_TIMER_HZ / 1000). This line lands immediately AFTER the
+    // "APIC: calibrated over ..." line above (the gate depends on that order — re-arming between the
+    // stores and the print would put the armed line before the calibrated line).
+    init_timer();
 }
 
 /// Calibrated invariant-TSC frequency in Hz, or 0 if calibration has not run / failed.

@@ -18,6 +18,7 @@ pub mod trb;
 pub mod ring;
 pub mod event;
 pub mod context;
+pub mod ftdi;
 
 use ring::TransferRing;
 use self::trb::Trb;
@@ -449,6 +450,19 @@ struct BotPending {
     completion_code: u8,
 }
 
+/// In-flight FTDI console bulk-OUT transfer (U2.5). The FTDI TX is a single bulk-OUT stage — no
+/// CBW/CSW dance — so this is a slimmer twin of [`BotPending`]: the awaited Normal TRB is matched by
+/// its physical address so the drain pump claims exactly its own completion. Inert (None) unless the
+/// FTDI console is draining.
+#[derive(Clone, Copy)]
+struct FtdiPending {
+    slot_id: u8,
+    out_dci: u8,
+    wait_trb_phys: u64,
+    done: bool,
+    completion_code: u8,
+}
+
 /// In-flight SYNCHRONOUS EP0 control transfer, used during hub bring-up (a main-loop, non-event
 /// context). Like `BotPending` but for EP0: the awaited Status TRB is matched by its physical
 /// address so the sync pump claims exactly its own completion before the async descriptor FSM
@@ -532,6 +546,12 @@ fn parse_supported_protocols(base_address: usize) -> Vec<PortProtocol> {
 pub struct DeviceSlot {
     pub active: bool,
     pub port_id: u8,
+    /// USB device-descriptor idVendor / idProduct, captured in the device-descriptor handler (they
+    /// were read there and discarded before U2.5). Used to recognise the FTDI FT232 (0403:6001) once
+    /// its vendor-specific interface turns up in the config walk. 0/0 until the device descriptor
+    /// arrives.
+    pub vid: u16,
+    pub pid: u16,
     pub input_context: *mut InputContext,
     pub output_context: *mut DeviceContext,
     pub ep0_ring: Option<TransferRing>,
@@ -610,6 +630,8 @@ impl DeviceSlot {
         Self {
             active: false,
             port_id: 0,
+            vid: 0,
+            pid: 0,
             input_context: core::ptr::null_mut(),
             output_context: core::ptr::null_mut(),
             ep0_ring: None,
@@ -653,6 +675,8 @@ impl DeviceSlot {
     pub fn reset_soft_state(&mut self) {
         self.active = false;
         self.port_id = 0;
+        self.vid = 0;
+        self.pid = 0;
         if let Some(r) = self.ep0_ring.take() { core::mem::forget(r); }
         if let Some(r) = self.bulk_in_ring.take() { core::mem::forget(r); }
         if let Some(r) = self.bulk_out_ring.take() { core::mem::forget(r); }
@@ -706,6 +730,24 @@ pub struct XhciController {
     /// Set once the storage bulk endpoints are configured; the main loop performs the
     /// (synchronous) SCSI bring-up + first read in a safe, non-event context.
     pub storage_pending_bringup: bool,
+
+    // --- U2.5 FTDI USB-serial console (root-port only) ---
+    /// Slot whose Configure-Endpoint we issued for the FTDI bulk endpoints (0 = none). Kept
+    /// SEPARATE from `configuring_slot` so the completion is not claimed by the storage branch.
+    ftdi_configuring_slot: u8,
+    /// Slot id of the enumerated FTDI FT232 (0 = none).
+    ftdi_slot: u8,
+    /// Set once the FTDI bulk endpoints are configured; the main loop runs the (synchronous)
+    /// SET_CONFIGURATION + FTDI vendor setup in a safe, non-event context (mirrors storage).
+    ftdi_pending_bringup: bool,
+    /// In-flight FTDI console bulk-OUT transfer (the drain pump waits on it).
+    ftdi_pending: Option<FtdiPending>,
+    /// Running total of console bytes drained out the FTDI cable (for the TX-mirror PASS line).
+    ftdi_tx_total: u64,
+    /// One-shot: the FTDI-TX-mirror PASS line has been printed (after the first backlog drain).
+    ftdi_pass_logged: bool,
+    /// One-shot: the FTDI-TX-disabled line has been printed (so a wedged sink logs exactly once).
+    ftdi_disabled_logged: bool,
     /// Human-readable progress of the mass-storage bring-up, surfaced by the shell `diskinfo`
     /// command. On the serial-less rMBP the boot enumeration log is wiped when the GUI takes over,
     /// so a failed bring-up would otherwise be a silent "no device"; this makes the stall point
@@ -826,6 +868,13 @@ impl XhciController {
             event_ring_phys_base: 0,
             storage_slot: 0,
             storage_pending_bringup: false,
+            ftdi_configuring_slot: 0,
+            ftdi_slot: 0,
+            ftdi_pending_bringup: false,
+            ftdi_pending: None,
+            ftdi_tx_total: 0,
+            ftdi_pass_logged: false,
+            ftdi_disabled_logged: false,
             storage_note: "no mass-storage device enumerated",
             bot_tag: 1,
             bot_pending: None,
@@ -1136,6 +1185,18 @@ impl XhciController {
                                     // Storage setup is done; move on to the next connected port.
                                     self.start_next_port();
                                 }
+                                // U2.5: the FTDI's Configure-Endpoint completed. Cache the slot and
+                                // defer SET_CONFIGURATION + the FTDI vendor setup to the main loop
+                                // (a safe, non-event context, like storage). Kept in its OWN field
+                                // so this is not misclaimed by the storage branch above or the
+                                // address-device (`ours`) branch below.
+                                else if self.ftdi_configuring_slot == slot_id as u8 {
+                                    serial_println!("xHCI: FTDI Endpoints Configured (Slot {}). Console bring-up pending.", slot_id);
+                                    self.ftdi_configuring_slot = 0;
+                                    self.ftdi_slot = slot_id as u8;
+                                    self.ftdi_pending_bringup = true;
+                                    self.start_next_port();
+                                }
                                 else if self.slots[slot_id as usize].mouse_state == 1
                                     || self.slots[slot_id as usize].keyboard_state == 1 {
                                     // The single Configure-Endpoint that programmed this device's HID
@@ -1272,6 +1333,26 @@ impl XhciController {
                             }
                         }
 
+                        // U2.5: FTDI console bulk-OUT completion. The FTDI slot is distinct from the
+                        // storage slot, so slot_id + out_dci disambiguate it from any BOT transfer.
+                        // Matched by TRB address (or any error) so the drain pump claims exactly its
+                        // own Normal-TRB completion before the async FSM below.
+                        if endpoint_id > 1 && slot_id > 0 {
+                            if let Some(p) = self.ftdi_pending {
+                                if p.slot_id == slot_id as u8 && endpoint_id as u8 == p.out_dci {
+                                    let is_match = param == p.wait_trb_phys;
+                                    let is_error = completion_code != 1 && completion_code != 13;
+                                    if is_match || is_error {
+                                        if let Some(fp) = self.ftdi_pending.as_mut() {
+                                            fp.completion_code = completion_code as u8;
+                                            fp.done = true;
+                                        }
+                                        return; // consumed by the FTDI TX pump
+                                    }
+                                }
+                            }
+                        }
+
                         // An EP0 transfer for the port being ENUMERATED failed (STALL on a
                         // descriptor fetch / SET_CONFIGURATION, babble, transaction error...).
                         // This was silently dropped before — the enumeration FSM then deadlocked
@@ -1356,6 +1437,17 @@ impl XhciController {
                                     serial_println!(">>> VENDOR ID : [{:04x}]", vid);
                                     serial_println!(">>> PRODUCT ID: [{:04x}]", pid);
 
+                                    // U2.5: persist idVendor/idProduct on the slot — but ONLY from a
+                                    // DEVICE descriptor (bDescriptorType 0x01). This same block also
+                                    // handles config-descriptor events, where desc_data[8..12] are
+                                    // interface/endpoint bytes, not vid/pid; guarding here keeps the
+                                    // FTDI's real 0403:6001 from being clobbered. The FT232's
+                                    // vendor-specific interface later keys on these to identify itself.
+                                    if desc_data[1] == 0x01 {
+                                        self.slots[slot_id as usize].vid = vid;
+                                        self.slots[slot_id as usize].pid = pid;
+                                    }
+
                                     // UNA-22-HAUL: Inspect Class Code
                                     let class_code = desc_data[4];
                                     let subclass = desc_data[5];
@@ -1403,6 +1495,10 @@ impl XhciController {
                                         // Mass-storage tracking: collect the bulk IN/OUT
                                         // endpoints during the walk, configure once after.
                                         let mut is_mass_storage = false;
+                                        // U2.5: FTDI FT232 tracking — its vendor-specific interface
+                                        // (class 0xFF) carries the same bulk IN/OUT pair as MSC, so it
+                                        // reuses the bulk-collection arm below.
+                                        let mut is_ftdi = false;
                                         let mut bulk_in: Option<(u8, u16)> = None;
                                         let mut bulk_out: Option<(u8, u16)> = None;
 
@@ -1430,6 +1526,20 @@ impl XhciController {
                                                     // collect its bulk endpoints below and configure after the walk.
                                                     serial_println!("xHCI: >>> MASS STORAGE INTERFACE DETECTED (Class 0x08) <<<");
                                                     is_mass_storage = true;
+                                                } else if current_intf_class == 0xFF {
+                                                    // U2.5: a vendor-specific interface. The FTDI FT232 (device
+                                                    // class 0x00 → Composite branch) exposes exactly one such
+                                                    // interface with a bulk IN/OUT pair; gate on the persisted
+                                                    // idVendor/idProduct so only the real FT232 (0403:6001) is
+                                                    // treated as an FTDI console.
+                                                    let (vid, pid) = {
+                                                        let s = &self.slots[slot_id as usize];
+                                                        (s.vid, s.pid)
+                                                    };
+                                                    if vid == ftdi::FTDI_VID && pid == ftdi::FTDI_PID {
+                                                        serial_println!("xHCI: >>> FTDI USB-SERIAL DETECTED (0403:6001) <<<");
+                                                        is_ftdi = true;
+                                                    }
                                                 }
                                             } else if desc_type == 0x05 && found_hid { // HID Endpoint
                                                 if offset + 6 >= 256 { break; }
@@ -1494,7 +1604,7 @@ impl XhciController {
                                                     }
                                                     found_hid = false; // one interrupt-IN EP per interface; next iface re-arms
                                                 }
-                                            } else if desc_type == 0x05 && is_mass_storage { // Bulk Endpoint
+                                            } else if desc_type == 0x05 && (is_mass_storage || is_ftdi) { // Bulk Endpoint (MSC or FTDI)
                                                 if offset + 6 >= 256 { break; }
                                                 let ep_addr = desc_data[offset + 2];
                                                 let ep_attr = desc_data[offset + 3];
@@ -1528,6 +1638,22 @@ impl XhciController {
                                                 }
                                                 _ => {
                                                     serial_println!("xHCI: Mass storage missing bulk endpoints (in={:?}, out={:?}); skipping device.", bulk_in, bulk_out);
+                                                    self.start_next_port();
+                                                }
+                                            }
+                                        } else if is_ftdi {
+                                            // U2.5: same bulk-generic Configure-Endpoint as storage, but
+                                            // tracked via `ftdi_configuring_slot` so its completion routes
+                                            // to the FTDI console bring-up, not the SCSI path. (A device
+                                            // is either MSC or FTDI — different interface classes — so
+                                            // these two arms are mutually exclusive.)
+                                            match (bulk_in, bulk_out) {
+                                                (Some((ia, im)), Some((oa, om))) => {
+                                                    self.ftdi_configuring_slot = slot_id as u8;
+                                                    self.configure_endpoints(slot_id as u8, ia, im, oa, om);
+                                                }
+                                                _ => {
+                                                    serial_println!("xHCI: FTDI missing bulk endpoints (in={:?}, out={:?}); skipping device.", bulk_in, bulk_out);
                                                     self.start_next_port();
                                                 }
                                             }
@@ -2149,6 +2275,21 @@ impl XhciController {
                 self.storage_slot = 0;
                 self.storage_pending_bringup = false;
                 self.storage_note = "storage slot disposed after an enumeration stall";
+            }
+            // U2.5: mirror the storage clears for the FTDI console fields. Without this, a disposed
+            // slot id that later gets REUSED (hot-plug) would still match the stale
+            // `ftdi_configuring_slot`/`ftdi_slot` — the Configure-Endpoint completion dispatch checks
+            // `ftdi_configuring_slot == slot_id` BEFORE the HID branch, so a reused slot would be
+            // misrouted into the FTDI console path and its real HID/MSC setup skipped. Guarded on the
+            // disposed slot `i`, so a healthy console on another slot is never disturbed.
+            if self.ftdi_configuring_slot == i as u8 {
+                self.ftdi_configuring_slot = 0;
+            }
+            if self.ftdi_slot == i as u8 {
+                self.ftdi_slot = 0;
+                self.ftdi_pending_bringup = false;
+                self.ftdi_pending = None;
+                ftdi::set_live(false); // the console's slot is torn down — stop the drain
             }
             self.hid_setproto_pending.retain(|s| *s != i as u8);
             self.hubs_pending.retain(|s| *s != i as u8);
@@ -3179,6 +3320,165 @@ impl XhciController {
                 }
             }
             Err(e) => serial_println!("xHCI: READ(10) LBA0 failed: {:?}", e),
+        }
+    }
+
+    /// Main-loop hook (U2.5): bring up the FTDI console ONCE (SET_CONFIGURATION + the four FTDI
+    /// vendor requests, all synchronous EP0 in this safe non-event context), then drain the
+    /// boot-capture ring out its bulk-OUT endpoint on EVERY call while the sink is live. Wired into
+    /// both main loops beside `service_hid_setproto`.
+    pub fn service_ftdi(&mut self) {
+        if self.ftdi_pending_bringup {
+            self.ftdi_pending_bringup = false;
+            let slot = self.ftdi_slot;
+            if slot == 0 {
+                return;
+            }
+            serial_println!("xHCI: === FTDI CONSOLE BRING-UP (SET_CONFIG + vendor setup) ===");
+            // SET_CONFIGURATION(1) — put the device in the CONFIGURED state so its bulk endpoints go
+            // active. bmRequestType 0x00 (host->device | standard | device), bRequest 0x09 — the exact
+            // call `bring_up_storage` makes.
+            match self.sync_control(slot, 0x00, 0x09, 1, 0, 0, 0, false) {
+                Ok(1) => {}
+                other => {
+                    serial_println!(":: U2.5: FTDI setup failed (SET_CONFIGURATION {:?}) ::", other);
+                    return;
+                }
+            }
+            // FTDI vendor requests: bmRequestType 0x40 (host->device | vendor | device), wIndex 0, no
+            // data stage. Order per Linux ftdi_sio: RESET → SET_BAUDRATE → SET_DATA → SET_FLOW_CTRL.
+            let steps: [(&str, u8, u16); 4] = [
+                ("RESET", ftdi::FTDI_SIO_RESET, 0x0000),
+                ("SET_BAUDRATE", ftdi::FTDI_SIO_SET_BAUDRATE, ftdi::FTDI_BAUD_115200),
+                ("SET_DATA", ftdi::FTDI_SIO_SET_DATA, ftdi::FTDI_DATA_8N1),
+                ("SET_FLOW_CTRL", ftdi::FTDI_SIO_SET_FLOW_CTRL, 0x0000),
+            ];
+            for (name, b_req, w_value) in steps {
+                match self.sync_control(slot, 0x40, b_req, w_value, 0, 0, 0, false) {
+                    Ok(1) => {}
+                    other => {
+                        serial_println!(":: U2.5: FTDI setup failed ({} {:?}) ::", name, other);
+                        return;
+                    }
+                }
+            }
+            serial_println!(":: U2.5: FTDI console up (0403:6001, 115200 8N1) ::");
+            ftdi::set_live(true);
+        }
+        self.drain_ftdi();
+    }
+
+    /// Drain the FTDI boot-capture ring out the console's bulk-OUT endpoint, ≤512 B per transfer,
+    /// until the ring is empty. Bounded + non-blocking by construction: any timeout / non-success
+    /// completion turns the sink OFF permanently and drops all further output — the kernel must never
+    /// wedge on console TX.
+    fn drain_ftdi(&mut self) {
+        if !ftdi::is_live() {
+            return;
+        }
+        let slot = self.ftdi_slot;
+        if slot == 0 {
+            return;
+        }
+        let (out_ep, data_phys) = {
+            let s = &self.slots[slot as usize];
+            let dp = match s.scsi_data_buffer {
+                Some(p) => p as u64,
+                None => return,
+            };
+            (s.bulk_out_ep, dp)
+        };
+        if out_ep == 0 {
+            return;
+        }
+        let out_dci = (out_ep & 0x0F) * 2;
+
+        loop {
+            // Stage up to 512 B of the oldest ring bytes into the FTDI slot's DMA buffer (reused as
+            // the TX staging buffer — the FTDI slot never runs BOT, so its `scsi_data_buffer` is free).
+            let n = unsafe { ftdi::drain_into(data_phys as *mut u8, 512) };
+            if n == 0 {
+                break; // ring drained
+            }
+            match self.ftdi_tx_stage(slot, out_dci, data_phys, n as u32) {
+                Ok(1) | Ok(13) => self.ftdi_tx_total += n as u64,
+                Ok(_) => {
+                    self.disable_ftdi_tx("bad completion code");
+                    return;
+                }
+                Err(()) => {
+                    self.disable_ftdi_tx("timeout");
+                    return;
+                }
+            }
+        }
+        // First clean empty of the backlog: announce the mirror is live. The PASS line itself enters
+        // the ring and rides the NEXT drain — that is expected, and is the gate's proof the sink stays
+        // live end to end.
+        if !self.ftdi_pass_logged && self.ftdi_tx_total > 0 {
+            self.ftdi_pass_logged = true;
+            serial_println!(
+                ":: U2.5: FTDI TX mirror -> PASS ({} boot bytes replayed) ::",
+                self.ftdi_tx_total
+            );
+        }
+    }
+
+    /// Turn the FTDI TX sink off permanently and log it exactly once.
+    fn disable_ftdi_tx(&mut self, reason: &'static str) {
+        ftdi::set_live(false);
+        if !self.ftdi_disabled_logged {
+            self.ftdi_disabled_logged = true;
+            serial_println!(":: U2.5: FTDI TX disabled ({}) ::", reason);
+        }
+    }
+
+    /// Push one Normal TRB (`len` bytes from `data_phys`) onto the FTDI slot's bulk-OUT ring, ring the
+    /// OUT doorbell, and pump the event ring until its completion arrives (matched by TRB address).
+    /// Returns the completion code. A slimmer twin of `run_bot_stage` (single stage, no CBW/CSW).
+    fn ftdi_tx_stage(&mut self, slot_id: u8, out_dci: u8, data_phys: u64, len: u32) -> Result<u8, ()> {
+        let wait_trb_phys = {
+            let ring = self.slots[slot_id as usize].bulk_out_ring.as_mut().ok_or(())?;
+            let base = ring.get_ptr();
+            let idx = ring
+                .push(Trb { parameter: data_phys, status: len, control: (1 << 10) | (1 << 5) })
+                .map_err(|_| ())?;
+            base + (idx as u64) * 16
+        };
+        self.ftdi_pending = Some(FtdiPending {
+            slot_id,
+            out_dci,
+            wait_trb_phys,
+            done: false,
+            completion_code: 0,
+        });
+        self.ring_doorbell(slot_id, out_dci as u32);
+        let pump = self.pump_until_ftdi_done(2000);
+        let pending = self.ftdi_pending.take();
+        pump?;
+        Ok(pending.ok_or(())?.completion_code)
+    }
+
+    /// Pump the event ring until the in-flight FTDI TX transfer reports done (or the iteration budget
+    /// is exhausted). Unrelated events are dispatched normally during the wait. Mirrors
+    /// `pump_until_bot_done`.
+    fn pump_until_ftdi_done(&mut self, max_iters: u64) -> Result<(), ()> {
+        let mut iters: u64 = 0;
+        loop {
+            match &self.ftdi_pending {
+                Some(p) if p.done => return Ok(()),
+                None => return Ok(()),
+                _ => {}
+            }
+            if self.drain_event_ring_once() {
+                continue;
+            }
+            crate::hlt();
+            iters += 1;
+            if iters >= max_iters {
+                serial_println!("xHCI: FTDI TX pump TIMEOUT after {} yields", iters);
+                return Err(());
+            }
         }
     }
 
