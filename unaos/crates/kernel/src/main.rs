@@ -318,17 +318,19 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
                 vcpu,
             );
 
-            // M7: a minimal process model — sys_spawn + sys_wait (the parent reaps a disk-loaded child).
-            // A gated kernel task on `vcpu` (the m6g-loader idiom), with the demo core `cpu` passed as its
-            // arg: it waits for the M6g loader to finish (so its lines print first AND the M6d/M6f/M6g slots
-            // have freed), builds the PARENT's slot, and spawns the parent on `cpu`. The parent's sys_spawn
-            // then loads HELLO.BIN off the SD card into a fresh slot and runs it at EL0 as a CHILD co-located
-            // on `cpu`; sys_wait blocks the parent until the child exits (a scheduler wake — QEMU-testable)
-            // and returns its status. The launcher folds the verdict. (Deferred to run-time because M6d+M6f
-            // hold all 8 slots at BSP-wiring time; they free as their fixtures exit — hence the M6g gate.)
+            // U4: the process model + per-process handle table — sys_spawn (returns a HANDLE) + sys_wait
+            // (reaps by handle). A gated kernel task on `vcpu` (the m6g-loader idiom), with the demo core
+            // `cpu` passed as its arg: it waits for the M6g loader to finish (so its lines print first AND the
+            // M6d/M6f/M6g slots have freed), builds the PARENT's and ORPHAN's slots, and spawns both on `cpu`.
+            // The parent's two sys_spawns load HELLO.BIN off the SD card into fresh slots and run them at EL0
+            // as CHILDREN co-located on `cpu`, each installed as a handle in the parent's table; sys_wait
+            // reaps each by handle (a scheduler wake — QEMU-testable). The orphan's sys_wait on an unheld
+            // handle returns -ECHILD (structural ownership). The launcher folds the verdict. (Deferred to
+            // run-time because M6d+M6f hold all 8 slots at BSP-wiring time; they free as their fixtures exit
+            // — hence the M6g gate.)
             unaos_kernel::arch::sched::spawn(
-                "m7-launch",
-                unaos_kernel::arch::syscall::m7_launcher,
+                "u4-launch",
+                unaos_kernel::arch::syscall::u4_launcher,
                 cpu,
                 vcpu,
             );

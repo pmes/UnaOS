@@ -41,12 +41,14 @@ const SYS_SLEEP_MS: u64 = 5;
 const SYS_GETPID: u64 = 6;
 /// M6f: write a fixed {pid, ticks} struct to the user pointer in x0 via `copy_to_user`. Returns 0 or -EFAULT.
 const SYS_GETINFO: u64 = 7;
-/// M7: load the fixed on-disk program (`HELLO.BIN`) into a fresh per-task slot, run it at EL0 as a CHILD,
-/// and return the child's pid (or a negative errno). No args this arc — arbitrary program-by-name is M8
-/// (it needs a validated `copy_from_user` name). See `sys_spawn`.
+/// M7/U4: load the fixed on-disk program (`HELLO.BIN`) into a fresh per-task slot, run it at EL0 as a CHILD,
+/// and return a HANDLE index into the CALLER's per-process handle table (U4 — not the raw pid), or a negative
+/// errno. No args this arc — arbitrary program-by-name is M8 (it needs a validated `copy_from_user` name).
+/// See `sys_spawn`.
 const SYS_SPAWN: u64 = 8;
-/// M7: block the caller until the child with pid `a0` exits, then return its exit status (or -ECHILD if
-/// no such child). Woken by the child's `done.post()` — a scheduler wake, so it works under QEMU. See `sys_wait`.
+/// M7/U4: block the caller until the child referred to by the HANDLE in `a0` exits, then return its exit
+/// status (or -ECHILD if that handle is not in the caller's table — structural ownership). Woken by the
+/// child's `done.post()` — a scheduler wake, so it works under QEMU. See `sys_wait`.
 const SYS_WAIT: u64 = 9;
 
 /// M6e demo: the sentinel `sys_exit` status the preemption spinner uses so its exit is accounted to
@@ -60,14 +62,19 @@ const M6D_EXIT_STATUS: u64 = 0x6D;
 /// M6f demo: the sentinel `sys_exit` status every M6f fixture uses so its exit lands in `EL0_M6F_DONE` and
 /// never perturbs the M6b/M6d/M6e counters (same discipline as M6D/M6E). Tested BEFORE the catch-all `else`.
 const M6F_EXIT_STATUS: u64 = 0x6F;
-/// M7 demo: the sentinel `sys_exit` status the process-model PARENT (`el0-m7parent`) uses so ITS exit lands
-/// in `EL0_M7_DONE`, never perturbing the M6b/M6d/M6e/M6f/M6g counters (same sentinel discipline). The CHILD
-/// is reaped through the Proc table by pid (see the SYS_EXIT arm), not by this status.
-const M7_EXIT_STATUS: u64 = 0x77;
-/// M7: the exit status the child-KILL path stores into a child's Proc entry so a killed child still wakes
+/// U4 demo: the sentinel `sys_exit` status the process-model fixtures (`el0-u4parent`, `el0-u4orphan`) use so
+/// THEIR exits land in `EL0_U4_DONE`, never perturbing the M6b/M6d/M6e/M6f/M6g counters (same sentinel
+/// discipline). A spawned CHILD is reaped through the Proc table by pid (see the SYS_EXIT arm), not by this
+/// status. Fresh value (the retired M7 demo used `0x77`); distinct from the M6D/M6E/M6F sentinels and 0.
+const U4_EXIT_STATUS: u64 = 0x74;
+/// U4 demo: the nonzero WITNESS token the parent reports iff it reaped BOTH children by handle with status 0.
+/// A token (not a pid) — `sys_spawn` now returns a handle, so the verdict only needs non-zero-means-both-ok.
+/// Must match `movz x23, #0xC4` in `__u4_prog_parent`; `u4_launcher` only checks it is non-zero.
+const U4_WITNESS_TOKEN: u64 = 0xC4;
+/// U4: the exit status the child-KILL path stores into a child's Proc entry so a killed child still wakes
 /// its parent's `sys_wait` (rather than hanging it) — non-zero so the parent's witness computes 0 (a killed
 /// child is a FAIL). A normal child exits with its own status (0 for `HELLO.BIN`); this is used only on a kill.
-const M7_KILLED_STATUS: i32 = 0x4B; // 'K'
+const U4_KILLED_STATUS: i32 = 0x4B; // 'K'
 
 // --- The inline EL0 FIXTURES: three fault-SHAPE fixtures (M6b) + one preemption spinner (M6e). These
 // are fixtures, not programs, so they stay inline in the kernel image; only the well-behaved `hello`
@@ -385,53 +392,84 @@ unsafe extern "C" {
     static __m6f_prog_sleep: u8;
 }
 
-// --- M7 inline EL0 PARENT fixture (a minimal process model). Position-independent, register-only (writes no
-// user stack — safe on any slot under preemption), so it runs wherever the kernel copies it into its slot's
-// code page. It exercises the new surface: SYS_SPAWN loads the fixed on-disk `HELLO.BIN` as a CHILD and
-// returns the child pid; SYS_WAIT blocks the parent until that child exits and returns its status; the parent
-// then reports a WITNESS (the child pid iff the reap succeeded with status 0, else 0) and exits with the M7
-// sentinel status (`0x77` -> EL0_M7_DONE, off every prior counter). ABI: x8=nr, args x0-x2, ret x0. ---
+// --- U4 inline EL0 fixtures (per-process handle table). ONE blob with TWO fixtures — the PARENT and the
+// ownership NEGATIVE (the orphan) — copied into each fixture's own slot; each task enters at its own offset
+// (the M6d/M6f multi-fixture-blob shape). Both are position-independent, register-only (write no user stack,
+// so they are safe on any slot under preemption). ABI: x8=nr, args x0-x2, ret x0.
+//
+// PARENT (`el0-u4parent`): the U4 capability — a spawner reaps MULTIPLE children BY HANDLE. `SYS_SPAWN` now
+// returns a small HANDLE index into the caller's per-process handle table (not a raw pid); `SYS_WAIT` takes
+// that handle. Two spawns (two handles in x19/x20), two waits (two statuses in x21/x22), then a WITNESS
+// (a nonzero token iff both handles were valid — sign bit clear — AND both children exited status 0, else 0),
+// and `sys_exit(U4_EXIT_STATUS)` (`0x74` -> EL0_U4_DONE, off every prior counter).
+//
+// ORPHAN (`el0-u4orphan`): the ownership NEGATIVE — it spawned nothing, so handle #0 is Empty in ITS OWN
+// per-process table; `sys_wait(0)` must therefore return `-ECHILD` (-10). It reports 1 iff it saw exactly
+// -ECHILD (structural ownership: a task cannot reap a child whose handle is not in its table), else 0, then
+// exits with the same sentinel. Deterministic — needs no cross-fixture pid plumbing (its table is empty).
 core::arch::global_asm!(
     r#"
-    .globl __m7_parent_blob_start
-__m7_parent_blob_start:
+    .globl __u4_blob_start
+__u4_blob_start:
     .balign 4
-    .globl __m7_prog_parent
-__m7_prog_parent:
-    mov  x8, #8                            // SYS_SPAWN (loads HELLO.BIN as a child; returns pid or -errno)
+    .globl __u4_prog_parent
+__u4_prog_parent:
+    mov  x8, #8                            // SYS_SPAWN -> handle_a (a handle index >=0, or a negative errno)
     svc  #0
-    mov  x19, x0                           // x19 = child pid (P) or a negative errno
-    cmp  x19, #0
-    b.gt 1f                                // signed pid > 0 -> reap it; else the spawn failed
-    mov  x0, xzr                           // spawn failed: witness = 0
-    mov  x8, #3                            // SYS_REPORT(0)
+    mov  x19, x0                           // x19 = handle_a
+    mov  x8, #8                            // SYS_SPAWN -> handle_b (a SECOND child, a SECOND handle)
     svc  #0
-    b    2f
-1:  mov  x0, x19                           // SYS_WAIT(pid) — blocks until the child exits (scheduler wake)
+    mov  x20, x0                           // x20 = handle_b
+    mov  x0, x19                           // SYS_WAIT(handle_a) — blocks until child A exits (scheduler wake)
     mov  x8, #9
     svc  #0
-    mov  x20, x0                           // x20 = child exit status (S)
-    mov  x22, xzr                          // witness = 0
-    cmp  x20, #0
-    b.ne 3f                                // status != 0 (a killed/failed child) -> witness stays 0
-    mov  x22, x19                          // status == 0 -> witness = the child pid
-3:  mov  x0, x22                           // SYS_REPORT(witness)
+    mov  x21, x0                           // x21 = status_a
+    mov  x0, x20                           // SYS_WAIT(handle_b) — reap child B by its handle
+    mov  x8, #9
+    svc  #0
+    mov  x22, x0                           // x22 = status_b
+    mov  x23, xzr                          // witness = 0
+    tbnz x19, #63, 1f                      // handle_a < 0 (spawn A failed) -> witness stays 0
+    tbnz x20, #63, 1f                      // handle_b < 0 (spawn B failed) -> witness stays 0
+    cbnz x21, 1f                           // status_a != 0 (child A not clean) -> witness stays 0
+    cbnz x22, 1f                           // status_b != 0 (child B not clean) -> witness stays 0
+    movz x23, #0xC4                        // all four OK -> witness = U4_WITNESS_TOKEN (nonzero)
+1:  mov  x0, x23                           // SYS_REPORT(witness)
     mov  x8, #3
     svc  #0
-2:  mov  x8, #2                            // SYS_EXIT(M7_EXIT_STATUS) -> EL0_M7_DONE
-    movz x0, #0x77
+    mov  x8, #2                            // SYS_EXIT(U4_EXIT_STATUS) -> EL0_U4_DONE
+    movz x0, #0x74
     svc  #0
-4:  b 4b                                   // sys_exit never returns; belt-and-braces guard
+2:  b 2b                                   // sys_exit never returns; belt-and-braces guard
+
+    // The ownership negative: sys_wait a handle it never installed.
     .balign 4
-    .globl __m7_parent_blob_end
-__m7_parent_blob_end:
+    .globl __u4_prog_orphan
+__u4_prog_orphan:
+    mov  x0, #0                            // SYS_WAIT(handle #0) — Empty in its OWN never-spawned table
+    mov  x8, #9
+    svc  #0
+    mov  x1, xzr                           // report = 0
+    cmn  x0, #10                           // x0 == -ECHILD (-10)?  (x0 + 10 == 0 -> Z)
+    cinc x1, x1, eq                        // saw -ECHILD -> report = 1 (structural ownership enforced)
+    mov  x0, x1                            // SYS_REPORT(1 iff -ECHILD, else 0)
+    mov  x8, #3
+    svc  #0
+    mov  x8, #2                            // SYS_EXIT(U4_EXIT_STATUS) -> EL0_U4_DONE
+    movz x0, #0x74
+    svc  #0
+3:  b 3b                                   // sys_exit never returns; belt-and-braces guard
+    .balign 4
+    .globl __u4_blob_end
+__u4_blob_end:
 "#
 );
 
 unsafe extern "C" {
-    static __m7_parent_blob_start: u8;
-    static __m7_parent_blob_end: u8;
-    static __m7_prog_parent: u8;
+    static __u4_blob_start: u8;
+    static __u4_blob_end: u8;
+    static __u4_prog_parent: u8;
+    static __u4_prog_orphan: u8;
 }
 
 /// The `hello` EL0 program (M6c), built as a SEPARATE link product (`crates/user-blob`) and baked in
@@ -583,13 +621,15 @@ static EL0_M6G_KILLED: AtomicU32 = AtomicU32::new(0);
 static M6F_VERDICT_PRINTED: AtomicBool = AtomicBool::new(false);
 
 // =============================================================================================
-// M7 accounting — a minimal process model: sys_spawn (load+run a child from storage) + sys_wait (reap it)
+// U4 accounting — the process model + per-process handle table: sys_spawn (load+run a child from storage,
+// return a HANDLE into the caller's table) + sys_wait (reap the child a handle refers to). Evolves M7.
 // =============================================================================================
 
-/// Set when `m6g_loader` returns (every path). The M7 launcher gates on this so (a) all M6g lines print
-/// FIRST — ordering — and (b) the M6d/M6f/M6g slots have freed (their tasks exited), so the parent's and
-/// child's slot allocations succeed. (M6d + M6f hold all 8 slots when the BSP wires the demo; they free as
-/// their fixtures exit, so M7's slots can only be claimed at run-time, after this gate — see `m7_launcher`.)
+/// Set when `m6g_loader` returns (every path). The U4 launcher gates on this so (a) all M6g lines print
+/// FIRST — ordering — and (b) the M6d/M6f/M6g slots have freed (their tasks exited), so the parent's, the
+/// orphan's, and the children's slot allocations succeed. (M6d + M6f hold all 8 slots when the BSP wires the
+/// demo; they free as their fixtures exit, so U4's slots can only be claimed at run-time, after this gate —
+/// see `u4_launcher`.)
 static M6G_LOADER_DONE: AtomicBool = AtomicBool::new(false);
 
 /// A spawned child's exit STATUS is stored valid once `state == PEXITED`.
@@ -623,14 +663,20 @@ static PROCS: [Proc; MAX_PROCS] = [const {
     }
 }; MAX_PROCS];
 
-/// The parent's WITNESS (reported via SYS_REPORT): the reaped child's pid iff the reap succeeded with exit
-/// status 0, else 0. `m7_launcher`'s verdict demands it be a non-zero pid (and `EL0_M7_KILLED == 0`).
-static M7_PARENT_WITNESS: AtomicU64 = AtomicU64::new(0);
-/// The parent reached its `0x77` sentinel exit (the demo's completion signal; want 1). Read by the verdict.
-static EL0_M7_DONE: AtomicU32 = AtomicU32::new(0);
-/// A killed M7 task (child or parent) — a real bug (the child is well-behaved; a kill fails the verdict).
-/// Kept OFF the M6b `killed_unexpected` counter (see `record_el0_kill`) so an M7 failure is its own FAIL.
-static EL0_M7_KILLED: AtomicU32 = AtomicU32::new(0);
+/// The parent's WITNESS (reported via SYS_REPORT): `U4_WITNESS_TOKEN` (nonzero) iff it reaped BOTH children
+/// by handle with exit status 0, else 0. `u4_launcher`'s verdict demands it be non-zero (and no kill). A
+/// token, not a pid — `sys_spawn` now returns a handle, so the verdict only needs non-zero-means-both-ok.
+static U4_PARENT_WITNESS: AtomicU64 = AtomicU64::new(0);
+/// The ownership NEGATIVE result: 1 iff `el0-u4orphan`'s `sys_wait(0)` on an Empty handle returned exactly
+/// `-ECHILD` (structural ownership enforced — it holds no such handle), else 0. Read by the verdict.
+static U4_ORPHAN_ECHILD: AtomicU32 = AtomicU32::new(0);
+/// The U4 fixtures (parent + orphan) that reached their `0x74` sentinel exit (the completion signal; want 2).
+/// Read by the verdict, which waits for both before judging.
+static EL0_U4_DONE: AtomicU32 = AtomicU32::new(0);
+/// A killed U4 task (a child, the parent, or the orphan) — a real bug (the children are well-behaved; a kill
+/// fails the verdict). Kept OFF the M6b `killed_unexpected` counter (see `record_el0_kill`) so a U4 failure is
+/// its own FAIL.
+static EL0_U4_KILLED: AtomicU32 = AtomicU32::new(0);
 
 /// Claim a FREE Proc entry, returning its index. CAS on `state` (FREE->RUNNING) is the atomic ownership
 /// token; the pid=0 placeholder is overwritten with the real child pid (Release) by the caller AFTER the
@@ -673,11 +719,104 @@ fn proc_free(i: usize) {
     PROCS[i].state.store(PFREE, Ordering::Release);
 }
 
-/// M7: record the value the process-model PARENT reported via SYS_REPORT (its witness). Keyed by name like
-/// `m6d_report`/`m6f_report`; the SYS_REPORT arm calls all three and each ignores the others' tasks.
-fn m7_report(value: u64) {
-    if super::sched::current_name() == Some("el0-m7parent") {
-        M7_PARENT_WITNESS.store(value, Ordering::Release);
+// ---------------------------------------------------------------------------------------------
+// U4 Part A — the per-process handle table (keyed by ASID; the ownership namespace)
+// ---------------------------------------------------------------------------------------------
+//
+// A small fixed handle table PER PROCESS, indexed by the process's ASID. Each EL0 process runs in its own
+// M6d slot with a distinct ASID (1..=USER_SLOTS); the shared/boot context is ASID 0 (a valid but
+// unused-by-U4 index — U4's fixtures each run in their OWN slot, so their tables are `HANDLES[asid >= 1]`).
+// A handle value is `0` when Empty; otherwise it is the CHILD task id (pid) the handle refers to — the key
+// into `PROCS`. So the two structures are deliberately SEPARATE and complementary: `PROCS` is keyed by pid
+// (the process control blocks: exit `status`/`state`/`done`), `HANDLES` is keyed by ASID (the spawner's
+// private namespace of child capabilities). Static, const-init, no heap — the `PROCS` discipline.
+//
+// Single-writer invariant: exactly one live task runs under any given ASID (one task per slot; a slot is
+// torn down before it can be reused), and that task's syscalls are serialized (one SVC at a time), so a
+// given `HANDLES[asid]` ROW is only ever touched by its own task. The atomics carry memory-ordering
+// (publish the pid store with Release; a later handle read Acquires it), not cross-task contention.
+//
+// SCOPE NOTE (deferred to U5): a row is NOT cleared when its slot/ASID is torn down (teardown lives in
+// `boot.rs`, out of this arc's lane). U4 relies on reapers CONSUMING their handles (`sys_wait` clears on
+// reap) — so a well-behaved process leaves an empty row at exit, and the U4 demo is clean by construction
+// (the parent reaps both children; the orphan spawns nothing; parent/orphan/children hold DISTINCT ASIDs
+// while alive, and only the parent ever WRITES a row). A process that exits with UN-reaped handles would
+// leave stale entries a future ASID-reuse could observe — harmless today (nothing reuses a row it did not
+// write) but a real lifecycle concern once processes churn slots freely. That belongs to U5, which owns
+// handle lifecycle (revoke / teardown-clear) alongside the capability CHECK it adds at this same lookup.
+const NHANDLE: usize = 8; // handle slots per process (small, static — like MAX_PROCS)
+/// `RESERVING` marks a handle slot claimed by an in-flight `sys_spawn` before the real child pid is known
+/// (0 = Empty would let a re-scan re-claim it; a real pid is never `u64::MAX`). Overwritten with the pid
+/// once the child is spawned, or cleared if the load fails — never observed by any other task (single-writer).
+const HANDLE_RESERVING: u64 = u64::MAX;
+static HANDLES: [[AtomicU64; NHANDLE]; super::boot::USER_SLOTS + 1] =
+    [const { [const { AtomicU64::new(0) }; NHANDLE] }; super::boot::USER_SLOTS + 1];
+
+/// The ASID of the address space the caller is running in, read from `TTBR0_EL1[63:48]`. A syscall executes
+/// with the caller's `TTBR0_EL1` live (M6d), so this names the CALLER's per-process handle table. Read
+/// SYNCHRONOUSLY inside the SVC handler — resolving a handle against the wrong ASID would reap the wrong
+/// child or spuriously `-ECHILD`. (Placed with the handle helpers it serves; the asm-wrapper twin of
+/// `remask_irq`.)
+#[inline]
+fn current_asid() -> u64 {
+    let ttbr0: u64;
+    // SAFETY: a plain read of a system register; no memory access, no clobber.
+    unsafe { core::arch::asm!("mrs {}, TTBR0_EL1", out(reg) ttbr0, options(nomem, nostack, preserves_flags)) };
+    ttbr0 >> 48
+}
+
+/// Claim the first Empty slot in `HANDLES[asid]`, storing `pid` (CAS 0->pid), and return its index — the
+/// value `sys_spawn` returns to EL0. `None` if the table is full (-> `-EAGAIN`, never grow it). Mirrors
+/// `proc_reserve`. `asid` is always in range (0..=USER_SLOTS from a 16-bit TTBR0 ASID with USER_SLOTS==8;
+/// debug-asserted). `pid` is `HANDLE_RESERVING` for a pre-spawn reservation, then overwritten with the real
+/// pid via `handle_set` — or the real pid directly.
+fn handle_install(asid: u64, pid: u64) -> Option<usize> {
+    debug_assert!((asid as usize) < HANDLES.len(), "handle_install: asid out of range");
+    let table = &HANDLES[asid as usize];
+    for (i, slot) in table.iter().enumerate() {
+        if slot.compare_exchange(0, pid, Ordering::AcqRel, Ordering::Acquire).is_ok() {
+            return Some(i);
+        }
+    }
+    None
+}
+
+/// Overwrite the pid stored at `HANDLES[asid][idx]` (Release) — used to replace a `HANDLE_RESERVING`
+/// placeholder with the real child pid once `sys_spawn` has it.
+fn handle_set(asid: u64, idx: usize, pid: u64) {
+    debug_assert!((asid as usize) < HANDLES.len() && idx < NHANDLE, "handle_set: out of range");
+    HANDLES[asid as usize][idx].store(pid, Ordering::Release);
+}
+
+/// The pid at `HANDLES[asid][idx]`, or `None` if the index is out of range or the slot is Empty (0) — i.e.
+/// the caller holds no such child handle (structural ownership: `-ECHILD`). A `HANDLE_RESERVING` placeholder
+/// can never be seen here (single-writer: the same task is not concurrently spawning and waiting).
+fn handle_get(asid: u64, idx: usize) -> Option<u64> {
+    if idx >= NHANDLE {
+        return None;
+    }
+    debug_assert!((asid as usize) < HANDLES.len(), "handle_get: asid out of range");
+    match HANDLES[asid as usize][idx].load(Ordering::Acquire) {
+        0 => None,
+        pid => Some(pid),
+    }
+}
+
+/// Clear (0 = Empty) the handle at `HANDLES[asid][idx]` — the handle is consumed when its child is reaped in
+/// `sys_wait`, or released when a failed `sys_spawn` unwinds its reservation.
+fn handle_clear(asid: u64, idx: usize) {
+    debug_assert!((asid as usize) < HANDLES.len() && idx < NHANDLE, "handle_clear: out of range");
+    HANDLES[asid as usize][idx].store(0, Ordering::Release);
+}
+
+/// U4: record a value a process-model fixture reported via SYS_REPORT, keyed by the reporting task's name —
+/// the PARENT's witness token and the ORPHAN's ownership result. Keyed by name like `m6d_report`/`m6f_report`;
+/// the SYS_REPORT arm calls all three and each ignores the others' tasks.
+fn u4_report(value: u64) {
+    match super::sched::current_name() {
+        Some("el0-u4parent") => U4_PARENT_WITNESS.store(value, Ordering::Release),
+        Some("el0-u4orphan") => U4_ORPHAN_ECHILD.store(value as u32, Ordering::Release),
+        _ => {} // a stray report from any other task is ignored (never happens in the demo)
     }
 }
 
@@ -852,17 +991,18 @@ pub fn record_el0_kill(name: &str, ec: u64, far: u64, far_valid: bool) {
         EL0_M6G_KILLED.fetch_add(1, Ordering::AcqRel);
         return;
     }
-    // M7: a killed process-model task (the spawned CHILD or the PARENT). Off the M6b counter — a kill here
-    // is a real M7 bug that fails the M7 verdict, not a phantom M6b regression. For a killed CHILD, also post
-    // its Proc `done` (with a non-zero sentinel status) so the parent's blocked `sys_wait` WAKES instead of
-    // hanging — the child never reaches its own SYS_EXIT post. `current_id()` is the faulting task (still
-    // current here — see aarch64_el0_fault_handler), i.e. the child's pid = its Proc key.
-    if name == "m7-child" || name == "el0-m7parent" {
-        EL0_M7_KILLED.fetch_add(1, Ordering::AcqRel);
-        if name == "m7-child" {
+    // U4: a killed process-model task (a spawned CHILD, the PARENT, or the ORPHAN). Off the M6b counter — a
+    // kill here is a real U4 bug that fails the U4 verdict, not a phantom M6b regression. For a killed CHILD,
+    // also post its Proc `done` (with a non-zero sentinel status) so the parent's blocked `sys_wait` WAKES
+    // instead of hanging — the child never reaches its own SYS_EXIT post. `current_id()` is the faulting task
+    // (still current here — see aarch64_el0_fault_handler), i.e. the child's pid = its Proc key. (The parent
+    // and orphan are not in PROCS — they were spawned by the launcher, not by sys_spawn — so no Proc post.)
+    if name == "u4-child" || name == "el0-u4parent" || name == "el0-u4orphan" {
+        EL0_U4_KILLED.fetch_add(1, Ordering::AcqRel);
+        if name == "u4-child" {
             if let Some(id) = super::sched::current_id() {
                 if let Some(i) = proc_find_running(id) {
-                    PROCS[i].status.store(M7_KILLED_STATUS, Ordering::Release);
+                    PROCS[i].status.store(U4_KILLED_STATUS, Ordering::Release);
                     PROCS[i].state.store(PEXITED, Ordering::Release);
                     PROCS[i].done.post();
                 }
@@ -1242,10 +1382,10 @@ extern "C" fn aarch64_svc_handler(frame: *mut u64) {
         SYS_WRITE => sys_write(a0, a1, a2),
         SYS_REPORT => {
             // Route by the reporting task's name: M6d names land in m6d_report, M6f names in m6f_report, the
-            // M7 parent in m7_report; each ignores the others' names, so calling all is safe and additive.
+            // U4 parent/orphan in u4_report; each ignores the others' names, so calling all is safe and additive.
             m6d_report(a0);
             m6f_report(a0);
-            m7_report(a0);
+            u4_report(a0);
             0
         }
         SYS_YIELD => sys_yield(),
@@ -1262,9 +1402,10 @@ extern "C" fn aarch64_svc_handler(frame: *mut u64) {
             // sentinel exit would land in EL0_EXITED_ERR and FAIL the M6b verdict). Otherwise: status 0 =
             // normal completion (hello); nonzero = a fault-test program self-reporting that its intended
             // fault never happened (survivor protocol).
-            // M7: a spawned CHILD's exit is reaped by its parent's sys_wait through the Proc table, keyed by
-            // pid — NOT by any counter. This precedes every check below (the same precedence rule) and
-            // SHORT-CIRCUITS to sched::exit() so the child's status-0 exit never lands in EL0_EXITED_OK
+            // U4: a spawned CHILD's exit is reaped by its parent's sys_wait through the Proc table, keyed by
+            // pid — NOT by any counter, and NOT by the handle (the handle is the parent's-side namespace; the
+            // child's exit accounting is pid-keyed). This precedes every check below (the same precedence rule)
+            // and SHORT-CIRCUITS to sched::exit() so the child's status-0 exit never lands in EL0_EXITED_OK
             // (M6b's `exited=1`) nor any sentinel counter. Record status + EXITED, then post `done` so the
             // (blocked or soon-to-block) parent's sys_wait wakes and reads the status. current_id() is the
             // exiting child = its Proc key (stored by sys_spawn before the child could ever be dispatched).
@@ -1291,8 +1432,8 @@ extern "C" fn aarch64_svc_handler(frame: *mut u64) {
                 EL0_M6D_DONE.fetch_add(1, Ordering::AcqRel);
             } else if a0 == M6F_EXIT_STATUS {
                 EL0_M6F_DONE.fetch_add(1, Ordering::AcqRel);
-            } else if a0 == M7_EXIT_STATUS {
-                EL0_M7_DONE.fetch_add(1, Ordering::AcqRel);
+            } else if a0 == U4_EXIT_STATUS {
+                EL0_U4_DONE.fetch_add(1, Ordering::AcqRel);
             } else if a0 == 0 {
                 EL0_EXITED_OK.fetch_add(1, Ordering::AcqRel);
             } else {
@@ -1506,7 +1647,7 @@ fn m6f_report(value: u64) {
 }
 
 // =============================================================================================
-// M7: sys_spawn (load+run a child from storage) + sys_wait (block-reap) + the shared loader core
+// U4: sys_spawn (load+run a child from storage, return a HANDLE) + sys_wait (reap by handle) + shared loader
 // =============================================================================================
 
 // Negative errnos returned to EL0 by sys_spawn/sys_wait (Linux-aarch64 values). These never appear in the
@@ -1556,7 +1697,7 @@ fn spawn_errno(e: &SpawnErr) -> i64 {
 /// The shared loader CORE for both `m6g_loader` and `sys_spawn`: mount the FAT volume off the SD card, find
 /// and size-check the fixed program (`HELLO.BIN`), read it, copy it into a FRESH per-task slot's code page,
 /// I-cache-sync, protect the page EL0-RX/EL1-RO BEFORE any task exists, and return the run parameters. It
-/// PRINTS NOTHING (so sys_spawn stays silent inside the M7 flow) — the M6g loader reconstructs its serial
+/// PRINTS NOTHING (so sys_spawn stays silent inside the U4 flow) — the M6g loader reconstructs its serial
 /// lines from the `Loaded`/`SpawnErr` result.
 ///
 /// The slot is allocated LAST — after every fallible step (mount/find/size/read) — so no failure path ever
@@ -1597,46 +1738,67 @@ fn load_program_into_slot() -> Result<Loaded, SpawnErr> {
     })
 }
 
-/// SYS_SPAWN(): load the fixed on-disk program (`HELLO.BIN`) into a fresh slot and run it at EL0 as a CHILD
-/// of the caller; return the child's pid, or a negative errno. No arguments this arc — the program is fixed;
-/// arbitrary program-by-name is M8 (it needs a validated `copy_from_user` name, a STOP tripwire here).
+/// SYS_SPAWN(): load the fixed on-disk program (`HELLO.BIN`) into a fresh slot, run it at EL0 as a CHILD of
+/// the caller, and return a HANDLE index into the CALLER's per-process handle table (U4 — not the raw pid),
+/// or a negative errno. The handle IS the ownership token: `sys_wait` takes it, and it can only be reaped by
+/// a caller whose table holds it. No arguments this arc — the program is fixed; arbitrary program-by-name is
+/// M8 (it needs a validated `copy_from_user` name, a STOP tripwire here).
 ///
 /// Race-freedom (the child cannot exit before its pid is recorded): the whole SVC handler runs IRQ-masked and
 /// the CHILD is co-located on the CALLER's core, so the child stays queued-not-dispatched until the parent
-/// yields (which it does only later, in sys_wait). We (1) claim a Proc entry, (2) load the program, (3) spawn
-/// the child (queued, not run), (4) store its real pid with Release — all before returning to EL0, hence
-/// strictly before the parent can yield and let the child run. The child's exit/kill lookup therefore always
-/// observes the stored pid. This co-location invariant is load-bearing and QEMU-true (no sched change needed).
+/// yields (which it does only later, in sys_wait). We (1) claim a Proc entry, (2) reserve a handle slot in the
+/// caller's table, (3) load the program, (4) spawn the child (queued, not run), (5) store its real pid with
+/// Release into BOTH the Proc entry and the handle slot — all before returning to EL0, hence strictly before
+/// the parent can yield and let the child run. The child's exit/kill lookup therefore always observes the
+/// stored Proc pid. This co-location invariant is load-bearing and QEMU-true (no sched change needed). The
+/// handle slot is reserved BEFORE the load so a full handle table fails cleanly with nothing to un-spawn.
 fn sys_spawn() -> i64 {
     // Gate: we need a block device to load the child off. -ENODEV so a no-SD boot fails the spawn cleanly.
     if crate::drivers::block::info().is_none() {
         return ENODEV;
     }
+    // The CALLER's ASID names its per-process handle table — read synchronously here, where the caller's
+    // TTBR0 is live (sys_spawn installs into and sys_wait resolves from the SAME table, since both run as
+    // the parent).
+    let asid = current_asid();
     // Claim the Proc entry FIRST, so a failed load frees nothing but the entry, and (crucially) so the pid
     // slot exists to receive the real pid before the child can be dispatched.
     let Some(i) = proc_reserve() else {
         return EAGAIN; // process table full
     };
+    // Reserve a HANDLE slot in the caller's table BEFORE spawning (a RESERVING placeholder, overwritten with
+    // the real pid below). A full handle table fails here with only the Proc entry to release — no child has
+    // been loaded or spawned yet, so there is nothing to un-spawn.
+    let Some(h) = handle_install(asid, HANDLE_RESERVING) else {
+        proc_free(i);
+        return EAGAIN; // handle table full
+    };
     let loaded = match load_program_into_slot() {
         Ok(l) => l,
         Err(e) => {
-            proc_free(i); // no slot was allocated on any failure path — just release the entry
+            handle_clear(asid, h); // release the reserved handle slot
+            proc_free(i); // no address-space slot was allocated on any load-failure path — release the entry
             return spawn_errno(&e);
         }
     };
     // Co-locate the child on the caller's core (the invariant above): sys_spawn always runs with its EL0
     // caller current, so `this_cpu` is the parent's core.
     let cpu = super::percpu::this_cpu().cpu_index as usize;
-    let pid = super::sched::spawn_user_slot("m7-child", loaded.base, loaded.sp, loaded.ttbr0, cpu);
-    // Record the real pid (Release) BEFORE returning to EL0 — before the parent can yield and let the child
-    // run. The child's exit path (proc_find_running) is guaranteed to see this.
+    let pid = super::sched::spawn_user_slot("u4-child", loaded.base, loaded.sp, loaded.ttbr0, cpu);
+    // Record the real pid (Release) into BOTH the Proc entry (pid-keyed exit accounting) and the reserved
+    // handle slot (ASID-keyed ownership namespace) BEFORE returning to EL0 — before the parent can yield and
+    // let the child run. The child's exit path sees the Proc pid; the parent's later sys_wait resolves the
+    // handle to it.
     PROCS[i].pid.store(pid, Ordering::Release);
-    pid as i64
+    handle_set(asid, h, pid);
+    h as i64 // return the HANDLE index (per-process; two processes can each hold handle 0 to different children)
 }
 
-/// SYS_WAIT(pid): block the caller until its child `pid` exits, then return the child's exit status (or
-/// `-ECHILD` if it has no such child). The waker is the child's `done.post()` — a SCHEDULER wake (from the
-/// child's SYS_EXIT or its kill path), so this works under QEMU (unlike a timer-driven sleep).
+/// SYS_WAIT(handle): block the caller until the child its `handle` refers to exits, then return the child's
+/// exit status — or `-ECHILD` if that handle is not in the CALLER's table (out-of-range or Empty). Structural
+/// ownership: you can only reap a child whose handle is in YOUR table; a foreign or stale handle simply isn't
+/// there. The waker is the child's `done.post()` — a SCHEDULER wake (from the child's SYS_EXIT or its kill
+/// path), so this works under QEMU (unlike a timer-driven sleep).
 ///
 /// We wait on `done` UNCONDITIONALLY (not only when the child is still RUNNING): the child posts `done`
 /// exactly once (exit or kill), so waiting once either fast-returns a permit the child already left (child
@@ -1644,9 +1806,18 @@ fn sys_spawn() -> i64 {
 /// so the reaped entry's semaphore returns to 0 permits and is clean for reuse — the balance the process
 /// table relies on. (Under QEMU the child, co-located, cannot run until we block here, so it is always the
 /// park path; the fast path is the metal case where a timer preempts the parent between spawn and wait.)
-fn sys_wait(pid: u64) -> i64 {
-    let Some(i) = proc_find_child(pid) else {
+///
+/// The handle is CONSUMED by the reap (`handle_clear`), so a second `sys_wait` on the same handle returns
+/// `-ECHILD` (Empty) — correct. `PROCS` stays keyed by pid (exit accounting); `HANDLES` by ASID (ownership).
+fn sys_wait(handle: u64) -> i64 {
+    let asid = current_asid();
+    // Resolve the handle against the CALLER's OWN table — the structural ownership check. Not in the table
+    // (out-of-range or Empty) => the caller holds no such child => -ECHILD.
+    let Some(pid) = handle_get(asid, handle as usize) else {
         return ECHILD;
+    };
+    let Some(i) = proc_find_child(pid) else {
+        return ECHILD; // the handle named a pid with no Proc entry (defensive; cannot happen in the demo)
     };
     let woken = PROCS[i].done.wait();
     debug_assert!(woken, "sys_wait: called off a scheduled task");
@@ -1655,7 +1826,8 @@ fn sys_wait(pid: u64) -> i64 {
     // I-masked regardless of any future change to wait()'s IRQ discipline (the sys_yield/sys_sleep contract).
     remask_irq();
     let status = PROCS[i].status.load(Ordering::Acquire) as i64;
-    proc_free(i); // reap: the entry is now free for reuse (its `done` is back at 0 permits)
+    proc_free(i); // reap the Proc entry (its `done` is back at 0 permits, free for reuse)
+    handle_clear(asid, handle as usize); // consume the handle: a second sys_wait on it now returns -ECHILD
     status
 }
 
@@ -1677,9 +1849,9 @@ fn sys_wait(pid: u64) -> i64 {
 /// missing SD device / FAT volume / file / oversize logs one clean skip line and returns.
 pub fn m6g_loader(arg: usize) {
     m6g_loader_run(arg);
-    // Release the M7 gate: by here every M6g line has printed AND the M6d/M6f/M6g slots have freed (their
-    // tasks exited), so the M7 launcher may build the parent + child. Set on EVERY path (load / skip / no-SD)
-    // so the launcher never waits out its deadline; the launcher separately re-checks for an SD device.
+    // Release the U4 gate: by here every M6g line has printed AND the M6d/M6f/M6g slots have freed (their
+    // tasks exited), so the U4 launcher may build the parent + orphan + children. Set on EVERY path (load /
+    // skip / no-SD) so the launcher never waits out its deadline; the launcher separately re-checks for an SD.
     M6G_LOADER_DONE.store(true, Ordering::Release);
 }
 
@@ -1707,7 +1879,7 @@ fn m6g_loader_run(_: usize) {
     }
 
     // 3-6. Load HELLO.BIN into a fresh slot via the shared core, then reproduce M6g's EXACT serial lines
-    //      from the result (the core is silent so sys_spawn stays quiet inside the M7 flow). Every skip path
+    //      from the result (the core is silent so sys_spawn stays quiet inside the U4 flow). Every skip path
     //      first echoes the "FAT mounted from SD (..)" progress line (mirroring the original mid-flow print)
     //      so the M6g gate is byte-identical. On success: emit the two M6g lines then drop the program to
     //      EL0 on THIS core (the loader's), so the folded verdict's cooperative yield guarantees dispatch.
@@ -1784,64 +1956,94 @@ fn m6g_loader_run(_: usize) {
 }
 
 // =============================================================================================
-// M7: the process-model demo — the parent's slot + the gated launcher/verdict
+// U4: the process-model demo — the parent + orphan slots + the gated launcher/verdict
 // =============================================================================================
 
-/// The M7 parent's run parameters: its EL0 entry VA, initial SP_EL0, and slot TTBR0. (One task, one slot —
-/// unlike the M6d/M6f multi-slot demos.)
-struct M7Demo {
+/// The U4 fixtures' run parameters: the parent's and the orphan's EL0 entry VAs (both inside the shared
+/// window VA — only the slot FRAME differs, via TTBR0), the shared initial SP_EL0, and each fixture's slot
+/// TTBR0. Two tasks, two slots (with DISTINCT ASIDs — the isolation the ownership negative proves).
+struct U4Demo {
     parent: u64,
+    orphan: u64,
     sp: u64,
-    ttbr0: u64,
+    ttbr0_parent: u64,
+    ttbr0_orphan: u64,
 }
 
-/// M7 setup: reserve the Proc semaphores, then allocate + build the PARENT's slot, copy the parent fixture
-/// into it, I-cache-sync, and protect the code page (EL0-RX/EL1-RO). Emits the M7 setup line; returns the
-/// parent's entry/sp/ttbr0. `None` if slot allocation fails. Called ONCE, from `m7_launcher`, AFTER the M6g
-/// gate — so the M6d/M6f/M6g slots have freed (at BSP-wiring time all 8 are held by M6d+M6f) and strictly
-/// before the parent (hence any child) exists, which is why the `done.init()` reservations here cannot race
-/// a concurrent wait/post (the M4 discipline, satisfied without needing the BSP specifically).
-fn m7_setup() -> Option<M7Demo> {
+/// U4 setup: reserve the Proc semaphores, then allocate + build TWO private slots (parent + orphan) via the
+/// unwinding `alloc_user_slots`, copy the U4 blob (both fixtures) into each slot's code page, I-cache-sync,
+/// and protect each code page (EL0-RX/EL1-RO). Emits the U4 setup line; returns both entries + slot roots.
+/// `None` if slot allocation fails (the whole request is released, not leaked). Called ONCE, from
+/// `u4_launcher`, AFTER the M6g gate — so the M6d/M6f/M6g slots have freed (at BSP-wiring time all 8 are held
+/// by M6d+M6f) and strictly before the parent (hence any child) exists, which is why the `done.init()`
+/// reservations here cannot race a concurrent wait/post (the M4 discipline).
+///
+/// The parent and orphan get DISTINCT slots (hence distinct ASIDs), so their per-process handle tables are
+/// distinct rows of `HANDLES` — the substrate the negative proves: handle #0 means the parent's child A in
+/// the parent's table, and Empty in the orphan's.
+fn u4_setup() -> Option<U4Demo> {
     for p in &PROCS {
         p.done.init();
     }
     let (base, size) = super::boot::user_region();
-    let sp = (base + size as u64) & !0xF; // 16-aligned window top = initial SP_EL0
-    let bstart = &raw const __m7_parent_blob_start as usize;
-    let bend = &raw const __m7_parent_blob_end as usize;
+    let sp = (base + size as u64) & !0xF; // 16-aligned window top = shared initial SP_EL0
+    let bstart = &raw const __u4_blob_start as usize;
+    let bend = &raw const __u4_blob_end as usize;
     let blen = bend - bstart;
-    assert!(blen <= super::boot::USER_CODE_SIZE, "M7 parent blob does not fit in a code page");
-    // Entry VA = base + the parent fixture's offset within the blob (an eret to a misaligned entry is EC 0x22).
-    let parent = base + (&raw const __m7_prog_parent as usize - bstart) as u64;
-    assert!(parent & 3 == 0, "M7 parent entry misaligned");
+    assert!(blen <= super::boot::USER_CODE_SIZE, "U4 blob does not fit in a code page");
+    // Entry VAs = base + each fixture's offset within the blob (an eret to a misaligned entry is EC 0x22).
+    let entry = |label: *const u8| -> u64 {
+        let va = base + (label as usize - bstart) as u64;
+        assert!(va & 3 == 0, "U4 fixture entry misaligned");
+        va
+    };
+    let parent = entry(&raw const __u4_prog_parent);
+    let orphan = entry(&raw const __u4_prog_orphan);
 
-    let slot = super::boot::alloc_user_slot()?;
-    let backing = super::boot::slot_backing_ptr(slot);
-    // Copy the parent fixture into the slot's code page (identity backing VA) + I-cache sync (DC CVAU/IC IVAU;
-    // PIPT L1 caches make it fetchable at the aliased EL0 window VA), then protect it EL0-RX/EL1-RO.
-    unsafe { core::ptr::copy_nonoverlapping(bstart as *const u8, backing, blen) };
-    super::cache::icache_sync_range(backing as usize, blen);
-    unsafe { super::boot::protect_user_slot_code(slot, super::boot::USER_CODE_SIZE) };
+    // Two slots, released together on partial failure (the M6d/M6f unwind). slots[0] = parent, [1] = orphan.
+    let mut slots = [0usize; 2];
+    if !super::boot::alloc_user_slots(&mut slots) {
+        return None;
+    }
+    // Copy the whole blob into each slot's code page (identity backing VA) + I-cache sync (DC CVAU/IC IVAU;
+    // PIPT L1 caches make it fetchable at the aliased EL0 window VA), then protect each EL0-RX/EL1-RO.
+    for &s in &slots {
+        let backing = super::boot::slot_backing_ptr(s);
+        unsafe { core::ptr::copy_nonoverlapping(bstart as *const u8, backing, blen) };
+        super::cache::icache_sync_range(backing as usize, blen);
+    }
+    for &s in &slots {
+        unsafe { super::boot::protect_user_slot_code(s, super::boot::USER_CODE_SIZE) };
+    }
 
     serial_println!(
-        ":: M7: process model — sys_spawn + sys_wait (parent reaps a disk-loaded child) ::"
+        ":: U4: process model — per-process handle table (sys_spawn->handle, sys_wait(handle)) ::"
     );
-    Some(M7Demo { parent, sp, ttbr0: super::boot::slot_ttbr0(slot) })
+    Some(U4Demo {
+        parent,
+        orphan,
+        sp,
+        ttbr0_parent: super::boot::slot_ttbr0(slots[0]),
+        ttbr0_orphan: super::boot::slot_ttbr0(slots[1]),
+    })
 }
 
-/// M7 launcher + verdict (the M6g-loader shape: one gated kernel task). Spawned on a scheduled sibling core;
-/// `parent_cpu` (the task arg) is the demo core the parent should run on. Flow:
+/// U4 launcher + verdict (the M6g-loader shape: one gated kernel task). Spawned on a scheduled sibling core;
+/// `demo_cpu` (the task arg) is the demo core the parent + orphan run on. Flow:
 ///   1. Wait (bounded) for `M6G_LOADER_DONE`, so all M6g lines print first AND the slots have freed.
-///   2. Skip silently if no SD device (the parent's sys_spawn loads the child off the card — nothing to run).
-///   3. `m7_setup()` (build the parent's slot, print the M7 setup line), then spawn the parent on `parent_cpu`.
-///      The parent's `sys_spawn` co-locates the CHILD on `parent_cpu` too — the invariant that keeps the child
-///      queued-not-dispatched until the parent blocks in sys_wait (so the child's pid is recorded first).
-///   4. Verdict (folded): wait (bounded CNTPCT) for the parent to finish its spawn→wait→report→exit
-///      round-trip, then PASS iff the parent reaped a real child (witness = a non-zero pid) with no kill.
-/// The three M7 lines (setup, the child's `hello from EL0` — the THIRD in a full boot — and the PASS) all
-/// land after the M6g lines and in that order (setup precedes the parent spawn; the child's hello precedes
-/// the parent's exit, which precedes EL0_M7_DONE, which the verdict polls before printing PASS).
-pub fn m7_launcher(parent_cpu: usize) {
+///   2. Skip silently if no SD device (the parent's sys_spawn loads the children off the card — nothing to run).
+///   3. `u4_setup()` (build both slots, print the U4 setup line), then spawn the parent AND the orphan on
+///      `demo_cpu`. The parent's two `sys_spawn`s co-locate BOTH children on `demo_cpu` too — the invariant
+///      that keeps each child queued-not-dispatched until the parent blocks in sys_wait (so both pids are
+///      recorded first; load-bearing for two children exactly as M7's was for one). The orphan's
+///      `sys_wait(0)` returns immediately (-ECHILD), so it never parks — no deadlock with the co-located work.
+///   4. Verdict (folded): wait (bounded CNTPCT) for BOTH fixtures to reach their sentinel exit
+///      (`EL0_U4_DONE == 2`), then PASS iff the parent reaped both children (witness non-zero) AND the orphan
+///      saw -ECHILD (ownership enforced) AND no U4 task was killed. Prints ONE PASS line.
+/// The U4 lines (setup, the two children's `hello from EL0` — the THIRD and FOURTH in a full boot — and the
+/// PASS) all land after the M6g lines and in that order (setup precedes the spawns; the children's hellos
+/// precede the parent's exit, which precedes EL0_U4_DONE reaching 2, which the verdict polls before PASS).
+pub fn u4_launcher(demo_cpu: usize) {
     // 1. Gate on the M6g loader (its lines printed + its/M6d's/M6f's slots freed).
     let wstart = super::timer::cntpct();
     let wdeadline = 10 * super::timer::cntfrq();
@@ -1857,40 +2059,46 @@ pub fn m7_launcher(parent_cpu: usize) {
         return;
     }
 
-    // 2. No SD device -> the child cannot be loaded; skip silently (keeps the no-SD control path free of M7
-    //    lines, mirroring how M6g's own no-SD path is the empty control).
+    // 2. No SD device -> the children cannot be loaded; skip silently (keeps the no-SD control path free of
+    //    U4 lines, mirroring how M6g's own no-SD path is the empty control).
     if crate::drivers::block::info().is_none() {
         return;
     }
 
-    // 3. Build the parent's slot + spawn it on the demo core.
-    let Some(m7) = m7_setup() else {
-        serial_println!(":: M7: no free address-space slot — process-model demo skipped ::");
+    // 3. Build the parent + orphan slots and spawn both on the demo core.
+    let Some(u4) = u4_setup() else {
+        serial_println!(":: U4: no free address-space slot — process-model demo skipped ::");
         return;
     };
-    super::sched::spawn_user_slot("el0-m7parent", m7.parent, m7.sp, m7.ttbr0, parent_cpu);
+    super::sched::spawn_user_slot("el0-u4parent", u4.parent, u4.sp, u4.ttbr0_parent, demo_cpu);
+    super::sched::spawn_user_slot("el0-u4orphan", u4.orphan, u4.sp, u4.ttbr0_orphan, demo_cpu);
 
-    // 4. Folded verdict: wait (bounded ~5 s, yielding) for the parent to reach its sentinel exit, then judge.
+    // 4. Folded verdict: wait (bounded ~5 s, yielding) for BOTH fixtures to reach their sentinel exit, then
+    //    judge. Two children (two disk loads) + the orphan complete well under this budget under QEMU.
     let vstart = super::timer::cntpct();
     let vdeadline = 5 * super::timer::cntfrq();
-    while EL0_M7_DONE.load(Ordering::Acquire) == 0
+    while EL0_U4_DONE.load(Ordering::Acquire) < 2
         && super::timer::cntpct().wrapping_sub(vstart) <= vdeadline
     {
         super::sched::yield_now();
     }
-    let witness = M7_PARENT_WITNESS.load(Ordering::Acquire);
-    let killed = EL0_M7_KILLED.load(Ordering::Acquire);
-    if witness != 0 && killed == 0 {
+    let witness = U4_PARENT_WITNESS.load(Ordering::Acquire);
+    let orphan = U4_ORPHAN_ECHILD.load(Ordering::Acquire);
+    let killed = EL0_U4_KILLED.load(Ordering::Acquire);
+    // The parent reports the token iff it reaped BOTH children by handle with status 0, else 0 — so
+    // `== U4_WITNESS_TOKEN` is exactly "both reaped OK" (tighter than the M7 `!= 0`, and it pins the
+    // fixture/verdict contract on one constant).
+    if witness == U4_WITNESS_TOKEN && orphan == 1 && killed == 0 {
         serial_println!(
-            ":: M7: parent spawned child pid={}, waited, child exited status 0 -> PASS ::",
-            witness
+            ":: U4: process model — parent reaped 2 children by handle, non-child sys_wait -ECHILD (per-process handle tables) -> PASS ::"
         );
     } else {
         serial_println!(
-            ":: M7: process model FAIL — witness={} killed={} done={} (want pid>0 / 0 / 1) ::",
+            ":: U4: process model FAIL — witness={:#x} orphan_echild={} killed={} done={} (want nonzero / 1 / 0 / 2) ::",
             witness,
+            orphan,
             killed,
-            EL0_M7_DONE.load(Ordering::Acquire)
+            EL0_U4_DONE.load(Ordering::Acquire)
         );
     }
 }

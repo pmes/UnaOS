@@ -175,6 +175,36 @@
   CSD v2`), printed the third `hello from EL0`, and was reaped by the parent's blocking
   `sys_wait` (woken by the child's scheduler post) under a live timer, with the whole prior
   battery green (M6b/M6d/M6e/M6f/M6g + CAPSTONE 6/6) and 0 unexpected faults.
+- **U4** — the process model + **per-process handle table** (roadmap-U4: "PIDs,
+  spawn/wait/exit status, per-process handle table"). Evolves M7 without a new syscall
+  number: **`SYS_SPAWN = 8`** now installs the child into the *spawner's* handle table
+  and returns a small **handle index** (not a raw pid); **`SYS_WAIT = 9`** takes that
+  *handle*. Ownership becomes **structural** — a task can only reap children whose handles
+  are in ITS table, which folds M7's review note (any task could `sys_wait` any pid) by
+  construction. The table is a static, const-init `HANDLES[[AtomicU64; 8]; USER_SLOTS+1]`
+  keyed by the caller's **ASID** (read from `TTBR0_EL1[63:48]` synchronously in the SVC
+  handler — the caller's root is live there); a handle value is the child pid (0 = Empty).
+  `PROCS` stays keyed by pid (the exit-accounting control blocks); `HANDLES` is keyed by
+  ASID (the spawner's private *namespace of child capabilities*) — deliberately separate.
+  `sys_spawn` reserves a handle slot *before* loading (a full table fails `-EAGAIN` with
+  nothing to un-spawn), then stores the real pid into both the `PROCS` entry and the handle
+  slot; `sys_wait` resolves the handle → pid, reaps M7-style, then *consumes* the handle
+  (a second wait on it returns `-ECHILD`). `sys_write` is **left untouched** (routing a
+  resource syscall through a handle is deferred to U5, when there is a capability check to
+  add). The demo evolves the M7 launcher: a parent fixture (`el0-u4parent`) `sys_spawn`s
+  **two** children and reaps **both by handle**, and an ownership negative (`el0-u4orphan`,
+  its own slot/ASID) calls `sys_wait(0)` on an Empty handle and must get `-ECHILD`.
+  QEMU-verified (`./arroyo kernel8-test 30`, in place of the M7 line): the U4 setup line,
+  **four** `hello from EL0` (M6c inline #1, M6g loader #2, the two U4 children #3/#4), and
+  `:: U4: process model — parent reaped 2 children by handle, non-child sys_wait -ECHILD
+  (per-process handle tables) -> PASS ::`, with every M6b/M6c/M6d/M6e/M6f/M6g + CAPSTONE
+  line byte-identical (hex/pid-normalized set-diff: only the M7 line → the U4 line, `hello`
+  3 → 4) and 0 unexpected faults. **No metal this arc** — every piece is scheduler/syscall
+  logic (handle install/resolve/clear, the owner-scoped reap, the `-ECHILD` negative), all
+  deterministic under QEMU raspi4b (the reap wake is a scheduler post, not the timer); the
+  child disk-loads ride the same EMMC2 path M7 already metal-confirmed. This is the exact
+  substrate U5 turns into capabilities (a child handle IS a capability to that process;
+  grant = transfer the handle, revoke = clear it — U5 adds the *check* at this handle lookup).
 - Not yet: an arbitrary program-by-name `sys_spawn` (M8) and a code-signing / allowlist
   gate on the loader (`SECURITY.md`).
 
@@ -302,7 +332,7 @@
 | Per-page perms + fault→kill | U1b ✅ | M6b ✅ |
 | Loadable programs | U2 ✅ (from FAT storage) | M6c ✅ (embedded blob) |
 | Per-process address space | U3 (per-process PML4/CR3) | M6d ✅ (TTBR0 + ASID) |
-| Process model, PIDs, handle table | U4 (arch-neutral) | M7 ✅ (aarch64 `sys_spawn`/`sys_wait`); U4 generalizes |
+| Process model, PIDs, handle table | U4 (x86 port pending) | M7 ✅ → **U4 ✅** (aarch64 `sys_spawn`→handle / `sys_wait`(handle); per-process handle table, owner-scoped reap) |
 | Capabilities at the syscall boundary | U5 (arch-neutral) | U5 |
 | FS-backed grants | U6 (UnaFS attributes) | U6 |
 
@@ -321,8 +351,8 @@ Conventions shared across arches:
   | 5 | `SYS_SLEEP_MS` | ms | 0 | aarch64 M6f — `sleep_ticks` (cooperative yield where no timer IRQ) |
   | 6 | `SYS_GETPID` | — | task id | aarch64 M6f |
   | 7 | `SYS_GETINFO` | ptr | 0 / `-EFAULT` | aarch64 M6f — writes {pid, ticks} via `copy_to_user` |
-  | 8 | `SYS_SPAWN` | — | child pid / `-errno` | aarch64 M7 — loads the fixed `HELLO.BIN` into a fresh slot, runs it at EL0 as a child (arbitrary program-by-name is M8) |
-  | 9 | `SYS_WAIT` | pid | exit status / `-ECHILD` | aarch64 M7 — blocks until the child exits (scheduler wake via the child's `done` post) |
+  | 8 | `SYS_SPAWN` | — | **handle** / `-errno` | aarch64 M7→**U4** — loads the fixed `HELLO.BIN` into a fresh slot, runs it at EL0 as a child, and returns a **handle index into the caller's per-process handle table** (U4 — not the raw pid; arbitrary program-by-name is M8) |
+  | 9 | `SYS_WAIT` | **handle** | exit status / `-ECHILD` | aarch64 M7→**U4** — blocks until the child that *handle* refers to exits (scheduler wake via the child's `done` post); `-ECHILD` if the handle is not in the caller's table (structural ownership) |
 
   aarch64 leads 4–9 (M6f 4–7, M7 8–9); the x86 U-side port adopts the same numbers so
   the arches stay aligned (x86 adds SMAP considerations aarch64's PAN-less A72 lacks).
