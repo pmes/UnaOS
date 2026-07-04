@@ -300,6 +300,35 @@ fn mpidr_affinity() -> u32 {
     ((((mpidr >> 32) & 0xFF) << 24) | (mpidr & 0x00FF_FFFF)) as u32
 }
 
+/// This core's MPIDR affinity in the packed {Aff3,Aff2,Aff1,Aff0} byte form — the value the SMP path
+/// (`smp_virt.rs`) uses both as the PSCI `CPU_ON` target and as the argument to `send_sgi` (see the
+/// affinity note there). On single-cluster boards (QEMU `virt`, Pi 4) this equals the Aff0 core index
+/// with the higher affinity bytes 0; on Tegra234 the cluster is in Aff2/Aff1 and Aff0 is always 0, so
+/// the full packing is load-bearing. GICv3 only (the redistributor/`ICC_SGI1R` model); `pub` for JM5.
+#[cfg(not(feature = "pi"))]
+pub fn this_affinity() -> u32 {
+    mpidr_affinity()
+}
+
+/// The byte stride between adjacent redistributor frames, given one frame's `GICR_TYPER`. QEMU `virt`
+/// is a fixed 2-frame class (RD + SGI = `GICR_STRIDE`); the Tegra234 GIC-600 is a 4-frame class
+/// (RD + SGI + VLPI + reserved), derived at runtime from `GICR_TYPER.VLPIS` (bit 1; bit 0 is PLPIS,
+/// bit 4 is the `Last` marker used by the walk). Factored so both `this_cpu_redistributor` and the
+/// JM5 `enumerate_redistributor_affinities` advance identically.
+#[cfg(not(feature = "pi"))]
+#[inline]
+fn gicr_stride(typer: u64) -> usize {
+    #[cfg(not(feature = "tegra"))]
+    {
+        let _ = typer;
+        GICR_STRIDE
+    }
+    #[cfg(feature = "tegra")]
+    {
+        if typer & (1 << 1) != 0 { 0x4_0000 } else { 0x2_0000 }
+    }
+}
+
 /// Find THIS core's redistributor frame by walking the GICR frames and matching GICR_TYPER's
 /// affinity against MPIDR_EL1. On QEMU virt's UEFI single-core path it's the first frame; the walk
 /// is factored (not cached in a BSP-only static) so JC2's APs each resolve their own. Panics — a
@@ -309,8 +338,6 @@ fn mpidr_affinity() -> u32 {
 #[cfg(not(feature = "pi"))]
 fn this_cpu_redistributor() -> usize {
     let target = mpidr_affinity();
-    // 8 >> the 4 frames QEMU virt `-smp 4` exposes; an Orin cluster count would raise this.
-    const MAX_FRAMES: usize = 8;
     let mut frame = GICR_BASE;
     for _ in 0..MAX_FRAMES {
         let typer = unsafe { gicr_read64(frame, GICR_TYPER) };
@@ -320,24 +347,47 @@ fn this_cpu_redistributor() -> usize {
         if typer & (1 << 4) != 0 {
             panic!("GICv3: no redistributor frame for MPIDR affinity {:#010x}", target);
         }
-        // Advance to the next redistributor. virt uses its fixed 2-frame stride; tegra derives it from
-        // this frame's GICR_TYPER.VLPIS — bit 1 (bit 0 is PLPIS; the Last check above uses bit 4). A
-        // GICv4 4-frame RD (RD+SGI+VLPI+reserved) is 0x4_0000; a 2-frame one is 0x2_0000. (BSP-inert for
-        // JM4 single-core — the boot core matches the first frame before any advance — but correct for
-        // the deferred SMP arc on any redistributor layout.)
-        #[cfg(not(feature = "tegra"))]
-        {
-            frame += GICR_STRIDE;
-        }
-        #[cfg(feature = "tegra")]
-        {
-            frame += if typer & (1 << 1) != 0 { 0x4_0000 } else { 0x2_0000 };
-        }
+        // Advance to the next redistributor (virt fixed 2-frame / tegra VLPIS-derived 2-or-4-frame).
+        // BSP-inert for the single-core boot (the boot core matches the first frame before any advance),
+        // but exercised on metal for the first time by JM5's `enumerate_redistributor_affinities`.
+        frame += gicr_stride(typer);
     }
     panic!(
         "GICv3: redistributor walk exceeded {} frames (no Last bit / wrong stride) for affinity {:#010x}",
         MAX_FRAMES, target
     );
+}
+
+/// Frame cap for a redistributor walk — 8 covers QEMU `virt -smp 4` and the Orin Nano's 6 cores
+/// (matching `percpu::NUM_CPUS`). Shared by `this_cpu_redistributor` and the JM5 enumeration.
+#[cfg(not(feature = "pi"))]
+const MAX_FRAMES: usize = 8;
+
+/// Enumerate every redistributor frame the GIC exposes, recording each frame's `GICR_TYPER` affinity
+/// (packed {Aff3,Aff2,Aff1,Aff0}) into `out` in walk order; returns the count. Metal-truth core
+/// discovery for JM5 SMP: on the Orin the fused core set (and its real cluster affinities) is read
+/// straight from the silicon rather than the firmware DTB (whose `fdt` parse is blocked, task
+/// cde963a7), so this adapts to whatever the board actually is. The walk follows the same
+/// `GICR_TYPER.Last` (bit 4) terminator and `gicr_stride` advance as `this_cpu_redistributor`, and is
+/// bounded by `MAX_FRAMES` and `out.len()` so a GIC that never reports `Last` cannot read past the
+/// mapped redistributor region. This is the first code to walk a *non-first* frame on Orin metal —
+/// i.e. the first exercise of JM4's VLPIS-derived stride. GICv3 only (`pub` for `smp_virt`).
+#[cfg(not(feature = "pi"))]
+pub fn enumerate_redistributor_affinities(out: &mut [u32]) -> usize {
+    let mut frame = GICR_BASE;
+    let mut n = 0usize;
+    for _ in 0..MAX_FRAMES {
+        let typer = unsafe { gicr_read64(frame, GICR_TYPER) };
+        if n < out.len() {
+            out[n] = (typer >> 32) as u32;
+            n += 1;
+        }
+        if typer & (1 << 4) != 0 || n >= out.len() {
+            break; // Last frame, or the caller's buffer is full
+        }
+        frame += gicr_stride(typer);
+    }
+    n
 }
 
 /// Wake this core's redistributor and put all its banked INTIDs (SGIs + PPIs) into Group 1, then
@@ -423,7 +473,10 @@ pub fn init_secondary_v3() {
 fn self_sgi_smoke() {
     // A free SGI INTID: the scheduler's IPI is SGI 0 (smp::IPI_RESCHED); 15 is unused everywhere.
     const SMOKE_SGI: u32 = 15;
-    let self_cpu = (mpidr_affinity() & 0xF) as usize; // Aff0 = this core's target-list bit / GICC id
+    // Target THIS core by its full packed MPIDR affinity (see `send_sgi`): on QEMU `virt` this is Aff0
+    // with the upper bytes 0 (byte-identical to the old `& 0xF`), on Tegra234 it is the real cluster
+    // affinity so the self-SGI lands on the boot core regardless of which cluster it is.
+    let self_target = mpidr_affinity() as usize;
     enable_sgi(SMOKE_SGI);
 
     let before = super::percpu::this_cpu().ipis.load(core::sync::atomic::Ordering::Relaxed);
@@ -432,7 +485,7 @@ fn self_sgi_smoke() {
         let daif: u64;
         core::arch::asm!("mrs {}, DAIF", out(reg) daif, options(nomem, nostack, preserves_flags));
         // Make the SGI pending first, then unmask IRQ so it is taken immediately on the isb.
-        send_sgi(self_cpu, SMOKE_SGI);
+        send_sgi(self_target, SMOKE_SGI);
         core::arch::asm!("msr daifclr, #2", options(nomem, nostack, preserves_flags));
         core::arch::asm!("isb", options(nomem, nostack, preserves_flags));
         // Bounded wait (~100 ms off the free-running CNTPCT, the same window verify_live uses).
@@ -563,12 +616,19 @@ pub fn enable_spi(intid: u32, target_cpu: usize) {
 
 /// GICv3 SPI enable. Group/config/priority/enable stay in the distributor (as v2), but CPU routing
 /// under ARE=1 is by affinity through the 64-bit GICD_IROUTER<n> (0x6000 + 8*n) instead of the v2
-/// ITARGETSR byte. `target_cpu` maps to Aff0 on QEMU virt (higher affinities 0); JC2 / Orin clusters
-/// must widen this to the target's full MPIDR affinity.
+/// ITARGETSR byte. `target` is the destination core's packed MPIDR affinity {Aff3,Aff2,Aff1,Aff0}
+/// (`this_affinity()`); JM5 widens the write from Aff0-only to the full affinity so an SPI routes to
+/// the right core on a multi-cluster SoC. IROUTER packs Aff0[7:0]/Aff1[15:8]/Aff2[23:16]/Aff3[39:32]
+/// with IRM(bit31)=0 (route to one PE). On QEMU `virt` this reduces to Aff0 = core index (byte-identical
+/// to the pre-JM5 write). Not on the JM5 metal path — the sole SPI (PL011 RX) is baremetal/pi-only, so
+/// this v3 arm is correctness-only reuse; carried for a future EL1-hosted-v3 peripheral.
 #[cfg(not(feature = "pi"))]
-fn enable_spi_v3(intid: u32, target_cpu: usize) {
+fn enable_spi_v3(intid: u32, target: usize) {
     let word = (intid / 32) as usize;
     let bit = intid % 32;
+    let aff = target as u64;
+    // packed {Aff3[31:24],Aff2[23:16],Aff1[15:8],Aff0[7:0]} -> IROUTER {Aff3[39:32],Aff2..Aff0[23:0]}.
+    let irouter = (aff & 0x00FF_FFFF) | (((aff >> 24) & 0xFF) << 32);
     unsafe {
         let goff = GICD_IGROUPR + word * 4;
         gicd_write(goff, gicd_read(goff) | (1 << bit)); // Group 1 (deliverable), RMW
@@ -576,39 +636,56 @@ fn enable_spi_v3(intid: u32, target_cpu: usize) {
         let cshift = (intid % 16) * 2;
         gicd_write(coff, gicd_read(coff) & !(0b11 << cshift)); // level-sensitive, RMW
         core::ptr::write_volatile((GICD_BASE + GICD_IPRIORITYR + intid as usize) as *mut u8, 0x00);
-        core::ptr::write_volatile((GICD_BASE + GICD_IROUTER + intid as usize * 8) as *mut u64, (target_cpu as u64) & 0xF);
+        core::ptr::write_volatile((GICD_BASE + GICD_IROUTER + intid as usize * 8) as *mut u64, irouter);
         gicd_write(GICD_ISENABLER + word * 4, 1 << bit);
         core::arch::asm!("dsb sy", options(nostack, preserves_flags));
     }
 }
 
-/// Send SGI `intid` (0-15) to core `target_cpu` (its GIC CPU-interface number, which equals the
-/// core index on the Pi 4). The `DSB` publishes any memory the target will read on wake before the
-/// interrupt is raised. TargetListFilter=0b00 => use the CPUTargetList bitmask in bits[23:16].
-pub fn send_sgi(target_cpu: usize, intid: u32) {
+/// Send SGI `intid` (0-15) to the core whose affinity is `target`. On the **v3** path `target` is the
+/// target core's packed MPIDR affinity ({Aff3,Aff2,Aff1,Aff0}, as `this_affinity()` returns) — the form
+/// needed to reach a specific core on a **multi-cluster** SoC like Tegra234 (Aff2=cluster, Aff1=core,
+/// Aff0=0). On the **v2** path (Pi 4) `target` is the CPU-interface bitmask index, which on a
+/// single-cluster board equals the core index = Aff0; since a single-cluster affinity is just its Aff0
+/// with the upper bytes 0, a caller passing a plain core index remains correct on both v2 and v3, and
+/// the value is byte-identical on QEMU `virt`. The `DSB` publishes any memory the target reads on wake
+/// before the interrupt is raised.
+pub fn send_sgi(target: usize, intid: u32) {
     // v3: SGIs are generated by writing the ICC_SGI1R_EL1 system register, not GICD_SGIR. Compiled
     // out on the pi build.
     #[cfg(not(feature = "pi"))]
     if is_v3() {
-        send_sgi_v3(target_cpu, intid);
+        send_sgi_v3(target, intid);
         return;
     }
     unsafe {
         core::arch::asm!("dsb ish", options(nostack, preserves_flags));
-        let val = ((1u32 << target_cpu) << 16) | (intid & 0xF);
+        // v2 (Pi 4 / virt-v2, single cluster): TargetList bit = core index = Aff0.
+        let val = ((1u32 << target) << 16) | (intid & 0xF);
         gicd_write(GICD_SGIR, val);
     }
 }
 
-/// GICv3 SGI generation via ICC_SGI1R_EL1 (S3_0_C12_C11_5): INTID in bits[27:24], TargetList in
-/// bits[15:0] (one bit per Aff0 in the target's affinity group), Aff1/2/3 in [23:16]/[39:32]/[55:48].
-/// QEMU virt (cortex-a72) keeps every core in one affinity group (Aff1..3 = 0, Aff0 = core index),
-/// so `1 << target_cpu` addresses core `target_cpu`. JC2 / Orin clusters (non-zero Aff1) must fill
-/// the affinity fields from the target's MPIDR. The `dsb ish` publishes memory the target reads on
-/// wake before the SGI is raised (as the v2 path does).
+/// GICv3 SGI generation via ICC_SGI1R_EL1 (S3_0_C12_C11_5). `target` is the destination core's packed
+/// MPIDR affinity {Aff3,Aff2,Aff1,Aff0}. The register fields: INTID[27:24], IRM(bit40)=0 (route by
+/// affinity, not broadcast), Aff3[55:48], Aff2[39:32], Aff1[23:16], and TargetList[15:0] = `1<<Aff0`
+/// (the Aff0 bitmask within the {Aff3,Aff2,Aff1} affinity group). On QEMU `virt` every core is Aff1..3=0
+/// with Aff0=core index, so this reduces to `(intid<<24)|(1<<core)` — byte-identical to the pre-JM5
+/// value; on Tegra234 the cluster affinities (Aff2/Aff1) are filled from the target's real MPIDR so an
+/// SGI reaches the right core across clusters. The `dsb ish` publishes memory the target reads on wake
+/// before the SGI is raised (as the v2 path does).
 #[cfg(not(feature = "pi"))]
-fn send_sgi_v3(target_cpu: usize, intid: u32) {
-    let sgi = ((intid as u64 & 0xF) << 24) | (1u64 << (target_cpu & 0xF));
+fn send_sgi_v3(target: usize, intid: u32) {
+    let aff = target as u64;
+    let aff0 = aff & 0xFF;
+    let aff1 = (aff >> 8) & 0xFF;
+    let aff2 = (aff >> 16) & 0xFF;
+    let aff3 = (aff >> 24) & 0xFF;
+    let sgi = (aff3 << 48)
+        | (aff2 << 32)
+        | ((intid as u64 & 0xF) << 24)
+        | (aff1 << 16)
+        | (1u64 << (aff0 & 0xF));
     unsafe {
         core::arch::asm!("dsb ish", options(nostack, preserves_flags));
         core::arch::asm!("msr S3_0_C12_C11_5, {}", in(reg) sgi, options(nostack, preserves_flags));

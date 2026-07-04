@@ -119,17 +119,20 @@ aarch64 `virt` QEMU invocation (QEMU takes the last value of the repeated
 machine property). Default stays GICv2. The knob only affects the `virt` runs;
 the Pi bare-metal paths (`kernel8*`, QEMU `raspi4b`) are always GICv2.
 
-### Orin metal pending
+### Orin metal status
 
-All GICv3 **and PSCI SMP** work to date is **QEMU `virt` (`gic-version=3`)
-only**. The Jetson Orin Nano's on-silicon GICv3 + PSCI — real Redistributor
-frames at the Tegra234 base, cluster affinities in the target MPIDR, and the
-board firmware's own PSCI conduit re-confirmed against its DTB — is **not yet
-brought up**; that is a later, operator-attended arc. The `virt` PSCI `CPU_ON`
-bring-up above is written to make it a small delta (swap the GICR base + confirm
-the conduit; the capture/replay and per-core GICv3 init carry over). Nothing here
-should be read as a metal claim: QEMU models no Tegra machine, and QEMU-green
-does not imply Orin-correct.
+The boot-core GICv3 + generic timer are **METAL-CONFIRMED** on Orin (JM3 MMU + JM4
+GIC/timer). **SMP** (all secondaries via PSCI `CPU_ON` + cross-core SGI) is written and
+**QEMU-green** (Arc JM5: real Redistributor-frame enumeration for the fused core set,
+multi-cluster affinity targeting `Aff2=cluster`/`Aff1=core`/`Aff0=0`, `HCR_EL2`/`CPTR_EL2`
+carried in the AP entry stub, SMC conduit), but its **metal boot is ⛔ blocked**: on the real
+Orin, PSCI **`CPU_ON` triggers a fatal Tegra RAS Uncorrectable Error** (CBB fabric "Error
+response from slave") before any AP comes online, reproducibly across two attended attempts —
+while the GICR enumeration, VLPIS stride, and the PSCI *query* path (`AFFINITY_INFO`) all work
+on silicon. This is a Tegra-firmware (BL31/MCE) core-bring-up issue, not a JM5 code bug; it
+needs a dedicated investigation (see the "JM5 result" section for the syndrome, the sharp
+query-works/power-faults split, and the ranked hypotheses). QEMU models no Tegra machine, so
+QEMU-green did not — and here could not — imply Orin-correct.
 
 ## 4. Jetson Orin Nano headless bring-up (Arc JM2)
 
@@ -395,6 +398,145 @@ and the heartbeat is **timer-driven** — `ticks` climbing exactly 250/beat with
 `live`, the whole timer→GIC→CPU-interface→vector→handler→EOI loop closed on Orin.
 No degraded fallback path was taken. This is the interrupt-driven heartbeat verdict.
 
+### JM5 result — Orin SMP via PSCI CPU_ON + cross-core SGI (QEMU-green 3/3; **metal ⛔ blocked on Tegra `CPU_ON`**)
+
+JM4 ran the Orin on its boot core alone. JM5 brings the **secondary Cortex-A78AE cores
+online via PSCI `CPU_ON`** and proves cross-core SGI in both directions, un-gating the
+JC2 `smp_virt.rs` path for the `tegra` build and making its shared code correct on a
+**multi-cluster** SoC. The Orin Nano is a 6-core part (BSP + 5 secondaries).
+
+**The multi-cluster generalization (the crux).** Tegra234 encodes the topology as
+**Aff2 = cluster (0–2), Aff1 = core-in-cluster (0–3), Aff0 = 0 always** (from upstream
+`tegra234.dtsi`: `cpu@0…cpu@300`, `cpu@10000…`, `cpu@20000…`). So MPIDR Aff0 — which the
+QEMU-`virt` single-cluster path used as the core id — is **not** a usable identifier on
+Orin. JM5 splits the two roles the old path conflated:
+
+* a **linear index** `0..N-1` (BSP = 0, secondaries 1..), dense and board-independent,
+  selects a core's stack / per-CPU block / `CORE_READY` slot, and is handed to a woken
+  core as the PSCI **context id** (delivered in `x0`); the AP entry stub uses `x0`
+  directly instead of reading MPIDR;
+* the **MPIDR affinity** (packed `{Aff3,Aff2,Aff1,Aff0}`) is a separate value used only
+  as the `CPU_ON` target and the `send_sgi`/`IROUTER` target, so an SGI/SPI reaches the
+  right core across clusters. On `virt` the two coincide (affinity = Aff0 = index), so
+  the path stays byte-compatible there.
+
+**Metal-truth core discovery.** Rather than parse the firmware DTB for the fused-core set
+(the `fdt-0.1.5` parse of the real Orin DTB panics — task cde963a7), JM5 walks the GIC
+**redistributor frames** (`gic::enumerate_redistributor_affinities`), reading each
+frame's `GICR_TYPER` affinity — the core set and its real cluster affinities read straight
+off the silicon, adapting to whatever the board is. This is the **first code to walk a
+non-first redistributor frame on Orin**, i.e. the first metal exercise of JM4's
+`GICR_TYPER.VLPIS`-derived stride.
+
+**Delta-list items landed** (all in `smp_virt.rs`/`gic.rs`, shared with `virt`):
+
+* **Part A — Tegra GICR + un-gate.** The tegra SMP kick-off runs in `tegra_early_stop`
+  after the JM4 GIC/timer bring-up; APs resolve their own redistributor via the JM4
+  Tegra234 GICR base + VLPIS stride (`gic::init_secondary_v3` — inherited, not
+  re-hardcoded). `MAX_FRAMES = 8` covers the 6 cores.
+* **Part B — `HCR_EL2` in `SEC_CTX`.** The capture/replay now carries `HCR_EL2`; a
+  PSCI-reset AP forces `E2H`/`TGE` to the BSP's value (E2H=0) **before** replaying
+  `TCR`/`TTBR`/`SCTLR_EL2`, so the translation regime is interpreted correctly regardless
+  of the AP's UNKNOWN reset `E2H` (QEMU-invisible; JM3 confirmed the BSP is E2H=0).
+* **Part C — `CPTR_EL2` + stack in the asm stub.** The `HCR_EL2` and `CPTR_EL2` replays
+  and the stack setup are now in the AP entry asm stub, **before any compiler-generated
+  code** (structural, not compiler fortune). A `CurrentEL` guard parks a core that comes
+  up at an EL other than EL2 (belt-and-braces for a firmware that drops APs to EL1),
+  which the BSP then observes as a clean `CORE_READY` timeout rather than a wedge.
+* **Part D — affinity widening.** `send_sgi_v3` fills `ICC_SGI1R_EL1` `{Aff3,Aff2,Aff1}` +
+  `TargetList = 1<<Aff0` from the target's real MPIDR (was Aff0-only); `enable_spi_v3`
+  writes the full affinity into `GICD_IROUTER`. On `virt` both reduce to the pre-JM5 value
+  (byte-identical), so one code path serves both boards.
+* **Part E — per-AP distinct SGI INTIDs. DEFERRED** (delta-list follow-up). The BSP→AP
+  direction is already individually attributable (each AP's own IPI counter); only the
+  AP→BSP proof coalesces (one INTID). Deferred to keep the arc to one clean session.
+
+The PSCI conduit is **SMC** (Orin's ATF/BL31 monitor at EL3, as on QEMU's emulated PSCI);
+the tegra caller passes `dtb=0`, so `report_conduit` prints the assumed-SMC line without
+touching the panicking DTB parse. `percpu::NUM_CPUS` was raised **4→8** (a Peter-approved
+one-line lane extension: additive, inert for pi/virt/x86 — only the static block array
+grows) to give the 6-core Orin enough per-CPU slots.
+
+**QEMU gate (functional, not byte-identical — the shared SMP-correctness fixes legitimately
+change what `virt` runs).** On QEMU-`virt gic-version=3` the enumerated bring-up is
+**3/3 secondaries online + cross-core SGI**, verbatim:
+
+```
+:: AARCH64 SMP: redistributor walk found 4 core(s); BSP aff=0x00000000, 3 secondary(ies) to start ::
+:: AARCH64 SMP: CPU_ON AP 1 (aff=0x00000001) -> SUCCESS (entry=0x…) ::
+:: AARCH64 SMP: AP 1 online (aff=0x00000001) ::   (…AP 2, AP 3…)
+:: AARCH64 SMP: BSP -> AP 1 SGI OK (count 0 -> 1) ::   (…AP 2, AP 3…)
+:: AARCH64 SMP: AP -> BSP SGI OK (3 online APs pinged, 2 delivered; BSP ipi 1 -> 3) ::
+:: AARCH64 SMP: 3/3 secondaries online via PSCI CPU_ON on the GICv3 path ::
+```
+
+Intended `virt` log deltas vs JC2: the new `redistributor walk …` discovery line, the
+`aff=0x…` fields on the CPU_ON/online/warning lines (affinity-format change), and the
+BSP→AP proof targeted by affinity. The rest of the battery:
+
+* **virt-GICv2 — behavior-identical** (no SMP at runtime; `is_v3()` false). Not quite
+  byte-identical: the GICv2 and GICv3 `virt` runs are the **same binary** (`gic-version` is
+  a QEMU runtime flag, not a compile flag), so the shared v3/SMP code the arc necessarily
+  changes (`send_sgi_v3`, `enumerate_redistributor_affinities`, …) is compiled into the v2
+  binary too, even though v2 never calls it. The **only** diffs vs the pre-JM5 baseline are
+  **two layout-dependent values** — the printed kernel-image size (`max_vaddr`, same page
+  count) and `VBAR_EL2` — both shifted by that code growth. **No boot-sequence or behavior
+  line differs.** (The per-CPU/stack array sizes are `tegra`-gated precisely so the *arrays*
+  don't add to this — the residual shift is pure code size.)
+* **Pi `kernel8-test` — byte-identical mod interleave.** The pi build compiles *none* of
+  the JM5 code (`smp_virt` and every v3 helper are `cfg(not(pi))`; `percpu::NUM_CPUS` stays
+  4). The `kernel8.img` is the **same size** as baseline (differing only in LLVM `.llvm.<N>`
+  symbol-mangling suffixes, which never reach serial), and the serial log is the **same set
+  of lines** as baseline — a **sorted diff is empty**; the raw diff is only the known
+  cross-core scheduler interleave. So pi behaviour is provably unchanged.
+* **x86** — U1a/U1b/U2 PASS + xHCI MISSION SUCCESS (arch/aarch64 not compiled).
+
+`check` both arches; `UNAOS_TEGRA=1 build` both legs; `esp-jetson` links.
+
+**Metal (Part F): ⛔ BLOCKED — PSCI `CPU_ON` triggers a fatal Tegra RAS fault (2 operator-attended
+attempts, 2026-07-04).** QEMU cannot model the Orin, so the metal boot is the verdict — and it is a
+**failure isolated to `CPU_ON`**. Both attempts booted clean through JM3/JM4 and *into* JM5, then the
+**first** `CPU_ON` (to a real cluster-0 core, aff `0x00000100`) caused a fatal firmware **RAS
+Uncorrectable Error** *before it returned* — no AP ever came online, and the BSP itself powered off
+(0 post-fault heartbeats). Syndrome (verbatim):
+
+```
+:: AARCH64 SMP: enumerated core 0..7 aff = 0x0 / 0x100 / 0x200 / 0x300 / 0x10000 / 0x10100 / 0x10200 / 0x10300 ::
+:: AARCH64 SMP: core 1..7 AFFINITY_INFO=1 -> present ::            (all 8 report present/OFF)
+:: AARCH64 SMP: walk found 8 core(s); … 7 present -> starting ::
+ERROR:  RAS Uncorrectable Error in IOB … SERR = Error response from slave … IERR = CBB Interface Error
+ERROR:  RAS Uncorrectable Error in ACI … IERR = FillWrite Error … ADDR = 0x8000000000000b5c
+ERROR:  Powering off core
+```
+
+**What metal *did* confirm** (bonus): JM3 MMU + JM4 GIC (`992 INTIDs`) + `timer LIVE` re-ran clean;
+the **GICR enumeration works on silicon** — the walk crossed non-first frames (the first metal
+exercise of JM4's VLPIS stride) and read all 8 frames' affinities: **two full clusters** (cluster0
+`0x0/0x100/0x200/0x300`, cluster1 `0x10000…0x10300`); and the **SMC conduit works** — all 8
+`AFFINITY_INFO` SMCs returned cleanly (`=1`, OFF). So the split is sharp: everything up to and
+including PSCI *queries* works; only PSCI `CPU_ON`'s core-power action faults.
+
+**Diagnosis.** The `CBB Interface Error` / `Error response from slave` on the Tegra Control Backbone
+fabric, raised inside BL31 while servicing `CPU_ON`, is a bus error powering/resetting the target
+core — not something our code touches directly. The `AFFINITY_INFO` gate (JM5 attempt-2 fix) did not
+help because this firmware reports all 8 die slots present. **Ranked hypotheses for a dedicated
+follow-up** (NOT for blind on-metal iteration — the STOP tripwire held):
+1. Tegra `CPU_ON` needs **MCE / BPMP coordination** (Tegra's Multi-Core-Environment firmware) that a
+   generic PSCI call from our minimal EL2 kernel does not provide → BL31's core-power path errors.
+2. A **latent/poisoned RAS condition** surfaced by the first SMC→EL3 barrier (the fault lands exactly
+   at the first `CPU_ON`; `ADDR` differs run-to-run: `0x…200`, `0x…b5c`).
+3. **Entry point high in DRAM** (kernel at `0x25e52c000` ≈ 9.5 GiB) rejected by BL31's reset-vector
+   programming — a low-PA trampoline would test this.
+4. **Caller-EL** interaction: we run the whole path at NS-EL2; JetPack's OS calls PSCI from EL1/EL2
+   with a fuller ATF handshake.
+
+**Landing:** JM5 is **QEMU-green** (the SMP mechanism is correct for a compliant PSCI/GICv3 — proven
+3/3 on `virt`) and **metal-blocked on Tegra `CPU_ON`**. This needs a dedicated "Orin PSCI/MCE core
+bring-up" investigation (possibly the NVIDIA-collaboration angle), not a JM5 code fix. Captures:
+`unaos/target/serial-orin-jm5-FAIL-rasfault.log` (attempt 1) and
+`serial-orin-jm5-FAIL2-affinfo-allpresent.log` (attempt 2, with the enumerated affinities +
+AFFINITY_INFO results).
+
 ### Orin-metal delta list (feeds JM3 + the cable-day graphical arc)
 
 The `virt` GICv3 + PSCI SMP (JC2) is written to be a small delta to Orin silicon,
@@ -418,25 +560,33 @@ but the following must change and are **not** covered by QEMU:
   `GICR_TYPER.VLPIS` (bit 1); on real Orin the `GICv3 init (GICD=0xf400000,
   GICR=0xf440000, 992 INTIDs)` + `self-SGI delivered` + `timer LIVE` lines confirm the
   boot-core redistributor + CPU interface + timer PPI all work (see "JM4 result").
-  **Still deferred to the SMP arc:** the parallel `smp_virt.rs` walk still hardcodes
-  the virt `GICR_BASE`/stride, and the target MPIDR must be widened to real cluster
-  affinities (Aff1-3) for `IROUTER`/`ICC_SGI1R` — none of which JM4 touched (single
-  core only; the VLPIS stride, needed only for a non-first AP frame, was never
-  exercised on the boot core).
-* **PSCI conduit from the real DTB.** JC2 confirmed QEMU's conduit is **SMC** via
-  `dumpdtb`, but the DTB **parse path is latent** — only the SMC-assumed fallback
-  has ever run (the `virt` log prints `method not in FDT, assumed`). On the Orin,
-  parse `/psci method` from the firmware DTB and honor it (`smc` vs `hvc`).
-* **`SEC_CTX` must add `HCR_EL2`.** The capture/replay of the BSP's live EL2 state
-  omits `HCR_EL2`; `E2H` is not guaranteed 0 on all silicon, and a reset AP coming
-  up with a different `E2H`/`TGE` than the BSP would interpret the replayed
-  `TCR`/`TTBR`/`SCTLR` under the wrong translation regime. Add `HCR_EL2` to the
-  captured set.
-* **`CPTR_EL2` replay + AP pre-MMU stack spill → asm stub.** Both currently rely on
-  compiler fortune (the `CPTR_EL2` replay runs in Rust before the first FP/NEON
-  instruction; the pre-MMU stack spill assumes the compiler doesn't touch the stack
-  first). On real silicon make these **structural** — do the `CPTR_EL2` write and
-  the stack setup in the AP entry asm stub, before any compiler-generated code runs.
-* **Per-AP SGI attribution via distinct INTIDs.** The cross-core SGI proof is "at
-  least once" (GICv3 coalesces) because every AP uses one INTID; on metal, give each
-  AP a distinct SGI INTID so per-core delivery is individually attributable.
+  **SMP-arc part ✅ QEMU-green; metal pending (JM5):** `smp_virt.rs` no longer hardcodes
+  a virt base — its APs resolve their own redistributor through `gic::init_secondary_v3`
+  (Tegra234 GICR base + VLPIS stride), the core set is discovered by walking the GICR
+  frames (`gic::enumerate_redistributor_affinities` — the first non-first-frame walk, i.e.
+  the first exercise of the VLPIS stride), and `send_sgi_v3`/`enable_spi_v3` are widened to
+  the target's full MPIDR affinity (`ICC_SGI1R_EL1` `{Aff3,Aff2,Aff1}` + `1<<Aff0`;
+  `GICD_IROUTER` full affinity). On QEMU-`virt` this reduces to the pre-JM5 value; on Orin
+  it is the load-bearing multi-cluster path (Aff2=cluster, Aff1=core, Aff0=0). See "JM5
+  result".
+* **PSCI conduit from the real DTB.** ✅ QEMU-green; metal pending (JM5). JC2 confirmed
+  QEMU's conduit is **SMC** via `dumpdtb`. On Orin the boot chain is ATF/BL31 + OP-TEE, so
+  SMC is near-certain; JM5 uses **SMC** and — because the `fdt-0.1.5` parse of the real
+  Orin DTB panics (task cde963a7) — the tegra caller passes `dtb=0`, so `report_conduit`
+  prints the assumed-SMC line without parsing. If `CPU_ON` errors on metal, that is a clean
+  diagnostic → STOP (do not blind-try `hvc`). A hand-rolled `/psci method` FDT walk (no
+  `fdt` crate) remains a future option, out of the critical path.
+* **`SEC_CTX` must add `HCR_EL2`.** ✅ QEMU-green; metal pending (JM5). The capture/replay
+  now carries `HCR_EL2`; the AP forces `E2H`/`TGE` to the BSP's value **first** (in the
+  entry stub) before the `TCR`/`TTBR`/`SCTLR_EL2` replay, so the regime is interpreted
+  correctly regardless of the AP's UNKNOWN reset `E2H`. See "JM5 result".
+* **`CPTR_EL2` replay + AP pre-MMU stack spill → asm stub.** ✅ QEMU-green; metal pending
+  (JM5). The `HCR_EL2`/`CPTR_EL2` replays and the stack setup are now in the AP entry asm
+  stub, **before any compiler-generated code** (structural, not compiler fortune). A
+  `CurrentEL` guard parks an AP woken at EL≠2 without touching an EL2 register (→ a clean
+  BSP-side timeout, not a wedge).
+* **Per-AP SGI attribution via distinct INTIDs.** ⏸ **DEFERRED** (JM5 follow-up). The
+  cross-core SGI proof stays "at least once" for the AP→BSP direction (GICv3 coalesces one
+  INTID); the BSP→AP direction is already per-core attributable (each AP's own IPI counter).
+  Deferred to keep JM5 to one clean session; give each AP a distinct SGI INTID in a
+  follow-up so AP→BSP delivery is individually attributable too.
