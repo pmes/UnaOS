@@ -817,6 +817,18 @@ fn tegra_early_stop(boot_info: &BootInfo) -> ! {
     unaos_kernel::arch::exceptions::enable_irq();
     unaos_kernel::arch::timer::verify_live();
 
+    // 3b. JM5: bring the Orin's secondary cores online via PSCI CPU_ON + per-core GICv3 bring-up, proven
+    //     by cross-core SGI. It runs AFTER the boot-core GIC/timer bring-up above: each AP reuses
+    //     `gic::init_secondary_v3` and the Tegra234 GICR base/stride established for the boot core (JM4),
+    //     and discovers the fused core set by walking the redistributors (metal truth — the first
+    //     exercise of JM4's VLPIS stride on a non-first frame). `dtb=0` skips the `/psci` FDT parse: the
+    //     `fdt-0.1.5` parse of the real Orin DTB panics (task cde963a7), and SMC is the Orin PSCI conduit
+    //     (ATF/BL31) regardless. Gated on `gic::is_v3()` (always true on the Orin GIC-600), matching the
+    //     virt kick-off's runtime gate. On QEMU (`tegra` off) this is never compiled.
+    if unaos_kernel::arch::gic::is_v3() {
+        unaos_kernel::arch::smp_virt::start_secondaries(0, 0);
+    }
+
     // 4. Interrupt-driven idle. `arch::hlt()` parks in WFI when the timer IRQ is confirmed delivering
     //    (woken by each PPI-30 tick) and falls back to a poll-spin otherwise (no wake source). The
     //    heartbeat is now driven by `timer::ticks()` advancing — a climbing number proves the whole

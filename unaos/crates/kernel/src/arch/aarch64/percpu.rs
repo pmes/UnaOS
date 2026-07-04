@@ -27,7 +27,21 @@ macro_rules! tpidr_reg {
     () => { "TPIDR_EL2" };
 }
 
-/// The Pi 4 is 4× Cortex-A72. Index by MPIDR Aff0 (0..3).
+/// Per-CPU block count. The Pi 4 is 4× Cortex-A72 (indexed by MPIDR Aff0 0..3); the QEMU `virt`
+/// SMP run is 4 cores; the Jetson Orin Nano is a **6-core** Cortex-A78AE SoC. On multi-cluster silicon
+/// MPIDR Aff0 is *not* a dense core id (Tegra234 encodes the cluster in Aff1/Aff2 with Aff0=0), so the
+/// SMP bring-up assigns each core a **linear index** 0..N-1 (BSP=0) and uses that as the block index —
+/// see `smp_virt.rs`. The Orin build sizes this to 8 (covers 6 + headroom, matching `smp_virt`'s
+/// `MAX_CORES`); pi/virt keep 4. It is `tegra`-gated rather than a flat bump specifically so the
+/// **pi and virt binaries — and thus their serial logs — stay byte-identical** (a larger array would
+/// shift the BSS layout and every address printed after it).
+///
+/// NOTE (JM5 lane extension, Peter-approved 2026-07-04): `percpu.rs` is a shared aarch64 core file not
+/// named in the JM5 brief's lane; this `tegra`-gated size is the only out-of-lane change and is flagged
+/// for Fable's review. It changes no logic — only the block count, and only on the Orin build.
+#[cfg(feature = "tegra")]
+pub const NUM_CPUS: usize = 8;
+#[cfg(not(feature = "tegra"))]
 pub const NUM_CPUS: usize = 4;
 
 /// One core's private data. `#[repr(C, align(64))]` puts each core's block on its own cache line so
