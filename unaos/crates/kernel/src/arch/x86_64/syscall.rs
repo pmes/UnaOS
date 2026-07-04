@@ -147,6 +147,23 @@ unaos_user_tf_syscall:
     syscall                                 // -> #DB at the SYSCALL-entry stub (CPL 0)
 1:  jmp 1b                                  // sys_exit never returns; spin as a guard
 
+    // U3 fixture — read this process's PRIVATE data-page sentinel and write it to a readback slot,
+    // then exit. `lea r8,[rip+blob_start]` = USER_BASE (the blob is loaded at USER_BASE), so
+    // [r8+0x1000] is the data page. Under a per-process CR3 that VA hits THIS process's private
+    // frame; a task that (wrongly) ran under the shared window would read the wrong sentinel. The
+    // GPR scrub zeroed r8 on entry, so the `lea` is the only source of the address. No stack use.
+    .balign 16
+    .globl unaos_user_u3_reader
+unaos_user_u3_reader:
+    lea r8, [rip + unaos_user_blob_start]   // r8 = USER_BASE (code page base)
+    add r8, 0x1000                          // r8 -> data page (USER_BASE + PAGE)
+    mov rax, [r8]                           // read this process's private sentinel
+    mov [r8 + 8], rax                       // write it to the readback slot (data page + 8)
+    mov rax, 2                              // SYS_EXIT
+    mov rdi, 0                              // status = 0
+    syscall
+1:  jmp 1b
+
     .globl unaos_user_blob_end
 unaos_user_blob_end:
 "#
@@ -160,6 +177,7 @@ unsafe extern "C" {
     static unaos_user_code_write: u8;
     static unaos_user_stack_exec: u8;
     static unaos_user_tf_syscall: u8;
+    static unaos_user_u3_reader: u8;
 }
 
 // --- The SYSCALL entry stub (LSTAR target). Naked; the only assembly in the syscall path.
@@ -272,6 +290,9 @@ static U2_0A_KILLED: AtomicU32 = AtomicU32::new(0);
 /// exit (a FAIL). A kill (untrusted bytes faulting) leaves both 0 — the verdict times out to FAIL.
 static U2_EXITED_OK: AtomicU32 = AtomicU32::new(0);
 static U2_EXITED_ERR: AtomicU32 = AtomicU32::new(0);
+/// U3: number of per-process-CR3 ring-3 fixture tasks that reached `sys_exit` (the readback verdict
+/// waits for this to hit 2 before reading each slot's readback word).
+static U3_EXITED: AtomicU32 = AtomicU32::new(0);
 
 // #PF error-code bits (mirror `x86_64::PageFaultErrorCode`), used by `record_ring3_kill` to demand
 // the EXACT fault shape each fixture provokes — not merely "it died".
@@ -373,6 +394,11 @@ extern "C" fn syscall_dispatch(nr: u64, a0: u64, a1: u64, a2: u64) -> i64 {
                     // Reaching sys_exit means the #DB was neutralized and the syscall resumed — the
                     // fixture always exits 0 (kernel survived).
                     U2_0A_EXITED_OK.fetch_add(1, Ordering::AcqRel);
+                }
+                Some(n) if n.starts_with("u3-") => {
+                    // U3 per-process-CR3 fixture task exiting (its own accounting, so the U1a/U1b
+                    // default counts stay byte-for-byte). The readback verdict reads slot memory.
+                    U3_EXITED.fetch_add(1, Ordering::AcqRel);
                 }
                 _ => {
                     if a0 == 0 {
@@ -842,6 +868,117 @@ fn u2_verdict(_: usize) {
         serial_println!(
             ":: U2: FAIL — exited_ok={} exited_err={} (want 1/0; 0/0 = program never returned or was killed) ::",
             ok, err
+        );
+    }
+}
+
+/// U3 Part A: prove per-process CR3 isolation with a DETERMINISTIC KERNEL probe (no ring 3). Allocate
+/// two address-space slots, plant DISTINCT sentinels at the same user VA in each, then swap CR3 to
+/// each and read that VA — confirming each reads its own. This is the metal-catchable proof (the x86
+/// twin of M6d's nG probe) that two processes' USER_BASE windows are isolated; it runs on the BSP at
+/// boot before any per-process ring-3 task. One-shot; frees both slots when done.
+pub fn u3_probe_once() {
+    const SENT_A: u64 = 0xA5A5_A5A5_0000_00A1;
+    const SENT_B: u64 = 0x5A5A_5A5A_0000_00B2;
+    let mut slots = [0usize; 2];
+    if !crate::arch::memory::alloc_user_spaces(&mut slots) {
+        serial_println!(":: U3: address-space pool exhausted — isolation probe skipped ::");
+        return;
+    }
+    let (a, b) = (slots[0], slots[1]);
+    let (a_val, b_val, ok) = crate::arch::memory::probe_isolation(a, b, 0, SENT_A, SENT_B);
+    if ok {
+        serial_println!(
+            ":: U3: per-process CR3 isolation (A={:#018x} B={:#018x} distinct) -> PASS ::",
+            a_val, b_val
+        );
+    } else {
+        serial_println!(
+            ":: U3: per-process CR3 isolation FAIL (A={:#018x} want {:#018x}; B={:#018x} want {:#018x}) ::",
+            a_val, SENT_A, b_val, SENT_B
+        );
+    }
+    crate::arch::memory::free_user_space_by_cr3(crate::arch::memory::slot_cr3(a));
+    crate::arch::memory::free_user_space_by_cr3(crate::arch::memory::slot_cr3(b));
+}
+
+// U3 ring-3 fixture sentinels (distinct per task; the low byte tags the task). Planted in each
+// slot's data page (window page 1, offset 0); `u3_reader` copies it to the readback word (offset 8).
+const U3_SENT_A: u64 = 0xC3C3_C3C3_0000_000A;
+const U3_SENT_B: u64 = 0x3C3C_3C3C_0000_000B;
+const U3_DATA_OFF: usize = 0x1000; // window page 1 (data) — sentinel at +0, readback at +8
+
+/// U3 Part B/C: TWO ring-3 tasks, each in its OWN private address space (CR3), each running the
+/// `u3_reader` blob — read the slot-private sentinel at USER_BASE+PAGE, write it to USER_BASE+PAGE+8,
+/// `sys_exit(0)`. This exercises the per-process CR3 DISPATCH (the trampoline installs the task's CR3
+/// before `iretq`) and TEARDOWN (`exit` restores the kernel CR3 + frees the slot) end to end: a task
+/// that (wrongly) ran under the shared window would read the wrong sentinel, so the readback verdict
+/// catches it. Runs on `cpu` (a scheduled AP), FIFO (ring 3 is cooperative). One-shot.
+pub fn u3_run_fixture(cpu: usize) {
+    let mut slots = [0usize; 2];
+    if !crate::arch::memory::alloc_user_spaces(&mut slots) {
+        serial_println!(":: U3: address-space pool exhausted — ring-3 fixture skipped ::");
+        return;
+    }
+    let sents = [U3_SENT_A, U3_SENT_B];
+    let blob_start = &raw const unaos_user_blob_start as usize;
+    let blob_end = &raw const unaos_user_blob_end as usize;
+    let blob_len = blob_end - blob_start;
+    let reader_entry = USER_BASE + (&raw const unaos_user_u3_reader as usize - blob_start) as u64;
+    let sp = USER_BASE + USER_WINDOW_PAGES * PAGE_SIZE - 16;
+
+    for (i, &s) in slots.iter().enumerate() {
+        let backing = crate::arch::memory::slot_backing_ptr(s);
+        unsafe {
+            // Copy the blob into the slot's code page (page 0) through the kernel identity alias —
+            // never through USER_BASE, so the code mapping stays read-only (W^X). Plant this slot's
+            // private sentinel in the data page and clear its readback word.
+            core::ptr::copy_nonoverlapping(blob_start as *const u8, backing, blob_len);
+            core::ptr::write_volatile(backing.add(U3_DATA_OFF) as *mut u64, sents[i]);
+            core::ptr::write_volatile(backing.add(U3_DATA_OFF + 8) as *mut u64, 0);
+        }
+    }
+
+    U3_EXITED.store(0, Ordering::Release);
+    let names = ["u3-space-a", "u3-space-b"];
+    for (i, &s) in slots.iter().enumerate() {
+        crate::arch::sched::spawn_user_in_space(
+            names[i],
+            reader_entry,
+            sp,
+            cpu,
+            crate::arch::memory::slot_cr3(s),
+        );
+    }
+
+    // Wait (bounded on the BSP-driven ms-clock) for both tasks to exit.
+    let deadline = crate::arch::ticks() + 2000;
+    while U3_EXITED.load(Ordering::Acquire) < 2 && crate::arch::ticks() < deadline {
+        core::hint::spin_loop();
+    }
+
+    // Verify each slot's readback equals ITS OWN sentinel (each task ran in its own space). The slots
+    // were freed by each task's `exit` teardown, but the static backing persists until re-alloc, so
+    // reading it here through the identity alias is valid.
+    let mut readbacks = [0u64; 2];
+    let mut ok = U3_EXITED.load(Ordering::Acquire) == 2;
+    for (i, &s) in slots.iter().enumerate() {
+        let backing = crate::arch::memory::slot_backing_ptr(s);
+        let rb = unsafe { core::ptr::read_volatile(backing.add(U3_DATA_OFF + 8) as *const u64) };
+        readbacks[i] = rb;
+        if rb != sents[i] {
+            ok = false;
+        }
+    }
+    if ok {
+        serial_println!(
+            ":: U3: 2 ring-3 tasks each in a private CR3 read their own sentinel (A={:#018x} B={:#018x}) -> PASS ::",
+            readbacks[0], readbacks[1]
+        );
+    } else {
+        serial_println!(
+            ":: U3: ring-3 per-process CR3 FAIL — exited={} A={:#018x}/want {:#018x} B={:#018x}/want {:#018x} ::",
+            U3_EXITED.load(Ordering::Acquire), readbacks[0], sents[0], readbacks[1], sents[1]
         );
     }
 }
