@@ -12,7 +12,7 @@ Legend: **✅ metal-confirmed** · **🔬 QEMU-green, metal pending** · dates I
 
 ## hw-rmbp track — 2026-07-04 (landed on `hw-rmbp`, awaiting integration)
 
-### U3.5 — preemptible ring 3 (x86) 🔬 `hw-rmbp`
+### U3.5 — preemptible ring 3 (x86) ✅ `hw-rmbp`
 - **What:** completes the U3 process abstraction — a ring-3 task can now be dropped
   **preemptible** (`Task.preemptible` sets `RFLAGS.IF` in the `iretq` frame), so the
   local-APIC timer evicts it and other work shares its core. This closes the one-core
@@ -36,8 +36,13 @@ Legend: **✅ metal-confirmed** · **🔬 QEMU-green, metal pending** · dates I
 - **Honest scope:** per-task opt-in (only the spinner is preemptible); FP/SIMD is NOT saved
   across preemption yet (no FXSAVE/FXRSTOR — the register-only spinner is safe); one user
   task per core (RSP0/`syscall_kernel_rsp` set at first entry only); no PCID.
-- **Metal — PENDING:** TCG under-delivers preemption timing; rides the next rMBP reflash
-  (the aarch64 M6e twin is metal-confirmed on the real Pi 4).
+- **Metal — ★ CONFIRMED (real 2012 rMBP, 2026-07-04, bootlog photo):** `:: SMEP on ::` (real
+  supervisor-execute protection active while the preemptible spinner ran) then `:: U3.5: ring-3
+  preemption — IRQs-at-ring3=156, co-task ran, spinner resumed -> PASS ::` — the real timer preempted
+  the ring-3 spinner 156× and the swapgs-on-ring3-timer + CR3-at-dispatch + reap ran correctly on Ivy
+  Bridge, every prior fixture PASS (U1a/U1b/U2-0a/U3 byte-consistent), 0 unexpected faults. The same
+  boot also confirmed the U2.5 APIC ms-clock fix on metal: `initcnt=6236 [1 kHz calibrated]`,
+  `ms-clock 999 Hz` (the old ~119 Hz reading is gone).
 - **Commit:** on `hw-rmbp` (see landing report); unmerged (integrator records the merge).
 
 ---
