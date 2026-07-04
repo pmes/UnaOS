@@ -328,6 +328,59 @@ The JM3 kernel never parses the DTB (`tegra_early_stop` diverges before pci/smp_
 so the header-only non-BOOTDIAG path boots cleanly and is what produced the capture
 above; `serial-orin-jm3-r1-bootdiag-panic.log` holds the panic + the DTB/model proof.
 
+### JM4 result — Orin GIC-600 + generic-timer interrupt (single core; QEMU-green, **metal PENDING**)
+
+JM3 left the Orin kernel spinning its heartbeat after the MMU came up. JM4 brings up
+the **Tegra234 GIC-600 (GICv3) + the ARM generic timer on the boot core** so a timer
+PPI (INTID 30) is delivered, turning the spin-heartbeat into an interrupt-driven one.
+**SMP is deferred** (PSCI-on-Tegra, MPIDR affinity widening, per-AP SGI INTIDs) —
+boot core only.
+
+The whole interrupt path was already EL2-aware and is **reused unchanged**:
+`exceptions::install` (VBAR_EL2 + `HCR_EL2.IMO` routing), `gic::init` (GICv3 detect +
+distributor + this-core redistributor + ICC CPU interface + self-SGI smoke),
+`timer::init` (CNTP timer, INTID 30, interval from the 31.25 MHz CNTFRQ),
+`enable_irq`, `verify_live`. The **only** Orin-specific change was the GIC base
+addresses in `gic.rs`: a third build-time base-set (mirroring `serial.rs`) pointing
+the `tegra` build at the authoritative Tegra234 GIC-600 addresses from upstream
+`tegra234.dtsi` — **GICD `0x0F40_0000`, GICR `0x0F44_0000`** — both inside the
+low-1-GiB Device-nGnRE window `mmu_tegra` already maps. The per-core redistributor
+stride is derived at runtime from `GICR_TYPER.VLPIS` (bit 1: a 4-frame GIC-600 is
+`0x4_0000`, a 2-frame one `0x2_0000`); it is inert for the single-core boot (the boot
+core matches the first redistributor frame before any stride advance) but
+correct-by-construction for the deferred SMP arc. `tegra_early_stop` then enters an
+interrupt-driven idle — `arch::hlt()` (WFI when the timer IRQ is confirmed delivering,
+else poll-spin) with a heartbeat driven by `timer::ticks()` advancing, and a
+CNTPCT-driven fallback beat that labels the degraded "GIC up, PPI-30 not delivering"
+state rather than dark-hanging.
+
+**QEMU cannot model the Orin** (`tegra` is off in every QEMU build — it drives the
+QEMU-`virt` PL011/GIC, not the Tegra234 ones), so the QEMU gate is **byte-stability +
+compile only**; the arc verdict is metal. Landed evidence: `check` both arches;
+`UNAOS_TEGRA=1 build` both legs; `esp-jetson` links. The GIC change is tegra-gated or
+virt-token-identical — the QEMU virt-**GICv2** serial log is **byte-identical**
+clean-vs-JM4, virt-**GICv3** SMP stays **3/3** online, the Pi `kernel8-test` log is
+identical modulo the known cross-core SMP interleave (proven by a same-binary re-run
+showing the same interleave), and x86 stays U1a/U1b PASS + MISSION SUCCESS. (The ELF
+hash differs only in LLVM `.llvm.<N>` symbol-mangling suffixes, which never reach
+serial — so byte-identical *logs*, not byte-identical *binaries*, is the gate.)
+Five-lens adversarial review → two issues, both fixed pre-commit (a wrong-bit VLPIS
+test — bit 0 PLPIS vs bit 1 VLPIS; a stale JM3 call-site comment).
+
+**Metal PENDING (Part D, operator-attended):** boot `./arroyo esp-jetson` (non-
+BOOTDIAG — the bootdiag `fdt` panic is the separate flagged follow-up) media over the
+RPi Debug Probe, capture → `unaos/target/serial-orin-jm4.log`. **Success sequence:**
+the JM3 mmu lines → `boot diag EL=2 CNTFRQ=31250000` → `exception vectors installed
+(VBAR_EL2=…)` → `GICv3 init (GICD=0xf400000, GICR=0xf440000, …)` (proves the Tegra234
+bases resolved + the boot-core redistributor was found) → `GIC self-SGI delivered
+(v3)` (SGI delivery on Orin) → `generic timer armed … INTID 30` → `timer diag …
+ISTATUS=1 … PPI30 pending=1` → `timer LIVE: IRQ delivery confirmed; idle = WFI` →
+`:: tegra: heartbeat N (ticks=…, live) ::` climbing. **Degraded-but-alive**
+(acceptable, records the risk): up to `timer diag`, then `timer NOT live … poll-spin
+fallback`, then the CNTPCT-driven fallback beat. **Failure:** the redistributor-walk
+panic printing the MPIDR affinity (wrong base/stride) — a clean syndrome. No metal
+claim is recorded until the capture shows it.
+
 ### Orin-metal delta list (feeds JM3 + the cable-day graphical arc)
 
 The `virt` GICv3 + PSCI SMP (JC2) is written to be a small delta to Orin silicon,
@@ -345,13 +398,14 @@ but the following must change and are **not** covered by QEMU:
   (`0x2679df000`, model 'NVIDIA Jetson Orin Nano … Super') — R4's "no DTB table" was the
   wrong-GUID artifact. (Follow-up, out of the JM3 lane: BOOTDIAG's full `fdt` parse of
   the real DTB panics — see the JM3-result caveat.)
-* **GICR base *and* frame stride.** The redistributor walk (`smp_virt.rs`)
-  hardcodes the QEMU-`virt` `GICR_BASE` (`0x080A_0000`) and a `0x2_0000` per-core
-  stride (two 64 KiB frames: RD + SGI). Tegra234's GIC-600 is a **4-frame** class
-  (RD + SGI + VLPI + reserved) — derive the stride from `GICR_TYPER.VLPIS` instead
-  of assuming virt's two-frame layout, and point the base at the Tegra234
-  redistributor. Widen the target MPIDR to real cluster affinities (Aff1-3) for
-  `IROUTER`/`ICC_SGI1R` while here.
+* **GICR base *and* frame stride.** ✅ **boot core done in JM4 (QEMU-green; metal
+  pending)** — `gic.rs` now selects the Tegra234 GIC-600 bases (GICD `0x0F40_0000`,
+  GICR `0x0F44_0000`) for the `tegra` build and derives the redistributor stride from
+  `GICR_TYPER.VLPIS` (bit 1) instead of the QEMU-`virt` hardcodes, so the boot-core
+  redistributor walk resolves on Tegra234. **Still deferred to the SMP arc:** the
+  parallel `smp_virt.rs` walk still hardcodes the virt `GICR_BASE`/stride, and the
+  target MPIDR must be widened to real cluster affinities (Aff1-3) for
+  `IROUTER`/`ICC_SGI1R` — none of which JM4 touched (single core only).
 * **PSCI conduit from the real DTB.** JC2 confirmed QEMU's conduit is **SMC** via
   `dumpdtb`, but the DTB **parse path is latent** — only the SMC-assumed fallback
   has ever run (the `virt` log prints `method not in FDT, assumed`). On the Orin,
