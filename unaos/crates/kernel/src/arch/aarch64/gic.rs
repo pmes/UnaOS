@@ -30,23 +30,37 @@
 // timer lives here, INTID 30), SPIs 32+ (shared peripherals). The timer tick is a PPI, so it needs
 // no SPI routing, only a per-core enable (in ISENABLER0 — GICD's on v2, the Redistributor's on v3).
 
-// --- MMIO bases (QEMU `virt` vs BCM2711 GIC-400), selected at build time like the UART. ---
-#[cfg(not(feature = "pi"))]
+// --- MMIO bases: QEMU `virt` vs BCM2711 GIC-400 (Pi) vs Tegra234 GIC-600 (Jetson Orin), selected at
+// build time like the UART (serial.rs's three-way pattern). `tegra` is a GICv3 SoC, so it inherits the
+// v3 redistributor path below with its own bases; it never touches the v2 GICC MMIO. ---
+#[cfg(all(not(feature = "pi"), not(feature = "tegra")))]
 const GICD_BASE: usize = 0x0800_0000; // QEMU virt distributor (VIRT_GIC_DIST)
-#[cfg(not(feature = "pi"))]
-const GICC_BASE: usize = 0x0801_0000; // QEMU virt CPU interface (VIRT_GIC_CPU)
-
+#[cfg(feature = "tegra")]
+const GICD_BASE: usize = 0x0F40_0000; // Tegra234 GIC-600 distributor (upstream tegra234.dtsi, 64 KiB)
 #[cfg(feature = "pi")]
 const GICD_BASE: usize = 0xFF84_1000; // BCM2711 GIC-400 distributor
+
+// GICv2 memory-mapped CPU interface. GICv3 (virt-v3 / tegra) uses the ICC_*_EL1 system registers and
+// never reads this, but `gicc_read`/`gicc_write` + `init_v2` reference it unconditionally, so it must
+// resolve on every build. tegra shares virt's value (inert — the tegra path is v3, never entering
+// init_v2/gicc_*), which keeps virt's token byte-identical.
+#[cfg(not(feature = "pi"))]
+const GICC_BASE: usize = 0x0801_0000; // QEMU virt CPU interface (VIRT_GIC_CPU); inert on tegra (v3)
 #[cfg(feature = "pi")]
 const GICC_BASE: usize = 0xFF84_2000; // BCM2711 GIC-400 CPU interface
 
-// --- GICv3 redistributor (QEMU `virt` only; the Pi GIC-400 is v2 and never reaches this code). ---
-// The GICD lives at the same 0x0800_0000 on virt for both versions; v3 adds the per-core GICR bank.
-#[cfg(not(feature = "pi"))]
+// --- GICv3 redistributor bases (v3 only; the Pi GIC-400 is v2 and never reaches this code). ---
+// The GICD lives at the same base on virt for both versions; v3 adds the per-core GICR bank.
+#[cfg(all(not(feature = "pi"), not(feature = "tegra")))]
 const GICR_BASE: usize = 0x080A_0000; // QEMU virt redistributor base (VIRT_GIC_REDIST)
-#[cfg(not(feature = "pi"))]
-const GICR_STRIDE: usize = 0x2_0000; // per-CPU: the RD frame (0) + the SGI frame (0x1_0000)
+#[cfg(feature = "tegra")]
+const GICR_BASE: usize = 0x0F44_0000; // Tegra234 GIC-600 redistributor base (upstream tegra234.dtsi, 2 MiB)
+// Per-core redistributor stride. QEMU virt is a 2-frame class (RD + SGI = 0x2_0000). The Tegra234
+// GIC-600 is a 4-frame class (RD + SGI + VLPI + reserved), so tegra derives its stride at runtime from
+// GICR_TYPER.VLPIS in `this_cpu_redistributor` rather than using this const — which therefore does not
+// exist on the tegra build.
+#[cfg(all(not(feature = "pi"), not(feature = "tegra")))]
+const GICR_STRIDE: usize = 0x2_0000; // QEMU virt: RD frame (0) + SGI frame (0x1_0000)
 #[cfg(not(feature = "pi"))]
 const GICR_SGI_OFFSET: usize = 0x1_0000; // the SGI/PPI register frame within one redistributor
 
@@ -306,7 +320,19 @@ fn this_cpu_redistributor() -> usize {
         if typer & (1 << 4) != 0 {
             panic!("GICv3: no redistributor frame for MPIDR affinity {:#010x}", target);
         }
-        frame += GICR_STRIDE;
+        // Advance to the next redistributor. virt uses its fixed 2-frame stride; tegra derives it from
+        // this frame's GICR_TYPER.VLPIS — bit 1 (bit 0 is PLPIS; the Last check above uses bit 4). A
+        // GICv4 4-frame RD (RD+SGI+VLPI+reserved) is 0x4_0000; a 2-frame one is 0x2_0000. (BSP-inert for
+        // JM4 single-core — the boot core matches the first frame before any advance — but correct for
+        // the deferred SMP arc on any redistributor layout.)
+        #[cfg(not(feature = "tegra"))]
+        {
+            frame += GICR_STRIDE;
+        }
+        #[cfg(feature = "tegra")]
+        {
+            frame += if typer & (1 << 1) != 0 { 0x4_0000 } else { 0x2_0000 };
+        }
     }
     panic!(
         "GICv3: redistributor walk exceeded {} frames (no Last bit / wrong stride) for affinity {:#010x}",

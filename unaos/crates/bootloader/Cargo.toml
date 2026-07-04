@@ -3,8 +3,20 @@ name = "bootloader"
 version = "0.1.0"
 edition = "2024"
 
+[features]
+default = []
+# Additive UEFI boot-time diagnostics for the Jetson Orin headless bring-up (JM2). Prints, BEFORE the
+# GOP lookup: firmware vendor/revision + UEFI spec revision, the GraphicsOutput handle COUNT (JM1 saw
+# get_handle_for_protocol → NOT_FOUND), ConOut's device path, and — the UART truth — the DTB /chosen
+# stdout-path + serial aliases (which UART the firmware drives as console, so JM3 knows whether the
+# tegra driver's UARTC base is right). Pulls in `fdt` to parse the device tree. OFF by default, so a
+# non-bootdiag build is byte-identical. Enabled by arroyo via UNAOS_BOOTDIAG=1.
+bootdiag = ["dep:fdt"]
+
 [dependencies]
 uefi = { version = "0.38.0", features = ["alloc", "global_allocator", "logger", "panic_handler"] }
 log = "0.4.21"
 xmas-elf = "0.10.0"
 unaos-boot-info = { path = "../boot-info" }
+# Only compiled with the `bootdiag` feature (device-tree parsing for the stdout-path/aliases dump).
+fdt = { version = "0.1.5", optional = true }

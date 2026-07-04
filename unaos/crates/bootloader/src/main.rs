@@ -95,10 +95,197 @@ fn boot_fail(fb_addr: u64, fb_size: usize, status: Status, what: &str) -> Status
     status
 }
 
+/// UEFI boot-time diagnostics (`bootdiag` feature; enabled via `UNAOS_BOOTDIAG=1`). For the Jetson
+/// Orin headless bring-up (JM2): surface the firmware identity, whether the platform publishes ANY
+/// GraphicsOutput protocol, ConOut's device path, and the device-tree console/UART truth. Best-effort:
+/// absent nodes/properties and unavailable protocols degrade to a note rather than aborting boot (the
+/// DTB parse additionally assumes a well-formed firmware device tree). Called while boot services are
+/// live, before the GOP lookup.
+#[cfg(feature = "bootdiag")]
+fn bootdiag() {
+    use uefi::boot::{self, SearchType};
+    use uefi::proto::console::gop::GraphicsOutput;
+
+    log::info!("BOOTDIAG: ===== UnaOS boot diagnostics (bootdiag) =====");
+
+    // Firmware identity + the UEFI spec revision it implements.
+    log::info!(
+        "BOOTDIAG: firmware vendor='{}' fw-revision={:#010x} uefi-revision={}",
+        uefi::system::firmware_vendor(),
+        uefi::system::firmware_revision(),
+        uefi::system::uefi_revision(),
+    );
+
+    // How many handles publish GraphicsOutput? JM1's `get_handle_for_protocol` returned NOT_FOUND on
+    // the Orin; count them explicitly so a truly headless SoC reads 0 (LocateHandleBuffer → NOT_FOUND)
+    // rather than leaving it ambiguous.
+    match boot::locate_handle_buffer(SearchType::from_proto::<GraphicsOutput>()) {
+        Ok(buf) => log::info!("BOOTDIAG: GraphicsOutput handles = {}", buf.len()),
+        Err(e) => log::info!("BOOTDIAG: GraphicsOutput handles = 0 ({:?})", e.status()),
+    }
+
+    // ConOut's device path — what device the firmware console output targets (a UEFI-side cross-check
+    // on the UART truth). The DTB stdout-path below is the canonical answer.
+    bootdiag_conout();
+
+    // The device tree's console truth (aarch64 only): /chosen stdout-path names the console UART, and
+    // /aliases resolves serial* to the physical UART node (its name carries the MMIO base). This is
+    // exactly what JM3 needs to confirm the tegra driver's UARTC base.
+    #[cfg(target_arch = "aarch64")]
+    bootdiag_dtb();
+
+    log::info!("BOOTDIAG: ===== end diagnostics =====");
+}
+
+/// Best-effort dump of ConOut's device path. The `uefi` crate has no safe getter for the ConsoleOut
+/// handle, so read it from the raw system table; every step degrades to an honest note on failure
+/// (no panic). Uses `to_string16` (not the `Display` impl, which `.unwrap()`s the text protocol).
+#[cfg(feature = "bootdiag")]
+fn bootdiag_conout() {
+    use uefi::boot;
+    use uefi::proto::device_path::{
+        text::{AllowShortcuts, DisplayOnly},
+        DevicePath,
+    };
+
+    let Some(st) = uefi::table::system_table_raw() else {
+        log::info!("BOOTDIAG: ConOut: system table unavailable");
+        return;
+    };
+    // SAFETY: the system table is valid while boot services are live.
+    let conout_ptr = unsafe { st.as_ref() }.stdout_handle;
+    // SAFETY: firmware-provided ConOut handle; `from_ptr` returns None if it is null.
+    let Some(handle) = (unsafe { uefi::Handle::from_ptr(conout_ptr) }) else {
+        log::info!("BOOTDIAG: ConOut: handle is null");
+        return;
+    };
+    match boot::open_protocol_exclusive::<DevicePath>(handle) {
+        Ok(dp) => match dp.to_string16(DisplayOnly(true), AllowShortcuts(true)) {
+            Ok(s) => log::info!("BOOTDIAG: ConOut device path: {}", s),
+            Err(e) => log::info!("BOOTDIAG: ConOut device path unrenderable ({:?})", e),
+        },
+        Err(e) => log::info!("BOOTDIAG: ConOut has no DevicePath ({:?})", e.status()),
+    }
+}
+
+/// Best-effort dump of the device-tree console/UART truth: the DTB model, the raw `/chosen`
+/// `stdout-path` (carries baud/format), `bootargs`, and the `serial*`/`uart*` `/aliases` (whose node
+/// names carry the physical MMIO base). Parses the DTB the firmware published as a UEFI configuration
+/// table. Any absent node/property degrades to a note; the header + block bounds are validated so a
+/// truncated DTB is skipped rather than faulting (a well-formed firmware DTB is otherwise assumed).
+#[cfg(all(feature = "bootdiag", target_arch = "aarch64"))]
+fn bootdiag_dtb() {
+    // EFI_DTB_TABLE_GUID (UEFI spec / EDK2 gFdtTableGuid), the same GUID the kernel handoff scan
+    // uses. The uefi 0.38 crate ships no named constant for it (ConfigTableEntry exposes only
+    // ACPI/SMBIOS/... GUIDs), so define it by string via the mistake-proof `guid!` macro rather
+    // than a hand-laid mixed-endian byte array.
+    let dtb_guid = uefi::guid!("b1b621d5-f19c-41a5-830b-d9152c69aae0");
+    let mut dtb_addr: u64 = 0;
+    uefi::system::with_config_table(|entries| {
+        for entry in entries {
+            if entry.guid == dtb_guid {
+                dtb_addr = entry.address as u64;
+                break;
+            }
+        }
+    });
+    if dtb_addr == 0 {
+        log::info!("BOOTDIAG: no DTB configuration table published by firmware");
+        return;
+    }
+
+    // Read the FDT magic + total size from the header (both big-endian, at offsets 0 and 4).
+    let hdr = dtb_addr as *const u8;
+    // SAFETY: firmware DTB base; the 8-byte header is valid while boot services are live.
+    let (magic, total) = unsafe {
+        let magic = u32::from_be_bytes([hdr.read(), hdr.add(1).read(), hdr.add(2).read(), hdr.add(3).read()]);
+        let total = u32::from_be_bytes([hdr.add(4).read(), hdr.add(5).read(), hdr.add(6).read(), hdr.add(7).read()]);
+        (magic, total)
+    };
+    // fdt 0.1.5's `Fdt::new` validates only magic + totalsize, not the internal block offsets, and
+    // several accessors PANIC on absent/empty data (`chosen()` → `.expect("/chosen is required")`,
+    // `root().model()` → `.unwrap()`, `Chosen::stdout/bootargs` underflow on an empty value).
+    // Firmware may legitimately omit any of these. So: require a full v17 header, bound the struct +
+    // strings blocks against the buffer (else the first traversal indexes out of bounds), and read
+    // every field via `find_node`/`property` (which return `Option`) — never via the panicking
+    // helpers. A sparse firmware DTB then degrades to a note instead of aborting boot.
+    if magic != 0xd00d_feed || total < 40 || total > 4 * 1024 * 1024 {
+        log::info!("BOOTDIAG: DTB @ {:#x}: bad magic/size (magic={:#010x} size={})", dtb_addr, magic, total);
+        return;
+    }
+    // SAFETY: total >= 40 confirms the full v17 fdt_header is present at hdr; these fields all lie
+    // within its first 40 bytes (off_dt_struct@8, off_dt_strings@12, size_dt_strings@32,
+    // size_dt_struct@36 — all big-endian).
+    let (off_struct, size_struct, off_strings, size_strings) = unsafe {
+        let off_struct = u32::from_be_bytes([hdr.add(8).read(), hdr.add(9).read(), hdr.add(10).read(), hdr.add(11).read()]) as u64;
+        let off_strings = u32::from_be_bytes([hdr.add(12).read(), hdr.add(13).read(), hdr.add(14).read(), hdr.add(15).read()]) as u64;
+        let size_strings = u32::from_be_bytes([hdr.add(32).read(), hdr.add(33).read(), hdr.add(34).read(), hdr.add(35).read()]) as u64;
+        let size_struct = u32::from_be_bytes([hdr.add(36).read(), hdr.add(37).read(), hdr.add(38).read(), hdr.add(39).read()]) as u64;
+        (off_struct, size_struct, off_strings, size_strings)
+    };
+    if off_struct + size_struct > total as u64 || off_strings + size_strings > total as u64 {
+        log::info!("BOOTDIAG: DTB @ {:#x}: struct/strings block out of bounds — skipping parse", dtb_addr);
+        return;
+    }
+    // SAFETY: `total` is the FDT-declared length, bounded to 4 MiB above.
+    let slice = unsafe { core::slice::from_raw_parts(hdr, total as usize) };
+    let fdt = match fdt::Fdt::new(slice) {
+        Ok(f) => f,
+        Err(e) => {
+            log::info!("BOOTDIAG: DTB @ {:#x}: parse failed ({:?})", dtb_addr, e);
+            return;
+        }
+    };
+    // Board model via the root node's `model` property (NOT `root().model()`, which unwraps).
+    let model = fdt
+        .find_node("/")
+        .and_then(|r| r.property("model"))
+        .and_then(|p| p.as_str())
+        .unwrap_or("(no model property)");
+    log::info!("BOOTDIAG: DTB @ {:#x} size={} model='{}'", dtb_addr, total, model);
+
+    // /chosen: the console UART truth. Read properties directly off the node — never via
+    // `fdt.chosen()` (whose helpers panic when /chosen is absent or a property value is empty). The
+    // raw stdout-path string carries the console (often an alias like `serial0`, with a baud suffix);
+    // the /aliases dump below resolves that alias to the physical UART node.
+    if let Some(chosen) = fdt.find_node("/chosen") {
+        match chosen.property("stdout-path").and_then(|p| p.as_str()) {
+            Some(sp) => log::info!("BOOTDIAG: /chosen stdout-path = '{}'", sp),
+            None => log::info!("BOOTDIAG: /chosen has no stdout-path property"),
+        }
+        if let Some(args) = chosen.property("bootargs").and_then(|p| p.as_str()) {
+            log::info!("BOOTDIAG: /chosen bootargs = '{}'", args);
+        }
+    } else {
+        log::info!("BOOTDIAG: no /chosen node");
+    }
+
+    // /aliases: the serial*/uart* → UART node mapping. The node name (e.g. "serial@0c280000")
+    // carries the physical MMIO base — directly comparable to the tegra driver's UARTC 0x0C28_0000.
+    match fdt.aliases() {
+        Some(aliases) => {
+            for (name, path) in aliases.all() {
+                if name.contains("serial") || name.contains("uart") {
+                    log::info!("BOOTDIAG: alias {} -> {}", name, path);
+                }
+            }
+        }
+        None => log::info!("BOOTDIAG: no /aliases node"),
+    }
+}
+
 #[entry]
 fn main() -> Status {
     uefi::helpers::init().unwrap();
     log::info!("UnaOS UEFI Bootloader Started");
+
+    // Boot-time diagnostics (UNAOS_BOOTDIAG=1 → `bootdiag` feature). Additive and OFF by default
+    // (byte-identical boot logs when off). Runs here — while boot services are live and before any
+    // GOP access — so a headless SoC (Jetson Orin) still surfaces the firmware identity, the GOP
+    // handle count, ConOut's device path, and the DTB console/UART truth. Best-effort: absent data
+    // degrades to a note rather than aborting boot.
+    #[cfg(feature = "bootdiag")]
+    bootdiag();
 
     let fb_addr: u64;
     let fb_size: usize;
@@ -109,19 +296,46 @@ fn main() -> Status {
     let mut edid_source: u32 = 0;
     let mut mode_action: u32 = 0;
 
-    {
+    'gop: {
+        // Acquire the GraphicsOutput protocol. On firmware that publishes no GOP at all — a headless
+        // server SoC like the Jetson Orin, which drives only a serial console — one of these lookups
+        // fails (JM1 saw `get_handle_for_protocol` → NOT_FOUND). Rather than bounce back to the
+        // firmware boot picker (the old `return Status::UNSUPPORTED`, invisible on a serial-less box),
+        // both Err arms now BOOT HEADLESS: zero the framebuffer info so `fb_addr == 0` tells the kernel
+        // to fall back to a serial-only console, and record `mode_action = 4` ("headless, no GOP
+        // protocol") for the boot-log readout. `break 'gop` skips the whole display-mode-selection body.
         let gop_handle = match boot::get_handle_for_protocol::<GraphicsOutput>() {
             Ok(handle) => handle,
             Err(e) => {
-                log::error!("Failed to get GraphicsOutput handle: {:?}", e);
-                return Status::UNSUPPORTED;
+                log::warn!("No GraphicsOutput handle ({:?}); booting headless (serial only)", e);
+                fb_info = FrameBufferInfo {
+                    width: 0,
+                    height: 0,
+                    stride: 0,
+                    bytes_per_pixel: 4,
+                    pixel_format: PixelFormat::Unknown,
+                };
+                fb_addr = 0;
+                fb_size = 0;
+                mode_action = 4;
+                break 'gop;
             }
         };
         let mut gop = match boot::open_protocol_exclusive::<GraphicsOutput>(gop_handle) {
             Ok(gop) => gop,
             Err(e) => {
-                log::error!("Failed to open GraphicsOutput protocol: {:?}", e);
-                return Status::UNSUPPORTED;
+                log::warn!("GraphicsOutput handle present but open failed ({:?}); booting headless", e);
+                fb_info = FrameBufferInfo {
+                    width: 0,
+                    height: 0,
+                    stride: 0,
+                    bytes_per_pixel: 4,
+                    pixel_format: PixelFormat::Unknown,
+                };
+                fb_addr = 0;
+                fb_size = 0;
+                mode_action = 4;
+                break 'gop;
             }
         };
         
@@ -424,10 +638,10 @@ fn main() -> Status {
     // AArch64 DTB logic
     #[cfg(target_arch = "aarch64")]
     {
-        // uefi::table::cfg::DEVICE_TREE_GUID
-        let dtb_guid = uefi::Guid::from_bytes([
-            0xb1, 0xb6, 0x21, 0xb1, 0x59, 0xc1, 0x4a, 0x4f, 0x93, 0x20, 0xd0, 0x04, 0x67, 0xe4, 0x8a, 0xe9,
-        ]);
+        // EFI_DTB_TABLE_GUID (UEFI spec / EDK2 gFdtTableGuid). The uefi 0.38 crate ships no named
+        // constant for it (ConfigTableEntry exposes only ACPI/SMBIOS/... GUIDs), so define it by
+        // string via the mistake-proof `guid!` macro rather than a hand-laid mixed-endian byte array.
+        let dtb_guid = uefi::guid!("b1b621d5-f19c-41a5-830b-d9152c69aae0");
         
         uefi::system::with_config_table(|config_table| {
             for config_entry in config_table {
