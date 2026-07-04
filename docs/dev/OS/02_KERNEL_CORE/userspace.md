@@ -110,8 +110,8 @@
   round-trip -> PASS`, `4 hostile pointers refused (EFAULT), 0 kills -> PASS`,
   `yield/sleep interleave -> PASS`, the per-task preempt line (all 0 under QEMU;
   > 0 on metal), with M6c/M6b/M6d/M6e + CAPSTONE all unchanged and 0 unexpected
-  faults. Metal rides along with M6g's reflash (validation + copies run under the
-  ASIDs the metal already proved; the preempt counter goes > 0 there).
+  faults. ★ Metal-confirmed (real Pi 4, 2026-07-04, on the M6g reflash): all three M6f
+  verdicts PASS on silicon and the per-task preempt counter went > 0 (`spsentinel=3`).
 - **M6g** — load a program FROM STORAGE and run it at EL0 (the Pi twin of x86 U2).
   The block layer (`drivers::block`) now dispatches over a registered backend: the
   default xHCI USB-MSC path is untouched, and a new `register_sd` (cfg-gated to
@@ -137,9 +137,14 @@
   (Fat32)`, `HELLO.BIN loaded from SD (51 bytes) -> EL0`, a second `hello from EL0`,
   `disk-loaded EL0 program exited ok -> PASS`, with M6b/M6c/M6d/M6e/M6f + CAPSTONE
   all unchanged and 0 unexpected faults; the `UNAOS_SDIMG=0` control adds exactly the
-  two no-card lines + the loader-skipped line. Metal-only: the EMMC2 base actually
-  carrying the card, the mailbox clock-rate query against real firmware, real card
-  timing, and the M6f preempt-counter riders (all pending the M6g reflash).
+  two no-card lines + the loader-skipped line. **★ Metal-confirmed (real Pi 4,
+  2026-07-04):** the EMMC2-first success leg — which QEMU cannot exercise — ran on
+  silicon: no fallback line, `SD card @0xfe340000 identified — 31116288 blocks (15193
+  MiB, CSD v2)` (the real ~16 GB SDHC card, block-addressed), then FAT mount + `HELLO.BIN
+  loaded from SD (51 bytes) -> EL0` + second `hello from EL0` + `disk-loaded EL0 program
+  exited ok -> PASS`, with M6b/M6d/M6e/M6f + CAPSTONE 6/6 all green and 0 unexpected
+  faults. The reflash also carried M6f's metal (all three M6f verdicts PASS; the per-task
+  preempt rider went > 0 — `spsentinel=3`).
 - Not yet: a process/handle model (U4) and a code-signing / allowlist gate on the
   loader (`SECURITY.md`).
 
