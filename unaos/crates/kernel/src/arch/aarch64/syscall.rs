@@ -21,7 +21,7 @@
 // faulting inline fixtures) and a verdict task that demands the EXACT outcome split — see `verdict`
 // and main.rs. M6f adds a real copy_from_user and a wider surface.
 
-use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicI32, AtomicU8, AtomicU32, AtomicU64, Ordering};
 
 // --- Syscall numbers. WRITE/EXIT are the M6a/M6b core; REPORT is the M6d demo channel; YIELD/SLEEP_MS/
 // GETPID/GETINFO are the M6f "real" surface (all thin over existing scheduler/timer primitives). The
@@ -41,6 +41,13 @@ const SYS_SLEEP_MS: u64 = 5;
 const SYS_GETPID: u64 = 6;
 /// M6f: write a fixed {pid, ticks} struct to the user pointer in x0 via `copy_to_user`. Returns 0 or -EFAULT.
 const SYS_GETINFO: u64 = 7;
+/// M7: load the fixed on-disk program (`HELLO.BIN`) into a fresh per-task slot, run it at EL0 as a CHILD,
+/// and return the child's pid (or a negative errno). No args this arc — arbitrary program-by-name is M8
+/// (it needs a validated `copy_from_user` name). See `sys_spawn`.
+const SYS_SPAWN: u64 = 8;
+/// M7: block the caller until the child with pid `a0` exits, then return its exit status (or -ECHILD if
+/// no such child). Woken by the child's `done.post()` — a scheduler wake, so it works under QEMU. See `sys_wait`.
+const SYS_WAIT: u64 = 9;
 
 /// M6e demo: the sentinel `sys_exit` status the preemption spinner uses so its exit is accounted to
 /// `EL0_SPIN_DONE` and never perturbs the M6b `exited/killed` counters. Demo-only — there is no real
@@ -53,6 +60,14 @@ const M6D_EXIT_STATUS: u64 = 0x6D;
 /// M6f demo: the sentinel `sys_exit` status every M6f fixture uses so its exit lands in `EL0_M6F_DONE` and
 /// never perturbs the M6b/M6d/M6e counters (same discipline as M6D/M6E). Tested BEFORE the catch-all `else`.
 const M6F_EXIT_STATUS: u64 = 0x6F;
+/// M7 demo: the sentinel `sys_exit` status the process-model PARENT (`el0-m7parent`) uses so ITS exit lands
+/// in `EL0_M7_DONE`, never perturbing the M6b/M6d/M6e/M6f/M6g counters (same sentinel discipline). The CHILD
+/// is reaped through the Proc table by pid (see the SYS_EXIT arm), not by this status.
+const M7_EXIT_STATUS: u64 = 0x77;
+/// M7: the exit status the child-KILL path stores into a child's Proc entry so a killed child still wakes
+/// its parent's `sys_wait` (rather than hanging it) — non-zero so the parent's witness computes 0 (a killed
+/// child is a FAIL). A normal child exits with its own status (0 for `HELLO.BIN`); this is used only on a kill.
+const M7_KILLED_STATUS: i32 = 0x4B; // 'K'
 
 // --- The inline EL0 FIXTURES: three fault-SHAPE fixtures (M6b) + one preemption spinner (M6e). These
 // are fixtures, not programs, so they stay inline in the kernel image; only the well-behaved `hello`
@@ -370,6 +385,55 @@ unsafe extern "C" {
     static __m6f_prog_sleep: u8;
 }
 
+// --- M7 inline EL0 PARENT fixture (a minimal process model). Position-independent, register-only (writes no
+// user stack — safe on any slot under preemption), so it runs wherever the kernel copies it into its slot's
+// code page. It exercises the new surface: SYS_SPAWN loads the fixed on-disk `HELLO.BIN` as a CHILD and
+// returns the child pid; SYS_WAIT blocks the parent until that child exits and returns its status; the parent
+// then reports a WITNESS (the child pid iff the reap succeeded with status 0, else 0) and exits with the M7
+// sentinel status (`0x77` -> EL0_M7_DONE, off every prior counter). ABI: x8=nr, args x0-x2, ret x0. ---
+core::arch::global_asm!(
+    r#"
+    .globl __m7_parent_blob_start
+__m7_parent_blob_start:
+    .balign 4
+    .globl __m7_prog_parent
+__m7_prog_parent:
+    mov  x8, #8                            // SYS_SPAWN (loads HELLO.BIN as a child; returns pid or -errno)
+    svc  #0
+    mov  x19, x0                           // x19 = child pid (P) or a negative errno
+    cmp  x19, #0
+    b.gt 1f                                // signed pid > 0 -> reap it; else the spawn failed
+    mov  x0, xzr                           // spawn failed: witness = 0
+    mov  x8, #3                            // SYS_REPORT(0)
+    svc  #0
+    b    2f
+1:  mov  x0, x19                           // SYS_WAIT(pid) — blocks until the child exits (scheduler wake)
+    mov  x8, #9
+    svc  #0
+    mov  x20, x0                           // x20 = child exit status (S)
+    mov  x22, xzr                          // witness = 0
+    cmp  x20, #0
+    b.ne 3f                                // status != 0 (a killed/failed child) -> witness stays 0
+    mov  x22, x19                          // status == 0 -> witness = the child pid
+3:  mov  x0, x22                           // SYS_REPORT(witness)
+    mov  x8, #3
+    svc  #0
+2:  mov  x8, #2                            // SYS_EXIT(M7_EXIT_STATUS) -> EL0_M7_DONE
+    movz x0, #0x77
+    svc  #0
+4:  b 4b                                   // sys_exit never returns; belt-and-braces guard
+    .balign 4
+    .globl __m7_parent_blob_end
+__m7_parent_blob_end:
+"#
+);
+
+unsafe extern "C" {
+    static __m7_parent_blob_start: u8;
+    static __m7_parent_blob_end: u8;
+    static __m7_prog_parent: u8;
+}
+
 /// The `hello` EL0 program (M6c), built as a SEPARATE link product (`crates/user-blob`) and baked in
 /// as a flat binary instead of living in the kernel's `.text`. `arroyo kernel8` builds it — a naked,
 /// position-independent `sys_write("hello from EL0\n") + sys_exit(0)` routine — for the bare aarch64
@@ -517,6 +581,105 @@ static EL0_M6G_KILLED: AtomicU32 = AtomicU32::new(0);
 /// Set by `m6f_verdict` as its last act: the M6g loader waits on this so every LOADER M6g line lands after
 /// the M6b/M6e/M6d/M6f verdict lines (the Part-B probe's two early M6g lines land before the demo).
 static M6F_VERDICT_PRINTED: AtomicBool = AtomicBool::new(false);
+
+// =============================================================================================
+// M7 accounting — a minimal process model: sys_spawn (load+run a child from storage) + sys_wait (reap it)
+// =============================================================================================
+
+/// Set when `m6g_loader` returns (every path). The M7 launcher gates on this so (a) all M6g lines print
+/// FIRST — ordering — and (b) the M6d/M6f/M6g slots have freed (their tasks exited), so the parent's and
+/// child's slot allocations succeed. (M6d + M6f hold all 8 slots when the BSP wires the demo; they free as
+/// their fixtures exit, so M7's slots can only be claimed at run-time, after this gate — see `m7_launcher`.)
+static M6G_LOADER_DONE: AtomicBool = AtomicBool::new(false);
+
+/// A spawned child's exit STATUS is stored valid once `state == PEXITED`.
+const PFREE: u8 = 0; // entry unused
+const PRUNNING: u8 = 1; // claimed; a child is (or is about to be) running under `pid`
+const PEXITED: u8 = 2; // the child exited/was killed; `status` is valid, awaiting reap by sys_wait
+
+/// The process table: parent + up to a few children. Static so it OUTLIVES each child's `Task` Box (which is
+/// freed on exit) and each child's slot teardown — the reap accounting must survive both. `MAX_PROCS` is a
+/// small cap « USER_SLOTS (8): if it exhausts, sys_spawn returns `-EAGAIN`, never grows the slot pool (a STOP
+/// tripwire). `done` is posted exactly once by the child (its exit OR its kill path) and waited exactly once
+/// by the parent's sys_wait, so a reaped-then-reused entry always starts at 0 permits (no drain needed).
+const MAX_PROCS: usize = 4;
+struct Proc {
+    /// The child task id; the sys_wait key. 0 while an entry is FREE or a claim's pid is not yet stored.
+    pid: AtomicU64,
+    /// The child's exit status; valid once `state == PEXITED`.
+    status: AtomicI32,
+    /// FREE / RUNNING / EXITED — the ownership + lifecycle token (CAS'd FREE->RUNNING to claim).
+    state: AtomicU8,
+    /// Posted once by the child (SYS_EXIT or the kill path), awaited once by the parent's sys_wait. The
+    /// scheduler-post wake makes sys_wait work under QEMU (unlike a timer-driven `sleep_ticks`).
+    done: super::sched::Semaphore,
+}
+static PROCS: [Proc; MAX_PROCS] = [const {
+    Proc {
+        pid: AtomicU64::new(0),
+        status: AtomicI32::new(0),
+        state: AtomicU8::new(PFREE),
+        done: super::sched::Semaphore::new(0),
+    }
+}; MAX_PROCS];
+
+/// The parent's WITNESS (reported via SYS_REPORT): the reaped child's pid iff the reap succeeded with exit
+/// status 0, else 0. `m7_launcher`'s verdict demands it be a non-zero pid (and `EL0_M7_KILLED == 0`).
+static M7_PARENT_WITNESS: AtomicU64 = AtomicU64::new(0);
+/// The parent reached its `0x77` sentinel exit (the demo's completion signal; want 1). Read by the verdict.
+static EL0_M7_DONE: AtomicU32 = AtomicU32::new(0);
+/// A killed M7 task (child or parent) — a real bug (the child is well-behaved; a kill fails the verdict).
+/// Kept OFF the M6b `killed_unexpected` counter (see `record_el0_kill`) so an M7 failure is its own FAIL.
+static EL0_M7_KILLED: AtomicU32 = AtomicU32::new(0);
+
+/// Claim a FREE Proc entry, returning its index. CAS on `state` (FREE->RUNNING) is the atomic ownership
+/// token; the pid=0 placeholder is overwritten with the real child pid (Release) by the caller AFTER the
+/// child is spawned (see `sys_spawn` — the child cannot be dispatched until the parent yields, so the real
+/// pid is always in place before any lookup). `None` if the table is full (-> `-EAGAIN`, never grow the pool).
+fn proc_reserve() -> Option<usize> {
+    for i in 0..MAX_PROCS {
+        if PROCS[i]
+            .state
+            .compare_exchange(PFREE, PRUNNING, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            PROCS[i].pid.store(0, Ordering::Release);
+            PROCS[i].status.store(0, Ordering::Release);
+            return Some(i);
+        }
+    }
+    None
+}
+
+/// Find the RUNNING Proc entry whose pid matches — the child-exit / child-kill lookup. Called with a live
+/// task id (`> 0`), so it never spuriously matches a fresh claim's pid=0 placeholder.
+fn proc_find_running(pid: u64) -> Option<usize> {
+    (0..MAX_PROCS).find(|&i| {
+        PROCS[i].state.load(Ordering::Acquire) == PRUNNING && PROCS[i].pid.load(Ordering::Acquire) == pid
+    })
+}
+
+/// Find the non-FREE (RUNNING or EXITED) Proc entry whose pid matches — the sys_wait lookup. `None` => the
+/// caller has no such child (`-ECHILD`).
+fn proc_find_child(pid: u64) -> Option<usize> {
+    (0..MAX_PROCS).find(|&i| {
+        PROCS[i].state.load(Ordering::Acquire) != PFREE && PROCS[i].pid.load(Ordering::Acquire) == pid
+    })
+}
+
+/// Release a Proc entry to FREE — after reaping in sys_wait, or unwinding a failed sys_spawn claim.
+fn proc_free(i: usize) {
+    PROCS[i].pid.store(0, Ordering::Release);
+    PROCS[i].state.store(PFREE, Ordering::Release);
+}
+
+/// M7: record the value the process-model PARENT reported via SYS_REPORT (its witness). Keyed by name like
+/// `m6d_report`/`m6f_report`; the SYS_REPORT arm calls all three and each ignores the others' tasks.
+fn m7_report(value: u64) {
+    if super::sched::current_name() == Some("el0-m7parent") {
+        M7_PARENT_WITNESS.store(value, Ordering::Release);
+    }
+}
 
 /// M6d: record a value an EL0 task reported via SYS_REPORT, keyed by the reporting task's name. Called on
 /// the reporting task's own kernel stack (from the SVC handler), IRQ-masked.
@@ -687,6 +850,24 @@ pub fn record_el0_kill(name: &str, ec: u64, far: u64, far_valid: bool) {
     // the loader's own verdict — route it to its own counter, never the M6b `killed_unexpected` count.
     if name == "m6g-hello" {
         EL0_M6G_KILLED.fetch_add(1, Ordering::AcqRel);
+        return;
+    }
+    // M7: a killed process-model task (the spawned CHILD or the PARENT). Off the M6b counter — a kill here
+    // is a real M7 bug that fails the M7 verdict, not a phantom M6b regression. For a killed CHILD, also post
+    // its Proc `done` (with a non-zero sentinel status) so the parent's blocked `sys_wait` WAKES instead of
+    // hanging — the child never reaches its own SYS_EXIT post. `current_id()` is the faulting task (still
+    // current here — see aarch64_el0_fault_handler), i.e. the child's pid = its Proc key.
+    if name == "m7-child" || name == "el0-m7parent" {
+        EL0_M7_KILLED.fetch_add(1, Ordering::AcqRel);
+        if name == "m7-child" {
+            if let Some(id) = super::sched::current_id() {
+                if let Some(i) = proc_find_running(id) {
+                    PROCS[i].status.store(M7_KILLED_STATUS, Ordering::Release);
+                    PROCS[i].state.store(PEXITED, Ordering::Release);
+                    PROCS[i].done.post();
+                }
+            }
+        }
         return;
     }
     let (base, size) = super::boot::user_region();
@@ -1060,16 +1241,19 @@ extern "C" fn aarch64_svc_handler(frame: *mut u64) {
     let ret: i64 = match nr {
         SYS_WRITE => sys_write(a0, a1, a2),
         SYS_REPORT => {
-            // Route by the reporting task's name: M6d names land in m6d_report, M6f names in m6f_report;
-            // each ignores the other's names, so calling both is safe and additive.
+            // Route by the reporting task's name: M6d names land in m6d_report, M6f names in m6f_report, the
+            // M7 parent in m7_report; each ignores the others' names, so calling all is safe and additive.
             m6d_report(a0);
             m6f_report(a0);
+            m7_report(a0);
             0
         }
         SYS_YIELD => sys_yield(),
         SYS_SLEEP_MS => sys_sleep_ms(a0),
         SYS_GETPID => super::sched::current_id().map(|id| id as i64).unwrap_or(-1),
         SYS_GETINFO => sys_getinfo(a0),
+        SYS_SPAWN => sys_spawn(),
+        SYS_WAIT => sys_wait(a0),
         SYS_EXIT => {
             // Demo accounting BEFORE the no-return exit. The sentinel statuses are routed to their own
             // counters so the M6b (`exited=1 killed=3`) and M6e (`completed=1`) verdicts stay byte-
@@ -1078,6 +1262,20 @@ extern "C" fn aarch64_svc_handler(frame: *mut u64) {
             // sentinel exit would land in EL0_EXITED_ERR and FAIL the M6b verdict). Otherwise: status 0 =
             // normal completion (hello); nonzero = a fault-test program self-reporting that its intended
             // fault never happened (survivor protocol).
+            // M7: a spawned CHILD's exit is reaped by its parent's sys_wait through the Proc table, keyed by
+            // pid — NOT by any counter. This precedes every check below (the same precedence rule) and
+            // SHORT-CIRCUITS to sched::exit() so the child's status-0 exit never lands in EL0_EXITED_OK
+            // (M6b's `exited=1`) nor any sentinel counter. Record status + EXITED, then post `done` so the
+            // (blocked or soon-to-block) parent's sys_wait wakes and reads the status. current_id() is the
+            // exiting child = its Proc key (stored by sys_spawn before the child could ever be dispatched).
+            if let Some(id) = super::sched::current_id() {
+                if let Some(i) = proc_find_running(id) {
+                    PROCS[i].status.store(a0 as i32, Ordering::Release);
+                    PROCS[i].state.store(PEXITED, Ordering::Release);
+                    PROCS[i].done.post();
+                    super::sched::exit(); // never returns
+                }
+            }
             // M6g: the disk-loaded program (the M6c `hello` bytes off the SD card) exits with status 0.
             // Route by NAME, BEFORE the sentinel-status checks, so its exit lands in the M6g counters and
             // never corrupts the M6b `EL0_EXITED_OK` accounting (which `exited=1` depends on).
@@ -1093,6 +1291,8 @@ extern "C" fn aarch64_svc_handler(frame: *mut u64) {
                 EL0_M6D_DONE.fetch_add(1, Ordering::AcqRel);
             } else if a0 == M6F_EXIT_STATUS {
                 EL0_M6F_DONE.fetch_add(1, Ordering::AcqRel);
+            } else if a0 == M7_EXIT_STATUS {
+                EL0_M7_DONE.fetch_add(1, Ordering::AcqRel);
             } else if a0 == 0 {
                 EL0_EXITED_OK.fetch_add(1, Ordering::AcqRel);
             } else {
@@ -1306,6 +1506,160 @@ fn m6f_report(value: u64) {
 }
 
 // =============================================================================================
+// M7: sys_spawn (load+run a child from storage) + sys_wait (block-reap) + the shared loader core
+// =============================================================================================
+
+// Negative errnos returned to EL0 by sys_spawn/sys_wait (Linux-aarch64 values). These never appear in the
+// demo's serial output — the parent fixture only tests the SIGN of the spawn return — but are named for the
+// (future) real userspace that will interpret them. `EFAULT` (-14) is already defined for the M6f copies.
+const ENOENT: i64 = -2; // no such file (HELLO.BIN missing)
+const EIO: i64 = -5; // read/mount I/O error, or an empty file
+const E2BIG: i64 = -7; // the program is larger than one code page
+const ECHILD: i64 = -10; // sys_wait: no child with that pid
+const EAGAIN: i64 = -11; // the process table (or slot pool) is full
+const ENODEV: i64 = -19; // no block device / FAT volume to load from
+
+/// A program successfully loaded into a fresh per-task slot: the EL0 entry VA, the initial SP_EL0, the
+/// slot's TTBR0, and (for the M6g loader's log line) the slot id, byte length, and FAT kind.
+struct Loaded {
+    base: u64,
+    sp: u64,
+    ttbr0: u64,
+    slot: usize,
+    len: usize,
+    kind: crate::fs::fat::FatKind,
+}
+
+/// Why `load_program_into_slot` could not produce a `Loaded`. The `FatKind` rides along on the post-mount
+/// variants so the M6g loader can reproduce its exact "FAT mounted from SD (..)" progress line before its
+/// specific skip line (keeping the M6g gate byte-identical); sys_spawn maps every variant to a negative errno.
+enum SpawnErr {
+    NoMount(crate::fs::fat::FatError),
+    NoFile(crate::fs::fat::FatKind),
+    BadSize(crate::fs::fat::FatKind, u32),
+    ReadErr(crate::fs::fat::FatKind, crate::fs::fat::FatError),
+    Empty(crate::fs::fat::FatKind),
+    NoSlot(crate::fs::fat::FatKind),
+}
+
+/// Map a load failure to the errno sys_spawn returns to EL0.
+fn spawn_errno(e: &SpawnErr) -> i64 {
+    match e {
+        SpawnErr::NoMount(_) => ENODEV,
+        SpawnErr::NoFile(_) => ENOENT,
+        SpawnErr::BadSize(_, _) => E2BIG,
+        SpawnErr::ReadErr(_, _) | SpawnErr::Empty(_) => EIO,
+        SpawnErr::NoSlot(_) => EAGAIN,
+    }
+}
+
+/// The shared loader CORE for both `m6g_loader` and `sys_spawn`: mount the FAT volume off the SD card, find
+/// and size-check the fixed program (`HELLO.BIN`), read it, copy it into a FRESH per-task slot's code page,
+/// I-cache-sync, protect the page EL0-RX/EL1-RO BEFORE any task exists, and return the run parameters. It
+/// PRINTS NOTHING (so sys_spawn stays silent inside the M7 flow) — the M6g loader reconstructs its serial
+/// lines from the `Loaded`/`SpawnErr` result.
+///
+/// The slot is allocated LAST — after every fallible step (mount/find/size/read) — so no failure path ever
+/// leaves an allocated slot to free (the A72 exposes no "free an unused slot" primitive, and
+/// `teardown_user_slot` would repoint the caller's live TTBR0). A single `alloc_user_slot` attempt suffices:
+/// both callers run only after M6d/M6f/M6g released their slots, so the pool has room. The loaded bytes are
+/// UNTRUSTED — nothing about them is trusted beyond the one-page size bound; they run only under EL0 +
+/// per-page permissions + the M6b fault-kill net (no signature, no allowlist). That containment is the point.
+fn load_program_into_slot() -> Result<Loaded, SpawnErr> {
+    let fs = crate::fs::fat::mount().map_err(SpawnErr::NoMount)?;
+    let kind = fs.kind();
+    let de = fs.find_in_root("HELLO.BIN").map_err(|_| SpawnErr::NoFile(kind))?;
+    // Reject up-front from the ON-DISK directory size (the U2 truncation lesson): `read_file` caps the copy
+    // at min(de.size, cap), so a post-read length check could never SEE an oversize file — it would silently
+    // truncate then run it. Gate on `de.size` against the single code page instead.
+    let cap = super::boot::USER_CODE_SIZE;
+    if de.size == 0 || de.size as u64 > cap as u64 {
+        return Err(SpawnErr::BadSize(kind, de.size));
+    }
+    let mut bytes: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
+    fs.read_file(&de, &mut bytes, cap).map_err(|e| SpawnErr::ReadErr(kind, e))?;
+    if bytes.is_empty() {
+        return Err(SpawnErr::Empty(kind));
+    }
+    let slot = super::boot::alloc_user_slot().ok_or(SpawnErr::NoSlot(kind))?;
+    let (base, size) = super::boot::user_region();
+    let backing = super::boot::slot_backing_ptr(slot);
+    unsafe { core::ptr::copy_nonoverlapping(bytes.as_ptr(), backing, bytes.len()) };
+    super::cache::icache_sync_range(backing as usize, bytes.len());
+    unsafe { super::boot::protect_user_slot_code(slot, super::boot::USER_CODE_SIZE) };
+    Ok(Loaded {
+        base,
+        sp: (base + size as u64) & !0xF, // 16-aligned window top = initial SP_EL0
+        ttbr0: super::boot::slot_ttbr0(slot),
+        slot,
+        len: bytes.len(),
+        kind,
+    })
+}
+
+/// SYS_SPAWN(): load the fixed on-disk program (`HELLO.BIN`) into a fresh slot and run it at EL0 as a CHILD
+/// of the caller; return the child's pid, or a negative errno. No arguments this arc — the program is fixed;
+/// arbitrary program-by-name is M8 (it needs a validated `copy_from_user` name, a STOP tripwire here).
+///
+/// Race-freedom (the child cannot exit before its pid is recorded): the whole SVC handler runs IRQ-masked and
+/// the CHILD is co-located on the CALLER's core, so the child stays queued-not-dispatched until the parent
+/// yields (which it does only later, in sys_wait). We (1) claim a Proc entry, (2) load the program, (3) spawn
+/// the child (queued, not run), (4) store its real pid with Release — all before returning to EL0, hence
+/// strictly before the parent can yield and let the child run. The child's exit/kill lookup therefore always
+/// observes the stored pid. This co-location invariant is load-bearing and QEMU-true (no sched change needed).
+fn sys_spawn() -> i64 {
+    // Gate: we need a block device to load the child off. -ENODEV so a no-SD boot fails the spawn cleanly.
+    if crate::drivers::block::info().is_none() {
+        return ENODEV;
+    }
+    // Claim the Proc entry FIRST, so a failed load frees nothing but the entry, and (crucially) so the pid
+    // slot exists to receive the real pid before the child can be dispatched.
+    let Some(i) = proc_reserve() else {
+        return EAGAIN; // process table full
+    };
+    let loaded = match load_program_into_slot() {
+        Ok(l) => l,
+        Err(e) => {
+            proc_free(i); // no slot was allocated on any failure path — just release the entry
+            return spawn_errno(&e);
+        }
+    };
+    // Co-locate the child on the caller's core (the invariant above): sys_spawn always runs with its EL0
+    // caller current, so `this_cpu` is the parent's core.
+    let cpu = super::percpu::this_cpu().cpu_index as usize;
+    let pid = super::sched::spawn_user_slot("m7-child", loaded.base, loaded.sp, loaded.ttbr0, cpu);
+    // Record the real pid (Release) BEFORE returning to EL0 — before the parent can yield and let the child
+    // run. The child's exit path (proc_find_running) is guaranteed to see this.
+    PROCS[i].pid.store(pid, Ordering::Release);
+    pid as i64
+}
+
+/// SYS_WAIT(pid): block the caller until its child `pid` exits, then return the child's exit status (or
+/// `-ECHILD` if it has no such child). The waker is the child's `done.post()` — a SCHEDULER wake (from the
+/// child's SYS_EXIT or its kill path), so this works under QEMU (unlike a timer-driven sleep).
+///
+/// We wait on `done` UNCONDITIONALLY (not only when the child is still RUNNING): the child posts `done`
+/// exactly once (exit or kill), so waiting once either fast-returns a permit the child already left (child
+/// exited first — no park) or parks until the child posts. Exactly one post is consumed by exactly one wait,
+/// so the reaped entry's semaphore returns to 0 permits and is clean for reuse — the balance the process
+/// table relies on. (Under QEMU the child, co-located, cannot run until we block here, so it is always the
+/// park path; the fast path is the metal case where a timer preempts the parent between spawn and wait.)
+fn sys_wait(pid: u64) -> i64 {
+    let Some(i) = proc_find_child(pid) else {
+        return ECHILD;
+    };
+    let woken = PROCS[i].done.wait();
+    debug_assert!(woken, "sys_wait: called off a scheduled task");
+    // `Semaphore::wait` restores the SVC-entry DAIF (IRQ masked on exception entry), so IRQ is already masked
+    // here; re-mask defensively so the `__vec_svc` epilogue's banked ELR/SPSR/SP_EL0 restore is guaranteed
+    // I-masked regardless of any future change to wait()'s IRQ discipline (the sys_yield/sys_sleep contract).
+    remask_irq();
+    let status = PROCS[i].status.load(Ordering::Acquire) as i64;
+    proc_free(i); // reap: the entry is now free for reuse (its `done` is back at 0 permits)
+    status
+}
+
+// =============================================================================================
 // M6g: load a program FROM STORAGE and run it at EL0 (the Pi twin of x86 U2)
 // =============================================================================================
 
@@ -1321,7 +1675,15 @@ fn m6f_report(value: u64) {
 /// Ordering: it first waits (bounded) for `M6F_VERDICT_PRINTED` so every LOADER line lands AFTER the
 /// M6b/M6e/M6d/M6f verdict lines (the Part-B probe's two lines already printed early, on the BSP). A
 /// missing SD device / FAT volume / file / oversize logs one clean skip line and returns.
-pub fn m6g_loader(_: usize) {
+pub fn m6g_loader(arg: usize) {
+    m6g_loader_run(arg);
+    // Release the M7 gate: by here every M6g line has printed AND the M6d/M6f/M6g slots have freed (their
+    // tasks exited), so the M7 launcher may build the parent + child. Set on EVERY path (load / skip / no-SD)
+    // so the launcher never waits out its deadline; the launcher separately re-checks for an SD device.
+    M6G_LOADER_DONE.store(true, Ordering::Release);
+}
+
+fn m6g_loader_run(_: usize) {
     // 1. Wait (bounded ~8 s CNTPCT, yielding — the m6d_verdict idiom) for the M6f verdict to publish, so
     //    the loader's lines follow every prior verdict line rather than racing into the middle of them.
     let wstart = super::timer::cntpct();
@@ -1344,82 +1706,56 @@ pub fn m6g_loader(_: usize) {
         return;
     }
 
-    // 3. Mount the FAT volume off the SD card and locate + size-check HELLO.BIN.
-    let fs = match crate::fs::fat::mount() {
-        Ok(fs) => fs,
-        Err(e) => {
+    // 3-6. Load HELLO.BIN into a fresh slot via the shared core, then reproduce M6g's EXACT serial lines
+    //      from the result (the core is silent so sys_spawn stays quiet inside the M7 flow). Every skip path
+    //      first echoes the "FAT mounted from SD (..)" progress line (mirroring the original mid-flow print)
+    //      so the M6g gate is byte-identical. On success: emit the two M6g lines then drop the program to
+    //      EL0 on THIS core (the loader's), so the folded verdict's cooperative yield guarantees dispatch.
+    let loaded = match load_program_into_slot() {
+        Ok(l) => l,
+        Err(SpawnErr::NoMount(e)) => {
             serial_println!(":: M6g: no FAT volume ({:?}) — loader skipped ::", e);
             return;
         }
-    };
-    serial_println!(":: M6g: FAT mounted from SD ({:?}) ::", fs.kind());
-    let de = match fs.find_in_root("HELLO.BIN") {
-        Ok(de) => de,
-        Err(_) => {
+        Err(SpawnErr::NoFile(kind)) => {
+            serial_println!(":: M6g: FAT mounted from SD ({:?}) ::", kind);
             serial_println!(":: M6g: HELLO.BIN not found on the FAT volume — loader skipped ::");
             return;
         }
-    };
-    // Reject up-front from the ON-DISK directory size (the U2 truncation lesson): `read_file` caps the
-    // copy at min(de.size, cap), so a post-read length check could never SEE an oversize file — it would
-    // silently truncate then run it. Gate on `de.size` against the single code page instead.
-    let cap = super::boot::USER_CODE_SIZE;
-    if de.size == 0 || de.size as u64 > cap as u64 {
-        serial_println!(
-            ":: M6g: HELLO.BIN bad size {} bytes (must be 1..={}) — loader skipped ::",
-            de.size, cap
-        );
-        return;
-    }
-    let mut bytes: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
-    if let Err(e) = fs.read_file(&de, &mut bytes, cap) {
-        serial_println!(":: M6g: HELLO.BIN read error ({:?}) — loader skipped ::", e);
-        return;
-    }
-    if bytes.is_empty() {
-        serial_println!(":: M6g: HELLO.BIN read empty — loader skipped ::");
-        return;
-    }
-
-    // 4. Claim a private address-space slot (bounded poll: M6d/M6f free their 8 slots as their fixtures
-    //    exit, so after the step-1 wait at least 4 are free). Never grow the pool if it won't free (STOP).
-    let sstart = super::timer::cntpct();
-    let sdeadline = 2 * super::timer::cntfrq();
-    let slot = loop {
-        if let Some(s) = super::boot::alloc_user_slot() {
-            break s;
+        Err(SpawnErr::BadSize(kind, sz)) => {
+            serial_println!(":: M6g: FAT mounted from SD ({:?}) ::", kind);
+            serial_println!(
+                ":: M6g: HELLO.BIN bad size {} bytes (must be 1..={}) — loader skipped ::",
+                sz,
+                super::boot::USER_CODE_SIZE
+            );
+            return;
         }
-        if super::timer::cntpct().wrapping_sub(sstart) > sdeadline {
+        Err(SpawnErr::ReadErr(kind, e)) => {
+            serial_println!(":: M6g: FAT mounted from SD ({:?}) ::", kind);
+            serial_println!(":: M6g: HELLO.BIN read error ({:?}) — loader skipped ::", e);
+            return;
+        }
+        Err(SpawnErr::Empty(kind)) => {
+            serial_println!(":: M6g: FAT mounted from SD ({:?}) ::", kind);
+            serial_println!(":: M6g: HELLO.BIN read empty — loader skipped ::");
+            return;
+        }
+        Err(SpawnErr::NoSlot(kind)) => {
+            serial_println!(":: M6g: FAT mounted from SD ({:?}) ::", kind);
             serial_println!(":: M6g: no free address-space slot — loader skipped ::");
             return;
         }
-        super::sched::yield_now();
     };
-
-    // 5. Copy the UNTRUSTED bytes into the slot's code page through the Global identity backing VA (never
-    //    the EL0 window VA), I-cache-sync, then protect the page EL0-RX/EL1-RO BEFORE the task exists —
-    //    the M6d copy discipline. From here the bytes are contained only by EL0 + per-page perms + the
-    //    M6b fault-kill net; nothing about them is otherwise trusted.
-    let (base, size) = super::boot::user_region();
-    let backing = super::boot::slot_backing_ptr(slot);
-    unsafe { core::ptr::copy_nonoverlapping(bytes.as_ptr(), backing, bytes.len()) };
-    super::cache::icache_sync_range(backing as usize, bytes.len());
-    unsafe { super::boot::protect_user_slot_code(slot, super::boot::USER_CODE_SIZE) };
-
-    // 6. Drop it to EL0 in the slot: entry = the window base (blob offset 0), SP = 16-aligned window top.
-    //    Run it on THIS core (the loader's), so the verdict's cooperative `yield_now` below guarantees it
-    //    is dispatched (render/input own the other APs) — the x86 "same AP, FIFO after the program" idiom.
-    let ttbr0 = super::boot::slot_ttbr0(slot);
-    let asid = ttbr0 >> 48;
-    let sp = (base + size as u64) & !0xF;
-    let run_cpu = super::percpu::this_cpu().cpu_index as usize;
+    serial_println!(":: M6g: FAT mounted from SD ({:?}) ::", loaded.kind);
     serial_println!(
         ":: M6g: HELLO.BIN loaded from SD ({} bytes) -> EL0 (slot {}, ASID {}) ::",
-        bytes.len(),
-        slot,
-        asid
+        loaded.len,
+        loaded.slot,
+        loaded.ttbr0 >> 48
     );
-    super::sched::spawn_user_slot("m6g-hello", base, sp, ttbr0, run_cpu);
+    let run_cpu = super::percpu::this_cpu().cpu_index as usize;
+    super::sched::spawn_user_slot("m6g-hello", loaded.base, loaded.sp, loaded.ttbr0, run_cpu);
 
     // 7. Verdict (folded in — no extra task): wait (bounded ~2 s, yielding so m6g-hello runs on this core)
     //    for the disk program to terminate, then print PASS/FAIL. The disk blob's `sys_exit(0)` is routed
@@ -1443,6 +1779,118 @@ pub fn m6g_loader(_: usize) {
         serial_println!(
             ":: M6g: disk-loaded EL0 program FAIL — done={} err={} killed={} (want 1/0/0) ::",
             done, err, killed
+        );
+    }
+}
+
+// =============================================================================================
+// M7: the process-model demo — the parent's slot + the gated launcher/verdict
+// =============================================================================================
+
+/// The M7 parent's run parameters: its EL0 entry VA, initial SP_EL0, and slot TTBR0. (One task, one slot —
+/// unlike the M6d/M6f multi-slot demos.)
+struct M7Demo {
+    parent: u64,
+    sp: u64,
+    ttbr0: u64,
+}
+
+/// M7 setup: reserve the Proc semaphores, then allocate + build the PARENT's slot, copy the parent fixture
+/// into it, I-cache-sync, and protect the code page (EL0-RX/EL1-RO). Emits the M7 setup line; returns the
+/// parent's entry/sp/ttbr0. `None` if slot allocation fails. Called ONCE, from `m7_launcher`, AFTER the M6g
+/// gate — so the M6d/M6f/M6g slots have freed (at BSP-wiring time all 8 are held by M6d+M6f) and strictly
+/// before the parent (hence any child) exists, which is why the `done.init()` reservations here cannot race
+/// a concurrent wait/post (the M4 discipline, satisfied without needing the BSP specifically).
+fn m7_setup() -> Option<M7Demo> {
+    for p in &PROCS {
+        p.done.init();
+    }
+    let (base, size) = super::boot::user_region();
+    let sp = (base + size as u64) & !0xF; // 16-aligned window top = initial SP_EL0
+    let bstart = &raw const __m7_parent_blob_start as usize;
+    let bend = &raw const __m7_parent_blob_end as usize;
+    let blen = bend - bstart;
+    assert!(blen <= super::boot::USER_CODE_SIZE, "M7 parent blob does not fit in a code page");
+    // Entry VA = base + the parent fixture's offset within the blob (an eret to a misaligned entry is EC 0x22).
+    let parent = base + (&raw const __m7_prog_parent as usize - bstart) as u64;
+    assert!(parent & 3 == 0, "M7 parent entry misaligned");
+
+    let slot = super::boot::alloc_user_slot()?;
+    let backing = super::boot::slot_backing_ptr(slot);
+    // Copy the parent fixture into the slot's code page (identity backing VA) + I-cache sync (DC CVAU/IC IVAU;
+    // PIPT L1 caches make it fetchable at the aliased EL0 window VA), then protect it EL0-RX/EL1-RO.
+    unsafe { core::ptr::copy_nonoverlapping(bstart as *const u8, backing, blen) };
+    super::cache::icache_sync_range(backing as usize, blen);
+    unsafe { super::boot::protect_user_slot_code(slot, super::boot::USER_CODE_SIZE) };
+
+    serial_println!(
+        ":: M7: process model — sys_spawn + sys_wait (parent reaps a disk-loaded child) ::"
+    );
+    Some(M7Demo { parent, sp, ttbr0: super::boot::slot_ttbr0(slot) })
+}
+
+/// M7 launcher + verdict (the M6g-loader shape: one gated kernel task). Spawned on a scheduled sibling core;
+/// `parent_cpu` (the task arg) is the demo core the parent should run on. Flow:
+///   1. Wait (bounded) for `M6G_LOADER_DONE`, so all M6g lines print first AND the slots have freed.
+///   2. Skip silently if no SD device (the parent's sys_spawn loads the child off the card — nothing to run).
+///   3. `m7_setup()` (build the parent's slot, print the M7 setup line), then spawn the parent on `parent_cpu`.
+///      The parent's `sys_spawn` co-locates the CHILD on `parent_cpu` too — the invariant that keeps the child
+///      queued-not-dispatched until the parent blocks in sys_wait (so the child's pid is recorded first).
+///   4. Verdict (folded): wait (bounded CNTPCT) for the parent to finish its spawn→wait→report→exit
+///      round-trip, then PASS iff the parent reaped a real child (witness = a non-zero pid) with no kill.
+/// The three M7 lines (setup, the child's `hello from EL0` — the THIRD in a full boot — and the PASS) all
+/// land after the M6g lines and in that order (setup precedes the parent spawn; the child's hello precedes
+/// the parent's exit, which precedes EL0_M7_DONE, which the verdict polls before printing PASS).
+pub fn m7_launcher(parent_cpu: usize) {
+    // 1. Gate on the M6g loader (its lines printed + its/M6d's/M6f's slots freed).
+    let wstart = super::timer::cntpct();
+    let wdeadline = 10 * super::timer::cntfrq();
+    while !M6G_LOADER_DONE.load(Ordering::Acquire)
+        && super::timer::cntpct().wrapping_sub(wstart) <= wdeadline
+    {
+        super::sched::yield_now();
+    }
+
+    // One-shot (spawned once; guard defensively).
+    static DONE: AtomicBool = AtomicBool::new(false);
+    if DONE.swap(true, Ordering::Relaxed) {
+        return;
+    }
+
+    // 2. No SD device -> the child cannot be loaded; skip silently (keeps the no-SD control path free of M7
+    //    lines, mirroring how M6g's own no-SD path is the empty control).
+    if crate::drivers::block::info().is_none() {
+        return;
+    }
+
+    // 3. Build the parent's slot + spawn it on the demo core.
+    let Some(m7) = m7_setup() else {
+        serial_println!(":: M7: no free address-space slot — process-model demo skipped ::");
+        return;
+    };
+    super::sched::spawn_user_slot("el0-m7parent", m7.parent, m7.sp, m7.ttbr0, parent_cpu);
+
+    // 4. Folded verdict: wait (bounded ~5 s, yielding) for the parent to reach its sentinel exit, then judge.
+    let vstart = super::timer::cntpct();
+    let vdeadline = 5 * super::timer::cntfrq();
+    while EL0_M7_DONE.load(Ordering::Acquire) == 0
+        && super::timer::cntpct().wrapping_sub(vstart) <= vdeadline
+    {
+        super::sched::yield_now();
+    }
+    let witness = M7_PARENT_WITNESS.load(Ordering::Acquire);
+    let killed = EL0_M7_KILLED.load(Ordering::Acquire);
+    if witness != 0 && killed == 0 {
+        serial_println!(
+            ":: M7: parent spawned child pid={}, waited, child exited status 0 -> PASS ::",
+            witness
+        );
+    } else {
+        serial_println!(
+            ":: M7: process model FAIL — witness={} killed={} done={} (want pid>0 / 0 / 1) ::",
+            witness,
+            killed,
+            EL0_M7_DONE.load(Ordering::Acquire)
         );
     }
 }
