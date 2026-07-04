@@ -87,15 +87,16 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         boot_info.framebuffer_info,
     );
 
-    // 0b. Jetson Orin Nano (tegra): install the kernel's own MMU, then stop before GIC/timer. The
-    //     UEFI-handoff translation tables map RAM but NOT the Tegra peripheral MMIO (JM2 R4: the
-    //     kernel faulted on its first UARTC read), so `tegra_early_stop` first calls `mmu_tegra::init`
-    //     to map RAM Normal-WB + the Tegra device window Device-nGnRE (JM3 — the R4 UARTC-fault fix),
-    //     which is what finally lets the serial path drive UARTC. It still stops before the shared
-    //     `arch::init()` GIC + generic-timer bring-up, which walks QEMU-`virt` MMIO bases unmapped on
-    //     Tegra234 (that driver work is JM4). Diverges, so everything below is unreachable on tegra
-    //     (covered by the fn's `allow(unreachable_code)`). `tegra` is off in every QEMU build, so this
-    //     is inert there and the regression logs are byte-identical.
+    // 0b. Jetson Orin Nano (tegra): install the kernel's own MMU (JM3), then bring up the GIC + timer
+    //     on the boot core (JM4). The UEFI-handoff tables map RAM but NOT the Tegra peripheral MMIO
+    //     (JM2 R4: the kernel faulted on its first UARTC read), so `tegra_early_stop` first calls
+    //     `mmu_tegra::init` to map RAM Normal-WB + the Tegra device window Device-nGnRE — which is what
+    //     lets the serial path drive UARTC — then brings up the Tegra234 GIC-600 + the generic timer on
+    //     the boot core (their GIC bases sit in that mapped device window) and enters an interrupt-driven
+    //     idle. It diverges before the rest of `kernel_main` (heap/SMP/scheduler/GUI — later arcs), so
+    //     everything below is unreachable on tegra (covered by the fn's `allow(unreachable_code)`).
+    //     `tegra` is off in every QEMU build, so this is inert there and the regression logs are
+    //     byte-identical.
     #[cfg(all(feature = "tegra", target_arch = "aarch64"))]
     tegra_early_stop(boot_info);
 
@@ -659,18 +660,19 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     }
 }
 
-/// Jetson Orin Nano (Tegra234) MMU bring-up + early platform stop — the `tegra` build's terminus.
-/// JM3: the UEFI-handoff translation tables map RAM but NOT the Tegra peripheral MMIO (JM2 R4: the
-/// kernel faulted on its first UARTC read), so this first installs the kernel's OWN regime via
-/// `mmu_tegra::init` — RAM Normal-WB + the Tegra device window Device-nGnRE + a fault vector — which is
-/// what finally lets the serial path drive UARTC. It then stops BEFORE the shared `arch::init()` GIC +
-/// generic-timer bring-up (those walk QEMU-`virt` GICD/GICR bases unmapped on Tegra234 — JM4) and
-/// proves the kernel is alive over the now-mapped Tegra UART with a periodic heartbeat.
+/// Jetson Orin Nano (Tegra234) platform bring-up — the `tegra` build's terminus. JM3 installs the
+/// kernel's own MMU via `mmu_tegra::init` (RAM Normal-WB + the Tegra device window Device-nGnRE + a
+/// fault vector), which is what lets the serial path drive UARTC. JM4 then brings up the Tegra234
+/// GIC-600 + the ARM generic timer on the BOOT CORE and enters an interrupt-driven idle: the heartbeat
+/// is now driven by the timer PPI (INTID 30) delivered through the GIC, not a spin. It still stops
+/// BEFORE the rest of `kernel_main` (heap/memory init, SMP, scheduler, GUI — later arcs). SMP on Tegra
+/// (PSCI CPU_ON, affinity widening) is deferred; only the boot core's redistributor is brought up here.
 ///
 /// Diverges (so `kernel_main` is `!` on tegra and everything after the call site is unreachable —
-/// covered by that fn's `allow(unreachable_code)`). There is no timer IRQ to wake a `WFI`, so this
-/// is a plain spin: the heartbeat cadence climbing IS the liveness proof. `tegra` is off in every
-/// QEMU build, so this is never compiled into a regression run.
+/// covered by that fn's `allow(unreachable_code)`). If the timer IRQ delivers, the idle is `WFI` woken
+/// by each tick; if `verify_live` finds it does not (e.g. a wrong GIC base), it degrades to a poll-spin
+/// with a CNTPCT-driven heartbeat — a debuggable "alive but timer-IRQ-not-delivering" state, not a dark
+/// hang. `tegra` is off in every QEMU build, so this is never compiled into a regression run.
 #[cfg(all(feature = "tegra", target_arch = "aarch64"))]
 fn tegra_early_stop(boot_info: &BootInfo) -> ! {
     // 1. Install the kernel's own MMU FIRST — SILENT. Nothing has printed yet (fbcon::init is
@@ -715,20 +717,56 @@ fn tegra_early_stop(boot_info: &BootInfo) -> ! {
         if sctlr & 1 != 0 { "on" } else { "off" },
         (daif >> 6) & 0b1111,
     );
-    serial_println!(":: tegra: early platform stop (gic/timer discovery = JM4) ::");
+    // 3. JM4: bring up the Tegra234 GIC-600 + generic timer on the BOOT CORE so the heartbeat is
+    //    interrupt-driven. We reuse the shared, EL2-aware interrupt path piece by piece rather than
+    //    calling `arch::init()` (which would reprint its own "Core Hardware Init" + boot-diag banner).
+    //    `gic::init` now walks the Tegra234 GICD/GICR bases (mapped by mmu_tegra's L1[0] device window);
+    //    everything else — the EL2 vector table, HCR_EL2.IMO routing, the CNTP timer at INTID 30 — is
+    //    identical to the QEMU-virt/Pi path. `exceptions::install` here overwrites the bounded Part-C
+    //    fault vector mmu_tegra set for the switch window; from now on the full exceptions.rs table
+    //    (with the IRQ stub) is the handler. SMP/other cores are a later arc — boot core only.
+    serial_println!(":: tegra: JM4 — bringing up Tegra234 GIC-600 + generic timer (boot core) ::");
+    unaos_kernel::arch::percpu::init(0);
+    unaos_kernel::arch::exceptions::install();
+    unaos_kernel::arch::gic::init();
+    unaos_kernel::arch::timer::init();
+    unaos_kernel::arch::timer::diagnose();
+    unaos_kernel::arch::exceptions::enable_irq();
+    unaos_kernel::arch::timer::verify_live();
 
-    // Serial-alive idle loop: no GIC ⇒ no timer IRQ ⇒ no WFI (it would sleep forever with no wake
-    // source); a plain spin with a heartbeat every ~10^8 iterations. The heartbeat number climbing
-    // proves the kernel is alive and the Tegra UART TX path works from the kernel — the arc verdict.
-    let mut hb: u64 = 0;
+    // 4. Interrupt-driven idle. `arch::hlt()` parks in WFI when the timer IRQ is confirmed delivering
+    //    (woken by each PPI-30 tick) and falls back to a poll-spin otherwise (no wake source). The
+    //    heartbeat is now driven by `timer::ticks()` advancing — a climbing number proves the whole
+    //    timer→GIC→CPU-interface→vector→handler→EOI loop closed on Orin silicon (the JM4 verdict). If
+    //    `verify_live` reported NOT live, `ticks()` stays frozen, so a CNTPCT-driven fallback beat keeps
+    //    liveness visible and labels the degraded state (GIC up, PPI-30 not delivering).
+    let mut last_beat: u64 = 0;
+    let cntpct_hz: u64 = {
+        let f = unaos_kernel::arch::timer::cntfrq();
+        if f == 0 { 31_250_000 } else { f }
+    };
+    let mut next_cntpct: u64 = unaos_kernel::arch::timer::cntpct().wrapping_add(cntpct_hz);
+    let mut spin_hb: u64 = 0;
     loop {
-        let mut i: u64 = 0;
-        while i < 100_000_000 {
-            core::hint::spin_loop();
-            i += 1;
+        unaos_kernel::arch::hlt();
+        let t = unaos_kernel::arch::timer::ticks();
+        let beat = t / 250; // once per second of timer-driven time (timer.rs TICK_HZ = 250)
+        if beat != last_beat {
+            last_beat = beat;
+            serial_println!(":: tegra: heartbeat {} (ticks={}, live) ::", beat, t);
+        } else if !unaos_kernel::arch::timer::is_live() {
+            // Degraded: timer IRQ not delivering, so `ticks()` never moves. Prove liveness off the
+            // free-running physical counter instead — one beat per ~1 s of CNTPCT time.
+            let now = unaos_kernel::arch::timer::cntpct();
+            if now.wrapping_sub(next_cntpct) < (u64::MAX / 2) {
+                next_cntpct = now.wrapping_add(cntpct_hz);
+                serial_println!(
+                    ":: tegra: heartbeat {} (timer-IRQ NOT delivering — CNTPCT-driven) ::",
+                    spin_hb
+                );
+                spin_hb = spin_hb.wrapping_add(1);
+            }
         }
-        serial_println!(":: tegra: heartbeat {} ::", hb);
-        hb = hb.wrapping_add(1);
     }
 }
 

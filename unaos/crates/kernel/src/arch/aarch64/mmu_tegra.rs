@@ -169,7 +169,7 @@ pub fn init(boot_info: &BootInfo) -> MmuInfo {
 }
 
 /// Populate `L1`: `L1[0]` = the low-1-GiB Device window (covers UARTC 0x0C28_0000 and the Tegra234 GIC
-/// region 0x0F00_0000 for JM4), every RAM GiB the firmware map names = a Normal-WB block, the rest
+/// region 0x0F40_0000 for JM4), every RAM GiB the firmware map names = a Normal-WB block, the rest
 /// invalid. Returns the RAM-GiB mask. Runs on the still-active UEFI map (all RAM readable), MMU-on;
 /// plain volatile writes only.
 unsafe fn build_l1(boot_info: &BootInfo, el: u64) -> u64 {
