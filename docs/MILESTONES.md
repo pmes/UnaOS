@@ -12,7 +12,7 @@ Legend: **✅ metal-confirmed** · **🔬 QEMU-green, metal pending** · dates I
 
 ## hw-pi4 track — 2026-07-04 (landed on `hw-pi4`, awaiting integration)
 
-### M7 — a minimal process model: sys_spawn + sys_wait (aarch64) 🔬 `hw-pi4`
+### M7 — a minimal process model: sys_spawn + sys_wait (aarch64) ✅ `hw-pi4`
 - **What:** the reaping half of a process model — an EL0 program can now spawn a child
   program and reap it. **`SYS_SPAWN` (8)** loads the fixed on-disk `HELLO.BIN` into a
   fresh per-task slot and runs it at EL0 as a *child*, returning its pid; **`SYS_WAIT`
@@ -33,9 +33,17 @@ Legend: **✅ metal-confirmed** · **🔬 QEMU-green, metal pending** · dates I
   unexpected faults. x86 (`test` + `UNAOS_FATIMG=1 test`) functionally byte-identical
   through the U-lines (seam is `baremetal`-only; sole diffs are QEMU timer-calibration
   jitter); `check` both arches; aarch64 virt v2 + GICv3 JC2 SMP 3/3 unchanged.
-- **Tested — metal:** metal-pending (rides the next Pi reflash, a joint session with
-  Peter). Expected delta vs QEMU: the same PASS line; the child's `hello from EL0` off
-  the real card; preemption of the blocked parent — per-core timing only.
+- **Tested — metal (real Pi 4, 2026-07-04):** ★ PASS on silicon. `:: M7: parent spawned
+  child pid=41, waited, child exited status 0 -> PASS ::` — the parent `sys_spawn`ed a child
+  that loaded `HELLO.BIN` off the **real** card via the EMMC2-first path QEMU cannot exercise
+  (`SD card @0xfe340000 — 31116288 blocks (15193 MiB, CSD v2)`), printed the **third** `hello
+  from EL0`, and exited status 0; the parent's blocking `sys_wait` was woken by the child's
+  scheduler post and reaped it — all under a live timer (EL0 preemption live: M6e
+  `IRQs-taken-at-EL0=23`, M6f `spsentinel=3`). Full battery green on metal: M6b `exited=1
+  killed=3 PASS`, M6d ×3, M6f ×3, M6g `disk-loaded EL0 program exited ok -> PASS`, CAPSTONE
+  6/6, EL=1/CNTFRQ=54 MHz, **0 unexpected faults, 0 FAIL lines**. (Prepped non-destructively by
+  swapping `kernel8.img` on the mounted FAT volume — no re-flash needed; the gate-verified
+  binary.) Log: `target/serial-pi.m7-metal.log`.
 - **Commit:** this arc on `hw-pi4` (merge pending the integrator, who records the merge hash).
 
 ---

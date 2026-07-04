@@ -169,8 +169,12 @@
   a **third** `hello from EL0` (M6c inline #1, M6g loader #2, the M7 child #3), and
   `:: M7: parent spawned child pid=<p>, waited, child exited status 0 -> PASS ::`, with
   every M6b/M6c/M6d/M6e/M6f/M6g + CAPSTONE line unchanged and 0 unexpected faults.
-  **Metal-pending** (rides the next Pi reflash): same PASS line; the child's disk load
-  off the real card and preemption of the blocked parent are the metal-only deltas.
+  **★ Metal-confirmed (real Pi 4, 2026-07-04):** `:: M7: parent spawned child pid=41,
+  waited, child exited status 0 -> PASS ::` on silicon — the child loaded off the real
+  card via the EMMC2-first path QEMU cannot exercise (`SD card @0xfe340000 — 15193 MiB,
+  CSD v2`), printed the third `hello from EL0`, and was reaped by the parent's blocking
+  `sys_wait` (woken by the child's scheduler post) under a live timer, with the whole prior
+  battery green (M6b/M6d/M6e/M6f/M6g + CAPSTONE 6/6) and 0 unexpected faults.
 - Not yet: an arbitrary program-by-name `sys_spawn` (M8) and a code-signing / allowlist
   gate on the loader (`SECURITY.md`).
 
