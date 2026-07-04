@@ -345,7 +345,26 @@ extern "x86-interrupt" fn double_fault_handler(
     panic!("EXCEPTION: DOUBLE FAULT\n{:#?}", stack_frame);
 }
 
-extern "x86-interrupt" fn timer_interrupt_handler(_stack_frame: InterruptStackFrame) {
+/// U3.5: count of timer IRQs taken while the interrupted context was ring 3 (CPL 3) — i.e. the timer
+/// PREEMPTED a running preemptible ring-3 task. Cooperative ring 3 (RFLAGS.IF clear, the U1a/U1b/U2/
+/// U2.5/U3 fixtures) never lets the timer fire, so this stays 0 for them; a nonzero value is the
+/// preemptible-ring-3 proof. Metal-only truth — TCG may under-deliver, so the fixture gates on `> 0`,
+/// not an exact count.
+pub static IRQS_AT_RING3: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+extern "x86-interrupt" fn timer_interrupt_handler(stack_frame: InterruptStackFrame) {
+    // U3.5: a timer that fires while ring 3 is running (a PREEMPTIBLE task — RFLAGS.IF set) enters
+    // CPL 0 on TSS.RSP0 with GS still the USER gs. Conditionally `swapgs` so `note_tick()`/
+    // `this_cpu()`/the scheduler resolve the kernel per-CPU block (exactly like the U1b ring-3 fault
+    // handler), and swap back before the compiler-emitted `iretq`. `from_ring3` reads only the
+    // interrupt frame (no GS), so it is safe to consult before the swap. A CPL-0 tick (kernel task /
+    // scheduler idle / the cooperative demos, whose IF is clear so the timer never lands in their
+    // ring-3 run) takes neither branch — that path is byte-identical to before U3.5.
+    let from_user = from_ring3(&stack_frame);
+    if from_user {
+        unsafe { core::arch::asm!("swapgs", options(nostack, preserves_flags)) };
+        IRQS_AT_RING3.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    }
     // Local APIC timer tick. Lock-free. This CPU's own tick counter (each core's timer fires
     // independently at the calibrated 1 kHz) drives the per-CPU `sleep_ticks` deadlines.
     crate::arch::percpu::note_tick();
@@ -367,6 +386,16 @@ extern "x86-interrupt" fn timer_interrupt_handler(_stack_frame: InterruptStackFr
     // Preemption point. No-op unless a scheduled task is running on THIS cpu and its quantum
     // expired; runs with IF=0 (interrupt gate) and the preempted task's `iretq` restores its IF.
     crate::arch::sched::timer_preempt();
+    // U3.5: restore the user GS before the compiler-emitted `iretq` returns to ring 3. When the timer
+    // preempted a ring-3 task, `timer_preempt` switched away here and this runs only at RESUME time —
+    // when the task is re-dispatched, control returns from `timer_preempt` to exactly this point.
+    // `from_user` lived on the (preserved) kernel stack across the switch. The swap is self-correcting:
+    // it leaves `IA32_KERNEL_GS_BASE = &PerCpuData` for the next kernel entry regardless of the
+    // intervening switches, because the live GS here is always this CPU's kernel per-CPU pointer (the
+    // scheduler and CPU-pinned tasks never leave kernel GS while at CPL 0).
+    if from_user {
+        unsafe { core::arch::asm!("swapgs", options(nostack, preserves_flags)) };
+    }
 }
 
 /// Inter-processor interrupt handler (IDT vector `IPI_VECTOR`). Lock-free and WAKE-ONLY: record
@@ -375,9 +404,24 @@ extern "x86-interrupt" fn timer_interrupt_handler(_stack_frame: InterruptStackFr
 /// re-checks its run queue and picks up work a `spawn` just enqueued. Keeping it switch-free is
 /// what makes the running task's `current` pointer single-owner (only the scheduler loop and the
 /// timer preempt site ever switch).
-extern "x86-interrupt" fn ipi_handler(_stack_frame: InterruptStackFrame) {
+extern "x86-interrupt" fn ipi_handler(stack_frame: InterruptStackFrame) {
+    // U3.5: the reschedule IPI is a MASKABLE interrupt (interrupt gate), so once ring 3 is
+    // preemptible (RFLAGS.IF set) it — exactly like the timer — can be delivered while a ring-3 task
+    // runs, entering CPL 0 with GS still the user gs. `note_ipi()` is GS-relative (`this_cpu()`), so
+    // conditionally `swapgs` on a CPL-3 entry and swap back before `iretq`, the same treatment the
+    // timer handler gets (the brief's "the timer OR ANY IRQ" rule). A CPL-0 IPI — an idle or
+    // kernel-mode target, which is every IPI the current build actually sends — takes neither branch,
+    // so this stays byte-identical for them. Wake-only (no context switch), so the entry/exit swaps
+    // balance within this one invocation; `eoi()`/`note_ipi` in between run under the kernel GS.
+    let from_user = from_ring3(&stack_frame);
+    if from_user {
+        unsafe { core::arch::asm!("swapgs", options(nostack, preserves_flags)) };
+    }
     crate::arch::percpu::note_ipi();
     crate::arch::apic::eoi();
+    if from_user {
+        unsafe { core::arch::asm!("swapgs", options(nostack, preserves_flags)) };
+    }
 }
 
 /// Count of NMIs taken (lock-free introspection; see the NMI handler below).
