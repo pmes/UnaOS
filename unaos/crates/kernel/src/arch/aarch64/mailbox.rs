@@ -57,6 +57,7 @@ const TAG_SET_DEPTH: u32 = 0x0004_8005;
 const TAG_SET_PIXEL_ORDER: u32 = 0x0004_8006;
 const TAG_ALLOCATE_FB: u32 = 0x0004_0001;
 const TAG_GET_PITCH: u32 = 0x0004_0008;
+const TAG_GET_CLOCK_RATE: u32 = 0x0003_0002; // M6g: query a clock's current rate (value buffer {id, rate})
 const TAG_END: u32 = 0x0000_0000;
 
 const PIXEL_ORDER_BGR: u32 = 0; // firmware: 0 = BGR, 1 = RGB. We request BGR to match the rest of
@@ -212,6 +213,29 @@ fn query_display_size() -> Option<(u32, u32)> {
     } else {
         None
     }
+}
+
+/// M6g: ask the VideoCore firmware for a clock's current rate in Hz (RPi firmware property interface,
+/// tag `GET_CLOCK_RATE`; value buffer `{clock_id, rate}`). Returns `None` on a mailbox failure or a
+/// zero rate (clock not present / not running). Used ONLY by the EMMC2 probe on the BSP to resolve the
+/// SDHCI base clock when the controller's own `CAPABILITIES` base-clock field reads zero. The `MBOX`
+/// static is single-user: the boot framebuffer call is long done by SMP/probe time, and the probe runs
+/// single-threaded on the BSP (before the loader task is spawned), so no lock is needed — same as the
+/// framebuffer calls above.
+pub fn get_clock_rate(clock_id: u32) -> Option<u32> {
+    request(0, 8 * 4); // total size (8 words used)
+    request(1, 0); // request
+    request(2, TAG_GET_CLOCK_RATE);
+    request(3, 8); // value buffer size (2 words: clock_id, rate)
+    request(4, 0); // request code
+    request(5, clock_id); // clock id (reply preserves it)
+    request(6, 0); // rate (reply)
+    request(7, TAG_END);
+    if !mbox_call(8) {
+        return None;
+    }
+    let rate = reply(6);
+    if rate == 0 { None } else { Some(rate) }
 }
 
 /// Bring up the VideoCore framebuffer: pick a resolution (the firmware's current mode if sane,

@@ -12,6 +12,35 @@ Legend: **✅ metal-confirmed** · **🔬 QEMU-green, metal pending** · dates I
 
 ## Round 5 — 2026-07-03
 
+### M6g — load a program from storage (aarch64) ✅ `hw-pi4`
+- **What:** the Pi twin of x86 U2 — the first *program loaded from the microSD the
+  Pi booted from* into the EL0 boundary. A block-layer backend seam lets the
+  read-only path dispatch to a new BCM2711 EMMC2/SDHCI microSD driver (PIO,
+  single-block CMD17, polled, no writes) beside the untouched xHCI path; the driver
+  probes **EMMC2 first, legacy Arasan second** (the reverse of QEMU, so the metal
+  base is the first tried). The loader mounts the card's FAT volume, reads
+  `HELLO.BIN`, size-checks it, copies it into a fresh per-task M6d slot (EL0-RX/EL1-RO
+  before the task exists), and runs it at EL0 (`hello from EL0`). The loaded bytes are
+  untrusted — bounded only by size, contained by EL0 + per-page perms + the M6b
+  fault-kill net.
+- **Tested — QEMU:** `./arroyo kernel8-test 30` → `SD card @0xfe300000 identified —
+  131072 blocks (64 MiB, CSD v1)`, `FAT mounted from SD (Fat32)`, `HELLO.BIN loaded
+  from SD (51 bytes) -> EL0`, second `hello from EL0`, `disk-loaded EL0 program exited
+  ok -> PASS`, with every prior milestone byte-identical and 0 unexpected faults; the
+  `UNAOS_SDIMG=0` no-SD control adds exactly the two no-card lines + the loader-skipped
+  line. x86 (`test` + `UNAOS_FATIMG=1 test`) byte-identical (seam inert); `check` both
+  arches; aarch64 virt v2 + GICv3 JC2 SMP 3/3 unchanged.
+- **Tested — metal (real Pi 4, 2026-07-04):** ★ the driver's EMMC2-first success leg —
+  the one QEMU physically cannot exercise — ran on silicon: **no fallback line**, `SD card
+  @0xfe340000 identified — 31116288 blocks (15193 MiB, CSD v2)` (the real ~16 GB microSD,
+  SDHC/block-addressed — vs QEMU's 64 MiB/CSD v1 legacy fallback), then `FAT mounted from
+  SD (Fat32)`, `HELLO.BIN loaded from SD (51 bytes) -> EL0`, second `hello from EL0`,
+  `disk-loaded EL0 program exited ok -> PASS`. This reflash also carried M6f's pending
+  metal: all three M6f verdicts PASS and the per-task preempt rider went > 0 on silicon
+  (`spsentinel=3`); M6b `exited=1 killed=3 PASS`, M6d ×3 PASS, M6e `IRQs-taken-at-EL0=26`,
+  CAPSTONE 6/6, 0 unexpected faults. EL=1, CNTFRQ=54 MHz.
+- **Commit:** *(merge pending)* · arcs `11b8191` `a072a48` `683d48c`.
+
 ### U2 — loadable ring-3 programs from FAT (x86) ✅ `hw-rmbp`
 - **What:** the first *real program loaded from disk* into the x86 privilege
   boundary. A flat ring-3 binary (`HELLO.BIN`) is read off a FAT volume,
@@ -29,15 +58,19 @@ Legend: **✅ metal-confirmed** · **🔬 QEMU-green, metal pending** · dates I
   #MC fire path.
 - **Commit:** `9cdf397` (merge) · arc `7d8a6bb`.
 
-### M6f — validated user pointers + wider syscalls (aarch64) 🔬 `hw-pi4`
+### M6f — validated user pointers + wider syscalls (aarch64) ✅ `hw-pi4`
 - **What:** `copy_from_user`/`copy_to_user` (bounds- and overflow-checked; a bad
   pointer is an error return, not a task kill) plus the first "real" syscalls
   (`yield`, `sleep_ms`, `getpid`, `getinfo`). Also folds five hardening items
   from the M6d review, incl. scrubbing the FP/SIMD registers at first entry.
 - **Tested — QEMU:** `./arroyo kernel8-test 30` → the M6f fixtures PASS
   (getinfo round-trip; four hostile pointers all refused with no kills;
-  yield/sleep interleave) with every prior milestone still green. Metal rides
-  the next Pi reflash (M6g).
+  yield/sleep interleave) with every prior milestone still green.
+- **Tested — metal (real Pi 4, 2026-07-04, on the M6g reflash):** all three M6f
+  verdicts PASS on silicon (getinfo/copy_to_user round-trip, 4 hostile pointers
+  refused with 0 kills, yield/sleep interleave) and the per-task EL0 preempt rider
+  went > 0 (`spsentinel=3`, QEMU shows all 0) — the timer preempted that slot task
+  and it resumed correctly under its own ASID.
 - **Commit:** `ee21e30` (merge) · arcs `71ed153` + `e65ffc0`.
 
 ### JM2 — Orin headless first light (aarch64/Jetson) 🔬 `hw-jetson`

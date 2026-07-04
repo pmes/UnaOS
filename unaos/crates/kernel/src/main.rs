@@ -149,6 +149,13 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         let online = unaos_kernel::arch::smp::online_secondaries();
         unaos_kernel::arch::sched::start_aps(&online);
 
+        // M6g Part B: probe the microSD (EMMC2 first, legacy SDHCI fallback) and register it as the block
+        // backend. Synchronous, on the BSP, BEFORE the M6b demo — single-threaded mailbox use (the boot
+        // framebuffer call is long done) and deterministic serial placement: its two lines land early,
+        // before the demo lines. The M6g loader (spawned below) later reads the FAT volume off this card.
+        #[cfg(all(target_arch = "aarch64", feature = "baremetal"))]
+        unaos_kernel::drivers::emmc2::probe();
+
         // M6b: EL0 fault isolation + per-page user permissions. Four EL0 programs on one AP (never
         // the unscheduled BSP): hello (must still work — the code page is EL0-RX), then three that
         // each provoke a specific fault the kernel must answer by KILLING THE TASK, not halting —
@@ -276,6 +283,19 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
             } else {
                 serial_println!(":: M6f: slot allocation failed — validated-user-pointer demo SKIPPED ::");
             }
+
+            // M6g: load a program FROM STORAGE and run it at EL0 — the Pi twin of x86 U2. A kernel task
+            // on `vcpu` (a scheduled sibling of the demo core): it waits for the M6f verdict, mounts the
+            // FAT volume off the SD card the Part-B probe registered, reads HELLO.BIN (the M6c blob bytes,
+            // carried onto the boot media), copies it into a fresh M6d slot, and drops it to EL0. The
+            // loaded bytes are untrusted — contained by EL0 + per-page perms + the M6b fault-kill net. It
+            // doubles as its own verdict. No-op (one skip line) when no SD block device was registered.
+            unaos_kernel::arch::sched::spawn(
+                "m6g-loader",
+                unaos_kernel::arch::syscall::m6g_loader,
+                0,
+                vcpu,
+            );
         }
     }
 

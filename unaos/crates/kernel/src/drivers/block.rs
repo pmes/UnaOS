@@ -8,6 +8,22 @@
 use spin::Mutex;
 use crate::drivers::xhci::{XHCI_CONTROLLER, CswStatus};
 
+// M6g backend selector (aarch64 bare-metal only). The block layer dispatches over a registered
+// backend: the default is the xHCI USB-MSC path this file has always served; `register_sd` flips it
+// to the EMMC2/SDHCI microSD driver (`drivers::emmc2`). Everything SD-related is cfg-gated so the x86
+// build compiles the pre-M6g file verbatim (no dead static, no behavioural change) — the seam is
+// invisible to any target that never calls `register_sd`.
+#[cfg(all(target_arch = "aarch64", feature = "baremetal"))]
+use core::sync::atomic::{AtomicU8, Ordering};
+#[cfg(all(target_arch = "aarch64", feature = "baremetal"))]
+const BACKEND_XHCI: u8 = 0;
+#[cfg(all(target_arch = "aarch64", feature = "baremetal"))]
+const BACKEND_SD: u8 = 1;
+/// Which backend `read_block`/`write_block` dispatch to. Only `register_sd` ever flips it to SD; the
+/// xHCI enumeration path (which populates `BLOCK_DEVICE` from the xHCI driver) never touches it.
+#[cfg(all(target_arch = "aarch64", feature = "baremetal"))]
+static BACKEND: AtomicU8 = AtomicU8::new(BACKEND_XHCI);
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BlockError {
     NotReady,
@@ -41,6 +57,16 @@ pub fn info() -> Option<BlockDeviceInfo> {
     *BLOCK_DEVICE.lock()
 }
 
+/// M6g: register the microSD (EMMC2/SDHCI) as the block backend — publish its geometry AND flip the
+/// selector so `read_block` routes to `drivers::emmc2`. Called once, from the bare-metal BSP probe
+/// after a successful card init (`emmc2::probe`). aarch64 bare-metal only; x86 never calls it, so its
+/// read/write path is byte-identical to the pre-M6g xHCI-only code.
+#[cfg(all(target_arch = "aarch64", feature = "baremetal"))]
+pub fn register_sd(dev: BlockDeviceInfo) {
+    *BLOCK_DEVICE.lock() = Some(dev);
+    BACKEND.store(BACKEND_SD, Ordering::Release);
+}
+
 /// Read one block (`lba`) into `buf`. Locks BLOCK_DEVICE only briefly (to read geometry),
 /// then locks the xHCI controller — never both at once — so there is no nested-lock deadlock.
 /// Returns the number of bytes copied.
@@ -48,6 +74,13 @@ pub fn read_block(lba: u64, buf: &mut [u8]) -> Result<usize, BlockError> {
     let dev = info().ok_or(BlockError::NotReady)?;
     if lba >= dev.num_blocks {
         return Err(BlockError::BadLba);
+    }
+
+    // M6g: SD backend routes to the EMMC2/SDHCI driver; the xHCI body below is unchanged (and the
+    // only path an x86 build compiles). read_block_512 re-guards the lba against its own num_blocks.
+    #[cfg(all(target_arch = "aarch64", feature = "baremetal"))]
+    if BACKEND.load(Ordering::Acquire) == BACKEND_SD {
+        return crate::drivers::emmc2::read_block_512(lba, buf);
     }
 
     let mut guard = XHCI_CONTROLLER.lock();
@@ -68,6 +101,13 @@ pub fn write_block(lba: u64, buf: &[u8]) -> Result<(), BlockError> {
     let dev = info().ok_or(BlockError::NotReady)?;
     if lba >= dev.num_blocks {
         return Err(BlockError::BadLba);
+    }
+
+    // M6g: the SD backend is READ-ONLY by design (no card writes, ever, this arc) — refuse the write
+    // before touching any controller. The xHCI body below is unchanged (and the only x86 path).
+    #[cfg(all(target_arch = "aarch64", feature = "baremetal"))]
+    if BACKEND.load(Ordering::Acquire) == BACKEND_SD {
+        return Err(BlockError::Io);
     }
 
     let mut guard = XHCI_CONTROLLER.lock();
