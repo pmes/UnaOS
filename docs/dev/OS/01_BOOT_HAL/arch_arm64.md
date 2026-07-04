@@ -125,12 +125,14 @@ The boot-core GICv3 + generic timer are **METAL-CONFIRMED** on Orin (JM3 MMU + J
 GIC/timer). **SMP** (all secondaries via PSCI `CPU_ON` + cross-core SGI) is written and
 **QEMU-green** (Arc JM5: real Redistributor-frame enumeration for the fused core set,
 multi-cluster affinity targeting `Aff2=cluster`/`Aff1=core`/`Aff0=0`, `HCR_EL2`/`CPTR_EL2`
-carried in the AP entry stub, SMC conduit) but its **metal boot is pending** — QEMU models
-no Tegra machine, so QEMU-green does not imply Orin-correct. See the "JM5 result" section
-for the design, the QEMU evidence, and the expected/degraded metal lines. The remaining
-metal risks are concentrated in JM5's first-on-silicon paths: the VLPIS stride reaching
-non-first redistributor frames, the EL a PSCI-woken AP comes up at, and the multi-cluster
-SGI/`CPU_ON` affinity targeting.
+carried in the AP entry stub, SMC conduit), but its **metal boot is ⛔ blocked**: on the real
+Orin, PSCI **`CPU_ON` triggers a fatal Tegra RAS Uncorrectable Error** (CBB fabric "Error
+response from slave") before any AP comes online, reproducibly across two attended attempts —
+while the GICR enumeration, VLPIS stride, and the PSCI *query* path (`AFFINITY_INFO`) all work
+on silicon. This is a Tegra-firmware (BL31/MCE) core-bring-up issue, not a JM5 code bug; it
+needs a dedicated investigation (see the "JM5 result" section for the syndrome, the sharp
+query-works/power-faults split, and the ranked hypotheses). QEMU models no Tegra machine, so
+QEMU-green did not — and here could not — imply Orin-correct.
 
 ## 4. Jetson Orin Nano headless bring-up (Arc JM2)
 
@@ -396,7 +398,7 @@ and the heartbeat is **timer-driven** — `ticks` climbing exactly 250/beat with
 `live`, the whole timer→GIC→CPU-interface→vector→handler→EOI loop closed on Orin.
 No degraded fallback path was taken. This is the interrupt-driven heartbeat verdict.
 
-### JM5 result — Orin SMP: all cores online via PSCI CPU_ON + cross-core SGI (QEMU-green; **metal pending**)
+### JM5 result — Orin SMP via PSCI CPU_ON + cross-core SGI (QEMU-green 3/3; **metal ⛔ blocked on Tegra `CPU_ON`**)
 
 JM4 ran the Orin on its boot core alone. JM5 brings the **secondary Cortex-A78AE cores
 online via PSCI `CPU_ON`** and proves cross-core SGI in both directions, un-gating the
@@ -491,15 +493,49 @@ BSP→AP proof targeted by affinity. The rest of the battery:
 
 `check` both arches; `UNAOS_TEGRA=1 build` both legs; `esp-jetson` links.
 
-**Metal (Part F): PENDING — operator-attended.** QEMU cannot model the Orin, so the arc
-verdict is the metal boot. **Expected** (after the JM3/JM4 lines): `redistributor walk
-found 6 core(s)` with real cluster affinities (Aff2/Aff1), `CPU_ON AP n -> SUCCESS`,
-`AP n online (aff=…)`, `BSP -> AP n SGI OK`, `AP -> BSP SGI OK`, and
-`5/5 secondaries online via PSCI CPU_ON`. Degraded-but-honest: fewer online, an SGI that
-does not deliver, or an AP that comes up at EL≠2 → the exact core + syndrome, then STOP
-(no blind on-metal iteration). Capture → `unaos/target/serial-orin-jm5.log`. Metal risks
-concentrated here (first exercise on silicon): the VLPIS stride reaching non-first frames,
-the AP's woken EL, and the multi-cluster affinity targeting.
+**Metal (Part F): ⛔ BLOCKED — PSCI `CPU_ON` triggers a fatal Tegra RAS fault (2 operator-attended
+attempts, 2026-07-04).** QEMU cannot model the Orin, so the metal boot is the verdict — and it is a
+**failure isolated to `CPU_ON`**. Both attempts booted clean through JM3/JM4 and *into* JM5, then the
+**first** `CPU_ON` (to a real cluster-0 core, aff `0x00000100`) caused a fatal firmware **RAS
+Uncorrectable Error** *before it returned* — no AP ever came online, and the BSP itself powered off
+(0 post-fault heartbeats). Syndrome (verbatim):
+
+```
+:: AARCH64 SMP: enumerated core 0..7 aff = 0x0 / 0x100 / 0x200 / 0x300 / 0x10000 / 0x10100 / 0x10200 / 0x10300 ::
+:: AARCH64 SMP: core 1..7 AFFINITY_INFO=1 -> present ::            (all 8 report present/OFF)
+:: AARCH64 SMP: walk found 8 core(s); … 7 present -> starting ::
+ERROR:  RAS Uncorrectable Error in IOB … SERR = Error response from slave … IERR = CBB Interface Error
+ERROR:  RAS Uncorrectable Error in ACI … IERR = FillWrite Error … ADDR = 0x8000000000000b5c
+ERROR:  Powering off core
+```
+
+**What metal *did* confirm** (bonus): JM3 MMU + JM4 GIC (`992 INTIDs`) + `timer LIVE` re-ran clean;
+the **GICR enumeration works on silicon** — the walk crossed non-first frames (the first metal
+exercise of JM4's VLPIS stride) and read all 8 frames' affinities: **two full clusters** (cluster0
+`0x0/0x100/0x200/0x300`, cluster1 `0x10000…0x10300`); and the **SMC conduit works** — all 8
+`AFFINITY_INFO` SMCs returned cleanly (`=1`, OFF). So the split is sharp: everything up to and
+including PSCI *queries* works; only PSCI `CPU_ON`'s core-power action faults.
+
+**Diagnosis.** The `CBB Interface Error` / `Error response from slave` on the Tegra Control Backbone
+fabric, raised inside BL31 while servicing `CPU_ON`, is a bus error powering/resetting the target
+core — not something our code touches directly. The `AFFINITY_INFO` gate (JM5 attempt-2 fix) did not
+help because this firmware reports all 8 die slots present. **Ranked hypotheses for a dedicated
+follow-up** (NOT for blind on-metal iteration — the STOP tripwire held):
+1. Tegra `CPU_ON` needs **MCE / BPMP coordination** (Tegra's Multi-Core-Environment firmware) that a
+   generic PSCI call from our minimal EL2 kernel does not provide → BL31's core-power path errors.
+2. A **latent/poisoned RAS condition** surfaced by the first SMC→EL3 barrier (the fault lands exactly
+   at the first `CPU_ON`; `ADDR` differs run-to-run: `0x…200`, `0x…b5c`).
+3. **Entry point high in DRAM** (kernel at `0x25e52c000` ≈ 9.5 GiB) rejected by BL31's reset-vector
+   programming — a low-PA trampoline would test this.
+4. **Caller-EL** interaction: we run the whole path at NS-EL2; JetPack's OS calls PSCI from EL1/EL2
+   with a fuller ATF handshake.
+
+**Landing:** JM5 is **QEMU-green** (the SMP mechanism is correct for a compliant PSCI/GICv3 — proven
+3/3 on `virt`) and **metal-blocked on Tegra `CPU_ON`**. This needs a dedicated "Orin PSCI/MCE core
+bring-up" investigation (possibly the NVIDIA-collaboration angle), not a JM5 code fix. Captures:
+`unaos/target/serial-orin-jm5-FAIL-rasfault.log` (attempt 1) and
+`serial-orin-jm5-FAIL2-affinfo-allpresent.log` (attempt 2, with the enumerated affinities +
+AFFINITY_INFO results).
 
 ### Orin-metal delta list (feeds JM3 + the cable-day graphical arc)
 
