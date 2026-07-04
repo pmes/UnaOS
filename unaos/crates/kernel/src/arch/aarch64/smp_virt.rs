@@ -71,6 +71,17 @@ const IPI_SGI: u32 = 0;
 /// else a negative error (-2 INVALID_PARAMS, -4 ALREADY_ON, ...).
 const PSCI_CPU_ON: u64 = 0xC400_0003;
 
+/// PSCI `AFFINITY_INFO` (64-bit) function identifier (DEN0022). x1 = target MPIDR (affinity form), x2 =
+/// lowest affinity level (0 = core). Returns 0 = ON, 1 = OFF, 2 = ON_PENDING for a core the firmware
+/// knows, or a negative error (-2 INVALID_PARAMS) for an affinity that is not a valid, present PE. It is
+/// a pure query of the firmware's topology table — it does NOT touch the core's power/reset hardware —
+/// so it is safe to probe every enumerated redistributor frame with it. **Load-bearing on Orin metal**
+/// (JM5 attempt 1): the Tegra234 GIC-600 exposes redistributor frames for the whole die's core slots
+/// (8), but the Nano is a 6-core part — a `CPU_ON` to a fuse-disabled phantom core is a *fatal firmware
+/// RAS Uncorrectable Error* ("CBB Interface Error / Error response from slave" → the core powers off).
+/// So each enumerated core is gated behind `AFFINITY_INFO` and only started if it reports valid.
+const PSCI_AFFINITY_INFO: u64 = 0xC400_0004;
+
 /// Set true by each secondary once its MMU + vectors + per-CPU + GICv3 CPU interface + IPI SGI are up
 /// and IRQs are unmasked. Indexed by **linear core index**. The BSP waits on this (Acquire) before it
 /// sends any BSP → AP ping, so a ping can never be lost to a not-yet-receptive core. Release on the AP
@@ -248,26 +259,25 @@ extern "C" fn __secondary_rust_virt(core_raw: u64) -> ! {
     }
 }
 
-/// Issue a PSCI `CPU_ON` via the **SMC** conduit and return x0 (0 = SUCCESS, else negative error).
-///
-/// SMC is the conduit that reaches the emulated/firmware PSCI from our EL2 kernel: QEMU
+/// Issue a PSCI fast call via the **SMC** conduit and return x0 (0/positive = result, else negative
+/// error). SMC is the conduit that reaches the emulated/firmware PSCI from our EL2 kernel: QEMU
 /// `virt,virtualization=on` advertises `method = "smc"` and intercepts the SMC in TCG regardless of EL3;
 /// the Orin's ATF/BL31 monitor at EL3 services the SMC directly. (An `hvc` from EL2 would be taken to
 /// our own EL2 vector instead.)
 ///
 /// SMCCC (DEN0028): a fast call returns results in x0-x3 and preserves only x18-x30 + SP — so x0-x17 are
-/// volatile. x1-x3 are marked clobbered outputs, x4-x17 clobbers. No `nomem`: the call has a global side
-/// effect (it makes the BSP's prior stores to SEC_CTX/stacks matter on another core), and its ordering
-/// vs the `dsb sy`-terminated `clean_range`s must be preserved.
-fn psci_cpu_on(target_mpidr: u64, entry: u64, context_id: u64) -> i64 {
-    let mut x0 = PSCI_CPU_ON;
+/// volatile. x1-x3 are marked clobbered outputs, x4-x17 clobbers. No `nomem`: PSCI calls have global
+/// side effects (a `CPU_ON` makes the BSP's prior stores to SEC_CTX/stacks matter on another core), and
+/// their ordering vs the `dsb sy`-terminated `clean_range`s must be preserved.
+fn psci_call(func: u64, x1: u64, x2: u64, x3: u64) -> i64 {
+    let mut x0 = func;
     unsafe {
         core::arch::asm!(
             "smc #0",
             inout("x0") x0,
-            inout("x1") target_mpidr => _,
-            inout("x2") entry => _,
-            inout("x3") context_id => _,
+            inout("x1") x1 => _,
+            inout("x2") x2 => _,
+            inout("x3") x3 => _,
             out("x4") _, out("x5") _, out("x6") _, out("x7") _,
             out("x8") _, out("x9") _, out("x10") _, out("x11") _,
             out("x12") _, out("x13") _, out("x14") _, out("x15") _,
@@ -276,6 +286,18 @@ fn psci_cpu_on(target_mpidr: u64, entry: u64, context_id: u64) -> i64 {
         );
     }
     x0 as i64
+}
+
+/// PSCI `CPU_ON`: start the core at `target_mpidr` executing at `entry` with `context_id` in its x0.
+fn psci_cpu_on(target_mpidr: u64, entry: u64, context_id: u64) -> i64 {
+    psci_call(PSCI_CPU_ON, target_mpidr, entry, context_id)
+}
+
+/// PSCI `AFFINITY_INFO` at core level: is `target_mpidr` a valid, present PE? Returns 0 (ON) / 1 (OFF) /
+/// 2 (ON_PENDING) for a known core, or a negative error (-2 INVALID_PARAMS) for an affinity the firmware
+/// does not populate — the safe presence check that keeps a `CPU_ON` off a fuse-disabled phantom core.
+fn psci_affinity_info(target_mpidr: u64) -> i64 {
+    psci_call(PSCI_AFFINITY_INFO, target_mpidr, 0, 0)
 }
 
 /// Convert a packed GICR/`MPIDR`-contiguous affinity {Aff3[31:24],Aff2[23:16],Aff1[15:8],Aff0[7:0]} —
@@ -394,23 +416,60 @@ pub fn start_secondaries(dtb_addr: u64, dtb_size: usize) {
         aff_by_index[n_cores] = a;
         n_cores += 1;
     }
-    let n_aps = n_cores - 1;
+    let n_enumerated_aps = n_cores - 1;
+    // Dump every enumerated affinity up front — BEFORE any PSCI call — so the metal capture has the full
+    // set even if a later probe/CPU_ON faults (JM5 attempt 1 lost them to a RAS fault).
+    for idx in 0..n_cores {
+        serial_println!(
+            ":: AARCH64 SMP: enumerated core {} aff={:#010x}{} ::",
+            idx,
+            aff_by_index[idx],
+            if idx == 0 { " (BSP)" } else { "" }
+        );
+    }
+
+    // Presence gate (JM5 attempt-1 fix): the Tegra234 GIC-600 exposes redistributor frames for the whole
+    // die's core slots, but the Nano is a 6-core part — a `CPU_ON` to a fuse-disabled phantom core is a
+    // *fatal firmware RAS Uncorrectable Error*. `AFFINITY_INFO` is a safe topology query (it never touches
+    // the core's power hardware) that returns a valid state (0/1/2) for a present core and a negative
+    // error for a phantom. Only cores it reports present are startable. On QEMU `virt` all enumerated
+    // cores are present, so this is a no-op there (still 3/3).
+    let mut startable = [false; MAX_CORES];
+    let mut n_startable = 0usize;
+    for idx in 1..n_cores {
+        let info = psci_affinity_info(affinity_to_mpidr(aff_by_index[idx]));
+        startable[idx] = info >= 0; // 0=ON, 1=OFF, 2=ON_PENDING; negative = INVALID_PARAMS (absent)
+        if startable[idx] {
+            n_startable += 1;
+        }
+        serial_println!(
+            ":: AARCH64 SMP: core {} (aff={:#010x}) AFFINITY_INFO={} -> {} ::",
+            idx,
+            aff_by_index[idx],
+            info,
+            if startable[idx] { "present" } else { "absent (phantom, skipped)" }
+        );
+    }
     serial_println!(
-        ":: AARCH64 SMP: redistributor walk found {} core(s); BSP aff={:#010x}, {} secondary(ies) to start ::",
+        ":: AARCH64 SMP: walk found {} core(s); BSP aff={:#010x}; {} enumerated secondary(ies), {} present -> starting ::",
         n_present,
         bsp_aff,
-        n_aps
+        n_enumerated_aps,
+        n_startable
     );
 
     let freq = timer::cntfrq();
     let freq = if freq == 0 { 62_500_000 } else { freq };
     let bsp_ipi_before = percpu::cpu(0).ipis.load(Ordering::Acquire);
 
-    // Start each secondary. Target = its real MPIDR affinity; context id = its linear index (delivered
-    // in x0, used by the entry stub for the stack + as the per-CPU index). Entry PA = the stub symbol
-    // (identity-mapped). A CPU_ON error → log + skip, never hang.
+    // Start each PRESENT secondary. Target = its real MPIDR affinity; context id = its linear index
+    // (delivered in x0, used by the entry stub for the stack + as the per-CPU index). Entry PA = the stub
+    // symbol (identity-mapped). A CPU_ON error → log + skip, never hang.
     let entry = _secondary_start_virt as *const () as usize as u64;
     for idx in 1..n_cores {
+        if !startable[idx] {
+            continue;
+        }
         let aff = aff_by_index[idx];
         let ret = psci_cpu_on(affinity_to_mpidr(aff), entry, idx as u64);
         if ret == 0 {
@@ -426,8 +485,11 @@ pub fn start_secondaries(dtb_addr: u64, dtb_size: usize) {
         }
     }
 
-    // Wait (≤ ~500 ms each) for every secondary to publish readiness.
+    // Wait (≤ ~500 ms each) for every started secondary to publish readiness.
     for idx in 1..n_cores {
+        if !startable[idx] {
+            continue;
+        }
         let deadline = timer::cntpct() + freq / 2;
         if !wait_until(deadline, || CORE_READY[idx].load(Ordering::Acquire)) {
             serial_println!(
@@ -463,7 +525,9 @@ pub fn start_secondaries(dtb_addr: u64, dtb_size: usize) {
     // IRQs. The v3 IAR carries no source CPU, but only APs send SGI 0 to the BSP (the BSP never
     // self-sends), so any growth of the BSP's counter is attributable to an AP. (Per-AP distinct INTIDs
     // for individually-attributable AP→BSP delivery are a deferred delta-list follow-up.)
-    let online = (1..n_cores).filter(|&c| CORE_READY[c].load(Ordering::Acquire)).count();
+    let online = (1..n_cores)
+        .filter(|&c| startable[c] && CORE_READY[c].load(Ordering::Acquire))
+        .count();
     let deadline = timer::cntpct() + freq / 10;
     let ok = wait_until(deadline, || {
         percpu::cpu(0).ipis.load(Ordering::Acquire) > bsp_ipi_before
@@ -491,6 +555,6 @@ pub fn start_secondaries(dtb_addr: u64, dtb_size: usize) {
     serial_println!(
         ":: AARCH64 SMP: {}/{} secondaries online via PSCI CPU_ON on the GICv3 path ::",
         online,
-        n_aps
+        n_startable
     );
 }
