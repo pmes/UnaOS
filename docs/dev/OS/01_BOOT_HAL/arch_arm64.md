@@ -202,18 +202,19 @@ is unaffected.
 
 ### UART / GOP truth table
 
-The `tegra` serial driver's assumptions vs. what the operator-attended R4 boot
-(2026-07-03, real Orin Nano) actually showed. The right-hand column is the metal
-result — a claim only where the serial capture shows it.
+The `tegra` serial driver's assumptions vs. what the real Orin Nano showed. R4
+(2026-07-03) established GOP/firmware and the UARTC fault; **JM3 Part D
+(2026-07-04) resolved the rest** once the kernel maps device memory. A claim only
+where the serial capture shows it.
 
-| Aspect            | Driver assumption (pre-metal)                            | R4 metal result (2026-07-03, real Orin)             |
+| Aspect            | Driver assumption (pre-metal)                            | Metal result (R4 2026-07-03 / **JM3 2026-07-04**)   |
 |-------------------|----------------------------------------------------------|-----------------------------------------------------|
-| GOP               | none published (headless)                                | **CONFIRMED: `GraphicsOutput handles = 0 (NOT_FOUND)`** — genuinely headless |
-| Firmware          | —                                                        | **EDK II, fw-rev `0x00010000`, UEFI 2.7**           |
-| DTB config table  | firmware publishes its FDT                               | **UNVERIFIED** — R4 printed `no DTB configuration table published by firmware`, but that scan used a **wrong `EFI_DTB_TABLE_GUID`** (it matched no firmware GUID either way), so the "no DTB table" result is an artifact of the bug, not a measured fact. Re-measured with the corrected constant at the next attended boot (JM3 Part D); the `/chosen stdout-path` UART-truth path and the kernel's `dtb_addr` being 0 are UNVERIFIED for the same reason. |
-| Console UART base | UARTC `0x0C28_0000`, NS16550, reg-shift 2 (AON/SPE TCU)  | **UNRESOLVED + BLOCKED** — the first UARTC access (`LSR @ 0x0C28_0014`) *faults*: the region is unmapped in the UEFI-handoff tables (see R4 result). The base cannot be validated until the kernel maps device memory (JM3). |
-| Handoff EL        | EL2 (QEMU `virt` / Pi UEFI)                              | unknown — the kernel crashed *inside* the first `serial_println!`, before its `EL=` line printed |
-| Generic-timer Hz  | unknown on silicon (62.5 MHz QEMU `virt`, 54 MHz Pi 4)  | unknown — same (crashed before the `CNTFRQ=` line) |
+| GOP               | none published (headless)                                | **CONFIRMED (R4): `GraphicsOutput handles = 0 (NOT_FOUND)`** — genuinely headless |
+| Firmware          | —                                                        | **CONFIRMED (R4): EDK II, fw-rev `0x00010000`, UEFI 2.7** |
+| DTB config table  | firmware publishes its FDT                               | **CONFIRMED PRESENT (JM3):** with the corrected `EFI_DTB_TABLE_GUID`, `Found DTB at 0x2679df000, size: 997852` (bootloader), and BOOTDIAG read `model='NVIDIA Jetson Orin Nano Engineering Reference Developer Kit Super'`. R4's "no DTB configuration table" was the **wrong-GUID artifact** (now disproven). ⚠ BOOTDIAG's *full* parse of this 997 KB DTB panics inside `fdt-0.1.5` (`node.rs:472`) — a bootdiag-parser robustness bug the GUID fix exposed (see "JM3 result"); the header/model read is fine, and the kernel path (header-only) is unaffected. |
+| Console UART base | UARTC `0x0C28_0000`, NS16550, reg-shift 2 (AON/SPE TCU)  | **CONFIRMED (JM3): UARTC `0x0C28_0000`.** Once the kernel maps it Device-nGnRE, the banner + 72 climbing heartbeats print cleanly over the header — the assumed base is the real console. |
+| Handoff EL        | EL2 (QEMU `virt` / Pi UEFI)                              | **CONFIRMED (JM3): EL2** (`EL=2`); the EL2 non-VHE (`E2H=0`) MMU path worked, so the assumption held on A78AE silicon. |
+| Generic-timer Hz  | unknown on silicon (62.5 MHz QEMU `virt`, 54 MHz Pi 4)  | **CONFIRMED (JM3): 31.25 MHz** (`CNTFRQ=31250000`) — a new fact, distinct from QEMU/Pi (JM4 derives the tick from it). |
 
 ### R4 metal result (2026-07-03, operator-attended)
 
@@ -255,7 +256,7 @@ EL2 analogue of the Pi bare-metal `boot::mmu_init`. Until then `serial::tegra`
 cannot drive UARTC, and the tegra early-stop's banner/heartbeats never reach the
 console. This is the first item on the delta list below.
 
-### JM3 result — kernel-owned Tegra MMU (QEMU-green; **metal PENDING**)
+### JM3 result — kernel-owned Tegra MMU (**METAL-CONFIRMED 2026-07-04**)
 
 JM3 builds and installs that regime. New module
 `arch/aarch64/mmu_tegra.rs` (`#[cfg(feature = "tegra")]`): a single L1 translation
@@ -288,33 +289,62 @@ only**, and the arc verdict is metal (below). Landed evidence:
   cross-core SGI-coalescing nondeterminism), `kernel8-test` (Pi M6b/M6d PASS + M6e
   verdict + CAPSTONE 6/6).
 
-**Metal PENDING (Part D, operator-attended):** the attended Orin boot over the RPi
-Debug Probe is the verdict. Expected in order: the `BOOTDIAG` block (now with the
-**corrected `EFI_DTB_TABLE_GUID`** — this re-measures the "DTB config table" truth
-either way), headless handoff, the two `:: tegra: mmu … ::` lines, the banner with
-the **first real `EL=` / `CNTFRQ=` from Orin silicon**, the early-stop line, and ≥3
-climbing heartbeats → save as `unaos/target/serial-orin-jm3.log`. The UART/GOP
-truth-table rows (console UART base, handoff EL, CNTFRQ, DTB table) and delta-list
-item 1 are filled from **that capture** — no metal claim is recorded here until the
-serial log shows it. If the kernel is dark after the `SCTLR` write, the honest
-landing is this QEMU-green code + the capture + a written diagnosis (STOP tripwire).
+**★★ METAL-CONFIRMED (Part D, 2026-07-04, operator-attended).** The attended Orin
+boot over the RPi Debug Probe is the verdict, and it passed clean — the first UnaOS
+kernel to run its own MMU and drive UARTC on Orin silicon. Capture
+`unaos/target/serial-orin-jm3.log` (73 heartbeats, **zero faults / panics /
+exceptions**), verbatim:
+
+```
+[bootloader] ...booting headless (serial only)
+[bootloader] Found DTB at 0x2679df000, size: 997852
+:: tegra: mmu live (EL2) — RAM Normal-WB + Tegra Device-nGnRE mapped ::
+:: tegra: mmu regs — SCTLR 0x30c5183d->0x30c5183d TCR=0x80813519 MAIR=0x4ff TTBR0=0x25e5eb000 RAM-GiB-mask=0x3fc ::
+:: UnaOS aarch64 kernel — Jetson Orin Nano (Tegra234), headless serial console ::
+:: AARCH64 boot diag: EL=2  CNTFRQ=31250000 Hz  MMU=on  DAIF(DAIF)=0b1111 ::
+:: tegra: early platform stop (gic/timer discovery = JM4) ::
+:: tegra: heartbeat 0..72 ::
+```
+
+Metal facts (feed JM4): **handoff EL = 2** (the EL2 non-VHE `E2H=0` assumption held
+on A78AE); **CNTFRQ = 31.25 MHz** (new — ≠ QEMU 62.5 / Pi 54); firmware
+**SCTLR_EL2 = `0x30c5183d`** (M|C|I already set, so our RMW was correctly
+idempotent — `old == new`); **TTBR0 = `0x25e5eb000`** (our L1, in RAM GiB 9);
+**RAM-GiB-mask = `0x3fc` = GiB 2..9** — the firmware-map-derived RAM span matched the
+Orin's DRAM (`0x8000_0000..0x2_8000_0000`) exactly; **UARTC `0x0C28_0000` confirmed**
+as the console base. The Part-C fault vector stayed inert (no fault). The DTB is
+present (`0x2679df000`, 997 KB) — R4's "no DTB table" was the wrong-GUID artifact,
+now disproven.
+
+⚠ **Bootdiag caveat (this capture used non-BOOTDIAG media).** The first Part-D
+attempt used `UNAOS_BOOTDIAG=1` media; with the corrected GUID, BOOTDIAG now reaches
+the real 997 KB Orin DTB and its `fdt-0.1.5` traversal (`find_node("/chosen")` /
+`aliases()`) **panics** (`node.rs:472` "bad node") → the bootloader shuts the board
+down *before* the kernel loads. This is a latent JM2-bootdiag robustness bug the
+GUID fix exposed (JM2 never parsed a real DTB — the wrong GUID always early-returned;
+the crate's node *traversal* panics where its *helpers* were already guarded). It is
+**outside the JM3 lane** (bootdiag parser / an `fdt` bump) and flagged as a follow-up.
+The JM3 kernel never parses the DTB (`tegra_early_stop` diverges before pci/smp_virt),
+so the header-only non-BOOTDIAG path boots cleanly and is what produced the capture
+above; `serial-orin-jm3-r1-bootdiag-panic.log` holds the panic + the DTB/model proof.
 
 ### Orin-metal delta list (feeds JM3 + the cable-day graphical arc)
 
 The `virt` GICv3 + PSCI SMP (JC2) is written to be a small delta to Orin silicon,
 but the following must change and are **not** covered by QEMU:
 
-* **Kernel MMU that maps the Tegra peripherals (the R4 blocker — do this FIRST).**
-  ✅ **CODE COMPLETE (JM3) — metal PENDING.** `arch/aarch64/mmu_tegra.rs` installs a
+* **Kernel MMU that maps the Tegra peripherals (the R4 blocker).** ✅✅ **DONE —
+  METAL-CONFIRMED (JM3, 2026-07-04).** `arch/aarch64/mmu_tegra.rs` installs a
   kernel-owned regime (RAM Normal-WB from the firmware map + the Tegra device window
   Device-nGnRE, EL2 primary / EL1 fallback), the EL2 analogue of the Pi bare-metal
-  `boot::mmu_init`/`enable_mmu`; wired into `tegra_early_stop` before the banner. See
-  the "JM3 result" section above. QEMU cannot exercise it (metal-only); the attended
-  Orin boot (Part D) is the verdict and re-measures the console UART base at the same
-  time — the DTB `/chosen stdout-path` truth is re-read there with the corrected
-  `EFI_DTB_TABLE_GUID` (R4's "no DTB table" was an artifact of the old wrong GUID,
-  not a measured absence). This entry is marked *measured* only once the JM3 capture
-  shows the banner + heartbeats.
+  `boot::mmu_init`/`enable_mmu`; wired into `tegra_early_stop` before the banner. On
+  real Orin silicon the switch works at **EL2**, the banner + 72 heartbeats print over
+  UARTC `0x0C28_0000`, `RAM-GiB-mask=0x3fc` (GiB 2..9) matches the DRAM span, and there
+  are **zero faults**. See the "JM3 result" section for the full capture. The corrected
+  `EFI_DTB_TABLE_GUID` also confirmed the Orin **does** publish a DTB config table
+  (`0x2679df000`, model 'NVIDIA Jetson Orin Nano … Super') — R4's "no DTB table" was the
+  wrong-GUID artifact. (Follow-up, out of the JM3 lane: BOOTDIAG's full `fdt` parse of
+  the real DTB panics — see the JM3-result caveat.)
 * **GICR base *and* frame stride.** The redistributor walk (`smp_virt.rs`)
   hardcodes the QEMU-`virt` `GICR_BASE` (`0x080A_0000`) and a `0x2_0000` per-core
   stride (two 64 KiB frames: RD + SGI). Tegra234's GIC-600 is a **4-frame** class
