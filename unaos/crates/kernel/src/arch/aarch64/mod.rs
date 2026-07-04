@@ -18,7 +18,19 @@ pub mod smp;
 // `gic::is_v3()`, so the GICv2 virt run stays single-core.
 #[cfg(not(feature = "pi"))]
 pub mod smp_virt;
-#[cfg(feature = "baremetal")]
+// JC3: the QEMU `virt`/UEFI EL2 -> EL1 drop (the non-Pi sibling of `boot`'s `drop_to_el1`/`enable_mmu`).
+// `virt`-only (baremetal implies pi; tegra keeps its own EL2 regime in `mmu_tegra` this arc) — it un-gates
+// the scheduler on the `virt` boot core so CAPSTONE runs at EL1.
+#[cfg(all(target_arch = "aarch64", not(feature = "pi"), not(feature = "tegra")))]
+pub mod boot_virt;
+// The aarch64 kernel-thread scheduler + sync primitives. Compiled for the Pi bare-metal path (its
+// original home) AND, since JC3, the `virt` path (which drops EL2 -> EL1 via `boot_virt` so the scheduler
+// can run at EL1). NOT compiled for tegra (single-core Orin userspace is a follow-on arc). Its EL0/user
+// machinery (`spawn_user*`, the user trampoline, slot teardown) stays `#[cfg(feature = "baremetal")]`.
+#[cfg(any(
+    feature = "baremetal",
+    all(target_arch = "aarch64", not(feature = "pi"), not(feature = "tegra"))
+))]
 pub mod sched;
 #[cfg(feature = "baremetal")]
 pub mod syscall;
