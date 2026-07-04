@@ -16,6 +16,7 @@
 
 
 use alloc::alloc::{alloc_zeroed, Layout};
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use unaos_boot_info::{BootInfo, MemoryRegion, MemoryRegionKind};
 
 /// The UEFI memory map (as converted by the bootloader), published once at `init` so later
@@ -279,3 +280,256 @@ pub unsafe fn map_user_page(va: u64, phys: u64, writable: bool, nx: bool) {
 // `protect_user_page_ro` (a BSP-only `invlpg` after a live W-drop) is gone with the hole it left: a
 // PTE that was never writable cannot be cached writable on any core. W^X is enforced across cores
 // by construction — see `docs/SECURITY.md`.
+
+// =================================================================================================
+// U3 — per-process address spaces (CR3). The x86 mirror of aarch64 M6d (per-task TTBR0/ASID).
+// -------------------------------------------------------------------------------------------------
+// Until U3, every ring-3 task (U1a/U1b/U2) shared ONE user window at USER_BASE=1 TiB in the single
+// firmware page table. U3 gives each user PROCESS its own top-level page table (its own CR3): each
+// slot's PML4 SHARES the kernel half (identity map incl. high MMIO like the xHCI BAR at 768 GiB,
+// heap, kernel code/stacks, IST/percpu/GDT — every PML4 entry EXCEPT PML4[2]) by copying those
+// entries from the live kernel PML4 (so they point at the SAME kernel next-level tables — a kernel
+// mapping edit BELOW the PML4 propagates automatically, unlike a deep copy), and builds its OWN
+// USER_BASE window in PML4[2]. Two processes can then map the same VA to different frames.
+//
+// PLAIN CR3, no PCID: a `mov cr3` flushes the non-global TLB, which is exactly the isolation we want
+// (user pages are never global), so no explicit invalidation is needed on a switch — the CR3 write
+// is the flush. PCID (the x86 analogue of M6d's ASID optimization) is DEFERRED; correct, and there
+// are only a handful of switches per boot. Ring 3 is cooperative (RFLAGS.IF clear — not yet
+// preemptible), so a task runs from its trampoline CR3-load to its exit under one CR3, and a
+// syscall/fault runs under the caller's own CR3 (correct: copy_from_user reads that process's
+// window) — CR3 only moves at trampoline-entry and exit-teardown, mirroring M6d's cooperative
+// lifecycle. When preemptible ring 3 lands, the CR3 switch moves to the general dispatch path.
+//
+// STATIC POOL (mirrors M6d's boot.rs 8-slot pool): no heap, a hard cap that is a STOP tripwire, and
+// teardown = flip a flag (the tables are rebuilt on the next alloc; the restoring `mov cr3`
+// full-flush retires the retired process's user TLB entries). A real user-memory allocator (dynamic
+// slots, paged user memory) is a later arc.
+//
+// PER-SLOT TABLE FREEZE (STOP tripwire, mirrors M6d): a slot copies the kernel PML4 ENTRIES at build
+// time. Because those entries point at the SHARED kernel next-level tables, any kernel edit below
+// the PML4 is visible to live slots — but a NEW top-level (PML4-entry) kernel region added post-boot
+// would be INVISIBLE to already-built slots. The kernel never adds a PML4 entry post-boot (the
+// identity map is fixed at boot; the only per-process PML4 entry is [2]). If that ever changes, the
+// new region must be mirrored into every live slot PML4 (or force a rebuild).
+
+/// Number of concurrent per-process address spaces. Hard cap — a STOP tripwire, like M6d's 8.
+pub const USER_SLOTS: usize = 8;
+/// Pages in a user window: code, data, and two stack pages. MUST match `syscall::USER_WINDOW_PAGES`.
+const U3_WINDOW_PAGES: usize = 4;
+const PAGE_4K: u64 = 0x1000;
+
+/// A 4 KiB-aligned page-table (512 × u64). In `.bss` (identity-mapped), so its address IS its
+/// physical address — usable directly as a CR3 / next-level pointer.
+#[repr(C, align(4096))]
+struct PageTable([u64; 512]);
+impl PageTable {
+    const fn zeroed() -> Self {
+        PageTable([0; 512])
+    }
+}
+
+/// A slot's user backing store: `U3_WINDOW_PAGES` contiguous 4 KiB frames (code + data + 2 stack).
+#[repr(C, align(4096))]
+struct Backing([u8; U3_WINDOW_PAGES * 4096]);
+impl Backing {
+    const fn zeroed() -> Self {
+        Backing([0; U3_WINDOW_PAGES * 4096])
+    }
+}
+
+// One PML4 + one PDPT + one PD + one PT per slot: the USER_BASE window only ever touches PML4[2] →
+// PDPT[0] → PD[0] → PT[0..U3_WINDOW_PAGES], so a single next-level table at each level suffices.
+static mut SLOT_PML4: [PageTable; USER_SLOTS] = [const { PageTable::zeroed() }; USER_SLOTS];
+static mut SLOT_PDPT: [PageTable; USER_SLOTS] = [const { PageTable::zeroed() }; USER_SLOTS];
+static mut SLOT_PD: [PageTable; USER_SLOTS] = [const { PageTable::zeroed() }; USER_SLOTS];
+static mut SLOT_PT: [PageTable; USER_SLOTS] = [const { PageTable::zeroed() }; USER_SLOTS];
+static mut SLOT_BACKING: [Backing; USER_SLOTS] = [const { Backing::zeroed() }; USER_SLOTS];
+static SLOT_USED: [AtomicBool; USER_SLOTS] = [const { AtomicBool::new(false) }; USER_SLOTS];
+
+/// The kernel (firmware) PML4 physical base, captured once on the BSP at boot BEFORE any process CR3
+/// is installed. Restoring it on task teardown returns the CPU to the shared kernel address space.
+static KERNEL_CR3: AtomicU64 = AtomicU64::new(0);
+
+/// Physical (== virtual) base of a static slot table.
+#[inline]
+fn table_pa(p: *const u64) -> u64 {
+    p as u64
+}
+#[inline]
+fn slot_pml4_ptr(s: usize) -> *mut u64 {
+    unsafe { (&raw mut SLOT_PML4[s]).cast::<u64>() }
+}
+#[inline]
+fn slot_pdpt_ptr(s: usize) -> *mut u64 {
+    unsafe { (&raw mut SLOT_PDPT[s]).cast::<u64>() }
+}
+#[inline]
+fn slot_pd_ptr(s: usize) -> *mut u64 {
+    unsafe { (&raw mut SLOT_PD[s]).cast::<u64>() }
+}
+#[inline]
+fn slot_pt_ptr(s: usize) -> *mut u64 {
+    unsafe { (&raw mut SLOT_PT[s]).cast::<u64>() }
+}
+
+/// Kernel identity pointer to slot `s`'s user backing — write a loaded program / plant a sentinel
+/// through THIS, never through USER_BASE, so the process code mapping stays read-only (W^X holds).
+pub fn slot_backing_ptr(s: usize) -> *mut u8 {
+    unsafe { (&raw mut SLOT_BACKING[s]).cast::<u8>() }
+}
+
+/// The per-process CR3 value (its PML4 physical base) for slot `s`.
+pub fn slot_cr3(s: usize) -> u64 {
+    slot_pml4_ptr(s) as u64
+}
+
+/// Capture (once) and return the kernel PML4 physical base. First call MUST be on the BSP at boot
+/// while the firmware/kernel CR3 is live (before any process CR3 switch) — U3 setup guarantees this.
+pub fn kernel_cr3() -> u64 {
+    let v = KERNEL_CR3.load(Ordering::Relaxed);
+    if v != 0 {
+        return v;
+    }
+    let cur = cr3_table() as u64;
+    // Race-safe: the first writer wins; all writers observe the same live kernel CR3 at boot.
+    KERNEL_CR3.store(cur, Ordering::Relaxed);
+    cur
+}
+
+/// Load `cr3` into the CR3 register (installs that address space; flushes the non-global TLB).
+#[inline]
+pub unsafe fn load_cr3(cr3: u64) {
+    unsafe { core::arch::asm!("mov cr3, {}", in(reg) cr3, options(nostack, preserves_flags)) };
+}
+
+/// Restore the shared kernel address space (used on user-task teardown before freeing the slot).
+#[inline]
+pub fn restore_kernel_cr3() {
+    unsafe { load_cr3(kernel_cr3()) };
+}
+
+/// Build slot `s`'s page table: share the kernel half (copy every live PML4 entry except PML4[2]),
+/// then wire the slot's own PML4[2] → PDPT[0] → PD[0] → PT[0..N] → its backing frames with the U1a
+/// window shape (page 0 code = USER + RX, read-only from the start; pages 1..N data/stack = USER +
+/// RW + NX). The code page is RO-from-start (no writable→RO flip), so W^X holds by construction.
+unsafe fn build_slot(s: usize) {
+    let kpml4 = kernel_cr3() as *const u64; // capture kernel CR3 (BSP, boot) and share its half
+    let pml4 = slot_pml4_ptr(s);
+    let user_pml4_i = pml4_index(super::syscall::USER_BASE);
+    for i in 0..512 {
+        // Share every kernel PML4 entry except the per-process user-window slot, which is private.
+        let e = if i == user_pml4_i { 0 } else { unsafe { *kpml4.add(i) } };
+        unsafe { *pml4.add(i) = e };
+    }
+    let pdpt = slot_pdpt_ptr(s);
+    let pd = slot_pd_ptr(s);
+    let pt = slot_pt_ptr(s);
+    // Intermediate entries: PRESENT|WRITABLE|USER (ring-3 reach is the AND of U bits on the path;
+    // WRITABLE on a parent does not make leaves writable — the leaf W bit governs that).
+    let inter = PTE_PRESENT | PTE_WRITABLE | PTE_USER;
+    unsafe {
+        *pml4.add(user_pml4_i) = (table_pa(pdpt) & PTE_ADDR) | inter;
+        *pdpt.add(pdpt_index(super::syscall::USER_BASE)) = (table_pa(pd) & PTE_ADDR) | inter;
+        *pd.add(pd_index(super::syscall::USER_BASE)) = (table_pa(pt) & PTE_ADDR) | inter;
+    }
+    let backing = slot_backing_ptr(s) as u64;
+    for p in 0..U3_WINDOW_PAGES {
+        let va = super::syscall::USER_BASE + (p as u64) * PAGE_4K;
+        let frame = backing + (p as u64) * PAGE_4K;
+        // Page 0 = code: USER, executable (no NX), read-only (no WRITABLE). Pages 1..N = data/stack:
+        // USER, WRITABLE, NX.
+        let mut flags = PTE_PRESENT | PTE_USER;
+        if p != 0 {
+            flags |= PTE_WRITABLE | PTE_NX;
+        }
+        unsafe { *pt.add(pt_index(va)) = (frame & PTE_ADDR) | flags };
+    }
+}
+
+/// Allocate a fresh per-process address space from the static pool and build its window. Returns the
+/// slot index, or `None` when the pool is exhausted (a STOP tripwire — the hard cap is deliberate).
+pub fn alloc_user_space() -> Option<usize> {
+    for s in 0..USER_SLOTS {
+        if SLOT_USED[s]
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            unsafe { build_slot(s) };
+            return Some(s);
+        }
+    }
+    None
+}
+
+/// Allocate `out.len()` slots, filling `out` with their indices. FULL UNWIND on partial failure
+/// (mirrors M6d's `alloc_user_slots`): a slot that was claimed but never installed is released with
+/// no TLB work, so exhaustion never leaks a partial claim. Returns false if the pool can't satisfy
+/// the whole request.
+pub fn alloc_user_spaces(out: &mut [usize]) -> bool {
+    let mut n = 0;
+    while n < out.len() {
+        match alloc_user_space() {
+            Some(s) => {
+                out[n] = s;
+                n += 1;
+            }
+            None => {
+                for &s in &out[..n] {
+                    SLOT_USED[s].store(false, Ordering::Release); // never installed -> no TLB flush
+                }
+                return false;
+            }
+        }
+    }
+    true
+}
+
+/// Release the slot whose CR3 is `cr3`. The caller MUST have already restored the kernel CR3 (that
+/// `mov cr3` full-flush is what retires this slot's user TLB entries) — see `restore_kernel_cr3`.
+pub fn free_user_space_by_cr3(cr3: u64) {
+    for s in 0..USER_SLOTS {
+        if slot_cr3(s) == cr3 {
+            SLOT_USED[s].store(false, Ordering::Release);
+            return;
+        }
+    }
+}
+
+/// U3 DETERMINISTIC ISOLATION PROBE (the metal-catchable proof — x86 twin of M6d's nG probe). Plant
+/// DISTINCT sentinels at the same user VA in two slots' data pages, then — interrupts masked — install
+/// each slot's CR3 in turn and read that same VA, confirming each reads its OWN sentinel. A bug that
+/// let the two share PML4[2] (or failed to isolate the window) reads the same value twice. Restores
+/// the kernel CR3 before returning. `data_off` is the byte offset within the data page (page 1).
+/// Returns `(a_val, b_val, ok)`.
+pub fn probe_isolation(
+    slot_a: usize,
+    slot_b: usize,
+    data_off: u64,
+    sent_a: u64,
+    sent_b: u64,
+) -> (u64, u64, bool) {
+    let cr3_a = slot_cr3(slot_a);
+    let cr3_b = slot_cr3(slot_b);
+    let kcr3 = kernel_cr3();
+    let page_off = (PAGE_4K + data_off) as usize; // data page = window page 1
+    let data_va = super::syscall::USER_BASE + PAGE_4K + data_off;
+    // Plant the sentinels through the backing identity aliases (kernel half — always mapped).
+    unsafe {
+        core::ptr::write_volatile(slot_backing_ptr(slot_a).add(page_off) as *mut u64, sent_a);
+        core::ptr::write_volatile(slot_backing_ptr(slot_b).add(page_off) as *mut u64, sent_b);
+    }
+    // Swap CR3 to each slot in turn and read the SAME user VA at CPL 0 (no SMAP on Ivy Bridge, so a
+    // supervisor read of a user page is allowed; SMEP blocks only supervisor EXECUTE of user pages).
+    let (a_val, b_val) = crate::arch::without_interrupts(|| unsafe {
+        load_cr3(cr3_a);
+        let a = core::ptr::read_volatile(data_va as *const u64);
+        load_cr3(cr3_b);
+        let b = core::ptr::read_volatile(data_va as *const u64);
+        load_cr3(kcr3);
+        (a, b)
+    });
+    // Review fold (M6d): distinct-value assert — identical reads mean the windows aliased.
+    debug_assert!(a_val != b_val, "U3: isolation probe read identical values — windows not isolated");
+    (a_val, b_val, a_val == sent_a && b_val == sent_b)
+}

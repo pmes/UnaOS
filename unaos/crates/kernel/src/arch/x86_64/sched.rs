@@ -167,6 +167,11 @@ pub struct Task {
     /// ring 3 at `user_entry` with rsp = `user_rsp`. 0 / unused for ordinary kernel tasks.
     user_entry: u64,
     user_rsp: u64,
+    /// U3: this task's private CR3 (per-process PML4 physical base), or 0 to run in the SHARED kernel
+    /// address space (the default — U1a/U1b/U2 keep 0). When non-zero, `user_task_trampoline` installs
+    /// it before the `iretq` to ring 3, and `exit` restores the kernel CR3 + frees the slot on
+    /// teardown. Ring 3 is cooperative (IF-masked), so one CR3 covers the task's whole ring-3 run.
+    user_cr3: u64,
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -460,6 +465,7 @@ fn spawn_inner(
         done_sem,
         user_entry: 0,
         user_rsp: 0,
+        user_cr3: 0,
     });
 
     RUN_QUEUES[target_cpu].lock().push(task);
@@ -493,10 +499,10 @@ extern "C" fn user_task_trampoline() -> ! {
     let cpu = percpu::this_cpu().cpu_index as usize;
     let raw = SCHED[cpu].current.load(Ordering::Acquire) as *const Task;
     debug_assert!(!raw.is_null(), "user_task_trampoline: current is null");
-    let (entry, user_rsp, ktop) = unsafe {
+    let (entry, user_rsp, ktop, user_cr3) = unsafe {
         let s = &(*raw).stack;
         let ktop = ((s.as_ptr() as usize + s.len()) & !0xF) as u64;
-        ((*raw).user_entry, (*raw).user_rsp, ktop)
+        ((*raw).user_entry, (*raw).user_rsp, ktop, (*raw).user_cr3)
     };
     // TSS.RSP0 (used by the CPU on a ring-3 FAULT) and the per-CPU SYSCALL kernel-rsp anchor (used
     // by the SYSCALL stub — SYSCALL does not switch stacks itself) both point at this task's kernel
@@ -504,6 +510,16 @@ extern "C" fn user_task_trampoline() -> ! {
     // triple-fault.
     crate::arch::gdt::set_privilege_stack0(cpu, ktop);
     percpu::set_syscall_kernel_rsp(ktop);
+
+    // U3: install this task's private address space (per-process CR3) before dropping to ring 3.
+    // Safe here: the kernel half (kernel code, this Box kernel stack, GDT/TSS/IDT/percpu, the iretq
+    // frame below) is shared into every per-process PML4, so loading the process CR3 pulls nothing
+    // out from under us — only PML4[2] (the USER_BASE window) changes to this process's private one.
+    // `entry`/`user_rsp` are already in locals (read above). A 0 CR3 means the shared kernel window
+    // (U1a/U1b/U2) — leave CR3 untouched so those paths stay byte-identical.
+    if user_cr3 != 0 {
+        unsafe { crate::arch::memory::load_cr3(user_cr3) };
+    }
 
     // Drop to ring 3. `swapgs` parks this CPU's PerCpuData pointer in the GS shadow for the syscall
     // path; the `iretq` frame is [SS, RSP, RFLAGS(IF clear), CS, RIP] (RIP pushed LAST so `iretq`
@@ -575,6 +591,20 @@ extern "C" fn user_task_trampoline() -> ! {
 /// that never runs the scheduler loop. Fire-and-forget: `sys_exit` marks it FINISHED and the
 /// scheduler reclaims it. Returns the task id.
 pub fn spawn_user(name: &'static str, user_entry: u64, user_rsp: u64, target_cpu: usize) -> u64 {
+    spawn_user_in_space(name, user_entry, user_rsp, target_cpu, 0)
+}
+
+/// U3: like `spawn_user`, but the task runs in a PRIVATE address space `user_cr3` (a per-process
+/// PML4 physical base from `memory::alloc_user_space`). `user_task_trampoline` installs that CR3
+/// before dropping to ring 3, and `exit` restores the kernel CR3 + frees the slot on teardown.
+/// `user_cr3 == 0` is exactly `spawn_user` (the shared kernel window — U1a/U1b/U2).
+pub fn spawn_user_in_space(
+    name: &'static str,
+    user_entry: u64,
+    user_rsp: u64,
+    target_cpu: usize,
+    user_cr3: u64,
+) -> u64 {
     assert!(target_cpu < MAX_CPUS, "spawn_user: target_cpu out of range");
     let mut stack: Box<[u8]> = alloc::vec![0u8; TASK_STACK_SIZE].into_boxed_slice();
     let ctx_rsp = build_initial_frame(&mut stack, user_task_trampoline);
@@ -593,6 +623,7 @@ pub fn spawn_user(name: &'static str, user_entry: u64, user_rsp: u64, target_cpu
         done_sem: None,
         user_entry,
         user_rsp,
+        user_cr3,
     });
     RUN_QUEUES[target_cpu].lock().push(task);
     poke_for(target_cpu, PRIO_NORMAL);
@@ -759,6 +790,16 @@ pub fn exit() -> ! {
     let raw = SCHED[cpu].current.load(Ordering::Acquire) as *mut Task;
     assert!(!raw.is_null(), "exit: no current task");
     unsafe {
+        // U3: if this task owned a private address space, tear it down HERE — restore the shared
+        // kernel CR3 (that `mov cr3` full-flush retires this process's user TLB entries), THEN free
+        // the slot. Order matters: free-after-restore, so no core is left on the dead root. We run on
+        // this task's own kernel stack + scheduler code, both Global in the kernel half (shared into
+        // every process root), so restoring the kernel CR3 doesn't pull the stack out from under us.
+        let user_cr3 = (*raw).user_cr3;
+        if user_cr3 != 0 {
+            crate::arch::memory::restore_kernel_cr3();
+            crate::arch::memory::free_user_space_by_cr3(user_cr3);
+        }
         (*raw).state.store(STATE_FINISHED, Ordering::Release);
         // Switch away for good. `old_rsp` is a throwaway slot on the dying stack (the scheduler
         // never reads it back, and never switches into a Finished task).

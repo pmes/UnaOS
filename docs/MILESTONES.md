@@ -46,6 +46,27 @@ Legend: **✅ metal-confirmed** · **🔬 QEMU-green, metal pending** · dates I
   binary.) Log: `target/serial-pi.m7-metal.log`.
 - **Commit:** this arc on `hw-pi4` (merge pending the integrator, who records the merge hash).
 
+## Round 6 — 2026-07-04 (landed on track branches; awaiting integration)
+
+### U3 — per-process address spaces (CR3) (x86) 🔬 `hw-rmbp`
+- **What:** each ring-3 process now runs in its OWN top-level page table (its own
+  CR3) instead of sharing one user window — the x86 mirror of aarch64 M6d. A static
+  8-slot pool of page tables each SHARES the kernel half (copies every kernel PML4
+  entry except the user-window slot, so the identity map / MMIO / heap / kernel
+  stacks are shared) and owns a PRIVATE user window at USER_BASE. The scheduler
+  installs a task's CR3 before dropping to ring 3 and restores the kernel CR3 +
+  frees the slot on exit. Two processes can map the same address to different
+  memory. Plain `mov cr3` (full TLB flush) — PCID (the x86 ASID analogue) deferred.
+- **Tested — QEMU:** `./arroyo test 25` → a deterministic kernel isolation probe
+  (two spaces, same VA, distinct sentinels, swap CR3 and read → distinct) PASS, and
+  two ring-3 tasks each in their own CR3 each read their own private sentinel PASS;
+  U1a/U1b/U2/U2.5 byte-identical, no reboot loop; coexists with the U2 disk loader
+  (`UNAOS_FATIMG=1`), the U2.5 FTDI console (`UNAOS_USBSERIAL=1`), and the FAT
+  regression (`test-fat part`/`sf`). `./arroyo check` both arches; 0 aarch64 files.
+  4-lens adversarial review → 0 confirmed findings.
+- **Metal — PENDING:** rides the next rMBP reflash (FTDI cable day, ~2026-07-08).
+- **Commits:** on `hw-rmbp` (see landing report); unmerged (Fable credits out).
+
 ---
 
 ## Round 5 — 2026-07-03

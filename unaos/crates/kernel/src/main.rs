@@ -425,6 +425,13 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
                 serial_println!(":: U2-0a: TF+SYSCALL DoS fixture on core {} ::", cpu);
                 unaos_kernel::arch::sched::spawn_user("u2-tf-syscall", demo.tf_syscall, demo.sp, cpu);
                 unaos_kernel::arch::syscall::await_u2_0a_verdict();
+
+                // U3: per-process address spaces (CR3) — the x86 mirror of aarch64 M6d. First the
+                // deterministic kernel isolation probe (two slots, same VA, distinct sentinels, swap
+                // CR3 and read — no ring 3), then two ring-3 tasks each in its OWN address space, each
+                // reading its slot-private sentinel — exercises the CR3 dispatch + teardown end to end.
+                unaos_kernel::arch::syscall::u3_probe_once();
+                unaos_kernel::arch::syscall::u3_run_fixture(cpu);
             } else {
                 serial_println!(":: U1a: no application processors online — ring-3 demo SKIPPED ::");
             }
