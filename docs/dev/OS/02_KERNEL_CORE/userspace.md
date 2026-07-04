@@ -145,8 +145,38 @@
   exited ok -> PASS`, with M6b/M6d/M6e/M6f + CAPSTONE 6/6 all green and 0 unexpected
   faults. The reflash also carried M6f's metal (all three M6f verdicts PASS; the per-task
   preempt rider went > 0 — `spsentinel=3`).
-- Not yet: a process/handle model (U4) and a code-signing / allowlist gate on the
-  loader (`SECURITY.md`).
+- **M7** — a minimal process model: `sys_spawn` + `sys_wait` (the Pi pioneers the
+  roadmap-U4 process model, as it did M6a–M6g). Two new syscalls continue the M6f
+  surface: **`SYS_SPAWN = 8`** loads the fixed on-disk program (`HELLO.BIN`) into a
+  fresh per-task slot and runs it at EL0 as a *child* of the caller, returning the
+  child's pid (no name/path argument this arc — that is M8, needing a validated
+  `copy_from_user` name); **`SYS_WAIT = 9`** blocks the caller until that child exits
+  and returns its exit status. A small static process table (`PROCS`, cap 4 « the 8
+  slots) survives each child's slot teardown; each entry carries a counting
+  `Semaphore` the child *posts* once (on exit **or** kill) and the parent *waits* once
+  — a scheduler wake, so the whole reap round-trip is **QEMU-testable** (the waker is a
+  scheduler post, not the timer). `sys_spawn` reuses the M6g loader core, refactored
+  into a shared, silent `load_program_into_slot()` (the M6g loader now reconstructs its
+  own serial lines from the result, so its output stays byte-identical). The child's
+  pid-recording race is closed by a **co-location invariant**: the child is queued on
+  the caller's core and cannot be dispatched until the parent yields (in `sys_wait`),
+  which is strictly after `sys_spawn` records the pid — all IRQ-masked in the SVC
+  handler, so no `sched.rs` change is needed. The demo is a gated launcher (the M6g
+  shape) that, after M6g frees its slots, spawns a parent fixture (`el0-m7parent`) that
+  `sys_spawn`s a child, `sys_wait`s it, and reports the reaped pid as its witness.
+  QEMU-verified (`./arroyo kernel8-test 30`, after the M6g lines):
+  `:: M7: process model — sys_spawn + sys_wait (parent reaps a disk-loaded child) ::`,
+  a **third** `hello from EL0` (M6c inline #1, M6g loader #2, the M7 child #3), and
+  `:: M7: parent spawned child pid=<p>, waited, child exited status 0 -> PASS ::`, with
+  every M6b/M6c/M6d/M6e/M6f/M6g + CAPSTONE line unchanged and 0 unexpected faults.
+  **★ Metal-confirmed (real Pi 4, 2026-07-04):** `:: M7: parent spawned child pid=41,
+  waited, child exited status 0 -> PASS ::` on silicon — the child loaded off the real
+  card via the EMMC2-first path QEMU cannot exercise (`SD card @0xfe340000 — 15193 MiB,
+  CSD v2`), printed the third `hello from EL0`, and was reaped by the parent's blocking
+  `sys_wait` (woken by the child's scheduler post) under a live timer, with the whole prior
+  battery green (M6b/M6d/M6e/M6f/M6g + CAPSTONE 6/6) and 0 unexpected faults.
+- Not yet: an arbitrary program-by-name `sys_spawn` (M8) and a code-signing / allowlist
+  gate on the loader (`SECURITY.md`).
 
 ### x86_64 (branch `hw-rmbp`)
 
@@ -272,7 +302,7 @@
 | Per-page perms + fault→kill | U1b ✅ | M6b ✅ |
 | Loadable programs | U2 ✅ (from FAT storage) | M6c ✅ (embedded blob) |
 | Per-process address space | U3 (per-process PML4/CR3) | M6d ✅ (TTBR0 + ASID) |
-| Process model, PIDs, handle table | U4 (arch-neutral) | U4 |
+| Process model, PIDs, handle table | U4 (arch-neutral) | M7 ✅ (aarch64 `sys_spawn`/`sys_wait`); U4 generalizes |
 | Capabilities at the syscall boundary | U5 (arch-neutral) | U5 |
 | FS-backed grants | U6 (UnaFS attributes) | U6 |
 
@@ -291,9 +321,11 @@ Conventions shared across arches:
   | 5 | `SYS_SLEEP_MS` | ms | 0 | aarch64 M6f — `sleep_ticks` (cooperative yield where no timer IRQ) |
   | 6 | `SYS_GETPID` | — | task id | aarch64 M6f |
   | 7 | `SYS_GETINFO` | ptr | 0 / `-EFAULT` | aarch64 M6f — writes {pid, ticks} via `copy_to_user` |
+  | 8 | `SYS_SPAWN` | — | child pid / `-errno` | aarch64 M7 — loads the fixed `HELLO.BIN` into a fresh slot, runs it at EL0 as a child (arbitrary program-by-name is M8) |
+  | 9 | `SYS_WAIT` | pid | exit status / `-ECHILD` | aarch64 M7 — blocks until the child exits (scheduler wake via the child's `done` post) |
 
-  aarch64 leads 4–7 (M6f); the x86 U-side port adopts the same numbers so the
-  arches stay aligned (x86 adds SMAP considerations aarch64's PAN-less A72 lacks).
+  aarch64 leads 4–9 (M6f 4–7, M7 8–9); the x86 U-side port adopts the same numbers so
+  the arches stay aligned (x86 adds SMAP considerations aarch64's PAN-less A72 lacks).
 - **User faults kill the task, kernel faults stay fatal.** Fault accounting
   is matched (task, vector/EC, address) so demos assert exact outcomes.
 - **User pages are never executable-and-writable**; code pages are read-only

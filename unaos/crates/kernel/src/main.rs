@@ -317,6 +317,21 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
                 0,
                 vcpu,
             );
+
+            // M7: a minimal process model — sys_spawn + sys_wait (the parent reaps a disk-loaded child).
+            // A gated kernel task on `vcpu` (the m6g-loader idiom), with the demo core `cpu` passed as its
+            // arg: it waits for the M6g loader to finish (so its lines print first AND the M6d/M6f/M6g slots
+            // have freed), builds the PARENT's slot, and spawns the parent on `cpu`. The parent's sys_spawn
+            // then loads HELLO.BIN off the SD card into a fresh slot and runs it at EL0 as a CHILD co-located
+            // on `cpu`; sys_wait blocks the parent until the child exits (a scheduler wake — QEMU-testable)
+            // and returns its status. The launcher folds the verdict. (Deferred to run-time because M6d+M6f
+            // hold all 8 slots at BSP-wiring time; they free as their fixtures exit — hence the M6g gate.)
+            unaos_kernel::arch::sched::spawn(
+                "m7-launch",
+                unaos_kernel::arch::syscall::m7_launcher,
+                cpu,
+                vcpu,
+            );
         }
     }
 

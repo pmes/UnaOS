@@ -10,6 +10,44 @@ Legend: **✅ metal-confirmed** · **🔬 QEMU-green, metal pending** · dates I
 
 ---
 
+## hw-pi4 track — 2026-07-04 (landed on `hw-pi4`, awaiting integration)
+
+### M7 — a minimal process model: sys_spawn + sys_wait (aarch64) ✅ `hw-pi4`
+- **What:** the reaping half of a process model — an EL0 program can now spawn a child
+  program and reap it. **`SYS_SPAWN` (8)** loads the fixed on-disk `HELLO.BIN` into a
+  fresh per-task slot and runs it at EL0 as a *child*, returning its pid; **`SYS_WAIT`
+  (9)** blocks the caller until that child exits and returns its exit status. A small
+  static process table (cap 4) carries, per child, a counting `Semaphore` the child
+  posts once (on exit *or* kill) and the parent waits once — a **scheduler** wake, so
+  the reap is QEMU-testable, not timer-gated. The child's disk load reuses the M6g
+  loader core, refactored into a shared, silent `load_program_into_slot()` (the M6g
+  loader reconstructs its own lines from the result — its output stays byte-identical).
+  The pid-recording race is closed by a co-location invariant (child queued on the
+  caller's core, undispatchable until the parent yields in `sys_wait`), so **no
+  scheduler change** was needed. The Pi pioneers roadmap-U4, as it did M6a–M6g.
+- **Tested — QEMU:** `./arroyo kernel8-test 30` → after the M6g lines: `:: M7: process
+  model — sys_spawn + sys_wait (parent reaps a disk-loaded child) ::`, a **third** `hello
+  from EL0` (the M7 child), `:: M7: parent spawned child pid=<p>, waited, child exited
+  status 0 -> PASS ::`, with every M6b/M6c/M6d/M6e/M6f/M6g + CAPSTONE line byte-identical
+  (hex/pid-normalized set-diff: only the two new M7 marker lines + `hello` 2→3) and 0
+  unexpected faults. x86 (`test` + `UNAOS_FATIMG=1 test`) functionally byte-identical
+  through the U-lines (seam is `baremetal`-only; sole diffs are QEMU timer-calibration
+  jitter); `check` both arches; aarch64 virt v2 + GICv3 JC2 SMP 3/3 unchanged.
+- **Tested — metal (real Pi 4, 2026-07-04):** ★ PASS on silicon. `:: M7: parent spawned
+  child pid=41, waited, child exited status 0 -> PASS ::` — the parent `sys_spawn`ed a child
+  that loaded `HELLO.BIN` off the **real** card via the EMMC2-first path QEMU cannot exercise
+  (`SD card @0xfe340000 — 31116288 blocks (15193 MiB, CSD v2)`), printed the **third** `hello
+  from EL0`, and exited status 0; the parent's blocking `sys_wait` was woken by the child's
+  scheduler post and reaped it — all under a live timer (EL0 preemption live: M6e
+  `IRQs-taken-at-EL0=23`, M6f `spsentinel=3`). Full battery green on metal: M6b `exited=1
+  killed=3 PASS`, M6d ×3, M6f ×3, M6g `disk-loaded EL0 program exited ok -> PASS`, CAPSTONE
+  6/6, EL=1/CNTFRQ=54 MHz, **0 unexpected faults, 0 FAIL lines**. (Prepped non-destructively by
+  swapping `kernel8.img` on the mounted FAT volume — no re-flash needed; the gate-verified
+  binary.) Log: `target/serial-pi.m7-metal.log`.
+- **Commit:** this arc on `hw-pi4` (merge pending the integrator, who records the merge hash).
+
+---
+
 ## Round 5 — 2026-07-03
 
 ### M6g — load a program from storage (aarch64) ✅ `hw-pi4`
