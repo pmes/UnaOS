@@ -164,6 +164,22 @@ unaos_user_u3_reader:
     syscall
 1:  jmp 1b
 
+    // U3.5 fixture — a PREEMPTIBLE ring-3 spinner that NEVER syscalls: it increments a counter in its
+    // OWN (private-CR3) data page in a tight loop forever. Cooperative ring 3 (RFLAGS.IF clear) would
+    // WEDGE its core here — the one-core DoS this arc closes; preemptible ring 3 (IF set) lets the
+    // timer evict it so co-located tasks share the core, and the counter (read back through the slot's
+    // kernel alias) proves it RESUMES correctly across preemptions under its OWN CR3 (a task run under
+    // the wrong CR3 would bump a different frame). `lea` recovers USER_BASE (r8 was scrubbed to 0 on
+    // entry); the loop touches only the data page — no stack, no syscall. The kernel watchdog reaps it
+    // via the scheduler at a preemption boundary (it never exits).
+    .balign 16
+    .globl unaos_user_u3_5_spinner
+unaos_user_u3_5_spinner:
+    lea r8, [rip + unaos_user_blob_start]   // r8 = USER_BASE (code page base)
+    add r8, 0x1000                          // r8 -> data page (USER_BASE + PAGE)
+1:  inc qword ptr [r8]                       // bump the forward-progress counter (private CR3)
+    jmp 1b                                   // spin forever — never syscalls; reaped by the watchdog
+
     .globl unaos_user_blob_end
 unaos_user_blob_end:
 "#
@@ -178,6 +194,7 @@ unsafe extern "C" {
     static unaos_user_stack_exec: u8;
     static unaos_user_tf_syscall: u8;
     static unaos_user_u3_reader: u8;
+    static unaos_user_u3_5_spinner: u8;
 }
 
 // --- The SYSCALL entry stub (LSTAR target). Naked; the only assembly in the syscall path.
@@ -981,4 +998,129 @@ pub fn u3_run_fixture(cpu: usize) {
             U3_EXITED.load(Ordering::Acquire), readbacks[0], sents[0], readbacks[1], sents[1]
         );
     }
+}
+
+// ---------------------------------------------------------------------------------------------
+// U3.5 — preemptible ring 3 (the x86 twin of aarch64 M6e). Completes the U3 process abstraction:
+// a ring-3 task can now be dropped PREEMPTIBLE (RFLAGS.IF set), so the timer evicts it and other
+// work shares its core — closing the one-core DoS a never-syscalling program was, and letting the
+// per-process CR3 travel through the general scheduler DISPATCH path (not just first entry).
+// ---------------------------------------------------------------------------------------------
+
+/// Byte offset of the spinner's forward-progress counter within the slot backing: window page 1
+/// (data), offset 0 — matches `unaos_user_u3_5_spinner` writing `[USER_BASE + PAGE]`.
+const U3_5_COUNTER_OFF: usize = 0x1000;
+/// Steps the kernel co-task takes (each with a sleep) before exiting — the DoS-fix witness.
+const U3_5_COTASK_STEPS: u32 = 8;
+/// U3.5 co-task progress: bumped once per step. Reaching `U3_5_COTASK_STEPS` proves the spinner did
+/// NOT wedge the core (the co-task got CPU time via preemption).
+static U3_5_COTASK_PROGRESS: AtomicU32 = AtomicU32::new(0);
+
+/// U3.5 kernel co-task pinned to the SPINNER'S core: take `U3_5_COTASK_STEPS` steps, sleeping between
+/// them so it time-shares the core with the preemptible spinner, then exit. Under cooperative ring 3
+/// this task would NEVER run (the spinner would hog the core forever); its completion is the proof the
+/// DoS is fixed. A KERNEL task (not a second ring-3 task) by design — one user task per core keeps
+/// TSS.RSP0 valid without a dispatch-time RSP0 install (an M7-twin concern, out of this arc's scope).
+fn u3_5_cotask(_: usize) {
+    for _ in 0..U3_5_COTASK_STEPS {
+        U3_5_COTASK_PROGRESS.fetch_add(1, Ordering::AcqRel);
+        crate::arch::sched::sleep_ticks(2);
+    }
+}
+
+/// U3.5: prove PREEMPTIBLE ring 3 end to end. Spawn a preemptible ring-3 spinner (`jmp`-loop that
+/// bumps a private-CR3 counter and never syscalls) plus a KERNEL co-task on the SAME core `cpu`, then
+/// (BSP-side, bounded on the ms-clock) confirm the three properties the arc must deliver:
+///   (a) the timer PREEMPTED the spinner — `interrupts::IRQS_AT_RING3 > 0` (the metal-only truth
+///       cooperative ring 3 can never show); gate on `> 0`, not an exact count (TCG under-delivers);
+///   (b) the co-task RAN to completion — the spinner no longer wedges the core (the DoS fix);
+///   (c) the spinner RESUMES correctly across preemptions — its private-CR3 counter keeps CLIMBING
+///       (a task resumed under the wrong CR3, or with a corrupt register file, would stop/misbehave).
+/// Then the watchdog REAPS the spinner via the scheduler `KillSwitch` (it never exits on its own) and
+/// confirms it terminated. Prints one PASS/FAIL line. One-shot; runs after `u3_run_fixture`, so the
+/// address-space pool is free and this is the LAST ring-3 fixture (nothing after it relies on the AP's
+/// cooperative FIFO ordering). `cpu` is a scheduled AP.
+pub fn u3_5_run_fixture(cpu: usize) {
+    let Some(slot) = crate::arch::memory::alloc_user_space() else {
+        serial_println!(":: U3.5: address-space pool exhausted — preemption fixture skipped ::");
+        return;
+    };
+    let cr3 = crate::arch::memory::slot_cr3(slot);
+    let backing = crate::arch::memory::slot_backing_ptr(slot);
+    let blob_start = &raw const unaos_user_blob_start as usize;
+    let blob_end = &raw const unaos_user_blob_end as usize;
+    let blob_len = blob_end - blob_start;
+    let spin_entry = USER_BASE + (&raw const unaos_user_u3_5_spinner as usize - blob_start) as u64;
+    let sp = USER_BASE + USER_WINDOW_PAGES * PAGE_SIZE - 16;
+
+    // Copy the blob into the slot's code page (page 0) through the kernel identity alias — never
+    // through USER_BASE, so the code mapping stays read-only (W^X) — and zero the counter word.
+    unsafe {
+        core::ptr::copy_nonoverlapping(blob_start as *const u8, backing, blob_len);
+        core::ptr::write_volatile(backing.add(U3_5_COUNTER_OFF) as *mut u64, 0);
+    }
+
+    U3_5_COTASK_PROGRESS.store(0, Ordering::Release);
+    let irqs_before = crate::arch::interrupts::IRQS_AT_RING3.load(Ordering::Acquire);
+    let kill = alloc::sync::Arc::new(crate::arch::sched::KillSwitch::new());
+
+    // Co-task first (queued at the spinner's priority), then the preemptible spinner — both on `cpu`.
+    serial_println!(":: U3.5: preemptible-ring-3 demo — spinner + co-task on core {} ::", cpu);
+    crate::arch::sched::spawn("u3.5-cotask", u3_5_cotask, 0, cpu, crate::arch::sched::PRIO_NORMAL);
+    crate::arch::sched::spawn_user_preemptible("u3.5-spinner", spin_entry, sp, cpu, cr3, kill.clone());
+
+    // (a)+(b): wait until the timer has preempted the spinner AND the co-task finished AND the spinner
+    // has made some progress. Bounded on the BSP-driven ms-clock (the BSP's timer advances `ticks()`
+    // while it spins here, as the U1a/U2/U3 verdicts also rely on).
+    let read_counter = || unsafe { core::ptr::read_volatile(backing.add(U3_5_COUNTER_OFF) as *const u64) };
+    let deadline = crate::arch::ticks() + 4000;
+    loop {
+        let irqs = crate::arch::interrupts::IRQS_AT_RING3.load(Ordering::Acquire) - irqs_before;
+        let cot = U3_5_COTASK_PROGRESS.load(Ordering::Acquire);
+        if (irqs > 0 && cot >= U3_5_COTASK_STEPS && read_counter() > 0) || crate::arch::ticks() >= deadline {
+            break;
+        }
+        core::hint::spin_loop();
+    }
+
+    // (c): the spinner is still running (not yet reaped). Sample its counter across a short bounded
+    // window and confirm it CLIMBED — forward progress over (necessarily several quanta of) preemptions
+    // proves each eviction was correctly resumed. The window spans many quanta at 1 kHz; the counter
+    // increments at CPU speed, so any live spinner grows it by a huge margin.
+    let progress_1 = read_counter();
+    let obs_deadline = crate::arch::ticks() + 100;
+    while crate::arch::ticks() < obs_deadline {
+        core::hint::spin_loop();
+    }
+    let progress_2 = read_counter();
+    let resumed = progress_1 > 0 && progress_2 > progress_1;
+
+    // Reap the spinner via the scheduler (it never exits) and confirm it terminated within the bound.
+    kill.request();
+    let kdeadline = crate::arch::ticks() + 2000;
+    while !kill.is_reaped() && crate::arch::ticks() < kdeadline {
+        core::hint::spin_loop();
+    }
+    let reaped = kill.is_reaped();
+
+    let irqs = crate::arch::interrupts::IRQS_AT_RING3.load(Ordering::Acquire) - irqs_before;
+    let cot = U3_5_COTASK_PROGRESS.load(Ordering::Acquire);
+    if irqs > 0 && cot >= U3_5_COTASK_STEPS && resumed && reaped {
+        serial_println!(
+            ":: U3.5: ring-3 preemption — IRQs-at-ring3={}, co-task ran, spinner resumed -> PASS ::",
+            irqs
+        );
+    } else {
+        serial_println!(
+            ":: U3.5: ring-3 preemption FAIL — irqs={} cotask={}/{} progress={}->{} reaped={} ::",
+            irqs, cot, U3_5_COTASK_STEPS, progress_1, progress_2, reaped
+        );
+    }
+
+    // Slot lifecycle: on the PASS path the scheduler's reap already restored the kernel CR3 + freed
+    // the slot. On a reap TIMEOUT (`!reaped`), the spinner never self-exits (it never syscalls), so it
+    // is still ALIVE and running under `cr3` — freeing that slot here would be unsafe (a later
+    // `alloc_user_space` could rebuild a live address space underfoot) and could double-free against a
+    // late scheduler reap. Leaking one of the 8 slots is harmless: U3.5 is the LAST ring-3 fixture, and
+    // a timeout is already a hard FAIL. So we deliberately do NOT free here.
 }

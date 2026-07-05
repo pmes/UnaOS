@@ -432,6 +432,14 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
                 // reading its slot-private sentinel — exercises the CR3 dispatch + teardown end to end.
                 unaos_kernel::arch::syscall::u3_probe_once();
                 unaos_kernel::arch::syscall::u3_run_fixture(cpu);
+
+                // U3.5: preemptible ring 3 (the x86 twin of aarch64 M6e) — completes U3. Drop a
+                // PREEMPTIBLE ring-3 spinner (never syscalls) plus a kernel co-task on the same core:
+                // the timer evicts the spinner so the co-task runs (the DoS fix), and the spinner's
+                // private-CR3 counter keeps climbing across preemptions (correct resume through the
+                // CR3-at-dispatch path). A watchdog reaps the spinner via the scheduler. Runs LAST so
+                // the preemptible task can't perturb the cooperative U1a/U1b/U2/U3 ordering above.
+                unaos_kernel::arch::syscall::u3_5_run_fixture(cpu);
             } else {
                 serial_println!(":: U1a: no application processors online — ring-3 demo SKIPPED ::");
             }

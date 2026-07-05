@@ -409,6 +409,20 @@ pub fn restore_kernel_cr3() {
     unsafe { load_cr3(kernel_cr3()) };
 }
 
+/// U3.5: install `target` CR3 iff it differs from the live one. A `mov cr3` is a full non-global TLB
+/// flush, so the "only if different" skips the redundant flush on the common no-switch dispatch (same
+/// task resumed, or kernel task → kernel task). Called IRQ-masked from the scheduler DISPATCH path,
+/// before switching into the incoming task — the single site where a task's address space is
+/// established for BOTH first entry (was the trampoline) and resume-after-preemption (which never
+/// goes through the trampoline). `target` is a raw CR3 base (no PCID — CR4.PCIDE is off), directly
+/// comparable to the live CR3 base.
+#[inline]
+pub unsafe fn switch_cr3_if_needed(target: u64) {
+    if cr3_table() as u64 != target {
+        unsafe { load_cr3(target) };
+    }
+}
+
 /// Build slot `s`'s page table: share the kernel half (copy every live PML4 entry except PML4[2]),
 /// then wire the slot's own PML4[2] → PDPT[0] → PD[0] → PT[0..N] → its backing frames with the U1a
 /// window shape (page 0 code = USER + RX, read-only from the start; pages 1..N data/stack = USER +

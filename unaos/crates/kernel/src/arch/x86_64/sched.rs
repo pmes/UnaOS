@@ -95,6 +95,48 @@ const WAIT_CAPACITY: usize = 32;
 /// The task starts masked; its trampoline enables interrupts explicitly.
 const INITIAL_RFLAGS: u64 = 0x0000_0002;
 
+/// RFLAGS.IF (interrupt-enable, bit 9). U3.5: OR'd into a PREEMPTIBLE ring-3 task's `iretq` RFLAGS so
+/// the timer can evict it; a cooperative (default) ring-3 task keeps IF clear and runs to completion.
+const RFLAGS_IF: u64 = 1 << 9;
+
+/// U3.5: external-termination handshake for a PREEMPTIBLE ring-3 task that never yields (a spinner).
+/// A cooperative task exits via `sys_exit`; a never-syscalling one can only be stopped by the
+/// scheduler REAPING it at a preemption boundary. The requester sets `requested`; the scheduler, on
+/// the task's next switch-back, tears its address space down, drops it, and sets `reaped`. Shared by
+/// `Arc` (exactly like `Task::done_sem`) so it outlives the dropped `Task` — the requester keeps a
+/// clone across the request/reap window.
+pub struct KillSwitch {
+    requested: AtomicBool,
+    reaped: AtomicBool,
+}
+
+impl KillSwitch {
+    /// A fresh, un-requested kill switch. `const` so a fixture can build one before the Arc.
+    pub const fn new() -> Self {
+        KillSwitch { requested: AtomicBool::new(false), reaped: AtomicBool::new(false) }
+    }
+    /// Request termination at the task's next preemption (idempotent).
+    pub fn request(&self) {
+        self.requested.store(true, Ordering::Release);
+    }
+    /// True once the scheduler has reaped the task (torn its address space down + dropped it).
+    pub fn is_reaped(&self) -> bool {
+        self.reaped.load(Ordering::Acquire)
+    }
+    fn is_requested(&self) -> bool {
+        self.requested.load(Ordering::Acquire)
+    }
+    fn mark_reaped(&self) {
+        self.reaped.store(true, Ordering::Release);
+    }
+}
+
+impl Default for KillSwitch {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 // ---------------------------------------------------------------------------------------------
 // Task
 // ---------------------------------------------------------------------------------------------
@@ -172,6 +214,16 @@ pub struct Task {
     /// it before the `iretq` to ring 3, and `exit` restores the kernel CR3 + frees the slot on
     /// teardown. Ring 3 is cooperative (IF-masked), so one CR3 covers the task's whole ring-3 run.
     user_cr3: u64,
+    /// U3.5: preemptible ring 3. When true, `user_task_trampoline` drops to ring 3 with RFLAGS.IF
+    /// SET, so the timer can preempt this task and other work shares its core (the DoS fix). The
+    /// default `false` (U1a/U1b/U2/U2.5/U3) keeps IF clear — cooperative, run-to-completion FIFO — so
+    /// those fixtures stay byte-identical. Only the U3.5 spinner is preemptible.
+    preemptible: bool,
+    /// U3.5: external-kill handshake for a `preemptible` task that never yields, or `None` (every
+    /// other task). The scheduler checks it on switch-back and REAPS the task (address-space teardown
+    /// + drop + mark reaped) instead of requeuing. An `Arc` (like `done_sem`) so the requester's clone
+    /// keeps it alive after the Box is dropped.
+    kill: Option<Arc<KillSwitch>>,
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -466,6 +518,8 @@ fn spawn_inner(
         user_entry: 0,
         user_rsp: 0,
         user_cr3: 0,
+        preemptible: false,
+        kill: None,
     });
 
     RUN_QUEUES[target_cpu].lock().push(task);
@@ -499,31 +553,35 @@ extern "C" fn user_task_trampoline() -> ! {
     let cpu = percpu::this_cpu().cpu_index as usize;
     let raw = SCHED[cpu].current.load(Ordering::Acquire) as *const Task;
     debug_assert!(!raw.is_null(), "user_task_trampoline: current is null");
-    let (entry, user_rsp, ktop, user_cr3) = unsafe {
+    let (entry, user_rsp, ktop, preemptible) = unsafe {
         let s = &(*raw).stack;
         let ktop = ((s.as_ptr() as usize + s.len()) & !0xF) as u64;
-        ((*raw).user_entry, (*raw).user_rsp, ktop, (*raw).user_cr3)
+        ((*raw).user_entry, (*raw).user_rsp, ktop, (*raw).preemptible)
     };
-    // TSS.RSP0 (used by the CPU on a ring-3 FAULT) and the per-CPU SYSCALL kernel-rsp anchor (used
-    // by the SYSCALL stub — SYSCALL does not switch stacks itself) both point at this task's kernel
-    // stack top, so a syscall or a fault from ring 3 lands on a valid kernel stack, never a
-    // triple-fault.
+    // TSS.RSP0 (used by the CPU on a ring-3 FAULT or timer preemption) and the per-CPU SYSCALL
+    // kernel-rsp anchor (used by the SYSCALL stub — SYSCALL does not switch stacks itself) both point
+    // at this task's kernel stack top, so a syscall, fault, or IRQ from ring 3 lands on a valid kernel
+    // stack, never a triple-fault. (Only ONE user task runs per core at a time in U3.5's fixture — a
+    // preemptible spinner plus KERNEL co-tasks — so a stale RSP0 across a switch is harmless; a
+    // second concurrent user task per core would need RSP0/CR3 at dispatch, an M7-twin arc.)
     crate::arch::gdt::set_privilege_stack0(cpu, ktop);
     percpu::set_syscall_kernel_rsp(ktop);
 
-    // U3: install this task's private address space (per-process CR3) before dropping to ring 3.
-    // Safe here: the kernel half (kernel code, this Box kernel stack, GDT/TSS/IDT/percpu, the iretq
-    // frame below) is shared into every per-process PML4, so loading the process CR3 pulls nothing
-    // out from under us — only PML4[2] (the USER_BASE window) changes to this process's private one.
-    // `entry`/`user_rsp` are already in locals (read above). A 0 CR3 means the shared kernel window
-    // (U1a/U1b/U2) — leave CR3 untouched so those paths stay byte-identical.
-    if user_cr3 != 0 {
-        unsafe { crate::arch::memory::load_cr3(user_cr3) };
-    }
+    // U3/U3.5: this task's private CR3 was installed by the scheduler DISPATCH path (`run`) before it
+    // switched into this trampoline — NOT here — so the same CR3 install covers a RESUMED preempted
+    // task too (which never re-enters this trampoline). `exit` restores the kernel CR3 + frees the
+    // slot on teardown. The kernel half (kernel code, this Box kernel stack, GDT/TSS/IDT/percpu, the
+    // iretq frame below) is shared into every per-process PML4, so running under the process CR3 pulls
+    // nothing out from under us — only PML4[2] (the USER_BASE window) is private.
+
+    // U3.5: a PREEMPTIBLE task drops to ring 3 with RFLAGS.IF SET so the timer can evict it; the
+    // default cooperative task keeps IF clear (INITIAL_RFLAGS), running to completion FIFO.
+    let user_rflags = if preemptible { INITIAL_RFLAGS | RFLAGS_IF } else { INITIAL_RFLAGS };
 
     // Drop to ring 3. `swapgs` parks this CPU's PerCpuData pointer in the GS shadow for the syscall
-    // path; the `iretq` frame is [SS, RSP, RFLAGS(IF clear), CS, RIP] (RIP pushed LAST so `iretq`
-    // pops it first). Interrupts are masked here, so the swapgs/iretq window can't take an IRQ.
+    // path; the `iretq` frame is [SS, RSP, RFLAGS, CS, RIP] (RIP pushed LAST so `iretq` pops it
+    // first). Interrupts are masked HERE, so the swapgs/iretq window can't take an IRQ; a preemptible
+    // task only becomes interruptible once `iretq` loads its IF=1 RFLAGS in ring 3.
     //
     // U2 Part-0b: FIRST-ENTRY GPR SCRUB — the x86 twin of the aarch64 M6d first-`eret` scrub (and of
     // the U1b SYSRET-return scrub, which only covers the return half). Before this, the trampoline's
@@ -576,7 +634,7 @@ extern "C" fn user_task_trampoline() -> ! {
             "iretq",
             ss = in(reg) crate::arch::gdt::USER_DATA_SEL as u64,
             ursp = in(reg) user_rsp,
-            rflags = in(reg) INITIAL_RFLAGS, // reserved bit set, IF clear -> cooperative ring 3
+            rflags = in(reg) user_rflags, // reserved bit set; IF clear (cooperative) or set (preemptible)
             cs = in(reg) crate::arch::gdt::USER_CODE_SEL as u64,
             entry = in(reg) entry,
             options(noreturn),
@@ -605,6 +663,38 @@ pub fn spawn_user_in_space(
     target_cpu: usize,
     user_cr3: u64,
 ) -> u64 {
+    spawn_user_inner(name, user_entry, user_rsp, target_cpu, user_cr3, false, None)
+}
+
+/// U3.5: like `spawn_user_in_space`, but the task drops to ring 3 PREEMPTIBLE (RFLAGS.IF set, so the
+/// timer can evict it) and carries a `KillSwitch` the watchdog uses to reap it — it never yields, so
+/// the scheduler is the only thing that can stop it. The x86 twin of aarch64 M6e's I-unmasked
+/// `spawn_user`. `user_cr3` must be a real private address space (a preemptible task can be preempted
+/// mid-run, and the CR3 is re-installed at every dispatch — including its resume). Returns the id.
+pub fn spawn_user_preemptible(
+    name: &'static str,
+    user_entry: u64,
+    user_rsp: u64,
+    target_cpu: usize,
+    user_cr3: u64,
+    kill: Arc<KillSwitch>,
+) -> u64 {
+    spawn_user_inner(name, user_entry, user_rsp, target_cpu, user_cr3, true, Some(kill))
+}
+
+/// Shared ring-3 spawn: build the user task (cooperative or `preemptible`, with an optional external
+/// `kill` handshake), enqueue it on `target_cpu`, and poke that CPU. `spawn_user_in_space` (hence
+/// `spawn_user` and every U1a/U1b/U2/U2.5/U3 caller) passes `preemptible=false, kill=None`, so those
+/// tasks are built byte-identically to before U3.5.
+fn spawn_user_inner(
+    name: &'static str,
+    user_entry: u64,
+    user_rsp: u64,
+    target_cpu: usize,
+    user_cr3: u64,
+    preemptible: bool,
+    kill: Option<Arc<KillSwitch>>,
+) -> u64 {
     assert!(target_cpu < MAX_CPUS, "spawn_user: target_cpu out of range");
     let mut stack: Box<[u8]> = alloc::vec![0u8; TASK_STACK_SIZE].into_boxed_slice();
     let ctx_rsp = build_initial_frame(&mut stack, user_task_trampoline);
@@ -624,6 +714,8 @@ pub fn spawn_user_in_space(
         user_entry,
         user_rsp,
         user_cr3,
+        preemptible,
+        kill,
     });
     RUN_QUEUES[target_cpu].lock().push(task);
     poke_for(target_cpu, PRIO_NORMAL);
@@ -1630,6 +1722,20 @@ fn run() -> ! {
                 // handlers read it Acquire).
                 SCHED[cpu].current.store(raw as u64, Ordering::Release);
 
+                // U3.5: install the incoming task's ADDRESS SPACE (CR3) here — the single dispatch
+                // site that covers BOTH a first entry (was the trampoline's job) AND a resume after
+                // preemption (which never re-enters the trampoline). A user task runs under its
+                // private `user_cr3`; a kernel task and the cooperative shared-window fixtures
+                // (`user_cr3 == 0`) run under the kernel CR3 — so a kernel task never inherits a
+                // just-preempted user task's CR3 (which could be freed on that task's teardown). We
+                // are IF=0 here (loop top), and "only if different" skips the redundant full-flush
+                // `mov cr3` on the common no-switch case.
+                let target_cr3 = {
+                    let uc = unsafe { (*raw).user_cr3 };
+                    if uc != 0 { uc } else { crate::arch::memory::kernel_cr3() }
+                };
+                unsafe { crate::arch::memory::switch_cr3_if_needed(target_cr3) };
+
                 unsafe {
                     switch_context(SCHED[cpu].scheduler_rsp.as_ptr(), entry_rsp);
                 }
@@ -1649,10 +1755,28 @@ fn run() -> ! {
                     STATE_FINISHED => drop(task),
                     STATE_BLOCKED => park_blocked(cpu, park, task),
                     _ => {
-                        // READY (yielded or preempted): rotate to the back of its priority level.
+                        // READY (yielded or preempted). U3.5: a preemptible never-yielding task whose
+                        // KillSwitch has been requested is REAPED here instead of requeued — the only
+                        // way to stop a task that never calls `sys_exit`. Teardown MIRRORS `exit`:
+                        // restore the kernel CR3 (this task ran under its own CR3, still live here;
+                        // that mov-cr3 full-flush retires the slot's user TLB entries) BEFORE freeing
+                        // the slot, so no core is left on a dead/reused root. We are IF=0.
                         debug_assert_eq!(park, PARK_NONE, "non-blocked task carried a park action");
-                        task.state.store(STATE_READY, Ordering::Release);
-                        RUN_QUEUES[cpu].lock().push(task);
+                        let reap = task.kill.as_ref().is_some_and(|k| k.is_requested());
+                        if reap {
+                            if task.user_cr3 != 0 {
+                                crate::arch::memory::restore_kernel_cr3();
+                                crate::arch::memory::free_user_space_by_cr3(task.user_cr3);
+                            }
+                            if let Some(k) = &task.kill {
+                                k.mark_reaped(); // through the Arc — the requester's clone keeps it live
+                            }
+                            drop(task); // frees the kstack; the interrupt frame on it is abandoned
+                        } else {
+                            // Rotate to the back of its priority level.
+                            task.state.store(STATE_READY, Ordering::Release);
+                            RUN_QUEUES[cpu].lock().push(task);
+                        }
                     }
                 }
             }

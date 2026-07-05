@@ -10,6 +10,43 @@ Legend: **✅ metal-confirmed** · **🔬 QEMU-green, metal pending** · dates I
 
 ---
 
+## hw-rmbp track — 2026-07-04 (landed on `hw-rmbp`, awaiting integration)
+
+### U3.5 — preemptible ring 3 (x86) ✅ `hw-rmbp`
+- **What:** completes the U3 process abstraction — a ring-3 task can now be dropped
+  **preemptible** (`Task.preemptible` sets `RFLAGS.IF` in the `iretq` frame), so the
+  local-APIC timer evicts it and other work shares its core. This closes the one-core
+  DoS a program that never syscalls (`jmp $`) was. The x86 twin of aarch64 M6e. The
+  timer ISR conditionally `swapgs`es on a CPL-3 entry so the scheduler sees the kernel
+  per-CPU block, and the per-process **CR3 install moved from the trampoline into the
+  scheduler DISPATCH path** so it covers a resumed-after-preemption task (which never
+  re-enters the trampoline) as well as first entry. The full user register file is
+  saved/restored across preempt/resume by the existing `x86-interrupt` + `switch_context`
+  machinery. The cooperative fixtures (U1a/U1b/U2/U2.5/U3) stay `preemptible=false` — IF
+  clear, never preempted — so they are byte-identical.
+- **Tested — QEMU:** `./arroyo test 25` → `:: U3.5: ring-3 preemption — IRQs-at-ring3=160,
+  co-task ran, spinner resumed -> PASS ::` (a preemptible spinner is preempted 160×, a
+  kernel co-task on the same core runs to completion = the DoS fix, the spinner's
+  private-CR3 counter climbs across preemptions = correct resume, and a watchdog reaps it
+  via a scheduler `KillSwitch`). U1a/U1b/U2/U2.5/U3 byte-identical (only the U1a shared-blob
+  size and 2 new U3.5 lines differ); coexists with the U2 disk loader (`UNAOS_FATIMG=1` →
+  `hello from disk`), the U2.5 FTDI console (`UNAOS_USBSERIAL=1`), and the FAT regression
+  (`test-fat part`/`sf`). `./arroyo check` both arches; 0 aarch64 files. Multi-lens
+  adversarial review before commit.
+- **Honest scope:** per-task opt-in (only the spinner is preemptible); FP/SIMD is NOT saved
+  across preemption yet (no FXSAVE/FXRSTOR — the register-only spinner is safe); one user
+  task per core (RSP0/`syscall_kernel_rsp` set at first entry only); no PCID.
+- **Metal — ★ CONFIRMED (real 2012 rMBP, 2026-07-04, bootlog photo):** `:: SMEP on ::` (real
+  supervisor-execute protection active while the preemptible spinner ran) then `:: U3.5: ring-3
+  preemption — IRQs-at-ring3=156, co-task ran, spinner resumed -> PASS ::` — the real timer preempted
+  the ring-3 spinner 156× and the swapgs-on-ring3-timer + CR3-at-dispatch + reap ran correctly on Ivy
+  Bridge, every prior fixture PASS (U1a/U1b/U2-0a/U3 byte-consistent), 0 unexpected faults. The same
+  boot also confirmed the U2.5 APIC ms-clock fix on metal: `initcnt=6236 [1 kHz calibrated]`,
+  `ms-clock 999 Hz` (the old ~119 Hz reading is gone).
+- **Commit:** on `hw-rmbp` (see landing report); unmerged (integrator records the merge).
+
+---
+
 ## hw-pi4 track — 2026-07-04 (landed on `hw-pi4`, awaiting integration)
 
 ### M7 — a minimal process model: sys_spawn + sys_wait (aarch64) ✅ `hw-pi4`
