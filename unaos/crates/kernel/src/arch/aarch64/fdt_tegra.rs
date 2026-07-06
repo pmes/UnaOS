@@ -388,6 +388,39 @@ pub fn xusb_ids(dtb_addr: u64, dtb_size: usize, ram_gib_mask: u64) -> Option<Xus
     Some(ids)
 }
 
+/// JB2b: does the firmware DTB mark the XUSB host node `dma-coherent`? A DT boolean is presence
+/// (`val_len == 0`), so `prop_at(..).found` is the test. `Some(true)` = the controller's DMA snoops
+/// the CPU caches (Normal-WB rings need no cache maintenance — the Linux tegra234.dtsi stance);
+/// `Some(false)` = the prop is absent from this firmware's tree (verify-don't-assume: the attach
+/// still proceeds, and a stale-ring enumeration stall becomes the diagnosis); `None` = the node or
+/// the DTB itself was unresolvable. Same node match as `xusb_ids`.
+pub fn xusb_dma_coherent(dtb_addr: u64, dtb_size: usize, ram_gib_mask: u64) -> Option<bool> {
+    if dtb_addr == 0 || dtb_size == 0 {
+        return None;
+    }
+    let g_lo = dtb_addr >> 30;
+    let g_hi = (dtb_addr + dtb_size as u64 - 1) >> 30;
+    let mapped = |g: u64| g == 0 || (g < 64 && (ram_gib_mask >> g) & 1 != 0);
+    if !mapped(g_lo) || !mapped(g_hi) {
+        return None;
+    }
+    let blob = unsafe { core::slice::from_raw_parts(dtb_addr as *const u8, dtb_size) };
+    let fdt = Fdt::new(blob)?;
+    let mut path = [0u8; MAX_PATH];
+    let mut plen = 0usize;
+    fdt.for_each_prop(|e| {
+        if plen == 0 && e.path.windows(11).any(|w| w == b"usb@3610000") {
+            let l = e.path.len().min(MAX_PATH);
+            path[..l].copy_from_slice(&e.path[..l]);
+            plen = l;
+        }
+    });
+    if plen == 0 {
+        return None;
+    }
+    Some(fdt.prop_at(&path[..plen], b"dma-coherent").found)
+}
+
 /// JB1a: print the BPMP IPC geometry from the firmware DTB. Read-only; pre-heap; EL2. Every
 /// outcome is one serial line — including every way of failing to find things.
 pub fn jb1a_dump(dtb_addr: u64, dtb_size: usize, ram_gib_mask: u64) {

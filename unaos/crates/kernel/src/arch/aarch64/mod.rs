@@ -53,6 +53,10 @@ pub mod fdt_tegra;
 // transport every partition-ungate MRQ (XUSB, nvdisplay) rides on.
 #[cfg(feature = "tegra")]
 pub mod bpmp_tegra;
+// JB2b: platform-attach of the shared xHCI driver at the ungated XUSB block (raw MMIO, polled) +
+// the EL1 keyboard-pump task — the Orin USB-keyboard first-light arc.
+#[cfg(feature = "tegra")]
+pub mod xusb_tegra;
 
 pub fn init() {
     serial_println!(":: AARCH64 Core Hardware Init ::");

@@ -312,7 +312,10 @@ pub fn jb1b_ping(geom: &BpmpGeom) -> Option<Chan> {
 /// firmware DTB (`fdt_tegra::xusb_ids`), every response err printed, and the probe announces
 /// itself first (the JX1 EL3-fatal discipline: if the ungate was insufficient, the last line
 /// names the touch).
-pub fn jb1c_ungate_xusb(chan: &Chan, ids: &super::fdt_tegra::XusbIds) {
+///
+/// Returns true iff the block came ALIVE (a sane capability word read back) — the gate the JB2b
+/// xHCI attach hangs off: a false here means 0x0361_0000 must not be touched again this boot.
+pub fn jb1c_ungate_xusb(chan: &Chan, ids: &super::fdt_tegra::XusbIds) -> bool {
     serial_println!(
         ":: tegra: JB1c — XUSB ids from DTB: {} clocks, {} resets, {} power-domains ::",
         ids.n_clocks,
@@ -327,7 +330,7 @@ pub fn jb1c_ungate_xusb(chan: &Chan, ids: &super::fdt_tegra::XusbIds) {
             }
             None => {
                 serial_println!(":: tegra: JB1c — PG {} ON -> TIMEOUT; STOP ::", id);
-                return;
+                return false;
             }
         }
     }
@@ -339,7 +342,7 @@ pub fn jb1c_ungate_xusb(chan: &Chan, ids: &super::fdt_tegra::XusbIds) {
             }
             None => {
                 serial_println!(":: tegra: JB1c — CLK {} enable -> TIMEOUT; STOP ::", id);
-                return;
+                return false;
             }
         }
     }
@@ -351,7 +354,7 @@ pub fn jb1c_ungate_xusb(chan: &Chan, ids: &super::fdt_tegra::XusbIds) {
             }
             None => {
                 serial_println!(":: tegra: JB1c — RESET {} deassert -> TIMEOUT; STOP ::", id);
-                return;
+                return false;
             }
         }
     }
@@ -361,7 +364,7 @@ pub fn jb1c_ungate_xusb(chan: &Chan, ids: &super::fdt_tegra::XusbIds) {
     let cap0 = r32(XUSB_HOST);
     if cap0 == 0xFFFF_FFFF || cap0 == 0 {
         serial_println!(":: tegra: JB1c — XUSB cap0={:#010x} (still gated/absent) ::", cap0);
-        return;
+        return false;
     }
     let caplength = (cap0 & 0xff) as u64;
     let hcs1 = r32(XUSB_HOST + 0x04);
@@ -395,4 +398,5 @@ pub fn jb1c_ungate_xusb(chan: &Chan, ids: &super::fdt_tegra::XusbIds) {
         }
     }
     serial_println!(":: tegra: JB2a — port survey done ({} ports scanned) ::", max_ports);
+    true
 }

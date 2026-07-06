@@ -72,6 +72,14 @@ impl EventRing {
             return None;
         }
 
+        // DMA-read ordering: `has_event` proved freshness from the TRB's control word; the full
+        // read below loads the parameter/status words at DIFFERENT addresses, and aarch64 allows
+        // load-load reordering across addresses — those loads could be satisfied with pre-DMA
+        // stale data even though the cycle bit read fresh. `fence(Acquire)` lowers to `dmb ishld`
+        // (the xHC is a coherent inner-shareable observer); on x86 (TSO) it is compiler-only,
+        // zero codegen. Linux's event-ring handler issues the same `rmb()` after its cycle check.
+        core::sync::atomic::fence(core::sync::atomic::Ordering::Acquire);
+
         // Volatile read of the DMA-written TRB (see has_event).
         let trb = unsafe { core::ptr::read_volatile(&self.trbs[self.dequeue_index]) };
 

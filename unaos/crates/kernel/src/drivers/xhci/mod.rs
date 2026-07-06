@@ -406,6 +406,15 @@ pub fn interrupt_ack() {
 pub unsafe fn ring_doorbell_asm(doorbell_addr: u64, target: u32) {
     xdbg!("xHCI: Ringing Doorbell at {:#x} with Target {}", doorbell_addr, target);
     core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+    // aarch64 (added for JB2b, live on EVERY aarch64 metal xHCI — virt/Pi included): the fence
+    // above lowers to `dmb ish`, which orders Normal (inner-shareable) memory only — the doorbell
+    // is Device-nGnRE, which is Outer-Shareable, so without a stronger barrier the controller can
+    // observe the doorbell BEFORE the TRB/context bytes it announces and fetch a stale cycle bit.
+    // `dsb st` is what Linux's arm64 `writel` (`__iowmb`) issues before every MMIO store for
+    // exactly this. Strictly-conservative strengthening on any aarch64 target. x86: compiled out
+    // (TSO + the mfence above already order this); QEMU TCG never reorders (metal-only-visible).
+    #[cfg(target_arch = "aarch64")]
+    core::arch::asm!("dsb st", options(nostack, preserves_flags));
     core::ptr::write_volatile(doorbell_addr as *mut u32, target);
     core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
 }
@@ -1974,6 +1983,14 @@ impl XhciController {
             // Write USBCMD: bit 0 = RS (Run/Stop), bit 2 = INTE (Interrupter Enable).
             // INTE is the global gate for host-system interrupts; without it QEMU never
             // asserts the IRQ regardless of IMAN.IE (xhci_intr_raise requires both).
+            //
+            // aarch64 (any target, not just Tegra): publish the CPU-prepared DMA structures
+            // (DCBAA, scratchpad array+buffers, ERST) BEFORE the Run bit — the controller may
+            // fetch them the moment RS lands, and plain Normal-memory stores are not ordered
+            // against this Device-nGnRE write (same Normal->Device gap as `ring_doorbell_asm`;
+            // `dsb st` = Linux `__iowmb`). x86: no-op.
+            #[cfg(target_arch = "aarch64")]
+            core::arch::asm!("dsb st", options(nostack, preserves_flags));
             let usbcmd_ptr = self.op_base as *mut u32;
             let cmd = core::ptr::read_volatile(usbcmd_ptr);
             core::ptr::write_volatile(usbcmd_ptr, cmd | 0b101);
