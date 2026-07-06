@@ -295,6 +295,15 @@ unsafe fn fill_table(l1: *mut u64, ram_gib_mask: u64, el: u64) {
             };
             l1.add(i).write_volatile(desc);
         }
+        // JB1: GiB 1 (0x4000_0000) carries the SYSRAM the BPMP IVC shmem lives in (TX 0x4007_0000 /
+        // RX 0x4007_1000, read off the firmware DTB on silicon) plus further Tegra peripherals — map
+        // it Device-nGnRE like GiB 0 unless the firmware genuinely declared RAM there. Device
+        // memory is non-speculative, so this only reduces the stray-touch protection for EXPLICIT
+        // accesses — and the JX1 lesson stands regardless: a gated block faults at EL3, mapped or
+        // not, so the map was never the real guard.
+        if (ram_gib_mask >> 1) & 1 == 0 {
+            l1.add(1).write_volatile(device_block(1 << 30, el));
+        }
     }
 }
 

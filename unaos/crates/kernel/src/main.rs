@@ -894,6 +894,20 @@ fn tegra_early_stop(boot_info: &'static mut BootInfo) -> ! {
         boot_info.dtb_size,
         mmu.ram_gib_mask,
     );
+    // JB1b: establish the BPMP IVC command channel and prove it with one MRQ_PING — the transport
+    // every partition-ungate MRQ (XUSB, nvdisplay) rides on. Geometry is resolved from the same
+    // DTB (never hardcoded); a missing/odd DTB shape prints and skips. Pre-drop, EL2, polled;
+    // every new MMIO class prints before the first touch (the JX1 EL3-fatal discipline).
+    match unaos_kernel::arch::fdt_tegra::bpmp_geometry(
+        boot_info.dtb_addr,
+        boot_info.dtb_size,
+        mmu.ram_gib_mask,
+    ) {
+        Some(geom) => {
+            unaos_kernel::arch::bpmp_tegra::jb1b_ping(&geom);
+        }
+        None => serial_println!(":: tegra: JB1b — geometry unresolved from DTB; SKIP ::"),
+    }
 
     // 2. Boot banner: the same EL / CNTFRQ / MMU / DAIF snapshot `arch::boot_diagnostics` prints, read
     // straight from system registers (zero MMIO — cannot fault). Now the first REAL EL/CNTFRQ values

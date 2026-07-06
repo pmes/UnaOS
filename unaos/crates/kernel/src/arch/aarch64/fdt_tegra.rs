@@ -243,6 +243,84 @@ fn w(p: &PropWords) -> W {
     W(p.words, p.n)
 }
 
+/// The resolved BPMP IPC geometry (JB1b): absolute PAs computed from the DTB the firmware
+/// published — shmem child `reg` = [offset, size] under a parent whose `reg` = [hi lo hi lo].
+pub struct BpmpGeom {
+    pub shmem_tx: u64,
+    pub shmem_rx: u64,
+    pub hsp_base: u64,
+    /// mboxes[2] — the HSP doorbell MASTER id (19 = BPMP on Tegra234); the doorbell INDEX is a
+    /// separate constant (3) from the Linux tegra-hsp db_map.
+    pub db_master: u32,
+}
+
+/// Resolve the JB1b geometry silently (the JB1a dump is the human-readable twin). `None` = any
+/// piece missing or shaped unexpectedly — the caller prints and stops rather than guessing.
+pub fn bpmp_geometry(dtb_addr: u64, dtb_size: usize, ram_gib_mask: u64) -> Option<BpmpGeom> {
+    if dtb_addr == 0 || dtb_size == 0 {
+        return None;
+    }
+    let g_lo = dtb_addr >> 30;
+    let g_hi = (dtb_addr + dtb_size as u64 - 1) >> 30;
+    let mapped = |g: u64| g == 0 || (g < 64 && (ram_gib_mask >> g) & 1 != 0);
+    if !mapped(g_lo) || !mapped(g_hi) {
+        return None;
+    }
+    let blob = unsafe { core::slice::from_raw_parts(dtb_addr as *const u8, dtb_size) };
+    let fdt = Fdt::new(blob)?;
+
+    let mut bpmp_path = [0u8; MAX_PATH];
+    let mut bpmp_len = 0usize;
+    fdt.for_each_prop(|e| {
+        if bpmp_len == 0 && e.depth == 2 && e.path.len() >= 5 && &e.path[1..5] == b"bpmp" {
+            let l = e.path.len().min(MAX_PATH);
+            bpmp_path[..l].copy_from_slice(&e.path[..l]);
+            bpmp_len = l;
+        }
+    });
+    if bpmp_len == 0 {
+        return None;
+    }
+    let bp = &bpmp_path[..bpmp_len];
+    let mboxes = fdt.prop_at(bp, b"mboxes");
+    let shmem = fdt.prop_at(bp, b"shmem");
+    if mboxes.n < 3 || shmem.n < 2 {
+        return None;
+    }
+
+    // A shmem phandle target: child reg [offset, size] + parent reg [hi lo hi lo] -> absolute PA.
+    let resolve_shmem = |ph: u32| -> Option<u64> {
+        let mut buf = [0u8; MAX_PATH];
+        let n = fdt.path_of_phandle(ph, &mut buf);
+        if n == 0 {
+            return None;
+        }
+        let node = &buf[..n];
+        let reg = fdt.prop_at(node, b"reg");
+        let preg = fdt.prop_at(parent(node), b"reg");
+        if reg.n < 1 || preg.n < 2 {
+            return None;
+        }
+        let parent_base = ((preg.words[0] as u64) << 32) | preg.words[1] as u64;
+        Some(parent_base + reg.words[0] as u64)
+    };
+    let shmem_tx = resolve_shmem(shmem.words[0])?;
+    let shmem_rx = resolve_shmem(shmem.words[1])?;
+
+    // The HSP node behind mboxes[0]: reg [hi lo hi lo] -> base.
+    let mut hbuf = [0u8; MAX_PATH];
+    let hn = fdt.path_of_phandle(mboxes.words[0], &mut hbuf);
+    if hn == 0 {
+        return None;
+    }
+    let hreg = fdt.prop_at(&hbuf[..hn], b"reg");
+    if hreg.n < 2 {
+        return None;
+    }
+    let hsp_base = ((hreg.words[0] as u64) << 32) | hreg.words[1] as u64;
+    Some(BpmpGeom { shmem_tx, shmem_rx, hsp_base, db_master: mboxes.words[2] })
+}
+
 /// JB1a: print the BPMP IPC geometry from the firmware DTB. Read-only; pre-heap; EL2. Every
 /// outcome is one serial line — including every way of failing to find things.
 pub fn jb1a_dump(dtb_addr: u64, dtb_size: usize, ram_gib_mask: u64) {
