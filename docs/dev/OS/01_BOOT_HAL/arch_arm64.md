@@ -329,7 +329,7 @@ JM6 code is `tegra`-gated (a new `boot_tegra` module, a tegra arm on the `sched`
 tegra-only `tegra_early_stop` body), so every non-tegra build's cfg set — and thus its output — is
 unchanged.
 
-### JM7 — Orin video: the GOP framebuffer through the tegra tables (metal verdict pending)
+### JM7 — Orin video: the GOP framebuffer through the tegra tables (⛔ **blocked on firmware: the GOP is BltOnly**)
 
 With a monitor connected at boot, NVIDIA's UEFI publishes a GOP and the bootloader hands its
 framebuffer to the kernel (`BootInfo::framebuffer_*`); `fbcon` — the boot-log mirror every
@@ -347,9 +347,19 @@ a live boot console on the Orin:
 - **`tegra_early_stop`** prints the GOP handoff (`:: tegra: JM7 — GOP fb addr=… size=… WxH stride
   bpp ::`) and **no longer detaches fbcon** before the drop (contrast JC3/virt, whose EL1 map omits
   the fb) — the monitor shows the pre-drop dump, the EL1 landing line, and the CAPSTONE run live.
-- Expected on metal (monitor on the DP→HDMI cable): the full boot log in 8×8 grey-on-black text on
-  screen, through CAPSTONE COMPLETE; serial identical to JM6b plus the JM7 GOP line. Failure modes
-  are bounded: a wrong/unmapped fb GiB faults into the Part-C vector as a printed syndrome.
+- **Metal verdict (2026-07-06, monitor on the DP→HDMI cable, capture `serial-orin-jm7.log`): the
+  kernel side is confirmed safe and correct, but NO PIXELS — NVIDIA's UEFI GOP exposes no linear
+  framebuffer.** The bootloader's GOP log shows 5 modes, EDID read fine (the monitor's native
+  1920×1200 was detected and current), but every mode is BltOnly — `usable()` found no Rgb/Bgr
+  mode to set, and the active mode's `frame_buffer()` path correctly reported *"active mode has no
+  linear framebuffer; booting without a display"*. The kernel received
+  `fb addr=0x0 size=0x0 1920x1200 stride=2048 bpp=4` (mode info without a surface), fbcon stayed
+  inert, and the boot ran headless-identical: EL1 landing + CAPSTONE 6/6 again. Conclusion:
+  **video-via-GOP is impossible on this firmware**; real Orin video means driving the Tegra234
+  display engine (nvdisplay) directly — allocate a kernel surface, program scanout, then hand
+  fbcon/`Screen` that address, at which point JM7's mapping + flush machinery is reused unchanged.
+  That is its own major arc. The JM7 code stays: correct, inert when `fb addr=0`, and the landing
+  pad for the nvdisplay arc's surface.
 - Out of scope, documented for the follow-on: interactive console/GUI on Orin (input), and real USB
   keyboard/mouse — the Orin's built-in ports are **Tegra XUSB** (a platform controller needing
   firmware/phy bring-up, NOT the PCIe xHCI the kernel already drives); that is its own arc.
