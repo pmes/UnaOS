@@ -364,6 +364,26 @@ a live boot console on the Orin:
   keyboard/mouse — the Orin's built-in ports are **Tegra XUSB** (a platform controller needing
   firmware/phy bring-up, NOT the PCIe xHCI the kernel already drives); that is its own arc.
 
+### JX1 result — XUSB first light (⛔ **the block is EL3-fatal to touch post-EBS; BPMP ungate required first**)
+
+The one-boot probe (a guarded read of the xHCI capability block @ `0x0361_0000`, the Linux DT
+`usb@3610000` base) answered the keyboard/mouse arc's gating question decisively, in the negative:
+after `ExitBootServices`, the **first read fired an SError — ESR `0xbe000011` (EC=0x2F SError,
+ISS=0x11) — fatal to EL3**: NVIDIA's BL31 printed "Unhandled Exception in EL3" and a crash dump
+(capture `serial-orin-jx1.log`; the boot had run cleanly through JM3/JM4/heap first). UEFI tears
+its USB stack down at handoff and the XUSB partition is clock-gated/powered off; a gated Tegra
+block is a **CBB-fabric abort**, not an open-bus read — the same wall class as JM5's `CPU_ON` RAS
+fault, and it means no guarded-read pattern can probe gated blocks safely. The probe was removed
+after one boot (it would kill every boot); the result comment stays at the call site.
+
+**Implication for the USB arc (the Opus brief):** bring up the **tegra-bpmp IVC channel first**
+(HSP doorbell + shared-memory ring to the BPMP), then `MRQ_CLK`/`MRQ_RESET` to enable + de-reset
+the XUSB host partition (and the padctl), THEN re-probe `0x0361_0000` — only after that does the
+"platform-attach the existing xHCI stack" plan (and the XUSB-firmware-load question) become
+testable. Linux's `xhci-tegra` follows exactly this order. The BPMP shared-memory/doorbell bases
+and MRQ ABI are in the L4T sources (`tegra-bpmp` bindings); budget one arc for the IVC channel +
+clock/reset MRQs alone.
+
 ## 4. Jetson Orin Nano headless bring-up (Arc JM2)
 
 The Orin is brought up **headless over serial**. The only console that has ever
