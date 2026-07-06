@@ -447,6 +447,89 @@ sched down metal-only paths at EL1; a CBB/implementation-defined report masquera
 Every occurrence is deterministic per binary+flow, so one instrumented boot per hypothesis
 decides. The JB1 deliverables above all completed BEFORE the EL1 hit and stand independently.
 
+### JB2b — the xHCI platform attach + polled USB keyboard (QEMU-green, ⏳ METAL-PENDING)
+
+JB2b attaches the repo's **existing, x86-metal-proven xHCI driver** (`drivers/xhci/`) to the XUSB
+block JB1c ungated, at its raw MMIO base `0x0361_0000` — no PCIe, no MSI-X, fully polled — and
+brings a USB keyboard to first light: enumeration at EL2 pre-drop, keystrokes decoded and printed
+at EL1 by a scheduled task. The driver needed **no platform constructor at all**: its controller
+takes one raw base address, and the whole PCIe layer (`PciScanner`, bus-master enable, MSI-X) was
+always caller-side. The tegra attach (`arch/aarch64/xusb_tegra.rs::jb2b_attach`) replays the exact
+`arch/aarch64/pci.rs` sequence — `xhci::init` (halt + HCRST + CNR) → `XhciController::new` →
+rings → `init_interrupter` → `init_pointers` → `start()` — then pumps the polled enumeration
+(`poll_events` + `service_hubs`/`service_hid_setproto`/`service_slot_disposal`/`service_enum`)
+bounded to 60 s of CNTPCT, exiting when a keyboard's interrupt-IN read is armed
+(`keyboard_state == 3`). The window is sized to the worst case, not the happy path: on Orin's
+31.25 MHz counter `hw_wait_budget()` is ~4.8 s per bounded stage (double its ~60 MHz design
+note), and a stalled co-device ahead of the keyboard in the serialized queue can burn a
+~22 s retry ladder before the keyboard's port is even tried; the happy path exits in seconds.
+On success, a cooperative kernel task (`jb2-kbd`,
+`xusb_tegra::kbd_pump_body`) is spawned onto the boot core **before** the JM6 drop
+(`poke_cpu` self-skips, so nothing latches at the GIC to greet EL1); `run_capstone_boot_core`'s
+EL1 dispatch loop co-runs it with the CAPSTONE tasks, and it keeps running after they drain.
+
+Design facts (each verified against Linux `xhci-tegra.c` / `tegra234.dtsi` / edk2-nvidia before
+a line was written):
+- **Firmware**: on Tegra234 the xHCI Falcon firmware is UEFI-resident (Linux's tegra234 soc data
+  loads none; its IFR path only reads the running firmware's header). `USBCMD.HCRST` resets the
+  xHC state machine, not the Falcon (separate reset domain) — the driver's standard init is
+  exactly what Linux runs on t234.
+- **DMA coherence**: `tegra234.dtsi` marks `usb@3610000` `dma-coherent` — XUSB snoops the CPU
+  caches, so the driver's Normal-WB heap rings (identity-mapped: VA==PA on both tables) need no
+  cache maintenance. Verify-don't-assume: `fdt_tegra::xusb_dma_coherent` probes the **live**
+  firmware DTB for the prop and the boot prints the verdict before the attach.
+- **Ordering (the two shared-driver edits, both invisible on x86)**: `dsb st` (aarch64-only)
+  before the doorbell write in `ring_doorbell_asm` and before the Run/Stop write in `start()` —
+  the pre-existing `fence(SeqCst)` lowers to `dmb ish`, which does NOT order Normal-memory TRB
+  writes against a Device-nGnRE (outer-shareable) doorbell; `dsb st` is Linux's `__iowmb`. And a
+  `fence(Acquire)` (`dmb ishld`) in `EventRing::pop` between the cycle-bit check and the full TRB
+  read — loads from different TRB words may otherwise satisfy out of order (Linux's `rmb()`
+  twin). x86 codegen is unchanged (cfg'd out / compiler-only).
+- **padctl/PHY**: left exactly as UEFI programmed it (separate block + reset domain, not in the
+  JB1c PG toggle; the JB2a CCS=1/PLS=Polling reads ARE that state working). The BAR2 firmware
+  mailbox (SS clock-scaling requests) is interrupt-delivered and irrelevant to polled HS work.
+- **EL3-fatal discipline**: the attach is gated on `jb1c_ungate_xusb`'s new ALIVE verdict
+  (`main.rs` threads it as `xusb_alive`) plus its own pre-flight cap0 read — `0x0361_0000` is
+  never touched on a boot whose ungate failed. Every new register class prints before first
+  touch; every wait is budget-bounded, so the worst case (SMMU not in bypass ⇒ DMA silently
+  dropped; signature = healthy PORTSC + command timeouts) is a few bounded timeouts, an honest
+  topology dump, and the **unchanged** JM6b drop + CAPSTONE chain.
+- **EL1 liveness**: the EL1 pump calls ONLY `poll_events` (event drain → HID decode →
+  interrupt-IN re-arm) — never the `service_*` sync pumps, whose `crate::hlt()` would WFI with no
+  wake source at EL1 (the drop disables the timer but `timer::LIVE` reads stale-true). Busy-poll
+  + `yield_now`, never `sleep_ticks` (the boot-core drive loop drains no sleepers).
+
+Expected metal serial (the attended-boot checklist): the unchanged JB1/JB2a chain, then
+`:: tegra: JB2b — usb@3610000 dma-coherent: YES … ::` → `:: tegra: JB2b — attaching the shared
+xHCI driver @0x3610000 … ::` → the driver's own init lines (`Controller Reset Complete`,
+`Supported Protocol`, `scratchpad`, `Controller Started!`) → per-port enumeration stages →
+`SET_PROTOCOL(boot) OK` → `:: tegra: JB2b — keyboard ARMED (slot S, root port P) -> PASS ::` →
+`:: tegra: JB2b — EL1 keyboard pump task spawned (boot core) ::` → the unchanged JM6b drop +
+EL1 landing → `:: tegra: JB2b — EL1 keyboard pump live (xHCI polled at EL1) ::` → CAPSTONE 6/6 →
+then, per keystroke, `xHCI: KEY: 'h' …` + `:: tegra: JB2b — KEY 'h' ::`. If no keyboard arms:
+`keyboard NOT armed within the window` + a topology dump, and the boot completes as JB1e did.
+
+Adversarial review (7-lens workflow + per-finding refutation pass): 0 must-fix; both should-fix
+findings FIXED in-arc — (1) the pump window was 20 s but the worst-case stalled-co-device retry
+ladder computes to ~22 s on Orin's clock → widened to 60 s; (2) the JB1e heal's serial print
+hard-locked `SERIAL_PORT` from fault context — a phantom striking mid-`_print` would have
+spin-deadlocked the very heal that was about to fix it → the heal line now `try_lock`s (skips
+the line, never the heal, if the fault interrupted a print). Two accepted-and-noted nits:
+the xHCI extended-capability walk trusts hardware-provided next-pointers (could in principle
+chase garbage outside the ungated block — well-formed on this silicon, UEFI walks the same list
+every boot; a range clamp is deliberate non-creep for this arc), and the new `dsb st` barriers
+are aarch64-wide (virt/Pi metal included), a strictly conservative strengthening.
+
+Gate results (2026-07-06, re-run after the review fixes): `./arroyo check` + `UNAOS_TEGRA=1
+./arroyo check` green; x86 `test` MISSION SUCCESS; virt GICv2 `test-arm` full USB suite green;
+virt GICv3 `test-arm` JC3 EL1-drop + CAPSTONE 6/6; Pi `kernel8` builds + `kernel8-test` full
+battery (M6*, U4, U5, CAPSTONE) green; `esp-jetson` links. NOTE: virt `VBAR_EL1` moved from
+round 10's `0x7c38c000` — the barrier instructions grew the aarch64 image and shifted the link
+layout; the vector base is still 2 KiB-aligned and unshifted-in-the-bug-sense, and the whole
+CAPSTONE chain is green at the new address (the current value prints in the run's own
+`exception vectors installed` line). QEMU models no Tegra — **the verdict is the next
+Peter-attended metal boot.**
+
 ## 4. Jetson Orin Nano headless bring-up (Arc JM2)
 
 The Orin is brought up **headless over serial**. The only console that has ever
