@@ -10,6 +10,49 @@ Legend: **✅ metal-confirmed** · **🔬 QEMU-green, metal pending** · dates I
 
 ---
 
+## hw-rmbp track — 2026-07-05 (landed on `hw-rmbp`, awaiting integration)
+
+### U4x — the process model + per-process handle table (x86) 🔬 `hw-rmbp`
+- **What:** the x86 twin of aarch64 M7/U4 — a parent loads a child program into its OWN
+  address space, runs it ring-3, and reaps it by an owner-scoped **handle**. **Part 0 (the
+  enabler):** the `TSS.RSP0` + per-CPU `syscall_kernel_rsp` install moved from the ring-3
+  trampoline into the scheduler **DISPATCH** path (beside U3.5's CR3-at-dispatch), so a task
+  RESUMED after a block (which never re-enters the trampoline) gets ITS OWN kernel stack —
+  the prerequisite for >1 concurrent user task per core, closing a use-after-free where a
+  resumed task's syscall/fault would otherwise land on a sibling's (possibly freed) kernel
+  stack. **Part A:** `SYS_SPAWN=8` returns a small handle index into the caller's per-process
+  handle table (`HANDLES`, keyed by the caller's address-space **slot** — the x86 stand-in
+  for aarch64's ASID, read from the live CR3 via `current_slot`); `SYS_WAIT=9` blocks on the
+  child's done-semaphore, returns its status, and **consumes** the handle. `PROCS` (pid-keyed)
+  and `HANDLES` (slot-keyed) are separate, static, const-init — the reviewed aarch64 U4 design
+  adopted directly. **Part B:** a parent spawns two children and reaps both by distinct
+  handles; an orphan's `sys_wait(0)` returns `-ECHILD` (proving the tables are per-process).
+- **Load path — an honest x86 divergence:** aarch64 reads `HELLO.BIN` inside the SVC handler
+  (its EMMC2 driver is PIO). x86 storage is USB-over-xHCI, whose BOT read pump `hlt()`s to
+  await completion — and `hlt` with IF=0 hangs, while the SYSCALL handler is IF-masked. So the
+  FAT read is pre-staged off FAT ONCE on the BSP main loop (IF=1, the proven U2 path) and
+  `sys_spawn` only memcpys the staged bytes into a fresh slot. Same observable behavior.
+- **Tested — QEMU:** `UNAOS_FATIMG=1 ./arroyo test 30` (and `test-fat part`/`sf`) →
+  `:: U4x: x86 process model — parent reaped 2 children by handle, non-child sys_wait -ECHILD
+  -> PASS ::`, with the two children each printing `hello from disk` (the 2nd/3rd in a full
+  boot). **U1a/U1b/U2/U2.5/U3/U3.5 byte-identical** (proven by a pre-change baseline diff — the
+  RSP0-at-dispatch move does not disturb the cooperative single-user-task path); U4x skips
+  cleanly with no FAT volume (default / `UNAOS_USBSERIAL=1`). `./arroyo check` both arches; **0
+  aarch64 files touched**. Two independent adversarial reviews (an 8-lens sweep + a 3-lens deep
+  pass on the RSP0-at-dispatch use-after-free, the spawn/wait concurrency+leak+hang surface,
+  and the blob's cross-syscall register ABI) each returned **0 findings**.
+- **Honest scope:** register-only + cooperative fixtures (IF clear); `MAX_PROCS=4` + the static
+  8-slot pool (STOP tripwires); no PCID; no `copy_from_user`/program-by-name; handle rows not
+  cleared on slot teardown (harmless today — reapers consume handles; the capability CHECK +
+  grant/attenuate/revoke + teardown-clear is U5). **FP/SIMD across a ring-3 context switch stays
+  unsaved** (now reachable via Part 0's multi-task-per-core, not just U3.5 preemption) — the
+  fixtures are register-only, so the gap is ledgered in SECURITY.md, not closed this arc.
+- **Metal:** pending (rides the next reflash / FTDI cable day) — fully QEMU-verifiable (the reap
+  wake is a scheduler post; child loads ride U2's metal-confirmed FAT path).
+- **Commit:** on `hw-rmbp` (see landing report); unmerged (integrator records the merge).
+
+---
+
 ## hw-rmbp track — 2026-07-04 (landed on `hw-rmbp`, awaiting integration)
 
 ### U3.5 — preemptible ring 3 (x86) ✅ `hw-rmbp`

@@ -609,6 +609,11 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
             // U2 PASS line onto the framebuffer.
             #[cfg(target_arch = "x86_64")]
             unaos_kernel::arch::syscall::u2_probe_once();
+            // U4x (x86): the process model — sys_spawn (returns a HANDLE) + sys_wait (reaps by handle).
+            // One-shot, gated on storage like U2; it pre-stages HELLO.BIN here (IF=1) then runs a parent
+            // that spawns + reaps 2 children by handle, plus an orphan whose sys_wait(0) -> -ECHILD.
+            #[cfg(target_arch = "x86_64")]
+            unaos_kernel::arch::syscall::u4x_probe_once();
             unaos_kernel::drivers::xhci::log_summary_once();
             while let Some(event) = unaos_kernel::pal::next_event() {
                 match event {
@@ -722,6 +727,12 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         // enumerates asynchronously above. No-op on aarch64 / when no FAT volume is present.
         #[cfg(target_arch = "x86_64")]
         unaos_kernel::arch::syscall::u2_probe_once();
+        // U4x (x86): the process model — sys_spawn (returns a HANDLE) + sys_wait (reaps by handle).
+        // One-shot, gated on storage like U2; pre-stages HELLO.BIN here (IF=1 — the syscall handler is
+        // IF-masked and the xHCI BOT pump hlt()s), then runs a parent that spawns + reaps 2 children by
+        // handle, plus an orphan whose sys_wait(0) -> -ECHILD (per-process handle tables).
+        #[cfg(target_arch = "x86_64")]
+        unaos_kernel::arch::syscall::u4x_probe_once();
         // One-shot USB topology dump to serial (enumeration diagnosis; `usbinfo` shows it live).
         unaos_kernel::drivers::xhci::log_summary_once();
 

@@ -384,6 +384,19 @@ pub fn slot_cr3(s: usize) -> u64 {
     slot_pml4_ptr(s) as u64
 }
 
+/// U4x: the address-space SLOT the caller is currently running in, matched from the LIVE CR3 against
+/// the slot pool — the x86 twin of aarch64's `current_asid` (which reads `TTBR0_EL1[63:48]`). x86 has
+/// no architectural ASID, so a per-process handle table is keyed by this slot index instead. A syscall
+/// runs with the caller's process CR3 still live (the kernel half is shared into every slot PML4, so
+/// the handler runs fine under it — CR3 is only restored at task teardown), so the live CR3 names the
+/// CALLER's address space. `None` when the live CR3 is the shared kernel window (`user_cr3 == 0` —
+/// U1a/U2's tasks): such a caller has no private slot and therefore no handle table. No PCID
+/// (CR4.PCIDE is off), so the CR3 base compares directly against `slot_cr3`.
+pub fn current_slot() -> Option<usize> {
+    let live = cr3_table() as u64;
+    (0..USER_SLOTS).find(|&s| slot_cr3(s) == live)
+}
+
 /// Capture (once) and return the kernel PML4 physical base. First call MUST be on the BSP at boot
 /// while the firmware/kernel CR3 is live (before any process CR3 switch) — U3 setup guarantees this.
 pub fn kernel_cr3() -> u64 {

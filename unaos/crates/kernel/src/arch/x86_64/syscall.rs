@@ -21,7 +21,9 @@
 // mechanism and every hardening bit (NXE, W^X code page, per-page NX, SMEP, RSP0) the brief asks
 // for are preserved. Full user-GPR preservation across a syscall + fault->task-kill are arc U1b.
 
-use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use core::sync::atomic::{
+    AtomicBool, AtomicI32, AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering,
+};
 
 use x86_64::registers::control::Cr4;
 use x86_64::registers::model_specific::{LStar, Msr};
@@ -32,6 +34,12 @@ use crate::arch::percpu::{KERNEL_RSP_OFFSET, USER_RSP_OFFSET};
 // --- Syscall numbers (the tiny U1a subset; mirrors aarch64). ---
 const SYS_WRITE: u64 = 1;
 const SYS_EXIT: u64 = 2;
+// U4x: the process-model pair (same numbers as aarch64 U4). `sys_spawn` loads the fixed on-disk
+// program (`HELLO.BIN`) into a fresh slot, runs it ring-3 as a CHILD, and returns a small HANDLE
+// index into the caller's per-process handle table; `sys_wait(handle)` blocks until that child exits
+// and returns its status (or `-ECHILD` if the handle is not in the caller's table).
+const SYS_SPAWN: u64 = 8;
+const SYS_WAIT: u64 = 9;
 
 /// Base of the ring-3 window: 1 TiB — a FRESH top-level slot (PML4 index 2) above the firmware
 /// identity map, so mapping it touches no kernel state. `setup` proves it unmapped before use.
@@ -197,6 +205,88 @@ unsafe extern "C" {
     static unaos_user_u3_5_spinner: u8;
 }
 
+// --- U4x ring-3 fixtures (per-process handle table). ONE blob with TWO fixtures — the PARENT (the
+// spawner capability) and the ownership NEGATIVE (the orphan) — copied into each fixture's OWN slot
+// and entered at its own offset (the aarch64 __u4 twin). Kept SEPARATE from the U1a/U1b/U3/U3.5 blob
+// above so those fixtures stay byte-identical. Both are position-independent and REGISTER-ONLY (no
+// memory refs at all — only GPR ops + `syscall`), so they run correctly at any VA and write no user
+// stack. ABI (Linux-style): rax = number, args rdi/rsi/rdx, return in rax.
+//
+// The SYSCALL/SYSRET contract this relies on: the C dispatcher preserves the callee-saved GPRs
+// (rbx/rbp/r12-r15) across a syscall (and `switch_context` preserves them across the sys_wait BLOCK),
+// so the parent safely accumulates its two handles + two statuses in r12-r15 across four syscalls;
+// the sysret tail scrubs only rdi/rsi/rdx/r8-r10, never r12-r15 or rax (the return value).
+//
+// PARENT (`u4x-parent`): the capability — a spawner reaps MULTIPLE children BY HANDLE. Two `SYS_SPAWN`s
+// (two handle indices in r12/r13), two `SYS_WAIT`s (two statuses in r14/r15), then `sys_exit(status)`
+// where status = 0 iff BOTH handles were valid (sign clear) AND both children exited 0, else 1 — the
+// witness the kernel routes into `U4X_PARENT_OK`.
+//
+// ORPHAN (`u4x-orphan`): the ownership NEGATIVE — it spawned nothing, so handle #0 is Empty in ITS OWN
+// per-process table; `sys_wait(0)` must therefore return `-ECHILD` (-10). It exits 0 iff it saw
+// exactly -ECHILD (structural ownership: a task cannot reap a child whose handle is not in its table),
+// else 1 — routed into `U4X_ORPHAN_ECHILD`. Deterministic; its handle table is empty.
+core::arch::global_asm!(
+    r#"
+    .globl unaos_user_u4x_blob_start
+unaos_user_u4x_blob_start:
+    .balign 16
+    .globl unaos_user_u4x_parent
+unaos_user_u4x_parent:
+    mov rax, 8                              // SYS_SPAWN (child A) -> rax = handle_a (>=0) or -errno
+    syscall
+    mov r12, rax                            // r12 = handle_a  (callee-saved; survives the next syscalls)
+    mov rax, 8                              // SYS_SPAWN (child B) -> a SECOND child, a SECOND handle
+    syscall
+    mov r13, rax                            // r13 = handle_b
+    mov rax, 9                              // SYS_WAIT(handle_a) — blocks until child A exits (sched wake)
+    mov rdi, r12
+    syscall
+    mov r14, rax                            // r14 = status_a
+    mov rax, 9                              // SYS_WAIT(handle_b) — reap child B by ITS handle
+    mov rdi, r13
+    syscall
+    mov r15, rax                            // r15 = status_b
+    mov rdi, 1                              // default exit status = 1 (FAIL); cleared to 0 iff all OK
+    test r12, r12
+    js 1f                                   // handle_a < 0 (spawn A failed) -> witness stays FAIL
+    test r13, r13
+    js 1f                                   // handle_b < 0 (spawn B failed) -> witness stays FAIL
+    test r14, r14
+    jnz 1f                                  // status_a != 0 (child A not clean) -> witness stays FAIL
+    test r15, r15
+    jnz 1f                                  // status_b != 0 (child B not clean) -> witness stays FAIL
+    xor edi, edi                            // all four OK -> exit status 0 (both reaped by handle)
+1:  mov rax, 2                              // SYS_EXIT(status) -> U4X_PARENT_OK, U4X_DONE
+    syscall
+2:  jmp 2b                                  // sys_exit never returns; belt-and-braces guard
+
+    // The ownership negative: sys_wait a handle it never installed (handle #0, Empty in its own table).
+    .balign 16
+    .globl unaos_user_u4x_orphan
+unaos_user_u4x_orphan:
+    mov rax, 9                              // SYS_WAIT(handle #0) — Empty in its OWN never-spawned table
+    xor edi, edi                            // handle = 0
+    syscall                                 // rax should be -ECHILD (-10)
+    mov rdi, 1                              // default exit status = 1 (FAIL)
+    cmp rax, -10                            // rax == -ECHILD?
+    jne 3f
+    xor edi, edi                            // saw -ECHILD -> exit 0 (structural ownership enforced)
+3:  mov rax, 2                              // SYS_EXIT(status) -> U4X_ORPHAN_ECHILD, U4X_DONE
+    syscall
+4:  jmp 4b                                  // sys_exit never returns; belt-and-braces guard
+    .globl unaos_user_u4x_blob_end
+unaos_user_u4x_blob_end:
+"#
+);
+
+unsafe extern "C" {
+    static unaos_user_u4x_blob_start: u8;
+    static unaos_user_u4x_blob_end: u8;
+    static unaos_user_u4x_parent: u8;
+    static unaos_user_u4x_orphan: u8;
+}
+
 // --- The SYSCALL entry stub (LSTAR target). Naked; the only assembly in the syscall path.
 //
 // On entry (CPL 0, from SYSCALL): rcx = user RIP, r11 = user RFLAGS, rax = number, rdi/rsi/rdx =
@@ -350,6 +440,27 @@ pub fn record_ring3_kill(name: &str, vec: u8, err: u64, cr2: u64) {
         U2_0A_KILLED.fetch_add(1, Ordering::AcqRel);
         return;
     }
+    // U4x: a killed process-model task (a spawned CHILD, the PARENT, or the ORPHAN). Off the U1b
+    // counter — a kill here is a real U4x bug that fails the U4x verdict, not a phantom U1b regression.
+    // For a killed CHILD, also post its Proc `done` (with a nonzero sentinel status) so the parent's
+    // blocked sys_wait WAKES instead of hanging — the child never reaches its own sys_exit post.
+    // `current_task_id` names the faulting task (still current here — see `ring3_fault_kill`), i.e. the
+    // child's pid = its Proc key. (The parent and orphan are not in PROCS — they were spawned by the
+    // launcher, not by sys_spawn — so no Proc post.)
+    if name == "u4x-child" || name == "u4x-parent" || name == "u4x-orphan" {
+        U4X_KILLED.fetch_add(1, Ordering::AcqRel);
+        if name == "u4x-child" {
+            let cpu = crate::arch::percpu::this_cpu().cpu_index as usize;
+            if let Some(id) = crate::arch::sched::current_task_id(cpu) {
+                if let Some(i) = proc_find_running(id) {
+                    PROCS[i].status.store(U4X_KILLED_STATUS, Ordering::Release);
+                    PROCS[i].state.store(PEXITED, Ordering::Release);
+                    PROCS[i].done.post();
+                }
+            }
+        }
+        return;
+    }
     let code_end = USER_BASE + PAGE_SIZE; // the code page is the first page of the window only
     let window_end = USER_BASE + USER_WINDOW_PAGES * PAGE_SIZE;
     let expected = match name {
@@ -394,8 +505,27 @@ extern "C" fn syscall_dispatch(nr: u64, a0: u64, a1: u64, a2: u64) -> i64 {
     }
     match nr {
         SYS_WRITE => sys_write(a0, a1, a2),
+        SYS_SPAWN => sys_spawn(),
+        SYS_WAIT => sys_wait(a0),
         SYS_EXIT => {
-            // Accounting BEFORE the no-return exit, routed by task so the U1a/U1b, Part-0a, and U2
+            // U4x: a spawned CHILD's exit is reaped by its parent's sys_wait through the Proc table,
+            // keyed by pid — NOT by any counter and NOT by the handle (the handle is the parent's-side
+            // namespace; the child's exit accounting is pid-keyed). This SHORT-CIRCUITS before every
+            // check below (the same precedence rule aarch64 U4 uses) so the child's status-0 exit never
+            // lands in U1A_EXITED_OK (which U1a's `exited=1` depends on) nor any sentinel counter.
+            // Record status + EXITED, post `done` so the (blocked or soon-to-block) parent wakes and
+            // reads it. The exiting child's id (its Proc key) was stored by sys_spawn before the child
+            // could ever be dispatched, so `proc_find_running` always resolves it here.
+            let cpu = crate::arch::percpu::this_cpu().cpu_index as usize;
+            if let Some(id) = crate::arch::sched::current_task_id(cpu) {
+                if let Some(i) = proc_find_running(id) {
+                    PROCS[i].status.store(a0 as i32, Ordering::Release);
+                    PROCS[i].state.store(PEXITED, Ordering::Release);
+                    PROCS[i].done.post();
+                    crate::arch::sched::exit(); // never returns
+                }
+            }
+            // Accounting BEFORE the no-return exit, routed by task so the U1a/U1b, Part-0a, U2, and U4x
             // verdicts stay independent (U1a/U1b keep their exact byte-for-byte counts). status 0 =
             // normal completion; nonzero = a program self-reporting failure (the U1b survivor
             // protocol). U1a/U1b tasks fall through to the default branch unchanged.
@@ -411,6 +541,19 @@ extern "C" fn syscall_dispatch(nr: u64, a0: u64, a1: u64, a2: u64) -> i64 {
                     // Reaching sys_exit means the #DB was neutralized and the syscall resumed — the
                     // fixture always exits 0 (kernel survived).
                     U2_0A_EXITED_OK.fetch_add(1, Ordering::AcqRel);
+                }
+                Some("u4x-parent") => {
+                    // The parent's witness: status 0 iff it reaped BOTH children by handle with status
+                    // 0 (see the parent blob). Routed to its own counter so the U1a `exited=1` count
+                    // stays byte-for-byte.
+                    U4X_PARENT_OK.store((a0 == 0) as u32, Ordering::Release);
+                    U4X_DONE.fetch_add(1, Ordering::AcqRel);
+                }
+                Some("u4x-orphan") => {
+                    // The ownership negative: status 0 iff its `sys_wait(0)` on an Empty handle returned
+                    // exactly -ECHILD (structural ownership enforced).
+                    U4X_ORPHAN_ECHILD.store((a0 == 0) as u32, Ordering::Release);
+                    U4X_DONE.fetch_add(1, Ordering::AcqRel);
                 }
                 Some(n) if n.starts_with("u3-") => {
                     // U3 per-process-CR3 fixture task exiting (its own accounting, so the U1a/U1b
@@ -887,6 +1030,10 @@ fn u2_verdict(_: usize) {
             ok, err
         );
     }
+    // U4x: signal that U2 is fully done (verdict printed) so the U4x launcher orders its lines AFTER
+    // U2's — the x86 twin of aarch64 U4 gating on `M6G_LOADER_DONE`. Set on BOTH the PASS and FAIL
+    // paths (U4x waits bounded on it, so a U2 FAIL still lets U4x run rather than hang).
+    U2_DONE.store(true, Ordering::Release);
 }
 
 /// U3 Part A: prove per-process CR3 isolation with a DETERMINISTIC KERNEL probe (no ring 3). Allocate
@@ -1123,4 +1270,494 @@ pub fn u3_5_run_fixture(cpu: usize) {
     // `alloc_user_space` could rebuild a live address space underfoot) and could double-free against a
     // late scheduler reap. Leaking one of the 8 slots is harmless: U3.5 is the LAST ring-3 fixture, and
     // a timeout is already a hard FAIL. So we deliberately do NOT free here.
+}
+
+// =============================================================================================
+// U4x — the x86 process model: sys_spawn (a spawner loads+runs a child from storage, returns a
+// HANDLE) + sys_wait (reap by handle) + a per-process handle table. The x86 twin of aarch64's M7/U4;
+// it adopts that arc's SETTLED design directly. It completes the process abstraction U3/U3.5 began:
+// a parent runs a child program in its OWN address space and reaps it by an owner-scoped HANDLE.
+//
+// Two static tables, deliberately SEPARATE and complementary (the aarch64 U4 design):
+//   * PROCS   — keyed by pid: the process control blocks (exit `status`/`state`/`done`).
+//   * HANDLES — keyed by the caller's address-space SLOT (x86 has no architectural ASID, so the slot
+//     index plays the role aarch64's ASID does): the spawner's PRIVATE namespace of child
+//     capabilities. A handle value is 0 (Empty) or the child's pid (the PROCS key). `sys_spawn`
+//     returns the small handle INDEX; `sys_wait` takes it.
+//
+// Single-writer invariant: exactly one live task runs under any given slot (one task per slot, torn
+// down before reuse) and its syscalls are serialized (one at a time, IRQ-masked), so a given
+// `HANDLES[slot]` row is only ever touched by its own task. The atomics carry memory ordering
+// (publish the pid with Release; a handle read Acquires it), not cross-task contention.
+//
+// STORAGE / IF NOTE (the load-bearing x86 divergence from the aarch64 twin): aarch64's `sys_spawn`
+// reads HELLO.BIN off the SD card synchronously INSIDE the SVC handler because its EMMC2 driver is
+// PIO (no interrupts). x86 storage is USB mass-storage over xHCI, whose BOT read pump `hlt()`s to
+// await the async completion (`xhci::pump_until_bot_done`) — and `hlt` with IF=0 hangs forever. The
+// SYSCALL handler runs IF-masked (SFMASK clears IF), so it CANNOT do a BOT read. So the FAT read is
+// hoisted OUT of the syscall: the child program is pre-staged off FAT ONCE by `stage_hello` on the
+// BSP main loop (IF=1 — the proven U2 read path), and `sys_spawn` instantiates each child by a pure
+// memcpy of the staged bytes into a fresh slot (IF=0-safe). The child still runs storage-loaded
+// HELLO.BIN bytes gated on storage being present — the observable behavior is the aarch64 twin's.
+//
+// SCOPE NOTE (deferred to U5, mirroring the aarch64 U4 note): a handle row is NOT cleared when its
+// slot is torn down (`exit`/reap free the slot in sched.rs, out of this file's bookkeeping). U4x
+// relies on reapers CONSUMING their handles (`sys_wait` clears on reap), so a well-behaved process
+// leaves an empty row at exit and the demo is clean by construction (the parent reaps both children;
+// the orphan spawns nothing; parent/orphan/children hold DISTINCT slots while alive, and only the
+// parent ever WRITES a row). A capability CHECK at this lookup + grant/attenuate/revoke +
+// teardown-clear is U5.
+// =============================================================================================
+
+// Negative errnos returned to ring 3 by sys_spawn/sys_wait (Linux values; arch-independent in Linux).
+// These never appear in the demo's serial output — the parent only tests the SIGN of the spawn return
+// and compares the wait return to -ECHILD — but are named for a future real userspace. (The FAT-read
+// failure modes ENOENT/EIO/E2BIG the aarch64 twin maps are handled here at stage time — a failed
+// `stage_hello` skips the whole demo — so `sys_spawn` never surfaces them.)
+const ECHILD: i64 = -10; // sys_wait: no child with that handle in the caller's table
+const EAGAIN: i64 = -11; // the process table (or slot pool, or handle table) is full
+const ENODEV: i64 = -19; // no program staged (no block device / no HELLO.BIN at stage time)
+
+/// A killed child's Proc status: a nonzero sentinel the child-KILL path stores so a killed child still
+/// WAKES its parent's sys_wait — but with status != 0, so the parent's witness reads FAIL (a killed
+/// child is a U4x bug; a clean child exits 0). Used only on a kill.
+const U4X_KILLED_STATUS: i32 = 0x4B; // 'K'
+
+// --- Pre-staged child program (HELLO.BIN), read ONCE off FAT by `stage_hello` on the BSP (IF=1) and
+// copied into each fresh child slot by `sys_spawn` (a pure memcpy, IF=0-safe). Written once, before
+// any sys_spawn, then read-only — published via `HELLO_STAGED` (Release/Acquire). One code page max
+// (the ring-3 window's code page size), matching the U2 size bound. ---
+static mut HELLO_BYTES: [u8; PAGE_SIZE as usize] = [0; PAGE_SIZE as usize];
+static HELLO_LEN: AtomicUsize = AtomicUsize::new(0);
+static HELLO_STAGED: AtomicBool = AtomicBool::new(false);
+
+/// Load HELLO.BIN off the FAT volume into the pre-stage buffer. Called ONCE from `u4x_probe_once` on
+/// the BSP main loop (IF=1 — the proven U2 read path; see the STORAGE / IF NOTE above). Returns true
+/// iff a valid, non-empty, size-bounded program was staged; a missing volume/file/oversize/read-error
+/// returns false (the caller then skips the U4x demo cleanly). The bytes are UNTRUSTED — nothing is
+/// trusted beyond the one-page size bound; each child runs them only under ring-3 + NX + W^X + SMEP +
+/// the U1b fault-kill net.
+fn stage_hello() -> bool {
+    let fs = match crate::fs::fat::mount() {
+        Ok(fs) => fs,
+        Err(_) => return false,
+    };
+    let de = match fs.find_in_root("HELLO.BIN") {
+        Ok(de) => de,
+        Err(_) => return false,
+    };
+    // Reject up-front from the ON-DISK directory size (the U2 truncation lesson): `read_file` caps the
+    // copy at min(de.size, cap), so a post-read length check could never SEE an oversize file.
+    if de.size == 0 || de.size as u64 > PAGE_SIZE {
+        return false;
+    }
+    let mut bytes: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
+    if fs.read_file(&de, &mut bytes, PAGE_SIZE as usize).is_err() || bytes.is_empty() {
+        return false;
+    }
+    unsafe {
+        core::ptr::copy_nonoverlapping(bytes.as_ptr(), (&raw mut HELLO_BYTES).cast::<u8>(), bytes.len());
+    }
+    HELLO_LEN.store(bytes.len(), Ordering::Release);
+    HELLO_STAGED.store(true, Ordering::Release); // publish the bytes (a later sys_spawn Acquires this)
+    true
+}
+
+// --- The process table (pid-keyed): the parent's view of its children's lifecycle. ---
+const PFREE: u8 = 0; // entry unused
+const PRUNNING: u8 = 1; // claimed; a child is (or is about to be) running under `pid`
+const PEXITED: u8 = 2; // the child exited/was killed; `status` is valid, awaiting reap by sys_wait
+
+/// A spawned child's process control block. Static so it OUTLIVES the child's `Task` Box (freed on
+/// exit) and its slot teardown — the reap accounting must survive both. `done` is posted exactly once
+/// by the child (its exit OR its kill path) and waited exactly once by the parent's sys_wait, so a
+/// reaped-then-reused entry always starts at 0 permits (no drain needed) — the M4 balance discipline.
+struct Proc {
+    /// The child task id; the sys_wait key. 0 while an entry is FREE or a claim's pid is not yet stored.
+    pid: AtomicU64,
+    /// The child's exit status; valid once `state == PEXITED`.
+    status: AtomicI32,
+    /// FREE / RUNNING / EXITED — the ownership + lifecycle token (CAS'd FREE->RUNNING to claim).
+    state: AtomicU8,
+    /// Posted once by the child (SYS_EXIT or the kill path), awaited once by the parent's sys_wait. A
+    /// scheduler-post wake, so sys_wait works under QEMU (unlike a timer-driven sleep).
+    done: crate::arch::sched::Semaphore,
+}
+/// A small cap « USER_SLOTS: if it exhausts, sys_spawn returns -EAGAIN, never grows the slot pool.
+const MAX_PROCS: usize = 4;
+static PROCS: [Proc; MAX_PROCS] = [const {
+    Proc {
+        pid: AtomicU64::new(0),
+        status: AtomicI32::new(0),
+        state: AtomicU8::new(PFREE),
+        done: crate::arch::sched::Semaphore::new(0),
+    }
+}; MAX_PROCS];
+
+/// Claim a FREE Proc entry, returning its index. The CAS on `state` (FREE->RUNNING) is the atomic
+/// ownership token; the pid=0 placeholder is overwritten with the real child pid (Release) by
+/// `sys_spawn` AFTER the child is spawned (the child cannot be dispatched until the parent yields, so
+/// the real pid is always in place before any lookup). `None` if the table is full (-> -EAGAIN).
+fn proc_reserve() -> Option<usize> {
+    for i in 0..MAX_PROCS {
+        if PROCS[i]
+            .state
+            .compare_exchange(PFREE, PRUNNING, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            PROCS[i].pid.store(0, Ordering::Release);
+            PROCS[i].status.store(0, Ordering::Release);
+            return Some(i);
+        }
+    }
+    None
+}
+
+/// Find the RUNNING Proc entry whose pid matches — the child-exit / child-kill lookup. Called with a
+/// live task id (`> 0`), so it never spuriously matches a fresh claim's pid=0 placeholder.
+fn proc_find_running(pid: u64) -> Option<usize> {
+    (0..MAX_PROCS).find(|&i| {
+        PROCS[i].state.load(Ordering::Acquire) == PRUNNING
+            && PROCS[i].pid.load(Ordering::Acquire) == pid
+    })
+}
+
+/// Find the non-FREE (RUNNING or EXITED) Proc entry whose pid matches — the sys_wait lookup. `None`
+/// => the caller has no such child.
+fn proc_find_child(pid: u64) -> Option<usize> {
+    (0..MAX_PROCS).find(|&i| {
+        PROCS[i].state.load(Ordering::Acquire) != PFREE
+            && PROCS[i].pid.load(Ordering::Acquire) == pid
+    })
+}
+
+/// Release a Proc entry to FREE — after reaping in sys_wait, or unwinding a failed sys_spawn claim.
+fn proc_free(i: usize) {
+    PROCS[i].pid.store(0, Ordering::Release);
+    PROCS[i].state.store(PFREE, Ordering::Release);
+}
+
+// --- The per-process handle table (slot-keyed): the ownership namespace. ---
+const NHANDLE: usize = 8; // handle slots per process (small, static — like MAX_PROCS)
+/// `RESERVING` marks a handle slot claimed by an in-flight `sys_spawn` before the real child pid is
+/// known (0 = Empty would let a re-scan re-claim it; a real pid is never `u64::MAX`). Overwritten with
+/// the pid once the child is spawned, or cleared if the load fails — never observed by another task.
+const HANDLE_RESERVING: u64 = u64::MAX;
+static HANDLES: [[AtomicU64; NHANDLE]; crate::arch::memory::USER_SLOTS] =
+    [const { [const { AtomicU64::new(0) }; NHANDLE] }; crate::arch::memory::USER_SLOTS];
+
+/// Claim the first Empty slot in `HANDLES[slot]`, storing `pid` (CAS 0->pid), and return its index —
+/// the value `sys_spawn` returns to ring 3. `None` if the table is full (-> -EAGAIN). `pid` is
+/// `HANDLE_RESERVING` for a pre-spawn reservation, then overwritten with the real pid via `handle_set`.
+/// `slot` is always in range (from `current_slot`, 0..USER_SLOTS; debug-asserted).
+fn handle_install(slot: usize, pid: u64) -> Option<usize> {
+    debug_assert!(slot < HANDLES.len(), "handle_install: slot out of range");
+    for (i, h) in HANDLES[slot].iter().enumerate() {
+        if h.compare_exchange(0, pid, Ordering::AcqRel, Ordering::Acquire).is_ok() {
+            return Some(i);
+        }
+    }
+    None
+}
+
+/// Overwrite the pid stored at `HANDLES[slot][idx]` (Release) — replace a `HANDLE_RESERVING`
+/// placeholder with the real child pid once `sys_spawn` has it.
+fn handle_set(slot: usize, idx: usize, pid: u64) {
+    debug_assert!(slot < HANDLES.len() && idx < NHANDLE, "handle_set: out of range");
+    HANDLES[slot][idx].store(pid, Ordering::Release);
+}
+
+/// The pid at `HANDLES[slot][idx]`, or `None` if the index is out of range or the slot is Empty (0) —
+/// i.e. the caller holds no such child handle (structural ownership: -ECHILD). A `HANDLE_RESERVING`
+/// placeholder can never be seen here (single-writer: a task is not concurrently spawning and waiting).
+fn handle_get(slot: usize, idx: usize) -> Option<u64> {
+    if idx >= NHANDLE {
+        return None;
+    }
+    debug_assert!(slot < HANDLES.len(), "handle_get: slot out of range");
+    match HANDLES[slot][idx].load(Ordering::Acquire) {
+        0 => None,
+        pid => Some(pid),
+    }
+}
+
+/// Clear (0 = Empty) the handle at `HANDLES[slot][idx]` — consumed when its child is reaped in
+/// `sys_wait`, or released when a failed `sys_spawn` unwinds its reservation.
+fn handle_clear(slot: usize, idx: usize) {
+    debug_assert!(slot < HANDLES.len() && idx < NHANDLE, "handle_clear: out of range");
+    HANDLES[slot][idx].store(0, Ordering::Release);
+}
+
+/// SYS_SPAWN(): instantiate the pre-staged program (HELLO.BIN) in a fresh slot, run it ring-3 as a
+/// CHILD of the caller, and return a HANDLE index into the CALLER's per-process handle table (not the
+/// raw pid), or a negative errno. The handle IS the ownership token: `sys_wait` takes it, and only a
+/// caller whose table holds it can reap the child. No args this arc — the program is fixed (arbitrary
+/// program-by-name is a later arc; it needs a validated copy_from_user name).
+///
+/// Race-freedom (the child cannot exit before its pid is recorded): the whole dispatch runs IRQ-masked
+/// and the CHILD is co-located on the CALLER's core, so it stays queued-not-dispatched until the parent
+/// yields (which it does only later, in sys_wait). We (1) claim a Proc entry, (2) reserve a handle slot
+/// (RESERVING), (3) allocate + fill a fresh address-space slot, (4) spawn the child (queued, not run),
+/// (5) store its real pid (Release) into BOTH the Proc entry and the handle slot — all before returning
+/// to ring 3. The handle is reserved BEFORE the slot fill so a full handle table fails cleanly with
+/// nothing to un-spawn. No FAT I/O here — the program was pre-staged (see the STORAGE / IF NOTE).
+fn sys_spawn() -> i64 {
+    // Gate: a program must be staged (which required a block device + HELLO.BIN at stage time).
+    if !HELLO_STAGED.load(Ordering::Acquire) {
+        return ENODEV;
+    }
+    // The CALLER's address-space SLOT names its per-process handle table — read synchronously here,
+    // where the caller's CR3 is live (sys_spawn installs into and sys_wait resolves from the SAME
+    // table, since both run as the parent). A caller in the shared kernel window has no slot/table.
+    let Some(slot) = crate::arch::memory::current_slot() else {
+        return EAGAIN;
+    };
+    // Claim the Proc entry FIRST, so a failed alloc frees only the entry, and so the pid slot exists to
+    // receive the real pid before the child can be dispatched.
+    let Some(pi) = proc_reserve() else {
+        return EAGAIN; // process table full
+    };
+    // Reserve a HANDLE slot BEFORE allocating the address space (a RESERVING placeholder). A full
+    // handle table fails here with only the Proc entry to release — nothing loaded or spawned yet.
+    let Some(h) = handle_install(slot, HANDLE_RESERVING) else {
+        proc_free(pi);
+        return EAGAIN; // handle table full
+    };
+    // Allocate a fresh per-process address space for the child (LAST fallible step). On exhaustion,
+    // unwind the handle + Proc reservations — no child was spawned, nothing to un-spawn.
+    let Some(child_slot) = crate::arch::memory::alloc_user_space() else {
+        handle_clear(slot, h);
+        proc_free(pi);
+        return EAGAIN; // slot pool exhausted
+    };
+    // Fill the child's slot: scrub the whole window (no prior-process residue), then copy the pre-staged
+    // program into the code page (page 0) through the kernel identity alias — never through USER_BASE,
+    // so the ring-3 code mapping stays read-only (W^X holds by construction). IF=0-safe (memcpy only).
+    let len = HELLO_LEN.load(Ordering::Acquire);
+    let backing = crate::arch::memory::slot_backing_ptr(child_slot);
+    unsafe {
+        core::ptr::write_bytes(backing, 0, (USER_WINDOW_PAGES * PAGE_SIZE) as usize);
+        core::ptr::copy_nonoverlapping((&raw const HELLO_BYTES).cast::<u8>(), backing, len);
+    }
+    // Co-locate the child on the caller's core (the invariant above): sys_spawn always runs with its
+    // ring-3 caller current, so `this_cpu` is the parent's core.
+    let cpu = crate::arch::percpu::this_cpu().cpu_index as usize;
+    let sp = USER_BASE + USER_WINDOW_PAGES * PAGE_SIZE - 16;
+    let cr3 = crate::arch::memory::slot_cr3(child_slot);
+    let pid = crate::arch::sched::spawn_user_in_space("u4x-child", USER_BASE, sp, cpu, cr3);
+    // Record the real pid (Release) into BOTH the Proc entry (pid-keyed exit accounting) and the
+    // reserved handle slot (slot-keyed ownership) BEFORE returning to ring 3 — before the parent can
+    // yield and let the child run. The child's exit path sees the Proc pid; the parent's later
+    // sys_wait resolves the handle to it.
+    PROCS[pi].pid.store(pid, Ordering::Release);
+    handle_set(slot, h, pid);
+    h as i64 // the HANDLE index (per-process; two processes can each hold handle 0 to different children)
+}
+
+/// SYS_WAIT(handle): block the caller until the child its `handle` refers to exits, then return the
+/// child's exit status — or `-ECHILD` if that handle is not in the CALLER's table (out-of-range or
+/// Empty). Structural ownership: you can only reap a child whose handle is in YOUR table. The waker is
+/// the child's `done.post()` — a scheduler wake (from its SYS_EXIT or kill path), so this works under
+/// QEMU. The handle is CONSUMED by the reap (`handle_clear`), so a second sys_wait on it -> -ECHILD.
+///
+/// We wait on `done` UNCONDITIONALLY: the child posts it exactly once (exit or kill), so this either
+/// fast-returns a permit the child already left (child exited first — no park) or parks until it posts.
+/// Exactly one post is consumed by exactly one wait, so the reaped entry returns to 0 permits, clean
+/// for reuse.
+fn sys_wait(handle: u64) -> i64 {
+    let Some(slot) = crate::arch::memory::current_slot() else {
+        return ECHILD; // no slot -> no handle table -> the caller holds no children
+    };
+    // Resolve the handle against the CALLER's OWN table — the structural ownership check. Not present
+    // (out-of-range or Empty) => the caller holds no such child => -ECHILD.
+    let Some(pid) = handle_get(slot, handle as usize) else {
+        return ECHILD;
+    };
+    let Some(pi) = proc_find_child(pid) else {
+        return ECHILD; // the handle named a pid with no Proc entry (defensive; cannot happen in the demo)
+    };
+    let woken = PROCS[pi].done.wait();
+    debug_assert!(woken, "sys_wait: called off a scheduled task");
+    let status = PROCS[pi].status.load(Ordering::Acquire) as i64;
+    proc_free(pi); // reap the Proc entry (its `done` is back at 0 permits, free for reuse)
+    handle_clear(slot, handle as usize); // consume the handle: a second sys_wait on it now -> -ECHILD
+    status
+}
+
+// --- U4x demo accounting (written by the exit/kill paths + the parent/orphan witnesses, read by the
+// verdict). ---
+/// The parent's witness: 1 iff it reaped BOTH children by handle with exit status 0 (its `sys_exit(0)`),
+/// else 0. Written by the SYS_EXIT arm for `u4x-parent`.
+static U4X_PARENT_OK: AtomicU32 = AtomicU32::new(0);
+/// The ownership NEGATIVE: 1 iff `u4x-orphan`'s `sys_wait(0)` on an Empty handle returned exactly
+/// -ECHILD (its `sys_exit(0)`), else 0.
+static U4X_ORPHAN_ECHILD: AtomicU32 = AtomicU32::new(0);
+/// The U4x fixtures (parent + orphan) that reached their sys_exit (the completion signal; want 2). The
+/// verdict waits for both before judging.
+static U4X_DONE: AtomicU32 = AtomicU32::new(0);
+/// A killed U4x task (a child, the parent, or the orphan) — a real bug (the children are well-behaved;
+/// a kill fails the verdict). Kept OFF the U1b `killed_unexpected` counter (see `record_ring3_kill`).
+static U4X_KILLED: AtomicU32 = AtomicU32::new(0);
+/// Set once U2's verdict has printed, so the U4x launcher orders its lines AFTER U2's (the aarch64
+/// `M6G_LOADER_DONE` twin).
+static U2_DONE: AtomicBool = AtomicBool::new(false);
+
+/// U4x fixture run parameters: the parent's + orphan's ring-3 entry VAs (both inside the shared window
+/// VA — only the slot FRAME differs, via CR3), the shared initial user rsp, and each fixture's slot
+/// CR3. Two tasks, two DISTINCT slots (hence distinct handle-table rows — the isolation the ownership
+/// negative proves).
+struct U4xDemo {
+    parent: u64,
+    orphan: u64,
+    sp: u64,
+    parent_cr3: u64,
+    orphan_cr3: u64,
+}
+
+/// U4x setup: reserve the Proc semaphores, allocate + build TWO private slots (parent + orphan), copy
+/// the U4x blob (both fixtures) into each slot's code page through the identity alias, and return each
+/// fixture's entry VA + slot CR3. `None` if slot allocation fails (the whole request is released, not
+/// leaked). Called ONCE from the launcher, strictly before the parent (hence any child) exists — so the
+/// `done.init()` reservations here cannot race a concurrent wait/post. The parent and orphan get
+/// DISTINCT slots (hence distinct handle-table rows): handle #0 means the parent's child A in the
+/// parent's table, and Empty in the orphan's — the substrate the negative proves.
+fn u4x_setup() -> Option<U4xDemo> {
+    // Reserve each Proc semaphore's waiter capacity (the park-side push must not reallocate under the
+    // held lock). Done before any child can block a parent on it.
+    for p in &PROCS {
+        p.done.init();
+    }
+    let mut slots = [0usize; 2];
+    if !crate::arch::memory::alloc_user_spaces(&mut slots) {
+        return None;
+    }
+    let blob_start = &raw const unaos_user_u4x_blob_start as usize;
+    let blob_end = &raw const unaos_user_u4x_blob_end as usize;
+    let blob_len = blob_end - blob_start;
+    assert!(blob_len as u64 <= PAGE_SIZE, "U4x blob does not fit in a code page");
+    let parent_off = (&raw const unaos_user_u4x_parent as usize - blob_start) as u64;
+    let orphan_off = (&raw const unaos_user_u4x_orphan as usize - blob_start) as u64;
+    for &s in &slots {
+        let backing = crate::arch::memory::slot_backing_ptr(s);
+        unsafe {
+            // Scrub the whole window (residue), then copy the blob into the code page (page 0) through
+            // the identity alias — never USER_BASE, so the code mapping stays read-only (W^X).
+            core::ptr::write_bytes(backing, 0, (USER_WINDOW_PAGES * PAGE_SIZE) as usize);
+            core::ptr::copy_nonoverlapping(blob_start as *const u8, backing, blob_len);
+        }
+    }
+    serial_println!(
+        ":: U4x: process model — per-process handle table (sys_spawn->handle, sys_wait(handle)) ::"
+    );
+    Some(U4xDemo {
+        parent: USER_BASE + parent_off,
+        orphan: USER_BASE + orphan_off,
+        sp: USER_BASE + USER_WINDOW_PAGES * PAGE_SIZE - 16,
+        parent_cr3: crate::arch::memory::slot_cr3(slots[0]),
+        orphan_cr3: crate::arch::memory::slot_cr3(slots[1]),
+    })
+}
+
+/// U4x launcher + verdict (the `u2_verdict` shape: one gated kernel task on a scheduled sibling core).
+/// `demo_cpu` (the task arg) is the core the parent + orphan run on. Flow:
+///   1. Wait (bounded, yielding) for `U2_DONE`, so all U2 lines print first.
+///   2. Skip silently if no block device.
+///   3. `u4x_setup()` (build both slots, print the setup line), then spawn the parent AND the orphan on
+///      `demo_cpu`. The parent's two sys_spawns co-locate BOTH children on `demo_cpu` too — the
+///      invariant that keeps each child queued-not-dispatched until the parent blocks in sys_wait (so
+///      both pids are recorded first). The orphan's `sys_wait(0)` returns immediately (-ECHILD), so it
+///      never parks.
+///   4. Verdict: wait (bounded) for BOTH fixtures to reach sys_exit (`U4X_DONE == 2`), then PASS iff the
+///      parent reaped both children AND the orphan saw -ECHILD AND no U4x task was killed. One PASS line.
+pub fn u4x_launcher(demo_cpu: usize) {
+    // 1. Gate on U2 (bounded, yielding — don't wedge this sibling core if U2 is slow/absent).
+    let wdeadline = crate::arch::ticks() + 10_000;
+    while !U2_DONE.load(Ordering::Acquire) && crate::arch::ticks() < wdeadline {
+        crate::arch::sched::yield_now();
+    }
+
+    // One-shot (spawned once; guard defensively).
+    static DONE: AtomicBool = AtomicBool::new(false);
+    if DONE.swap(true, Ordering::Relaxed) {
+        return;
+    }
+
+    // 2. No block device -> the children cannot run (their program came off it); skip silently.
+    if crate::drivers::block::info().is_none() {
+        return;
+    }
+
+    // 3. Build the parent + orphan slots and spawn both on the demo core.
+    let Some(demo) = u4x_setup() else {
+        serial_println!(":: U4x: no free address-space slot — process-model demo skipped ::");
+        return;
+    };
+    crate::arch::sched::spawn_user_in_space(
+        "u4x-parent",
+        demo.parent,
+        demo.sp,
+        demo_cpu,
+        demo.parent_cr3,
+    );
+    crate::arch::sched::spawn_user_in_space(
+        "u4x-orphan",
+        demo.orphan,
+        demo.sp,
+        demo_cpu,
+        demo.orphan_cr3,
+    );
+
+    // 4. Verdict: wait (bounded, yielding) for BOTH fixtures to reach sys_exit, then judge.
+    let vdeadline = crate::arch::ticks() + 5000;
+    while U4X_DONE.load(Ordering::Acquire) < 2 && crate::arch::ticks() < vdeadline {
+        crate::arch::sched::yield_now();
+    }
+    let parent_ok = U4X_PARENT_OK.load(Ordering::Acquire);
+    let orphan = U4X_ORPHAN_ECHILD.load(Ordering::Acquire);
+    let killed = U4X_KILLED.load(Ordering::Acquire);
+    if parent_ok == 1 && orphan == 1 && killed == 0 {
+        serial_println!(
+            ":: U4x: x86 process model — parent reaped 2 children by handle, non-child sys_wait -ECHILD -> PASS ::"
+        );
+    } else {
+        serial_println!(
+            ":: U4x: x86 process model FAIL — parent_ok={} orphan_echild={} killed={} done={} (want 1/1/0/2) ::",
+            parent_ok,
+            orphan,
+            killed,
+            U4X_DONE.load(Ordering::Acquire)
+        );
+    }
+}
+
+/// U4x one-shot, fired from the main loop once a block device is present (mirrors `u2_probe_once`'s
+/// gate). It (BSP, IF=1) PRE-STAGES the child program off FAT (`stage_hello` — the read cannot live in
+/// the IF=0 syscall handler, see the STORAGE / IF NOTE), then spawns the launcher on a sibling AP. Does
+/// nothing until a block device and a scheduled AP exist; a missing HELLO.BIN skips the demo cleanly.
+pub fn u4x_probe_once() {
+    static DONE: AtomicBool = AtomicBool::new(false);
+    if DONE.load(Ordering::Relaxed) {
+        return;
+    }
+    if crate::drivers::block::info().is_none() {
+        return; // retry next loop iteration until storage enumerates
+    }
+    let online = crate::arch::smp::online_aps();
+    let Some(&cpu) = online.first() else {
+        DONE.store(true, Ordering::Relaxed);
+        serial_println!(":: U4x: no application processor online — process-model demo skipped ::");
+        return;
+    };
+    DONE.store(true, Ordering::Relaxed); // one-shot from here regardless of outcome
+
+    // Pre-stage HELLO.BIN off FAT HERE (BSP main loop, IF=1). A missing volume/file skips the demo.
+    if !stage_hello() {
+        serial_println!(":: U4x: HELLO.BIN not available — process-model demo skipped ::");
+        return;
+    }
+
+    // The launcher runs on a sibling core (or the demo core if only one AP), spawning the parent +
+    // orphan on `cpu` — the `u2_probe_once` split.
+    let vcpu = online.get(1).copied().unwrap_or(cpu);
+    crate::arch::sched::spawn("u4x-launch", u4x_launcher, cpu, vcpu, crate::arch::sched::PRIO_NORMAL);
 }
