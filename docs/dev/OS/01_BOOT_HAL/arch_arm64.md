@@ -644,6 +644,64 @@ report and a *different* arc, not a padctl bug. **Zero-code alternative Peter ca
 roll back to the pre-update firmware slot (restores the old always-on handoff); no Jetson UEFI
 menu USB/XHCI toggle exists.
 
+### JB0 brief — turn the cooling fan back on (safety hygiene; run FIRST on Orin)
+
+Discovered 2026-07-06: when UnaOS takes over from UEFI the **fan stops and the Orin runs hot**.
+Same mechanism as JB2c — NVIDIA's `ExitBootServices` teardown disables the fan PWM's clock + reset
+(the device-discovery driver's `AutoEnableClocks`/`AutoResetModule` are undone). Scoped from a
+3-agent research pass (fan-PWM / thermal-safety / teardown-scope), all cross-corroborated; see the
+per-claim confidences below.
+
+**Urgency — real but NOT a damage risk (confidence HIGH).** The Orin has an OS-independent hardware
+thermal net armed by NVIDIA BL31/BPMP before UnaOS runs: **103 °C Tj** = hardware clock-throttle
+(50/75/87.5 % caps, no OS notified), **105 °C Tj** = a die→PMIC failsafe that power-cycles the board
+(cannot be altered in software). So a dead fan can never cook the silicon — worst case is a clean
+PMIC reset needing a manual power-button press. **With the stock heatsink and light bring-up load
+(CAPSTONE / xHCI / keyboard pump, ~5–10 W) the board sits in the 40s–low-60s °C — safe indefinitely;
+attended runs of minutes are trivially fine.** The one hard rule: never run *sustained heavy
+GPU/CPU load with no heatsink*. So JB0 is hygiene, not an emergency that gates every boot.
+
+**The fix (confidence HIGH; register model corroborated by Linux `pwm-tegra.c` AND UEFI's own
+`TegraPwmDxe`, which drives this same block during boot).** Controller = **PWM3 @ base
+`0x032A0000`**, channel 0, one 32-bit CSR at base+0x0. **No fan MRQ exists** (MRQ_THERMAL only
+reads temps / sets trips) — the host drives the PWM directly, but the clock/reset prerequisites ride
+the same BPMP transport JB1 proved. CSR fields: bit[31]=ENABLE, bits[23:16]=DUTY (n/256), bits[12:0]
+=SCALE (frequency only). Ordered:
+1. BPMP `MRQ_CLK`/`CMD_CLK_ENABLE` on `TEGRA234_CLK_PWM3 = 107` (0x6B). *(verify-don't-assume the ID
+   against `clk-t234.h`.)*
+2. BPMP `MRQ_RESET`/`CMD_RESET_DEASSERT` on `TEGRA234_RESET_PWM3 = 70` (0x46). *(verify vs
+   `reset-t234.h`.)*
+3. **No `MRQ_PG`** — the `pwm3` DT node has no `power-domains`; always-on rail (both the DTS and the
+   UEFI teardown confirm PWM gets clock+reset only, never a powergate). So — unlike XUSB — the CSR
+   aperture is **not** a gated block: **no new EL3-fatal class** (the XUSB trap was touching a
+   *power-gated* block; PWM has no power domain).
+4. `w32(0x032A0000, 0x81FF0000)` → ENABLE + ~100 % duty → fan full-on. (UEFI's own "medium" is
+   `0x80800000`; the DT `cooling-levels` top = 255 = 0xFF for full.)
+5. Pinmux is normally already applied by MB1/UEFI on the devkit — only touch `pinmux@2430000` if the
+   fan stays silent after 1–4 (MEDIUM confidence).
+
+**Mapping — already covered (verified):** `0x032A0000` (53 MiB) is inside GiB 0, which
+`mmu_tegra` maps as one Device-nGnRE block (same block that reaches XUSB `0x3610000` and the BPMP) —
+no MMU change. Note: CSR reads/writes appear to work even with the clock off, but the output won't
+toggle until steps 1–2 run; benign (no abort), just do the ungate first.
+
+**Scope recommendation: a tiny standalone arc, run FIRST on Orin, before JB2c** — it's the cheapest
+teardown-restore (no PG, no pad re-init), it's the #1 safety item, and it keeps the fan decoupled
+from JB2c's heavier pad work. Lane: tegra `arch/aarch64` files + the JB1 BPMP MRQ transport (no
+shared kernel-core); doc = this file + the jetson resume note. Alternatively fold it in as JB2c's
+step 0 (same lane, same transport) if you'd rather one Orin session — integrator's call; the plan
+file's follow-on-arc order (`~/.claude/plans/unaos-opus-jetson.md`) should get JB0 inserted ahead
+of JB2c either way.
+
+**What else the teardown kills (the "other things to turn on" list, confidence HIGH — from
+edk2-nvidia's per-driver EBS config).** Ranked by urgency: **(1) fan PWM3** — JB0 (this);
+**(2) USB pads / XUSB** — JB2c; **(3) nvdisplay** — JD1 (also a powergate, `SocDisplayHandoffMode=
+NEVER`); (4) PCIe (powergate) and (5) Ethernet/EQOS (clk+reset+PG) — only if/when those subsystems
+are needed. **Survives EBS, no action:** PMIC/regulator rails (RegulatorDxe registers no EBS event —
+voltages persist), the BPMP itself, and GIC/timer/UART (not device-discovery drivers). So at handoff
+the *voltages* are all up; only on-SoC clock/reset/powergate partitions get torn down, and only the
+ones a given subsystem needs must be re-asserted.
+
 ## 4. Jetson Orin Nano headless bring-up (Arc JM2)
 
 The Orin is brought up **headless over serial**. The only console that has ever
