@@ -8,23 +8,24 @@
 // way that drives a different (and simpler) sequence:
 //
 //   * virt: `boot_virt::build_l1` builds a FRESH EL1&0 identity table, then arms the EL1 regime at it.
-//   * tegra (here): `mmu_tegra::init` has ALREADY built an identity `L1` — `L1[0]` = the Tegra Device
+//   * tegra (here): `mmu_tegra::init` has ALREADY built the identity map — `L1[0]` = the Tegra Device
 //     window (UARTC `0x0C28_0000` + GIC-600 `0x0F40_0000`), each firmware-declared RAM GiB = Normal-WB
-//     — and is running the **EL2** regime on it. We do not rebuild it: the EL1 arm points
-//     `TTBR0_EL1`/`TCR_EL1`/`MAIR_EL1`/`SCTLR_EL1` at that SAME `L1` (its PA is `MmuInfo::ttbr0`).
+//     — and is running the **EL2** regime on it. It also built the **EL1-precise twin** `L1_EL1`
+//     (`MmuInfo::ttbr0_el1`), same GiB set with the EL1&0 leaf recipe; the EL1 arm points
+//     `TTBR0_EL1`/`TCR_EL1`/`MAIR_EL1`/`SCTLR_EL1` at THAT twin. The map is IDENTITY (VA==PA), so
+//     enabling EL1 translation moves neither PC nor SP.
 //
-// Why reusing the EL2-built table is sound at EL1. The map is IDENTITY (VA==PA), so enabling EL1
-// translation moves neither PC nor SP. The block descriptors carry EL2 attribute bits; reinterpreted
-// under the EL1&0 stage-1 regime they remain correct for a kernel-only (no-EL0) core:
-//   - RAM blocks set descriptor bit 6 (mmu_tegra's `EL2_AP1_RES1`) with bit 7 clear. Under EL1&0 that is
-//     AP[2:1]=0b01 => **EL1 read-write** (also EL0-RW, but there is no EL0 here). AF=1, PXN=0 => the
-//     kernel executes RAM. Correct: code runs, the stack and heap are read-write.
-//   - Device blocks add bit 54 (mmu_tegra's `EL2_XN`) => under EL1&0 that is UXN=1 (no EL0 exec); PXN
-//     (bit 53) is clear, so the window is nominally EL1-executable — but it is Device-nGnRE memory the
-//     kernel never branches into, so this is a permission nicety, not a hazard. AP[2:1]=0b01 => EL1 RW,
-//     so UARTC/GIC MMIO is reachable (serial keeps working after the drop). Correct.
-//   (An EL1-precise map — RAM AP[2:1]=0b00 no-EL0, Device PXN|UXN — is only worth building when EL0 code
-//   runs on Orin; that is a follow-on arc. For single-core EL1 CAPSTONE, the reused table is correct.)
+// Why the live EL2 `L1` itself must NOT be the EL1 table — the JM6 metal lesson (5 dark boots; the
+// original arc did exactly that and hung dark at the eret). EL2 leaf descriptors set AP[1] (bit 6,
+// RES1 in the single-privilege EL2 regime). Reinterpreted under EL1&0, bit 6 is AP[2:1]=0b01 =
+// "EL0 read-write" — and the VMSA forces PXN=1 for ANY region writable at EL0 (Arm ARM DDI 0487,
+// stage-1 instruction access permissions), regardless of the descriptor's PXN bit and of
+// SCTLR_EL1.WXN. "There is no EL0 yet" does not matter: the rule is unconditional. Every RAM GiB was
+// therefore privileged-execute-never at EL1: the first post-eret fetch took a permission-fault
+// instruction abort, and the VBAR_EL1 vector — in the same unexecutable RAM — could not even fetch its
+// handler (recursive abort, dark). QEMU never caught it because no Tegra234 machine model exists; the
+// virt twin was green because `boot_virt` builds its table with the EL1 recipe (AP[2:1]=0b00) from the
+// start. `L1_EL1` maps RAM AP[2:1]=0b00 (EL1 RW, no EL0, EL1-executable) and Device UXN|PXN|nGnRE.
 //
 // The load-bearing invariant (same as virt, `boot_virt.rs:167-192`): we arm the EL1 regime with
 // **`SCTLR_EL1.M=1` while STILL at EL2** — where it is DORMANT (`SCTLR_EL2` governs EL2 translation). It
@@ -73,12 +74,13 @@ const TCR_EL1_VAL: u64 = 25            // T0SZ  [5:0]
 const SCTLR_EL1_VAL: u64 = 0x30D0_0800 | (1 << 0) | (1 << 2) | (1 << 12);
 
 /// Program the EL1&0 translation regime from EL2 with the MMU ENABLED (M=1), pointing at `mmu_tegra`'s
-/// already-built identity `L1` (`l1_pa`). Dormant while we remain at EL2 (SCTLR_EL2 governs EL2
-/// translation); it becomes live the instant the drop's `eret` lands at EL1 — so EL1 never runs a single
-/// instruction with its MMU off. One `asm!` block, no memory traffic inside; `tlbi vmalle1` drops any
-/// stale EL1&0 TLB state before the regime is armed. The map is identity, so arming EL1 translation moves
-/// neither PC nor SP once we are at EL1. No table build / cache-clean here: `mmu_tegra::init` already
-/// wrote `L1` and cleaned it to the Point of Coherency, and it is the live EL2 table we are reusing.
+/// already-built **EL1-precise** identity table (`l1_pa` = `MmuInfo::ttbr0_el1` — NOT the live EL2 `L1`;
+/// see the module header for the AP[1]-forces-PXN lesson). Dormant while we remain at EL2 (SCTLR_EL2
+/// governs EL2 translation); it becomes live the instant the drop's `eret` lands at EL1 — so EL1 never
+/// runs a single instruction with its MMU off. One `asm!` block, no memory traffic inside; `tlbi vmalle1`
+/// drops any stale EL1&0 TLB state before the regime is armed. The map is identity, so arming EL1
+/// translation moves neither PC nor SP once we are at EL1. No table build / cache-clean here:
+/// `mmu_tegra::init` already wrote `L1_EL1` and cleaned it to the Point of Coherency.
 unsafe fn enable_el1_regime(l1_pa: u64) {
     unsafe {
         core::arch::asm!(
@@ -169,7 +171,8 @@ unsafe extern "C" {
 }
 
 /// Drop the Orin boot core EL2 -> EL1 on the `tegra` path: arm the EL1&0 regime at `mmu_tegra`'s already-
-/// built identity `L1` (`l1_pa` = `MmuInfo::ttbr0`) with the MMU on (dormant at EL2), then eret to EL1.
+/// built EL1-precise identity table (`l1_pa` = `MmuInfo::ttbr0_el1`) with the MMU on (dormant at EL2),
+/// then eret to EL1.
 /// Returns to the caller now running at EL1 with the MMU live and DAIF masked. The caller must (re-)init
 /// per-CPU (`percpu::init`, now TPIDR_EL1) and the exception vectors (`exceptions::install`, now VBAR_EL1)
 /// before running the scheduler. Call at EL2 AFTER JM4's GIC/timer bring-up (the drop disables the timer,

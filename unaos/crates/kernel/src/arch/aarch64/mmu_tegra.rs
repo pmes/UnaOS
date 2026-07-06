@@ -41,6 +41,17 @@ use unaos_boot_info::{BootInfo, MemoryRegion, MemoryRegionKind};
 struct PageTable([u64; 512]);
 static mut L1: PageTable = PageTable([0; 512]);
 
+/// The **EL1-precise twin** of `L1`, built only on the EL2-primary path, for the JM6 EL2 -> EL1 drop
+/// (`boot_tegra`). Same 512-entry shape, same RAM-GiB set, but with the EL1&0 leaf recipe: RAM
+/// AP[2:1]=0b00 (EL1 read-write, no EL0, EL1-executable), Device UXN|PXN. The live EL2 `L1` CANNOT be
+/// reused as the EL1 table — its leaves set AP[1] (RES1 in the single-privilege EL2 regime), which the
+/// EL1&0 regime reads as AP[2:1]=0b01 = "EL0 read-write", and the VMSA forces PXN=1 for any region
+/// writable at EL0 (DDI 0487, stage-1 instruction access permissions) regardless of the descriptor PXN
+/// bit or SCTLR_EL1.WXN. That made every RAM GiB privileged-execute-never and was the JM6 metal dark
+/// hang: the first EL1 fetch aborted, and the VBAR_EL1 vector (same RAM) could not even fetch its
+/// handler. "No EL0 exists yet" does not matter — the rule is unconditional.
+static mut L1_EL1: PageTable = PageTable([0; 512]);
+
 // ── Translation attributes (ARM ARM DDI0487). ──────────────────────────────────────────────────────
 // MAIR: AttrIdx 0 = Normal Inner/Outer Write-Back non-transient (0xFF); AttrIdx 1 = **Device-nGnRE**
 // (0x04) — deliberately nGnRE for Tegra (early-write-ack tolerant), NOT the Pi's nGnRnE (0x00). Layout
@@ -126,6 +137,10 @@ pub struct MmuInfo {
     /// (never in this mask); the u64 width caps at GiB 63 (64 GiB, the PS ceiling) which is well above
     /// Orin RAM's ~10 GiB top.
     pub ram_gib_mask: u64,
+    /// PA of the **EL1-precise** table (`L1_EL1`) for the JM6 drop's `TTBR0_EL1` — see the `L1_EL1`
+    /// doc for why the live EL2 table cannot serve. On the EL1 fallback path (`el == 1`) `L1` itself
+    /// was already built with the EL1 recipe, so this aliases `ttbr0`.
+    pub ttbr0_el1: u64,
 }
 
 /// Read `CurrentEL` (bits [3:2]). A pure system-register read — cannot fault, so it is always safe to
@@ -156,8 +171,14 @@ pub fn init(boot_info: &BootInfo) -> MmuInfo {
         },
     };
     let ttbr0 = &raw const L1 as u64;
+    // The EL1-precise twin only exists on the EL2-primary path; at the EL1 fallback `L1` itself was
+    // built with the EL1 recipe and doubles as both.
+    let ttbr0_el1 = if el == 2 { &raw const L1_EL1 as u64 } else { ttbr0 };
     let ram_gib_mask = unsafe { build_l1(boot_info, el) };
-    unsafe { clean_l1_to_poc() };
+    unsafe { clean_table_to_poc(ttbr0) };
+    if el == 2 {
+        unsafe { clean_table_to_poc(ttbr0_el1) };
+    }
     let (sctlr_old, sctlr_new) = unsafe {
         if el == 2 { enable_el2(ttbr0) } else { enable_el1(ttbr0) }
     };
@@ -165,7 +186,7 @@ pub fn init(boot_info: &BootInfo) -> MmuInfo {
     // at our handler (Part C) so a subsequent fault is a recorded syndrome, not R4's dark hang under
     // UEFI's now-possibly-unmapped VBAR.
     unsafe { install_vectors(el) };
-    MmuInfo { el, sctlr_old, sctlr_new, tcr, mair, ttbr0, ram_gib_mask }
+    MmuInfo { el, sctlr_old, sctlr_new, tcr, mair, ttbr0, ram_gib_mask, ttbr0_el1 }
 }
 
 /// Populate `L1`: `L1[0]` = the low-1-GiB Device window (covers UARTC 0x0C28_0000 and the Tegra234 GIC
@@ -225,7 +246,25 @@ unsafe fn build_l1(boot_info: &BootInfo, el: u64) -> u64 {
     // 3. Write all 512 L1 entries. L1[0] = Device (never overwritten by a RAM GiB); GiB 1
     //    (0x4000_0000, more Tegra peripherals) stays unmapped unless a firmware RAM region genuinely
     //    claimed it (the mask decides — we never blanket-map it Normal).
-    let l1 = &raw mut L1 as *mut u64;
+    unsafe { fill_table(&raw mut L1 as *mut u64, ram_gib_mask, el) };
+    // 4. EL2-primary path only: build the EL1-precise twin for the JM6 drop — same GiB set, EL1&0
+    //    leaf recipe (RAM AP[2:1]=0b00 EL1-executable, Device UXN|PXN). See the `L1_EL1` doc for why
+    //    the live EL2 table must not serve as TTBR0_EL1 (AP[1] forces PXN under EL1&0). Built HERE
+    //    (init) though the drop runs much later (after JM4 + memory::init): sound because the PC/SP
+    //    GiBs re-marked in step 2 cannot move between init and the drop (the image is fixed and the
+    //    boot stack is never switched on this path), and the heap memory::init later carves comes
+    //    from Usable regions already in this same mask. A future arc that adds a mapping to the live
+    //    EL2 `L1` (a new device window, a remap) MUST mirror it here or post-drop code loses it.
+    if el == 2 {
+        unsafe { fill_table(&raw mut L1_EL1 as *mut u64, ram_gib_mask, 1) };
+    }
+    ram_gib_mask
+}
+
+/// Write all 512 entries of one L1 table with the leaf recipe for `el` (2 = the single-privilege EL2
+/// regime, 1 = EL1&0): entry 0 = the low-1-GiB Device window, each `ram_gib_mask` GiB = Normal-WB RAM,
+/// the rest invalid. Volatile entry-by-entry writes (no dependence on the loader zeroing `.bss`).
+unsafe fn fill_table(l1: *mut u64, ram_gib_mask: u64, el: u64) {
     unsafe {
         l1.add(0).write_volatile(device_block(0, el));
         for i in 1..512usize {
@@ -237,14 +276,12 @@ unsafe fn build_l1(boot_info: &BootInfo, el: u64) -> u64 {
             l1.add(i).write_volatile(desc);
         }
     }
-    ram_gib_mask
 }
 
-/// Clean the whole L1 page to the Point of Coherency (`dc cvac` every 64-byte line, then `dsb sy`).
+/// Clean one 4 KiB table page to the Point of Coherency (`dc cvac` every 64-byte line, then `dsb sy`).
 /// The descriptors were written through UEFI's cacheable mapping, so they may sit in the data cache;
 /// the table walker must see them in RAM once we drop the data cache for the reprogram window.
-unsafe fn clean_l1_to_poc() {
-    let base = &raw const L1 as u64;
+unsafe fn clean_table_to_poc(base: u64) {
     let mut off: u64 = 0;
     while off < 4096 {
         unsafe {
@@ -343,6 +380,17 @@ unsafe fn install_vectors(el: u64) {
             let vbar = &raw const tegra_vectors_el1 as u64;
             core::arch::asm!("msr VBAR_EL1, {}", "isb", in(reg) vbar, options(nostack, preserves_flags));
         }
+    }
+}
+
+/// Arm VBAR_EL1 at the Part-C EL1 fault vector while still at EL2 (non-VHE, so the EL1-banked write is
+/// genuine — no E2H redirection). Called just before the JM6 drop: if anything still aborts on the EL1
+/// landing, the vector — now in EL1-executable RAM under `L1_EL1` — prints a syndrome through the
+/// mapped UARTC instead of hanging dark. `exceptions::install` replaces it right after the landing.
+pub unsafe fn arm_el1_fault_vector() {
+    unsafe {
+        let vbar = &raw const tegra_vectors_el1 as u64;
+        core::arch::asm!("msr VBAR_EL1, {}", "isb", in(reg) vbar, options(nostack, preserves_flags));
     }
 }
 

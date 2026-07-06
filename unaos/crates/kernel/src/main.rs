@@ -949,13 +949,58 @@ fn tegra_early_stop(boot_info: &'static mut BootInfo) -> ! {
     serial_println!(
         ":: tegra: JM6 — dropping the Orin boot core EL2 -> EL1 for the scheduler + CAPSTONE ::"
     );
-    // Reuse mmu_tegra's already-built identity L1 (RAM Normal-WB + the Tegra device window) for the EL1
-    // regime — `mmu.ttbr0` is its PA. The EL1 arm is dormant (SCTLR_EL1.M set while still at EL2) until
-    // the eret, so EL1 never runs an instruction with its MMU off (the load-bearing invariant).
-    unsafe { unaos_kernel::arch::boot_tegra::drop_to_el1(mmu.ttbr0) };
-    // Now at EL1 with the MMU live and DAIF masked. Re-seed this core's per-CPU block (now TPIDR_EL1) and
-    // install the EL1 exception vectors (VBAR_EL1) — both pick the EL from CurrentEL at runtime (JC3) — then
-    // run CAPSTONE cooperatively. The VBAR_EL1 line (vs the pre-drop VBAR_EL2) is the crisp EL1 proof.
+    // The EL1 regime gets mmu_tegra's EL1-PRECISE twin table (`mmu.ttbr0_el1`), NOT the live EL2 L1:
+    // EL2 leaves carry AP[1] (RES1 at EL2), which the EL1&0 regime reads as "EL0-writable", and the VMSA
+    // forces PXN=1 on any EL0-writable region — reusing the EL2 table made all RAM unexecutable at EL1
+    // (the original JM6 dark hang; see boot_tegra.rs). The EL1 arm is dormant (SCTLR_EL1.M set while
+    // still at EL2) until the eret, so EL1 never runs an instruction with its MMU off.
+    //
+    // Verify-don't-assume (the JM6 investigation plan): print the drop's actual inputs at EL2 first —
+    // HCR_EL2 as JM4 left it (the drop rewrites it to RW-only), ID_AA64MMFR1_EL1.VH (bits [11:8]; VHE
+    // present on A78AE, and E2H=1 handoff would redirect every *_EL1 msr above — must be non-VHE here),
+    // the twin table's PA, and its two load-bearing descriptors read back from RAM: L1_EL1[0] (Device
+    // window) and L1_EL1[code GiB] (must be AP[2:1]=0b00, PXN=0 — EL1-executable).
+    {
+        let (hcr, mmfr1, pc): (u64, u64, u64);
+        unsafe {
+            core::arch::asm!("mrs {}, HCR_EL2", out(reg) hcr, options(nomem, nostack, preserves_flags));
+            core::arch::asm!("mrs {}, ID_AA64MMFR1_EL1", out(reg) mmfr1, options(nomem, nostack, preserves_flags));
+            core::arch::asm!("adr {}, .", out(reg) pc, options(nomem, nostack, preserves_flags));
+        }
+        let code_gib = (pc >> 30) as usize;
+        let l1 = mmu.ttbr0_el1 as *const u64;
+        let (d0, dcode) = unsafe { (l1.read_volatile(), l1.add(code_gib).read_volatile()) };
+        serial_println!(
+            ":: tegra: JM6b pre-drop — HCR_EL2={:#x} MMFR1.VH={} TTBR0_EL1={:#x} L1_EL1[0]={:#x} L1_EL1[{}]={:#x} ::",
+            hcr,
+            (mmfr1 >> 8) & 0xf,
+            mmu.ttbr0_el1,
+            d0,
+            code_gib,
+            dcode,
+        );
+    }
+    // Arm VBAR_EL1 at mmu_tegra's Part-C EL1 fault vector BEFORE the eret: under the fixed table the
+    // vector is fetchable at EL1, so a residual landing fault prints an ESR/FAR/ELR syndrome line
+    // instead of hanging dark. exceptions::install replaces it two lines below.
+    unsafe { unaos_kernel::arch::mmu_tegra::arm_el1_fault_vector() };
+    unsafe { unaos_kernel::arch::boot_tegra::drop_to_el1(mmu.ttbr0_el1) };
+    // Now at EL1 with the MMU live and DAIF masked. Print the landing proof (CurrentEL + the live
+    // SCTLR_EL1) — the first EL1 serial line ever on Orin silicon — then re-seed this core's per-CPU
+    // block (now TPIDR_EL1) and install the EL1 exception vectors (VBAR_EL1) — both pick the EL from
+    // CurrentEL at runtime (JC3) — then run CAPSTONE cooperatively.
+    {
+        let (current_el, sctlr): (u64, u64);
+        unsafe {
+            core::arch::asm!("mrs {}, CurrentEL", out(reg) current_el, options(nomem, nostack, preserves_flags));
+            core::arch::asm!("mrs {}, SCTLR_EL1", out(reg) sctlr, options(nomem, nostack, preserves_flags));
+        }
+        serial_println!(
+            ":: tegra: JM6b — EL1 landing: CurrentEL={} SCTLR_EL1={:#x} ::",
+            (current_el >> 2) & 0b11,
+            sctlr,
+        );
+    }
     unaos_kernel::arch::percpu::init(0);
     unaos_kernel::arch::exceptions::install();
     unaos_kernel::arch::sched::run_capstone_boot_core(0);
