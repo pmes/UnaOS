@@ -885,6 +885,15 @@ fn tegra_early_stop(boot_info: &'static mut BootInfo) -> ! {
         boot_info.framebuffer_info.stride,
         boot_info.framebuffer_info.bytes_per_pixel,
     );
+    // JB1a: print the BPMP IPC geometry (shmem TX/RX, HSP mboxes, reserved-memory carveouts) from
+    // the firmware DTB — a read-only RAM walk, no MMIO (the JX1 lesson: gated Tegra blocks are
+    // EL3-fatal to touch, so the geometry gets VERIFIED off the firmware's own tree before the
+    // JB1 IVC arc maps or touches anything).
+    unaos_kernel::arch::fdt_tegra::jb1a_dump(
+        boot_info.dtb_addr,
+        boot_info.dtb_size,
+        mmu.ram_gib_mask,
+    );
 
     // 2. Boot banner: the same EL / CNTFRQ / MMU / DAIF snapshot `arch::boot_diagnostics` prints, read
     // straight from system registers (zero MMIO — cannot fault). Now the first REAL EL/CNTFRQ values

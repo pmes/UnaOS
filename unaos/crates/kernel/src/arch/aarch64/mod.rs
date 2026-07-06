@@ -45,6 +45,10 @@ pub mod syscall;
 // Tegra device windows Device-nGnRE before touching any peripheral MMIO (the R4 UARTC-fault fix).
 #[cfg(feature = "tegra")]
 pub mod mmu_tegra;
+// JB1a: bounded read-only FDT walker — prints the BPMP IPC geometry (shmem/mboxes/reserved-memory)
+// from the firmware DTB, the verified starting line for the BPMP IVC arc (JB1).
+#[cfg(feature = "tegra")]
+pub mod fdt_tegra;
 
 pub fn init() {
     serial_println!(":: AARCH64 Core Hardware Init ::");
