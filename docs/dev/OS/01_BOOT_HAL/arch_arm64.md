@@ -652,14 +652,19 @@ Same mechanism as JB2c — NVIDIA's `ExitBootServices` teardown disables the fan
 3-agent research pass (fan-PWM / thermal-safety / teardown-scope), all cross-corroborated; see the
 per-claim confidences below.
 
-**Urgency — real but NOT a damage risk (confidence HIGH).** The Orin has an OS-independent hardware
-thermal net armed by NVIDIA BL31/BPMP before UnaOS runs: **103 °C Tj** = hardware clock-throttle
-(50/75/87.5 % caps, no OS notified), **105 °C Tj** = a die→PMIC failsafe that power-cycles the board
-(cannot be altered in software). So a dead fan can never cook the silicon — worst case is a clean
-PMIC reset needing a manual power-button press. **With the stock heatsink and light bring-up load
-(CAPSTONE / xHCI / keyboard pump, ~5–10 W) the board sits in the 40s–low-60s °C — safe indefinitely;
-attended runs of minutes are trivially fine.** The one hard rule: never run *sustained heavy
-GPU/CPU load with no heatsink*. So JB0 is hygiene, not an emergency that gates every boot.
+**Urgency — no die-DESTRUCTION risk, but genuinely hot (correction from a metal observation).** The
+Orin has an OS-independent hardware thermal net armed by NVIDIA BL31/BPMP before UnaOS runs: **103 °C
+Tj** = hardware clock-throttle (50/75/87.5 % caps, no OS notified), **105 °C Tj** = a die→PMIC
+failsafe that power-cycles the board (cannot be altered in software). So a dead fan can never *cook*
+the silicon — worst case is a clean PMIC reset. **BUT those trips sit far above touch-temperature:
+in live fire (2026-07-06, pre-JB0 boots) Peter found the heatsink too hot to hold a finger on —
+~55–65 °C surface ⇒ ~70–90 °C Tj — with the fan still off and NOTHING throttling.** The board will
+happily sit fan-off in that 70–90 °C band indefinitely under light bring-up load and never trip, so
+the failsafe does NOT keep it comfortable — it only stops destruction. **Corrected verdict: the fan
+is a real need, not mere "hygiene"; do NOT run long fan-off boots.** JB0 runs ~1 s into every Orin
+boot (right after the JB1b ping), so once it is in the image the fan comes on almost immediately —
+verify it spins before leaning on any long (e.g. JB2c 60 s-window) boot. The hard damage rule still
+stands: never run *sustained heavy GPU/CPU load with no heatsink*.
 
 **The fix (confidence HIGH; register model corroborated by Linux `pwm-tegra.c` AND UEFI's own
 `TegraPwmDxe`, which drives this same block during boot).** Controller = **PWM3 @ base
