@@ -644,7 +644,7 @@ report and a *different* arc, not a padctl bug. **Zero-code alternative Peter ca
 roll back to the pre-update firmware slot (restores the old always-on handoff); no Jetson UEFI
 menu USB/XHCI toggle exists.
 
-### JB2c — landed (QEMU-green, ⏳ METAL-PENDING — verdict is the next attended Orin boot)
+### JB2c — landed + ✅ METAL: pads powered up (CCS=1), enumeration blocked by the predicted SMMU DMA-drop (2026-07-06)
 
 Implemented 2026-07-06 as `xusb_tegra::jb2c_padctl_powerup(chan)` (the padctl MMIO) + a one-line
 `bpmp_tegra::jb2c_usb2_trk_clk(chan)` (step 1, the tracking clock over the proven JB1 BPMP channel),
@@ -687,25 +687,53 @@ fuse read — we preserve the firmware's value (soft; affects HS receiver margin
 powers up). If first light fails *specifically* on signal integrity, folding in the fuse read (via
 the FUSE `USB_CALIB` register) is the refinement — but the pads powering up does not depend on it.
 
-**Expected serial (Peter-attended metal):** after `JB1c … XUSB ALIVE`, a block of
-`:: tegra: JB2c — USB2_TRK clk 165 enable -> err=0 ::` → `padctl @0x3520000 pad power-up …` →
-`bias pad up, tracking COMPLETED …` → three `pad N up: CTL0=… CTL1=… (PD/PD_ZI/PD_DR -> 0)` (b26/b29
-of CTL0 and b2 of CTL1 read **0**) → `padctl … done -> PASS`. Then the JB2b port survey should, on a
-plugged device, show `CCS=1` + `PLS` advancing out of RxDetect (was the dead `PORTSC=0x2a0`), the
-enumeration pump takes over, and a keyboard descriptor + keystrokes print at EL1.
+**★ METAL RESULT (Peter-attended, 2026-07-06, capture `target/serial-orin-jb2c-metal.log`).** The
+padctl bring-up ran clean on Orin silicon and **fixed the pad-teardown regression — the pads power up
+and the ports train**, which is exactly what JB2c set out to do:
+```
+:: tegra: JB0 — fan ON (~40% duty): CSR<-0x80660000 (readback 0x80660000) -> PASS ::   (JB0 reconfirmed)
+:: tegra: JB1c — XUSB ALIVE: xHCI v1.20 ... USBSTS=0x00000001 -> PASS ::
+:: tegra: JB2c — USB2_TRK clk 165 enable -> err=0 ::                                    (the 349->165 fix, err=0)
+:: tegra: JB2c — padctl @0x3520000 pad power-up (pads 0/1/2); pre PAD_MUX=0x55 PORT_CAP=0x111 ::
+:: tegra: JB2c — bias pad up, tracking COMPLETED (BIAS_CTL0=0x060e0338 CTL1=0x0451e8df) :: (PD b11 cleared, tracking one-shot completed — no timeout)
+:: tegra: JB2c — pad 0 up: CTL0=0x02cc88d1 CTL1=0x00101000 (PD/PD_ZI/PD_DR -> 0) ::      (0x26cc88d1 -> 0x02cc88d1: PD b26 + PD_ZI b29 cleared, TERM_SEL + HS_CURR_LEVEL preserved)
+:: tegra: JB2c — pad 1 up: CTL0=0x02cc88d0 ... ::  pad 2 up: CTL0=0x02cc88d1 ...
+:: tegra: JB2c — padctl USB2 pad power-up done -> PASS ::
+```
+**No EL3 fault** on any padctl write (Step-0's "always-powered, safe to write" held). Then the JB2b
+survey showed the **dead ports come alive**: `port 6 [usb2] 0x00000e03 CCS=1 PED=1 PLS=0(U0) sp=3(HS)`
+and `port 7 [usb2] 0x00000603 CCS=1 PED=1 PLS=0(U0) sp=1(FS)` — both were the dead `0x000002a0`
+(CCS=0, RxDetect) before JB2c. Devices **connect, reset, and train to U0.** JB0 fan reconfirmed; boot
+finished clean (JM6b drop → EL1 → CAPSTONE 6/6).
 
-**STOP tripwire (unchanged):** pads healthy (`CCS=1`) but enumeration times out ⇒ the NISO1 SMMU
-`GBPA=ABORT` DMA-drop signature — an honest STOP + a *different* arc, **not** a padctl bug. A padctl
-write dying at EL3 should NOT happen (Step-0 read the block clean) — if one does, the last serial
-line names the killer; save the capture and STOP.
+**★ …but enumeration is blocked one layer deeper — the predicted STOP tripwire fired.** With the pads
+healthy (CCS=1), every port stalls at `ENABLE_SLOT` with **`watchdog-timeout, code 0`** (no completion
+event), and the driver logs **`reset change latched but no event was delivered; polling fallback`** on
+every port reset. Across the whole 60 s window: **0 command-completion events, 0 transfer events, 6
+"no event delivered" fallbacks.** The controller runs and drives the ports (all MMIO / link-internal —
+no system-memory DMA), but **cannot write a single event or completion into the command/event rings in
+RAM.** That is a total controller→memory DMA-write failure = **exactly the NISO1 SMMU `GBPA=ABORT`
+DMA-drop signature this dossier predicted** (UEFI left the XUSB stream-id's SMMU translation as
+ABORT/stale, so the controller's ring DMA is dropped). It is **NOT a padctl bug and NOT a JB2c bug** —
+JB2c is a metal success at the pad layer. The same shared xHCI driver enumerates fully on x86 + QEMU
+virt, so the ring programming is correct; only the Tegra DMA path is dead.
+
+**⇒ NEXT ARC (fresh session, don't stack): the XUSB SMMU/DMA path** — program the NISO1 SMMU (or
+verify/relax `GBPA`, install a bypass/identity stream-table entry for the XUSB stream-id) so the
+controller's ring DMA lands. The `dma-coherent` DTB prop was honored at attach; the failure is the
+translate/abort stage, above coherency. Differential for that arc to rule out: (1) SMMU GBPA=ABORT /
+missing STE for the XUSB SID (leading hypothesis); (2) an IOVA≠PA offset the SMMU imposes vs the raw
+PAs we hand the controller. **Zero-code alternative Peter can try meanwhile:** roll back to the
+pre-update firmware slot — the old always-on handoff left both the pads *and* the DMA path programmed,
+which is how JB2a saw ports CONNECTED and (per the JB2b verdict) enumeration further along.
 
 **Gate (2026-07-06):** `./arroyo check` + `UNAOS_TEGRA=1 ./arroyo check` green both arches; virt
 GICv3 `test-arm` JC3 drop → CAPSTONE 6/6 (VBAR_EL1=0x7c389800, shifted by JB2b's binary growth, not
 this arc); Pi `kernel8-test` all M6/U4/U5 verdicts + CAPSTONE 6/6; x86 `test` MISSION SUCCESS;
-`esp-jetson` links (kernel.elf 220,584 B — healthy, not the ~355 KB corrupt-bloat signature). The
-whole diff is inside `#[cfg(feature = "tegra")]` code (`bpmp_tegra.rs`, `xusb_tegra.rs`, and the
-`tegra_early_stop` hunk in `main.rs`), so **non-tegra binaries are byte-identical by construction**
-(the QEMU logs are unchanged). QEMU models no Tegra — the real verdict is the attended Orin boot.
+`esp-jetson` links (kernel.elf 220,584 B — healthy, not the ~355 KB corrupt-bloat signature); metal
+boot as above. The whole diff is inside `#[cfg(feature = "tegra")]` code (`bpmp_tegra.rs`,
+`xusb_tegra.rs`, and the `tegra_early_stop` hunk in `main.rs`), so **non-tegra binaries are
+byte-identical by construction** (the QEMU logs are unchanged).
 
 ### JB0 brief — turn the cooling fan back on (safety hygiene; run FIRST on Orin)
 
