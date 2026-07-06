@@ -32,8 +32,9 @@ const MAX_TOKENS: usize = 400_000;
 const MAX_DEPTH: usize = 16;
 /// Longest node-name path we keep (bytes, '/'-joined).
 const MAX_PATH: usize = 160;
-/// Most raw u32 words we capture from one property.
-const MAX_WORDS: usize = 12;
+/// Most raw u32 words we capture from one property (the XUSB `clocks` list is 8 [phandle, id]
+/// pairs = 16 words — keep headroom above that).
+const MAX_WORDS: usize = 20;
 
 #[inline]
 fn be32(d: &[u8], off: usize) -> Option<u32> {
@@ -319,6 +320,72 @@ pub fn bpmp_geometry(dtb_addr: u64, dtb_size: usize, ram_gib_mask: u64) -> Optio
     }
     let hsp_base = ((hreg.words[0] as u64) << 32) | hreg.words[1] as u64;
     Some(BpmpGeom { shmem_tx, shmem_rx, hsp_base, db_master: mboxes.words[2] })
+}
+
+/// JB1c: the XUSB host node's BPMP resource IDs, read off the firmware DTB (never a header
+/// guess). `clocks`/`resets`/`power-domains` are [phandle, id] pairs — we keep the ids.
+pub struct XusbIds {
+    pub clocks: [u32; 8],
+    pub n_clocks: usize,
+    pub resets: [u32; 4],
+    pub n_resets: usize,
+    pub pds: [u32; 4],
+    pub n_pds: usize,
+}
+
+/// Find the node whose name contains "usb@3610000" and read its BPMP resource id lists.
+pub fn xusb_ids(dtb_addr: u64, dtb_size: usize, ram_gib_mask: u64) -> Option<XusbIds> {
+    if dtb_addr == 0 || dtb_size == 0 {
+        return None;
+    }
+    let g_lo = dtb_addr >> 30;
+    let g_hi = (dtb_addr + dtb_size as u64 - 1) >> 30;
+    let mapped = |g: u64| g == 0 || (g < 64 && (ram_gib_mask >> g) & 1 != 0);
+    if !mapped(g_lo) || !mapped(g_hi) {
+        return None;
+    }
+    let blob = unsafe { core::slice::from_raw_parts(dtb_addr as *const u8, dtb_size) };
+    let fdt = Fdt::new(blob)?;
+    let mut path = [0u8; MAX_PATH];
+    let mut plen = 0usize;
+    fdt.for_each_prop(|e| {
+        if plen == 0 && e.path.windows(11).any(|w| w == b"usb@3610000") {
+            let l = e.path.len().min(MAX_PATH);
+            path[..l].copy_from_slice(&e.path[..l]);
+            plen = l;
+        }
+    });
+    if plen == 0 {
+        return None;
+    }
+    let node = &path[..plen];
+    // [phandle, id] pairs -> collect the odd-index words.
+    let pick = |p: &PropWords, out: &mut [u32], n: &mut usize| {
+        let mut i = 1;
+        while i < p.n && *n < out.len() {
+            out[*n] = p.words[i];
+            *n += 1;
+            i += 2;
+        }
+    };
+    let mut ids = XusbIds {
+        clocks: [0; 8],
+        n_clocks: 0,
+        resets: [0; 4],
+        n_resets: 0,
+        pds: [0; 4],
+        n_pds: 0,
+    };
+    let clocks = fdt.prop_at(node, b"clocks");
+    let resets = fdt.prop_at(node, b"resets");
+    let pds = fdt.prop_at(node, b"power-domains");
+    pick(&clocks, &mut ids.clocks, &mut ids.n_clocks);
+    pick(&resets, &mut ids.resets, &mut ids.n_resets);
+    pick(&pds, &mut ids.pds, &mut ids.n_pds);
+    if ids.n_clocks == 0 && ids.n_resets == 0 {
+        return None;
+    }
+    Some(ids)
 }
 
 /// JB1a: print the BPMP IPC geometry from the firmware DTB. Read-only; pre-heap; EL2. Every

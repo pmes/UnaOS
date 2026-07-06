@@ -53,6 +53,17 @@ const CPU_TX_CH: u64 = 3;
 
 const MSG_ACK: u32 = 1 << 0;
 const MRQ_PING: u32 = 0;
+// The partition-ungate MRQs (soc/tegra/bpmp-abi.h): MRQ_RESET { cmd, reset_id } with
+// CMD_RESET_DEASSERT = 2; MRQ_CLK single word cmd_and_id = subcommand[31:24] | clk_id[23:0]
+// with CMD_CLK_ENABLE = 7; MRQ_PG { cmd = CMD_PG_SET_STATE = 1, id, state } with
+// PG_STATE_ON = 1.
+const MRQ_RESET: u32 = 20;
+const CMD_RESET_DEASSERT: u32 = 2;
+const MRQ_CLK: u32 = 22;
+const CMD_CLK_ENABLE: u32 = 7;
+const MRQ_PG: u32 = 66;
+const CMD_PG_SET_STATE: u32 = 1;
+const PG_STATE_ON: u32 = 1;
 
 const HSP_INT_DIMENSIONING: u64 = 0x380;
 const HSP_DB_STRIDE: u64 = 0x100;
@@ -130,9 +141,43 @@ fn doorbell(hsp_base: u64) -> Option<Doorbell> {
     Some(Doorbell { trigger: db + HSP_DB_TRIGGER, enable: db + HSP_DB_ENABLE })
 }
 
+/// An established IVC command channel: queue bases + the doorbell trigger. Single in-flight
+/// message (the BPMP command channel is one frame deep).
+pub struct Chan {
+    txq: u64,
+    rxq: u64,
+    trigger: u64,
+}
+
+impl Chan {
+    /// One synchronous MRQ round-trip: write the frame (code=mrq, MSG_ACK, payload words), ring,
+    /// poll for the response, consume it. Returns (err, first-two payload words); `None` = timeout.
+    pub fn transfer(&self, mrq: u32, payload: &[u32]) -> Option<(i32, [u32; 2])> {
+        let frame = self.txq + OFF_FRAME;
+        w32(frame, mrq);
+        w32(frame + 4, MSG_ACK);
+        for (i, &p) in payload.iter().enumerate().take(28) {
+            w32(frame + 8 + (i as u64) * 4, p);
+        }
+        dsb();
+        w32(self.txq + OFF_W_COUNT, r32(self.txq + OFF_W_COUNT).wrapping_add(1));
+        dsb();
+        w32(self.trigger, 1);
+        if !wait_ms(100, || r32(self.rxq + OFF_W_COUNT) != r32(self.rxq + OFF_R_COUNT)) {
+            return None;
+        }
+        let rframe = self.rxq + OFF_FRAME;
+        let err = r32(rframe) as i32;
+        let out = [r32(rframe + 8), r32(rframe + 12)];
+        w32(self.rxq + OFF_R_COUNT, r32(self.rxq + OFF_R_COUNT).wrapping_add(1));
+        dsb();
+        Some((err, out))
+    }
+}
+
 /// JB1b: establish the IVC command channel and exchange one MRQ_PING. Pre-drop, EL2, polled.
-/// Returns true iff the ping round-trip verified (reply == challenge << 1).
-pub fn jb1b_ping(geom: &BpmpGeom) -> bool {
+/// Returns the live channel iff the ping round-trip verified (reply == challenge << 1).
+pub fn jb1b_ping(geom: &BpmpGeom) -> Option<Chan> {
     let daif: u64;
     unsafe {
         core::arch::asm!("mrs {}, DAIF", out(reg) daif, options(nomem, nostack, preserves_flags));
@@ -145,7 +190,7 @@ pub fn jb1b_ping(geom: &BpmpGeom) -> bool {
         geom.db_master,
         (daif >> 6) & 0b1111,
     );
-    let Some(db) = doorbell(geom.hsp_base) else { return false };
+    let Some(db) = doorbell(geom.hsp_base) else { return None };
     let _ = db.enable; // read in the derivation print; kept for the follow-on RX-interrupt arc
 
     // Queue bases for the command channel (index 3, stride 256) — TX we write, RX the BPMP writes.
@@ -220,7 +265,7 @@ pub fn jb1b_ping(geom: &BpmpGeom) -> bool {
             r32(txq + OFF_W_STATE),
             acked,
         );
-        return false;
+        return None;
     }
     serial_println!(":: tegra: JB1b — IVC channel ESTABLISHED ::");
 
@@ -239,7 +284,7 @@ pub fn jb1b_ping(geom: &BpmpGeom) -> bool {
     let ready = wait_ms(100, || r32(rxq + OFF_W_COUNT) != r32(rxq + OFF_R_COUNT));
     if !ready {
         serial_println!(":: tegra: JB1b — MRQ_PING TIMEOUT (no response frame); STOP ::");
-        return false;
+        return None;
     }
     // Inbound frame layout (Linux tegra_bpmp_channel_read): the mb_data CODE field carries the
     // mrq_response err, FLAGS its flags, and the MRQ payload starts at data[0] (+8).
@@ -258,5 +303,75 @@ pub fn jb1b_ping(geom: &BpmpGeom) -> bool {
         want,
         if pass { "PASS" } else { "FAIL" },
     );
-    pass
+    if pass { Some(Chan { txq, rxq, trigger: db.trigger }) } else { None }
+}
+
+/// JB1c: ungate the XUSB host partition via the established BPMP channel, then re-probe the xHCI
+/// capability block that was EL3-fatal to touch in JX1. Order per Linux xhci-tegra: power domains
+/// ON (MRQ_PG), clocks ENABLE (MRQ_CLK), resets DEASSERT (MRQ_RESET) — every id read off the
+/// firmware DTB (`fdt_tegra::xusb_ids`), every response err printed, and the probe announces
+/// itself first (the JX1 EL3-fatal discipline: if the ungate was insufficient, the last line
+/// names the touch).
+pub fn jb1c_ungate_xusb(chan: &Chan, ids: &super::fdt_tegra::XusbIds) {
+    serial_println!(
+        ":: tegra: JB1c — XUSB ids from DTB: {} clocks, {} resets, {} power-domains ::",
+        ids.n_clocks,
+        ids.n_resets,
+        ids.n_pds,
+    );
+    for i in 0..ids.n_pds {
+        let id = ids.pds[i];
+        match chan.transfer(MRQ_PG, &[CMD_PG_SET_STATE, id, PG_STATE_ON]) {
+            Some((err, _)) => {
+                serial_println!(":: tegra: JB1c — PG {} ON -> err={} ::", id, err)
+            }
+            None => {
+                serial_println!(":: tegra: JB1c — PG {} ON -> TIMEOUT; STOP ::", id);
+                return;
+            }
+        }
+    }
+    for i in 0..ids.n_clocks {
+        let id = ids.clocks[i];
+        match chan.transfer(MRQ_CLK, &[(CMD_CLK_ENABLE << 24) | (id & 0x00ff_ffff)]) {
+            Some((err, _)) => {
+                serial_println!(":: tegra: JB1c — CLK {} enable -> err={} ::", id, err)
+            }
+            None => {
+                serial_println!(":: tegra: JB1c — CLK {} enable -> TIMEOUT; STOP ::", id);
+                return;
+            }
+        }
+    }
+    for i in 0..ids.n_resets {
+        let id = ids.resets[i];
+        match chan.transfer(MRQ_RESET, &[CMD_RESET_DEASSERT, id]) {
+            Some((err, _)) => {
+                serial_println!(":: tegra: JB1c — RESET {} deassert -> err={} ::", id, err)
+            }
+            None => {
+                serial_println!(":: tegra: JB1c — RESET {} deassert -> TIMEOUT; STOP ::", id);
+                return;
+            }
+        }
+    }
+    // The moment of truth: the read that was an EL3-fatal SError in JX1. Announce first.
+    const XUSB_HOST: u64 = 0x0361_0000;
+    serial_println!(":: tegra: JB1c — probing XUSB host @{:#x} (was EL3-fatal in JX1) ::", XUSB_HOST);
+    let cap0 = r32(XUSB_HOST);
+    if cap0 == 0xFFFF_FFFF || cap0 == 0 {
+        serial_println!(":: tegra: JB1c — XUSB cap0={:#010x} (still gated/absent) ::", cap0);
+        return;
+    }
+    let caplength = (cap0 & 0xff) as u64;
+    serial_println!(
+        ":: tegra: JB1c — XUSB ALIVE: xHCI v{:x}.{:02x} CAPLENGTH={:#x} HCSPARAMS1={:#010x} HCCPARAMS1={:#010x} USBCMD={:#010x} USBSTS={:#010x} -> PASS ::",
+        (cap0 >> 24) & 0xff,
+        (cap0 >> 16) & 0xff,
+        caplength,
+        r32(XUSB_HOST + 0x04),
+        r32(XUSB_HOST + 0x10),
+        r32(XUSB_HOST + caplength),
+        r32(XUSB_HOST + caplength + 0x04),
+    );
 }

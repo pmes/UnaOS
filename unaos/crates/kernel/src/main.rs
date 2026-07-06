@@ -904,7 +904,19 @@ fn tegra_early_stop(boot_info: &'static mut BootInfo) -> ! {
         mmu.ram_gib_mask,
     ) {
         Some(geom) => {
-            unaos_kernel::arch::bpmp_tegra::jb1b_ping(&geom);
+            // JB1c: with the channel proven by the ping, ungate the XUSB host partition (power
+            // domains -> clocks -> reset deassert, all ids read off the DTB's usb@3610000 node)
+            // and re-probe the xHCI capability block that was EL3-fatal in JX1.
+            if let Some(chan) = unaos_kernel::arch::bpmp_tegra::jb1b_ping(&geom) {
+                match unaos_kernel::arch::fdt_tegra::xusb_ids(
+                    boot_info.dtb_addr,
+                    boot_info.dtb_size,
+                    mmu.ram_gib_mask,
+                ) {
+                    Some(ids) => unaos_kernel::arch::bpmp_tegra::jb1c_ungate_xusb(&chan, &ids),
+                    None => serial_println!(":: tegra: JB1c — no usb@3610000 ids in DTB; SKIP ::"),
+                }
+            }
         }
         None => serial_println!(":: tegra: JB1b — geometry unresolved from DTB; SKIP ::"),
     }
