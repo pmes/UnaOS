@@ -939,6 +939,47 @@ fn tegra_early_stop(boot_info: &'static mut BootInfo) -> ! {
     unaos_kernel::arch::memory::init(boot_info);
     serial_println!(":: KERNEL HEAP ALLOCATED ::");
 
+    // 3d. JX1: XUSB first light — is the Tegra234 XUSB host controller alive after
+    //     ExitBootServices? UEFI loads the XUSB firmware for its own USB support (USB boot, setup-
+    //     menu keyboard); if the controller is left powered + clocked, the kernel can take it over
+    //     with the EXISTING xHCI stack (platform-attached at this base instead of PCIe-discovered) —
+    //     the gating question for the Orin keyboard/mouse arc. Guarded volatile reads of the xHCI
+    //     capability block @ 0x0361_0000 (Linux DT `usb@3610000`; inside mmu_tegra's GiB-0 Device
+    //     window). All-ones/zero first word = open bus / clock-gated (report + move on); a CBB
+    //     fault would print through the full exceptions.rs vectors JM4 installed (bounded, not
+    //     dark). Expect USBSTS.HCH=1 (EDK2 halts the HC at ExitBootServices but leaves the XUSB
+    //     firmware resident) — halted-but-decoding is exactly the takeover-ready state.
+    {
+        const XUSB_HOST: u64 = 0x0361_0000;
+        let cap0 = unsafe { core::ptr::read_volatile(XUSB_HOST as *const u32) };
+        if cap0 == 0xFFFF_FFFF || cap0 == 0 {
+            serial_println!(
+                ":: tegra: JX1 — XUSB host @{:#x}: cap0={:#010x} (clock-gated or absent) ::",
+                XUSB_HOST,
+                cap0
+            );
+        } else {
+            let caplength = (cap0 & 0xFF) as u64;
+            let hciversion = (cap0 >> 16) & 0xFFFF;
+            let hcs1 = unsafe { core::ptr::read_volatile((XUSB_HOST + 0x04) as *const u32) };
+            let hcc1 = unsafe { core::ptr::read_volatile((XUSB_HOST + 0x10) as *const u32) };
+            let usbcmd = unsafe { core::ptr::read_volatile((XUSB_HOST + caplength) as *const u32) };
+            let usbsts =
+                unsafe { core::ptr::read_volatile((XUSB_HOST + caplength + 0x04) as *const u32) };
+            serial_println!(
+                ":: tegra: JX1 — XUSB host @{:#x}: xHCI v{:x}.{:02x} CAPLENGTH={:#x} HCSPARAMS1={:#010x} HCCPARAMS1={:#010x} USBCMD={:#010x} USBSTS={:#010x} ::",
+                XUSB_HOST,
+                hciversion >> 8,
+                hciversion & 0xff,
+                caplength,
+                hcs1,
+                hcc1,
+                usbcmd,
+                usbsts
+            );
+        }
+    }
+
     // 4. JM6: drop the Orin BOOT CORE EL2 -> EL1 and run the scheduler + full M4 CAPSTONE at EL1 — the
     //    first time the scheduler runs on Orin silicon. This is the tegra analogue of the virt JC3 call
     //    site (`kernel_main`), and it becomes the tegra terminus: `run_capstone_boot_core` never returns.
