@@ -105,8 +105,12 @@ pub struct Task {
     done_sem: Option<Arc<Semaphore>>,
     /// EL0 user-mode entry point + initial SP_EL0 (M6a). Non-zero only for `is_user` tasks made via
     /// `spawn_user`: such a task's initial frame lands in `user_task_trampoline`, which `eret`s to EL0
-    /// at `user_entry` with SP_EL0 = `user_sp`. 0 / unused for ordinary kernel tasks.
+    /// at `user_entry` with SP_EL0 = `user_sp`. 0 / unused for ordinary kernel tasks. Read only by
+    /// `user_task_trampoline` (baremetal-only); on the `virt` build every task is a kernel thread, so
+    /// these stay 0 and unread (`spawn_inner` still initialises them for the shared struct layout).
+    #[cfg_attr(not(feature = "baremetal"), allow(dead_code))]
     user_entry: u64,
+    #[cfg_attr(not(feature = "baremetal"), allow(dead_code))]
     user_sp: u64,
     /// M6d: the TTBR0_EL1 value (`root_pa | asid << 48`) that installs this task's address space, or 0
     /// for a kernel task (no switch — kernel mappings are Global and byte-identical in every root, so a
@@ -275,7 +279,9 @@ extern "C" fn task_trampoline() -> ! {
 }
 
 /// Placeholder `entry` for user tasks: `spawn_user` sets `Task.entry` to this, but `user_task_trampoline`
-/// never calls it (it `eret`s to EL0 instead). Panics loudly if a path ever reaches it.
+/// never calls it (it `eret`s to EL0 instead). Panics loudly if a path ever reaches it. EL0/user machinery
+/// is baremetal-only (the `virt` JC3 path runs kernel-thread CAPSTONE, no EL0 — see the module gate).
+#[cfg(feature = "baremetal")]
 fn user_never(_: usize) {
     unreachable!("user task's kernel `entry` was called");
 }
@@ -292,7 +298,8 @@ fn user_never(_: usize) {
 /// the stack the later `svc`/IRQ re-entry (`__vec_svc`/`__vec_irq`) runs on, so the 16 KiB Box must
 /// have headroom for the SVC/IRQ frame (256 GPR + 528 FP + 32 banked + the Rust handler) — it does;
 /// this trampoline uses only a shallow prologue. The msr+eret are one `noreturn` asm block so nothing
-/// runs after the drop.
+/// runs after the drop. Baremetal-only (EL0/user machinery — the `virt` path has no EL0 this arc).
+#[cfg(feature = "baremetal")]
 extern "C" fn user_task_trampoline() -> ! {
     let cpu = percpu::this_cpu().cpu_index as usize;
     let raw = SCHED[cpu].current.load(Ordering::Acquire) as *const Task;
@@ -431,6 +438,10 @@ pub fn spawn(name: &'static str, entry: fn(usize), arg: usize, cpu: usize) -> u6
 /// address space (a private slot) is created with `spawn_user_slot` instead. Setting `user_ttbr0` to the
 /// boot root (rather than 0) is load-bearing: if a per-slot task last ran on this core, `dispatch_next`
 /// must switch TTBR0 back to the boot root before this task's EL0 access hits the shared window VA.
+///
+/// EL0/user spawn machinery (this and `spawn_user_slot`/`spawn_user_inner`) is baremetal-only: it reaches
+/// into `super::boot` (the Pi-gated user MMU), and the `virt` JC3 path runs kernel-thread CAPSTONE only.
+#[cfg(feature = "baremetal")]
 pub fn spawn_user(name: &'static str, user_entry: u64, user_sp: u64, cpu: usize) -> u64 {
     spawn_user_inner(name, user_entry, user_sp, super::boot::boot_ttbr0(), cpu)
 }
@@ -439,6 +450,7 @@ pub fn spawn_user(name: &'static str, user_entry: u64, user_sp: u64, cpu: usize)
 /// slot root `slot_l1_pa | (asid << 48)` from `boot::slot_ttbr0`. `dispatch_next` installs it on
 /// dispatch; `exit` tears the slot down. This is what lets an EL0 program write its own (slot-private)
 /// stack without disturbing any other task.
+#[cfg(feature = "baremetal")]
 pub fn spawn_user_slot(
     name: &'static str,
     user_entry: u64,
@@ -449,6 +461,7 @@ pub fn spawn_user_slot(
     spawn_user_inner(name, user_entry, user_sp, user_ttbr0, cpu)
 }
 
+#[cfg(feature = "baremetal")]
 fn spawn_user_inner(
     name: &'static str,
     user_entry: u64,
@@ -551,7 +564,13 @@ const _: () = {
 fn poke_cpu(target: usize) {
     let this = percpu::this_cpu().cpu_index as usize;
     if target != this {
+        // The reschedule SGI: `smp::IPI_RESCHED` on the Pi (spin-table SMP), SGI 0 on the `virt` path
+        // (`smp_virt::IPI_SGI`; `smp` is baremetal-only there). On the JC3 boot-core-only CAPSTONE this
+        // branch is never taken (self-poke is skipped), so the `virt` value is only ever a compile target.
+        #[cfg(feature = "baremetal")]
         super::gic::send_sgi(target, super::smp::IPI_RESCHED);
+        #[cfg(not(feature = "baremetal"))]
+        super::gic::send_sgi(target, 0);
     }
 }
 
@@ -613,15 +632,19 @@ pub fn exit() -> ! {
     let raw = SCHED[cpu].current.load(Ordering::Acquire) as *mut Task;
     assert!(!raw.is_null(), "exit: no current task");
     unsafe {
-        // M6d: if this task owns a private address-space slot (ASID != 0), tear it down HERE — repoint
-        // this core's TTBR0 off the dead slot root and broadcast-invalidate its ASID (see
+        // M6d (baremetal only): if this task owns a private address-space slot (ASID != 0), tear it down
+        // HERE — repoint this core's TTBR0 off the dead slot root and broadcast-invalidate its ASID (see
         // `boot::teardown_user_slot`). Done before the switch-away, on the task's own kernel stack, which
         // is a Global identity mapping present in the boot root too — so repointing TTBR0 to the boot
         // root does not pull the stack out from under us. Shared-window (ASID 0) and kernel (ttbr0 = 0)
-        // tasks skip it.
-        let asid = (*raw).user_ttbr0 >> 48;
-        if asid != 0 {
-            super::boot::teardown_user_slot(asid);
+        // tasks skip it. On `virt` (JC3) every task is a kernel thread (user_ttbr0 == 0), so there is no
+        // slot to retire and the whole block is compiled out (it reaches into the Pi-gated `super::boot`).
+        #[cfg(feature = "baremetal")]
+        {
+            let asid = (*raw).user_ttbr0 >> 48;
+            if asid != 0 {
+                super::boot::teardown_user_slot(asid);
+            }
         }
         (*raw).state.store(STATE_FINISHED, Ordering::Release);
         // `old_sp` is a throwaway on the dying stack — the scheduler never reads it back and never
@@ -1723,4 +1746,51 @@ pub fn start_aps(online: &[usize]) {
         ":: AARCH64 SCHED: preemption ON; busy-pair + sleep + full M4 capstone on APs {:?} ::",
         online
     );
+}
+
+/// JC3: run the M4 CAPSTONE on the `virt` boot core ALONE, cooperatively, and never return. Called by
+/// `main.rs` right after the boot core drops EL2 -> EL1 (`boot_virt::drop_to_el1`) with its per-CPU
+/// (TPIDR_EL1) and EL1 vectors installed. This is the QEMU-testable proof that the scheduler + all six
+/// sync primitives run at EL1 on the GICv3 `virt` path.
+///
+/// Boot-core-only (no SMP): the coordinator AND both "worker" cores are the boot core itself
+/// (`CAP_CORES = [cpu, cpu]`), so every cross-core wake in `capstone_body` degrades to a same-core
+/// cooperative reschedule — exactly how the Pi CAPSTONE already runs under QEMU (no Group-1 IRQ delivery;
+/// "every block/wake carried by the run() busy-poll"). It exercises the SEMANTICS of all six primitives
+/// (a real park + switch + wake for each Semaphore/Mutex/Channel/Condvar/RwLock/join), proving they
+/// function at EL1; true cross-core contention timing remains the Pi/metal proof. The single-core queue
+/// is never transiently empty while CAPSTONE is in flight (each worker is queued before the coordinator
+/// blocks and runs to completion between the coordinator's blocks), so the driver makes progress to the
+/// final `CAPSTONE COMPLETE` line, then idles.
+///
+/// No preemption: the drop disabled the physical timer (the shared `__vec_irq` stub banks EL2 state), so
+/// `SCHED_ACTIVE` stays FALSE (`timer_preempt` no-ops) and the drive loop busy-polls rather than WFI —
+/// never wedging the single core in a wake-less WFI (`crate::arch::hlt` would WFI while `is_live()` still
+/// reads true from the pre-drop EL2 `verify_live`). Task bodies still run IRQ-unmasked (`task_trampoline`
+/// clears I), but with the timer disabled and the JC2 SMP SGIs long quiescent there is no IRQ source.
+pub fn run_capstone_boot_core(cpu: usize) -> ! {
+    assert!(cpu < NUM_CPUS, "run_capstone_boot_core: cpu out of range");
+    // Reserve every primitive's waiter capacity on the boot core before any task can block on it.
+    CAP_SEM.init();
+    CAP_MTX.init();
+    CAP_CHAN.init();
+    CAP_CV_PRED.init();
+    CAP_CV.init();
+    CAP_RW.init();
+    // Coordinator and both workers co-located on the boot core: cross-core wakes become same-core
+    // cooperative reschedules.
+    *CAP_CORES.lock() = [cpu, cpu];
+    serial_println!(
+        ":: AARCH64 SCHED (virt): boot core {} at EL1 — running the full M4 CAPSTONE cooperatively ::",
+        cpu
+    );
+    spawn("capstone", capstone_body, 0, cpu);
+    SCHED_GO.store(true, Ordering::Release); // harmless (no APs on this path)
+    // Cooperative dispatch loop: drain the run queue, then busy-poll (never WFI). `dispatch_next` returns
+    // false only once the queue drains — after CAPSTONE has fully completed — at which point the core just
+    // idle-spins (a headless regression captures the log within its timeout).
+    loop {
+        while dispatch_next(cpu) {}
+        core::hint::spin_loop();
+    }
 }

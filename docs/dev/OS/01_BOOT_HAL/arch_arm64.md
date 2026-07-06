@@ -103,13 +103,15 @@ Two release mechanisms, selected by platform:
   its entry into that core's release slot and `SEV`. Unchanged by JC2 — the whole
   PSCI path is `#[cfg(not(feature = "pi"))]`, so every Pi image compiles it out.
 
-**No scheduler on the `virt` path yet.** The aarch64 scheduler is
-`#[cfg(feature = "baremetal")]`-gated and coupled to EL1 (`ELR_EL1`/`SPSR_EL1`
-eret paths), while the `virt` kernel runs at EL2. Un-gating it needs a `virt`
-**EL2 → EL1 drop** mirroring the Pi's `boot::drop_to_el1`, after which the
-scheduler un-gates as-is and CAPSTONE can run there — the **JC3** candidate. So
-the JC2 secondaries only receive SGIs; they run no scheduled work. The per-core
-generic-timer tick is likewise deferred: arming it on a secondary would
+**Scheduler on the `virt` path — the boot core, since JC3.** The aarch64 scheduler
+was `#[cfg(feature = "baremetal")]`-gated and coupled to EL1 (`ELR_EL1`/`SPSR_EL1`
+eret paths), while the `virt` kernel runs at EL2. **Arc JC3** un-gates it: after the
+JC2 SMP proof completes, the boot core drops **EL2 → EL1** (`arch/aarch64/boot_virt.rs`,
+the `virt` analogue of the Pi `boot::drop_to_el1`/`enable_mmu`) and runs the full
+6-primitive M4 CAPSTONE there — see the **JC3 result** section below. Only the boot
+core drops; the JC2 secondaries stay parked at EL2 and still receive SGIs but run no
+scheduled work (SMP scheduling on `virt` remains a later step). The per-core
+generic-timer tick is likewise still deferred: arming it on a secondary would
 double-count the shared `ticks()` clock the xHCI/e1000 timeout budgets read.
 
 ### Build knob
@@ -133,6 +135,79 @@ on silicon. This is a Tegra-firmware (BL31/MCE) core-bring-up issue, not a JM5 c
 needs a dedicated investigation (see the "JM5 result" section for the syndrome, the sharp
 query-works/power-faults split, and the ranked hypotheses). QEMU models no Tegra machine, so
 QEMU-green did not — and here could not — imply Orin-correct.
+
+### JC3 result — virt EL2 → EL1 drop + scheduler/CAPSTONE at EL1 (**QEMU-green**)
+
+The `virt` boot core now runs the scheduler and the full six-primitive CAPSTONE at
+**EL1**. The whole arc is QEMU-testable (the point is to prove the scheduler/EL1 path
+on `virt gic-version=3`); a metal boot is a bonus, not the verdict.
+
+**The drop (`arch/aarch64/boot_virt.rs`).** UEFI hands the `virt` kernel off at **EL2
+with the MMU already on**. To run the EL1-coupled scheduler, the boot core builds a
+fresh **EL1&0 identity map** — `L1[0]` = the low-1-GiB Device window (GICv3
+`0x0800_0000`, PL011 `0x0900_0000`), each firmware-declared RAM GiB = a Normal-WB block
+(QEMU `virt` = 1 GiB at `0x4000_0000`), plus a belt-and-braces re-mark of the executing
+and stack GiBs — then **arms the EL1 regime with `M=1` while still at EL2** (dormant
+there; `SCTLR_EL2` governs EL2 translation). The regime becomes live the instant the
+`eret` lands at EL1, so **EL1 never runs a single instruction with its MMU off** — no
+atomic ever executes on Device-typed memory (the hazard the Pi drop avoids by running no
+atomics in its MMU-off window). `TCR_EL1`/`MAIR`/`SCTLR_EL1` are the proven `boot.rs`
+EL1&0 recipe (`SCTLR_EL1` absolute with the A72 RES1 mask, since UEFI never initialised
+it). The drop proper mirrors `boot::drop_to_el1` (HCR_EL2.RW, CPTR/CPACR FP-enable,
+CNTHCTL, `VMPIDR`/`VPIDR` seed, `SPSR_EL2 = 0x3c5` = EL1h + DAIF masked, `eret` to `x30`),
+with one `virt`-specific addition: it **disables the physical timer** (`CNTP_CTL_EL0 = 0`).
+
+**Why the timer is disabled + cooperative CAPSTONE.** The shared IRQ vector stub
+`exceptions::__vec_irq` banks `ELR_EL2`/`SPSR_EL2` on the not-baremetal build (compile-time
+`irq_el!() == "2"`), which would fault if an IRQ were taken at EL1. So CAPSTONE on `virt`
+runs **cooperatively** — exactly how the Pi CAPSTONE already runs under QEMU raspi4b (no
+Group-1 delivery; every block/wake carried by the dispatch loop) — and the only periodic
+IRQ source is killed before the drop. The JC2 SMP SGIs are quiescent by then (their proof
+completed). `SCHED_ACTIVE` stays false.
+
+**Per-CPU EL flip (`arch/aarch64/percpu.rs`).** Baremetal keeps a fixed `TPIDR_EL1`
+(compile-time). The not-baremetal build (`virt` + tegra) now selects the thread-pointer
+register at **runtime from `CurrentEL`** (`EL2 → TPIDR_EL2`, else `TPIDR_EL1`): the boot
+core uses `TPIDR_EL2` for the EL2 bring-up + JC2 SMP proof, then `percpu::init(0)` is
+re-called after the drop to seed `TPIDR_EL1`. tegra (always EL2) is behaviour-identical;
+Pi is byte-identical (proven).
+
+**Scheduler un-gate (`sched.rs` + `mod.rs`).** The scheduler module is now compiled for
+`virt` too; all EL0/user machinery (`spawn_user*`, the user trampoline, the `exit()` slot
+teardown, `poke_cpu`'s SGI id) stays `#[cfg(feature = "baremetal")]` (it reaches into the
+Pi-only `super::boot`). CAPSTONE runs on the boot core **alone**
+(`sched::run_capstone_boot_core`): coordinator and both "worker" cores are the boot core
+(`CAP_CORES = [0, 0]`), so every cross-core wake degrades to a same-core cooperative
+reschedule. This exercises the *semantics* of all six primitives (a real park + switch +
+wake for each); true cross-core contention timing remains the Pi/metal proof.
+
+**Evidence** (`UNAOS_GICV3=1 ./arroyo test-arm 45`):
+
+```
+:: AARCH64 SMP: 3/3 secondaries online via PSCI CPU_ON on the GICv3 path ::
+:: JC3: SMP proof done; dropping the virt boot core EL2 -> EL1 for the scheduler + CAPSTONE ::
+:: AARCH64 exception vectors installed (VBAR_EL1 = 0x7c38c000) ::      <- boot core now at EL1
+:: AARCH64 SCHED (virt): boot core 0 at EL1 — running the full M4 CAPSTONE cooperatively ::
+:: CAPSTONE Semaphore: PASS ::   :: CAPSTONE Mutex: PASS ::   :: CAPSTONE Channel: PASS ::
+:: CAPSTONE Condvar: PASS ::     :: CAPSTONE RwLock: PASS ::  :: CAPSTONE join: PASS ::
+:: CAPSTONE COMPLETE — all 6 sync primitives verified in one boot ::
+```
+
+The `VBAR_EL1` line (vs the pre-drop `VBAR_EL2`) is the crisp proof the boot core reached
+EL1; CAPSTONE 6/6 then runs the scheduler + every sync primitive there. The **JC2 SMP proof
+still passes 3/3** (it runs before the drop).
+
+**Regression bar (all held).** `./arroyo check` both arches; `UNAOS_TEGRA=1 ./arroyo build`
+both legs + `esp-jetson` link. GICv2 `virt` (`test-arm 25`): behaviour identical — the only
+diff is **3 layout-only lines** (kernel ELF `192 → 198` pages, load address, `VBAR_EL2`, all
+shifted by the added code). x86 (`test 25`): unaffected (MISSION SUCCESS + U1a/U1b/U2/U3
+PASS). Pi (`kernel8-test 30`): **byte-identical mod interleave** (sorted-diff `0` vs a base
+worktree at `31ff7a1`, over a log that runs the full Pi scheduler + CAPSTONE + M6g/EL0).
+
+**Deferred (follow-on).** EL0 on `virt` (a `hello`-class program at EL1&0) and the Orin
+boot-core drop (repeat this drop on JM3's `mmu_tegra` EL2 regime → an EL1 regime, then run
+the scheduler + a disk-loaded EL0 program on silicon — the metal payoff, needs no SMP). SMP
+scheduling on `virt` (dropping the APs too) is likewise later.
 
 ## 4. Jetson Orin Nano headless bring-up (Arc JM2)
 

@@ -127,6 +127,17 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         boot_info.mode_action,
     );
 
+    // JC3 (virt/UEFI, GICv3 only): capture the firmware RAM-GiB map from boot_info BEFORE memory::init
+    // consumes it (it takes the `&'static mut`), so the EL2->EL1 drop below can build the boot core's EL1
+    // identity map. Runtime-gated on `is_v3()` so the GICv2 virt run computes nothing beyond the cheap GIC
+    // check; compiled only on the `virt` build (baremetal has boot.rs; tegra keeps its EL2 regime).
+    #[cfg(all(target_arch = "aarch64", not(feature = "pi"), not(feature = "tegra")))]
+    let jc3_ram_gib_mask = if unaos_kernel::arch::gic::is_v3() {
+        unaos_kernel::arch::boot_virt::ram_gib_mask(boot_info)
+    } else {
+        0
+    };
+
     // 4. Global Heap Allocation (Phase 3 Memory Translation)
     unaos_kernel::arch::memory::init(boot_info);
     serial_println!(":: KERNEL HEAP ALLOCATED ::");
@@ -153,6 +164,29 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     #[cfg(all(target_arch = "aarch64", not(feature = "pi"), not(feature = "tegra")))]
     if unaos_kernel::arch::gic::is_v3() {
         unaos_kernel::arch::smp_virt::start_secondaries(dtb_addr, dtb_size);
+
+        // JC3: with the JC2 SMP proof complete (the secondaries are parked at EL2 in their WFI loop), drop
+        // the BOOT CORE EL2 -> EL1 and run the scheduler + full M4 CAPSTONE there — the QEMU-testable proof
+        // that the scheduler and all six sync primitives run at EL1 on the GICv3 `virt` path. Sequenced
+        // AFTER the SMP proof so the two never fight (the APs are parked before the BSP changes its EL);
+        // only the BSP drops (the APs stay at EL2). This DIVERGES — the boot core becomes the CAPSTONE core
+        // and never returns — so the GICv3 virt run ENDS here (no GUI/USB below); the GICv2 (!is_v3) run is
+        // untouched and falls through to the normal boot path.
+        //
+        // Detach fbcon first: after the drop the boot core's EL1 map covers only RAM + the low peripheral
+        // window (PL011/GIC), and the firmware framebuffer may live outside both (e.g. a high PCI BAR), so
+        // a serial_println! that mirrored to it would fault at EL1. Serial itself (PL011, in the mapped
+        // Device window) stays live, so the CAPSTONE log is captured regardless.
+        unaos_kernel::video::fbcon::detach();
+        serial_println!(
+            ":: JC3: SMP proof done; dropping the virt boot core EL2 -> EL1 for the scheduler + CAPSTONE ::"
+        );
+        unsafe { unaos_kernel::arch::boot_virt::drop_to_el1(jc3_ram_gib_mask) };
+        // Now at EL1 with the MMU live and DAIF masked. Re-seed this core's per-CPU block (now TPIDR_EL1)
+        // and install the EL1 exception vectors (VBAR_EL1), then run CAPSTONE cooperatively (never returns).
+        unaos_kernel::arch::percpu::init(0);
+        unaos_kernel::arch::exceptions::install();
+        unaos_kernel::arch::sched::run_capstone_boot_core(0);
     }
 
     // 4b. aarch64 scheduler (M3a): a cooperative round-robin smoke test on the boot core — spawn a
