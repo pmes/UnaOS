@@ -37,10 +37,20 @@ aarch64 (Pi 4) track and ports to x86/Jetson after:
     down, so no capability outlives the process that held it.
   As the first routed resource, `write` to the console is now a capability (`CONSOLE` + `write`),
   granted to a process at launch — there is no ambient "stdout everyone can write".
-* **U6 (next)** — capability *transfer between principals* over the bandy message bus, a general
-  object table (routing filesystem/network syscalls through handles the way the console now is),
-  and cross-process revocation. This is where the UnaFS `owner`/`grants:*` attributes of the
-  model above become the persistent form of these live kernel handles.
+* **U6a (landed, 2026-07-06)** — the *general object table*. A handle is now a
+  `(kind, target, rights)` descriptor: the **kind** (`Child` / `Console` / and the scaffolds `File` /
+  `Socket`) rides in a parallel sidecar so the value word keeps its `Empty`/`in-flight` sentinels
+  untouched, and **all** kinds are first-free-allocated by one allocator. This retires U5's fixed
+  console index (`CONSOLE_FD`): that index is now a *reserved* slot the allocator skips, so a process
+  that both prints **and** spawns can hold a console cap alongside its child/object handles with no
+  index collision — the one fragility U5's review flagged. `File`/`Socket` are scaffolds today
+  (resolvable to their kind with rights-checking, but no filesystem/network syscall routes through
+  them yet); they prove the table is general, and are where fs/net capabilities will attach.
+* **U7 (next)** — capability *transfer between principals* over the bandy message bus and
+  cross-process **revocation trees** (the reserved `revoke` right), plus real filesystem/network
+  syscalls routing through the `File`/`Socket` kinds the way the console now is. This is where the
+  UnaFS `owner`/`grants:*` attributes of the model above become the persistent form of these live
+  kernel handles.
 
 See `docs/SECURITY.md` (the hardening ledger) and `docs/dev/OS/02_KERNEL_CORE/userspace.md`
 (the syscall-level detail) for the exact mechanism and evidence.

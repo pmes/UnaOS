@@ -164,6 +164,52 @@ Legend: **✅ metal-confirmed** · **🔬 QEMU-green, metal pending** · dates I
 
 ## hw-pi4 track — 2026-07-04 (landed on `hw-pi4`, awaiting integration)
 
+### U6a — the general object table: `(kind, target, rights)` descriptors, first-free for ALL kinds, the `CONSOLE_FD` collision closed (aarch64) ✅ `hw-pi4`
+- **What:** generalizes U5's fixed-shape handle into a general **object descriptor**. A handle now
+  names one of four **kinds** — `Child(pid)` (U4), `Console` (U5), and the **scaffolds** `File(id)` /
+  `Socket(id)` (defined + resolvable via `handle_resolve`, but no fs/net syscall routes through them
+  yet — they prove the table is genuinely general, not that fs/net exists). The **kind rides in a
+  parallel sidecar** `HANDLE_KIND[[AtomicU8; 8]; USER_SLOTS+1]` (keyed identically to `HANDLES`/
+  `HANDLE_RIGHTS`), so the value word keeps U4/U5's sentinels **byte-identical** — `0` = Empty (the
+  lock-free allocator's free marker), `u64::MAX` = `RESERVING` — and nothing else is reserved. Picking
+  the sidecar over the value word's high bits makes the sentinel-collision STOP tripwire *structurally
+  impossible* (a `File`/`Socket` id may be any non-`0`/non-`u64::MAX` word, no masking) and mirrors the
+  rights sidecar 1:1 (kind + rights published Release BEFORE the live value; single-writer-per-ASID the
+  backstop). **The `CONSOLE_FD` collision is closed** (the arc's raison d'être + U5's one design note):
+  U5 pinned the console cap at a fixed index via an unconditional store while `handle_install`'s
+  first-free scan allocated from index 0, so a process that both PRINTED and SPAWNED 2+ children could
+  auto-allocate a child onto index 1 and have it clobbered by the console install. U6 makes `CONSOLE_FD`
+  a **reserved index the first-free allocator SKIPS**: the console lives there by the `fd=1`/stdout
+  convention (keeping every prior blob byte-identical), children/objects fill `{0, 2, 3, ..}`, so a
+  console cap and N child/object caps coexist with **zero index collision for any interleaving of
+  installs**. Every consumer is behaviour-preserved: `handle_resolve` dispatches on the kind sidecar
+  (`sys_wait`→`Child`, `sys_write`→`Console`+`CAP_WRITE`, `sys_cap` grant/revoke on any kind); the
+  **attenuation invariant is unchanged** and the mint copies the source's kind (attenuate rights, never
+  re-kind); `handle_clear`/`clear_handle_row`/`handle_row_is_clear` also handle the kind. Lane:
+  `arch/aarch64/syscall.rs` (the descriptor, reserved-index alloc, resolve, kind scaffold, the demo) +
+  a `main.rs` launcher; no `boot.rs` change (`clear_handle_row` already wipes the whole row), no
+  scheduler primitive, no driver, no x86 file.
+- **Tested — QEMU:** `./arroyo kernel8-test` → after the U5 PASS line: the U6 setup line, `u6: parent
+  print (pre-spawn)`, `u6: parent print (post-spawn; console survived 2 spawns)`, the two children's
+  `hello from EL0`, and `:: U6: general object table — printing spawner + 2 children, no index
+  collision, File/Socket kinds resolve -> PASS ::`. The `el0-u6spawn` fixture is the printing spawner U5
+  could not serve: it prints, spawns 2 children (distinct auto-allocated handles, both `!= CONSOLE_FD`),
+  prints AGAIN (the console cap survived the spawns), and reaps both by handle — witness `0xF`. The
+  launcher additionally proves kernel-side that the `File`/`Socket` kinds resolve to their kind with the
+  required right (and `Denied`/`-EACCES`-equivalent without) and that the exact U5-breaking
+  console-vs-two-children interleaving no longer collides (`u6_kernel_check`). Every
+  M6b/M6d/M6e/M6f/M6g/U4/U5 verdict line **byte-identical** (sorted set-diff: the only delta is
+  `VBAR_EL1` shifting one page — benign binary growth from the added code — plus the new U6 lines) and
+  CAPSTONE 6/6, 0 unexpected faults. `check` both arches; x86 `test` MISSION SUCCESS; aarch64 virt v2
+  clean USB enumeration + GICv3 CAPSTONE 6/6 unchanged; zero x86 files.
+- **Tested — metal:** none this arc — U6 is fully QEMU-verifiable (descriptor/allocator/resolve logic;
+  the demo's two children ride U4/M7's already-metal-confirmed EMMC2 load path).
+- **Deferred:** **U7** — cross-process handle-transfer (`SYS_XFER`, a cross-ASID write discipline that
+  breaks the single-writer invariant) + revocation trees (`CAP_REVOKE`, reserved) + the bandy Ring-3
+  delegation wrapper; and a later arc — real `File`/`Socket` fs/net syscalls routing through these
+  kinds, plus UnaFS `owner`/`grants:*` enforcement on `SYS_OPEN` (rides the kernel UnaFS mount).
+- **Commit:** this arc on `hw-pi4` (merge pending the integrator, who records the merge hash).
+
 ### U5 — handles as capabilities: the enforcement CHECK + grant/attenuate/revoke + routed `sys_write` + teardown-clear (aarch64) ✅ `hw-pi4`
 - **What:** turns U4's handle STRUCTURE into a real **capability**. A handle now carries
   **rights** — a bitmask `CAP_READ|CAP_WRITE|CAP_EXEC|CAP_GRANT|CAP_REVOKE` in a **sidecar**

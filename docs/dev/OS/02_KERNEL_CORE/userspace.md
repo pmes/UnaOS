@@ -246,10 +246,35 @@
   unexpected faults. No metal this arc (pure syscall logic; the child loads ride U4/M7's
   metal-confirmed EMMC2 path). Lane: `arch/aarch64/syscall.rs` + the `boot.rs` row-clear + a
   `main.rs` launcher — no scheduler primitive, no driver, no x86 file.
-- Not yet (U6): bandy handle-transfer between principals, a general object table (routing
-  fs/net syscalls through handles), and cross-process revocation trees (`CAP_REVOKE` as a
-  right is defined but reserved). Not yet (M8): an arbitrary program-by-name `sys_spawn`, and
-  a code-signing / allowlist gate on the loader (`SECURITY.md`).
+- **U6a** — the **general object table**: `(kind, target, rights)` descriptors, first-free for
+  ALL kinds, the `CONSOLE_FD` collision closed (roadmap-U6 part (a)). Generalizes U5's
+  fixed-shape handle. The **kind** rides in a parallel sidecar `HANDLE_KIND[[AtomicU8; 8];
+  USER_SLOTS+1]` (keyed like `HANDLES`/`HANDLE_RIGHTS`), so the value word keeps U4/U5's `0`=Empty
+  / `u64::MAX`=`RESERVING` sentinels byte-identical and nothing else is reserved; a handle names
+  `Child(pid)`, `Console`, or the **scaffolds** `File(id)` / `Socket(id)` (resolvable via
+  `handle_resolve`, but no fs/net syscall routes through them yet). `handle_resolve` now dispatches
+  on the kind sidecar. **The fixed `CONSOLE_FD = 1` pin is retired**: it is a *reserved* index the
+  first-free allocator (`handle_install`) SKIPS, so the console cap (installed there by the
+  `fd=1`/stdout convention — keeping every prior blob byte-identical) and auto-allocated child/
+  object handles (`{0, 2, 3, ..}`) never collide, for any interleaving — closing U5's one design
+  note (a process that both prints and spawns 2+ children). Attenuation is unchanged and a grant
+  now copies the source handle's kind (attenuate rights, never re-kind); `handle_clear`/
+  `clear_handle_row`/`handle_row_is_clear` also handle the kind. Evidence — `./arroyo kernel8-test`
+  → after the U5 PASS line, the `el0-u6spawn` printing spawner (prints, spawns 2 children off the
+  reserved index, prints again proving the console survived, reaps both by handle) plus a
+  kernel-side check (File/Socket kinds resolve with/without rights; the U5-breaking interleaving no
+  longer collides): `:: U6: general object table — printing spawner + 2 children, no index
+  collision, File/Socket kinds resolve -> PASS ::`. Every M6b/M6d/M6e/M6f/M6g/U4/U5 line
+  byte-identical (only `VBAR_EL1` shifts one page — benign binary growth — plus the new U6 lines),
+  CAPSTONE 6/6, 0 unexpected faults. No metal this arc (pure syscall logic; the two children ride
+  U4/M7's metal-confirmed EMMC2 path). Lane: `arch/aarch64/syscall.rs` + a `main.rs` launcher — no
+  `boot.rs` change (`clear_handle_row` already wipes the whole row), no scheduler primitive, no
+  driver, no x86 file.
+- Not yet (U7): cross-process **bandy handle-transfer** between principals (`SYS_XFER` — a
+  cross-ASID write discipline that breaks U6's single-writer invariant) and cross-process
+  **revocation trees** (`CAP_REVOKE` as a right is defined but reserved), plus real `File`/`Socket`
+  fs/net syscalls routing through the U6 kinds. Not yet (M8): an arbitrary program-by-name
+  `sys_spawn`, and a code-signing / allowlist gate on the loader (`SECURITY.md`).
 
 ### x86_64 (branch `hw-rmbp`)
 

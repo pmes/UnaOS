@@ -386,6 +386,22 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
                 cpu,
                 vcpu,
             );
+
+            // U6: the general OBJECT TABLE — the (kind, target, rights) descriptor + first-free allocation for
+            // ALL kinds, killing U5's fixed CONSOLE_FD pin. A gated kernel task on `vcpu` (the u5-launch idiom),
+            // demo core `cpu` as its arg: it waits for the U5 verdict (U5_LAUNCH_DONE), builds a fixture slot,
+            // runs the kernel-side object-table checks (File/Socket kinds resolve; the reserved-index allocator
+            // survives the exact console-vs-child interleaving U5 couldn't), then runs `el0-u6spawn` on `cpu` —
+            // the printing spawner U5 couldn't serve: it prints, spawns 2 children (distinct auto-allocated
+            // handles, off the reserved console index), prints AGAIN (the console cap survived the spawns), and
+            // reaps both by handle. Gated after U5 for the same reason U5 gates after U4 — the 8 slots free as
+            // the prior fixtures exit. Fully QEMU-verifiable (its children load off the SD, like U4).
+            unaos_kernel::arch::sched::spawn(
+                "u6-launch",
+                unaos_kernel::arch::syscall::u6_launcher,
+                cpu,
+                vcpu,
+            );
         }
     }
 
