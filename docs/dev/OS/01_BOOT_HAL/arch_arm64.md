@@ -329,6 +329,61 @@ JM6 code is `tegra`-gated (a new `boot_tegra` module, a tegra arm on the `sched`
 tegra-only `tegra_early_stop` body), so every non-tegra build's cfg set — and thus its output — is
 unchanged.
 
+### JM7 — Orin video: the GOP framebuffer through the tegra tables (⛔ **blocked on firmware: the GOP is BltOnly**)
+
+With a monitor connected at boot, NVIDIA's UEFI publishes a GOP and the bootloader hands its
+framebuffer to the kernel (`BootInfo::framebuffer_*`); `fbcon` — the boot-log mirror every
+`serial_println!` already writes through — has been drawing to it since `kernel_main` step 0 under
+the UEFI map. JM7 makes that survive the kernel's own translation regimes, turning the monitor into
+a live boot console on the Orin:
+
+- **`mmu_tegra::build_l1` step 2b** force-marks the GOP's GiB range into the RAM-GiB mask (the GOP
+  carveout can sit in a Reserved region the RAM scan skips), so both the live EL2 `L1` **and the EL1
+  twin `L1_EL1`** map it — the mirror works before *and after* the JM6b drop. Mapped Normal-WB (a
+  1 GiB block cannot carry a separate attribute without a new MAIR index); CPU-write → scanout
+  coherency rides fbcon's existing damage-tracked `flush_range` → `dc cvac` (the Pi recipe;
+  `arch::flush_framebuffer_range` is unconditional on aarch64). Headless boots (`fb addr=0`): the
+  mask is untouched and fbcon stays inert — behavior identical to JM6b.
+- **`tegra_early_stop`** prints the GOP handoff (`:: tegra: JM7 — GOP fb addr=… size=… WxH stride
+  bpp ::`) and **no longer detaches fbcon** before the drop (contrast JC3/virt, whose EL1 map omits
+  the fb) — the monitor shows the pre-drop dump, the EL1 landing line, and the CAPSTONE run live.
+- **Metal verdict (2026-07-06, monitor on the DP→HDMI cable, capture `serial-orin-jm7.log`): the
+  kernel side is confirmed safe and correct, but NO PIXELS — NVIDIA's UEFI GOP exposes no linear
+  framebuffer.** The bootloader's GOP log shows 5 modes, EDID read fine (the monitor's native
+  1920×1200 was detected and current), but every mode is BltOnly — `usable()` found no Rgb/Bgr
+  mode to set, and the active mode's `frame_buffer()` path correctly reported *"active mode has no
+  linear framebuffer; booting without a display"*. The kernel received
+  `fb addr=0x0 size=0x0 1920x1200 stride=2048 bpp=4` (mode info without a surface), fbcon stayed
+  inert, and the boot ran headless-identical: EL1 landing + CAPSTONE 6/6 again. Conclusion:
+  **video-via-GOP is impossible on this firmware**; real Orin video means driving the Tegra234
+  display engine (nvdisplay) directly — allocate a kernel surface, program scanout, then hand
+  fbcon/`Screen` that address, at which point JM7's mapping + flush machinery is reused unchanged.
+  That is its own major arc. The JM7 code stays: correct, inert when `fb addr=0`, and the landing
+  pad for the nvdisplay arc's surface.
+- Out of scope, documented for the follow-on: interactive console/GUI on Orin (input), and real USB
+  keyboard/mouse — the Orin's built-in ports are **Tegra XUSB** (a platform controller needing
+  firmware/phy bring-up, NOT the PCIe xHCI the kernel already drives); that is its own arc.
+
+### JX1 result — XUSB first light (⛔ **the block is EL3-fatal to touch post-EBS; BPMP ungate required first**)
+
+The one-boot probe (a guarded read of the xHCI capability block @ `0x0361_0000`, the Linux DT
+`usb@3610000` base) answered the keyboard/mouse arc's gating question decisively, in the negative:
+after `ExitBootServices`, the **first read fired an SError — ESR `0xbe000011` (EC=0x2F SError,
+ISS=0x11) — fatal to EL3**: NVIDIA's BL31 printed "Unhandled Exception in EL3" and a crash dump
+(capture `serial-orin-jx1.log`; the boot had run cleanly through JM3/JM4/heap first). UEFI tears
+its USB stack down at handoff and the XUSB partition is clock-gated/powered off; a gated Tegra
+block is a **CBB-fabric abort**, not an open-bus read — the same wall class as JM5's `CPU_ON` RAS
+fault, and it means no guarded-read pattern can probe gated blocks safely. The probe was removed
+after one boot (it would kill every boot); the result comment stays at the call site.
+
+**Implication for the USB arc (the Opus brief):** bring up the **tegra-bpmp IVC channel first**
+(HSP doorbell + shared-memory ring to the BPMP), then `MRQ_CLK`/`MRQ_RESET` to enable + de-reset
+the XUSB host partition (and the padctl), THEN re-probe `0x0361_0000` — only after that does the
+"platform-attach the existing xHCI stack" plan (and the XUSB-firmware-load question) become
+testable. Linux's `xhci-tegra` follows exactly this order. The BPMP shared-memory/doorbell bases
+and MRQ ABI are in the L4T sources (`tegra-bpmp` bindings); budget one arc for the IVC channel +
+clock/reset MRQs alone.
+
 ## 4. Jetson Orin Nano headless bring-up (Arc JM2)
 
 The Orin is brought up **headless over serial**. The only console that has ever

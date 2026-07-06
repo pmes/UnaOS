@@ -243,6 +243,26 @@ unsafe fn build_l1(boot_info: &BootInfo, el: u64) -> u64 {
         }
     }
 
+    // 2b. JM7 (video): the UEFI GOP framebuffer, when the firmware published one (monitor connected
+    //     at boot; `framebuffer_addr == 0` on a headless boot — nothing changes there). The GOP
+    //     carveout can sit in a Reserved region the RAM scan skipped, and fbcon keeps mirroring
+    //     serial output onto it long after this switch — so its GiBs MUST be in the map (both
+    //     tables — the EL1 twin is filled from this same mask) or the first post-switch mirror
+    //     faults into the Part-C vector. Mapped Normal-WB like RAM (a 1 GiB block cannot carry a
+    //     separate attribute without a new MAIR index); CPU-write → scanout coherency is fbcon's
+    //     existing damage-tracked `flush_range` → `dc cvac` (the Pi-proven recipe), valid on WB.
+    if boot_info.framebuffer_addr != 0 && boot_info.framebuffer_size != 0 {
+        let fb_lo = boot_info.framebuffer_addr >> 30;
+        let fb_hi = (boot_info.framebuffer_addr + boot_info.framebuffer_size as u64 - 1) >> 30;
+        let mut g = fb_lo;
+        while g <= fb_hi {
+            if g >= 1 && g < 64 {
+                ram_gib_mask |= 1u64 << g;
+            }
+            g += 1;
+        }
+    }
+
     // 3. Write all 512 L1 entries. L1[0] = Device (never overwritten by a RAM GiB); GiB 1
     //    (0x4000_0000, more Tegra peripherals) stays unmapped unless a firmware RAM region genuinely
     //    claimed it (the mask decides — we never blanket-map it Normal).
