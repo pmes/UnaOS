@@ -885,6 +885,41 @@ fn tegra_early_stop(boot_info: &'static mut BootInfo) -> ! {
         boot_info.framebuffer_info.stride,
         boot_info.framebuffer_info.bytes_per_pixel,
     );
+    // JB1a: print the BPMP IPC geometry (shmem TX/RX, HSP mboxes, reserved-memory carveouts) from
+    // the firmware DTB — a read-only RAM walk, no MMIO (the JX1 lesson: gated Tegra blocks are
+    // EL3-fatal to touch, so the geometry gets VERIFIED off the firmware's own tree before the
+    // JB1 IVC arc maps or touches anything).
+    unaos_kernel::arch::fdt_tegra::jb1a_dump(
+        boot_info.dtb_addr,
+        boot_info.dtb_size,
+        mmu.ram_gib_mask,
+    );
+    // JB1b: establish the BPMP IVC command channel and prove it with one MRQ_PING — the transport
+    // every partition-ungate MRQ (XUSB, nvdisplay) rides on. Geometry is resolved from the same
+    // DTB (never hardcoded); a missing/odd DTB shape prints and skips. Pre-drop, EL2, polled;
+    // every new MMIO class prints before the first touch (the JX1 EL3-fatal discipline).
+    match unaos_kernel::arch::fdt_tegra::bpmp_geometry(
+        boot_info.dtb_addr,
+        boot_info.dtb_size,
+        mmu.ram_gib_mask,
+    ) {
+        Some(geom) => {
+            // JB1c: with the channel proven by the ping, ungate the XUSB host partition (power
+            // domains -> clocks -> reset deassert, all ids read off the DTB's usb@3610000 node)
+            // and re-probe the xHCI capability block that was EL3-fatal in JX1.
+            if let Some(chan) = unaos_kernel::arch::bpmp_tegra::jb1b_ping(&geom) {
+                match unaos_kernel::arch::fdt_tegra::xusb_ids(
+                    boot_info.dtb_addr,
+                    boot_info.dtb_size,
+                    mmu.ram_gib_mask,
+                ) {
+                    Some(ids) => unaos_kernel::arch::bpmp_tegra::jb1c_ungate_xusb(&chan, &ids),
+                    None => serial_println!(":: tegra: JB1c — no usb@3610000 ids in DTB; SKIP ::"),
+                }
+            }
+        }
+        None => serial_println!(":: tegra: JB1b — geometry unresolved from DTB; SKIP ::"),
+    }
 
     // 2. Boot banner: the same EL / CNTFRQ / MMU / DAIF snapshot `arch::boot_diagnostics` prints, read
     // straight from system registers (zero MMIO — cannot fault). Now the first REAL EL/CNTFRQ values

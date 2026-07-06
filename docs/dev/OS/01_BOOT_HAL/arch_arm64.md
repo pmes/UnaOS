@@ -384,6 +384,45 @@ testable. Linux's `xhci-tegra` follows exactly this order. The BPMP shared-memor
 and MRQ ABI are in the L4T sources (`tegra-bpmp` bindings); budget one arc for the IVC channel +
 clock/reset MRQs alone.
 
+### JB1 result — the BPMP channel + XUSB ungate (✅ **METAL-CONFIRMED**), and the EC=0 phantom (open)
+
+**Landed and metal-proven (2026-07-06, captures in `serial-orin-jx1.log`):**
+- **JB1a**: the firmware DTB (BootInfo::dtb_addr) parsed on silicon by the hand-rolled bounded FDT
+  walker (`fdt_tegra.rs`; the root node's EMPTY name cost one boot — path matchers must not emit
+  a leading double slash). Geometry: `/bpmp mboxes[hsp, DB, master 19]`, shmem TX `0x4007_0000` /
+  RX `0x4007_1000` (SYSRAM `sram@40000000` children), HSP @ `0x03c0_0000`.
+- **JB1b**: the IVC command channel (`bpmp_tegra.rs`): HSP doorbell derived on-board from
+  HSP_INT_DIMENSIONING (`dim=0x8a228` → db_base `0x3c90000`, BPMP doorbell index 3), queue index
+  3, stride 256; the SYNC→ACK→ESTABLISHED handshake (first metal run found the peer already in
+  SYNC and exposed a missing final arm — the acked→peer-ESTABLISHED transition — fixed);
+  **`MRQ_PING err=0 reply=0xab5466 (want 0xab5466) → PASS`, twice** — the first UnaOS↔BPMP
+  exchange on silicon.
+- **JB1c**: XUSB host partition ungated over that channel — ids read off the DTB's `usb@3610000`
+  node (8 clocks, 2 power domains; NOTE: the firmware DTB exposes **no `resets` prop** on that
+  node — JB2 must check the padctl node and Linux's reset ordering); `MRQ_PG` ON (domains 12, 10)
+  and `MRQ_CLK` enable (267, 269, 268, 275, 14, 272, 103, 14) all `err=0`; then the exact read
+  that was **EL3-fatal in JX1** returned: **xHCI v1.20, CAPLENGTH 0x20, HCSPARAMS1 0x08000524
+  (8 ports), USBCMD 0, USBSTS 0x11 (halted-but-decoding) → PASS.** The JB2 keyboard arc starts
+  from a live controller.
+- **Bootloader I-cache fix** (`bootloader/main.rs`): the loader previously jumped into a freshly
+  written+relocated image with NO cache maintenance — stale I-cache lines of the previous build's
+  code at the recycled load base are a real ARMv8 hazard (invisible in QEMU). Now: `dc cvau` the
+  image to PoU, `dsb ish; ic iallu; dsb ish; isb`. Correct regardless of the phantom below.
+
+**OPEN — the EC=0 phantom (the arc's one unresolved thread; instrumented, documented, parked):**
+three occurrences of a fault with **ESR exactly `0x2000000` (EC=0x00 "unknown reason", IL=1,
+ISS=0), FAR=0**, at INNOCENT instructions (a stack `str` before a `bl`; an epilogue
+`ldp x29,x30,[sp],#0x60`), at BOTH ELs (twice at EL2 in the JB1b window on one specific binary,
+deterministic for that binary; once at EL1 mid-CAPSTONE task-teardown on the JB1c boot — which
+otherwise passed all JB1c lines first). Survived the I-cache fix. The Part-C vectors now print
+the ENTRY INDEX + SPSR (an async entry printing stale ESR would masquerade as sync — the EL1 hit
+came through exceptions.rs which attributes SYNCHRONOUS natively). Candidate directions for the
+follow-on: full GPR/SPSR dump at the fault; A/B the JB1c ungate vs CAPSTONE (the EL1 hit was the
+first boot combining both — though the EL2 hits predate any ungate); `timer::LIVE=true` steering
+sched down metal-only paths at EL1; a CBB/implementation-defined report masquerading as EC=0.
+Every occurrence is deterministic per binary+flow, so one instrumented boot per hypothesis
+decides. The JB1 deliverables above all completed BEFORE the EL1 hit and stand independently.
+
 ## 4. Jetson Orin Nano headless bring-up (Arc JM2)
 
 The Orin is brought up **headless over serial**. The only console that has ever

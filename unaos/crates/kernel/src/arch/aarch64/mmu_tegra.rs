@@ -295,6 +295,15 @@ unsafe fn fill_table(l1: *mut u64, ram_gib_mask: u64, el: u64) {
             };
             l1.add(i).write_volatile(desc);
         }
+        // JB1: GiB 1 (0x4000_0000) carries the SYSRAM the BPMP IVC shmem lives in (TX 0x4007_0000 /
+        // RX 0x4007_1000, read off the firmware DTB on silicon) plus further Tegra peripherals — map
+        // it Device-nGnRE like GiB 0 unless the firmware genuinely declared RAM there. Device
+        // memory is non-speculative, so this only reduces the stray-touch protection for EXPLICIT
+        // accesses — and the JX1 lesson stands regardless: a gated block faults at EL3, mapped or
+        // not, so the map was never the real guard.
+        if (ram_gib_mask >> 1) & 1 == 0 {
+            l1.add(1).write_volatile(device_block(1 << 30, el));
+        }
     }
 }
 
@@ -429,32 +438,44 @@ unsafe extern "C" {
 core::arch::global_asm!(
     r#"
     .section .text
-    // EL2 vector table: 16 entries at 0x80 spacing, 2 KiB-aligned for VBAR_EL2.
+    // EL2 vector table: 16 entries at 0x80 spacing, 2 KiB-aligned for VBAR_EL2. Each entry
+    // loads its own INDEX (JB1b lesson: an async entry — IRQ 5 / FIQ 6 — does NOT write ESR, so
+    // a funnel that prints a stale ESR looks exactly like an impossible synchronous fault; the
+    // index disambiguates). Index map (SP0: 0-3, SPx: 4-7, lower-EL A64: 8-11, A32: 12-15;
+    // within each block: sync, irq, fiq, serror).
     .balign 0x800
     .globl tegra_vectors_el2
 tegra_vectors_el2:
+    .set idx2, 0
     .rept 16
     .balign 0x80
+    mov x3, #idx2
     b   tegra_fault_common_el2
+    .set idx2, idx2+1
     .endr
 tegra_fault_common_el2:
     mrs x0, ESR_EL2
     mrs x1, FAR_EL2
     mrs x2, ELR_EL2
+    mrs x4, SPSR_EL2
     b   tegra_fault_handler
 
     // EL1 fallback vector table (same shape; reads the EL1 syndrome registers).
     .balign 0x800
     .globl tegra_vectors_el1
 tegra_vectors_el1:
+    .set idx1, 0
     .rept 16
     .balign 0x80
+    mov x3, #idx1
     b   tegra_fault_common_el1
+    .set idx1, idx1+1
     .endr
 tegra_fault_common_el1:
     mrs x0, ESR_EL1
     mrs x1, FAR_EL1
     mrs x2, ELR_EL1
+    mrs x4, SPSR_EL1
     b   tegra_fault_handler
 "#
 );
@@ -466,12 +487,23 @@ tegra_fault_common_el1:
 /// would spin on the lock — an accepted risk for a diagnostic of last resort; the common case, a wrong
 /// device/RAM mapping caught at the first access, prints cleanly.)
 #[unsafe(no_mangle)]
-extern "C" fn tegra_fault_handler(esr: u64, far: u64, elr: u64) -> ! {
+extern "C" fn tegra_fault_handler(esr: u64, far: u64, elr: u64, idx: u64, spsr: u64) -> ! {
+    // idx names the vector entry (blocks of 4 — SP0 / SPx / lower-A64 / lower-A32; within each:
+    // 0 sync, 1 irq, 2 fiq, 3 serror). ESR is only meaningful for sync/serror entries.
+    let kind = match idx & 3 {
+        0 => "sync",
+        1 => "IRQ",
+        2 => "FIQ",
+        _ => "SError",
+    };
     serial_println!(
-        ":: tegra: FAULT — ESR_EL2={:#x} FAR_EL2={:#x} ELR_EL2={:#x} ::",
+        ":: tegra: FAULT — entry {} ({}) ESR={:#x} FAR={:#x} ELR={:#x} SPSR={:#x} ::",
+        idx,
+        kind,
         esr,
         far,
-        elr
+        elr,
+        spsr,
     );
     loop {
         core::hint::spin_loop();
