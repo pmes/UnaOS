@@ -549,20 +549,9 @@ pub fn a78ae_errata_probe() {
         core::arch::asm!("mrs {}, S3_0_C15_C1_4", out(reg) ecx, options(nomem, nostack, preserves_flags));
     }
     serial_println!(":: tegra: JB1d — CPUECTLR_EL1={:#x} (erratum-1941500 bit8={}) ::", ecx, (ecx >> 8) & 1);
-    if (ecx >> 8) & 1 == 0 {
-        serial_println!(":: tegra: JB1d — bit8 CLEAR: applying the 1941500 workaround (set) ::");
-        unsafe {
-            core::arch::asm!(
-                "msr S3_0_C15_C1_4, {}",
-                "isb",
-                in(reg) ecx | (1 << 8),
-                options(nostack, preserves_flags)
-            );
-        }
-        let rb: u64;
-        unsafe {
-            core::arch::asm!("mrs {}, S3_0_C15_C1_4", out(reg) rb, options(nomem, nostack, preserves_flags));
-        }
-        serial_println!(":: tegra: JB1d — CPUECTLR_EL1 readback={:#x} ::", rb);
-    }
+    // METAL VERDICT (2026-07-06): the WRITE is EL3-gated — `msr S3_0_C15_C1_4` from EL2 traps to
+    // an UNHANDLED EL3 exception (BL31 crash dump, box reboots; two attended boots confirmed).
+    // The bit CANNOT be applied OS-side on this firmware; only an NVIDIA BL31/UEFI update can.
+    // Report-only here; the OS-side mitigation is the JB1e heal (exceptions.rs: ic iallu + retry
+    // on the proven-stale EC=0 signature).
 }
