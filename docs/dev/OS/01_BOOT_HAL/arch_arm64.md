@@ -680,7 +680,9 @@ the same BPMP transport JB1 proved. CSR fields: bit[31]=ENABLE, bits[23:16]=DUTY
    UEFI teardown confirm PWM gets clock+reset only, never a powergate). So — unlike XUSB — the CSR
    aperture is **not** a gated block: **no new EL3-fatal class** (the XUSB trap was touching a
    *power-gated* block; PWM has no power domain).
-4. `w32(0x032A0000, 0x81FF0000)` → ENABLE + ~100 % duty → fan full-on. (UEFI's own "medium" is
+4. `w32(0x032A0000, 0x81000000)` → ENABLE + 100 % duty → fan full-on (100%-duty count 256=0x100
+   overflows the nominal 8-bit field into bit24; this is the exact value mainline emits — see the
+   JB0 landed note). (UEFI's own "medium" is
    `0x80800000`; the DT `cooling-levels` top = 255 = 0xFF for full.)
 5. Pinmux is normally already applied by MB1/UEFI on the devkit — only touch `pinmux@2430000` if the
    fan stays silent after 1–4 (MEDIUM confidence).
