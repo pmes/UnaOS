@@ -526,6 +526,15 @@ pub unsafe fn teardown_user_slot(asid: u64) {
             options(nostack, preserves_flags),
         );
     }
+    // U5 teardown-clear (folds U4's one deferred lifecycle note): wipe this ASID's per-process handle row so a
+    // future slot-reuse always starts from an empty capability table. Ordering is load-bearing — clear the row
+    // BEFORE releasing the used-flag below, NOT after: once `SLOT_USED` goes false another core's
+    // `alloc_user_slot` may claim this same slot (same ASID) and begin populating its row, so a clear placed
+    // after the release could wipe the NEW owner's capabilities. The clear lives in `syscall` (which owns the
+    // table); both modules are `#[cfg(feature = "baremetal")]`, so the call is always available here. The dead
+    // ASID is already off this core's live TTBR0 (repointed above), and no task runs under it (the owner is
+    // exiting), so nothing observes a torn intermediate state.
+    super::syscall::clear_handle_row(asid);
     SLOT_USED[(asid - 1) as usize].store(false, Ordering::Release);
 }
 

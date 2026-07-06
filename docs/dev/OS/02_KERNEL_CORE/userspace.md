@@ -205,8 +205,51 @@
   child disk-loads ride the same EMMC2 path M7 already metal-confirmed. This is the exact
   substrate U5 turns into capabilities (a child handle IS a capability to that process;
   grant = transfer the handle, revoke = clear it — U5 adds the *check* at this handle lookup).
-- Not yet: an arbitrary program-by-name `sys_spawn` (M8) and a code-signing / allowlist
-  gate on the loader (`SECURITY.md`).
+- **U5** — handles as **capabilities**: the enforcement CHECK + grant/attenuate/revoke +
+  routed `sys_write` + teardown-clear (roadmap-U5). Turns U4's handle STRUCTURE into a
+  checked capability. A handle now carries **rights** — a bitmask `CAP_READ`(0x1)/`CAP_WRITE`
+  (0x2)/`CAP_EXEC`(0x4)/`CAP_GRANT`(0x8)/`CAP_REVOKE`(0x10) — held in a **sidecar**
+  `HANDLE_RIGHTS[[AtomicU32; 8]; USER_SLOTS+1]` keyed identically to `HANDLES`, so U4's value-
+  word sentinels (`0` = Empty, `u64::MAX` = RESERVING) are byte-unperturbed — and names a
+  **target** beyond "child pid": a well-known `HANDLE_CONSOLE = u64::MAX-1` token (two kinds
+  only, `CHILD(pid)` and `CONSOLE`; a general object table is U6). The CHECK is one
+  `handle_resolve(asid, idx, req_rights)` at the single lookup point every handle-consuming
+  path uses: out-of-range/Empty ⇒ the caller's own errno (`sys_wait` → `-ECHILD`, preserving
+  U4 structural ownership; `sys_write`/`SYS_CAP` → `-EACCES`), present-but-missing-a-right ⇒
+  `-EACCES`. **`SYS_CAP = 10`** (sub-op in `x0`: `GRANT=0`/`REVOKE=1`) adds the first-class
+  ops: **GRANT**(src_idx, req_rights) mints a new handle to the same target carrying a rights
+  mask that must be a **subset** of the granter's rights on the source — the **attenuation
+  (monotonic-decrease) invariant**, `req & !src_rights != 0` ⇒ `-EACCES` (a grant can never
+  amplify), requiring `CAP_GRANT` on the source; **REVOKE**(idx) drops a handle the caller
+  owns (ownership-based — a process may always drop its own caps; subsequent use ⇒ `-EACCES`/
+  `-ECHILD`). **`sys_write` routes through the table**: `fd` is a handle index that must
+  resolve to a `CONSOLE` handle with `CAP_WRITE` — there is no ambient stdout. Every printing
+  EL0 process is **endowed** a `CONSOLE`+`CAP_WRITE` cap at the conventional index
+  `CONSOLE_FD = 1` at spawn/launch (`install_console_cap`: the shared window ASID 0 for
+  `el0-hello`; each M6f/M6g/U4-child slot); the `copy_from_user` validation + all-or-nothing
+  `-EFAULT` path is byte-identical, so the M6f hostile fixture (which holds the cap) still gets
+  `-EFAULT`, not `-EACCES`. **Teardown-clear** folds U4's one deferred lifecycle note:
+  `boot::teardown_user_slot` wipes the whole `HANDLES[asid]` row + its rights **before**
+  releasing the slot's used-flag (not after — a post-release clear could race a concurrent
+  `alloc_user_slot` on another core that reclaims the same ASID), so no capability outlives its
+  owning ASID; the clear lives behind `syscall::clear_handle_row(asid)` (both modules are
+  `#[cfg(feature = "baremetal")]`). QEMU-verified (`./arroyo kernel8-test 8`, after the U4
+  PASS): the U5 setup line, `u5: cap write` **twice** (the write-cap write + the write through
+  the minted attenuated cap), and `:: U5: capabilities — write-cap OK, no-cap -EACCES,
+  attenuated grant bounded, revoke enforced, teardown-clear clean -> PASS ::`. The `el0-u5cap`
+  fixture proves the four EL0-observable behaviours against its own table (write-cap OK; a
+  write-less cap → `-EACCES`; a grant exceeding the granter rejected while a subset grant works
+  and its handle writes; a revoked handle → `-EACCES`) via a witness bitmask (`0xF`); the
+  launcher proves the fifth kernel-side (the fixture's handle row is clear after its slot
+  teardown). Every M6b/M6d/M6e/M6f/M6g/U4 line byte-identical (only the four U5 lines added;
+  all four prior `hello from EL0`, the M6f `EFAULT` PASS, U4 PASS, CAPSTONE 6/6) and 0
+  unexpected faults. No metal this arc (pure syscall logic; the child loads ride U4/M7's
+  metal-confirmed EMMC2 path). Lane: `arch/aarch64/syscall.rs` + the `boot.rs` row-clear + a
+  `main.rs` launcher — no scheduler primitive, no driver, no x86 file.
+- Not yet (U6): bandy handle-transfer between principals, a general object table (routing
+  fs/net syscalls through handles), and cross-process revocation trees (`CAP_REVOKE` as a
+  right is defined but reserved). Not yet (M8): an arbitrary program-by-name `sys_spawn`, and
+  a code-signing / allowlist gate on the loader (`SECURITY.md`).
 
 ### x86_64 (branch `hw-rmbp`)
 

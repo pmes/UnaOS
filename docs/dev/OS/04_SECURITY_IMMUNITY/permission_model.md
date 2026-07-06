@@ -14,3 +14,33 @@ We do not ask for permissions at install time (when users blindly click "Yes"). 
 For apps that demand invasive permissions (like social media apps wanting your contacts):
 * **Data Mocking:** The user can choose to feed "Mock Data" to the app.
 * **The Result:** The app thinks it uploaded your contacts, but it actually uploaded a generated list of fake names ("John Doe," "Jane Smith"). The app functions, but your privacy remains intact.
+
+## 4. Kernel Mechanism: Handles as Capabilities (implementation status)
+The "specific file handle, never the whole folder" model of §2 is not just a UI convention — it
+is the kernel's enforcement mechanism. A **handle** is an unforgeable, per-process reference that
+carries **rights** and is **checked at the point of use**. The chain lands incrementally on the
+aarch64 (Pi 4) track and ports to x86/Jetson after:
+
+* **U4 (landed)** — the *structure*: a per-process handle table, keyed by address-space id (ASID).
+  A child process is named by a handle into the spawner's table, so ownership is structural — a
+  process can only act on handles in its own table.
+* **U5 (landed, 2026-07-05)** — the *check*. A handle now carries a **rights bitmask**
+  (`read`/`write`/`exec`/`grant`/`revoke`) and names a **target** (a child process, or a resource
+  such as the console). Every resource syscall resolves its handle through one enforcement point
+  that requires the needed right, else `-EACCES`. This makes the three capability operations real:
+  * **Grant / attenuate** — a process holding `grant` on a handle can mint a *new* handle to the
+    same resource for another table, but only with a **subset** of its own rights. A grant can
+    **never amplify** rights (the monotonic-decrease invariant). This is exactly the "pass only
+    that file handle, read-only" story, enforced.
+  * **Revoke** — a process can drop a handle it owns; any later use fails.
+  * **Bounded lifetime** — a process's whole handle table is cleared when its address space is torn
+    down, so no capability outlives the process that held it.
+  As the first routed resource, `write` to the console is now a capability (`CONSOLE` + `write`),
+  granted to a process at launch — there is no ambient "stdout everyone can write".
+* **U6 (next)** — capability *transfer between principals* over the bandy message bus, a general
+  object table (routing filesystem/network syscalls through handles the way the console now is),
+  and cross-process revocation. This is where the UnaFS `owner`/`grants:*` attributes of the
+  model above become the persistent form of these live kernel handles.
+
+See `docs/SECURITY.md` (the hardening ledger) and `docs/dev/OS/02_KERNEL_CORE/userspace.md`
+(the syscall-level detail) for the exact mechanism and evidence.

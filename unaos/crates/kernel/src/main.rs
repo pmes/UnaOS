@@ -368,6 +368,23 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
                 cpu,
                 vcpu,
             );
+
+            // U5: handles as CAPABILITIES — the enforcement layer on top of U4's handle STRUCTURE. A gated
+            // kernel task on `vcpu` (the u4-launch idiom), demo core `cpu` as its arg: it waits for the U4
+            // verdict (U4_LAUNCH_DONE), builds + pre-endows a single fixture slot, and runs `el0-u5cap` on
+            // `cpu`. That fixture proves, against its own per-process table, the four EL0-observable
+            // capability semantics — a console cap writes; a write-LESS cap gets -EACCES; a grant cannot
+            // exceed the granter's rights (attenuation) while a subset grant works; a revoked handle is
+            // -EACCES — and the launcher then proves the fifth kernel-side: the fixture's handle row is
+            // cleared on slot teardown (no stale capability outlives its ASID). Fully QEMU-verifiable (pure
+            // syscall logic; no disk). Gated after U4 for the same reason U4 gates after M6g — the 8 slots
+            // free as the prior fixtures exit.
+            unaos_kernel::arch::sched::spawn(
+                "u5-launch",
+                unaos_kernel::arch::syscall::u5_launcher,
+                cpu,
+                vcpu,
+            );
         }
     }
 

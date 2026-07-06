@@ -92,6 +92,50 @@ Legend: **✅ metal-confirmed** · **🔬 QEMU-green, metal pending** · dates I
 
 ## hw-pi4 track — 2026-07-04 (landed on `hw-pi4`, awaiting integration)
 
+### U5 — handles as capabilities: the enforcement CHECK + grant/attenuate/revoke + routed `sys_write` + teardown-clear (aarch64) ✅ `hw-pi4`
+- **What:** turns U4's handle STRUCTURE into a real **capability**. A handle now carries
+  **rights** — a bitmask `CAP_READ|CAP_WRITE|CAP_EXEC|CAP_GRANT|CAP_REVOKE` in a **sidecar**
+  `HANDLE_RIGHTS[[AtomicU32; 8]; USER_SLOTS+1]` keyed identically to `HANDLES`, so U4's
+  `0`/`RESERVING` value-word sentinel logic stays byte-unperturbed — and names a **target**
+  beyond "child pid" (a well-known `HANDLE_CONSOLE = u64::MAX-1` token; two kinds only,
+  `CHILD(pid)` and `CONSOLE`, not a general object table — that is U6). The **CHECK** is a
+  single `handle_resolve(asid, idx, req_rights)` at the one lookup point every handle-consuming
+  path goes through: out-of-range/Empty ⇒ the caller's own errno (`sys_wait` → `-ECHILD`, U4's
+  structural ownership preserved; `sys_write`/`SYS_CAP` → `-EACCES`), missing-a-right ⇒
+  `-EACCES`. **`SYS_CAP` (10)** adds grant/attenuate/revoke: GRANT mints a new handle to the
+  same target carrying a rights mask that must be a **subset** of the granter's rights on the
+  source — the **attenuation (monotonic-decrease) invariant**, `req & !src_rights != 0` ⇒
+  `-EACCES` (a grant can never amplify), requiring `CAP_GRANT` on the source; REVOKE drops a
+  handle the caller owns (subsequent use ⇒ `-EACCES`/`-ECHILD`). **`sys_write` routes through
+  the table** — `fd` is a handle index that must resolve to a `CONSOLE` handle with
+  `CAP_WRITE`; no ambient stdout. Every printing EL0 process is **endowed** a `CONSOLE`+
+  `CAP_WRITE` cap at `CONSOLE_FD = 1` at spawn/launch (shared window ASID 0 for `el0-hello`;
+  each M6f/M6g/U4-child slot), and the `copy_from_user`/all-or-nothing `-EFAULT` path is
+  byte-identical (the M6f hostile fixture holds the cap, so its bad-pointer writes still
+  `-EFAULT`, not `-EACCES`). **Teardown-clear** folds U4's one deferred note:
+  `boot::teardown_user_slot` wipes the whole `HANDLES[asid]` row + rights **before** releasing
+  the slot's used-flag (not after — a post-release clear could race a concurrent
+  `alloc_user_slot` on another core reclaiming the ASID), so no capability outlives its ASID.
+  Lane: `arch/aarch64/syscall.rs` + a `boot.rs` row-clear (in `teardown_user_slot`) + a
+  `main.rs` launcher; no scheduler primitive, no driver, no x86 file.
+- **Tested — QEMU:** `./arroyo kernel8-test 8` → after the U4 PASS line: the U5 setup line,
+  `u5: cap write` **twice** (the write-cap write + the write through the minted attenuated
+  cap), and `:: U5: capabilities — write-cap OK, no-cap -EACCES, attenuated grant bounded,
+  revoke enforced, teardown-clear clean -> PASS ::`. The `el0-u5cap` fixture proves four
+  EL0-observable behaviours against its own table (write-cap OK; a write-less cap → `-EACCES`;
+  a grant exceeding the granter's rights rejected while a subset grant works and its handle
+  writes; a revoked handle → `-EACCES`) via a witness bitmask (`0xF`), and the launcher proves
+  the fifth kernel-side (the fixture's handle row is clear after its slot teardown). Every
+  M6b/M6d/M6e/M6f/M6g/U4 line byte-identical (hex/pid-normalized set-diff: only the four new U5
+  lines added; all four prior `hello from EL0` land, the M6f `4 hostile … EFAULT` PASS holds,
+  U4 PASS holds, CAPSTONE 6/6) and 0 unexpected faults. `check` both arches; x86 `test` MISSION
+  SUCCESS; aarch64 virt v2 MISSION SUCCESS + GICv3 JC3 SMP 3/3 + CAPSTONE 6/6 unchanged.
+- **Tested — metal:** none this arc — U5 is fully QEMU-verifiable (the checks/grants/revokes
+  are pure syscall logic; the reap wake is a scheduler post; the child disk-loads ride
+  U4/M7's already-metal-confirmed EMMC2 path). A future reflash would re-exercise the endowed
+  prints off the real card, but nothing in U5 is metal-*gated*.
+- **Commit:** this arc on `hw-pi4` (merge pending the integrator, who records the merge hash).
+
 ### U4 — the process model + per-process handle table (aarch64) ✅ `hw-pi4`
 - **What:** the ownership half of the process model — `sys_spawn` now returns a **handle**
   into the *caller's* per-process handle table (not a raw pid) and `sys_wait` takes that
