@@ -409,7 +409,24 @@ clock/reset MRQs alone.
   code at the recycled load base are a real ARMv8 hazard (invisible in QEMU). Now: `dc cvau` the
   image to PoU, `dsb ish; ic iallu; dsb ish; isb`. Correct regardless of the phantom below.
 
-**OPEN — the EC=0 phantom (the arc's one unresolved thread; instrumented, documented, parked):**
+**✅ RESOLVED — the EC=0 phantom = Cortex-A78AE erratum 1941500, unmitigated in NVIDIA's firmware
+(root-caused + healed 2026-07-06, same session).** The chain, each link metal-verified: (1) the
+EC0-probe printed the D-side word at the faulting ELR = the valid encoding (`0xa9454ff4`) while
+the I-side raised UNDEFINED — a proven I/D divergence (CTR_EL0: DIC=0, IDC=1); (2) MIDR
+`0x410fd421` = **A78AE r0p1**, inside erratum 1941500's affected range (≤ r0p1); (3)
+CPUECTLR_EL1 reads `0xa000000b40543000` — **the documented workaround bit [8] is CLEAR** (TF-A's
+A78AE workaround was historically inverted — `bic` for `orr` — and NVIDIA's BL31 is TF-A
+lineage); (4) the bit is **EL3-gated**: an EL2 `msr` traps to an unhandled EL3 exception (BL31
+crash dump; the JB1d write was disarmed to report-only after two boot-loop boots). Only an NVIDIA
+firmware update can set the bit. **The OS-side mitigation (JB1e, `exceptions.rs`)**: on a sync
+EC=0 whose D-side word reads back valid, `ic iallu; dsb ish; isb` and RETRY the instruction —
+`__vec_sync` gained SAVE_FP/RESTORE_FP + an eret path (the requirement the frame-macro comment
+always documented), bounded at 64 heals/boot, one counted serial line per heal, all other faults
+print-and-halt unchanged. Verification boot: the full chain (ping PASS, XUSB ALIVE, EL1 landing,
+CAPSTONE 6/6) ran clean. The JB1d evidence line (r0p1 + bit8=0) prints every boot as the standing
+record for the NVIDIA upstream report.
+
+*(Historical dossier, superseded by the above:)*
 three occurrences of a fault with **ESR exactly `0x2000000` (EC=0x00 "unknown reason", IL=1,
 ISS=0), FAR=0**, at INNOCENT instructions (a stack `str` before a `bl`; an epilogue
 `ldp x29,x30,[sp],#0x60`), at BOTH ELs (twice at EL2 in the JB1b window on one specific binary,

@@ -305,9 +305,20 @@ __vec_irq:
     .globl __vec_sync
 __vec_sync:
     SAVE_GPRS
+    SAVE_FP
     mov x0, #0
     bl aarch64_fault_handler
-    b .
+    // JB1e (the A78AE erratum-1941500 heal): the handler returns 1 to RETRY the faulting
+    // instruction after I-side invalidation (EC=0 with a valid D-side word = the proven stale
+    // macro-op/I-side divergence; the chicken bit is EL3-gated on this firmware, so retry is the
+    // only OS-side mitigation). ELR/SPSR are still banked from entry — the handler takes no
+    // nested exception and never unmasks — so a bare eret resumes exactly at the faulting PC.
+    // FP is saved/restored because the handler's Rust may clobber SIMD regs (+neon fmt).
+    cbz x0, 1f
+    RESTORE_FP
+    RESTORE_GPRS
+    eret
+1:  b .
     .globl __vec_fiq
 __vec_fiq:
     SAVE_GPRS
@@ -405,11 +416,23 @@ extern "C" fn aarch64_irq_handler() {
     super::gic::handle_irq();
 }
 
+/// JB1e: heals applied to the A78AE erratum-1941500 phantom this boot (bounded so a genuinely
+/// broken instruction stream cannot retry forever).
+static EC0_HEALS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+const EC0_HEAL_CAP: u32 = 64;
+
 /// Fatal-exception logger (called from the sync/fiq/serror stubs; `kind`: 0=sync, 2=fiq, 3=serror).
 /// Reads the syndrome/return/fault-address registers for the EL we booted at, prints them, and
 /// halts — the ARM analogue of the x86 page-fault/GPF/double-fault handlers.
+///
+/// JB1e exception: an EC=0x00 "unknown reason" sync fault whose D-side instruction word reads back
+/// valid is the PROVEN A78AE erratum-1941500 signature (stale I-side state; MIDR r0p1 is in the
+/// affected range, the CPUECTLR_EL1[8] workaround bit ships CLEAR in NVIDIA's firmware, and the
+/// bit is EL3-gated — a lower-EL write traps fatally — so an I-side invalidate + RETRY is the only
+/// OS-side mitigation). Returns 1 to make __vec_sync restore the frame and eret back to the
+/// faulting PC; every heal prints one counted line. All other faults print and halt as before.
 #[unsafe(no_mangle)]
-extern "C" fn aarch64_fault_handler(kind: u64) -> ! {
+extern "C" fn aarch64_fault_handler(kind: u64) -> u64 {
     let (esr, elr, far): (u64, u64, u64);
     unsafe {
         if BOOT_EL.load(Ordering::Relaxed) == 2 {
@@ -420,6 +443,32 @@ extern "C" fn aarch64_fault_handler(kind: u64) -> ! {
             core::arch::asm!("mrs {}, ESR_EL1", out(reg) esr, options(nomem, nostack, preserves_flags));
             core::arch::asm!("mrs {}, ELR_EL1", out(reg) elr, options(nomem, nostack, preserves_flags));
             core::arch::asm!("mrs {}, FAR_EL1", out(reg) far, options(nomem, nostack, preserves_flags));
+        }
+    }
+    // JB1e: the erratum heal, tried BEFORE the fatal print. Conditions: a sync entry, EC=0, an
+    // ELR in the identity-mapped kernel range, a VALID-looking D-side instruction word (nonzero,
+    // not all-ones — a real UNDEF encoding would halt below on the next retry anyway), and heal
+    // budget left. `ic iallu` refreshes the I-side (macro-op cache included) for this core.
+    if kind == 0 && (esr >> 26) & 0x3F == 0 && (0x8000_0000..0x40_0000_0000).contains(&elr) {
+        let dword = unsafe { core::ptr::read_volatile(elr as *const u32) };
+        let heals = EC0_HEALS.load(Ordering::Relaxed);
+        if dword != 0 && dword != 0xFFFF_FFFF && heals < EC0_HEAL_CAP {
+            EC0_HEALS.store(heals + 1, Ordering::Relaxed);
+            serial_println!(
+                ":: A78AE-1941500 heal #{}: EC=0 at ELR={:#x} (D-side {:#010x} valid) — ic iallu + retry ::",
+                heals + 1,
+                elr,
+                dword,
+            );
+            unsafe {
+                core::arch::asm!(
+                    "ic iallu",
+                    "dsb ish",
+                    "isb",
+                    options(nostack, preserves_flags)
+                );
+            }
+            return 1;
         }
     }
     let what = match kind {
@@ -435,6 +484,27 @@ extern "C" fn aarch64_fault_handler(kind: u64) -> ! {
     let ec = (esr >> 26) & 0x3F;
     serial_println!("=== AARCH64 EXCEPTION: {} ===", what);
     serial_println!("ESR={:#x} (EC={:#04x})  ELR={:#x}  FAR={:#x}", esr, ec, elr, far);
+    // EC 0x00 ("unknown reason") probe — the Orin EC=0 phantom (see arch_arm64.md "JB1 result"):
+    // an UNDEF at an ELR whose bytes disassemble innocently smells like the I-side fetching
+    // different bytes than the D-side holds (stale I-cache class). Read the instruction word back
+    // through the D-side and print it with CTR_EL0 (IDC/DIC bits say what maintenance the core
+    // architecturally requires): D-word == the ELF's encoding proves a D/I divergence; a different
+    // word means real memory corruption. Guarded to a plausible identity-mapped kernel range so a
+    // garbage ELR cannot fault the fault handler.
+    if ec == 0 && kind == 0 && elr >= 0x8000_0000 && elr < 0x40_0000_0000 {
+        let dword = unsafe { core::ptr::read_volatile(elr as *const u32) };
+        let ctr: u64;
+        unsafe {
+            core::arch::asm!("mrs {}, CTR_EL0", out(reg) ctr, options(nomem, nostack, preserves_flags));
+        }
+        serial_println!(
+            "EC0-probe: D-side [ELR]={:#010x}  CTR_EL0={:#x} (DIC={} IDC={})",
+            dword,
+            ctr,
+            (ctr >> 29) & 1,
+            (ctr >> 28) & 1,
+        );
+    }
     crate::arch::hlt_loop();
 }
 
@@ -473,7 +543,11 @@ extern "C" fn aarch64_el0_fault_handler() -> ! {
         _ => false,
     };
     let Some(name) = super::sched::current_name() else {
-        aarch64_fault_handler(4); // no current task: a kernel bug — fatal, never a kill
+        // No current task: a kernel bug — fatal, never a kill. kind=4 can never take the JB1e
+        // heal path (it is kind==0-gated), so the handler always prints-and-halts here; the
+        // explicit hlt_loop restores the divergence the old `-> !` signature provided.
+        aarch64_fault_handler(4);
+        crate::arch::hlt_loop();
     };
     if far_valid {
         serial_println!(

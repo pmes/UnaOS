@@ -505,7 +505,53 @@ extern "C" fn tegra_fault_handler(esr: u64, far: u64, elr: u64, idx: u64, spsr: 
         elr,
         spsr,
     );
+    // The EC=0 phantom probe (see exceptions.rs twin + arch_arm64.md): D-side read-back of the
+    // faulting instruction word — equal-to-the-ELF proves a D/I-side divergence (stale I-cache
+    // class), different proves memory corruption. Range-guarded against a garbage ELR.
+    if (esr >> 26) & 0x3f == 0 && idx & 3 == 0 && (0x8000_0000..0x40_0000_0000).contains(&elr) {
+        let dword = unsafe { core::ptr::read_volatile(elr as *const u32) };
+        let ctr: u64;
+        unsafe {
+            core::arch::asm!("mrs {}, CTR_EL0", out(reg) ctr, options(nomem, nostack, preserves_flags));
+        }
+        serial_println!(
+            ":: tegra: EC0-probe — D-side [ELR]={:#010x} CTR_EL0={:#x} ::",
+            dword,
+            ctr,
+        );
+    }
     loop {
         core::hint::spin_loop();
     }
+}
+
+/// JB1d: the A78AE erratum-1941500 probe — the EC=0 phantom's leading suspect (see arch_arm64.md
+/// "JB1 result"; the D-side read-back PROVED an I-side/D-side divergence at the fault). The
+/// documented workaround is CPUECTLR_EL1[8]=1 (A78AE r0p1 and earlier), and TF-A's A78AE
+/// implementation historically INVERTED it (`bic` instead of `orr`), so BL31-lineage firmware may
+/// leave the bit CLEAR — or actively clear it. CPUECTLR_EL1 is IMPLEMENTATION DEFINED
+/// (S3_0_C15_C1_4 on the A78 family, per TF-A cortex_a78.h); EL3 may gate lower-EL access, so an
+/// access here can itself UNDEF — every step prints BEFORE the touch, and an UNDEF lands in the
+/// instrumented Part-C vector with the announce line naming it.
+pub fn a78ae_errata_probe() {
+    let midr: u64;
+    unsafe {
+        core::arch::asm!("mrs {}, MIDR_EL1", out(reg) midr, options(nomem, nostack, preserves_flags));
+    }
+    serial_println!(
+        ":: tegra: JB1d — MIDR={:#x} (r{}p{}) — reading CPUECTLR_EL1 (IMPDEF) next ::",
+        midr,
+        (midr >> 20) & 0xf,
+        midr & 0xf,
+    );
+    let ecx: u64;
+    unsafe {
+        core::arch::asm!("mrs {}, S3_0_C15_C1_4", out(reg) ecx, options(nomem, nostack, preserves_flags));
+    }
+    serial_println!(":: tegra: JB1d — CPUECTLR_EL1={:#x} (erratum-1941500 bit8={}) ::", ecx, (ecx >> 8) & 1);
+    // METAL VERDICT (2026-07-06): the WRITE is EL3-gated — `msr S3_0_C15_C1_4` from EL2 traps to
+    // an UNHANDLED EL3 exception (BL31 crash dump, box reboots; two attended boots confirmed).
+    // The bit CANNOT be applied OS-side on this firmware; only an NVIDIA BL31/UEFI update can.
+    // Report-only here; the OS-side mitigation is the JB1e heal (exceptions.rs: ic iallu + retry
+    // on the proven-stale EC=0 signature).
 }
