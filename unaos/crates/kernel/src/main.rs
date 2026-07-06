@@ -885,6 +885,11 @@ fn tegra_early_stop(boot_info: &'static mut BootInfo) -> ! {
         boot_info.framebuffer_info.stride,
         boot_info.framebuffer_info.bytes_per_pixel,
     );
+    // JB1d: the A78AE erratum-1941500 probe/workaround (CPUECTLR_EL1[8]) — the EC=0 phantom's
+    // leading suspect after the D-side read-back proved an I/D divergence. Prints MIDR + the bit
+    // state BL31 left, sets it if clear. Runs before everything else so the whole boot (JB1b/c +
+    // the drop + CAPSTONE) executes under the workaround.
+    unaos_kernel::arch::mmu_tegra::a78ae_errata_probe();
     // JB1a: print the BPMP IPC geometry (shmem TX/RX, HSP mboxes, reserved-memory carveouts) from
     // the firmware DTB — a read-only RAM walk, no MMIO (the JX1 lesson: gated Tegra blocks are
     // EL3-fatal to touch, so the geometry gets VERIFIED off the firmware's own tree before the
