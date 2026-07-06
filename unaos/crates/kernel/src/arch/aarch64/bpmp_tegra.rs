@@ -133,12 +133,17 @@ fn doorbell(hsp_base: u64) -> Option<Doorbell> {
 /// JB1b: establish the IVC command channel and exchange one MRQ_PING. Pre-drop, EL2, polled.
 /// Returns true iff the ping round-trip verified (reply == challenge << 1).
 pub fn jb1b_ping(geom: &BpmpGeom) -> bool {
+    let daif: u64;
+    unsafe {
+        core::arch::asm!("mrs {}, DAIF", out(reg) daif, options(nomem, nostack, preserves_flags));
+    }
     serial_println!(
-        ":: tegra: JB1b — geom: shmem_tx={:#x} shmem_rx={:#x} hsp={:#x} db_master={} ::",
+        ":: tegra: JB1b — geom: shmem_tx={:#x} shmem_rx={:#x} hsp={:#x} db_master={} DAIF={:#06b} ::",
         geom.shmem_tx,
         geom.shmem_rx,
         geom.hsp_base,
         geom.db_master,
+        (daif >> 6) & 0b1111,
     );
     let Some(db) = doorbell(geom.hsp_base) else { return false };
     let _ = db.enable; // read in the derivation print; kept for the follow-on RX-interrupt arc
