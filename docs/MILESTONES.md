@@ -49,6 +49,40 @@ Legend: **✅ metal-confirmed** · **🔬 QEMU-green, metal pending** · dates I
 
 ## hw-pi4 track — 2026-07-04 (landed on `hw-pi4`, awaiting integration)
 
+### U4 — the process model + per-process handle table (aarch64) ✅ `hw-pi4`
+- **What:** the ownership half of the process model — `sys_spawn` now returns a **handle**
+  into the *caller's* per-process handle table (not a raw pid) and `sys_wait` takes that
+  handle, so reaping is **structurally owner-scoped**: a task can only reap children whose
+  handles are in ITS table (folding M7's review note — any task could `sys_wait` any pid —
+  by construction). The table is a static, const-init `HANDLES[[AtomicU64; 8]; USER_SLOTS+1]`
+  keyed by the caller's **ASID** (read from `TTBR0_EL1[63:48]` synchronously in the SVC
+  handler); `PROCS` stays keyed by pid (exit-accounting control blocks) while `HANDLES` is
+  keyed by ASID (the spawner's private namespace of child capabilities) — deliberately
+  separate. No new syscall number, no new scheduler primitive, no driver, no boot change:
+  the whole arc is `arch/aarch64/syscall.rs` + one `main.rs` launcher tweak. `sys_write`
+  stays the `fd==1` path (routing a resource syscall through a handle is U5, when there is a
+  capability *check* to add). This is the exact substrate U5 turns into capabilities (grant =
+  transfer a handle, revoke = clear it; U5 adds the check at this same handle lookup).
+- **Tested — QEMU:** `./arroyo kernel8-test 30` → in place of the M7 line: the U4 setup line,
+  **four** `hello from EL0` (M6c inline #1, M6g loader #2, the two U4 children #3/#4), and
+  `:: U4: process model — parent reaped 2 children by handle, non-child sys_wait -ECHILD
+  (per-process handle tables) -> PASS ::`. The demo: a parent (`el0-u4parent`) `sys_spawn`s
+  two children and reaps **both by handle**; an ownership negative (`el0-u4orphan`, its own
+  slot/ASID) calls `sys_wait(0)` on an Empty handle and gets `-ECHILD`. Every
+  M6b/M6c/M6d/M6e/M6f/M6g + CAPSTONE line byte-identical (hex/pid-normalized set-diff: only
+  the M7 line → the U4 line, `hello` 3→4) and 0 unexpected faults. x86 (`test` +
+  `UNAOS_FATIMG=1 test`) functionally byte-identical through the U-lines (seam is
+  `baremetal`-only; sole diff is a QEMU timer/scheduling jitter on the async U2 exit at the
+  25 s window boundary — reliably present with a longer window; U3/U3.5 untouched); `check`
+  both arches; aarch64 virt v2 + GICv3 JM5 SMP 3/3 unchanged.
+- **Tested — metal:** none this arc — U4 is fully QEMU-verifiable (every piece is
+  scheduler/syscall logic: the handle install/resolve/clear, the owner-scoped reap, the
+  two-child spawn/reap, and the `-ECHILD` negative are all deterministic under QEMU raspi4b —
+  the reap wake is a scheduler post, not the timer). The child disk-loads ride the same EMMC2
+  path M7 already metal-confirmed; a future reflash would show the two extra `hello from EL0`
+  off the real card, but nothing in U4 is metal-*gated*.
+- **Commit:** this arc on `hw-pi4` (merge pending the integrator, who records the merge hash).
+
 ### M7 — a minimal process model: sys_spawn + sys_wait (aarch64) ✅ `hw-pi4`
 - **What:** the reaping half of a process model — an EL0 program can now spawn a child
   program and reap it. **`SYS_SPAWN` (8)** loads the fixed on-disk `HELLO.BIN` into a
