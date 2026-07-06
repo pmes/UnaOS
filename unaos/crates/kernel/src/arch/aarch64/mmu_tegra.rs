@@ -505,6 +505,21 @@ extern "C" fn tegra_fault_handler(esr: u64, far: u64, elr: u64, idx: u64, spsr: 
         elr,
         spsr,
     );
+    // The EC=0 phantom probe (see exceptions.rs twin + arch_arm64.md): D-side read-back of the
+    // faulting instruction word — equal-to-the-ELF proves a D/I-side divergence (stale I-cache
+    // class), different proves memory corruption. Range-guarded against a garbage ELR.
+    if (esr >> 26) & 0x3f == 0 && idx & 3 == 0 && (0x8000_0000..0x40_0000_0000).contains(&elr) {
+        let dword = unsafe { core::ptr::read_volatile(elr as *const u32) };
+        let ctr: u64;
+        unsafe {
+            core::arch::asm!("mrs {}, CTR_EL0", out(reg) ctr, options(nomem, nostack, preserves_flags));
+        }
+        serial_println!(
+            ":: tegra: EC0-probe — D-side [ELR]={:#010x} CTR_EL0={:#x} ::",
+            dword,
+            ctr,
+        );
+    }
     loop {
         core::hint::spin_loop();
     }

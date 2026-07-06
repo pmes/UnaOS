@@ -435,6 +435,27 @@ extern "C" fn aarch64_fault_handler(kind: u64) -> ! {
     let ec = (esr >> 26) & 0x3F;
     serial_println!("=== AARCH64 EXCEPTION: {} ===", what);
     serial_println!("ESR={:#x} (EC={:#04x})  ELR={:#x}  FAR={:#x}", esr, ec, elr, far);
+    // EC 0x00 ("unknown reason") probe — the Orin EC=0 phantom (see arch_arm64.md "JB1 result"):
+    // an UNDEF at an ELR whose bytes disassemble innocently smells like the I-side fetching
+    // different bytes than the D-side holds (stale I-cache class). Read the instruction word back
+    // through the D-side and print it with CTR_EL0 (IDC/DIC bits say what maintenance the core
+    // architecturally requires): D-word == the ELF's encoding proves a D/I divergence; a different
+    // word means real memory corruption. Guarded to a plausible identity-mapped kernel range so a
+    // garbage ELR cannot fault the fault handler.
+    if ec == 0 && kind == 0 && elr >= 0x8000_0000 && elr < 0x40_0000_0000 {
+        let dword = unsafe { core::ptr::read_volatile(elr as *const u32) };
+        let ctr: u64;
+        unsafe {
+            core::arch::asm!("mrs {}, CTR_EL0", out(reg) ctr, options(nomem, nostack, preserves_flags));
+        }
+        serial_println!(
+            "EC0-probe: D-side [ELR]={:#010x}  CTR_EL0={:#x} (DIC={} IDC={})",
+            dword,
+            ctr,
+            (ctr >> 29) & 1,
+            (ctr >> 28) & 1,
+        );
+    }
     crate::arch::hlt_loop();
 }
 
