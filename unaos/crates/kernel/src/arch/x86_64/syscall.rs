@@ -40,6 +40,16 @@ const SYS_EXIT: u64 = 2;
 // and returns its status (or `-ECHILD` if the handle is not in the caller's table).
 const SYS_SPAWN: u64 = 8;
 const SYS_WAIT: u64 = 9;
+// U5x: operate on the caller's OWN handle table as capabilities. `a0` selects the sub-op
+// (`CAP_OP_GRANT`/`CAP_OP_REVOKE`); the remaining args are op-specific (see `sys_cap`). GRANT mints a
+// new, rights-attenuated handle to the same target as a source handle the caller holds `CAP_GRANT` on;
+// REVOKE clears a handle the caller owns. The enforcement layer sits at the handle lookup
+// (`handle_resolve`). Same number as aarch64 U5.
+const SYS_CAP: u64 = 10;
+/// `SYS_CAP` sub-ops (in `a0`). GRANT: `a1`=source handle idx, `a2`=requested rights mask -> new handle
+/// idx (attenuated) or a negative errno. REVOKE: `a1`=handle idx to drop -> 0 or a negative errno.
+const CAP_OP_GRANT: u64 = 0;
+const CAP_OP_REVOKE: u64 = 1;
 
 /// Base of the ring-3 window: 1 TiB — a FRESH top-level slot (PML4 index 2) above the firmware
 /// identity map, so mapping it touches no kernel state. `setup` proves it unmapped before use.
@@ -287,6 +297,111 @@ unsafe extern "C" {
     static unaos_user_u4x_orphan: u8;
 }
 
+// --- U5x ring-3 fixture (handles as capabilities — the aarch64 `__u5_prog_cap` twin). ONE fixture
+// (`u5x-cap`) exercising all four ring-3-observable capability behaviours against its OWN slot's handle
+// table, which the launcher (`u5x_setup`) pre-endows with two handles:
+//   handle 1 = CONSOLE, rights = CAP_WRITE|CAP_GRANT (the "full" console cap — writes and grants from it)
+//   handle 2 = CONSOLE, rights = CAP_READ            (a console cap WITHOUT write — the -EACCES negative)
+// Position-independent; register-only apart from the RIP-relative message load (writes no user stack, so
+// it is safe on any slot). It builds a witness bitmask in r12 (callee-saved — the C dispatcher preserves
+// it across each `syscall`, the u4x-parent idiom) and conveys it as its `sys_exit` STATUS, which the
+// SYS_EXIT arm routes BY NAME into `U5X_WITNESS` (x86 routes by task name, so no SYS_REPORT is needed —
+// the aarch64 twin uses SYS_REPORT only because its sentinel exit status is reserved for demo routing).
+// The teardown-clear (behaviour 5) is proven kernel-side by `u5x_launcher` after this fixture exits.
+// ABI (Linux-style): rax = number, args rdi/rsi/rdx, return in rax.
+core::arch::global_asm!(
+    r#"
+    .globl unaos_user_u5x_blob_start
+unaos_user_u5x_blob_start:
+    .balign 16
+    .globl unaos_user_u5x_cap
+unaos_user_u5x_cap:
+    xor r12d, r12d                          // witness bitmask = 0 (callee-saved; survives syscalls)
+
+    // (1) write-cap OK: sys_write(handle 1) -> byte count (>= 0)
+    mov rax, 1                              // SYS_WRITE
+    mov rdi, 1                              // fd = handle 1 (CONSOLE, CAP_WRITE|CAP_GRANT)
+    lea rsi, [rip + unaos_user_u5x_msg]     // buf -> the ring-3 VA at run time (RIP-relative)
+    mov rdx, [rip + unaos_user_u5x_msglen]  // len (from the embedded length word)
+    syscall
+    test rax, rax
+    js 1f                                   // negative -> skip bit0 (fail)
+    or r12, 1                               // bit0: write-cap OK
+1:
+    // (2) no-cap -EACCES: sys_write(handle 2, lacks CAP_WRITE) -> -EACCES (-13)
+    mov rax, 1
+    mov rdi, 2                              // fd = handle 2 (CONSOLE, CAP_READ only)
+    lea rsi, [rip + unaos_user_u5x_msg]
+    mov rdx, [rip + unaos_user_u5x_msglen]
+    syscall
+    cmp rax, -13                            // rax == -EACCES ?
+    jne 2f
+    or r12, 2                               // bit1: no-cap correctly denied
+2:
+    // (3) attenuation: granting MORE than held is rejected; a subset grant works and its handle writes.
+    mov rax, 10                             // SYS_CAP
+    xor edi, edi                            // CAP_OP_GRANT (0)
+    mov rsi, 1                              // src = handle 1 (CAP_WRITE|CAP_GRANT, NOT CAP_EXEC)
+    mov rdx, 6                              // request CAP_WRITE|CAP_EXEC (2|4) -> would amplify -> reject
+    syscall
+    test rax, rax
+    jns 3f                                  // grant SUCCEEDED (>=0) -> attenuation broken -> fail bit2
+    mov rax, 10                             // subset grant: CAP_WRITE only (subset of held)
+    xor edi, edi                            // CAP_OP_GRANT
+    mov rsi, 1                              // src = handle 1
+    mov rdx, 2                              // CAP_WRITE
+    syscall
+    test rax, rax
+    js 3f                                   // subset grant failed -> fail bit2
+    mov r13, rax                            // r13 = the minted (attenuated) handle idx (callee-saved)
+    mov rax, 1                              // write through the minted cap -> must succeed
+    mov rdi, r13
+    lea rsi, [rip + unaos_user_u5x_msg]
+    mov rdx, [rip + unaos_user_u5x_msglen]
+    syscall
+    test rax, rax
+    js 3f                                   // minted cap can't write -> fail bit2
+    or r12, 4                               // bit2: attenuation bounded + subset grant usable
+3:
+    // (4) revoke enforced: revoke handle 1, then a write through it -> -EACCES
+    mov rax, 10                             // SYS_CAP
+    mov rdi, 1                              // CAP_OP_REVOKE (1)
+    mov rsi, 1                              // drop handle 1
+    syscall
+    test rax, rax
+    jnz 4f                                  // revoke must return 0
+    mov rax, 1                              // SYS_WRITE(handle 1) — now revoked
+    mov rdi, 1
+    lea rsi, [rip + unaos_user_u5x_msg]
+    mov rdx, [rip + unaos_user_u5x_msglen]
+    syscall
+    cmp rax, -13                            // -EACCES ?
+    jne 4f
+    or r12, 8                               // bit3: revoke enforced
+4:
+    mov rax, 2                              // SYS_EXIT(witness) -> routed by name into U5X_WITNESS
+    mov rdi, r12                            // status = witness bitmask
+    syscall
+5:  jmp 5b                                  // sys_exit never returns; belt-and-braces guard
+    // Read-only data in the (ring-3 RX, kernel-readable) code page. Length is an assemble-time label
+    // difference loaded RIP-relative (the M6c/hello idiom — no `mov reg, sym-sym` memory-operand trap).
+    .balign 8
+unaos_user_u5x_msglen:
+    .quad unaos_user_u5x_msg_end - unaos_user_u5x_msg
+unaos_user_u5x_msg:
+    .ascii "u5x: cap write\n"
+unaos_user_u5x_msg_end:
+    .globl unaos_user_u5x_blob_end
+unaos_user_u5x_blob_end:
+"#
+);
+
+unsafe extern "C" {
+    static unaos_user_u5x_blob_start: u8;
+    static unaos_user_u5x_blob_end: u8;
+    static unaos_user_u5x_cap: u8;
+}
+
 // --- The SYSCALL entry stub (LSTAR target). Naked; the only assembly in the syscall path.
 //
 // On entry (CPL 0, from SYSCALL): rcx = user RIP, r11 = user RFLAGS, rax = number, rdi/rsi/rdx =
@@ -461,6 +576,13 @@ pub fn record_ring3_kill(name: &str, vec: u8, err: u64, cr2: u64) {
         }
         return;
     }
+    // U5x: a killed capability fixture — off the U1b counter (a kill here is a real U5x bug that fails
+    // the U5x verdict, not a phantom U1b regression). It is not in PROCS (the launcher spawned it, not
+    // sys_spawn), so there is no parent semaphore to post — the launcher times out to FAIL on `U5X_DONE`.
+    if name == "u5x-cap" {
+        U5X_KILLED.fetch_add(1, Ordering::AcqRel);
+        return;
+    }
     let code_end = USER_BASE + PAGE_SIZE; // the code page is the first page of the window only
     let window_end = USER_BASE + USER_WINDOW_PAGES * PAGE_SIZE;
     let expected = match name {
@@ -507,6 +629,7 @@ extern "C" fn syscall_dispatch(nr: u64, a0: u64, a1: u64, a2: u64) -> i64 {
         SYS_WRITE => sys_write(a0, a1, a2),
         SYS_SPAWN => sys_spawn(),
         SYS_WAIT => sys_wait(a0),
+        SYS_CAP => sys_cap(a0, a1, a2),
         SYS_EXIT => {
             // U4x: a spawned CHILD's exit is reaped by its parent's sys_wait through the Proc table,
             // keyed by pid — NOT by any counter and NOT by the handle (the handle is the parent's-side
@@ -555,6 +678,13 @@ extern "C" fn syscall_dispatch(nr: u64, a0: u64, a1: u64, a2: u64) -> i64 {
                     U4X_ORPHAN_ECHILD.store((a0 == 0) as u32, Ordering::Release);
                     U4X_DONE.fetch_add(1, Ordering::AcqRel);
                 }
+                Some("u5x-cap") => {
+                    // U5x: the capability fixture conveys its 4-bit witness bitmask as its exit STATUS
+                    // (routed by name, like the U4x parent/orphan — x86 has no SYS_REPORT). Stored for
+                    // the launcher's verdict; `U5X_DONE` gates the read.
+                    U5X_WITNESS.store(a0 as u32, Ordering::Release);
+                    U5X_DONE.fetch_add(1, Ordering::AcqRel);
+                }
                 Some(n) if n.starts_with("u3-") => {
                     // U3 per-process-CR3 fixture task exiting (its own accounting, so the U1a/U1b
                     // default counts stay byte-for-byte). The readback verdict reads slot memory.
@@ -587,8 +717,16 @@ extern "C" fn syscall_dispatch(nr: u64, a0: u64, a1: u64, a2: u64) -> i64 {
 /// BSP-quiet window (see `await_verdict`), so the best-effort console lock is uncontended here and
 /// the line is not dropped.
 fn sys_write(fd: u64, buf: u64, len: u64) -> i64 {
-    if fd != 1 {
-        return -9; // -EBADF (only stdout for U1a)
+    // U5x: `fd` is a HANDLE INDEX into the caller's per-process table, not the ambient POSIX stdout. It
+    // must resolve to a CONSOLE resource carrying CAP_WRITE. No such handle / wrong kind / missing
+    // CAP_WRITE all yield -EACCES — the enforcement point (subsuming U1a's `fd != 1 -> -EBADF`). A
+    // printing process is endowed this cap at spawn/launch (`install_console_cap`): the shared window at
+    // `setup()` (U1a/U1b/U2) and each spawned child in `sys_spawn`, so every prior print still lands; a
+    // process WITHOUT it gets -EACCES (the U5x negative). The pointer validation below is unchanged, so
+    // a hostile pointer still yields -EFAULT.
+    match handle_resolve(caller_row(), fd, CAP_WRITE) {
+        Ok(HandleTarget::Console) => {}
+        _ => return EACCES,
     }
     let window = USER_WINDOW_PAGES * PAGE_SIZE;
     let end = buf.wrapping_add(len);
@@ -738,6 +876,13 @@ pub fn setup() -> UserDemo {
         USER_BASE,
         blob_len
     );
+
+    // U5x: endow the SHARED window (`SHARED_ROW` — where `spawn_user` runs U1a/U1b/U2 with `user_cr3 == 0`,
+    // so `current_slot()` is None and `caller_row()` falls back to `SHARED_ROW`) with a console write-
+    // capability, so `hello`/`u2-hello`'s `sys_write(fd 1)` still reaches the console once writes route
+    // through the table. The shared window is never torn down, so this endowment persists for the whole
+    // boot; the U1b fault fixtures share `SHARED_ROW` but never write, so the single fixed cap serves them.
+    install_console_cap(SHARED_ROW);
 
     // Per-routine entry VAs: USER_BASE + (label - blob_start), since the blob is copied to the code
     // page base. `hello` sits at offset 0 (== USER_BASE); every entry lies within the code page.
@@ -1317,6 +1462,9 @@ pub fn u3_5_run_fixture(cpu: usize) {
 const ECHILD: i64 = -10; // sys_wait: no child with that handle in the caller's table
 const EAGAIN: i64 = -11; // the process table (or slot pool, or handle table) is full
 const ENODEV: i64 = -19; // no program staged (no block device / no HELLO.BIN at stage time)
+// U5x capability errnos.
+const EACCES: i64 = -13; // a capability check failed — no such handle / wrong kind / missing right / amplify
+const EINVAL: i64 = -22; // a SYS_CAP sub-op selector that is neither GRANT nor REVOKE
 
 /// A killed child's Proc status: a nonzero sentinel the child-KILL path stores so a killed child still
 /// WAKES its parent's sys_wait — but with status != 0, so the parent's witness reads FAIL (a killed
@@ -1443,8 +1591,169 @@ const NHANDLE: usize = 8; // handle slots per process (small, static — like MA
 /// known (0 = Empty would let a re-scan re-claim it; a real pid is never `u64::MAX`). Overwritten with
 /// the pid once the child is spawned, or cleared if the load fails — never observed by another task.
 const HANDLE_RESERVING: u64 = u64::MAX;
-static HANDLES: [[AtomicU64; NHANDLE]; crate::arch::memory::USER_SLOTS] =
-    [const { [const { AtomicU64::new(0) }; NHANDLE] }; crate::arch::memory::USER_SLOTS];
+/// The handle-table row for the SHARED kernel window — the x86 twin of aarch64 ASID 0's row. x86 keys
+/// `HANDLES` by address-space SLOT, but the U1a/U1b/U2 fixtures run in the shared window (`user_cr3 == 0`,
+/// so `current_slot()` is None and they have no private slot). One extra row (index `USER_SLOTS`) gives
+/// them a home for the console cap `setup()` endows; `caller_row()` maps None -> `SHARED_ROW`. This row
+/// is never torn down, so its endowment persists for the whole boot.
+const SHARED_ROW: usize = crate::arch::memory::USER_SLOTS;
+/// `HANDLES[row][idx]`: 0 (Empty), a child pid (`Child`), `HANDLE_CONSOLE` (the console resource), or
+/// `HANDLE_RESERVING` (an in-flight `sys_spawn` reservation). `USER_SLOTS + 1` rows: one per private slot
+/// plus `SHARED_ROW`.
+static HANDLES: [[AtomicU64; NHANDLE]; crate::arch::memory::USER_SLOTS + 1] =
+    [const { [const { AtomicU64::new(0) }; NHANDLE] }; crate::arch::memory::USER_SLOTS + 1];
+
+// =============================================================================================
+// U5x — handles as CAPABILITIES: rights, a resource target beyond "child pid", the enforcement CHECK,
+// grant/attenuate/revoke, and a teardown-clear. The aarch64 U5 (`arch/aarch64/syscall.rs`) twin, keyed
+// by address-space SLOT instead of ASID. U4x built the STRUCTURE (a per-process, slot-keyed handle
+// table); U5x turns each handle into a capability — an unforgeable reference carrying RIGHTS, CHECKED at
+// the point of use, GRANTABLE (attenuated) and REVOKABLE, its lifetime bounded by the owning slot's
+// teardown-clear. Two things are added to what a handle names: a rights bitmask (a sidecar array, so
+// U4x's `0`/`RESERVING` value-word sentinels stay byte-identical) and a resource TARGET beyond "child
+// pid" (a `CONSOLE` well-known token, so `sys_write` routes through the table). Deliberately minimal:
+// two target kinds (Child(pid), Console), a small rights set, no general object table (that is U6+).
+// =============================================================================================
+
+/// Capability rights — a small bitmask carried in the sidecar `HANDLE_RIGHTS`, checked at
+/// `handle_resolve`. `CAP_WRITE` gates `sys_write`; `CAP_GRANT` gates minting attenuated copies;
+/// `CAP_READ`/`CAP_EXEC`/`CAP_REVOKE` round out the model (`CAP_REVOKE` reserved for cross-process
+/// revocation — U6; U5x revoke is ownership-based). Values are stable across arches (aarch64 U5 twin).
+const CAP_READ: u32 = 1 << 0; // 0x01
+const CAP_WRITE: u32 = 1 << 1; // 0x02
+const CAP_EXEC: u32 = 1 << 2; // 0x04
+const CAP_GRANT: u32 = 1 << 3; // 0x08
+const CAP_REVOKE: u32 = 1 << 4; // 0x10 (reserved: cross-process revocation, U6)
+// The rights are the distinct low 5 bits — a well-formed bitmask (each a single, non-overlapping bit,
+// which the attenuation check `req & !src` relies on). This const-assert verifies that and anchors every
+// CAP_* as used, so the bits not yet exercised in Rust this arc (CAP_EXEC — held by no fixture, so the
+// attenuation negative bites; CAP_REVOKE — reserved for U6) don't read as dead code.
+const _: () = assert!(
+    (CAP_READ | CAP_WRITE | CAP_EXEC | CAP_GRANT | CAP_REVOKE) == 0x1F,
+    "capability rights must be the distinct low 5 bits"
+);
+
+/// The well-known target token stored in a handle's value word to mean "the serial console resource" (as
+/// opposed to a child pid). Distinct from `0` (Empty), `HANDLE_RESERVING` (`u64::MAX`), and every real
+/// pid (small, monotonic), so the value word alone discriminates Child(pid) from Console without
+/// perturbing U4x's sentinel checks. One non-pid token (not a general object table) is the arc's scope.
+const HANDLE_CONSOLE: u64 = u64::MAX - 1;
+
+/// The conventional stdout handle index. Every ring-3 program prints with `sys_write(fd=1, ..)`, so the
+/// console write-capability is endowed at this fixed index in each printing process's table
+/// (`install_console_cap`). Reserved by convention, like fd 1 on POSIX.
+const CONSOLE_FD: usize = 1;
+
+/// The rights sidecar: keyed IDENTICALLY to `HANDLES` (`[row][idx]`), so the value word keeps U4x's exact
+/// `0`/`RESERVING` sentinel semantics and the rights ride alongside. Written Release beside the value
+/// store (rights published BEFORE the value that makes a handle live, so a resolver that observes the
+/// value also observes the rights), cleared in `handle_clear`/`clear_handle_row`. `0` == an inert handle.
+static HANDLE_RIGHTS: [[AtomicU32; NHANDLE]; crate::arch::memory::USER_SLOTS + 1] =
+    [const { [const { AtomicU32::new(0) }; NHANDLE] }; crate::arch::memory::USER_SLOTS + 1];
+
+/// What a resolved handle NAMES: a child process (by pid — U4x's meaning) or the console resource (U5x).
+#[derive(Clone, Copy)]
+enum HandleTarget {
+    Child(u64),
+    Console,
+}
+
+/// Why `handle_resolve` refused: the handle is not in the caller's table (out-of-range/Empty/RESERVING),
+/// or it is present but lacks a required right. Callers map these to their own errno (`sys_wait` ->
+/// `-ECHILD` for either, preserving U4x's structural-ownership semantics; `sys_write`/`sys_cap` ->
+/// `-EACCES`).
+enum ResolveErr {
+    NoHandle,
+    Denied,
+}
+
+/// The HANDLES row for the caller: its private address-space slot, or `SHARED_ROW` when the caller runs
+/// in the shared kernel window (`current_slot()` is None — U1a/U1b/U2). The x86 twin of aarch64's
+/// `current_asid()` (0 for the shared window, 1.. for private).
+fn caller_row() -> usize {
+    crate::arch::memory::current_slot().unwrap_or(SHARED_ROW)
+}
+
+/// The U5x enforcement CHECK, at the SINGLE lookup point every handle-consuming path goes through.
+/// Resolve `idx` against the caller's own (`row`) table, then require the handle carry every bit in
+/// `req`. Returns the target on success. `NoHandle` for out-of-range/Empty/`RESERVING` (a reserving
+/// placeholder is never a usable handle); `Denied` when a present handle lacks a required right. The
+/// value word is loaded Acquire (synchronizing with the Release store that installed it), then the
+/// rights — so a resolver that sees a live value also sees its rights.
+fn handle_resolve(row: usize, idx: u64, req: u32) -> Result<HandleTarget, ResolveErr> {
+    if idx as usize >= NHANDLE {
+        return Err(ResolveErr::NoHandle);
+    }
+    debug_assert!(row < HANDLES.len(), "handle_resolve: row out of range");
+    let raw = HANDLES[row][idx as usize].load(Ordering::Acquire);
+    if raw == 0 || raw == HANDLE_RESERVING {
+        return Err(ResolveErr::NoHandle);
+    }
+    let rights = HANDLE_RIGHTS[row][idx as usize].load(Ordering::Acquire);
+    if rights & req != req {
+        return Err(ResolveErr::Denied);
+    }
+    Ok(if raw == HANDLE_CONSOLE {
+        HandleTarget::Console
+    } else {
+        HandleTarget::Child(raw)
+    })
+}
+
+/// Set the rights word at `HANDLES[row][idx]` (Release) — used beside a value store to attach rights to a
+/// freshly-installed handle (a child handle in `sys_spawn`, a minted handle in `sys_cap_grant`).
+fn handle_set_rights(row: usize, idx: usize, rights: u32) {
+    debug_assert!(row < HANDLES.len() && idx < NHANDLE, "handle_set_rights: out of range");
+    HANDLE_RIGHTS[row][idx].store(rights, Ordering::Release);
+}
+
+/// Install a capability at a FIXED index (not `handle_install`'s first-free scan): store the rights FIRST
+/// (Release), then the target value (Release), so a resolver that observes the live value also observes
+/// the rights. Used to endow the console write-capability at `CONSOLE_FD` and to plant the U5x demo's
+/// fixtures. Always called BEFORE the target process is dispatched (setup / pre-spawn), so there is no
+/// concurrent resolver; the ordering is defensive belt-and-braces.
+fn install_cap(row: usize, idx: usize, target: u64, rights: u32) {
+    debug_assert!(row < HANDLES.len() && idx < NHANDLE, "install_cap: out of range");
+    HANDLE_RIGHTS[row][idx].store(rights, Ordering::Release);
+    HANDLES[row][idx].store(target, Ordering::Release);
+}
+
+/// Endow the process running in `row` with a console WRITE-capability at `CONSOLE_FD` — the bootstrap
+/// that lets a ring-3 program print once `sys_write` routes through the table. Given to every printing
+/// process: the shared window (`SHARED_ROW`) in `setup`, and each spawned child in `sys_spawn`. A process
+/// NOT so endowed gets `-EACCES` from `sys_write` (the U5x negative).
+fn install_console_cap(row: usize) {
+    install_cap(row, CONSOLE_FD, HANDLE_CONSOLE, CAP_WRITE);
+}
+
+/// True iff the entire `HANDLES[row]` row (values AND rights) is clear — the teardown-clear verifier.
+/// Read by `u5x_launcher` after the fixture exits and its slot is retired: `free_user_space_by_cr3`
+/// clears the row on exit, so this transitions false -> true, proving no stale capability outlives its
+/// owning slot.
+fn handle_row_is_clear(row: usize) -> bool {
+    debug_assert!(row < HANDLES.len(), "handle_row_is_clear: row out of range");
+    (0..NHANDLE).all(|i| {
+        HANDLES[row][i].load(Ordering::Acquire) == 0
+            && HANDLE_RIGHTS[row][i].load(Ordering::Acquire) == 0
+    })
+}
+
+/// U5x: clear an ENTIRE per-process handle row (every value + its rights) when the owning slot is torn
+/// down — the lifecycle half of "U5x owns revoke/teardown-clear", folding U4x's one deferred note (a row
+/// was NOT cleared on teardown, so a future slot-reuse could observe stale entries). Called from
+/// `memory::free_user_space_by_cr3` BEFORE the slot's used-flag is released (clear-before-release, the
+/// ordering aarch64 U5 endorsed), so no concurrent `alloc_user_space` on another core can claim the slot
+/// and populate the row between the clear and the release. `slot` is a PRIVATE slot (0..USER_SLOTS);
+/// `SHARED_ROW` is never torn down.
+pub fn clear_handle_row(slot: usize) {
+    debug_assert!(slot < crate::arch::memory::USER_SLOTS, "clear_handle_row: not a private slot");
+    for i in 0..NHANDLE {
+        // Clear the value first (Empty => `handle_resolve` bails as NoHandle before reading rights), then
+        // the rights — so no intermediate state is ever a live handle with stale rights.
+        HANDLES[slot][i].store(0, Ordering::Release);
+        HANDLE_RIGHTS[slot][i].store(0, Ordering::Release);
+    }
+}
 
 /// Claim the first Empty slot in `HANDLES[slot]`, storing `pid` (CAS 0->pid), and return its index —
 /// the value `sys_spawn` returns to ring 3. `None` if the table is full (-> -EAGAIN). `pid` is
@@ -1481,11 +1790,15 @@ fn handle_get(slot: usize, idx: usize) -> Option<u64> {
     }
 }
 
-/// Clear (0 = Empty) the handle at `HANDLES[slot][idx]` — consumed when its child is reaped in
-/// `sys_wait`, or released when a failed `sys_spawn` unwinds its reservation.
+/// Clear (0 = Empty) the handle at `HANDLES[slot][idx]` AND its rights sidecar — consumed when its child
+/// is reaped in `sys_wait`, revoked by `sys_cap_revoke`, or released when a failed `sys_spawn` unwinds its
+/// reservation. U5x: clears BOTH the value and the rights (value first — Empty => `handle_resolve` bails
+/// before reading rights — then rights), mirroring the aarch64 twin's `handle_clear`, so a dropped
+/// capability never leaves a stale rights word behind an Empty slot for a later re-install to inherit.
 fn handle_clear(slot: usize, idx: usize) {
     debug_assert!(slot < HANDLES.len() && idx < NHANDLE, "handle_clear: out of range");
     HANDLES[slot][idx].store(0, Ordering::Release);
+    HANDLE_RIGHTS[slot][idx].store(0, Ordering::Release);
 }
 
 /// SYS_SPAWN(): instantiate the pre-staged program (HELLO.BIN) in a fresh slot, run it ring-3 as a
@@ -1539,6 +1852,11 @@ fn sys_spawn() -> i64 {
         core::ptr::write_bytes(backing, 0, (USER_WINDOW_PAGES * PAGE_SIZE) as usize);
         core::ptr::copy_nonoverlapping((&raw const HELLO_BYTES).cast::<u8>(), backing, len);
     }
+    // U5x: endow the CHILD's OWN table with a console write-capability (the child runs HELLO.BIN, which
+    // `sys_write`s fd 1). Done here, on the freshly-built slot, BEFORE the child is spawned — the child
+    // cannot be dispatched until the parent yields (the co-location invariant below), so there is no
+    // concurrent resolver of the child's table. Without this the child's first print would -EACCES (routed).
+    install_console_cap(child_slot);
     // Co-locate the child on the caller's core (the invariant above): sys_spawn always runs with its
     // ring-3 caller current, so `this_cpu` is the parent's core.
     let cpu = crate::arch::percpu::this_cpu().cpu_index as usize;
@@ -1548,8 +1866,11 @@ fn sys_spawn() -> i64 {
     // Record the real pid (Release) into BOTH the Proc entry (pid-keyed exit accounting) and the
     // reserved handle slot (slot-keyed ownership) BEFORE returning to ring 3 — before the parent can
     // yield and let the child run. The child's exit path sees the Proc pid; the parent's later
-    // sys_wait resolves the handle to it.
+    // sys_wait resolves the handle to it. U5x: the parent's child handle carries CAP_READ (the ownership
+    // token — `sys_wait` gates on kind==Child, not on the right; published Release BEFORE the pid so the
+    // handle is never live sans rights).
     PROCS[pi].pid.store(pid, Ordering::Release);
+    handle_set_rights(slot, h, CAP_READ);
     handle_set(slot, h, pid);
     h as i64 // the HANDLE index (per-process; two processes can each hold handle 0 to different children)
 }
@@ -1565,13 +1886,15 @@ fn sys_spawn() -> i64 {
 /// Exactly one post is consumed by exactly one wait, so the reaped entry returns to 0 permits, clean
 /// for reuse.
 fn sys_wait(handle: u64) -> i64 {
-    let Some(slot) = crate::arch::memory::current_slot() else {
-        return ECHILD; // no slot -> no handle table -> the caller holds no children
-    };
-    // Resolve the handle against the CALLER's OWN table — the structural ownership check. Not present
-    // (out-of-range or Empty) => the caller holds no such child => -ECHILD.
-    let Some(pid) = handle_get(slot, handle as usize) else {
-        return ECHILD;
+    let row = caller_row();
+    // Resolve the handle against the CALLER's OWN table — the structural ownership check, now through the
+    // U5x enforcement point. It must be a CHILD handle (U4x's meaning). Out-of-range/Empty (NoHandle), a
+    // rights shortfall (Denied), or a CONSOLE handle all mean "you hold no such child" => -ECHILD
+    // (byte-identical to U4x for the orphan's `sys_wait(0)` and for a shared-window caller). Waiting
+    // requires no resource right — holding the child handle is the ownership token (`req = 0`).
+    let pid = match handle_resolve(row, handle, 0) {
+        Ok(HandleTarget::Child(pid)) => pid,
+        _ => return ECHILD,
     };
     let Some(pi) = proc_find_child(pid) else {
         return ECHILD; // the handle named a pid with no Proc entry (defensive; cannot happen in the demo)
@@ -1580,8 +1903,74 @@ fn sys_wait(handle: u64) -> i64 {
     debug_assert!(woken, "sys_wait: called off a scheduled task");
     let status = PROCS[pi].status.load(Ordering::Acquire) as i64;
     proc_free(pi); // reap the Proc entry (its `done` is back at 0 permits, free for reuse)
-    handle_clear(slot, handle as usize); // consume the handle: a second sys_wait on it now -> -ECHILD
+    handle_clear(row, handle as usize); // consume the handle: a second sys_wait on it now -> -ECHILD
     status
+}
+
+/// SYS_CAP(op, a1, a2): grant/attenuate/revoke on the CALLER's OWN handle table — capabilities as
+/// first-class operations. `op` selects the sub-op. Runs single-writer over the caller's table (one
+/// syscall at a time, IRQ-masked; one live task per slot), so no lock is needed. The aarch64 `sys_cap`
+/// twin. See `sys_cap_grant`/`sys_cap_revoke`.
+fn sys_cap(op: u64, a1: u64, a2: u64) -> i64 {
+    let row = caller_row();
+    match op {
+        CAP_OP_GRANT => sys_cap_grant(row, a1, a2),
+        CAP_OP_REVOKE => sys_cap_revoke(row, a1),
+        _ => EINVAL,
+    }
+}
+
+/// SYS_CAP GRANT(src_idx, req_rights): mint a NEW handle in the caller's own table naming the SAME target
+/// as `src_idx`, carrying `req_rights` — enforcing the ATTENUATION (monotonic-decrease) invariant: the
+/// minted rights can never exceed the granter's rights on the source. Requires `CAP_GRANT` on the source.
+/// Returns the new handle index, or a negative errno:
+///   -EACCES — no such source handle, source lacks CAP_GRANT, or `req_rights` would AMPLIFY (bits the
+///             granter does not hold): the core U5x property — a grant can never produce more rights than
+///             the granter.
+///   -EAGAIN — the caller's handle table is full (no free slot to mint into; never grown).
+/// The mint targets the caller's OWN table (a child spawns nothing to grant into yet); cross-table minting
+/// is a straightforward extension once cross-process object naming lands (U6).
+fn sys_cap_grant(row: usize, src_idx: u64, req_rights: u64) -> i64 {
+    // Resolve the source's raw target + rights (no right required to READ your own handle's descriptor).
+    let Some(target) = handle_get(row, src_idx as usize) else {
+        return EACCES; // no such source handle
+    };
+    if target == HANDLE_RESERVING {
+        return EACCES; // an in-flight reservation is not a grantable handle (defensive; single-writer)
+    }
+    let src_rights = HANDLE_RIGHTS[row][src_idx as usize].load(Ordering::Acquire);
+    if src_rights & CAP_GRANT == 0 {
+        return EACCES; // the source does not authorize granting
+    }
+    let req = req_rights as u32;
+    // Attenuation: reject any requested bit the granter does not itself hold. `req & !src_rights` is
+    // exactly the set of amplifying bits; non-empty => the grant would exceed the granter's authority.
+    if req & !src_rights != 0 {
+        return EACCES;
+    }
+    // Mint: reuse `handle_install` for the first-free slot claim (the U4x sentinel logic), then attach the
+    // attenuated rights. Single-writer over this table (the caller is mid-syscall, not concurrently
+    // resolving), so the value-then-rights order carries no race.
+    match handle_install(row, target) {
+        Some(idx) => {
+            handle_set_rights(row, idx, req);
+            idx as i64
+        }
+        None => EAGAIN, // handle table full
+    }
+}
+
+/// SYS_CAP REVOKE(idx): drop a handle the caller owns (`handle_clear`, which also clears its rights). A
+/// process may always drop its OWN capabilities (ownership-based — the caller's table is its own), so no
+/// right is required; `CAP_REVOKE` is reserved for cross-process revocation (revocation trees — U6).
+/// Returns 0, or -ECHILD if the index is out-of-range/Empty (nothing to revoke). After revoke, any use of
+/// the index returns -EACCES (`sys_write`) / -ECHILD (`sys_wait`) — the handle is gone.
+fn sys_cap_revoke(row: usize, idx: u64) -> i64 {
+    if idx as usize >= NHANDLE || handle_get(row, idx as usize).is_none() {
+        return ECHILD; // out-of-range or Empty — no such handle to revoke
+    }
+    handle_clear(row, idx as usize);
+    0
 }
 
 // --- U4x demo accounting (written by the exit/kill paths + the parent/orphan witnesses, read by the
@@ -1601,6 +1990,23 @@ static U4X_KILLED: AtomicU32 = AtomicU32::new(0);
 /// Set once U2's verdict has printed, so the U4x launcher orders its lines AFTER U2's (the aarch64
 /// `M6G_LOADER_DONE` twin).
 static U2_DONE: AtomicBool = AtomicBool::new(false);
+/// Set once the U4x launcher has printed its verdict AND its slots have freed, so the U5x launcher orders
+/// its lines AFTER U4x's and runs with a free slot for the teardown-clear proof (the aarch64
+/// `U4_LAUNCH_DONE` twin).
+static U4X_LAUNCH_DONE: AtomicBool = AtomicBool::new(false);
+
+// --- U5x demo accounting (written by the exit/kill paths, read by the launcher's verdict). ---
+/// The capability fixture's witness bitmask (its `sys_exit` status, routed by name). One bit per proven
+/// behaviour: write-cap OK (bit0), no-cap -EACCES (bit1), attenuated grant bounded + subset grant usable
+/// (bit2), revoke enforced (bit3). The verdict PASSes iff it equals `U5X_WITNESS_ALL`.
+static U5X_WITNESS: AtomicU32 = AtomicU32::new(0);
+/// 1 once the capability fixture reaches `sys_exit` (its witness is then valid). The launcher waits on
+/// this before reading `U5X_WITNESS`.
+static U5X_DONE: AtomicU32 = AtomicU32::new(0);
+/// Incremented if the capability fixture is KILLED (a fault) — any kill is a verdict FAIL.
+static U5X_KILLED: AtomicU32 = AtomicU32::new(0);
+/// The full witness — all four capability behaviours proven.
+const U5X_WITNESS_ALL: u32 = 0xF;
 
 /// U4x fixture run parameters: the parent's + orphan's ring-3 entry VAs (both inside the shared window
 /// VA — only the slot FRAME differs, via CR3), the shared initial user rsp, and each fixture's slot
@@ -1684,12 +2090,14 @@ pub fn u4x_launcher(demo_cpu: usize) {
 
     // 2. No block device -> the children cannot run (their program came off it); skip silently.
     if crate::drivers::block::info().is_none() {
+        U4X_LAUNCH_DONE.store(true, Ordering::Release); // release the U5x gate (U5x also skips on no-SD)
         return;
     }
 
     // 3. Build the parent + orphan slots and spawn both on the demo core.
     let Some(demo) = u4x_setup() else {
         serial_println!(":: U4x: no free address-space slot — process-model demo skipped ::");
+        U4X_LAUNCH_DONE.store(true, Ordering::Release); // release the U5x gate even on the skip path
         return;
     };
     crate::arch::sched::spawn_user_in_space(
@@ -1728,6 +2136,9 @@ pub fn u4x_launcher(demo_cpu: usize) {
             U4X_DONE.load(Ordering::Acquire)
         );
     }
+    // Release the U5x gate: the U4x verdict has printed and (both fixtures having exited) the U4x slots
+    // are freed, so the U5x launcher may build + endow its fixture slot and order its lines after ours.
+    U4X_LAUNCH_DONE.store(true, Ordering::Release);
 }
 
 /// U4x one-shot, fired from the main loop once a block device is present (mirrors `u2_probe_once`'s
@@ -1753,6 +2164,9 @@ pub fn u4x_probe_once() {
     // Pre-stage HELLO.BIN off FAT HERE (BSP main loop, IF=1). A missing volume/file skips the demo.
     if !stage_hello() {
         serial_println!(":: U4x: HELLO.BIN not available — process-model demo skipped ::");
+        // U4x is skipped, but the U5x fixture is an inline blob (no HELLO.BIN needed), so release the
+        // U5x gate immediately rather than making it wait out its 10 s deadline before running.
+        U4X_LAUNCH_DONE.store(true, Ordering::Release);
         return;
     }
 
@@ -1760,4 +2174,146 @@ pub fn u4x_probe_once() {
     // orphan on `cpu` — the `u2_probe_once` split.
     let vcpu = online.get(1).copied().unwrap_or(cpu);
     crate::arch::sched::spawn("u4x-launch", u4x_launcher, cpu, vcpu, crate::arch::sched::PRIO_NORMAL);
+}
+
+/// U5x fixture run parameters: the capability fixture's ring-3 entry VA (inside the shared window VA —
+/// only the slot FRAME differs, via CR3), the initial user rsp, its slot CR3, and its slot INDEX (for the
+/// teardown-clear proof — `handle_row_is_clear(slot)`).
+struct U5xDemo {
+    cap: u64,
+    sp: u64,
+    cr3: u64,
+    slot: usize,
+}
+
+/// U5x setup: allocate + build ONE private slot, copy the U5x blob into its code page through the identity
+/// alias (the slot's code page is RX-RO from the start — W^X by construction, `build_slot`), then
+/// PRE-ENDOW the fixture's table with the two handles the demo exercises:
+///   handle 1 = CONSOLE, {CAP_WRITE|CAP_GRANT} — the "full" console cap it writes from and grants from
+///   handle 2 = CONSOLE, {CAP_READ}            — a console cap WITHOUT write (the `-EACCES` negative)
+/// Emits the U5x setup line; returns the run params. `None` if slot allocation fails. Called ONCE from
+/// `u5x_launcher`, after the U4x gate — so a slot is free and no task runs under the fixture's slot yet
+/// (the endowment stores cannot race a resolver). Register-only fixture (writes no user stack).
+fn u5x_setup() -> Option<U5xDemo> {
+    let slot = crate::arch::memory::alloc_user_space()?;
+    let blob_start = &raw const unaos_user_u5x_blob_start as usize;
+    let blob_end = &raw const unaos_user_u5x_blob_end as usize;
+    let blob_len = blob_end - blob_start;
+    assert!(blob_len as u64 <= PAGE_SIZE, "U5x blob does not fit in a code page");
+    let cap_off = (&raw const unaos_user_u5x_cap as usize - blob_start) as u64;
+    let backing = crate::arch::memory::slot_backing_ptr(slot);
+    unsafe {
+        // Scrub the whole window (residue), then copy the blob into the code page (page 0) through the
+        // identity alias — never USER_BASE, so the code mapping stays read-only (W^X).
+        core::ptr::write_bytes(backing, 0, (USER_WINDOW_PAGES * PAGE_SIZE) as usize);
+        core::ptr::copy_nonoverlapping(blob_start as *const u8, backing, blob_len);
+    }
+    // Pre-endow the fixture's table (before it is dispatched — no concurrent resolver). Two console caps:
+    // a full one (write + grant) at index 1, and a write-LESS one at index 2 for the negative.
+    install_cap(slot, 1, HANDLE_CONSOLE, CAP_WRITE | CAP_GRANT);
+    install_cap(slot, 2, HANDLE_CONSOLE, CAP_READ);
+    serial_println!(
+        ":: U5x: capabilities — rights + CHECK + grant/attenuate/revoke + routed sys_write ::"
+    );
+    Some(U5xDemo {
+        cap: USER_BASE + cap_off,
+        sp: USER_BASE + USER_WINDOW_PAGES * PAGE_SIZE - 16,
+        cr3: crate::arch::memory::slot_cr3(slot),
+        slot,
+    })
+}
+
+/// U5x launcher + verdict (the `u4x_launcher` shape: one gated kernel task on a scheduled sibling core).
+/// `demo_cpu` (the task arg) is the core the cap fixture runs on. Flow:
+///   1. Wait (bounded, yielding) for `U4X_LAUNCH_DONE`, so the U5x lines land after the U4x verdict and
+///      the U4x slots have freed.
+///   2. Skip silently if no block device — U5x needs NO disk (its fixture is an inline blob), but gating
+///      on it keeps the no-storage control path free of demo lines (mirrors U4x).
+///   3. `u5x_setup()` (build + pre-endow the fixture's slot), then spawn the fixture on `demo_cpu`.
+///   4. Verdict (folded): wait (bounded) for the fixture's exit (`U5X_DONE == 1`), read its witness, then
+///      wait (bounded) for its handle row to be cleared — the teardown-clear proof:
+///      `sched::exit -> memory::free_user_space_by_cr3` clears the row when the fixture exits,
+///      transitioning `handle_row_is_clear` false->true (the fixture holds live handles at exit — the
+///      minted cap and the write-less cap — so this genuinely exercises the clear). PASS iff witness ==
+///      `U5X_WITNESS_ALL` AND the row cleared AND no U5x kill. Prints ONE PASS line.
+pub fn u5x_launcher(demo_cpu: usize) {
+    // 1. Gate on the U4x launcher (its verdict printed + its slots freed), bounded + yielding.
+    let wdeadline = crate::arch::ticks() + 10_000;
+    while !U4X_LAUNCH_DONE.load(Ordering::Acquire) && crate::arch::ticks() < wdeadline {
+        crate::arch::sched::yield_now();
+    }
+
+    // One-shot (spawned once; guard defensively).
+    static DONE: AtomicBool = AtomicBool::new(false);
+    if DONE.swap(true, Ordering::Relaxed) {
+        return;
+    }
+
+    // 2. No block device -> keep the no-storage control path free of demo lines (U5x needs no disk).
+    if crate::drivers::block::info().is_none() {
+        return;
+    }
+
+    // 3. Build + pre-endow the fixture slot and spawn it on the demo core.
+    let Some(u5) = u5x_setup() else {
+        serial_println!(":: U5x: no free address-space slot — capability demo skipped ::");
+        return;
+    };
+    crate::arch::sched::spawn_user_in_space("u5x-cap", u5.cap, u5.sp, demo_cpu, u5.cr3);
+
+    // 4a. Wait (bounded, yielding) for the fixture to reach its exit, then snapshot the witness.
+    let vdeadline = crate::arch::ticks() + 5000;
+    while U5X_DONE.load(Ordering::Acquire) < 1 && crate::arch::ticks() < vdeadline {
+        crate::arch::sched::yield_now();
+    }
+    let witness = U5X_WITNESS.load(Ordering::Acquire);
+    let killed = U5X_KILLED.load(Ordering::Acquire);
+
+    // 4b. Teardown-clear proof: the fixture exited above, so its exit path cleared its handle row. That
+    //     clear runs just after the exit accounting, so poll (bounded) until the row is clear — false->true
+    //     when teardown runs. Nothing reuses the slot after (U5x is the last demo), so once clear it stays.
+    let tdeadline = crate::arch::ticks() + 2000;
+    while !handle_row_is_clear(u5.slot) && crate::arch::ticks() < tdeadline {
+        crate::arch::sched::yield_now();
+    }
+    let cleared = handle_row_is_clear(u5.slot);
+
+    if witness == U5X_WITNESS_ALL && cleared && killed == 0 {
+        serial_println!(
+            ":: U5x: x86 capabilities — write-cap OK, no-cap -EACCES, attenuated grant bounded, revoke enforced, teardown-clear clean -> PASS ::"
+        );
+    } else {
+        serial_println!(
+            ":: U5x: x86 capabilities FAIL — witness={:#x} cleared={} killed={} done={} (want {:#x} / true / 0 / 1) ::",
+            witness,
+            cleared,
+            killed,
+            U5X_DONE.load(Ordering::Acquire),
+            U5X_WITNESS_ALL
+        );
+    }
+}
+
+/// U5x one-shot, fired from the main loop after `u4x_probe_once` (gated on storage like U4x, so the no-SD
+/// control path stays free of demo lines). It spawns the U5x launcher on a sibling AP; the launcher gates
+/// on `U4X_LAUNCH_DONE`, so ordering + the free-slot precondition hold regardless of interleave. No FAT
+/// I/O — the U5x fixture is an inline blob (unlike U2/U4x's disk-loaded child).
+pub fn u5x_probe_once() {
+    static DONE: AtomicBool = AtomicBool::new(false);
+    if DONE.load(Ordering::Relaxed) {
+        return;
+    }
+    if crate::drivers::block::info().is_none() {
+        return; // retry next loop iteration until storage enumerates (mirrors u4x_probe_once)
+    }
+    let online = crate::arch::smp::online_aps();
+    let Some(&cpu) = online.first() else {
+        DONE.store(true, Ordering::Relaxed);
+        serial_println!(":: U5x: no application processor online — capability demo skipped ::");
+        return;
+    };
+    DONE.store(true, Ordering::Relaxed); // one-shot from here regardless of outcome
+
+    let vcpu = online.get(1).copied().unwrap_or(cpu);
+    crate::arch::sched::spawn("u5x-launch", u5x_launcher, cpu, vcpu, crate::arch::sched::PRIO_NORMAL);
 }
