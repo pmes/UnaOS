@@ -628,6 +628,33 @@ fn main() -> Status {
         }
     }
 
+    // aarch64: make the just-written (and just-relocated) kernel image coherent with the
+    // INSTRUCTION side before jumping into it. ARMv8 I-caches are not coherent with stores: the
+    // image bytes sit in the D-cache, while the I-cache (and unified L2 as fetched) may hold
+    // STALE lines from whatever previously occupied these physical pages — across repeated boot
+    // cycles UEFI's allocator hands back the same base, so that is the PREVIOUS kernel build's
+    // code. Executing a stale line raises an EC=0 "unknown reason" exception at an address whose
+    // CURRENT bytes disassemble innocently (the JB1b metal lesson on the Orin A78AE, 2026-07-06 —
+    // nondeterministic, and invisible in QEMU, which models no I-cache). The ARMv8
+    // code-modification sequence: clean every image line to the Point of Unification, then
+    // invalidate the whole I-cache, with barriers.
+    #[cfg(target_arch = "aarch64")]
+    unsafe {
+        let mut addr = load_base & !63;
+        let end = load_base + (max_vaddr - min_vaddr);
+        while addr < end {
+            core::arch::asm!("dc cvau, {}", in(reg) addr, options(nostack, preserves_flags));
+            addr += 64;
+        }
+        core::arch::asm!(
+            "dsb ish",
+            "ic iallu",
+            "dsb ish",
+            "isb",
+            options(nostack, preserves_flags)
+        );
+    }
+
     let entry_point = elf.header.pt2.entry_point() - min_vaddr + load_base;
 
     #[allow(unused_mut)]
