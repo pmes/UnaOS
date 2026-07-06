@@ -426,6 +426,13 @@ print-and-halt unchanged. Verification boot: the full chain (ping PASS, XUSB ALI
 CAPSTONE 6/6) ran clean. The JB1d evidence line (r0p1 + bit8=0) prints every boot as the standing
 record for the NVIDIA upstream report.
 
+**Heal proven in live fire + JB2a port survey (the session's closing boot):** the phantom struck
+mid-CAPSTONE and the heal caught it — `heal #1: EC=0 at ELR=0x25e544d30 (D-side 0xf81f0ffe valid)
+— ic iallu + retry` — and the boot ran to CAPSTONE COMPLETE. Same boot, the JB2a survey (pure
+PORTSC reads on the ungated controller, no writes/reset) reported the plugged keyboard: **ports 6
+and 7 CONNECTED, PORTSC=0x000202e1 (CCS=1, PLS=7 Polling, USB2)** — the JB2 enumeration arc's
+starting evidence, delivered before a line of driver porting.
+
 *(Historical dossier, superseded by the above:)*
 three occurrences of a fault with **ESR exactly `0x2000000` (EC=0x00 "unknown reason", IL=1,
 ISS=0), FAR=0**, at INNOCENT instructions (a stack `str` before a `bl`; an epilogue
