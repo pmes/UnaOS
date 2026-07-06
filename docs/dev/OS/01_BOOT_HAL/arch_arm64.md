@@ -680,8 +680,10 @@ the same BPMP transport JB1 proved. CSR fields: bit[31]=ENABLE, bits[23:16]=DUTY
    UEFI teardown confirm PWM gets clock+reset only, never a powergate). So — unlike XUSB — the CSR
    aperture is **not** a gated block: **no new EL3-fatal class** (the XUSB trap was touching a
    *power-gated* block; PWM has no power domain).
-4. `w32(0x032A0000, 0x81FF0000)` → ENABLE + ~100 % duty → fan full-on. (UEFI's own "medium" is
-   `0x80800000`; the DT `cooling-levels` top = 255 = 0xFF for full.)
+4. `w32(0x032A0000, <csr>)` where `csr = ENABLE | (duty<<16)`, `duty = round(pct/100 * 256)`.
+   100% = `0x81000000` (count 256=0x100 overflows the nominal 8-bit field into bit24 — the exact
+   value mainline emits). **Shipped value is regulated to ~40% = `0x80660000`** (100% was deafening
+   on a few-watt board — see the JB0 landed note). (UEFI's own "medium" is `0x80800000` = 50%.)
 5. Pinmux is normally already applied by MB1/UEFI on the devkit — only touch `pinmux@2430000` if the
    fan stays silent after 1–4 (MEDIUM confidence).
 
@@ -707,27 +709,47 @@ voltages persist), the BPMP itself, and GIC/timer/UART (not device-discovery dri
 the *voltages* are all up; only on-SoC clock/reset/powergate partitions get torn down, and only the
 ones a given subsystem needs must be re-asserted.
 
-### JB0 — landed (QEMU-green, ⏳ METAL-PENDING)
+### JB0 — landed + ✅ METAL-CONFIRMED (fan spins on Orin silicon, 2026-07-06)
 
 Implemented as `bpmp_tegra::jb0_fan_on(chan)`, called from `main.rs` the instant the BPMP channel
 is proven by the JB1b ping — **before** the JB1c XUSB ungate, so cooling is restored first. It runs
 the three steps above over the just-proven channel: `MRQ_CLK` enable on `TEGRA234_CLK_PWM3` (107),
-`MRQ_RESET` deassert on `TEGRA234_RESET_PWM3` (70), then `w32(0x032A0000, 0x8100_0000)`. **All three
-constants verified against mainline** (`tegra234-clock.h` / `tegra234-reset.h` / `pwm-tegra.c` +
-`tegra234.dtsi pwm@32a0000`): the clock/reset IDs were right; the full-on CSR value is **`0x8100_0000`**
-— the Linux driver's 100%-duty count is 256 (`0x100`), which overflows the nominal 8-bit duty field
-into bit 24, so the exact value mainline emits is `ENABLE | (0x100 << 16)`, not the `0x80FF_0000`
-(255/256) first guessed (that also runs the fan full, one tick short). Best-effort: a failed
+`MRQ_RESET` deassert on `TEGRA234_RESET_PWM3` (70), then a PWM3 CSR write. **All three constants
+verified against mainline** (`tegra234-clock.h` / `tegra234-reset.h` / `pwm-tegra.c` +
+`tegra234.dtsi pwm@32a0000`): clock/reset IDs correct; the duty count = `round(fraction * 256)` at
+shift 16 (100% = 256 = `0x100`, which overflows the nominal 8-bit field into bit 24 — so full-on is
+`ENABLE | (0x100<<16)` = `0x8100_0000`, not the `0x80FF_0000` first guessed). Best-effort: a failed
 clock/reset MRQ prints and skips (no-fan is not fatal — the hardware thermal net still protects the
 die); the CSR is always-mapped + always-powered, so the write cannot EL3-fault.
 
-Expected serial (before the JB1c XUSB lines): `:: tegra: JB0 — fan PWM3 clk 107 enable -> err=0 ::`
-→ `:: tegra: JB0 — fan PWM3 reset 70 deassert -> err=0 ::` → `:: tegra: JB0 — touching fan PWM3 CSR
-@0x32a0000 … ::` → `:: tegra: JB0 — fan ON: CSR<-0x81000000 (readback 0x81000000) -> PASS ::`. **The
-metal proof is trivial and instant: the fan spins up audibly** (and the readback line echoes the CSR).
+**Metal result (attended boot):** the whole chain ran clean on Orin silicon — `JB0 — fan PWM3 clk
+107 enable -> err=0` → `reset 70 deassert -> err=0` → `fan ON … CSR<-… (readback matches) -> PASS`
+→ JB1c XUSB ALIVE → Controller Started → **CAPSTONE 6/6**. **The fan physically spun.** First run at
+100% (`0x8100_0000`) was deafening (a headless bring-up board draws only a few watts), so the
+shipped value is **regulated to ~40% duty: `PWM_FAN_DUTY = 0x8066_0000`** (`ENABLE | 0x66<<16`,
+102/256) — confirmed on metal (`readback 0x80660000`), much quieter, ample cooling, CAPSTONE 6/6.
+Retune trivially: duty = `round(pct/100 * 256)`, CSR = `0x8000_0000 | (duty<<16)`.
+
+**We do NOT need closed-loop thermal management.** The Orin's BL31/BPMP hardware thermal net
+(103 °C throttle / 105 °C PMIC cutoff, OS-independent) guarantees safety regardless of fan value,
+and UnaOS's light workload (CAPSTONE / polled xHCI / keyboard pump, a few watts) sits in a stable
+cool band at a fixed 40%. Varying RPM by temperature is a pure acoustics/heavy-load nicety — if ever
+wanted, the cheap form is a periodic `MRQ_THERMAL` Tj read stepping the fan through 2–3 duty bands
+(Linux cooling-levels style), not a control loop. Filed as a future arc, not a JB0 blocker.
+
+**⚠ Build hazard (cost several attended boots — recorded so it doesn't recur):** an *incremental*
+`esp-jetson` build produced a **corrupt kernel.elf** (355 KB vs the correct ~221 KB — a ~57% `.text`
+bloat, the signature of `overflow-checks`/`debug-assertions` sneaking on). It hash-flashed to the
+card faithfully but **faulted on the first instruction at EL2, before any serial** — a dead hang
+right after `Bootloader Started`, indistinguishable from a firmware EBS stall. A full `./arroyo
+clean` + rebuild reproduced the correct 221 KB binary and booted. **Lesson: sanity-check the kernel
+size before flashing** (a 60-line change must not balloon the binary), and prefer a clean build for
+metal media. Also: `./arroyo clean` wipes `target/`, which will delete an in-progress serial capture
+there — keep the bridge log outside `target/`.
+
 Gate: `./arroyo check` + `UNAOS_TEGRA=1 ./arroyo check` green; x86 `test` MISSION SUCCESS; virt GICv3
 `test-arm` CAPSTONE 6/6; Pi `kernel8` builds; `esp-jetson` links. Changes are entirely tegra-cfg-gated
-(non-tegra binaries byte-identical). QEMU models no Tegra PWM — the verdict is the next attended boot.
+(non-tegra binaries byte-identical).
 
 ## 4. Jetson Orin Nano headless bring-up (Arc JM2)
 

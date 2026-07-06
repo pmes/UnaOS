@@ -406,12 +406,16 @@ pub fn jb1c_ungate_xusb(chan: &Chan, ids: &super::fdt_tegra::XusbIds) -> bool {
 // `&pwm3` channel 0 = the fan; UEFI's own TegraPwmDxe drives this same block during boot).
 // PWM_CONTROLLER_PWM_CSR_0 is one 32-bit register at base+0x0 (channel 0): bit[31] = ENABLE,
 // DUTY = a fraction of 256 at PWM_DUTY_SHIFT=16, bits[12:0] = SCALE (output frequency only —
-// irrelevant to on/off). Per drivers/pwm/pwm-tegra.c the duty count for 100% is 256 (0x100),
-// which overflows the nominal 8-bit field into bit 24 — the exact value mainline writes for a
-// full-on request is ENABLE | (0x100 << 16) = 0x8100_0000 (cross-checks: UEFI's "medium" is
-// 0x8080_0000 = 128/256 = 50%). Using the true-100% value the reference driver emits.
+// irrelevant to on/off). Per drivers/pwm/pwm-tegra.c the duty count = round(fraction * 256):
+// 256 (0x100) = 100% (overflows the nominal 8-bit field into bit 24; UEFI's "medium" is
+// 0x8080_0000 = 128 = 50%). METAL-PROVEN 2026-07-06: 0x8100_0000 (100%) spun the fan full — far
+// louder than a headless bring-up board needs. Regulated to ~40% (duty 0x66 = 102/256) =
+// ENABLE | (0x66 << 16) = 0x8066_0000: ample cooling for the light CAPSTONE/xHCI load, much
+// quieter (fan noise ~ RPM²). Retune: duty = round(pct/100 * 256), CSR = 0x8000_0000 |
+// (duty << 16) — e.g. 25%->0x8040_0000, 50%->0x8080_0000, 100%->0x8100_0000. (A future arc could
+// make this thermal-adaptive via MRQ_THERMAL Tj reads instead of a fixed duty.)
 const PWM3_CSR: u64 = 0x032A_0000;
-const PWM_FAN_FULL_ON: u32 = 0x8100_0000;
+const PWM_FAN_DUTY: u32 = 0x8066_0000; // ENABLE + ~40% duty
 // TEGRA234_CLK_PWM3 / TEGRA234_RESET_PWM3 (dt-bindings/{clock,reset}/tegra234-*.h). PWM3 sits in
 // an always-on rail (its DT node has no `power-domains`), so — unlike the XUSB host block — this
 // CSR is NOT a power-gated aperture: no MRQ_PG and no JX1-class EL3-fatal risk. It only needs its
@@ -425,10 +429,11 @@ const RESET_PWM3: u32 = 70;
 /// (A dead fan can't damage the die — BL31/BPMP arm an OS-independent hardware thermal net that
 /// throttles at 103 C and PMIC-resets at 105 C — but restoring cooling keeps the SoC out of the
 /// throttle band.) This is the cheapest teardown-restore: re-enable the PWM3 clock + deassert its
-/// reset over the SAME BPMP channel JB1 proved, then drive the CSR full-on. Runs FIRST on Orin,
-/// before the XUSB work. Best-effort: a failed clock/reset MRQ prints and skips (no fan is not
-/// fatal); the CSR is always-mapped (GiB-0 Device block, same as XUSB) and always-powered, so the
-/// write cannot EL3-fault — the pre-touch line is JX1 discipline, not a real hazard here.
+/// reset over the SAME BPMP channel JB1 proved, then drive the CSR to a regulated ~40% duty
+/// (metal-proven: 100% ran the fan deafeningly). Runs FIRST on Orin, before the XUSB work.
+/// Best-effort: a failed clock/reset MRQ prints and skips (no fan is not fatal); the CSR is
+/// always-mapped (GiB-0 Device block, same as XUSB) and always-powered, so the write cannot
+/// EL3-fault — the pre-touch line is JX1 discipline, not a real hazard here.
 pub fn jb0_fan_on(chan: &Chan) {
     match chan.transfer(MRQ_CLK, &[(CMD_CLK_ENABLE << 24) | (CLK_PWM3 & 0x00ff_ffff)]) {
         Some((err, _)) => {
@@ -453,11 +458,11 @@ pub fn jb0_fan_on(chan: &Chan) {
         ":: tegra: JB0 — touching fan PWM3 CSR @{:#x} (always-on, not PG-gated) ::",
         PWM3_CSR
     );
-    w32(PWM3_CSR, PWM_FAN_FULL_ON);
+    w32(PWM3_CSR, PWM_FAN_DUTY);
     dsb();
     serial_println!(
-        ":: tegra: JB0 — fan ON: CSR<-{:#010x} (readback {:#010x}) -> PASS ::",
-        PWM_FAN_FULL_ON,
+        ":: tegra: JB0 — fan ON (~40% duty): CSR<-{:#010x} (readback {:#010x}) -> PASS ::",
+        PWM_FAN_DUTY,
         r32(PWM3_CSR),
     );
 }
