@@ -329,6 +329,31 @@ JM6 code is `tegra`-gated (a new `boot_tegra` module, a tegra arm on the `sched`
 tegra-only `tegra_early_stop` body), so every non-tegra build's cfg set — and thus its output — is
 unchanged.
 
+### JM7 — Orin video: the GOP framebuffer through the tegra tables (metal verdict pending)
+
+With a monitor connected at boot, NVIDIA's UEFI publishes a GOP and the bootloader hands its
+framebuffer to the kernel (`BootInfo::framebuffer_*`); `fbcon` — the boot-log mirror every
+`serial_println!` already writes through — has been drawing to it since `kernel_main` step 0 under
+the UEFI map. JM7 makes that survive the kernel's own translation regimes, turning the monitor into
+a live boot console on the Orin:
+
+- **`mmu_tegra::build_l1` step 2b** force-marks the GOP's GiB range into the RAM-GiB mask (the GOP
+  carveout can sit in a Reserved region the RAM scan skips), so both the live EL2 `L1` **and the EL1
+  twin `L1_EL1`** map it — the mirror works before *and after* the JM6b drop. Mapped Normal-WB (a
+  1 GiB block cannot carry a separate attribute without a new MAIR index); CPU-write → scanout
+  coherency rides fbcon's existing damage-tracked `flush_range` → `dc cvac` (the Pi recipe;
+  `arch::flush_framebuffer_range` is unconditional on aarch64). Headless boots (`fb addr=0`): the
+  mask is untouched and fbcon stays inert — behavior identical to JM6b.
+- **`tegra_early_stop`** prints the GOP handoff (`:: tegra: JM7 — GOP fb addr=… size=… WxH stride
+  bpp ::`) and **no longer detaches fbcon** before the drop (contrast JC3/virt, whose EL1 map omits
+  the fb) — the monitor shows the pre-drop dump, the EL1 landing line, and the CAPSTONE run live.
+- Expected on metal (monitor on the DP→HDMI cable): the full boot log in 8×8 grey-on-black text on
+  screen, through CAPSTONE COMPLETE; serial identical to JM6b plus the JM7 GOP line. Failure modes
+  are bounded: a wrong/unmapped fb GiB faults into the Part-C vector as a printed syndrome.
+- Out of scope, documented for the follow-on: interactive console/GUI on Orin (input), and real USB
+  keyboard/mouse — the Orin's built-in ports are **Tegra XUSB** (a platform controller needing
+  firmware/phy bring-up, NOT the PCIe xHCI the kernel already drives); that is its own arc.
+
 ## 4. Jetson Orin Nano headless bring-up (Arc JM2)
 
 The Orin is brought up **headless over serial**. The only console that has ever

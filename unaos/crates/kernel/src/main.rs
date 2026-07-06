@@ -871,6 +871,20 @@ fn tegra_early_stop(boot_info: &'static mut BootInfo) -> ! {
         mmu.ttbr0,
         mmu.ram_gib_mask,
     );
+    // JM7 (video): report the GOP the firmware handed off (addr=0 = headless boot, fbcon inert).
+    // With a monitor connected, fbcon has been mirroring serial output onto this framebuffer since
+    // kernel_main step 0 (under the UEFI map), and mmu_tegra just mapped its GiBs into BOTH tables
+    // (the mask above includes them) — so the monitor is already showing this very boot log, and
+    // keeps showing it across the EL1 drop.
+    serial_println!(
+        ":: tegra: JM7 — GOP fb addr={:#x} size={:#x} {}x{} stride={} bpp={} ::",
+        boot_info.framebuffer_addr,
+        boot_info.framebuffer_size,
+        boot_info.framebuffer_info.width,
+        boot_info.framebuffer_info.height,
+        boot_info.framebuffer_info.stride,
+        boot_info.framebuffer_info.bytes_per_pixel,
+    );
 
     // 2. Boot banner: the same EL / CNTFRQ / MMU / DAIF snapshot `arch::boot_diagnostics` prints, read
     // straight from system registers (zero MMIO — cannot fault). Now the first REAL EL/CNTFRQ values
@@ -941,11 +955,11 @@ fn tegra_early_stop(boot_info: &'static mut BootInfo) -> ! {
     //    (the stub reads ELR_EL2/SPSR_EL2 — a fault at EL1), and CAPSTONE runs cooperatively (exactly how
     //    the Pi/virt CAPSTONE already runs under QEMU with no Group-1 delivery).
     //
-    //    Detach fbcon first (mirrors JC3): after the drop the EL1 map covers only RAM + the Tegra device
-    //    window, so a serial_println! that mirrored to a framebuffer outside it would fault at EL1. Orin
-    //    here is headless (no fb), so this is a defensive no-op; UARTC lives in the mapped device window,
-    //    so the CAPSTONE log is captured over serial regardless.
-    unaos_kernel::video::fbcon::detach();
+    //    JM7 (video): fbcon is deliberately NOT detached here (contrast JC3/virt, whose EL1 map omits
+    //    the fb). mmu_tegra mapped the GOP GiBs into BOTH the live EL2 table and the EL1 twin, so the
+    //    mirror keeps working across the drop — a connected monitor shows the pre-drop dump, the EL1
+    //    landing line, and the CAPSTONE run live. Headless (fb addr=0): fbcon is inert, so keeping it
+    //    attached is the same no-op the old detach was.
     serial_println!(
         ":: tegra: JM6 — dropping the Orin boot core EL2 -> EL1 for the scheduler + CAPSTONE ::"
     );
