@@ -136,6 +136,14 @@ needs a dedicated investigation (see the "JM5 result" section for the syndrome, 
 query-works/power-faults split, and the ranked hypotheses). QEMU models no Tegra machine, so
 QEMU-green did not — and here could not — imply Orin-correct.
 
+**Scheduler on Orin — the boot core, JM6 (QEMU-green; ⛔ metal FAILED).** JM6 drops the Orin boot
+core **EL2 → EL1** (`arch/aarch64/boot_tegra.rs`, reusing JM3's `mmu_tegra` identity `L1`) to run the
+scheduler + CAPSTONE at EL1 — single-core, sidestepping the JM5 `CPU_ON` wall. It lands **QEMU-green**
+(the drop mechanism is JC3's, proven on `virt`), but on the **real Orin it dark-hangs at the drop**:
+the `eret` reaches EL1, then the first EL1 instruction fetch aborts (5 attended boots; monitor- and
+`SCTLR_EL1`-independent). This gates any "scheduler-on-Orin" claim — see the **JM6 result** section
+below for the full localization + investigation plan.
+
 ### JC3 result — virt EL2 → EL1 drop + scheduler/CAPSTONE at EL1 (**QEMU-green**)
 
 The `virt` boot core now runs the scheduler and the full six-primitive CAPSTONE at
@@ -204,10 +212,96 @@ shifted by the added code). x86 (`test 25`): unaffected (MISSION SUCCESS + U1a/U
 PASS). Pi (`kernel8-test 30`): **byte-identical mod interleave** (sorted-diff `0` vs a base
 worktree at `31ff7a1`, over a log that runs the full Pi scheduler + CAPSTONE + M6g/EL0).
 
-**Deferred (follow-on).** EL0 on `virt` (a `hello`-class program at EL1&0) and the Orin
-boot-core drop (repeat this drop on JM3's `mmu_tegra` EL2 regime → an EL1 regime, then run
-the scheduler + a disk-loaded EL0 program on silicon — the metal payoff, needs no SMP). SMP
-scheduling on `virt` (dropping the APs too) is likewise later.
+**Deferred (follow-on).** EL0 on `virt` (a `hello`-class program at EL1&0) is still later; the
+Orin boot-core drop named here is now done — see the **JM6 result** below. SMP scheduling on
+`virt` (dropping the APs too) is likewise later.
+
+### JM6 result — Orin EL2 → EL1 drop + scheduler/CAPSTONE at EL1 (QEMU-green; ⛔ **metal FAILED — dark hang at the drop**)
+
+JM6 repeats the JC3 drop on the **Orin** (Tegra234, Cortex-A78AE) boot core: it drops
+**EL2 → EL1** and runs the full six-primitive M4 CAPSTONE cooperatively at EL1 — the first time
+the scheduler runs on Orin silicon. Single-core, so it needs no SMP and sidesteps the parked
+JM5 `CPU_ON` wall entirely. The Orin path is **not** emulated in QEMU (QEMU models no Tegra
+machine), so this lands **QEMU-green** — it compiles under `UNAOS_TEGRA` and the drop MECHANISM
+is the JC3 one already proven on `virt` — and its **true verdict is a Peter-attended Orin serial
+capture** (metal PENDING).
+
+**The drop (`arch/aarch64/boot_tegra.rs`).** The tegra analogue of `boot_virt.rs`. The decisive
+difference from `virt`: `virt` builds a *fresh* EL1 table, whereas tegra **reuses the identity
+`L1` `mmu_tegra::init` already built** for the EL2 regime (its PA is `MmuInfo::ttbr0`). The EL1
+arm points `TTBR0_EL1`/`TCR_EL1`/`MAIR_EL1`/`SCTLR_EL1` at that same `L1` and arms it with
+**`SCTLR_EL1.M=1` while still at EL2** (dormant there); it becomes live the instant the `eret`
+lands at EL1, so **EL1 never runs a single instruction with its MMU off**. The map is identity,
+so PC/SP do not move across the drop. `MAIR_EL1 = 0x04FF` matches the `L1`'s AttrIdx encoding
+(Normal-WB / Device-**nGnRE** — Tegra's early-write-ack type, not the Pi/virt nGnRnE). Reusing
+the EL2-built descriptors is sound at EL1 for a kernel-only core: each leaf's bit 6 reads as
+AP[2:1]=`0b01` (**EL1 read-write**), PXN=0 on RAM (the kernel executes it), and the device
+window stays EL1-RW so UARTC/GIC MMIO is reachable — an EL1-precise map (RAM no-EL0, Device
+PXN|UXN) is only worth building once EL0 code runs on Orin (a follow-on arc). The drop proper
+mirrors `drop_el2_to_el1_virt` (VMPIDR/VPIDR seed, CPTR/CPACR FP-enable, CNTHCTL, HCR_EL2.RW,
+`SPSR_EL2 = 0x3c5` = EL1h + DAIF masked, `eret` to `x30`, **CNTP disabled**), with one
+tegra-specific addition: it **masks DAIF (`daifset #0xf`) up front**, because JM4 leaves IRQs
+unmasked at EL2 (it proved the timer PPI delivering there) — CAPSTONE at EL1 needs none, and an
+IRQ taken at EL1 would fault the EL2-banking `__vec_irq` stub. `SCTLR_EL1` is the absolute A72
+RES1-mask value (`0x30D0_0800 | M|C|I`): every bit in that mask is, on A78AE, still RES1 or a
+control whose 1-value is benign for a kernel-only core, and no A78AE RES1 bit lies outside it, so
+the mask is a safe superset (Orin UEFI runs the kernel at EL2, so `SCTLR_EL1` was never
+initialised → an absolute value, not an RMW).
+
+**Call site (`main.rs::tegra_early_stop`).** After JM4 (GIC-600 + generic timer up, timer IRQ
+proven at EL2), the terminus is now: `fbcon::detach()` → banner → `boot_tegra::drop_to_el1(
+mmu.ttbr0)` → `percpu::init(0)` (now `TPIDR_EL1`) → `exceptions::install()` (now `VBAR_EL1`) →
+`sched::run_capstone_boot_core(0)` (never returns). `percpu`/`exceptions` pick the EL from
+`CurrentEL` at runtime (JC3), so they need no change. **JM5's `CPU_ON` SMP is deliberately not
+invoked on this path**: on the real Orin the first `CPU_ON` RAS-faults (BL31/MCE, external
+firmware) and powers the box off *before returning*, which would prevent ever reaching CAPSTONE;
+JM6 is single-core by design. `smp_virt` stays compiled for tegra — it is simply not called.
+
+**Metal verdict — ⛔ FAILED (dark hang at the drop; 5 Peter-attended boots, 2026-07-05).** On the
+real Orin the boot core **dark-hangs at the EL2 → EL1 drop.** Every line up to and including
+`:: tegra: JM6 — dropping … ::` prints cleanly — JM3 (EL2 MMU), JM4 (GIC/timer), and the heap init
+(`:: KERNEL HEAP ALLOCATED ::`) all run on silicon — then nothing. Captures:
+`target/serial-orin-jm6-FAIL{,2,3,4}-*.log`.
+
+*Localization (what the 5 boots established):*
+- **Monitor-independent** — headless reboots (matching the JM3/JM4 baseline) hang identically. (With a
+  monitor the firmware publishes a GOP where headless publishes none, but the kernel boots `fb_addr=0`
+  either way; the hang is unchanged.)
+- **The `eret` reaches EL1** — an illegal exception return would have faulted to `VBAR_EL2` (which
+  `mmu_tegra` set) and printed a syndrome; it does not. So the transition to EL1 completes.
+- **The first EL1 instruction fetch aborts** — a diagnostic build armed `VBAR_EL1` with `mmu_tegra`'s
+  bounded fault printer *before* the eret, and a second build `eret`ed into a naked EL1 stub that
+  raw-writes `JM6` to UARTC as its first instructions (no stack, no calls). **Both stayed dark** — so
+  `.text` is unfetchable/unexecutable at EL1 the instant the drop lands (the vector fetch aborts too).
+- **`SCTLR_EL1` is not the sole cause** — switching from the absolute A72 RES1-mask value to
+  `mmu_tegra`'s **metal-proven `SCTLR_EL2` RMW** (`read | M|C|I`) changed nothing.
+
+*Open puzzle:* the reused `L1` maps the code GiB Normal-WB with **PXN=0** (EL1-executable) and
+`SCTLR_EL1.M=1`, so by analysis the fetch should succeed — yet on A78AE it aborts. A *fresh* EL1 L1
+(the `boot_virt` model) differs from the reused one **only in AP[1]** (EL0 access), which does not
+change EL1 executability — so it is unlikely to be the fix on its own.
+
+*Investigation plan (a dedicated session, like the JM5 `CPU_ON` wall — NOT blind reboots):*
+1. **Verify, don't assume** — at EL2 right before the eret, read back `SCTLR_EL1`/`TCR_EL1`/
+   `TTBR0_EL1`/`MAIR_EL1`/`HCR_EL2`, the `ELR_EL2` return VA, and the `L1[code-GiB]` descriptor, and
+   print them (serial works at EL2). Catches any "the register/descriptor isn't what we think" bug.
+2. Keep the EL1 fault vector + the sentinel stub as permanent instruments.
+3. Audit `HCR_EL2` for an A78AE EL1&0-regime bit the QEMU-A72 `boot_virt` path never needs (VM is
+   already 0; check the full firmware `HCR_EL2` vs our absolute `1<<31`).
+4. Consider I-cache/TLB coherency across the regime switch (`ic iallu`), and a low-PA landing trampoline.
+
+The QEMU DONE gate below still stands (JM6 lands QEMU-green as briefed); this metal FAIL is the arc's
+true verdict and gates any "metal-confirmed" claim.
+
+**Regression bar (all held, QEMU).** `./arroyo check` both arches; `UNAOS_TEGRA=1 ./arroyo check`
+both legs + `esp-jetson` link. virt (`UNAOS_GICV3=1 test-arm 45`): SMP 3/3 + the JC3 drop +
+`VBAR_EL1 = 0x7c38c000` + CAPSTONE 6/6 — **byte-identical** to JC3 (same `VBAR_EL1` address, so
+the virt binary layout is unshifted). Pi (`kernel8-test 30`): **sorted-diff 0** (the Pi *binary*
+hash shifts only because a longer `main.rs` comment moves embedded panic/`Location` line-number
+strings; the serial log — the behaviour — is unchanged). x86 (`test 25`): MISSION SUCCESS. All
+JM6 code is `tegra`-gated (a new `boot_tegra` module, a tegra arm on the `sched` cfg gate, and the
+tegra-only `tegra_early_stop` body), so every non-tegra build's cfg set — and thus its output — is
+unchanged.
 
 ## 4. Jetson Orin Nano headless bring-up (Arc JM2)
 

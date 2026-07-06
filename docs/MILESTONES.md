@@ -51,6 +51,40 @@ Legend: **✅ metal-confirmed** · **🔬 QEMU-green, metal pending** · dates I
   wake is a scheduler post; child loads ride U2's metal-confirmed FAT path).
 - **Commit:** on `hw-rmbp` (see landing report); unmerged (integrator records the merge).
 
+## hw-jetson track — 2026-07-05 (landed on `hw-jetson`, awaiting integration)
+
+### JM6 — drop the Orin boot core EL2 → EL1 + run the scheduler/CAPSTONE at EL1 🔬 QEMU-green / ⛔ metal FAILED `hw-jetson`
+- **What:** repeats the JC3 drop on the **Orin** (Tegra234, Cortex-A78AE) boot core — it drops
+  **EL2 → EL1** and runs the full six-primitive M4 CAPSTONE cooperatively at EL1, the first time
+  the scheduler runs on Orin silicon. A new `arch/aarch64/boot_tegra.rs` (the tegra analogue of
+  `boot_virt`) arms the EL1&0 regime at **`mmu_tegra`'s already-built identity `L1`** (`MmuInfo::
+  ttbr0`) with `SCTLR_EL1.M=1` *while still at EL2* — dormant until the `eret`, so EL1 never runs
+  an instruction with its MMU off — then a naked-asm drop (mask DAIF, seed VMPIDR/VPIDR, FP-enable,
+  `HCR_EL2.RW`, **disable CNTP**, `SPSR_EL2 = 0x3c5`, `eret` to `x30`). `main.rs::tegra_early_stop`
+  gains the JM6 terminus after JM4 (`fbcon::detach` → `boot_tegra::drop_to_el1(mmu.ttbr0)` →
+  `percpu::init(0)` → `exceptions::install()` → `sched::run_capstone_boot_core(0)`, never returns).
+  Single-core by design: JM5's Orin SMP (`CPU_ON`) is **parked** (metal-blocked on an external
+  Tegra BL31/MCE RAS fault) and deliberately not invoked here, so JM6 sidesteps that wall.
+- **Tested — QEMU (the DONE gate; Orin is not emulated):** `./arroyo check` both arches +
+  `UNAOS_TEGRA=1 ./arroyo check` both legs, no new warnings. Non-regression: virt
+  (`UNAOS_GICV3=1 test-arm 45`) SMP 3/3 + JC3 drop + `VBAR_EL1 = 0x7c38c000` + CAPSTONE 6/6 —
+  **byte-identical** to JC3 (same VBAR address ⇒ virt binary layout unshifted); Pi (`kernel8-test`)
+  **sorted-diff 0**; x86 (`test`) MISSION SUCCESS; `esp-jetson` media links. All JM6 code is
+  `tegra`-gated, so every non-tegra build's cfg set (and output) is unchanged.
+- **Metal — ⛔ FAILED (Peter-attended, Orin, 2026-07-05, 5 boots):** the boot core **dark-hangs at the
+  EL2→EL1 drop.** JM3/JM4 + the heap init all run on silicon (every line through `:: tegra: JM6 —
+  dropping … ::` prints), then dark. Localized: the `eret` reaches EL1 (no `VBAR_EL2` illegal-return
+  fault), but the **first EL1 instruction fetch aborts** — a `VBAR_EL1` fault vector *and* a raw-UARTC
+  sentinel stub armed before the eret both stayed dark, so `.text` is unexecutable at EL1 the instant
+  the drop lands. Monitor-independent; `SCTLR_EL1`-independent (the `mmu_tegra` RMW pattern didn't help).
+  Needs a dedicated investigation (see `arch_arm64.md` §3 JM6 result for the plan), NOT blind reboots.
+  Captures `target/serial-orin-jm6-FAIL{,2,3,4}-*.log`.
+- **Honest scope:** the reused EL2-built `L1` is correct for a kernel-only (no-EL0) core but not
+  EL1-precise (RAM reads EL0-accessible via AP[1]=1; the device window is nominally EL1-executable
+  though no code branches there) — an EL1-precise map is worth building only once EL0 runs on Orin.
+  EL0-on-Orin and EL1 timer preemption (needs EL1-non-banking vectors) are follow-on arcs.
+- **Commit:** this arc on `hw-jetson` (merge pending the integrator, who records the merge hash).
+
 ---
 
 ## hw-rmbp track — 2026-07-04 (landed on `hw-rmbp`, awaiting integration)
