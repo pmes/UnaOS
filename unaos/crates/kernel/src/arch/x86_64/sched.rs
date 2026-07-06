@@ -553,19 +553,15 @@ extern "C" fn user_task_trampoline() -> ! {
     let cpu = percpu::this_cpu().cpu_index as usize;
     let raw = SCHED[cpu].current.load(Ordering::Acquire) as *const Task;
     debug_assert!(!raw.is_null(), "user_task_trampoline: current is null");
-    let (entry, user_rsp, ktop, preemptible) = unsafe {
-        let s = &(*raw).stack;
-        let ktop = ((s.as_ptr() as usize + s.len()) & !0xF) as u64;
-        ((*raw).user_entry, (*raw).user_rsp, ktop, (*raw).preemptible)
-    };
-    // TSS.RSP0 (used by the CPU on a ring-3 FAULT or timer preemption) and the per-CPU SYSCALL
-    // kernel-rsp anchor (used by the SYSCALL stub — SYSCALL does not switch stacks itself) both point
-    // at this task's kernel stack top, so a syscall, fault, or IRQ from ring 3 lands on a valid kernel
-    // stack, never a triple-fault. (Only ONE user task runs per core at a time in U3.5's fixture — a
-    // preemptible spinner plus KERNEL co-tasks — so a stale RSP0 across a switch is harmless; a
-    // second concurrent user task per core would need RSP0/CR3 at dispatch, an M7-twin arc.)
-    crate::arch::gdt::set_privilege_stack0(cpu, ktop);
-    percpu::set_syscall_kernel_rsp(ktop);
+    let (entry, user_rsp, preemptible) =
+        unsafe { ((*raw).user_entry, (*raw).user_rsp, (*raw).preemptible) };
+    // U4x: TSS.RSP0 (used by the CPU on a ring-3 FAULT or timer preemption) and the per-CPU SYSCALL
+    // kernel-rsp anchor (used by the SYSCALL stub — SYSCALL does not switch stacks itself) are BOTH
+    // installed at the scheduler DISPATCH site (`run`) — NOT here — so, exactly like the CR3 install
+    // U3.5 moved there, they are correct for BOTH this first entry AND a task RESUMED after a block or
+    // preemption (which never re-enters this trampoline). That single dispatch install is what makes a
+    // SECOND concurrent user task per core safe (U4x's parent + children): a syscall or fault from a
+    // resumed task lands on ITS OWN kernel stack, never a just-freed sibling's. See `run`.
 
     // U3/U3.5: this task's private CR3 was installed by the scheduler DISPATCH path (`run`) before it
     // switched into this trampoline — NOT here — so the same CR3 install covers a RESUMED preempted
@@ -1735,6 +1731,23 @@ fn run() -> ! {
                     if uc != 0 { uc } else { crate::arch::memory::kernel_cr3() }
                 };
                 unsafe { crate::arch::memory::switch_cr3_if_needed(target_cr3) };
+
+                // U4x: install the incoming task's KERNEL-STACK anchors here too — the M7-twin of the
+                // CR3-at-dispatch above. TSS.RSP0 is the stack the CPU switches to on a ring-3
+                // fault/IRQ; `syscall_kernel_rsp` is the stack the SYSCALL stub switches to (SYSCALL
+                // does not switch stacks itself). Both must name the INCOMING task's own kernel stack.
+                // Doing it HERE — the single dispatch site — covers first entry AND resume-after-
+                // block/preempt (which never re-enters the trampoline), which is what makes a SECOND
+                // concurrent user task per core safe: a syscall/fault from a resumed task lands on its
+                // OWN kernel stack, never a just-freed sibling's (the U4x parent/children hazard the
+                // trampoline-only install could not cover). We are IF=0 here. Set unconditionally: for
+                // a kernel task both anchors are simply never consulted (it never enters from ring 3).
+                let ktop = {
+                    let s = unsafe { &(*raw).stack };
+                    ((s.as_ptr() as usize + s.len()) & !0xF) as u64
+                };
+                crate::arch::gdt::set_privilege_stack0(cpu, ktop);
+                percpu::set_syscall_kernel_rsp(ktop);
 
                 unsafe {
                     switch_context(SCHED[cpu].scheduler_rsp.as_ptr(), entry_rsp);
