@@ -10,6 +10,44 @@ Legend: **✅ metal-confirmed** · **🔬 QEMU-green, metal pending** · dates I
 
 ---
 
+## hw-rmbp track — 2026-07-06 (landed on `hw-rmbp`, awaiting integration)
+
+### U5x — handles as capabilities: the CHECK + grant/attenuate/revoke + routed `sys_write` + teardown-clear (x86) 🔬 `hw-rmbp`
+- **What:** the x86 twin of aarch64 U5 — turns U4x's handle STRUCTURE into a real **capability**,
+  keyed by the address-space **slot** where aarch64 keys by ASID. A handle now carries **rights**
+  (`CAP_READ|CAP_WRITE|CAP_EXEC|CAP_GRANT|CAP_REVOKE`, in a sidecar `HANDLE_RIGHTS` array keyed
+  identically to `HANDLES`, so U4x's `0`/`RESERVING` value-word sentinels stay byte-unperturbed) and
+  names a **target** beyond "child pid" (a `HANDLE_CONSOLE = u64::MAX-1` token — two kinds,
+  `Child(pid)`/`Console`, no general object table = U6). **The CHECK** is a single
+  `handle_resolve(row, idx, req_rights)` at the one lookup point every handle-consuming path uses:
+  out-of-range/Empty/`RESERVING` ⇒ the caller's own errno (`sys_wait` → `-ECHILD`, U4x ownership
+  preserved; `sys_write`/`SYS_CAP` → `-EACCES`), missing-a-right ⇒ `-EACCES`. **`SYS_CAP=10`** carries
+  GRANT (mints an **attenuated** handle — `req & !src_rights != 0` ⇒ `-EACCES`, so a grant can never
+  amplify; requires `CAP_GRANT` on the source) and REVOKE (ownership-based). **`sys_write` routes
+  through the table** — `fd` is a handle that must resolve to `Console`+`CAP_WRITE`; no ambient stdout.
+- **The x86 divergence (SLOT vs ASID):** the shared kernel window (U1a/U1b/U2 run with `user_cr3 == 0`,
+  so `current_slot()` is `None`) has no private slot, so `HANDLES`/`HANDLE_RIGHTS` grow one extra row
+  `SHARED_ROW` (index `USER_SLOTS` — the x86 twin of aarch64 ASID 0); `caller_row()` maps `None →
+  SHARED_ROW`. The console cap is endowed there in `setup()` (covers U1a/U1b/U2) and per child in
+  `sys_spawn`, so every prior print still lands. The fixture conveys its 4-bit witness as its `sys_exit`
+  **status**, routed by task name (x86 needs no `SYS_REPORT`).
+- **Teardown-clear** (folds U4x's one deferred note): `memory::free_user_space_by_cr3` wipes the slot's
+  handle row (values + rights) **before** releasing the used-flag; both teardown paths (normal `exit` +
+  the KillSwitch reap) funnel through it, so the clear rides both.
+- **Tested — QEMU:** `./arroyo test-fat part 30` (and `sf`) → after the U4x PASS line: the U5x setup
+  line, `u5x: cap write` twice (the write-cap + the minted cap reaching the console), and
+  `:: U5x: x86 capabilities — write-cap OK, no-cap -EACCES, attenuated grant bounded, revoke enforced,
+  teardown-clear clean -> PASS ::`. **U1a/U1b/U2/U2.5/U3/U3.5/U4x all PASS byte-identical** (routing
+  `sys_write` drops no print — every printing process holds the endowed cap); the default no-FAT
+  `./arroyo test` stays MISSION SUCCESS with U2/U4x skipping cleanly (U5x, being an inline fixture,
+  still runs + PASSes). `./arroyo check` both arches; **0 aarch64 files touched**.
+- **Honest scope:** register-only + cooperative fixture; deferred to U6 (the pi4 U6 twin) — bandy
+  handle-transfer, a general object table (fs/net kinds, first-free `Console`), cross-process revocation
+  trees (`CAP_REVOKE` defined but reserved); PCID and `copy_from_user`/`copy_to_user` stay separately
+  deferred; FP/SIMD-across-context-switch stays ledgered (U4x left it register-only).
+- **Metal:** pending (pure syscall logic; the child loads ride U2's metal-confirmed FAT path).
+- **Commit:** on `hw-rmbp` (see landing report); unmerged (integrator records the merge).
+
 ## hw-rmbp track — 2026-07-05 (landed on `hw-rmbp`, awaiting integration)
 
 ### U4x — the process model + per-process handle table (x86) 🔬 `hw-rmbp`

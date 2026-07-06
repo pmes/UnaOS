@@ -517,6 +517,12 @@ pub fn alloc_user_spaces(out: &mut [usize]) -> bool {
 pub fn free_user_space_by_cr3(cr3: u64) {
     for s in 0..USER_SLOTS {
         if slot_cr3(s) == cr3 {
+            // U5x teardown-clear: wipe the slot's per-process handle row (values + rights) BEFORE
+            // releasing the used-flag (clear-before-release), so no capability outlives its owning slot
+            // and no concurrent `alloc_user_space` can claim the slot and populate the row in between.
+            // Both user-task teardown paths funnel through here — normal `exit` and the KillSwitch reap
+            // of a never-exiting preemptible ring-3 task — so the clear rides both.
+            super::syscall::clear_handle_row(s);
             SLOT_USED[s].store(false, Ordering::Release);
             return;
         }

@@ -632,6 +632,11 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
             // that spawns + reaps 2 children by handle, plus an orphan whose sys_wait(0) -> -ECHILD.
             #[cfg(target_arch = "x86_64")]
             unaos_kernel::arch::syscall::u4x_probe_once();
+            // U5x (x86): handles as CAPABILITIES — rights + the enforcement CHECK + grant/attenuate/revoke
+            // + routed sys_write + teardown-clear. One-shot, gated on storage + after U4x; the fixture is
+            // an inline blob (no FAT I/O).
+            #[cfg(target_arch = "x86_64")]
+            unaos_kernel::arch::syscall::u5x_probe_once();
             unaos_kernel::drivers::xhci::log_summary_once();
             while let Some(event) = unaos_kernel::pal::next_event() {
                 match event {
@@ -751,6 +756,10 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         // handle, plus an orphan whose sys_wait(0) -> -ECHILD (per-process handle tables).
         #[cfg(target_arch = "x86_64")]
         unaos_kernel::arch::syscall::u4x_probe_once();
+        // U5x (x86): handles as CAPABILITIES — rights + the enforcement CHECK + grant/attenuate/revoke +
+        // routed sys_write + teardown-clear. One-shot, gated on storage + after U4x; inline-blob fixture.
+        #[cfg(target_arch = "x86_64")]
+        unaos_kernel::arch::syscall::u5x_probe_once();
         // One-shot USB topology dump to serial (enumeration diagnosis; `usbinfo` shows it live).
         unaos_kernel::drivers::xhci::log_summary_once();
 
