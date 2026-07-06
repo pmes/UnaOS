@@ -932,6 +932,16 @@ fn tegra_early_stop(boot_info: &'static mut BootInfo) -> ! {
                     Some(ids) => {
                         xusb_alive =
                             unaos_kernel::arch::bpmp_tegra::jb1c_ungate_xusb(&chan, &ids);
+                        // JB2c: the firmware's ExitBootServices teardown powered the padctl USB2
+                        // pads DOWN (JB2b root cause: ports read PORTSC=0x2a0 CCS=0, electrically
+                        // dead). Re-program the pad power-up sequence HERE — pre-drop at EL2, while
+                        // the BPMP `chan` is in scope for the bias-pad tracking clock — so the pads
+                        // are live BEFORE the JB2b xHCI attach surveys the ports below. Gated on the
+                        // ungate: padctl is always-powered, but there is no point powering pads for
+                        // a controller that never came alive.
+                        if xusb_alive {
+                            unaos_kernel::arch::xusb_tegra::jb2c_padctl_powerup(&chan);
+                        }
                     }
                     None => serial_println!(":: tegra: JB1c — no usb@3610000 ids in DTB; SKIP ::"),
                 }

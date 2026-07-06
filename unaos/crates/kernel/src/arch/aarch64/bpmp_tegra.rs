@@ -401,6 +401,37 @@ pub fn jb1c_ungate_xusb(chan: &Chan, ids: &super::fdt_tegra::XusbIds) -> bool {
     true
 }
 
+// JB2c step 1: the USB2 bias-pad tracking clock. TEGRA234_CLK_USB2_TRK = 165
+// (dt-bindings/clock/tegra234-clock.h line 323: `#define TEGRA234_CLK_USB2_TRK 165U` — verified
+// against live mainline 2026-07-06, and cross-corroborated by the JB0 PWM3 clk=107/reset=70 IDs
+// reading out of the same headers). The bias pad's tracking pass (padctl BIAS_PAD_CTL1 USB2_PD_TRK
+// -> TRK_COMPLETED) needs this gate running; NVIDIA's ExitBootServices teardown left it disabled
+// along with the pad power-down. Linux `tegra186_utmi_bias_pad_power_on` enables it before tracking
+// (and, since tegra234 `trk_hw_mode=false`, disables it again after — we leave it on: harmless for
+// first light, one fewer MRQ on the scarce attended boot, and it does not re-trigger tracking once
+// TRK_COMPLETED is W1C'd).
+const CLK_USB2_TRK: u32 = 165;
+
+/// JB2c step 1: enable the USB2 bias-pad tracking clock over the proven BPMP channel (same MRQ_CLK
+/// transport as JB0/JB1c). Returns true iff the enable acked err=0. Best-effort: on timeout/err the
+/// padctl helper still runs the power-up (tracking then just times out its warn-only poll and the
+/// pads still come out of power-down), so the caller logs but does not gate on this.
+pub fn jb2c_usb2_trk_clk(chan: &Chan) -> bool {
+    match chan.transfer(MRQ_CLK, &[(CMD_CLK_ENABLE << 24) | (CLK_USB2_TRK & 0x00ff_ffff)]) {
+        Some((err, _)) => {
+            serial_println!(
+                ":: tegra: JB2c — USB2_TRK clk {} enable -> err={} ::",
+                CLK_USB2_TRK, err
+            );
+            err == 0
+        }
+        None => {
+            serial_println!(":: tegra: JB2c — USB2_TRK clk enable TIMEOUT (proceeding) ::");
+            false
+        }
+    }
+}
+
 // JB0 fan constants. The devkit cooling fan is driven by Tegra234 PWM controller PWM3 at MMIO
 // base 0x032A_0000 (verified against tegra234.dtsi `pwm3: pwm@32a0000`; the `pwm-fan` node's
 // `&pwm3` channel 0 = the fan; UEFI's own TegraPwmDxe drives this same block during boot).

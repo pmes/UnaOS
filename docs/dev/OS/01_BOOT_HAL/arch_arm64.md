@@ -644,6 +644,69 @@ report and a *different* arc, not a padctl bug. **Zero-code alternative Peter ca
 roll back to the pre-update firmware slot (restores the old always-on handoff); no Jetson UEFI
 menu USB/XHCI toggle exists.
 
+### JB2c — landed (QEMU-green, ⏳ METAL-PENDING — verdict is the next attended Orin boot)
+
+Implemented 2026-07-06 as `xusb_tegra::jb2c_padctl_powerup(chan)` (the padctl MMIO) + a one-line
+`bpmp_tegra::jb2c_usb2_trk_clk(chan)` (step 1, the tracking clock over the proven JB1 BPMP channel),
+called from `main.rs` inside the `chan` scope right after `jb1c_ungate_xusb` sets `xusb_alive` —
+**pre-drop at EL2, before the JB2b attach surveys the ports** (the JM6b drop terminus is untouched).
+Every offset/bit was re-verified against live mainline Linux `drivers/phy/tegra/xusb-tegra186.c`
+(`tegra186_utmi_{bias_,}pad_power_on`, tegra234 SoC data) 2026-07-06 and cross-checked bit-for-bit
+against the Step-0 silicon readback — which confirmed *every* target value the firmware left
+pre-power-down (`TRK_START_TIMER` already `0x1e`, `TRK_DONE_RESET_TIMER` already `0x0a`,
+`HS_DISCON_LEVEL` already `0x7`, `PD2`=0, HS_CURR_LEVEL a real fuse value) — so the sequence is
+idempotent on the config fields and load-bearing only on the power-down bits.
+
+**★ One constant correction the verification caught:** `TEGRA234_CLK_USB2_TRK = 165`
+(dt-bindings/clock/tegra234-clock.h line 323, `165U`) — an early draft eyeballed `349`, which is
+wrong. Corroborated by the JB0 PWM3 clk=107 / reset=70 IDs reading cleanly out of the same headers.
+
+Sequence (base `P = 0x3520000`; HOST pads 0/1/2, pad 3 disabled left alone; VBUS untouched):
+1. BPMP `MRQ_CLK` enable `CLK_USB2_TRK` (165).
+2–3. `PAD_MUX`(+0x004)→XUSB / `PORT_CAP`(+0x008)→HOST, RMW — idempotent no-ops (already `0x55`/`0x111`).
+4–5. per-pad `OTG_PADx_CTL0`(0x88+x·0x40): clear `PD_ZI`(b29), set `TERM_SEL`(b25) [HS_CURR_LEVEL
+   left = the firmware's resident fuse value, better than the dossier's "0 ok"]; `OTG_PADx_CTL1`
+   (0x8C+x·0x40): clear `TERM_RANGE_ADJ`[6:3] + `RPD_CTRL`[30:26].
+6–7. `BIAS_PAD_CTL1`(0x288): `TRK_START_TIMER`=0x1e, `TRK_DONE_RESET_TIMER`=0x0a; `BIAS_PAD_CTL0`
+   (0x284): clear `BIAS_PAD_PD`(b11), `HS_DISCON_LEVEL`=0x7 [HS_SQUELCH left as firmware set it];
+   `udelay(1)`.
+8. `BIAS_PAD_CTL1` clear `USB2_PD_TRK`(b26) → start tracking; poll `TRK_COMPLETED`(b31) ~200 µs
+   (warn-only, proceed on timeout); **W1C** it (write 1 to b31); `BIAS_PAD_CTL2`(0x28C) clear
+   `CYA_TRK_CODE_UPDATE_ON_IDLE`(b31) [tegra234 `trk_hw_mode=false` → `USB2_TRK_HW_MODE` b0 stays 0];
+   `udelay(2)`.
+9. per-pad clear `USB2_OTG_PD`(b26, CTL0) + `USB2_OTG_PD_DR`(b2, CTL1) — the two clears that light
+   the port.
+10. VBUS: nothing (rails always-on; never `VBUS_OVERRIDE`, never `RESET_XUSB_PADCTL`).
+
+All writes are **read-modify-write**, so the firmware's resident per-die fuse calibration survives in
+the fields the sequence doesn't name. **Two deliberate parity deltas vs mainline, both non-blocking
+for first light** (confirmed by the reconciliation pass): (a) Linux disables the trk clock after
+tracking — we leave it on (harmless once `TRK_COMPLETED` is W1C'd; one fewer MRQ on the scarce
+attended boot; avoids an unverified `CMD_CLK_DISABLE`); (b) Linux programs `HS_SQUELCH_LEVEL` from a
+fuse read — we preserve the firmware's value (soft; affects HS receiver margin, not whether the pad
+powers up). If first light fails *specifically* on signal integrity, folding in the fuse read (via
+the FUSE `USB_CALIB` register) is the refinement — but the pads powering up does not depend on it.
+
+**Expected serial (Peter-attended metal):** after `JB1c … XUSB ALIVE`, a block of
+`:: tegra: JB2c — USB2_TRK clk 165 enable -> err=0 ::` → `padctl @0x3520000 pad power-up …` →
+`bias pad up, tracking COMPLETED …` → three `pad N up: CTL0=… CTL1=… (PD/PD_ZI/PD_DR -> 0)` (b26/b29
+of CTL0 and b2 of CTL1 read **0**) → `padctl … done -> PASS`. Then the JB2b port survey should, on a
+plugged device, show `CCS=1` + `PLS` advancing out of RxDetect (was the dead `PORTSC=0x2a0`), the
+enumeration pump takes over, and a keyboard descriptor + keystrokes print at EL1.
+
+**STOP tripwire (unchanged):** pads healthy (`CCS=1`) but enumeration times out ⇒ the NISO1 SMMU
+`GBPA=ABORT` DMA-drop signature — an honest STOP + a *different* arc, **not** a padctl bug. A padctl
+write dying at EL3 should NOT happen (Step-0 read the block clean) — if one does, the last serial
+line names the killer; save the capture and STOP.
+
+**Gate (2026-07-06):** `./arroyo check` + `UNAOS_TEGRA=1 ./arroyo check` green both arches; virt
+GICv3 `test-arm` JC3 drop → CAPSTONE 6/6 (VBAR_EL1=0x7c389800, shifted by JB2b's binary growth, not
+this arc); Pi `kernel8-test` all M6/U4/U5 verdicts + CAPSTONE 6/6; x86 `test` MISSION SUCCESS;
+`esp-jetson` links (kernel.elf 220,584 B — healthy, not the ~355 KB corrupt-bloat signature). The
+whole diff is inside `#[cfg(feature = "tegra")]` code (`bpmp_tegra.rs`, `xusb_tegra.rs`, and the
+`tegra_early_stop` hunk in `main.rs`), so **non-tegra binaries are byte-identical by construction**
+(the QEMU logs are unchanged). QEMU models no Tegra — the real verdict is the attended Orin boot.
+
 ### JB0 brief — turn the cooling fan back on (safety hygiene; run FIRST on Orin)
 
 Discovered 2026-07-06: when UnaOS takes over from UEFI the **fan stops and the Orin runs hot**.
