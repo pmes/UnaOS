@@ -530,6 +530,120 @@ CAPSTONE chain is green at the new address (the current value prints in the run'
 `exception vectors installed` line). QEMU models no Tegra — **the verdict is the next
 Peter-attended metal boot.**
 
+### JB2b — the attended metal verdict (2026-07-06): driver attach CONFIRMED, enumeration blocked by a firmware regression
+
+Two attended Orin boots (SD-in-USB-reader boot media; the same keyboard NVIDIA UEFI had just
+enumerated as "Generic Usb Keyboard" on the shell `devices` list). **Both booted the JB2b binary
+clean through the entire software chain:**
+
+- **JB1 replays deterministically on silicon**: MRQ_PING PASS, XUSB ungate all `err=0`, XUSB
+  ALIVE `xHCI v1.20`, zero erratum-1941500 heals fired.
+- **JB2b's driver attach is metal-proven**: `dma-coherent: YES` from the live DTB, then the
+  shared x86 driver ran on non-PCIe silicon for the first time — `Controller Reset Complete`,
+  **both** protocol banks decoded (`USB 3.1 ports 1..4`, `USB 2.0 ports 5..8`), interrupter +
+  rings programmed, scratchpad (3 buffers) allocated, `Controller Started!`.
+- **The honest-failure path worked exactly as designed**: no keyboard armed in the 60 s window →
+  full 8-port topology dump → the **unchanged** JM6b EL2→EL1 drop → EL1 landing → **CAPSTONE 6/6**.
+  The boot completed as JB1e did, precisely as the JB2b brief anticipated for the no-keyboard case.
+
+**But every one of the 8 root ports read `PORTSC=0x000002a0` (CCS=0, PP=1, PLS=RxDetect) from the
+first pre-reset survey read, USBSTS.PCD never set, and the keyboard LED stayed dark** — physically
+confirmed (no LED, and an unplug/replug into a *different* port during the live window still
+produced zero port activity). The bus was electrically silent the instant our kernel took over.
+
+**Root cause (4-agent research pass, high confidence — see the JB2c brief for the full dossier):
+a NVIDIA firmware update between the JB2a test and this one.** JB2a saw ports 6 & 7 CONNECTED with
+`USBSTS=0x11` (controller left live, port-change pending) on the older firmware. The updated
+firmware (JetPack 6.0 GA / L4T r36.3+, edk2-nvidia "hide device resources at uefi exit") runs a
+more aggressive `ExitBootServices` teardown on the Device-Tree boot path: it **power-gates the
+XUSB partition and de-programs the padctl USB pads**. Our kernel's JB1c re-ungates the *controller*
+(so the xHCI MMIO decodes and `Controller Started!` succeeds), but **nothing re-programs the
+padctl pads** — they sit at reset defaults (powered down), so no root port ever leaves RxDetect,
+CCS never asserts, and the downstream RTS5420 hub (which fans out the 4 physical Type-A ports)
+never trains or powers its ports. `USBSTS=0x11`(old)→`0x01`(new) is the fingerprint.
+
+This is **not** a JB2b bug and **not** a VBUS-GPIO problem — the P3768 devkit's 5V rail is
+hardwired `regulator-always-on` with no GPIO enable, so the dark LED is a downstream *symptom* of
+the un-trained pad, not a missing GPIO write. JB2b's design note "padctl/PHY: left exactly as UEFI
+programmed it" was a correct bet on the old firmware and lost to the update. **The fix is a new arc,
+JB2c** (below): re-program the padctl USB2 pad power-on sequence at `0x3520000` (pad n=1). padctl is
+always-powered (outside the PG toggle) and already in the GiB-0 device map, so it is *not* a new
+EL3-fatal MMIO class like JX1 — reads and writes there are safe on this ungated block.
+
+Captured: `target/serial-orin-jb2b-1.log` (both boots + the UEFI shell `devices`/`map` that proves
+the keyboard was live pre-handoff).
+
+### JB2c brief — re-program the padctl USB2 pads (the enumeration fix)
+
+Scoped from the JB2b metal verdict + the 4-agent research pass (2026-07-06). **One arc; do not
+stack on unreviewed JB2b.** Lane: `arch/aarch64` tegra files (`xusb_tegra.rs` — revise the
+"never touch padctl" directive at its head; `bpmp_tegra.rs` — add `TEGRA234_CLK_USB2_TRK` enable
++ the survey; a new padctl helper), this doc.
+
+**Step 0 (this arc's first boot — read-only confirm, cheapest fork).** After JB1c ALIVE, dump
+padctl read-only next to the PORTSC survey: `USB2_PAD_MUX` (0x3520004), `USB2_PORT_CAP` (0x3520008),
+`OTG_PAD1_CTL0` (0x35200C8), `OTG_PAD1_CTL1` (0x35200CC). **Prediction that confirms the root
+cause**: `OTG_PAD1_CTL0.PD` (bit26) and/or `PD_ZI` (bit29) *set*, and `PORT_CAP` for port 1 *not*
+HOST(0x1) — i.e. pads at reset defaults. If instead the pads read already-programmed yet PORTSC is
+still 0x2a0, the cause shifts to VBUS/rail or the NISO1 SMMU and this arc is the wrong fix — so this
+one read-only boot forks the whole decision. (padctl is always-powered; these reads cannot EL3-fault.)
+
+**Step 0 RESULT — CONFIRMED on silicon (2026-07-06, `target/serial-orin-jb2c-probe-CONFIRM.log`).**
+A read-only probe (temporarily added at the end of `bpmp_tegra.rs::jb1c_ungate_xusb`, after the
+JB2a survey; run on two power-cycles, captured, then **reverted to keep the JB2b arc clean at
+`5fc51fe`** — JB2c re-adds it as its first writes, or skips it since the answer is now known) read
+padctl cleanly — no EL3 fault, proving the block is safe to touch — and the values (identical across
+both boots) nail the root cause and *refine* the fix:
+```
+USB2_PAD_MUX=0x00000055   USB2_PORT_CAP=0x00000111
+OTG_PAD0 CTL0=0x26cc88d1  OTG_PAD1 CTL0=0x26cc88d0  OTG_PAD2 CTL0=0x26cc88d1  OTG_PAD3 CTL0=0x26cc88e0
+   (all four: PD b26=1, PD_ZI b29=1, TERM_SEL b25=1;  CTL1 PD_DR b2=1)
+BIAS_PAD_CTL0=0x060e0b38 (BIAS_PAD_PD b11=1)   BIAS_PAD_CTL1=0x0451e8df (PD_TRK b26=1)
+```
+- **Every pad power-down bit is SET**: all 4 USB2 OTG pads powered down (PD+PD_ZI+PD_DR) *and* the
+  shared bias pad powered down (BIAS_PAD_PD + PD_TRK). This is the reset/torn-down state → no port
+  trains → CCS never asserts. Root cause proven, not inferred.
+- **Refinement vs the predicted sequence**: `PAD_MUX=0x55` = XUSB routing already set for all 4 ports
+  (2-bit field per port, 0b01=XUSB); `PORT_CAP=0x111` = ports 0/1/2 already HOST (2-bit field at n*4,
+  0b01=HOST), port 3 disabled. **The firmware left routing + capability intact and ONLY powered the
+  pads down.** So Step-1 sub-steps 2 (`PAD_MUX`) and 3 (`PORT_CAP`) are idempotent no-ops on this
+  silicon; the load-bearing fix is the **pad power-up**: clear PD/PD_ZI (CTL0) + PD_DR (CTL1) on the
+  HOST pads, and the bias-pad power-up + tracking (steps E–H). Program the HOST-capable pads (0,1,2 —
+  the hub upstream is pad 1 per Linux, but powering all three HOST pads covers whichever physical
+  connector the device lands on). Leave pad 3 (disabled) alone.
+- **De-risks the JB2c writes**: same always-powered block the probe read without fault, so the
+  power-up writes are not a new EL3-fatal class.
+
+**Step 1 (the fix).** Program pad n=1 (the hub upstream), all offsets from `P=0x3520000`, sequence
+verbatim from Linux `drivers/phy/tegra/xusb-tegra186.c` (`tegra234_xusb_padctl_soc`):
+1. Enable `TEGRA234_CLK_USB2_TRK` via BPMP MRQ_CLK (bias-pad tracking clock).
+2. `PAD_MUX` (P+0x004): set port-1 field to XUSB (`0x1 << 2`).
+3. `PORT_CAP` (P+0x008): set port-1 cap to HOST (`0x1 << 4`).
+4. `OTG_PAD1_CTL0` (P+0x0C8): clear `PD_ZI` (bit29), set `TERM_SEL` (bit25), `HS_CURR_LEVEL`=0 ok
+   for first light (fuse-cal is a later refinement).
+5. `OTG_PAD1_CTL1` (P+0x0CC): clear `TERM_RANGE_ADJ` (bits[6:3]) + `RPD_CTRL` (bits[30:26]).
+6. `BIAS_PAD_CTL1` (P+0x288): `TRK_START_TIMER`=0x1e (bits[18:12]), `TRK_DONE_RESET_TIMER`=0x0a
+   (bits[25:19]).
+7. `BIAS_PAD_CTL0` (P+0x284): clear `BIAS_PAD_PD` (bit11), `HS_DISCON_LEVEL`=0x7 (bits[5:3]);
+   udelay(1).
+8. Run tracking: clear `USB2_PD_TRK` (P+0x288 bit26); poll `TRK_COMPLETED` (bit31) with a ~100 µs
+   budget (proceed on timeout); write `TRK_COMPLETED` back; clear `CYA_TRK_CODE_UPDATE_ON_IDLE`
+   (P+0x28C bit31); udelay(2).
+9. The two clears that light the port: `OTG_PAD1_CTL0` clear `USB2_OTG_PD` (bit26);
+   `OTG_PAD1_CTL1` clear `USB2_OTG_PD_DR` (bit2).
+10. **VBUS: do nothing** — `vdd_5v0_sys`/`vdd_1v1_hub` are always-on; **do NOT** set `VBUS_OVERRIDE`
+    (P+0x360, a device-mode fake, wrong for a host port); **do NOT** assert `RESET_XUSB_PADCTL`
+    (would wipe all padctl state).
+
+Then re-run the JB2b survey: CCS should assert + PLS advance out of RxDetect on plug, and the
+existing enumeration pump takes over → keyboard first light at EL1.
+
+**STOP tripwire (unchanged from JB2b):** if, after the pads come up, PORTSC goes healthy (CCS=1)
+but enumeration times out, that's the NISO1 SMMU `GBPA=ABORT` DMA-drop signature — an honest STOP
+report and a *different* arc, not a padctl bug. **Zero-code alternative Peter can try meanwhile:**
+roll back to the pre-update firmware slot (restores the old always-on handoff); no Jetson UEFI
+menu USB/XHCI toggle exists.
+
 ## 4. Jetson Orin Nano headless bring-up (Arc JM2)
 
 The Orin is brought up **headless over serial**. The only console that has ever
