@@ -903,6 +903,11 @@ fn tegra_early_stop(boot_info: &'static mut BootInfo) -> ! {
     // every partition-ungate MRQ (XUSB, nvdisplay) rides on. Geometry is resolved from the same
     // DTB (never hardcoded); a missing/odd DTB shape prints and skips. Pre-drop, EL2, polled;
     // every new MMIO class prints before the first touch (the JX1 EL3-fatal discipline).
+    //
+    // `xusb_alive` gates the JB2b xHCI attach below: touching 0x0361_0000 without a completed
+    // JB1c ungate is an EL3-fatal CBB abort (the JX1 lesson), so the attach runs ONLY on a boot
+    // whose ungate proved the block alive.
+    let mut xusb_alive = false;
     match unaos_kernel::arch::fdt_tegra::bpmp_geometry(
         boot_info.dtb_addr,
         boot_info.dtb_size,
@@ -913,12 +918,21 @@ fn tegra_early_stop(boot_info: &'static mut BootInfo) -> ! {
             // domains -> clocks -> reset deassert, all ids read off the DTB's usb@3610000 node)
             // and re-probe the xHCI capability block that was EL3-fatal in JX1.
             if let Some(chan) = unaos_kernel::arch::bpmp_tegra::jb1b_ping(&geom) {
+                // JB0: fan FIRST. The UEFI ExitBootServices teardown stopped the cooling fan
+                // (it disabled the PWM3 clock + reset); restore it before anything else so the
+                // SoC has cooling for the rest of the boot. Cheapest teardown-restore (no
+                // power-gate), rides the just-proven BPMP channel. Safety hygiene: a dead fan
+                // can't damage the die (BL31/BPMP hardware thermal net), but this keeps it cool.
+                unaos_kernel::arch::bpmp_tegra::jb0_fan_on(&chan);
                 match unaos_kernel::arch::fdt_tegra::xusb_ids(
                     boot_info.dtb_addr,
                     boot_info.dtb_size,
                     mmu.ram_gib_mask,
                 ) {
-                    Some(ids) => unaos_kernel::arch::bpmp_tegra::jb1c_ungate_xusb(&chan, &ids),
+                    Some(ids) => {
+                        xusb_alive =
+                            unaos_kernel::arch::bpmp_tegra::jb1c_ungate_xusb(&chan, &ids);
+                    }
                     None => serial_println!(":: tegra: JB1c — no usb@3610000 ids in DTB; SKIP ::"),
                 }
             }
@@ -976,8 +990,42 @@ fn tegra_early_stop(boot_info: &'static mut BootInfo) -> ! {
     //     regression) and a dead box on the Orin boot the arc's verdict depends on. mmu_tegra mapped RAM
     //     Normal-WB (identity), so the heap region `memory::init` carves is coherent both here (EL2) and,
     //     unchanged, after the JM6 drop (EL1) — the allocator state lives in RAM the reused L1 also maps.
+    // (dtb fields are Copy; grabbed before `memory::init` consumes the &'static mut borrow.)
+    let (dtb_addr, dtb_size) = (boot_info.dtb_addr, boot_info.dtb_size);
     unaos_kernel::arch::memory::init(boot_info);
     serial_println!(":: KERNEL HEAP ALLOCATED ::");
+
+    // 3e. JB2b: platform-attach the shared xHCI driver at the XUSB block JB1c ungated, and pump
+    //     the polled enumeration to a USB keyboard's armed interrupt-IN read — the Orin keyboard
+    //     first-light arc. Runs HERE because it needs the heap (rings/contexts/buffers, step 3c)
+    //     and the live EL2 timer (JM4 — the driver's bounded sync pumps `hlt()` between polls,
+    //     and WFI needs the tick as its wake source; post-drop that would wedge, which is why the
+    //     EL1 side below is a poll-only task). All bounded: a dead controller or wedged port is
+    //     a few budgeted timeouts and an honest topology dump, then the JM6b chain proceeds
+    //     unchanged. On success the keyboard keeps DMA-ing into identity-mapped RAM across the
+    //     drop, and a pre-spawned task pumps it at EL1 (`xusb_tegra::kbd_pump_body`) — spawned
+    //     onto the boot core's run queue NOW (pure RAM state; `poke_cpu` self-skips, so nothing
+    //     is latched at the GIC to greet EL1), dispatched by `run_capstone_boot_core`'s drive
+    //     loop cooperatively alongside (and after) the CAPSTONE tasks. No keyboard -> no task ->
+    //     the JM6b/CAPSTONE flow is byte-identical to the JB1e verification boot.
+    if xusb_alive {
+        let coherent = unaos_kernel::arch::fdt_tegra::xusb_dma_coherent(
+            dtb_addr,
+            dtb_size,
+            mmu.ram_gib_mask,
+        );
+        if unaos_kernel::arch::xusb_tegra::jb2b_attach(coherent).is_some() {
+            unaos_kernel::arch::sched::spawn(
+                "jb2-kbd",
+                unaos_kernel::arch::xusb_tegra::kbd_pump_body,
+                0,
+                0,
+            );
+            serial_println!(":: tegra: JB2b — EL1 keyboard pump task spawned (boot core) ::");
+        }
+    } else {
+        serial_println!(":: tegra: JB2b — SKIPPED (XUSB not ungated/alive this boot) ::");
+    }
 
     // 3d. JX1 RESULT (probe removed — metal-answered 2026-07-06, capture serial-orin-jx1.log): the
     //     Tegra234 XUSB host block @ 0x0361_0000 is NOT accessible after ExitBootServices. The

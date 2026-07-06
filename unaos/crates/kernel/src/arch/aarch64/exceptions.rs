@@ -454,12 +454,26 @@ extern "C" fn aarch64_fault_handler(kind: u64) -> u64 {
         let heals = EC0_HEALS.load(Ordering::Relaxed);
         if dword != 0 && dword != 0xFFFF_FFFF && heals < EC0_HEAL_CAP {
             EC0_HEALS.store(heals + 1, Ordering::Relaxed);
-            serial_println!(
-                ":: A78AE-1941500 heal #{}: EC=0 at ELR={:#x} (D-side {:#010x} valid) — ic iallu + retry ::",
-                heals + 1,
-                elr,
-                dword,
-            );
+            // JB2b hardening: print the heal line WITHOUT a blocking lock. The phantom can strike
+            // an instruction INSIDE an in-progress `_print` on this same core — the serial spin
+            // Mutex is then already held here, and `without_interrupts` cannot mask a SYNCHRONOUS
+            // exception — so the plain serial_println! this used to be would spin-deadlock the
+            // very heal that was about to fix the fault (a dark hang instead of a recovery). The
+            // fatal path below accepts that lock risk as a last-resort diagnostic; the heal is a
+            // continue-running path and must not. try_lock: the uncontended common case prints; a
+            // fault-interrupted holder skips the line — the heal itself needs no lock, and the
+            // EC0_HEALS counter still records it. The fbcon mirror (its own locks) is skipped
+            // too; the headless Orin loses nothing.
+            if let Some(mut port) = super::serial::SERIAL_PORT.try_lock() {
+                use core::fmt::Write;
+                let _ = writeln!(
+                    port,
+                    ":: A78AE-1941500 heal #{}: EC=0 at ELR={:#x} (D-side {:#010x} valid) — ic iallu + retry ::",
+                    heals + 1,
+                    elr,
+                    dword,
+                );
+            }
             unsafe {
                 core::arch::asm!(
                     "ic iallu",

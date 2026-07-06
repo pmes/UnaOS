@@ -447,6 +447,288 @@ sched down metal-only paths at EL1; a CBB/implementation-defined report masquera
 Every occurrence is deterministic per binary+flow, so one instrumented boot per hypothesis
 decides. The JB1 deliverables above all completed BEFORE the EL1 hit and stand independently.
 
+### JB2b — the xHCI platform attach + polled USB keyboard (QEMU-green, ⏳ METAL-PENDING)
+
+JB2b attaches the repo's **existing, x86-metal-proven xHCI driver** (`drivers/xhci/`) to the XUSB
+block JB1c ungated, at its raw MMIO base `0x0361_0000` — no PCIe, no MSI-X, fully polled — and
+brings a USB keyboard to first light: enumeration at EL2 pre-drop, keystrokes decoded and printed
+at EL1 by a scheduled task. The driver needed **no platform constructor at all**: its controller
+takes one raw base address, and the whole PCIe layer (`PciScanner`, bus-master enable, MSI-X) was
+always caller-side. The tegra attach (`arch/aarch64/xusb_tegra.rs::jb2b_attach`) replays the exact
+`arch/aarch64/pci.rs` sequence — `xhci::init` (halt + HCRST + CNR) → `XhciController::new` →
+rings → `init_interrupter` → `init_pointers` → `start()` — then pumps the polled enumeration
+(`poll_events` + `service_hubs`/`service_hid_setproto`/`service_slot_disposal`/`service_enum`)
+bounded to 60 s of CNTPCT, exiting when a keyboard's interrupt-IN read is armed
+(`keyboard_state == 3`). The window is sized to the worst case, not the happy path: on Orin's
+31.25 MHz counter `hw_wait_budget()` is ~4.8 s per bounded stage (double its ~60 MHz design
+note), and a stalled co-device ahead of the keyboard in the serialized queue can burn a
+~22 s retry ladder before the keyboard's port is even tried; the happy path exits in seconds.
+On success, a cooperative kernel task (`jb2-kbd`,
+`xusb_tegra::kbd_pump_body`) is spawned onto the boot core **before** the JM6 drop
+(`poke_cpu` self-skips, so nothing latches at the GIC to greet EL1); `run_capstone_boot_core`'s
+EL1 dispatch loop co-runs it with the CAPSTONE tasks, and it keeps running after they drain.
+
+Design facts (each verified against Linux `xhci-tegra.c` / `tegra234.dtsi` / edk2-nvidia before
+a line was written):
+- **Firmware**: on Tegra234 the xHCI Falcon firmware is UEFI-resident (Linux's tegra234 soc data
+  loads none; its IFR path only reads the running firmware's header). `USBCMD.HCRST` resets the
+  xHC state machine, not the Falcon (separate reset domain) — the driver's standard init is
+  exactly what Linux runs on t234.
+- **DMA coherence**: `tegra234.dtsi` marks `usb@3610000` `dma-coherent` — XUSB snoops the CPU
+  caches, so the driver's Normal-WB heap rings (identity-mapped: VA==PA on both tables) need no
+  cache maintenance. Verify-don't-assume: `fdt_tegra::xusb_dma_coherent` probes the **live**
+  firmware DTB for the prop and the boot prints the verdict before the attach.
+- **Ordering (the two shared-driver edits, both invisible on x86)**: `dsb st` (aarch64-only)
+  before the doorbell write in `ring_doorbell_asm` and before the Run/Stop write in `start()` —
+  the pre-existing `fence(SeqCst)` lowers to `dmb ish`, which does NOT order Normal-memory TRB
+  writes against a Device-nGnRE (outer-shareable) doorbell; `dsb st` is Linux's `__iowmb`. And a
+  `fence(Acquire)` (`dmb ishld`) in `EventRing::pop` between the cycle-bit check and the full TRB
+  read — loads from different TRB words may otherwise satisfy out of order (Linux's `rmb()`
+  twin). x86 codegen is unchanged (cfg'd out / compiler-only).
+- **padctl/PHY**: left exactly as UEFI programmed it (separate block + reset domain, not in the
+  JB1c PG toggle; the JB2a CCS=1/PLS=Polling reads ARE that state working). The BAR2 firmware
+  mailbox (SS clock-scaling requests) is interrupt-delivered and irrelevant to polled HS work.
+- **EL3-fatal discipline**: the attach is gated on `jb1c_ungate_xusb`'s new ALIVE verdict
+  (`main.rs` threads it as `xusb_alive`) plus its own pre-flight cap0 read — `0x0361_0000` is
+  never touched on a boot whose ungate failed. Every new register class prints before first
+  touch; every wait is budget-bounded, so the worst case (SMMU not in bypass ⇒ DMA silently
+  dropped; signature = healthy PORTSC + command timeouts) is a few bounded timeouts, an honest
+  topology dump, and the **unchanged** JM6b drop + CAPSTONE chain.
+- **EL1 liveness**: the EL1 pump calls ONLY `poll_events` (event drain → HID decode →
+  interrupt-IN re-arm) — never the `service_*` sync pumps, whose `crate::hlt()` would WFI with no
+  wake source at EL1 (the drop disables the timer but `timer::LIVE` reads stale-true). Busy-poll
+  + `yield_now`, never `sleep_ticks` (the boot-core drive loop drains no sleepers).
+
+Expected metal serial (the attended-boot checklist): the unchanged JB1/JB2a chain, then
+`:: tegra: JB2b — usb@3610000 dma-coherent: YES … ::` → `:: tegra: JB2b — attaching the shared
+xHCI driver @0x3610000 … ::` → the driver's own init lines (`Controller Reset Complete`,
+`Supported Protocol`, `scratchpad`, `Controller Started!`) → per-port enumeration stages →
+`SET_PROTOCOL(boot) OK` → `:: tegra: JB2b — keyboard ARMED (slot S, root port P) -> PASS ::` →
+`:: tegra: JB2b — EL1 keyboard pump task spawned (boot core) ::` → the unchanged JM6b drop +
+EL1 landing → `:: tegra: JB2b — EL1 keyboard pump live (xHCI polled at EL1) ::` → CAPSTONE 6/6 →
+then, per keystroke, `xHCI: KEY: 'h' …` + `:: tegra: JB2b — KEY 'h' ::`. If no keyboard arms:
+`keyboard NOT armed within the window` + a topology dump, and the boot completes as JB1e did.
+
+Adversarial review (7-lens workflow + per-finding refutation pass): 0 must-fix; both should-fix
+findings FIXED in-arc — (1) the pump window was 20 s but the worst-case stalled-co-device retry
+ladder computes to ~22 s on Orin's clock → widened to 60 s; (2) the JB1e heal's serial print
+hard-locked `SERIAL_PORT` from fault context — a phantom striking mid-`_print` would have
+spin-deadlocked the very heal that was about to fix it → the heal line now `try_lock`s (skips
+the line, never the heal, if the fault interrupted a print). Two accepted-and-noted nits:
+the xHCI extended-capability walk trusts hardware-provided next-pointers (could in principle
+chase garbage outside the ungated block — well-formed on this silicon, UEFI walks the same list
+every boot; a range clamp is deliberate non-creep for this arc), and the new `dsb st` barriers
+are aarch64-wide (virt/Pi metal included), a strictly conservative strengthening.
+
+Gate results (2026-07-06, re-run after the review fixes): `./arroyo check` + `UNAOS_TEGRA=1
+./arroyo check` green; x86 `test` MISSION SUCCESS; virt GICv2 `test-arm` full USB suite green;
+virt GICv3 `test-arm` JC3 EL1-drop + CAPSTONE 6/6; Pi `kernel8` builds + `kernel8-test` full
+battery (M6*, U4, U5, CAPSTONE) green; `esp-jetson` links. NOTE: virt `VBAR_EL1` moved from
+round 10's `0x7c38c000` — the barrier instructions grew the aarch64 image and shifted the link
+layout; the vector base is still 2 KiB-aligned and unshifted-in-the-bug-sense, and the whole
+CAPSTONE chain is green at the new address (the current value prints in the run's own
+`exception vectors installed` line). QEMU models no Tegra — **the verdict is the next
+Peter-attended metal boot.**
+
+### JB2b — the attended metal verdict (2026-07-06): driver attach CONFIRMED, enumeration blocked by a firmware regression
+
+Two attended Orin boots (SD-in-USB-reader boot media; the same keyboard NVIDIA UEFI had just
+enumerated as "Generic Usb Keyboard" on the shell `devices` list). **Both booted the JB2b binary
+clean through the entire software chain:**
+
+- **JB1 replays deterministically on silicon**: MRQ_PING PASS, XUSB ungate all `err=0`, XUSB
+  ALIVE `xHCI v1.20`, zero erratum-1941500 heals fired.
+- **JB2b's driver attach is metal-proven**: `dma-coherent: YES` from the live DTB, then the
+  shared x86 driver ran on non-PCIe silicon for the first time — `Controller Reset Complete`,
+  **both** protocol banks decoded (`USB 3.1 ports 1..4`, `USB 2.0 ports 5..8`), interrupter +
+  rings programmed, scratchpad (3 buffers) allocated, `Controller Started!`.
+- **The honest-failure path worked exactly as designed**: no keyboard armed in the 60 s window →
+  full 8-port topology dump → the **unchanged** JM6b EL2→EL1 drop → EL1 landing → **CAPSTONE 6/6**.
+  The boot completed as JB1e did, precisely as the JB2b brief anticipated for the no-keyboard case.
+
+**But every one of the 8 root ports read `PORTSC=0x000002a0` (CCS=0, PP=1, PLS=RxDetect) from the
+first pre-reset survey read, USBSTS.PCD never set, and the keyboard LED stayed dark** — physically
+confirmed (no LED, and an unplug/replug into a *different* port during the live window still
+produced zero port activity). The bus was electrically silent the instant our kernel took over.
+
+**Root cause (4-agent research pass, high confidence — see the JB2c brief for the full dossier):
+a NVIDIA firmware update between the JB2a test and this one.** JB2a saw ports 6 & 7 CONNECTED with
+`USBSTS=0x11` (controller left live, port-change pending) on the older firmware. The updated
+firmware (JetPack 6.0 GA / L4T r36.3+, edk2-nvidia "hide device resources at uefi exit") runs a
+more aggressive `ExitBootServices` teardown on the Device-Tree boot path: it **power-gates the
+XUSB partition and de-programs the padctl USB pads**. Our kernel's JB1c re-ungates the *controller*
+(so the xHCI MMIO decodes and `Controller Started!` succeeds), but **nothing re-programs the
+padctl pads** — they sit at reset defaults (powered down), so no root port ever leaves RxDetect,
+CCS never asserts, and the downstream RTS5420 hub (which fans out the 4 physical Type-A ports)
+never trains or powers its ports. `USBSTS=0x11`(old)→`0x01`(new) is the fingerprint.
+
+This is **not** a JB2b bug and **not** a VBUS-GPIO problem — the P3768 devkit's 5V rail is
+hardwired `regulator-always-on` with no GPIO enable, so the dark LED is a downstream *symptom* of
+the un-trained pad, not a missing GPIO write. JB2b's design note "padctl/PHY: left exactly as UEFI
+programmed it" was a correct bet on the old firmware and lost to the update. **The fix is a new arc,
+JB2c** (below): re-program the padctl USB2 pad power-on sequence at `0x3520000` (pad n=1). padctl is
+always-powered (outside the PG toggle) and already in the GiB-0 device map, so it is *not* a new
+EL3-fatal MMIO class like JX1 — reads and writes there are safe on this ungated block.
+
+Captured: `target/serial-orin-jb2b-1.log` (both boots + the UEFI shell `devices`/`map` that proves
+the keyboard was live pre-handoff).
+
+### JB2c brief — re-program the padctl USB2 pads (the enumeration fix)
+
+Scoped from the JB2b metal verdict + the 4-agent research pass (2026-07-06). **One arc; do not
+stack on unreviewed JB2b.** Lane: `arch/aarch64` tegra files (`xusb_tegra.rs` — revise the
+"never touch padctl" directive at its head; `bpmp_tegra.rs` — add `TEGRA234_CLK_USB2_TRK` enable
++ the survey; a new padctl helper), this doc.
+
+**Step 0 (this arc's first boot — read-only confirm, cheapest fork).** After JB1c ALIVE, dump
+padctl read-only next to the PORTSC survey: `USB2_PAD_MUX` (0x3520004), `USB2_PORT_CAP` (0x3520008),
+`OTG_PAD1_CTL0` (0x35200C8), `OTG_PAD1_CTL1` (0x35200CC). **Prediction that confirms the root
+cause**: `OTG_PAD1_CTL0.PD` (bit26) and/or `PD_ZI` (bit29) *set*, and `PORT_CAP` for port 1 *not*
+HOST(0x1) — i.e. pads at reset defaults. If instead the pads read already-programmed yet PORTSC is
+still 0x2a0, the cause shifts to VBUS/rail or the NISO1 SMMU and this arc is the wrong fix — so this
+one read-only boot forks the whole decision. (padctl is always-powered; these reads cannot EL3-fault.)
+
+**Step 0 RESULT — CONFIRMED on silicon (2026-07-06, `target/serial-orin-jb2c-probe-CONFIRM.log`).**
+A read-only probe (temporarily added at the end of `bpmp_tegra.rs::jb1c_ungate_xusb`, after the
+JB2a survey; run on two power-cycles, captured, then **reverted to keep the JB2b arc clean at
+`5fc51fe`** — JB2c re-adds it as its first writes, or skips it since the answer is now known) read
+padctl cleanly — no EL3 fault, proving the block is safe to touch — and the values (identical across
+both boots) nail the root cause and *refine* the fix:
+```
+USB2_PAD_MUX=0x00000055   USB2_PORT_CAP=0x00000111
+OTG_PAD0 CTL0=0x26cc88d1  OTG_PAD1 CTL0=0x26cc88d0  OTG_PAD2 CTL0=0x26cc88d1  OTG_PAD3 CTL0=0x26cc88e0
+   (all four: PD b26=1, PD_ZI b29=1, TERM_SEL b25=1;  CTL1 PD_DR b2=1)
+BIAS_PAD_CTL0=0x060e0b38 (BIAS_PAD_PD b11=1)   BIAS_PAD_CTL1=0x0451e8df (PD_TRK b26=1)
+```
+- **Every pad power-down bit is SET**: all 4 USB2 OTG pads powered down (PD+PD_ZI+PD_DR) *and* the
+  shared bias pad powered down (BIAS_PAD_PD + PD_TRK). This is the reset/torn-down state → no port
+  trains → CCS never asserts. Root cause proven, not inferred.
+- **Refinement vs the predicted sequence**: `PAD_MUX=0x55` = XUSB routing already set for all 4 ports
+  (2-bit field per port, 0b01=XUSB); `PORT_CAP=0x111` = ports 0/1/2 already HOST (2-bit field at n*4,
+  0b01=HOST), port 3 disabled. **The firmware left routing + capability intact and ONLY powered the
+  pads down.** So Step-1 sub-steps 2 (`PAD_MUX`) and 3 (`PORT_CAP`) are idempotent no-ops on this
+  silicon; the load-bearing fix is the **pad power-up**: clear PD/PD_ZI (CTL0) + PD_DR (CTL1) on the
+  HOST pads, and the bias-pad power-up + tracking (steps E–H). Program the HOST-capable pads (0,1,2 —
+  the hub upstream is pad 1 per Linux, but powering all three HOST pads covers whichever physical
+  connector the device lands on). Leave pad 3 (disabled) alone.
+- **De-risks the JB2c writes**: same always-powered block the probe read without fault, so the
+  power-up writes are not a new EL3-fatal class.
+
+**Step 1 (the fix).** Program pad n=1 (the hub upstream), all offsets from `P=0x3520000`, sequence
+verbatim from Linux `drivers/phy/tegra/xusb-tegra186.c` (`tegra234_xusb_padctl_soc`):
+1. Enable `TEGRA234_CLK_USB2_TRK` via BPMP MRQ_CLK (bias-pad tracking clock).
+2. `PAD_MUX` (P+0x004): set port-1 field to XUSB (`0x1 << 2`).
+3. `PORT_CAP` (P+0x008): set port-1 cap to HOST (`0x1 << 4`).
+4. `OTG_PAD1_CTL0` (P+0x0C8): clear `PD_ZI` (bit29), set `TERM_SEL` (bit25), `HS_CURR_LEVEL`=0 ok
+   for first light (fuse-cal is a later refinement).
+5. `OTG_PAD1_CTL1` (P+0x0CC): clear `TERM_RANGE_ADJ` (bits[6:3]) + `RPD_CTRL` (bits[30:26]).
+6. `BIAS_PAD_CTL1` (P+0x288): `TRK_START_TIMER`=0x1e (bits[18:12]), `TRK_DONE_RESET_TIMER`=0x0a
+   (bits[25:19]).
+7. `BIAS_PAD_CTL0` (P+0x284): clear `BIAS_PAD_PD` (bit11), `HS_DISCON_LEVEL`=0x7 (bits[5:3]);
+   udelay(1).
+8. Run tracking: clear `USB2_PD_TRK` (P+0x288 bit26); poll `TRK_COMPLETED` (bit31) with a ~100 µs
+   budget (proceed on timeout); write `TRK_COMPLETED` back; clear `CYA_TRK_CODE_UPDATE_ON_IDLE`
+   (P+0x28C bit31); udelay(2).
+9. The two clears that light the port: `OTG_PAD1_CTL0` clear `USB2_OTG_PD` (bit26);
+   `OTG_PAD1_CTL1` clear `USB2_OTG_PD_DR` (bit2).
+10. **VBUS: do nothing** — `vdd_5v0_sys`/`vdd_1v1_hub` are always-on; **do NOT** set `VBUS_OVERRIDE`
+    (P+0x360, a device-mode fake, wrong for a host port); **do NOT** assert `RESET_XUSB_PADCTL`
+    (would wipe all padctl state).
+
+Then re-run the JB2b survey: CCS should assert + PLS advance out of RxDetect on plug, and the
+existing enumeration pump takes over → keyboard first light at EL1.
+
+**STOP tripwire (unchanged from JB2b):** if, after the pads come up, PORTSC goes healthy (CCS=1)
+but enumeration times out, that's the NISO1 SMMU `GBPA=ABORT` DMA-drop signature — an honest STOP
+report and a *different* arc, not a padctl bug. **Zero-code alternative Peter can try meanwhile:**
+roll back to the pre-update firmware slot (restores the old always-on handoff); no Jetson UEFI
+menu USB/XHCI toggle exists.
+
+### JB0 brief — turn the cooling fan back on (safety hygiene; run FIRST on Orin)
+
+Discovered 2026-07-06: when UnaOS takes over from UEFI the **fan stops and the Orin runs hot**.
+Same mechanism as JB2c — NVIDIA's `ExitBootServices` teardown disables the fan PWM's clock + reset
+(the device-discovery driver's `AutoEnableClocks`/`AutoResetModule` are undone). Scoped from a
+3-agent research pass (fan-PWM / thermal-safety / teardown-scope), all cross-corroborated; see the
+per-claim confidences below.
+
+**Urgency — no die-DESTRUCTION risk, but genuinely hot (correction from a metal observation).** The
+Orin has an OS-independent hardware thermal net armed by NVIDIA BL31/BPMP before UnaOS runs: **103 °C
+Tj** = hardware clock-throttle (50/75/87.5 % caps, no OS notified), **105 °C Tj** = a die→PMIC
+failsafe that power-cycles the board (cannot be altered in software). So a dead fan can never *cook*
+the silicon — worst case is a clean PMIC reset. **BUT those trips sit far above touch-temperature:
+in live fire (2026-07-06, pre-JB0 boots) Peter found the heatsink too hot to hold a finger on —
+~55–65 °C surface ⇒ ~70–90 °C Tj — with the fan still off and NOTHING throttling.** The board will
+happily sit fan-off in that 70–90 °C band indefinitely under light bring-up load and never trip, so
+the failsafe does NOT keep it comfortable — it only stops destruction. **Corrected verdict: the fan
+is a real need, not mere "hygiene"; do NOT run long fan-off boots.** JB0 runs ~1 s into every Orin
+boot (right after the JB1b ping), so once it is in the image the fan comes on almost immediately —
+verify it spins before leaning on any long (e.g. JB2c 60 s-window) boot. The hard damage rule still
+stands: never run *sustained heavy GPU/CPU load with no heatsink*.
+
+**The fix (confidence HIGH; register model corroborated by Linux `pwm-tegra.c` AND UEFI's own
+`TegraPwmDxe`, which drives this same block during boot).** Controller = **PWM3 @ base
+`0x032A0000`**, channel 0, one 32-bit CSR at base+0x0. **No fan MRQ exists** (MRQ_THERMAL only
+reads temps / sets trips) — the host drives the PWM directly, but the clock/reset prerequisites ride
+the same BPMP transport JB1 proved. CSR fields: bit[31]=ENABLE, bits[23:16]=DUTY (n/256), bits[12:0]
+=SCALE (frequency only). Ordered:
+1. BPMP `MRQ_CLK`/`CMD_CLK_ENABLE` on `TEGRA234_CLK_PWM3 = 107` (0x6B). *(verify-don't-assume the ID
+   against `clk-t234.h`.)*
+2. BPMP `MRQ_RESET`/`CMD_RESET_DEASSERT` on `TEGRA234_RESET_PWM3 = 70` (0x46). *(verify vs
+   `reset-t234.h`.)*
+3. **No `MRQ_PG`** — the `pwm3` DT node has no `power-domains`; always-on rail (both the DTS and the
+   UEFI teardown confirm PWM gets clock+reset only, never a powergate). So — unlike XUSB — the CSR
+   aperture is **not** a gated block: **no new EL3-fatal class** (the XUSB trap was touching a
+   *power-gated* block; PWM has no power domain).
+4. `w32(0x032A0000, 0x81FF0000)` → ENABLE + ~100 % duty → fan full-on. (UEFI's own "medium" is
+   `0x80800000`; the DT `cooling-levels` top = 255 = 0xFF for full.)
+5. Pinmux is normally already applied by MB1/UEFI on the devkit — only touch `pinmux@2430000` if the
+   fan stays silent after 1–4 (MEDIUM confidence).
+
+**Mapping — already covered (verified):** `0x032A0000` (53 MiB) is inside GiB 0, which
+`mmu_tegra` maps as one Device-nGnRE block (same block that reaches XUSB `0x3610000` and the BPMP) —
+no MMU change. Note: CSR reads/writes appear to work even with the clock off, but the output won't
+toggle until steps 1–2 run; benign (no abort), just do the ungate first.
+
+**Scope recommendation: a tiny standalone arc, run FIRST on Orin, before JB2c** — it's the cheapest
+teardown-restore (no PG, no pad re-init), it's the #1 safety item, and it keeps the fan decoupled
+from JB2c's heavier pad work. Lane: tegra `arch/aarch64` files + the JB1 BPMP MRQ transport (no
+shared kernel-core); doc = this file + the jetson resume note. Alternatively fold it in as JB2c's
+step 0 (same lane, same transport) if you'd rather one Orin session — integrator's call; the plan
+file's follow-on-arc order (`~/.claude/plans/unaos-opus-jetson.md`) should get JB0 inserted ahead
+of JB2c either way.
+
+**What else the teardown kills (the "other things to turn on" list, confidence HIGH — from
+edk2-nvidia's per-driver EBS config).** Ranked by urgency: **(1) fan PWM3** — JB0 (this);
+**(2) USB pads / XUSB** — JB2c; **(3) nvdisplay** — JD1 (also a powergate, `SocDisplayHandoffMode=
+NEVER`); (4) PCIe (powergate) and (5) Ethernet/EQOS (clk+reset+PG) — only if/when those subsystems
+are needed. **Survives EBS, no action:** PMIC/regulator rails (RegulatorDxe registers no EBS event —
+voltages persist), the BPMP itself, and GIC/timer/UART (not device-discovery drivers). So at handoff
+the *voltages* are all up; only on-SoC clock/reset/powergate partitions get torn down, and only the
+ones a given subsystem needs must be re-asserted.
+
+### JB0 — landed (QEMU-green, ⏳ METAL-PENDING)
+
+Implemented as `bpmp_tegra::jb0_fan_on(chan)`, called from `main.rs` the instant the BPMP channel
+is proven by the JB1b ping — **before** the JB1c XUSB ungate, so cooling is restored first. It runs
+the three steps above over the just-proven channel: `MRQ_CLK` enable on `TEGRA234_CLK_PWM3` (107),
+`MRQ_RESET` deassert on `TEGRA234_RESET_PWM3` (70), then `w32(0x032A0000, 0x8100_0000)`. **All three
+constants verified against mainline** (`tegra234-clock.h` / `tegra234-reset.h` / `pwm-tegra.c` +
+`tegra234.dtsi pwm@32a0000`): the clock/reset IDs were right; the full-on CSR value is **`0x8100_0000`**
+— the Linux driver's 100%-duty count is 256 (`0x100`), which overflows the nominal 8-bit duty field
+into bit 24, so the exact value mainline emits is `ENABLE | (0x100 << 16)`, not the `0x80FF_0000`
+(255/256) first guessed (that also runs the fan full, one tick short). Best-effort: a failed
+clock/reset MRQ prints and skips (no-fan is not fatal — the hardware thermal net still protects the
+die); the CSR is always-mapped + always-powered, so the write cannot EL3-fault.
+
+Expected serial (before the JB1c XUSB lines): `:: tegra: JB0 — fan PWM3 clk 107 enable -> err=0 ::`
+→ `:: tegra: JB0 — fan PWM3 reset 70 deassert -> err=0 ::` → `:: tegra: JB0 — touching fan PWM3 CSR
+@0x32a0000 … ::` → `:: tegra: JB0 — fan ON: CSR<-0x81000000 (readback 0x81000000) -> PASS ::`. **The
+metal proof is trivial and instant: the fan spins up audibly** (and the readback line echoes the CSR).
+Gate: `./arroyo check` + `UNAOS_TEGRA=1 ./arroyo check` green; x86 `test` MISSION SUCCESS; virt GICv3
+`test-arm` CAPSTONE 6/6; Pi `kernel8` builds; `esp-jetson` links. Changes are entirely tegra-cfg-gated
+(non-tegra binaries byte-identical). QEMU models no Tegra PWM — the verdict is the next attended boot.
+
 ## 4. Jetson Orin Nano headless bring-up (Arc JM2)
 
 The Orin is brought up **headless over serial**. The only console that has ever
