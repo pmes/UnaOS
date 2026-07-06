@@ -163,10 +163,11 @@ pub fn jb1b_ping(geom: &BpmpGeom) -> bool {
     w32(txq + OFF_W_STATE, IVC_STATE_SYNC);
     dsb();
     w32(db.trigger, 1);
+    let mut acked = false;
     let mut established = false;
     let ok = wait_ms(100, || match r32(rxq + OFF_W_STATE) {
         IVC_STATE_ACK => {
-            // Peer cleared its side; clear ours, declare established.
+            // Peer cleared its side in response to our SYNC; clear ours, declare established.
             w32(txq + OFF_W_COUNT, 0);
             w32(rxq + OFF_R_COUNT, 0);
             dsb();
@@ -177,22 +178,42 @@ pub fn jb1b_ping(geom: &BpmpGeom) -> bool {
             true
         }
         IVC_STATE_SYNC => {
-            // Peer restarted too: clear ours, answer ACK, keep waiting for its ESTABLISHED.
+            // Peer is (re)starting too: clear ours, answer ACK, wait for its ESTABLISHED.
             w32(txq + OFF_W_COUNT, 0);
             w32(rxq + OFF_R_COUNT, 0);
             dsb();
             w32(txq + OFF_W_STATE, IVC_STATE_ACK);
             dsb();
             w32(db.trigger, 1);
+            acked = true;
             false
         }
-        IVC_STATE_ESTABLISHED if established => true,
+        IVC_STATE_ESTABLISHED => {
+            if established {
+                true
+            } else if acked {
+                // The three-way tail (the JB1b first-boot lesson): we answered peer-SYNC with
+                // ACK, the peer established — now WE establish and the channel is up. The first
+                // metal run timed out exactly here, with the BPMP already at ESTABLISHED.
+                w32(txq + OFF_W_STATE, IVC_STATE_ESTABLISHED);
+                dsb();
+                w32(db.trigger, 1);
+                established = true;
+                true
+            } else {
+                // Stale ESTABLISHED from before the peer notices our SYNC — keep waiting; the
+                // BPMP always answers a SYNC.
+                false
+            }
+        }
         _ => false,
     });
     if !ok && !established {
         serial_println!(
-            ":: tegra: JB1b — IVC sync TIMEOUT (rx state={:#x}); STOP ::",
-            r32(rxq + OFF_W_STATE)
+            ":: tegra: JB1b — IVC sync TIMEOUT (rx state={:#x} tx state={:#x} acked={}); STOP ::",
+            r32(rxq + OFF_W_STATE),
+            r32(txq + OFF_W_STATE),
+            acked,
         );
         return false;
     }
