@@ -23,13 +23,20 @@ pub mod smp_virt;
 // the scheduler on the `virt` boot core so CAPSTONE runs at EL1.
 #[cfg(all(target_arch = "aarch64", not(feature = "pi"), not(feature = "tegra")))]
 pub mod boot_virt;
+// JM6: the Jetson Orin (Tegra234) EL2 -> EL1 drop — the tegra analogue of `boot_virt`, reusing
+// `mmu_tegra`'s already-built identity L1 for the EL1 regime so the boot core runs the scheduler +
+// CAPSTONE at EL1 on silicon. `tegra`-only (mirrors `boot_virt`'s `virt`-only role).
+#[cfg(all(target_arch = "aarch64", feature = "tegra"))]
+pub mod boot_tegra;
 // The aarch64 kernel-thread scheduler + sync primitives. Compiled for the Pi bare-metal path (its
-// original home) AND, since JC3, the `virt` path (which drops EL2 -> EL1 via `boot_virt` so the scheduler
-// can run at EL1). NOT compiled for tegra (single-core Orin userspace is a follow-on arc). Its EL0/user
-// machinery (`spawn_user*`, the user trampoline, slot teardown) stays `#[cfg(feature = "baremetal")]`.
+// original home), the `virt` path (JC3, which drops EL2 -> EL1 via `boot_virt`), AND, since JM6, the
+// `tegra` path (which drops EL2 -> EL1 via `boot_tegra`) — so the scheduler can run at EL1 on the Orin
+// boot core. Its EL0/user machinery (`spawn_user*`, the user trampoline, slot teardown) stays
+// `#[cfg(feature = "baremetal")]` (single-core Orin *userspace* is a follow-on arc).
 #[cfg(any(
     feature = "baremetal",
-    all(target_arch = "aarch64", not(feature = "pi"), not(feature = "tegra"))
+    all(target_arch = "aarch64", not(feature = "pi"), not(feature = "tegra")),
+    all(target_arch = "aarch64", feature = "tegra")
 ))]
 pub mod sched;
 #[cfg(feature = "baremetal")]

@@ -87,16 +87,17 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         boot_info.framebuffer_info,
     );
 
-    // 0b. Jetson Orin Nano (tegra): install the kernel's own MMU (JM3), then bring up the GIC + timer
-    //     on the boot core (JM4). The UEFI-handoff tables map RAM but NOT the Tegra peripheral MMIO
-    //     (JM2 R4: the kernel faulted on its first UARTC read), so `tegra_early_stop` first calls
-    //     `mmu_tegra::init` to map RAM Normal-WB + the Tegra device window Device-nGnRE — which is what
-    //     lets the serial path drive UARTC — then brings up the Tegra234 GIC-600 + the generic timer on
-    //     the boot core (their GIC bases sit in that mapped device window) and enters an interrupt-driven
-    //     idle. It diverges before the rest of `kernel_main` (heap/SMP/scheduler/GUI — later arcs), so
-    //     everything below is unreachable on tegra (covered by the fn's `allow(unreachable_code)`).
-    //     `tegra` is off in every QEMU build, so this is inert there and the regression logs are
-    //     byte-identical.
+    // 0b. Jetson Orin Nano (tegra): install the kernel's own MMU (JM3), bring up the GIC + timer on the
+    //     boot core (JM4), then drop EL2 -> EL1 and run the scheduler + CAPSTONE at EL1 (JM6). The
+    //     UEFI-handoff tables map RAM but NOT the Tegra peripheral MMIO (JM2 R4: the kernel faulted on its
+    //     first UARTC read), so `tegra_early_stop` first calls `mmu_tegra::init` to map RAM Normal-WB + the
+    //     Tegra device window Device-nGnRE — which is what lets the serial path drive UARTC — then brings
+    //     up the Tegra234 GIC-600 + the generic timer (their GIC bases sit in that mapped device window)
+    //     and proves the timer PPI at EL2, and finally (JM6) drops the boot core EL2 -> EL1 and runs the
+    //     M4 CAPSTONE cooperatively at EL1. It diverges before the rest of `kernel_main` (heap/GUI and
+    //     Orin userspace/SMP — later arcs), so everything below is unreachable on tegra (covered by the
+    //     fn's `allow(unreachable_code)`). `tegra` is off in every QEMU build, so this is inert there and
+    //     the regression logs are byte-identical.
     #[cfg(all(feature = "tegra", target_arch = "aarch64"))]
     tegra_early_stop(boot_info);
 
@@ -812,18 +813,19 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
 /// Jetson Orin Nano (Tegra234) platform bring-up — the `tegra` build's terminus. JM3 installs the
 /// kernel's own MMU via `mmu_tegra::init` (RAM Normal-WB + the Tegra device window Device-nGnRE + a
 /// fault vector), which is what lets the serial path drive UARTC. JM4 then brings up the Tegra234
-/// GIC-600 + the ARM generic timer on the BOOT CORE and enters an interrupt-driven idle: the heartbeat
-/// is now driven by the timer PPI (INTID 30) delivered through the GIC, not a spin. It still stops
-/// BEFORE the rest of `kernel_main` (heap/memory init, SMP, scheduler, GUI — later arcs). SMP on Tegra
-/// (PSCI CPU_ON, affinity widening) is deferred; only the boot core's redistributor is brought up here.
+/// GIC-600 + the ARM generic timer on the BOOT CORE and proves the timer PPI (INTID 30) delivers through
+/// the GIC at EL2 (`verify_live`). **JM6** then drops the boot core **EL2 -> EL1** (`boot_tegra`, reusing
+/// mmu_tegra's identity L1) and runs the full six-primitive M4 CAPSTONE cooperatively at EL1
+/// (`sched::run_capstone_boot_core`) — the first time the scheduler runs on Orin silicon. Heap/memory
+/// init and Orin *userspace* (EL0) are later arcs; SMP (PSCI CPU_ON) is parked (metal-blocked, see JM6/
+/// JM5 notes at the call site), so JM6 is single-core and sidesteps that wall.
 ///
 /// Diverges (so `kernel_main` is `!` on tegra and everything after the call site is unreachable —
-/// covered by that fn's `allow(unreachable_code)`). If the timer IRQ delivers, the idle is `WFI` woken
-/// by each tick; if `verify_live` finds it does not (e.g. a wrong GIC base), it degrades to a poll-spin
-/// with a CNTPCT-driven heartbeat — a debuggable "alive but timer-IRQ-not-delivering" state, not a dark
-/// hang. `tegra` is off in every QEMU build, so this is never compiled into a regression run.
+/// covered by that fn's `allow(unreachable_code)`). `run_capstone_boot_core` never returns: it drains the
+/// run queue (CAPSTONE 6/6) then idle-spins, so a headless serial capture gets the whole log. `tegra` is
+/// off in every QEMU build, so this is never compiled into a regression run — its verdict is Orin metal.
 #[cfg(all(feature = "tegra", target_arch = "aarch64"))]
-fn tegra_early_stop(boot_info: &BootInfo) -> ! {
+fn tegra_early_stop(boot_info: &'static mut BootInfo) -> ! {
     // 1. Install the kernel's own MMU FIRST — SILENT. Nothing has printed yet (fbcon::init is
     //    print-free when fb_addr == 0), and the serial path cannot touch UARTC until this maps the
     //    Tegra device window. The FIRST serial byte of the whole kernel is the `mmu live` line below.
@@ -883,52 +885,52 @@ fn tegra_early_stop(boot_info: &BootInfo) -> ! {
     unaos_kernel::arch::exceptions::enable_irq();
     unaos_kernel::arch::timer::verify_live();
 
-    // 3b. JM5: bring the Orin's secondary cores online via PSCI CPU_ON + per-core GICv3 bring-up, proven
-    //     by cross-core SGI. It runs AFTER the boot-core GIC/timer bring-up above: each AP reuses
-    //     `gic::init_secondary_v3` and the Tegra234 GICR base/stride established for the boot core (JM4),
-    //     and discovers the fused core set by walking the redistributors (metal truth — the first
-    //     exercise of JM4's VLPIS stride on a non-first frame). `dtb=0` skips the `/psci` FDT parse: the
-    //     `fdt-0.1.5` parse of the real Orin DTB panics (task cde963a7), and SMC is the Orin PSCI conduit
-    //     (ATF/BL31) regardless. Gated on `gic::is_v3()` (always true on the Orin GIC-600), matching the
-    //     virt kick-off's runtime gate. On QEMU (`tegra` off) this is never compiled.
-    if unaos_kernel::arch::gic::is_v3() {
-        unaos_kernel::arch::smp_virt::start_secondaries(0, 0);
-    }
+    // 3c. Initialize the GLOBAL HEAP before the scheduler. CAPSTONE allocates (per-primitive waiter
+    //     queues via `CAP_*.init()`, and each task's stack via `spawn`), so the heap MUST be live before
+    //     `run_capstone_boot_core`. On every other path `kernel_main` calls `memory::init` at its line 4;
+    //     the tegra path DIVERGES here (in `tegra_early_stop`) BEFORE `kernel_main` reaches that call, so
+    //     without this the first CAPSTONE allocation would hit the empty `#[global_allocator]` (Heap::empty)
+    //     → null → `handle_alloc_error` → panic — invisible in QEMU (tegra is never compiled into a
+    //     regression) and a dead box on the Orin boot the arc's verdict depends on. mmu_tegra mapped RAM
+    //     Normal-WB (identity), so the heap region `memory::init` carves is coherent both here (EL2) and,
+    //     unchanged, after the JM6 drop (EL1) — the allocator state lives in RAM the reused L1 also maps.
+    unaos_kernel::arch::memory::init(boot_info);
+    serial_println!(":: KERNEL HEAP ALLOCATED ::");
 
-    // 4. Interrupt-driven idle. `arch::hlt()` parks in WFI when the timer IRQ is confirmed delivering
-    //    (woken by each PPI-30 tick) and falls back to a poll-spin otherwise (no wake source). The
-    //    heartbeat is now driven by `timer::ticks()` advancing — a climbing number proves the whole
-    //    timer→GIC→CPU-interface→vector→handler→EOI loop closed on Orin silicon (the JM4 verdict). If
-    //    `verify_live` reported NOT live, `ticks()` stays frozen, so a CNTPCT-driven fallback beat keeps
-    //    liveness visible and labels the degraded state (GIC up, PPI-30 not delivering).
-    let mut last_beat: u64 = 0;
-    let cntpct_hz: u64 = {
-        let f = unaos_kernel::arch::timer::cntfrq();
-        if f == 0 { 31_250_000 } else { f }
-    };
-    let mut next_cntpct: u64 = unaos_kernel::arch::timer::cntpct().wrapping_add(cntpct_hz);
-    let mut spin_hb: u64 = 0;
-    loop {
-        unaos_kernel::arch::hlt();
-        let t = unaos_kernel::arch::timer::ticks();
-        let beat = t / 250; // once per second of timer-driven time (timer.rs TICK_HZ = 250)
-        if beat != last_beat {
-            last_beat = beat;
-            serial_println!(":: tegra: heartbeat {} (ticks={}, live) ::", beat, t);
-        } else if !unaos_kernel::arch::timer::is_live() {
-            // Degraded: timer IRQ not delivering, so `ticks()` never moves. Prove liveness off the
-            // free-running physical counter instead — one beat per ~1 s of CNTPCT time.
-            let now = unaos_kernel::arch::timer::cntpct();
-            if now.wrapping_sub(next_cntpct) < (u64::MAX / 2) {
-                next_cntpct = now.wrapping_add(cntpct_hz);
-                serial_println!(
-                    ":: tegra: heartbeat {} (timer-IRQ NOT delivering — CNTPCT-driven) ::",
-                    spin_hb
-                );
-                spin_hb = spin_hb.wrapping_add(1);
-            }
-        }
-    }
+    // 4. JM6: drop the Orin BOOT CORE EL2 -> EL1 and run the scheduler + full M4 CAPSTONE at EL1 — the
+    //    first time the scheduler runs on Orin silicon. This is the tegra analogue of the virt JC3 call
+    //    site (`kernel_main`), and it becomes the tegra terminus: `run_capstone_boot_core` never returns.
+    //
+    //    Single-core, by design. JM5 (Orin SMP via PSCI CPU_ON) is PARKED and deliberately NOT invoked on
+    //    this path: on the real Orin the first `CPU_ON` triggers a fatal Tegra RAS Uncorrectable Error
+    //    (CBB fabric — a BL31/MCE firmware issue, NOT a JM5 code bug; see the "JM5 result" doc section)
+    //    and powers the box off BEFORE returning, which would prevent ever reaching CAPSTONE. JM6 needs no
+    //    SMP, so it sidesteps that wall entirely. (`smp_virt` stays compiled for tegra; it is simply not
+    //    called here. Re-attempting Orin SMP / iterating CPU_ON is out of scope for this arc.)
+    //
+    //    JM4 above brought the timer up and PROVED IRQ delivery at EL2 (`verify_live`); the drop then
+    //    DISABLES the physical timer so no IRQ hits the EL2-banking `__vec_irq` stub once we are at EL1
+    //    (the stub reads ELR_EL2/SPSR_EL2 — a fault at EL1), and CAPSTONE runs cooperatively (exactly how
+    //    the Pi/virt CAPSTONE already runs under QEMU with no Group-1 delivery).
+    //
+    //    Detach fbcon first (mirrors JC3): after the drop the EL1 map covers only RAM + the Tegra device
+    //    window, so a serial_println! that mirrored to a framebuffer outside it would fault at EL1. Orin
+    //    here is headless (no fb), so this is a defensive no-op; UARTC lives in the mapped device window,
+    //    so the CAPSTONE log is captured over serial regardless.
+    unaos_kernel::video::fbcon::detach();
+    serial_println!(
+        ":: tegra: JM6 — dropping the Orin boot core EL2 -> EL1 for the scheduler + CAPSTONE ::"
+    );
+    // Reuse mmu_tegra's already-built identity L1 (RAM Normal-WB + the Tegra device window) for the EL1
+    // regime — `mmu.ttbr0` is its PA. The EL1 arm is dormant (SCTLR_EL1.M set while still at EL2) until
+    // the eret, so EL1 never runs an instruction with its MMU off (the load-bearing invariant).
+    unsafe { unaos_kernel::arch::boot_tegra::drop_to_el1(mmu.ttbr0) };
+    // Now at EL1 with the MMU live and DAIF masked. Re-seed this core's per-CPU block (now TPIDR_EL1) and
+    // install the EL1 exception vectors (VBAR_EL1) — both pick the EL from CurrentEL at runtime (JC3) — then
+    // run CAPSTONE cooperatively. The VBAR_EL1 line (vs the pre-drop VBAR_EL2) is the crisp EL1 proof.
+    unaos_kernel::arch::percpu::init(0);
+    unaos_kernel::arch::exceptions::install();
+    unaos_kernel::arch::sched::run_capstone_boot_core(0);
 }
 
 /// Handle one keyboard byte against the console: printable ASCII extends the input line, backspace
