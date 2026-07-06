@@ -400,3 +400,64 @@ pub fn jb1c_ungate_xusb(chan: &Chan, ids: &super::fdt_tegra::XusbIds) -> bool {
     serial_println!(":: tegra: JB2a — port survey done ({} ports scanned) ::", max_ports);
     true
 }
+
+// JB0 fan constants. The devkit cooling fan is driven by Tegra234 PWM controller PWM3 at MMIO
+// base 0x032A_0000 (verified against tegra234.dtsi `pwm3: pwm@32a0000`; the `pwm-fan` node's
+// `&pwm3` channel 0 = the fan; UEFI's own TegraPwmDxe drives this same block during boot).
+// PWM_CONTROLLER_PWM_CSR_0 is one 32-bit register at base+0x0 (channel 0): bit[31] = ENABLE,
+// DUTY = a fraction of 256 at PWM_DUTY_SHIFT=16, bits[12:0] = SCALE (output frequency only —
+// irrelevant to on/off). Per drivers/pwm/pwm-tegra.c the duty count for 100% is 256 (0x100),
+// which overflows the nominal 8-bit field into bit 24 — the exact value mainline writes for a
+// full-on request is ENABLE | (0x100 << 16) = 0x8100_0000 (cross-checks: UEFI's "medium" is
+// 0x8080_0000 = 128/256 = 50%). Using the true-100% value the reference driver emits.
+const PWM3_CSR: u64 = 0x032A_0000;
+const PWM_FAN_FULL_ON: u32 = 0x8100_0000;
+// TEGRA234_CLK_PWM3 / TEGRA234_RESET_PWM3 (dt-bindings/{clock,reset}/tegra234-*.h). PWM3 sits in
+// an always-on rail (its DT node has no `power-domains`), so — unlike the XUSB host block — this
+// CSR is NOT a power-gated aperture: no MRQ_PG and no JX1-class EL3-fatal risk. It only needs its
+// clock enabled + module reset deasserted (both undone by the UEFI ExitBootServices teardown)
+// before the CSR output toggles.
+const CLK_PWM3: u32 = 107;
+const RESET_PWM3: u32 = 70;
+
+/// JB0: turn the Orin cooling fan back on. NVIDIA's ExitBootServices teardown disables the fan
+/// PWM's clock + module reset, so the fan stops the instant UnaOS takes over and the SoC heats up.
+/// (A dead fan can't damage the die — BL31/BPMP arm an OS-independent hardware thermal net that
+/// throttles at 103 C and PMIC-resets at 105 C — but restoring cooling keeps the SoC out of the
+/// throttle band.) This is the cheapest teardown-restore: re-enable the PWM3 clock + deassert its
+/// reset over the SAME BPMP channel JB1 proved, then drive the CSR full-on. Runs FIRST on Orin,
+/// before the XUSB work. Best-effort: a failed clock/reset MRQ prints and skips (no fan is not
+/// fatal); the CSR is always-mapped (GiB-0 Device block, same as XUSB) and always-powered, so the
+/// write cannot EL3-fault — the pre-touch line is JX1 discipline, not a real hazard here.
+pub fn jb0_fan_on(chan: &Chan) {
+    match chan.transfer(MRQ_CLK, &[(CMD_CLK_ENABLE << 24) | (CLK_PWM3 & 0x00ff_ffff)]) {
+        Some((err, _)) => {
+            serial_println!(":: tegra: JB0 — fan PWM3 clk {} enable -> err={} ::", CLK_PWM3, err)
+        }
+        None => {
+            serial_println!(":: tegra: JB0 — fan PWM3 clk enable TIMEOUT; fan skipped ::");
+            return;
+        }
+    }
+    match chan.transfer(MRQ_RESET, &[CMD_RESET_DEASSERT, RESET_PWM3]) {
+        Some((err, _)) => serial_println!(
+            ":: tegra: JB0 — fan PWM3 reset {} deassert -> err={} ::",
+            RESET_PWM3, err
+        ),
+        None => {
+            serial_println!(":: tegra: JB0 — fan PWM3 reset deassert TIMEOUT; fan skipped ::");
+            return;
+        }
+    }
+    serial_println!(
+        ":: tegra: JB0 — touching fan PWM3 CSR @{:#x} (always-on, not PG-gated) ::",
+        PWM3_CSR
+    );
+    w32(PWM3_CSR, PWM_FAN_FULL_ON);
+    dsb();
+    serial_println!(
+        ":: tegra: JB0 — fan ON: CSR<-{:#010x} (readback {:#010x}) -> PASS ::",
+        PWM_FAN_FULL_ON,
+        r32(PWM3_CSR),
+    );
+}

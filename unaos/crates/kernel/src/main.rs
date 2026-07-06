@@ -918,6 +918,12 @@ fn tegra_early_stop(boot_info: &'static mut BootInfo) -> ! {
             // domains -> clocks -> reset deassert, all ids read off the DTB's usb@3610000 node)
             // and re-probe the xHCI capability block that was EL3-fatal in JX1.
             if let Some(chan) = unaos_kernel::arch::bpmp_tegra::jb1b_ping(&geom) {
+                // JB0: fan FIRST. The UEFI ExitBootServices teardown stopped the cooling fan
+                // (it disabled the PWM3 clock + reset); restore it before anything else so the
+                // SoC has cooling for the rest of the boot. Cheapest teardown-restore (no
+                // power-gate), rides the just-proven BPMP channel. Safety hygiene: a dead fan
+                // can't damage the die (BL31/BPMP hardware thermal net), but this keeps it cool.
+                unaos_kernel::arch::bpmp_tegra::jb0_fan_on(&chan);
                 match unaos_kernel::arch::fdt_tegra::xusb_ids(
                     boot_info.dtb_addr,
                     boot_info.dtb_size,

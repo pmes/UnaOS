@@ -702,6 +702,28 @@ voltages persist), the BPMP itself, and GIC/timer/UART (not device-discovery dri
 the *voltages* are all up; only on-SoC clock/reset/powergate partitions get torn down, and only the
 ones a given subsystem needs must be re-asserted.
 
+### JB0 — landed (QEMU-green, ⏳ METAL-PENDING)
+
+Implemented as `bpmp_tegra::jb0_fan_on(chan)`, called from `main.rs` the instant the BPMP channel
+is proven by the JB1b ping — **before** the JB1c XUSB ungate, so cooling is restored first. It runs
+the three steps above over the just-proven channel: `MRQ_CLK` enable on `TEGRA234_CLK_PWM3` (107),
+`MRQ_RESET` deassert on `TEGRA234_RESET_PWM3` (70), then `w32(0x032A0000, 0x8100_0000)`. **All three
+constants verified against mainline** (`tegra234-clock.h` / `tegra234-reset.h` / `pwm-tegra.c` +
+`tegra234.dtsi pwm@32a0000`): the clock/reset IDs were right; the full-on CSR value is **`0x8100_0000`**
+— the Linux driver's 100%-duty count is 256 (`0x100`), which overflows the nominal 8-bit duty field
+into bit 24, so the exact value mainline emits is `ENABLE | (0x100 << 16)`, not the `0x80FF_0000`
+(255/256) first guessed (that also runs the fan full, one tick short). Best-effort: a failed
+clock/reset MRQ prints and skips (no-fan is not fatal — the hardware thermal net still protects the
+die); the CSR is always-mapped + always-powered, so the write cannot EL3-fault.
+
+Expected serial (before the JB1c XUSB lines): `:: tegra: JB0 — fan PWM3 clk 107 enable -> err=0 ::`
+→ `:: tegra: JB0 — fan PWM3 reset 70 deassert -> err=0 ::` → `:: tegra: JB0 — touching fan PWM3 CSR
+@0x32a0000 … ::` → `:: tegra: JB0 — fan ON: CSR<-0x81000000 (readback 0x81000000) -> PASS ::`. **The
+metal proof is trivial and instant: the fan spins up audibly** (and the readback line echoes the CSR).
+Gate: `./arroyo check` + `UNAOS_TEGRA=1 ./arroyo check` green; x86 `test` MISSION SUCCESS; virt GICv3
+`test-arm` CAPSTONE 6/6; Pi `kernel8` builds; `esp-jetson` links. Changes are entirely tegra-cfg-gated
+(non-tegra binaries byte-identical). QEMU models no Tegra PWM — the verdict is the next attended boot.
+
 ## 4. Jetson Orin Nano headless bring-up (Arc JM2)
 
 The Orin is brought up **headless over serial**. The only console that has ever
