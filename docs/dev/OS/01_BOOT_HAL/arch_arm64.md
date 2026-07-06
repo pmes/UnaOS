@@ -136,16 +136,17 @@ needs a dedicated investigation (see the "JM5 result" section for the syndrome, 
 query-works/power-faults split, and the ranked hypotheses). QEMU models no Tegra machine, so
 QEMU-green did not — and here could not — imply Orin-correct.
 
-**Scheduler on Orin — the boot core, JM6 (⛔ metal FAILED) → JM6b (root cause found + fixed; metal
-re-verify PENDING).** JM6 drops the Orin boot core **EL2 → EL1** (`arch/aarch64/boot_tegra.rs`) to run
+**Scheduler on Orin — the boot core, JM6 (⛔ metal FAILED) → JM6b (fixed; ✅ METAL-CONFIRMED
+2026-07-06).** JM6 drops the Orin boot core **EL2 → EL1** (`arch/aarch64/boot_tegra.rs`) to run
 the scheduler + CAPSTONE at EL1 — single-core, sidestepping the JM5 `CPU_ON` wall. The original arc
 reused JM3's live EL2 identity `L1` as the EL1 table and **dark-hung at the drop on the real Orin**
 (5 attended boots): EL2 leaf descriptors set AP[1] (RES1 at EL2), which the EL1&0 regime reads as
 "EL0-writable", and the VMSA **forces PXN=1 on any EL0-writable region** — every RAM GiB was
 privileged-execute-never, so the first EL1 fetch aborted and the armed `VBAR_EL1` vector could not even
 fetch its handler. JM6b fixes it by building an **EL1-precise twin table** (`mmu_tegra`'s `L1_EL1`, RAM
-AP[2:1]=0b00) and pointing `TTBR0_EL1` at that. See the **JM6 result** section below for the full
-story; the fix's own verdict is a Peter-attended Orin boot (metal PENDING).
+AP[2:1]=0b00) and pointing `TTBR0_EL1` at that. **Metal-confirmed on the first attended boot: EL1
+landing line + CAPSTONE 6/6 — the scheduler runs on Orin silicon.** Full story + the confirming
+register/descriptor dump in the **JM6 result** section below.
 
 ### JC3 result — virt EL2 → EL1 drop + scheduler/CAPSTONE at EL1 (**QEMU-green**)
 
@@ -219,7 +220,7 @@ worktree at `31ff7a1`, over a log that runs the full Pi scheduler + CAPSTONE + M
 Orin boot-core drop named here is now done — see the **JM6 result** below. SMP scheduling on
 `virt` (dropping the APs too) is likewise later.
 
-### JM6 result — Orin EL2 → EL1 drop + scheduler/CAPSTONE at EL1 (⛔ metal FAILED → **JM6b: root cause found + fixed, metal re-verify PENDING**)
+### JM6 result — Orin EL2 → EL1 drop + scheduler/CAPSTONE at EL1 (⛔ metal FAILED → **JM6b: fixed + ✅ METAL-CONFIRMED 2026-07-06**)
 
 JM6 repeats the JC3 drop on the **Orin** (Tegra234, Cortex-A78AE) boot core: it drops
 **EL2 → EL1** and runs the full six-primitive M4 CAPSTONE cooperatively at EL1 — the first time
@@ -303,9 +304,20 @@ EL1 fault printer **before** the eret (under the fixed table the handler is fetc
 landing fault prints a syndrome instead of hanging dark), and prints an **EL1 landing line**
 (`CurrentEL` + live `SCTLR_EL1`) as the first EL1 serial output on Orin silicon.
 
-The QEMU DONE gate below still stands; the JM6b fix's true verdict is a Peter-attended Orin serial
-capture (**metal re-verify PENDING**). Expected: the pre-drop line, the landing line, then CAPSTONE
-6/6 at EL1.
+**✅ Metal verdict — CONFIRMED (first boot, 2026-07-06, capture `target/serial-orin-jm6b.log`).** The
+attended Orin boot ran the complete predicted chain: JM3 mmu live (EL2) → JM4 GIC/timer LIVE → heap →
+`:: tegra: JM6b pre-drop — HCR_EL2=0x88000038 MMFR1.VH=1 TTBR0_EL1=0x25e5eb000
+L1_EL1[0]=0x60000000000405 L1_EL1[9]=0x240000701 ::` → `:: tegra: JM6b — EL1 landing: CurrentEL=1
+SCTLR_EL1=0x30d01805 ::` → `VBAR_EL1 = 0x25e5c3800` → **CAPSTONE 6/6 PASS at EL1** — the first time
+the scheduler runs on Orin silicon. The pre-drop dump validates the diagnosis end to end: the twin
+table is a distinct page from the EL2 `L1` (`0x25e5eb000` vs `0x25e5ea000`); the code-GiB leaf
+`0x240000701` decodes to PA GiB 9 + AF + inner-shareable + Normal-WB + block with **AP[2:1]=0b00**
+(EL1-executable — the fix); the device leaf carries UXN|PXN. Two facts worth keeping: `MMFR1.VH=1` —
+VHE exists on the A78AE but the handoff regime was non-VHE (the `*_EL1` arms landed, as the JM3-based
+exclusion argued); and the firmware+JM4 `HCR_EL2` was `0x88000038` — **TGE (bit 27) was set**, so the
+drop's bare `HCR_EL2 = RW-only` write was load-bearing (an eret with TGE=1 would have been an illegal
+return). The scheduler banner prints "(virt)" on Orin — a known cosmetic (hardcoded string in
+`run_capstone_boot_core`), left for a follow-on.
 
 **Regression bar (all held, QEMU).** `./arroyo check` both arches; `UNAOS_TEGRA=1 ./arroyo check`
 both legs + `esp-jetson` link. virt (`UNAOS_GICV3=1 test-arm 45`): SMP 3/3 + the JC3 drop +
