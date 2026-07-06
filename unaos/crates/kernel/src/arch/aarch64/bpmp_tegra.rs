@@ -364,14 +364,35 @@ pub fn jb1c_ungate_xusb(chan: &Chan, ids: &super::fdt_tegra::XusbIds) {
         return;
     }
     let caplength = (cap0 & 0xff) as u64;
+    let hcs1 = r32(XUSB_HOST + 0x04);
     serial_println!(
         ":: tegra: JB1c — XUSB ALIVE: xHCI v{:x}.{:02x} CAPLENGTH={:#x} HCSPARAMS1={:#010x} HCCPARAMS1={:#010x} USBCMD={:#010x} USBSTS={:#010x} -> PASS ::",
         (cap0 >> 24) & 0xff,
         (cap0 >> 16) & 0xff,
         caplength,
-        r32(XUSB_HOST + 0x04),
+        hcs1,
         r32(XUSB_HOST + 0x10),
         r32(XUSB_HOST + caplength),
         r32(XUSB_HOST + caplength + 0x04),
     );
+    // JB2a: the port survey — pure PORTSC reads (xHCI op_base + 0x400 + 0x10*port), no writes, no
+    // reset (the resident XUSB firmware state stays untouched). CCS (bit 0) = a device is
+    // physically connected; PLS [8:5] = link state; speed [13:10] (1=FS 2=LS 3=HS 4=SS). With a
+    // keyboard plugged into the Orin, one line here is the JB2 enumeration arc's first hardware
+    // evidence. MaxPorts = HCSPARAMS1[31:24].
+    let op = XUSB_HOST + caplength;
+    let max_ports = ((hcs1 >> 24) & 0xff) as u64;
+    for port in 0..max_ports.min(16) {
+        let sc = r32(op + 0x400 + 0x10 * port);
+        if sc & 1 != 0 {
+            serial_println!(
+                ":: tegra: JB2a — port {} CONNECTED: PORTSC={:#010x} (PLS={} speed={}) ::",
+                port + 1,
+                sc,
+                (sc >> 5) & 0xf,
+                (sc >> 10) & 0xf,
+            );
+        }
+    }
+    serial_println!(":: tegra: JB2a — port survey done ({} ports scanned) ::", max_ports);
 }
