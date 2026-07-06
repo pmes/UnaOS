@@ -133,15 +133,20 @@ impl<'a> Fdt<'a> {
                     if depth < MAX_DEPTH {
                         ends[depth] = path_len;
                         // Append "/name" (truncate silently if the buffer fills — paths this
-                        // deep are beyond anything we query).
-                        if path_len < MAX_PATH {
-                            path[path_len] = b'/';
-                            path_len += 1;
-                        }
-                        for &b in name {
+                        // deep are beyond anything we query). The ROOT node's name is EMPTY —
+                        // skip the append entirely so a top-level node is "/bpmp", not "//bpmp"
+                        // (the JB1a first-boot lesson: the double slash made every path matcher
+                        // miss).
+                        if !name.is_empty() {
                             if path_len < MAX_PATH {
-                                path[path_len] = b;
+                                path[path_len] = b'/';
                                 path_len += 1;
+                            }
+                            for &b in name {
+                                if path_len < MAX_PATH {
+                                    path[path_len] = b;
+                                    path_len += 1;
+                                }
                             }
                         }
                     }
@@ -275,7 +280,8 @@ pub fn jb1a_dump(dtb_addr: u64, dtb_size: usize, ram_gib_mask: u64) {
     let mut bpmp_path = [0u8; MAX_PATH];
     let mut bpmp_len = 0usize;
     fdt.for_each_prop(|e| {
-        if bpmp_len == 0 && e.depth == 1 {
+        // A top-level node's properties arrive at depth 2 (root push = 1, node push = 2).
+        if bpmp_len == 0 && e.depth == 2 {
             // e.path is "/<name>"; check the name component.
             if e.path.len() >= 5 && &e.path[1..5] == b"bpmp" {
                 let l = e.path.len().min(MAX_PATH);
@@ -338,7 +344,8 @@ pub fn jb1a_dump(dtb_addr: u64, dtb_size: usize, ram_gib_mask: u64) {
     //    variant of the channel), raw reg words.
     let mut printed = 0u32;
     fdt.for_each_prop(|e| {
-        if e.name == b"reg" && e.depth == 2 && printed < 6 {
+        // /reserved-memory/<child> properties arrive at depth 3 (root=1, reserved-memory=2).
+        if e.name == b"reg" && e.depth == 3 && printed < 6 {
             let p = e.path;
             let under_resv = p.len() > 16 && &p[..16] == b"/reserved-memory";
             if under_resv {
