@@ -1143,6 +1143,12 @@ fn tegra_early_stop(boot_info: &'static mut BootInfo) -> ! {
         // JB3 boot-10: the FPCI wrapper's bus-master enable — the last torn-down link
         // (Linux sets it before its first controller touch; JB2b never did).
         unaos_kernel::arch::xusb_tegra::jb3_fpci_enable();
+        // JB3 boot-11: with BAR2 routed, probe/restore the ARU-side DMA config
+        // (IFRDMA/STREAMID_FIELD) and send the firmware the MSG_ENABLED handshake.
+        unaos_kernel::arch::xusb_tegra::jb3_aru_probe(jb3_sid);
+        // JB3 boot-12: the Falcon (the xHC command engine) — read CPUCTL/BOOTVEC + the
+        // firmware header; restart the halted CPU the ROM-loader way if needed.
+        unaos_kernel::arch::xusb_tegra::jb3_falcon();
         let coherent = unaos_kernel::arch::fdt_tegra::xusb_dma_coherent(
             dtb_addr,
             dtb_size,

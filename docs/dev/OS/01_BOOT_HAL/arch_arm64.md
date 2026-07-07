@@ -780,6 +780,45 @@ clean-build `esp-jetson` links `kernel.elf` = 227,752 B (healthy band; the growt
 probe); all changes `tegra`-gated ⇒ non-tegra binaries byte-identical by construction. Metal
 next: boot 1 = this read-only dump, Peter-attended.
 
+### JB3 — LANDED 2026-07-07 (12-boot Peter-attended bench day): FIVE torn-down layers found + restored; root cause pinned = the XUSB Falcon is halted/locked by the EBS teardown
+
+**The single biggest finding: the JB2c dossier's "one SMMU register" model was wrong — the
+JetPack-6 ExitBootServices teardown tears down the ENTIRE controller-to-memory path, layer by
+layer.** Each boot named the next layer (the probe design made the silicon self-diagnosing:
+USFCFG=1 turned silent drops into logged fault syndromes with stream IDs). All restorations are
+in `tegra_early_stop`, in order, `tegra`-gated. Capture: `~/serial-orin-jb3-probe.log`.
+
+| Boot | Found | Restored |
+|---|---|---|
+| 1 | v2 SMMU pair (dual MMU-500 — NOT v3; DTB-confirmed sid=0xe → `iommu@8000000`): `CLIENTPD=1`, 0 SMRs, 0 faults — client port SHUT, silent swallow | read-only probe |
+| 2 | NS writes take; USF fault names **sid `0x80e`** (event-ring writes; GFAR = our ring) | client port on + USFCFG=1 + SMR exact-0xe |
+| 4 | cmd-ring reads emit **`0xc0e`**, inst1 sees **`0x100e`** — per-class SID decorations | SMR mask bit 11 |
+| 5 | v2 pair fully clean, DMA still dead ⇒ killer downstream | SMR MASK=0x7f00 (low byte 0x0e = XUSB only) |
+| 6 | census: NO SMMUv3 exists in the firmware DTB (3× MMU-500 only); MC err regs static | discrimination only |
+| 7 | identity S1 translation clean (CB0: const 4K L1, 512×1GiB, WBWA+ISH, T0SZ=25) — still dead | S2CR translate → CB0 |
+| 8 | `dc civac` experiment: **event ring truly empty in DRAM** — coherency ruled OUT | (experiment, shared driver, tegra-gated) |
+| 9 | **MC stream-ID overrides ALL FOUR = 0** (EBS-cleared; Linux reprograms every boot) | HOSTR/HOSTW ← 0xe (rb ✓) |
+| 10 | **FPCI wrapper wiped**: CFG_1 io/mem/busmaster = 0, BAR0 = 0xc | CFG_1 ← 0x7, BAR0 restored (field is 128K-granular) |
+| 11 | **BAR2 wiped too**; ARU IFRDMA/STREAMID_FIELD = 0 (SID field refuses NS writes); mailbox HW alive (owner claim takes) but **firmware never ACKs** MSG_ENABLED | CFG_7 ← 0x3650000 |
+| 12 | **Falcon CPUCTL/BOOTVEC read 0xffffffff via CSB** (dead window / lockdown) while the FW-header ioctl returns sane data (fw resident, codesize 0xc85f) — restart write has no effect | — |
+
+**Verdict: every fabric layer (SMMU, MC SID, FPCI, ARU routing) is restored and verified
+fault-free; the xHC command engine itself — the Falcon microcontroller — is halted and locked
+against NS revival.** Ports train (link HW is autonomous); nothing DMAs because the engine that
+would do it is not running. Honest STOP per the brief ("a probe day that pins the root cause is
+a landable arc" — this pinned it five layers deeper than the dossier's hypothesis).
+
+**Next (JB4, Fable/Peter-led):** (a) Peter's zero-code lever first — the pre-update firmware
+slot (its gentler EBS exit leaves the Falcon running; all of JB3's restorations remain in the
+boot chain and are still required/valid); (b) else Falcon revival: MRQ_RESET the XUSB
+partition + falcon cold-start + firmware reload from the resident image (research arc: t234 fw
+carveout, CSB lockdown semantics, possibly EL3/BPMP-mediated). The five restorations are
+prerequisites either way — none of this work is wasted.
+
+Gate (arc close): `./arroyo check` + `UNAOS_TEGRA=1 ./arroyo check` green both arches; every
+QEMU suite unaffected (all changes `tegra`-gated ⇒ non-tegra byte-identical by construction);
+clean `esp-jetson` healthy at each boot (final 243,248 B); 12 attended metal boots as above.
+
 ### JB0 brief — turn the cooling fan back on (safety hygiene; run FIRST on Orin)
 
 Discovered 2026-07-06: when UnaOS takes over from UEFI the **fan stops and the Orin runs hot**.
