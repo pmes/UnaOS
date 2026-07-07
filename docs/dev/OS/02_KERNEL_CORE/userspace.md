@@ -302,11 +302,20 @@
   boot — only 3 of 4 cores online, a metal SMP variance orthogonal to U6b). Scope: read-only, flat root, one
   volume — no write/create/delete, no seek, no dir ops. Lane: `arch/aarch64/syscall.rs` + a `main.rs`
   launcher + a read-only `fs/fat.rs` helper — no `boot.rs` change, no scheduler primitive, no x86 file.
-- Not yet (U7): cross-process **bandy handle-transfer** between principals (`SYS_XFER` — a
-  cross-ASID write discipline that breaks U6's single-writer invariant) and cross-process
-  **revocation trees** (`CAP_REVOKE` as a right is defined but reserved), plus real `File`/`Socket`
-  fs/net syscalls routing through the U6 kinds. Not yet (M8): an arbitrary program-by-name
-  `sys_spawn`, and a code-signing / allowlist gate on the loader (`SECURITY.md`).
+- **U7 (landed 2026-07-07)** — cross-process transfer WITHOUT breaking single-writer: `SYS_XFER = 13`
+  deposits an attenuated `(kind, target, rights)` descriptor into the recipient's per-ASID transfer
+  **inbox** (tx-exact CAS discipline; the sender never writes the recipient's handle row);
+  `SYS_RECV = 14` installs it into the caller's OWN row; `SYS_CAP` XREVOKE (sender-owned record) makes
+  the received cap stale at its next `handle_resolve`. Owner-scoped (`dest` = a `Child` handle in the
+  sender's table), `Console`/`Socket` payloads, single-level revoke. Demo: the parent's over-rights
+  transfer refused, the child prints through the transferred cap, the revoked cap denies with
+  `-EACCES`, and the launcher proves the child's row byte-clear while the deposit was pending. See
+  the `SECURITY.md` U7 ledger entry for the full mechanism.
+- Not yet: **revocation trees** (a derived copy — re-grant or onward re-transfer — escapes
+  single-level revoke today; derivation records + `CAP_REVOKE` are that arc), the **bandy Ring-3
+  delegation wrapper**, `File` transfer (descriptor migration), real `Socket` fs/net syscalls.
+  Not yet (M8): an arbitrary program-by-name `sys_spawn`, and a code-signing / allowlist gate on the
+  loader (`SECURITY.md`).
 
 ### x86_64 (branch `hw-rmbp`)
 

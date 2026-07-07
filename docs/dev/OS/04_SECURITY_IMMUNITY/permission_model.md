@@ -46,9 +46,19 @@ aarch64 (Pi 4) track and ports to x86/Jetson after:
   index collision — the one fragility U5's review flagged. `File`/`Socket` are scaffolds today
   (resolvable to their kind with rights-checking, but no filesystem/network syscall routes through
   them yet); they prove the table is general, and are where fs/net capabilities will attach.
-* **U7 (next)** — capability *transfer between principals* over the bandy message bus and
-  cross-process **revocation trees** (the reserved `revoke` right), plus real filesystem/network
-  syscalls routing through the `File`/`Socket` kinds the way the console now is. This is where the
+* **U7 (landed 2026-07-07, the cross-process core)** — capability *transfer between processes*,
+  kernel-mediated and single-writer-preserving: `SYS_XFER` deposits an **attenuated** descriptor into
+  the recipient's per-ASID transfer **inbox** (the one deliberately cross-ASID surface, CAS-managed);
+  `SYS_RECV` pulls it into the recipient's **own** handle row; the recipient is named by a `Child`
+  handle in the sender's table (owner-scoped — no global process namespace). A **sender-owned
+  transfer record** gives single-level **revoke**: the received cap goes stale at its next resolve.
+  A transfer can never amplify (the same monotonic-decrease invariant as grant, now across
+  processes), and the sender never writes — or revokes into — anything but its own record.
+* **Still ahead** — **revocation trees** (a revoked transfer cascading through the recipient's
+  re-grants/re-transfers — today a derived copy escapes single-level revoke; per-cap derivation
+  records + the reserved `revoke` right are that arc), the **bandy Ring-3 delegation wrapper** (so
+  host-native principals delegate over the message bus), and real filesystem/network syscalls
+  routing `File`/`Socket` payloads (File transfer needs descriptor migration). This is where the
   UnaFS `owner`/`grants:*` attributes of the model above become the persistent form of these live
   kernel handles.
 
