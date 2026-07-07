@@ -12,7 +12,7 @@ Legend: **✅ metal-confirmed** · **🔬 QEMU-green, metal pending** · dates I
 
 ## hw-pi4 track — 2026-07-07 (Opus round, post-Campaign 2)
 
-### U9 — real File writes + seek: EMMC2 sector write, in-place `fat::write_at`, `SYS_SEEK`, File+`CAP_WRITE`-routed `sys_write` (aarch64) 🔬 `hw-pi4`
+### U9 — real File writes + seek: EMMC2 sector write, in-place `fat::write_at`, `SYS_SEEK`, File+`CAP_WRITE`-routed `sys_write` (aarch64) ✅ `hw-pi4`
 - **What:** gives U6b's read-only `File`+`CAP_READ` its WRITE half — `CAP_WRITE` on a `File` now
   means something. Bottom-up: (1) **EMMC2 sector write** — `emmc2::write_block_512`, the exact mirror
   of the polled CMD17 read path with three deltas (`WRITE_SINGLE_BLOCK`/`cmd(24)` host→card so
@@ -54,11 +54,16 @@ Legend: **✅ metal-confirmed** · **🔬 QEMU-green, metal pending** · dates I
   widened the pi4 lane to the shared `fat.rs`/`block.rs` + the FAT image builder for this arc after the
   executor stopped and reported; `fat::write_at` is purely additive (x86 never calls it), the block seam
   + image plant are cfg-/pi-scoped.
-- **Metal:** none this arc — **but the EMMC2 WRITE is the first write the driver has ever issued to the
-  card**, so real-silicon timing (buffer-write-ready latency, DAT0 programming-busy) is proven only on
-  the next Pi boundary. QEMU's generic-sdhci models the PIO write FIFO but not that timing. Call out on
-  the boundary.
-- **Commit:** on `hw-pi4` (Opus-executed, post-Campaign 2).
+- **Metal:** ✅ **METAL-CONFIRMED on the real Pi 4 (2026-07-07, same session).** Booted the self-contained
+  UNAOS card; the EMMC2 driver identified the real card `@0xfe340000 15193 MiB CSD v2`, mounted its FAT32,
+  and the `el0-u9write` fixture opened `SCRATCH.BIN` RW, overwrote it in place with a polled **CMD24**, read
+  it back through the same cap, and the launcher's fresh-mount raw re-read confirmed the sector CHANGED while
+  the size did NOT — `:: U9: … on-disk sector changed + size unchanged -> PASS ::`, with **15/15 PASS** (all
+  prior + U9), **CAPSTONE 6/6** (all 4 cores online), and only the 3 expected M6b EL0 kills. **This is the
+  first write the EMMC2 driver has ever issued to a card — the metal-risk write path (buffer-write-ready +
+  FIFO push + transfer-complete/DAT0-programming-busy) is now proven on silicon**, the one thing QEMU's
+  generic-sdhci could not vouch for.
+- **Commit:** on `hw-pi4` (Opus-executed, post-Campaign 2; metal-confirmed same session).
 
 ## hw-rmbp track — 2026-07-07 (Campaign 2, Fable-executed)
 
