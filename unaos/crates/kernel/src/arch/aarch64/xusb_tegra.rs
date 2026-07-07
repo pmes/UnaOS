@@ -286,6 +286,185 @@ pub fn jb2c_padctl_powerup(chan: &super::bpmp_tegra::Chan) {
 /// slot configures; that is fine and visible in the log) but its SCSI/BOT bring-up is the JB3
 /// arc, not this one — the BOT pump is the driver's heaviest synchronous path and the keyboard
 /// does not need it.
+/// JB3 boot-10: the FPCI wrapper — Tegra's XUSB host sits behind a fake-PCI config space
+/// (`fpci` region @0x360_0000, same ungated partition as the host MMIO), and the FIRST thing
+/// Linux xhci-tegra does before touching the controller is
+/// `XUSB_CFG_1 |= IO_SPACE_EN | MEM_SPACE_EN | BUS_MASTER_EN` (+ program the BAR in CFG_4).
+/// JB2b skipped this and went straight to the 0x361_0000 MMIO — which works for register
+/// access, but **BUS_MASTER_EN gates the controller's ability to issue DMA at all**. The
+/// boot-2..9 chain proved: SMMU open + translating + fault-free, MC SIDs programmed,
+/// coherency ruled out (dc-civac: DRAM genuinely empty) — the one remaining torn-down link
+/// is the wrapper's bus-master enable, exactly what an "hide device resources at exit" EBS
+/// teardown would clear. Dump CFG_0/1/4, set the enables, re-dump.
+const XUSB_FPCI: u64 = 0x0360_0000;
+
+pub fn jb3_fpci_enable() {
+    let r = |off: u64| unsafe { core::ptr::read_volatile((XUSB_FPCI + off) as *const u32) };
+    let w = |off: u64, v: u32| unsafe {
+        core::ptr::write_volatile((XUSB_FPCI + off) as *mut u32, v)
+    };
+    serial_println!(":: tegra: JB3 — FPCI @{:#010x} first touch ::", XUSB_FPCI);
+    let cfg0 = r(0x0);
+    let cfg1 = r(0x4);
+    let cfg4 = r(0x10);
+    let cfg5 = r(0x14);
+    serial_println!(
+        ":: tegra: JB3 — FPCI CFG_0={:#010x} CFG_1={:#010x} (io={} mem={} busmaster={}) CFG_4={:#010x} CFG_5={:#010x} ::",
+        cfg0,
+        cfg1,
+        cfg1 & 1,
+        (cfg1 >> 1) & 1,
+        (cfg1 >> 2) & 1,
+        cfg4,
+        cfg5
+    );
+    // BAR0 first if the teardown wiped it (Linux order), then the enables. (Boot-10 rb
+    // showed the BAR0 field clamps to 128 KiB granularity — bit 16 is RO — so the complex
+    // decodes from 0x0360_0000; expected, not fought.)
+    if cfg4 & !0xf == 0 {
+        w(0x10, 0x0361_0000);
+    }
+    // Boot-11: BAR2 (XUSB_CFG_7 @0x1c) routes the ARU/mailbox window @0x365_0000 — wiped by
+    // the same teardown (boot-10 proved BAR0 + CFG_1 were). Program it BEFORE any 0x365_0000
+    // touch (an unrouted window is the JX1 EL3-fatal class).
+    let cfg7 = r(0x1c);
+    if cfg7 & !0xf == 0 {
+        w(0x1c, 0x0365_0000);
+    }
+    w(0x4, cfg1 | 0b111); // IO_SPACE_EN | MEM_SPACE_EN | BUS_MASTER_EN
+    serial_println!(
+        ":: tegra: JB3 — FPCI enable: CFG_1 rb={:#010x} CFG_4 rb={:#010x} CFG_7 {:#010x}->rb={:#010x} ::",
+        r(0x4),
+        r(0x10),
+        cfg7,
+        r(0x1c)
+    );
+}
+
+/// JB3 boot-11: the ARU/BAR2 window (0x365_0000, routed by CFG_7 above) — the controller-side
+/// DMA/stream-id config (`IFRDMA_CFG0/1`, `STREAMID_FIELD` @ +0x0e0/0xe4/0xe8) is
+/// "firmware-initialized" state (xhci-tegra never rewrites it) — exactly the class this
+/// board's ExitBootServices teardown wipes. Dump it; if the stream-id field reads torn (0),
+/// program the DTB SID into it. Then send the firmware the `MSG_ENABLED` mailbox handshake
+/// exactly as Linux tegra_xusb_enable_firmware_messages does (owner-claim -> DATA_IN ->
+/// CMD |= INT_EN|DEST_FALC), bounded-polling DATA_OUT for the ACK — log-heavy, every raw
+/// word printed; a missing ACK is telemetry, not a crash.
+const XUSB_BAR2: u64 = 0x0365_0000;
+
+pub fn jb3_aru_probe(xusb_sid: u32) {
+    let r = |off: u64| unsafe { core::ptr::read_volatile((XUSB_BAR2 + off) as *const u32) };
+    let w = |off: u64, v: u32| unsafe {
+        core::ptr::write_volatile((XUSB_BAR2 + off) as *mut u32, v)
+    };
+    serial_println!(":: tegra: JB3 — ARU/BAR2 @{:#010x} first touch ::", XUSB_BAR2);
+    let (c0, c1, sidf) = (r(0x0e0), r(0x0e4), r(0x0e8));
+    serial_println!(
+        ":: tegra: JB3 — ARU IFRDMA_CFG0={:#010x} CFG1={:#010x} STREAMID_FIELD={:#010x} ::",
+        c0,
+        c1,
+        sidf
+    );
+    if sidf == 0 {
+        w(0x0e8, xusb_sid & 0xff);
+        serial_println!(
+            ":: tegra: JB3 — ARU STREAMID_FIELD <- {:#x}: rb={:#010x} ::",
+            xusb_sid & 0xff,
+            r(0x0e8)
+        );
+    }
+    // Mailbox: cmd 0x004, data_in 0x008, data_out 0x00c, owner 0x010. OWNER_SW=2.
+    // MBOX_CMD_MSG_ENABLED=5 in DATA_IN[31:24]; CMD gets INT_EN(b31)|DEST_FALC(b27).
+    let own0 = r(0x010);
+    w(0x010, 2);
+    let own1 = r(0x010);
+    serial_println!(
+        ":: tegra: JB3 — MBOX owner {:#x}->claim rb={:#x} cmd={:#010x} data_out={:#010x} ::",
+        own0,
+        own1,
+        r(0x004),
+        r(0x00c)
+    );
+    if own1 == 2 {
+        w(0x008, 5u32 << 24); // MSG_ENABLED
+        w(0x004, r(0x004) | (1 << 31) | (1 << 27));
+        // Bounded ACK poll (~200 µs of reads) — log the final raw state either way.
+        let mut spins = 0u32;
+        while spins < 50_000 && r(0x00c) == 0 {
+            spins += 1;
+        }
+        serial_println!(
+            ":: tegra: JB3 — MBOX MSG_ENABLED sent: cmd={:#010x} data_out={:#010x} owner={:#x} (spins {}) ::",
+            r(0x004),
+            r(0x00c),
+            r(0x010),
+            spins
+        );
+        w(0x010, 0); // release
+    } else {
+        serial_println!(":: tegra: JB3 — MBOX owner claim did not take; skipping send ::");
+    }
+}
+
+/// JB3 boot-12: the Falcon — on XUSB the Falcon microcontroller IS the xHC command engine,
+/// and boot-11's verdict (mailbox hardware alive, owner claim takes, firmware never answers,
+/// ARU config wiped) says the EBS teardown halted it. CSB access (per xhci-tegra t234):
+/// page = csb_addr>>9 -> BAR2+0x9c, then BAR2+0x2000+(csb_addr&0x1ff). CPUCTL @ CSB 0x100
+/// (STARTCPU=b1, HALTED=b4, STOPPED=b5), BOOTVEC @ 0x104. Firmware header via the
+/// FW_SCRATCH ioctl (BAR2+0x1000, type 17<<24, reply @ BAR2+0x1c): word 2 = boot_codetag
+/// (the restart vector the ROM loader uses). If halted/stopped: BOOTVEC <- boot_codetag,
+/// CPUCTL <- STARTCPU, re-read — the exact tegra_xusb_load_firmware_rom start sequence.
+pub fn jb3_falcon() {
+    let r = |off: u64| unsafe { core::ptr::read_volatile((XUSB_BAR2 + off) as *const u32) };
+    let w = |off: u64, v: u32| unsafe {
+        core::ptr::write_volatile((XUSB_BAR2 + off) as *mut u32, v)
+    };
+    let csb_r = |addr: u32| {
+        w(0x9c, (addr >> 9) & 0x7f_ffff);
+        r(0x2000 + (addr & 0x1ff) as u64)
+    };
+    let csb_w = |addr: u32, v: u32| {
+        w(0x9c, (addr >> 9) & 0x7f_ffff);
+        w(0x2000 + (addr & 0x1ff) as u64, v);
+    };
+    let fw_hdr = |word_off: u32| {
+        w(0x1000, (17u32 << 24) | word_off);
+        r(0x1c)
+    };
+    let cpuctl = csb_r(0x100);
+    let bootvec = csb_r(0x104);
+    // header words: [0] boot_loadaddr_in_imem, [1] boot_codedfi_offset, [2] boot_codetag,
+    // [3] boot_codesize; fwimg_created_time further in — read a few for identity.
+    let (h0, h2, h3) = (fw_hdr(0x0), fw_hdr(0x8), fw_hdr(0xc));
+    serial_println!(
+        ":: tegra: JB3 — FALCON CPUCTL={:#010x} (halted={} stopped={}) BOOTVEC={:#010x} fw[0]={:#010x} codetag={:#010x} codesize={:#010x} ::",
+        cpuctl,
+        (cpuctl >> 4) & 1,
+        (cpuctl >> 5) & 1,
+        bootvec,
+        h0,
+        h2,
+        h3
+    );
+    if cpuctl & ((1 << 4) | (1 << 5)) != 0 || cpuctl == 0 {
+        let vec = if h2 != 0 && h2 != 0xffff_ffff { h2 } else { bootvec };
+        csb_w(0x104, vec);
+        csb_w(0x100, 1 << 1); // CPUCTL_STARTCPU
+        // settle a moment, then observe
+        let mut spins = 0u32;
+        while spins < 100_000 && csb_r(0x100) & ((1 << 4) | (1 << 5)) != 0 {
+            spins += 1;
+        }
+        serial_println!(
+            ":: tegra: JB3 — FALCON restart: BOOTVEC<-{:#x} STARTCPU; CPUCTL rb={:#010x} (spins {}) ::",
+            vec,
+            csb_r(0x100),
+            spins
+        );
+    } else {
+        serial_println!(":: tegra: JB3 — FALCON already running; no restart ::");
+    }
+}
+
 pub fn jb2b_attach(dma_coherent: Option<bool>) -> Option<(u8, u8)> {
     serial_println!(
         ":: tegra: JB2b — usb@3610000 dma-coherent: {} ::",

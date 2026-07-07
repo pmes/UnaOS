@@ -1100,12 +1100,70 @@ fn tegra_early_stop(boot_info: &'static mut BootInfo) -> ! {
     //     loop cooperatively alongside (and after) the CAPSTONE tasks. No keyboard -> no task ->
     //     the JM6b/CAPSTONE flow is byte-identical to the JB1e verification boot.
     if xusb_alive {
+        // JB3 (probe half): dump the NISO1 SMMU stream-match state BEFORE the attach, and the
+        // global fault registers AFTER it — the JB2c verdict said the controller drives the
+        // ports but cannot land one DMA write in RAM (ENABLE_SLOT watchdogs, 0 events), the
+        // predicted SMMU drop. Bases + the XUSB stream id come off the LIVE firmware DTB
+        // (verify-don't-assume); if the tree doesn't cooperate, fall back to the researched
+        // tegra234 values (dual MMU-500 @0x0800_0000/0x0700_0000, SID 0x0e) and say so.
+        // Read-only this boot — the fix writes are boot 2, chosen by what this dump says.
+        let (jb3_bases, jb3_n, jb3_sid) = match unaos_kernel::arch::fdt_tegra::xusb_iommu(
+            dtb_addr,
+            dtb_size,
+            mmu.ram_gib_mask,
+        ) {
+            Some(io) => (io.bases, io.n_bases, io.sid),
+            None => {
+                serial_println!(
+                    ":: tegra: JB3 — DTB iommus unresolved; probing predicted bases ::"
+                );
+                ([0x0800_0000u64, 0x0700_0000u64], 2, 0x0e)
+            }
+        };
+        unaos_kernel::arch::smmu_tegra::jb3_probe(&jb3_bases[..jb3_n], jb3_sid);
+        // JB3 fix (boot 2): boot 1 read CLIENTPD=1 + zero SMRs + zero faults on both instances
+        // — the ExitBootServices teardown shut the SMMU client port, and with the fabric's
+        // external-bypass path off (MB2), the controller's DMA has nowhere to go. Open ONLY
+        // the XUSB stream (SMR match -> S2CR bypass) and turn the client port back on with
+        // USFCFG=1 so anything unexpected faults-and-logs instead of dying silently.
+        unaos_kernel::arch::smmu_tegra::jb3_open_stream(&jb3_bases[..jb3_n], jb3_sid);
+        // JB3 boot-6 (discrimination): the v2 pair is open + fault-free yet DMA still dies —
+        // a second killer sits downstream. Census the DTB's smmu/iommu nodes (find any
+        // SMMUv3 without touching unknown addresses), dump the v3's CR0/GBPA state if one
+        // exists, and bracket the attach with MC error-log reads.
+        let v3 = unaos_kernel::arch::fdt_tegra::smmu_census(dtb_addr, dtb_size, mmu.ram_gib_mask);
+        if let Some(v3_base) = v3 {
+            unaos_kernel::arch::smmu_tegra::jb3_v3_dump(v3_base);
+        }
+        unaos_kernel::arch::smmu_tegra::jb3_mc_errs("pre-attach");
+        // JB3 boot-9: re-program the MC XUSB SID overrides (HOSTR/HOSTW) like the L4T kernel
+        // does every boot — the UEFI exit teardown cleared them; the SMMU chain is proven
+        // clean and this is the remaining torn-down link that assigns the stream its id.
+        unaos_kernel::arch::smmu_tegra::jb3_mc_sid_fix(jb3_sid);
+        // JB3 boot-10: the FPCI wrapper's bus-master enable — the last torn-down link
+        // (Linux sets it before its first controller touch; JB2b never did).
+        unaos_kernel::arch::xusb_tegra::jb3_fpci_enable();
+        // JB3 boot-11: with BAR2 routed, probe/restore the ARU-side DMA config
+        // (IFRDMA/STREAMID_FIELD) and send the firmware the MSG_ENABLED handshake.
+        unaos_kernel::arch::xusb_tegra::jb3_aru_probe(jb3_sid);
+        // JB3 boot-12: the Falcon (the xHC command engine) — read CPUCTL/BOOTVEC + the
+        // firmware header; restart the halted CPU the ROM-loader way if needed.
+        unaos_kernel::arch::xusb_tegra::jb3_falcon();
         let coherent = unaos_kernel::arch::fdt_tegra::xusb_dma_coherent(
             dtb_addr,
             dtb_size,
             mmu.ram_gib_mask,
         );
-        if unaos_kernel::arch::xusb_tegra::jb2b_attach(coherent).is_some() {
+        let attached = unaos_kernel::arch::xusb_tegra::jb2b_attach(coherent).is_some();
+        // The post-attach witness: after the enumeration window (and any ENABLE_SLOT
+        // watchdogs), sGFSR/sGFSYNR say whether THIS block recorded the kills — and name the
+        // faulting StreamID.
+        unaos_kernel::arch::smmu_tegra::jb3_faults(&jb3_bases[..jb3_n]);
+        unaos_kernel::arch::smmu_tegra::jb3_mc_errs("post-attach");
+        if let Some(v3_base) = v3 {
+            unaos_kernel::arch::smmu_tegra::jb3_v3_dump(v3_base);
+        }
+        if attached {
             unaos_kernel::arch::sched::spawn(
                 "jb2-kbd",
                 unaos_kernel::arch::xusb_tegra::kbd_pump_body,

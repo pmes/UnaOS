@@ -735,6 +735,90 @@ boot as above. The whole diff is inside `#[cfg(feature = "tegra")]` code (`bpmp_
 `xusb_tegra.rs`, and the `tegra_early_stop` hunk in `main.rs`), so **non-tegra binaries are
 byte-identical by construction** (the QEMU logs are unchanged).
 
+### JB3 (probe half) — the NISO1 SMMU is a dual MMU-500, and the probe reads how the XUSB stream dies (2026-07-07)
+
+**Phase-0 research verdict (Campaign 2; every claim verify-on-device at the probe boot).** The
+JB2c dossier's "GBPA/STE" language assumed SMMUv3 — the silicon says otherwise. Mainline
+`tegra234.dtsi` (corroborated for L4T r36): `usb@3610000 { iommus = <&smmu_niso1
+TEGRA234_SID_XUSB_HOST>; }` with `TEGRA234_SID_XUSB_HOST = 0x0e` (`dt-bindings/memory/
+tegra234-mc.h`), and **`smmu_niso1` is `"nvidia,tegra234-smmu", "nvidia,smmu-500"` — a dual ARM
+MMU-500 (SMMUv2)** at `0x0800_0000` + `0x0700_0000` (two fabric-interleaved instances, the
+Tegra194 pattern; Linux broadcasts writes to both). Both bases sit in the GiB-0 Device block
+`mmu_tegra` already maps — no new mapping. So the v3 plan translates to v2 reality:
+`sCR0.CLIENTPD` (global bypass), `sCR0.USFCFG` (unmatched stream → fault vs bypass), and
+`SMR[n]`/`S2CR[n]` stream matching. The board's own MB2 log (`serial-orin-jb2c-metal.log`)
+shows `Program NV master stream id` → `SMMU external bypass disable` → `SMMU init` at t≈0.18 s —
+the boot chain configures this block, UEFI's USB boot DMA then works through it, and the
+ExitBootServices teardown strands us one layer below JB2c's pads.
+
+**The probe (read-only, `smmu_tegra::jb3_probe` + `jb3_faults`, wired around the JB2b attach in
+`tegra_early_stop`).** `fdt_tegra::xusb_iommu` resolves the LIVE firmware DTB's `iommus`
+(phandle → SMMU node path, `reg` bases, bounded-ASCII `compatible`, the SID) with a
+researched-values fallback that says so. Pre-attach, per instance: `sCR0` (CLIENTPD/USFCFG/
+EXIDENABLE decoded), `IDR0/1/2/7`, the fault set, then every VALID `SMR[n]`+`S2CR[n]` with an
+explicit `*MATCHES-XUSB*` verdict (`(sid ^ ID) & ~MASK == 0`). Post-attach (after the
+ENABLE_SLOT watchdogs): `sGFSR`/`sGFAR`/`sGFSYNR0/1` — **the silicon names the faulting
+StreamID itself.** No writes this boot (JX1 discipline: announce each instance before first
+touch; GFSR is not even W1C'd — boot 2 owns clearing).
+
+**The differential the dump settles → the boot-2 fix ladder:**
+1. USFCFG=1 + no SMR matches 0x0e → unmatched-stream abort ⇒ claim a free SMR (VALID, ID=0x0e,
+   MASK=0) + `S2CR.TYPE=bypass`, both instances (preferred over clearing USFCFG, which widens
+   every unmatched stream).
+2. An SMR matches with `S2CR.TYPE=translate` → UEFI's translation context, page tables dead
+   since ExitBootServices ⇒ flip that S2CR to bypass (both instances).
+3. Match with `TYPE=fault` → explicit kill ⇒ same flip.
+4. CLIENTPD=1 or everything permissive → the drop is NOT this SMMU (differential moves to the
+   MC-level bypass kill / IOVA≠PA) — an honest STOP, not a guess.
+   Residual risk named up front: if the MB2 "external bypass disable" is an MC-side abort of
+   ALL non-translated traffic, the bypass fixes (1–3) won't land and the arc needs a real
+   identity translation context — that outcome would show as: probe fix applied cleanly, GFSR
+   silent, yet ENABLE_SLOT still watchdogs.
+
+Gate (probe milestone): `./arroyo check` + `UNAOS_TEGRA=1 ./arroyo check` green both arches;
+clean-build `esp-jetson` links `kernel.elf` = 227,752 B (healthy band; the growth is this
+probe); all changes `tegra`-gated ⇒ non-tegra binaries byte-identical by construction. Metal
+next: boot 1 = this read-only dump, Peter-attended.
+
+### JB3 — LANDED 2026-07-07 (12-boot Peter-attended bench day): FIVE torn-down layers found + restored; root cause pinned = the XUSB Falcon is halted/locked by the EBS teardown
+
+**The single biggest finding: the JB2c dossier's "one SMMU register" model was wrong — the
+JetPack-6 ExitBootServices teardown tears down the ENTIRE controller-to-memory path, layer by
+layer.** Each boot named the next layer (the probe design made the silicon self-diagnosing:
+USFCFG=1 turned silent drops into logged fault syndromes with stream IDs). All restorations are
+in `tegra_early_stop`, in order, `tegra`-gated. Capture: `~/serial-orin-jb3-probe.log`.
+
+| Boot | Found | Restored |
+|---|---|---|
+| 1 | v2 SMMU pair (dual MMU-500 — NOT v3; DTB-confirmed sid=0xe → `iommu@8000000`): `CLIENTPD=1`, 0 SMRs, 0 faults — client port SHUT, silent swallow | read-only probe |
+| 2 | NS writes take; USF fault names **sid `0x80e`** (event-ring writes; GFAR = our ring) | client port on + USFCFG=1 + SMR exact-0xe |
+| 4 | cmd-ring reads emit **`0xc0e`**, inst1 sees **`0x100e`** — per-class SID decorations | SMR mask bit 11 |
+| 5 | v2 pair fully clean, DMA still dead ⇒ killer downstream | SMR MASK=0x7f00 (low byte 0x0e = XUSB only) |
+| 6 | census: NO SMMUv3 exists in the firmware DTB (3× MMU-500 only); MC err regs static | discrimination only |
+| 7 | identity S1 translation clean (CB0: const 4K L1, 512×1GiB, WBWA+ISH, T0SZ=25) — still dead | S2CR translate → CB0 |
+| 8 | `dc civac` experiment: **event ring truly empty in DRAM** — coherency ruled OUT | (experiment, shared driver, tegra-gated) |
+| 9 | **MC stream-ID overrides ALL FOUR = 0** (EBS-cleared; Linux reprograms every boot) | HOSTR/HOSTW ← 0xe (rb ✓) |
+| 10 | **FPCI wrapper wiped**: CFG_1 io/mem/busmaster = 0, BAR0 = 0xc | CFG_1 ← 0x7, BAR0 restored (field is 128K-granular) |
+| 11 | **BAR2 wiped too**; ARU IFRDMA/STREAMID_FIELD = 0 (SID field refuses NS writes); mailbox HW alive (owner claim takes) but **firmware never ACKs** MSG_ENABLED | CFG_7 ← 0x3650000 |
+| 12 | **Falcon CPUCTL/BOOTVEC read 0xffffffff via CSB** (dead window / lockdown) while the FW-header ioctl returns sane data (fw resident, codesize 0xc85f) — restart write has no effect | — |
+
+**Verdict: every fabric layer (SMMU, MC SID, FPCI, ARU routing) is restored and verified
+fault-free; the xHC command engine itself — the Falcon microcontroller — is halted and locked
+against NS revival.** Ports train (link HW is autonomous); nothing DMAs because the engine that
+would do it is not running. Honest STOP per the brief ("a probe day that pins the root cause is
+a landable arc" — this pinned it five layers deeper than the dossier's hypothesis).
+
+**Next (JB4, Fable/Peter-led):** (a) Peter's zero-code lever first — the pre-update firmware
+slot (its gentler EBS exit leaves the Falcon running; all of JB3's restorations remain in the
+boot chain and are still required/valid); (b) else Falcon revival: MRQ_RESET the XUSB
+partition + falcon cold-start + firmware reload from the resident image (research arc: t234 fw
+carveout, CSB lockdown semantics, possibly EL3/BPMP-mediated). The five restorations are
+prerequisites either way — none of this work is wasted.
+
+Gate (arc close): `./arroyo check` + `UNAOS_TEGRA=1 ./arroyo check` green both arches; every
+QEMU suite unaffected (all changes `tegra`-gated ⇒ non-tegra byte-identical by construction);
+clean `esp-jetson` healthy at each boot (final 243,248 B); 12 attended metal boots as above.
+
 ### JB0 brief — turn the cooling fan back on (safety hygiene; run FIRST on Orin)
 
 Discovered 2026-07-06: when UnaOS takes over from UEFI the **fan stops and the Orin runs hot**.
