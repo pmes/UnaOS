@@ -402,6 +402,112 @@ unsafe extern "C" {
     static unaos_user_u5x_cap: u8;
 }
 
+// --- U6x ring-3 fixture (the general object table — the aarch64 `__u6_prog_spawn` twin). ONE fixture
+// (`u6x-spawn`) — the printing SPAWNER the U5x table couldn't serve: a process that BOTH prints (holds a
+// console cap at the reserved `CONSOLE_FD`) AND spawns 2+ children (auto-allocated, distinct object
+// handles), proving zero index collision. Position-independent; register-only apart from the RIP-relative
+// message loads (writes no user stack, so it is safe on any slot). It builds a witness bitmask in r12
+// (callee-saved — preserved across each `syscall`, the u4x/u5x idiom) and conveys it as its `sys_exit`
+// STATUS, which the SYS_EXIT arm routes BY NAME into `U6X_WITNESS` (x86 needs no SYS_REPORT). The scaffold
+// File/Socket kinds are proven kernel-side by `u6x_launcher` (no ring-3 syscall routes through them yet).
+// ABI (Linux-style): rax = number, args rdi/rsi/rdx, return in rax.
+//
+// FLOW: (1) print BEFORE spawning (console cap works) -> bit0. (2) spawn child A, child B -> r13/r14; both
+// handles must be >=0, neither the reserved console index (1), and distinct -> bit1. (3) print AFTER the two
+// spawns -> bit2: the console cap at index 1 SURVIVED — under U5x a child could have been auto-allocated onto
+// index 1 and then clobbered by the console install (or vice versa); U6x's reserved-index allocator makes
+// that impossible. (4) reap BOTH children by handle, each status 0 -> bit3. Witness == 0xF iff all four held.
+core::arch::global_asm!(
+    r#"
+    .globl unaos_user_u6x_blob_start
+unaos_user_u6x_blob_start:
+    .balign 16
+    .globl unaos_user_u6x_spawn
+unaos_user_u6x_spawn:
+    xor r12d, r12d                          // witness bitmask = 0 (callee-saved; survives syscalls)
+
+    // (1) print BEFORE spawning — the console cap at the reserved index (fd=1) works
+    mov rax, 1                              // SYS_WRITE
+    mov rdi, 1                              // fd = CONSOLE_FD (the reserved console handle index)
+    lea rsi, [rip + unaos_user_u6x_msg_pre] // buf -> the ring-3 VA at run time (RIP-relative)
+    mov rdx, [rip + unaos_user_u6x_msg_pre_len]
+    syscall
+    test rax, rax
+    js 1f                                   // negative -> skip bit0 (fail)
+    or r12, 1                               // bit0: print-before-spawn OK
+1:
+    // (2) spawn TWO children — distinct handles auto-allocated around the reserved console index
+    mov rax, 8                              // SYS_SPAWN -> handle_a
+    syscall
+    mov r13, rax                            // r13 = handle_a
+    mov rax, 8                              // SYS_SPAWN -> handle_b
+    syscall
+    mov r14, rax                            // r14 = handle_b
+    test r13, r13
+    js 2f                                   // handle_a < 0 (spawn A failed) -> fail bit1
+    test r14, r14
+    js 2f                                   // handle_b < 0 (spawn B failed) -> fail bit1
+    cmp r13, 1                              // handle_a == CONSOLE_FD ? (must NOT land on the reserved index)
+    je 2f
+    cmp r14, 1                              // handle_b == CONSOLE_FD ?
+    je 2f
+    cmp r13, r14                            // handle_a == handle_b ? (must be distinct)
+    je 2f
+    or r12, 2                               // bit1: both valid, off the reserved index, distinct
+2:
+    // (3) print AFTER spawning — the console cap MUST have survived the two spawns (the no-collision proof)
+    mov rax, 1                              // SYS_WRITE
+    mov rdi, 1                              // fd = console (still intact iff no collision)
+    lea rsi, [rip + unaos_user_u6x_msg_post]
+    mov rdx, [rip + unaos_user_u6x_msg_post_len]
+    syscall
+    test rax, rax
+    js 3f                                   // console clobbered -> negative -> fail bit2
+    or r12, 4                               // bit2: print-after-spawn OK (console survived the spawns)
+3:
+    // (4) reap BOTH children by their handles — each must exit status 0
+    mov rax, 9                              // SYS_WAIT(handle_a)
+    mov rdi, r13
+    syscall
+    mov r15, rax                            // r15 = status_a
+    mov rax, 9                              // SYS_WAIT(handle_b)
+    mov rdi, r14
+    syscall                                 // rax = status_b
+    test r15, r15
+    jnz 4f                                  // status_a != 0 -> fail bit3
+    test rax, rax
+    jnz 4f                                  // status_b != 0 -> fail bit3
+    or r12, 8                               // bit3: both children reaped with status 0
+4:
+    mov rax, 2                              // SYS_EXIT(witness) -> routed by name into U6X_WITNESS
+    mov rdi, r12                            // status = witness bitmask
+    syscall
+5:  jmp 5b                                  // sys_exit never returns; belt-and-braces guard
+    // Read-only data in the (ring-3 RX, kernel-readable) code page. Each length is an assemble-time label
+    // difference loaded RIP-relative (the U5x/hello idiom — no `mov reg, sym-sym` memory-operand trap).
+    .balign 8
+unaos_user_u6x_msg_pre_len:
+    .quad unaos_user_u6x_msg_pre_end - unaos_user_u6x_msg_pre
+unaos_user_u6x_msg_pre:
+    .ascii "u6x: parent print (pre-spawn)\n"
+unaos_user_u6x_msg_pre_end:
+    .balign 8
+unaos_user_u6x_msg_post_len:
+    .quad unaos_user_u6x_msg_post_end - unaos_user_u6x_msg_post
+unaos_user_u6x_msg_post:
+    .ascii "u6x: parent print (post-spawn; console survived 2 spawns)\n"
+unaos_user_u6x_msg_post_end:
+    .globl unaos_user_u6x_blob_end
+unaos_user_u6x_blob_end:
+"#
+);
+
+unsafe extern "C" {
+    static unaos_user_u6x_blob_start: u8;
+    static unaos_user_u6x_blob_end: u8;
+    static unaos_user_u6x_spawn: u8;
+}
+
 // --- The SYSCALL entry stub (LSTAR target). Naked; the only assembly in the syscall path.
 //
 // On entry (CPL 0, from SYSCALL): rcx = user RIP, r11 = user RFLAGS, rax = number, rdi/rsi/rdx =
@@ -583,6 +689,14 @@ pub fn record_ring3_kill(name: &str, vec: u8, err: u64, cr2: u64) {
         U5X_KILLED.fetch_add(1, Ordering::AcqRel);
         return;
     }
+    // U6x: a killed printing-spawner fixture — off the U1b counter (a kill here is a real U6x bug that fails
+    // the U6x verdict, not a phantom U1b regression). It is not in PROCS (the launcher spawned it, not
+    // sys_spawn), so no parent semaphore to post — the launcher times out to FAIL on `U6X_DONE`. (A killed
+    // U6x CHILD shares the `u4x-child` name above — its kill posts a non-zero status that fails the reap.)
+    if name == "u6x-spawn" {
+        U6X_KILLED.fetch_add(1, Ordering::AcqRel);
+        return;
+    }
     let code_end = USER_BASE + PAGE_SIZE; // the code page is the first page of the window only
     let window_end = USER_BASE + USER_WINDOW_PAGES * PAGE_SIZE;
     let expected = match name {
@@ -684,6 +798,14 @@ extern "C" fn syscall_dispatch(nr: u64, a0: u64, a1: u64, a2: u64) -> i64 {
                     // the launcher's verdict; `U5X_DONE` gates the read.
                     U5X_WITNESS.store(a0 as u32, Ordering::Release);
                     U5X_DONE.fetch_add(1, Ordering::AcqRel);
+                }
+                Some("u6x-spawn") => {
+                    // U6x: the printing spawner conveys its 4-bit witness bitmask as its exit STATUS (routed
+                    // by name, same as u5x-cap — x86 has no SYS_REPORT). Its two children exit via the
+                    // pid-keyed short-circuit above (they are `u4x-child`s), so only the parent reaches here.
+                    // Stored for the launcher's verdict; `U6X_DONE` gates the read.
+                    U6X_WITNESS.store(a0 as u32, Ordering::Release);
+                    U6X_DONE.fetch_add(1, Ordering::AcqRel);
                 }
                 Some(n) if n.starts_with("u3-") => {
                     // U3 per-process-CR3 fixture task exiting (its own accounting, so the U1a/U1b
@@ -1639,9 +1761,16 @@ const _: () = assert!(
 /// perturbing U4x's sentinel checks. One non-pid token (not a general object table) is the arc's scope.
 const HANDLE_CONSOLE: u64 = u64::MAX - 1;
 
-/// The conventional stdout handle index. Every ring-3 program prints with `sys_write(fd=1, ..)`, so the
-/// console write-capability is endowed at this fixed index in each printing process's table
-/// (`install_console_cap`). Reserved by convention, like fd 1 on POSIX.
+/// The RESERVED console handle index — the stdout convention (fd 1, like POSIX). Every ring-3 program
+/// prints with `sys_write(fd=1, ..)`, so the console write-capability is endowed here
+/// (`install_console_cap`). U6x: this index is now a RESERVED region the first-free allocator
+/// (`handle_install`) SKIPS — so a process may hold a console cap here AND N auto-allocated child/object
+/// caps with **zero index collision, for any interleaving of installs**. This closes the U5x design note:
+/// there, `install_console_cap`'s unconditional store to a fixed index could clobber a child that
+/// `handle_install`'s first-free scan had already placed at index 1 (harmless only because no process both
+/// printed and spawned). Reserving the index — rather than allocating the console through the shared
+/// allocator — keeps the `fd=1` stdout ABI byte-identical for every existing blob (index 0 stays a general
+/// slot; children/objects fill {0, 2, 3, ..}). See `handle_install`.
 const CONSOLE_FD: usize = 1;
 
 /// The rights sidecar: keyed IDENTICALLY to `HANDLES` (`[row][idx]`), so the value word keeps U4x's exact
@@ -1651,11 +1780,49 @@ const CONSOLE_FD: usize = 1;
 static HANDLE_RIGHTS: [[AtomicU32; NHANDLE]; crate::arch::memory::USER_SLOTS + 1] =
     [const { [const { AtomicU32::new(0) }; NHANDLE] }; crate::arch::memory::USER_SLOTS + 1];
 
-/// What a resolved handle NAMES: a child process (by pid — U4x's meaning) or the console resource (U5x).
+// ---------------------------------------------------------------------------------------------
+// U6x — the general OBJECT descriptor: a handle is (kind, target, rights), first-free allocated for ALL
+// kinds (the aarch64 pi4 U6a twin, keyed by SLOT/row instead of ASID).
+// ---------------------------------------------------------------------------------------------
+//
+// U5x made a handle a capability but the descriptor was FIXED-SHAPE: two kinds only, discriminated by a
+// magic value word (`HANDLE_CONSOLE` vs a pid), with the console pinned at a fixed index. U6x turns it into
+// a general object descriptor without disturbing the lock-free allocator: the KIND rides in a PARALLEL
+// sidecar (`HANDLE_KIND`, keyed identically to `HANDLES`/`HANDLE_RIGHTS`), exactly like the rights.
+//
+// Why a sidecar (not the value word's high bits): the value word's ONLY reserved values stay `0` (Empty —
+// the allocator's free marker) and `u64::MAX` (RESERVING — an in-flight claim), byte-identical to U4x/U5x.
+// The kind lives elsewhere, so a `File(id)`/`Socket(id)` may carry an ARBITRARY id in the value word with
+// no high-bit masking and no risk of a real `(kind, id)` aliasing Empty/RESERVING — the STOP tripwire the
+// brief names is structurally impossible here (the only ids to avoid remain `0` and `u64::MAX`, the same two
+// a real pid already avoids; the demo's scaffold ids are small). It mirrors the existing `HANDLE_RIGHTS`
+// sidecar 1:1 — same shape, same publish-before-the-live-value / observe-after discipline.
+const KIND_EMPTY: u8 = 0; // no object — matches the value word's `0`=Empty (a cleared/free slot)
+const KIND_CHILD: u8 = 1; // a child process (value word = its pid) — U4x's meaning
+const KIND_CONSOLE: u8 = 2; // the serial console (value word = the `HANDLE_CONSOLE` token) — U5x's meaning
+const KIND_FILE: u8 = 3; // U6x scaffold: a file object (value word = an opaque id); no fs syscall routes here yet
+const KIND_SOCKET: u8 = 4; // U6x scaffold: a socket object (value word = an opaque id); no net syscall routes yet
+
+/// The KIND sidecar: keyed IDENTICALLY to `HANDLES`/`HANDLE_RIGHTS` (`[row][idx]`). Discriminates what a
+/// live handle NAMES (`KIND_*`), so the value word carries only the target payload (a pid / the console
+/// token / an object id) and keeps U4x/U5x's `0`=Empty / `u64::MAX`=RESERVING sentinels intact. Written
+/// with Release BEFORE the value store that makes a handle live (so a resolver observing the live value
+/// also observes the kind), cleared in `handle_clear`/`clear_handle_row`. `KIND_EMPTY` (0) == an
+/// inert/absent slot (the const-init).
+static HANDLE_KIND: [[AtomicU8; NHANDLE]; crate::arch::memory::USER_SLOTS + 1] =
+    [const { [const { AtomicU8::new(KIND_EMPTY) }; NHANDLE] }; crate::arch::memory::USER_SLOTS + 1];
+
+/// What a resolved handle NAMES — the general object descriptor's kind + payload. `Child(pid)` (U4x) and
+/// `Console` (U5x) are the live kinds every consumer routes through; `File(id)`/`Socket(id)` are U6x
+/// SCAFFOLDS — defined and resolvable so the table is provably general, though no fs/net syscall routes
+/// through them yet (adding those is U7+/out of scope). The payload is the handle's value word (a pid, or an
+/// opaque object id; `Console` carries none).
 #[derive(Clone, Copy)]
 enum HandleTarget {
     Child(u64),
     Console,
+    File(u64),
+    Socket(u64),
 }
 
 /// Why `handle_resolve` refused: the handle is not in the caller's table (out-of-range/Empty/RESERVING),
@@ -1674,12 +1841,16 @@ fn caller_row() -> usize {
     crate::arch::memory::current_slot().unwrap_or(SHARED_ROW)
 }
 
-/// The U5x enforcement CHECK, at the SINGLE lookup point every handle-consuming path goes through.
-/// Resolve `idx` against the caller's own (`row`) table, then require the handle carry every bit in
-/// `req`. Returns the target on success. `NoHandle` for out-of-range/Empty/`RESERVING` (a reserving
-/// placeholder is never a usable handle); `Denied` when a present handle lacks a required right. The
-/// value word is loaded Acquire (synchronizing with the Release store that installed it), then the
-/// rights — so a resolver that sees a live value also sees its rights.
+/// The enforcement CHECK, at the SINGLE lookup point every handle-consuming path goes through. Resolve
+/// `idx` against the caller's own (`row`) table, then require the handle carry every bit in `req`. Returns
+/// the general target on success. `NoHandle` for out-of-range/Empty/`RESERVING` (a reserving placeholder is
+/// never a usable handle); `Denied` when a present handle lacks a required right. The value word is loaded
+/// Acquire (synchronizing with the Release store that installed it), then the rights, then the KIND — so a
+/// resolver that sees a live value also sees its rights and kind (they are stored BEFORE the value goes
+/// live). U6x: the kind comes from the `HANDLE_KIND` sidecar (not a magic value word), so the payload is
+/// dispatched by kind — `Child`/`File`/`Socket` carry the value word as pid/id; `Console` ignores it. A
+/// live value with `KIND_EMPTY` is a kernel bug (kind is always published before the value) — treated
+/// defensively as `NoHandle`.
 fn handle_resolve(row: usize, idx: u64, req: u32) -> Result<HandleTarget, ResolveErr> {
     if idx as usize >= NHANDLE {
         return Err(ResolveErr::NoHandle);
@@ -1693,11 +1864,13 @@ fn handle_resolve(row: usize, idx: u64, req: u32) -> Result<HandleTarget, Resolv
     if rights & req != req {
         return Err(ResolveErr::Denied);
     }
-    Ok(if raw == HANDLE_CONSOLE {
-        HandleTarget::Console
-    } else {
-        HandleTarget::Child(raw)
-    })
+    match HANDLE_KIND[row][idx as usize].load(Ordering::Acquire) {
+        KIND_CHILD => Ok(HandleTarget::Child(raw)),
+        KIND_CONSOLE => Ok(HandleTarget::Console),
+        KIND_FILE => Ok(HandleTarget::File(raw)),
+        KIND_SOCKET => Ok(HandleTarget::Socket(raw)),
+        _ => Err(ResolveErr::NoHandle), // KIND_EMPTY / unknown on a live value — a kernel bug; fail closed
+    }
 }
 
 /// Set the rights word at `HANDLES[row][idx]` (Release) — used beside a value store to attach rights to a
@@ -1707,34 +1880,57 @@ fn handle_set_rights(row: usize, idx: usize, rights: u32) {
     HANDLE_RIGHTS[row][idx].store(rights, Ordering::Release);
 }
 
-/// Install a capability at a FIXED index (not `handle_install`'s first-free scan): store the rights FIRST
-/// (Release), then the target value (Release), so a resolver that observes the live value also observes
-/// the rights. Used to endow the console write-capability at `CONSOLE_FD` and to plant the U5x demo's
-/// fixtures. Always called BEFORE the target process is dispatched (setup / pre-spawn), so there is no
-/// concurrent resolver; the ordering is defensive belt-and-braces.
-fn install_cap(row: usize, idx: usize, target: u64, rights: u32) {
+/// Set the KIND byte at `HANDLE_KIND[row][idx]` (Release) — the U6x twin of `handle_set_rights`, stored
+/// beside the value/rights when a handle is installed (a child in `sys_spawn` = `KIND_CHILD`; a mint in
+/// `sys_cap_grant` = the source's kind). Published BEFORE the value goes live (see `handle_resolve`).
+fn handle_set_kind(row: usize, idx: usize, kind: u8) {
+    debug_assert!(row < HANDLES.len() && idx < NHANDLE, "handle_set_kind: out of range");
+    HANDLE_KIND[row][idx].store(kind, Ordering::Release);
+}
+
+/// The KIND byte at `HANDLE_KIND[row][idx]` (Acquire) — read alongside `handle_get`'s value when a caller
+/// needs the raw descriptor (e.g. `sys_cap_grant`, whose mint must copy the source handle's kind).
+/// `KIND_EMPTY` for an out-of-range/absent slot.
+fn handle_kind(row: usize, idx: usize) -> u8 {
+    if idx >= NHANDLE {
+        return KIND_EMPTY;
+    }
+    debug_assert!(row < HANDLES.len(), "handle_kind: row out of range");
+    HANDLE_KIND[row][idx].load(Ordering::Acquire)
+}
+
+/// Install a capability at a FIXED index (not `handle_install`'s first-free scan): store the KIND and
+/// rights FIRST (Release), then the target value (Release, LAST) — so a resolver that observes the live
+/// value also observes the kind + rights. Used to endow the console cap at `CONSOLE_FD` and to plant the
+/// U5x/U6x demo fixtures (console / File / Socket). Always called BEFORE the target process is dispatched
+/// (setup / pre-spawn), so there is no concurrent resolver; the ordering is defensive belt-and-braces.
+fn install_cap(row: usize, idx: usize, kind: u8, target: u64, rights: u32) {
     debug_assert!(row < HANDLES.len() && idx < NHANDLE, "install_cap: out of range");
+    HANDLE_KIND[row][idx].store(kind, Ordering::Release);
     HANDLE_RIGHTS[row][idx].store(rights, Ordering::Release);
     HANDLES[row][idx].store(target, Ordering::Release);
 }
 
-/// Endow the process running in `row` with a console WRITE-capability at `CONSOLE_FD` — the bootstrap
-/// that lets a ring-3 program print once `sys_write` routes through the table. Given to every printing
-/// process: the shared window (`SHARED_ROW`) in `setup`, and each spawned child in `sys_spawn`. A process
-/// NOT so endowed gets `-EACCES` from `sys_write` (the U5x negative).
+/// Endow the process running in `row` with a console WRITE-capability at the RESERVED `CONSOLE_FD` — the
+/// bootstrap that lets a ring-3 program print once `sys_write` routes through the table. Given to every
+/// printing process: the shared window (`SHARED_ROW`) in `setup`, each spawned child in `sys_spawn`, and
+/// the U6x printing spawner in its launcher. A process NOT so endowed gets `-EACCES` from `sys_write` (the
+/// U5x negative). U6x: because `handle_install` SKIPS `CONSOLE_FD`, this store can never clobber (nor be
+/// clobbered by) an auto-allocated child/object handle, for any ordering of installs.
 fn install_console_cap(row: usize) {
-    install_cap(row, CONSOLE_FD, HANDLE_CONSOLE, CAP_WRITE);
+    install_cap(row, CONSOLE_FD, KIND_CONSOLE, HANDLE_CONSOLE, CAP_WRITE);
 }
 
-/// True iff the entire `HANDLES[row]` row (values AND rights) is clear — the teardown-clear verifier.
-/// Read by `u5x_launcher` after the fixture exits and its slot is retired: `free_user_space_by_cr3`
-/// clears the row on exit, so this transitions false -> true, proving no stale capability outlives its
-/// owning slot.
+/// True iff the entire `HANDLES[row]` row (values, rights AND kinds) is clear — the teardown-clear
+/// verifier. Read by `u5x_launcher` after the fixture exits and its slot is retired:
+/// `free_user_space_by_cr3` clears the row on exit, so this transitions false -> true, proving no stale
+/// capability outlives its owning slot.
 fn handle_row_is_clear(row: usize) -> bool {
     debug_assert!(row < HANDLES.len(), "handle_row_is_clear: row out of range");
     (0..NHANDLE).all(|i| {
         HANDLES[row][i].load(Ordering::Acquire) == 0
             && HANDLE_RIGHTS[row][i].load(Ordering::Acquire) == 0
+            && HANDLE_KIND[row][i].load(Ordering::Acquire) == KIND_EMPTY
     })
 }
 
@@ -1748,21 +1944,33 @@ fn handle_row_is_clear(row: usize) -> bool {
 pub fn clear_handle_row(slot: usize) {
     debug_assert!(slot < crate::arch::memory::USER_SLOTS, "clear_handle_row: not a private slot");
     for i in 0..NHANDLE {
-        // Clear the value first (Empty => `handle_resolve` bails as NoHandle before reading rights), then
-        // the rights — so no intermediate state is ever a live handle with stale rights.
+        // Clear the value first (Empty => `handle_resolve` bails as NoHandle before reading rights/kind),
+        // then the rights and kind — so no intermediate state is ever a live handle with stale rights/kind.
         HANDLES[slot][i].store(0, Ordering::Release);
         HANDLE_RIGHTS[slot][i].store(0, Ordering::Release);
+        HANDLE_KIND[slot][i].store(KIND_EMPTY, Ordering::Release);
     }
 }
 
-/// Claim the first Empty slot in `HANDLES[slot]`, storing `pid` (CAS 0->pid), and return its index —
-/// the value `sys_spawn` returns to ring 3. `None` if the table is full (-> -EAGAIN). `pid` is
-/// `HANDLE_RESERVING` for a pre-spawn reservation, then overwritten with the real pid via `handle_set`.
+/// Claim the first Empty slot in `HANDLES[slot]`, storing `value` (CAS 0->value), and return its index —
+/// the handle `sys_spawn` / `sys_cap_grant` return to ring 3. `None` if the table is full (-> -EAGAIN).
+/// Callers claim with `HANDLE_RESERVING`, then publish the kind + rights + real value (value LAST — see
+/// `sys_spawn` / `sys_cap_grant`); `value` may be any non-`0` word (the CAS treats only `0` as free).
 /// `slot` is always in range (from `current_slot`, 0..USER_SLOTS; debug-asserted).
-fn handle_install(slot: usize, pid: u64) -> Option<usize> {
+///
+/// U6x — the collision fix: the scan SKIPS the reserved `CONSOLE_FD`. That index belongs to the console cap
+/// by convention (`install_console_cap`, an unconditional fixed-index store); by never handing it out here,
+/// an auto-allocated child/object handle can never land on it and be clobbered by a later console install,
+/// nor clobber a console already there — for ANY interleaving of installs. So the general allocator hands
+/// out {0, 2, 3, .., NHANDLE-1}; the console lives at `CONSOLE_FD`. This closes the one U5x design note (a
+/// printing spawner colliding a child with the console).
+fn handle_install(slot: usize, value: u64) -> Option<usize> {
     debug_assert!(slot < HANDLES.len(), "handle_install: slot out of range");
     for (i, h) in HANDLES[slot].iter().enumerate() {
-        if h.compare_exchange(0, pid, Ordering::AcqRel, Ordering::Acquire).is_ok() {
+        if i == CONSOLE_FD {
+            continue; // reserved for the console cap — never auto-allocated (the U6x no-collision invariant)
+        }
+        if h.compare_exchange(0, value, Ordering::AcqRel, Ordering::Acquire).is_ok() {
             return Some(i);
         }
     }
@@ -1790,15 +1998,16 @@ fn handle_get(slot: usize, idx: usize) -> Option<u64> {
     }
 }
 
-/// Clear (0 = Empty) the handle at `HANDLES[slot][idx]` AND its rights sidecar — consumed when its child
-/// is reaped in `sys_wait`, revoked by `sys_cap_revoke`, or released when a failed `sys_spawn` unwinds its
-/// reservation. U5x: clears BOTH the value and the rights (value first — Empty => `handle_resolve` bails
-/// before reading rights — then rights), mirroring the aarch64 twin's `handle_clear`, so a dropped
-/// capability never leaves a stale rights word behind an Empty slot for a later re-install to inherit.
+/// Clear (0 = Empty) the handle at `HANDLES[slot][idx]` AND its rights + kind sidecars — consumed when its
+/// child is reaped in `sys_wait`, revoked by `sys_cap_revoke`, or released when a failed `sys_spawn` unwinds
+/// its reservation. Clears the value first (Empty => `handle_resolve` bails before reading rights/kind),
+/// then the rights and kind, mirroring the aarch64 twin's `handle_clear`, so a dropped capability never
+/// leaves a stale rights/kind word behind an Empty slot for a later re-install to inherit.
 fn handle_clear(slot: usize, idx: usize) {
     debug_assert!(slot < HANDLES.len() && idx < NHANDLE, "handle_clear: out of range");
     HANDLES[slot][idx].store(0, Ordering::Release);
     HANDLE_RIGHTS[slot][idx].store(0, Ordering::Release);
+    HANDLE_KIND[slot][idx].store(KIND_EMPTY, Ordering::Release);
 }
 
 /// SYS_SPAWN(): instantiate the pre-staged program (HELLO.BIN) in a fresh slot, run it ring-3 as a
@@ -1866,10 +2075,12 @@ fn sys_spawn() -> i64 {
     // Record the real pid (Release) into BOTH the Proc entry (pid-keyed exit accounting) and the
     // reserved handle slot (slot-keyed ownership) BEFORE returning to ring 3 — before the parent can
     // yield and let the child run. The child's exit path sees the Proc pid; the parent's later
-    // sys_wait resolves the handle to it. U5x: the parent's child handle carries CAP_READ (the ownership
-    // token — `sys_wait` gates on kind==Child, not on the right; published Release BEFORE the pid so the
-    // handle is never live sans rights).
+    // sys_wait resolves the handle to it. U5x/U6x: the parent's child handle is KIND_CHILD carrying
+    // CAP_READ (the ownership token — `sys_wait` gates on kind==Child, not on the right). Kind + rights are
+    // published Release BEFORE the pid (the live value word), so the handle is never observed live without
+    // its kind/rights.
     PROCS[pi].pid.store(pid, Ordering::Release);
+    handle_set_kind(slot, h, KIND_CHILD);
     handle_set_rights(slot, h, CAP_READ);
     handle_set(slot, h, pid);
     h as i64 // the HANDLE index (per-process; two processes can each hold handle 0 to different children)
@@ -1929,15 +2140,18 @@ fn sys_cap(op: u64, a1: u64, a2: u64) -> i64 {
 ///             the granter.
 ///   -EAGAIN — the caller's handle table is full (no free slot to mint into; never grown).
 /// The mint targets the caller's OWN table (a child spawns nothing to grant into yet); cross-table minting
-/// is a straightforward extension once cross-process object naming lands (U6).
+/// is a straightforward extension once cross-process handle-transfer lands (U7). U6x: the mint names the
+/// SAME (kind, target) as the source — a grant attenuates RIGHTS, never re-kinds the object. So a granted
+/// console cap stays a console cap; a granted File stays that File.
 fn sys_cap_grant(row: usize, src_idx: u64, req_rights: u64) -> i64 {
-    // Resolve the source's raw target + rights (no right required to READ your own handle's descriptor).
+    // Resolve the source's raw target + kind + rights (no right required to READ your own handle's descriptor).
     let Some(target) = handle_get(row, src_idx as usize) else {
         return EACCES; // no such source handle
     };
     if target == HANDLE_RESERVING {
         return EACCES; // an in-flight reservation is not a grantable handle (defensive; single-writer)
     }
+    let src_kind = handle_kind(row, src_idx as usize);
     let src_rights = HANDLE_RIGHTS[row][src_idx as usize].load(Ordering::Acquire);
     if src_rights & CAP_GRANT == 0 {
         return EACCES; // the source does not authorize granting
@@ -1948,12 +2162,16 @@ fn sys_cap_grant(row: usize, src_idx: u64, req_rights: u64) -> i64 {
     if req & !src_rights != 0 {
         return EACCES;
     }
-    // Mint: reuse `handle_install` for the first-free slot claim (the U4x sentinel logic), then attach the
-    // attenuated rights. Single-writer over this table (the caller is mid-syscall, not concurrently
-    // resolving), so the value-then-rights order carries no race.
-    match handle_install(row, target) {
+    // Mint: claim a first-free slot with `handle_install` (a RESERVING placeholder — the value word goes
+    // live LAST), then publish the source's kind + the attenuated rights, then the real target value.
+    // Single-writer over this table (the caller is mid-syscall, not concurrently resolving), so the
+    // kind/rights-then-value order is the defensive belt-and-braces that keeps a live value from ever being
+    // seen sans kind/rights.
+    match handle_install(row, HANDLE_RESERVING) {
         Some(idx) => {
+            handle_set_kind(row, idx, src_kind);
             handle_set_rights(row, idx, req);
+            handle_set(row, idx, target); // publish the live value LAST (Release)
             idx as i64
         }
         None => EAGAIN, // handle table full
@@ -2007,6 +2225,30 @@ static U5X_DONE: AtomicU32 = AtomicU32::new(0);
 static U5X_KILLED: AtomicU32 = AtomicU32::new(0);
 /// The full witness — all four capability behaviours proven.
 const U5X_WITNESS_ALL: u32 = 0xF;
+/// Set once the U5x launcher has printed its verdict AND its slot has freed, so the U6x launcher orders its
+/// lines AFTER U5x's and runs with a free slot (the aarch64 `U5_LAUNCH_DONE` twin; the x86 `U4X_LAUNCH_DONE`
+/// idiom).
+static U5X_LAUNCH_DONE: AtomicBool = AtomicBool::new(false);
+
+// --- U6x demo accounting (the general object table; written by the exit/kill paths, read by the launcher's
+// verdict). ---
+/// The printing-spawner fixture's witness bitmask (its `sys_exit` status, routed by name). One bit per
+/// proven behaviour: print-before-spawn OK (bit0), both child handles valid + off the reserved console index
+/// + distinct (bit1), print-AFTER-spawn OK — the console cap survived two spawns (bit2), both children reaped
+/// status 0 (bit3). The verdict PASSes iff it equals `U6X_WITNESS_ALL` AND the kernel-side check held.
+static U6X_WITNESS: AtomicU32 = AtomicU32::new(0);
+/// 1 once the printing-spawner reaches `sys_exit` (its witness is then valid). The launcher waits on this
+/// before reading `U6X_WITNESS`.
+static U6X_DONE: AtomicU32 = AtomicU32::new(0);
+/// Incremented if the printing-spawner fixture is KILLED (a fault) — any kill is a verdict FAIL.
+static U6X_KILLED: AtomicU32 = AtomicU32::new(0);
+/// The kernel-side U6x check result (set by `u6x_launcher`): the general object table resolves the
+/// `File`/`Socket` scaffold kinds (with the right rights, `Denied` without) AND the first-free allocator
+/// skips the reserved `CONSOLE_FD` so an interleaved console-install + two child installs collide on no
+/// index. Both must hold for the U6x PASS.
+static U6X_KINDS_OK: AtomicBool = AtomicBool::new(false);
+/// The full witness — all four object-table behaviours proven.
+const U6X_WITNESS_ALL: u32 = 0xF;
 
 /// U4x fixture run parameters: the parent's + orphan's ring-3 entry VAs (both inside the shared window
 /// VA — only the slot FRAME differs, via CR3), the shared initial user rsp, and each fixture's slot
@@ -2210,8 +2452,8 @@ fn u5x_setup() -> Option<U5xDemo> {
     }
     // Pre-endow the fixture's table (before it is dispatched — no concurrent resolver). Two console caps:
     // a full one (write + grant) at index 1, and a write-LESS one at index 2 for the negative.
-    install_cap(slot, 1, HANDLE_CONSOLE, CAP_WRITE | CAP_GRANT);
-    install_cap(slot, 2, HANDLE_CONSOLE, CAP_READ);
+    install_cap(slot, 1, KIND_CONSOLE, HANDLE_CONSOLE, CAP_WRITE | CAP_GRANT);
+    install_cap(slot, 2, KIND_CONSOLE, HANDLE_CONSOLE, CAP_READ);
     serial_println!(
         ":: U5x: capabilities — rights + CHECK + grant/attenuate/revoke + routed sys_write ::"
     );
@@ -2251,12 +2493,14 @@ pub fn u5x_launcher(demo_cpu: usize) {
 
     // 2. No block device -> keep the no-storage control path free of demo lines (U5x needs no disk).
     if crate::drivers::block::info().is_none() {
+        U5X_LAUNCH_DONE.store(true, Ordering::Release); // release the U6x gate (U6x also gates on storage)
         return;
     }
 
     // 3. Build + pre-endow the fixture slot and spawn it on the demo core.
     let Some(u5) = u5x_setup() else {
         serial_println!(":: U5x: no free address-space slot — capability demo skipped ::");
+        U5X_LAUNCH_DONE.store(true, Ordering::Release); // release the U6x gate even on the skip path
         return;
     };
     crate::arch::sched::spawn_user_in_space("u5x-cap", u5.cap, u5.sp, demo_cpu, u5.cr3);
@@ -2292,6 +2536,164 @@ pub fn u5x_launcher(demo_cpu: usize) {
             U5X_WITNESS_ALL
         );
     }
+    // Release the U6x gate: the U5x verdict has printed and (the fixture having exited) the U5x slot has
+    // freed, so the U6x launcher may build + endow its fixture slot and order its lines after ours.
+    U5X_LAUNCH_DONE.store(true, Ordering::Release);
+}
+
+/// U6x fixture run parameters: the printing-spawner's ring-3 entry VA (inside the shared window VA — only
+/// the slot FRAME differs, via CR3), the initial user rsp, its slot CR3, and its slot INDEX (so the launcher
+/// can run the kernel-side object-table checks against — and then endow — that exact row).
+struct U6xDemo {
+    spawn: u64,
+    sp: u64,
+    cr3: u64,
+    slot: usize,
+}
+
+/// U6x setup: allocate + build ONE private slot, copy the U6x blob into its code page through the identity
+/// alias (the slot's code page is RX-RO from the start — W^X by construction), and return the run params.
+/// Does NOT endow the console cap — the launcher runs its kernel-side checks against the fresh (empty) row
+/// FIRST, then endows the live console cap. Also (re-)reserves the PROCS semaphores' waiter capacity so the
+/// two children the fixture spawns can be waited on without a park-side reallocation (idempotent — u4x_setup
+/// reserves them too, but this keeps U6x self-contained). Emits the U6x setup line; `None` if slot
+/// allocation fails. Called ONCE from `u6x_launcher`, after the U5x gate — so a slot is free and no task runs
+/// under the fixture's slot yet (the checks/endowment cannot race a resolver). Register-only fixture (writes
+/// no user stack), so one slot suffices.
+fn u6x_setup() -> Option<U6xDemo> {
+    // Reserve each Proc semaphore's waiter capacity before any child can block the parent on it (the
+    // u4x_setup discipline; idempotent when u4x already ran, which it has by the U5x -> U6x gate chain).
+    for p in &PROCS {
+        p.done.init();
+    }
+    let slot = crate::arch::memory::alloc_user_space()?;
+    let blob_start = &raw const unaos_user_u6x_blob_start as usize;
+    let blob_end = &raw const unaos_user_u6x_blob_end as usize;
+    let blob_len = blob_end - blob_start;
+    assert!(blob_len as u64 <= PAGE_SIZE, "U6x blob does not fit in a code page");
+    let spawn_off = (&raw const unaos_user_u6x_spawn as usize - blob_start) as u64;
+    let backing = crate::arch::memory::slot_backing_ptr(slot);
+    unsafe {
+        // Scrub the whole window (residue), then copy the blob into the code page (page 0) through the
+        // identity alias — never USER_BASE, so the code mapping stays read-only (W^X).
+        core::ptr::write_bytes(backing, 0, (USER_WINDOW_PAGES * PAGE_SIZE) as usize);
+        core::ptr::copy_nonoverlapping(blob_start as *const u8, backing, blob_len);
+    }
+    serial_println!(
+        ":: U6x: general object table — (kind, target, rights) descriptors, first-free alloc skips the reserved console index ::"
+    );
+    Some(U6xDemo {
+        spawn: USER_BASE + spawn_off,
+        sp: USER_BASE + USER_WINDOW_PAGES * PAGE_SIZE - 16,
+        cr3: crate::arch::memory::slot_cr3(slot),
+        slot,
+    })
+}
+
+/// U6x kernel-side check — run against the fixture's FRESH, empty row before it is endowed/dispatched (no
+/// concurrent resolver): prove the two things the ring-3 fixture cannot observe itself.
+///
+///   (A) NO INDEX COLLISION for any interleaving: auto-allocate two handles (`handle_install`), THEN install
+///       the console cap at the reserved `CONSOLE_FD`. Under U5x's allocator the second auto-handle would
+///       land on index 1 and the console's unconditional store would clobber it; U6x's allocator skips the
+///       reserved index, so both auto-handles keep their values AND the console lands intact — verified via
+///       `handle_get`. This is the exact interleaving the U5x review flagged, exercised directly.
+///   (B) The scaffold FILE/SOCKET kinds RESOLVE to their kind carrying the required right, and to `Denied`
+///       (`-EACCES`-equivalent) without it — proving the table is genuinely general (not console-only). The
+///       ids are small non-sentinel words (never `0` / `u64::MAX`), so the value word never aliases
+///       Empty/RESERVING.
+///
+/// Returns true iff every check held. Leaves the row dirty; the caller `clear_handle_row`s it before endowing
+/// the live console cap.
+fn u6x_kernel_check(slot: usize) -> bool {
+    // (A) no-collision stress — the exact interleaving the U5x review flagged (spawn-onto-1, then console-install).
+    let (Some(a), Some(b)) = (handle_install(slot, 0xA1), handle_install(slot, 0xB2)) else {
+        return false; // a fresh 8-slot row cannot be full; a None here is a kernel bug -> fail closed
+    };
+    install_console_cap(slot); // unconditional store at CONSOLE_FD — must neither clobber nor be clobbered by a/b
+    let nocollide = a != CONSOLE_FD
+        && b != CONSOLE_FD
+        && a != b
+        && handle_get(slot, a) == Some(0xA1)
+        && handle_get(slot, b) == Some(0xB2)
+        && handle_get(slot, CONSOLE_FD) == Some(HANDLE_CONSOLE);
+
+    // (B) File/Socket scaffold kinds resolve to their kind with the right rights, Denied without.
+    install_cap(slot, 3, KIND_FILE, 0x100, CAP_READ);
+    install_cap(slot, 4, KIND_SOCKET, 0x200, CAP_READ | CAP_WRITE);
+    let file_ok = matches!(handle_resolve(slot, 3, CAP_READ), Ok(HandleTarget::File(0x100)))
+        && matches!(handle_resolve(slot, 3, CAP_WRITE), Err(ResolveErr::Denied));
+    let sock_ok = matches!(handle_resolve(slot, 4, CAP_READ | CAP_WRITE), Ok(HandleTarget::Socket(0x200)))
+        && matches!(handle_resolve(slot, 4, CAP_EXEC), Err(ResolveErr::Denied));
+
+    nocollide && file_ok && sock_ok
+}
+
+/// U6x launcher + verdict (the `u5x_launcher` shape: one gated kernel task on a scheduled sibling core).
+/// `demo_cpu` (the task arg) is the core the printing spawner runs on. Flow:
+///   1. Wait (bounded, yielding) for `U5X_LAUNCH_DONE`, so the U6x lines land after the U5x verdict and the
+///      U5x slot has freed.
+///   2. Skip silently if no block device — the fixture's two children load `HELLO.BIN` off it (as U4x does).
+///   3. `u6x_setup()` (build the fixture slot, print the setup line), run the KERNEL-SIDE object-table checks
+///      against its fresh row (`u6x_kernel_check`), `clear_handle_row` the scratch, endow the live console
+///      cap, and spawn `u6x-spawn` on `demo_cpu`. Its two `sys_spawn`s co-locate BOTH children on `demo_cpu`
+///      (the U4x co-location invariant — each child stays queued-not-dispatched until the parent blocks in
+///      its first `sys_wait`, so both pids are recorded first).
+///   4. Verdict (folded): wait (bounded) for the fixture's exit (`U6X_DONE == 1`), then PASS iff its witness
+///      == `U6X_WITNESS_ALL` (printed before AND after two spawns with no collision, both children reaped
+///      clean) AND the kernel-side check held AND no U6x kill. Prints ONE PASS line. U6x is the last demo, so
+///      it releases no further gate.
+pub fn u6x_launcher(demo_cpu: usize) {
+    // 1. Gate on the U5x launcher (its verdict printed + its slot freed), bounded + yielding.
+    let wdeadline = crate::arch::ticks() + 10_000;
+    while !U5X_LAUNCH_DONE.load(Ordering::Acquire) && crate::arch::ticks() < wdeadline {
+        crate::arch::sched::yield_now();
+    }
+
+    // One-shot (spawned once; guard defensively).
+    static DONE: AtomicBool = AtomicBool::new(false);
+    if DONE.swap(true, Ordering::Relaxed) {
+        return;
+    }
+
+    // 2. No block device -> the children cannot be loaded; skip silently (mirrors U4x/U5x's control discipline).
+    if crate::drivers::block::info().is_none() {
+        return;
+    }
+
+    // 3. Build the fixture slot, run the kernel-side checks against its fresh row, then endow + spawn it.
+    let Some(u6) = u6x_setup() else {
+        serial_println!(":: U6x: no free address-space slot — object-table demo skipped ::");
+        return;
+    };
+    U6X_KINDS_OK.store(u6x_kernel_check(u6.slot), Ordering::Release);
+    clear_handle_row(u6.slot); // wipe the scratch handles the check planted...
+    install_console_cap(u6.slot); // ...then endow the LIVE console cap the fixture prints through.
+    crate::arch::sched::spawn_user_in_space("u6x-spawn", u6.spawn, u6.sp, demo_cpu, u6.cr3);
+
+    // 4. Folded verdict: wait (bounded, yielding) for the fixture's exit, then judge. Two children (two
+    //    spawns) + the parent complete well under this budget under QEMU.
+    let vdeadline = crate::arch::ticks() + 5000;
+    while U6X_DONE.load(Ordering::Acquire) < 1 && crate::arch::ticks() < vdeadline {
+        crate::arch::sched::yield_now();
+    }
+    let witness = U6X_WITNESS.load(Ordering::Acquire);
+    let kinds_ok = U6X_KINDS_OK.load(Ordering::Acquire);
+    let killed = U6X_KILLED.load(Ordering::Acquire);
+    if witness == U6X_WITNESS_ALL && kinds_ok && killed == 0 {
+        serial_println!(
+            ":: U6x: x86 general object table — printing spawner + 2 children, no index collision, File/Socket kinds resolve -> PASS ::"
+        );
+    } else {
+        serial_println!(
+            ":: U6x: x86 general object table FAIL — witness={:#x} kinds_ok={} killed={} done={} (want {:#x} / true / 0 / 1) ::",
+            witness,
+            kinds_ok,
+            killed,
+            U6X_DONE.load(Ordering::Acquire),
+            U6X_WITNESS_ALL
+        );
+    }
 }
 
 /// U5x one-shot, fired from the main loop after `u4x_probe_once` (gated on storage like U4x, so the no-SD
@@ -2316,4 +2718,37 @@ pub fn u5x_probe_once() {
 
     let vcpu = online.get(1).copied().unwrap_or(cpu);
     crate::arch::sched::spawn("u5x-launch", u5x_launcher, cpu, vcpu, crate::arch::sched::PRIO_NORMAL);
+}
+
+/// U6x one-shot, fired from the main loop after `u5x_probe_once` (gated on storage like U4x/U5x). It spawns
+/// the U6x launcher on a sibling AP; the launcher gates on `U5X_LAUNCH_DONE`, so ordering + the free-slot
+/// precondition hold regardless of interleave. The printing spawner's two children run HELLO.BIN, so — like
+/// U4x — it needs the program staged: `u4x_probe_once` stages it first (idempotent `HELLO_STAGED`), and this
+/// re-stages defensively if needed. Without a FAT volume/HELLO.BIN the children cannot run, so the demo is
+/// skipped cleanly (no false FAIL) — exactly as U4x skips.
+pub fn u6x_probe_once() {
+    static DONE: AtomicBool = AtomicBool::new(false);
+    if DONE.load(Ordering::Relaxed) {
+        return;
+    }
+    if crate::drivers::block::info().is_none() {
+        return; // retry next loop iteration until storage enumerates (mirrors u4x/u5x_probe_once)
+    }
+    let online = crate::arch::smp::online_aps();
+    let Some(&cpu) = online.first() else {
+        DONE.store(true, Ordering::Relaxed);
+        serial_println!(":: U6x: no application processor online — object-table demo skipped ::");
+        return;
+    };
+    DONE.store(true, Ordering::Relaxed); // one-shot from here regardless of outcome
+
+    // The spawner's 2 children run HELLO.BIN off FAT (via sys_spawn's pre-staged buffer). Ensure it is
+    // staged; a missing volume/file means nothing to spawn, so skip cleanly rather than emit a false FAIL.
+    if !HELLO_STAGED.load(Ordering::Acquire) && !stage_hello() {
+        serial_println!(":: U6x: HELLO.BIN not available — object-table demo skipped ::");
+        return;
+    }
+
+    let vcpu = online.get(1).copied().unwrap_or(cpu);
+    crate::arch::sched::spawn("u6x-launch", u6x_launcher, cpu, vcpu, crate::arch::sched::PRIO_NORMAL);
 }
