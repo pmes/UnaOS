@@ -418,6 +418,22 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
                 cpu,
                 vcpu,
             );
+
+            // U7: cross-process capability transfer — the first CROSS-process op on the object table. A
+            // gated kernel task on `vcpu` (the u6b-launch idiom), demo core `cpu` as its arg: it waits for
+            // the U6b verdict (U6B_LAUNCH_DONE), builds TWO fixture slots, and orchestrates the delegation
+            // script — the parent SYS_XFERs an attenuated Console cap into the child's per-ASID inbox (an
+            // over-rights transfer is refused), the child SYS_RECVs it into its OWN handle row and PRINTS
+            // through it, the parent then revokes the transfer (sender-owned record) and the child's next
+            // use is -EACCES. The launcher also proves the single-writer invariant kernel-side (the child's
+            // row is byte-clear while the deposit sits in its inbox) and that teardown leaves no descriptor,
+            // inbox slot, or transfer record behind. Fully QEMU-verifiable (cooperative SYS_YIELD polling).
+            unaos_kernel::arch::sched::spawn(
+                "u7-launch",
+                unaos_kernel::arch::syscall::u7_launcher,
+                cpu,
+                vcpu,
+            );
         }
     }
 

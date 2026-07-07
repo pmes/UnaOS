@@ -10,6 +10,48 @@ Legend: **✅ metal-confirmed** · **🔬 QEMU-green, metal pending** · dates I
 
 ---
 
+## hw-pi4 track — 2026-07-07 (Campaign 1 — the round-13 sweep, Fable-executed)
+
+### U7 — cross-process capability transfer: inbox-mediated `SYS_XFER`/`SYS_RECV` + sender revoke, single-writer preserved (aarch64) 🔬 `hw-pi4`
+- **What:** the first CROSS-process op on the object table — kernel-mediated delegation that preserves
+  the single-writer-per-row invariant by construction. `SYS_XFER = 13` (dest = a `Child` handle in the
+  SENDER's own table — owner-scoped; src must carry `CAP_GRANT`; `req & !src_rights != 0 -> -EACCES`)
+  deposits the attenuated descriptor into the recipient's per-ASID **inbox** (`NXFER = 4`; state word
+  `0`/`RESERVING`/unique-tx; every claim/consume/retract/teardown a tx-exact CAS); `SYS_RECV = 14`
+  installs it into the CALLER's own row. `SYS_CAP` XREVOKE (op 2) flips the **sender-owned record**
+  (`MAX_XFERS = 8`); the received cap goes stale at its next `handle_resolve` via a recipient-written
+  sidecar (`HANDLE_XFER_REC`) — nobody ever writes a foreign row, not even to revoke. pid→ASID rides a
+  new `Proc.asid` field; a **post-check + retract** closes the deposit-vs-exit race sender-side;
+  teardown sweeps inbox + records (recycled ASIDs inherit nothing). Payloads: `Console`/`Socket` only
+  (`File` = sender-local descriptor, refused; `Child` = reap delegation, refused).
+- **Tested — QEMU:** `./arroyo kernel8-test 30` → after the U6b PASS line: the U7 setup line,
+  `u7: child prints via the transferred cap` (a REAL console write authorized by a transferred
+  capability), and `:: U7: cross-process transfer — SYS_XFER attenuated, child received + used the cap,
+  revoke enforced, single-writer intact -> PASS ::`. The launcher-orchestrated script (GO words +
+  cooperative SYS_YIELD polling — deterministic under QEMU) proves: over-rights transfer refused;
+  the **single-writer witness** (the child's handle row byte-clear while the t1 deposit sits in its
+  inbox, the child provably parked pre-RECV); use-then-revoke ordering; the revoked cap `-EACCES`;
+  teardown leaves rows/inboxes/records fully clear. **Every prior M6/U4/U5/U6/U6b verdict
+  byte-identical** (sorted scratch-worktree baseline diff vs `5ea4b48` — only the U7 lines + the
+  binary-growth VBAR shift differ) + CAPSTONE 6/6 + 19/19 PASS + 0 faults; `./arroyo check` both
+  arches; **zero x86 files**.
+- **Honest scope:** single-LEVEL revoke — a re-granted or re-transferred copy escapes it (derived
+  caps; the revocation-TREE arc adds derivation records); one documented TOCTOU residue at the
+  sys_xfer post-check (exit + ASID-recycle + consume between two adjacent checks; generation-tagged
+  inboxes ride the tree arc). Deferred: trees, the bandy Ring-3 wrapper, arbitrary recipients,
+  `File` payload migration, real Socket syscalls.
+- **Metal:** none expected (pure syscall logic; rides at the next Pi boundary with the battery).
+- **Review:** five-lens adversarial panel + refuter verification (29 agents) — 2 distinct CONFIRMED
+  must-fixes, **both fixed in-arc**: XREVOKE made tx-exact (the revoked flag moved into the record's TX
+  word, bit 63 — the stale-revoke-on-reclaimed-record race and the born-revoked window are gone) and
+  `u7_build` now scrubs the whole window (U6b's +0x3000 plant landed exactly on the GO word — the
+  witness was racy). Notes closed: post-revoke laundering (`-EACCES` on delegation from a revoked
+  received cap), sender-ASID-recycle revoke authority (teardown disowns records), `handle_row_is_clear`
+  covers the transfer sidecar, planted-Proc truthfulness (EXITED on fixture exit/kill). Ledgered: the
+  RCsc-codegen memory-model footnote. Re-gated green after the fixes (19/19 PASS, sorted-diff pure
+  append).
+- **Commit:** on `hw-pi4` (Campaign 1, Fable-executed; multi-lens adversarial review before merge).
+
 ## hw-rmbp track — 2026-07-07 (Campaign 1 — the round-13 sweep, Fable-executed)
 
 ### U6bx — real File handles: `SYS_OPEN`/`SYS_READ` through the object table, served from the BSP-staged source (x86) 🔬 `hw-rmbp`
