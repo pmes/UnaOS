@@ -50,6 +50,14 @@ const SYS_CAP: u64 = 10;
 /// idx (attenuated) or a negative errno. REVOKE: `a1`=handle idx to drop -> 0 or a negative errno.
 const CAP_OP_GRANT: u64 = 0;
 const CAP_OP_REVOKE: u64 = 1;
+// U6bx: REAL File handles — the object table's first resource syscalls on a non-Console kind (the
+// aarch64 pi4 U6b twin; same numbers). OPEN(name_ptr, name_len) looks the name up in the BSP-STAGED
+// file set — not the disk: the SYSCALL handler runs IF-masked and the xHCI BOT read pump `hlt()`s, so
+// an in-handler disk read would hang the core (see the STORAGE / IF NOTE at the pre-stage buffer) —
+// and mints a File handle carrying `CAP_READ`. READ(handle, buf, len) serves the staged bytes through
+// that handle, gated by File + `CAP_READ` at `handle_resolve` (the `sys_write` Console twin).
+const SYS_OPEN: u64 = 11;
+const SYS_READ: u64 = 12;
 
 /// Base of the ring-3 window: 1 TiB — a FRESH top-level slot (PML4 index 2) above the firmware
 /// identity map, so mapping it touches no kernel state. `setup` proves it unmapped before use.
@@ -508,6 +516,102 @@ unsafe extern "C" {
     static unaos_user_u6x_spawn: u8;
 }
 
+// --- U6bx ring-3 fixture (REAL File handles — the aarch64 `__u6b_prog_file` twin). ONE fixture
+// (`u6bx-file`) exercising the object table's FIRST resource syscall on a non-Console object: it opens the
+// staged file by name (SYS_OPEN -> a File handle carrying CAP_READ), reads through it (SYS_READ), compares
+// the bytes against the kernel-planted expected prefix, and proves the SYS_READ CHECK rejects both a File
+// handle stripped of CAP_READ (the rights arm, pre-endowed at `U6BX_NOCAP_IDX`) and a non-File handle
+// carrying CAP_READ (the kind arm, a Socket at `U6BX_SOCK_IDX`). Register-only (writes no user stack): the
+// read dest is the DATA page (window page 1) and the compare target the kernel-planted page-2 prefix, both
+// fixed window VAs. Its own SYS_OPEN first-free-claims index 0 (index 1 = the reserved CONSOLE_FD, never
+// auto-allocated; 2/3 are pre-endowed). Witness bitmask (5 bits — see `U6BX_WITNESS_ALL`) conveyed as its
+// exit STATUS, which the SYS_EXIT arm routes BY NAME into `U6BX_WITNESS` (the u5x/u6x idiom — x86 needs no
+// SYS_REPORT). ABI (Linux-style): rax = number, args rdi/rsi/rdx, return in rax; rcx/r11 are the
+// SYSCALL-clobbered pair, so state rides r12-r15 (restored across syscalls like every other GPR).
+core::arch::global_asm!(
+    r#"
+    .globl unaos_user_u6bx_blob_start
+unaos_user_u6bx_blob_start:
+    .balign 16
+    .globl unaos_user_u6bx_file
+unaos_user_u6bx_file:
+    xor r12d, r12d                          // witness bitmask = 0 (survives syscalls)
+    lea r14, [rip + unaos_user_u6bx_blob_start] // window base (the blob runs at the code-page base)
+    mov r15, r14
+    add r14, 0x1000                         // r14 -> read buffer (the writable DATA page, window page 1)
+    add r15, 0x2000                         // r15 -> kernel-planted expected prefix (window page 2)
+
+    // (0) SYS_OPEN("HELLO.BIN") -> a File handle carrying CAP_READ
+    mov rax, 11                             // SYS_OPEN
+    lea rdi, [rip + unaos_user_u6bx_name]   // name ptr (in the RO code page — ring-3 readable)
+    mov rsi, [rip + unaos_user_u6bx_namelen] // name len (from the embedded length word)
+    syscall
+    mov r13, rax                            // r13 = handle (>= 0) or -errno
+    test r13, r13
+    js 1f                                   // open failed (negative) -> skip bit0 + the read/bytes checks
+    add r12, 1                              // bit0: open OK
+
+    // (1) SYS_READ(handle, buf, 16) -> exactly 16 bytes back
+    mov rax, 12                             // SYS_READ
+    mov rdi, r13                            // the File handle SYS_OPEN minted
+    mov rsi, r14                            // dest buf (data page)
+    mov rdx, 16
+    syscall
+    cmp rax, 16
+    jne 1f                                  // short/failed read -> skip bit1 + the bytes check
+    add r12, 2                              // bit1: read OK (16 bytes)
+
+    // (2) the 16 read bytes must equal the kernel-planted staged prefix (two 8-byte compares)
+    mov rax, [r14]
+    cmp rax, [r15]
+    jne 1f
+    mov rax, [r14 + 8]
+    cmp rax, [r15 + 8]
+    jne 1f
+    add r12, 4                              // bit2: bytes match the staged source
+1:
+    // (3) a File handle WITHOUT CAP_READ (pre-endowed, backed by a real descriptor) -> -EACCES (the rights arm)
+    mov rax, 12                             // SYS_READ
+    mov rdi, 2                              // U6BX_NOCAP_IDX
+    mov rsi, r14
+    mov rdx, 16
+    syscall
+    cmp rax, -13                            // exactly -EACCES ?
+    jne 2f
+    add r12, 8                              // bit3: no-CAP_READ File -> -EACCES
+2:
+    // (4) a non-File handle (a Socket carrying CAP_READ, pre-endowed) -> -EACCES (the kind arm)
+    mov rax, 12                             // SYS_READ
+    mov rdi, 3                              // U6BX_SOCK_IDX
+    mov rsi, r14
+    mov rdx, 16
+    syscall
+    cmp rax, -13
+    jne 3f
+    add r12, 16                             // bit4: wrong-kind handle -> -EACCES
+3:
+    mov rax, 2                              // SYS_EXIT(witness) -> routed by name into U6BX_WITNESS
+    mov rdi, r12
+    syscall
+4:  jmp 4b                                  // sys_exit never returns; belt-and-braces guard
+
+    .balign 8
+unaos_user_u6bx_namelen:
+    .quad unaos_user_u6bx_name_end - unaos_user_u6bx_name
+unaos_user_u6bx_name:
+    .ascii "HELLO.BIN"
+unaos_user_u6bx_name_end:
+    .globl unaos_user_u6bx_blob_end
+unaos_user_u6bx_blob_end:
+"#
+);
+
+unsafe extern "C" {
+    static unaos_user_u6bx_blob_start: u8;
+    static unaos_user_u6bx_blob_end: u8;
+    static unaos_user_u6bx_file: u8;
+}
+
 // --- The SYSCALL entry stub (LSTAR target). Naked; the only assembly in the syscall path.
 //
 // On entry (CPL 0, from SYSCALL): rcx = user RIP, r11 = user RFLAGS, rax = number, rdi/rsi/rdx =
@@ -697,6 +801,13 @@ pub fn record_ring3_kill(name: &str, vec: u8, err: u64, cr2: u64) {
         U6X_KILLED.fetch_add(1, Ordering::AcqRel);
         return;
     }
+    // U6bx: a killed File-handle fixture — off the U1b counter (a kill here is a real U6bx bug that fails
+    // the U6bx verdict, not a phantom U1b regression). It is not in PROCS (the launcher spawned it, not
+    // sys_spawn), so no parent semaphore to post — the launcher times out to FAIL on `U6BX_DONE`.
+    if name == "u6bx-file" {
+        U6BX_KILLED.fetch_add(1, Ordering::AcqRel);
+        return;
+    }
     let code_end = USER_BASE + PAGE_SIZE; // the code page is the first page of the window only
     let window_end = USER_BASE + USER_WINDOW_PAGES * PAGE_SIZE;
     let expected = match name {
@@ -744,6 +855,8 @@ extern "C" fn syscall_dispatch(nr: u64, a0: u64, a1: u64, a2: u64) -> i64 {
         SYS_SPAWN => sys_spawn(),
         SYS_WAIT => sys_wait(a0),
         SYS_CAP => sys_cap(a0, a1, a2),
+        SYS_OPEN => sys_open(a0, a1),
+        SYS_READ => sys_read(a0, a1, a2),
         SYS_EXIT => {
             // U4x: a spawned CHILD's exit is reaped by its parent's sys_wait through the Proc table,
             // keyed by pid — NOT by any counter and NOT by the handle (the handle is the parent's-side
@@ -806,6 +919,13 @@ extern "C" fn syscall_dispatch(nr: u64, a0: u64, a1: u64, a2: u64) -> i64 {
                     // Stored for the launcher's verdict; `U6X_DONE` gates the read.
                     U6X_WITNESS.store(a0 as u32, Ordering::Release);
                     U6X_DONE.fetch_add(1, Ordering::AcqRel);
+                }
+                Some("u6bx-file") => {
+                    // U6bx: the File-handle fixture conveys its 5-bit witness bitmask as its exit STATUS
+                    // (routed by name, same as u5x-cap/u6x-spawn — x86 has no SYS_REPORT). Stored for the
+                    // launcher's verdict; `U6BX_DONE` gates the read.
+                    U6BX_WITNESS.store(a0 as u32, Ordering::Release);
+                    U6BX_DONE.fetch_add(1, Ordering::AcqRel);
                 }
                 Some(n) if n.starts_with("u3-") => {
                     // U3 per-process-CR3 fixture task exiting (its own accounting, so the U1a/U1b
@@ -1586,7 +1706,12 @@ const EAGAIN: i64 = -11; // the process table (or slot pool, or handle table) is
 const ENODEV: i64 = -19; // no program staged (no block device / no HELLO.BIN at stage time)
 // U5x capability errnos.
 const EACCES: i64 = -13; // a capability check failed — no such handle / wrong kind / missing right / amplify
-const EINVAL: i64 = -22; // a SYS_CAP sub-op selector that is neither GRANT nor REVOKE
+const EINVAL: i64 = -22; // a SYS_CAP sub-op neither GRANT nor REVOKE; a malformed SYS_OPEN name length
+// U6bx File-handle errnos (the aarch64 U6b set, minus the mount/dir codes a staged set cannot produce).
+const EFAULT: i64 = -14; // a user range outside the window (or, for a SYS_READ dest, not writable within it)
+const ENOENT: i64 = -2; // SYS_OPEN: no staged file by that name (the staged set is the x86 "volume")
+const EIO: i64 = -5; // SYS_READ: a live descriptor over an unstaged source — a kernel bug; fail closed
+const EMFILE: i64 = -24; // SYS_OPEN: the caller's open-file table is full
 
 /// A killed child's Proc status: a nonzero sentinel the child-KILL path stores so a killed child still
 /// WAKES its parent's sys_wait — but with status != 0, so the parent's witness reads FAIL (a killed
@@ -1631,6 +1756,242 @@ fn stage_hello() -> bool {
     HELLO_LEN.store(bytes.len(), Ordering::Release);
     HELLO_STAGED.store(true, Ordering::Release); // publish the bytes (a later sys_spawn Acquires this)
     true
+}
+
+// =============================================================================================
+// U6bx: REAL File handles — the staged-file set + per-task open-file descriptors + SYS_OPEN/SYS_READ
+// (the aarch64 pi4 U6b twin, keyed by SLOT/row instead of ASID).
+// =============================================================================================
+//
+// pi4's U6b reads the disk INSIDE the SVC handler — its EMMC2 driver is PIO, so an in-handler FAT walk is
+// just MMIO polling. x86 CANNOT mirror that: storage is USB-over-xHCI, whose BOT read pump `hlt()`s
+// awaiting the transfer event, and the SYSCALL handler runs IF-masked (SFMASK) — an in-handler disk read
+// would sleep a core that can never wake (the exact U4x sys_spawn divergence; the STORAGE / IF NOTE
+// above). The honest x86 scope: `SYS_OPEN` opens a file from the BSP-STAGED set — files the BSP pre-read
+// at IF=1 over the proven U2 FAT path — and `SYS_READ` serves the staged bytes. The CAPABILITY layer (the
+// File kind + CAP_READ + the single `handle_resolve` CHECK, the descriptor sidecars, the reserve-last/
+// unwind open, the teardown-clear) is byte-for-byte the pi4 twin; ONLY the source of the bytes differs.
+// Arbitrary-runtime-file open awaits an interrupt-driven / IF-safe storage path (deferred).
+
+/// The staged-file NAME table: index k names the source `staged_bytes(k)` serves. ONE entry today —
+/// HELLO.BIN, the buffer `stage_hello` fills for sys_spawn (shared; written once, then read-only). A
+/// future file rides by adding its name here + a stage buffer + a `staged_bytes` arm.
+const STAGED_NAMES: [&str; 1] = ["HELLO.BIN"];
+/// Upper bound on a SYS_OPEN name (the aarch64 twin's `MAX_NAME`): a dotted 8.3 name is at most 12 bytes.
+const MAX_NAME: usize = 12;
+
+/// The staged bytes behind staged-file `idx`, or `None` if that stage has not published. Index 0 =
+/// HELLO.BIN = `HELLO_BYTES[..HELLO_LEN]`, gated by `HELLO_STAGED` (Acquire, pairing with the
+/// `stage_hello` Release) — written ONCE on the BSP before any consumer could hold a descriptor, then
+/// read-only, so the returned slice is stable for the rest of the boot (the sys_spawn contract).
+fn staged_bytes(idx: u32) -> Option<&'static [u8]> {
+    match idx {
+        0 if HELLO_STAGED.load(Ordering::Acquire) => {
+            let len = HELLO_LEN.load(Ordering::Acquire);
+            Some(unsafe { core::slice::from_raw_parts((&raw const HELLO_BYTES).cast::<u8>(), len) })
+        }
+        _ => None,
+    }
+}
+
+/// Look a validated name up in the staged set: `Some((staged idx, size))` iff that file is staged NOW.
+/// The size comes from the staged bytes (not a directory entry) — the staged set IS the x86 "volume".
+fn staged_lookup(name: &str) -> Option<(u32, u32)> {
+    for (k, n) in STAGED_NAMES.iter().enumerate() {
+        if *n == name {
+            return staged_bytes(k as u32).map(|b| (k as u32, b.len() as u32));
+        }
+    }
+    None
+}
+
+// --- Per-task open-file descriptors: parallel atomic sidecars keyed `[row][idx]` exactly like
+// HANDLES/HANDLE_RIGHTS/HANDLE_KIND (`SHARED_ROW` included), so a File handle's value word carries only
+// the +1-biased descriptor index (never the `0`/`u64::MAX` sentinels). Access is single-writer per row at
+// any instant — a row is populated ONLY before its task is dispatched (`u6bx_launcher`'s pre-endow) or BY
+// that one task mid-syscall (IF-masked), and cleared at teardown after the task exits — so the
+// Release/Acquire discipline is belt-and-braces (the HANDLE_RIGHTS twin). Presence is a dedicated
+// `FILE_USED` flag (NOT an overloaded index sentinel), so descriptor 0 is representable. Read-only,
+// sequential (no seek) — the arc's scope, mirroring pi4 U6b. ---
+const NFILE: usize = 4; // open files per task (small, static — the demo opens at most two per row)
+
+/// Per-descriptor presence: `true` == `[row][idx]` holds a live open file. Claimed (CAS false->true) in
+/// `files_alloc`, cleared in `files_free`/`clear_files_row`. The single source of truth for "is this
+/// file-id valid" — `sys_read` re-checks it after decoding a handle's file-id (defense in depth).
+static FILE_USED: [[AtomicBool; NFILE]; crate::arch::memory::USER_SLOTS + 1] =
+    [const { [const { AtomicBool::new(false) }; NFILE] }; crate::arch::memory::USER_SLOTS + 1];
+/// The open file's STAGED-SET index (which staged source serves it — the x86 stand-in for pi4's
+/// `FILE_CLUSTER` chain head). Meaningful only where `FILE_USED`.
+static FILE_STAGED: [[AtomicU32; NFILE]; crate::arch::memory::USER_SLOTS + 1] =
+    [const { [const { AtomicU32::new(0) }; NFILE] }; crate::arch::memory::USER_SLOTS + 1];
+/// The open file's total byte size (the EOF bound `sys_read` clamps against). Meaningful only where `FILE_USED`.
+static FILE_SIZE: [[AtomicU32; NFILE]; crate::arch::memory::USER_SLOTS + 1] =
+    [const { [const { AtomicU32::new(0) }; NFILE] }; crate::arch::memory::USER_SLOTS + 1];
+/// The sequential read offset — advanced by exactly the count each `sys_read` delivers. Meaningful only
+/// where `FILE_USED`. No seek this arc: the offset only ever moves forward.
+static FILE_OFFSET: [[AtomicU32; NFILE]; crate::arch::memory::USER_SLOTS + 1] =
+    [const { [const { AtomicU32::new(0) }; NFILE] }; crate::arch::memory::USER_SLOTS + 1];
+
+/// Claim the first free descriptor in the caller's FILES row for a freshly-opened file, returning its
+/// index (the caller biases it to the file-id `idx + 1`). Publishes staged-idx/size/offset after the
+/// `FILE_USED` CAS claim — safe because a resolver only reaches a descriptor via a File HANDLE, which
+/// `sys_open` installs strictly AFTER this returns (stored Release regardless, belt-and-braces — the pi4
+/// `files_alloc` discipline). `None` if the row is full (-> `-EMFILE`; never grown).
+fn files_alloc(row: usize, staged_idx: u32, size: u32) -> Option<usize> {
+    debug_assert!(row < FILE_USED.len(), "files_alloc: row out of range");
+    for k in 0..NFILE {
+        if FILE_USED[row][k].compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire).is_ok()
+        {
+            FILE_STAGED[row][k].store(staged_idx, Ordering::Release);
+            FILE_SIZE[row][k].store(size, Ordering::Release);
+            FILE_OFFSET[row][k].store(0, Ordering::Release);
+            return Some(k);
+        }
+    }
+    None
+}
+
+/// Release descriptor `idx` in the caller's FILES row — the unwind for a `sys_open` that allocated a
+/// descriptor but then failed to install its handle (the sys_spawn reserve/unwind discipline). Clears the
+/// fields then drops `FILE_USED` LAST (Release), so the slot is never seen free with stale fields.
+fn files_free(row: usize, idx: usize) {
+    debug_assert!(row < FILE_USED.len() && idx < NFILE, "files_free: out of range");
+    FILE_STAGED[row][idx].store(0, Ordering::Release);
+    FILE_SIZE[row][idx].store(0, Ordering::Release);
+    FILE_OFFSET[row][idx].store(0, Ordering::Release);
+    FILE_USED[row][idx].store(false, Ordering::Release);
+}
+
+/// Clear an ENTIRE per-task open-file row at teardown — the file twin of `clear_handle_row`'s handle wipe
+/// (which calls this). Presence dropped last per descriptor, so no torn intermediate looks live. `slot`
+/// is a PRIVATE slot (0..USER_SLOTS); `SHARED_ROW` is never torn down (its opens persist, like its caps).
+fn clear_files_row(slot: usize) {
+    debug_assert!(slot < crate::arch::memory::USER_SLOTS, "clear_files_row: not a private slot");
+    for k in 0..NFILE {
+        FILE_STAGED[slot][k].store(0, Ordering::Release);
+        FILE_SIZE[slot][k].store(0, Ordering::Release);
+        FILE_OFFSET[slot][k].store(0, Ordering::Release);
+        FILE_USED[slot][k].store(false, Ordering::Release);
+    }
+}
+
+/// True iff the entire FILES row for `row` is free — the U6bx teardown-clear verifier (the file twin of
+/// `handle_row_is_clear`, the aarch64 `files_row_is_clear` twin). Read by `u6bx_launcher` after the
+/// fixture exits and its slot retires: teardown clears the row, transitioning this false->true, proving
+/// no open file outlives its owning slot.
+fn files_row_is_clear(row: usize) -> bool {
+    debug_assert!(row < FILE_USED.len(), "files_row_is_clear: row out of range");
+    (0..NFILE).all(|k| !FILE_USED[row][k].load(Ordering::Acquire))
+}
+
+/// SYS_OPEN(name_ptr, name_len) -> a handle index, or a negative errno. The FIRST resource-OPEN through
+/// the object table (the aarch64 U6b twin): validate + copy the name, look it up in the STAGED set,
+/// record an open-file descriptor in the caller's FILES row, and install a `File` handle (first-free)
+/// carrying `CAP_READ` — the capability a later SYS_READ presents.
+///
+/// Ordering mirrors the twin (and sys_spawn): every fallible READ-ONLY lookup first (name bound/copy,
+/// staged lookup), so a failure there returns with nothing to unwind; RESOURCES claimed last (a
+/// descriptor, then a handle). The one failure that must unwind is a full handle table AFTER a descriptor
+/// was claimed — `files_free` it, then `-EAGAIN`. Errnos: `-EINVAL` (bad name length), `-EFAULT` (name
+/// range outside the window), `-ENOENT` (not in the staged set — non-UTF-8 names match nothing),
+/// `-EMFILE` (FILES row full), `-EAGAIN` (handle table full).
+fn sys_open(name_ptr: u64, name_len: u64) -> i64 {
+    let row = caller_row();
+    // 1. Bound + copy the name — the sys_write pointer discipline: the WHOLE range inside the user
+    //    window (overflow rejected), then a bounded direct read (ring-3 VA == kernel VA in the live CR3).
+    let n = name_len as usize;
+    if n == 0 || n > MAX_NAME {
+        return EINVAL;
+    }
+    let window = USER_WINDOW_PAGES * PAGE_SIZE;
+    let end = name_ptr.wrapping_add(name_len);
+    if end < name_ptr || name_ptr < USER_BASE || end > USER_BASE + window {
+        return EFAULT;
+    }
+    let mut namebuf = [0u8; MAX_NAME];
+    namebuf[..n].copy_from_slice(unsafe { core::slice::from_raw_parts(name_ptr as *const u8, n) });
+    let Ok(name) = core::str::from_utf8(&namebuf[..n]) else {
+        return ENOENT; // a non-UTF-8 name matches no staged entry
+    };
+    // 2. Read-only lookup — nothing claimed yet, so a miss returns cleanly.
+    let Some((sidx, size)) = staged_lookup(name) else {
+        return ENOENT;
+    };
+    // 3. Claim resources LAST — a descriptor, then a handle. Only a full handle table needs unwinding.
+    let Some(fid) = files_alloc(row, sidx, size) else {
+        return EMFILE; // this task's open-file row is full
+    };
+    let file_id = (fid + 1) as u64; // +1 bias: never the value word's 0 (Empty) / u64::MAX (RESERVING)
+    let Some(h) = handle_install(row, HANDLE_RESERVING) else {
+        files_free(row, fid); // no handle slot — release the descriptor we just claimed (no leak)
+        return EAGAIN;
+    };
+    // Publish the kind + rights, then the live file-id LAST (Release) — a resolver that observes the live
+    // value also observes File + CAP_READ. Single-writer over this row (mid-syscall); belt-and-braces.
+    handle_set_kind(row, h, KIND_FILE);
+    handle_set_rights(row, h, CAP_READ);
+    handle_set(row, h, file_id);
+    h as i64
+}
+
+/// SYS_READ(handle, buf, len) -> the byte count (`0` = EOF), or a negative errno. The object table's
+/// first resource-read CHECK on a non-Console object: `handle_resolve(row, handle, CAP_READ)` must yield
+/// a `File`. A missing right (`Denied`), a non-File kind (Console/Child/Socket), or no handle (Empty/oob)
+/// ALL return `-EACCES` — the single enforcement point, the twin of `sys_write`'s Console+CAP_WRITE. Then
+/// it clamps the request to the bytes left from the descriptor's offset, validates the WHOLE destination
+/// up front (a bad buffer is `-EFAULT` with no copy and NO offset change), serves the bytes from the
+/// staged source (the honest x86 divergence — see the section note), and advances the offset by exactly
+/// the count delivered. Sequential — no seek.
+fn sys_read(handle: u64, buf: u64, len: u64) -> i64 {
+    let row = caller_row();
+    // The CHECK: File + CAP_READ, or -EACCES. Identical shape to sys_write's Console + CAP_WRITE resolve.
+    let file_id = match handle_resolve(row, handle, CAP_READ) {
+        Ok(HandleTarget::File(id)) => id,
+        _ => return EACCES,
+    };
+    // Decode the file-id -> descriptor index (undo the +1 bias) and re-check presence (defense in depth:
+    // a live File handle always has a live descriptor, but never trust the value word blindly).
+    let Some(idx) = (file_id as usize).checked_sub(1) else {
+        return EACCES;
+    };
+    if idx >= NFILE || !FILE_USED[row][idx].load(Ordering::Acquire) {
+        return EACCES;
+    }
+    let size = FILE_SIZE[row][idx].load(Ordering::Acquire);
+    let offset = FILE_OFFSET[row][idx].load(Ordering::Acquire);
+    // Bytes available from the current offset, clamped to the request. `offset` advances only by
+    // delivered counts and never exceeds `size`, so the subtraction cannot underflow; 0 = clean EOF.
+    let want = core::cmp::min(len as usize, size.saturating_sub(offset) as usize);
+    if want == 0 {
+        return 0; // EOF, or the caller requested nothing
+    }
+    // Validate the WHOLE destination BEFORE any copy — and it must be WRITABLE user memory: inside the
+    // window AND past the read-only code page (page 0 is ring3-RX/RO; a kernel store there would either
+    // fault under CR0.WP or corrupt W^X-protected code — excluded by construction, the x86 stand-in for
+    // the twin's `user_range_ok(.., writable)`). A bad buffer is -EFAULT with no copy, no offset move.
+    let window_end = USER_BASE + USER_WINDOW_PAGES * PAGE_SIZE;
+    let end = buf.wrapping_add(want as u64);
+    if end < buf || buf < USER_BASE + PAGE_SIZE || end > window_end {
+        return EFAULT;
+    }
+    // Serve from the staged source (written once, read-only — stable across the whole boot).
+    let Some(src) = staged_bytes(FILE_STAGED[row][idx].load(Ordering::Acquire)) else {
+        return EIO; // a live descriptor over an unstaged source is a kernel bug; fail closed
+    };
+    // offset..offset+want lies inside the staged bytes: `size` was captured from this same source at
+    // open, the source never shrinks (written once), and offset only advances by delivered counts. The
+    // defensive clamp keeps even a violated assumption from over-reading the source.
+    let got = core::cmp::min(want, src.len().saturating_sub(offset as usize));
+    if got == 0 {
+        return 0; // treat a (impossible) source shrink as EOF rather than over-read
+    }
+    // The dest range was validated above and the ring-3 VA equals the kernel VA in the live CR3 (the
+    // sys_write discipline, write-side): a plain bounded copy into the caller's RW pages.
+    unsafe {
+        core::ptr::copy_nonoverlapping(src.as_ptr().add(offset as usize), buf as *mut u8, got);
+    }
+    FILE_OFFSET[row][idx].store(offset + got as u32, Ordering::Release);
+    got as i64
 }
 
 // --- The process table (pid-keyed): the parent's view of its children's lifecycle. ---
@@ -1950,6 +2311,10 @@ pub fn clear_handle_row(slot: usize) {
         HANDLE_RIGHTS[slot][i].store(0, Ordering::Release);
         HANDLE_KIND[slot][i].store(KIND_EMPTY, Ordering::Release);
     }
+    // U6bx: the slot's open-FILE row rides the same teardown (handles first, so no File handle can name a
+    // descriptor this wipe has already freed) — covers both the exit and the fault-kill path, exactly like
+    // the handles (the aarch64 `clear_handle_row` -> `clear_files_row` twin).
+    clear_files_row(slot);
 }
 
 /// Claim the first Empty slot in `HANDLES[slot]`, storing `value` (CAS 0->value), and return its index —
@@ -2249,6 +2614,31 @@ static U6X_KILLED: AtomicU32 = AtomicU32::new(0);
 static U6X_KINDS_OK: AtomicBool = AtomicBool::new(false);
 /// The full witness — all four object-table behaviours proven.
 const U6X_WITNESS_ALL: u32 = 0xF;
+/// Set once the U6x launcher has printed its verdict AND its slot has freed, so the U6bx launcher orders
+/// its lines AFTER U6x's and runs with a free slot (the `U5X_LAUNCH_DONE` idiom; the aarch64
+/// `U6_LAUNCH_DONE` twin).
+static U6X_LAUNCH_DONE: AtomicBool = AtomicBool::new(false);
+
+// --- U6bx demo accounting (real File handles; written by the exit/kill paths, read by the launcher's
+// verdict). ---
+/// The File-handle fixture's witness bitmask (its `sys_exit` status, routed by name). One bit per proven
+/// behaviour: open OK (bit0), 16-byte read OK (bit1), the read bytes match the staged source (bit2), a
+/// File handle WITHOUT `CAP_READ` -> `-EACCES` (bit3 — the rights arm), a non-File handle WITH `CAP_READ`
+/// -> `-EACCES` (bit4 — the kind arm). The verdict PASSes iff it equals `U6BX_WITNESS_ALL` AND the FILES
+/// row teardown-cleared.
+static U6BX_WITNESS: AtomicU32 = AtomicU32::new(0);
+/// 1 once the File-handle fixture reaches `sys_exit` (its witness is then valid). The launcher waits on
+/// this before reading `U6BX_WITNESS`.
+static U6BX_DONE: AtomicU32 = AtomicU32::new(0);
+/// Incremented if the File-handle fixture is KILLED (a fault) — any kill is a verdict FAIL.
+static U6BX_KILLED: AtomicU32 = AtomicU32::new(0);
+/// The full witness — all five File-handle behaviours proven (the aarch64 `U6B_WITNESS_ALL` twin).
+const U6BX_WITNESS_ALL: u32 = 0x1F;
+/// The handle indices `u6bx_launcher` pre-endows for the fixture's two negatives, off the allocator's
+/// first-free path (the fixture's own SYS_OPEN claims index 0; index 1 = the reserved `CONSOLE_FD`). The
+/// `mov rdi, {2,3}` operands in the fixture blob MUST match these (the aarch64 U6B_*_IDX twin).
+const U6BX_NOCAP_IDX: usize = 2;
+const U6BX_SOCK_IDX: usize = 3;
 
 /// U4x fixture run parameters: the parent's + orphan's ring-3 entry VAs (both inside the shared window
 /// VA — only the slot FRAME differs, via CR3), the shared initial user rsp, and each fixture's slot
@@ -2641,8 +3031,8 @@ fn u6x_kernel_check(slot: usize) -> bool {
 ///      its first `sys_wait`, so both pids are recorded first).
 ///   4. Verdict (folded): wait (bounded) for the fixture's exit (`U6X_DONE == 1`), then PASS iff its witness
 ///      == `U6X_WITNESS_ALL` (printed before AND after two spawns with no collision, both children reaped
-///      clean) AND the kernel-side check held AND no U6x kill. Prints ONE PASS line. U6x is the last demo, so
-///      it releases no further gate.
+///      clean) AND the kernel-side check held AND no U6x kill. Prints ONE PASS line, then releases the U6bx
+///      gate (`U6X_LAUNCH_DONE`) so the File-handle demo orders after this one.
 pub fn u6x_launcher(demo_cpu: usize) {
     // 1. Gate on the U5x launcher (its verdict printed + its slot freed), bounded + yielding.
     let wdeadline = crate::arch::ticks() + 10_000;
@@ -2658,12 +3048,14 @@ pub fn u6x_launcher(demo_cpu: usize) {
 
     // 2. No block device -> the children cannot be loaded; skip silently (mirrors U4x/U5x's control discipline).
     if crate::drivers::block::info().is_none() {
+        U6X_LAUNCH_DONE.store(true, Ordering::Release); // release the U6bx gate (it also gates on storage)
         return;
     }
 
     // 3. Build the fixture slot, run the kernel-side checks against its fresh row, then endow + spawn it.
     let Some(u6) = u6x_setup() else {
         serial_println!(":: U6x: no free address-space slot — object-table demo skipped ::");
+        U6X_LAUNCH_DONE.store(true, Ordering::Release); // release the U6bx gate even on the skip path
         return;
     };
     U6X_KINDS_OK.store(u6x_kernel_check(u6.slot), Ordering::Release);
@@ -2694,6 +3086,9 @@ pub fn u6x_launcher(demo_cpu: usize) {
             U6X_WITNESS_ALL
         );
     }
+    // Release the U6bx gate: the U6x verdict has printed and (the fixture having exited) the U6x slot has
+    // freed, so the U6bx launcher may build + endow its fixture slot and order its lines after ours.
+    U6X_LAUNCH_DONE.store(true, Ordering::Release);
 }
 
 /// U5x one-shot, fired from the main loop after `u4x_probe_once` (gated on storage like U4x, so the no-SD
@@ -2751,4 +3146,187 @@ pub fn u6x_probe_once() {
 
     let vcpu = online.get(1).copied().unwrap_or(cpu);
     crate::arch::sched::spawn("u6x-launch", u6x_launcher, cpu, vcpu, crate::arch::sched::PRIO_NORMAL);
+}
+
+/// U6bx fixture run parameters: the File-handle fixture's ring-3 entry VA (inside the shared window VA —
+/// only the slot FRAME differs, via CR3), the initial user rsp, its slot CR3, and its slot INDEX (so the
+/// launcher can pre-endow the fixture's table, plant the expected bytes through the slot's identity
+/// backing, and — after exit — verify the FILES-row teardown-clear).
+struct U6bxDemo {
+    file: u64,
+    sp: u64,
+    cr3: u64,
+    slot: usize,
+}
+
+/// U6bx setup: allocate + build ONE private slot, copy the U6bx blob into its code page through the
+/// identity alias (the slot's code page is RX-RO from the start — W^X by construction), and return the
+/// run params. Does NOT pre-endow — the launcher endows the two negative-test handles and plants the
+/// expected bytes after this returns (before dispatch, no concurrent resolver). Emits the U6bx setup
+/// line; `None` if slot allocation fails. Called ONCE from `u6bx_launcher`, after the U6x gate — so a
+/// slot is free and no task runs under the fixture's slot yet. Register-only fixture (writes no user
+/// stack; its writable targets are the data page and the kernel-planted page-2 prefix), one slot suffices.
+fn u6bx_setup() -> Option<U6bxDemo> {
+    let slot = crate::arch::memory::alloc_user_space()?;
+    let blob_start = &raw const unaos_user_u6bx_blob_start as usize;
+    let blob_end = &raw const unaos_user_u6bx_blob_end as usize;
+    let blob_len = blob_end - blob_start;
+    assert!(blob_len as u64 <= PAGE_SIZE, "U6bx blob does not fit in a code page");
+    let file_off = (&raw const unaos_user_u6bx_file as usize - blob_start) as u64;
+    let backing = crate::arch::memory::slot_backing_ptr(slot);
+    unsafe {
+        // Scrub the whole window (residue), then copy the blob into the code page (page 0) through the
+        // identity alias — never USER_BASE, so the code mapping stays read-only (W^X).
+        core::ptr::write_bytes(backing, 0, (USER_WINDOW_PAGES * PAGE_SIZE) as usize);
+        core::ptr::copy_nonoverlapping(blob_start as *const u8, backing, blob_len);
+    }
+    serial_println!(
+        ":: U6bx: real File handles — SYS_OPEN/SYS_READ routed through the object table (File + CAP_READ; BSP-staged source) ::"
+    );
+    Some(U6bxDemo {
+        file: USER_BASE + file_off,
+        sp: USER_BASE + USER_WINDOW_PAGES * PAGE_SIZE - 16,
+        cr3: crate::arch::memory::slot_cr3(slot),
+        slot,
+    })
+}
+
+/// U6bx launcher + verdict (the `u6x_launcher` shape: one gated kernel task on a scheduled sibling core).
+/// `demo_cpu` (the task arg) is the core the File-handle fixture runs on. Flow:
+///   1. Wait (bounded) for `U6X_LAUNCH_DONE`, so the U6bx lines land after the U6x verdict and the U6x
+///      slot has freed.
+///   2. Skip silently if no block device / nothing staged — the staged set backs both the fixture's own
+///      open AND the no-CAP_READ negative's descriptor (mirrors U4x/U5x/U6x's control-path discipline;
+///      `u6bx_probe_once` already staged or skipped with its own line).
+///   3. `u6bx_setup()` (build the fixture slot, print the setup line), then PRE-ENDOW its table + PLANT
+///      the expected bytes (all before dispatch, no concurrent resolver):
+///        - a File handle at `U6BX_NOCAP_IDX` backed by a REAL descriptor but with ZERO rights — the
+///          rights arm of the SYS_READ CHECK (a PRESENT File lacking `CAP_READ` must be `-EACCES`);
+///        - a `Socket` handle at `U6BX_SOCK_IDX` carrying `CAP_READ` — the kind arm (a non-File object
+///          with the right present must still be `-EACCES`);
+///        - the staged prefix (first 16 bytes) at window page 2, through the slot's identity backing.
+///      Then spawn `u6bx-file` on `demo_cpu`. From `u6bx_setup` on, EVERY path spawns the fixture (the
+///      pi4 U6b discipline: there is no free-an-undispatched-slot primitive, so a bail after the alloc
+///      would leak the slot — nothing after the alloc is allowed to fail out).
+///   4. Verdict (folded): wait (bounded) for the fixture's exit (`U6BX_DONE == 1`), read its witness,
+///      then wait (bounded) for its FILES row to clear — the file teardown-clear proof (the fixture exits
+///      holding TWO live descriptors: its own open + the pre-endowed no-cap backing, so
+///      `files_row_is_clear` transitions false->true when teardown runs). PASS iff witness ==
+///      `U6BX_WITNESS_ALL` AND the file row cleared AND no U6bx kill. Prints ONE PASS line. U6bx is the
+///      last demo, so it releases no further gate.
+pub fn u6bx_launcher(demo_cpu: usize) {
+    // 1. Gate on the U6x launcher (its verdict printed + its slot freed), bounded + yielding.
+    let wdeadline = crate::arch::ticks() + 10_000;
+    while !U6X_LAUNCH_DONE.load(Ordering::Acquire) && crate::arch::ticks() < wdeadline {
+        crate::arch::sched::yield_now();
+    }
+
+    // One-shot (spawned once; guard defensively).
+    static DONE: AtomicBool = AtomicBool::new(false);
+    if DONE.swap(true, Ordering::Relaxed) {
+        return;
+    }
+
+    // 2. No block device, or nothing staged -> the fixture could neither open nor be denied against a
+    //    real descriptor; skip silently (the probe already printed a skip line if staging failed).
+    if crate::drivers::block::info().is_none() || !HELLO_STAGED.load(Ordering::Acquire) {
+        return;
+    }
+
+    // 3. Build the fixture slot (allocates it + prints the setup line). From here EVERY path spawns.
+    let Some(u6b) = u6bx_setup() else {
+        serial_println!(":: U6bx: no free address-space slot — File-handle demo skipped ::");
+        return;
+    };
+    // 3a. The rights negative: a File handle backed by a REAL descriptor but carrying ZERO rights — a
+    //     PRESENT File lacking CAP_READ is exactly the rights arm of the CHECK, distinct from an absent
+    //     handle. `files_alloc` on the fixture's FRESH row cannot fail (NFILE free descriptors, cleared at
+    //     the prior teardown of this slot); if it somehow did, leave the index Empty — the fixture's read
+    //     still gets -EACCES (via NoHandle) and nothing leaks (the row rides teardown either way).
+    let staged_sz = HELLO_LEN.load(Ordering::Acquire) as u32;
+    if let Some(fid) = files_alloc(u6b.slot, 0, staged_sz) {
+        install_cap(u6b.slot, U6BX_NOCAP_IDX, KIND_FILE, (fid + 1) as u64, 0);
+    }
+    // 3b. The kind negative: a Socket handle carrying CAP_READ — it HAS the right, so the read is denied
+    //     purely on kind (SYS_READ serves File only). A scaffold id, no backing (never dereferenced).
+    install_cap(u6b.slot, U6BX_SOCK_IDX, KIND_SOCKET, 0x200, CAP_READ);
+    // 3c. Plant the expected prefix the fixture compares its read against — the first 16 staged bytes
+    //     into window page 2, through the slot's identity backing (never USER_BASE; the ring-3 mappings
+    //     stay exactly as built). The staged buffer is the arc's declared source of truth (the honest
+    //     divergence), so the bytes-match proves the FULL capability path delivers the source byte-exact
+    //     to ring 3; source->disk fidelity is U2's separately (metal-)proven FAT path — and sys_spawn's
+    //     children RUN these same staged bytes, a behavioral proof they are the real program. These plain
+    //     stores are ordered before the fixture can run by `spawn_user_in_space`'s run-queue publication
+    //     (x86-TSO + the queue lock), the same pre-dispatch discipline as the endowments above.
+    if let Some(src) = staged_bytes(0) {
+        let plant = core::cmp::min(16, src.len());
+        unsafe {
+            let dst = crate::arch::memory::slot_backing_ptr(u6b.slot).add(2 * PAGE_SIZE as usize);
+            core::ptr::copy_nonoverlapping(src.as_ptr(), dst, plant);
+        }
+    }
+    crate::arch::sched::spawn_user_in_space("u6bx-file", u6b.file, u6b.sp, demo_cpu, u6b.cr3);
+
+    // 4a. Wait (bounded, yielding) for the fixture to reach its exit, then snapshot the witness.
+    let vdeadline = crate::arch::ticks() + 5000;
+    while U6BX_DONE.load(Ordering::Acquire) < 1 && crate::arch::ticks() < vdeadline {
+        crate::arch::sched::yield_now();
+    }
+    let witness = U6BX_WITNESS.load(Ordering::Acquire);
+    let killed = U6BX_KILLED.load(Ordering::Acquire);
+
+    // 4b. FILES-row teardown-clear proof: the fixture exited holding two live descriptors, so its exit
+    //     path cleared the row (`clear_handle_row` -> `clear_files_row`). Poll (bounded) until it clears —
+    //     false->true when teardown runs. Nothing reuses the slot after (U6bx is the last demo).
+    let tdeadline = crate::arch::ticks() + 2000;
+    while !files_row_is_clear(u6b.slot) && crate::arch::ticks() < tdeadline {
+        crate::arch::sched::yield_now();
+    }
+    let files_cleared = files_row_is_clear(u6b.slot);
+
+    if witness == U6BX_WITNESS_ALL && files_cleared && killed == 0 {
+        serial_println!(
+            ":: U6bx: x86 real File handles — open+read via a File capability OK, no-CAP_READ -EACCES, wrong-kind -EACCES -> PASS ::"
+        );
+    } else {
+        serial_println!(
+            ":: U6bx: x86 real File handles FAIL — witness={:#x} files_cleared={} killed={} done={} (want {:#x} / true / 0 / 1) ::",
+            witness,
+            files_cleared,
+            killed,
+            U6BX_DONE.load(Ordering::Acquire),
+            U6BX_WITNESS_ALL
+        );
+    }
+}
+
+/// U6bx one-shot, fired from the main loop after `u6x_probe_once` (gated on storage like U4x/U5x/U6x). It
+/// spawns the U6bx launcher on a sibling AP; the launcher gates on `U6X_LAUNCH_DONE`, so ordering + the
+/// free-slot precondition hold regardless of interleave. The staged set backs both the fixture's SYS_OPEN
+/// and the no-CAP_READ negative's descriptor, so — like U4x/U6x — it needs HELLO.BIN staged:
+/// `u4x_probe_once` normally staged it long before; this re-stages defensively. Without a FAT
+/// volume/HELLO.BIN there is nothing to open, so the demo is skipped cleanly (no false FAIL).
+pub fn u6bx_probe_once() {
+    static DONE: AtomicBool = AtomicBool::new(false);
+    if DONE.load(Ordering::Relaxed) {
+        return;
+    }
+    if crate::drivers::block::info().is_none() {
+        return; // retry next loop iteration until storage enumerates (mirrors u4x/u5x/u6x_probe_once)
+    }
+    let online = crate::arch::smp::online_aps();
+    let Some(&cpu) = online.first() else {
+        DONE.store(true, Ordering::Relaxed);
+        serial_println!(":: U6bx: no application processor online — File-handle demo skipped ::");
+        return;
+    };
+    DONE.store(true, Ordering::Relaxed); // one-shot from here regardless of outcome
+
+    if !HELLO_STAGED.load(Ordering::Acquire) && !stage_hello() {
+        serial_println!(":: U6bx: HELLO.BIN not available — File-handle demo skipped ::");
+        return;
+    }
+
+    let vcpu = online.get(1).copied().unwrap_or(cpu);
+    crate::arch::sched::spawn("u6bx-launch", u6bx_launcher, cpu, vcpu, crate::arch::sched::PRIO_NORMAL);
 }

@@ -10,7 +10,42 @@ Legend: **✅ metal-confirmed** · **🔬 QEMU-green, metal pending** · dates I
 
 ---
 
-## hw-rmbp track — 2026-07-06 (landed on `hw-rmbp`, awaiting integration)
+## hw-rmbp track — 2026-07-07 (Campaign 1 — the round-13 sweep, Fable-executed)
+
+### U6bx — real File handles: `SYS_OPEN`/`SYS_READ` through the object table, served from the BSP-staged source (x86) 🔬 `hw-rmbp`
+- **What:** the x86 twin of pi4 U6b — makes U6x's `File` **scaffold** real, bringing the arches to
+  File-handle parity: `SYS_OPEN = 11` mints a `File` handle carrying `CAP_READ` (first-free, skipping the
+  reserved `CONSOLE_FD`; per-task FILES descriptor sidecars keyed `[row][idx]`, file-id = descriptor
+  index + 1 so the value word stays clear of the `0`/`u64::MAX` sentinels); `SYS_READ = 12` is the
+  enforcement point — `handle_resolve(row, handle, CAP_READ)` must yield a `File`, and a missing right /
+  wrong kind / absent handle **all** return `-EACCES` (the `sys_write` Console+`CAP_WRITE` twin). Whole-
+  destination validated up front as writable window memory (`-EFAULT`, no offset advance); offset-exact
+  sequential reads, `0` = EOF; teardown-clear extends `clear_handle_row` to the FILES row (exit + kill).
+- **The honest x86 divergence (the U4x pattern):** pi4 reads the disk INSIDE the SVC handler (EMMC2 is
+  PIO). x86 cannot — the xHCI BOT read pump `hlt()`s and the SYSCALL handler is IF-masked — so `SYS_OPEN`
+  serves the **BSP-staged set** (pre-read at IF=1 over the proven U2 FAT path; HELLO.BIN today, the same
+  `stage_hello` buffer `sys_spawn` uses) and `SYS_READ` serves the staged bytes. The capability layer is
+  byte-for-byte the pi4 twin; only the source of the bytes differs. Arbitrary-runtime-file open awaits an
+  IF-safe / interrupt-driven x86 storage arc (which retires the divergence entirely).
+- **Tested — QEMU:** `./arroyo test-fat sf 180` → after the U6x PASS line: the U6bx setup line and
+  `:: U6bx: x86 real File handles — open+read via a File capability OK, no-CAP_READ -EACCES, wrong-kind
+  -EACCES -> PASS ::` (13/13 PASS lines, 0 fault lines). The `u6bx-file` fixture opens HELLO.BIN, reads
+  16 bytes through the cap and verifies them against the kernel-planted staged prefix, then proves both
+  denial arms (a real-descriptor File with ZERO rights; a Socket WITH `CAP_READ`) — witness `0x1F`; the
+  launcher proves the FILES-row teardown-clear kernel-side. **U1a/U1b/U2/U2.5/U3/U3.5/U4x/U5x/U6x all
+  PASS byte-identical** (stash-free scratch-worktree baseline diff vs `e74dcb9` — pure append: no-FAT
+  `32a33`, test-fat `37a38,39`); default no-FAT `./arroyo test` stays MISSION SUCCESS with U6bx skipping
+  cleanly. `./arroyo check` both arches; **0 aarch64 files touched** (main.rs additions cfg-gated x86).
+- **Honest scope:** the pre-staged set only; read-only, no seek/write/dirs. Deferred: x86 U7 (the pi4 U7
+  twin), IF-safe storage (the divergence-retiring arc), real Socket routing, PCID, copy_from_user.
+- **Metal:** pending (pure syscall logic; the staged source rides U2's metal-confirmed FAT path).
+- **Review:** five-lens adversarial panel (cap-check / unwind / bounds / concurrency / regression) +
+  refuter verification — **0 must-fix**, 2 deferrable notes ledgered in `SECURITY.md` (the non-atomic
+  `FILE_OFFSET` advance under concurrent same-SHARED_ROW readers; REVOKE orphaning a File descriptor —
+  both shapes shared with the merged pi4 twin; both fold into U7/U7x).
+- **Commit:** on `hw-rmbp` (Campaign 1, Fable-executed; multi-lens adversarial review before merge).
+
+## hw-rmbp track — 2026-07-06 (merged round 12, `9cc0326`)
 
 ### U6x — the general object table: `(kind, target, rights)`, first-free for all kinds, `CONSOLE_FD` collision closed (x86) 🔬 `hw-rmbp`
 - **What:** the x86 twin of aarch64 U6a — generalizes U5x's fixed-shape handle into a general **object
