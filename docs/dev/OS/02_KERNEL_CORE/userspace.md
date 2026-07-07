@@ -270,6 +270,35 @@
   U4/M7's metal-confirmed EMMC2 path). Lane: `arch/aarch64/syscall.rs` + a `main.rs` launcher — no
   `boot.rs` change (`clear_handle_row` already wipes the whole row), no scheduler primitive, no
   driver, no x86 file.
+- **U6b** — **real `File` handles**: `SYS_OPEN`/`SYS_READ` routed through the object table via
+  `File` + `CAP_READ` (makes U6a's `File` scaffold real — the first resource syscall on a
+  **non-Console** object, the precursor to UnaFS grants). **`SYS_OPEN = 11`**`(name_ptr, name_len)`
+  `copy_from_user`s the bounded 8.3 name, mounts the single **read-only** FAT volume, finds the
+  top-level entry (a directory ⇒ `-EISDIR`, missing ⇒ `-ENOENT`), records a per-task **open-file
+  descriptor**, and installs a `File` handle carrying `CAP_READ`; **`SYS_READ = 12`**`(handle, buf,
+  len)` is the CHECK — `handle_resolve(asid, handle, CAP_READ)` must yield a `File` (a missing right,
+  a non-File kind, or no handle all ⇒ `-EACCES`, the twin of `sys_write`'s Console+`CAP_WRITE`) — then
+  clamps to `min(len, size − offset)`, validates the destination (`user_range_ok(.., writable=true)`;
+  a bad buffer ⇒ `-EFAULT`, no read, **no offset advance**), reads via a read-only offset-aware FAT
+  reader (`fat::read_at`; `read_file` left byte-identical), `copy_to_user`s, and advances the offset
+  by the count delivered (`0` = EOF; **sequential, no seek**). The descriptor lives in a per-task
+  **FILES table** — parallel atomic arrays `FILE_USED`/`FILE_CLUSTER`/`FILE_SIZE`/`FILE_OFFSET` keyed
+  `[asid][idx]` (`NFILE = 4`), the same sidecar shape as `HANDLE_RIGHTS`/`HANDLE_KIND`; the `File`
+  handle's value word carries the **file-id = descriptor index + 1** (the `+1` keeps it clear of the
+  `0`/`u64::MAX` sentinels). `sys_open` claims resources last (mirroring `sys_spawn`'s reserve/unwind
+  — a full handle table after a descriptor was claimed frees it then `-EAGAIN`, no leak).
+  Teardown-clear now folds files in: `clear_handle_row` also clears the FILES row, so a reused ASID
+  sees no stale file. Evidence — `./arroyo kernel8-test` → after the U6 PASS line, the `el0-u6bfile`
+  fixture opens `HELLO.BIN`, reads it through the `File` capability and verifies the bytes against the
+  kernel-planted on-disk prefix, then proves the CHECK denies both a present File lacking `CAP_READ`
+  (rights arm) and a `Socket` carrying `CAP_READ` (kind arm) with `-EACCES` — witness `0x1F`; the
+  launcher proves the file-row teardown-clear kernel-side: `:: U6b: real File handles — open+read via
+  a File capability OK, no-CAP_READ -EACCES, wrong-kind -EACCES -> PASS ::`. Every
+  M6b/M6d/M6e/M6f/M6g/U4/U5/U6 line byte-identical (the shared FAT mount does not regress M6g/U4),
+  CAPSTONE 6/6, 0 unexpected faults. No metal this arc unless flashed (the FAT/SD read is
+  metal-confirmed via M6g/U4; the syscall layer is QEMU-verifiable). Scope: read-only, flat root, one
+  volume — no write/create/delete, no seek, no dir ops. Lane: `arch/aarch64/syscall.rs` + a `main.rs`
+  launcher + a read-only `fs/fat.rs` helper — no `boot.rs` change, no scheduler primitive, no x86 file.
 - Not yet (U7): cross-process **bandy handle-transfer** between principals (`SYS_XFER` — a
   cross-ASID write discipline that breaks U6's single-writer invariant) and cross-process
   **revocation trees** (`CAP_REVOKE` as a right is defined but reserved), plus real `File`/`Socket`

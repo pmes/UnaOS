@@ -79,6 +79,13 @@ impl DirEntry {
         me.len() == other.len()
             && me.iter().zip(other.bytes()).all(|(a, b)| a.eq_ignore_ascii_case(&b))
     }
+
+    /// The entry's first data cluster — the chain head a `read_at` walk starts from (U6b: `SYS_OPEN`
+    /// stores this in its per-task file-descriptor table so a later `SYS_READ` needs no re-scan of the
+    /// directory). Read-only accessor; `0` for an empty/zero-length file (never a valid data cluster).
+    pub fn first_cluster(&self) -> u32 {
+        self.first_cluster
+    }
 }
 
 /// Parse one 512-byte directory sector, appending real file/dir entries to `out`. Returns `true`
@@ -610,6 +617,83 @@ impl FatFs {
             let next = self.fat_entry(cluster)?;
             if self.is_eoc(next) {
                 break; // chain ended before de.size (malformed) — return the short read
+            }
+            if self.is_bad(next) || next < 2 {
+                return Err(FatError::BadChain);
+            }
+            cluster = next;
+            hops += 1;
+            if hops > self.count_of_clusters {
+                return Err(FatError::BadChain); // chain longer than the volume has clusters -> loop
+            }
+        }
+        Ok(())
+    }
+
+    /// Read up to `max` bytes of a file into `out`, starting at byte offset `start` within the file,
+    /// given the file's first cluster and byte size (the two fields U6b's `SYS_OPEN` records so a later
+    /// `SYS_READ` need not re-scan the directory). Sequential-only: it walks the chain from the first
+    /// cluster, skipping whole clusters/sectors up to `start`, then copies `min(max, size - start)`
+    /// bytes. Read-only — never writes the FAT, directory, or data. Stops at `size`, `start + max`, or
+    /// end-of-chain; guards against bad/free clusters and chain loops exactly as `read_file`.
+    ///
+    /// This is the offset-aware twin of `read_file`; `read_file` is deliberately left untouched (its
+    /// M6g/U4 `load_program_into_slot` caller reads whole programs from offset 0 and must stay
+    /// byte-identical). `read_at(fc, size, 0, out, max)` delivers the same bytes `read_file` would for a
+    /// non-directory entry, so the two share no code by design, not by divergence.
+    pub fn read_at(
+        &self,
+        first_cluster: u32,
+        size: u32,
+        start: u32,
+        out: &mut alloc::vec::Vec<u8>,
+        max: usize,
+    ) -> Result<(), FatError> {
+        if start >= size {
+            return Ok(()); // at or past EOF — nothing to read (a legal 0-byte result)
+        }
+        // Total bytes to deliver: from `start` to the earlier of EOF and `start + max`. `start < size`
+        // above, so `end > start` and `want >= 1` here.
+        let end = core::cmp::min(size as usize, (start as usize).saturating_add(max));
+        let mut want = end - start as usize;
+        let mut skip = start as usize; // bytes still to skip before the first delivered byte
+        if want == 0 {
+            return Ok(()); // caller requested 0 bytes
+        }
+        if !self.valid_cluster(first_cluster) {
+            return Err(FatError::BadChain);
+        }
+        let clus_bytes = self.sec_per_clus as usize * SECTOR_SIZE;
+        let mut cluster = first_cluster;
+        let mut hops = 0u32;
+        let mut buf = [0u8; SECTOR_SIZE];
+        'chain: loop {
+            if !self.valid_cluster(cluster) {
+                return Err(FatError::BadChain);
+            }
+            if skip >= clus_bytes {
+                // The whole cluster is before `start` — skip it without touching the disk.
+                skip -= clus_bytes;
+            } else {
+                for s in 0..self.sec_per_clus as u64 {
+                    if skip >= SECTOR_SIZE {
+                        skip -= SECTOR_SIZE; // this whole sector is still before `start`
+                        continue;
+                    }
+                    read_sector(self.cluster_lba(cluster) + s, &mut buf)?;
+                    let from = skip; // nonzero only on the first partially-skipped sector
+                    skip = 0;
+                    let take = core::cmp::min(want, SECTOR_SIZE - from);
+                    out.extend_from_slice(&buf[from..from + take]);
+                    want -= take;
+                    if want == 0 {
+                        break 'chain;
+                    }
+                }
+            }
+            let next = self.fat_entry(cluster)?;
+            if self.is_eoc(next) {
+                break; // chain ended before `end` (malformed vs `size`) — return the short read
             }
             if self.is_bad(next) || next < 2 {
                 return Err(FatError::BadChain);

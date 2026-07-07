@@ -59,6 +59,18 @@ const SYS_CAP: u64 = 10;
 /// (attenuated) or a negative errno. REVOKE: `a1`=handle idx to drop -> 0 or a negative errno.
 const CAP_OP_GRANT: u64 = 0;
 const CAP_OP_REVOKE: u64 = 1;
+/// U6b: open a disk file BY NAME under the object table. `a0`=name ptr (EL0), `a1`=name len -> a HANDLE
+/// index naming a `File` object carrying `CAP_READ`, or a negative errno. `copy_from_user`s the (bounded)
+/// name, mounts the single FAT volume, finds the top-level 8.3 entry, allocates a per-task file descriptor,
+/// and installs the File handle first-free. Read-only, flat root, one volume — the capability precursor to
+/// UnaFS grants. See `sys_open`.
+const SYS_OPEN: u64 = 11;
+/// U6b: read from an open File handle. `a0`=handle idx, `a1`=dest buf (EL0, writable), `a2`=len -> the byte
+/// count (`0` = EOF), or a negative errno. The CHECK: `handle_resolve(asid, handle, CAP_READ)` must yield a
+/// `File` — a missing right, a non-File kind, or no handle all give `-EACCES` (the object-table enforcement
+/// point, the twin of `sys_write`'s Console+CAP_WRITE). Sequential — the descriptor's offset advances by the
+/// count returned. See `sys_read`.
+const SYS_READ: u64 = 12;
 
 /// M6e demo: the sentinel `sys_exit` status the preemption spinner uses so its exit is accounted to
 /// `EL0_SPIN_DONE` and never perturbs the M6b `exited/killed` counters. Demo-only — there is no real
@@ -104,6 +116,24 @@ const U6_EXIT_STATUS: u64 = 0x76;
 /// kernel-side kind/no-collision check passed. Must match the `add x23, x23, #{1,2,4,8}` steps in
 /// `__u6_prog_spawn`.
 const U6_WITNESS_ALL: u64 = 0xF;
+/// U6b demo: the sentinel `sys_exit` status the File-handle fixture (`el0-u6bfile`) uses so ITS exit lands in
+/// `EL0_U6B_DONE`, never perturbing the M6b/M6d/M6e/M6f/M6g/U4/U5/U6 counters (same sentinel discipline).
+/// Distinct from every prior sentinel (0x6D/0x6E/0x6F/0x74/0x75/0x76) and 0; `0x77` is free (the retired M7
+/// demo once used it). Tested BEFORE the catch-all `else` in SYS_EXIT.
+const U6B_EXIT_STATUS: u64 = 0x77;
+/// U6b demo: the witness bitmask the File-handle fixture reports — one bit per proven behaviour: bit0
+/// open OK (`SYS_OPEN("HELLO.BIN")` -> handle >= 0), bit1 read OK (`SYS_READ` -> 16 bytes), bit2 bytes match
+/// the on-disk blob (the 16 read bytes equal the kernel-planted `USER_BLOB` prefix), bit3 a File handle
+/// LACKING `CAP_READ` -> `-EACCES` (the rights CHECK), bit4 a non-File handle (a `Socket` carrying `CAP_READ`)
+/// -> `-EACCES` (the kind CHECK). `u6b_launcher` PASSes iff it equals `U6B_WITNESS_ALL` (all five). Must match
+/// the `add x23, x23, #{1,2,4,8,16}` steps in `__u6b_prog_file`.
+const U6B_WITNESS_ALL: u64 = 0x1F;
+/// The handle indices `u6b_launcher` pre-endows in the fixture's table for its two negative checks, chosen
+/// off the reserved `CONSOLE_FD` (1) and off index 0 (which the fixture's own `SYS_OPEN` first-free-claims):
+/// a File handle WITHOUT `CAP_READ` (the rights negative) and a `Socket` handle WITH `CAP_READ` (the kind
+/// negative). The `mov x0, #{2,3}` operands in `__u6b_prog_file` MUST match these.
+const U6B_NOCAP_IDX: usize = 2;
+const U6B_SOCK_IDX: usize = 3;
 
 // --- The inline EL0 FIXTURES: three fault-SHAPE fixtures (M6b) + one preemption spinner (M6e). These
 // are fixtures, not programs, so they stay inline in the kernel image; only the well-behaved `hello`
@@ -691,6 +721,102 @@ unsafe extern "C" {
     static __u6_prog_spawn: u8;
 }
 
+// --- U6b inline EL0 fixture (real File handles). ONE fixture (`el0-u6bfile`) exercising the object table's
+// FIRST resource syscall on a non-Console object: it opens a disk file by name, reads it through the returned
+// File capability, and proves the SYS_READ CHECK rejects both a File handle stripped of `CAP_READ` (the rights
+// arm) and a non-File handle carrying `CAP_READ` (the kind arm). Position-independent; it writes NO user stack
+// (SYS_READ's dest and the compare targets are fixed DATA-page VAs the kernel wrote, not the stack), so it is
+// safe on any slot under preemption. `u6b_launcher` pre-endows its table (before dispatch, no concurrent
+// resolver): a File handle at index 2 backed by a real descriptor but with ZERO rights (the rights negative),
+// and a `Socket` handle at index 3 carrying `CAP_READ` (the kind negative); it also plants the expected on-disk
+// prefix (`USER_BLOB[..16]`) at the data-page VA the fixture compares against. The fixture's own `SYS_OPEN`
+// first-free-claims index 0 (index 1 = the reserved `CONSOLE_FD`, never auto-allocated). It builds a witness
+// bitmask in x23 (one bit per passed check) and SYS_REPORTs it, then exits with the U6b sentinel. ABI: x8=nr,
+// args x0-x2, ret x0. The `mov x2, #(9f-8f)` name length assembles to an immediate (the M6c idiom).
+core::arch::global_asm!(
+    r#"
+    .globl __u6b_blob_start
+__u6b_blob_start:
+    .balign 4
+    .globl __u6b_prog_file
+__u6b_prog_file:
+    mov  x23, xzr                          // witness bitmask = 0
+    adr  x9, __u6b_blob_start              // x9 = window base (blob copied at code-page offset 0)
+    add  x12, x9, #0x2000                  // x12 = read buffer VA (writable data page)
+    add  x13, x9, #0x3000                  // x13 = expected-bytes VA (data page; launcher plants USER_BLOB[..16])
+
+    // (0) open HELLO.BIN -> a File handle carrying CAP_READ
+    mov  x8, #11                           // SYS_OPEN
+    adr  x0, 8f                            // name ptr (in the RO code page — EL0-readable)
+    mov  x1, #(9f - 8f)                    // name len ("HELLO.BIN" = 9)
+    svc  #0
+    mov  x19, x0                           // x19 = handle (>=0) or -errno
+    tbnz x19, #63, 1f                      // open failed (negative) -> skip bit0/read/bytes
+    add  x23, x23, #1                      // bit0: open OK
+
+    // (1) read the first 16 bytes into the buffer
+    mov  x8, #12                           // SYS_READ
+    mov  x0, x19                           // handle
+    mov  x1, x12                           // dest buf
+    mov  x2, #16
+    svc  #0
+    cmp  x0, #16                           // exactly 16 bytes back?
+    b.ne 1f                                // short/failed read -> skip bit1/bytes
+    add  x23, x23, #2                      // bit1: read OK (16 bytes)
+
+    // (2) the 16 read bytes must equal the kernel-planted on-disk blob prefix (two 8-byte compares)
+    ldr  x10, [x12]
+    ldr  x11, [x13]
+    cmp  x10, x11
+    b.ne 1f
+    ldr  x10, [x12, #8]
+    ldr  x11, [x13, #8]
+    cmp  x10, x11
+    b.ne 1f
+    add  x23, x23, #4                      // bit2: bytes match the on-disk blob
+1:
+    // (3) a File handle WITHOUT CAP_READ (pre-endowed at index 2) must be denied -> -EACCES (the rights CHECK)
+    mov  x8, #12                           // SYS_READ
+    mov  x0, #2                            // U6B_NOCAP_IDX
+    mov  x1, x12
+    mov  x2, #16
+    svc  #0
+    cmn  x0, #13                           // x0 == -13 (-EACCES) ?
+    b.ne 2f
+    add  x23, x23, #8                      // bit3: no-CAP_READ File -> -EACCES
+2:
+    // (4) a non-File handle (a Socket carrying CAP_READ, pre-endowed at index 3) -> -EACCES (the kind CHECK)
+    mov  x8, #12                           // SYS_READ
+    mov  x0, #3                            // U6B_SOCK_IDX
+    mov  x1, x12
+    mov  x2, #16
+    svc  #0
+    cmn  x0, #13
+    b.ne 3f
+    add  x23, x23, #16                     // bit4: wrong-kind handle -> -EACCES
+3:
+    mov  x0, x23                           // SYS_REPORT(witness bitmask)
+    mov  x8, #3
+    svc  #0
+    mov  x8, #2                            // SYS_EXIT(U6B_EXIT_STATUS) -> EL0_U6B_DONE
+    movz x0, #0x77
+    svc  #0
+4:  b 4b                                   // sys_exit never returns; belt-and-braces guard
+    .balign 4
+8:  .ascii "HELLO.BIN"
+9:
+    .balign 4
+    .globl __u6b_blob_end
+__u6b_blob_end:
+"#
+);
+
+unsafe extern "C" {
+    static __u6b_blob_start: u8;
+    static __u6b_blob_end: u8;
+    static __u6b_prog_file: u8;
+}
+
 /// The `hello` EL0 program (M6c), built as a SEPARATE link product (`crates/user-blob`) and baked in
 /// as a flat binary instead of living in the kernel's `.text`. `arroyo kernel8` builds it — a naked,
 /// position-independent `sys_write("hello from EL0\n") + sys_exit(0)` routine — for the bare aarch64
@@ -929,6 +1055,21 @@ static U6_KINDS_OK: AtomicBool = AtomicBool::new(false);
 /// Set by `u5_launcher` at its every exit path (PASS/FAIL/skip) — the gate `u6_launcher` waits on so the U6
 /// lines land strictly AFTER the U5 verdict (and the U5 slot has freed). Mirrors the U4_LAUNCH_DONE idiom.
 static U5_LAUNCH_DONE: AtomicBool = AtomicBool::new(false);
+
+/// The U6b File-handle fixture's WITNESS bitmask (reported via SYS_REPORT): one bit per proven behaviour
+/// (see `U6B_WITNESS_ALL`). `u6b_launcher` PASSes iff it equals `U6B_WITNESS_ALL` (open+read+bytes-match via a
+/// File capability, and both the rights and kind SYS_READ denials).
+static U6B_WITNESS: AtomicU64 = AtomicU64::new(0);
+/// The U6b fixture (`el0-u6bfile`) reached its `0x77` sentinel exit (want 1). Read by `u6b_launcher`, which
+/// waits for it before judging — and, once set, the fixture's slot is torn down so its handle + file rows clear.
+static EL0_U6B_DONE: AtomicU32 = AtomicU32::new(0);
+/// A killed U6b task — a real bug (the File-handle fixture is well-behaved: it writes no stack and faults on
+/// nothing). Off the M6b `killed_unexpected` counter (see `record_el0_kill`), so a U6b fault fails only U6b.
+static EL0_U6B_KILLED: AtomicU32 = AtomicU32::new(0);
+/// Set by `u6_launcher` at its every exit path (PASS/FAIL/skip) — the gate `u6b_launcher` waits on so the U6b
+/// lines land strictly AFTER the U6 verdict (and the U6 slot has freed). Mirrors the U5_LAUNCH_DONE idiom. (U6
+/// was the last demo before U6b, so it previously released no gate; this is that release.)
+static U6_LAUNCH_DONE: AtomicBool = AtomicBool::new(false);
 
 /// Claim a FREE Proc entry, returning its index. CAS on `state` (FREE->RUNNING) is the atomic ownership
 /// token; the pid=0 placeholder is overwritten with the real child pid (Release) by the caller AFTER the
@@ -1223,6 +1364,11 @@ pub fn clear_handle_row(asid: u64) {
         HANDLE_RIGHTS[asid as usize][i].store(0, Ordering::Release);
         HANDLE_KIND[asid as usize][i].store(KIND_EMPTY, Ordering::Release);
     }
+    // U6b: wipe this ASID's open-file descriptors alongside its handles. A File handle is only usable through
+    // its descriptor (`sys_read` re-checks `FILE_USED`), so the handle clear above already denies any read;
+    // clearing the descriptors here reclaims the slots and guarantees a REUSED ASID starts with no stale file
+    // (no leaked offset, no aliasable descriptor). Same teardown site, same ordering guarantees as the handles.
+    clear_files_row(asid);
 }
 
 /// The ASID of the address space the caller is running in, read from `TTBR0_EL1[63:48]`. A syscall executes
@@ -1297,6 +1443,96 @@ fn handle_clear(asid: u64, idx: usize) {
     HANDLE_KIND[asid as usize][idx].store(KIND_EMPTY, Ordering::Release);
 }
 
+// ---------------------------------------------------------------------------------------------
+// U6b — the per-task OPEN-FILE table: what a `File` handle's value word points at
+// ---------------------------------------------------------------------------------------------
+//
+// A `File` handle (U6a's scaffold, now real) names a resource that needs per-open STATE the handle word alone
+// can't hold: which file (its chain head + byte size) and how far a sequential reader has advanced (its
+// offset). That state lives here, in a small per-task descriptor table keyed like `HANDLES` (`[asid][idx]`).
+// The `File` handle's value word carries the FILE-ID = `descriptor index + 1` (a small non-`0`, non-`u64::MAX`
+// word — the +1 bias keeps it clear of the value word's Empty/RESERVING sentinels, structurally, for any
+// index including 0). `handle_resolve` returns `File(file_id)`; `sys_read` decodes `idx = file_id - 1`.
+//
+// Shape mirrors the handle sidecars: parallel atomic arrays, no lock. Access is single-writer per row at any
+// instant — a row is populated ONLY before its task is dispatched (`u6b_launcher`'s pre-endow) or BY that one
+// task mid-syscall (`sys_open`/`sys_read`, IRQ-masked), and cleared at teardown after the task exits — so the
+// `Release`-store / `Acquire`-load discipline is the belt-and-braces (the same as `HANDLE_RIGHTS`/`_KIND`).
+// Presence is a dedicated `FILE_USED` flag (NOT an overloaded cluster sentinel) so a legal 0-cluster (empty)
+// file is representable without aliasing "free". Read-only, one FAT volume, no seek — the arc's scope.
+const NFILE: usize = 4; // open files per process (small, static — a demo opens at most two per row)
+
+/// Per-descriptor presence flag: `true` == this `[asid][idx]` slot holds a live open file. Claimed
+/// (`false`->`true`) in `files_alloc`, cleared in `files_free`/`clear_files_row`. The single source of truth
+/// for "is this file-id valid" — `sys_read` re-checks it after decoding a handle's file-id (defense in depth).
+static FILE_USED: [[AtomicBool; NFILE]; super::boot::USER_SLOTS + 1] =
+    [const { [const { AtomicBool::new(false) }; NFILE] }; super::boot::USER_SLOTS + 1];
+/// The open file's first data cluster (chain head for a `read_at` walk). Meaningful only where `FILE_USED`.
+static FILE_CLUSTER: [[AtomicU32; NFILE]; super::boot::USER_SLOTS + 1] =
+    [const { [const { AtomicU32::new(0) }; NFILE] }; super::boot::USER_SLOTS + 1];
+/// The open file's total byte size (the EOF bound `sys_read` clamps against). Meaningful only where `FILE_USED`.
+static FILE_SIZE: [[AtomicU32; NFILE]; super::boot::USER_SLOTS + 1] =
+    [const { [const { AtomicU32::new(0) }; NFILE] }; super::boot::USER_SLOTS + 1];
+/// The sequential read offset — advanced by the byte count each `sys_read` returns. Meaningful only where
+/// `FILE_USED`. No seek this arc: offset only ever moves forward, by exactly what was delivered.
+static FILE_OFFSET: [[AtomicU32; NFILE]; super::boot::USER_SLOTS + 1] =
+    [const { [const { AtomicU32::new(0) }; NFILE] }; super::boot::USER_SLOTS + 1];
+
+/// Claim the first free descriptor in `FILES[asid]` for a freshly-opened file, returning its index (the caller
+/// biases it to the file-id `idx + 1`). Publishes size/offset/cluster with the `FILE_USED` presence flag stored
+/// LAST (Release) — so a resolver that observes a live descriptor also observes its fields (mirrors the handle
+/// "publish the live word last" discipline). `None` if the row is full (-> `-EMFILE`; never grown).
+fn files_alloc(asid: u64, first_cluster: u32, size: u32) -> Option<usize> {
+    debug_assert!((asid as usize) < FILE_USED.len(), "files_alloc: asid out of range");
+    for k in 0..NFILE {
+        if FILE_USED[asid as usize][k]
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            // Fields first, presence already claimed above — but re-publish nothing that could be read as live
+            // before these land: the CAS made USED true, yet a resolver only reaches this descriptor via a File
+            // HANDLE, which `sys_open` installs strictly AFTER this returns, so no reader can observe the row
+            // between the CAS and these stores. Stored Release regardless (belt-and-braces).
+            FILE_CLUSTER[asid as usize][k].store(first_cluster, Ordering::Release);
+            FILE_SIZE[asid as usize][k].store(size, Ordering::Release);
+            FILE_OFFSET[asid as usize][k].store(0, Ordering::Release);
+            return Some(k);
+        }
+    }
+    None
+}
+
+/// Release descriptor `idx` in `FILES[asid]` — used to unwind a `sys_open` that allocated a descriptor but then
+/// failed to install its handle (mirrors `sys_spawn`'s reserve/unwind). Clears the fields then drops `FILE_USED`
+/// LAST (Release), so the slot is never seen free with stale fields.
+fn files_free(asid: u64, idx: usize) {
+    debug_assert!((asid as usize) < FILE_USED.len() && idx < NFILE, "files_free: out of range");
+    FILE_CLUSTER[asid as usize][idx].store(0, Ordering::Release);
+    FILE_SIZE[asid as usize][idx].store(0, Ordering::Release);
+    FILE_OFFSET[asid as usize][idx].store(0, Ordering::Release);
+    FILE_USED[asid as usize][idx].store(false, Ordering::Release);
+}
+
+/// Clear an ENTIRE per-task open-file row at teardown — the file twin of `clear_handle_row`'s handle wipe (it
+/// calls this). Presence dropped last per slot, so no torn intermediate looks live. `asid` is 1..=USER_SLOTS.
+fn clear_files_row(asid: u64) {
+    debug_assert!(asid >= 1 && (asid as usize) < FILE_USED.len(), "clear_files_row: asid out of range");
+    for k in 0..NFILE {
+        FILE_CLUSTER[asid as usize][k].store(0, Ordering::Release);
+        FILE_SIZE[asid as usize][k].store(0, Ordering::Release);
+        FILE_OFFSET[asid as usize][k].store(0, Ordering::Release);
+        FILE_USED[asid as usize][k].store(false, Ordering::Release);
+    }
+}
+
+/// True iff the entire `FILES[asid]` row is free — the U6b teardown-clear verifier (the file twin of
+/// `handle_row_is_clear`). Read by `u6b_launcher` after the fixture exits and its slot retires: teardown clears
+/// the row, transitioning this false->true, proving no open file outlives its owning ASID.
+fn files_row_is_clear(asid: u64) -> bool {
+    debug_assert!((asid as usize) < FILE_USED.len(), "files_row_is_clear: asid out of range");
+    (0..NFILE).all(|k| !FILE_USED[asid as usize][k].load(Ordering::Acquire))
+}
+
 /// U4: record a value a process-model fixture reported via SYS_REPORT, keyed by the reporting task's name —
 /// the PARENT's witness token and the ORPHAN's ownership result. Keyed by name like `m6d_report`/`m6f_report`;
 /// the SYS_REPORT arm calls all three and each ignores the others' tasks.
@@ -1321,6 +1557,14 @@ fn u5_report(value: u64) {
 fn u6_report(value: u64) {
     if super::sched::current_name() == Some("el0-u6spawn") {
         U6_WITNESS.store(value, Ordering::Release);
+    }
+}
+
+/// U6b: record the File-handle fixture's witness bitmask (SYS_REPORT), keyed by the reporting task's name.
+/// Called from the SYS_REPORT arm alongside the M6d/M6f/U4/U5/U6 reporters; each ignores the others' names.
+fn u6b_report(value: u64) {
+    if super::sched::current_name() == Some("el0-u6bfile") {
+        U6B_WITNESS.store(value, Ordering::Release);
     }
 }
 
@@ -1531,6 +1775,13 @@ pub fn record_el0_kill(name: &str, ec: u64, far: u64, far_valid: bool) {
     // killed U6 CHILD shares the `u4-child` name above — its kill posts a non-zero status that fails the reap.)
     if name == "el0-u6spawn" {
         EL0_U6_KILLED.fetch_add(1, Ordering::AcqRel);
+        return;
+    }
+    // U6b: the File-handle fixture is well-behaved (writes no stack, faults on nothing); a kill here is a real
+    // U6b bug. Route it to its own counter, never the M6b `killed_unexpected` count, so a U6b fault fails only
+    // the U6b verdict (its missing SYS_REPORT already leaves the witness incomplete).
+    if name == "el0-u6bfile" {
+        EL0_U6B_KILLED.fetch_add(1, Ordering::AcqRel);
         return;
     }
     let (base, size) = super::boot::user_region();
@@ -1918,6 +2169,7 @@ extern "C" fn aarch64_svc_handler(frame: *mut u64) {
             u4_report(a0);
             u5_report(a0);
             u6_report(a0);
+            u6b_report(a0);
             0
         }
         SYS_YIELD => sys_yield(),
@@ -1927,6 +2179,8 @@ extern "C" fn aarch64_svc_handler(frame: *mut u64) {
         SYS_SPAWN => sys_spawn(),
         SYS_WAIT => sys_wait(a0),
         SYS_CAP => sys_cap(a0, a1, a2),
+        SYS_OPEN => sys_open(a0, a1),
+        SYS_READ => sys_read(a0, a1, a2),
         SYS_EXIT => {
             // Demo accounting BEFORE the no-return exit. The sentinel statuses are routed to their own
             // counters so the M6b (`exited=1 killed=3`) and M6e (`completed=1`) verdicts stay byte-
@@ -1971,6 +2225,8 @@ extern "C" fn aarch64_svc_handler(frame: *mut u64) {
                 EL0_U5_DONE.fetch_add(1, Ordering::AcqRel);
             } else if a0 == U6_EXIT_STATUS {
                 EL0_U6_DONE.fetch_add(1, Ordering::AcqRel);
+            } else if a0 == U6B_EXIT_STATUS {
+                EL0_U6B_DONE.fetch_add(1, Ordering::AcqRel);
             } else if a0 == 0 {
                 EL0_EXITED_OK.fetch_add(1, Ordering::AcqRel);
             } else {
@@ -2203,6 +2459,8 @@ const E2BIG: i64 = -7; // the program is larger than one code page
 const ECHILD: i64 = -10; // sys_wait: no child with that pid
 const EAGAIN: i64 = -11; // the process table (or slot pool) is full
 const ENODEV: i64 = -19; // no block device / FAT volume to load from
+const EISDIR: i64 = -21; // sys_open: the named entry is a directory, not a file
+const EMFILE: i64 = -24; // sys_open: the caller's open-file (or handle) table is full
 
 /// A program successfully loaded into a fresh per-task slot: the EL0 entry VA, the initial SP_EL0, the
 /// slot's TTBR0, and (for the M6g loader's log line) the slot id, byte length, and FAT kind.
@@ -2456,6 +2714,126 @@ fn sys_cap_revoke(asid: u64, idx: u64) -> i64 {
     }
     handle_clear(asid, idx as usize);
     0
+}
+
+/// The longest name `sys_open` accepts: a FAT 8.3 short name is at most "NAMENAME.EXT" = 8 + '.' + 3 = 12
+/// bytes. A longer request cannot name a real entry, so it is rejected as malformed rather than truncated.
+const MAX_NAME: usize = 12;
+
+/// SYS_OPEN(name_ptr, name_len) -> a File-handle index, or a negative errno. The first resource syscall routed
+/// through a NON-Console object: it makes U6a's `File` scaffold real. `copy_from_user`s the (bounded) 8.3 name,
+/// mounts the single read-only FAT volume, finds the top-level entry, records an open-file descriptor in the
+/// caller's per-task FILES row, and installs a `File` handle (first-free) carrying `CAP_READ` — the capability
+/// a later `SYS_READ` presents. Returns the handle index EL0 reads/waits on.
+///
+/// Ordering mirrors `load_program_into_slot`/`sys_spawn`: do every fallible READ-ONLY lookup first (name copy,
+/// mount, find, dir-reject), so a failure there returns with nothing to unwind; claim RESOURCES last (a file
+/// descriptor, then a handle). The one failure that must unwind is a full handle table AFTER a descriptor was
+/// claimed — free the descriptor, then `-EAGAIN`. Errnos: `-EINVAL` (bad name length), `-EFAULT` (bad name
+/// pointer), `-ENODEV`/`-EIO` (mount failure), `-ENOENT` (no such file), `-EISDIR` (a directory), `-EMFILE`
+/// (open-file table full), `-EAGAIN` (handle table full). Read-only, flat root, one volume — scope by design.
+fn sys_open(name_ptr: u64, name_len: u64) -> i64 {
+    let asid = current_asid();
+    // 1. Bound + copy the name. A 0-length or over-8.3 request is malformed (-EINVAL); copy_from_user validates
+    //    the whole source range up front, so a bad/oob pointer is -EFAULT with no deref.
+    let n = name_len as usize;
+    if n == 0 || n > MAX_NAME {
+        return EINVAL;
+    }
+    let mut namebuf = [0u8; MAX_NAME];
+    if copy_from_user(&mut namebuf[..n], name_ptr, n).is_err() {
+        return EFAULT;
+    }
+    let Ok(name) = core::str::from_utf8(&namebuf[..n]) else {
+        return ENOENT; // a non-ASCII/UTF-8 name matches no 8.3 entry
+    };
+    // 2. Read-only lookups — nothing claimed yet, so each failure returns cleanly.
+    let fs = match crate::fs::fat::mount() {
+        Ok(fs) => fs,
+        Err(crate::fs::fat::FatError::NoDisk) => return ENODEV,
+        Err(_) => return EIO,
+    };
+    let de = match fs.find_in_root(name) {
+        Ok(de) => de,
+        Err(crate::fs::fat::FatError::NotFound) => return ENOENT,
+        Err(_) => return EIO,
+    };
+    if de.is_dir {
+        return EISDIR; // a directory is not readable through a File handle (no dir ops this arc)
+    }
+    // 3. Claim resources LAST — a descriptor, then a handle. Only a full handle table needs unwinding.
+    let Some(fid) = files_alloc(asid, de.first_cluster(), de.size) else {
+        return EMFILE; // this task's open-file table is full
+    };
+    let file_id = (fid + 1) as u64; // +1 bias: never the value word's 0 (Empty) / u64::MAX (RESERVING) sentinel
+    let Some(h) = handle_install(asid, HANDLE_RESERVING) else {
+        files_free(asid, fid); // no handle slot — release the descriptor we just claimed (no leak)
+        return EAGAIN;
+    };
+    // Publish the kind + rights, then the live file-id LAST (Release) — so the handle is never observed live
+    // without its File kind and CAP_READ. Single-writer over this row (mid-syscall), so this is belt-and-braces.
+    handle_set_kind(asid, h, KIND_FILE);
+    handle_set_rights(asid, h, CAP_READ);
+    handle_set(asid, h, file_id);
+    h as i64
+}
+
+/// SYS_READ(handle, buf, len) -> the byte count (`0` = EOF), or a negative errno. The object table's first
+/// resource-read CHECK on a non-Console object: `handle_resolve(asid, handle, CAP_READ)` must yield a `File`.
+/// A missing right (`Denied`), a non-File kind (Console/Child/Socket), or no handle (Empty/oob) ALL return
+/// `-EACCES` — the single enforcement point, the twin of `sys_write`'s Console+CAP_WRITE. Then it clamps the
+/// request to the bytes left from the descriptor's offset, validates the WHOLE destination up front (a bad
+/// buffer is `-EFAULT` with no read and NO offset change), reads through the read-only offset-aware FAT reader,
+/// `copy_to_user`s the bytes, and advances the offset by exactly the count delivered. Sequential — no seek.
+fn sys_read(handle: u64, buf: u64, len: u64) -> i64 {
+    let asid = current_asid();
+    // The CHECK: File + CAP_READ, or -EACCES. Identical shape to sys_write's Console + CAP_WRITE resolve.
+    let file_id = match handle_resolve(asid, handle, CAP_READ) {
+        Ok(HandleTarget::File(id)) => id,
+        _ => return EACCES,
+    };
+    // Decode the file-id -> descriptor index (undo the +1 bias) and re-check presence (defense in depth: a live
+    // File handle always has a live descriptor, but never trust the value word blindly).
+    let Some(idx) = (file_id as usize).checked_sub(1) else {
+        return EACCES;
+    };
+    if idx >= NFILE || !FILE_USED[asid as usize][idx].load(Ordering::Acquire) {
+        return EACCES;
+    }
+    let size = FILE_SIZE[asid as usize][idx].load(Ordering::Acquire);
+    let offset = FILE_OFFSET[asid as usize][idx].load(Ordering::Acquire);
+    // Bytes available from the current offset, clamped to the request. `offset` is advanced only by delivered
+    // counts and never exceeds `size`, so `size - offset` cannot underflow; `want == 0` is a clean EOF.
+    let want = core::cmp::min(len as usize, size.saturating_sub(offset) as usize);
+    if want == 0 {
+        return 0; // EOF, or the caller requested nothing
+    }
+    // Validate the WHOLE destination BEFORE any disk read — a bad buffer is -EFAULT with no I/O, no offset move.
+    if !user_range_ok(buf, want, true) {
+        return EFAULT;
+    }
+    // Re-mount (as sys_spawn does — the single volume is deterministic, so the descriptor's cluster/size stay
+    // valid across mounts) and read `want` bytes from `offset` via the read-only offset-aware reader.
+    let fs = match crate::fs::fat::mount() {
+        Ok(fs) => fs,
+        Err(crate::fs::fat::FatError::NoDisk) => return ENODEV,
+        Err(_) => return EIO,
+    };
+    let cluster = FILE_CLUSTER[asid as usize][idx].load(Ordering::Acquire);
+    let mut bytes: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
+    if fs.read_at(cluster, size, offset, &mut bytes, want).is_err() {
+        return EIO;
+    }
+    let got = bytes.len();
+    if got == 0 {
+        return 0; // a short chain (malformed vs size) yielded nothing here — treat as EOF
+    }
+    // got <= want, and buf..buf+want was validated above, so this copy always passes; the check is defensive.
+    if copy_to_user(buf, &bytes, got).is_err() {
+        return EFAULT; // offset NOT advanced — a rejected buffer leaves the file position unchanged
+    }
+    FILE_OFFSET[asid as usize][idx].store(offset + got as u32, Ordering::Release);
+    got as i64
 }
 
 // =============================================================================================
@@ -2987,12 +3365,14 @@ pub fn u6_launcher(demo_cpu: usize) {
 
     // 2. No SD device -> the children cannot be loaded; skip silently (mirrors U4/U5's control discipline).
     if crate::drivers::block::info().is_none() {
+        U6_LAUNCH_DONE.store(true, Ordering::Release); // release the U6b gate (U6b also gates on the SD)
         return;
     }
 
     // 3. Build the fixture slot, run the kernel-side checks against its fresh row, then endow + spawn it.
     let Some(u6) = u6_setup() else {
         serial_println!(":: U6: no free address-space slot — object-table demo skipped ::");
+        U6_LAUNCH_DONE.store(true, Ordering::Release); // release the U6b gate
         return;
     };
     U6_KINDS_OK.store(u6_kernel_check(u6.asid), Ordering::Release);
@@ -3024,6 +3404,181 @@ pub fn u6_launcher(demo_cpu: usize) {
             killed,
             EL0_U6_DONE.load(Ordering::Acquire),
             U6_WITNESS_ALL
+        );
+    }
+    // Release the U6b gate: the U6 verdict line has printed and the U6 slot has freed, so `u6b_launcher` may
+    // now run its File-handle demo (its lines land strictly after this).
+    U6_LAUNCH_DONE.store(true, Ordering::Release);
+}
+
+// =============================================================================================
+// U6b: real File handles — the File-handle fixture's slot + pre-endowment + the gated launcher/verdict
+// =============================================================================================
+
+/// The U6b fixture's run parameters: the File-handle fixture's EL0 entry VA (inside the shared window VA — only
+/// the slot FRAME differs, via TTBR0), the initial SP_EL0, its slot TTBR0, its ASID (so the launcher can
+/// pre-endow the fixture's table and, after exit, verify the file-row teardown-clear), and its SLOT id (so the
+/// launcher can plant the expected on-disk prefix through the slot's identity backing).
+struct U6bDemo {
+    file: u64,
+    sp: u64,
+    ttbr0: u64,
+    asid: u64,
+    slot: usize,
+}
+
+/// U6b setup: allocate + build ONE private slot, copy the U6b blob into its code page, I-cache-sync, protect it
+/// EL0-RX/EL1-RO, and return the run params. Does NOT pre-endow — the launcher endows the two negative-test
+/// handles and plants the expected bytes after this returns (before dispatch, no concurrent resolver). Emits the
+/// U6b setup line; `None` if slot allocation fails. Called ONCE from `u6b_launcher`, after the U6 gate — so a
+/// slot is free and no task runs under the fixture's ASID yet. Register-only fixture (writes no user stack; its
+/// only writable target is a kernel-filled data page), so one slot suffices.
+fn u6b_setup() -> Option<U6bDemo> {
+    let (base, size) = super::boot::user_region();
+    let sp = (base + size as u64) & !0xF; // 16-aligned window top = initial SP_EL0
+    let bstart = &raw const __u6b_blob_start as usize;
+    let bend = &raw const __u6b_blob_end as usize;
+    let blen = bend - bstart;
+    assert!(blen <= super::boot::USER_CODE_SIZE, "U6b blob does not fit in a code page");
+    let file = {
+        let va = base + (&raw const __u6b_prog_file as usize - bstart) as u64;
+        assert!(va & 3 == 0, "U6b fixture entry misaligned"); // an eret to a misaligned entry is EC 0x22
+        va
+    };
+    let slot = super::boot::alloc_user_slot()?;
+    let backing = super::boot::slot_backing_ptr(slot);
+    unsafe { core::ptr::copy_nonoverlapping(bstart as *const u8, backing, blen) };
+    super::cache::icache_sync_range(backing as usize, blen);
+    unsafe { super::boot::protect_user_slot_code(slot, super::boot::USER_CODE_SIZE) };
+    let ttbr0 = super::boot::slot_ttbr0(slot);
+    let asid = ttbr0 >> 48;
+    serial_println!(
+        ":: U6b: real File handles — SYS_OPEN/SYS_READ routed through the object table (File + CAP_READ) ::"
+    );
+    Some(U6bDemo { file, sp, ttbr0, asid, slot })
+}
+
+/// U6b launcher + verdict (the `u6_launcher` shape: one gated kernel task on a sibling core). `demo_cpu` (the
+/// task arg) is the core the File-handle fixture runs on. Flow:
+///   1. Wait (bounded) for `U6_LAUNCH_DONE`, so the U6b lines land after the U6 verdict and the U6 slot freed.
+///   2. Skip silently if no SD device — the fixture reads a real disk file (as U4/U6's children do).
+///   3. `u6b_setup()` (build the fixture slot, print the setup line), then PRE-ENDOW its table + PLANT the
+///      expected bytes (all before dispatch, no concurrent resolver):
+///        - a File handle at `U6B_NOCAP_IDX` backed by a real open-file descriptor but with ZERO rights — the
+///          rights arm of the SYS_READ CHECK (a PRESENT File lacking `CAP_READ` must be `-EACCES`);
+///        - a `Socket` handle at `U6B_SOCK_IDX` carrying `CAP_READ` — the kind arm (a non-File object with the
+///          right present must still be `-EACCES`);
+///        - the on-disk prefix `USER_BLOB[..16]` at the data-page VA the fixture's bytes-match compares against
+///          (`HELLO.BIN` on the boot media IS `USER_BLOB`, so a correct read reproduces it), published with a
+///          `dsb ish` before the fixture's core is dispatched.
+///      Then spawn `el0-u6bfile` on `demo_cpu`.
+///   4. Verdict (folded): wait (bounded) for the fixture's sentinel exit (`EL0_U6B_DONE == 1`), read its witness
+///      bitmask, then wait (bounded) for its FILE row to clear — the file-row teardown-clear proof (the fixture
+///      exits holding TWO live descriptors: its own open + the pre-endowed no-cap File, so `files_row_is_clear`
+///      transitions false->true when teardown runs). PASS iff witness == `U6B_WITNESS_ALL` AND the file row
+///      cleared AND no U6b kill. Prints ONE PASS line. U6b is the last demo, so it releases no further gate.
+pub fn u6b_launcher(demo_cpu: usize) {
+    // 1. Gate on the U6 launcher (its verdict printed + the U6 slot freed).
+    let wstart = super::timer::cntpct();
+    let wdeadline = 10 * super::timer::cntfrq();
+    while !U6_LAUNCH_DONE.load(Ordering::Acquire)
+        && super::timer::cntpct().wrapping_sub(wstart) <= wdeadline
+    {
+        super::sched::yield_now();
+    }
+
+    // One-shot (spawned once; guard defensively).
+    static DONE: AtomicBool = AtomicBool::new(false);
+    if DONE.swap(true, Ordering::Relaxed) {
+        return;
+    }
+
+    // 2. No SD device -> the fixture cannot read a disk file; skip silently (mirrors U4/U5/U6's control path).
+    if crate::drivers::block::info().is_none() {
+        return;
+    }
+
+    // 3. Pre-flight the ONE fallible disk lookup — HELLO.BIN's chain head + size, backing the rights-negative
+    //    File descriptor — BEFORE allocating a slot, following `load_program_into_slot`'s discipline (fallible
+    //    lookups first, resource alloc last). Doing it here means a lookup failure (SD present but HELLO.BIN
+    //    unmountable / absent / a directory) skips with NOTHING allocated to unwind — no leaked address-space
+    //    slot (there is no free-an-undispatched-slot primitive, so the fix is to not allocate before this).
+    let (nocap_fc, nocap_sz) = match crate::fs::fat::mount()
+        .and_then(|fs| fs.find_in_root("HELLO.BIN").map(|de| (de.first_cluster(), de.size, de.is_dir)))
+    {
+        Ok((fc, sz, false)) => (fc, sz),
+        _ => {
+            serial_println!(
+                ":: U6b: pre-open of HELLO.BIN for the no-CAP_READ negative failed — File-handle demo skipped ::"
+            );
+            return;
+        }
+    };
+
+    // 4. Build the fixture slot (allocates it + prints the setup line). From here EVERY path spawns the fixture,
+    //    so the slot is always reached by teardown at the fixture's exit — no undispatched-slot leak below.
+    let Some(u6b) = u6b_setup() else {
+        serial_println!(":: U6b: no free address-space slot — File-handle demo skipped ::");
+        return;
+    };
+    // 4a. The rights negative: install a File handle at U6B_NOCAP_IDX backed by a real descriptor but carrying
+    //     ZERO rights. A PRESENT File lacking CAP_READ is exactly the rights arm of the CHECK — distinct from an
+    //     absent handle. `files_alloc` on the fixture's FRESH row cannot fail (NFILE free slots, cleared at the
+    //     prior teardown of this ASID); if it somehow did, leave index 2 Empty (the fixture's read still gets
+    //     -EACCES, via NoHandle) and spawn anyway — never a leak, never a return-without-spawn.
+    if let Some(fid) = files_alloc(u6b.asid, nocap_fc, nocap_sz) {
+        install_cap(u6b.asid, U6B_NOCAP_IDX, KIND_FILE, (fid + 1) as u64, 0);
+    }
+    // 4b. The kind negative: a Socket handle carrying CAP_READ at U6B_SOCK_IDX. It HAS the right, so the read is
+    //     denied purely on kind (SYS_READ serves File only) — the kind arm, not the rights arm. A scaffold id,
+    //     no backing (never resolved as a real socket this arc).
+    install_cap(u6b.asid, U6B_SOCK_IDX, KIND_SOCKET, 0x200, CAP_READ);
+    // 4c. Plant the expected on-disk prefix the fixture compares its read against. Written through the slot's
+    //     identity backing (the documented data-sentinel path — coherent with the EL0 read at the aliased VA on
+    //     this PIPT A72); `dsb ish` completes/publishes it to the fixture's core before dispatch.
+    let plant_len = core::cmp::min(16, USER_BLOB.len());
+    unsafe {
+        let dst = super::boot::slot_backing_ptr(u6b.slot).add(0x3000);
+        core::ptr::copy_nonoverlapping(USER_BLOB.as_ptr(), dst, plant_len);
+        core::arch::asm!("dsb ish", options(nostack, preserves_flags));
+    }
+    super::sched::spawn_user_slot("el0-u6bfile", u6b.file, u6b.sp, u6b.ttbr0, demo_cpu);
+
+    // 4a. Wait (bounded ~5 s, yielding) for the fixture to reach its sentinel exit, then snapshot the witness.
+    let vstart = super::timer::cntpct();
+    let vdeadline = 5 * super::timer::cntfrq();
+    while EL0_U6B_DONE.load(Ordering::Acquire) < 1
+        && super::timer::cntpct().wrapping_sub(vstart) <= vdeadline
+    {
+        super::sched::yield_now();
+    }
+    let witness = U6B_WITNESS.load(Ordering::Acquire);
+    let killed = EL0_U6B_KILLED.load(Ordering::Acquire);
+
+    // 4b. File-row teardown-clear proof: the fixture exited holding two live descriptors, so its exit path
+    //     cleared the FILES row (via `clear_handle_row` -> `clear_files_row`). Poll (bounded) until it clears —
+    //     false->true when teardown runs. Nothing reuses the slot after (U6b is the last demo), so it stays clear.
+    let tstart = super::timer::cntpct();
+    let tdeadline = 2 * super::timer::cntfrq();
+    while !files_row_is_clear(u6b.asid)
+        && super::timer::cntpct().wrapping_sub(tstart) <= tdeadline
+    {
+        super::sched::yield_now();
+    }
+    let files_cleared = files_row_is_clear(u6b.asid);
+
+    if witness == U6B_WITNESS_ALL && files_cleared && killed == 0 {
+        serial_println!(
+            ":: U6b: real File handles — open+read via a File capability OK, no-CAP_READ -EACCES, wrong-kind -EACCES -> PASS ::"
+        );
+    } else {
+        serial_println!(
+            ":: U6b: real File handles FAIL — witness={:#x} files_cleared={} killed={} done={} (want {:#x} / true / 0 / 1) ::",
+            witness,
+            files_cleared,
+            killed,
+            EL0_U6B_DONE.load(Ordering::Acquire),
+            U6B_WITNESS_ALL
         );
     }
 }
