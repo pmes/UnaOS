@@ -10,6 +10,44 @@ Legend: **✅ metal-confirmed** · **🔬 QEMU-green, metal pending** · dates I
 
 ---
 
+## hw-pi4 track — 2026-07-07 (Campaign 2, Fable-executed)
+
+### U8 — revocation trees + generation-tagged inboxes: revoke chases derived capabilities; the sys_xfer TOCTOU closes (aarch64) 🔬 `hw-pi4`
+- **What:** closes U7's two documented escapes. (1) A bounded static **derivation ledger**
+  (`MAX_DERIV = 16` nodes: state-exact CAS transitions over a `0`/`RESERVING`/unique-id word,
+  Release-publish/Acquire-read — the U7 discipline, no heap) records an edge child→parent at every
+  derive: `sys_cap_grant` (local mint) and `SYS_XFER`/`SYS_RECV` (delivered transfer; the node rides
+  the inbox slot and the sender-owned record). Revoke = mark ONE node; `handle_resolve` walks
+  child→root (bounded, cycle-free by construction) and denies if ANY ancestor is revoked — **no revoke
+  path ever writes another ASID's row** (U7's stale-at-use pattern, generalized). `CAP_REVOKE` gets its
+  real semantics: `SYS_CAP` REVOKE of a handle CARRYING it kills the whole derivation subtree
+  (re-grants + re-transfers, however deep, exactly once, idempotently); without it the drop stays local
+  (U5 semantics, unchanged). XREVOKE marks the transfer's node too (id-guarded against reclaim ABA), so
+  a re-transferred-onward cap dies with the root transfer — the U7 escape, closed. Node lifetime:
+  frees on handle-drop when childless, else a **tombstone** until the subtree drains (cascading,
+  CAS-arbitrated free). (2) **Generation-tagged inboxes:** a per-ASID generation word bumps at teardown
+  (before the sweep); deposits stamp it, RECV delivers only on an exact match, the sender post-check
+  re-reads it — recipient-exit + ASID-recycle + new-tenant-consume inside the deposit window can no
+  longer deliver to the wrong tenant, from either side.
+- **Tested — QEMU:** `./arroyo kernel8-test 30` → after the U7 PASS: the U8 setup line, both fixture
+  prints, and `:: U8: revocation trees — parent revoke kills re-grant + re-transfer, generation-tagged
+  inbox, ledger clean -> PASS ::`. The `el0-u8tree` fixture (register-only, single slot) proves witness
+  `0xF`: grant→re-grant chain works pre-revoke; parent revoke (with `CAP_REVOKE`) → 0 and its double
+  revoke → exactly `-ECHILD`; BOTH descendants `-EACCES` at next use; a right-less revoke stays local
+  (the derived copy still writes) + its own double-revoke errno. `u8_kernel_check` drives the REAL
+  `sys_xfer_from`/`sys_recv_for` code paths over scratch ASIDs: an S→R1→R2 re-transfer chain, root
+  XREVOKE ⇒ R1 **and** R2 stale + laundering refused; a deposit stamped before the teardown bump is
+  never delivered to the recycled ASID (record freed; a late XREVOKE honestly `-ENOENT`); afterwards
+  rows/inboxes/records/derivation ledger all provably clear. **Every prior verdict byte-identical**
+  (sorted scratch-worktree baseline diff vs `225ae48` — only the U8 lines + the binary-growth VBAR/ELR
+  shift differ), 19/19 prior PASS + U8 = 20, CAPSTONE 6/6, 0 unexpected faults; `./arroyo test-arm 22`
+  byte-identical; `./arroyo check` both arches; **zero x86 files**.
+- **Honest scope:** revocation + generations only. Deferred: the bandy Ring-3 delegation wrapper,
+  arbitrary recipients, `File` payload migration, real Socket syscalls, UnaFS `grants:*` on open. The
+  U7 RCsc-codegen footnote stands (the new code keeps the same ordering discipline).
+- **Metal:** none expected (pure syscall logic; rides the next Pi boundary with the battery).
+- **Commit:** on `hw-pi4` (Campaign 2, Fable-executed).
+
 ## hw-pi4 track — 2026-07-07 (Campaign 1 — the round-13 sweep, Fable-executed)
 
 ### U7 — cross-process capability transfer: inbox-mediated `SYS_XFER`/`SYS_RECV` + sender revoke, single-writer preserved (aarch64) 🔬 `hw-pi4`
