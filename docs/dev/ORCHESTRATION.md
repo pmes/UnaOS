@@ -149,11 +149,42 @@ self-driving template:
   rewritten (e.g. a reset+cherry-pick). **Never** advise a plain `git pull` on a
   rewritten branch — force-with-lease only.
 
+## Single-seat CAMPAIGN mode (adopted 2026-07-07, Peter's call — the current mode)
+
+The 3-parallel-Opus-executor model is dissolved: **Fable executes the arcs
+directly** as well as reviewing and merging, working with Peter in **campaigns**
+— long focused runs, each a coherent chapter with a base goal + stretch,
+leapfrogging across tracks by chapters (bring one track up, the next catches up
+with its twin or passes). What changes and what doesn't:
+
+- **The unit is the campaign, not the arc.** Internally it stays milestone'd
+  exactly as before: commit-sized milestones, each green + committed on its
+  track branch, targeted gates per milestone, one full battery at the
+  merge-window close. Batteries batch; blast radius doesn't grow.
+- **The adversarial multi-agent review is now the COI guard** — the seat
+  reviewing wrote the code, so the independent Workflow panel (lens reviewers +
+  refuter panels per must-fix) runs before EVERY merge, and confirmed must-fixes
+  are fixed in-arc and re-gated before the merge proceeds. Campaign 1's U7
+  panel confirming 2 must-fixes the author-seat had already gated green is the
+  standing proof this discipline is load-bearing.
+- **Checkpoint discipline:** a clean baton (commit + resume docs + memory) at
+  every milestone boundary, so context/credit exhaustion never strands work.
+- **Jetson campaigns are sized by attended-boot batches** (Peter's bench time is
+  the scarce complement): prep everything offline, batch questions per boot.
+- Unchanged: track branches + `--no-ff` merges to main, the DONE gates, docs
+  current by construction, **Peter attends metal and pushes — Fable never
+  pushes.** The one-unmerged-arc cap generalizes to one unmerged CAMPAIGN
+  milestone chain per track, merged in-order within the campaign.
+- The per-track briefs remain the arc contracts (STATUS flips to LANDED at
+  close); when a campaign spans tracks, the campaign plan file names the order.
+
 ## Guardrails specific to this seat
 
 - Fable reviews **before** merge and **before** metal, always. QEMU-green ≠
   correct; metal happens at arc boundaries (Peter).
-- Merge only reviewed arcs. A confirmed must-fix goes back to the track as a
+- Merge only reviewed arcs. In campaign mode a confirmed must-fix is fixed
+  in-arc by the executing seat and re-gated before the merge (the review panel
+  re-verifies the fix path); in executor mode it goes back to the track as a
   fresh brief, not patched by Fable on the track branch.
 - Keep the roadmap/security/userspace docs current *as arcs land* — docs stay
   correct by construction, not in a later sweep.
