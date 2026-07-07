@@ -809,6 +809,151 @@ unsafe extern "C" {
     static unaos_user_u7x_child: u8;
 }
 
+// --- U8x ring-3 fixture (revocation trees — the aarch64 `__u8_prog_tree` twin). ONE fixture (`u8x-tree`)
+// exercising the derivation-ledger semantics observable from a SINGLE process: a grant CHAIN (grant ->
+// re-grant) dies WHOLE when the PARENT capability — one carrying `CAP_REVOKE` — is revoked (the U7x escape
+// #1, closed locally); a revoke WITHOUT `CAP_REVOKE` keeps U5x's ownership semantics (drops only the
+// caller's own row entry — the derived copy survives); and a double revoke returns the correct errno with no
+// ledger corruption. The CROSS-process half (re-transfer cascade + generation-tagged inboxes) is proven
+// kernel-side by `u8_kernel_check` (it needs three cooperating processes — a fixture race would be staged,
+// not real). Position-independent, register-only apart from the RIP-relative message loads (writes no user
+// stack — safe on any slot under preemption). Pre-endowed by the launcher: index 2 = a console cap
+// `CAP_WRITE|CAP_GRANT|CAP_REVOKE` (the revocable parent), index 3 = a console cap `CAP_WRITE|CAP_GRANT`
+// (no CAP_REVOKE — the locality negative). It builds a witness bitmask in r12 (callee-saved, the u5x idiom)
+// and conveys it as its `sys_exit` STATUS, routed BY NAME into `U8X_WITNESS` (x86 has no SYS_REPORT — the
+// aarch64 twin uses one only because its sentinel exit status is reserved for demo routing). ABI
+// (Linux-style): rax = number, args rdi/rsi/rdx, return in rax; witness rides r12, the derived handles
+// r13/r14/r15 (all callee-saved — preserved across each `syscall`). Errnos: -EACCES=-13, -ECHILD=-10.
+core::arch::global_asm!(
+    r#"
+    .globl unaos_user_u8x_blob_start
+unaos_user_u8x_blob_start:
+    .balign 16
+    .globl unaos_user_u8x_tree
+unaos_user_u8x_tree:
+    xor  r12d, r12d                         // witness bitmask = 0 (callee-saved; survives syscalls)
+
+    // (0) the grant CHAIN: g1 = GRANT(src=2, CAP_WRITE|CAP_GRANT) -> g2 = GRANT(g1, CAP_WRITE) -> write
+    //     through g2 lands (a two-deep derived capability carries real authority pre-revoke)
+    mov  rax, 10                            // SYS_CAP
+    xor  edi, edi                           // CAP_OP_GRANT (0)
+    mov  rsi, 2                             // src = U8X_SRC_IDX (CAP_WRITE|CAP_GRANT|CAP_REVOKE)
+    mov  rdx, 0xA                           // req = CAP_WRITE|CAP_GRANT (a strict subset)
+    syscall
+    test rax, rax
+    js   1f                                 // grant failed -> skip bit0
+    mov  r13, rax                           // r13 = g1 (the child cap)
+    mov  rax, 10                            // re-grant: g2 = GRANT(g1, CAP_WRITE)
+    xor  edi, edi
+    mov  rsi, r13
+    mov  rdx, 2                             // CAP_WRITE
+    syscall
+    test rax, rax
+    js   1f
+    mov  r14, rax                           // r14 = g2 (the grandchild cap)
+    mov  rax, 1                             // write through g2 -> must land
+    mov  rdi, r14
+    lea  rsi, [rip + unaos_user_u8x_msg1]
+    mov  rdx, [rip + unaos_user_u8x_msg1len]
+    syscall
+    test rax, rax
+    js   1f
+    or   r12, 1                             // bit0: grant chain works
+1:
+    // (1) revoke the PARENT: index 2 carries CAP_REVOKE, so this kills the derivation SUBTREE -> 0; then
+    //     immediately revoke it AGAIN -> exactly -ECHILD (the double-revoke errno, checked HERE while index
+    //     2 is provably still Empty — a later first-free grant may legitimately reuse it)
+    mov  rax, 10                            // SYS_CAP
+    mov  rdi, 1                             // CAP_OP_REVOKE
+    mov  rsi, 2
+    syscall
+    test rax, rax
+    jnz  2f                                 // revoke must return 0
+    mov  rax, 10                            // double revoke of 2 -> -ECHILD (-10; the row is Empty now)
+    mov  rdi, 1
+    mov  rsi, 2
+    syscall
+    cmp  rax, -10                           // exactly -ECHILD ?
+    jne  2f
+    or   r12, 2                             // bit1: parent revoke accepted; double revoke errno'd
+2:
+    // (2) BOTH descendant copies are now stale at use: write via g1 -> -EACCES; write via g2 -> -EACCES
+    mov  rax, 1
+    mov  rdi, r13
+    lea  rsi, [rip + unaos_user_u8x_msg1]
+    mov  rdx, [rip + unaos_user_u8x_msg1len]
+    syscall
+    cmp  rax, -13                           // exactly -EACCES ?
+    jne  3f
+    mov  rax, 1
+    mov  rdi, r14
+    lea  rsi, [rip + unaos_user_u8x_msg1]
+    mov  rdx, [rip + unaos_user_u8x_msg1len]
+    syscall
+    cmp  rax, -13
+    jne  3f
+    or   r12, 4                             // bit2: the whole subtree died with the parent
+3:
+    // (3) locality + errno negatives: g4 = GRANT(src=3, CAP_WRITE); revoke index 3 (NO CAP_REVOKE) -> 0 but
+    //     LOCAL only — g4 still writes; then a double revoke of 3 -> exactly -ECHILD
+    mov  rax, 10
+    xor  edi, edi                           // CAP_OP_GRANT
+    mov  rsi, 3                             // src = U8X_SRC2_IDX (CAP_WRITE|CAP_GRANT — no CAP_REVOKE)
+    mov  rdx, 2                             // CAP_WRITE
+    syscall
+    test rax, rax
+    js   4f
+    mov  r15, rax                           // r15 = g4
+    mov  rax, 10                            // revoke index 3 — right-less, so row-local only
+    mov  rdi, 1
+    mov  rsi, 3
+    syscall
+    test rax, rax
+    jnz  4f
+    mov  rax, 1                             // g4 must STILL write (no CAP_REVOKE => no subtree kill)
+    mov  rdi, r15
+    lea  rsi, [rip + unaos_user_u8x_msg2]
+    mov  rdx, [rip + unaos_user_u8x_msg2len]
+    syscall
+    test rax, rax
+    js   4f
+    mov  rax, 10                            // double revoke of 3 -> -ECHILD (-10; already Empty)
+    mov  rdi, 1
+    mov  rsi, 3
+    syscall
+    cmp  rax, -10
+    jne  4f
+    or   r12, 8                             // bit3: right-less revoke stayed local; double revoke errno'd
+4:
+    mov  rax, 2                             // SYS_EXIT(witness) -> routed by name into U8X_WITNESS
+    mov  rdi, r12
+    syscall
+5:  jmp  5b                                 // sys_exit never returns; belt-and-braces guard
+    // Read-only data in the (ring-3 RX, kernel-readable) code page. Lengths are assemble-time label
+    // differences loaded RIP-relative (the u5x/u7x idiom).
+    .balign 8
+unaos_user_u8x_msg1len:
+    .quad unaos_user_u8x_msg1_end - unaos_user_u8x_msg1
+unaos_user_u8x_msg1:
+    .ascii "u8x: write via the grandchild cap\n"
+unaos_user_u8x_msg1_end:
+    .balign 8
+unaos_user_u8x_msg2len:
+    .quad unaos_user_u8x_msg2_end - unaos_user_u8x_msg2
+unaos_user_u8x_msg2:
+    .ascii "u8x: right-less revoke stays local\n"
+unaos_user_u8x_msg2_end:
+    .globl unaos_user_u8x_blob_end
+unaos_user_u8x_blob_end:
+"#
+);
+
+unsafe extern "C" {
+    static unaos_user_u8x_blob_start: u8;
+    static unaos_user_u8x_blob_end: u8;
+    static unaos_user_u8x_tree: u8;
+}
+
 // --- The SYSCALL entry stub (LSTAR target). Naked; the only assembly in the syscall path.
 //
 // On entry (CPL 0, from SYSCALL): rcx = user RIP, r11 = user RFLAGS, rax = number, rdi/rsi/rdx =
@@ -1020,6 +1165,13 @@ pub fn record_ring3_kill(name: &str, vec: u8, err: u64, cr2: u64) {
         }
         return;
     }
+    // U8x: the revocation-tree fixture is register-only and well-behaved; a kill is a real U8x bug — its own
+    // counter, never the U1b `killed_unexpected` count. Not in PROCS (the launcher spawned it, not
+    // sys_spawn), so no parent semaphore to post — the launcher times out to FAIL on `U8X_DONE`.
+    if name == "u8x-tree" {
+        U8X_KILLED.fetch_add(1, Ordering::AcqRel);
+        return;
+    }
     let code_end = USER_BASE + PAGE_SIZE; // the code page is the first page of the window only
     let window_end = USER_BASE + USER_WINDOW_PAGES * PAGE_SIZE;
     let expected = match name {
@@ -1167,6 +1319,15 @@ extern "C" fn syscall_dispatch(nr: u64, a0: u64, a1: u64, a2: u64) -> i64 {
                     // launcher's verdict; `U6BX_DONE` gates the read.
                     U6BX_WITNESS.store(a0 as u32, Ordering::Release);
                     U6BX_DONE.fetch_add(1, Ordering::AcqRel);
+                }
+                Some("u8x-tree") => {
+                    // U8x: the revocation-tree fixture conveys its 4-bit witness bitmask as its exit STATUS
+                    // (routed by name, same idiom). It has NO planted Proc entry (a single register-only
+                    // fixture — the kernel-side check plants its own scratch entries), so it takes the
+                    // ordinary by-name path, not the u7x pid-keyed short-circuit above. `U8X_DONE` gates
+                    // the launcher's read.
+                    U8X_WITNESS.store(a0 as u32, Ordering::Release);
+                    U8X_DONE.fetch_add(1, Ordering::AcqRel);
                 }
                 Some(n) if n.starts_with("u3-") => {
                     // U3 per-process-CR3 fixture task exiting (its own accounting, so the U1a/U1b
@@ -2361,6 +2522,8 @@ fn xfer_rec_claim(sender_row: u64) -> Option<(usize, u64)> {
 fn xfer_rec_free(r: usize) {
     debug_assert!(r < MAX_XFERS, "xfer_rec_free: out of range");
     XFER_REC_SENDER[r].store(0, Ordering::Release);
+    XFER_REC_DERIV[r].store(0, Ordering::Release); // U8x: the derivation sidecar clears with the record
+    XFER_REC_DERIV_ID[r].store(0, Ordering::Release);
     XFER_REC_TX[r].store(0, Ordering::Release); // clears the revoked bit with the id (one word)
 }
 
@@ -2377,6 +2540,8 @@ fn xfer_slot_release(row: usize, k: usize) {
     XFER_SLOT_TARGET[row][k].store(0, Ordering::Release);
     XFER_SLOT_RIGHTS[row][k].store(0, Ordering::Release);
     XFER_SLOT_REC[row][k].store(0, Ordering::Release);
+    XFER_SLOT_DERIV[row][k].store(0, Ordering::Release); // U8x sidecars clear with the slot
+    XFER_SLOT_GEN[row][k].store(0, Ordering::Release);
     XFER_SLOT_TX[row][k].store(0, Ordering::Release);
 }
 
@@ -2404,6 +2569,11 @@ fn clear_xfer_inbox_row(row: usize) {
             let rec = XFER_SLOT_REC[row][k].load(Ordering::Acquire);
             if rec != 0 {
                 xfer_rec_free((rec - 1) as usize);
+            }
+            // U8x: a swept (never-delivered) deposit drops its derivation node with the slot.
+            let dn = XFER_SLOT_DERIV[row][k].load(Ordering::Acquire);
+            if dn != 0 {
+                deriv_drop(dn);
             }
             xfer_slot_release(row, k);
         }
@@ -2439,6 +2609,14 @@ fn sys_xfer(dest: u64, src: u64, req_rights: u64) -> i64 {
     let Some(row) = crate::arch::memory::current_slot() else {
         return EACCES;
     };
+    sys_xfer_from(row, dest, src, req_rights)
+}
+
+/// The `sys_xfer` body, parameterized on the sending ROW — the dispatcher passes `current_slot()`; the U8x
+/// kernel-side check drives the SAME code path with scratch rows (no ring-3 detour, no duplicate logic).
+/// The SHARED_ROW refusal lives in the `sys_xfer` wrapper above (a ring-3 caller invariant), so this body
+/// never needs it; the kernel check only ever passes private scratch rows.
+fn sys_xfer_from(row: usize, dest: u64, src: u64, req_rights: u64) -> i64 {
     // 1. The recipient: a Child handle in the CALLER's OWN table (structural, owner-scoped delegation).
     let pid = match handle_resolve(row, dest, 0) {
         Ok(HandleTarget::Child(pid)) => pid,
@@ -2467,6 +2645,12 @@ fn sys_xfer(dest: u64, src: u64, req_rights: u64) -> i64 {
     {
         return EACCES;
     }
+    // U8x: a source on a revoked derivation chain must not be re-transferred either (the tree-deep twin of
+    // the record check above — post-revoke delegation is refused however deep the chain).
+    let src_dn = HANDLE_DERIV[row][src as usize].load(Ordering::Acquire);
+    if src_dn != 0 && deriv_stale(src_dn) {
+        return EACCES;
+    }
     // 3. Attenuation across processes: any requested bit the sender does not hold is an amplification.
     let req = req_rights as u32;
     if req & !src_rights != 0 {
@@ -2487,16 +2671,28 @@ fn sys_xfer(dest: u64, src: u64, req_rights: u64) -> i64 {
     if dst_row >= crate::arch::memory::USER_SLOTS {
         return ECHILD; // never a private row (defensive; sys_spawn only records private slots)
     }
-    // 5. Claim the revoke ledger entry, then the inbox slot; either full unwinds cleanly (-EAGAIN).
-    let Some((rec, tx)) = xfer_rec_claim(row as u64) else {
+    // U8x: snapshot the recipient's inbox GENERATION before depositing — the deposit is stamped with it,
+    // RECV verifies it, and the post-check re-reads it (a change = the recipient tore down = retract).
+    let dst_gen = SLOT_GEN[dst_row].load(Ordering::Acquire);
+    // 5. Record the derivation edge (delivered cap -> source), then claim the revoke ledger entry, then
+    //    the inbox slot; any exhaustion unwinds cleanly (-EAGAIN).
+    let Some((node, node_id)) = deriv_derive_from(row, src as usize) else {
         return EAGAIN;
     };
+    let Some((rec, tx)) = xfer_rec_claim(row as u64) else {
+        deriv_drop(node);
+        return EAGAIN;
+    };
+    // The record remembers the transfer's node (+ its id, the ABA guard) so XREVOKE kills the subtree.
+    XFER_REC_DERIV[rec].store(node, Ordering::Release);
+    XFER_REC_DERIV_ID[rec].store(node_id, Ordering::Release);
     let Some(slot) = (0..NXFER).find(|&k| {
         XFER_SLOT_TX[dst_row][k]
             .compare_exchange(0, HANDLE_RESERVING, Ordering::AcqRel, Ordering::Acquire)
             .is_ok()
     }) else {
         xfer_rec_free(rec);
+        deriv_drop(node);
         return EAGAIN; // the recipient's inbox is full
     };
     // 6. Publish the descriptor (Release), the tx LAST — a recipient that observes the live tx observes
@@ -2505,10 +2701,16 @@ fn sys_xfer(dest: u64, src: u64, req_rights: u64) -> i64 {
     XFER_SLOT_TARGET[dst_row][slot].store(target, Ordering::Release);
     XFER_SLOT_RIGHTS[dst_row][slot].store(req, Ordering::Release);
     XFER_SLOT_REC[dst_row][slot].store((rec + 1) as u32, Ordering::Release);
+    XFER_SLOT_DERIV[dst_row][slot].store(node, Ordering::Release);
+    XFER_SLOT_GEN[dst_row][slot].store(dst_gen, Ordering::Release);
     XFER_SLOT_TX[dst_row][slot].store(tx, Ordering::Release);
-    // 7. POST-CHECK + retract (see the doc comment). Same entry, same pid, still RUNNING — or undo ours.
+    // 7. POST-CHECK + retract (see the doc comment). Same entry, same pid, still RUNNING, SAME inbox
+    //    generation — or undo ours. The generation re-read (U8x) closes the residual TOCTOU U7x documented:
+    //    even if the entry looks unchanged, a teardown-and-recycle inside the window bumped the generation,
+    //    and a deposit stamped with the OLD one is retracted here (or discarded at RECV — both sides hold).
     if PROCS[pi].state.load(Ordering::Acquire) != PRUNNING
         || PROCS[pi].pid.load(Ordering::Acquire) != pid
+        || SLOT_GEN[dst_row].load(Ordering::Acquire) != dst_gen
     {
         if XFER_SLOT_TX[dst_row][slot]
             .compare_exchange(tx, HANDLE_RESERVING, Ordering::AcqRel, Ordering::Acquire)
@@ -2516,9 +2718,10 @@ fn sys_xfer(dest: u64, src: u64, req_rights: u64) -> i64 {
         {
             xfer_slot_release(dst_row, slot);
             xfer_rec_free(rec);
+            deriv_drop(node);
         }
         // CAS failure = the recipient's teardown (or a last-instant consume) won the slot and freed (or
-        // took ownership of) the record — either way it is no longer ours to unwind.
+        // took ownership of) the record + node — either way they are no longer ours to unwind.
         return ECHILD;
     }
     tx as i64
@@ -2538,6 +2741,16 @@ fn sys_recv() -> i64 {
     let Some(row) = crate::arch::memory::current_slot() else {
         return EACCES;
     };
+    sys_recv_for(row)
+}
+
+/// The `sys_recv` body, parameterized on the receiving ROW — the dispatcher passes `current_slot()`; the
+/// U8x kernel-side check drives the SAME code path with scratch rows (no ring-3 detour, no duplicate
+/// logic). The SHARED_ROW refusal lives in the `sys_recv` wrapper above (a ring-3 caller invariant).
+fn sys_recv_for(row: usize) -> i64 {
+    if row >= XFER_SLOT_TX.len() {
+        return EAGAIN; // defensive; a real ring-3 caller always has an in-range row
+    }
     for k in 0..NXFER {
         let tx = XFER_SLOT_TX[row][k].load(Ordering::Acquire);
         if tx == 0 || tx == HANDLE_RESERVING {
@@ -2554,19 +2767,28 @@ fn sys_recv() -> i64 {
         let target = XFER_SLOT_TARGET[row][k].load(Ordering::Acquire);
         let rights = XFER_SLOT_RIGHTS[row][k].load(Ordering::Acquire);
         let rec = XFER_SLOT_REC[row][k].load(Ordering::Acquire);
-        // Revoked while pending (or a recordless slot — a kernel bug, failed closed): discard, keep scanning.
+        let node = XFER_SLOT_DERIV[row][k].load(Ordering::Acquire);
+        let dep_gen = XFER_SLOT_GEN[row][k].load(Ordering::Acquire);
+        // Revoked while pending, a recordless slot (a kernel bug, failed closed), or — U8x — a deposit
+        // stamped for a PREVIOUS tenant of this row (its generation predates the current one: the sender
+        // aimed at a process that tore down; the recycled slot's new tenant must never consume it):
+        // discard, keep scanning.
         if rec == 0
             || XFER_REC_TX[(rec - 1) as usize].load(Ordering::Acquire) & XFER_REVOKED_BIT != 0
+            || dep_gen != SLOT_GEN[row].load(Ordering::Acquire)
         {
             if rec != 0 {
                 xfer_rec_free((rec - 1) as usize);
+            }
+            if node != 0 {
+                deriv_drop(node); // the undelivered cap's node dies with the deposit
             }
             xfer_slot_release(row, k);
             continue;
         }
         // Install into the CALLER's OWN row: reserve first-free, publish kind + rights + the transfer
-        // reference, then the live value LAST. A full table re-queues the transfer (restore the tx — we
-        // own the slot, so a plain Release store is safe) and returns -EAGAIN.
+        // reference + the derivation node, then the live value LAST. A full table re-queues the transfer
+        // (restore the tx — we own the slot, so a plain Release store is safe) and returns -EAGAIN.
         let Some(h) = handle_install(row, HANDLE_RESERVING) else {
             XFER_SLOT_TX[row][k].store(tx, Ordering::Release);
             return EAGAIN;
@@ -2574,6 +2796,7 @@ fn sys_recv() -> i64 {
         handle_set_kind(row, h, kind);
         handle_set_rights(row, h, rights);
         HANDLE_XFER_REC[row][h].store(rec, Ordering::Release); // the revocation hook, pre-live
+        HANDLE_DERIV[row][h].store(node, Ordering::Release); // the derivation edge, pre-live (U8x)
         handle_set(row, h, target);
         xfer_slot_release(row, k); // consume the inbox slot (record ownership moved to the handle)
         return h as i64;
@@ -2600,10 +2823,18 @@ fn sys_cap_xrevoke(row: usize, txid: u64) -> i64 {
             // record was freed (and possibly reclaimed for someone else's transfer) between the find and
             // the flip — the transfer is already closed, NOTHING is written to the record's current
             // tenant, and the caller honestly gets -ENOENT.
+            // U8x: capture the transfer's derivation node (+ its publish-time id) BEFORE the CAS — a won
+            // CAS proves the record still ledgered this transfer when read, so the pair is this transfer's.
+            let dn = XFER_REC_DERIV[r].load(Ordering::Acquire);
+            let dn_id = XFER_REC_DERIV_ID[r].load(Ordering::Acquire);
             return if XFER_REC_TX[r]
                 .compare_exchange(txid, txid | XFER_REVOKED_BIT, Ordering::AcqRel, Ordering::Acquire)
                 .is_ok()
             {
+                // Mark the transfer's node revoked (id-guarded — a concurrently dropped-and-reclaimed node
+                // is left alone; it had no children, so nothing escapes). This is what makes the revoke a
+                // TREE: every re-grant/re-transfer below the delivered cap dies at next use.
+                deriv_revoke_if(dn, dn_id);
                 0
             } else {
                 ENOENT
@@ -2611,6 +2842,248 @@ fn sys_cap_xrevoke(row: usize, txid: u64) -> i64 {
         }
     }
     ENOENT
+}
+
+// =============================================================================================
+// U8x: revocation TREES (the derivation ledger) + generation-tagged inboxes — closing U7x's two
+// documented escapes. The aarch64 pi4 U8 twin, slot-keyed.
+// =============================================================================================
+//
+// U7x left two honest gaps (its SECURITY.md entry): (1) revoke was SINGLE-LEVEL — a recipient who re-granted
+// or re-transferred a received cap created a DERIVED copy a later revoke never reached; (2) the sys_xfer
+// post-check had a residual TOCTOU — recipient-exit + slot-recycle + new-tenant-consume inside the
+// deposit-live -> post-check window could deliver a transfer to the wrong tenant. U8x closes both.
+//
+// (1) THE DERIVATION LEDGER. Every mint that derives one capability from another records an edge
+// child -> parent in a bounded static ledger of NODES (the U7x static-atomic-array discipline — no heap,
+// state-exact CAS transitions, Release-publish / Acquire-read). `sys_cap_grant` (a local mint) and
+// `sys_xfer`/`sys_recv` (a delivered transfer) both derive; handles installed by spawn/open/endow are ROOTS
+// (no node until they first act as a grant/transfer source — the node is created LAZILY then). Revocation is
+// MARK-ONE-NODE; staleness is discovered at USE: `handle_resolve` walks child -> root through the ledger
+// (bounded — the ledger is bounded and a parent is always created before its child, so cycles are impossible
+// by construction) and fails `Denied` if ANY ancestor is revoked. This keeps U7x's load-bearing invariant:
+// **no revoke path ever writes another row** — the stale-at-use pattern, generalized. Revoke is O(1);
+// resolve pays the bounded walk.
+//
+// NODE LIFETIME (the documented choice: tombstones until the subtree drains). A node frees when its owning
+// handle DROPS **and** it has no live children; a dropped node with live children persists as a TOMBSTONE
+// (still walkable, still carrying its revoked bit) until its last child frees — then the free cascades up
+// through any drained tombstoned ancestors (`deriv_drop`). Freeing is arbitrated by a state-exact CAS on the
+// node's ID word (two racing freers — the owner's drop vs a child's cascade — resolve to exactly one winner).
+// Every walkable node is PINNED: a resolver only reaches a node through a live handle (whose own node cannot
+// free) and live child edges (a live child holds `KIDS > 0` on its parent), so no walk ever reads a freed/
+// reclaimed node. Ledger exhaustion is `-EAGAIN` at mint/transfer time (the U4x resource-bound discipline —
+// claim last, unwind on failure, no leak on any path).
+//
+// (2) GENERATION-TAGGED INBOXES. A per-slot generation word is bumped at teardown (the same site as the U7x
+// inbox sweep, BEFORE the sweep). A deposit stamps the recipient's current generation into its slot; RECV
+// verifies the stamp against the CURRENT generation (a mismatch = the deposit was aimed at a PREVIOUS tenant
+// — discarded, never delivered) and the sender's post-check re-reads the generation (a change = retract). A
+// recycled slot's new tenant is therefore structurally unable to consume a stale deposit, from BOTH sides.
+
+/// Derivation ledger capacity — bounded and static like `MAX_XFERS`. The demo peak is ~6 live nodes.
+const MAX_DERIV: usize = 16;
+/// Bit 63 of a node's ID word marks the node (and thereby its whole subtree, at resolve time) REVOKED. The
+/// flag rides IN the state word so revocation is a state-exact CAS (the `XFER_REVOKED_BIT` discipline); node
+/// ids are a monotonic counter from 1, so bit 63 never aliases a genuine id.
+const DERIV_REVOKED_BIT: u64 = 1 << 63;
+
+/// A node's STATE word: 0 = free, `HANDLE_RESERVING` = mid-claim, else = its unique node id (live), possibly
+/// `| DERIV_REVOKED_BIT` (live, revoked). The id makes revoke/free ABA-safe (a reclaimed slot carries a NEW
+/// id, so a stale revoke-by-expected-id can never hit the new tenant — see `deriv_revoke_if`).
+static DERIV_ID: [AtomicU64; MAX_DERIV] = [const { AtomicU64::new(0) }; MAX_DERIV];
+/// The node's parent edge: parent node index + 1, or 0 = a root. Set once at claim, cleared at free.
+static DERIV_PARENT: [AtomicU32; MAX_DERIV] = [const { AtomicU32::new(0) }; MAX_DERIV];
+/// Live children count — what pins a tombstoned parent until its subtree drains.
+static DERIV_KIDS: [AtomicU32; MAX_DERIV] = [const { AtomicU32::new(0) }; MAX_DERIV];
+/// The owning handle dropped (tombstone flag): the node frees when this is set AND `KIDS == 0`.
+static DERIV_DROPPED: [AtomicBool; MAX_DERIV] = [const { AtomicBool::new(false) }; MAX_DERIV];
+/// The next node id — monotonic from 1 (never 0/u64::MAX, the state sentinels).
+static DERIV_NEXT_ID: AtomicU64 = AtomicU64::new(1);
+
+/// Which derivation node (index + 1; 0 = a root with no node yet) a handle's capability is. Keyed
+/// `[row][idx]` like every handle sidecar; written only by the row's own task (mid-syscall) or its teardown.
+static HANDLE_DERIV: [[AtomicU32; NHANDLE]; crate::arch::memory::USER_SLOTS + 1] =
+    [const { [const { AtomicU32::new(0) }; NHANDLE] }; crate::arch::memory::USER_SLOTS + 1];
+
+/// The derivation node riding a PENDING deposit (index + 1) — ownership passes inbox-slot -> received handle
+/// at RECV; every discard path (revoked-pending, generation-stale, retract, teardown sweep) drops it instead.
+static XFER_SLOT_DERIV: [[AtomicU32; NXFER]; crate::arch::memory::USER_SLOTS + 1] =
+    [const { [const { AtomicU32::new(0) }; NXFER] }; crate::arch::memory::USER_SLOTS + 1];
+/// The recipient GENERATION stamped into a pending deposit — RECV delivers only on an exact match with the
+/// recipient's CURRENT generation (see `SLOT_GEN`).
+static XFER_SLOT_GEN: [[AtomicU64; NXFER]; crate::arch::memory::USER_SLOTS + 1] =
+    [const { [const { AtomicU64::new(0) }; NXFER] }; crate::arch::memory::USER_SLOTS + 1];
+
+/// The transfer record's derivation node (index + 1) + that node's ID at publish time — what
+/// `sys_cap_xrevoke` marks so the revoke reaches everything DERIVED from the transferred cap (re-grants,
+/// re-transfers), not just the directly received handle. The captured ID makes the mark ABA-safe: if the
+/// node was dropped and its slot reclaimed by the time the revoke lands, the id no longer matches and
+/// nothing is written (a dropped node had no children left to protect, so nothing escapes).
+static XFER_REC_DERIV: [AtomicU32; MAX_XFERS] = [const { AtomicU32::new(0) }; MAX_XFERS];
+static XFER_REC_DERIV_ID: [AtomicU64; MAX_XFERS] = [const { AtomicU64::new(0) }; MAX_XFERS];
+
+/// Per-slot inbox GENERATION: bumped (AcqRel) at the TOP of `clear_handle_row` — i.e. strictly before the
+/// teardown's inbox sweep — so any deposit stamped with the old generation is dead-on-arrival for the slot's
+/// next tenant even if it lands after the sweep passed its slot. `SHARED_ROW` never tears down. Sized
+/// `USER_SLOTS + 1` for index symmetry with the other row-keyed sidecars.
+static SLOT_GEN: [AtomicU64; crate::arch::memory::USER_SLOTS + 1] =
+    [const { AtomicU64::new(0) }; crate::arch::memory::USER_SLOTS + 1];
+
+/// Claim a free derivation node under `parent_ref` (a node index + 1, or 0 for a root): CAS the ID word
+/// 0 -> RESERVING, publish the edge + zeroed counters, bump the parent's KIDS (the parent is pinned — the
+/// caller holds its owning handle live), then the fresh id LAST (live-last). Returns `(node index + 1, id)`,
+/// or `None` when the ledger is exhausted (-> `-EAGAIN` at the caller, nothing to unwind).
+fn deriv_claim(parent_ref: u32) -> Option<(u32, u64)> {
+    debug_assert!(parent_ref as usize <= MAX_DERIV, "deriv_claim: bad parent ref");
+    for n in 0..MAX_DERIV {
+        if DERIV_ID[n]
+            .compare_exchange(0, HANDLE_RESERVING, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            DERIV_PARENT[n].store(parent_ref, Ordering::Release);
+            DERIV_KIDS[n].store(0, Ordering::Release);
+            DERIV_DROPPED[n].store(false, Ordering::Release);
+            if parent_ref != 0 {
+                DERIV_KIDS[(parent_ref - 1) as usize].fetch_add(1, Ordering::AcqRel);
+            }
+            let id = DERIV_NEXT_ID.fetch_add(1, Ordering::AcqRel);
+            DERIV_ID[n].store(id, Ordering::Release);
+            return Some(((n + 1) as u32, id));
+        }
+    }
+    None
+}
+
+/// Mark node `nref` (index + 1) REVOKED — state-exact on the CURRENT id, idempotent (an already-revoked id
+/// CASes to itself). Caller must PIN the node (own its live handle, or hold its record's txid — see
+/// `deriv_revoke_if` for the unpinned case). Descendants discover the mark at their next `handle_resolve`.
+fn deriv_revoke(nref: u32) {
+    debug_assert!(nref >= 1 && (nref as usize) <= MAX_DERIV, "deriv_revoke: bad ref");
+    let n = (nref - 1) as usize;
+    let cur = DERIV_ID[n].load(Ordering::Acquire);
+    if cur == 0 || cur == HANDLE_RESERVING {
+        return; // freed/mid-claim — nothing live to mark (pinned callers never see this)
+    }
+    let _ = DERIV_ID[n].compare_exchange(
+        cur,
+        cur | DERIV_REVOKED_BIT,
+        Ordering::AcqRel,
+        Ordering::Acquire,
+    );
+}
+
+/// Mark node `nref` REVOKED only while it still carries `expect_id` — the ABA-safe form for callers that do
+/// NOT pin the node (`sys_cap_xrevoke`: the recipient may drop the received handle — freeing the node —
+/// concurrently with the sender's revoke; a reclaimed slot carries a NEW id, so the mark can never hit an
+/// unrelated node). A lost CAS means the node was freed (it had no live children — nothing escapes).
+fn deriv_revoke_if(nref: u32, expect_id: u64) {
+    if nref == 0 || (nref as usize) > MAX_DERIV {
+        return;
+    }
+    let n = (nref - 1) as usize;
+    let _ = DERIV_ID[n]
+        .compare_exchange(expect_id, expect_id | DERIV_REVOKED_BIT, Ordering::AcqRel, Ordering::Acquire);
+}
+
+/// True iff node `nref` or ANY ancestor is revoked — the read-side walk `handle_resolve` pays. Bounded by
+/// `MAX_DERIV` (cycles are impossible: a parent is claimed strictly before its child and edges never change);
+/// every node on the path is pinned (see the section comment), so a freed/reclaimed node is never read.
+fn deriv_stale(nref: u32) -> bool {
+    let mut r = nref;
+    for _ in 0..MAX_DERIV {
+        if r == 0 {
+            return false; // reached a root, nothing revoked on the path
+        }
+        let n = (r - 1) as usize;
+        if n >= MAX_DERIV {
+            return true; // corrupt reference — fail closed
+        }
+        let id = DERIV_ID[n].load(Ordering::Acquire);
+        if id == 0 || id == HANDLE_RESERVING {
+            return false; // structurally unreachable on a pinned walk; benign stop (defensive)
+        }
+        if id & DERIV_REVOKED_BIT != 0 {
+            return true;
+        }
+        r = DERIV_PARENT[n].load(Ordering::Acquire);
+    }
+    true // walk budget exhausted — impossible by construction; fail closed
+}
+
+/// Drop node `nref` (its owning handle/pending-slot released it): tombstone it, and FREE it iff its subtree
+/// has drained — then cascade the free up through any drained tombstoned ancestors. The free is arbitrated
+/// by a state-exact CAS on the ID word (the owner's drop and a child's cascade can race; exactly one wins).
+/// A revoked tombstone keeps its bit until the free, so late resolvers of surviving descendants still deny.
+fn deriv_drop(nref: u32) {
+    let mut r = nref;
+    loop {
+        if r == 0 || (r as usize) > MAX_DERIV {
+            return;
+        }
+        let n = (r - 1) as usize;
+        DERIV_DROPPED[n].store(true, Ordering::Release);
+        if DERIV_KIDS[n].load(Ordering::Acquire) != 0 {
+            return; // live children pin it — a TOMBSTONE until the subtree drains
+        }
+        let mut id = DERIV_ID[n].load(Ordering::Acquire);
+        loop {
+            if id == 0 || id == HANDLE_RESERVING {
+                return; // already freed / mid-claim (a racing freer won)
+            }
+            match DERIV_ID[n].compare_exchange(
+                id,
+                HANDLE_RESERVING,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => break,
+                // A racing REVOKE (deriv_revoke_if from a sender's xrevoke on this unpinned
+                // node) only flips DERIV_REVOKED_BIT and NEVER frees — we remain the sole
+                // freer, so retry against the refreshed word; returning here would leak the
+                // node (and every tombstoned ancestor it pins) permanently, exhausting the
+                // ledger to -EAGAIN. A racing FREER leaves 0/RESERVING — caught above on the
+                // reload. (aarch64 U8 review must-fix, carried into the twin.)
+                Err(cur) => id = cur,
+            }
+        }
+        let parent = DERIV_PARENT[n].load(Ordering::Acquire);
+        DERIV_PARENT[n].store(0, Ordering::Release);
+        DERIV_DROPPED[n].store(false, Ordering::Release);
+        DERIV_ID[n].store(0, Ordering::Release); // freed LAST
+        if parent == 0 {
+            return;
+        }
+        // Un-child the parent; if we took its LAST kid and it is tombstoned, cascade the free up.
+        if DERIV_KIDS[(parent - 1) as usize].fetch_sub(1, Ordering::AcqRel) != 1 {
+            return;
+        }
+        if !DERIV_DROPPED[(parent - 1) as usize].load(Ordering::Acquire) {
+            return; // the parent's owning handle is still live — it frees on its own drop
+        }
+        r = parent;
+    }
+}
+
+/// True iff the whole derivation ledger is free — the U8x leak verifier (every node's lifetime closed).
+fn deriv_all_free() -> bool {
+    (0..MAX_DERIV).all(|n| DERIV_ID[n].load(Ordering::Acquire) == 0)
+}
+
+/// Ensure the source handle at `[row][src]` has a derivation node (creating a lazy ROOT node if not), and
+/// mint a CHILD node under it — the shared derive step of `sys_cap_grant` and `sys_xfer`. Returns the child
+/// `(node ref, id)`, or `None` on ledger exhaustion (-> `-EAGAIN`; a root node created en route stays
+/// attached to the source handle and frees with it — never a leak).
+fn deriv_derive_from(row: usize, src: usize) -> Option<(u32, u64)> {
+    let src_node = match HANDLE_DERIV[row][src].load(Ordering::Acquire) {
+        0 => {
+            let (n, _) = deriv_claim(0)?;
+            HANDLE_DERIV[row][src].store(n, Ordering::Release);
+            n
+        }
+        n => n,
+    };
+    deriv_claim(src_node)
 }
 
 // --- The process table (pid-keyed): the parent's view of its children's lifecycle. ---
@@ -2727,17 +3200,18 @@ static HANDLES: [[AtomicU64; NHANDLE]; crate::arch::memory::USER_SLOTS + 1] =
 
 /// Capability rights — a small bitmask carried in the sidecar `HANDLE_RIGHTS`, checked at
 /// `handle_resolve`. `CAP_WRITE` gates `sys_write`; `CAP_GRANT` gates minting attenuated copies;
-/// `CAP_READ`/`CAP_EXEC`/`CAP_REVOKE` round out the model (`CAP_REVOKE` reserved for cross-process
-/// revocation — U6; U5x revoke is ownership-based). Values are stable across arches (aarch64 U5 twin).
+/// `CAP_READ`/`CAP_EXEC`/`CAP_REVOKE` round out the model (U8x: revoking a handle carrying `CAP_REVOKE`
+/// kills its derivation SUBTREE; a right-less revoke stays local — U5x's ownership semantics). Values are
+/// stable across arches (aarch64 U5 twin).
 const CAP_READ: u32 = 1 << 0; // 0x01
 const CAP_WRITE: u32 = 1 << 1; // 0x02
 const CAP_EXEC: u32 = 1 << 2; // 0x04
 const CAP_GRANT: u32 = 1 << 3; // 0x08
-const CAP_REVOKE: u32 = 1 << 4; // 0x10 (reserved: cross-process revocation, U6)
+const CAP_REVOKE: u32 = 1 << 4; // 0x10 (U8x: revoking a handle carrying this kills its derivation SUBTREE)
 // The rights are the distinct low 5 bits — a well-formed bitmask (each a single, non-overlapping bit,
 // which the attenuation check `req & !src` relies on). This const-assert verifies that and anchors every
-// CAP_* as used, so the bits not yet exercised in Rust this arc (CAP_EXEC — held by no fixture, so the
-// attenuation negative bites; CAP_REVOKE — reserved for U6) don't read as dead code.
+// CAP_* as used, so the model bit not yet exercised in Rust this arc (CAP_EXEC — held by no fixture, so
+// the attenuation negative bites) doesn't read as dead code.
 const _: () = assert!(
     (CAP_READ | CAP_WRITE | CAP_EXEC | CAP_GRANT | CAP_REVOKE) == 0x1F,
     "capability rights must be the distinct low 5 bits"
@@ -2860,6 +3334,14 @@ fn handle_resolve(row: usize, idx: u64, req: u32) -> Result<HandleTarget, Resolv
     if rec != 0 && XFER_REC_TX[(rec - 1) as usize].load(Ordering::Acquire) & XFER_REVOKED_BIT != 0 {
         return Err(ResolveErr::Denied);
     }
+    // U8x: a DERIVED capability is stale if ANY ancestor node in the derivation ledger is revoked — the
+    // bounded child->root walk that makes revocation a TREE (a re-grant or re-transfer chain dies whole
+    // when any node above it is marked). Roots (no node) skip the walk entirely; no revoke path ever
+    // wrote this row — staleness is discovered here, at use (the U7x record pattern, generalized).
+    let dn = HANDLE_DERIV[row][idx as usize].load(Ordering::Acquire);
+    if dn != 0 && deriv_stale(dn) {
+        return Err(ResolveErr::Denied);
+    }
     match HANDLE_KIND[row][idx as usize].load(Ordering::Acquire) {
         KIND_CHILD => Ok(HandleTarget::Child(raw)),
         KIND_CONSOLE => Ok(HandleTarget::Console),
@@ -2930,6 +3412,8 @@ fn handle_row_is_clear(row: usize) -> bool {
             // U7x: the transfer-reference sidecar is part of "clear" too — the single-writer snapshot and
             // the teardown proof must not miss a stale record reference behind an otherwise-empty slot.
             && HANDLE_XFER_REC[row][i].load(Ordering::Acquire) == 0
+            // U8x: likewise the derivation sidecar — a stale node reference is part of "not clear".
+            && HANDLE_DERIV[row][i].load(Ordering::Acquire) == 0
     })
 }
 
@@ -2942,6 +3426,11 @@ fn handle_row_is_clear(row: usize) -> bool {
 /// `SHARED_ROW` is never torn down.
 pub fn clear_handle_row(slot: usize) {
     debug_assert!(slot < crate::arch::memory::USER_SLOTS, "clear_handle_row: not a private slot");
+    // U8x: bump this slot's inbox GENERATION first — strictly BEFORE the inbox sweep below — so every
+    // deposit stamped for the dying tenant is dead-on-arrival for the slot's next tenant even if it lands
+    // after the sweep passed its slot (RECV verifies the stamp; the sender's post-check re-reads this word).
+    // This closes the U7x-documented sys_xfer TOCTOU (exit + recycle + consume inside the deposit window).
+    SLOT_GEN[slot].fetch_add(1, Ordering::AcqRel);
     for i in 0..NHANDLE {
         // Clear the value first (Empty => `handle_resolve` bails as NoHandle before reading rights/kind),
         // then the rights and kind — so no intermediate state is ever a live handle with stale rights/kind.
@@ -2953,6 +3442,12 @@ pub fn clear_handle_row(slot: usize) {
         let rec = HANDLE_XFER_REC[slot][i].swap(0, Ordering::AcqRel);
         if rec != 0 {
             xfer_rec_free((rec - 1) as usize);
+        }
+        // U8x: the teardown is a drop of every handle the dying task held — its derivation nodes free (or
+        // tombstone until their subtrees drain), so a reused slot inherits no stale derivation reference.
+        let dn = HANDLE_DERIV[slot][i].swap(0, Ordering::AcqRel);
+        if dn != 0 {
+            deriv_drop(dn);
         }
     }
     // U7x: wipe this slot's transfer INBOX alongside its handles — a pending (undelivered) transfer to a
@@ -3042,6 +3537,15 @@ fn handle_clear(slot: usize, idx: usize) {
     let rec = HANDLE_XFER_REC[slot][idx].swap(0, Ordering::AcqRel);
     if rec != 0 {
         xfer_rec_free((rec - 1) as usize);
+    }
+    // U8x: dropping the handle drops its derivation node — freed if its subtree has drained, else a
+    // tombstone until it does (see `deriv_drop`). Swap-clears the sidecar so a re-installed handle at this
+    // index never inherits a stale node reference. NOTE the order: the record is freed FIRST (above), the
+    // node dropped after — `sys_cap_xrevoke` relies on it (a won tx-exact CAS there implies the node it
+    // captured was not yet dropped-and-reclaimed; the id guard covers the residue).
+    let dn = HANDLE_DERIV[slot][idx].swap(0, Ordering::AcqRel);
+    if dn != 0 {
+        deriv_drop(dn);
     }
 }
 
@@ -3205,25 +3709,40 @@ fn sys_cap_grant(row: usize, src_idx: u64, req_rights: u64) -> i64 {
     {
         return EACCES;
     }
+    // U8x: a source whose derivation chain is revoked is stale for delegation too — a mint from a dead
+    // subtree would be a fresh, revocation-free copy (the laundering check, now tree-deep).
+    let src_dn = HANDLE_DERIV[row][src_idx as usize].load(Ordering::Acquire);
+    if src_dn != 0 && deriv_stale(src_dn) {
+        return EACCES;
+    }
     let req = req_rights as u32;
     // Attenuation: reject any requested bit the granter does not itself hold. `req & !src_rights` is
     // exactly the set of amplifying bits; non-empty => the grant would exceed the granter's authority.
     if req & !src_rights != 0 {
         return EACCES;
     }
+    // U8x: record the derivation EDGE (mint -> source) so a later revoke of the source (or any ancestor)
+    // reaches this copy at its next use. Ledger exhaustion is -EAGAIN with nothing else claimed yet.
+    let Some((new_node, _)) = deriv_derive_from(row, src_idx as usize) else {
+        return EAGAIN;
+    };
     // Mint: claim a first-free slot with `handle_install` (a RESERVING placeholder — the value word goes
-    // live LAST), then publish the source's kind + the attenuated rights, then the real target value.
-    // Single-writer over this table (the caller is mid-syscall, not concurrently resolving), so the
-    // kind/rights-then-value order is the defensive belt-and-braces that keeps a live value from ever being
-    // seen sans kind/rights.
+    // live LAST), then publish the source's kind + the attenuated rights + the derivation node, then the
+    // real target value. Single-writer over this table (the caller is mid-syscall, not concurrently
+    // resolving), so the kind/rights-then-value order is the defensive belt-and-braces that keeps a live
+    // value from ever being seen sans kind/rights.
     match handle_install(row, HANDLE_RESERVING) {
         Some(idx) => {
             handle_set_kind(row, idx, src_kind);
             handle_set_rights(row, idx, req);
+            HANDLE_DERIV[row][idx].store(new_node, Ordering::Release);
             handle_set(row, idx, target); // publish the live value LAST (Release)
             idx as i64
         }
-        None => EAGAIN, // handle table full
+        None => {
+            deriv_drop(new_node); // unwind the freshly-minted node (it has no children — frees now)
+            EAGAIN // handle table full
+        }
     }
 }
 
@@ -3252,6 +3771,17 @@ fn sys_cap_revoke(row: usize, idx: u64) -> i64 {
                 files_free(row, fid);
             }
         }
+    }
+    // U8x: CAP_REVOKE gets its real semantics — revoking a handle that CARRIES the right marks its
+    // derivation node revoked, killing the whole subtree derived from it (every re-grant, and every
+    // re-transfer whose chain passes through it) at the descendants' next use. Without the right the revoke
+    // keeps U5x's ownership semantics: the caller's own row entry drops, derived copies survive. The mark
+    // precedes the clear (the clear's `deriv_drop` tombstones the node, preserving the bit for as long as
+    // any descendant lives). A handle with no node has no descendants — nothing to mark.
+    let rights = HANDLE_RIGHTS[row][idx as usize].load(Ordering::Acquire);
+    let dn = HANDLE_DERIV[row][idx as usize].load(Ordering::Acquire);
+    if rights & CAP_REVOKE != 0 && dn != 0 {
+        deriv_revoke(dn);
     }
     handle_clear(row, idx as usize);
     0
@@ -3373,6 +3903,28 @@ static U7X_CHILD_WITNESS: AtomicU32 = AtomicU32::new(0);
 static U7X_DONE: AtomicU32 = AtomicU32::new(0);
 /// A killed U7x fixture — a real U7x bug (both are well-behaved). Off the U1b counter.
 static U7X_KILLED: AtomicU32 = AtomicU32::new(0);
+
+// --- U8x demo accounting (revocation trees; the single-process fixture's witness + the kernel-side
+// cross-process check, read by the launcher's verdict). ---
+/// The handle indices `u8x_launcher` pre-endows in the fixture's table (off index 0 — first-free-claimed by
+/// the fixture's own grants — and off the reserved `CONSOLE_FD`): a full console cap WITH `CAP_REVOKE` (the
+/// tree-revoke parent) and one WITHOUT it (the locality negative). The `mov rsi, {2,3}` operands in
+/// `unaos_user_u8x_tree` MUST match (the aarch64 U8_*_IDX twin).
+const U8X_SRC_IDX: usize = 2;
+const U8X_SRC2_IDX: usize = 3;
+/// The full witness bitmask the revocation-tree fixture reports (as its exit status): bit0 grant chain works
+/// (grant -> re-grant -> write through the grandchild cap lands), bit1 revoking the PARENT (a handle carrying
+/// `CAP_REVOKE`) returns 0 AND revoking it again returns exactly `-ECHILD`, bit2 BOTH descendant copies are
+/// `-EACCES` at their next use (the subtree kill), bit3 a revoke WITHOUT `CAP_REVOKE` stays LOCAL (the derived
+/// copy still writes) and its double-revoke errno too. `u8x_launcher` PASSes iff it equals `U8X_WITNESS_ALL`
+/// AND the kernel-side re-transfer-cascade + generation checks passed.
+const U8X_WITNESS_ALL: u32 = 0xF;
+/// The U8x fixture's final witness bitmask (its `sys_exit` status, routed by name — the u5x idiom).
+static U8X_WITNESS: AtomicU32 = AtomicU32::new(0);
+/// The U8x fixture (`u8x-tree`) reached its witness exit (want 1). Read by `u8x_launcher`'s bounded wait.
+static U8X_DONE: AtomicU32 = AtomicU32::new(0);
+/// A killed U8x fixture — a real bug (it is register-only and well-behaved). Off the U1b counter.
+static U8X_KILLED: AtomicU32 = AtomicU32::new(0);
 
 /// U4x fixture run parameters: the parent's + orphan's ring-3 entry VAs (both inside the shared window
 /// VA — only the slot FRAME differs, via CR3), the shared initial user rsp, and each fixture's slot
@@ -4155,6 +4707,16 @@ fn u7x_release_go(slot: usize) {
 ///      iff both witnesses == `U7X_WITNESS_ALL` AND used AND the snapshot held AND everything cleared AND
 ///      no U7x kill. Prints ONE PASS line. U7x is the last demo, so it releases no further gate.
 pub fn u7x_launcher(demo_cpu: usize) {
+    // U8x rides the SAME kernel task, strictly after the whole U7x flow (every U7x exit path — PASS, FAIL,
+    // or skip — falls through to it): the ordering gate the `*_LAUNCH_DONE` statics provide between
+    // separately spawned launchers is here the program order of one task, and the U7x fixtures' slots have
+    // torn down by the time `u7x_run` returns (its verdict waits on their exits + teardown). The aarch64
+    // u7_launcher twin.
+    u7x_run(demo_cpu);
+    u8x_launcher(demo_cpu);
+}
+
+fn u7x_run(demo_cpu: usize) {
     // 1. Gate on the U6bx launcher (its verdict printed + its slot freed), bounded + yielding.
     let wdeadline = crate::arch::ticks() + 10_000;
     while !U6BX_LAUNCH_DONE.load(Ordering::Acquire) && crate::arch::ticks() < wdeadline {
@@ -4281,6 +4843,198 @@ pub fn u7x_launcher(demo_cpu: usize) {
             U7X_DONE.load(Ordering::Acquire),
             U7X_WITNESS_ALL,
             U7X_WITNESS_ALL
+        );
+    }
+}
+
+// =============================================================================================
+// U8x: revocation trees — the single-process ring-3 fixture (grant-chain kill + locality + errno
+// negatives) and the kernel-side cross-process checks (re-transfer cascade + generation), folded
+// into one launcher/verdict that rides the U7x launcher task. The aarch64 u8_launcher twin.
+// =============================================================================================
+
+/// Build the U8x fixture slot — the `u7x_build` shape for the U8x blob (allocate, scrub the WHOLE window,
+/// copy the blob into its RX-RO code page through the identity alias, return the run params). `None` if slot
+/// allocation fails. Does NOT pre-endow (the launcher does, before dispatch).
+fn u8x_build() -> Option<U7xFix> {
+    let slot = crate::arch::memory::alloc_user_space()?;
+    let bstart = &raw const unaos_user_u8x_blob_start as usize;
+    let bend = &raw const unaos_user_u8x_blob_end as usize;
+    let blen = bend - bstart;
+    assert!(blen as u64 <= PAGE_SIZE, "U8x blob does not fit in a code page");
+    let off = (&raw const unaos_user_u8x_tree as usize - bstart) as u64;
+    let backing = crate::arch::memory::slot_backing_ptr(slot);
+    unsafe {
+        core::ptr::write_bytes(backing, 0, (USER_WINDOW_PAGES * PAGE_SIZE) as usize);
+        core::ptr::copy_nonoverlapping(bstart as *const u8, backing, blen);
+    }
+    Some(U7xFix {
+        entry: USER_BASE + off,
+        sp: USER_BASE + USER_WINDOW_PAGES * PAGE_SIZE - 16,
+        cr3: crate::arch::memory::slot_cr3(slot),
+        slot,
+    })
+}
+
+/// The U8x kernel-side checks — the cross-process halves the single-process fixture cannot stage. Drives
+/// the REAL syscall bodies (`sys_xfer_from`/`sys_recv_for`/`sys_cap_grant`/`sys_cap_xrevoke`) over three
+/// scratch rows (5/6/7 — every demo fixture has exited and torn down by the time this runs, so the rows are
+/// provably clear and nothing else touches them; every planted resource is dropped again before returning,
+/// verified by the final ledger-clean checks the verdict folds in). Rows 5/6/7 are all private (< USER_SLOTS
+/// = 8), so none is the refused `SHARED_ROW`. Returns true iff ALL hold:
+///
+///  1. THE RE-TRANSFER CASCADE (U7x escape #2): S transfers a console cap to R1 (with CAP_GRANT); R1
+///     re-transfers it onward to R2; S revokes the ROOT transfer -> R1's cap is stale (U7x semantics) AND
+///     R2's re-transferred cap is stale TOO (the tree — U7x provably let this one escape), and a re-grant
+///     from the dead cap is refused.
+///  2. GENERATION-TAGGED INBOXES: a deposit stamped for R1's current tenant, followed by R1's teardown
+///     generation bump (the `clear_handle_row` primitive — here invoked as the bare bump, the exact word
+///     teardown writes), is NEVER delivered to the recycled row's next tenant (RECV discards it; its record
+///     frees, so the sender's later XREVOKE honestly finds nothing).
+///  3. LEDGER HYGIENE: after dropping every planted handle/Proc entry, the handle rows, inboxes, transfer
+///     records AND the derivation ledger are all fully clear — no revoke/discard path leaked a node.
+fn u8_kernel_check() -> bool {
+    const S: usize = 5; // scratch "sender" row
+    const R1: usize = 6; // scratch first recipient
+    const R2: usize = 7; // scratch grand-recipient
+    const PID1: u64 = 0xE1; // planted recipient pids (never collide: PROCS holds only planted entries now)
+    const PID2: u64 = 0xE2;
+    let mut ok = true;
+
+    // Plant the two recipient Proc entries (the pid->slot maps sys_xfer resolves through).
+    let Some(p1) = proc_reserve() else {
+        return false;
+    };
+    let Some(p2) = proc_reserve() else {
+        proc_free(p1);
+        return false;
+    };
+    PROCS[p1].slot.store(R1 + 1, Ordering::Release); // +1-biased, like sys_spawn's pid->slot map
+    PROCS[p1].pid.store(PID1, Ordering::Release);
+    PROCS[p2].slot.store(R2 + 1, Ordering::Release);
+    PROCS[p2].pid.store(PID2, Ordering::Release);
+    // The sender's table: a delegable console cap at 0, a Child handle naming R1's tenant at 2 (in S's row)
+    // and — in R1's own row — a Child handle naming R2's tenant at 2, for the onward hop.
+    install_cap(S, 0, KIND_CONSOLE, HANDLE_CONSOLE, CAP_WRITE | CAP_GRANT);
+    install_cap(S, 2, KIND_CHILD, PID1, 0);
+    install_cap(R1, 2, KIND_CHILD, PID2, 0);
+
+    // 1. The cascade. S -> R1 (keeping CAP_GRANT so R1 may delegate onward) -> R2; then revoke the root.
+    let t1 = sys_xfer_from(S, 2, 0, (CAP_WRITE | CAP_GRANT) as u64);
+    ok &= t1 > 0;
+    let h1 = sys_recv_for(R1);
+    ok &= h1 >= 0;
+    // h2 must carry CAP_GRANT: the laundering assertion below has to reach the U8x tree-deep staleness check
+    // in sys_cap_grant — without CAP_GRANT the earlier missing-right gate returns the same EACCES and the
+    // assertion is vacuous (aarch64 U8 review note, carried into the twin).
+    let t2 = if h1 >= 0 {
+        sys_xfer_from(R1, 2, h1 as u64, (CAP_WRITE | CAP_GRANT) as u64)
+    } else {
+        -1
+    };
+    ok &= t2 > 0;
+    let h2 = sys_recv_for(R2);
+    ok &= h2 >= 0;
+    // Pre-revoke, the grand-received cap carries real authority.
+    ok &= matches!(handle_resolve(R2, h2 as u64, CAP_WRITE), Ok(HandleTarget::Console));
+    // The sender revokes the ROOT transfer...
+    ok &= t1 > 0 && sys_cap_xrevoke(S, t1 as u64) == 0;
+    // ...the direct recipient's cap is stale (U7x's own guarantee, unchanged)...
+    ok &= handle_resolve(R1, h1 as u64, CAP_WRITE).is_err();
+    // ...AND the RE-TRANSFERRED cap is stale too — the U7x escape, closed by the derivation walk.
+    ok &= handle_resolve(R2, h2 as u64, CAP_WRITE).is_err();
+    // ...and the dead cap cannot be laundered by a fresh local mint either — h2 CARRIES CAP_GRANT, so this
+    // EACCES provably comes from the tree-deep staleness check, not the missing-right gate.
+    ok &= sys_cap_grant(R2, h2 as u64, CAP_WRITE as u64) == EACCES;
+
+    // 2. Generations. Deposit for R1's CURRENT tenant, then that tenant tears down (the generation bump is
+    //    the exact store `clear_handle_row` opens with) — the recycled row's next tenant RECVs nothing.
+    let t3 = sys_xfer_from(S, 2, 0, CAP_WRITE as u64);
+    ok &= t3 > 0;
+    SLOT_GEN[R1].fetch_add(1, Ordering::AcqRel); // teardown + recycle: a NEW tenant generation
+    ok &= sys_recv_for(R1) == EAGAIN; // the stale deposit is discarded, never delivered
+    ok &= t3 > 0 && sys_cap_xrevoke(S, t3 as u64) == ENOENT; // its record already freed by the discard
+
+    // 3. Drop everything planted/delivered, then demand every ledger fully clear (subtree tombstones
+    //    drained, no node/record/slot leaked on any of the paths above).
+    if h2 >= 0 {
+        handle_clear(R2, h2 as usize);
+    }
+    if h1 >= 0 {
+        handle_clear(R1, h1 as usize);
+    }
+    handle_clear(R1, 2);
+    handle_clear(S, 2);
+    handle_clear(S, 0);
+    proc_free(p1);
+    proc_free(p2);
+    ok &= handle_row_is_clear(S) && handle_row_is_clear(R1) && handle_row_is_clear(R2);
+    ok &= xfer_row_is_clear(R1) && xfer_row_is_clear(R2);
+    ok &= xfer_recs_all_free() && deriv_all_free();
+    ok
+}
+
+/// U8x launcher + verdict — called by `u7x_launcher` after the whole U7x flow (program-order gating; see
+/// `u7x_launcher`). Flow: one-shot guard; skip silently with no block device (the control-path discipline —
+/// U8x needs no disk); build + pre-endow + spawn the single fixture (`u8x-tree`: index 2 = a console cap
+/// WITH `CAP_REVOKE`, index 3 = one WITHOUT); wait (bounded) for its witness exit; wait (bounded) for its
+/// teardown (row clear + the derivation ledger drained — the tombstone-cascade proof); run the kernel-side
+/// cross-process checks (which need the clear ledgers); PASS iff witness == `U8X_WITNESS_ALL` AND torn down
+/// AND no kill AND the kernel checks held. U8x is the last demo — it releases no further gate.
+fn u8x_launcher(demo_cpu: usize) {
+    // One-shot (the U7x launcher is spawned once; guard defensively anyway).
+    static DONE: AtomicBool = AtomicBool::new(false);
+    if DONE.swap(true, Ordering::Relaxed) {
+        return;
+    }
+    // No block device -> keep the no-storage control path free of demo lines (mirrors the prior gates).
+    if crate::drivers::block::info().is_none() {
+        return;
+    }
+    let Some(fix) = u8x_build() else {
+        serial_println!(":: U8x: no free address-space slot — revocation-tree demo skipped ::");
+        return;
+    };
+    install_cap(fix.slot, U8X_SRC_IDX, KIND_CONSOLE, HANDLE_CONSOLE, CAP_WRITE | CAP_GRANT | CAP_REVOKE);
+    install_cap(fix.slot, U8X_SRC2_IDX, KIND_CONSOLE, HANDLE_CONSOLE, CAP_WRITE | CAP_GRANT);
+    serial_println!(
+        ":: U8x: revocation trees — derivation ledger + generation-tagged inboxes (revoke chases the subtree) ::"
+    );
+    crate::arch::sched::spawn_user_in_space("u8x-tree", fix.entry, fix.sp, demo_cpu, fix.cr3);
+
+    // Wait (bounded, yielding) for the fixture's witness exit, then snapshot the witness.
+    let vdeadline = crate::arch::ticks() + 5000;
+    while U8X_DONE.load(Ordering::Acquire) < 1 && crate::arch::ticks() < vdeadline {
+        crate::arch::sched::yield_now();
+    }
+    let witness = U8X_WITNESS.load(Ordering::Acquire);
+    let killed = U8X_KILLED.load(Ordering::Acquire);
+
+    // Teardown proof: the fixture exited holding live derived handles (g1/g2/g4 and the two endowed sources
+    // — g1/g2 already stale, but their NODES persist as tombstones until the row clears), so its teardown
+    // must drain BOTH the handle row and the derivation ledger. Poll bounded; false->true.
+    let tdeadline = crate::arch::ticks() + 2000;
+    while !(handle_row_is_clear(fix.slot) && deriv_all_free()) && crate::arch::ticks() < tdeadline {
+        crate::arch::sched::yield_now();
+    }
+    let cleared = handle_row_is_clear(fix.slot) && deriv_all_free();
+
+    // Kernel-side cross-process checks (they require the drained ledgers the wait above establishes).
+    let ledger_ok = cleared && u8_kernel_check();
+
+    if witness == U8X_WITNESS_ALL && cleared && ledger_ok && killed == 0 {
+        serial_println!(
+            ":: U8x: revocation trees — parent revoke kills re-grant + re-transfer, generation-tagged inbox, ledger clean -> PASS ::"
+        );
+    } else {
+        serial_println!(
+            ":: U8x: revocation trees FAIL — witness={:#x} cleared={} ledger={} killed={} done={} (want {:#x}/true/true/0/1) ::",
+            witness,
+            cleared,
+            ledger_ok,
+            killed,
+            U8X_DONE.load(Ordering::Acquire),
+            U8X_WITNESS_ALL
         );
     }
 }
