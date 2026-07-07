@@ -402,6 +402,22 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
                 cpu,
                 vcpu,
             );
+
+            // U6b: real File handles — SYS_OPEN/SYS_READ routed through the object table, making U6a's `File`
+            // scaffold real (the first resource syscall on a non-Console object; the precursor to UnaFS grants).
+            // A gated kernel task on `vcpu` (the u6-launch idiom), demo core `cpu` as its arg: it waits for the
+            // U6 verdict (U6_LAUNCH_DONE), builds a fixture slot, pre-endows it (a File handle WITHOUT CAP_READ
+            // + a Socket handle WITH CAP_READ) and plants the expected on-disk prefix, then runs `el0-u6bfile`
+            // on `cpu`. That fixture opens HELLO.BIN, reads it through the returned File capability and verifies
+            // the bytes, then proves the SYS_READ CHECK denies both a no-CAP_READ File (rights arm) and a
+            // non-File Socket (kind arm) with -EACCES. Gated after U6 for the same reason U6 gates after U5 —
+            // the 8 slots free as the prior fixtures exit. Fully QEMU-verifiable (reads the SD, like U4/U6).
+            unaos_kernel::arch::sched::spawn(
+                "u6b-launch",
+                unaos_kernel::arch::syscall::u6b_launcher,
+                cpu,
+                vcpu,
+            );
         }
     }
 

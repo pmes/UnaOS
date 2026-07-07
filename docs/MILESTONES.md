@@ -197,6 +197,56 @@ Legend: **✅ metal-confirmed** · **🔬 QEMU-green, metal pending** · dates I
 
 ## hw-pi4 track — 2026-07-04 (landed on `hw-pi4`, awaiting integration)
 
+### U6b — real File handles: `SYS_OPEN`/`SYS_READ` routed through the object table via `File` + `CAP_READ` (aarch64) ✅ `hw-pi4`
+- **What:** makes U6a's `File` **scaffold** real — the first resource syscall routed through a **non-Console**
+  object, and the direct precursor to UnaFS grants (a program opening a disk file under a capability).
+  **`SYS_OPEN = 11`**`(name_ptr, name_len)` → `copy_from_user`s the bounded 8.3 name, mounts the single
+  read-only FAT volume, finds the top-level entry, records a per-task **open-file descriptor** and installs a
+  `File` handle carrying `CAP_READ`; **`SYS_READ = 12`**`(handle, buf, len)` → the CHECK
+  `handle_resolve(asid, handle, CAP_READ)` must yield a `File` (a missing right, a non-File kind, or no handle
+  all give `-EACCES` — the twin of `sys_write`'s Console+`CAP_WRITE`), then it clamps to `min(len, size-offset)`,
+  validates the destination (`user_range_ok(.., writable=true)` — a bad buffer is `-EFAULT` with no read and no
+  offset move), reads through a new read-only **offset-aware** FAT reader (`fat::read_at`), `copy_to_user`s, and
+  advances the descriptor's offset by the count delivered (`0` = EOF; sequential, no seek). The descriptor lives
+  in a small **per-task FILES table** — parallel atomic arrays (`FILE_USED`/`FILE_CLUSTER`/`FILE_SIZE`/
+  `FILE_OFFSET`, keyed `[asid][idx]`, `NFILE = 4`), the same lock-free sidecar shape as `HANDLE_RIGHTS`/
+  `HANDLE_KIND`; the `File` handle's value word carries the **file-id = descriptor index + 1** (the `+1` bias
+  keeps it clear of the value word's `0`/`u64::MAX` sentinels, structurally). **Teardown-clear** extends U5's
+  discipline to files: `clear_handle_row` now also clears the FILES row, so a reused ASID starts with no stale
+  file, no leaked offset, no aliasable descriptor. **Scope by design:** read-only, flat root, one FAT volume, no
+  write/create/delete, no seek, no directory ops, no second mount — `SYS_OPEN` is the hook a later arc's UnaFS
+  `owner`/`grants:*` enforcement rides. Lane: `arch/aarch64/syscall.rs` (the FILES table, `SYS_OPEN`/`SYS_READ`,
+  the teardown-clear extension, the demo) + a `main.rs` launcher + `fs/fat.rs` (a read-only `read_at` +
+  `first_cluster()` getter; `read_file` left **byte-identical** for its M6g/U4 caller); no scheduler primitive,
+  no `boot.rs` change (the teardown-clear folds into `clear_handle_row`), no x86 file.
+- **Tested — QEMU:** `./arroyo kernel8-test` → after the U6 PASS line: the U6b setup line and `:: U6b: real
+  File handles — open+read via a File capability OK, no-CAP_READ -EACCES, wrong-kind -EACCES -> PASS ::`. The
+  `el0-u6bfile` fixture opens `HELLO.BIN`, reads its first 16 bytes through the returned `File` capability and
+  verifies they equal the kernel-planted on-disk prefix (`USER_BLOB[..16]` — `HELLO.BIN` on the media *is*
+  `USER_BLOB`), then proves the CHECK denies both a **present File lacking `CAP_READ`** (the rights arm) and a
+  **`Socket` carrying `CAP_READ`** (the kind arm, `SYS_READ` serves `File` only) with `-EACCES` — witness `0x1F`
+  (all five bits). The launcher additionally proves the **file-row teardown-clear** kernel-side (the fixture
+  exits holding two live descriptors — its own open + a pre-endowed no-cap File — so `files_row_is_clear`
+  transitions false→true when its slot retires). Every M6b/M6d/M6e/M6f/M6g/U4/U5/U6 verdict line
+  **byte-identical** (the shared FAT mount does not regress M6g/U4 — both still PASS their disk loads) and
+  CAPSTONE 6/6, 0 unexpected faults. `check` both arches; x86 `test` MISSION SUCCESS; aarch64 virt v2 clean USB
+  enumeration + GICv3 CAPSTONE 6/6 unchanged; zero x86 files.
+- **Tested — metal:** ✅ **METAL-CONFIRMED on the real Pi 4 (2026-07-06)** — Peter booted (non-destructive
+  `kernel8.img` swap on the mounted FAT; `HELLO.BIN` was already byte-identical to this build, so the
+  bytes-match test is exact), I ran the Debug-Probe serial bridge. On silicon: `:: U6b: real File handles —
+  open+read via a File capability OK, no-CAP_READ -EACCES, wrong-kind -EACCES -> PASS ::` — the fixture opened
+  `HELLO.BIN` and read it through a `File` capability off the **real EMMC2/SD card** (the metal-only EMMC2-first
+  leg `SD card @0xfe340000 identified — 31116288 blocks (15193 MiB, CSD v2)`, which QEMU cannot exercise), and
+  both `-EACCES` denials held. `EL=1`/`CNTFRQ=54 MHz`, EL0 preempt live (`M6e IRQs-taken-at-EL0=23`,
+  `M6f spsentinel=2`), full battery green (M6b `exited=1 killed=3`, M6d ×3, M6f ×3, M6g/U4/U5/U6 PASS), 0
+  unexpected faults. (The scheduler CAPSTONE demo sat out this particular boot — only 3 of 4 cores came online,
+  and it needs the full 4; that is a known metal SMP AP-bring-up variance in the scheduler track, orthogonal to
+  U6b's pure-syscall logic.) Metal log `unaos/target/serial-pi.u6b-metal.log`.
+- **Deferred:** file **writes**/create/delete, **seek**/`lseek`, **directory** ops (the natural extensions once
+  read-only File handles are proven); real **`Socket`** handles (net syscalls — the fs twin of this arc); UnaFS
+  `owner`/`grants:*` checked on `SYS_OPEN` (rides the kernel UnaFS mount, K2/K3); a second mount / media detect.
+- **Commit:** this arc on `hw-pi4` (merge pending the integrator, who records the merge hash).
+
 ### U6a — the general object table: `(kind, target, rights)` descriptors, first-free for ALL kinds, the `CONSOLE_FD` collision closed (aarch64) ✅ `hw-pi4`
 - **What:** generalizes U5's fixed-shape handle into a general **object descriptor**. A handle now
   names one of four **kinds** — `Child(pid)` (U4), `Console` (U5), and the **scaffolds** `File(id)` /
