@@ -1127,6 +1127,15 @@ fn tegra_early_stop(boot_info: &'static mut BootInfo) -> ! {
         // the XUSB stream (SMR match -> S2CR bypass) and turn the client port back on with
         // USFCFG=1 so anything unexpected faults-and-logs instead of dying silently.
         unaos_kernel::arch::smmu_tegra::jb3_open_stream(&jb3_bases[..jb3_n], jb3_sid);
+        // JB3 boot-6 (discrimination): the v2 pair is open + fault-free yet DMA still dies —
+        // a second killer sits downstream. Census the DTB's smmu/iommu nodes (find any
+        // SMMUv3 without touching unknown addresses), dump the v3's CR0/GBPA state if one
+        // exists, and bracket the attach with MC error-log reads.
+        let v3 = unaos_kernel::arch::fdt_tegra::smmu_census(dtb_addr, dtb_size, mmu.ram_gib_mask);
+        if let Some(v3_base) = v3 {
+            unaos_kernel::arch::smmu_tegra::jb3_v3_dump(v3_base);
+        }
+        unaos_kernel::arch::smmu_tegra::jb3_mc_errs("pre-attach");
         let coherent = unaos_kernel::arch::fdt_tegra::xusb_dma_coherent(
             dtb_addr,
             dtb_size,
@@ -1137,6 +1146,10 @@ fn tegra_early_stop(boot_info: &'static mut BootInfo) -> ! {
         // watchdogs), sGFSR/sGFSYNR say whether THIS block recorded the kills — and name the
         // faulting StreamID.
         unaos_kernel::arch::smmu_tegra::jb3_faults(&jb3_bases[..jb3_n]);
+        unaos_kernel::arch::smmu_tegra::jb3_mc_errs("post-attach");
+        if let Some(v3_base) = v3 {
+            unaos_kernel::arch::smmu_tegra::jb3_v3_dump(v3_base);
+        }
         if attached {
             unaos_kernel::arch::sched::spawn(
                 "jb2-kbd",

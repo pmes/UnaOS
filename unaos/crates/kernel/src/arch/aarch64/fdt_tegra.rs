@@ -547,6 +547,89 @@ pub fn jb1a_dump(dtb_addr: u64, dtb_size: usize, ram_gib_mask: u64) {
     }
 }
 
+/// JB3 boot-6: census of EVERY smmu/iommu node the firmware DTB knows — name, compatible,
+/// first reg base. Boot-5's verdict (v2 pair open + fault-free, DMA still dead) means a second
+/// killer sits downstream; Tegra234 carries SMMUv3 instances alongside the MMU-500 pairs, and
+/// this walk finds their bases WITHOUT touching any unknown address (read-only RAM). Returns
+/// the first base whose compatible contains "smmu-v3" (the dump candidate), if any.
+pub fn smmu_census(dtb_addr: u64, dtb_size: usize, ram_gib_mask: u64) -> Option<u64> {
+    if dtb_addr == 0 || dtb_size == 0 {
+        return None;
+    }
+    let g_lo = dtb_addr >> 30;
+    let g_hi = (dtb_addr + dtb_size as u64 - 1) >> 30;
+    let mapped = |g: u64| g == 0 || (g < 64 && (ram_gib_mask >> g) & 1 != 0);
+    if !mapped(g_lo) || !mapped(g_hi) {
+        return None;
+    }
+    let blob = unsafe { core::slice::from_raw_parts(dtb_addr as *const u8, dtb_size) };
+    let fdt = Fdt::new(blob)?;
+    // Collect unique matching node paths (bounded), then print each once with compatible+reg.
+    const MAX_NODES: usize = 8;
+    let mut paths = [[0u8; MAX_PATH]; MAX_NODES];
+    let mut lens = [0usize; MAX_NODES];
+    let mut n = 0usize;
+    fdt.for_each_prop(|e| {
+        let hit = e.path.windows(4).any(|w| w == b"smmu")
+            || e.path.windows(6).any(|w| w == b"iommu@");
+        if !hit || n >= MAX_NODES {
+            return;
+        }
+        let l = e.path.len().min(MAX_PATH);
+        let dup = (0..n).any(|i| lens[i] == l && &paths[i][..l] == &e.path[..l]);
+        if !dup {
+            paths[n][..l].copy_from_slice(&e.path[..l]);
+            lens[n] = l;
+            n += 1;
+        }
+    });
+    let mut v3_base: Option<u64> = None;
+    for i in 0..n {
+        let node = &paths[i][..lens[i]];
+        let compat = fdt.prop_at(node, b"compatible");
+        let mut cbuf = [b' '; 44];
+        let mut cl = 0usize;
+        let mut is_v3 = false;
+        'fill: for wi in 0..compat.n {
+            for b in compat.words[wi].to_be_bytes() {
+                if cl >= cbuf.len() {
+                    break 'fill;
+                }
+                cbuf[cl] = if b == 0 { b'|' } else if b.is_ascii_graphic() { b } else { b'?' };
+                cl += 1;
+            }
+        }
+        // "smmu-v3" anywhere in the ASCII view
+        if cl >= 7 {
+            for w in cbuf[..cl].windows(7) {
+                if w == b"smmu-v3" {
+                    is_v3 = true;
+                }
+            }
+        }
+        let reg = fdt.prop_at(node, b"reg");
+        let base = if reg.n >= 2 {
+            ((reg.words[0] as u64) << 32) | reg.words[1] as u64
+        } else {
+            0
+        };
+        serial_println!(
+            ":: tegra: JB3 — census {}: reg0={:#010x} compat='{}'{} ::",
+            core::str::from_utf8(node).unwrap_or("?"),
+            base,
+            core::str::from_utf8(&cbuf[..cl]).unwrap_or("?"),
+            if is_v3 { " *V3*" } else { "" }
+        );
+        if is_v3 && v3_base.is_none() && base != 0 {
+            v3_base = Some(base);
+        }
+    }
+    if n == 0 {
+        serial_println!(":: tegra: JB3 — census: no smmu/iommu nodes found ::");
+    }
+    v3_base
+}
+
 /// JB3: the XUSB host node's `iommus` binding, resolved to the SMMU node it names — stream id
 /// + the SMMU instance base(s) + a bounded ASCII view of its `compatible`, all off the LIVE
 /// firmware DTB (verify-don't-assume: mainline tegra234.dtsi predicts

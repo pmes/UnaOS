@@ -200,7 +200,13 @@ pub fn jb3_open_stream(bases: &[u64], xusb_sid: u32) {
     );
     for (i, &base) in bases.iter().enumerate() {
         let scr0_pre = rd(base, SCR0);
-        wr(base, SMR_BASE, (1 << 31) | (xusb_sid & 0x7fff));
+        // Boot-2/-4 metal verdicts: the controller does NOT emit the DTB's bare SID — it
+        // decorates the upper bits per transaction class (observed: 0x80e event-ring writes,
+        // 0xc0e command-ring reads, 0x100e on inst1; each named by the USFCFG=1 fault logs,
+        // sGFAR matching our ring addresses exactly). Match with MASK=0x7f00 (SMR mask bits
+        // are DON'T-CARE): any SID whose low 8 bits are the XUSB_HOST id hits the bypass —
+        // and no other Tegra234 master shares that low byte, so nothing else does.
+        wr(base, SMR_BASE, (1 << 31) | (0x7f00 << 16) | (xusb_sid & 0x7fff));
         wr(base, S2CR_BASE, 0b01 << 16); // TYPE=bypass, CBNDX dont-care
         let scr0_new = (scr0_pre & !1) | (1 << 10); // CLIENTPD=0, USFCFG=1
         wr(base, SCR0, scr0_new);
@@ -228,6 +234,52 @@ pub fn jb3_open_stream(bases: &[u64], xusb_sid: u32) {
         }
     }
     serial_println!(":: tegra: JB3 — XUSB stream opened (SMR bypass + client port on) ::");
+}
+
+/// JB3 boot-6: the MC error log — the always-on memory controller records aborted client
+/// requests (status names the client + reason, ADR the address). Legacy layout at the
+/// broadcast base (INTSTATUS 0x00, ERR_STATUS 0x08, ERR_ADR 0x0c); the same block whose SID
+/// region we already read safely. Read-only.
+pub fn jb3_mc_errs(tag: &str) {
+    let ist = rd(MC_SID_BASE, 0x00);
+    let est = rd(MC_SID_BASE, 0x08);
+    let adr = rd(MC_SID_BASE, 0x0c);
+    serial_println!(
+        ":: tegra: JB3 — MC {} INTSTATUS={:#010x} ERR_STATUS={:#010x} ERR_ADR={:#010x} ::",
+        tag,
+        ist,
+        est,
+        adr
+    );
+}
+
+/// JB3 boot-6: read-only dump of an SMMUv3 instance (base from the DTB census — never a
+/// guessed address). v3 layout: IDR0 0x0, IDR1 0x4, CR0 0x20, CR0ACK 0x24, GBPA 0x44
+/// (ABORT b20, UPDATE b31), STRTAB_BASE 0x80/0x84, STRTAB_BASE_CFG 0x88. If CR0.SMMUEN=0,
+/// GBPA governs every incoming transaction — GBPA.ABORT=1 is the classic silent-drop config.
+pub fn jb3_v3_dump(base: u64) {
+    serial_println!(":: tegra: JB3 — SMMUv3 @{:#010x} first touch (read-only) ::", base);
+    let idr0 = rd(base, 0x00);
+    let idr1 = rd(base, 0x04);
+    let cr0 = rd(base, 0x20);
+    let cr0ack = rd(base, 0x24);
+    let gbpa = rd(base, 0x44);
+    let st_lo = rd(base, 0x80);
+    let st_hi = rd(base, 0x84);
+    let st_cfg = rd(base, 0x88);
+    serial_println!(
+        ":: tegra: JB3 — v3 IDR0={:#010x} IDR1={:#010x} CR0={:#010x} (SMMUEN={}) CR0ACK={:#010x} GBPA={:#010x} (ABORT={}) STRTAB={:#x}_{:08x} CFG={:#010x} ::",
+        idr0,
+        idr1,
+        cr0,
+        cr0 & 1,
+        cr0ack,
+        gbpa,
+        (gbpa >> 20) & 1,
+        st_hi,
+        st_lo,
+        st_cfg
+    );
 }
 
 fn jb3_fault_line(i: usize, base: u64, tag: &str) {
