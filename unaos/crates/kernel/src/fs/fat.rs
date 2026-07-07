@@ -14,14 +14,18 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-//! Read-only FAT16 / FAT32 reader built on the generic block device.
+//! FAT16 / FAT32 reader (+ U9 in-place writer) built on the generic block device.
 //!
 //! Handles both a **superfloppy** (the FAT BPB sits at LBA 0, no partition table) and an
 //! **MBR-partitioned** disk (an MBR at LBA 0 whose partition entry points at the BPB). All
-//! multi-byte on-disk fields are little-endian. This module is read-only — it never writes to
-//! the FAT, directories, or data — so a mis-parse can at worst report garbage, never corrupt a
-//! volume. FAT type is determined strictly by the data-cluster count per the Microsoft FAT
-//! specification (the only correct method). FAT12 and non-512-byte logical sectors are rejected.
+//! multi-byte on-disk fields are little-endian. Parsing is read-only — a mis-parse can at worst
+//! report garbage, never corrupt a volume. The ONE mutating entry point is [`FatFs::write_at`]
+//! (U9): a bounded **in-place overwrite** that read-modify-writes only the data sectors already
+//! belonging to an existing file's cluster chain — it never grows a file, never allocates or
+//! frees clusters, and never writes the FAT or a directory entry, so it cannot change the volume's
+//! structure (size/layout) or any file but the one addressed, and only within its current bytes.
+//! FAT type is determined strictly by the data-cluster count per the Microsoft FAT specification
+//! (the only correct method). FAT12 and non-512-byte logical sectors are rejected.
 
 use alloc::string::String;
 use core::sync::atomic::{AtomicBool, Ordering};
@@ -192,6 +196,16 @@ fn read_sector(lba: u64, buf: &mut [u8; SECTOR_SIZE]) -> Result<(), FatError> {
     match crate::drivers::block::read_block(lba, buf) {
         Ok(n) if n >= SECTOR_SIZE => Ok(()),
         _ => Err(FatError::Io),
+    }
+}
+
+/// U9: write one full 512-byte sector at absolute `lba` from `buf`. The write half of `read_sector`; the
+/// caller supplies a whole sector (a read-modify-write already merged the changed bytes). Any block error
+/// is `FatError::Io`. Used ONLY by `write_at`, which passes only LBAs it walked out of an existing chain.
+fn write_sector(lba: u64, buf: &[u8; SECTOR_SIZE]) -> Result<(), FatError> {
+    match crate::drivers::block::write_block(lba, buf) {
+        Ok(()) => Ok(()),
+        Err(_) => Err(FatError::Io),
     }
 }
 
@@ -705,6 +719,94 @@ impl FatFs {
             }
         }
         Ok(())
+    }
+
+    /// U9: overwrite up to `data.len()` bytes of a file **in place**, starting at byte offset `start` within
+    /// the file, given the file's first cluster and byte `size` (the two fields `SYS_OPEN` records). The write
+    /// half of `read_at` and its exact structural twin: it walks the cluster chain from the first cluster,
+    /// skipping whole clusters/sectors up to `start`, then read-modify-writes each touched sector (read it,
+    /// overwrite the `[start..)` slice, write it back). Returns the number of bytes written.
+    ///
+    /// STRICTLY BOUNDED — this is what makes it safe to call on a real volume:
+    ///   * **Never grows a file**: the write is clamped to `min(size, start + data.len())`, so it never writes
+    ///     past the file's current EOF. A `start >= size` write is a clean 0-byte no-op (never grows).
+    ///   * **Never allocates/frees clusters**: it only visits clusters ALREADY in the chain; no FAT entry is
+    ///     ever written (`fat_entry` is read-only here, exactly as in `read_at`).
+    ///   * **Never mutates a directory**: the on-disk `size` and the directory entry are untouched — a caller
+    ///     that re-`mount`s and `find_in_root`s the file sees the same size and chain head afterwards.
+    /// Guards against bad/free clusters and chain loops exactly as `read_at`. A chain that ends before `size`
+    /// (a malformed volume) yields a SHORT write (the returned count) rather than writing outside the chain.
+    pub fn write_at(
+        &self,
+        first_cluster: u32,
+        size: u32,
+        start: u32,
+        data: &[u8],
+    ) -> Result<usize, FatError> {
+        if start >= size {
+            return Ok(0); // at or past EOF — nothing to overwrite (never grows the file)
+        }
+        // Total bytes to write: from `start` to the earlier of EOF and `start + data.len()`. `start < size`
+        // above, so `end > start` whenever `data` is non-empty.
+        let end = core::cmp::min(size as usize, (start as usize).saturating_add(data.len()));
+        let mut want = end - start as usize; // bytes still to write; decremented as sectors are written
+        let total = want;
+        if want == 0 {
+            return Ok(0); // empty source slice
+        }
+        if !self.valid_cluster(first_cluster) {
+            return Err(FatError::BadChain);
+        }
+        let clus_bytes = self.sec_per_clus as usize * SECTOR_SIZE;
+        let mut cluster = first_cluster;
+        let mut hops = 0u32;
+        let mut buf = [0u8; SECTOR_SIZE];
+        let mut skip = start as usize; // bytes still to skip before the first written byte
+        let mut src_off = 0usize; // bytes of `data` already written
+        'chain: loop {
+            if !self.valid_cluster(cluster) {
+                return Err(FatError::BadChain);
+            }
+            if skip >= clus_bytes {
+                // The whole cluster is before `start` — skip it without touching the disk.
+                skip -= clus_bytes;
+            } else {
+                for s in 0..self.sec_per_clus as u64 {
+                    if skip >= SECTOR_SIZE {
+                        skip -= SECTOR_SIZE; // this whole sector is still before `start`
+                        continue;
+                    }
+                    let lba = self.cluster_lba(cluster) + s;
+                    let from = skip; // nonzero only on the first partially-skipped sector
+                    skip = 0;
+                    let take = core::cmp::min(want, SECTOR_SIZE - from);
+                    // Read-modify-write: read the sector, overwrite [from..from+take], write it back. Even a
+                    // full-sector overwrite reads first (uniform RMW — the brief's "read-modify-write the
+                    // touched sectors"; a partial first/last sector's untouched bytes MUST be preserved).
+                    read_sector(lba, &mut buf)?;
+                    buf[from..from + take].copy_from_slice(&data[src_off..src_off + take]);
+                    write_sector(lba, &buf)?;
+                    src_off += take;
+                    want -= take;
+                    if want == 0 {
+                        break 'chain;
+                    }
+                }
+            }
+            let next = self.fat_entry(cluster)?;
+            if self.is_eoc(next) {
+                break; // chain ended before `end` (malformed vs `size`) — return the short write
+            }
+            if self.is_bad(next) || next < 2 {
+                return Err(FatError::BadChain);
+            }
+            cluster = next;
+            hops += 1;
+            if hops > self.count_of_clusters {
+                return Err(FatError::BadChain); // chain longer than the volume has clusters -> loop
+            }
+        }
+        Ok(total - want)
     }
 }
 

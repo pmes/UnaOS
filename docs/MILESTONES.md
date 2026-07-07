@@ -10,6 +10,56 @@ Legend: **✅ metal-confirmed** · **🔬 QEMU-green, metal pending** · dates I
 
 ---
 
+## hw-pi4 track — 2026-07-07 (Opus round, post-Campaign 2)
+
+### U9 — real File writes + seek: EMMC2 sector write, in-place `fat::write_at`, `SYS_SEEK`, File+`CAP_WRITE`-routed `sys_write` (aarch64) 🔬 `hw-pi4`
+- **What:** gives U6b's read-only `File`+`CAP_READ` its WRITE half — `CAP_WRITE` on a `File` now
+  means something. Bottom-up: (1) **EMMC2 sector write** — `emmc2::write_block_512`, the exact mirror
+  of the polled CMD17 read path with three deltas (`WRITE_SINGLE_BLOCK`/`cmd(24)` host→card so
+  `CMD_DAT_DIR_READ` is omitted; the Buffer-**Write**-Ready bit `INT_WRITE_RDY = 1<<4`, distinct from
+  the read path's bit 5; a FIFO that PUSHES 128 LE words, short buffers zero-padded to a full sector);
+  same `send_command`, same bounded CNTPCT deadlines. (2) **Block seam** — `block::write_block` routes
+  the SD backend to it (previously refused), inside the existing `#[cfg(aarch64, baremetal)]` arm so the
+  x86 xHCI write path is byte-identical. (3) **`fat::write_at`** — the write twin of `read_at`: walks
+  the file's existing chain, skips to `start`, read-modify-writes only the touched data sectors.
+  BOUNDED BY CONSTRUCTION — clamped to `min(size, start+len)` so it **never grows** a file (write
+  at/after EOF = 0-byte no-op), visits only in-chain clusters so it **never allocates or writes a FAT
+  entry**, and **never touches a directory** (on-disk size + chain head unchanged). (4) **`SYS_SEEK = 15`**
+  `(handle, offset)` — absolute seek; CHECK requires a `File` with ANY of `CAP_READ|CAP_WRITE`, past-size
+  ⇒ `-EINVAL` (seeking TO `size` is legal), sets the U6b `FILE_OFFSET` (now settable). (5) **Routed
+  writes** — `SYS_OPEN` gains a mode bit in `a2` (`0`=RO/`CAP_READ`, `1`=RW/`CAP_READ|CAP_WRITE`);
+  `sys_write` is kind-dispatched at its single `handle_resolve(asid, fd, CAP_WRITE)` CHECK — `Console`
+  streams to serial (byte-identical), `File`+`CAP_WRITE` overwrites in place at the descriptor offset via
+  `sys_write_file`→`fat::write_at` (the write twin of `sys_read`'s clamp/validate/offset discipline).
+  Because the U7/U8 derivation-revocation walk lives INSIDE `handle_resolve`, a revoked File-write cap is
+  `-EACCES` at the write with **no new code**.
+- **Tested — QEMU:** `./arroyo kernel8-test 30` → after the U8 PASS: the U9 setup line and
+  `:: U9: real File writes — open-RW+seek+write+readback OK, RO-write/wrong-kind/revoked-cap all -EACCES,
+  on-disk sector changed + size unchanged -> PASS ::`. The `el0-u9write` fixture (register-only, single
+  slot, witness `0x1F`) opens a DEDICATED scratch file (`SCRATCH.BIN`, 1 KiB of `0xEE` planted by the
+  launcher's FAT image — never `HELLO.BIN`) RW, seeks to a partial-sector offset, overwrites a 16-byte
+  sentinel in place, seeks back and reads it through the SAME cap, and proves the RO-write + wrong-kind
+  `-EACCES` denials; the launcher folds the kernel-side proofs — a fresh-mount raw re-read shows the
+  sector CHANGED (to the sentinel, differing from the pre-image) while the directory size did NOT, and a
+  scratch-ASID setup proves a U8-revoked File-write cap `-EACCES` (revoking a granted ancestor makes the
+  derived `CAP_WRITE` resolve fail — exactly `sys_write`'s only gate). **Every prior verdict
+  byte-identical** (sorted scratch-worktree baseline diff vs `e8db35c` — only the U9 lines + the
+  binary-growth VBAR shift `0xad000`→`0xad800` differ), 14 prior PASS + U9 = 15, CAPSTONE 6/6, 0
+  unexpected faults; `./arroyo test-arm 22` byte-identical (the driver is baremetal-gated); `./arroyo
+  check` both arches; **zero x86 files**.
+- **Honest scope:** IN-PLACE OVERWRITE ONLY. Deferred (each needs an allocation-policy pass): file
+  growth / cluster allocation / create / delete / truncate; directory mutation; write-back caching
+  (every write is a synchronous RMW to the card); UnaFS `owner`/`grants:*` on `SYS_OPEN` (the RW mode
+  bit is the local precursor; the ACL check rides the kernel UnaFS mount, K2/K3). **Lane:** the seat
+  widened the pi4 lane to the shared `fat.rs`/`block.rs` + the FAT image builder for this arc after the
+  executor stopped and reported; `fat::write_at` is purely additive (x86 never calls it), the block seam
+  + image plant are cfg-/pi-scoped.
+- **Metal:** none this arc — **but the EMMC2 WRITE is the first write the driver has ever issued to the
+  card**, so real-silicon timing (buffer-write-ready latency, DAT0 programming-busy) is proven only on
+  the next Pi boundary. QEMU's generic-sdhci models the PIO write FIFO but not that timing. Call out on
+  the boundary.
+- **Commit:** on `hw-pi4` (Opus-executed, post-Campaign 2).
+
 ## hw-rmbp track — 2026-07-07 (Campaign 2, Fable-executed)
 
 ### U7x — cross-process capability transfer: inbox-mediated `SYS_XFER`/`SYS_RECV` + sender revoke, single-writer preserved (x86) 🔬 `hw-rmbp`

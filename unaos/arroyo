@@ -468,6 +468,13 @@ kernel8() {
     # Mirror of the x86 carry (make-fat-img.sh's HELLO_BIN block).
     cp "${WORKSPACE_DIR}/target/user_blob.bin" "$KERNEL8_DIR/HELLO.BIN"
 
+    # U9: plant a DEDICATED writable scratch file (NEVER HELLO.BIN — other fixtures load that as EL0 code).
+    # 1 KiB (> 512 so fat::probe_once never cats it) of a known 0xEE filler; the u9 File-write demo opens it
+    # RW, seeks in, overwrites a 16-byte sentinel IN PLACE, reads it back, and the launcher re-reads the raw
+    # sector to prove it changed while the file size did not. Re-created every kernel8 build (KERNEL8_DIR is
+    # wiped above + the .img is rebuilt), so each kernel8-test run gets a pristine scratch file.
+    head -c 1024 /dev/zero | tr '\000' '\356' > "$KERNEL8_DIR/SCRATCH.BIN"
+
     bash "${WORKSPACE_DIR}/scripts/make-pi-img.sh" "$KERNEL8_DIR" "${WORKSPACE_DIR}/target/UnaOS-pi4-baremetal.img" 64
     echo -e "${COLOR_GREEN}✅ Flashable image: target/UnaOS-pi4-baremetal.img — Imager → Use custom → microSD → SD slot.${COLOR_RESET}"
 }

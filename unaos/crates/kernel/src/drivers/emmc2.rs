@@ -61,6 +61,7 @@ const C1_SRST_HC: u32 = 1 << 24;
 // --- INTERRUPT (0x30) bits (W1C). ---
 const INT_CMD_DONE: u32 = 1 << 0;
 const INT_DATA_DONE: u32 = 1 << 1;
+const INT_WRITE_RDY: u32 = 1 << 4; // Buffer Write Ready (U9 write path); the READ path uses bit 5 below
 const INT_READ_RDY: u32 = 1 << 5;
 const INT_ERR: u32 = 1 << 15; // summary of any error interrupt (bits 16+)
 /// Any error: the error-summary bit OR any of the error-status bits [31:16].
@@ -75,6 +76,7 @@ const CMD_CRCCHK: u32 = 1 << 19;
 const CMD_IXCHK: u32 = 1 << 20;
 const CMD_ISDATA: u32 = 1 << 21;
 const CMD_DAT_DIR_READ: u32 = 1 << 4; // 1 = card -> host
+const CMD_DAT_DIR_WRITE: u32 = 0 << 4; // 0 = host -> card (U9; a no-op OR — the point is to OMIT DAT_DIR_READ)
 #[inline]
 const fn cmd(index: u32) -> u32 {
     index << 24
@@ -436,4 +438,68 @@ pub fn read_block_512(lba: u64, buf: &mut [u8]) -> Result<usize, BlockError> {
         return Err(BlockError::Io);
     }
     Ok(n)
+}
+
+/// U9: write one 512-byte block at `lba` from `buf` via a polled single-block CMD24 — the exact mirror of
+/// `read_block_512` with three deltas: the command is WRITE_SINGLE_BLOCK (`cmd(24)`, direction host->card so
+/// `CMD_DAT_DIR_READ` is OMITTED), the ready bit is Buffer-Write-Ready (`INT_WRITE_RDY`, bit 4) not
+/// Buffer-Read-Ready (bit 5), and the FIFO loop PUSHES 128 little-endian words instead of draining them.
+/// Backs `drivers::block::write_block` on the SD backend. `buf` shorter than 512 is zero-padded to the block
+/// size (the block-layer convention) — the controller demands exactly 128 words or it stalls / corrupts the
+/// block, so we always push a full sector. No cache maintenance (PIO from a normal kernel buffer, no DMA).
+///
+/// ⚠ This is the FIRST metal-risk WRITE path on the Pi 4 EMMC2 driver: QEMU's generic-sdhci models the PIO
+/// write FIFO, but silicon timing (buffer-write-ready latency, DAT0 programming-busy) is only proven on metal.
+pub fn write_block_512(lba: u64, buf: &[u8]) -> Result<(), BlockError> {
+    let guard = CARD.lock();
+    let card = guard.as_ref().ok_or(BlockError::NotReady)?;
+    if lba >= card.num_blocks {
+        return Err(BlockError::BadLba);
+    }
+    // SDSC uses byte addressing; guard that the byte offset fits the 32-bit ARG1 register (as the read path does).
+    let arg = if card.block_addressing {
+        lba as u32
+    } else {
+        let byte_off = lba.checked_mul(512).filter(|&b| b <= u32::MAX as u64).ok_or(BlockError::BadLba)?;
+        byte_off as u32
+    };
+    let base = card.base;
+
+    write32(base, INTERRUPT, 0xFFFF_FFFF); // clear stale status
+    write32(base, BLKSIZECNT, (1 << 16) | 512); // one block, 512 bytes
+
+    // CMD24 WRITE_SINGLE_BLOCK: R1 (CRC+index check) + data present + host->card direction (no DAT_DIR_READ).
+    send_command(
+        base,
+        cmd(24) | CMD_RESP_48 | CMD_CRCCHK | CMD_IXCHK | CMD_ISDATA | CMD_DAT_DIR_WRITE,
+        arg,
+    )
+    .map_err(|_| BlockError::Io)?;
+
+    // PIO out: wait for the write buffer to be ready, push 128 little-endian words, then wait transfer-complete.
+    if !wait_set(base, INTERRUPT, INT_WRITE_RDY, DATA_TIMEOUT_MS) {
+        return Err(BlockError::Io);
+    }
+    write32(base, INTERRUPT, INT_WRITE_RDY); // W1C
+    let n = buf.len().min(512);
+    for i in 0..128usize {
+        let off = i * 4;
+        // Assemble one LE word from up to four source bytes; bytes past `n` (a short buffer) are zero-padded.
+        let mut word = [0u8; 4];
+        for (k, slot) in word.iter_mut().enumerate() {
+            if off + k < n {
+                *slot = buf[off + k];
+            }
+        }
+        write32(base, DATA, u32::from_le_bytes(word));
+    }
+    if !wait_set(base, INTERRUPT, INT_DATA_DONE | INT_ERR_ANY, DATA_TIMEOUT_MS) {
+        return Err(BlockError::Io);
+    }
+    let int = read32(base, INTERRUPT);
+    write32(base, INTERRUPT, int); // W1C everything we saw
+    if int & INT_ERR_ANY != 0 {
+        return Err(BlockError::Io);
+    }
+    Ok(())
 }
