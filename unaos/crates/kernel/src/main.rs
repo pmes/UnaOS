@@ -653,6 +653,12 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
             // an inline blob (no FAT I/O).
             #[cfg(target_arch = "x86_64")]
             unaos_kernel::arch::syscall::u5x_probe_once();
+            // U6x (x86): the general OBJECT TABLE — (kind, target, rights) descriptors + first-free
+            // allocation for ALL kinds, killing U5x's fixed CONSOLE_FD pin. One-shot, gated on storage +
+            // after U5x; a printing spawner both prints AND spawns 2 children off the reserved console index
+            // (the case U5x couldn't serve), plus kernel-side File/Socket-kind resolves.
+            #[cfg(target_arch = "x86_64")]
+            unaos_kernel::arch::syscall::u6x_probe_once();
             unaos_kernel::drivers::xhci::log_summary_once();
             while let Some(event) = unaos_kernel::pal::next_event() {
                 match event {
@@ -776,6 +782,12 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         // routed sys_write + teardown-clear. One-shot, gated on storage + after U4x; inline-blob fixture.
         #[cfg(target_arch = "x86_64")]
         unaos_kernel::arch::syscall::u5x_probe_once();
+        // U6x (x86): the general OBJECT TABLE — (kind, target, rights) descriptors + first-free allocation
+        // for ALL kinds, closing U5x's fixed CONSOLE_FD collision. One-shot, gated on storage + after U5x;
+        // a printing spawner both prints AND spawns 2 children off the reserved console index (the case U5x
+        // couldn't serve), plus a kernel-side File/Socket-kind + no-collision proof.
+        #[cfg(target_arch = "x86_64")]
+        unaos_kernel::arch::syscall::u6x_probe_once();
         // One-shot USB topology dump to serial (enumeration diagnosis; `usbinfo` shows it live).
         unaos_kernel::drivers::xhci::log_summary_once();
 

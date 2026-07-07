@@ -12,6 +12,39 @@ Legend: **✅ metal-confirmed** · **🔬 QEMU-green, metal pending** · dates I
 
 ## hw-rmbp track — 2026-07-06 (landed on `hw-rmbp`, awaiting integration)
 
+### U6x — the general object table: `(kind, target, rights)`, first-free for all kinds, `CONSOLE_FD` collision closed (x86) 🔬 `hw-rmbp`
+- **What:** the x86 twin of aarch64 U6a — generalizes U5x's fixed-shape handle into a general **object
+  descriptor**, keyed by the address-space **slot**/`row` where aarch64 keys by ASID. The **kind** rides
+  in a parallel sidecar `HANDLE_KIND[[AtomicU8; 8]; USER_SLOTS+1]` (keyed identically to
+  `HANDLES`/`HANDLE_RIGHTS`), so the value word keeps U4x/U5x's sentinels **byte-identical** (`0`=Empty,
+  `u64::MAX`=`RESERVING`) and nothing else is reserved — a `File(id)`/`Socket(id)` may carry any
+  non-sentinel id with no high-bit masking (the STOP-tripwire sentinel collision is structurally
+  impossible). `handle_resolve` dispatches `Child`/`Console`/`File`/`Socket` on the sidecar; `File`/`Socket`
+  are resolvable **scaffolds** (no fs/net syscall routes through them yet).
+- **`CONSOLE_FD` collision closed (the raison d'être + U5x's one design note):** `handle_install` (the
+  first-free allocator) now **SKIPS** the reserved `CONSOLE_FD`, so a process that both prints (console cap
+  at the fd=1/stdout index) AND spawns 2+ children (auto-allocated at `{0, 2, 3, ..}`) has **zero index
+  collision for any interleaving** of installs — the console never clobbers, nor is clobbered by, an
+  auto-allocated handle. The `fd=1` stdout ABI stays byte-identical for every existing blob. Every consumer
+  is behaviour-preserved: attenuation unchanged, the mint copies the source's kind (never re-kinds) and
+  publishes the value LAST; `handle_clear`/`clear_handle_row`/`handle_row_is_clear` also handle the kind.
+- **Tested — QEMU:** `./arroyo test-fat part 30` (and `sf`) → after the U5x PASS line: the U6x setup line,
+  `u6x: parent print (pre-spawn)` and `u6x: parent print (post-spawn; console survived 2 spawns)`, and
+  `:: U6x: x86 general object table — printing spawner + 2 children, no index collision, File/Socket kinds
+  resolve -> PASS ::`. `u6x-spawn` is the printing spawner U5x couldn't serve (prints → spawns 2 off the
+  reserved index → prints again [console survived] → reaps both); `u6x_kernel_check` proves kernel-side that
+  `File`/`Socket` kinds resolve with/without rights and that the exact U5x-breaking interleaving no longer
+  collides. **U1a/U1b/U2/U2.5/U3/U3.5/U4x/U5x all PASS byte-identical** (proven by a stash-free scratch-
+  worktree baseline diff — pure append of the U6x lines); the default no-FAT `./arroyo test` stays MISSION
+  SUCCESS with U6x skipping cleanly (like U4x — its children need the staged program). `./arroyo check` both
+  arches; **0 aarch64 files touched**.
+- **Honest scope:** the OBJECT TABLE only. Deferred to U7 (the pi4 U7 twin): cross-process handle-transfer
+  (`SYS_XFER`, breaks single-writer) + revocation trees (`CAP_REVOKE` still reserved) + the bandy Ring-3
+  wrapper; real `File`/`Socket` fs/net routing through these kinds is a later arc. PCID and
+  `copy_from_user`/`copy_to_user` stay separately deferred.
+- **Metal:** pending (pure syscall logic; the child loads ride U2/U4x's metal-confirmed FAT path).
+- **Commit:** on `hw-rmbp` (see landing report); unmerged (integrator records the merge).
+
 ### U5x — handles as capabilities: the CHECK + grant/attenuate/revoke + routed `sys_write` + teardown-clear (x86) 🔬 `hw-rmbp`
 - **What:** the x86 twin of aarch64 U5 — turns U4x's handle STRUCTURE into a real **capability**,
   keyed by the address-space **slot** where aarch64 keys by ASID. A handle now carries **rights**
