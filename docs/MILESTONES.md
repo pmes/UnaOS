@@ -198,9 +198,17 @@ Legend: **✅ metal-confirmed** · **🔬 QEMU-green, metal pending** · dates I
   **byte-identical** (the shared FAT mount does not regress M6g/U4 — both still PASS their disk loads) and
   CAPSTONE 6/6, 0 unexpected faults. `check` both arches; x86 `test` MISSION SUCCESS; aarch64 virt v2 clean USB
   enumeration + GICv3 CAPSTONE 6/6 unchanged; zero x86 files.
-- **Tested — metal:** none this arc unless flashed — `SYS_READ` drives the real EMMC2/SD read from EL0, whose
-  FAT/SD path is already metal-confirmed via M6g/U4; the syscall + capability layer is QEMU-verifiable. METAL
-  PENDING (a metal boot is a bonus if Peter is flashing).
+- **Tested — metal:** ✅ **METAL-CONFIRMED on the real Pi 4 (2026-07-06)** — Peter booted (non-destructive
+  `kernel8.img` swap on the mounted FAT; `HELLO.BIN` was already byte-identical to this build, so the
+  bytes-match test is exact), I ran the Debug-Probe serial bridge. On silicon: `:: U6b: real File handles —
+  open+read via a File capability OK, no-CAP_READ -EACCES, wrong-kind -EACCES -> PASS ::` — the fixture opened
+  `HELLO.BIN` and read it through a `File` capability off the **real EMMC2/SD card** (the metal-only EMMC2-first
+  leg `SD card @0xfe340000 identified — 31116288 blocks (15193 MiB, CSD v2)`, which QEMU cannot exercise), and
+  both `-EACCES` denials held. `EL=1`/`CNTFRQ=54 MHz`, EL0 preempt live (`M6e IRQs-taken-at-EL0=23`,
+  `M6f spsentinel=2`), full battery green (M6b `exited=1 killed=3`, M6d ×3, M6f ×3, M6g/U4/U5/U6 PASS), 0
+  unexpected faults. (The scheduler CAPSTONE demo sat out this particular boot — only 3 of 4 cores came online,
+  and it needs the full 4; that is a known metal SMP AP-bring-up variance in the scheduler track, orthogonal to
+  U6b's pure-syscall logic.) Metal log `unaos/target/serial-pi.u6b-metal.log`.
 - **Deferred:** file **writes**/create/delete, **seek**/`lseek`, **directory** ops (the natural extensions once
   read-only File handles are proven); real **`Socket`** handles (net syscalls — the fs twin of this arc); UnaFS
   `owner`/`grants:*` checked on `SYS_OPEN` (rides the kernel UnaFS mount, K2/K3); a second mount / media detect.

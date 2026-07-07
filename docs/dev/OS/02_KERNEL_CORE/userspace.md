@@ -295,8 +295,11 @@
   launcher proves the file-row teardown-clear kernel-side: `:: U6b: real File handles — open+read via
   a File capability OK, no-CAP_READ -EACCES, wrong-kind -EACCES -> PASS ::`. Every
   M6b/M6d/M6e/M6f/M6g/U4/U5/U6 line byte-identical (the shared FAT mount does not regress M6g/U4),
-  CAPSTONE 6/6, 0 unexpected faults. No metal this arc unless flashed (the FAT/SD read is
-  metal-confirmed via M6g/U4; the syscall layer is QEMU-verifiable). Scope: read-only, flat root, one
+  CAPSTONE 6/6, 0 unexpected faults. ✅ **METAL-CONFIRMED on the real Pi 4 (2026-07-06)**: U6b PASS on
+  silicon — the fixture read `HELLO.BIN` through a `File` capability off the real EMMC2/SD card (the
+  metal-only `@0xfe340000 15193 MiB CSD v2` leg), both `-EACCES` denials held; `EL=1`/54 MHz, full
+  battery green (metal log `unaos/target/serial-pi.u6b-metal.log`; the scheduler CAPSTONE sat out that
+  boot — only 3 of 4 cores online, a metal SMP variance orthogonal to U6b). Scope: read-only, flat root, one
   volume — no write/create/delete, no seek, no dir ops. Lane: `arch/aarch64/syscall.rs` + a `main.rs`
   launcher + a read-only `fs/fat.rs` helper — no `boot.rs` change, no scheduler primitive, no x86 file.
 - Not yet (U7): cross-process **bandy handle-transfer** between principals (`SYS_XFER` — a
