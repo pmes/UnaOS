@@ -1121,6 +1121,12 @@ fn tegra_early_stop(boot_info: &'static mut BootInfo) -> ! {
             }
         };
         unaos_kernel::arch::smmu_tegra::jb3_probe(&jb3_bases[..jb3_n], jb3_sid);
+        // JB3 fix (boot 2): boot 1 read CLIENTPD=1 + zero SMRs + zero faults on both instances
+        // — the ExitBootServices teardown shut the SMMU client port, and with the fabric's
+        // external-bypass path off (MB2), the controller's DMA has nowhere to go. Open ONLY
+        // the XUSB stream (SMR match -> S2CR bypass) and turn the client port back on with
+        // USFCFG=1 so anything unexpected faults-and-logs instead of dying silently.
+        unaos_kernel::arch::smmu_tegra::jb3_open_stream(&jb3_bases[..jb3_n], jb3_sid);
         let coherent = unaos_kernel::arch::fdt_tegra::xusb_dma_coherent(
             dtb_addr,
             dtb_size,

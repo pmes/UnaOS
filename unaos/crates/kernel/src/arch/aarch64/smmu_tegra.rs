@@ -149,6 +149,87 @@ pub fn jb3_faults(bases: &[u64]) {
     }
 }
 
+/// Additional GR0 offsets for the fix half.
+const TLBIALLNSNH: u64 = 0x068; // invalidate all NS non-hyp TLB entries (write-any)
+const STLBGSYNC: u64 = 0x070; // global TLB sync (write-any)
+const STLBGSTATUS: u64 = 0x074; // GSACTIVE b0 — sync complete when clear
+
+/// The Tegra234 MC stream-id override block (always-on MC @0x02c0_0000, GiB-0 Device map);
+/// XUSB_HOSTR's override register offset per tegra234-mc-sid.c. Read-only here: it tells us
+/// which SID the controller actually EMITS (predicted 0x0e; 0x7f would be the legacy
+/// "bypass" SID and would explain an SMR miss).
+const MC_SID_BASE: u64 = 0x02c0_0000;
+const MC_SID_XUSB_HOSTR: u64 = 0x250;
+
+fn wr(base: u64, off: u64, v: u32) {
+    unsafe { core::ptr::write_volatile((base + off) as *mut u32, v) }
+}
+
+/// JB3 fix (boot 2) — open the XUSB stream through the NISO1 pair.
+///
+/// Boot 1's metal verdict (2026-07-07, serial-orin-jb3-probe.log): both instances sit at
+/// sCR0.CLIENTPD=1 (client port DISABLED), USFCFG=0, ZERO valid SMRs, and sGFSR never latches —
+/// UEFI's ExitBootServices teardown shut the SMMU's client port outright (the JB2c pad lesson,
+/// one layer deeper), and with the fabric's external-bypass path also disabled (the MB2 task),
+/// the controller's DMA writes are swallowed with no fault logic ever reached.
+///
+/// The re-open, per instance and deliberately in this order:
+///   1. SMR[0] = VALID | ID=sid (mask 0) and S2CR[0] = TYPE=bypass — the stream's route exists
+///      BEFORE any traffic can be accepted;
+///   2. sCR0: clear CLIENTPD (accept transactions), set USFCFG (unmatched streams FAULT — so
+///      a wrong-SID surprise logs itself in sGFSR/sGFSYNR1 instead of dying silently);
+///   3. TLBIALLNSNH + sTLBGSYNC/sTLBGSTATUS bounded poll (no stale bypass/translation state);
+///   4. readbacks printed — NS-write efficacy is itself a verify-don't-assume item (if the
+///      readback still shows CLIENTPD=1, the block is secure-owned and this arc STOPs).
+/// Security posture (ledgered in the arc doc): only the matched XUSB stream bypasses; every
+/// other NISO1 stream now faults-and-logs rather than silently dropping. Bring-up honest,
+/// tightened further when real SMMU translation arrives.
+pub fn jb3_open_stream(bases: &[u64], xusb_sid: u32) {
+    // Read-only first: what SID does the fabric say XUSB emits?
+    serial_println!(
+        ":: tegra: JB3 — MC SID block @{:#010x} first touch (read-only) ::",
+        MC_SID_BASE
+    );
+    let ovr = rd(MC_SID_BASE, MC_SID_XUSB_HOSTR);
+    let sec = rd(MC_SID_BASE, MC_SID_XUSB_HOSTR + 4);
+    serial_println!(
+        ":: tegra: JB3 — MC XUSB_HOSTR override={:#010x} (sid={:#x}) security={:#010x} ::",
+        ovr,
+        ovr & 0xff,
+        sec
+    );
+    for (i, &base) in bases.iter().enumerate() {
+        let scr0_pre = rd(base, SCR0);
+        wr(base, SMR_BASE, (1 << 31) | (xusb_sid & 0x7fff));
+        wr(base, S2CR_BASE, 0b01 << 16); // TYPE=bypass, CBNDX dont-care
+        let scr0_new = (scr0_pre & !1) | (1 << 10); // CLIENTPD=0, USFCFG=1
+        wr(base, SCR0, scr0_new);
+        wr(base, TLBIALLNSNH, 0);
+        wr(base, STLBGSYNC, 0);
+        let mut spins = 0u32;
+        while rd(base, STLBGSTATUS) & 1 != 0 && spins < 100_000 {
+            spins += 1;
+        }
+        serial_println!(
+            ":: tegra: JB3 — inst{} OPEN: sCR0 {:#010x}->{:#010x} (rb {:#010x}) SMR[0] rb={:#010x} S2CR[0] rb={:#010x} tlbsync {} ::",
+            i,
+            scr0_pre,
+            scr0_new,
+            rd(base, SCR0),
+            rd(base, SMR_BASE),
+            rd(base, S2CR_BASE),
+            if spins < 100_000 { "OK" } else { "TIMEOUT" }
+        );
+        if rd(base, SCR0) & 1 != 0 {
+            serial_println!(
+                ":: tegra: JB3 — inst{} sCR0 write did NOT take (secure-owned?); STOP ::",
+                i
+            );
+        }
+    }
+    serial_println!(":: tegra: JB3 — XUSB stream opened (SMR bypass + client port on) ::");
+}
+
 fn jb3_fault_line(i: usize, base: u64, tag: &str) {
     let gfsr = rd(base, SGFSR);
     let far_lo = rd(base, SGFAR_LO);
