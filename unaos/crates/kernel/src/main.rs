@@ -675,6 +675,12 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
             // (the case U5x couldn't serve), plus kernel-side File/Socket-kind resolves.
             #[cfg(target_arch = "x86_64")]
             unaos_kernel::arch::syscall::u6x_probe_once();
+            // U6bx (x86): REAL File handles — SYS_OPEN mints a File capability from the BSP-staged set and
+            // SYS_READ serves bytes through it gated by CAP_READ (the pi4 U6b twin; the staged source is
+            // the honest x86 divergence — the IF-masked handler can't pump the hlt()-ing xHCI BOT read).
+            // One-shot, gated on storage + after U6x.
+            #[cfg(target_arch = "x86_64")]
+            unaos_kernel::arch::syscall::u6bx_probe_once();
             unaos_kernel::drivers::xhci::log_summary_once();
             while let Some(event) = unaos_kernel::pal::next_event() {
                 match event {
@@ -804,6 +810,12 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         // couldn't serve), plus a kernel-side File/Socket-kind + no-collision proof.
         #[cfg(target_arch = "x86_64")]
         unaos_kernel::arch::syscall::u6x_probe_once();
+        // U6bx (x86): REAL File handles — SYS_OPEN mints a File capability from the BSP-staged set and
+        // SYS_READ serves bytes through it gated by CAP_READ (the pi4 U6b twin; the staged source is the
+        // honest x86 divergence — the IF-masked handler can't pump the hlt()-ing xHCI BOT read). One-shot,
+        // gated on storage + after U6x.
+        #[cfg(target_arch = "x86_64")]
+        unaos_kernel::arch::syscall::u6bx_probe_once();
         // One-shot USB topology dump to serial (enumeration diagnosis; `usbinfo` shows it live).
         unaos_kernel::drivers::xhci::log_summary_once();
 
