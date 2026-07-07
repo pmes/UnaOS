@@ -4023,15 +4023,26 @@ fn deriv_drop(nref: u32) {
         if DERIV_KIDS[n].load(Ordering::Acquire) != 0 {
             return; // live children pin it — a TOMBSTONE until the subtree drains
         }
-        let id = DERIV_ID[n].load(Ordering::Acquire);
-        if id == 0 || id == HANDLE_RESERVING {
-            return; // already freed / mid-claim (a racing freer won)
-        }
-        if DERIV_ID[n]
-            .compare_exchange(id, HANDLE_RESERVING, Ordering::AcqRel, Ordering::Acquire)
-            .is_err()
-        {
-            return; // lost the free race (or a racing revoke flipped the bit — retry is the winner's job)
+        let mut id = DERIV_ID[n].load(Ordering::Acquire);
+        loop {
+            if id == 0 || id == HANDLE_RESERVING {
+                return; // already freed / mid-claim (a racing freer won)
+            }
+            match DERIV_ID[n].compare_exchange(
+                id,
+                HANDLE_RESERVING,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => break,
+                // A racing REVOKE (deriv_revoke_if from a sender's xrevoke on this unpinned
+                // node) only flips DERIV_REVOKED_BIT and NEVER frees — we remain the sole
+                // freer, so retry against the refreshed word; returning here would leak the
+                // node (and every tombstoned ancestor it pins) permanently, exhausting the
+                // ledger to -EAGAIN. A racing FREER leaves 0/RESERVING — caught above on the
+                // reload. (U8 review must-fix, fixed in-arc.)
+                Err(cur) => id = cur,
+            }
         }
         let parent = DERIV_PARENT[n].load(Ordering::Acquire);
         DERIV_PARENT[n].store(0, Ordering::Release);
@@ -5128,7 +5139,14 @@ fn u8_kernel_check() -> bool {
     ok &= t1 > 0;
     let h1 = sys_recv_for(R1);
     ok &= h1 >= 0;
-    let t2 = if h1 >= 0 { sys_xfer_from(R1, 2, h1 as u64, CAP_WRITE as u64) } else { -1 };
+    // h2 must carry CAP_GRANT: the laundering assertion below has to reach the U8 tree-deep
+    // staleness check in sys_cap_grant — without CAP_GRANT the earlier missing-right gate
+    // returns the same EACCES and the assertion is vacuous (U8 review note, closed in-arc).
+    let t2 = if h1 >= 0 {
+        sys_xfer_from(R1, 2, h1 as u64, (CAP_WRITE | CAP_GRANT) as u64)
+    } else {
+        -1
+    };
     ok &= t2 > 0;
     let h2 = sys_recv_for(R2);
     ok &= h2 >= 0;
@@ -5140,7 +5158,9 @@ fn u8_kernel_check() -> bool {
     ok &= handle_resolve(R1, h1 as u64, CAP_WRITE).is_err();
     // ...AND the RE-TRANSFERRED cap is stale too — the U7 escape, closed by the derivation walk.
     ok &= handle_resolve(R2, h2 as u64, CAP_WRITE).is_err();
-    // ...and the dead cap cannot be laundered by a fresh local mint either.
+    // ...and the dead cap cannot be laundered by a fresh local mint either — h2 CARRIES
+    // CAP_GRANT, so this EACCES provably comes from the tree-deep staleness check, not the
+    // missing-right gate.
     ok &= sys_cap_grant(R2, h2 as u64, CAP_WRITE as u64) == EACCES;
 
     // 2. Generations. Deposit for R1's CURRENT tenant, then that tenant tears down (the generation bump
