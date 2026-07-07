@@ -10,6 +10,45 @@ Legend: **✅ metal-confirmed** · **🔬 QEMU-green, metal pending** · dates I
 
 ---
 
+## hw-rmbp track — 2026-07-07 (Campaign 2, Fable-executed)
+
+### U7x — cross-process capability transfer: inbox-mediated `SYS_XFER`/`SYS_RECV` + sender revoke, single-writer preserved (x86) 🔬 `hw-rmbp`
+- **What:** the x86 twin of pi4 U7, restoring full arch parity on the capability chain — kernel-mediated
+  delegation that preserves the single-writer-per-row invariant by construction. `SYS_XFER = 13` (dest =
+  a `Child` handle in the SENDER's own table — owner-scoped; src must carry `CAP_GRANT`;
+  `req & !src_rights != 0 -> -EACCES`) deposits the attenuated descriptor into the recipient's per-SLOT
+  **inbox** (`NXFER = 4`; state word `0`/`RESERVING`/unique-tx; every claim/consume/retract/teardown a
+  tx-exact CAS); `SYS_RECV = 14` installs it into the CALLER's own row. `SYS_CAP` XREVOKE (op 2) flips
+  `XFER_REVOKED_BIT` inside the **sender-owned record's TX word** (`MAX_XFERS = 8`; tx-exact — the pi4
+  review-fixed shape, inherited); the received cap goes stale at its next `handle_resolve` via the
+  recipient-written `HANDLE_XFER_REC` sidecar; pending-revoked discarded at RECV; post-revoke
+  grant/re-transfer laundering refused. pid→row rides a new `Proc.slot` (+1-biased — the `Proc.asid`
+  substitution); post-check + retract closes the deposit-vs-exit race; teardown sweeps inbox + records
+  and DISOWNS the dying sender's transfers. Payloads: `Console`/`Socket` only. x86 divergences: slot
+  keying throughout, and the **SHARED_ROW refused as a transfer endpoint** (`-EACCES` both directions).
+  **Folds both U6bx review notes:** the `FILE_OFFSET` advance is now a tx-exact CAS range-claim
+  (well-defined for racing SHARED_ROW readers), and `SYS_CAP` REVOKE of a `File` handle frees its FILES
+  descriptor (no more open→revoke `-EMFILE` exhaustion).
+- **Tested — QEMU:** `UNAOS_FATIMG=sf ./arroyo test-fat sf 180` → after the U6bx PASS line: the U7x setup
+  line, `u7x: child prints via the transferred cap` (a REAL console write authorized by a transferred
+  capability), and `:: U7x: cross-process transfer — SYS_XFER attenuated, child received + used the cap,
+  revoke enforced, single-writer intact -> PASS ::` (14/14 PASS). The launcher-orchestrated script
+  proves: over-rights transfer refused; the **single-writer witness** (the child's handle row byte-clear
+  while the t1 deposit sits in its inbox, the child provably parked pre-RECV); use-then-revoke ordering;
+  the revoked cap `-EACCES`; teardown leaves rows/inboxes/records fully clear. Sequencing divergence
+  from pi4: no x86 yield syscall, so each fixture runs on its OWN dedicated AP (3 APs required; fewer
+  skips cleanly) with bounded-spin GO/RECV polls; witnesses ride name-routed exit statuses (no
+  SYS_REPORT); the child's USE cue is a store to its own RW page. **Every prior U1a→U6bx verdict
+  byte-identical** (sorted scratch-worktree baseline diff vs `225ae48` — pure append `33a34,35`);
+  default no-FAT `./arroyo test` stays MISSION SUCCESS (U7x needs no FAT file, so — like U5x — it runs
+  and PASSes there too); `./arroyo check` both arches; **zero aarch64 files touched**.
+- **Honest scope:** single-LEVEL revoke — re-granted/re-transferred copies escape it (revocation TREES =
+  the pi4-led U8: derivation records + real `CAP_REVOKE`); one documented TOCTOU residue at the sys_xfer
+  post-check (generation-tagged inboxes ride the tree arc); a GRANT-minted duplicate File handle shares
+  its descriptor — revoking either frees it, the survivor fails CLOSED.
+- **Metal:** none expected (pure syscall logic; rides the next rMBP boundary with the battery).
+- **Commit:** on `hw-rmbp` (Campaign 2, Fable-executed; adversarial review panel before merge).
+
 ## hw-pi4 track — 2026-07-07 (Campaign 1 — the round-13 sweep, Fable-executed)
 
 ### U7 — cross-process capability transfer: inbox-mediated `SYS_XFER`/`SYS_RECV` + sender revoke, single-writer preserved (aarch64) 🔬 `hw-pi4`

@@ -50,6 +50,11 @@ const SYS_CAP: u64 = 10;
 /// idx (attenuated) or a negative errno. REVOKE: `a1`=handle idx to drop -> 0 or a negative errno.
 const CAP_OP_GRANT: u64 = 0;
 const CAP_OP_REVOKE: u64 = 1;
+/// U7x: revoke a TRANSFER the caller previously made with `SYS_XFER` (`a1` = the transfer id SYS_XFER
+/// returned). Sender-only (the transfer RECORD is sender-owned); single-level — revoking a transfer makes
+/// the RECEIVED capability stale at its next `handle_resolve` (and discards it if still pending in the
+/// recipient's inbox), but does NOT cascade through further re-transfers (revocation TREES are deferred).
+const CAP_OP_XREVOKE: u64 = 2;
 // U6bx: REAL File handles — the object table's first resource syscalls on a non-Console kind (the
 // aarch64 pi4 U6b twin; same numbers). OPEN(name_ptr, name_len) looks the name up in the BSP-STAGED
 // file set — not the disk: the SYSCALL handler runs IF-masked and the xHCI BOT read pump `hlt()`s, so
@@ -58,6 +63,18 @@ const CAP_OP_REVOKE: u64 = 1;
 // that handle, gated by File + `CAP_READ` at `handle_resolve` (the `sys_write` Console twin).
 const SYS_OPEN: u64 = 11;
 const SYS_READ: u64 = 12;
+// U7x: cross-process capability transfer — the FIRST cross-process op on the object table (the aarch64
+// pi4 U7 twin; same numbers). XFER(dest, src, req_rights) deposits an ATTENUATED copy of a capability
+// the caller holds into the recipient's per-SLOT transfer INBOX (the one deliberately cross-slot
+// surface, CAS-managed); the recipient names itself by being a `Child` handle in the SENDER's own table
+// (owner-scoped delegation — no global process namespace). RECV() pulls a pending capability out of the
+// CALLER's own inbox into the CALLER's own handle row — so every handle-table row keeps its single
+// writer (the sender NEVER writes the recipient's row). Returns: XFER -> a transfer id (for a later
+// CAP_OP_XREVOKE), RECV -> a handle index. x86 divergence: rows are keyed by address-space SLOT, and the
+// SHARED_ROW (the U1a/U1b/U2 kernel window, torn down never and owned by no single process) is refused
+// as a transfer endpoint — both XFER and RECV from a shared-window caller return -EACCES.
+const SYS_XFER: u64 = 13;
+const SYS_RECV: u64 = 14;
 
 /// Base of the ring-3 window: 1 TiB — a FRESH top-level slot (PML4 index 2) above the firmware
 /// identity map, so mapping it touches no kernel state. `setup` proves it unmapped before use.
@@ -612,6 +629,186 @@ unsafe extern "C" {
     static unaos_user_u6bx_file: u8;
 }
 
+// --- U7x ring-3 fixtures (cross-process capability transfer — the aarch64 `__u7_prog_{parent,child}`
+// twins). TWO fixtures in one blob, run in two separate slots (each slot gets the whole blob; only the
+// entry differs). Both are register-only apart from the RIP-relative message load and — the one x86
+// twist — the CHILD's single store to its OWN RW data (the USED word at window +0x3008, its "first write
+// through the transferred cap landed" cue; pi4 conveyed this via SYS_REPORT, which x86 does not have).
+// The GO word at window +0x3000 is written ONLY by the kernel (the launcher, through the slot backing);
+// the fixtures merely poll it.
+//
+// SEQUENCING (the x86 divergence from pi4's SYS_YIELD-cooperative co-location): x86 ring 3 is
+// IF-masked/cooperative and has no yield syscall, so a polling fixture HOGS its core. Each fixture
+// therefore runs on its OWN dedicated AP (the launcher on a third), and the polls are plain bounded
+// spins: GO polls are pure user-memory loads (+`pause`); RECV polls re-issue the syscall until it stops
+// returning -EAGAIN. Budgets are generous but finite — an exhausted budget falls through to the witness
+// exit, so the verdict FAILs honestly instead of wedging the core forever.
+//
+// PARENT (`u7x-parent`, pre-endowed: U7X_DEST_IDX = a Child handle naming the child fixture;
+// U7X_SRC_IDX = a full Console cap CAP_WRITE|CAP_GRANT):
+//   (0) an OVER-RIGHTS transfer (req = CAP_WRITE|CAP_EXEC, bits the source lacks) must be -EACCES — the
+//       attenuation invariant crosses processes intact;
+//   (1) XFER t1 (req = CAP_WRITE) -> a transfer id (saved for the revoke);
+//   then it spins on ITS GO word (the launcher releases it only after the child's first USE lands, so
+//   the revoke is provably use-then-revoke);
+//   (2) SYS_CAP XREVOKE(t1) -> 0;  (3) XFER t2 (the "revoke done" signal the child unblocks on) -> ok.
+// CHILD (`u7x-child`, row deliberately EMPTY at spawn — the single-writer snapshot proves the parent's
+// deposit never touched it): spins on its GO (released only after the launcher has verified the
+// pending-deposit/untouched-row snapshot), then (0) RECV t1 -> h1; (1) WRITES through h1 (the
+// transferred Console cap — the line lands on the console) and stores the USED word; (2) RECV t2;
+// (3) the revoked h1 must now be -EACCES. Each conveys a 4-bit witness bitmask as its `sys_exit` STATUS
+// (routed by name — the u5x idiom). ABI (Linux-style): rax = number, args rdi/rsi/rdx, return in rax;
+// witness rides r12, saved values r13, budgets r14, the GO pointer rbx (all callee-saved).
+core::arch::global_asm!(
+    r#"
+    .globl unaos_user_u7x_blob_start
+unaos_user_u7x_blob_start:
+    .balign 16
+    .globl unaos_user_u7x_parent
+unaos_user_u7x_parent:
+    xor  r12d, r12d                         // witness bitmask = 0
+
+    // (0) over-rights XFER: dest=U7X_DEST_IDX, src=U7X_SRC_IDX, req=CAP_WRITE|CAP_EXEC (6) -> -EACCES
+    mov  rax, 13                            // SYS_XFER
+    mov  rdi, 2                             // U7X_DEST_IDX (the Child handle)
+    mov  rsi, 3                             // U7X_SRC_IDX (Console, CAP_WRITE|CAP_GRANT — no CAP_EXEC)
+    mov  rdx, 6                             // req = CAP_WRITE|CAP_EXEC — would AMPLIFY -> must be refused
+    syscall
+    cmp  rax, -13                           // exactly -EACCES ?
+    jne  1f
+    or   r12, 1                             // b0: cross-process attenuation held
+1:
+    // (1) XFER t1: req = CAP_WRITE (2) -> transfer id >= 1
+    mov  rax, 13                            // SYS_XFER
+    mov  rdi, 2
+    mov  rsi, 3
+    mov  rdx, 2                             // req = CAP_WRITE (a strict subset of the source's rights)
+    syscall
+    mov  r13, rax                           // r13 = t1's transfer id (or -errno)
+    test r13, r13
+    js   9f                                 // deposit failed -> report the partial witness
+    or   r12, 2                             // b1: t1 deposited
+
+    // spin on the parent GO word (window +0x3000; the launcher releases it after the child's first USE)
+    lea  rbx, [rip + unaos_user_u7x_blob_start]
+    add  rbx, 0x3000                        // rbx = GO VA (the blob runs at the code-page base)
+    mov  r14, 0x8000000                     // bounded poll budget (pure loads + pause; ~seconds of spin)
+2:  mov  rax, [rbx]
+    test rax, rax
+    jnz  3f
+    pause
+    dec  r14
+    jnz  2b
+    jmp  9f                                 // GO never released -> partial witness (verdict FAILs)
+3:
+    // (2) revoke t1: SYS_CAP(CAP_OP_XREVOKE=2, transfer id) -> 0
+    mov  rax, 10                            // SYS_CAP
+    mov  rdi, 2                             // CAP_OP_XREVOKE
+    mov  rsi, r13
+    syscall
+    test rax, rax
+    jnz  9f
+    or   r12, 4                             // b2: revoke accepted
+
+    // (3) XFER t2 — the "revoke done" signal the child unblocks on
+    mov  rax, 13                            // SYS_XFER
+    mov  rdi, 2
+    mov  rsi, 3
+    mov  rdx, 2
+    syscall
+    test rax, rax
+    js   9f
+    or   r12, 8                             // b3: t2 deposited
+9:  mov  rax, 2                             // SYS_EXIT(witness) -> routed by name into U7X_PARENT_WITNESS
+    mov  rdi, r12
+    syscall
+10: jmp  10b                                // sys_exit never returns; belt-and-braces guard
+
+    .balign 16
+    .globl unaos_user_u7x_child
+unaos_user_u7x_child:
+    xor  r12d, r12d                         // witness bitmask = 0
+    lea  rbx, [rip + unaos_user_u7x_blob_start]
+    add  rbx, 0x3000                        // rbx = GO VA (USED word = GO + 8)
+
+    // spin on the child GO (released only after the launcher's single-writer snapshot)
+    mov  r14, 0x8000000                     // bounded poll budget
+11: mov  rax, [rbx]
+    test rax, rax
+    jnz  12f
+    pause
+    dec  r14
+    jnz  11b
+    jmp  19f                                // never released -> report the (empty) witness
+
+12: // (0) RECV t1 -> h1 (poll: -EAGAIN means the deposit is not yet visible — it always is by GO time)
+    mov  r14, 0x100000                      // bounded syscall-poll budget
+13: mov  rax, 14                            // SYS_RECV
+    syscall
+    test rax, rax
+    jns  14f                                // >= 0 -> received
+    pause
+    dec  r14
+    jnz  13b
+    jmp  19f                                // nothing ever arrived -> partial witness
+14: mov  r13, rax                           // r13 = h1 (the received, transferred Console cap)
+    or   r12, 1                             // b0: received
+
+    // (1) USE it: sys_write(h1, msg, len) — the transferred capability actually carries authority
+    mov  rax, 1                             // SYS_WRITE
+    mov  rdi, r13
+    lea  rsi, [rip + unaos_user_u7x_msg]
+    mov  rdx, [rip + unaos_user_u7x_msglen]
+    syscall
+    cmp  rax, 1
+    jl   15f                                // write failed -> no USED store (the launcher's wait FAILs honestly)
+    or   r12, 2                             // b1: used
+    mov  qword ptr [rbx + 8], 1             // the USED word — the launcher's revoke cue (own RW data page)
+
+15: // (2) RECV t2 — the parent's "revoke done" signal
+    mov  r14, 0x100000
+16: mov  rax, 14                            // SYS_RECV
+    syscall
+    test rax, rax
+    jns  17f
+    pause
+    dec  r14
+    jnz  16b
+    jmp  19f
+17: or   r12, 4                             // b2: t2 received
+
+    // (3) the revoked h1 must now be STALE: sys_write(h1) -> -EACCES (single-level revoke enforced at use)
+    mov  rax, 1                             // SYS_WRITE
+    mov  rdi, r13
+    lea  rsi, [rip + unaos_user_u7x_msg]
+    mov  rdx, [rip + unaos_user_u7x_msglen]
+    syscall
+    cmp  rax, -13                           // exactly -EACCES ?
+    jne  19f
+    or   r12, 8                             // b3: revoke enforced
+19: mov  rax, 2                             // SYS_EXIT(witness) -> routed by name into U7X_CHILD_WITNESS
+    mov  rdi, r12
+    syscall
+20: jmp  20b                                // sys_exit never returns; belt-and-braces guard
+
+    .balign 8
+unaos_user_u7x_msglen:
+    .quad unaos_user_u7x_msg_end - unaos_user_u7x_msg
+unaos_user_u7x_msg:
+    .ascii "u7x: child prints via the transferred cap\n"
+unaos_user_u7x_msg_end:
+    .globl unaos_user_u7x_blob_end
+unaos_user_u7x_blob_end:
+"#
+);
+
+unsafe extern "C" {
+    static unaos_user_u7x_blob_start: u8;
+    static unaos_user_u7x_blob_end: u8;
+    static unaos_user_u7x_parent: u8;
+    static unaos_user_u7x_child: u8;
+}
+
 // --- The SYSCALL entry stub (LSTAR target). Naked; the only assembly in the syscall path.
 //
 // On entry (CPL 0, from SYSCALL): rcx = user RIP, r11 = user RFLAGS, rax = number, rdi/rsi/rdx =
@@ -808,6 +1005,21 @@ pub fn record_ring3_kill(name: &str, vec: u8, err: u64, cr2: u64) {
         U6BX_KILLED.fetch_add(1, Ordering::AcqRel);
         return;
     }
+    // U7x: the transfer fixtures are well-behaved (register-only apart from the child's own-data USED
+    // store; they fault on nothing). A kill here is a real U7x bug — route it to its own counter, never
+    // the U1b `killed_unexpected` count, so a U7x fault fails only the U7x verdict. A killed CHILD's
+    // launcher-planted Proc entry goes EXITED too (the exit-arm twin), so the pid->slot map never
+    // vouches for a dead recipient. No `done` post — the launcher waits on deadline counters.
+    if name == "u7x-parent" || name == "u7x-child" {
+        U7X_KILLED.fetch_add(1, Ordering::AcqRel);
+        let cpu = crate::arch::percpu::this_cpu().cpu_index as usize;
+        if let Some(id) = crate::arch::sched::current_task_id(cpu) {
+            if let Some(i) = proc_find_running(id) {
+                PROCS[i].state.store(PEXITED, Ordering::Release);
+            }
+        }
+        return;
+    }
     let code_end = USER_BASE + PAGE_SIZE; // the code page is the first page of the window only
     let window_end = USER_BASE + USER_WINDOW_PAGES * PAGE_SIZE;
     let expected = match name {
@@ -857,7 +1069,36 @@ extern "C" fn syscall_dispatch(nr: u64, a0: u64, a1: u64, a2: u64) -> i64 {
         SYS_CAP => sys_cap(a0, a1, a2),
         SYS_OPEN => sys_open(a0, a1),
         SYS_READ => sys_read(a0, a1, a2),
+        SYS_XFER => sys_xfer(a0, a1, a2),
+        SYS_RECV => sys_recv(),
         SYS_EXIT => {
+            // U7x: the transfer fixtures exit BY NAME, BEFORE the Proc short-circuit below — the CHILD
+            // has a launcher-PLANTED Proc entry (the pid->slot map sys_xfer resolves its dest through),
+            // so without this precedence its exit would be swallowed by the child-reap path (posting a
+            // `done` nobody waits on) and `U7X_DONE` would never gate the verdict. The exit STATUS is
+            // the fixture's witness bitmask (the u5x idiom — x86 has no SYS_REPORT); the parent (not in
+            // PROCS) rides the same arm for symmetry. The planted entry is marked EXITED so a late
+            // sys_xfer to this recipient fails the RUNNING check instead of depositing into a torn-down
+            // inbox; the launcher frees the entry after its verdict (no `done` post — it waits on the
+            // counter).
+            {
+                let nm = crate::arch::sched::current_name();
+                if nm == Some("u7x-parent") || nm == Some("u7x-child") {
+                    if nm == Some("u7x-parent") {
+                        U7X_PARENT_WITNESS.store(a0 as u32, Ordering::Release);
+                    } else {
+                        U7X_CHILD_WITNESS.store(a0 as u32, Ordering::Release);
+                    }
+                    U7X_DONE.fetch_add(1, Ordering::AcqRel);
+                    let cpu = crate::arch::percpu::this_cpu().cpu_index as usize;
+                    if let Some(id) = crate::arch::sched::current_task_id(cpu) {
+                        if let Some(i) = proc_find_running(id) {
+                            PROCS[i].state.store(PEXITED, Ordering::Release);
+                        }
+                    }
+                    crate::arch::sched::exit(); // never returns
+                }
+            }
             // U4x: a spawned CHILD's exit is reaped by its parent's sys_wait through the Proc table,
             // keyed by pid — NOT by any counter and NOT by the handle (the handle is the parent's-side
             // namespace; the child's exit accounting is pid-keyed). This SHORT-CIRCUITS before every
@@ -1958,29 +2199,46 @@ fn sys_read(handle: u64, buf: u64, len: u64) -> i64 {
         return EACCES;
     }
     let size = FILE_SIZE[row][idx].load(Ordering::Acquire);
-    let offset = FILE_OFFSET[row][idx].load(Ordering::Acquire);
-    // Bytes available from the current offset, clamped to the request. `offset` advances only by
-    // delivered counts and never exceeds `size`, so the subtraction cannot underflow; 0 = clean EOF.
-    let want = core::cmp::min(len as usize, size.saturating_sub(offset) as usize);
-    if want == 0 {
-        return 0; // EOF, or the caller requested nothing
-    }
-    // Validate the WHOLE destination BEFORE any copy — and it must be WRITABLE user memory: inside the
-    // window AND past the read-only code page (page 0 is ring3-RX/RO; a kernel store there would either
-    // fault under CR0.WP or corrupt W^X-protected code — excluded by construction, the x86 stand-in for
-    // the twin's `user_range_ok(.., writable)`). A bad buffer is -EFAULT with no copy, no offset move.
+    // U7x (folding the ledgered U6bx note): the offset advance is now a tx-exact CAS CLAIM, not a
+    // load->store — two SHARED_ROW tasks racing one descriptor each claim a DISJOINT byte range (the
+    // winner advances the offset before copying; the loser re-reads and claims the next range), so
+    // concurrent reads are well-defined instead of double-delivering one range. Private slots keep their
+    // single-writer discipline untouched (the CAS never retries there). The destination is validated
+    // BEFORE the claim, so an -EFAULT still moves no offset and loses no bytes.
     let window_end = USER_BASE + USER_WINDOW_PAGES * PAGE_SIZE;
-    let end = buf.wrapping_add(want as u64);
-    if end < buf || buf < USER_BASE + PAGE_SIZE || end > window_end {
-        return EFAULT;
-    }
+    let (offset, want) = loop {
+        let offset = FILE_OFFSET[row][idx].load(Ordering::Acquire);
+        // Bytes available from the current offset, clamped to the request. `offset` advances only by
+        // claimed counts and never exceeds `size`, so the subtraction cannot underflow; 0 = clean EOF.
+        let want = core::cmp::min(len as usize, size.saturating_sub(offset) as usize);
+        if want == 0 {
+            return 0; // EOF, or the caller requested nothing
+        }
+        // Validate the WHOLE destination BEFORE any claim or copy — and it must be WRITABLE user memory:
+        // inside the window AND past the read-only code page (page 0 is ring3-RX/RO; a kernel store there
+        // would either fault under CR0.WP or corrupt W^X-protected code — excluded by construction, the
+        // x86 stand-in for the twin's `user_range_ok(.., writable)`). A bad buffer is -EFAULT with no
+        // copy and no offset move.
+        let end = buf.wrapping_add(want as u64);
+        if end < buf || buf < USER_BASE + PAGE_SIZE || end > window_end {
+            return EFAULT;
+        }
+        if FILE_OFFSET[row][idx]
+            .compare_exchange(offset, offset + want as u32, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            break (offset, want); // the range [offset, offset+want) is now exclusively ours
+        }
+    };
     // Serve from the staged source (written once, read-only — stable across the whole boot).
     let Some(src) = staged_bytes(FILE_STAGED[row][idx].load(Ordering::Acquire)) else {
         return EIO; // a live descriptor over an unstaged source is a kernel bug; fail closed
     };
     // offset..offset+want lies inside the staged bytes: `size` was captured from this same source at
-    // open, the source never shrinks (written once), and offset only advances by delivered counts. The
-    // defensive clamp keeps even a violated assumption from over-reading the source.
+    // open, the source never shrinks (written once), and offset only advances by claimed counts. The
+    // defensive clamp keeps even a violated assumption from over-reading the source (the claim above
+    // already advanced the offset by `want`; a short `got` here is an impossible-source-shrink fail-safe,
+    // not a real path).
     let got = core::cmp::min(want, src.len().saturating_sub(offset as usize));
     if got == 0 {
         return 0; // treat a (impossible) source shrink as EOF rather than over-read
@@ -1990,8 +2248,369 @@ fn sys_read(handle: u64, buf: u64, len: u64) -> i64 {
     unsafe {
         core::ptr::copy_nonoverlapping(src.as_ptr().add(offset as usize), buf as *mut u8, got);
     }
-    FILE_OFFSET[row][idx].store(offset + got as u32, Ordering::Release);
     got as i64
+}
+
+// =============================================================================================
+// U7x: cross-process capability transfer — the per-SLOT transfer INBOX, the sender-owned transfer
+// RECORDS (the revoke ledger), and SYS_XFER / SYS_RECV / SYS_CAP-XREVOKE. The aarch64 pi4 U7 twin,
+// keyed by address-space SLOT/row instead of ASID.
+// =============================================================================================
+//
+// THE INVARIANT THIS DESIGN EXISTS TO PRESERVE: every `HANDLES[row]` row has exactly ONE writer — its
+// own task (U4x's lock-free foundation). A naive transfer where sender A writes recipient B's row would
+// break that. So A never touches B's row: A deposits an attenuated `(kind, target, rights)` descriptor
+// into B's per-slot INBOX — the one deliberately cross-slot surface, where every claim/consume/retract
+// is a tx-exact CAS — and B pulls it into its OWN row with SYS_RECV (B writes only itself). Revocation
+// reaches B the same one-way: the sender flips a bit in ITS OWN transfer RECORD, and B's next
+// `handle_resolve` of the received cap reads it (the read-side hook in handle_resolve) — nobody ever
+// writes another task's row. Delegation is OWNER-SCOPED: the recipient is named by a `Child` handle in
+// the SENDER's table (no global process namespace).
+//
+// Slot/record state words reuse the handle protocol: `0` = free, `HANDLE_RESERVING` (u64::MAX) = an
+// in-flight claim, anything else = live (a slot holds the transfer id; a record holds its tx). Sidecars
+// are published (Release) BEFORE the state word goes live and read (Acquire) after observing it — the
+// HANDLE_RIGHTS discipline. Transfer ids are globally unique (a monotonic counter), which is what makes
+// the tx-exact CASes ABA-safe: a consumer, a retracting sender, and a tearing-down recipient can race
+// and exactly one wins each slot.
+//
+// x86 divergences from the pi4 twin (both from the slot keying): (a) the pid->recipient-row map is the
+// new `Proc.slot` (+1-biased; pi4 added `Proc.asid`); (b) the SHARED_ROW — the shared kernel window,
+// which is never torn down and belongs to no single process — is refused as a transfer ENDPOINT: a
+// shared-window caller gets `-EACCES` from both SYS_XFER and SYS_RECV (a transfer into an immortal,
+// multi-tenant row could never be safely torn down or revoked-by-teardown; pi4 had no such row).
+//
+// Scope (mirrors pi4 exactly): single-LEVEL revoke (no cascade through re-transfers — revocation TREES
+// are deferred); Console/Socket payloads only (`File` is refused: a file-id indexes the SENDER's
+// per-row FILES table, so a cross-row File transfer needs descriptor migration — deferred with writes/
+// seek; `Child` is refused: delegating reap rights is a process-model question, not a transfer one);
+// records are a small fixed ledger (`MAX_XFERS`) whose lifetime IS the transfer's (claimed at XFER,
+// released by whichever of handle-drop / pending-discard / sender-retract / recipient-teardown ends
+// it). One residual TOCTOU is accepted and documented at the sys_xfer post-check.
+
+/// Pending-transfer slots per recipient (per row). Small and static, like NHANDLE — a full inbox is
+/// `-EAGAIN` (the sender retries or gives up), never grown.
+const NXFER: usize = 4;
+/// Sender-side transfer records (the revoke ledger), global — each live transfer holds exactly one.
+const MAX_XFERS: usize = 8;
+/// Bit 63 of a RECORD's TX word marks the (still-live) transfer REVOKED. The flag rides IN the state word
+/// so the revoke is a **tx-exact CAS** like every other transition — a separate flag word would race the
+/// free/reclaim cycle (the pi4 review-confirmed stale-revoke: a delayed store landing on a freed-and-
+/// reclaimed record would revoke an unrelated sender's fresh transfer, or mint one born-revoked). txids
+/// are a monotonic counter from 1, so bit 63 is never set on a genuine id; `txid | BIT` can never alias
+/// `RESERVING` (that would need `txid == i64::MAX`).
+const XFER_REVOKED_BIT: u64 = 1 << 63;
+
+/// The inbox slot's STATE word: 0 = free, `HANDLE_RESERVING` = mid-claim, else = the transfer id (live).
+/// `USER_SLOTS + 1` rows for index symmetry with HANDLES; the SHARED_ROW row exists but is refused as an
+/// endpoint (see the section note), so it stays permanently clear.
+static XFER_SLOT_TX: [[AtomicU64; NXFER]; crate::arch::memory::USER_SLOTS + 1] =
+    [const { [const { AtomicU64::new(0) }; NXFER] }; crate::arch::memory::USER_SLOTS + 1];
+/// The pending descriptor: what kind of object the transferred cap names. Meaningful only where TX is live.
+static XFER_SLOT_KIND: [[AtomicU8; NXFER]; crate::arch::memory::USER_SLOTS + 1] =
+    [const { [const { AtomicU8::new(KIND_EMPTY) }; NXFER] }; crate::arch::memory::USER_SLOTS + 1];
+/// The pending descriptor's target payload (the value word the received handle will carry).
+static XFER_SLOT_TARGET: [[AtomicU64; NXFER]; crate::arch::memory::USER_SLOTS + 1] =
+    [const { [const { AtomicU64::new(0) }; NXFER] }; crate::arch::memory::USER_SLOTS + 1];
+/// The pending descriptor's (already attenuated) rights.
+static XFER_SLOT_RIGHTS: [[AtomicU32; NXFER]; crate::arch::memory::USER_SLOTS + 1] =
+    [const { [const { AtomicU32::new(0) }; NXFER] }; crate::arch::memory::USER_SLOTS + 1];
+/// The record index + 1 backing this pending transfer (0 = none — a kernel bug on a live slot).
+static XFER_SLOT_REC: [[AtomicU32; NXFER]; crate::arch::memory::USER_SLOTS + 1] =
+    [const { [const { AtomicU32::new(0) }; NXFER] }; crate::arch::memory::USER_SLOTS + 1];
+
+/// A record's STATE word: 0 = free, `HANDLE_RESERVING` = mid-claim, `txid` = the live transfer it
+/// ledgers, `txid | XFER_REVOKED_BIT` = that transfer, revoked (read by `handle_resolve` — the received
+/// cap goes stale — and by `sys_recv` — a still-pending revoked transfer is discarded, never delivered).
+static XFER_REC_TX: [AtomicU64; MAX_XFERS] = [const { AtomicU64::new(0) }; MAX_XFERS];
+/// The row (slot, as u64) that made the transfer — only IT may XREVOKE (sender-owned; checked in
+/// sys_cap_xrevoke). Disowned to `u64::MAX` (never a real row) when the sender's slot tears down, so
+/// revoke authority dies with the sender instead of passing to the slot's next tenant.
+static XFER_REC_SENDER: [AtomicU64; MAX_XFERS] = [const { AtomicU64::new(0) }; MAX_XFERS];
+/// The next transfer id — globally unique, monotonic from 1 (never 0/u64::MAX, the state sentinels).
+static XFER_NEXT_TX: AtomicU64 = AtomicU64::new(1);
+
+/// Which transfer RECORD (index + 1; 0 = not a transferred cap) a RECEIVED handle references — the
+/// revocation hook `handle_resolve` reads. Keyed `[row][idx]` like the other handle sidecars, and — the
+/// point — written ONLY by the row's own task (`sys_recv`) or its teardown: the sender reaches a received
+/// cap exclusively through the record, never through this row.
+static HANDLE_XFER_REC: [[AtomicU32; NHANDLE]; crate::arch::memory::USER_SLOTS + 1] =
+    [const { [const { AtomicU32::new(0) }; NHANDLE] }; crate::arch::memory::USER_SLOTS + 1];
+
+/// Claim a free transfer record and mint its transfer id: CAS the state word 0 -> RESERVING, publish the
+/// sender (Release), then the tx LAST (live-last, the handle_install discipline; the revoked flag needs no
+/// reset — it lives in the TX word this store replaces whole).
+fn xfer_rec_claim(sender_row: u64) -> Option<(usize, u64)> {
+    for r in 0..MAX_XFERS {
+        if XFER_REC_TX[r]
+            .compare_exchange(0, HANDLE_RESERVING, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            XFER_REC_SENDER[r].store(sender_row, Ordering::Release);
+            let tx = XFER_NEXT_TX.fetch_add(1, Ordering::AcqRel);
+            XFER_REC_TX[r].store(tx, Ordering::Release);
+            return Some((r, tx));
+        }
+    }
+    None
+}
+
+/// Release a transfer record — by exactly ONE of: the received handle's drop (`handle_clear`), a pending
+/// revoked transfer's discard (`sys_recv`), the sender's retract (`sys_xfer` post-check), or the
+/// recipient's inbox teardown. Fields cleared first, the state word freed LAST (the files_free shape).
+fn xfer_rec_free(r: usize) {
+    debug_assert!(r < MAX_XFERS, "xfer_rec_free: out of range");
+    XFER_REC_SENDER[r].store(0, Ordering::Release);
+    XFER_REC_TX[r].store(0, Ordering::Release); // clears the revoked bit with the id (one word)
+}
+
+/// True iff the whole record ledger is free — the U7x leak verifier (every transfer's lifetime closed).
+fn xfer_recs_all_free() -> bool {
+    (0..MAX_XFERS).all(|r| XFER_REC_TX[r].load(Ordering::Acquire) == 0)
+}
+
+/// Zero a CLAIMED inbox slot's descriptor fields and free the slot (state word 0 LAST). The caller must
+/// OWN the slot — i.e. hold its tx-exact CAS win (consume/retract/teardown) or its RESERVING claim.
+fn xfer_slot_release(row: usize, k: usize) {
+    debug_assert!(row < XFER_SLOT_TX.len() && k < NXFER, "xfer_slot_release: out of range");
+    XFER_SLOT_KIND[row][k].store(KIND_EMPTY, Ordering::Release);
+    XFER_SLOT_TARGET[row][k].store(0, Ordering::Release);
+    XFER_SLOT_RIGHTS[row][k].store(0, Ordering::Release);
+    XFER_SLOT_REC[row][k].store(0, Ordering::Release);
+    XFER_SLOT_TX[row][k].store(0, Ordering::Release);
+}
+
+/// True iff `row`'s inbox holds no live or in-flight slot — the teardown/leak verifier.
+fn xfer_row_is_clear(row: usize) -> bool {
+    debug_assert!(row < XFER_SLOT_TX.len(), "xfer_row_is_clear: row out of range");
+    (0..NXFER).all(|k| XFER_SLOT_TX[row][k].load(Ordering::Acquire) == 0)
+}
+
+/// Teardown-clear a slot's transfer inbox (called from `clear_handle_row`): claim each live slot by
+/// tx-exact CAS (so a racing consumer/retractor never double-frees), free its record, release the slot. A
+/// slot mid-claim (`RESERVING`) belongs to a sender between its CAS and its live-store; that sender's own
+/// post-check retracts it (it re-reads the recipient's Proc state, which is no longer RUNNING by the time
+/// this teardown runs) — one pass here is sufficient, not a spin.
+fn clear_xfer_inbox_row(row: usize) {
+    for k in 0..NXFER {
+        let tx = XFER_SLOT_TX[row][k].load(Ordering::Acquire);
+        if tx == 0 || tx == HANDLE_RESERVING {
+            continue;
+        }
+        if XFER_SLOT_TX[row][k]
+            .compare_exchange(tx, HANDLE_RESERVING, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            let rec = XFER_SLOT_REC[row][k].load(Ordering::Acquire);
+            if rec != 0 {
+                xfer_rec_free((rec - 1) as usize);
+            }
+            xfer_slot_release(row, k);
+        }
+    }
+}
+
+/// SYS_XFER(dest, src, req_rights) -> a transfer id (>= 1), or a negative errno. Deposit an ATTENUATED
+/// copy of a capability the caller holds into the recipient's inbox — the cross-process delegation
+/// primitive (a shell handing an editor a console cap), owner-scoped: `dest` must be a `Child` handle in
+/// the CALLER's own table.
+///
+/// Flow: resolve `dest` (must be `Child`; `-ECHILD` otherwise) -> resolve `src` in the caller's own table
+/// (must carry `CAP_GRANT`, the delegation right — the same authority `sys_cap_grant` demands; `-EACCES`)
+/// -> enforce ATTENUATION (`req & !src_rights != 0` => `-EACCES` — the monotonic-decrease invariant,
+/// cross-process now) -> map the child pid to its SLOT through its Proc entry (must be RUNNING;
+/// `-ECHILD`) -> claim a record, then CAS-claim an inbox slot (each full => `-EAGAIN`, the record
+/// unwound) -> publish the descriptor, tx LAST -> POST-CHECK the recipient.
+///
+/// The post-check closes the deposit-vs-exit race from the sender's side: if the recipient exited between
+/// the RUNNING check and the deposit going live, its teardown may have already swept the inbox — so the
+/// sender re-reads the Proc entry and, on any change, RETRACTS its own deposit (tx-exact CAS; the loser
+/// of the race does nothing — the winner freed the record) and returns `-ECHILD`. Residual (documented,
+/// accepted this arc, same as pi4): if the recipient exited, its slot was recycled, AND the new tenant
+/// consumed the deposit — all between the live-store and this post-check — the cap lands with the new
+/// tenant. Closing that needs generation-tagged inboxes, which ride the revocation-tree arc.
+///
+/// Payload kinds: `Console`/`Socket` only. `File` is refused (`-EACCES`): its file-id indexes the
+/// SENDER's per-row FILES table — a cross-row File transfer needs descriptor migration (deferred).
+/// `Child` is refused (`-EACCES`): delegating reap rights is a process-model arc, not a transfer one.
+/// A SHARED_ROW caller is refused (`-EACCES` — the x86 divergence; see the section note).
+fn sys_xfer(dest: u64, src: u64, req_rights: u64) -> i64 {
+    // The caller must own a PRIVATE row: the shared kernel window is not a transfer endpoint.
+    let Some(row) = crate::arch::memory::current_slot() else {
+        return EACCES;
+    };
+    // 1. The recipient: a Child handle in the CALLER's OWN table (structural, owner-scoped delegation).
+    let pid = match handle_resolve(row, dest, 0) {
+        Ok(HandleTarget::Child(pid)) => pid,
+        _ => return ECHILD,
+    };
+    // 2. The source capability: present, carrying CAP_GRANT (the delegation right), of a transferable kind.
+    let Some(target) = handle_get(row, src as usize) else {
+        return EACCES;
+    };
+    if target == HANDLE_RESERVING {
+        return EACCES; // an in-flight reservation is not a transferable handle (defensive; single-writer)
+    }
+    let src_kind = handle_kind(row, src as usize);
+    if src_kind != KIND_CONSOLE && src_kind != KIND_SOCKET {
+        return EACCES; // File needs descriptor migration; Child would delegate reaping — both refused
+    }
+    let src_rights = HANDLE_RIGHTS[row][src as usize].load(Ordering::Acquire);
+    if src_rights & CAP_GRANT == 0 {
+        return EACCES; // the source does not authorize delegation
+    }
+    // U7x: a revoked RECEIVED cap must not be re-TRANSFERRED onward either (the sys_cap_grant laundering
+    // check's transfer twin) — post-revoke delegation is refused; pre-revoke copies are the tree arc.
+    let src_rec = HANDLE_XFER_REC[row][src as usize].load(Ordering::Acquire);
+    if src_rec != 0
+        && XFER_REC_TX[(src_rec - 1) as usize].load(Ordering::Acquire) & XFER_REVOKED_BIT != 0
+    {
+        return EACCES;
+    }
+    // 3. Attenuation across processes: any requested bit the sender does not hold is an amplification.
+    let req = req_rights as u32;
+    if req & !src_rights != 0 {
+        return EACCES;
+    }
+    // 4. pid -> the recipient's row (the inbox key), via the Proc table; it must be RUNNING now (and is
+    //    re-checked after the deposit — see the post-check below). The +1 bias undone; 0 = no slot
+    //    recorded (a shared-window task is not a transfer recipient).
+    let Some(pi) = proc_find_child(pid) else {
+        return ECHILD;
+    };
+    if PROCS[pi].state.load(Ordering::Acquire) != PRUNNING {
+        return ECHILD;
+    }
+    let Some(dst_row) = PROCS[pi].slot.load(Ordering::Acquire).checked_sub(1) else {
+        return ECHILD;
+    };
+    if dst_row >= crate::arch::memory::USER_SLOTS {
+        return ECHILD; // never a private row (defensive; sys_spawn only records private slots)
+    }
+    // 5. Claim the revoke ledger entry, then the inbox slot; either full unwinds cleanly (-EAGAIN).
+    let Some((rec, tx)) = xfer_rec_claim(row as u64) else {
+        return EAGAIN;
+    };
+    let Some(slot) = (0..NXFER).find(|&k| {
+        XFER_SLOT_TX[dst_row][k]
+            .compare_exchange(0, HANDLE_RESERVING, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+    }) else {
+        xfer_rec_free(rec);
+        return EAGAIN; // the recipient's inbox is full
+    };
+    // 6. Publish the descriptor (Release), the tx LAST — a recipient that observes the live tx observes
+    //    the whole descriptor (the handle publish-order discipline, applied to the one cross-row surface).
+    XFER_SLOT_KIND[dst_row][slot].store(src_kind, Ordering::Release);
+    XFER_SLOT_TARGET[dst_row][slot].store(target, Ordering::Release);
+    XFER_SLOT_RIGHTS[dst_row][slot].store(req, Ordering::Release);
+    XFER_SLOT_REC[dst_row][slot].store((rec + 1) as u32, Ordering::Release);
+    XFER_SLOT_TX[dst_row][slot].store(tx, Ordering::Release);
+    // 7. POST-CHECK + retract (see the doc comment). Same entry, same pid, still RUNNING — or undo ours.
+    if PROCS[pi].state.load(Ordering::Acquire) != PRUNNING
+        || PROCS[pi].pid.load(Ordering::Acquire) != pid
+    {
+        if XFER_SLOT_TX[dst_row][slot]
+            .compare_exchange(tx, HANDLE_RESERVING, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            xfer_slot_release(dst_row, slot);
+            xfer_rec_free(rec);
+        }
+        // CAS failure = the recipient's teardown (or a last-instant consume) won the slot and freed (or
+        // took ownership of) the record — either way it is no longer ours to unwind.
+        return ECHILD;
+    }
+    tx as i64
+}
+
+/// SYS_RECV() -> a handle index, or `-EAGAIN` when nothing is pending (the caller retries) — also
+/// `-EAGAIN` when the caller's handle table is full (the pending transfer stays queued). The recipient's
+/// half of the transfer: scan the CALLER's OWN inbox, claim the first live slot (tx-exact CAS), and
+/// install the descriptor into the CALLER's OWN handle row — the single-writer invariant is preserved
+/// because the only row written is the caller's, by the caller, mid-syscall. A SHARED_ROW caller is
+/// refused (`-EACCES` — the x86 divergence; the shared window is not a transfer endpoint).
+///
+/// A transfer revoked while still PENDING is discarded here (record freed, slot released, scan continues)
+/// — it is never delivered. A delivered cap records its transfer (the `HANDLE_XFER_REC` sidecar, stored
+/// BEFORE the live value) so a later revoke reaches it at `handle_resolve`.
+fn sys_recv() -> i64 {
+    let Some(row) = crate::arch::memory::current_slot() else {
+        return EACCES;
+    };
+    for k in 0..NXFER {
+        let tx = XFER_SLOT_TX[row][k].load(Ordering::Acquire);
+        if tx == 0 || tx == HANDLE_RESERVING {
+            continue;
+        }
+        // Claim-to-consume (tx-exact): losing means a racing retract/teardown owns the slot — move on.
+        if XFER_SLOT_TX[row][k]
+            .compare_exchange(tx, HANDLE_RESERVING, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            continue;
+        }
+        let kind = XFER_SLOT_KIND[row][k].load(Ordering::Acquire);
+        let target = XFER_SLOT_TARGET[row][k].load(Ordering::Acquire);
+        let rights = XFER_SLOT_RIGHTS[row][k].load(Ordering::Acquire);
+        let rec = XFER_SLOT_REC[row][k].load(Ordering::Acquire);
+        // Revoked while pending (or a recordless slot — a kernel bug, failed closed): discard, keep scanning.
+        if rec == 0
+            || XFER_REC_TX[(rec - 1) as usize].load(Ordering::Acquire) & XFER_REVOKED_BIT != 0
+        {
+            if rec != 0 {
+                xfer_rec_free((rec - 1) as usize);
+            }
+            xfer_slot_release(row, k);
+            continue;
+        }
+        // Install into the CALLER's OWN row: reserve first-free, publish kind + rights + the transfer
+        // reference, then the live value LAST. A full table re-queues the transfer (restore the tx — we
+        // own the slot, so a plain Release store is safe) and returns -EAGAIN.
+        let Some(h) = handle_install(row, HANDLE_RESERVING) else {
+            XFER_SLOT_TX[row][k].store(tx, Ordering::Release);
+            return EAGAIN;
+        };
+        handle_set_kind(row, h, kind);
+        handle_set_rights(row, h, rights);
+        HANDLE_XFER_REC[row][h].store(rec, Ordering::Release); // the revocation hook, pre-live
+        handle_set(row, h, target);
+        xfer_slot_release(row, k); // consume the inbox slot (record ownership moved to the handle)
+        return h as i64;
+    }
+    EAGAIN
+}
+
+/// SYS_CAP XREVOKE(transfer id): the SENDER invalidates a transfer it made. Single-level: the received
+/// cap goes stale at its next `handle_resolve` (or the pending deposit is discarded at RECV) — but a cap
+/// the recipient already re-granted/re-transferred onward is NOT cascaded (revocation TREES, deferred).
+/// Sender-only: the record carries the transferring row; anyone else gets `-EACCES`. An unknown/already-
+/// closed transfer id is `-ENOENT` (ids are globally unique, so a stale id can never alias a new one).
+fn sys_cap_xrevoke(row: usize, txid: u64) -> i64 {
+    if txid == 0 || txid == HANDLE_RESERVING || txid & XFER_REVOKED_BIT != 0 {
+        return ENOENT; // never a live transfer id
+    }
+    for r in 0..MAX_XFERS {
+        if XFER_REC_TX[r].load(Ordering::Acquire) == txid {
+            if XFER_REC_SENDER[r].load(Ordering::Acquire) != row as u64 {
+                return EACCES; // only the sender may revoke its transfer (disowned records match no row)
+            }
+            // TX-EXACT, like every other record/slot transition (the pi4 review-confirmed fix): the
+            // revoked bit can only land while the record still ledgers THIS transfer. A lost CAS means the
+            // record was freed (and possibly reclaimed for someone else's transfer) between the find and
+            // the flip — the transfer is already closed, NOTHING is written to the record's current
+            // tenant, and the caller honestly gets -ENOENT.
+            return if XFER_REC_TX[r]
+                .compare_exchange(txid, txid | XFER_REVOKED_BIT, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                0
+            } else {
+                ENOENT
+            };
+        }
+    }
+    ENOENT
 }
 
 // --- The process table (pid-keyed): the parent's view of its children's lifecycle. ---
@@ -2010,6 +2629,11 @@ struct Proc {
     status: AtomicI32,
     /// FREE / RUNNING / EXITED — the ownership + lifecycle token (CAS'd FREE->RUNNING to claim).
     state: AtomicU8,
+    /// U7x: the child's address-space SLOT, +1-biased (0 = none) — the pid->slot map `sys_xfer` resolves a
+    /// `Child` dest handle through (the transfer inbox is keyed by the RECIPIENT's slot; the x86 twin of
+    /// pi4's `Proc.asid`, biased because slot 0 is a valid slot). Stored (Release) beside the pid by
+    /// `sys_spawn` (and by the U7x launcher for its planted fixture entry); 0 while FREE.
+    slot: AtomicUsize,
     /// Posted once by the child (SYS_EXIT or the kill path), awaited once by the parent's sys_wait. A
     /// scheduler-post wake, so sys_wait works under QEMU (unlike a timer-driven sleep).
     done: crate::arch::sched::Semaphore,
@@ -2021,6 +2645,7 @@ static PROCS: [Proc; MAX_PROCS] = [const {
         pid: AtomicU64::new(0),
         status: AtomicI32::new(0),
         state: AtomicU8::new(PFREE),
+        slot: AtomicUsize::new(0),
         done: crate::arch::sched::Semaphore::new(0),
     }
 }; MAX_PROCS];
@@ -2038,6 +2663,7 @@ fn proc_reserve() -> Option<usize> {
         {
             PROCS[i].pid.store(0, Ordering::Release);
             PROCS[i].status.store(0, Ordering::Release);
+            PROCS[i].slot.store(0, Ordering::Release);
             return Some(i);
         }
     }
@@ -2065,6 +2691,7 @@ fn proc_find_child(pid: u64) -> Option<usize> {
 /// Release a Proc entry to FREE — after reaping in sys_wait, or unwinding a failed sys_spawn claim.
 fn proc_free(i: usize) {
     PROCS[i].pid.store(0, Ordering::Release);
+    PROCS[i].slot.store(0, Ordering::Release); // U7x: drop the pid->slot map with the entry
     PROCS[i].state.store(PFREE, Ordering::Release);
 }
 
@@ -2225,6 +2852,14 @@ fn handle_resolve(row: usize, idx: u64, req: u32) -> Result<HandleTarget, Resolv
     if rights & req != req {
         return Err(ResolveErr::Denied);
     }
+    // U7x: a RECEIVED (transferred) capability goes STALE the moment its sender revokes the transfer. The
+    // revocation state lives in the sender-owned transfer RECORD — never in the recipient's row, which only
+    // the recipient writes (single-writer preserved); this read-side check is how the sender's revoke reaches
+    // the recipient's next use. One extra Acquire load; `0` (not a transferred cap) for every other handle.
+    let rec = HANDLE_XFER_REC[row][idx as usize].load(Ordering::Acquire);
+    if rec != 0 && XFER_REC_TX[(rec - 1) as usize].load(Ordering::Acquire) & XFER_REVOKED_BIT != 0 {
+        return Err(ResolveErr::Denied);
+    }
     match HANDLE_KIND[row][idx as usize].load(Ordering::Acquire) {
         KIND_CHILD => Ok(HandleTarget::Child(raw)),
         KIND_CONSOLE => Ok(HandleTarget::Console),
@@ -2292,6 +2927,9 @@ fn handle_row_is_clear(row: usize) -> bool {
         HANDLES[row][i].load(Ordering::Acquire) == 0
             && HANDLE_RIGHTS[row][i].load(Ordering::Acquire) == 0
             && HANDLE_KIND[row][i].load(Ordering::Acquire) == KIND_EMPTY
+            // U7x: the transfer-reference sidecar is part of "clear" too — the single-writer snapshot and
+            // the teardown proof must not miss a stale record reference behind an otherwise-empty slot.
+            && HANDLE_XFER_REC[row][i].load(Ordering::Acquire) == 0
     })
 }
 
@@ -2310,6 +2948,30 @@ pub fn clear_handle_row(slot: usize) {
         HANDLES[slot][i].store(0, Ordering::Release);
         HANDLE_RIGHTS[slot][i].store(0, Ordering::Release);
         HANDLE_KIND[slot][i].store(KIND_EMPTY, Ordering::Release);
+        // U7x: a received cap's transfer record is released with its handle (the handle_clear twin), so a
+        // torn-down recipient leaks no record and a reused slot inherits no stale transfer reference.
+        let rec = HANDLE_XFER_REC[slot][i].swap(0, Ordering::AcqRel);
+        if rec != 0 {
+            xfer_rec_free((rec - 1) as usize);
+        }
+    }
+    // U7x: wipe this slot's transfer INBOX alongside its handles — a pending (undelivered) transfer to a
+    // dying process is discarded and its record freed, so a REUSED slot starts with an empty inbox (no
+    // stale pending capability for the next tenant to receive). Claim-to-clear per slot (tx-exact CAS) so
+    // a racing consumer or retractor never double-frees; a sender racing this teardown re-checks its
+    // recipient AFTER depositing (the sys_xfer post-check) and retracts, closing the deposit-into-a-dead-
+    // slot path from its side.
+    clear_xfer_inbox_row(slot);
+    // U7x: DISOWN any still-live transfer this dying slot sent (SENDER -> u64::MAX, never a real row):
+    // revoke authority dies with the sender, so the slot's next tenant can neither revoke nor be blamed
+    // for the old tenant's transfers (txids are monotonic and were returned to ring 3 — without this, a
+    // recycled sender slot could enumerate and kill its predecessor's live delegations). The CAS is
+    // owner-exact: a record freed or reclaimed by another sender in the window simply fails the exchange.
+    // The orphaned transfer stays live for its recipient — irrevocable until the revocation-tree arc
+    // re-homes derivations.
+    for r in 0..MAX_XFERS {
+        let _ =
+            XFER_REC_SENDER[r].compare_exchange(slot as u64, u64::MAX, Ordering::AcqRel, Ordering::Acquire);
     }
     // U6bx: the slot's open-FILE row rides the same teardown (handles first, so no File handle can name a
     // descriptor this wipe has already freed) — covers both the exit and the fault-kill path, exactly like
@@ -2373,6 +3035,14 @@ fn handle_clear(slot: usize, idx: usize) {
     HANDLES[slot][idx].store(0, Ordering::Release);
     HANDLE_RIGHTS[slot][idx].store(0, Ordering::Release);
     HANDLE_KIND[slot][idx].store(KIND_EMPTY, Ordering::Release);
+    // U7x: if this was a RECEIVED (transferred) capability, dropping the handle ends the transfer — free
+    // its record (the transfer's whole lifetime is: XFER claims the record, the received handle references
+    // it, this clear releases it; a pending-discard or sender-retract frees it on the other paths). The
+    // swap clears the sidecar so a re-installed handle at this index never inherits a stale record.
+    let rec = HANDLE_XFER_REC[slot][idx].swap(0, Ordering::AcqRel);
+    if rec != 0 {
+        xfer_rec_free((rec - 1) as usize);
+    }
 }
 
 /// SYS_SPAWN(): instantiate the pre-staged program (HELLO.BIN) in a fresh slot, run it ring-3 as a
@@ -2444,6 +3114,9 @@ fn sys_spawn() -> i64 {
     // CAP_READ (the ownership token — `sys_wait` gates on kind==Child, not on the right). Kind + rights are
     // published Release BEFORE the pid (the live value word), so the handle is never observed live without
     // its kind/rights.
+    // U7x: the child's slot (+1-biased) is published BEFORE the pid (the entry's live key) — a sys_xfer
+    // that finds this entry by pid always observes the slot its inbox deposit is keyed by.
+    PROCS[pi].slot.store(child_slot + 1, Ordering::Release);
     PROCS[pi].pid.store(pid, Ordering::Release);
     handle_set_kind(slot, h, KIND_CHILD);
     handle_set_rights(slot, h, CAP_READ);
@@ -2492,6 +3165,7 @@ fn sys_cap(op: u64, a1: u64, a2: u64) -> i64 {
     match op {
         CAP_OP_GRANT => sys_cap_grant(row, a1, a2),
         CAP_OP_REVOKE => sys_cap_revoke(row, a1),
+        CAP_OP_XREVOKE => sys_cap_xrevoke(row, a1), // U7x: revoke a transfer this caller made (sender-only)
         _ => EINVAL,
     }
 }
@@ -2520,6 +3194,16 @@ fn sys_cap_grant(row: usize, src_idx: u64, req_rights: u64) -> i64 {
     let src_rights = HANDLE_RIGHTS[row][src_idx as usize].load(Ordering::Acquire);
     if src_rights & CAP_GRANT == 0 {
         return EACCES; // the source does not authorize granting
+    }
+    // U7x: a revoked RECEIVED cap is stale for DELEGATION too, not only for use — without this check a
+    // recipient holding CAP_GRANT on a transferred cap could mint a fresh, revocation-free copy AFTER the
+    // sender revoked (post-revoke laundering, the pi4 review-confirmed hole). Copies minted BEFORE the
+    // revoke remain the documented revocation-TREE scope (derivation records chase those).
+    let src_rec = HANDLE_XFER_REC[row][src_idx as usize].load(Ordering::Acquire);
+    if src_rec != 0
+        && XFER_REC_TX[(src_rec - 1) as usize].load(Ordering::Acquire) & XFER_REVOKED_BIT != 0
+    {
+        return EACCES;
     }
     let req = req_rights as u32;
     // Attenuation: reject any requested bit the granter does not itself hold. `req & !src_rights` is
@@ -2551,6 +3235,23 @@ fn sys_cap_grant(row: usize, src_idx: u64, req_rights: u64) -> i64 {
 fn sys_cap_revoke(row: usize, idx: u64) -> i64 {
     if idx as usize >= NHANDLE || handle_get(row, idx as usize).is_none() {
         return ECHILD; // out-of-range or Empty — no such handle to revoke
+    }
+    // U7x (folding the ledgered U6bx note): revoking a FILE handle releases its open-file DESCRIPTOR too —
+    // without this, the descriptor outlived every handle to it and repeat open->revoke loops exhausted the
+    // FILES row to a permanent -EMFILE. The +1-biased file-id decodes to the descriptor index; a stale or
+    // out-of-range id (a kernel bug) is simply skipped — the handle clear below still denies every use.
+    // Honest scope: a GRANT-minted duplicate File handle shares the descriptor, so revoking either one
+    // frees it and the survivor's reads fail CLOSED (-EACCES at the FILE_USED re-check) — per-descriptor
+    // refcounts ride the revocation-tree arc.
+    if handle_kind(row, idx as usize) == KIND_FILE {
+        if let Some(fid) = handle_get(row, idx as usize)
+            .filter(|&v| v != HANDLE_RESERVING)
+            .and_then(|v| (v as usize).checked_sub(1))
+        {
+            if fid < NFILE && FILE_USED[row][fid].load(Ordering::Acquire) {
+                files_free(row, fid);
+            }
+        }
     }
     handle_clear(row, idx as usize);
     0
@@ -2639,6 +3340,39 @@ const U6BX_WITNESS_ALL: u32 = 0x1F;
 /// `mov rdi, {2,3}` operands in the fixture blob MUST match these (the aarch64 U6B_*_IDX twin).
 const U6BX_NOCAP_IDX: usize = 2;
 const U6BX_SOCK_IDX: usize = 3;
+/// Set once the U6bx launcher has printed its verdict AND its slot has freed, so the U7x launcher orders
+/// its lines AFTER U6bx's and runs with free slots (the `U6X_LAUNCH_DONE` idiom; the aarch64
+/// `U6B_LAUNCH_DONE` twin — U6bx was the last demo before U7x, so it previously released no gate).
+static U6BX_LAUNCH_DONE: AtomicBool = AtomicBool::new(false);
+
+// --- U7x demo accounting (cross-process transfer; written by the exit/kill paths, read by the launcher's
+// verdict). ---
+/// The parent's pre-endowed handle indices: the `Child` handle naming the recipient (`U7X_DEST_IDX`) and
+/// the full Console cap it transfers from (`U7X_SRC_IDX`, `CAP_WRITE|CAP_GRANT` — CAP_GRANT is the
+/// delegation right XFER requires on its source). The `mov rdi/rsi, {2,3}` operands in
+/// `unaos_user_u7x_parent` MUST match (the aarch64 U7_*_IDX twin).
+const U7X_DEST_IDX: usize = 2;
+const U7X_SRC_IDX: usize = 3;
+/// The full per-fixture witness — 4 bits each. Parent: over-rights XFER `-EACCES` (b0), XFER t1 ok (b1),
+/// XREVOKE t1 ok (b2), XFER t2 ok (b3). Child: RECV t1 (b0), USED the transferred Console cap — a real
+/// `sys_write` through it landed (b1), RECV t2 (b2), the revoked t1 cap now `-EACCES` (b3).
+const U7X_WITNESS_ALL: u32 = 0xF;
+/// Window offsets of the launcher-written GO word (the fixtures only poll it) and the child-written USED
+/// word (its "first write through the transferred cap landed" cue — pi4 conveyed this via SYS_REPORT,
+/// which x86 lacks; the child stores to its OWN RW page instead and the launcher reads it through the
+/// slot's identity backing). The `add rbx, 0x3000` / `[rbx + 8]` in the blob MUST match.
+const U7X_GO_OFF: usize = 0x3000;
+const U7X_USED_OFF: usize = 0x3008;
+/// The parent fixture's final witness bitmask (its `sys_exit` status, routed by name ahead of the Proc
+/// short-circuit — see the SYS_EXIT arm).
+static U7X_PARENT_WITNESS: AtomicU32 = AtomicU32::new(0);
+/// The child fixture's final witness bitmask (same routing).
+static U7X_CHILD_WITNESS: AtomicU32 = AtomicU32::new(0);
+/// The U7x fixtures that reached their witness exit (want 2 — parent + child). Read by `u7x_launcher`'s
+/// deadline-bounded wait.
+static U7X_DONE: AtomicU32 = AtomicU32::new(0);
+/// A killed U7x fixture — a real U7x bug (both are well-behaved). Off the U1b counter.
+static U7X_KILLED: AtomicU32 = AtomicU32::new(0);
 
 /// U4x fixture run parameters: the parent's + orphan's ring-3 entry VAs (both inside the shared window
 /// VA — only the slot FRAME differs, via CR3), the shared initial user rsp, and each fixture's slot
@@ -3212,8 +3946,8 @@ fn u6bx_setup() -> Option<U6bxDemo> {
 ///      then wait (bounded) for its FILES row to clear — the file teardown-clear proof (the fixture exits
 ///      holding TWO live descriptors: its own open + the pre-endowed no-cap backing, so
 ///      `files_row_is_clear` transitions false->true when teardown runs). PASS iff witness ==
-///      `U6BX_WITNESS_ALL` AND the file row cleared AND no U6bx kill. Prints ONE PASS line. U6bx is the
-///      last demo, so it releases no further gate.
+///      `U6BX_WITNESS_ALL` AND the file row cleared AND no U6bx kill. Prints ONE PASS line, then releases
+///      the U7x gate (`U6BX_LAUNCH_DONE`) so the transfer demo orders after this one.
 pub fn u6bx_launcher(demo_cpu: usize) {
     // 1. Gate on the U6x launcher (its verdict printed + its slot freed), bounded + yielding.
     let wdeadline = crate::arch::ticks() + 10_000;
@@ -3230,12 +3964,14 @@ pub fn u6bx_launcher(demo_cpu: usize) {
     // 2. No block device, or nothing staged -> the fixture could neither open nor be denied against a
     //    real descriptor; skip silently (the probe already printed a skip line if staging failed).
     if crate::drivers::block::info().is_none() || !HELLO_STAGED.load(Ordering::Acquire) {
+        U6BX_LAUNCH_DONE.store(true, Ordering::Release); // release the U7x gate (it also gates on storage)
         return;
     }
 
     // 3. Build the fixture slot (allocates it + prints the setup line). From here EVERY path spawns.
     let Some(u6b) = u6bx_setup() else {
         serial_println!(":: U6bx: no free address-space slot — File-handle demo skipped ::");
+        U6BX_LAUNCH_DONE.store(true, Ordering::Release); // release the U7x gate even on the skip path
         return;
     };
     // 3a. The rights negative: a File handle backed by a REAL descriptor but carrying ZERO rights — a
@@ -3298,6 +4034,9 @@ pub fn u6bx_launcher(demo_cpu: usize) {
             U6BX_WITNESS_ALL
         );
     }
+    // Release the U7x gate: the U6bx verdict has printed and (the fixture having exited) the U6bx slot
+    // has freed, so the U7x launcher may build its two fixture slots and order its lines after ours.
+    U6BX_LAUNCH_DONE.store(true, Ordering::Release);
 }
 
 /// U6bx one-shot, fired from the main loop after `u6x_probe_once` (gated on storage like U4x/U5x/U6x). It
@@ -3307,6 +4046,10 @@ pub fn u6bx_launcher(demo_cpu: usize) {
 /// `u4x_probe_once` normally staged it long before; this re-stages defensively. Without a FAT
 /// volume/HELLO.BIN there is nothing to open, so the demo is skipped cleanly (no false FAIL).
 pub fn u6bx_probe_once() {
+    // U7x rides the SAME main-loop call sites as this probe (chained here, in-lane, rather than adding a
+    // new hook in main.rs): each pass gives the U7x probe its own storage/AP-gated one-shot attempt; the
+    // launchers' `U6BX_LAUNCH_DONE` gate orders the demos regardless of which probe fires first.
+    u7x_probe_once();
     static DONE: AtomicBool = AtomicBool::new(false);
     if DONE.load(Ordering::Relaxed) {
         return;
@@ -3329,4 +4072,239 @@ pub fn u6bx_probe_once() {
 
     let vcpu = online.get(1).copied().unwrap_or(cpu);
     crate::arch::sched::spawn("u6bx-launch", u6bx_launcher, cpu, vcpu, crate::arch::sched::PRIO_NORMAL);
+}
+
+// =============================================================================================
+// U7x: cross-process transfer — the two-fixture demo (parent delegates, child receives + uses,
+// sender revokes) and the gated launcher/verdict. The aarch64 u7_launcher twin, with one structural
+// x86 divergence: pi4 co-locates both fixtures on one core and sequences them with SYS_YIELD; x86
+// ring 3 is IF-masked/cooperative with no yield syscall, so a polling fixture HOGS its core — each
+// fixture therefore gets its OWN dedicated AP (the launcher on a third), and the polls are bounded
+// spins (see the blob header). Needs 3 online APs; fewer skips cleanly.
+// =============================================================================================
+
+/// One U7x fixture's run parameters (the `U6bxDemo` shape, twice): the ring-3 entry VA, initial user rsp,
+/// the slot CR3, and the SLOT id (the inbox key + handle row + the GO/USED word plant).
+struct U7xFix {
+    entry: u64,
+    sp: u64,
+    cr3: u64,
+    slot: usize,
+}
+
+/// Build ONE U7x fixture slot: allocate, scrub the WHOLE window (the pi4 review-confirmed GO-word lesson:
+/// slot backings survive teardown, and U6bx deterministically plants nonzero bytes in a prior tenant of
+/// this slot — a stale nonzero GO would release a fixture early and turn the single-writer snapshot into
+/// a race; x86 setups already scrub, kept explicit here), copy the (shared two-entry) U7x blob into its
+/// code page through the identity alias (RX-RO from the start — W^X by construction), and return the run
+/// params for the requested entry symbol. Does NOT pre-endow (the launcher does, per fixture, before
+/// dispatch). `None` if slot allocation fails.
+fn u7x_build(entry_sym: *const u8) -> Option<U7xFix> {
+    let slot = crate::arch::memory::alloc_user_space()?;
+    let bstart = &raw const unaos_user_u7x_blob_start as usize;
+    let bend = &raw const unaos_user_u7x_blob_end as usize;
+    let blen = bend - bstart;
+    assert!(blen as u64 <= PAGE_SIZE, "U7x blob does not fit in a code page");
+    let off = (entry_sym as usize - bstart) as u64;
+    let backing = crate::arch::memory::slot_backing_ptr(slot);
+    unsafe {
+        core::ptr::write_bytes(backing, 0, (USER_WINDOW_PAGES * PAGE_SIZE) as usize);
+        core::ptr::copy_nonoverlapping(bstart as *const u8, backing, blen);
+    }
+    Some(U7xFix {
+        entry: USER_BASE + off,
+        sp: USER_BASE + USER_WINDOW_PAGES * PAGE_SIZE - 16,
+        cr3: crate::arch::memory::slot_cr3(slot),
+        slot,
+    })
+}
+
+/// Release a fixture's GO word (window +0x3000): the launcher-side half of the demo's sequencing. Written
+/// through the slot's identity backing (the u6bx data-plant path); a volatile store suffices on x86-TSO —
+/// the spinning fixture's next aliased load observes it.
+fn u7x_release_go(slot: usize) {
+    unsafe {
+        let go = crate::arch::memory::slot_backing_ptr(slot).add(U7X_GO_OFF) as *mut u64;
+        core::ptr::write_volatile(go, 1);
+    }
+}
+
+/// U7x launcher + verdict (the `u6bx_launcher` shape: one gated kernel task on a scheduled sibling core).
+/// `demo_cpu` (the task arg) is the CHILD's core; the PARENT runs on a third AP (see the section note).
+/// Flow:
+///   1. Wait (bounded) for `U6BX_LAUNCH_DONE`, so the U7x lines land after the U6bx verdict and its slot
+///      has freed.
+///   2. Skip silently if no block device (mirrors U4x..U6bx's control-path discipline — U7x itself needs
+///      no disk, but the gate keeps the no-storage control path free of demo lines). Skip with a line if
+///      fewer than 3 APs are online (the parent needs a core neither the child nor this launcher holds).
+///   3. Claim a Proc entry (the child's pid->slot map for SYS_XFER), build the CHILD slot (row
+///      deliberately EMPTY — the single-writer snapshot depends on it), spawn `u7x-child` (it spins on
+///      its GO word), publish its slot+pid into the Proc entry, build + PRE-ENDOW the PARENT
+///      (U7X_DEST_IDX = a Child handle naming the child; U7X_SRC_IDX = a full Console cap
+///      `CAP_WRITE|CAP_GRANT`), print the setup line, spawn `u7x-parent`.
+///   4. THE SINGLE-WRITER WITNESS: wait (bounded) until the parent's t1 deposit is LIVE in the child's
+///      inbox, then — with the child still parked on its GO word, provably pre-RECV — verify the child's
+///      handle row is still completely CLEAR (`handle_row_is_clear`): the deposit crossed processes
+///      without one byte landing in the recipient's row. Only then release the child's GO.
+///   5. Wait (bounded) for the child's USED word (its first write through the transferred cap landed),
+///      then release the parent's GO — so the revoke is provably use-then-revoke.
+///   6. Verdict (folded): wait (bounded) for both witness exits (`U7X_DONE == 2`), read both witnesses,
+///      then wait (bounded) for the teardown proof — both handle rows clear, both inboxes clear, and the
+///      transfer-record ledger fully FREE (every transfer's lifetime closed: t1 freed when the child's
+///      revoked handle was torn down, t2 likewise, no pending residue). Free the planted Proc entry. PASS
+///      iff both witnesses == `U7X_WITNESS_ALL` AND used AND the snapshot held AND everything cleared AND
+///      no U7x kill. Prints ONE PASS line. U7x is the last demo, so it releases no further gate.
+pub fn u7x_launcher(demo_cpu: usize) {
+    // 1. Gate on the U6bx launcher (its verdict printed + its slot freed), bounded + yielding.
+    let wdeadline = crate::arch::ticks() + 10_000;
+    while !U6BX_LAUNCH_DONE.load(Ordering::Acquire) && crate::arch::ticks() < wdeadline {
+        crate::arch::sched::yield_now();
+    }
+
+    // One-shot (spawned once; guard defensively).
+    static DONE: AtomicBool = AtomicBool::new(false);
+    if DONE.swap(true, Ordering::Relaxed) {
+        return;
+    }
+
+    // 2. No block device -> keep the no-storage control path free of demo lines (U7x needs no disk).
+    if crate::drivers::block::info().is_none() {
+        return;
+    }
+    // The parent's dedicated core: a third AP, distinct from the child's (`demo_cpu`) and this
+    // launcher's. Cooperative ring 3 hogs its core while polling, so sharing either would deadlock the
+    // sequencing (the launcher could never run to release a GO word).
+    let online = crate::arch::smp::online_aps();
+    let Some(&parent_cpu) = online.get(2) else {
+        serial_println!(":: U7x: fewer than 3 application processors — transfer demo skipped ::");
+        return;
+    };
+
+    // 3a. The child's Proc entry FIRST (nothing else claimed if the table is full).
+    let Some(pi) = proc_reserve() else {
+        serial_println!(":: U7x: no free process entry — transfer demo skipped ::");
+        return;
+    };
+    // 3b. Build + spawn the CHILD (its handle row stays EMPTY — the single-writer snapshot depends on
+    //     that; it parks on its GO word, so it makes no syscall that could populate anything).
+    let Some(child) = u7x_build(&raw const unaos_user_u7x_child) else {
+        serial_println!(":: U7x: no free address-space slot — transfer demo skipped ::");
+        proc_free(pi);
+        return;
+    };
+    let child_pid =
+        crate::arch::sched::spawn_user_in_space("u7x-child", child.entry, child.sp, demo_cpu, child.cr3);
+    // Publish the pid->slot map (slot first — the sys_spawn discipline — then the pid, the live key).
+    PROCS[pi].slot.store(child.slot + 1, Ordering::Release);
+    PROCS[pi].pid.store(child_pid, Ordering::Release);
+    // 3c. Build + pre-endow + spawn the PARENT. If its slot alloc fails the child is already live: it
+    //     parks to its GO budget, exits with its (empty) witness, and its slot tears down cleanly.
+    let Some(parent) = u7x_build(&raw const unaos_user_u7x_parent) else {
+        serial_println!(":: U7x: no free address-space slot — transfer demo skipped (child will park out) ::");
+        proc_free(pi);
+        return;
+    };
+    install_cap(parent.slot, U7X_DEST_IDX, KIND_CHILD, child_pid, CAP_READ);
+    install_cap(parent.slot, U7X_SRC_IDX, KIND_CONSOLE, HANDLE_CONSOLE, CAP_WRITE | CAP_GRANT);
+    serial_println!(
+        ":: U7x: cross-process transfer — inbox-mediated SYS_XFER/SYS_RECV + sender revoke (single-writer preserved) ::"
+    );
+    crate::arch::sched::spawn_user_in_space("u7x-parent", parent.entry, parent.sp, parent_cpu, parent.cr3);
+
+    // 4. The single-writer witness: t1 pending in the child's inbox + the child's row still untouched
+    //    (the child is provably pre-RECV — it is parked on the GO word this launcher has not released).
+    let ddeadline = crate::arch::ticks() + 5000;
+    let mut deposit_seen = false;
+    while !deposit_seen && crate::arch::ticks() < ddeadline {
+        deposit_seen = (0..NXFER).any(|k| {
+            let t = XFER_SLOT_TX[child.slot][k].load(Ordering::Acquire);
+            t != 0 && t != HANDLE_RESERVING
+        });
+        if !deposit_seen {
+            crate::arch::sched::yield_now();
+        }
+    }
+    let snap_ok = deposit_seen && handle_row_is_clear(child.slot);
+    u7x_release_go(child.slot);
+
+    // 5. Use-then-revoke sequencing: wait for the child's first successful write through the cap (its
+    //    USED word, read through the slot backing), then let the parent revoke.
+    let used_ptr = unsafe {
+        crate::arch::memory::slot_backing_ptr(child.slot).add(U7X_USED_OFF) as *const u64
+    };
+    let udeadline = crate::arch::ticks() + 5000;
+    while unsafe { core::ptr::read_volatile(used_ptr) } == 0 && crate::arch::ticks() < udeadline {
+        crate::arch::sched::yield_now();
+    }
+    let used = unsafe { core::ptr::read_volatile(used_ptr) };
+    u7x_release_go(parent.slot);
+
+    // 6a. Wait (bounded) for both witness exits, then snapshot the witnesses.
+    let vdeadline = crate::arch::ticks() + 8000;
+    while U7X_DONE.load(Ordering::Acquire) < 2 && crate::arch::ticks() < vdeadline {
+        crate::arch::sched::yield_now();
+    }
+    let pw = U7X_PARENT_WITNESS.load(Ordering::Acquire);
+    let cw = U7X_CHILD_WITNESS.load(Ordering::Acquire);
+    let killed = U7X_KILLED.load(Ordering::Acquire);
+
+    // 6b. Teardown/leak proof: both rows + both inboxes clear and the record ledger fully free (t1's
+    //     record was released when the child's revoked handle tore down; t2's likewise — false->true as
+    //     the exits' teardowns run).
+    let all_clear = |ps: usize, cs: usize| {
+        handle_row_is_clear(ps)
+            && handle_row_is_clear(cs)
+            && xfer_row_is_clear(ps)
+            && xfer_row_is_clear(cs)
+            && xfer_recs_all_free()
+    };
+    let tdeadline = crate::arch::ticks() + 2000;
+    while !all_clear(parent.slot, child.slot) && crate::arch::ticks() < tdeadline {
+        crate::arch::sched::yield_now();
+    }
+    let cleared = all_clear(parent.slot, child.slot);
+    proc_free(pi); // the planted pid->slot entry (the fixtures exited by name, never through the Proc path)
+
+    if pw == U7X_WITNESS_ALL && cw == U7X_WITNESS_ALL && used != 0 && snap_ok && cleared && killed == 0 {
+        serial_println!(
+            ":: U7x: cross-process transfer — SYS_XFER attenuated, child received + used the cap, revoke enforced, single-writer intact -> PASS ::"
+        );
+    } else {
+        serial_println!(
+            ":: U7x: cross-process transfer FAIL — parent={:#x} child={:#x} used={} snap={} cleared={} killed={} done={} (want {:#x}/{:#x}/1/true/true/0/2) ::",
+            pw,
+            cw,
+            used,
+            snap_ok,
+            cleared,
+            killed,
+            U7X_DONE.load(Ordering::Acquire),
+            U7X_WITNESS_ALL,
+            U7X_WITNESS_ALL
+        );
+    }
+}
+
+/// U7x one-shot, chained off `u6bx_probe_once`'s main-loop call sites (gated on storage like the prior
+/// probes, so the no-storage control path stays free of demo lines). It spawns the U7x launcher on a
+/// sibling AP; the launcher gates on `U6BX_LAUNCH_DONE`, so ordering + the free-slot precondition hold
+/// regardless of interleave. No FAT I/O — both U7x fixtures are inline blobs.
+pub fn u7x_probe_once() {
+    static DONE: AtomicBool = AtomicBool::new(false);
+    if DONE.load(Ordering::Relaxed) {
+        return;
+    }
+    if crate::drivers::block::info().is_none() {
+        return; // retry next loop iteration until storage enumerates (mirrors the prior probes)
+    }
+    let online = crate::arch::smp::online_aps();
+    let Some(&cpu) = online.first() else {
+        DONE.store(true, Ordering::Relaxed);
+        serial_println!(":: U7x: no application processor online — transfer demo skipped ::");
+        return;
+    };
+    DONE.store(true, Ordering::Relaxed); // one-shot from here regardless of outcome
+
+    let vcpu = online.get(1).copied().unwrap_or(cpu);
+    crate::arch::sched::spawn("u7x-launch", u7x_launcher, cpu, vcpu, crate::arch::sched::PRIO_NORMAL);
 }
