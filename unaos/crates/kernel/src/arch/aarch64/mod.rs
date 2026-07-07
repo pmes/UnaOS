@@ -57,6 +57,10 @@ pub mod bpmp_tegra;
 // the EL1 keyboard-pump task — the Orin USB-keyboard first-light arc.
 #[cfg(feature = "tegra")]
 pub mod xusb_tegra;
+// JB3: the NISO1 SMMU (dual MMU-500) — read-only probe of the stream-match state that the JB2c
+// metal verdict indicted for the total XUSB DMA-write drop (ENABLE_SLOT watchdogs, 0 events).
+#[cfg(feature = "tegra")]
+pub mod smmu_tegra;
 
 pub fn init() {
     serial_println!(":: AARCH64 Core Hardware Init ::");

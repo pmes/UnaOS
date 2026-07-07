@@ -546,3 +546,107 @@ pub fn jb1a_dump(dtb_addr: u64, dtb_size: usize, ram_gib_mask: u64) {
         serial_println!(":: tegra: JB1a — no bpmp/shmem reserved-memory children ::");
     }
 }
+
+/// JB3: the XUSB host node's `iommus` binding, resolved to the SMMU node it names — stream id
+/// + the SMMU instance base(s) + a bounded ASCII view of its `compatible`, all off the LIVE
+/// firmware DTB (verify-don't-assume: mainline tegra234.dtsi predicts
+/// `<&smmu_niso1 TEGRA234_SID_XUSB_HOST=0x0e>` with the dual MMU-500 at 0x0800_0000 +
+/// 0x0700_0000 — this reads what THIS board's firmware actually says).
+pub struct XusbIommu {
+    pub sid: u32,
+    pub bases: [u64; 2],
+    pub n_bases: usize,
+}
+
+/// Read-only RAM walk (no MMIO). Prints as it resolves — every failure mode is one serial
+/// line — and returns `None` if the tree doesn't cooperate (the caller then probes the
+/// predicted bases, saying so). Same node match + GiB guard as `xusb_ids`.
+pub fn xusb_iommu(dtb_addr: u64, dtb_size: usize, ram_gib_mask: u64) -> Option<XusbIommu> {
+    if dtb_addr == 0 || dtb_size == 0 {
+        return None;
+    }
+    let g_lo = dtb_addr >> 30;
+    let g_hi = (dtb_addr + dtb_size as u64 - 1) >> 30;
+    let mapped = |g: u64| g == 0 || (g < 64 && (ram_gib_mask >> g) & 1 != 0);
+    if !mapped(g_lo) || !mapped(g_hi) {
+        return None;
+    }
+    let blob = unsafe { core::slice::from_raw_parts(dtb_addr as *const u8, dtb_size) };
+    let fdt = Fdt::new(blob)?;
+    let mut path = [0u8; MAX_PATH];
+    let mut plen = 0usize;
+    fdt.for_each_prop(|e| {
+        if plen == 0 && e.path.windows(11).any(|w| w == b"usb@3610000") {
+            let l = e.path.len().min(MAX_PATH);
+            path[..l].copy_from_slice(&e.path[..l]);
+            plen = l;
+        }
+    });
+    if plen == 0 {
+        serial_println!(":: tegra: JB3 — no usb@3610000 node in DTB ::");
+        return None;
+    }
+    let iommus = fdt.prop_at(&path[..plen], b"iommus");
+    if !iommus.found || iommus.n < 2 {
+        serial_println!(":: tegra: JB3 — usb@3610000 has no iommus prop (n={}) ::", iommus.n);
+        return None;
+    }
+    let (ph, sid) = (iommus.words[0], iommus.words[1]);
+    let mut spath = [0u8; MAX_PATH];
+    let slen = fdt.path_of_phandle(ph, &mut spath);
+    if slen == 0 {
+        serial_println!(
+            ":: tegra: JB3 — iommus phandle {:#x} unresolved (sid={:#x}) ::",
+            ph,
+            sid
+        );
+        return None;
+    }
+    let snode = &spath[..slen];
+    // Bus-level #address-cells=2 / #size-cells=2: reg entries are [addr-hi addr-lo size-hi
+    // size-lo]; the dual-MMU-500 node carries two entries (one per mirrored instance).
+    let reg = fdt.prop_at(snode, b"reg");
+    let mut out = XusbIommu {
+        sid,
+        bases: [0; 2],
+        n_bases: 0,
+    };
+    let mut w = 0usize;
+    while w + 3 < reg.n && out.n_bases < 2 {
+        out.bases[out.n_bases] = ((reg.words[w] as u64) << 32) | reg.words[w + 1] as u64;
+        out.n_bases += 1;
+        w += 4;
+    }
+    // `compatible` is a NUL-joined string list riding the BE words — a bounded ASCII view is
+    // enough to tell smmu-500 (v2) from smmu-v3 on the serial line.
+    let compat = fdt.prop_at(snode, b"compatible");
+    let mut cbuf = [b' '; 44];
+    let mut cl = 0usize;
+    'fill: for wi in 0..compat.n {
+        for b in compat.words[wi].to_be_bytes() {
+            if cl >= cbuf.len() {
+                break 'fill;
+            }
+            cbuf[cl] = match b {
+                0 => b'|',
+                b if b.is_ascii_graphic() => b,
+                _ => b'?',
+            };
+            cl += 1;
+        }
+    }
+    serial_println!(
+        ":: tegra: JB3 — DTB: {} sid={:#x} -> {} reg0={:#010x} reg1={:#010x} ({} inst) compat='{}' ::",
+        core::str::from_utf8(&path[..plen]).unwrap_or("usb@3610000"),
+        sid,
+        core::str::from_utf8(snode).unwrap_or("?"),
+        out.bases[0],
+        out.bases[1],
+        out.n_bases,
+        core::str::from_utf8(&cbuf[..cl]).unwrap_or("?")
+    );
+    if out.n_bases == 0 {
+        return None;
+    }
+    Some(out)
+}

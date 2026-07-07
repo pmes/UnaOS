@@ -1100,12 +1100,38 @@ fn tegra_early_stop(boot_info: &'static mut BootInfo) -> ! {
     //     loop cooperatively alongside (and after) the CAPSTONE tasks. No keyboard -> no task ->
     //     the JM6b/CAPSTONE flow is byte-identical to the JB1e verification boot.
     if xusb_alive {
+        // JB3 (probe half): dump the NISO1 SMMU stream-match state BEFORE the attach, and the
+        // global fault registers AFTER it — the JB2c verdict said the controller drives the
+        // ports but cannot land one DMA write in RAM (ENABLE_SLOT watchdogs, 0 events), the
+        // predicted SMMU drop. Bases + the XUSB stream id come off the LIVE firmware DTB
+        // (verify-don't-assume); if the tree doesn't cooperate, fall back to the researched
+        // tegra234 values (dual MMU-500 @0x0800_0000/0x0700_0000, SID 0x0e) and say so.
+        // Read-only this boot — the fix writes are boot 2, chosen by what this dump says.
+        let (jb3_bases, jb3_n, jb3_sid) = match unaos_kernel::arch::fdt_tegra::xusb_iommu(
+            dtb_addr,
+            dtb_size,
+            mmu.ram_gib_mask,
+        ) {
+            Some(io) => (io.bases, io.n_bases, io.sid),
+            None => {
+                serial_println!(
+                    ":: tegra: JB3 — DTB iommus unresolved; probing predicted bases ::"
+                );
+                ([0x0800_0000u64, 0x0700_0000u64], 2, 0x0e)
+            }
+        };
+        unaos_kernel::arch::smmu_tegra::jb3_probe(&jb3_bases[..jb3_n], jb3_sid);
         let coherent = unaos_kernel::arch::fdt_tegra::xusb_dma_coherent(
             dtb_addr,
             dtb_size,
             mmu.ram_gib_mask,
         );
-        if unaos_kernel::arch::xusb_tegra::jb2b_attach(coherent).is_some() {
+        let attached = unaos_kernel::arch::xusb_tegra::jb2b_attach(coherent).is_some();
+        // The post-attach witness: after the enumeration window (and any ENABLE_SLOT
+        // watchdogs), sGFSR/sGFSYNR say whether THIS block recorded the kills — and name the
+        // faulting StreamID.
+        unaos_kernel::arch::smmu_tegra::jb3_faults(&jb3_bases[..jb3_n]);
+        if attached {
             unaos_kernel::arch::sched::spawn(
                 "jb2-kbd",
                 unaos_kernel::arch::xusb_tegra::kbd_pump_body,
