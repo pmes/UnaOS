@@ -58,9 +58,9 @@ pub fn info() -> Option<BlockDeviceInfo> {
 }
 
 /// M6g: register the microSD (EMMC2/SDHCI) as the block backend — publish its geometry AND flip the
-/// selector so `read_block` routes to `drivers::emmc2`. Called once, from the bare-metal BSP probe
-/// after a successful card init (`emmc2::probe`). aarch64 bare-metal only; x86 never calls it, so its
-/// read/write path is byte-identical to the pre-M6g xHCI-only code.
+/// selector so `read_block` (and, since U9, `write_block`) route to `drivers::emmc2`. Called once, from
+/// the bare-metal BSP probe after a successful card init (`emmc2::probe`). aarch64 bare-metal only; x86
+/// never calls it, so its read/write path is byte-identical to the pre-M6g xHCI-only code.
 #[cfg(all(target_arch = "aarch64", feature = "baremetal"))]
 pub fn register_sd(dev: BlockDeviceInfo) {
     *BLOCK_DEVICE.lock() = Some(dev);
@@ -103,11 +103,12 @@ pub fn write_block(lba: u64, buf: &[u8]) -> Result<(), BlockError> {
         return Err(BlockError::BadLba);
     }
 
-    // M6g: the SD backend is READ-ONLY by design (no card writes, ever, this arc) — refuse the write
-    // before touching any controller. The xHCI body below is unchanged (and the only x86 path).
+    // U9: the SD backend now services in-place block WRITES (polled CMD24), routing to the EMMC2/SDHCI
+    // driver just as reads route to `read_block_512`. write_block_512 re-guards the lba against its own
+    // num_blocks. The xHCI body below is unchanged (and the only path an x86 build compiles).
     #[cfg(all(target_arch = "aarch64", feature = "baremetal"))]
     if BACKEND.load(Ordering::Acquire) == BACKEND_SD {
-        return Err(BlockError::Io);
+        return crate::drivers::emmc2::write_block_512(lba, buf);
     }
 
     let mut guard = XHCI_CONTROLLER.lock();

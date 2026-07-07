@@ -85,6 +85,12 @@ const SYS_READ: u64 = 12;
 // recipient's row). Returns: XFER -> a transfer id (for a later CAP_OP_XREVOKE), RECV -> a handle index.
 const SYS_XFER: u64 = 13;
 const SYS_RECV: u64 = 14;
+/// U9: absolute seek on an open File descriptor. `a0`=handle idx, `a1`=absolute byte offset -> the new offset,
+/// or a negative errno. The CHECK: `handle_resolve` must yield a `File` carrying ANY of `CAP_READ|CAP_WRITE`
+/// (a non-File kind / no handle / a revoked-ancestor cap all give `-EACCES`); a request past the file's `size`
+/// is `-EINVAL` (seeking TO `size`, the EOF position, is legal). Sets `FILE_OFFSET` (the U6b sidecar). Both a
+/// later `SYS_READ` and a File `SYS_WRITE` resume from the seeked offset. See `sys_seek`.
+const SYS_SEEK: u64 = 15;
 
 /// M6e demo: the sentinel `sys_exit` status the preemption spinner uses so its exit is accounted to
 /// `EL0_SPIN_DONE` and never perturbs the M6b `exited/killed` counters. Demo-only — there is no real
@@ -186,6 +192,35 @@ const U8_WITNESS_ALL: u64 = 0xF;
 /// `__u8_prog_tree` MUST match.
 const U8_SRC_IDX: usize = 2;
 const U8_SRC2_IDX: usize = 3;
+
+/// U9 demo: the sentinel `sys_exit` status the File-WRITE fixture (`el0-u9write`) uses so ITS exit lands in
+/// `EL0_U9_DONE`, never perturbing any prior counter (same sentinel discipline). Distinct from every prior
+/// sentinel (0x6D/0x6E/0x6F/0x74..0x79) and 0. Tested BEFORE the catch-all `else` in SYS_EXIT.
+const U9_EXIT_STATUS: u64 = 0x7A;
+/// U9 demo: the witness bitmask the File-WRITE fixture reports — one bit per proven behaviour: bit0 open-RW OK
+/// (`SYS_OPEN("SCRATCH.BIN", RW)` -> handle >= 0), bit1 seek+write OK (`SYS_SEEK` to the scratch offset then
+/// `SYS_WRITE` -> the pattern length), bit2 read-back matches (seek back, `SYS_READ` -> the just-written bytes,
+/// proving the overwrite landed and is visible through the same cap), bit3 an RO-opened File write -> `-EACCES`
+/// (the CAP_WRITE rights CHECK), bit4 a non-File handle (a `Socket` carrying `CAP_WRITE`) write -> `-EACCES`
+/// (the kind CHECK). `u9_launcher` PASSes iff it equals `U9_WITNESS_ALL` AND the kernel-side checks held. Must
+/// match the `add x23, x23, #{1,2,4,8,16}` steps in `__u9_prog_write`.
+const U9_WITNESS_ALL: u64 = 0x1F;
+/// The handle index `u9_launcher` pre-endows: a `Socket` carrying `CAP_WRITE` — the kind negative (a non-File
+/// object WITH the write right is still `-EACCES`, denied purely on kind). Off index 0 (the fixture's own RW
+/// open first-free-claims it) and off `CONSOLE_FD`. The `mov x0, #2` operand in `__u9_prog_write` MUST match.
+const U9_SOCK_IDX: usize = 2;
+/// U9 demo: the dedicated scratch file the fixture opens + overwrites (planted by the launcher's FAT image,
+/// filled with 0x55; NEVER `HELLO.BIN`). 11 chars (<= `MAX_NAME`); the `mov x1, #(9f-8f)` in the blob matches.
+const U9_SCRATCH_NAME: &str = "SCRATCH.BIN";
+/// U9 demo: the absolute byte offset the fixture seeks to and the 16-byte pattern it writes there. `OFFSET`
+/// lands 8 bytes into the file's SECOND 512-byte sector, so the overwrite is a partial-sector read-modify-write
+/// (the interesting case: the sector's other bytes must survive). Both are shared with `__u9_prog_write` (the
+/// `movz`/`.ascii` there MUST match) and with the launcher's kernel-side "the sector changed" re-read.
+const U9_WRITE_OFFSET: u32 = 520;
+const U9_PATTERN: [u8; 16] = *b"U9-WRITE-OK-1234";
+/// U9 demo: the scratch file's planted size (1 KiB of 0x55) — the "size did NOT change" invariant the launcher
+/// asserts before and after the in-place write. Kept > 512 so `probe_once` never cats it (its `<= 512` guard).
+const U9_SCRATCH_SIZE: u32 = 1024;
 
 // --- The inline EL0 FIXTURES: three fault-SHAPE fixtures (M6b) + one preemption spinner (M6e). These
 // are fixtures, not programs, so they stay inline in the kernel image; only the well-behaved `hello`
@@ -1182,6 +1217,130 @@ unsafe extern "C" {
     static __u8_prog_tree: u8;
 }
 
+// --- U9 inline EL0 fixture (real File WRITES + SEEK). ONE fixture (`el0-u9write`) exercising the object
+// table's FIRST mutating resource path: it opens a DEDICATED scratch file RW, seeks into it, overwrites a
+// known 16-byte pattern IN PLACE, seeks back and reads it through the SAME capability to witness the write
+// landed, and proves the `sys_write` CHECK rejects both an RO-opened File (missing `CAP_WRITE` — the rights
+// arm) and a non-File handle carrying `CAP_WRITE` (the kind arm). Position-independent; its only writable
+// user target is the slot's data page at +0x2000 (the SYS_READ dest) — it writes NO user stack, so it is safe
+// on any slot under preemption. `u9_launcher` pre-endows a `Socket` handle at index 2 carrying `CAP_WRITE`
+// (the kind negative). The fixture's own RW `SYS_OPEN` first-free-claims index 0 (index 1 = the reserved
+// `CONSOLE_FD`); its RO open then claims index 3. The write pattern lives in the RO code page (a `.ascii`
+// constant, EL0-readable). It builds a witness bitmask in x23 (one bit per passed check) and SYS_REPORTs it,
+// then exits with the U9 sentinel. ABI: x8=nr, args x0-x2, ret x0. `mov x1, #(9f-8f)` = the 8.3 name length.
+core::arch::global_asm!(
+    r#"
+    .globl __u9_blob_start
+__u9_blob_start:
+    .balign 4
+    .globl __u9_prog_write
+__u9_prog_write:
+    mov  x23, xzr                          // witness bitmask = 0
+    adr  x9, __u9_blob_start               // x9 = window base (blob copied at code-page offset 0)
+    add  x12, x9, #0x2000                  // x12 = read-back buffer VA (writable data page)
+    adr  x13, 12f                          // x13 = write-pattern VA (RO code page; also the compare source)
+
+    // (0) open SCRATCH.BIN RW (mode=1) -> a File handle carrying CAP_READ|CAP_WRITE
+    mov  x8, #11                           // SYS_OPEN
+    adr  x0, 8f                            // name ptr (RO code page — EL0-readable)
+    mov  x1, #(9f - 8f)                    // name len ("SCRATCH.BIN" = 11)
+    mov  x2, #1                            // mode = RW
+    svc  #0
+    mov  x19, x0                           // x19 = RW handle (>=0) or -errno
+    tbnz x19, #63, 1f                      // open failed (negative) -> skip bit0/1/2
+    add  x23, x23, #1                      // bit0: open RW OK
+
+    // (1) seek to the scratch offset (520), then overwrite the 16-byte pattern in place
+    mov  x8, #15                           // SYS_SEEK
+    mov  x0, x19
+    mov  x1, #520                          // U9_WRITE_OFFSET
+    svc  #0
+    cmp  x0, #520                          // seek returns the new absolute offset
+    b.ne 1f
+    mov  x8, #1                            // SYS_WRITE (File + CAP_WRITE -> fat::write_at at the offset)
+    mov  x0, x19
+    mov  x1, x13                           // src = the 16-byte pattern
+    mov  x2, #16
+    svc  #0
+    cmp  x0, #16                           // wrote exactly 16 bytes?
+    b.ne 1f
+    add  x23, x23, #2                      // bit1: seek + in-place write OK
+
+    // (2) seek back to 520 and read the 16 bytes through the SAME cap; they must equal the pattern
+    mov  x8, #15                           // SYS_SEEK back to 520
+    mov  x0, x19
+    mov  x1, #520
+    svc  #0
+    cmp  x0, #520
+    b.ne 1f
+    mov  x8, #12                           // SYS_READ
+    mov  x0, x19
+    mov  x1, x12                           // dest buf
+    mov  x2, #16
+    svc  #0
+    cmp  x0, #16                           // exactly 16 bytes back?
+    b.ne 1f
+    ldr  x10, [x12]                        // two 8-byte compares: read-back == the pattern we wrote
+    ldr  x11, [x13]
+    cmp  x10, x11
+    b.ne 1f
+    ldr  x10, [x12, #8]
+    ldr  x11, [x13, #8]
+    cmp  x10, x11
+    b.ne 1f
+    add  x23, x23, #4                      // bit2: read-back matches the written pattern
+1:
+    // (3) an RO-opened File (mode=0, CAP_READ only) written to must be denied -> -EACCES (the rights CHECK)
+    mov  x8, #11                           // SYS_OPEN SCRATCH.BIN RO
+    adr  x0, 8f
+    mov  x1, #(9f - 8f)
+    mov  x2, #0                            // mode = RO
+    svc  #0
+    mov  x20, x0                           // x20 = RO handle
+    tbnz x20, #63, 2f                      // RO open failed -> skip bit3
+    mov  x8, #1                            // SYS_WRITE through the RO handle
+    mov  x0, x20
+    mov  x1, x13
+    mov  x2, #16
+    svc  #0
+    cmn  x0, #13                           // x0 == -13 (-EACCES) ?
+    b.ne 2f
+    add  x23, x23, #8                      // bit3: RO-open File write -> -EACCES
+2:
+    // (4) a non-File handle (a Socket carrying CAP_WRITE, pre-endowed at index 2) -> -EACCES (the kind CHECK)
+    mov  x8, #1                            // SYS_WRITE
+    mov  x0, #2                            // U9_SOCK_IDX
+    mov  x1, x13
+    mov  x2, #16
+    svc  #0
+    cmn  x0, #13
+    b.ne 3f
+    add  x23, x23, #16                     // bit4: wrong-kind handle write -> -EACCES
+3:
+    mov  x0, x23                           // SYS_REPORT(witness bitmask)
+    mov  x8, #3
+    svc  #0
+    mov  x8, #2                            // SYS_EXIT(U9_EXIT_STATUS) -> EL0_U9_DONE
+    movz x0, #0x7A
+    svc  #0
+4:  b 4b                                   // sys_exit never returns; belt-and-braces guard
+    .balign 4
+8:  .ascii "SCRATCH.BIN"
+9:
+    .balign 8
+12: .ascii "U9-WRITE-OK-1234"
+    .balign 4
+    .globl __u9_blob_end
+__u9_blob_end:
+"#
+);
+
+unsafe extern "C" {
+    static __u9_blob_start: u8;
+    static __u9_blob_end: u8;
+    static __u9_prog_write: u8;
+}
+
 /// The `hello` EL0 program (M6c), built as a SEPARATE link product (`crates/user-blob`) and baked in
 /// as a flat binary instead of living in the kernel's `.text`. `arroyo kernel8` builds it — a naked,
 /// position-independent `sys_write("hello from EL0\n") + sys_exit(0)` routine — for the bare aarch64
@@ -1467,6 +1626,15 @@ static U8_WITNESS: AtomicU64 = AtomicU64::new(0);
 static EL0_U8_DONE: AtomicU32 = AtomicU32::new(0);
 /// A killed U8 fixture — a real bug (it is register-only and well-behaved). Off the M6b counter.
 static EL0_U8_KILLED: AtomicU32 = AtomicU32::new(0);
+
+/// The U9 File-WRITE fixture's WITNESS bitmask (reported via SYS_REPORT): one bit per proven behaviour (see
+/// `U9_WITNESS_ALL`). `u9_launcher` PASSes iff it equals `U9_WITNESS_ALL` AND the kernel-side checks held.
+static U9_WITNESS: AtomicU64 = AtomicU64::new(0);
+/// The U9 fixture (`el0-u9write`) reached its `0x7A` sentinel exit (want 1). Read by `u9_launcher`'s wait.
+static EL0_U9_DONE: AtomicU32 = AtomicU32::new(0);
+/// A killed U9 fixture — a real bug (it is register-only; its only writable user target is its own data page).
+/// Off the M6b counter.
+static EL0_U9_KILLED: AtomicU32 = AtomicU32::new(0);
 
 /// Claim a FREE Proc entry, returning its index. CAS on `state` (FREE->RUNNING) is the atomic ownership
 /// token; the pid=0 placeholder is overwritten with the real child pid (Release) by the caller AFTER the
@@ -1945,8 +2113,9 @@ static FILE_CLUSTER: [[AtomicU32; NFILE]; super::boot::USER_SLOTS + 1] =
 /// The open file's total byte size (the EOF bound `sys_read` clamps against). Meaningful only where `FILE_USED`.
 static FILE_SIZE: [[AtomicU32; NFILE]; super::boot::USER_SLOTS + 1] =
     [const { [const { AtomicU32::new(0) }; NFILE] }; super::boot::USER_SLOTS + 1];
-/// The sequential read offset — advanced by the byte count each `sys_read` returns. Meaningful only where
-/// `FILE_USED`. No seek this arc: offset only ever moves forward, by exactly what was delivered.
+/// The descriptor's byte offset — advanced by the count each `sys_read`/File `sys_write` delivers, and set
+/// absolutely by `SYS_SEEK` (U9). Meaningful only where `FILE_USED`. Always kept `<= FILE_SIZE`: reads/writes
+/// clamp to the bytes remaining, and `sys_seek` rejects an offset past `size` with `-EINVAL`.
 static FILE_OFFSET: [[AtomicU32; NFILE]; super::boot::USER_SLOTS + 1] =
     [const { [const { AtomicU32::new(0) }; NFILE] }; super::boot::USER_SLOTS + 1];
 
@@ -2050,6 +2219,14 @@ fn u6b_report(value: u64) {
 fn u8_report(value: u64) {
     if super::sched::current_name() == Some("el0-u8tree") {
         U8_WITNESS.store(value, Ordering::Release);
+    }
+}
+
+/// U9: record the File-WRITE fixture's witness bitmask (SYS_REPORT), keyed by the reporting task's name.
+/// Called from the SYS_REPORT arm alongside the other reporters; each ignores the others' names.
+fn u9_report(value: u64) {
+    if super::sched::current_name() == Some("el0-u9write") {
+        U9_WITNESS.store(value, Ordering::Release);
     }
 }
 
@@ -2303,6 +2480,12 @@ pub fn record_el0_kill(name: &str, ec: u64, far: u64, far_valid: bool) {
     }
     if name == "el0-u6bfile" {
         EL0_U6B_KILLED.fetch_add(1, Ordering::AcqRel);
+        return;
+    }
+    // U9: the File-WRITE fixture is register-only (its only writable user target is its own data page); a kill
+    // is a real U9 bug — its own counter, never the M6b `killed_unexpected` count (same discipline as above).
+    if name == "el0-u9write" {
+        EL0_U9_KILLED.fetch_add(1, Ordering::AcqRel);
         return;
     }
     let (base, size) = super::boot::user_region();
@@ -2693,6 +2876,7 @@ extern "C" fn aarch64_svc_handler(frame: *mut u64) {
             u6b_report(a0);
             u7_report(a0);
             u8_report(a0);
+            u9_report(a0);
             0
         }
         SYS_YIELD => sys_yield(),
@@ -2702,8 +2886,9 @@ extern "C" fn aarch64_svc_handler(frame: *mut u64) {
         SYS_SPAWN => sys_spawn(),
         SYS_WAIT => sys_wait(a0),
         SYS_CAP => sys_cap(a0, a1, a2),
-        SYS_OPEN => sys_open(a0, a1),
+        SYS_OPEN => sys_open(a0, a1, a2),
         SYS_READ => sys_read(a0, a1, a2),
+        SYS_SEEK => sys_seek(a0, a1),
         SYS_XFER => sys_xfer(a0, a1, a2),
         SYS_RECV => sys_recv(),
         SYS_EXIT => {
@@ -2779,6 +2964,8 @@ extern "C" fn aarch64_svc_handler(frame: *mut u64) {
                 EL0_U6B_DONE.fetch_add(1, Ordering::AcqRel);
             } else if a0 == U8_EXIT_STATUS {
                 EL0_U8_DONE.fetch_add(1, Ordering::AcqRel);
+            } else if a0 == U9_EXIT_STATUS {
+                EL0_U9_DONE.fetch_add(1, Ordering::AcqRel);
             } else if a0 == 0 {
                 EL0_EXITED_OK.fetch_add(1, Ordering::AcqRel);
             } else {
@@ -2855,19 +3042,22 @@ pub fn copy_to_user(user_va: u64, ksrc: &[u8], len: usize) -> Result<(), Efault>
     Ok(())
 }
 
-/// SYS_WRITE(fd, buf, len): write `len` bytes from the EL0 buffer to the serial console; returns the count,
-/// or a negative errno. Routed through `copy_from_user` (M6f): validate the WHOLE range up front so a
+/// SYS_WRITE(fd, buf, len): write `len` bytes from the EL0 buffer, returning the count or a negative errno.
+/// U9 makes this KIND-DISPATCHED at the single CAP_WRITE CHECK: a `Console` handle streams to the serial
+/// console (byte-identical to before); a `File` handle overwrites in place at the descriptor's offset via
+/// `sys_write_file` (`fat::write_at`). Routed through `copy_from_user`: validate the WHOLE range up front so a
 /// hostile pointer yields `-EFAULT` with NO partial output (byte-identical to the pre-M6f all-or-nothing
-/// behaviour), then stream to the console in bounded stack chunks THROUGH the validated copy primitive.
+/// behaviour), then stream/write in bounded chunks THROUGH the validated copy primitive.
 fn sys_write(fd: u64, buf: u64, len: u64) -> i64 {
-    // U5: `fd` is a HANDLE INDEX into the caller's per-process table, not the ambient POSIX stdout. It must
-    // resolve to a CONSOLE resource carrying CAP_WRITE. No such handle / wrong kind / missing CAP_WRITE all
-    // yield -EACCES — the enforcement point. A printing process is endowed this cap at spawn/launch
-    // (`install_console_cap`), so every M6*/U4 print still lands; a process WITHOUT it gets -EACCES (the U5
-    // negative). The pointer validation below is unchanged, so a hostile pointer still yields -EFAULT (the
-    // M6f fixture, which HOLDS the console cap, resolves past this check and then hits the range check).
-    match handle_resolve(current_asid(), fd, CAP_WRITE) {
-        Ok(HandleTarget::Console) => {}
+    // U5/U9: `fd` is a HANDLE INDEX into the caller's per-process table, not the ambient POSIX stdout. It must
+    // resolve to a resource carrying CAP_WRITE. No such handle / a File LACKING CAP_WRITE (an RO open) / a
+    // non-{Console,File} kind all yield -EACCES — the single enforcement point (the U8 derivation/revocation
+    // check rides inside `handle_resolve`, so a revoked File-write cap is `-EACCES` here too). A `Console`
+    // falls through to the serial path below; a `File` with CAP_WRITE routes to the in-place FAT writer.
+    let asid = current_asid();
+    match handle_resolve(asid, fd, CAP_WRITE) {
+        Ok(HandleTarget::Console) => {} // fall through to the console-streaming path below
+        Ok(HandleTarget::File(file_id)) => return sys_write_file(asid, file_id, buf, len),
         _ => return EACCES,
     }
     let total = len as usize;
@@ -2892,6 +3082,60 @@ fn sys_write(fd: u64, buf: u64, len: u64) -> i64 {
         off += n;
     }
     len as i64
+}
+
+/// U9: the File half of `sys_write` — an IN-PLACE overwrite at the descriptor's offset. The CHECK already
+/// passed in `sys_write` (a `File` handle carrying CAP_WRITE, non-revoked), so this decodes the file-id ->
+/// descriptor, clamps the write to the bytes left to EOF (NEVER grows the file), validates the WHOLE source up
+/// front (a bad buffer is -EFAULT with no I/O and NO offset move), copies the bytes into a bounded kernel
+/// buffer, writes them through the in-place FAT writer, and advances the offset by exactly the count written.
+/// The exact write twin of `sys_read`: same descriptor decode, same up-front clamp/validate, same offset
+/// discipline. No create/grow/truncate — a write at/after EOF writes 0 bytes (a later arc adds allocation).
+fn sys_write_file(asid: u64, file_id: u64, buf: u64, len: u64) -> i64 {
+    // Decode the file-id -> descriptor index (undo the +1 bias) and re-check presence (defense in depth: a live
+    // File handle always has a live descriptor, but never trust the value word blindly — mirrors sys_read).
+    let Some(idx) = (file_id as usize).checked_sub(1) else {
+        return EACCES;
+    };
+    if idx >= NFILE || !FILE_USED[asid as usize][idx].load(Ordering::Acquire) {
+        return EACCES;
+    }
+    let size = FILE_SIZE[asid as usize][idx].load(Ordering::Acquire);
+    let offset = FILE_OFFSET[asid as usize][idx].load(Ordering::Acquire);
+    // In-place only: clamp the write to the bytes left from `offset` to EOF. `offset <= size` always (reads/
+    // writes clamp; seek rejects past size), so `size - offset` cannot underflow; a write at/after EOF is 0
+    // bytes (never grows the file). `want == 0` is a clean no-op.
+    let want = core::cmp::min(len as usize, size.saturating_sub(offset) as usize);
+    if want == 0 {
+        return 0; // at/after EOF, or nothing requested — 0 bytes written, no growth
+    }
+    // Validate the WHOLE source BEFORE any disk I/O — a bad buffer is -EFAULT with no write and no offset move.
+    if !user_range_ok(buf, want, false) {
+        return EFAULT;
+    }
+    // Copy the user bytes into a bounded kernel buffer (capped at `want <= size`), then overwrite in place.
+    let mut data: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
+    data.resize(want, 0);
+    if copy_from_user(&mut data, buf, want).is_err() {
+        return EFAULT; // offset NOT advanced — a rejected buffer leaves the file position unchanged
+    }
+    // Re-mount (as sys_read does — the single volume is deterministic) and write `want` bytes at `offset`.
+    let fs = match crate::fs::fat::mount() {
+        Ok(fs) => fs,
+        Err(crate::fs::fat::FatError::NoDisk) => return ENODEV,
+        Err(_) => return EIO,
+    };
+    let cluster = FILE_CLUSTER[asid as usize][idx].load(Ordering::Acquire);
+    let wrote = match fs.write_at(cluster, size, offset, &data) {
+        Ok(n) => n,
+        Err(_) => return EIO,
+    };
+    if wrote == 0 {
+        return 0; // a short chain (malformed vs size) wrote nothing here — no offset move
+    }
+    // wrote <= want <= size - offset, so offset + wrote <= size — the FILE_OFFSET <= FILE_SIZE invariant holds.
+    FILE_OFFSET[asid as usize][idx].store(offset + wrote as u32, Ordering::Release);
+    wrote as i64
 }
 
 /// The fixed struct SYS_GETINFO writes to EL0. `#[repr(C)]` so the byte layout is stable for the user
@@ -3316,19 +3560,21 @@ fn sys_cap_revoke(asid: u64, idx: u64) -> i64 {
 /// bytes. A longer request cannot name a real entry, so it is rejected as malformed rather than truncated.
 const MAX_NAME: usize = 12;
 
-/// SYS_OPEN(name_ptr, name_len) -> a File-handle index, or a negative errno. The first resource syscall routed
-/// through a NON-Console object: it makes U6a's `File` scaffold real. `copy_from_user`s the (bounded) 8.3 name,
-/// mounts the single read-only FAT volume, finds the top-level entry, records an open-file descriptor in the
-/// caller's per-task FILES row, and installs a `File` handle (first-free) carrying `CAP_READ` — the capability
-/// a later `SYS_READ` presents. Returns the handle index EL0 reads/waits on.
+/// SYS_OPEN(name_ptr, name_len, mode) -> a File-handle index, or a negative errno. The first resource syscall
+/// routed through a NON-Console object: it makes U6a's `File` scaffold real. `copy_from_user`s the (bounded) 8.3
+/// name, mounts the single FAT volume, finds the top-level entry, records an open-file descriptor in the
+/// caller's per-task FILES row, and installs a `File` handle (first-free). U9: `mode` bit0 selects the rights the
+/// handle carries — `0` (RO, as before) = `CAP_READ`; `1` (RW) = `CAP_READ | CAP_WRITE`, the write cap a File
+/// `SYS_WRITE` presents. (Higher `mode` bits are reserved and ignored — no O_CREAT/O_TRUNC: create/grow are a
+/// later arc.) Returns the handle index EL0 reads/writes/waits on.
 ///
 /// Ordering mirrors `load_program_into_slot`/`sys_spawn`: do every fallible READ-ONLY lookup first (name copy,
 /// mount, find, dir-reject), so a failure there returns with nothing to unwind; claim RESOURCES last (a file
 /// descriptor, then a handle). The one failure that must unwind is a full handle table AFTER a descriptor was
 /// claimed — free the descriptor, then `-EAGAIN`. Errnos: `-EINVAL` (bad name length), `-EFAULT` (bad name
 /// pointer), `-ENODEV`/`-EIO` (mount failure), `-ENOENT` (no such file), `-EISDIR` (a directory), `-EMFILE`
-/// (open-file table full), `-EAGAIN` (handle table full). Read-only, flat root, one volume — scope by design.
-fn sys_open(name_ptr: u64, name_len: u64) -> i64 {
+/// (open-file table full), `-EAGAIN` (handle table full). Flat root, one volume, in-place writes — scope by design.
+fn sys_open(name_ptr: u64, name_len: u64, mode: u64) -> i64 {
     let asid = current_asid();
     // 1. Bound + copy the name. A 0-length or over-8.3 request is malformed (-EINVAL); copy_from_user validates
     //    the whole source range up front, so a bad/oob pointer is -EFAULT with no deref.
@@ -3366,10 +3612,13 @@ fn sys_open(name_ptr: u64, name_len: u64) -> i64 {
         files_free(asid, fid); // no handle slot — release the descriptor we just claimed (no leak)
         return EAGAIN;
     };
-    // Publish the kind + rights, then the live file-id LAST (Release) — so the handle is never observed live
-    // without its File kind and CAP_READ. Single-writer over this row (mid-syscall), so this is belt-and-braces.
+    // U9: RW mode (bit0) endows CAP_WRITE alongside CAP_READ, so a File `SYS_WRITE` through this handle passes
+    // the CAP_WRITE CHECK; RO (bit0 clear) keeps the U6b read-only cap. Publish the kind + rights, then the live
+    // file-id LAST (Release) — so the handle is never observed live without its File kind and rights.
+    // Single-writer over this row (mid-syscall), so this is belt-and-braces.
+    let rights = if mode & 1 != 0 { CAP_READ | CAP_WRITE } else { CAP_READ };
     handle_set_kind(asid, h, KIND_FILE);
-    handle_set_rights(asid, h, CAP_READ);
+    handle_set_rights(asid, h, rights);
     handle_set(asid, h, file_id);
     h as i64
 }
@@ -3430,6 +3679,42 @@ fn sys_read(handle: u64, buf: u64, len: u64) -> i64 {
     }
     FILE_OFFSET[asid as usize][idx].store(offset + got as u32, Ordering::Release);
     got as i64
+}
+
+/// SYS_SEEK(handle, offset) -> the new absolute offset, or a negative errno (U9). Absolute seek on an open
+/// File descriptor: the CHECK requires a `File` handle carrying ANY of CAP_READ|CAP_WRITE. `handle_resolve`
+/// requires ALL bits in `req`, so "any of" is expressed by resolving for CAP_READ, else for CAP_WRITE —
+/// whichever right is present (and the File kind, and — via `handle_resolve` — no revoked ancestor) admits the
+/// seek; a non-File kind / no handle / a revoked cap all give `-EACCES`. An offset PAST `size` is `-EINVAL`
+/// (seeking exactly TO `size`, the EOF position, is legal). Sets FILE_OFFSET; a later SYS_READ / File
+/// SYS_WRITE resumes from it. No I/O — pure descriptor-state update.
+fn sys_seek(handle: u64, offset: u64) -> i64 {
+    let asid = current_asid();
+    // The CHECK: a File carrying CAP_READ OR CAP_WRITE (either admits a seek), non-revoked. The double resolve
+    // expresses "any of" over `handle_resolve`'s all-bits-in-`req` semantics without reading the sidecars raw.
+    let file_id = match handle_resolve(asid, handle, CAP_READ) {
+        Ok(HandleTarget::File(id)) => id,
+        _ => match handle_resolve(asid, handle, CAP_WRITE) {
+            Ok(HandleTarget::File(id)) => id,
+            _ => return EACCES,
+        },
+    };
+    // Decode the file-id -> descriptor index (undo the +1 bias) and re-check presence (defense in depth).
+    let Some(idx) = (file_id as usize).checked_sub(1) else {
+        return EACCES;
+    };
+    if idx >= NFILE || !FILE_USED[asid as usize][idx].load(Ordering::Acquire) {
+        return EACCES;
+    }
+    let size = FILE_SIZE[asid as usize][idx].load(Ordering::Acquire);
+    // Absolute seek: an offset PAST the file's size is invalid; seeking exactly TO `size` (the EOF position, a
+    // legal 0-byte read/write point) is allowed. Preserves the FILE_OFFSET <= FILE_SIZE invariant. `size` is a
+    // u32, so `offset <= size` guarantees the cast below is exact and the return fits a non-negative i64.
+    if offset > size as u64 {
+        return EINVAL;
+    }
+    FILE_OFFSET[asid as usize][idx].store(offset as u32, Ordering::Release);
+    offset as i64
 }
 
 // =============================================================================================
@@ -4919,12 +5204,14 @@ fn u7_release_go(slot: usize) {
 ///      iff both witnesses == `U7_WITNESS_ALL` AND used AND the snapshot held AND everything cleared AND no
 ///      U7 kill. Prints ONE PASS line. U7 is the last demo, so it releases no further gate.
 pub fn u7_launcher(demo_cpu: usize) {
-    // U8 rides the SAME kernel task, strictly after the whole U7 flow (every U7 exit path — PASS, FAIL, or
-    // skip — falls through to it): the ordering gate the *_LAUNCH_DONE statics provide between separately
-    // spawned launchers is here the program order of one task, and the U7 fixtures' slots have torn down
-    // by the time `u7_run` returns (its verdict waits on their exits).
+    // U8, then U9, ride the SAME kernel task, each strictly after the prior flow (every exit path — PASS, FAIL,
+    // or skip — falls through): the ordering gate the *_LAUNCH_DONE statics provide between separately spawned
+    // launchers is here the program order of one task. Each launcher's verdict waits on its fixture's exit +
+    // teardown, so the demo slot is free again before the next builds — no new gate needed. Keeping U9 here
+    // (rather than a `sched::spawn` in main.rs) stays wholly inside the aarch64 syscall lane.
     u7_run(demo_cpu);
     u8_launcher(demo_cpu);
+    u9_launcher(demo_cpu);
 }
 
 fn u7_run(demo_cpu: usize) {
@@ -5257,6 +5544,215 @@ fn u8_launcher(demo_cpu: usize) {
             killed,
             EL0_U8_DONE.load(Ordering::Acquire),
             U8_WITNESS_ALL
+        );
+    }
+}
+
+// =============================================================================================
+// U9: real File WRITES + SEEK — the single-process EL0 fixture (open-RW -> seek -> in-place write ->
+// seek back -> read-back witness + the RO-write / wrong-kind denials) and the kernel-side checks
+// (the on-disk sector actually changed + the file size did NOT, and a U8-revoked File-write cap is
+// -EACCES), folded into one launcher/verdict that rides the U7 launcher task after U8.
+// =============================================================================================
+
+/// Build the U9 fixture slot — the `u8_build` shape for the U9 blob (allocate, scrub, copy, I-cache-sync,
+/// protect, return run params). The scrub keeps the U7/U8 discipline: a prior tenant's bytes survive teardown
+/// and must never leak into a fresh fixture window (the fixture's read-back buffer lives at +0x2000).
+fn u9_build() -> Option<U7Fix> {
+    let (base, size) = super::boot::user_region();
+    let sp = (base + size as u64) & !0xF;
+    let bstart = &raw const __u9_blob_start as usize;
+    let bend = &raw const __u9_blob_end as usize;
+    let blen = bend - bstart;
+    assert!(blen <= super::boot::USER_CODE_SIZE, "U9 blob does not fit in a code page");
+    let entry = {
+        let va = base + (&raw const __u9_prog_write as usize - bstart) as u64;
+        assert!(va & 3 == 0, "U9 fixture entry misaligned");
+        va
+    };
+    let slot = super::boot::alloc_user_slot()?;
+    let backing = super::boot::slot_backing_ptr(slot);
+    unsafe {
+        core::ptr::write_bytes(backing, 0, size);
+        core::ptr::copy_nonoverlapping(bstart as *const u8, backing, blen);
+    }
+    super::cache::icache_sync_range(backing as usize, blen);
+    unsafe { super::boot::protect_user_slot_code(slot, super::boot::USER_CODE_SIZE) };
+    let ttbr0 = super::boot::slot_ttbr0(slot);
+    Some(U7Fix { entry, sp, ttbr0, asid: ttbr0 >> 48, slot })
+}
+
+/// U9 kernel-side helper: read 16 bytes at absolute file offset `off` from a fresh mount, via the read-only
+/// offset-aware FAT reader — the "raw re-read" the launcher uses to prove the on-disk bytes changed. `None` on
+/// any mount/read failure or a short read. Independent of any FILE_OFFSET sidecar (it re-derives everything).
+fn u9_read16(fc: u32, size: u32, off: u32) -> Option<[u8; 16]> {
+    let fs = crate::fs::fat::mount().ok()?;
+    let mut v: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
+    fs.read_at(fc, size, off, &mut v, 16).ok()?;
+    if v.len() < 16 {
+        return None;
+    }
+    let mut out = [0u8; 16];
+    out.copy_from_slice(&v[..16]);
+    Some(out)
+}
+
+/// The U9 kernel-side revocation check — the "a U8-revoked File cap write is -EACCES" denial, staged over a
+/// scratch ASID row (6 — every demo fixture has exited and torn down by the time this runs, exactly as
+/// `u8_kernel_check` relies on) because a revoked-derivation setup is cleaner kernel-side than in the EL0 blob.
+/// `sys_write`'s ONLY gate is `handle_resolve(asid, fd, CAP_WRITE)`, so proving that resolve is `Err` after the
+/// ancestor is revoked IS proving the write returns `-EACCES`. Backs a real File descriptor so the pre-revoke
+/// cap would genuinely write; the post-revoke denial then provably comes from the derivation walk. Drops
+/// everything planted and demands the handle/file/derivation ledgers all clear (no node/descriptor leaked).
+fn u9_check_revoked_write(fc: u32, sz: u32) -> bool {
+    const A: u64 = 6; // scratch ASID row (provably clear here — the fixture uses a different, freshly-alloc'd slot)
+    let mut ok = true;
+    // Back a real File descriptor so the ROOT cap names a genuine open file (a write through it WOULD land).
+    let Some(fid) = files_alloc(A, fc, sz) else {
+        return false;
+    };
+    let file_id = (fid + 1) as u64;
+    // A ROOT File cap carrying CAP_WRITE|CAP_GRANT|CAP_REVOKE at index 2 (off index 0 / CONSOLE_FD, the U8 idiom).
+    install_cap(A, 2, KIND_FILE, file_id, CAP_WRITE | CAP_GRANT | CAP_REVOKE);
+    // Pre-revoke: the root File+CAP_WRITE cap resolves — a `sys_write` through it WOULD pass the CHECK.
+    ok &= matches!(handle_resolve(A, 2, CAP_WRITE), Ok(HandleTarget::File(id)) if id == file_id);
+    // Derive a child File+CAP_WRITE (records the derivation edge + back-fills the root's node).
+    let g = sys_cap_grant(A, 2, CAP_WRITE as u64);
+    ok &= g >= 0;
+    // Pre-revoke: the DERIVED File+CAP_WRITE cap also resolves — a write through it WOULD land too.
+    if g >= 0 {
+        ok &= matches!(handle_resolve(A, g as u64, CAP_WRITE), Ok(HandleTarget::File(_)));
+    }
+    // Revoke the ROOT (index 2 carries CAP_REVOKE) -> kills the derivation subtree; the revoke clears index 2.
+    ok &= sys_cap_revoke(A, 2) == 0;
+    // THE DENIAL: the derived File+CAP_WRITE cap is now stale — its next CAP_WRITE resolve (exactly the CHECK
+    // `sys_write` performs) is `-EACCES`. This is the "a U8-revoked File cap write -> -EACCES" proof.
+    if g >= 0 {
+        ok &= handle_resolve(A, g as u64, CAP_WRITE).is_err();
+    }
+    // Drop everything planted; index 2 was already cleared by the revoke, so clearing the derived handle drops
+    // the last node (the root's tombstone cascades free). Then demand every ledger clear — no leak on any path.
+    if g >= 0 {
+        handle_clear(A, g as usize);
+    }
+    files_free(A, fid);
+    ok &= handle_row_is_clear(A) && files_row_is_clear(A) && deriv_all_free();
+    ok
+}
+
+/// U9 launcher + verdict — called by the U7 launcher task after the whole U8 flow (program-order gating; see
+/// `u7_launcher`). Flow: skip silently with no SD (the fixture writes a real disk file); pre-flight SCRATCH.BIN
+/// (chain head + size + the pre-image bytes at the write offset — the "changed" baseline) BEFORE allocating a
+/// slot; build + pre-endow (index 2 = a `Socket` carrying `CAP_WRITE`, the kind negative) + spawn the fixture;
+/// wait (bounded) for its sentinel exit + teardown (its two open descriptors clear the FILES row); then the
+/// kernel-side checks: re-read the on-disk bytes at the offset (must now equal the written pattern, and differ
+/// from the pre-image) + the directory size UNCHANGED (in-place, never grew), and the revoked-File-write denial.
+/// PASS iff witness == `U9_WITNESS_ALL` AND torn down AND no kill AND all kernel checks held. U9 is the last
+/// demo — it releases no further gate.
+fn u9_launcher(demo_cpu: usize) {
+    // One-shot (the U7 launcher is spawned once; guard defensively anyway).
+    static DONE: AtomicBool = AtomicBool::new(false);
+    if DONE.swap(true, Ordering::Relaxed) {
+        return;
+    }
+    // No SD device -> the fixture cannot write a disk file; skip silently (mirrors U6b/U7/U8's control path).
+    if crate::drivers::block::info().is_none() {
+        return;
+    }
+    // Pre-flight the ONE fallible disk lookup — SCRATCH.BIN's chain head + size — BEFORE allocating a slot
+    // (the U6b discipline: fallible lookups first, resource alloc last, so a lookup failure leaks nothing).
+    let (fc, pre_size) = match crate::fs::fat::mount()
+        .and_then(|fs| fs.find_in_root(U9_SCRATCH_NAME).map(|de| (de.first_cluster(), de.size, de.is_dir)))
+    {
+        Ok((fc, sz, false)) => (fc, sz),
+        _ => {
+            serial_println!(
+                ":: U9: pre-open of SCRATCH.BIN failed (absent / a directory / unmountable) — File-write demo skipped ::"
+            );
+            return;
+        }
+    };
+    // Capture the pre-image bytes at the write offset (the 0x55 filler the image planted) — the baseline the
+    // "sector changed" check compares against. A read failure here is not fatal to the demo; it fails the check.
+    let pre = u9_read16(fc, pre_size, U9_WRITE_OFFSET);
+
+    // Build the fixture slot (allocates it), pre-endow the kind negative, print the setup line, spawn.
+    let Some(fix) = u9_build() else {
+        serial_println!(":: U9: no free address-space slot — File-write demo skipped ::");
+        return;
+    };
+    // The kind negative: a Socket carrying CAP_WRITE at U9_SOCK_IDX. It HAS the right, so a File `sys_write` is
+    // denied purely on kind (write serves Console/File only) — the kind arm, not the rights arm. A scaffold id.
+    install_cap(fix.asid, U9_SOCK_IDX, KIND_SOCKET, 0x200, CAP_WRITE);
+    serial_println!(
+        ":: U9: real File writes — SYS_SEEK + File+CAP_WRITE routed through fat::write_at (in place) ::"
+    );
+    super::sched::spawn_user_slot("el0-u9write", fix.entry, fix.sp, fix.ttbr0, demo_cpu);
+
+    // Wait (bounded ~5 s, yielding) for the fixture's sentinel exit, then snapshot the witness.
+    let vstart = super::timer::cntpct();
+    let vdeadline = 5 * super::timer::cntfrq();
+    while EL0_U9_DONE.load(Ordering::Acquire) < 1
+        && super::timer::cntpct().wrapping_sub(vstart) <= vdeadline
+    {
+        super::sched::yield_now();
+    }
+    let witness = U9_WITNESS.load(Ordering::Acquire);
+    let killed = EL0_U9_KILLED.load(Ordering::Acquire);
+
+    // Teardown proof: the fixture exited holding two live descriptors (its RW + RO opens) and the pre-endowed
+    // Socket handle, so its exit cleared BOTH the FILES row and the handle row. Poll bounded; false->true.
+    let tstart = super::timer::cntpct();
+    let tdeadline = 2 * super::timer::cntfrq();
+    while !(files_row_is_clear(fix.asid) && handle_row_is_clear(fix.asid))
+        && super::timer::cntpct().wrapping_sub(tstart) <= tdeadline
+    {
+        super::sched::yield_now();
+    }
+    let cleared = files_row_is_clear(fix.asid) && handle_row_is_clear(fix.asid);
+
+    // Kernel-side "the write actually hit the disk" checks: re-read SCRATCH.BIN from a fresh mount. The size
+    // must be UNCHANGED (in-place — never grew), the bytes at the offset must now equal the written pattern,
+    // and they must differ from the pre-image (a real change, not a coincidence).
+    let post = crate::fs::fat::mount()
+        .ok()
+        .and_then(|fs| fs.find_in_root(U9_SCRATCH_NAME).ok())
+        .map(|de| (de.first_cluster(), de.size));
+    let (size_unchanged, sector_changed) = match (post, pre) {
+        (Some((post_fc, post_size)), Some(pre_bytes)) => {
+            let size_unchanged = post_size == pre_size && post_size == U9_SCRATCH_SIZE;
+            let now = u9_read16(post_fc, post_size, U9_WRITE_OFFSET);
+            let sector_changed =
+                now == Some(U9_PATTERN) && pre_bytes != U9_PATTERN;
+            (size_unchanged, sector_changed)
+        }
+        _ => (false, false),
+    };
+
+    // Kernel-side revoked-File-write denial (needs a clear scratch row — every fixture has torn down by here).
+    let revoke_ok = u9_check_revoked_write(fc, pre_size);
+
+    if witness == U9_WITNESS_ALL
+        && cleared
+        && killed == 0
+        && size_unchanged
+        && sector_changed
+        && revoke_ok
+    {
+        serial_println!(
+            ":: U9: real File writes — open-RW+seek+write+readback OK, RO-write/wrong-kind/revoked-cap all -EACCES, on-disk sector changed + size unchanged -> PASS ::"
+        );
+    } else {
+        serial_println!(
+            ":: U9: real File writes FAIL — witness={:#x} cleared={} killed={} size_unchanged={} sector_changed={} revoke={} done={} (want {:#x}/true/0/true/true/true/1) ::",
+            witness,
+            cleared,
+            killed,
+            size_unchanged,
+            sector_changed,
+            revoke_ok,
+            EL0_U9_DONE.load(Ordering::Acquire),
+            U9_WITNESS_ALL
         );
     }
 }
