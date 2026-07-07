@@ -286,6 +286,50 @@ pub fn jb2c_padctl_powerup(chan: &super::bpmp_tegra::Chan) {
 /// slot configures; that is fine and visible in the log) but its SCSI/BOT bring-up is the JB3
 /// arc, not this one — the BOT pump is the driver's heaviest synchronous path and the keyboard
 /// does not need it.
+/// JB3 boot-10: the FPCI wrapper — Tegra's XUSB host sits behind a fake-PCI config space
+/// (`fpci` region @0x360_0000, same ungated partition as the host MMIO), and the FIRST thing
+/// Linux xhci-tegra does before touching the controller is
+/// `XUSB_CFG_1 |= IO_SPACE_EN | MEM_SPACE_EN | BUS_MASTER_EN` (+ program the BAR in CFG_4).
+/// JB2b skipped this and went straight to the 0x361_0000 MMIO — which works for register
+/// access, but **BUS_MASTER_EN gates the controller's ability to issue DMA at all**. The
+/// boot-2..9 chain proved: SMMU open + translating + fault-free, MC SIDs programmed,
+/// coherency ruled out (dc-civac: DRAM genuinely empty) — the one remaining torn-down link
+/// is the wrapper's bus-master enable, exactly what an "hide device resources at exit" EBS
+/// teardown would clear. Dump CFG_0/1/4, set the enables, re-dump.
+const XUSB_FPCI: u64 = 0x0360_0000;
+
+pub fn jb3_fpci_enable() {
+    let r = |off: u64| unsafe { core::ptr::read_volatile((XUSB_FPCI + off) as *const u32) };
+    let w = |off: u64, v: u32| unsafe {
+        core::ptr::write_volatile((XUSB_FPCI + off) as *mut u32, v)
+    };
+    serial_println!(":: tegra: JB3 — FPCI @{:#010x} first touch ::", XUSB_FPCI);
+    let cfg0 = r(0x0);
+    let cfg1 = r(0x4);
+    let cfg4 = r(0x10);
+    let cfg5 = r(0x14);
+    serial_println!(
+        ":: tegra: JB3 — FPCI CFG_0={:#010x} CFG_1={:#010x} (io={} mem={} busmaster={}) CFG_4={:#010x} CFG_5={:#010x} ::",
+        cfg0,
+        cfg1,
+        cfg1 & 1,
+        (cfg1 >> 1) & 1,
+        (cfg1 >> 2) & 1,
+        cfg4,
+        cfg5
+    );
+    // BAR0 first if the teardown wiped it (Linux order), then the enables.
+    if cfg4 & !0xf == 0 {
+        w(0x10, 0x0361_0000);
+    }
+    w(0x4, cfg1 | 0b111); // IO_SPACE_EN | MEM_SPACE_EN | BUS_MASTER_EN
+    serial_println!(
+        ":: tegra: JB3 — FPCI enable: CFG_1 rb={:#010x} CFG_4 rb={:#010x} ::",
+        r(0x4),
+        r(0x10)
+    );
+}
+
 pub fn jb2b_attach(dma_coherent: Option<bool>) -> Option<(u8, u8)> {
     serial_println!(
         ":: tegra: JB2b — usb@3610000 dma-coherent: {} ::",

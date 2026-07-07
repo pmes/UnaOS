@@ -1136,6 +1136,13 @@ fn tegra_early_stop(boot_info: &'static mut BootInfo) -> ! {
             unaos_kernel::arch::smmu_tegra::jb3_v3_dump(v3_base);
         }
         unaos_kernel::arch::smmu_tegra::jb3_mc_errs("pre-attach");
+        // JB3 boot-9: re-program the MC XUSB SID overrides (HOSTR/HOSTW) like the L4T kernel
+        // does every boot — the UEFI exit teardown cleared them; the SMMU chain is proven
+        // clean and this is the remaining torn-down link that assigns the stream its id.
+        unaos_kernel::arch::smmu_tegra::jb3_mc_sid_fix(jb3_sid);
+        // JB3 boot-10: the FPCI wrapper's bus-master enable — the last torn-down link
+        // (Linux sets it before its first controller touch; JB2b never did).
+        unaos_kernel::arch::xusb_tegra::jb3_fpci_enable();
         let coherent = unaos_kernel::arch::fdt_tegra::xusb_dma_coherent(
             dtb_addr,
             dtb_size,

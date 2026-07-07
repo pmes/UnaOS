@@ -146,6 +146,17 @@ pub fn jb3_probe(bases: &[u64], xusb_sid: u32) {
 pub fn jb3_faults(bases: &[u64]) {
     for (i, &base) in bases.iter().enumerate() {
         jb3_fault_line(i, base, "post-attach");
+        // Boot-7: translation faults land in the context bank, not the global GFSR.
+        // CB0 FSR @ +0x58 (TF b1, AFF b2, PF b3, EF b4, MULTI b31), FAR @ +0x60/0x64.
+        let cb = base + CB0_OFF;
+        serial_println!(
+            ":: tegra: JB3 — inst{} CB0: SCTLR={:#010x} FSR={:#010x} FAR={:#x}_{:08x} ::",
+            i,
+            rd(cb, 0x0),
+            rd(cb, 0x58),
+            rd(cb, 0x64),
+            rd(cb, 0x60)
+        );
     }
 }
 
@@ -163,6 +174,72 @@ const MC_SID_XUSB_HOSTR: u64 = 0x250;
 
 fn wr(base: u64, off: u64, v: u32) {
     unsafe { core::ptr::write_volatile((base + off) as *mut u32, v) }
+}
+
+// ---- JB3 boot-7: a REAL identity translation context ------------------------------------
+// Boot-6 verdict: no SMMUv3 exists in the firmware's world (census: only the three MMU-500
+// pairs) and the v2 pair passes our matched stream fault-free — yet every DMA write still
+// vanishes. The one agent left downstream is the fabric/MC, and the MB2 boot log names its
+// policy outright: "SMMU external bypass disable" — UNTRANSLATED traffic is refused. Bypass
+// output is untranslated by definition; UEFI's own SmmuDxe and Linux both run this fabric
+// with real translation contexts. So: stop bypassing, translate identity.
+//
+// Geometry (from the boot-1 IDR dumps, both instances identical): IDR1=0xe0000080 →
+// PAGESIZE=64 KiB (b31), NUMPAGENDXB=6 → NUMPAGE=128 → global half = 8 MiB; GR1 = base
+// +0x10000 (page 1); CB n = base + 8 MiB + n·64 KiB; NUMCB=128 — CB0 is free (UEFI's
+// contexts died with it; we own the block now).
+
+/// One 4 KiB stage-1 L1 table: 512 × 1 GiB identity blocks covering IA[38:0] (T0SZ=25).
+/// Const-built — no runtime init, no interior mutability. Descriptor: PA | AF | SH=inner |
+/// AP[2:1]=01 (RW, any privilege) | AttrIndx=0 (MAIR0 idx0 = Normal-WB) | VALID (block).
+#[repr(C, align(4096))]
+struct IdMap([u64; 512]);
+const fn idmap_build() -> IdMap {
+    let mut t = [0u64; 512];
+    let mut i = 0;
+    while i < 512 {
+        t[i] = ((i as u64) << 30) | (1 << 10) | (0b11 << 8) | (0b01 << 6) | 0b01;
+        i += 1;
+    }
+    IdMap(t)
+}
+static JB3_IDMAP: IdMap = idmap_build();
+
+/// MMU-500 layout constants for this silicon (verified against the boot-1 IDR dumps).
+const GR1_OFF: u64 = 0x10000; // page 1 (64 KiB pages)
+const CB0_OFF: u64 = 8 * 1024 * 1024; // global half = NUMPAGE(128) × 64 KiB
+// GR1: CBAR[n] @ +4n (TYPE [17:16]: 0b01 = stage-1 with stage-2 bypass); CBA2R[n] @ +0x800+4n
+// (VA64 b0). CB regs: SCTLR 0x0, TCR2 0x10, TTBR0 0x20/0x24, TCR 0x30, MAIR0 0x38.
+
+fn jb3_install_identity_cb0(base: u64) {
+    let table_pa = &JB3_IDMAP as *const _ as u64; // kernel RAM is identity-mapped (VA == PA)
+    // The PTW must see the table: it was const-built into the image, but clean it to PoC
+    // anyway — insurance against a non-snooping walker.
+    unsafe {
+        let mut p = table_pa & !63;
+        while p < table_pa + 4096 {
+            core::arch::asm!("dc cvac, {}", in(reg) p, options(nostack, preserves_flags));
+            p += 64;
+        }
+        core::arch::asm!("dsb sy", options(nostack, preserves_flags));
+    }
+    wr(base, GR1_OFF + 0x800, 1); // CBA2R[0]: VA64
+    wr(base, GR1_OFF, 0b01 << 16); // CBAR[0]: stage-1, stage-2 bypass
+    let cb = base + CB0_OFF;
+    wr(cb, 0x10, 0b010 | (0b111 << 15)); // TCR2: PASIZE=40-bit, SEP=upstream
+    wr(cb, 0x20, table_pa as u32); // TTBR0 lo
+    wr(cb, 0x24, (table_pa >> 32) as u32); // TTBR0 hi (ASID 0)
+    // TCR: T0SZ=25 (39-bit IA, start level 1, 1 GiB blocks), TG0=4K, IRGN0=ORGN0=WBWA, SH0=inner
+    wr(cb, 0x30, 25 | (0b01 << 8) | (0b01 << 10) | (0b11 << 12));
+    wr(cb, 0x38, 0x0000_00ff); // MAIR0: AttrIndx0 = Normal WB RAWA
+    wr(cb, 0x58, 0xffff_ffff); // FSR: W1C-clear UEFI-era residue so post-attach faults are OURS
+    wr(cb, 0x0, (1 << 5) | (1 << 6) | 1); // SCTLR: CFRE | CFIE | M
+    serial_println!(
+        ":: tegra: JB3 — CB0 armed: CBAR rb={:#010x} CBA2R rb={:#010x} FSR rb={:#010x} ::",
+        rd(base, GR1_OFF),
+        rd(base, GR1_OFF + 0x800),
+        rd(cb, 0x58)
+    );
 }
 
 /// JB3 fix (boot 2) — open the XUSB stream through the NISO1 pair.
@@ -207,7 +284,12 @@ pub fn jb3_open_stream(bases: &[u64], xusb_sid: u32) {
         // are DON'T-CARE): any SID whose low 8 bits are the XUSB_HOST id hits the bypass —
         // and no other Tegra234 master shares that low byte, so nothing else does.
         wr(base, SMR_BASE, (1 << 31) | (0x7f00 << 16) | (xusb_sid & 0x7fff));
-        wr(base, S2CR_BASE, 0b01 << 16); // TYPE=bypass, CBNDX dont-care
+        // Boot-7: TRANSLATE through the identity CB0, not bypass — the fabric refuses
+        // untranslated output (boot 5/6: bypass matched + fault-free, DMA still swallowed;
+        // "SMMU external bypass disable" is the MB2 policy). Identity tables make the
+        // translation a no-op address-wise while satisfying the translated-traffic rule.
+        jb3_install_identity_cb0(base);
+        wr(base, S2CR_BASE, 0b00 << 16); // TYPE=translate, CBNDX=0
         let scr0_new = (scr0_pre & !1) | (1 << 10); // CLIENTPD=0, USFCFG=1
         wr(base, SCR0, scr0_new);
         wr(base, TLBIALLNSNH, 0);
@@ -234,6 +316,41 @@ pub fn jb3_open_stream(bases: &[u64], xusb_sid: u32) {
         }
     }
     serial_println!(":: tegra: JB3 — XUSB stream opened (SMR bypass + client port on) ::");
+}
+
+/// JB3 boot-9: (re)program the MC stream-id overrides for the XUSB host, exactly as the L4T
+/// kernel does at every boot (tegra234-mc-sid.c) — READ and WRITE clients have SEPARATE
+/// override registers (XUSB_HOSTR @0x250, XUSB_HOSTW @0x258; security config at +4). The
+/// boot-8 chain proved the SMMU passes our matched stream fault-free and the writes still
+/// never reach DRAM; Linux survives the same post-ExitBootServices state by re-programming
+/// ALL client SID overrides as a standard MC boot step — UEFI's teardown cleared them and
+/// nothing on our side ever put them back. Write the DTB SID, print pre/post + security.
+pub fn jb3_mc_sid_fix(xusb_sid: u32) {
+    const PAIRS: [(&str, u64); 4] = [
+        ("HOSTR", 0x250),
+        ("HOSTW", 0x258),
+        ("DEVR", 0x260),
+        ("DEVW", 0x268),
+    ];
+    for (name, off) in PAIRS {
+        let pre = rd(MC_SID_BASE, off);
+        let sec = rd(MC_SID_BASE, off + 4);
+        serial_println!(
+            ":: tegra: JB3 — MC SID {}: override={:#010x} security={:#010x} ::",
+            name,
+            pre,
+            sec
+        );
+    }
+    // Program the HOST pair only (device-mode controller stays untouched).
+    wr(MC_SID_BASE, 0x250, xusb_sid & 0xff);
+    wr(MC_SID_BASE, 0x258, xusb_sid & 0xff);
+    serial_println!(
+        ":: tegra: JB3 — MC SID HOSTR/HOSTW <- {:#x}: rb={:#010x}/{:#010x} ::",
+        xusb_sid & 0xff,
+        rd(MC_SID_BASE, 0x250),
+        rd(MC_SID_BASE, 0x258)
+    );
 }
 
 /// JB3 boot-6: the MC error log — the always-on memory controller records aborted client

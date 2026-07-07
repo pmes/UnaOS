@@ -2492,6 +2492,29 @@ impl XhciController {
                     serial_println!(
                         "xHCI: WATCHDOG: port {} stuck at '{}' (cmd={:#x}).",
                         port, self.enum_stage, self.enum_cmd_phys);
+                    // JB3 boot-8 experiment (Tegra-only, one line per watchdog): the SMMU
+                    // passes our stream fault-free yet no event ever appears — distinguish
+                    // "the controller's DMA write never reached DRAM" from "it landed but
+                    // the CPU's cached line is stale (fabric snooping dead post-EBS)" by
+                    // invalidating the CPU's copy of the event ring and re-checking.
+                    #[cfg(feature = "tegra")]
+                    {
+                        let landed = {
+                            EVENT_RING
+                                .lock()
+                                .as_ref()
+                                .map(|r| r.has_event_after_invalidate())
+                                .unwrap_or(false)
+                        };
+                        serial_println!(
+                            "xHCI: [tegra] event ring after dc-civac: {}",
+                            if landed {
+                                "EVENT PRESENT — writes LAND, CPU snoop broken (coherency)"
+                            } else {
+                                "still empty — writes never reach DRAM"
+                            }
+                        );
+                    }
                     // Unwedge the command ring first: the xHC executes commands in order, so
                     // the hung command blocks everything (including slot disposal) until it
                     // is aborted. The abort pump may itself deliver the failure completion
