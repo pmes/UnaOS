@@ -22,3 +22,4 @@ secret.txt
 evidence.txt
 .env
 cargo_check.log
+jetson-serial.log
