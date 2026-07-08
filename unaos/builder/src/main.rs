@@ -233,13 +233,24 @@ fn main() {
     // exact 4/4 controller shape and a byte-identical boot log.
     let usbserial = std::env::var("UNAOS_USBSERIAL").is_ok();
     let xhci_dev = if usbserial { "qemu-xhci,id=xhci,p2=8,p3=8" } else { "qemu-xhci,id=xhci" };
+    // UNAOS_NOSTORAGE=1 omits the usb-storage device entirely, so the kernel enumerates NO block device
+    // (block::info() -> None) — the QEMU analog of the metal 2012 rMBP, where the SD reader never enumerates
+    // over xHCI (the storage-enumeration blocker). Used to exercise the no-storage control path: the
+    // storage-INDEPENDENT capability demos (U5x/U7x/U8x — inline console-cap blobs) run + print there, while
+    // every storage-GATED arc (U2/U4x/U6x/U6bx/U9x/U11x) skips. Previews exactly what the metal FTDI console
+    // shows. NOTE: `is_ok()` treats an EMPTY value as SET (the known knob trap) — `UNAOS_NOSTORAGE=` is ON.
+    let nostorage = std::env::var("UNAOS_NOSTORAGE").is_ok();
     cmd.arg("-drive").arg(format!("if=none,id=esp,format=raw,file=fat:rw:{}", esp_dir.display()))
        .arg("-device").arg("ide-hd,drive=esp,bootindex=0")
        .arg("-device").arg("isa-debug-exit,iobase=0xf4,iosize=0x04")
-       .arg("-device").arg(xhci_dev)
-       .arg("-drive").arg(format!("if=none,id=stick,format=raw,file={}", stick_image.display()))
-       .arg("-device").arg("usb-storage,bus=xhci.0,drive=stick,bootindex=1")
-       .arg("-device").arg("usb-kbd,bus=xhci.0")
+       .arg("-device").arg(xhci_dev);
+    if nostorage {
+        println!("   UNAOS_NOSTORAGE: usb-storage omitted — kernel sees no block device (metal-like no-storage path)");
+    } else {
+        cmd.arg("-drive").arg(format!("if=none,id=stick,format=raw,file={}", stick_image.display()))
+           .arg("-device").arg("usb-storage,bus=xhci.0,drive=stick,bootindex=1");
+    }
+    cmd.arg("-device").arg("usb-kbd,bus=xhci.0")
        .arg("-device").arg("usb-tablet,bus=xhci.0")
        .arg("-m").arg("1G");
 

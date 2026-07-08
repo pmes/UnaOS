@@ -119,6 +119,15 @@ else
     echo "    WARNING: ${HELLO_BIN} absent — image has no HELLO.BIN (run './arroyo fat-img' via arroyo, not make-fat-img.sh directly)"
 fi
 
+# U9x M2: plant a DEDICATED writable scratch file (NEVER HELLO.BIN — other fixtures load that as EL0
+# code). 1 KiB of 0xEE filler, mirroring the pi4 image plant (arroyo's kernel8 SCRATCH.BIN block): the
+# U9x fixture opens it RW, seeks to 520, overwrites a 16-byte pattern, and the launcher flushes that
+# staged write to disk and raw-re-reads the sector to prove it landed (bytes changed + size unchanged).
+# 0356 octal == 0xEE; matches the kernel's in-memory const seed (U9X_SCRATCH_FILL) byte-for-byte, so the
+# no-FAT in-memory core and the on-disk backing serve identical pre-image bytes.
+head -c 1024 /dev/zero | tr '\000' '\356' > "${MNT}/SCRATCH.BIN"
+echo "    added SCRATCH.BIN (1024 bytes of 0xEE) for the U9x File-write demo"
+
 # Strip macOS metadata (AppleDouble ._ files, Spotlight/fseventsd) so `ls` shows a clean tree.
 sync
 find "$MNT" -name '._*' -delete 2>/dev/null || true

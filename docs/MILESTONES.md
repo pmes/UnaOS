@@ -121,7 +121,133 @@ Legend: **✅ metal-confirmed** · **🔬 QEMU-green, metal pending** · dates I
 - **Metal:** CANNOT be metal-confirmed — the standing x86 xHCI enumeration blocker (`task_47291f90`) means the
   rMBP enumerates no mass-storage device, so `block::info()` is None and U9x's storage-gated demo SKIPS on
   metal exactly as U8x/U7x do. QEMU-green is the ceiling until that blocker clears; the gate is NOT relaxed.
+
+### U9x M2 — real disk write-back: FAT cluster capture, a per-descriptor dirty flag, a flush queue past teardown, and the launcher's IF=1 flush + raw-sector re-read (x86) 🔬 `hw-rmbp`
+- **What:** completes the pi4 U9 twin — persists M1's staged in-memory write to the FAT on disk, the honest way
+  around the IF-masked handler. M1 proved the whole capability surface with an in-memory `wstage` buffer (a
+  read-back witnessed the write); M2 FLUSHES that dirty buffer to the FAT via the shell-proven
+  `fat::write_at`→`block::write_block` path, at IF=1, OUTSIDE the SYSCALL handler, and the launcher raw-re-reads
+  the sector to prove it landed. **THE crux (why M1 stopped here):** the dirty `wstage` buffer is freed at the
+  fixture's teardown (`clear_files_row`, IF=0), but the flush needs IF=1 disk I/O — a naive "flush at teardown"
+  cannot work. **Resolution — a flush queue that survives teardown, drained by the demo launcher at IF=1.**
+  Teardown COPIES each dirty descriptor's bytes + its `(cluster, size, [lo,hi))` into a small static flush queue
+  (the copy is self-contained — a stranded entry can never dangle at a freed buffer), then frees the `wstage`
+  slot exactly as M1 (so the reviewed teardown-clear proof, `wstage_all_free()`, is undisturbed). The launcher —
+  on the demo AP at IF=1, where the xHCI BOT pump self-services its own event ring (drains DMA'd ring memory +
+  acks the interrupter via raw MMIO, so it drives from ANY CPU) — drains the queue via `fat::write_at` (in place,
+  never grows), then raw-re-reads the sector.
+- **The additions:** (1) a launcher **pre-flight** (IF=1, gated on `HELLO_STAGED`, the BSP's FAT-present signal)
+  mounts + `find_in_root`s SCRATCH.BIN, validates it (regular file, non-zero chain head, size == the staged/wstage
+  length), captures the pre-image bytes at the write offset, and publishes the chain head to `SCRATCH_CLUSTER`
+  (Release) BEFORE the fixture opens — the x86 stand-in for pi4 capturing `FILE_CLUSTER` at open (x86 cannot walk
+  the FAT in the IF-masked handler). (2) `sys_open` records `FILE_CLUSTER` from it; a per-descriptor `FILE_DIRTY`
+  + dirty range `[lo,hi)` set by `sys_write_file` (fresh on the first write, so the flushed span is EXACTLY the
+  touched sectors, never from offset 0). (3) The **revoke ordering** — a whole-task TEARDOWN (`clear_files_row`)
+  ENQUEUES dirty; a REVOKE / open-unwind (`files_free`) DISCARDS dirty (revoke repudiates the write, so a revoked
+  cap never flushes stale bytes). (4) `SCRATCH.BIN` (1 KiB of `0xEE`) planted on the x86 FAT image
+  (`make-fat-img.sh`), mirroring the pi4 plant; its bytes equal M1's const seed, so the in-memory core is
+  byte-identical whether or not a FAT is present. **Folded the two M1 review notes:** `sys_write_file`'s offset
+  advance is now a tx-exact `compare_exchange` claim (CAS-symmetric with `sys_read`), and a writable (`CAP_WRITE`)
+  open on `SHARED_ROW` is refused (a shared writable descriptor could race the unsynchronized staging memcpy).
+- **DUAL MODE:** disk-backed (a FAT volume backs SCRATCH.BIN — `test-fat sf`) REQUIRES the on-disk write-back
+  proof; in-memory (no FAT — plain `./arroyo test` attaches a non-FAT usb.img) runs the M1 core with the flush a
+  no-op and does ZERO AP disk I/O (the pre-flight is `HELLO_STAGED`-gated, so a no-FAT run never issues an AP xHCI
+  read). The revoke-discard proof is NON-VACUOUS: `u9x_check_revoked_write` first shows (positive control) that a
+  dirty descriptor run through `clear_files_row` DOES enqueue a flush, THEN shows the revoke path leaves the queue
+  empty — only the contrast proves discard. Verdict evolution: M1 `staged in-place, no disk write-back this
+  milestone` → M2 `staged write FLUSHED to FAT (on-disk sector changed + size unchanged)`.
+- **Tested — QEMU:** `UNAOS_FATIMG=sf ./arroyo test-fat sf 300` → the U9x line now proves the on-disk write-back:
+  `:: U9x: real File writes — open-RW+seek+write+readback OK, RO-write/wrong-kind/revoked-cap all -EACCES, staged
+  write FLUSHED to FAT (on-disk sector changed + size unchanged) -> PASS ::`. The launcher's raw re-read of the
+  flushed sector (fresh mount, `read_at` chain-walk) finds the 16-byte pattern at offset 520, differing from the
+  `0xEE` pre-image, with the directory size unchanged (1024) — the pi4 U9 proof, in QEMU. **All 16 prior
+  U1a→U8x PASS/FAIL verdicts byte-identical** (sorted scratch-worktree baseline diff vs `ddefc40`; the ONLY
+  verdict delta is the U9x line evolving M1→M2). (Two *descriptive* setup banners show best-effort-console-drop
+  jitter — the baseline run itself dropped U7x's banner while this run kept it and dropped U6bx's — a pre-existing
+  timing artifact of AP-side console contention, not a behavioral change: every demo ran and PASSed identically.)
+  Default no-FAT `./arroyo test 25` stays MISSION SUCCESS AND U9x PASSes its in-memory core (`in-memory core; no
+  FAT volume, flush is a no-op`), with zero AP disk I/O. `./arroyo check` both arches, **zero aarch64 files
+  touched** (`arch/x86_64/syscall.rs` + `make-fat-img.sh` only — the write stack `fat.rs`/`block.rs`/`drivers/xhci`
+  REUSED unchanged via its existing API). Adversarial code review (atomics/ordering, lifecycle/leaks, flush
+  correctness, revoke-discard proof), 0 confirmed findings.
+- **First concurrent AP-side xHCI BOT I/O in the tree:** the disk-backed flush is the first time a demo AP drives
+  the hlt-pumped xHCI BOT engine while the BSP main loop also services xHCI (they serialize on the single
+  `XHCI_CONTROLLER` lock). The pump is BOUNDED (a 2000-iter timeout → `Io`), so a failure would be a LOUD verdict
+  FAIL, never a hang; `test-fat sf` is its empirical proof.
+- **Metal:** unchanged from M1 — CANNOT be metal-confirmed (the xHCI enumeration blocker `task_47291f90` leaves
+  `block::info()` None on the real rMBP, so the whole demo SKIPS there; QEMU-green is the ceiling, gate NOT
+  relaxed). Unlike pi4 U9 (metal-confirmed on real EMMC2), x86 U9x waits on that blocker.
+- **Deferred / tracked:** generation-tagged file-ids (a bare descriptor index lets a revoke+reopen alias a reused
+  slot — real but not ring-3-reachable this arc; the x86 twin of pi4 U11, lands as **U11x**). File
+  growth/create/delete (U10 twin); IF-safe interrupt-driven x86 storage (retires the staged-buffer divergence +
+  the AP-flush detour); UnaFS `grants:*` on `SYS_OPEN`.
 - **Commit:** `538a1bf` (`hw-rmbp`, Opus-executed).
+
+### U11x — open-file lifecycle: SYS_CLOSE + generation-tagged file-ids (x86) 🔬 `hw-rmbp`
+- **What:** the x86 twin of pi4 U11 M1 (`714daad`) — closes the U9x-tracked revoke+reopen aliasing gap. Before
+  this, a per-task FILES descriptor was named to ring 3 by a bare `+1`-biased slot index; when a File revoke
+  (`sys_cap_revoke`) freed a slot and a later `sys_open` first-fit-reused it, a lingering sibling handle carrying
+  the old index would silently re-bind to the DIFFERENT file now living in that slot (the `FILE_USED` guard lapsed
+  the moment the slot went live again). Fix = the standard slotmap/generation-index: a per-slot `FILE_GEN` counter
+  bumped LAST on every free (`files_free` — the path SYS_CLOSE + the File-revoke drop + `sys_open`'s unwind route
+  through — and `clear_files_row` at teardown); File handle words now pack `(gen << 32) | (idx + 1)`; and
+  `file_desc_validate` is the SINGLE seam (range + `FILE_USED` + gen) every File consumer (`sys_read`/
+  `sys_write_file`/`sys_seek`/`sys_close`, and the revoke File-drop) funnels through — a stale handle to a reused
+  slot is `-EACCES` (a gen mismatch), never a rebind. Gen 0 packs to exactly `idx + 1`, byte-identical to the
+  pre-U11x file-id, so every prior scaffold/kernel check that reads the value word is unaffected.
+- **SYS_CLOSE (17):** frees the caller's descriptor slot (bumping its gen) + clears the handle word. Requires NO
+  right (`handle_resolve(row, handle, 0)`); a non-File kind is `-EINVAL` (left intact), an unresolvable /
+  already-closed / stale-slot handle is `-EBADF` (a double-close returns cleanly; a use-after-close is denied). New
+  errno `EBADF = -9`. **x86 divergence from pi4:** `files_free` DISCARDS un-flushed dirty bytes (the staged
+  write-back is a whole-task-teardown event, `clear_files_row`), so an explicit close of a dirty RW descriptor
+  drops the write exactly as a revoke does — the demo closes RO handles; a future arc can make close enqueue the
+  flush.
+- **The x86 gap is revoke+reopen, not unlink:** x86 has no U10 (create/unlink), so — unlike pi4's fixture, which
+  creates + unlinks — the aliasing vector here is a File revoke (which frees the descriptor) then a reopen reusing
+  the slot. The gap is NOT ring-3-reachable at U9x (no way to hold a stale file-id across a free), so the ring-3
+  fixture (`u11x-close`) proves SYS_CLOSE semantics (open+read → close → double-close `-EBADF` → use-after-close
+  `-EACCES` → reopen+read; a 5-bit witness) over the immutable staged SCRATCH.BIN, while `u11x_check_gen_rebind`
+  (kernel-side, scratch row 6) is the airtight no-rebind proof: claim a slot + mint its `(gen, idx)`; free it (gen
+  bumps); re-claim the SAME slot (first-fit) at the bumped gen; prove the OLD file-id is rejected (gen mismatch)
+  EVEN THOUGH the slot is live again, while a FRESH file-id resolves. Chained off `u9x_launcher` in program order;
+  storage-gated (chain-inherited) but needs no disk itself (reads the static seed + pure descriptor bookkeeping),
+  so it PASSes identically in FAT and non-FAT block-device modes.
+- **Tested — QEMU:** `UNAOS_FATIMG=sf ./arroyo test-fat sf 300` → `:: U11x: open-file lifecycle —
+  open+read/close/double-close(-EBADF)/use-after-close(-EACCES)/reopen+read OK, gen-tagged file-id rejects a stale
+  sibling to a reused slot -> PASS ::`, with **all 17 prior U1a→U9x verdicts byte-identical**. Default no-FAT
+  `./arroyo test 30` stays MISSION SUCCESS and U11x PASSes (block device present, no FAT needed). `./arroyo check`
+  both arches green, **zero aarch64 files touched** (`arch/x86_64/syscall.rs` only). Every File value word backing
+  a real descriptor is gen-tagged (`sys_open`, the U6bx no-cap plant, the U9x revoke-check plant); the two opaque
+  scaffold ids (`0x100`/`0x200`) are untouched and resolve identically.
+- **Metal:** storage-gated like the rest of the chain (chained off `u9x_launcher`), so the xHCI enumeration
+  blocker (`task_47291f90`) keeps it off metal — QEMU-green is the ceiling. The gen-tag mechanism itself is
+  always-on in the syscall path; only the demo is gated.
+- **Commit:** `hw-rmbp`, Opus-executed.
+
+### No-storage capability-chain visibility — inline console-cap demos (U5x/U7x/U8x) run on the metal path + `UNAOS_NOSTORAGE` knob 🔬 `hw-rmbp`
+- **What:** the direct enabler for the FTDI metal bench. Every U-arc demo gated on `block::info().is_none()` and
+  SKIPPED with no block device, so on the metal rMBP (where the SD reader never enumerates over xHCI —
+  `task_47291f90` — leaving `block::info()` None) the whole capability chain was invisible. But U5x/U7x/U8x are
+  **inline console-cap blobs needing NO storage** (no `SYS_OPEN`, no `staged_bytes`, no disk — they transfer/revoke
+  `Console` caps and `sys_write` streams to serial); their gate was control-path DISCIPLINE (a clean no-storage
+  boot log), not a functional dependency. With the FTDI cable making the no-storage metal path observable, the gate
+  is **deliberately relaxed for those three demos only** (probe + launcher/run sites), surfacing the U5→U8 slice
+  (capabilities → cross-process transfer → revocation trees) over the metal console without waiting for the xHCI
+  storage fix.
+- **Scope + safety:** surgical — the storage-GATED arcs (U2 load/U4x/U6x/U6bx/U9x/U11x, which genuinely need FAT /
+  HELLO.BIN) KEEP their gates and still skip; NO protection touched (SMEP/NXE/W^X/page-perms are orthogonal — this
+  is a demo-visibility gate); the relaxed demos are the already-reviewed U5x/U7x/U8x fixtures on an additional path,
+  not new surface; relative demo order is preserved by the existing `*_LAUNCH_DONE` bounded waits, not the block
+  gate. New builder knob **`UNAOS_NOSTORAGE=1`** omits the QEMU `usb-storage` device (block absent) — the QEMU
+  analog of the metal no-storage path, and a preview of what the FTDI console replays.
+- **Tested — QEMU:** `UNAOS_NOSTORAGE=1 ./arroyo test 90` → `note='no mass-storage device enumerated'` (block
+  absent) with U5x/U7x/U8x **PASS**, every storage-gated arc absent (cleanly skipped), and U1a/U1b/U2-0/U3/U3.5
+  still PASS. **No regression block-present** (the relaxation is a no-op there): `./arroyo test 30` stays MISSION
+  SUCCESS with the applicable chain PASS; `UNAOS_FATIMG=sf ./arroyo test-fat sf 300` runs U1a→U11x with **0 FAIL**.
+  `./arroyo check` both arches green, **zero aarch64 files touched** (`arch/x86_64/syscall.rs` + `builder/src/main.rs`).
+- **Metal:** this is the metal ENABLER — the U5→U8 console-cap slice becomes metal-confirmable over the FTDI cable
+  at the Peter-attended bench; the storage-gated arcs still wait on `task_47291f90`.
+- **Commit:** `hw-rmbp`, Opus-executed.
 
 ---
 
