@@ -981,21 +981,44 @@ fn jb8_falcon_witness(tag: &str) {
 #[cfg(all(target_arch = "aarch64", feature = "jb8lever"))]
 fn jb8_reconnect_lever() {
     // gEfiUsb2HcProtocolGuid — the handle XhciControllerDxe installs its host-controller I/O on.
+    // It exists only after Start has run; on a plain auto-boot BDS never connects the XHCI driver
+    // at all (metal JB8: BARs unprogrammed, mem decode off), so when no Usb2Hc handle exists the
+    // lever is a loader-side `connect -r`: ConnectController(recursive) over every handle, which
+    // is what makes XhciControllerDxe.Start run (PG cycle + IFR firmware load) for the first time.
     static USB2_HC_GUID: uefi::Guid = uefi::guid!("3e745226-9818-45b6-a2ac-d7cd0e8ba2bc");
-    let handles = match boot::locate_handle_buffer(boot::SearchType::ByProtocol(&USB2_HC_GUID)) {
-        Ok(h) => h,
-        Err(e) => {
-            log::error!("JB8-lever: no Usb2Hc handles ({e:?}) — XhciControllerDxe never started?");
-            return;
+    let usb2 = boot::locate_handle_buffer(boot::SearchType::ByProtocol(&USB2_HC_GUID));
+    match usb2 {
+        Ok(handles) if !handles.is_empty() => {
+            log::info!("JB8-lever: {} Usb2Hc handle(s); disconnect+reconnect each", handles.len());
+            for &h in handles.iter() {
+                let d = boot::disconnect_controller(h, None, None);
+                let c = boot::connect_controller(h, &[], None, true);
+                log::info!("JB8-lever: handle {h:?} disconnect={d:?} reconnect={c:?}");
+            }
         }
-    };
-    log::info!("JB8-lever: {} Usb2Hc handle(s); disconnect+reconnect each", handles.len());
-    for &h in handles.iter() {
-        let d = boot::disconnect_controller(h, None, None);
-        let c = boot::connect_controller(h, &[], None, true);
-        log::info!("JB8-lever: handle {h:?} disconnect={d:?} reconnect={c:?}");
+        _ => {
+            log::info!("JB8-lever: no Usb2Hc handles — XhciControllerDxe never started; connect-all pass");
+            match boot::locate_handle_buffer(boot::SearchType::AllHandles) {
+                Ok(all) => {
+                    let (mut ok, mut err) = (0u32, 0u32);
+                    for &h in all.iter() {
+                        match boot::connect_controller(h, &[], None, true) {
+                            Ok(()) => ok += 1,
+                            Err(_) => err += 1, // NOT_FOUND for non-controller handles — expected
+                        }
+                    }
+                    log::info!("JB8-lever: connect-all over {} handles (connected={ok} none={err})", all.len());
+                    let post = boot::locate_handle_buffer(boot::SearchType::ByProtocol(&USB2_HC_GUID));
+                    log::info!(
+                        "JB8-lever: Usb2Hc handles after connect-all: {}",
+                        post.map(|h| h.len()).unwrap_or(0)
+                    );
+                }
+                Err(e) => log::error!("JB8-lever: AllHandles enumeration failed: {e:?}"),
+            }
+        }
     }
-    jb8_falcon_witness("post-reconnect");
+    jb8_falcon_witness("post-connect");
 }
 
 /// 8-bit ACPI checksum: the byte value that makes the sum of every byte in `bytes` zero (mod 256).
