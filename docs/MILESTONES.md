@@ -250,6 +250,125 @@ Legend: **✅ metal-confirmed** · **🔬 QEMU-green, metal pending** · dates I
 - **Commit:** `hw-rmbp`, Opus-executed.
 
 ---
+## hw-jetson track — 2026-07-08 (attended bench, Peter at the Orin)
+
+### JB9 (bench outcome) — ⭐ USB WORKS ON ORIN: inherit + no-HCRST + 64-byte contexts ✅ metal-attended `hw-jetson`
+- **The six-arc XUSB mystery is closed, verdict "other":** the fabric was never broken — the JB9f
+  inherit-run probe (bare RS=1 on UEFI's halted state, no reset) posted a PSC event into UEFI's own
+  >4 GiB event ring in 200 ms. Three real bugs, fixed live at the bench: (1) HCRST kills the
+  inherited Falcon's service loop → `JB9G_NO_HCRST` halt-only takeover; (2) the JB3 fabric chain
+  mutated a working config → `JB9H_SKIP_CHAIN` (the MC-override-reads-0x0 "torn-down link" that
+  founded arc B is what the WORKING config looks like); (3) the Tegra xHC has `HCCPARAMS1.CSZ=1`
+  (64-byte contexts) vs the driver's hard-coded 32-byte stride → ADDRESS_DEVICE code-17; fixed
+  shared-driver-wide (`context::CTX_WORDS`, Peter-approved), + SuperSpeed+ PSI-5 MPS0 mapping +
+  FS EP0 babble-learn retry + DISABLE_SLOT takeover eviction. **Result: both halves of a VIA hub
+  fully enumerate on Orin silicon** (descriptors + hub bring-up over real DMA). Also proven: the
+  ARU mailbox never answers NS even pre-EBS (JB9d loader bracket); a true PG cycle can't reload the
+  FW (ROM has no bare IFR autoboot — ⚠ the cycle DESTROYS the only FW instance); AO IFRDMA regs are
+  NS-locked. Next arc: nested-hub descent (devices sat behind hub layers, storage_slot still 0),
+  port-7 FS retry reset, direct-port `keyboard ARMED` demo.
+- **Detail:** [`arch_arm64.md` §JB9 bench verdict](dev/OS/01_BOOT_HAL/arch_arm64.md).
+
+### JB9 (as-shipped) — FW-liveness without CPUCTL + DMA-path forensics 🔬→✅ see verdict above `hw-jetson`
+- **What:** the two kernel-side probes the JB8 verdict demands. **A** (`jb9_fw_alive`, at
+  raw-handoff / post-xhc-restart / post-enum-attempt): a CPUCTL-free liveness witness — fw-header
+  identity via the ARU ioctl (+checksum/created-time), an ARU scratch heartbeat (two sweeps ~10 ms
+  apart), and MSG_ENABLED with a patient 5-attempt/~100 ms retry ladder (vs JB3's one ~200 µs try)
+  — one `FW-ALIVE`/`FW-SILENT` verdict line each. **B** (fired at t≈200 ms and t≈5 s inside the
+  `jb2b_attach` pump window, i.e. WHILE enable-slot is pending): SMR/S2CR/context-bank dump for
+  SID 0xe with an "is TTBR0 our identity table?" verdict (stale UEFI translation = the prime
+  IOVA≠PA suspect), MC HOSTR/HOSTW + error log at that instant, the FW-side SID view (ARU
+  STREAMID_FIELD + the AO IFR-autoboot trio, base DTB-resolved from padctl reg region 1), and a
+  ±2 MiB near-target RAM scan for command-completion TRBs that landed at a wrong PA.
+- **Tested:** `./arroyo check` + `UNAOS_TEGRA=1 ./arroyo check` green both arches; `esp-jetson`
+  links (kernel.elf 269,480 B, 137 `tegra:` strings); `test-arm` green (`storage_slot=1`, zero
+  panics — all JB9 code `tegra`-feature + `JB9_PROBE`-gated, QEMU byte-inert).
+- **Detail:** [`arch_arm64.md` §JB9](dev/OS/01_BOOT_HAL/arch_arm64.md). Next: the attended bench
+  fills the §JB9 verdict — which of {FW idled, SMMU stale context, SID mismatch, other}.
+
+### JB8 — ⭐ METAL VERDICT: the Falcon was NEVER halted — CPUCTL is a CSB-locked register; the real failure is the DMA path ✅ metal-attended (USB reader) `hw-jetson`
+- **The decisive read (boot 5, pre-EBS, driver live):** xHC running (`HCH=0 CNR=0`), USB enumeration in
+  progress — and `CPUCTL`/`BOOTVEC` still read `0xffffffff` while the ARU fw-header ioctl answers. The
+  Falcon is **alive and CSB-locked** (signed FW, raised priv level). Every JB3→JB7 "halted/reset-held"
+  verdict read a locked register; JB7's "non-secure wall" dissolves — there was never a stopped core.
+- **The real failure:** at kernel time port resets complete, 3 ports link-train to U0 (`CCS=1 PED=1`),
+  but `enable-slot` times out — command/event-ring **DMA never touches DRAM, zero faults** (arc B's
+  question reopened, now against a live engine). Plus: UEFI never programs FPCI CFG BARs (DT-fixed
+  addressing only); auto-boots never connect XhciControllerDxe; generic edk2 XhciDxe's un-gated
+  `XhcHaltHC` is the (benign) EBS actor; `DisconnectController` fails `INVALID_PARAMETER` (open).
+- **Next:** kernel-side CPUCTL-free FW-liveness probe (mailbox retry + scratch heartbeat) + DMA-path
+  forensics (SMMU S2CR/CB binding at write time, stale UEFI SMMU context, MC vs FW StreamID).
+- **Detail:** [`arch_arm64.md` §JB8](dev/OS/01_BOOT_HAL/arch_arm64.md), bench verdict subsection.
+
+### JB8 (as-shipped) — pre-EBS Falcon witness + reconnect lever; IFR-autoboot discovery 🔬→✅ see verdict above `hw-jetson`
+- **What:** an edk2-nvidia source read (r36.4.0-updates) shows **UEFI never halts the Falcon core** (only
+  BPMP PG/reset asserts at EBS — *both* teardown layers carry the JB6 ACPI skip) and **T234 starts it via
+  IFR DMA autoboot** (three AO-aperture writes: `IFRDMA_CFG0/1` = fw-buffer PA, `STREAMID` = 0xE; buffer is
+  `EfiRuntimeServicesData`, survives EBS) — plain NS MMIO, **no secure world** — so JB7's "NS-unstartable"
+  verdict rests on a lever nobody has pulled. JB8 ships the discriminating loader-side probe:
+  `jb8_falcon_witness` reads FPCI CFG + CSB `CPUCTL`/`BOOTVEC`/fw-header + `USBSTS.CNR` **pre-ExitBootServices**
+  (is the Falcon already dead before handoff?), and a separate `jb8lever` risk media
+  (`UNAOS_JB8_LEVER=1`) forces `Disconnect`+`ConnectController` on the `Usb2Hc` handles — a fresh
+  `XhciControllerDxe.Start` (PG cycle + IFR load) right before handoff, with a post-reconnect re-read.
+- **Tested:** `./arroyo check` + `UNAOS_TEGRA=1 ./arroyo check` green both arches; `esp-jetson` links with
+  and without the lever feature (kernel.elf 254,536 B, 120 `tegra:` strings); `test-arm` green
+  (`storage_slot=1`, zero panics — loader-side, tegra234-DTB-gated, QEMU inert). Metal: pending the
+  attended bench (witness media first, lever media only if the witness reads dead).
+- **Detail:** [`arch_arm64.md` §JB8](dev/OS/01_BOOT_HAL/arch_arm64.md). Next: bench; then the kernel-side
+  IFR restart if the lever proves the path.
+
+### JB7 — arc B refuted, arc A closed at the non-secure wall (Falcon core reset-held, unstartable from NS) ✅ metal-attended (native microSD) `hw-jetson`
+- **What:** an offline read of the JB6 run-F serial **refutes arc B** (the "XUSB StreamID mismatch"): the
+  MC override **sticks** at `0xe` (`rb=0x0000000e/0x0000000e`; the "reads `0x0`" was the pre-fix
+  first-touch), the SMMU stream matches + identity-translates, and the fault census is **clean**
+  (`sGFSR=0x0`, CB0 FSR unchanged, `MC INTSTATUS=0x0`, before *and* after attach). Zero faults ⇒ no XUSB
+  DMA is even attempted — the empty event ring is **arc A's shadow** (a halted Falcon = a halted xHC
+  command engine issues no completion), not a DMA-delivery failure. S2CR bypass (the baton's fix) was
+  moreover already refuted on metal (boots 5/6). Added a read-only clock-census probe
+  (`bpmp_tegra::jb7_clocks_query`, MRQ_CLK `IS_ENABLED`) to characterise the halt (`feature="tegra"` +
+  `JB5_PROBE`-gated → QEMU byte-identical). A BAR2-vs-CFG CSB cross-read (`jb7_csb_cfg_read`) was added
+  then **removed** — the metal boot proved the CFG aperture EL3-fatal (below).
+- **Metal — ✅ attended (Orin, native microSD, 2026-07-08), arc A CLOSED at the non-secure wall:**
+  (1) the alternate FPCI/CFG CSB aperture is **EL3-fatal** — first touch trapped to BL31 (`Unhandled
+  Exception in EL3`, `esr_el3=0xbe000011`, EC 0x2F SError) and killed the boot; unrouted post-EBS, probe
+  removed. (2) **Boot-medium bisect refuted** — first Falcon-witness boot off the **native microSD slot**
+  (not a USB reader) still read `CPUCTL=0xffffffff`; the halt is universal, not the USB-boot path.
+  (3) **Clock census** — core clock 269 **ON**, leaf 270/271 gated but not the lever (JB4 enabled them on
+  metal; CPUCTL stayed dead) ⇒ core is **reset-held**, not clock-gated. Clean through **CAPSTONE 6/6**.
+  With no `resets` on `usb@3610000`, MRQ_RESET can't reach the Falcon and the only BPMP reset (MRQ_PG
+  cycle) is retired — so a **non-secure kernel cannot start the halted Falcon** (as JB5 was for revival).
+  Next XUSB swing is bootloader/UEFI-side (suppress `XhciControllerDxe.Start` → inherit MB2's live Falcon)
+  or a pivot off USB.
+- **Tested — QEMU (the DONE gate):** `./arroyo check` + `UNAOS_TEGRA=1 ./arroyo check` both arches green
+  (probes compile clean, zero new warnings); `UNAOS_TEGRA=1 ./arroyo esp-jetson` links (`kernel.elf`
+  254,536 B tegra, 120 `tegra:` strings); virt `test-arm` green (`storage_slot=1`, byte-identical — all
+  JB7 code gated off).
+- **Detail:** [`arch_arm64.md` §JB7](dev/OS/01_BOOT_HAL/arch_arm64.md). Next: the attended arc-A bench.
+
+### JB6 — "inherit, don't revive" the XUSB Falcon: a bootloader dummy-ACPI table makes UEFI skip its ExitBootServices teardown ✅ teardown-skip metal-proven / 🔬 enum → arcs A+B `hw-jetson`
+- **What:** the bootloader installs a minimal, spec-correct dummy **ACPI 2.0 RSDP+XSDT** into the UEFI
+  config table immediately before `ExitBootServices` (`install_tegra_acpi_shim`, gated on a `tegra234`
+  DTB sniff so QEMU `esp-arm` stays byte-identical). NVIDIA's `XhciControllerDxe.OnExitBootServices`
+  self-skips its XUSB teardown when an ACPI table is present, so UnaOS **inherits a powered,
+  FPCI-configured XUSB block** instead of a torn-down dead one. The run-F kernel path is
+  non-destructive (`JB5_RUN_E_REPLAY=false` retires the domain-power-cycle replay that would kill an
+  inherited-live block; read-only witnesses + a `jb6_csb_sweep` diagnostic ship active behind
+  `JB5_PROBE`). Preceded by **JB5**, which — 5 probe boots + a full edk2-nvidia source read —
+  **refuted** non-secure Falcon revival (MB2 one-shot IFR self-boot; UEFI power-gate vote-refcounted).
+- **Metal — ✅ teardown-skip PROVEN (Peter-attended, Orin, 2026-07-08):** A/B at raw handoff,
+  no-shim → shim: XUSB power gates `0x0`→**`0x1`**, FPCI `busmaster=0`→**`1`**, BARs
+  unprogrammed→**programmed**. Boot ran clean through **CAPSTONE 6/6**. **Not yet enumerating** — two
+  root-caused next arcs: **(A)** the inherited Falcon *core* is halted (`CPUCTL=0xffffffff` read via the
+  NVIDIA-correct T234 CSB path — the core is in reset / clock-gated behind a live ARU; needs a
+  reset-deassert), **(B)** an XUSB MC StreamID mismatch (DMA tagged SID 0 vs the SMMU stream opened for
+  SID 0xe → event-ring writes never reach DRAM).
+- **Tested — QEMU (the DONE gate):** `./arroyo check` both arches green; `UNAOS_TEGRA=1 ./arroyo
+  esp-jetson` links (`kernel.elf` 246 KB, healthy); virt `test-arm` green (`storage_slot=1`) with the
+  shim correctly a **no-op** on the QEMU virt DTB (non-tegra path byte-identical).
+- **Detail:** [`arch_arm64.md` §JB5+JB6](dev/OS/01_BOOT_HAL/arch_arm64.md). Next: arcs **A** (start the
+  halted Falcon core) + **B** (MC StreamID) per the A+B baton.
+
+---
 
 ## hw-pi4 track — 2026-07-07 (Opus round, post-Campaign 2)
 

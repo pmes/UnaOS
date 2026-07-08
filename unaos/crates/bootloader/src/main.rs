@@ -750,6 +750,32 @@ fn main() -> Status {
     };
     let regions = unsafe { core::slice::from_raw_parts_mut(regions_ptr, max_regions) };
 
+    // JB6 (Jetson Orin, attended-bench arc): NVIDIA's UEFI `XhciControllerDxe.OnExitBootServices`
+    // tears the XUSB Falcon down on a Device-Tree boot (USBCMD<-0, padctl DeInitHw, power-gate
+    // Assert), but SELF-SKIPS the whole teardown when an ACPI table is present
+    // (`EfiGetSystemConfigurationTable(&gEfiAcpiTableGuid)` succeeds -> immediate `return`;
+    // source-verified in edk2-nvidia). Installing a minimal, well-formed dummy ACPI 2.0 RSDP/XSDT
+    // into the UEFI config table right before ExitBootServices flips that branch, so UnaOS inherits
+    // a LIVE Falcon (the Linux-style "inherit, don't revive"). Runtime-gated on a tegra234 DTB
+    // sniff, so QEMU `esp-arm` (virt DTB, never contains "tegra234") stays byte-identical.
+    #[cfg(target_arch = "aarch64")]
+    {
+        // JB8 (Jetson Orin, bench arc): the JB6 shim below skips the EBS *teardown*, yet the kernel
+        // still inherits a HALTED Falcon (JB7: CPUCTL=0xffffffff, core reset-held, no NS lever). So
+        // the halt happens earlier — inside UEFI's own driver lifetime. This witness reads the
+        // Falcon's CPUCTL/BOOTVEC + firmware header from HERE, pre-ExitBootServices, while
+        // XhciControllerDxe still owns a live block. One bit of output decides the whole arc:
+        //   CPUCTL != 0xffffffff pre-EBS  -> the kill is in the EBS window (huntable from the loader);
+        //   CPUCTL == 0xffffffff pre-EBS  -> Start (or MB2/secure) never left the core running, and
+        //                                    the lever is a forced driver reconnect (jb8lever below).
+        if dtb_is_tegra234(dtb_addr, dtb_size) {
+            jb8_falcon_witness("pre-EBS");
+            #[cfg(feature = "jb8lever")]
+            jb8_disconnect_lever();
+            install_tegra_acpi_shim();
+        }
+    }
+
     let memory_map = unsafe { boot::exit_boot_services(Some(MemoryType::LOADER_DATA)) };
     
     let mut regions_len = 0;
@@ -784,4 +810,262 @@ fn main() -> Status {
     };
 
     kernel_entry(boot_info_static);
+}
+
+/// JB6 (Jetson Orin attended-bench arc): install a minimal, spec-correct dummy ACPI 2.0 RSDP+XSDT
+/// into the UEFI configuration table immediately before ExitBootServices, so NVIDIA's
+/// `XhciControllerDxe.OnExitBootServices` (and `XusbControllerDxe`) see an ACPI boot and SKIP the
+/// XUSB Falcon teardown — UnaOS then inherits a live Falcon instead of a power-gated dead block.
+///
+/// Blast radius (source-verified against edk2-nvidia, 2026-07-08): the DXE core signals the
+/// `gEfiAcpiTableGuid` event group from inside `InstallConfigurationTable`, so our install fires,
+/// synchronously and before ExitBootServices, exactly one NVIDIA callback — EqosDeviceDxe's
+/// `UpdateACPIMacAddress`. That callback presence-checks the table then walks the ACPI *SDT
+/// protocol* registry (`gEfiAcpiSdtProtocolGuid`), never our RSDP; with no SDT protocol / no DSDT
+/// it early-returns EFI_SUCCESS. So our RSDP/XSDT bytes are never dereferenced on the DT-boot path
+/// and a zero-entry XSDT is safe. The tables are made fully valid anyway (both RSDP checksums, a
+/// valid empty XSDT) as cheap defensive insurance.
+///
+/// Runtime-gated (at the call site, via `dtb_is_tegra234`) so QEMU `esp-arm` (virt DTB, which
+/// never contains "tegra234") never reaches this: on non-Tegra firmware the whole JB6/JB8 block
+/// is a no-op.
+#[cfg(target_arch = "aarch64")]
+fn install_tegra_acpi_shim() {
+    // One page of ACPI_RECLAIM memory survives ExitBootServices and is mapped Reserved by the
+    // kernel's memory-map pass (never handed to the allocator), so the tables persist untouched.
+    let page = match boot::allocate_pages(boot::AllocateType::AnyPages, MemoryType::ACPI_RECLAIM, 1)
+    {
+        Ok(p) => p.as_ptr(),
+        Err(e) => {
+            log::error!("JB6: ACPI shim page alloc failed: {:?} — teardown will NOT skip", e);
+            return;
+        }
+    };
+    unsafe { core::ptr::write_bytes(page, 0, 4096) };
+    let base = page as u64;
+    let xsdt_addr = base + 64; // RSDP at [0..36), XSDT at [64..100) — both inside one 4 KiB page
+
+    // XSDT: a standard 36-byte ACPI System Description Table header with ZERO entry pointers
+    // (Length == header size). An empty XSDT is legal and the safest possible payload.
+    let mut xsdt = [0u8; 36];
+    xsdt[0..4].copy_from_slice(b"XSDT");
+    xsdt[4..8].copy_from_slice(&36u32.to_le_bytes()); // Length (header only, no entries)
+    xsdt[8] = 1; // Revision
+    xsdt[10..16].copy_from_slice(b"UNAOS "); // OEMID (6)
+    xsdt[16..24].copy_from_slice(b"UNAOSTBL"); // OEM Table ID (8)
+    xsdt[24..28].copy_from_slice(&1u32.to_le_bytes()); // OEM Revision
+    xsdt[28..32].copy_from_slice(b"UNAO"); // Creator ID (4)
+    xsdt[32..36].copy_from_slice(&1u32.to_le_bytes()); // Creator Revision
+    xsdt[9] = acpi_checksum(&xsdt); // whole-table byte sum == 0 (mod 256)
+
+    // RSDP: ACPI 2.0 (Revision 2), 36 bytes. RsdtAddress left 0 (XSDT-only, legal at rev 2).
+    let mut rsdp = [0u8; 36];
+    rsdp[0..8].copy_from_slice(b"RSD PTR "); // signature (the trailing space is required)
+    rsdp[9..15].copy_from_slice(b"UNAOS "); // OEMID (6)
+    rsdp[15] = 2; // Revision = 2 (ACPI 2.0+ — what gEfiAcpiTableGuid denotes)
+    rsdp[20..24].copy_from_slice(&36u32.to_le_bytes()); // Length (whole RSDP)
+    rsdp[24..32].copy_from_slice(&xsdt_addr.to_le_bytes()); // XsdtAddress (64-bit)
+    rsdp[8] = acpi_checksum(&rsdp[0..20]); // v1 checksum: first 20 bytes sum == 0
+    rsdp[32] = acpi_checksum(&rsdp); // extended checksum: all 36 bytes sum == 0
+
+    unsafe {
+        core::ptr::copy_nonoverlapping(rsdp.as_ptr(), page, 36);
+        core::ptr::copy_nonoverlapping(xsdt.as_ptr(), xsdt_addr as *mut u8, 36);
+    }
+
+    // gEfiAcpiTableGuid (ACPI 2.0+). Installing it under this GUID is what flips
+    // XhciControllerDxe's teardown to its no-op ACPI branch. `&'static Guid` is required by the
+    // boot service, hence the `static`.
+    static ACPI2_TABLE_GUID: uefi::Guid = uefi::guid!("8868e871-e4f1-11d3-bc22-0080c73c8881");
+    match unsafe {
+        boot::install_configuration_table(&ACPI2_TABLE_GUID, base as *const core::ffi::c_void)
+    } {
+        Ok(()) => log::info!(
+            "JB6: dummy ACPI 2.0 table installed (RSDP @{:#x}, XSDT @{:#x}) — XUSB Falcon teardown will self-skip",
+            base,
+            xsdt_addr
+        ),
+        Err(e) => log::error!("JB6: install_configuration_table failed: {:?} — teardown will NOT skip", e),
+    }
+}
+
+/// Gate for the JB6 shim + JB8 probes: only the real Orin firmware DTB. QEMU virt's root
+/// `compatible` is "linux,dummy-virt" and never contains "tegra234"; a raw substring scan of the
+/// bounded blob is decisive and needs no FDT parser in the loader.
+#[cfg(target_arch = "aarch64")]
+fn dtb_is_tegra234(dtb_addr: u64, dtb_size: usize) -> bool {
+    if dtb_addr == 0 || dtb_size < 8 || dtb_size > 4 * 1024 * 1024 {
+        return false;
+    }
+    let blob = unsafe { core::slice::from_raw_parts(dtb_addr as *const u8, dtb_size) };
+    let tegra = blob.windows(8).any(|w| w == b"tegra234");
+    if !tegra {
+        log::info!("JB6/JB8: firmware DTB is not tegra234 — tegra shims skipped (QEMU-safe no-op)");
+    }
+    tegra
+}
+
+/// JB8: pre-ExitBootServices Falcon witness. Metal boots 2–3 showed UEFI never programs the FPCI
+/// CFG BARs at all (CFG_7 stays raw garbage while USB-reader boots demonstrably work) — the NVIDIA
+/// driver drives the block through the DT-fixed addresses (`FalconSetHostBase2Addr(0x3650000)`),
+/// not FPCI routing. So the CFG header is dumped for the record only, and the CSB read uses the
+/// same DT-fixed windows UEFI's own FalconLib uses — gated NOT on CFG_7 but on "a Usb2Hc handle
+/// exists" (= generic XhciDxe bound on top of the NVIDIA stack = XhciControllerDxe.Start ran = the
+/// block is powered and its MMIO live). CSB recipe is byte-for-byte the kernel's JB3 path
+/// (page-select @BAR2+0x9c, window @+0x2000; FW_SCRATCH ioctl @+0x1000, reply @+0x1c) — the only
+/// safe CSB aperture (the FPCI/CFG-path one is EL3-FATAL; never resurrect it).
+#[cfg(target_arch = "aarch64")]
+fn jb8_falcon_witness(tag: &str) {
+    const XUSB_FPCI: u64 = 0x0361_0000; // FPCI CFG header (== DT xHC base; cap regs live here too)
+    const XUSB_BAR2: u64 = 0x0365_0000; // ARU/CSB window, DT-fixed (UEFI FalconLib's Base2Addr)
+    let cfg = |off: u64| unsafe { core::ptr::read_volatile((XUSB_FPCI + off) as *const u32) };
+    let cfg0 = cfg(0x0); // vendor/device id — liveness canary
+    let cfg1 = cfg(0x4); // io/mem/busmaster enables
+    let cfg4 = cfg(0x10); // BAR0 (UEFI leaves it unprogrammed; recorded, not trusted)
+    let cfg7 = cfg(0x1c); // BAR2 routing (same)
+    log::info!(
+        "JB8[{tag}]: FPCI CFG_0={cfg0:#010x} CFG_1={cfg1:#010x} (mem={} busmaster={}) CFG_4={cfg4:#010x} CFG_7={cfg7:#010x}",
+        (cfg1 >> 1) & 1,
+        (cfg1 >> 2) & 1
+    );
+    static USB2_HC_GUID: uefi::Guid = uefi::guid!("3e745226-9818-45b6-a2ac-d7cd0e8ba2bc");
+    let started = boot::locate_handle_buffer(boot::SearchType::ByProtocol(&USB2_HC_GUID))
+        .map(|h| !h.is_empty())
+        .unwrap_or(false);
+    if cfg0 == 0xffff_ffff || !started {
+        log::info!("JB8[{tag}]: no Usb2Hc handle (XhciControllerDxe not Started) — CSB witness skipped");
+        return;
+    }
+    let (bar0, bar2) = (XUSB_FPCI, XUSB_BAR2);
+    let r = |off: u64| unsafe { core::ptr::read_volatile((bar2 + off) as *const u32) };
+    let w = |off: u64, v: u32| unsafe { core::ptr::write_volatile((bar2 + off) as *mut u32, v) };
+    let csb_r = |addr: u32| {
+        w(0x9c, (addr >> 9) & 0x7f_ffff);
+        r(0x2000 + (addr & 0x1ff) as u64)
+    };
+    let fw_hdr = |word_off: u32| {
+        w(0x1000, (17u32 << 24) | word_off);
+        r(0x1c)
+    };
+    let cpuctl = csb_r(0x100);
+    let bootvec = csb_r(0x104);
+    let (codetag, codesize) = (fw_hdr(0x8), fw_hdr(0xc));
+    log::info!(
+        "JB8[{tag}]: FALCON CPUCTL={cpuctl:#010x} (halted={} stopped={}) BOOTVEC={bootvec:#010x} fw codetag={codetag:#010x} codesize={codesize:#010x}",
+        (cpuctl >> 4) & 1,
+        (cpuctl >> 5) & 1
+    );
+    // USBSTS.CNR (bit 11): edk2-nvidia's T234 Start skips the firmware load entirely when CNR
+    // clears within 200 ms (MB2-resident FW), else IFR-DMA-autoboots it. CNR here pre-EBS says
+    // which of those worlds this boot lives in (remember CNR is a stale latch post-halt — it is
+    // only trustworthy as a "was ready at some point" witness, never as "running now").
+    if bar0 != 0 {
+        let cap = unsafe { core::ptr::read_volatile(bar0 as *const u32) };
+        let usbsts =
+            unsafe { core::ptr::read_volatile((bar0 + (cap & 0xff) as u64 + 0x4) as *const u32) };
+        log::info!(
+            "JB8[{tag}]: xHC cap={cap:#010x} USBSTS={usbsts:#010x} CNR={}",
+            (usbsts >> 11) & 1
+        );
+    }
+    // JB9d (bench 2026-07-08): the pre-EBS MAILBOX liveness bit — the one datum the whole JB9
+    // kernel campaign is missing. Post-EBS the FW is mailbox-dead at every point (raw-handoff /
+    // post-restart / post-PG-cycle, 5-attempt ladders), and the only actor between "FW provably
+    // servicing pre-EBS" (JB8: HCH=0, enumerating) and the dead kernel handoff is generic
+    // XhciDxe's XhcHaltHC (USBCMD.RS=0) + PciIo attribute restore. This send brackets the kill:
+    //   SERVICED here + dead at kernel raw-handoff  -> the EBS halt parks the FW service loop
+    //     (kernel counter-lever: attach WITHOUT HCRST / replay the halted state);
+    //   silent here too (while USB demonstrably enumerates) -> the mailbox was never
+    //     NS-serviceable on this firmware, and mailbox silence stops meaning "FW idle".
+    // Same MSG_ENABLED words the kernel's jb3_aru_probe writes (owner-claim -> DATA_IN ->
+    // CMD|=INT_EN|DEST_FALC); 3 short attempts (~15 ms total) to keep the pre-EBS dwell small —
+    // the NVIDIA driver still owns the block, so a held owner semaphore is itself a datum.
+    let own0 = r(0x010);
+    let mut serviced = false;
+    let mut attempts = 0u32;
+    while attempts < 3 && !serviced {
+        attempts += 1;
+        w(0x010, 2); // OWNER_SW
+        if r(0x010) != 2 {
+            boot::stall(core::time::Duration::from_micros(5_000));
+            continue;
+        }
+        w(0x008, 5u32 << 24); // MBOX_CMD_MSG_ENABLED
+        w(0x004, r(0x004) | (1 << 31) | (1 << 27)); // INT_EN | DEST_FALC
+        let mut polls = 0u32;
+        while polls < 50 {
+            if r(0x00c) != 0 || r(0x010) != 2 {
+                serviced = true;
+                break;
+            }
+            boot::stall(core::time::Duration::from_micros(100));
+            polls += 1;
+        }
+        if r(0x010) == 2 {
+            w(0x010, 0); // release
+        }
+    }
+    log::info!(
+        "JB9d[{tag}]: MBOX MSG_ENABLED {} (owner pre={own0:#x} now={:#x} data_out={:#010x}, attempts={attempts})",
+        if serviced { "SERVICED" } else { "SILENT" },
+        r(0x010),
+        r(0x00c)
+    );
+}
+
+/// JB8 lever (feature `jb8lever`, arroyo `UNAOS_JB8_LEVER=1` — separate media, only flashed when
+/// the plain witness shows the Falcon already dead pre-EBS): force a full driver-model
+/// disconnect + reconnect of every USB2 host-controller handle, so NVIDIA's
+/// `XhciControllerDxe.Start` runs AGAIN right before handoff — a fresh Falcon firmware load /
+/// core start at the last possible moment, with the JB6 shim then skipping the teardown. Runs
+/// after the kernel + DTB are fully read into memory, so tearing down a USB boot volume's stack
+/// is safe. A witness re-read reports whether the reconnect left the core running.
+#[cfg(all(target_arch = "aarch64", feature = "jb8lever"))]
+fn jb8_disconnect_lever() {
+    // gEfiUsb2HcProtocolGuid — the handle XhciControllerDxe installs its host-controller I/O on.
+    // It exists only after Start has run; on a plain auto-boot BDS never connects the XHCI driver
+    // at all (metal JB8: BARs unprogrammed, mem decode off), so when no Usb2Hc handle exists the
+    // lever is a loader-side `connect -r`: ConnectController(recursive) over every handle, which
+    // is what makes XhciControllerDxe.Start run (PG cycle + IFR firmware load) for the first time.
+    static USB2_HC_GUID: uefi::Guid = uefi::guid!("3e745226-9818-45b6-a2ac-d7cd0e8ba2bc");
+    // Boot-3 taught: on a USB-reader boot XhciControllerDxe IS Started (Usb2Hc exists), the Falcon
+    // runs during UEFI, and the un-gated killer candidate at EBS is GENERIC edk2 XhciDxe's
+    // XhcExitBootService (unconditional XhcHaltHC + OriginalPciAttributes restore — no ACPI gate;
+    // source-verified). Its DriverBindingStop CLOSES that EBS event. So the lever is now
+    // disconnect-and-STAY-disconnected: Stop halts the xHC (same HCH=1 either way) but nothing
+    // touches the block at EBS afterwards, and the kernel inherits whatever the Falcon state
+    // truly is. If Usb2Hc is absent (native-slot boot, driver never Started), connect-all first
+    // so there is a Started stack to witness + disconnect.
+    let mut handles = boot::locate_handle_buffer(boot::SearchType::ByProtocol(&USB2_HC_GUID));
+    if !matches!(&handles, Ok(h) if !h.is_empty()) {
+        log::info!("JB8-lever: no Usb2Hc handles — connect-all pass to Start XhciControllerDxe");
+        if let Ok(all) = boot::locate_handle_buffer(boot::SearchType::AllHandles) {
+            let mut ok = 0u32;
+            for &h in all.iter() {
+                if boot::connect_controller(h, &[], None, true).is_ok() {
+                    ok += 1;
+                }
+            }
+            log::info!("JB8-lever: connect-all over {} handles (connected={ok})", all.len());
+        }
+        handles = boot::locate_handle_buffer(boot::SearchType::ByProtocol(&USB2_HC_GUID));
+    }
+    jb8_falcon_witness("pre-disconnect");
+    match handles {
+        Ok(h) if !h.is_empty() => {
+            for &hc in h.iter() {
+                let d = boot::disconnect_controller(hc, None, None);
+                log::info!("JB8-lever: handle {:#x} disconnect(no reconnect)={d:?}", hc.as_ptr() as usize);
+            }
+        }
+        _ => log::info!("JB8-lever: still no Usb2Hc handle — nothing to disconnect"),
+    }
+    jb8_falcon_witness("post-disconnect");
+}
+
+/// 8-bit ACPI checksum: the byte value that makes the sum of every byte in `bytes` zero (mod 256).
+#[cfg(target_arch = "aarch64")]
+fn acpi_checksum(bytes: &[u8]) -> u8 {
+    let sum = bytes.iter().fold(0u8, |a, &b| a.wrapping_add(b));
+    0u8.wrapping_sub(sum)
 }

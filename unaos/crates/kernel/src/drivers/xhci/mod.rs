@@ -23,7 +23,7 @@ pub mod ftdi;
 use ring::TransferRing;
 use self::trb::Trb;
 use self::event::{EventRing, ErstEntry, ErstTable};
-use self::context::{InputContext, DeviceContext};
+use self::context::{InputContext, DeviceContext, CTX_WORDS};
 use spin::Mutex;
 use alloc::vec::Vec;
 
@@ -820,6 +820,9 @@ pub struct XhciController {
     /// (a doorbell on a stopped ring restarts it AT the wedged TRB) — mirrors Linux's
     /// CMD_RING_STATE gating.
     cmd_ring_stopped: bool,
+    /// Per-root-port learned EP0 MPS for Full-Speed devices: false = first-guess 8, true = the
+    /// port babbled at dev-desc (device's real bMaxPacketSize0 > 8) and retries use 64.
+    fs_ep0_mps64: [bool; 32],
 }
 
 /// A recorded enumeration stall: which port died, at which stage, why (completion error /
@@ -902,6 +905,7 @@ impl XhciController {
             stall_count: 0,
             slots_to_disable: Vec::new(),
             cmd_ring_stopped: false,
+            fs_ep0_mps64: [false; 32],
         }
     }
 
@@ -1377,6 +1381,19 @@ impl XhciController {
                             serial_println!(
                                 "xHCI: EP0 transfer FAILED (slot {}, code {}) during enumeration.",
                                 slot_id, completion_code);
+                            // Babble (code 3) on EP0 during enumeration = the device's real
+                            // bMaxPacketSize0 exceeds the context's. Only Full-Speed has an
+                            // ambiguous MPS0 — learn 64 for this port so the retry addresses
+                            // with the corrected context (see the mps0 match in address_device).
+                            if completion_code == 3 {
+                                let p = (self.enumerating_port as usize) & 31;
+                                if !self.fs_ep0_mps64[p] {
+                                    self.fs_ep0_mps64[p] = true;
+                                    serial_println!(
+                                        "xHCI: EP0 babble on port {} -> retrying with FS MPS0=64.",
+                                        self.enumerating_port);
+                                }
+                            }
                             self.recover_enumeration("ep0-transfer-failed", completion_code as u8);
                             return;
                         }
@@ -2800,8 +2817,8 @@ impl XhciController {
             // 2. FILL INPUT CONTEXT (MANUAL OFFSET CALCULATION)
             let base_ptr = input_ctx_virt as *mut u32;
 
-            // Clear Input Context (33 * 32 = 1056 bytes)
-            core::ptr::write_bytes(base_ptr as *mut u8, 0, 1056);
+            // Clear Input Context (33 contexts × CTX_WORDS × 4 bytes — stride follows HCCPARAMS1.CSZ)
+            core::ptr::write_bytes(base_ptr as *mut u8, 0, core::mem::size_of::<InputContext>());
 
             // 3a. INPUT CONTROL CONTEXT (Offset 0x00)
             base_ptr.add(1).write_volatile(3); // Enable Slot (Bit 0) and EP0 (Bit 1)
@@ -2818,16 +2835,25 @@ impl XhciController {
                 2 => 8,   // Low Speed  (bMaxPacketSize0 always 8)
                 3 => 64,  // High Speed (always 64)
                 4 => 512, // SuperSpeed (always 512)
-                _ => 8,   // Full Speed / unknown: 8 is always valid for FS control transfers (a
-                          // larger FS MPS0 would be refined from bMaxPacketSize0 — a follow-up).
+                5 => 512, // SuperSpeedPlus (Tegra234 XUSB reports Gen2 root devices as PSI 5;
+                          // MPS0 is 512 like SS — without this the slot context carried MPS0=8
+                          // and the XUSB FW rejected ADDRESS_DEVICE with code 17, JB9 bench)
+                // Full Speed / unknown: FS bMaxPacketSize0 is 8/16/32/64 and unknowable before
+                // the first descriptor read. 8 is the safe first guess (a 64-MPS device answers
+                // an 18-byte read with one oversized packet -> Babble, code 3); on that exact
+                // failure the recovery path below flips this port to 64 and the enum FSM's
+                // built-in retry re-addresses with the corrected context.
+                _ => {
+                    if self.fs_ep0_mps64[(port_id as usize) & 31] { 64 } else { 8 }
+                }
             };
             serial_println!("xHCI: Port {} speed {} -> EP0 MPS {}", port_id, speed, mps0);
-            let slot_ctx_ptr = base_ptr.add(8);
+            let slot_ctx_ptr = base_ptr.add(CTX_WORDS);
             slot_ctx_ptr.add(0).write_volatile((1 << 27) | ((speed & 0xF) << 20)); // Context Entries=1 + Speed
             slot_ctx_ptr.add(1).write_volatile((port_id as u32) << 16); // Root Hub Port Number
 
             // 3c. ENDPOINT 0 CONTEXT (Offset 0x40 -> Index 16 in u32)
-            let ep0_ctx_ptr = base_ptr.add(16);
+            let ep0_ctx_ptr = base_ptr.add(2 * CTX_WORDS);
             ep0_ctx_ptr.add(1).write_volatile((4 << 3) | (3 << 1) | (mps0 << 16)); // EP Type = 4, CErr = 3, MPS
             ep0_ctx_ptr.add(2).write_volatile((ep0_ring_phys as u32) | 1); // Bit 0 must match Cycle Bit (1)
             ep0_ctx_ptr.add(3).write_volatile((ep0_ring_phys >> 32) as u32);
@@ -2892,13 +2918,13 @@ impl XhciController {
             slot.bulk_out_ep = out_addr;
 
             // 2. CLEAR INPUT CONTEXT (Safety first)
-            core::ptr::write_bytes(base_ptr as *mut u8, 0, 1056);
+            core::ptr::write_bytes(base_ptr as *mut u8, 0, core::mem::size_of::<InputContext>());
 
             // 3. INPUT CONTROL CONTEXT (Offset 0x00): A0 (slot context) + both bulk DCIs.
             base_ptr.add(1).write_volatile(1u32 | (1 << in_dci) | (1 << out_dci));
 
             // 4. SLOT CONTEXT (Offset 0x20 -> Index 8)
-            let slot_ctx_ptr = base_ptr.add(8);
+            let slot_ctx_ptr = base_ptr.add(CTX_WORDS);
             // Copy from OUTPUT_CONTEXT
             for i in 0..8 {
                 let val = core::ptr::read_volatile((output_ctx_virt as *const u32).add(i));
@@ -2912,14 +2938,14 @@ impl XhciController {
 
             // 5. BULK IN endpoint context. The DCI-th endpoint context lives at u32
             //    index 16 + (DCI - 1) * 8 in the input context.
-            let ep_in_ptr = base_ptr.add(16 + ((in_dci as usize - 1) * 8));
+            let ep_in_ptr = base_ptr.add((1 + in_dci as usize) * CTX_WORDS);
             ep_in_ptr.add(1).write_volatile((6 << 3) | (3 << 1) | ((in_mps as u32) << 16)); // EP Type 6 (Bulk IN), CErr 3
             ep_in_ptr.add(2).write_volatile((bulk_in_phys as u32) | 1);
             ep_in_ptr.add(3).write_volatile((bulk_in_phys >> 32) as u32);
             ep_in_ptr.add(4).write_volatile(in_mps as u32);
 
             // 6. BULK OUT endpoint context.
-            let ep_out_ptr = base_ptr.add(16 + ((out_dci as usize - 1) * 8));
+            let ep_out_ptr = base_ptr.add((1 + out_dci as usize) * CTX_WORDS);
             ep_out_ptr.add(1).write_volatile((2 << 3) | (3 << 1) | ((out_mps as u32) << 16)); // EP Type 2 (Bulk OUT), CErr 3
             ep_out_ptr.add(2).write_volatile((bulk_out_phys as u32) | 1);
             ep_out_ptr.add(3).write_volatile((bulk_out_phys >> 32) as u32);
@@ -3769,10 +3795,10 @@ impl XhciController {
             let input_ctx_virt = self.slots[hub_slot as usize].input_context;
             let output_ctx_virt = self.slots[hub_slot as usize].output_context;
             let base_ptr = input_ctx_virt as *mut u32;
-            core::ptr::write_bytes(base_ptr as *mut u8, 0, 1056);
+            core::ptr::write_bytes(base_ptr as *mut u8, 0, core::mem::size_of::<InputContext>());
             base_ptr.add(1).write_volatile(1); // Input Control: A0 (slot context) only
 
-            let slot_ctx = base_ptr.add(8);
+            let slot_ctx = base_ptr.add(CTX_WORDS);
             for i in 0..8 {
                 slot_ctx.add(i).write_volatile(core::ptr::read_volatile((output_ctx_virt as *const u32).add(i)));
             }
@@ -3851,10 +3877,10 @@ impl XhciController {
             *self.dcbaap.add(slot_id as usize) = output_ctx_virt as u64;
 
             let base_ptr = input_ctx_virt as *mut u32;
-            core::ptr::write_bytes(base_ptr as *mut u8, 0, 1056);
+            core::ptr::write_bytes(base_ptr as *mut u8, 0, core::mem::size_of::<InputContext>());
             base_ptr.add(1).write_volatile(3); // A0 (slot) + A1 (EP0)
 
-            let slot_ctx = base_ptr.add(8);
+            let slot_ctx = base_ptr.add(CTX_WORDS);
             // DW0: Context Entries = 1 | Route String (bits 19:0) | Speed (bits 23:20).
             slot_ctx.add(0).write_volatile((1 << 27) | (route_string & 0xFFFFF) | ((speed & 0xF) << 20));
             // DW1: Root Hub Port Number (bits 23:16) — the root port the hub chain starts at.
@@ -3863,7 +3889,7 @@ impl XhciController {
             // EP0 control context. MPS: 8 for Low Speed; 64 otherwise (QEMU is lenient about the
             // Full-Speed initial 8-byte read).
             let mps0: u32 = if speed == 2 { 8 } else { 64 };
-            let ep0_ctx = base_ptr.add(16);
+            let ep0_ctx = base_ptr.add(2 * CTX_WORDS);
             ep0_ctx.add(1).write_volatile((4 << 3) | (3 << 1) | (mps0 << 16));
             ep0_ctx.add(2).write_volatile((ep0_ring_phys as u32) | 1);
             ep0_ctx.add(3).write_volatile((ep0_ring_phys >> 32) as u32);
@@ -4222,7 +4248,7 @@ impl XhciController {
             };
 
             // Clear the whole input context, then add the slot context (A0) + each endpoint.
-            core::ptr::write_bytes(base_ptr as *mut u8, 0, 1056);
+            core::ptr::write_bytes(base_ptr as *mut u8, 0, core::mem::size_of::<InputContext>());
             let mut add_flags: u32 = 1; // A0 = slot context
             let mut mdci: u32 = 0;
 
@@ -4241,7 +4267,7 @@ impl XhciController {
                     let l = core::alloc::Layout::from_size_align(512, 64).unwrap();
                     slot.data_buffer = Some(alloc::alloc::alloc_zeroed(l));
                 }
-                let ep = base_ptr.add(16 + ((dci as usize - 1) * 8));
+                let ep = base_ptr.add((1 + dci as usize) * CTX_WORDS);
                 ep.add(0).write_volatile((encode_interval(interval) << 16) | (mps << 24));
                 ep.add(1).write_volatile((7 << 3) | (3 << 1) | (mps << 16)); // EP Type 7 (Interrupt IN), CErr 3
                 ep.add(2).write_volatile((phys as u32) | 1);
@@ -4264,7 +4290,7 @@ impl XhciController {
                     let l = core::alloc::Layout::from_size_align(512, 64).unwrap();
                     slot.mouse_data_buffer = Some(alloc::alloc::alloc_zeroed(l));
                 }
-                let ep = base_ptr.add(16 + ((dci as usize - 1) * 8));
+                let ep = base_ptr.add((1 + dci as usize) * CTX_WORDS);
                 ep.add(0).write_volatile((encode_interval(interval) << 16) | (mps << 24));
                 ep.add(1).write_volatile((7 << 3) | (3 << 1) | (mps << 16)); // EP Type 7 (Interrupt IN), CErr 3
                 ep.add(2).write_volatile((phys as u32) | 1);
@@ -4278,7 +4304,7 @@ impl XhciController {
             // Input Control Context (A-flags), then the slot context copied from the output context
             // with Context Entries updated to the highest DCI in use.
             base_ptr.add(1).write_volatile(add_flags);
-            let slot_ctx_ptr = base_ptr.add(8);
+            let slot_ctx_ptr = base_ptr.add(CTX_WORDS);
             for i in 0..8 {
                 let val = core::ptr::read_volatile((output_ctx_virt as *const u32).add(i));
                 slot_ctx_ptr.add(i).write_volatile(val);
