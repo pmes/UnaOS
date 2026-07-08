@@ -12,7 +12,24 @@ Legend: **✅ metal-confirmed** · **🔬 QEMU-green, metal pending** · dates I
 
 ## hw-jetson track — 2026-07-08 (attended bench, Peter at the Orin)
 
-### JB9 — FW-liveness without CPUCTL + DMA-path forensics 🔬 QEMU-green, bench pending `hw-jetson`
+### JB9 (bench outcome) — ⭐ USB WORKS ON ORIN: inherit + no-HCRST + 64-byte contexts ✅ metal-attended `hw-jetson`
+- **The six-arc XUSB mystery is closed, verdict "other":** the fabric was never broken — the JB9f
+  inherit-run probe (bare RS=1 on UEFI's halted state, no reset) posted a PSC event into UEFI's own
+  >4 GiB event ring in 200 ms. Three real bugs, fixed live at the bench: (1) HCRST kills the
+  inherited Falcon's service loop → `JB9G_NO_HCRST` halt-only takeover; (2) the JB3 fabric chain
+  mutated a working config → `JB9H_SKIP_CHAIN` (the MC-override-reads-0x0 "torn-down link" that
+  founded arc B is what the WORKING config looks like); (3) the Tegra xHC has `HCCPARAMS1.CSZ=1`
+  (64-byte contexts) vs the driver's hard-coded 32-byte stride → ADDRESS_DEVICE code-17; fixed
+  shared-driver-wide (`context::CTX_WORDS`, Peter-approved), + SuperSpeed+ PSI-5 MPS0 mapping +
+  FS EP0 babble-learn retry + DISABLE_SLOT takeover eviction. **Result: both halves of a VIA hub
+  fully enumerate on Orin silicon** (descriptors + hub bring-up over real DMA). Also proven: the
+  ARU mailbox never answers NS even pre-EBS (JB9d loader bracket); a true PG cycle can't reload the
+  FW (ROM has no bare IFR autoboot — ⚠ the cycle DESTROYS the only FW instance); AO IFRDMA regs are
+  NS-locked. Next arc: nested-hub descent (devices sat behind hub layers, storage_slot still 0),
+  port-7 FS retry reset, direct-port `keyboard ARMED` demo.
+- **Detail:** [`arch_arm64.md` §JB9 bench verdict](dev/OS/01_BOOT_HAL/arch_arm64.md).
+
+### JB9 (as-shipped) — FW-liveness without CPUCTL + DMA-path forensics 🔬→✅ see verdict above `hw-jetson`
 - **What:** the two kernel-side probes the JB8 verdict demands. **A** (`jb9_fw_alive`, at
   raw-handoff / post-xhc-restart / post-enum-attempt): a CPUCTL-free liveness witness — fw-header
   identity via the ARU ioctl (+checksum/created-time), an ARU scratch heartbeat (two sweeps ~10 ms

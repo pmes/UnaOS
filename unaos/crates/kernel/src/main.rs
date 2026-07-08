@@ -1033,6 +1033,11 @@ fn tegra_early_stop(boot_info: &'static mut BootInfo) -> ! {
                             // JB9-A probe point 1: FW liveness at raw handoff, CPUCTL-free
                             // (JB8: CPUCTL is a CSB priv-lock read, never a liveness witness).
                             unaos_kernel::arch::xusb_tegra::jb9_fw_alive("raw-handoff");
+                            // JB9f: the inherit-run discriminator — MUST run here, before any
+                            // UnaOS reset touches the controller: resume UEFI's own halted
+                            // state (RS=1, no HCRST) and watch its inherited event ring for
+                            // autonomous port-status-change posts.
+                            unaos_kernel::arch::xusb_tegra::jb9f_inherit_run_probe();
                         }
                         Some(_) => serial_println!(
                             ":: tegra: JB5 — XUSB domain not ON at handoff; raw witness SKIPPED (JX1 rule) ::"
@@ -1095,7 +1100,9 @@ fn tegra_early_stop(boot_info: &'static mut BootInfo) -> ! {
                             // surveys the ports below. Gated on the ungate: padctl is
                             // always-powered, but there is no point powering pads for a
                             // controller that never came alive.
-                            if xusb_alive {
+                            // JB9h: with the JB6 shim the pads were never torn down — the RMW
+                            // re-powerup mutates live-pad state the inherited FW is using.
+                            if xusb_alive && !unaos_kernel::arch::xusb_tegra::JB9H_SKIP_CHAIN {
                                 unaos_kernel::arch::xusb_tegra::jb2c_padctl_powerup(&chan);
                             }
                         }
@@ -1200,6 +1207,15 @@ fn tegra_early_stop(boot_info: &'static mut BootInfo) -> ! {
                 ([0x0800_0000u64, 0x0700_0000u64], 2, 0x0e)
             }
         };
+        // JB9h: on the inherit path the ENTIRE fabric chain below is skipped — JB9f proved the
+        // inherited state passes the FW's DMA as-is, and every write here (SMMU re-arm with
+        // USFCFG=1, MC SID rewrite, FPCI full-enable, ARU restore, the locked-CSB restart
+        // attempt) mutates a WORKING configuration built by/for the live firmware.
+        let jb9h_skip = unaos_kernel::arch::xusb_tegra::JB9H_SKIP_CHAIN;
+        if jb9h_skip {
+            serial_println!(":: tegra: JB9h — JB3 fabric chain SKIPPED (inherit path, fabric untouched) ::");
+        }
+        if !jb9h_skip {
         unaos_kernel::arch::smmu_tegra::jb3_probe(&jb3_bases[..jb3_n], jb3_sid);
         // JB3 fix (boot 2): boot 1 read CLIENTPD=1 + zero SMRs + zero faults on both instances
         // — the ExitBootServices teardown shut the SMMU client port, and with the fabric's
@@ -1208,6 +1224,7 @@ fn tegra_early_stop(boot_info: &'static mut BootInfo) -> ! {
         // USFCFG=1 so anything unexpected faults-and-logs instead of dying silently.
         unaos_kernel::arch::smmu_tegra::jb3_open_stream(&jb3_bases[..jb3_n], jb3_sid);
         unaos_kernel::arch::xusb_tegra::jb5_witness("post-smmu-open");
+        }
         // JB3 boot-6 (discrimination): the v2 pair is open + fault-free yet DMA still dies —
         // a second killer sits downstream. Census the DTB's smmu/iommu nodes (find any
         // SMMUv3 without touching unknown addresses), dump the v3's CR0/GBPA state if one
@@ -1217,6 +1234,7 @@ fn tegra_early_stop(boot_info: &'static mut BootInfo) -> ! {
             unaos_kernel::arch::smmu_tegra::jb3_v3_dump(v3_base);
         }
         unaos_kernel::arch::smmu_tegra::jb3_mc_errs("pre-attach");
+        if !jb9h_skip {
         // JB3 boot-9: re-program the MC XUSB SID overrides (HOSTR/HOSTW) like the L4T kernel
         // does every boot — the UEFI exit teardown cleared them; the SMMU chain is proven
         // clean and this is the remaining torn-down link that assigns the stream its id.
@@ -1234,6 +1252,7 @@ fn tegra_early_stop(boot_info: &'static mut BootInfo) -> ! {
         // firmware header; restart the halted CPU the ROM-loader way if needed.
         unaos_kernel::arch::xusb_tegra::jb3_falcon();
         unaos_kernel::arch::xusb_tegra::jb5_witness("post-jb3falcon");
+        }
         // JB4 (attended bench): the XUSB Falcon revival levers. Runs AFTER jb3_falcon (BAR2/FPCI
         // routed, ARU restored) and reuses the JB1c-proven `chan`/`ids`. Two forks:
         //   * Boot 2 ONLY (JB4_ALLOW_PG_CYCLE — CALL-SITE-enforced; jb4_powergate_cycle does NOT
@@ -1253,6 +1272,8 @@ fn tegra_early_stop(boot_info: &'static mut BootInfo) -> ! {
                 unaos_kernel::arch::xusb_tegra::jb3_aru_probe(jb3_sid);
             }
             unaos_kernel::arch::xusb_tegra::jb4_falcon_revive(chan, ids);
+            // JB9c: judge the cycle by the CPUCTL/CNR-free witness, not the two proven liars.
+            unaos_kernel::arch::xusb_tegra::jb9_fw_alive("post-pg-cycle");
         }
         let coherent = unaos_kernel::arch::fdt_tegra::xusb_dma_coherent(
             dtb_addr,
@@ -1267,6 +1288,21 @@ fn tegra_early_stop(boot_info: &'static mut BootInfo) -> ! {
             dtb_size,
             mmu.ram_gib_mask,
         );
+        // JB9b levers (bench 2026-07-08, first JB9 boot's verdict = SID mismatch: AO
+        // IFRDMA_STREAMID reads 0x7f-bypass while MC/SMMU are built around 0xe): lever 1 retags
+        // the FW side to the DTB SID; lever 2 (same boot, independent register) accepts the
+        // 0x7f class through the identity CB as the fallback. Both print readbacks, so the
+        // next JB9-B capture says which lever (if either) moved the rings.
+        // JB9e: the low-ring discriminator — answered (silent; high-address theory refuted).
+        // MUST stay off on the JB9g inherit path: its xhci::init runs the HCRST that kills the
+        // inherited firmware before the no-HCRST attach gets its chance.
+        if !unaos_kernel::arch::xusb_tegra::JB9G_NO_HCRST {
+            unaos_kernel::arch::xusb_tegra::jb9e_low_ring_probe();
+        }
+        if !jb9h_skip {
+            unaos_kernel::arch::xusb_tegra::jb9b_ao_sid_fix(jb9_ao, jb3_sid);
+            unaos_kernel::arch::smmu_tegra::jb9b_accept_bypass_sid(&jb3_bases[..jb3_n]);
+        }
         let attached = unaos_kernel::arch::xusb_tegra::jb2b_attach(
             coherent,
             &jb3_bases[..jb3_n],

@@ -506,11 +506,21 @@ pub fn jb3_falcon() {
 /// call into tegra_early_stop — at the attended bench.
 /// JB5 probe media: back to FALSE — the JB4 boots (1+2) answered their question (a real MRQ_PG
 /// partition cycle does NOT re-run the Falcon self-boot); the JB5 bisect wants a pure chain.
+/// JB9c (bench 2026-07-08): TRUE again — JB4's verdict was judged on CNR + CPUCTL, BOTH since
+/// proven unreliable (CNR = stale latch, CPUCTL = CSB priv-lock read), and today's AO capture
+/// shows IFRDMA_CFG0/1 still hold the fw buffer PA in the always-on domain — everything the
+/// Falcon ROM needs to self-load after a power-up. Re-run the PG cycle, judged this time by the
+/// JB9 witnesses (mailbox retry ladder, ring DMA, AO write-lock state), not the two liars.
+/// JB9g: back to FALSE — the JB9c boot answered it (true rail drop, post-OFF=0x0, and the FW
+/// still never services; the t234 ROM does NOT re-run IFR autoboot on a bare PG-on). Worse: with
+/// the FW un-reloadable from NS, the cycle DESTROYS the inherited firmware the JB9g no-HCRST
+/// takeover depends on. Keep false on every inherit-path boot.
 pub const JB4_ENABLE: bool = false;
 
 /// Secondary guard for the partition-reset revival lever (bpmp_tegra::jb4_powergate_cycle, boot 2).
 /// Stays FALSE even when JB4_ENABLE is true — the seat flips it ONLY for the explicit boot-2 fork
 /// (the cycle wipes the partition and requires re-running the JB3 chain afterward).
+/// JB9c: answered (see JB4_ENABLE) — back to FALSE; the cycle kills the inherited firmware.
 pub const JB4_ALLOW_PG_CYCLE: bool = false;
 
 // Falcon CSB register address (mainline xhci-tegra XUSB_FALC_CPUCTL), read through the BAR2 ARU
@@ -848,6 +858,19 @@ pub fn jb6_csb_sweep() {
 /// no-op (call sites stay wired).
 pub const JB9_PROBE: bool = true;
 
+/// JB9g: take over the inherited (cleanly-halted) controller WITHOUT HCRST — the reset is what
+/// kills the Falcon's service loop on this firmware (JB9f: engine posts on bare RS=1; JB9e:
+/// dead after HCRST even into an all-low ring). False restores the JB2b halt+HCRST init.
+pub const JB9G_NO_HCRST: bool = true;
+
+/// JB9h: skip the ENTIRE JB3 fabric chain (SMMU open / MC SID / FPCI full-enable / ARU restore /
+/// locked-CSB restart attempt / padctl re-powerup / JB9b levers) on the inherit path. JB9f proved
+/// the inherited fabric passes the FW's DMA as-is at raw handoff; the chain was built for the
+/// halted-Falcon world and rewrites that working state — prime suspect for JB9g's still-dead
+/// enable-slot (jb3_open_stream flips the SMMU from CLIENTPD=1 pass-through to matched-translate
+/// + USFCFG=1 fault-everything-else, on a FW whose true runtime SIDs we've never observed).
+pub const JB9H_SKIP_CHAIN: bool = true;
+
 /// The ARU register span the heartbeat sweeps: [0x0, 0x140) — the first-page range jb6_csb_sweep
 /// / JB8 metal proved decodes cleanly (reads return data, no fault) on this block.
 const JB9_HB_WORDS: usize = 0x140 / 4;
@@ -1005,6 +1028,41 @@ pub fn jb9_fw_sid_view(tag: &str, ao: Option<u64>) {
     }
 }
 
+/// JB9b lever 1 (bench 2026-07-08): the first JB9 boot's forensics converged on a SID MISMATCH —
+/// AO `IFRDMA_STREAMID` reads 0x7f (the legacy BYPASS SID) while the MC overrides and the SMMU
+/// matching are built around the DTB's 0xe, and MB2's "SMMU external bypass disable" policy
+/// refuses bypass-class traffic: silent drop, zero faults, empty rings. Retag the FW side: write
+/// the DTB SID into AO IFRDMA_STREAMID (UEFI programs this register with plain NS MMIO, so the
+/// write should take). Read-back printed — if it refuses, lever 2 (accept 0x7f at the SMMU)
+/// catches the traffic instead.
+pub fn jb9b_ao_sid_fix(ao: Option<u64>, sid: u32) {
+    if !JB9_PROBE {
+        return;
+    }
+    let Some(base) = ao else {
+        serial_println!(":: tegra: JB9b — AO SID fix: SKIP (no AO base from DTB) ::");
+        return;
+    };
+    let r = |off: u64| unsafe { core::ptr::read_volatile((base + off) as *const u32) };
+    let w = |off: u64, v: u32| unsafe { core::ptr::write_volatile((base + off) as *mut u32, v) };
+    let pre = r(0x1c4);
+    serial_println!(
+        ":: tegra: JB9b — AO IFRDMA_STREAMID @{:#010x}+0x1c4: pre={:#010x} <- {:#x} ::",
+        base,
+        pre,
+        sid & 0xff
+    );
+    if pre & 0xff != sid & 0xff {
+        w(0x1c4, sid & 0xff);
+        dsb();
+    }
+    serial_println!(
+        ":: tegra: JB9b — AO IFRDMA_STREAMID rb={:#010x} ({}) ::",
+        r(0x1c4),
+        if r(0x1c4) & 0xff == sid & 0xff { "TOOK" } else { "REFUSED" }
+    );
+}
+
 /// JB9-B: near-target scan — did the event-ring writeback land NEAR where it should have?
 /// Scans ±2 MiB of identity-mapped RAM around the event ring for the command-completion
 /// fingerprint (TRB qword0 pointing into the command ring's page + TRB type 33 in dword3) — a
@@ -1058,6 +1116,216 @@ pub fn jb9_ring_scan(evt_phys: u64, cmd_phys: u64, tag: &str) {
         ":: tegra: JB9-B [{}] — near-target scan [{:#x}..{:#x}) cmd-page={:#x}: {} completion-TRB hit(s) ::",
         tag, start, end, cmd_page, hits
     );
+}
+
+/// JB9f (bench 2026-07-08): the INHERIT-RUN discriminator. The loader demonstrably uses the
+/// engine's DMA (it reads kernel.elf off the USB stick), so the kill is inside
+/// exit_boot_services — and the only actor is generic XhciDxe's XhcHaltHC (USBCMD.RS=0, no
+/// reset). That leaves UEFI's whole DMA world (DCBAA, command ring, event ring, ERSTBA/ERDP)
+/// programmed at handoff, and ERSTBA/ERDP are READABLE. This probe, at raw-handoff before any
+/// UnaOS touch: snapshot the inherited event ring, set RS=1 with NO reset, wait ~200 ms — live
+/// ports (pads kept up by the JB6 shim) generate Port-Status-Change events autonomously — then
+/// re-dump. New TRBs = firmware + DMA are FINE and our own HCRST is what parks the FW (kernel
+/// fix: take over without reset). Nothing = the FW parks at RS=0 itself, and preventing the EBS
+/// halt (UEFI-side) is the only NS road left. Controller is re-halted afterwards, so the JB
+/// chain and attach see the same halted handoff as every prior boot.
+pub fn jb9f_inherit_run_probe() {
+    if !JB9_PROBE {
+        return;
+    }
+    let cap0 = unsafe { core::ptr::read_volatile(XUSB_HOST as *const u32) };
+    if cap0 == 0 || cap0 == 0xFFFF_FFFF {
+        serial_println!(":: tegra: JB9f — cap0 dead; SKIP ::");
+        return;
+    }
+    let caplen = (cap0 & 0xff) as u64;
+    let op = XUSB_HOST + caplen;
+    let rtsoff = unsafe { core::ptr::read_volatile((XUSB_HOST + 0x18) as *const u32) } & !0x1f;
+    let ir0 = XUSB_HOST + rtsoff as u64 + 0x20;
+    let r32 = |a: u64| unsafe { core::ptr::read_volatile(a as *const u32) };
+    let r64 = |a: u64| unsafe { core::ptr::read_volatile(a as *const u64) };
+    let w32 = |a: u64, v: u32| unsafe { core::ptr::write_volatile(a as *mut u32, v) };
+    let (usbcmd, usbsts) = (r32(op), r32(op + 0x04));
+    let erstsz = r32(ir0 + 0x08);
+    let erstba = r64(ir0 + 0x10) & !0x3f;
+    let erdp = r64(ir0 + 0x18) & !0xf;
+    serial_println!(
+        ":: tegra: JB9f — inherited: USBCMD={:#010x} USBSTS={:#010x} (HCH={}) ERSTSZ={} ERSTBA={:#x} ERDP={:#x} ::",
+        usbcmd, usbsts, usbsts & 1, erstsz, erstba, erdp
+    );
+    // The inherited ERST entry names UEFI's event ring (boot-services RAM, identity-mapped,
+    // dead-but-intact post-EBS). Bail if anything reads unprogrammed.
+    if erstba == 0 || erstsz == 0 || erstba >= 1 << 40 {
+        serial_println!(":: tegra: JB9f — no inherited interrupter; SKIP ::");
+        return;
+    }
+    let ring_base = r64(erstba) & !0xf;
+    let ring_size = (r32(erstba + 8) & 0xffff) as u64;
+    serial_println!(
+        ":: tegra: JB9f — inherited event ring @{:#x} ({} TRBs); snapshotting @ERDP ::",
+        ring_base, ring_size
+    );
+    if ring_base == 0 || ring_base >= 1 << 40 || ring_size == 0 || ring_size > 4096 {
+        serial_println!(":: tegra: JB9f — inherited ERST entry implausible; SKIP ::");
+        return;
+    }
+    // Snapshot 8 TRBs starting at ERDP (wrapping the segment) — where the next posts land.
+    let idx0 = if erdp >= ring_base { (erdp - ring_base) / 16 } else { 0 };
+    let trb_at = |i: u64| ring_base + ((idx0 + i) % ring_size) * 16;
+    let mut before = [0u32; 8];
+    for (i, b) in before.iter_mut().enumerate() {
+        *b = r32(trb_at(i as u64) + 12); // control word (cycle + type) is the change detector
+    }
+    // RS=1, no reset — resume the engine on UEFI's own state.
+    w32(op, r32(op) | 1);
+    let mut spins = 0u32;
+    while r32(op + 0x04) & 1 != 0 && spins < 100_000 {
+        spins += 1;
+    }
+    udelay(200_000); // 200 ms — port-status-change events post autonomously if the FW runs
+    let mut changed = 0u32;
+    for (i, &b) in before.iter().enumerate() {
+        let now = r32(trb_at(i as u64) + 12);
+        if now != b {
+            changed += 1;
+            let t = trb_at(i as u64);
+            serial_println!(
+                ":: tegra: JB9f — NEW TRB @{:#x}: {:#010x} {:#010x} {:#010x} {:#010x} (type={}) ::",
+                t, r32(t), r32(t + 4), r32(t + 8), r32(t + 12), (r32(t + 12) >> 10) & 0x3f
+            );
+        }
+    }
+    serial_println!(
+        ":: tegra: JB9f — inherit-run verdict: {} (USBSTS={:#010x} HCH={} after 200 ms) ::",
+        if changed > 0 {
+            "ENGINE POSTED ⭐ — FW alive on RS=1, our HCRST is the killer"
+        } else {
+            "nothing posted — FW parks at the EBS RS=0 halt itself"
+        },
+        r32(op + 0x04),
+        r32(op + 0x04) & 1
+    );
+    // Halt again — hand the JB chain the same halted controller as every prior boot.
+    w32(op, r32(op) & !1);
+    let mut spins = 0u32;
+    while r32(op + 0x04) & 1 == 0 && spins < 100_000 {
+        spins += 1;
+    }
+}
+
+/// JB9e (bench 2026-07-08): the LOW-RING discriminator. JB9d's bracket proved the mailbox is
+/// silent even pre-EBS on a provably-DMA-ing firmware — mailbox silence means nothing. What
+/// actually differs between UEFI's working DMA and ours is WHERE the DMA-write targets live:
+/// every UEFI buffer is low EfiBootServicesData; our event ring + ERST are statics in the kernel
+/// image, which the loader places HIGH (~0x2_5e40_0000, above 4 GiB), while the command ring /
+/// DCBAA / contexts are heap allocations at the DRAM base (0x8000_xxxx, 32-bit reachable). The
+/// observed failure — command fetch targets low, event writes high, ONLY the event writes never
+/// happen — fits "the inherited FPCI/AXI address path drops device writes above 4 GiB" exactly.
+/// This probe hand-programs interrupter 0 with an ALL-LOW event ring + ERST (heap), pushes one
+/// NOOP command on an all-low command ring, rings doorbell 0, and polls the low ring for the
+/// completion TRB. LANDED = the whole JB3→JB9 DMA mystery is the event ring's address; the fix
+/// is relocating the event ring/ERST to heap (an event.rs/mod.rs change — outside this lane,
+/// STOP-and-report). SILENT = the high-address theory dies too. Runs before jb2b_attach; the
+/// attach's own halt+HCRST wipes every register this probe programs.
+pub fn jb9e_low_ring_probe() {
+    if !JB9_PROBE {
+        return;
+    }
+    let cap0 = unsafe { core::ptr::read_volatile(XUSB_HOST as *const u32) };
+    if cap0 == 0 || cap0 == 0xFFFF_FFFF {
+        serial_println!(":: tegra: JB9e — cap0 dead; SKIP ::");
+        return;
+    }
+    // Reset to a clean halted state first (the same init jb2b_attach uses).
+    xhci::init(XUSB_HOST);
+
+    let caplen = (cap0 & 0xff) as u64;
+    let op = XUSB_HOST + caplen;
+    let dboff = unsafe { core::ptr::read_volatile((XUSB_HOST + 0x14) as *const u32) } & !0x3;
+    let rtsoff = unsafe { core::ptr::read_volatile((XUSB_HOST + 0x18) as *const u32) } & !0x1f;
+    let ir0 = XUSB_HOST + rtsoff as u64 + 0x20;
+    let r32 = |a: u64| unsafe { core::ptr::read_volatile(a as *const u32) };
+    let w32 = |a: u64, v: u32| unsafe { core::ptr::write_volatile(a as *mut u32, v) };
+    let w64 = |a: u64, v: u64| unsafe { core::ptr::write_volatile(a as *mut u64, v) };
+
+    // All-low DMA structures, straight off the heap (the DRAM-base pool the command ring already
+    // lives in). 64-byte alignment from the allocator satisfies ERST/ring requirements.
+    let evt = xhci::ring::allocate_buffer(4096) as u64; // 256 TRBs
+    let erst = xhci::ring::allocate_buffer(64) as u64;
+    let cmd = xhci::ring::allocate_ring(16) as u64;
+    let dcbaa = xhci::ring::allocate_buffer(2048) as u64;
+    serial_println!(
+        ":: tegra: JB9e — low-ring probe: evt={:#x} erst={:#x} cmd={:#x} dcbaa={:#x} (all must be <4GiB) ::",
+        evt, erst, cmd, dcbaa
+    );
+    if evt == 0 || erst == 0 || cmd == 0 || dcbaa == 0 || evt >= 1 << 32 {
+        serial_println!(":: tegra: JB9e — allocation unusable; SKIP ::");
+        return;
+    }
+    unsafe {
+        // ERST[0] = { ring_address: evt, size: 256 }
+        core::ptr::write_volatile(erst as *mut u64, evt);
+        core::ptr::write_volatile((erst + 8) as *mut u32, 256);
+        core::ptr::write_volatile((erst + 12) as *mut u32, 0);
+        // One NOOP command TRB (type 23), cycle=1, at cmd[0].
+        core::ptr::write_volatile(cmd as *mut u64, 0);
+        core::ptr::write_volatile((cmd + 8) as *mut u32, 0);
+        core::ptr::write_volatile((cmd + 12) as *mut u32, (23 << 10) | 1);
+    }
+    dsb();
+    // Program the halted controller: 1 slot, low DCBAA, low command ring (RCS=1), interrupter 0
+    // fully low. No IMAN/INTE — pure polling.
+    w32(op + 0x38, 1); // CONFIG.MaxSlotsEn
+    w64(op + 0x30, dcbaa); // DCBAAP
+    w64(op + 0x18, cmd | 1); // CRCR, RCS=1
+    w32(ir0 + 0x08, 1); // ERSTSZ
+    w64(ir0 + 0x10, erst); // ERSTBA
+    w64(ir0 + 0x18, evt); // ERDP
+    dsb();
+    w32(op + 0x0, r32(op + 0x0) | 1); // USBCMD.RS
+    // Wait for HCH to clear, then ring doorbell 0 (host controller command doorbell).
+    let mut spins = 0u32;
+    while r32(op + 0x04) & 1 != 0 && spins < 100_000 {
+        spins += 1;
+    }
+    dsb();
+    w32(XUSB_HOST + dboff as u64, 0);
+    dsb();
+    // Poll the LOW event ring for the completion (cycle bit 1 in TRB[0].control), bounded 500 ms.
+    let deadline = cntpct().wrapping_add(cntfrq() / 2);
+    let mut landed = false;
+    loop {
+        let ctrl = unsafe { core::ptr::read_volatile((evt + 12) as *const u32) };
+        if ctrl & 1 != 0 {
+            landed = true;
+            break;
+        }
+        if cntpct().wrapping_sub(deadline) < (1u64 << 63) {
+            break;
+        }
+        core::hint::spin_loop();
+    }
+    let (d0, d1, d2, d3) = unsafe {
+        (
+            core::ptr::read_volatile(evt as *const u32),
+            core::ptr::read_volatile((evt + 4) as *const u32),
+            core::ptr::read_volatile((evt + 8) as *const u32),
+            core::ptr::read_volatile((evt + 12) as *const u32),
+        )
+    };
+    serial_println!(
+        ":: tegra: JB9e — NOOP completion in LOW event ring: {} — evt[0]={:#010x} {:#010x} {:#010x} {:#010x} (type={}) USBSTS={:#010x} CRCR={:#x} ::",
+        if landed { "LANDED ⭐ (high-address event ring was the killer)" } else { "silent (high-address theory refuted)" },
+        d0, d1, d2, d3, (d3 >> 10) & 0x3f,
+        r32(op + 0x04),
+        unsafe { core::ptr::read_volatile((op + 0x18) as *const u64) } & !0x3f
+    );
+    // Halt again so jb2b_attach's init starts from the same state as every prior boot.
+    w32(op + 0x0, r32(op + 0x0) & !1);
+    let mut spins = 0u32;
+    while r32(op + 0x04) & 1 == 0 && spins < 100_000 {
+        spins += 1;
+    }
 }
 
 /// JB5 run E: release the SS ELPG clamps — the InitHw step jb2c never covered. UEFI's
@@ -1189,9 +1457,31 @@ pub fn jb2b_attach(
 
     // The exact sequence the PCIe paths run (arch/aarch64/pci.rs), minus discovery/bus-master —
     // a platform controller has no config space; DMA mastering came with the BPMP ungate.
-    xhci::init(XUSB_HOST); // halt + HCRST + CNR wait (Falcon survives; see header)
-    // JB9-A probe point 2: the FW's liveness right after our halt+HCRST+CNR restart — did the
-    // reset sequence idle the firmware's service loop, or is it still answering?
+    // JB9g (bench 2026-07-08): NO-HCRST takeover — the arc's payoff lever. JB9f proved the
+    // firmware is alive and DMA-capable on the inherited state (bare RS=1 posts PSC events into
+    // UEFI's own >4GiB event ring within 200 ms), while every UnaOS attach since JB2b ran
+    // halt+HCRST first and got a permanently-non-servicing engine (JB9e: not even a NOOP into an
+    // all-low ring). HCRST on this inherited post-EBS state is what kills the Falcon's service
+    // loop — so take over the xHCI-legal way that skips it: the controller is already cleanly
+    // halted (XhcHaltHC RS=0), reprogram DCBAAP/CRCR/ERST/CONFIG below while halted, then RS=1.
+    if JB9G_NO_HCRST {
+        let cl = (cap0 & 0xff) as u64;
+        let op = XUSB_HOST + cl;
+        let r = |a: u64| unsafe { core::ptr::read_volatile(a as *const u32) };
+        let w = |a: u64, v: u32| unsafe { core::ptr::write_volatile(a as *mut u32, v) };
+        w(op, r(op) & !1); // RS=0 (idempotent if already halted)
+        let mut spins = 0u32;
+        while r(op + 0x04) & 1 == 0 && spins < 100_000 {
+            spins += 1;
+        }
+        serial_println!(
+            ":: tegra: JB9g — no-HCRST takeover: halted (USBSTS={:#010x}), inherited FW state preserved ::",
+            r(op + 0x04)
+        );
+    } else {
+        xhci::init(XUSB_HOST); // halt + HCRST + CNR wait — KILLS the inherited Falcon (JB9f/JB9e)
+    }
+    // JB9-A probe point 2: the FW's liveness right after our takeover (no-HCRST or reset path).
     jb9_fw_alive("post-xhc-restart");
     // JB9-B needs the ring physical bases after the controller lock is released — captured here.
     let mut jb9_evt_phys = 0u64;
@@ -1218,6 +1508,33 @@ pub fn jb2b_attach(
         x.init_pointers(command_ring_phys);
         x.start();
         *xhci::XHCI_CONTROLLER.lock() = Some(x);
+    }
+
+    // JB9i (bench 2026-07-08): evict UEFI's stale device slots. On the inherit path the firmware
+    // still holds the slots UEFI enumerated (it was never reset), so our fresh ENABLE_SLOT
+    // succeeds (slot 5) but ADDRESS_DEVICE on a device the FW considers already-owned fails with
+    // completion code 17 (Parameter Error). DISABLE_SLOT 1..8 is the spec-clean reclaim — a
+    // not-enabled slot just completes with code 11 (Slot Not Enabled), harmless.
+    if JB9G_NO_HCRST {
+        let mut guard = xhci::XHCI_CONTROLLER.lock();
+        if let Some(x) = guard.as_mut() {
+            for slot in 1u8..=8 {
+                let trb = xhci::trb::Trb {
+                    parameter: 0,
+                    status: 0,
+                    control: (10 << 10) | ((slot as u32) << 24), // TRB type 10 = Disable Slot
+                };
+                let _ = x.send_command(trb);
+            }
+            // Drain the eight completions (bounded ~100 ms) before enumeration starts, so no
+            // stale completion aliases against the enum FSM's own commands.
+            let deadline = cntpct().wrapping_add(cntfrq() / 10);
+            while cntpct().wrapping_sub(deadline) >= (1u64 << 63) {
+                x.poll_events();
+                core::hint::spin_loop();
+            }
+            serial_println!(":: tegra: JB9i — inherited-slot eviction: DISABLE_SLOT 1..8 issued + drained ::");
+        }
     }
 
     // Pump the polled enumeration, bounded. 60 s wall-clock, sized to the WORST case, not the

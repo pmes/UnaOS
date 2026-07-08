@@ -15,20 +15,32 @@
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 
+/// Context stride in u32 words. HCCPARAMS1.CSZ selects the controller's context size: CSZ=0 →
+/// 32-byte contexts (QEMU, Intel Panther Point, VL805), CSZ=1 → 64-byte (Tegra234 XUSB — its FW
+/// rejects 32-byte-stride input contexts with completion code 17 Parameter Error at
+/// ADDRESS_DEVICE; JB9 bench 2026-07-08). The meaningful dwords sit in the first 8 words either
+/// way, so field writes are stride-agnostic — only the array shape the hardware walks changes.
+/// Compile-time by feature: the tegra kernel always drives the CSZ=1 XUSB block; every other
+/// build (x86, pi4, QEMU regressions) stays byte-identical at 32.
+#[cfg(feature = "tegra")]
+pub const CTX_WORDS: usize = 16;
+#[cfg(not(feature = "tegra"))]
+pub const CTX_WORDS: usize = 8;
+
 #[derive(Debug, Clone, Copy)]
 #[repr(C, align(64))]
 pub struct DeviceContext {
-    pub slot: [u32; 8],      // Slot Context (32 bytes)
-    pub ep0:  [u32; 8],      // Endpoint 0 Context (32 bytes)
-    pub eps:  [[u32; 8]; 30] // Endpoints 1-30 (30 * 32 bytes)
+    pub slot: [u32; CTX_WORDS],      // Slot Context
+    pub ep0:  [u32; CTX_WORDS],      // Endpoint 0 Context
+    pub eps:  [[u32; CTX_WORDS]; 30] // Endpoints 1-30
 }
 
 impl DeviceContext {
     pub const fn new() -> Self {
         Self {
-            slot: [0; 8],
-            ep0: [0; 8],
-            eps: [[0; 8]; 30],
+            slot: [0; CTX_WORDS],
+            ep0: [0; CTX_WORDS],
+            eps: [[0; CTX_WORDS]; 30],
         }
     }
 }
@@ -36,14 +48,14 @@ impl DeviceContext {
 #[derive(Debug, Clone, Copy)]
 #[repr(C, align(64))]
 pub struct InputContext {
-    pub control: [u32; 8],   // Input Control Context (32 bytes)
+    pub control: [u32; CTX_WORDS],   // Input Control Context
     pub device:  DeviceContext
 }
 
 impl InputContext {
     pub const fn new() -> Self {
         Self {
-            control: [0; 8],
+            control: [0; CTX_WORDS],
             device: DeviceContext::new(),
         }
     }

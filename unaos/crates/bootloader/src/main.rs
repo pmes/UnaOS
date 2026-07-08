@@ -968,6 +968,49 @@ fn jb8_falcon_witness(tag: &str) {
             (usbsts >> 11) & 1
         );
     }
+    // JB9d (bench 2026-07-08): the pre-EBS MAILBOX liveness bit — the one datum the whole JB9
+    // kernel campaign is missing. Post-EBS the FW is mailbox-dead at every point (raw-handoff /
+    // post-restart / post-PG-cycle, 5-attempt ladders), and the only actor between "FW provably
+    // servicing pre-EBS" (JB8: HCH=0, enumerating) and the dead kernel handoff is generic
+    // XhciDxe's XhcHaltHC (USBCMD.RS=0) + PciIo attribute restore. This send brackets the kill:
+    //   SERVICED here + dead at kernel raw-handoff  -> the EBS halt parks the FW service loop
+    //     (kernel counter-lever: attach WITHOUT HCRST / replay the halted state);
+    //   silent here too (while USB demonstrably enumerates) -> the mailbox was never
+    //     NS-serviceable on this firmware, and mailbox silence stops meaning "FW idle".
+    // Same MSG_ENABLED words the kernel's jb3_aru_probe writes (owner-claim -> DATA_IN ->
+    // CMD|=INT_EN|DEST_FALC); 3 short attempts (~15 ms total) to keep the pre-EBS dwell small —
+    // the NVIDIA driver still owns the block, so a held owner semaphore is itself a datum.
+    let own0 = r(0x010);
+    let mut serviced = false;
+    let mut attempts = 0u32;
+    while attempts < 3 && !serviced {
+        attempts += 1;
+        w(0x010, 2); // OWNER_SW
+        if r(0x010) != 2 {
+            boot::stall(core::time::Duration::from_micros(5_000));
+            continue;
+        }
+        w(0x008, 5u32 << 24); // MBOX_CMD_MSG_ENABLED
+        w(0x004, r(0x004) | (1 << 31) | (1 << 27)); // INT_EN | DEST_FALC
+        let mut polls = 0u32;
+        while polls < 50 {
+            if r(0x00c) != 0 || r(0x010) != 2 {
+                serviced = true;
+                break;
+            }
+            boot::stall(core::time::Duration::from_micros(100));
+            polls += 1;
+        }
+        if r(0x010) == 2 {
+            w(0x010, 0); // release
+        }
+    }
+    log::info!(
+        "JB9d[{tag}]: MBOX MSG_ENABLED {} (owner pre={own0:#x} now={:#x} data_out={:#010x}, attempts={attempts})",
+        if serviced { "SERVICED" } else { "SILENT" },
+        r(0x010),
+        r(0x00c)
+    );
 }
 
 /// JB8 lever (feature `jb8lever`, arroyo `UNAOS_JB8_LEVER=1` — separate media, only flashed when

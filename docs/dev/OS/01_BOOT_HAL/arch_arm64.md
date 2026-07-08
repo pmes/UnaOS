@@ -1358,8 +1358,52 @@ already writes and the CSB page-select.
 254,536 B by the probe code, well under the ~355 KB corrupt-bloat signature); virt `test-arm`
 green (`storage_slot=1`, zero panics — JB9 is `tegra`-gated, QEMU byte-inert).
 
-**Bench verdict (attended, pending):** which of {FW idled, SMMU stale context, SID mismatch,
-other} the data supports — to be filled from the JB9 serial after Peter's next bench window.
+#### JB9 bench verdict (attended, 2026-07-08 pm, ~10 boots — serial `unaos-jetson-jb9-serial.log`)
+
+**Answer: OTHER — the fabric was never broken; UnaOS was breaking it.** The JB9 probes eliminated
+every standing hypothesis, then a live-debug ladder (JB9b→JB9k, one lever per boot) found and fixed
+the real, three-part cause. USB enumeration now works on Orin silicon: both halves of a VIA VL2109
+hub enumerate (USB3 root port 1 + USB2 root port 6), device descriptors and hub bring-up complete
+over real DMA into the >4 GiB event ring, and DISABLE_SLOT/ADDRESS_DEVICE/EP0 transfers all
+round-trip. The chronicle:
+
+- **JB9-A** (three points + JB9d loader-side pre-EBS): the ARU mailbox NEVER answers MSG_ENABLED
+  from NS — *including pre-EBS while the FW is provably enumerating USB*. Mailbox silence means
+  nothing on this firmware; the JB3 no-ACK was a red herring. The fw-header ioctl also answers
+  across a true PG cycle (it reads the AO-configured DRAM buffer, not a running FW) — demoted as a
+  liveness witness. The ARU scratch heartbeat found only one flaky bit (BAR2+0x18).
+- **JB9-B**: SMMU bound to OUR identity CB (stale-UEFI-context hypothesis dead), MC overrides
+  correct, zero faults, nothing near-target. AO IFR view: `IFRDMA_CFG0/1` hold the fw buffer PA;
+  `IFRDMA_STREAMID=0x7f`. **JB9b**: the AO retag to 0xe is NS-REFUSED (even freshly post-PG-cycle);
+  accepting the 0x7f class at the SMMU changed nothing — no XUSB DMA was reaching the SMMU at all.
+- **JB9c**: a TRUE MRQ_PG rail drop (post-OFF=0x0 verified) neither restarts the FW nor unlocks AO —
+  the t234 ROM does NOT re-run IFR autoboot on a bare PG-on; only `XhciControllerDxe.Start` ever
+  loads this Falcon. ⚠ The PG cycle *destroys* the only firmware instance — never run it on an
+  inherit-path boot.
+- **JB9e**: a NOOP into an ALL-<4 GiB hand-programmed interrupter also lands nothing after HCRST
+  (and UEFI's own event ring turns out to live >4 GiB anyway) — address theory dead.
+- **⭐ JB9f (inherit-run)**: at raw handoff, bare `RS=1` on UEFI's own halted state — with NO reset —
+  posts a Port-Status-Change TRB into UEFI's event ring within 200 ms. **The firmware was alive the
+  whole time; the failure was in UnaOS's takeover.**
+- **The three real bugs, fixed in order:** (1) **HCRST kills the inherited Falcon's service loop**
+  (JB9g `JB9G_NO_HCRST`: halt-only takeover, reprogram while halted, RS=1 — xHCI-legal, no reset);
+  (2) the JB3 fabric chain **mutates a working configuration** (JB9h `JB9H_SKIP_CHAIN`: skip SMMU
+  re-arm/MC/FPCI/ARU/padctl/CSB-poke entirely on the inherit path — with it skipped, enable-slot
+  COMPLETES: command completions land in the high event ring; the MC override reading 0x0 — arc B's
+  founding "torn-down link" — is simply what the working config looks like); (3) **HCCPARAMS1.CSZ=1**:
+  the Tegra xHC uses 64-byte contexts and the shared driver was hard-coded 32-byte stride — the
+  cause of ADDRESS_DEVICE code-17 Parameter Error (fixed shared-driver-wide via
+  `context::CTX_WORDS`, tegra=16/others=8, Peter-approved shared-file change; QEMU regression
+  byte-identical). Plus two conventional driver gaps found immediately after: PORTSC speed ID 5
+  (SuperSpeed+) had no MPS0 mapping (→ 512), and Full-Speed EP0 babble now learns MPS0=64 per port
+  for the FSM's retry (`fs_ep0_mps64`). JB9i (DISABLE_SLOT 1..8 eviction of UEFI's stale slots) is
+  retained as takeover hygiene.
+
+**Remaining (next arc):** the hub-downstream walk only descends one level (Peter's keyboard/mouse/
+storage sat behind nested VL2109 hub layers; `storage_slot=0`); port 7's FS device passes the
+babble-learn then watchdogs at dev-desc (needs a fresh port reset in the retry flow); the JB4/JB5
+chain code paths should be formally retired/gated for inherit-path boots; and a direct-to-root-port
+keyboard boot is the quick win to demonstrate `keyboard ARMED` end-to-end.
 
 ## 4. Jetson Orin Nano headless bring-up (Arc JM2)
 

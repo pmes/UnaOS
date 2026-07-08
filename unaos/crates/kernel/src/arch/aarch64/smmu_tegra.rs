@@ -399,6 +399,33 @@ pub fn jb3_v3_dump(base: u64) {
     );
 }
 
+/// JB9b lever 2 (bench 2026-07-08, fallback for the AO retag): accept the 0x7f bypass-SID class
+/// through the SAME identity context the 0xe stream already translates through. SMR[1] matches
+/// low-byte 0x7f with the same don't-care upper mask SMR[0] uses (the controller decorates upper
+/// bits per transaction class — JB3 boots 2/4), S2CR[1] routes to CB0 (already armed by
+/// jb3_open_stream). If the fabric drops bypass-SID traffic BEFORE the SMMU this does nothing —
+/// that outcome (AO rb=TOOK ignored + SMR[1] never faults/translates + rings still empty) is
+/// itself the discriminating datum. TLB-flushed; readbacks printed.
+pub fn jb9b_accept_bypass_sid(bases: &[u64]) {
+    for (i, &base) in bases.iter().enumerate() {
+        wr(base, SMR_BASE + 4, (1 << 31) | (0x7f00 << 16) | 0x7f);
+        wr(base, S2CR_BASE + 4, 0b00 << 16); // TYPE=translate, CBNDX=0 (the JB3 identity CB)
+        wr(base, TLBIALLNSNH, 0);
+        wr(base, STLBGSYNC, 0);
+        let mut spins = 0u32;
+        while rd(base, STLBGSTATUS) & 1 != 0 && spins < 100_000 {
+            spins += 1;
+        }
+        serial_println!(
+            ":: tegra: JB9b — inst{} SMR[1] rb={:#010x} S2CR[1] rb={:#010x} (accept sid-0x7f class via CB0) tlbsync {} ::",
+            i,
+            rd(base, SMR_BASE + 4),
+            rd(base, S2CR_BASE + 4),
+            if spins < 100_000 { "OK" } else { "TIMEOUT" }
+        );
+    }
+}
+
 /// JB9-B: the DMA-forensics dump, taken WHILE enable-slot is pending (the JB8 verdict's live
 /// window: a running Falcon fetches the command ring / writes the event ring and nothing lands,
 /// zero faults). Per instance: the SMR that matches the XUSB SID and its S2CR routing, then the
