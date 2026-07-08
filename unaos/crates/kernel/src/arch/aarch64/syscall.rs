@@ -3550,7 +3550,7 @@ fn openfile_mark_unlink_pending_at(row: u32, first_cluster: u32) {
 /// `sys_unlink`, the `sys_open` unwind), where block I/O is legal; NEVER from teardown (IRQ-masked — that path
 /// logs a leak instead). The name is already `0xE5`'d, so freeing here can never alias; a mount/free error only
 /// orphans clusters (lost clusters — benign, chkdsk-reclaimable), never aliases. Holds no lock across the I/O.
-fn free_orphan_chain(first_cluster: u32) {
+fn free_orphan_chain(first_cluster: u32) -> bool {
     let fs = match crate::fs::fat::mount() {
         Ok(fs) => fs,
         Err(_) => {
@@ -3558,7 +3558,7 @@ fn free_orphan_chain(first_cluster: u32) {
                 "U11-defer: deferred free of chain @cluster {} — mount failed, orphaned (leak)",
                 first_cluster
             );
-            return;
+            return false;
         }
     };
     if fs.free_chain(first_cluster).is_err() {
@@ -3566,7 +3566,9 @@ fn free_orphan_chain(first_cluster: u32) {
             "U11-defer: deferred free of chain @cluster {} — free_chain error, orphaned (leak)",
             first_cluster
         );
+        return false;
     }
+    true
 }
 
 // =============================================================================================
@@ -3596,7 +3598,9 @@ fn free_orphan_chain(first_cluster: u32) {
 // `Some(fc)` (last-close-of-pending, the row already cleared to EMPTY), so it is queued once and freed once
 // by the reaper; the explicit-close path frees inline and NEVER queues, so no chain is both freed inline and
 // queued. SMP-safe: a teardown on core X pushes, the reaper on core Y drains — a single `SpinMutex` serializes
-// them with no torn reads and no lost/duplicated entries.
+// them with no torn reads and no lost/duplicated entries. The lock is taken IRQ-MASKED on BOTH sides (via
+// `IrqGuard`), so the reaper's preemptible task body can never be timer-preempted while holding it — closing
+// the same-core push-vs-preempted-pop deadlock that is otherwise live in the single-AP-fallback boot.
 
 /// U11-M2b: capacity of the deferred-free ring. A teardown queues at most ONE chain per exiting task (its
 /// single last-`unlink_pending` open), so 16 pending chains is generous headroom before the honest full-queue
@@ -3621,6 +3625,41 @@ impl DeferredFree {
 /// allocation-free, I/O-free critical section) and in the reaper's pop — but NEVER held across `free_chain` I/O.
 static DEFERRED_FREE: SpinMutex<DeferredFree> = SpinMutex::new(DeferredFree::EMPTY);
 
+/// U11-M2b (deadlock fix): an RAII IRQ-mask guard for the two `DEFERRED_FREE` critical sections.
+/// `DEFERRED_FREE` is a bare `spin::Mutex` acquired in two IRQ-ASYMMETRIC contexts: `deferred_free_push`
+/// runs in the IRQ-masked teardown path, but `deferred_free_pop` runs in the reaper TASK body, which the
+/// metal generic timer can PREEMPT (kernel task bodies run I-unmasked; `SCHED_ACTIVE` enables preemption).
+/// Without masking, a timer preempt of the reaper WHILE it holds the lock, followed by a SAME-CORE teardown
+/// push spinning IRQ-masked on that lock, deadlocks the core forever (the preempted holder is pinned to that
+/// core — run queues never migrate — so it can never be rescheduled to release it). That is dormant in a
+/// healthy ≥2-AP boot — the reaper (on `online.get(1)`) and the EL0 fixtures whose teardown pushes (on
+/// `online.first()`) sit on DISTINCT cores — but becomes LIVE in the single-AP fallback, where
+/// `reaper_cpu`/`vcpu`/`demo_cpu` all collapse onto the one AP (the pi4's 3/4-core boot variance can produce
+/// it). Masking IRQs across the whole bounded, I/O-free critical section makes the hold non-preemptible, so
+/// `DEFERRED_FREE` is a proper IRQ-safe spinlock at ANY core count. It SAVES and restores the DAIF snapshot
+/// (the `sched.rs` `irq_save_mask` idiom, kept LOCAL so M2b still touches no `sched.rs`) so it nests
+/// correctly in the already-masked teardown push (it restores the prior mask, never an unconditional clear).
+struct IrqGuard(u64);
+impl IrqGuard {
+    #[inline]
+    fn mask_save() -> Self {
+        let daif: u64;
+        unsafe {
+            core::arch::asm!("mrs {}, daif", out(reg) daif, options(nomem, nostack, preserves_flags));
+            core::arch::asm!("msr daifset, #2", options(nomem, nostack, preserves_flags));
+        }
+        IrqGuard(daif)
+    }
+}
+impl Drop for IrqGuard {
+    #[inline]
+    fn drop(&mut self) {
+        // Restore the caller's prior DAIF (masked in teardown, unmasked in the reaper) — never an
+        // unconditional unmask, which would drop the IRQ mask mid-teardown.
+        unsafe { core::arch::asm!("msr daif, {}", in(reg) self.0, options(nomem, nostack, preserves_flags)) };
+    }
+}
+
 /// U11-M2b: enqueue a teardown-orphaned chain head for the reaper. I/O-free (lock + array write + unlock) — so
 /// it is SAFE in the IRQ-masked teardown context, the same class as M2a's teardown decrement. Returns `false`
 /// iff the queue is FULL (the caller degrades to logging the leak + leaving the clusters allocated — never a
@@ -3628,6 +3667,9 @@ static DEFERRED_FREE: SpinMutex<DeferredFree> = SpinMutex::new(DeferredFree::EMP
 /// caller holds both. `#[must_use]`: dropping a `false` return would silently lose the leak-log fallback.
 #[must_use]
 fn deferred_free_push(first_cluster: u32) -> bool {
+    // IRQ-mask the critical section (declared BEFORE the lock guard, so on scope exit the lock drops FIRST,
+    // then IRQs are restored): the paired `deferred_free_pop` runs preemptibly, so the lock must be IRQ-safe.
+    let _irq = IrqGuard::mask_save();
     let mut q = DEFERRED_FREE.lock();
     if q.len >= NDEFERFREE {
         return false; // full — caller logs the honest leak
@@ -3643,6 +3685,10 @@ fn deferred_free_push(first_cluster: u32) -> bool {
 /// lock before the `free_chain` block I/O (holding the queue lock across `mount()` would let a teardown push
 /// spin IRQ-masked on it — an unbounded stall in the one place that must never stall).
 fn deferred_free_pop() -> Option<u32> {
+    // IRQ-mask across the pop so a metal timer cannot preempt the reaper while it holds the lock — which,
+    // paired with a same-core IRQ-masked teardown push, would deadlock the core (see `IrqGuard`). The guard
+    // is declared BEFORE the lock, so the lock releases before IRQs are restored on every return path.
+    let _irq = IrqGuard::mask_save();
     let mut q = DEFERRED_FREE.lock();
     if q.len == 0 {
         return None;
@@ -3666,10 +3712,14 @@ pub fn orphan_reaper(_: usize) {
     loop {
         match deferred_free_pop() {
             Some(fc) => {
-                // The queue lock is already dropped; the block I/O is the reaper's own. A per-chain line is the
-                // positive twin of M2a's "leaked" log — its ABSENCE for a reaped file is the gate's witness.
-                serial_println!("U11-defer: reaper freed teardown-orphaned chain @cluster {}", fc);
-                free_orphan_chain(fc);
+                // The queue lock is already dropped; the block I/O is the reaper's own. Log the positive
+                // witness (the twin of M2a's "leaked" log) ONLY on a SUCCESSFUL free — its ABSENCE for a file
+                // is the gate's witness, and `free_orphan_chain` logs its own error/leak line on failure, so
+                // the two can never both appear for one chain. (Freeing succeeds in the QEMU gate: the line
+                // still prints, byte-identically, after the silent successful free.)
+                if free_orphan_chain(fc) {
+                    serial_println!("U11-defer: reaper freed teardown-orphaned chain @cluster {}", fc);
+                }
             }
             None => super::sched::yield_now(),
         }

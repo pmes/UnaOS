@@ -52,6 +52,23 @@ Legend: **✅ metal-confirmed** · **🔬 QEMU-green, metal pending** · dates I
   x86 files. `SpinMutex` reused from `sched.rs`; **NO `sched.rs` change** and **NO `fat.rs` change** (the reaper
   calls M2a's existing `free_chain`). 🔬 Metal-pending (pure syscall lifecycle + a kernel service task + FAT free;
   QEMU proves the reaper in full — rides the next Pi boundary alongside U10/U11-M1/M2).
+- **Seat coalesce-review fix (1 confirmed should-fix, in-lane):** `DEFERRED_FREE` is a bare `spin::Mutex` acquired
+  in two IRQ-ASYMMETRIC contexts — `deferred_free_push` in the IRQ-masked teardown, but `deferred_free_pop` in the
+  reaper TASK body, which the metal timer PREEMPTS (task bodies run I-unmasked; `SCHED_ACTIVE` on). A timer preempt
+  of the reaper while it holds the lock, then a **same-core** teardown push spinning IRQ-masked on it, deadlocks
+  that core (run queues never migrate → the preempted holder never releases). Dormant in a healthy ≥2-AP boot (reaper
+  on `online.get(1)` vs EL0 fixtures on `online.first()` — distinct cores) but **live in the single-AP fallback**
+  (`reaper_cpu`/`vcpu`/`demo_cpu` collapse onto one AP; the pi4's 3/4-core boot variance can produce it). Fixed by a
+  local RAII `IrqGuard` (save/restore DAIF — the `sched.rs` `irq_save_mask` idiom, kept local so M2b **still touches
+  no `sched.rs`**) masking IRQs across **both** `deferred_free_push`/`pop`, making the hold non-preemptible → a
+  proper IRQ-safe spinlock at any core count. Also folded the log nit: `free_orphan_chain` returns `bool`; the reaper
+  logs "reaper freed …" only on a SUCCESSFUL free (its error/leak line covers failure). Byte-transparent under QEMU
+  (cooperative — no preemption): **22 PASS**, CAPSTONE 6/6, reaper freed cluster 8, no teardown-leak line, 0 faults;
+  `check` both arches; `test-arm` clean; zero x86 files. **Flagged, NOT fixed (future SMP-hardening arc):** the
+  reaper's downstream `fat::set_fat_entry` read-modify-write is unlocked across cores (no FS-mutation lock spanning
+  the RMW) — a latent lost-update/cluster-aliasing race should the OS ever run uncoordinated concurrent FAT writers;
+  not live today (the reaper's free is await-verdict-sequenced after all writers exit), and its fix touches `fat.rs`
+  (out of this lane).
 
 ### U11 (M2 / U12) — cross-process unlink-defers-free: a global open-file refcount + deferred chain-free (aarch64) 🔬 `hw-pi4`
 - **What:** closes the SECOND (and last) of U10's two review notes — **cross-process unlink-while-open** (POSIX
