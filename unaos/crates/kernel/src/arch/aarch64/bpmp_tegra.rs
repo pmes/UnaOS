@@ -61,6 +61,9 @@ const MRQ_RESET: u32 = 20;
 const CMD_RESET_DEASSERT: u32 = 2;
 const MRQ_CLK: u32 = 22;
 const CMD_CLK_ENABLE: u32 = 7;
+// MRQ_CLK subcommand: read a clock's actual enabled state (soc/tegra/bpmp-abi.h CMD_CLK_IS_ENABLED).
+// Pure query — response payload[0] = 1 (running) / 0 (gated). Used by jb7_clocks_query (arc A).
+const CMD_CLK_IS_ENABLED: u32 = 6;
 const MRQ_PG: u32 = 66;
 const CMD_PG_SET_STATE: u32 = 1;
 const PG_STATE_ON: u32 = 1;
@@ -673,6 +676,35 @@ pub fn jb5_pg_on(chan: &Chan, ids: &super::fdt_tegra::XusbIds) -> bool {
         }
     }
     all_on
+}
+
+/// JB7 (arc A): read-only clock-state census for the halted-Falcon question. `jb1c_ungate_xusb`
+/// only proves each MRQ_CLK ENABLE *acked* (err==0) — never that the clock is actually running.
+/// This issues MRQ_CLK CMD_CLK_IS_ENABLED (a pure query, zero mutation) for every DTB clock the
+/// XUSB host lists PLUS the four Falcon leaf clocks (267/269/270/271), so a gated core clock behind
+/// an otherwise-powered partition shows as `=0`. If every clock reads `=1` while CPUCTL stays
+/// 0xffffffff, clock-gating is RULED OUT — the Falcon core is held in reset, not unclocked. Runs at
+/// raw handoff (before jb1c re-enables anything) so it reports the state UEFI actually left.
+pub fn jb7_clocks_query(chan: &Chan, ids: &super::fdt_tegra::XusbIds) {
+    let query = |id: u32, tag: &str| {
+        match chan.transfer(MRQ_CLK, &[(CMD_CLK_IS_ENABLED << 24) | (id & 0x00ff_ffff)]) {
+            Some((err, out)) => serial_println!(
+                ":: tegra: JB7 — CLK {} IS_ENABLED ({}) err={} = {} ::",
+                id, tag, err, out[0]
+            ),
+            None => serial_println!(":: tegra: JB7 — CLK {} IS_ENABLED ({}) -> TIMEOUT ::", id, tag),
+        }
+    };
+    serial_println!(
+        ":: tegra: JB7 — Falcon clock census (read-only MRQ_CLK IS_ENABLED): {} DTB + 4 leaf ::",
+        ids.n_clocks
+    );
+    for i in 0..ids.n_clocks {
+        query(ids.clocks[i], "dtb");
+    }
+    for id in [CLK_XUSB_CORE_HOST, CLK_XUSB_FALCON, CLK_XUSB_FALCON_HOST, CLK_XUSB_FALCON_SS] {
+        query(id, "leaf");
+    }
 }
 
 /// JB4-prep IMEM-preserving witness re-assert (see the block comment). Re-enables the Falcon clock

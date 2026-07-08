@@ -800,6 +800,64 @@ pub fn jb6_csb_sweep() {
     w(0x9c, 0);
 }
 
+/// JB7 (arc A): cross-read the Falcon CPUCTL via NVIDIA's ALTERNATE CFG/FPCI CSB path to settle
+/// dead-core vs BAR2-aperture. `jb6_csb_sweep` proved the BAR2 CSB window reads all-ones with a
+/// working page-select — but that is ONE aperture. `UsbFalconLib.c::FalconMapReg`'s else-branch
+/// (the path FalconUtil uses, taken when XusbHostBase2Addr==0) reaches the SAME Falcon CSB through
+/// config space: page-select @ `XUSB_FPCI+0x41c`, 512-byte data window @ `XUSB_FPCI+0x800 +
+/// (addr & 0x1ff)`, PageIndex = addr>>9 (source-verified against edk2-nvidia 2026-07-08). Read
+/// CPUCTL@0x100 (+ two neighbors) via BOTH apertures the same boot:
+///   * both read 0xffffffff -> the Falcon core is DEFINITIVELY dead (not a BAR2-aperture artifact);
+///   * CFG reads real data  -> the BAR2 CSB window is the problem and the core may be alive.
+/// STRICTLY non-destructive: the only writes are page-selects (the same class `jb6_csb_sweep`
+/// performs) — no resets, no power/clock/PG changes. FPCI config space decodes regardless of BAR
+/// programming, so the CFG path is reachable at raw handoff; the BAR2 path reuses the route
+/// `jb5_bar2_route` already established. Both page-selects are zeroed on exit.
+pub fn jb7_csb_cfg_read() {
+    if !JB5_PROBE {
+        return;
+    }
+    let fr = |off: u64| unsafe { core::ptr::read_volatile((XUSB_FPCI + off) as *const u32) };
+    let fw = |off: u64, v: u32| unsafe {
+        core::ptr::write_volatile((XUSB_FPCI + off) as *mut u32, v)
+    };
+    let br = |off: u64| unsafe { core::ptr::read_volatile((XUSB_BAR2 + off) as *const u32) };
+    let bw = |off: u64, v: u32| unsafe {
+        core::ptr::write_volatile((XUSB_BAR2 + off) as *mut u32, v)
+    };
+    // CFG path: page-select @ FPCI+0x41c, data window @ FPCI+0x800 + (addr & 0x1ff).
+    let cfg_r = |addr: u32| -> (u32, u32) {
+        fw(0x41c, (addr >> 9) & 0x7f_ffff);
+        (fr(0x41c), fr(0x800 + (addr & 0x1ff) as u64))
+    };
+    // BAR2 path (the jb6 mechanism): page-select @ BAR2+0x9c, window @ BAR2+0x2000 + (addr & 0x1ff).
+    let bar2_r = |addr: u32| -> (u32, u32) {
+        bw(0x9c, (addr >> 9) & 0x7f_ffff);
+        (br(0x9c), br(0x2000 + (addr & 0x1ff) as u64))
+    };
+    serial_println!(
+        ":: tegra: JB7 — CSB dual-path read via FPCI @{:#010x} (arc A: dead-core vs BAR2 aperture) ::",
+        XUSB_FPCI
+    );
+    for &a in &[0x100u32, 0x104, 0x110] {
+        let (cfg_pg, cfg_val) = cfg_r(a);
+        let (bar_pg, bar_val) = bar2_r(a);
+        let verdict = if cfg_val != 0xffff_ffff {
+            "CFG-LIVE — BAR2 aperture suspect"
+        } else if bar_val != 0xffff_ffff {
+            "BAR2-LIVE — CFG suspect"
+        } else {
+            "both 0xffffffff — core dead"
+        };
+        serial_println!(
+            ":: tegra: JB7 — CSB[{:#05x}]: CFG(pg_rb={:#x} val={:#010x}) BAR2(pg_rb={:#x} val={:#010x}) -> {} ::",
+            a, cfg_pg, cfg_val, bar_pg, bar_val, verdict
+        );
+    }
+    fw(0x41c, 0);
+    bw(0x9c, 0);
+}
+
 /// JB5 run E: release the SS ELPG clamps — the InitHw step jb2c never covered. UEFI's
 /// UsbPadCtlDxe DeInitHw (EBS) powers USB3 down per port: set SSPX_ELPG_CLAMP_EN_EARLY, 200 µs,
 /// set SSPX_ELPG_CLAMP_EN, 350 µs, set SSPX_ELPG_VCORE_DOWN — so every UnaOS boot inherits the SS

@@ -12,6 +12,29 @@ Legend: **✅ metal-confirmed** · **🔬 QEMU-green, metal pending** · dates I
 
 ## hw-jetson track — 2026-07-08 (attended bench, Peter at the Orin)
 
+### JB7 — arc A is the sole blocker; arc B refuted from the JB6 log + two read-only Falcon-core probes 🔬 offline prep, attended bench pending `hw-jetson`
+- **What:** an offline read of the JB6 run-F serial **refutes arc B** (the "XUSB StreamID mismatch"): the
+  MC override **sticks** at `0xe` (`rb=0x0000000e/0x0000000e`; the "reads `0x0`" was the pre-fix
+  first-touch), the SMMU stream matches + identity-translates, and the fault census is **clean**
+  (`sGFSR=0x0`, CB0 FSR unchanged, `MC INTSTATUS=0x0`, before *and* after attach). Zero faults ⇒ no XUSB
+  DMA is even attempted — the empty event ring is **arc A's shadow** (a halted Falcon = a halted xHC
+  command engine issues no completion), not a DMA-delivery failure. S2CR bypass (the baton's fix) was
+  moreover already refuted on metal (boots 5/6). **Arc A** (`CPUCTL=0xffffffff` at every stage, immovable;
+  ARU alive, core in reset behind it) is the only blocker. Added two probes (`feature="tegra"` +
+  `JB5_PROBE`-gated → QEMU byte-identical): **`jb7_csb_cfg_read`** cross-reads CPUCTL via NVIDIA's
+  alternate FPCI/CFG CSB path (`FPCI+0x41c`/`+0x800`, source-verified against `UsbFalconLib.c`) vs BAR2
+  (dead-core vs aperture), and **`jb7_clocks_query`** reports the 9 DTB + 4 leaf Falcon clocks' actual
+  `MRQ_CLK IS_ENABLED` state (clock-gated vs reset-held).
+- **Bench (pending):** two non-destructive boots — A1 (JB7 probes) + A2 the **boot-medium bisect** (boot
+  from native microSD/NVMe, never tried — every prior boot was SD-in-a-USB-reader, a USB device on the very
+  XUSB host; if the Falcon arrives alive on a non-USB boot, arc A is solved with zero kernel code). Runbook
+  `~/.claude/plans/unaos-jetson-arcA-bench.md`.
+- **Tested — QEMU (the DONE gate):** `./arroyo check` + `UNAOS_TEGRA=1 ./arroyo check` both arches green
+  (probes compile clean, zero new warnings); `UNAOS_TEGRA=1 ./arroyo esp-jetson` links (`kernel.elf`
+  254,856 B tegra, 122 `tegra:` strings); virt `test-arm` green (`storage_slot=1`, byte-identical — all
+  JB7 code gated off).
+- **Detail:** [`arch_arm64.md` §JB7](dev/OS/01_BOOT_HAL/arch_arm64.md). Next: the attended arc-A bench.
+
 ### JB6 — "inherit, don't revive" the XUSB Falcon: a bootloader dummy-ACPI table makes UEFI skip its ExitBootServices teardown ✅ teardown-skip metal-proven / 🔬 enum → arcs A+B `hw-jetson`
 - **What:** the bootloader installs a minimal, spec-correct dummy **ACPI 2.0 RSDP+XSDT** into the UEFI
   config table immediately before `ExitBootServices` (`install_tegra_acpi_shim`, gated on a `tegra234`

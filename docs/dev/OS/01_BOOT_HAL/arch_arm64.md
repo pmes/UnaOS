@@ -1141,6 +1141,65 @@ media. **Always rebuild `UNAOS_TEGRA=1 ./arroyo esp-jetson` after any `test-arm`
 `kernel.elf` (~248 KB tegra vs ~355 KB virt/corrupt) before flashing.** The size-check caught it here
 before a wasted attended boot.
 
+### JB7 — arc A is the sole blocker; arc B refuted from the JB6 log (offline analysis, 2026-07-08)
+
+A close read of the JB6 run-F serial (`unaos-jetson-jb6-serial.log`) settles the two "next arcs" the
+JB5+JB6 section left open: **arc A (the halted Falcon core) is the only real blocker, and arc B (the
+"XUSB StreamID mismatch") is a misdiagnosis** — the event ring is empty because a halted command engine
+issues no DMA, not because DMA is dropped.
+
+**Arc B, retired.** The StreamID/SMMU path is already correct, and the fault census is clean:
+
+| Evidence (run-F serial) | Reading |
+| --- | --- |
+| `MC SID HOSTR/HOSTW <- 0xe: rb=0x0000000e/0x0000000e` | The MC StreamID override **sticks**. The JB5+JB6 note's "reads `0x0`" is the *pre-fix first-touch* (`jb3_open_stream`), not the operative post-`jb3_mc_sid_fix` value. |
+| `inst0/inst1 OPEN: SMR[0] rb=0xff00000e S2CR[0] rb=0x00000000`, `CB0 armed` | SMR matches the decorated SIDs (mask `0x7f00`); S2CR=translate through the identity CB0; USFCFG=1. Correctly configured. |
+| `inst{0,1} {pre,post-attach} faults: sGFSR=0x00000000`; CB0 `FSR` unchanged; `MC INTSTATUS=0x00000000` | **Zero faults, before and after the attach.** With USFCFG=1 a SID-mismatched write would latch a USF fault naming the SID. Nothing latches ⇒ **no XUSB DMA is ever attempted.** |
+
+The baton's proposed arc-B fix (S2CR bypass) was moreover **already refuted on metal** (boots 5/6: bypass
+matched, fault-free, DMA still swallowed — the MB2 policy "SMMU external bypass disable" refuses
+untranslated traffic; the code moved to identity-translate). Arc B is not independently testable until the
+Falcon runs, and its config is already in place for when it does.
+
+**Arc A, characterized.** `CPUCTL=0xffffffff` (halted=1 stopped=1) at *every* witness stage — raw-handoff
+through post-attach — and nothing moves it (`jb3_falcon`'s CSB STARTCPU restart: `CPUCTL rb=0xffffffff
+(spins 100000)`, the wrong path for t234). `jb6_csb_sweep` proved the BAR2 CSB **page-select sticks**
+(`page_rb` tracks `page_want` for every page) while the data window reads `0xffffffff` throughout — the ARU
+wrapper answers (`BAR2[0x000]=0x00140009`) but the Falcon core behind it does not. Ports train fine
+(`port 1/6/7 CCS=1 … U0` — the port state machine is hardware, independent of the Falcon), the driver
+reaches ENABLE_SLOT, and the watchdog fires because the halted command engine never DMA-reads the TRB nor
+DMA-writes a completion. On Tegra XUSB **the Falcon *is* the xHC command engine**; a halted Falcon means no
+DMA of any kind, which is exactly the zero-fault census above.
+
+**Two read-only probes added (compile-gated `feature="tegra"`, run-time `JB5_PROBE`-gated → QEMU
+byte-identical), wired into the raw-handoff block before any XUSB-affecting MRQ:**
+
+- **`xusb_tegra::jb7_csb_cfg_read`** — cross-reads `CPUCTL@0x100` (+`0x104`/`0x110`) through NVIDIA's
+  *alternate* FPCI/CFG CSB path (`XUSB_FPCI+0x41c` page-select, `XUSB_FPCI+0x800+(addr&0x1ff)` window;
+  `PageIndex=addr/0x200`, source-verified against `UsbFalconLib.c::FalconMapReg`) **and** the BAR2 path,
+  same boot. Both `0xffffffff` ⇒ core definitively dead (not a BAR2-aperture artifact); CFG reads real
+  data ⇒ the BAR2 window is the problem and the core may be alive. Only writes are page-selects (zeroed
+  on exit).
+- **`bpmp_tegra::jb7_clocks_query`** — MRQ_CLK `CMD_CLK_IS_ENABLED` (a pure query) for all 9 DTB clocks +
+  the 4 Falcon leaf clocks (267/269/270/271). `jb1c_ungate_xusb` only proves each ENABLE *acked* (err==0);
+  this reports the clocks' *actual* state. All `=1` while `CPUCTL=0xffffffff` ⇒ clock-gating ruled out,
+  the core is **reset-held**.
+
+**The attended bench (runbook: `~/.claude/plans/unaos-jetson-arcA-bench.md`)** runs two non-destructive
+boots: **A1** (the JB7 probes on the usual SD-in-USB-reader — characterizes dead-core-vs-aperture and
+clock-gated-vs-reset-held), and **A2** the **boot-medium bisect** — boot from the board's *native* microSD
+(SDMMC) or an NVMe FAT partition instead of a USB reader. Every prior Orin boot used SD-in-a-USB-reader — a
+USB device on the very XUSB host we are trying to inherit — so the hypothesis that the generic UEFI xHCI
+driver reading our boot medium is what halts the Falcon has **never been tested**. If the Falcon arrives
+alive on a non-USB boot (`witness[raw-handoff]` CPUCTL ≠ `0xffffffff`), arc A is solved with zero kernel
+code. If it stays halted, the halt is universal (XhciControllerDxe Start, or MB2/TZ) and arc A is at the
+non-secure wall — an honest, documented outcome, as JB5 was for revival.
+
+**Gate:** `./arroyo check` both arches green; `UNAOS_TEGRA=1 ./arroyo check` both arches green (JB7 probes
+compile clean, zero new warnings); `UNAOS_TEGRA=1 ./arroyo esp-jetson` links, `kernel.elf` 254,856 B tegra
+(122 `tegra:` strings; +7 KB over JB4-prep is the added probe format strings, not corrupt-bloat); virt
+`test-arm` green (`storage_slot=1`, byte-identical — all JB7 code gated off).
+
 ## 4. Jetson Orin Nano headless bring-up (Arc JM2)
 
 The Orin is brought up **headless over serial**. The only console that has ever
