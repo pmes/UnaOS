@@ -121,6 +121,66 @@ Legend: **✅ metal-confirmed** · **🔬 QEMU-green, metal pending** · dates I
 - **Metal:** CANNOT be metal-confirmed — the standing x86 xHCI enumeration blocker (`task_47291f90`) means the
   rMBP enumerates no mass-storage device, so `block::info()` is None and U9x's storage-gated demo SKIPS on
   metal exactly as U8x/U7x do. QEMU-green is the ceiling until that blocker clears; the gate is NOT relaxed.
+
+### U9x M2 — real disk write-back: FAT cluster capture, a per-descriptor dirty flag, a flush queue past teardown, and the launcher's IF=1 flush + raw-sector re-read (x86) 🔬 `hw-rmbp`
+- **What:** completes the pi4 U9 twin — persists M1's staged in-memory write to the FAT on disk, the honest way
+  around the IF-masked handler. M1 proved the whole capability surface with an in-memory `wstage` buffer (a
+  read-back witnessed the write); M2 FLUSHES that dirty buffer to the FAT via the shell-proven
+  `fat::write_at`→`block::write_block` path, at IF=1, OUTSIDE the SYSCALL handler, and the launcher raw-re-reads
+  the sector to prove it landed. **THE crux (why M1 stopped here):** the dirty `wstage` buffer is freed at the
+  fixture's teardown (`clear_files_row`, IF=0), but the flush needs IF=1 disk I/O — a naive "flush at teardown"
+  cannot work. **Resolution — a flush queue that survives teardown, drained by the demo launcher at IF=1.**
+  Teardown COPIES each dirty descriptor's bytes + its `(cluster, size, [lo,hi))` into a small static flush queue
+  (the copy is self-contained — a stranded entry can never dangle at a freed buffer), then frees the `wstage`
+  slot exactly as M1 (so the reviewed teardown-clear proof, `wstage_all_free()`, is undisturbed). The launcher —
+  on the demo AP at IF=1, where the xHCI BOT pump self-services its own event ring (drains DMA'd ring memory +
+  acks the interrupter via raw MMIO, so it drives from ANY CPU) — drains the queue via `fat::write_at` (in place,
+  never grows), then raw-re-reads the sector.
+- **The additions:** (1) a launcher **pre-flight** (IF=1, gated on `HELLO_STAGED`, the BSP's FAT-present signal)
+  mounts + `find_in_root`s SCRATCH.BIN, validates it (regular file, non-zero chain head, size == the staged/wstage
+  length), captures the pre-image bytes at the write offset, and publishes the chain head to `SCRATCH_CLUSTER`
+  (Release) BEFORE the fixture opens — the x86 stand-in for pi4 capturing `FILE_CLUSTER` at open (x86 cannot walk
+  the FAT in the IF-masked handler). (2) `sys_open` records `FILE_CLUSTER` from it; a per-descriptor `FILE_DIRTY`
+  + dirty range `[lo,hi)` set by `sys_write_file` (fresh on the first write, so the flushed span is EXACTLY the
+  touched sectors, never from offset 0). (3) The **revoke ordering** — a whole-task TEARDOWN (`clear_files_row`)
+  ENQUEUES dirty; a REVOKE / open-unwind (`files_free`) DISCARDS dirty (revoke repudiates the write, so a revoked
+  cap never flushes stale bytes). (4) `SCRATCH.BIN` (1 KiB of `0xEE`) planted on the x86 FAT image
+  (`make-fat-img.sh`), mirroring the pi4 plant; its bytes equal M1's const seed, so the in-memory core is
+  byte-identical whether or not a FAT is present. **Folded the two M1 review notes:** `sys_write_file`'s offset
+  advance is now a tx-exact `compare_exchange` claim (CAS-symmetric with `sys_read`), and a writable (`CAP_WRITE`)
+  open on `SHARED_ROW` is refused (a shared writable descriptor could race the unsynchronized staging memcpy).
+- **DUAL MODE:** disk-backed (a FAT volume backs SCRATCH.BIN — `test-fat sf`) REQUIRES the on-disk write-back
+  proof; in-memory (no FAT — plain `./arroyo test` attaches a non-FAT usb.img) runs the M1 core with the flush a
+  no-op and does ZERO AP disk I/O (the pre-flight is `HELLO_STAGED`-gated, so a no-FAT run never issues an AP xHCI
+  read). The revoke-discard proof is NON-VACUOUS: `u9x_check_revoked_write` first shows (positive control) that a
+  dirty descriptor run through `clear_files_row` DOES enqueue a flush, THEN shows the revoke path leaves the queue
+  empty — only the contrast proves discard. Verdict evolution: M1 `staged in-place, no disk write-back this
+  milestone` → M2 `staged write FLUSHED to FAT (on-disk sector changed + size unchanged)`.
+- **Tested — QEMU:** `UNAOS_FATIMG=sf ./arroyo test-fat sf 300` → the U9x line now proves the on-disk write-back:
+  `:: U9x: real File writes — open-RW+seek+write+readback OK, RO-write/wrong-kind/revoked-cap all -EACCES, staged
+  write FLUSHED to FAT (on-disk sector changed + size unchanged) -> PASS ::`. The launcher's raw re-read of the
+  flushed sector (fresh mount, `read_at` chain-walk) finds the 16-byte pattern at offset 520, differing from the
+  `0xEE` pre-image, with the directory size unchanged (1024) — the pi4 U9 proof, in QEMU. **All 16 prior
+  U1a→U8x PASS/FAIL verdicts byte-identical** (sorted scratch-worktree baseline diff vs `ddefc40`; the ONLY
+  verdict delta is the U9x line evolving M1→M2). (Two *descriptive* setup banners show best-effort-console-drop
+  jitter — the baseline run itself dropped U7x's banner while this run kept it and dropped U6bx's — a pre-existing
+  timing artifact of AP-side console contention, not a behavioral change: every demo ran and PASSed identically.)
+  Default no-FAT `./arroyo test 25` stays MISSION SUCCESS AND U9x PASSes its in-memory core (`in-memory core; no
+  FAT volume, flush is a no-op`), with zero AP disk I/O. `./arroyo check` both arches, **zero aarch64 files
+  touched** (`arch/x86_64/syscall.rs` + `make-fat-img.sh` only — the write stack `fat.rs`/`block.rs`/`drivers/xhci`
+  REUSED unchanged via its existing API). Adversarial code review (atomics/ordering, lifecycle/leaks, flush
+  correctness, revoke-discard proof), 0 confirmed findings.
+- **First concurrent AP-side xHCI BOT I/O in the tree:** the disk-backed flush is the first time a demo AP drives
+  the hlt-pumped xHCI BOT engine while the BSP main loop also services xHCI (they serialize on the single
+  `XHCI_CONTROLLER` lock). The pump is BOUNDED (a 2000-iter timeout → `Io`), so a failure would be a LOUD verdict
+  FAIL, never a hang; `test-fat sf` is its empirical proof.
+- **Metal:** unchanged from M1 — CANNOT be metal-confirmed (the xHCI enumeration blocker `task_47291f90` leaves
+  `block::info()` None on the real rMBP, so the whole demo SKIPS there; QEMU-green is the ceiling, gate NOT
+  relaxed). Unlike pi4 U9 (metal-confirmed on real EMMC2), x86 U9x waits on that blocker.
+- **Deferred / tracked:** generation-tagged file-ids (a bare descriptor index lets a revoke+reopen alias a reused
+  slot — real but not ring-3-reachable this arc; the x86 twin of pi4 U11, lands as **U11x**). File
+  growth/create/delete (U10 twin); IF-safe interrupt-driven x86 storage (retires the staged-buffer divergence +
+  the AP-flush detour); UnaFS `grants:*` on `SYS_OPEN`.
 - **Commit:** `538a1bf` (`hw-rmbp`, Opus-executed).
 
 ---

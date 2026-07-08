@@ -1575,28 +1575,40 @@ fn sys_write_file(row: usize, file_id: u64, buf: u64, len: u64) -> i64 {
         return EIO;
     };
     let size = FILE_SIZE[row][idx].load(Ordering::Acquire);
-    let offset = FILE_OFFSET[row][idx].load(Ordering::Acquire);
-    // In-place only: clamp the write to the bytes left from `offset` to EOF. `offset <= size` always (reads/
-    // writes clamp; seek rejects past size), so `size - offset` cannot underflow; a write at/after EOF is 0
-    // bytes (never grows the file). `want == 0` is a clean no-op that moves no offset.
-    let want = core::cmp::min(len as usize, size.saturating_sub(offset) as usize);
-    if want == 0 {
-        return 0;
-    }
-    // Validate the WHOLE source range up front — inside the user window, READABLE (the code page is RX, so a
-    // source there, e.g. the fixture's RO pattern constant, is legal; only WRITE destinations must exclude the
-    // code page). A bad buffer is -EFAULT with no copy and no offset move; overflow is rejected.
     let window = USER_WINDOW_PAGES * PAGE_SIZE;
-    let end = buf.wrapping_add(want as u64);
-    if end < buf || buf < USER_BASE || end > USER_BASE + window {
-        return EFAULT;
-    }
+    // U9x M2 (folding the M1 review's offset-CAS note): claim the write range with a tx-exact
+    // `compare_exchange`, EXACTLY as `sys_read` claims its read range — so the write offset advance is
+    // CAS-symmetric with the read path (closing the M1 load/store asymmetry before any shared writable
+    // descriptor exists). In-place only: `want` clamps to the bytes left from `offset` to EOF (`offset <= size`
+    // always — reads/writes clamp, seek rejects past size — so `size - offset` never underflows; a write
+    // at/after EOF is 0 bytes, never grows). The WHOLE source range is validated BEFORE the claim (inside the
+    // user window, readable — the code page is RX, so the fixture's RO pattern constant is a legal source; a
+    // bad buffer is -EFAULT with NO claim, no copy, no offset move). Single-writer per private slot (one
+    // IF-masked syscall at a time), so the CAS never retries here — the symmetry is the point.
+    let (offset, want) = loop {
+        let offset = FILE_OFFSET[row][idx].load(Ordering::Acquire);
+        let want = core::cmp::min(len as usize, size.saturating_sub(offset) as usize);
+        if want == 0 {
+            return 0; // at/after EOF (never grows) or nothing requested — a clean no-op, no offset move
+        }
+        let end = buf.wrapping_add(want as u64);
+        if end < buf || buf < USER_BASE || end > USER_BASE + window {
+            return EFAULT;
+        }
+        if FILE_OFFSET[row][idx]
+            .compare_exchange(offset, offset + want as u32, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            break (offset, want); // [offset, offset+want) is now exclusively ours
+        }
+    };
     // Pure memcpy: user bytes -> the writable staging buffer at [offset, offset+want). The ring-3 VA equals the
     // kernel VA in the live CR3 (the sys_write/sys_read discipline), and offset+want <= size <= the buffer
     // length (WSTAGE is seeded to `size` at open), so the store stays inside the descriptor's own buffer.
     wstage_write_at(widx, offset as usize, buf, want);
-    // want <= size - offset, so offset + want <= size — the FILE_OFFSET <= FILE_SIZE invariant holds.
-    FILE_OFFSET[row][idx].store(offset + want as u32, Ordering::Release);
+    // U9x M2: mark the descriptor dirty + cover [offset, offset+want) so the task's TEARDOWN flushes exactly
+    // the touched bytes to disk (a REVOKE discards them instead — see `files_free`).
+    mark_dirty(row, idx, offset, offset + want as u32);
     want as i64
 }
 
@@ -2421,10 +2433,12 @@ fn stage_hello() -> bool {
 // Arbitrary-runtime-file open awaits an interrupt-driven / IF-safe storage path (deferred).
 
 /// U9x: the DEDICATED writable scratch file the File-WRITE fixture opens + overwrites (NEVER `HELLO.BIN`,
-/// which other fixtures load as EL0 code). M1 stages it PURELY IN-MEMORY — a const seed, always present
-/// regardless of disk (the honest self-contained core: no disk write-back). M2 replaces this in-memory seed
-/// with a BSP-staged, disk-backed buffer + a flush pump. 11 chars (<= `MAX_NAME`); the fixture's namelen
-/// matches. The aarch64 twin's `U9_SCRATCH_NAME`.
+/// which other fixtures load as EL0 code). The wstage seed is ALWAYS the in-memory const (below) — present
+/// regardless of disk, so the in-memory core is self-contained. M2 KEEPS that seed (it equals the on-disk
+/// plant byte-for-byte) and additionally, when a FAT volume is present, CAPTURES this file's on-disk chain head
+/// (the launcher pre-flight -> `SCRATCH_CLUSTER`) so a dirty write is flushed to disk at teardown; the launcher
+/// then raw-re-reads the sector. 11 chars (<= `MAX_NAME`); the fixture's namelen matches. The aarch64 twin's
+/// `U9_SCRATCH_NAME`.
 const U9X_SCRATCH_NAME: &str = "SCRATCH.BIN";
 /// U9x: the in-memory scratch file's byte size (the EOF bound writes/seeks clamp against). 1024 bytes, so the
 /// fixture's write offset (520) lands 8 bytes into the SECOND 512-byte sector — a partial-sector overwrite
@@ -2438,6 +2452,13 @@ const U9X_SCRATCH_FILL: u8 = 0xEE;
 /// open COPIES this into a per-descriptor writable staging buffer (writes land there, in place); an RO open
 /// serves it directly. Const-initialized, so it is always "staged" in M1 with no disk dependency.
 static U9X_SCRATCH_SEED: [u8; U9X_SCRATCH_SIZE] = [U9X_SCRATCH_FILL; U9X_SCRATCH_SIZE];
+/// U9x M2: SCRATCH.BIN's on-disk FAT chain head, captured by the launcher's pre-flight (a fresh `mount` +
+/// `find_in_root`, IF=1 on the demo AP) and published (Release) BEFORE the fixture is spawned, so a RW
+/// `sys_open` can record it into the descriptor's `FILE_CLUSTER` (Acquire) — the flush target. `0` == NO disk
+/// backing (no FAT volume, or SCRATCH.BIN absent / the wrong size): the fixture then runs the M1 IN-MEMORY
+/// core (const seed above) and the flush is a no-op. x86 can't walk the FAT inside the IF-masked handler, so
+/// the launcher pre-captures the chain head at IF=1 (the x86 stand-in for pi4 capturing FILE_CLUSTER at open).
+static SCRATCH_CLUSTER: AtomicU32 = AtomicU32::new(0);
 
 /// The staged-file NAME table: index k names the source `staged_bytes(k)` serves. Index 0 = HELLO.BIN (the
 /// buffer `stage_hello` fills for sys_spawn; shared, written once, then read-only). Index 1 = SCRATCH.BIN
@@ -2473,6 +2494,18 @@ fn staged_lookup(name: &str) -> Option<(u32, u32)> {
         }
     }
     None
+}
+
+/// U9x M2: the on-disk FAT chain head for a staged file — the flush target a RW `sys_open` records into its
+/// descriptor's `FILE_CLUSTER`. Only SCRATCH.BIN (index 1) is ever opened writable and flushed; its cluster is
+/// captured by the launcher pre-flight into `SCRATCH_CLUSTER`. HELLO.BIN (index 0) is read-only EL0 code — never
+/// written, so it has no flush target (`0`). `0` also means "no disk backing" (no FAT / not yet captured), which
+/// drops a write to the M1 in-memory path (no flush). A future writable staged file adds its own arm here.
+fn staged_cluster(idx: u32) -> u32 {
+    match idx {
+        1 => SCRATCH_CLUSTER.load(Ordering::Acquire),
+        _ => 0,
+    }
 }
 
 // --- Per-task open-file descriptors: parallel atomic sidecars keyed `[row][idx]` exactly like
@@ -2511,6 +2544,137 @@ static FILE_OFFSET: [[AtomicU32; NFILE]; crate::arch::memory::USER_SLOTS + 1] =
 /// the BSP flush pump that persists it to FAT. Meaningful only where `FILE_USED`.
 static FILE_WSTAGE: [[AtomicU32; NFILE]; crate::arch::memory::USER_SLOTS + 1] =
     [const { [const { AtomicU32::new(0) }; NFILE] }; crate::arch::memory::USER_SLOTS + 1];
+/// U9x M2: the open file's on-disk FAT chain head (the flush target for a dirty RW descriptor), captured at
+/// `sys_open` from `staged_cluster(sidx)`. `0` == no disk backing (in-memory mode / no FAT) — a dirty write
+/// on a `0`-cluster descriptor is never flushed. The x86 twin of pi4's `FILE_CLUSTER`. Meaningful where `FILE_USED`.
+static FILE_CLUSTER: [[AtomicU32; NFILE]; crate::arch::memory::USER_SLOTS + 1] =
+    [const { [const { AtomicU32::new(0) }; NFILE] }; crate::arch::memory::USER_SLOTS + 1];
+/// U9x M2: the descriptor's DIRTY flag — set by `sys_write_file` when a File write lands in the writable
+/// staging buffer. A dirty descriptor's bytes are flushed to disk at whole-task TEARDOWN (`clear_files_row`
+/// enqueues them for the launcher's IF=1 flush pump); a REVOKE / open-unwind (`files_free`) DISCARDS them
+/// (revoke repudiates the write — the brief's revoke ordering). Meaningful where `FILE_USED`.
+static FILE_DIRTY: [[AtomicBool; NFILE]; crate::arch::memory::USER_SLOTS + 1] =
+    [const { [const { AtomicBool::new(false) }; NFILE] }; crate::arch::memory::USER_SLOTS + 1];
+/// U9x M2: the dirty byte range [LO, HI) covering every byte the descriptor's writes touched — the exact span
+/// the flush persists. `fat::write_at` read-modify-writes precisely the SECTORS this span overlaps; for the
+/// demo's single contiguous write that is exactly one sector (ALL it dirtied, NONE it didn't). NOTE: two
+/// DISJOINT writes widen [LO,HI) to their union, so the flush also RMWs any clean sector BETWEEN them — safe
+/// here only because untouched staging bytes equal the on-disk content (the seed == the SCRATCH.BIN plant,
+/// byte-for-byte); a future writable file whose staged image diverges from disk would need per-run tracking.
+/// Set FRESH on the first write (NOT min/max'd against the 0 init — else the first write's range would start
+/// at offset 0 and RMW an un-dirtied sector); widened on later writes. Meaningful where `FILE_USED && FILE_DIRTY`.
+static FILE_DIRTY_LO: [[AtomicU32; NFILE]; crate::arch::memory::USER_SLOTS + 1] =
+    [const { [const { AtomicU32::new(0) }; NFILE] }; crate::arch::memory::USER_SLOTS + 1];
+static FILE_DIRTY_HI: [[AtomicU32; NFILE]; crate::arch::memory::USER_SLOTS + 1] =
+    [const { [const { AtomicU32::new(0) }; NFILE] }; crate::arch::memory::USER_SLOTS + 1];
+
+/// U9x M2: mark descriptor `[row][idx]` dirty and cover [lo, hi) in its dirty range. On the FIRST write
+/// (`FILE_DIRTY` false->true) SET [LO,HI) fresh to exactly [lo,hi); on later writes WIDEN by min/max — so the
+/// first write never starts the flushed span at offset 0 (which would RMW an un-dirtied sector). Single-writer
+/// per descriptor: a writable buffer is written by exactly ONE task mid IF-masked syscall (a shared writable
+/// open is refused at `sys_open`), so the swap + load/store is race-free without a lock.
+fn mark_dirty(row: usize, idx: usize, lo: u32, hi: u32) {
+    if FILE_DIRTY[row][idx].swap(true, Ordering::AcqRel) {
+        // Already dirty — widen the covered range to the union with the prior [LO,HI).
+        let cur_lo = FILE_DIRTY_LO[row][idx].load(Ordering::Acquire);
+        let cur_hi = FILE_DIRTY_HI[row][idx].load(Ordering::Acquire);
+        FILE_DIRTY_LO[row][idx].store(cur_lo.min(lo), Ordering::Release);
+        FILE_DIRTY_HI[row][idx].store(cur_hi.max(hi), Ordering::Release);
+    } else {
+        // First write — SET the range exactly (never min/max against the 0 init).
+        FILE_DIRTY_LO[row][idx].store(lo, Ordering::Release);
+        FILE_DIRTY_HI[row][idx].store(hi, Ordering::Release);
+    }
+}
+
+// --- U9x M2 flush queue: dirty writable buffers awaiting persistence to disk. THE crux resolution — a File
+// write lands in an in-memory wstage buffer INSIDE the IF-masked SYSCALL handler (no disk I/O there), and
+// that buffer is FREED at the owning task's teardown (`clear_files_row`, IF=0) — but the flush needs IF=1
+// disk I/O. So teardown COPIES each dirty descriptor's bytes + its (cluster, size, [lo,hi)) into this static
+// queue (surviving the teardown), and the demo launcher DRAINS it at IF=1 (the shell-proven
+// `fat::write_at`->`block::write_block` path) and frees each entry. A COPY (not the wstage slot itself) makes
+// every entry self-contained — a stranded entry can never point at a freed buffer. A REVOKE never enqueues
+// (`files_free` discards dirty), so a revoked write is never flushed. Bounded by `NWSTAGE` (at most one dirty
+// entry per writable buffer, and the demo opens one). Populated at IF=0 on the fixture's CPU; drained by the
+// launcher only AFTER it observes full teardown (`wstage_all_free()` — the Acquire edge that makes the
+// enqueue's stores visible, since teardown enqueues strictly BEFORE it frees the wstage slot). ---
+const NFLUSH: usize = NWSTAGE;
+/// Per-entry presence: `true` == a dirty flush is pending. Claimed (CAS false->true) in `flush_enqueue`,
+/// cleared LAST (Release) in `flush_drain_one` after the write-back.
+static FLUSH_USED: [AtomicBool; NFLUSH] = [const { AtomicBool::new(false) }; NFLUSH];
+/// The flush target: the file's FAT chain head, its total size (the EOF bound `write_at` clamps against), and
+/// the dirty byte range [START, START+LEN). Meaningful only where `FLUSH_USED`.
+static FLUSH_CLUSTER: [AtomicU32; NFLUSH] = [const { AtomicU32::new(0) }; NFLUSH];
+static FLUSH_SIZE: [AtomicU32; NFLUSH] = [const { AtomicU32::new(0) }; NFLUSH];
+static FLUSH_START: [AtomicU32; NFLUSH] = [const { AtomicU32::new(0) }; NFLUSH];
+static FLUSH_LEN: [AtomicU32; NFLUSH] = [const { AtomicU32::new(0) }; NFLUSH];
+/// Sticky: set if a `flush_enqueue` was ever DROPPED because the queue was full (impossible in the demo —
+/// `NFLUSH == NWSTAGE` bounds concurrent dirty buffers — but a silent drop would mean a lost acknowledged
+/// write, so the launcher verdict reads this and FAILs loudly rather than treating it as a clean flush).
+static FLUSH_OVERFLOW: AtomicBool = AtomicBool::new(false);
+/// The dirty bytes themselves — a copy of `wstage[start..start+len]`, taken at teardown BEFORE the wstage slot
+/// is freed. One page each (the staged size bound). Row-major like `WSTAGE_BUF`.
+static mut FLUSH_BUF: [[u8; PAGE_SIZE as usize]; NFLUSH] = [[0; PAGE_SIZE as usize]; NFLUSH];
+
+/// Copy a dirty descriptor's staged bytes into a free flush-queue entry, capturing the flush target (cluster,
+/// size, [start, start+len)). Called from `clear_files_row` at teardown BEFORE the wstage slot is freed — `src`
+/// is `wstage_bytes(widx)[start..]`, still live here; `src.len()` is the dirty span (<= PAGE_SIZE, the buffer
+/// bound). Fields written first, `FLUSH_LEN` published LAST (Release) so a scanning drainer that sees the slot
+/// used also sees its fields. On a full queue: set the sticky `FLUSH_OVERFLOW`, log, return false (never a
+/// silent drop).
+fn flush_enqueue(cluster: u32, size: u32, start: u32, src: &[u8]) -> bool {
+    let len = src.len();
+    debug_assert!(len <= PAGE_SIZE as usize, "flush_enqueue: dirty span exceeds a page");
+    for k in 0..NFLUSH {
+        if FLUSH_USED[k].compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire).is_ok() {
+            unsafe {
+                let dst = (&raw mut FLUSH_BUF).cast::<u8>().add(k * PAGE_SIZE as usize);
+                core::ptr::copy_nonoverlapping(src.as_ptr(), dst, len);
+            }
+            FLUSH_CLUSTER[k].store(cluster, Ordering::Relaxed);
+            FLUSH_SIZE[k].store(size, Ordering::Relaxed);
+            FLUSH_START[k].store(start, Ordering::Relaxed);
+            FLUSH_LEN[k].store(len as u32, Ordering::Release); // publish LAST
+            return true;
+        }
+    }
+    FLUSH_OVERFLOW.store(true, Ordering::Release);
+    serial_println!(
+        ":: U9x: FLUSH QUEUE FULL — dropped a dirty write-back (cluster={} {} bytes @ {}) ::",
+        cluster, len, start
+    );
+    false
+}
+
+/// Drain ONE pending flush entry to disk via `fat::write_at` (in place — never grows/allocs/writes-FAT/touches
+/// a directory), then free the entry. Returns `Some(true)` on a full write-back, `Some(false)` on an I/O/short
+/// write (entry still freed — a demo flush failure FAILs the verdict, it never strands the queue or retries),
+/// `None` if no entry is pending. Called ONLY from the launcher at IF=1 (the shell-proven disk-write context).
+fn flush_drain_one(fs: &crate::fs::fat::FatFs) -> Option<bool> {
+    for k in 0..NFLUSH {
+        if FLUSH_USED[k].load(Ordering::Acquire) {
+            let cluster = FLUSH_CLUSTER[k].load(Ordering::Acquire);
+            let size = FLUSH_SIZE[k].load(Ordering::Acquire);
+            let start = FLUSH_START[k].load(Ordering::Acquire);
+            let len = FLUSH_LEN[k].load(Ordering::Acquire) as usize;
+            let bytes = unsafe {
+                let base = (&raw const FLUSH_BUF).cast::<u8>().add(k * PAGE_SIZE as usize);
+                core::slice::from_raw_parts(base, len)
+            };
+            let ok = fs.write_at(cluster, size, start, bytes).map(|w| w == len).unwrap_or(false);
+            FLUSH_LEN[k].store(0, Ordering::Relaxed);
+            FLUSH_USED[k].store(false, Ordering::Release); // free LAST
+            return Some(ok);
+        }
+    }
+    None
+}
+
+/// True iff the flush queue holds no pending entry — the launcher's post-drain leak check (no dirty write-back
+/// stranded).
+fn flush_all_free() -> bool {
+    (0..NFLUSH).all(|k| !FLUSH_USED[k].load(Ordering::Acquire))
+}
 
 // --- U9x writable staging pool: the write twin of the read-only staged set. A small fixed pool of
 // per-descriptor writable buffers. A File opened RW (SYS_OPEN mode bit0) claims a slot SEEDED from the
@@ -2606,8 +2770,10 @@ fn wstage_all_free() -> bool {
 /// for a RW open (`0` for a RO open). Publishes staged-idx/size/offset/wstage after the `FILE_USED` CAS
 /// claim — safe because a resolver only reaches a descriptor via a File HANDLE, which `sys_open` installs
 /// strictly AFTER this returns (stored Release regardless, belt-and-braces — the pi4 `files_alloc`
-/// discipline). `None` if the row is full (-> `-EMFILE`; never grown).
-fn files_alloc(row: usize, staged_idx: u32, size: u32, wstage: u32) -> Option<usize> {
+/// discipline). `None` if the row is full (-> `-EMFILE`; never grown). U9x M2: `cluster` is the file's on-disk
+/// FAT chain head (the flush target; `0` == no disk backing), and the descriptor starts CLEAN (`FILE_DIRTY`
+/// false) with an empty dirty range.
+fn files_alloc(row: usize, staged_idx: u32, size: u32, wstage: u32, cluster: u32) -> Option<usize> {
     debug_assert!(row < FILE_USED.len(), "files_alloc: row out of range");
     for k in 0..NFILE {
         if FILE_USED[row][k].compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire).is_ok()
@@ -2616,6 +2782,10 @@ fn files_alloc(row: usize, staged_idx: u32, size: u32, wstage: u32) -> Option<us
             FILE_SIZE[row][k].store(size, Ordering::Release);
             FILE_OFFSET[row][k].store(0, Ordering::Release);
             FILE_WSTAGE[row][k].store(wstage, Ordering::Release);
+            FILE_CLUSTER[row][k].store(cluster, Ordering::Release);
+            FILE_DIRTY[row][k].store(false, Ordering::Release);
+            FILE_DIRTY_LO[row][k].store(0, Ordering::Release);
+            FILE_DIRTY_HI[row][k].store(0, Ordering::Release);
             return Some(k);
         }
     }
@@ -2629,10 +2799,17 @@ fn files_alloc(row: usize, staged_idx: u32, size: u32, wstage: u32) -> Option<us
 /// is freed too (no writable buffer outlives its descriptor — pi4's backing is the disk; x86's is the pool).
 fn files_free(row: usize, idx: usize) {
     debug_assert!(row < FILE_USED.len() && idx < NFILE, "files_free: out of range");
+    // U9x M2: a REVOKE (or a sys_open unwind) DISCARDS any dirty bytes — it frees the writable buffer WITHOUT
+    // enqueuing a flush, so a revoked File-write cap never persists stale bytes (the brief's revoke ordering:
+    // revoke drops the dirty flag). Only a whole-task TEARDOWN (`clear_files_row`) enqueues dirty bytes.
     if let Some(widx) = (FILE_WSTAGE[row][idx].load(Ordering::Acquire) as usize).checked_sub(1) {
         wstage_free(widx);
     }
     FILE_WSTAGE[row][idx].store(0, Ordering::Release);
+    FILE_CLUSTER[row][idx].store(0, Ordering::Release);
+    FILE_DIRTY[row][idx].store(false, Ordering::Release);
+    FILE_DIRTY_LO[row][idx].store(0, Ordering::Release);
+    FILE_DIRTY_HI[row][idx].store(0, Ordering::Release);
     FILE_STAGED[row][idx].store(0, Ordering::Release);
     FILE_SIZE[row][idx].store(0, Ordering::Release);
     FILE_OFFSET[row][idx].store(0, Ordering::Release);
@@ -2646,10 +2823,34 @@ fn files_free(row: usize, idx: usize) {
 fn clear_files_row(slot: usize) {
     debug_assert!(slot < crate::arch::memory::USER_SLOTS, "clear_files_row: not a private slot");
     for k in 0..NFILE {
+        // U9x M2: a DIRTY, disk-backed writable descriptor persists at teardown — COPY its dirty bytes +
+        // (cluster, size, [lo,hi)) into the flush queue BEFORE freeing the wstage slot (the entry is a COPY, so
+        // it survives the free and can never point at a freed buffer). The launcher drains it to disk at IF=1.
+        // This is the whole-task teardown path (normal exit AND the fault-kill path, via `clear_handle_row`),
+        // so a write acknowledged to ring 3 is persisted, not lost — and never stranded. A clean descriptor, or
+        // one with no disk backing (`cluster == 0`: in-memory mode / no FAT), just frees. Enqueue BEFORE
+        // `wstage_free`: the launcher drains only after observing `wstage_all_free()` (the Acquire edge pairing
+        // with this `wstage_free`'s Release), so it always sees a fully-populated queue entry.
         if let Some(widx) = (FILE_WSTAGE[slot][k].load(Ordering::Acquire) as usize).checked_sub(1) {
+            if FILE_DIRTY[slot][k].load(Ordering::Acquire) {
+                let cluster = FILE_CLUSTER[slot][k].load(Ordering::Acquire);
+                if cluster != 0 {
+                    let size = FILE_SIZE[slot][k].load(Ordering::Acquire);
+                    let lo = FILE_DIRTY_LO[slot][k].load(Ordering::Acquire);
+                    let hi = FILE_DIRTY_HI[slot][k].load(Ordering::Acquire);
+                    let all = wstage_bytes(widx);
+                    if lo < hi && (hi as usize) <= all.len() {
+                        flush_enqueue(cluster, size, lo, &all[lo as usize..hi as usize]);
+                    }
+                }
+            }
             wstage_free(widx);
         }
         FILE_WSTAGE[slot][k].store(0, Ordering::Release);
+        FILE_CLUSTER[slot][k].store(0, Ordering::Release);
+        FILE_DIRTY[slot][k].store(false, Ordering::Release);
+        FILE_DIRTY_LO[slot][k].store(0, Ordering::Release);
+        FILE_DIRTY_HI[slot][k].store(0, Ordering::Release);
         FILE_STAGED[slot][k].store(0, Ordering::Release);
         FILE_SIZE[slot][k].store(0, Ordering::Release);
         FILE_OFFSET[slot][k].store(0, Ordering::Release);
@@ -2706,6 +2907,16 @@ fn sys_open(name_ptr: u64, name_len: u64, mode: u64) -> i64 {
     //    content, so a read before any write sees the original bytes), then a descriptor, then a handle. RO
     //    (bit0 clear) keeps the U6bx read-only path: no writable slot, `CAP_READ` only.
     let rw = mode & 1 != 0;
+    // U9x M2 (folding the M1 review's SHARED_ROW writable-open note): a writable open needs a PRIVATE
+    // single-writer descriptor row — its wstage buffer is written by exactly one task mid IF-masked syscall,
+    // with no lock. SHARED_ROW is the multi-tenant kernel window (U1a/U1b/U2 run there with `user_cr3 == 0`, so
+    // `caller_row()` falls back to it), where two tasks could race one writable descriptor + the unsynchronized
+    // staging memcpy. Refuse it (mirroring SHARED_ROW's refusal as a transfer endpoint). Not reachable from the
+    // demo (the fixture runs in a private slot; SHARED_ROW fixtures open no files) — defensive, like the
+    // `FILE_WSTAGE == 0` EIO guard in `sys_write_file`.
+    if rw && row == SHARED_ROW {
+        return EACCES;
+    }
     let wstage = if rw {
         // The staged content is the seed. staged_lookup already proved it Some, so this is Some too.
         let Some(seed) = staged_bytes(sidx) else {
@@ -2718,7 +2929,11 @@ fn sys_open(name_ptr: u64, name_len: u64, mode: u64) -> i64 {
     } else {
         0
     };
-    let Some(fid) = files_alloc(row, sidx, size, wstage) else {
+    // U9x M2: the flush target — the file's on-disk chain head (SCRATCH.BIN's, captured by the launcher
+    // pre-flight; `0` for HELLO.BIN or when no FAT backs it). A dirty write on a `0`-cluster descriptor is
+    // never flushed (in-memory mode). Recorded for every open (harmless on RO / never-flushed descriptors).
+    let cluster = staged_cluster(sidx);
+    let Some(fid) = files_alloc(row, sidx, size, wstage, cluster) else {
         if let Some(w) = (wstage as usize).checked_sub(1) {
             wstage_free(w); // FILES row full — release the writable slot we just claimed (no leak)
         }
@@ -4363,6 +4578,15 @@ const U9X_SOCK_IDX: usize = 2;
 /// kernel-side revoked-cap-write denial held. Must match the `add r12, {1,2,4,8,16}` steps in
 /// `unaos_user_u9x_write`.
 const U9X_WITNESS_ALL: u32 = 0x1F;
+/// U9x M2: the byte offset the fixture seeks to and overwrites (the `mov rsi, 520` in `unaos_user_u9x_write`
+/// MUST match). 520 lands 8 bytes into the SECOND 512-byte sector — a PARTIAL-sector overwrite, so the flush's
+/// read-modify-write must preserve the sector's other bytes (the interesting on-disk case M2 proves). The
+/// aarch64 twin's `U9_WRITE_OFFSET`.
+const U9X_WRITE_OFFSET: u32 = 520;
+/// U9x M2: the 16-byte pattern the fixture writes (the `.ascii "U9x-WRITE-OK-123"` in the blob MUST match).
+/// The launcher's raw re-read of the flushed sector must find exactly these bytes at `U9X_WRITE_OFFSET`. The
+/// aarch64 twin's `U9_PATTERN`.
+const U9X_PATTERN: [u8; 16] = *b"U9x-WRITE-OK-123";
 /// The U9x fixture's final witness bitmask (its `sys_exit` status, routed by name — the u5x/u6bx/u8x idiom).
 static U9X_WITNESS: AtomicU32 = AtomicU32::new(0);
 /// The U9x fixture (`u9x-write`) reached its witness exit (want 1). Read by `u9x_launcher`'s bounded wait.
@@ -4977,7 +5201,8 @@ pub fn u6bx_launcher(demo_cpu: usize) {
     //     the prior teardown of this slot); if it somehow did, leave the index Empty — the fixture's read
     //     still gets -EACCES (via NoHandle) and nothing leaks (the row rides teardown either way).
     let staged_sz = HELLO_LEN.load(Ordering::Acquire) as u32;
-    if let Some(fid) = files_alloc(u6b.slot, 0, staged_sz, 0) {
+    if let Some(fid) = files_alloc(u6b.slot, 0, staged_sz, 0, 0) {
+        // cluster 0: HELLO.BIN is read-only (no writable staging, never dirtied) — no flush target (U9x M2).
         install_cap(u6b.slot, U6BX_NOCAP_IDX, KIND_FILE, (fid + 1) as u64, 0);
     }
     // 3b. The kind negative: a Socket handle carrying CAP_READ — it HAS the right, so the read is denied
@@ -5515,31 +5740,66 @@ fn u9x_build() -> Option<U7xFix> {
     })
 }
 
-/// The U9x kernel-side revocation check — the "a U8x-revoked File cap write is `-EACCES`" denial, staged over a
-/// scratch row (5 — every demo fixture has exited and torn down by the time this runs, and `u8_kernel_check`
-/// dropped its own plants, so the row is provably clear). `sys_write`'s File gate is `handle_resolve(row, fd,
-/// CAP_WRITE)`, so proving that resolve is `Err` after the ancestor is revoked IS proving the write returns
-/// `-EACCES`. Backs a REAL writable File descriptor (a wstage-seeded open, exactly what a RW `SYS_OPEN` mints)
-/// so the pre-revoke cap would genuinely write; the post-revoke denial then provably comes from the derivation
-/// walk. Drops everything planted and demands the handle / file / writable-pool / derivation ledgers all clear
-/// (no node/descriptor/buffer leaked). The aarch64 `u9_check_revoked_write` twin (minus the disk re-read — M1
-/// has no disk write-back).
+/// The U9x kernel-side revocation + revoke-DISCARD check — staged over a scratch row (5 — every demo fixture
+/// has exited and torn down by the time this runs, and `u8_kernel_check` dropped its plants, so the row is
+/// provably clear). Proves TWO things:
+///   (1) a U8x-revoked File-write cap is `-EACCES` — `sys_write`'s File gate is `handle_resolve(row, fd,
+///       CAP_WRITE)`, so an `Err` resolve after the ancestor is revoked IS the write denial (the derivation walk);
+///   (2) M2's revoke ordering — a REVOKE of a DIRTY File cap DISCARDS the staged write (never persists stale
+///       bytes). The negative alone ("the flush queue is empty after the revoke") would be VACUOUS: the queue is
+///       empty after ANY revoke, since only TEARDOWN (`clear_files_row`) enqueues. So a POSITIVE control first
+///       proves that a dirty descriptor run through `clear_files_row` DOES register a pending flush; the
+///       contrast (teardown persists, revoke discards) is the real proof.
+/// Backs REAL writable descriptors (wstage-seeded, exactly what a RW `SYS_OPEN` mints). Drops everything planted
+/// and demands the handle / file / writable-pool / derivation / flush ledgers all clear (no leak). The aarch64
+/// `u9_check_revoked_write` twin, plus the x86-specific flush-queue discard proof (pi4 writes in-handler, no queue).
 fn u9x_check_revoked_write() -> bool {
     const A: usize = 5; // scratch row (provably clear here — the fixture uses a freshly-alloc'd slot; u8_kernel_check dropped its plants)
     let mut ok = true;
+    ok &= flush_all_free(); // a clean starting queue (the launcher already drained the fixture's flush, if any)
     // Back a REAL writable File descriptor: seed a writable staging slot from SCRATCH.BIN's staged content
     // (what a RW `SYS_OPEN` does), so the ROOT cap names a genuine open file a write through WOULD land in.
     let Some(seed) = staged_bytes(1) else {
         return false; // SCRATCH.BIN not staged — cannot stage a writable descriptor (an M1 kernel bug)
     };
+    let dirty_lo = U9X_WRITE_OFFSET;
+    let dirty_hi = U9X_WRITE_OFFSET + U9X_PATTERN.len() as u32;
+    let scratch_cluster = SCRATCH_CLUSTER.load(Ordering::Acquire);
+
+    // --- POSITIVE control (disk-backed mode only): a DIRTY descriptor run through the whole-task TEARDOWN
+    //     (`clear_files_row`) DOES enqueue a flush — so the negative below discriminates instead of being
+    //     vacuous. Uses SCRATCH.BIN's REAL chain head (harmless even if some path drained the probe — it would
+    //     re-write the seed bytes it copied); we RESET the queue WITHOUT a disk write (drop the entry, no `write_at`).
+    if scratch_cluster != 0 {
+        let Some(w) = wstage_alloc(seed) else {
+            return false;
+        };
+        let Some(fid) = files_alloc(A, 1, seed.len() as u32, (w + 1) as u32, scratch_cluster) else {
+            wstage_free(w);
+            return false;
+        };
+        mark_dirty(A, fid, dirty_lo, dirty_hi);
+        clear_files_row(A); // the whole-task teardown path — enqueues the dirty descriptor + frees its wstage
+        ok &= !flush_all_free(); // PROVES teardown registered a pending flush (so the negative below is meaningful)
+        // Reset the queue WITHOUT persisting (no write_at to the probe cluster): drop every entry. A leftover
+        // entry transitions the final `flush_all_free()` below to false -> a loud verdict FAIL, never a silent drain.
+        for k in 0..NFLUSH {
+            FLUSH_LEN[k].store(0, Ordering::Relaxed);
+            FLUSH_USED[k].store(false, Ordering::Release);
+        }
+        ok &= flush_all_free() && files_row_is_clear(A) && wstage_all_free();
+    }
+
+    // --- NEGATIVE: a REVOKE of a DIRTY File cap DISCARDS the write (no enqueue) AND the derived cap goes stale.
     let Some(w) = wstage_alloc(seed) else {
         return false;
     };
-    let Some(fid) = files_alloc(A, 1, seed.len() as u32, (w + 1) as u32) else {
+    let Some(fid) = files_alloc(A, 1, seed.len() as u32, (w + 1) as u32, scratch_cluster) else {
         wstage_free(w);
         return false;
     };
     let file_id = (fid + 1) as u64;
+    mark_dirty(A, fid, dirty_lo, dirty_hi); // dirty — the write the revoke must repudiate (never flush)
     // A ROOT File cap carrying CAP_WRITE|CAP_GRANT|CAP_REVOKE at index 2 (off index 0/CONSOLE_FD, the U8x idiom).
     install_cap(A, 2, KIND_FILE, file_id, CAP_WRITE | CAP_GRANT | CAP_REVOKE);
     // Pre-revoke: the root File+CAP_WRITE cap resolves — a `sys_write` through it WOULD pass the CHECK.
@@ -5552,8 +5812,11 @@ fn u9x_check_revoked_write() -> bool {
         ok &= matches!(handle_resolve(A, g as u64, CAP_WRITE), Ok(HandleTarget::File(_)));
     }
     // Revoke the ROOT (index 2 carries CAP_REVOKE) -> kills the derivation subtree; the revoke clears index 2
-    // AND — because it is a File handle — frees the shared descriptor + its writable staging slot.
+    // AND — because it is a File handle — frees the shared (DIRTY) descriptor + its writable staging slot via
+    // `files_free`, which DISCARDS the dirty bytes (no flush enqueued).
     ok &= sys_cap_revoke(A, 2) == 0;
+    // THE DISCARD PROOF: the revoke did NOT enqueue the dirty write — a revoked File-write cap never persists.
+    ok &= flush_all_free();
     // THE DENIAL: the derived File+CAP_WRITE cap is now stale — its next CAP_WRITE resolve (exactly the CHECK
     // `sys_write` performs) is `-EACCES`. This is the "a U8x-revoked File cap write -> -EACCES" proof.
     if g >= 0 {
@@ -5561,28 +5824,53 @@ fn u9x_check_revoked_write() -> bool {
     }
     // Drop everything planted; index 2 was already cleared by the revoke (freeing the descriptor + writable
     // slot), so clearing the derived handle drops the last node (the root's tombstone cascades free). Then
-    // demand every ledger clear — no handle / descriptor / writable-pool / derivation node leaked on any path.
+    // demand every ledger clear — no handle / descriptor / writable-pool / derivation node / flush entry leaked.
     if g >= 0 {
         handle_clear(A, g as usize);
     }
-    ok &= handle_row_is_clear(A) && files_row_is_clear(A) && wstage_all_free() && deriv_all_free();
+    ok &= handle_row_is_clear(A)
+        && files_row_is_clear(A)
+        && wstage_all_free()
+        && deriv_all_free()
+        && flush_all_free();
     ok
 }
 
-/// U9x launcher + verdict — chained off `u8x_launcher` in program order (see its note). Flow: one-shot guard;
-/// skip silently with no block device (the control-path discipline — U9x's M1 write path is purely in-memory
-/// and needs no disk, but the gate keeps the no-storage path free of demo lines, exactly as U8x does; QEMU
-/// provides USB mass-storage, so the gate opens); build + pre-endow the kind negative (index 2 = a `Socket`
-/// carrying `CAP_WRITE`) + spawn the single fixture (`u9x-write`); wait (bounded) for its witness exit; wait
-/// (bounded) for its teardown (FILES row + writable pool + handle row all clear); run the kernel-side
-/// revoked-cap-write denial. PASS iff witness == `U9X_WITNESS_ALL` AND torn down AND no kill AND the revoke
-/// check held. U9x is the last demo — it releases no further gate.
+/// U9x kernel-side helper: read 16 bytes at absolute file offset `off` from a FRESH mount, via the read-only
+/// offset-aware FAT reader (`read_at`, which WALKS the cluster chain — it never assumes the file's clusters are
+/// contiguous). The "raw re-read" the launcher uses to prove the flushed bytes landed on disk. `None` on any
+/// mount/read failure or a short read. Independent of any FILE_OFFSET sidecar (re-derives everything from a
+/// fresh mount). The aarch64 `u9_read16` twin.
+fn u9x_read16(fc: u32, size: u32, off: u32) -> Option<[u8; 16]> {
+    let fs = crate::fs::fat::mount().ok()?;
+    let mut v: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
+    fs.read_at(fc, size, off, &mut v, 16).ok()?;
+    if v.len() < 16 {
+        return None;
+    }
+    let mut out = [0u8; 16];
+    out.copy_from_slice(&v[..16]);
+    Some(out)
+}
+
+/// U9x launcher + verdict (M2 — real disk write-back) — chained off `u8x_launcher` in program order. Flow:
+/// one-shot; skip silently with no block device (the control-path discipline). PRE-FLIGHT (gated on
+/// `HELLO_STAGED`, the BSP's FAT-present signal) captures SCRATCH.BIN's chain head + size + the pre-image bytes
+/// at the write offset and publishes the cluster BEFORE the fixture opens; build + pre-endow the kind negative
+/// (index 2 = a `Socket` carrying `CAP_WRITE`) + spawn `u9x-write`; wait (bounded) for its witness exit and
+/// teardown (FILES row + writable pool + handle row clear — the teardown that ENQUEUES the dirty write). Then,
+/// disk-backed and only once teardown is observed, DRAIN the flush queue to disk (`fat::write_at`, in place) and
+/// RAW-RE-READ the sector to prove the bytes landed + size unchanged. Finally the kernel-side
+/// revoked-cap-write denial + revoke-discard proof. PASS iff witness == `U9X_WITNESS_ALL` AND torn down AND no
+/// kill AND the revoke check held AND (disk-backed) the on-disk write-back proof held.
 ///
-/// M1 scope note: the write path is a STAGED in-place overwrite of an in-memory per-descriptor buffer — a
-/// read-back through the SAME cap (fixture bit2) is the write witness. There is NO on-disk "sector changed"
-/// check here (that is M2's disk write-back + raw re-read), and it CANNOT be metal-confirmed on the rMBP (the
-/// xHCI storage-enumeration blocker means the block device is absent on metal, so this whole demo SKIPS there,
-/// exactly as U8x does) — QEMU-green is the ceiling.
+/// TWO MODES: disk-backed (a FAT volume backs SCRATCH.BIN — `test-fat sf`) requires the on-disk proof; in-memory
+/// (no FAT — plain `./arroyo test` attaches a non-FAT usb.img) runs the M1 core with the flush a no-op and does
+/// ZERO AP disk I/O (the pre-flight is skipped, bounding the no-FAT run). The write path CANNOT be
+/// metal-confirmed on the rMBP (the xHCI storage-enumeration blocker means the block device is absent on metal,
+/// so this whole demo SKIPS there, exactly as U8x does) — QEMU-green is the ceiling. NOTE: the disk-backed flush
+/// is the FIRST concurrent AP-side xHCI BOT I/O in the tree; the pump is BOUNDED (a 2000-iter timeout -> `Io`),
+/// so a failure is a LOUD verdict FAIL (`flushed=false`), never a hang — `test-fat sf` is its empirical proof.
 fn u9x_launcher(demo_cpu: usize) {
     // One-shot (reached once via the U8x chain; guard defensively anyway).
     static DONE: AtomicBool = AtomicBool::new(false);
@@ -5593,6 +5881,29 @@ fn u9x_launcher(demo_cpu: usize) {
     if crate::drivers::block::info().is_none() {
         return;
     }
+    // U9x M2: pre-flight SCRATCH.BIN's chain head + size + the pre-image bytes at the write offset from a FRESH
+    // mount at IF=1, and publish the cluster (Release) BEFORE spawning the fixture so its RW `sys_open` records
+    // it as the flush target. GATED on `HELLO_STAGED` — the BSP's "a FAT volume mounted" signal (set by
+    // `stage_hello` before this chain runs): no FAT -> false -> ZERO AP disk I/O, U9x runs its in-memory core.
+    // The pre-flight also VALIDATES SCRATCH.BIN (a regular file, non-zero chain head, size == U9X_SCRATCH_SIZE ==
+    // the staged/wstage length the flush drives `write_at` with); any mismatch drops to in-memory mode rather
+    // than flushing against an inconsistent size. Best-effort — never fail the demo for a missing on-disk file.
+    let (fc, pre_size, pre) = if HELLO_STAGED.load(Ordering::Acquire) {
+        match crate::fs::fat::mount().ok().and_then(|fs| fs.find_in_root(U9X_SCRATCH_NAME).ok()) {
+            Some(de)
+                if !de.is_dir && de.first_cluster() != 0 && de.size == U9X_SCRATCH_SIZE as u32 =>
+            {
+                let fc = de.first_cluster();
+                SCRATCH_CLUSTER.store(fc, Ordering::Release); // publish the flush target before the fixture opens
+                (fc, de.size, u9x_read16(fc, de.size, U9X_WRITE_OFFSET))
+            }
+            _ => (0, 0, None), // absent / a directory / the wrong size -> in-memory mode
+        }
+    } else {
+        (0, 0, None) // no FAT volume mounted (the BSP's stage_hello failed) -> in-memory mode, no AP disk I/O
+    };
+    let disk_backed = fc != 0;
+
     let Some(fix) = u9x_build() else {
         serial_println!(":: U9x: no free address-space slot — File-write demo skipped ::");
         return;
@@ -5602,7 +5913,7 @@ fn u9x_launcher(demo_cpu: usize) {
     // id, never dereferenced.
     install_cap(fix.slot, U9X_SOCK_IDX, KIND_SOCKET, 0x200, CAP_WRITE);
     serial_println!(
-        ":: U9x: real File writes — SYS_SEEK + File+CAP_WRITE routed through a staged in-place overwrite ::"
+        ":: U9x: real File writes — SYS_SEEK + File+CAP_WRITE, staged in-place then flushed to FAT (out of the IF-masked handler) ::"
     );
     crate::arch::sched::spawn_user_in_space("u9x-write", fix.entry, fix.sp, demo_cpu, fix.cr3);
 
@@ -5616,7 +5927,8 @@ fn u9x_launcher(demo_cpu: usize) {
 
     // Teardown proof: the fixture exited holding two live descriptors (its RW + RO opens; the RW one owns a
     // writable staging slot) and the pre-endowed Socket handle, so its exit cleared BOTH the FILES row (with
-    // its writable slot) and the handle row. Poll bounded; false->true.
+    // its writable slot) and the handle row. The RW descriptor was DIRTY, so its teardown also ENQUEUED a flush
+    // (drained below). Poll bounded; false->true.
     let tdeadline = crate::arch::ticks() + 2000;
     while !(files_row_is_clear(fix.slot) && handle_row_is_clear(fix.slot) && wstage_all_free())
         && crate::arch::ticks() < tdeadline
@@ -5625,22 +5937,64 @@ fn u9x_launcher(demo_cpu: usize) {
     }
     let cleared = files_row_is_clear(fix.slot) && handle_row_is_clear(fix.slot) && wstage_all_free();
 
-    // Kernel-side revoked-File-write denial (needs a clear scratch row — every fixture has torn down by here).
+    // U9x M2: FLUSH the staged write to disk + prove it LANDED — disk-backed mode, and ONLY once teardown is
+    // observed (`cleared` is the Acquire edge that makes the enqueue's stores visible; draining before it could
+    // race a late enqueue and strand it — so on a teardown timeout we do NOT drain, and the verdict FAILs on
+    // `cleared`). Drain every pending entry via `fat::write_at` (in place, never grows), then raw-re-read the
+    // sector: it must now equal the pattern, DIFFER from the pre-image (a real change), and the directory size
+    // must be UNCHANGED. A drain I/O timeout (the AP could not drive the xHCI BOT pump) fails `flushed` — bounded,
+    // never a hang. `flushed` also demands the queue drained empty and no entry was dropped on a full queue.
+    let (flushed, sector_changed, size_unchanged) = if disk_backed && cleared {
+        match crate::fs::fat::mount() {
+            Ok(fs) => {
+                let mut flushed = true;
+                while let Some(one) = flush_drain_one(&fs) {
+                    flushed &= one;
+                }
+                flushed &= flush_all_free() && !FLUSH_OVERFLOW.load(Ordering::Acquire);
+                let now = u9x_read16(fc, pre_size, U9X_WRITE_OFFSET);
+                let post_size = fs.find_in_root(U9X_SCRATCH_NAME).ok().map(|de| de.size);
+                let sector_changed = now == Some(U9X_PATTERN) && pre != Some(U9X_PATTERN);
+                let size_unchanged =
+                    post_size == Some(pre_size) && post_size == Some(U9X_SCRATCH_SIZE as u32);
+                (flushed, sector_changed, size_unchanged)
+            }
+            Err(_) => (false, false, false),
+        }
+    } else {
+        (false, false, false) // in-memory mode (flush a no-op) OR !cleared (the verdict fails on `cleared`)
+    };
+
+    // Kernel-side revoked-File-write denial + revoke-discard proof (needs a clear scratch row — every fixture
+    // has torn down by here, and the launcher's own flush drained above, so the flush queue starts clean).
     let revoke_ok = u9x_check_revoked_write();
 
-    if witness == U9X_WITNESS_ALL && cleared && killed == 0 && revoke_ok {
-        serial_println!(
-            ":: U9x: real File writes — open-RW+seek+write+readback OK, RO-write/wrong-kind/revoked-cap all -EACCES (staged in-place, no disk write-back this milestone) -> PASS ::"
-        );
+    // Verdict: the M1 CORE (witness + torn down + no kill + revoke check) in every mode; PLUS, in disk-backed
+    // mode, the on-disk write-back proof (flushed + sector changed + size unchanged). In-memory mode states so.
+    let core_ok = witness == U9X_WITNESS_ALL && cleared && killed == 0 && revoke_ok;
+    let pass = core_ok && (!disk_backed || (flushed && sector_changed && size_unchanged));
+    if pass {
+        if disk_backed {
+            serial_println!(
+                ":: U9x: real File writes — open-RW+seek+write+readback OK, RO-write/wrong-kind/revoked-cap all -EACCES, staged write FLUSHED to FAT (on-disk sector changed + size unchanged) -> PASS ::"
+            );
+        } else {
+            serial_println!(
+                ":: U9x: real File writes — open-RW+seek+write+readback OK, RO-write/wrong-kind/revoked-cap all -EACCES (in-memory core; no FAT volume, flush is a no-op) -> PASS ::"
+            );
+        }
     } else {
         serial_println!(
-            ":: U9x: real File writes FAIL — witness={:#x} cleared={} killed={} revoke={} done={} (want {:#x}/true/0/true/1) ::",
+            ":: U9x: real File writes FAIL — disk_backed={} witness={:#x} cleared={} killed={} revoke={} flushed={} sector_changed={} size_unchanged={} done={} (want disk_backed?ALL/true/0/true/true/true/true : ALL/true/0/true) ::",
+            disk_backed,
             witness,
             cleared,
             killed,
             revoke_ok,
+            flushed,
+            sector_changed,
+            size_unchanged,
             U9X_DONE.load(Ordering::Acquire),
-            U9X_WITNESS_ALL
         );
     }
 }
