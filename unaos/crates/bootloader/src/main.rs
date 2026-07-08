@@ -771,7 +771,7 @@ fn main() -> Status {
         if dtb_is_tegra234(dtb_addr, dtb_size) {
             jb8_falcon_witness("pre-EBS");
             #[cfg(feature = "jb8lever")]
-            jb8_reconnect_lever();
+            jb8_disconnect_lever();
             install_tegra_acpi_shim();
         }
     }
@@ -905,39 +905,38 @@ fn dtb_is_tegra234(dtb_addr: u64, dtb_size: usize) -> bool {
     tegra
 }
 
-/// JB8: pre-ExitBootServices Falcon witness. Reads the XUSB FPCI config header, self-locates BAR2
-/// from CFG_7 (never assumes the kernel's 0x365_0000 — the UEFI driver programmed the live value),
-/// then reads the Falcon CSB CPUCTL/BOOTVEC and the firmware-header codetag/codesize through the
-/// BAR2 ARU aperture — byte-for-byte the kernel's JB3 recipe (page-select @+0x9c, window @+0x2000;
-/// FW_SCRATCH ioctl @+0x1000, reply @+0x1c), which is the only CSB aperture proven safe on this
-/// block (the FPCI/CFG-path aperture is EL3-FATAL post-EBS — never resurrect it; pre-EBS we still
-/// stay on the proven path). Read-only apart from the CSB page-select and the FW_SCRATCH ioctl
-/// doorbell, both of which the NVIDIA driver itself uses at will. Runs only on a tegra234 DTB
-/// (caller-gated), where UEFI flat-maps the XUSB MMIO it actively drives.
+/// JB8: pre-ExitBootServices Falcon witness. Metal boots 2–3 showed UEFI never programs the FPCI
+/// CFG BARs at all (CFG_7 stays raw garbage while USB-reader boots demonstrably work) — the NVIDIA
+/// driver drives the block through the DT-fixed addresses (`FalconSetHostBase2Addr(0x3650000)`),
+/// not FPCI routing. So the CFG header is dumped for the record only, and the CSB read uses the
+/// same DT-fixed windows UEFI's own FalconLib uses — gated NOT on CFG_7 but on "a Usb2Hc handle
+/// exists" (= generic XhciDxe bound on top of the NVIDIA stack = XhciControllerDxe.Start ran = the
+/// block is powered and its MMIO live). CSB recipe is byte-for-byte the kernel's JB3 path
+/// (page-select @BAR2+0x9c, window @+0x2000; FW_SCRATCH ioctl @+0x1000, reply @+0x1c) — the only
+/// safe CSB aperture (the FPCI/CFG-path one is EL3-FATAL; never resurrect it).
 #[cfg(target_arch = "aarch64")]
 fn jb8_falcon_witness(tag: &str) {
-    const XUSB_FPCI: u64 = 0x0361_0000;
+    const XUSB_FPCI: u64 = 0x0361_0000; // FPCI CFG header (== DT xHC base; cap regs live here too)
+    const XUSB_BAR2: u64 = 0x0365_0000; // ARU/CSB window, DT-fixed (UEFI FalconLib's Base2Addr)
     let cfg = |off: u64| unsafe { core::ptr::read_volatile((XUSB_FPCI + off) as *const u32) };
     let cfg0 = cfg(0x0); // vendor/device id — liveness canary
     let cfg1 = cfg(0x4); // io/mem/busmaster enables
-    let cfg4 = cfg(0x10); // BAR0 — xHC MMIO
-    let cfg7 = cfg(0x1c); // BAR2 — routes the ARU/CSB window
-    // Field masks per edk2-nvidia (XUSB_CFG_4 addr = bits [31:15], XUSB_CFG_7 addr = bits [31:16]).
-    // An unprogrammed BAR reads low garbage (metal boot 1 read CFG_7=0x1ff) — a sloppier mask turned
-    // that into a near-zero "address" and the resulting read reset the board. Mask exactly, and only
-    // dereference when the masked base is nonzero AND memory-space decode is on.
-    let mem_en = cfg1 & 0b10 != 0;
-    let bar0 = (cfg4 & 0xffff_8000) as u64;
-    let bar2 = (cfg7 & 0xffff_0000) as u64;
+    let cfg4 = cfg(0x10); // BAR0 (UEFI leaves it unprogrammed; recorded, not trusted)
+    let cfg7 = cfg(0x1c); // BAR2 routing (same)
     log::info!(
         "JB8[{tag}]: FPCI CFG_0={cfg0:#010x} CFG_1={cfg1:#010x} (mem={} busmaster={}) CFG_4={cfg4:#010x} CFG_7={cfg7:#010x}",
-        mem_en as u32,
+        (cfg1 >> 1) & 1,
         (cfg1 >> 2) & 1
     );
-    if cfg0 == 0xffff_ffff || bar2 == 0 || !mem_en {
-        log::info!("JB8[{tag}]: BAR2 unrouted / mem-decode off — CSB witness skipped");
+    static USB2_HC_GUID: uefi::Guid = uefi::guid!("3e745226-9818-45b6-a2ac-d7cd0e8ba2bc");
+    let started = boot::locate_handle_buffer(boot::SearchType::ByProtocol(&USB2_HC_GUID))
+        .map(|h| !h.is_empty())
+        .unwrap_or(false);
+    if cfg0 == 0xffff_ffff || !started {
+        log::info!("JB8[{tag}]: no Usb2Hc handle (XhciControllerDxe not Started) — CSB witness skipped");
         return;
     }
+    let (bar0, bar2) = (XUSB_FPCI, XUSB_BAR2);
     let r = |off: u64| unsafe { core::ptr::read_volatile((bar2 + off) as *const u32) };
     let w = |off: u64, v: u32| unsafe { core::ptr::write_volatile((bar2 + off) as *mut u32, v) };
     let csb_r = |addr: u32| {
@@ -979,46 +978,46 @@ fn jb8_falcon_witness(tag: &str) {
 /// after the kernel + DTB are fully read into memory, so tearing down a USB boot volume's stack
 /// is safe. A witness re-read reports whether the reconnect left the core running.
 #[cfg(all(target_arch = "aarch64", feature = "jb8lever"))]
-fn jb8_reconnect_lever() {
+fn jb8_disconnect_lever() {
     // gEfiUsb2HcProtocolGuid — the handle XhciControllerDxe installs its host-controller I/O on.
     // It exists only after Start has run; on a plain auto-boot BDS never connects the XHCI driver
     // at all (metal JB8: BARs unprogrammed, mem decode off), so when no Usb2Hc handle exists the
     // lever is a loader-side `connect -r`: ConnectController(recursive) over every handle, which
     // is what makes XhciControllerDxe.Start run (PG cycle + IFR firmware load) for the first time.
     static USB2_HC_GUID: uefi::Guid = uefi::guid!("3e745226-9818-45b6-a2ac-d7cd0e8ba2bc");
-    let usb2 = boot::locate_handle_buffer(boot::SearchType::ByProtocol(&USB2_HC_GUID));
-    match usb2 {
-        Ok(handles) if !handles.is_empty() => {
-            log::info!("JB8-lever: {} Usb2Hc handle(s); disconnect+reconnect each", handles.len());
-            for &h in handles.iter() {
-                let d = boot::disconnect_controller(h, None, None);
-                let c = boot::connect_controller(h, &[], None, true);
-                log::info!("JB8-lever: handle {h:?} disconnect={d:?} reconnect={c:?}");
-            }
-        }
-        _ => {
-            log::info!("JB8-lever: no Usb2Hc handles — XhciControllerDxe never started; connect-all pass");
-            match boot::locate_handle_buffer(boot::SearchType::AllHandles) {
-                Ok(all) => {
-                    let (mut ok, mut err) = (0u32, 0u32);
-                    for &h in all.iter() {
-                        match boot::connect_controller(h, &[], None, true) {
-                            Ok(()) => ok += 1,
-                            Err(_) => err += 1, // NOT_FOUND for non-controller handles — expected
-                        }
-                    }
-                    log::info!("JB8-lever: connect-all over {} handles (connected={ok} none={err})", all.len());
-                    let post = boot::locate_handle_buffer(boot::SearchType::ByProtocol(&USB2_HC_GUID));
-                    log::info!(
-                        "JB8-lever: Usb2Hc handles after connect-all: {}",
-                        post.map(|h| h.len()).unwrap_or(0)
-                    );
+    // Boot-3 taught: on a USB-reader boot XhciControllerDxe IS Started (Usb2Hc exists), the Falcon
+    // runs during UEFI, and the un-gated killer candidate at EBS is GENERIC edk2 XhciDxe's
+    // XhcExitBootService (unconditional XhcHaltHC + OriginalPciAttributes restore — no ACPI gate;
+    // source-verified). Its DriverBindingStop CLOSES that EBS event. So the lever is now
+    // disconnect-and-STAY-disconnected: Stop halts the xHC (same HCH=1 either way) but nothing
+    // touches the block at EBS afterwards, and the kernel inherits whatever the Falcon state
+    // truly is. If Usb2Hc is absent (native-slot boot, driver never Started), connect-all first
+    // so there is a Started stack to witness + disconnect.
+    let mut handles = boot::locate_handle_buffer(boot::SearchType::ByProtocol(&USB2_HC_GUID));
+    if !matches!(&handles, Ok(h) if !h.is_empty()) {
+        log::info!("JB8-lever: no Usb2Hc handles — connect-all pass to Start XhciControllerDxe");
+        if let Ok(all) = boot::locate_handle_buffer(boot::SearchType::AllHandles) {
+            let mut ok = 0u32;
+            for &h in all.iter() {
+                if boot::connect_controller(h, &[], None, true).is_ok() {
+                    ok += 1;
                 }
-                Err(e) => log::error!("JB8-lever: AllHandles enumeration failed: {e:?}"),
+            }
+            log::info!("JB8-lever: connect-all over {} handles (connected={ok})", all.len());
+        }
+        handles = boot::locate_handle_buffer(boot::SearchType::ByProtocol(&USB2_HC_GUID));
+    }
+    jb8_falcon_witness("pre-disconnect");
+    match handles {
+        Ok(h) if !h.is_empty() => {
+            for &hc in h.iter() {
+                let d = boot::disconnect_controller(hc, None, None);
+                log::info!("JB8-lever: handle {:#x} disconnect(no reconnect)={d:?}", hc.as_ptr() as usize);
             }
         }
+        _ => log::info!("JB8-lever: still no Usb2Hc handle — nothing to disconnect"),
     }
-    jb8_falcon_witness("post-connect");
+    jb8_falcon_witness("post-disconnect");
 }
 
 /// 8-bit ACPI checksum: the byte value that makes the sum of every byte in `bytes` zero (mod 256).
