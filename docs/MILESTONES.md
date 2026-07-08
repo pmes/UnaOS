@@ -65,6 +65,64 @@ Legend: **✅ metal-confirmed** · **🔬 QEMU-green, metal pending** · dates I
   generic-sdhci could not vouch for.
 - **Commit:** on `hw-pi4` (Opus-executed, post-Campaign 2; metal-confirmed same session).
 
+## hw-rmbp track — 2026-07-07 (U8x — the round after Campaign 2, Opus-executed)
+
+### U8x — revocation trees + generation-tagged inboxes: revoke chases derived capabilities; the sys_xfer TOCTOU closes (x86) 🔬 `hw-rmbp`
+- **What:** the x86 twin of pi4 U8 on top of U7x, restoring FULL arch parity on the capability chain
+  (U4→U8 now symmetric). Closes both escapes U7x's entry documents, slot-keyed throughout. (1) A bounded
+  static **derivation ledger** (`MAX_DERIV = 16` nodes: state-exact CAS over a `0`/`RESERVING`/unique-id
+  word, Release-publish/Acquire-read — the U7x discipline, no heap) records an edge child→parent at every
+  derive: `sys_cap_grant` (local mint) and `SYS_XFER`/`SYS_RECV` (delivered transfer; the node rides the
+  inbox slot + the sender-owned record). Revoke = mark ONE node; `handle_resolve` walks child→root
+  (bounded, cycle-free by construction) and denies if ANY ancestor is revoked — **no revoke path ever
+  writes another row** (U7x's stale-at-use pattern, generalized). `CAP_REVOKE` gets its real semantics:
+  `SYS_CAP` REVOKE of a handle CARRYING it kills the whole derivation subtree (re-grants + re-transfers,
+  however deep, exactly once, idempotently — a second revoke is `-ECHILD`); without it the drop stays
+  local (U5x semantics, unchanged). XREVOKE marks the transfer's node too (id-guarded against reclaim
+  ABA), so a re-transferred-onward cap dies with the root transfer — the U7x escape, closed. Node
+  lifetime: frees on handle-drop when childless, else a **tombstone** until the subtree drains (cascading,
+  CAS-arbitrated free). (2) **Generation-tagged inboxes:** a per-slot generation word (`SLOT_GEN` — the
+  x86 twin of pi4's `ASID_GEN`) bumps at teardown before the sweep; deposits stamp it, RECV delivers only
+  on an exact match, the sender post-check re-reads it — recipient-exit + slot-recycle + new-tenant-consume
+  inside the deposit window can no longer deliver to the wrong tenant, from either side. x86 divergences:
+  slot keying (`current_slot()`, `Proc.slot`); the SHARED_ROW stays refused as an endpoint; and the
+  fixture conveys its witness via its name-routed `sys_exit` status (x86 has no SYS_REPORT).
+- **Tested — QEMU:** `UNAOS_FATIMG=sf ./arroyo test-fat sf 260` → after the U7x PASS line: the U8x setup
+  line, both fixture prints (`u8x: write via the grandchild cap`, `u8x: right-less revoke stays local`),
+  and `:: U8x: revocation trees — parent revoke kills re-grant + re-transfer, generation-tagged inbox,
+  ledger clean -> PASS ::` (14/14 PASS). The `u8x-tree` fixture (register-only, single slot) proves
+  witness `0xF`: grant→re-grant chain works pre-revoke; parent revoke (with `CAP_REVOKE`) → 0 and its
+  double revoke → exactly `-ECHILD`; BOTH descendants `-EACCES` at next use; a right-less revoke stays
+  local (the derived copy still writes) + its own double-revoke errno. `u8_kernel_check` drives the REAL
+  `sys_xfer_from`/`sys_recv_for` code paths over scratch rows 5/6/7 (all private, `< USER_SLOTS`, none the
+  refused SHARED_ROW): an S→R1→R2 re-transfer chain, root XREVOKE ⇒ R1 **and** R2 stale + laundering
+  refused (non-vacuous — the re-transferred cap carries `CAP_GRANT`); a deposit stamped before the
+  teardown bump is never delivered to the recycled row (record freed; a late XREVOKE honestly `-ENOENT`);
+  afterwards rows/inboxes/records/derivation ledger all provably clear. **Every prior U1a→U7x verdict
+  byte-identical** (sorted scratch-worktree baseline diff vs `e8db35c` — pure append of the U8x lines; the
+  U7x setup *banner* is a best-effort-console drop under peak 3-AP contention, not a regression — its PASS
+  verdict, on the same branch-free path, lands byte-identical); default no-FAT `./arroyo test` stays
+  MISSION SUCCESS (U8x needs no FAT file, so — like U7x — it runs and PASSes there too); `./arroyo check`
+  both arches; **zero aarch64 files touched**.
+- **Honest scope:** revocation + generations only. Carried from the aarch64 U8 review: `deriv_drop`
+  retries the free-CAS past a racing revoke (a lost-CAS return would leak the node + tombstoned ancestors,
+  exhausting the ledger under SMP); the laundering witness is non-vacuous. Deferred: the bandy Ring-3
+  delegation wrapper, arbitrary recipients, `File` payload migration, real Socket syscalls, UnaFS
+  `grants:*` on open, IF-safe x86 storage (retires the U6bx staged-source divergence).
+  **Known latent (folded to a dedicated cross-arch fix arc):** distinct from the carried revoke-vs-free
+  race above, the `deriv_drop` tombstone/free *handshake* is a store-buffering (Dekker) race — a
+  concurrent parent-vs-child drop of a cross-process chain can have both sides decline the free and
+  leak a ledger node (fail-closed → eventual `-EAGAIN`; **no** UAF/escalation, the free is
+  CAS-arbitrated). The identical Release/Acquire orderings ship in the aarch64 U8 twin, so the
+  StoreLoad-fence fix lands on **both** arches together (surfaced by the U8x pre-merge concurrency lens).
+- **Metal:** 🔬 metal-pending. The rMBP boot came up (kernel + USB enumeration fine) but **storage
+  never enumerated** — an orthogonal x86 xHCI blocker (the SD-reader `058f:6362` enumerates
+  unconfigured behind a hub; a hot-plug `ADDRESS_DEVICE` failed with a USB transaction error across 3
+  resets), handed to the USB/xHCI track. So U8x's storage-gated demo **skipped rather than failing** —
+  unexercised on metal, not a pass/fail. QEMU-green on `test` + `test-fat`; rides the next rMBP
+  boundary once the xHCI enumeration path is fixed.
+- **Commit:** on `hw-rmbp` (the round after Campaign 2, Opus-executed).
+
 ## hw-rmbp track — 2026-07-07 (Campaign 2, Fable-executed)
 
 ### U7x — cross-process capability transfer: inbox-mediated `SYS_XFER`/`SYS_RECV` + sender revoke, single-writer preserved (x86) 🔬 `hw-rmbp`
