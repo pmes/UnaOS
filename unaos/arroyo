@@ -475,6 +475,14 @@ kernel8() {
     # wiped above + the .img is rebuilt), so each kernel8-test run gets a pristine scratch file.
     head -c 1024 /dev/zero | tr '\000' '\356' > "$KERNEL8_DIR/SCRATCH.BIN"
 
+    # U10: plant a DEDICATED file to GROW (NEVER HELLO.BIN/SCRATCH.BIN). Exactly 512 bytes = one 512-byte
+    # cluster of 0xC1 filler (octal \301); the u10 file-growth demo opens it RW, seeks to its EOF (the cluster
+    # boundary) and writes past it — forcing fat::write_grow to allocate + zero + chain a SECOND cluster and bump
+    # the on-disk directory size — then the launcher re-mounts and proves the size grew, the appended data is on
+    # disk, the original cluster is intact, and both FAT copies agree. Re-created every kernel8 build, so each
+    # kernel8-test run gets a pristine 1-cluster file to grow.
+    head -c 512 /dev/zero | tr '\000' '\301' > "$KERNEL8_DIR/GROW.BIN"
+
     bash "${WORKSPACE_DIR}/scripts/make-pi-img.sh" "$KERNEL8_DIR" "${WORKSPACE_DIR}/target/UnaOS-pi4-baremetal.img" 64
     echo -e "${COLOR_GREEN}✅ Flashable image: target/UnaOS-pi4-baremetal.img — Imager → Use custom → microSD → SD slot.${COLOR_RESET}"
 }

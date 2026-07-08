@@ -14,18 +14,23 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-//! FAT16 / FAT32 reader (+ U9 in-place writer) built on the generic block device.
+//! FAT16 / FAT32 reader (+ U9 in-place writer, + U10 grow/create allocator) built on the generic
+//! block device.
 //!
 //! Handles both a **superfloppy** (the FAT BPB sits at LBA 0, no partition table) and an
 //! **MBR-partitioned** disk (an MBR at LBA 0 whose partition entry points at the BPB). All
 //! multi-byte on-disk fields are little-endian. Parsing is read-only — a mis-parse can at worst
-//! report garbage, never corrupt a volume. The ONE mutating entry point is [`FatFs::write_at`]
-//! (U9): a bounded **in-place overwrite** that read-modify-writes only the data sectors already
-//! belonging to an existing file's cluster chain — it never grows a file, never allocates or
-//! frees clusters, and never writes the FAT or a directory entry, so it cannot change the volume's
-//! structure (size/layout) or any file but the one addressed, and only within its current bytes.
-//! FAT type is determined strictly by the data-cluster count per the Microsoft FAT specification
-//! (the only correct method). FAT12 and non-512-byte logical sectors are rejected.
+//! report garbage, never corrupt a volume. The mutating entry points are [`FatFs::write_at`]
+//! (U9: a bounded **in-place overwrite** — read-modify-writes only data sectors already in an
+//! existing chain; never grows, allocates, frees, or touches the FAT/directory) and, since U10,
+//! [`FatFs::write_grow`] (extend a file: allocate + zero-fill + chain new clusters, then bump the
+//! directory `size`). The U10 allocation invariants are FAT-safety-critical: **every FAT mutation
+//! writes ALL `num_fats` copies**
+//! ([`FatFs::set_fat_entry`]); the free search is **bounded** and returns `NoSpace` when full
+//! ([`FatFs::alloc_cluster`]); a new cluster is **zero-filled before it joins a chain**; and the
+//! directory `size` (the reader's truth) is bumped **last**, so a crash mid-grow leaves a consistent
+//! smaller file. FAT type is determined strictly by the data-cluster count per the Microsoft FAT
+//! specification (the only correct method). FAT12 and non-512-byte logical sectors are rejected.
 
 use alloc::string::String;
 use core::sync::atomic::{AtomicBool, Ordering};
@@ -51,6 +56,9 @@ pub enum FatError {
     IsDirectory,
     /// The cluster chain is malformed (free/bad cluster mid-chain, or a loop).
     BadChain,
+    /// U10: no free space — the free-cluster search found no free cluster (volume full), or a directory has
+    /// no free slot for a new entry (root-directory-chain extension is out of scope). Surfaces as `-ENOSPC`.
+    NoSpace,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -92,54 +100,72 @@ impl DirEntry {
     }
 }
 
+/// A classified 32-byte directory slot: `End` (a 0x00 marker — stop scanning this directory), `Skip` (a
+/// deleted 0xE5, long-file-name component, or volume-label slot — not a real entry), or `Entry` (a parsed
+/// 8.3 file/dir entry). The single source of truth for the on-disk dirent format, so the read walkers
+/// (`scan_dir_sector`) and the U10 write-side locator (`locate_in_*`) never diverge on how a slot is parsed.
+enum DirSlot {
+    End,
+    Skip,
+    Entry(DirEntry),
+}
+
+/// Classify one 32-byte directory slot per the FAT short-entry rules.
+fn classify_dir_slot(e: &[u8]) -> DirSlot {
+    match e[0] {
+        0x00 => return DirSlot::End,  // no more entries in this directory
+        0xE5 => return DirSlot::Skip, // deleted entry
+        _ => {}
+    }
+    let attr = e[11];
+    if attr & 0x0F == 0x0F {
+        return DirSlot::Skip; // long-file-name component
+    }
+    if attr & 0x08 != 0 {
+        return DirSlot::Skip; // volume label
+    }
+    // 8.3 name: base (8) '.' ext (3), each with trailing spaces trimmed. 0x05 in byte 0 is an
+    // escaped 0xE5 (a legitimate leading byte, distinct from the deleted marker).
+    let mut name = [0u8; 12];
+    let mut n = 0usize;
+    let mut base = 8usize;
+    while base > 0 && e[base - 1] == b' ' {
+        base -= 1;
+    }
+    for k in 0..base {
+        name[n] = if k == 0 && e[0] == 0x05 { 0xE5 } else { e[k] };
+        n += 1;
+    }
+    let mut ext = 3usize;
+    while ext > 0 && e[8 + ext - 1] == b' ' {
+        ext -= 1;
+    }
+    if ext > 0 {
+        name[n] = b'.';
+        n += 1;
+        for k in 0..ext {
+            name[n] = e[8 + k];
+            n += 1;
+        }
+    }
+    DirSlot::Entry(DirEntry {
+        name,
+        name_len: n as u8,
+        is_dir: attr & 0x10 != 0,
+        size: u32le(e, 28),
+        first_cluster: ((u16le(e, 20) as u32) << 16) | u16le(e, 26) as u32,
+    })
+}
+
 /// Parse one 512-byte directory sector, appending real file/dir entries to `out`. Returns `true`
 /// if a 0x00 (end-of-directory) marker was reached, telling the caller to stop scanning.
 fn scan_dir_sector(sec: &[u8; SECTOR_SIZE], out: &mut alloc::vec::Vec<DirEntry>) -> bool {
     for i in 0..(SECTOR_SIZE / 32) {
-        let e = &sec[i * 32..i * 32 + 32];
-        match e[0] {
-            0x00 => return true, // no more entries in this directory
-            0xE5 => continue,    // deleted entry
-            _ => {}
+        match classify_dir_slot(&sec[i * 32..i * 32 + 32]) {
+            DirSlot::End => return true,
+            DirSlot::Skip => continue,
+            DirSlot::Entry(de) => out.push(de),
         }
-        let attr = e[11];
-        if attr & 0x0F == 0x0F {
-            continue; // long-file-name component
-        }
-        if attr & 0x08 != 0 {
-            continue; // volume label
-        }
-        // 8.3 name: base (8) '.' ext (3), each with trailing spaces trimmed. 0x05 in byte 0 is an
-        // escaped 0xE5 (a legitimate leading byte, distinct from the deleted marker).
-        let mut name = [0u8; 12];
-        let mut n = 0usize;
-        let mut base = 8usize;
-        while base > 0 && e[base - 1] == b' ' {
-            base -= 1;
-        }
-        for k in 0..base {
-            name[n] = if k == 0 && e[0] == 0x05 { 0xE5 } else { e[k] };
-            n += 1;
-        }
-        let mut ext = 3usize;
-        while ext > 0 && e[8 + ext - 1] == b' ' {
-            ext -= 1;
-        }
-        if ext > 0 {
-            name[n] = b'.';
-            n += 1;
-            for k in 0..ext {
-                name[n] = e[8 + k];
-                n += 1;
-            }
-        }
-        out.push(DirEntry {
-            name,
-            name_len: n as u8,
-            is_dir: attr & 0x10 != 0,
-            size: u32le(e, 28),
-            first_cluster: ((u16le(e, 20) as u32) << 16) | u16le(e, 26) as u32,
-        });
     }
     false
 }
@@ -505,27 +531,172 @@ impl FatFs {
         }
     }
 
-    /// Read the FAT entry for `cluster` (the next cluster in the chain). A 2- or 4-byte entry never
-    /// straddles a 512-byte sector boundary (2 and 4 both divide 512), so one sector read suffices.
+    /// Read the FAT entry for `cluster` (the next cluster in the chain), from the FIRST FAT copy — the read
+    /// walkers' single-copy accessor. Delegates to [`FatFs::fat_entry_copy`] so the FAT-offset math (and its
+    /// out-of-region guard) lives in exactly one place.
     fn fat_entry(&self, cluster: u32) -> Result<u32, FatError> {
+        self.fat_entry_copy(cluster, 0)
+    }
+
+    /// U10: read the FAT entry for `cluster` from a SPECIFIC FAT copy (`fat` in `0..num_fats`). A 2- or
+    /// 4-byte entry never straddles a 512-byte sector boundary (2 and 4 both divide 512), so one sector read
+    /// suffices. The multi-copy accessor: `fat_entry` (copy 0) is the read path; the launcher compares copies
+    /// to prove every FAT mutation mirrored to all of them. `parse_bpb` already gates the FAT size against the
+    /// cluster count, but re-check `sec < fat_sz` so a stray out-of-range cluster can never read a sector
+    /// outside the FAT (defense in depth on untrusted media).
+    pub fn fat_entry_copy(&self, cluster: u32, fat: u32) -> Result<u32, FatError> {
+        if fat >= self.num_fats {
+            return Err(FatError::BadChain);
+        }
         let offset = match self.kind {
             FatKind::Fat16 => cluster as u64 * 2,
             FatKind::Fat32 => cluster as u64 * 4,
         };
         let sec = offset / SECTOR_SIZE as u64;
-        // The entry must lie within the FAT region. parse_bpb already gates the FAT size against the
-        // cluster count, but re-check here so a stray out-of-range cluster can never read a sector
-        // outside the FAT (defense in depth on untrusted media).
         if sec >= self.fat_sz as u64 {
             return Err(FatError::BadChain);
         }
         let within = (offset % SECTOR_SIZE as u64) as usize;
         let mut buf = [0u8; SECTOR_SIZE];
-        read_sector(self.fat_start + sec, &mut buf)?;
+        read_sector(self.fat_start + fat as u64 * self.fat_sz as u64 + sec, &mut buf)?;
         Ok(match self.kind {
             FatKind::Fat16 => u16le(&buf, within) as u32,
             FatKind::Fat32 => u32le(&buf, within) & 0x0FFF_FFFF,
         })
+    }
+
+    /// Number of FAT copies (`num_fats`, usually 2 on FAT32). Public for the launcher's FAT-copy-agreement check.
+    pub fn num_fats(&self) -> u32 {
+        self.num_fats
+    }
+
+    /// The end-of-chain marker to write into a terminal cluster's FAT entry (`>= 0xFFF8` / `>= 0x0FFFFFF8`
+    /// both read as EOC; write the canonical all-ones form).
+    fn eoc_value(&self) -> u32 {
+        match self.kind {
+            FatKind::Fat16 => 0xFFFF,
+            FatKind::Fat32 => 0x0FFF_FFFF,
+        }
+    }
+
+    /// U10: write the FAT entry for `cluster` to `next` (a cluster number, or 0 for free / EOC for terminal) in
+    /// EVERY FAT copy (`num_fats`). A one-FAT write is a corrupt volume, so this ALWAYS mirrors to all copies —
+    /// the whole point of the primitive. Read-modify-write per copy so neighbouring entries in the sector are
+    /// preserved; on FAT32 the reserved high 4 bits of the 32-bit slot are preserved per the Microsoft FAT spec.
+    fn set_fat_entry(&self, cluster: u32, next: u32) -> Result<(), FatError> {
+        let offset = match self.kind {
+            FatKind::Fat16 => cluster as u64 * 2,
+            FatKind::Fat32 => cluster as u64 * 4,
+        };
+        let sec = offset / SECTOR_SIZE as u64;
+        if sec >= self.fat_sz as u64 {
+            return Err(FatError::BadChain); // never index past the FAT region
+        }
+        let within = (offset % SECTOR_SIZE as u64) as usize;
+        let mut buf = [0u8; SECTOR_SIZE];
+        for f in 0..self.num_fats as u64 {
+            let lba = self.fat_start + f * self.fat_sz as u64 + sec;
+            read_sector(lba, &mut buf)?;
+            match self.kind {
+                FatKind::Fat16 => {
+                    let v = (next & 0xFFFF) as u16;
+                    buf[within..within + 2].copy_from_slice(&v.to_le_bytes());
+                }
+                FatKind::Fat32 => {
+                    let existing = u32le(&buf, within);
+                    let v = (existing & 0xF000_0000) | (next & 0x0FFF_FFFF);
+                    buf[within..within + 4].copy_from_slice(&v.to_le_bytes());
+                }
+            }
+            write_sector(lba, &buf)?;
+        }
+        Ok(())
+    }
+
+    /// U10: zero-fill every sector of a data cluster. Called BEFORE a freshly allocated cluster joins a chain,
+    /// so no stale bytes from a previously-freed file can leak into a grown/created region (an information-
+    /// disclosure invariant).
+    fn zero_cluster(&self, cluster: u32) -> Result<(), FatError> {
+        if !self.valid_cluster(cluster) {
+            return Err(FatError::BadChain);
+        }
+        let zeros = [0u8; SECTOR_SIZE];
+        for s in 0..self.sec_per_clus as u64 {
+            write_sector(self.cluster_lba(cluster) + s, &zeros)?;
+        }
+        Ok(())
+    }
+
+    /// U10: allocate one data cluster — a bounded first-fit free search over `[2, count_of_clusters + 2)`,
+    /// then zero-fill it and mark it EOC in all FAT copies, returning its number READY TO LINK (a terminated
+    /// 1-cluster orphan until the caller links it onto a chain). NEVER spins (each FAT sector is read at most
+    /// once) and NEVER returns a reserved/bad/out-of-range cluster — only one whose FAT entry reads `0` (free).
+    /// `-ENOSPC` (`NoSpace`) when the volume is full. Zero-fill precedes any linkage (see [`FatFs::zero_cluster`]).
+    fn alloc_cluster(&self) -> Result<u32, FatError> {
+        let entry_bytes: u64 = if self.kind == FatKind::Fat32 { 4 } else { 2 };
+        let last = self.count_of_clusters + 2; // exclusive: valid data clusters are 2 ..= count+1
+        let mut buf = [0u8; SECTOR_SIZE];
+        let mut loaded = u64::MAX;
+        let mut c = 2u32;
+        while c < last {
+            let offset = c as u64 * entry_bytes;
+            let sec = offset / SECTOR_SIZE as u64;
+            if sec >= self.fat_sz as u64 {
+                break; // past the FAT region (defensive — parse_bpb already gates this)
+            }
+            if sec != loaded {
+                read_sector(self.fat_start + sec, &mut buf)?;
+                loaded = sec;
+            }
+            let within = (offset % SECTOR_SIZE as u64) as usize;
+            let e = match self.kind {
+                FatKind::Fat16 => u16le(&buf, within) as u32,
+                FatKind::Fat32 => u32le(&buf, within) & 0x0FFF_FFFF,
+            };
+            if e == 0 {
+                // Free. Zero-fill FIRST (no stale bytes when it joins a chain), then terminate it (EOC) so the
+                // caller receives a valid 1-cluster chain to link onto the tail.
+                self.zero_cluster(c)?;
+                self.set_fat_entry(c, self.eoc_value())?;
+                return Ok(c);
+            }
+            c += 1;
+        }
+        Err(FatError::NoSpace)
+    }
+
+    /// U10: every cluster in a file's chain, in order (empty for a 0-length / 0-cluster file). Bounded exactly
+    /// as the read walkers (loop guard vs `count_of_clusters`). Public for the launcher's post-grow check and
+    /// used by `write_grow` to find the chain tail.
+    pub fn chain_clusters(&self, first_cluster: u32) -> Result<alloc::vec::Vec<u32>, FatError> {
+        let mut out = alloc::vec::Vec::new();
+        if first_cluster == 0 {
+            return Ok(out); // a 0-length file owns no clusters
+        }
+        if !self.valid_cluster(first_cluster) {
+            return Err(FatError::BadChain);
+        }
+        let mut c = first_cluster;
+        let mut hops = 0u32;
+        loop {
+            if !self.valid_cluster(c) {
+                return Err(FatError::BadChain);
+            }
+            out.push(c);
+            let next = self.fat_entry(c)?;
+            if self.is_eoc(next) {
+                break;
+            }
+            if self.is_bad(next) || next < 2 {
+                return Err(FatError::BadChain);
+            }
+            c = next;
+            hops += 1;
+            if hops > self.count_of_clusters {
+                return Err(FatError::BadChain); // longer than the volume has clusters -> loop
+            }
+        }
+        Ok(out)
     }
 
     /// List the root directory. FAT32 follows the root cluster chain; FAT16 reads its fixed region.
@@ -807,6 +978,186 @@ impl FatFs {
             }
         }
         Ok(total - want)
+    }
+
+    /// U10: like [`FatFs::find_in_root`] but also returns the on-disk LOCATION of the matched 8.3 entry — the
+    /// absolute LBA of its directory sector and the byte offset of its 32-byte slot within that sector. That
+    /// location is what [`FatFs::write_dir_entry_fields`] read-modify-writes to publish a grown `size` / a new
+    /// `first_cluster`. Read-only; `NotFound` if the entry is absent.
+    pub fn find_located(&self, name: &str) -> Result<(DirEntry, u64, usize), FatError> {
+        match self.kind {
+            FatKind::Fat32 => self.locate_in_dir_chain(self.root_cluster, name),
+            FatKind::Fat16 => self.locate_in_fixed_root16(name),
+        }
+    }
+
+    /// FAT16 fixed root directory: a contiguous run of sectors, no cluster chain. Returns the matched entry
+    /// with its (LBA, slot-offset). Stops at the 0x00 end marker exactly as `read_fixed_root16`.
+    fn locate_in_fixed_root16(&self, name: &str) -> Result<(DirEntry, u64, usize), FatError> {
+        let mut buf = [0u8; SECTOR_SIZE];
+        for s in 0..self.root_dir_sectors as u64 {
+            let lba = self.root_dir_lba + s;
+            read_sector(lba, &mut buf)?;
+            for i in 0..(SECTOR_SIZE / 32) {
+                match classify_dir_slot(&buf[i * 32..i * 32 + 32]) {
+                    DirSlot::End => return Err(FatError::NotFound),
+                    DirSlot::Skip => continue,
+                    DirSlot::Entry(de) => {
+                        if de.eq_name(name) {
+                            return Ok((de, lba, i * 32));
+                        }
+                    }
+                }
+            }
+        }
+        Err(FatError::NotFound)
+    }
+
+    /// A directory stored as a cluster chain (the FAT32 root, or any subdirectory): the located twin of
+    /// `read_dir_chain`. Same bounded walk + bad/free-cluster + loop guards.
+    fn locate_in_dir_chain(&self, start: u32, name: &str) -> Result<(DirEntry, u64, usize), FatError> {
+        let mut cluster = start;
+        let mut hops = 0u32;
+        let mut buf = [0u8; SECTOR_SIZE];
+        loop {
+            if !self.valid_cluster(cluster) {
+                return Err(FatError::BadChain);
+            }
+            for s in 0..self.sec_per_clus as u64 {
+                let lba = self.cluster_lba(cluster) + s;
+                read_sector(lba, &mut buf)?;
+                for i in 0..(SECTOR_SIZE / 32) {
+                    match classify_dir_slot(&buf[i * 32..i * 32 + 32]) {
+                        DirSlot::End => return Err(FatError::NotFound),
+                        DirSlot::Skip => continue,
+                        DirSlot::Entry(de) => {
+                            if de.eq_name(name) {
+                                return Ok((de, lba, i * 32));
+                            }
+                        }
+                    }
+                }
+            }
+            let next = self.fat_entry(cluster)?;
+            if self.is_eoc(next) {
+                return Err(FatError::NotFound);
+            }
+            if self.is_bad(next) || next < 2 {
+                return Err(FatError::BadChain);
+            }
+            cluster = next;
+            hops += 1;
+            if hops > self.count_of_clusters {
+                return Err(FatError::BadChain);
+            }
+        }
+    }
+
+    /// U10: publish a directory entry's `first_cluster` (bytes 20-21 hi, 26-27 lo) and `size` (bytes 28-31) at
+    /// its on-disk location, read-modify-write so the rest of the 32-byte entry (name / attr / timestamps) is
+    /// preserved. This is the LAST write of a grow or create — the directory `size` is the reader's source of
+    /// truth, so bumping it only after the data + FAT are durable keeps a crash mid-grow consistent (the file
+    /// never claims unwritten clusters).
+    fn write_dir_entry_fields(
+        &self,
+        lba: u64,
+        off: usize,
+        first_cluster: u32,
+        size: u32,
+    ) -> Result<(), FatError> {
+        if off + 32 > SECTOR_SIZE {
+            return Err(FatError::Io); // a slot never straddles a sector; a bad offset is a caller bug
+        }
+        let mut buf = [0u8; SECTOR_SIZE];
+        read_sector(lba, &mut buf)?;
+        let hi = (first_cluster >> 16) as u16;
+        let lo = (first_cluster & 0xFFFF) as u16;
+        buf[off + 20..off + 22].copy_from_slice(&hi.to_le_bytes());
+        buf[off + 26..off + 28].copy_from_slice(&lo.to_le_bytes());
+        buf[off + 28..off + 32].copy_from_slice(&size.to_le_bytes());
+        write_sector(lba, &buf)?;
+        Ok(())
+    }
+
+    /// U10: WRITE with GROWTH — overwrite `data` at byte offset `start`, EXTENDING the file (allocating,
+    /// zero-filling, and chaining new clusters, then bumping the directory `size`) when the write runs past the
+    /// current EOF. The growth twin of `write_at`; the caller uses `write_at` for the pure in-place case (a
+    /// write wholly within the current bytes) and this only when `start + data.len()` exceeds `size`. `start`
+    /// must be `<= size` (the seek gate enforces it — there are no sparse holes). Returns
+    /// `(bytes_written, new_size, new_first_cluster)`: the caller republishes size + chain-head into its
+    /// descriptor, and this file's on-disk directory entry (`dir_lba`, `dir_off`) is already updated here.
+    ///
+    /// SAFE ORDER (crash-consistency + no information disclosure):
+    ///   1. walk the existing chain (bounded) to find its tail;
+    ///   2. for each new cluster needed: `alloc_cluster` (free-search + ZERO-FILL + EOC), then link the tail to
+    ///      it — so a newly allocated cluster is always zero-filled BEFORE it joins the chain;
+    ///   3. read-modify-write the `data` into the (now-existing) clusters;
+    ///   4. LAST, publish the new `size` (+ `first_cluster` if the file had none) to the directory entry.
+    /// A crash before step 4 leaves the OLD (smaller) size on disk — never a size that claims unwritten
+    /// clusters. Every FAT mutation (`alloc_cluster`, the tail link) writes ALL FAT copies via `set_fat_entry`.
+    pub fn write_grow(
+        &self,
+        first_cluster: u32,
+        size: u32,
+        dir_lba: u64,
+        dir_off: usize,
+        start: u32,
+        data: &[u8],
+    ) -> Result<(usize, u32, u32), FatError> {
+        if data.is_empty() {
+            return Ok((0, size, first_cluster));
+        }
+        // No sparse holes: the caller's seek keeps `start <= size`. Reject a hole defensively.
+        if start > size {
+            return Err(FatError::BadChain);
+        }
+        let clus_bytes = self.sec_per_clus as usize * SECTOR_SIZE;
+        let end = (start as usize).checked_add(data.len()).ok_or(FatError::BadChain)?;
+        if end > u32::MAX as usize {
+            return Err(FatError::NoSpace); // a FAT file size is a 32-bit field — cannot exceed it
+        }
+        let new_size = core::cmp::max(size, end as u32);
+
+        // 1. The existing chain, in order. Empty for a 0-length / 0-cluster file.
+        let mut chain = self.chain_clusters(first_cluster)?;
+
+        // 2. Clusters the file must span to hold `end` bytes (`end >= 1`), then append as needed. Each append
+        //    allocates+zeroes+terminates a cluster, then links the current tail onto it (all FAT copies).
+        let needed = (end + clus_bytes - 1) / clus_bytes; // ceil
+        let mut new_first = first_cluster;
+        while chain.len() < needed {
+            let n = self.alloc_cluster()?; // free + zero + EOC — a terminated orphan ready to link
+            match chain.last() {
+                Some(&tail) => self.set_fat_entry(tail, n)?, // link old tail -> n
+                None => new_first = n,                       // the file had no clusters; n is the head
+            }
+            chain.push(n);
+        }
+
+        // 3. RMW the data across the chain. `start <= size <= end`, and the chain now covers [0, needed*clus),
+        //    so every byte in [start, end) maps to an existing cluster. A partial sector preserves its other
+        //    bytes; a freshly allocated cluster's untouched bytes stay zero (from step 2's zero-fill).
+        let mut written = 0usize;
+        let mut pos = start as usize;
+        let mut buf = [0u8; SECTOR_SIZE];
+        while written < data.len() {
+            let ci = pos / clus_bytes;
+            let cluster = *chain.get(ci).ok_or(FatError::BadChain)?;
+            let in_clus = pos % clus_bytes;
+            let sec_in_clus = (in_clus / SECTOR_SIZE) as u64;
+            let in_sec = in_clus % SECTOR_SIZE;
+            let lba = self.cluster_lba(cluster) + sec_in_clus;
+            let take = core::cmp::min(data.len() - written, SECTOR_SIZE - in_sec);
+            read_sector(lba, &mut buf)?;
+            buf[in_sec..in_sec + take].copy_from_slice(&data[written..written + take]);
+            write_sector(lba, &buf)?;
+            written += take;
+            pos += take;
+        }
+
+        // 4. LAST: publish size (+ chain head if it changed) to the directory — data + FAT already durable.
+        self.write_dir_entry_fields(dir_lba, dir_off, new_first, new_size)?;
+        Ok((written, new_size, new_first))
     }
 }
 

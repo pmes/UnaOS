@@ -222,6 +222,36 @@ const U9_PATTERN: [u8; 16] = *b"U9-WRITE-OK-1234";
 /// asserts before and after the in-place write. Kept > 512 so `probe_once` never cats it (its `<= 512` guard).
 const U9_SCRATCH_SIZE: u32 = 1024;
 
+/// U10 demo: the sentinel `sys_exit` status the file-GROWTH fixture (`el0-u10grow`) uses so ITS exit lands in
+/// `EL0_U10_DONE`, never perturbing any prior counter. Distinct from every prior sentinel (…0x7A) and 0.
+const U10_EXIT_STATUS: u64 = 0x7B;
+/// U10 demo: the witness bitmask the file-GROWTH fixture reports — one bit per proven behaviour: bit0 open-RW
+/// OK; bit1 seek-to-EOF + write PAST the cluster boundary → 16 (the GROW happened, not a U9 clamp-to-0); bit2
+/// seek-back + read → the appended pattern (visible through the same cap); bit3 read at offset 0 → the original
+/// filler (the pre-existing cluster is intact — the grow did not corrupt it); bit4 an RO-opened File write →
+/// `-EACCES` (growth is gated by the SAME single CAP_WRITE CHECK as the in-place write). `u10_launcher` PASSes
+/// iff it equals `U10_WITNESS_ALL` AND the kernel-side checks held. Must match the `add x23, x23, #{1,2,4,8,16}`
+/// steps in `__u10_prog_grow`.
+const U10_WITNESS_ALL: u64 = 0x1F;
+/// U10 demo: the dedicated file the fixture GROWS (planted by the launcher's FAT image as 1 sector = exactly one
+/// 512-byte cluster of `0xC1` filler; NEVER `HELLO.BIN`/`SCRATCH.BIN`). 8 chars (<= `MAX_NAME`); the
+/// `mov x1, #(9f-8f)` in the blob matches.
+const U10_GROW_NAME: &str = "GROW.BIN";
+/// U10 demo: the planted size (512 = one full cluster of `0xC1`) — the "before" size. The fixture seeks HERE
+/// (EOF, on the cluster boundary) and writes, so the grow crosses into a freshly allocated SECOND cluster.
+const U10_GROW_PLANTED_SIZE: u32 = 512;
+/// U10 demo: the absolute byte offset the fixture seeks to and the 16-byte pattern it appends there. `OFFSET`
+/// is the planted EOF (== one cluster), so the write allocates + chains a new cluster; the launcher's raw
+/// re-read at this offset proves the appended bytes landed. Shared with `__u10_prog_grow` and the launcher.
+const U10_GROW_OFFSET: u32 = 512;
+const U10_GROW_PATTERN: [u8; 16] = *b"U10-GROW-OK-5678";
+/// U10 demo: the `0xC1` byte the image fills the planted cluster with — the fixture reads offset 0 back and the
+/// launcher re-reads it to prove the original cluster survived the grow. `__u10_prog_grow`'s filler constant
+/// (16 × `0xC1`) and the image's `tr '\000' '\301'` plant MUST match.
+const U10_GROW_FILLER: u8 = 0xC1;
+/// U10 demo: the file's size AFTER the grow (`512 + 16`) — the "size increased" invariant the launcher asserts.
+const U10_GROW_NEW_SIZE: u32 = U10_GROW_PLANTED_SIZE + 16;
+
 // --- The inline EL0 FIXTURES: three fault-SHAPE fixtures (M6b) + one preemption spinner (M6e). These
 // are fixtures, not programs, so they stay inline in the kernel image; only the well-behaved `hello`
 // routine moved out to a separately linked blob in M6c (see `USER_BLOB` below). Fully
@@ -1341,6 +1371,148 @@ unsafe extern "C" {
     static __u9_prog_write: u8;
 }
 
+// --- U10 inline EL0 fixture (real file GROWTH). ONE fixture (`el0-u10grow`) exercising the object table's
+// first ALLOCATING resource path: it opens a DEDICATED 1-cluster file RW, seeks to its planted EOF (the
+// cluster boundary), writes 16 bytes PAST it — forcing `fat::write_grow` to allocate + zero-fill + chain a
+// second cluster and bump the on-disk directory size — then seeks back and reads the appended bytes through
+// the SAME capability (bit2), confirms the ORIGINAL first cluster is intact (bit3), and proves an RO-opened
+// File write is still `-EACCES` (bit4 — growth rides the SAME single CAP_WRITE CHECK as the in-place write).
+// Position-independent; its only writable user target is the slot's data page at +0x2000 (the SYS_READ dest) —
+// it writes NO user stack, so it is safe on any slot under preemption. The fixture's own RW `SYS_OPEN`
+// first-free-claims index 0 (index 1 = the reserved `CONSOLE_FD`); its RO open then claims index 3. It builds a
+// witness bitmask in x23 (one bit per passed check) and SYS_REPORTs it, then exits with the U10 sentinel.
+// ABI: x8=nr, args x0-x2, ret x0. `mov x1, #(9f-8f)` = the 8.3 name length.
+core::arch::global_asm!(
+    r#"
+    .globl __u10_blob_start
+__u10_blob_start:
+    .balign 4
+    .globl __u10_prog_grow
+__u10_prog_grow:
+    mov  x23, xzr                          // witness bitmask = 0
+    adr  x9, __u10_blob_start              // x9 = window base (blob copied at code-page offset 0)
+    add  x12, x9, #0x2000                  // x12 = read-back buffer VA (writable data page)
+    adr  x13, 12f                          // x13 = append-pattern VA (RO code page; also the compare source)
+    adr  x14, 13f                          // x14 = filler-expect VA (RO code page; 16 x 0xC1)
+
+    // (0) open GROW.BIN RW (mode=1) -> a File handle carrying CAP_READ|CAP_WRITE
+    mov  x8, #11                           // SYS_OPEN
+    adr  x0, 8f                            // name ptr (RO code page — EL0-readable)
+    mov  x1, #(9f - 8f)                    // name len ("GROW.BIN" = 8)
+    mov  x2, #1                            // mode = RW
+    svc  #0
+    mov  x19, x0                           // x19 = RW handle (>=0) or -errno
+    tbnz x19, #63, 1f                      // open failed (negative) -> skip bit0..bit3
+    add  x23, x23, #1                      // bit0: open RW OK
+
+    // (1) seek to the planted EOF (512, the cluster boundary) and WRITE past it -> GROW (alloc + zero + chain)
+    mov  x8, #15                           // SYS_SEEK
+    mov  x0, x19
+    mov  x1, #512                          // U10_GROW_OFFSET (== planted size == one full cluster)
+    svc  #0
+    cmp  x0, #512                          // seek returns the new absolute offset
+    b.ne 1f
+    mov  x8, #1                            // SYS_WRITE (File + CAP_WRITE past EOF -> fat::write_grow)
+    mov  x0, x19
+    mov  x1, x13                           // src = the 16-byte append pattern
+    mov  x2, #16
+    svc  #0
+    cmp  x0, #16                           // grew by exactly 16 bytes (NOT a U9 clamp-to-0)?
+    b.ne 1f
+    add  x23, x23, #2                      // bit1: seek-to-EOF + grow write OK
+
+    // (2) seek back to 512 and read the appended 16 bytes through the SAME cap; they must equal the pattern
+    mov  x8, #15                           // SYS_SEEK back to 512
+    mov  x0, x19
+    mov  x1, #512
+    svc  #0
+    cmp  x0, #512
+    b.ne 1f
+    mov  x8, #12                           // SYS_READ
+    mov  x0, x19
+    mov  x1, x12                           // dest buf
+    mov  x2, #16
+    svc  #0
+    cmp  x0, #16                           // exactly 16 bytes back?
+    b.ne 1f
+    ldr  x10, [x12]                        // two 8-byte compares: read-back == the appended pattern
+    ldr  x11, [x13]
+    cmp  x10, x11
+    b.ne 1f
+    ldr  x10, [x12, #8]
+    ldr  x11, [x13, #8]
+    cmp  x10, x11
+    b.ne 1f
+    add  x23, x23, #4                      // bit2: appended bytes read back through the same cap
+
+    // (3) seek to 0 and read the FIRST 16 bytes; must still equal the planted filler (original cluster intact)
+    mov  x8, #15                           // SYS_SEEK to 0
+    mov  x0, x19
+    mov  x1, #0
+    svc  #0
+    cmp  x0, #0
+    b.ne 1f
+    mov  x8, #12                           // SYS_READ
+    mov  x0, x19
+    mov  x1, x12
+    mov  x2, #16
+    svc  #0
+    cmp  x0, #16
+    b.ne 1f
+    ldr  x10, [x12]                        // read-back == the planted 0xC1 filler
+    ldr  x11, [x14]
+    cmp  x10, x11
+    b.ne 1f
+    ldr  x10, [x12, #8]
+    ldr  x11, [x14, #8]
+    cmp  x10, x11
+    b.ne 1f
+    add  x23, x23, #8                      // bit3: original cluster survived the grow (no corruption)
+1:
+    // (4) an RO-opened File (mode=0, CAP_READ only) written to must be denied -> -EACCES (growth is gated by
+    //     the SAME single CAP_WRITE CHECK as the in-place write — a File WITHOUT CAP_WRITE can never grow)
+    mov  x8, #11                           // SYS_OPEN GROW.BIN RO
+    adr  x0, 8f
+    mov  x1, #(9f - 8f)
+    mov  x2, #0                            // mode = RO
+    svc  #0
+    mov  x20, x0                           // x20 = RO handle
+    tbnz x20, #63, 2f                      // RO open failed -> skip bit4
+    mov  x8, #1                            // SYS_WRITE through the RO handle
+    mov  x0, x20
+    mov  x1, x13
+    mov  x2, #16
+    svc  #0
+    cmn  x0, #13                           // x0 == -13 (-EACCES) ?
+    b.ne 2f
+    add  x23, x23, #16                     // bit4: RO-open File write -> -EACCES
+2:
+    mov  x0, x23                           // SYS_REPORT(witness bitmask)
+    mov  x8, #3
+    svc  #0
+    mov  x8, #2                            // SYS_EXIT(U10_EXIT_STATUS) -> EL0_U10_DONE
+    movz x0, #0x7B
+    svc  #0
+4:  b 4b                                   // sys_exit never returns; belt-and-braces guard
+    .balign 4
+8:  .ascii "GROW.BIN"
+9:
+    .balign 8
+12: .ascii "U10-GROW-OK-5678"
+    .balign 8
+13: .byte 0xC1, 0xC1, 0xC1, 0xC1, 0xC1, 0xC1, 0xC1, 0xC1, 0xC1, 0xC1, 0xC1, 0xC1, 0xC1, 0xC1, 0xC1, 0xC1
+    .balign 4
+    .globl __u10_blob_end
+__u10_blob_end:
+"#
+);
+
+unsafe extern "C" {
+    static __u10_blob_start: u8;
+    static __u10_blob_end: u8;
+    static __u10_prog_grow: u8;
+}
+
 /// The `hello` EL0 program (M6c), built as a SEPARATE link product (`crates/user-blob`) and baked in
 /// as a flat binary instead of living in the kernel's `.text`. `arroyo kernel8` builds it — a naked,
 /// position-independent `sys_write("hello from EL0\n") + sys_exit(0)` routine — for the bare aarch64
@@ -1635,6 +1807,15 @@ static EL0_U9_DONE: AtomicU32 = AtomicU32::new(0);
 /// A killed U9 fixture — a real bug (it is register-only; its only writable user target is its own data page).
 /// Off the M6b counter.
 static EL0_U9_KILLED: AtomicU32 = AtomicU32::new(0);
+
+/// The U10 file-GROWTH fixture's WITNESS bitmask (reported via SYS_REPORT): one bit per proven behaviour (see
+/// `U10_WITNESS_ALL`). `u10_launcher` PASSes iff it equals `U10_WITNESS_ALL` AND the kernel-side checks held.
+static U10_WITNESS: AtomicU64 = AtomicU64::new(0);
+/// The U10 fixture (`el0-u10grow`) reached its `0x7B` sentinel exit (want 1). Read by `u10_launcher`'s wait.
+static EL0_U10_DONE: AtomicU32 = AtomicU32::new(0);
+/// A killed U10 fixture — a real bug (register-only; its only writable user target is its own data page).
+/// Off the M6b counter.
+static EL0_U10_KILLED: AtomicU32 = AtomicU32::new(0);
 
 /// Claim a FREE Proc entry, returning its index. CAS on `state` (FREE->RUNNING) is the atomic ownership
 /// token; the pid=0 placeholder is overwritten with the real child pid (Release) by the caller AFTER the
@@ -2118,12 +2299,21 @@ static FILE_SIZE: [[AtomicU32; NFILE]; super::boot::USER_SLOTS + 1] =
 /// clamp to the bytes remaining, and `sys_seek` rejects an offset past `size` with `-EINVAL`.
 static FILE_OFFSET: [[AtomicU32; NFILE]; super::boot::USER_SLOTS + 1] =
     [const { [const { AtomicU32::new(0) }; NFILE] }; super::boot::USER_SLOTS + 1];
+/// U10: the on-disk LOCATION of this file's directory entry — the absolute LBA of its directory sector and
+/// (in `FILE_DIR_OFF`) the byte offset of its 32-byte slot within that sector, both captured at `sys_open`
+/// (from `fat::find_located`). A GROW republishes the file's `size`/`first_cluster` into that slot, so the
+/// on-disk directory stays the reader's source of truth. Meaningful only where `FILE_USED`; unused (both `0`)
+/// for descriptors that never grow (the U6b no-cap negative, the U9 revoke check).
+static FILE_DIR_LBA: [[AtomicU64; NFILE]; super::boot::USER_SLOTS + 1] =
+    [const { [const { AtomicU64::new(0) }; NFILE] }; super::boot::USER_SLOTS + 1];
+static FILE_DIR_OFF: [[AtomicU32; NFILE]; super::boot::USER_SLOTS + 1] =
+    [const { [const { AtomicU32::new(0) }; NFILE] }; super::boot::USER_SLOTS + 1];
 
 /// Claim the first free descriptor in `FILES[asid]` for a freshly-opened file, returning its index (the caller
 /// biases it to the file-id `idx + 1`). Publishes size/offset/cluster with the `FILE_USED` presence flag stored
 /// LAST (Release) — so a resolver that observes a live descriptor also observes its fields (mirrors the handle
 /// "publish the live word last" discipline). `None` if the row is full (-> `-EMFILE`; never grown).
-fn files_alloc(asid: u64, first_cluster: u32, size: u32) -> Option<usize> {
+fn files_alloc(asid: u64, first_cluster: u32, size: u32, dir_lba: u64, dir_off: u32) -> Option<usize> {
     debug_assert!((asid as usize) < FILE_USED.len(), "files_alloc: asid out of range");
     for k in 0..NFILE {
         if FILE_USED[asid as usize][k]
@@ -2137,6 +2327,8 @@ fn files_alloc(asid: u64, first_cluster: u32, size: u32) -> Option<usize> {
             FILE_CLUSTER[asid as usize][k].store(first_cluster, Ordering::Release);
             FILE_SIZE[asid as usize][k].store(size, Ordering::Release);
             FILE_OFFSET[asid as usize][k].store(0, Ordering::Release);
+            FILE_DIR_LBA[asid as usize][k].store(dir_lba, Ordering::Release);
+            FILE_DIR_OFF[asid as usize][k].store(dir_off, Ordering::Release);
             return Some(k);
         }
     }
@@ -2151,6 +2343,8 @@ fn files_free(asid: u64, idx: usize) {
     FILE_CLUSTER[asid as usize][idx].store(0, Ordering::Release);
     FILE_SIZE[asid as usize][idx].store(0, Ordering::Release);
     FILE_OFFSET[asid as usize][idx].store(0, Ordering::Release);
+    FILE_DIR_LBA[asid as usize][idx].store(0, Ordering::Release);
+    FILE_DIR_OFF[asid as usize][idx].store(0, Ordering::Release);
     FILE_USED[asid as usize][idx].store(false, Ordering::Release);
 }
 
@@ -2162,6 +2356,8 @@ fn clear_files_row(asid: u64) {
         FILE_CLUSTER[asid as usize][k].store(0, Ordering::Release);
         FILE_SIZE[asid as usize][k].store(0, Ordering::Release);
         FILE_OFFSET[asid as usize][k].store(0, Ordering::Release);
+        FILE_DIR_LBA[asid as usize][k].store(0, Ordering::Release);
+        FILE_DIR_OFF[asid as usize][k].store(0, Ordering::Release);
         FILE_USED[asid as usize][k].store(false, Ordering::Release);
     }
 }
@@ -2227,6 +2423,14 @@ fn u8_report(value: u64) {
 fn u9_report(value: u64) {
     if super::sched::current_name() == Some("el0-u9write") {
         U9_WITNESS.store(value, Ordering::Release);
+    }
+}
+
+/// U10: record the file-GROWTH fixture's witness bitmask (SYS_REPORT), keyed by the reporting task's name.
+/// Called from the SYS_REPORT arm alongside the other reporters; each ignores the others' names.
+fn u10_report(value: u64) {
+    if super::sched::current_name() == Some("el0-u10grow") {
+        U10_WITNESS.store(value, Ordering::Release);
     }
 }
 
@@ -2486,6 +2690,11 @@ pub fn record_el0_kill(name: &str, ec: u64, far: u64, far_valid: bool) {
     // is a real U9 bug — its own counter, never the M6b `killed_unexpected` count (same discipline as above).
     if name == "el0-u9write" {
         EL0_U9_KILLED.fetch_add(1, Ordering::AcqRel);
+        return;
+    }
+    // U10: the file-GROWTH fixture is likewise register-only; a kill is a real U10 bug (its own counter).
+    if name == "el0-u10grow" {
+        EL0_U10_KILLED.fetch_add(1, Ordering::AcqRel);
         return;
     }
     let (base, size) = super::boot::user_region();
@@ -2877,6 +3086,7 @@ extern "C" fn aarch64_svc_handler(frame: *mut u64) {
             u7_report(a0);
             u8_report(a0);
             u9_report(a0);
+            u10_report(a0);
             0
         }
         SYS_YIELD => sys_yield(),
@@ -2966,6 +3176,8 @@ extern "C" fn aarch64_svc_handler(frame: *mut u64) {
                 EL0_U8_DONE.fetch_add(1, Ordering::AcqRel);
             } else if a0 == U9_EXIT_STATUS {
                 EL0_U9_DONE.fetch_add(1, Ordering::AcqRel);
+            } else if a0 == U10_EXIT_STATUS {
+                EL0_U10_DONE.fetch_add(1, Ordering::AcqRel);
             } else if a0 == 0 {
                 EL0_EXITED_OK.fetch_add(1, Ordering::AcqRel);
             } else {
@@ -3084,13 +3296,24 @@ fn sys_write(fd: u64, buf: u64, len: u64) -> i64 {
     len as i64
 }
 
-/// U9: the File half of `sys_write` — an IN-PLACE overwrite at the descriptor's offset. The CHECK already
-/// passed in `sys_write` (a `File` handle carrying CAP_WRITE, non-revoked), so this decodes the file-id ->
-/// descriptor, clamps the write to the bytes left to EOF (NEVER grows the file), validates the WHOLE source up
-/// front (a bad buffer is -EFAULT with no I/O and NO offset move), copies the bytes into a bounded kernel
-/// buffer, writes them through the in-place FAT writer, and advances the offset by exactly the count written.
-/// The exact write twin of `sys_read`: same descriptor decode, same up-front clamp/validate, same offset
-/// discipline. No create/grow/truncate — a write at/after EOF writes 0 bytes (a later arc adds allocation).
+/// U10: the largest single File `sys_write` that GROWS a file (bounds the kernel copy buffer + the number of
+/// clusters one call allocates). A longer write returns a short count (`GROW_WRITE_MAX`); the caller loops. The
+/// in-place (non-growing) branch keeps U9's `min(len, size - offset)` clamp untouched, so this only ever caps
+/// the growth path. 8 KiB = up to 16 new 512-byte clusters per call — ample for the demo, bounded for safety.
+const GROW_WRITE_MAX: usize = 8 * 1024;
+
+/// U9/U10: the File half of `sys_write` at the descriptor's offset. The CHECK already passed in `sys_write` (a
+/// `File` handle carrying CAP_WRITE, non-revoked), so this decodes the file-id -> descriptor, then splits on
+/// whether the write stays within the current bytes:
+///   * **in place** (`len <= size - offset`) — U9's path, BYTE-IDENTICAL: clamp to EOF, validate the whole
+///     source up front, copy into a bounded buffer, `fat::write_at`, advance the offset;
+///   * **grow** (`len` runs past EOF) — U10: cap to `GROW_WRITE_MAX`, validate + copy, then `fat::write_grow`
+///     ALLOCATES + zero-fills + chains new clusters and bumps the on-disk directory `size` LAST; republish the
+///     new size / chain-head / offset into the descriptor.
+/// The grow path is reachable ONLY through this function, which `sys_write` reaches ONLY after resolving the
+/// handle for CAP_WRITE — so growth is CAP_WRITE-gated by exactly the same single CHECK as the in-place write
+/// (an RO-opened File, a revoked cap, or a non-File kind can never reach it). A bad buffer is `-EFAULT` with no
+/// I/O and no offset move; `-ENOSPC` when the volume is full.
 fn sys_write_file(asid: u64, file_id: u64, buf: u64, len: u64) -> i64 {
     // Decode the file-id -> descriptor index (undo the +1 bias) and re-check presence (defense in depth: a live
     // File handle always has a live descriptor, but never trust the value word blindly — mirrors sys_read).
@@ -3102,38 +3325,80 @@ fn sys_write_file(asid: u64, file_id: u64, buf: u64, len: u64) -> i64 {
     }
     let size = FILE_SIZE[asid as usize][idx].load(Ordering::Acquire);
     let offset = FILE_OFFSET[asid as usize][idx].load(Ordering::Acquire);
-    // In-place only: clamp the write to the bytes left from `offset` to EOF. `offset <= size` always (reads/
-    // writes clamp; seek rejects past size), so `size - offset` cannot underflow; a write at/after EOF is 0
-    // bytes (never grows the file). `want == 0` is a clean no-op.
-    let want = core::cmp::min(len as usize, size.saturating_sub(offset) as usize);
+    let inplace_avail = size.saturating_sub(offset) as usize; // bytes from `offset` to EOF
+
+    if len as usize <= inplace_avail {
+        // ===== U9 IN-PLACE branch — unchanged (a write wholly within the current bytes never grows) =====
+        // `offset <= size` always (reads/writes clamp; seek rejects past size), so `size - offset` cannot
+        // underflow; a write at/after EOF with `len == 0` is a clean 0-byte no-op.
+        let want = core::cmp::min(len as usize, inplace_avail);
+        if want == 0 {
+            return 0; // at/after EOF, or nothing requested — 0 bytes written, no growth
+        }
+        // Validate the WHOLE source BEFORE any disk I/O — a bad buffer is -EFAULT with no write, no offset move.
+        if !user_range_ok(buf, want, false) {
+            return EFAULT;
+        }
+        // Copy the user bytes into a bounded kernel buffer (capped at `want <= size`), then overwrite in place.
+        let mut data: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
+        data.resize(want, 0);
+        if copy_from_user(&mut data, buf, want).is_err() {
+            return EFAULT; // offset NOT advanced — a rejected buffer leaves the file position unchanged
+        }
+        // Re-mount (as sys_read does — the single volume is deterministic) and write `want` bytes at `offset`.
+        let fs = match crate::fs::fat::mount() {
+            Ok(fs) => fs,
+            Err(crate::fs::fat::FatError::NoDisk) => return ENODEV,
+            Err(_) => return EIO,
+        };
+        let cluster = FILE_CLUSTER[asid as usize][idx].load(Ordering::Acquire);
+        let wrote = match fs.write_at(cluster, size, offset, &data) {
+            Ok(n) => n,
+            Err(_) => return EIO,
+        };
+        if wrote == 0 {
+            return 0; // a short chain (malformed vs size) wrote nothing here — no offset move
+        }
+        // wrote <= want <= size - offset, so offset + wrote <= size — the FILE_OFFSET <= FILE_SIZE invariant holds.
+        FILE_OFFSET[asid as usize][idx].store(offset + wrote as u32, Ordering::Release);
+        return wrote as i64;
+    }
+
+    // ===== U10 GROW branch — the write runs past EOF; extend the file. `offset <= size` (seek gate), so there
+    // is no sparse hole. Cap the write so one call's kernel buffer + cluster allocation stay bounded.
+    let want = core::cmp::min(len as usize, GROW_WRITE_MAX);
     if want == 0 {
-        return 0; // at/after EOF, or nothing requested — 0 bytes written, no growth
+        return 0; // (unreachable: len > inplace_avail >= 0 implies len >= 1) — defensive
     }
-    // Validate the WHOLE source BEFORE any disk I/O — a bad buffer is -EFAULT with no write and no offset move.
     if !user_range_ok(buf, want, false) {
-        return EFAULT;
+        return EFAULT; // bad buffer -> -EFAULT with no I/O, no allocation, no offset move
     }
-    // Copy the user bytes into a bounded kernel buffer (capped at `want <= size`), then overwrite in place.
     let mut data: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
     data.resize(want, 0);
     if copy_from_user(&mut data, buf, want).is_err() {
-        return EFAULT; // offset NOT advanced — a rejected buffer leaves the file position unchanged
+        return EFAULT;
     }
-    // Re-mount (as sys_read does — the single volume is deterministic) and write `want` bytes at `offset`.
     let fs = match crate::fs::fat::mount() {
         Ok(fs) => fs,
         Err(crate::fs::fat::FatError::NoDisk) => return ENODEV,
         Err(_) => return EIO,
     };
     let cluster = FILE_CLUSTER[asid as usize][idx].load(Ordering::Acquire);
-    let wrote = match fs.write_at(cluster, size, offset, &data) {
-        Ok(n) => n,
-        Err(_) => return EIO,
+    let dir_lba = FILE_DIR_LBA[asid as usize][idx].load(Ordering::Acquire);
+    let dir_off = FILE_DIR_OFF[asid as usize][idx].load(Ordering::Acquire) as usize;
+    let (wrote, new_size, new_first) = match fs.write_grow(cluster, size, dir_lba, dir_off, offset, &data) {
+        Ok(t) => t,
+        Err(crate::fs::fat::FatError::NoSpace) => return ENOSPC,
+        Err(_) => return EIO, // a bad chain / block error — nothing advanced (the dir bump is write_grow's last step)
     };
     if wrote == 0 {
-        return 0; // a short chain (malformed vs size) wrote nothing here — no offset move
+        return 0; // no bytes written (empty source already handled; defensive) — no state change
     }
-    // wrote <= want <= size - offset, so offset + wrote <= size — the FILE_OFFSET <= FILE_SIZE invariant holds.
+    // Republish the descriptor: new chain head (unchanged unless the file had 0 clusters), grown size, and the
+    // advanced offset. `offset + wrote <= new_size` (new_size = max(size, offset + want), wrote <= want), so the
+    // FILE_OFFSET <= FILE_SIZE invariant holds. Single-writer over this row (mid-syscall, IRQ-masked).
+    FILE_CLUSTER[asid as usize][idx].store(new_first, Ordering::Release);
+    FILE_SIZE[asid as usize][idx].store(new_size, Ordering::Release);
     FILE_OFFSET[asid as usize][idx].store(offset + wrote as u32, Ordering::Release);
     wrote as i64
 }
@@ -3257,6 +3522,7 @@ const EAGAIN: i64 = -11; // the process table (or slot pool) is full
 const ENODEV: i64 = -19; // no block device / FAT volume to load from
 const EISDIR: i64 = -21; // sys_open: the named entry is a directory, not a file
 const EMFILE: i64 = -24; // sys_open: the caller's open-file (or handle) table is full
+const ENOSPC: i64 = -28; // U10: no free cluster (volume full) / no free root-dir slot (grow/create)
 
 /// A program successfully loaded into a fresh per-task slot: the EL0 entry VA, the initial SP_EL0, the
 /// slot's TTBR0, and (for the M6g loader's log line) the slot id, byte length, and FAT kind.
@@ -3595,8 +3861,10 @@ fn sys_open(name_ptr: u64, name_len: u64, mode: u64) -> i64 {
         Err(crate::fs::fat::FatError::NoDisk) => return ENODEV,
         Err(_) => return EIO,
     };
-    let de = match fs.find_in_root(name) {
-        Ok(de) => de,
+    // U10: `find_located` also returns the on-disk LOCATION of the entry (its directory sector LBA + slot
+    // offset), recorded in the descriptor so a later GROW can republish `size`/`first_cluster` into it.
+    let (de, dir_lba, dir_off) = match fs.find_located(name) {
+        Ok(t) => t,
         Err(crate::fs::fat::FatError::NotFound) => return ENOENT,
         Err(_) => return EIO,
     };
@@ -3604,7 +3872,7 @@ fn sys_open(name_ptr: u64, name_len: u64, mode: u64) -> i64 {
         return EISDIR; // a directory is not readable through a File handle (no dir ops this arc)
     }
     // 3. Claim resources LAST — a descriptor, then a handle. Only a full handle table needs unwinding.
-    let Some(fid) = files_alloc(asid, de.first_cluster(), de.size) else {
+    let Some(fid) = files_alloc(asid, de.first_cluster(), de.size, dir_lba, dir_off as u32) else {
         return EMFILE; // this task's open-file table is full
     };
     let file_id = (fid + 1) as u64; // +1 bias: never the value word's 0 (Empty) / u64::MAX (RESERVING) sentinel
@@ -5072,7 +5340,9 @@ pub fn u6b_launcher(demo_cpu: usize) {
     //     absent handle. `files_alloc` on the fixture's FRESH row cannot fail (NFILE free slots, cleared at the
     //     prior teardown of this ASID); if it somehow did, leave index 2 Empty (the fixture's read still gets
     //     -EACCES, via NoHandle) and spawn anyway — never a leak, never a return-without-spawn.
-    if let Some(fid) = files_alloc(u6b.asid, nocap_fc, nocap_sz) {
+    // dir_lba/off = 0: this descriptor is read-denied (zero rights) and never grown, so its directory location
+    // is unused (U10).
+    if let Some(fid) = files_alloc(u6b.asid, nocap_fc, nocap_sz, 0, 0) {
         install_cap(u6b.asid, U6B_NOCAP_IDX, KIND_FILE, (fid + 1) as u64, 0);
     }
     // 4b. The kind negative: a Socket handle carrying CAP_READ at U6B_SOCK_IDX. It HAS the right, so the read is
@@ -5214,14 +5484,15 @@ fn u7_release_go(slot: usize) {
 ///      iff both witnesses == `U7_WITNESS_ALL` AND used AND the snapshot held AND everything cleared AND no
 ///      U7 kill. Prints ONE PASS line. U7 is the last demo, so it releases no further gate.
 pub fn u7_launcher(demo_cpu: usize) {
-    // U8, then U9, ride the SAME kernel task, each strictly after the prior flow (every exit path — PASS, FAIL,
-    // or skip — falls through): the ordering gate the *_LAUNCH_DONE statics provide between separately spawned
-    // launchers is here the program order of one task. Each launcher's verdict waits on its fixture's exit +
-    // teardown, so the demo slot is free again before the next builds — no new gate needed. Keeping U9 here
-    // (rather than a `sched::spawn` in main.rs) stays wholly inside the aarch64 syscall lane.
+    // U8, then U9, then U10, ride the SAME kernel task, each strictly after the prior flow (every exit path —
+    // PASS, FAIL, or skip — falls through): the ordering gate the *_LAUNCH_DONE statics provide between
+    // separately spawned launchers is here the program order of one task. Each launcher's verdict waits on its
+    // fixture's exit + teardown, so the demo slot is free again before the next builds — no new gate needed.
+    // Keeping U9/U10 here (rather than a `sched::spawn` in main.rs) stays wholly inside the aarch64 syscall lane.
     u7_run(demo_cpu);
     u8_launcher(demo_cpu);
     u9_launcher(demo_cpu);
+    u10_launcher(demo_cpu);
 }
 
 fn u7_run(demo_cpu: usize) {
@@ -5618,7 +5889,8 @@ fn u9_check_revoked_write(fc: u32, sz: u32) -> bool {
     const A: u64 = 6; // scratch ASID row (provably clear here — the fixture uses a different, freshly-alloc'd slot)
     let mut ok = true;
     // Back a real File descriptor so the ROOT cap names a genuine open file (a write through it WOULD land).
-    let Some(fid) = files_alloc(A, fc, sz) else {
+    // dir_lba/off = 0: the write is denied at the revoked-cap resolve, so it never reaches the grow path (U10).
+    let Some(fid) = files_alloc(A, fc, sz, 0, 0) else {
         return false;
     };
     let file_id = (fid + 1) as u64;
@@ -5763,6 +6035,183 @@ fn u9_launcher(demo_cpu: usize) {
             revoke_ok,
             EL0_U9_DONE.load(Ordering::Acquire),
             U9_WITNESS_ALL
+        );
+    }
+}
+
+// =============================================================================================
+// U10: file GROWTH — the single-process EL0 fixture (open-RW -> seek-to-EOF -> write PAST the cluster
+// boundary -> read-back the appended bytes + confirm the original cluster + the RO-write denial) and the
+// kernel-side checks (a fresh-mount re-read shows the directory size GREW, the appended data is on disk,
+// the original cluster survived, and both FAT copies agree along the now-2-cluster chain), folded into one
+// launcher/verdict that rides the U7 launcher task after U9.
+// =============================================================================================
+
+/// Build the U10 fixture slot — the `u9_build` shape for the U10 blob (allocate, scrub, copy, I-cache-sync,
+/// protect, return run params). The scrub keeps the U7/U8/U9 discipline: a prior tenant's bytes must never leak
+/// into a fresh fixture window (the fixture's read-back buffer lives at +0x2000).
+fn u10_build() -> Option<U7Fix> {
+    let (base, size) = super::boot::user_region();
+    let sp = (base + size as u64) & !0xF;
+    let bstart = &raw const __u10_blob_start as usize;
+    let bend = &raw const __u10_blob_end as usize;
+    let blen = bend - bstart;
+    assert!(blen <= super::boot::USER_CODE_SIZE, "U10 blob does not fit in a code page");
+    let entry = {
+        let va = base + (&raw const __u10_prog_grow as usize - bstart) as u64;
+        assert!(va & 3 == 0, "U10 fixture entry misaligned");
+        va
+    };
+    let slot = super::boot::alloc_user_slot()?;
+    let backing = super::boot::slot_backing_ptr(slot);
+    unsafe {
+        core::ptr::write_bytes(backing, 0, size);
+        core::ptr::copy_nonoverlapping(bstart as *const u8, backing, blen);
+    }
+    super::cache::icache_sync_range(backing as usize, blen);
+    unsafe { super::boot::protect_user_slot_code(slot, super::boot::USER_CODE_SIZE) };
+    let ttbr0 = super::boot::slot_ttbr0(slot);
+    Some(U7Fix { entry, sp, ttbr0, asid: ttbr0 >> 48, slot })
+}
+
+/// U10 kernel-side helper: from a FRESH mount, walk GROW.BIN's chain and prove (a) it grew from 1 cluster to
+/// exactly 2 (the append crossed the cluster boundary) and (b) EVERY cluster's FAT entry is byte-identical
+/// across ALL `num_fats` copies — the "one-FAT write is a corrupt volume" invariant, verified end to end. `false`
+/// on any mount / walk / read failure. Independent of any descriptor sidecar (it re-derives everything).
+fn u10_fats_consistent(first_cluster: u32) -> bool {
+    let Ok(fs) = crate::fs::fat::mount() else {
+        return false;
+    };
+    let Ok(chain) = fs.chain_clusters(first_cluster) else {
+        return false;
+    };
+    if chain.len() != 2 {
+        return false; // grew from the planted 1 cluster to exactly 2
+    }
+    let nf = fs.num_fats();
+    for &c in &chain {
+        let Ok(e0) = fs.fat_entry_copy(c, 0) else {
+            return false;
+        };
+        let mut f = 1;
+        while f < nf {
+            match fs.fat_entry_copy(c, f) {
+                Ok(ef) if ef == e0 => {}
+                _ => return false, // a copy disagrees (or read failed) -> a torn / one-FAT write
+            }
+            f += 1;
+        }
+    }
+    true
+}
+
+/// U10 launcher + verdict — called by the U7 launcher task after the U9 flow (program-order gating; see
+/// `u7_launcher`). Flow: skip silently with no SD (the fixture grows a real disk file); pre-flight GROW.BIN
+/// (chain head + planted size) BEFORE allocating a slot; build + spawn the fixture; wait (bounded) for its
+/// sentinel exit + teardown (its two open descriptors clear the FILES row); then the kernel-side checks — a
+/// fresh-mount re-read shows the directory size GREW to `U10_GROW_NEW_SIZE`, the appended bytes at the grow
+/// offset are on disk, the original first cluster is intact, and both FAT copies agree along the 2-cluster
+/// chain. PASS iff witness == `U10_WITNESS_ALL` AND torn down AND no kill AND all kernel checks held. U10 is the
+/// last demo — it releases no further gate.
+fn u10_launcher(demo_cpu: usize) {
+    // One-shot (the U7 launcher is spawned once; guard defensively anyway).
+    static DONE: AtomicBool = AtomicBool::new(false);
+    if DONE.swap(true, Ordering::Relaxed) {
+        return;
+    }
+    // No SD device -> the fixture cannot grow a disk file; skip silently (mirrors U6b/U7/U8/U9's control path).
+    if crate::drivers::block::info().is_none() {
+        return;
+    }
+    // Pre-flight the ONE fallible disk lookup — GROW.BIN's chain head + planted size — BEFORE allocating a slot
+    // (the U6b/U9 discipline: fallible lookups first, resource alloc last, so a lookup failure leaks nothing).
+    let pre_size = match crate::fs::fat::mount()
+        .and_then(|fs| fs.find_in_root(U10_GROW_NAME).map(|de| (de.first_cluster(), de.size, de.is_dir)))
+    {
+        Ok((_fc, sz, false)) => sz,
+        _ => {
+            serial_println!(
+                ":: U10: pre-open of GROW.BIN failed (absent / a directory / unmountable) — file-growth demo skipped ::"
+            );
+            return;
+        }
+    };
+
+    // Build the fixture slot (allocates it), print the setup line, spawn. No pre-endow: the fixture's only
+    // negative (bit4) is an RO open of the same file, so no scaffold handle is needed.
+    let Some(fix) = u10_build() else {
+        serial_println!(":: U10: no free address-space slot — file-growth demo skipped ::");
+        return;
+    };
+    serial_println!(
+        ":: U10: file growth — File+CAP_WRITE past EOF routed through fat::write_grow (alloc + zero + chain, dir size last) ::"
+    );
+    super::sched::spawn_user_slot("el0-u10grow", fix.entry, fix.sp, fix.ttbr0, demo_cpu);
+
+    // Wait (bounded ~5 s, yielding) for the fixture's sentinel exit, then snapshot the witness.
+    let vstart = super::timer::cntpct();
+    let vdeadline = 5 * super::timer::cntfrq();
+    while EL0_U10_DONE.load(Ordering::Acquire) < 1
+        && super::timer::cntpct().wrapping_sub(vstart) <= vdeadline
+    {
+        super::sched::yield_now();
+    }
+    let witness = U10_WITNESS.load(Ordering::Acquire);
+    let killed = EL0_U10_KILLED.load(Ordering::Acquire);
+
+    // Teardown proof: the fixture exited holding two live descriptors (its RW + RO opens), so its exit cleared
+    // BOTH the FILES row and the handle row. Poll bounded; false->true.
+    let tstart = super::timer::cntpct();
+    let tdeadline = 2 * super::timer::cntfrq();
+    while !(files_row_is_clear(fix.asid) && handle_row_is_clear(fix.asid))
+        && super::timer::cntpct().wrapping_sub(tstart) <= tdeadline
+    {
+        super::sched::yield_now();
+    }
+    let cleared = files_row_is_clear(fix.asid) && handle_row_is_clear(fix.asid);
+
+    // Kernel-side "the grow actually hit the disk" checks: re-read GROW.BIN from a fresh mount. The size must
+    // have GROWN to U10_GROW_NEW_SIZE (and past the pre-size), the bytes at the grow offset must equal the
+    // appended pattern, the original first cluster must still hold the planted filler, and both FAT copies must
+    // agree along the now-2-cluster chain.
+    let post = crate::fs::fat::mount()
+        .ok()
+        .and_then(|fs| fs.find_in_root(U10_GROW_NAME).ok())
+        .map(|de| (de.first_cluster(), de.size));
+    let (size_grew, appended, original_intact, fats_ok) = match post {
+        Some((post_fc, post_size)) => {
+            let size_grew = post_size == U10_GROW_NEW_SIZE && post_size > pre_size;
+            let appended = u9_read16(post_fc, post_size, U10_GROW_OFFSET) == Some(U10_GROW_PATTERN);
+            let original_intact = u9_read16(post_fc, post_size, 0) == Some([U10_GROW_FILLER; 16]);
+            let fats_ok = u10_fats_consistent(post_fc);
+            (size_grew, appended, original_intact, fats_ok)
+        }
+        None => (false, false, false, false),
+    };
+
+    if witness == U10_WITNESS_ALL
+        && cleared
+        && killed == 0
+        && size_grew
+        && appended
+        && original_intact
+        && fats_ok
+    {
+        serial_println!(
+            ":: U10: file growth — open-RW+grow-write+readback OK, original cluster intact, RO-write -EACCES, on-disk size grew + appended data present + both FAT copies consistent -> PASS ::"
+        );
+    } else {
+        serial_println!(
+            ":: U10: file growth FAIL — witness={:#x} cleared={} killed={} size_grew={} appended={} intact={} fats={} done={} (want {:#x}/true/0/true/true/true/true/1) ::",
+            witness,
+            cleared,
+            killed,
+            size_grew,
+            appended,
+            original_intact,
+            fats_ok,
+            EL0_U10_DONE.load(Ordering::Acquire),
+            U10_WITNESS_ALL
         );
     }
 }
