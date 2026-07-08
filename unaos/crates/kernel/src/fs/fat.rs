@@ -193,10 +193,14 @@ fn format_83(name: &str) -> Option<[u8; 11]> {
     let bytes = name.as_bytes();
     let (base, ext): (&[u8], &[u8]) = match name.find('.') {
         Some(i) => {
-            if name[i + 1..].contains('.') {
-                return None; // a second dot -> not a plain 8.3 name
+            let ext = &bytes[i + 1..];
+            // Reject a trailing dot ("FILE.") or a second dot ("A.B.C"): neither is a distinct 8.3 name.
+            // "FILE." would store as "FILE" and never re-parse (classify_dir_slot) back to "FILE.", so a later
+            // find_located("FILE.") would miss it and create_in_root would write a DUPLICATE "FILE" entry.
+            if ext.is_empty() || ext.contains(&b'.') {
+                return None;
             }
-            (&bytes[..i], &bytes[i + 1..])
+            (&bytes[..i], ext)
         }
         None => (bytes, &[][..]),
     };

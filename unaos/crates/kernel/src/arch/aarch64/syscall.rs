@@ -282,10 +282,12 @@ const U10C_WRITTEN: u32 = 16;
 /// in `EL0_U10D_DONE`. Distinct from every prior sentinel (…0x7C) and 0.
 const U10D_EXIT_STATUS: u64 = 0x7D;
 /// U10-delete demo: the witness bitmask the DELETE fixture reports — bit0 create+open OK; bit1 write → 16
-/// (grow-from-empty allocates the cluster); bit2 `SYS_UNLINK` → 0 (delete: dir 0xE5 + free chain, all copies);
-/// bit3 a plain RO re-open → `-ENOENT` (the file is GONE). `u10d_launcher` PASSes iff it equals
-/// `U10D_WITNESS_ALL` AND the kernel-side checks held. Matches `add x23, x23, #{1,2,4,8}` in the blob.
-const U10D_WITNESS_ALL: u64 = 0xF;
+/// (grow-from-empty allocates the cluster); bit2 `SYS_UNLINK` → 0 (delete: dir 0xE5 + free chain, all copies,
+/// and invalidate ALL of this process's descriptors for the file); bit3 a read through a SIBLING handle (the
+/// file was opened twice) → `-EACCES` (the sibling descriptor was invalidated too — no stale reference to the
+/// freed chain); bit4 a plain RO re-open → `-ENOENT` (the file is GONE). `u10d_launcher` PASSes iff it equals
+/// `U10D_WITNESS_ALL` AND the kernel-side checks held. Matches `add x23, x23, #{1,2,4,8,16}` in the blob.
+const U10D_WITNESS_ALL: u64 = 0x1F;
 /// U10-delete demo: the self-contained file the fixture creates, writes, and DELETES (it does not exist in the
 /// planted image). 9 chars (<= `MAX_NAME`); the `mov x1, #(9f-8f)` in the blob matches.
 const U10D_NAME: &str = "DELME.BIN";
@@ -1653,11 +1655,12 @@ unsafe extern "C" {
 
 // --- U10-delete inline EL0 fixture (real file DELETE via SYS_UNLINK). ONE self-contained fixture
 // (`el0-u10delete`): it CREATES its own file (O_CREAT|RW), WRITES to it (grow-from-empty allocates a data
-// cluster), UNLINKs it through the same File+CAP_WRITE handle (dir entry -> 0xE5 + the chain freed in all FAT
-// copies, and the handle invalidated), and re-opens the name RO to prove it is GONE (`-ENOENT`). Self-contained
-// so it never depends on another demo's state. Position-independent; no writable user target beyond the pattern
-// it passes from the RO code page. It builds a witness bitmask in x23 and SYS_REPORTs it, then exits with the
-// U10-delete sentinel. ABI: x8=nr, args x0-x2, ret x0.
+// cluster), opens it a SECOND time (a sibling handle), UNLINKs it through the first handle (dir entry -> 0xE5 +
+// the chain freed in all FAT copies + EVERY descriptor for the file invalidated), proves a read through the
+// SIBLING handle is now `-EACCES` (no stale reference to the freed chain), and re-opens the name RO to prove it
+// is GONE (`-ENOENT`). Self-contained so it never depends on another demo's state. Position-independent; its
+// only writable user target is the slot's data page at +0x2000 (the SYS_READ dest). It builds a witness bitmask
+// in x23 and SYS_REPORTs it, then exits with the U10-delete sentinel. ABI: x8=nr, args x0-x2, ret x0.
 core::arch::global_asm!(
     r#"
     .globl __u10d_blob_start
@@ -1666,16 +1669,18 @@ __u10d_blob_start:
     .globl __u10d_prog_delete
 __u10d_prog_delete:
     mov  x23, xzr                          // witness bitmask = 0
+    adr  x9, __u10d_blob_start             // x9 = window base
+    add  x12, x9, #0x2000                  // x12 = read dest VA (writable data page)
     adr  x13, 12f                          // x13 = write-pattern VA (RO code page)
 
-    // (0) open DELME.BIN O_CREAT|RW (mode=3) -> CREATE a 0-length file, RW handle
+    // (0) open DELME.BIN O_CREAT|RW (mode=3) -> CREATE a 0-length file, RW handle h0
     mov  x8, #11                           // SYS_OPEN
     adr  x0, 8f                            // name ptr
     mov  x1, #(9f - 8f)                    // name len ("DELME.BIN" = 9)
     mov  x2, #3                            // mode = O_CREAT | RW
     svc  #0
-    mov  x19, x0                           // x19 = RW handle (>=0) or -errno
-    tbnz x19, #63, 1f                      // create/open failed -> skip bit0..bit2
+    mov  x19, x0                           // x19 = h0 (>=0) or -errno
+    tbnz x19, #63, 1f                      // create/open failed -> skip bit0..bit3
     add  x23, x23, #1                      // bit0: create + open OK
 
     // (1) write 16 bytes -> grow-from-empty (allocates the file's one data cluster)
@@ -1688,15 +1693,34 @@ __u10d_prog_delete:
     b.ne 1f
     add  x23, x23, #2                      // bit1: write (grow) OK
 
-    // (2) unlink the file through the SAME File+CAP_WRITE handle -> 0 (dir 0xE5 + free chain, handle invalidated)
+    // open DELME.BIN RW AGAIN (no O_CREAT — it exists now) -> a SIBLING handle h1 (setup for bit3)
+    mov  x8, #11                           // SYS_OPEN DELME.BIN RW
+    adr  x0, 8f
+    mov  x1, #(9f - 8f)
+    mov  x2, #1                            // mode = RW
+    svc  #0
+    mov  x20, x0                           // x20 = h1 (the sibling) or -errno
+    tbnz x20, #63, 1f                      // sibling open failed -> skip bit2/bit3
+
+    // (2) unlink the file through h0 -> 0 (dir 0xE5 + free chain, and invalidate ALL of this proc's descriptors)
     mov  x8, #16                           // SYS_UNLINK
     mov  x0, x19
     svc  #0
     cmp  x0, #0
     b.ne 1f
     add  x23, x23, #4                      // bit2: unlink OK
+
+    // (3) a read through the SIBLING h1 must now be denied -> -EACCES (its descriptor was invalidated too)
+    mov  x8, #12                           // SYS_READ
+    mov  x0, x20
+    mov  x1, x12
+    mov  x2, #16
+    svc  #0
+    cmn  x0, #13                           // x0 == -13 (-EACCES) ?
+    b.ne 1f
+    add  x23, x23, #8                      // bit3: sibling handle fail-safe (no stale reference to freed chain)
 1:
-    // (3) a plain RO open of the deleted name must now fail -> -ENOENT (the file is GONE)
+    // (4) a plain RO open of the deleted name must now fail -> -ENOENT (the file is GONE)
     mov  x8, #11                           // SYS_OPEN DELME.BIN RO (no O_CREAT)
     adr  x0, 8f
     mov  x1, #(9f - 8f)
@@ -1704,7 +1728,7 @@ __u10d_prog_delete:
     svc  #0
     cmn  x0, #2                            // x0 == -2 (-ENOENT) ?
     b.ne 2f
-    add  x23, x23, #8                      // bit3: re-open -> -ENOENT (gone)
+    add  x23, x23, #16                     // bit4: re-open -> -ENOENT (gone)
 2:
     mov  x0, x23                           // SYS_REPORT(witness bitmask)
     mov  x8, #3
@@ -2579,6 +2603,27 @@ fn files_free(asid: u64, idx: usize) {
     FILE_DIR_LBA[asid as usize][idx].store(0, Ordering::Release);
     FILE_DIR_OFF[asid as usize][idx].store(0, Ordering::Release);
     FILE_USED[asid as usize][idx].store(false, Ordering::Release);
+}
+
+/// U10: free EVERY descriptor in `FILES[asid]` that names the directory entry at (`dir_lba`, `dir_off`). Used by
+/// `sys_unlink`: a file opened more than once in the SAME process yields independent descriptors all pointing at
+/// the same chain head + directory slot, so deleting via one handle must invalidate ALL of them — otherwise a
+/// SIBLING descriptor keeps `FILE_USED = true` with a stale `FILE_CLUSTER` pointing at the now-freed (and
+/// re-allocatable) chain, and a later read/write/unlink through the sibling handle would alias whatever reuses
+/// that cluster. `(dir_lba, dir_off)` uniquely identifies a file's on-disk entry, so this frees exactly the
+/// deleted file's aliases and nothing else. After it, every sibling handle still resolves but fails the
+/// `FILE_USED` re-check in `sys_read`/`sys_write_file`/`sys_seek`/`sys_unlink` -> `-EACCES` (fail-safe; the
+/// sibling handle words linger until task teardown, harmlessly). `dir_lba != 0` (the caller guards scaffolds).
+fn files_free_by_dir(asid: u64, dir_lba: u64, dir_off: u32) {
+    debug_assert!((asid as usize) < FILE_USED.len() && dir_lba != 0, "files_free_by_dir: bad args");
+    for k in 0..NFILE {
+        if FILE_USED[asid as usize][k].load(Ordering::Acquire)
+            && FILE_DIR_LBA[asid as usize][k].load(Ordering::Acquire) == dir_lba
+            && FILE_DIR_OFF[asid as usize][k].load(Ordering::Acquire) == dir_off
+        {
+            files_free(asid, k);
+        }
+    }
 }
 
 /// Clear an ENTIRE per-task open-file row at teardown — the file twin of `clear_handle_row`'s handle wipe (it
@@ -4278,8 +4323,11 @@ fn sys_seek(handle: u64, offset: u64) -> i64 {
 /// on-disk directory location from the descriptor (recorded at open), then `fat::delete_located` marks the
 /// directory entry deleted FIRST and frees the whole chain (all FAT copies), and finally the descriptor + handle
 /// are invalidated so no further read/write/seek can reach the now-deleted file. A scaffold descriptor with no
-/// recorded directory location (`dir_lba == 0`) is refused (`-EACCES`). Single handle per file this arc — other
-/// handles to the same file (none in practice) would be left dangling.
+/// recorded directory location (`dir_lba == 0`) is refused (`-EACCES`). ALL of the CALLER's descriptors naming
+/// the same on-disk entry are invalidated (`files_free_by_dir`), so opening a file twice in one process and
+/// deleting via one handle leaves the sibling fail-safe (`-EACCES`), not aliasing the freed chain. The remaining
+/// gap is CROSS-process: a file open in another process when unlinked here leaves that process's descriptor
+/// stale — closing it needs a global open-file refcount (POSIX unlink-defers-free), deferred with `SYS_CLOSE`.
 fn sys_unlink(handle: u64) -> i64 {
     let asid = current_asid();
     // The CHECK: File + CAP_WRITE, or -EACCES (identical to sys_write's gate — delete is a mutation).
@@ -4311,8 +4359,10 @@ fn sys_unlink(handle: u64) -> i64 {
         return EIO; // a bad chain / block error — the dir mark is delete_located's first step, so a failure
                     // there changed nothing; a failure while freeing only orphans clusters (never aliases)
     }
-    // The file is gone: invalidate the descriptor + handle so no further read/write/seek can reach it.
-    files_free(asid, idx);
+    // The file is gone: invalidate EVERY descriptor in this process's row that names it — not just `idx` — so a
+    // file opened more than once here cannot leave a sibling descriptor pointing at the now-freed chain (its next
+    // use fails the FILE_USED re-check -> -EACCES). Then clear the handle we were called with.
+    files_free_by_dir(asid, dir_lba, dir_off as u32);
     handle_clear(asid, handle as usize);
     0
 }
