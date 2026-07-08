@@ -2248,14 +2248,23 @@ impl XhciController {
             self.enumerating_port = port;
             self.enum_resets = 1;
             serial_println!("xHCI: === Enumerating Port {} (PORTSC={:#x}) ===", port, portsc);
-            // Always USB-reset the port before addressing the device, whether or not PED is
-            // already set. A device the firmware enumerated (our USB stick / SD reader IS the
-            // UEFI boot device) — and every SuperSpeed device, whose link auto-trains to
-            // PED=1 — keeps its old USB address across our controller reset (HCRST resets the
-            // controller, not the device). ADDRESS_DEVICE issues SET_ADDRESS to the Default
-            // address, so the device must be in Default state, which a USB reset restores.
-            // The Port Reset Change event then drives the rest.
-            self.issue_enum_reset(port);
+            // Debounce BEFORE the first reset (USB 2.0 TATTDB: 100 ms of stable connection
+            // after attach). The metal rMBP bench captured a hot-plugged High-Speed SD reader
+            // that, reset immediately on the connect event, trained at Full-Speed (failed HS
+            // chirp) and then failed every ADDRESS_DEVICE with USB Transaction Error (code 4)
+            // — resetting a device whose attach hasn't electrically settled is the classic
+            // cause. service_enum issues the reset once the gate expires; boot-scan devices
+            // (long since stable) just pay the same 100 ms, which is harmless.
+            //
+            // The reset itself is always issued whether or not PED is already set. A device
+            // the firmware enumerated (our USB stick / SD reader IS the UEFI boot device) —
+            // and every SuperSpeed device, whose link auto-trains to PED=1 — keeps its old
+            // USB address across our controller reset (HCRST resets the controller, not the
+            // device). ADDRESS_DEVICE issues SET_ADDRESS to the Default address, so the
+            // device must be in Default state, which a USB reset restores. The Port Reset
+            // Change event then drives the rest.
+            self.enum_cmd_phys = 0;
+            self.set_enum_stage("debounce");
             return;
         }
         self.enum_active = false;
@@ -2288,6 +2297,16 @@ impl XhciController {
             port, self.enum_stage, why, code, portsc);
         self.last_stall = Some(EnumStall { port, stage: self.enum_stage, why, code, portsc });
         self.stall_count += 1;
+
+        // Metal diagnostic (rMBP bench 2026-07-08): ADDRESS_DEVICE failing with USB
+        // Transaction Error while a USB2 port reads Full-Speed usually means a High-Speed
+        // device whose HS chirp failed during reset — name the pattern so the serial capture
+        // says what happened instead of just "code 4".
+        if code == 4 && self.port_major(port) == 2 && ((portsc >> 10) & 0xF) == 1 {
+            serial_println!(
+                "xHCI: [recovery] hint: port {} trained at Full-Speed; if this device is High-Speed \
+                 the HS chirp failed — the paced retry re-resets it.", port);
+        }
 
         // Clean the in-flight bookkeeping.
         self.pending_ports.retain(|p| *p != port);
@@ -2487,8 +2506,19 @@ impl XhciController {
                     self.enable_slot(port);
                 }
             }
+            "debounce" => {
+                // Connect debounce (USB 2.0 TATTDB, 100 ms) before the first reset — see
+                // start_next_port. Always advances, so no separate watchdog is needed.
+                if age >= 100 * per_ms {
+                    self.issue_enum_reset(port);
+                }
+            }
             "retry-wait" => {
-                if age >= 200 * per_ms {
+                // Recovery pacing, ESCALATING per attempt (200/400/600 ms): the bench's
+                // hot-plugged SD reader failed the same way at a fixed 200 ms spacing —
+                // a device still settling from its own failed handshake needs longer, and
+                // extra wait on an already-failed port costs nothing.
+                if age >= 200 * (self.enum_resets as u64).max(1) * per_ms {
                     self.issue_enum_reset(port);
                 }
             }
@@ -2885,7 +2915,11 @@ impl XhciController {
         }
     }
 
-    pub fn configure_endpoints(&mut self, slot_id: u8, in_addr: u8, in_mps: u16, out_addr: u8, out_mps: u16) {
+    /// Build the bulk-IN/OUT input context (rings, DMA buffers, slot fields) for a
+    /// Configure-Endpoint command and return the input context's physical address. Shared by
+    /// the async root path (`configure_endpoints`) and the synchronous hub-downstream path
+    /// (`configure_bulk_endpoints_sync`).
+    fn build_bulk_input_ctx(&mut self, slot_id: u8, in_addr: u8, in_mps: u16, out_addr: u8, out_mps: u16) -> u64 {
         unsafe {
             // DCI = endpoint_number * 2 + (1 for IN, 0 for OUT).
             let in_dci = ((in_addr & 0x0F) * 2) + 1;
@@ -2952,21 +2986,48 @@ impl XhciController {
             ep_out_ptr.add(4).write_volatile(out_mps as u32);
 
             serial_println!("xHCI: Input Context Configured for Bulk Transport.");
+            input_ctx_virt as u64
+        }
+    }
 
-            // 7. SEND CONFIGURE ENDPOINT COMMAND
-            let trb = Trb {
-                parameter: input_ctx_virt as u64,
-                status: 0,
-                control: (12 << 10) | ((slot_id as u32) << 24),
-            };
+    pub fn configure_endpoints(&mut self, slot_id: u8, in_addr: u8, in_mps: u16, out_addr: u8, out_mps: u16) {
+        let input_ctx_phys = self.build_bulk_input_ctx(slot_id, in_addr, in_mps, out_addr, out_mps);
+        let trb = Trb {
+            parameter: input_ctx_phys,
+            status: 0,
+            control: (12 << 10) | ((slot_id as u32) << 24),
+        };
+        match self.send_command(trb) {
+            // Root-FSM-only (the hub-downstream path configures via the sync variant below).
+            Ok(phys) => self.track_enum_cmd(phys, "configure-eps"),
+            Err(e) => {
+                serial_println!("xHCI: Failed to send Configure Endpoint command: {}", e);
+                self.recover_enumeration("command-send-failed", 0);
+            }
+        }
+    }
 
-            match self.send_command(trb) {
-                // Root-FSM-only (storage bulk endpoints; no storage-behind-hub support).
-                Ok(phys) => self.track_enum_cmd(phys, "configure-eps"),
-                Err(e) => {
-                    serial_println!("xHCI: Failed to send Configure Endpoint command: {}", e);
-                    self.recover_enumeration("command-send-failed", 0);
-                }
+    /// Synchronous Configure-Endpoint for a hub-downstream device's bulk pair. Safe ONLY from
+    /// the main-loop context (`run_command_sync` pumps the event ring). Deliberately does NOT
+    /// touch `configuring_slot`/`track_enum_cmd`: the async completion dispatch belongs to the
+    /// root FSM, and a downstream completion routed there would advance the root port queue
+    /// mid-enumeration (the exact aliasing the `is_downstream` flag exists to prevent).
+    fn configure_bulk_endpoints_sync(&mut self, slot_id: u8, in_addr: u8, in_mps: u16, out_addr: u8, out_mps: u16) -> bool {
+        let input_ctx_phys = self.build_bulk_input_ctx(slot_id, in_addr, in_mps, out_addr, out_mps);
+        let trb = Trb {
+            parameter: input_ctx_phys,
+            status: 0,
+            control: (12 << 10) | ((slot_id as u32) << 24),
+        };
+        match self.run_command_sync(trb) {
+            Ok((1, _)) => true,
+            Ok((c, _)) => {
+                serial_println!("xHCI: downstream Configure-Endpoint code {} (slot {})", c, slot_id);
+                false
+            }
+            Err(_) => {
+                serial_println!("xHCI: downstream Configure-Endpoint timed out (slot {})", slot_id);
+                false
             }
         }
     }
@@ -3908,9 +3969,10 @@ impl XhciController {
     }
 
     /// Enumerate one device behind a hub: ENABLE_SLOT, ADDRESS_DEVICE (with route string), read the
-    /// device + configuration descriptors, and — for an HID keyboard/mouse — hand off to the
-    /// existing endpoint-configuration path (which finishes set-config + arms the interrupt read
-    /// via the normal async completion). Storage / non-HID behind a hub is not yet handled.
+    /// device + configuration descriptors, and hand off by interface class — Mass Storage gets a
+    /// synchronous bulk Configure-Endpoint + the deferred SCSI bring-up (service_storage), an HID
+    /// keyboard/mouse goes to the existing endpoint-configuration path (which finishes set-config +
+    /// arms the interrupt read via the normal async completion).
     fn enumerate_downstream(&mut self, _hub_slot: u8, port: u8, root_hub_port: u8, speed: u32) {
         // ENABLE_SLOT.
         let slot_id = match self.run_command_sync(Trb { parameter: 0, status: 0, control: 9 << 10 }) {
@@ -3940,6 +4002,26 @@ impl XhciController {
             serial_println!("xHCI: downstream slot {} config-descriptor failed", slot_id);
             return;
         }
+        // Mass storage first: the metal rMBP's SD reader sits behind a hub and reports class 0
+        // at the device level — the interface descriptor is the only place to detect it. This
+        // used to be HID-only, leaving a hubbed MSC device `other/unconfigured` forever (the
+        // photographed metal failure). One storage device is supported, mirroring the root path.
+        if let Some(((in_addr, in_mps), (out_addr, out_mps))) = self.parse_msc_config(buf) {
+            serial_println!(
+                "xHCI: >>> HUB DOWNSTREAM MASS STORAGE (slot {}, bulk in {:#x}/{} out {:#x}/{}) <<<",
+                slot_id, in_addr, in_mps, out_addr, out_mps);
+            if self.storage_slot != 0 {
+                serial_println!("xHCI: storage slot {} already active; ignoring the hubbed device.", self.storage_slot);
+            } else if self.configure_bulk_endpoints_sync(slot_id, in_addr, in_mps, out_addr, out_mps) {
+                // Defer SET_CONFIGURATION + SCSI bring-up to service_storage (same main-loop
+                // context, next hook) — identical hand-off to the root path's async completion.
+                self.storage_slot = slot_id;
+                self.storage_pending_bringup = true;
+                self.storage_note = "hub-downstream endpoints configured; SCSI bring-up pending";
+                serial_println!("xHCI: Endpoints Configured (Slot {}). Storage ready.", slot_id);
+            }
+            return;
+        }
         match self.parse_hid_config(buf) {
             Some((is_kbd, is_rel, ep_addr, mps, interval, intf_num)) => {
                 serial_println!("xHCI: HUB downstream slot {} is {} (ep {:#x} mps {} iface {})",
@@ -3966,6 +4048,45 @@ impl XhciController {
                 self.configure_hid_endpoints(slot_id, false);
             }
             None => serial_println!("xHCI: HUB downstream slot {}: no HID interrupt endpoint", slot_id),
+        }
+    }
+
+    /// Parse a configuration descriptor (in `buf`) for a Mass-Storage-Class interface
+    /// (bInterfaceClass 0x08 — matched at ANY subclass/protocol, like the root path) and collect
+    /// its bulk IN/OUT endpoint pair. Returns ((in_addr, in_mps), (out_addr, out_mps)) or None.
+    fn parse_msc_config(&self, buf: u64) -> Option<((u8, u16), (u8, u16))> {
+        unsafe {
+            let p = buf as *const u8;
+            let total = ((*p.add(2) as usize) | ((*p.add(3) as usize) << 8)).min(64);
+            let mut off = 0usize;
+            let mut in_msc = false;
+            let mut bulk_in: Option<(u8, u16)> = None;
+            let mut bulk_out: Option<(u8, u16)> = None;
+            while off + 2 <= total {
+                let len = *p.add(off) as usize;
+                let dtype = *p.add(off + 1);
+                if len == 0 { break; }
+                if dtype == 0x04 && off + 8 <= total {
+                    in_msc = *p.add(off + 5) == 0x08;
+                } else if dtype == 0x05 && in_msc && off + 6 <= total {
+                    let ep_addr = *p.add(off + 2);
+                    let attr = *p.add(off + 3);
+                    if (attr & 0x3) == 0x02 { // Bulk
+                        // wMaxPacketSize bits 10:0 (mask off HS mult bits 12:11).
+                        let mps = ((*p.add(off + 4) as u16) | ((*p.add(off + 5) as u16) << 8)) & 0x07FF;
+                        if (ep_addr & 0x80) != 0 {
+                            if bulk_in.is_none() { bulk_in = Some((ep_addr, mps)); }
+                        } else if bulk_out.is_none() {
+                            bulk_out = Some((ep_addr, mps));
+                        }
+                    }
+                }
+                off += len;
+            }
+            match (bulk_in, bulk_out) {
+                (Some(i), Some(o)) => Some((i, o)),
+                _ => None,
+            }
         }
     }
 

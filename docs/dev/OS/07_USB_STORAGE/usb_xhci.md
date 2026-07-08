@@ -94,7 +94,31 @@ Boot evidence: `xHCI: READ(10) LBA0 CSW status=Passed residue=0`,
 
 ---
 
-## 6. Input
+## 6. Enumeration robustness (metal-informed)
+
+Root-port enumeration is a staged FSM (`debounce → await-reset → reset-settle →
+enable-slot → address-device → …`) driven by `service_enum()` with a watchdog on
+every stage. Two behaviors come straight from the 2012 rMBP metal bench
+(2026-07-08), where a hot-plugged High-Speed SD reader trained at Full-Speed
+(failed HS chirp) and then failed every `ADDRESS_DEVICE` with USB Transaction
+Error (code 4):
+
+- **Connect debounce** — 100 ms (USB 2.0 TATTDB) between the connect event and
+  the first port reset, so the reset never lands on an electrically unsettled
+  attach.
+- **Escalating retry pacing** — recovery re-resets are spaced 200/400/600 ms
+  (attempt-scaled), and a code-4-with-FS-speed failure logs an explicit
+  failed-HS-chirp hint in the serial capture.
+
+**Mass storage behind a hub** is detected at the *interface* level (MSC devices
+report class 0 at the device level), gets a synchronous bulk Configure-Endpoint
+from the hub bring-up path, and hands off to the same `service_storage()` SCSI
+bring-up as a root-port device. QEMU reproduction: `UNAOS_HUBSTORAGE=1` attaches
+the usb-storage behind a `usb-hub`.
+
+---
+
+## 7. Input
 
 Boot-protocol HID keyboards, mice, and tablets enumerated on the controller are
 translated to console input events (a USB HID scancode → ASCII table lives in
@@ -102,11 +126,13 @@ translated to console input events (a USB HID scancode → ASCII table lives in
 
 ---
 
-## 7. Status and limitations
+## 8. Status and limitations
 
 Implemented: controller bring-up + BIOS→OS handoff, interrupt-driven event
-delivery, device enumeration, single-tier USB hubs, BOT mass-storage read/write,
-and HID input. aarch64 uses a polled variant (no interrupts there yet).
+delivery, device enumeration (with connect debounce + bounded, paced retry
+recovery), single-tier USB hubs (HID **and mass storage** downstream), BOT
+mass-storage read/write, and HID input. aarch64 uses a polled variant (no
+interrupts there yet).
 
 Not yet implemented: endpoint STALL recovery, multi-tier hubs, and broader class
 support. The `skip_xhci` Cargo feature (`UNAOS_SKIP_XHCI=1`) disables USB bring-up
