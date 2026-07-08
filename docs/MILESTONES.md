@@ -64,6 +64,20 @@ Legend: **✅ metal-confirmed** · **🔬 QEMU-green, metal pending** · dates I
   pending row is a different file → claim a fresh row) and (b) recording each descriptor's row INDEX in
   `FILE_OPENROW`, so every decrement/mark hits that exact row, never a re-searchable key. A targeted re-verify
   confirmed the fix closes it with no new leak/double-free/stale-index path.
+- **Seat coalesce-review fix (a SECOND, distinct slot-recycle bug; refuted 0/3 — own follow-up commit).** The
+  above fixed the incref/JOIN side; the `sys_unlink` SWEEP side had the same root: `files_free_by_dir` matched
+  descriptors by the recyclable `(dir_lba, dir_off)`, so when ONE process held an unlinked file F open AND created
+  a new file G in F's recycled `0xE5` slot, a `SYS_UNLINK` of G swept BOTH descriptors and both reached
+  `refcount == 0`, but the loop kept only the LAST orphan chain head (`orphan = Some(fc)` overwriting) → the
+  earlier chain leaked. A benign lost-cluster leak on the EXPLICIT path (refcount stayed exact, no UAF/double-free),
+  distinct from the teardown-only honest-scope leak below. Fixed by freeing EVERY orphan head the sweep produces
+  (`files_free_by_dir` is `sys_unlink`-only = block-I/O-legal, so it frees each inline via `free_orphan_chain`; the
+  `OPEN_FILES` lock is never held across the I/O). Proven by a deterministic kernel-side check
+  (`u11defer_check_double_orphan`, the `u11_check_gen_rebind` style — physically recycle a slot asserting G reused
+  F's exact slot, reproduce the two-descriptor/two-pending-row state, run the real sweep, fresh-mount confirm BOTH
+  chains free in all FAT copies): `:: U11-reuse: sys_unlink slot-recycle — two files sharing a recycled dir slot
+  BOTH free their chains (all FAT copies) -> PASS ::`. **Now 21 PASS** (the prior 20 byte-identical + U11-reuse),
+  CAPSTONE 6/6, `./arroyo check` both arches, zero x86 files.
 - **Honest scope — M2a (explicit-close path) lands.** The cross-process defer is proven for the explicit-close
   path. The teardown DECREMENT is done (a short, I/O-free `SpinMutex` critical section, safe in the IRQ-masked
   teardown context); but a program that EXITS holding the LAST `unlink_pending` open leaves its chain allocated (a

@@ -3126,36 +3126,35 @@ fn files_free(asid: u64, idx: usize) -> Option<u32> {
     openfile_decref_at(row)
 }
 
-/// U10: free EVERY descriptor in `FILES[asid]` that names the directory entry at (`dir_lba`, `dir_off`). Used by
-/// `sys_unlink`: a file opened more than once in the SAME process yields independent descriptors all pointing at
-/// the same chain head + directory slot, so deleting via one handle must invalidate ALL of them — otherwise a
-/// SIBLING descriptor keeps `FILE_USED = true` with a stale `FILE_CLUSTER` pointing at the now-freed (and
-/// re-allocatable) chain, and a later read/write/unlink through the sibling handle would alias whatever reuses
-/// that cluster. `(dir_lba, dir_off)` uniquely identifies a file's on-disk entry, so this frees exactly the
-/// deleted file's aliases and nothing else. After it, every sibling handle still resolves but fails the
-/// `FILE_USED` re-check in `sys_read`/`sys_write_file`/`sys_seek`/`sys_unlink` -> `-EACCES` (fail-safe; the
-/// sibling handle words linger until task teardown, harmlessly). `dir_lba != 0` (the caller guards scaffolds).
+/// U10/U11-M2: free EVERY of this process's descriptors whose recorded directory slot is (`dir_lba`, `dir_off`),
+/// and FREE the cluster chain of each one that turns out to be the LAST close of an `unlink_pending` file. Used by
+/// `sys_unlink`: a file opened more than once in the SAME process yields independent descriptors all naming the
+/// same slot, so deleting via one handle must invalidate ALL of them (the U10 fail-safe — otherwise a sibling
+/// descriptor keeps `FILE_USED = true` with a stale `FILE_CLUSTER` aliasing a now-freed, re-allocatable chain).
+/// After it, every sibling handle still resolves but fails the `FILE_USED` re-check -> `-EACCES`.
 ///
-/// U11-M2: each drop decrements the file's cross-process refcount. All these descriptors name the SAME file, so
-/// at most ONE decrement (the last, iff this process is the sole opener) reaches `refcount == 0` and returns the
-/// chain head to free; the returned `Option<u32>` carries that head (the caller frees it — the same-process
-/// immediate free, byte-identical to U10). If another process still holds the file open, none reach 0 and this
-/// returns `None` (POSIX unlink-defers-free). `#[must_use]`: dropping the result could leak the freed file.
-#[must_use]
-fn files_free_by_dir(asid: u64, dir_lba: u64, dir_off: u32) -> Option<u32> {
+/// ⚠ `(dir_lba, dir_off)` is a directory SLOT, and FAT RECYCLES it — `create_in_root` reuses a `0xE5`'d slot for
+/// a new file — so it does NOT uniquely identify a file. TWO distinct files can share the same `(dir_lba,
+/// dir_off)` in ONE process (open F; F unlinked while this process holds it, its slot goes `0xE5`; create G,
+/// which reuses F's slot) while sitting on DIFFERENT `OPEN_FILES` rows. This sweep therefore matches BOTH, and
+/// BOTH can reach `refcount == 0` while `unlink_pending`. So it MUST free EVERY orphan chain head it produces,
+/// not just the last — else the earlier file's chain leaks (a benign lost-cluster leak, but a real one, on the
+/// EXPLICIT unlink path). This is called ONLY from `sys_unlink` (a block-I/O-legal context — teardown uses
+/// `files_free` directly + logs), so each head is freed inline (`free_orphan_chain`); `files_free` drops the
+/// `OPEN_FILES` lock before returning the head, so the I/O is never under a lock. `dir_lba != 0` (caller guards).
+fn files_free_by_dir(asid: u64, dir_lba: u64, dir_off: u32) {
     debug_assert!((asid as usize) < FILE_USED.len() && dir_lba != 0, "files_free_by_dir: bad args");
-    let mut orphan = None;
     for k in 0..NFILE {
         if FILE_USED[asid as usize][k].load(Ordering::Acquire)
             && FILE_DIR_LBA[asid as usize][k].load(Ordering::Acquire) == dir_lba
             && FILE_DIR_OFF[asid as usize][k].load(Ordering::Acquire) == dir_off
         {
+            // Free EACH orphan head (not just the last) — two recycled-slot files can both drop to 0 here.
             if let Some(fc) = files_free(asid, k) {
-                orphan = Some(fc);
+                free_orphan_chain(fc);
             }
         }
     }
-    orphan
 }
 
 /// Clear an ENTIRE per-task open-file row at teardown — the file twin of `clear_handle_row`'s handle wipe (it
@@ -5137,15 +5136,14 @@ fn sys_unlink(handle: u64) -> i64 {
     // so the row exists. MUST precede the drops below so the drop that reaches 0 (sole-opener case) sees the
     // pending flag and returns the chain head.
     openfile_mark_unlink_pending_at(open_row, cluster);
-    // (3) Drop EVERY descriptor in this process's row that names the file — each decrements the refcount and
-    // bumps its slot generation (U11 stale-sibling protection). If this process was the sole opener, the last
-    // decrement returns the chain head to free NOW (block I/O legal here); otherwise another process's live
-    // descriptor keeps the chain allocated until its last close. Then clear the handle we were called with.
-    let orphan = files_free_by_dir(asid, dir_lba, dir_off as u32);
+    // (3) Drop EVERY descriptor in this process's row that names the file (each decrements the refcount and bumps
+    // its slot generation — U11 stale-sibling protection) and FREE the chain of each that reaches its last close
+    // (block I/O legal here, never under a lock). A sole-opener drops to 0 and frees immediately (the U10
+    // behaviour, deferred); a cross-process opener keeps the chain allocated until its last close. Note: FAT
+    // slot-recycling can put a DIFFERENT still-open unlinked file's descriptor on the same `(dir_lba, dir_off)` —
+    // `files_free_by_dir` frees EVERY orphan head it produces, so neither chain leaks. Then clear our handle.
+    files_free_by_dir(asid, dir_lba, dir_off as u32);
     handle_clear(asid, handle as usize);
-    if let Some(fc) = orphan {
-        free_orphan_chain(fc); // sole-opener: free immediately (never under a lock) — the U10 behaviour, deferred
-    }
     0
 }
 
@@ -6702,6 +6700,7 @@ pub fn u7_launcher(demo_cpu: usize) {
     u10d_launcher(demo_cpu);
     u11_launcher(demo_cpu);
     u11defer_run(demo_cpu);
+    u11reuse_run();
 }
 
 fn u7_run(demo_cpu: usize) {
@@ -8094,6 +8093,131 @@ fn u11defer_run(demo_cpu: usize) {
             reusable_c3,
             U11DEFER_A_WITNESS_ALL,
             U11DEFER_B_WITNESS_ALL
+        );
+    }
+}
+
+/// U11-M2 (seat coalesce-review fix): PROVE `files_free_by_dir` frees EVERY orphan chain head when FAT recycles a
+/// deleted-but-still-open file's directory slot for a new file — so two DISTINCT files that end up sharing one
+/// `(dir_lba, dir_off)` in one process (on DIFFERENT `OPEN_FILES` rows) BOTH free their chains on the explicit
+/// `sys_unlink` sweep, with neither leaked. Kernel-side + deterministic (the `u11_check_gen_rebind` style, more
+/// robust than depending on exact cross-process slot-recycle timing in EL0): it PHYSICALLY recycles a slot
+/// (create F, `0xE5` F, create G — asserting G reused F's EXACT slot), reproduces the two-descriptor /
+/// two-pending-row table state on a scratch ASID, runs the real `files_free_by_dir` sweep, and a fresh mount
+/// confirms BOTH cluster chains are free in ALL FAT copies. Runs in the launcher (kernel-task) context, so block
+/// I/O is legal. Returns `true` iff BOTH chains freed (before the fix, the earlier head leaks -> `false`).
+fn u11defer_check_double_orphan() -> bool {
+    const A: u64 = 6; // scratch ASID row (every demo fixture torn down by now — the gen-rebind check's convention)
+    clear_files_row(A);
+    let fs = match crate::fs::fat::mount() {
+        Ok(fs) => fs,
+        Err(_) => return false,
+    };
+    // 1. Create file F + grow it a real cluster (cF), then delete its NAME only (`0xE5`) — cF stays ALLOCATED
+    //    (the cross-process-held-open state), and F's slot is now free for reuse.
+    let (de_f, lba_f, off_f) = match fs.create_in_root("SLTF.BIN", 0x20) {
+        Ok(t) => t,
+        Err(_) => return false,
+    };
+    let c_f = match fs.write_grow(de_f.first_cluster(), de_f.size, lba_f, off_f, 0, &[0xF1u8; 16]) {
+        Ok((_, _, first)) => first,
+        Err(_) => return false,
+    };
+    if fs.mark_dir_deleted(lba_f, off_f).is_err() {
+        return false;
+    }
+    // 2. Create file G — `create_in_root` reuses the FIRST free slot, which is F's just-`0xE5`'d slot (nothing
+    //    else was created between). ASSERT it landed on F's EXACT slot (the shared-key precondition this test
+    //    needs), then grow it a DISTINCT cluster (cG != cF, since cF is still allocated so first-fit skips it).
+    let (de_g, lba_g, off_g) = match fs.create_in_root("SLTG.BIN", 0x20) {
+        Ok(t) => t,
+        Err(_) => return false,
+    };
+    if lba_g != lba_f || off_g != off_f {
+        return false; // G did not reuse F's slot -> the shared-(dir_lba,dir_off) precondition did not hold
+    }
+    let c_g = match fs.write_grow(de_g.first_cluster(), de_g.size, lba_g, off_g, 0, &[0xF2u8; 16]) {
+        Ok((_, _, first)) => first,
+        Err(_) => return false,
+    };
+    if c_f == 0 || c_g == 0 || c_f == c_g {
+        return false; // both files must own DISTINCT real chains
+    }
+    // 3. Reproduce the table state slot-recycling produces: TWO descriptors on ASID A at the SAME (lba_f, off_f),
+    //    on DIFFERENT `OPEN_FILES` rows, each `unlink_pending` with its own chain head. (`openfile_incref`'s
+    //    `unlink_pending`-skip is what puts G on a FRESH row rather than joining F's pending row.)
+    let Some(row_f) = openfile_incref(lba_f, off_f as u32) else {
+        return false;
+    };
+    openfile_mark_unlink_pending_at(row_f as u32, c_f);
+    let Some(fid_f) = files_alloc(A, c_f, 16, lba_f, off_f as u32) else {
+        return false;
+    };
+    FILE_OPENROW[A as usize][fid_f].store(row_f as u32, Ordering::Release);
+    let Some(row_g) = openfile_incref(lba_f, off_f as u32) else {
+        return false;
+    };
+    openfile_mark_unlink_pending_at(row_g as u32, c_g);
+    let Some(fid_g) = files_alloc(A, c_g, 16, lba_f, off_f as u32) else {
+        return false;
+    };
+    FILE_OPENROW[A as usize][fid_g].store(row_g as u32, Ordering::Release);
+    if row_f == row_g {
+        return false; // the skip-pending join must place the two files on DIFFERENT rows
+    }
+    // 4. THE SWEEP: one `files_free_by_dir` matches BOTH descriptors (same slot) and must free BOTH chains.
+    files_free_by_dir(A, lba_f, off_f as u32);
+    // 5. Fresh mount: BOTH cF and cG must be free in ALL FAT copies (re-allocatable). Before the fix the earlier
+    //    head (cF) leaks -> its entry stays nonzero -> `false`.
+    let fs2 = match crate::fs::fat::mount() {
+        Ok(fs) => fs,
+        Err(_) => return false,
+    };
+    let nf = fs2.num_fats();
+    let mut ok = true;
+    let mut f = 0;
+    while f < nf {
+        ok &= fs2.fat_entry_copy(c_f, f) == Ok(0);
+        ok &= fs2.fat_entry_copy(c_g, f) == Ok(0);
+        f += 1;
+    }
+    // 6. Cleanup: the scratch descriptors are already freed by the sweep; clear the row defensively, and `0xE5`
+    //    G's (== F's) slot so no live directory entry lingers pointing at the now-freed cG.
+    clear_files_row(A);
+    let _ = fs2.mark_dir_deleted(lba_f, off_f);
+    ok
+}
+
+/// U11-M2 (seat coalesce-review fix): launcher + PASS line for the slot-recycle two-orphan proof. Rides the U7
+/// kernel task after `u11defer_run`. Kernel-side only (no EL0 fixture — the proof is a deterministic table + FAT
+/// manipulation, the `u11_check_gen_rebind` style). Releases no further gate.
+fn u11reuse_run() {
+    static DONE: AtomicBool = AtomicBool::new(false);
+    if DONE.swap(true, Ordering::Relaxed) {
+        return;
+    }
+    if crate::drivers::block::info().is_none() {
+        return; // no SD -> the check creates real files; skip silently
+    }
+    // Pre-flight: require the scratch files ABSENT (a stale image would confound `create_in_root`'s slot reuse).
+    match crate::fs::fat::mount() {
+        Ok(fs) => {
+            if fs.find_in_root("SLTF.BIN").is_ok() || fs.find_in_root("SLTG.BIN").is_ok() {
+                serial_println!(
+                    ":: U11-reuse: SLTF/SLTG present pre-demo (stale image) — slot-recycle proof skipped ::"
+                );
+                return;
+            }
+        }
+        Err(_) => return,
+    }
+    if u11defer_check_double_orphan() {
+        serial_println!(
+            ":: U11-reuse: sys_unlink slot-recycle — two files sharing a recycled dir slot BOTH free their chains (all FAT copies) -> PASS ::"
+        );
+    } else {
+        serial_println!(
+            ":: U11-reuse: sys_unlink slot-recycle — orphan-head sweep FAIL (a chain leaked or the recycle precondition was not met) ::"
         );
     }
 }
