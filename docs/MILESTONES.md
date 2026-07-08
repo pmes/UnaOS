@@ -12,6 +12,23 @@ Legend: **✅ metal-confirmed** · **🔬 QEMU-green, metal pending** · dates I
 
 ## hw-jetson track — 2026-07-08 (attended bench, Peter at the Orin)
 
+### JB9 — FW-liveness without CPUCTL + DMA-path forensics 🔬 QEMU-green, bench pending `hw-jetson`
+- **What:** the two kernel-side probes the JB8 verdict demands. **A** (`jb9_fw_alive`, at
+  raw-handoff / post-xhc-restart / post-enum-attempt): a CPUCTL-free liveness witness — fw-header
+  identity via the ARU ioctl (+checksum/created-time), an ARU scratch heartbeat (two sweeps ~10 ms
+  apart), and MSG_ENABLED with a patient 5-attempt/~100 ms retry ladder (vs JB3's one ~200 µs try)
+  — one `FW-ALIVE`/`FW-SILENT` verdict line each. **B** (fired at t≈200 ms and t≈5 s inside the
+  `jb2b_attach` pump window, i.e. WHILE enable-slot is pending): SMR/S2CR/context-bank dump for
+  SID 0xe with an "is TTBR0 our identity table?" verdict (stale UEFI translation = the prime
+  IOVA≠PA suspect), MC HOSTR/HOSTW + error log at that instant, the FW-side SID view (ARU
+  STREAMID_FIELD + the AO IFR-autoboot trio, base DTB-resolved from padctl reg region 1), and a
+  ±2 MiB near-target RAM scan for command-completion TRBs that landed at a wrong PA.
+- **Tested:** `./arroyo check` + `UNAOS_TEGRA=1 ./arroyo check` green both arches; `esp-jetson`
+  links (kernel.elf 269,480 B, 137 `tegra:` strings); `test-arm` green (`storage_slot=1`, zero
+  panics — all JB9 code `tegra`-feature + `JB9_PROBE`-gated, QEMU byte-inert).
+- **Detail:** [`arch_arm64.md` §JB9](dev/OS/01_BOOT_HAL/arch_arm64.md). Next: the attended bench
+  fills the §JB9 verdict — which of {FW idled, SMMU stale context, SID mismatch, other}.
+
 ### JB8 — ⭐ METAL VERDICT: the Falcon was NEVER halted — CPUCTL is a CSB-locked register; the real failure is the DMA path ✅ metal-attended (USB reader) `hw-jetson`
 - **The decisive read (boot 5, pre-EBS, driver live):** xHC running (`HCH=0 CNR=0`), USB enumeration in
   progress — and `CPUCTL`/`BOOTVEC` still read `0xffffffff` while the ARU fw-header ioctl answers. The

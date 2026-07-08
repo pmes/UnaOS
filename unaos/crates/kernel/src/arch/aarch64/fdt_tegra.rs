@@ -423,6 +423,47 @@ pub fn xusb_dma_coherent(dtb_addr: u64, dtb_size: usize, ram_gib_mask: u64) -> O
     Some(fdt.prop_at(&path[..plen], b"dma-coherent").found)
 }
 
+/// JB9: the XUSB padctl AO aperture base — reg region 1 of the `padctl@3520000` node. The JB8
+/// edk2-nvidia source read pinned the IFR-autoboot registers there (`IFRDMA_CFG0` @AO+0x1bc,
+/// `IFRDMA_CFG1` @AO+0x1c0, `IFRDMA_STREAMID` @AO+0x1c4 — "padctl DT reg region 1"); resolving
+/// the base from the LIVE firmware DTB (verify-don't-assume) instead of hardcoding it keeps an
+/// unverified-aperture touch (the JX1 EL3-fatal class) impossible. `reg` on /bus@0 children is
+/// (addr:2, size:2) cells, so region 1's base is words[4..6]. None = node/region absent.
+pub fn xusb_padctl_ao(dtb_addr: u64, dtb_size: usize, ram_gib_mask: u64) -> Option<u64> {
+    if dtb_addr == 0 || dtb_size == 0 {
+        return None;
+    }
+    let g_lo = dtb_addr >> 30;
+    let g_hi = (dtb_addr + dtb_size as u64 - 1) >> 30;
+    let mapped = |g: u64| g == 0 || (g < 64 && (ram_gib_mask >> g) & 1 != 0);
+    if !mapped(g_lo) || !mapped(g_hi) {
+        return None;
+    }
+    let blob = unsafe { core::slice::from_raw_parts(dtb_addr as *const u8, dtb_size) };
+    let fdt = Fdt::new(blob)?;
+    let mut path = [0u8; MAX_PATH];
+    let mut plen = 0usize;
+    fdt.for_each_prop(|e| {
+        if plen == 0 && e.path.windows(14).any(|w| w == b"padctl@3520000") {
+            let l = e.path.len().min(MAX_PATH);
+            path[..l].copy_from_slice(&e.path[..l]);
+            plen = l;
+        }
+    });
+    if plen == 0 {
+        return None;
+    }
+    let reg = fdt.prop_at(&path[..plen], b"reg");
+    if reg.n < 8 {
+        return None;
+    }
+    let base = ((reg.words[4] as u64) << 32) | reg.words[5] as u64;
+    if base == 0 {
+        return None;
+    }
+    Some(base)
+}
+
 /// JB1a: print the BPMP IPC geometry from the firmware DTB. Read-only; pre-heap; EL2. Every
 /// outcome is one serial line — including every way of failing to find things.
 pub fn jb1a_dump(dtb_addr: u64, dtb_size: usize, ram_gib_mask: u64) {

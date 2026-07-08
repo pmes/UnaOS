@@ -814,6 +814,252 @@ pub fn jb6_csb_sweep() {
 // cross-check, and the two apertures behaving differently (BAR2 decodes-but-floats vs CFG unrouted)
 // is itself the finding.
 
+// ---------------------------------------------------------------------------------------------
+// JB9: FW-liveness without CPUCTL + DMA-path forensics.
+//
+// The JB8 metal verdict this arc stands on: the Falcon was NEVER halted — CPUCTL=0xffffffff is a
+// CSB priv-lock read (signed FW at raised priv; external CSB reads float all-ones) taken on a
+// provably RUNNING core (pre-EBS: HCH=0, CNR=0, USB enumerating), so CPUCTL/BOOTVEC are never a
+// liveness witness on this firmware. The real failure is the DMA path: at kernel time the
+// register path is healthy (ports link-train to U0, CCS=1 PED=1) but enable-slot watchdog-times-
+// out — command-ring fetches / event-ring writebacks never touch DRAM, with a clean SMMU/MC fault
+// census. Two probes, in order:
+//   A (jb9_fw_alive) — a CPUCTL-free FW-liveness witness: fw-header identity reads through the
+//     ARU ioctl (the one aperture JB8 proved answers on a locked core), an ARU scratch heartbeat
+//     (two sweeps ~10 ms apart — a live FW that updates any mailbox/scratch word shows as a
+//     diff), and the MSG_ENABLED handshake with a PATIENT retry ladder (JB3 tried once with a
+//     ~200 µs poll; a busy FW at handoff time deserves 5 spaced attempts over ~50 ms). Run at
+//     three points: raw-handoff, post-xhc-restart, post-enum-attempt.
+//   B (jb9_stream_dump in smmu_tegra + jb9_fw_sid_view + jb9_ring_scan) — forensics captured
+//     WHILE enable-slot is pending (the JB8 log: ~340 ms per watchdog attempt, 3 per port — the
+//     pump loop fires the capture at t≈200 ms and t≈5 s into the window): the SMMU binding for
+//     the XUSB stream at write time, the MC override/error state at that instant, the SID the FW
+//     itself is configured to tag (ARU STREAMID_FIELD), and a near-target scan for command-
+//     completion TRBs that landed NEAR the event ring (a stale translation lands DMA at a wrong
+//     PA with zero faults — if the write went somewhere nearby, the scan names where).
+// Everything is read-only except the mailbox handshake (the same writes jb3_aru_probe already
+// makes) and stays inside apertures prior arcs proved safe: ARU/BAR2 first page (JB6/JB8),
+// SMMU/MC (JB3), RAM (the scan). No CFG-path CSB, no FPCI BAR dereference, no AO touch — the AO
+// IFRDMA_STREAMID read is SKIPped by design (no source-verified register offset; an unverified
+// aperture is the JX1 EL3-fatal class).
+// ---------------------------------------------------------------------------------------------
+
+/// JB9 master gate, sibling of JB5_PROBE: probe media only. When false every jb9_* is a silent
+/// no-op (call sites stay wired).
+pub const JB9_PROBE: bool = true;
+
+/// The ARU register span the heartbeat sweeps: [0x0, 0x140) — the first-page range jb6_csb_sweep
+/// / JB8 metal proved decodes cleanly (reads return data, no fault) on this block.
+const JB9_HB_WORDS: usize = 0x140 / 4;
+
+/// BAR2 routed + mem-decode on — the same self-guard jb5_witness uses before an ARU touch.
+fn jb9_bar2_routed() -> bool {
+    let fr = |off: u64| unsafe { core::ptr::read_volatile((XUSB_FPCI + off) as *const u32) };
+    fr(0x1c) & !0xf != 0 && (fr(0x4) >> 1) & 1 == 1
+}
+
+/// JB9-A: the CPUCTL-free FW-liveness witness. Prints one FW-ALIVE / FW-SILENT verdict line per
+/// probe point; ALIVE = the firmware demonstrably did something (served the header ioctl AND
+/// (answered the mailbox OR updated a scratch word between sweeps)).
+pub fn jb9_fw_alive(tag: &str) {
+    if !JB9_PROBE {
+        return;
+    }
+    if !jb9_bar2_routed() {
+        serial_println!(":: tegra: JB9-A [{}] — BAR2 unrouted; SKIP ::", tag);
+        return;
+    }
+    let r = |off: u64| unsafe { core::ptr::read_volatile((XUSB_BAR2 + off) as *const u32) };
+    let w = |off: u64, v: u32| unsafe { core::ptr::write_volatile((XUSB_BAR2 + off) as *mut u32, v) };
+    let fw_hdr = |byte_off: u32| {
+        w(0x1000, (17u32 << 24) | byte_off); // FW_IOCTL_CFGTBL_READ (JB3 boot-12, JB8-proven)
+        r(0x1c)
+    };
+
+    // 1. FW-header identity: codetag/codesize (the JB8 liveness anchor: 0xc85f when the resident
+    //    image answers) + fwimg_checksum @0x28 / fwimg_created_time @0x2c (mainline
+    //    tegra_xusb_fw_header layout) — a wrong/floating aperture cannot fake four coherent words.
+    let (codetag, codesize) = (fw_hdr(0x08), fw_hdr(0x0c));
+    let (cksum, created) = (fw_hdr(0x28), fw_hdr(0x2c));
+    let hdr_ok = codesize != 0 && codesize != 0xffff_ffff;
+    serial_println!(
+        ":: tegra: JB9-A [{}] — fw hdr: codetag={:#010x} codesize={:#010x} checksum={:#010x} created={:#010x} ({}) ::",
+        tag, codetag, codesize, cksum, created,
+        if hdr_ok { "ioctl SERVED" } else { "ioctl DEAD" }
+    );
+
+    // 2. Scratch heartbeat: sweep the proven ARU range twice, ~10 ms apart. Any word a live FW
+    //    updates between sweeps is a heartbeat CPUCTL can never show.
+    let mut snap = [0u32; JB9_HB_WORDS];
+    for (i, s) in snap.iter_mut().enumerate() {
+        *s = r(4 * i as u64);
+    }
+    udelay(10_000);
+    let mut changed = 0u32;
+    for (i, &s) in snap.iter().enumerate() {
+        let now = r(4 * i as u64);
+        if now != s {
+            changed += 1;
+            if changed <= 8 {
+                serial_println!(
+                    ":: tegra: JB9-A [{}] — heartbeat: BAR2[{:#05x}] {:#010x} -> {:#010x} ::",
+                    tag, 4 * i, s, now
+                );
+            }
+        }
+    }
+    serial_println!(
+        ":: tegra: JB9-A [{}] — heartbeat: {} of {} ARU words changed over ~10 ms ::",
+        tag, changed, JB9_HB_WORDS
+    );
+
+    // 3. MSG_ENABLED, patiently: 5 attempts, each = claim -> send -> ~10 ms ACK poll -> release,
+    //    ~10 ms apart (total ~100 ms vs JB3's one ~200 µs try). Serviced = DATA_OUT went nonzero
+    //    OR the firmware released/took the owner semaphore itself.
+    let mut serviced = false;
+    let mut attempts_used = 0u32;
+    for attempt in 0..5u32 {
+        attempts_used = attempt + 1;
+        let own0 = r(0x010);
+        w(0x010, 2); // OWNER_SW
+        if r(0x010) != 2 {
+            // Can't claim — either the FW holds it (itself a liveness datum) or the semaphore
+            // is dead. Log once, wait, retry.
+            if attempt == 0 {
+                serial_println!(
+                    ":: tegra: JB9-A [{}] — mbox owner claim refused (pre={:#x} rb={:#x}) ::",
+                    tag, own0, r(0x010)
+                );
+            }
+            udelay(10_000);
+            continue;
+        }
+        w(0x008, 5u32 << 24); // DATA_IN: MBOX_CMD_MSG_ENABLED
+        w(0x004, r(0x004) | (1 << 31) | (1 << 27)); // CMD: INT_EN | DEST_FALC
+        let deadline = cntpct().wrapping_add(cntfrq().saturating_mul(10) / 1000); // ~10 ms
+        loop {
+            if r(0x00c) != 0 || r(0x010) != 2 {
+                serviced = true;
+                break;
+            }
+            if cntpct().wrapping_sub(deadline) < (1u64 << 63) {
+                break; // deadline passed (wrap-safe)
+            }
+            core::hint::spin_loop();
+        }
+        let (dout, own) = (r(0x00c), r(0x010));
+        if own == 2 {
+            w(0x010, 0); // release for the next attempt / the firmware
+        }
+        if serviced {
+            serial_println!(
+                ":: tegra: JB9-A [{}] — MSG_ENABLED serviced on attempt {}: data_out={:#010x} owner={:#x} ::",
+                tag, attempt + 1, dout, own
+            );
+            break;
+        }
+        udelay(10_000);
+    }
+    serial_println!(
+        ":: tegra: JB9-A [{}] — verdict: {} (hdr={} heartbeat={} mbox={} attempts={}) ::",
+        tag,
+        if hdr_ok && (serviced || changed > 0) { "FW-ALIVE" } else { "FW-SILENT" },
+        hdr_ok, changed, serviced, attempts_used
+    );
+}
+
+/// JB9-B: the SID the firmware itself is configured to tag its DMA with — ARU IFRDMA_CFG0/1 +
+/// STREAMID_FIELD (BAR2 +0xe0/0xe4/0xe8, the words jb3_aru_probe restores), plus the AO-side
+/// IFR-autoboot registers (the JB8 source read: `IFRDMA_CFG0` @AO+0x1bc, `CFG1` @AO+0x1c0,
+/// `IFRDMA_STREAMID` @AO+0x1c4 — the SID UEFI told the Falcon's ROM DMA engine to tag with).
+/// `ao` = padctl reg region 1 base, DTB-resolved by the caller; None prints a SKIP (never a
+/// guessed address — the JX1 rule).
+pub fn jb9_fw_sid_view(tag: &str, ao: Option<u64>) {
+    if !JB9_PROBE || !jb9_bar2_routed() {
+        return;
+    }
+    let r = |off: u64| unsafe { core::ptr::read_volatile((XUSB_BAR2 + off) as *const u32) };
+    serial_println!(
+        ":: tegra: JB9-B [{}] — FW SID view (ARU): IFRDMA_CFG0={:#010x} CFG1={:#010x} STREAMID_FIELD={:#010x} ::",
+        tag, r(0x0e0), r(0x0e4), r(0x0e8)
+    );
+    match ao {
+        Some(base) => {
+            // JX1 discipline: a new address class announces itself BEFORE the first read, so a
+            // dead boot's last line names the killer aperture. (padctl AO is always-on and the
+            // base is DTB-resolved, but the discipline costs one line.)
+            serial_println!(
+                ":: tegra: JB9-B [{}] — padctl AO @{:#010x} first touch ::",
+                tag, base
+            );
+            let ar = |off: u64| unsafe { core::ptr::read_volatile((base + off) as *const u32) };
+            serial_println!(
+                ":: tegra: JB9-B [{}] — FW SID view (AO @{:#010x}): IFRDMA_CFG0={:#010x} CFG1={:#010x} STREAMID={:#010x} ::",
+                tag, base, ar(0x1bc), ar(0x1c0), ar(0x1c4)
+            );
+        }
+        None => serial_println!(
+            ":: tegra: JB9-B [{}] — AO IFRDMA view: SKIP (padctl reg region 1 not in DTB) ::",
+            tag
+        ),
+    }
+}
+
+/// JB9-B: near-target scan — did the event-ring writeback land NEAR where it should have?
+/// Scans ±2 MiB of identity-mapped RAM around the event ring for the command-completion
+/// fingerprint (TRB qword0 pointing into the command ring's page + TRB type 33 in dword3) — a
+/// stale IOVA≠PA translation would deposit exactly that pattern at a wrong PA. Also dumps the
+/// event ring's first four TRB slots (did anything land AT target?). Read-only RAM walk, ~4 MiB
+/// at 16-byte steps, clamped to the DRAM base so it can never wander into device space.
+pub fn jb9_ring_scan(evt_phys: u64, cmd_phys: u64, tag: &str) {
+    if !JB9_PROBE || evt_phys == 0 || cmd_phys == 0 {
+        return;
+    }
+    let rd64 = |a: u64| unsafe { core::ptr::read_volatile(a as *const u64) };
+    let rd32 = |a: u64| unsafe { core::ptr::read_volatile(a as *const u32) };
+    // At target: the ring itself.
+    for i in 0..4u64 {
+        let t = evt_phys + 16 * i;
+        serial_println!(
+            ":: tegra: JB9-B [{}] — evt-ring[{}] @{:#x}: {:#010x} {:#010x} {:#010x} {:#010x} ::",
+            tag, i, t, rd32(t), rd32(t + 4), rd32(t + 8), rd32(t + 12)
+        );
+    }
+    // Near target: the fingerprint sweep. Orin DRAM starts at 0x8000_0000 (the heap the rings
+    // live in is identity-mapped RAM just above it) — clamp so the scan stays in RAM.
+    const DRAM_BASE: u64 = 0x8000_0000;
+    let start = evt_phys.saturating_sub(2 * 1024 * 1024).max(DRAM_BASE) & !15;
+    let end = evt_phys + 2 * 1024 * 1024;
+    let cmd_page = cmd_phys & !0xfff;
+    let mut hits = 0u32;
+    let mut p = start;
+    while p < end {
+        let qw0 = rd64(p);
+        if qw0 >= cmd_page && qw0 < cmd_page + 0x1000 {
+            let d3 = rd32(p + 12);
+            if (d3 >> 10) & 0x3f == 33 {
+                hits += 1;
+                if hits <= 4 {
+                    let (dir, delta) = if p >= evt_phys {
+                        ("+", p - evt_phys)
+                    } else {
+                        ("-", evt_phys - p)
+                    };
+                    serial_println!(
+                        ":: tegra: JB9-B [{}] — near-target HIT @{:#x} (evt-ring{}{:#x}): {:#010x} {:#010x} {:#010x} {:#010x} ::",
+                        tag, p, dir, delta, rd32(p), rd32(p + 4), rd32(p + 8), d3
+                    );
+                }
+            }
+        }
+        p += 16;
+    }
+    serial_println!(
+        ":: tegra: JB9-B [{}] — near-target scan [{:#x}..{:#x}) cmd-page={:#x}: {} completion-TRB hit(s) ::",
+        tag, start, end, cmd_page, hits
+    );
+}
+
 /// JB5 run E: release the SS ELPG clamps — the InitHw step jb2c never covered. UEFI's
 /// UsbPadCtlDxe DeInitHw (EBS) powers USB3 down per port: set SSPX_ELPG_CLAMP_EN_EARLY, 200 µs,
 /// set SSPX_ELPG_CLAMP_EN, 350 µs, set SSPX_ELPG_VCORE_DOWN — so every UnaOS boot inherits the SS
@@ -910,7 +1156,14 @@ pub fn jb5_settle_witness(tag: &str) {
     jb5_witness(tag);
 }
 
-pub fn jb2b_attach(dma_coherent: Option<bool>) -> Option<(u8, u8)> {
+/// `jb9_smmu` = (NISO1 SMMU instance bases, XUSB SID) — threaded in by the caller so the JB9-B
+/// forensic captures below can dump the stream binding at enable-slot-pending time.
+pub fn jb2b_attach(
+    dma_coherent: Option<bool>,
+    jb9_bases: &[u64],
+    jb9_sid: u32,
+    jb9_ao: Option<u64>,
+) -> Option<(u8, u8)> {
     serial_println!(
         ":: tegra: JB2b — usb@3610000 dma-coherent: {} ::",
         match dma_coherent {
@@ -937,6 +1190,12 @@ pub fn jb2b_attach(dma_coherent: Option<bool>) -> Option<(u8, u8)> {
     // The exact sequence the PCIe paths run (arch/aarch64/pci.rs), minus discovery/bus-master —
     // a platform controller has no config space; DMA mastering came with the BPMP ungate.
     xhci::init(XUSB_HOST); // halt + HCRST + CNR wait (Falcon survives; see header)
+    // JB9-A probe point 2: the FW's liveness right after our halt+HCRST+CNR restart — did the
+    // reset sequence idle the firmware's service loop, or is it still answering?
+    jb9_fw_alive("post-xhc-restart");
+    // JB9-B needs the ring physical bases after the controller lock is released — captured here.
+    let mut jb9_evt_phys = 0u64;
+    let mut jb9_cmd_phys = 0u64;
     unsafe {
         let mut x = xhci::XhciController::new(XUSB_HOST as usize);
         let (event_ring_phys, command_ring_phys) = {
@@ -949,6 +1208,8 @@ pub fn jb2b_attach(dma_coherent: Option<bool>) -> Option<(u8, u8)> {
                 cmd_ring_guard.as_mut().unwrap().get_ptr(),
             )
         };
+        jb9_evt_phys = event_ring_phys;
+        jb9_cmd_phys = command_ring_phys;
         let erst_table_phys = &raw mut xhci::ERST_TABLE as u64;
         // One line before the first RUNTIME-register / doorbell-array touch (new offsets within
         // the ungated block — the JX1 discipline: a dead boot's last line names the killer).
@@ -968,8 +1229,28 @@ pub fn jb2b_attach(dma_coherent: Option<bool>) -> Option<(u8, u8)> {
     // stages plus the keyboard's own. Only a FAILING boot pays the wait (the happy path exits at
     // keyboard-ARMED in a few seconds), and the driver's stage/still-waiting lines keep the
     // serial console visibly alive throughout.
-    let deadline = cntpct().wrapping_add(cntfrq().saturating_mul(60));
+    let pump_start = cntpct();
+    let deadline = pump_start.wrapping_add(cntfrq().saturating_mul(60));
+    // JB9-B capture marks: t≈200 ms (mid the FIRST port's first enable-slot attempt — the JB8
+    // log shows ~340 ms per watchdog attempt, so the command is in flight) and t≈5 s (a later
+    // port's attempt — same question after several rounds of recovery). Fired OUTSIDE the
+    // controller lock; every capture is read-only.
+    let mut jb9_marks = [
+        (cntfrq() / 5, "t+200ms", false),
+        (cntfrq().saturating_mul(5), "t+5s", false),
+    ];
     loop {
+        if JB9_PROBE {
+            let elapsed = cntpct().wrapping_sub(pump_start);
+            for m in jb9_marks.iter_mut() {
+                if !m.2 && elapsed >= m.0 {
+                    m.2 = true;
+                    super::smmu_tegra::jb9_stream_dump(jb9_bases, jb9_sid, m.1);
+                    jb9_fw_sid_view(m.1, jb9_ao);
+                    jb9_ring_scan(jb9_evt_phys, jb9_cmd_phys, m.1);
+                }
+            }
+        }
         let armed = {
             let mut guard = xhci::XHCI_CONTROLLER.lock();
             let x = guard.as_mut().unwrap();

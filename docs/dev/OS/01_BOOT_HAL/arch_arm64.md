@@ -1305,6 +1305,62 @@ retry + FW scratch heartbeat), (b) DMA-path forensics under the live-Falcon prem
 writes go (SMMU S2CR/CB actually bound to stream 0xe at write time? stale UEFI SMMU context translating
 IOVA≠PA? MC override vs the FW's own StreamID field) — arc B's question, reopened with arc A dead.
 
+### JB9 — FW-liveness without CPUCTL + DMA-path forensics (kernel-side arc)
+
+JB8's verdict reframed everything this arc stands on: the Falcon runs, CPUCTL/BOOTVEC are CSB
+priv-locked reads (never a liveness witness on this firmware), and the real failure is the DMA
+path — register ops healthy (ports link-train to U0, `CCS=1 PED=1`), but `enable-slot`
+watchdog-times-out because command-ring fetches / event-ring writebacks never touch DRAM, with a
+clean SMMU/MC fault census. JB9 ships two kernel-side probes (all `tegra`-feature +
+`JB9_PROBE`-gated, QEMU byte-inert):
+
+**A — the CPUCTL-free FW-liveness witness** (`xusb_tegra::jb9_fw_alive`), run at three points:
+`raw-handoff` (after the JB5 minimal BAR2 route, before any XUSB-affecting MRQ),
+`post-xhc-restart` (inside `jb2b_attach`, right after the shared driver's halt+HCRST+CNR init),
+and `post-enum-attempt` (after the enumeration window closes). Each print is one verdict line
+built from three CPUCTL-free signals:
+1. *fw-header identity* through the ARU ioctl (the aperture JB8 proved answers on a locked core):
+   codetag/codesize + `fwimg_checksum`@0x28 / `fwimg_created_time`@0x2c (mainline
+   `tegra_xusb_fw_header` layout) — four coherent words a floating aperture cannot fake;
+2. *scratch heartbeat*: the proven ARU range `[0x0,0x140)` swept twice ~10 ms apart — any word a
+   live FW updates between sweeps is a heartbeat;
+3. *MSG_ENABLED, patiently*: 5 spaced claim→send→~10 ms-ACK-poll→release attempts over ~100 ms
+   (JB3's single ~200 µs try is the one datum suggesting the FW may not service requests
+   post-handoff; a busy FW deserves patience before that verdict sticks).
+Verdict line: `JB9-A [tag] — verdict: FW-ALIVE|FW-SILENT (hdr=… heartbeat=… mbox=… attempts=…)`.
+
+**B — DMA forensics at enable-slot-pending time.** The pump loop inside `jb2b_attach` fires two
+read-only captures at t≈200 ms and t≈5 s into the window — per the JB8 log, squarely inside an
+enable-slot watchdog attempt (~340 ms each, 3 per port), i.e. while a live engine is actively
+fetching a command ring that never lands. Each capture:
+- `smmu_tegra::jb9_stream_dump` — the SMR matching SID 0xe and its S2CR routing on both NISO1
+  instances, then the FULL context bank S2CR points at (SCTLR/TTBR0/TCR/TCR2/MAIR0 + FSR/FAR)
+  with an explicit **"is TTBR0 OUR JB3 identity table?"** verdict — the prime suspect is a stale
+  UEFI context translating IOVA≠PA (silent mis-landing explains the zero faults) — plus the MC
+  HOSTR/HOSTW overrides + error log *at that instant*;
+- `xusb_tegra::jb9_fw_sid_view` — the SID the firmware side is configured to tag: ARU
+  `IFRDMA_CFG0/1`+`STREAMID_FIELD` (BAR2+0xe0/0xe4/0xe8) and the AO-side IFR-autoboot trio
+  (`IFRDMA_CFG0`@AO+0x1bc, `CFG1`@+0x1c0, `IFRDMA_STREAMID`@+0x1c4 — JB8's edk2 source read),
+  the AO base DTB-resolved from `padctl@3520000` reg region 1 (`fdt_tegra::xusb_padctl_ao`;
+  absent ⇒ printed SKIP, never a guessed aperture);
+- `xusb_tegra::jb9_ring_scan` — did the event-ring writeback land NEAR the target? The event
+  ring's first four TRB slots (at-target), then a ±2 MiB RAM sweep around the ring for the
+  command-completion fingerprint (TRB qword0 pointing into the command-ring page + type 33),
+  clamped to the DRAM base. A hit at a wrong PA names the stale-translation delta directly.
+
+Hazard posture: no CFG-path CSB touch (EL3-fatal, JB7), no FPCI BAR dereference (JB8 masks
+lesson — the probes ride the already-routed windows), AO read only from a DTB-resolved base with
+a JX1 first-touch announce line. The only writes are the mailbox handshake words `jb3_aru_probe`
+already writes and the CSB page-select.
+
+**Gate:** `./arroyo check` + `UNAOS_TEGRA=1 ./arroyo check` both arches green; `UNAOS_TEGRA=1
+./arroyo esp-jetson` links (kernel.elf 269,480 B tegra, 137 `tegra:` strings — grown from JB8's
+254,536 B by the probe code, well under the ~355 KB corrupt-bloat signature); virt `test-arm`
+green (`storage_slot=1`, zero panics — JB9 is `tegra`-gated, QEMU byte-inert).
+
+**Bench verdict (attended, pending):** which of {FW idled, SMMU stale context, SID mismatch,
+other} the data supports — to be filled from the JB9 serial after Peter's next bench window.
+
 ## 4. Jetson Orin Nano headless bring-up (Arc JM2)
 
 The Orin is brought up **headless over serial**. The only console that has ever

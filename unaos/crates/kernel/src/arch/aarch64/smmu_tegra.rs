@@ -399,6 +399,84 @@ pub fn jb3_v3_dump(base: u64) {
     );
 }
 
+/// JB9-B: the DMA-forensics dump, taken WHILE enable-slot is pending (the JB8 verdict's live
+/// window: a running Falcon fetches the command ring / writes the event ring and nothing lands,
+/// zero faults). Per instance: the SMR that matches the XUSB SID and its S2CR routing, then the
+/// FULL context bank that S2CR points at — SCTLR/TTBR0/TCR/TCR2/MAIR0 + FSR/FAR — with an
+/// explicit "is TTBR0 OUR identity table?" verdict (a stale UEFI context translating IOVA≠PA
+/// lands DMA at the wrong PA with zero faults — the prime suspect). Then the MC HOSTR/HOSTW
+/// override + error log AT THIS INSTANT (not pre/post like JB3's brackets). Read-only.
+pub fn jb9_stream_dump(bases: &[u64], xusb_sid: u32, tag: &str) {
+    let ours = &JB3_IDMAP as *const _ as u64;
+    serial_println!(
+        ":: tegra: JB9-B [{}] — SMMU stream {:#x} binding at enable-slot-pending time ::",
+        tag,
+        xusb_sid
+    );
+    for (i, &base) in bases.iter().enumerate() {
+        let scr0 = rd(base, SCR0);
+        let n = (rd(base, IDR0) & 0xff).min(MAX_SMRG);
+        let mut matched = false;
+        for s in 0..n {
+            let smr = rd(base, SMR_BASE + 4 * s as u64);
+            if smr & (1 << 31) == 0 {
+                continue;
+            }
+            let (id, mask) = (smr & 0x7fff, (smr >> 16) & 0x7fff);
+            if (xusb_sid ^ id) & !mask & 0x7fff != 0 {
+                continue;
+            }
+            matched = true;
+            let s2cr = rd(base, S2CR_BASE + 4 * s as u64);
+            let (s2type, cbndx) = ((s2cr >> 16) & 0b11, (s2cr & 0xff) as u64);
+            serial_println!(
+                ":: tegra: JB9-B [{}] — inst{} sCR0={:#010x} SMR[{}]={:#010x} S2CR={:#010x} (type={} cbndx={}) ::",
+                tag, i, scr0, s, smr, s2cr, s2type, cbndx
+            );
+            // The context bank S2CR routes to (only meaningful for type=translate).
+            let cb = base + CB0_OFF + cbndx * 0x10000;
+            let (ttbr_lo, ttbr_hi) = (rd(cb, 0x20), rd(cb, 0x24));
+            let ttbr = ((ttbr_hi as u64) << 32 | ttbr_lo as u64) & 0xffff_ffff_ffff;
+            serial_println!(
+                ":: tegra: JB9-B [{}] — inst{} CB{}: SCTLR={:#010x} TTBR0={:#x} ({}) TCR={:#010x} TCR2={:#010x} MAIR0={:#010x} CBAR={:#010x} CBA2R={:#010x} ::",
+                tag, i, cbndx,
+                rd(cb, 0x0),
+                ttbr,
+                if ttbr == ours { "OURS — JB3 identity map" } else { "NOT OURS — stale/foreign table" },
+                rd(cb, 0x30),
+                rd(cb, 0x10),
+                rd(cb, 0x38),
+                rd(base, GR1_OFF + 4 * cbndx),
+                rd(base, GR1_OFF + 0x800 + 4 * cbndx)
+            );
+            serial_println!(
+                ":: tegra: JB9-B [{}] — inst{} CB{} faults: FSR={:#010x} FAR={:#x}_{:08x} ::",
+                tag, i, cbndx, rd(cb, 0x58), rd(cb, 0x64), rd(cb, 0x60)
+            );
+        }
+        if !matched {
+            serial_println!(
+                ":: tegra: JB9-B [{}] — inst{} sCR0={:#010x}: NO valid SMR matches SID {:#x} (USFCFG={} governs) ::",
+                tag, i, scr0, xusb_sid, (scr0 >> 10) & 1
+            );
+        }
+        jb3_fault_line(i, base, tag);
+    }
+    // The MC's view at this instant: which SID do HOSTR/HOSTW transactions carry, and has the
+    // always-on MC logged an aborted client request while the command engine was fetching?
+    serial_println!(
+        ":: tegra: JB9-B [{}] — MC HOSTR={:#010x}/sec={:#010x} HOSTW={:#010x}/sec={:#010x} INTSTATUS={:#010x} ERR_STATUS={:#010x} ERR_ADR={:#010x} ::",
+        tag,
+        rd(MC_SID_BASE, 0x250),
+        rd(MC_SID_BASE, 0x254),
+        rd(MC_SID_BASE, 0x258),
+        rd(MC_SID_BASE, 0x25c),
+        rd(MC_SID_BASE, 0x00),
+        rd(MC_SID_BASE, 0x08),
+        rd(MC_SID_BASE, 0x0c)
+    );
+}
+
 fn jb3_fault_line(i: usize, base: u64, tag: &str) {
     let gfsr = rd(base, SGFSR);
     let far_lo = rd(base, SGFAR_LO);

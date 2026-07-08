@@ -1030,6 +1030,9 @@ fn tegra_early_stop(boot_info: &'static mut BootInfo) -> ! {
                             // first JB7 metal boot and is EL3-FATAL on the halted block — SError to
                             // BL31 — so it was removed; see the xusb_tegra JB7 note.)
                             unaos_kernel::arch::bpmp_tegra::jb7_clocks_query(&chan, ids);
+                            // JB9-A probe point 1: FW liveness at raw handoff, CPUCTL-free
+                            // (JB8: CPUCTL is a CSB priv-lock read, never a liveness witness).
+                            unaos_kernel::arch::xusb_tegra::jb9_fw_alive("raw-handoff");
                         }
                         Some(_) => serial_println!(
                             ":: tegra: JB5 — XUSB domain not ON at handoff; raw witness SKIPPED (JX1 rule) ::"
@@ -1256,8 +1259,25 @@ fn tegra_early_stop(boot_info: &'static mut BootInfo) -> ! {
             dtb_size,
             mmu.ram_gib_mask,
         );
-        let attached = unaos_kernel::arch::xusb_tegra::jb2b_attach(coherent).is_some();
+        // JB9: the SMMU bases + SID + the DTB-resolved padctl AO aperture ride into the attach
+        // so the enable-slot-pending forensic captures (t+200ms / t+5s inside the pump window)
+        // can dump the stream binding + the FW-side SID view live.
+        let jb9_ao = unaos_kernel::arch::fdt_tegra::xusb_padctl_ao(
+            dtb_addr,
+            dtb_size,
+            mmu.ram_gib_mask,
+        );
+        let attached = unaos_kernel::arch::xusb_tegra::jb2b_attach(
+            coherent,
+            &jb3_bases[..jb3_n],
+            jb3_sid,
+            jb9_ao,
+        )
+        .is_some();
         unaos_kernel::arch::xusb_tegra::jb5_witness("post-attach");
+        // JB9-A probe point 3: FW liveness after the enumeration attempt (did the enable-slot
+        // watchdog rounds leave the firmware's service loop dead or still answering?).
+        unaos_kernel::arch::xusb_tegra::jb9_fw_alive("post-enum-attempt");
         // The post-attach witness: after the enumeration window (and any ENABLE_SLOT
         // watchdogs), sGFSR/sGFSYNR say whether THIS block recorded the kills — and name the
         // faulting StreamID.
