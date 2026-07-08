@@ -12,6 +12,23 @@ Legend: **✅ metal-confirmed** · **🔬 QEMU-green, metal pending** · dates I
 
 ## hw-jetson track — 2026-07-08 (attended bench, Peter at the Orin)
 
+### JB8 — pre-EBS Falcon witness + reconnect lever; IFR-autoboot discovery reopens the NS start question 🔬 QEMU-green, metal pending `hw-jetson`
+- **What:** an edk2-nvidia source read (r36.4.0-updates) shows **UEFI never halts the Falcon core** (only
+  BPMP PG/reset asserts at EBS — *both* teardown layers carry the JB6 ACPI skip) and **T234 starts it via
+  IFR DMA autoboot** (three AO-aperture writes: `IFRDMA_CFG0/1` = fw-buffer PA, `STREAMID` = 0xE; buffer is
+  `EfiRuntimeServicesData`, survives EBS) — plain NS MMIO, **no secure world** — so JB7's "NS-unstartable"
+  verdict rests on a lever nobody has pulled. JB8 ships the discriminating loader-side probe:
+  `jb8_falcon_witness` reads FPCI CFG + CSB `CPUCTL`/`BOOTVEC`/fw-header + `USBSTS.CNR` **pre-ExitBootServices**
+  (is the Falcon already dead before handoff?), and a separate `jb8lever` risk media
+  (`UNAOS_JB8_LEVER=1`) forces `Disconnect`+`ConnectController` on the `Usb2Hc` handles — a fresh
+  `XhciControllerDxe.Start` (PG cycle + IFR load) right before handoff, with a post-reconnect re-read.
+- **Tested:** `./arroyo check` + `UNAOS_TEGRA=1 ./arroyo check` green both arches; `esp-jetson` links with
+  and without the lever feature (kernel.elf 254,536 B, 120 `tegra:` strings); `test-arm` green
+  (`storage_slot=1`, zero panics — loader-side, tegra234-DTB-gated, QEMU inert). Metal: pending the
+  attended bench (witness media first, lever media only if the witness reads dead).
+- **Detail:** [`arch_arm64.md` §JB8](dev/OS/01_BOOT_HAL/arch_arm64.md). Next: bench; then the kernel-side
+  IFR restart if the lever proves the path.
+
 ### JB7 — arc B refuted, arc A closed at the non-secure wall (Falcon core reset-held, unstartable from NS) ✅ metal-attended (native microSD) `hw-jetson`
 - **What:** an offline read of the JB6 run-F serial **refutes arc B** (the "XUSB StreamID mismatch"): the
   MC override **sticks** at `0xe` (`rb=0x0000000e/0x0000000e`; the "reads `0x0`" was the pre-fix

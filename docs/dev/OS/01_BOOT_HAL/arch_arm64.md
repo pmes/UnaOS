@@ -1215,6 +1215,62 @@ warnings); `UNAOS_TEGRA=1 ./arroyo esp-jetson` links, `kernel.elf` 254,536 B teg
 virt `test-arm` green (`storage_slot=1`, byte-identical — all JB7 code gated off). Metal: native-microSD
 boot clean through CAPSTONE 6/6 with the clock census; the removed CFG probe's EL3 fault is recorded above.
 
+### JB8 — pre-EBS Falcon witness + reconnect lever, and the IFR-autoboot discovery (loader-side arc)
+
+JB7 closed arc A "at the non-secure wall" on the premise that starting the Falcon core needs a reset lever
+NS can't reach. A source read of edk2-nvidia (r36.4.0-updates, the JetPack-6 branch this board runs, plus
+main) overturns a load-bearing part of that premise:
+
+- **Nothing in UEFI ever halts the Falcon core.** There is no STOPCPU/CPUCTL-halt anywhere in the tree. The
+  only teardown levers are BPMP: the driver's `OnExitBootServices` asserts the XUSBA/XUSBC power gates
+  (MRQ_PG — PG assert implies partition reset), and a *second*, framework-level EBS teardown
+  (`DeviceDiscoveryOnExitBootServices`) gates clocks + asserts the DT resets (MRQ_RESET). **Both** carry the
+  same ACPI-table skip, so the JB6 dummy-ACPI shim suppresses both — consistent with JB6's live-block
+  inheritance.
+- **T234 UEFI never starts the Falcon via CPUCTL.** In `XhciControllerDxe.Start` (after a PG
+  deassert→assert→deassert cycle, padctl `InitHw`, and FPCI CFG_4/CFG_7/CFG_1 programming) it polls
+  `USBSTS.CNR` for 200 ms: if CNR clears, firmware is already alive from the boot chain (MB2 — "Skipping
+  powergate XUSB") and the load is **skipped**; else it runs `FalconFirmwareIfrLoad` — **IFR DMA autoboot**:
+  copy the `xusb-fw` flash-partition blob (from `UsbFirmwareDxe`) into a DMA buffer of
+  `EfiRuntimeServicesData` (survives EBS), then three writes to the **AO aperture** (padctl DT reg region 1):
+  `AO+0x1bc IFRDMA_CFG0` ← buffer PA[31:0], `AO+0x1c0 IFRDMA_CFG1` ← PA[39:32], `AO+0x1c4
+  IFRDMA_STREAMID` ← 0xE — and the Falcon's ROM engine fetches and boots the firmware itself. Plain NS MMIO
+  + NS DMA; **no secure world involved**. The legacy CSB `BOOTVEC`+`CPUCTL_STARTCPU` path (what JB3 tried) is
+  T186/T194-only. `Start` runs unconditionally at BDS connect (driver-binding on the DeviceDiscovery DT
+  handle; DEPEX = padctl + xusb-fw protocols), not just when USB is used.
+
+So the "reset-held core" may in fact be a **never-IFR-restarted core after the Start PG cycle** — and IFR is
+an NS-reachable start lever the kernel (or loader) can pull, provided the AO aperture and a firmware image
+are in hand (post-EBS, `IFRDMA_CFG0/1` should still hold the runtime-services buffer PA).
+
+**JB8 ships the discriminating probe, loader-side** (`crates/bootloader`, runtime-gated on the tegra234 DTB
+sniff — now factored into `dtb_is_tegra234`, shared with the JB6 shim; QEMU virt untouched at runtime):
+
+- `jb8_falcon_witness("pre-EBS")` — runs immediately before the JB6 shim + `exit_boot_services`, while
+  `XhciControllerDxe` still owns a live block: FPCI CFG_0/CFG_1/CFG_7, then (BAR2 self-located from CFG_7,
+  never assumed) the kernel's exact JB3 CSB recipe — `CPUCTL`, `BOOTVEC`, fw codetag/codesize via the
+  FW_SCRATCH ioctl — plus `USBSTS.CNR` via BAR0 (pre-EBS CNR discriminates "MB2 FW alive, load skipped"
+  from "IFR load attempted"; post-halt CNR remains a stale latch, JB7). One bit decides the arc:
+  `CPUCTL!=0xffffffff` pre-EBS ⇒ the kill is in the EBS window (huntable from the loader);
+  `==0xffffffff` ⇒ `Start`'s own PG cycle (or earlier) left it dead and the lever is a forced re-`Start`.
+- `jb8_reconnect_lever()` — **separate risk media**, bootloader feature `jb8lever`
+  (`UNAOS_JB8_LEVER=1 ./arroyo esp-jetson`): `DisconnectController`+`ConnectController(recursive)` on every
+  `Usb2Hc` handle, forcing a fresh `XhciControllerDxe.Start` — a fresh PG cycle + (if CNR stays set) a fresh
+  IFR firmware load — at the last moment before handoff, then a `post-reconnect` witness re-read. Runs after
+  the kernel/DTB are fully in memory, so tearing a USB boot volume's stack down is safe. Flash this only
+  after the plain witness reads dead.
+
+Bench matrix (attended): boot the plain media, read `JB8[pre-EBS]` off the UEFI console/serial, compare
+with the kernel's raw-handoff witness. Dead pre-EBS → flash the `jb8lever` media. If the lever's
+`post-reconnect` witness shows `CPUCTL` sane, the *kernel-side* follow-on is the IFR restart: read
+`IFRDMA_CFG0/1` back from the AO aperture post-handoff and re-trigger autoboot (also re-examine the 0xE
+IFRDMA StreamID against the retired arc-B census before writing it).
+
+**Gate:** `./arroyo check` + `UNAOS_TEGRA=1 ./arroyo check` both arches green; `UNAOS_TEGRA=1 ./arroyo
+esp-jetson` links (`kernel.elf` 254,536 B tegra, 120 `tegra:` strings) with and without `UNAOS_JB8_LEVER=1`;
+virt `test-arm` green (`storage_slot=1`, zero panics — JB8 is loader-side and DTB-gated, QEMU inert). Metal
+pending the attended bench (Peter flashes; witness first, lever media second).
+
 ## 4. Jetson Orin Nano headless bring-up (Arc JM2)
 
 The Orin is brought up **headless over serial**. The only console that has ever

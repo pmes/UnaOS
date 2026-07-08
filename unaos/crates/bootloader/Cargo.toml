@@ -12,6 +12,10 @@ default = []
 # tegra driver's UARTC base is right). Pulls in `fdt` to parse the device tree. OFF by default, so a
 # non-bootdiag build is byte-identical. Enabled by arroyo via UNAOS_BOOTDIAG=1.
 bootdiag = ["dep:fdt"]
+# JB8 lever (Jetson Orin bench): pre-ExitBootServices disconnect+reconnect of the Usb2Hc handles to
+# force a fresh XhciControllerDxe.Start (fresh Falcon firmware load) right before handoff. Bench-only
+# risk media — OFF by default; enabled by arroyo via UNAOS_JB8_LEVER=1. aarch64-only code paths.
+jb8lever = []
 
 [dependencies]
 uefi = { version = "0.38.0", features = ["alloc", "global_allocator", "logger", "panic_handler"] }

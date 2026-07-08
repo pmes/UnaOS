@@ -759,7 +759,22 @@ fn main() -> Status {
     // a LIVE Falcon (the Linux-style "inherit, don't revive"). Runtime-gated on a tegra234 DTB
     // sniff, so QEMU `esp-arm` (virt DTB, never contains "tegra234") stays byte-identical.
     #[cfg(target_arch = "aarch64")]
-    install_tegra_acpi_shim(dtb_addr, dtb_size);
+    {
+        // JB8 (Jetson Orin, bench arc): the JB6 shim below skips the EBS *teardown*, yet the kernel
+        // still inherits a HALTED Falcon (JB7: CPUCTL=0xffffffff, core reset-held, no NS lever). So
+        // the halt happens earlier — inside UEFI's own driver lifetime. This witness reads the
+        // Falcon's CPUCTL/BOOTVEC + firmware header from HERE, pre-ExitBootServices, while
+        // XhciControllerDxe still owns a live block. One bit of output decides the whole arc:
+        //   CPUCTL != 0xffffffff pre-EBS  -> the kill is in the EBS window (huntable from the loader);
+        //   CPUCTL == 0xffffffff pre-EBS  -> Start (or MB2/secure) never left the core running, and
+        //                                    the lever is a forced driver reconnect (jb8lever below).
+        if dtb_is_tegra234(dtb_addr, dtb_size) {
+            jb8_falcon_witness("pre-EBS");
+            #[cfg(feature = "jb8lever")]
+            jb8_reconnect_lever();
+            install_tegra_acpi_shim();
+        }
+    }
 
     let memory_map = unsafe { boot::exit_boot_services(Some(MemoryType::LOADER_DATA)) };
     
@@ -811,22 +826,11 @@ fn main() -> Status {
 /// and a zero-entry XSDT is safe. The tables are made fully valid anyway (both RSDP checksums, a
 /// valid empty XSDT) as cheap defensive insurance.
 ///
-/// Runtime-gated on a `tegra234` substring in the firmware DTB so QEMU `esp-arm` (virt DTB, which
-/// never contains that string) is byte-identical: on non-Tegra firmware this is a no-op.
+/// Runtime-gated (at the call site, via `dtb_is_tegra234`) so QEMU `esp-arm` (virt DTB, which
+/// never contains "tegra234") never reaches this: on non-Tegra firmware the whole JB6/JB8 block
+/// is a no-op.
 #[cfg(target_arch = "aarch64")]
-fn install_tegra_acpi_shim(dtb_addr: u64, dtb_size: usize) {
-    // Gate: only the real Orin firmware DTB. QEMU virt's root `compatible` is "linux,dummy-virt"
-    // and never contains "tegra234"; a raw substring scan of the bounded blob is decisive and
-    // needs no FDT parser in the loader.
-    if dtb_addr == 0 || dtb_size < 8 || dtb_size > 4 * 1024 * 1024 {
-        return;
-    }
-    let blob = unsafe { core::slice::from_raw_parts(dtb_addr as *const u8, dtb_size) };
-    if !blob.windows(8).any(|w| w == b"tegra234") {
-        log::info!("JB6: firmware DTB is not tegra234 — ACPI shim skipped (QEMU-safe no-op)");
-        return;
-    }
-
+fn install_tegra_acpi_shim() {
     // One page of ACPI_RECLAIM memory survives ExitBootServices and is mapped Reserved by the
     // kernel's memory-map pass (never handed to the allocator), so the tables persist untouched.
     let page = match boot::allocate_pages(boot::AllocateType::AnyPages, MemoryType::ACPI_RECLAIM, 1)
@@ -883,6 +887,109 @@ fn install_tegra_acpi_shim(dtb_addr: u64, dtb_size: usize) {
         ),
         Err(e) => log::error!("JB6: install_configuration_table failed: {:?} — teardown will NOT skip", e),
     }
+}
+
+/// Gate for the JB6 shim + JB8 probes: only the real Orin firmware DTB. QEMU virt's root
+/// `compatible` is "linux,dummy-virt" and never contains "tegra234"; a raw substring scan of the
+/// bounded blob is decisive and needs no FDT parser in the loader.
+#[cfg(target_arch = "aarch64")]
+fn dtb_is_tegra234(dtb_addr: u64, dtb_size: usize) -> bool {
+    if dtb_addr == 0 || dtb_size < 8 || dtb_size > 4 * 1024 * 1024 {
+        return false;
+    }
+    let blob = unsafe { core::slice::from_raw_parts(dtb_addr as *const u8, dtb_size) };
+    let tegra = blob.windows(8).any(|w| w == b"tegra234");
+    if !tegra {
+        log::info!("JB6/JB8: firmware DTB is not tegra234 — tegra shims skipped (QEMU-safe no-op)");
+    }
+    tegra
+}
+
+/// JB8: pre-ExitBootServices Falcon witness. Reads the XUSB FPCI config header, self-locates BAR2
+/// from CFG_7 (never assumes the kernel's 0x365_0000 — the UEFI driver programmed the live value),
+/// then reads the Falcon CSB CPUCTL/BOOTVEC and the firmware-header codetag/codesize through the
+/// BAR2 ARU aperture — byte-for-byte the kernel's JB3 recipe (page-select @+0x9c, window @+0x2000;
+/// FW_SCRATCH ioctl @+0x1000, reply @+0x1c), which is the only CSB aperture proven safe on this
+/// block (the FPCI/CFG-path aperture is EL3-FATAL post-EBS — never resurrect it; pre-EBS we still
+/// stay on the proven path). Read-only apart from the CSB page-select and the FW_SCRATCH ioctl
+/// doorbell, both of which the NVIDIA driver itself uses at will. Runs only on a tegra234 DTB
+/// (caller-gated), where UEFI flat-maps the XUSB MMIO it actively drives.
+#[cfg(target_arch = "aarch64")]
+fn jb8_falcon_witness(tag: &str) {
+    const XUSB_FPCI: u64 = 0x0361_0000;
+    let cfg = |off: u64| unsafe { core::ptr::read_volatile((XUSB_FPCI + off) as *const u32) };
+    let cfg0 = cfg(0x0); // vendor/device id — liveness canary
+    let cfg1 = cfg(0x4); // io/mem/busmaster enables
+    let cfg7 = cfg(0x1c); // BAR2 — routes the ARU/CSB window
+    let bar2 = (cfg7 & !0xfu32) as u64;
+    log::info!(
+        "JB8[{tag}]: FPCI CFG_0={cfg0:#010x} CFG_1={cfg1:#010x} (mem={} busmaster={}) CFG_7={cfg7:#010x}",
+        (cfg1 >> 1) & 1,
+        (cfg1 >> 2) & 1
+    );
+    if cfg0 == 0xffff_ffff || bar2 == 0 {
+        log::info!("JB8[{tag}]: BAR2 unrouted/block dead — CSB witness skipped");
+        return;
+    }
+    let r = |off: u64| unsafe { core::ptr::read_volatile((bar2 + off) as *const u32) };
+    let w = |off: u64, v: u32| unsafe { core::ptr::write_volatile((bar2 + off) as *mut u32, v) };
+    let csb_r = |addr: u32| {
+        w(0x9c, (addr >> 9) & 0x7f_ffff);
+        r(0x2000 + (addr & 0x1ff) as u64)
+    };
+    let fw_hdr = |word_off: u32| {
+        w(0x1000, (17u32 << 24) | word_off);
+        r(0x1c)
+    };
+    let cpuctl = csb_r(0x100);
+    let bootvec = csb_r(0x104);
+    let (codetag, codesize) = (fw_hdr(0x8), fw_hdr(0xc));
+    log::info!(
+        "JB8[{tag}]: FALCON CPUCTL={cpuctl:#010x} (halted={} stopped={}) BOOTVEC={bootvec:#010x} fw codetag={codetag:#010x} codesize={codesize:#010x}",
+        (cpuctl >> 4) & 1,
+        (cpuctl >> 5) & 1
+    );
+    // USBSTS.CNR (bit 11): edk2-nvidia's T234 Start skips the firmware load entirely when CNR
+    // clears within 200 ms (MB2-resident FW), else IFR-DMA-autoboots it. CNR here pre-EBS says
+    // which of those worlds this boot lives in (remember CNR is a stale latch post-halt — it is
+    // only trustworthy as a "was ready at some point" witness, never as "running now").
+    let bar0 = (cfg(0x10) & !0xfu32) as u64;
+    if bar0 != 0 {
+        let cap = unsafe { core::ptr::read_volatile(bar0 as *const u32) };
+        let usbsts =
+            unsafe { core::ptr::read_volatile((bar0 + (cap & 0xff) as u64 + 0x4) as *const u32) };
+        log::info!(
+            "JB8[{tag}]: xHC cap={cap:#010x} USBSTS={usbsts:#010x} CNR={}",
+            (usbsts >> 11) & 1
+        );
+    }
+}
+
+/// JB8 lever (feature `jb8lever`, arroyo `UNAOS_JB8_LEVER=1` — separate media, only flashed when
+/// the plain witness shows the Falcon already dead pre-EBS): force a full driver-model
+/// disconnect + reconnect of every USB2 host-controller handle, so NVIDIA's
+/// `XhciControllerDxe.Start` runs AGAIN right before handoff — a fresh Falcon firmware load /
+/// core start at the last possible moment, with the JB6 shim then skipping the teardown. Runs
+/// after the kernel + DTB are fully read into memory, so tearing down a USB boot volume's stack
+/// is safe. A witness re-read reports whether the reconnect left the core running.
+#[cfg(all(target_arch = "aarch64", feature = "jb8lever"))]
+fn jb8_reconnect_lever() {
+    // gEfiUsb2HcProtocolGuid — the handle XhciControllerDxe installs its host-controller I/O on.
+    static USB2_HC_GUID: uefi::Guid = uefi::guid!("3e745226-9818-45b6-a2ac-d7cd0e8ba2bc");
+    let handles = match boot::locate_handle_buffer(boot::SearchType::ByProtocol(&USB2_HC_GUID)) {
+        Ok(h) => h,
+        Err(e) => {
+            log::error!("JB8-lever: no Usb2Hc handles ({e:?}) — XhciControllerDxe never started?");
+            return;
+        }
+    };
+    log::info!("JB8-lever: {} Usb2Hc handle(s); disconnect+reconnect each", handles.len());
+    for &h in handles.iter() {
+        let d = boot::disconnect_controller(h, None, None);
+        let c = boot::connect_controller(h, &[], None, true);
+        log::info!("JB8-lever: handle {h:?} disconnect={d:?} reconnect={c:?}");
+    }
+    jb8_falcon_witness("post-reconnect");
 }
 
 /// 8-bit ACPI checksum: the byte value that makes the sum of every byte in `bytes` zero (mod 256).

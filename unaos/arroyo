@@ -55,9 +55,15 @@ fi
 # untouched); OFF by default => byte-identical boot logs. Only the aarch64 bootloader build reads it
 # (esp-jetson / the Orin); the x86 bootloader is built by the `builder` crate and is unaffected.
 BOOTLOADER_FEATURES=""
-if [ -n "${UNAOS_BOOTDIAG:-}" ]; then
-    BOOTLOADER_FEATURES="--features bootdiag"
-    echo -e "${COLOR_YELLOW}⚡ bootloader features: bootdiag${COLOR_RESET}"
+_bfeats=""
+[ -n "${UNAOS_BOOTDIAG:-}" ] && _bfeats="${_bfeats}bootdiag,"
+# UNAOS_JB8_LEVER=1 turns on the bootloader's `jb8lever` feature — the JB8 pre-EBS Usb2Hc
+# disconnect+reconnect (forced XhciControllerDxe.Start re-run) on the Jetson Orin. Bench-only risk
+# media; OFF by default. aarch64/tegra234-gated at runtime; x86 bootloader unaffected.
+[ -n "${UNAOS_JB8_LEVER:-}" ] && _bfeats="${_bfeats}jb8lever,"
+if [ -n "$_bfeats" ]; then
+    BOOTLOADER_FEATURES="--features ${_bfeats%,}"
+    echo -e "${COLOR_YELLOW}⚡ bootloader features: ${_bfeats%,}${COLOR_RESET}"
 fi
 
 # UNAOS_GICV3=1 selects the GICv3 model on the aarch64 `virt` board. A trailing `-machine
