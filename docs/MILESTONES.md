@@ -12,7 +12,21 @@ Legend: **✅ metal-confirmed** · **🔬 QEMU-green, metal pending** · dates I
 
 ## hw-jetson track — 2026-07-08 (attended bench, Peter at the Orin)
 
-### JB8 — pre-EBS Falcon witness + reconnect lever; IFR-autoboot discovery reopens the NS start question 🔬 QEMU-green, metal pending `hw-jetson`
+### JB8 — ⭐ METAL VERDICT: the Falcon was NEVER halted — CPUCTL is a CSB-locked register; the real failure is the DMA path ✅ metal-attended (USB reader) `hw-jetson`
+- **The decisive read (boot 5, pre-EBS, driver live):** xHC running (`HCH=0 CNR=0`), USB enumeration in
+  progress — and `CPUCTL`/`BOOTVEC` still read `0xffffffff` while the ARU fw-header ioctl answers. The
+  Falcon is **alive and CSB-locked** (signed FW, raised priv level). Every JB3→JB7 "halted/reset-held"
+  verdict read a locked register; JB7's "non-secure wall" dissolves — there was never a stopped core.
+- **The real failure:** at kernel time port resets complete, 3 ports link-train to U0 (`CCS=1 PED=1`),
+  but `enable-slot` times out — command/event-ring **DMA never touches DRAM, zero faults** (arc B's
+  question reopened, now against a live engine). Plus: UEFI never programs FPCI CFG BARs (DT-fixed
+  addressing only); auto-boots never connect XhciControllerDxe; generic edk2 XhciDxe's un-gated
+  `XhcHaltHC` is the (benign) EBS actor; `DisconnectController` fails `INVALID_PARAMETER` (open).
+- **Next:** kernel-side CPUCTL-free FW-liveness probe (mailbox retry + scratch heartbeat) + DMA-path
+  forensics (SMMU S2CR/CB binding at write time, stale UEFI SMMU context, MC vs FW StreamID).
+- **Detail:** [`arch_arm64.md` §JB8](dev/OS/01_BOOT_HAL/arch_arm64.md), bench verdict subsection.
+
+### JB8 (as-shipped) — pre-EBS Falcon witness + reconnect lever; IFR-autoboot discovery 🔬→✅ see verdict above `hw-jetson`
 - **What:** an edk2-nvidia source read (r36.4.0-updates) shows **UEFI never halts the Falcon core** (only
   BPMP PG/reset asserts at EBS — *both* teardown layers carry the JB6 ACPI skip) and **T234 starts it via
   IFR DMA autoboot** (three AO-aperture writes: `IFRDMA_CFG0/1` = fw-buffer PA, `STREAMID` = 0xE; buffer is

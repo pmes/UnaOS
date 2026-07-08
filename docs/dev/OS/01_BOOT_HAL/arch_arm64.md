@@ -1268,8 +1268,42 @@ IFRDMA StreamID against the retired arc-B census before writing it).
 
 **Gate:** `./arroyo check` + `UNAOS_TEGRA=1 ./arroyo check` both arches green; `UNAOS_TEGRA=1 ./arroyo
 esp-jetson` links (`kernel.elf` 254,536 B tegra, 120 `tegra:` strings) with and without `UNAOS_JB8_LEVER=1`;
-virt `test-arm` green (`storage_slot=1`, zero panics — JB8 is loader-side and DTB-gated, QEMU inert). Metal
-pending the attended bench (Peter flashes; witness first, lever media second).
+virt `test-arm` green (`storage_slot=1`, zero panics — JB8 is loader-side and DTB-gated, QEMU inert).
+
+#### JB8 bench verdict (attended, 2026-07-08 pm, USB-reader boots — serial `unaos-jetson-jb8-serial.log`)
+
+Five metal boots (`8513f0e` fixed a first-media crash loop: an unprogrammed CFG_7 read `0x1ff`, a sloppy
+`& !0xf` mask dereferenced it — exact masks + mem-decode guard now; `504dc3c` re-based the witness on the
+DT-fixed windows). Findings, in escalating order of importance:
+
+1. **UEFI never programs the FPCI CFG BARs.** CFG_4/CFG_7 read raw garbage (`0x0180ff05`/`0x1ff`) on every
+   boot, pre- and post-connect, while USB-reader boots demonstrably work — the NVIDIA driver drives the
+   block purely via the DT-fixed addresses. FPCI CFG state is not a proxy for driver state; witness gating
+   moved to "Usb2Hc handle exists".
+2. **A plain auto-boot never connects XhciControllerDxe at all** (no Usb2Hc handle, block unpowered).
+   Every previous "raw-handoff" reading is conditioned on how the boot was launched. The lever's
+   connect-all handles this; `DisconnectController` on the Usb2Hc handle fails `INVALID_PARAMETER` on this
+   firmware (twice, handle fresh from `locate_handle_buffer`) — unexplained, needs a follow-up (try the
+   `driver_image` param, or disconnect the parent NonDiscoverable handle).
+3. **⭐ `CPUCTL=0xffffffff` NEVER meant "halted core."** The decisive read: pre-EBS, driver live, xHC
+   running (`USBSTS=0x10`, HCH=0, CNR=0), USB enumeration in progress — and CPUCTL/BOOTVEC *still* read
+   `0xffffffff` while the fw-header ioctl answers (`codesize=0xc85f`). The Falcon is **alive and
+   CSB-locked** (signed FW at raised priv level → external CSB reads float all-ones; the ARU mailbox
+   services still respond). **Every "halted/reset-held Falcon" verdict from JB3→JB7 read a locked
+   register, not a dead core.** JB7's "NS wall" dissolves: there was never a stopped core to start.
+4. **The real failure is the DMA path, register path is fine.** At kernel time (JB6 shim active, generic
+   XhciDxe's un-gated `XhcHaltHC` being the only EBS action): the kernel restarts the xHC (HCH 1→0), port
+   resets complete, three ports link-train to U0 with `CCS=1 PED=1` — but the `enable-slot` command times
+   out: command-ring fetches / event-ring writebacks never touch DRAM, with a **clean fault census** (JB7's
+   zero-faults observation, now with the opposite meaning: DMA is *attempted* by a live engine and
+   silently goes elsewhere/nowhere). The JB3 mailbox MSG_ENABLED no-ACK is the remaining witness that the
+   FW may not be *servicing* requests post-handoff — discriminating "FW alive but DMA misrouted" from "FW
+   idled by the EBS halt" is the next arc's first probe.
+
+**Next-arc shape (fresh brief):** kernel-side, two probes — (a) a CPUCTL-free FW-liveness witness (mailbox
+retry + FW scratch heartbeat), (b) DMA-path forensics under the live-Falcon premise: where do event-ring
+writes go (SMMU S2CR/CB actually bound to stream 0xe at write time? stale UEFI SMMU context translating
+IOVA≠PA? MC override vs the FW's own StreamID field) — arc B's question, reopened with arc A dead.
 
 ## 4. Jetson Orin Nano headless bring-up (Arc JM2)
 
