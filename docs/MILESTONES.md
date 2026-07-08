@@ -109,12 +109,15 @@ Legend: **✅ metal-confirmed** · **🔬 QEMU-green, metal pending** · dates I
   exhausting the ledger under SMP); the laundering witness is non-vacuous. Deferred: the bandy Ring-3
   delegation wrapper, arbitrary recipients, `File` payload migration, real Socket syscalls, UnaFS
   `grants:*` on open, IF-safe x86 storage (retires the U6bx staged-source divergence).
-  **Known latent (folded to a dedicated cross-arch fix arc):** distinct from the carried revoke-vs-free
-  race above, the `deriv_drop` tombstone/free *handshake* is a store-buffering (Dekker) race — a
-  concurrent parent-vs-child drop of a cross-process chain can have both sides decline the free and
-  leak a ledger node (fail-closed → eventual `-EAGAIN`; **no** UAF/escalation, the free is
-  CAS-arbitrated). The identical Release/Acquire orderings ship in the aarch64 U8 twin, so the
-  StoreLoad-fence fix lands on **both** arches together (surfaced by the U8x pre-merge concurrency lens).
+  **Closed in the same merge window (deriv_drop SeqCst fence):** distinct from the carried
+  revoke-vs-free race above, the `deriv_drop` tombstone/free *handshake* was a store-buffering (Dekker)
+  race — a concurrent parent-vs-child drop of a cross-process chain could have both sides decline the
+  free and leak a ledger node (fail-closed → eventual `-EAGAIN`; **no** UAF/escalation, the free is
+  CAS-arbitrated). The identical Release/Acquire orderings shipped in the aarch64 U8 twin, so the fix
+  promoted the four handshake ops (DROPPED store + KIDS load on the parent side; KIDS fetch_sub +
+  DROPPED load on the child side) to `SeqCst` on **both** arches together — one total order forbids the
+  double-stale outcome, the both-free case stays arbitrated by the `DERIV_ID` CAS. Surfaced by the U8x
+  pre-merge concurrency lens.
 - **Metal:** 🔬 metal-pending. The rMBP boot came up (kernel + USB enumeration fine) but **storage
   never enumerated** — an orthogonal x86 xHCI blocker (the SD-reader `058f:6362` enumerates
   unconfigured behind a hub; a hot-plug `ADDRESS_DEVICE` failed with a USB transaction error across 3

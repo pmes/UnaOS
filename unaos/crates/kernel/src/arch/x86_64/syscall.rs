@@ -3022,8 +3022,17 @@ fn deriv_drop(nref: u32) {
             return;
         }
         let n = (r - 1) as usize;
-        DERIV_DROPPED[n].store(true, Ordering::Release);
-        if DERIV_KIDS[n].load(Ordering::Acquire) != 0 {
+        // SeqCst (not Release/Acquire) on the DROPPED×KIDS handshake below: the parent-drop side
+        // (store DROPPED here, then load KIDS) and the child-drop side (fetch_sub KIDS, then load
+        // DROPPED, further down) form a store-buffering / Dekker pair. With only Release/Acquire
+        // (no StoreLoad fence) a concurrent parent-vs-child drop of the same chain could have BOTH
+        // sides read stale — the parent sees KIDS != 0 and the child sees DROPPED == false — so
+        // neither frees this node and it leaks as a permanent tombstone (fail-closed: ledger
+        // exhaustion -> -EAGAIN). SeqCst puts the four handshake ops in one total order, which
+        // forbids the double-stale outcome; the both-free case stays arbitrated by the DERIV_ID CAS
+        // below. Keep the four SeqCst ops symmetric with the twin arch. (U8/U8x concurrency lens.)
+        DERIV_DROPPED[n].store(true, Ordering::SeqCst);
+        if DERIV_KIDS[n].load(Ordering::SeqCst) != 0 {
             return; // live children pin it — a TOMBSTONE until the subtree drains
         }
         let mut id = DERIV_ID[n].load(Ordering::Acquire);
@@ -3055,10 +3064,11 @@ fn deriv_drop(nref: u32) {
             return;
         }
         // Un-child the parent; if we took its LAST kid and it is tombstoned, cascade the free up.
-        if DERIV_KIDS[(parent - 1) as usize].fetch_sub(1, Ordering::AcqRel) != 1 {
+        if DERIV_KIDS[(parent - 1) as usize].fetch_sub(1, Ordering::SeqCst) != 1 {
             return;
         }
-        if !DERIV_DROPPED[(parent - 1) as usize].load(Ordering::Acquire) {
+        // SeqCst: child side of the store-buffering handshake (see the DROPPED store above).
+        if !DERIV_DROPPED[(parent - 1) as usize].load(Ordering::SeqCst) {
             return; // the parent's owning handle is still live — it frees on its own drop
         }
         r = parent;
