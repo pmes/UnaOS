@@ -24,8 +24,8 @@
 //! (U9: a bounded **in-place overwrite** — read-modify-writes only data sectors already in an
 //! existing chain; never grows, allocates, frees, or touches the FAT/directory) and, since U10,
 //! [`FatFs::write_grow`] (extend a file: allocate + zero-fill + chain new clusters, then bump the
-//! directory `size`). The U10 allocation invariants are FAT-safety-critical: **every FAT mutation
-//! writes ALL `num_fats` copies**
+//! directory `size`) and [`FatFs::create_in_root`] (add a fresh 0-length root-directory entry). The
+//! U10 allocation invariants are FAT-safety-critical: **every FAT mutation writes ALL `num_fats` copies**
 //! ([`FatFs::set_fat_entry`]); the free search is **bounded** and returns `NoSpace` when full
 //! ([`FatFs::alloc_cluster`]); a new cluster is **zero-filled before it joins a chain**; and the
 //! directory `size` (the reader's truth) is bumped **last**, so a crash mid-grow leaves a consistent
@@ -155,6 +155,61 @@ fn classify_dir_slot(e: &[u8]) -> DirSlot {
         size: u32le(e, 28),
         first_cluster: ((u16le(e, 20) as u32) << 16) | u16le(e, 26) as u32,
     })
+}
+
+/// U10: one legal 8.3 character (upcased), or `None` if the byte cannot appear in a short name. The reserved
+/// set (`" * + , . / : ; < = > ? [ \ ] |`), spaces, and control bytes are rejected; letters are upcased so a
+/// created name matches how `classify_dir_slot` reads it back (short names are stored uppercase on disk).
+fn to_upper_83(b: u8) -> Option<u8> {
+    let up = b.to_ascii_uppercase();
+    match up {
+        b'A'..=b'Z'
+        | b'0'..=b'9'
+        | b'_'
+        | b'-'
+        | b'~'
+        | b'!'
+        | b'#'
+        | b'$'
+        | b'%'
+        | b'&'
+        | b'\''
+        | b'('
+        | b')'
+        | b'@'
+        | b'^'
+        | b'{'
+        | b'}' => Some(up),
+        _ => None,
+    }
+}
+
+/// U10: format an 8.3 name (e.g. `"FRESH.BIN"`) into the on-disk 11-byte space-padded field (`"FRESH   BIN"`),
+/// or `None` if it is not a representable short name (LFN, subdirectory paths, and multi-dot names are out of
+/// scope this arc). Base is 1..=8 chars, extension 0..=3, each a legal 8.3 char. The result re-parses (via
+/// `classify_dir_slot`) to the same textual name, so a freshly created entry is found by the same `eq_name`.
+fn format_83(name: &str) -> Option<[u8; 11]> {
+    let mut out = [b' '; 11];
+    let bytes = name.as_bytes();
+    let (base, ext): (&[u8], &[u8]) = match name.find('.') {
+        Some(i) => {
+            if name[i + 1..].contains('.') {
+                return None; // a second dot -> not a plain 8.3 name
+            }
+            (&bytes[..i], &bytes[i + 1..])
+        }
+        None => (bytes, &[][..]),
+    };
+    if base.is_empty() || base.len() > 8 || ext.len() > 3 {
+        return None;
+    }
+    for (k, &b) in base.iter().enumerate() {
+        out[k] = to_upper_83(b)?;
+    }
+    for (k, &b) in ext.iter().enumerate() {
+        out[8 + k] = to_upper_83(b)?;
+    }
+    Some(out)
 }
 
 /// Parse one 512-byte directory sector, appending real file/dir entries to `out`. Returns `true`
@@ -1158,6 +1213,93 @@ impl FatFs {
         // 4. LAST: publish size (+ chain head if it changed) to the directory — data + FAT already durable.
         self.write_dir_entry_fields(dir_lba, dir_off, new_first, new_size)?;
         Ok((written, new_size, new_first))
+    }
+
+    /// U10: CREATE a new 8.3 entry in the ROOT directory — a 0-length file (`first_cluster = 0`, `size = 0`)
+    /// with attribute `attr` (a plain file is `0x20`). Finds a free directory slot (a `0x00` end-of-directory or
+    /// a `0xE5` deleted slot) and writes the 8.3 name + zeroed metadata there; the first `write_grow` of the
+    /// 0-cluster file allocates its first cluster and sets `first_cluster`. Returns the parsed entry with its
+    /// on-disk (LBA, slot-offset). `NoSpace` if the root directory has no free slot (extending the root-dir chain
+    /// is out of scope); `Unsupported` if the name is not a representable short name. Allocates NO clusters and
+    /// touches NO FAT — only the one directory sector. The caller must have confirmed the name is absent (this
+    /// does not de-duplicate); a 0-length entry never aliases another file's data (it owns no clusters).
+    pub fn create_in_root(&self, name: &str, attr: u8) -> Result<(DirEntry, u64, usize), FatError> {
+        let raw = format_83(name).ok_or(FatError::Unsupported)?;
+        let (lba, off) = self.find_free_root_slot()?;
+        let mut buf = [0u8; SECTOR_SIZE];
+        read_sector(lba, &mut buf)?;
+        // Write a fresh 32-byte entry: 11-byte name, attr, everything else zero (NTRes/times = 0, first_cluster
+        // hi@20 lo@26 = 0, size@28 = 0). Never set the volume-label bit — this is a file/dir entry.
+        for b in buf[off..off + 32].iter_mut() {
+            *b = 0;
+        }
+        buf[off..off + 11].copy_from_slice(&raw);
+        buf[off + 11] = attr & !0x08;
+        write_sector(lba, &buf)?;
+        // Re-parse the slot we just wrote so the returned DirEntry is byte-for-byte what a reader would see.
+        match classify_dir_slot(&buf[off..off + 32]) {
+            DirSlot::Entry(de) => Ok((de, lba, off)),
+            _ => Err(FatError::Io), // unreachable: we just wrote a valid non-empty, non-LFN entry
+        }
+    }
+
+    /// U10: the on-disk location of the first FREE root-directory slot (a `0x00` end marker or a `0xE5` deleted
+    /// slot). `NoSpace` if the root directory is full — extending the root-directory chain is out of scope this
+    /// arc. Writing into the first `0x00` slot preserves the terminator (the slots after it stay `0x00`), and a
+    /// `0xE5` slot is mid-directory, so either choice keeps the directory correctly terminated.
+    fn find_free_root_slot(&self) -> Result<(u64, usize), FatError> {
+        match self.kind {
+            FatKind::Fat32 => self.free_slot_in_dir_chain(self.root_cluster),
+            FatKind::Fat16 => self.free_slot_in_fixed_root16(),
+        }
+    }
+
+    fn free_slot_in_fixed_root16(&self) -> Result<(u64, usize), FatError> {
+        let mut buf = [0u8; SECTOR_SIZE];
+        for s in 0..self.root_dir_sectors as u64 {
+            let lba = self.root_dir_lba + s;
+            read_sector(lba, &mut buf)?;
+            for i in 0..(SECTOR_SIZE / 32) {
+                let b0 = buf[i * 32];
+                if b0 == 0x00 || b0 == 0xE5 {
+                    return Ok((lba, i * 32));
+                }
+            }
+        }
+        Err(FatError::NoSpace) // fixed root full — no extension possible
+    }
+
+    fn free_slot_in_dir_chain(&self, start: u32) -> Result<(u64, usize), FatError> {
+        let mut cluster = start;
+        let mut hops = 0u32;
+        let mut buf = [0u8; SECTOR_SIZE];
+        loop {
+            if !self.valid_cluster(cluster) {
+                return Err(FatError::BadChain);
+            }
+            for s in 0..self.sec_per_clus as u64 {
+                let lba = self.cluster_lba(cluster) + s;
+                read_sector(lba, &mut buf)?;
+                for i in 0..(SECTOR_SIZE / 32) {
+                    let b0 = buf[i * 32];
+                    if b0 == 0x00 || b0 == 0xE5 {
+                        return Ok((lba, i * 32));
+                    }
+                }
+            }
+            let next = self.fat_entry(cluster)?;
+            if self.is_eoc(next) {
+                return Err(FatError::NoSpace); // root-dir chain full; extending it is out of scope
+            }
+            if self.is_bad(next) || next < 2 {
+                return Err(FatError::BadChain);
+            }
+            cluster = next;
+            hops += 1;
+            if hops > self.count_of_clusters {
+                return Err(FatError::BadChain);
+            }
+        }
     }
 }
 

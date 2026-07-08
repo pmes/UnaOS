@@ -252,6 +252,24 @@ const U10_GROW_FILLER: u8 = 0xC1;
 /// U10 demo: the file's size AFTER the grow (`512 + 16`) — the "size increased" invariant the launcher asserts.
 const U10_GROW_NEW_SIZE: u32 = U10_GROW_PLANTED_SIZE + 16;
 
+/// U10-create demo: the sentinel `sys_exit` status the CREATE fixture (`el0-u10create`) uses so ITS exit lands
+/// in `EL0_U10C_DONE`, never perturbing any prior counter. Distinct from every prior sentinel (…0x7B) and 0.
+const U10C_EXIT_STATUS: u64 = 0x7C;
+/// U10-create demo: the witness bitmask the CREATE fixture reports — bit0 open O_CREAT|RW OK (the file is
+/// created); bit1 write at offset 0 → 16 (the first grow of a 0-cluster file allocates its first cluster + sets
+/// the directory first_cluster); bit2 seek-0 + read → the pattern (readback through the same cap); bit3 a SECOND
+/// O_CREAT|RW open of the same name → a handle (idempotent create-if-present). `u10c_launcher` PASSes iff it
+/// equals `U10C_WITNESS_ALL` AND the kernel-side checks held. Matches `add x23, x23, #{1,2,4,8}` in the blob.
+const U10C_WITNESS_ALL: u64 = 0xF;
+/// U10-create demo: the file the fixture CREATES (it does NOT exist in the planted image; the demo makes it).
+/// 9 chars (<= `MAX_NAME`); the `mov x1, #(9f-8f)` in the blob matches. Formats to the 8.3 slot "FRESH   BIN".
+const U10C_NAME: &str = "FRESH.BIN";
+/// U10-create demo: the 16-byte pattern the fixture writes into the freshly created file (also its final size).
+const U10C_PATTERN: [u8; 16] = *b"U10-CREATE-OK-99";
+/// U10-create demo: the created file's size after the write (== the pattern length) — the launcher's re-mount
+/// asserts the on-disk entry has exactly this size.
+const U10C_WRITTEN: u32 = 16;
+
 // --- The inline EL0 FIXTURES: three fault-SHAPE fixtures (M6b) + one preemption spinner (M6e). These
 // are fixtures, not programs, so they stay inline in the kernel image; only the well-behaved `hello`
 // routine moved out to a separately linked blob in M6c (see `USER_BLOB` below). Fully
@@ -1513,6 +1531,103 @@ unsafe extern "C" {
     static __u10_prog_grow: u8;
 }
 
+// --- U10-create inline EL0 fixture (real file CREATE via O_CREAT). ONE fixture (`el0-u10create`) that opens a
+// name that does NOT exist with O_CREAT|RW (mode=3) — forcing `fat::create_in_root` to write a fresh 0-length
+// 8.3 directory entry — then WRITES a pattern at offset 0 (the first grow of a 0-cluster file: `write_grow`
+// allocates the first cluster and sets the directory `first_cluster`), reads it back through the SAME cap
+// (bit2), and re-opens the now-existing name with O_CREAT|RW to prove create-if-present is idempotent (bit3).
+// Position-independent; its only writable user target is the slot's data page at +0x2000. The fixture's own two
+// opens first-free-claim descriptors 0 and 3 (index 1 = the reserved `CONSOLE_FD`). It builds a witness bitmask
+// in x23 and SYS_REPORTs it, then exits with the U10-create sentinel. ABI: x8=nr, args x0-x2, ret x0.
+core::arch::global_asm!(
+    r#"
+    .globl __u10c_blob_start
+__u10c_blob_start:
+    .balign 4
+    .globl __u10c_prog_create
+__u10c_prog_create:
+    mov  x23, xzr                          // witness bitmask = 0
+    adr  x9, __u10c_blob_start             // x9 = window base
+    add  x12, x9, #0x2000                  // x12 = read-back buffer VA (writable data page)
+    adr  x13, 12f                          // x13 = write-pattern VA (RO code page; compare source)
+
+    // (0) open FRESH.BIN O_CREAT|RW (mode=3) -> CREATE a 0-length file, return an RW handle
+    mov  x8, #11                           // SYS_OPEN
+    adr  x0, 8f                            // name ptr
+    mov  x1, #(9f - 8f)                    // name len ("FRESH.BIN" = 9)
+    mov  x2, #3                            // mode = O_CREAT | RW
+    svc  #0
+    mov  x19, x0                           // x19 = RW handle (>=0) or -errno
+    tbnz x19, #63, 1f                      // create/open failed -> skip bit0..bit2
+    add  x23, x23, #1                      // bit0: create + open OK
+
+    // (1) write the 16-byte pattern at offset 0 -> first GROW of a 0-cluster file (alloc + set dir first_cluster)
+    mov  x8, #1                            // SYS_WRITE (File + CAP_WRITE, offset 0 past EOF=0 -> fat::write_grow)
+    mov  x0, x19
+    mov  x1, x13                           // src = the 16-byte pattern
+    mov  x2, #16
+    svc  #0
+    cmp  x0, #16                           // wrote (grew by) exactly 16 bytes?
+    b.ne 1f
+    add  x23, x23, #2                      // bit1: first-grow write OK
+
+    // (2) seek to 0 and read the 16 bytes through the SAME cap; they must equal the pattern
+    mov  x8, #15                           // SYS_SEEK to 0
+    mov  x0, x19
+    mov  x1, #0
+    svc  #0
+    cmp  x0, #0
+    b.ne 1f
+    mov  x8, #12                           // SYS_READ
+    mov  x0, x19
+    mov  x1, x12
+    mov  x2, #16
+    svc  #0
+    cmp  x0, #16
+    b.ne 1f
+    ldr  x10, [x12]
+    ldr  x11, [x13]
+    cmp  x10, x11
+    b.ne 1f
+    ldr  x10, [x12, #8]
+    ldr  x11, [x13, #8]
+    cmp  x10, x11
+    b.ne 1f
+    add  x23, x23, #4                      // bit2: read-back matches the written pattern
+1:
+    // (3) a SECOND O_CREAT|RW open of the SAME name -> the file now EXISTS -> a handle (idempotent, no duplicate)
+    mov  x8, #11                           // SYS_OPEN FRESH.BIN O_CREAT|RW again
+    adr  x0, 8f
+    mov  x1, #(9f - 8f)
+    mov  x2, #3
+    svc  #0
+    tbnz x0, #63, 2f                       // second open failed -> skip bit3
+    add  x23, x23, #8                      // bit3: idempotent create-if-present OK
+2:
+    mov  x0, x23                           // SYS_REPORT(witness bitmask)
+    mov  x8, #3
+    svc  #0
+    mov  x8, #2                            // SYS_EXIT(U10C_EXIT_STATUS) -> EL0_U10C_DONE
+    movz x0, #0x7C
+    svc  #0
+4:  b 4b                                   // sys_exit never returns; belt-and-braces guard
+    .balign 4
+8:  .ascii "FRESH.BIN"
+9:
+    .balign 8
+12: .ascii "U10-CREATE-OK-99"
+    .balign 4
+    .globl __u10c_blob_end
+__u10c_blob_end:
+"#
+);
+
+unsafe extern "C" {
+    static __u10c_blob_start: u8;
+    static __u10c_blob_end: u8;
+    static __u10c_prog_create: u8;
+}
+
 /// The `hello` EL0 program (M6c), built as a SEPARATE link product (`crates/user-blob`) and baked in
 /// as a flat binary instead of living in the kernel's `.text`. `arroyo kernel8` builds it — a naked,
 /// position-independent `sys_write("hello from EL0\n") + sys_exit(0)` routine — for the bare aarch64
@@ -1816,6 +1931,14 @@ static EL0_U10_DONE: AtomicU32 = AtomicU32::new(0);
 /// A killed U10 fixture — a real bug (register-only; its only writable user target is its own data page).
 /// Off the M6b counter.
 static EL0_U10_KILLED: AtomicU32 = AtomicU32::new(0);
+
+/// The U10-create fixture's WITNESS bitmask (reported via SYS_REPORT): see `U10C_WITNESS_ALL`. `u10c_launcher`
+/// PASSes iff it equals `U10C_WITNESS_ALL` AND the kernel-side checks held.
+static U10C_WITNESS: AtomicU64 = AtomicU64::new(0);
+/// The U10-create fixture (`el0-u10create`) reached its `0x7C` sentinel exit (want 1). Read by `u10c_launcher`.
+static EL0_U10C_DONE: AtomicU32 = AtomicU32::new(0);
+/// A killed U10-create fixture — a real bug (register-only). Off the M6b counter.
+static EL0_U10C_KILLED: AtomicU32 = AtomicU32::new(0);
 
 /// Claim a FREE Proc entry, returning its index. CAS on `state` (FREE->RUNNING) is the atomic ownership
 /// token; the pid=0 placeholder is overwritten with the real child pid (Release) by the caller AFTER the
@@ -2434,6 +2557,13 @@ fn u10_report(value: u64) {
     }
 }
 
+/// U10-create: record the CREATE fixture's witness bitmask (SYS_REPORT), keyed by the reporting task's name.
+fn u10c_report(value: u64) {
+    if super::sched::current_name() == Some("el0-u10create") {
+        U10C_WITNESS.store(value, Ordering::Release);
+    }
+}
+
 fn u7_report(value: u64) {
     match super::sched::current_name() {
         Some("el0-u7parent") => U7_PARENT_WITNESS.store(value, Ordering::Release),
@@ -2695,6 +2825,11 @@ pub fn record_el0_kill(name: &str, ec: u64, far: u64, far_valid: bool) {
     // U10: the file-GROWTH fixture is likewise register-only; a kill is a real U10 bug (its own counter).
     if name == "el0-u10grow" {
         EL0_U10_KILLED.fetch_add(1, Ordering::AcqRel);
+        return;
+    }
+    // U10-create: the CREATE fixture is likewise register-only; a kill is a real bug (its own counter).
+    if name == "el0-u10create" {
+        EL0_U10C_KILLED.fetch_add(1, Ordering::AcqRel);
         return;
     }
     let (base, size) = super::boot::user_region();
@@ -3087,6 +3222,7 @@ extern "C" fn aarch64_svc_handler(frame: *mut u64) {
             u8_report(a0);
             u9_report(a0);
             u10_report(a0);
+            u10c_report(a0);
             0
         }
         SYS_YIELD => sys_yield(),
@@ -3178,6 +3314,8 @@ extern "C" fn aarch64_svc_handler(frame: *mut u64) {
                 EL0_U9_DONE.fetch_add(1, Ordering::AcqRel);
             } else if a0 == U10_EXIT_STATUS {
                 EL0_U10_DONE.fetch_add(1, Ordering::AcqRel);
+            } else if a0 == U10C_EXIT_STATUS {
+                EL0_U10C_DONE.fetch_add(1, Ordering::AcqRel);
             } else if a0 == 0 {
                 EL0_EXITED_OK.fetch_add(1, Ordering::AcqRel);
             } else {
@@ -3826,20 +3964,29 @@ fn sys_cap_revoke(asid: u64, idx: u64) -> i64 {
 /// bytes. A longer request cannot name a real entry, so it is rejected as malformed rather than truncated.
 const MAX_NAME: usize = 12;
 
+/// U10: `SYS_OPEN` mode bit1 — create the file if it is absent (and endow the write cap, since you create to
+/// write). Bit0 remains RW (U9). `O_CREAT` on an EXISTING file just opens it (idempotent). No `O_TRUNC` /
+/// `O_EXCL` / `O_APPEND` this arc — higher bits stay reserved.
+const O_CREAT: u64 = 1 << 1;
+
 /// SYS_OPEN(name_ptr, name_len, mode) -> a File-handle index, or a negative errno. The first resource syscall
 /// routed through a NON-Console object: it makes U6a's `File` scaffold real. `copy_from_user`s the (bounded) 8.3
 /// name, mounts the single FAT volume, finds the top-level entry, records an open-file descriptor in the
 /// caller's per-task FILES row, and installs a `File` handle (first-free). U9: `mode` bit0 selects the rights the
-/// handle carries — `0` (RO, as before) = `CAP_READ`; `1` (RW) = `CAP_READ | CAP_WRITE`, the write cap a File
-/// `SYS_WRITE` presents. (Higher `mode` bits are reserved and ignored — no O_CREAT/O_TRUNC: create/grow are a
-/// later arc.) Returns the handle index EL0 reads/writes/waits on.
+/// handle carries — `0` (RO) = `CAP_READ`; `1` (RW) = `CAP_READ | CAP_WRITE`, the write cap a File `SYS_WRITE`
+/// presents. U10: `mode` bit1 (`O_CREAT`) creates the file if it is absent — a 0-length root-directory entry
+/// (`fat::create_in_root`), and endows RW (you create to write); the first grow-write allocates its first
+/// cluster. `O_CREAT` on an existing file just opens it. Returns the handle index EL0 reads/writes/waits on.
 ///
-/// Ordering mirrors `load_program_into_slot`/`sys_spawn`: do every fallible READ-ONLY lookup first (name copy,
+/// Ordering mirrors `load_program_into_slot`/`sys_spawn`: do the fallible READ-ONLY lookups first (name copy,
 /// mount, find, dir-reject), so a failure there returns with nothing to unwind; claim RESOURCES last (a file
-/// descriptor, then a handle). The one failure that must unwind is a full handle table AFTER a descriptor was
-/// claimed — free the descriptor, then `-EAGAIN`. Errnos: `-EINVAL` (bad name length), `-EFAULT` (bad name
-/// pointer), `-ENODEV`/`-EIO` (mount failure), `-ENOENT` (no such file), `-EISDIR` (a directory), `-EMFILE`
-/// (open-file table full), `-EAGAIN` (handle table full). Flat root, one volume, in-place writes — scope by design.
+/// descriptor, then a handle). The one KERNEL-resource unwind is a full handle table AFTER a descriptor was
+/// claimed — free the descriptor, then `-EAGAIN`. (An `O_CREAT` that then fails to claim a handle leaves a
+/// harmless 0-length directory entry on disk — no kernel leak, and a re-open finds/reuses it.) Errnos:
+/// `-EINVAL` (bad name length), `-EFAULT` (bad name pointer), `-ENODEV`/`-EIO` (mount failure), `-ENOENT` (no
+/// such file, no `O_CREAT`), `-EINVAL` (an `O_CREAT` name not representable as 8.3), `-ENOSPC` (root directory
+/// full), `-EISDIR` (a directory), `-EMFILE` (open-file table full), `-EAGAIN` (handle table full). Flat root,
+/// one volume — scope by design.
 fn sys_open(name_ptr: u64, name_len: u64, mode: u64) -> i64 {
     let asid = current_asid();
     // 1. Bound + copy the name. A 0-length or over-8.3 request is malformed (-EINVAL); copy_from_user validates
@@ -3862,10 +4009,23 @@ fn sys_open(name_ptr: u64, name_len: u64, mode: u64) -> i64 {
         Err(_) => return EIO,
     };
     // U10: `find_located` also returns the on-disk LOCATION of the entry (its directory sector LBA + slot
-    // offset), recorded in the descriptor so a later GROW can republish `size`/`first_cluster` into it.
+    // offset), recorded in the descriptor so a later GROW can republish `size`/`first_cluster` into it. When the
+    // entry is ABSENT and `O_CREAT` is set, create a fresh 0-length entry (which yields the same triple); the
+    // create writes only one directory sector (no cluster/FAT touched) and is still a "fallible lookup before
+    // any resource claim" — its own failures (name / no-space) return cleanly.
     let (de, dir_lba, dir_off) = match fs.find_located(name) {
         Ok(t) => t,
-        Err(crate::fs::fat::FatError::NotFound) => return ENOENT,
+        Err(crate::fs::fat::FatError::NotFound) => {
+            if mode & O_CREAT == 0 {
+                return ENOENT; // absent and no O_CREAT
+            }
+            match fs.create_in_root(name, 0x20 /* ATTR_ARCHIVE — a plain file */) {
+                Ok(t) => t,
+                Err(crate::fs::fat::FatError::Unsupported) => return EINVAL, // name not representable as 8.3
+                Err(crate::fs::fat::FatError::NoSpace) => return ENOSPC,     // root directory full
+                Err(_) => return EIO,
+            }
+        }
         Err(_) => return EIO,
     };
     if de.is_dir {
@@ -3880,11 +4040,11 @@ fn sys_open(name_ptr: u64, name_len: u64, mode: u64) -> i64 {
         files_free(asid, fid); // no handle slot — release the descriptor we just claimed (no leak)
         return EAGAIN;
     };
-    // U9: RW mode (bit0) endows CAP_WRITE alongside CAP_READ, so a File `SYS_WRITE` through this handle passes
-    // the CAP_WRITE CHECK; RO (bit0 clear) keeps the U6b read-only cap. Publish the kind + rights, then the live
-    // file-id LAST (Release) — so the handle is never observed live without its File kind and rights.
-    // Single-writer over this row (mid-syscall), so this is belt-and-braces.
-    let rights = if mode & 1 != 0 { CAP_READ | CAP_WRITE } else { CAP_READ };
+    // U9/U10: RW (bit0) or O_CREAT (bit1 — you create to write) endows CAP_WRITE alongside CAP_READ, so a File
+    // `SYS_WRITE` through this handle passes the CAP_WRITE CHECK; RO (neither bit) keeps the U6b read-only cap.
+    // Publish the kind + rights, then the live file-id LAST (Release) — the handle is never observed live without
+    // its File kind and rights. Single-writer over this row (mid-syscall), so this is belt-and-braces.
+    let rights = if mode & (1 | O_CREAT) != 0 { CAP_READ | CAP_WRITE } else { CAP_READ };
     handle_set_kind(asid, h, KIND_FILE);
     handle_set_rights(asid, h, rights);
     handle_set(asid, h, file_id);
@@ -5493,6 +5653,7 @@ pub fn u7_launcher(demo_cpu: usize) {
     u8_launcher(demo_cpu);
     u9_launcher(demo_cpu);
     u10_launcher(demo_cpu);
+    u10c_launcher(demo_cpu);
 }
 
 fn u7_run(demo_cpu: usize) {
@@ -6212,6 +6373,145 @@ fn u10_launcher(demo_cpu: usize) {
             fats_ok,
             EL0_U10_DONE.load(Ordering::Acquire),
             U10_WITNESS_ALL
+        );
+    }
+}
+
+// =============================================================================================
+// U10-create: file CREATE — the single-process EL0 fixture (open O_CREAT|RW -> write-from-empty ->
+// read-back -> idempotent re-open) and the kernel-side checks (a fresh-mount re-read finds FRESH.BIN
+// in the root with the right size + content, and exactly ONE entry — no duplicate), folded into one
+// launcher/verdict that rides the U7 launcher task after U10-grow.
+// =============================================================================================
+
+/// Build the U10-create fixture slot — the `u10_build` shape for the U10-create blob.
+fn u10c_build() -> Option<U7Fix> {
+    let (base, size) = super::boot::user_region();
+    let sp = (base + size as u64) & !0xF;
+    let bstart = &raw const __u10c_blob_start as usize;
+    let bend = &raw const __u10c_blob_end as usize;
+    let blen = bend - bstart;
+    assert!(blen <= super::boot::USER_CODE_SIZE, "U10-create blob does not fit in a code page");
+    let entry = {
+        let va = base + (&raw const __u10c_prog_create as usize - bstart) as u64;
+        assert!(va & 3 == 0, "U10-create fixture entry misaligned");
+        va
+    };
+    let slot = super::boot::alloc_user_slot()?;
+    let backing = super::boot::slot_backing_ptr(slot);
+    unsafe {
+        core::ptr::write_bytes(backing, 0, size);
+        core::ptr::copy_nonoverlapping(bstart as *const u8, backing, blen);
+    }
+    super::cache::icache_sync_range(backing as usize, blen);
+    unsafe { super::boot::protect_user_slot_code(slot, super::boot::USER_CODE_SIZE) };
+    let ttbr0 = super::boot::slot_ttbr0(slot);
+    Some(U7Fix { entry, sp, ttbr0, asid: ttbr0 >> 48, slot })
+}
+
+/// U10-create launcher + verdict — called by the U7 launcher task after the U10-grow flow. Flow: skip with no
+/// SD; confirm FRESH.BIN is ABSENT up front (the demo must CREATE it, not find a stale one) BEFORE allocating a
+/// slot; build + spawn the fixture; wait (bounded) for its sentinel exit + teardown (its two open descriptors
+/// clear the FILES row); then the kernel-side checks — a fresh mount finds FRESH.BIN in the root with size ==
+/// `U10C_WRITTEN`, its content == the written pattern, a valid first cluster, and EXACTLY ONE such entry (the
+/// second O_CREAT opened, did not duplicate). PASS iff witness == `U10C_WITNESS_ALL` AND torn down AND no kill
+/// AND all kernel checks held. U10-create is the last demo — it releases no further gate.
+fn u10c_launcher(demo_cpu: usize) {
+    static DONE: AtomicBool = AtomicBool::new(false);
+    if DONE.swap(true, Ordering::Relaxed) {
+        return;
+    }
+    if crate::drivers::block::info().is_none() {
+        return; // no SD -> the fixture cannot create a disk file; skip silently
+    }
+    // Pre-flight: the volume must mount, and FRESH.BIN must be ABSENT (so a PASS proves a real create). A stale
+    // FRESH.BIN (should never happen — kernel8 rebuilds the image) would make the create an idempotent open; log
+    // and skip rather than report a misleading PASS.
+    match crate::fs::fat::mount() {
+        Ok(fs) => {
+            if fs.find_in_root(U10C_NAME).is_ok() {
+                serial_println!(
+                    ":: U10-create: FRESH.BIN already present pre-demo (stale image) — create demo skipped ::"
+                );
+                return;
+            }
+        }
+        Err(_) => return, // unmountable -> skip silently (mirrors the no-SD path)
+    }
+
+    let Some(fix) = u10c_build() else {
+        serial_println!(":: U10-create: no free address-space slot — create demo skipped ::");
+        return;
+    };
+    serial_println!(
+        ":: U10-create: file create — SYS_OPEN O_CREAT routed through fat::create_in_root (fresh dir entry, grow-from-empty) ::"
+    );
+    super::sched::spawn_user_slot("el0-u10create", fix.entry, fix.sp, fix.ttbr0, demo_cpu);
+
+    let vstart = super::timer::cntpct();
+    let vdeadline = 5 * super::timer::cntfrq();
+    while EL0_U10C_DONE.load(Ordering::Acquire) < 1
+        && super::timer::cntpct().wrapping_sub(vstart) <= vdeadline
+    {
+        super::sched::yield_now();
+    }
+    let witness = U10C_WITNESS.load(Ordering::Acquire);
+    let killed = EL0_U10C_KILLED.load(Ordering::Acquire);
+
+    let tstart = super::timer::cntpct();
+    let tdeadline = 2 * super::timer::cntfrq();
+    while !(files_row_is_clear(fix.asid) && handle_row_is_clear(fix.asid))
+        && super::timer::cntpct().wrapping_sub(tstart) <= tdeadline
+    {
+        super::sched::yield_now();
+    }
+    let cleared = files_row_is_clear(fix.asid) && handle_row_is_clear(fix.asid);
+
+    // Kernel-side "the create actually hit the disk" checks: re-mount and find FRESH.BIN. It must EXIST with the
+    // written size + content, a valid first cluster (grew from 0), and be the ONLY such entry (idempotent create).
+    let (exists, size_ok, content_ok, single, fc_ok) = match crate::fs::fat::mount() {
+        Ok(fs) => match fs.find_in_root(U10C_NAME) {
+            Ok(de) => {
+                let fc = de.first_cluster();
+                let size_ok = de.size == U10C_WRITTEN;
+                let content_ok = u9_read16(fc, de.size, 0) == Some(U10C_PATTERN);
+                let fc_ok = fc >= 2;
+                let count = fs
+                    .read_root()
+                    .map(|v| v.iter().filter(|d| d.name() == U10C_NAME).count())
+                    .unwrap_or(0);
+                (true, size_ok, content_ok, count == 1, fc_ok)
+            }
+            Err(_) => (false, false, false, false, false),
+        },
+        Err(_) => (false, false, false, false, false),
+    };
+
+    if witness == U10C_WITNESS_ALL
+        && cleared
+        && killed == 0
+        && exists
+        && size_ok
+        && content_ok
+        && single
+        && fc_ok
+    {
+        serial_println!(
+            ":: U10-create: file create — O_CREAT+write-from-empty+readback OK, idempotent re-open, on-disk entry present with right size + content, no duplicate -> PASS ::"
+        );
+    } else {
+        serial_println!(
+            ":: U10-create: file create FAIL — witness={:#x} cleared={} killed={} exists={} size={} content={} single={} fc={} done={} (want {:#x}/true/0/true/true/true/true/true/1) ::",
+            witness,
+            cleared,
+            killed,
+            exists,
+            size_ok,
+            content_ok,
+            single,
+            fc_ok,
+            EL0_U10C_DONE.load(Ordering::Acquire),
+            U10C_WITNESS_ALL
         );
     }
 }
