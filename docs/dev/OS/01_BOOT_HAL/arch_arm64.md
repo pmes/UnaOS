@@ -1064,6 +1064,83 @@ Gate: `./arroyo check` + `UNAOS_TEGRA=1 ./arroyo check` green; x86 `test` MISSIO
 `test-arm` CAPSTONE 6/6; Pi `kernel8` builds; `esp-jetson` links. Changes are entirely tegra-cfg-gated
 (non-tegra binaries byte-identical).
 
+### JB5 + JB6 — the Falcon "inherit, don't revive" pivot (attended bench, 2026-07-08)
+
+**JB5 closed the revival question — negative.** Five attended probe boots plus a full read of NVIDIA's
+edk2-nvidia source established that a non-secure kernel **cannot** re-boot the halted XUSB Falcon: MB2
+boots it once per cold boot from its IFR image, and that self-boot is a **one-shot, un-re-armable from
+non-secure** (five register / clock / power / PG-cycle / faithful-replay families tried on silicon —
+every one left `CPUCTL=0xffffffff`). UEFI's own cold-boot D→A→D power-gate dance never re-boots it
+either: `DeviceDiscoveryLib` **vote-refcounts** the power gate, so a Deassert on an already-ON domain is
+a vote++ with **no MRQ** and the Falcon is never actually cycled. Revival is not the lever.
+
+**JB6 is the lever: don't revive — *inherit*.** NVIDIA's `XhciControllerDxe.OnExitBootServices` tears
+the XUSB block down on a Device-Tree boot (USBCMD←0, `UsbPadCtlDxe DeInitHw`, power-gate Assert), **but
+self-skips the entire teardown when an ACPI table is present** — `EfiGetSystemConfigurationTable(
+&gEfiAcpiTableGuid)` succeeds → immediate `return` (source-verified). So the **bootloader installs a
+minimal, spec-correct dummy ACPI 2.0 RSDP+XSDT** into the UEFI config table immediately before
+`ExitBootServices` (`crates/bootloader/src/main.rs::install_tegra_acpi_shim`), runtime-gated on a
+`tegra234` substring in the firmware DTB so QEMU `esp-arm` stays byte-identical. The install's blast
+radius is a single callback: adding a table under `gEfiAcpiTableGuid` signals that event group, firing
+only EqosDeviceDxe's `UpdateACPIMacAddress`, which walks the ACPI **SDT protocol** (never our RSDP) and
+early-returns when no SDT/DSDT is present — so a zero-entry XSDT is safe (both RSDP checksums and the
+XSDT are made valid regardless).
+
+**Metal result — the teardown-skip is PROVEN (attended, 2026-07-08).** A/B of the raw XUSB handoff
+state, prior no-shim boot vs the JB6 shim boot:
+
+| Handoff signal | Prior boot (no shim) | JB6 boot (shim) |
+| --- | --- | --- |
+| XUSB power gates (PG 12 / 10 `GET_STATE`) | `0x0` / `0x0` — torn OFF | **`0x1` / `0x1` — ON** |
+| FPCI `CFG_1` | `mem=0 busmaster=0` | **`mem=1 busmaster=1`** |
+| FPCI BAR4 / BAR7 | `0x0000000c` unprogrammed | **`0x0360000c` / `0x0365000c` programmed** |
+
+UnaOS inherits a **powered, FPCI-configured** XUSB block instead of a torn-down dead one — the
+"inherit, don't revive" the whole JB1–JB6 arc chased. The shim caused zero instability (the boot ran
+clean through `CAPSTONE COMPLETE — all 6 sync primitives`), and the run-F kernel path is
+non-destructive (`JB5_RUN_E_REPLAY=false` retires the run-E power-cycle replay that would kill an
+inherited-live block; the read-only raw-handoff witness + a `jb1c_ungate_xusb` no-op run instead).
+
+**Two clean next arcs remain — the inherited Falcon core is halted, and enumeration is blocked
+downstream.**
+
+- **(A) Halted Falcon core.** `CPUCTL` still reads `0xffffffff`, and this is **not a code bug**:
+  UnaOS's CSB access (BAR2 `ARU_C11_CSBRANGE@0x9c` page-select + `CSB_BASE@0x2000` window, `CPUCTL@0x100`)
+  is byte-identical to NVIDIA's own T234 path (`UsbFalconLib.c::FalconMapReg`, gated by the comment
+  `/* Set Base 2 adress, only valid in T234 & T264 */`). The `jb6_csb_sweep` probe proved the
+  page-select **sticks** (write `0x1234` → readback `0x1234`; `page_rb` tracks `page_want` for every
+  page) yet the CSB data window returns all-ones for every address — the ARU wrapper is alive but the
+  **Falcon core behind it is unresponsive (held in reset / clock-gated)**. The `fw_hdr` path reads the
+  firmware *image* header fine (it doesn't need the core executing), confirming "fw loaded, core not
+  running." UEFI idled the Falcon core before EBS, independent of the teardown we skipped. JB6 thus
+  moves the problem from *"revive a power-gated dead block"* (proved impossible from NS) to *"start a
+  powered, halted core"* — a reset-deassert lever, a different and more tractable arc.
+- **(B) XUSB StreamID mismatch.** Enumeration reaches ENABLE_SLOT then stalls with
+  `event ring … writes never reach DRAM`: the SMMU stream is opened for `SID=0xe` (the DTB's XUSB iommu
+  id) but the MC `XUSB_HOSTR` StreamID override reads `0x0`, so XUSB DMA is tagged SID 0, never matches
+  the opened stream, and event-TRB write-backs never land in DRAM. An MC-StreamID / SMMU arc,
+  orthogonal to the Falcon.
+
+**Committed state.** The JB6 bootloader shim ships live (tegra-gated). The kernel JB5/JB6 probe
+instrumentation ships **active behind `JB5_PROBE=true`** (read-only witnesses + `jb6_csb_sweep`) as the
+diagnostic base for arcs A/B; the JB4 revival levers stay dormant (`JB4_ENABLE=false`,
+`JB4_ALLOW_PG_CYCLE=false`); the destructive run-E replay is retired (`JB5_RUN_E_REPLAY=false`). Also
+kept: the `fdt_tegra` `XusbIds.clocks` cap 8→9 fix (the `usb@3610000` node lists 9 clocks; the 8-slot
+cap silently dropped `TEGRA234_CLK_PLLE`).
+
+**Gate:** `./arroyo check` both arches green; `UNAOS_TEGRA=1 ./arroyo esp-jetson` links
+(`kernel.elf` 246 KB, healthy); virt `test-arm` green (storage_slot=1, and the shim is correctly a
+**no-op** on the QEMU virt DTB — non-tegra path byte-identical). Metal: JB6 teardown-skip A/B confirmed
+on Orin silicon, boot clean through CAPSTONE.
+
+**⚠ Build hazard addendum (a new flavor of the JB0 355 KB trap).** `./arroyo test-arm` calls
+`prepare_aarch64` **without** `UNAOS_TEGRA=1`, so it rebuilds `kernel.elf` as the **non-tegra
+QEMU-virt** kernel (~355 KB — full generic xHCI, no Tegra UART / GICv3 / JB code) and repackages it
+into the same `target/aarch64_esp`. Running `test-arm` after `esp-jetson` silently clobbers the tegra
+media. **Always rebuild `UNAOS_TEGRA=1 ./arroyo esp-jetson` after any `test-arm`, and size-check
+`kernel.elf` (~248 KB tegra vs ~355 KB virt/corrupt) before flashing.** The size-check caught it here
+before a wasted attended boot.
+
 ## 4. Jetson Orin Nano headless bring-up (Arc JM2)
 
 The Orin is brought up **headless over serial**. The only console that has ever

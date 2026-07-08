@@ -750,6 +750,17 @@ fn main() -> Status {
     };
     let regions = unsafe { core::slice::from_raw_parts_mut(regions_ptr, max_regions) };
 
+    // JB6 (Jetson Orin, attended-bench arc): NVIDIA's UEFI `XhciControllerDxe.OnExitBootServices`
+    // tears the XUSB Falcon down on a Device-Tree boot (USBCMD<-0, padctl DeInitHw, power-gate
+    // Assert), but SELF-SKIPS the whole teardown when an ACPI table is present
+    // (`EfiGetSystemConfigurationTable(&gEfiAcpiTableGuid)` succeeds -> immediate `return`;
+    // source-verified in edk2-nvidia). Installing a minimal, well-formed dummy ACPI 2.0 RSDP/XSDT
+    // into the UEFI config table right before ExitBootServices flips that branch, so UnaOS inherits
+    // a LIVE Falcon (the Linux-style "inherit, don't revive"). Runtime-gated on a tegra234 DTB
+    // sniff, so QEMU `esp-arm` (virt DTB, never contains "tegra234") stays byte-identical.
+    #[cfg(target_arch = "aarch64")]
+    install_tegra_acpi_shim(dtb_addr, dtb_size);
+
     let memory_map = unsafe { boot::exit_boot_services(Some(MemoryType::LOADER_DATA)) };
     
     let mut regions_len = 0;
@@ -784,4 +795,99 @@ fn main() -> Status {
     };
 
     kernel_entry(boot_info_static);
+}
+
+/// JB6 (Jetson Orin attended-bench arc): install a minimal, spec-correct dummy ACPI 2.0 RSDP+XSDT
+/// into the UEFI configuration table immediately before ExitBootServices, so NVIDIA's
+/// `XhciControllerDxe.OnExitBootServices` (and `XusbControllerDxe`) see an ACPI boot and SKIP the
+/// XUSB Falcon teardown — UnaOS then inherits a live Falcon instead of a power-gated dead block.
+///
+/// Blast radius (source-verified against edk2-nvidia, 2026-07-08): the DXE core signals the
+/// `gEfiAcpiTableGuid` event group from inside `InstallConfigurationTable`, so our install fires,
+/// synchronously and before ExitBootServices, exactly one NVIDIA callback — EqosDeviceDxe's
+/// `UpdateACPIMacAddress`. That callback presence-checks the table then walks the ACPI *SDT
+/// protocol* registry (`gEfiAcpiSdtProtocolGuid`), never our RSDP; with no SDT protocol / no DSDT
+/// it early-returns EFI_SUCCESS. So our RSDP/XSDT bytes are never dereferenced on the DT-boot path
+/// and a zero-entry XSDT is safe. The tables are made fully valid anyway (both RSDP checksums, a
+/// valid empty XSDT) as cheap defensive insurance.
+///
+/// Runtime-gated on a `tegra234` substring in the firmware DTB so QEMU `esp-arm` (virt DTB, which
+/// never contains that string) is byte-identical: on non-Tegra firmware this is a no-op.
+#[cfg(target_arch = "aarch64")]
+fn install_tegra_acpi_shim(dtb_addr: u64, dtb_size: usize) {
+    // Gate: only the real Orin firmware DTB. QEMU virt's root `compatible` is "linux,dummy-virt"
+    // and never contains "tegra234"; a raw substring scan of the bounded blob is decisive and
+    // needs no FDT parser in the loader.
+    if dtb_addr == 0 || dtb_size < 8 || dtb_size > 4 * 1024 * 1024 {
+        return;
+    }
+    let blob = unsafe { core::slice::from_raw_parts(dtb_addr as *const u8, dtb_size) };
+    if !blob.windows(8).any(|w| w == b"tegra234") {
+        log::info!("JB6: firmware DTB is not tegra234 — ACPI shim skipped (QEMU-safe no-op)");
+        return;
+    }
+
+    // One page of ACPI_RECLAIM memory survives ExitBootServices and is mapped Reserved by the
+    // kernel's memory-map pass (never handed to the allocator), so the tables persist untouched.
+    let page = match boot::allocate_pages(boot::AllocateType::AnyPages, MemoryType::ACPI_RECLAIM, 1)
+    {
+        Ok(p) => p.as_ptr(),
+        Err(e) => {
+            log::error!("JB6: ACPI shim page alloc failed: {:?} — teardown will NOT skip", e);
+            return;
+        }
+    };
+    unsafe { core::ptr::write_bytes(page, 0, 4096) };
+    let base = page as u64;
+    let xsdt_addr = base + 64; // RSDP at [0..36), XSDT at [64..100) — both inside one 4 KiB page
+
+    // XSDT: a standard 36-byte ACPI System Description Table header with ZERO entry pointers
+    // (Length == header size). An empty XSDT is legal and the safest possible payload.
+    let mut xsdt = [0u8; 36];
+    xsdt[0..4].copy_from_slice(b"XSDT");
+    xsdt[4..8].copy_from_slice(&36u32.to_le_bytes()); // Length (header only, no entries)
+    xsdt[8] = 1; // Revision
+    xsdt[10..16].copy_from_slice(b"UNAOS "); // OEMID (6)
+    xsdt[16..24].copy_from_slice(b"UNAOSTBL"); // OEM Table ID (8)
+    xsdt[24..28].copy_from_slice(&1u32.to_le_bytes()); // OEM Revision
+    xsdt[28..32].copy_from_slice(b"UNAO"); // Creator ID (4)
+    xsdt[32..36].copy_from_slice(&1u32.to_le_bytes()); // Creator Revision
+    xsdt[9] = acpi_checksum(&xsdt); // whole-table byte sum == 0 (mod 256)
+
+    // RSDP: ACPI 2.0 (Revision 2), 36 bytes. RsdtAddress left 0 (XSDT-only, legal at rev 2).
+    let mut rsdp = [0u8; 36];
+    rsdp[0..8].copy_from_slice(b"RSD PTR "); // signature (the trailing space is required)
+    rsdp[9..15].copy_from_slice(b"UNAOS "); // OEMID (6)
+    rsdp[15] = 2; // Revision = 2 (ACPI 2.0+ — what gEfiAcpiTableGuid denotes)
+    rsdp[20..24].copy_from_slice(&36u32.to_le_bytes()); // Length (whole RSDP)
+    rsdp[24..32].copy_from_slice(&xsdt_addr.to_le_bytes()); // XsdtAddress (64-bit)
+    rsdp[8] = acpi_checksum(&rsdp[0..20]); // v1 checksum: first 20 bytes sum == 0
+    rsdp[32] = acpi_checksum(&rsdp); // extended checksum: all 36 bytes sum == 0
+
+    unsafe {
+        core::ptr::copy_nonoverlapping(rsdp.as_ptr(), page, 36);
+        core::ptr::copy_nonoverlapping(xsdt.as_ptr(), xsdt_addr as *mut u8, 36);
+    }
+
+    // gEfiAcpiTableGuid (ACPI 2.0+). Installing it under this GUID is what flips
+    // XhciControllerDxe's teardown to its no-op ACPI branch. `&'static Guid` is required by the
+    // boot service, hence the `static`.
+    static ACPI2_TABLE_GUID: uefi::Guid = uefi::guid!("8868e871-e4f1-11d3-bc22-0080c73c8881");
+    match unsafe {
+        boot::install_configuration_table(&ACPI2_TABLE_GUID, base as *const core::ffi::c_void)
+    } {
+        Ok(()) => log::info!(
+            "JB6: dummy ACPI 2.0 table installed (RSDP @{:#x}, XSDT @{:#x}) — XUSB Falcon teardown will self-skip",
+            base,
+            xsdt_addr
+        ),
+        Err(e) => log::error!("JB6: install_configuration_table failed: {:?} — teardown will NOT skip", e),
+    }
+}
+
+/// 8-bit ACPI checksum: the byte value that makes the sum of every byte in `bytes` zero (mod 256).
+#[cfg(target_arch = "aarch64")]
+fn acpi_checksum(bytes: &[u8]) -> u8 {
+    let sum = bytes.iter().fold(0u8, |a, &b| a.wrapping_add(b));
+    0u8.wrapping_sub(sum)
 }

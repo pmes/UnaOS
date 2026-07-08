@@ -32,8 +32,8 @@ const MAX_TOKENS: usize = 400_000;
 const MAX_DEPTH: usize = 16;
 /// Longest node-name path we keep (bytes, '/'-joined).
 const MAX_PATH: usize = 160;
-/// Most raw u32 words we capture from one property (the XUSB `clocks` list is 8 [phandle, id]
-/// pairs = 16 words — keep headroom above that).
+/// Most raw u32 words we capture from one property (the XUSB `clocks` list is 9 [phandle, id]
+/// pairs = 18 words — keep headroom above that).
 const MAX_WORDS: usize = 20;
 
 #[inline]
@@ -325,7 +325,9 @@ pub fn bpmp_geometry(dtb_addr: u64, dtb_size: usize, ram_gib_mask: u64) -> Optio
 /// JB1c: the XUSB host node's BPMP resource IDs, read off the firmware DTB (never a header
 /// guess). `clocks`/`resets`/`power-domains` are [phandle, id] pairs — we keep the ids.
 pub struct XusbIds {
-    pub clocks: [u32; 8],
+    // 9 slots: the tegra234.dtsi usb@3610000 `clocks` list has NINE entries — an 8-slot cap
+    // silently dropped the 9th (TEGRA234_CLK_PLLE, the UPHY/SS 100 MHz PLL; JB5 finding).
+    pub clocks: [u32; 9],
     pub n_clocks: usize,
     pub resets: [u32; 4],
     pub n_resets: usize,
@@ -369,7 +371,7 @@ pub fn xusb_ids(dtb_addr: u64, dtb_size: usize, ram_gib_mask: u64) -> Option<Xus
         }
     };
     let mut ids = XusbIds {
-        clocks: [0; 8],
+        clocks: [0; 9],
         n_clocks: 0,
         resets: [0; 4],
         n_resets: 0,

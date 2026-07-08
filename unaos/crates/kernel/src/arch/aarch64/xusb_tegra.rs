@@ -504,6 +504,8 @@ pub fn jb3_falcon() {
 /// JB4 master run-time guard. FALSE this arc → dormant (jb4_falcon_revive prints one line and
 /// returns without touching a register). The seat flips it to true — together with wiring the
 /// call into tegra_early_stop — at the attended bench.
+/// JB5 probe media: back to FALSE — the JB4 boots (1+2) answered their question (a real MRQ_PG
+/// partition cycle does NOT re-run the Falcon self-boot); the JB5 bisect wants a pure chain.
 pub const JB4_ENABLE: bool = false;
 
 /// Secondary guard for the partition-reset revival lever (bpmp_tegra::jb4_powergate_cycle, boot 2).
@@ -639,6 +641,259 @@ pub fn jb4_falcon_revive(chan: &super::bpmp_tegra::Chan, ids: &super::fdt_tegra:
             "CNR clear but firmware silent on the mailbox -> STOP (re-run the JB3 chain / rollback)"
         }
     );
+}
+
+// ---------------------------------------------------------------------------------------------
+// JB5 (attended bench): the raw-handoff Falcon witness + per-stage bisect.
+//
+// The JB4 bench + the Linux-source research flipped the frame: Linux never REVIVES the Falcon —
+// on t234 it has no code that can (tegra234_soc.firmware=NULL → the driver only polls CNR), and a
+// genuine partition power-cycle strands the Falcon for Linux exactly as it did for us (the
+// rmmod/insmod xhci-tegra twin: "Falcon state: 0xffffffff", reboot required). Linux works because
+// it INHERITS a running Falcon from MB2 (our own MB2 log: "Binary xusb loaded successfully" +
+// "Skipping powergate XUSB" — partition left ON, firmware resident). edk2-nvidia has NO XUSB-host
+// DXE driver, so the device-discovery EBS teardown never touches the Falcon (dossier correction).
+// So WHO halts ours? Two suspects: (a) our own JB chain — every CPUCTL read we ever took came
+// AFTER JB1c's MRQs + padctl + SMMU/MC rewires; (b) the generic MdeModulePkg XhciDxe, active at
+// EBS because our boot medium hangs off the USB reader. JB5 answers both in one boot per medium:
+// witness the Falcon at RAW handoff (before any XUSB-affecting MRQ), then re-witness after every
+// stage — if it arrives alive and dies at stage N, stage N is the killer; if it arrives dead on
+// the USB-reader boot but alive on the module-microSD boot, the USB boot path is the killer.
+//
+// The one physical impurity: the CSB/CPUCTL window rides BAR2, and UEFI hands us FPCI with BARs
+// unprogrammed + decode disabled — so the "raw" witness needs a minimal BAR2 route first (BAR
+// bases + MEM_SPACE_EN only; no bus-master, no io — jb3_fpci_enable's full 0b111 comes later at
+// its own checkpoint). Config-space reads (CFG_*) decode regardless. Guarded by a read-only
+// MRQ_PG GET_STATE (bpmp_tegra::jb5_pg_on) so a gated partition is a printed SKIP, not the JX1
+// EL3-fatal abort. Every touch prints before it happens (JX1 discipline).
+// ---------------------------------------------------------------------------------------------
+
+/// JB5 master gate: probe media only. When false every jb5_* is a silent no-op (call sites can
+/// stay wired).
+pub const JB5_PROBE: bool = true;
+
+/// JB5 run-D/E branch: the destructive UEFI XhciControllerDxe *replay* (jb5_uefi_pg_cycle POWER-
+/// CYCLES the XUSB partition, then jb5_elpg_release / jb5_fpci_uefi_and_poll). RETIRED FALSE for
+/// JB6: a power-cycle re-runs MB2's one-shot Falcon boot only on a cold partition — but on a JB6
+/// boot the Falcon is inherited LIVE (the bootloader's dummy-ACPI shim makes UEFI skip the XUSB
+/// teardown), and cycling the domain would KILL it. With this false the branch takes the normal,
+/// non-destructive `jb1c_ungate_xusb` path (MRQ_PG-ON is a harmless no-op on an already-ON domain),
+/// while JB5_PROBE stays true so the read-only raw-handoff witness + downstream witnesses still run
+/// and prove the inherited Falcon is alive (CPUCTL != 0xffffffff). See jetson JB6 baton.
+pub const JB5_RUN_E_REPLAY: bool = false;
+
+/// JB5: the least-mutating writes that make the ARU/BAR2 (CSB/CPUCTL/mailbox) window readable at
+/// raw handoff: program BAR0/BAR2 bases iff unset, set MEM_SPACE_EN only. The pre-write CFG dump
+/// is itself a witness of what UEFI/EBS left (Linux-boot handoffs may differ — compare per boot).
+pub fn jb5_bar2_route() {
+    if !JB5_PROBE {
+        return;
+    }
+    let r = |off: u64| unsafe { core::ptr::read_volatile((XUSB_FPCI + off) as *const u32) };
+    let w = |off: u64, v: u32| unsafe {
+        core::ptr::write_volatile((XUSB_FPCI + off) as *mut u32, v)
+    };
+    serial_println!(":: tegra: JB5 — FPCI CFG first touch @{:#010x} (raw handoff) ::", XUSB_FPCI);
+    let (cfg0, cfg1, cfg4, cfg7) = (r(0x0), r(0x4), r(0x10), r(0x1c));
+    serial_println!(
+        ":: tegra: JB5 — handoff FPCI: CFG_0={:#010x} CFG_1={:#010x} (io={} mem={} busmaster={}) CFG_4={:#010x} CFG_7={:#010x} ::",
+        cfg0, cfg1, cfg1 & 1, (cfg1 >> 1) & 1, (cfg1 >> 2) & 1, cfg4, cfg7
+    );
+    if cfg4 & !0xf == 0 {
+        w(0x10, 0x0361_0000);
+    }
+    if cfg7 & !0xf == 0 {
+        w(0x1c, 0x0365_0000);
+    }
+    if (cfg1 >> 1) & 1 == 0 {
+        w(0x4, cfg1 | 0b010); // MEM_SPACE_EN only — bus-master/io stay as handed off
+    }
+    serial_println!(
+        ":: tegra: JB5 — minimal BAR2 route: CFG_1 rb={:#010x} CFG_4 rb={:#010x} CFG_7 rb={:#010x} ::",
+        r(0x4), r(0x10), r(0x1c)
+    );
+}
+
+/// JB5: the one-line state witness — xHCI cap0 + USBSTS (CNR b11 / HCH b0, direct aperture) and,
+/// iff BAR2 is routed (self-guarded via CFG), the Falcon CSB CPUCTL + the ARU mailbox owner.
+/// CPUCTL is THE discriminator: a running Falcon reads sane low bits; a halted one 0xffffffff.
+pub fn jb5_witness(tag: &str) {
+    if !JB5_PROBE {
+        return;
+    }
+    let cap0 = unsafe { core::ptr::read_volatile(XUSB_HOST as *const u32) };
+    let (usbsts, cnr, hch) = if cap0 == 0 || cap0 == 0xFFFF_FFFF {
+        (0u32, 9u32, 9u32) // 9 = n/a (cap dead)
+    } else {
+        let cl = (cap0 & 0xff) as u64;
+        let s = unsafe { core::ptr::read_volatile((XUSB_HOST + cl + 0x04) as *const u32) };
+        (s, (s >> 11) & 1, s & 1)
+    };
+    let fr = |off: u64| unsafe { core::ptr::read_volatile((XUSB_FPCI + off) as *const u32) };
+    let (cfg1, cfg7) = (fr(0x4), fr(0x1c));
+    if cfg7 & !0xf != 0 && (cfg1 >> 1) & 1 == 1 {
+        let br = |off: u64| unsafe { core::ptr::read_volatile((XUSB_BAR2 + off) as *const u32) };
+        let bw = |off: u64, v: u32| unsafe {
+            core::ptr::write_volatile((XUSB_BAR2 + off) as *mut u32, v)
+        };
+        bw(0x9c, (0x100u32 >> 9) & 0x7f_ffff); // CSB page for CPUCTL @0x100
+        let cpuctl = br(0x2000 + (0x100 & 0x1ff) as u64);
+        serial_println!(
+            ":: tegra: JB5 — witness[{}]: cap0={:#010x} USBSTS={:#010x} (CNR={} HCH={}) CPUCTL={:#010x} (halted={} stopped={}) mbox_owner={:#x} ::",
+            tag, cap0, usbsts, cnr, hch, cpuctl, (cpuctl >> 4) & 1, (cpuctl >> 5) & 1, br(0x010)
+        );
+    } else {
+        serial_println!(
+            ":: tegra: JB5 — witness[{}]: cap0={:#010x} USBSTS={:#010x} (CNR={} HCH={}) CPUCTL=n/a (BAR2 unrouted) ::",
+            tag, cap0, usbsts, cnr, hch
+        );
+    }
+}
+
+/// JB6 probe (read-mostly): disambiguate why CPUCTL reads 0xffffffff on an inherited-powered XUSB
+/// block. Run F showed direct ARU/BAR2 reads decode as 0x0 (block powered), but the CSB window
+/// (page-select @0x9c -> data window @0x2000) reads 0xffffffff AND an ARU STREAMID_FIELD write did
+/// not stick (wrote 0xe, read 0). Hypothesis: the 0x9c page-select write is not landing either, so
+/// the CSB window points nowhere -> 0xffffffff (a stuck-page artifact, NOT a dead Falcon core).
+/// This checks whether 0x9c accepts writes, sweeps direct ARU regs, and sweeps a few CSB addresses
+/// with a page-select readback each time. STRICTLY non-destructive: the only writes are the same
+/// page-select writes jb3_falcon already performs (no resets, no power/clock/PG changes).
+pub fn jb6_csb_sweep() {
+    if !JB5_PROBE {
+        return;
+    }
+    let r = |off: u64| unsafe { core::ptr::read_volatile((XUSB_BAR2 + off) as *const u32) };
+    let w = |off: u64, v: u32| unsafe {
+        core::ptr::write_volatile((XUSB_BAR2 + off) as *mut u32, v)
+    };
+    // (1) Does the CSB page-select register (ARU_C11_CSBRANGE @0x9c) accept writes at all?
+    let pre = r(0x9c);
+    w(0x9c, 0x1234);
+    let rb = r(0x9c);
+    w(0x9c, 0);
+    serial_println!(
+        ":: tegra: JB6 — CSB page-sel 0x9c: pre={:#010x} wrote=0x1234 rb={:#010x} STICKS={} ::",
+        pre,
+        rb,
+        rb == 0x1234
+    );
+    // (2) Direct ARU/BAR2 register sweep (pure reads) — which decode (non-ff) and are non-zero?
+    for &o in &[0x00u64, 0x04, 0x08, 0x0c, 0x10, 0x9c, 0xe0, 0xe4, 0xe8, 0x100, 0x104, 0x110] {
+        serial_println!(":: tegra: JB6 — BAR2[{:#05x}] = {:#010x} ::", o, r(o));
+    }
+    // (3) CSB indirect sweep via 0x9c->0x2000, reading back the page-select each time to see if the
+    // window actually re-pages. If page_rb never reflects the write, the window is a stuck page.
+    let csb_r = |addr: u32| -> (u32, u32) {
+        w(0x9c, (addr >> 9) & 0x7f_ffff);
+        (r(0x9c), r(0x2000 + (addr & 0x1ff) as u64))
+    };
+    for &a in &[0x0000u32, 0x0100, 0x0104, 0x0110, 0x0f00, 0x1000, 0x4_0000] {
+        let (pg, val) = csb_r(a);
+        serial_println!(
+            ":: tegra: JB6 — CSB[{:#07x}] page_want={:#x} page_rb={:#010x} val={:#010x} ::",
+            a,
+            (a >> 9) & 0x7f_ffff,
+            pg,
+            val
+        );
+    }
+    w(0x9c, 0);
+}
+
+/// JB5 run E: release the SS ELPG clamps — the InitHw step jb2c never covered. UEFI's
+/// UsbPadCtlDxe DeInitHw (EBS) powers USB3 down per port: set SSPX_ELPG_CLAMP_EN_EARLY, 200 µs,
+/// set SSPX_ELPG_CLAMP_EN, 350 µs, set SSPX_ELPG_VCORE_DOWN — so every UnaOS boot inherits the SS
+/// partition CLAMPED with VCORE down, and nothing in the JB chain ever released it. InitHw's
+/// InitUsb3PadX clears all three per port in XUSB_PADCTL_ELPG_PROGRAM_1_0 (@0x24; t186+ layout:
+/// port i uses bits 3i CLAMP_EN / 3i+1 CLAMP_EN_EARLY / 3i+2 VCORE_DOWN). Clear the 4 ports' 12
+/// bits (RMW), print pre/post. (UsbPadCtlTegra234.c, source-verified 2026-07-08.)
+pub fn jb5_elpg_release() {
+    if !JB5_PROBE {
+        return;
+    }
+    let r = |off: u64| unsafe { core::ptr::read_volatile((PADCTL + off) as *const u32) };
+    let w = |off: u64, v: u32| unsafe {
+        core::ptr::write_volatile((PADCTL + off) as *mut u32, v)
+    };
+    let pre = r(0x24);
+    w(0x24, pre & !0xfff); // SSP0..SSP3 × {CLAMP_EN, CLAMP_EN_EARLY, VCORE_DOWN}
+    serial_println!(
+        ":: tegra: JB5 — ELPG_PROGRAM_1 SS clamp release: {:#010x} -> rb={:#010x} (12 low bits cleared) ::",
+        pre,
+        r(0x24)
+    );
+}
+
+/// JB5 run D: the XhciControllerDxe FPCI config, verbatim from source (XhciControllerPrivate.h:
+/// CFG_1@0x04, CFG_4@0x10, CFG_7@0x1c, AXI_CFG_0@0xF8; CNR=b11, HCE=b12): program BAR0/BAR2
+/// bases, AXI_CFG_0 <- 0x5 (never written by any prior UnaOS boot), CFG_1 |= mem+busmaster —
+/// then poll the TRUE readiness signal, CSB CPUCTL != 0xffffffff, for ~300 ms (UEFI polls CNR
+/// for 200 ms, but CNR is a proven stale latch on this board). Returns cap0-alive.
+pub fn jb5_fpci_uefi_and_poll() -> bool {
+    if !JB5_PROBE {
+        return false;
+    }
+    let r = |off: u64| unsafe { core::ptr::read_volatile((XUSB_FPCI + off) as *const u32) };
+    let w = |off: u64, v: u32| unsafe {
+        core::ptr::write_volatile((XUSB_FPCI + off) as *mut u32, v)
+    };
+    serial_println!(":: tegra: JB5 — XhciControllerDxe FPCI replay @{:#010x} ::", XUSB_FPCI);
+    let (cfg1, cfg4, cfg7, axi) = (r(0x4), r(0x10), r(0x1c), r(0xf8));
+    serial_println!(
+        ":: tegra: JB5 — post-cycle FPCI: CFG_1={:#010x} CFG_4={:#010x} CFG_7={:#010x} AXI_CFG_0={:#010x} ::",
+        cfg1, cfg4, cfg7, axi
+    );
+    w(0x10, 0x0361_0000); // CFG_4: BAR0
+    w(0x1c, 0x0365_0000); // CFG_7: BAR2 (ARU/CSB window)
+    w(0xf8, 0x5); // AXI_CFG_0 <- 0x5 — the UEFI write no UnaOS boot has ever made
+    w(0x4, r(0x4) | 0b110); // CFG_1: MEM_SPACE(b1) | BUS_MASTER(b2), exactly UEFI's two bits
+    serial_println!(
+        ":: tegra: JB5 — FPCI programmed: CFG_1 rb={:#010x} CFG_4 rb={:#010x} CFG_7 rb={:#010x} AXI_CFG_0 rb={:#010x} ::",
+        r(0x4), r(0x10), r(0x1c), r(0xf8)
+    );
+    let cap0 = unsafe { core::ptr::read_volatile(XUSB_HOST as *const u32) };
+    if cap0 == 0 || cap0 == 0xFFFF_FFFF {
+        serial_println!(":: tegra: JB5 — cap0={:#010x} (dead post-replay) -> STOP ::", cap0);
+        return false;
+    }
+    // The Falcon self-boot window: poll CPUCTL through the freshly-routed BAR2 CSB page window.
+    let br = |off: u64| unsafe { core::ptr::read_volatile((XUSB_BAR2 + off) as *const u32) };
+    let bw = |off: u64, v: u32| unsafe {
+        core::ptr::write_volatile((XUSB_BAR2 + off) as *mut u32, v)
+    };
+    let csb_cpuctl = || {
+        bw(0x9c, (0x100u32 >> 9) & 0x7f_ffff);
+        br(0x2000 + (0x100 & 0x1ff) as u64)
+    };
+    let deadline = cntpct().wrapping_add(cntfrq().saturating_mul(300) / 1000);
+    let mut cpuctl = csb_cpuctl();
+    while cpuctl == 0xFFFF_FFFF && cntpct().wrapping_sub(deadline) >= (1u64 << 63) {
+        core::hint::spin_loop();
+        cpuctl = csb_cpuctl();
+    }
+    let cl = (cap0 & 0xff) as u64;
+    let sts = unsafe { core::ptr::read_volatile((XUSB_HOST + cl + 0x04) as *const u32) };
+    serial_println!(
+        ":: tegra: JB5 — Falcon-boot poll: CPUCTL={:#010x} ({}) USBSTS={:#010x} (CNR={} HCE={}) ::",
+        cpuctl,
+        if cpuctl != 0xFFFF_FFFF { "ALIVE — self-boot ran" } else { "still 0xffffffff after 300ms" },
+        sts, (sts >> 11) & 1, (sts >> 12) & 1
+    );
+    true
+}
+
+/// JB5 run C: bounded ~300 ms settle (CNTPCT, mainline waits up to 200 ms for the Falcon
+/// self-boot) then re-witness — if the Linux-order power-up edge kicked the boot-ROM, CPUCTL
+/// flips from 0xffffffff to sane bits within this window.
+pub fn jb5_settle_witness(tag: &str) {
+    if !JB5_PROBE {
+        return;
+    }
+    let deadline = cntpct().wrapping_add(cntfrq().saturating_mul(300) / 1000);
+    while cntpct().wrapping_sub(deadline) >= (1u64 << 63) {
+        core::hint::spin_loop();
+    }
+    jb5_witness(tag);
 }
 
 pub fn jb2b_attach(dma_coherent: Option<bool>) -> Option<(u8, u8)> {

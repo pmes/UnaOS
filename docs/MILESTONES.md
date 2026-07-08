@@ -10,6 +10,31 @@ Legend: **✅ metal-confirmed** · **🔬 QEMU-green, metal pending** · dates I
 
 ---
 
+## hw-jetson track — 2026-07-08 (attended bench, Peter at the Orin)
+
+### JB6 — "inherit, don't revive" the XUSB Falcon: a bootloader dummy-ACPI table makes UEFI skip its ExitBootServices teardown ✅ teardown-skip metal-proven / 🔬 enum → arcs A+B `hw-jetson`
+- **What:** the bootloader installs a minimal, spec-correct dummy **ACPI 2.0 RSDP+XSDT** into the UEFI
+  config table immediately before `ExitBootServices` (`install_tegra_acpi_shim`, gated on a `tegra234`
+  DTB sniff so QEMU `esp-arm` stays byte-identical). NVIDIA's `XhciControllerDxe.OnExitBootServices`
+  self-skips its XUSB teardown when an ACPI table is present, so UnaOS **inherits a powered,
+  FPCI-configured XUSB block** instead of a torn-down dead one. The run-F kernel path is
+  non-destructive (`JB5_RUN_E_REPLAY=false` retires the domain-power-cycle replay that would kill an
+  inherited-live block; read-only witnesses + a `jb6_csb_sweep` diagnostic ship active behind
+  `JB5_PROBE`). Preceded by **JB5**, which — 5 probe boots + a full edk2-nvidia source read —
+  **refuted** non-secure Falcon revival (MB2 one-shot IFR self-boot; UEFI power-gate vote-refcounted).
+- **Metal — ✅ teardown-skip PROVEN (Peter-attended, Orin, 2026-07-08):** A/B at raw handoff,
+  no-shim → shim: XUSB power gates `0x0`→**`0x1`**, FPCI `busmaster=0`→**`1`**, BARs
+  unprogrammed→**programmed**. Boot ran clean through **CAPSTONE 6/6**. **Not yet enumerating** — two
+  root-caused next arcs: **(A)** the inherited Falcon *core* is halted (`CPUCTL=0xffffffff` read via the
+  NVIDIA-correct T234 CSB path — the core is in reset / clock-gated behind a live ARU; needs a
+  reset-deassert), **(B)** an XUSB MC StreamID mismatch (DMA tagged SID 0 vs the SMMU stream opened for
+  SID 0xe → event-ring writes never reach DRAM).
+- **Tested — QEMU (the DONE gate):** `./arroyo check` both arches green; `UNAOS_TEGRA=1 ./arroyo
+  esp-jetson` links (`kernel.elf` 246 KB, healthy); virt `test-arm` green (`storage_slot=1`) with the
+  shim correctly a **no-op** on the QEMU virt DTB (non-tegra path byte-identical).
+- **Detail:** [`arch_arm64.md` §JB5+JB6](dev/OS/01_BOOT_HAL/arch_arm64.md). Next: arcs **A** (start the
+  halted Falcon core) + **B** (MC StreamID) per the A+B baton.
+
 ## hw-pi4 track — 2026-07-07 (Opus round, post-Campaign 2)
 
 ### U9 — real File writes + seek: EMMC2 sector write, in-place `fat::write_at`, `SYS_SEEK`, File+`CAP_WRITE`-routed `sys_write` (aarch64) ✅ `hw-pi4`

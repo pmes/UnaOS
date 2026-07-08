@@ -544,6 +544,137 @@ const CLK_XUSB_FALCON: u32 = 269;
 const CLK_XUSB_FALCON_HOST: u32 = 270;
 const CLK_XUSB_FALCON_SS: u32 = 271;
 
+/// JB5 run C (attended bench): the Linux-probe-order bring-up — the one NS sequence never yet
+/// tried on this board. Runs A/B proved UEFI hands over the XUSB domain POWER-GATED on every boot
+/// path, and that JB1c's power-first order (PG ON → clocks) does not self-boot the Falcon. Linux
+/// (xhci-tegra probe, lens-B verified) orders it: clocks FIRST, PHY/padctl, THEN the power domains
+/// ON in genpd order — SS (XUSBA, 10) before HOST (XUSBC, 12) — the reverse of the DTB/JB1c order.
+/// Hypothesis under test: the Falcon boot-ROM samples its clock at the partition power-up EDGE —
+/// powering a clockless domain skips the self-boot, and enabling the clock afterwards is too late.
+/// So: enable every DTB clock, then PG ON iterating pds REVERSED (10 then 12), then the cap0 probe
+/// (mirrors jb1c's tail; the JX1 announce-then-touch discipline). Caller runs padctl before this.
+pub fn jb5_linux_order_ungate(chan: &Chan, ids: &super::fdt_tegra::XusbIds) -> bool {
+    serial_println!(
+        ":: tegra: JB5 — Linux-order ungate: {} clocks FIRST, then PG {:?} reversed (SS before HOST) ::",
+        ids.n_clocks,
+        &ids.pds[..ids.n_pds],
+    );
+    for i in 0..ids.n_clocks {
+        let id = ids.clocks[i];
+        match chan.transfer(MRQ_CLK, &[(CMD_CLK_ENABLE << 24) | (id & 0x00ff_ffff)]) {
+            Some((err, _)) => {
+                serial_println!(":: tegra: JB5 — CLK {} enable (pre-power) -> err={} ::", id, err)
+            }
+            None => {
+                serial_println!(":: tegra: JB5 — CLK {} enable -> TIMEOUT; STOP ::", id);
+                return false;
+            }
+        }
+    }
+    for i in (0..ids.n_pds).rev() {
+        let id = ids.pds[i];
+        match chan.transfer(MRQ_PG, &[CMD_PG_SET_STATE, id, PG_STATE_ON]) {
+            Some((err, _)) => {
+                serial_println!(":: tegra: JB5 — PG {} ON (Linux order) -> err={} ::", id, err)
+            }
+            None => {
+                serial_println!(":: tegra: JB5 — PG {} ON -> TIMEOUT; STOP ::", id);
+                return false;
+            }
+        }
+    }
+    const XUSB_HOST: u64 = 0x0361_0000;
+    serial_println!(":: tegra: JB5 — probing XUSB host @{:#x} (post Linux-order ungate) ::", XUSB_HOST);
+    let cap0 = r32(XUSB_HOST);
+    if cap0 == 0xFFFF_FFFF || cap0 == 0 {
+        serial_println!(":: tegra: JB5 — XUSB cap0={:#010x} (still gated/absent) ::", cap0);
+        return false;
+    }
+    let caplength = (cap0 & 0xff) as u64;
+    serial_println!(
+        ":: tegra: JB5 — XUSB ALIVE (Linux order): cap0={:#010x} USBCMD={:#010x} USBSTS={:#010x} -> proceed ::",
+        cap0,
+        r32(XUSB_HOST + caplength),
+        r32(XUSB_HOST + caplength + 0x04),
+    );
+    true
+}
+
+/// JB5 run D: enable every DTB clock (now all NINE — the 8-slot cap dropped PLLE) before any
+/// power edge, mirroring the DeviceDiscovery framework's AutoEnableClocks that precedes
+/// XhciControllerDxe's Start().
+pub fn jb5_clocks_on(chan: &Chan, ids: &super::fdt_tegra::XusbIds) {
+    for i in 0..ids.n_clocks {
+        let id = ids.clocks[i];
+        match chan.transfer(MRQ_CLK, &[(CMD_CLK_ENABLE << 24) | (id & 0x00ff_ffff)]) {
+            Some((err, _)) => {
+                serial_println!(":: tegra: JB5 — CLK {} enable -> err={} ::", id, err)
+            }
+            None => serial_println!(":: tegra: JB5 — CLK {} enable -> TIMEOUT ::", id),
+        }
+    }
+}
+
+/// JB5 run D: the XhciControllerDxe power-gate sequence, verbatim (edk2-nvidia
+/// XhciControllerDxe.c DeviceDiscoveryDriverBindingStart, source-verified 2026-07-08):
+/// Deassert (ON) every gate → Assert (OFF) every gate ("reset to default state") → Deassert (ON)
+/// every gate — the deliberate double-cycle UEFI uses to revive the Falcon from the power-gated
+/// state its own ExitBootServices teardown leaves. GET_STATE brackets prove each edge on serial.
+/// MRQs only — no XUSB MMIO happens between the OFF and the final ON (the JX1 rule).
+pub fn jb5_uefi_pg_cycle(chan: &Chan, ids: &super::fdt_tegra::XusbIds) {
+    let set = |state: u32, tag: &str| {
+        for i in 0..ids.n_pds {
+            let id = ids.pds[i];
+            match chan.transfer(MRQ_PG, &[CMD_PG_SET_STATE, id, state]) {
+                Some((err, _)) => {
+                    serial_println!(":: tegra: JB5 — PG {} <- {} ({}) -> err={} ::", id, state, tag, err)
+                }
+                None => serial_println!(":: tegra: JB5 — PG {} <- {} ({}) -> TIMEOUT ::", id, state, tag),
+            }
+        }
+        for i in 0..ids.n_pds {
+            let id = ids.pds[i];
+            if let Some((err, out)) = chan.transfer(MRQ_PG, &[CMD_PG_GET_STATE, id]) {
+                serial_println!(
+                    ":: tegra: JB5 — PG {} state after {} err={} = {:#x} ::",
+                    id, tag, err, out[0]
+                );
+            }
+        }
+    };
+    serial_println!(":: tegra: JB5 — XhciControllerDxe PG replay: Deassert -> Assert -> Deassert ::");
+    set(PG_STATE_ON, "deassert-1");
+    set(PG_STATE_OFF, "assert");
+    set(PG_STATE_ON, "deassert-2");
+}
+
+/// JB5 (attended bench): the read-only power-state guard for the raw-handoff Falcon witness.
+/// MRQ_PG GET_STATE of every DTB power domain — a pure query, zero mutation — so the JB5 probe
+/// touches XUSB MMIO only on a boot where the partition is provably ON (the JX1 gated-block rule).
+/// Returns true iff every domain reads ON (0x1).
+pub fn jb5_pg_on(chan: &Chan, ids: &super::fdt_tegra::XusbIds) -> bool {
+    let mut all_on = true;
+    for i in 0..ids.n_pds {
+        let id = ids.pds[i];
+        match chan.transfer(MRQ_PG, &[CMD_PG_GET_STATE, id]) {
+            Some((err, out)) => {
+                serial_println!(
+                    ":: tegra: JB5 — PG {} GET_STATE (read-only) err={} = {:#x} ::",
+                    id, err, out[0]
+                );
+                if err != 0 || out[0] != 1 {
+                    all_on = false;
+                }
+            }
+            None => {
+                serial_println!(":: tegra: JB5 — PG {} GET_STATE -> TIMEOUT ::", id);
+                all_on = false;
+            }
+        }
+    }
+    all_on
+}
+
 /// JB4-prep IMEM-preserving witness re-assert (see the block comment). Re-enables the Falcon clock
 /// tree (269/267/270/271) and re-asserts every power domain JB1c resolved from the DTB (XUSBC/XUSBA)
 /// ON — no reset, no PG-OFF. Best-effort; each MRQ's err is printed; nothing gates on it.

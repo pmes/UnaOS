@@ -989,6 +989,11 @@ fn tegra_early_stop(boot_info: &'static mut BootInfo) -> ! {
     // JB1c ungate is an EL3-fatal CBB abort (the JX1 lesson), so the attach runs ONLY on a boot
     // whose ungate proved the block alive.
     let mut xusb_alive = false;
+    // JB4 (attended bench): hoist the proven BPMP channel + the DTB-resolved XUSB ids out of the
+    // JB1c match so the JB4 Falcon-revival levers below (jb4_powergate_cycle / jb4_falcon_revive)
+    // can reuse the exact `chan`/`ids` JB1c already validated — no re-ping, no re-resolve.
+    let mut jb_chan: Option<unaos_kernel::arch::bpmp_tegra::Chan> = None;
+    let mut jb_ids: Option<unaos_kernel::arch::fdt_tegra::XusbIds> = None;
     match unaos_kernel::arch::fdt_tegra::bpmp_geometry(
         boot_info.dtb_addr,
         boot_info.dtb_size,
@@ -999,30 +1004,95 @@ fn tegra_early_stop(boot_info: &'static mut BootInfo) -> ! {
             // domains -> clocks -> reset deassert, all ids read off the DTB's usb@3610000 node)
             // and re-probe the xHCI capability block that was EL3-fatal in JX1.
             if let Some(chan) = unaos_kernel::arch::bpmp_tegra::jb1b_ping(&geom) {
-                // JB0: fan FIRST. The UEFI ExitBootServices teardown stopped the cooling fan
-                // (it disabled the PWM3 clock + reset); restore it before anything else so the
-                // SoC has cooling for the rest of the boot. Cheapest teardown-restore (no
-                // power-gate), rides the just-proven BPMP channel. Safety hygiene: a dead fan
-                // can't damage the die (BL31/BPMP hardware thermal net), but this keeps it cool.
-                unaos_kernel::arch::bpmp_tegra::jb0_fan_on(&chan);
-                match unaos_kernel::arch::fdt_tegra::xusb_ids(
+                // JB5 (attended bench): resolve the XUSB ids FIRST (a pure DTB read, no MMIO)
+                // so the raw-handoff Falcon witness can run BEFORE any XUSB-affecting MRQ —
+                // the whole point is to see the state UEFI handed over, untouched. A read-only
+                // MRQ_PG GET_STATE guards the first MMIO touch (the JX1 gated-block rule); the
+                // minimal BAR2 route is the one physically-unavoidable mutation (UEFI hands
+                // FPCI over with BARs unprogrammed — see the JB5 block comment in xusb_tegra).
+                let jb5_ids = unaos_kernel::arch::fdt_tegra::xusb_ids(
                     boot_info.dtb_addr,
                     boot_info.dtb_size,
                     mmu.ram_gib_mask,
-                ) {
-                    Some(ids) => {
-                        xusb_alive =
-                            unaos_kernel::arch::bpmp_tegra::jb1c_ungate_xusb(&chan, &ids);
-                        // JB2c: the firmware's ExitBootServices teardown powered the padctl USB2
-                        // pads DOWN (JB2b root cause: ports read PORTSC=0x2a0 CCS=0, electrically
-                        // dead). Re-program the pad power-up sequence HERE — pre-drop at EL2, while
-                        // the BPMP `chan` is in scope for the bias-pad tracking clock — so the pads
-                        // are live BEFORE the JB2b xHCI attach surveys the ports below. Gated on the
-                        // ungate: padctl is always-powered, but there is no point powering pads for
-                        // a controller that never came alive.
-                        if xusb_alive {
-                            unaos_kernel::arch::xusb_tegra::jb2c_padctl_powerup(&chan);
+                );
+                if unaos_kernel::arch::xusb_tegra::JB5_PROBE {
+                    match jb5_ids.as_ref() {
+                        Some(ids) if unaos_kernel::arch::bpmp_tegra::jb5_pg_on(&chan, ids) => {
+                            unaos_kernel::arch::xusb_tegra::jb5_bar2_route();
+                            unaos_kernel::arch::xusb_tegra::jb5_witness("raw-handoff");
+                            // JB6 probe: is CPUCTL=0xffffffff a stuck CSB page-select or a dead
+                            // Falcon core? Read-only ARU/CSB sweep (only page-select writes).
+                            unaos_kernel::arch::xusb_tegra::jb6_csb_sweep();
                         }
+                        Some(_) => serial_println!(
+                            ":: tegra: JB5 — XUSB domain not ON at handoff; raw witness SKIPPED (JX1 rule) ::"
+                        ),
+                        None => {}
+                    }
+                }
+                // JB0: fan next. The UEFI ExitBootServices teardown stopped the cooling fan
+                // (it disabled the PWM3 clock + reset); restore it early so the SoC has
+                // cooling for the rest of the boot. Cheapest teardown-restore (no power-gate),
+                // rides the just-proven BPMP channel. Safety hygiene: a dead fan can't damage
+                // the die (BL31/BPMP hardware thermal net), but this keeps it cool. (JB5 note:
+                // the raw witness above deliberately precedes even this unrelated-PWM MRQ.)
+                unaos_kernel::arch::bpmp_tegra::jb0_fan_on(&chan);
+                match jb5_ids {
+                    Some(ids) => {
+                        if unaos_kernel::arch::xusb_tegra::JB5_RUN_E_REPLAY {
+                            // JB5 run D: the XhciControllerDxe replay. Source-verified
+                            // (edk2-nvidia XhciControllerDxe.c + Private.h, 2026-07-08): UEFI
+                            // revives the Falcon from the SAME power-gated handoff state every
+                            // boot with NOTHING but clocks -> PG Deassert->Assert->Deassert ->
+                            // padctl InitHw -> FPCI CFG_4/CFG_7/AXI_CFG_0<-0x5/CFG_1 -> CNR
+                            // poll — zero firmware writes (UsbFalconLib = accessors only). Runs
+                            // 0-C differed from that recipe in: the double PG cycle, the
+                            // AXI_CFG_0 write, the 9th clock (PLLE), and the SMMU state at the
+                            // fetch edge (pre-armed identity-translate here, re-tightened by
+                            // the normal JB3 chain downstream). Replay it exactly; the real
+                            // pass signal is CPUCTL != 0xffffffff (CNR is a stale latch).
+                            unaos_kernel::arch::bpmp_tegra::jb5_clocks_on(&chan, &ids);
+                            if let Some(io) = unaos_kernel::arch::fdt_tegra::xusb_iommu(
+                                boot_info.dtb_addr,
+                                boot_info.dtb_size,
+                                mmu.ram_gib_mask,
+                            ) {
+                                unaos_kernel::arch::smmu_tegra::jb3_open_stream(
+                                    &io.bases[..io.n_bases],
+                                    io.sid,
+                                );
+                                unaos_kernel::arch::smmu_tegra::jb3_mc_sid_fix(io.sid);
+                            }
+                            unaos_kernel::arch::bpmp_tegra::jb5_uefi_pg_cycle(&chan, &ids);
+                            unaos_kernel::arch::xusb_tegra::jb2c_padctl_powerup(&chan);
+                            // Run E: the InitHw step jb2c never covered — release the SS ELPG
+                            // clamps + VCORE_DOWN that UEFI's DeInitHw asserted at EBS.
+                            unaos_kernel::arch::xusb_tegra::jb5_elpg_release();
+                            xusb_alive =
+                                unaos_kernel::arch::xusb_tegra::jb5_fpci_uefi_and_poll();
+                            unaos_kernel::arch::xusb_tegra::jb5_witness("post-uefi-replay");
+                            unaos_kernel::arch::xusb_tegra::jb5_settle_witness(
+                                "post-uefi-replay-300ms",
+                            );
+                        } else {
+                            xusb_alive =
+                                unaos_kernel::arch::bpmp_tegra::jb1c_ungate_xusb(&chan, &ids);
+                            // JB2c: the firmware's ExitBootServices teardown powered the padctl
+                            // USB2 pads DOWN (JB2b root cause: ports read PORTSC=0x2a0 CCS=0,
+                            // electrically dead). Re-program the pad power-up sequence HERE —
+                            // pre-drop at EL2, while the BPMP `chan` is in scope for the bias-pad
+                            // tracking clock — so the pads are live BEFORE the JB2b xHCI attach
+                            // surveys the ports below. Gated on the ungate: padctl is
+                            // always-powered, but there is no point powering pads for a
+                            // controller that never came alive.
+                            if xusb_alive {
+                                unaos_kernel::arch::xusb_tegra::jb2c_padctl_powerup(&chan);
+                            }
+                        }
+                        // JB4 (attended bench): retain the proven channel + ids for the
+                        // Falcon-revival levers below (moved last — no borrow follows).
+                        jb_ids = Some(ids);
+                        jb_chan = Some(chan);
                     }
                     None => serial_println!(":: tegra: JB1c — no usb@3610000 ids in DTB; SKIP ::"),
                 }
@@ -1127,6 +1197,7 @@ fn tegra_early_stop(boot_info: &'static mut BootInfo) -> ! {
         // the XUSB stream (SMR match -> S2CR bypass) and turn the client port back on with
         // USFCFG=1 so anything unexpected faults-and-logs instead of dying silently.
         unaos_kernel::arch::smmu_tegra::jb3_open_stream(&jb3_bases[..jb3_n], jb3_sid);
+        unaos_kernel::arch::xusb_tegra::jb5_witness("post-smmu-open");
         // JB3 boot-6 (discrimination): the v2 pair is open + fault-free yet DMA still dies —
         // a second killer sits downstream. Census the DTB's smmu/iommu nodes (find any
         // SMMUv3 without touching unknown addresses), dump the v3's CR0/GBPA state if one
@@ -1140,21 +1211,46 @@ fn tegra_early_stop(boot_info: &'static mut BootInfo) -> ! {
         // does every boot — the UEFI exit teardown cleared them; the SMMU chain is proven
         // clean and this is the remaining torn-down link that assigns the stream its id.
         unaos_kernel::arch::smmu_tegra::jb3_mc_sid_fix(jb3_sid);
+        unaos_kernel::arch::xusb_tegra::jb5_witness("post-mc-sid");
         // JB3 boot-10: the FPCI wrapper's bus-master enable — the last torn-down link
         // (Linux sets it before its first controller touch; JB2b never did).
         unaos_kernel::arch::xusb_tegra::jb3_fpci_enable();
+        unaos_kernel::arch::xusb_tegra::jb5_witness("post-fpci-full");
         // JB3 boot-11: with BAR2 routed, probe/restore the ARU-side DMA config
         // (IFRDMA/STREAMID_FIELD) and send the firmware the MSG_ENABLED handshake.
         unaos_kernel::arch::xusb_tegra::jb3_aru_probe(jb3_sid);
+        unaos_kernel::arch::xusb_tegra::jb5_witness("post-aru-mbox");
         // JB3 boot-12: the Falcon (the xHC command engine) — read CPUCTL/BOOTVEC + the
         // firmware header; restart the halted CPU the ROM-loader way if needed.
         unaos_kernel::arch::xusb_tegra::jb3_falcon();
+        unaos_kernel::arch::xusb_tegra::jb5_witness("post-jb3falcon");
+        // JB4 (attended bench): the XUSB Falcon revival levers. Runs AFTER jb3_falcon (BAR2/FPCI
+        // routed, ARU restored) and reuses the JB1c-proven `chan`/`ids`. Two forks:
+        //   * Boot 2 ONLY (JB4_ALLOW_PG_CYCLE — CALL-SITE-enforced; jb4_powergate_cycle does NOT
+        //     self-check it): MRQ_PG partition OFF->ON re-runs the Falcon self-boot but WIPES the
+        //     partition, so re-run the JB3 fabric chain (padctl + SMMU stream + MC-SID + FPCI +
+        //     ARU, the proven order) before polling. jb3_falcon (the CSB restart) is deliberately
+        //     NOT re-run — the wrong path for t234; jb4_falcon_revive polls USBSTS.CNR instead.
+        //   * Boot 1+2 (JB4_ENABLE, self-checked in jb4_falcon_revive): the non-destructive
+        //     readiness poll — makes NO CSB writes; USBSTS.CNR clearing is the one true signal.
+        if let (Some(chan), Some(ids)) = (jb_chan.as_ref(), jb_ids.as_ref()) {
+            if unaos_kernel::arch::xusb_tegra::JB4_ALLOW_PG_CYCLE {
+                unaos_kernel::arch::bpmp_tegra::jb4_powergate_cycle(chan, ids);
+                unaos_kernel::arch::xusb_tegra::jb2c_padctl_powerup(chan);
+                unaos_kernel::arch::smmu_tegra::jb3_open_stream(&jb3_bases[..jb3_n], jb3_sid);
+                unaos_kernel::arch::smmu_tegra::jb3_mc_sid_fix(jb3_sid);
+                unaos_kernel::arch::xusb_tegra::jb3_fpci_enable();
+                unaos_kernel::arch::xusb_tegra::jb3_aru_probe(jb3_sid);
+            }
+            unaos_kernel::arch::xusb_tegra::jb4_falcon_revive(chan, ids);
+        }
         let coherent = unaos_kernel::arch::fdt_tegra::xusb_dma_coherent(
             dtb_addr,
             dtb_size,
             mmu.ram_gib_mask,
         );
         let attached = unaos_kernel::arch::xusb_tegra::jb2b_attach(coherent).is_some();
+        unaos_kernel::arch::xusb_tegra::jb5_witness("post-attach");
         // The post-attach witness: after the enumeration window (and any ENABLE_SLOT
         // watchdogs), sGFSR/sGFSYNR say whether THIS block recorded the kills — and name the
         // faulting StreamID.
