@@ -1789,9 +1789,11 @@ unsafe extern "C" {
 // (`el0-u11close`) that: creates A11.BIN (O_CREAT|RW) and grow-writes it; opens it a SECOND time (a sibling
 // descriptor in a different slot naming the SAME on-disk entry); UNLINKs it through the first handle (which frees
 // BOTH of this process's A11 descriptors and clears the first handle, leaving the sibling lingering on a now-free
-// slot); REUSES the freed slots by opening a DIFFERENT file B11.BIN twice + writing it; then proves a read through
-// the STALE sibling handle is `-EACCES` — a GENERATION mismatch (the slot is LIVE again for B11, so the only
-// possible denial is the stale generation), NOT a silent rebind that would leak B11's bytes; and finally exercises
+// slot); REUSES the freed slots with a DIFFERENT file B11.BIN — create + grow-write it, THEN open it a second time
+// so the sibling's reclaimed slot snapshots B11's REAL size + cluster (a genuine negative control: a broken no-gen
+// read WOULD leak B11's data); then proves a read through the STALE sibling handle is `-EACCES` — a GENERATION
+// mismatch (the slot is LIVE again for B11, so the only possible denial is the stale generation), NOT a silent
+// rebind that would leak B11's 16 bytes; and finally exercises
 // SYS_CLOSE end-to-end (close → `0`, double-close → `-EBADF`, close→re-open→read round-trip returns B11's content).
 // Self-contained (creates its own files) so it never depends on another demo's state. Position-independent; its
 // only writable user target is the slot's data page at +0x2000 (the SYS_READ dest). It builds a witness bitmask in
@@ -1844,39 +1846,42 @@ __u11_prog_close:
     b.ne 2f
     add  x23, x23, #4                      // bit2: unlink OK
 
-    // (3) REUSE the freed slots with a DIFFERENT file: open B11.BIN twice (first-fit reclaims A11's old slots at a
-    //     FRESH generation), write B11's content, then prove a read through the STALE sibling hA1 is -EACCES — a
-    //     GENERATION mismatch (the slot is live again for B11, so the only reason to deny is the stale gen), NOT a
-    //     silent rebind that would return B11's bytes.
-    mov  x8, #11                           // SYS_OPEN B11.BIN O_CREAT|RW -> hB0
+    // (3) REUSE the freed slots with a DIFFERENT file B11.BIN, and make the sibling's slot a GENUINE negative
+    //     control: create + grow-write B11 through hB0 FIRST (B11 now owns a real cluster + size 16 on disk),
+    //     THEN open B11 a second time into hB1 — first-fit reclaims hA1's OTHER freed slot, and because the open
+    //     happens AFTER the write, hB1's descriptor snapshots B11's REAL size+cluster. So the stale sibling hA1
+    //     now aliases a LIVE descriptor that genuinely names B11's 16 bytes: a broken (no-gen) read via hA1 WOULD
+    //     return B11's data (a real cross-file leak). The read must instead be -EACCES — a GENERATION mismatch,
+    //     the only reason to deny given the slot is live again — proving no rebind and no data disclosure.
+    mov  x8, #11                           // SYS_OPEN B11.BIN O_CREAT|RW -> hB0 (first-fit reclaims one freed slot)
     adr  x0, 10f
     mov  x1, #(11f - 10f)
     mov  x2, #3
     svc  #0
     mov  x21, x0                           // x21 = hB0
     tbnz x21, #63, 2f
-    mov  x8, #11                           // SYS_OPEN B11.BIN RW -> hB1 (reuses the OTHER freed slot = hA1's slot)
-    adr  x0, 10f
-    mov  x1, #(11f - 10f)
-    mov  x2, #1
-    svc  #0
-    mov  x22, x0                           // x22 = hB1
-    tbnz x22, #63, 2f
-    mov  x8, #1                            // SYS_WRITE B11 pattern via hB0 (so a rebind read WOULD return B11's bytes)
+    mov  x8, #1                            // SYS_WRITE B11 pattern via hB0 -> grow-from-empty gives B11 a real cluster
     mov  x0, x21
     mov  x1, x14
     mov  x2, #16
     svc  #0
     cmp  x0, #16
     b.ne 2f
-    mov  x8, #12                           // SYS_READ through the STALE sibling hA1
+    mov  x8, #11                           // SYS_OPEN B11.BIN RW AGAIN -> hB1 reclaims hA1's OTHER freed slot; opened
+    adr  x0, 10f                           //   AFTER the write, so its descriptor snapshots B11's REAL size+cluster —
+    mov  x1, #(11f - 10f)                  //   the stale hA1 now aliases a LIVE descriptor that names B11's 16 bytes
+    mov  x2, #1
+    svc  #0
+    mov  x22, x0                           // x22 = hB1 (occupies hA1's slot, a genuine live B11 descriptor)
+    tbnz x22, #63, 2f
+    mov  x8, #12                           // SYS_READ through the STALE sibling hA1 (its slot is LIVE again for B11)
     mov  x0, x20
     mov  x1, x12
     mov  x2, #16
     svc  #0
-    cmn  x0, #13                           // x0 == -13 (-EACCES) — gen mismatch, NOT a rebind?
+    cmn  x0, #13                           // x0 == -13 (-EACCES) — a GEN mismatch, NOT B11's 16 bytes (no data rebind)?
     b.ne 2f
-    add  x23, x23, #8                      // bit3: stale sibling denied by GEN mismatch (no rebind to B11.BIN)
+    add  x23, x23, #8                      // bit3: stale sibling denied by GEN mismatch (no rebind, no B11 data leak)
 
     // (4) SYS_CLOSE end-to-end: close hB0 -> 0; double-close -> -EBADF; re-open B11.BIN RO -> read round-trips
     mov  x8, #17                           // SYS_CLOSE(hB0)
