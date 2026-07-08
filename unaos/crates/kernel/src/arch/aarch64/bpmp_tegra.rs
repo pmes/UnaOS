@@ -497,3 +497,126 @@ pub fn jb0_fan_on(chan: &Chan) {
         r32(PWM3_CSR),
     );
 }
+
+// ---------------------------------------------------------------------------------------------
+// JB4-prep: the BPMP levers the XUSB Falcon revival (xusb_tegra::jb4_falcon_revive) rides on.
+// COMPILE-GATED (feature="tegra") + DORMANT — never wired into tegra_early_stop this arc; the seat
+// wires the calls and flips xusb_tegra::JB4_ENABLE at the attended bench. Dossier: arch_arm64.md
+// §JB4-prep. The Phase-A research + adversarial verify pinned (mainline drivers/usb/host/
+// xhci-tegra.c + the tegra234 DTB/clock/reset headers + the BPMP ABI):
+//   * On t234 the Falcon AUTO-BOOTS its resident firmware — the image lives in the CARVEOUT_XUSB
+//     DRAM region MB2 authenticated at cold boot; Falcon IMEM is volatile. Mainline NEVER restarts
+//     it via CSB: tegra234_soc.firmware=NULL → tegra_xusb_init_ifr_firmware() only polls xHCI
+//     USBSTS.CNR (STS_CNR) until the Falcon self-boots and clears Controller-Not-Ready. The CSB
+//     BOOTVEC+CPUCTL_STARTCPU restart path exists ONLY for chips WITH .firmware (t124/t210/t186/
+//     t194) — it is the WRONG path for t234 (and unreachable through the dead CSB window).
+//   * There is NO XUSB host/SS/falcon reset id on t234 (dt-bindings/reset/tegra234-reset.h has only
+//     TEGRA234_RESET_XUSB_PADCTL=114, the PHY pads) and usb@3610000 carries no `resets`, so
+//     MRQ_RESET cannot reach the Falcon (JB1c's deassert loop already no-ops for XUSB).
+//   * The ONLY BPMP lever that resets the Falcon partition is an MRQ_PG power-domain OFF->ON of
+//     XUSBC(12)+XUSBA(10). This mirrors how Linux revives the Falcon on every ELPG resume
+//     (power-cycle, then wait STS_CNR; the Falcon re-loads IMEM from the resident carveout image).
+//     It is the single most promising lever, but the verify pass rated it UNCERTAIN: MB2 is gone at
+//     runtime (no software reload), so success rides entirely on the Falcon's own boot-ROM re-running
+//     the carveout->IMEM load on power-up — unproven post-EBS on bare metal.
+//
+// Two helpers:
+//   * jb4_reassert_falcon — IMEM-preserving WITNESS: re-enable the Falcon clock tree + re-assert the
+//     power domains JB1c already set (ON only). CONFIRMED not a fix (clock 269 is already enabled;
+//     the dead CSB is a halted core, not a gated clock) — its value is to prove that on the serial
+//     log before the honest STOP, and to cover the FALCON_HOST/SS leaf clocks (270/271) absent from
+//     the DTB `clocks` list.
+//   * jb4_powergate_cycle — the PARTITION-RESET revival lever (bench boot 2): MRQ_PG OFF->ON with a
+//     GET_STATE bracket so the log proves the rail actually dropped (JB1c's ON-only was a ref-counted
+//     no-op if UEFI left the domain ON — which is why the halted Falcon was never re-booted). It
+//     WIPES the whole partition, so the seat MUST re-run the JB3 chain (padctl + FPCI + ARU + SMMU +
+//     MC-SID) afterward and then poll USBSTS.CNR (jb4_falcon_revive). Double-guarded (JB4_ENABLE +
+//     JB4_ALLOW_PG_CYCLE).
+// ---------------------------------------------------------------------------------------------
+
+const PG_STATE_OFF: u32 = 0;
+const CMD_PG_GET_STATE: u32 = 2; // MRQ_PG subcommand: read a power domain's current state
+// t234 XUSB clock ids (dt-bindings/clock/tegra234-clock.h). FALCON = the Falcon core clock
+// ("xusb_falcon_src", already enabled by JB1c); CORE_HOST = the host core clock ("xusb_host");
+// FALCON_HOST/FALCON_SS = leaf clocks NOT in the DTB `clocks` list (re-asserted for completeness).
+const CLK_XUSB_CORE_HOST: u32 = 267;
+const CLK_XUSB_FALCON: u32 = 269;
+const CLK_XUSB_FALCON_HOST: u32 = 270;
+const CLK_XUSB_FALCON_SS: u32 = 271;
+
+/// JB4-prep IMEM-preserving witness re-assert (see the block comment). Re-enables the Falcon clock
+/// tree (269/267/270/271) and re-asserts every power domain JB1c resolved from the DTB (XUSBC/XUSBA)
+/// ON — no reset, no PG-OFF. Best-effort; each MRQ's err is printed; nothing gates on it.
+pub fn jb4_reassert_falcon(chan: &Chan, ids: &super::fdt_tegra::XusbIds) {
+    for id in [CLK_XUSB_FALCON, CLK_XUSB_CORE_HOST, CLK_XUSB_FALCON_HOST, CLK_XUSB_FALCON_SS] {
+        match chan.transfer(MRQ_CLK, &[(CMD_CLK_ENABLE << 24) | (id & 0x00ff_ffff)]) {
+            Some((err, _)) => {
+                serial_println!(":: tegra: JB4 — re-enable XUSB clk {} -> err={} ::", id, err)
+            }
+            None => serial_println!(":: tegra: JB4 — re-enable XUSB clk {} -> TIMEOUT ::", id),
+        }
+    }
+    for i in 0..ids.n_pds {
+        let id = ids.pds[i];
+        match chan.transfer(MRQ_PG, &[CMD_PG_SET_STATE, id, PG_STATE_ON]) {
+            Some((err, _)) => {
+                serial_println!(":: tegra: JB4 — re-assert PG {} ON -> err={} ::", id, err)
+            }
+            None => serial_println!(":: tegra: JB4 — re-assert PG {} ON -> TIMEOUT ::", id),
+        }
+    }
+}
+
+/// JB4-prep PARTITION-RESET revival lever — the boot-2 fork (see the block comment). MRQ_PG OFF->ON
+/// of the XUSB power domains with a GET_STATE bracket, so the log proves the rail actually dropped
+/// (not a ref-counted no-op). WIPES the whole partition: the seat MUST re-run the JB3 chain
+/// afterward and then poll USBSTS.CNR (jb4_falcon_revive) — the Falcon re-loads its IMEM from the
+/// resident carveout image (IFR) on power-up. Bounded MRQs; between OFF and ON it issues NO MMIO to
+/// the (now-gated) XUSB block (that would be EL3-fatal — the JX1 rule); reads cap0 only after ON.
+pub fn jb4_powergate_cycle(chan: &Chan, ids: &super::fdt_tegra::XusbIds) {
+    serial_println!(
+        ":: tegra: JB4 — MRQ_PG partition cycle (OFF->ON); WIPES partition -> seat re-runs JB3 chain + polls CNR ::"
+    );
+    let getstate = |id: u32, tag: &str| match chan.transfer(MRQ_PG, &[CMD_PG_GET_STATE, id]) {
+        Some((err, out)) => {
+            serial_println!(":: tegra: JB4 — PG {} state {} err={} = {:#x} ::", id, tag, err, out[0])
+        }
+        None => serial_println!(":: tegra: JB4 — PG {} GET_STATE {} -> TIMEOUT ::", id, tag),
+    };
+    for i in 0..ids.n_pds {
+        getstate(ids.pds[i], "pre");
+    }
+    for state in [PG_STATE_OFF, PG_STATE_ON] {
+        for i in 0..ids.n_pds {
+            let id = ids.pds[i];
+            match chan.transfer(MRQ_PG, &[CMD_PG_SET_STATE, id, state]) {
+                Some((err, _)) => {
+                    serial_println!(":: tegra: JB4 — PG {} <- state {} -> err={} ::", id, state, err)
+                }
+                None => {
+                    serial_println!(":: tegra: JB4 — PG {} <- state {} -> TIMEOUT; STOP ::", id, state);
+                    return;
+                }
+            }
+        }
+        // After the OFF pass, confirm the rail actually dropped — a no-op OFF means UEFI/other refs
+        // still hold the domain, so the Falcon never power-cycles and stays halted.
+        if state == PG_STATE_OFF {
+            for i in 0..ids.n_pds {
+                getstate(ids.pds[i], "post-OFF");
+            }
+        }
+    }
+    for i in 0..ids.n_pds {
+        getstate(ids.pds[i], "post-ON");
+    }
+    // Fabric-liveness only: the Falcon still needs its own on-power-up carveout reload; this just
+    // says whether the host wrapper's cap word answers after the re-power.
+    const XUSB_HOST: u64 = 0x0361_0000;
+    let cap0 = r32(XUSB_HOST);
+    serial_println!(
+        ":: tegra: JB4 — post-cycle XUSB cap0={:#010x} ({}) ::",
+        cap0,
+        if cap0 == 0 || cap0 == 0xFFFF_FFFF { "wrapper NOT back" } else { "wrapper alive" }
+    );
+}

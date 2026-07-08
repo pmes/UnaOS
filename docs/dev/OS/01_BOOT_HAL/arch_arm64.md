@@ -819,6 +819,134 @@ Gate (arc close): `./arroyo check` + `UNAOS_TEGRA=1 ./arroyo check` green both a
 QEMU suite unaffected (all changes `tegra`-gated ⇒ non-tegra byte-identical by construction);
 clean `esp-jetson` healthy at each boot (final 243,248 B); 12 attended metal boots as above.
 
+### JB4-prep — the Falcon revival dossier (OFFLINE: research + compile-gated code + the bench plan; the attended bench follows)
+
+**Scope.** JB3 pinned the root cause: every fabric layer restored + fault-free, the XUSB **Falcon**
+(the xHC command engine) halted/locked — CSB `CPUCTL`/`BOOTVEC` read `0xffffffff`, firmware resident
+(`codesize 0xc85f`), the mailbox unACKed. This arc is **strictly offline** — research + dormant
+revival code + a bench plan — no metal, no flashing, no serial. It answers the four unknowns from
+primary sources, ships a compile-gated `jb4_falcon_revive()` behind `JB4_ENABLE = false`, and lays
+out a boot-by-boot bench (cheapest fork first). The Peter-attended bench (JB4 proper) runs it later.
+
+**The four unknowns — answered (per-claim confidence + sources).**
+
+1. **Why is the CSB window dead (`0xffffffff`)?**
+   - *The BAR2 CSB aperture UnaOS uses is CORRECT — not a wrong-register bug.* **[HIGH]** Mainline
+     `drivers/usb/host/xhci-tegra.c` `tegra234_ops` routes CSB through **BAR2** (`.csb_reg_readl =
+     bar2_csb_readl`): page-select `XUSB_BAR2_ARU_C11_CSBRANGE = 0x9c`, data base
+     `XUSB_BAR2_CSB_BASE_ADDR = 0x2000` — byte-for-byte what `jb3_falcon`/`csb_r` use, and the same
+     BAR2 the FW-header ioctl (`0x1000`→`0x1c`) and mailbox (`0x004..0x010`) read *successfully*. So
+     the Falcon core behind the CSB bus is simply not answering; the wrapper/ARU around it is fine.
+   - *A "missing Falcon clock/reset the DTB lists but JB1c skipped" is ruled out.* **[HIGH]**
+     `tegra234.dtsi` `usb@3610000 { clocks = … }` already contains `TEGRA234_CLK_XUSB_FALCON` (269,
+     "xusb_falcon_src") and `TEGRA234_CLK_XUSB_CORE_HOST` (267, "xusb_host"), both of which JB1c
+     enables (they are early in the list, inside the 8-slot cap); the node has **no `resets`
+     property** (reset is folded into `power-domains = XUSBC(12), XUSBA(10)`, which JB1c powers ON).
+     So the Falcon is already clocked *and* powered when the CSB reads all-ones.
+   - *Leading explanation (verify-confirmed): the Falcon CORE is halted / not executing, so its
+     internal Config-Space-Bus slave floats all-ones — while the ARU wrapper (mailbox, FW-header
+     ioctl) outside the core keeps answering.* **[HIGH]** The adversarial pass REFUTED both the
+     "missing Falcon clock" and the "wrong CSB routing" hypotheses (clock 269 is already enabled by
+     JB1c; the routing is byte-for-byte mainline). The EBS teardown left the core halted; whether a
+     power-cycle re-runs its on-chip self-boot is the central bench question (unknowns 2–4).
+   - *edk2-nvidia teardown function.* **[LOW / unconfirmed offline]** The *behavioral* evidence
+     across JB2c/JB3 is unambiguous — the JetPack-6 EBS exit powers down the USB2 pads, shuts the
+     SMMU client port, zeroes the MC SIDs + FPCI `CFG_1`/BARs + ARU routing, and halts the Falcon —
+     but the exact edk2-nvidia routine ("hide device resources at uefi exit") was not pinned to a
+     file/commit from public sources this arc. edk2-nvidia does carry falcon tooling
+     (`Silicon/NVIDIA/Application/FalconUtil`). Recorded as an open citation, not load-bearing.
+
+2. **The full reset path — would an `MRQ_RESET` assert/deassert clear the lockdown, and what does it
+   wipe?**
+   - *There is no separate XUSB-host/Falcon reset id on t234.* **[HIGH]**
+     `dt-bindings/reset/tegra234-reset.h` exposes only `TEGRA234_RESET_XUSB_PADCTL` (114) and the
+     `PEX_USB_UPHY_*` lane resets (146–162); `usb@3610000` carries no `resets`. On t234 the
+     host/SS/Falcon reset is owned by the **power domain** (`MRQ_PG`) — Linux acquires the
+     `xusb_host`/`xusb_ss` reset controls only when power-domains are *absent*.
+   - *So the only Falcon-reset lever is a power-domain cycle (`MRQ_PG` OFF→ON) — the revival path.*
+     **[HIGH mechanism / UNCERTAIN outcome]** A partition power-cycle resets the Falcon and clears
+     its *volatile* IMEM, but the firmware **image** persists in the DRAM carveout — so on power-up
+     the Falcon boot-ROM re-runs its carveout→IMEM self-boot (the Linux ELPG-resume mechanism:
+     power-cycle, then wait `USBSTS.CNR`). It is NOT a one-way door — but whether that self-boot
+     actually runs post-EBS on bare metal is the open question the verify pass rated **UNCERTAIN**
+     (MB2 is gone at runtime, so no software reload; it rides entirely on the Falcon's boot-ROM).
+
+3. **Firmware reload — where does the image live, and what is the t234 load path if IMEM is lost?**
+   - *On t234 the OS does NOT — and cannot, non-secure — reload the xusb firmware.* **[HIGH]**
+     `tegra234_soc.firmware = NULL`. `tegra_xusb_load_firmware()` branches
+     `if (!soc->firmware) → tegra_xusb_init_ifr_firmware()`, which only **waits for the Falcon and
+     reads the timestamp** — it loads no binary. The firmware is loaded by the bootloader (IFR,
+     in-field-recovery firmware mode). The older ROM-loader DMA path (`tegra_xusb_load_firmware_rom`:
+     `XUSB_CSB_MP_ILOAD_*` + `L2IMEMOP` DMA from a firmware buffer) is **not used on t234**.
+   - *The Falcon AUTO-BOOTS its resident image; the OS just waits for `USBSTS.CNR` to clear.*
+     **[HIGH]** `tegra_xusb_init_ifr_firmware()` polls xHCI `USBSTS.CNR` (up to 200 ms) for the
+     Falcon to self-boot — it writes no CSB. The firmware image lives in the **CARVEOUT_XUSB DRAM**
+     region MB2 authenticated at cold boot (persistent — do NOT read it out-of-band, it MC-RAS-
+     faults); Falcon IMEM is volatile. So "no NS reload" does NOT mean "strand": the image survives
+     in DRAM, and a clean power-up re-runs the Falcon boot-ROM's carveout→IMEM self-boot. The manual
+     CSB `BOOTVEC`+`STARTCPU` restart is the WRONG path for t234; the real re-init lever is to make
+     the Falcon re-run that self-boot — a power-domain cycle (unknown 2) or Peter's firmware-slot
+     rollback (boot 0). Success is measured by `USBSTS.CNR` clearing, never by a CSB read.
+   - *The old ROM-loader NS reload (`tegra_xusb_load_firmware_rom`: `ILOAD`/`L2IMEMOP` DMA) is
+     unavailable on t234.* **[HIGH, verify-REFUTED as a lever]** It exists only for chips WITH
+     `.firmware`, and every step rides the (dead) CSB window — so it can neither run nor is it the
+     t234 mechanism. Not implemented.
+
+4. **The BPMP angle — any MRQ that restarts/unlocks/reloads XUSB firmware?**
+   - *No dedicated xusb/falcon MRQ.* **[MEDIUM]** The BPMP ABI (`soc/tegra/bpmp-abi.h`) carries no
+     MRQ that reloads or unlocks the xusb Falcon; the xusb-relevant levers are the generic
+     `MRQ_CLK` (enable), `MRQ_PG` (power-domain state), and `MRQ_RESET` (assert/deassert/module),
+     plus `MRQ_UPHY` for the PHY lanes (not the Falcon). So the BPMP path reduces to: re-assert
+     clocks/power (a no-op witness) or a `MRQ_PG` partition cycle (the revival lever) — no
+     BPMP-mediated firmware reload for NS software to call (the verify pass confirmed MB2, which owns
+     the reload, is a cold-boot applet absent at runtime).
+
+**The verdict this dossier reaches.** The aperture is right; the Falcon is already clocked + powered;
+the dead CSB is a halted CORE (not a clock/routing/reset the usual levers reach); and on t234 the
+Falcon self-boots its resident carveout image (the OS just waits for `USBSTS.CNR`). So a non-secure
+kernel cannot "restart" the Falcon by poking CSB. The one lever that re-runs its self-boot is an
+`MRQ_PG` partition OFF→ON (the ELPG-resume mechanism) — the best code lever, but rated **UNCERTAIN**
+by the verify pass post-EBS on bare metal (MB2 is gone at runtime; success rides on the Falcon's own
+boot-ROM). The cheapest lever overall is Peter's zero-code firmware-slot rollback. The bench settles
+it in order, cheapest first, with `USBSTS.CNR` clearing as the single success signal.
+
+**The revival code (compile-gated + DORMANT).** In `xusb_tegra.rs` / `bpmp_tegra.rs`, all under
+`feature = "tegra"` (⇒ out of every QEMU regression; non-tegra binaries byte-identical) AND a
+run-time `const JB4_ENABLE: bool = false`; nothing is wired into `tegra_early_stop` this arc, so it
+is dead-inert. The seat flips `JB4_ENABLE` and adds the calls at the bench.
+- `xusb_tegra::jb4_falcon_revive(chan, ids)` — a NON-DESTRUCTIVE readiness check that makes **no CSB
+  writes**: (1) baseline (FW header + mailbox owner + a read-only CSB `CPUCTL` witness +
+  `USBSTS.CNR`); (2) a witness clock/power re-assert via `bpmp_tegra::jb4_reassert_falcon` (proves
+  it is not a dropped clock); (3) a bounded `USBSTS.CNR` poll (~300 ms — the *true* signal); (4) if
+  CNR clears → the `MSG_ENABLED` handshake + PASS; else an **honest STOP** naming the two real
+  levers. The seat runs it standalone (boot 1, expected STOP) AND after the boot-2 partition cycle +
+  JB3 re-run (expected PASS if the Falcon re-booted).
+- `bpmp_tegra::jb4_powergate_cycle(chan, ids)` — the PARTITION-RESET revival lever (boot 2,
+  double-guarded `JB4_ENABLE` + `JB4_ALLOW_PG_CYCLE`): `MRQ_PG` OFF→ON of XUSBC/XUSBA with a
+  `GET_STATE` bracket (proving the rail actually dropped — an ON-only is a ref-counted no-op, which
+  is why JB1c never re-booted the halted Falcon). It WIPES the partition, so the seat MUST re-run the
+  JB3 chain (padctl + FPCI + ARU + SMMU + MC-SID) after it, then poll `USBSTS.CNR`.
+- `bpmp_tegra::jb4_reassert_falcon(chan, ids)` — the IMEM-preserving witness re-assert (clocks
+  269/267/270/271 + power ON); confirmed not a fix, kept for the "not a clock" proof + the
+  `FALCON_HOST`/`FALCON_SS` leaf clocks absent from the DTB `clocks` list.
+The CSB `BOOTVEC`/`STARTCPU` restart and the NS `ILOAD` firmware reload are DELIBERATELY NOT
+implemented — the verify pass refuted both for t234 (wrong path / runs through the dead CSB window).
+
+**Decision tree — the bench (cheapest fork first, one question per boot; `USBSTS.CNR` clear = win).**
+
+| Boot | Flip / run | Expected serial | Abort criteria → next |
+|---|---|---|---|
+| 0 (Peter, ZERO code) | Roll back to the pre-JetPack-6 firmware slot; boot UnaOS unchanged (all JB3 restorations remain required + valid) | The JB2a `PORTSC` CONNECTED lines return with the Falcon running (the gentler EBS exit leaves it alive, `CNR` already clear) → enumeration proceeds through the JB3 fabric | Ports still dead / `CNR` still set → rollback is not the lever; go to boot 1 |
+| 1 (non-destructive) | `JB4_ENABLE = true`; wire `jb4_falcon_revive(&chan, &ids)` after `jb3_falcon()` in `tegra_early_stop` | `JB4 — baseline … codesize=0xc85f … USBSTS.CNR=1`; `re-enable/​re-assert … err=0`; then **`CNR still set … STOP`** (expected — proves clocks/power are not the blocker) | `CNR still set` (expected) → the halted core will not self-restart from NS; go to boot 2 |
+| 2 (partition cycle — the real lever) | `JB4_ALLOW_PG_CYCLE = true`; call `jb4_powergate_cycle(&chan, &ids)`, then RE-RUN the JB3 chain (jb2c padctl + jb3 fpci/aru/smmu/mc), then `jb4_falcon_revive` again | `PG … state pre=… post-OFF=<dropped>`; `post-ON=…`; `post-cycle XUSB cap0=<alive>`; JB3 chain re-applies; then **`CNR CLEARED (Falcon up)` → `MSG_ENABLED … PASS`** | `post-OFF` shows the rail did NOT drop (ref-counted) → domain pinned, cycle is a no-op → rollback. `CNR still set` after a real drop → the Falcon did not self-boot post-EBS → rollback. |
+| 3 | — (no code) | — | NS `ILOAD` reload is refuted (dead CSB + IFR part) and runtime MB2 reload is absent → there is no boot 3; the firmware-slot rollback (boot 0) is the terminal lever. |
+
+**Security posture (for the seat's ledger when this goes live).** All JB4 code is dormant this arc
+(no live surface). When enabled it performs non-secure MMIO **reads** of the Falcon CSB + BPMP
+`MRQ_CLK`/`MRQ_PG`, and — at boot 2 only — a guarded `MRQ_PG` partition cycle; it makes **no CSB
+writes** and weakens no protection (SMEP/WXN/page-perms/checksums untouched). The honest STOP forks
+mean a Falcon that will not self-boot ends in a clean report, never a blind escalation.
+
 ### JB0 brief — turn the cooling fan back on (safety hygiene; run FIRST on Orin)
 
 Discovered 2026-07-06: when UnaOS takes over from UEFI the **fan stops and the Orin runs hot**.

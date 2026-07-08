@@ -465,6 +465,182 @@ pub fn jb3_falcon() {
     }
 }
 
+// ---------------------------------------------------------------------------------------------
+// JB4-prep: the XUSB Falcon revival readiness check — COMPILE-GATED (feature="tegra") + DORMANT.
+//
+// JB3 pinned the root cause five layers past the SMMU: every fabric layer (SMMU, MC-SID, FPCI,
+// ARU) is restored + fault-free, but the Falcon microcontroller — the xHC command engine — is
+// halted (CSB CPUCTL/BOOTVEC read 0xffffffff), so nothing DMAs. JB4-prep is the OFFLINE research +
+// revival code for the attended bench that follows. What the Phase-A research + adversarial verify
+// pinned from primary sources (full dossier + per-claim confidence in arch_arm64.md §JB4-prep):
+//
+//   * The dead CSB is a HALTED FALCON CORE, not a code bug. The BAR2 CSB aperture UnaOS uses is
+//     byte-for-byte the mainline t234 path (ARU_C11_CSBRANGE @0x9c page-select, CSB_BASE_ADDR
+//     @0x2000); the clock (269) is already enabled by JB1c and usb@3610000 has no `resets`. So the
+//     Falcon's internal CSB slave floats all-ones because the core is not executing — while the ARU
+//     wrapper (mailbox, FW-header ioctl) outside the core keeps answering. (Verify: the "missing
+//     clock / wrong routing" and "MRQ_RESET clears it" hypotheses were both REFUTED.)
+//   * On t234 the Falcon AUTO-BOOTS its resident firmware; the OS NEVER restarts it via CSB.
+//     tegra234_soc.firmware=NULL → tegra_xusb_init_ifr_firmware() only polls xHCI USBSTS.CNR until
+//     the Falcon self-boots and clears Controller-Not-Ready. The CSB BOOTVEC+CPUCTL_STARTCPU
+//     restart exists only for chips WITH .firmware — it is the WRONG path for t234 (and unreachable
+//     through the dead window). So the ONE true "Falcon is up" signal here is USBSTS.CNR clearing.
+//   * The only lever that re-runs the Falcon's on-power-up self-boot is an MRQ_PG partition OFF->ON
+//     (bpmp_tegra::jb4_powergate_cycle) — the boot-2 fork, which wipes the partition and needs the
+//     JB3 chain re-run after. The cheapest real lever is Peter's zero-code FIRMWARE-SLOT ROLLBACK
+//     (bench boot 0), whose gentler EBS exit leaves the Falcon running.
+//
+// So jb4_falcon_revive is a NON-DESTRUCTIVE READINESS CHECK + honest STOP: baseline read, a witness
+// clock/power re-assert (proves it is not a dropped clock), a bounded USBSTS.CNR poll (the true
+// signal), and — only if CNR clears — the MSG_ENABLED handshake. If CNR stays set it STOPs and
+// names the two real levers (the MRQ_PG partition cycle, or the rollback). It performs the same
+// readiness check the seat re-runs AFTER the boot-2 partition cycle. DORMANCY is two-layer:
+// feature="tegra" keeps it out of every QEMU regression (non-tegra builds byte-identical), and
+// `JB4_ENABLE` gates every register touch at run time. This arc ships it FALSE and never wires it
+// into tegra_early_stop; the seat flips JB4_ENABLE and adds the call at the bench. Depends on JB3
+// having run first (BAR2/FPCI routed, ARU restored).
+// ---------------------------------------------------------------------------------------------
+
+/// JB4 master run-time guard. FALSE this arc → dormant (jb4_falcon_revive prints one line and
+/// returns without touching a register). The seat flips it to true — together with wiring the
+/// call into tegra_early_stop — at the attended bench.
+pub const JB4_ENABLE: bool = false;
+
+/// Secondary guard for the partition-reset revival lever (bpmp_tegra::jb4_powergate_cycle, boot 2).
+/// Stays FALSE even when JB4_ENABLE is true — the seat flips it ONLY for the explicit boot-2 fork
+/// (the cycle wipes the partition and requires re-running the JB3 chain afterward).
+pub const JB4_ALLOW_PG_CYCLE: bool = false;
+
+// Falcon CSB register address (mainline xhci-tegra XUSB_FALC_CPUCTL), read through the BAR2 ARU
+// CSB-range page mechanism (csb_r) for the log only — NOT written (the CSB restart is the wrong
+// path for t234; see the block comment). CPUCTL bits: STATE_HALTED b4, STATE_STOPPED b5.
+const FALC_CPUCTL: u32 = 0x100;
+
+/// The xHCI operational USBSTS.CNR — the ONE true "Falcon has booted its resident firmware" signal
+/// on t234 (mainline tegra_xusb_wait_for_falcon polls exactly this). op_base = XUSB_HOST +
+/// CAPLENGTH; USBSTS @ op+0x04; CNR (Controller-Not-Ready) = bit 11. `Some(true)` = not ready,
+/// `Some(false)` = ready (Falcon up), `None` = the block's cap word is dead (not ungated/alive).
+fn xusb_cnr_set() -> Option<bool> {
+    let cap0 = unsafe { core::ptr::read_volatile(XUSB_HOST as *const u32) };
+    if cap0 == 0 || cap0 == 0xFFFF_FFFF {
+        return None;
+    }
+    let caplength = (cap0 & 0xff) as u64;
+    let usbsts = unsafe { core::ptr::read_volatile((XUSB_HOST + caplength + 0x04) as *const u32) };
+    Some((usbsts >> 11) & 1 != 0)
+}
+
+/// JB4-prep: non-destructive readiness check for the halted XUSB Falcon. `chan` = the proven BPMP
+/// channel; `ids` = the XUSB resource ids JB1c resolved from the live DTB (its power domains are
+/// re-asserted as a witness). Runs AFTER the JB3 chain (needs BAR2/FPCI routed + ARU restored). It
+/// makes NO CSB writes (the t234 Falcon self-boots; the CSB restart is the wrong path); the true
+/// signal is USBSTS.CNR. The seat calls this both standalone (boot 1, expected STOP) and after the
+/// boot-2 partition cycle + JB3-chain re-run (expected PASS if the Falcon re-booted).
+pub fn jb4_falcon_revive(chan: &super::bpmp_tegra::Chan, ids: &super::fdt_tegra::XusbIds) {
+    if !JB4_ENABLE {
+        serial_println!(":: tegra: JB4 — falcon revive DORMANT (JB4_ENABLE=false); no writes ::");
+        return;
+    }
+    let r = |off: u64| unsafe { core::ptr::read_volatile((XUSB_BAR2 + off) as *const u32) };
+    let w = |off: u64, v: u32| unsafe { core::ptr::write_volatile((XUSB_BAR2 + off) as *mut u32, v) };
+    let csb_r = |addr: u32| {
+        w(0x9c, (addr >> 9) & 0x7f_ffff);
+        r(0x2000 + (addr & 0x1ff) as u64)
+    };
+    let fw_hdr = |byte_off: u32| {
+        w(0x1000, (17u32 << 24) | byte_off); // FW_IOCTL_CFGTBL_READ (empirically works, JB3 boot-12)
+        r(0x1c) // ARU_SMI_ARU_FW_SCRATCH_DATA0
+    };
+    serial_println!(":: tegra: JB4 — falcon readiness: ARU/BAR2 @{:#010x} (JB4_ENABLE=true) ::", XUSB_BAR2);
+
+    // 1. Baseline: firmware image still resident (header readable)? mailbox owner? CSB alive? CNR?
+    let codetag = fw_hdr(0x08); // header boot_codetag @0x08
+    let codesize = fw_hdr(0x0c); // header boot_codesize @0x0c (0xc85f when resident, JB3 boot-12)
+    let owner0 = r(0x010);
+    let cpuctl0 = csb_r(FALC_CPUCTL); // read-only witness; 0xffffffff while the core is halted
+    let cnr0 = xusb_cnr_set();
+    serial_println!(
+        ":: tegra: JB4 — baseline: fw codetag={:#010x} codesize={:#010x} mbox_owner={:#x} CSB CPUCTL={:#010x} USBSTS.CNR={} ::",
+        codetag, codesize, owner0, cpuctl0,
+        match cnr0 { Some(true) => "1 (not ready)", Some(false) => "0 (READY)", None => "n/a (cap dead)" }
+    );
+    if codesize == 0 || codesize == 0xffff_ffff {
+        serial_println!(
+            ":: tegra: JB4 — fw header not readable (codesize={:#010x}); the ARU wrapper is torn down -> STOP: re-run the JB3 FPCI/ARU restore first ::",
+            codesize
+        );
+        return;
+    }
+
+    // 2. Witness re-assert of the Falcon clock tree + power domains (IMEM-preserving; ON only). NOT
+    //    expected to fix anything — the Falcon clock 269 is already enabled by JB1c — its value is
+    //    to prove the dead CSB is not a dropped-clock case. See bpmp_tegra::jb4_reassert_falcon.
+    super::bpmp_tegra::jb4_reassert_falcon(chan, ids);
+
+    // 3. Poll USBSTS.CNR — the ONE true readiness signal (mainline waits up to 200 ms for the
+    //    Falcon to self-boot and clear it). Bounded 300 ms on CNTPCT. On the non-destructive path
+    //    this will stay set (the core is halted); after the boot-2 partition cycle + JB3 re-run it
+    //    should clear if the Falcon re-loaded its resident image.
+    let deadline = cntpct().wrapping_add(cntfrq().saturating_mul(300) / 1000);
+    let mut ready = false;
+    loop {
+        if xusb_cnr_set() == Some(false) {
+            ready = true;
+            break;
+        }
+        if cntpct().wrapping_sub(deadline) < (1u64 << 63) {
+            break; // deadline passed (wrap-safe)
+        }
+        core::hint::spin_loop();
+    }
+    let cpuctl_now = csb_r(FALC_CPUCTL);
+    serial_println!(
+        ":: tegra: JB4 — post-reassert: CNR {} CSB CPUCTL={:#010x} (halted={} stopped={}) ::",
+        if ready { "CLEARED (Falcon up)" } else { "still set" },
+        cpuctl_now, (cpuctl_now >> 4) & 1, (cpuctl_now >> 5) & 1
+    );
+    if !ready {
+        serial_println!(
+            ":: tegra: JB4 — Falcon still Not-Ready (CNR set) -> STOP: on t234 the Falcon boots its resident carveout image on power-up (IFR) and this non-secure window cannot restart a halted core (the CSB BOOTVEC/STARTCPU path is wrong for t234). Levers: MRQ_PG OFF->ON partition cycle + re-run the JB3 chain (jb4_powergate_cycle, boot 2), or the firmware-slot rollback (boot 0) ::"
+        );
+        return;
+    }
+
+    // 4. CNR clear -> the Falcon is running. Confirm with the MSG_ENABLED handshake (owner-claim ->
+    //    DATA_IN -> CMD|=INT_EN|DEST_FALC), bounded ACK poll. Mirrors jb3_aru_probe / mainline
+    //    tegra_xusb_enable_firmware_messages (OWNER_SW=2). A live Falcon services this; a false CNR
+    //    would show as no ACK here.
+    let own_pre = r(0x010);
+    w(0x010, 2); // OWNER_SW
+    if r(0x010) != 2 {
+        serial_println!(
+            ":: tegra: JB4 — CNR clear but mailbox owner claim did not take (owner={:#x}); re-check -> STOP ::",
+            r(0x010)
+        );
+        return;
+    }
+    w(0x008, 5u32 << 24); // DATA_IN: MBOX_CMD_MSG_ENABLED (5) in [31:24]
+    w(0x004, r(0x004) | (1 << 31) | (1 << 27)); // CMD: INT_EN(b31) | DEST_FALC(b27)
+    let mut spins = 0u32;
+    while spins < 250_000 && r(0x010) == 2 && r(0x00c) == 0 {
+        spins += 1;
+    }
+    let (cmd_rb, dout_rb, own_rb) = (r(0x004), r(0x00c), r(0x010));
+    if own_rb == 2 {
+        w(0x010, 0); // release if the firmware never did
+    }
+    let fw_serviced = own_rb != 2 || dout_rb != 0;
+    serial_println!(
+        ":: tegra: JB4 — MSG_ENABLED: cmd={:#010x} data_out={:#010x} owner {:#x}->{:#x} (spins {}) -> {} ::",
+        cmd_rb, dout_rb, own_pre, own_rb, spins,
+        if fw_serviced {
+            "RUNNING + firmware servicing (Falcon revived) -> PASS"
+        } else {
+            "CNR clear but firmware silent on the mailbox -> STOP (re-run the JB3 chain / rollback)"
+        }
+    );
+}
+
 pub fn jb2b_attach(dma_coherent: Option<bool>) -> Option<(u8, u8)> {
     serial_println!(
         ":: tegra: JB2b — usb@3610000 dma-coherent: {} ::",
