@@ -22,6 +22,10 @@
 // and main.rs. M6f adds a real copy_from_user and a wider surface.
 
 use core::sync::atomic::{AtomicBool, AtomicI32, AtomicU8, AtomicU32, AtomicU64, Ordering};
+// U11-M2: the low-level SPINLOCK (spin::Mutex) guarding the GLOBAL cross-ASID open-file refcount table. Same
+// primitive the scheduler uses for RUN_QUEUES/SLEEPERS (`sched.rs`), imported directly because that module's
+// alias is private. It is safe to take IRQ-masked (the teardown decrement path) — never held across block I/O.
+use spin::Mutex as SpinMutex;
 
 // --- Syscall numbers. WRITE/EXIT are the M6a/M6b core; REPORT is the M6d demo channel; YIELD/SLEEP_MS/
 // GETPID/GETINFO are the M6f "real" surface (all thin over existing scheduler/timer primitives). The
@@ -99,6 +103,15 @@ const SYS_SEEK: u64 = 15;
 /// its directory entry deleted (0xE5), then invalidates the descriptor + handle. Dir mark FIRST, then free, so a
 /// crash mid-delete leaves lost clusters (benign), never a live entry pointing at freed/re-allocated clusters.
 const SYS_UNLINK: u64 = 16;
+
+/// U11: CLOSE an open `File` — `a0`=handle idx -> `0`, or a negative errno. Frees the handle's descriptor slot
+/// (bumping the slot's GENERATION so any lingering sibling handle to the same slot goes stale, not re-bound to a
+/// later file) and clears the handle word. A close needs NO capability right — you may always close a handle you
+/// hold — so it resolves with `req = 0` (kind + descriptor identity still enforced). A non-`File` kind is
+/// `-EINVAL` (Console/Socket are not closeable this arc; never silently corrupted); an unresolvable / already-
+/// closed / stale-slot handle is `-EBADF` (double-close returns cleanly; use-after-close is denied). Only the
+/// CALLER's own descriptor is freed — a cross-process open is unaffected (that lifetime is the open-file refcount).
+const SYS_CLOSE: u64 = 17;
 
 /// M6e demo: the sentinel `sys_exit` status the preemption spinner uses so its exit is accounted to
 /// `EL0_SPIN_DONE` and never perturbs the M6b `exited/killed` counters. Demo-only — there is no real
@@ -294,6 +307,55 @@ const U10D_NAME: &str = "DELME.BIN";
 /// U10-delete demo: the 16-byte pattern the fixture writes before deleting (so the file owns a real data
 /// cluster, whose freeing the launcher then verifies).
 const U10D_PATTERN: [u8; 16] = *b"U10-DELETE-OK-42";
+
+/// U11 demo: the sentinel `sys_exit` status the open-file-lifecycle fixture (`el0-u11close`) uses so ITS exit
+/// lands in `EL0_U11_DONE`. Distinct from every prior sentinel (…0x7D) and 0.
+const U11_EXIT_STATUS: u64 = 0x7E;
+/// U11 demo: the witness bitmask the fixture reports — bit0 create A11.BIN + grow-write OK; bit1 a SECOND RW
+/// open of A11.BIN → a sibling handle; bit2 `SYS_UNLINK` via the first handle → `0` (frees BOTH of this proc's
+/// A11 descriptors, leaving the sibling lingering on a freed slot); bit3 after opening B11.BIN into the reused
+/// slots + writing it, a read through the STALE sibling → `-EACCES` (a GENERATION mismatch — the slot is live
+/// again for B11, so the only reason to deny is the stale gen — NOT a silent rebind onto B11's bytes); bit4
+/// `SYS_CLOSE` → `0`, double-close → `-EBADF`, and a close→re-open→read round-trip returns B11's content.
+/// `u11_launcher` PASSes iff it equals `U11_WITNESS_ALL` AND the kernel-side gen-rebind check + on-disk checks
+/// hold. Matches `add x23, x23, #{1,2,4,8,16}` in the blob.
+const U11_WITNESS_ALL: u64 = 0x1F;
+/// U11 demo: the self-contained file the fixture CREATES, opens twice, and UNLINKs (it does not exist in the
+/// planted image; the fixture makes it). 7 chars (<= `MAX_NAME`); the `mov x1, #(9f-8f)` in the blob matches.
+const U11_A_NAME: &str = "A11.BIN";
+/// U11 demo: the self-contained file the fixture creates in the slots A11.BIN freed (the "different file" whose
+/// slot-reuse the stale sibling must NOT rebind onto). 7 chars; the `mov x1, #(11f-10f)` in the blob matches.
+const U11_B_NAME: &str = "B11.BIN";
+/// U11 demo: the 16-byte pattern written into A11.BIN (grow-from-empty), and into B11.BIN — distinct so a
+/// mistaken rebind would be observable. Match the `.ascii` bytes in the blob.
+const U11_B_PATTERN: [u8; 16] = *b"U11-REOPEN-B-567";
+
+/// U11-M2 (defer) demo: the sentinel `sys_exit` status BOTH cross-process fixtures (`el0-u11defer-a`,
+/// `el0-u11defer-b`) use so their exits land in `EL0_U11DEFER_DONE` (want 2). Distinct from every prior
+/// sentinel (…0x7E) and 0.
+const U11DEFER_EXIT_STATUS: u64 = 0x7F;
+/// U11-M2 (defer) demo: process A's witness bitmask — bit0 create DEFER.BIN + grow-write OK; bit1 a read-back
+/// AFTER B unlinked returns A's ORIGINAL bytes (the chain is STILL alive — the unlink was deferred); bit2
+/// SYS_CLOSE OK (the LAST close, which runs the deferred free); bit3 double-close → -EBADF. Matches
+/// `add x23, x23, #{1,2,4,8}` in program A. `u11defer_run` PASSes iff A's witness == this.
+const U11DEFER_A_WITNESS_ALL: u64 = 0xF;
+/// U11-M2 (defer) demo: process B's witness bitmask — bit0 open DEFER.BIN (A created it) OK; bit1 SYS_UNLINK via
+/// B's handle → 0 (deferred: A still holds it open, so the chain is NOT freed); bit2 a re-open of the unlinked
+/// name → -ENOENT (the name is gone immediately). Matches `add x23, x23, #{1,2,4}` in program B.
+const U11DEFER_B_WITNESS_ALL: u64 = 0x7;
+/// U11-M2 (defer) demo: the launcher-CUE tokens the fixtures SYS_REPORT (all `> 0xF`, so `u11defer_report`
+/// distinguishes them from a final witness). A reports `A_OPENED` after create+write; B reports `B_UNLINKED`
+/// after unlink+re-open; A reports `A_READ` after the post-unlink read. The launcher releases the next GO word
+/// (and runs its fresh-mount checkpoint) on each cue — it is the single choreography sequencer.
+const U11DEFER_A_OPENED: u64 = 0x60;
+const U11DEFER_B_UNLINKED: u64 = 0x61;
+const U11DEFER_A_READ: u64 = 0x62;
+/// U11-M2 (defer) demo: the file A creates + writes + reads and B unlinks — runtime-created (not planted). 9
+/// chars (<= `MAX_NAME`); the `mov x1, #(9f-8f)` in the blob matches.
+const U11DEFER_NAME: &str = "DEFER.BIN";
+/// U11-M2 (defer) demo: the 16-byte pattern A writes into DEFER.BIN — A reads it back AFTER B unlinks to prove
+/// the chain is still alive. Match the `.ascii` bytes in the blob.
+const U11DEFER_PATTERN: [u8; 16] = *b"U11-DEFER-OK-777";
 
 // --- The inline EL0 FIXTURES: three fault-SHAPE fixtures (M6b) + one preemption spinner (M6e). These
 // are fixtures, not programs, so they stay inline in the kernel image; only the well-behaved `hello`
@@ -1754,6 +1816,358 @@ unsafe extern "C" {
     static __u10d_prog_delete: u8;
 }
 
+// --- U11 inline EL0 fixture (open-file LIFECYCLE: SYS_CLOSE + generation-tagged file-ids). ONE fixture
+// (`el0-u11close`) that: creates A11.BIN (O_CREAT|RW) and grow-writes it; opens it a SECOND time (a sibling
+// descriptor in a different slot naming the SAME on-disk entry); UNLINKs it through the first handle (which frees
+// BOTH of this process's A11 descriptors and clears the first handle, leaving the sibling lingering on a now-free
+// slot); REUSES the freed slots with a DIFFERENT file B11.BIN — create + grow-write it, THEN open it a second time
+// so the sibling's reclaimed slot snapshots B11's REAL size + cluster (a genuine negative control: a broken no-gen
+// read WOULD leak B11's data); then proves a read through the STALE sibling handle is `-EACCES` — a GENERATION
+// mismatch (the slot is LIVE again for B11, so the only possible denial is the stale generation), NOT a silent
+// rebind that would leak B11's 16 bytes; and finally exercises
+// SYS_CLOSE end-to-end (close → `0`, double-close → `-EBADF`, close→re-open→read round-trip returns B11's content).
+// Self-contained (creates its own files) so it never depends on another demo's state. Position-independent; its
+// only writable user target is the slot's data page at +0x2000 (the SYS_READ dest). It builds a witness bitmask in
+// x23 and SYS_REPORTs it, then exits with the U11 sentinel. ABI: x8=nr, args x0-x2, ret x0.
+core::arch::global_asm!(
+    r#"
+    .globl __u11_blob_start
+__u11_blob_start:
+    .balign 4
+    .globl __u11_prog_close
+__u11_prog_close:
+    mov  x23, xzr                          // witness bitmask = 0
+    adr  x9, __u11_blob_start              // x9 = window base
+    add  x12, x9, #0x2000                  // x12 = read dest VA (writable data page)
+    adr  x13, 12f                          // x13 = A-pattern VA (RO code page)
+    adr  x14, 13f                          // x14 = B-pattern VA
+
+    // (0) create A11.BIN (O_CREAT|RW, mode=3) -> hA0, then write 16 bytes (grow-from-empty allocates its cluster)
+    mov  x8, #11                           // SYS_OPEN
+    adr  x0, 8f                            // "A11.BIN"
+    mov  x1, #(9f - 8f)
+    mov  x2, #3                            // O_CREAT | RW
+    svc  #0
+    mov  x19, x0                           // x19 = hA0 (>=0) or -errno
+    tbnz x19, #63, 2f                      // create/open failed -> report what we have
+    mov  x8, #1                            // SYS_WRITE
+    mov  x0, x19
+    mov  x1, x13
+    mov  x2, #16
+    svc  #0
+    cmp  x0, #16
+    b.ne 2f
+    add  x23, x23, #1                      // bit0: create A11.BIN + grow-write OK
+
+    // (1) open A11.BIN RW AGAIN (no O_CREAT — it exists) -> hA1, a SIBLING descriptor (a different slot)
+    mov  x8, #11                           // SYS_OPEN A11.BIN RW
+    adr  x0, 8f
+    mov  x1, #(9f - 8f)
+    mov  x2, #1                            // RW
+    svc  #0
+    mov  x20, x0                           // x20 = hA1 (the sibling that will go stale)
+    tbnz x20, #63, 2f
+    add  x23, x23, #2                      // bit1: sibling open OK
+
+    // (2) unlink via hA0 -> 0 (frees BOTH of this proc's A11 descriptors + clears hA0; hA1 lingers on a freed slot)
+    mov  x8, #16                           // SYS_UNLINK
+    mov  x0, x19
+    svc  #0
+    cmp  x0, #0
+    b.ne 2f
+    add  x23, x23, #4                      // bit2: unlink OK
+
+    // (3) REUSE the freed slots with a DIFFERENT file B11.BIN, and make the sibling's slot a GENUINE negative
+    //     control: create + grow-write B11 through hB0 FIRST (B11 now owns a real cluster + size 16 on disk),
+    //     THEN open B11 a second time into hB1 — first-fit reclaims hA1's OTHER freed slot, and because the open
+    //     happens AFTER the write, hB1's descriptor snapshots B11's REAL size+cluster. So the stale sibling hA1
+    //     now aliases a LIVE descriptor that genuinely names B11's 16 bytes: a broken (no-gen) read via hA1 WOULD
+    //     return B11's data (a real cross-file leak). The read must instead be -EACCES — a GENERATION mismatch,
+    //     the only reason to deny given the slot is live again — proving no rebind and no data disclosure.
+    mov  x8, #11                           // SYS_OPEN B11.BIN O_CREAT|RW -> hB0 (first-fit reclaims one freed slot)
+    adr  x0, 10f
+    mov  x1, #(11f - 10f)
+    mov  x2, #3
+    svc  #0
+    mov  x21, x0                           // x21 = hB0
+    tbnz x21, #63, 2f
+    mov  x8, #1                            // SYS_WRITE B11 pattern via hB0 -> grow-from-empty gives B11 a real cluster
+    mov  x0, x21
+    mov  x1, x14
+    mov  x2, #16
+    svc  #0
+    cmp  x0, #16
+    b.ne 2f
+    mov  x8, #11                           // SYS_OPEN B11.BIN RW AGAIN -> hB1 reclaims hA1's OTHER freed slot; opened
+    adr  x0, 10f                           //   AFTER the write, so its descriptor snapshots B11's REAL size+cluster —
+    mov  x1, #(11f - 10f)                  //   the stale hA1 now aliases a LIVE descriptor that names B11's 16 bytes
+    mov  x2, #1
+    svc  #0
+    mov  x22, x0                           // x22 = hB1 (occupies hA1's slot, a genuine live B11 descriptor)
+    tbnz x22, #63, 2f
+    mov  x8, #12                           // SYS_READ through the STALE sibling hA1 (its slot is LIVE again for B11)
+    mov  x0, x20
+    mov  x1, x12
+    mov  x2, #16
+    svc  #0
+    cmn  x0, #13                           // x0 == -13 (-EACCES) — a GEN mismatch, NOT B11's 16 bytes (no data rebind)?
+    b.ne 2f
+    add  x23, x23, #8                      // bit3: stale sibling denied by GEN mismatch (no rebind, no B11 data leak)
+
+    // (4) SYS_CLOSE end-to-end: close hB0 -> 0; double-close -> -EBADF; re-open B11.BIN RO -> read round-trips
+    mov  x8, #17                           // SYS_CLOSE(hB0)
+    mov  x0, x21
+    svc  #0
+    cmp  x0, #0
+    b.ne 2f
+    mov  x8, #17                           // SYS_CLOSE(hB0) AGAIN -> double-close must be clean
+    mov  x0, x21
+    svc  #0
+    cmn  x0, #9                            // x0 == -9 (-EBADF)?
+    b.ne 2f
+    mov  x8, #11                           // re-open B11.BIN RO -> hB2
+    adr  x0, 10f
+    mov  x1, #(11f - 10f)
+    mov  x2, #0                            // RO
+    svc  #0
+    mov  x24, x0                           // x24 = hB2
+    tbnz x24, #63, 2f
+    mov  x8, #12                           // SYS_READ hB2 -> B11's content (close->reopen->read round-trip)
+    mov  x0, x24
+    mov  x1, x12
+    mov  x2, #16
+    svc  #0
+    cmp  x0, #16
+    b.ne 2f
+    ldr  x10, [x12]                        // two 8-byte compares: read-back == the B11 pattern
+    ldr  x11, [x14]
+    cmp  x10, x11
+    b.ne 2f
+    ldr  x10, [x12, #8]
+    ldr  x11, [x14, #8]
+    cmp  x10, x11
+    b.ne 2f
+    add  x23, x23, #16                     // bit4: SYS_CLOSE OK + double-close -EBADF + close->reopen->read round-trip
+2:
+    mov  x0, x23                           // SYS_REPORT(witness bitmask)
+    mov  x8, #3
+    svc  #0
+    mov  x8, #2                            // SYS_EXIT(U11_EXIT_STATUS) -> EL0_U11_DONE
+    movz x0, #0x7E
+    svc  #0
+4:  b 4b                                   // sys_exit never returns; belt-and-braces guard
+    .balign 4
+8:  .ascii "A11.BIN"
+9:
+    .balign 4
+10: .ascii "B11.BIN"
+11:
+    .balign 8
+12: .ascii "U11-CLOSE-A-1234"
+    .balign 8
+13: .ascii "U11-REOPEN-B-567"
+    .balign 4
+    .globl __u11_blob_end
+__u11_blob_end:
+"#
+);
+
+unsafe extern "C" {
+    static __u11_blob_start: u8;
+    static __u11_blob_end: u8;
+    static __u11_prog_close: u8;
+}
+
+// --- U11-M2 inline EL0 fixtures (cross-process unlink-defers-free). TWO programs in ONE shared blob (the U7
+// two-fixture idiom), each copied into its OWN slot; the launcher sequences them with per-step GO words:
+//   * el0-u11defer-a: creates DEFER.BIN (O_CREAT|RW) + grow-writes it; reports A_OPENED; parks on its read GO
+//     (+0x3010); after B has unlinked the file, SEEKs to 0 and READs — the 16 bytes must STILL come back (the
+//     chain is alive: B's unlink was deferred because A holds it open); reports A_READ; parks on its close GO
+//     (+0x3018); SYS_CLOSEs (the LAST close → the deferred free runs) + double-close → -EBADF.
+//   * el0-u11defer-b: parks on its unlink GO (+0x3000); OPENs DEFER.BIN (A created it), SYS_UNLINKs it (returns
+//     0, deferred), and a re-open of the now-gone name → -ENOENT; reports B_UNLINKED.
+// Both build a witness in x23, SYS_REPORT it, and exit with the U11-defer sentinel. Register-only save the read
+// buffer at +0x2000 (the SYS_READ dest); GO words live in page 3 (+0x3000..). ABI: x8=nr, args x0-x2, ret x0.
+core::arch::global_asm!(
+    r#"
+    .globl __u11defer_blob_start
+__u11defer_blob_start:
+    .balign 4
+    .globl __u11defer_prog_a
+__u11defer_prog_a:
+    mov  x23, xzr                          // witness bitmask = 0
+    adr  x9, __u11defer_blob_start         // x9 = window base
+    add  x12, x9, #0x2000                  // x12 = read dest VA (writable data page)
+    adr  x13, 7f                           // x13 = pattern VA (RO code page)
+
+    // (0) create DEFER.BIN (O_CREAT|RW, mode=3) -> hA, then write 16 bytes (grow-from-empty allocates its cluster)
+    mov  x8, #11                           // SYS_OPEN
+    adr  x0, 8f                            // "DEFER.BIN"
+    mov  x1, #(9f - 8f)
+    mov  x2, #3                            // O_CREAT | RW
+    svc  #0
+    mov  x19, x0                           // x19 = hA (>=0) or -errno
+    tbnz x19, #63, 2f                      // create/open failed -> report what we have
+    mov  x8, #1                            // SYS_WRITE 16 bytes (the pattern) -> grow
+    mov  x0, x19
+    mov  x1, x13
+    mov  x2, #16
+    svc  #0
+    cmp  x0, #16
+    b.ne 2f
+    add  x23, x23, #1                      // bit0: create DEFER.BIN + grow-write OK
+    mov  x8, #3                            // SYS_REPORT(A_OPENED) — cue: launcher releases B's unlink
+    movz x0, #0x60
+    svc  #0
+
+    // park on the read GO word (base + 0x3010; released after B has unlinked + the launcher's checkpoint-1)
+    add  x9, x9, #0x1000
+    add  x9, x9, #0x1000
+    add  x9, x9, #0x1000                   // x9 = base + 0x3000
+    add  x9, x9, #0x10                     // x9 = base + 0x3010 = A read-GO
+    movz x24, #0x8000                      // bounded poll budget
+3:  ldr  x10, [x9]
+    cbnz x10, 4f
+    mov  x8, #4                            // SYS_YIELD — cooperative
+    svc  #0
+    subs x24, x24, #1
+    b.ne 3b
+    b    2f                                // GO never released -> report the partial witness (verdict FAILs)
+
+4:  // (1) seek to 0, then READ 16 -> must STILL return A's original bytes (the chain is alive despite B's unlink)
+    mov  x8, #15                           // SYS_SEEK(hA, 0)
+    mov  x0, x19
+    mov  x1, #0
+    svc  #0
+    cmp  x0, #0                            // seek returns the new offset (0); anything else is a failure
+    b.ne 2f
+    mov  x8, #12                           // SYS_READ(hA, buf, 16)
+    mov  x0, x19
+    mov  x1, x12
+    mov  x2, #16
+    svc  #0
+    cmp  x0, #16                           // 16 bytes back == the chain was NOT freed (defer held)
+    b.ne 2f
+    ldr  x10, [x12]                        // read-back == pattern (lo 8)
+    ldr  x11, [x13]
+    cmp  x10, x11
+    b.ne 2f
+    ldr  x10, [x12, #8]                    // (hi 8)
+    ldr  x11, [x13, #8]
+    cmp  x10, x11
+    b.ne 2f
+    add  x23, x23, #2                      // bit1: read-after-unlink returns the original bytes (chain alive)
+    mov  x8, #3                            // SYS_REPORT(A_READ) — cue: launcher checkpoint-2, releases close GO
+    movz x0, #0x62
+    svc  #0
+
+    // park on the close GO word (base + 0x3018; released after the launcher's checkpoint-2)
+    add  x9, x9, #0x8                      // x9 = base+0x3010 -> base+0x3018 = A close-GO
+    movz x24, #0x8000
+5:  ldr  x10, [x9]
+    cbnz x10, 6f
+    mov  x8, #4                            // SYS_YIELD
+    svc  #0
+    subs x24, x24, #1
+    b.ne 5b
+    b    2f
+
+6:  // (2) SYS_CLOSE hA -> 0 (the LAST reference: the deferred free runs now, in syscall context)
+    mov  x8, #17                           // SYS_CLOSE(hA)
+    mov  x0, x19
+    svc  #0
+    cmp  x0, #0
+    b.ne 2f
+    add  x23, x23, #4                      // bit2: close OK (last close -> chain freed)
+    mov  x8, #17                           // SYS_CLOSE(hA) AGAIN -> double-close must be clean
+    mov  x0, x19
+    svc  #0
+    cmn  x0, #9                            // x0 == -9 (-EBADF)?
+    b.ne 2f
+    add  x23, x23, #8                      // bit3: double-close -> -EBADF
+2:
+    mov  x0, x23                           // SYS_REPORT(final witness)
+    mov  x8, #3
+    svc  #0
+    mov  x8, #2                            // SYS_EXIT(U11DEFER_EXIT_STATUS) -> EL0_U11DEFER_DONE
+    movz x0, #0x7F
+    svc  #0
+1:  b 1b                                   // sys_exit never returns; belt-and-braces guard
+
+    .balign 4
+    .globl __u11defer_prog_b
+__u11defer_prog_b:
+    mov  x23, xzr                          // witness bitmask = 0
+    adr  x9, __u11defer_blob_start
+    add  x9, x9, #0x1000
+    add  x9, x9, #0x1000
+    add  x9, x9, #0x1000                   // x9 = base + 0x3000 = B unlink-GO
+
+    // park on the unlink GO word (released after A reported A_OPENED — so DEFER.BIN exists before B opens it)
+    movz x24, #0x8000
+13: ldr  x10, [x9]
+    cbnz x10, 14f
+    mov  x8, #4                            // SYS_YIELD
+    svc  #0
+    subs x24, x24, #1
+    b.ne 13b
+    b    12f                               // GO never released -> report the partial witness
+
+14: // (0) open DEFER.BIN RW (no O_CREAT — A created it) -> hB
+    mov  x8, #11                           // SYS_OPEN
+    adr  x0, 8f
+    mov  x1, #(9f - 8f)
+    mov  x2, #1                            // RW
+    svc  #0
+    mov  x20, x0                           // x20 = hB (>=0) or -errno
+    tbnz x20, #63, 12f
+    add  x23, x23, #1                      // bit0: B open of the existing file OK
+    // (1) unlink via hB -> 0 (A still holds it open -> the chain-free is DEFERRED, nothing freed here)
+    mov  x8, #16                           // SYS_UNLINK
+    mov  x0, x20
+    svc  #0
+    cmp  x0, #0
+    b.ne 12f
+    add  x23, x23, #2                      // bit1: unlink OK (deferred)
+    // (2) re-open the unlinked name RO -> -ENOENT (the NAME is gone immediately, even though the chain lives)
+    mov  x8, #11                           // SYS_OPEN DEFER.BIN RO
+    adr  x0, 8f
+    mov  x1, #(9f - 8f)
+    mov  x2, #0                            // RO
+    svc  #0
+    cmn  x0, #2                            // x0 == -2 (-ENOENT)?
+    b.ne 12f
+    add  x23, x23, #4                      // bit2: re-open of the unlinked name -> -ENOENT (name gone)
+    mov  x8, #3                            // SYS_REPORT(B_UNLINKED) — cue: launcher checkpoint-1, releases A's read
+    movz x0, #0x61
+    svc  #0
+12:
+    mov  x0, x23                           // SYS_REPORT(final witness)
+    mov  x8, #3
+    svc  #0
+    mov  x8, #2                            // SYS_EXIT(U11DEFER_EXIT_STATUS) -> EL0_U11DEFER_DONE
+    movz x0, #0x7F
+    svc  #0
+11: b 11b                                  // sys_exit never returns; belt-and-braces guard
+
+    .balign 4
+8:  .ascii "DEFER.BIN"
+9:
+    .balign 8
+7:  .ascii "U11-DEFER-OK-777"
+    .balign 4
+    .globl __u11defer_blob_end
+__u11defer_blob_end:
+"#
+);
+
+unsafe extern "C" {
+    static __u11defer_blob_start: u8;
+    static __u11defer_blob_end: u8;
+    static __u11defer_prog_a: u8;
+    static __u11defer_prog_b: u8;
+}
+
 /// The `hello` EL0 program (M6c), built as a SEPARATE link product (`crates/user-blob`) and baked in
 /// as a flat binary instead of living in the kernel's `.text`. `arroyo kernel8` builds it — a naked,
 /// position-independent `sys_write("hello from EL0\n") + sys_exit(0)` routine — for the bare aarch64
@@ -2073,6 +2487,28 @@ static U10D_WITNESS: AtomicU64 = AtomicU64::new(0);
 static EL0_U10D_DONE: AtomicU32 = AtomicU32::new(0);
 /// A killed U10-delete fixture — a real bug (register-only). Off the M6b counter.
 static EL0_U10D_KILLED: AtomicU32 = AtomicU32::new(0);
+
+/// The U11 open-file-lifecycle fixture's WITNESS bitmask (reported via SYS_REPORT): see `U11_WITNESS_ALL`.
+/// `u11_launcher` PASSes iff it equals `U11_WITNESS_ALL` AND the kernel-side gen-rebind + on-disk checks held.
+static U11_WITNESS: AtomicU64 = AtomicU64::new(0);
+/// The U11 fixture (`el0-u11close`) reached its `0x7E` sentinel exit (want 1). Read by `u11_launcher`.
+static EL0_U11_DONE: AtomicU32 = AtomicU32::new(0);
+/// A killed U11 fixture — a real bug (register-only). Off the M6b counter.
+static EL0_U11_KILLED: AtomicU32 = AtomicU32::new(0);
+
+/// U11-M2 (defer): the two cross-process fixtures' final witness bitmasks (SYS_REPORT), keyed by name.
+static U11DEFER_A_WITNESS: AtomicU64 = AtomicU64::new(0);
+static U11DEFER_B_WITNESS: AtomicU64 = AtomicU64::new(0);
+/// U11-M2 (defer): the launcher's choreography cue flags — A finished create+write; B finished unlink+re-open;
+/// A finished the post-unlink read. The launcher (single sequencer) releases the next GO word + runs its
+/// fresh-mount checkpoint on each. Set from `u11defer_report` when the matching cue token is reported.
+static U11DEFER_A_OPENED_F: AtomicU32 = AtomicU32::new(0);
+static U11DEFER_B_UNLINKED_F: AtomicU32 = AtomicU32::new(0);
+static U11DEFER_A_READ_F: AtomicU32 = AtomicU32::new(0);
+/// U11-M2 (defer): BOTH fixtures reached their `0x7F` sentinel exit (want 2). Read by `u11defer_run`.
+static EL0_U11DEFER_DONE: AtomicU32 = AtomicU32::new(0);
+/// U11-M2 (defer): a killed defer fixture — a real bug (register-only, bar its +0x2000 read buffer).
+static EL0_U11DEFER_KILLED: AtomicU32 = AtomicU32::new(0);
 
 /// Claim a FREE Proc entry, returning its index. CAS on `state` (FREE->RUNNING) is the atomic ownership
 /// token; the pid=0 placeholder is overwritten with the real child pid (Release) by the caller AFTER the
@@ -2565,11 +3001,72 @@ static FILE_DIR_LBA: [[AtomicU64; NFILE]; super::boot::USER_SLOTS + 1] =
     [const { [const { AtomicU64::new(0) }; NFILE] }; super::boot::USER_SLOTS + 1];
 static FILE_DIR_OFF: [[AtomicU32; NFILE]; super::boot::USER_SLOTS + 1] =
     [const { [const { AtomicU32::new(0) }; NFILE] }; super::boot::USER_SLOTS + 1];
+/// U11: per-descriptor GENERATION counter. A `File` handle's value word packs `(gen << 32) | (idx + 1)`, and
+/// `file_desc_validate` rejects a handle whose packed gen != the slot's CURRENT gen — so a stale sibling handle
+/// to a slot that was freed and then FIRST-FIT-REUSED by a different file is `-EACCES` (a gen mismatch), never a
+/// silent re-bind to that different file (closes the U10 sibling-rebind note). Bumped on EVERY free
+/// (`files_free` — the path `SYS_CLOSE`, `sys_unlink`'s `files_free_by_dir`, and `clear_files_row` all route
+/// through or mirror) so the very next reuse of the slot lands on a fresh generation. Const-init `0`; monotone
+/// within a boot (a u32 wrap is ~4 billion frees away — unreachable for the demo). Acquire/Release-paired with
+/// `FILE_USED` (published last on alloc, cleared on free) so a validator that sees a live slot sees its gen.
+static FILE_GEN: [[AtomicU32; NFILE]; super::boot::USER_SLOTS + 1] =
+    [const { [const { AtomicU32::new(0) }; NFILE] }; super::boot::USER_SLOTS + 1];
+
+/// U11-M2: per-descriptor pointer to the GLOBAL open-file refcount row this descriptor increments (`OPEN_FILES`
+/// index, or `OPENROW_NONE` for a scaffold/free slot). Recorded by `sys_open` right after `files_alloc` (the row
+/// `openfile_incref` returned), and used by `files_free`/`sys_unlink` to decrement/mark that EXACT row — NOT a
+/// key search. This is what makes the refcount robust against FAT recycling a deleted file's directory SLOT:
+/// `(dir_lba, dir_off)` identifies a slot, not a file, so a new file created in an unlinked-but-still-open file's
+/// recycled `0xE5` slot would collide on the key; keying the decrement/mark on the row INDEX the descriptor
+/// actually claimed keeps each file's refcount + deferred-free strictly its own. Const-init `OPENROW_NONE`.
+static FILE_OPENROW: [[AtomicU32; NFILE]; super::boot::USER_SLOTS + 1] =
+    [const { [const { AtomicU32::new(OPENROW_NONE) }; NFILE] }; super::boot::USER_SLOTS + 1];
+
+/// U11-M2: the `FILE_OPENROW` sentinel for "this descriptor increments no open-file row" (a scaffold with no file
+/// identity, or a free slot). `u32::MAX` is unreachable as a real `OPEN_FILES` index (`NOPENFILE` is tiny).
+const OPENROW_NONE: u32 = u32::MAX;
+
+/// U11: pack a `(generation, descriptor index)` pair into a `File` handle's value word. Low 32 bits = `idx + 1`
+/// (the +1 bias keeps the whole word clear of the value word's `0`=Empty / `u64::MAX`=RESERVING sentinels for
+/// ANY index and generation — `idx + 1 >= 1` so the low half is nonzero, and `idx + 1 <= NFILE` so the word is
+/// never all-ones); high 32 bits = the slot's generation at open time. `file_desc_validate` decodes + validates.
+/// The gen-0 encoding of index `idx` is exactly `idx + 1` — byte-identical to the pre-U11 bare file-id, so the
+/// scaffold File handles (U6/U9 kernel checks, which read the value word directly) are unaffected.
+fn file_id_pack(g: u32, idx: usize) -> u64 {
+    ((g as u64) << 32) | ((idx + 1) as u64)
+}
+
+/// U11: THE single point that turns a `File` handle's value word into a live descriptor index. Decodes the
+/// packed `(gen, idx)`, bounds-checks `idx`, requires the slot LIVE (`FILE_USED`), and requires the packed
+/// generation to equal the slot's CURRENT generation. The gen check is what closes the U10 sibling-rebind note:
+/// after a slot is freed (gen bumped) and first-fit-REUSED by a different file (`FILE_USED` true again), a
+/// lingering handle carrying the OLD gen fails here — no silent re-bind. Every File consumer
+/// (`sys_read`/`sys_write_file`/`sys_seek`/`sys_unlink`/`sys_close`) funnels its file-id through this ONE helper,
+/// so the descriptor-identity check is inherited once (no per-syscall re-derivation that could drift). Returns
+/// the validated index; `None` == invalid/stale (the caller maps to `-EACCES`, or `sys_close` to `-EBADF`).
+/// Acquire loads pair with the Release stores in `files_alloc`/`files_free` (belt-and-braces: a row has one
+/// writer at a time — its own task mid-syscall, or teardown after exit).
+fn file_desc_validate(asid: u64, file_id: u64) -> Option<usize> {
+    let idx = ((file_id & 0xFFFF_FFFF) as usize).checked_sub(1)?;
+    if idx >= NFILE {
+        return None;
+    }
+    if !FILE_USED[asid as usize][idx].load(Ordering::Acquire) {
+        return None; // free slot — a closed/unlinked descriptor (the U6b–U10 presence check)
+    }
+    let g = (file_id >> 32) as u32;
+    if FILE_GEN[asid as usize][idx].load(Ordering::Acquire) != g {
+        return None; // slot was freed + reused since this handle was minted — stale, no rebind (U11)
+    }
+    Some(idx)
+}
 
 /// Claim the first free descriptor in `FILES[asid]` for a freshly-opened file, returning its index (the caller
-/// biases it to the file-id `idx + 1`). Publishes size/offset/cluster with the `FILE_USED` presence flag stored
-/// LAST (Release) — so a resolver that observes a live descriptor also observes its fields (mirrors the handle
-/// "publish the live word last" discipline). `None` if the row is full (-> `-EMFILE`; never grown).
+/// packs it with the slot's current generation into the file-id via `file_id_pack`). Publishes size/offset/
+/// cluster with the `FILE_USED` presence flag stored LAST (Release) — so a resolver that observes a live
+/// descriptor also observes its fields (mirrors the handle "publish the live word last" discipline). The slot's
+/// generation is NOT touched here (it advances only on free), so the value the caller reads to pack the handle is
+/// the generation this descriptor lives under. `None` if the row is full (-> `-EMFILE`; never grown).
 fn files_alloc(asid: u64, first_cluster: u32, size: u32, dir_lba: u64, dir_off: u32) -> Option<usize> {
     debug_assert!((asid as usize) < FILE_USED.len(), "files_alloc: asid out of range");
     for k in 0..NFILE {
@@ -2586,34 +3083,65 @@ fn files_alloc(asid: u64, first_cluster: u32, size: u32, dir_lba: u64, dir_off: 
             FILE_OFFSET[asid as usize][k].store(0, Ordering::Release);
             FILE_DIR_LBA[asid as usize][k].store(dir_lba, Ordering::Release);
             FILE_DIR_OFF[asid as usize][k].store(dir_off, Ordering::Release);
+            // U11-M2: default to NO open-file row. A real `sys_open` OVERWRITES this with the row
+            // `openfile_incref` returned (right after this call); a scaffold descriptor (files_alloc called
+            // directly, no incref) keeps NONE, so its `files_free` decrement is a no-op.
+            FILE_OPENROW[asid as usize][k].store(OPENROW_NONE, Ordering::Release);
             return Some(k);
         }
     }
     None
 }
 
-/// Release descriptor `idx` in `FILES[asid]` — used to unwind a `sys_open` that allocated a descriptor but then
-/// failed to install its handle (mirrors `sys_spawn`'s reserve/unwind). Clears the fields then drops `FILE_USED`
-/// LAST (Release), so the slot is never seen free with stale fields.
-fn files_free(asid: u64, idx: usize) {
+/// Release descriptor `idx` in `FILES[asid]` — the ONE descriptor-free primitive (`sys_close`, `sys_unlink`'s
+/// `files_free_by_dir`, `sys_open`'s reserve/unwind, and `clear_files_row` at teardown all route through it).
+/// Clears the fields, drops `FILE_USED` (Release), then BUMPS the slot's generation (U11) — so the very next
+/// `files_alloc` reuse of this slot lands on a fresh gen and any handle still carrying the old (gen, idx) fails
+/// `file_desc_validate`'s gen check (no sibling rebind). The gen bump is last: a validator that observed the slot
+/// LIVE with the old gen resolved a genuinely-live descriptor (the same file); the rebind window only opens after
+/// a full free+reuse, by which point this bump has landed.
+///
+/// U11-M2: this is ALSO the refcount-DECREMENT choke point. It reads the descriptor's open-file ROW pointer
+/// (`FILE_OPENROW`) BEFORE clearing it and decrements THAT exact row (`openfile_decref_at`) — not a key search,
+/// so a directory slot FAT recycled for a different file can never redirect this decrement. It returns
+/// `Some(chain head)` IFF that decrement was the LAST close of an `unlink_pending` file that owns clusters — the
+/// caller then frees the chain (`free_orphan_chain`) in a block-I/O-legal context, or (teardown) logs the leak.
+/// Scaffold descriptors (`FILE_OPENROW == OPENROW_NONE`) decref to a no-op. `#[must_use]`: dropping the result
+/// could leak a live chain.
+#[must_use]
+fn files_free(asid: u64, idx: usize) -> Option<u32> {
     debug_assert!((asid as usize) < FILE_USED.len() && idx < NFILE, "files_free: out of range");
+    // Read the open-file row this descriptor increments BEFORE the clears below reset it.
+    let row = FILE_OPENROW[asid as usize][idx].load(Ordering::Acquire);
     FILE_CLUSTER[asid as usize][idx].store(0, Ordering::Release);
     FILE_SIZE[asid as usize][idx].store(0, Ordering::Release);
     FILE_OFFSET[asid as usize][idx].store(0, Ordering::Release);
     FILE_DIR_LBA[asid as usize][idx].store(0, Ordering::Release);
     FILE_DIR_OFF[asid as usize][idx].store(0, Ordering::Release);
+    FILE_OPENROW[asid as usize][idx].store(OPENROW_NONE, Ordering::Release);
     FILE_USED[asid as usize][idx].store(false, Ordering::Release);
+    FILE_GEN[asid as usize][idx].fetch_add(1, Ordering::AcqRel); // U11: stale-sibling protection on slot reuse
+    // U11-M2: drop this descriptor's cross-process open-file refcount by ROW INDEX (no-op for scaffolds). The
+    // returned chain head (if any) is the caller's to free — never under any lock, never in teardown context.
+    openfile_decref_at(row)
 }
 
-/// U10: free EVERY descriptor in `FILES[asid]` that names the directory entry at (`dir_lba`, `dir_off`). Used by
-/// `sys_unlink`: a file opened more than once in the SAME process yields independent descriptors all pointing at
-/// the same chain head + directory slot, so deleting via one handle must invalidate ALL of them — otherwise a
-/// SIBLING descriptor keeps `FILE_USED = true` with a stale `FILE_CLUSTER` pointing at the now-freed (and
-/// re-allocatable) chain, and a later read/write/unlink through the sibling handle would alias whatever reuses
-/// that cluster. `(dir_lba, dir_off)` uniquely identifies a file's on-disk entry, so this frees exactly the
-/// deleted file's aliases and nothing else. After it, every sibling handle still resolves but fails the
-/// `FILE_USED` re-check in `sys_read`/`sys_write_file`/`sys_seek`/`sys_unlink` -> `-EACCES` (fail-safe; the
-/// sibling handle words linger until task teardown, harmlessly). `dir_lba != 0` (the caller guards scaffolds).
+/// U10/U11-M2: free EVERY of this process's descriptors whose recorded directory slot is (`dir_lba`, `dir_off`),
+/// and FREE the cluster chain of each one that turns out to be the LAST close of an `unlink_pending` file. Used by
+/// `sys_unlink`: a file opened more than once in the SAME process yields independent descriptors all naming the
+/// same slot, so deleting via one handle must invalidate ALL of them (the U10 fail-safe — otherwise a sibling
+/// descriptor keeps `FILE_USED = true` with a stale `FILE_CLUSTER` aliasing a now-freed, re-allocatable chain).
+/// After it, every sibling handle still resolves but fails the `FILE_USED` re-check -> `-EACCES`.
+///
+/// ⚠ `(dir_lba, dir_off)` is a directory SLOT, and FAT RECYCLES it — `create_in_root` reuses a `0xE5`'d slot for
+/// a new file — so it does NOT uniquely identify a file. TWO distinct files can share the same `(dir_lba,
+/// dir_off)` in ONE process (open F; F unlinked while this process holds it, its slot goes `0xE5`; create G,
+/// which reuses F's slot) while sitting on DIFFERENT `OPEN_FILES` rows. This sweep therefore matches BOTH, and
+/// BOTH can reach `refcount == 0` while `unlink_pending`. So it MUST free EVERY orphan chain head it produces,
+/// not just the last — else the earlier file's chain leaks (a benign lost-cluster leak, but a real one, on the
+/// EXPLICIT unlink path). This is called ONLY from `sys_unlink` (a block-I/O-legal context — teardown uses
+/// `files_free` directly + logs), so each head is freed inline (`free_orphan_chain`); `files_free` drops the
+/// `OPEN_FILES` lock before returning the head, so the I/O is never under a lock. `dir_lba != 0` (caller guards).
 fn files_free_by_dir(asid: u64, dir_lba: u64, dir_off: u32) {
     debug_assert!((asid as usize) < FILE_USED.len() && dir_lba != 0, "files_free_by_dir: bad args");
     for k in 0..NFILE {
@@ -2621,22 +3149,33 @@ fn files_free_by_dir(asid: u64, dir_lba: u64, dir_off: u32) {
             && FILE_DIR_LBA[asid as usize][k].load(Ordering::Acquire) == dir_lba
             && FILE_DIR_OFF[asid as usize][k].load(Ordering::Acquire) == dir_off
         {
-            files_free(asid, k);
+            // Free EACH orphan head (not just the last) — two recycled-slot files can both drop to 0 here.
+            if let Some(fc) = files_free(asid, k) {
+                free_orphan_chain(fc);
+            }
         }
     }
 }
 
 /// Clear an ENTIRE per-task open-file row at teardown — the file twin of `clear_handle_row`'s handle wipe (it
-/// calls this). Presence dropped last per slot, so no torn intermediate looks live. `asid` is 1..=USER_SLOTS.
+/// calls this). Routes each slot through `files_free`, so the per-slot field clears + generation bump are
+/// identical to before AND every live descriptor's cross-process refcount is decremented here (the teardown
+/// decrement — a short, I/O-free `SpinMutex` critical section, safe in this IRQ-masked context, the same way the
+/// scheduler locks `RUN_QUEUES`/`SLEEPERS` IRQ-masked). `asid` is 1..=USER_SLOTS.
+///
+/// U11-M2 honest scope: if a teardown decrement is the LAST close of an `unlink_pending` file, `files_free`
+/// returns the chain head — but freeing it HERE is UNSAFE (teardown is IRQ-masked, on a stack about to be freed,
+/// block I/O illegal), so this LOGS a transient leak instead. The clusters stay allocated (lost clusters —
+/// benign) until reclaimed; a reaper that frees them in a safe context is M2b (out of this milestone's scope).
 fn clear_files_row(asid: u64) {
     debug_assert!(asid >= 1 && (asid as usize) < FILE_USED.len(), "clear_files_row: asid out of range");
     for k in 0..NFILE {
-        FILE_CLUSTER[asid as usize][k].store(0, Ordering::Release);
-        FILE_SIZE[asid as usize][k].store(0, Ordering::Release);
-        FILE_OFFSET[asid as usize][k].store(0, Ordering::Release);
-        FILE_DIR_LBA[asid as usize][k].store(0, Ordering::Release);
-        FILE_DIR_OFF[asid as usize][k].store(0, Ordering::Release);
-        FILE_USED[asid as usize][k].store(false, Ordering::Release);
+        if let Some(orphan) = files_free(asid, k) {
+            serial_println!(
+                "U11-defer: teardown last-close of an unlinked file — chain @cluster {} left allocated (leak; M2b reaper)",
+                orphan
+            );
+        }
     }
 }
 
@@ -2646,6 +3185,170 @@ fn clear_files_row(asid: u64) {
 fn files_row_is_clear(asid: u64) -> bool {
     debug_assert!((asid as usize) < FILE_USED.len(), "files_row_is_clear: asid out of range");
     (0..NFILE).all(|k| !FILE_USED[asid as usize][k].load(Ordering::Acquire))
+}
+
+// =============================================================================================
+// U11-M2: the GLOBAL (cross-ASID) open-file refcount table — POSIX unlink-defers-free.
+// =============================================================================================
+//
+// U11 M1 gave every File descriptor a per-task lifetime (SYS_CLOSE + generation tags). This table adds the
+// CROSS-process lifetime the U10 delete note left open: a file unlinked while ANOTHER process holds it open
+// must keep its cluster chain allocated until that process's LAST close — else the freed chain is first-fit-
+// reused under the still-live descriptor (cross-file read/write + information disclosure). A row is JOINED by the
+// file's on-disk identity `(dir_lba, dir_off)` at open time, so ONE row is shared by every open of that file
+// across every ASID and `refcount` is the count of live descriptors naming it. BUT `(dir_lba, dir_off)` is a
+// directory SLOT, which FAT RECYCLES the moment a file is deleted (`create_in_root` reuses `0xE5` slots) — so it
+// identifies a slot, not a file. Two guards make the accounting robust to that recycling: (a) the open-time join
+// SKIPS `unlink_pending` rows (a deferred-free file's name is `0xE5`'d, so it can't be re-opened by name — a key
+// match on a pending row is a DIFFERENT file that reused the slot, and gets a FRESH row), and (b) every
+// descriptor records its row INDEX in `FILE_OPENROW`, so the paired decrement/mark hit that EXACT row rather than
+// re-searching the recyclable key. Generation tags (M1) cover descriptor-slot reuse; this covers directory-slot
+// reuse one level up.
+//
+// The table is the ONLY cross-ASID shared File state, so it is guarded by a single `SpinMutex` (NOT the
+// sleeping `Mutex`, which yields — illegal in the IRQ-masked teardown decrement path). The lock is held ONLY
+// across the short table mutation (find/claim/±refcount, read `first_cluster`); the `free_chain` block I/O is
+// ALWAYS the caller's, after the lock drops — never under the lock, never in teardown context.
+//
+// Lifecycle: `sys_open` increments (find-or-claim a row) BEFORE `files_alloc`; `files_free` (the one
+// descriptor-free primitive) decrements. `sys_unlink` marks the row `unlink_pending` + stashes the chain head,
+// but frees nothing while `refcount > 0`; the decrement that drops `refcount` to 0 on an `unlink_pending` row
+// hands the chain head back so the caller frees it (all FAT copies) in a block-I/O-legal context.
+
+/// Rows in the global open-file table. Small + static — a full table on a NEW identity is `-ENFILE`.
+const NOPENFILE: usize = 16;
+
+/// One open-file identity's shared state. Guarded by `OPEN_FILES` (a `SpinMutex`), so the fields are plain
+/// `Copy` integers — the lock provides mutual exclusion (no atomics; atomics are not `Copy` and would block the
+/// `derive`). A row is FREE iff `refcount == 0` (its canonical empty form also has `dir_lba == 0`).
+#[derive(Clone, Copy)]
+struct OpenFileRow {
+    dir_lba: u64,         // identity key: the file's directory-entry sector LBA (0 in a free row)
+    dir_off: u32,         // identity key: the 32-byte slot's offset within that sector
+    refcount: u32,        // live open descriptors across ALL processes; 0 == free row
+    unlink_pending: bool, // the name has been 0xE5'd; free `first_cluster` at the last close
+    first_cluster: u32,   // chain head to free at the last close — captured at UNLINK (authoritative there)
+}
+
+impl OpenFileRow {
+    const EMPTY: Self = OpenFileRow {
+        dir_lba: 0,
+        dir_off: 0,
+        refcount: 0,
+        unlink_pending: false,
+        first_cluster: 0,
+    };
+}
+
+/// The global open-file refcount table. `SpinMutex::new` is `const` and `OpenFileRow: Copy`, so this is a
+/// const-constructed static (mirrors `sched.rs`'s `RUN_QUEUES`/`SLEEPERS`). Its lock is taken IRQ-masked in the
+/// teardown decrement (safe: a bounded, allocation-free, I/O-free critical section) and in every open/close/
+/// unlink — but NEVER held across a `mount()`/`free_chain` block-I/O call.
+static OPEN_FILES: SpinMutex<[OpenFileRow; NOPENFILE]> = SpinMutex::new([OpenFileRow::EMPTY; NOPENFILE]);
+
+/// U11-M2: INCREMENT the open-file refcount for the file at `(dir_lba, dir_off)` and return the OPEN_FILES ROW
+/// INDEX it landed on (the caller records it in `FILE_OPENROW` so the paired decrement/mark hit this exact row).
+/// It JOINS an existing NON-`unlink_pending` row for this identity (another live open of the SAME file, any ASID)
+/// with `refcount += 1`, else CLAIMS a free row. **The `unlink_pending` exclusion is load-bearing:** an unlinked
+/// file's name is `0xE5`'d, so it can never be re-opened by name — any key match on a pending row is therefore a
+/// DIFFERENT file that FAT recycled the deleted file's directory slot for, and joining it would conflate the two
+/// files' refcounts + deferred free. The two rows may then legitimately share the `(dir_lba, dir_off)` key; the
+/// per-descriptor `FILE_OPENROW` index is what keeps every later decrement/mark unambiguous. `None` iff the table
+/// is full on a NEW identity (no free row) — `sys_open` maps that to `-ENFILE`. Called BEFORE `files_alloc` so
+/// every increment pairs with exactly one decrement (the descriptor's `files_free`, or `openfile_decref_at` on
+/// the alloc-full unwind), with no path where a decrement lands on a row this open never incremented.
+fn openfile_incref(dir_lba: u64, dir_off: u32) -> Option<usize> {
+    let mut table = OPEN_FILES.lock();
+    // Join only a LIVE, NON-pending row for this identity (a legitimate second open of the same file). A pending
+    // row with the same key is a different file reusing the recycled directory slot — skip it, claim fresh.
+    for (i, row) in table.iter_mut().enumerate() {
+        if row.refcount > 0 && !row.unlink_pending && row.dir_lba == dir_lba && row.dir_off == dir_off {
+            row.refcount += 1;
+            return Some(i);
+        }
+    }
+    for (i, row) in table.iter_mut().enumerate() {
+        if row.refcount == 0 {
+            *row = OpenFileRow { dir_lba, dir_off, refcount: 1, unlink_pending: false, first_cluster: 0 };
+            return Some(i);
+        }
+    }
+    None // table full on a new identity -> -ENFILE
+}
+
+/// U11-M2: DECREMENT the open-file refcount for the row at INDEX `row` (a `FILE_OPENROW` value the descriptor
+/// recorded at open). Returns `Some(first_cluster)` IFF this was the LAST close of an `unlink_pending` file that
+/// owns clusters — the caller MUST then free that chain (`free_orphan_chain`, block-I/O-legal context; NEVER
+/// teardown). `None` otherwise: still referenced, not unlinked, an empty (0-cluster) unlinked file, a scaffold
+/// (`row == OPENROW_NONE` / out of range), or an already-retired row (defensive). Decrementing by INDEX (not by
+/// the recyclable `(dir_lba, dir_off)` key) is what makes the accounting robust to FAT recycling a deleted
+/// file's directory slot — this decrement can only ever touch the row this descriptor actually incremented. The
+/// row is cleared at 0. Only the short table mutation runs under the lock; the free is the caller's, after the
+/// lock drops.
+#[must_use]
+fn openfile_decref_at(row: u32) -> Option<u32> {
+    let row = row as usize;
+    if row >= NOPENFILE {
+        return None; // OPENROW_NONE (scaffold / free slot) — nothing was counted
+    }
+    let mut table = OPEN_FILES.lock();
+    let r = &mut table[row];
+    if r.refcount == 0 {
+        return None; // already retired (defensive — a paired decrement should never observe this)
+    }
+    r.refcount -= 1;
+    if r.refcount == 0 {
+        let pending = r.unlink_pending;
+        let fc = r.first_cluster;
+        *r = OpenFileRow::EMPTY; // free the row
+        // Hand the chain to the caller ONLY if the file was unlinked AND owns clusters: a 0-cluster unlinked file
+        // has no chain, and a non-unlinked last-close just retires the row.
+        return if pending && fc != 0 { Some(fc) } else { None };
+    }
+    None // still referenced by another descriptor
+}
+
+/// U11-M2: mark the open-file row at INDEX `row` UNLINK-PENDING and stash the chain head to free at the last
+/// close. Called from `sys_unlink` (with the unlinking descriptor's `FILE_OPENROW`) AFTER the name is `0xE5`'d
+/// and BEFORE the caller's descriptors are dropped — so the decrement that reaches `refcount == 0` (sole-opener
+/// case) already sees the pending flag and frees the chain in the same syscall. Marking by INDEX (not key) keeps
+/// the pending state on THIS file's row even after FAT recycles its directory slot for another file. `row ==
+/// OPENROW_NONE` / out of range / a retired row is a defensive no-op. `first_cluster` here is authoritative.
+fn openfile_mark_unlink_pending_at(row: u32, first_cluster: u32) {
+    let row = row as usize;
+    if row >= NOPENFILE {
+        return;
+    }
+    let mut table = OPEN_FILES.lock();
+    let r = &mut table[row];
+    if r.refcount > 0 {
+        r.unlink_pending = true;
+        r.first_cluster = first_cluster;
+    }
+}
+
+/// U11-M2: free the cluster chain of an `unlink_pending` file whose LAST descriptor just closed — the deferred
+/// half of the `sys_unlink` split, run at close time. Called ONLY from SYSCALL context (`sys_close`,
+/// `sys_unlink`, the `sys_open` unwind), where block I/O is legal; NEVER from teardown (IRQ-masked — that path
+/// logs a leak instead). The name is already `0xE5`'d, so freeing here can never alias; a mount/free error only
+/// orphans clusters (lost clusters — benign, chkdsk-reclaimable), never aliases. Holds no lock across the I/O.
+fn free_orphan_chain(first_cluster: u32) {
+    let fs = match crate::fs::fat::mount() {
+        Ok(fs) => fs,
+        Err(_) => {
+            serial_println!(
+                "U11-defer: deferred free of chain @cluster {} — mount failed, orphaned (leak)",
+                first_cluster
+            );
+            return;
+        }
+    };
+    if fs.free_chain(first_cluster).is_err() {
+        serial_println!(
+            "U11-defer: deferred free of chain @cluster {} — free_chain error, orphaned (leak)",
+            first_cluster
+        );
+    }
 }
 
 /// U4: record a value a process-model fixture reported via SYS_REPORT, keyed by the reporting task's name —
@@ -2723,6 +3426,31 @@ fn u10c_report(value: u64) {
 fn u10d_report(value: u64) {
     if super::sched::current_name() == Some("el0-u10delete") {
         U10D_WITNESS.store(value, Ordering::Release);
+    }
+}
+
+/// U11: record the open-file-lifecycle fixture's witness bitmask (SYS_REPORT), keyed by the reporting task's name.
+fn u11_report(value: u64) {
+    if super::sched::current_name() == Some("el0-u11close") {
+        U11_WITNESS.store(value, Ordering::Release);
+    }
+}
+
+/// U11-M2 (defer): record the two cross-process fixtures' SYS_REPORTs, keyed by task name. Each fixture reports
+/// mid-run CUE tokens (all `> 0xF`, so they never collide with a witness value) that release the launcher's next
+/// choreography edge, then its final witness bitmask (`<= 0xF`).
+fn u11defer_report(value: u64) {
+    match super::sched::current_name() {
+        Some("el0-u11defer-a") => match value {
+            U11DEFER_A_OPENED => U11DEFER_A_OPENED_F.store(1, Ordering::Release),
+            U11DEFER_A_READ => U11DEFER_A_READ_F.store(1, Ordering::Release),
+            _ => U11DEFER_A_WITNESS.store(value, Ordering::Release),
+        },
+        Some("el0-u11defer-b") => match value {
+            U11DEFER_B_UNLINKED => U11DEFER_B_UNLINKED_F.store(1, Ordering::Release),
+            _ => U11DEFER_B_WITNESS.store(value, Ordering::Release),
+        },
+        _ => {} // a stray report from any other task is ignored (never happens in the demo)
     }
 }
 
@@ -2997,6 +3725,17 @@ pub fn record_el0_kill(name: &str, ec: u64, far: u64, far_valid: bool) {
     // U10-delete: the DELETE fixture is likewise register-only; a kill is a real bug (its own counter).
     if name == "el0-u10delete" {
         EL0_U10D_KILLED.fetch_add(1, Ordering::AcqRel);
+        return;
+    }
+    // U11: the open-file-lifecycle fixture is likewise register-only; a kill is a real bug (its own counter).
+    if name == "el0-u11close" {
+        EL0_U11_KILLED.fetch_add(1, Ordering::AcqRel);
+        return;
+    }
+    // U11-M2 (defer): the two cross-process fixtures are register-only (bar their +0x2000 read buffer); a kill of
+    // either is a real bug -> its own counter, off the M6b accounting.
+    if name == "el0-u11defer-a" || name == "el0-u11defer-b" {
+        EL0_U11DEFER_KILLED.fetch_add(1, Ordering::AcqRel);
         return;
     }
     let (base, size) = super::boot::user_region();
@@ -3391,6 +4130,8 @@ extern "C" fn aarch64_svc_handler(frame: *mut u64) {
             u10_report(a0);
             u10c_report(a0);
             u10d_report(a0);
+            u11_report(a0);
+            u11defer_report(a0);
             0
         }
         SYS_YIELD => sys_yield(),
@@ -3404,6 +4145,7 @@ extern "C" fn aarch64_svc_handler(frame: *mut u64) {
         SYS_READ => sys_read(a0, a1, a2),
         SYS_SEEK => sys_seek(a0, a1),
         SYS_UNLINK => sys_unlink(a0),
+        SYS_CLOSE => sys_close(a0),
         SYS_XFER => sys_xfer(a0, a1, a2),
         SYS_RECV => sys_recv(),
         SYS_EXIT => {
@@ -3487,6 +4229,12 @@ extern "C" fn aarch64_svc_handler(frame: *mut u64) {
                 EL0_U10C_DONE.fetch_add(1, Ordering::AcqRel);
             } else if a0 == U10D_EXIT_STATUS {
                 EL0_U10D_DONE.fetch_add(1, Ordering::AcqRel);
+            } else if a0 == U11_EXIT_STATUS {
+                EL0_U11_DONE.fetch_add(1, Ordering::AcqRel);
+            } else if a0 == U11DEFER_EXIT_STATUS {
+                // Both defer fixtures (A + B) ride this one sentinel; neither has a planted Proc entry (they use
+                // no sys_xfer), so both fall through the Proc short-circuit to here. Want 2 (both exited).
+                EL0_U11DEFER_DONE.fetch_add(1, Ordering::AcqRel);
             } else if a0 == 0 {
                 EL0_EXITED_OK.fetch_add(1, Ordering::AcqRel);
             } else {
@@ -3624,14 +4372,11 @@ const GROW_WRITE_MAX: usize = 8 * 1024;
 /// (an RO-opened File, a revoked cap, or a non-File kind can never reach it). A bad buffer is `-EFAULT` with no
 /// I/O and no offset move; `-ENOSPC` when the volume is full.
 fn sys_write_file(asid: u64, file_id: u64, buf: u64, len: u64) -> i64 {
-    // Decode the file-id -> descriptor index (undo the +1 bias) and re-check presence (defense in depth: a live
-    // File handle always has a live descriptor, but never trust the value word blindly — mirrors sys_read).
-    let Some(idx) = (file_id as usize).checked_sub(1) else {
+    // U11: decode + validate through the single descriptor-identity seam (range, `FILE_USED`, and generation —
+    // a stale write-cap to a reused slot is rejected here, never rebound onto the different file's chain).
+    let Some(idx) = file_desc_validate(asid, file_id) else {
         return EACCES;
     };
-    if idx >= NFILE || !FILE_USED[asid as usize][idx].load(Ordering::Acquire) {
-        return EACCES;
-    }
     let size = FILE_SIZE[asid as usize][idx].load(Ordering::Acquire);
     let offset = FILE_OFFSET[asid as usize][idx].load(Ordering::Acquire);
     let inplace_avail = size.saturating_sub(offset) as usize; // bytes from `offset` to EOF
@@ -3826,10 +4571,12 @@ fn m6f_report(value: u64) {
 const ENOENT: i64 = -2; // no such file (HELLO.BIN missing)
 const EIO: i64 = -5; // read/mount I/O error, or an empty file
 const E2BIG: i64 = -7; // the program is larger than one code page
+const EBADF: i64 = -9; // U11: sys_close of an unresolvable / already-closed / stale-slot handle
 const ECHILD: i64 = -10; // sys_wait: no child with that pid
 const EAGAIN: i64 = -11; // the process table (or slot pool) is full
 const ENODEV: i64 = -19; // no block device / FAT volume to load from
 const EISDIR: i64 = -21; // sys_open: the named entry is a directory, not a file
+const ENFILE: i64 = -23; // U11-M2: the GLOBAL cross-process open-file table is full (a new file identity, no row)
 const EMFILE: i64 = -24; // sys_open: the caller's open-file (or handle) table is full
 const ENOSPC: i64 = -28; // U10: no free cluster (volume full) / no free root-dir slot (grow/create)
 
@@ -4202,13 +4949,39 @@ fn sys_open(name_ptr: u64, name_len: u64, mode: u64) -> i64 {
     if de.is_dir {
         return EISDIR; // a directory is not readable through a File handle (no dir ops this arc)
     }
-    // 3. Claim resources LAST — a descriptor, then a handle. Only a full handle table needs unwinding.
+    // 3. Claim resources — the GLOBAL open-file refcount FIRST, then a per-task descriptor, then a handle.
+    // U11-M2: increment the cross-ASID open-file refcount BEFORE `files_alloc` and remember the ROW it landed on.
+    // Incrementing first pairs every increment with EXACTLY one decrement — the descriptor's `files_free`
+    // (close/teardown), or the one-line `openfile_decref_at` on the `files_alloc`-full unwind — leaving no path
+    // where a decrement lands on a row this open never incremented (which could race a concurrent same-file open
+    // on SMP). A full table on a NEW identity is a clean -ENFILE, nothing else claimed.
+    let Some(open_row) = openfile_incref(dir_lba, dir_off as u32) else {
+        return ENFILE; // the global open-file table is full (a new file identity, no free row)
+    };
     let Some(fid) = files_alloc(asid, de.first_cluster(), de.size, dir_lba, dir_off as u32) else {
+        // Undo the increment we just made — there is no descriptor to record the row in / route through
+        // `files_free`. Decrement THAT exact row. The free below only fires in the (defensive) case a concurrent
+        // unlink made this the last close; block I/O is legal in this syscall context.
+        if let Some(fc) = openfile_decref_at(open_row as u32) {
+            free_orphan_chain(fc);
+        }
         return EMFILE; // this task's open-file table is full
     };
-    let file_id = (fid + 1) as u64; // +1 bias: never the value word's 0 (Empty) / u64::MAX (RESERVING) sentinel
+    // U11-M2: bind the descriptor to the refcount row it increments, so its `files_free` (and `sys_unlink`'s
+    // mark) hit exactly THIS row — never a key search that a recycled directory slot could redirect. Recorded
+    // before any further unwind, so the handle-install-fail `files_free` below decrements the right row.
+    FILE_OPENROW[asid as usize][fid].store(open_row as u32, Ordering::Release);
+    // U11: pack the slot's CURRENT generation with `idx + 1` into the file-id (the value word) — so a later
+    // free + first-fit reuse of this same slot (bumped gen) makes any handle still carrying this word fail
+    // `file_desc_validate`'s gen check (no sibling rebind). `files_alloc` never bumps gen, and the row has a
+    // single writer (this task, mid-syscall), so the gen read here is the one this descriptor lives under.
+    let file_id = file_id_pack(FILE_GEN[asid as usize][fid].load(Ordering::Acquire), fid);
     let Some(h) = handle_install(asid, HANDLE_RESERVING) else {
-        files_free(asid, fid); // no handle slot — release the descriptor we just claimed (no leak)
+        // No handle slot — release the descriptor we just claimed; its `files_free` also decrements the refcount
+        // (balanced against the incref above). The orphan-free only fires if a concurrent unlink raced this open.
+        if let Some(fc) = files_free(asid, fid) {
+            free_orphan_chain(fc);
+        }
         return EAGAIN;
     };
     // U9/U10: RW (bit0) or O_CREAT (bit1 — you create to write) endows CAP_WRITE alongside CAP_READ, so a File
@@ -4236,14 +5009,11 @@ fn sys_read(handle: u64, buf: u64, len: u64) -> i64 {
         Ok(HandleTarget::File(id)) => id,
         _ => return EACCES,
     };
-    // Decode the file-id -> descriptor index (undo the +1 bias) and re-check presence (defense in depth: a live
-    // File handle always has a live descriptor, but never trust the value word blindly).
-    let Some(idx) = (file_id as usize).checked_sub(1) else {
+    // U11: decode + validate the file-id through the single descriptor-identity seam — range, presence
+    // (`FILE_USED`), AND generation (a stale handle to a reused slot is rejected here, not silently rebound).
+    let Some(idx) = file_desc_validate(asid, file_id) else {
         return EACCES;
     };
-    if idx >= NFILE || !FILE_USED[asid as usize][idx].load(Ordering::Acquire) {
-        return EACCES;
-    }
     let size = FILE_SIZE[asid as usize][idx].load(Ordering::Acquire);
     let offset = FILE_OFFSET[asid as usize][idx].load(Ordering::Acquire);
     // Bytes available from the current offset, clamped to the request. `offset` is advanced only by delivered
@@ -4298,13 +5068,10 @@ fn sys_seek(handle: u64, offset: u64) -> i64 {
             _ => return EACCES,
         },
     };
-    // Decode the file-id -> descriptor index (undo the +1 bias) and re-check presence (defense in depth).
-    let Some(idx) = (file_id as usize).checked_sub(1) else {
+    // U11: decode + validate through the single descriptor-identity seam (range, `FILE_USED`, and generation).
+    let Some(idx) = file_desc_validate(asid, file_id) else {
         return EACCES;
     };
-    if idx >= NFILE || !FILE_USED[asid as usize][idx].load(Ordering::Acquire) {
-        return EACCES;
-    }
     let size = FILE_SIZE[asid as usize][idx].load(Ordering::Acquire);
     // Absolute seek: an offset PAST the file's size is invalid; seeking exactly TO `size` (the EOF position, a
     // legal 0-byte read/write point) is allowed. Preserves the FILE_OFFSET <= FILE_SIZE invariant. `size` is a
@@ -4316,18 +5083,23 @@ fn sys_seek(handle: u64, offset: u64) -> i64 {
     offset as i64
 }
 
-/// SYS_UNLINK(handle) -> `0` or a negative errno (U10). DELETE the file the open File+`CAP_WRITE` handle refers
-/// to. The CHECK is `sys_write`'s — `handle_resolve(asid, handle, CAP_WRITE)` must yield a `File` (an RO-opened
-/// File, a non-File kind, no handle, or a revoked cap all give `-EACCES`) — deletion is a mutation, gated by the
-/// SAME single write CHECK, so it can never be reached without `CAP_WRITE`. It reads the file's chain head +
-/// on-disk directory location from the descriptor (recorded at open), then `fat::delete_located` marks the
-/// directory entry deleted FIRST and frees the whole chain (all FAT copies), and finally the descriptor + handle
-/// are invalidated so no further read/write/seek can reach the now-deleted file. A scaffold descriptor with no
-/// recorded directory location (`dir_lba == 0`) is refused (`-EACCES`). ALL of the CALLER's descriptors naming
-/// the same on-disk entry are invalidated (`files_free_by_dir`), so opening a file twice in one process and
-/// deleting via one handle leaves the sibling fail-safe (`-EACCES`), not aliasing the freed chain. The remaining
-/// gap is CROSS-process: a file open in another process when unlinked here leaves that process's descriptor
-/// stale — closing it needs a global open-file refcount (POSIX unlink-defers-free), deferred with `SYS_CLOSE`.
+/// SYS_UNLINK(handle) -> `0` or a negative errno (U10; U11-M2 defers the chain-free). DELETE the file the open
+/// File+`CAP_WRITE` handle refers to. The CHECK is `sys_write`'s — `handle_resolve(asid, handle, CAP_WRITE)` must
+/// yield a `File` (an RO-opened File, a non-File kind, no handle, or a revoked cap all give `-EACCES`) — deletion
+/// is a mutation, gated by the SAME single write CHECK, so it can never be reached without `CAP_WRITE`. A scaffold
+/// descriptor with no recorded directory location (`dir_lba == 0`) is refused (`-EACCES`).
+///
+/// U11-M2 — POSIX unlink-defers-free. The NAME disappears immediately (`mark_dir_deleted` -> a re-open is
+/// `-ENOENT`), but the cluster CHAIN is freed only at the file's LAST close across ALL processes:
+///  1. `mark_dir_deleted` writes the directory entry `0xE5` FIRST (a failure here changes nothing -> `-EIO`).
+///  2. Mark the file's open-file refcount row `unlink_pending` + stash the chain head (before the drops below,
+///     so the drop that reaches `refcount == 0` frees the chain).
+///  3. Drop ALL of THIS process's descriptors naming the file (`files_free_by_dir`, each decrementing the
+///     refcount) — the U10 sibling-invalidation, so a file opened twice HERE leaves no live sibling on the freed
+///     chain. If this process is the SOLE opener, the last decrement reaches 0 and returns the chain head, which
+///     is freed NOW (all FAT copies) in this syscall context — byte-identical to U10's immediate delete. If
+///     ANOTHER process still holds the file open, the refcount stays > 0: the chain is left ALLOCATED (a live
+///     descriptor there keeps reading its original bytes) until that process's last `SYS_CLOSE` frees it.
 fn sys_unlink(handle: u64) -> i64 {
     let asid = current_asid();
     // The CHECK: File + CAP_WRITE, or -EACCES (identical to sys_write's gate — delete is a mutation).
@@ -4335,15 +5107,14 @@ fn sys_unlink(handle: u64) -> i64 {
         Ok(HandleTarget::File(id)) => id,
         _ => return EACCES,
     };
-    let Some(idx) = (file_id as usize).checked_sub(1) else {
+    // U11: decode + validate through the single descriptor-identity seam (range, `FILE_USED`, and generation).
+    let Some(idx) = file_desc_validate(asid, file_id) else {
         return EACCES;
     };
-    if idx >= NFILE || !FILE_USED[asid as usize][idx].load(Ordering::Acquire) {
-        return EACCES;
-    }
     let cluster = FILE_CLUSTER[asid as usize][idx].load(Ordering::Acquire);
     let dir_lba = FILE_DIR_LBA[asid as usize][idx].load(Ordering::Acquire);
     let dir_off = FILE_DIR_OFF[asid as usize][idx].load(Ordering::Acquire) as usize;
+    let open_row = FILE_OPENROW[asid as usize][idx].load(Ordering::Acquire); // the refcount row to mark pending
     // A descriptor with no recorded directory location (a scaffold, dir_lba == 0) cannot be deleted — refuse
     // rather than 0xE5 an unknown sector. Real opens always record a nonzero dir LBA (the FAT/dir regions never
     // sit at LBA 0 — that is the MBR / boot sector).
@@ -4355,15 +5126,65 @@ fn sys_unlink(handle: u64) -> i64 {
         Err(crate::fs::fat::FatError::NoDisk) => return ENODEV,
         Err(_) => return EIO,
     };
-    if fs.delete_located(dir_lba, dir_off, cluster).is_err() {
-        return EIO; // a bad chain / block error — the dir mark is delete_located's first step, so a failure
-                    // there changed nothing; a failure while freeing only orphans clusters (never aliases)
+    // (1) Make the NAME disappear FIRST — a re-open is `-ENOENT` immediately. A failure here leaves the row +
+    // descriptors + refcount untouched (nothing to unwind) -> `-EIO`.
+    if fs.mark_dir_deleted(dir_lba, dir_off).is_err() {
+        return EIO;
     }
-    // The file is gone: invalidate EVERY descriptor in this process's row that names it — not just `idx` — so a
-    // file opened more than once here cannot leave a sibling descriptor pointing at the now-freed chain (its next
-    // use fails the FILE_USED re-check -> -EACCES). Then clear the handle we were called with.
+    // (2) Arm the deferred free: mark THIS file's refcount row (by the descriptor's `FILE_OPENROW` index, not a
+    // recyclable key) `unlink_pending` and stash the chain head. This process holds the file open (refcount >= 1),
+    // so the row exists. MUST precede the drops below so the drop that reaches 0 (sole-opener case) sees the
+    // pending flag and returns the chain head.
+    openfile_mark_unlink_pending_at(open_row, cluster);
+    // (3) Drop EVERY descriptor in this process's row that names the file (each decrements the refcount and bumps
+    // its slot generation — U11 stale-sibling protection) and FREE the chain of each that reaches its last close
+    // (block I/O legal here, never under a lock). A sole-opener drops to 0 and frees immediately (the U10
+    // behaviour, deferred); a cross-process opener keeps the chain allocated until its last close. Note: FAT
+    // slot-recycling can put a DIFFERENT still-open unlinked file's descriptor on the same `(dir_lba, dir_off)` —
+    // `files_free_by_dir` frees EVERY orphan head it produces, so neither chain leaks. Then clear our handle.
     files_free_by_dir(asid, dir_lba, dir_off as u32);
     handle_clear(asid, handle as usize);
+    0
+}
+
+/// SYS_CLOSE(handle) -> `0` or a negative errno (U11). Give a `File` descriptor a real end-of-life: free its
+/// per-task descriptor slot (bumping the slot's generation, so any lingering sibling handle to the SAME slot
+/// goes stale rather than re-binding to a file that later reuses the slot) and clear the handle word. A close is
+/// not a mutation of the underlying object, so it requires NO capability right — `handle_resolve(asid, handle,
+/// 0)` admits any live handle the caller holds (kind + descriptor identity are still enforced). Semantics:
+///   * a live `File` -> free descriptor + clear handle -> `0`;
+///   * a `Console`/`Socket`/`Child` kind -> `-EINVAL`, object table UNTOUCHED (not closeable this arc — never
+///     corrupt it by freeing a File slot it does not own);
+///   * an unresolvable handle (Empty / out-of-range / RESERVING / revoked), or a `File` whose descriptor is
+///     already stale/closed (`file_desc_validate` fails) -> `-EBADF` — so a double-close returns cleanly and a
+///     use-after-close is denied.
+/// Only the caller's OWN descriptor slot is freed; a file another process holds open is unaffected (the
+/// cross-process open lifetime is the open-file refcount). U11-M2: this drop decrements that refcount, and if it
+/// is the LAST close of an `unlink_pending` file the deferred chain-free runs HERE — block I/O is legal in
+/// syscall context (unlike teardown). The common case (a non-unlinked or not-last close) still does no I/O.
+fn sys_close(handle: u64) -> i64 {
+    let asid = current_asid();
+    // Resolve for NO right (close is always permitted on a handle you hold). A non-File kind is refused without
+    // being touched; anything that does not resolve falls through to -EBADF (already closed / never opened).
+    let file_id = match handle_resolve(asid, handle, 0) {
+        Ok(HandleTarget::File(id)) => id,
+        Ok(_) => return EINVAL, // Console/Socket/Child — not a closeable File this arc; leave it intact
+        Err(_) => return EBADF, // no such handle (already closed / never opened / oob / revoked)
+    };
+    // The handle is a live File, but its descriptor may already be gone (a sibling unlink freed the slot, or this
+    // is a stale handle to a reused slot). Validate before freeing so a double-close / stale-close is -EBADF, not
+    // a free of someone else's current descriptor.
+    let Some(idx) = file_desc_validate(asid, file_id) else {
+        return EBADF;
+    };
+    // Release the slot + bump its generation (stale-sibling protection) + decrement the cross-process refcount.
+    let orphan = files_free(asid, idx);
+    handle_clear(asid, handle as usize);
+    // U11-M2: if this was the LAST close of an `unlink_pending` file, free its chain now (all FAT copies). Done
+    // AFTER dropping the handle + the table lock — never under a lock; block I/O is legal here (syscall context).
+    if let Some(fc) = orphan {
+        free_orphan_chain(fc);
+    }
     0
 }
 
@@ -5877,6 +6698,9 @@ pub fn u7_launcher(demo_cpu: usize) {
     u10_launcher(demo_cpu);
     u10c_launcher(demo_cpu);
     u10d_launcher(demo_cpu);
+    u11_launcher(demo_cpu);
+    u11defer_run(demo_cpu);
+    u11reuse_run();
 }
 
 fn u7_run(demo_cpu: usize) {
@@ -6301,7 +7125,7 @@ fn u9_check_revoked_write(fc: u32, sz: u32) -> bool {
     if g >= 0 {
         handle_clear(A, g as usize);
     }
-    files_free(A, fid);
+    let _ = files_free(A, fid); // scaffold descriptor (dir_lba == 0): the refcount decrement is a no-op
     ok &= handle_row_is_clear(A) && files_row_is_clear(A) && deriv_all_free();
     ok
 }
@@ -6872,6 +7696,528 @@ fn u10d_launcher(demo_cpu: usize) {
             reusable,
             EL0_U10D_DONE.load(Ordering::Acquire),
             U10D_WITNESS_ALL
+        );
+    }
+}
+
+/// Build the U11 open-file-lifecycle fixture slot — the `u10d_build` shape for the U11 blob.
+fn u11_build() -> Option<U7Fix> {
+    let (base, size) = super::boot::user_region();
+    let sp = (base + size as u64) & !0xF;
+    let bstart = &raw const __u11_blob_start as usize;
+    let bend = &raw const __u11_blob_end as usize;
+    let blen = bend - bstart;
+    assert!(blen <= super::boot::USER_CODE_SIZE, "U11 blob does not fit in a code page");
+    let entry = {
+        let va = base + (&raw const __u11_prog_close as usize - bstart) as u64;
+        assert!(va & 3 == 0, "U11 fixture entry misaligned");
+        va
+    };
+    let slot = super::boot::alloc_user_slot()?;
+    let backing = super::boot::slot_backing_ptr(slot);
+    unsafe {
+        core::ptr::write_bytes(backing, 0, size);
+        core::ptr::copy_nonoverlapping(bstart as *const u8, backing, blen);
+    }
+    super::cache::icache_sync_range(backing as usize, blen);
+    unsafe { super::boot::protect_user_slot_code(slot, super::boot::USER_CODE_SIZE) };
+    let ttbr0 = super::boot::slot_ttbr0(slot);
+    Some(U7Fix { entry, sp, ttbr0, asid: ttbr0 >> 48, slot })
+}
+
+/// U11 kernel-side proof of the generation-tag rebind fix, staged on a scratch ASID row (6 — clear by this point
+/// in the demo chain, exactly as `u9_check_revoked_write` relies on, and re-cleared defensively first). It
+/// reproduces the U10 sibling-rebind hole MECHANICALLY: claim a descriptor slot and mint its `(gen, idx)`
+/// file-id; free it (bumping the gen); then RE-claim the SAME slot (first-fit) for a "different file" — and
+/// prove the OLD file-id is now rejected by `file_desc_validate` (a generation mismatch) EVEN THOUGH the slot is
+/// live again (`FILE_USED` true), while a FRESH file-id minted against the reused slot resolves. That is exactly
+/// "no silent rebind on slot reuse", isolated from disk/EL0 timing. Leaves the row clean (no descriptor leaked).
+fn u11_check_gen_rebind() -> bool {
+    const A: u64 = 6; // scratch ASID row (every demo fixture has exited + torn down by the time this runs)
+    clear_files_row(A); // defensive: start from a provably clear row
+    let mut ok = true;
+    // 1. Claim a slot; mint its file-id at the current generation. A live descriptor resolves.
+    let Some(fid0) = files_alloc(A, 3 /*cluster*/, 16 /*size*/, 0, 0) else {
+        return false;
+    };
+    let g0 = FILE_GEN[A as usize][fid0].load(Ordering::Acquire);
+    let id0 = file_id_pack(g0, fid0);
+    ok &= file_desc_validate(A, id0) == Some(fid0);
+    // 2. Free the slot (bumps the generation). The old file-id no longer resolves (slot is free).
+    let _ = files_free(A, fid0); // scaffold descriptor (dir_lba == 0): the refcount decrement is a no-op
+    ok &= file_desc_validate(A, id0).is_none();
+    // 3. Re-claim: first-fit reuses the SAME slot at the bumped generation — a "different file".
+    let Some(fid1) = files_alloc(A, 9 /*different cluster*/, 32, 0, 0) else {
+        return false;
+    };
+    ok &= fid1 == fid0; // first-fit really reclaimed the slot
+    let g1 = FILE_GEN[A as usize][fid1].load(Ordering::Acquire);
+    ok &= g1 != g0; // the generation advanced on free
+    let id1 = file_id_pack(g1, fid1);
+    // 4. THE PROOF: the slot is LIVE again, yet the STALE file-id is rejected (gen mismatch — no rebind); the
+    //    FRESH file-id resolves.
+    ok &= FILE_USED[A as usize][fid1].load(Ordering::Acquire);
+    ok &= file_desc_validate(A, id0).is_none();
+    ok &= file_desc_validate(A, id1) == Some(fid1);
+    // Cleanup: drop the descriptor and demand the row clean (no leak).
+    let _ = files_free(A, fid1); // scaffold descriptor (dir_lba == 0): the refcount decrement is a no-op
+    ok &= files_row_is_clear(A);
+    ok
+}
+
+/// U11 launcher + verdict — the LAST demo in the chain, after U10-delete. Flow: skip with no SD; require A11.BIN
+/// and B11.BIN ABSENT pre-demo (the fixture creates them; a stale image would confound the on-disk checks);
+/// build + spawn the fixture; wait (bounded) for its sentinel exit + teardown; run the kernel-side gen-rebind
+/// proof; then a fresh mount confirms A11.BIN is GONE (unlinked) and B11.BIN is PRESENT (created + never
+/// deleted). PASS iff witness == `U11_WITNESS_ALL` AND torn down AND no kill AND the gen-rebind proof + on-disk
+/// checks hold. Releases no further gate.
+fn u11_launcher(demo_cpu: usize) {
+    static DONE: AtomicBool = AtomicBool::new(false);
+    if DONE.swap(true, Ordering::Relaxed) {
+        return;
+    }
+    if crate::drivers::block::info().is_none() {
+        return; // no SD -> the fixture cannot create/open disk files; skip silently
+    }
+    // Pre-flight: mount and require both demo files ABSENT (fresh image). A stale A11/B11 would confound the
+    // on-disk gone/present checks; log and skip.
+    match crate::fs::fat::mount() {
+        Ok(fs) => {
+            if fs.find_in_root(U11_A_NAME).is_ok() || fs.find_in_root(U11_B_NAME).is_ok() {
+                serial_println!(
+                    ":: U11: A11.BIN/B11.BIN already present pre-demo (stale image) — lifecycle demo skipped ::"
+                );
+                return;
+            }
+        }
+        Err(_) => return, // unmountable -> skip silently
+    }
+
+    let Some(fix) = u11_build() else {
+        serial_println!(":: U11: no free address-space slot — lifecycle demo skipped ::");
+        return;
+    };
+    serial_println!(
+        ":: U11: open-file lifecycle — SYS_CLOSE + generation-tagged file-ids (stale sibling to a reused slot -> -EACCES, no rebind) ::"
+    );
+    super::sched::spawn_user_slot("el0-u11close", fix.entry, fix.sp, fix.ttbr0, demo_cpu);
+
+    let vstart = super::timer::cntpct();
+    let vdeadline = 5 * super::timer::cntfrq();
+    while EL0_U11_DONE.load(Ordering::Acquire) < 1
+        && super::timer::cntpct().wrapping_sub(vstart) <= vdeadline
+    {
+        super::sched::yield_now();
+    }
+    let witness = U11_WITNESS.load(Ordering::Acquire);
+    let killed = EL0_U11_KILLED.load(Ordering::Acquire);
+
+    let tstart = super::timer::cntpct();
+    let tdeadline = 2 * super::timer::cntfrq();
+    while !(files_row_is_clear(fix.asid) && handle_row_is_clear(fix.asid))
+        && super::timer::cntpct().wrapping_sub(tstart) <= tdeadline
+    {
+        super::sched::yield_now();
+    }
+    let cleared = files_row_is_clear(fix.asid) && handle_row_is_clear(fix.asid);
+
+    // Kernel-side mechanistic proof of the gen-tag (isolated from disk/EL0 timing) — runs AFTER teardown so
+    // nothing else touches the scratch ASID row.
+    let gen_ok = u11_check_gen_rebind();
+
+    // Kernel-side on-disk checks: A11.BIN was unlinked (GONE) and B11.BIN was created + kept, with its written
+    // content intact (PRESENT) — the close→re-open→read round-trip really returned B11's bytes off disk.
+    let (a_gone, b_present) = match crate::fs::fat::mount() {
+        Ok(fs) => {
+            let a_gone = fs.find_in_root(U11_A_NAME).is_err();
+            let b_present = match fs.find_in_root(U11_B_NAME) {
+                Ok(de) => u9_read16(de.first_cluster(), de.size, 0) == Some(U11_B_PATTERN),
+                Err(_) => false,
+            };
+            (a_gone, b_present)
+        }
+        Err(_) => (false, false),
+    };
+
+    if witness == U11_WITNESS_ALL && cleared && killed == 0 && gen_ok && a_gone && b_present {
+        serial_println!(
+            ":: U11: open-file lifecycle — SYS_CLOSE + gen-tagged file-ids: close/double-close/round-trip OK, stale sibling to a reused slot -EACCES (gen mismatch, no rebind), A11 unlinked + B11 present -> PASS ::"
+        );
+    } else {
+        serial_println!(
+            ":: U11: open-file lifecycle FAIL — witness={:#x} cleared={} killed={} gen_ok={} a_gone={} b_present={} done={} (want {:#x}/true/0/true/true/true/1) ::",
+            witness,
+            cleared,
+            killed,
+            gen_ok,
+            a_gone,
+            b_present,
+            EL0_U11_DONE.load(Ordering::Acquire),
+            U11_WITNESS_ALL
+        );
+    }
+}
+
+/// U11-M2 (defer): release ONE of a fixture's per-step GO words (`off` within its slot window) — the launcher's
+/// sequencing lever. Written through the slot's identity backing + `dsb ish` (the `u7_release_go` idiom,
+/// parameterized by offset so A's read (+0x3010) / close (+0x3018) edges and B's unlink (+0x3000) edge each have
+/// their own word). The whole window is scrubbed at build (`u11defer_build`), so no stale GO releases a step early.
+fn u11defer_release_go(slot: usize, off: usize) {
+    unsafe {
+        let go = super::boot::slot_backing_ptr(slot).add(off) as *mut u64;
+        core::ptr::write_volatile(go, 1);
+        core::arch::asm!("dsb ish", options(nostack, preserves_flags));
+    }
+}
+
+/// U11-M2 (defer): build ONE fixture slot for the shared two-entry defer blob (the `u7_build` shape — scrub the
+/// whole window, copy the blob, I-cache-sync, protect the code page EL0-RX/EL1-RO). `entry_sym` selects program A
+/// or B. `None` if slot allocation fails.
+fn u11defer_build(entry_sym: *const u8) -> Option<U7Fix> {
+    let (base, size) = super::boot::user_region();
+    let sp = (base + size as u64) & !0xF;
+    let bstart = &raw const __u11defer_blob_start as usize;
+    let bend = &raw const __u11defer_blob_end as usize;
+    let blen = bend - bstart;
+    assert!(blen <= super::boot::USER_CODE_SIZE, "U11-defer blob does not fit in a code page");
+    let entry = {
+        let va = base + (entry_sym as usize - bstart) as u64;
+        assert!(va & 3 == 0, "U11-defer fixture entry misaligned");
+        va
+    };
+    let slot = super::boot::alloc_user_slot()?;
+    let backing = super::boot::slot_backing_ptr(slot);
+    unsafe {
+        core::ptr::write_bytes(backing, 0, size);
+        core::ptr::copy_nonoverlapping(bstart as *const u8, backing, blen);
+    }
+    super::cache::icache_sync_range(backing as usize, blen);
+    unsafe { super::boot::protect_user_slot_code(slot, super::boot::USER_CODE_SIZE) };
+    let ttbr0 = super::boot::slot_ttbr0(slot);
+    Some(U7Fix { entry, sp, ttbr0, asid: ttbr0 >> 48, slot })
+}
+
+/// U11-M2 (defer) launcher + verdict — the cross-process unlink-defers-free proof. Rides the same U7 kernel task,
+/// strictly after U11. Two co-located fixtures (`el0-u11defer-a`/`-b` on `demo_cpu`, cooperative via SYS_YIELD)
+/// with this launcher (on the sibling core) as the single SEQUENCER: it releases each choreography edge only
+/// after the prior step's SYS_REPORT cue, and re-mounts the FAT at THREE checkpoints to prove — kernel-side, off
+/// the fixtures' own claims — that B's unlink freed NOTHING while A held the file open, and A's last close freed
+/// the chain (all FAT copies) exactly once.
+///
+///   A creates+writes DEFER.BIN, reports A_OPENED
+///     -> release B's unlink
+///   B opens+unlinks (name gone -> a re-open is -ENOENT), reports B_UNLINKED
+///     -> CHECKPOINT-1: name GONE on disk, chain (cluster `f0`) STILL allocated in all FAT copies -> release A's read
+///   A seeks+reads its ORIGINAL bytes (the deferred chain is alive), reports A_READ
+///     -> CHECKPOINT-2: chain still allocated -> release A's close
+///   A closes (last ref: the deferred free runs) + double-close -> -EBADF; both exit
+///     -> CHECKPOINT-3: chain FREED in all FAT copies + re-allocatable (first-free == `f0`)
+///
+/// PASS iff both witnesses full AND all three cues fired AND both exited AND no kill AND both rows torn down AND
+/// the three on-disk checkpoints hold. Runtime-created file (no arroyo plant); needs a fresh image (DEFER.BIN
+/// absent pre-demo). U11-defer is the last demo — releases no further gate.
+fn u11defer_run(demo_cpu: usize) {
+    static DONE: AtomicBool = AtomicBool::new(false);
+    if DONE.swap(true, Ordering::Relaxed) {
+        return;
+    }
+    if crate::drivers::block::info().is_none() {
+        return; // no SD -> the fixtures cannot create/open disk files; skip silently
+    }
+    // Pre-flight: require DEFER.BIN ABSENT (a stale copy would confound the on-disk checks), and snapshot the
+    // first-free cluster `f0` — A's grow-from-empty write allocates it (first-fit), so `f0` is DEFER.BIN's chain
+    // head, which the three checkpoints track (allocated -> allocated -> freed + re-allocatable).
+    let f0 = match crate::fs::fat::mount() {
+        Ok(fs) => {
+            if fs.find_in_root(U11DEFER_NAME).is_ok() {
+                serial_println!(
+                    ":: U11-defer: DEFER.BIN already present pre-demo (stale image) — defer demo skipped ::"
+                );
+                return;
+            }
+            match fs.first_free_cluster() {
+                Ok(c) => c,
+                Err(_) => {
+                    serial_println!(":: U11-defer: no free cluster pre-demo — defer demo skipped ::");
+                    return;
+                }
+            }
+        }
+        Err(_) => return, // unmountable -> skip silently
+    };
+
+    // Build + spawn A, then B. A creates the file B unlinks, but B parks on its GO word until A has created it,
+    // so the create-before-open ordering is enforced by the launcher (below), not by spawn order.
+    let Some(a) = u11defer_build(&raw const __u11defer_prog_a) else {
+        serial_println!(":: U11-defer: no free address-space slot — defer demo skipped ::");
+        return;
+    };
+    let Some(b) = u11defer_build(&raw const __u11defer_prog_b) else {
+        serial_println!(":: U11-defer: no free address-space slot — defer demo skipped (A will park out) ::");
+        return;
+    };
+    serial_println!(
+        ":: U11-defer: cross-process unlink-defers-free — B unlinks A's open file; chain freed at A's last close ::"
+    );
+    super::sched::spawn_user_slot("el0-u11defer-a", a.entry, a.sp, a.ttbr0, demo_cpu);
+    super::sched::spawn_user_slot("el0-u11defer-b", b.entry, b.sp, b.ttbr0, demo_cpu);
+
+    // Bounded flag-wait (deadline in cntfrq units), yielding cooperatively — the `u7_run` idiom. Returns whether
+    // the flag was set within the deadline.
+    let wait_flag = |flag: &AtomicU32, secs: u64| -> bool {
+        let start = super::timer::cntpct();
+        let deadline = secs * super::timer::cntfrq();
+        while flag.load(Ordering::Acquire) == 0
+            && super::timer::cntpct().wrapping_sub(start) <= deadline
+        {
+            super::sched::yield_now();
+        }
+        flag.load(Ordering::Acquire) != 0
+    };
+    // Fresh-mount FAT snapshot: is DEFER.BIN's chain head `f0` still allocated in ALL FAT copies (non-zero)?
+    let chain_allocated = || -> bool {
+        match crate::fs::fat::mount() {
+            Ok(fs) => {
+                let nf = fs.num_fats();
+                let mut all = true;
+                let mut f = 0;
+                while f < nf {
+                    match fs.fat_entry_copy(f0, f) {
+                        Ok(0) => all = false, // free -> NOT allocated
+                        Ok(_) => {}
+                        Err(_) => all = false,
+                    }
+                    f += 1;
+                }
+                all
+            }
+            Err(_) => false,
+        }
+    };
+
+    // Edge 1: A runs immediately (no GO gate on its open). Wait for A_OPENED, then release B's unlink.
+    let a_opened = wait_flag(&U11DEFER_A_OPENED_F, 5);
+    u11defer_release_go(b.slot, 0x3000);
+    // Edge 2: wait for B_UNLINKED; CHECKPOINT-1 — the NAME is gone on disk, but the chain is STILL allocated.
+    let b_unlinked = wait_flag(&U11DEFER_B_UNLINKED_F, 5);
+    let name_gone_c1 = match crate::fs::fat::mount() {
+        Ok(fs) => fs.find_in_root(U11DEFER_NAME).is_err(),
+        Err(_) => false,
+    };
+    let chain_alive_c1 = chain_allocated();
+    u11defer_release_go(a.slot, 0x3010);
+    // Edge 3: wait for A_READ; CHECKPOINT-2 — the chain is STILL allocated (A read its bytes; nothing was freed).
+    let a_read = wait_flag(&U11DEFER_A_READ_F, 5);
+    let chain_alive_c2 = chain_allocated();
+    u11defer_release_go(a.slot, 0x3018);
+
+    // Verdict: wait for both sentinel exits, read witnesses + kills, wait teardown-clear, then CHECKPOINT-3.
+    let vstart = super::timer::cntpct();
+    let vdeadline = 5 * super::timer::cntfrq();
+    while EL0_U11DEFER_DONE.load(Ordering::Acquire) < 2
+        && super::timer::cntpct().wrapping_sub(vstart) <= vdeadline
+    {
+        super::sched::yield_now();
+    }
+    let a_witness = U11DEFER_A_WITNESS.load(Ordering::Acquire);
+    let b_witness = U11DEFER_B_WITNESS.load(Ordering::Acquire);
+    let done = EL0_U11DEFER_DONE.load(Ordering::Acquire);
+    let killed = EL0_U11DEFER_KILLED.load(Ordering::Acquire);
+
+    let tstart = super::timer::cntpct();
+    let tdeadline = 2 * super::timer::cntfrq();
+    while !(files_row_is_clear(a.asid)
+        && files_row_is_clear(b.asid)
+        && handle_row_is_clear(a.asid)
+        && handle_row_is_clear(b.asid))
+        && super::timer::cntpct().wrapping_sub(tstart) <= tdeadline
+    {
+        super::sched::yield_now();
+    }
+    let cleared = files_row_is_clear(a.asid)
+        && files_row_is_clear(b.asid)
+        && handle_row_is_clear(a.asid)
+        && handle_row_is_clear(b.asid);
+
+    // CHECKPOINT-3: A's last close ran the deferred free — `f0` is now free in ALL FAT copies and re-allocatable
+    // (the first-free cluster is `f0` again, since nothing below it was ever freed). The name was gone since B.
+    let (freed_c3, reusable_c3) = match crate::fs::fat::mount() {
+        Ok(fs) => {
+            let nf = fs.num_fats();
+            let mut freed = true;
+            let mut f = 0;
+            while f < nf {
+                match fs.fat_entry_copy(f0, f) {
+                    Ok(0) => {}
+                    _ => freed = false,
+                }
+                f += 1;
+            }
+            (freed, fs.first_free_cluster() == Ok(f0))
+        }
+        Err(_) => (false, false),
+    };
+
+    let ok = a_opened
+        && b_unlinked
+        && a_read
+        && a_witness == U11DEFER_A_WITNESS_ALL
+        && b_witness == U11DEFER_B_WITNESS_ALL
+        && done == 2
+        && killed == 0
+        && cleared
+        && name_gone_c1
+        && chain_alive_c1
+        && chain_alive_c2
+        && freed_c3
+        && reusable_c3;
+    if ok {
+        serial_println!(
+            ":: U11-defer: cross-process unlink-defers-free — name gone at unlink, reader keeps original bytes, chain freed (all FAT copies) + re-allocatable at last close -> PASS ::"
+        );
+    } else {
+        serial_println!(
+            ":: U11-defer: cross-process unlink-defers-free FAIL — a_w={:#x} b_w={:#x} opened={} unlinked={} read={} done={} killed={} cleared={} c1(gone={},alive={}) c2_alive={} c3(freed={},reuse={}) (want {:#x}/{:#x}/t/t/t/2/0/t/t/t/t/t/t) ::",
+            a_witness,
+            b_witness,
+            a_opened,
+            b_unlinked,
+            a_read,
+            done,
+            killed,
+            cleared,
+            name_gone_c1,
+            chain_alive_c1,
+            chain_alive_c2,
+            freed_c3,
+            reusable_c3,
+            U11DEFER_A_WITNESS_ALL,
+            U11DEFER_B_WITNESS_ALL
+        );
+    }
+}
+
+/// U11-M2 (seat coalesce-review fix): PROVE `files_free_by_dir` frees EVERY orphan chain head when FAT recycles a
+/// deleted-but-still-open file's directory slot for a new file — so two DISTINCT files that end up sharing one
+/// `(dir_lba, dir_off)` in one process (on DIFFERENT `OPEN_FILES` rows) BOTH free their chains on the explicit
+/// `sys_unlink` sweep, with neither leaked. Kernel-side + deterministic (the `u11_check_gen_rebind` style, more
+/// robust than depending on exact cross-process slot-recycle timing in EL0): it PHYSICALLY recycles a slot
+/// (create F, `0xE5` F, create G — asserting G reused F's EXACT slot), reproduces the two-descriptor /
+/// two-pending-row table state on a scratch ASID, runs the real `files_free_by_dir` sweep, and a fresh mount
+/// confirms BOTH cluster chains are free in ALL FAT copies. Runs in the launcher (kernel-task) context, so block
+/// I/O is legal. Returns `true` iff BOTH chains freed (before the fix, the earlier head leaks -> `false`).
+fn u11defer_check_double_orphan() -> bool {
+    const A: u64 = 6; // scratch ASID row (every demo fixture torn down by now — the gen-rebind check's convention)
+    clear_files_row(A);
+    let fs = match crate::fs::fat::mount() {
+        Ok(fs) => fs,
+        Err(_) => return false,
+    };
+    // 1. Create file F + grow it a real cluster (cF), then delete its NAME only (`0xE5`) — cF stays ALLOCATED
+    //    (the cross-process-held-open state), and F's slot is now free for reuse.
+    let (de_f, lba_f, off_f) = match fs.create_in_root("SLTF.BIN", 0x20) {
+        Ok(t) => t,
+        Err(_) => return false,
+    };
+    let c_f = match fs.write_grow(de_f.first_cluster(), de_f.size, lba_f, off_f, 0, &[0xF1u8; 16]) {
+        Ok((_, _, first)) => first,
+        Err(_) => return false,
+    };
+    if fs.mark_dir_deleted(lba_f, off_f).is_err() {
+        return false;
+    }
+    // 2. Create file G — `create_in_root` reuses the FIRST free slot, which is F's just-`0xE5`'d slot (nothing
+    //    else was created between). ASSERT it landed on F's EXACT slot (the shared-key precondition this test
+    //    needs), then grow it a DISTINCT cluster (cG != cF, since cF is still allocated so first-fit skips it).
+    let (de_g, lba_g, off_g) = match fs.create_in_root("SLTG.BIN", 0x20) {
+        Ok(t) => t,
+        Err(_) => return false,
+    };
+    if lba_g != lba_f || off_g != off_f {
+        return false; // G did not reuse F's slot -> the shared-(dir_lba,dir_off) precondition did not hold
+    }
+    let c_g = match fs.write_grow(de_g.first_cluster(), de_g.size, lba_g, off_g, 0, &[0xF2u8; 16]) {
+        Ok((_, _, first)) => first,
+        Err(_) => return false,
+    };
+    if c_f == 0 || c_g == 0 || c_f == c_g {
+        return false; // both files must own DISTINCT real chains
+    }
+    // 3. Reproduce the table state slot-recycling produces: TWO descriptors on ASID A at the SAME (lba_f, off_f),
+    //    on DIFFERENT `OPEN_FILES` rows, each `unlink_pending` with its own chain head. (`openfile_incref`'s
+    //    `unlink_pending`-skip is what puts G on a FRESH row rather than joining F's pending row.)
+    let Some(row_f) = openfile_incref(lba_f, off_f as u32) else {
+        return false;
+    };
+    openfile_mark_unlink_pending_at(row_f as u32, c_f);
+    let Some(fid_f) = files_alloc(A, c_f, 16, lba_f, off_f as u32) else {
+        return false;
+    };
+    FILE_OPENROW[A as usize][fid_f].store(row_f as u32, Ordering::Release);
+    let Some(row_g) = openfile_incref(lba_f, off_f as u32) else {
+        return false;
+    };
+    openfile_mark_unlink_pending_at(row_g as u32, c_g);
+    let Some(fid_g) = files_alloc(A, c_g, 16, lba_f, off_f as u32) else {
+        return false;
+    };
+    FILE_OPENROW[A as usize][fid_g].store(row_g as u32, Ordering::Release);
+    if row_f == row_g {
+        return false; // the skip-pending join must place the two files on DIFFERENT rows
+    }
+    // 4. THE SWEEP: one `files_free_by_dir` matches BOTH descriptors (same slot) and must free BOTH chains.
+    files_free_by_dir(A, lba_f, off_f as u32);
+    // 5. Fresh mount: BOTH cF and cG must be free in ALL FAT copies (re-allocatable). Before the fix the earlier
+    //    head (cF) leaks -> its entry stays nonzero -> `false`.
+    let fs2 = match crate::fs::fat::mount() {
+        Ok(fs) => fs,
+        Err(_) => return false,
+    };
+    let nf = fs2.num_fats();
+    let mut ok = true;
+    let mut f = 0;
+    while f < nf {
+        ok &= fs2.fat_entry_copy(c_f, f) == Ok(0);
+        ok &= fs2.fat_entry_copy(c_g, f) == Ok(0);
+        f += 1;
+    }
+    // 6. Cleanup: the scratch descriptors are already freed by the sweep; clear the row defensively, and `0xE5`
+    //    G's (== F's) slot so no live directory entry lingers pointing at the now-freed cG.
+    clear_files_row(A);
+    let _ = fs2.mark_dir_deleted(lba_f, off_f);
+    ok
+}
+
+/// U11-M2 (seat coalesce-review fix): launcher + PASS line for the slot-recycle two-orphan proof. Rides the U7
+/// kernel task after `u11defer_run`. Kernel-side only (no EL0 fixture — the proof is a deterministic table + FAT
+/// manipulation, the `u11_check_gen_rebind` style). Releases no further gate.
+fn u11reuse_run() {
+    static DONE: AtomicBool = AtomicBool::new(false);
+    if DONE.swap(true, Ordering::Relaxed) {
+        return;
+    }
+    if crate::drivers::block::info().is_none() {
+        return; // no SD -> the check creates real files; skip silently
+    }
+    // Pre-flight: require the scratch files ABSENT (a stale image would confound `create_in_root`'s slot reuse).
+    match crate::fs::fat::mount() {
+        Ok(fs) => {
+            if fs.find_in_root("SLTF.BIN").is_ok() || fs.find_in_root("SLTG.BIN").is_ok() {
+                serial_println!(
+                    ":: U11-reuse: SLTF/SLTG present pre-demo (stale image) — slot-recycle proof skipped ::"
+                );
+                return;
+            }
+        }
+        Err(_) => return,
+    }
+    if u11defer_check_double_orphan() {
+        serial_println!(
+            ":: U11-reuse: sys_unlink slot-recycle — two files sharing a recycled dir slot BOTH free their chains (all FAT copies) -> PASS ::"
+        );
+    } else {
+        serial_println!(
+            ":: U11-reuse: sys_unlink slot-recycle — orphan-head sweep FAIL (a chain leaked or the recycle precondition was not met) ::"
         );
     }
 }

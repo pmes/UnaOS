@@ -1306,35 +1306,60 @@ impl FatFs {
         }
     }
 
+    /// U11-M2: mark a directory entry deleted (first byte -> `0xE5`) via RMW, preserving the rest of the sector.
+    /// Factored out of `delete_located` so the cross-process unlink-defers-free path can make the NAME disappear
+    /// immediately (a subsequent re-open is `-ENOENT`) while the cluster chain stays allocated until the last
+    /// open handle closes. `dir_off` must address a whole 32-byte slot within the sector. This is the crash-
+    /// safety-critical FIRST step of any delete: after it the file is gone from the directory, but its clusters
+    /// are still marked used — a crash here loses clusters (benign, chkdsk-reclaimable), never aliases live data.
+    pub fn mark_dir_deleted(&self, dir_lba: u64, dir_off: usize) -> Result<(), FatError> {
+        if dir_off + 32 > SECTOR_SIZE {
+            return Err(FatError::Io);
+        }
+        let mut buf = [0u8; SECTOR_SIZE];
+        read_sector(dir_lba, &mut buf)?;
+        buf[dir_off] = 0xE5;
+        write_sector(dir_lba, &buf)?;
+        Ok(())
+    }
+
+    /// U11-M2: free every cluster in a file's chain (each FAT entry -> `0`, in ALL FAT copies), returning the
+    /// freed clusters. Factored out of `delete_located` so the deferred (cross-process) path can free the chain
+    /// at the LAST close, separately in time from marking the name deleted. Collects the chain BEFORE freeing
+    /// anything, so a bad chain aborts with nothing freed; freeing low-to-high keeps first-fit reuse
+    /// deterministic. The caller MUST have already made the directory entry unreachable (`mark_dir_deleted`) —
+    /// freeing a chain a live entry still points at would alias. A 0-length file (`first_cluster == 0`) owns no
+    /// clusters, so this is a no-op returning the empty chain.
+    pub fn free_chain(&self, first_cluster: u32) -> Result<alloc::vec::Vec<u32>, FatError> {
+        let chain = self.chain_clusters(first_cluster)?;
+        for &c in &chain {
+            self.set_fat_entry(c, 0)?;
+        }
+        Ok(chain)
+    }
+
     /// U10: DELETE a file whose directory entry is at (`dir_lba`, `dir_off`) and whose chain head is
-    /// `first_cluster`. Order is crash-safety-critical: mark the directory entry deleted (`0xE5`) FIRST, THEN
-    /// free the cluster chain (every entry -> `0`, ALL FAT copies). A crash after the `0xE5` mark but before the
-    /// chain is fully freed leaves the file GONE with some clusters still marked used (lost clusters — benign,
-    /// reclaimable by chkdsk); it can NEVER leave a live directory entry pointing at freed (and possibly
-    /// re-allocated) clusters, which would alias another file's data. Returns the freed clusters (for the
-    /// launcher's re-allocatability check). A 0-length file (`first_cluster == 0`) frees nothing.
+    /// `first_cluster` — the IMMEDIATE (single-syscall) delete. Order is crash-safety-critical: mark the
+    /// directory entry deleted (`0xE5`) FIRST, THEN free the cluster chain (every entry -> `0`, ALL FAT copies).
+    /// A crash after the `0xE5` mark but before the chain is fully freed leaves the file GONE with some clusters
+    /// still marked used (lost clusters — benign, reclaimable by chkdsk); it can NEVER leave a live directory
+    /// entry pointing at freed (and possibly re-allocated) clusters, which would alias another file's data.
+    /// Returns the freed clusters (for the launcher's re-allocatability check). A 0-length file
+    /// (`first_cluster == 0`) frees nothing. U11-M2: this is now exactly `mark_dir_deleted` + `free_chain`; the
+    /// cross-process defer path (`sys_unlink`) calls those two halves at DIFFERENT times (mark at unlink, free at
+    /// the last close). Pre-validates the chain up front so the immediate path keeps its U10 "a bad chain aborts
+    /// with nothing changed" contract byte-for-byte (the write order — dir `0xE5`, then free — is unchanged).
     pub fn delete_located(
         &self,
         dir_lba: u64,
         dir_off: usize,
         first_cluster: u32,
     ) -> Result<alloc::vec::Vec<u32>, FatError> {
-        if dir_off + 32 > SECTOR_SIZE {
-            return Err(FatError::Io);
-        }
-        // Collect the chain BEFORE mutating anything (a bad chain aborts the delete with nothing changed).
-        let chain = self.chain_clusters(first_cluster)?;
-        // 1. Mark the directory entry deleted (first byte -> 0xE5), RMW so the rest of the sector is preserved.
-        let mut buf = [0u8; SECTOR_SIZE];
-        read_sector(dir_lba, &mut buf)?;
-        buf[dir_off] = 0xE5;
-        write_sector(dir_lba, &buf)?;
-        // 2. Free every cluster in the chain (all FAT copies). The entry is already gone, so even a partial free
-        //    only orphans clusters (never aliases). Freeing low-to-high keeps first-fit reuse deterministic.
-        for &c in &chain {
-            self.set_fat_entry(c, 0)?;
-        }
-        Ok(chain)
+        // Pre-validate the chain BEFORE any mutation so a bad chain aborts with nothing changed (the U10
+        // immediate-path contract). `free_chain` re-walks it below; the extra walk is read-only.
+        let _ = self.chain_clusters(first_cluster)?;
+        self.mark_dir_deleted(dir_lba, dir_off)?;
+        self.free_chain(first_cluster)
     }
 
     /// U10: the number of the first FREE data cluster (a bounded read-only first-fit scan), or `NoSpace` if the

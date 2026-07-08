@@ -12,6 +12,131 @@ Legend: **✅ metal-confirmed** · **🔬 QEMU-green, metal pending** · dates I
 
 ## hw-pi4 track — 2026-07-08 (Opus round)
 
+### U11 (M2 / U12) — cross-process unlink-defers-free: a global open-file refcount + deferred chain-free (aarch64) 🔬 `hw-pi4`
+- **What:** closes the SECOND (and last) of U10's two review notes — **cross-process unlink-while-open** (POSIX
+  unlink-defers-free). U10 freed a file's cluster chain the instant `sys_unlink` ran; if ANOTHER process held the
+  file open, its live descriptor kept pointing at a chain a later create+grow could first-fit-reuse — a cross-file
+  read/write + information disclosure. The fix defers the chain-free to the file's LAST close across ALL processes:
+  - **A global (cross-ASID) open-file refcount table** (`OPEN_FILES`, `NOPENFILE = 16` rows, joined by the on-disk
+    identity `(dir_lba, dir_off)`), guarded by a single **`SpinMutex`** — the scheduler's low-level spinlock, NOT
+    the sleeping `Mutex` (which yields, illegal in the IRQ-masked teardown path). One row is shared by every open
+    of a file across every ASID; `refcount` counts its live descriptors. The lock is held ONLY across the short
+    table mutation (±refcount, read the stashed chain head) — NEVER across `mount()`/`free_chain` block I/O.
+  - **`sys_open` increments, `files_free` decrements.** The increment is BEFORE `files_alloc`, so every increment
+    pairs with exactly one decrement — the descriptor's `files_free` (close/teardown) or a one-line
+    `openfile_decref_at` on the `files_alloc`-full unwind — with no path where a decrement lands on a row this open
+    never incremented (an SMP race the after-`files_alloc` ordering would open). A full table on a NEW identity is
+    a clean **`-ENFILE` (`-23`)** with reserve/unwind claim-last on every failure path.
+  - **`sys_unlink` marks + defers.** It writes the directory entry `0xE5` FIRST (`fat::mark_dir_deleted` — the
+    name is GONE immediately, a re-open is `-ENOENT`), marks the refcount row `unlink_pending` + stashes the chain
+    head, then drops all of the caller's descriptors naming the file (`files_free_by_dir`, each decrementing). If
+    the caller is the SOLE opener, the last decrement reaches 0 and frees the chain NOW — byte-identical to U10. If
+    ANOTHER process still holds it open, the refcount stays > 0 and nothing is freed: that process keeps reading
+    its original bytes until its last close.
+  - **`sys_close` frees at the last close.** The decrement that drops an `unlink_pending` file's refcount to 0
+    returns the stashed chain head, and `sys_close`/`sys_unlink` free it (`fat::free_chain`, all FAT copies) in
+    syscall context AFTER releasing the lock — block I/O is legal there.
+  - **`fat::delete_located` split** into `mark_dir_deleted(dir_lba, dir_off)` (the `0xE5` write) + `free_chain(
+    first_cluster)` (the all-FAT-copies chain free); `delete_located` remains their pre-validated composition for
+    the immediate path (the U10 "bad chain → nothing changed" contract holds byte-for-byte).
+- **Tested — QEMU:** `./arroyo kernel8-test 30` → after the U11 (M1) PASS, one new verdict:
+  `:: U11-defer: cross-process unlink-defers-free — name gone at unlink, reader keeps original bytes, chain freed
+  (all FAT copies) + re-allocatable at last close -> PASS ::`. A **two-process** fixture (the U7 GO-word
+  choreography, launcher as the single sequencer): process A (`el0-u11defer-a`) creates + writes + reads
+  `DEFER.BIN`; process B (`el0-u11defer-b`) opens + `SYS_UNLINK`s it while A holds it open. The launcher re-mounts
+  the FAT at THREE checkpoints — after B's unlink the NAME is gone but the chain (cluster `f0`) is STILL allocated
+  in all FAT copies; A then seeks + reads its ORIGINAL 16 bytes back (the deferred chain is alive); after A's last
+  `SYS_CLOSE` the chain is FREED in all FAT copies + re-allocatable (`first_free == f0`). Both A and B drop their
+  handles via explicit syscalls (B's unlink, A's close), so no teardown I/O is needed. **20 PASS** (19 prior +
+  U11-defer), **CAPSTONE 6/6**, only the 3 expected M6b kills, 0 unexpected faults, no leak lines. Every prior
+  verdict **byte-identical** (sorted scratch-worktree baseline diff vs `d0d12ef` — a single appended U11-defer
+  PASS line; the binary-growth `VBAR`/EL0-fault-ELR shift touches only diagnostic addresses, not any verdict).
+  `./arroyo test-arm 22` green (baremetal-gated); `./arroyo check` both arches; **zero x86 files** (the `fat.rs`
+  split is additive — x86 never calls the new writers).
+- **Adversarial review (3 lenses — refcount pairing / double-free+leak+FAT-safety / SMP+teardown lock discipline —
+  with per-finding refuters).** Lock discipline, teardown-I/O-safety, SMP incref ordering, and deadlock lenses all
+  clean. **1 real should-fix, caught + fixed in-arc:** the refcount row was originally keyed only on
+  `(dir_lba, dir_off)`, a directory SLOT which FAT recycles for a new file the moment a delete `0xE5`'s it — so a
+  file created in an unlinked-but-still-open file's reused slot could conflate the two files' refcount + deferred
+  free (a lost-cluster leak / mis-triggered free; not a UAF/disclosure — refcount stayed exact). This is the M1
+  descriptor-slot-reuse hole one level up, which generation tags don't cover. Fixed by (a) excluding
+  `unlink_pending` rows from the open-time join (a `0xE5`'d file can't be re-opened by name, so a key match on a
+  pending row is a different file → claim a fresh row) and (b) recording each descriptor's row INDEX in
+  `FILE_OPENROW`, so every decrement/mark hits that exact row, never a re-searchable key. A targeted re-verify
+  confirmed the fix closes it with no new leak/double-free/stale-index path.
+- **Seat coalesce-review fix (a SECOND, distinct slot-recycle bug; refuted 0/3 — own follow-up commit).** The
+  above fixed the incref/JOIN side; the `sys_unlink` SWEEP side had the same root: `files_free_by_dir` matched
+  descriptors by the recyclable `(dir_lba, dir_off)`, so when ONE process held an unlinked file F open AND created
+  a new file G in F's recycled `0xE5` slot, a `SYS_UNLINK` of G swept BOTH descriptors and both reached
+  `refcount == 0`, but the loop kept only the LAST orphan chain head (`orphan = Some(fc)` overwriting) → the
+  earlier chain leaked. A benign lost-cluster leak on the EXPLICIT path (refcount stayed exact, no UAF/double-free),
+  distinct from the teardown-only honest-scope leak below. Fixed by freeing EVERY orphan head the sweep produces
+  (`files_free_by_dir` is `sys_unlink`-only = block-I/O-legal, so it frees each inline via `free_orphan_chain`; the
+  `OPEN_FILES` lock is never held across the I/O). Proven by a deterministic kernel-side check
+  (`u11defer_check_double_orphan`, the `u11_check_gen_rebind` style — physically recycle a slot asserting G reused
+  F's exact slot, reproduce the two-descriptor/two-pending-row state, run the real sweep, fresh-mount confirm BOTH
+  chains free in all FAT copies): `:: U11-reuse: sys_unlink slot-recycle — two files sharing a recycled dir slot
+  BOTH free their chains (all FAT copies) -> PASS ::`. **Now 21 PASS** (the prior 20 byte-identical + U11-reuse),
+  CAPSTONE 6/6, `./arroyo check` both arches, zero x86 files.
+- **Honest scope — M2a (explicit-close path) lands.** The cross-process defer is proven for the explicit-close
+  path. The teardown DECREMENT is done (a short, I/O-free `SpinMutex` critical section, safe in the IRQ-masked
+  teardown context); but a program that EXITS holding the LAST `unlink_pending` open leaves its chain allocated (a
+  transient lost-cluster leak, logged) — freeing it needs a reaper running in a block-I/O-legal context, which is
+  **M2b** (deferred: it wants a `sched.rs` scheduler hook, outside this arc's lane — STOP-and-report boundary).
+- **Lane:** aarch64 `syscall.rs` + `fs/fat.rs` (the `delete_located` split — additive, reuses `set_fat_entry`/
+  `chain_clusters`) + docs; zero x86 files. `SpinMutex` reused from `sched.rs` (not reimplemented); no `sched.rs`
+  change. 🔬 Metal-pending (pure syscall lifecycle + FAT free; rides the next Pi boundary alongside U10/U11-M1).
+
+### U11 (M1) — open-file lifecycle: `SYS_CLOSE` + generation-tagged file-ids (aarch64) 🔬 `hw-pi4`
+- **What:** gives a `File` descriptor a real end-of-life and a stable identity across slot reuse, closing the FIRST
+  of U10's two review notes — the **same-process sibling-handle rebind on slot reuse**. U10 left a per-task FILES
+  row as a bare `+1`-biased slot index with NO generation, so after an unlink freed a slot (`files_free_by_dir`
+  invalidating a multiply-opened file's descriptors) a later `sys_open` first-fit-REUSED it and a lingering sibling
+  handle silently REBOUND to the different file. The fix is the standard slotmap/generation-index:
+  - **`FILE_GEN[asid][idx]`** — a per-slot generation counter, bumped on every free (`files_free` — the one free
+    primitive `SYS_CLOSE`/`files_free_by_dir`/`sys_open`-unwind all route through — and `clear_files_row` at
+    teardown).
+  - **Packed file-ids** — the `File` handle's value word now carries `(gen << 32) | (idx + 1)` (`file_id_pack`);
+    generation 0 packs to exactly `idx + 1`, byte-identical to the pre-U11 bare file-id.
+  - **`file_desc_validate`** — the SINGLE seam decoding a value word to a live descriptor index (range + `FILE_USED`
+    + **gen == the slot's current gen**). Every File consumer (`sys_read`/`sys_write_file`/`sys_seek`/`sys_unlink`/
+    `sys_close`) funnels through it, so a stale handle to a reused slot is `-EACCES` (a gen mismatch, EVEN when
+    `FILE_USED` is true again) — no rebind, and no per-syscall re-derivation (five open-coded checks → one).
+  - **`SYS_CLOSE = 17`** — resolves the handle for NO right (a close is always permitted on a handle you hold),
+    frees the descriptor slot (bumping the gen), and clears the handle → `0`. A `Console`/`Socket`/`Child` kind is
+    `-EINVAL` (object table untouched — not closeable this arc); an unresolvable / already-closed / stale-slot
+    handle is `-EBADF` (`-9`) — double-close and use-after-close are clean.
+  `handle_resolve` is UNCHANGED (still returns `File(raw)`), so the U6/U9 scaffold checks that resolve File handles
+  directly are byte-identically unaffected; the gen validation lives one layer out. For programs that never close,
+  open→read/write→teardown is byte-identical to U10 (teardown drops the descriptor exactly as a close would).
+- **Tested — QEMU:** `./arroyo kernel8-test 30` → after the U10-delete PASS, one new verdict:
+  `:: U11: open-file lifecycle — SYS_CLOSE + gen-tagged file-ids: close/double-close/round-trip OK, stale sibling to
+  a reused slot -EACCES (gen mismatch, no rebind), A11 unlinked + B11 present -> PASS ::`. A register-only fixture
+  (`el0-u11close`, witness `0x1F`) creates + grow-writes `A11.BIN`, opens it a SECOND time (a sibling descriptor),
+  `SYS_UNLINK`s via the first handle (freeing both A11 descriptors, the sibling left lingering on a freed slot),
+  REUSES the freed slots by opening + writing `B11.BIN`, then proves a read through the STALE sibling is `-EACCES`
+  (the slot is LIVE again for B11, so the denial can ONLY be the stale generation — not a rebind onto B11's bytes),
+  and exercises `SYS_CLOSE` → `0` / double-close → `-EBADF` / close→re-open→read round-trip. A kernel-side
+  `u11_check_gen_rebind` proves the mechanism in isolation on a scratch ASID (claim → mint id → free (bump) →
+  re-claim the same slot → the OLD id is rejected while the slot is live, the FRESH one resolves), and a fresh
+  `mount()` confirms `A11.BIN` gone + `B11.BIN` present with its content. **19 PASS** (18 prior + U11),
+  **CAPSTONE 6/6**, only the 3 expected M6b kills, 0 unexpected faults. Every prior verdict **byte-identical**
+  (sorted scratch-worktree baseline diff vs `ddefc40` — a single appended U11 line; no VBAR/USER_REGION shift
+  surfaced in any verdict). `./arroyo test-arm 22` green (baremetal-gated); `./arroyo check` both arches; **zero
+  x86 files** (the design is the pi4 lead — its x86 twin U11x is a later rmbp arc).
+- **Honest scope:** M1 (generation tags + `SYS_CLOSE`) lands and closes hole 1. **Deferred to the next arc (U11 M2
+  / U12):** the SECOND U10 note — **cross-process unlink-while-open** (POSIX unlink-defers-free) — needs a global
+  cross-ASID `(dir_lba, dir_off)`-keyed open-file refcount + a `fat::delete_located` split. It was NOT half-landed:
+  its blocker is that a program which exits WITHOUT closing must still trigger the deferred chain-free at TEARDOWN,
+  and teardown (`exit` → `teardown_user_slot` → `clear_handle_row`) runs **IRQ-masked, on the dying task's kernel
+  stack, TTBR0 already repointed to the boot root, right before the context-switch away** — doing multi-sector
+  polled SD I/O there (plus a new global Mutex-guarded refcount table + SMP-safety proof) is arc-deep and likely
+  wants a reaper, not inline teardown I/O. The `O_CREAT` ambient-namespace gap stays the future UnaFS ACL arc.
+- **Lane:** aarch64 `syscall.rs` only — no `fat.rs`/`block.rs`/`arroyo` change (the fixture creates its own files).
+- **Metal:** 🔬 QEMU-green, **metal pending** — pure syscall lifecycle (the generation tag + `SYS_CLOSE` are
+  QEMU-provable in full); rides the next Pi 4 boundary alongside the still-pending U10 metal-verify.
+- **Commit:** on `hw-pi4` (Opus-executed) — see git log.
+
 ### U10 — file GROWTH + CREATE + DELETE: cluster allocation, FAT-chain extension, directory mutation (aarch64) 🔬 `hw-pi4`
 - **What:** gives `fat::write_at` (U9's in-place-only writer) an ALLOCATOR, so `CAP_WRITE` can now **extend and
   create** files — the three restrictions U9 kept (never write the FAT, never allocate, never touch a directory)
