@@ -920,15 +920,22 @@ fn jb8_falcon_witness(tag: &str) {
     let cfg = |off: u64| unsafe { core::ptr::read_volatile((XUSB_FPCI + off) as *const u32) };
     let cfg0 = cfg(0x0); // vendor/device id — liveness canary
     let cfg1 = cfg(0x4); // io/mem/busmaster enables
+    let cfg4 = cfg(0x10); // BAR0 — xHC MMIO
     let cfg7 = cfg(0x1c); // BAR2 — routes the ARU/CSB window
-    let bar2 = (cfg7 & !0xfu32) as u64;
+    // Field masks per edk2-nvidia (XUSB_CFG_4 addr = bits [31:15], XUSB_CFG_7 addr = bits [31:16]).
+    // An unprogrammed BAR reads low garbage (metal boot 1 read CFG_7=0x1ff) — a sloppier mask turned
+    // that into a near-zero "address" and the resulting read reset the board. Mask exactly, and only
+    // dereference when the masked base is nonzero AND memory-space decode is on.
+    let mem_en = cfg1 & 0b10 != 0;
+    let bar0 = (cfg4 & 0xffff_8000) as u64;
+    let bar2 = (cfg7 & 0xffff_0000) as u64;
     log::info!(
-        "JB8[{tag}]: FPCI CFG_0={cfg0:#010x} CFG_1={cfg1:#010x} (mem={} busmaster={}) CFG_7={cfg7:#010x}",
-        (cfg1 >> 1) & 1,
+        "JB8[{tag}]: FPCI CFG_0={cfg0:#010x} CFG_1={cfg1:#010x} (mem={} busmaster={}) CFG_4={cfg4:#010x} CFG_7={cfg7:#010x}",
+        mem_en as u32,
         (cfg1 >> 2) & 1
     );
-    if cfg0 == 0xffff_ffff || bar2 == 0 {
-        log::info!("JB8[{tag}]: BAR2 unrouted/block dead — CSB witness skipped");
+    if cfg0 == 0xffff_ffff || bar2 == 0 || !mem_en {
+        log::info!("JB8[{tag}]: BAR2 unrouted / mem-decode off — CSB witness skipped");
         return;
     }
     let r = |off: u64| unsafe { core::ptr::read_volatile((bar2 + off) as *const u32) };
@@ -953,7 +960,6 @@ fn jb8_falcon_witness(tag: &str) {
     // clears within 200 ms (MB2-resident FW), else IFR-DMA-autoboots it. CNR here pre-EBS says
     // which of those worlds this boot lives in (remember CNR is a stale latch post-halt — it is
     // only trustworthy as a "was ready at some point" witness, never as "running now").
-    let bar0 = (cfg(0x10) & !0xfu32) as u64;
     if bar0 != 0 {
         let cap = unsafe { core::ptr::read_volatile(bar0 as *const u32) };
         let usbsts =
