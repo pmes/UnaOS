@@ -849,12 +849,22 @@ out a boot-by-boot bench (cheapest fork first). The Peter-attended bench (JB4 pr
      "missing Falcon clock" and the "wrong CSB routing" hypotheses (clock 269 is already enabled by
      JB1c; the routing is byte-for-byte mainline). The EBS teardown left the core halted; whether a
      power-cycle re-runs its on-chip self-boot is the central bench question (unknowns 2–4).
-   - *edk2-nvidia teardown function.* **[LOW / unconfirmed offline]** The *behavioral* evidence
-     across JB2c/JB3 is unambiguous — the JetPack-6 EBS exit powers down the USB2 pads, shuts the
-     SMMU client port, zeroes the MC SIDs + FPCI `CFG_1`/BARs + ARU routing, and halts the Falcon —
-     but the exact edk2-nvidia routine ("hide device resources at uefi exit") was not pinned to a
-     file/commit from public sources this arc. edk2-nvidia does carry falcon tooling
-     (`Silicon/NVIDIA/Application/FalconUtil`). Recorded as an open citation, not load-bearing.
+   - *edk2-nvidia teardown mechanism: the device-discovery framework's ExitBootServices handler,
+     NOT `PcieControllerDxe`.* **[MEDIUM]** A candidate — `PcieControllerDxe.OnExitBootServices`,
+     which toggles PCIe `PERST#` (`XTL_RC_MGMT_PERST_CONTROL_PERST_O_N`) on nodes with the
+     `nvidia,uefi-exit-reset` DTB property — was VERIFIED against source and **ruled out**: that
+     driver "manages only PCIe root-complex controllers, not XUSB/USB" (`controller@141xxxxx`,
+     NVMe/M.2). The Tegra234 XUSB host is a standalone BPMP-power-gated block whose "FPCI" is an
+     *internal fake-PCI* space — not on the system PCIe root complex — so a root-port `PERST#` never
+     reaches it (and the observed teardown is clocks/SMMU/MC-SID/FPCI/ARU/Falcon, not a `PERST#`
+     pulse). The real teardown is the edk2-nvidia **device-discovery driver framework**: at
+     ExitBootServices it undoes each managed non-discoverable device's `AutoEnableClocks` /
+     `AutoResetModule` bring-up — the SAME mechanism this repo's JB0 (fan PWM clock+reset) and JB2c
+     (USB2 pads) dossiers already pinned, here extended to the XUSB Falcon. This also explains why
+     JB1c's clock+power re-enable does not revive it: re-applying a clock does not restart a Falcon
+     CPU that stopped when its clock was pulled — only a power-domain cycle re-runs the boot-ROM/IFR
+     self-boot (unknown 2). (Verified 2026-07-07 against `PcieControllerDxe.c`; the exact
+     device-discovery source file was not pinned, but the mechanism is corroborated by JB0/JB2c.)
 
 2. **The full reset path — would an `MRQ_RESET` assert/deassert clear the lockdown, and what does it
    wipe?**
