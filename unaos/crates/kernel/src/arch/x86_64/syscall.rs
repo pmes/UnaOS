@@ -75,6 +75,12 @@ const SYS_READ: u64 = 12;
 // as a transfer endpoint — both XFER and RECV from a shared-window caller return -EACCES.
 const SYS_XFER: u64 = 13;
 const SYS_RECV: u64 = 14;
+// U9x: absolute seek on an open File descriptor (the aarch64 pi4 U9 twin; same number). SEEK(handle,
+// offset) -> the new absolute offset, or a negative errno. The CHECK requires a File handle carrying ANY
+// of `CAP_READ|CAP_WRITE`; an offset PAST the file's size is `-EINVAL` (seeking exactly TO size, the EOF
+// position, is legal). A later SYS_READ / File SYS_WRITE resumes from the seeked offset. No I/O — a pure
+// descriptor-state update, so it is IF-masked-handler-safe (the whole x86 staged-storage divergence).
+const SYS_SEEK: u64 = 15;
 
 /// Base of the ring-3 window: 1 TiB — a FRESH top-level slot (PML4 index 2) above the firmware
 /// identity map, so mapping it touches no kernel state. `setup` proves it unmapped before use.
@@ -954,6 +960,134 @@ unsafe extern "C" {
     static unaos_user_u8x_tree: u8;
 }
 
+// --- U9x ring-3 fixture (real File WRITES + SEEK — the aarch64 `__u9_prog_write` twin). ONE fixture
+// (`u9x-write`) exercising the object table's FIRST mutating resource path: it opens a DEDICATED scratch file
+// RW, seeks into it, overwrites a known 16-byte pattern IN PLACE (into its per-descriptor writable staging
+// buffer — the x86 stand-in for pi4's in-place FAT write; see `sys_write_file`), seeks back and reads it
+// through the SAME capability to witness the write landed, and proves the `sys_write` CHECK rejects both an
+// RO-opened File (missing CAP_WRITE — the rights arm) and a non-File handle carrying CAP_WRITE (the kind arm).
+// Register-only apart from the read-back dest: the dest is the DATA page (window page 1) and the write
+// pattern a RO code-page `.ascii` constant, both fixed window VAs — it writes NO user stack, so it is safe on
+// any slot under preemption. `u9x_launcher` pre-endows a `Socket` handle at index 2 carrying CAP_WRITE (the
+// kind negative). The fixture's own RW `SYS_OPEN` first-free-claims index 0 (index 1 = the reserved
+// CONSOLE_FD, never auto-allocated; 2 is pre-endowed); its RO open then claims index 3. It builds a 5-bit
+// witness bitmask (see `U9X_WITNESS_ALL`) and conveys it as its `sys_exit` STATUS, routed BY NAME into
+// `U9X_WITNESS` (x86 has no SYS_REPORT — the u5x/u6bx/u8x idiom). ABI (Linux-style): rax = number, args
+// rdi/rsi/rdx, return in rax; rcx/r11 are the SYSCALL-clobbered pair, so state rides r12-r15/rbx.
+core::arch::global_asm!(
+    r#"
+    .globl unaos_user_u9x_blob_start
+unaos_user_u9x_blob_start:
+    .balign 16
+    .globl unaos_user_u9x_write
+unaos_user_u9x_write:
+    xor r12d, r12d                          // witness bitmask = 0 (survives syscalls)
+    lea r14, [rip + unaos_user_u9x_blob_start] // r14 = window base (blob runs at the code-page base)
+    add r14, 0x1000                         // r14 -> read-back dest (writable DATA page, window page 1)
+    lea r15, [rip + unaos_user_u9x_pattern] // r15 -> the 16-byte write pattern (RO code page; also compare src)
+
+    // (0) SYS_OPEN("SCRATCH.BIN", RW) -> a File handle carrying CAP_READ|CAP_WRITE
+    mov rax, 11                             // SYS_OPEN
+    lea rdi, [rip + unaos_user_u9x_name]    // name ptr (RO code page — ring-3 readable)
+    mov rsi, [rip + unaos_user_u9x_namelen] // name len ("SCRATCH.BIN" = 11)
+    mov rdx, 1                              // mode = RW
+    syscall
+    mov rbx, rax                            // rbx = RW handle (>= 0) or -errno
+    test rbx, rbx
+    js 1f                                   // open failed (negative) -> skip bit0/1/2
+    add r12, 1                              // bit0: open RW OK
+
+    // (1) seek to the scratch offset (520), then overwrite the 16-byte pattern in place
+    mov rax, 15                             // SYS_SEEK
+    mov rdi, rbx
+    mov rsi, 520                            // U9X_WRITE_OFFSET
+    syscall
+    cmp rax, 520                            // seek returns the new absolute offset
+    jne 1f
+    mov rax, 1                              // SYS_WRITE (File + CAP_WRITE -> in-place staged-buffer overwrite)
+    mov rdi, rbx
+    mov rsi, r15                            // src = the 16-byte pattern
+    mov rdx, 16
+    syscall
+    cmp rax, 16                             // wrote exactly 16 bytes?
+    jne 1f
+    add r12, 2                              // bit1: seek + in-place write OK
+
+    // (2) seek back to 520 and read the 16 bytes through the SAME cap; they must equal the pattern
+    mov rax, 15                             // SYS_SEEK back to 520
+    mov rdi, rbx
+    mov rsi, 520
+    syscall
+    cmp rax, 520
+    jne 1f
+    mov rax, 12                             // SYS_READ
+    mov rdi, rbx
+    mov rsi, r14                            // dest buf (data page)
+    mov rdx, 16
+    syscall
+    cmp rax, 16                             // exactly 16 bytes back?
+    jne 1f
+    mov rax, [r14]                          // two 8-byte compares: read-back == the pattern we wrote
+    cmp rax, [r15]
+    jne 1f
+    mov rax, [r14 + 8]
+    cmp rax, [r15 + 8]
+    jne 1f
+    add r12, 4                              // bit2: read-back matches the written pattern
+1:
+    // (3) an RO-opened File (mode=0, CAP_READ only) written to must be denied -> -EACCES (the rights CHECK)
+    mov rax, 11                             // SYS_OPEN SCRATCH.BIN RO
+    lea rdi, [rip + unaos_user_u9x_name]
+    mov rsi, [rip + unaos_user_u9x_namelen]
+    xor edx, edx                            // mode = RO
+    syscall
+    mov r13, rax                            // r13 = RO handle
+    test r13, r13
+    js 2f                                   // RO open failed -> skip bit3
+    mov rax, 1                              // SYS_WRITE through the RO handle
+    mov rdi, r13
+    mov rsi, r15
+    mov rdx, 16
+    syscall
+    cmp rax, -13                            // exactly -EACCES ?
+    jne 2f
+    add r12, 8                              // bit3: RO-open File write -> -EACCES
+2:
+    // (4) a non-File handle (a Socket carrying CAP_WRITE, pre-endowed at index 2) -> -EACCES (the kind CHECK)
+    mov rax, 1                              // SYS_WRITE
+    mov rdi, 2                              // U9X_SOCK_IDX
+    mov rsi, r15
+    mov rdx, 16
+    syscall
+    cmp rax, -13
+    jne 3f
+    add r12, 16                             // bit4: wrong-kind handle write -> -EACCES
+3:
+    mov rax, 2                              // SYS_EXIT(witness) -> routed by name into U9X_WITNESS
+    mov rdi, r12
+    syscall
+4:  jmp 4b                                  // sys_exit never returns; belt-and-braces guard
+
+    .balign 8
+unaos_user_u9x_namelen:
+    .quad unaos_user_u9x_name_end - unaos_user_u9x_name
+unaos_user_u9x_name:
+    .ascii "SCRATCH.BIN"
+unaos_user_u9x_name_end:
+    .balign 8
+unaos_user_u9x_pattern:
+    .ascii "U9x-WRITE-OK-123"
+    .globl unaos_user_u9x_blob_end
+unaos_user_u9x_blob_end:
+"#
+);
+
+unsafe extern "C" {
+    static unaos_user_u9x_blob_start: u8;
+    static unaos_user_u9x_blob_end: u8;
+    static unaos_user_u9x_write: u8;
+}
+
 // --- The SYSCALL entry stub (LSTAR target). Naked; the only assembly in the syscall path.
 //
 // On entry (CPL 0, from SYSCALL): rcx = user RIP, r11 = user RFLAGS, rax = number, rdi/rsi/rdx =
@@ -1172,6 +1306,14 @@ pub fn record_ring3_kill(name: &str, vec: u8, err: u64, cr2: u64) {
         U8X_KILLED.fetch_add(1, Ordering::AcqRel);
         return;
     }
+    // U9x: the File-WRITE fixture is register-only (its only user store is the read-back dest) and
+    // well-behaved; a kill is a real U9x bug — its own counter, never the U1b `killed_unexpected` count. Not
+    // in PROCS (the launcher spawned it, not sys_spawn), so no parent semaphore to post — the launcher times
+    // out to FAIL on `U9X_DONE`.
+    if name == "u9x-write" {
+        U9X_KILLED.fetch_add(1, Ordering::AcqRel);
+        return;
+    }
     let code_end = USER_BASE + PAGE_SIZE; // the code page is the first page of the window only
     let window_end = USER_BASE + USER_WINDOW_PAGES * PAGE_SIZE;
     let expected = match name {
@@ -1219,10 +1361,11 @@ extern "C" fn syscall_dispatch(nr: u64, a0: u64, a1: u64, a2: u64) -> i64 {
         SYS_SPAWN => sys_spawn(),
         SYS_WAIT => sys_wait(a0),
         SYS_CAP => sys_cap(a0, a1, a2),
-        SYS_OPEN => sys_open(a0, a1),
+        SYS_OPEN => sys_open(a0, a1, a2),
         SYS_READ => sys_read(a0, a1, a2),
         SYS_XFER => sys_xfer(a0, a1, a2),
         SYS_RECV => sys_recv(),
+        SYS_SEEK => sys_seek(a0, a1),
         SYS_EXIT => {
             // U7x: the transfer fixtures exit BY NAME, BEFORE the Proc short-circuit below — the CHILD
             // has a launcher-PLANTED Proc entry (the pid->slot map sys_xfer resolves its dest through),
@@ -1329,6 +1472,14 @@ extern "C" fn syscall_dispatch(nr: u64, a0: u64, a1: u64, a2: u64) -> i64 {
                     U8X_WITNESS.store(a0 as u32, Ordering::Release);
                     U8X_DONE.fetch_add(1, Ordering::AcqRel);
                 }
+                Some("u9x-write") => {
+                    // U9x: the File-WRITE fixture conveys its 5-bit witness bitmask as its exit STATUS (routed
+                    // by name, the same u5x/u6bx/u8x idiom — x86 has no SYS_REPORT). No planted Proc entry (a
+                    // single register-only fixture; the kernel-side revoke check plants its own scratch row),
+                    // so it takes the ordinary by-name path. `U9X_DONE` gates the launcher's read.
+                    U9X_WITNESS.store(a0 as u32, Ordering::Release);
+                    U9X_DONE.fetch_add(1, Ordering::AcqRel);
+                }
                 Some(n) if n.starts_with("u3-") => {
                     // U3 per-process-CR3 fixture task exiting (its own accounting, so the U1a/U1b
                     // default counts stay byte-for-byte). The readback verdict reads slot memory.
@@ -1348,10 +1499,14 @@ extern "C" fn syscall_dispatch(nr: u64, a0: u64, a1: u64, a2: u64) -> i64 {
     }
 }
 
-/// SYS_WRITE(fd, buf, len): copy `len` bytes from the ring-3 buffer to the serial console; returns
-/// the count written, or a negative errno.
+/// SYS_WRITE(fd, buf, len): write `len` bytes from the ring-3 buffer, returning the count written or a
+/// negative errno. U9x makes this KIND-DISPATCHED at the single CAP_WRITE CHECK (the aarch64 U9 twin): a
+/// `Console` handle streams to the serial console (byte-identical to before); a `File` handle carrying
+/// CAP_WRITE overwrites its per-descriptor writable staging buffer IN PLACE at the descriptor's offset via
+/// `sys_write_file` — a pure memcpy, IF-masked-handler-safe (no disk I/O in the SYSCALL handler; see the
+/// STAGED WRITE-BACK note above `sys_write_file`).
 ///
-/// The pointer is a ring-3 VA that (identity map) equals the kernel VA, so the kernel reads it
+/// The console pointer is a ring-3 VA that (identity map) equals the kernel VA, so the kernel reads it
 /// directly — BUT it is UNTRUSTED, so it is bound-checked against the user window before the deref:
 /// a ring-3 caller must not be able to point `buf` at kernel RAM (exfiltration out the console) or
 /// at unmapped memory (a ring-0 fault). Full copy_from_user is a later arc; this closes the hole
@@ -1361,15 +1516,16 @@ extern "C" fn syscall_dispatch(nr: u64, a0: u64, a1: u64, a2: u64) -> i64 {
 /// BSP-quiet window (see `await_verdict`), so the best-effort console lock is uncontended here and
 /// the line is not dropped.
 fn sys_write(fd: u64, buf: u64, len: u64) -> i64 {
-    // U5x: `fd` is a HANDLE INDEX into the caller's per-process table, not the ambient POSIX stdout. It
-    // must resolve to a CONSOLE resource carrying CAP_WRITE. No such handle / wrong kind / missing
-    // CAP_WRITE all yield -EACCES — the enforcement point (subsuming U1a's `fd != 1 -> -EBADF`). A
-    // printing process is endowed this cap at spawn/launch (`install_console_cap`): the shared window at
-    // `setup()` (U1a/U1b/U2) and each spawned child in `sys_spawn`, so every prior print still lands; a
-    // process WITHOUT it gets -EACCES (the U5x negative). The pointer validation below is unchanged, so
-    // a hostile pointer still yields -EFAULT.
-    match handle_resolve(caller_row(), fd, CAP_WRITE) {
-        Ok(HandleTarget::Console) => {}
+    // U5x/U9x: `fd` is a HANDLE INDEX into the caller's per-process table, not the ambient POSIX stdout. It
+    // must resolve to a resource carrying CAP_WRITE. No such handle / a File LACKING CAP_WRITE (an RO open) /
+    // a non-{Console,File} kind all yield -EACCES — the single enforcement point (subsuming U1a's `fd != 1 ->
+    // -EBADF`; the U8x derivation/revocation walk rides inside `handle_resolve`, so a revoked File-write cap
+    // is -EACCES here too). A `Console` is endowed at spawn/launch (`install_console_cap`) and streams below;
+    // a `File` with CAP_WRITE routes to the in-place staged-buffer writer. A hostile pointer still -> -EFAULT.
+    let row = caller_row();
+    match handle_resolve(row, fd, CAP_WRITE) {
+        Ok(HandleTarget::Console) => {} // fall through to the console-streaming path below
+        Ok(HandleTarget::File(file_id)) => return sys_write_file(row, file_id, buf, len),
         _ => return EACCES,
     }
     let window = USER_WINDOW_PAGES * PAGE_SIZE;
@@ -1390,6 +1546,95 @@ fn sys_write(fd: u64, buf: u64, len: u64) -> i64 {
     };
     serial_print!("{}", text);
     written as i64
+}
+
+/// U9x: the File half of `sys_write` — an IN-PLACE overwrite at the descriptor's offset, into the
+/// descriptor's per-descriptor WRITABLE staging buffer (the write twin of `sys_read`'s staged-source read).
+/// The CHECK already passed in `sys_write` (a `File` handle carrying CAP_WRITE, non-revoked), so this decodes
+/// the file-id -> descriptor, clamps the write to the bytes left to EOF (NEVER grows the file), validates the
+/// WHOLE source up front (a bad buffer is -EFAULT with no copy and NO offset move), and memcpys the bytes into
+/// the writable buffer at `offset` — a pure in-memory copy, safe in the IF-masked SYSCALL handler (the whole
+/// reason x86 STAGES the write instead of driving the xHCI BOT pump in-handler; see the STORAGE / IF NOTE at
+/// the pre-stage buffer). M1 scope: purely in-memory — a read-back through the same cap witnesses it; there is
+/// NO disk write-back here (that is M2, a BSP-side flush pump). The exact write twin of `sys_read`: same
+/// decode, same up-front clamp/validate, same offset discipline. No create/grow/truncate — a write at/after
+/// EOF writes 0 bytes (a later arc adds allocation).
+fn sys_write_file(row: usize, file_id: u64, buf: u64, len: u64) -> i64 {
+    // Decode the file-id -> descriptor index (undo the +1 bias) and re-check presence (defense in depth: a
+    // live File handle always has a live descriptor, but never trust the value word blindly — mirrors sys_read).
+    let Some(idx) = (file_id as usize).checked_sub(1) else {
+        return EACCES;
+    };
+    if idx >= NFILE || !FILE_USED[row][idx].load(Ordering::Acquire) {
+        return EACCES;
+    }
+    // A File+CAP_WRITE descriptor is always RW-opened, so it owns a writable staging slot (FILE_WSTAGE holds
+    // the +1-biased pool index). A File+CAP_WRITE handle with NO writable buffer (FILE_WSTAGE == 0) is a kernel
+    // setup bug (an RO descriptor endowed CAP_WRITE out of band) — fail closed, never fabricate a write target.
+    let Some(widx) = (FILE_WSTAGE[row][idx].load(Ordering::Acquire) as usize).checked_sub(1) else {
+        return EIO;
+    };
+    let size = FILE_SIZE[row][idx].load(Ordering::Acquire);
+    let offset = FILE_OFFSET[row][idx].load(Ordering::Acquire);
+    // In-place only: clamp the write to the bytes left from `offset` to EOF. `offset <= size` always (reads/
+    // writes clamp; seek rejects past size), so `size - offset` cannot underflow; a write at/after EOF is 0
+    // bytes (never grows the file). `want == 0` is a clean no-op that moves no offset.
+    let want = core::cmp::min(len as usize, size.saturating_sub(offset) as usize);
+    if want == 0 {
+        return 0;
+    }
+    // Validate the WHOLE source range up front — inside the user window, READABLE (the code page is RX, so a
+    // source there, e.g. the fixture's RO pattern constant, is legal; only WRITE destinations must exclude the
+    // code page). A bad buffer is -EFAULT with no copy and no offset move; overflow is rejected.
+    let window = USER_WINDOW_PAGES * PAGE_SIZE;
+    let end = buf.wrapping_add(want as u64);
+    if end < buf || buf < USER_BASE || end > USER_BASE + window {
+        return EFAULT;
+    }
+    // Pure memcpy: user bytes -> the writable staging buffer at [offset, offset+want). The ring-3 VA equals the
+    // kernel VA in the live CR3 (the sys_write/sys_read discipline), and offset+want <= size <= the buffer
+    // length (WSTAGE is seeded to `size` at open), so the store stays inside the descriptor's own buffer.
+    wstage_write_at(widx, offset as usize, buf, want);
+    // want <= size - offset, so offset + want <= size — the FILE_OFFSET <= FILE_SIZE invariant holds.
+    FILE_OFFSET[row][idx].store(offset + want as u32, Ordering::Release);
+    want as i64
+}
+
+/// SYS_SEEK(handle, offset) -> the new absolute offset, or a negative errno (U9x; the aarch64 pi4 U9 twin).
+/// Absolute seek on an open File descriptor: the CHECK requires a `File` handle carrying ANY of
+/// CAP_READ|CAP_WRITE. `handle_resolve` requires ALL bits in `req`, so "any of" is expressed by resolving for
+/// CAP_READ, else for CAP_WRITE — whichever right is present (and the File kind, and — via `handle_resolve` —
+/// no revoked ancestor) admits the seek; a non-File kind / no handle / a revoked cap all give `-EACCES`. An
+/// offset PAST `size` is `-EINVAL` (seeking exactly TO `size`, the EOF position, is legal). Sets FILE_OFFSET;
+/// a later SYS_READ / File SYS_WRITE resumes from it. No I/O — a pure descriptor-state update (so it is safe in
+/// the IF-masked SYSCALL handler).
+fn sys_seek(handle: u64, offset: u64) -> i64 {
+    let row = caller_row();
+    // The CHECK: a File carrying CAP_READ OR CAP_WRITE (either admits a seek), non-revoked. The double resolve
+    // expresses "any of" over `handle_resolve`'s all-bits-in-`req` semantics without reading the sidecars raw.
+    let file_id = match handle_resolve(row, handle, CAP_READ) {
+        Ok(HandleTarget::File(id)) => id,
+        _ => match handle_resolve(row, handle, CAP_WRITE) {
+            Ok(HandleTarget::File(id)) => id,
+            _ => return EACCES,
+        },
+    };
+    // Decode the file-id -> descriptor index (undo the +1 bias) and re-check presence (defense in depth).
+    let Some(idx) = (file_id as usize).checked_sub(1) else {
+        return EACCES;
+    };
+    if idx >= NFILE || !FILE_USED[row][idx].load(Ordering::Acquire) {
+        return EACCES;
+    }
+    let size = FILE_SIZE[row][idx].load(Ordering::Acquire);
+    // Absolute seek: an offset PAST the file's size is invalid; seeking exactly TO `size` (the EOF position, a
+    // legal 0-byte read/write point) is allowed. Preserves the FILE_OFFSET <= FILE_SIZE invariant. `size` is a
+    // u32, so `offset <= size` guarantees the cast is exact and the return fits a non-negative i64.
+    if offset > size as u64 {
+        return EINVAL;
+    }
+    FILE_OFFSET[row][idx].store(offset as u32, Ordering::Release);
+    offset as i64
 }
 
 /// Per-CPU SYSCALL/SYSRET + NX/SMEP setup. Called once per CPU (BSP in `arch::init`, each AP in
@@ -2175,23 +2420,46 @@ fn stage_hello() -> bool {
 // unwind open, the teardown-clear) is byte-for-byte the pi4 twin; ONLY the source of the bytes differs.
 // Arbitrary-runtime-file open awaits an interrupt-driven / IF-safe storage path (deferred).
 
-/// The staged-file NAME table: index k names the source `staged_bytes(k)` serves. ONE entry today —
-/// HELLO.BIN, the buffer `stage_hello` fills for sys_spawn (shared; written once, then read-only). A
-/// future file rides by adding its name here + a stage buffer + a `staged_bytes` arm.
-const STAGED_NAMES: [&str; 1] = ["HELLO.BIN"];
+/// U9x: the DEDICATED writable scratch file the File-WRITE fixture opens + overwrites (NEVER `HELLO.BIN`,
+/// which other fixtures load as EL0 code). M1 stages it PURELY IN-MEMORY — a const seed, always present
+/// regardless of disk (the honest self-contained core: no disk write-back). M2 replaces this in-memory seed
+/// with a BSP-staged, disk-backed buffer + a flush pump. 11 chars (<= `MAX_NAME`); the fixture's namelen
+/// matches. The aarch64 twin's `U9_SCRATCH_NAME`.
+const U9X_SCRATCH_NAME: &str = "SCRATCH.BIN";
+/// U9x: the in-memory scratch file's byte size (the EOF bound writes/seeks clamp against). 1024 bytes, so the
+/// fixture's write offset (520) lands 8 bytes into the SECOND 512-byte sector — a partial-sector overwrite
+/// (the interesting case for M2's disk write-back: the sector's other bytes must survive). The aarch64 twin's
+/// `U9_SCRATCH_SIZE`.
+const U9X_SCRATCH_SIZE: usize = 1024;
+/// U9x: the filler byte the in-memory scratch seed carries — a distinctive non-pattern value, so a read-back
+/// of the written region provably differs from the pre-image. Matches the pi4 image plant (`arroyo`).
+const U9X_SCRATCH_FILL: u8 = 0xEE;
+/// U9x: the in-memory scratch SEED — the read-only initial content of `SCRATCH.BIN` (`staged_bytes(1)`). A RW
+/// open COPIES this into a per-descriptor writable staging buffer (writes land there, in place); an RO open
+/// serves it directly. Const-initialized, so it is always "staged" in M1 with no disk dependency.
+static U9X_SCRATCH_SEED: [u8; U9X_SCRATCH_SIZE] = [U9X_SCRATCH_FILL; U9X_SCRATCH_SIZE];
+
+/// The staged-file NAME table: index k names the source `staged_bytes(k)` serves. Index 0 = HELLO.BIN (the
+/// buffer `stage_hello` fills for sys_spawn; shared, written once, then read-only). Index 1 = SCRATCH.BIN
+/// (U9x's writable scratch — the in-memory seed above). A future file rides by adding its name here + a stage
+/// buffer + a `staged_bytes` arm.
+const STAGED_NAMES: [&str; 2] = ["HELLO.BIN", U9X_SCRATCH_NAME];
 /// Upper bound on a SYS_OPEN name (the aarch64 twin's `MAX_NAME`): a dotted 8.3 name is at most 12 bytes.
 const MAX_NAME: usize = 12;
 
 /// The staged bytes behind staged-file `idx`, or `None` if that stage has not published. Index 0 =
 /// HELLO.BIN = `HELLO_BYTES[..HELLO_LEN]`, gated by `HELLO_STAGED` (Acquire, pairing with the
 /// `stage_hello` Release) — written ONCE on the BSP before any consumer could hold a descriptor, then
-/// read-only, so the returned slice is stable for the rest of the boot (the sys_spawn contract).
+/// read-only, so the returned slice is stable for the rest of the boot (the sys_spawn contract). Index 1 =
+/// SCRATCH.BIN = the U9x const seed (always present in M1 — no disk dependency; it is the READ-ONLY seed a RW
+/// open copies from, not the live writable buffer, which is per-descriptor via `wstage_bytes`).
 fn staged_bytes(idx: u32) -> Option<&'static [u8]> {
     match idx {
         0 if HELLO_STAGED.load(Ordering::Acquire) => {
             let len = HELLO_LEN.load(Ordering::Acquire);
             Some(unsafe { core::slice::from_raw_parts((&raw const HELLO_BYTES).cast::<u8>(), len) })
         }
+        1 => Some(&U9X_SCRATCH_SEED),
         _ => None,
     }
 }
@@ -2213,8 +2481,9 @@ fn staged_lookup(name: &str) -> Option<(u32, u32)> {
 // any instant — a row is populated ONLY before its task is dispatched (`u6bx_launcher`'s pre-endow) or BY
 // that one task mid-syscall (IF-masked), and cleared at teardown after the task exits — so the
 // Release/Acquire discipline is belt-and-braces (the HANDLE_RIGHTS twin). Presence is a dedicated
-// `FILE_USED` flag (NOT an overloaded index sentinel), so descriptor 0 is representable. Read-only,
-// sequential (no seek) — the arc's scope, mirroring pi4 U6b. ---
+// `FILE_USED` flag (NOT an overloaded index sentinel), so descriptor 0 is representable. U9x adds absolute
+// SEEK + File WRITES (into a per-descriptor writable staging buffer), so these sidecars now back a mutable,
+// randomly-addressable descriptor — the aarch64 U9 twin's model. ---
 const NFILE: usize = 4; // open files per task (small, static — the demo opens at most two per row)
 
 /// Per-descriptor presence: `true` == `[row][idx]` holds a live open file. Claimed (CAS false->true) in
@@ -2229,17 +2498,116 @@ static FILE_STAGED: [[AtomicU32; NFILE]; crate::arch::memory::USER_SLOTS + 1] =
 /// The open file's total byte size (the EOF bound `sys_read` clamps against). Meaningful only where `FILE_USED`.
 static FILE_SIZE: [[AtomicU32; NFILE]; crate::arch::memory::USER_SLOTS + 1] =
     [const { [const { AtomicU32::new(0) }; NFILE] }; crate::arch::memory::USER_SLOTS + 1];
-/// The sequential read offset — advanced by exactly the count each `sys_read` delivers. Meaningful only
-/// where `FILE_USED`. No seek this arc: the offset only ever moves forward.
+/// The sequential read/write offset — advanced by exactly the count each `sys_read`/`sys_write` delivers,
+/// or set absolutely by `SYS_SEEK` (U9x). Meaningful only where `FILE_USED`. Always kept `<= FILE_SIZE`:
+/// reads/writes clamp to the bytes remaining, and `sys_seek` rejects an offset past `size` with `-EINVAL`.
 static FILE_OFFSET: [[AtomicU32; NFILE]; crate::arch::memory::USER_SLOTS + 1] =
     [const { [const { AtomicU32::new(0) }; NFILE] }; crate::arch::memory::USER_SLOTS + 1];
+/// U9x: the open file's WRITABLE staging-pool slot, `+1`-biased (`0` == a READ-ONLY descriptor with no
+/// writable buffer). Set by `files_alloc` when a File is opened RW; a File `SYS_WRITE` overwrites
+/// `WSTAGE_BUF[wstage-1]` in place, and `SYS_READ` serves from it (read-back witnesses writes). The x86
+/// stand-in for pi4's on-disk backing — pi4 writes straight to FAT in-handler (PIO), x86 CANNOT (the
+/// IF-masked handler / hlt-ing xHCI BOT pump), so the write lands in this in-memory buffer instead. M2 adds
+/// the BSP flush pump that persists it to FAT. Meaningful only where `FILE_USED`.
+static FILE_WSTAGE: [[AtomicU32; NFILE]; crate::arch::memory::USER_SLOTS + 1] =
+    [const { [const { AtomicU32::new(0) }; NFILE] }; crate::arch::memory::USER_SLOTS + 1];
+
+// --- U9x writable staging pool: the write twin of the read-only staged set. A small fixed pool of
+// per-descriptor writable buffers. A File opened RW (SYS_OPEN mode bit0) claims a slot SEEDED from the
+// file's staged content; a File SYS_WRITE overwrites it IN PLACE at the descriptor's offset (a pure memcpy,
+// IF-masked-handler-safe); a SYS_READ through the same descriptor serves from it, so a read-back through the
+// SAME cap witnesses the write. Per-slot single-writer: a slot is claimed by ONE descriptor at a time
+// (`WSTAGE_USED` CAS), SEEDED before its File handle installs (no concurrent reader yet), then read/written
+// only by that descriptor's owning task mid-syscall (IF-masked). M1 scope: purely in-memory — no disk
+// write-back (that is M2). One page max per buffer (the staged size bound); `NWSTAGE` bounds concurrent
+// writable opens (the demo needs one). ---
+const NWSTAGE: usize = 2;
+/// Per-slot presence: `true` == the pool slot holds a live writable buffer. Claimed (CAS false->true) in
+/// `wstage_alloc`, cleared in `wstage_free`. The single source of truth for "is this pool slot in use".
+static WSTAGE_USED: [AtomicBool; NWSTAGE] = [const { AtomicBool::new(false) }; NWSTAGE];
+/// Each writable buffer's live byte length (== the file's size; writes are in-place and never grow it, so
+/// this is fixed for the buffer's lifetime). Meaningful only where `WSTAGE_USED`.
+static WSTAGE_LEN: [AtomicU32; NWSTAGE] = [const { AtomicU32::new(0) }; NWSTAGE];
+/// The writable buffers themselves — one page each. `static mut` + raw-pointer access mirrors `HELLO_BYTES`;
+/// per-slot single-writer (above) makes the access race-free without a lock. Flat row-major layout: slot k
+/// occupies bytes [k*PAGE_SIZE, (k+1)*PAGE_SIZE).
+static mut WSTAGE_BUF: [[u8; PAGE_SIZE as usize]; NWSTAGE] = [[0; PAGE_SIZE as usize]; NWSTAGE];
+
+/// Claim a free writable-staging slot and SEED it from `seed` (the file's staged content, capped at one
+/// page — the staged size bound guarantees `seed.len() <= PAGE_SIZE`). Returns the pool index, or `None` if
+/// the pool is full. Called from `sys_open` on a RW open, BEFORE the descriptor/handle are installed, so no
+/// concurrent reader can observe a half-seeded buffer.
+fn wstage_alloc(seed: &[u8]) -> Option<usize> {
+    // A writable buffer is exactly one page; a seed larger than that cannot be represented — reject (the RW
+    // open then returns `-EMFILE`) rather than silently truncate, which would leave `FILE_SIZE` (the full
+    // staged size) > the buffer length and let a near-EOF write clamp against `FILE_SIZE` run PAST the slot's
+    // page. Every staged file is <= PAGE_SIZE today (HELLO.BIN is one-page-bounded at stage time; SCRATCH.BIN
+    // is 1 KiB), so this never fires in M1 — it is a defensive guard keeping `FILE_SIZE == WSTAGE_LEN <=
+    // PAGE_SIZE` for every RW descriptor, the invariant `sys_write_file`'s in-bounds memcpy relies on.
+    if seed.len() > PAGE_SIZE as usize {
+        return None;
+    }
+    let n = seed.len();
+    for k in 0..NWSTAGE {
+        if WSTAGE_USED[k].compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire).is_ok() {
+            // Seed the buffer from the staged content, then publish the length (Release) after the copy.
+            unsafe {
+                let dst = (&raw mut WSTAGE_BUF).cast::<u8>().add(k * PAGE_SIZE as usize);
+                core::ptr::copy_nonoverlapping(seed.as_ptr(), dst, n);
+            }
+            WSTAGE_LEN[k].store(n as u32, Ordering::Release);
+            return Some(k);
+        }
+    }
+    None
+}
+
+/// Release writable-staging slot `widx` — clears the length then drops `WSTAGE_USED` LAST (Release), so the
+/// slot is never seen free with a stale length. Called from `files_free`/`clear_files_row` when the owning
+/// descriptor is released or its slot is torn down (no writable buffer outlives its descriptor).
+fn wstage_free(widx: usize) {
+    debug_assert!(widx < NWSTAGE, "wstage_free: out of range");
+    WSTAGE_LEN[widx].store(0, Ordering::Release);
+    WSTAGE_USED[widx].store(false, Ordering::Release);
+}
+
+/// The live bytes behind writable-staging slot `widx` (its current content, `WSTAGE_LEN` bytes) — what a
+/// SYS_READ serves for a RW descriptor. Stable-length (writes are in-place), single-writer per slot.
+fn wstage_bytes(widx: usize) -> &'static [u8] {
+    debug_assert!(widx < NWSTAGE, "wstage_bytes: out of range");
+    let len = WSTAGE_LEN[widx].load(Ordering::Acquire) as usize;
+    unsafe {
+        let base = (&raw const WSTAGE_BUF).cast::<u8>().add(widx * PAGE_SIZE as usize);
+        core::slice::from_raw_parts(base, len)
+    }
+}
+
+/// Overwrite writable-staging slot `widx` IN PLACE: copy `len` bytes from user VA `buf` to the buffer at
+/// `offset`. The caller (`sys_write_file`) has already clamped `offset + len <= WSTAGE_LEN <= PAGE_SIZE` and
+/// validated `buf..buf+len` inside the user window, so the copy stays inside this slot's page and the ring-3
+/// VA equals the kernel VA in the live CR3. A pure memcpy — no disk, IF-masked-handler-safe.
+fn wstage_write_at(widx: usize, offset: usize, buf: u64, len: usize) {
+    debug_assert!(widx < NWSTAGE && offset + len <= PAGE_SIZE as usize, "wstage_write_at: out of range");
+    unsafe {
+        let dst = (&raw mut WSTAGE_BUF).cast::<u8>().add(widx * PAGE_SIZE as usize).add(offset);
+        core::ptr::copy_nonoverlapping(buf as *const u8, dst, len);
+    }
+}
+
+/// True iff the entire writable-staging pool is free — the U9x teardown-clear verifier (the writable twin of
+/// `files_row_is_clear`): read by `u9x_launcher` after the fixture exits and its slot retires, proving no
+/// writable buffer leaked (every RW open's slot returned to the pool on teardown).
+fn wstage_all_free() -> bool {
+    (0..NWSTAGE).all(|k| !WSTAGE_USED[k].load(Ordering::Acquire))
+}
 
 /// Claim the first free descriptor in the caller's FILES row for a freshly-opened file, returning its
-/// index (the caller biases it to the file-id `idx + 1`). Publishes staged-idx/size/offset after the
-/// `FILE_USED` CAS claim — safe because a resolver only reaches a descriptor via a File HANDLE, which
-/// `sys_open` installs strictly AFTER this returns (stored Release regardless, belt-and-braces — the pi4
-/// `files_alloc` discipline). `None` if the row is full (-> `-EMFILE`; never grown).
-fn files_alloc(row: usize, staged_idx: u32, size: u32) -> Option<usize> {
+/// index (the caller biases it to the file-id `idx + 1`). `wstage` is the `+1`-biased writable-staging slot
+/// for a RW open (`0` for a RO open). Publishes staged-idx/size/offset/wstage after the `FILE_USED` CAS
+/// claim — safe because a resolver only reaches a descriptor via a File HANDLE, which `sys_open` installs
+/// strictly AFTER this returns (stored Release regardless, belt-and-braces — the pi4 `files_alloc`
+/// discipline). `None` if the row is full (-> `-EMFILE`; never grown).
+fn files_alloc(row: usize, staged_idx: u32, size: u32, wstage: u32) -> Option<usize> {
     debug_assert!(row < FILE_USED.len(), "files_alloc: row out of range");
     for k in 0..NFILE {
         if FILE_USED[row][k].compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire).is_ok()
@@ -2247,6 +2615,7 @@ fn files_alloc(row: usize, staged_idx: u32, size: u32) -> Option<usize> {
             FILE_STAGED[row][k].store(staged_idx, Ordering::Release);
             FILE_SIZE[row][k].store(size, Ordering::Release);
             FILE_OFFSET[row][k].store(0, Ordering::Release);
+            FILE_WSTAGE[row][k].store(wstage, Ordering::Release);
             return Some(k);
         }
     }
@@ -2254,10 +2623,16 @@ fn files_alloc(row: usize, staged_idx: u32, size: u32) -> Option<usize> {
 }
 
 /// Release descriptor `idx` in the caller's FILES row — the unwind for a `sys_open` that allocated a
-/// descriptor but then failed to install its handle (the sys_spawn reserve/unwind discipline). Clears the
-/// fields then drops `FILE_USED` LAST (Release), so the slot is never seen free with stale fields.
+/// descriptor but then failed to install its handle (the sys_spawn reserve/unwind discipline), and the
+/// per-handle drop `sys_cap_revoke` performs on a File. Clears the fields then drops `FILE_USED` LAST
+/// (Release), so the slot is never seen free with stale fields. U9x: a RW descriptor's writable staging slot
+/// is freed too (no writable buffer outlives its descriptor — pi4's backing is the disk; x86's is the pool).
 fn files_free(row: usize, idx: usize) {
     debug_assert!(row < FILE_USED.len() && idx < NFILE, "files_free: out of range");
+    if let Some(widx) = (FILE_WSTAGE[row][idx].load(Ordering::Acquire) as usize).checked_sub(1) {
+        wstage_free(widx);
+    }
+    FILE_WSTAGE[row][idx].store(0, Ordering::Release);
     FILE_STAGED[row][idx].store(0, Ordering::Release);
     FILE_SIZE[row][idx].store(0, Ordering::Release);
     FILE_OFFSET[row][idx].store(0, Ordering::Release);
@@ -2265,11 +2640,16 @@ fn files_free(row: usize, idx: usize) {
 }
 
 /// Clear an ENTIRE per-task open-file row at teardown — the file twin of `clear_handle_row`'s handle wipe
-/// (which calls this). Presence dropped last per descriptor, so no torn intermediate looks live. `slot`
-/// is a PRIVATE slot (0..USER_SLOTS); `SHARED_ROW` is never torn down (its opens persist, like its caps).
+/// (which calls this). Presence dropped last per descriptor, so no torn intermediate looks live. U9x: each
+/// descriptor's writable staging slot is freed too. `slot` is a PRIVATE slot (0..USER_SLOTS); `SHARED_ROW`
+/// is never torn down (its opens persist, like its caps).
 fn clear_files_row(slot: usize) {
     debug_assert!(slot < crate::arch::memory::USER_SLOTS, "clear_files_row: not a private slot");
     for k in 0..NFILE {
+        if let Some(widx) = (FILE_WSTAGE[slot][k].load(Ordering::Acquire) as usize).checked_sub(1) {
+            wstage_free(widx);
+        }
+        FILE_WSTAGE[slot][k].store(0, Ordering::Release);
         FILE_STAGED[slot][k].store(0, Ordering::Release);
         FILE_SIZE[slot][k].store(0, Ordering::Release);
         FILE_OFFSET[slot][k].store(0, Ordering::Release);
@@ -2286,18 +2666,21 @@ fn files_row_is_clear(row: usize) -> bool {
     (0..NFILE).all(|k| !FILE_USED[row][k].load(Ordering::Acquire))
 }
 
-/// SYS_OPEN(name_ptr, name_len) -> a handle index, or a negative errno. The FIRST resource-OPEN through
-/// the object table (the aarch64 U6b twin): validate + copy the name, look it up in the STAGED set,
-/// record an open-file descriptor in the caller's FILES row, and install a `File` handle (first-free)
-/// carrying `CAP_READ` — the capability a later SYS_READ presents.
+/// SYS_OPEN(name_ptr, name_len, mode) -> a handle index, or a negative errno. The FIRST resource-OPEN through
+/// the object table (the aarch64 U6b/U9 twin): validate + copy the name, look it up in the STAGED set, record
+/// an open-file descriptor in the caller's FILES row, and install a `File` handle (first-free). U9x: `mode`
+/// bit0 selects the rights the handle carries — `0` (RO, as U6bx) = `CAP_READ`; `1` (RW) =
+/// `CAP_READ | CAP_WRITE`, the write cap a File `SYS_WRITE` presents, PLUS a per-descriptor WRITABLE staging
+/// buffer (seeded from the file's staged content) that writes land in and reads serve from. (Higher `mode`
+/// bits are reserved and ignored — no O_CREAT/O_TRUNC: create/grow are a later arc.)
 ///
-/// Ordering mirrors the twin (and sys_spawn): every fallible READ-ONLY lookup first (name bound/copy,
-/// staged lookup), so a failure there returns with nothing to unwind; RESOURCES claimed last (a
-/// descriptor, then a handle). The one failure that must unwind is a full handle table AFTER a descriptor
-/// was claimed — `files_free` it, then `-EAGAIN`. Errnos: `-EINVAL` (bad name length), `-EFAULT` (name
-/// range outside the window), `-ENOENT` (not in the staged set — non-UTF-8 names match nothing),
-/// `-EMFILE` (FILES row full), `-EAGAIN` (handle table full).
-fn sys_open(name_ptr: u64, name_len: u64) -> i64 {
+/// Ordering mirrors the twin (and sys_spawn): every fallible READ-ONLY lookup first (name bound/copy, staged
+/// lookup), so a failure there returns with nothing to unwind; RESOURCES claimed last (a RW open's writable
+/// staging slot, then a descriptor, then a handle), each failure unwinding the prior claims — no leaked slot
+/// on any path. Errnos: `-EINVAL` (bad name length), `-EFAULT` (name range outside the window), `-ENOENT`
+/// (not in the staged set — non-UTF-8 names match nothing), `-EMFILE` (no writable staging slot, or the
+/// FILES row full), `-EAGAIN` (handle table full).
+fn sys_open(name_ptr: u64, name_len: u64, mode: u64) -> i64 {
     let row = caller_row();
     // 1. Bound + copy the name — the sys_write pointer discipline: the WHOLE range inside the user
     //    window (overflow rejected), then a bounded direct read (ring-3 VA == kernel VA in the live CR3).
@@ -2319,19 +2702,40 @@ fn sys_open(name_ptr: u64, name_len: u64) -> i64 {
     let Some((sidx, size)) = staged_lookup(name) else {
         return ENOENT;
     };
-    // 3. Claim resources LAST — a descriptor, then a handle. Only a full handle table needs unwinding.
-    let Some(fid) = files_alloc(row, sidx, size) else {
+    // 3. Claim resources LAST — for a RW open, a writable staging slot FIRST (seeded from the file's staged
+    //    content, so a read before any write sees the original bytes), then a descriptor, then a handle. RO
+    //    (bit0 clear) keeps the U6bx read-only path: no writable slot, `CAP_READ` only.
+    let rw = mode & 1 != 0;
+    let wstage = if rw {
+        // The staged content is the seed. staged_lookup already proved it Some, so this is Some too.
+        let Some(seed) = staged_bytes(sidx) else {
+            return ENOENT;
+        };
+        match wstage_alloc(seed) {
+            Some(w) => (w + 1) as u32,
+            None => return EMFILE, // the writable staging pool is full (too many concurrent RW opens)
+        }
+    } else {
+        0
+    };
+    let Some(fid) = files_alloc(row, sidx, size, wstage) else {
+        if let Some(w) = (wstage as usize).checked_sub(1) {
+            wstage_free(w); // FILES row full — release the writable slot we just claimed (no leak)
+        }
         return EMFILE; // this task's open-file row is full
     };
     let file_id = (fid + 1) as u64; // +1 bias: never the value word's 0 (Empty) / u64::MAX (RESERVING)
     let Some(h) = handle_install(row, HANDLE_RESERVING) else {
-        files_free(row, fid); // no handle slot — release the descriptor we just claimed (no leak)
+        files_free(row, fid); // no handle slot — release the descriptor (and its writable slot); no leak
         return EAGAIN;
     };
-    // Publish the kind + rights, then the live file-id LAST (Release) — a resolver that observes the live
-    // value also observes File + CAP_READ. Single-writer over this row (mid-syscall); belt-and-braces.
+    // U9x: RW mode (bit0) endows CAP_WRITE alongside CAP_READ, so a File `SYS_WRITE` through this handle passes
+    // the CAP_WRITE CHECK; RO keeps the U6bx read-only cap. Publish the kind + rights, then the live file-id
+    // LAST (Release) — a resolver that observes the live value also observes File + its rights. Single-writer
+    // over this row (mid-syscall); belt-and-braces.
+    let rights = if rw { CAP_READ | CAP_WRITE } else { CAP_READ };
     handle_set_kind(row, h, KIND_FILE);
-    handle_set_rights(row, h, CAP_READ);
+    handle_set_rights(row, h, rights);
     handle_set(row, h, file_id);
     h as i64
 }
@@ -2341,9 +2745,10 @@ fn sys_open(name_ptr: u64, name_len: u64) -> i64 {
 /// a `File`. A missing right (`Denied`), a non-File kind (Console/Child/Socket), or no handle (Empty/oob)
 /// ALL return `-EACCES` — the single enforcement point, the twin of `sys_write`'s Console+CAP_WRITE. Then
 /// it clamps the request to the bytes left from the descriptor's offset, validates the WHOLE destination
-/// up front (a bad buffer is `-EFAULT` with no copy and NO offset change), serves the bytes from the
-/// staged source (the honest x86 divergence — see the section note), and advances the offset by exactly
-/// the count delivered. Sequential — no seek.
+/// up front (a bad buffer is `-EFAULT` with no copy and NO offset change), serves the bytes from the source
+/// (U9x: a RW descriptor's per-descriptor writable staging buffer — so a read-back witnesses prior writes; a
+/// RO descriptor's read-only staged source, the honest x86 divergence — see the section note), and advances
+/// the offset by exactly the count delivered. The offset is set by `SYS_SEEK` (U9x) or advanced sequentially.
 fn sys_read(handle: u64, buf: u64, len: u64) -> i64 {
     let row = caller_row();
     // The CHECK: File + CAP_READ, or -EACCES. Identical shape to sys_write's Console + CAP_WRITE resolve.
@@ -2391,15 +2796,21 @@ fn sys_read(handle: u64, buf: u64, len: u64) -> i64 {
             break (offset, want); // the range [offset, offset+want) is now exclusively ours
         }
     };
-    // Serve from the staged source (written once, read-only — stable across the whole boot).
-    let Some(src) = staged_bytes(FILE_STAGED[row][idx].load(Ordering::Acquire)) else {
-        return EIO; // a live descriptor over an unstaged source is a kernel bug; fail closed
+    // U9x: serve from the descriptor's WRITABLE staging buffer if it has one (a RW open — so a read-back
+    // witnesses prior writes through the same cap), else the read-only staged source (a RO open — written
+    // once, stable across the whole boot). Both are stable-length: the writable buffer's length is fixed at
+    // open (writes are in-place, never grow), the staged source never shrinks.
+    let src: &[u8] = match (FILE_WSTAGE[row][idx].load(Ordering::Acquire) as usize).checked_sub(1) {
+        Some(widx) => wstage_bytes(widx),
+        None => match staged_bytes(FILE_STAGED[row][idx].load(Ordering::Acquire)) {
+            Some(s) => s,
+            None => return EIO, // a live RO descriptor over an unstaged source is a kernel bug; fail closed
+        },
     };
-    // offset..offset+want lies inside the staged bytes: `size` was captured from this same source at
-    // open, the source never shrinks (written once), and offset only advances by claimed counts. The
-    // defensive clamp keeps even a violated assumption from over-reading the source (the claim above
-    // already advanced the offset by `want`; a short `got` here is an impossible-source-shrink fail-safe,
-    // not a real path).
+    // offset..offset+want lies inside `src`: `size` was captured from this same source at open, the source
+    // never shrinks, and offset only advances by claimed counts. The defensive clamp keeps even a violated
+    // assumption from over-reading the source (the claim above already advanced the offset by `want`; a short
+    // `got` here is an impossible-source-shrink fail-safe, not a real path).
     let got = core::cmp::min(want, src.len().saturating_sub(offset as usize));
     if got == 0 {
         return 0; // treat a (impossible) source shrink as EOF rather than over-read
@@ -3936,6 +4347,30 @@ static U8X_DONE: AtomicU32 = AtomicU32::new(0);
 /// A killed U8x fixture — a real bug (it is register-only and well-behaved). Off the U1b counter.
 static U8X_KILLED: AtomicU32 = AtomicU32::new(0);
 
+// --- U9x demo accounting (real File writes + seek; the single-process fixture's witness + the kernel-side
+// revoked-cap-write check, read by the launcher's verdict). The aarch64 U9 twin. ---
+/// The handle index `u9x_launcher` pre-endows: a `Socket` carrying `CAP_WRITE` — the kind negative (a
+/// non-File object WITH the write right is still `-EACCES`, denied purely on kind, since `sys_write` serves
+/// Console/File only). Off index 0 (the fixture's own RW open first-free-claims it) and off `CONSOLE_FD`. The
+/// `mov rdi, 2` operand in `unaos_user_u9x_write` MUST match.
+const U9X_SOCK_IDX: usize = 2;
+/// The full witness bitmask the File-WRITE fixture reports (as its exit status): bit0 open-RW OK
+/// (`SYS_OPEN("SCRATCH.BIN", RW)` -> handle >= 0), bit1 seek+write OK (`SYS_SEEK` to the scratch offset then
+/// `SYS_WRITE` -> the pattern length), bit2 read-back matches (seek back, `SYS_READ` -> the just-written
+/// bytes, proving the in-place overwrite landed and is visible through the SAME cap), bit3 an RO-opened File
+/// write -> `-EACCES` (the CAP_WRITE rights CHECK), bit4 a non-File handle (a `Socket` carrying `CAP_WRITE`)
+/// write -> `-EACCES` (the kind CHECK). `u9x_launcher` PASSes iff it equals `U9X_WITNESS_ALL` AND the
+/// kernel-side revoked-cap-write denial held. Must match the `add r12, {1,2,4,8,16}` steps in
+/// `unaos_user_u9x_write`.
+const U9X_WITNESS_ALL: u32 = 0x1F;
+/// The U9x fixture's final witness bitmask (its `sys_exit` status, routed by name — the u5x/u6bx/u8x idiom).
+static U9X_WITNESS: AtomicU32 = AtomicU32::new(0);
+/// The U9x fixture (`u9x-write`) reached its witness exit (want 1). Read by `u9x_launcher`'s bounded wait.
+static U9X_DONE: AtomicU32 = AtomicU32::new(0);
+/// A killed U9x fixture — a real bug (it is register-only apart from its read-back dest store). Off the U1b
+/// counter (a kill here fails only the U9x verdict, never a phantom U1b regression).
+static U9X_KILLED: AtomicU32 = AtomicU32::new(0);
+
 /// U4x fixture run parameters: the parent's + orphan's ring-3 entry VAs (both inside the shared window
 /// VA — only the slot FRAME differs, via CR3), the shared initial user rsp, and each fixture's slot
 /// CR3. Two tasks, two DISTINCT slots (hence distinct handle-table rows — the isolation the ownership
@@ -4542,7 +4977,7 @@ pub fn u6bx_launcher(demo_cpu: usize) {
     //     the prior teardown of this slot); if it somehow did, leave the index Empty — the fixture's read
     //     still gets -EACCES (via NoHandle) and nothing leaks (the row rides teardown either way).
     let staged_sz = HELLO_LEN.load(Ordering::Acquire) as u32;
-    if let Some(fid) = files_alloc(u6b.slot, 0, staged_sz) {
+    if let Some(fid) = files_alloc(u6b.slot, 0, staged_sz, 0) {
         install_cap(u6b.slot, U6BX_NOCAP_IDX, KIND_FILE, (fid + 1) as u64, 0);
     }
     // 3b. The kind negative: a Socket handle carrying CAP_READ — it HAS the right, so the read is denied
@@ -4990,7 +5425,9 @@ fn u8_kernel_check() -> bool {
 /// WITH `CAP_REVOKE`, index 3 = one WITHOUT); wait (bounded) for its witness exit; wait (bounded) for its
 /// teardown (row clear + the derivation ledger drained — the tombstone-cascade proof); run the kernel-side
 /// cross-process checks (which need the clear ledgers); PASS iff witness == `U8X_WITNESS_ALL` AND torn down
-/// AND no kill AND the kernel checks held. U8x is the last demo — it releases no further gate.
+/// AND no kill AND the kernel checks held. Then it chains `u9x_launcher` (the File-WRITE demo) in program
+/// order — the same one-task chaining `u7x_launcher` uses for `u8x_launcher`, so U9x's lines land after the
+/// U8x verdict and its slot has freed.
 fn u8x_launcher(demo_cpu: usize) {
     // One-shot (the U7x launcher is spawned once; guard defensively anyway).
     static DONE: AtomicBool = AtomicBool::new(false);
@@ -5045,6 +5482,165 @@ fn u8x_launcher(demo_cpu: usize) {
             killed,
             U8X_DONE.load(Ordering::Acquire),
             U8X_WITNESS_ALL
+        );
+    }
+
+    // Chain the U9x File-WRITE demo in program order (the `u7x_launcher` -> `u8x_launcher` idiom): every U8x
+    // exit path above falls through to here, and the U8x fixture's slot has torn down (its verdict waited on
+    // teardown), so a slot is free for U9x. U9x gates on the block device itself, so the no-storage control
+    // path stays free of U9x lines too.
+    u9x_launcher(demo_cpu);
+}
+
+/// Build the U9x fixture slot — the `u8x_build` shape for the U9x blob (allocate, scrub the WHOLE window, copy
+/// the blob into its RX-RO code page through the identity alias, return the run params). `None` if slot
+/// allocation fails. Does NOT pre-endow (the launcher does, before dispatch).
+fn u9x_build() -> Option<U7xFix> {
+    let slot = crate::arch::memory::alloc_user_space()?;
+    let bstart = &raw const unaos_user_u9x_blob_start as usize;
+    let bend = &raw const unaos_user_u9x_blob_end as usize;
+    let blen = bend - bstart;
+    assert!(blen as u64 <= PAGE_SIZE, "U9x blob does not fit in a code page");
+    let off = (&raw const unaos_user_u9x_write as usize - bstart) as u64;
+    let backing = crate::arch::memory::slot_backing_ptr(slot);
+    unsafe {
+        core::ptr::write_bytes(backing, 0, (USER_WINDOW_PAGES * PAGE_SIZE) as usize);
+        core::ptr::copy_nonoverlapping(bstart as *const u8, backing, blen);
+    }
+    Some(U7xFix {
+        entry: USER_BASE + off,
+        sp: USER_BASE + USER_WINDOW_PAGES * PAGE_SIZE - 16,
+        cr3: crate::arch::memory::slot_cr3(slot),
+        slot,
+    })
+}
+
+/// The U9x kernel-side revocation check — the "a U8x-revoked File cap write is `-EACCES`" denial, staged over a
+/// scratch row (5 — every demo fixture has exited and torn down by the time this runs, and `u8_kernel_check`
+/// dropped its own plants, so the row is provably clear). `sys_write`'s File gate is `handle_resolve(row, fd,
+/// CAP_WRITE)`, so proving that resolve is `Err` after the ancestor is revoked IS proving the write returns
+/// `-EACCES`. Backs a REAL writable File descriptor (a wstage-seeded open, exactly what a RW `SYS_OPEN` mints)
+/// so the pre-revoke cap would genuinely write; the post-revoke denial then provably comes from the derivation
+/// walk. Drops everything planted and demands the handle / file / writable-pool / derivation ledgers all clear
+/// (no node/descriptor/buffer leaked). The aarch64 `u9_check_revoked_write` twin (minus the disk re-read — M1
+/// has no disk write-back).
+fn u9x_check_revoked_write() -> bool {
+    const A: usize = 5; // scratch row (provably clear here — the fixture uses a freshly-alloc'd slot; u8_kernel_check dropped its plants)
+    let mut ok = true;
+    // Back a REAL writable File descriptor: seed a writable staging slot from SCRATCH.BIN's staged content
+    // (what a RW `SYS_OPEN` does), so the ROOT cap names a genuine open file a write through WOULD land in.
+    let Some(seed) = staged_bytes(1) else {
+        return false; // SCRATCH.BIN not staged — cannot stage a writable descriptor (an M1 kernel bug)
+    };
+    let Some(w) = wstage_alloc(seed) else {
+        return false;
+    };
+    let Some(fid) = files_alloc(A, 1, seed.len() as u32, (w + 1) as u32) else {
+        wstage_free(w);
+        return false;
+    };
+    let file_id = (fid + 1) as u64;
+    // A ROOT File cap carrying CAP_WRITE|CAP_GRANT|CAP_REVOKE at index 2 (off index 0/CONSOLE_FD, the U8x idiom).
+    install_cap(A, 2, KIND_FILE, file_id, CAP_WRITE | CAP_GRANT | CAP_REVOKE);
+    // Pre-revoke: the root File+CAP_WRITE cap resolves — a `sys_write` through it WOULD pass the CHECK.
+    ok &= matches!(handle_resolve(A, 2, CAP_WRITE), Ok(HandleTarget::File(id)) if id == file_id);
+    // Derive a child File+CAP_WRITE (records the derivation edge + back-fills the root's node).
+    let g = sys_cap_grant(A, 2, CAP_WRITE as u64);
+    ok &= g >= 0;
+    // Pre-revoke: the DERIVED File+CAP_WRITE cap also resolves — a write through it WOULD land too.
+    if g >= 0 {
+        ok &= matches!(handle_resolve(A, g as u64, CAP_WRITE), Ok(HandleTarget::File(_)));
+    }
+    // Revoke the ROOT (index 2 carries CAP_REVOKE) -> kills the derivation subtree; the revoke clears index 2
+    // AND — because it is a File handle — frees the shared descriptor + its writable staging slot.
+    ok &= sys_cap_revoke(A, 2) == 0;
+    // THE DENIAL: the derived File+CAP_WRITE cap is now stale — its next CAP_WRITE resolve (exactly the CHECK
+    // `sys_write` performs) is `-EACCES`. This is the "a U8x-revoked File cap write -> -EACCES" proof.
+    if g >= 0 {
+        ok &= handle_resolve(A, g as u64, CAP_WRITE).is_err();
+    }
+    // Drop everything planted; index 2 was already cleared by the revoke (freeing the descriptor + writable
+    // slot), so clearing the derived handle drops the last node (the root's tombstone cascades free). Then
+    // demand every ledger clear — no handle / descriptor / writable-pool / derivation node leaked on any path.
+    if g >= 0 {
+        handle_clear(A, g as usize);
+    }
+    ok &= handle_row_is_clear(A) && files_row_is_clear(A) && wstage_all_free() && deriv_all_free();
+    ok
+}
+
+/// U9x launcher + verdict — chained off `u8x_launcher` in program order (see its note). Flow: one-shot guard;
+/// skip silently with no block device (the control-path discipline — U9x's M1 write path is purely in-memory
+/// and needs no disk, but the gate keeps the no-storage path free of demo lines, exactly as U8x does; QEMU
+/// provides USB mass-storage, so the gate opens); build + pre-endow the kind negative (index 2 = a `Socket`
+/// carrying `CAP_WRITE`) + spawn the single fixture (`u9x-write`); wait (bounded) for its witness exit; wait
+/// (bounded) for its teardown (FILES row + writable pool + handle row all clear); run the kernel-side
+/// revoked-cap-write denial. PASS iff witness == `U9X_WITNESS_ALL` AND torn down AND no kill AND the revoke
+/// check held. U9x is the last demo — it releases no further gate.
+///
+/// M1 scope note: the write path is a STAGED in-place overwrite of an in-memory per-descriptor buffer — a
+/// read-back through the SAME cap (fixture bit2) is the write witness. There is NO on-disk "sector changed"
+/// check here (that is M2's disk write-back + raw re-read), and it CANNOT be metal-confirmed on the rMBP (the
+/// xHCI storage-enumeration blocker means the block device is absent on metal, so this whole demo SKIPS there,
+/// exactly as U8x does) — QEMU-green is the ceiling.
+fn u9x_launcher(demo_cpu: usize) {
+    // One-shot (reached once via the U8x chain; guard defensively anyway).
+    static DONE: AtomicBool = AtomicBool::new(false);
+    if DONE.swap(true, Ordering::Relaxed) {
+        return;
+    }
+    // No block device -> keep the no-storage control path free of demo lines (mirrors every prior gate).
+    if crate::drivers::block::info().is_none() {
+        return;
+    }
+    let Some(fix) = u9x_build() else {
+        serial_println!(":: U9x: no free address-space slot — File-write demo skipped ::");
+        return;
+    };
+    // The kind negative: a Socket carrying CAP_WRITE at U9X_SOCK_IDX. It HAS the right, so a File `sys_write`
+    // is denied purely on kind (write serves Console/File only) — the kind arm, not the rights arm. A scaffold
+    // id, never dereferenced.
+    install_cap(fix.slot, U9X_SOCK_IDX, KIND_SOCKET, 0x200, CAP_WRITE);
+    serial_println!(
+        ":: U9x: real File writes — SYS_SEEK + File+CAP_WRITE routed through a staged in-place overwrite ::"
+    );
+    crate::arch::sched::spawn_user_in_space("u9x-write", fix.entry, fix.sp, demo_cpu, fix.cr3);
+
+    // Wait (bounded, yielding) for the fixture's witness exit, then snapshot the witness.
+    let vdeadline = crate::arch::ticks() + 5000;
+    while U9X_DONE.load(Ordering::Acquire) < 1 && crate::arch::ticks() < vdeadline {
+        crate::arch::sched::yield_now();
+    }
+    let witness = U9X_WITNESS.load(Ordering::Acquire);
+    let killed = U9X_KILLED.load(Ordering::Acquire);
+
+    // Teardown proof: the fixture exited holding two live descriptors (its RW + RO opens; the RW one owns a
+    // writable staging slot) and the pre-endowed Socket handle, so its exit cleared BOTH the FILES row (with
+    // its writable slot) and the handle row. Poll bounded; false->true.
+    let tdeadline = crate::arch::ticks() + 2000;
+    while !(files_row_is_clear(fix.slot) && handle_row_is_clear(fix.slot) && wstage_all_free())
+        && crate::arch::ticks() < tdeadline
+    {
+        crate::arch::sched::yield_now();
+    }
+    let cleared = files_row_is_clear(fix.slot) && handle_row_is_clear(fix.slot) && wstage_all_free();
+
+    // Kernel-side revoked-File-write denial (needs a clear scratch row — every fixture has torn down by here).
+    let revoke_ok = u9x_check_revoked_write();
+
+    if witness == U9X_WITNESS_ALL && cleared && killed == 0 && revoke_ok {
+        serial_println!(
+            ":: U9x: real File writes — open-RW+seek+write+readback OK, RO-write/wrong-kind/revoked-cap all -EACCES (staged in-place, no disk write-back this milestone) -> PASS ::"
+        );
+    } else {
+        serial_println!(
+            ":: U9x: real File writes FAIL — witness={:#x} cleared={} killed={} revoke={} done={} (want {:#x}/true/0/true/1) ::",
+            witness,
+            cleared,
+            killed,
+            revoke_ok,
+            U9X_DONE.load(Ordering::Acquire),
+            U9X_WITNESS_ALL
         );
     }
 }

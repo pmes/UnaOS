@@ -69,7 +69,61 @@ Legend: **✅ metal-confirmed** · **🔬 QEMU-green, metal pending** · dates I
   ALLOCATES + MUTATES the FAT and directory on a real card — the metal-risk beyond U9's single in-place sector
   (multi-sector zero-fill, both-FAT mirrored writes, directory RMW).** The launchers' fresh-mount re-read is the
   proof; the boundary should re-copy pristine `GROW.BIN` (0xC1, 512 B) between runs, as U9 does for `SCRATCH.BIN`.
-- **Commit:** on `hw-pi4` (Opus-executed) — M1 `a10c4b5`, M2 `5f1b0a3`, M3 `d02fb9c`.
+- **Commit:** on `hw-pi4` (Opus-executed) — M1 `a10c4b5`, M2 `5f1b0a3`, M3 `d02fb9c`, review fixes `dac149a`, docs `45bff90`.
+
+## hw-rmbp track — 2026-07-08 (U9x — File writes + seek, the pi4 U9 twin, Opus-executed)
+
+### U9x M1 — real File writes + seek on x86 as a STAGED WRITE-BACK: `SYS_SEEK`, RW `SYS_OPEN`, File+`CAP_WRITE`-routed `sys_write` into a per-descriptor in-memory buffer (x86) 🔬 `hw-rmbp`
+- **What:** the x86 twin of pi4 U9 — gives U6bx's read-only `File`+`CAP_READ` its WRITE half, structurally
+  faithful to the pi4 lead at the CAPABILITY layer and diverging ONLY where the hardware forces it. **The
+  load-bearing divergence (the same one U6bx's read side pays):** aarch64 U9 writes straight to the SD card
+  INSIDE the SVC handler (its EMMC2 driver is PIO). x86 CANNOT — storage is USB-over-xHCI whose BOT pump
+  `hlt()`s awaiting async completion, and the SYSCALL handler runs IF-masked (SFMASK clears IF), so a `hlt`
+  at IF=0 never wakes: no disk I/O in-handler. So the write is **STAGED** — the write twin of the staged read.
+  (1) **`SYS_SEEK = 15`** — a near-verbatim mirror of aarch64 `sys_seek`: File + ANY of `CAP_READ|CAP_WRITE`,
+  `-EINVAL` strictly past size (seeking TO size is legal), sets `FILE_OFFSET` (now settable). (2) **RW
+  `SYS_OPEN`** — a mode bit in `a2` (`0` = RO/`CAP_READ`, byte-identical to U6bx; `1` = RW/`CAP_READ|CAP_WRITE`;
+  backward-safe because the first-entry GPR scrub zeroes `rdx`, so the old U6bx open reads mode 0). A RW open
+  claims a per-descriptor **writable staging buffer** from a small fixed pool (`NWSTAGE`, one page each,
+  per-slot single-writer, `static mut` mirroring `HELLO_BYTES`), SEEDED from the file's staged content and
+  tracked by a `+1`-biased `FILE_WSTAGE` sidecar; reserve/unwind is claim-last (slot→descriptor→handle) on
+  every failure path. (3) **Routed writes** — `sys_write` is KIND-DISPATCHED at its single
+  `handle_resolve(row, fd, CAP_WRITE)` CHECK: a `Console` streams to serial (byte-identical), a `File` with
+  `CAP_WRITE` overwrites its writable buffer IN PLACE at the descriptor offset via `sys_write_file` — a pure
+  **memcpy** (IF-masked-handler-safe), clamped to `min(len, size-offset)` (never grows), whole source
+  validated up front (`-EFAULT` with no offset move), offset advanced by the count written. (4) **Read-back
+  through the SAME cap** — `sys_read` serves a RW descriptor from its writable buffer, so a seek-back-and-read
+  WITNESSES the write. The CHECK inherits U7x/U8x for free (the derivation/revocation walk lives inside
+  `handle_resolve`, so a revoked write-cap is `-EACCES` at the write with no new code). **Three denials:** a
+  File opened RO written to (rights arm), a non-File `Socket` carrying `CAP_WRITE` (kind arm), and a
+  U8x-revoked File-write cap all `-EACCES`.
+- **Honest scope — M1: IN-MEMORY ONLY, NO DISK WRITE-BACK.** `SCRATCH.BIN` is a const in-memory seed (1 KiB
+  of `0xEE`, always present regardless of disk), NOT read from FAT; the read-back is the write witness — there
+  is no on-disk "sector changed" check. **M2** (deferred, the completing twin) adds: capturing the FAT cluster
+  chain at stage time + a per-descriptor dirty flag + a BSP-side write-back flush pump (reusing the existing
+  shell-proven `fat::write_at`→`block::write_block` path from the polled main loop, IF=1) + planting
+  `SCRATCH.BIN` on the x86 FAT image. M1 landed as a complete, honest capability milestone rather than
+  half-landing the flush. Also deferred: file growth/create/delete/truncate; directory mutation; IF-safe
+  interrupt-driven x86 storage (retires the staged-buffer divergence for both read and write); UnaFS
+  `grants:*` on `SYS_OPEN` (K2/K3).
+- **Tested — QEMU:** `UNAOS_FATIMG=sf ./arroyo test-fat sf 300` → after the U8x PASS: the U9x setup line and
+  `:: U9x: real File writes — open-RW+seek+write+readback OK, RO-write/wrong-kind/revoked-cap all -EACCES
+  (staged in-place, no disk write-back this milestone) -> PASS ::`. The `u9x-write` fixture (single slot,
+  register-only apart from the read-back dest, witness `0x1F`) opens `SCRATCH.BIN` RW, seeks to a
+  partial-sector offset (520), overwrites a 16-byte sentinel IN PLACE, seeks back and reads it through the
+  SAME cap, and proves the RO-write + wrong-kind denials; `u9x_check_revoked_write` stages the U8x-revoked-
+  File-write denial over scratch row 5 and demands the handle/file/writable-pool/derivation ledgers all clear.
+  **Every prior U1a→U8x verdict byte-identical** (sorted scratch-worktree baseline diff vs `ca1b765` — pure
+  append of the U9x lines). Default no-FAT `./arroyo test` stays MISSION SUCCESS AND U9x **runs and PASSes**
+  there too — its in-memory scratch needs no FAT volume, which DIVERGES from the HELLO.BIN-dependent demos
+  (U2/U4x/U6x/U6bx), all of which skip cleanly without a FAT. `./arroyo check` both arches, **zero aarch64
+  files touched** (`arch/x86_64/syscall.rs` only — the write stack `fat.rs`/`block.rs`/`drivers/xhci` untouched).
+- **Metal:** CANNOT be metal-confirmed — the standing x86 xHCI enumeration blocker (`task_47291f90`) means the
+  rMBP enumerates no mass-storage device, so `block::info()` is None and U9x's storage-gated demo SKIPS on
+  metal exactly as U8x/U7x do. QEMU-green is the ceiling until that blocker clears; the gate is NOT relaxed.
+- **Commit:** `538a1bf` (`hw-rmbp`, Opus-executed).
+
+---
 
 ## hw-pi4 track — 2026-07-07 (Opus round, post-Campaign 2)
 
