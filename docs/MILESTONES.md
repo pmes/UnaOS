@@ -12,6 +12,47 @@ Legend: **✅ metal-confirmed** · **🔬 QEMU-green, metal pending** · dates I
 
 ## hw-pi4 track — 2026-07-08 (Opus round)
 
+### U11 (M2b / U12b) — the teardown-last-close REAPER: deferred-free queue + kernel reaper task (aarch64) 🔬 `hw-pi4`
+- **What:** closes the ONE honest-scope gap M2a left open. M2a proved the cross-process defer for the
+  EXPLICIT-close path (the chain frees at the last `SYS_CLOSE`), but a program that EXITS holding the last
+  cross-process open of an `unlink_pending` file cannot free its chain at teardown — that runs IRQ-masked, on the
+  dying task's own kernel stack, TTBR0 on the boot root, immediately before `switch_context`, where multi-sector
+  polled SD I/O is illegal. M2a therefore LOGGED that as a transient lost-cluster leak (benign, until reboot).
+  **M2b actually frees it**, in a block-I/O-legal context, via two additive pieces (both aarch64 `syscall.rs`):
+  - **`DEFERRED_FREE`** — a bounded (`NDEFERFREE = 16`) `SpinMutex`-guarded ring of chain heads with its OWN lock
+    (separate from `OPEN_FILES`, so the teardown push never contends with live open/close). `clear_files_row`'s
+    last-close-of-`unlink_pending` branch now PUSHES the head (`deferred_free_push` — lock + array write + unlock,
+    I/O-free, the SAFE twin of M2a's teardown decrement) instead of logging the leak. A FULL queue degrades
+    honestly to the M2a log-the-leak behavior — the push NEVER blocks, spins, or does I/O.
+  - **`orphan_reaper`** — a forever kernel service task spawned at BOOT via the EXISTING
+    `sched::spawn(name, fn, arg, cpu)` service-task API (`main.rs`'s aarch64-baremetal service block, alongside
+    `input`/`render`; **NO `sched.rs` change — the feared scheduler hook was not needed**). It drains the queue:
+    pop one head UNDER the lock, RELEASE the lock, THEN `free_orphan_chain` (mount + all-FAT-copies free — block
+    I/O, legal here: EL1, IRQs enabled, its own stack). It `yield_now`s when empty so it never hogs its core under
+    QEMU's cooperative scheduler, and is co-located with the demo VERDICT core so the launcher's bounded
+    `yield_now` poll cedes it CPU to drain deterministically.
+  Freed EXACTLY once: a teardown-orphaned chain reaches the queue ONLY via `openfile_decref_at` returning
+  `Some(fc)` (last-close-of-pending, the row already EMPTY) — queued once, reaped once; the explicit-close path
+  frees inline and NEVER queues, so no chain is both freed inline and queued. SMP-safe (a teardown on core X
+  pushes, the reaper on core Y drains — one `SpinMutex`, no torn reads, no lost/duplicated entries).
+- **Tested — QEMU:** `./arroyo kernel8-test 30` → after U11-reuse, one new verdict:
+  `:: U11-reap: teardown-last-close reaper — A exits holding the unlinked file open, its chain freed by the reaper
+  (all FAT copies) + re-allocatable, no teardown leak -> PASS ::`. A two-process fixture (`el0-u11reap-a`/`-b`,
+  the u11defer choreography): A creates + writes + holds `DEFER2.BIN` open; B opens + `SYS_UNLINK`s it (deferred —
+  A holds it); A reads its ORIGINAL bytes back (chain alive), then **EXITS WITHOUT CLOSING** — so TEARDOWN is the
+  last close. The launcher proves the same three checkpoints as u11defer, but CHECKPOINT-3 is a bounded
+  `yield_now` poll of the FAT until the REAPER has freed the chain (all FAT copies) + it is re-allocatable
+  (`first_free == f0`); the serial shows `U11-defer: reaper freed teardown-orphaned chain @cluster N` and the M2a
+  `"teardown … left allocated (leak)"` line does NOT appear for `DEFER2.BIN` (reaped, not leaked). **22 PASS** (21
+  prior byte-identical + U11-reap — sorted scratch-worktree baseline diff vs `d57520f`, a single appended line),
+  **CAPSTONE 6/6**, only the 3 expected M6b kills, 0 unexpected faults. `./arroyo test-arm 22` green (baremetal-
+  gated); `./arroyo check` both arches, `./arroyo kernel8` compiles; **zero x86 files**.
+- **Lane:** aarch64 `syscall.rs` (`DEFERRED_FREE` + `orphan_reaper` + the `clear_files_row` push + the reap
+  fixture/launcher) + the aarch64-baremetal service-spawn block of `main.rs` (additive, cfg-scoped) + docs; zero
+  x86 files. `SpinMutex` reused from `sched.rs`; **NO `sched.rs` change** and **NO `fat.rs` change** (the reaper
+  calls M2a's existing `free_chain`). 🔬 Metal-pending (pure syscall lifecycle + a kernel service task + FAT free;
+  QEMU proves the reaper in full — rides the next Pi boundary alongside U10/U11-M1/M2).
+
 ### U11 (M2 / U12) — cross-process unlink-defers-free: a global open-file refcount + deferred chain-free (aarch64) 🔬 `hw-pi4`
 - **What:** closes the SECOND (and last) of U10's two review notes — **cross-process unlink-while-open** (POSIX
   unlink-defers-free). U10 freed a file's cluster chain the instant `sys_unlink` ran; if ANOTHER process held the
@@ -78,11 +119,12 @@ Legend: **✅ metal-confirmed** · **🔬 QEMU-green, metal pending** · dates I
   chains free in all FAT copies): `:: U11-reuse: sys_unlink slot-recycle — two files sharing a recycled dir slot
   BOTH free their chains (all FAT copies) -> PASS ::`. **Now 21 PASS** (the prior 20 byte-identical + U11-reuse),
   CAPSTONE 6/6, `./arroyo check` both arches, zero x86 files.
-- **Honest scope — M2a (explicit-close path) lands.** The cross-process defer is proven for the explicit-close
-  path. The teardown DECREMENT is done (a short, I/O-free `SpinMutex` critical section, safe in the IRQ-masked
-  teardown context); but a program that EXITS holding the LAST `unlink_pending` open leaves its chain allocated (a
-  transient lost-cluster leak, logged) — freeing it needs a reaper running in a block-I/O-legal context, which is
-  **M2b** (deferred: it wants a `sched.rs` scheduler hook, outside this arc's lane — STOP-and-report boundary).
+- **Honest scope — M2a (explicit-close path) landed; the teardown-last-close gap is now CLOSED by M2b (above).**
+  The cross-process defer is proven for the explicit-close path, and the teardown DECREMENT is done (a short,
+  I/O-free `SpinMutex` critical section, safe in the IRQ-masked teardown context). A program that EXITS holding
+  the LAST `unlink_pending` open cannot free its chain in teardown (IRQ-masked, dying stack, block I/O illegal),
+  so M2a LOGGED it as a transient lost-cluster leak — now REAPED by M2b's deferred-free queue + `orphan_reaper`
+  (which turned out to need NO `sched.rs` hook — the existing `sched::spawn` service-task API sufficed).
 - **Lane:** aarch64 `syscall.rs` + `fs/fat.rs` (the `delete_located` split — additive, reuses `set_fat_entry`/
   `chain_clusters`) + docs; zero x86 files. `SpinMutex` reused from `sched.rs` (not reimplemented); no `sched.rs`
   change. 🔬 Metal-pending (pure syscall lifecycle + FAT free; rides the next Pi boundary alongside U10/U11-M1).

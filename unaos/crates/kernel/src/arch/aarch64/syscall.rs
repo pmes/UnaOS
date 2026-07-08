@@ -357,6 +357,31 @@ const U11DEFER_NAME: &str = "DEFER.BIN";
 /// the chain is still alive. Match the `.ascii` bytes in the blob.
 const U11DEFER_PATTERN: [u8; 16] = *b"U11-DEFER-OK-777";
 
+/// U11-M2b (reap) demo: the sentinel `sys_exit` status BOTH reap fixtures (`el0-u11reap-a`, `el0-u11reap-b`)
+/// use so their exits land in `EL0_U11REAP_DONE` (want 2). Distinct from every prior sentinel (…0x7F) and 0.
+const U11REAP_EXIT_STATUS: u64 = 0x80;
+/// U11-M2b (reap) demo: process A's witness bitmask — bit0 create DEFER2.BIN + grow-write OK; bit1 a read-back
+/// AFTER B unlinked returns A's ORIGINAL bytes (the chain is STILL alive — the unlink was deferred). A then
+/// EXITS WITHOUT CLOSING (no close bit: teardown is the last close), so `u11reap_run` PASSes iff A == this.
+/// Matches `add x23, x23, #{1,2}` in program A.
+const U11REAP_A_WITNESS_ALL: u64 = 0x3;
+/// U11-M2b (reap) demo: process B's witness bitmask — bit0 open DEFER2.BIN OK; bit1 SYS_UNLINK -> 0 (deferred:
+/// A still holds it open); bit2 a re-open of the unlinked name -> -ENOENT. Matches `add x23, x23, #{1,2,4}` in B.
+const U11REAP_B_WITNESS_ALL: u64 = 0x7;
+/// U11-M2b (reap) demo: the launcher-CUE tokens the fixtures SYS_REPORT (all `> 0xF`, so `u11reap_report`
+/// distinguishes them from a final witness). A reports `A_OPENED` after create+write; B reports `B_UNLINKED`
+/// after unlink+re-open; A reports `A_READ` after the post-unlink read. The launcher releases the next GO word
+/// (and runs its fresh-mount checkpoint) on each cue — it is the single choreography sequencer.
+const U11REAP_A_OPENED: u64 = 0x63;
+const U11REAP_B_UNLINKED: u64 = 0x64;
+const U11REAP_A_READ: u64 = 0x65;
+/// U11-M2b (reap) demo: the file A creates + writes + reads and B unlinks — runtime-created (not planted). 10
+/// chars (<= `MAX_NAME`); the `mov x1, #(9f-8f)` in the blob matches. Distinct from DEFER.BIN (the u11defer file).
+const U11REAP_NAME: &str = "DEFER2.BIN";
+/// U11-M2b (reap) demo: the 16-byte pattern A writes into DEFER2.BIN — A reads it back AFTER B unlinks to prove
+/// the chain is still alive. Match the `.ascii` bytes in the blob.
+const U11REAP_PATTERN: [u8; 16] = *b"U11-REAP-OK-7777";
+
 // --- The inline EL0 FIXTURES: three fault-SHAPE fixtures (M6b) + one preemption spinner (M6e). These
 // are fixtures, not programs, so they stay inline in the kernel image; only the well-behaved `hello`
 // routine moved out to a separately linked blob in M6c (see `USER_BLOB` below). Fully
@@ -2168,6 +2193,179 @@ unsafe extern "C" {
     static __u11defer_prog_b: u8;
 }
 
+// --- U11-M2b inline EL0 fixtures (teardown-last-close reaper). The u11defer two-fixture blob, with ONE
+// behavioural change: program A EXITS WITHOUT CLOSING while holding the last cross-process open of the unlinked
+// file — so TEARDOWN (not an explicit SYS_CLOSE) is the last close, `clear_files_row` queues the orphaned chain,
+// and the `orphan_reaper` frees it. Same GO-word choreography (+0x3000 B-unlink, +0x3010 A-read, +0x3018
+// A-EXIT), same +0x2000 read buffer. Witnesses: A = {create+write, read-after-unlink} (0x3, NO close bit),
+// B = {open, unlink, re-open -ENOENT} (0x7, same as u11defer B). ABI: x8=nr, args x0-x2, ret x0.
+core::arch::global_asm!(
+    r#"
+    .globl __u11reap_blob_start
+__u11reap_blob_start:
+    .balign 4
+    .globl __u11reap_prog_a
+__u11reap_prog_a:
+    mov  x23, xzr                          // witness bitmask = 0
+    adr  x9, __u11reap_blob_start          // x9 = window base
+    add  x12, x9, #0x2000                  // x12 = read dest VA (writable data page)
+    adr  x13, 7f                           // x13 = pattern VA (RO code page)
+
+    // (0) create DEFER2.BIN (O_CREAT|RW, mode=3) -> hA, then write 16 bytes (grow-from-empty allocates its cluster)
+    mov  x8, #11                           // SYS_OPEN
+    adr  x0, 8f                            // "DEFER2.BIN"
+    mov  x1, #(9f - 8f)
+    mov  x2, #3                            // O_CREAT | RW
+    svc  #0
+    mov  x19, x0                           // x19 = hA (>=0) or -errno
+    tbnz x19, #63, 2f                      // create/open failed -> report what we have
+    mov  x8, #1                            // SYS_WRITE 16 bytes (the pattern) -> grow
+    mov  x0, x19
+    mov  x1, x13
+    mov  x2, #16
+    svc  #0
+    cmp  x0, #16
+    b.ne 2f
+    add  x23, x23, #1                      // bit0: create DEFER2.BIN + grow-write OK
+    mov  x8, #3                            // SYS_REPORT(A_OPENED) — cue: launcher releases B's unlink
+    movz x0, #0x63
+    svc  #0
+
+    // park on the read GO word (base + 0x3010; released after B has unlinked + the launcher's checkpoint-1)
+    add  x9, x9, #0x1000
+    add  x9, x9, #0x1000
+    add  x9, x9, #0x1000                   // x9 = base + 0x3000
+    add  x9, x9, #0x10                     // x9 = base + 0x3010 = A read-GO
+    movz x24, #0x8000                      // bounded poll budget
+3:  ldr  x10, [x9]
+    cbnz x10, 4f
+    mov  x8, #4                            // SYS_YIELD — cooperative
+    svc  #0
+    subs x24, x24, #1
+    b.ne 3b
+    b    2f                                // GO never released -> report the partial witness (verdict FAILs)
+
+4:  // (1) seek to 0, then READ 16 -> must STILL return A's original bytes (the chain is alive despite B's unlink)
+    mov  x8, #15                           // SYS_SEEK(hA, 0)
+    mov  x0, x19
+    mov  x1, #0
+    svc  #0
+    cmp  x0, #0                            // seek returns the new offset (0); anything else is a failure
+    b.ne 2f
+    mov  x8, #12                           // SYS_READ(hA, buf, 16)
+    mov  x0, x19
+    mov  x1, x12
+    mov  x2, #16
+    svc  #0
+    cmp  x0, #16                           // 16 bytes back == the chain was NOT freed (defer held)
+    b.ne 2f
+    ldr  x10, [x12]                        // read-back == pattern (lo 8)
+    ldr  x11, [x13]
+    cmp  x10, x11
+    b.ne 2f
+    ldr  x10, [x12, #8]                    // (hi 8)
+    ldr  x11, [x13, #8]
+    cmp  x10, x11
+    b.ne 2f
+    add  x23, x23, #2                      // bit1: read-after-unlink returns the original bytes (chain alive)
+    mov  x8, #3                            // SYS_REPORT(A_READ) — cue: launcher checkpoint-2, releases the exit GO
+    movz x0, #0x65
+    svc  #0
+
+    // park on the EXIT GO word (base + 0x3018; released after the launcher's checkpoint-2). When released, A
+    // reports its witness and EXITS WITHOUT CLOSING hA — teardown is the last close, so the deferred chain-free
+    // is queued at teardown and the reaper frees it. There is deliberately NO SYS_CLOSE here.
+    add  x9, x9, #0x8                      // x9 = base+0x3010 -> base+0x3018 = A exit-GO
+    movz x24, #0x8000
+5:  ldr  x10, [x9]
+    cbnz x10, 2f                           // exit GO released -> report witness + EXIT (no close)
+    mov  x8, #4                            // SYS_YIELD
+    svc  #0
+    subs x24, x24, #1
+    b.ne 5b
+2:
+    mov  x0, x23                           // SYS_REPORT(final witness)
+    mov  x8, #3
+    svc  #0
+    mov  x8, #2                            // SYS_EXIT(U11REAP_EXIT_STATUS) -> EL0_U11REAP_DONE (A holds hA open)
+    movz x0, #0x80
+    svc  #0
+1:  b 1b                                   // sys_exit never returns; belt-and-braces guard
+
+    .balign 4
+    .globl __u11reap_prog_b
+__u11reap_prog_b:
+    mov  x23, xzr                          // witness bitmask = 0
+    adr  x9, __u11reap_blob_start
+    add  x9, x9, #0x1000
+    add  x9, x9, #0x1000
+    add  x9, x9, #0x1000                   // x9 = base + 0x3000 = B unlink-GO
+
+    // park on the unlink GO word (released after A reported A_OPENED — so DEFER2.BIN exists before B opens it)
+    movz x24, #0x8000
+13: ldr  x10, [x9]
+    cbnz x10, 14f
+    mov  x8, #4                            // SYS_YIELD
+    svc  #0
+    subs x24, x24, #1
+    b.ne 13b
+    b    12f                               // GO never released -> report the partial witness
+
+14: // (0) open DEFER2.BIN RW (no O_CREAT — A created it) -> hB
+    mov  x8, #11                           // SYS_OPEN
+    adr  x0, 8f
+    mov  x1, #(9f - 8f)
+    mov  x2, #1                            // RW
+    svc  #0
+    mov  x20, x0                           // x20 = hB (>=0) or -errno
+    tbnz x20, #63, 12f
+    add  x23, x23, #1                      // bit0: B open of the existing file OK
+    // (1) unlink via hB -> 0 (A still holds it open -> the chain-free is DEFERRED, nothing freed here)
+    mov  x8, #16                           // SYS_UNLINK
+    mov  x0, x20
+    svc  #0
+    cmp  x0, #0
+    b.ne 12f
+    add  x23, x23, #2                      // bit1: unlink OK (deferred)
+    // (2) re-open the unlinked name RO -> -ENOENT (the NAME is gone immediately, even though the chain lives)
+    mov  x8, #11                           // SYS_OPEN DEFER2.BIN RO
+    adr  x0, 8f
+    mov  x1, #(9f - 8f)
+    mov  x2, #0                            // RO
+    svc  #0
+    cmn  x0, #2                            // x0 == -2 (-ENOENT)?
+    b.ne 12f
+    add  x23, x23, #4                      // bit2: re-open of the unlinked name -> -ENOENT (name gone)
+    mov  x8, #3                            // SYS_REPORT(B_UNLINKED) — cue: launcher checkpoint-1, releases A's read
+    movz x0, #0x64
+    svc  #0
+12:
+    mov  x0, x23                           // SYS_REPORT(final witness)
+    mov  x8, #3
+    svc  #0
+    mov  x8, #2                            // SYS_EXIT(U11REAP_EXIT_STATUS) -> EL0_U11REAP_DONE
+    movz x0, #0x80
+    svc  #0
+11: b 11b                                  // sys_exit never returns; belt-and-braces guard
+
+    .balign 4
+8:  .ascii "DEFER2.BIN"
+9:
+    .balign 8
+7:  .ascii "U11-REAP-OK-7777"
+    .balign 4
+    .globl __u11reap_blob_end
+__u11reap_blob_end:
+"#
+);
+
+unsafe extern "C" {
+    static __u11reap_blob_start: u8;
+    static __u11reap_blob_end: u8;
+    static __u11reap_prog_a: u8;
+    static __u11reap_prog_b: u8;
+}
+
 /// The `hello` EL0 program (M6c), built as a SEPARATE link product (`crates/user-blob`) and baked in
 /// as a flat binary instead of living in the kernel's `.text`. `arroyo kernel8` builds it — a naked,
 /// position-independent `sys_write("hello from EL0\n") + sys_exit(0)` routine — for the bare aarch64
@@ -2509,6 +2707,20 @@ static U11DEFER_A_READ_F: AtomicU32 = AtomicU32::new(0);
 static EL0_U11DEFER_DONE: AtomicU32 = AtomicU32::new(0);
 /// U11-M2 (defer): a killed defer fixture — a real bug (register-only, bar its +0x2000 read buffer).
 static EL0_U11DEFER_KILLED: AtomicU32 = AtomicU32::new(0);
+
+/// U11-M2b (reap): the two reap fixtures' final witness bitmasks (SYS_REPORT), keyed by name.
+static U11REAP_A_WITNESS: AtomicU64 = AtomicU64::new(0);
+static U11REAP_B_WITNESS: AtomicU64 = AtomicU64::new(0);
+/// U11-M2b (reap): the launcher's choreography cue flags — A finished create+write; B finished unlink+re-open;
+/// A finished the post-unlink read. The launcher (single sequencer) releases the next GO word + runs its
+/// fresh-mount checkpoint on each. Set from `u11reap_report` when the matching cue token is reported.
+static U11REAP_A_OPENED_F: AtomicU32 = AtomicU32::new(0);
+static U11REAP_B_UNLINKED_F: AtomicU32 = AtomicU32::new(0);
+static U11REAP_A_READ_F: AtomicU32 = AtomicU32::new(0);
+/// U11-M2b (reap): BOTH fixtures reached their `0x80` sentinel exit (want 2). Read by `u11reap_run`.
+static EL0_U11REAP_DONE: AtomicU32 = AtomicU32::new(0);
+/// U11-M2b (reap): a killed reap fixture — a real bug (register-only, bar its +0x2000 read buffer).
+static EL0_U11REAP_KILLED: AtomicU32 = AtomicU32::new(0);
 
 /// Claim a FREE Proc entry, returning its index. CAS on `state` (FREE->RUNNING) is the atomic ownership
 /// token; the pid=0 placeholder is overwritten with the real child pid (Release) by the caller AFTER the
@@ -3165,16 +3377,22 @@ fn files_free_by_dir(asid: u64, dir_lba: u64, dir_off: u32) {
 ///
 /// U11-M2 honest scope: if a teardown decrement is the LAST close of an `unlink_pending` file, `files_free`
 /// returns the chain head — but freeing it HERE is UNSAFE (teardown is IRQ-masked, on a stack about to be freed,
-/// block I/O illegal), so this LOGS a transient leak instead. The clusters stay allocated (lost clusters —
-/// benign) until reclaimed; a reaper that frees them in a safe context is M2b (out of this milestone's scope).
+/// block I/O illegal). U11-M2b closes that gap: `deferred_free_push` hands the chain to the `orphan_reaper` via
+/// the I/O-free deferred-free queue (lock + array write — the SAFE twin of the teardown decrement above), and
+/// the reaper frees it in a block-I/O-legal context. If the queue is FULL, degrade honestly to the M2a
+/// behavior — LOG the leak + leave the clusters allocated (benign lost clusters) — but NEVER block, spin, or do
+/// I/O here.
 fn clear_files_row(asid: u64) {
     debug_assert!(asid >= 1 && (asid as usize) < FILE_USED.len(), "clear_files_row: asid out of range");
     for k in 0..NFILE {
         if let Some(orphan) = files_free(asid, k) {
-            serial_println!(
-                "U11-defer: teardown last-close of an unlinked file — chain @cluster {} left allocated (leak; M2b reaper)",
-                orphan
-            );
+            // U11-M2b: queue the teardown-orphaned chain for the reaper (I/O-free). Full queue -> honest leak-log.
+            if !deferred_free_push(orphan) {
+                serial_println!(
+                    "U11-defer: teardown last-close of an unlinked file — chain @cluster {} left allocated (queue full; leak)",
+                    orphan
+                );
+            }
         }
     }
 }
@@ -3351,6 +3569,113 @@ fn free_orphan_chain(first_cluster: u32) {
     }
 }
 
+// =============================================================================================
+// U11-M2b: the DEFERRED-FREE QUEUE + the orphan REAPER — freeing the teardown-last-close chain.
+// =============================================================================================
+//
+// M2a closed the cross-process defer for the EXPLICIT-close path: the chain frees at the last `SYS_CLOSE`
+// (`sys_close`/`sys_unlink`, syscall context, block I/O legal). But when TEARDOWN is the LAST close of an
+// `unlink_pending` file — a program EXITS *without* closing while holding the last cross-process open —
+// `clear_files_row`'s decrement reaches `refcount == 0` in an IRQ-masked context on the dying task's own
+// kernel stack (TTBR0 on the boot root, immediately before `switch_context`), where multi-sector polled SD
+// I/O is illegal. M2a therefore LOGGED the leak and left the clusters allocated (benign lost clusters).
+//
+// M2b actually frees that chain, in a block-I/O-legal context, by splitting the work in two:
+//   * `clear_files_row` PUSHES the chain head onto `DEFERRED_FREE` — an I/O-free critical section (lock +
+//     array write + unlock), the SAFE twin of M2a's teardown decrement. A separate `SpinMutex` from
+//     `OPEN_FILES` so the teardown push never contends with live open/close on the refcount table. A FULL
+//     queue degrades to the M2a behavior (log the leak, leave allocated) — the push never blocks/spins/faults.
+//   * the `orphan_reaper` kernel service task (spawned at BOOT via the existing `sched::spawn` service-task
+//     API in `main.rs`, NOT lazily — a spawn allocates a `Box<Task>` and takes `RUN_QUEUES`, both illegal in
+//     the teardown push path) DRAINS the queue: pop one head UNDER the lock, RELEASE the lock, THEN mount +
+//     free the chain (`free_orphan_chain`). Block I/O runs ONLY in the reaper's context (EL1, IRQs enabled,
+//     its own stack), never under the queue lock. It `yield_now()`s when the queue is empty so it never hogs
+//     its core (QEMU raspi4b is cooperative — no timer preemption). It never exits (a forever service loop).
+//
+// Freed EXACTLY once: a teardown-orphaned chain reaches the queue ONLY via `openfile_decref_at` returning
+// `Some(fc)` (last-close-of-pending, the row already cleared to EMPTY), so it is queued once and freed once
+// by the reaper; the explicit-close path frees inline and NEVER queues, so no chain is both freed inline and
+// queued. SMP-safe: a teardown on core X pushes, the reaper on core Y drains — a single `SpinMutex` serializes
+// them with no torn reads and no lost/duplicated entries.
+
+/// U11-M2b: capacity of the deferred-free ring. A teardown queues at most ONE chain per exiting task (its
+/// single last-`unlink_pending` open), so 16 pending chains is generous headroom before the honest full-queue
+/// degrade (log + leave allocated) ever fires.
+const NDEFERFREE: usize = 16;
+
+/// U11-M2b: the bounded deferred-free queue — chain heads awaiting the reaper. Guarded by its OWN `SpinMutex`
+/// (NOT `OPEN_FILES` — a separate lock keeps the IRQ-masked teardown push off the refcount table's hot lock).
+/// A plain fixed array + count: the push is lock + one store, the pop is lock + one load; neither allocates
+/// or touches block I/O. `0` is never a valid chain head (clusters start at 2), so it doubles as the scrub value.
+struct DeferredFree {
+    heads: [u32; NDEFERFREE], // chain heads (first_cluster) pending free; entries [0..len) are valid
+    len: usize,               // count of valid entries
+}
+
+impl DeferredFree {
+    const EMPTY: Self = DeferredFree { heads: [0; NDEFERFREE], len: 0 };
+}
+
+/// U11-M2b: the deferred-free queue instance. `SpinMutex::new` is `const`, so this is a const-constructed
+/// static (the `OPEN_FILES` idiom). Its lock is taken IRQ-masked in the teardown push (safe: a bounded,
+/// allocation-free, I/O-free critical section) and in the reaper's pop — but NEVER held across `free_chain` I/O.
+static DEFERRED_FREE: SpinMutex<DeferredFree> = SpinMutex::new(DeferredFree::EMPTY);
+
+/// U11-M2b: enqueue a teardown-orphaned chain head for the reaper. I/O-free (lock + array write + unlock) — so
+/// it is SAFE in the IRQ-masked teardown context, the same class as M2a's teardown decrement. Returns `false`
+/// iff the queue is FULL (the caller degrades to logging the leak + leaving the clusters allocated — never a
+/// block/spin/fault). NEVER call this under the `OPEN_FILES` lock: it is a deliberately separate lock, and no
+/// caller holds both. `#[must_use]`: dropping a `false` return would silently lose the leak-log fallback.
+#[must_use]
+fn deferred_free_push(first_cluster: u32) -> bool {
+    let mut q = DEFERRED_FREE.lock();
+    if q.len >= NDEFERFREE {
+        return false; // full — caller logs the honest leak
+    }
+    let i = q.len;
+    q.heads[i] = first_cluster;
+    q.len = i + 1;
+    true
+}
+
+/// U11-M2b: dequeue ONE orphaned chain head, or `None` when empty. LIFO (order is irrelevant — each head names
+/// a DISTINCT chain freed exactly once). The reaper calls this to take a head UNDER the lock, then DROPS the
+/// lock before the `free_chain` block I/O (holding the queue lock across `mount()` would let a teardown push
+/// spin IRQ-masked on it — an unbounded stall in the one place that must never stall).
+fn deferred_free_pop() -> Option<u32> {
+    let mut q = DEFERRED_FREE.lock();
+    if q.len == 0 {
+        return None;
+    }
+    let i = q.len - 1; // local index: avoids borrowing the guard both mutably (`heads[..]=`) and immutably (`len`)
+    let fc = q.heads[i];
+    q.heads[i] = 0; // scrub (defensive — 0 is never a valid head)
+    q.len = i;
+    Some(fc)
+}
+
+/// U11-M2b: the deferred-free REAPER — a forever kernel service task that closes M2a's teardown-last-close
+/// honest-scope gap. Spawned ONCE at boot (`main.rs`'s aarch64-baremetal service block, via `sched::spawn`) so
+/// it already exists before any orphan is queued — a lazily-spawned reaper would need a heap `Box<Task>` +
+/// `RUN_QUEUES`, both illegal from the IRQ-masked teardown push. Each turn: pop one chain head (lock held only
+/// for the pop), RELEASE the lock, THEN `free_orphan_chain` (mount + all-FAT-copies free — block I/O, legal
+/// HERE: EL1, IRQs enabled, its own stack, never in teardown context). When the queue is empty it `yield_now`s,
+/// so on QEMU raspi4b's cooperative scheduler (no timer preemption) it cedes its core to the launcher/verdict
+/// tasks and never hogs it. The `arg` is unused (the `fn(usize)` service-task shape). Never returns.
+pub fn orphan_reaper(_: usize) {
+    loop {
+        match deferred_free_pop() {
+            Some(fc) => {
+                // The queue lock is already dropped; the block I/O is the reaper's own. A per-chain line is the
+                // positive twin of M2a's "leaked" log — its ABSENCE for a reaped file is the gate's witness.
+                serial_println!("U11-defer: reaper freed teardown-orphaned chain @cluster {}", fc);
+                free_orphan_chain(fc);
+            }
+            None => super::sched::yield_now(),
+        }
+    }
+}
+
 /// U4: record a value a process-model fixture reported via SYS_REPORT, keyed by the reporting task's name —
 /// the PARENT's witness token and the ORPHAN's ownership result. Keyed by name like `m6d_report`/`m6f_report`;
 /// the SYS_REPORT arm calls all three and each ignores the others' tasks.
@@ -3449,6 +3774,24 @@ fn u11defer_report(value: u64) {
         Some("el0-u11defer-b") => match value {
             U11DEFER_B_UNLINKED => U11DEFER_B_UNLINKED_F.store(1, Ordering::Release),
             _ => U11DEFER_B_WITNESS.store(value, Ordering::Release),
+        },
+        _ => {} // a stray report from any other task is ignored (never happens in the demo)
+    }
+}
+
+/// U11-M2b (reap): record the two teardown-reap fixtures' SYS_REPORTs, keyed by task name (the `u11defer_report`
+/// idiom). Cue tokens (`> 0xF`) release the launcher's next choreography edge; a final witness (`<= 0xF`) lands
+/// in the witness word.
+fn u11reap_report(value: u64) {
+    match super::sched::current_name() {
+        Some("el0-u11reap-a") => match value {
+            U11REAP_A_OPENED => U11REAP_A_OPENED_F.store(1, Ordering::Release),
+            U11REAP_A_READ => U11REAP_A_READ_F.store(1, Ordering::Release),
+            _ => U11REAP_A_WITNESS.store(value, Ordering::Release),
+        },
+        Some("el0-u11reap-b") => match value {
+            U11REAP_B_UNLINKED => U11REAP_B_UNLINKED_F.store(1, Ordering::Release),
+            _ => U11REAP_B_WITNESS.store(value, Ordering::Release),
         },
         _ => {} // a stray report from any other task is ignored (never happens in the demo)
     }
@@ -3736,6 +4079,12 @@ pub fn record_el0_kill(name: &str, ec: u64, far: u64, far_valid: bool) {
     // either is a real bug -> its own counter, off the M6b accounting.
     if name == "el0-u11defer-a" || name == "el0-u11defer-b" {
         EL0_U11DEFER_KILLED.fetch_add(1, Ordering::AcqRel);
+        return;
+    }
+    // U11-M2b (reap): the two teardown-reap fixtures are likewise register-only (bar their +0x2000 read buffer);
+    // a kill of either is a real bug -> its own counter, off the M6b accounting.
+    if name == "el0-u11reap-a" || name == "el0-u11reap-b" {
+        EL0_U11REAP_KILLED.fetch_add(1, Ordering::AcqRel);
         return;
     }
     let (base, size) = super::boot::user_region();
@@ -4132,6 +4481,7 @@ extern "C" fn aarch64_svc_handler(frame: *mut u64) {
             u10d_report(a0);
             u11_report(a0);
             u11defer_report(a0);
+            u11reap_report(a0);
             0
         }
         SYS_YIELD => sys_yield(),
@@ -4235,6 +4585,11 @@ extern "C" fn aarch64_svc_handler(frame: *mut u64) {
                 // Both defer fixtures (A + B) ride this one sentinel; neither has a planted Proc entry (they use
                 // no sys_xfer), so both fall through the Proc short-circuit to here. Want 2 (both exited).
                 EL0_U11DEFER_DONE.fetch_add(1, Ordering::AcqRel);
+            } else if a0 == U11REAP_EXIT_STATUS {
+                // Both reap fixtures (A + B) ride this one sentinel; neither has a planted Proc entry. Want 2.
+                // A's exit here is the LAST close of the unlinked file (it never SYS_CLOSEd) — its teardown
+                // queues the orphaned chain for the reaper.
+                EL0_U11REAP_DONE.fetch_add(1, Ordering::AcqRel);
             } else if a0 == 0 {
                 EL0_EXITED_OK.fetch_add(1, Ordering::AcqRel);
             } else {
@@ -6701,6 +7056,7 @@ pub fn u7_launcher(demo_cpu: usize) {
     u11_launcher(demo_cpu);
     u11defer_run(demo_cpu);
     u11reuse_run();
+    u11reap_run(demo_cpu);
 }
 
 fn u7_run(demo_cpu: usize) {
@@ -8218,6 +8574,249 @@ fn u11reuse_run() {
     } else {
         serial_println!(
             ":: U11-reuse: sys_unlink slot-recycle — orphan-head sweep FAIL (a chain leaked or the recycle precondition was not met) ::"
+        );
+    }
+}
+
+/// U11-M2b (reap): build ONE fixture slot for the shared two-entry reap blob (the `u11defer_build` shape —
+/// scrub the whole window, copy the blob, I-cache-sync, protect the code page EL0-RX/EL1-RO). `entry_sym`
+/// selects program A or B. `None` if slot allocation fails.
+fn u11reap_build(entry_sym: *const u8) -> Option<U7Fix> {
+    let (base, size) = super::boot::user_region();
+    let sp = (base + size as u64) & !0xF;
+    let bstart = &raw const __u11reap_blob_start as usize;
+    let bend = &raw const __u11reap_blob_end as usize;
+    let blen = bend - bstart;
+    assert!(blen <= super::boot::USER_CODE_SIZE, "U11-reap blob does not fit in a code page");
+    let entry = {
+        let va = base + (entry_sym as usize - bstart) as u64;
+        assert!(va & 3 == 0, "U11-reap fixture entry misaligned");
+        va
+    };
+    let slot = super::boot::alloc_user_slot()?;
+    let backing = super::boot::slot_backing_ptr(slot);
+    unsafe {
+        core::ptr::write_bytes(backing, 0, size);
+        core::ptr::copy_nonoverlapping(bstart as *const u8, backing, blen);
+    }
+    super::cache::icache_sync_range(backing as usize, blen);
+    unsafe { super::boot::protect_user_slot_code(slot, super::boot::USER_CODE_SIZE) };
+    let ttbr0 = super::boot::slot_ttbr0(slot);
+    Some(U7Fix { entry, sp, ttbr0, asid: ttbr0 >> 48, slot })
+}
+
+/// U11-M2b (reap) launcher + verdict — the teardown-last-close REAPER proof. Rides the same U7 kernel task,
+/// strictly after `u11reuse_run`. Two co-located fixtures (`el0-u11reap-a`/`-b` on `demo_cpu`, cooperative via
+/// SYS_YIELD) with this launcher (on the sibling core, co-located with the `orphan_reaper`) as the single
+/// SEQUENCER. It is the `u11defer_run` choreography UP TO A's exit — except **A EXITS WITHOUT CLOSING** while
+/// holding the last cross-process open, so the chain is freed by the REAPER at teardown, not by an explicit
+/// `SYS_CLOSE`. The launcher re-mounts the FAT at THREE checkpoints:
+///
+///   A creates+writes DEFER2.BIN, reports A_OPENED
+///     -> release B's unlink
+///   B opens+unlinks (name gone -> a re-open is -ENOENT), reports B_UNLINKED
+///     -> CHECKPOINT-1: name GONE on disk, chain (cluster `f0`) STILL allocated -> release A's read
+///   A seeks+reads its ORIGINAL bytes (the deferred chain is alive), reports A_READ
+///     -> CHECKPOINT-2: chain still allocated -> release A's EXIT GO
+///   A exits WITHOUT closing (teardown queues the orphan); B exits
+///     -> CHECKPOINT-3: bounded YIELD-poll of the FAT until the reaper has FREED the chain (all FAT copies) +
+///        it is re-allocatable (`first_free == f0`) — the yields cede this core to the co-located reaper, so
+///        the cooperative-QEMU drain is deterministic.
+///
+/// PASS iff both witnesses full AND all three cues fired AND both exited AND no kill AND both rows torn down AND
+/// the three checkpoints hold. Runtime-created file (no arroyo plant); needs a fresh image (DEFER2.BIN absent
+/// pre-demo). The last demo — releases no further gate. The M2a `"teardown … leaked"` line must NOT appear for
+/// DEFER2.BIN (the reaper freed it, not leaked it) — its ABSENCE is confirmed in the gate.
+fn u11reap_run(demo_cpu: usize) {
+    static DONE: AtomicBool = AtomicBool::new(false);
+    if DONE.swap(true, Ordering::Relaxed) {
+        return;
+    }
+    if crate::drivers::block::info().is_none() {
+        return; // no SD -> the fixtures cannot create/open disk files; skip silently
+    }
+    // Pre-flight: require DEFER2.BIN ABSENT (a stale copy would confound the on-disk checks), and snapshot the
+    // first-free cluster `f0` — A's grow-from-empty write allocates it (first-fit), so `f0` is DEFER2.BIN's
+    // chain head, which the checkpoints track (allocated -> allocated -> freed-by-reaper + re-allocatable).
+    let f0 = match crate::fs::fat::mount() {
+        Ok(fs) => {
+            if fs.find_in_root(U11REAP_NAME).is_ok() {
+                serial_println!(
+                    ":: U11-reap: DEFER2.BIN already present pre-demo (stale image) — reaper demo skipped ::"
+                );
+                return;
+            }
+            match fs.first_free_cluster() {
+                Ok(c) => c,
+                Err(_) => {
+                    serial_println!(":: U11-reap: no free cluster pre-demo — reaper demo skipped ::");
+                    return;
+                }
+            }
+        }
+        Err(_) => return, // unmountable -> skip silently
+    };
+
+    // Build + spawn A, then B (B parks on its GO until A has created the file, like u11defer).
+    let Some(a) = u11reap_build(&raw const __u11reap_prog_a) else {
+        serial_println!(":: U11-reap: no free address-space slot — reaper demo skipped ::");
+        return;
+    };
+    let Some(b) = u11reap_build(&raw const __u11reap_prog_b) else {
+        serial_println!(":: U11-reap: no free address-space slot — reaper demo skipped (A will park out) ::");
+        return;
+    };
+    serial_println!(
+        ":: U11-reap: teardown-last-close reaper — A exits holding the last open of an unlinked file; its chain freed by the reaper ::"
+    );
+    super::sched::spawn_user_slot("el0-u11reap-a", a.entry, a.sp, a.ttbr0, demo_cpu);
+    super::sched::spawn_user_slot("el0-u11reap-b", b.entry, b.sp, b.ttbr0, demo_cpu);
+
+    // Bounded flag-wait (the `u11defer_run` idiom), yielding cooperatively.
+    let wait_flag = |flag: &AtomicU32, secs: u64| -> bool {
+        let start = super::timer::cntpct();
+        let deadline = secs * super::timer::cntfrq();
+        while flag.load(Ordering::Acquire) == 0
+            && super::timer::cntpct().wrapping_sub(start) <= deadline
+        {
+            super::sched::yield_now();
+        }
+        flag.load(Ordering::Acquire) != 0
+    };
+    // Fresh-mount FAT snapshot: is DEFER2.BIN's chain head `f0` still allocated in ALL FAT copies (non-zero)?
+    let chain_allocated = || -> bool {
+        match crate::fs::fat::mount() {
+            Ok(fs) => {
+                let nf = fs.num_fats();
+                let mut all = true;
+                let mut f = 0;
+                while f < nf {
+                    match fs.fat_entry_copy(f0, f) {
+                        Ok(0) => all = false, // free -> NOT allocated
+                        Ok(_) => {}
+                        Err(_) => all = false,
+                    }
+                    f += 1;
+                }
+                all
+            }
+            Err(_) => false,
+        }
+    };
+
+    // Edge 1: A runs immediately (no GO gate on its open). Wait for A_OPENED, then release B's unlink.
+    let a_opened = wait_flag(&U11REAP_A_OPENED_F, 5);
+    u11defer_release_go(b.slot, 0x3000);
+    // Edge 2: wait for B_UNLINKED; CHECKPOINT-1 — the NAME is gone on disk, but the chain is STILL allocated.
+    let b_unlinked = wait_flag(&U11REAP_B_UNLINKED_F, 5);
+    let name_gone_c1 = match crate::fs::fat::mount() {
+        Ok(fs) => fs.find_in_root(U11REAP_NAME).is_err(),
+        Err(_) => false,
+    };
+    let chain_alive_c1 = chain_allocated();
+    u11defer_release_go(a.slot, 0x3010);
+    // Edge 3: wait for A_READ; CHECKPOINT-2 — the chain is STILL allocated (A read its bytes; nothing was freed).
+    let a_read = wait_flag(&U11REAP_A_READ_F, 5);
+    let chain_alive_c2 = chain_allocated();
+    u11defer_release_go(a.slot, 0x3018); // release A's EXIT GO — A now exits WITHOUT closing
+
+    // Verdict: wait for both sentinel exits, read witnesses + kills, wait teardown-clear, then CHECKPOINT-3.
+    let vstart = super::timer::cntpct();
+    let vdeadline = 5 * super::timer::cntfrq();
+    while EL0_U11REAP_DONE.load(Ordering::Acquire) < 2
+        && super::timer::cntpct().wrapping_sub(vstart) <= vdeadline
+    {
+        super::sched::yield_now();
+    }
+    let a_witness = U11REAP_A_WITNESS.load(Ordering::Acquire);
+    let b_witness = U11REAP_B_WITNESS.load(Ordering::Acquire);
+    let done = EL0_U11REAP_DONE.load(Ordering::Acquire);
+    let killed = EL0_U11REAP_KILLED.load(Ordering::Acquire);
+
+    let tstart = super::timer::cntpct();
+    let tdeadline = 2 * super::timer::cntfrq();
+    while !(files_row_is_clear(a.asid)
+        && files_row_is_clear(b.asid)
+        && handle_row_is_clear(a.asid)
+        && handle_row_is_clear(b.asid))
+        && super::timer::cntpct().wrapping_sub(tstart) <= tdeadline
+    {
+        super::sched::yield_now();
+    }
+    let cleared = files_row_is_clear(a.asid)
+        && files_row_is_clear(b.asid)
+        && handle_row_is_clear(a.asid)
+        && handle_row_is_clear(b.asid);
+
+    // CHECKPOINT-3: A exited WITHOUT closing -> its teardown queued `f0` to the reaper. Bounded YIELD-poll the
+    // FAT until the reaper has freed it (all FAT copies) AND it is re-allocatable (`first_free == f0`, since
+    // nothing below it was ever freed). The yields cede this core to the co-located reaper so the cooperative-
+    // QEMU drain is deterministic. Times out (still false) if the reaper never runs -> the verdict FAILs loudly.
+    let (freed_c3, reusable_c3) = {
+        let dstart = super::timer::cntpct();
+        let ddeadline = 5 * super::timer::cntfrq();
+        loop {
+            let snap = match crate::fs::fat::mount() {
+                Ok(fs) => {
+                    let nf = fs.num_fats();
+                    let mut freed = true;
+                    let mut f = 0;
+                    while f < nf {
+                        match fs.fat_entry_copy(f0, f) {
+                            Ok(0) => {}
+                            _ => freed = false,
+                        }
+                        f += 1;
+                    }
+                    (freed, fs.first_free_cluster() == Ok(f0))
+                }
+                Err(_) => (false, false),
+            };
+            if snap.0 && snap.1 {
+                break (true, true);
+            }
+            if super::timer::cntpct().wrapping_sub(dstart) > ddeadline {
+                break snap;
+            }
+            super::sched::yield_now();
+        }
+    };
+
+    let ok = a_opened
+        && b_unlinked
+        && a_read
+        && a_witness == U11REAP_A_WITNESS_ALL
+        && b_witness == U11REAP_B_WITNESS_ALL
+        && done == 2
+        && killed == 0
+        && cleared
+        && name_gone_c1
+        && chain_alive_c1
+        && chain_alive_c2
+        && freed_c3
+        && reusable_c3;
+    if ok {
+        serial_println!(
+            ":: U11-reap: teardown-last-close reaper — A exits holding the unlinked file open, its chain freed by the reaper (all FAT copies) + re-allocatable, no teardown leak -> PASS ::"
+        );
+    } else {
+        serial_println!(
+            ":: U11-reap: teardown-last-close reaper FAIL — a_w={:#x} b_w={:#x} opened={} unlinked={} read={} done={} killed={} cleared={} c1(gone={},alive={}) c2_alive={} c3(freed={},reuse={}) (want {:#x}/{:#x}/t/t/t/2/0/t/t/t/t/t/t) ::",
+            a_witness,
+            b_witness,
+            a_opened,
+            b_unlinked,
+            a_read,
+            done,
+            killed,
+            cleared,
+            name_gone_c1,
+            chain_alive_c1,
+            chain_alive_c2,
+            freed_c3,
+            reusable_c3,
+            U11REAP_A_WITNESS_ALL,
+            U11REAP_B_WITNESS_ALL
         );
     }
 }

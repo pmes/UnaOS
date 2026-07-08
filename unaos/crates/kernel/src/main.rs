@@ -760,9 +760,24 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
             }
             unaos_kernel::arch::sched::spawn("input", input_service, 0, input_cpu);
             unaos_kernel::arch::sched::spawn("render", render_service, 0, render_cpu);
+            // U11-M2b: the deferred-free REAPER — a forever kernel service task that frees a cluster chain
+            // orphaned when a program EXITS holding the last cross-process open of an unlinked file (teardown
+            // is the last close, but block I/O is illegal there, so `clear_files_row` queues the chain head and
+            // the reaper frees it in this block-I/O-legal context). Spawned at BOOT — never lazily from the
+            // teardown push (which cannot allocate a `Box<Task>` or take `RUN_QUEUES`). Co-located with the
+            // demo VERDICT core (`online.get(1)`), so the U11-reap launcher's bounded `yield_now` poll cedes it
+            // the CPU to drain deterministically under QEMU's cooperative scheduler; falls back to the input
+            // core if only one AP came up (still off the demo core). Additive + aarch64-baremetal-scoped.
+            let reaper_cpu = online.get(1).copied().unwrap_or(input_cpu);
+            unaos_kernel::arch::sched::spawn(
+                "orphan-reaper",
+                unaos_kernel::arch::syscall::orphan_reaper,
+                0,
+                reaper_cpu,
+            );
             serial_println!(
-                ":: INPUT on core {} + RENDER on core {} scheduled (OS on its own scheduler; BSP idle) ::",
-                input_cpu, render_cpu
+                ":: INPUT on core {} + RENDER on core {} + orphan-reaper on core {} scheduled (OS on its own scheduler; BSP idle) ::",
+                input_cpu, render_cpu, reaper_cpu
             );
             unaos_kernel::arch::hlt_loop();
         }
