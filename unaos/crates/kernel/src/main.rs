@@ -1262,18 +1262,26 @@ fn tegra_early_stop(boot_info: &'static mut BootInfo) -> ! {
         //     NOT re-run — the wrong path for t234; jb4_falcon_revive polls USBSTS.CNR instead.
         //   * Boot 1+2 (JB4_ENABLE, self-checked in jb4_falcon_revive): the non-destructive
         //     readiness poll — makes NO CSB writes; USBSTS.CNR clearing is the one true signal.
-        if let (Some(chan), Some(ids)) = (jb_chan.as_ref(), jb_ids.as_ref()) {
-            if unaos_kernel::arch::xusb_tegra::JB4_ALLOW_PG_CYCLE {
-                unaos_kernel::arch::bpmp_tegra::jb4_powergate_cycle(chan, ids);
-                unaos_kernel::arch::xusb_tegra::jb2c_padctl_powerup(chan);
-                unaos_kernel::arch::smmu_tegra::jb3_open_stream(&jb3_bases[..jb3_n], jb3_sid);
-                unaos_kernel::arch::smmu_tegra::jb3_mc_sid_fix(jb3_sid);
-                unaos_kernel::arch::xusb_tegra::jb3_fpci_enable();
-                unaos_kernel::arch::xusb_tegra::jb3_aru_probe(jb3_sid);
+        // JB10: gated behind !jb9h_skip for symmetry with the JB3 chain above — the JB4 revival
+        // levers belong to the halted-Falcon (chain) world, never the inherit path. On an inherit
+        // boot (jb9h_skip=true) the whole block is skipped; its calls were already inert there
+        // anyway (jb4_falcon_revive self-returns on JB4_ENABLE=false, jb9_fw_alive is JB9_PROBE-
+        // gated). The destructive inner cycle stays double-guarded by JB4_ALLOW_PG_CYCLE + the
+        // compile-time assertion in xusb_tegra.rs.
+        if !jb9h_skip {
+            if let (Some(chan), Some(ids)) = (jb_chan.as_ref(), jb_ids.as_ref()) {
+                if unaos_kernel::arch::xusb_tegra::JB4_ALLOW_PG_CYCLE {
+                    unaos_kernel::arch::bpmp_tegra::jb4_powergate_cycle(chan, ids);
+                    unaos_kernel::arch::xusb_tegra::jb2c_padctl_powerup(chan);
+                    unaos_kernel::arch::smmu_tegra::jb3_open_stream(&jb3_bases[..jb3_n], jb3_sid);
+                    unaos_kernel::arch::smmu_tegra::jb3_mc_sid_fix(jb3_sid);
+                    unaos_kernel::arch::xusb_tegra::jb3_fpci_enable();
+                    unaos_kernel::arch::xusb_tegra::jb3_aru_probe(jb3_sid);
+                }
+                unaos_kernel::arch::xusb_tegra::jb4_falcon_revive(chan, ids);
+                // JB9c: judge the cycle by the CPUCTL/CNR-free witness, not the two proven liars.
+                unaos_kernel::arch::xusb_tegra::jb9_fw_alive("post-pg-cycle");
             }
-            unaos_kernel::arch::xusb_tegra::jb4_falcon_revive(chan, ids);
-            // JB9c: judge the cycle by the CPUCTL/CNR-free witness, not the two proven liars.
-            unaos_kernel::arch::xusb_tegra::jb9_fw_alive("post-pg-cycle");
         }
         let coherent = unaos_kernel::arch::fdt_tegra::xusb_dma_coherent(
             dtb_addr,

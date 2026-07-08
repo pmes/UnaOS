@@ -375,6 +375,38 @@ Legend: **✅ metal-confirmed** · **🔬 QEMU-green, metal pending** · dates I
 - **Commit:** `hw-rmbp`, Opus-executed.
 
 ---
+## hw-jetson track — 2026-07-08 (code arc — QEMU-green + adversarial-review-clean; USB-behaviour metal-pending)
+
+### JB10 — nested-hub descent + FS Evaluate-Context + root-kbd readiness + inherit-path housekeeping ✅ QEMU-green + review-clean / 🔬 metal-pending `hw-jetson`
+- **What:** the four JB9-baton follow-ups. **(1) Nested-hub descent** (shared `xhci/mod.rs`, additive,
+  hub-FSM is dead code under QEMU): `enumerate_downstream` detects a downstream hub (class `0x09`) and
+  pushes it to `hubs_pending` so `service_hubs` descends another tier; `DeviceSlot` gains
+  `route_string`/`route_depth`, `bring_up_hub` accumulates the Route String per tier (`| port <<
+  (4·depth)`, 5-tier cap), and `address_downstream` programs the DW2 Transaction Translator for LS/FS
+  children (HS/SS keep DW2=0 → working VIA-hub path byte-unchanged). **(2) FS EP0 Evaluate-Context**
+  (`#[cfg(feature="tegra")]`, `JB10_FS_EVAL_CTX`, HYPOTHESIS): the JB9 baton's "needs a port reset" is
+  refuted by the serial — the retry already resets + re-addresses at MPS0=64 and the FS device still
+  goes silent, so the tear-down churn itself is the culprit. Adopts Linux `xhci_check_maxpacket`: read
+  8 bytes, patch EP0 MPS0 in place via Evaluate Context (TRB 13, EP0 from the *output* context — the
+  review caught the source-offset bug), read the full descriptor, no teardown; deferred to
+  `service_enum` (`fs-mps-learn` stage), fallback to babble→recover. **(3) Root-keyboard demo:** no
+  code — the path already arms a root HID end to end; item 2 helps a FS root keyboard. **(4)
+  Housekeeping:** `JB9_PROBE` default-off (diagnostic suite only — recipe gates on `JB9G_NO_HCRST` /
+  `JB5_PROBE`, untouched), two compile-time asserts making the FW-destroying levers un-co-enable-able
+  with the inherit recipe, JB4 block wrapped in `!jb9h_skip`; forensic kit KEPT (flip back at a bench).
+- **Verified by construction + a 5-lens adversarial review (1 CONFIRMED bug fixed pre-commit: the
+  Evaluate-Context EP0 source offset).** QEMU cannot exercise items 1–3 (no `usb-hub`, lenient MPS) —
+  they land as levers for the next attended bench; item 4 needs no bench.
+- **Tested:** `UNAOS_TEGRA=1 ./arroyo check` green both arches; `./arroyo test` (x86) + `./arroyo
+  test-arm` (aarch64 virt) byte-green (root storage/kbd/mouse enumerate — items 1–2 are dead-under-QEMU
+  or `cfg(tegra)`, non-tegra byte-identical); `esp-jetson` `kernel.elf` **241,936 B / 90 `tegra:`
+  strings** (the JB9_PROBE-off shrink from ~257 KB / ~100+ is intended, NOT a virt clobber; JB10 code
+  present: `HUB-BEHIND-HUB`, `tegra fs-mps`).
+- **Detail:** [`arch_arm64.md` §JB10](dev/OS/01_BOOT_HAL/arch_arm64.md). Next (attended bench): flash +
+  watch nested descent (`storage_slot` past 0), the FS `fs-mps-learn` lever, and a direct-root
+  `keyboard ARMED`; then a scoped arc to retire the dead JB3/JB4/JB5 chain code.
+
+---
 ## hw-jetson track — 2026-07-08 (attended bench, Peter at the Orin)
 
 ### JB9 (bench outcome) — ⭐ USB WORKS ON ORIN: inherit + no-HCRST + 64-byte contexts ✅ metal-attended `hw-jetson`

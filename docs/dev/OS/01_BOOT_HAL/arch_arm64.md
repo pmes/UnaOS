@@ -1403,7 +1403,76 @@ round-trip. The chronicle:
 storage sat behind nested VL2109 hub layers; `storage_slot=0`); port 7's FS device passes the
 babble-learn then watchdogs at dev-desc (needs a fresh port reset in the retry flow); the JB4/JB5
 chain code paths should be formally retired/gated for inherit-path boots; and a direct-to-root-port
-keyboard boot is the quick win to demonstrate `keyboard ARMED` end-to-end.
+keyboard boot is the quick win to demonstrate `keyboard ARMED` end-to-end. **These four are JB10,
+below.**
+
+### JB10 — nested-hub descent, FS Evaluate-Context, root-keyboard readiness, inherit-path housekeeping
+
+JB10 follows the JB9 verdict (USB enumerates on the Orin). It is **QEMU-green + code-review clean;
+the USB-behaviour halves are metal-pending — QEMU cannot exercise them** (its regression attaches
+devices only on root ports, no `usb-hub`, and is lenient about EP0 MPS), so items 1–3 below are
+verified only by construction and an adversarial 5-lens review, not on silicon. They land as levers
+for the next attended bench. Item 4 is pure hygiene and needs no bench.
+
+1. **Nested-hub descent** (shared `drivers/xhci/mod.rs`, additive; the hub FSM is dead code under
+   the QEMU suites, so this cannot regress x86/Pi4). `enumerate_downstream` now detects a downstream
+   device that is itself a hub (device class `0x09`) and pushes its slot into `hubs_pending`, so the
+   next `service_hubs` pass brings it up and descends another tier — mirroring the root-port `HUB
+   DETECTED` push. `DeviceSlot` gains `route_string`/`route_depth`; `bring_up_hub` extends the route
+   for each child (`route | (port << (4·depth))`, `depth+1`) with a 5-tier cap (the xHCI Route String
+   is 20 bits = 5 nibbles). `address_downstream` programs the Slot Context DW2 Transaction Translator
+   (TT Hub Slot ID / TT Port Number) for Low/Full-Speed children — the immediate parent hub is the TT
+   for the common single-level-HS-hub topology; HS/SS children keep DW2 = 0, so the working VIA-hub
+   HS path is byte-unchanged. Root devices leave `route_*` at 0 (addressed by the root FSM), cleared
+   in `reset_soft_state`/`new` for recycled-slot safety.
+2. **Full-Speed EP0 Evaluate-Context** (`drivers/xhci/mod.rs`, `#[cfg(feature="tegra")]`,
+   const-toggle `JB10_FS_EVAL_CTX`, default on; **HYPOTHESIS — verify on the bench**). The JB9 baton
+   framed port 7 as "needs a fresh port reset", but the serial refutes that: the babble→recover path
+   *already* does DISABLE_SLOT + fresh port reset + re-ADDRESS at the correct MPS0=64 — and the FS
+   device then goes **silent** (dev-desc watchdog-times-out, PORTSC still `0x603` connected). The
+   device responds at MPS0=8 (it babbles = it sent data) but not after the tear-down churn. So JB10
+   adopts Linux `xhci_check_maxpacket`: for a Tegra FS root device, read the first 8 bytes (one
+   packet, no babble), learn `bMaxPacketSize0`, patch EP0 MPS0 **in place** via an Evaluate Context
+   command (TRB type 13, Add-flag A1, EP0 copied from the *output* context), then read the full
+   descriptor — all on the same slot, no DISABLE_SLOT, no reset. Deferred to `service_enum`
+   (`fs-mps-learn` stage, main-loop context where `sync_control`/`run_command_sync` are safe, never
+   inside `poll_events`). On any failure it falls back to the shared babble→recover path. Non-tegra
+   builds are byte-identical (the whole path is `cfg(tegra)`; `begin_device_descriptor` collapses to
+   the prior `request_device_descriptor` call). ⚠ A review pass caught the Evaluate-Context source
+   offset (the output DeviceContext has no Input-Control prefix, so EP0 is at `1·CTX_WORDS`, not
+   `2·CTX_WORDS`) — fixed before commit; the wrong offset would have submitted a null-ring EP0 that
+   the strict Tegra FW rejects (code 17), silently defeating the lever.
+3. **Direct-root keyboard demo** — no code change. The path already exists end to end (root device →
+   `poll_events` class-detect → `configure_hid_endpoints` → `keyboard_state` 1→2→3 → `keyboard_armed`
+   → `:: tegra: JB2b — keyboard ARMED (slot, root port) -> PASS ::`, then `kbd_pump_body` prints
+   `:: tegra: JB2b — KEY '<c>' ::`). Item 2 improves the odds for a Full-Speed root keyboard on the
+   Tegra FW. Bench procedure: plug a USB keyboard directly into an Orin root port (no hub) and boot;
+   watch for `keyboard ARMED -> PASS` then a `KEY` line per keystroke.
+4. **Inherit-path housekeeping** (`xusb_tegra.rs` + `main.rs`, tegra-only, zero x86/Pi4 blast radius).
+   `JB9_PROBE` defaults **false** now the verdict is in — it silences the diagnostic suite
+   (`jb9_fw_alive`, `jb9f_inherit_run_probe`, the `jb9_fw_sid_view`/`jb9_ring_scan`/`jb9_stream_dump`
+   pump-window captures). It does **not** touch the working recipe: the JB9g no-HCRST takeover and
+   JB9i slot eviction gate on `JB9G_NO_HCRST`, and `jb5_bar2_route` (load-bearing) gates on
+   `JB5_PROBE` — both stay true. Two compile-time tripwires
+   (`const _: () = assert!(!(JB4_ALLOW_PG_CYCLE && JB9G_NO_HCRST))` and the `JB5_RUN_E_REPLAY` twin)
+   make the two firmware-destroying levers un-co-enable-able with the inherit recipe: a wrong pairing
+   now fails the build, not a boot. The `main.rs` JB4 revival block is wrapped in `if !jb9h_skip` for
+   symmetry with the JB3 chain. The forensic kit is **kept, not deleted** — flip `JB9_PROBE` back to
+   `true` at the next bench when a failed downstream enumeration needs the telemetry; retiring the
+   dead JB3/JB4/JB5 chain code is a separate scoped cleanup arc (it spans `bpmp_tegra`/`smmu_tegra`).
+
+**Build note:** with `JB9_PROBE=false` the optimizer prunes the dead `if JB9_PROBE` diagnostic call
+sites, so `esp-jetson` `kernel.elf` is **~242 KB / ~90 `tegra:` strings** (down from ~257 KB / ~100–140
+with the probes on) — this is the intended shrink, **not** a broken/virt-clobbered build; the corrupt
+RED LINE remains ~355 KB.
+
+**Known limitations (follow-ups, not regressions):** (a) a *normal* hot-unplug of a root port hosting
+a nested hub tree tears nothing down (the disconnect handler only logs) so the subtree's slots/contexts
+leak — pre-existing behaviour for tier-1 too, bounded, no UAF, matching the codebase's forget-don't-free
+model; the *recovery* path does cascade-dispose correctly. (b) TT attribution is correct only when every
+intermediate hub above a LS/FS device is High-Speed (single-level is the target); a LS/FS device below a
+non-HS intermediate hub is not handled. (c) a SuperSpeed device *behind* a USB3 hub is mis-speeded
+(`reset_downstream_port` decodes LS/HS/FS only, no SS) — not needed for the keyboard/mouse demo.
 
 ## 4. Jetson Orin Nano headless bring-up (Arc JM2)
 

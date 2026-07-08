@@ -523,6 +523,14 @@ pub const JB4_ENABLE: bool = false;
 /// JB9c: answered (see JB4_ENABLE) — back to FALSE; the cycle kills the inherited firmware.
 pub const JB4_ALLOW_PG_CYCLE: bool = false;
 
+/// JB10 tripwire: the destructive MRQ_PG partition cycle (bpmp_tegra::jb4_powergate_cycle,
+/// main.rs call site) DESTROYS the inherited firmware — proven post-OFF=0x0, no bare-IFR autoboot
+/// on t234 (JB9c). The no-HCRST inherit recipe (JB9G_NO_HCRST) depends on that firmware staying
+/// live, so the two can never be co-enabled. This compile-time assertion forces a future bench
+/// editor who flips JB4_ALLOW_PG_CYCLE true to consciously also leave the inherit world
+/// (JB9G_NO_HCRST=false) — a wrong pairing fails the build, not a boot.
+const _: () = assert!(!(JB4_ALLOW_PG_CYCLE && JB9G_NO_HCRST));
+
 // Falcon CSB register address (mainline xhci-tegra XUSB_FALC_CPUCTL), read through the BAR2 ARU
 // CSB-range page mechanism (csb_r) for the log only — NOT written (the CSB restart is the wrong
 // path for t234; see the block comment). CPUCTL bits: STATE_HALTED b4, STATE_STOPPED b5.
@@ -692,6 +700,12 @@ pub const JB5_PROBE: bool = true;
 /// and prove the inherited Falcon is alive (CPUCTL != 0xffffffff). See jetson JB6 baton.
 pub const JB5_RUN_E_REPLAY: bool = false;
 
+/// JB10 tripwire (twin of the JB4 one): the JB5 run-D/E branch power-cycles the XUSB partition
+/// (bpmp_tegra::jb5_uefi_pg_cycle) and likewise KILLS the inherited firmware. It is mutually
+/// exclusive with the no-HCRST inherit recipe — enforced at compile time so it can never be
+/// co-enabled with JB9G_NO_HCRST on an inherit-path boot.
+const _: () = assert!(!(JB5_RUN_E_REPLAY && JB9G_NO_HCRST));
+
 /// JB5: the least-mutating writes that make the ARU/BAR2 (CSB/CPUCTL/mailbox) window readable at
 /// raw handoff: program BAR0/BAR2 bases iff unset, set MEM_SPACE_EN only. The pre-write CFG dump
 /// is itself a witness of what UEFI/EBS left (Linux-boot handoffs may differ — compare per boot).
@@ -856,7 +870,18 @@ pub fn jb6_csb_sweep() {
 
 /// JB9 master gate, sibling of JB5_PROBE: probe media only. When false every jb9_* is a silent
 /// no-op (call sites stay wired).
-pub const JB9_PROBE: bool = true;
+///
+/// JB10: default-OFF now the JB9 verdict is in (USB enumerates on the Orin). This silences the
+/// diagnostic suite on a production inherit boot — `jb9_fw_alive` (the FW-liveness witness),
+/// `jb9f_inherit_run_probe` (the RS=1/re-halt discriminator that PROVED the no-HCRST recipe), and
+/// the `jb9_fw_sid_view`/`jb9_ring_scan`/`jb9_stream_dump` forensic captures in the pump window.
+/// It does NOT touch the working recipe: JB9i eviction and the JB9g no-HCRST takeover gate on
+/// `JB9G_NO_HCRST`, not this flag, so `jb2b_attach` is byte-identical with the probes off. Flip
+/// back to `true` at the next attended bench when a downstream device's failed enumeration needs
+/// that telemetry (the forensic kit is deliberately KEPT, not deleted — see arch_arm64.md §JB10).
+/// Sibling note: `JB5_PROBE` must STAY true — `jb5_bar2_route` (the load-bearing minimal FPCI
+/// decode the inherit boot needs) rides that gate; it is NOT interchangeable with this one.
+pub const JB9_PROBE: bool = false;
 
 /// JB9g: take over the inherited (cleanly-halted) controller WITHOUT HCRST — the reset is what
 /// kills the Falcon's service loop on this firmware (JB9f: engine posts on bare RS=1; JB9e:
