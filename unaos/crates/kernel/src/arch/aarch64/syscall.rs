@@ -92,6 +92,14 @@ const SYS_RECV: u64 = 14;
 /// later `SYS_READ` and a File `SYS_WRITE` resume from the seeked offset. See `sys_seek`.
 const SYS_SEEK: u64 = 15;
 
+/// U10: DELETE (unlink) the file an open File+`CAP_WRITE` handle refers to. `a0`=handle idx -> `0`, or a
+/// negative errno. The CHECK is `sys_write`'s: `handle_resolve(asid, fd, CAP_WRITE)` must yield a `File` (a
+/// non-File kind / no handle / an RO-opened / a revoked cap all give `-EACCES`) — deletion is a mutation, gated
+/// by the SAME single write CHECK. Frees the file's cluster chain (every FAT entry -> 0, ALL copies) and marks
+/// its directory entry deleted (0xE5), then invalidates the descriptor + handle. Dir mark FIRST, then free, so a
+/// crash mid-delete leaves lost clusters (benign), never a live entry pointing at freed/re-allocated clusters.
+const SYS_UNLINK: u64 = 16;
+
 /// M6e demo: the sentinel `sys_exit` status the preemption spinner uses so its exit is accounted to
 /// `EL0_SPIN_DONE` and never perturbs the M6b `exited/killed` counters. Demo-only — there is no real
 /// userspace yet, so overloading one status value for demo bookkeeping is safe and documented here.
@@ -269,6 +277,21 @@ const U10C_PATTERN: [u8; 16] = *b"U10-CREATE-OK-99";
 /// U10-create demo: the created file's size after the write (== the pattern length) — the launcher's re-mount
 /// asserts the on-disk entry has exactly this size.
 const U10C_WRITTEN: u32 = 16;
+
+/// U10-delete demo: the sentinel `sys_exit` status the DELETE fixture (`el0-u10delete`) uses so ITS exit lands
+/// in `EL0_U10D_DONE`. Distinct from every prior sentinel (…0x7C) and 0.
+const U10D_EXIT_STATUS: u64 = 0x7D;
+/// U10-delete demo: the witness bitmask the DELETE fixture reports — bit0 create+open OK; bit1 write → 16
+/// (grow-from-empty allocates the cluster); bit2 `SYS_UNLINK` → 0 (delete: dir 0xE5 + free chain, all copies);
+/// bit3 a plain RO re-open → `-ENOENT` (the file is GONE). `u10d_launcher` PASSes iff it equals
+/// `U10D_WITNESS_ALL` AND the kernel-side checks held. Matches `add x23, x23, #{1,2,4,8}` in the blob.
+const U10D_WITNESS_ALL: u64 = 0xF;
+/// U10-delete demo: the self-contained file the fixture creates, writes, and DELETES (it does not exist in the
+/// planted image). 9 chars (<= `MAX_NAME`); the `mov x1, #(9f-8f)` in the blob matches.
+const U10D_NAME: &str = "DELME.BIN";
+/// U10-delete demo: the 16-byte pattern the fixture writes before deleting (so the file owns a real data
+/// cluster, whose freeing the launcher then verifies).
+const U10D_PATTERN: [u8; 16] = *b"U10-DELETE-OK-42";
 
 // --- The inline EL0 FIXTURES: three fault-SHAPE fixtures (M6b) + one preemption spinner (M6e). These
 // are fixtures, not programs, so they stay inline in the kernel image; only the well-behaved `hello`
@@ -1628,6 +1651,85 @@ unsafe extern "C" {
     static __u10c_prog_create: u8;
 }
 
+// --- U10-delete inline EL0 fixture (real file DELETE via SYS_UNLINK). ONE self-contained fixture
+// (`el0-u10delete`): it CREATES its own file (O_CREAT|RW), WRITES to it (grow-from-empty allocates a data
+// cluster), UNLINKs it through the same File+CAP_WRITE handle (dir entry -> 0xE5 + the chain freed in all FAT
+// copies, and the handle invalidated), and re-opens the name RO to prove it is GONE (`-ENOENT`). Self-contained
+// so it never depends on another demo's state. Position-independent; no writable user target beyond the pattern
+// it passes from the RO code page. It builds a witness bitmask in x23 and SYS_REPORTs it, then exits with the
+// U10-delete sentinel. ABI: x8=nr, args x0-x2, ret x0.
+core::arch::global_asm!(
+    r#"
+    .globl __u10d_blob_start
+__u10d_blob_start:
+    .balign 4
+    .globl __u10d_prog_delete
+__u10d_prog_delete:
+    mov  x23, xzr                          // witness bitmask = 0
+    adr  x13, 12f                          // x13 = write-pattern VA (RO code page)
+
+    // (0) open DELME.BIN O_CREAT|RW (mode=3) -> CREATE a 0-length file, RW handle
+    mov  x8, #11                           // SYS_OPEN
+    adr  x0, 8f                            // name ptr
+    mov  x1, #(9f - 8f)                    // name len ("DELME.BIN" = 9)
+    mov  x2, #3                            // mode = O_CREAT | RW
+    svc  #0
+    mov  x19, x0                           // x19 = RW handle (>=0) or -errno
+    tbnz x19, #63, 1f                      // create/open failed -> skip bit0..bit2
+    add  x23, x23, #1                      // bit0: create + open OK
+
+    // (1) write 16 bytes -> grow-from-empty (allocates the file's one data cluster)
+    mov  x8, #1                            // SYS_WRITE
+    mov  x0, x19
+    mov  x1, x13
+    mov  x2, #16
+    svc  #0
+    cmp  x0, #16
+    b.ne 1f
+    add  x23, x23, #2                      // bit1: write (grow) OK
+
+    // (2) unlink the file through the SAME File+CAP_WRITE handle -> 0 (dir 0xE5 + free chain, handle invalidated)
+    mov  x8, #16                           // SYS_UNLINK
+    mov  x0, x19
+    svc  #0
+    cmp  x0, #0
+    b.ne 1f
+    add  x23, x23, #4                      // bit2: unlink OK
+1:
+    // (3) a plain RO open of the deleted name must now fail -> -ENOENT (the file is GONE)
+    mov  x8, #11                           // SYS_OPEN DELME.BIN RO (no O_CREAT)
+    adr  x0, 8f
+    mov  x1, #(9f - 8f)
+    mov  x2, #0                            // mode = RO
+    svc  #0
+    cmn  x0, #2                            // x0 == -2 (-ENOENT) ?
+    b.ne 2f
+    add  x23, x23, #8                      // bit3: re-open -> -ENOENT (gone)
+2:
+    mov  x0, x23                           // SYS_REPORT(witness bitmask)
+    mov  x8, #3
+    svc  #0
+    mov  x8, #2                            // SYS_EXIT(U10D_EXIT_STATUS) -> EL0_U10D_DONE
+    movz x0, #0x7D
+    svc  #0
+4:  b 4b                                   // sys_exit never returns; belt-and-braces guard
+    .balign 4
+8:  .ascii "DELME.BIN"
+9:
+    .balign 8
+12: .ascii "U10-DELETE-OK-42"
+    .balign 4
+    .globl __u10d_blob_end
+__u10d_blob_end:
+"#
+);
+
+unsafe extern "C" {
+    static __u10d_blob_start: u8;
+    static __u10d_blob_end: u8;
+    static __u10d_prog_delete: u8;
+}
+
 /// The `hello` EL0 program (M6c), built as a SEPARATE link product (`crates/user-blob`) and baked in
 /// as a flat binary instead of living in the kernel's `.text`. `arroyo kernel8` builds it — a naked,
 /// position-independent `sys_write("hello from EL0\n") + sys_exit(0)` routine — for the bare aarch64
@@ -1939,6 +2041,14 @@ static U10C_WITNESS: AtomicU64 = AtomicU64::new(0);
 static EL0_U10C_DONE: AtomicU32 = AtomicU32::new(0);
 /// A killed U10-create fixture — a real bug (register-only). Off the M6b counter.
 static EL0_U10C_KILLED: AtomicU32 = AtomicU32::new(0);
+
+/// The U10-delete fixture's WITNESS bitmask (reported via SYS_REPORT): see `U10D_WITNESS_ALL`. `u10d_launcher`
+/// PASSes iff it equals `U10D_WITNESS_ALL` AND the kernel-side checks held.
+static U10D_WITNESS: AtomicU64 = AtomicU64::new(0);
+/// The U10-delete fixture (`el0-u10delete`) reached its `0x7D` sentinel exit (want 1). Read by `u10d_launcher`.
+static EL0_U10D_DONE: AtomicU32 = AtomicU32::new(0);
+/// A killed U10-delete fixture — a real bug (register-only). Off the M6b counter.
+static EL0_U10D_KILLED: AtomicU32 = AtomicU32::new(0);
 
 /// Claim a FREE Proc entry, returning its index. CAS on `state` (FREE->RUNNING) is the atomic ownership
 /// token; the pid=0 placeholder is overwritten with the real child pid (Release) by the caller AFTER the
@@ -2564,6 +2674,13 @@ fn u10c_report(value: u64) {
     }
 }
 
+/// U10-delete: record the DELETE fixture's witness bitmask (SYS_REPORT), keyed by the reporting task's name.
+fn u10d_report(value: u64) {
+    if super::sched::current_name() == Some("el0-u10delete") {
+        U10D_WITNESS.store(value, Ordering::Release);
+    }
+}
+
 fn u7_report(value: u64) {
     match super::sched::current_name() {
         Some("el0-u7parent") => U7_PARENT_WITNESS.store(value, Ordering::Release),
@@ -2830,6 +2947,11 @@ pub fn record_el0_kill(name: &str, ec: u64, far: u64, far_valid: bool) {
     // U10-create: the CREATE fixture is likewise register-only; a kill is a real bug (its own counter).
     if name == "el0-u10create" {
         EL0_U10C_KILLED.fetch_add(1, Ordering::AcqRel);
+        return;
+    }
+    // U10-delete: the DELETE fixture is likewise register-only; a kill is a real bug (its own counter).
+    if name == "el0-u10delete" {
+        EL0_U10D_KILLED.fetch_add(1, Ordering::AcqRel);
         return;
     }
     let (base, size) = super::boot::user_region();
@@ -3223,6 +3345,7 @@ extern "C" fn aarch64_svc_handler(frame: *mut u64) {
             u9_report(a0);
             u10_report(a0);
             u10c_report(a0);
+            u10d_report(a0);
             0
         }
         SYS_YIELD => sys_yield(),
@@ -3235,6 +3358,7 @@ extern "C" fn aarch64_svc_handler(frame: *mut u64) {
         SYS_OPEN => sys_open(a0, a1, a2),
         SYS_READ => sys_read(a0, a1, a2),
         SYS_SEEK => sys_seek(a0, a1),
+        SYS_UNLINK => sys_unlink(a0),
         SYS_XFER => sys_xfer(a0, a1, a2),
         SYS_RECV => sys_recv(),
         SYS_EXIT => {
@@ -3316,6 +3440,8 @@ extern "C" fn aarch64_svc_handler(frame: *mut u64) {
                 EL0_U10_DONE.fetch_add(1, Ordering::AcqRel);
             } else if a0 == U10C_EXIT_STATUS {
                 EL0_U10C_DONE.fetch_add(1, Ordering::AcqRel);
+            } else if a0 == U10D_EXIT_STATUS {
+                EL0_U10D_DONE.fetch_add(1, Ordering::AcqRel);
             } else if a0 == 0 {
                 EL0_EXITED_OK.fetch_add(1, Ordering::AcqRel);
             } else {
@@ -4143,6 +4269,52 @@ fn sys_seek(handle: u64, offset: u64) -> i64 {
     }
     FILE_OFFSET[asid as usize][idx].store(offset as u32, Ordering::Release);
     offset as i64
+}
+
+/// SYS_UNLINK(handle) -> `0` or a negative errno (U10). DELETE the file the open File+`CAP_WRITE` handle refers
+/// to. The CHECK is `sys_write`'s — `handle_resolve(asid, handle, CAP_WRITE)` must yield a `File` (an RO-opened
+/// File, a non-File kind, no handle, or a revoked cap all give `-EACCES`) — deletion is a mutation, gated by the
+/// SAME single write CHECK, so it can never be reached without `CAP_WRITE`. It reads the file's chain head +
+/// on-disk directory location from the descriptor (recorded at open), then `fat::delete_located` marks the
+/// directory entry deleted FIRST and frees the whole chain (all FAT copies), and finally the descriptor + handle
+/// are invalidated so no further read/write/seek can reach the now-deleted file. A scaffold descriptor with no
+/// recorded directory location (`dir_lba == 0`) is refused (`-EACCES`). Single handle per file this arc — other
+/// handles to the same file (none in practice) would be left dangling.
+fn sys_unlink(handle: u64) -> i64 {
+    let asid = current_asid();
+    // The CHECK: File + CAP_WRITE, or -EACCES (identical to sys_write's gate — delete is a mutation).
+    let file_id = match handle_resolve(asid, handle, CAP_WRITE) {
+        Ok(HandleTarget::File(id)) => id,
+        _ => return EACCES,
+    };
+    let Some(idx) = (file_id as usize).checked_sub(1) else {
+        return EACCES;
+    };
+    if idx >= NFILE || !FILE_USED[asid as usize][idx].load(Ordering::Acquire) {
+        return EACCES;
+    }
+    let cluster = FILE_CLUSTER[asid as usize][idx].load(Ordering::Acquire);
+    let dir_lba = FILE_DIR_LBA[asid as usize][idx].load(Ordering::Acquire);
+    let dir_off = FILE_DIR_OFF[asid as usize][idx].load(Ordering::Acquire) as usize;
+    // A descriptor with no recorded directory location (a scaffold, dir_lba == 0) cannot be deleted — refuse
+    // rather than 0xE5 an unknown sector. Real opens always record a nonzero dir LBA (the FAT/dir regions never
+    // sit at LBA 0 — that is the MBR / boot sector).
+    if dir_lba == 0 {
+        return EACCES;
+    }
+    let fs = match crate::fs::fat::mount() {
+        Ok(fs) => fs,
+        Err(crate::fs::fat::FatError::NoDisk) => return ENODEV,
+        Err(_) => return EIO,
+    };
+    if fs.delete_located(dir_lba, dir_off, cluster).is_err() {
+        return EIO; // a bad chain / block error — the dir mark is delete_located's first step, so a failure
+                    // there changed nothing; a failure while freeing only orphans clusters (never aliases)
+    }
+    // The file is gone: invalidate the descriptor + handle so no further read/write/seek can reach it.
+    files_free(asid, idx);
+    handle_clear(asid, handle as usize);
+    0
 }
 
 // =============================================================================================
@@ -5654,6 +5826,7 @@ pub fn u7_launcher(demo_cpu: usize) {
     u9_launcher(demo_cpu);
     u10_launcher(demo_cpu);
     u10c_launcher(demo_cpu);
+    u10d_launcher(demo_cpu);
 }
 
 fn u7_run(demo_cpu: usize) {
@@ -6512,6 +6685,143 @@ fn u10c_launcher(demo_cpu: usize) {
             fc_ok,
             EL0_U10C_DONE.load(Ordering::Acquire),
             U10C_WITNESS_ALL
+        );
+    }
+}
+
+// =============================================================================================
+// U10-delete: file DELETE — the single-process EL0 fixture (create -> write -> SYS_UNLINK -> re-open
+// -ENOENT) and the kernel-side checks (a fresh mount finds the entry GONE, the file's data cluster is
+// free again in ALL FAT copies, and the first-free cluster is unchanged from before the run — the
+// freed cluster is re-allocatable), folded into one launcher/verdict that rides the U7 launcher task
+// after U10-create.
+// =============================================================================================
+
+/// Build the U10-delete fixture slot — the `u10_build` shape for the U10-delete blob.
+fn u10d_build() -> Option<U7Fix> {
+    let (base, size) = super::boot::user_region();
+    let sp = (base + size as u64) & !0xF;
+    let bstart = &raw const __u10d_blob_start as usize;
+    let bend = &raw const __u10d_blob_end as usize;
+    let blen = bend - bstart;
+    assert!(blen <= super::boot::USER_CODE_SIZE, "U10-delete blob does not fit in a code page");
+    let entry = {
+        let va = base + (&raw const __u10d_prog_delete as usize - bstart) as u64;
+        assert!(va & 3 == 0, "U10-delete fixture entry misaligned");
+        va
+    };
+    let slot = super::boot::alloc_user_slot()?;
+    let backing = super::boot::slot_backing_ptr(slot);
+    unsafe {
+        core::ptr::write_bytes(backing, 0, size);
+        core::ptr::copy_nonoverlapping(bstart as *const u8, backing, blen);
+    }
+    super::cache::icache_sync_range(backing as usize, blen);
+    unsafe { super::boot::protect_user_slot_code(slot, super::boot::USER_CODE_SIZE) };
+    let ttbr0 = super::boot::slot_ttbr0(slot);
+    Some(U7Fix { entry, sp, ttbr0, asid: ttbr0 >> 48, slot })
+}
+
+/// U10-delete launcher + verdict — called by the U7 launcher task after the U10-create flow. Flow: skip with no
+/// SD; confirm DELME.BIN is ABSENT and snapshot the first-free cluster `f0` (the cluster the fixture's write
+/// will allocate — deterministic, single sequential kernel task) BEFORE allocating a slot; build + spawn the
+/// fixture; wait (bounded) for its sentinel exit + teardown; then the kernel-side checks — a fresh mount finds
+/// DELME.BIN GONE, `f0`'s FAT entry is `0` in ALL copies (the chain was freed everywhere), and the first-free
+/// cluster is again `f0` (the freed cluster is re-allocatable). PASS iff witness == `U10D_WITNESS_ALL` AND torn
+/// down AND no kill AND all kernel checks held. U10-delete is the last demo — it releases no further gate.
+fn u10d_launcher(demo_cpu: usize) {
+    static DONE: AtomicBool = AtomicBool::new(false);
+    if DONE.swap(true, Ordering::Relaxed) {
+        return;
+    }
+    if crate::drivers::block::info().is_none() {
+        return; // no SD -> the fixture cannot delete a disk file; skip silently
+    }
+    // Pre-flight: mount, require DELME.BIN ABSENT, and snapshot the first-free cluster (what the fixture's write
+    // will allocate). A stale DELME.BIN would confound the re-allocatability proof; log and skip.
+    let f0 = match crate::fs::fat::mount() {
+        Ok(fs) => {
+            if fs.find_in_root(U10D_NAME).is_ok() {
+                serial_println!(
+                    ":: U10-delete: DELME.BIN already present pre-demo (stale image) — delete demo skipped ::"
+                );
+                return;
+            }
+            match fs.first_free_cluster() {
+                Ok(c) => c,
+                Err(_) => {
+                    serial_println!(":: U10-delete: no free cluster to probe — delete demo skipped ::");
+                    return;
+                }
+            }
+        }
+        Err(_) => return, // unmountable -> skip silently
+    };
+
+    let Some(fix) = u10d_build() else {
+        serial_println!(":: U10-delete: no free address-space slot — delete demo skipped ::");
+        return;
+    };
+    serial_println!(
+        ":: U10-delete: file delete — SYS_UNLINK routed through fat::delete_located (dir 0xE5 + free chain, all FAT copies) ::"
+    );
+    super::sched::spawn_user_slot("el0-u10delete", fix.entry, fix.sp, fix.ttbr0, demo_cpu);
+
+    let vstart = super::timer::cntpct();
+    let vdeadline = 5 * super::timer::cntfrq();
+    while EL0_U10D_DONE.load(Ordering::Acquire) < 1
+        && super::timer::cntpct().wrapping_sub(vstart) <= vdeadline
+    {
+        super::sched::yield_now();
+    }
+    let witness = U10D_WITNESS.load(Ordering::Acquire);
+    let killed = EL0_U10D_KILLED.load(Ordering::Acquire);
+
+    let tstart = super::timer::cntpct();
+    let tdeadline = 2 * super::timer::cntfrq();
+    while !(files_row_is_clear(fix.asid) && handle_row_is_clear(fix.asid))
+        && super::timer::cntpct().wrapping_sub(tstart) <= tdeadline
+    {
+        super::sched::yield_now();
+    }
+    let cleared = files_row_is_clear(fix.asid) && handle_row_is_clear(fix.asid);
+
+    // Kernel-side "the delete actually hit the disk" checks: re-mount, and verify DELME.BIN is GONE, its data
+    // cluster `f0` is free in ALL FAT copies, and the first-free cluster is again `f0` (re-allocatable).
+    let (gone, freed, reusable) = match crate::fs::fat::mount() {
+        Ok(fs) => {
+            let gone = fs.find_in_root(U10D_NAME).is_err();
+            let nf = fs.num_fats();
+            let mut freed = true;
+            let mut f = 0;
+            while f < nf {
+                match fs.fat_entry_copy(f0, f) {
+                    Ok(0) => {}
+                    _ => freed = false,
+                }
+                f += 1;
+            }
+            let reusable = fs.first_free_cluster() == Ok(f0);
+            (gone, freed, reusable)
+        }
+        Err(_) => (false, false, false),
+    };
+
+    if witness == U10D_WITNESS_ALL && cleared && killed == 0 && gone && freed && reusable {
+        serial_println!(
+            ":: U10-delete: file delete — create+write+unlink OK, re-open -ENOENT, on-disk entry gone + chain freed (all FAT copies) + cluster re-allocatable -> PASS ::"
+        );
+    } else {
+        serial_println!(
+            ":: U10-delete: file delete FAIL — witness={:#x} cleared={} killed={} gone={} freed={} reusable={} done={} (want {:#x}/true/0/true/true/true/1) ::",
+            witness,
+            cleared,
+            killed,
+            gone,
+            freed,
+            reusable,
+            EL0_U10D_DONE.load(Ordering::Acquire),
+            U10D_WITNESS_ALL
         );
     }
 }

@@ -1301,6 +1301,69 @@ impl FatFs {
             }
         }
     }
+
+    /// U10: DELETE a file whose directory entry is at (`dir_lba`, `dir_off`) and whose chain head is
+    /// `first_cluster`. Order is crash-safety-critical: mark the directory entry deleted (`0xE5`) FIRST, THEN
+    /// free the cluster chain (every entry -> `0`, ALL FAT copies). A crash after the `0xE5` mark but before the
+    /// chain is fully freed leaves the file GONE with some clusters still marked used (lost clusters — benign,
+    /// reclaimable by chkdsk); it can NEVER leave a live directory entry pointing at freed (and possibly
+    /// re-allocated) clusters, which would alias another file's data. Returns the freed clusters (for the
+    /// launcher's re-allocatability check). A 0-length file (`first_cluster == 0`) frees nothing.
+    pub fn delete_located(
+        &self,
+        dir_lba: u64,
+        dir_off: usize,
+        first_cluster: u32,
+    ) -> Result<alloc::vec::Vec<u32>, FatError> {
+        if dir_off + 32 > SECTOR_SIZE {
+            return Err(FatError::Io);
+        }
+        // Collect the chain BEFORE mutating anything (a bad chain aborts the delete with nothing changed).
+        let chain = self.chain_clusters(first_cluster)?;
+        // 1. Mark the directory entry deleted (first byte -> 0xE5), RMW so the rest of the sector is preserved.
+        let mut buf = [0u8; SECTOR_SIZE];
+        read_sector(dir_lba, &mut buf)?;
+        buf[dir_off] = 0xE5;
+        write_sector(dir_lba, &buf)?;
+        // 2. Free every cluster in the chain (all FAT copies). The entry is already gone, so even a partial free
+        //    only orphans clusters (never aliases). Freeing low-to-high keeps first-fit reuse deterministic.
+        for &c in &chain {
+            self.set_fat_entry(c, 0)?;
+        }
+        Ok(chain)
+    }
+
+    /// U10: the number of the first FREE data cluster (a bounded read-only first-fit scan), or `NoSpace` if the
+    /// volume is full. Does NOT allocate — the peek twin of `alloc_cluster`'s search, for the launcher's
+    /// re-allocatability proof (the cluster a just-deleted file used is free again == the first-free is unchanged).
+    pub fn first_free_cluster(&self) -> Result<u32, FatError> {
+        let entry_bytes: u64 = if self.kind == FatKind::Fat32 { 4 } else { 2 };
+        let last = self.count_of_clusters + 2;
+        let mut buf = [0u8; SECTOR_SIZE];
+        let mut loaded = u64::MAX;
+        let mut c = 2u32;
+        while c < last {
+            let offset = c as u64 * entry_bytes;
+            let sec = offset / SECTOR_SIZE as u64;
+            if sec >= self.fat_sz as u64 {
+                break;
+            }
+            if sec != loaded {
+                read_sector(self.fat_start + sec, &mut buf)?;
+                loaded = sec;
+            }
+            let within = (offset % SECTOR_SIZE as u64) as usize;
+            let e = match self.kind {
+                FatKind::Fat16 => u16le(&buf, within) as u32,
+                FatKind::Fat32 => u32le(&buf, within) & 0x0FFF_FFFF,
+            };
+            if e == 0 {
+                return Ok(c);
+            }
+            c += 1;
+        }
+        Err(FatError::NoSpace)
+    }
 }
 
 /// One-shot boot probe: the first time a block device is present, mount the FAT volume and log its
