@@ -6120,9 +6120,9 @@ fn u9x_read16(fc: u32, size: u32, off: u32) -> Option<[u8; 16]> {
 ///
 /// TWO MODES: disk-backed (a FAT volume backs SCRATCH.BIN — `test-fat sf`) requires the on-disk proof; in-memory
 /// (no FAT — plain `./arroyo test` attaches a non-FAT usb.img) runs the M1 core with the flush a no-op and does
-/// ZERO AP disk I/O (the pre-flight is skipped, bounding the no-FAT run). The write path CANNOT be
-/// metal-confirmed on the rMBP (the xHCI storage-enumeration blocker means the block device is absent on metal,
-/// so this whole demo SKIPS there, exactly as U8x does) — QEMU-green is the ceiling. NOTE: the disk-backed flush
+/// ZERO AP disk I/O (the pre-flight is skipped, bounding the no-FAT run). METAL-CONFIRMED on the rMBP
+/// (2026-07-08 bench, post xHCI-enumeration fix): on-disk write-back PASSes off a FAT16 SD card; the pre-flight
+/// self-heals a prior boot's persisted pattern (see below) so re-runs stay honest. NOTE: the disk-backed flush
 /// is the FIRST concurrent AP-side xHCI BOT I/O in the tree; the pump is BOUNDED (a 2000-iter timeout -> `Io`),
 /// so a failure is a LOUD verdict FAIL (`flushed=false`), never a hang — `test-fat sf` is its empirical proof.
 fn u9x_launcher(demo_cpu: usize) {
@@ -6149,7 +6149,31 @@ fn u9x_launcher(demo_cpu: usize) {
             {
                 let fc = de.first_cluster();
                 SCRATCH_CLUSTER.store(fc, Ordering::Release); // publish the flush target before the fixture opens
-                (fc, de.size, u9x_read16(fc, de.size, U9X_WRITE_OFFSET))
+                let mut pre = u9x_read16(fc, de.size, U9X_WRITE_OFFSET);
+                // Re-run self-heal (metal): a PRIOR boot's flush already persisted U9X_PATTERN to
+                // this card, so `pre == pattern` and the strict "sector CHANGED" proof below could
+                // never pass again (first seen at the 2026-07-08 rMBP bench, boot #3). Restore the
+                // 0xEE seed in place — same write_at path, in-place, never grows — and re-read it
+                // as the pre-image, making the demo idempotent across reboots on the same medium.
+                // QEMU never hits this (each run starts from a fresh image). Best-effort: a failed
+                // restore leaves `pre` as-is and the verdict stays honest (FAILs on sector_changed).
+                if pre == Some(U9X_PATTERN) {
+                    if let Ok(fs) = crate::fs::fat::mount() {
+                        let seed = [U9X_SCRATCH_FILL; 16];
+                        let restored = fs
+                            .write_at(fc, de.size, U9X_WRITE_OFFSET, &seed)
+                            .map(|w| w == seed.len())
+                            .unwrap_or(false);
+                        serial_println!(
+                            ":: U9x: pre-flight found a prior boot's pattern on disk; seed restore {} ::",
+                            if restored { "OK" } else { "FAILED" }
+                        );
+                        if restored {
+                            pre = u9x_read16(fc, de.size, U9X_WRITE_OFFSET);
+                        }
+                    }
+                }
+                (fc, de.size, pre)
             }
             _ => (0, 0, None), // absent / a directory / the wrong size -> in-memory mode
         }
