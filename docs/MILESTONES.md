@@ -10,6 +10,67 @@ Legend: **✅ metal-confirmed** · **🔬 QEMU-green, metal pending** · dates I
 
 ---
 
+## hw-pi4 track — 2026-07-08 (Opus round)
+
+### U10 — file GROWTH + CREATE + DELETE: cluster allocation, FAT-chain extension, directory mutation (aarch64) 🔬 `hw-pi4`
+- **What:** gives `fat::write_at` (U9's in-place-only writer) an ALLOCATOR, so `CAP_WRITE` can now **extend and
+  create** files — the three restrictions U9 kept (never write the FAT, never allocate, never touch a directory)
+  are lifted in rising order of risk. New `fat.rs` primitives, all FAT-safety-critical:
+  - **`set_fat_entry`** — writes EVERY FAT copy (`num_fats`, 2 on this card) at the mirrored offset, read-modify-
+    write per copy (neighbours preserved), FAT32 reserved high-nibble preserved. A one-FAT write is a corrupt
+    volume, so it always mirrors.
+  - **`alloc_cluster`** — a bounded first-fit free search over `[2, count+2)`; **zero-fills the cluster BEFORE it
+    can join a chain** (no stale-byte information disclosure), marks it EOC in all copies; `-ENOSPC` (new
+    `FatError::NoSpace`) when full. Never spins, never returns a reserved/bad/out-of-range cluster.
+  - **`find_located` / `write_dir_entry_fields`** — locate a directory entry's on-disk `(LBA, slot)` and RMW its
+    `first_cluster`/`size`, so the reader's source of truth (dir `size`) is bumped **last**.
+  - **`write_grow`** — walk chain → alloc+zero+link new clusters → RMW the data → publish dir `size` LAST. A
+    crash before the last step leaves the OLD smaller size on disk, never a size claiming unwritten clusters.
+  - **`create_in_root`** — format an 8.3 name (`format_83`), find a free directory slot (`0x00`/`0xE5`), write a
+    fresh 0-length entry; the first grow-write allocates its first cluster. Root-dir full → `-ENOSPC`.
+  - **`delete_located`** — crash-safe order: mark the dir entry `0xE5` FIRST, then free the whole chain (all FAT
+    copies); a crash mid-delete leaves lost clusters (benign), never a live entry aliasing freed clusters.
+  A refactor keeps the read path honest: `fat_entry` delegates to the new `pub fat_entry_copy` (one FAT-offset
+  site), and `scan_dir_sector` shares the on-disk 8.3 parse with the new locator via `classify_dir_slot`/`DirSlot`
+  (single source of truth). **Syscall surface:** the per-task FILES descriptor gains the dir `(LBA, off)` (captured
+  at `sys_open`); `sys_write_file` splits — `len <= bytes-to-EOF` keeps U9's in-place path byte-identical, a write
+  past EOF routes to `write_grow` (capped `GROW_WRITE_MAX = 8 KiB`); `SYS_OPEN` gains **`O_CREAT`** (mode bit1,
+  endows RW); **`SYS_UNLINK = 16`** deletes via a File+`CAP_WRITE` handle. Grow, create, AND delete are all
+  reachable ONLY through `sys_write`'s single `handle_resolve(asid, fd, CAP_WRITE)` CHECK (create via an O_CREAT
+  open that endows `CAP_WRITE`), so an RO-opened / revoked (U7/U8 walk inside `handle_resolve`) / wrong-kind handle
+  is `-EACCES` and can never mutate the volume — no new enforcement code.
+- **Tested — QEMU:** `./arroyo kernel8-test 30` → after the U9 PASS, three new verdicts:
+  `:: U10: file growth — … on-disk size grew + appended data present + both FAT copies consistent -> PASS ::`,
+  `:: U10-create: file create — … on-disk entry present with right size + content, no duplicate -> PASS ::`,
+  `:: U10-delete: file delete — … on-disk entry gone + chain freed (all FAT copies) + cluster re-allocatable -> PASS ::`.
+  Three register-only single-slot fixtures (`el0-u10{grow,create,delete}`, witnesses `0x1F`/`0xF`/`0x1F`) drive the
+  three ops through the syscall surface; each launcher folds the kernel-side proof — a **fresh `mount()` re-read**
+  shows the on-disk `size` grew / the entry appeared / the entry vanished, the appended-or-written bytes are on the
+  card, the original clusters survived, both FAT copies agree along the chain, and a deleted file's cluster is free
+  again (first-fit re-allocatable). The delete fixture also opens its file TWICE and proves that after unlinking via
+  one handle a read through the SIBLING handle is `-EACCES` (no stale reference to the freed chain). **18 PASS** (15 prior + the 3 U10), **CAPSTONE 6/6**, only the 3 expected M6b
+  EL0 kills, 0 unexpected faults. Every prior verdict **byte-identical** (sorted scratch-worktree baseline diff vs
+  `ca1b765` — only the new U10 lines differ, plus the binary-growth `VBAR_EL1` shift `0xad800`→`0xb1000` and the
+  identity-mapped `USER_REGION` address shift it drags along, which move the M6b EL0-fault diagnostic ELR/FAR — the
+  M6b **verdict** line is byte-identical). `./arroyo test-arm 22` green (the module is baremetal-gated); `./arroyo
+  check` both arches; **zero x86 files** (the new FAT writers are additive — x86 never calls them).
+- **Honest scope:** grow + create + delete land. **Deferred:** subdirectories, LFN (long names), rename,
+  write-back caching (every mutation is a synchronous RMW to the card), root-directory-chain extension (root-dir
+  full → `-ENOSPC`), and UnaFS `owner`/`grants:*` on the namespace ops (open/create/unlink are cap-gated on the
+  *handle* for read/write/delete, but the by-name namespace itself is not ACL'd yet — the future UnaFS layer).
+  Deletion invalidates ALL of the caller's descriptors naming the file (a same-process double-open leaves the
+  sibling fail-safe, `-EACCES`); the remaining gap is CROSS-process (a file open in another process when unlinked
+  leaves that process's descriptor stale — needs a global open-file refcount / `SYS_CLOSE`, deferred). An `O_CREAT`
+  that then fails to claim a kernel handle leaves a harmless 0-length entry (no kernel leak). Names are strict 8.3
+  (trailing-dot / multi-dot / non-representable names → `-EINVAL`).
+- **Lane:** the seat's U9 widening stands — the pi4 lane covers the shared `fat.rs`/`block.rs` + the FAT image
+  builder in `arroyo` for this arc (`block.rs` untouched this arc). All FAT writers are aarch64-only by call site.
+- **Metal:** 🔬 QEMU-green, **metal pending** — rides the next Pi 4 boundary. ⚠ **This is the first arc that
+  ALLOCATES + MUTATES the FAT and directory on a real card — the metal-risk beyond U9's single in-place sector
+  (multi-sector zero-fill, both-FAT mirrored writes, directory RMW).** The launchers' fresh-mount re-read is the
+  proof; the boundary should re-copy pristine `GROW.BIN` (0xC1, 512 B) between runs, as U9 does for `SCRATCH.BIN`.
+- **Commit:** on `hw-pi4` (Opus-executed) — M1 `a10c4b5`, M2 `5f1b0a3`, M3 `d02fb9c`.
+
 ## hw-pi4 track — 2026-07-07 (Opus round, post-Campaign 2)
 
 ### U9 — real File writes + seek: EMMC2 sector write, in-place `fat::write_at`, `SYS_SEEK`, File+`CAP_WRITE`-routed `sys_write` (aarch64) ✅ `hw-pi4`
