@@ -5087,11 +5087,9 @@ pub fn u5x_launcher(demo_cpu: usize) {
         return;
     }
 
-    // 2. No block device -> keep the no-storage control path free of demo lines (U5x needs no disk).
-    if crate::drivers::block::info().is_none() {
-        U5X_LAUNCH_DONE.store(true, Ordering::Release); // release the U6x gate (U6x also gates on storage)
-        return;
-    }
+    // 2. U5x runs REGARDLESS of a block device (its fixture is an inline console-cap blob — no disk), so the
+    //    capability chain is visible on the no-storage / metal path. `U5X_LAUNCH_DONE` is set at the end of the
+    //    run path below (and on the no-free-slot skip), so the U6x gate is released either way.
 
     // 3. Build + pre-endow the fixture slot and spawn it on the demo core.
     let Some(u5) = u5x_setup() else {
@@ -5306,9 +5304,10 @@ pub fn u5x_probe_once() {
     if DONE.load(Ordering::Relaxed) {
         return;
     }
-    if crate::drivers::block::info().is_none() {
-        return; // retry next loop iteration until storage enumerates (mirrors u4x_probe_once)
-    }
+    // U5x is an INLINE console-cap demo — it needs NO block device (its fixture is an inline blob; sys_write
+    // targets the serial console, never disk). It runs REGARDLESS of storage so the capability chain is VISIBLE
+    // on the no-storage / metal path (replayed over the FTDI console), not only when a block device enumerates.
+    // The storage-GATED arcs (U2/U4x/U6x/U6bx/U9x/U11x) keep their gates. (Scoped relaxation — U5x/U7x/U8x only.)
     let online = crate::arch::smp::online_aps();
     let Some(&cpu) = online.first() else {
         DONE.store(true, Ordering::Relaxed);
@@ -5654,10 +5653,8 @@ fn u7x_run(demo_cpu: usize) {
         return;
     }
 
-    // 2. No block device -> keep the no-storage control path free of demo lines (U7x needs no disk).
-    if crate::drivers::block::info().is_none() {
-        return;
-    }
+    // 2. U7x runs REGARDLESS of a block device (both fixtures are inline console-cap blobs — no disk), so the
+    //    cross-process-transfer rung is visible on the no-storage / metal path.
     // The parent's dedicated core: a third AP, distinct from the child's (`demo_cpu`) and this
     // launcher's. Cooperative ring 3 hogs its core while polling, so sharing either would deadlock the
     // sequencing (the launcher could never run to release a GO word).
@@ -5914,10 +5911,8 @@ fn u8x_launcher(demo_cpu: usize) {
     if DONE.swap(true, Ordering::Relaxed) {
         return;
     }
-    // No block device -> keep the no-storage control path free of demo lines (mirrors the prior gates).
-    if crate::drivers::block::info().is_none() {
-        return;
-    }
+    // U8x runs REGARDLESS of a block device (its fixture is an inline console-cap blob — no disk), so the
+    // revocation-tree rung is visible on the no-storage / metal path. (Scoped relaxation — U5x/U7x/U8x only.)
     let Some(fix) = u8x_build() else {
         serial_println!(":: U8x: no free address-space slot — revocation-tree demo skipped ::");
         return;
@@ -6405,9 +6400,9 @@ pub fn u7x_probe_once() {
     if DONE.load(Ordering::Relaxed) {
         return;
     }
-    if crate::drivers::block::info().is_none() {
-        return; // retry next loop iteration until storage enumerates (mirrors the prior probes)
-    }
+    // U7x is an INLINE demo — both fixtures are inline blobs transferring a console cap, no disk. It runs
+    // REGARDLESS of storage so the cross-process-transfer rung shows on the no-storage / metal path (it needs 3
+    // online APs; fewer skips cleanly in u7x_run). (Scoped relaxation — U5x/U7x/U8x only.)
     let online = crate::arch::smp::online_aps();
     let Some(&cpu) = online.first() else {
         DONE.store(true, Ordering::Relaxed);

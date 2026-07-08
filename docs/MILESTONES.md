@@ -224,6 +224,31 @@ Legend: **✅ metal-confirmed** · **🔬 QEMU-green, metal pending** · dates I
   always-on in the syscall path; only the demo is gated.
 - **Commit:** `hw-rmbp`, Opus-executed.
 
+### No-storage capability-chain visibility — inline console-cap demos (U5x/U7x/U8x) run on the metal path + `UNAOS_NOSTORAGE` knob 🔬 `hw-rmbp`
+- **What:** the direct enabler for the FTDI metal bench. Every U-arc demo gated on `block::info().is_none()` and
+  SKIPPED with no block device, so on the metal rMBP (where the SD reader never enumerates over xHCI —
+  `task_47291f90` — leaving `block::info()` None) the whole capability chain was invisible. But U5x/U7x/U8x are
+  **inline console-cap blobs needing NO storage** (no `SYS_OPEN`, no `staged_bytes`, no disk — they transfer/revoke
+  `Console` caps and `sys_write` streams to serial); their gate was control-path DISCIPLINE (a clean no-storage
+  boot log), not a functional dependency. With the FTDI cable making the no-storage metal path observable, the gate
+  is **deliberately relaxed for those three demos only** (probe + launcher/run sites), surfacing the U5→U8 slice
+  (capabilities → cross-process transfer → revocation trees) over the metal console without waiting for the xHCI
+  storage fix.
+- **Scope + safety:** surgical — the storage-GATED arcs (U2 load/U4x/U6x/U6bx/U9x/U11x, which genuinely need FAT /
+  HELLO.BIN) KEEP their gates and still skip; NO protection touched (SMEP/NXE/W^X/page-perms are orthogonal — this
+  is a demo-visibility gate); the relaxed demos are the already-reviewed U5x/U7x/U8x fixtures on an additional path,
+  not new surface; relative demo order is preserved by the existing `*_LAUNCH_DONE` bounded waits, not the block
+  gate. New builder knob **`UNAOS_NOSTORAGE=1`** omits the QEMU `usb-storage` device (block absent) — the QEMU
+  analog of the metal no-storage path, and a preview of what the FTDI console replays.
+- **Tested — QEMU:** `UNAOS_NOSTORAGE=1 ./arroyo test 90` → `note='no mass-storage device enumerated'` (block
+  absent) with U5x/U7x/U8x **PASS**, every storage-gated arc absent (cleanly skipped), and U1a/U1b/U2-0/U3/U3.5
+  still PASS. **No regression block-present** (the relaxation is a no-op there): `./arroyo test 30` stays MISSION
+  SUCCESS with the applicable chain PASS; `UNAOS_FATIMG=sf ./arroyo test-fat sf 300` runs U1a→U11x with **0 FAIL**.
+  `./arroyo check` both arches green, **zero aarch64 files touched** (`arch/x86_64/syscall.rs` + `builder/src/main.rs`).
+- **Metal:** this is the metal ENABLER — the U5→U8 console-cap slice becomes metal-confirmable over the FTDI cable
+  at the Peter-attended bench; the storage-gated arcs still wait on `task_47291f90`.
+- **Commit:** `hw-rmbp`, Opus-executed.
+
 ---
 
 ## hw-pi4 track — 2026-07-07 (Opus round, post-Campaign 2)
