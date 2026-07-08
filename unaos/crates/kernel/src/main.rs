@@ -1023,12 +1023,12 @@ fn tegra_early_stop(boot_info: &'static mut BootInfo) -> ! {
                             // JB6 probe: is CPUCTL=0xffffffff a stuck CSB page-select or a dead
                             // Falcon core? Read-only ARU/CSB sweep (only page-select writes).
                             unaos_kernel::arch::xusb_tegra::jb6_csb_sweep();
-                            // JB7 (arc A): jb6 proved the page-select STICKS yet the BAR2 CSB
-                            // window is all-ones. Settle dead-core vs BAR2-aperture by cross-reading
-                            // CPUCTL through NVIDIA's alternate FPCI/CFG CSB path, and census the
-                            // Falcon clocks' ACTUAL enabled state (jb1c only proves the enable
-                            // acked). Both read-only, on the untouched inherited handoff state.
-                            unaos_kernel::arch::xusb_tegra::jb7_csb_cfg_read();
+                            // JB7 (arc A): census the Falcon clocks' ACTUAL enabled state — jb1c
+                            // only proves each MRQ_CLK ENABLE *acked*, not that the clock runs. A
+                            // pure BPMP query on the untouched inherited handoff state; clock-gated
+                            // vs reset-held. (The alternate FPCI/CFG CSB cross-read was tried on the
+                            // first JB7 metal boot and is EL3-FATAL on the halted block — SError to
+                            // BL31 — so it was removed; see the xusb_tegra JB7 note.)
                             unaos_kernel::arch::bpmp_tegra::jb7_clocks_query(&chan, ids);
                         }
                         Some(_) => serial_println!(

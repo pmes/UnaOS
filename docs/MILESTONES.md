@@ -12,26 +12,31 @@ Legend: **✅ metal-confirmed** · **🔬 QEMU-green, metal pending** · dates I
 
 ## hw-jetson track — 2026-07-08 (attended bench, Peter at the Orin)
 
-### JB7 — arc A is the sole blocker; arc B refuted from the JB6 log + two read-only Falcon-core probes 🔬 offline prep, attended bench pending `hw-jetson`
+### JB7 — arc B refuted, arc A closed at the non-secure wall (Falcon core reset-held, unstartable from NS) ✅ metal-attended (native microSD) `hw-jetson`
 - **What:** an offline read of the JB6 run-F serial **refutes arc B** (the "XUSB StreamID mismatch"): the
   MC override **sticks** at `0xe` (`rb=0x0000000e/0x0000000e`; the "reads `0x0`" was the pre-fix
   first-touch), the SMMU stream matches + identity-translates, and the fault census is **clean**
   (`sGFSR=0x0`, CB0 FSR unchanged, `MC INTSTATUS=0x0`, before *and* after attach). Zero faults ⇒ no XUSB
   DMA is even attempted — the empty event ring is **arc A's shadow** (a halted Falcon = a halted xHC
   command engine issues no completion), not a DMA-delivery failure. S2CR bypass (the baton's fix) was
-  moreover already refuted on metal (boots 5/6). **Arc A** (`CPUCTL=0xffffffff` at every stage, immovable;
-  ARU alive, core in reset behind it) is the only blocker. Added two probes (`feature="tegra"` +
-  `JB5_PROBE`-gated → QEMU byte-identical): **`jb7_csb_cfg_read`** cross-reads CPUCTL via NVIDIA's
-  alternate FPCI/CFG CSB path (`FPCI+0x41c`/`+0x800`, source-verified against `UsbFalconLib.c`) vs BAR2
-  (dead-core vs aperture), and **`jb7_clocks_query`** reports the 9 DTB + 4 leaf Falcon clocks' actual
-  `MRQ_CLK IS_ENABLED` state (clock-gated vs reset-held).
-- **Bench (pending):** two non-destructive boots — A1 (JB7 probes) + A2 the **boot-medium bisect** (boot
-  from native microSD/NVMe, never tried — every prior boot was SD-in-a-USB-reader, a USB device on the very
-  XUSB host; if the Falcon arrives alive on a non-USB boot, arc A is solved with zero kernel code). Runbook
-  `~/.claude/plans/unaos-jetson-arcA-bench.md`.
+  moreover already refuted on metal (boots 5/6). Added a read-only clock-census probe
+  (`bpmp_tegra::jb7_clocks_query`, MRQ_CLK `IS_ENABLED`) to characterise the halt (`feature="tegra"` +
+  `JB5_PROBE`-gated → QEMU byte-identical). A BAR2-vs-CFG CSB cross-read (`jb7_csb_cfg_read`) was added
+  then **removed** — the metal boot proved the CFG aperture EL3-fatal (below).
+- **Metal — ✅ attended (Orin, native microSD, 2026-07-08), arc A CLOSED at the non-secure wall:**
+  (1) the alternate FPCI/CFG CSB aperture is **EL3-fatal** — first touch trapped to BL31 (`Unhandled
+  Exception in EL3`, `esr_el3=0xbe000011`, EC 0x2F SError) and killed the boot; unrouted post-EBS, probe
+  removed. (2) **Boot-medium bisect refuted** — first Falcon-witness boot off the **native microSD slot**
+  (not a USB reader) still read `CPUCTL=0xffffffff`; the halt is universal, not the USB-boot path.
+  (3) **Clock census** — core clock 269 **ON**, leaf 270/271 gated but not the lever (JB4 enabled them on
+  metal; CPUCTL stayed dead) ⇒ core is **reset-held**, not clock-gated. Clean through **CAPSTONE 6/6**.
+  With no `resets` on `usb@3610000`, MRQ_RESET can't reach the Falcon and the only BPMP reset (MRQ_PG
+  cycle) is retired — so a **non-secure kernel cannot start the halted Falcon** (as JB5 was for revival).
+  Next XUSB swing is bootloader/UEFI-side (suppress `XhciControllerDxe.Start` → inherit MB2's live Falcon)
+  or a pivot off USB.
 - **Tested — QEMU (the DONE gate):** `./arroyo check` + `UNAOS_TEGRA=1 ./arroyo check` both arches green
   (probes compile clean, zero new warnings); `UNAOS_TEGRA=1 ./arroyo esp-jetson` links (`kernel.elf`
-  254,856 B tegra, 122 `tegra:` strings); virt `test-arm` green (`storage_slot=1`, byte-identical — all
+  254,536 B tegra, 120 `tegra:` strings); virt `test-arm` green (`storage_slot=1`, byte-identical — all
   JB7 code gated off).
 - **Detail:** [`arch_arm64.md` §JB7](dev/OS/01_BOOT_HAL/arch_arm64.md). Next: the attended arc-A bench.
 

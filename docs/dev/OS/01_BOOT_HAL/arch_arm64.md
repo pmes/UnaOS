@@ -1141,7 +1141,7 @@ media. **Always rebuild `UNAOS_TEGRA=1 ./arroyo esp-jetson` after any `test-arm`
 `kernel.elf` (~248 KB tegra vs ~355 KB virt/corrupt) before flashing.** The size-check caught it here
 before a wasted attended boot.
 
-### JB7 — arc A is the sole blocker; arc B refuted from the JB6 log (offline analysis, 2026-07-08)
+### JB7 — arc B refuted, arc A closed at the non-secure wall (attended bench, 2026-07-08)
 
 A close read of the JB6 run-F serial (`unaos-jetson-jb6-serial.log`) settles the two "next arcs" the
 JB5+JB6 section left open: **arc A (the halted Falcon core) is the only real blocker, and arc B (the
@@ -1171,34 +1171,49 @@ reaches ENABLE_SLOT, and the watchdog fires because the halted command engine ne
 DMA-writes a completion. On Tegra XUSB **the Falcon *is* the xHC command engine**; a halted Falcon means no
 DMA of any kind, which is exactly the zero-fault census above.
 
-**Two read-only probes added (compile-gated `feature="tegra"`, run-time `JB5_PROBE`-gated → QEMU
+**Two read-only probes were added (compile-gated `feature="tegra"`, run-time `JB5_PROBE`-gated → QEMU
 byte-identical), wired into the raw-handoff block before any XUSB-affecting MRQ:**
 
-- **`xusb_tegra::jb7_csb_cfg_read`** — cross-reads `CPUCTL@0x100` (+`0x104`/`0x110`) through NVIDIA's
-  *alternate* FPCI/CFG CSB path (`XUSB_FPCI+0x41c` page-select, `XUSB_FPCI+0x800+(addr&0x1ff)` window;
-  `PageIndex=addr/0x200`, source-verified against `UsbFalconLib.c::FalconMapReg`) **and** the BAR2 path,
-  same boot. Both `0xffffffff` ⇒ core definitively dead (not a BAR2-aperture artifact); CFG reads real
-  data ⇒ the BAR2 window is the problem and the core may be alive. Only writes are page-selects (zeroed
-  on exit).
 - **`bpmp_tegra::jb7_clocks_query`** — MRQ_CLK `CMD_CLK_IS_ENABLED` (a pure query) for all 9 DTB clocks +
   the 4 Falcon leaf clocks (267/269/270/271). `jb1c_ungate_xusb` only proves each ENABLE *acked* (err==0);
-  this reports the clocks' *actual* state. All `=1` while `CPUCTL=0xffffffff` ⇒ clock-gating ruled out,
-  the core is **reset-held**.
+  this reports the clocks' *actual* state.
+- **`xusb_tegra::jb7_csb_cfg_read`** — a BAR2-vs-alternate-CFG CSB cross-read of `CPUCTL`. Added, then
+  **removed** after the metal boot proved it EL3-fatal (see below); the retirement note stands in
+  `xusb_tegra.rs` where the function was.
 
-**The attended bench (runbook: `~/.claude/plans/unaos-jetson-arcA-bench.md`)** runs two non-destructive
-boots: **A1** (the JB7 probes on the usual SD-in-USB-reader — characterizes dead-core-vs-aperture and
-clock-gated-vs-reset-held), and **A2** the **boot-medium bisect** — boot from the board's *native* microSD
-(SDMMC) or an NVMe FAT partition instead of a USB reader. Every prior Orin boot used SD-in-a-USB-reader — a
-USB device on the very XUSB host we are trying to inherit — so the hypothesis that the generic UEFI xHCI
-driver reading our boot medium is what halts the Falcon has **never been tested**. If the Falcon arrives
-alive on a non-USB boot (`witness[raw-handoff]` CPUCTL ≠ `0xffffffff`), arc A is solved with zero kernel
-code. If it stays halted, the halt is universal (XhciControllerDxe Start, or MB2/TZ) and arc A is at the
-non-secure wall — an honest, documented outcome, as JB5 was for revival.
+**Attended bench (2026-07-08, native microSD) — three findings close arc A:**
 
-**Gate:** `./arroyo check` both arches green; `UNAOS_TEGRA=1 ./arroyo check` both arches green (JB7 probes
-compile clean, zero new warnings); `UNAOS_TEGRA=1 ./arroyo esp-jetson` links, `kernel.elf` 254,856 B tegra
-(122 `tegra:` strings; +7 KB over JB4-prep is the added probe format strings, not corrupt-bloat); virt
-`test-arm` green (`storage_slot=1`, byte-identical — all JB7 code gated off).
+- **The alternate CFG CSB aperture is EL3-fatal.** `jb7_csb_cfg_read`'s first access to the FPCI/CFG CSB
+  window (`XUSB_FPCI+0x41c`/`+0x800`, the `UsbFalconLib.c::FalconMapReg` else-branch FalconUtil uses inside
+  UEFI) trapped to BL31 — `Unhandled Exception in EL3`, `esr_el3=0xbe000011` (EC 0x2F = SError, an async
+  CBB/fabric abort), `far_el3=0` — and killed the boot. Post-EBS on the inherited halted block that aperture
+  is unrouted, so touching it is the JX1 EL3-fatal class (an SError cannot be guarded from EL2). The probe
+  was **removed**; the BAR2 aperture (`jb6_csb_sweep`) is the only usable CSB path and cleanly reads
+  `0xffffffff`. Two apertures behaving differently (BAR2 decodes-but-floats vs CFG unrouted) is itself
+  confirmation the core is dead behind a partially-live ARU.
+- **Boot-medium bisect (A2) — refuted.** Booted from the board's **native microSD slot (SDMMC)**, not a USB
+  reader — the first Falcon-witness boot ever taken off a non-USB medium. `witness[raw-handoff]:
+  CPUCTL=0xffffffff` all the same. The halt is **not** the USB-boot path; it is universal.
+- **Clock census — core-clocked but reset-held.** All 9 DTB clocks read `=1`, including the Falcon **core**
+  clock 269; the two Falcon **leaf** clocks absent from the DTB list read gated — `CLK 270 (FALCON_HOST)=0`,
+  `CLK 271 (FALCON_SS)=0`. Not the lever: JB4 already enabled 270/271 on metal (`re-enable XUSB clk
+  270/271 -> err=0`) and `CPUCTL` stayed `0xffffffff`. Core clock on + core halted = **held in reset**, not
+  clock-gated. The clean boot ran through **CAPSTONE 6/6**.
+
+**Verdict — arc A is at the non-secure wall.** Every non-destructive NS lever is tried or ruled out: CSB
+STARTCPU (wrong path for t234), clock reassert (269 on, 270/271 enable no-ops), power/PG reassert (JB4/JB5,
+retired), the boot-medium bisect (universal halt), the alt CFG aperture (EL3-fatal), and MRQ_RESET (no
+`resets` on `usb@3610000`; the only BPMP reset is the retired MRQ_PG cycle). The core is held in reset by an
+agent outside NS reach — UEFI's `XhciControllerDxe.Start` handling, or MB2/secure-world. Starting it needs
+secure-world (BL31/MCE), a custom MB2, or a firmware-slot change — outside the executor's NS lane. This
+mirrors JB5's revival verdict: **a non-secure kernel cannot start the halted XUSB Falcon.** The next jetson
+XUSB swing is therefore a bootloader/UEFI-side question — can the JB6 shim also suppress
+`XhciControllerDxe.Start` so UnaOS inherits MB2's still-running Falcon? — a fresh arc, or a pivot off USB.
+
+**Gate:** `./arroyo check` + `UNAOS_TEGRA=1 ./arroyo check` both arches green (probes compile clean, zero new
+warnings); `UNAOS_TEGRA=1 ./arroyo esp-jetson` links, `kernel.elf` 254,536 B tegra (120 `tegra:` strings);
+virt `test-arm` green (`storage_slot=1`, byte-identical — all JB7 code gated off). Metal: native-microSD
+boot clean through CAPSTONE 6/6 with the clock census; the removed CFG probe's EL3 fault is recorded above.
 
 ## 4. Jetson Orin Nano headless bring-up (Arc JM2)
 
