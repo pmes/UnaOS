@@ -81,6 +81,15 @@ const SYS_RECV: u64 = 14;
 // position, is legal). A later SYS_READ / File SYS_WRITE resumes from the seeked offset. No I/O — a pure
 // descriptor-state update, so it is IF-masked-handler-safe (the whole x86 staged-storage divergence).
 const SYS_SEEK: u64 = 15;
+// U11x: CLOSE an open File — SYS_CLOSE(handle) -> `0`, or a negative errno (the aarch64 pi4 U11 twin; same
+// number). Frees the handle's open-file DESCRIPTOR (bumping its generation so a first-fit slot reuse can never
+// re-bind a lingering sibling file-id to a different file — the U9x revoke+reopen aliasing gap) and clears the
+// handle word. Close is not a mutation of the object, so it requires NO capability right; a non-File kind is
+// `-EINVAL` (left intact), and an unresolvable / already-closed / stale-slot handle is `-EBADF` (a double-close
+// returns cleanly; a use-after-close is denied). No I/O — the x86 staged write-back happens at whole-task
+// teardown (`clear_files_row`), so like a revoke this drop DISCARDS any un-flushed dirty bytes (only teardown
+// persists; a future arc could make an explicit close enqueue the flush).
+const SYS_CLOSE: u64 = 17;
 
 /// Base of the ring-3 window: 1 TiB — a FRESH top-level slot (PML4 index 2) above the firmware
 /// identity map, so mapping it touches no kernel state. `setup` proves it unmapped before use.
@@ -1088,6 +1097,129 @@ unsafe extern "C" {
     static unaos_user_u9x_write: u8;
 }
 
+// --- U11x ring-3 fixture (open-file LIFECYCLE: SYS_CLOSE + generation-tagged file-ids). ONE fixture
+// (`u11x-close`) exercising SYS_CLOSE end-to-end over the immutable staged SCRATCH.BIN (all 0xEE): open RO + read
+// the 16-byte seed; SYS_CLOSE -> 0; double-close -> -EBADF; a read through the now-closed handle -> -EACCES; then
+// REOPEN (a fresh handle first-fit-reusing the freed descriptor slot) + read the seed again. It builds a 5-bit
+// witness bitmask (see `U11X_WITNESS_ALL`) and conveys it as its `sys_exit` STATUS, routed BY NAME into
+// `U11X_WITNESS` (x86 has no SYS_REPORT — the u5x/u6bx/u8x/u9x idiom). Register-only apart from the read-back dest
+// (the DATA page, window page 1) — writes NO user stack, so it is safe on any slot under preemption. The fixture
+// reads offset 0 of SCRATCH.BIN's STAGED seed (always 0xEE, independent of any prior U9x disk write at offset
+// 520). It cannot reach the gen-rebind gap from ring 3 (no way to hold a stale file-id across a free), so the
+// no-rebind proof is kernel-side (`u11x_check_gen_rebind`). ABI (Linux-style): rax = number, args rdi/rsi/rdx,
+// return in rax; rcx/r11 are the SYSCALL-clobbered pair, so state rides r12-r15/rbx.
+core::arch::global_asm!(
+    r#"
+    .globl unaos_user_u11x_blob_start
+unaos_user_u11x_blob_start:
+    .balign 16
+    .globl unaos_user_u11x_close
+unaos_user_u11x_close:
+    xor r12d, r12d                          // witness bitmask = 0 (survives syscalls)
+    lea r14, [rip + unaos_user_u11x_blob_start] // r14 = window base (blob runs at the code-page base)
+    add r14, 0x1000                         // r14 -> read-back dest (writable DATA page, window page 1)
+    lea r15, [rip + unaos_user_u11x_pattern] // r15 -> the 16-byte expected seed (0xEE x16; RO code page)
+
+    // (0) open SCRATCH.BIN RO -> hA; read 16 bytes; they must equal the staged 0xEE seed
+    mov rax, 11                             // SYS_OPEN
+    lea rdi, [rip + unaos_user_u11x_name]   // name ptr (RO code page — ring-3 readable)
+    mov rsi, [rip + unaos_user_u11x_namelen] // name len ("SCRATCH.BIN" = 11)
+    xor edx, edx                            // mode = RO
+    syscall
+    mov rbx, rax                            // rbx = hA (>= 0) or -errno
+    test rbx, rbx
+    js 9f                                   // open failed -> exit with the witness so far
+    mov rax, 12                             // SYS_READ(hA, dest, 16)
+    mov rdi, rbx
+    mov rsi, r14
+    mov rdx, 16
+    syscall
+    cmp rax, 16
+    jne 1f                                  // short read -> skip bit0, still exercise the close path
+    mov rax, [r14]                          // two 8-byte compares: read-back == the 0xEE seed
+    cmp rax, [r15]
+    jne 1f
+    mov rax, [r14 + 8]
+    cmp rax, [r15 + 8]
+    jne 1f
+    add r12, 1                              // bit0: open RO + read matches the seed
+1:
+    // (1) SYS_CLOSE(hA) -> 0
+    mov rax, 17                             // SYS_CLOSE
+    mov rdi, rbx
+    syscall
+    test rax, rax                           // == 0 ?
+    jnz 2f
+    add r12, 2                              // bit1: close OK
+2:
+    // (2) SYS_CLOSE(hA) AGAIN -> -EBADF (double-close must be clean)
+    mov rax, 17
+    mov rdi, rbx
+    syscall
+    cmp rax, -9                             // -EBADF ?
+    jne 3f
+    add r12, 4                              // bit2: double-close -> -EBADF
+3:
+    // (3) a SYS_READ through the now-closed hA -> -EACCES (use-after-close denied; the handle word was cleared)
+    mov rax, 12
+    mov rdi, rbx
+    mov rsi, r14
+    mov rdx, 16
+    syscall
+    cmp rax, -13                            // -EACCES ?
+    jne 4f
+    add r12, 8                              // bit3: use-after-close -> -EACCES
+4:
+    // (4) reopen SCRATCH.BIN RO -> hB (a fresh handle reusing the freed slot); read 16 -> equals the seed again
+    mov rax, 11                             // SYS_OPEN SCRATCH.BIN RO
+    lea rdi, [rip + unaos_user_u11x_name]
+    mov rsi, [rip + unaos_user_u11x_namelen]
+    xor edx, edx
+    syscall
+    mov r13, rax                            // r13 = hB
+    test r13, r13
+    js 9f
+    mov rax, 12                             // SYS_READ(hB, dest, 16)
+    mov rdi, r13
+    mov rsi, r14
+    mov rdx, 16
+    syscall
+    cmp rax, 16
+    jne 9f
+    mov rax, [r14]
+    cmp rax, [r15]
+    jne 9f
+    mov rax, [r14 + 8]
+    cmp rax, [r15 + 8]
+    jne 9f
+    add r12, 16                             // bit4: reopen + read round-trip matches the seed
+9:
+    mov rax, 2                              // SYS_EXIT(witness) -> routed by name into U11X_WITNESS
+    mov rdi, r12
+    syscall
+8:  jmp 8b                                  // sys_exit never returns; belt-and-braces guard
+
+    .balign 8
+unaos_user_u11x_namelen:
+    .quad unaos_user_u11x_name_end - unaos_user_u11x_name
+unaos_user_u11x_name:
+    .ascii "SCRATCH.BIN"
+unaos_user_u11x_name_end:
+    .balign 8
+unaos_user_u11x_pattern:
+    .byte 0xEE, 0xEE, 0xEE, 0xEE, 0xEE, 0xEE, 0xEE, 0xEE
+    .byte 0xEE, 0xEE, 0xEE, 0xEE, 0xEE, 0xEE, 0xEE, 0xEE
+    .globl unaos_user_u11x_blob_end
+unaos_user_u11x_blob_end:
+"#
+);
+
+unsafe extern "C" {
+    static unaos_user_u11x_blob_start: u8;
+    static unaos_user_u11x_blob_end: u8;
+    static unaos_user_u11x_close: u8;
+}
+
 // --- The SYSCALL entry stub (LSTAR target). Naked; the only assembly in the syscall path.
 //
 // On entry (CPL 0, from SYSCALL): rcx = user RIP, r11 = user RFLAGS, rax = number, rdi/rsi/rdx =
@@ -1314,6 +1446,14 @@ pub fn record_ring3_kill(name: &str, vec: u8, err: u64, cr2: u64) {
         U9X_KILLED.fetch_add(1, Ordering::AcqRel);
         return;
     }
+    // U11x: the open-file-lifecycle fixture is register-only (its only user store is the read-back dest) and
+    // well-behaved; a kill is a real U11x bug — its own counter, never the U1b `killed_unexpected` count. Not in
+    // PROCS (the launcher spawned it, not sys_spawn), so no parent semaphore to post — the launcher times out to
+    // FAIL on `U11X_DONE`.
+    if name == "u11x-close" {
+        U11X_KILLED.fetch_add(1, Ordering::AcqRel);
+        return;
+    }
     let code_end = USER_BASE + PAGE_SIZE; // the code page is the first page of the window only
     let window_end = USER_BASE + USER_WINDOW_PAGES * PAGE_SIZE;
     let expected = match name {
@@ -1366,6 +1506,7 @@ extern "C" fn syscall_dispatch(nr: u64, a0: u64, a1: u64, a2: u64) -> i64 {
         SYS_XFER => sys_xfer(a0, a1, a2),
         SYS_RECV => sys_recv(),
         SYS_SEEK => sys_seek(a0, a1),
+        SYS_CLOSE => sys_close(a0),
         SYS_EXIT => {
             // U7x: the transfer fixtures exit BY NAME, BEFORE the Proc short-circuit below — the CHILD
             // has a launcher-PLANTED Proc entry (the pid->slot map sys_xfer resolves its dest through),
@@ -1480,6 +1621,14 @@ extern "C" fn syscall_dispatch(nr: u64, a0: u64, a1: u64, a2: u64) -> i64 {
                     U9X_WITNESS.store(a0 as u32, Ordering::Release);
                     U9X_DONE.fetch_add(1, Ordering::AcqRel);
                 }
+                Some("u11x-close") => {
+                    // U11x: the open-file-lifecycle fixture conveys its 5-bit witness bitmask as its exit STATUS
+                    // (routed by name, the same u5x/u6bx/u8x/u9x idiom — x86 has no SYS_REPORT). No planted Proc
+                    // entry (a single register-only fixture; the kernel-side gen-rebind check plants its own
+                    // scratch row), so it takes the ordinary by-name path. `U11X_DONE` gates the launcher's read.
+                    U11X_WITNESS.store(a0 as u32, Ordering::Release);
+                    U11X_DONE.fetch_add(1, Ordering::AcqRel);
+                }
                 Some(n) if n.starts_with("u3-") => {
                     // U3 per-process-CR3 fixture task exiting (its own accounting, so the U1a/U1b
                     // default counts stay byte-for-byte). The readback verdict reads slot memory.
@@ -1560,14 +1709,11 @@ fn sys_write(fd: u64, buf: u64, len: u64) -> i64 {
 /// decode, same up-front clamp/validate, same offset discipline. No create/grow/truncate — a write at/after
 /// EOF writes 0 bytes (a later arc adds allocation).
 fn sys_write_file(row: usize, file_id: u64, buf: u64, len: u64) -> i64 {
-    // Decode the file-id -> descriptor index (undo the +1 bias) and re-check presence (defense in depth: a
-    // live File handle always has a live descriptor, but never trust the value word blindly — mirrors sys_read).
-    let Some(idx) = (file_id as usize).checked_sub(1) else {
+    // U11x: decode + validate the file-id through the ONE seam (undo the +1 bias, bounds + presence + generation
+    // — a stale sibling to a reused slot is rejected). `None` -> -EACCES. Mirrors sys_read.
+    let Some(idx) = file_desc_validate(row, file_id) else {
         return EACCES;
     };
-    if idx >= NFILE || !FILE_USED[row][idx].load(Ordering::Acquire) {
-        return EACCES;
-    }
     // A File+CAP_WRITE descriptor is always RW-opened, so it owns a writable staging slot (FILE_WSTAGE holds
     // the +1-biased pool index). A File+CAP_WRITE handle with NO writable buffer (FILE_WSTAGE == 0) is a kernel
     // setup bug (an RO descriptor endowed CAP_WRITE out of band) — fail closed, never fabricate a write target.
@@ -1631,13 +1777,11 @@ fn sys_seek(handle: u64, offset: u64) -> i64 {
             _ => return EACCES,
         },
     };
-    // Decode the file-id -> descriptor index (undo the +1 bias) and re-check presence (defense in depth).
-    let Some(idx) = (file_id as usize).checked_sub(1) else {
+    // U11x: decode + validate the file-id through the ONE seam (bounds + presence + generation — a stale sibling
+    // to a reused slot is rejected). `None` -> -EACCES.
+    let Some(idx) = file_desc_validate(row, file_id) else {
         return EACCES;
     };
-    if idx >= NFILE || !FILE_USED[row][idx].load(Ordering::Acquire) {
-        return EACCES;
-    }
     let size = FILE_SIZE[row][idx].load(Ordering::Acquire);
     // Absolute seek: an offset PAST the file's size is invalid; seeking exactly TO `size` (the EOF position, a
     // legal 0-byte read/write point) is allowed. Preserves the FILE_OFFSET <= FILE_SIZE invariant. `size` is a
@@ -1647,6 +1791,40 @@ fn sys_seek(handle: u64, offset: u64) -> i64 {
     }
     FILE_OFFSET[row][idx].store(offset as u32, Ordering::Release);
     offset as i64
+}
+
+/// SYS_CLOSE(handle) -> `0`, or a negative errno (U11x; the aarch64 pi4 U11 twin). CLOSE an open `File`: free the
+/// handle's descriptor slot (bumping its generation, so a first-fit reuse never re-binds a lingering sibling
+/// file-id) and clear the handle word. A close is not a mutation of the underlying object, so it requires NO
+/// capability right — `handle_resolve(row, handle, 0)` admits any live handle the caller holds (kind + descriptor
+/// identity are still enforced). Semantics:
+///   * a live `File` -> free descriptor + clear handle -> `0`;
+///   * a `Console`/`Socket`/`Child` kind -> `-EINVAL`, object table UNTOUCHED (not closeable this arc — never
+///     corrupt it by freeing a File slot it does not own);
+///   * an unresolvable handle (Empty / out-of-range / RESERVING / revoked), or a `File` whose descriptor is
+///     already stale/closed (`file_desc_validate` fails) -> `-EBADF` — so a double-close returns cleanly and a
+///     use-after-close is denied.
+/// Only the caller's OWN descriptor slot is freed. x86 divergence from pi4: `files_free` DISCARDS any un-flushed
+/// dirty bytes (the staged write-back is a whole-task-teardown event, `clear_files_row`), so an explicit close of
+/// a dirty RW descriptor drops the un-flushed write exactly as a revoke does — the demo closes RO handles.
+fn sys_close(handle: u64) -> i64 {
+    let row = caller_row();
+    // Resolve for NO right (close is always permitted on a handle you hold). A non-File kind is refused without
+    // being touched; anything that does not resolve falls through to -EBADF (already closed / never opened).
+    let file_id = match handle_resolve(row, handle, 0) {
+        Ok(HandleTarget::File(id)) => id,
+        Ok(_) => return EINVAL, // Console/Socket/Child — not a closeable File this arc; leave it intact
+        Err(_) => return EBADF, // no such handle (already closed / never opened / oob / revoked)
+    };
+    // The handle is a live File, but its descriptor may already be gone (a sibling revoke freed the slot, or this
+    // is a stale handle to a reused slot). Validate before freeing so a double-close / stale-close is -EBADF, not
+    // a free of someone else's current descriptor.
+    let Some(idx) = file_desc_validate(row, file_id) else {
+        return EBADF;
+    };
+    files_free(row, idx); // release the slot + its writable staging (if any) + bump the generation
+    handle_clear(row, handle as usize);
+    0
 }
 
 /// Per-CPU SYSCALL/SYSRET + NX/SMEP setup. Called once per CPU (BSP in `arch::init`, each AP in
@@ -2371,6 +2549,7 @@ const EFAULT: i64 = -14; // a user range outside the window (or, for a SYS_READ 
 const ENOENT: i64 = -2; // SYS_OPEN: no staged file by that name (the staged set is the x86 "volume")
 const EIO: i64 = -5; // SYS_READ: a live descriptor over an unstaged source — a kernel bug; fail closed
 const EMFILE: i64 = -24; // SYS_OPEN: the caller's open-file table is full
+const EBADF: i64 = -9; // U11x SYS_CLOSE: no such handle (already closed / never opened / oob / stale-slot)
 
 /// A killed child's Proc status: a nonzero sentinel the child-KILL path stores so a killed child still
 /// WAKES its parent's sys_wait — but with status != 0, so the parent's witness reads FAIL (a killed
@@ -2566,6 +2745,17 @@ static FILE_DIRTY: [[AtomicBool; NFILE]; crate::arch::memory::USER_SLOTS + 1] =
 static FILE_DIRTY_LO: [[AtomicU32; NFILE]; crate::arch::memory::USER_SLOTS + 1] =
     [const { [const { AtomicU32::new(0) }; NFILE] }; crate::arch::memory::USER_SLOTS + 1];
 static FILE_DIRTY_HI: [[AtomicU32; NFILE]; crate::arch::memory::USER_SLOTS + 1] =
+    [const { [const { AtomicU32::new(0) }; NFILE] }; crate::arch::memory::USER_SLOTS + 1];
+/// U11x: per-descriptor GENERATION counter. A `File` handle's value word packs `(gen << 32) | (idx + 1)`, and
+/// `file_desc_validate` rejects a handle whose packed gen != the slot's CURRENT gen — so a stale sibling handle
+/// to a slot that was freed (e.g. by a File revoke or SYS_CLOSE) and then FIRST-FIT-REUSED by a different file is
+/// `-EACCES` (a gen mismatch), never a silent re-bind to that different file (closes the U9x revoke+reopen note).
+/// Bumped LAST on EVERY free (`files_free` — the path SYS_CLOSE, `sys_cap_revoke`'s File-drop, and `sys_open`'s
+/// unwind route through — and `clear_files_row` at teardown) so the very next reuse of the slot lands on a fresh
+/// generation. Const-init `0`; monotone within a boot (a u32 wrap is ~4 billion frees away — unreachable for the
+/// demo). Acquire/Release-paired with `FILE_USED` (published last on alloc, cleared on free) so a validator that
+/// sees a live slot sees its gen. Meaningful for every slot (a fresh, never-freed slot reads gen 0). ---
+static FILE_GEN: [[AtomicU32; NFILE]; crate::arch::memory::USER_SLOTS + 1] =
     [const { [const { AtomicU32::new(0) }; NFILE] }; crate::arch::memory::USER_SLOTS + 1];
 
 /// U9x M2: mark descriptor `[row][idx]` dirty and cover [lo, hi) in its dirty range. On the FIRST write
@@ -2765,6 +2955,41 @@ fn wstage_all_free() -> bool {
     (0..NWSTAGE).all(|k| !WSTAGE_USED[k].load(Ordering::Acquire))
 }
 
+/// U11x: pack a `(generation, descriptor index)` pair into a `File` handle's value word. Low 32 bits = `idx + 1`
+/// (the +1 bias keeps the whole word clear of the value word's `0`=Empty / `u64::MAX`=RESERVING sentinels for ANY
+/// index and generation — `idx + 1 >= 1` so the low half is nonzero, and `idx + 1 <= NFILE` so the word is never
+/// all-ones); high 32 bits = the slot's generation at open time. `file_desc_validate` decodes + validates. The
+/// gen-0 encoding of index `idx` is exactly `idx + 1` — byte-identical to the pre-U11x bare file-id, so a fresh
+/// open on a never-freed slot is unchanged.
+fn file_id_pack(g: u32, idx: usize) -> u64 {
+    ((g as u64) << 32) | ((idx + 1) as u64)
+}
+
+/// U11x: THE single point that turns a `File` handle's value word into a live descriptor index. Decodes the
+/// packed `(gen, idx)`, bounds-checks `idx`, requires the slot LIVE (`FILE_USED`), and requires the packed
+/// generation to equal the slot's CURRENT generation. The gen check is what closes the U9x revoke+reopen note:
+/// after a slot is freed (gen bumped) and first-fit-REUSED by a different file (`FILE_USED` true again), a
+/// lingering handle carrying the OLD gen fails here — no silent re-bind. Every File consumer
+/// (`sys_read`/`sys_write_file`/`sys_seek`/`sys_close`, and `sys_cap_revoke`'s File-drop) funnels its file-id
+/// through this ONE helper, so the descriptor-identity check is inherited once (no per-syscall re-derivation that
+/// could drift). Returns the validated index; `None` == invalid/stale (the caller maps to `-EACCES`, or
+/// `sys_close` to `-EBADF`). Acquire loads pair with the Release stores in `files_alloc`/`files_free`
+/// (belt-and-braces: a row has one writer at a time — its own task mid-syscall, or teardown after exit).
+fn file_desc_validate(row: usize, file_id: u64) -> Option<usize> {
+    let idx = ((file_id & 0xFFFF_FFFF) as usize).checked_sub(1)?;
+    if idx >= NFILE {
+        return None;
+    }
+    if !FILE_USED[row][idx].load(Ordering::Acquire) {
+        return None; // free slot — a closed/revoked/unopened descriptor (the U6bx–U9x presence check)
+    }
+    let g = (file_id >> 32) as u32;
+    if FILE_GEN[row][idx].load(Ordering::Acquire) != g {
+        return None; // slot was freed + reused since this handle was minted — stale, no rebind (U11x)
+    }
+    Some(idx)
+}
+
 /// Claim the first free descriptor in the caller's FILES row for a freshly-opened file, returning its
 /// index (the caller biases it to the file-id `idx + 1`). `wstage` is the `+1`-biased writable-staging slot
 /// for a RW open (`0` for a RO open). Publishes staged-idx/size/offset/wstage after the `FILE_USED` CAS
@@ -2814,6 +3039,11 @@ fn files_free(row: usize, idx: usize) {
     FILE_SIZE[row][idx].store(0, Ordering::Release);
     FILE_OFFSET[row][idx].store(0, Ordering::Release);
     FILE_USED[row][idx].store(false, Ordering::Release);
+    // U11x: bump the slot's generation LAST — so the next `files_alloc` reuse lands on a fresh gen and any handle
+    // still carrying the old (gen, idx) fails `file_desc_validate`'s gen check (no sibling rebind). Last because a
+    // validator that observed the slot LIVE with the old gen resolved a genuinely-live descriptor (the same
+    // file); the rebind window only opens once the slot is both free AND reused.
+    FILE_GEN[row][idx].fetch_add(1, Ordering::AcqRel);
 }
 
 /// Clear an ENTIRE per-task open-file row at teardown — the file twin of `clear_handle_row`'s handle wipe
@@ -2855,6 +3085,9 @@ fn clear_files_row(slot: usize) {
         FILE_SIZE[slot][k].store(0, Ordering::Release);
         FILE_OFFSET[slot][k].store(0, Ordering::Release);
         FILE_USED[slot][k].store(false, Ordering::Release);
+        // U11x: bump each slot's generation at teardown too (last, per slot) — so a recycled slot never hands its
+        // next tenant a stale-gen descriptor that a lingering file-id could rebind to.
+        FILE_GEN[slot][k].fetch_add(1, Ordering::AcqRel);
     }
 }
 
@@ -2939,7 +3172,11 @@ fn sys_open(name_ptr: u64, name_len: u64, mode: u64) -> i64 {
         }
         return EMFILE; // this task's open-file row is full
     };
-    let file_id = (fid + 1) as u64; // +1 bias: never the value word's 0 (Empty) / u64::MAX (RESERVING)
+    // U11x: pack the slot's CURRENT generation into the file-id — `(gen << 32) | (idx + 1)`. The +1 low half
+    // keeps the word clear of the 0 (Empty) / u64::MAX (RESERVING) sentinels; the gen high half lets
+    // `file_desc_validate` reject a stale sibling handle after a free+reuse of this slot. `files_alloc` never
+    // touches gen (it advances only on free), so this reads the gen this descriptor lives under.
+    let file_id = file_id_pack(FILE_GEN[row][fid].load(Ordering::Acquire), fid);
     let Some(h) = handle_install(row, HANDLE_RESERVING) else {
         files_free(row, fid); // no handle slot — release the descriptor (and its writable slot); no leak
         return EAGAIN;
@@ -2971,14 +3208,12 @@ fn sys_read(handle: u64, buf: u64, len: u64) -> i64 {
         Ok(HandleTarget::File(id)) => id,
         _ => return EACCES,
     };
-    // Decode the file-id -> descriptor index (undo the +1 bias) and re-check presence (defense in depth:
-    // a live File handle always has a live descriptor, but never trust the value word blindly).
-    let Some(idx) = (file_id as usize).checked_sub(1) else {
+    // U11x: decode + validate the file-id through the ONE seam — undo the +1 bias, bounds-check, re-check
+    // presence (defense in depth) AND require the packed generation to match the slot's current gen (a stale
+    // sibling to a reused slot is rejected, no rebind). `None` -> -EACCES.
+    let Some(idx) = file_desc_validate(row, file_id) else {
         return EACCES;
     };
-    if idx >= NFILE || !FILE_USED[row][idx].load(Ordering::Acquire) {
-        return EACCES;
-    }
     let size = FILE_SIZE[row][idx].load(Ordering::Acquire);
     // U7x (folding the ledgered U6bx note): the offset advance is now a tx-exact CAS CLAIM, not a
     // load->store — two SHARED_ROW tasks racing one descriptor each claim a DISJOINT byte range (the
@@ -4399,11 +4634,12 @@ fn sys_cap_revoke(row: usize, idx: u64) -> i64 {
     // frees it and the survivor's reads fail CLOSED (-EACCES at the FILE_USED re-check) — per-descriptor
     // refcounts ride the revocation-tree arc.
     if handle_kind(row, idx as usize) == KIND_FILE {
-        if let Some(fid) = handle_get(row, idx as usize)
-            .filter(|&v| v != HANDLE_RESERVING)
-            .and_then(|v| (v as usize).checked_sub(1))
-        {
-            if fid < NFILE && FILE_USED[row][fid].load(Ordering::Acquire) {
+        // U11x: the value word is now a gen-tagged file-id `(gen << 32) | (idx + 1)`, so decode it through
+        // `file_desc_validate` (which masks the low half, bounds-checks, and matches the generation) rather than a
+        // bare `checked_sub(1)` — a bare subtract would leave the gen bits in the index. A stale/out-of-range id
+        // (a kernel bug) validates to `None` and is simply skipped; the handle clear below still denies every use.
+        if let Some(file_id) = handle_get(row, idx as usize).filter(|&v| v != HANDLE_RESERVING) {
+            if let Some(fid) = file_desc_validate(row, file_id) {
                 files_free(row, fid);
             }
         }
@@ -4594,6 +4830,21 @@ static U9X_DONE: AtomicU32 = AtomicU32::new(0);
 /// A killed U9x fixture — a real bug (it is register-only apart from its read-back dest store). Off the U1b
 /// counter (a kill here fails only the U9x verdict, never a phantom U1b regression).
 static U9X_KILLED: AtomicU32 = AtomicU32::new(0);
+
+/// The U11x open-file-lifecycle fixture (`u11x-close`) exercises SYS_CLOSE end-to-end over the immutable staged
+/// SCRATCH.BIN: (bit0) open RO + read the 16-byte seed OK; (bit1) SYS_CLOSE -> `0`; (bit2) double-close ->
+/// `-EBADF`; (bit3) a read through the closed handle -> `-EACCES` (use-after-close denied); (bit4) reopen (a fresh
+/// handle reusing the freed slot) + read the seed again (round-trip). 5 bits — see `U11X_WITNESS_ALL`. The x86
+/// gen-rebind gap is not ring-3-reachable (no way to hold a stale file-id across a free), so this fixture proves
+/// SYS_CLOSE semantics while `u11x_check_gen_rebind` (kernel-side) is the airtight no-rebind proof.
+const U11X_WITNESS_ALL: u32 = 0x1F;
+/// The U11x fixture's final witness bitmask (its `sys_exit` status, routed by name — the u5x/u6bx/u8x/u9x idiom).
+static U11X_WITNESS: AtomicU32 = AtomicU32::new(0);
+/// The U11x fixture (`u11x-close`) reached its witness exit (want 1). Read by `u11x_launcher`'s bounded wait.
+static U11X_DONE: AtomicU32 = AtomicU32::new(0);
+/// A killed U11x fixture — a real bug (register-only apart from its read-back dest store). Off the U1b counter (a
+/// kill here fails only the U11x verdict, never a phantom U1b regression).
+static U11X_KILLED: AtomicU32 = AtomicU32::new(0);
 
 /// U4x fixture run parameters: the parent's + orphan's ring-3 entry VAs (both inside the shared window
 /// VA — only the slot FRAME differs, via CR3), the shared initial user rsp, and each fixture's slot
@@ -5203,7 +5454,11 @@ pub fn u6bx_launcher(demo_cpu: usize) {
     let staged_sz = HELLO_LEN.load(Ordering::Acquire) as u32;
     if let Some(fid) = files_alloc(u6b.slot, 0, staged_sz, 0, 0) {
         // cluster 0: HELLO.BIN is read-only (no writable staging, never dirtied) — no flush target (U9x M2).
-        install_cap(u6b.slot, U6BX_NOCAP_IDX, KIND_FILE, (fid + 1) as u64, 0);
+        // U11x: pack the descriptor's generation into the file-id like a real `sys_open` (consistency — this cap
+        // carries rights 0 so a read is denied on rights before `file_desc_validate`, but the value word stays a
+        // valid gen-tagged file-id).
+        let nocap_id = file_id_pack(FILE_GEN[u6b.slot][fid].load(Ordering::Acquire), fid);
+        install_cap(u6b.slot, U6BX_NOCAP_IDX, KIND_FILE, nocap_id, 0);
     }
     // 3b. The kind negative: a Socket handle carrying CAP_READ — it HAS the right, so the read is denied
     //     purely on kind (SYS_READ serves File only). A scaffold id, no backing (never dereferenced).
@@ -5798,7 +6053,11 @@ fn u9x_check_revoked_write() -> bool {
         wstage_free(w);
         return false;
     };
-    let file_id = (fid + 1) as u64;
+    // U11x: pack the descriptor's CURRENT generation (the positive control above ran `clear_files_row(A)`, which
+    // bumps every slot's gen, so slot 0's gen is non-zero here) — the revoke below decodes this file-id through
+    // `file_desc_validate`, which now checks the gen, so a bare `(fid + 1)` would fail to match and the descriptor
+    // would never be freed (leaking the row, failing the verdict).
+    let file_id = file_id_pack(FILE_GEN[A][fid].load(Ordering::Acquire), fid);
     mark_dirty(A, fid, dirty_lo, dirty_hi); // dirty — the write the revoke must repudiate (never flush)
     // A ROOT File cap carrying CAP_WRITE|CAP_GRANT|CAP_REVOKE at index 2 (off index 0/CONSOLE_FD, the U8x idiom).
     install_cap(A, 2, KIND_FILE, file_id, CAP_WRITE | CAP_GRANT | CAP_REVOKE);
@@ -5995,6 +6254,144 @@ fn u9x_launcher(demo_cpu: usize) {
             sector_changed,
             size_unchanged,
             U9X_DONE.load(Ordering::Acquire),
+        );
+    }
+
+    // Chain the U11x open-file-lifecycle demo in program order (the u7x -> u8x -> u9x idiom): every U9x exit path
+    // above falls through to here, and the U9x fixture's slot has torn down (its verdict waited on teardown), so a
+    // slot is free for U11x. U11x needs no disk (it reads SCRATCH.BIN's static staged seed), but chaining it here
+    // keeps it behind the same block-device gate as the rest of the storage-gated chain (the no-storage control
+    // path stays demo-line-free).
+    u11x_launcher(demo_cpu);
+}
+
+/// Build the U11x fixture slot — the `u9x_build` shape for the U11x blob (allocate, scrub the WHOLE window, copy
+/// the blob into its RX-RO code page through the identity alias, return the run params). `None` if slot
+/// allocation fails. Does NOT pre-endow (the fixture opens its own files; no negatives to plant).
+fn u11x_build() -> Option<U7xFix> {
+    let slot = crate::arch::memory::alloc_user_space()?;
+    let bstart = &raw const unaos_user_u11x_blob_start as usize;
+    let bend = &raw const unaos_user_u11x_blob_end as usize;
+    let blen = bend - bstart;
+    assert!(blen as u64 <= PAGE_SIZE, "U11x blob does not fit in a code page");
+    let off = (&raw const unaos_user_u11x_close as usize - bstart) as u64;
+    let backing = crate::arch::memory::slot_backing_ptr(slot);
+    unsafe {
+        core::ptr::write_bytes(backing, 0, (USER_WINDOW_PAGES * PAGE_SIZE) as usize);
+        core::ptr::copy_nonoverlapping(bstart as *const u8, backing, blen);
+    }
+    Some(U7xFix {
+        entry: USER_BASE + off,
+        sp: USER_BASE + USER_WINDOW_PAGES * PAGE_SIZE - 16,
+        cr3: crate::arch::memory::slot_cr3(slot),
+        slot,
+    })
+}
+
+/// U11x kernel-side proof of the generation-tag rebind fix, staged on a scratch row (6 — clear by this point in
+/// the demo chain, since every fixture has exited + torn down and `u9x_check_revoked_write` used row 5; re-cleared
+/// defensively first). It reproduces the U9x revoke+reopen aliasing hole MECHANICALLY: claim a descriptor slot and
+/// mint its `(gen, idx)` file-id; free it (bumping the gen); then RE-claim the SAME slot (first-fit) for a
+/// "different file" — and prove the OLD file-id is now rejected by `file_desc_validate` (a generation mismatch)
+/// EVEN THOUGH the slot is live again (`FILE_USED` true), while a FRESH file-id minted against the reused slot
+/// resolves. That is exactly "no silent rebind on slot reuse", isolated from disk/EL0 timing. Leaves the row clean
+/// (no descriptor leaked). The aarch64 `u11_check_gen_rebind` twin (x86 `files_alloc`/`row` shape).
+fn u11x_check_gen_rebind() -> bool {
+    const A: usize = 6; // scratch private row (clear here — every fixture has torn down; u9x used row 5)
+    clear_files_row(A); // defensive: start from a provably clear row
+    let mut ok = true;
+    // 1. Claim a slot; mint its file-id at the current generation. A live descriptor resolves.
+    let Some(fid0) = files_alloc(A, 1 /*staged idx*/, 16 /*size*/, 0 /*wstage: RO*/, 0 /*cluster*/) else {
+        return false;
+    };
+    let g0 = FILE_GEN[A][fid0].load(Ordering::Acquire);
+    let id0 = file_id_pack(g0, fid0);
+    ok &= file_desc_validate(A, id0) == Some(fid0);
+    // 2. Free the slot (bumps the generation). The old file-id no longer resolves (slot is free).
+    files_free(A, fid0);
+    ok &= file_desc_validate(A, id0).is_none();
+    // 3. Re-claim: first-fit reuses the SAME slot at the bumped generation — a "different file".
+    let Some(fid1) = files_alloc(A, 1, 32 /*different size*/, 0, 0) else {
+        return false;
+    };
+    ok &= fid1 == fid0; // first-fit really reclaimed the slot
+    let g1 = FILE_GEN[A][fid1].load(Ordering::Acquire);
+    ok &= g1 != g0; // the generation advanced on free
+    let id1 = file_id_pack(g1, fid1);
+    // 4. THE PROOF: the slot is LIVE again, yet the STALE file-id is rejected (gen mismatch — no rebind); the
+    //    FRESH file-id resolves.
+    ok &= FILE_USED[A][fid1].load(Ordering::Acquire);
+    ok &= file_desc_validate(A, id0).is_none();
+    ok &= file_desc_validate(A, id1) == Some(fid1);
+    // Cleanup: drop the descriptor and demand the row clean (no leak).
+    files_free(A, fid1);
+    ok &= files_row_is_clear(A);
+    ok
+}
+
+/// U11x launcher + verdict — the LAST demo in the chain, chained off `u9x_launcher` in program order. Flow:
+/// one-shot; skip silently with no block device (the control-path discipline, chain-inherited); build + spawn the
+/// `u11x-close` fixture; wait (bounded) for its witness exit + teardown (FILES row + handle row clear); then run
+/// the kernel-side gen-rebind proof. PASS iff witness == `U11X_WITNESS_ALL` AND torn down AND no kill AND the
+/// gen-rebind proof held. Releases no further gate. No disk I/O (the fixture reads the static staged seed and the
+/// gen-rebind proof is pure descriptor bookkeeping) — so, unlike U9x, this runs identically in both FAT and
+/// non-FAT block-device modes and needs no metal storage (the xHCI enumeration blocker still keeps it off metal,
+/// like the rest of the storage-gated chain).
+fn u11x_launcher(demo_cpu: usize) {
+    // One-shot (reached once via the U9x chain; guard defensively anyway).
+    static DONE: AtomicBool = AtomicBool::new(false);
+    if DONE.swap(true, Ordering::Relaxed) {
+        return;
+    }
+    // No block device -> keep the no-storage control path free of demo lines (mirrors every prior gate; also
+    // chain-inherited, since `u9x_launcher` already returned before reaching here in that case).
+    if crate::drivers::block::info().is_none() {
+        return;
+    }
+    let Some(fix) = u11x_build() else {
+        serial_println!(":: U11x: no free address-space slot — open-file-lifecycle demo skipped ::");
+        return;
+    };
+    serial_println!(
+        ":: U11x: open-file lifecycle — SYS_CLOSE + generation-tagged file-ids (stale sibling to a reused slot -> -EACCES, no rebind) ::"
+    );
+    crate::arch::sched::spawn_user_in_space("u11x-close", fix.entry, fix.sp, demo_cpu, fix.cr3);
+
+    // Wait (bounded, yielding) for the fixture's witness exit, then snapshot the witness + kill count.
+    let vdeadline = crate::arch::ticks() + 5000;
+    while U11X_DONE.load(Ordering::Acquire) < 1 && crate::arch::ticks() < vdeadline {
+        crate::arch::sched::yield_now();
+    }
+    let witness = U11X_WITNESS.load(Ordering::Acquire);
+    let killed = U11X_KILLED.load(Ordering::Acquire);
+
+    // Teardown proof: the fixture exited holding one live descriptor (its reopened hB) and no pre-endowed handles,
+    // so its exit cleared BOTH the FILES row and the handle row. Poll bounded; false->true.
+    let tdeadline = crate::arch::ticks() + 2000;
+    while !(files_row_is_clear(fix.slot) && handle_row_is_clear(fix.slot))
+        && crate::arch::ticks() < tdeadline
+    {
+        crate::arch::sched::yield_now();
+    }
+    let cleared = files_row_is_clear(fix.slot) && handle_row_is_clear(fix.slot);
+
+    // Kernel-side mechanistic proof of the gen-tag (isolated from EL0 timing) — runs AFTER teardown so nothing
+    // else touches the scratch row.
+    let gen_ok = u11x_check_gen_rebind();
+
+    if witness == U11X_WITNESS_ALL && cleared && killed == 0 && gen_ok {
+        serial_println!(
+            ":: U11x: open-file lifecycle — open+read/close/double-close(-EBADF)/use-after-close(-EACCES)/reopen+read OK, gen-tagged file-id rejects a stale sibling to a reused slot -> PASS ::"
+        );
+    } else {
+        serial_println!(
+            ":: U11x: open-file lifecycle FAIL — witness={:#x} cleared={} killed={} gen_ok={} done={} (want {:#x}/true/0/true/1) ::",
+            witness,
+            cleared,
+            killed,
+            gen_ok,
+            U11X_DONE.load(Ordering::Acquire),
+            U11X_WITNESS_ALL,
         );
     }
 }

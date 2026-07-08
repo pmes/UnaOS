@@ -183,6 +183,47 @@ Legend: **✅ metal-confirmed** · **🔬 QEMU-green, metal pending** · dates I
   the AP-flush detour); UnaFS `grants:*` on `SYS_OPEN`.
 - **Commit:** `538a1bf` (`hw-rmbp`, Opus-executed).
 
+### U11x — open-file lifecycle: SYS_CLOSE + generation-tagged file-ids (x86) 🔬 `hw-rmbp`
+- **What:** the x86 twin of pi4 U11 M1 (`714daad`) — closes the U9x-tracked revoke+reopen aliasing gap. Before
+  this, a per-task FILES descriptor was named to ring 3 by a bare `+1`-biased slot index; when a File revoke
+  (`sys_cap_revoke`) freed a slot and a later `sys_open` first-fit-reused it, a lingering sibling handle carrying
+  the old index would silently re-bind to the DIFFERENT file now living in that slot (the `FILE_USED` guard lapsed
+  the moment the slot went live again). Fix = the standard slotmap/generation-index: a per-slot `FILE_GEN` counter
+  bumped LAST on every free (`files_free` — the path SYS_CLOSE + the File-revoke drop + `sys_open`'s unwind route
+  through — and `clear_files_row` at teardown); File handle words now pack `(gen << 32) | (idx + 1)`; and
+  `file_desc_validate` is the SINGLE seam (range + `FILE_USED` + gen) every File consumer (`sys_read`/
+  `sys_write_file`/`sys_seek`/`sys_close`, and the revoke File-drop) funnels through — a stale handle to a reused
+  slot is `-EACCES` (a gen mismatch), never a rebind. Gen 0 packs to exactly `idx + 1`, byte-identical to the
+  pre-U11x file-id, so every prior scaffold/kernel check that reads the value word is unaffected.
+- **SYS_CLOSE (17):** frees the caller's descriptor slot (bumping its gen) + clears the handle word. Requires NO
+  right (`handle_resolve(row, handle, 0)`); a non-File kind is `-EINVAL` (left intact), an unresolvable /
+  already-closed / stale-slot handle is `-EBADF` (a double-close returns cleanly; a use-after-close is denied). New
+  errno `EBADF = -9`. **x86 divergence from pi4:** `files_free` DISCARDS un-flushed dirty bytes (the staged
+  write-back is a whole-task-teardown event, `clear_files_row`), so an explicit close of a dirty RW descriptor
+  drops the write exactly as a revoke does — the demo closes RO handles; a future arc can make close enqueue the
+  flush.
+- **The x86 gap is revoke+reopen, not unlink:** x86 has no U10 (create/unlink), so — unlike pi4's fixture, which
+  creates + unlinks — the aliasing vector here is a File revoke (which frees the descriptor) then a reopen reusing
+  the slot. The gap is NOT ring-3-reachable at U9x (no way to hold a stale file-id across a free), so the ring-3
+  fixture (`u11x-close`) proves SYS_CLOSE semantics (open+read → close → double-close `-EBADF` → use-after-close
+  `-EACCES` → reopen+read; a 5-bit witness) over the immutable staged SCRATCH.BIN, while `u11x_check_gen_rebind`
+  (kernel-side, scratch row 6) is the airtight no-rebind proof: claim a slot + mint its `(gen, idx)`; free it (gen
+  bumps); re-claim the SAME slot (first-fit) at the bumped gen; prove the OLD file-id is rejected (gen mismatch)
+  EVEN THOUGH the slot is live again, while a FRESH file-id resolves. Chained off `u9x_launcher` in program order;
+  storage-gated (chain-inherited) but needs no disk itself (reads the static seed + pure descriptor bookkeeping),
+  so it PASSes identically in FAT and non-FAT block-device modes.
+- **Tested — QEMU:** `UNAOS_FATIMG=sf ./arroyo test-fat sf 300` → `:: U11x: open-file lifecycle —
+  open+read/close/double-close(-EBADF)/use-after-close(-EACCES)/reopen+read OK, gen-tagged file-id rejects a stale
+  sibling to a reused slot -> PASS ::`, with **all 17 prior U1a→U9x verdicts byte-identical**. Default no-FAT
+  `./arroyo test 30` stays MISSION SUCCESS and U11x PASSes (block device present, no FAT needed). `./arroyo check`
+  both arches green, **zero aarch64 files touched** (`arch/x86_64/syscall.rs` only). Every File value word backing
+  a real descriptor is gen-tagged (`sys_open`, the U6bx no-cap plant, the U9x revoke-check plant); the two opaque
+  scaffold ids (`0x100`/`0x200`) are untouched and resolve identically.
+- **Metal:** storage-gated like the rest of the chain (chained off `u9x_launcher`), so the xHCI enumeration
+  blocker (`task_47291f90`) keeps it off metal — QEMU-green is the ceiling. The gen-tag mechanism itself is
+  always-on in the syscall path; only the demo is gated.
+- **Commit:** `hw-rmbp`, Opus-executed.
+
 ---
 
 ## hw-pi4 track — 2026-07-07 (Opus round, post-Campaign 2)
