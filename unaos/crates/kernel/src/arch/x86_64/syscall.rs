@@ -7566,7 +7566,12 @@ fn u10cx_run(demo_cpu: usize) {
     }
     let cleared = files_row_is_clear(fix.slot) && handle_row_is_clear(fix.slot) && wstage_all_free();
 
-    let (drained, created_ok) = if ready && cleared {
+    // Gate the DRAIN on the SAME signal as the enqueue (HELLO_STAGED — a FAT volume is present), not the
+    // stricter `ready`, so a FAT-present boot where the pre-flight failed (`ready` false) still DRAINS the op the
+    // fixture enqueued (no stranded slot) and cannot masquerade as a false in-memory PASS. `ready` (the ABSENT
+    // pre-flight held) is folded into the pass instead: a FAT-present demo must actually prove on disk.
+    let disk_present = HELLO_STAGED.load(Ordering::Acquire);
+    let (drained, created_ok) = if disk_present && cleared {
         match crate::fs::fat::mount() {
             Ok(fs) => {
                 let mut drained = true;
@@ -7585,9 +7590,9 @@ fn u10cx_run(demo_cpu: usize) {
     };
 
     let core_ok = witness == U10CX_WITNESS_ALL && cleared && killed == 0;
-    let pass = core_ok && (!ready || (drained && created_ok));
+    let pass = core_ok && (!disk_present || (ready && drained && created_ok));
     if pass {
-        if ready {
+        if disk_present {
             serial_println!(
                 ":: U10c: file create — O_CREAT|RW+write+readback+idempotent-reopen OK, CREATED on FAT (on-disk entry present + content + exactly one dir entry, no duplicate) -> PASS ::"
             );
@@ -7598,8 +7603,8 @@ fn u10cx_run(demo_cpu: usize) {
         }
     } else {
         serial_println!(
-            ":: U10c: file create FAIL — ready={} witness={:#x} cleared={} killed={} drained={} created_ok={} done={} (want ready?ALL/true/0/true/true : ALL/true/0) ::",
-            ready, witness, cleared, killed, drained, created_ok, U10CX_DONE.load(Ordering::Acquire),
+            ":: U10c: file create FAIL — disk_present={} ready={} witness={:#x} cleared={} killed={} drained={} created_ok={} done={} (want disk?ready/ALL/true/0/true/true : ALL/true/0) ::",
+            disk_present, ready, witness, cleared, killed, drained, created_ok, U10CX_DONE.load(Ordering::Acquire),
         );
     }
 }
@@ -7731,7 +7736,12 @@ fn u10dx_run(demo_cpu: usize) {
     }
     let cleared = files_row_is_clear(fix.slot) && handle_row_is_clear(fix.slot) && wstage_all_free();
 
-    let (drained, deleted_ok) = if ready && cleared {
+    // Gate the DRAIN on the SAME signal as the enqueue (HELLO_STAGED), not the stricter `ready`, so a FAT-present
+    // boot with a failed pre-flight still drains the fixture's op (no stranded slot) and cannot report a false
+    // in-memory PASS; `ready` (absent pre-flight + a captured f0) is folded into the pass — a FAT-present demo
+    // must prove the delete on disk.
+    let disk_present = HELLO_STAGED.load(Ordering::Acquire);
+    let (drained, deleted_ok) = if disk_present && cleared {
         match crate::fs::fat::mount() {
             Ok(fs) => {
                 let mut drained = true;
@@ -7750,9 +7760,9 @@ fn u10dx_run(demo_cpu: usize) {
     };
 
     let core_ok = witness == U10DX_WITNESS_ALL && cleared && killed == 0;
-    let pass = core_ok && (!ready || (drained && deleted_ok));
+    let pass = core_ok && (!disk_present || (ready && drained && deleted_ok));
     if pass {
-        if ready {
+        if disk_present {
             serial_println!(
                 ":: U10d: file delete — create+write+unlink OK, sibling read -EACCES, re-open -ENOENT, DELETED on FAT (dir gone + chain freed in all FAT copies + cluster re-allocatable) -> PASS ::"
             );
@@ -7763,8 +7773,8 @@ fn u10dx_run(demo_cpu: usize) {
         }
     } else {
         serial_println!(
-            ":: U10d: file delete FAIL — ready={} witness={:#x} cleared={} killed={} drained={} deleted_ok={} done={} (want ready?ALL/true/0/true/true : ALL/true/0) ::",
-            ready, witness, cleared, killed, drained, deleted_ok, U10DX_DONE.load(Ordering::Acquire),
+            ":: U10d: file delete FAIL — disk_present={} ready={} witness={:#x} cleared={} killed={} drained={} deleted_ok={} done={} (want disk?ready/ALL/true/0/true/true : ALL/true/0) ::",
+            disk_present, ready, witness, cleared, killed, drained, deleted_ok, U10DX_DONE.load(Ordering::Acquire),
         );
     }
 }
