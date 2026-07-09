@@ -90,6 +90,10 @@ const SYS_SEEK: u64 = 15;
 // teardown (`clear_files_row`), so like a revoke this drop DISCARDS any un-flushed dirty bytes (only teardown
 // persists; a future arc could make an explicit close enqueue the flush).
 const SYS_CLOSE: u64 = 17;
+// U10: SYS_OPEN `mode` bit1 — create the file if it is absent from the "volume" (the aarch64 U10 O_CREAT twin;
+// same encoding). bit0 = RW. `mode == 3` (O_CREAT | RW) is what the create/delete fixtures pass. A create is
+// inherently RW (you create to write it); higher bits (O_TRUNC/O_EXCL/O_APPEND) stay reserved this arc.
+const O_CREAT: u64 = 1 << 1;
 
 /// Base of the ring-3 window: 1 TiB — a FRESH top-level slot (PML4 index 2) above the firmware
 /// identity map, so mapping it touches no kernel state. `setup` proves it unmapped before use.
@@ -1360,6 +1364,102 @@ unsafe extern "C" {
     static unaos_user_u10x_grow: u8;
 }
 
+// --- U10 CREATE ring-3 fixture (create-from-nothing — the aarch64 `__u10c_prog_create` twin). ONE fixture
+// (`u10cx-create`): O_CREAT|RW-opens FRESH.BIN (absent from the staged set — the kernel creates an in-memory
+// descriptor; the real dir entry + first-cluster alloc defer to the launcher's IF=1 drain), writes a 16-byte
+// pattern at offset 0 (a grow-from-empty), reads it back through the SAME cap, and re-opens the same name
+// O_CREAT|RW (idempotent create-if-present -> a second handle). 4-bit witness (`U10CX_WITNESS_ALL`) conveyed as
+// its `sys_exit` status, routed BY NAME into `U10CX_WITNESS`. Register-only apart from the read-back dest.
+core::arch::global_asm!(
+    r#"
+    .globl unaos_user_u10cx_blob_start
+unaos_user_u10cx_blob_start:
+    .balign 16
+    .globl unaos_user_u10cx_create
+unaos_user_u10cx_create:
+    xor r12d, r12d                          // witness bitmask = 0
+    lea r14, [rip + unaos_user_u10cx_blob_start]
+    add r14, 0x1000                         // r14 -> read-back dest (writable DATA page)
+    lea r15, [rip + unaos_user_u10cx_pattern] // r15 -> the 16-byte pattern (also the compare source)
+
+    // (0) SYS_OPEN("FRESH.BIN", O_CREAT|RW=3) -> creates the file, a File handle carrying CAP_READ|CAP_WRITE
+    mov rax, 11                             // SYS_OPEN
+    lea rdi, [rip + unaos_user_u10cx_name]
+    mov rsi, [rip + unaos_user_u10cx_namelen]
+    mov rdx, 3                              // mode = O_CREAT | RW
+    syscall
+    mov rbx, rax
+    test rbx, rbx
+    js 1f
+    add r12, 1                              // bit0: O_CREAT|RW open OK (created)
+
+    // (1) write the 16-byte pattern at offset 0 (past EOF=0) -> grow-from-empty returns 16
+    mov rax, 1                              // SYS_WRITE
+    mov rdi, rbx
+    mov rsi, r15
+    mov rdx, 16
+    syscall
+    cmp rax, 16
+    jne 1f
+    add r12, 2                              // bit1: write-from-empty OK
+
+    // (2) seek back to 0 and read the 16 bytes through the SAME cap -> must equal the pattern
+    mov rax, 15                             // SYS_SEEK
+    mov rdi, rbx
+    xor esi, esi                            // offset 0
+    syscall
+    cmp rax, 0
+    jne 1f
+    mov rax, 12                             // SYS_READ
+    mov rdi, rbx
+    mov rsi, r14
+    mov rdx, 16
+    syscall
+    cmp rax, 16
+    jne 1f
+    mov rax, [r14]
+    cmp rax, [r15]
+    jne 1f
+    mov rax, [r14 + 8]
+    cmp rax, [r15 + 8]
+    jne 1f
+    add r12, 4                              // bit2: read-back matches the written pattern
+1:
+    // (3) a SECOND O_CREAT|RW open of the same name -> a handle (idempotent create-if-present, no duplicate)
+    mov rax, 11
+    lea rdi, [rip + unaos_user_u10cx_name]
+    mov rsi, [rip + unaos_user_u10cx_namelen]
+    mov rdx, 3                              // O_CREAT | RW
+    syscall
+    test rax, rax
+    js 2f
+    add r12, 8                              // bit3: idempotent second open OK
+2:
+    mov rax, 2                              // SYS_EXIT(witness) -> routed by name into U10CX_WITNESS
+    mov rdi, r12
+    syscall
+3:  jmp 3b
+
+    .balign 8
+unaos_user_u10cx_namelen:
+    .quad unaos_user_u10cx_name_end - unaos_user_u10cx_name
+unaos_user_u10cx_name:
+    .ascii "FRESH.BIN"
+unaos_user_u10cx_name_end:
+    .balign 8
+unaos_user_u10cx_pattern:
+    .ascii "U10x-CREATE-OK99"
+    .globl unaos_user_u10cx_blob_end
+unaos_user_u10cx_blob_end:
+"#
+);
+
+unsafe extern "C" {
+    static unaos_user_u10cx_blob_start: u8;
+    static unaos_user_u10cx_blob_end: u8;
+    static unaos_user_u10cx_create: u8;
+}
+
 // --- The SYSCALL entry stub (LSTAR target). Naked; the only assembly in the syscall path.
 //
 // On entry (CPL 0, from SYSCALL): rcx = user RIP, r11 = user RFLAGS, rax = number, rdi/rsi/rdx =
@@ -1601,6 +1701,11 @@ pub fn record_ring3_kill(name: &str, vec: u8, err: u64, cr2: u64) {
         U10X_KILLED.fetch_add(1, Ordering::AcqRel);
         return;
     }
+    // U10 CREATE: the create fixture is register-only + well-behaved; a kill is a real U10 bug — its own counter.
+    if name == "u10cx-create" {
+        U10CX_KILLED.fetch_add(1, Ordering::AcqRel);
+        return;
+    }
     let code_end = USER_BASE + PAGE_SIZE; // the code page is the first page of the window only
     let window_end = USER_BASE + USER_WINDOW_PAGES * PAGE_SIZE;
     let expected = match name {
@@ -1782,6 +1887,11 @@ extern "C" fn syscall_dispatch(nr: u64, a0: u64, a1: u64, a2: u64) -> i64 {
                     // takes the ordinary by-name path. `U10X_DONE` gates the launcher's read.
                     U10X_WITNESS.store(a0 as u32, Ordering::Release);
                     U10X_DONE.fetch_add(1, Ordering::AcqRel);
+                }
+                Some("u10cx-create") => {
+                    // U10 CREATE: the create fixture conveys its 4-bit witness bitmask as its exit STATUS (by name).
+                    U10CX_WITNESS.store(a0 as u32, Ordering::Release);
+                    U10CX_DONE.fetch_add(1, Ordering::AcqRel);
                 }
                 Some(n) if n.starts_with("u3-") => {
                     // U3 per-process-CR3 fixture task exiting (its own accounting, so the U1a/U1b
@@ -2881,6 +2991,16 @@ const GROW_WRITE_MAX: usize = 512;
 /// U10 CREATE / DELETE: the runtime-created file names (absent from the staged set; the fixtures O_CREAT them).
 const U10C_NAME: &str = "FRESH.BIN";
 const U10D_NAME: &str = "DELME.BIN";
+/// U10 CREATE: the 16-byte pattern the create fixture writes into FRESH.BIN (also its final size). The `.ascii`
+/// in the fixture MUST match; the launcher re-reads it from disk. 16 chars. The aarch64 twin's `U10C_PATTERN`.
+const U10C_PATTERN: [u8; 16] = *b"U10x-CREATE-OK99";
+/// U10 CREATE: the created file's size after the write (== the pattern length) — the launcher's on-disk check.
+const U10C_WRITTEN: u32 = 16;
+/// U10 CREATE/DELETE: the `FILE_STAGED` sentinel a runtime-created descriptor carries — it is NOT backed by any
+/// staged blob (it always owns a wstage buffer, so `sys_read` serves from that and never consults `FILE_STAGED`);
+/// `staged_bytes(u32::MAX)` is `None`, so even a mis-read fails closed. Distinguishes a created descriptor's
+/// (irrelevant) staged index from a real one at a glance.
+const CREATED_STAGED_SENTINEL: u32 = u32::MAX;
 
 /// The staged-file NAME table: index k names the source `staged_bytes(k)` serves. Index 0 = HELLO.BIN (the
 /// buffer `stage_hello` fills for sys_spawn; shared, written once, then read-only). Index 1 = SCRATCH.BIN
@@ -3025,6 +3145,14 @@ static FILE_GREW: [[AtomicBool; NFILE]; crate::arch::memory::USER_SLOTS + 1] =
 static FILE_CREATED: [[AtomicBool; NFILE]; crate::arch::memory::USER_SLOTS + 1] =
     [const { [const { AtomicBool::new(false) }; NFILE] }; crate::arch::memory::USER_SLOTS + 1];
 
+/// U10 M3: per-row, per-U10-name "this created file was UNLINKED in this row" overlay. `sys_unlink` sets it (the
+/// descriptors are freed at unlink, so this — not a descriptor flag — is what makes a subsequent plain (non-
+/// O_CREAT) re-open of the name `-ENOENT` for the rest of the row's life). Indexed by the `U10_NAMES` id. Reset
+/// at teardown (`clear_files_row`) so a recycled slot/row starts clean and metal re-runs stay honest. Row-keyed
+/// like the descriptor tables; single-writer per row (its own task mid-syscall, or teardown after exit).
+static DYN_DELETED: [[AtomicBool; N_U10_NAMES]; crate::arch::memory::USER_SLOTS + 1] =
+    [const { [const { AtomicBool::new(false) }; N_U10_NAMES] }; crate::arch::memory::USER_SLOTS + 1];
+
 /// U9x M2: mark descriptor `[row][idx]` dirty and cover [lo, hi) in its dirty range. On the FIRST write
 /// (`FILE_DIRTY` false->true) SET [LO,HI) fresh to exactly [lo,hi); on later writes WIDEN by min/max — so the
 /// first write never starts the flushed span at offset 0 (which would RMW an un-dirtied sector). Single-writer
@@ -3154,6 +3282,8 @@ const U10OP_CREATE_GROW_DELETE: u32 = 3;
 /// the on-disk directory entry by the SAME name the fixture named (`find_located`). GROW.BIN is also a staged
 /// file (idx `GROW_STAGED_IDX`); FRESH.BIN/DELME.BIN are runtime-created (never staged).
 const U10_NAMES: [&str; 3] = [U10_GROW_NAME, U10C_NAME, U10D_NAME];
+/// The count of `U10_NAMES` — the width of the per-row `DYN_DELETED` overlay.
+const N_U10_NAMES: usize = U10_NAMES.len();
 static U10_USED: [AtomicBool; NU10] = [const { AtomicBool::new(false) }; NU10];
 static U10_OP: [AtomicU32; NU10] = [const { AtomicU32::new(0) }; NU10];
 static U10_NAMEID: [AtomicU32; NU10] = [const { AtomicU32::new(0) }; NU10];
@@ -3591,6 +3721,120 @@ fn files_row_is_clear(row: usize) -> bool {
     (0..NFILE).all(|k| !FILE_USED[row][k].load(Ordering::Acquire))
 }
 
+/// The `U10_NAMES` index of `name`, or `None` if it is not a U10 demo file. The single map from a name to the
+/// `+1`-biased `FILE_OPNAME` a created/growable descriptor carries and the `U10_NAMEID` a deferred op indexes.
+fn u10_name_id(name: &str) -> Option<u32> {
+    U10_NAMES.iter().position(|n| *n == name).map(|i| i as u32)
+}
+
+/// The `U10_NAMES` index of a name that O_CREAT may CREATE — the runtime files (FRESH.BIN / DELME.BIN), NOT the
+/// staged GROW.BIN (index 0, which is always resolved by the staged path). `None` for anything else — so O_CREAT
+/// of an arbitrary name is `-ENOENT`, never a way to mint a file outside the demo set.
+fn u10_creatable_nameid(name: &str) -> Option<u32> {
+    match u10_name_id(name) {
+        Some(id) if id != 0 => Some(id), // FRESH.BIN / DELME.BIN
+        _ => None,
+    }
+}
+
+/// The index of a LIVE runtime-created descriptor for `name` in `row`, or `None`. A created file "exists" for a
+/// second open (idempotent create-if-present) / a sibling open exactly while one of its descriptors is live —
+/// the x86 in-memory stand-in for the aarch64 on-disk `find_located` after an in-handler `create_in_root`.
+fn created_desc_in_row(row: usize, name: &str) -> Option<usize> {
+    let nameid = u10_name_id(name)?;
+    (0..NFILE).find(|&k| {
+        FILE_USED[row][k].load(Ordering::Acquire)
+            && FILE_CREATED[row][k].load(Ordering::Acquire)
+            && FILE_OPNAME[row][k].load(Ordering::Acquire) == nameid + 1
+    })
+}
+
+/// Install a `File` handle over an already-allocated descriptor `fid` carrying `rights` — the shared tail of
+/// every open path (staged, created, sibling): pack the slot's current generation into the file-id, reserve a
+/// handle (unwinding the descriptor on a full handle table, `-EAGAIN`), then publish kind + rights + the live
+/// file-id LAST (Release), so a resolver that sees the live value sees File + its rights. Returns the handle idx.
+fn install_file_handle(row: usize, fid: usize, rights: u32) -> i64 {
+    let file_id = file_id_pack(FILE_GEN[row][fid].load(Ordering::Acquire), fid);
+    let Some(h) = handle_install(row, HANDLE_RESERVING) else {
+        files_free(row, fid); // no handle slot — release the descriptor (and its writable slot); no leak
+        return EAGAIN;
+    };
+    handle_set_kind(row, h, KIND_FILE);
+    handle_set_rights(row, h, rights);
+    handle_set(row, h, file_id);
+    h as i64
+}
+
+/// The DYNAMIC-open path (U10 M2/M3) — reached when a name is NOT in the staged set. Resolves, in order: a LIVE
+/// runtime-created file in this row (idempotent create / sibling open); [M3: a created-then-deleted name -> gone];
+/// an O_CREAT target (a fresh created file). Anything else -> `-ENOENT`. A created file is inherently RW, so this
+/// refuses SHARED_ROW (the private-single-writer rule the U9x/M1 grow path relies on) up front.
+fn sys_open_dynamic(row: usize, name: &str, mode: u64) -> i64 {
+    let create = mode & O_CREAT != 0;
+    if row == SHARED_ROW {
+        return EACCES; // a created descriptor is RW; SHARED_ROW is refused (the writable-open discipline)
+    }
+    // A live created file in this row -> open ANOTHER descriptor to it (idempotent 2nd create / a sibling).
+    if let Some(existing) = created_desc_in_row(row, name) {
+        return open_created_sibling(row, existing);
+    }
+    // U10 M3: a created-then-deleted name stays GONE for a plain (non-O_CREAT) open.
+    if let Some(nameid) = u10_name_id(name) {
+        if !create && DYN_DELETED[row][nameid as usize].load(Ordering::Acquire) {
+            return ENOENT;
+        }
+    }
+    // O_CREAT of a creatable name -> a fresh 0-length created file (the first write grows it).
+    if create {
+        if let Some(nameid) = u10_creatable_nameid(name) {
+            return open_create_new(row, nameid);
+        }
+    }
+    ENOENT
+}
+
+/// U10 M2: open a FRESH runtime-created file — a 0-length RW descriptor backed by an EMPTY writable staging
+/// buffer (the first write grows it from empty; the real dir-entry + first-cluster alloc DEFER to the launcher
+/// drain). Marks the descriptor CREATED + stamps its `FILE_OPNAME` so the grow branch fires and teardown enqueues
+/// a `CreateGrow` op naming THIS file. Rights `CAP_READ | CAP_WRITE` (O_CREAT implies write). Errnos as the
+/// staged path: `-EMFILE` (no writable slot / FILES row full), `-EAGAIN` (handle table full).
+fn open_create_new(row: usize, nameid: u32) -> i64 {
+    let Some(w) = wstage_alloc(&[]) else {
+        return EMFILE; // the writable staging pool is full
+    };
+    let Some(fid) = files_alloc(row, CREATED_STAGED_SENTINEL, 0, (w + 1) as u32, 0) else {
+        wstage_free(w);
+        return EMFILE; // this task's open-file row is full
+    };
+    FILE_CREATED[row][fid].store(true, Ordering::Release);
+    FILE_OPNAME[row][fid].store(nameid + 1, Ordering::Release);
+    install_file_handle(row, fid, CAP_READ | CAP_WRITE)
+}
+
+/// U10 M2/M3: open ANOTHER descriptor to a live created file (`existing`) — the idempotent second O_CREAT open and
+/// the delete fixture's sibling handle. COPIES the existing descriptor's wstage content so the new descriptor's
+/// `WSTAGE_LEN == FILE_SIZE` invariant holds (a sibling never writes in the demo, so it stays CLEAN and enqueues
+/// NO op at teardown — only the primary's `CreateGrow`/`CreateGrowDelete` op persists; NU10 == 1 holds). Same
+/// CREATED identity (`FILE_OPNAME` name-id) so `sys_unlink` invalidates every sibling of the file.
+fn open_created_sibling(row: usize, existing: usize) -> i64 {
+    let seed: &[u8] = match (FILE_WSTAGE[row][existing].load(Ordering::Acquire) as usize).checked_sub(1) {
+        Some(ew) => wstage_bytes(ew),
+        None => &[],
+    };
+    let size = FILE_SIZE[row][existing].load(Ordering::Acquire);
+    let opname = FILE_OPNAME[row][existing].load(Ordering::Acquire); // already +1-biased
+    let Some(w) = wstage_alloc(seed) else {
+        return EMFILE;
+    };
+    let Some(fid) = files_alloc(row, CREATED_STAGED_SENTINEL, size, (w + 1) as u32, 0) else {
+        wstage_free(w);
+        return EMFILE;
+    };
+    FILE_CREATED[row][fid].store(true, Ordering::Release);
+    FILE_OPNAME[row][fid].store(opname, Ordering::Release);
+    install_file_handle(row, fid, CAP_READ | CAP_WRITE)
+}
+
 /// SYS_OPEN(name_ptr, name_len, mode) -> a handle index, or a negative errno. The FIRST resource-OPEN through
 /// the object table (the aarch64 U6b/U9 twin): validate + copy the name, look it up in the STAGED set, record
 /// an open-file descriptor in the caller's FILES row, and install a `File` handle (first-free). U9x: `mode`
@@ -3623,9 +3867,12 @@ fn sys_open(name_ptr: u64, name_len: u64, mode: u64) -> i64 {
     let Ok(name) = core::str::from_utf8(&namebuf[..n]) else {
         return ENOENT; // a non-UTF-8 name matches no staged entry
     };
-    // 2. Read-only lookup — nothing claimed yet, so a miss returns cleanly.
+    // 2. Read-only lookup — nothing claimed yet, so a miss returns cleanly. A name NOT in the staged set may be a
+    //    live runtime-CREATED file in this row (idempotent / sibling open) or an O_CREAT target (U10 M2/M3); the
+    //    dynamic-open path handles those, and returns -ENOENT if the name is neither. The STAGED path below is
+    //    UNCHANGED (U9x/U6bx byte-for-byte).
     let Some((sidx, size)) = staged_lookup(name) else {
-        return ENOENT;
+        return sys_open_dynamic(row, name, mode);
     };
     // 3. Claim resources LAST — for a RW open, a writable staging slot FIRST (seeded from the file's staged
     //    content, so a read before any write sees the original bytes), then a descriptor, then a handle. RO
@@ -5357,6 +5604,19 @@ static U10X_DONE: AtomicU32 = AtomicU32::new(0);
 /// A killed U10 GROW fixture — a real bug (register-only apart from its read-back dest store). Off the U1b counter.
 static U10X_KILLED: AtomicU32 = AtomicU32::new(0);
 
+/// U10 CREATE: the witness bitmask the create fixture (`u10cx-create`) reports: bit0 open O_CREAT|RW OK (the file
+/// is created), bit1 write at offset 0 -> 16 (grow-from-empty allocates the first cluster), bit2 seek-0 + read ->
+/// the pattern (through the SAME cap), bit3 a SECOND O_CREAT|RW open of the same name -> a handle (idempotent
+/// create-if-present). `u10cx_launcher` PASSes iff it equals `U10CX_WITNESS_ALL` AND the on-disk create proof
+/// held. Must match `add r12, {1,2,4,8}` in `unaos_user_u10cx_create`. The aarch64 twin's `U10C_WITNESS_ALL`.
+const U10CX_WITNESS_ALL: u32 = 0xF;
+/// The U10 CREATE fixture's final witness bitmask (its `sys_exit` status, routed by name — the u5x/u9x idiom).
+static U10CX_WITNESS: AtomicU32 = AtomicU32::new(0);
+/// The U10 CREATE fixture (`u10cx-create`) reached its witness exit (want 1). Read by `u10cx_launcher`'s wait.
+static U10CX_DONE: AtomicU32 = AtomicU32::new(0);
+/// A killed U10 CREATE fixture — a real bug (register-only apart from its read-back dest store). Off the U1b counter.
+static U10CX_KILLED: AtomicU32 = AtomicU32::new(0);
+
 /// U4x fixture run parameters: the parent's + orphan's ring-3 entry VAs (both inside the shared window
 /// VA — only the slot FRAME differs, via CR3), the shared initial user rsp, and each fixture's slot
 /// CR3. Two tasks, two DISTINCT slots (hence distinct handle-table rows — the isolation the ownership
@@ -6823,9 +7083,7 @@ fn u10x_build() -> Option<U7xFix> {
 /// relies on, made structural).
 fn u10x_launcher(demo_cpu: usize) {
     u10x_run(demo_cpu);
-    // Chain the U10 CREATE demo (added in M2); until then, chain U11x directly so the existing storage-gated
-    // U11x regression keeps running behind the same block-device gate.
-    u11x_launcher(demo_cpu);
+    u10cx_launcher(demo_cpu); // chain CREATE (which chains DELETE, then U11x) on ALL paths
 }
 
 /// U10 GROW run + verdict (real on-disk file growth). Flow (the `u9x_launcher` shape): one-shot; skip silently
@@ -7012,6 +7270,166 @@ fn u10x_ondisk_grow_ok(fs: &crate::fs::fat::FatFs) -> bool {
         }
     }
     true
+}
+
+/// Build the U10 CREATE fixture slot — the `u10x_build` shape for the `u10cx-create` blob.
+fn u10cx_build() -> Option<U7xFix> {
+    let slot = crate::arch::memory::alloc_user_space()?;
+    let bstart = &raw const unaos_user_u10cx_blob_start as usize;
+    let bend = &raw const unaos_user_u10cx_blob_end as usize;
+    let blen = bend - bstart;
+    assert!(blen as u64 <= PAGE_SIZE, "U10cx blob does not fit in a code page");
+    let off = (&raw const unaos_user_u10cx_create as usize - bstart) as u64;
+    let backing = crate::arch::memory::slot_backing_ptr(slot);
+    unsafe {
+        core::ptr::write_bytes(backing, 0, (USER_WINDOW_PAGES * PAGE_SIZE) as usize);
+        core::ptr::copy_nonoverlapping(bstart as *const u8, backing, blen);
+    }
+    Some(U7xFix {
+        entry: USER_BASE + off,
+        sp: USER_BASE + USER_WINDOW_PAGES * PAGE_SIZE - 16,
+        cr3: crate::arch::memory::slot_cr3(slot),
+        slot,
+    })
+}
+
+/// U10 CREATE launcher — the thin wrapper (chains the next launcher on ALL paths of the run).
+fn u10cx_launcher(demo_cpu: usize) {
+    u10cx_run(demo_cpu);
+    // Chain the U10 DELETE demo (added in M3); until then chain U11x directly so the storage-gated U11x
+    // regression keeps running behind the same block-device gate.
+    u11x_launcher(demo_cpu);
+}
+
+/// U10 CREATE run + verdict (real on-disk file creation). Flow (the `u10x_run` shape): one-shot; skip silently
+/// with no block device. PRE-FLIGHT at IF=1 (gated on `HELLO_STAGED`): SELF-HEAL a persistent metal card — if
+/// FRESH.BIN already exists (a prior boot created it), DELETE it so the ABSENT precondition holds and the demo
+/// creates it afresh (the U9x seed-restore idiom; QEMU always starts clean). Build + spawn `u10cx-create`; wait
+/// (bounded) for its witness exit + teardown (its two descriptors — the primary + the idempotent sibling — clear
+/// the FILES + handle rows, and the DIRTY primary's teardown ENQUEUES the `CreateGrow` op). Then, disk-backed and
+/// only once teardown is observed, DRAIN the op to disk (`create_in_root` + `write_grow`) and re-read from a fresh
+/// mount: FRESH.BIN exists, size 16, the pattern is on disk, first cluster >= 2, and EXACTLY ONE root entry names
+/// it (no duplicate). PASS iff witness == `U10CX_WITNESS_ALL` AND torn down AND no kill AND (disk-backed) the
+/// drain succeeded AND every on-disk check held. In-memory mode (no FAT) runs the witness core, drain a no-op.
+fn u10cx_run(demo_cpu: usize) {
+    static DONE: AtomicBool = AtomicBool::new(false);
+    if DONE.swap(true, Ordering::Relaxed) {
+        return;
+    }
+    if crate::drivers::block::info().is_none() {
+        return;
+    }
+    // Pre-flight at IF=1: FRESH.BIN must be ABSENT to prove the demo CREATED it — self-heal a persistent card by
+    // deleting a stale copy. `ready` == a FAT volume is present AND FRESH.BIN is now absent (disk-backed proof on).
+    let ready = HELLO_STAGED.load(Ordering::Acquire) && u10_preflight_absent(U10C_NAME);
+
+    let Some(fix) = u10cx_build() else {
+        serial_println!(":: U10c: no free address-space slot — file-create demo skipped ::");
+        return;
+    };
+    serial_println!(
+        ":: U10c: file create — O_CREAT|RW of an absent name, written then CREATED on FAT via fat::create_in_root + write_grow (deferred to IF=1) ::"
+    );
+    crate::arch::sched::spawn_user_in_space("u10cx-create", fix.entry, fix.sp, demo_cpu, fix.cr3);
+
+    let vdeadline = crate::arch::ticks() + 5000;
+    while U10CX_DONE.load(Ordering::Acquire) < 1 && crate::arch::ticks() < vdeadline {
+        crate::arch::sched::yield_now();
+    }
+    let witness = U10CX_WITNESS.load(Ordering::Acquire);
+    let killed = U10CX_KILLED.load(Ordering::Acquire);
+
+    let tdeadline = crate::arch::ticks() + 2000;
+    while !(files_row_is_clear(fix.slot) && handle_row_is_clear(fix.slot) && wstage_all_free())
+        && crate::arch::ticks() < tdeadline
+    {
+        crate::arch::sched::yield_now();
+    }
+    let cleared = files_row_is_clear(fix.slot) && handle_row_is_clear(fix.slot) && wstage_all_free();
+
+    let (drained, created_ok) = if ready && cleared {
+        match crate::fs::fat::mount() {
+            Ok(fs) => {
+                let mut drained = true;
+                let mut count = 0u32;
+                while let Some(one) = u10_flush_drain_one(&fs) {
+                    drained &= one;
+                    count += 1;
+                }
+                drained &= count == 1 && u10_flush_all_free() && !U10_OVERFLOW.load(Ordering::Acquire);
+                (drained, u10cx_ondisk_create_ok(&fs))
+            }
+            Err(_) => (false, false),
+        }
+    } else {
+        (false, false)
+    };
+
+    let core_ok = witness == U10CX_WITNESS_ALL && cleared && killed == 0;
+    let pass = core_ok && (!ready || (drained && created_ok));
+    if pass {
+        if ready {
+            serial_println!(
+                ":: U10c: file create — O_CREAT|RW+write+readback+idempotent-reopen OK, CREATED on FAT (on-disk entry present + content + exactly one dir entry, no duplicate) -> PASS ::"
+            );
+        } else {
+            serial_println!(
+                ":: U10c: file create — O_CREAT|RW+write+readback+idempotent-reopen OK (in-memory core; no FAT volume, create-flush is a no-op) -> PASS ::"
+            );
+        }
+    } else {
+        serial_println!(
+            ":: U10c: file create FAIL — ready={} witness={:#x} cleared={} killed={} drained={} created_ok={} done={} (want ready?ALL/true/0/true/true : ALL/true/0) ::",
+            ready, witness, cleared, killed, drained, created_ok, U10CX_DONE.load(Ordering::Acquire),
+        );
+    }
+}
+
+/// U10 pre-flight helper (IF=1): ensure a runtime-created file `name` is ABSENT on disk (delete a stale copy from
+/// a persistent metal card so the create/delete demo's ABSENT precondition holds across reboots), returning true
+/// iff a FAT volume mounted AND the name is now absent. Uses only pub `fat.rs` primitives; QEMU always starts
+/// from a fresh image, so the delete only runs on metal re-runs.
+fn u10_preflight_absent(name: &str) -> bool {
+    let Ok(fs) = crate::fs::fat::mount() else {
+        return false;
+    };
+    if let Ok((de, lba, off)) = fs.find_located(name) {
+        // A stale copy from a prior boot — delete it so the demo recreates it afresh.
+        let _ = fs.delete_located(lba, off, de.first_cluster());
+    }
+    fs.find_located(name).is_err() // now absent?
+}
+
+/// U10 CREATE on-disk proof (fresh re-read via `fs`): FRESH.BIN exists, is non-dir, size `U10C_WRITTEN`, holds
+/// the pattern, has a real first cluster, and appears EXACTLY ONCE in the root (no duplicate). Then re-runs the
+/// create drain to exercise the idempotent create-if-present dedup branch (`find_located` hits -> `create_in_root`
+/// is SKIPPED) — the deferred model creates only once, so this is what proves the no-duplicate guarantee the
+/// aarch64 twin proves via its second in-handler open.
+fn u10cx_ondisk_create_ok(fs: &crate::fs::fat::FatFs) -> bool {
+    let Ok((de, _lba, _off)) = fs.find_located(U10C_NAME) else {
+        return false;
+    };
+    if de.is_dir || de.size != U10C_WRITTEN || de.first_cluster() < 2 {
+        return false;
+    }
+    if u9x_read16(de.first_cluster(), de.size, 0) != Some(U10C_PATTERN) {
+        return false;
+    }
+    let Ok(root) = fs.read_root() else {
+        return false;
+    };
+    if root.iter().filter(|d| !d.is_dir && d.name() == U10C_NAME).count() != 1 {
+        return false;
+    }
+    // Idempotency (create-if-present): the drain finds FRESH.BIN and SKIPS create_in_root — a re-drain must not
+    // duplicate. This exercises the find-first-then-create dedup branch the single-op deferred path can't otherwise.
+    if !u10_drain_create_grow(fs, U10C_NAME, &U10C_PATTERN) {
+        return false;
+    }
+    let Ok(root2) = fs.read_root() else {
+        return false;
+    };
+    root2.iter().filter(|d| !d.is_dir && d.name() == U10C_NAME).count() == 1
 }
 
 /// Build the U11x fixture slot — the `u9x_build` shape for the U11x blob (allocate, scrub the WHOLE window, copy
