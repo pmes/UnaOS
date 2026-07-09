@@ -374,6 +374,59 @@ Legend: **✅ metal-confirmed** · **🔬 QEMU-green, metal pending** · dates I
   at the Peter-attended bench; the storage-gated arcs still wait on `task_47291f90`.
 - **Commit:** `hw-rmbp`, Opus-executed.
 
+### U10x — file GROWTH + CREATE + DELETE: cluster allocation, FAT-chain extension, directory mutation, all DEFERRED out of the IF-masked handler (x86) 🔬 `hw-rmbp`
+- **What:** the x86 twin of pi4 U10 (M1 grow / M2 create / M3 delete), giving U9x's in-place File writer an
+  ALLOCATOR — arch-symmetric with pi4 at the capability layer, diverging ONLY where the hardware forces it.
+  **The FAT allocator is reused VERBATIM** from the shared `fs/fat.rs` (pi4 landed it: `write_grow`,
+  `create_in_root`, `find_located`, `mark_dir_deleted`, `free_chain`, `delete_located`, `first_free_cluster`) —
+  the port adds ZERO FS logic, only a read-only `cluster_size()` accessor (rmbp's shared-kernel-core lane) for the
+  launcher's cluster-size-aware chain check. **THE load-bearing divergence (the same wall U9x M2 hit):** pi4 does
+  grow/create/delete disk I/O straight in the SVC handler (EMMC2 PIO); x86 CANNOT — the SYSCALL handler runs
+  IF-masked and the xHCI BOT pump `hlt()`s, so no disk I/O in-handler. So every U10 mutation is **DEFERRED** to the
+  demo launcher's IF=1 drain (a SEPARATE U10 op-queue, leaving the metal-confirmed U9x in-place write-back path
+  untouched). (1) **GROW** (`SYS_WRITE` past EOF on a growable descriptor) — the extend stages in the descriptor's
+  one-page `wstage` buffer in-handler (`sys_write_grow`, size-before-offset, `FILE_SIZE == WSTAGE_LEN <= PAGE`
+  invariant); teardown enqueues a `Grow` op the launcher drains via `fat::write_grow`. A per-descriptor
+  `FILE_OPNAME` marks it growable (set at open ONLY for the staged GROW.BIN — SCRATCH.BIN stays in-place-only,
+  U9x byte-for-byte) and the deferred op ALWAYS names the descriptor's OWN file (no confused-deputy: a RW
+  SCRATCH.BIN holder can never mint a GROW.BIN op). (2) **CREATE** (`SYS_OPEN` `O_CREAT` of a name absent from the
+  staged set) — a dynamic in-memory created-file model (`sys_open_dynamic`/`open_create_new`/`open_created_sibling`,
+  the idempotent 2nd open + the sibling handle) backed by an empty `wstage`; teardown enqueues a `CreateGrow` op
+  (`create_in_root`-if-absent + `write_grow`-from-empty). (3) **DELETE** (`SYS_UNLINK = 16`) — gated by the SAME
+  single `CAP_WRITE` CHECK as write; a scaffold guard refuses an immutable STAGED file (HELLO.BIN is EL0 code —
+  only a `FILE_CREATED` descriptor is unlinkable); marks the name gone for the row (`DYN_DELETED` → a plain
+  re-open is `-ENOENT`), invalidates EVERY descriptor of the file (each `files_free` bumps the slot gen, so a
+  stale sibling handle is `-EACCES` — the U11x gen-tag), and enqueues a `CreateGrowDelete` op the launcher replays
+  (create + grow allocating a real cluster, a mid-op EXISTENCE witness, then `delete_located`).
+- **Honest scope + faithful divergences (design + code adversarially reviewed):** create/grow/delete disk I/O all
+  DEFER to the launcher — so the x86 DELETE is a launcher-side REPLAY of the fixture's create+grow+unlink (a weaker
+  causal exercise than pi4's in-handler unlink of an independently-persisted file), and its bit3 (sibling read
+  `-EACCES`) proves gen-invalidation, NOT a freed-chain aliasing fail-safe (physically impossible pre-drain on
+  x86). The delete proof is made NON-VACUOUS by the drain's mid-op existence witness + `count == 1` + `drained`
+  gating (a no-op drain cannot pass). Grow is one-page-bounded (invisible to the 16-byte demo). The FAT-safety
+  invariants ride the shared `fat.rs` verbatim (all `num_fats` copies; zero-fill before chaining; dir `size` last;
+  `0xE5` before free). Enqueue and drain are gated on the SAME "FAT present" signal so no op strands and no false
+  in-memory PASS can mask a present volume (a code-review follow-up). Deferred, unchanged: subdirs/LFN/rename;
+  IF-safe interrupt-driven x86 storage (retires the deferral); UnaFS `owner`/`grants:*` on open/create/unlink.
+- **Tested — QEMU:** three fixtures (`u10x-grow` witness `0x1F`, `u10cx-create` `0xF`, `u10dx-delete` `0x1F`),
+  each register-only apart from the read-back dest, chained `u9x → u10x → u10cx → u10dx → u11x` (every launcher
+  chains the next on ALL paths, so a skip never strands U11x). `UNAOS_FATIMG=sf ./arroyo test-fat sf 300` (FAT32,
+  512-B clusters) → on-disk grow (528B, 2-cluster chain, appended + original intact + all FAT copies consistent) /
+  create (FRESH.BIN present, size 16, exactly one dir entry) / delete (DELME.BIN gone + chain freed all copies +
+  cluster re-allocatable) all **PASS**; **20 PASS / 0 FAIL**, image cross-checked (GROW.BIN 528, FRESH.BIN
+  count=1, DELME.BIN count=0). `test-fat p16` (FAT16 fixed-root, 2048-B clusters — the cluster-size-aware grow
+  proof: 528B stays in one cluster, chain len 1) also **20 PASS / 0 FAIL**. Default no-FAT `./arroyo test 40`
+  stays MISSION SUCCESS with all three U10 demos + U11x **PASS** in the in-memory core (deferred flush a no-op, no
+  stranded op). `UNAOS_NOSTORAGE=1 ./arroyo test 90` skips the storage-gated arcs cleanly (console-cap slice
+  U5x/U7x/U8x still PASS). `./arroyo check` both arches green, **zero aarch64 files touched** (`arch/x86_64/
+  syscall.rs` + the read-only `fat.rs` accessor + the `make-fat-img.sh` GROW.BIN plant). Metal re-run self-heal
+  (delete+recreate a prior boot's grown/created/deleted file via pub `fat.rs` primitives) keeps re-runs honest on
+  a persistent card. **Capability chain U4→U10 now COMPLETE + arch-symmetric with pi4; unblocks U11x M2.**
+- **Metal:** the storage-gated chain runs on real hardware only past `task_47291f90` — now closed by evidence at
+  the 2026-07-08 bench (U1→U11x metal-confirmed off a FAT16 SD card), so a future attended bench can metal-confirm
+  U10 by re-flashing; the self-heal makes it idempotent across reboots.
+- **Commits:** `hw-rmbp` — M1 `6a54a76`, M2 `39ae5c5`, M3 `4471d34`, review fix `91c93b8`; Opus-executed.
+
 ---
 ## hw-jetson track — 2026-07-08 (attended bench, Peter at the Orin)
 
