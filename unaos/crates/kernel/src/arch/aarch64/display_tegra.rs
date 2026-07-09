@@ -55,6 +55,12 @@ use super::fdt_tegra;
 /// absent (`JD1 — no simple-framebuffer node in DTB`).
 pub const JD1_DC_PROBE: bool = false;
 
+/// Seconds to hold the JD1 test pattern on the panel before fbcon paints the boot log over it — long
+/// enough to read the colour bars by eye and confirm the pixel-format decode at the bench. 0 = no
+/// hold (the bars just flash). A `CNTPCT` busy-wait (see `busy_wait_secs`); set back to 0 once the
+/// format is confirmed so the boot is not slowed.
+pub const JD1_TEST_PATTERN_HOLD_SECS: u64 = 3;
+
 /// The inherited scanout: physical base, byte length of the visible image, and pixel layout —
 /// exactly what `fbcon::init` / `video::WRITER` need. `len` bounds every draw to the visible frame.
 pub struct ScanoutFb {
@@ -144,10 +150,40 @@ pub fn jd1_survey(dtb_addr: u64, dtb_size: usize, ram_gib_mask: u64) -> Option<S
     Some(ScanoutFb { base: sfb.base, len, info })
 }
 
+/// Busy-wait ~`secs` seconds on the always-on system counter (`CNTPCT_EL0`) — so the JD1 test
+/// pattern lingers on the panel before fbcon paints over it. A pure system-register spin: no GIC/
+/// timer (this runs pre-JM4 at EL2) and no MMIO; `CNTFRQ_EL0` gives the counter rate. Bounded, and
+/// short next to the seconds the boot already spends in USB enumeration.
+fn busy_wait_secs(secs: u64) {
+    if secs == 0 {
+        return;
+    }
+    let (freq, start): (u64, u64);
+    unsafe {
+        core::arch::asm!("mrs {}, cntfrq_el0", out(reg) freq, options(nomem, nostack, preserves_flags));
+        core::arch::asm!("mrs {}, cntpct_el0", out(reg) start, options(nomem, nostack, preserves_flags));
+    }
+    if freq == 0 {
+        return;
+    }
+    let target = start.wrapping_add(secs.saturating_mul(freq));
+    loop {
+        let now: u64;
+        unsafe {
+            core::arch::asm!("mrs {}, cntpct_el0", out(reg) now, options(nomem, nostack, preserves_flags));
+        }
+        if now >= target {
+            break;
+        }
+        core::hint::spin_loop();
+    }
+}
+
 /// Paint a distinctive test pattern into the inherited scanout so a bench boot can confirm — before
 /// fbcon takes the screen for the boot log — that the inherited `{base, stride, format}` actually
 /// land on the panel: a wrong stride shears the bars, a wrong format swaps blue↔red, a wrong base
-/// shows nothing. Eight colour bars + a bright frame. Flushed to RAM for the (non-coherent) DCE.
+/// shows nothing. Eight colour bars + a bright frame. Flushed to RAM for the (non-coherent) DCE, then
+/// held on screen for `JD1_TEST_PATTERN_HOLD_SECS` so it is legible before fbcon paints over it.
 ///
 /// SAFETY: `base`/`len` come from `jd1_survey`, which already bounded the base to DRAM and `len` to
 /// the carveout size; `FrameBuffer::put_pixel`/`fill_rect` are themselves bounds-checked against
@@ -183,6 +219,8 @@ pub fn jd1_test_pattern(fb: &ScanoutFb) {
     surf.fill_rect(0, 0, 4, h, edge);
     surf.fill_rect(w.saturating_sub(4), 0, 4, h, edge);
     surf.flush_all();
+    // Hold the pattern on the panel so it is legible before fbcon paints the boot log over it.
+    busy_wait_secs(JD1_TEST_PATTERN_HOLD_SECS);
 }
 
 /// Default-OFF read-only fallback (see [`JD1_DC_PROBE`]): sweep the nvdisplay window registers for

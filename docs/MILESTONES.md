@@ -377,7 +377,7 @@ Legend: **✅ metal-confirmed** · **🔬 QEMU-green, metal pending** · dates I
 ---
 ## hw-jetson track — 2026-07-08 (code arc — QEMU-green + adversarial-review-clean; USB-behaviour metal-pending)
 
-### JD1 — first pixels: inherit the firmware's live scanout framebuffer ✅ QEMU-inert + gate-green + review-clean / 🔬 metal-pending `hw-jetson`
+### JD1 — first pixels: inherit the firmware's live scanout framebuffer ✅ METAL-CONFIRMED (Orin panel, 2026-07-08) `hw-jetson`
 - **What:** get the boot log + CAPSTONE onto the Orin panel. JM7 found the panel dark because the UEFI
   GOP is `BltOnly` (no linear framebuffer) — but the firmware's DCE is still scanning out a DRAM carveout.
   **The finding (edk2-nvidia source):** the GOP is `BltOnly` *on purpose* — the default `SocDisplayHandoff`
@@ -402,12 +402,17 @@ Legend: **✅ metal-confirmed** · **🔬 QEMU-green, metal pending** · dates I
   an address + geometry.
 - **Tested:** `UNAOS_TEGRA=1 ./arroyo check` green both arches; `./arroyo test` (x86) + `./arroyo test-arm`
   (aarch64 virt) byte-green (all JD1 code `cfg(feature="tegra")` / inside `tegra_early_stop` → non-tegra
-  byte-identical); `esp-jetson` `kernel.elf` **250,408 B / 101 `tegra:` strings** (up from JB10's 241,936 B
-  / 90 — the JD1 survey/map/blit code; RED LINE ~355 KB; JD1 strings present: `JD1 — scanout`, `panel LIVE`).
-- **Detail:** [`arch_arm64.md` §JD1](dev/OS/01_BOOT_HAL/arch_arm64.md). Next (attended bench): flash + watch
-  the `JD1 — scanout:` verdict + `simple-fb` dump, then the test pattern + mirrored boot log + `CAPSTONE
-  COMPLETE` on the panel; if `no simple-framebuffer node in DTB`, flip `JD1_DC_PROBE=true` (panel lit) for
-  the register-sweep fallback.
+  byte-identical); `esp-jetson` `kernel.elf` **250,416 B / 101 `tegra:` strings** (up from JB10's 241,936 B
+  / 90 — the JD1 survey/map/blit + linger code; RED LINE ~355 KB).
+- **✅ METAL (2026-07-08, Peter at the Orin):** the firmware published the SIMPLEFB handoff into our FDT
+  (`simple-fb /chosen/framebuffer 1920x1200 x8r8g8b8` → `framebuffer@0x279e00000` `0x960000` →
+  `scanout base=0x279e00000 (Bgr) sane=true` → `panel LIVE`). On the panel: the colour-bar test pattern
+  rendered **pixel-correct** (blue 2nd / red 5th → `Bgr` decode right; clean bars → stride right; framed +
+  full-screen → base/geometry right), then fbcon painted the whole boot log + `CAPSTONE COMPLETE` across the
+  EL2→EL1 drop. UnaOS's first correct frame on the Orin. `JD1_DC_PROBE` fallback never needed. A 3 s
+  `JD1_TEST_PATTERN_HOLD_SECS` (`CNTPCT` busy-wait) keeps the pattern legible before the console takes over.
+- **Detail:** [`arch_arm64.md` §JD1](dev/OS/01_BOOT_HAL/arch_arm64.md). Next: **JD2** — route the inherited
+  USB keyboard to a live shell on the panel (first interactive UnaOS session on the Orin).
 
 ### JB10 — nested-hub descent + FS Evaluate-Context + root-kbd readiness + inherit-path housekeeping ✅ QEMU-green + review-clean / 🔬 metal-pending `hw-jetson`
 - **What:** the four JB9-baton follow-ups. **(1) Nested-hub descent** (shared `xhci/mod.rs`, additive,

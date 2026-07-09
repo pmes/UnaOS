@@ -1564,15 +1564,23 @@ safe + primary and touching a *powergated* display block would be EL3-fatal (the
 lit so it is *believed* powered, but the DTB path proves pixels without betting on that. It touches only
 plain config registers within the block's own decoded aperture (never the read-to-clear status region).
 
-**Status.** `UNAOS_TEGRA=1 ./arroyo check` green both arches; `./arroyo test` (x86) + `./arroyo test-arm`
-(aarch64 virt) byte-green; `esp-jetson` `kernel.elf` = **250,408 B / 101 `tegra:` strings** (up from JB10's
-241,936 B / 90 — the JD1 survey/map/blit code + strings; RED LINE ~355 KB). **METAL-PENDING (attended
-bench):** the verdict line + the `simple-fb` dump identify the inherited scanout, then the test pattern and
-the mirrored boot log + `CAPSTONE COMPLETE` should appear on the panel. Bench watch-items: does the DTB carry
-`/chosen/framebuffer` (SIMPLEFB handoff present in the FDT we captured?); does the test pattern render with
-correct colours/no shear (base/stride/format right?); if `JD1 — no simple-framebuffer node in DTB`, flip
-`JD1_DC_PROBE = true` (panel confirmed lit) for the register-sweep fallback. A blank panel after a correct
-verdict = wrong base/stride/format/memory-type, **not** "re-init needed" (do not reset the DC/SOR/DP).
+**Status — ✅ METAL-CONFIRMED (2026-07-08, attended bench; Peter at the Orin, DP→HDMI monitor).** The
+firmware DID publish the SIMPLEFB handoff into the FDT we captured: `JD1 — simple-fb /chosen/framebuffer:
+1920x1200 stride=8192 fmt='x8r8g8b8'` → `resv /reserved-memory/framebuffer@2,79E00000 reg[0x2 0x79e00000 0x0
+0x960000]` → `scanout: base=0x279e00000 size=0x960000 1920x1200 stride=8192B fmt=x8r8g8b8 (Bgr) sane=true` →
+`panel LIVE`. The scanout base is in GiB 9 (already RAM-mapped — `map_fb_region` confirmed it) and the
+carveout size `0x960000` = exactly `8192×1200`. **On the panel:** the colour-bar test pattern rendered
+pixel-correct — clean vertical bars (black·blue·green·cyan·red·magenta·yellow·white), a crisp full-frame
+border, correct colours (blue 2nd / red 5th → the `x8r8g8b8 → Bgr` decode is right; a swap would trade
+blue↔red and cyan↔yellow), no shear (stride right), full-screen (base/geometry right) — then fbcon painted
+the whole boot log + `CAPSTONE COMPLETE` across the EL2→EL1 drop. UnaOS's first deliberate, pixel-correct
+frame on the Orin. A 3 s hold (`JD1_TEST_PATTERN_HOLD_SECS`, a `CNTPCT` busy-wait) keeps the pattern legible
+before the console takes the screen; set it to 0 to skip. `UNAOS_TEGRA=1 ./arroyo check` green both arches;
+`./arroyo test` (x86) + `test-arm` (aarch64 virt) byte-green; `esp-jetson` `kernel.elf` = **250,416 B / 101
+`tegra:` strings** (up from JB10's 241,936 B / 90; RED LINE ~355 KB). The DC-register fallback (`JD1_DC_PROBE`)
+was never needed — the DTB path carried it. NEXT (JD2): route the inherited USB keyboard to a live shell on
+the panel. A blank panel after a correct verdict = wrong base/stride/format/memory-type, **not** "re-init
+needed" (do not reset the DC/SOR/DP).
 
 ## 4. Jetson Orin Nano headless bring-up (Arc JM2)
 
