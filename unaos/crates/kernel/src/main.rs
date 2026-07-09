@@ -966,6 +966,37 @@ fn tegra_early_stop(boot_info: &'static mut BootInfo) -> ! {
         boot_info.framebuffer_info.stride,
         boot_info.framebuffer_info.bytes_per_pixel,
     );
+    // JD1 (video): the JM7 GOP is BltOnly — no linear framebuffer — so the panel is dark even though
+    // the firmware's DCE is still scanning out a live framebuffer from a DRAM carveout. INHERIT that
+    // scanout (don't re-init the pipeline): the firmware's SIMPLEFB display-handoff published the
+    // scanout base+geometry+format into the DTB (a `simple-framebuffer` node), so `jd1_survey` reads
+    // it read-only (no display MMIO), maps the carveout Normal-WB into BOTH translation tables, paints
+    // a test pattern, and brings fbcon online on it — from here every `serial_println!` (JB1a … JM4 …
+    // and the EL1 CAPSTONE, across the JM6 drop) also paints onto the Orin panel. Headless (no handoff
+    // published, or geometry fails sanity): `jd1_survey` returns None and this whole block is a no-op,
+    // so the boot stays byte-identical to the pre-JD1 headless path. `tegra`-only → inert in QEMU.
+    if let Some(fb) = unaos_kernel::arch::display_tegra::jd1_survey(
+        boot_info.dtb_addr,
+        boot_info.dtb_size,
+        mmu.ram_gib_mask,
+    ) {
+        if unaos_kernel::arch::mmu_tegra::map_fb_region(fb.base, fb.len) {
+            // Prove the inherited {base, stride, format} reach the panel before fbcon clears to black.
+            unaos_kernel::arch::display_tegra::jd1_test_pattern(&fb);
+            // fbcon online on the inherited scanout: fills black + starts mirroring the boot log. The
+            // EL1 twin was patched by map_fb_region, and the tegra path never detaches fbcon (JM7), so
+            // the mirror survives the JM6 EL2 -> EL1 drop and shows the CAPSTONE run live.
+            unaos_kernel::video::fbcon::init(fb.base, fb.len, fb.info);
+            serial_println!(
+                ":: tegra: JD1 — panel LIVE: inherited scanout mapped + fbcon mirroring the boot log ::"
+            );
+        } else {
+            serial_println!(
+                ":: tegra: JD1 — scanout base {:#x} not mappable (not DRAM GiB 2..63); headless ::",
+                fb.base,
+            );
+        }
+    }
     // JB1d: the A78AE erratum-1941500 probe/workaround (CPUECTLR_EL1[8]) — the EC=0 phantom's
     // leading suspect after the D-side read-back proved an I/D divergence. Prints MIDR + the bit
     // state BL31 left, sets it if clear. Runs before everything else so the whole boot (JB1b/c +
