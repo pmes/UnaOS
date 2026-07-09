@@ -47,7 +47,7 @@ Security model: **capabilities first, POSIX-layerable** — detailed in
 | **U3** | Per-process address spaces: per-process PML4, CR3 switch in the scheduler | rmbp | Pi as **M6d** (per-task TTBR0 + ASID) |
 | **U4** | Process model: PIDs, spawn/wait/exit status, **per-process handle table** — arch-neutral | shared | — |
 | **U5** | **Capability model**: handles are capabilities; every syscall checked at the handle table; grant/attenuate/revoke; bandy handle-transfer semantics | shared | — |
-| **U6** | UnaFS enforcement: `owner`/`grants:*` typed attributes checked on open (rides on K2/K3 below) | rmbp+host | — |
+| **U6** | UnaFS enforcement: `owner`/`grants:*` typed attributes checked on open. **aarch64 enforcement SEAM landed 2026-07-08 (owned-by-default at `SYS_OPEN` + `SYS_FGRANT` delegation, in-kernel; feeds the on-disk attrs once K2/K3/K4 land)**; x86 twin (U6x) future | rmbp+host / **pi led seam** | — |
 | **H1** | Hardening ledger — folded into each track's next brief; tracked in `SECURITY.md` | all | — |
 
 **Pi lane:** M6c loadable blob → M6e preemptible EL0 (metal-gated) → M6d

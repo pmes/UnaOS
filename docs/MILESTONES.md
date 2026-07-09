@@ -12,6 +12,51 @@ Legend: **✅ metal-confirmed** · **🔬 QEMU-green, metal pending** · dates I
 
 ## hw-pi4 track — 2026-07-08 (Opus round)
 
+### U6 — UnaFS owner/grants: the by-NAME namespace ACL, enforced at `SYS_OPEN` (aarch64) 🔬 `hw-pi4`
+- **What:** closes the LAST documented capability gap the U6b→U11 line left. `SYS_OPEN`/`O_CREAT`/`SYS_UNLINK`
+  were gated on the HANDLE capability, but the by-NAME namespace itself was NOT ACL'd — any process could
+  open/create/unlink any name. This lands the in-kernel enforcement SEAM (the on-disk UnaFS `owner`/`grants:*`
+  attributes will feed it once K2/K3/K4 land; no on-disk owner format exists yet and `fat.rs` is shared/off-lane).
+  **Secure-by-default (owned-by-default):** an `O_CREAT` of a NEW name records the creating principal as the
+  file's OWNER (PRIVATE); the new `O_PUBLIC` mode bit (bit2) opts a create OUT to world-access. An open of an
+  EXISTING owned file is admitted only for the owner or a principal the owner GRANTED; else `-EACCES`. A file with
+  NO owner row (pre-existing / host-created / `O_PUBLIC`) is PUBLIC — byte-identical to the pre-U6 behaviour.
+  - **M1 — the `SYS_OPEN` ACL** (`21baee8`): `OWNED_FILES`, a bounded `SpinMutex<[OwnedFile;16]>` keyed by the FAT
+    file-identity `(dir_lba, dir_off)` (the `OPEN_FILES` idiom); owner + up to 4 grants, ALL fenced by the
+    `(ASID, ASID_GEN)` incarnation (the recycle fence the file-id/xfer/derivation machinery already uses). Checked
+    in `sys_open`'s "nothing-claimed-yet" window (a clean `-EACCES`). A private create that cannot record an owner
+    FAILS CLOSED (`-ENOSPC`, undoing the fresh dir entry). The row clears at unlink (FAT may recycle the slot) and
+    at OWNER teardown (`clear_handle_row` — the file reverts to PUBLIC, keeping the bounded table self-cleaning);
+    its lock is IRQ-masked via the M2b `IrqGuard` (acquired in BOTH syscall and teardown contexts). The two
+    cross-process U11 fixtures tag their shared file `O_PUBLIC` (one mode bit each) so B still opens A's file.
+  - **M2 — `SYS_FGRANT` delegation** (`8034d0c`): `SYS_FGRANT(file_handle, child_handle, rights)` (= 18). The owner
+    grants (a `CAP_READ|CAP_WRITE` subset) or revokes (`rights = 0`) access to a principal named OWNER-SCOPED by a
+    `Child` handle it holds (the `SYS_XFER` idiom — no raw pid/ASID from EL0). Ownership is checked BEFORE the
+    grantee is resolved (a non-owner is `-EACCES` regardless of argument). The grant is an ACL edge on the FILE —
+    nothing lands in the grantee's table; it opens the name and the ACL admits it; a handle it ALREADY holds
+    survives a revoke (the ACL gates ACQUISITION, not held caps).
+- **Tested — QEMU:** `./arroyo kernel8-test 35` → one new verdict after U11-reap:
+  `:: U6-grants: owner/grants on open — non-owner -EACCES, owner grant admits read, non-owner grant -EACCES,
+  revoke re-denies -> PASS ::`. A two-process fixture (`el0-uowner-a` OWNER / `el0-uowner-b` GRANTEE, the u11defer
+  choreography + the U7 proc-reserve/Child-handle pre-endow): A creates `OWNED.BIN` private; B (a different ASID)
+  is DENIED (`-EACCES` — the gap closed); A `SYS_FGRANT`s B read → B opens + reads the matching bytes; B (a
+  non-owner) is refused `SYS_FGRANT` (`-EACCES`); A revokes → B is re-denied; A (owner) re-opens its own file
+  throughout. **23 PASS** (22 prior byte-identical + U6-grants), **CAPSTONE 6/6**, only the 3 expected M6b kills,
+  0 unexpected faults. `./arroyo check` both arches green; `./arroyo test-arm 30` MISSION SUCCESS; `./arroyo
+  kernel8` compiles.
+- **Lane:** additive on `arch/aarch64/syscall.rs` (the `OWNED_FILES` table + `sys_open` ACL + `SYS_FGRANT` + the
+  uowner fixture/launcher, riding the existing `u7_launcher` chain) + docs; **NO `sched.rs` / `fat.rs` / `main.rs`
+  change**; zero x86 files.
+- **Honest scope (flagged, not a defect):** the owner/grants store is in-kernel, VOLATILE, boot-scoped — there are
+  no persistent principals yet (the model's own documented gap), so ownership is meaningful only within a boot and
+  only while the owner process lives. A persistent form (and retroactively owning pre-existing/host files) awaits
+  the on-disk UnaFS attributes (K2/K3/K4). The x86 twin (U6x) and a `SYS_FGRANT` that endows a directly-usable
+  handle (vs. open-by-name) remain future.
+- **Metal:** 🔬 QEMU-green, metal-pending. Rides the next Pi 4 boundary alongside U10/U11 (the FAT-mutating stack).
+  QEMU exercises the ACL + delegation in full (no timer/IPI needed); the metal watch-item is the same `(ASID,
+  ASID_GEN)` teardown-revert path the U11 reaper walks.
+- **Commit:** `21baee8` (M1) + `8034d0c` (M2), branch `hw-pi4`.
+
 ### U11 (M2b / U12b) — the teardown-last-close REAPER: deferred-free queue + kernel reaper task (aarch64) 🔬 `hw-pi4`
 - **What:** closes the ONE honest-scope gap M2a left open. M2a proved the cross-process defer for the
   EXPLICIT-close path (the chain frees at the last `SYS_CLOSE`), but a program that EXITS holding the last
