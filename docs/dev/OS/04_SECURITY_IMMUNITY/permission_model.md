@@ -54,6 +54,16 @@ aarch64 (Pi 4) track and ports to x86/Jetson after:
   transfer record** gives single-level **revoke**: the received cap goes stale at its next resolve.
   A transfer can never amplify (the same monotonic-decrease invariant as grant, now across
   processes), and the sender never writes — or revokes into — anything but its own record.
+* **U6 (landed 2026-07-08, aarch64 — the by-NAME ACL)** — the file namespace itself is now ACL'd at
+  `SYS_OPEN`, closing the gap that handle-cap gating left open (any process could open/create/unlink
+  any name). **Owned-by-default:** an `O_CREAT` of a new name records the creating principal as the
+  file's **owner** (private); an `O_PUBLIC` bit opts out to world-access. An open of an owned file is
+  admitted only for the owner or a principal it **granted** (`SYS_FGRANT`, owner-scoped via a `Child`
+  handle, mirroring `SYS_XFER`; `rights = 0` revokes) — the grant is an ACL edge on the *file*, so the
+  grantee simply opens the name and the check admits it. The store is in-kernel and keyed by the file's
+  identity, fenced by the `(ASID, ASID_GEN)` incarnation; it is the **enforcement seam** the UnaFS
+  `owner`/`grants:*` typed attributes below will feed once the kernel UnaFS mount (K2/K3/K4) lands. The
+  x86 twin (U6x) and a persistent (on-disk) owner form are future.
 * **Still ahead** — **revocation trees** (a revoked transfer cascading through the recipient's
   re-grants/re-transfers — today a derived copy escapes single-level revoke; per-cap derivation
   records + the reserved `revoke` right are that arc), the **bandy Ring-3 delegation wrapper** (so
