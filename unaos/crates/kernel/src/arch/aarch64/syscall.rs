@@ -2025,11 +2025,12 @@ __u11defer_prog_a:
     add  x12, x9, #0x2000                  // x12 = read dest VA (writable data page)
     adr  x13, 7f                           // x13 = pattern VA (RO code page)
 
-    // (0) create DEFER.BIN (O_CREAT|RW, mode=3) -> hA, then write 16 bytes (grow-from-empty allocates its cluster)
+    // (0) create DEFER.BIN (O_CREAT|RW|O_PUBLIC, mode=7) -> hA, then write 16 bytes (grow-from-empty allocates a cluster)
+    // U6: O_PUBLIC — B (a DIFFERENT ASID) opens this file below, so it must be world-accessible, not owned-private.
     mov  x8, #11                           // SYS_OPEN
     adr  x0, 8f                            // "DEFER.BIN"
     mov  x1, #(9f - 8f)
-    mov  x2, #3                            // O_CREAT | RW
+    mov  x2, #7                            // O_CREAT | RW | O_PUBLIC
     svc  #0
     mov  x19, x0                           // x19 = hA (>=0) or -errno
     tbnz x19, #63, 2f                      // create/open failed -> report what we have
@@ -2211,11 +2212,12 @@ __u11reap_prog_a:
     add  x12, x9, #0x2000                  // x12 = read dest VA (writable data page)
     adr  x13, 7f                           // x13 = pattern VA (RO code page)
 
-    // (0) create DEFER2.BIN (O_CREAT|RW, mode=3) -> hA, then write 16 bytes (grow-from-empty allocates its cluster)
+    // (0) create DEFER2.BIN (O_CREAT|RW|O_PUBLIC, mode=7) -> hA, then write 16 bytes (grow-from-empty allocates a cluster)
+    // U6: O_PUBLIC — B (a DIFFERENT ASID) opens this file below, so it must be world-accessible, not owned-private.
     mov  x8, #11                           // SYS_OPEN
     adr  x0, 8f                            // "DEFER2.BIN"
     mov  x1, #(9f - 8f)
-    mov  x2, #3                            // O_CREAT | RW
+    mov  x2, #7                            // O_CREAT | RW | O_PUBLIC
     svc  #0
     mov  x19, x0                           // x19 = hA (>=0) or -errno
     tbnz x19, #63, 2f                      // create/open failed -> report what we have
@@ -3078,6 +3080,10 @@ pub fn clear_handle_row(asid: u64) {
     // clearing the descriptors here reclaims the slots and guarantees a REUSED ASID starts with no stale file
     // (no leaked offset, no aliasable descriptor). Same teardown site, same ordering guarantees as the handles.
     clear_files_row(asid);
+    // U6: drop the owner/grants rows this ASID owned (its private files revert to PUBLIC — no persistent
+    // principal keeps owning them, and the ASID's next tenant is a different process) and sweep any grant
+    // naming it. `IrqGuard`-safe under this already-IRQ-masked teardown. Keeps the bounded table self-cleaning.
+    owned_clear_owner_asid(asid);
 }
 
 /// The ASID of the address space the caller is running in, read from `TTBR0_EL1[63:48]`. A syscall executes
@@ -3722,6 +3728,165 @@ pub fn orphan_reaper(_: usize) {
                 }
             }
             None => super::sched::yield_now(),
+        }
+    }
+}
+
+// =============================================================================================
+// U6: UnaFS owner/grants — the by-NAME namespace ACL, enforced at SYS_OPEN.
+//
+// The gap the U6b→U11 chain left: SYS_OPEN / O_CREAT / SYS_UNLINK are gated on the HANDLE capability
+// (CAP_READ/CAP_WRITE), but the by-NAME namespace itself was NOT ACL'd — any process could open,
+// create, or unlink any name. This closes it with an in-kernel owner/grants table checked at
+// SYS_OPEN (the hook U6b/U9 named). OWNED-BY-DEFAULT (secure-by-default): an O_CREAT of a NEW name
+// makes the creator its OWNER (the file is PRIVATE); the O_PUBLIC mode bit opts a create into
+// world-access. An open of an EXISTING owned file is allowed only for the owner or a principal the
+// owner GRANTED (SYS_FGRANT); everyone else is -EACCES. A file with NO owner row (pre-existing /
+// host-created, or created O_PUBLIC) is PUBLIC — byte-identical to the pre-U6 behaviour.
+//
+// PRINCIPAL identity = the (ASID, ASID_GEN) incarnation — the same recycle fence the file-id / xfer
+// / derivation machinery uses (ASIDs recycle across process lifetimes; ASID_GEN is bumped at
+// teardown). A stale owner/grant whose gen no longer matches never authorizes a recycled tenant.
+//
+// LIFETIME (in-kernel, VOLATILE — this is the ENFORCEMENT SEAM the on-disk UnaFS owner/grants:*
+// attributes will feed once K2/K3/K4 land; there is no on-disk owner format yet, and fat.rs is
+// shared/off-lane): a row is keyed by the file's directory-slot identity (dir_lba, dir_off). It is
+// CLEARED at unlink (the name is gone; FAT may recycle the slot to a DIFFERENT file — the U11
+// recycled-slot hazard) and at OWNER TEARDOWN (clear_handle_row → the file reverts to PUBLIC, which
+// also keeps the bounded table self-cleaning across create/exit cycles). Because the table is
+// bounded, a PRIVATE create that cannot record an owner FAILS CLOSED (-ENOSPC, undoing the fresh
+// directory entry) rather than leave a "private" file silently world-accessible.
+//
+// LOCKING: OWNED_FILES has its OWN SpinMutex, taken IRQ-masked on every access via the local
+// `IrqGuard` — because it is acquired in BOTH syscall context (sys_open, IRQs enabled) AND the
+// IRQ-masked teardown path (clear_handle_row), exactly the asymmetry the M2b IrqGuard closes for
+// DEFERRED_FREE. No block I/O and no other lock is ever held across it.
+
+/// U6: rows in the owner/grants table — one per PRIVATE (owned) file currently tracked. Bounded and
+/// static (the OPEN_FILES idiom). A row is FREE iff `dir_lba == 0` (a real directory entry never sits
+/// at LBA 0 — that is the MBR/boot sector — so 0 is an unambiguous free marker, as in `sys_unlink`).
+const NOWNED: usize = 16;
+/// U6: grantees per owned file. Bounded; a full grant list is `-ENOSPC` on SYS_FGRANT.
+const NFGRANT: usize = 4;
+
+/// U6: one grant edge on an owned file — a principal `(asid, gen)` and the rights it was granted. An
+/// EMPTY slot has `rights == 0` (a real grant always carries >= 1 of CAP_READ|CAP_WRITE), so
+/// `rights == 0` doubles as the free marker AND disambiguates the real ASID 0 (the shared window).
+#[derive(Clone, Copy)]
+struct FileGrant {
+    asid: u64,
+    asid_gen: u64, // grantee's ASID_GEN captured at grant time — the recycle fence (`gen` is a reserved keyword)
+    rights: u32,
+}
+
+impl FileGrant {
+    const EMPTY: Self = FileGrant { asid: 0, asid_gen: 0, rights: 0 };
+}
+
+/// U6: one owned file's ACL. Guarded by `OWNED_FILES` (a `SpinMutex`), so plain `Copy` integers — the
+/// lock provides mutual exclusion (no atomics; the OPEN_FILES idiom).
+#[derive(Clone, Copy)]
+struct OwnedFile {
+    dir_lba: u64,   // identity key: directory-entry sector LBA (0 == free row)
+    dir_off: u32,   // identity key: 32-byte slot offset within that sector
+    owner_asid: u64,
+    owner_gen: u64,
+    grants: [FileGrant; NFGRANT],
+}
+
+impl OwnedFile {
+    const EMPTY: Self = OwnedFile {
+        dir_lba: 0,
+        dir_off: 0,
+        owner_asid: 0,
+        owner_gen: 0,
+        grants: [FileGrant::EMPTY; NFGRANT],
+    };
+}
+
+/// U6: the owner/grants table. `SpinMutex::new` is `const` and `OwnedFile: Copy` (the OPEN_FILES
+/// idiom). Its lock is taken IRQ-masked via `IrqGuard` on EVERY access (syscall + teardown).
+static OWNED_FILES: SpinMutex<[OwnedFile; NOWNED]> = SpinMutex::new([OwnedFile::EMPTY; NOWNED]);
+
+/// U6: record `(owner_asid, owner_gen)` as the OWNER of the file at `(dir_lba, dir_off)` — called at
+/// the O_CREAT of a NEW private name. OVERWRITES any existing row for this key (defensive against a
+/// recycled directory slot whose prior owner row was not yet cleared), else CLAIMS a free row. Returns
+/// `false` iff the table is full (the caller fails the private create CLOSED). Grants start empty.
+fn owned_set_owner(dir_lba: u64, dir_off: u32, owner_asid: u64, owner_gen: u64) -> bool {
+    let _irq = IrqGuard::mask_save();
+    let mut t = OWNED_FILES.lock();
+    for row in t.iter_mut() {
+        if row.dir_lba == dir_lba && row.dir_off == dir_off {
+            *row = OwnedFile { dir_lba, dir_off, owner_asid, owner_gen, grants: [FileGrant::EMPTY; NFGRANT] };
+            return true;
+        }
+    }
+    for row in t.iter_mut() {
+        if row.dir_lba == 0 {
+            *row = OwnedFile { dir_lba, dir_off, owner_asid, owner_gen, grants: [FileGrant::EMPTY; NFGRANT] };
+            return true;
+        }
+    }
+    false // table full — the private create fails closed (-ENOSPC)
+}
+
+/// U6: the ACL verdict for a caller opening an EXISTING file. `true` = ALLOW: the file is PUBLIC (no
+/// owner row), the caller IS the owner (gen-matched — full authority), or the caller holds a grant
+/// whose rights COVER the requested access (`requested ⊆ granted`, gen-fenced). `false` = DENY
+/// (-EACCES): the file is owned and the caller is neither owner nor a sufficiently-granted principal.
+/// `requested` is the rights the open mode asks for (CAP_READ, or CAP_READ|CAP_WRITE for RW/O_CREAT).
+fn owned_access_ok(dir_lba: u64, dir_off: u32, asid: u64, caller_gen: u64, requested: u32) -> bool {
+    let _irq = IrqGuard::mask_save();
+    let t = OWNED_FILES.lock();
+    for row in t.iter() {
+        if row.dir_lba == dir_lba && row.dir_off == dir_off {
+            // Owner: full authority over its own file.
+            if row.owner_asid == asid && row.owner_gen == caller_gen {
+                return true;
+            }
+            // A grantee: the requested access must be a SUBSET of what it was granted (gen-fenced).
+            for g in row.grants.iter() {
+                if g.rights != 0 && g.asid == asid && g.asid_gen == caller_gen {
+                    return (requested & !g.rights) == 0;
+                }
+            }
+            return false; // owned, and the caller is neither owner nor sufficiently granted
+        }
+    }
+    true // no owner row -> PUBLIC (pre-existing / host-created / O_PUBLIC create)
+}
+
+/// U6: drop the owner/grants row for `(dir_lba, dir_off)` — called at SYS_UNLINK (the name is gone; the
+/// directory slot may be recycled to a DIFFERENT file that will set its OWN owner). Idempotent no-op if
+/// the file was public (no row).
+fn owned_clear(dir_lba: u64, dir_off: u32) {
+    let _irq = IrqGuard::mask_save();
+    let mut t = OWNED_FILES.lock();
+    for row in t.iter_mut() {
+        if row.dir_lba == dir_lba && row.dir_off == dir_off {
+            *row = OwnedFile::EMPTY;
+        }
+    }
+}
+
+/// U6: at the teardown of ASID `asid`, drop every file it OWNS (the file reverts to PUBLIC — there is no
+/// persistent principal to keep owning it, and the ASID's next tenant is a DIFFERENT process) and sweep
+/// any GRANT naming `asid` (a grantee that exited). Matches on the ASID irrespective of gen — the whole
+/// address space is being torn down. Called from `clear_handle_row` (the IRQ-masked teardown path); keeps
+/// the bounded table self-cleaning across create/exit cycles. (The gen fence in `owned_access_ok` already
+/// makes an UNSWEPT stale entry harmless — this is table hygiene + the owner-exit-reverts-to-public rule.)
+fn owned_clear_owner_asid(asid: u64) {
+    let _irq = IrqGuard::mask_save();
+    let mut t = OWNED_FILES.lock();
+    for row in t.iter_mut() {
+        if row.dir_lba != 0 && row.owner_asid == asid {
+            *row = OwnedFile::EMPTY;
+        } else {
+            for g in row.grants.iter_mut() {
+                if g.rights != 0 && g.asid == asid {
+                    *g = FileGrant::EMPTY;
+                }
+            }
         }
     }
 }
@@ -5289,8 +5454,15 @@ const MAX_NAME: usize = 12;
 
 /// U10: `SYS_OPEN` mode bit1 — create the file if it is absent (and endow the write cap, since you create to
 /// write). Bit0 remains RW (U9). `O_CREAT` on an EXISTING file just opens it (idempotent). No `O_TRUNC` /
-/// `O_EXCL` / `O_APPEND` this arc — higher bits stay reserved.
+/// `O_EXCL` / `O_APPEND` this arc — bits >= 3 stay reserved.
 const O_CREAT: u64 = 1 << 1;
+
+/// U6: `SYS_OPEN` mode bit2 — at an `O_CREAT` of a NEW name, make the file PUBLIC (world-accessible) instead
+/// of the owned-by-default private file. UnaOS is secure-by-default: a plain `O_CREAT` records the creator as
+/// the file's OWNER (private — only the owner or a principal it `SYS_FGRANT`s may open it); `O_PUBLIC` opts a
+/// create OUT of ownership into the pre-U6 open-by-anyone behaviour. Ignored on an open of an existing file
+/// (ownership is fixed at create) and outside `O_CREAT`. See `sys_open` and the owner/grants block.
+const O_PUBLIC: u64 = 1 << 2;
 
 /// SYS_OPEN(name_ptr, name_len, mode) -> a File-handle index, or a negative errno. The first resource syscall
 /// routed through a NON-Console object: it makes U6a's `File` scaffold real. `copy_from_user`s the (bounded) 8.3
@@ -5336,6 +5508,7 @@ fn sys_open(name_ptr: u64, name_len: u64, mode: u64) -> i64 {
     // entry is ABSENT and `O_CREAT` is set, create a fresh 0-length entry (which yields the same triple); the
     // create writes only one directory sector (no cluster/FAT touched) and is still a "fallible lookup before
     // any resource claim" — its own failures (name / no-space) return cleanly.
+    let mut created = false; // U6: did THIS open create a NEW name (-> the caller becomes its owner)?
     let (de, dir_lba, dir_off) = match fs.find_located(name) {
         Ok(t) => t,
         Err(crate::fs::fat::FatError::NotFound) => {
@@ -5343,7 +5516,10 @@ fn sys_open(name_ptr: u64, name_len: u64, mode: u64) -> i64 {
                 return ENOENT; // absent and no O_CREAT
             }
             match fs.create_in_root(name, 0x20 /* ATTR_ARCHIVE — a plain file */) {
-                Ok(t) => t,
+                Ok(t) => {
+                    created = true;
+                    t
+                }
                 Err(crate::fs::fat::FatError::Unsupported) => return EINVAL, // name not representable as 8.3
                 Err(crate::fs::fat::FatError::NoSpace) => return ENOSPC,     // root directory full
                 Err(_) => return EIO,
@@ -5353,6 +5529,24 @@ fn sys_open(name_ptr: u64, name_len: u64, mode: u64) -> i64 {
     };
     if de.is_dir {
         return EISDIR; // a directory is not readable through a File handle (no dir ops this arc)
+    }
+    // U6: the by-NAME namespace ACL — the gate to ACQUIRING a File capability by name (thereafter the handle
+    // IS the authority). Owned-by-default (secure-by-default): a fresh O_CREAT records the creator as OWNER
+    // (unless O_PUBLIC); an open of an EXISTING file is admitted only for the owner or a granted principal.
+    // Sits in the "fallible lookups first, nothing claimed yet" window — a denial here is a clean -EACCES
+    // with nothing to unwind (mirrors the ordering the sys_open doc-comment states).
+    let asid_gen = ASID_GEN[asid as usize].load(Ordering::Acquire);
+    let requested = if mode & (1 | O_CREAT) != 0 { CAP_READ | CAP_WRITE } else { CAP_READ };
+    if created {
+        // A NEW name — the caller is its owner. Record ownership unless O_PUBLIC. If the bounded owner table
+        // is full, fail CLOSED: undo the fresh (0-length) directory entry and return -ENOSPC rather than
+        // leave a "private" file silently world-accessible.
+        if mode & O_PUBLIC == 0 && !owned_set_owner(dir_lba, dir_off as u32, asid, asid_gen) {
+            let _ = fs.mark_dir_deleted(dir_lba, dir_off);
+            return ENOSPC;
+        }
+    } else if !owned_access_ok(dir_lba, dir_off as u32, asid, asid_gen, requested) {
+        return EACCES; // an owned file, and the caller is neither its owner nor a sufficiently-granted principal
     }
     // 3. Claim resources — the GLOBAL open-file refcount FIRST, then a per-task descriptor, then a handle.
     // U11-M2: increment the cross-ASID open-file refcount BEFORE `files_alloc` and remember the ROW it landed on.
@@ -5536,6 +5730,10 @@ fn sys_unlink(handle: u64) -> i64 {
     if fs.mark_dir_deleted(dir_lba, dir_off).is_err() {
         return EIO;
     }
+    // U6: the name is gone — drop its owner/grants row. FAT may recycle this directory slot for a DIFFERENT
+    // file, which would then set its OWN owner; leaving a stale row here would (gen fence aside) misattribute
+    // the recycled file. Placed after the `0xE5` write so the ACL row dies exactly when the name does.
+    owned_clear(dir_lba, dir_off as u32);
     // (2) Arm the deferred free: mark THIS file's refcount row (by the descriptor's `FILE_OPENROW` index, not a
     // recyclable key) `unlink_pending` and stash the chain head. This process holds the file open (refcount >= 1),
     // so the row exists. MUST precede the drops below so the drop that reaches 0 (sole-opener case) sees the
