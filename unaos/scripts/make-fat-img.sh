@@ -128,6 +128,15 @@ fi
 head -c 1024 /dev/zero | tr '\000' '\356' > "${MNT}/SCRATCH.BIN"
 echo "    added SCRATCH.BIN (1024 bytes of 0xEE) for the U9x File-write demo"
 
+# U10 GROW: plant a DEDICATED 1-cluster file the growth fixture extends across the cluster boundary.
+# 512 bytes of 0xC1 (0301 octal) == exactly one 512-B cluster on the FAT32 layouts (part/gpt/sf); the
+# fixture seeks to 512 (EOF) and appends a 16-byte pattern, so the file grows to 528 and (on 512-B
+# clusters) allocates + zero-fills + chains a SECOND cluster. 0xC1 matches the kernel's staged seed
+# (U10_GROW_SEED) byte-for-byte, so a read-back before any write sees the original filler. (The launcher
+# self-heals a prior boot's grown copy on a persistent metal card, so re-runs stay honest.)
+head -c 512 /dev/zero | tr '\000' '\301' > "${MNT}/GROW.BIN"
+echo "    added GROW.BIN (512 bytes of 0xC1) for the U10 file-growth demo"
+
 # Strip macOS metadata (AppleDouble ._ files, Spotlight/fseventsd) so `ls` shows a clean tree.
 sync
 find "$MNT" -name '._*' -delete 2>/dev/null || true

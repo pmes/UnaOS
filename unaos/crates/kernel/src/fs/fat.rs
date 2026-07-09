@@ -629,6 +629,14 @@ impl FatFs {
         self.num_fats
     }
 
+    /// Bytes per cluster (`sec_per_clus * bytes_per_sec`). Public for the U10 GROW launcher's chain-length
+    /// check: a grow allocates `new_size.div_ceil(cluster_size)` clusters, which differs across the image
+    /// layouts (512-B clusters on FAT32 superfloppy/MBR vs 2048-B on the FAT16 fixed-root image), so the
+    /// launcher computes the expected chain length rather than assuming a fixed 2.
+    pub fn cluster_size(&self) -> u32 {
+        self.sec_per_clus * self.bytes_per_sec
+    }
+
     /// The end-of-chain marker to write into a terminal cluster's FAT entry (`>= 0xFFF8` / `>= 0x0FFFFFF8`
     /// both read as EOC; write the canonical all-ones form).
     fn eoc_value(&self) -> u32 {

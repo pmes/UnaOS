@@ -227,8 +227,9 @@ fn main() {
     // the raw usb.img default already behaved this way (OVMF never boots a non-FAT device).
     // qemu-xhci defaults to p2=4 USB2 ports. With the FTDI attached (U2.5) there are four full/high-
     // speed USB2 devices — storage + kbd + tablet + serial — and QEMU overflows the 4th onto an
-    // AUTO-INSERTED usb-hub, putting the FTDI behind a hub. Hub-downstream enumeration is HID-only
-    // this arc, so a hubbed FTDI is never configured. Widen the root-port count so every device lands
+    // AUTO-INSERTED usb-hub, putting the FTDI behind a hub. Hub-downstream enumeration handles
+    // HID + mass storage but not FTDI, so a hubbed FTDI is never configured. Widen the root-port
+    // count so every device lands
     // on a root port — but ONLY when the FTDI is attached, so the default (no-knob) runs keep the
     // exact 4/4 controller shape and a byte-identical boot log.
     let usbserial = std::env::var("UNAOS_USBSERIAL").is_ok();
@@ -240,12 +241,23 @@ fn main() {
     // every storage-GATED arc (U2/U4x/U6x/U6bx/U9x/U11x) skips. Previews exactly what the metal FTDI console
     // shows. NOTE: `is_ok()` treats an EMPTY value as SET (the known knob trap) — `UNAOS_NOSTORAGE=` is ON.
     let nostorage = std::env::var("UNAOS_NOSTORAGE").is_ok();
+    // UNAOS_HUBSTORAGE=1 attaches the usb-storage BEHIND a usb-hub instead of on a root port —
+    // the QEMU reproduction of the metal rMBP failure mode where the SD reader sits downstream of
+    // a hub and used to be left `class=0x0`/unconfigured (hub-downstream enumeration was HID-only).
+    // Exercises the hub-downstream mass-storage path end to end (interface-level MSC detect +
+    // Configure-Endpoint + BOT). NOTE: `is_ok()` — an EMPTY value is ON, like the other knobs.
+    let hubstorage = std::env::var("UNAOS_HUBSTORAGE").is_ok();
     cmd.arg("-drive").arg(format!("if=none,id=esp,format=raw,file=fat:rw:{}", esp_dir.display()))
        .arg("-device").arg("ide-hd,drive=esp,bootindex=0")
        .arg("-device").arg("isa-debug-exit,iobase=0xf4,iosize=0x04")
        .arg("-device").arg(xhci_dev);
     if nostorage {
         println!("   UNAOS_NOSTORAGE: usb-storage omitted — kernel sees no block device (metal-like no-storage path)");
+    } else if hubstorage {
+        println!("   UNAOS_HUBSTORAGE: usb-storage attached behind a usb-hub (hub-downstream MSC path)");
+        cmd.arg("-drive").arg(format!("if=none,id=stick,format=raw,file={}", stick_image.display()))
+           .arg("-device").arg("usb-hub,bus=xhci.0,port=1,id=hub0")
+           .arg("-device").arg("usb-storage,bus=xhci.0,port=1.1,drive=stick,bootindex=1");
     } else {
         cmd.arg("-drive").arg(format!("if=none,id=stick,format=raw,file={}", stick_image.display()))
            .arg("-device").arg("usb-storage,bus=xhci.0,drive=stick,bootindex=1");

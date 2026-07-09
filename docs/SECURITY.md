@@ -110,13 +110,25 @@ capability-isolated software principals**, not classical login/uid multi-user.
   xHCI write pump, the write is **STAGED** — an in-place overwrite of a
   per-descriptor in-memory buffer a read-back witnesses through the same cap (the
   write twin of U6bx's staged read); M1 is in-memory only, the BSP-side disk
-  write-back is M2. The bandy Ring-3 delegation wrapper, the x86 write/grow twin
-  (U10x), subdirs/LFN/rename, and write-back caching remain future. UnaFS
-  `owner`/`grants:*` enforcement on the by-name namespace — the last cap gap —
-  landed on the **aarch64** track as **U6** (see the aarch64 ledger: owned-by-
-  default at `SYS_OPEN` + `SYS_FGRANT` delegation, an in-kernel seam the on-disk
-  attributes will feed); the **x86 twin (U6x)** remains future. See both ledgers
-  below.)*
+  write-back is M2. Its ALLOCATOR twin **U10x** (2026-07-08) then landed
+  grow/create/delete on x86 — every FAT mutation DEFERRED out of the IF-masked
+  handler to a launcher IF=1 drain (a separate op-queue; the shared `fat.rs` writers
+  reused VERBATIM, x86 adds only a read-only `cluster_size()` accessor). It rides the
+  SAME single `handle_resolve(row, fd, CAP_WRITE)` CHECK (grow and unlink are
+  mutations; create via an O_CREAT open that endows the write cap), plus a scaffold
+  guard that refuses `SYS_UNLINK` on an immutable STAGED file (HELLO.BIN is EL0 code —
+  only a runtime-created descriptor is unlinkable, a flag reset on every slot free) and
+  a per-descriptor `FILE_OPNAME` binding so a deferred op ALWAYS names the descriptor's
+  OWN file (no confused-deputy: a RW SCRATCH.BIN holder can never mint a GROW.BIN op).
+  x86 divergences are ledgered honestly: the deferred DELETE is a launcher-side replay
+  (weaker causal fidelity than pi4's in-handler unlink), its sibling-`-EACCES` proves
+  gen-invalidation not a freed-chain aliasing fail-safe (no on-disk chain exists
+  pre-drain), and grow is one-page-bounded. UnaFS `owner`/`grants:*` enforcement on the
+  by-name namespace — the last cap gap — landed on the **aarch64** track as **U6**
+  (owned-by-default at `SYS_OPEN` + `SYS_FGRANT` delegation, an in-kernel seam the
+  on-disk attributes will feed; see the aarch64 ledger); the **x86 twin (U6x)**, the
+  bandy Ring-3 delegation wrapper, subdirs/LFN/rename, and write-back caching remain
+  future. See both ledgers below.)*
 - **UnaFS stores the metadata natively**: `owner` and `grants:*` are ordinary
   typed attributes — queryable ("show every file the midi-agent can write"),
   and no on-disk format change is ever needed.
