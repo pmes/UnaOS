@@ -2382,14 +2382,15 @@ unsafe extern "C" {
 // table naming B (so A's SYS_FGRANT is owner-scoped), then releases each choreography edge only after the prior
 // step's SYS_REPORT cue:
 //   * el0-uowner-a (OWNER): creates OWNED.BIN PRIVATE (O_CREAT|RW, mode=3 — owned by A) + grow-writes it; reports
-//     A_READY; parks on its GRANT GO (+0x3000); SYS_FGRANTs B read (child handle 2) -> 0; reports A_GRANTED;
-//     parks on its REVOKE GO (+0x3010); SYS_FGRANTs B rights=0 (revoke) -> 0; reports A_REVOKED; parks on its
-//     EXIT GO (+0x3018); RE-opens OWNED.BIN (owner authority persists) -> a handle; exits. A stays alive (owner)
-//     through all of B's opens — its EXIT GO is released only after B has exited.
+//     A_READY; parks on its GRANT GO (+0x3000); SYS_FGRANTs B read+write (rights=3, child handle 2) -> 0; reports
+//     A_GRANTED; parks on its REVOKE GO (+0x3010); SYS_FGRANTs B rights=0 (revoke) -> 0; reports A_REVOKED; parks
+//     on its EXIT GO (+0x3018); RE-opens OWNED.BIN (owner authority persists) -> a handle; exits. A stays alive
+//     (owner) through all of B's opens — its EXIT GO is released only after B has exited.
 //   * el0-uowner-b (GRANTEE): parks on GO1 (+0x3000); opens OWNED.BIN -> -EACCES (not owner, not granted);
-//     reports B_DENIED1; parks on GO2 (+0x3010); opens -> a handle, READs the 16 bytes (must match A's pattern),
-//     then tries SYS_FGRANT itself (a non-owner) -> -EACCES, and closes; reports B_OPENED; parks on GO3
-//     (+0x3018); opens -> -EACCES again (the revoke took effect); exits.
+//     reports B_DENIED1; parks on GO2 (+0x3010); opens RW -> a handle, READs the 16 bytes (must match A's
+//     pattern), tries SYS_FGRANT itself (a non-owner) -> -EACCES, tries SYS_UNLINK via its CAP_WRITE handle ->
+//     -EACCES (delete is OWNER-only — a content grantee cannot unlink+recreate to steal ownership), and closes;
+//     reports B_OPENED; parks on GO3 (+0x3018); opens -> -EACCES again (the revoke took effect); exits.
 // Both build a witness in x23, SYS_REPORT it, and exit with the U6 sentinel. B's read buffer is +0x2000; GO words
 // live in page 3 (+0x3000/+0x3010/+0x3018 per slot). ABI: x8=nr, args x0-x2, ret x0.
 core::arch::global_asm!(
@@ -2440,7 +2441,7 @@ __uowner_prog_a:
     mov  x8, #18                           // SYS_FGRANT
     mov  x0, x19                           // file handle hA
     mov  x1, #2                            // child handle idx (Child -> B; UOWNER_CHILD_IDX)
-    mov  x2, #1                            // rights = CAP_READ
+    mov  x2, #3                            // rights = CAP_READ | CAP_WRITE (B may read AND write content, NOT delete)
     svc  #0
     cmp  x0, #0
     b.ne 2f
@@ -2557,15 +2558,15 @@ __uowner_prog_b:
     b.ne 24b
     b    21f
 
-25: // (1) open OWNED.BIN RO AFTER the grant -> a handle (>=0)
+25: // (1) open OWNED.BIN RW AFTER the grant -> a handle (>=0) carrying CAP_READ|CAP_WRITE (within the grant)
     mov  x8, #11
     adr  x0, 8f
     mov  x1, #(9f - 8f)
-    mov  x2, #0                            // RO (== the granted right)
+    mov  x2, #1                            // RW (requested R|W subset of the granted R|W)
     svc  #0
     mov  x20, x0                           // x20 = hB (>=0) or -errno
     tbnz x20, #63, 21f
-    add  x23, x23, #2                      // bit1: granted open OK
+    add  x23, x23, #2                      // bit1: granted RW open OK
     // (2) read 16 bytes -> the content must match A's pattern
     mov  x8, #12                           // SYS_READ
     mov  x0, x20
@@ -2593,6 +2594,14 @@ __uowner_prog_b:
     cmn  x0, #13                           // -EACCES?
     b.ne 21f
     add  x23, x23, #8                      // bit3: a non-owner grant is denied (-EACCES)
+    // (4) a grantee cannot DELETE — SYS_UNLINK via its CAP_WRITE handle -> -EACCES (only the owner may unlink;
+    //     the fix that stops a WRITE-grantee from unlink+recreate to STEAL ownership). OWNED.BIN survives.
+    mov  x8, #16                           // SYS_UNLINK(hB)
+    mov  x0, x20
+    svc  #0
+    cmn  x0, #13                           // -EACCES?
+    b.ne 21f
+    add  x23, x23, #16                     // bit4: grantee unlink denied (-EACCES) — delete is owner-only
     mov  x8, #17                           // SYS_CLOSE(hB)
     mov  x0, x20
     svc  #0
@@ -2622,7 +2631,7 @@ __uowner_prog_b:
     svc  #0
     cmn  x0, #13                           // -EACCES?
     b.ne 21f
-    add  x23, x23, #16                     // bit4: post-revoke open denied (-EACCES)
+    add  x23, x23, #32                     // bit5: post-revoke open denied (-EACCES)
 21:
     mov  x0, x23                           // SYS_REPORT(final witness)
     mov  x8, #3
@@ -3015,10 +3024,12 @@ const UOWNER_EXIT_STATUS: u64 = 0x81;
 /// revoke -> OK (ownership authority persists). `uowner_run` PASSes iff A == this. Matches `add x23,#{1,2,4,8}`.
 const UOWNER_A_WITNESS_ALL: u64 = 0xF;
 /// U6 demo: GRANTEE (B)'s witness — bit0 open OWNED.BIN BEFORE any grant -> -EACCES (the gap closed: a
-/// non-owner is denied by name); bit1 open AFTER grant -> a handle; bit2 the 16 read bytes match A's pattern;
-/// bit3 B (a non-owner) SYS_FGRANT -> -EACCES (only the owner may grant); bit4 open AFTER revoke -> -EACCES
-/// again (revoke enforced). `uowner_run` PASSes iff B == this. Matches `add x23,#{1,2,4,8,16}` in program B.
-const UOWNER_B_WITNESS_ALL: u64 = 0x1F;
+/// non-owner is denied by name); bit1 RW open AFTER grant -> a handle (within the R|W grant); bit2 the 16 read
+/// bytes match A's pattern; bit3 B (a non-owner) SYS_FGRANT -> -EACCES (only the owner may grant); bit4 B
+/// SYS_UNLINK via its CAP_WRITE handle -> -EACCES (delete is owner-only — a content grantee cannot unlink+recreate
+/// to steal ownership); bit5 open AFTER revoke -> -EACCES again (revoke enforced). `uowner_run` PASSes iff B ==
+/// this. Matches `add x23,#{1,2,4,8,16,32}` in program B.
+const UOWNER_B_WITNESS_ALL: u64 = 0x3F;
 /// U6 demo: the private file A creates + owns; B is denied, then granted, then re-denied. Runtime-created (not
 /// planted). 9 chars (<= `MAX_NAME`); the `mov x1, #(9f-8f)` in the blob matches. Never unlinked (A exits owning
 /// it — its owner row then reverts to PUBLIC at teardown), so the launcher pre-checks it ABSENT on a fresh image.
@@ -4231,6 +4242,23 @@ fn owned_is_owner(dir_lba: u64, dir_off: u32, asid: u64, caller_gen: u64) -> boo
         }
     }
     false
+}
+
+/// U6: may `(asid, gen)` UNLINK the file at `(dir_lba, dir_off)`? DELETE is an OWNER-only authority, distinct
+/// from content write: an OWNED file may be unlinked ONLY by its current owner — a `CAP_WRITE` GRANTEE gets
+/// content read/write, NEVER delete (else it could `unlink` + `O_CREAT` the name to STEAL ownership and lock the
+/// real owner out). A PUBLIC file (no owner row) keeps the pre-U6 behaviour: anyone holding a `CAP_WRITE` handle
+/// (which, for a public file, any process could obtain) may unlink it — "public" carries no delete protection.
+fn owned_unlink_permitted(dir_lba: u64, dir_off: u32, asid: u64, caller_gen: u64) -> bool {
+    let _irq = IrqGuard::mask_save();
+    let t = OWNED_FILES.lock();
+    for row in t.iter() {
+        if row.dir_lba == dir_lba && row.dir_off == dir_off {
+            // Owned -> only the owner may delete (grants confer content access, not delete).
+            return row.owner_asid == asid && row.owner_gen == caller_gen;
+        }
+    }
+    true // public (no owner row) -> the pre-U6 CAP_WRITE-gated unlink applies
 }
 
 /// U6: SYS_FGRANT's table half. Verify the row at `(dir_lba, dir_off)` is owned by `(owner_asid, owner_gen)`,
@@ -5985,8 +6013,10 @@ fn sys_open(name_ptr: u64, name_len: u64, mode: u64) -> i64 {
     if created {
         // A NEW name — the caller is its owner. Record ownership unless O_PUBLIC. If the bounded owner table
         // is full, fail CLOSED: undo the fresh (0-length) directory entry and return -ENOSPC rather than
-        // leave a "private" file silently world-accessible.
-        if mode & O_PUBLIC == 0 && !owned_set_owner(dir_lba, dir_off as u32, asid, asid_gen) {
+        // leave a "private" file silently world-accessible. ASID 0 (the shared/boot window) is NEVER torn down
+        // and its ASID_GEN never bumps, so it cannot be a gen-fenced private owner — an ASID-0 create is always
+        // PUBLIC (no owner row). Untrusted EL0 runs under ASID 1..8; ASID 0 is EL1/boot only.
+        if asid != 0 && mode & O_PUBLIC == 0 && !owned_set_owner(dir_lba, dir_off as u32, asid, asid_gen) {
             let _ = fs.mark_dir_deleted(dir_lba, dir_off);
             return ENOSPC;
         }
@@ -6165,6 +6195,15 @@ fn sys_unlink(handle: u64) -> i64 {
     if dir_lba == 0 {
         return EACCES;
     }
+    // U6: DELETE is an OWNER-only authority. The handle-side `CAP_WRITE` CHECK above admits both the owner AND a
+    // WRITE-GRANTEE (a grantee legitimately opened this file RW), but a content grantee must NOT be able to
+    // delete — else it could `unlink` + `O_CREAT` the name to STEAL ownership and lock the real owner out. So an
+    // OWNED file is unlinkable only by its current owner; a PUBLIC file (no owner row) keeps the prior behaviour.
+    // Checked BEFORE any on-disk mutation, so a denied unlink changes nothing.
+    let asid_gen = ASID_GEN[asid as usize].load(Ordering::Acquire);
+    if !owned_unlink_permitted(dir_lba, dir_off as u32, asid, asid_gen) {
+        return EACCES;
+    }
     let fs = match crate::fs::fat::mount() {
         Ok(fs) => fs,
         Err(crate::fs::fat::FatError::NoDisk) => return ENODEV,
@@ -6287,8 +6326,13 @@ fn sys_fgrant(file_handle: u64, child_handle: u64, rights: u64) -> i64 {
         return ECHILD; // no ASID recorded (a shared-window task is not a grant recipient)
     }
     let grantee_gen = ASID_GEN[grantee_asid as usize].load(Ordering::Acquire);
-    // Only file rights are meaningful for a grant; mask the request to READ|WRITE (other bits -> revoke).
-    let rights = (rights as u32) & (CAP_READ | CAP_WRITE);
+    // Only READ|WRITE are grantable file rights. `rights == 0` is an explicit REVOKE; a NONZERO request that
+    // names ONLY unsupported bits is malformed (`-EINVAL`) rather than silently coerced to a revoke.
+    let req = rights as u32;
+    if req != 0 && req & (CAP_READ | CAP_WRITE) == 0 {
+        return EINVAL;
+    }
+    let rights = req & (CAP_READ | CAP_WRITE);
     owned_grant(dir_lba, dir_off, asid, asid_gen, grantee_asid, grantee_gen, rights)
 }
 
@@ -9761,7 +9805,7 @@ fn uowner_run(demo_cpu: usize) {
         && on_disk
     {
         serial_println!(
-            ":: U6-grants: owner/grants on open — non-owner -EACCES, owner grant admits read, non-owner grant -EACCES, revoke re-denies -> PASS ::"
+            ":: U6-grants: owner/grants on open — non-owner -EACCES, owner grant admits R|W, grantee unlink -EACCES (delete owner-only), non-owner grant -EACCES, revoke re-denies -> PASS ::"
         );
     } else {
         serial_println!(
