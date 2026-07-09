@@ -1414,6 +1414,34 @@ devices only on root ports, no `usb-hub`, and is lenient about EP0 MPS), so item
 verified only by construction and an adversarial 5-lens review, not on silicon. They land as levers
 for the next attended bench. Item 4 is pure hygiene and needs no bench.
 
+> **✅ JB10 METAL VERDICT (attended bench, 2026-07-08 — all four confirmed in one boot).** Serial
+> `~/unaos-bench/jetson-serial-2026-07-08-180338.log`. **Item 1 (nested-hub):** the VIA VL2109 chain
+> enumerated two tiers deep — `HUB DETECTED (slot 4)` → `HUB-BEHIND-HUB DETECTED (slot 5, 2109:2813,
+> route 0x2 tier 1)` → descended → tier-2 devices at route `0x22`/`0x32`/`0x42` (route-string math
+> exact on silicon) → a **Low-Speed keyboard (slot 8, route 0x42, tier 2) `keyboard ARMED (root port
+> 6) -> PASS`**, and typing came through end-to-end (`KEY 'h' 'e' 'l' 'l' 'o'` at EL1) — so the LS-child
+> TT (DW2) programming is correct on hardware too. **Item 2 (FS Evaluate-Context):** the JB9 port-7
+> blocker cracked — `[tegra fs-mps] slot 10 (FS port 7) … bMaxPacketSize0 = 64 … EP0 MPS0 -> 64
+> (Evaluate Context OK)`: the strict Tegra FW **accepted** the in-place Evaluate Context (the
+> review-caught EP0-offset fix was right), so the FS device learns MPS0 and reads its descriptor
+> instead of going silent after the old teardown churn. **Item 4:** JB9 diagnostic suite silent
+> (0 `FW-ALIVE`/`jb9f`/`ring_scan` lines). CAPSTONE 6/6, clean EL2→EL1 drop. **Still open (documented
+> follow-up):** storage-behind-hub — slot 6 (Alcor `058f:6362`, tier 2) enumerated but "no HID
+> interrupt endpoint"; downstream storage is not yet claimed, so `storage_slot` stays 0.
+
+> **Display (why the panel is dark — precise finding, 2026-07-08 bench).** The JetPack UEFI publishes
+> its GraphicsOutput in **`BltOnly` mode**: 5 modes, current 1920×1200, every one `fmt=BltOnly` — i.e.
+> a `Blt()` boot-service with **no linear framebuffer** (and `Blt()` is gone after ExitBootServices).
+> The bootloader logs `GOP: active mode has no linear framebuffer; booting without a display`
+> (`crates/bootloader/src/main.rs@450`) and the kernel takes the headless path (`JM7 — GOP fb
+> addr=0x0`, banner `headless serial console`). So all boot/CAPSTONE output goes to UARTC serial, never
+> the panel — even though the firmware itself IS driving the monitor at 1920×1200 (its display
+> controller is live and scanning out a framebuffer from DRAM; the panel holds the firmware's last
+> frame). The UEFI-GOP route to a framebuffer is a **dead end** on this board. Getting pixels needs
+> UnaOS to **inherit the firmware's live scanout FB** (read the Tegra234 nvdisplay scanout base, map
+> it, blit — the JB6→JB9 "inherit, don't re-init" pattern) or drive the Tegra DC natively. That is the
+> next arc, **JD1** (baton `~/.claude/plans/unaos-jetson-display-BATON.md`).
+
 1. **Nested-hub descent** (shared `drivers/xhci/mod.rs`, additive; the hub FSM is dead code under
    the QEMU suites, so this cannot regress x86/Pi4). `enumerate_downstream` now detects a downstream
    device that is itself a hub (device class `0x09`) and pushes its slot into `hubs_pending`, so the
