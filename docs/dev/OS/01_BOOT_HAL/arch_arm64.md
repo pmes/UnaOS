@@ -355,11 +355,11 @@ a live boot console on the Orin:
   linear framebuffer; booting without a display"*. The kernel received
   `fb addr=0x0 size=0x0 1920x1200 stride=2048 bpp=4` (mode info without a surface), fbcon stayed
   inert, and the boot ran headless-identical: EL1 landing + CAPSTONE 6/6 again. Conclusion:
-  **video-via-GOP is impossible on this firmware**; real Orin video means driving the Tegra234
-  display engine (nvdisplay) directly — allocate a kernel surface, program scanout, then hand
-  fbcon/`Screen` that address, at which point JM7's mapping + flush machinery is reused unchanged.
-  That is its own major arc. The JM7 code stays: correct, inert when `fb addr=0`, and the landing
-  pad for the nvdisplay arc's surface.
+  **video-via-GOP is impossible on this firmware**; real Orin video means going around the GOP to the
+  live scanout. **Resolved in §JD1** (below): the firmware does not withhold the framebuffer, it hands
+  it off through the DTB (`simple-framebuffer`, the SIMPLEFB handoff), so UnaOS **inherits** the live
+  scanout base+geometry from the device tree — no need to allocate a surface or re-program the DC. The
+  JM7 code stays: correct, inert when `fb addr=0`, and the mapping/flush machinery JD1 reuses unchanged.
 - Out of scope, documented for the follow-on: interactive console/GUI on Orin (input), and real USB
   keyboard/mouse — the Orin's built-in ports are **Tegra XUSB** (a platform controller needing
   firmware/phy bring-up, NOT the PCIe xHCI the kernel already drives); that is its own arc.
@@ -1403,7 +1403,184 @@ round-trip. The chronicle:
 storage sat behind nested VL2109 hub layers; `storage_slot=0`); port 7's FS device passes the
 babble-learn then watchdogs at dev-desc (needs a fresh port reset in the retry flow); the JB4/JB5
 chain code paths should be formally retired/gated for inherit-path boots; and a direct-to-root-port
-keyboard boot is the quick win to demonstrate `keyboard ARMED` end-to-end.
+keyboard boot is the quick win to demonstrate `keyboard ARMED` end-to-end. **These four are JB10,
+below.**
+
+### JB10 — nested-hub descent, FS Evaluate-Context, root-keyboard readiness, inherit-path housekeeping
+
+JB10 follows the JB9 verdict (USB enumerates on the Orin). It is **QEMU-green + code-review clean;
+the USB-behaviour halves are metal-pending — QEMU cannot exercise them** (its regression attaches
+devices only on root ports, no `usb-hub`, and is lenient about EP0 MPS), so items 1–3 below are
+verified only by construction and an adversarial 5-lens review, not on silicon. They land as levers
+for the next attended bench. Item 4 is pure hygiene and needs no bench.
+
+> **✅ JB10 METAL VERDICT (attended bench, 2026-07-08 — all four confirmed in one boot).** Serial
+> `~/unaos-bench/jetson-serial-2026-07-08-180338.log`. **Item 1 (nested-hub):** the VIA VL2109 chain
+> enumerated two tiers deep — `HUB DETECTED (slot 4)` → `HUB-BEHIND-HUB DETECTED (slot 5, 2109:2813,
+> route 0x2 tier 1)` → descended → tier-2 devices at route `0x22`/`0x32`/`0x42` (route-string math
+> exact on silicon) → a **Low-Speed keyboard (slot 8, route 0x42, tier 2) `keyboard ARMED (root port
+> 6) -> PASS`**, and typing came through end-to-end (`KEY 'h' 'e' 'l' 'l' 'o'` at EL1) — so the LS-child
+> TT (DW2) programming is correct on hardware too. **Item 2 (FS Evaluate-Context):** the JB9 port-7
+> blocker cracked — `[tegra fs-mps] slot 10 (FS port 7) … bMaxPacketSize0 = 64 … EP0 MPS0 -> 64
+> (Evaluate Context OK)`: the strict Tegra FW **accepted** the in-place Evaluate Context (the
+> review-caught EP0-offset fix was right), so the FS device learns MPS0 and reads its descriptor
+> instead of going silent after the old teardown churn. **Item 4:** JB9 diagnostic suite silent
+> (0 `FW-ALIVE`/`jb9f`/`ring_scan` lines). CAPSTONE 6/6, clean EL2→EL1 drop. **Still open (documented
+> follow-up):** storage-behind-hub — slot 6 (Alcor `058f:6362`, tier 2) enumerated but "no HID
+> interrupt endpoint"; downstream storage is not yet claimed, so `storage_slot` stays 0.
+
+> **Display (why the panel is dark — precise finding, 2026-07-08 bench).** The JetPack UEFI publishes
+> its GraphicsOutput in **`BltOnly` mode**: 5 modes, current 1920×1200, every one `fmt=BltOnly` — i.e.
+> a `Blt()` boot-service with **no linear framebuffer** (and `Blt()` is gone after ExitBootServices).
+> The bootloader logs `GOP: active mode has no linear framebuffer; booting without a display`
+> (`crates/bootloader/src/main.rs@450`) and the kernel takes the headless path (`JM7 — GOP fb
+> addr=0x0`, banner `headless serial console`). So all boot/CAPSTONE output goes to UARTC serial, never
+> the panel — even though the firmware itself IS driving the monitor at 1920×1200 (its display
+> controller is live and scanning out a framebuffer from DRAM; the panel holds the firmware's last
+> frame). The UEFI-GOP route to a framebuffer is a **dead end** on this board. Getting pixels needs
+> UnaOS to **inherit the firmware's live scanout FB** (read the Tegra234 nvdisplay scanout base, map
+> it, blit — the JB6→JB9 "inherit, don't re-init" pattern) or drive the Tegra DC natively. That is the
+> next arc, **JD1** (baton `~/.claude/plans/unaos-jetson-display-BATON.md`).
+
+1. **Nested-hub descent** (shared `drivers/xhci/mod.rs`, additive; the hub FSM is dead code under
+   the QEMU suites, so this cannot regress x86/Pi4). `enumerate_downstream` now detects a downstream
+   device that is itself a hub (device class `0x09`) and pushes its slot into `hubs_pending`, so the
+   next `service_hubs` pass brings it up and descends another tier — mirroring the root-port `HUB
+   DETECTED` push. `DeviceSlot` gains `route_string`/`route_depth`; `bring_up_hub` extends the route
+   for each child (`route | (port << (4·depth))`, `depth+1`) with a 5-tier cap (the xHCI Route String
+   is 20 bits = 5 nibbles). `address_downstream` programs the Slot Context DW2 Transaction Translator
+   (TT Hub Slot ID / TT Port Number) for Low/Full-Speed children — the immediate parent hub is the TT
+   for the common single-level-HS-hub topology; HS/SS children keep DW2 = 0, so the working VIA-hub
+   HS path is byte-unchanged. Root devices leave `route_*` at 0 (addressed by the root FSM), cleared
+   in `reset_soft_state`/`new` for recycled-slot safety.
+2. **Full-Speed EP0 Evaluate-Context** (`drivers/xhci/mod.rs`, `#[cfg(feature="tegra")]`,
+   const-toggle `JB10_FS_EVAL_CTX`, default on; **HYPOTHESIS — verify on the bench**). The JB9 baton
+   framed port 7 as "needs a fresh port reset", but the serial refutes that: the babble→recover path
+   *already* does DISABLE_SLOT + fresh port reset + re-ADDRESS at the correct MPS0=64 — and the FS
+   device then goes **silent** (dev-desc watchdog-times-out, PORTSC still `0x603` connected). The
+   device responds at MPS0=8 (it babbles = it sent data) but not after the tear-down churn. So JB10
+   adopts Linux `xhci_check_maxpacket`: for a Tegra FS root device, read the first 8 bytes (one
+   packet, no babble), learn `bMaxPacketSize0`, patch EP0 MPS0 **in place** via an Evaluate Context
+   command (TRB type 13, Add-flag A1, EP0 copied from the *output* context), then read the full
+   descriptor — all on the same slot, no DISABLE_SLOT, no reset. Deferred to `service_enum`
+   (`fs-mps-learn` stage, main-loop context where `sync_control`/`run_command_sync` are safe, never
+   inside `poll_events`). On any failure it falls back to the shared babble→recover path. Non-tegra
+   builds are byte-identical (the whole path is `cfg(tegra)`; `begin_device_descriptor` collapses to
+   the prior `request_device_descriptor` call). ⚠ A review pass caught the Evaluate-Context source
+   offset (the output DeviceContext has no Input-Control prefix, so EP0 is at `1·CTX_WORDS`, not
+   `2·CTX_WORDS`) — fixed before commit; the wrong offset would have submitted a null-ring EP0 that
+   the strict Tegra FW rejects (code 17), silently defeating the lever.
+3. **Direct-root keyboard demo** — no code change. The path already exists end to end (root device →
+   `poll_events` class-detect → `configure_hid_endpoints` → `keyboard_state` 1→2→3 → `keyboard_armed`
+   → `:: tegra: JB2b — keyboard ARMED (slot, root port) -> PASS ::`, then `kbd_pump_body` prints
+   `:: tegra: JB2b — KEY '<c>' ::`). Item 2 improves the odds for a Full-Speed root keyboard on the
+   Tegra FW. Bench procedure: plug a USB keyboard directly into an Orin root port (no hub) and boot;
+   watch for `keyboard ARMED -> PASS` then a `KEY` line per keystroke.
+4. **Inherit-path housekeeping** (`xusb_tegra.rs` + `main.rs`, tegra-only, zero x86/Pi4 blast radius).
+   `JB9_PROBE` defaults **false** now the verdict is in — it silences the diagnostic suite
+   (`jb9_fw_alive`, `jb9f_inherit_run_probe`, the `jb9_fw_sid_view`/`jb9_ring_scan`/`jb9_stream_dump`
+   pump-window captures). It does **not** touch the working recipe: the JB9g no-HCRST takeover and
+   JB9i slot eviction gate on `JB9G_NO_HCRST`, and `jb5_bar2_route` (load-bearing) gates on
+   `JB5_PROBE` — both stay true. Two compile-time tripwires
+   (`const _: () = assert!(!(JB4_ALLOW_PG_CYCLE && JB9G_NO_HCRST))` and the `JB5_RUN_E_REPLAY` twin)
+   make the two firmware-destroying levers un-co-enable-able with the inherit recipe: a wrong pairing
+   now fails the build, not a boot. The `main.rs` JB4 revival block is wrapped in `if !jb9h_skip` for
+   symmetry with the JB3 chain. The forensic kit is **kept, not deleted** — flip `JB9_PROBE` back to
+   `true` at the next bench when a failed downstream enumeration needs the telemetry; retiring the
+   dead JB3/JB4/JB5 chain code is a separate scoped cleanup arc (it spans `bpmp_tegra`/`smmu_tegra`).
+
+**Build note:** with `JB9_PROBE=false` the optimizer prunes the dead `if JB9_PROBE` diagnostic call
+sites, so `esp-jetson` `kernel.elf` is **~242 KB / ~90 `tegra:` strings** (down from ~257 KB / ~100–140
+with the probes on) — this is the intended shrink, **not** a broken/virt-clobbered build; the corrupt
+RED LINE remains ~355 KB.
+
+**Known limitations (follow-ups, not regressions):** (a) a *normal* hot-unplug of a root port hosting
+a nested hub tree tears nothing down (the disconnect handler only logs) so the subtree's slots/contexts
+leak — pre-existing behaviour for tier-1 too, bounded, no UAF, matching the codebase's forget-don't-free
+model; the *recovery* path does cascade-dispose correctly. (b) TT attribution is correct only when every
+intermediate hub above a LS/FS device is High-Speed (single-level is the target); a LS/FS device below a
+non-HS intermediate hub is not handled. (c) a SuperSpeed device *behind* a USB3 hub is mis-speeded
+(`reset_downstream_port` decodes LS/HS/FS only, no SS) — not needed for the keyboard/mouse demo.
+
+### JD1 — first pixels: inherit the firmware's live scanout framebuffer (QEMU-inert, ⏳ METAL-PENDING)
+
+JM7 established the block: the panel is dark not because the display is off but because NVIDIA's UEFI
+publishes its GOP in **`BltOnly`** mode — no CPU-linear framebuffer, so `BootInfo::framebuffer_addr == 0`
+and fbcon stays inert — even though the firmware's display engine is very much alive and scanning out a
+framebuffer from DRAM (the panel holds the last frame at 1920×1200). JD1 lights UnaOS's own boot console on
+that panel by **inheriting** the firmware's live scanout rather than re-initialising the pipeline (the
+JB6→JB9 "inherit, don't re-init" lesson, applied to display).
+
+**The decisive finding (edk2-nvidia source, cross-checked against mainline Linux `drm/tegra`):** the GOP is
+`BltOnly` *on purpose*. The Orin's `SocDisplayHandoffMethod` defaults to **SIMPLEFB**, under which the
+firmware deliberately withholds a linear GOP surface and instead hands the framebuffer off **through the
+device tree**. MB2/TegraBL allocates the scanout as a fixed DRAM carveout (`CARVEOUT_DISP_EARLY_BOOT_FB`)
+that the DCE (the RISC-V ucontroller owning nvdisplay) scans out; at ReadyToBoot the UEFI display driver
+writes a `compatible = "simple-framebuffer"` node into the FDT it exposes — geometry (`width`/`height`/
+`stride`/`format`) on the node, and the **physical** base/size in the node's `memory-region` reserved-memory
+`reg`, with `iommu-addresses = <&dcN base size>` declaring the display-IOMMU **identity** map (so the reg PA
+equals the DC's scanout IOVA). The bootloader already captures that FDT into `BootInfo::dtb_addr`, so the
+live scanout PA is sitting in a DTB the kernel can walk. This is a strictly better inherit path than reading
+the nvdisplay window register (which would be an SMMU IOVA, double-buffered, and behind a possibly-gated
+block): **a pure RAM walk — no display MMIO, no SMMU translation, no active/assembly hazard, no
+EL3-fatal-touch risk.**
+
+**Implementation (all `cfg(feature = "tegra")` → non-tegra x86/`virt` builds are byte-identical; QEMU never
+compiles `tegra`, so this is inert in every regression):**
+- **`fdt_tegra::nvdisplay_simplefb`** resolves the handoff: finds the first non-`disabled`
+  `simple-framebuffer` node, reads `width`/`height`/`stride`(bytes)/`format`(string), follows
+  `memory-region` → reserved-memory `reg` (2 addr + 2 size cells) for the physical base+size. `jd1_dump` is
+  the human-readable twin (prints every `simple-framebuffer` node and every `fb`/`framebuffer`/`display`
+  reserved-memory carveout), so a bench boot is self-diagnosing even when the strict resolver rejects a node.
+- **`display_tegra::jd1_survey`** maps the `format` string to a `FrameBuffer` layout (`"x8r8g8b8"` →
+  in-memory `[B,G,R,X]` = UnaOS `Bgr`; `"x8b8g8r8"` → `Rgb`), converts the byte `stride` to the pixel
+  `FrameBufferInfo::stride`, sanity-gates the result (DRAM base ≥ `0x8000_0000`, sane geometry, carveout
+  covers the visible image), and prints the `:: tegra: JD1 — scanout: base=… size=… WxH stride=…B fmt=… ::`
+  verdict. `None` (no handoff / bad geometry) → the boot stays headless, byte-identical to pre-JD1.
+- **`mmu_tegra::map_fb_region`** maps the carveout's GiB span Normal-WB into **both** the live EL2 `L1` and
+  the EL1 twin `L1_EL1` (cleans the edited descriptors to PoC; `tlbi alle2` for the active EL2 regime; the
+  EL1 twin is picked up by the JM6 drop's own `tlbi vmalle1`), so the panel keeps working across the
+  EL2→EL1 drop. Idempotent — a GiB already mapped by `build_l1` is confirmed, not re-written; it refuses
+  GiB 0/1 (Device/SYSRAM) and out-of-range bases.
+- **`main.rs::tegra_early_stop`** (right after the JM7 report): survey → map → `jd1_test_pattern` (eight
+  colour bars + a bright frame, so a wrong stride shears the bars and a wrong format swaps blue↔red) →
+  `fbcon::init` on the inherited scanout. fbcon is *not* detached on the tegra path, so from here every
+  `serial_println!` (JB1a … JM4 … and the EL1 CAPSTONE, across the JM6 drop) also paints onto the panel.
+  CPU-write → scanout coherency rides fbcon's existing damage-tracked `flush_range` → `dc cvac` (the
+  Pi-HVS recipe — the DCE does not snoop the CPU cache), valid on Normal-WB. The shared renderer
+  (`video/framebuffer.rs`/`fbcon.rs`/`screen.rs`) is **unchanged** — JD1 only feeds it an address+geometry.
+
+**DC-register fallback (default OFF).** For the case where the firmware published no simple-framebuffer node
+into the DTB we received, `display_tegra::jd1_dc_survey` (behind `const JD1_DC_PROBE = false`) is a read-only
+sweep of the nvdisplay window registers. Register map, cross-checked against mainline `drm/tegra`
+`dc.h`/`hub.c` (register numbers are **dword** indices, byte = index≪2): the display block is
+`display@13800000` (compatible `nvidia,tegra234-display`, ~0xEF000, inside the GiB-0 device window), heads at
+`0x13800000 + n·0x10000` (n=0..3; the one bench-confirm number, T194-derived), per-window aperture at
+`head + 0x2800 + 0xC00·i` with `WIN_OPTIONS`(WIN_ENABLE bit30) `+0x600`, `WINDOWGROUP_SET_CONTROL`(OWNER)
+`+0x608`, `COLOR_DEPTH` `+0x60c`, `SIZE` `+0x614`, `CROPPED_SIZE` `+0x618`, `PLANAR_STORAGE`(stride/64)
+`+0x624`, `START_ADDR` `+0x700`, `SURFACE_KIND`(0=pitch) `+0x72c`, `START_ADDR_HI` `+0x734`. The read base is
+an SMMU IOVA with **bit 39 a GPU sector-swizzle flag to mask**. It is default-off because the DTB path is
+safe + primary and touching a *powergated* display block would be EL3-fatal (the JX1 lesson) — the panel is
+lit so it is *believed* powered, but the DTB path proves pixels without betting on that. It touches only
+plain config registers within the block's own decoded aperture (never the read-to-clear status region).
+
+**Status — ✅ METAL-CONFIRMED (2026-07-08, attended bench; Peter at the Orin, DP→HDMI monitor).** The
+firmware DID publish the SIMPLEFB handoff into the FDT we captured: `JD1 — simple-fb /chosen/framebuffer:
+1920x1200 stride=8192 fmt='x8r8g8b8'` → `resv /reserved-memory/framebuffer@2,79E00000 reg[0x2 0x79e00000 0x0
+0x960000]` → `scanout: base=0x279e00000 size=0x960000 1920x1200 stride=8192B fmt=x8r8g8b8 (Bgr) sane=true` →
+`panel LIVE`. The scanout base is in GiB 9 (already RAM-mapped — `map_fb_region` confirmed it) and the
+carveout size `0x960000` = exactly `8192×1200`. **On the panel:** the colour-bar test pattern rendered
+pixel-correct — clean vertical bars (black·blue·green·cyan·red·magenta·yellow·white), a crisp full-frame
+border, correct colours (blue 2nd / red 5th → the `x8r8g8b8 → Bgr` decode is right; a swap would trade
+blue↔red and cyan↔yellow), no shear (stride right), full-screen (base/geometry right) — then fbcon painted
+the whole boot log + `CAPSTONE COMPLETE` across the EL2→EL1 drop. UnaOS's first deliberate, pixel-correct
+frame on the Orin. A 3 s hold (`JD1_TEST_PATTERN_HOLD_SECS`, a `CNTPCT` busy-wait) keeps the pattern legible
+before the console takes the screen; set it to 0 to skip. `UNAOS_TEGRA=1 ./arroyo check` green both arches;
+`./arroyo test` (x86) + `test-arm` (aarch64 virt) byte-green; `esp-jetson` `kernel.elf` = **250,416 B / 101
+`tegra:` strings** (up from JB10's 241,936 B / 90; RED LINE ~355 KB). The DC-register fallback (`JD1_DC_PROBE`)
+was never needed — the DTB path carried it. NEXT (JD2): route the inherited USB keyboard to a live shell on
+the panel. A blank panel after a correct verdict = wrong base/stride/format/memory-type, **not** "re-init
+needed" (do not reset the DC/SOR/DP).
 
 ## 4. Jetson Orin Nano headless bring-up (Arc JM2)
 

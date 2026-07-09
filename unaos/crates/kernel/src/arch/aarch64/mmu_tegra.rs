@@ -423,6 +423,97 @@ pub unsafe fn arm_el1_fault_vector() {
     }
 }
 
+/// Clean one translation descriptor's cache line to the Point of Coherency so the table walker sees
+/// the new value once the data cache is bypassed. Ordering (the `dsb`) is done once by the caller.
+#[inline]
+unsafe fn clean_desc(addr: u64) {
+    unsafe {
+        core::arch::asm!("dc cvac, {}", in(reg) addr, options(nostack, preserves_flags));
+    }
+}
+
+/// A valid Normal-WB 1 GiB block: bits[1:0]=0b01 (block) AND AttrIdx (bits[4:2]) == 0 (MAIR Normal).
+#[inline]
+fn is_ram_block(desc: u64) -> bool {
+    desc & 0b11 == DESC_BLOCK && desc & (0b111 << 2) == ATTR_NORMAL
+}
+
+/// JD1 (video): map the inherited firmware scanout framebuffer's GiB span Normal-WB into BOTH live
+/// translation tables — the running EL2 `L1` and the EL1-precise twin `L1_EL1` — so the CPU can draw
+/// into the firmware's live scanout and the panel keeps working across the JM6 EL2 -> EL1 drop.
+///
+/// Called from `tegra_early_stop` AFTER `init` (the MMU is live, so the survey could read the
+/// nvdisplay scanout base through the GiB-0 device window) but BEFORE the drop. Most scanout
+/// carveouts already fall inside a firmware-declared RAM GiB (mapped at `init` step 1) — for those
+/// this is a no-op that just confirms the twin agrees. It only *adds* a GiB when the carveout sits
+/// in a Reserved region the RAM scan skipped. Whole 1 GiB blocks (the L1 granularity), Normal-WB
+/// like RAM: the DC scans DRAM and does not snoop the CPU cache, so CPU-write -> scanout coherency
+/// rides fbcon's existing `flush_range` -> `dc cvac` (the Pi-HVS recipe), valid on Normal-WB.
+///
+/// Returns `true` iff every GiB spanned by `[pa, pa+size)` is mapped Normal-WB afterwards. Refuses
+/// GiB 0/1 (the Device / SYSRAM windows) and GiB >= 64 (beyond the 36-bit IPS ceiling): a scanout
+/// base there is a survey misread, not a framebuffer, and the caller must then skip the blit.
+pub fn map_fb_region(pa: u64, size: usize) -> bool {
+    if pa == 0 || size == 0 {
+        return false;
+    }
+    let g_lo = pa >> 30;
+    let g_hi = (pa + size as u64 - 1) >> 30;
+    // A scanout framebuffer lives in DRAM (Orin: 0x8000_0000.., GiB 2 upward). GiB 0 is the Tegra
+    // Device window and GiB 1 the SYSRAM/peripheral window — never a framebuffer.
+    if g_lo < 2 || g_hi >= 64 {
+        return false;
+    }
+    let el = current_el();
+    let l1 = &raw mut L1 as *mut u64;
+    // The EL1 twin only exists on the EL2-primary path; on the EL1 fallback `L1` itself carries the
+    // EL1 recipe and doubles as both, so there is nothing separate to patch there.
+    let patch_twin = el == 2;
+    let l1_el1 = &raw mut L1_EL1 as *mut u64;
+    let mut changed = false;
+    let mut all_ok = true;
+    for g in g_lo..=g_hi {
+        let gi = g as usize;
+        let cur = unsafe { l1.add(gi).read_volatile() };
+        if !is_ram_block(cur) {
+            // Invalid (a Reserved-only GiB the RAM scan skipped): map it Normal-WB in the live table.
+            unsafe {
+                l1.add(gi).write_volatile(ram_block(g << 30, el));
+                clean_desc(l1.add(gi) as u64);
+            }
+            changed = true;
+        }
+        // Keep the EL1 twin in lock-step so the mapping survives the JM6 drop.
+        if patch_twin {
+            let cur1 = unsafe { l1_el1.add(gi).read_volatile() };
+            if !is_ram_block(cur1) {
+                unsafe {
+                    l1_el1.add(gi).write_volatile(ram_block(g << 30, 1));
+                    clean_desc(l1_el1.add(gi) as u64);
+                }
+                changed = true;
+            }
+        }
+        all_ok &= is_ram_block(unsafe { l1.add(gi).read_volatile() });
+    }
+    if changed {
+        // Publish the new descriptors and drop stale TLB state for the ACTIVE regime so the very
+        // next access (the JD1 blit) walks the fresh map. The `dsb sy` also orders the `dc cvac`s
+        // above. On the EL2-primary path the EL1 twin needs no TLBI here — the drop's own
+        // `tlbi vmalle1` (boot_tegra::enable_el1_regime) flushes EL1&0 before that regime is armed,
+        // and the twin is not the active table until then. (`tlbi alle2` would trap at EL1, so the
+        // TLBI must match the regime we are actually running.)
+        unsafe {
+            if el == 2 {
+                core::arch::asm!("dsb sy", "tlbi alle2", "dsb sy", "isb", options(nostack, preserves_flags));
+            } else {
+                core::arch::asm!("dsb sy", "tlbi vmalle1", "dsb sy", "isb", options(nostack, preserves_flags));
+            }
+        }
+    }
+    all_ok
+}
+
 // ── Part C: bounded fault visibility ────────────────────────────────────────────────────────────────
 //
 // A minimal, inert-until-it-fires EL2/EL1 vector table. Two 2 KiB-aligned tables (16 entries each, at

@@ -61,6 +61,10 @@ pub mod xusb_tegra;
 // metal verdict indicted for the total XUSB DMA-write drop (ENABLE_SLOT watchdogs, 0 events).
 #[cfg(feature = "tegra")]
 pub mod smmu_tegra;
+// JD1: inherit the firmware's live scanout framebuffer (DTB `simple-framebuffer` handoff) so fbcon
+// mirrors the boot log + CAPSTONE onto the Orin panel — the fix for the BltOnly-GOP dead end (JM7).
+#[cfg(feature = "tegra")]
+pub mod display_tegra;
 
 pub fn init() {
     serial_println!(":: AARCH64 Core Hardware Init ::");

@@ -541,6 +541,75 @@ Legend: **✅ metal-confirmed** · **🔬 QEMU-green, metal pending** · dates I
 - **Commits:** `hw-rmbp` — M1 `6a54a76`, M2 `39ae5c5`, M3 `4471d34`, review fix `91c93b8`; Opus-executed.
 
 ---
+## hw-jetson track — 2026-07-08 (code arc — QEMU-green + adversarial-review-clean; USB-behaviour metal-pending)
+
+### JD1 — first pixels: inherit the firmware's live scanout framebuffer ✅ METAL-CONFIRMED (Orin panel, 2026-07-08) `hw-jetson`
+- **What:** get the boot log + CAPSTONE onto the Orin panel. JM7 found the panel dark because the UEFI
+  GOP is `BltOnly` (no linear framebuffer) — but the firmware's DCE is still scanning out a DRAM carveout.
+  **The finding (edk2-nvidia source):** the GOP is `BltOnly` *on purpose* — the default `SocDisplayHandoff`
+  is SIMPLEFB, which hands the framebuffer off through the **device tree** instead: a `simple-framebuffer`
+  node (geometry) → `memory-region` reserved-memory `reg` (the **physical** scanout base, with
+  `iommu-addresses` declaring IOVA==PA). JD1 **inherits** that (the JB6→JB9 "inherit, don't re-init"
+  pattern): a pure DTB walk — no display MMIO, no SMMU translation, no double-buffer hazard, no
+  EL3-fatal-touch risk. `fdt_tegra::nvdisplay_simplefb` resolves it (+ `jd1_dump` diagnostic twin),
+  `display_tegra::jd1_survey` decodes format/geometry + prints the `JD1 — scanout:` verdict,
+  `mmu_tegra::map_fb_region` maps the carveout Normal-WB into **both** the EL2 `L1` and the EL1 twin (so
+  it survives the JM6 drop), then `jd1_test_pattern` + `fbcon::init` bring the panel up. A read-only
+  nvdisplay register sweep (`display_tegra::jd1_dc_survey`, `const JD1_DC_PROBE=false`) is the documented
+  bench fallback for the case where the FDT we received carries no handoff node.
+- **Register facts** (for the fallback), cross-checked against mainline `drm/tegra` `dc.h`/`hub.c` via a
+  4-source research pass + adversarial verify (HIGH trust; the only bench-confirm number is the `0x10000`
+  per-head stride): DC block `display@13800000`, per-window aperture `head+0x2800+0xC00·i`,
+  `START_ADDR`/`_HI` at `+0x700`/`+0x734` (dword offsets ≪2), stride via `PLANAR_STORAGE`(×64), bit39 = a
+  swizzle flag to mask.
+- **Verified by construction + a 3-lens adversarial review** (MMU-correctness · off-tegra-neutrality ·
+  DTB/scanout-safety, refuter-verified). QEMU never compiles `tegra`, so this is inert in every regression;
+  the shared renderer (`video/framebuffer.rs`/`fbcon.rs`/`screen.rs`) is **unchanged** — JD1 only feeds it
+  an address + geometry.
+- **Tested:** `UNAOS_TEGRA=1 ./arroyo check` green both arches; `./arroyo test` (x86) + `./arroyo test-arm`
+  (aarch64 virt) byte-green (all JD1 code `cfg(feature="tegra")` / inside `tegra_early_stop` → non-tegra
+  byte-identical); `esp-jetson` `kernel.elf` **250,416 B / 101 `tegra:` strings** (up from JB10's 241,936 B
+  / 90 — the JD1 survey/map/blit + linger code; RED LINE ~355 KB).
+- **✅ METAL (2026-07-08, Peter at the Orin):** the firmware published the SIMPLEFB handoff into our FDT
+  (`simple-fb /chosen/framebuffer 1920x1200 x8r8g8b8` → `framebuffer@0x279e00000` `0x960000` →
+  `scanout base=0x279e00000 (Bgr) sane=true` → `panel LIVE`). On the panel: the colour-bar test pattern
+  rendered **pixel-correct** (blue 2nd / red 5th → `Bgr` decode right; clean bars → stride right; framed +
+  full-screen → base/geometry right), then fbcon painted the whole boot log + `CAPSTONE COMPLETE` across the
+  EL2→EL1 drop. UnaOS's first correct frame on the Orin. `JD1_DC_PROBE` fallback never needed. A 3 s
+  `JD1_TEST_PATTERN_HOLD_SECS` (`CNTPCT` busy-wait) keeps the pattern legible before the console takes over.
+- **Detail:** [`arch_arm64.md` §JD1](dev/OS/01_BOOT_HAL/arch_arm64.md). Next: **JD2** — route the inherited
+  USB keyboard to a live shell on the panel (first interactive UnaOS session on the Orin).
+
+### JB10 — nested-hub descent + FS Evaluate-Context + root-kbd readiness + inherit-path housekeeping ✅ QEMU-green + review-clean / 🔬 metal-pending `hw-jetson`
+- **What:** the four JB9-baton follow-ups. **(1) Nested-hub descent** (shared `xhci/mod.rs`, additive,
+  hub-FSM is dead code under QEMU): `enumerate_downstream` detects a downstream hub (class `0x09`) and
+  pushes it to `hubs_pending` so `service_hubs` descends another tier; `DeviceSlot` gains
+  `route_string`/`route_depth`, `bring_up_hub` accumulates the Route String per tier (`| port <<
+  (4·depth)`, 5-tier cap), and `address_downstream` programs the DW2 Transaction Translator for LS/FS
+  children (HS/SS keep DW2=0 → working VIA-hub path byte-unchanged). **(2) FS EP0 Evaluate-Context**
+  (`#[cfg(feature="tegra")]`, `JB10_FS_EVAL_CTX`, HYPOTHESIS): the JB9 baton's "needs a port reset" is
+  refuted by the serial — the retry already resets + re-addresses at MPS0=64 and the FS device still
+  goes silent, so the tear-down churn itself is the culprit. Adopts Linux `xhci_check_maxpacket`: read
+  8 bytes, patch EP0 MPS0 in place via Evaluate Context (TRB 13, EP0 from the *output* context — the
+  review caught the source-offset bug), read the full descriptor, no teardown; deferred to
+  `service_enum` (`fs-mps-learn` stage), fallback to babble→recover. **(3) Root-keyboard demo:** no
+  code — the path already arms a root HID end to end; item 2 helps a FS root keyboard. **(4)
+  Housekeeping:** `JB9_PROBE` default-off (diagnostic suite only — recipe gates on `JB9G_NO_HCRST` /
+  `JB5_PROBE`, untouched), two compile-time asserts making the FW-destroying levers un-co-enable-able
+  with the inherit recipe, JB4 block wrapped in `!jb9h_skip`; forensic kit KEPT (flip back at a bench).
+- **Verified by construction + a 5-lens adversarial review (1 CONFIRMED bug fixed pre-commit: the
+  Evaluate-Context EP0 source offset).** QEMU cannot exercise items 1–3 (no `usb-hub`, lenient MPS) —
+  they land as levers for the next attended bench; item 4 needs no bench.
+- **Tested:** `UNAOS_TEGRA=1 ./arroyo check` green both arches; `./arroyo test` (x86) + `./arroyo
+  test-arm` (aarch64 virt) byte-green (root storage/kbd/mouse enumerate — items 1–2 are dead-under-QEMU
+  or `cfg(tegra)`, non-tegra byte-identical); `esp-jetson` `kernel.elf` **241,936 B / 90 `tegra:`
+  strings** (the JB9_PROBE-off shrink from ~257 KB / ~100+ is intended, NOT a virt clobber; JB10 code
+  present: `HUB-BEHIND-HUB`, `tegra fs-mps`).
+- **Detail:** [`arch_arm64.md` §JB10](dev/OS/01_BOOT_HAL/arch_arm64.md). Next (attended bench): flash +
+  watch nested descent (`storage_slot` past 0), the FS `fs-mps-learn` lever, and a direct-root
+  `keyboard ARMED`; then a scoped arc to retire the dead JB3/JB4/JB5 chain code.
+
+---
 ## hw-jetson track — 2026-07-08 (attended bench, Peter at the Orin)
 
 ### JB9 (bench outcome) — ⭐ USB WORKS ON ORIN: inherit + no-HCRST + 64-byte contexts ✅ metal-attended `hw-jetson`

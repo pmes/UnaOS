@@ -776,3 +776,299 @@ pub fn xusb_iommu(dtb_addr: u64, dtb_size: usize, ram_gib_mask: u64) -> Option<X
     }
     Some(out)
 }
+
+/// JD1 (video): the firmware's live scanout framebuffer, taken from the DTB `simple-framebuffer`
+/// handoff — the SIMPLEFB display-handoff the JetPack UEFI uses (edk2-nvidia
+/// `DisplayDeviceTreeHelperLib`). The GOP is `BltOnly` precisely *because* the firmware hands the
+/// framebuffer off through the device tree instead: MB2/TegraBL allocates a DRAM carveout
+/// (`CARVEOUT_DISP_EARLY_BOOT_FB`) that the DCE scans out, and the UEFI display driver writes
+/// `width/height/stride/format` onto a `compatible = "simple-framebuffer"` node (under /chosen) and
+/// the **physical** base/size into that node's `memory-region` reserved-memory `reg`, with
+/// `iommu-addresses` declaring the display-IOMMU *identity* map (so the reg PA equals the DC's
+/// scanout IOVA). Reading this is a pure RAM walk — no display MMIO, no SMMU translation, no
+/// double-buffer active/assembly hazard, no powergate touch — the purest "inherit, don't re-init".
+pub struct SimpleFb {
+    /// Physical scanout base (the EARLY_FB sub-carveout PA the firmware already page-aligned).
+    pub base: u64,
+    pub size: u64,
+    pub width: u32,
+    pub height: u32,
+    /// Line stride in BYTES (the simplefb binding's `stride`, already in bytes — unlike the DC's
+    /// `PLANAR_STORAGE`, which is bytes/64).
+    pub stride: u32,
+    /// The `format` string, e.g. `"x8r8g8b8"` (BGRX in memory) / `"x8b8g8r8"` (RGBX in memory).
+    pub format: [u8; 16],
+    pub format_len: usize,
+    /// PA came from a `memory-region` reserved-memory node (true) vs a `reg` on the fb node (false).
+    pub via_memregion: bool,
+}
+
+/// Longest simple-framebuffer node list we keep (one per active head; Orin Nano lights one).
+const MAX_FB_NODES: usize = 4;
+
+/// Resolve the DTB `simple-framebuffer` handoff silently (the `jd1_dump` twin is the human-readable
+/// form). Returns the first non-`disabled` node that carries a resolvable physical base + geometry.
+/// `None` = no such node (the firmware did not publish the SIMPLEFB handoff into the DTB we were
+/// handed, or the DTB is unmapped/malformed) — the caller then prints and skips the blit.
+pub fn nvdisplay_simplefb(dtb_addr: u64, dtb_size: usize, ram_gib_mask: u64) -> Option<SimpleFb> {
+    if dtb_addr == 0 || dtb_size == 0 {
+        return None;
+    }
+    let g_lo = dtb_addr >> 30;
+    let g_hi = (dtb_addr + dtb_size as u64 - 1) >> 30;
+    let mapped = |g: u64| g == 0 || (g < 64 && (ram_gib_mask >> g) & 1 != 0);
+    if !mapped(g_lo) || !mapped(g_hi) {
+        return None;
+    }
+    let blob = unsafe { core::slice::from_raw_parts(dtb_addr as *const u8, dtb_size) };
+    let fdt = Fdt::new(blob)?;
+
+    // Pass 1: collect every node whose `compatible` names "simple-framebuffer" (the firmware writes
+    // one per active head under /chosen). Bounded.
+    let mut paths = [[0u8; MAX_PATH]; MAX_FB_NODES];
+    let mut lens = [0usize; MAX_FB_NODES];
+    let mut n = 0usize;
+    fdt.for_each_prop(|e| {
+        if n >= MAX_FB_NODES || e.name != b"compatible" {
+            return;
+        }
+        let end = (e.val_off + e.val_len).min(blob.len());
+        if blob[e.val_off..end].windows(18).any(|q| q == b"simple-framebuffer") {
+            let l = e.path.len().min(MAX_PATH);
+            let dup = (0..n).any(|i| lens[i] == l && &paths[i][..l] == &e.path[..l]);
+            if !dup {
+                paths[n][..l].copy_from_slice(&e.path[..l]);
+                lens[n] = l;
+                n += 1;
+            }
+        }
+    });
+
+    // Pass 2: take the first node that is not `status = "disabled"` and resolves to a sane base.
+    for i in 0..n {
+        let node = &paths[i][..lens[i]];
+        // The firmware sets status="okay" only on the active head; skip any explicitly disabled one.
+        let status = fdt.prop_at(node, b"status");
+        if status.found {
+            let mut sb = [0u8; 12];
+            let mut sl = 0usize;
+            'sfill: for wi in 0..status.n {
+                for b in status.words[wi].to_be_bytes() {
+                    if b == 0 || sl >= sb.len() {
+                        break 'sfill;
+                    }
+                    sb[sl] = b;
+                    sl += 1;
+                }
+            }
+            if sl >= 8 && &sb[..8] == b"disabled" {
+                continue;
+            }
+        }
+        let width = fdt.prop_at(node, b"width");
+        let height = fdt.prop_at(node, b"height");
+        let stride = fdt.prop_at(node, b"stride");
+        let format = fdt.prop_at(node, b"format");
+        let memregion = fdt.prop_at(node, b"memory-region");
+        let node_reg = fdt.prop_at(node, b"reg");
+
+        // Physical base+size: prefer the `memory-region` reserved-memory node's `reg` (the
+        // /reserved-memory bus is 2 address + 2 size cells → [base_hi base_lo size_hi size_lo]);
+        // fall back to a `reg` directly on the fb node (same cell shape under /chosen).
+        let (base, size, via_memregion) = if memregion.found && memregion.n >= 1 {
+            let mut rbuf = [0u8; MAX_PATH];
+            let rn = fdt.path_of_phandle(memregion.words[0], &mut rbuf);
+            if rn == 0 {
+                continue;
+            }
+            let rr = fdt.prop_at(&rbuf[..rn], b"reg");
+            if rr.n < 4 {
+                continue;
+            }
+            (
+                ((rr.words[0] as u64) << 32) | rr.words[1] as u64,
+                ((rr.words[2] as u64) << 32) | rr.words[3] as u64,
+                true,
+            )
+        } else if node_reg.n >= 4 {
+            (
+                ((node_reg.words[0] as u64) << 32) | node_reg.words[1] as u64,
+                ((node_reg.words[2] as u64) << 32) | node_reg.words[3] as u64,
+                false,
+            )
+        } else {
+            continue;
+        };
+        // Require a DRAM base (>= 0x8000_0000) here too — so a bad-but-resolvable first node does not
+        // mask a valid later one (the full geometry/size sanity lives in display_tegra::jd1_survey).
+        if base < 0x8000_0000 || width.n == 0 || height.n == 0 {
+            continue;
+        }
+        let mut fmt = [0u8; 16];
+        let mut fmt_len = 0usize;
+        'ffill: for wi in 0..format.n {
+            for b in format.words[wi].to_be_bytes() {
+                if b == 0 || fmt_len >= 16 {
+                    break 'ffill;
+                }
+                fmt[fmt_len] = b;
+                fmt_len += 1;
+            }
+        }
+        return Some(SimpleFb {
+            base,
+            size,
+            width: width.words[0],
+            height: height.words[0],
+            stride: if stride.n >= 1 { stride.words[0] } else { 0 },
+            format: fmt,
+            format_len: fmt_len,
+            via_memregion,
+        });
+    }
+    None
+}
+
+/// JD1 (video): human-readable dump of the DTB display handoff — the twin of `nvdisplay_simplefb`.
+/// Read-only RAM walk (NO display MMIO). Prints every `simple-framebuffer` node it finds (geometry,
+/// format, memory-region/reg) plus any reserved-memory child whose name mentions fb/framebuffer/
+/// display, so a bench boot sees exactly what the firmware published even when the strict resolver
+/// rejects it. Every outcome — including every way of finding nothing — is one serial line.
+pub fn jd1_dump(dtb_addr: u64, dtb_size: usize, ram_gib_mask: u64) {
+    if dtb_addr == 0 || dtb_size == 0 {
+        serial_println!(":: tegra: JD1 — no DTB handed off; cannot survey the scanout handoff ::");
+        return;
+    }
+    let g_lo = dtb_addr >> 30;
+    let g_hi = (dtb_addr + dtb_size as u64 - 1) >> 30;
+    let mapped = |g: u64| g == 0 || (g < 64 && (ram_gib_mask >> g) & 1 != 0);
+    if !mapped(g_lo) || !mapped(g_hi) {
+        serial_println!(":: tegra: JD1 — DTB GiB unmapped (mask {:#x}); skip survey ::", ram_gib_mask);
+        return;
+    }
+    let blob = unsafe { core::slice::from_raw_parts(dtb_addr as *const u8, dtb_size) };
+    let Some(fdt) = Fdt::new(blob) else {
+        serial_println!(":: tegra: JD1 — bad DTB header; skip survey ::");
+        return;
+    };
+
+    let mut paths = [[0u8; MAX_PATH]; MAX_FB_NODES];
+    let mut lens = [0usize; MAX_FB_NODES];
+    let mut n = 0usize;
+    fdt.for_each_prop(|e| {
+        if n >= MAX_FB_NODES || e.name != b"compatible" {
+            return;
+        }
+        let end = (e.val_off + e.val_len).min(blob.len());
+        if blob[e.val_off..end].windows(18).any(|q| q == b"simple-framebuffer") {
+            let l = e.path.len().min(MAX_PATH);
+            let dup = (0..n).any(|i| lens[i] == l && &paths[i][..l] == &e.path[..l]);
+            if !dup {
+                paths[n][..l].copy_from_slice(&e.path[..l]);
+                lens[n] = l;
+                n += 1;
+            }
+        }
+    });
+    for i in 0..n {
+        let node = &paths[i][..lens[i]];
+        let wp = fdt.prop_at(node, b"width");
+        let hp = fdt.prop_at(node, b"height");
+        let sp = fdt.prop_at(node, b"stride");
+        let mr = fdt.prop_at(node, b"memory-region");
+        let rg = fdt.prop_at(node, b"reg");
+        let fmtp = fdt.prop_at(node, b"format");
+        let mut fb = [b' '; 16];
+        let mut fl = 0usize;
+        'x: for wi in 0..fmtp.n {
+            for b in fmtp.words[wi].to_be_bytes() {
+                if b == 0 || fl >= 16 {
+                    break 'x;
+                }
+                fb[fl] = b;
+                fl += 1;
+            }
+        }
+        serial_println!(
+            ":: tegra: JD1 — simple-fb {}: {}x{} stride={} fmt='{}' memory-region{} reg{} ::",
+            core::str::from_utf8(node).unwrap_or("?"),
+            if wp.n >= 1 { wp.words[0] } else { 0 },
+            if hp.n >= 1 { hp.words[0] } else { 0 },
+            if sp.n >= 1 { sp.words[0] } else { 0 },
+            core::str::from_utf8(&fb[..fl]).unwrap_or("?"),
+            w(&mr),
+            w(&rg),
+        );
+    }
+    if n == 0 {
+        serial_println!(
+            ":: tegra: JD1 — no simple-framebuffer node in DTB (SIMPLEFB handoff not published here?) ::"
+        );
+    }
+    // Reserved-memory fb/display carveouts — the DRAM the scanout is backed by (cross-check).
+    let mut resv = 0u32;
+    fdt.for_each_prop(|e| {
+        if e.name == b"reg" && e.depth == 3 && resv < 6 {
+            let p = e.path;
+            if p.len() > 16 && &p[..16] == b"/reserved-memory" {
+                let name = &p[17.min(p.len())..];
+                let interesting = name.windows(2).any(|q| q == b"fb")
+                    || name.windows(7).any(|q| q == b"display")
+                    || name.windows(11).any(|q| q == b"framebuffer");
+                if interesting {
+                    let words = PropWords::capture(blob, e.val_off, e.val_len);
+                    serial_println!(
+                        ":: tegra: JD1 — resv {} reg{} ::",
+                        core::str::from_utf8(p).unwrap_or("?"),
+                        w(&words),
+                    );
+                    resv += 1;
+                }
+            }
+        }
+    });
+}
+
+/// JD1 (video, DC-probe fallback only): the Tegra234 display-controller block base+size from the
+/// DTB `display@…` node (compatible `nvidia,tegra234-display`, reg ~`0x1380_0000` on L4T). Used ONLY
+/// by the default-off `display_tegra::JD1_DC_PROBE` register survey; the primary handoff is the
+/// `simple-framebuffer` reg above. Verify-don't-assume — resolved from the live DTB, never hardcoded,
+/// so the survey's read-only sweep stays inside the block's own decoded aperture. `reg` on the
+/// wrapper is (addr:2, size:2) cells. `None` = node/reg absent.
+pub fn nvdisplay_base(dtb_addr: u64, dtb_size: usize, ram_gib_mask: u64) -> Option<(u64, u64)> {
+    if dtb_addr == 0 || dtb_size == 0 {
+        return None;
+    }
+    let g_lo = dtb_addr >> 30;
+    let g_hi = (dtb_addr + dtb_size as u64 - 1) >> 30;
+    let mapped = |g: u64| g == 0 || (g < 64 && (ram_gib_mask >> g) & 1 != 0);
+    if !mapped(g_lo) || !mapped(g_hi) {
+        return None;
+    }
+    let blob = unsafe { core::slice::from_raw_parts(dtb_addr as *const u8, dtb_size) };
+    let fdt = Fdt::new(blob)?;
+    let mut path = [0u8; MAX_PATH];
+    let mut plen = 0usize;
+    fdt.for_each_prop(|e| {
+        // Match the node name component "display@" (not the "display-hub@" sibling, whose name has
+        // "display-" not "display@").
+        if plen == 0 && e.path.windows(8).any(|q| q == b"display@") {
+            let l = e.path.len().min(MAX_PATH);
+            path[..l].copy_from_slice(&e.path[..l]);
+            plen = l;
+        }
+    });
+    if plen == 0 {
+        return None;
+    }
+    let reg = fdt.prop_at(&path[..plen], b"reg");
+    if reg.n < 4 {
+        return None;
+    }
+    let base = ((reg.words[0] as u64) << 32) | reg.words[1] as u64;
+    let size = ((reg.words[2] as u64) << 32) | reg.words[3] as u64;
+    if base == 0 {
+        return None;
+    }
+    Some((base, size))
+}

@@ -981,6 +981,37 @@ fn tegra_early_stop(boot_info: &'static mut BootInfo) -> ! {
         boot_info.framebuffer_info.stride,
         boot_info.framebuffer_info.bytes_per_pixel,
     );
+    // JD1 (video): the JM7 GOP is BltOnly — no linear framebuffer — so the panel is dark even though
+    // the firmware's DCE is still scanning out a live framebuffer from a DRAM carveout. INHERIT that
+    // scanout (don't re-init the pipeline): the firmware's SIMPLEFB display-handoff published the
+    // scanout base+geometry+format into the DTB (a `simple-framebuffer` node), so `jd1_survey` reads
+    // it read-only (no display MMIO), maps the carveout Normal-WB into BOTH translation tables, paints
+    // a test pattern, and brings fbcon online on it — from here every `serial_println!` (JB1a … JM4 …
+    // and the EL1 CAPSTONE, across the JM6 drop) also paints onto the Orin panel. Headless (no handoff
+    // published, or geometry fails sanity): `jd1_survey` returns None and this whole block is a no-op,
+    // so the boot stays byte-identical to the pre-JD1 headless path. `tegra`-only → inert in QEMU.
+    if let Some(fb) = unaos_kernel::arch::display_tegra::jd1_survey(
+        boot_info.dtb_addr,
+        boot_info.dtb_size,
+        mmu.ram_gib_mask,
+    ) {
+        if unaos_kernel::arch::mmu_tegra::map_fb_region(fb.base, fb.len) {
+            // Prove the inherited {base, stride, format} reach the panel before fbcon clears to black.
+            unaos_kernel::arch::display_tegra::jd1_test_pattern(&fb);
+            // fbcon online on the inherited scanout: fills black + starts mirroring the boot log. The
+            // EL1 twin was patched by map_fb_region, and the tegra path never detaches fbcon (JM7), so
+            // the mirror survives the JM6 EL2 -> EL1 drop and shows the CAPSTONE run live.
+            unaos_kernel::video::fbcon::init(fb.base, fb.len, fb.info);
+            serial_println!(
+                ":: tegra: JD1 — panel LIVE: inherited scanout mapped + fbcon mirroring the boot log ::"
+            );
+        } else {
+            serial_println!(
+                ":: tegra: JD1 — scanout base {:#x} not mappable (not DRAM GiB 2..63); headless ::",
+                fb.base,
+            );
+        }
+    }
     // JB1d: the A78AE erratum-1941500 probe/workaround (CPUECTLR_EL1[8]) — the EC=0 phantom's
     // leading suspect after the D-side read-back proved an I/D divergence. Prints MIDR + the bit
     // state BL31 left, sets it if clear. Runs before everything else so the whole boot (JB1b/c +
@@ -1277,18 +1308,26 @@ fn tegra_early_stop(boot_info: &'static mut BootInfo) -> ! {
         //     NOT re-run — the wrong path for t234; jb4_falcon_revive polls USBSTS.CNR instead.
         //   * Boot 1+2 (JB4_ENABLE, self-checked in jb4_falcon_revive): the non-destructive
         //     readiness poll — makes NO CSB writes; USBSTS.CNR clearing is the one true signal.
-        if let (Some(chan), Some(ids)) = (jb_chan.as_ref(), jb_ids.as_ref()) {
-            if unaos_kernel::arch::xusb_tegra::JB4_ALLOW_PG_CYCLE {
-                unaos_kernel::arch::bpmp_tegra::jb4_powergate_cycle(chan, ids);
-                unaos_kernel::arch::xusb_tegra::jb2c_padctl_powerup(chan);
-                unaos_kernel::arch::smmu_tegra::jb3_open_stream(&jb3_bases[..jb3_n], jb3_sid);
-                unaos_kernel::arch::smmu_tegra::jb3_mc_sid_fix(jb3_sid);
-                unaos_kernel::arch::xusb_tegra::jb3_fpci_enable();
-                unaos_kernel::arch::xusb_tegra::jb3_aru_probe(jb3_sid);
+        // JB10: gated behind !jb9h_skip for symmetry with the JB3 chain above — the JB4 revival
+        // levers belong to the halted-Falcon (chain) world, never the inherit path. On an inherit
+        // boot (jb9h_skip=true) the whole block is skipped; its calls were already inert there
+        // anyway (jb4_falcon_revive self-returns on JB4_ENABLE=false, jb9_fw_alive is JB9_PROBE-
+        // gated). The destructive inner cycle stays double-guarded by JB4_ALLOW_PG_CYCLE + the
+        // compile-time assertion in xusb_tegra.rs.
+        if !jb9h_skip {
+            if let (Some(chan), Some(ids)) = (jb_chan.as_ref(), jb_ids.as_ref()) {
+                if unaos_kernel::arch::xusb_tegra::JB4_ALLOW_PG_CYCLE {
+                    unaos_kernel::arch::bpmp_tegra::jb4_powergate_cycle(chan, ids);
+                    unaos_kernel::arch::xusb_tegra::jb2c_padctl_powerup(chan);
+                    unaos_kernel::arch::smmu_tegra::jb3_open_stream(&jb3_bases[..jb3_n], jb3_sid);
+                    unaos_kernel::arch::smmu_tegra::jb3_mc_sid_fix(jb3_sid);
+                    unaos_kernel::arch::xusb_tegra::jb3_fpci_enable();
+                    unaos_kernel::arch::xusb_tegra::jb3_aru_probe(jb3_sid);
+                }
+                unaos_kernel::arch::xusb_tegra::jb4_falcon_revive(chan, ids);
+                // JB9c: judge the cycle by the CPUCTL/CNR-free witness, not the two proven liars.
+                unaos_kernel::arch::xusb_tegra::jb9_fw_alive("post-pg-cycle");
             }
-            unaos_kernel::arch::xusb_tegra::jb4_falcon_revive(chan, ids);
-            // JB9c: judge the cycle by the CPUCTL/CNR-free witness, not the two proven liars.
-            unaos_kernel::arch::xusb_tegra::jb9_fw_alive("post-pg-cycle");
         }
         let coherent = unaos_kernel::arch::fdt_tegra::xusb_dma_coherent(
             dtb_addr,

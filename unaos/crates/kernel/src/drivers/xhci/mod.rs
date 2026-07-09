@@ -620,6 +620,15 @@ pub struct DeviceSlot {
     /// their async completions must not advance the root port queue or trip root recovery.
     pub is_downstream: bool,
 
+    /// xHCI Route String (Slot Context DW0 bits 19:0) this device was addressed with, and its
+    /// tier depth (hops from the root hub: 0 = root device / root-port hub, 1 = tier-1 downstream,
+    /// …). A downstream HUB stores these so its own `bring_up_hub` can extend the route for its
+    /// children: a child on port P of a hub at depth D gets `route | (P << (4*D))`, depth D+1.
+    /// Root devices leave these at 0 (route string 0, addressed by the root FSM). Cleared in
+    /// `reset_soft_state` so a recycled slot id cannot inherit a dead device's topology.
+    pub route_string: u32,
+    pub route_depth: u8,
+
     // Dedicated DMA buffers for Bulk-Only Transport (mass storage). Kept separate from
     // descriptor_buffer / data_buffer so a CBW can't clobber descriptors or HID reports.
     pub cbw_buffer: Option<*mut u8>,       // 31-byte Command Block Wrapper
@@ -666,6 +675,8 @@ impl DeviceSlot {
             descriptor_buffer: desc_buffer,
             ep0_expect_phys: 0,
             is_downstream: false,
+            route_string: 0,
+            route_depth: 0,
             cbw_buffer: None,
             csw_buffer: None,
             scsi_data_buffer: None,
@@ -713,10 +724,28 @@ impl DeviceSlot {
         self.keyboard_state = 0;
         self.ep0_expect_phys = 0;
         self.is_downstream = false;
+        self.route_string = 0;
+        self.route_depth = 0;
         self.bulk_in_ep = 0;
         self.bulk_out_ep = 0;
     }
 }
+
+/// JB10 (Tegra-only, HYPOTHESIS — verify on the Orin bench): enumerate a Full-Speed ROOT device
+/// whose real `bMaxPacketSize0` > 8 the Linux `xhci_check_maxpacket` way. Instead of reading the
+/// full 18-byte descriptor at the guessed MPS0=8 (which babbles: the device answers with a packet
+/// larger than 8) and then TEARING the slot down + resetting the port to re-address at MPS0=64,
+/// read only the first 8 bytes (one packet, no babble), learn `bMaxPacketSize0`, patch EP0 MPS0 in
+/// place with an Evaluate Context command, then read the full descriptor — all on the SAME slot,
+/// no DISABLE_SLOT, no port reset. The JB9 bench (serial: port 7, an FS device) showed the babble
+/// → DISABLE_SLOT → reset → re-ADDRESS@MPS64 cycle re-addresses correctly yet leaves the device
+/// SILENT (dev-desc watchdog-times-out, PORTSC still 0x603 connected) — i.e. the tear-down churn
+/// itself is what the FS device does not survive. This flag flips false to fall back to the shared
+/// babble→recover path on the same build. Tegra-only: non-tegra builds are byte-identical (the
+/// whole path is `#[cfg(feature = "tegra")]`); QEMU cannot exercise it (lenient MPS enforcement).
+/// See docs/dev/OS/01_BOOT_HAL/arch_arm64.md §JB10.
+#[cfg(feature = "tegra")]
+const JB10_FS_EVAL_CTX: bool = true;
 
 pub struct XhciController {
     base_addr: usize,
@@ -1239,7 +1268,7 @@ impl XhciController {
                                     if self.slots[slot_id as usize].active
                                         && self.slots[slot_id as usize].ep0_ring.is_some() {
                                         serial_println!("xHCI: >>> SLOT {} ENABLED & ADDRESSED <<<", slot_id);
-                                        self.request_device_descriptor(slot_id as u8);
+                                        self.begin_device_descriptor(slot_id as u8);
                                     } else {
                                         serial_println!("xHCI: completion for disposed slot {}; ignoring.", slot_id);
                                     }
@@ -2577,6 +2606,18 @@ impl XhciController {
                     self.recover_enumeration("watchdog-timeout", 0);
                 }
             }
+            // JB10 (Tegra): learn a Full-Speed device's MPS0 in place then read the full
+            // descriptor — done synchronously here in ONE pass (sync_control/run_command_sync are
+            // safe in this main-loop context) and it transitions the stage on the way out (to
+            // dev-desc via request_device_descriptor, or via recover_enumeration on failure), so it
+            // never lingers unwatched. begin_device_descriptor only sets this stage on tegra.
+            #[cfg(feature = "tegra")]
+            "fs-mps-learn" => {
+                match self.slots.iter().position(|s| s.active && !s.is_downstream && s.port_id == port) {
+                    Some(slot_id) => self.fs_learn_mps0(slot_id as u8, port),
+                    None => self.recover_enumeration("fs-mps-no-slot", 0),
+                }
+            }
             // Invariant: with enum_active set, EVERY stage has a deadline. An unknown stage
             // here would be a bug — don't let it become an unwatchable parked state.
             _ => {
@@ -3816,6 +3857,20 @@ impl XhciController {
 
         let root_hub_port = self.slots[hub_slot as usize].port_id;
         let ttt = ((characteristics >> 5) & 0x3) as u32; // TT Think Time (wHubCharacteristics bits 5-6)
+        // This hub's own Route String + tier depth (0 for a hub sitting on a root port). Children
+        // extend it: a device on downstream port P gets `hub_route | (P << (4*hub_depth))` at depth
+        // hub_depth+1 — 4 bits per tier, so nibble `hub_depth` carries P (see DeviceSlot.route_*).
+        let hub_route = self.slots[hub_slot as usize].route_string;
+        let hub_depth = self.slots[hub_slot as usize].route_depth;
+        // xHCI Route String is 20 bits = 5 nibbles = at most 5 hub tiers. A hub already at depth 5
+        // has no nibble left for its children — stop the descent here rather than aliasing tier 1.
+        if hub_depth >= 5 {
+            serial_println!(
+                "xHCI: HUB slot {} at max USB tier depth ({}); not descending further.",
+                hub_slot, hub_depth);
+            serial_println!("xHCI: === HUB slot {} bring-up complete ===", hub_slot);
+            return;
+        }
 
         // 3. Mark the slot as a hub (Hub bit + Number of Ports + TTT) so the controller will route
         //    transactions through it to downstream devices.
@@ -3842,7 +3897,13 @@ impl XhciController {
             }
             serial_println!("xHCI: HUB slot {} port {}: device connected; enumerating...", hub_slot, port);
             if let Some(speed) = self.reset_downstream_port(hub_slot, port, buf) {
-                self.enumerate_downstream(hub_slot, port, root_hub_port, speed);
+                // Each route-string nibble is 4 bits. Clamp a hub port > 15 to 15 (as Linux does)
+                // so it stays a valid downstream-port nibble instead of aliasing onto 0 (= the hub
+                // itself) or a sibling. Hubs with > 15 ports are rare; the target VIA hub has ≤ 4,
+                // so for it this is identical to the port number.
+                let child_route = hub_route | (((port as u32).min(15)) << (4 * hub_depth));
+                let child_depth = hub_depth + 1;
+                self.enumerate_downstream(hub_slot, port, root_hub_port, child_route, child_depth, speed);
             }
         }
         serial_println!("xHCI: === HUB slot {} bring-up complete ===", hub_slot);
@@ -3913,9 +3974,13 @@ impl XhciController {
     }
 
     /// Address a device behind a hub: like `address_device` but the slot context carries a
-    /// non-zero Route String (the downstream port number, tier 1), the chain's Root Hub Port
-    /// Number, and the device Speed. Synchronous. Returns true on success.
-    fn address_downstream(&mut self, slot_id: u8, root_hub_port: u8, route_string: u32, speed: u32) -> bool {
+    /// non-zero Route String (accumulated across the hub tiers, not just tier 1), the chain's Root
+    /// Hub Port Number, the device Speed, and — for a Low/Full-Speed device behind a High-Speed hub
+    /// — the Transaction Translator fields (TT Hub Slot ID / TT Port Number, DW2). `depth` is the
+    /// device's tier depth (stored on the slot so a downstream hub can extend the route for its own
+    /// children); `tt_hub_slot`/`tt_port` are 0 for HS/SS devices (no TT). Synchronous; returns true
+    /// on success.
+    fn address_downstream(&mut self, slot_id: u8, root_hub_port: u8, route_string: u32, depth: u8, speed: u32, tt_hub_slot: u8, tt_port: u8) -> bool {
         unsafe {
             let input_layout = core::alloc::Layout::from_size_align(core::mem::size_of::<InputContext>(), 64).unwrap();
             let output_layout = core::alloc::Layout::from_size_align(core::mem::size_of::<DeviceContext>(), 64).unwrap();
@@ -3934,6 +3999,10 @@ impl XhciController {
             // root-enumeration recovery. port_id can't tell them apart — this flag does.
             slot.is_downstream = true;
             slot.active = true;
+            // Remember the accumulated route + tier so this slot, if it turns out to be a hub,
+            // can extend the route for its own downstream children (see bring_up_hub).
+            slot.route_string = route_string;
+            slot.route_depth = depth;
 
             *self.dcbaap.add(slot_id as usize) = output_ctx_virt as u64;
 
@@ -3946,6 +4015,17 @@ impl XhciController {
             slot_ctx.add(0).write_volatile((1 << 27) | (route_string & 0xFFFFF) | ((speed & 0xF) << 20));
             // DW1: Root Hub Port Number (bits 23:16) — the root port the hub chain starts at.
             slot_ctx.add(1).write_volatile((root_hub_port as u32) << 16);
+
+            // DW2: Transaction Translator. A Low/Full-Speed device behind a High-Speed hub must
+            // name its TT (xHCI 4.3): TT Hub Slot ID (bits 7:0) = the HS hub's slot, TT Port Number
+            // (bits 15:8) = that hub's downstream port. HS/SS devices need no TT (fields stay 0), so
+            // this write is confined to speed 1 (FS) / 2 (LS) and leaves the currently-working
+            // HS-downstream path (the VIA hub's own halves) byte-unchanged. For the common single-
+            // level topology the immediate parent hub IS the TT (passed in by the caller); a LS/FS
+            // device more than one hub below a HS hub would need the higher HS hub — not handled.
+            if speed == 1 || speed == 2 {
+                slot_ctx.add(2).write_volatile((tt_hub_slot as u32) | ((tt_port as u32) << 8));
+            }
 
             // EP0 control context. MPS: 8 for Low Speed; 64 otherwise (QEMU is lenient about the
             // Full-Speed initial 8-byte read).
@@ -3968,20 +4048,29 @@ impl XhciController {
         }
     }
 
-    /// Enumerate one device behind a hub: ENABLE_SLOT, ADDRESS_DEVICE (with route string), read the
-    /// device + configuration descriptors, and hand off by interface class — Mass Storage gets a
-    /// synchronous bulk Configure-Endpoint + the deferred SCSI bring-up (service_storage), an HID
-    /// keyboard/mouse goes to the existing endpoint-configuration path (which finishes set-config +
-    /// arms the interrupt read via the normal async completion).
-    fn enumerate_downstream(&mut self, _hub_slot: u8, port: u8, root_hub_port: u8, speed: u32) {
+    /// Enumerate one device behind a hub: ENABLE_SLOT, ADDRESS_DEVICE (with the accumulated route
+    /// string + tier depth), read the device descriptor, and dispatch by class: a downstream device
+    /// that is itself a hub (class 0x09) is queued into `hubs_pending` so the next `service_hubs`
+    /// pass brings it up and descends another tier (this is what makes the walk recurse past tier 1);
+    /// a Mass-Storage device (interface class 0x08 — the metal rMBP's hubbed SD reader) gets a
+    /// synchronous bulk Configure-Endpoint + the deferred SCSI bring-up (service_storage); an HID
+    /// keyboard/mouse hands off to the existing endpoint-configuration path. (rmbp's hub-downstream
+    /// MSC + jetson's nested-hub descent, reconciled at the seat coalesce.)
+    ///
+    /// `route_string`/`depth` are this device's accumulated route (from `bring_up_hub`); `hub_slot`
+    /// is the immediate parent hub (its slot is the Transaction Translator for a LS/FS child).
+    fn enumerate_downstream(&mut self, hub_slot: u8, port: u8, root_hub_port: u8, route_string: u32, depth: u8, speed: u32) {
         // ENABLE_SLOT.
         let slot_id = match self.run_command_sync(Trb { parameter: 0, status: 0, control: 9 << 10 }) {
             Ok((1, sid)) if sid > 0 => sid,
             other => { serial_println!("xHCI: downstream ENABLE_SLOT failed ({:?})", other); return; }
         };
 
-        // ADDRESS_DEVICE with route string = downstream port number (tier 1).
-        if !self.address_downstream(slot_id, root_hub_port, port as u32, speed) {
+        // A Low/Full-Speed child names its parent hub as the Transaction Translator (single-level
+        // topology); HS/SS children pass 0 (address_downstream leaves DW2 clear for them).
+        let (tt_hub_slot, tt_port) = if speed == 1 || speed == 2 { (hub_slot, port) } else { (0, 0) };
+        // ADDRESS_DEVICE with the full accumulated route string (tier `depth`).
+        if !self.address_downstream(slot_id, root_hub_port, route_string, depth, speed, tt_hub_slot, tt_port) {
             return;
         }
         let buf = self.slots[slot_id as usize].descriptor_buffer as u64;
@@ -3995,7 +4084,18 @@ impl XhciController {
             let p = buf as *const u8;
             (*p.add(4), (*p.add(8) as u16) | ((*p.add(9) as u16) << 8), (*p.add(10) as u16) | ((*p.add(11) as u16) << 8))
         };
-        serial_println!("xHCI: HUB downstream slot {} device class={:#x} vid={:04x} pid={:04x}", slot_id, class, vid, pid);
+        serial_println!("xHCI: HUB downstream slot {} device class={:#x} vid={:04x} pid={:04x} (route {:#x} tier {})",
+            slot_id, class, vid, pid, route_string, depth);
+
+        // A hub behind this hub (device-level class 0x09): queue it for its own bring-up so the
+        // walk descends another tier. bring_up_hub does SET_CONFIGURATION + the hub descriptor +
+        // the downstream port walk; its slot already carries the extended route/depth. Mirrors the
+        // root-port HUB DETECTED push. No config-descriptor read here — bring_up_hub SET_CONFIGs.
+        if class == 0x09 {
+            serial_println!("xHCI: >>> HUB-BEHIND-HUB DETECTED (slot {}, tier {}) <<<", slot_id, depth);
+            self.hubs_pending.push(slot_id as u8);
+            return;
+        }
 
         // GET configuration descriptor (first 64 bytes) and look for an HID interrupt-IN endpoint.
         if self.sync_control(slot_id, 0x80, 0x06, 0x0200, 0, 64, buf, true).is_err() {
@@ -4214,6 +4314,118 @@ impl XhciController {
                 serial_println!("xHCI: push_ep0 failed, no ep0_ring for slot {}", slot_id);
                 0
             }
+        }
+    }
+
+    /// Begin the root device-descriptor read after ADDRESS_DEVICE. Normally this is a straight
+    /// `request_device_descriptor`, but on Tegra a Full-Speed device (addressed at MPS0=8, real
+    /// MPS0 unknown) is first routed through the `fs-mps-learn` stage (JB10): the main loop reads
+    /// 8 bytes, patches MPS0 via Evaluate Context, then reads the full descriptor — avoiding the
+    /// babble + tear-down that leaves the FS device silent on this firmware. Non-FS / non-tegra
+    /// paths are unchanged and byte-identical.
+    fn begin_device_descriptor(&mut self, slot_id: u8) {
+        #[cfg(feature = "tegra")]
+        {
+            let port = self.slots[slot_id as usize].port_id;
+            let speed = (self.read_portsc(port) >> 10) & 0xF;
+            // speed 1 = Full Speed. Skip if a prior babble already learned MPS0=64 for this port
+            // (address_device then programmed 64, so the full read won't babble) — go straight
+            // through, which also prevents a learn/retry loop.
+            if JB10_FS_EVAL_CTX && speed == 1 && !self.fs_ep0_mps64[(port as usize) & 31] {
+                serial_println!(
+                    "xHCI: [tegra fs-mps] slot {} (FS port {}): learning MPS0 before full descriptor.",
+                    slot_id, port);
+                self.enum_cmd_phys = 0;
+                self.set_enum_stage("fs-mps-learn");
+                return;
+            }
+        }
+        self.request_device_descriptor(slot_id);
+    }
+
+    /// JB10 (Tegra): learn a Full-Speed device's real MPS0 and patch EP0 in place, then read the
+    /// full descriptor — all on `slot_id`, no teardown. Runs from `service_enum` (main-loop
+    /// context, where `sync_control`/`run_command_sync` are safe), never from `poll_events`. On any
+    /// failure it falls back to the shared babble→recover path (sets `fs_ep0_mps64` so the
+    /// re-address uses MPS0=64). `port` is the root port (for the `fs_ep0_mps64` index).
+    #[cfg(feature = "tegra")]
+    fn fs_learn_mps0(&mut self, slot_id: u8, port: u8) {
+        let buf = self.slots[slot_id as usize].descriptor_buffer as u64;
+        // Phase 1: read the first 8 descriptor bytes at MPS0=8 — a single packet, no babble.
+        if self.sync_control(slot_id, 0x80, 0x06, 0x0100, 0, 8, buf, true).is_err() {
+            serial_println!(
+                "xHCI: [tegra fs-mps] slot {} 8-byte dev-desc failed; falling back to babble-recover.",
+                slot_id);
+            self.fs_ep0_mps64[(port as usize) & 31] = true;
+            self.recover_enumeration("fs-mps-8byte-failed", 0);
+            return;
+        }
+        let mps0 = unsafe { *(buf as *const u8).add(7) }; // bMaxPacketSize0
+        serial_println!("xHCI: [tegra fs-mps] slot {} bMaxPacketSize0 = {}", slot_id, mps0);
+        // Phase 2: if it exceeds the guessed 8, patch EP0 MPS0 in place via Evaluate Context.
+        // Only the legal FS values are accepted; anything else falls back rather than program junk.
+        if mps0 > 8 {
+            if mps0 != 16 && mps0 != 32 && mps0 != 64 {
+                serial_println!(
+                    "xHCI: [tegra fs-mps] slot {} illegal bMaxPacketSize0 {}; falling back.",
+                    slot_id, mps0);
+                self.fs_ep0_mps64[(port as usize) & 31] = true;
+                self.recover_enumeration("fs-mps-illegal", 0);
+                return;
+            }
+            if !self.evaluate_ep0_mps(slot_id, mps0 as u32) {
+                self.fs_ep0_mps64[(port as usize) & 31] = true;
+                self.recover_enumeration("fs-mps-eval-failed", 0);
+                return;
+            }
+        }
+        // Phase 3: full 18-byte descriptor read on the same slot — rejoins the normal FSM
+        // (its completion drives the class dispatch exactly as usual).
+        self.request_device_descriptor(slot_id);
+    }
+
+    /// JB10 (Tegra): patch a slot's EP0 Max Packet Size in place with an Evaluate Context command
+    /// (TRB type 13), mirroring Linux `xhci_check_maxpacket`. Only the EP0 context is flagged (Add
+    /// Context A1); the EP0 context is copied from the device (output) context and its MPS field
+    /// (Slot/EP context DW1 bits 31:16) replaced. Synchronous; true on completion code 1.
+    #[cfg(feature = "tegra")]
+    fn evaluate_ep0_mps(&mut self, slot_id: u8, mps0: u32) -> bool {
+        unsafe {
+            let input_ctx_virt = self.slots[slot_id as usize].input_context;
+            let output_ctx_virt = self.slots[slot_id as usize].output_context;
+            if input_ctx_virt.is_null() || output_ctx_virt.is_null() {
+                return false;
+            }
+            let base_ptr = input_ctx_virt as *mut u32;
+            core::ptr::write_bytes(base_ptr as *mut u8, 0, core::mem::size_of::<InputContext>());
+            base_ptr.add(1).write_volatile(1 << 1); // Add Context: A1 (EP0 context) only
+            // Copy the current EP0 context from the output (device) context, then patch MPS0.
+            // Layout differs between the two: the INPUT context has an Input Control Context at
+            // offset 0, so its EP0 (DCI 1) is at 2*CTX_WORDS; the OUTPUT (Device) context has NO
+            // control prefix — slot@0, EP0 (DCI 1)@1*CTX_WORDS. Reading the output EP0 preserves
+            // the live EP Type / CErr / TR Dequeue Pointer that ADDRESS_DEVICE established; only
+            // MPS0 changes. (Copying from 2*CTX_WORDS here would grab the zeroed EP1 region and
+            // submit an EP-Type=0 / null-ring context the strict Tegra FW rejects with code 17.)
+            let ep0_out = (output_ctx_virt as *const u32).add(CTX_WORDS);
+            let ep0_in = base_ptr.add(2 * CTX_WORDS);
+            for i in 0..8 {
+                ep0_in.add(i).write_volatile(core::ptr::read_volatile(ep0_out.add(i)));
+            }
+            let dw1 = ep0_in.add(1).read_volatile();
+            ep0_in.add(1).write_volatile((dw1 & 0x0000_FFFF) | (mps0 << 16));
+        }
+        let trb = Trb {
+            parameter: self.slots[slot_id as usize].input_context as u64,
+            status: 0,
+            control: (13 << 10) | ((slot_id as u32) << 24), // TRB type 13 = Evaluate Context
+        };
+        match self.run_command_sync(trb) {
+            Ok((1, _)) => {
+                serial_println!("xHCI: [tegra fs-mps] slot {} EP0 MPS0 -> {} (Evaluate Context OK)", slot_id, mps0);
+                true
+            }
+            Ok((c, _)) => { serial_println!("xHCI: [tegra fs-mps] slot {} Evaluate Context code {}", slot_id, c); false }
+            Err(_) => { serial_println!("xHCI: [tegra fs-mps] slot {} Evaluate Context timed out", slot_id); false }
         }
     }
 
