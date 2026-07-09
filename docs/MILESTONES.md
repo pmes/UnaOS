@@ -35,12 +35,21 @@ Legend: **✅ metal-confirmed** · **🔬 QEMU-green, metal pending** · dates I
     grantee is resolved (a non-owner is `-EACCES` regardless of argument). The grant is an ACL edge on the FILE —
     nothing lands in the grantee's table; it opens the name and the ACL admits it; a handle it ALREADY holds
     survives a revoke (the ACL gates ACQUISITION, not held caps).
+  - **F1 — delete is OWNER-only** (`1ca2e89`, an adversarial-self-review fix): `SYS_UNLINK` is gated on OWNERSHIP,
+    not merely the handle's `CAP_WRITE`. A content `CAP_WRITE` grantee (which legitimately opened the file RW)
+    could otherwise `unlink` + `O_CREAT` the name to STEAL ownership and lock the real owner out — the M2 gate
+    missed it because the demo granted only `CAP_READ`. Now an OWNED file is unlinkable only by its owner; a
+    PUBLIC file keeps the prior `CAP_WRITE`-gated unlink (so u10delete / u11defer / u11reuse / u11reap stay
+    byte-identical). Two latent hardenings folded in: an ASID-0 create is PUBLIC (ASID 0 is never torn down / gen-
+    bumped, so it cannot be a gen-fenced private owner), and `SYS_FGRANT` returns `-EINVAL` for a nonzero rights
+    request that names only unsupported bits (instead of silently coercing it to a revoke).
 - **Tested — QEMU:** `./arroyo kernel8-test 35` → one new verdict after U11-reap:
-  `:: U6-grants: owner/grants on open — non-owner -EACCES, owner grant admits read, non-owner grant -EACCES,
-  revoke re-denies -> PASS ::`. A two-process fixture (`el0-uowner-a` OWNER / `el0-uowner-b` GRANTEE, the u11defer
-  choreography + the U7 proc-reserve/Child-handle pre-endow): A creates `OWNED.BIN` private; B (a different ASID)
-  is DENIED (`-EACCES` — the gap closed); A `SYS_FGRANT`s B read → B opens + reads the matching bytes; B (a
-  non-owner) is refused `SYS_FGRANT` (`-EACCES`); A revokes → B is re-denied; A (owner) re-opens its own file
+  `:: U6-grants: owner/grants on open — non-owner -EACCES, owner grant admits R|W, grantee unlink -EACCES (delete
+  owner-only), non-owner grant -EACCES, revoke re-denies -> PASS ::`. A two-process fixture (`el0-uowner-a` OWNER /
+  `el0-uowner-b` GRANTEE, the u11defer choreography + the U7 proc-reserve/Child-handle pre-endow): A creates
+  `OWNED.BIN` private; B (a different ASID) is DENIED (`-EACCES` — the gap closed); A `SYS_FGRANT`s B read+write →
+  B opens RW + reads the matching bytes; B (a non-owner) is refused `SYS_FGRANT` (`-EACCES`) and its `SYS_UNLINK`
+  is refused (`-EACCES` — delete is owner-only); A revokes → B is re-denied; A (owner) re-opens its own file
   throughout. **23 PASS** (22 prior byte-identical + U6-grants), **CAPSTONE 6/6**, only the 3 expected M6b kills,
   0 unexpected faults. `./arroyo check` both arches green; `./arroyo test-arm 30` MISSION SUCCESS; `./arroyo
   kernel8` compiles.
@@ -55,7 +64,7 @@ Legend: **✅ metal-confirmed** · **🔬 QEMU-green, metal pending** · dates I
 - **Metal:** 🔬 QEMU-green, metal-pending. Rides the next Pi 4 boundary alongside U10/U11 (the FAT-mutating stack).
   QEMU exercises the ACL + delegation in full (no timer/IPI needed); the metal watch-item is the same `(ASID,
   ASID_GEN)` teardown-revert path the U11 reaper walks.
-- **Commit:** `21baee8` (M1) + `8034d0c` (M2), branch `hw-pi4`.
+- **Commit:** `21baee8` (M1) + `8034d0c` (M2) + `1ca2e89` (F1), branch `hw-pi4`.
 
 ### U11 (M2b / U12b) — the teardown-last-close REAPER: deferred-free queue + kernel reaper task (aarch64) 🔬 `hw-pi4`
 - **What:** closes the ONE honest-scope gap M2a left open. M2a proved the cross-process defer for the
