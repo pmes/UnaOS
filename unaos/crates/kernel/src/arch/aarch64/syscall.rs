@@ -3423,6 +3423,9 @@ pub fn clear_handle_row(asid: u64) {
     // principal keeps owning them, and the ASID's next tenant is a different process) and sweep any grant
     // naming it. `IrqGuard`-safe under this already-IRQ-masked teardown. Keeps the bounded table self-cleaning.
     owned_clear_owner_asid(asid);
+    // M2.1: clear this slot's persistent principal STAMP — the slot's next tenant is a different program, so
+    // it must not inherit the departed program's principal (the ppid twin of owned_clear_owner_asid).
+    slot_ppid_clear(asid);
 }
 
 /// The ASID of the address space the caller is running in, read from `TTBR0_EL1[63:48]`. A syscall executes
@@ -5729,10 +5732,10 @@ fn spawn_errno(e: &SpawnErr) -> i64 {
 /// both callers run only after M6d/M6f/M6g released their slots, so the pool has room. The loaded bytes are
 /// UNTRUSTED — nothing about them is trusted beyond the one-page size bound; they run only under EL0 +
 /// per-page permissions + the M6b fault-kill net (no signature, no allowlist). That containment is the point.
-fn load_program_into_slot() -> Result<Loaded, SpawnErr> {
+fn load_program_into_slot(name: &str) -> Result<Loaded, SpawnErr> {
     let fs = crate::fs::fat::mount().map_err(SpawnErr::NoMount)?;
     let kind = fs.kind();
-    let de = fs.find_in_root("HELLO.BIN").map_err(|_| SpawnErr::NoFile(kind))?;
+    let de = fs.find_in_root(name).map_err(|_| SpawnErr::NoFile(kind))?;
     // Reject up-front from the ON-DISK directory size (the U2 truncation lesson): `read_file` caps the copy
     // at min(de.size, cap), so a post-read length check could never SEE an oversize file — it would silently
     // truncate then run it. Gate on `de.size` against the single code page instead.
@@ -5751,10 +5754,14 @@ fn load_program_into_slot() -> Result<Loaded, SpawnErr> {
     unsafe { core::ptr::copy_nonoverlapping(bytes.as_ptr(), backing, bytes.len()) };
     super::cache::icache_sync_range(backing as usize, bytes.len());
     unsafe { super::boot::protect_user_slot_code(slot, super::boot::USER_CODE_SIZE) };
+    let ttbr0 = super::boot::slot_ttbr0(slot);
+    // M2.1: stamp this slot's persistent principal from the loader-RESOLVED name (launcher policy v1 — the
+    // ONLY mint path; kernel-derived, never EL0-set). Nothing reads it until M2.3/M2.4 (behaviour-neutral).
+    slot_ppid_stamp(ttbr0 >> 48, PrincipalRecord::program_name(name));
     Ok(Loaded {
         base,
         sp: (base + size as u64) & !0xF, // 16-aligned window top = initial SP_EL0
-        ttbr0: super::boot::slot_ttbr0(slot),
+        ttbr0,
         slot,
         len: bytes.len(),
         kind,
@@ -5796,7 +5803,7 @@ fn sys_spawn() -> i64 {
         proc_free(i);
         return EAGAIN; // handle table full
     };
-    let loaded = match load_program_into_slot() {
+    let loaded = match load_program_into_slot("HELLO.BIN") {
         Ok(l) => l,
         Err(e) => {
             handle_clear(asid, h); // release the reserved handle slot
@@ -7153,7 +7160,7 @@ fn m6g_loader_run(_: usize) {
     //      first echoes the "FAT mounted from SD (..)" progress line (mirroring the original mid-flow print)
     //      so the M6g gate is byte-identical. On success: emit the two M6g lines then drop the program to
     //      EL0 on THIS core (the loader's), so the folded verdict's cooperative yield guarantees dispatch.
-    let loaded = match load_program_into_slot() {
+    let loaded = match load_program_into_slot("HELLO.BIN") {
         Ok(l) => l,
         Err(SpawnErr::NoMount(e)) => {
             serial_println!(":: M6g: no FAT volume ({:?}) — loader skipped ::", e);
@@ -8197,12 +8204,29 @@ struct PrincipalRecord {
 impl PrincipalRecord {
     const NONE: Self = PrincipalRecord { kind: PRIN_NONE, len: 0, value: [0u8; PRIN_VALUE_LEN] };
 
-    /// A PROGRAM_NAME principal from a byte string (truncated to the 30-byte value field). M1 test helper —
-    /// M2 derives the real record from the launcher-stamped identity, never from EL0 input.
+    /// A PROGRAM_NAME principal from a full value byte string (truncated to the 30-byte value field). Used by
+    /// the M1 codec test with pre-formed `b"prog:..."` values.
     fn program(name: &[u8]) -> Self {
         let mut value = [0u8; PRIN_VALUE_LEN];
         let n = core::cmp::min(name.len(), PRIN_VALUE_LEN);
         value[..n].copy_from_slice(&name[..n]);
+        PrincipalRecord { kind: PRIN_PROGRAM_NAME, len: n as u8, value }
+    }
+
+    /// M2 launcher policy v1: the PROGRAM_NAME principal for the 8.3 file name the loader RESOLVED — the
+    /// canonical `"prog:<NAME>"` projection (truncated at 30 bytes). This is the ONLY way a principal is
+    /// minted for a spawned program: kernel-derived from the load name, never from EL0 input. Two programs
+    /// with the same 8.3 name are BY DESIGN the same principal until `IMAGE_SHA256` lands (honest residual).
+    fn program_name(name: &str) -> Self {
+        let mut value = [0u8; PRIN_VALUE_LEN];
+        let mut n = 0usize;
+        for &b in b"prog:".iter().chain(name.as_bytes()) {
+            if n >= PRIN_VALUE_LEN {
+                break;
+            }
+            value[n] = b;
+            n += 1;
+        }
         PrincipalRecord { kind: PRIN_PROGRAM_NAME, len: n as u8, value }
     }
 
@@ -8217,6 +8241,48 @@ impl PrincipalRecord {
         value.copy_from_slice(&b[2..2 + PRIN_VALUE_LEN]);
         PrincipalRecord { kind: b[0], len: b[1], value }
     }
+}
+
+// M2.1: the launcher's principal STAMP table — the persistent PrincipalRecord assigned to each address-space
+// slot at spawn (indexed by ASID, mirroring OWNED_FILES/OPEN_FILES). Launcher policy v1: the KERNEL stamps
+// SLOT_PPID[asid] from the loader-RESOLVED 8.3 program name at `load_program_into_slot`; NO EL0 path may set
+// or change it. Cleared to NONE at slot teardown. A slot with NONE (an inline-blob fixture with no resolved
+// load name, or a torn-down slot) is ANONYMOUS = public-only: it may still own files at RUNTIME via (asid,gen)
+// [U6 unchanged], but its ownership does not PERSIST across reboot. Its own SpinMutex, taken IRQ-masked via
+// IrqGuard (stamped in syscall/boot context, cleared in the IRQ-masked teardown path — the OWNED_FILES idiom).
+static SLOT_PPID: SpinMutex<[PrincipalRecord; super::boot::USER_SLOTS + 1]> =
+    SpinMutex::new([PrincipalRecord::NONE; super::boot::USER_SLOTS + 1]);
+
+/// M2.1: stamp `asid`'s persistent principal at spawn (called from `load_program_into_slot` with the
+/// loader-resolved name). ASID 0 (boot/shared) is never a spawned program — ignored defensively.
+fn slot_ppid_stamp(asid: u64, rec: PrincipalRecord) {
+    if asid == 0 || asid as usize >= super::boot::USER_SLOTS + 1 {
+        return;
+    }
+    let _irq = IrqGuard::mask_save();
+    SLOT_PPID.lock()[asid as usize] = rec;
+}
+
+/// M2.1: clear `asid`'s stamp at teardown (the slot's next tenant is a DIFFERENT program). Called from
+/// `clear_handle_row`, alongside `owned_clear_owner_asid`.
+fn slot_ppid_clear(asid: u64) {
+    if asid as usize >= super::boot::USER_SLOTS + 1 {
+        return;
+    }
+    let _irq = IrqGuard::mask_save();
+    SLOT_PPID.lock()[asid as usize] = PrincipalRecord::NONE;
+}
+
+/// M2: the caller's stamped persistent principal (NONE = anonymous/public-only). Read at O_CREAT (persist the
+/// owner) and at open (cross-reboot enforcement, gated). Read-only snapshot under the IRQ-masked lock.
+#[allow(dead_code)] // wired by M2.3/M2.4 (persist + gated enforcement); the stamp lands in M2.1
+fn current_principal() -> PrincipalRecord {
+    let asid = current_asid();
+    if asid as usize >= super::boot::USER_SLOTS + 1 {
+        return PrincipalRecord::NONE;
+    }
+    let _irq = IrqGuard::mask_save();
+    SLOT_PPID.lock()[asid as usize]
 }
 
 /// K1: one grant edge on disk — a principal + the rights it holds (36 bytes: 32 + u32 LE).
