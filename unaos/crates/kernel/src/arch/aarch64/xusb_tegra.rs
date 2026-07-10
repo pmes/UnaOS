@@ -282,10 +282,12 @@ pub fn jb2c_padctl_powerup(chan: &super::bpmp_tegra::Chan) {
 ///
 /// Returns Some((slot, port)) iff a keyboard is armed — the caller's cue to spawn the EL1 pump.
 ///
-/// Deliberately NOT run: `service_storage` / `service_ftdi`. The boot stick will enumerate (its
-/// slot configures; that is fine and visible in the log) but its SCSI/BOT bring-up is the JB3
-/// arc, not this one — the BOT pump is the driver's heaviest synchronous path and the keyboard
-/// does not need it.
+/// JD3: `service_storage` now DOES run in the pump loop below. A mass-storage device behind the
+/// hub (the Alcor reader) has its SCSI/BOT bring-up done HERE, pre-drop, while the JM4 timer is
+/// live — the only safe place for the driver's heaviest synchronous path, since the post-drop EL1
+/// core has no timer to wake the BOT pump's bounded `crate::hlt()` waits. Once a disk is up the
+/// pump returns; a keyboard-only boot is unaffected (`service_storage` is a no-op with nothing
+/// pending). Still NOT run here: `service_ftdi` (the console-bridge arc, not this one).
 /// JB3 boot-10: the FPCI wrapper — Tegra's XUSB host sits behind a fake-PCI config space
 /// (`fpci` region @0x360_0000, same ungated partition as the host MMIO), and the FIRST thing
 /// Linux xhci-tegra does before touching the controller is
@@ -1573,6 +1575,14 @@ pub fn jb2b_attach(
     // serial console visibly alive throughout.
     let pump_start = cntpct();
     let deadline = pump_start.wrapping_add(cntfrq().saturating_mul(60));
+    // JD3: once the keyboard is armed, keep pumping for a bounded settle window so a mass-storage
+    // device BEHIND the hub (the Alcor reader — it enumerates after the root ports, then its SCSI
+    // bring-up runs synchronously) can publish its block device before the EL2->EL1 drop. 8 s
+    // comfortably covers the JB10 nested-hub descent + bring-up; a storage-present boot exits the
+    // instant the disk is ready, so only a keyboard-only boot pays the full wait once.
+    let storage_settle = cntfrq().saturating_mul(8);
+    let mut armed: Option<(u8, u8)> = None;
+    let mut armed_at: u64 = 0;
     // JB9-B capture marks: t≈200 ms (mid the FIRST port's first enable-slot attempt — the JB8
     // log shows ~340 ms per watchdog attempt, so the command is in flight) and t≈5 s (a later
     // port's attempt — same question after several rounds of recovery). Fired OUTSIDE the
@@ -1593,7 +1603,7 @@ pub fn jb2b_attach(
                 }
             }
         }
-        let armed = {
+        let (armed_now, storage_slot, storage_ready) = {
             let mut guard = xhci::XHCI_CONTROLLER.lock();
             let x = guard.as_mut().unwrap();
             x.poll_events();
@@ -1601,15 +1611,43 @@ pub fn jb2b_attach(
             x.service_hid_setproto();
             x.service_slot_disposal();
             x.service_enum();
-            keyboard_armed(x)
+            // JD3: bring a mass-storage device up IN this pre-drop window, while the JM4 timer is
+            // live. Once the hub descent configures the MSC bulk endpoints, `service_storage` runs
+            // the synchronous SCSI bring-up (SET_CONFIGURATION / INQUIRY / READ CAPACITY) and
+            // publishes `drivers::block::BLOCK_DEVICE`, so the panel shell's `ls`/`cat` have a real
+            // FAT volume behind them post-drop. It MUST run here, not in the post-drop pump: its BOT
+            // waits ride `crate::hlt()`, which the timerless EL1 core cannot wake (the JD2/JB2b
+            // rule). A no-op until a device is pending, so keyboard-only boots are unaffected.
+            x.service_storage();
+            (keyboard_armed(x), x.storage_slot, x.storage_slot != 0 && x.storage_note == "ready")
         };
-        if let Some((slot, port)) = armed {
-            serial_println!(
-                ":: tegra: JB2b — keyboard ARMED (slot {}, root port {}) -> PASS ::",
-                slot,
-                port
-            );
-            return Some((slot, port));
+        // Capture the keyboard the first time it arms, but keep pumping so a hubbed MSC can settle.
+        if armed.is_none() {
+            if let Some((slot, port)) = armed_now {
+                serial_println!(
+                    ":: tegra: JB2b — keyboard ARMED (slot {}, root port {}) -> PASS ::",
+                    slot,
+                    port
+                );
+                armed = Some((slot, port));
+                armed_at = cntpct();
+            }
+        }
+        if let Some(k) = armed {
+            if storage_ready {
+                serial_println!(
+                    ":: tegra: JD3 — mass storage ready (slot {}); panel shell ls/cat live ::",
+                    storage_slot
+                );
+                return Some(k);
+            }
+            // Keyboard up but no disk yet: give the hubbed MSC a bounded settle window, then drop.
+            if cntpct().wrapping_sub(armed_at) >= storage_settle {
+                serial_println!(
+                    ":: tegra: JD3 — no mass storage within the settle window; proceeding (shell ls/cat report no disk) ::"
+                );
+                return Some(k);
+            }
         }
         if cntpct().wrapping_sub(deadline) < (1u64 << 63) {
             break; // deadline passed (wrap-safe compare)

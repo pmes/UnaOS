@@ -1466,6 +1466,13 @@ fn tegra_early_stop(boot_info: &'static mut BootInfo) -> ! {
     // instead of hanging dark. exceptions::install replaces it two lines below.
     unsafe { unaos_kernel::arch::mmu_tegra::arm_el1_fault_vector() };
     unsafe { unaos_kernel::arch::boot_tegra::drop_to_el1(mmu.ttbr0_el1) };
+    // JD3: the drop just disabled the physical timer (CNTP_CTL=0) and the EL1 core has no interrupt
+    // source, so mark the timer NOT-live — `verify_live` set it true at EL2 and that reading is now
+    // stale. From here `arch::hlt()` busy-spins instead of a wake-less WFI-park, which is what lets
+    // the post-drop panel shell's synchronous USB-MSC reads make progress: `ls`/`cat` ->
+    // `block::read_block` -> the BOT pump, whose `crate::hlt()` yields now spin (bounded by the
+    // pump's free-running-counter wall-clock deadline) rather than parking this timerless core.
+    unaos_kernel::arch::timer::set_not_live();
     // Now at EL1 with the MMU live and DAIF masked. Print the landing proof (CurrentEL + the live
     // SCTLR_EL1) — the first EL1 serial line ever on Orin silicon — then re-seed this core's per-CPU
     // block (now TPIDR_EL1) and install the EL1 exception vectors (VBAR_EL1) — both pick the EL from

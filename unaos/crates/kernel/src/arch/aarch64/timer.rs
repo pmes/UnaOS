@@ -119,6 +119,16 @@ pub fn is_live() -> bool {
     LIVE.load(Ordering::Relaxed)
 }
 
+/// Clear the liveness flag. Used by the Jetson (tegra) EL2->EL1 drop, which disables the physical
+/// timer (CNTP_CTL=0) but leaves the core with no interrupt source at EL1 — so from there
+/// `arch::hlt()` must fall back to a busy spin instead of a wake-less WFI-park (`verify_live` set
+/// LIVE true at EL2, and that reading is stale once the timer is off). The free-running counter used
+/// for wall-clock timeouts (CNTPCT/CNTVCT) keeps counting regardless, so polled paths still bound
+/// themselves correctly. `Relaxed` matches the other `LIVE` accesses.
+pub fn set_not_live() {
+    LIVE.store(false, Ordering::Relaxed);
+}
+
 /// Post-unmask liveness gate: watch the tick counter actually advance over a bounded wall-clock
 /// window (timed off the always-running CNTPCT, which doesn't depend on the IRQ). Call ONCE right
 /// after IRQs are unmasked.

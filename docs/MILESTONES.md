@@ -10,6 +10,34 @@ Legend: **✅ metal-confirmed** · **🔬 QEMU-green, metal pending** · dates I
 
 ---
 
+## hw-jetson track — 2026-07-10 (JD3 code arc — QEMU-green; metal-pending attended bench)
+
+### JD3 M1+M2 — storage behind the hub → real `ls`/`cat` on the Orin panel shell 🔬 `hw-jetson`
+- **What:** JD2's panel shell had no disk behind its `ls`/`cat`. JD3 brings up the hubbed
+  mass-storage device (the Alcor reader) and gives the shell real files. The shell↔FAT↔block wiring
+  is already architecture-neutral, so the work was *when/how* the tegra path drives the block device:
+  **(M1)** run the (previously-skipped) `service_storage` SCSI bring-up **inside the pre-drop
+  `jb2b_attach` pump**, while the JM4 timer is live — the only place the BOT/control pump's bounded
+  `crate::hlt()` waits have a wake source — with a bounded 8 s storage-settle window after the
+  keyboard arms so a device that enumerates behind the hub can publish `BLOCK_DEVICE` before the
+  drop. **(M2)** make the *post*-drop panel shell's reads work on the timerless EL1 core: the JM6
+  drop disables the physical timer but left `timer::LIVE` stale-true, so `arch::hlt()` would
+  WFI-park the core forever the first time `ls`/`cat` hit the BOT pump. Fix = `timer::set_not_live()`
+  after the drop (→ `hlt()` busy-spins) + convert the shared `pump_until_bot_done` from a fixed
+  iteration budget to a `now_cycles`/`hw_wait_budget` **wall-clock** deadline (so a busy-spinning
+  `hlt()` doesn't time out in microseconds). The wall-clock change mirrors the Pi's polled EMMC2
+  driver (CNTPCT-deadline reads with the timer IRQ off) and is arch-neutral. *The one shared-file
+  edit (`drivers/xhci/mod.rs`) is the "xHCI seam" the JD3 brief pre-authorised the jetson track to
+  request from the integrator.*
+- **Tested — QEMU:** `./arroyo check` + `UNAOS_TEGRA=1 ./arroyo check` green both arches;
+  `UNAOS_HUBSTORAGE=1 ./arroyo test 25` → **MISSION SUCCESS** (`storage_slot=2 note='ready'`, no BOT
+  timeout — the primary guard for the shared BOT-pump change); `./arroyo test-arm 22` → **MISSION
+  SUCCESS** (aarch64 BOT-pump guard); `UNAOS_GICV3=1 ./arroyo test-arm 40` → **CAPSTONE 6/6**;
+  `esp-jetson kernel.elf` links, **107 `tegra:` strings** (JD2 was 105). **Metal-PENDING** — QEMU has
+  no Alcor and never compiles the tegra feature, so the post-drop timerless BOT busy-poll is
+  bench-only; watch hub-MSC power/timing on the real reader + the settle-window/budget sizing.
+- **Detail:** [`arch_arm64.md` §JD3](dev/OS/01_BOOT_HAL/arch_arm64.md). **Commit:** see `git log` (`hw-jetson`).
+
 ## hw-pi4 track — 2026-07-10
 
 > **⭐ METAL BENCH (2026-07-10, attended — real Pi 4, Debug Probe serial):** the entire FAT-mutating
