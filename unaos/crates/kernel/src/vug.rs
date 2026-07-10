@@ -420,18 +420,14 @@ pub fn run_crystal(pal: &mut TargetPal, mode: Mode) {
     serial_println!(":: VUG: crystal exit clean — {} frames ::", frame);
 }
 
-/// The heartbeat + title HUD (the existing Vug aesthetic), plus a live frame counter.
+/// The title HUD (the existing Vug aesthetic), plus a live frame counter.
 ///
 /// POLISH-1: the legacy right-edge VU-meter segment stack was removed. It predated the M3b corner
 /// meters and, sitting at the right edge in purple/grey, read as the CPU pulse meter's per-core bars
-/// gone astray (the CPU meter actually lives bottom-left under RENDER, drawn by `draw_meters`). The
-/// red blinking heartbeat, the title, and the live stat line stay.
-fn draw_stats(pal: &mut TargetPal, frame: u64, faces: u32, solid: bool, w: i32, _h: i32) {
-    // The little red heartbeat (intentional — the demo's pulse).
-    if (frame / 15) % 2 == 0 {
-        pal.draw_rect((w as usize) / 2 - 10, 20, 20, 20, 0x00FF0000);
-    }
-
+/// gone astray (the CPU meter actually lives bottom-left under RENDER, drawn by `draw_meters`).
+/// POLISH-2: the blinking red heartbeat square was removed too (Peter's call — not needed; any real
+/// problem will be obvious from the frozen crystal or a dead frame counter). Title + stat line stay.
+fn draw_stats(pal: &mut TargetPal, frame: u64, faces: u32, solid: bool, _w: i32, _h: i32) {
     // Title + live stat line.
     pal.draw_text(20, 20, "VUG // quartz", 0x00FFFFFF);
     let mode = if solid { "solid" } else { "wire " };
