@@ -879,6 +879,19 @@ impl FatFs {
         }
     }
 
+    /// JD4: list ANY directory by its first cluster — `0` means the root (the value a subdirectory's
+    /// `..` entry stores when its parent is the root, and the FAT16 fixed root's convention), else the
+    /// cluster chain is walked exactly as a FAT32 root (`read_dir_chain`). The purely additive public
+    /// face of the existing read walkers; takes NO lock because it is read-only (F3's namespace-lock
+    /// arc may revisit read-side locking).
+    pub fn read_dir(&self, first_cluster: u32) -> Result<alloc::vec::Vec<DirEntry>, FatError> {
+        if first_cluster == 0 {
+            self.read_root()
+        } else {
+            self.read_dir_chain(first_cluster)
+        }
+    }
+
     /// FAT16 fixed root directory: a contiguous run of sectors, no cluster chain.
     fn read_fixed_root16(&self) -> Result<alloc::vec::Vec<DirEntry>, FatError> {
         let mut out = alloc::vec::Vec::new();
