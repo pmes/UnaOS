@@ -3694,24 +3694,32 @@ fn files_free(asid: u64, idx: usize) -> Option<u32> {
 /// a new file — so it does NOT uniquely identify a file. TWO distinct files can share the same `(dir_lba,
 /// dir_off)` in ONE process (open F; F unlinked while this process holds it, its slot goes `0xE5`; create G,
 /// which reuses F's slot) while sitting on DIFFERENT `OPEN_FILES` rows. This sweep therefore matches BOTH, and
-/// BOTH can reach `refcount == 0` while `unlink_pending`. So it MUST free EVERY orphan chain head it produces,
-/// not just the last — else the earlier file's chain leaks (a benign lost-cluster leak, but a real one, on the
-/// EXPLICIT unlink path). This is called ONLY from `sys_unlink` (a block-I/O-legal context — teardown uses
-/// `files_free` directly + logs), so each head is freed inline (`free_orphan_chain`); `files_free` drops the
-/// `OPEN_FILES` lock before returning the head, so the I/O is never under a lock. `dir_lba != 0` (caller guards).
-fn files_free_by_dir(asid: u64, dir_lba: u64, dir_off: u32) {
+/// BOTH can reach `refcount == 0` while `unlink_pending`. So the caller MUST free EVERY orphan chain head this
+/// returns, not just the last — else the earlier file's chain leaks (a benign lost-cluster leak, but a real one,
+/// on the EXPLICIT unlink path). This is called ONLY from `sys_unlink` (a block-I/O-legal context — teardown uses
+/// `files_free` directly + logs). F3-M3: it now COLLECTS the orphan heads (`(heads, count)`, at most one per
+/// descriptor slot) instead of freeing inline — `sys_unlink` runs it under the NAMESPACE lock, and the free
+/// (`free_orphan_chain`) mounts + does chain block I/O, which must happen AFTER that guard drops (the span rule:
+/// the namespace lock is never held across `mount()`). `dir_lba != 0` (caller guards). `#[must_use]`: dropping
+/// the result leaks every collected chain.
+#[must_use]
+fn files_free_by_dir(asid: u64, dir_lba: u64, dir_off: u32) -> ([u32; NFILE], usize) {
     debug_assert!((asid as usize) < FILE_USED.len() && dir_lba != 0, "files_free_by_dir: bad args");
+    let mut heads = [0u32; NFILE];
+    let mut n = 0usize;
     for k in 0..NFILE {
         if FILE_USED[asid as usize][k].load(Ordering::Acquire)
             && FILE_DIR_LBA[asid as usize][k].load(Ordering::Acquire) == dir_lba
             && FILE_DIR_OFF[asid as usize][k].load(Ordering::Acquire) == dir_off
         {
-            // Free EACH orphan head (not just the last) — two recycled-slot files can both drop to 0 here.
+            // Collect EACH orphan head (not just the last) — two recycled-slot files can both drop to 0 here.
             if let Some(fc) = files_free(asid, k) {
-                free_orphan_chain(fc);
+                heads[n] = fc;
+                n += 1;
             }
         }
     }
+    (heads, n)
 }
 
 /// Clear an ENTIRE per-task open-file row at teardown — the file twin of `clear_handle_row`'s handle wipe (it
@@ -4259,6 +4267,58 @@ fn owned_unlink_permitted(dir_lba: u64, dir_off: u32, asid: u64, caller_gen: u64
         }
     }
     true // public (no owner row) -> the pre-U6 CAP_WRITE-gated unlink applies
+}
+
+// =============================================================================================
+// F3-M3: the UnaFS NAMESPACE lock — mutual atomicity for the coupled multi-step name sequences.
+// =============================================================================================
+//
+// FAT_MUTATION (F2) and DIR_MUTATION (F3-M2) each serialize ONE sector RMW, but the name-level
+// operations are multi-step SEQUENCES whose steps interleave across cores:
+//   * sys_open:   find_located -> ACL check -> openfile_incref/files_alloc — an unlink landing between
+//     the lookup and the incref binds a descriptor to a `first_cluster` a sole-opener unlink just freed
+//     (stale-chain UAF / cross-file disclosure once the cluster is re-allocated);
+//   * sys_open (create): create_in_root -> owned_set_owner — a racing unlink's `owned_clear` on the
+//     recycled directory slot can land BETWEEN them (private->public / ownership theft), and two
+//     creates can scan-then-claim the SAME free directory slot / write a duplicate name;
+//   * sys_unlink: mark_dir_deleted -> owned_clear -> mark_unlink_pending -> files_free_by_dir — the
+//     `0xE5`-before-mark-pending window lets a concurrent last-close miss the pending flag.
+// NAMESPACE makes each sequence atomic against the others: every one of those races needs a second
+// sequence to interleave, so one lock over all of them closes the whole set.
+//
+// SPAN (deliberately RELAXED vs the tight-span rule that governs FAT_MUTATION/DIR_MUTATION): the hold
+// IS permitted to cover the bounded directory block I/O inside the sequences — find_located's bounded
+// directory walk, create_in_root's bounded slot scan + RMW, mark_dir_deleted's one-sector RMW — because
+// the aarch64 storage path is fully POLLED (no scheduler yield under the lock; see FAT_MUTATION's arch
+// note). It is NEVER held across `mount()` or a chain-free (`free_orphan_chain` mounts + walks an
+// unbounded-ish chain): sys_open takes it AFTER mount() returns, and sys_unlink COLLECTS orphan chain
+// heads under the lock but frees them after the guard drops.
+//
+// LOCK ORDER (strict): NAMESPACE ⊃ { FAT_MUTATION, DIR_MUTATION, OPEN_FILES, OWNED_FILES,
+// DEFERRED_FREE }. Inner locks are taken (and released) freely while NAMESPACE is held — the sequences
+// above do exactly that — but NAMESPACE is NEVER acquired while any inner lock is held: no inner-lock
+// critical section (with_fat_lock/with_dir_lock closures, openfile_*, owned_*, deferred_free_*) calls
+// back into ns_lock(). This file is aarch64-only, so the lock needs no cfg gate; x86 is untouched.
+
+/// F3-M3: the per-mount namespace lock (one volume -> one static). A `()` mutex — it guards SEQUENCES,
+/// not data; the tables keep their own inner locks.
+static NAMESPACE: SpinMutex<()> = SpinMutex::new(());
+
+/// F3-M3: the RAII hold on [`NAMESPACE`]. IRQ-masked for the same reason every FS lock here is
+/// (syscalls run I-unmasked and preemptible; a timer preempt of a holder followed by a same-core
+/// re-entry into a namespace sequence would deadlock that core — run queues never migrate). Field
+/// order is load-bearing: `_lock` drops FIRST (release the mutex), `_irq` LAST (restore DAIF) — the
+/// lock is never held with IRQs unmasked.
+struct NsGuard {
+    _lock: spin::mutex::MutexGuard<'static, (), spin::relax::Spin>,
+    _irq: IrqGuard,
+}
+
+/// F3-M3: mask IRQs, then take the namespace lock. See [`NAMESPACE`] for the span + ordering rules.
+fn ns_lock() -> NsGuard {
+    let irq = IrqGuard::mask_save();
+    let lock = NAMESPACE.lock();
+    NsGuard { _lock: lock, _irq: irq }
 }
 
 /// U6: SYS_FGRANT's table half. Verify the row at `(dir_lba, dir_off)` is owned by `(owner_asid, owner_gen)`,
@@ -5976,6 +6036,15 @@ fn sys_open(name_ptr: u64, name_len: u64, mode: u64) -> i64 {
         Err(crate::fs::fat::FatError::NoDisk) => return ENODEV,
         Err(_) => return EIO,
     };
+    // F3-M3: the NAMESPACE hold — from the name lookup through the descriptor claim. It makes the
+    // lookup -> ACL -> incref sequence atomic against a concurrent sys_unlink (whose 0xE5 + owned_clear +
+    // mark-pending run under the same lock), closing: the open-races-unlink stale-chain UAF (a descriptor
+    // bound to a first_cluster the unlink just freed), the owned_clear-vs-owned_set_owner recycled-slot
+    // window, and the create scan-then-claim duplicate-name/slot race. Taken AFTER mount() (never held
+    // across it); every early return below drops it cleanly; the one unwind that frees a chain
+    // (free_orphan_chain mounts) drops it FIRST. Directory block I/O under the hold is bounded + polled
+    // (the NAMESPACE span rule).
+    let ns = ns_lock();
     // U10: `find_located` also returns the on-disk LOCATION of the entry (its directory sector LBA + slot
     // offset), recorded in the descriptor so a later GROW can republish `size`/`first_cluster` into it. When the
     // entry is ABSENT and `O_CREAT` is set, create a fresh 0-length entry (which yields the same triple); the
@@ -6035,8 +6104,11 @@ fn sys_open(name_ptr: u64, name_len: u64, mode: u64) -> i64 {
     let Some(fid) = files_alloc(asid, de.first_cluster(), de.size, dir_lba, dir_off as u32) else {
         // Undo the increment we just made — there is no descriptor to record the row in / route through
         // `files_free`. Decrement THAT exact row. The free below only fires in the (defensive) case a concurrent
-        // unlink made this the last close; block I/O is legal in this syscall context.
-        if let Some(fc) = openfile_decref_at(open_row as u32) {
+        // unlink made this the last close; block I/O is legal in this syscall context — but F3-M3: it mounts,
+        // so the namespace guard drops FIRST (never held across mount()/chain I/O).
+        let orphan = openfile_decref_at(open_row as u32);
+        drop(ns);
+        if let Some(fc) = orphan {
             free_orphan_chain(fc);
         }
         return EMFILE; // this task's open-file table is full
@@ -6045,6 +6117,9 @@ fn sys_open(name_ptr: u64, name_len: u64, mode: u64) -> i64 {
     // mark) hit exactly THIS row — never a key search that a recycled directory slot could redirect. Recorded
     // before any further unwind, so the handle-install-fail `files_free` below decrements the right row.
     FILE_OPENROW[asid as usize][fid].store(open_row as u32, Ordering::Release);
+    // F3-M3: the descriptor is fully bound to the (still-live-under-this-lock) file — the sequence the
+    // namespace lock protects is complete. The handle install below touches only per-task handle state.
+    drop(ns);
     // U11: pack the slot's CURRENT generation with `idx + 1` into the file-id (the value word) — so a later
     // free + first-fit reuse of this same slot (bumped gen) makes any handle still carrying this word fail
     // `file_desc_validate`'s gen check (no sibling rebind). `files_alloc` never bumps gen, and the row has a
@@ -6209,6 +6284,12 @@ fn sys_unlink(handle: u64) -> i64 {
         Err(crate::fs::fat::FatError::NoDisk) => return ENODEV,
         Err(_) => return EIO,
     };
+    // F3-M3: the NAMESPACE hold — the whole 0xE5 -> owned_clear -> mark-pending -> descriptor-drop sequence
+    // runs atomically against any concurrent sys_open's lookup -> ACL -> incref (same lock). This closes the
+    // `0xE5`-before-mark-pending window (a cross-core last-close can no longer land between them and miss the
+    // pending flag) and the owned_clear-vs-owned_set_owner recycled-slot window. Taken AFTER mount(); the
+    // orphan chain frees (which mount) happen after the guard drops.
+    let ns = ns_lock();
     // (1) Make the NAME disappear FIRST — a re-open is `-ENOENT` immediately. A failure here leaves the row +
     // descriptors + refcount untouched (nothing to unwind) -> `-EIO`.
     if fs.mark_dir_deleted(dir_lba, dir_off).is_err() {
@@ -6224,12 +6305,18 @@ fn sys_unlink(handle: u64) -> i64 {
     // pending flag and returns the chain head.
     openfile_mark_unlink_pending_at(open_row, cluster);
     // (3) Drop EVERY descriptor in this process's row that names the file (each decrements the refcount and bumps
-    // its slot generation — U11 stale-sibling protection) and FREE the chain of each that reaches its last close
-    // (block I/O legal here, never under a lock). A sole-opener drops to 0 and frees immediately (the U10
-    // behaviour, deferred); a cross-process opener keeps the chain allocated until its last close. Note: FAT
-    // slot-recycling can put a DIFFERENT still-open unlinked file's descriptor on the same `(dir_lba, dir_off)` —
-    // `files_free_by_dir` frees EVERY orphan head it produces, so neither chain leaks. Then clear our handle.
-    files_free_by_dir(asid, dir_lba, dir_off as u32);
+    // its slot generation — U11 stale-sibling protection), COLLECTING each chain head that reaches its last close.
+    // A sole-opener drops to 0 and frees immediately below (the U10 behaviour, deferred); a cross-process opener
+    // keeps the chain allocated until its last close. Note: FAT slot-recycling can put a DIFFERENT still-open
+    // unlinked file's descriptor on the same `(dir_lba, dir_off)` — EVERY collected head is freed, so neither
+    // chain leaks.
+    let (orphans, norphans) = files_free_by_dir(asid, dir_lba, dir_off as u32);
+    // F3-M3: the sequence is complete — release the namespace before the chain frees (free_orphan_chain
+    // mounts + walks chains; the lock is never held across that).
+    drop(ns);
+    for &fc in &orphans[..norphans] {
+        free_orphan_chain(fc);
+    }
     handle_clear(asid, handle as usize);
     0
 }
@@ -9403,8 +9490,12 @@ fn u11defer_check_double_orphan() -> bool {
     if row_f == row_g {
         return false; // the skip-pending join must place the two files on DIFFERENT rows
     }
-    // 4. THE SWEEP: one `files_free_by_dir` matches BOTH descriptors (same slot) and must free BOTH chains.
-    files_free_by_dir(A, lba_f, off_f as u32);
+    // 4. THE SWEEP: one `files_free_by_dir` matches BOTH descriptors (same slot) and must yield BOTH orphan
+    //    heads (F3-M3: the sweep collects; the caller frees — here exactly as sys_unlink does after its guard).
+    let (orphans, norphans) = files_free_by_dir(A, lba_f, off_f as u32);
+    for &fc in &orphans[..norphans] {
+        free_orphan_chain(fc);
+    }
     // 5. Fresh mount: BOTH cF and cG must be free in ALL FAT copies (re-allocatable). Before the fix the earlier
     //    head (cF) leaks -> its entry stays nonzero -> `false`.
     let fs2 = match crate::fs::fat::mount() {
