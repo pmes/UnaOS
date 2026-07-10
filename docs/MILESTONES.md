@@ -12,7 +12,7 @@ Legend: **✅ metal-confirmed** · **🔬 QEMU-green, metal pending** · dates I
 
 ## hw-jetson track — 2026-07-10 (JD3 code arc — QEMU-green; metal-pending attended bench)
 
-### JD3 M1+M2 — storage behind the hub → real `ls`/`cat` on the Orin panel shell 🔬 `hw-jetson`
+### JD3 — storage behind the hub → real `ls`/`cat` on the Orin panel shell (+ dead-code retirement) 🔬 `hw-jetson`
 - **What:** JD2's panel shell had no disk behind its `ls`/`cat`. JD3 brings up the hubbed
   mass-storage device (the Alcor reader) and gives the shell real files. The shell↔FAT↔block wiring
   is already architecture-neutral, so the work was *when/how* the tegra path drives the block device:
@@ -28,7 +28,12 @@ Legend: **✅ metal-confirmed** · **🔬 QEMU-green, metal pending** · dates I
   `hlt()` doesn't time out in microseconds). The wall-clock change mirrors the Pi's polled EMMC2
   driver (CNTPCT-deadline reads with the timer IRQ off) and is arch-neutral. *The one shared-file
   edit (`drivers/xhci/mod.rs`) is the "xHCI seam" the JD3 brief pre-authorised the jetson track to
-  request from the integrator.*
+  request from the integrator.* **(M3)** retire the dead JB3/JB4/JB5 "revive the halted Falcon"
+  machinery — dead since the JB9 inherit pivot (gated const-false, already optimizer-pruned): the
+  `!jb9h_skip`/`JB5_RUN_E_REPLAY` call blocks in `main.rs` + the orphaned functions across
+  `bpmp_tegra.rs`/`xusb_tegra.rs`/`smmu_tegra.rs` (~840 lines). KEPT: the ⭐ JB9 recipe, BOTH
+  firmware-destroying-lever compile-asserts (+ their guard consts), the shared XUSB/MMU register
+  consts, the read-only post-attach diagnostics, and the JB9 forensic kit. Behaviour-neutral.
 - **Tested — QEMU:** `./arroyo check` + `UNAOS_TEGRA=1 ./arroyo check` green both arches;
   `UNAOS_HUBSTORAGE=1 ./arroyo test 25` → **MISSION SUCCESS** (`storage_slot=2 note='ready'`, no BOT
   timeout — the primary guard for the shared BOT-pump change); `./arroyo test-arm 22` → **MISSION

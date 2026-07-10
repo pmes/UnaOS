@@ -1679,11 +1679,34 @@ Two changes fix this:
   pump). *This edits the shared xHCI driver — the "xHCI seam" the JD3 brief pre-authorised the jetson
   track to request from the integrator; it is `cfg`-neutral and benefits all arches.*
 
+**M3 — retire the dead JB3/JB4/JB5 revival machinery.** With storage working through the inherit
+path, the "revive the halted Falcon" code (JB3 fabric chain, JB4 partition-cycle levers, JB5
+UEFI-replay) — dead since the JB9 inherit pivot, gated off by `JB9H_SKIP_CHAIN`/`JB4_ENABLE`/
+`JB5_RUN_E_REPLAY`/`JB4_ALLOW_PG_CYCLE` (all const-false on the working boot, so already
+optimizer-pruned from the binary) — was removed from source: the `!jb9h_skip` / `JB5_RUN_E_REPLAY`
+call blocks in `main.rs` (the live JB1c ungate + JB2c pad power-up kept), and the now-orphaned
+functions in `bpmp_tegra.rs` (`jb5_linux_order_ungate`, `jb5_clocks_on`, `jb5_uefi_pg_cycle`,
+`jb4_reassert_falcon`, `jb4_powergate_cycle`), `xusb_tegra.rs` (`jb3_fpci_enable`, `jb3_aru_probe`,
+`jb3_falcon`, `jb4_falcon_revive`, `xusb_cnr_set`, `jb5_elpg_release`, `jb5_fpci_uefi_and_poll`,
+`jb5_settle_witness`, `JB4_ENABLE`, `FALC_CPUCTL`), and `smmu_tegra.rs` (`jb3_probe`,
+`jb3_open_stream`, `jb3_install_identity_cb0`, `jb3_mc_sid_fix`, `MC_SID_XUSB_HOSTR`). **Explicitly
+KEPT** (still load-bearing on the inherit path): the ⭐ JB9 recipe (`JB9G_NO_HCRST`,
+`JB9H_SKIP_CHAIN`, `context::CTX_WORDS`, `JB5_PROBE` + `jb5_bar2_route`); **both** compile-asserts
+that make the firmware-destroying levers un-co-enable-able (`JB4_ALLOW_PG_CYCLE`/`JB5_RUN_E_REPLAY`
+consts survive to feed them); the shared XUSB register consts (`XUSB_FPCI`, `XUSB_BAR2`, MMU-500
+`GR1_OFF`/`CB0_OFF`/`MC_SID_BASE`, `JB3_IDMAP`); the read-only post-attach diagnostics
+(`jb3_faults`, `jb3_mc_errs`, `jb3_v3_dump`); the JB5/JB6/JB7 witnesses; and the JB9 forensic kit.
+Nothing touching CPUCTL/BOOTVEC or MRQ_PG can be re-enabled without failing the build. (The now-dead
+JB2c re-power-up and the JB9b SID levers are out of the JB3/JB4/JB5 remit and left for the seat.)
+Net: `bpmp_tegra.rs` −217, `xusb_tegra.rs` −405, `smmu_tegra.rs` −220 lines; behaviour-neutral (the
+deleted code was already gated off, and the `tegra:`-string count is unchanged at 107).
+
 **Gate (QEMU):** `./arroyo check` + `UNAOS_TEGRA=1 ./arroyo check` green both arches;
 `UNAOS_HUBSTORAGE=1 ./arroyo test 25` → `MISSION SUCCESS` (`storage_slot=2 note='ready'`, no BOT
 timeout); `./arroyo test-arm 22` → `MISSION SUCCESS`; `UNAOS_GICV3=1 ./arroyo test-arm 40` →
 `CAPSTONE COMPLETE` 6/6; `esp-jetson kernel.elf` links, **107 `tegra:` strings** (JD2 was 105;
-validate tegra media by `tegra:`-string count, not size — the JD2 rule).
+validate tegra media by `tegra:`-string count, not size — the JD2 rule; the elf is ~388 KB, the
+handful of extra KB vs M1+M2 is optimizer inlining re-balancing after the dead code left, not bloat).
 
 **⚠ Metal is the real verdict — QEMU has no Alcor.** The tegra path never compiles under any QEMU
 gate, so the post-drop timerless BOT busy-poll is **metal-unexercised**; QEMU proves only the
