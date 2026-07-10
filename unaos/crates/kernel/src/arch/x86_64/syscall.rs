@@ -2593,6 +2593,36 @@ fn sys_write_file(row: usize, file_id: u64, buf: u64, len: u64) -> i64 {
             break (offset, want); // [offset, offset+want) is now exclusively ours
         }
     };
+    // S3 (irqstorage): a non-growable staged descriptor (SCRATCH.BIN, FILE_OPNAME == 0) writes THROUGH
+    // to the live volume synchronously via the storage service task — in place, out of the IF-masked
+    // handler — retiring the wstage buffer + the U9x FLUSH queue for this write. Nothing is staged or
+    // marked dirty, so a SYS_CLOSE / teardown of this descriptor discards nothing (the close-discards-
+    // dirty residual): the write is already on disk. Gated on a mounted FAT volume + the service task;
+    // the no-FAT core and created/growable descriptors fall through to the staged write below.
+    #[cfg(feature = "irqstorage")]
+    if FILE_OPNAME[row][idx].load(Ordering::Acquire) == 0
+        && HELLO_STAGED.load(Ordering::Acquire)
+        && crate::drivers::xhci::irqstorage::service_ready()
+    {
+        let sidx = FILE_STAGED[row][idx].load(Ordering::Acquire) as usize;
+        if let Some(name) = STAGED_NAMES.get(sidx) {
+            // Bounce the ring-3 source (validated in the CAS claim above) into a kernel-stack buffer the
+            // service task can reach; write_at persists it in place. `want <= PAGE_SIZE` (staged bound).
+            let mut kbuf = [0u8; PAGE_SIZE as usize];
+            unsafe {
+                core::ptr::copy_nonoverlapping(buf as *const u8, kbuf.as_mut_ptr(), want);
+            }
+            let n = unsafe {
+                crate::drivers::xhci::irqstorage::submit_write_file(
+                    name.as_bytes(), offset, kbuf.as_mut_ptr(), want,
+                )
+            };
+            if n < 0 {
+                return EIO;
+            }
+            return n as i64;
+        }
+    }
     // Pure memcpy: user bytes -> the writable staging buffer at [offset, offset+want). The ring-3 VA equals the
     // kernel VA in the live CR3 (the sys_write/sys_read discipline), and offset+want <= size <= the buffer
     // length (WSTAGE is seeded to `size` at open), so the store stays inside the descriptor's own buffer.
@@ -5177,13 +5207,16 @@ fn sys_read(handle: u64, buf: u64, len: u64) -> i64 {
             break (offset, want); // the range [offset, offset+want) is now exclusively ours
         }
     };
-    // S2 (irqstorage): a RO staged descriptor reads the LIVE volume through the storage service task,
-    // retiring the in-memory staged source for reads. Only RO descriptors (no writable buffer): a RW
-    // descriptor keeps serving its wstage buffer until S3 makes its WRITES live too (write-then-read-back
-    // coherence). Gated on a mounted FAT volume (HELLO_STAGED) + the service task being up; the no-FAT
-    // in-memory core and the pre-service window both fall through to the staged serve below unchanged.
+    // S2/S3 (irqstorage): a staged descriptor reads the LIVE volume through the storage service task,
+    // retiring the in-memory staged source for reads. The gate is `FILE_OPNAME == 0` — i.e. an
+    // IN-PLACE-only descriptor (a RO open, or a RW open of a non-growable staged file like SCRATCH.BIN,
+    // whose writes S3 makes live too). A GROWABLE descriptor (GROW.BIN / a created file, FILE_OPNAME set)
+    // keeps serving its wstage buffer until S4 makes its grow live (write-then-read-back coherence), and
+    // `STAGED_NAMES.get` excludes created files (the CREATED sentinel). Gated on a mounted FAT volume
+    // (HELLO_STAGED) + the service task being up; the no-FAT in-memory core and the pre-service window
+    // both fall through to the staged serve below unchanged.
     #[cfg(feature = "irqstorage")]
-    if FILE_WSTAGE[row][idx].load(Ordering::Acquire) == 0
+    if FILE_OPNAME[row][idx].load(Ordering::Acquire) == 0
         && HELLO_STAGED.load(Ordering::Acquire)
         && crate::drivers::xhci::irqstorage::service_ready()
     {
@@ -8282,6 +8315,23 @@ fn u9x_launcher(demo_cpu: usize) {
     let (flushed, sector_changed, size_unchanged) = if disk_backed && cleared {
         match crate::fs::fat::mount() {
             Ok(fs) => {
+                // S3 (irqstorage): with the write routed THROUGH the storage service task, the fixture's
+                // SYS_WRITE persisted SYNCHRONOUSLY in-syscall — so the disk ALREADY holds the pattern
+                // BEFORE any drain, and nothing was ever enqueued (FILE_DIRTY never set). This is the
+                // close-discards-dirty residual RETIRED: a SYS_CLOSE / teardown of the written descriptor
+                // loses nothing, because the write is on the volume, not in a staged buffer awaiting flush.
+                #[cfg(feature = "irqstorage")]
+                {
+                    let pre_drain = u9x_read16(fc, pre_size, U9X_WRITE_OFFSET);
+                    let no_defer = flush_all_free() && !FLUSH_OVERFLOW.load(Ordering::Acquire);
+                    let sync_ok = pre_drain == Some(U9X_PATTERN) && pre != Some(U9X_PATTERN) && no_defer;
+                    serial_println!(
+                        ":: S3: synchronous write-through — SYS_WRITE persisted to FAT in-syscall (disk held the write pre-drain: {}, no deferred flush: {}), close-discards-dirty residual retired -> {} ::",
+                        pre_drain == Some(U9X_PATTERN),
+                        no_defer,
+                        if sync_ok { "PASS" } else { "FAIL" }
+                    );
+                }
                 let mut flushed = true;
                 while let Some(one) = flush_drain_one(&fs) {
                     flushed &= one;

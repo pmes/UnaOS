@@ -64,6 +64,10 @@ pub enum BlockOp {
     /// File-range read: resolve `name` on the live volume (`find_located`), then `read_at(cluster,
     /// on-disk size, offset, .., len)` into `buf`. Returns the byte count read (`>= 0`), or `-EIO`.
     ReadFile,
+    /// File-range write-through: resolve `name`, then `write_at(cluster, on-disk size, offset,
+    /// buf[..len])` IN PLACE (never grows/allocs/touches the dir or FAT). Returns the byte count
+    /// written (`>= 0`), or `-EIO`.
+    WriteFile,
 }
 
 /// A storage transaction submitted to the service task. It lives on the SUBMITTER'S kernel stack:
@@ -191,6 +195,19 @@ pub unsafe fn submit_read_file(name: &[u8], offset: u32, kbuf: *mut u8, want: us
     unsafe { submit(&mut req as *mut BlockRequest) }
 }
 
+/// S3 helper the syscall layer calls: write `len` bytes at byte `offset` of file `name` on the LIVE
+/// volume, IN PLACE, from the KERNEL buffer `kbuf` (into which the handler has already bounced the
+/// ring-3 source). Returns the byte count written (`>= 0`) or `-EIO`. Blocks the caller on the
+/// service task.
+///
+/// SAFETY: `kbuf` must be a live kernel buffer of at least `len` bytes on the caller's stack. The
+/// caller must be a scheduled task.
+pub unsafe fn submit_write_file(name: &[u8], offset: u32, kbuf: *mut u8, len: usize) -> i32 {
+    let mut req = BlockRequest::new_file(BlockOp::WriteFile, name, offset, kbuf, len);
+    req.done.init();
+    unsafe { submit(&mut req as *mut BlockRequest) }
+}
+
 /// The service task body: pop one request, run it at IF=1, post the submitter. A normal scheduled
 /// kernel task, so its `hlt` inside the BOT pump wakes on the storage MSI-X. Never returns (the
 /// infinite loop makes the effective type `!`; `spawn` wants a `fn(usize)`, so it is left `()`).
@@ -249,6 +266,7 @@ fn service_one(req: &mut BlockRequest, fs: &mut Option<crate::fs::fat::FatFs>) -
             }
         }
         BlockOp::ReadFile => service_read_file(req, fs),
+        BlockOp::WriteFile => service_write_file(req, fs),
     }
 }
 
@@ -275,6 +293,24 @@ fn service_read_file(req: &mut BlockRequest, fs: &mut Option<crate::fs::fat::Fat
         core::ptr::copy_nonoverlapping(out.as_ptr(), req.buf, n);
     }
     n as i32
+}
+
+/// S3: a live in-place file-range write-through. Resolve `name` on the live volume, then `write_at`
+/// its on-disk chain at `[offset, offset+len)` from the kernel bounce buffer. `write_at` is strictly
+/// bounded — it never grows the file, allocs/frees clusters, or touches the directory/FAT — so this
+/// persists a bounded overwrite synchronously. Returns the byte count written (`>= 0`), or `-EIO`.
+fn service_write_file(req: &mut BlockRequest, fs: &mut Option<crate::fs::fat::FatFs>) -> i32 {
+    let Some(fs) = mounted(fs) else { return EIO };
+    let Ok(name) = core::str::from_utf8(&req.name[..req.name_len]) else { return EIO };
+    let (de, _lba, _off) = match fs.find_located(name) {
+        Ok(loc) if !loc.0.is_dir => loc,
+        _ => return EIO,
+    };
+    let data = unsafe { core::slice::from_raw_parts(req.buf, req.len) };
+    match fs.write_at(de.first_cluster(), de.size, req.offset, data) {
+        Ok(w) => w as i32,
+        Err(_) => EIO,
+    }
 }
 
 /// Spawn the storage service task once, on an online AP, when a block device is present. Idempotent
