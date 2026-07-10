@@ -643,7 +643,7 @@ battery() {
     _step "check (both arches)"        ""                    "$blog_dir/check.log"        "$0" check
     _step "check (tegra)"              ""                    "$blog_dir/check-tegra.log"  env UNAOS_TEGRA=1 "$0" check
     _step "x86 test 25 (MISSION)"      "MISSION SUCCESS"     "$blog_dir/test-x86.log"     "$0" test 25
-    _step "x86 test-fat sf 200"        "U11m2.*-> PASS"      "$blog_dir/test-fat.log"     "$0" test-fat sf 200
+    _step "x86 test-fat sf 300"        "U11m2.*-> PASS"      "$blog_dir/test-fat.log"     "$0" test-fat sf 300
     _step "arm virt v2 (MISSION)"      "MISSION SUCCESS"     "$blog_dir/test-arm-v2.log"  "$0" test-arm 22
     _step "arm virt v3 (CAPSTONE 6/6)" "CAPSTONE COMPLETE"   "$blog_dir/test-arm-v3.log"  env UNAOS_GICV3=1 "$0" test-arm 40
     _step "pi4 kernel8-test 35"        "CAPSTONE COMPLETE"   "$blog_dir/kernel8.log:target/serial-pi.log" "$0" kernel8-test 35
