@@ -48,14 +48,22 @@ use spin::Mutex as SpinMutex;
 use crate::arch::sched::{self, Semaphore, PRIO_NORMAL};
 use crate::drivers::block;
 
-/// The kind of transaction a `BlockRequest` carries. S1 defines only the raw single-sector ops (the
-/// block-layer primitive + the `bx-blockreq` self-test); S2..S4 add the file-range / allocator ops.
+/// Upper bound on a file name carried in a request — a dotted 8.3 name is at most 12 bytes (matches
+/// the syscall layer's `MAX_NAME`).
+pub const NAME_MAX: usize = 12;
+
+/// The kind of transaction a `BlockRequest` carries. S1: the raw single-sector ops (the block-layer
+/// primitive + the `bx-blockreq` self-test). S2: `ReadFile` (a live in-place file-range read,
+/// resolved BY NAME on the live volume). S3..S4 add the write / allocator ops.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum BlockOp {
     /// Raw sector read: read one block at `lba` into `buf[..len]`.
     Read,
     /// Raw sector write: write `buf[..len]` (zero-padded to the block size) to the block at `lba`.
     Write,
+    /// File-range read: resolve `name` on the live volume (`find_located`), then `read_at(cluster,
+    /// on-disk size, offset, .., len)` into `buf`. Returns the byte count read (`>= 0`), or `-EIO`.
+    ReadFile,
 }
 
 /// A storage transaction submitted to the service task. It lives on the SUBMITTER'S kernel stack:
@@ -65,13 +73,21 @@ pub enum BlockOp {
 /// `< 0` is a negative errno.
 pub struct BlockRequest {
     pub op: BlockOp,
-    /// Raw ops: the target LBA.
+    /// Raw ops: the target LBA. File ops: unused.
     pub lba: u64,
-    /// Data buffer (a kernel VA — for a syscall this is the identity-mapped user VA, bounds-checked
-    /// by the handler before submit; for the self-test a kernel stack buffer).
+    /// File ops: the byte offset within the file the read/write starts at.
+    pub offset: u32,
+    /// The data buffer — ALWAYS a KERNEL address (the submitter's kernel stack, in the shared kernel
+    /// half). It is NOT the ring-3 buffer: the user window lives in the submitter's private CR3
+    /// (PML4[2]), unreachable by the service task under the kernel CR3, so a file syscall BOUNCES —
+    /// the IF-masked handler copies user<->this kernel buffer, and the service task only ever touches
+    /// this kernel buffer. Raw ops / the self-test pass a kernel stack buffer directly.
     pub buf: *mut u8,
-    /// Bytes to transfer (raw ops: the block size).
+    /// Bytes to transfer (raw ops: the block size; file ops: the requested/available byte count).
     pub len: usize,
+    /// File ops: the 8.3 name to resolve on the live volume (`name[..name_len]`).
+    pub name: [u8; NAME_MAX],
+    pub name_len: usize,
     /// Outcome: `>= 0` a byte count / 0 success, `< 0` a negative errno. Written by the service task
     /// (Release) before `done.post()`; read by the submitter (Acquire) after `done.wait()` returns.
     pub result: AtomicI32,
@@ -86,8 +102,30 @@ impl BlockRequest {
         BlockRequest {
             op,
             lba,
+            offset: 0,
             buf,
             len,
+            name: [0u8; NAME_MAX],
+            name_len: 0,
+            result: AtomicI32::new(0),
+            done: Semaphore::new(0),
+        }
+    }
+
+    /// A fresh file-op request over `name[..name_len]` at byte `offset`, `len` bytes to/from the
+    /// KERNEL buffer `buf`. The submitter calls `done.init()` then `submit()`.
+    pub fn new_file(op: BlockOp, name: &[u8], offset: u32, buf: *mut u8, len: usize) -> Self {
+        let mut nb = [0u8; NAME_MAX];
+        let n = name.len().min(NAME_MAX);
+        nb[..n].copy_from_slice(&name[..n]);
+        BlockRequest {
+            op,
+            lba: 0,
+            offset,
+            buf,
+            len,
+            name: nb,
+            name_len: n,
             result: AtomicI32::new(0),
             done: Semaphore::new(0),
         }
@@ -140,10 +178,27 @@ pub unsafe fn submit(req: *mut BlockRequest) -> i32 {
     unsafe { (*req).result.load(Ordering::Acquire) }
 }
 
+/// S2 helper the syscall layer calls: read `want` bytes of file `name` at byte `offset` from the
+/// LIVE volume into the KERNEL buffer `kbuf`, returning the byte count (`>= 0`) or `-EIO`. Blocks the
+/// caller on the service task. The caller then copies `kbuf` out to the ring-3 destination (the
+/// bounce — `kbuf` is reachable by the service task; the user VA is not).
+///
+/// SAFETY: `kbuf` must be a live kernel buffer of at least `want` bytes on the caller's stack (pinned
+/// while it blocks). The caller must be a scheduled task (so it can block).
+pub unsafe fn submit_read_file(name: &[u8], offset: u32, kbuf: *mut u8, want: usize) -> i32 {
+    let mut req = BlockRequest::new_file(BlockOp::ReadFile, name, offset, kbuf, want);
+    req.done.init();
+    unsafe { submit(&mut req as *mut BlockRequest) }
+}
+
 /// The service task body: pop one request, run it at IF=1, post the submitter. A normal scheduled
 /// kernel task, so its `hlt` inside the BOT pump wakes on the storage MSI-X. Never returns (the
 /// infinite loop makes the effective type `!`; `spawn` wants a `fn(usize)`, so it is left `()`).
 fn service_task(_: usize) {
+    // Cache the mounted volume's GEOMETRY across requests (the BPB fields are stable for the boot;
+    // the FAT/dir/data are re-read fresh per op through the block layer, so a create/delete is always
+    // seen). Lazily mounted on the first file op. Raw ops never touch it.
+    let mut fs: Option<crate::fs::fat::FatFs> = None;
     loop {
         // Block until a request is queued. A counting semaphore, so each `wait()` return pairs with
         // exactly one queued request; a (should-not-happen) empty pop just loops back to wait.
@@ -156,7 +211,7 @@ fn service_task(_: usize) {
         let Some(addr) = addr else { continue };
         let req = addr as *mut BlockRequest;
         // SAFETY: the submitter is blocked in `done.wait()`, so `*req` is pinned + live until we post.
-        let result = unsafe { service_one(&mut *req) };
+        let result = unsafe { service_one(&mut *req, &mut fs) };
         unsafe {
             (*req).result.store(result, Ordering::Release);
             (*req).done.post();
@@ -164,11 +219,20 @@ fn service_task(_: usize) {
     }
 }
 
-/// Run one request to completion at IF=1 and return the submitter's `result`. S1: the raw sector ops
-/// through the block layer (whose `read_block`/`write_block` lock the controller + drive the BOT pump,
-/// which now wakes because we run IF=1). A timeout surfaces as `BlockError::Io` -> `EIO` — never a
-/// hang. S2..S4 extend this with the file-range / allocator ops.
-fn service_one(req: &mut BlockRequest) -> i32 {
+/// Mount the volume once, caching its geometry; return a reference for the file ops. `None` if no FAT
+/// volume is present (the caller then fails the request `-EIO`).
+fn mounted<'a>(fs: &'a mut Option<crate::fs::fat::FatFs>) -> Option<&'a crate::fs::fat::FatFs> {
+    if fs.is_none() {
+        *fs = crate::fs::fat::mount().ok();
+    }
+    fs.as_ref()
+}
+
+/// Run one request to completion at IF=1 and return the submitter's `result`. Raw sector ops go
+/// through the block layer; file ops resolve the name on the live volume and use `fat.rs` (both
+/// lock the controller + drive the BOT pump, which wakes because we run IF=1). A timeout surfaces as
+/// `BlockError::Io`/`FatError` -> `EIO` — never a hang.
+fn service_one(req: &mut BlockRequest, fs: &mut Option<crate::fs::fat::FatFs>) -> i32 {
     match req.op {
         BlockOp::Read => {
             let buf = unsafe { core::slice::from_raw_parts_mut(req.buf, req.len) };
@@ -184,7 +248,33 @@ fn service_one(req: &mut BlockRequest) -> i32 {
                 Err(_) => EIO,
             }
         }
+        BlockOp::ReadFile => service_read_file(req, fs),
     }
+}
+
+/// S2: a live in-place file-range read. Resolve `name` on the live volume, then `read_at` its
+/// on-disk chain at `[offset, offset+len)` into the kernel bounce buffer. Returns the byte count
+/// delivered (`>= 0`), or `-EIO` (no volume / not found / a directory / an I/O error). The syscall
+/// already clamped `len` to the descriptor's EOF; `read_at` re-clamps to the live on-disk size.
+fn service_read_file(req: &mut BlockRequest, fs: &mut Option<crate::fs::fat::FatFs>) -> i32 {
+    let Some(fs) = mounted(fs) else { return EIO };
+    let Ok(name) = core::str::from_utf8(&req.name[..req.name_len]) else { return EIO };
+    let (de, _lba, _off) = match fs.find_located(name) {
+        Ok(loc) if !loc.0.is_dir => loc,
+        _ => return EIO,
+    };
+    let mut out: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
+    if fs
+        .read_at(de.first_cluster(), de.size, req.offset, &mut out, req.len)
+        .is_err()
+    {
+        return EIO;
+    }
+    let n = out.len().min(req.len);
+    unsafe {
+        core::ptr::copy_nonoverlapping(out.as_ptr(), req.buf, n);
+    }
+    n as i32
 }
 
 /// Spawn the storage service task once, on an online AP, when a block device is present. Idempotent

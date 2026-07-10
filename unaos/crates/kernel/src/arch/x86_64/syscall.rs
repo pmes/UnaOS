@@ -5177,6 +5177,42 @@ fn sys_read(handle: u64, buf: u64, len: u64) -> i64 {
             break (offset, want); // the range [offset, offset+want) is now exclusively ours
         }
     };
+    // S2 (irqstorage): a RO staged descriptor reads the LIVE volume through the storage service task,
+    // retiring the in-memory staged source for reads. Only RO descriptors (no writable buffer): a RW
+    // descriptor keeps serving its wstage buffer until S3 makes its WRITES live too (write-then-read-back
+    // coherence). Gated on a mounted FAT volume (HELLO_STAGED) + the service task being up; the no-FAT
+    // in-memory core and the pre-service window both fall through to the staged serve below unchanged.
+    #[cfg(feature = "irqstorage")]
+    if FILE_WSTAGE[row][idx].load(Ordering::Acquire) == 0
+        && HELLO_STAGED.load(Ordering::Acquire)
+        && crate::drivers::xhci::irqstorage::service_ready()
+    {
+        let sidx = FILE_STAGED[row][idx].load(Ordering::Acquire) as usize;
+        if let Some(name) = STAGED_NAMES.get(sidx) {
+            // Bounce through a kernel-stack buffer: the service task (kernel CR3) cannot reach the ring-3
+            // window (PML4[2], the submitter's private CR3), but it can reach this stack buffer (shared
+            // kernel half). `want <= size <= PAGE_SIZE` (the staged size bound), so one page suffices.
+            let mut kbuf = [0u8; PAGE_SIZE as usize];
+            let n = unsafe {
+                crate::drivers::xhci::irqstorage::submit_read_file(
+                    name.as_bytes(), offset, kbuf.as_mut_ptr(), want,
+                )
+            };
+            if n < 0 {
+                return EIO;
+            }
+            let got = (n as usize).min(want);
+            if got == 0 {
+                return 0; // live EOF / short read
+            }
+            // Copy the fetched bytes out to the (already-validated) ring-3 destination — the submitter's
+            // CR3 is re-installed on resume, so the user window is mapped again.
+            unsafe {
+                core::ptr::copy_nonoverlapping(kbuf.as_ptr(), buf as *mut u8, got);
+            }
+            return got as i64;
+        }
+    }
     // U9x: serve from the descriptor's WRITABLE staging buffer if it has one (a RW open — so a read-back
     // witnesses prior writes through the same cap), else the read-only staged source (a RO open — written
     // once, stable across the whole boot). Both are stable-length: the writable buffer's length is fixed at
