@@ -6333,6 +6333,23 @@ fn sys_fgrant(file_handle: u64, child_handle: u64, rights: u64) -> i64 {
         return EINVAL;
     }
     let rights = req & (CAP_READ | CAP_WRITE);
+    // F2 (SMP-hardening): `grantee_asid` (from `PROCS[pi].asid`) and `grantee_gen` (from `ASID_GEN[grantee_asid]`)
+    // were captured as TWO separate atomic loads. On a multi-core boot the named child could EXIT between them and
+    // its ASID slot be recycled to a DIFFERENT process (a bumped `ASID_GEN`), so the grant would bind the stale
+    // `grantee_asid` to the RECYCLED incarnation's `grantee_gen` — a misdelegation of the owner's file to whatever
+    // process now holds that ASID (privilege escalation / disclosure). Re-validate that `pi` is STILL the same
+    // running incarnation AFTER reading its gen: an ASID's gen bumps only at teardown, which drives `state` off
+    // `PRUNNING` and clears `pid`/`asid` (`proc_free`), so a matching `state`/`pid`/`asid` proves the `(asid, gen)`
+    // pair is a consistent snapshot of ONE incarnation. Any mismatch means the child recycled mid-resolution —
+    // refuse (`-ECHILD`) rather than grant to the wrong principal. (Narrow, metal-only window — QEMU has no
+    // cross-core preemption; behaviourally transparent on the single-core path, where nothing recycles.)
+    if PROCS[pi].state.load(Ordering::Acquire) != PRUNNING
+        || PROCS[pi].pid.load(Ordering::Acquire) != pid
+        || PROCS[pi].asid.load(Ordering::Acquire) != grantee_asid
+        || ASID_GEN[grantee_asid as usize].load(Ordering::Acquire) != grantee_gen
+    {
+        return ECHILD;
+    }
     owned_grant(dir_lba, dir_off, asid, asid_gen, grantee_asid, grantee_gen, rights)
 }
 
@@ -7851,6 +7868,77 @@ pub fn u7_launcher(demo_cpu: usize) {
     u11reuse_run();
     u11reap_run(demo_cpu);
     uowner_run(demo_cpu);
+    // F2 M3: after all 23 fixtures have exited, witness that FAT_MUTATION serializes the FAT-table RMW ACROSS
+    // CORES (this task runs on `vcpu`; the worker on `demo_cpu` = online[0], always online). Runs LAST so it can
+    // never perturb the fixture battery, and it never touches the disk. Emits its own `F2-witness:` line — NOT a
+    // `-> PASS` line, so the 23-fixture count stays byte-equivalent.
+    f2_witness_launcher(demo_cpu);
+}
+
+/// F2 M3 witness worker — the `demo_cpu` half of the cross-core FAT_MUTATION stress. `fn(usize)` for
+/// `sched::spawn_joinable`; `arg` is the iteration count. Routes through the LOCKED `set_fat_entry`-equivalent
+/// RMW path (`fat::f2_witness_rmw(_, true)`). See `f2_witness_launcher`.
+fn f2_witness_worker_locked(iters: usize) {
+    crate::fs::fat::f2_witness_rmw(iters as u32, true);
+}
+
+/// F2 M3 witness worker — the `demo_cpu` half of the UNLOCKED control (`fat::f2_witness_rmw(_, false)`): the same
+/// stress with NO serialization, so a lost update can manifest if the two cores interleave. See
+/// `f2_witness_launcher`.
+fn f2_witness_worker_unlocked(iters: usize) {
+    crate::fs::fat::f2_witness_rmw(iters as u32, false);
+}
+
+/// F2 M3 — the cross-core witness for the M1 FAT_MUTATION serialization. Drives an in-RAM read-modify-write
+/// stress (fat::f2_witness_*, NOT the on-disk FAT — zero volume risk) on the SAME lock that guards
+/// `set_fat_entry`: this task (on `vcpu`) does one half inline while a joinable worker does the other half on
+/// `demo_cpu` (= online[0], always online, so the join can never hang). When the two are distinct online cores
+/// (any >= 2-core boot) the halves overlap and genuinely contend. Two passes:
+///   * LOCKED — every step goes through `with_fat_lock`; the counter MUST reach `2*N` (no update lost ->
+///     serialization holds cross-core). This is the witness verdict.
+///   * UNLOCKED control — no lock; the counter reaches `2*N` MINUS whatever the two cores raced away. A nonzero
+///     loss PROVES the environment provoked real contention (the lock's teeth are demonstrated on THIS boot); a
+///     zero loss is reported HONESTLY (QEMU's round-robin TCG did not interleave the RMWs — the true lost-update
+///     race is metal-only, the R1-arc honest-scope pattern). The on-disk `set_fat_entry` RMW rides the bench.
+/// Emits ONE `F2-witness:` serial line (deliberately not a `-> PASS` line — keeps the 23-fixture count intact).
+fn f2_witness_launcher(demo_cpu: usize) {
+    const N: u32 = 120_000;
+    let want = 2 * N;
+
+    // LOCKED pass: worker on demo_cpu + this core's half inline, both through `with_fat_lock`.
+    crate::fs::fat::f2_witness_reset();
+    let h = super::sched::spawn_joinable("f2-witness-lk", f2_witness_worker_locked, N as usize, demo_cpu);
+    crate::fs::fat::f2_witness_rmw(N, true);
+    h.join();
+    let locked_got = crate::fs::fat::f2_witness_value();
+
+    // UNLOCKED control: identical stress with NO serialization.
+    crate::fs::fat::f2_witness_reset();
+    let h2 = super::sched::spawn_joinable("f2-witness-ul", f2_witness_worker_unlocked, N as usize, demo_cpu);
+    crate::fs::fat::f2_witness_rmw(N, false);
+    h2.join();
+    let unlocked_got = crate::fs::fat::f2_witness_value();
+    let unlocked_lost = want.saturating_sub(unlocked_got);
+
+    if locked_got == want {
+        if unlocked_lost > 0 {
+            serial_println!(
+                ":: F2-witness: FAT_MUTATION cross-core RMW (worker on core {}) — locked {}/{} intact (0 lost); unlocked lost {}/{} -> serialization HOLDS under real contention ::",
+                demo_cpu, locked_got, want, unlocked_lost, want
+            );
+        } else {
+            serial_println!(
+                ":: F2-witness: FAT_MUTATION cross-core RMW (worker on core {}) — locked {}/{} intact; unlocked also 0 lost (QEMU RR-TCG did not interleave — cross-core contention is metal-only), lock engaged + serialized path intact ::",
+                demo_cpu, locked_got, want
+            );
+        }
+    } else {
+        // Only reachable if FAT_MUTATION failed to serialize — a real regression, not an expected outcome.
+        serial_println!(
+            ":: F2-witness: FAT_MUTATION cross-core RMW (worker on core {}) — locked {}/{}, LOST {} increments under the lock -> SERIALIZATION REGRESSION ::",
+            demo_cpu, locked_got, want, want - locked_got
+        );
+    }
 }
 
 fn u7_run(demo_cpu: usize) {
