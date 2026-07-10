@@ -148,7 +148,7 @@ Legend: **✅ metal-confirmed** · **🔬 QEMU-green, metal pending** · dates I
 - **Detail:** [`arch_arm64.md` §JD3](dev/OS/01_BOOT_HAL/arch_arm64.md). **Commit:** see `git log` (`hw-jetson`).
 ## hw-rmbp track — 2026-07-10 (U6gx — UnaFS owner/grants ACL, the x86 twin of pi4 U6, Opus-executed)
 
-### U6gx — UnaFS owner/grants: by-name ACL at SYS_OPEN + SYS_FGRANT delegation + F1 owner-only unlink (x86) 🔬 `hw-rmbp`
+### U6gx — UnaFS owner/grants: by-name ACL at SYS_OPEN + SYS_FGRANT delegation + F1 owner-only unlink (x86) ✅ METAL-CONFIRMED (2026-07-10) `hw-rmbp`
 - **What:** the x86 twin of the aarch64 U6 owner/grants ACL — closes the U11x M2 ledger anchor
   (cross-process open/unlink of a created file was GRANT-FREE on x86). Secure-by-DEFAULT: an
   `O_CREAT` of a NEW name records the creator as OWNER (PRIVATE); the new `O_PUBLIC` mode bit
@@ -176,6 +176,18 @@ Legend: **✅ metal-confirmed** · **🔬 QEMU-green, metal pending** · dates I
   each (21 priors byte-identical + U6gx; `grep 'PASS ::'` reads 21 — it misses U2-0a's `PASS (...)`
   format); `UNAOS_NOSTORAGE=1 test 90` clean skip. Metal: pure syscall logic, storage-gated
   (metal-pending like U8x/U11x — flash-and-watch at the next attended bench).
+- **✅ METAL (2026-07-10 attended bench, mid-2012 rMBP, boot 2 of 3):** the FULL x86 chain
+  U1→U11m2→U6gx confirmed on silicon in one boot — 23 PASS, zero FAIL: U9x/U10x staged
+  writes/grow/create/delete flushed on the real card, U11m2 delete HELD past unlink + released at
+  last close AND teardown + DELETED on FAT (chain freed all copies), the complete U6gx
+  owner/grants matrix. Bench facts: boot 1 hit 3 `BOT pump TIMEOUT`s (USBSTS PCD set — the
+  Generic USB SD reader bounced mid-battery, same intermittent family as the jetson Alcor; clean
+  boot 2 had zero) — the BOT layer still has NO endpoint-recovery path if a device stalls
+  mid-battery (honest gap; the STOR-D1 ladder's natural home). Boot-1 also proved fixture-arch
+  contamination is real: an aarch64 HELLO.BIN on the shared data card fails U2/U4x/U6x with
+  "never returned" signatures — keep per-arch HELLO.BIN on bench cards. Boot 3: GUI build
+  attended — `tste` three-section table + the vug crystal on the retina panel (vug present rate
+  is uncached-GOP-VRAM-bound; a PAT/write-combining arc is PARKED as a candidate).
 - **Commit:** see `git log` (`hw-rmbp`).
 
 ## hw-pi4 track — 2026-07-10
