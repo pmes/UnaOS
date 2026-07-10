@@ -25,6 +25,7 @@ use core::sync::atomic::{
     AtomicBool, AtomicI32, AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering,
 };
 
+use spin::Mutex as SpinMutex;
 use x86_64::registers::control::Cr4;
 use x86_64::registers::model_specific::{LStar, Msr};
 use x86_64::VirtAddr;
@@ -100,6 +101,17 @@ const SYS_UNLINK: u64 = 16;
 // same encoding). bit0 = RW. `mode == 3` (O_CREAT | RW) is what the create/delete fixtures pass. A create is
 // inherently RW (you create to write it); higher bits (O_TRUNC/O_EXCL/O_APPEND) stay reserved this arc.
 const O_CREAT: u64 = 1 << 1;
+// U6x: SYS_OPEN `mode` bit2 — opt an O_CREAT of a NEW name OUT of owned-by-default into world-access (the
+// aarch64 U6 twin; same encoding). Ignored on an open of an existing file (ownership is fixed at create) and
+// outside O_CREAT. Owned-by-default: a private create (no O_PUBLIC) records the creator as OWNER; O_PUBLIC
+// keeps the pre-U6 open-by-anyone behaviour. See `open_create_new` and the owner/grants block.
+const O_PUBLIC: u64 = 1 << 2;
+// U6x: UnaFS owner/grants delegation — SYS_FGRANT(file_handle, child_handle, rights) -> 0, or a negative errno
+// (the aarch64 U6 twin; same number). The OWNER of a private created file grants (a CAP_READ|CAP_WRITE subset)
+// or revokes (rights == 0) access to another principal named OWNER-SCOPED by a `Child` handle the caller holds
+// (the SYS_XFER idiom — no raw pid/slot from ring 3). The grant is an ACL edge on the FILE (nothing delivered to
+// the grantee's table); the grantee opens the name and the SYS_OPEN ACL admits it. See `sys_fgrant`.
+const SYS_FGRANT: u64 = 18;
 
 /// Base of the ring-3 window: 1 TiB — a FRESH top-level slot (PML4 index 2) above the firmware
 /// identity map, so mapping it touches no kernel state. `setup` proves it unmapped before use.
@@ -1685,6 +1697,287 @@ unsafe extern "C" {
     static unaos_user_u11m2_unlink: u8;
 }
 
+// --- U6x owner/grants ring-3 fixtures (the aarch64 `el0-uowner-a`/`el0-uowner-b` twins): TWO EL0 programs in
+// ONE blob — process A (`u6gx-owner`) creates OWNED.BIN PRIVATE, and process B (`u6gx-grantee`, a DIFFERENT
+// address space) is denied by default, granted, exercised, then revoked. The launcher (`u6gx_launcher`)
+// choreographs them with a single GO word (launcher -> fixture: the next step the fixture may proceed to) and a
+// single SIG word (fixture -> launcher: the last step it completed) planted per-slot at the fixed window
+// offsets below; A is pre-endowed with a `Child` handle naming B so its SYS_FGRANT is owner-scoped (the SYS_XFER
+// idiom — B is never named by a raw pid). Both convey a witness bitmask as their `sys_exit` status, routed BY
+// NAME into `U6GX_OWNER_WITNESS` / `U6GX_GRANTEE_WITNESS` (x86 has no SYS_REPORT — the u5x/u7x idiom).
+//
+// A (`u6gx-owner`, U6GX_OWNER_ALL = 0x3F): bit0 create OWNED.BIN PRIVATE (O_CREAT|RW, no O_PUBLIC -> A owns it) +
+// write the 16-byte pattern; bit1 SYS_FGRANT B read+write -> 0; bit2 SYS_FGRANT B revoke (rights 0) -> 0; bit3
+// the owner RE-opens its own file after the revoke -> a handle (owner authority persists); bit4 the owner
+// UNLINKs OWNED.BIN while B STILL HOLDS it open -> 0 (F1 admits the owner; the delete DEFERS — B holds a
+// refcount); bit5 an O_CREAT re-create of the just-unlinked name -> -EBUSY (its deferred delete has not
+// completed — the U11x M2 combined path). A exits; the kernel-side verdict proves ownership then dies at B's
+// last close (re-creatable again).
+//
+// B (`u6gx-grantee`, U6GX_GRANTEE_ALL = 0x1F): bit0 open OWNED.BIN BEFORE any grant -> -EACCES (a non-owner is
+// denied BY NAME — the gap U6x closes); bit1 open RW AFTER the grant -> a handle + the read-back matches A's
+// pattern (content proves the grant admitted it); bit2 B (a non-owner) tries SYS_FGRANT -> -EACCES (only the
+// owner may grant); bit3 B tries SYS_UNLINK via its CAP_WRITE handle -> -EACCES (F1 — a content grantee cannot
+// delete/steal ownership); bit4 open AFTER the revoke -> -EACCES (re-denied). B KEEPS its granted handle open
+// across A's revoke + unlink (a handle already held survives a revoke — the ACL gates ACQUISITION), then closes
+// it at the final step (releasing A's deferred delete).
+core::arch::global_asm!(
+    r#"
+    .globl unaos_user_u6gx_blob_start
+unaos_user_u6gx_blob_start:
+    .balign 16
+
+    // ---- Process A: the OWNER ----
+    .globl unaos_user_u6gx_owner
+unaos_user_u6gx_owner:
+    xor r12d, r12d                          // witness = 0
+    lea r15, [rip + unaos_user_u6gx_blob_start] // r15 = window base (== USER_BASE; GO/SIG live in a data page)
+    lea r14, [r15 + 0x1000]                 // r14 -> a scratch DATA page (unused by A; kept for symmetry)
+
+    // (0) create OWNED.BIN PRIVATE (O_CREAT|RW = 3, NO O_PUBLIC -> A becomes owner) -> hA in rbx
+    mov rax, 11                             // SYS_OPEN
+    lea rdi, [rip + unaos_user_u6gx_name]
+    mov rsi, [rip + unaos_user_u6gx_namelen]
+    mov rdx, 3                              // O_CREAT | RW  (PRIVATE — A owns it)
+    syscall
+    mov rbx, rax
+    test rbx, rbx
+    js 9f
+    // write the 16-byte pattern through hA (grows from empty)
+    mov rax, 1                              // SYS_WRITE
+    mov rdi, rbx
+    lea rsi, [rip + unaos_user_u6gx_pattern]
+    mov rdx, 16
+    syscall
+    cmp rax, 16
+    jne 9f
+    add r12, 1                              // bit0: create PRIVATE + write OK (an owner open+write)
+    mov qword ptr [r15 + 0x3808], 1         // SIG = 1 (A created the file — launcher releases B's pre-grant open)
+
+    // park: wait GO >= 1 (released after B's pre-grant open was denied)
+    mov rcx, 0x40000000
+1:  cmp qword ptr [r15 + 0x3800], 1
+    jae 2f
+    pause
+    dec rcx
+    jnz 1b
+    jmp 9f                                  // GO never released -> partial witness (verdict FAILs)
+
+2:  // (1) grant B read+write: SYS_FGRANT(hA, child handle 2 -> B, CAP_READ|CAP_WRITE = 3) -> 0
+    mov rax, 18                             // SYS_FGRANT
+    mov rdi, rbx                            // the FILE handle (hA)
+    mov rsi, 2                              // U6GX_CHILD_IDX — the Child handle naming B
+    mov rdx, 3                              // CAP_READ | CAP_WRITE
+    syscall
+    cmp rax, 0
+    jne 9f
+    add r12, 2                              // bit1: grant returned 0
+    mov qword ptr [r15 + 0x3808], 2         // SIG = 2 (launcher releases B's granted open)
+
+    // park: wait GO >= 2
+    mov rcx, 0x40000000
+3:  cmp qword ptr [r15 + 0x3800], 2
+    jae 4f
+    pause
+    dec rcx
+    jnz 3b
+    jmp 9f
+
+4:  // (2) revoke B: SYS_FGRANT(hA, child 2, rights = 0) -> 0
+    mov rax, 18
+    mov rdi, rbx
+    mov rsi, 2
+    xor edx, edx                            // rights = 0 -> REVOKE
+    syscall
+    cmp rax, 0
+    jne 9f
+    add r12, 4                              // bit2: revoke returned 0
+    mov qword ptr [r15 + 0x3808], 3         // SIG = 3 (launcher releases B's post-revoke denied open)
+
+    // park: wait GO >= 3 (released after B's post-revoke open was denied; B still holds its granted handle)
+    mov rcx, 0x40000000
+5:  cmp qword ptr [r15 + 0x3800], 3
+    jae 6f
+    pause
+    dec rcx
+    jnz 5b
+    jmp 9f
+
+6:  // (3) the OWNER re-opens its OWN file after the revoke -> still admitted (ownership authority persists) -> r13
+    mov rax, 11
+    lea rdi, [rip + unaos_user_u6gx_name]
+    mov rsi, [rip + unaos_user_u6gx_namelen]
+    mov rdx, 1                              // RW
+    syscall
+    mov r13, rax
+    test r13, r13
+    js 9f
+    add r12, 8                              // bit3: owner re-open OK
+
+    // (4) the OWNER UNLINKs OWNED.BIN while B STILL HOLDS it open -> 0 (F1 admits the owner; the delete DEFERS)
+    mov rax, 16                             // SYS_UNLINK
+    mov rdi, rbx                            // via the primary owner handle
+    syscall
+    cmp rax, 0
+    jne 9f
+    add r12, 16                             // bit4: owner unlink OK (deferred — B holds a refcount)
+
+    // (5) an O_CREAT re-create of the just-unlinked name -> -EBUSY (deferred delete not yet complete)
+    mov rax, 11
+    lea rdi, [rip + unaos_user_u6gx_name]
+    mov rsi, [rip + unaos_user_u6gx_namelen]
+    mov rdx, 3                              // O_CREAT | RW
+    syscall
+    cmp rax, -16                            // -EBUSY ?
+    jne 9f
+    add r12, 32                             // bit5: re-create refused while delete-pending
+9:
+    mov qword ptr [r15 + 0x3808], 4         // SIG = 4 (A is exiting — launcher releases B's final close)
+    mov rax, 2                              // SYS_EXIT(witness) -> routed by name into U6GX_OWNER_WITNESS
+    mov rdi, r12
+    syscall
+99: jmp 99b
+
+    // ---- Process B: the GRANTEE ----
+    .balign 16
+    .globl unaos_user_u6gx_grantee
+unaos_user_u6gx_grantee:
+    xor r12d, r12d                          // witness = 0
+    lea r15, [rip + unaos_user_u6gx_blob_start] // r15 = window base (its OWN slot's window)
+    lea r14, [r15 + 0x1000]                 // r14 -> read-back dest (writable DATA page)
+
+    // park: wait GO >= 1 (released after A created OWNED.BIN — so the file exists before B opens it)
+    mov rcx, 0x40000000
+11: cmp qword ptr [r15 + 0x3800], 1
+    jae 12f
+    pause
+    dec rcx
+    jnz 11b
+    jmp 19f
+
+12: // (0) open OWNED.BIN RO BEFORE any grant -> -EACCES (a non-owner is denied BY NAME: the gap closed)
+    mov rax, 11
+    lea rdi, [rip + unaos_user_u6gx_name]
+    mov rsi, [rip + unaos_user_u6gx_namelen]
+    xor edx, edx                            // RO, no O_CREAT
+    syscall
+    cmp rax, -13                            // -EACCES ?
+    jne 19f
+    add r12, 1                              // bit0: non-owner open denied
+    mov qword ptr [r15 + 0x3808], 1         // SIG = 1 (launcher tells A to grant)
+
+    // park: wait GO >= 2 (released after A granted B)
+    mov rcx, 0x40000000
+13: cmp qword ptr [r15 + 0x3800], 2
+    jae 14f
+    pause
+    dec rcx
+    jnz 13b
+    jmp 19f
+
+14: // (1) open OWNED.BIN RW AFTER the grant -> a handle (>= 0) carrying CAP_READ|CAP_WRITE -> rbx (KEPT open)
+    mov rax, 11
+    lea rdi, [rip + unaos_user_u6gx_name]
+    mov rsi, [rip + unaos_user_u6gx_namelen]
+    mov rdx, 1                              // RW (subset of the granted R|W)
+    syscall
+    mov rbx, rax
+    test rbx, rbx
+    js 19f
+    // read 16 bytes and verify the first 8 against A's pattern (content proves the grant admitted the open)
+    mov rax, 12                             // SYS_READ
+    mov rdi, rbx
+    mov rsi, r14
+    mov rdx, 16
+    syscall
+    cmp rax, 16
+    jne 19f
+    mov r8, [rip + unaos_user_u6gx_pattern]
+    cmp r8, [r14]
+    jne 19f
+    add r12, 2                              // bit1: granted RW open + read-back matches A's bytes
+
+    // (2) B (a non-owner) tries SYS_FGRANT -> -EACCES (only the owner may grant; no Child handle needed —
+    //     ownership is checked FIRST, before the child argument is resolved)
+    mov rax, 18                             // SYS_FGRANT
+    mov rdi, rbx                            // its own File handle
+    xor esi, esi                            // child handle 0 (irrelevant — the owner check fails first)
+    mov rdx, 3
+    syscall
+    cmp rax, -13                            // -EACCES ?
+    jne 19f
+    add r12, 4                              // bit2: non-owner grant denied
+
+    // (3) B tries SYS_UNLINK via its CAP_WRITE handle -> -EACCES (F1 — delete is owner-only; a content grantee
+    //     must not be able to unlink + recreate to STEAL ownership)
+    mov rax, 16                             // SYS_UNLINK
+    mov rdi, rbx
+    syscall
+    cmp rax, -13                            // -EACCES ?
+    jne 19f
+    add r12, 8                              // bit3: grantee unlink denied (delete owner-only)
+    mov qword ptr [r15 + 0x3808], 2         // SIG = 2 (launcher tells A to revoke) — B KEEPS rbx open
+
+    // park: wait GO >= 3 (released after A revoked B)
+    mov rcx, 0x40000000
+15: cmp qword ptr [r15 + 0x3800], 3
+    jae 16f
+    pause
+    dec rcx
+    jnz 15b
+    jmp 19f
+
+16: // (4) open OWNED.BIN RW AFTER the revoke -> -EACCES (re-denied; the handle B ALREADY holds is unaffected)
+    mov rax, 11
+    lea rdi, [rip + unaos_user_u6gx_name]
+    mov rsi, [rip + unaos_user_u6gx_namelen]
+    mov rdx, 1                              // RW
+    syscall
+    cmp rax, -13                            // -EACCES ?
+    jne 19f
+    add r12, 16                             // bit4: post-revoke open re-denied
+    mov qword ptr [r15 + 0x3808], 3         // SIG = 3 (B is done proving; launcher lets A unlink while B holds)
+
+    // park: wait GO >= 4 (released after A unlinked OWNED.BIN — B still holds rbx, so the delete DEFERRED)
+    mov rcx, 0x40000000
+17: cmp qword ptr [r15 + 0x3800], 4
+    jae 18f
+    pause
+    dec rcx
+    jnz 17b
+    jmp 19f
+
+18: // close the held handle -> releases the LAST cross-process refcount, which drains A's deferred delete
+    mov rax, 17                             // SYS_CLOSE
+    mov rdi, rbx
+    syscall
+19:
+    mov rax, 2                              // SYS_EXIT(witness) -> routed by name into U6GX_GRANTEE_WITNESS
+    mov rdi, r12
+    syscall
+199: jmp 199b
+
+    .balign 8
+unaos_user_u6gx_namelen:
+    .quad unaos_user_u6gx_name_end - unaos_user_u6gx_name
+unaos_user_u6gx_name:
+    .ascii "OWNED.BIN"
+unaos_user_u6gx_name_end:
+    .balign 8
+unaos_user_u6gx_pattern:
+    .ascii "U6x-OWNED-OK-777"
+    .globl unaos_user_u6gx_blob_end
+unaos_user_u6gx_blob_end:
+"#
+);
+
+unsafe extern "C" {
+    static unaos_user_u6gx_blob_start: u8;
+    static unaos_user_u6gx_blob_end: u8;
+    static unaos_user_u6gx_owner: u8;
+    static unaos_user_u6gx_grantee: u8;
+}
+
 // --- The SYSCALL entry stub (LSTAR target). Naked; the only assembly in the syscall path.
 //
 // On entry (CPL 0, from SYSCALL): rcx = user RIP, r11 = user RFLAGS, rax = number, rdi/rsi/rdx =
@@ -1942,6 +2235,13 @@ pub fn record_ring3_kill(name: &str, vec: u8, err: u64, cr2: u64) {
         U11M2_KILLED.fetch_add(1, Ordering::AcqRel);
         return;
     }
+    // U6x: the owner/grantee fixtures are well-behaved (register-only apart from the grantee's read-back store); a
+    // kill is a real U6x bug — its own counter, never the U1b `killed_unexpected` count. The launcher's
+    // unconditional cleanup still tears the fixtures' slots + Proc entries down.
+    if name == "u6gx-owner" || name == "u6gx-grantee" {
+        U6GX_KILLED.fetch_add(1, Ordering::AcqRel);
+        return;
+    }
     let code_end = USER_BASE + PAGE_SIZE; // the code page is the first page of the window only
     let window_end = USER_BASE + USER_WINDOW_PAGES * PAGE_SIZE;
     let expected = match name {
@@ -1996,6 +2296,7 @@ extern "C" fn syscall_dispatch(nr: u64, a0: u64, a1: u64, a2: u64) -> i64 {
         SYS_SEEK => sys_seek(a0, a1),
         SYS_UNLINK => sys_unlink(a0),
         SYS_CLOSE => sys_close(a0),
+        SYS_FGRANT => sys_fgrant(a0, a1, a2),
         SYS_EXIT => {
             // U7x: the transfer fixtures exit BY NAME, BEFORE the Proc short-circuit below — the CHILD
             // has a launcher-PLANTED Proc entry (the pid->slot map sys_xfer resolves its dest through),
@@ -2015,6 +2316,26 @@ extern "C" fn syscall_dispatch(nr: u64, a0: u64, a1: u64, a2: u64) -> i64 {
                         U7X_CHILD_WITNESS.store(a0 as u32, Ordering::Release);
                     }
                     U7X_DONE.fetch_add(1, Ordering::AcqRel);
+                    let cpu = crate::arch::percpu::this_cpu().cpu_index as usize;
+                    if let Some(id) = crate::arch::sched::current_task_id(cpu) {
+                        if let Some(i) = proc_find_running(id) {
+                            PROCS[i].state.store(PEXITED, Ordering::Release);
+                        }
+                    }
+                    crate::arch::sched::exit(); // never returns
+                }
+                // U6x owner/grants: the GRANTEE has a launcher-PLANTED Proc entry (A's Child handle names it,
+                // owner-scoped), so — exactly like the u7x child — its exit must be routed BY NAME BEFORE the
+                // Proc reap short-circuit below, or its witness (and `U6GX_DONE`) would be swallowed by the
+                // parent-reap path. The OWNER has no Proc entry but rides the same arm for symmetry. Mark the
+                // planted entry EXITED (a late SYS_FGRANT to this recipient then fails the RUNNING check).
+                if nm == Some("u6gx-owner") || nm == Some("u6gx-grantee") {
+                    if nm == Some("u6gx-owner") {
+                        U6GX_OWNER_WITNESS.store(a0 as u32, Ordering::Release);
+                    } else {
+                        U6GX_GRANTEE_WITNESS.store(a0 as u32, Ordering::Release);
+                    }
+                    U6GX_DONE.fetch_add(1, Ordering::AcqRel);
                     let cpu = crate::arch::percpu::this_cpu().cpu_index as usize;
                     if let Some(id) = crate::arch::sched::current_task_id(cpu) {
                         if let Some(i) = proc_find_running(id) {
@@ -2432,6 +2753,15 @@ fn sys_unlink(handle: u64) -> i64 {
     if nameid >= N_U10_NAMES {
         return EACCES;
     }
+    // U6x F1 — DELETE is an OWNER-only authority. The CAP_WRITE CHECK above admits both the owner AND a
+    // WRITE-GRANTEE (a grantee legitimately opened the file RW), but a content grantee must NOT be able to delete
+    // — else it could `unlink` + `O_CREAT` the name to STEAL ownership and lock the real owner out. So an OWNED
+    // file is unlinkable only by its current owner; a PUBLIC file (no owner row) keeps the prior CAP_WRITE-gated
+    // behaviour. Checked BEFORE any state change, so a denied unlink mutates nothing.
+    let caller_gen = SLOT_GEN[row].load(Ordering::Acquire);
+    if !owned_unlink_permitted(nameid, row, caller_gen) {
+        return EACCES;
+    }
     // Capture the file's bytes BEFORE freeing descriptors (files_free discards the wstage), then enqueue the
     // on-disk delete — a self-contained COPY (u10_flush_enqueue), so it survives the frees below. U11x M2: the op
     // is enqueued HELD — not drainable until the LAST descriptor across ALL rows closes (`openf_decref`'s
@@ -2447,6 +2777,11 @@ fn sys_unlink(handle: u64) -> i64 {
     if DYN_DELETED_G[nameid].swap(true, Ordering::AcqRel) {
         return ENOENT;
     }
+    // U6x: the name is gone — drop its owner/grants row NOW. Ownership ends at unlink (the pi4 `owned_clear`
+    // twin), so a later O_CREAT re-create of the name (once its deferred delete drains and clears DYN_DELETED_G)
+    // establishes a FRESH owner rather than inheriting the deleted file's ACL. Placed right after the unlink is
+    // claimed, so the ACL row dies exactly when the name does.
+    owned_clear(nameid);
     let mut heldslot = 0u32; // +1-biased queue slot of the held op (0 == none)
     if HELLO_STAGED.load(Ordering::Acquire) {
         let size = FILE_SIZE[row][idx].load(Ordering::Acquire) as usize;
@@ -2482,6 +2817,73 @@ fn sys_unlink(handle: u64) -> i64 {
     }
     handle_clear(row, handle as usize);
     0
+}
+
+/// SYS_FGRANT(file_handle, child_handle, rights) -> `0` or a negative errno (U6x, the aarch64 U6 twin). The
+/// OWNER of a private created file grants (a CAP_READ|CAP_WRITE subset) or revokes (`rights == 0`) access to
+/// another principal named OWNER-SCOPED by a `Child` handle it holds (the SYS_XFER idiom — ring 3 never supplies
+/// a raw pid/slot). The grant is an ACL edge on the FILE: nothing is delivered to the grantee's table; the
+/// grantee opens the name and the SYS_OPEN ACL admits it, and a handle it ALREADY holds survives a revoke (the
+/// ACL gates ACQUISITION, not held caps). Ordering mirrors the pi4 twin: ownership is verified BEFORE the
+/// grantee handle is resolved (a non-owner is `-EACCES` whatever it passes, and never learns whether that handle
+/// was valid). Errnos: `-EACCES` (the caller owns no private row / the file is public/staged/nonexistent / the
+/// caller is not its owner), `-ECHILD` (the child handle names no running child), `-EINVAL` (a nonzero rights
+/// request naming only unsupported bits), `-ENOSPC` (the file's bounded grant list is full).
+fn sys_fgrant(file_handle: u64, child_handle: u64, rights: u64) -> i64 {
+    // The caller must own a PRIVATE row — the shared kernel window owns no created files (created opens are
+    // refused on SHARED_ROW), so it can grant nothing.
+    let Some(row) = crate::arch::memory::current_slot() else {
+        return EACCES;
+    };
+    let caller_gen = SLOT_GEN[row].load(Ordering::Acquire);
+    // The FILE: a live File handle the caller holds; decode + validate its descriptor (range/USED/generation),
+    // then read the created-file NAME-ID the ACL is keyed by. A staged file (opname 0) owns nothing -> -EACCES.
+    let file_id = match handle_resolve(row, file_handle, 0) {
+        Ok(HandleTarget::File(id)) => id,
+        _ => return EACCES,
+    };
+    let Some(idx) = file_desc_validate(row, file_id) else {
+        return EACCES;
+    };
+    let Some(nameid) = (FILE_OPNAME[row][idx].load(Ordering::Acquire) as usize).checked_sub(1) else {
+        return EACCES; // a staged (non-created) descriptor owns no created name
+    };
+    if nameid >= N_U10_NAMES {
+        return EACCES;
+    }
+    // Only the file's OWNER may grant/revoke — checked FIRST, before resolving the grantee, so a non-owner is a
+    // clean -EACCES whatever it passes as the child handle (and it never learns whether that handle was valid).
+    if !owned_is_owner(nameid, row, caller_gen) {
+        return EACCES;
+    }
+    // The GRANTEE: named owner-scoped by a Child handle the caller holds (the SYS_XFER idiom). Resolve child ->
+    // pid -> the recipient's live SLOT + generation, exactly as sys_xfer does (must be RUNNING now; a
+    // shared-window task with no private slot is not a grantee).
+    let pid = match handle_resolve(row, child_handle, 0) {
+        Ok(HandleTarget::Child(pid)) => pid,
+        _ => return ECHILD,
+    };
+    let Some(pi) = proc_find_child(pid) else {
+        return ECHILD;
+    };
+    if PROCS[pi].state.load(Ordering::Acquire) != PRUNNING {
+        return ECHILD;
+    }
+    let Some(grantee_slot) = PROCS[pi].slot.load(Ordering::Acquire).checked_sub(1) else {
+        return ECHILD; // no private slot recorded (a shared-window task is not a grant recipient)
+    };
+    if grantee_slot >= crate::arch::memory::USER_SLOTS {
+        return ECHILD; // defensive: never the shared row (sys_spawn only records private slots)
+    }
+    let grantee_gen = SLOT_GEN[grantee_slot].load(Ordering::Acquire);
+    // Only READ|WRITE are grantable file rights. `rights == 0` is an explicit REVOKE; a NONZERO request naming
+    // ONLY unsupported bits is malformed (-EINVAL) rather than silently coerced to a revoke.
+    let req = rights as u32;
+    if req != 0 && req & (CAP_READ | CAP_WRITE) == 0 {
+        return EINVAL;
+    }
+    let rights = req & (CAP_READ | CAP_WRITE);
+    owned_grant(nameid, row, caller_gen, grantee_slot, grantee_gen, rights)
 }
 
 /// Per-CPU SYSCALL/SYSRET + NX/SMEP setup. Called once per CPU (BSP in `arch::init`, each AP in
@@ -3339,6 +3741,12 @@ const U11M2_NAME: &str = "DEFER.BIN";
 /// U11x M2: the 16-byte pattern the launcher writes into DEFER.BIN (the fixture read-verifies the first 8 bytes;
 /// the `.ascii` in the fixture MUST match). 16 chars. The pi4 twin's `U11_DEFER_PATTERN`.
 const U11M2_PATTERN: [u8; 16] = *b"U11x-DEFER-OK-42";
+/// U6x: the owner/grants demo's runtime-created file — the OWNED file the A/B fixtures choreograph over (A
+/// creates it PRIVATE; B is a different process, denied by default, granted, then revoked). A creatable
+/// `U10_NAMES` member (index 4), absent from the staged set. The pi4 `OWNED.BIN` twin.
+const U6GX_NAME: &str = "OWNED.BIN";
+// U6gx: A writes the 16-byte pattern `U6x-OWNED-OK-777` into OWNED.BIN (defined inline in the fixture's `.ascii`;
+// the granted B read-verifies the first 8 bytes). Kept in-blob (no kernel-side const) — B does the compare.
 /// U10 CREATE: the 16-byte pattern the create fixture writes into FRESH.BIN (also its final size). The `.ascii`
 /// in the fixture MUST match; the launcher re-reads it from disk. 16 chars. The aarch64 twin's `U10C_PATTERN`.
 const U10C_PATTERN: [u8; 16] = *b"U10x-CREATE-OK99";
@@ -3560,6 +3968,244 @@ fn openf_decref(nameid: usize) {
     }
 }
 
+// =============================================================================================
+// U6x: UnaFS owner/grants — the by-NAME namespace ACL, the x86 twin of the reviewed aarch64 U6 (owner/grants
+// enforced at SYS_OPEN + SYS_FGRANT delegation + F1 owner-only unlink). Closes the U11x M2 ledger anchor: on
+// x86, cross-process open/unlink of a created file was GRANT-FREE — any process could open/unlink any created
+// name. This makes the by-name namespace secure-by-DEFAULT.
+//
+// OWNED-BY-DEFAULT: an O_CREAT of a NEW name records the creating principal as the file's OWNER (the file is
+// PRIVATE); the O_PUBLIC mode bit opts a create into world-access. An open of an EXISTING owned file is admitted
+// only for the owner or a principal the owner GRANTED (SYS_FGRANT); everyone else is -EACCES. A file with NO
+// owner row (a STAGED file — HELLO.BIN/SCRATCH.BIN/GROW.BIN have no created-name identity — or a created file
+// opened O_PUBLIC, or one whose owner has torn down) is PUBLIC: byte-identical to the pre-U6x behaviour.
+//
+// IDENTITY — the KEY vs the PRINCIPAL. x86 keys the ACL by the created file's `U10_NAMES` NAME-ID (a direct
+// index, 0..N_U10_NAMES), NOT pi4's on-disk `(dir_lba, dir_off)`: x86's created-file identity space IS the
+// static name table (the same key `DYN_DELETED_G` / `OPENF_*` use), so there is no recycled-key aliasing class
+// by construction (U11x M2's reasoning) and no bounded-table "full" case — every creatable name has exactly one
+// owner row (`owned_set_owner` cannot fail, so a private create has no fail-closed -ENOSPC path, a clean x86
+// divergence from pi4). The PRINCIPAL is the address-space SLOT fenced by its `SLOT_GEN` incarnation (the x86
+// (ASID, ASID_GEN) analogue — `SLOT_GEN[slot]` is bumped at the TOP of `clear_handle_row`): a stale owner/grant
+// whose gen no longer matches never authorizes a recycled slot's next tenant.
+//
+// LIFETIME (in-kernel, VOLATILE — the ENFORCEMENT SEAM the on-disk UnaFS owner/grants:* attributes will feed
+// once persistent files land; there is no on-disk owner format yet, and `fat.rs` is shared/off-lane): a row is
+// CLEARED at SYS_UNLINK (the name is gone) and at OWNER TEARDOWN (`clear_handle_row` -> the file reverts to
+// PUBLIC — no persistent principal keeps owning it; this also keeps the table self-cleaning across create/exit).
+//
+// LOCKING: one `SpinMutex` (`OWNED_FILES`), a short I/O-free critical section taken IRQ-masked via
+// `crate::arch::without_interrupts` on EVERY access — the SYSCALL handler already runs IF-masked, but the
+// teardown path (`clear_handle_row`) does not necessarily, so the mask makes the two symmetric (the pi4 IrqGuard
+// discipline). No block I/O and no other lock is ever held across it.
+
+/// U6x: grantees per owned file. Bounded; a full grant list is `-ENOSPC` on SYS_FGRANT.
+const NFGRANT: usize = 4;
+
+/// U6x: one grant edge on an owned file — a principal `(slot, gen)` and the rights it was granted. An EMPTY
+/// slot has `rights == 0` (a real grant always carries >= 1 of CAP_READ|CAP_WRITE), so `rights == 0` doubles as
+/// the free marker and disambiguates the raw slot 0 (a valid slot).
+#[derive(Clone, Copy)]
+struct FileGrant {
+    slot: u32,
+    slot_gen: u64, // the grantee's SLOT_GEN captured at grant time — the recycle fence
+    rights: u32,
+}
+
+impl FileGrant {
+    const EMPTY: Self = FileGrant { slot: 0, slot_gen: 0, rights: 0 };
+}
+
+/// U6x: one created file's ACL, indexed DIRECTLY by name-id. `owner_slot` is `+1`-biased (`0` == no owner ==
+/// PUBLIC; slot 0 is a valid slot, so the bias disambiguates it). Guarded by `OWNED_FILES` — plain `Copy`
+/// integers, the lock provides mutual exclusion.
+#[derive(Clone, Copy)]
+struct OwnedFile {
+    owner_slot: u32, // +1-biased: 0 == public (no owner), else owner is (owner_slot - 1)
+    owner_gen: u64,
+    grants: [FileGrant; NFGRANT],
+}
+
+impl OwnedFile {
+    const EMPTY: Self = OwnedFile { owner_slot: 0, owner_gen: 0, grants: [FileGrant::EMPTY; NFGRANT] };
+}
+
+/// U6x: the owner/grants table, one row per creatable name (`N_U10_NAMES`). Indexed directly by name-id.
+static OWNED_FILES: SpinMutex<[OwnedFile; N_U10_NAMES]> =
+    SpinMutex::new([OwnedFile::EMPTY; N_U10_NAMES]);
+
+/// U6x: record `(owner_slot, owner_gen)` as the OWNER of `nameid` — called at the O_CREAT of a NEW private name.
+/// OVERWRITES any prior row (defensive against a recycled name whose old owner row was not yet cleared) and
+/// resets the grant list. Infallible (a direct index — no bounded-table "full" case).
+fn owned_set_owner(nameid: usize, owner_slot: usize, owner_gen: u64) {
+    if nameid >= N_U10_NAMES {
+        return;
+    }
+    crate::arch::without_interrupts(|| {
+        let mut t = OWNED_FILES.lock();
+        t[nameid] = OwnedFile {
+            owner_slot: (owner_slot + 1) as u32,
+            owner_gen,
+            grants: [FileGrant::EMPTY; NFGRANT],
+        };
+    });
+}
+
+/// U6x: the ACL verdict for a caller opening an EXISTING created file. `true` = ALLOW: PUBLIC (no owner row),
+/// the caller IS the owner (gen-matched — full authority), or it holds a grant whose rights COVER the requested
+/// access (`requested ⊆ granted`, gen-fenced). `false` = DENY (-EACCES). `requested` is CAP_READ, or
+/// CAP_READ|CAP_WRITE for an RW/O_CREAT open.
+fn owned_access_ok(nameid: usize, slot: usize, caller_gen: u64, requested: u32) -> bool {
+    if nameid >= N_U10_NAMES {
+        return true; // unknown name-id -> no ACL (public)
+    }
+    crate::arch::without_interrupts(|| {
+        let t = OWNED_FILES.lock();
+        let row = t[nameid];
+        let Some(owner) = (row.owner_slot as usize).checked_sub(1) else {
+            return true; // no owner -> PUBLIC
+        };
+        if owner == slot && row.owner_gen == caller_gen {
+            return true; // owner: full authority
+        }
+        for g in row.grants.iter() {
+            if g.rights != 0 && g.slot as usize == slot && g.slot_gen == caller_gen {
+                return (requested & !g.rights) == 0; // granted iff the request is a subset
+            }
+        }
+        false // owned, and the caller is neither owner nor a sufficiently-granted principal
+    })
+}
+
+/// U6x: is `(slot, gen)` the CURRENT owner of `nameid`? `false` for a public/unknown file. `sys_fgrant` refuses
+/// a non-owner FAST via this — before resolving (and thus leaking the validity of) the named grantee handle.
+fn owned_is_owner(nameid: usize, slot: usize, caller_gen: u64) -> bool {
+    if nameid >= N_U10_NAMES {
+        return false;
+    }
+    crate::arch::without_interrupts(|| {
+        let t = OWNED_FILES.lock();
+        let row = t[nameid];
+        match (row.owner_slot as usize).checked_sub(1) {
+            Some(owner) => owner == slot && row.owner_gen == caller_gen,
+            None => false,
+        }
+    })
+}
+
+/// U6x: may `(slot, gen)` UNLINK `nameid`? DELETE is an OWNER-only authority, distinct from content write: an
+/// OWNED file may be unlinked ONLY by its current owner — a CAP_WRITE grantee gets content read/write, NEVER
+/// delete (else it could `unlink` + `O_CREAT` the name to STEAL ownership and lock the real owner out — the F1
+/// class). A PUBLIC file (no owner row) keeps the pre-U6x behaviour: any CAP_WRITE handle may unlink it.
+fn owned_unlink_permitted(nameid: usize, slot: usize, caller_gen: u64) -> bool {
+    if nameid >= N_U10_NAMES {
+        return true;
+    }
+    crate::arch::without_interrupts(|| {
+        let t = OWNED_FILES.lock();
+        let row = t[nameid];
+        match (row.owner_slot as usize).checked_sub(1) {
+            Some(owner) => owner == slot && row.owner_gen == caller_gen, // owned -> owner-only
+            None => true,                                                // public -> pre-U6x CAP_WRITE gate
+        }
+    })
+}
+
+/// U6x: is `nameid` PUBLIC (no owner row)? The launcher's verdict uses it to prove ownership reverted after the
+/// unlink + last close (the pi4 C2 twin).
+fn owned_is_public(nameid: usize) -> bool {
+    if nameid >= N_U10_NAMES {
+        return true;
+    }
+    crate::arch::without_interrupts(|| OWNED_FILES.lock()[nameid].owner_slot == 0)
+}
+
+/// U6x: drop `nameid`'s owner/grants row — called at SYS_UNLINK (the name is gone; a later O_CREAT re-create
+/// sets its OWN owner). Idempotent no-op if the file was public.
+fn owned_clear(nameid: usize) {
+    if nameid >= N_U10_NAMES {
+        return;
+    }
+    crate::arch::without_interrupts(|| {
+        OWNED_FILES.lock()[nameid] = OwnedFile::EMPTY;
+    });
+}
+
+/// U6x: at the teardown of `slot`, drop every file it OWNS (revert to PUBLIC — no persistent principal keeps
+/// owning it, and the slot's next tenant is a DIFFERENT process) and sweep any GRANT naming `slot` (a grantee
+/// that exited). Matches on the slot irrespective of gen — the whole address space is being torn down. Called
+/// from `clear_handle_row`; keeps the table self-cleaning across create/exit cycles. (The gen fence already
+/// makes an unswept stale entry harmless — this is hygiene + the owner-exit-reverts-to-public rule.)
+fn owned_clear_owner_slot(slot: usize) {
+    crate::arch::without_interrupts(|| {
+        let mut t = OWNED_FILES.lock();
+        for row in t.iter_mut() {
+            if (row.owner_slot as usize).checked_sub(1) == Some(slot) {
+                *row = OwnedFile::EMPTY;
+            } else {
+                for g in row.grants.iter_mut() {
+                    if g.rights != 0 && g.slot as usize == slot {
+                        *g = FileGrant::EMPTY;
+                    }
+                }
+            }
+        }
+    });
+}
+
+/// U6x: SYS_FGRANT's table half. Verify `nameid` is owned by `(owner_slot, owner_gen)`, then add/update a grant
+/// for `(grantee_slot, grantee_gen)` with `rights` (a CAP_READ|CAP_WRITE subset), or REMOVE it when
+/// `rights == 0`. Returns `0`, or `-EACCES` (public/nonexistent file, or the caller is not its current owner) /
+/// `-ENOSPC` (the bounded grant list is full — add path only). Reclaims a gen-STALE grant slot when claiming.
+/// Only the current owner may mutate the ACL — checked here, so a non-owner is refused BEFORE any effect.
+fn owned_grant(
+    nameid: usize,
+    owner_slot: usize,
+    owner_gen: u64,
+    grantee_slot: usize,
+    grantee_gen: u64,
+    rights: u32,
+) -> i64 {
+    if nameid >= N_U10_NAMES {
+        return EACCES;
+    }
+    crate::arch::without_interrupts(|| {
+        let mut t = OWNED_FILES.lock();
+        let row = &mut t[nameid];
+        // Only the file's CURRENT owner (gen-matched) may grant or revoke.
+        if (row.owner_slot as usize).checked_sub(1) != Some(owner_slot) || row.owner_gen != owner_gen {
+            return EACCES;
+        }
+        // REVOKE (rights == 0): drop any existing grant for this grantee incarnation. Future opens deny; a
+        // handle the grantee ALREADY holds is unaffected (the ACL gates ACQUISITION, not held caps).
+        if rights == 0 {
+            for g in row.grants.iter_mut() {
+                if g.rights != 0 && g.slot as usize == grantee_slot && g.slot_gen == grantee_gen {
+                    *g = FileGrant::EMPTY;
+                }
+            }
+            return 0;
+        }
+        // GRANT/UPDATE: update an existing grant for this grantee in place.
+        for g in row.grants.iter_mut() {
+            if g.rights != 0 && g.slot as usize == grantee_slot && g.slot_gen == grantee_gen {
+                g.rights = rights;
+                return 0;
+            }
+        }
+        // Otherwise claim a free slot — or reclaim a gen-stale one (a grantee whose slot was recycled).
+        for g in row.grants.iter_mut() {
+            let stale =
+                g.rights != 0 && SLOT_GEN[g.slot as usize].load(Ordering::Acquire) != g.slot_gen;
+            if g.rights == 0 || stale {
+                *g = FileGrant { slot: grantee_slot as u32, slot_gen: grantee_gen, rights };
+                return 0;
+            }
+        }
+        ENOSPC // the file's grant list is full
+    })
+}
+
 /// U9x M2: mark descriptor `[row][idx]` dirty and cover [lo, hi) in its dirty range. On the FIRST write
 /// (`FILE_DIRTY` false->true) SET [LO,HI) fresh to exactly [lo,hi); on later writes WIDEN by min/max — so the
 /// first write never starts the flushed span at offset 0 (which would RMW an un-dirtied sector). Single-writer
@@ -3688,7 +4334,7 @@ const U10OP_CREATE_GROW_DELETE: u32 = 3;
 /// The U10 demo file names — the single source of truth an op's `U10_NAMEID` indexes, so the drain re-resolves
 /// the on-disk directory entry by the SAME name the fixture named (`find_located`). GROW.BIN is also a staged
 /// file (idx `GROW_STAGED_IDX`); FRESH.BIN/DELME.BIN/DEFER.BIN are runtime-created (never staged).
-const U10_NAMES: [&str; 4] = [U10_GROW_NAME, U10C_NAME, U10D_NAME, U11M2_NAME];
+const U10_NAMES: [&str; 5] = [U10_GROW_NAME, U10C_NAME, U10D_NAME, U11M2_NAME, U6GX_NAME];
 /// The count of `U10_NAMES` — the width of the per-row `DYN_DELETED` overlay.
 const N_U10_NAMES: usize = U10_NAMES.len();
 static U10_USED: [AtomicBool; NU10] = [const { AtomicBool::new(false) }; NU10];
@@ -4265,15 +4911,24 @@ fn sys_open_dynamic(row: usize, name: &str, mode: u64) -> i64 {
             return if create { EBUSY } else { ENOENT };
         }
         // A live created file in ANY private row -> open ANOTHER descriptor to it (idempotent 2nd create / a
-        // same-row sibling / the U11x M2 CROSS-PROCESS open).
+        // same-row sibling / the U11x M2 CROSS-PROCESS open). U6x: the by-NAME ACL gate — an open of an EXISTING
+        // owned file is admitted only for the owner or a sufficiently-granted principal (public files pass). The
+        // requested rights follow the open mode (RW or O_CREAT -> R|W; else R); a denial is a clean -EACCES with
+        // nothing claimed. The gen fence is the caller's CURRENT SLOT_GEN.
         if let Some((srcrow, existing)) = created_desc_any_row(row, nameid) {
-            return open_created_sibling(row, srcrow, existing);
+            let requested = if mode & 1 != 0 || create { CAP_READ | CAP_WRITE } else { CAP_READ };
+            let caller_gen = SLOT_GEN[row].load(Ordering::Acquire);
+            if !owned_access_ok(nameid as usize, row, caller_gen, requested) {
+                return EACCES;
+            }
+            return open_created_sibling(row, srcrow, existing, requested);
         }
     }
-    // O_CREAT of a creatable name -> a fresh 0-length created file (the first write grows it).
+    // O_CREAT of a creatable name -> a fresh 0-length created file (the first write grows it). U6x: owned-by-
+    // default unless O_PUBLIC (opt out into world-access).
     if create {
         if let Some(nameid) = u10_creatable_nameid(name) {
-            return open_create_new(row, nameid);
+            return open_create_new(row, nameid, mode & O_PUBLIC != 0);
         }
     }
     ENOENT
@@ -4284,9 +4939,9 @@ fn sys_open_dynamic(row: usize, name: &str, mode: u64) -> i64 {
 /// drain). Marks the descriptor CREATED + stamps its `FILE_OPNAME` so the grow branch fires and teardown enqueues
 /// a `CreateGrow` op naming THIS file. Rights `CAP_READ | CAP_WRITE` (O_CREAT implies write). Errnos as the
 /// staged path: `-EMFILE` (no writable slot / FILES row full), `-EAGAIN` (handle table full).
-fn open_create_new(row: usize, nameid: u32) -> i64 {
+fn open_create_new(row: usize, nameid: u32, public: bool) -> i64 {
     // U11x M2 defense in depth: `sys_open_dynamic` already refuses a delete-pending name up front, but this
-    // function is also callable directly (the u11m2 launcher) — enforce the invariant AT the create so no
+    // function is also callable directly (the u11m2 / u6x launchers) — enforce the invariant AT the create so no
     // caller can mint a second live file under a name whose delete has not completed.
     if (nameid as usize) < N_U10_NAMES && DYN_DELETED_G[nameid as usize].load(Ordering::Acquire) {
         return EBUSY;
@@ -4300,6 +4955,13 @@ fn open_create_new(row: usize, nameid: u32) -> i64 {
     };
     FILE_CREATED[row][fid].store(true, Ordering::Release);
     FILE_OPNAME[row][fid].store(nameid + 1, Ordering::Release);
+    // U6x: owned-by-default — a PRIVATE create records the creator (this row, fenced by its current SLOT_GEN) as
+    // the OWNER; O_PUBLIC keeps the pre-U6x open-by-anyone behaviour (no owner row). Recorded before the handle
+    // install; direct-index, so it cannot fail (no fail-closed unwind). A created file is always on a private row
+    // (SHARED_ROW is refused at `sys_open_dynamic`), so slot 0..USER_SLOTS is a valid gen-fenced owner.
+    if !public {
+        owned_set_owner(nameid as usize, row, SLOT_GEN[row].load(Ordering::Acquire));
+    }
     // U11x M2: incref AFTER the created identity is stamped and BEFORE `install_file_handle` — its EAGAIN unwind
     // routes through `files_free`, which decrefs by that identity, so every failure path pairs exactly once (an
     // incref after the install would leave the unwind decrementing an un-incremented count: underflow).
@@ -4316,7 +4978,7 @@ fn open_create_new(row: usize, nameid: u32) -> i64 {
 /// (NU10 == 1 overflow) — siblings are read-only in the demos (same ledger entry). Same CREATED identity
 /// (`FILE_OPNAME` name-id) so `sys_unlink` invalidates every sibling of the file in the unlinking row, and the
 /// U11x M2 global refcount counts this open (incref before `install_file_handle` — the unwind-pairing rule).
-fn open_created_sibling(row: usize, srcrow: usize, existing: usize) -> i64 {
+fn open_created_sibling(row: usize, srcrow: usize, existing: usize, rights: u32) -> i64 {
     let seed: &[u8] = match (FILE_WSTAGE[srcrow][existing].load(Ordering::Acquire) as usize).checked_sub(1) {
         Some(ew) => wstage_bytes(ew),
         None => &[],
@@ -4335,7 +4997,11 @@ fn open_created_sibling(row: usize, srcrow: usize, existing: usize) -> i64 {
     if let Some(nameid) = (opname as usize).checked_sub(1) {
         openf_incref(nameid);
     }
-    install_file_handle(row, fid, CAP_READ | CAP_WRITE)
+    // U6x: install exactly the ACL-vetted rights the open mode asked for — an RW open (owner, or a WRITE
+    // grantee) gets CAP_READ|CAP_WRITE; an RO open (a READ-only grantee) gets CAP_READ. The `sys_open_dynamic`
+    // ACL already proved `rights ⊆ granted`, so this never amplifies. (Pre-U6x callers all opened RW, so the
+    // common path is byte-identical.)
+    install_file_handle(row, fid, rights)
 }
 
 /// SYS_OPEN(name_ptr, name_len, mode) -> a handle index, or a negative errno. The FIRST resource-OPEN through
@@ -5586,6 +6252,13 @@ pub fn clear_handle_row(slot: usize) {
         let _ =
             XFER_REC_SENDER[r].compare_exchange(slot as u64, u64::MAX, Ordering::AcqRel, Ordering::Acquire);
     }
+    // U6x: revert every file this slot OWNS to PUBLIC and sweep any grant naming it (a grantee that exited) — an
+    // owner's authority is boot- and lifetime-scoped (no persistent principal), so its files revert when it tears
+    // down. SLOT_GEN was bumped at the top, so the gen fence already makes any unswept stale entry harmless; this
+    // keeps the bounded table self-cleaning and enforces the owner-exit-reverts-to-public rule. Before
+    // `clear_files_row` (the open-descriptor decrefs) — order-independent (a separate lock), placed here for
+    // adjacency with the file teardown (the aarch64 `owned_clear_owner_asid` twin).
+    owned_clear_owner_slot(slot);
     // U6bx: the slot's open-FILE row rides the same teardown (handles first, so no File handle can name a
     // descriptor this wipe has already freed) — covers both the exit and the fault-kill path, exactly like
     // the handles (the aarch64 `clear_handle_row` -> `clear_files_row` twin).
@@ -6149,6 +6822,32 @@ static U11M2_WITNESS: AtomicU32 = AtomicU32::new(0);
 static U11M2_DONE: AtomicU32 = AtomicU32::new(0);
 /// A killed U11x M2 fixture — a real bug (register-only apart from its read-back dest store). Off the U1b counter.
 static U11M2_KILLED: AtomicU32 = AtomicU32::new(0);
+
+/// U6x: the OWNER fixture's full witness — bit0 create PRIVATE + write; bit1 grant B R|W -> 0; bit2 revoke -> 0;
+/// bit3 owner re-open after revoke; bit4 owner unlink while B holds open -> 0 (deferred); bit5 O_CREAT re-create
+/// -> -EBUSY. Must match `add r12, {1,2,4,8,16,32}` in `unaos_user_u6gx_owner`.
+const U6GX_OWNER_ALL: u32 = 0x3F;
+/// U6x: the GRANTEE fixture's full witness — bit0 pre-grant open -> -EACCES; bit1 granted RW open + read-back
+/// matches; bit2 non-owner SYS_FGRANT -> -EACCES; bit3 grantee SYS_UNLINK -> -EACCES (F1); bit4 post-revoke open
+/// -> -EACCES. Must match `add r12, {1,2,4,8,16}` in `unaos_user_u6gx_grantee`.
+const U6GX_GRANTEE_ALL: u32 = 0x1F;
+/// U6x: the OWNER / GRANTEE fixtures' final witness bitmasks (their `sys_exit` status, routed by name — the
+/// u5x/u7x idiom; x86 has no SYS_REPORT).
+static U6GX_OWNER_WITNESS: AtomicU32 = AtomicU32::new(0);
+static U6GX_GRANTEE_WITNESS: AtomicU32 = AtomicU32::new(0);
+/// U6x: a COUNT of the two fixtures' witness exits (the launcher gates its read on `>= 2`).
+static U6GX_DONE: AtomicU32 = AtomicU32::new(0);
+/// U6x: a killed owner/grantee fixture — a real bug (register-only apart from the grantee's read-back store).
+static U6GX_KILLED: AtomicU32 = AtomicU32::new(0);
+/// U6x: the pre-endowed handle index in A's table where the launcher plants a `Child` handle naming B — so A's
+/// SYS_FGRANT is owner-scoped (A never names B by a raw pid). Distinct from `CONSOLE_FD` (1) and A's dynamic
+/// File handles (0, then 3).
+const U6GX_CHILD_IDX: usize = 2;
+/// U6x: the per-slot GO word (launcher -> fixture: the next step it may proceed to) and SIG word (fixture ->
+/// launcher: the last step it completed), planted at fixed offsets in each fixture's OWN window (a writable data
+/// page, beyond the RX-RO code page). Read/written by the launcher through `slot_backing_ptr`.
+const U6GX_GO_OFF: usize = 0x3800;
+const U6GX_SIG_OFF: usize = 0x3808;
 
 /// U4x fixture run parameters: the parent's + orphan's ring-3 entry VAs (both inside the shared window
 /// VA — only the slot FRAME differs, via CR3), the shared initial user rsp, and each fixture's slot
@@ -8300,7 +8999,9 @@ fn u11m2_phase(srow: usize, demo_cpu: usize, via_teardown: bool, want_done: u32)
     // "Process S": create DEFER.BIN on the scratch row through the PRODUCT open path, then write the pattern
     // into its wstage (the launcher stands in for the pi4 fixture A; opens/writes complete strictly BEFORE the
     // fixture spawns, so the cross-row snapshot-copy hazard cannot fire in the demo).
-    let h = open_create_new(srow, nameid as u32);
+    // U6x: DEFER.BIN is created PUBLIC — the cross-process `u11m2-unlink` fixture (a DIFFERENT row) opens it by
+    // name, so it must be world-accessible (the pi4 `DEFER.BIN` O_PUBLIC twin). This keeps U11x M2 byte-identical.
+    let h = open_create_new(srow, nameid as u32, true);
     if h < 0 {
         serial_println!(":: U11m2({}): scratch-row create failed ({}) ::", phase, h);
         return false;
@@ -8460,6 +9161,185 @@ fn u11m2_launcher(demo_cpu: usize) {
         }
     } else {
         serial_println!(":: U11m2: cross-process unlink-defers-free FAIL — p1={} p2={} ::", p1, p2);
+    }
+    // U6x: chain the owner/grants ACL demo (program order, the u9x->..->u11m2 idiom; the LAST demo in the chain).
+    u6gx_launcher(demo_cpu);
+}
+
+/// Build a U6x fixture slot at a given entry symbol — the `u7x_build`/`u11m2_build` shape (allocate a private
+/// address space, scrub the WHOLE window, copy the shared blob into the RX-RO code page through the identity
+/// alias, and return the run params for `entry_sym`). `None` if slot allocation fails.
+fn u6gx_build(entry_sym: *const u8) -> Option<U7xFix> {
+    let slot = crate::arch::memory::alloc_user_space()?;
+    let bstart = &raw const unaos_user_u6gx_blob_start as usize;
+    let bend = &raw const unaos_user_u6gx_blob_end as usize;
+    let blen = bend - bstart;
+    assert!(blen as u64 <= PAGE_SIZE, "U6x blob does not fit in a code page");
+    let off = (entry_sym as usize - bstart) as u64;
+    let backing = crate::arch::memory::slot_backing_ptr(slot);
+    unsafe {
+        core::ptr::write_bytes(backing, 0, (USER_WINDOW_PAGES * PAGE_SIZE) as usize);
+        core::ptr::copy_nonoverlapping(bstart as *const u8, backing, blen);
+    }
+    Some(U7xFix {
+        entry: USER_BASE + off,
+        sp: USER_BASE + USER_WINDOW_PAGES * PAGE_SIZE - 16,
+        cr3: crate::arch::memory::slot_cr3(slot),
+        slot,
+    })
+}
+
+/// U6x: set fixture `slot`'s GO word (launcher -> fixture: the next step it may proceed past) through the slot
+/// backing (the fixture polls the same VA in its window).
+fn u6gx_set_go(slot: usize, step: u64) {
+    let p = unsafe { crate::arch::memory::slot_backing_ptr(slot).add(U6GX_GO_OFF) as *mut u64 };
+    unsafe { core::ptr::write_volatile(p, step) };
+}
+
+/// U6x: read fixture `slot`'s SIG word (fixture -> launcher: the last step it completed).
+fn u6gx_get_sig(slot: usize) -> u64 {
+    let p = unsafe { crate::arch::memory::slot_backing_ptr(slot).add(U6GX_SIG_OFF) as *const u64 };
+    unsafe { core::ptr::read_volatile(p) }
+}
+
+/// U6x: wait (bounded, yielding) until fixture `slot`'s SIG word reaches `step`. Returns false on timeout (a
+/// wedged fixture — the verdict then FAILs honestly on the witness), so the launcher never hangs the boot.
+fn u6gx_wait_sig(slot: usize, step: u64) -> bool {
+    let deadline = crate::arch::ticks() + 5000;
+    while u6gx_get_sig(slot) < step && crate::arch::ticks() < deadline {
+        crate::arch::sched::yield_now();
+    }
+    u6gx_get_sig(slot) >= step
+}
+
+/// U6x launcher + verdict — UnaFS owner/grants, the x86 twin of the reviewed aarch64 U6 (owned-by-default at
+/// SYS_OPEN + SYS_FGRANT delegation + F1 owner-only unlink), folding pi4's post-hoc F1 fix from the start and
+/// asserting the U11x M2 combined path (owner unlink while a grantee holds open -> deferred; re-create -EBUSY;
+/// ownership dies at the last close). Two EL0 processes A (owner) + B (grantee) on their own cores (cooperative
+/// ring 3 hogs its core, so — like U7x — each needs a dedicated AP; the launcher on a third), choreographed with
+/// per-slot GO/SIG words. Chained off `u11m2_launcher` (LAST in the demo chain). Needs 3 online APs + storage;
+/// fewer skips cleanly. Every path releases both slots + B's Proc entry before returning (no strand).
+fn u6gx_launcher(_demo_cpu: usize) {
+    static DONE: AtomicBool = AtomicBool::new(false);
+    if DONE.swap(true, Ordering::Relaxed) {
+        return;
+    }
+    if crate::drivers::block::info().is_none() {
+        return; // keep the no-storage control path free of demo lines (mirrors every prior gate)
+    }
+    let nameid = match u10_name_id(U6GX_NAME) {
+        Some(id) => id as usize,
+        None => return,
+    };
+    // A dedicated core each for A and B (distinct from `demo_cpu` and this launcher): a polling ring-3 fixture
+    // hogs its core, so co-locating would deadlock the GO/SIG sequencing (the u7x structural divergence).
+    let online = crate::arch::smp::online_aps();
+    let (Some(&cpu_a), Some(&cpu_b)) = (online.first(), online.get(2)) else {
+        serial_println!(":: U6gx: fewer than 3 application processors — owner/grants demo skipped ::");
+        return;
+    };
+    // B's Proc entry FIRST (A's Child handle -> B resolves pid->slot in SYS_FGRANT); nothing else claimed on fail.
+    let Some(pi) = proc_reserve() else {
+        serial_println!(":: U6gx: no free process entry — owner/grants demo skipped ::");
+        return;
+    };
+    // Build + spawn B (the grantee); it parks on its GO word immediately, so it populates nothing pre-grant.
+    let Some(b) = u6gx_build(&raw const unaos_user_u6gx_grantee) else {
+        serial_println!(":: U6gx: no free address-space slot (B) — owner/grants demo skipped ::");
+        proc_free(pi);
+        return;
+    };
+    U6GX_OWNER_WITNESS.store(0, Ordering::Release);
+    U6GX_GRANTEE_WITNESS.store(0, Ordering::Release);
+    let b_pid = crate::arch::sched::spawn_user_in_space("u6gx-grantee", b.entry, b.sp, cpu_b, b.cr3);
+    PROCS[pi].slot.store(b.slot + 1, Ordering::Release); // slot first, then the live pid (the sys_spawn discipline)
+    PROCS[pi].pid.store(b_pid, Ordering::Release);
+    // Build + pre-endow + spawn A (the owner). Pre-endow A with a Child handle naming B (owner-scoped SYS_FGRANT).
+    let Some(a) = u6gx_build(&raw const unaos_user_u6gx_owner) else {
+        serial_println!(":: U6gx: no free address-space slot (A) — owner/grants demo skipped (B parks out) ::");
+        proc_free(pi);
+        return;
+    };
+    debug_assert!(a.slot != b.slot, "u6x: A and B landed on the same slot");
+    install_cap(a.slot, U6GX_CHILD_IDX, KIND_CHILD, b_pid, CAP_READ);
+    serial_println!(
+        ":: U6gx: UnaFS owner/grants — the by-NAME ACL at SYS_OPEN (owned-by-default) + SYS_FGRANT delegation + F1 owner-only unlink (aarch64 U6 twin) ::"
+    );
+    crate::arch::sched::spawn_user_in_space("u6gx-owner", a.entry, a.sp, cpu_a, a.cr3);
+
+    // The choreography (single GO/SIG per slot): A creates -> B pre-grant deny -> A grants -> B granted open +
+    // negatives (keeps its handle open) -> A revokes -> B post-revoke deny -> A reopen+unlink(deferred)+EBUSY ->
+    // B closes (releases). Each `wait_sig` returns false on timeout, short-circuiting to the verdict (which FAILs).
+    let seq_ok = u6gx_wait_sig(a.slot, 1) && {
+        u6gx_set_go(b.slot, 1);
+        u6gx_wait_sig(b.slot, 1)
+    } && {
+        u6gx_set_go(a.slot, 1);
+        u6gx_wait_sig(a.slot, 2)
+    } && {
+        u6gx_set_go(b.slot, 2);
+        u6gx_wait_sig(b.slot, 2)
+    } && {
+        u6gx_set_go(a.slot, 2);
+        u6gx_wait_sig(a.slot, 3)
+    } && {
+        u6gx_set_go(b.slot, 3);
+        u6gx_wait_sig(b.slot, 3)
+    } && {
+        u6gx_set_go(a.slot, 3);
+        u6gx_wait_sig(a.slot, 4) // A finished (reopen + deferred unlink + EBUSY), about to exit
+    } && {
+        u6gx_set_go(b.slot, 4); // release B's final close (which releases A's deferred delete)
+        true
+    };
+
+    // Wait (bounded) for both witness exits, then snapshot the witnesses + kill count.
+    let vdeadline = crate::arch::ticks() + 8000;
+    while U6GX_DONE.load(Ordering::Acquire) < 2 && crate::arch::ticks() < vdeadline {
+        crate::arch::sched::yield_now();
+    }
+    let ow = U6GX_OWNER_WITNESS.load(Ordering::Acquire);
+    let gw = U6GX_GRANTEE_WITNESS.load(Ordering::Acquire);
+    let killed = U6GX_KILLED.load(Ordering::Acquire);
+
+    // Teardown proof: both fixtures exited holding no live descriptors (A unlinked; B closed), so both rows +
+    // handle rows cleared. Poll bounded; false->true.
+    let tdeadline = crate::arch::ticks() + 3000;
+    let both_clear = |a: usize, b: usize| {
+        files_row_is_clear(a) && handle_row_is_clear(a) && files_row_is_clear(b) && handle_row_is_clear(b)
+    };
+    while !both_clear(a.slot, b.slot) && crate::arch::ticks() < tdeadline {
+        crate::arch::sched::yield_now();
+    }
+    let cleared = both_clear(a.slot, b.slot);
+
+    // C — ownership DIED at B's last close: the global open count is 0 and the file is unlink-PENDING no more. On
+    // the disk path the released delete op is now DRAINABLE — drain it at IF=1 (the queue holds exactly A's
+    // OWNED.BIN delete) so nothing strands; on the no-FAT path the last close already cleared DYN_DELETED_G.
+    // Either way the name is re-creatable again and the owner/grants row is EMPTY (public).
+    let disk_present = HELLO_STAGED.load(Ordering::Acquire);
+    if disk_present {
+        if let Ok(fs) = crate::fs::fat::mount() {
+            while u10_flush_drain_one(&fs).is_some() {}
+        }
+    }
+    let released = OPENF_REFS[nameid].load(Ordering::Acquire) == 0
+        && !OPENF_PENDING[nameid].load(Ordering::Acquire)
+        && !DYN_DELETED_G[nameid].load(Ordering::Acquire)
+        && owned_is_public(nameid);
+
+    proc_free(pi); // drop the planted pid->slot entry (the fixtures exited by name, not via the Proc path)
+
+    if seq_ok && ow == U6GX_OWNER_ALL && gw == U6GX_GRANTEE_ALL && killed == 0 && cleared && released {
+        serial_println!(
+            ":: U6gx: UnaFS owner/grants — non-owner open -EACCES, owner grant admits R|W (content crossed), non-owner grant -EACCES, grantee unlink -EACCES (delete owner-only), revoke re-denies, owner unlink defers while grantee holds + re-create -EBUSY, ownership dies at last close -> PASS ::"
+        );
+    } else {
+        serial_println!(
+            ":: U6gx: UnaFS owner/grants FAIL — seq={} owner={:#x} grantee={:#x} killed={} cleared={} released={} done={} (want true/{:#x}/{:#x}/0/true/true/2) ::",
+            seq_ok, ow, gw, killed, cleared, released, U6GX_DONE.load(Ordering::Acquire),
+            U6GX_OWNER_ALL, U6GX_GRANTEE_ALL,
+        );
     }
 }
 

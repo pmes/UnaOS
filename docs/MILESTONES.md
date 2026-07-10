@@ -10,6 +10,38 @@ Legend: **✅ metal-confirmed** · **🔬 QEMU-green, metal pending** · dates I
 
 ---
 
+## hw-rmbp track — 2026-07-10 (U6gx — UnaFS owner/grants ACL, the x86 twin of pi4 U6, Opus-executed)
+
+### U6gx — UnaFS owner/grants: by-name ACL at SYS_OPEN + SYS_FGRANT delegation + F1 owner-only unlink (x86) 🔬 `hw-rmbp`
+- **What:** the x86 twin of the aarch64 U6 owner/grants ACL — closes the U11x M2 ledger anchor
+  (cross-process open/unlink of a created file was GRANT-FREE on x86). Secure-by-DEFAULT: an
+  `O_CREAT` of a NEW name records the creator as OWNER (PRIVATE); the new `O_PUBLIC` mode bit
+  opts out to world-access. An open of an existing owned file is admitted only for the owner or a
+  principal the owner `SYS_FGRANT`ed (a `CAP_READ|CAP_WRITE` subset), else `-EACCES`; a file with
+  no owner row (a STAGED file / an `O_PUBLIC` create / a torn-down owner) is PUBLIC (pre-U6gx
+  behaviour). **F1 folded from the start** (pi4 learned it post-hoc): `SYS_UNLINK` is OWNER-only
+  for an owned file, so a content grantee cannot `unlink`+`O_CREAT` to steal ownership.
+- **How (the x86 substitutions):** the ACL is keyed by the created file's `U10_NAMES` **name-id**
+  (a direct index, not pi4's `(dir_lba,dir_off)` — no recycled-key aliasing, no bounded-table
+  "full", so `owned_set_owner` is infallible with no fail-closed path); the PRINCIPAL is the
+  address-space SLOT fenced by `SLOT_GEN` (the `(ASID, ASID_GEN)` analogue). `OWNED_FILES` is a
+  `SpinMutex<[OwnedFile; N_U10_NAMES]>` taken IRQ-masked via `without_interrupts` (syscall + the
+  teardown path symmetric — the pi4 `IrqGuard` discipline); cleared at unlink + owner teardown
+  (`owned_clear_owner_slot` in `clear_handle_row`, reverting to public). `SYS_FGRANT = 18` names
+  the grantee OWNER-SCOPED by a `Child` handle (the `SYS_XFER` idiom); ownership is checked before
+  the grantee handle is resolved. Additive on `arch/x86_64/syscall.rs`; **zero aarch64 files**.
+- **Tested:** a two-process `u6gx_launcher` (owner A + grantee B on their own cores, GO/SIG
+  choreography) witnesses the full matrix incl. the U11x M2 combined path (owner unlink while B
+  holds open → deferred; re-create `-EBUSY`; ownership dies at B's last close): `:: U6gx: UnaFS
+  owner/grants — non-owner open -EACCES, owner grant admits R|W (content crossed), non-owner grant
+  -EACCES, grantee unlink -EACCES (delete owner-only), revoke re-denies, owner unlink defers while
+  grantee holds + re-create -EBUSY, ownership dies at last close -> PASS ::`. `./arroyo check` both
+  arches; `test 40`/`90` (in-memory core) 17 PASS + U6gx; `test-fat sf` + `p16` **22 PASS 0 FAIL**
+  each (21 priors byte-identical + U6gx; `grep 'PASS ::'` reads 21 — it misses U2-0a's `PASS (...)`
+  format); `UNAOS_NOSTORAGE=1 test 90` clean skip. Metal: pure syscall logic, storage-gated
+  (metal-pending like U8x/U11x — flash-and-watch at the next attended bench).
+- **Commit:** see `git log` (`hw-rmbp`).
+
 ## hw-pi4 track — 2026-07-10
 
 > **⭐ METAL BENCH (2026-07-10, attended — real Pi 4, Debug Probe serial):** the entire FAT-mutating
