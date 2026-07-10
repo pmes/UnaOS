@@ -17,8 +17,103 @@
 use alloc::vec::Vec;
 use alloc::string::String;
 use crate::console::Console;
+use crate::fs::fat::{DirEntry, FatError, FatFs};
 use crate::vug;
 use crate::pal::TargetPal;
+
+/// JD4: the shell's current working directory as a NORMALIZED, CANONICAL absolute path
+/// ("/" = root, else "/DIR/SUB" in the on-disk 8.3 spelling). A path string, not a cached
+/// cluster: every command re-resolves it from the root, so a swapped or remounted card can
+/// never leave the shell holding a stale chain head — the worst case is an honest `-ENOENT`.
+/// `None` means the root (no heap touched until the first `cd`).
+static CWD: spin::Mutex<Option<String>> = spin::Mutex::new(None);
+
+/// The current working directory as a display/join-ready absolute path.
+fn cwd_path() -> String {
+    CWD.lock().clone().unwrap_or_else(|| String::from("/"))
+}
+
+/// Join `arg` onto `base` and normalize lexically: absolute `arg` replaces `base`, `.` and empty
+/// components collapse, `..` pops (never above the root). Purely textual — resolution against the
+/// volume happens in [`resolve_path`].
+fn normalize_path(base: &str, arg: &str) -> String {
+    let mut comps: Vec<&str> = Vec::new();
+    let prefix = if arg.starts_with('/') { "" } else { base };
+    for part in prefix.split('/').chain(arg.split('/')) {
+        match part {
+            "" | "." => {}
+            ".." => {
+                comps.pop();
+            }
+            p => comps.push(p),
+        }
+    }
+    if comps.is_empty() {
+        return String::from("/");
+    }
+    let mut out = String::new();
+    for c in comps {
+        out.push('/');
+        out.push_str(c);
+    }
+    out
+}
+
+/// A resolved absolute path: the root itself, or a concrete directory entry (file or subdir)
+/// plus the CANONICAL absolute path it was found at (on-disk 8.3 spelling).
+enum Resolved {
+    Root,
+    Entry(DirEntry, String),
+}
+
+/// Walk a normalized absolute path from the root, component by component, via the read-only
+/// `FatFs::read_dir`. Case-insensitive 8.3 matching (short names are stored uppercase on disk).
+/// Errors carry the errno-style tag the caller prints — nothing is swallowed.
+fn resolve_path(fs: &FatFs, path: &str) -> Result<Resolved, String> {
+    let mut cluster = 0u32; // 0 = the root (read_dir's convention)
+    let mut cur: Option<(DirEntry, String)> = None;
+    let mut canon = String::new();
+    for comp in path.split('/').filter(|c| !c.is_empty()) {
+        if let Some((de, _)) = &cur {
+            if !de.is_dir {
+                return Err(alloc::format!("{}: not a directory (-ENOTDIR)", canon));
+            }
+            cluster = de.first_cluster();
+        }
+        let entries = fs
+            .read_dir(cluster)
+            .map_err(|e| alloc::format!("{}: read failed ({:?}, -EIO)", canon, e))?;
+        match entries.iter().find(|de| de.name().eq_ignore_ascii_case(comp)) {
+            Some(de) => {
+                canon.push('/');
+                canon.push_str(de.name());
+                cur = Some((*de, canon.clone()));
+            }
+            None => {
+                return Err(alloc::format!("{}/{}: not found (-ENOENT)", canon, comp));
+            }
+        }
+    }
+    Ok(match cur {
+        None => Resolved::Root,
+        Some((de, canon)) => Resolved::Entry(de, canon),
+    })
+}
+
+/// Print one directory's entries in the `ls` table format, with the file/dir tally.
+fn print_dir_listing(console: &mut Console, entries: &[DirEntry]) {
+    let (mut files, mut dirs) = (0u32, 0u32);
+    for de in entries {
+        if de.is_dir {
+            dirs += 1;
+            console.println(&alloc::format!("  <DIR>         {}", de.name()));
+        } else {
+            files += 1;
+            console.println(&alloc::format!("  {:>10}  {}", de.size, de.name()));
+        }
+    }
+    console.println(&alloc::format!("{} file(s), {} dir(s)", files, dirs));
+}
 
 pub struct History {
     entries: Vec<String>,
@@ -59,7 +154,7 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
         "help" => {
             console.println("COMMANDS: ver, help, clear, echo, panic, gneiss");
             console.println("STORAGE:  diskinfo, usbinfo, read <lba>, write <lba> <byte>");
-            console.println("FILES:    fatinfo (FAT geometry), ls, cat <name>");
+            console.println("FILES:    fatinfo (FAT geometry), ls [dir], cd [dir], pwd, cat <path>");
             console.println("SMP:      sched (per-CPU run queues)");
             console.println("TEST:     tste (in-OS self-test suite: boot-replay + live checks)");
             console.println("NETWORK:  netinfo, ping <ip> [count], arp <ip>");
@@ -101,32 +196,67 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
             }
         },
         "ls" | "dir" => {
+            // JD4: `ls` lists the cwd; `ls <dir>` any path (absolute or cwd-relative). An `ls` of
+            // a plain file prints its one table line (the DOS idiom), not an error.
+            let path = normalize_path(&cwd_path(), args.first().copied().unwrap_or("."));
             match crate::fs::fat::mount() {
-                Ok(fs) => match fs.read_root() {
-                    Ok(entries) => {
-                        let (mut files, mut dirs) = (0u32, 0u32);
-                        for de in &entries {
-                            if de.is_dir {
-                                dirs += 1;
-                                console.println(&alloc::format!("  <DIR>         {}", de.name()));
-                            } else {
-                                files += 1;
-                                console.println(&alloc::format!("  {:>10}  {}", de.size, de.name()));
+                Ok(fs) => match resolve_path(&fs, &path) {
+                    Ok(Resolved::Root) => match fs.read_dir(0) {
+                        Ok(entries) => print_dir_listing(console, &entries),
+                        Err(e) => console.println(&alloc::format!("ls: /: read failed ({:?}, -EIO)", e)),
+                    },
+                    Ok(Resolved::Entry(de, canon)) => {
+                        if de.is_dir {
+                            match fs.read_dir(de.first_cluster()) {
+                                Ok(entries) => print_dir_listing(console, &entries),
+                                Err(e) => console.println(&alloc::format!(
+                                    "ls: {}: read failed ({:?}, -EIO)", canon, e)),
                             }
+                        } else {
+                            console.println(&alloc::format!("  {:>10}  {}", de.size, de.name()));
                         }
-                        console.println(&alloc::format!("{} file(s), {} dir(s)", files, dirs));
                     }
-                    Err(e) => console.println(&alloc::format!("ls: {:?}", e)),
+                    Err(msg) => console.println(&alloc::format!("ls: {}", msg)),
                 },
                 Err(e) => console.println(&alloc::format!("ls: no FAT filesystem ({:?})", e)),
             }
         },
+        "cd" => {
+            // JD4: change the shell's working directory. No argument (or `/`) returns to the
+            // root. The stored cwd is the CANONICAL on-disk spelling of the resolved path.
+            let path = normalize_path(&cwd_path(), args.first().copied().unwrap_or("/"));
+            match crate::fs::fat::mount() {
+                Ok(fs) => match resolve_path(&fs, &path) {
+                    Ok(Resolved::Root) => {
+                        *CWD.lock() = None;
+                        console.println("/");
+                    }
+                    Ok(Resolved::Entry(de, canon)) => {
+                        if de.is_dir {
+                            console.println(&canon);
+                            *CWD.lock() = Some(canon);
+                        } else {
+                            console.println(&alloc::format!(
+                                "cd: {}: not a directory (-ENOTDIR)", canon));
+                        }
+                    }
+                    Err(msg) => console.println(&alloc::format!("cd: {}", msg)),
+                },
+                Err(e) => console.println(&alloc::format!("cd: no FAT filesystem ({:?})", e)),
+            }
+        },
+        "pwd" => {
+            console.println(&cwd_path());
+        },
         "cat" | "type" => {
+            // JD4: `cat` takes a path (absolute or cwd-relative), e.g. `cat DOCS/README.TXT`.
             match args.first() {
-                None => console.println("usage: cat <name>"),
+                None => console.println("usage: cat <path>"),
                 Some(name) => match crate::fs::fat::mount() {
-                    Ok(fs) => match fs.find_in_root(name) {
-                        Ok(de) => {
+                    Ok(fs) => match resolve_path(&fs, &normalize_path(&cwd_path(), name)) {
+                        Ok(Resolved::Root) =>
+                            console.println("cat: /: is a directory (-EISDIR)"),
+                        Ok(Resolved::Entry(de, canon)) => {
                             // Bound the read so a huge file (e.g. kernel.elf) can't flood the console.
                             const CAP: usize = 8192;
                             let mut data: Vec<u8> = Vec::new();
@@ -147,12 +277,12 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
                                             "[... {} of {} bytes shown]", data.len(), de.size));
                                     }
                                 }
-                                Err(crate::fs::fat::FatError::IsDirectory) =>
-                                    console.println(&alloc::format!("cat: {}: is a directory", name)),
-                                Err(e) => console.println(&alloc::format!("cat: {:?}", e)),
+                                Err(FatError::IsDirectory) => console.println(&alloc::format!(
+                                    "cat: {}: is a directory (-EISDIR)", canon)),
+                                Err(e) => console.println(&alloc::format!("cat: {}: {:?}", canon, e)),
                             }
                         }
-                        Err(_) => console.println(&alloc::format!("cat: {}: not found", name)),
+                        Err(msg) => console.println(&alloc::format!("cat: {}", msg)),
                     },
                     Err(e) => console.println(&alloc::format!("cat: no FAT filesystem ({:?})", e)),
                 },

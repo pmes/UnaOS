@@ -1737,6 +1737,73 @@ through to `no mass storage within the settle window; proceeding` (graceful, no 
 power-cycle brought the Alcor up cleanly. So the JD3 code path is solid; the residual variability is
 hub-MSC power/timing on the real reader (a direct-root USB stick sidesteps it entirely).
 
+### JD4 — read-side FAT navigation on the panel shell + the last dead-lever retirement + screen-on-boot (🔬 QEMU-green, metal pending)
+
+JD3 gave the panel shell a real disk but only a flat root: `ls` listed the root, `cat` took a bare
+root filename. JD4 is the READ-side navigation arc (the write path is deliberately deferred to a
+future JD5 — pi4's F3 namespace-lock arc is about to churn `fat.rs`, and a jetson write path would
+both collide with and want those locks), plus two leftovers the seat blessed: the dead JB2c/JB9b
+levers and JD2's screen-on-boot polish.
+
+**M1 — `ls <dir>` / `cd` / `pwd` / `cat <path>` (`5ca6e28`, arch-neutral).** One seat-granted,
+purely additive read helper in `fat.rs`: `pub fn read_dir(first_cluster)` — the public face of the
+existing `read_root`/`read_dir_chain` walkers; cluster `0` means the root (the value a
+subdirectory's `..` entry stores when its parent is the root, and the FAT16 fixed root's
+convention). Read-only, takes NO lock (F3 may revisit read-side locking); placed in the read
+section away from the mutation code F3 will churn; no existing line touched. Everything else is
+`shell.rs`: the cwd lives as a **normalized, canonical absolute path string** (`/DIR/SUB` in the
+on-disk 8.3 spelling; `None` = root, no heap until the first `cd`), **re-resolved from the root on
+every command** — a swapped or remounted card can never leave the shell holding a stale chain head;
+the worst case is an honest `-ENOENT`. `normalize_path` folds `.`/`..`/`//`/absolute joins
+lexically (`..` never climbs above root); `resolve_path` walks components via `read_dir` with
+case-insensitive 8.3 matching and returns errno-tagged errors that are always printed, never
+swallowed (`-ENOENT`, `-ENOTDIR`, `-EISDIR`, `-EIO`). `ls [dir]` lists the cwd or any
+absolute/relative path (an `ls` of a plain file prints its one table line — the DOS idiom);
+`cd [dir]` canonicalizes, verifies it is a directory, stores + echoes the canonical path (no arg =
+root); `pwd` prints it; `cat <path>` resolves a full path (`cat DOCS/README.TXT`) then reads via
+the unchanged bounded `read_file`. The shell stays arch-neutral — the same commands work on x86 and
+both aarch64 targets; LFN entries are skipped (short names only), exactly as before.
+
+**M2 — the dead JB2c/JB9b levers retired (`436d7ef`, behaviour-neutral).** The two lever groups
+JD3's M3 explicitly left ("JB9/JB2c-named, not JB3/4/5"): `jb2c_padctl_powerup` +
+`jb2c_usb2_trk_clk` (the pre-inherit pad re-power-up — on the JB9g/h inherit path the JB6 shim
+keeps UEFI from tearing the pads down, and the `main.rs` call was gated on `!JB9H_SKIP_CHAIN` =
+never) and `jb9b_ao_sid_fix` + `jb9b_accept_bypass_sid` (the SID-mismatch levers, dead behind the
+same inherit gate AND `JB9_PROBE=false`; JB9f proved the inherited fabric passes the FW's DMA
+as-is). Their orphaned private helpers went too: the padctl register consts + `pr32`/`pw32` +
+`poll_trk_completed` (`xusb_tegra.rs`), `CLK_USB2_TRK` (`bpmp_tegra.rs`), and the smmu `wr` +
+TLB-sync consts (`smmu_tegra.rs`). **KEPT, untouched:** the ⭐ JB9 recipe, BOTH
+firmware-destroying-lever compile-asserts (their guard consts survive to feed them), the read-only
+diagnostics, and the JB9 forensic kit. Net −313 lines; `JB2c`/`JB9b` strings verified absent from
+the linked elf. The pre-inherit pad-power-up recipe (Linux `tegra186_utmi_*_power_on` for tegra234)
+lives in the git record at JD3 and earlier if a non-inherit boot path ever returns.
+
+**M3 — screen-on-boot (`195ab88`, tegra-only).** JD2 held the fbcon boot log on the panel until a
+blind first keystroke. `jd2_console_pump`'s phase 1 is now bounded: the console takes the panel at
+the **first keystroke OR a ~8 s CNTPCT wall-clock deadline**, whichever comes first (free-running
+counter — the JD3 timerless mechanism; the post-drop EL1 core has no timer IRQ, so no tick-based
+wait is possible). 8 s is long past the CAPSTONE stragglers, so the takeover cannot race a late
+fbcon paint — the reason JD2 could not simply draw at task start (that would also have erased the
+JD1 boot-log demo). A keystroke inside the window keeps the exact JD2 behaviour (fed through, not
+swallowed); the timeout path draws the banner + prompt and logs
+`:: tegra: JD4 — console OWNS the panel … screen-on-boot (no key, ~8 s) ::`. Headless boots
+(WRITER unseeded) still delegate to `kbd_pump_body` — the JB2b serial evidence contract holds.
+
+**Gate (QEMU):** `./arroyo check` + `UNAOS_TEGRA=1 ./arroyo check` green both arches;
+`UNAOS_HUBSTORAGE=1 ./arroyo test 25` → `MISSION SUCCESS` (run because M1 touches the shared
+`shell.rs`/`fat.rs`); `./arroyo test-arm 22` → `MISSION SUCCESS`; `UNAOS_GICV3=1 ./arroyo test-arm
+40` → `CAPSTONE COMPLETE` 6/6; `esp-jetson kernel.elf` links, **108 `tegra:` strings** (the JD4
+count: −9 retired JB2c/JB9b lines +… net of the POLISH-1/2 merges the branch rebased onto; validate
+by count, not size — the elf is ~452 KB with the polish-era console/vug machinery linked).
+
+**⚠ Metal is the real verdict.** QEMU exercises the resolver only through the shared x86/virt
+paths (no tegra compile, and the headless fixtures have a root-only card). Attended-bench proof:
+boot with the FAT card present (storage at boot — the JD3 rule), watch the shell appear ON ITS OWN
+after ~8 s (M3), then `diskinfo` → `ls` → `cd <some dir>` → `pwd` → `ls` → `cat <dir>/<file>` →
+`cd ..` — plus one honest-error probe (`cd NOSUCH`, expect `-ENOENT`). A card with at least one
+subdirectory + a small text file inside it is needed on the bench (the pristine JD3 card is
+root-only).
+
 ## 4. Jetson Orin Nano headless bring-up (Arc JM2)
 
 The Orin is brought up **headless over serial**. The only console that has ever

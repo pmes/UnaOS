@@ -1103,18 +1103,9 @@ fn tegra_early_stop(boot_info: &'static mut BootInfo) -> ! {
                     Some(ids) => {
                         xusb_alive =
                             unaos_kernel::arch::bpmp_tegra::jb1c_ungate_xusb(&chan, &ids);
-                        // JB2c: the firmware's ExitBootServices teardown powered the padctl USB2
-                        // pads DOWN (JB2b root cause: ports read PORTSC=0x2a0 CCS=0, electrically
-                        // dead). Re-program the pad power-up sequence HERE — pre-drop at EL2, while
-                        // the BPMP `chan` is in scope for the bias-pad tracking clock — so the pads
-                        // are live BEFORE the JB2b xHCI attach surveys the ports below. Gated on the
-                        // ungate (no point powering pads for a controller that never came alive).
-                        // JB9h: on the inherit boot the JB6 shim never let the pads be torn down, so
-                        // JB9H_SKIP_CHAIN skips this RMW rather than mutate live-pad state the
-                        // inherited FW is using.
-                        if xusb_alive && !unaos_kernel::arch::xusb_tegra::JB9H_SKIP_CHAIN {
-                            unaos_kernel::arch::xusb_tegra::jb2c_padctl_powerup(&chan);
-                        }
+                        // (JD4: the JB2c padctl re-power-up that ran here on pre-inherit boots was
+                        // retired — on the JB9g/h inherit path the JB6 shim keeps UEFI from tearing
+                        // the pads down, so they arrive live and the RMW was dead code.)
                     }
                     None => serial_println!(":: tegra: JB1c — no usb@3610000 ids in DTB; SKIP ::"),
                 }
@@ -1246,20 +1237,15 @@ fn tegra_early_stop(boot_info: &'static mut BootInfo) -> ! {
             dtb_size,
             mmu.ram_gib_mask,
         );
-        // JB9b levers (bench 2026-07-08, first JB9 boot's verdict = SID mismatch: AO
-        // IFRDMA_STREAMID reads 0x7f-bypass while MC/SMMU are built around 0xe): lever 1 retags
-        // the FW side to the DTB SID; lever 2 (same boot, independent register) accepts the
-        // 0x7f class through the identity CB as the fallback. Both print readbacks, so the
-        // next JB9-B capture says which lever (if either) moved the rings.
+        // (JD4: the JB9b SID levers — the AO IFRDMA_STREAMID retag + the SMMU accept-0x7f
+        // fallback — were retired; both were dead behind the JB9h inherit gate, and JB9f proved
+        // the inherited fabric passes the FW's DMA as-is. The forensics that found the SID
+        // mismatch live in the git record at JB9/JB10.)
         // JB9e: the low-ring discriminator — answered (silent; high-address theory refuted).
         // MUST stay off on the JB9g inherit path: its xhci::init runs the HCRST that kills the
         // inherited firmware before the no-HCRST attach gets its chance.
         if !unaos_kernel::arch::xusb_tegra::JB9G_NO_HCRST {
             unaos_kernel::arch::xusb_tegra::jb9e_low_ring_probe();
-        }
-        if !jb9h_skip {
-            unaos_kernel::arch::xusb_tegra::jb9b_ao_sid_fix(jb9_ao, jb3_sid);
-            unaos_kernel::arch::smmu_tegra::jb9b_accept_bypass_sid(&jb3_bases[..jb3_n]);
         }
         let attached = unaos_kernel::arch::xusb_tegra::jb2b_attach(
             coherent,
@@ -1449,17 +1435,42 @@ fn jd2_console_pump(_arg: usize) {
         return;
     }
     serial_println!(
-        ":: tegra: JD2 — EL1 console pump live (boot log holds the panel; first key enters the shell) ::"
+        ":: tegra: JD2 — EL1 console pump live (boot log holds the panel; first key or ~8 s enters the shell) ::"
     );
 
-    // Phase 1: pump the controller, leave the JD1 boot log visible until someone types.
-    let first_key: u8 = loop {
+    // Phase 1 (JD4 screen-on-boot polish): pump the controller with the JD1 boot log visible, but
+    // only until the FIRST KEYSTROKE or a ~8 s wall-clock deadline — whichever comes first — so a
+    // panel-lit boot always ends at a visible shell prompt instead of waiting for a blind keystroke.
+    // The bound rides CNTPCT (free-running, EL-independent — the JD3 timerless mechanism; the
+    // post-drop EL1 core has no timer IRQ), and 8 s is past the CAPSTONE stragglers, so taking the
+    // panel then cannot race a late fbcon paint. A keystroke keeps the JD2 behaviour byte-alike.
+    let deadline_ticks: u64 = {
+        let f: u64;
+        unsafe {
+            core::arch::asm!("mrs {}, CNTFRQ_EL0", out(reg) f, options(nomem, nostack, preserves_flags));
+        }
+        (if f == 0 { 62_500_000 } else { f }).saturating_mul(8)
+    };
+    let cntpct = || -> u64 {
+        let v: u64;
+        unsafe {
+            core::arch::asm!("mrs {}, CNTPCT_EL0", out(reg) v, options(nomem, nostack, preserves_flags));
+        }
+        v
+    };
+    let phase1_start = cntpct();
+    let first_key: Option<u8> = loop {
         if let Some(x) = unaos_kernel::drivers::xhci::XHCI_CONTROLLER.lock().as_mut() {
             x.poll_events();
         }
         match unaos_kernel::pal::next_event() {
-            Some(Event::Key(c)) => break c,
-            _ => unaos_kernel::arch::sched::yield_now(),
+            Some(Event::Key(c)) => break Some(c),
+            _ => {
+                if cntpct().wrapping_sub(phase1_start) >= deadline_ticks {
+                    break None; // quiescent boot — take the panel and show the prompt
+                }
+                unaos_kernel::arch::sched::yield_now();
+            }
         }
     };
 
@@ -1473,13 +1484,20 @@ fn jd2_console_pump(_arg: usize) {
     console.println("JD2: interactive shell on the inherited scanout. Type 'help'.");
     console.draw(&mut pal);
     pal.render();
-    serial_println!(
-        ":: tegra: JD2 — console OWNS the panel (Screen back buffer live); first key {:#04x} ::",
-        first_key
-    );
-    // The wake-up keystroke is a real keystroke: feed it through, don't swallow it.
-    handle_key(first_key, &mut console, &mut pal);
-    pal.render();
+    match first_key {
+        Some(c) => {
+            serial_println!(
+                ":: tegra: JD2 — console OWNS the panel (Screen back buffer live); first key {:#04x} ::",
+                c
+            );
+            // The wake-up keystroke is a real keystroke: feed it through, don't swallow it.
+            handle_key(c, &mut console, &mut pal);
+            pal.render();
+        }
+        None => serial_println!(
+            ":: tegra: JD4 — console OWNS the panel (Screen back buffer live); screen-on-boot (no key, ~8 s) ::"
+        ),
+    }
 
     loop {
         if let Some(x) = unaos_kernel::drivers::xhci::XHCI_CONTROLLER.lock().as_mut() {
