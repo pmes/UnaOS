@@ -1568,6 +1568,123 @@ unsafe extern "C" {
     static unaos_user_u10dx_delete: u8;
 }
 
+// --- U11x M2 ring-3 fixture (the aarch64 `el0-u11defer-b` twin): the OTHER-process actor against a file the
+// LAUNCHER created + holds open on a scratch row. ONE fixture (`u11m2-unlink`): plain-RW-opens DEFER.BIN (a
+// CROSS-PROCESS sibling open of another row's created file — the new U11x M2 capability), read-verifies the
+// launcher's pattern (first 8 bytes), opens a second (sibling) handle, SYS_UNLINKs via the primary (the name
+// vanishes GLOBALLY; the on-disk delete op is enqueued HELD — the launcher's row still holds the file open, so
+// the free is DEFERRED), then proves: the sibling read is `-EACCES` (invalidated), a plain re-open is `-ENOENT`
+// (gone for every process), and an O_CREAT re-create is `-EBUSY` (the delete has not completed). 6-bit witness
+// (`U11M2_WITNESS_ALL`) as its `sys_exit` status, routed BY NAME into `U11M2_WITNESS`. Register-only apart from
+// the read-back dest. Callee-saved regs (rbx/r13) hold the two handles across syscalls.
+core::arch::global_asm!(
+    r#"
+    .globl unaos_user_u11m2_blob_start
+unaos_user_u11m2_blob_start:
+    .balign 16
+    .globl unaos_user_u11m2_unlink
+unaos_user_u11m2_unlink:
+    xor r12d, r12d                          // witness bitmask = 0
+    lea r14, [rip + unaos_user_u11m2_blob_start]
+    add r14, 0x1000                         // r14 -> read-back dest (writable DATA page)
+
+    // (0) SYS_OPEN("DEFER.BIN", RW=1, NO O_CREAT) -> a cross-process sibling of the launcher's created file
+    mov rax, 11
+    lea rdi, [rip + unaos_user_u11m2_name]
+    mov rsi, [rip + unaos_user_u11m2_namelen]
+    mov rdx, 1                              // RW, plain open (the file must already exist ACROSS rows)
+    syscall
+    mov rbx, rax                            // rbx = primary handle
+    test rbx, rbx
+    js 3f
+    add r12, 1                              // bit0: cross-process open OK
+
+    // (1) read 16 bytes and verify the first 8 against the launcher's pattern (content crossed processes)
+    mov rax, 12                             // SYS_READ
+    mov rdi, rbx
+    mov rsi, r14
+    mov rdx, 16
+    syscall
+    cmp rax, 16
+    jne 3f
+    mov r8, [rip + unaos_user_u11m2_pattern]
+    cmp r8, [r14]
+    jne 3f
+    add r12, 2                              // bit1: read-back matches the other process's bytes
+
+    // sibling: a SECOND RW open -> r13 (for the invalidation negative after the unlink)
+    mov rax, 11
+    lea rdi, [rip + unaos_user_u11m2_name]
+    mov rsi, [rip + unaos_user_u11m2_namelen]
+    mov rdx, 1                              // RW
+    syscall
+    mov r13, rax
+    test r13, r13
+    js 3f                                   // no sibling -> cannot prove bit3; bail
+
+    // (2) SYS_UNLINK via the primary -> 0 (name gone globally; the delete DEFERS — the launcher still holds it)
+    mov rax, 16                             // SYS_UNLINK
+    mov rdi, rbx
+    syscall
+    cmp rax, 0
+    jne 3f
+    add r12, 4                              // bit2: unlink OK
+
+    // (3) a read through the now-invalidated SIBLING -> -EACCES (no stale reference)
+    mov rax, 12                             // SYS_READ
+    mov rdi, r13
+    mov rsi, r14
+    mov rdx, 16
+    syscall
+    cmp rax, -13                            // -EACCES ?
+    jne 3f
+    add r12, 8                              // bit3: sibling invalidated
+
+    // (4) a plain RO re-open of the unlinked name -> -ENOENT (gone for EVERY process, launcher's open or not)
+    mov rax, 11
+    lea rdi, [rip + unaos_user_u11m2_name]
+    mov rsi, [rip + unaos_user_u11m2_namelen]
+    xor edx, edx                            // RO, no O_CREAT
+    syscall
+    cmp rax, -2                             // -ENOENT ?
+    jne 3f
+    add r12, 16                             // bit4: re-open is gone
+
+    // (5) an O_CREAT|RW re-create of the unlinked name -> -EBUSY (its deferred delete has not completed)
+    mov rax, 11
+    lea rdi, [rip + unaos_user_u11m2_name]
+    mov rsi, [rip + unaos_user_u11m2_namelen]
+    mov rdx, 3                              // O_CREAT | RW
+    syscall
+    cmp rax, -16                            // -EBUSY ?
+    jne 3f
+    add r12, 32                             // bit5: re-create refused while delete-pending
+3:
+    mov rax, 2                              // SYS_EXIT(witness) -> routed by name into U11M2_WITNESS
+    mov rdi, r12
+    syscall
+4:  jmp 4b
+
+    .balign 8
+unaos_user_u11m2_namelen:
+    .quad unaos_user_u11m2_name_end - unaos_user_u11m2_name
+unaos_user_u11m2_name:
+    .ascii "DEFER.BIN"
+unaos_user_u11m2_name_end:
+    .balign 8
+unaos_user_u11m2_pattern:
+    .ascii "U11x-DEFER-OK-42"
+    .globl unaos_user_u11m2_blob_end
+unaos_user_u11m2_blob_end:
+"#
+);
+
+unsafe extern "C" {
+    static unaos_user_u11m2_blob_start: u8;
+    static unaos_user_u11m2_blob_end: u8;
+    static unaos_user_u11m2_unlink: u8;
+}
+
 // --- The SYSCALL entry stub (LSTAR target). Naked; the only assembly in the syscall path.
 //
 // On entry (CPL 0, from SYSCALL): rcx = user RIP, r11 = user RFLAGS, rax = number, rdi/rsi/rdx =
@@ -1819,6 +1936,12 @@ pub fn record_ring3_kill(name: &str, vec: u8, err: u64, cr2: u64) {
         U10DX_KILLED.fetch_add(1, Ordering::AcqRel);
         return;
     }
+    // U11x M2: the cross-process unlink fixture is register-only + well-behaved; a kill is a real bug — its own
+    // counter (the launcher's unconditional release path still cleans up the held op).
+    if name == "u11m2-unlink" {
+        U11M2_KILLED.fetch_add(1, Ordering::AcqRel);
+        return;
+    }
     let code_end = USER_BASE + PAGE_SIZE; // the code page is the first page of the window only
     let window_end = USER_BASE + USER_WINDOW_PAGES * PAGE_SIZE;
     let expected = match name {
@@ -2011,6 +2134,13 @@ extern "C" fn syscall_dispatch(nr: u64, a0: u64, a1: u64, a2: u64) -> i64 {
                     // U10 DELETE: the delete fixture conveys its 5-bit witness bitmask as its exit STATUS (by name).
                     U10DX_WITNESS.store(a0 as u32, Ordering::Release);
                     U10DX_DONE.fetch_add(1, Ordering::AcqRel);
+                }
+                Some("u11m2-unlink") => {
+                    // U11x M2: the cross-process unlink fixture conveys its 6-bit witness bitmask as its exit
+                    // STATUS (by name). Spawned TWICE (one per phase) — `U11M2_DONE` counts exits; the launcher
+                    // resets `U11M2_WITNESS` before each spawn and gates each read on the count.
+                    U11M2_WITNESS.store(a0 as u32, Ordering::Release);
+                    U11M2_DONE.fetch_add(1, Ordering::AcqRel);
                 }
                 Some(n) if n.starts_with("u3-") => {
                     // U3 per-process-CR3 fixture task exiting (its own accounting, so the U1a/U1b
@@ -2303,27 +2433,45 @@ fn sys_unlink(handle: u64) -> i64 {
         return EACCES;
     }
     // Capture the file's bytes BEFORE freeing descriptors (files_free discards the wstage), then enqueue the
-    // on-disk delete — a self-contained COPY (u10_flush_enqueue), so it survives the frees below. Enqueue only
-    // when a FAT volume is present (HELLO_STAGED): the no-FAT in-memory core has nothing to delete on disk, so a
-    // queued op would just strand (the launcher skips the drain). The in-memory delete semantics below run either
-    // way — the syscall still returns 0 and invalidates the descriptors.
+    // on-disk delete — a self-contained COPY (u10_flush_enqueue), so it survives the frees below. U11x M2: the op
+    // is enqueued HELD — not drainable until the LAST descriptor across ALL rows closes (`openf_decref`'s
+    // release; teardown counts as close), the x86 unlink-defers-free. A SOLE opener releases it right here in the
+    // sweep below (its own decrefs reach zero), so the U10 sole-process flow is unchanged. Enqueue only when a
+    // FAT volume is present (HELLO_STAGED): the no-FAT in-memory core has nothing to delete on disk, so a queued
+    // op would just strand (the launcher skips the drain). The in-memory delete semantics below run either way —
+    // the syscall still returns 0 and invalidates the caller's descriptors.
+    // U11x M2: CLAIM the unlink atomically (swap) — a SECOND unlink of the same name (e.g. another row's live
+    // sibling handle after a cross-row unlink) is -ENOENT (the name is already gone), never a double-enqueue of
+    // the delete op (NU10 == 1) or a double pending-mark. The claimer proceeds; its stores below complete the
+    // mark. (This also makes the flag-set the FIRST observable effect — no new increfs from here on.)
+    if DYN_DELETED_G[nameid].swap(true, Ordering::AcqRel) {
+        return ENOENT;
+    }
+    let mut heldslot = 0u32; // +1-biased queue slot of the held op (0 == none)
     if HELLO_STAGED.load(Ordering::Acquire) {
         let size = FILE_SIZE[row][idx].load(Ordering::Acquire) as usize;
-        match (FILE_WSTAGE[row][idx].load(Ordering::Acquire) as usize).checked_sub(1) {
+        let slot = match (FILE_WSTAGE[row][idx].load(Ordering::Acquire) as usize).checked_sub(1) {
             Some(w) => {
                 let all = wstage_bytes(w);
                 let n = size.min(all.len());
-                u10_flush_enqueue(U10OP_CREATE_GROW_DELETE, nameid as u32, 0, &all[..n]);
+                u10_flush_enqueue(U10OP_CREATE_GROW_DELETE, nameid as u32, 0, &all[..n], true)
             }
-            None => {
-                u10_flush_enqueue(U10OP_CREATE_GROW_DELETE, nameid as u32, 0, &[]);
-            }
+            None => u10_flush_enqueue(U10OP_CREATE_GROW_DELETE, nameid as u32, 0, &[], true),
+        };
+        if let Some(k) = slot {
+            heldslot = (k + 1) as u32;
         }
     }
-    // Mark the name gone for the row (a plain re-open is now -ENOENT), then invalidate EVERY descriptor in this
-    // row naming the file (the primary + every sibling): each free bumps the slot generation, so a stale sibling
-    // handle is -EACCES on its next use.
-    DYN_DELETED[row][nameid].store(true, Ordering::Release);
+    // U11x M2 ordering (the pi4 mark-0xE5 -> mark-pending -> drop-descriptors rule): (1) the name vanishes
+    // GLOBALLY (any row's plain re-open is now -ENOENT, an O_CREAT re-create -EBUSY — no new increfs possible
+    // from here on); (2) the file goes unlink-PENDING with its held op recorded; (3) EVERY descriptor in THIS
+    // row naming the file is invalidated (the primary + every sibling): each `files_free` bumps the slot
+    // generation (a stale sibling handle is -EACCES on its next use) and decrefs the global count — if this row
+    // held the last opens, the final decref performs the release. Descriptors in OTHER rows stay live (their
+    // reads keep serving their own wstage copies — read-after-unlink, the deferral) and release at their own
+    // close/teardown. (`DYN_DELETED_G` was already claimed by the swap above.)
+    OPENF_PENDING[nameid].store(true, Ordering::Release);
+    OPENF_HELDSLOT[nameid].store(heldslot, Ordering::Release);
     for k in 0..NFILE {
         if FILE_USED[row][k].load(Ordering::Acquire)
             && FILE_CREATED[row][k].load(Ordering::Acquire)
@@ -3059,6 +3207,7 @@ const ENOENT: i64 = -2; // SYS_OPEN: no staged file by that name (the staged set
 const EIO: i64 = -5; // SYS_READ: a live descriptor over an unstaged source — a kernel bug; fail closed
 const EMFILE: i64 = -24; // SYS_OPEN: the caller's open-file table is full
 const EBADF: i64 = -9; // U11x SYS_CLOSE: no such handle (already closed / never opened / oob / stale-slot)
+const EBUSY: i64 = -16; // U11x M2: O_CREAT of a name whose deferred on-disk DELETE has not drained yet
 const ENOSPC: i64 = -28; // U10: the FAT volume (or the one-page grow-staging buffer) is full
 
 /// A killed child's Proc status: a nonzero sentinel the child-KILL path stores so a killed child still
@@ -3184,6 +3333,12 @@ const GROW_WRITE_MAX: usize = 512;
 /// U10 CREATE / DELETE: the runtime-created file names (absent from the staged set; the fixtures O_CREAT them).
 const U10C_NAME: &str = "FRESH.BIN";
 const U10D_NAME: &str = "DELME.BIN";
+/// U11x M2: the cross-process defer demo's runtime-created file (created by the launcher on a scratch row, opened
+/// + unlinked by the EL0 fixture from ITS row — the pi4 `DEFER.BIN` twin). Absent from the staged set.
+const U11M2_NAME: &str = "DEFER.BIN";
+/// U11x M2: the 16-byte pattern the launcher writes into DEFER.BIN (the fixture read-verifies the first 8 bytes;
+/// the `.ascii` in the fixture MUST match). 16 chars. The pi4 twin's `U11_DEFER_PATTERN`.
+const U11M2_PATTERN: [u8; 16] = *b"U11x-DEFER-OK-42";
 /// U10 CREATE: the 16-byte pattern the create fixture writes into FRESH.BIN (also its final size). The `.ascii`
 /// in the fixture MUST match; the launcher re-reads it from disk. 16 chars. The aarch64 twin's `U10C_PATTERN`.
 const U10C_PATTERN: [u8; 16] = *b"U10x-CREATE-OK99";
@@ -3341,13 +3496,69 @@ static FILE_GREW: [[AtomicBool; NFILE]; crate::arch::memory::USER_SLOTS + 1] =
 static FILE_CREATED: [[AtomicBool; NFILE]; crate::arch::memory::USER_SLOTS + 1] =
     [const { [const { AtomicBool::new(false) }; NFILE] }; crate::arch::memory::USER_SLOTS + 1];
 
-/// U10 M3: per-row, per-U10-name "this created file was UNLINKED in this row" overlay. `sys_unlink` sets it (the
-/// descriptors are freed at unlink, so this — not a descriptor flag — is what makes a subsequent plain (non-
-/// O_CREAT) re-open of the name `-ENOENT` for the rest of the row's life). Indexed by the `U10_NAMES` id. Reset
-/// at teardown (`clear_files_row`) so a recycled slot/row starts clean and metal re-runs stay honest. Row-keyed
-/// like the descriptor tables; single-writer per row (its own task mid-syscall, or teardown after exit).
-static DYN_DELETED: [[AtomicBool; N_U10_NAMES]; crate::arch::memory::USER_SLOTS + 1] =
-    [const { [const { AtomicBool::new(false) }; N_U10_NAMES] }; crate::arch::memory::USER_SLOTS + 1];
+/// U11x M2 (was U10 M3's per-row overlay): GLOBAL per-U10-name "this created file was UNLINKED" flag — the x86
+/// twin of pi4's 0xE5'd directory entry. `sys_unlink` sets it IN-HANDLER, so the name vanishes for EVERY row
+/// immediately (a plain re-open is `-ENOENT` from any process, an O_CREAT re-create is `-EBUSY` — see
+/// `sys_open_dynamic`). Cleared when the file's deferred on-disk DELETE op DRAINS (`u10_flush_drain_one`), or —
+/// with no queued op (the no-FAT in-memory core) — at the LAST-close release (`openf_decref`), so the name
+/// becomes re-creatable exactly when the old file's delete has fully completed. This CANNOT stay per-row: with
+/// cross-row sibling opens (U11x M2) an unlink must hide the name from all rows at once. Global-per-boot; the
+/// U10 launchers' pre-flight self-heal covers metal re-runs on a persistent card.
+static DYN_DELETED_G: [AtomicBool; N_U10_NAMES] =
+    [const { AtomicBool::new(false) }; N_U10_NAMES];
+
+// --- U11x M2: the GLOBAL open-file refcount table — the x86 twin of pi4 U11 M2's `OPEN_FILES`
+// (`SpinMutex<[OpenFileRow; 16]>` keyed by the on-disk `(dir_lba, dir_off)`). x86's created-file identity space
+// is the STATIC `U10_NAMES` table, so the table is indexed DIRECTLY by name-id — no row allocation, no join, and
+// (because a re-create while a delete is pending is refused with `-EBUSY`) none of the pi4 recycled-slot-key
+// aliasing class (b863304) by construction. Pure atomics (no lock): a new incref of a name is impossible once
+// its `DYN_DELETED_G` flag is set (set BEFORE `OPENF_PENDING`), so the decref-to-zero edge can never race a
+// fresh open of the SAME file; the demo launchers sequence opens/closes, and the residual open-vs-unlink TOCTOU
+// (an open of a healthy name racing a concurrent unlink on another core) is ledgered in SECURITY.md — the
+// product fix is the pi4 SpinMutex table. ---
+/// The number of live descriptors (across ALL rows) naming created file `nameid` — incremented by every
+/// successful created-file open (`open_create_new` / `open_created_sibling`, strictly BEFORE
+/// `install_file_handle`, so its EAGAIN unwind through `files_free` pairs the decrement exactly once), and
+/// decremented by every descriptor release (`files_free`, and `clear_files_row` at teardown — teardown counts
+/// as close, the pi4 M2b semantics).
+static OPENF_REFS: [AtomicU32; N_U10_NAMES] = [const { AtomicU32::new(0) }; N_U10_NAMES];
+/// The file was unlinked while descriptors were still live — its deferred DELETE waits for the last close.
+/// Set by `sys_unlink` (after `DYN_DELETED_G`), consumed by the last `openf_decref`.
+static OPENF_PENDING: [AtomicBool; N_U10_NAMES] = [const { AtomicBool::new(false) }; N_U10_NAMES];
+/// The `+1`-biased U10-queue slot holding the file's HELD deferred-DELETE op (`0` == none — the no-FAT
+/// in-memory core, or the sole-opener case where the op released inside `sys_unlink` itself).
+static OPENF_HELDSLOT: [AtomicU32; N_U10_NAMES] = [const { AtomicU32::new(0) }; N_U10_NAMES];
+
+/// U11x M2: increment created file `nameid`'s global open count. See `OPENF_REFS` for the pairing discipline.
+fn openf_incref(nameid: usize) {
+    debug_assert!(nameid < N_U10_NAMES, "openf_incref: bad name-id");
+    OPENF_REFS[nameid].fetch_add(1, Ordering::AcqRel);
+}
+
+/// U11x M2: decrement created file `nameid`'s global open count — THE single release seam (the pi4
+/// `openfile_decref_at` twin). The LAST decrement of an unlink-PENDING file performs the deferred-free release:
+/// the file's HELD delete op (if any) becomes drainable (`U10_HELD` cleared — the launcher's IF=1 drain is the
+/// x86 reaper), and with NO queued op (no-FAT mode) the in-memory delete completes here, clearing
+/// `DYN_DELETED_G` so the name is re-creatable. Atomics only — safe from the IF-masked syscall handler AND the
+/// IF=0 teardown path (`clear_files_row`), exactly the two callers. Defensive on underflow (a pairing bug):
+/// restore 0 and return, never wrap (a wrapped count would strand a held op for the boot).
+fn openf_decref(nameid: usize) {
+    debug_assert!(nameid < N_U10_NAMES, "openf_decref: bad name-id");
+    let prev = OPENF_REFS[nameid].fetch_sub(1, Ordering::AcqRel);
+    if prev == 0 {
+        // Defensive: unpaired decref — undo the wrap without clobbering a concurrent legitimate incref
+        // (a plain store(0) could erase it; the CAS only repairs the exact wrapped value).
+        let _ = OPENF_REFS[nameid].compare_exchange(u32::MAX, 0, Ordering::AcqRel, Ordering::Acquire);
+        return;
+    }
+    if prev == 1 && OPENF_PENDING[nameid].swap(false, Ordering::AcqRel) {
+        // Last close of an unlinked file — release its deferred DELETE.
+        match (OPENF_HELDSLOT[nameid].swap(0, Ordering::AcqRel) as usize).checked_sub(1) {
+            Some(k) => U10_HELD[k].store(false, Ordering::Release), // op now drainable at the launcher's IF=1
+            None => DYN_DELETED_G[nameid].store(false, Ordering::Release), // no queued op — delete completes now
+        }
+    }
+}
 
 /// U9x M2: mark descriptor `[row][idx]` dirty and cover [lo, hi) in its dirty range. On the FIRST write
 /// (`FILE_DIRTY` false->true) SET [LO,HI) fresh to exactly [lo,hi); on later writes WIDEN by min/max — so the
@@ -3476,8 +3687,8 @@ const U10OP_CREATE_GROW: u32 = 2;
 const U10OP_CREATE_GROW_DELETE: u32 = 3;
 /// The U10 demo file names — the single source of truth an op's `U10_NAMEID` indexes, so the drain re-resolves
 /// the on-disk directory entry by the SAME name the fixture named (`find_located`). GROW.BIN is also a staged
-/// file (idx `GROW_STAGED_IDX`); FRESH.BIN/DELME.BIN are runtime-created (never staged).
-const U10_NAMES: [&str; 3] = [U10_GROW_NAME, U10C_NAME, U10D_NAME];
+/// file (idx `GROW_STAGED_IDX`); FRESH.BIN/DELME.BIN/DEFER.BIN are runtime-created (never staged).
+const U10_NAMES: [&str; 4] = [U10_GROW_NAME, U10C_NAME, U10D_NAME, U11M2_NAME];
 /// The count of `U10_NAMES` — the width of the per-row `DYN_DELETED` overlay.
 const N_U10_NAMES: usize = U10_NAMES.len();
 static U10_USED: [AtomicBool; NU10] = [const { AtomicBool::new(false) }; NU10];
@@ -3488,15 +3699,23 @@ static U10_LEN: [AtomicU32; NU10] = [const { AtomicU32::new(0) }; NU10];
 /// Sticky overflow — a dropped U10 op (queue full) is a lost acknowledged mutation; the launcher reads this and
 /// FAILs loudly rather than treating it as a clean drain (the U9x `FLUSH_OVERFLOW` discipline).
 static U10_OVERFLOW: AtomicBool = AtomicBool::new(false);
+/// U11x M2: the entry is HELD — enqueued by `sys_unlink` while OTHER processes still hold the file open, so the
+/// drain must skip it until the LAST close releases it (`openf_decref` clears it — the deferred-free). Set
+/// strictly BEFORE the `U10_LEN` Release publish in `u10_flush_enqueue`; the launchers drain only after
+/// observing their fixture's teardown (the standing sequencing invariant), so a drain never races the publish.
+static U10_HELD: [AtomicBool; NU10] = [const { AtomicBool::new(false) }; NU10];
 /// The op's bytes — a COPY of the wstage span, taken BEFORE the wstage slot frees (self-contained; a stranded op
 /// can never point at a freed buffer). One page each (the staged size bound).
 static mut U10_BUF: [[u8; PAGE_SIZE as usize]; NU10] = [[0; PAGE_SIZE as usize]; NU10];
 
 /// Enqueue a U10 deferred op — copy its bytes + (op, name-id, start) into a free slot. `nameid` indexes
-/// `U10_NAMES`. Fields written first, `U10_LEN` published LAST (Release). On a full queue: set the sticky
-/// `U10_OVERFLOW`, log, return false (never a silent drop). Called at IF=0 (teardown / unlink) on the fixture's
-/// CPU; drained by the launcher at IF=1 only after it observes teardown.
-fn u10_flush_enqueue(op: u32, nameid: u32, start: u32, src: &[u8]) -> bool {
+/// `U10_NAMES`. Fields written first, `U10_LEN` published LAST (Release). `held` (U11x M2) enqueues the op HELD
+/// (not drainable until `openf_decref`'s last-close release clears `U10_HELD`); a non-held enqueue clears the
+/// flag so a reused slot never inherits a stale hold. On a full queue: set the sticky `U10_OVERFLOW`, log,
+/// return `None` (never a silent drop). Returns the claimed slot index (the unlink path records it in
+/// `OPENF_HELDSLOT`). Called at IF=0 (teardown / unlink) on the fixture's CPU; drained by the launcher at IF=1
+/// only after it observes teardown.
+fn u10_flush_enqueue(op: u32, nameid: u32, start: u32, src: &[u8], held: bool) -> Option<usize> {
     let len = src.len();
     debug_assert!(len <= PAGE_SIZE as usize, "u10_flush_enqueue: op span exceeds a page");
     debug_assert!((nameid as usize) < U10_NAMES.len(), "u10_flush_enqueue: bad name-id");
@@ -3509,13 +3728,14 @@ fn u10_flush_enqueue(op: u32, nameid: u32, start: u32, src: &[u8]) -> bool {
             U10_OP[k].store(op, Ordering::Relaxed);
             U10_NAMEID[k].store(nameid, Ordering::Relaxed);
             U10_START[k].store(start, Ordering::Relaxed);
+            U10_HELD[k].store(held, Ordering::Release); // before the LEN publish (see U10_HELD)
             U10_LEN[k].store(len as u32, Ordering::Release); // publish LAST
-            return true;
+            return Some(k);
         }
     }
     U10_OVERFLOW.store(true, Ordering::Release);
     serial_println!(":: U10: OP QUEUE FULL — dropped a deferred op (op={} name={} {} bytes) ::", op, nameid, len);
-    false
+    None
 }
 
 /// Drain ONE pending U10 op to disk via the ready-made `fat.rs` primitive, then free the entry. Returns
@@ -3524,7 +3744,7 @@ fn u10_flush_enqueue(op: u32, nameid: u32, start: u32, src: &[u8]) -> bool {
 /// from a U10 launcher at IF=1.
 fn u10_flush_drain_one(fs: &crate::fs::fat::FatFs) -> Option<bool> {
     for k in 0..NU10 {
-        if U10_USED[k].load(Ordering::Acquire) {
+        if U10_USED[k].load(Ordering::Acquire) && !U10_HELD[k].load(Ordering::Acquire) {
             let op = U10_OP[k].load(Ordering::Acquire);
             let nameid = U10_NAMEID[k].load(Ordering::Acquire) as usize;
             let start = U10_START[k].load(Ordering::Acquire);
@@ -3540,6 +3760,11 @@ fn u10_flush_drain_one(fs: &crate::fs::fat::FatFs) -> Option<bool> {
                 U10OP_CREATE_GROW_DELETE => u10_drain_create_grow_delete(fs, name, bytes),
                 _ => false,
             };
+            // U11x M2: a drained DELETE completes the file's lifecycle — the name is re-creatable again
+            // (unconditional: on a failed drain the pre-flight self-heal owns the on-disk state anyway).
+            if op == U10OP_CREATE_GROW_DELETE {
+                DYN_DELETED_G[nameid].store(false, Ordering::Release);
+            }
             U10_LEN[k].store(0, Ordering::Relaxed);
             U10_USED[k].store(false, Ordering::Release); // free LAST
             return Some(ok);
@@ -3639,7 +3864,7 @@ fn u10_drain_create_grow_delete(fs: &crate::fs::fat::FatFs, name: &str, bytes: &
 // only by that descriptor's owning task mid-syscall (IF-masked). M1 scope: purely in-memory — no disk
 // write-back (that is M2). One page max per buffer (the staged size bound); `NWSTAGE` bounds concurrent
 // writable opens (the demo needs one). ---
-const NWSTAGE: usize = 2;
+const NWSTAGE: usize = 3; // U11x M2: launcher scratch-row buffer + fixture primary + fixture sibling, concurrent
 /// Per-slot presence: `true` == the pool slot holds a live writable buffer. Claimed (CAS false->true) in
 /// `wstage_alloc`, cleared in `wstage_free`. The single source of truth for "is this pool slot in use".
 static WSTAGE_USED: [AtomicBool; NWSTAGE] = [const { AtomicBool::new(false) }; NWSTAGE];
@@ -3806,6 +4031,15 @@ fn files_alloc(row: usize, staged_idx: u32, size: u32, wstage: u32, cluster: u32
 /// is freed too (no writable buffer outlives its descriptor — pi4's backing is the disk; x86's is the pool).
 fn files_free(row: usize, idx: usize) {
     debug_assert!(row < FILE_USED.len() && idx < NFILE, "files_free: out of range");
+    // U11x M2: capture the created-file identity BEFORE the clears — the decref (below, after the descriptor is
+    // fully released) needs it. Every created descriptor was incref'd exactly once at open (before its handle
+    // installed), so every release path through here (SYS_CLOSE, revoke, sys_open unwind, the unlink sweep)
+    // pairs it exactly once.
+    let openf_nameid = if FILE_CREATED[row][idx].load(Ordering::Acquire) {
+        (FILE_OPNAME[row][idx].load(Ordering::Acquire) as usize).checked_sub(1)
+    } else {
+        None
+    };
     // U9x M2: a REVOKE (or a sys_open unwind) DISCARDS any dirty bytes — it frees the writable buffer WITHOUT
     // enqueuing a flush, so a revoked File-write cap never persists stale bytes (the brief's revoke ordering:
     // revoke drops the dirty flag). Only a whole-task TEARDOWN (`clear_files_row`) enqueues dirty bytes.
@@ -3831,6 +4065,13 @@ fn files_free(row: usize, idx: usize) {
     // validator that observed the slot LIVE with the old gen resolved a genuinely-live descriptor (the same
     // file); the rebind window only opens once the slot is both free AND reused.
     FILE_GEN[row][idx].fetch_add(1, Ordering::AcqRel);
+    // U11x M2: the descriptor is fully released — drop its global open count. The LAST decref of an
+    // unlink-pending file releases the deferred delete (see `openf_decref`).
+    if let Some(nameid) = openf_nameid {
+        if nameid < N_U10_NAMES {
+            openf_decref(nameid);
+        }
+    }
 }
 
 /// Clear an ENTIRE per-task open-file row at teardown — the file twin of `clear_handle_row`'s handle wipe
@@ -3840,6 +4081,14 @@ fn files_free(row: usize, idx: usize) {
 fn clear_files_row(slot: usize) {
     debug_assert!(slot < crate::arch::memory::USER_SLOTS, "clear_files_row: not a private slot");
     for k in 0..NFILE {
+        // U11x M2: capture the created-file identity up front — teardown counts as CLOSE (the pi4 M2b
+        // semantics), so each created descriptor decrefs the global open count after its fields clear; the last
+        // decref of an unlink-pending file releases the deferred delete (atomics only — IF=0-safe).
+        let openf_nameid = if FILE_CREATED[slot][k].load(Ordering::Acquire) {
+            (FILE_OPNAME[slot][k].load(Ordering::Acquire) as usize).checked_sub(1)
+        } else {
+            None
+        };
         // U9x M2: a DIRTY, disk-backed writable descriptor persists at teardown — COPY its dirty bytes +
         // (cluster, size, [lo,hi)) into the flush queue BEFORE freeing the wstage slot (the entry is a COPY, so
         // it survives the free and can never point at a freed buffer). The launcher drains it to disk at IF=1.
@@ -3862,10 +4111,17 @@ fn clear_files_row(slot: usize) {
                     // Enqueue only when a FAT volume is present (HELLO_STAGED — the launcher pre-flight signal):
                     // in the no-FAT in-memory core there is nothing to persist to, so a queued op would just
                     // strand (the launcher skips the drain) and trip a false overflow on the next fixture's op.
+                    // U11x M2: SUPPRESSED for an unlink-pending name (`DYN_DELETED_G`) — a cross-row holder of
+                    // an unlinked file exiting dirty must NOT re-persist it (its only remaining persistence is
+                    // the HELD delete op; a CreateGrow here would both resurrect the file after its delete
+                    // drains and overflow the NU10 == 1 queue).
                     if let Some(nameid) = nameid {
                         let size = FILE_SIZE[slot][k].load(Ordering::Acquire) as usize;
-                        if HELLO_STAGED.load(Ordering::Acquire) && size <= all.len() {
-                            u10_flush_enqueue(U10OP_CREATE_GROW, nameid as u32, 0, &all[..size]);
+                        if HELLO_STAGED.load(Ordering::Acquire)
+                            && size <= all.len()
+                            && !DYN_DELETED_G[nameid].load(Ordering::Acquire)
+                        {
+                            u10_flush_enqueue(U10OP_CREATE_GROW, nameid as u32, 0, &all[..size], false);
                         }
                     }
                 } else if FILE_GREW[slot][k].load(Ordering::Acquire) {
@@ -3877,7 +4133,7 @@ fn clear_files_row(slot: usize) {
                         let lo = FILE_DIRTY_LO[slot][k].load(Ordering::Acquire);
                         let hi = FILE_DIRTY_HI[slot][k].load(Ordering::Acquire);
                         if cluster != 0 && lo < hi && (hi as usize) <= all.len() {
-                            u10_flush_enqueue(U10OP_GROW, nameid as u32, lo, &all[lo as usize..hi as usize]);
+                            u10_flush_enqueue(U10OP_GROW, nameid as u32, lo, &all[lo as usize..hi as usize], false);
                         }
                     }
                 } else {
@@ -3911,12 +4167,17 @@ fn clear_files_row(slot: usize) {
         // U11x: bump each slot's generation at teardown too (last, per slot) — so a recycled slot never hands its
         // next tenant a stale-gen descriptor that a lingering file-id could rebind to.
         FILE_GEN[slot][k].fetch_add(1, Ordering::AcqRel);
+        // U11x M2: teardown counts as CLOSE — the global open-count decref (the pi4 M2b teardown-decrement twin;
+        // the last decref of an unlink-pending file RELEASES its held delete op for the launcher's IF=1 drain —
+        // the x86 reaper). The release itself is one atomic store, so it is legal on this IF=0 dying path.
+        if let Some(nameid) = openf_nameid {
+            if nameid < N_U10_NAMES {
+                openf_decref(nameid);
+            }
+        }
     }
-    // U10 M3: clear this row's created-then-deleted overlay so a recycled slot — and a metal re-run on a
-    // persistent card — starts with every U10 name openable again (the launchers self-heal the on-disk side).
-    for j in 0..N_U10_NAMES {
-        DYN_DELETED[slot][j].store(false, Ordering::Release);
-    }
+    // (U10 M3's per-row DYN_DELETED reset is gone — the overlay is GLOBAL now (U11x M2, `DYN_DELETED_G`) and
+    // clears when the deferred delete completes: at the drain, or at the last-close release in no-FAT mode.)
 }
 
 /// True iff the entire FILES row for `row` is free — the U6bx teardown-clear verifier (the file twin of
@@ -3944,16 +4205,28 @@ fn u10_creatable_nameid(name: &str) -> Option<u32> {
     }
 }
 
-/// The index of a LIVE runtime-created descriptor for `name` in `row`, or `None`. A created file "exists" for a
-/// second open (idempotent create-if-present) / a sibling open exactly while one of its descriptors is live —
-/// the x86 in-memory stand-in for the aarch64 on-disk `find_located` after an in-handler `create_in_root`.
-fn created_desc_in_row(row: usize, name: &str) -> Option<usize> {
-    let nameid = u10_name_id(name)?;
-    (0..NFILE).find(|&k| {
-        FILE_USED[row][k].load(Ordering::Acquire)
-            && FILE_CREATED[row][k].load(Ordering::Acquire)
-            && FILE_OPNAME[row][k].load(Ordering::Acquire) == nameid + 1
-    })
+/// The `(row, index)` of a LIVE runtime-created descriptor for `nameid` in ANY private row (U11x M2 — was
+/// row-scoped `created_desc_in_row`), or `None`. A created file "exists" for a second open (idempotent
+/// create-if-present) / a sibling open — from the SAME process or ANOTHER (the cross-process open the refcount
+/// table counts) — exactly while one of its descriptors is live anywhere: the x86 in-memory stand-in for the
+/// aarch64 on-disk `find_located` after an in-handler `create_in_root`. The caller's own row is scanned first
+/// (prefer the local copy as the seed source). SHARED_ROW never holds created descriptors (refused at open).
+fn created_desc_any_row(prefer_row: usize, nameid: u32) -> Option<(usize, usize)> {
+    let find_in = |r: usize| {
+        (0..NFILE).find(|&k| {
+            FILE_USED[r][k].load(Ordering::Acquire)
+                && FILE_CREATED[r][k].load(Ordering::Acquire)
+                && FILE_OPNAME[r][k].load(Ordering::Acquire) == nameid + 1
+        })
+    };
+    if prefer_row < crate::arch::memory::USER_SLOTS {
+        if let Some(k) = find_in(prefer_row) {
+            return Some((prefer_row, k));
+        }
+    }
+    (0..crate::arch::memory::USER_SLOTS)
+        .filter(|&r| r != prefer_row)
+        .find_map(|r| find_in(r).map(|k| (r, k)))
 }
 
 /// Install a `File` handle over an already-allocated descriptor `fid` carrying `rights` — the shared tail of
@@ -3981,14 +4254,20 @@ fn sys_open_dynamic(row: usize, name: &str, mode: u64) -> i64 {
     if row == SHARED_ROW {
         return EACCES; // a created descriptor is RW; SHARED_ROW is refused (the writable-open discipline)
     }
-    // A live created file in this row -> open ANOTHER descriptor to it (idempotent 2nd create / a sibling).
-    if let Some(existing) = created_desc_in_row(row, name) {
-        return open_created_sibling(row, existing);
-    }
-    // U10 M3: a created-then-deleted name stays GONE for a plain (non-O_CREAT) open.
     if let Some(nameid) = u10_name_id(name) {
-        if !create && DYN_DELETED[row][nameid as usize].load(Ordering::Acquire) {
-            return ENOENT;
+        // U11x M2: the DELETED check comes FIRST — before the any-row scan and before any resource claim. An
+        // unlinked name is gone for EVERY row the moment `sys_unlink` sets the global flag, even while other
+        // rows' descriptors keep the file's content alive (the deferral): a plain re-open is `-ENOENT`, and an
+        // O_CREAT re-create is `-EBUSY` until the deferred on-disk delete completes (drains, or — no-FAT — the
+        // last close releases). Checking the sibling scan first would let ANY process re-open an unlink-pending
+        // file by name (and incref it), un-deleting it — the ordering is load-bearing.
+        if DYN_DELETED_G[nameid as usize].load(Ordering::Acquire) {
+            return if create { EBUSY } else { ENOENT };
+        }
+        // A live created file in ANY private row -> open ANOTHER descriptor to it (idempotent 2nd create / a
+        // same-row sibling / the U11x M2 CROSS-PROCESS open).
+        if let Some((srcrow, existing)) = created_desc_any_row(row, nameid) {
+            return open_created_sibling(row, srcrow, existing);
         }
     }
     // O_CREAT of a creatable name -> a fresh 0-length created file (the first write grows it).
@@ -4006,6 +4285,12 @@ fn sys_open_dynamic(row: usize, name: &str, mode: u64) -> i64 {
 /// a `CreateGrow` op naming THIS file. Rights `CAP_READ | CAP_WRITE` (O_CREAT implies write). Errnos as the
 /// staged path: `-EMFILE` (no writable slot / FILES row full), `-EAGAIN` (handle table full).
 fn open_create_new(row: usize, nameid: u32) -> i64 {
+    // U11x M2 defense in depth: `sys_open_dynamic` already refuses a delete-pending name up front, but this
+    // function is also callable directly (the u11m2 launcher) — enforce the invariant AT the create so no
+    // caller can mint a second live file under a name whose delete has not completed.
+    if (nameid as usize) < N_U10_NAMES && DYN_DELETED_G[nameid as usize].load(Ordering::Acquire) {
+        return EBUSY;
+    }
     let Some(w) = wstage_alloc(&[]) else {
         return EMFILE; // the writable staging pool is full
     };
@@ -4015,21 +4300,29 @@ fn open_create_new(row: usize, nameid: u32) -> i64 {
     };
     FILE_CREATED[row][fid].store(true, Ordering::Release);
     FILE_OPNAME[row][fid].store(nameid + 1, Ordering::Release);
+    // U11x M2: incref AFTER the created identity is stamped and BEFORE `install_file_handle` — its EAGAIN unwind
+    // routes through `files_free`, which decrefs by that identity, so every failure path pairs exactly once (an
+    // incref after the install would leave the unwind decrementing an un-incremented count: underflow).
+    openf_incref(nameid as usize);
     install_file_handle(row, fid, CAP_READ | CAP_WRITE)
 }
 
-/// U10 M2/M3: open ANOTHER descriptor to a live created file (`existing`) — the idempotent second O_CREAT open and
-/// the delete fixture's sibling handle. COPIES the existing descriptor's wstage content so the new descriptor's
-/// `WSTAGE_LEN == FILE_SIZE` invariant holds (a sibling never writes in the demo, so it stays CLEAN and enqueues
-/// NO op at teardown — only the primary's `CreateGrow`/`CreateGrowDelete` op persists; NU10 == 1 holds). Same
-/// CREATED identity (`FILE_OPNAME` name-id) so `sys_unlink` invalidates every sibling of the file.
-fn open_created_sibling(row: usize, existing: usize) -> i64 {
-    let seed: &[u8] = match (FILE_WSTAGE[row][existing].load(Ordering::Acquire) as usize).checked_sub(1) {
+/// U10 M2/M3 + U11x M2: open ANOTHER descriptor to a live created file (`[srcrow][existing]`) — the idempotent
+/// second O_CREAT open, the delete fixture's sibling handle, and (U11x M2) the CROSS-PROCESS open (`srcrow !=
+/// row`). COPIES the source descriptor's wstage content so the new descriptor's `WSTAGE_LEN == FILE_SIZE`
+/// invariant holds — a SNAPSHOT: a concurrent writer in the source row could torn-copy (ledgered in SECURITY.md;
+/// the demos sequence opens after writes complete — pi4 has no such window because both processes read the disk,
+/// serialized by the in-handler PIO). A sibling that WRITES and exits would enqueue its own CreateGrow op
+/// (NU10 == 1 overflow) — siblings are read-only in the demos (same ledger entry). Same CREATED identity
+/// (`FILE_OPNAME` name-id) so `sys_unlink` invalidates every sibling of the file in the unlinking row, and the
+/// U11x M2 global refcount counts this open (incref before `install_file_handle` — the unwind-pairing rule).
+fn open_created_sibling(row: usize, srcrow: usize, existing: usize) -> i64 {
+    let seed: &[u8] = match (FILE_WSTAGE[srcrow][existing].load(Ordering::Acquire) as usize).checked_sub(1) {
         Some(ew) => wstage_bytes(ew),
         None => &[],
     };
-    let size = FILE_SIZE[row][existing].load(Ordering::Acquire);
-    let opname = FILE_OPNAME[row][existing].load(Ordering::Acquire); // already +1-biased
+    let size = FILE_SIZE[srcrow][existing].load(Ordering::Acquire);
+    let opname = FILE_OPNAME[srcrow][existing].load(Ordering::Acquire); // already +1-biased
     let Some(w) = wstage_alloc(seed) else {
         return EMFILE;
     };
@@ -4039,6 +4332,9 @@ fn open_created_sibling(row: usize, existing: usize) -> i64 {
     };
     FILE_CREATED[row][fid].store(true, Ordering::Release);
     FILE_OPNAME[row][fid].store(opname, Ordering::Release);
+    if let Some(nameid) = (opname as usize).checked_sub(1) {
+        openf_incref(nameid);
+    }
     install_file_handle(row, fid, CAP_READ | CAP_WRITE)
 }
 
@@ -5837,6 +6133,22 @@ static U10DX_WITNESS: AtomicU32 = AtomicU32::new(0);
 static U10DX_DONE: AtomicU32 = AtomicU32::new(0);
 /// A killed U10 DELETE fixture — a real bug (register-only apart from its read-back dest store). Off the U1b counter.
 static U10DX_KILLED: AtomicU32 = AtomicU32::new(0);
+
+/// U11x M2: the witness bitmask the cross-process unlink fixture (`u11m2-unlink`) reports: bit0 a PLAIN RW open
+/// of ANOTHER process's created file -> a handle (the cross-row sibling open); bit1 read -> the launcher's
+/// pattern (content crossed processes); bit2 SYS_UNLINK -> 0 (the deferred cross-process unlink); bit3 a read
+/// through the invalidated sibling -> `-EACCES`; bit4 a plain re-open -> `-ENOENT` (gone globally, even while
+/// the launcher still holds it open); bit5 an O_CREAT re-create -> `-EBUSY` (refused until the deferred delete
+/// completes). Must match `add r12, {1,2,4,8,16,32}` in `unaos_user_u11m2_unlink`. The pi4 `el0-u11defer-b`
+/// witness's x86 shape.
+const U11M2_WITNESS_ALL: u32 = 0x3F;
+/// The U11x M2 fixture's final witness bitmask (its `sys_exit` status, routed by name — the u5x/u9x idiom).
+static U11M2_WITNESS: AtomicU32 = AtomicU32::new(0);
+/// The U11x M2 fixture reached its witness exit — a COUNT (the fixture runs once per phase; the launcher gates
+/// phase N's read on `>= N`).
+static U11M2_DONE: AtomicU32 = AtomicU32::new(0);
+/// A killed U11x M2 fixture — a real bug (register-only apart from its read-back dest store). Off the U1b counter.
+static U11M2_KILLED: AtomicU32 = AtomicU32::new(0);
 
 /// U4x fixture run parameters: the parent's + orphan's ring-3 entry VAs (both inside the shared window
 /// VA — only the slot FRAME differs, via CR3), the shared initial user rsp, and each fixture's slot
@@ -7751,7 +8063,7 @@ fn u10dx_run(demo_cpu: usize) {
                     count += 1;
                 }
                 drained &= count == 1 && u10_flush_all_free() && !U10_OVERFLOW.load(Ordering::Acquire);
-                (drained, u10dx_ondisk_delete_ok(&fs, f0))
+                (drained, u10dx_ondisk_delete_ok(&fs, U10D_NAME, f0))
             }
             Err(_) => (false, false),
         }
@@ -7779,13 +8091,13 @@ fn u10dx_run(demo_cpu: usize) {
     }
 }
 
-/// U10 DELETE on-disk proof (fresh re-read via `fs`): DELME.BIN is GONE from the directory, the cluster `f0` the
-/// create+grow drain allocated is FREE (`0`) in EVERY FAT copy, and `first_free_cluster` is `f0` again (the freed
-/// cluster is re-allocatable). The drain having returned true already proves the file genuinely EXISTED at `f0`
-/// with the written size mid-op (the existence witness in `u10_drain_create_grow_delete`), so these three checks
-/// are non-vacuous.
-fn u10dx_ondisk_delete_ok(fs: &crate::fs::fat::FatFs, f0: u32) -> bool {
-    if fs.find_located(U10D_NAME).is_ok() {
+/// U10/U11x-M2 DELETE on-disk proof (fresh re-read via `fs`): `name` is GONE from the directory, the cluster
+/// `f0` the create+grow drain allocated is FREE (`0`) in EVERY FAT copy, and `first_free_cluster` is `f0` again
+/// (the freed cluster is re-allocatable). The drain having returned true already proves the file genuinely
+/// EXISTED at `f0` with the written size mid-op (the existence witness in `u10_drain_create_grow_delete`), so
+/// these three checks are non-vacuous. Shared by `u10dx_run` (DELME.BIN) and `u11m2_phase` (DEFER.BIN).
+fn u10dx_ondisk_delete_ok(fs: &crate::fs::fat::FatFs, name: &str, f0: u32) -> bool {
+    if fs.find_located(name).is_ok() {
         return false; // not gone
     }
     let nf = fs.num_fats();
@@ -7926,6 +8238,228 @@ fn u11x_launcher(demo_cpu: usize) {
             U11X_DONE.load(Ordering::Acquire),
             U11X_WITNESS_ALL,
         );
+    }
+    // U11x M2: chain the cross-process unlink-defers-free demo (program order, the u9x->u10x->..->u11x idiom).
+    u11m2_launcher(demo_cpu);
+}
+
+/// Build a U11x M2 fixture slot — the `u11x_build` shape for the `u11m2-unlink` blob.
+fn u11m2_build() -> Option<U7xFix> {
+    let slot = crate::arch::memory::alloc_user_space()?;
+    let bstart = &raw const unaos_user_u11m2_blob_start as usize;
+    let bend = &raw const unaos_user_u11m2_blob_end as usize;
+    let blen = bend - bstart;
+    assert!(blen as u64 <= PAGE_SIZE, "U11m2 blob does not fit in a code page");
+    let off = (&raw const unaos_user_u11m2_unlink as usize - bstart) as u64;
+    let backing = crate::arch::memory::slot_backing_ptr(slot);
+    unsafe {
+        core::ptr::write_bytes(backing, 0, (USER_WINDOW_PAGES * PAGE_SIZE) as usize);
+        core::ptr::copy_nonoverlapping(bstart as *const u8, backing, blen);
+    }
+    Some(U7xFix {
+        entry: USER_BASE + off,
+        sp: USER_BASE + USER_WINDOW_PAGES * PAGE_SIZE - 16,
+        cr3: crate::arch::memory::slot_cr3(slot),
+        slot,
+    })
+}
+
+/// One U11x M2 phase: the launcher plays "process S" on the held scratch row `srow` — CREATE DEFER.BIN through
+/// the PRODUCT open path (`open_create_new`), write the pattern into its wstage, then spawn the EL0
+/// `u11m2-unlink` fixture (its OWN slot/row — the allocator cannot hand it `srow`, which is held) to open the
+/// file CROSS-PROCESS and unlink it. After the fixture exits + tears down, prove the DEFER (C1): the delete op
+/// is still HELD (disk mode), the file is unlink-PENDING at refcount 1 (only `srow`'s open left), the name is
+/// globally deleted — and `srow`'s descriptor still reads the ORIGINAL bytes (cross-process read-after-unlink).
+/// Then RELEASE via the product path this phase exercises — `via_teardown == false`: the SYS_CLOSE core
+/// (`files_free` + `handle_clear`), the explicit last-close; `via_teardown == true`: `free_user_space_by_cr3`,
+/// the REAL whole-task teardown funnel (`clear_handle_row` -> `clear_files_row` -> the teardown decref — the pi4
+/// M2b exit-without-close path; this also frees `srow` itself, so it must be the LAST phase). Prove the release
+/// (C2: op drainable, refcount 0, pending cleared), then drain at IF=1 (count == 1) and prove on disk: name
+/// GONE, chain freed in every FAT copy, cluster re-allocatable, and the name re-creatable again
+/// (`DYN_DELETED_G` cleared at the drain). In-memory mode (no FAT): the fixture witness + C1/C2 run identically
+/// minus the held-op/disk checks (the release clears `DYN_DELETED_G` instead — the no-queued-op arm). Returns
+/// PASS; prints its own FAIL diagnostics. `want_done` gates the fixture-exit wait (the fixture runs once per
+/// phase; `U11M2_DONE` is a cumulative count).
+fn u11m2_phase(srow: usize, demo_cpu: usize, via_teardown: bool, want_done: u32) -> bool {
+    let phase = if via_teardown { "teardown-release" } else { "close-release" };
+    let nameid = match u10_name_id(U11M2_NAME) {
+        Some(id) => id as usize,
+        None => return false,
+    };
+    let disk_present = HELLO_STAGED.load(Ordering::Acquire);
+    // Pre-flight at IF=1 (disk mode): DEFER.BIN absent (self-heal a persistent card) + snapshot the first free
+    // cluster the drain's create+grow will deterministically allocate (the u10dx_run discipline).
+    let (ready, f0) = if disk_present && u10_preflight_absent(U11M2_NAME) {
+        match crate::fs::fat::mount().ok().and_then(|fs| fs.first_free_cluster().ok()) {
+            Some(c) => (true, c),
+            None => (false, 0),
+        }
+    } else {
+        (false, 0)
+    };
+    // "Process S": create DEFER.BIN on the scratch row through the PRODUCT open path, then write the pattern
+    // into its wstage (the launcher stands in for the pi4 fixture A; opens/writes complete strictly BEFORE the
+    // fixture spawns, so the cross-row snapshot-copy hazard cannot fire in the demo).
+    let h = open_create_new(srow, nameid as u32);
+    if h < 0 {
+        serial_println!(":: U11m2({}): scratch-row create failed ({}) ::", phase, h);
+        return false;
+    }
+    let Some((_, fid)) = created_desc_any_row(srow, nameid as u32) else {
+        serial_println!(":: U11m2({}): created descriptor not found on the scratch row ::", phase);
+        // Defensive leg ("can't happen" — open_create_new just created it): sweep the whole scratch row so the
+        // unfindable descriptor + its refcount cannot strand, then drop the handle.
+        clear_files_row(srow);
+        handle_clear(srow, h as usize);
+        return false;
+    };
+    let Some(w) = (FILE_WSTAGE[srow][fid].load(Ordering::Acquire) as usize).checked_sub(1) else {
+        serial_println!(":: U11m2({}): created descriptor has no wstage ::", phase);
+        files_free(srow, fid); // defensive leg: release before returning (no stranded refcount)
+        handle_clear(srow, h as usize);
+        return false;
+    };
+    wstage_write_at(w, 0, U11M2_PATTERN.as_ptr() as u64, U11M2_PATTERN.len());
+    wstage_set_len_at_least(w, U11M2_PATTERN.len() as u32);
+    FILE_SIZE[srow][fid].store(U11M2_PATTERN.len() as u32, Ordering::Release);
+
+    // Spawn the cross-process actor. `srow` is HELD (allocated), so the fixture's slot is necessarily distinct.
+    let fix = match u11m2_build() {
+        Some(f) => f,
+        None => {
+            serial_println!(":: U11m2({}): no free address-space slot — releasing + skipping ::", phase);
+            files_free(srow, fid);
+            handle_clear(srow, h as usize);
+            return false;
+        }
+    };
+    debug_assert!(fix.slot != srow, "u11m2: fixture landed on the held scratch row");
+    U11M2_WITNESS.store(0, Ordering::Release);
+    crate::arch::sched::spawn_user_in_space("u11m2-unlink", fix.entry, fix.sp, demo_cpu, fix.cr3);
+
+    // Wait (bounded) for the fixture's witness exit, then for its teardown. NOTE: no `wstage_all_free()` in the
+    // predicate — the launcher's own `srow` wstage is legitimately live across this whole phase.
+    let vdeadline = crate::arch::ticks() + 5000;
+    while U11M2_DONE.load(Ordering::Acquire) < want_done && crate::arch::ticks() < vdeadline {
+        crate::arch::sched::yield_now();
+    }
+    let witness = U11M2_WITNESS.load(Ordering::Acquire);
+    let killed = U11M2_KILLED.load(Ordering::Acquire);
+    let tdeadline = crate::arch::ticks() + 2000;
+    while !(files_row_is_clear(fix.slot) && handle_row_is_clear(fix.slot)) && crate::arch::ticks() < tdeadline
+    {
+        crate::arch::sched::yield_now();
+    }
+    let cleared = files_row_is_clear(fix.slot) && handle_row_is_clear(fix.slot);
+
+    // C1 — the DEFER is observable: the file is unlink-PENDING at refcount 1 (only srow's open left), the name
+    // is globally gone, the delete op sits HELD (disk mode; NU10 == 1 -> entry 0), and srow's descriptor still
+    // serves the ORIGINAL bytes (cross-process read-after-unlink — the pi4 A-side witness).
+    let c1 = OPENF_REFS[nameid].load(Ordering::Acquire) == 1
+        && OPENF_PENDING[nameid].load(Ordering::Acquire)
+        && DYN_DELETED_G[nameid].load(Ordering::Acquire)
+        && (!disk_present
+            || (U10_USED[0].load(Ordering::Acquire) && U10_HELD[0].load(Ordering::Acquire)))
+        && wstage_bytes(w).get(..U11M2_PATTERN.len()) == Some(&U11M2_PATTERN[..]);
+
+    // RELEASE — the phase's product path (see the doc comment). Both funnel into the same `openf_decref` seam.
+    if via_teardown {
+        crate::arch::memory::free_user_space_by_cr3(crate::arch::memory::slot_cr3(srow));
+    } else {
+        files_free(srow, fid);
+        handle_clear(srow, h as usize);
+    }
+
+    // C2 — the release happened: refcount 0, pending consumed; disk mode: the op is now DRAINABLE (still queued,
+    // hold dropped); no-FAT mode: the in-memory delete completed (the name is re-creatable NOW).
+    let c2 = OPENF_REFS[nameid].load(Ordering::Acquire) == 0
+        && !OPENF_PENDING[nameid].load(Ordering::Acquire)
+        && if disk_present {
+            U10_USED[0].load(Ordering::Acquire) && !U10_HELD[0].load(Ordering::Acquire)
+        } else {
+            !DYN_DELETED_G[nameid].load(Ordering::Acquire)
+        };
+
+    // Drain at IF=1 (disk mode): exactly ONE op (the released delete), every disk step true, then the on-disk
+    // proof + the name re-creatable again (`DYN_DELETED_G` cleared at the drain).
+    let (drained, deleted_ok) = if disk_present {
+        match crate::fs::fat::mount() {
+            Ok(fs) => {
+                let mut drained = true;
+                let mut count = 0u32;
+                while let Some(one) = u10_flush_drain_one(&fs) {
+                    drained &= one;
+                    count += 1;
+                }
+                drained &= count == 1 && u10_flush_all_free() && !U10_OVERFLOW.load(Ordering::Acquire);
+                let ok = u10dx_ondisk_delete_ok(&fs, U11M2_NAME, f0)
+                    && !DYN_DELETED_G[nameid].load(Ordering::Acquire);
+                (drained, ok)
+            }
+            Err(_) => (false, false),
+        }
+    } else {
+        (false, false)
+    };
+
+    let core_ok = witness == U11M2_WITNESS_ALL && cleared && killed == 0 && c1 && c2;
+    let pass = core_ok && (!disk_present || (ready && drained && deleted_ok));
+    if !pass {
+        serial_println!(
+            ":: U11m2({}) FAIL — disk_present={} ready={} witness={:#x} cleared={} killed={} c1={} c2={} drained={} deleted_ok={} done={} (want disk?ready/{:#x}/true/0/true/true/true/true : {:#x}/…) ::",
+            phase, disk_present, ready, witness, cleared, killed, c1, c2, drained, deleted_ok,
+            U11M2_DONE.load(Ordering::Acquire), U11M2_WITNESS_ALL, U11M2_WITNESS_ALL,
+        );
+    }
+    pass
+}
+
+/// U11x M2 launcher + verdict — cross-process unlink-defers-free, the x86 twin of pi4 U11 M2/M2b (aarch64
+/// `b88d2ba`/`303e271`): a file's deferred on-disk DELETE fires at the LAST close ACROSS PROCESSES, not at
+/// unlink — the launcher's IF=1 drain playing the pi4 reaper. Two phases over the same machinery, one per
+/// release path: (1) explicit last CLOSE (the SYS_CLOSE core), (2) whole-task TEARDOWN (`free_user_space_by_cr3`
+/// — exit-without-close, the pi4 M2b orphan). Chained off `u11x_launcher` (LAST in the demo chain). The scratch
+/// row is a REAL allocated slot held across both phases (never a hardcoded row — the fixture's allocator must
+/// not be able to claim it); phase 2's teardown-release frees it, and every failure path releases before
+/// returning, so no held op or pending name can strand for the boot.
+fn u11m2_launcher(demo_cpu: usize) {
+    static DONE: AtomicBool = AtomicBool::new(false);
+    if DONE.swap(true, Ordering::Relaxed) {
+        return;
+    }
+    if crate::drivers::block::info().is_none() {
+        return;
+    }
+    let Some(srow) = crate::arch::memory::alloc_user_space() else {
+        serial_println!(":: U11m2: no free scratch slot — cross-process unlink demo skipped ::");
+        return;
+    };
+    serial_println!(
+        ":: U11m2: cross-process unlink-defers-free — a file another process holds open survives its unlink until the LAST close/teardown releases the deferred delete (pi4 U11 M2/M2b twin) ::"
+    );
+    let p1 = u11m2_phase(srow, demo_cpu, false, 1);
+    // Phase 2 re-creates DEFER.BIN (legal again — phase 1's drain/release cleared the deleted flag) and releases
+    // via the REAL teardown funnel, which also frees `srow` itself. On a phase-1 failure, still run it: it
+    // release-cleans the scratch row either way (the unconditional-cleanup discipline).
+    let p2 = u11m2_phase(srow, demo_cpu, true, 2);
+    if !p2 {
+        // A phase-2 failure may have exited on a leg BEFORE its teardown-release — tear the scratch row down
+        // unconditionally so neither the slot nor a lingering descriptor/refcount strands for the boot
+        // (idempotent if phase 2 already released: the row and handle row are simply already clear).
+        crate::arch::memory::free_user_space_by_cr3(crate::arch::memory::slot_cr3(srow));
+    }
+    if p1 && p2 {
+        if HELLO_STAGED.load(Ordering::Acquire) {
+            serial_println!(
+                ":: U11m2: cross-process unlink-defers-free — open-across-rows + read-after-unlink OK, delete op HELD past unlink, released at last CLOSE and at TEARDOWN, re-create -EBUSY while pending, DELETED on FAT (gone + chain freed all copies + re-allocatable + name re-creatable) -> PASS ::"
+            );
+        } else {
+            serial_println!(
+                ":: U11m2: cross-process unlink-defers-free — open-across-rows + read-after-unlink OK, released at last CLOSE and at TEARDOWN, re-create -EBUSY while pending (in-memory core; no FAT volume, delete-flush is a no-op) -> PASS ::"
+            );
+        }
+    } else {
+        serial_println!(":: U11m2: cross-process unlink-defers-free FAIL — p1={} p2={} ::", p1, p2);
     }
 }
 

@@ -588,6 +588,53 @@ Legend: **✅ metal-confirmed** · **🔬 QEMU-green, metal pending** · dates I
   U10 by re-flashing; the self-heal makes it idempotent across reboots.
 - **Commits:** `hw-rmbp` — M1 `6a54a76`, M2 `39ae5c5`, M3 `4471d34`, review fix `91c93b8`; Opus-executed.
 
+### U11x M2 — cross-process open refcounts + unlink-defers-free: the deferred DELETE fires at the LAST close across processes (x86) 🔬 `hw-rmbp`
+- **What:** the x86 twin of pi4 U11 M2/M2b (`b88d2ba`/`303e271`) — closes the U10-ledgered cross-process gap: a
+  file open in ANOTHER process when unlinked no longer has its delete fire immediately; the deferred
+  `CreateGrowDelete` op is enqueued **HELD** and released by the LAST descriptor release across all rows —
+  explicit `SYS_CLOSE` or whole-task TEARDOWN (`free_user_space_by_cr3` → `clear_files_row`, the pi4 M2b
+  exit-without-close orphan). The launcher's IF=1 drain plays the pi4 reaper (x86 needs no kernel task — the
+  release is one atomic store, legal at IF=0).
+- **Shape (x86-idiomatic, simpler than pi4 by construction):** the created-file identity space is the static
+  `U10_NAMES` table, so the global refcount table is indexed DIRECTLY by name-id (`OPENF_REFS`/`OPENF_PENDING`/
+  `OPENF_HELDSLOT`, pure atomics — no lock, no row allocation) instead of pi4's `SpinMutex` table keyed by the
+  recyclable `(dir_lba, dir_off)`; and because an O_CREAT re-create of a delete-pending name is REFUSED with the
+  new **`-EBUSY`** (until the delete drains — or, no-FAT, until the last-close release), the pi4 recycled-slot-key
+  aliasing class (`b863304`) cannot exist here. The per-row `DYN_DELETED` overlay became GLOBAL (`DYN_DELETED_G`):
+  unlink hides the name from EVERY row in-handler (plain re-open `-ENOENT` anywhere), cleared exactly when the
+  delete completes. New capability: `sys_open` resolves a live created file in ANY private row
+  (`created_desc_any_row`) — a cross-process sibling open snapshot-copies the source wstage (incref before
+  `install_file_handle`, so its EAGAIN unwind through `files_free` pairs the decref exactly once — every
+  release path funnels through the ONE `openf_decref` seam).
+- **Proof (`u11m2_launcher`, chained after `u11x_launcher`; TWO phases over one EL0 fixture):** the launcher
+  plays "process S" on a REAL allocated scratch slot (held across the phase so the fixture's allocator can never
+  claim it): product-path `open_create_new` of DEFER.BIN + pattern write; the EL0 `u11m2-unlink` fixture (own
+  slot) then proves witness `0x3F` — cross-row plain-RW open, read-back of the OTHER process's bytes, unlink → 0,
+  invalidated-sibling read `-EACCES`, re-open `-ENOENT`, re-create `-EBUSY`. C1 (the DEFER, after fixture
+  teardown): op still HELD + refcount 1 + pending + S's descriptor still reads the ORIGINAL bytes
+  (cross-process read-after-unlink). Release phase 1 = the SYS_CLOSE core (`files_free`+`handle_clear`);
+  phase 2 = the REAL teardown funnel (`free_user_space_by_cr3`). C2: released (drainable / refcount 0 / pending
+  consumed). Drain: exactly ONE op, on-disk gone + chain freed in all FAT copies + cluster re-allocatable +
+  name re-creatable again. In-memory (no-FAT) mode runs the identical witness + C1/C2 minus disk checks.
+- **Review:** adversarial pre-code design review (1 reviewer, 5 confirmed must-fixes folded before coding:
+  teardown `CreateGrow` suppressed for delete-pending names — else queue overflow + on-disk resurrection;
+  deleted-flag check FIRST in the open path — else the any-row scan un-deletes a pending file; incref pinned
+  before handle-install — else the EAGAIN unwind underflows the count and strands the name for the boot;
+  scratch row from the real allocator — a hardcoded row a fixture could land on would leak the launcher's
+  handle into ring 3; no-FAT release clears the deleted flag — else permanent `-EBUSY`). One code-level find at
+  gate time (the wstage pool needed 3 concurrent buffers), fixed as `NWSTAGE = 3`.
+- **Gate:** `./arroyo check` both arches (zero aarch64 files); `./arroyo test 40` MISSION SUCCESS, 17 PASS 0
+  FAIL (U11m2 in-memory core PASS, all priors unchanged); `UNAOS_FATIMG=sf ./arroyo test-fat sf 300` **21 PASS
+  0 FAIL** (U11m2 on-disk PASS appended, 20 priors); `UNAOS_FATIMG=p16 ./arroyo test-fat p16 300` 21 PASS 0
+  FAIL (FAT16); `UNAOS_NOSTORAGE=1 ./arroyo test 90` clean skip (storage-gated, chain-inherited).
+- **Honest divergences (ledgered in SECURITY.md):** the on-disk half is still the U10 launcher-side REPLAY;
+  re-create-while-pending is `-EBUSY` (pi4 allows an immediate re-create as a new file); the cross-row sibling
+  open is a SNAPSHOT copy (a concurrent writer in the source row could torn-copy, and a sibling that writes and
+  exits would enqueue its own op against `NU10 == 1` — demo-sequenced, product fix = the pi4 lock + per-file
+  backing); `SYS_CLOSE` still discards un-flushed dirty bytes (unchanged; now explicitly ledgered).
+- **Metal:** storage-gated like the chain; the xHCI fix (`3bee9d6`) is metal-confirmed, so a future attended
+  bench can metal-confirm U11m2 directly off the FAT card (self-healing pre-flight keeps re-runs honest).
+
 ---
 ## hw-jetson track — 2026-07-08 (code arc — QEMU-green + adversarial-review-clean; USB-behaviour metal-pending)
 
