@@ -338,12 +338,22 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
             }
         },
         "vug" => {
-             if args.len() > 0 && args[0] == "bebox" {
-                 console.println("Initializing GeekPort Simulation...");
-                 vug::run_bebox_mode(pal);
-             } else {
-                 console.println("Initiating Vug: Standard Spectrum...");
-                 vug::run_test_pattern(pal);
+             match args.first().copied() {
+                 Some("bebox") => {
+                     console.println("Vug: BeBox tribute (press any key)...");
+                     vug::run_bebox_mode(pal);
+                     // Tribute screen stays up; `took_screen` keeps the console off it.
+                 }
+                 Some("wire") => {
+                     console.println("Vug: sculpting the quartz (wireframe)...");
+                     vug::run_crystal(pal, vug::Mode::Wire);
+                     console.draw(pal); // clean exit: restore the shell over the demo
+                 }
+                 _ => {
+                     console.println("Vug: sculpting the quartz (solid)...");
+                     vug::run_crystal(pal, vug::Mode::Solid);
+                     console.draw(pal); // clean exit: restore the shell over the demo
+                 }
              }
         },
         "sched" | "ps" => {

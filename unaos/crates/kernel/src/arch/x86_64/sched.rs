@@ -279,6 +279,14 @@ impl SchedCpu {
 
 static SCHED: [SchedCpu; MAX_CPUS] = [const { SchedCpu::new() }; MAX_CPUS];
 
+/// VUG-1 M3b — per-CPU load counters for the demo's "CPU pulse" meter (BeOS-Pulse style). Additive,
+/// lock-free, relaxed: `run()` bumps `CPU_BUSY[cpu]` each time it dispatches a task and `CPU_IDLE[cpu]`
+/// each time it idles (`hlt`). The demo samples both once per frame and shows busy/(busy+idle) over
+/// the window as a per-core bar. Introspection only — never read on any scheduling path. This is the
+/// SEAM a real per-core utilization feed would replace.
+static CPU_BUSY: [AtomicU64; MAX_CPUS] = [const { AtomicU64::new(0) }; MAX_CPUS];
+static CPU_IDLE: [AtomicU64; MAX_CPUS] = [const { AtomicU64::new(0) }; MAX_CPUS];
+
 /// True once the BSP has finished SMP verification and turned scheduling on. Gates the timer
 /// handler's preempt branch so the pre-scheduler smoke test (`smp::verify_smp`) is provably
 /// identical to before (no context switches during it).
@@ -1705,6 +1713,7 @@ fn run() -> ! {
         };
         match next {
             Some(task) => {
+                CPU_BUSY[cpu].fetch_add(1, Ordering::Relaxed); // M3b CPU-pulse meter (introspection)
                 task.state.store(STATE_RUNNING, Ordering::Release);
                 // Fresh quantum + clear the reschedule signal, and publish the running priority so a
                 // remote waker/spawner can tell whether a newly-ready task should preempt us.
@@ -1799,6 +1808,7 @@ fn run() -> ! {
                 // returns past the `hlt`, so a wake that arrived in the empty-check window is not
                 // lost. On wake we loop back to the top (which `cli`s) and re-check the queue +
                 // sleepers.
+                CPU_IDLE[cpu].fetch_add(1, Ordering::Relaxed); // M3b CPU-pulse meter (introspection)
                 x86_64::instructions::interrupts::enable_and_hlt();
             }
         }
@@ -1874,6 +1884,20 @@ pub fn run_queue_len(cpu: usize) -> usize {
         return 0;
     }
     RUN_QUEUES[cpu].lock().len()
+}
+
+/// VUG-1 M3b: number of CPUs the "CPU pulse" meter should show (online cores, capped at MAX_CPUS).
+pub fn meter_cpu_count() -> usize {
+    core::cmp::min(crate::arch::acpi::cpu_count().max(1), MAX_CPUS)
+}
+
+/// VUG-1 M3b: cumulative `(busy, idle)` dispatch/idle counts for `cpu` (see `CPU_BUSY`/`CPU_IDLE`).
+/// The demo diffs these across a frame window to derive a per-core load fraction. Introspection only.
+pub fn meter_cpu_ticks(cpu: usize) -> (u64, u64) {
+    if cpu >= MAX_CPUS {
+        return (0, 0);
+    }
+    (CPU_BUSY[cpu].load(Ordering::Relaxed), CPU_IDLE[cpu].load(Ordering::Relaxed))
 }
 
 /// Name of the task currently running on THIS CPU, or `None` if the CPU is idle. `name` is a

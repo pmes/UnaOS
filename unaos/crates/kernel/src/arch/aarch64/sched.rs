@@ -159,6 +159,14 @@ impl SchedCpu {
 
 static SCHED: [SchedCpu; NUM_CPUS] = [const { SchedCpu::new() }; NUM_CPUS];
 
+/// VUG-1 M3b — per-CPU load counters for the demo's "CPU pulse" meter (BeOS-Pulse style). Additive,
+/// lock-free, relaxed: `dispatch_next` bumps `CPU_BUSY[cpu]` when it dispatches a task and
+/// `CPU_IDLE[cpu]` when the run queue is empty (the core idles). The demo samples both once per frame
+/// and shows busy/(busy+idle) over the window as a per-core bar. Introspection only — never read on
+/// any scheduling path. This is the SEAM a real per-core utilization feed would replace.
+static CPU_BUSY: [AtomicU64; NUM_CPUS] = [const { AtomicU64::new(0) }; NUM_CPUS];
+static CPU_IDLE: [AtomicU64; NUM_CPUS] = [const { AtomicU64::new(0) }; NUM_CPUS];
+
 /// Per-CPU ready queues. `VecDeque::new` is const, so no lazy_static; a `push` may allocate, but
 /// only at `spawn` (never under the switch), so the brief lock is realloc-free in the hot path.
 static RUN_QUEUES: [SpinMutex<VecDeque<Box<Task>>>; NUM_CPUS] =
@@ -727,9 +735,11 @@ pub fn timer_preempt() {
 fn dispatch_next(cpu: usize) -> bool {
     mask_irq();
     let Some(task) = RUN_QUEUES[cpu].lock().pop_front() else {
+        CPU_IDLE[cpu].fetch_add(1, Ordering::Relaxed); // M3b CPU-pulse meter (introspection)
         unmask_irq();
         return false;
     };
+    CPU_BUSY[cpu].fetch_add(1, Ordering::Relaxed); // M3b CPU-pulse meter (introspection)
     task.state.store(STATE_RUNNING, Ordering::Release);
     SCHED[cpu].quantum.store(QUANTUM_TICKS, Ordering::Relaxed);
     let raw = Box::into_raw(task);
@@ -783,6 +793,20 @@ fn dispatch_next(cpu: usize) -> bool {
         }
     }
     true
+}
+
+/// VUG-1 M3b: number of CPUs the "CPU pulse" meter should show. Arch-neutral mirror of the x86 accessor.
+pub fn meter_cpu_count() -> usize {
+    NUM_CPUS
+}
+
+/// VUG-1 M3b: cumulative `(busy, idle)` dispatch/idle counts for `cpu` (see `CPU_BUSY`/`CPU_IDLE`).
+/// The demo diffs these across a frame window to derive a per-core load fraction. Introspection only.
+pub fn meter_cpu_ticks(cpu: usize) -> (u64, u64) {
+    if cpu >= NUM_CPUS {
+        return (0, 0);
+    }
+    (CPU_BUSY[cpu].load(Ordering::Relaxed), CPU_IDLE[cpu].load(Ordering::Relaxed))
 }
 
 /// Park a task that switched back BLOCKED, per the action it set before switching. Runs in the

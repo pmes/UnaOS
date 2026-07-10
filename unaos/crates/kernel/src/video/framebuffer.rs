@@ -157,6 +157,38 @@ impl FrameBuffer {
         }
     }
 
+    /// Draw a line from `(x0, y0)` to `(x1, y1)` with the integer Bresenham algorithm. Endpoints
+    /// are signed so off-screen segments clip cleanly (each pixel is bounds-checked by `put_pixel`).
+    /// The engine primitive the `vug` renderer draws wireframes with.
+    pub fn draw_line(&self, x0: i32, y0: i32, x1: i32, y1: i32, color: u32) {
+        if self.base == 0 {
+            return;
+        }
+        let dx = (x1 - x0).abs();
+        let dy = -(y1 - y0).abs();
+        let sx = if x0 < x1 { 1 } else { -1 };
+        let sy = if y0 < y1 { 1 } else { -1 };
+        let mut err = dx + dy;
+        let (mut x, mut y) = (x0, y0);
+        loop {
+            if x >= 0 && y >= 0 {
+                self.put_pixel(x as usize, y as usize, color);
+            }
+            if x == x1 && y == y1 {
+                break;
+            }
+            let e2 = 2 * err;
+            if e2 >= dy {
+                err += dy;
+                x += sx;
+            }
+            if e2 <= dx {
+                err += dx;
+                y += sy;
+            }
+        }
+    }
+
     /// Copy `src` bytes into the framebuffer starting at `byte_offset` (bounds-checked, no-op if
     /// it would overrun). This is the double-buffer flush primitive: a bulk sequential copy onto
     /// the framebuffer, which on real hardware is slow/write-combining — sequential bulk copies
