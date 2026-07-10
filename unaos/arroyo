@@ -609,6 +609,55 @@ show_menu() {
     esac
 }
 
+# --- Full battery: the one-command merge-window suite (seat runs this before every merge) ---
+# Runs every gate serially, prints one ✅/❌ verdict line per step, exits nonzero on any failure.
+# Verdicts come from the serial logs (read with awk — control bytes break plain grep).
+battery() {
+    local t0=$SECONDS rc=0 results=""
+    local blog_dir="target/battery"; mkdir -p "$blog_dir"
+
+    _step() { # name, expected-pattern (empty = rc only), logfile[:verdictfile], cmd...
+        # kernel8-test doesn't echo its serial log to stdout, so a step may name a separate
+        # verdict file (logfile:verdictfile) — patterns are checked there instead.
+        local name="$1" pattern="$2" logf="${3%%:*}" vf="${3#*:}"; shift 3
+        echo -e "${COLOR_CYAN}⚡ battery: ${name}${COLOR_RESET}"
+        if "$@" > "$logf" 2>&1; then local crc=0; else local crc=$?; fi
+        local ok=1
+        [ "$crc" -ne 0 ] && ok=0
+        if [ -n "$pattern" ]; then
+            awk -v p="$pattern" 'BEGIN{f=1} $0 ~ p {f=0} END{exit f}' "$vf" || ok=0
+        fi
+        # Any explicit FAIL verdict line in a serial-backed step is a failure.
+        awk 'BEGIN{f=0} /-> FAIL|FAIL ::/{f=1} END{exit f}' "$vf" || ok=0
+        if [ "$ok" -eq 1 ]; then
+            results="${results}  ✅ ${name}\n"
+        else
+            results="${results}  ❌ ${name}  (log: ${logf})\n"; rc=1
+        fi
+    }
+
+    _step "check (both arches)"        ""                    "$blog_dir/check.log"        "$0" check
+    _step "check (tegra)"              ""                    "$blog_dir/check-tegra.log"  env UNAOS_TEGRA=1 "$0" check
+    _step "x86 test 25 (MISSION)"      "MISSION SUCCESS"     "$blog_dir/test-x86.log"     "$0" test 25
+    _step "x86 test-fat sf 200"        "U11m2.*-> PASS"      "$blog_dir/test-fat.log"     "$0" test-fat sf 200
+    _step "arm virt v2 (MISSION)"      "MISSION SUCCESS"     "$blog_dir/test-arm-v2.log"  "$0" test-arm 22
+    _step "arm virt v3 (CAPSTONE 6/6)" "CAPSTONE COMPLETE"   "$blog_dir/test-arm-v3.log"  env UNAOS_GICV3=1 "$0" test-arm 40
+    _step "pi4 kernel8-test 35"        "CAPSTONE COMPLETE"   "$blog_dir/kernel8.log:target/serial-pi.log" "$0" kernel8-test 35
+    _step "esp-jetson (links)"         ""                    "$blog_dir/esp-jetson.log"   env UNAOS_TEGRA=1 "$0" esp-jetson
+
+    local passes; passes=$(awk '/-> PASS|: PASS/{n++} END{print n+0}' "$blog_dir/test-fat.log" target/serial-pi.log 2>/dev/null)
+    echo -e "\n${COLOR_PURPLE}════════════ BATTERY SUMMARY ($(( SECONDS - t0 ))s) ════════════${COLOR_RESET}"
+    echo -e "$results"
+    echo "  PASS lines (fat+pi): $passes   step logs: $blog_dir/"
+    echo -e "  ${COLOR_CYAN}⚠ this run clobbered any x86 esp media — rebuild UNAOS_USBDEBUG=1 esp-x86 LAST before flashing${COLOR_RESET}"
+    if [ "$rc" -eq 0 ]; then
+        echo -e "${COLOR_GREEN}✅ FULL BATTERY GREEN${COLOR_RESET}"
+    else
+        echo -e "${COLOR_RED}❌ BATTERY FAILED — see step logs${COLOR_RESET}"
+    fi
+    return $rc
+}
+
 # --- Entry Point ---
 
 case "${1:-}" in
@@ -655,6 +704,9 @@ case "${1:-}" in
     kernel8-test|test-pi)
         test_kernel8 "${2:-8}"
         ;;
+    battery)
+        battery
+        ;;
     clean)
         clean_all
         ;;
@@ -665,7 +717,7 @@ case "${1:-}" in
         ;;
     *)
         echo -e "${COLOR_RED}Unknown command: $1${COLOR_RESET}"
-        echo "Usage: ./arroyo [x86|arm|test [secs]|test-arm [secs]|check|build|esp-x86|esp-arm|esp-jetson|fat-img|test-fat [part|gpt|p16|sf] [secs]|kernel8|kernel8-run|kernel8-test [secs]|clean]"
+        echo "Usage: ./arroyo [x86|arm|test [secs]|test-arm [secs]|check|build|esp-x86|esp-arm|esp-jetson|fat-img|test-fat [part|gpt|p16|sf] [secs]|kernel8|kernel8-run|kernel8-test [secs]|battery|clean]"
         exit 1
         ;;
 esac
