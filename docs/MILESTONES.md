@@ -233,7 +233,7 @@ Legend: **✅ metal-confirmed** · **🔬 QEMU-green, metal pending** · dates I
 - **Lane:** `fs/fat.rs` (aarch64 path — seat-granted for this arc) + `arch/aarch64/syscall.rs`; **zero x86
   behavioural change** (all new code cfg-gated `target_arch = "aarch64"`).
 
-### F3 — the UnaFS namespace / FS-metadata lock (aarch64) — every F2-ledgered race CLOSED (2026-07-10) `hw-pi4`
+### F3 — the UnaFS namespace / FS-metadata lock (aarch64) — every F2-ledgered race CLOSED ✅ METAL-CONFIRMED (2026-07-10) `hw-pi4`
 - **What:** F2 serialized the single FAT-sector RMW and ledgered six residual concurrent-FS-mutation
   races (all excluded-by-sequencing today). F3 closes all six, same discipline: behaviorally-transparent
   single-core (23-PASS battery byte-equivalent), cfg-gated aarch64 locks, zero x86 OBSERVABLE-behaviour
@@ -266,6 +266,15 @@ Legend: **✅ metal-confirmed** · **🔬 QEMU-green, metal pending** · dates I
 - **Tested:** `./arroyo kernel8-test` — **23 PASS** (byte-equivalent) + CAPSTONE 6/6, only the 3 expected
   M6b kills, no leaks/faults, zero R1/CMD13 error lines, + the `F2-witness:` AND `F3-witness:` lines.
   `./arroyo check` both arches; `./arroyo test-arm` MISSION SUCCESS.
+  ✅ **METAL-CONFIRMED (2026-07-10, attended bench, real Pi 4 / EMMC2 card, post-merge tip `8757b27`):**
+  the full 23-PASS battery ran through every F3-serialized path on silicon (compare-and-claim alloc,
+  `DIR_MUTATION` dir RMWs, namespace-locked open/create/unlink sequences) — CAPSTONE 6/6 (all 4 cores),
+  zero R1/CMD13, no leaks/faults, only the 3 expected M6b kills, and NO stall around the open/create/
+  unlink fixtures (the seat's ns-span polled-I/O latency watch: clear at real card timing). **The
+  F3-witness held under TRUE parallelism + preemption: LOCKED 240000/240000 intact, UNLOCKED control
+  lost 120000/240000 (exactly 50%)**; the F2-witness re-held identically (120000/240000 this boot).
+  Honest scope unchanged: the two-cores-mid-syscall DISK-sequence interleave stays unprovokable until
+  multiple EL0 cores run FS syscalls concurrently. Serial: `~/unaos-bench/pi-serial-2026-07-10-134423.log`.
 - **Lane:** `fs/fat.rs` (aarch64 path — same seat grant as F2) + `arch/aarch64/syscall.rs`; **zero x86
   behavioural change**.
 
