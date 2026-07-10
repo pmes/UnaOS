@@ -1582,6 +1582,54 @@ was never needed — the DTB path carried it. NEXT (JD2): route the inherited US
 the panel. A blank panel after a correct verdict = wrong base/stride/format/memory-type, **not** "re-init
 needed" (do not reset the DC/SOR/DP).
 
+### JD2 — interactive shell on the panel: keyboard → console → shell over the inherited scanout (✅ METAL-CONFIRMED 2026-07-10)
+
+JD1 put pixels on the panel; JB10 armed a USB keyboard whose HID reports land in the shared `pal`
+event queue. JD2 joins the two: the Orin's first interactive session, drawn on the inherited scanout
+and typed on the inherited keyboard, with **no new hardware touched** — pure software routing over
+the JD1/JB10 state.
+
+**Design (all `cfg(tegra)`, all in `main.rs`'s tegra blocks — the shared renderer/console/shell are
+called, never edited):**
+
+- `tegra_early_stop` now also seeds `video::WRITER` with the JD1 scanout (the same `{base, len,
+  info}` fbcon got) — the front-buffer handle the GUI `Screen` builds over, the x86/pi pattern.
+- The JB2b `jb2-kbd` spawn is replaced by **`jd2-console`** → `main.rs::jd2_console_pump`, a
+  cooperative EL1 task on the boot-core run queue (spawned pre-drop, dispatched by
+  `run_capstone_boot_core` alongside CAPSTONE). It keeps the JB2b discipline: `poll_events` only
+  (never the `service_*` pumps — their bounded waits WFI, and the post-drop core has no timer
+  wake), busy-poll + `yield_now`, never `sleep_ticks`.
+- **Phase 1:** the JD1 boot log holds the panel; the pump polls the xHCI until the **first
+  keystroke**. **Phase 2:** `fbcon::detach()` (serial mirror off the panel; serial itself
+  unaffected), build the double-buffered `video::Screen` over `WRITER` (~9 MiB back buffer off the
+  48 MiB heap), draw the `Console`, and feed every key — including the wake-up key — through the
+  shared `handle_key` → `shell::dispatch_command`. Each keystroke repaints only the input line;
+  `Screen::flush` cleans the damaged span to PoC (`dc cvac`) once per present — the DCE scans the
+  carveout from DRAM and does not snoop, the recipe fbcon already proved on this panel. Every key
+  is also echoed to serial (`:: tegra: JD2 — KEY … ::`) so the bench proof rides both channels.
+- **Headless boot** (no JD1 handoff → `WRITER` never seeded): the task delegates to the JB2b
+  `kbd_pump_body`, so a serial-only bench keeps the exact pre-JD2 `KEY` evidence lines.
+
+**Gate:** `UNAOS_TEGRA=1 ./arroyo check` green both arches; `./arroyo test` (x86) + `test-arm`
+(aarch64 virt) green — all JD2 code is `cfg(tegra)`, off in every QEMU build, so non-tegra images
+are byte-identical by construction. ⚠ **New size datum:** `esp-jetson` `kernel.elf` = **378,728 B /
+105 `tegra:` strings** (up from JD1's 250,416 B / 101). The +128 KB is the console/shell/FAT/font
+machinery the linker previously dead-code-eliminated from the tegra image — `dispatch_command` now
+being reachable pulls it all in. This is **past the old ~355 KB "red line"**, which was only ever a
+clobbered-virt-build heuristic: from JD2 on, validate tegra media by the `tegra:`-string count
+(≈105; a virt clobber has ~0), not by size.
+
+**Metal verdict — ✅ METAL-CONFIRMED (2026-07-10, attended bench; Peter at the Orin, this session
+flashed the card itself).** Serial (`~/unaos-bench/jetson-serial-2026-07-10-090000.log`): JD1
+unchanged (`scanout … sane=true` → `panel LIVE`), keyboard ARMED on **direct root port 6 (slot 4)**,
+`JD2 — EL1 console pump task spawned` → post-drop `console pump live`, `CAPSTONE COMPLETE`, then
+the first keystroke (0x0a) → `JD2 — console OWNS the panel (Screen back buffer live)`. Peter typed
+`help` ⏎ (each key echoed as a serial `KEY` line; the command list painted on the panel — verdict
+"it works!"), then `gneiss` ⏎ and more input: **the pump survived vug** — keystrokes kept flowing
+after it, no panic/wedge (vug-on-tegra behaviour beyond survival not formally assessed this bench).
+The first interactive UnaOS session on the Orin: typed on the inherited keyboard, drawn on the
+inherited scanout, dispatched by the shared shell at EL1.
+
 ## 4. Jetson Orin Nano headless bring-up (Arc JM2)
 
 The Orin is brought up **headless over serial**. The only console that has ever

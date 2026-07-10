@@ -636,6 +636,30 @@ Legend: **✅ metal-confirmed** · **🔬 QEMU-green, metal pending** · dates I
   bench can metal-confirm U11m2 directly off the FAT card (self-healing pre-flight keeps re-runs honest).
 
 ---
+## hw-jetson track — 2026-07-10 (code arc + same-day attended bench)
+
+### JD2 — interactive shell on the Orin panel: keyboard → console → shell over the inherited scanout ✅ METAL-CONFIRMED (2026-07-10) `hw-jetson`
+- **What:** the Orin's first interactive session — join JD1 (pixels) and JB10 (armed USB keyboard) with
+  pure software routing, no new hardware touched. `tegra_early_stop` seeds `video::WRITER` with the JD1
+  scanout; the JB2b `jb2-kbd` spawn becomes `jd2-console` (`main.rs::jd2_console_pump`, cooperative EL1
+  task alongside CAPSTONE, `poll_events`-only/JC3 semantics): the boot log holds the panel until the
+  **first keystroke**, then `fbcon::detach()` + a double-buffered `video::Screen` over the scanout and
+  every key feeds the shared `handle_key` → `shell::dispatch_command` (keystrokes also echo on serial).
+  Headless boots delegate to the JB2b `kbd_pump_body` unchanged. All `cfg(tegra)` — shared
+  renderer/console/shell called, never edited.
+- **Gate:** `UNAOS_TEGRA=1 ./arroyo check` both arches + `./arroyo test` + `test-arm` green (tegra off in
+  QEMU → non-tegra byte-identical by construction). ⚠ `esp-jetson` `kernel.elf` = **378,728 B / 105
+  `tegra:` strings** — the console/shell/FAT/font machinery is now linked in (+128 KB vs JD1), past the
+  old ~355 KB heuristic; validate tegra media by the `tegra:`-string count, not size.
+- **Metal (attended, 2026-07-10, same day):** keyboard ARMED direct-root port 6 slot 4 → pump live at
+  EL1 → CAPSTONE → first key flipped the panel to the console (`console OWNS the panel`), `help` ⏎
+  dispatched with every key echoed on serial and the output painted on the panel ("it works!"); the
+  pump even survived a `gneiss` (vug) dispatch — keys kept flowing, no panic. The first interactive
+  UnaOS session on the Orin. This session also flashed the SD card itself (the old EPERM was
+  session-specific). Serial: `~/unaos-bench/jetson-serial-2026-07-10-090000.log`.
+- **Detail:** [`arch_arm64.md` §JD2](dev/OS/01_BOOT_HAL/arch_arm64.md).
+
+---
 ## hw-jetson track — 2026-07-08 (code arc — QEMU-green + adversarial-review-clean; USB-behaviour metal-pending)
 
 ### JD1 — first pixels: inherit the firmware's live scanout framebuffer ✅ METAL-CONFIRMED (Orin panel, 2026-07-08) `hw-jetson`
