@@ -1737,7 +1737,7 @@ through to `no mass storage within the settle window; proceeding` (graceful, no 
 power-cycle brought the Alcor up cleanly. So the JD3 code path is solid; the residual variability is
 hub-MSC power/timing on the real reader (a direct-root USB stick sidesteps it entirely).
 
-### JD4 — read-side FAT navigation on the panel shell + the last dead-lever retirement + screen-on-boot (🔬 QEMU-green, metal pending)
+### JD4 — read-side FAT navigation on the panel shell + the last dead-lever retirement + screen-on-boot (✅ METAL-CONFIRMED 2026-07-10)
 
 JD3 gave the panel shell a real disk but only a flat root: `ls` listed the root, `cat` took a bare
 root filename. JD4 is the READ-side navigation arc (the write path is deliberately deferred to a
@@ -1796,13 +1796,29 @@ swallowed); the timeout path draws the banner + prompt and logs
 count: −9 retired JB2c/JB9b lines +… net of the POLISH-1/2 merges the branch rebased onto; validate
 by count, not size — the elf is ~452 KB with the polish-era console/vug machinery linked).
 
-**⚠ Metal is the real verdict.** QEMU exercises the resolver only through the shared x86/virt
-paths (no tegra compile, and the headless fixtures have a root-only card). Attended-bench proof:
-boot with the FAT card present (storage at boot — the JD3 rule), watch the shell appear ON ITS OWN
-after ~8 s (M3), then `diskinfo` → `ls` → `cd <some dir>` → `pwd` → `ls` → `cat <dir>/<file>` →
-`cd ..` — plus one honest-error probe (`cd NOSUCH`, expect `-ENOENT`). A card with at least one
-subdirectory + a small text file inside it is needed on the bench (the pristine JD3 card is
-root-only).
+**Metal verdict — ✅ METAL-CONFIRMED (2026-07-10, attended bench; Peter at the Orin; serial
+`~/unaos-bench/jetson-serial-2026-07-10-135751.log`).** Peter's verdict: **PASS**, all three
+milestones in one session across three boots:
+
+- **M3 — 3/3 boots**: the panel console took over ON ITS OWN each boot (`:: tegra: JD4 — console
+  OWNS the panel (Screen back buffer live); screen-on-boot (no key, ~8 s) ::`), after CAPSTONE 6/6,
+  zero fbcon races.
+- **M2 — every boot**: zero `JB2c`/`JB9b` serial lines; keyboard + storage enumeration unaffected.
+- **M1 — boot 3** (a **FAT16** card — `UNAOSRW`, the 29 MiB pi4 fixture card with a fresh
+  `DOCS/README.TXT`, in the Alcor reader behind the hub, slot 5): the full navigation sequence on
+  the panel — `diskinfo` → `ls` (root: `<DIR> DOCS` + the pi4 fixtures) → `cd docs` → `ls` →
+  `cat readme.txt` → `pwd` → `cd ..` → `cat /docs/readme.txt` → honest-error probes `cd nosuch`
+  (`-ENOENT`) and `cat docs` (`-EISDIR`). Bonus proofs beyond the QEMU gates: the whole sequence
+  was typed **lowercase** (case-insensitive 8.3 matching on silicon) and the card is FAT16 (the
+  fixed-root → subdirectory-cluster-chain leg of `read_dir`, which the FAT32 QEMU images don't
+  exercise on tegra).
+
+⚠ Bench reconfirmed the JD3 intermittency datum, twice: boots 1–2 had the storage device on hub
+route 0x4 read `vid=0000` (failed descriptor) and the settle window fell through GRACEFULLY each
+time (`no mass storage within the settle window; proceeding` — the shell still came up, reporting
+no disk honestly). Boot 3 with the reader re-seated came up clean. Also learned: the Orin boot
+stick itself did not surface as the block device on this bench — plan on a SEPARATE data
+card/reader for tegra storage benches (the pi4-style boot-disk read is not the tegra pattern).
 
 ## 4. Jetson Orin Nano headless bring-up (Arc JM2)
 
