@@ -339,6 +339,36 @@ fn with_fat_lock<R>(f: impl FnOnce() -> R) -> R {
     f()
 }
 
+/// F3-M2: the DIRECTORY-sector mutation lock — the twin of [`FAT_MUTATION`] for the three directory-sector
+/// read-modify-writes ([`FatFs::write_dir_entry_fields`], [`FatFs::mark_dir_deleted`], and
+/// [`FatFs::create_in_root`]'s slot write). Each was a bare `read_sector -> modify -> write_sector` of a
+/// directory sector with no serialization, so two cores RMW-ing entries in the SAME directory sector could
+/// lose an update (e.g. a grow's size-publish resurrecting a racing delete's `0xE5`). One lock for the FAT and
+/// one for directories is deliberate: they guard DISJOINT sectors and the two are never nested. Same arch
+/// reasoning as `FAT_MUTATION` (aarch64-only; the x86 FAT path `hlt`-waits, masking across it would hang).
+#[cfg(target_arch = "aarch64")]
+static DIR_MUTATION: spin::Mutex<()> = spin::Mutex::new(());
+
+/// Run `f` under the directory-sector mutation lock (aarch64), or unchanged (other arches). Same IRQ-masked,
+/// non-preemptible discipline as [`with_fat_lock`] (see its doc for the deadlock reasoning). LOCK SPAN: only
+/// a single directory-sector RMW (one bounded polled read + one write) — never a directory SCAN
+/// (`find_free_root_slot` / `find_located` stay outside; the F3-M3 namespace lock serializes those sequences).
+#[cfg(target_arch = "aarch64")]
+#[inline]
+fn with_dir_lock<R>(f: impl FnOnce() -> R) -> R {
+    crate::arch::without_interrupts(|| {
+        let _guard = DIR_MUTATION.lock();
+        f()
+    })
+}
+
+/// Non-aarch64 (x86): the directory-mutation lock is inert — the [`with_fat_lock`] passthrough reasoning.
+#[cfg(not(target_arch = "aarch64"))]
+#[inline(always)]
+fn with_dir_lock<R>(f: impl FnOnce() -> R) -> R {
+    f()
+}
+
 // ---------------------------------------------------------------------------------------------------------
 // F2 M3 witness: a cross-core stress of the FAT_MUTATION serialization on an IN-RAM scratch counter — NOT the
 // on-disk FAT, so it carries zero volume risk while exercising the EXACT lock that guards `set_fat_entry`. Two
@@ -749,6 +779,19 @@ impl FatFs {
     /// the whole point of the primitive. Read-modify-write per copy so neighbouring entries in the sector are
     /// preserved; on FAT32 the reserved high 4 bits of the 32-bit slot are preserved per the Microsoft FAT spec.
     fn set_fat_entry(&self, cluster: u32, next: u32) -> Result<(), FatError> {
+        // F2: serialize the WHOLE all-copies RMW under `FAT_MUTATION`. A concurrent writer mutating a
+        // different entry in this same sector (or the other FAT copy) can no longer read-before-our-write and
+        // then clobber our update. The lock spans ONLY the bounded `num_fats` read-modify-write, so on aarch64
+        // the hold is a couple of polled sector transfers with no scheduler yield (see `with_fat_lock`). On
+        // x86 `with_fat_lock` is a zero-cost passthrough.
+        with_fat_lock(|| self.set_fat_entry_inner(cluster, next))
+    }
+
+    /// F3: the lock-FREE body of [`FatFs::set_fat_entry`] — the all-copies FAT-sector RMW with NO
+    /// `FAT_MUTATION` acquisition. The caller MUST already hold `FAT_MUTATION` (on aarch64; on x86 the lock is
+    /// inert and this is just the shared body). Factored out so `alloc_cluster`'s compare-and-claim can
+    /// re-check + claim a candidate entry inside ONE lock hold without re-entering the (non-reentrant) lock.
+    fn set_fat_entry_inner(&self, cluster: u32, next: u32) -> Result<(), FatError> {
         let offset = match self.kind {
             FatKind::Fat16 => cluster as u64 * 2,
             FatKind::Fat32 => cluster as u64 * 4,
@@ -758,31 +801,24 @@ impl FatFs {
             return Err(FatError::BadChain); // never index past the FAT region
         }
         let within = (offset % SECTOR_SIZE as u64) as usize;
-        // F2: serialize the WHOLE all-copies RMW under `FAT_MUTATION`. A concurrent writer mutating a
-        // different entry in this same sector (or the other FAT copy) can no longer read-before-our-write and
-        // then clobber our update. The lock spans ONLY this bounded `num_fats` read-modify-write — the index
-        // math above is pure and stays outside — so on aarch64 the hold is a couple of polled sector transfers
-        // with no scheduler yield (see `with_fat_lock`). On x86 `with_fat_lock` is a zero-cost passthrough.
-        with_fat_lock(|| {
-            let mut buf = [0u8; SECTOR_SIZE];
-            for f in 0..self.num_fats as u64 {
-                let lba = self.fat_start + f * self.fat_sz as u64 + sec;
-                read_sector(lba, &mut buf)?;
-                match self.kind {
-                    FatKind::Fat16 => {
-                        let v = (next & 0xFFFF) as u16;
-                        buf[within..within + 2].copy_from_slice(&v.to_le_bytes());
-                    }
-                    FatKind::Fat32 => {
-                        let existing = u32le(&buf, within);
-                        let v = (existing & 0xF000_0000) | (next & 0x0FFF_FFFF);
-                        buf[within..within + 4].copy_from_slice(&v.to_le_bytes());
-                    }
+        let mut buf = [0u8; SECTOR_SIZE];
+        for f in 0..self.num_fats as u64 {
+            let lba = self.fat_start + f * self.fat_sz as u64 + sec;
+            read_sector(lba, &mut buf)?;
+            match self.kind {
+                FatKind::Fat16 => {
+                    let v = (next & 0xFFFF) as u16;
+                    buf[within..within + 2].copy_from_slice(&v.to_le_bytes());
                 }
-                write_sector(lba, &buf)?;
+                FatKind::Fat32 => {
+                    let existing = u32le(&buf, within);
+                    let v = (existing & 0xF000_0000) | (next & 0x0FFF_FFFF);
+                    buf[within..within + 4].copy_from_slice(&v.to_le_bytes());
+                }
             }
-            Ok(())
-        })
+            write_sector(lba, &buf)?;
+        }
+        Ok(())
     }
 
     /// U10: zero-fill every sector of a data cluster. Called BEFORE a freshly allocated cluster joins a chain,
@@ -800,10 +836,21 @@ impl FatFs {
     }
 
     /// U10: allocate one data cluster — a bounded first-fit free search over `[2, count_of_clusters + 2)`,
-    /// then zero-fill it and mark it EOC in all FAT copies, returning its number READY TO LINK (a terminated
-    /// 1-cluster orphan until the caller links it onto a chain). NEVER spins (each FAT sector is read at most
-    /// once) and NEVER returns a reserved/bad/out-of-range cluster — only one whose FAT entry reads `0` (free).
-    /// `-ENOSPC` (`NoSpace`) when the volume is full. Zero-fill precedes any linkage (see [`FatFs::zero_cluster`]).
+    /// then claim it (EOC in all FAT copies) and zero-fill it, returning its number READY TO LINK (a terminated
+    /// 1-cluster orphan until the caller links it onto a chain). NEVER returns a reserved/bad/out-of-range
+    /// cluster — only one whose FAT entry reads `0` (free) INSIDE the claim's lock hold. `-ENOSPC` (`NoSpace`)
+    /// when the volume is full.
+    ///
+    /// F3-M1 (compare-and-claim — closes the F2 cluster-aliasing leg): the free SEARCH stays unlocked (cheap,
+    /// read-only), but the CLAIM re-reads the candidate's entry under `FAT_MUTATION` and sets EOC only if it is
+    /// STILL free — so two cores whose unlocked searches both saw cluster `c` free can never both claim it (the
+    /// loser sees the winner's EOC and keeps scanning; a bounded retry, each cluster visited once). ORDER
+    /// REORDERED vs U10: the claim now PRECEDES the zero-fill — zero-filling before the claim would let the
+    /// loser's zero pass scribble a cluster the winner already claimed, linked, and wrote. The disclosure
+    /// invariant is intact: the cluster is zero-filled before the CALLER links it into any chain (it is
+    /// EOC-reserved but UNLINKED during the fill, so no reader path can walk onto its stale bytes). Error path:
+    /// a zero-fill failure AFTER the claim orphans `c` (EOC, unlinked — a benign lost cluster, chkdsk-
+    /// reclaimable), never an aliased or stale-visible one.
     fn alloc_cluster(&self) -> Result<u32, FatError> {
         let entry_bytes: u64 = if self.kind == FatKind::Fat32 { 4 } else { 2 };
         let last = self.count_of_clusters + 2; // exclusive: valid data clusters are 2 ..= count+1
@@ -826,11 +873,30 @@ impl FatFs {
                 FatKind::Fat32 => u32le(&buf, within) & 0x0FFF_FFFF,
             };
             if e == 0 {
-                // Free. Zero-fill FIRST (no stale bytes when it joins a chain), then terminate it (EOC) so the
-                // caller receives a valid 1-cluster chain to link onto the tail.
-                self.zero_cluster(c)?;
-                self.set_fat_entry(c, self.eoc_value())?;
-                return Ok(c);
+                // Candidate. COMPARE-AND-CLAIM under FAT_MUTATION: re-read the entry inside the lock and
+                // claim (EOC) only if still free — a racing allocator that claimed it first loses us nothing
+                // but this re-check. The whole hold is one sector read + the bounded all-copies RMW (the
+                // `with_fat_lock` span rule). On x86 the lock is inert (single FAT writer by construction).
+                let claimed = with_fat_lock(|| -> Result<bool, FatError> {
+                    let mut cbuf = [0u8; SECTOR_SIZE];
+                    read_sector(self.fat_start + sec, &mut cbuf)?;
+                    let cur = match self.kind {
+                        FatKind::Fat16 => u16le(&cbuf, within) as u32,
+                        FatKind::Fat32 => u32le(&cbuf, within) & 0x0FFF_FFFF,
+                    };
+                    if cur != 0 {
+                        return Ok(false); // lost the race — a concurrent claim took it
+                    }
+                    self.set_fat_entry_inner(c, self.eoc_value())?;
+                    Ok(true)
+                })?;
+                if claimed {
+                    // Zero AFTER the claim (see the doc comment): EOC-reserved but unlinked, so no reader can
+                    // see stale bytes; a failure here orphans `c` (benign lost cluster) rather than aliasing.
+                    self.zero_cluster(c)?;
+                    return Ok(c);
+                }
+                loaded = u64::MAX; // our search buffer is stale (a concurrent writer mutated this sector)
             }
             c += 1;
         }
@@ -1240,15 +1306,19 @@ impl FatFs {
         if off + 32 > SECTOR_SIZE {
             return Err(FatError::Io); // a slot never straddles a sector; a bad offset is a caller bug
         }
-        let mut buf = [0u8; SECTOR_SIZE];
-        read_sector(lba, &mut buf)?;
-        let hi = (first_cluster >> 16) as u16;
-        let lo = (first_cluster & 0xFFFF) as u16;
-        buf[off + 20..off + 22].copy_from_slice(&hi.to_le_bytes());
-        buf[off + 26..off + 28].copy_from_slice(&lo.to_le_bytes());
-        buf[off + 28..off + 32].copy_from_slice(&size.to_le_bytes());
-        write_sector(lba, &buf)?;
-        Ok(())
+        // F3-M2: the whole sector RMW under DIR_MUTATION — a concurrent RMW of a NEIGHBOURING slot in this
+        // same sector can no longer read-before-our-write and clobber this publish (or vice versa).
+        with_dir_lock(|| {
+            let mut buf = [0u8; SECTOR_SIZE];
+            read_sector(lba, &mut buf)?;
+            let hi = (first_cluster >> 16) as u16;
+            let lo = (first_cluster & 0xFFFF) as u16;
+            buf[off + 20..off + 22].copy_from_slice(&hi.to_le_bytes());
+            buf[off + 26..off + 28].copy_from_slice(&lo.to_le_bytes());
+            buf[off + 28..off + 32].copy_from_slice(&size.to_le_bytes());
+            write_sector(lba, &buf)?;
+            Ok(())
+        })
     }
 
     /// U10: WRITE with GROWTH — overwrite `data` at byte offset `start`, EXTENDING the file (allocating,
@@ -1343,21 +1413,25 @@ impl FatFs {
     pub fn create_in_root(&self, name: &str, attr: u8) -> Result<(DirEntry, u64, usize), FatError> {
         let raw = format_83(name).ok_or(FatError::Unsupported)?;
         let (lba, off) = self.find_free_root_slot()?;
-        let mut buf = [0u8; SECTOR_SIZE];
-        read_sector(lba, &mut buf)?;
-        // Write a fresh 32-byte entry: 11-byte name, attr, everything else zero (NTRes/times = 0, first_cluster
-        // hi@20 lo@26 = 0, size@28 = 0). Never set the volume-label bit — this is a file/dir entry.
-        for b in buf[off..off + 32].iter_mut() {
-            *b = 0;
-        }
-        buf[off..off + 11].copy_from_slice(&raw);
-        buf[off + 11] = attr & !0x08;
-        write_sector(lba, &buf)?;
-        // Re-parse the slot we just wrote so the returned DirEntry is byte-for-byte what a reader would see.
-        match classify_dir_slot(&buf[off..off + 32]) {
-            DirSlot::Entry(de) => Ok((de, lba, off)),
-            _ => Err(FatError::Io), // unreachable: we just wrote a valid non-empty, non-LFN entry
-        }
+        // F3-M2: the slot WRITE is a sector RMW under DIR_MUTATION (the free-slot SCAN above stays outside —
+        // per the with_dir_lock span rule; the scan-then-claim slot race itself is the F3-M3 namespace lock's).
+        with_dir_lock(|| {
+            let mut buf = [0u8; SECTOR_SIZE];
+            read_sector(lba, &mut buf)?;
+            // Write a fresh 32-byte entry: 11-byte name, attr, everything else zero (NTRes/times = 0,
+            // first_cluster hi@20 lo@26 = 0, size@28 = 0). Never set the volume-label bit — a file/dir entry.
+            for b in buf[off..off + 32].iter_mut() {
+                *b = 0;
+            }
+            buf[off..off + 11].copy_from_slice(&raw);
+            buf[off + 11] = attr & !0x08;
+            write_sector(lba, &buf)?;
+            // Re-parse the slot we just wrote so the returned DirEntry is byte-for-byte what a reader sees.
+            match classify_dir_slot(&buf[off..off + 32]) {
+                DirSlot::Entry(de) => Ok((de, lba, off)),
+                _ => Err(FatError::Io), // unreachable: we just wrote a valid non-empty, non-LFN entry
+            }
+        })
     }
 
     /// U10: the on-disk location of the first FREE root-directory slot (a `0x00` end marker or a `0xE5` deleted
@@ -1429,11 +1503,15 @@ impl FatFs {
         if dir_off + 32 > SECTOR_SIZE {
             return Err(FatError::Io);
         }
-        let mut buf = [0u8; SECTOR_SIZE];
-        read_sector(dir_lba, &mut buf)?;
-        buf[dir_off] = 0xE5;
-        write_sector(dir_lba, &buf)?;
-        Ok(())
+        // F3-M2: the sector RMW under DIR_MUTATION — a racing size-publish RMW of a sibling slot in this
+        // sector can no longer resurrect the `0xE5` (lost-delete), nor this delete clobber its publish.
+        with_dir_lock(|| {
+            let mut buf = [0u8; SECTOR_SIZE];
+            read_sector(dir_lba, &mut buf)?;
+            buf[dir_off] = 0xE5;
+            write_sector(dir_lba, &buf)?;
+            Ok(())
+        })
     }
 
     /// U11-M2: free every cluster in a file's chain (each FAT entry -> `0`, in ALL FAT copies), returning the

@@ -205,6 +205,42 @@ Legend: **✅ metal-confirmed** · **🔬 QEMU-green, metal pending** · dates I
 - **Lane:** `fs/fat.rs` (aarch64 path — seat-granted for this arc) + `arch/aarch64/syscall.rs`; **zero x86
   behavioural change** (all new code cfg-gated `target_arch = "aarch64"`).
 
+### F3 — the UnaFS namespace / FS-metadata lock (aarch64) — every F2-ledgered race CLOSED (2026-07-10) `hw-pi4`
+- **What:** F2 serialized the single FAT-sector RMW and ledgered six residual concurrent-FS-mutation
+  races (all excluded-by-sequencing today). F3 closes all six, same discipline: behaviorally-transparent
+  single-core (23-PASS battery byte-equivalent), cfg-gated aarch64 locks, zero x86 OBSERVABLE-behaviour
+  change (the shared `alloc_cluster` body's on-disk write ORDERING changed on x86 too — claim before
+  zero-fill; end-state identical, crash-window ordering noted in SECURITY.md).
+  - **M1 — `alloc_cluster` compare-and-claim** (the F2 flag's last leg, cluster-aliasing CLOSED). The
+    free search stays unlocked; the CLAIM re-reads the candidate entry under `FAT_MUTATION` and sets EOC
+    only if still free (loser rescans — bounded retry via the new lock-free `set_fat_entry_inner`).
+    Zero-fill moves AFTER the claim (zeroing an unclaimed cluster could scribble a winner's linked
+    data); the cluster is EOC-reserved but unlinked during the fill, so no reader sees stale bytes; a
+    zero-fail after claim orphans it (benign lost cluster), never aliases.
+  - **M2 — `DIR_MUTATION`** (directory-sector RMW lost-update CLOSED). The aarch64-only IRQ-masked twin
+    of `FAT_MUTATION` wraps the three directory-sector RMW bodies (`write_dir_entry_fields`,
+    `mark_dir_deleted`, `create_in_root`'s slot write — never a scan). FAT + dir locks guard disjoint
+    sectors and never nest.
+  - **M3 — the NAMESPACE lock** (the four sequence races CLOSED: open-races-unlink stale-chain UAF,
+    `owned_clear`-vs-`owned_set_owner` recycled-slot ownership theft, create slot-claim/duplicate-name,
+    the `0xE5`-before-mark-pending window's open-vs-unlink half — its last-close half was already U11's
+    mark-pending-before-drop under `OPEN_FILES`; `sys_close` takes no ns). One per-mount IRQ-masked SpinMutex (`NsGuard`, in
+    `arch/aarch64/syscall.rs`) spans `sys_open`'s `find_located → ACL → incref/files_alloc` (incl. the
+    create path) and `sys_unlink`'s `0xE5 → owned_clear → mark-pending → descriptor-drop`. Held across
+    the bounded polled directory I/O BY DESIGN, but never across `mount()`/chain frees —
+    `files_free_by_dir` now collects orphan heads (`#[must_use]`), freed after the guard drops. Strict
+    lock order: `NAMESPACE ⊃ {FAT_MUTATION, DIR_MUTATION, OPEN_FILES, OWNED_FILES, DEFERRED_FREE}`,
+    never acquired while an inner lock is held.
+  - **M4 — F3-witness** (the F2 pattern): in-RAM cross-core stress of the exact `ns_lock` guard — the
+    LOCKED pass loses nothing, the UNLOCKED control races away increments under QEMU RR-TCG. Emits an
+    `F3-witness:` line (not a `-> PASS` line). HONEST SCOPE: the full open-vs-unlink disk-sequence
+    interleave is not provokable from the single-EL0-core QEMU battery — metal-latent, rides the bench.
+- **Tested:** `./arroyo kernel8-test` — **23 PASS** (byte-equivalent) + CAPSTONE 6/6, only the 3 expected
+  M6b kills, no leaks/faults, zero R1/CMD13 error lines, + the `F2-witness:` AND `F3-witness:` lines.
+  `./arroyo check` both arches; `./arroyo test-arm` MISSION SUCCESS.
+- **Lane:** `fs/fat.rs` (aarch64 path — same seat grant as F2) + `arch/aarch64/syscall.rs`; **zero x86
+  behavioural change**.
+
 ### emmc2 R1-status hardening — the card's own verdict checked after CMD17/CMD24 (aarch64) ✅ METAL-CONFIRMED (2026-07-10) `hw-pi4`
 - **What:** `drivers/emmc2.rs`'s polled CMD17 (READ_SINGLE_BLOCK) and CMD24 (WRITE_SINGLE_BLOCK)
   issued the command and moved the data but ignored the card's **R1 status word** — the controller's
