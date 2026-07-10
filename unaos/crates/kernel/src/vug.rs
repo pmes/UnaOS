@@ -420,24 +420,14 @@ pub fn run_crystal(pal: &mut TargetPal, mode: Mode) {
     serial_println!(":: VUG: crystal exit clean — {} frames ::", frame);
 }
 
-/// The VU-meter / heartbeat HUD (the existing Vug aesthetic), plus a live frame counter.
-fn draw_stats(pal: &mut TargetPal, frame: u64, faces: u32, solid: bool, w: i32, h: i32) {
-    const SEGMENTS: usize = 10;
-    const SEG_H: usize = 10;
-    const SEG_SP: usize = 2;
-    const SEG_W: usize = 40;
-
-    let total_h = SEGMENTS * (SEG_H + SEG_SP);
-    let start_x = (w as usize).saturating_sub(SEG_W + 20);
-    let start_y = (h as usize).saturating_sub(total_h + 20);
-    let active = (frame / 3) % (SEGMENTS as u64);
-    for i in 0..SEGMENTS {
-        let color = if (i as u64) <= active { 0x00_B36BFF } else { 0x00_2A2A2A };
-        let y = start_y + i * (SEG_H + SEG_SP);
-        pal.draw_rect(start_x, y, SEG_W, SEG_H, color);
-    }
-
-    // The little red heartbeat.
+/// The heartbeat + title HUD (the existing Vug aesthetic), plus a live frame counter.
+///
+/// POLISH-1: the legacy right-edge VU-meter segment stack was removed. It predated the M3b corner
+/// meters and, sitting at the right edge in purple/grey, read as the CPU pulse meter's per-core bars
+/// gone astray (the CPU meter actually lives bottom-left under RENDER, drawn by `draw_meters`). The
+/// red blinking heartbeat, the title, and the live stat line stay.
+fn draw_stats(pal: &mut TargetPal, frame: u64, faces: u32, solid: bool, w: i32, _h: i32) {
+    // The little red heartbeat (intentional — the demo's pulse).
     if (frame / 15) % 2 == 0 {
         pal.draw_rect((w as usize) / 2 - 10, 20, 20, 20, 0x00FF0000);
     }
