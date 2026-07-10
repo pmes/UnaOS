@@ -43,6 +43,21 @@ Legend: **✅ metal-confirmed** · **🔬 QEMU-green, metal pending** · dates I
   exercised on silicon only when a real card complains.
 - **Commit:** see `git log` (`hw-pi4`).
 
+### emmc2 CMD13 post-write status — programming-phase errors surfaced (aarch64) `hw-pi4`
+- **What:** completes the R1 arc's story for writes. The R1 check catches a card that REJECTS CMD24,
+  but a card can also fail while PROGRAMMING the block after a clean transfer (DAT0 busy phase) — and
+  those errors (CARD_ECC_FAILED, generic ERROR, WP_ERASE_SKIP) appear only in a later SEND_STATUS, so
+  a discarded write still looked durable. `write_block_512` now waits out programming-busy
+  (`ST_DAT_INHIBIT` clear, dedicated 500 ms bound = 2× the spec's 250 ms write timeout — the plain
+  100 ms command timeout would flag a slow-but-legal write), then issues CMD13 SEND_STATUS (RCA
+  captured at CMD3, carried on `SdCard`) and applies the same `R1_ERROR_MASK` check — error →
+  `:: M6g: CMD13 R1 error status … ::` + `BlockError::Io`. Reads are unchanged (no programming phase).
+- **Tested:** `./arroyo kernel8-test 35` — **23 PASS**, CAPSTONE 6/6, no R1/CMD13 error lines, no
+  busy-timeouts (every write in the U9→U11/U6 FAT battery now exits through the CMD13 check — the
+  healthy path is exercised on every single write); `check` both arches; `test-arm 30` MISSION
+  SUCCESS. The error leg is metal-only (QEMU never fails programming), same honest scope as R1.
+- **Commit:** see `git log` (`hw-pi4`).
+
 ## hw-pi4 track — 2026-07-08 (Opus round)
 
 ### U6 — UnaFS owner/grants: the by-NAME namespace ACL, enforced at `SYS_OPEN` (aarch64) ✅ METAL-CONFIRMED (2026-07-10) `hw-pi4`

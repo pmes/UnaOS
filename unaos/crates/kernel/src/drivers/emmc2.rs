@@ -98,6 +98,10 @@ const ACMD41_TIMEOUT_MS: u64 = 1000; // the power-up (busy) polling loop
 const RESET_TIMEOUT_MS: u64 = 100;
 const CLK_STABLE_TIMEOUT_MS: u64 = 100;
 const DATA_TIMEOUT_MS: u64 = 200;
+/// Post-write programming-busy bound: the SD spec caps a single-block write's busy window at 250 ms
+/// (§4.6.2.2 write timeout); double it for margin. Distinct from CMD_TIMEOUT_MS (100 ms) — waiting for
+/// programming under the plain command timeout would misclassify a slow-but-successful write as an error.
+const PROG_BUSY_TIMEOUT_MS: u64 = 500;
 
 /// The identified card: which base won the probe, its addressing mode, and its capacity. `read_block_512`
 /// reads this. Behind a Mutex so a read serializes the (single) controller; on the Pi loader path only the
@@ -108,6 +112,8 @@ struct SdCard {
     block_addressing: bool,
     num_blocks: u64,
     csd_version: u8, // 1 or 2, for the identified line
+    /// CMD13 SEND_STATUS argument (RCA already shifted into [31:16]), captured at CMD3.
+    rca_arg: u32,
 }
 static CARD: Mutex<Option<SdCard>> = Mutex::new(None);
 
@@ -359,7 +365,7 @@ fn try_init(base: usize, clock_id: u32) -> Option<SdCard> {
         return None;
     }
 
-    Some(SdCard { base, block_addressing, num_blocks, csd_version })
+    Some(SdCard { base, block_addressing, num_blocks, csd_version, rca_arg })
 }
 
 /// Probe the microSD: EMMC2 first (the metal path), then the legacy base (QEMU's card). On success,
@@ -530,5 +536,18 @@ pub fn write_block_512(lba: u64, buf: &[u8]) -> Result<(), BlockError> {
     if int & INT_ERR_ANY != 0 {
         return Err(BlockError::Io);
     }
+
+    // The transfer is done at the LINK layer, but the card is now busy programming flash (DAT0 low) and
+    // programming-phase failures (CARD_ECC_FAILED, generic ERROR, WP_ERASE_SKIP) are only reported by a
+    // LATER SEND_STATUS — without this, a write the card ultimately discarded still returns Ok. Wait out
+    // programming-busy under the spec's write-timeout bound (send_command's own DAT_INHIBIT wait is only
+    // 100 ms — too short for a legal 250 ms busy), then fetch the card's post-programming verdict.
+    if !wait_clear(base, STATUS, ST_DAT_INHIBIT, PROG_BUSY_TIMEOUT_MS) {
+        serial_println!(":: M6g: CMD24 programming-busy timeout ::");
+        return Err(BlockError::Io);
+    }
+    send_command(base, cmd(13) | CMD_RESP_48 | CMD_CRCCHK | CMD_IXCHK, card.rca_arg)
+        .map_err(|_| BlockError::Io)?;
+    r1_check(base, "CMD13").map_err(|_| BlockError::Io)?;
     Ok(())
 }
