@@ -271,6 +271,9 @@ pub fn run(console: &mut Console, pal: &mut TargetPal) {
     // M2 — the six sync primitives, re-verified with fresh worker tasks.
     run_sync_section(console, pal, &mut tally);
 
+    // M3 — storage read checks (READ-ONLY; never mutates the volume).
+    run_storage_section(console, pal, &mut tally);
+
     // --- summary --------------------------------------------------------------------------------
     let summary = format!(
         "{} pass  {} fail  {} skip  (+{} boot-replayed)",
@@ -662,6 +665,77 @@ fn run_sync_section(console: &mut Console, pal: &mut TargetPal, tally: &mut Tall
         report(console, pal, tally, n, r);
     }
     let _ = ALL_BITS;
+}
+
+// =================================================================================================
+// M3 — storage read checks (READ-ONLY)
+// =================================================================================================
+//
+// FAT mount status, a root-directory walk, and a known-file read (HELLO.BIN): verify the read
+// length and that content came back. `tste` NEVER mutates the volume — no create/write/delete (those
+// stay in the boot-sequenced battery). When no FAT volume is present (e.g. the raw usb.img pattern
+// image under a plain `./arroyo test`) every storage check SKIPs honestly with the reason.
+
+const KNOWN_FILE: &str = "HELLO.BIN";
+
+fn run_storage_section(console: &mut Console, pal: &mut TargetPal, tally: &mut Tally) {
+    let fs = match crate::fs::fat::mount() {
+        Ok(fs) => fs,
+        Err(e) => {
+            let why = format!("no FAT volume mounted ({:?})", e);
+            report(console, pal, tally, "storage.mount", Outcome::Skip(why.clone()));
+            report(console, pal, tally, "storage.rootwalk", Outcome::Skip(why.clone()));
+            report(console, pal, tally, "storage.readfile", Outcome::Skip(why));
+            return;
+        }
+    };
+    report(console, pal, tally, "storage.mount", Outcome::Pass);
+
+    // Root-directory walk.
+    let entries = match fs.read_root() {
+        Ok(es) => es,
+        Err(e) => {
+            let why = format!("read_root failed ({:?})", e);
+            report(console, pal, tally, "storage.rootwalk", Outcome::Fail(why.clone()));
+            report(console, pal, tally, "storage.readfile", Outcome::Skip(String::from("root walk failed")));
+            return;
+        }
+    };
+    if entries.is_empty() {
+        report(console, pal, tally, "storage.rootwalk", Outcome::Fail(String::from("empty root")));
+    } else {
+        report(console, pal, tally, "storage.rootwalk", Outcome::Pass);
+    }
+
+    // Known-file read: length + content sanity (READ-ONLY).
+    let de = match fs.find_in_root(KNOWN_FILE) {
+        Ok(de) => de,
+        Err(_) => {
+            report(
+                console, pal, tally, "storage.readfile",
+                Outcome::Skip(format!("{} not present in root", KNOWN_FILE)),
+            );
+            return;
+        }
+    };
+    const CAP: usize = 4096;
+    let mut data: Vec<u8> = Vec::new();
+    let r = match fs.read_file(&de, &mut data, CAP) {
+        Ok(()) => {
+            let want = core::cmp::min(de.size as usize, CAP);
+            if data.len() != want {
+                Outcome::Fail(format!("read {} bytes, expected {}", data.len(), want))
+            } else if de.size == 0 {
+                Outcome::Fail(String::from("known file is zero-length"))
+            } else if data.iter().all(|&b| b == 0) {
+                Outcome::Fail(String::from("content all-zero (unexpected)"))
+            } else {
+                Outcome::Pass
+            }
+        }
+        Err(e) => Outcome::Fail(format!("read_file failed ({:?})", e)),
+    };
+    report(console, pal, tally, "storage.readfile", r);
 }
 
 fn poll_until_done() -> bool {
