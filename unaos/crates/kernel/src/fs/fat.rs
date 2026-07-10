@@ -749,6 +749,19 @@ impl FatFs {
     /// the whole point of the primitive. Read-modify-write per copy so neighbouring entries in the sector are
     /// preserved; on FAT32 the reserved high 4 bits of the 32-bit slot are preserved per the Microsoft FAT spec.
     fn set_fat_entry(&self, cluster: u32, next: u32) -> Result<(), FatError> {
+        // F2: serialize the WHOLE all-copies RMW under `FAT_MUTATION`. A concurrent writer mutating a
+        // different entry in this same sector (or the other FAT copy) can no longer read-before-our-write and
+        // then clobber our update. The lock spans ONLY the bounded `num_fats` read-modify-write, so on aarch64
+        // the hold is a couple of polled sector transfers with no scheduler yield (see `with_fat_lock`). On
+        // x86 `with_fat_lock` is a zero-cost passthrough.
+        with_fat_lock(|| self.set_fat_entry_inner(cluster, next))
+    }
+
+    /// F3: the lock-FREE body of [`FatFs::set_fat_entry`] — the all-copies FAT-sector RMW with NO
+    /// `FAT_MUTATION` acquisition. The caller MUST already hold `FAT_MUTATION` (on aarch64; on x86 the lock is
+    /// inert and this is just the shared body). Factored out so `alloc_cluster`'s compare-and-claim can
+    /// re-check + claim a candidate entry inside ONE lock hold without re-entering the (non-reentrant) lock.
+    fn set_fat_entry_inner(&self, cluster: u32, next: u32) -> Result<(), FatError> {
         let offset = match self.kind {
             FatKind::Fat16 => cluster as u64 * 2,
             FatKind::Fat32 => cluster as u64 * 4,
@@ -758,31 +771,24 @@ impl FatFs {
             return Err(FatError::BadChain); // never index past the FAT region
         }
         let within = (offset % SECTOR_SIZE as u64) as usize;
-        // F2: serialize the WHOLE all-copies RMW under `FAT_MUTATION`. A concurrent writer mutating a
-        // different entry in this same sector (or the other FAT copy) can no longer read-before-our-write and
-        // then clobber our update. The lock spans ONLY this bounded `num_fats` read-modify-write — the index
-        // math above is pure and stays outside — so on aarch64 the hold is a couple of polled sector transfers
-        // with no scheduler yield (see `with_fat_lock`). On x86 `with_fat_lock` is a zero-cost passthrough.
-        with_fat_lock(|| {
-            let mut buf = [0u8; SECTOR_SIZE];
-            for f in 0..self.num_fats as u64 {
-                let lba = self.fat_start + f * self.fat_sz as u64 + sec;
-                read_sector(lba, &mut buf)?;
-                match self.kind {
-                    FatKind::Fat16 => {
-                        let v = (next & 0xFFFF) as u16;
-                        buf[within..within + 2].copy_from_slice(&v.to_le_bytes());
-                    }
-                    FatKind::Fat32 => {
-                        let existing = u32le(&buf, within);
-                        let v = (existing & 0xF000_0000) | (next & 0x0FFF_FFFF);
-                        buf[within..within + 4].copy_from_slice(&v.to_le_bytes());
-                    }
+        let mut buf = [0u8; SECTOR_SIZE];
+        for f in 0..self.num_fats as u64 {
+            let lba = self.fat_start + f * self.fat_sz as u64 + sec;
+            read_sector(lba, &mut buf)?;
+            match self.kind {
+                FatKind::Fat16 => {
+                    let v = (next & 0xFFFF) as u16;
+                    buf[within..within + 2].copy_from_slice(&v.to_le_bytes());
                 }
-                write_sector(lba, &buf)?;
+                FatKind::Fat32 => {
+                    let existing = u32le(&buf, within);
+                    let v = (existing & 0xF000_0000) | (next & 0x0FFF_FFFF);
+                    buf[within..within + 4].copy_from_slice(&v.to_le_bytes());
+                }
             }
-            Ok(())
-        })
+            write_sector(lba, &buf)?;
+        }
+        Ok(())
     }
 
     /// U10: zero-fill every sector of a data cluster. Called BEFORE a freshly allocated cluster joins a chain,
@@ -800,10 +806,21 @@ impl FatFs {
     }
 
     /// U10: allocate one data cluster — a bounded first-fit free search over `[2, count_of_clusters + 2)`,
-    /// then zero-fill it and mark it EOC in all FAT copies, returning its number READY TO LINK (a terminated
-    /// 1-cluster orphan until the caller links it onto a chain). NEVER spins (each FAT sector is read at most
-    /// once) and NEVER returns a reserved/bad/out-of-range cluster — only one whose FAT entry reads `0` (free).
-    /// `-ENOSPC` (`NoSpace`) when the volume is full. Zero-fill precedes any linkage (see [`FatFs::zero_cluster`]).
+    /// then claim it (EOC in all FAT copies) and zero-fill it, returning its number READY TO LINK (a terminated
+    /// 1-cluster orphan until the caller links it onto a chain). NEVER returns a reserved/bad/out-of-range
+    /// cluster — only one whose FAT entry reads `0` (free) INSIDE the claim's lock hold. `-ENOSPC` (`NoSpace`)
+    /// when the volume is full.
+    ///
+    /// F3-M1 (compare-and-claim — closes the F2 cluster-aliasing leg): the free SEARCH stays unlocked (cheap,
+    /// read-only), but the CLAIM re-reads the candidate's entry under `FAT_MUTATION` and sets EOC only if it is
+    /// STILL free — so two cores whose unlocked searches both saw cluster `c` free can never both claim it (the
+    /// loser sees the winner's EOC and keeps scanning; a bounded retry, each cluster visited once). ORDER
+    /// REORDERED vs U10: the claim now PRECEDES the zero-fill — zero-filling before the claim would let the
+    /// loser's zero pass scribble a cluster the winner already claimed, linked, and wrote. The disclosure
+    /// invariant is intact: the cluster is zero-filled before the CALLER links it into any chain (it is
+    /// EOC-reserved but UNLINKED during the fill, so no reader path can walk onto its stale bytes). Error path:
+    /// a zero-fill failure AFTER the claim orphans `c` (EOC, unlinked — a benign lost cluster, chkdsk-
+    /// reclaimable), never an aliased or stale-visible one.
     fn alloc_cluster(&self) -> Result<u32, FatError> {
         let entry_bytes: u64 = if self.kind == FatKind::Fat32 { 4 } else { 2 };
         let last = self.count_of_clusters + 2; // exclusive: valid data clusters are 2 ..= count+1
@@ -826,11 +843,30 @@ impl FatFs {
                 FatKind::Fat32 => u32le(&buf, within) & 0x0FFF_FFFF,
             };
             if e == 0 {
-                // Free. Zero-fill FIRST (no stale bytes when it joins a chain), then terminate it (EOC) so the
-                // caller receives a valid 1-cluster chain to link onto the tail.
-                self.zero_cluster(c)?;
-                self.set_fat_entry(c, self.eoc_value())?;
-                return Ok(c);
+                // Candidate. COMPARE-AND-CLAIM under FAT_MUTATION: re-read the entry inside the lock and
+                // claim (EOC) only if still free — a racing allocator that claimed it first loses us nothing
+                // but this re-check. The whole hold is one sector read + the bounded all-copies RMW (the
+                // `with_fat_lock` span rule). On x86 the lock is inert (single FAT writer by construction).
+                let claimed = with_fat_lock(|| -> Result<bool, FatError> {
+                    let mut cbuf = [0u8; SECTOR_SIZE];
+                    read_sector(self.fat_start + sec, &mut cbuf)?;
+                    let cur = match self.kind {
+                        FatKind::Fat16 => u16le(&cbuf, within) as u32,
+                        FatKind::Fat32 => u32le(&cbuf, within) & 0x0FFF_FFFF,
+                    };
+                    if cur != 0 {
+                        return Ok(false); // lost the race — a concurrent claim took it
+                    }
+                    self.set_fat_entry_inner(c, self.eoc_value())?;
+                    Ok(true)
+                })?;
+                if claimed {
+                    // Zero AFTER the claim (see the doc comment): EOC-reserved but unlinked, so no reader can
+                    // see stale bytes; a failure here orphans `c` (benign lost cluster) rather than aliasing.
+                    self.zero_cluster(c)?;
+                    return Ok(c);
+                }
+                loaded = u64::MAX; // our search buffer is stale (a concurrent writer mutated this sector)
             }
             c += 1;
         }
