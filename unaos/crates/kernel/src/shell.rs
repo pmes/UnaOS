@@ -344,7 +344,7 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
             console.println("STORAGE:  diskinfo, usbinfo, read <lba>, write <lba> <byte>");
             console.println("FILES:    fatinfo (FAT geometry), ls [dir], cd [dir], pwd, cat <path>");
             console.println("WRITE:    touch <path>, write <path> <text>, append <path> <text>, rm <path>");
-            console.println("          (root dir; create/edit/delete files)");
+            console.println("          (root dir; create/edit/delete files; sync = write-through, always durable)");
             console.println("SMP:      sched (per-CPU run queues)");
             console.println("TEST:     tste (in-OS self-test suite: boot-replay + live checks)");
             console.println("NETWORK:  netinfo, ping <ip> [count], arp <ip>");
@@ -498,6 +498,12 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
                 None => console.println("usage: rm <path>"),
                 Some(name) => fs_rm(console, name),
             }
+        },
+        "sync" => {
+            // JD5-M3: storage is WRITE-THROUGH — block::write_block issues a synchronous BOT WRITE(10)
+            // (USB) / polled CMD24 (SD) that completes before the command returns, so there is no
+            // write-back cache to flush. `sync` is the honest confirmation of that (a no-op by design).
+            console.println("sync: write-through storage — every write is already durable on the card");
         },
         "diskinfo" => {
             match crate::drivers::block::info() {
