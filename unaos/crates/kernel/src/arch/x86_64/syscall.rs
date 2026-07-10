@@ -2883,6 +2883,24 @@ fn sys_fgrant(file_handle: u64, child_handle: u64, rights: u64) -> i64 {
         return EINVAL;
     }
     let rights = req & (CAP_READ | CAP_WRITE);
+    // F2-fold (SMP-hardening, the pi4 F2 M2 twin `4562501`): `grantee_slot` (from `PROCS[pi].slot`) and
+    // `grantee_gen` (from `SLOT_GEN[grantee_slot]`) were captured as TWO separate atomic loads. On a multi-core
+    // boot the named child could EXIT between them and its slot be recycled to a DIFFERENT process (a bumped
+    // `SLOT_GEN`), so the grant would bind the stale `grantee_slot` to the RECYCLED incarnation's `grantee_gen` —
+    // a misdelegation of the owner's file to whatever process now holds that slot (privilege escalation /
+    // disclosure). Re-validate that `pi` is STILL the same running incarnation AFTER reading its gen: a slot's
+    // gen bumps only at teardown (`clear_handle_row`, top), which drives `state` off `PRUNNING` and clears
+    // `pid`/`slot` (`proc_free`), so a matching `state`/`pid`/`slot` proves the `(slot, gen)` pair is a
+    // consistent snapshot of ONE incarnation. Any mismatch means the child recycled mid-resolution — refuse
+    // (`-ECHILD`) rather than grant to the wrong principal. (Narrow, metal-only window; behaviourally
+    // transparent single-core — nothing recycles mid-syscall on one core, so all witnesses stay byte-identical.)
+    if PROCS[pi].state.load(Ordering::Acquire) != PRUNNING
+        || PROCS[pi].pid.load(Ordering::Acquire) != pid
+        || PROCS[pi].slot.load(Ordering::Acquire) != grantee_slot + 1
+        || SLOT_GEN[grantee_slot].load(Ordering::Acquire) != grantee_gen
+    {
+        return ECHILD;
+    }
     owned_grant(nameid, row, caller_gen, grantee_slot, grantee_gen, rights)
 }
 
