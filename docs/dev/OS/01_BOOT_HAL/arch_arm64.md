@@ -1820,6 +1820,93 @@ no disk honestly). Boot 3 with the reader re-seated came up clean. Also learned:
 stick itself did not surface as the block device on this bench — plan on a SEPARATE data
 card/reader for tegra storage benches (the pi4-style boot-disk read is not the tegra pattern).
 
+### JD5 — the write path: create / edit / delete files from the panel shell (🔬 QEMU-green, metal-PENDING 2026-07-10)
+
+JD4 made the panel navigable read-only. JD5 makes the Orin a machine you can DO WORK ON: `touch`,
+`write`, `append`, and `rm` from the shell, through the SAME F3-locked FAT stack the U9/U10/U11
+syscalls and the QEMU fixtures prove. The arc completes the panel story: first pixels (JD1) → first
+keystroke (JD2) → first disk read (JD3) → first navigation (JD4) → first write (JD5).
+
+**Design — why the write path rides `fat.rs` directly, not the `SYS_OPEN`/`SYS_WRITE` syscall layer.**
+The brief allowed either the syscall path (preferred where reachable) or the `fat.rs` public mutation
+API (where not). The syscall path is NOT reachable from the kernel shell: `SYS_OPEN`/`SYS_WRITE` are
+EL0/ASID-keyed and dispatched from the SVC handler in the out-of-lane `arch/aarch64/syscall.rs`, and
+the kernel shell runs at **EL1 as ASID 0** — on the tegra post-drop core `TTBR0_EL1[63:48] = 0` (the
+drop loads a bare table PA with no ASID bits; the shell never switches TTBR0 to a user slot). So the
+shell rides the same `fat.rs` PUBLIC entry points the U9/U10/U11 syscalls call — `create_in_root`,
+`find_located`, `write_grow`, `delete_located` — and **`fat.rs` stays call-never-edit this arc**
+(pi4's K1 arc owns its mutation concurrently; JD5 only CALLS the existing public API under its
+existing lock contracts).
+
+**Principal — the kernel shell IS ASID 0, the public principal.** By U6's existing rule an ASID-0
+`O_CREAT` is always PUBLIC (no owner row — ASID 0 is the shared/boot window, never gen-fenced, never
+torn down, so it cannot be a private owner). Shell-created files are therefore plain public FAT
+files. The shell does not — and cannot without an out-of-lane `pub` accessor — consult the U6
+`OWNED_FILES` ACL, which lives entirely on the SVC `sys_open` path; that is correct, because the
+panel shell is the local trusted operator console, the same trust level as the shared boot window.
+(A future arc that runs EL0 tasks and returns to the shell must re-establish ASID 0 before shell FAT
+ops; today the shell is cooperative EL1 and never installs a user-slot TTBR0.)
+
+**Scope — root-directory only.** `create_in_root`/`find_located` operate on the root directory only,
+and `fat.rs` is call-never-edit, so a target whose parent is a subdirectory is an honest `-ENOTSUP`
+(a subdirectory create needs a future `create_in_dir`). Bare names resolve against the cwd; `.`/`..`
+normalize lexically first; only a root parent is writable. This is the one capability JD4's read-side
+navigation has that JD5's write side does not — deliberately, to stay within the call-never-edit
+contract while pi4's F3/K1 churns the mutation code.
+
+**M1 — `touch` + `write` (`3a143f5`, arch-neutral).** `touch <path>` creates a 0-length root file if
+absent (idempotent). `write <path> <text>` is create-or-TRUNCATE + store the exact bytes: a truncate
+of an existing file is `delete_located` (free chain + `0xE5`) then `create_in_root` then `write_grow`
+from offset 0 — the only create-or-truncate reachable through the PUBLIC API (there is no in-place
+shrink primitive, and the directory-field publisher is private). The existing `write <lba> <byte>`
+raw-block command is preserved byte-identically for its exact 2-numeric-arg shape; any other shape is
+the file write (text = rest of line, whitespace-collapsed like `echo`); a numeric filename stays
+reachable as `/NAME`.
+
+**M2 — `rm` + `append` (`dfaf180`, arch-neutral).** `append <path> <text>` opens, seeks to EOF, and
+grows via `write_grow` (allocate + zero-fill + chain, directory `size` published LAST), creating the
+file if absent (like `>>`). `rm <path>` (alias `del`) is `delete_located` — mark the dir slot `0xE5`
+FIRST, then free the chain (all FAT copies), the crash-safe order `fat.rs` guarantees; directory →
+`-EISDIR` (removal out of scope this arc), absent → `-ENOENT`.
+
+**M3 — safety rails + `sync` (`2531209`).** Three properties, made explicit:
+- **Bounded.** `block::write_block` rides the SAME JD3 wall-clock BOT pump as reads (`write_block` →
+  `storage_write10` → `scsi_write10` → `bot_transfer(Out)` → `run_bot_stage` → `pump_until_bot_done`,
+  a `now_cycles`/`hw_wait_budget×3` deadline). A stalled USB write times out to `BlockError::Io` →
+  `FatError::Io` → an honest console error; it never WFI-parks the timerless EL1 core. This is the
+  load-bearing check for the Orin's storage-is-a-USB-reader-that-stalls reality (JD3/JD4 benches) —
+  verified in the driver, not assumed.
+- **Consistent.** Each `fat.rs` step is atomic under F3's `FAT_MUTATION`/`DIR_MUTATION` locks, so a
+  mid-sequence failure leaves the volume consistent: a failed grow keeps the OLD (smaller) size (size
+  published last); a failed `rm`/truncate leaves lost clusters (benign, chkdsk-reclaimable), never an
+  aliasing or torn volume.
+- **Write-through.** `write_block` is synchronous (BOT WRITE(10) / polled SD CMD24 complete before the
+  command returns — no write-back cache), so every command is already durable when it returns; `sync`
+  is the honest no-op confirmation.
+
+**Gate (QEMU):** `./arroyo check` + `UNAOS_TEGRA=1 ./arroyo check` green both arches;
+`UNAOS_HUBSTORAGE=1 ./arroyo test 25` → `MISSION SUCCESS` (shared `shell.rs` guard); `./arroyo
+test-arm 22` → `MISSION SUCCESS`; `UNAOS_GICV3=1 ./arroyo test-arm 40` → `CAPSTONE COMPLETE` 6/6;
+`esp-jetson kernel.elf` links, **108 `tegra:` strings** (unchanged from JD4 — the shell-write strings
+carry no `tegra:` token; validate media by count, not size). The write PRIMITIVES themselves already
+run headless — the `el0-u10create`/`el0-u10delete`/`el0-u11close` fixtures exercise the identical
+`create_in_root`/`write_grow`/`delete_located` on a FAT image; JD5's shell arms are thin glue over
+them, invoked only on interactive input (the boot/test path is unperturbed). A headless demo of the
+SHELL write path is not cleanly reachable in-lane (the shell dispatches only on a keystroke, and tegra
+never runs in QEMU), so the shell-level verdict is attended-pending, exactly as JD2/JD3/JD4.
+
+**Metal verdict — 🔬 metal-PENDING (attended bench).** The money shot: on the panel, with a FAT data
+card present at boot (the tegra pattern — a separate reader, not the boot stick; hub-MSC enumeration
+is intermittent with a graceful fallthrough, so a no-disk boot must degrade to honest "no FAT
+filesystem"):
+1. `write NOTE.TXT hello from the orin` → `wrote N bytes to /NOTE.TXT (N bytes)`;
+2. `cat NOTE.TXT` → the text back;
+3. `append NOTE.TXT more` → grows the file; `cat` shows both;
+4. **power-cycle**, then `cat NOTE.TXT` → the content survives (write-through durability on silicon);
+5. `rm NOTE.TXT` → `removed /NOTE.TXT`; `cat NOTE.TXT` → `-ENOENT`.
+A stalled write must surface `-EIO` (never a hang), and a `write DOCS/X.TXT` must print the root-only
+`-ENOTSUP`. Use a FAT16 card to match the JD4-confirmed metal path.
+
 ## 4. Jetson Orin Nano headless bring-up (Arc JM2)
 
 The Orin is brought up **headless over serial**. The only console that has ever
