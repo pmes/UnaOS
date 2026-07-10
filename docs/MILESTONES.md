@@ -10,6 +10,43 @@ Legend: **✅ metal-confirmed** · **🔬 QEMU-green, metal pending** · dates I
 
 ---
 
+## hw-jetson track — 2026-07-10 (JD5 — the write path: the panel becomes a real workstation shell; same-day attended bench — PASS)
+
+### JD5 — `touch` / `write` / `append` / `rm` / `sync` on the panel shell ✅ METAL-CONFIRMED (2026-07-10) `hw-jetson`
+- **What (M1, arch-neutral, `3a143f5`):** `touch <path>` creates a 0-length root file (idempotent);
+  `write <path> <text>` is create-or-TRUNCATE storing the exact bytes (truncate = `delete_located` +
+  `create_in_root` + `write_grow` — the only create-or-truncate through the PUBLIC API; no in-place
+  shrink primitive). The raw `write <lba> <byte>` stays byte-identical for its 2-numeric-arg shape;
+  any other shape is the file write. Rides `fat.rs`'s F3-locked PUBLIC mutation API directly (the SVC
+  path is EL0/ASID-keyed + out-of-lane; the shell runs at EL1 as **ASID 0** → an ASID-0 create is
+  PUBLIC by U6's rule, so shell files are plain public FAT files). **Root-directory only** —
+  `create_in_root`/`find_located` are root-only and `fat.rs` is call-never-edit, so a subdir target
+  is an honest `-ENOTSUP`.
+- **What (M2, arch-neutral, `dfaf180`):** `append <path> <text>` = open-seek-end-write via
+  `write_grow` (create-if-absent, like `>>`); `rm <path>` (alias `del`) = `delete_located` (mark
+  `0xE5` first, then free the chain — crash-safe order), directory → `-EISDIR`, absent → `-ENOENT`.
+- **What (M3, `2531209`):** safety rails made explicit — writes are BOUNDED (`block::write_block`
+  rides the SAME JD3 wall-clock BOT pump as reads, so a stalled write times out to `-EIO`, never
+  WFI-parks the timerless EL1 core — verified in the driver), CONSISTENT (each `fat.rs` step atomic
+  under F3's `FAT_MUTATION`/`DIR_MUTATION`; a mid-sequence failure leaves lost clusters / the old
+  smaller size, never a torn volume), and WRITE-THROUGH (`sync` is an honest no-op — no cache).
+- **Tested (QEMU):** `check` + `UNAOS_TEGRA=1 check` green both arches; `UNAOS_HUBSTORAGE=1 test 25`
+  MISSION (shared `shell.rs` guard); `test-arm 22` MISSION; `UNAOS_GICV3=1 test-arm 40` CAPSTONE 6/6;
+  `esp-jetson` links, **108 `tegra:` strings** (unchanged — shell-write strings carry no `tegra:`
+  token; validate by count, not size). The write PRIMITIVES already run headless via the
+  `el0-u10create`/`u10delete`/`u11close` fixtures (identical `create_in_root`/`write_grow`/
+  `delete_located`); the SHELL arms are thin glue, dispatched only on a keystroke, so a headless
+  shell-write demo is not in-lane — verdict attended-pending like JD2/JD3/JD4.
+- **Metal — ✅ PASS (2026-07-10 attended bench, serial `jetson-serial-2026-07-10-165211.log`):** the
+  whole battery on the FAT16 `UNAOSRW` card (29 MiB, Alcor reader behind the hub, slot 5; clean enum
+  both boots) — boot 1 `write hello.txt` → `cat` → `append` → `cat`, **power-cycle**, boot 2
+  `cat hello.txt` **survives** (write-through durability on silicon), `rm` → `-ENOENT`,
+  `write docs/x.txt`/`docs/y.txt` → `-ENOTSUP` (file confirmed never created; `ls docs` still works),
+  all typed lowercase (case-insensitive 8.3). Zero `BOT pump TIMEOUT`/errors/panics both boots. ⚠ the
+  rMBP `UNAOS` card was repurposed as the Orin boot stick — rMBP must re-flash its boot media.
+- **Detail:** [`arch_arm64.md` §JD5](dev/OS/01_BOOT_HAL/arch_arm64.md). **Commits:** `3a143f5` M1 ·
+  `dfaf180` M2 · `2531209` M3 (`hw-jetson`).
+
 ## hw-jetson track — 2026-07-10 (JD4 — read-side navigation + last dead levers + screen-on-boot; same-day attended bench)
 
 ### JD4 — `ls <dir>` / `cd` / `pwd` / `cat <path>` on the panel shell + JB2c/JB9b lever retirement + screen-on-boot ✅ METAL-CONFIRMED (2026-07-10) `hw-jetson`
