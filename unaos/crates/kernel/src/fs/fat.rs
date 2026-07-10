@@ -34,6 +34,8 @@
 
 use alloc::string::String;
 use core::sync::atomic::{AtomicBool, Ordering};
+#[cfg(target_arch = "aarch64")]
+use core::sync::atomic::AtomicU32;
 
 /// Logical sector size we support. This equals the USB block device's block size (512 on every
 /// stick we target); the BPB's `bytes_per_sector` must agree, so one FAT sector maps 1:1 onto one
@@ -335,6 +337,59 @@ fn with_fat_lock<R>(f: impl FnOnce() -> R) -> R {
 #[inline(always)]
 fn with_fat_lock<R>(f: impl FnOnce() -> R) -> R {
     f()
+}
+
+// ---------------------------------------------------------------------------------------------------------
+// F2 M3 witness: a cross-core stress of the FAT_MUTATION serialization on an IN-RAM scratch counter — NOT the
+// on-disk FAT, so it carries zero volume risk while exercising the EXACT lock that guards `set_fat_entry`. Two
+// kernel tasks on distinct cores each drive `f2_witness_rmw(iters, locked)`. The step is a deliberately
+// NON-ATOMIC read-modify-write (`Relaxed` load + `store`, NOT `fetch_add`), so if the two cores interleave the
+// read->write windows an increment is LOST — unless `locked` routes the step through `with_fat_lock`, which
+// serializes exactly as it does for the real `set_fat_entry` RMW. The scratch counter is the witness: after
+// `2*iters` increments across two cores, a value below `2*iters` means updates were raced away. The launcher
+// (`arch::syscall::f2_witness_launcher`) runs a LOCKED pass (must reach `2*iters` — serialization holds) and an
+// UNLOCKED control (a nonzero loss proves the environment provoked real contention; a zero loss is reported
+// honestly — RR-TCG did not interleave, so the race is metal-only). This stands in for `set_fat_entry`'s real
+// on-disk RMW without scribbling the volume; the on-disk RMW under true metal parallelism rides the bench.
+#[cfg(target_arch = "aarch64")]
+static F2_WITNESS_COUNTER: AtomicU32 = AtomicU32::new(0);
+
+/// F2 M3 witness — reset the scratch counter before a run. See the module note above.
+#[cfg(target_arch = "aarch64")]
+pub fn f2_witness_reset() {
+    F2_WITNESS_COUNTER.store(0, Ordering::SeqCst);
+}
+
+/// F2 M3 witness — the scratch counter's current value (the increments that survived).
+#[cfg(target_arch = "aarch64")]
+pub fn f2_witness_value() -> u32 {
+    F2_WITNESS_COUNTER.load(Ordering::SeqCst)
+}
+
+/// F2 M3 witness — drive `iters` non-atomic read-modify-writes of the scratch counter, optionally serialized
+/// through the FAT_MUTATION lock (`locked`). NEVER touches the disk; safe to call concurrently from two cores.
+#[cfg(target_arch = "aarch64")]
+pub fn f2_witness_rmw(iters: u32, locked: bool) {
+    for _ in 0..iters {
+        if locked {
+            with_fat_lock(f2_witness_step);
+        } else {
+            f2_witness_step();
+        }
+    }
+}
+
+/// One non-atomic read-modify-write of the scratch counter with a WIDE read->write window (a short spin), so a
+/// round-robin-TCG quantum switch between the two cores is likely to land inside it. `#[inline(never)]` +
+/// `Relaxed` load/store keep the load and store as two separate observable ops (the lost-update surface).
+#[cfg(target_arch = "aarch64")]
+#[inline(never)]
+fn f2_witness_step() {
+    let v = F2_WITNESS_COUNTER.load(Ordering::Relaxed);
+    for _ in 0..48 {
+        core::hint::spin_loop();
+    }
+    F2_WITNESS_COUNTER.store(v.wrapping_add(1), Ordering::Relaxed);
 }
 
 /// Try to interpret `sec` as a FAT boot sector (BPB) for a volume starting at absolute `part_lba`,
