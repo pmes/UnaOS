@@ -19,6 +19,10 @@ pub mod ring;
 pub mod event;
 pub mod context;
 pub mod ftdi;
+// STOR-1: the interrupt-driven storage service task + BlockRequest submit/complete. x86_64 + the
+// `irqstorage` knob only — the default build never links it, so the staged storage path is untouched.
+#[cfg(all(target_arch = "x86_64", feature = "irqstorage"))]
+pub mod irqstorage;
 
 use ring::TransferRing;
 use self::trb::Trb;

@@ -667,6 +667,14 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
                 xhci.service_slot_disposal();
                 xhci.service_enum();
             }
+            // STOR-1 (x86, irqstorage knob): storage service task + `bx-blockreq` self-test, so the
+            // interrupt-driven path is exercised on the serial-less metal boot too. One-shot, gated on
+            // storage; a no-op without the knob.
+            #[cfg(all(target_arch = "x86_64", feature = "irqstorage"))]
+            {
+                unaos_kernel::drivers::xhci::irqstorage::start_service_once();
+                unaos_kernel::drivers::xhci::irqstorage::selftest_once();
+            }
             // Once storage is up, mount + log the FAT volume geometry (one-shot).
             unaos_kernel::fs::fat::probe_once();
             // U2 (x86): also run the FAT loader HERE so its lines are VISIBLE on the serial-less
@@ -816,6 +824,14 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
             xhci.service_enum();
         }
 
+        // STOR-1 (x86, irqstorage knob): bring up the interrupt-driven storage service task once a
+        // block device is present (before the storage fixtures submit through it), then run the
+        // `bx-blockreq` self-test once. Both are one-shot + gated on storage; a no-op without the knob.
+        #[cfg(all(target_arch = "x86_64", feature = "irqstorage"))]
+        {
+            unaos_kernel::drivers::xhci::irqstorage::start_service_once();
+            unaos_kernel::drivers::xhci::irqstorage::selftest_once();
+        }
         // Once storage is up, mount + log the FAT volume geometry (one-shot). Runs with the xHCI
         // lock released; read_block re-locks it briefly, so there is no nested-lock hazard.
         unaos_kernel::fs::fat::probe_once();

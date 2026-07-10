@@ -44,6 +44,10 @@ fn main() {
     if std::env::var("UNAOS_PI").is_ok() { feats.push("pi"); }
     if std::env::var("UNAOS_USBDEBUG").is_ok() { feats.push("usbdebug"); }
     if std::env::var("UNAOS_SCHED_DEMO").is_ok() { feats.push("sched_demo"); }
+    // UNAOS_IRQSTORAGE=1 routes x86 storage syscalls through the interrupt-driven storage service task
+    // (STOR-1) instead of the staged-buffer path. x86_64 only; a no-op on the aarch64 media the arroyo
+    // script builds. Metal-pending, so it stays opt-in.
+    if std::env::var("UNAOS_IRQSTORAGE").is_ok() { feats.push("irqstorage"); }
     // `tegra` (Jetson Orin / Tegra234 UART) is an aarch64 board feature; mapped here for parity with
     // the `pi` knob, though this x86_64 builder never produces aarch64 media (the `arroyo` script does).
     if std::env::var("UNAOS_TEGRA").is_ok() { feats.push("tegra"); }
