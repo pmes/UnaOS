@@ -77,6 +77,61 @@ Legend: **✅ metal-confirmed** · **🔬 QEMU-green, metal pending** · dates I
   format, fail-closed asymmetry, lock discipline, seat question). **Commit:** the single K1 M1
   commit on `hw-pi4` (see `git log`).
 
+## hw-rmbp track — 2026-07-10 (STOR-1 S1–S3 — interrupt-driven x86 storage behind the `irqstorage` knob; ✅ core mechanism METAL-CONFIRMED)
+
+### STOR-1 S1–S3 — the storage service task + live reads + live in-place write-through ✅ core mechanism METAL-CONFIRMED (2026-07-10) `hw-rmbp`
+- **What:** x86 storage syscalls run IF-masked (SFMASK), and the only kernel→sector path is the xHCI
+  BOT pump, which `hlt()`s awaiting a transfer event — a `hlt` at IF=0 never wakes, so an in-handler
+  disk op hangs the core. The whole staged-buffer family (U6bx staged read / U9x flush queue / U10x
+  op-queue) exists to defer disk work to an IF=1 context. STOR-1 lays the IF-safe replacement spine
+  (design `unaos/docs/dev/OS/07_USB_STORAGE/x86_interrupt_storage.md`): a scheduled kernel **storage service
+  task** (IF=1) owns the BOT pump; a syscall builds a `BlockRequest` on its kernel stack, wakes the
+  service task, and **blocks on a per-request semaphore** whose `wait` restores the caller's IF
+  snapshot across the switch — so the handler sleeps with IF=1 semantics though it entered IF-masked
+  (the crux). All wakeups happen at IF=1, so the wake-only MSI-X handler stays lock-free
+  (`sched.rs:28` preserved). **S1** (`7b2f05f`): the service task + submit/block/complete + a
+  `bx-blockreq` self-test (LBA0 polled vs service-task read → PASS); a bounded pump timeout →
+  `BlockError::Io`, never a hang. **S2** (`b73ba08`): `sys_read` serves a RO staged descriptor from
+  the LIVE volume (name-based `find_located`+`read_at`), bounced through a kernel-stack buffer (the
+  ring-3 window is the submitter's private CR3 = PML4[2], unreachable by the service task under kernel
+  CR3; the kernel stack is in the shared kernel half). **S3** (`fd5de85`): `sys_write_file` writes
+  THROUGH in place for a non-growable staged descriptor (SCRATCH.BIN) — synchronous `write_at`, no
+  wstage/dirty/FLUSH-queue; the matching read broadens to `FILE_OPNAME==0`; a new witness proves the
+  write is on disk pre-drain with an empty flush queue → **close-discards-dirty residual retired**.
+- **Knob:** everything behind the `irqstorage` cargo feature (`UNAOS_IRQSTORAGE=1`; mapped in
+  `builder` + `arroyo`), x86_64 only — the default build never links `drivers/xhci/irqstorage.rs`, so
+  the staged path is **byte-identical**. The live path is per-descriptor + coherent: it fires only for
+  in-place-only staged descriptors (`FILE_OPNAME==0`) with a mounted volume + the service task up;
+  growable/created descriptors and the no-FAT core fall through unchanged.
+- **Tested (QEMU):** `./arroyo check` both arches, knob on + off. Knob-ON `test 40` (non-FAT) = 18
+  PASS + MISSION + `bx-blockreq` PASS. Knob-ON `UNAOS_FATIMG=sf ./arroyo test 150` = **23 PASS** (22
+  fixtures + the S3 synchronous-write witness), with HELLO.BIN read + SCRATCH.BIN write/read-back
+  served LIVE. Knob-OFF `test 40` = 18 PASS + MISSION, `UNAOS_FATIMG=sf test` = 22 PASS,
+  **byte-identical** (no STOR-1 lines). `UNAOS_NOSTORAGE` clean both knob states. Lane: new
+  `drivers/xhci/irqstorage.rs` + `arch/x86_64/syscall.rs` + `builder`/`arroyo` + `main.rs`; `fat.rs`/
+  `block.rs` reused unchanged; **zero aarch64 files**.
+- **✅ Metal (2026-07-10 attended bench, real 2012 rMBP):** clean full-chain usbdebug boot over FTDI
+  serial — `:: bx-blockreq: PASS ::` (a raw LBA-0 read through the SERVICE TASK matched the polled read →
+  **transfer-IRQ I/O + the submit/block/complete handshake work on the real Panther Point xHCI**,
+  resolving design risk 1 — the one genuinely unproven thing), `U6bx` HELLO.BIN read LIVE, `S3`
+  synchronous write-through + `U9x` SCRATCH.BIN write/read-back LIVE on the real FAT16 card, and the
+  entire prior chain U1a→U6gx re-confirmed knob-ON; zero faults/timeouts/deadlock, HELLO.BIN intact.
+  Off by default still (the knob is the metal caveat). The bench ran pre-fix code; the review fixes are
+  transparent to the witnessed paths, so the confirm stands, and the fixed code re-benches at S4.
+- **Review (security-arc, 2 must-fix + 3 notes, all folded before merge):** MF1 — every `REQ_QUEUE`
+  hold is IRQ-masked at all 3 sites (closes a same-core service-task-preemption deadlock; masking both
+  sides avoids the swap-the-trap trap). MF2 — `sys_open` refuses a writable open of HELLO.BIN
+  (`rw && sidx==0 → -EACCES`), modeling immutable EL0 code as read-only — the root-cause close for the
+  S3 write-through overwriting the on-disk executable (honest severity: feature-gated code-image
+  regression, not a live ring-3 exploit). N1 offset-over-advance ledgered (rides S4), N2 `submit`
+  panics off-scheduler, N3 docs-root paths fixed.
+- **S4 (synchronous grow/create/delete)** stays a deliberately-deferred follow-on (design decision 4;
+  its cross-process races are metal-only, per risk 3).
+- **⚠ test-harness fact:** `./arroyo test-fat sf` is INTERMITTENTLY flaky — the OVMF USB-touch (builder
+  ~line 226) sometimes makes the kernel misread the usb-storage geometry as 64 MiB (usb.img size) →
+  `parse_bpb` rejects it → `NotFat` → fixtures run in-memory (18 PASS, looks like a regression but
+  isn't). `UNAOS_FATIMG=sf ./arroyo test 150` (env at script start) is the RELIABLE FAT form.
+
 ## hw-jetson track — 2026-07-10 (JD4 — read-side navigation + last dead levers + screen-on-boot; same-day attended bench)
 
 ### JD4 — `ls <dir>` / `cd` / `pwd` / `cat <path>` on the panel shell + JB2c/JB9b lever retirement + screen-on-boot ✅ METAL-CONFIRMED (2026-07-10) `hw-jetson`
