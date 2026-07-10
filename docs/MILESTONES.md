@@ -161,7 +161,7 @@ Legend: **✅ metal-confirmed** · **🔬 QEMU-green, metal pending** · dates I
 > One ancient 31 MB SD-1.0 card (`UNAOSRW`) was refused by the Pi 4 EEPROM bootloader outright
 > (no firmware output at all) — prefer the known-good 16 GB card.
 
-### F2 — SMP-hardening of the FAT-mutation seams (aarch64) 🔬 QEMU-green (incl. a cross-core witness with teeth), metal-pending `hw-pi4`
+### F2 — SMP-hardening of the FAT-mutation seams (aarch64) ✅ METAL-CONFIRMED (2026-07-10) `hw-pi4`
 - **What:** the whole FAT-mutating stack is metal-confirmed, but the U11-M2b reaper made a SECOND
   cross-core FAT writer permanent while two single-core-only assumptions remained. This arc closes the
   ones in the pi4 lane before SMP scheduling widens (not live today — the reaper's free is
@@ -197,7 +197,11 @@ Legend: **✅ metal-confirmed** · **🔬 QEMU-green, metal pending** · dates I
 - **Tested:** `./arroyo kernel8-test` — **23 PASS** (byte-equivalent) + CAPSTONE 6/6, only the 3 expected
   M6b kills, no leaks/faults, zero R1/CMD13 error lines, **+ the `F2-witness:` line** (locked 240000/240000
   intact, unlocked lost 116001/240000). `./arroyo check` both arches; `./arroyo test-arm` MISSION SUCCESS.
-  Metal-pending: the on-disk `set_fat_entry` RMW under true metal parallelism rides the next attended bench.
+  ✅ **METAL-CONFIRMED (2026-07-10, attended bench, real Pi 4 / EMMC2 card):** the full 23-PASS battery ran
+  through the `FAT_MUTATION`-serialized `set_fat_entry` RMW on silicon (so M1's on-disk RMW is metal-verified),
+  CAPSTONE 6/6 (all 4 cores up), zero R1/CMD13 errors, only the 3 expected M6b kills; and the F2-witness held
+  under TRUE parallelism + preemption — **LOCKED 240000/240000 intact, UNLOCKED control lost 119998/240000
+  (~50%, more contended than QEMU's ~48%)**. Serial: `~/unaos-bench/pi-serial-2026-07-10-110417.log`.
 - **Lane:** `fs/fat.rs` (aarch64 path — seat-granted for this arc) + `arch/aarch64/syscall.rs`; **zero x86
   behavioural change** (all new code cfg-gated `target_arch = "aarch64"`).
 
