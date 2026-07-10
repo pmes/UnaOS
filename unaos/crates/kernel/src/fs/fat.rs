@@ -294,6 +294,49 @@ fn write_sector(lba: u64, buf: &[u8; SECTOR_SIZE]) -> Result<(), FatError> {
     }
 }
 
+/// F2 (SMP-hardening): the FAT-table mutation lock. Serializes the read-modify-write of a FAT sector so two
+/// cores mutating entries that fall in the SAME sector cannot interleave read/write and lose an update — and
+/// so the mirrored FAT copies never diverge under concurrency. See [`with_fat_lock`] for the lock-span and the
+/// arch reasoning; the flag it closes is the U11-M2b reaper's downstream `set_fat_entry` RMW (docs/MILESTONES).
+///
+/// aarch64-only on purpose: the aarch64 storage path is fully POLLED (an emmc2 busy-poll on metal; a spin-loop
+/// under the QEMU raspi4b/virt models, which deliver no timer IRQ so `hlt` degrades to a spin), so the lock can
+/// span the bounded RMW block I/O without ever yielding the scheduler. x86 is EXCLUDED because its FAT path
+/// `hlt`s awaiting an async xHCI transfer event and a `hlt` under a cleared IF never wakes — masking IRQs
+/// across it would hang; the x86 side carries its own U11x concurrency model in `arch/x86_64` regardless.
+#[cfg(target_arch = "aarch64")]
+static FAT_MUTATION: spin::Mutex<()> = spin::Mutex::new(());
+
+/// Run `f` under the FAT-table mutation lock (aarch64), or unchanged (other arches).
+///
+/// IRQ-masked via `arch::without_interrupts` so the hold is NON-PREEMPTIBLE: aarch64 EL0 syscalls run
+/// I-unmasked and the U11-M2b reaper task is preemptible, so a metal timer preempt of a lock holder followed
+/// by a re-entry into the FAT writer on that same core would deadlock (run queues never migrate → the
+/// preempted holder never releases). Masking makes `FAT_MUTATION` a proper IRQ-safe spinlock at any core
+/// count — the exact discipline the reaper's `IrqGuard` established. `without_interrupts` SAVES and restores
+/// DAIF, so this nests correctly inside an already-masked caller (it never blindly unmasks).
+///
+/// LOCK SPAN: callers hold this ONLY across a single FAT-sector RMW (`set_fat_entry`'s bounded `num_fats`
+/// read+write loop) — never across a free-search (`alloc_cluster`), a data-cluster zero-fill/write loop, or a
+/// `mount()`. That is why "held across block I/O" is safe here: the aarch64 I/O is polled, so the span is a
+/// couple of bounded polled sector transfers with no scheduler yield, not an unbounded wait.
+#[cfg(target_arch = "aarch64")]
+#[inline]
+fn with_fat_lock<R>(f: impl FnOnce() -> R) -> R {
+    crate::arch::without_interrupts(|| {
+        let _guard = FAT_MUTATION.lock();
+        f()
+    })
+}
+
+/// Non-aarch64 (x86): the FAT-mutation lock is inert — see [`FAT_MUTATION`] for why masking IRQs across the
+/// x86 `hlt`-driven xHCI FAT path would hang. Byte-identical to the pre-F2 behaviour (a zero-cost passthrough).
+#[cfg(not(target_arch = "aarch64"))]
+#[inline(always)]
+fn with_fat_lock<R>(f: impl FnOnce() -> R) -> R {
+    f()
+}
+
 /// Try to interpret `sec` as a FAT boot sector (BPB) for a volume starting at absolute `part_lba`,
 /// on a device of `dev_blocks` total blocks. Returns a fully-computed [`FatFs`] on success.
 ///
@@ -660,24 +703,31 @@ impl FatFs {
             return Err(FatError::BadChain); // never index past the FAT region
         }
         let within = (offset % SECTOR_SIZE as u64) as usize;
-        let mut buf = [0u8; SECTOR_SIZE];
-        for f in 0..self.num_fats as u64 {
-            let lba = self.fat_start + f * self.fat_sz as u64 + sec;
-            read_sector(lba, &mut buf)?;
-            match self.kind {
-                FatKind::Fat16 => {
-                    let v = (next & 0xFFFF) as u16;
-                    buf[within..within + 2].copy_from_slice(&v.to_le_bytes());
+        // F2: serialize the WHOLE all-copies RMW under `FAT_MUTATION`. A concurrent writer mutating a
+        // different entry in this same sector (or the other FAT copy) can no longer read-before-our-write and
+        // then clobber our update. The lock spans ONLY this bounded `num_fats` read-modify-write — the index
+        // math above is pure and stays outside — so on aarch64 the hold is a couple of polled sector transfers
+        // with no scheduler yield (see `with_fat_lock`). On x86 `with_fat_lock` is a zero-cost passthrough.
+        with_fat_lock(|| {
+            let mut buf = [0u8; SECTOR_SIZE];
+            for f in 0..self.num_fats as u64 {
+                let lba = self.fat_start + f * self.fat_sz as u64 + sec;
+                read_sector(lba, &mut buf)?;
+                match self.kind {
+                    FatKind::Fat16 => {
+                        let v = (next & 0xFFFF) as u16;
+                        buf[within..within + 2].copy_from_slice(&v.to_le_bytes());
+                    }
+                    FatKind::Fat32 => {
+                        let existing = u32le(&buf, within);
+                        let v = (existing & 0xF000_0000) | (next & 0x0FFF_FFFF);
+                        buf[within..within + 4].copy_from_slice(&v.to_le_bytes());
+                    }
                 }
-                FatKind::Fat32 => {
-                    let existing = u32le(&buf, within);
-                    let v = (existing & 0xF000_0000) | (next & 0x0FFF_FFFF);
-                    buf[within..within + 4].copy_from_slice(&v.to_le_bytes());
-                }
+                write_sector(lba, &buf)?;
             }
-            write_sector(lba, &buf)?;
-        }
-        Ok(())
+            Ok(())
+        })
     }
 
     /// U10: zero-fill every sector of a data cluster. Called BEFORE a freshly allocated cluster joins a chain,
