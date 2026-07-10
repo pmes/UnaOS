@@ -155,6 +155,10 @@ pub fn _print(args: fmt::Arguments) {
     });
     // Mirror to the framebuffer console (visible without a serial port). fbcon self-guards.
     crate::video::fbcon::_print(args);
+    // TSTE-1 M2b: capture boot-fixture verdict lines (`-> PASS`/`-> FAIL`) into the selftest ring so
+    // `tste` can replay them. Additive, alloc-free, `try_lock` only; safe from this IRQ-masked
+    // context; zero change to what is printed above.
+    crate::selftest::capture(args);
 }
 
 // Expression-style (parentheses, no trailing semicolon) so the macros work in both

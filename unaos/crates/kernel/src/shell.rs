@@ -61,6 +61,7 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
             console.println("STORAGE:  diskinfo, usbinfo, read <lba>, write <lba> <byte>");
             console.println("FILES:    fatinfo (FAT geometry), ls, cat <name>");
             console.println("SMP:      sched (per-CPU run queues)");
+            console.println("TEST:     tste (in-OS self-test suite: boot-replay + live checks)");
             console.println("NETWORK:  netinfo, ping <ip> [count], arp <ip>");
             console.println("          connect <ip> <port> [message], udpsend <ip> <port> [message]");
             console.println("          get <ip> [port] [path]  (HTTP/1.0 GET)");
@@ -355,6 +356,11 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
                      console.draw(pal); // clean exit: restore the shell over the demo
                  }
              }
+        },
+        "tste" | "selftest" => {
+            // The in-OS self-test suite (TSTE-1). Prints a three-section PASS/FAIL/SKIP table in the
+            // console (like `ps` — it does NOT take the screen) and mirrors every line to serial.
+            crate::selftest::run(console, pal);
         },
         "sched" | "ps" => {
             #[cfg(target_arch = "x86_64")]
