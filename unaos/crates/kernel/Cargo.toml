@@ -41,7 +41,7 @@ usbdebug = []
 # of live in-place reads/writes with synchronous semantics. Default OFF: the staged path compiles
 # verbatim (byte-identical). Metal-PENDING (Panther Point transfer-IRQ behaviour is unproven), so it
 # lands behind this knob until an attended 2012 bench confirms. x86_64 only. Enable via
-# `UNAOS_IRQSTORAGE=1`. See docs/dev/OS/07_USB_STORAGE/x86_interrupt_storage.md.
+# `UNAOS_IRQSTORAGE=1`. See unaos/docs/dev/OS/07_USB_STORAGE/x86_interrupt_storage.md.
 irqstorage = []
 # Jetson Orin Nano (Tegra234) build: point the aarch64 serial at the Tegra UART — a 16550-style
 # controller at a Tegra MMIO base (NOT the QEMU `virt` PL011) — so the board has a real serial

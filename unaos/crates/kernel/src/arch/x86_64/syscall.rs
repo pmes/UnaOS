@@ -2620,6 +2620,9 @@ fn sys_write_file(row: usize, file_id: u64, buf: u64, len: u64) -> i64 {
             if n < 0 {
                 return EIO;
             }
+            // LEDGERED (STOR-1 review note N1): as in sys_read, the offset was CAS-advanced by `want`; a
+            // live short write / EIO returns `n <= want`. BENIGN today (in-place write, on-disk size ==
+            // captured size, so `n == want`); the advance-by-actual clamp rides S4.
             return n as i64;
         }
     }
@@ -5095,6 +5098,16 @@ fn sys_open(name_ptr: u64, name_len: u64, mode: u64) -> i64 {
     //    content, so a read before any write sees the original bytes), then a descriptor, then a handle. RO
     //    (bit0 clear) keeps the U6bx read-only path: no writable slot, `CAP_READ` only.
     let rw = mode & 1 != 0;
+    // STOR-1 review (MF2): HELLO.BIN (staged index 0) is IMMUTABLE EL0 CODE — the program image the U2
+    // loader ran and `sys_spawn` re-instantiates. Model it read-only AT THE SOURCE: refuse a writable
+    // open. This is the ROOT-CAUSE close for the S3 live write-through — which resolves the target BY
+    // NAME (`find_located` + `write_at`) and would otherwise overwrite the boot-critical executable on
+    // disk, surviving reboot, defeating the default staged path's `staged_cluster(0) == 0` never-flush
+    // protection — AND for the pre-S3 in-memory-dirty leg, in one place. SCRATCH.BIN/GROW.BIN keep their
+    // write-through (demo scratch, not code). No fixture opens HELLO.BIN RW, so this regresses nothing.
+    if rw && sidx == 0 {
+        return EACCES;
+    }
     // U9x M2 (folding the M1 review's SHARED_ROW writable-open note): a writable open needs a PRIVATE
     // single-writer descriptor row — its wstage buffer is written by exactly one task mid IF-masked syscall,
     // with no lock. SHARED_ROW is the multi-tenant kernel window (U1a/U1b/U2 run there with `user_cr3 == 0`, so
@@ -5234,6 +5247,11 @@ fn sys_read(handle: u64, buf: u64, len: u64) -> i64 {
             if n < 0 {
                 return EIO;
             }
+            // LEDGERED (STOR-1 review note N1): the offset was CAS-advanced by `want` above, but a live
+            // short read / EIO delivers `got <= want` — so a subsequent SEQUENTIAL read would skip the
+            // undelivered tail. BENIGN today (the live on-disk size == the staged size the claim used, so
+            // `got == want` always here); the real clamp (advance by bytes actually delivered) rides S4,
+            // where a live grow makes the on-disk size diverge from the descriptor's captured size.
             let got = (n as usize).min(want);
             if got == 0 {
                 return 0; // live EOF / short read

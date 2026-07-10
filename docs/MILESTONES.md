@@ -10,14 +10,14 @@ Legend: **✅ metal-confirmed** · **🔬 QEMU-green, metal pending** · dates I
 
 ---
 
-## hw-rmbp track — 2026-07-10 (STOR-1 S1–S3 — interrupt-driven x86 storage behind the `irqstorage` knob; QEMU-green, metal-pending)
+## hw-rmbp track — 2026-07-10 (STOR-1 S1–S3 — interrupt-driven x86 storage behind the `irqstorage` knob; ✅ core mechanism METAL-CONFIRMED)
 
-### STOR-1 S1–S3 — the storage service task + live reads + live in-place write-through 🔬 QEMU-green, metal-pending `hw-rmbp`
+### STOR-1 S1–S3 — the storage service task + live reads + live in-place write-through ✅ core mechanism METAL-CONFIRMED (2026-07-10) `hw-rmbp`
 - **What:** x86 storage syscalls run IF-masked (SFMASK), and the only kernel→sector path is the xHCI
   BOT pump, which `hlt()`s awaiting a transfer event — a `hlt` at IF=0 never wakes, so an in-handler
   disk op hangs the core. The whole staged-buffer family (U6bx staged read / U9x flush queue / U10x
   op-queue) exists to defer disk work to an IF=1 context. STOR-1 lays the IF-safe replacement spine
-  (design `dev/OS/07_USB_STORAGE/x86_interrupt_storage.md`): a scheduled kernel **storage service
+  (design `unaos/docs/dev/OS/07_USB_STORAGE/x86_interrupt_storage.md`): a scheduled kernel **storage service
   task** (IF=1) owns the BOT pump; a syscall builds a `BlockRequest` on its kernel stack, wakes the
   service task, and **blocks on a per-request semaphore** whose `wait` restores the caller's IF
   snapshot across the switch — so the handler sleeps with IF=1 semantics though it entered IF-masked
@@ -43,11 +43,23 @@ Legend: **✅ metal-confirmed** · **🔬 QEMU-green, metal pending** · dates I
   **byte-identical** (no STOR-1 lines). `UNAOS_NOSTORAGE` clean both knob states. Lane: new
   `drivers/xhci/irqstorage.rs` + `arch/x86_64/syscall.rs` + `builder`/`arroyo` + `main.rs`; `fat.rs`/
   `block.rs` reused unchanged; **zero aarch64 files**.
-- **Metal:** OFF BY DEFAULT — the 2012 rMBP Panther Point xHCI transfer-IRQ behaviour is unproven for
-  I/O (enumeration is metal-confirmed; transfer-event-driven I/O never exercised on that controller).
-  QEMU-green is the ceiling; the knob is the metal caveat. **S4 (synchronous grow/create/delete)** is
-  a deliberately-deferred follow-on (design decision 4; its cross-process races are metal-only, per
-  risk 3).
+- **✅ Metal (2026-07-10 attended bench, real 2012 rMBP):** clean full-chain usbdebug boot over FTDI
+  serial — `:: bx-blockreq: PASS ::` (a raw LBA-0 read through the SERVICE TASK matched the polled read →
+  **transfer-IRQ I/O + the submit/block/complete handshake work on the real Panther Point xHCI**,
+  resolving design risk 1 — the one genuinely unproven thing), `U6bx` HELLO.BIN read LIVE, `S3`
+  synchronous write-through + `U9x` SCRATCH.BIN write/read-back LIVE on the real FAT16 card, and the
+  entire prior chain U1a→U6gx re-confirmed knob-ON; zero faults/timeouts/deadlock, HELLO.BIN intact.
+  Off by default still (the knob is the metal caveat). The bench ran pre-fix code; the review fixes are
+  transparent to the witnessed paths, so the confirm stands, and the fixed code re-benches at S4.
+- **Review (security-arc, 2 must-fix + 3 notes, all folded before merge):** MF1 — every `REQ_QUEUE`
+  hold is IRQ-masked at all 3 sites (closes a same-core service-task-preemption deadlock; masking both
+  sides avoids the swap-the-trap trap). MF2 — `sys_open` refuses a writable open of HELLO.BIN
+  (`rw && sidx==0 → -EACCES`), modeling immutable EL0 code as read-only — the root-cause close for the
+  S3 write-through overwriting the on-disk executable (honest severity: feature-gated code-image
+  regression, not a live ring-3 exploit). N1 offset-over-advance ledgered (rides S4), N2 `submit`
+  panics off-scheduler, N3 docs-root paths fixed.
+- **S4 (synchronous grow/create/delete)** stays a deliberately-deferred follow-on (design decision 4;
+  its cross-process races are metal-only, per risk 3).
 - **⚠ test-harness fact:** `./arroyo test-fat sf` is INTERMITTENTLY flaky — the OVMF USB-touch (builder
   ~line 226) sometimes makes the kernel misread the usb-storage geometry as 64 MiB (usb.img size) →
   `parse_bpb` rejects it → `NotFat` → fixtures run in-memory (18 PASS, looks like a regression but

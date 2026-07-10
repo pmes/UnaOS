@@ -2,7 +2,7 @@
 // Copyright (C) 2026 The Architect & Una
 //
 // STOR-1 (S1): the storage SERVICE TASK + the BlockRequest submit/complete handshake — the
-// interrupt-driven x86 storage spine. See docs/dev/OS/07_USB_STORAGE/x86_interrupt_storage.md.
+// interrupt-driven x86 storage spine. See unaos/docs/dev/OS/07_USB_STORAGE/x86_interrupt_storage.md.
 //
 // The problem this exists to solve: every x86 storage syscall runs IF-masked (SFMASK clears IF on
 // `syscall` entry), and the only kernel->sector path is the xHCI Bulk-Only Transport (BOT) pump,
@@ -172,13 +172,26 @@ const REQ_QUEUE_CAP: usize = 16;
 /// caller is blocked in `done.wait()` for the whole transfer, pinning the stack frame it lives in.
 /// The caller must have `done.init()`ed it (reserve the single-waiter capacity).
 pub unsafe fn submit(req: *mut BlockRequest) -> i32 {
-    // Push the address, then wake the service task. IF is already masked in the syscall handler; on
-    // the self-test task `post`/`wait` snapshot and restore IF themselves, so no explicit guard here.
-    REQ_QUEUE.lock().push_back(req as usize);
+    // Push the address, then wake the service task. The REQ_QUEUE hold MUST be IRQ-masked: the service
+    // task pops it at IF=1 and is timer-preemptible there, and run queues are per-CPU with no steal, so
+    // a same-core submitter spinning at IF=0 against a preempted holder would deadlock the core (the
+    // `sched.rs:31` "a lock holder can't be preempted" invariant a plain spinlock relies on). Mask BOTH
+    // sides, scoped to the O(1) push — the mask ENDS here, never across the pump's `hlt`. A syscall
+    // submitter already runs IF=0 (no-op); this closes the window for an IF=1 kernel-task submitter
+    // (the self-test / any future one).
+    x86_64::instructions::interrupts::without_interrupts(|| {
+        REQ_QUEUE.lock().push_back(req as usize);
+    });
     REQ_READY.post();
     // Block until the service task posts. On a scheduled task this restores the caller's IF snapshot
-    // across the switch (IF-safe even though the handler entered IF=0).
-    let _ = unsafe { (*req).done.wait() };
+    // across the switch (IF-safe even though the handler entered IF=0). A submitter MUST be a scheduled
+    // task — an off-scheduler `false` (no `current` to block) would leave the request queued for the
+    // service task to DMA/post into a since-freed stack frame, so fail loud rather than dangle it
+    // (unreachable today: every caller runs on an AP task).
+    assert!(
+        unsafe { (*req).done.wait() },
+        "irqstorage::submit called off a scheduled task — the request would dangle"
+    );
     unsafe { (*req).result.load(Ordering::Acquire) }
 }
 
@@ -224,7 +237,10 @@ fn service_task(_: usize) {
             sched::yield_now();
             continue;
         }
-        let addr = REQ_QUEUE.lock().pop_front();
+        // MF1: mask IF across the O(1) pop (see `submit`) — the service task runs IF=1 and is
+        // preemptible, so a plain spinlock hold here could be preempted and deadlock a same-core
+        // submitter. The mask ends BEFORE `service_one` — the pump's `hlt` runs IF=1 (the whole point).
+        let addr = x86_64::instructions::interrupts::without_interrupts(|| REQ_QUEUE.lock().pop_front());
         let Some(addr) = addr else { continue };
         let req = addr as *mut BlockRequest;
         // SAFETY: the submitter is blocked in `done.wait()`, so `*req` is pinned + live until we post.
@@ -332,10 +348,11 @@ pub fn start_service_once() -> bool {
         return true; // lost the race — another pass already spawned it
     }
     REQ_READY.init(); // reserve the service task's wait-list before it can block
-    {
-        let mut q = REQ_QUEUE.lock();
-        q.reserve(REQ_QUEUE_CAP); // never reallocate under the spinlock
-    }
+    // MF1: mask IF for uniformity with the push/pop sites (this runs once on the BSP before the service
+    // task exists, so it can't deadlock — but keep every REQ_QUEUE hold masked by the same rule).
+    x86_64::instructions::interrupts::without_interrupts(|| {
+        REQ_QUEUE.lock().reserve(REQ_QUEUE_CAP); // never reallocate under the spinlock
+    });
     sched::spawn("storage-svc", service_task, 0, cpu, PRIO_NORMAL);
     serial_println!(
         ":: STOR-1: storage service task live on cpu {} (irqstorage) ::",
