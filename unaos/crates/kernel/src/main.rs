@@ -1435,17 +1435,42 @@ fn jd2_console_pump(_arg: usize) {
         return;
     }
     serial_println!(
-        ":: tegra: JD2 — EL1 console pump live (boot log holds the panel; first key enters the shell) ::"
+        ":: tegra: JD2 — EL1 console pump live (boot log holds the panel; first key or ~8 s enters the shell) ::"
     );
 
-    // Phase 1: pump the controller, leave the JD1 boot log visible until someone types.
-    let first_key: u8 = loop {
+    // Phase 1 (JD4 screen-on-boot polish): pump the controller with the JD1 boot log visible, but
+    // only until the FIRST KEYSTROKE or a ~8 s wall-clock deadline — whichever comes first — so a
+    // panel-lit boot always ends at a visible shell prompt instead of waiting for a blind keystroke.
+    // The bound rides CNTPCT (free-running, EL-independent — the JD3 timerless mechanism; the
+    // post-drop EL1 core has no timer IRQ), and 8 s is past the CAPSTONE stragglers, so taking the
+    // panel then cannot race a late fbcon paint. A keystroke keeps the JD2 behaviour byte-alike.
+    let deadline_ticks: u64 = {
+        let f: u64;
+        unsafe {
+            core::arch::asm!("mrs {}, CNTFRQ_EL0", out(reg) f, options(nomem, nostack, preserves_flags));
+        }
+        (if f == 0 { 62_500_000 } else { f }).saturating_mul(8)
+    };
+    let cntpct = || -> u64 {
+        let v: u64;
+        unsafe {
+            core::arch::asm!("mrs {}, CNTPCT_EL0", out(reg) v, options(nomem, nostack, preserves_flags));
+        }
+        v
+    };
+    let phase1_start = cntpct();
+    let first_key: Option<u8> = loop {
         if let Some(x) = unaos_kernel::drivers::xhci::XHCI_CONTROLLER.lock().as_mut() {
             x.poll_events();
         }
         match unaos_kernel::pal::next_event() {
-            Some(Event::Key(c)) => break c,
-            _ => unaos_kernel::arch::sched::yield_now(),
+            Some(Event::Key(c)) => break Some(c),
+            _ => {
+                if cntpct().wrapping_sub(phase1_start) >= deadline_ticks {
+                    break None; // quiescent boot — take the panel and show the prompt
+                }
+                unaos_kernel::arch::sched::yield_now();
+            }
         }
     };
 
@@ -1459,13 +1484,20 @@ fn jd2_console_pump(_arg: usize) {
     console.println("JD2: interactive shell on the inherited scanout. Type 'help'.");
     console.draw(&mut pal);
     pal.render();
-    serial_println!(
-        ":: tegra: JD2 — console OWNS the panel (Screen back buffer live); first key {:#04x} ::",
-        first_key
-    );
-    // The wake-up keystroke is a real keystroke: feed it through, don't swallow it.
-    handle_key(first_key, &mut console, &mut pal);
-    pal.render();
+    match first_key {
+        Some(c) => {
+            serial_println!(
+                ":: tegra: JD2 — console OWNS the panel (Screen back buffer live); first key {:#04x} ::",
+                c
+            );
+            // The wake-up keystroke is a real keystroke: feed it through, don't swallow it.
+            handle_key(c, &mut console, &mut pal);
+            pal.render();
+        }
+        None => serial_println!(
+            ":: tegra: JD4 — console OWNS the panel (Screen back buffer live); screen-on-boot (no key, ~8 s) ::"
+        ),
+    }
 
     loop {
         if let Some(x) = unaos_kernel::drivers::xhci::XHCI_CONTROLLER.lock().as_mut() {
