@@ -224,6 +224,70 @@ fn fs_write(console: &mut Console, arg: &str, data: &[u8]) {
     }
 }
 
+/// JD5 `append`: append `data` at the end of a ROOT file, creating it if absent (like `>>`). The
+/// append grows the file from its current EOF via `write_grow` (allocate + zero-fill + chain new
+/// clusters, directory `size` published LAST). A directory target is refused (`-EISDIR`).
+fn fs_append(console: &mut Console, arg: &str, data: &[u8]) {
+    let name = match resolve_root_name(arg) {
+        Ok(n) => n,
+        Err(msg) => return console.println(&alloc::format!("append: {}", msg)),
+    };
+    let fs = match crate::fs::fat::mount() {
+        Ok(fs) => fs,
+        Err(e) => return console.println(&alloc::format!("append: no FAT filesystem ({:?})", e)),
+    };
+    let (first_cluster, size, dir_lba, dir_off) = match fs.find_located(&name) {
+        Ok((de, dl, doff)) => {
+            if de.is_dir {
+                return console.println(&alloc::format!("append: /{}: is a directory (-EISDIR)", de.name()));
+            }
+            (de.first_cluster(), de.size, dl, doff)
+        }
+        Err(FatError::NotFound) => match fs.create_in_root(&name, 0x20) {
+            Ok((de, dl, doff)) => (de.first_cluster(), de.size, dl, doff), // fresh: 0, 0
+            Err(e) => return console.println(&alloc::format!("append: {}: {} ({:?})", name, fat_errno(e), e)),
+        },
+        Err(e) => return console.println(&alloc::format!("append: {}: {} ({:?})", name, fat_errno(e), e)),
+    };
+    if data.is_empty() {
+        return console.println(&alloc::format!("appended 0 bytes to /{} ({} bytes)", name, size));
+    }
+    // Seek to EOF (`start = size`) and grow: write_grow appends the new bytes past the current end.
+    match fs.write_grow(first_cluster, size, dir_lba, dir_off, size, data) {
+        Ok((written, new_size, _)) =>
+            console.println(&alloc::format!("appended {} bytes to /{} ({} bytes)", written, name, new_size)),
+        Err(e) => console.println(&alloc::format!("append: /{}: {} ({:?})", name, fat_errno(e), e)),
+    }
+}
+
+/// JD5 `rm`: delete a ROOT file — `delete_located` marks the directory slot `0xE5` FIRST, then frees
+/// the cluster chain (all FAT copies), the crash-safe order fat.rs guarantees. A directory target is
+/// refused (`-EISDIR` — directory removal is out of scope this arc); an absent name is `-ENOENT`.
+fn fs_rm(console: &mut Console, arg: &str) {
+    let name = match resolve_root_name(arg) {
+        Ok(n) => n,
+        Err(msg) => return console.println(&alloc::format!("rm: {}", msg)),
+    };
+    let fs = match crate::fs::fat::mount() {
+        Ok(fs) => fs,
+        Err(e) => return console.println(&alloc::format!("rm: no FAT filesystem ({:?})", e)),
+    };
+    match fs.find_located(&name) {
+        Ok((de, dl, doff)) => {
+            if de.is_dir {
+                return console.println(&alloc::format!("rm: /{}: is a directory (-EISDIR)", de.name()));
+            }
+            match fs.delete_located(dl, doff, de.first_cluster()) {
+                Ok(freed) => console.println(&alloc::format!(
+                    "removed /{} ({} cluster(s) freed)", de.name(), freed.len())),
+                Err(e) => console.println(&alloc::format!("rm: /{}: {} ({:?})", name, fat_errno(e), e)),
+            }
+        }
+        Err(FatError::NotFound) => console.println(&alloc::format!("rm: {}: not found (-ENOENT)", name)),
+        Err(e) => console.println(&alloc::format!("rm: {}: {} ({:?})", name, fat_errno(e), e)),
+    }
+}
+
 /// Print one directory's entries in the `ls` table format, with the file/dir tally.
 fn print_dir_listing(console: &mut Console, entries: &[DirEntry]) {
     let (mut files, mut dirs) = (0u32, 0u32);
@@ -279,7 +343,8 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
             console.println("COMMANDS: ver, help, clear, echo, panic, gneiss");
             console.println("STORAGE:  diskinfo, usbinfo, read <lba>, write <lba> <byte>");
             console.println("FILES:    fatinfo (FAT geometry), ls [dir], cd [dir], pwd, cat <path>");
-            console.println("WRITE:    touch <path>, write <path> <text>   (root dir; create/edit files)");
+            console.println("WRITE:    touch <path>, write <path> <text>, append <path> <text>, rm <path>");
+            console.println("          (root dir; create/edit/delete files)");
             console.println("SMP:      sched (per-CPU run queues)");
             console.println("TEST:     tste (in-OS self-test suite: boot-replay + live checks)");
             console.println("NETWORK:  netinfo, ping <ip> [count], arp <ip>");
@@ -418,6 +483,20 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
             match args.first() {
                 None => console.println("usage: touch <path>"),
                 Some(name) => fs_touch(console, name),
+            }
+        },
+        "append" => {
+            // JD5: append text at EOF, creating the file if absent (like `>>`). `append <path> <text>`.
+            match args.first() {
+                None => console.println("usage: append <path> <text>"),
+                Some(name) => fs_append(console, name, args[1..].join(" ").as_bytes()),
+            }
+        },
+        "rm" | "del" => {
+            // JD5: delete a ROOT file. `rm <path>`.
+            match args.first() {
+                None => console.println("usage: rm <path>"),
+                Some(name) => fs_rm(console, name),
             }
         },
         "diskinfo" => {
