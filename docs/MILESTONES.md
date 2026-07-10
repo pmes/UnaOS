@@ -541,6 +541,25 @@ Legend: **✅ metal-confirmed** · **🔬 QEMU-green, metal pending** · dates I
 - **Commits:** `hw-rmbp` — M1 `6a54a76`, M2 `39ae5c5`, M3 `4471d34`, review fix `91c93b8`; Opus-executed.
 
 ---
+## hw-jetson track — 2026-07-10 (code arc — QEMU-green; metal-pending)
+
+### JD2 — interactive shell on the Orin panel: keyboard → console → shell over the inherited scanout 🔬 QEMU-green / metal-pending `hw-jetson`
+- **What:** the Orin's first interactive session — join JD1 (pixels) and JB10 (armed USB keyboard) with
+  pure software routing, no new hardware touched. `tegra_early_stop` seeds `video::WRITER` with the JD1
+  scanout; the JB2b `jb2-kbd` spawn becomes `jd2-console` (`main.rs::jd2_console_pump`, cooperative EL1
+  task alongside CAPSTONE, `poll_events`-only/JC3 semantics): the boot log holds the panel until the
+  **first keystroke**, then `fbcon::detach()` + a double-buffered `video::Screen` over the scanout and
+  every key feeds the shared `handle_key` → `shell::dispatch_command` (keystrokes also echo on serial).
+  Headless boots delegate to the JB2b `kbd_pump_body` unchanged. All `cfg(tegra)` — shared
+  renderer/console/shell called, never edited.
+- **Gate:** `UNAOS_TEGRA=1 ./arroyo check` both arches + `./arroyo test` + `test-arm` green (tegra off in
+  QEMU → non-tegra byte-identical by construction). ⚠ `esp-jetson` `kernel.elf` = **378,728 B / 105
+  `tegra:` strings** — the console/shell/FAT/font machinery is now linked in (+128 KB vs JD1), past the
+  old ~355 KB heuristic; validate tegra media by the `tegra:`-string count, not size.
+- **Detail:** [`arch_arm64.md` §JD2](dev/OS/01_BOOT_HAL/arch_arm64.md). Metal (attended): first key
+  switches the panel to the console; `help`/`ver`/`echo` run on the panel.
+
+---
 ## hw-jetson track — 2026-07-08 (code arc — QEMU-green + adversarial-review-clean; USB-behaviour metal-pending)
 
 ### JD1 — first pixels: inherit the firmware's live scanout framebuffer ✅ METAL-CONFIRMED (Orin panel, 2026-07-08) `hw-jetson`

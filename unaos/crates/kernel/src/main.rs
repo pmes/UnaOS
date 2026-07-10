@@ -1002,6 +1002,12 @@ fn tegra_early_stop(boot_info: &'static mut BootInfo) -> ! {
             // EL1 twin was patched by map_fb_region, and the tegra path never detaches fbcon (JM7), so
             // the mirror survives the JM6 EL2 -> EL1 drop and shows the CAPSTONE run live.
             unaos_kernel::video::fbcon::init(fb.base, fb.len, fb.info);
+            // JD2: seed the shared GUI front-buffer handle with the same inherited scanout, so the
+            // EL1 console pump (spawned below, alongside CAPSTONE) can build its double-buffered
+            // `Screen` over it when the first keystroke arrives. fbcon and WRITER are handles to
+            // the same physical framebuffer (the x86/pi pattern); until the console takes over,
+            // only fbcon draws.
+            unaos_kernel::video::WRITER.lock().init(fb.base as usize, fb.len, fb.info);
             serial_println!(
                 ":: tegra: JD1 — panel LIVE: inherited scanout mapped + fbcon mirroring the boot log ::"
             );
@@ -1377,13 +1383,13 @@ fn tegra_early_stop(boot_info: &'static mut BootInfo) -> ! {
             unaos_kernel::arch::smmu_tegra::jb3_v3_dump(v3_base);
         }
         if attached {
-            unaos_kernel::arch::sched::spawn(
-                "jb2-kbd",
-                unaos_kernel::arch::xusb_tegra::kbd_pump_body,
-                0,
-                0,
-            );
-            serial_println!(":: tegra: JB2b — EL1 keyboard pump task spawned (boot core) ::");
+            // JD2: the pump grew a console. `jd2_console_pump` polls the xHCI exactly like the
+            // JB2b `kbd_pump_body` did, but on the first keystroke it takes over the JD1 panel
+            // with a `Screen`-backed `Console` and dispatches lines through the shared shell —
+            // the first interactive UnaOS session on the Orin. Headless boots (no JD1 scanout)
+            // delegate straight to `kbd_pump_body`, preserving the JB2b serial evidence lines.
+            unaos_kernel::arch::sched::spawn("jd2-console", jd2_console_pump, 0, 0);
+            serial_println!(":: tegra: JD2 — EL1 console pump task spawned (boot core) ::");
         }
     } else {
         serial_println!(":: tegra: JB2b — SKIPPED (XUSB not ungated/alive this boot) ::");
@@ -1508,6 +1514,95 @@ fn handle_key(
         console.draw_input_line(pal);
     }
     false
+}
+
+/// JD2 (tegra): the EL1 console pump — the Orin's interactive session, a cooperative kernel task
+/// on the boot core's run queue (spawned pre-drop, dispatched by `run_capstone_boot_core` alongside
+/// the CAPSTONE tasks). Supersedes the JB2b `kbd_pump_body` loop on panel-lit boots.
+///
+/// Phase 1 (boot log stays on the panel): poll the xHCI (`poll_events` ONLY — the `service_*` pumps
+/// ride `hlt()`, and post-drop the EL2 timer is off, so a WFI would park this core forever; the
+/// JB2b rule) and wait for the first HID keystroke. Phase 2 (the console owns the panel): detach
+/// fbcon's serial mirror, build the double-buffered `Screen` over the JD1-inherited scanout
+/// (`video::WRITER`, seeded in `tegra_early_stop`; the back buffer comes off the 48 MiB heap), and
+/// feed every keystroke through the shared `handle_key` -> `shell::dispatch_command`, presenting
+/// the damaged region after each. `Screen::flush` cleans the damage span to the Point of Coherency
+/// (`dc cvac`) once per present — the DCE scans the carveout from DRAM and does not snoop.
+///
+/// Headless boot (no JD1 scanout -> WRITER never seeded): delegates to `kbd_pump_body`, so a
+/// serial-only bench keeps the exact JB2b `KEY` evidence lines. Each keystroke is also echoed to
+/// serial here — the attended-bench proof rides both channels. Busy-poll + `yield_now`, never
+/// `sleep_ticks` (JC3 semantics: the drive loop drains no sleepers). Never returns.
+#[cfg(all(feature = "tegra", target_arch = "aarch64"))]
+fn jd2_console_pump(_arg: usize) {
+    use unaos_kernel::pal::{Event, GneissPal};
+
+    let front_fb = *unaos_kernel::video::WRITER.lock();
+    if front_fb.info().width == 0 {
+        unaos_kernel::arch::xusb_tegra::kbd_pump_body(0);
+        // kbd_pump_body never returns; unreachable, but keep the flow explicit.
+        return;
+    }
+    serial_println!(
+        ":: tegra: JD2 — EL1 console pump live (boot log holds the panel; first key enters the shell) ::"
+    );
+
+    // Phase 1: pump the controller, leave the JD1 boot log visible until someone types.
+    let first_key: u8 = loop {
+        if let Some(x) = unaos_kernel::drivers::xhci::XHCI_CONTROLLER.lock().as_mut() {
+            x.poll_events();
+        }
+        match unaos_kernel::pal::next_event() {
+            Some(Event::Key(c)) => break c,
+            _ => unaos_kernel::arch::sched::yield_now(),
+        }
+    };
+
+    // Phase 2: the console owns the panel. Detach the fbcon serial mirror FIRST so a CAPSTONE
+    // straggler line can't paint over the console frame (serial output is unaffected).
+    unaos_kernel::video::fbcon::detach();
+    let mut screen = unaos_kernel::video::Screen::new(front_fb);
+    let mut pal = unaos_kernel::pal::TargetPal::new(&mut screen);
+    let mut console = unaos_kernel::console::Console::new();
+    console.println("UnaOS — Jetson Orin Nano (Tegra234)");
+    console.println("JD2: interactive shell on the inherited scanout. Type 'help'.");
+    console.draw(&mut pal);
+    pal.render();
+    serial_println!(
+        ":: tegra: JD2 — console OWNS the panel (Screen back buffer live); first key {:#04x} ::",
+        first_key
+    );
+    // The wake-up keystroke is a real keystroke: feed it through, don't swallow it.
+    handle_key(first_key, &mut console, &mut pal);
+    pal.render();
+
+    loop {
+        if let Some(x) = unaos_kernel::drivers::xhci::XHCI_CONTROLLER.lock().as_mut() {
+            x.poll_events();
+        }
+        let mut keyed = false;
+        while let Some(ev) = unaos_kernel::pal::next_event() {
+            if let Event::Key(c) = ev {
+                // Serial echo: the bench evidence line (panel + serial must agree).
+                if (32..=126).contains(&c) {
+                    serial_println!(":: tegra: JD2 — KEY '{}' ::", c as char);
+                } else {
+                    serial_println!(":: tegra: JD2 — KEY {:#04x} ::", c);
+                }
+                keyed = true;
+                if handle_key(c, &mut console, &mut pal) {
+                    // A command took the whole screen (e.g. `gneiss`): stop draining this frame
+                    // so a queued keystroke can't paint the console back over it (the shared
+                    // drain-loop rule from the x86 GUI path).
+                    break;
+                }
+            }
+        }
+        if keyed {
+            pal.render();
+        }
+        unaos_kernel::arch::sched::yield_now();
+    }
 }
 
 /// M5b: the keyboard-event channel from the input service to the render service (bare-metal aarch64).
