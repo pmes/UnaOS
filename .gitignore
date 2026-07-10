@@ -23,3 +23,4 @@ evidence.txt
 .env
 cargo_check.log
 jetson-serial.log
+pi-serial.log

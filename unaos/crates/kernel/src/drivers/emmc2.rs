@@ -67,6 +67,15 @@ const INT_ERR: u32 = 1 << 15; // summary of any error interrupt (bits 16+)
 /// Any error: the error-summary bit OR any of the error-status bits [31:16].
 const INT_ERR_ANY: u32 = INT_ERR | 0xFFFF_0000;
 
+// --- R1 card-status error bits (SD Physical Layer §4.10.1). The R1 word rides RESP0 after any R1
+// command; these are the card-REPORTED failure bits — OUT_OF_RANGE(31), ADDRESS_ERROR(30),
+// BLOCK_LEN_ERROR(29), ERASE_SEQ_ERROR(28), ERASE_PARAM(27), WP_VIOLATION(26), CARD_IS_LOCKED(25),
+// LOCK_UNLOCK_FAILED(24), COM_CRC_ERROR(23), ILLEGAL_COMMAND(22), CARD_ECC_FAILED(21), CC_ERROR(20),
+// ERROR(19), CSD_OVERWRITE(16), WP_ERASE_SKIP(15), AKE_SEQ_ERROR(3). The controller's INT error bits
+// only cover the LINK (CRC/timeout/index); a card can complete the command cleanly at the link layer
+// while flagging e.g. WP_VIOLATION here — without this check that failure is silently swallowed. ---
+const R1_ERROR_MASK: u32 = 0xFFF9_8008;
+
 // --- CMDTM (0x0C) field builders. ---
 const CMD_RESP_NONE: u32 = 0b00 << 16;
 const CMD_RESP_136: u32 = 0b01 << 16;
@@ -89,6 +98,10 @@ const ACMD41_TIMEOUT_MS: u64 = 1000; // the power-up (busy) polling loop
 const RESET_TIMEOUT_MS: u64 = 100;
 const CLK_STABLE_TIMEOUT_MS: u64 = 100;
 const DATA_TIMEOUT_MS: u64 = 200;
+/// Post-write programming-busy bound: the SD spec caps a single-block write's busy window at 250 ms
+/// (§4.6.2.2 write timeout); double it for margin. Distinct from CMD_TIMEOUT_MS (100 ms) — waiting for
+/// programming under the plain command timeout would misclassify a slow-but-successful write as an error.
+const PROG_BUSY_TIMEOUT_MS: u64 = 500;
 
 /// The identified card: which base won the probe, its addressing mode, and its capacity. `read_block_512`
 /// reads this. Behind a Mutex so a read serializes the (single) controller; on the Pi loader path only the
@@ -99,6 +112,8 @@ struct SdCard {
     block_addressing: bool,
     num_blocks: u64,
     csd_version: u8, // 1 or 2, for the identified line
+    /// CMD13 SEND_STATUS argument (RCA already shifted into [31:16]), captured at CMD3.
+    rca_arg: u32,
 }
 static CARD: Mutex<Option<SdCard>> = Mutex::new(None);
 
@@ -175,6 +190,20 @@ fn send_command(base: usize, cmdtm: u32, arg: u32) -> Result<(), ()> {
         return Err(());
     }
     write32(base, INTERRUPT, INT_CMD_DONE);
+    Ok(())
+}
+
+/// Check the R1 card-status word (RESP0, valid immediately after an R1 command completes) for
+/// card-reported errors. `who` names the command for the one-line serial diagnostic. The controller's
+/// interrupt error bits (checked in `send_command`) cover only link-level failures; this is the CARD's
+/// own verdict — address out of range, write-protect violation, ECC failure, etc. Returns Err so the
+/// caller surfaces a real `BlockError` instead of treating a card-rejected transfer as success.
+fn r1_check(base: usize, who: &str) -> Result<(), ()> {
+    let r1 = read32(base, RESP0);
+    if r1 & R1_ERROR_MASK != 0 {
+        serial_println!(":: M6g: {} R1 error status {:#010x} ::", who, r1);
+        return Err(());
+    }
     Ok(())
 }
 
@@ -336,7 +365,7 @@ fn try_init(base: usize, clock_id: u32) -> Option<SdCard> {
         return None;
     }
 
-    Some(SdCard { base, block_addressing, num_blocks, csd_version })
+    Some(SdCard { base, block_addressing, num_blocks, csd_version, rca_arg })
 }
 
 /// Probe the microSD: EMMC2 first (the metal path), then the legacy base (QEMU's card). On success,
@@ -412,6 +441,9 @@ pub fn read_block_512(lba: u64, buf: &mut [u8]) -> Result<usize, BlockError> {
         arg,
     )
     .map_err(|_| BlockError::Io)?;
+    // The card answered at the link layer; now check ITS R1 verdict (out-of-range, ECC, ...) before
+    // touching the FIFO — a card that rejected CMD17 will never fill the read buffer.
+    r1_check(base, "CMD17").map_err(|_| BlockError::Io)?;
 
     // PIO in: wait for the block to be buffered, read 128 little-endian words, then wait transfer-complete.
     if !wait_set(base, INTERRUPT, INT_READ_RDY, DATA_TIMEOUT_MS) {
@@ -475,6 +507,9 @@ pub fn write_block_512(lba: u64, buf: &[u8]) -> Result<(), BlockError> {
         arg,
     )
     .map_err(|_| BlockError::Io)?;
+    // Mirror of the CMD17 check: the card's R1 verdict (write-protect, out-of-range, card-locked, ...)
+    // before pushing data — a card that rejected CMD24 will never accept the FIFO words.
+    r1_check(base, "CMD24").map_err(|_| BlockError::Io)?;
 
     // PIO out: wait for the write buffer to be ready, push 128 little-endian words, then wait transfer-complete.
     if !wait_set(base, INTERRUPT, INT_WRITE_RDY, DATA_TIMEOUT_MS) {
@@ -501,5 +536,18 @@ pub fn write_block_512(lba: u64, buf: &[u8]) -> Result<(), BlockError> {
     if int & INT_ERR_ANY != 0 {
         return Err(BlockError::Io);
     }
+
+    // The transfer is done at the LINK layer, but the card is now busy programming flash (DAT0 low) and
+    // programming-phase failures (CARD_ECC_FAILED, generic ERROR, WP_ERASE_SKIP) are only reported by a
+    // LATER SEND_STATUS — without this, a write the card ultimately discarded still returns Ok. Wait out
+    // programming-busy under the spec's write-timeout bound (send_command's own DAT_INHIBIT wait is only
+    // 100 ms — too short for a legal 250 ms busy), then fetch the card's post-programming verdict.
+    if !wait_clear(base, STATUS, ST_DAT_INHIBIT, PROG_BUSY_TIMEOUT_MS) {
+        serial_println!(":: M6g: CMD24 programming-busy timeout ::");
+        return Err(BlockError::Io);
+    }
+    send_command(base, cmd(13) | CMD_RESP_48 | CMD_CRCCHK | CMD_IXCHK, card.rca_arg)
+        .map_err(|_| BlockError::Io)?;
+    r1_check(base, "CMD13").map_err(|_| BlockError::Io)?;
     Ok(())
 }

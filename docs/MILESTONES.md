@@ -10,9 +10,57 @@ Legend: **✅ metal-confirmed** · **🔬 QEMU-green, metal pending** · dates I
 
 ---
 
+## hw-pi4 track — 2026-07-10
+
+> **⭐ METAL BENCH (2026-07-10, attended — real Pi 4, Debug Probe serial):** the entire FAT-mutating
+> stack confirmed on silicon in one boot off the real EMMC2 card (`@0xfe340000`, 15193 MiB CSD v2):
+> **23 PASS** — U9 in-place write, U10 grow/create/delete (real cluster allocation + both-FAT mirror +
+> directory RMW on the card), U11 M1/M2/M2b (close, unlink-defers-free, and the reaper freeing a real
+> teardown-orphaned chain), and **U6-grants** (owner ACL + the F1 grantee-unlink denial witnessed on
+> metal) — plus CAPSTONE 6/6, the 3 expected M6b kills, no leaks/faults, and **zero `M6g: R1 error`
+> lines** (the new R1 check rode the whole battery with no false positives on a healthy card).
+> Bench note: fixtures are stateful — a battery boot mutates `GROW.BIN`/`SCRATCH.BIN` and creates
+> `OWNED.BIN`/`FRESH.BIN`/`B11.BIN`; re-runs on a stale card self-report `(stale image) — demo skipped`
+> and are NOT failures. Re-prep = restore pristine `GROW.BIN`+`SCRATCH.BIN`, delete the created files.
+> One ancient 31 MB SD-1.0 card (`UNAOSRW`) was refused by the Pi 4 EEPROM bootloader outright
+> (no firmware output at all) — prefer the known-good 16 GB card.
+
+### emmc2 R1-status hardening — the card's own verdict checked after CMD17/CMD24 (aarch64) ✅ METAL-CONFIRMED (2026-07-10) `hw-pi4`
+- **What:** `drivers/emmc2.rs`'s polled CMD17 (READ_SINGLE_BLOCK) and CMD24 (WRITE_SINGLE_BLOCK)
+  issued the command and moved the data but ignored the card's **R1 status word** — the controller's
+  interrupt error bits cover only link-level failures (CRC/timeout/index), so a card-REPORTED error
+  (address out of range, write-protect violation, ECC failure, card-locked, …) was silently swallowed
+  and a bad read/write looked like success. Both paths now check RESP0 against the SD Physical Layer
+  §4.10.1 error mask (`R1_ERROR_MASK = 0xFFF9_8008`) immediately after the command completes, before
+  touching the PIO FIFO — symmetric across the two commands (the U9 mirror discipline) — logging one
+  `:: M6g: CMDnn R1 error status 0x… ::` diagnostic line and surfacing `BlockError::Io` up through
+  `drivers::block` instead of returning fabricated success.
+- **Tested:** `./arroyo kernel8-test 35` — **23 PASS** (all prior verdicts present incl. the full
+  U9/U10/U11/U6 FAT-mutating battery), CAPSTONE 6/6, only the 3 expected M6b kills, no leaks, and no
+  R1-error lines (QEMU's SD model returns clean R1, so the healthy path is proven un-regressed);
+  `./arroyo check` both arches green; `./arroyo test-arm 30` MISSION SUCCESS. The error leg itself is
+  unreachable under QEMU (its SD model doesn't fabricate card errors) — it is metal-relevant hardening,
+  exercised on silicon only when a real card complains.
+- **Commit:** see `git log` (`hw-pi4`).
+
+### emmc2 CMD13 post-write status — programming-phase errors surfaced (aarch64) `hw-pi4`
+- **What:** completes the R1 arc's story for writes. The R1 check catches a card that REJECTS CMD24,
+  but a card can also fail while PROGRAMMING the block after a clean transfer (DAT0 busy phase) — and
+  those errors (CARD_ECC_FAILED, generic ERROR, WP_ERASE_SKIP) appear only in a later SEND_STATUS, so
+  a discarded write still looked durable. `write_block_512` now waits out programming-busy
+  (`ST_DAT_INHIBIT` clear, dedicated 500 ms bound = 2× the spec's 250 ms write timeout — the plain
+  100 ms command timeout would flag a slow-but-legal write), then issues CMD13 SEND_STATUS (RCA
+  captured at CMD3, carried on `SdCard`) and applies the same `R1_ERROR_MASK` check — error →
+  `:: M6g: CMD13 R1 error status … ::` + `BlockError::Io`. Reads are unchanged (no programming phase).
+- **Tested:** `./arroyo kernel8-test 35` — **23 PASS**, CAPSTONE 6/6, no R1/CMD13 error lines, no
+  busy-timeouts (every write in the U9→U11/U6 FAT battery now exits through the CMD13 check — the
+  healthy path is exercised on every single write); `check` both arches; `test-arm 30` MISSION
+  SUCCESS. The error leg is metal-only (QEMU never fails programming), same honest scope as R1.
+- **Commit:** see `git log` (`hw-pi4`).
+
 ## hw-pi4 track — 2026-07-08 (Opus round)
 
-### U6 — UnaFS owner/grants: the by-NAME namespace ACL, enforced at `SYS_OPEN` (aarch64) 🔬 `hw-pi4`
+### U6 — UnaFS owner/grants: the by-NAME namespace ACL, enforced at `SYS_OPEN` (aarch64) ✅ METAL-CONFIRMED (2026-07-10) `hw-pi4`
 - **What:** closes the LAST documented capability gap the U6b→U11 line left. `SYS_OPEN`/`O_CREAT`/`SYS_UNLINK`
   were gated on the HANDLE capability, but the by-NAME namespace itself was NOT ACL'd — any process could
   open/create/unlink any name. This lands the in-kernel enforcement SEAM (the on-disk UnaFS `owner`/`grants:*`
@@ -66,7 +114,7 @@ Legend: **✅ metal-confirmed** · **🔬 QEMU-green, metal pending** · dates I
   ASID_GEN)` teardown-revert path the U11 reaper walks.
 - **Commit:** `21baee8` (M1) + `8034d0c` (M2) + `1ca2e89` (F1), branch `hw-pi4`.
 
-### U11 (M2b / U12b) — the teardown-last-close REAPER: deferred-free queue + kernel reaper task (aarch64) 🔬 `hw-pi4`
+### U11 (M2b / U12b) — the teardown-last-close REAPER: deferred-free queue + kernel reaper task (aarch64) ✅ METAL-CONFIRMED (2026-07-10) `hw-pi4`
 - **What:** closes the ONE honest-scope gap M2a left open. M2a proved the cross-process defer for the
   EXPLICIT-close path (the chain frees at the last `SYS_CLOSE`), but a program that EXITS holding the last
   cross-process open of an `unlink_pending` file cannot free its chain at teardown — that runs IRQ-masked, on the
@@ -124,7 +172,7 @@ Legend: **✅ metal-confirmed** · **🔬 QEMU-green, metal pending** · dates I
   not live today (the reaper's free is await-verdict-sequenced after all writers exit), and its fix touches `fat.rs`
   (out of this lane).
 
-### U11 (M2 / U12) — cross-process unlink-defers-free: a global open-file refcount + deferred chain-free (aarch64) 🔬 `hw-pi4`
+### U11 (M2 / U12) — cross-process unlink-defers-free: a global open-file refcount + deferred chain-free (aarch64) ✅ METAL-CONFIRMED (2026-07-10) `hw-pi4`
 - **What:** closes the SECOND (and last) of U10's two review notes — **cross-process unlink-while-open** (POSIX
   unlink-defers-free). U10 freed a file's cluster chain the instant `sys_unlink` ran; if ANOTHER process held the
   file open, its live descriptor kept pointing at a chain a later create+grow could first-fit-reuse — a cross-file
@@ -200,7 +248,7 @@ Legend: **✅ metal-confirmed** · **🔬 QEMU-green, metal pending** · dates I
   `chain_clusters`) + docs; zero x86 files. `SpinMutex` reused from `sched.rs` (not reimplemented); no `sched.rs`
   change. 🔬 Metal-pending (pure syscall lifecycle + FAT free; rides the next Pi boundary alongside U10/U11-M1).
 
-### U11 (M1) — open-file lifecycle: `SYS_CLOSE` + generation-tagged file-ids (aarch64) 🔬 `hw-pi4`
+### U11 (M1) — open-file lifecycle: `SYS_CLOSE` + generation-tagged file-ids (aarch64) ✅ METAL-CONFIRMED (2026-07-10) `hw-pi4`
 - **What:** gives a `File` descriptor a real end-of-life and a stable identity across slot reuse, closing the FIRST
   of U10's two review notes — the **same-process sibling-handle rebind on slot reuse**. U10 left a per-task FILES
   row as a bare `+1`-biased slot index with NO generation, so after an unlink freed a slot (`files_free_by_dir`
@@ -250,7 +298,7 @@ Legend: **✅ metal-confirmed** · **🔬 QEMU-green, metal pending** · dates I
   QEMU-provable in full); rides the next Pi 4 boundary alongside the still-pending U10 metal-verify.
 - **Commit:** on `hw-pi4` (Opus-executed) — see git log.
 
-### U10 — file GROWTH + CREATE + DELETE: cluster allocation, FAT-chain extension, directory mutation (aarch64) 🔬 `hw-pi4`
+### U10 — file GROWTH + CREATE + DELETE: cluster allocation, FAT-chain extension, directory mutation (aarch64) ✅ METAL-CONFIRMED (2026-07-10) `hw-pi4`
 - **What:** gives `fat::write_at` (U9's in-place-only writer) an ALLOCATOR, so `CAP_WRITE` can now **extend and
   create** files — the three restrictions U9 kept (never write the FAT, never allocate, never touch a directory)
   are lifted in rising order of risk. New `fat.rs` primitives, all FAT-safety-critical:
