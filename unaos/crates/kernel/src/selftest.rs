@@ -242,10 +242,10 @@ struct Pager {
 
 impl Pager {
     fn new(pal: &TargetPal) -> Self {
-        // Lines that fit above the prompt (console starts at y=20, 20px/line, ~40px prompt reserve),
-        // bounded to the console's retained-history window (leave a line for the more-prompt).
-        let fit = (pal.height() as usize).saturating_sub(60) / 20;
-        Pager { rows: fit.clamp(6, 24), on_page: 0 }
+        // Share the console's page-height math (the single source of truth) so a pager page is
+        // exactly one console screenful minus the prompt line — no independent clamp that would
+        // pause at ~2/3 height on a native-resolution panel.
+        Pager { rows: Console::page_rows(pal), on_page: 0 }
     }
 
     /// Push one line to the console, repaint progressively, and pause at page boundaries. Emitting the
