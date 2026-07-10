@@ -25,6 +25,46 @@ Legend: **✅ metal-confirmed** · **🔬 QEMU-green, metal pending** · dates I
 > One ancient 31 MB SD-1.0 card (`UNAOSRW`) was refused by the Pi 4 EEPROM bootloader outright
 > (no firmware output at all) — prefer the known-good 16 GB card.
 
+### F2 — SMP-hardening of the FAT-mutation seams (aarch64) 🔬 QEMU-green (incl. a cross-core witness with teeth), metal-pending `hw-pi4`
+- **What:** the whole FAT-mutating stack is metal-confirmed, but the U11-M2b reaper made a SECOND
+  cross-core FAT writer permanent while two single-core-only assumptions remained. This arc closes the
+  ones in the pi4 lane before SMP scheduling widens (not live today — the reaper's free is
+  await-verdict-sequenced strictly after all writers exit).
+  - **M1 — `fat::set_fat_entry` lost-update CLOSED.** The all-copies read-modify-write of a FAT sector
+    was unserialized: two cores mutating entries in the same sector (or the two mirrored FAT copies)
+    could read-before-the-other's-write and clobber an update. A new aarch64-only `FAT_MUTATION`
+    spinlock (`fs/fat.rs`), acquired IRQ-masked via `arch::without_interrupts` (non-preemptible → a
+    proper IRQ-safe spinlock at any core count, the reaper's `IrqGuard` discipline), serializes the whole
+    RMW. Span is bounded to a single FAT-sector RMW — never a free-search / data loop / `mount()` — safe
+    because the aarch64 storage path is polled. aarch64-only: x86's FAT path `hlt`s awaiting an async
+    xHCI event, so masking IRQs across it would hang (`with_fat_lock` is a zero-cost passthrough there,
+    x86 byte-identical). `5645123`.
+  - **M2 — the `sys_fgrant` grantee (asid,gen) TOCTOU CLOSED** (`arch/aarch64/syscall.rs`). The grant
+    captured the grantee identity as two separate atomic loads; a child exiting + ASID-recycling between
+    them could bind the grant to the recycled incarnation (misdelegation → privilege escalation /
+    disclosure). Now re-validates `state==PRUNNING && pid && asid` after the gen read (an ASID's gen bumps
+    only at teardown, which flips those) → `-ECHILD` on any mismatch. This was surfaced by a 23-agent
+    adversarial audit of the U6 (`OWNED_FILES`) + U11 (`OPEN_FILES` / open-vs-unlink) seams. `10e3c65`.
+  - **M3 — cross-core witness (with teeth).** An in-RAM stress on the SAME lock (no on-disk FAT touched,
+    zero volume risk): a joinable worker on `demo_cpu` + this task's half inline race a non-atomic
+    counter. On 4-core QEMU raspi4b (round-robin TCG) the UNLOCKED control raced away **~48%
+    (116001/240000)** of its increments while the LOCKED path lost **NONE** — a genuine cross-core
+    demonstration that the race is real AND the lock closes it. Emits an `F2-witness:` line, deliberately
+    not a `-> PASS` line, so the 23-fixture count stays byte-equivalent. `55451da`.
+  - **Audited SOUND / ledgered:** the U11 refcount lifecycle + the U6 owner-check are SMP-sound (verified,
+    no change); two windows are benign-by-design. The remaining races are metal-latent
+    (excluded-by-sequencing) and ledgered with identified fixes in [`SECURITY.md`](SECURITY.md) — most
+    notably the F2 flag's OTHER named leg, `alloc_cluster`'s free-search-then-claim **cluster-aliasing**
+    (SIMPLE, compare-and-claim under `FAT_MUTATION`, deferred to avoid restructuring the metal-confirmed
+    allocator beyond M1's `set_fat_entry` scope), the directory-sector RMW twin, and the
+    open-races-unlink / recycled-slot-ownership races that need a broader UnaFS namespace lock.
+- **Tested:** `./arroyo kernel8-test` — **23 PASS** (byte-equivalent) + CAPSTONE 6/6, only the 3 expected
+  M6b kills, no leaks/faults, zero R1/CMD13 error lines, **+ the `F2-witness:` line** (locked 240000/240000
+  intact, unlocked lost 116001/240000). `./arroyo check` both arches; `./arroyo test-arm` MISSION SUCCESS.
+  Metal-pending: the on-disk `set_fat_entry` RMW under true metal parallelism rides the next attended bench.
+- **Lane:** `fs/fat.rs` (aarch64 path — seat-granted for this arc) + `arch/aarch64/syscall.rs`; **zero x86
+  behavioural change** (all new code cfg-gated `target_arch = "aarch64"`).
+
 ### emmc2 R1-status hardening — the card's own verdict checked after CMD17/CMD24 (aarch64) ✅ METAL-CONFIRMED (2026-07-10) `hw-pi4`
 - **What:** `drivers/emmc2.rs`'s polled CMD17 (READ_SINGLE_BLOCK) and CMD24 (WRITE_SINGLE_BLOCK)
   issued the command and moved the data but ignored the card's **R1 status word** — the controller's
@@ -166,11 +206,14 @@ Legend: **✅ metal-confirmed** · **🔬 QEMU-green, metal pending** · dates I
   proper IRQ-safe spinlock at any core count. Also folded the log nit: `free_orphan_chain` returns `bool`; the reaper
   logs "reaper freed …" only on a SUCCESSFUL free (its error/leak line covers failure). Byte-transparent under QEMU
   (cooperative — no preemption): **22 PASS**, CAPSTONE 6/6, reaper freed cluster 8, no teardown-leak line, 0 faults;
-  `check` both arches; `test-arm` clean; zero x86 files. **Flagged, NOT fixed (future SMP-hardening arc):** the
+  `check` both arches; `test-arm` clean; zero x86 files. **Flagged for a future SMP-hardening arc:** the
   reaper's downstream `fat::set_fat_entry` read-modify-write is unlocked across cores (no FS-mutation lock spanning
   the RMW) — a latent lost-update/cluster-aliasing race should the OS ever run uncoordinated concurrent FAT writers;
   not live today (the reaper's free is await-verdict-sequenced after all writers exit), and its fix touches `fat.rs`
-  (out of this lane).
+  (out of this lane). **→ Addressed by the F2 arc (2026-07-10, above):** the lost-update leg is CLOSED (`FAT_MUTATION`
+  serializes the `set_fat_entry` RMW, `5645123`) and witnessed cross-core (`55451da`); the cluster-aliasing leg is
+  audit-confirmed with its fix specified (compare-and-claim under `FAT_MUTATION`) and ledgered in `SECURITY.md`,
+  deferred to avoid restructuring the metal-confirmed allocator beyond M1's scope.
 
 ### U11 (M2 / U12) — cross-process unlink-defers-free: a global open-file refcount + deferred chain-free (aarch64) ✅ METAL-CONFIRMED (2026-07-10) `hw-pi4`
 - **What:** closes the SECOND (and last) of U10's two review notes — **cross-process unlink-while-open** (POSIX
