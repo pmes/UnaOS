@@ -7960,6 +7960,8 @@ pub fn u7_launcher(demo_cpu: usize) {
     // never perturb the fixture battery, and it never touches the disk. Emits its own `F2-witness:` line — NOT a
     // `-> PASS` line, so the 23-fixture count stays byte-equivalent.
     f2_witness_launcher(demo_cpu);
+    // F3 M4: the NAMESPACE-lock twin — same discipline (last, in-RAM, no disk, its own `F3-witness:` line).
+    f3_witness_launcher(demo_cpu);
 }
 
 /// F2 M3 witness worker — the `demo_cpu` half of the cross-core FAT_MUTATION stress. `fn(usize)` for
@@ -8023,6 +8025,88 @@ fn f2_witness_launcher(demo_cpu: usize) {
         // Only reachable if FAT_MUTATION failed to serialize — a real regression, not an expected outcome.
         serial_println!(
             ":: F2-witness: FAT_MUTATION cross-core RMW (worker on core {}) — locked {}/{}, LOST {} increments under the lock -> SERIALIZATION REGRESSION ::",
+            demo_cpu, locked_got, want, want - locked_got
+        );
+    }
+}
+
+// F3-M4 witness: the NAMESPACE-lock twin of the F2 witness — an in-RAM cross-core stress of the EXACT lock
+// (`ns_lock`) that serializes sys_open/sys_unlink's name sequences, with zero volume risk. Two cores drive a
+// deliberately NON-ATOMIC counter RMW; the LOCKED pass routes every step through `ns_lock()` and must lose
+// nothing, the UNLOCKED control shows what the environment raced away. HONEST SCOPE: this witnesses that the
+// namespace lock serializes cross-core (engaged, correct, no deadlock with the inner locks it nests); the full
+// open-vs-unlink DISK-sequence interleave (two cores mid-syscall in find_located/mark_dir_deleted) is not
+// provokable from the single-EL0-core QEMU battery — that leg is metal-latent and rides the attended bench,
+// exactly the F2/R1 honest-scope pattern.
+static F3_WITNESS_COUNTER: AtomicU32 = AtomicU32::new(0);
+
+/// F3 witness — one non-atomic RMW of the scratch counter with a WIDE read->write window (the F2 step shape).
+#[inline(never)]
+fn f3_witness_step() {
+    let v = F3_WITNESS_COUNTER.load(Ordering::Relaxed);
+    for _ in 0..48 {
+        core::hint::spin_loop();
+    }
+    F3_WITNESS_COUNTER.store(v.wrapping_add(1), Ordering::Relaxed);
+}
+
+/// F3 witness — drive `iters` steps, optionally serialized through the REAL namespace lock (`ns_lock`).
+fn f3_witness_rmw(iters: u32, locked: bool) {
+    for _ in 0..iters {
+        if locked {
+            let _ns = ns_lock();
+            f3_witness_step();
+        } else {
+            f3_witness_step();
+        }
+    }
+}
+
+/// F3 witness worker — the `demo_cpu` half of the LOCKED pass (`fn(usize)` for `sched::spawn_joinable`).
+fn f3_witness_worker_locked(iters: usize) {
+    f3_witness_rmw(iters as u32, true);
+}
+
+/// F3 witness worker — the `demo_cpu` half of the UNLOCKED control.
+fn f3_witness_worker_unlocked(iters: usize) {
+    f3_witness_rmw(iters as u32, false);
+}
+
+/// F3-M4 — the cross-core witness for the M3 NAMESPACE serialization (the `f2_witness_launcher` shape: this
+/// task on `vcpu`, a joinable worker on `demo_cpu` = online[0] so the join can never hang). Emits ONE
+/// `F3-witness:` line — deliberately NOT a `-> PASS` line, so the 23-fixture count stays byte-equivalent.
+fn f3_witness_launcher(demo_cpu: usize) {
+    const N: u32 = 120_000;
+    let want = 2 * N;
+
+    F3_WITNESS_COUNTER.store(0, Ordering::SeqCst);
+    let h = super::sched::spawn_joinable("f3-witness-lk", f3_witness_worker_locked, N as usize, demo_cpu);
+    f3_witness_rmw(N, true);
+    h.join();
+    let locked_got = F3_WITNESS_COUNTER.load(Ordering::SeqCst);
+
+    F3_WITNESS_COUNTER.store(0, Ordering::SeqCst);
+    let h2 = super::sched::spawn_joinable("f3-witness-ul", f3_witness_worker_unlocked, N as usize, demo_cpu);
+    f3_witness_rmw(N, false);
+    h2.join();
+    let unlocked_got = F3_WITNESS_COUNTER.load(Ordering::SeqCst);
+    let unlocked_lost = want.saturating_sub(unlocked_got);
+
+    if locked_got == want {
+        if unlocked_lost > 0 {
+            serial_println!(
+                ":: F3-witness: NAMESPACE cross-core RMW (worker on core {}) — locked {}/{} intact (0 lost); unlocked lost {}/{} -> the open/unlink sequence lock serializes under real contention (disk-sequence interleave is metal-latent — rides the bench) ::",
+                demo_cpu, locked_got, want, unlocked_lost, want
+            );
+        } else {
+            serial_println!(
+                ":: F3-witness: NAMESPACE cross-core RMW (worker on core {}) — locked {}/{} intact; unlocked also 0 lost (QEMU RR-TCG did not interleave — cross-core contention is metal-only), lock engaged + serialized path intact ::",
+                demo_cpu, locked_got, want
+            );
+        }
+    } else {
+        serial_println!(
+            ":: F3-witness: NAMESPACE cross-core RMW (worker on core {}) — locked {}/{}, LOST {} increments under the lock -> SERIALIZATION REGRESSION ::",
             demo_cpu, locked_got, want, want - locked_got
         );
     }
