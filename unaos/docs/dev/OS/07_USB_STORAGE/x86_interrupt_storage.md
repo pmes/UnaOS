@@ -1,9 +1,14 @@
 # STOR-D1 — IF-safe interrupt-driven x86 storage (design)
 
-Status: **design only** (STOR-D1 / M1). No kernel code changes accompany this doc; it is the
-input to a seat review that green-lights (or iterates) a follow-on code arc. Track: `hw-rmbp`
-(x86_64, 2012 rMBP). Twin reference: the aarch64 polled storage path, which this design brings
-x86 into semantic parity with **without** copying its mechanism.
+Status: **S1–S3 LANDED** (2026-07-10, `hw-rmbp`, behind the `irqstorage` knob — QEMU-green,
+metal-pending; commits `7b2f05f`/`b73ba08`/`fd5de85`). S1 the storage service task +
+`BlockRequest` submit/block/complete; S2 live in-place reads (`sys_read`); S3 live in-place
+write-through (`sys_write_file`) closing the close-discards-dirty residual. **S4 (synchronous
+grow/create/delete) is DEFERRED** to a tightly-scoped follow-on (decision 4 below), since its
+cross-process races are metal-only (risk 3) and it rewrites the most load-bearing lifecycle code.
+The original design (below) is unchanged. Track: `hw-rmbp` (x86_64, 2012 rMBP). Twin reference:
+the aarch64 polled storage path, which this design brings x86 into semantic parity with
+**without** copying its mechanism.
 
 > Placement note: the STOR-D1 brief names `docs/dev/OS/07_STORAGE/`. The repo's storage doc home
 > is `docs/dev/OS/07_USB_STORAGE/` (alongside `usb_xhci.md`), so this doc lives there. Flagged for
