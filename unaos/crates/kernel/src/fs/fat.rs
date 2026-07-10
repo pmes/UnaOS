@@ -339,6 +339,36 @@ fn with_fat_lock<R>(f: impl FnOnce() -> R) -> R {
     f()
 }
 
+/// F3-M2: the DIRECTORY-sector mutation lock — the twin of [`FAT_MUTATION`] for the three directory-sector
+/// read-modify-writes ([`FatFs::write_dir_entry_fields`], [`FatFs::mark_dir_deleted`], and
+/// [`FatFs::create_in_root`]'s slot write). Each was a bare `read_sector -> modify -> write_sector` of a
+/// directory sector with no serialization, so two cores RMW-ing entries in the SAME directory sector could
+/// lose an update (e.g. a grow's size-publish resurrecting a racing delete's `0xE5`). One lock for the FAT and
+/// one for directories is deliberate: they guard DISJOINT sectors and the two are never nested. Same arch
+/// reasoning as `FAT_MUTATION` (aarch64-only; the x86 FAT path `hlt`-waits, masking across it would hang).
+#[cfg(target_arch = "aarch64")]
+static DIR_MUTATION: spin::Mutex<()> = spin::Mutex::new(());
+
+/// Run `f` under the directory-sector mutation lock (aarch64), or unchanged (other arches). Same IRQ-masked,
+/// non-preemptible discipline as [`with_fat_lock`] (see its doc for the deadlock reasoning). LOCK SPAN: only
+/// a single directory-sector RMW (one bounded polled read + one write) — never a directory SCAN
+/// (`find_free_root_slot` / `find_located` stay outside; the F3-M3 namespace lock serializes those sequences).
+#[cfg(target_arch = "aarch64")]
+#[inline]
+fn with_dir_lock<R>(f: impl FnOnce() -> R) -> R {
+    crate::arch::without_interrupts(|| {
+        let _guard = DIR_MUTATION.lock();
+        f()
+    })
+}
+
+/// Non-aarch64 (x86): the directory-mutation lock is inert — the [`with_fat_lock`] passthrough reasoning.
+#[cfg(not(target_arch = "aarch64"))]
+#[inline(always)]
+fn with_dir_lock<R>(f: impl FnOnce() -> R) -> R {
+    f()
+}
+
 // ---------------------------------------------------------------------------------------------------------
 // F2 M3 witness: a cross-core stress of the FAT_MUTATION serialization on an IN-RAM scratch counter — NOT the
 // on-disk FAT, so it carries zero volume risk while exercising the EXACT lock that guards `set_fat_entry`. Two
@@ -1276,15 +1306,19 @@ impl FatFs {
         if off + 32 > SECTOR_SIZE {
             return Err(FatError::Io); // a slot never straddles a sector; a bad offset is a caller bug
         }
-        let mut buf = [0u8; SECTOR_SIZE];
-        read_sector(lba, &mut buf)?;
-        let hi = (first_cluster >> 16) as u16;
-        let lo = (first_cluster & 0xFFFF) as u16;
-        buf[off + 20..off + 22].copy_from_slice(&hi.to_le_bytes());
-        buf[off + 26..off + 28].copy_from_slice(&lo.to_le_bytes());
-        buf[off + 28..off + 32].copy_from_slice(&size.to_le_bytes());
-        write_sector(lba, &buf)?;
-        Ok(())
+        // F3-M2: the whole sector RMW under DIR_MUTATION — a concurrent RMW of a NEIGHBOURING slot in this
+        // same sector can no longer read-before-our-write and clobber this publish (or vice versa).
+        with_dir_lock(|| {
+            let mut buf = [0u8; SECTOR_SIZE];
+            read_sector(lba, &mut buf)?;
+            let hi = (first_cluster >> 16) as u16;
+            let lo = (first_cluster & 0xFFFF) as u16;
+            buf[off + 20..off + 22].copy_from_slice(&hi.to_le_bytes());
+            buf[off + 26..off + 28].copy_from_slice(&lo.to_le_bytes());
+            buf[off + 28..off + 32].copy_from_slice(&size.to_le_bytes());
+            write_sector(lba, &buf)?;
+            Ok(())
+        })
     }
 
     /// U10: WRITE with GROWTH — overwrite `data` at byte offset `start`, EXTENDING the file (allocating,
@@ -1379,21 +1413,25 @@ impl FatFs {
     pub fn create_in_root(&self, name: &str, attr: u8) -> Result<(DirEntry, u64, usize), FatError> {
         let raw = format_83(name).ok_or(FatError::Unsupported)?;
         let (lba, off) = self.find_free_root_slot()?;
-        let mut buf = [0u8; SECTOR_SIZE];
-        read_sector(lba, &mut buf)?;
-        // Write a fresh 32-byte entry: 11-byte name, attr, everything else zero (NTRes/times = 0, first_cluster
-        // hi@20 lo@26 = 0, size@28 = 0). Never set the volume-label bit — this is a file/dir entry.
-        for b in buf[off..off + 32].iter_mut() {
-            *b = 0;
-        }
-        buf[off..off + 11].copy_from_slice(&raw);
-        buf[off + 11] = attr & !0x08;
-        write_sector(lba, &buf)?;
-        // Re-parse the slot we just wrote so the returned DirEntry is byte-for-byte what a reader would see.
-        match classify_dir_slot(&buf[off..off + 32]) {
-            DirSlot::Entry(de) => Ok((de, lba, off)),
-            _ => Err(FatError::Io), // unreachable: we just wrote a valid non-empty, non-LFN entry
-        }
+        // F3-M2: the slot WRITE is a sector RMW under DIR_MUTATION (the free-slot SCAN above stays outside —
+        // per the with_dir_lock span rule; the scan-then-claim slot race itself is the F3-M3 namespace lock's).
+        with_dir_lock(|| {
+            let mut buf = [0u8; SECTOR_SIZE];
+            read_sector(lba, &mut buf)?;
+            // Write a fresh 32-byte entry: 11-byte name, attr, everything else zero (NTRes/times = 0,
+            // first_cluster hi@20 lo@26 = 0, size@28 = 0). Never set the volume-label bit — a file/dir entry.
+            for b in buf[off..off + 32].iter_mut() {
+                *b = 0;
+            }
+            buf[off..off + 11].copy_from_slice(&raw);
+            buf[off + 11] = attr & !0x08;
+            write_sector(lba, &buf)?;
+            // Re-parse the slot we just wrote so the returned DirEntry is byte-for-byte what a reader sees.
+            match classify_dir_slot(&buf[off..off + 32]) {
+                DirSlot::Entry(de) => Ok((de, lba, off)),
+                _ => Err(FatError::Io), // unreachable: we just wrote a valid non-empty, non-LFN entry
+            }
+        })
     }
 
     /// U10: the on-disk location of the first FREE root-directory slot (a `0x00` end marker or a `0xE5` deleted
@@ -1465,11 +1503,15 @@ impl FatFs {
         if dir_off + 32 > SECTOR_SIZE {
             return Err(FatError::Io);
         }
-        let mut buf = [0u8; SECTOR_SIZE];
-        read_sector(dir_lba, &mut buf)?;
-        buf[dir_off] = 0xE5;
-        write_sector(dir_lba, &buf)?;
-        Ok(())
+        // F3-M2: the sector RMW under DIR_MUTATION — a racing size-publish RMW of a sibling slot in this
+        // sector can no longer resurrect the `0xE5` (lost-delete), nor this delete clobber its publish.
+        with_dir_lock(|| {
+            let mut buf = [0u8; SECTOR_SIZE];
+            read_sector(dir_lba, &mut buf)?;
+            buf[dir_off] = 0xE5;
+            write_sector(dir_lba, &buf)?;
+            Ok(())
+        })
     }
 
     /// U11-M2: free every cluster in a file's chain (each FAT entry -> `0`, in ALL FAT copies), returning the
