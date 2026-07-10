@@ -139,6 +139,72 @@ impl Screen {
         self.mark_full();
     }
 
+    /// Draw a Bresenham line into the back buffer and mark its bounding box damaged. Endpoints are
+    /// signed; the surface clips per-pixel. The `vug` wireframe primitive.
+    pub fn draw_line(&mut self, x0: i32, y0: i32, x1: i32, y1: i32, color: u32) {
+        self.back.draw_line(x0, y0, x1, y1, color);
+        let lo_x = x0.min(x1).max(0) as usize;
+        let lo_y = y0.min(y1).max(0) as usize;
+        let hi_x = x0.max(x1).max(0) as usize;
+        let hi_y = y0.max(y1).max(0) as usize;
+        self.mark(lo_x, lo_y, hi_x + 1, hi_y + 1);
+    }
+
+    /// Fill the triangle `(a, b, c)` (pixel coordinates) with a flat colour, marking its bounding
+    /// box damaged. Half-space scanline rasteriser: for each row spanning the triangle's vertical
+    /// extent, fill between the two edge intersections. The `vug` solid-facet primitive; the caller
+    /// does backface culling and painter's-order sorting, so this just fills.
+    pub fn fill_triangle(
+        &mut self,
+        a: (i32, i32),
+        b: (i32, i32),
+        c: (i32, i32),
+        color: u32,
+    ) {
+        // Sort vertices by y ascending: p0.y <= p1.y <= p2.y.
+        let mut p = [a, b, c];
+        p.sort_unstable_by_key(|v| v.1);
+        let (p0, p1, p2) = (p[0], p[1], p[2]);
+        let w = self.info.width as i32;
+        let h = self.info.height as i32;
+
+        // Interpolate an x at scanline `y` along the edge from `q` to `r` (in 1/65536 px).
+        let edge_x = |q: (i32, i32), r: (i32, i32), y: i32| -> i32 {
+            if r.1 == q.1 {
+                return q.0;
+            }
+            q.0 + ((r.0 - q.0) as i64 * (y - q.1) as i64 / (r.1 - q.1) as i64) as i32
+        };
+
+        let y_top = p0.1.max(0);
+        let y_bot = p2.1.min(h - 1);
+        let mut min_x = w;
+        let mut max_x = 0;
+        let mut y = y_top;
+        while y <= y_bot {
+            // Long edge p0->p2 spans the whole height; the short edge switches at p1.y.
+            let xa = edge_x(p0, p2, y);
+            let xb = if y < p1.1 {
+                edge_x(p0, p1, y)
+            } else {
+                edge_x(p1, p2, y)
+            };
+            let (mut xl, mut xr) = if xa <= xb { (xa, xb) } else { (xb, xa) };
+            xl = xl.max(0);
+            xr = xr.min(w - 1);
+            if xl <= xr {
+                let run = (xr - xl + 1) as usize;
+                self.back.fill_rect(xl as usize, y as usize, run, 1, color);
+                min_x = min_x.min(xl);
+                max_x = max_x.max(xr);
+            }
+            y += 1;
+        }
+        if min_x <= max_x {
+            self.mark(min_x as usize, y_top as usize, max_x as usize + 1, y_bot as usize + 1);
+        }
+    }
+
     pub fn scroll_up(&mut self, dy: usize, fill: u32) {
         self.back.scroll_up(dy, fill);
         self.mark_full();

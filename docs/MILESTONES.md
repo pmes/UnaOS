@@ -10,6 +10,36 @@ Legend: **✅ metal-confirmed** · **🔬 QEMU-green, metal pending** · dates I
 
 ---
 
+## gfx track — 2026-07-10
+
+### VUG-1 — the crystal: `vug` becomes the graphics engine's living demo (x86 + aarch64) 🔬 `gfx-vug`
+- **What:** rebuilt `vug` from a static test pattern into a real-time, software-rendered rotating
+  quartz crystal (an elongated hexagonal bipyramid — 14 vertices, 24 triangles), drawn through the
+  Gneiss PAL. Arch-neutral and float-free: geometry, a two-axis tumble, and perspective projection
+  run in Q16.16 fixed point off a 256-entry brad sine table. Solid mode does backface culling
+  (screen winding) + painter's-order depth sort + per-face integer Lambert shading (deep amethyst on
+  the #1E1E1E Can-Am grey, lilac seam highlights); `vug wire` shows the wireframe; `vug bebox` keeps
+  a BeBox tribute; any key exits cleanly back to the shell (the `took_screen` contract). This starts
+  the **graphics-engine ledger** — see [`dev/OS/08_VIDEO/engine.md`](dev/OS/08_VIDEO/engine.md).
+- **Engine primitives added (additive; fbcon/Console/Screen contracts unchanged):** `draw_line`
+  (Bresenham) and `fill_triangle` (scanline) on FrameBuffer/Screen/PAL with damage tracking;
+  `pal::pump_and_poll` so a full-screen interactive loop drives its own input (xHCI HID + aarch64
+  UART) and exits on a key.
+- **M3b corner meters:** a RENDER meter (the honest software "GPU monitor" — per-frame render/present
+  cycle span vs whole-frame span => busy %, frame time / FPS, drawn triangles + estimated filled
+  pixels) and a BeOS-Pulse-style **CPU pulse** meter (per-core busy/idle from additive relaxed
+  lock-free counters bumped at the dispatch/idle points of both schedulers; read via
+  `sched::meter_cpu_count`/`meter_cpu_ticks` — introspection only, never on a scheduling path). Both
+  render through the damage-tracked back buffer; one present per frame holds. Each meter names the
+  seam a real GPU/PMU utilization feed would replace.
+- **Tested — QEMU:** `./arroyo check` (x86 + aarch64) and `UNAOS_TEGRA=1 ./arroyo check` green;
+  `./arroyo test 25` and `./arroyo test-arm 22` both **MISSION SUCCESS** (vug runs only on command,
+  so it does not perturb headless boots — the regression suites are un-regressed by the added
+  scheduler counters). **Visual verdict is attended-pending:** `./arroyo x86` (QEMU GUI) and the next
+  Orin bench are where the crystal spins. The `:: VUG: crystal live — 24 faces, solid/wire, exit
+  clean ::` and `:: VUG: crystal exit clean — N frames ::` serial lines are emitted by `run_crystal`
+  when the demo is invoked (GUI-verified-pending; headless gates never type `vug`).
+
 ## hw-pi4 track — 2026-07-10
 
 > **⭐ METAL BENCH (2026-07-10, attended — real Pi 4, Debug Probe serial):** the entire FAT-mutating
