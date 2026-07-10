@@ -10,6 +10,26 @@ Legend: **✅ metal-confirmed** · **🔬 QEMU-green, metal pending** · dates I
 
 ---
 
+## hw-pi4 track — 2026-07-10
+
+### emmc2 R1-status hardening — the card's own verdict checked after CMD17/CMD24 (aarch64) 🔬 `hw-pi4`
+- **What:** `drivers/emmc2.rs`'s polled CMD17 (READ_SINGLE_BLOCK) and CMD24 (WRITE_SINGLE_BLOCK)
+  issued the command and moved the data but ignored the card's **R1 status word** — the controller's
+  interrupt error bits cover only link-level failures (CRC/timeout/index), so a card-REPORTED error
+  (address out of range, write-protect violation, ECC failure, card-locked, …) was silently swallowed
+  and a bad read/write looked like success. Both paths now check RESP0 against the SD Physical Layer
+  §4.10.1 error mask (`R1_ERROR_MASK = 0xFFF9_8008`) immediately after the command completes, before
+  touching the PIO FIFO — symmetric across the two commands (the U9 mirror discipline) — logging one
+  `:: M6g: CMDnn R1 error status 0x… ::` diagnostic line and surfacing `BlockError::Io` up through
+  `drivers::block` instead of returning fabricated success.
+- **Tested:** `./arroyo kernel8-test 35` — **23 PASS** (all prior verdicts present incl. the full
+  U9/U10/U11/U6 FAT-mutating battery), CAPSTONE 6/6, only the 3 expected M6b kills, no leaks, and no
+  R1-error lines (QEMU's SD model returns clean R1, so the healthy path is proven un-regressed);
+  `./arroyo check` both arches green; `./arroyo test-arm 30` MISSION SUCCESS. The error leg itself is
+  unreachable under QEMU (its SD model doesn't fabricate card errors) — it is metal-relevant hardening,
+  exercised on silicon only when a real card complains.
+- **Commit:** see `git log` (`hw-pi4`).
+
 ## hw-pi4 track — 2026-07-08 (Opus round)
 
 ### U6 — UnaFS owner/grants: the by-NAME namespace ACL, enforced at `SYS_OPEN` (aarch64) 🔬 `hw-pi4`
