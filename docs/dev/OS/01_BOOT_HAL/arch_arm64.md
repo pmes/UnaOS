@@ -1582,7 +1582,7 @@ was never needed — the DTB path carried it. NEXT (JD2): route the inherited US
 the panel. A blank panel after a correct verdict = wrong base/stride/format/memory-type, **not** "re-init
 needed" (do not reset the DC/SOR/DP).
 
-### JD2 — interactive shell on the panel: keyboard → console → shell over the inherited scanout (QEMU-inert, ⏳ METAL-PENDING)
+### JD2 — interactive shell on the panel: keyboard → console → shell over the inherited scanout (✅ METAL-CONFIRMED 2026-07-10)
 
 JD1 put pixels on the panel; JB10 armed a USB keyboard whose HID reports land in the shared `pal`
 event queue. JD2 joins the two: the Orin's first interactive session, drawn on the inherited scanout
@@ -1619,11 +1619,16 @@ being reachable pulls it all in. This is **past the old ~355 KB "red line"**, wh
 clobbered-virt-build heuristic: from JD2 on, validate tegra media by the `tegra:`-string count
 (≈105; a virt clobber has ~0), not by size.
 
-**Metal verdict (attended bench): ⏳ PENDING.** Expected: boot log on the panel as in JD1; the first
-keystroke switches the panel to the console (green prompt); typed characters echo at the prompt (and
-as serial `KEY` lines); `help` / `ver` / `echo …` dispatch and print; `fatinfo`/`ls` report "no FAT
-filesystem" honestly (no storage on this path yet). A keystroke that echoes on serial but not the
-panel = the `Screen` flush path, not input.
+**Metal verdict — ✅ METAL-CONFIRMED (2026-07-10, attended bench; Peter at the Orin, this session
+flashed the card itself).** Serial (`~/unaos-bench/jetson-serial-2026-07-10-090000.log`): JD1
+unchanged (`scanout … sane=true` → `panel LIVE`), keyboard ARMED on **direct root port 6 (slot 4)**,
+`JD2 — EL1 console pump task spawned` → post-drop `console pump live`, `CAPSTONE COMPLETE`, then
+the first keystroke (0x0a) → `JD2 — console OWNS the panel (Screen back buffer live)`. Peter typed
+`help` ⏎ (each key echoed as a serial `KEY` line; the command list painted on the panel — verdict
+"it works!"), then `gneiss` ⏎ and more input: **the pump survived vug** — keystrokes kept flowing
+after it, no panic/wedge (vug-on-tegra behaviour beyond survival not formally assessed this bench).
+The first interactive UnaOS session on the Orin: typed on the inherited keyboard, drawn on the
+inherited scanout, dispatched by the shared shell at EL1.
 
 ## 4. Jetson Orin Nano headless bring-up (Arc JM2)
 
