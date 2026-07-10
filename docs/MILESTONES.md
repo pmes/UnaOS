@@ -10,6 +10,41 @@ Legend: **✅ metal-confirmed** · **🔬 QEMU-green, metal pending** · dates I
 
 ---
 
+## ux track — 2026-07-10
+
+### TSTE-1 — `tste`: the in-OS self-test suite (x86 + aarch64) 🔬 `ux-tste`
+- **What:** running tests no longer needs a host. From a booted shell (x86 GUI, the Orin panel, or
+  the serial console) `tste` runs the suite and prints ONE three-section PASS/FAIL/SKIP table:
+  **[boot-time]** replays the boot-sequenced fixture verdicts, **[live]** re-runs everything that can
+  honestly re-run post-boot, **[skipped]** lists what can't (with reasons). New
+  `crates/kernel/src/selftest.rs` owns the suite; `shell.rs` gains a `tste` arm only. `tste` prints
+  in the console like `ps` (it does NOT take the screen) and is READ-ONLY toward storage. Every line
+  mirrors to serial as `:: TSTE: <name> -> PASS/FAIL/SKIP ::` + a `:: TSTE: N pass M fail K skip
+  (+B boot) ::` summary (the QEMU gate).
+- **[live] registry:** `sched.introspection` (meter counters readable + monotonic, ≥1 CPU);
+  `heap.roundtrip` (alloc/free/realloc round-trip); `video.geometry` (draw_line/fill_triangle
+  verified on an OFFSCREEN GneissPal buffer via the trait-default rasteriser — zero touch to the
+  visible framebuffer); the six sync primitives `sync.{mutex,rwlock,semaphore,channel,condvar,join}`
+  re-verified ON DEMAND with FRESH worker tasks (the coordinator never blocks — on the unscheduled
+  x86 BSP a blocking primitive would panic/bail, so all blocking runs in spawned workers it only
+  polls with a bounded budget; a broken/hung primitive surfaces as FAIL/SKIP, never a shell hang);
+  `storage.{mount,rootwalk,readfile}` (FAT mount, root walk, HELLO.BIN length+content — read-only).
+- **M2b boot-verdict replay:** a fixed 64-entry static ring in `selftest.rs` captures every
+  `-> PASS`/`-> FAIL` fixture line as it is emitted, via ONE additive hook at the serial `_print`
+  seam (both arches) — alloc-free, `try_lock` only, safe from IRQ-masked print contexts, zero change
+  to what is printed. This is what lets `tste` replay the boot-sequenced fixtures it cannot itself
+  re-execute.
+- **SKIP-honesty:** the sync section SKIPs (single core / probe timeout) and the storage section
+  SKIPs (no FAT volume) rather than faking a result. The full CROSS-CORE CAPSTONE stress + the EL0
+  U-arc fixtures stay boot-sequenced; re-running them on demand needs a launcher refactor — the
+  **TSTE-2** horizon, stated in `tste`'s own footer.
+- **Tested — QEMU:** `./arroyo check` (x86 + aarch64) and `UNAOS_TEGRA=1 ./arroyo check` green;
+  `./arroyo test 25` and `./arroyo test-arm 22` both **MISSION SUCCESS** (boot unperturbed — `tste`
+  runs only on command). Live demo via QMP `send-key` to the usb-kbd (`scripts/qmp_type.py`): typing
+  `tste` produced 16 boot-replayed + 9 live PASS (`9 pass 0 fail 0 skip (+16 boot)`); under
+  `UNAOS_FATIMG=sf` the storage checks PASS too (`12 pass 0 fail 0 skip (+19 boot)`), all six sync
+  primitives PASS on real QEMU. Metal/panel verdict rides `./arroyo x86` and the next Orin bench.
+
 ## gfx track — 2026-07-10
 
 ### VUG-1 — the crystal: `vug` becomes the graphics engine's living demo (x86 + aarch64) 🔬 `gfx-vug`
