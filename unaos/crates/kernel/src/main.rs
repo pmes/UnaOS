@@ -1041,11 +1041,6 @@ fn tegra_early_stop(boot_info: &'static mut BootInfo) -> ! {
     // JB1c ungate is an EL3-fatal CBB abort (the JX1 lesson), so the attach runs ONLY on a boot
     // whose ungate proved the block alive.
     let mut xusb_alive = false;
-    // JB4 (attended bench): hoist the proven BPMP channel + the DTB-resolved XUSB ids out of the
-    // JB1c match so the JB4 Falcon-revival levers below (jb4_powergate_cycle / jb4_falcon_revive)
-    // can reuse the exact `chan`/`ids` JB1c already validated — no re-ping, no re-resolve.
-    let mut jb_chan: Option<unaos_kernel::arch::bpmp_tegra::Chan> = None;
-    let mut jb_ids: Option<unaos_kernel::arch::fdt_tegra::XusbIds> = None;
     match unaos_kernel::arch::fdt_tegra::bpmp_geometry(
         boot_info.dtb_addr,
         boot_info.dtb_size,
@@ -1106,62 +1101,20 @@ fn tegra_early_stop(boot_info: &'static mut BootInfo) -> ! {
                 unaos_kernel::arch::bpmp_tegra::jb0_fan_on(&chan);
                 match jb5_ids {
                     Some(ids) => {
-                        if unaos_kernel::arch::xusb_tegra::JB5_RUN_E_REPLAY {
-                            // JB5 run D: the XhciControllerDxe replay. Source-verified
-                            // (edk2-nvidia XhciControllerDxe.c + Private.h, 2026-07-08): UEFI
-                            // revives the Falcon from the SAME power-gated handoff state every
-                            // boot with NOTHING but clocks -> PG Deassert->Assert->Deassert ->
-                            // padctl InitHw -> FPCI CFG_4/CFG_7/AXI_CFG_0<-0x5/CFG_1 -> CNR
-                            // poll — zero firmware writes (UsbFalconLib = accessors only). Runs
-                            // 0-C differed from that recipe in: the double PG cycle, the
-                            // AXI_CFG_0 write, the 9th clock (PLLE), and the SMMU state at the
-                            // fetch edge (pre-armed identity-translate here, re-tightened by
-                            // the normal JB3 chain downstream). Replay it exactly; the real
-                            // pass signal is CPUCTL != 0xffffffff (CNR is a stale latch).
-                            unaos_kernel::arch::bpmp_tegra::jb5_clocks_on(&chan, &ids);
-                            if let Some(io) = unaos_kernel::arch::fdt_tegra::xusb_iommu(
-                                boot_info.dtb_addr,
-                                boot_info.dtb_size,
-                                mmu.ram_gib_mask,
-                            ) {
-                                unaos_kernel::arch::smmu_tegra::jb3_open_stream(
-                                    &io.bases[..io.n_bases],
-                                    io.sid,
-                                );
-                                unaos_kernel::arch::smmu_tegra::jb3_mc_sid_fix(io.sid);
-                            }
-                            unaos_kernel::arch::bpmp_tegra::jb5_uefi_pg_cycle(&chan, &ids);
+                        xusb_alive =
+                            unaos_kernel::arch::bpmp_tegra::jb1c_ungate_xusb(&chan, &ids);
+                        // JB2c: the firmware's ExitBootServices teardown powered the padctl USB2
+                        // pads DOWN (JB2b root cause: ports read PORTSC=0x2a0 CCS=0, electrically
+                        // dead). Re-program the pad power-up sequence HERE — pre-drop at EL2, while
+                        // the BPMP `chan` is in scope for the bias-pad tracking clock — so the pads
+                        // are live BEFORE the JB2b xHCI attach surveys the ports below. Gated on the
+                        // ungate (no point powering pads for a controller that never came alive).
+                        // JB9h: on the inherit boot the JB6 shim never let the pads be torn down, so
+                        // JB9H_SKIP_CHAIN skips this RMW rather than mutate live-pad state the
+                        // inherited FW is using.
+                        if xusb_alive && !unaos_kernel::arch::xusb_tegra::JB9H_SKIP_CHAIN {
                             unaos_kernel::arch::xusb_tegra::jb2c_padctl_powerup(&chan);
-                            // Run E: the InitHw step jb2c never covered — release the SS ELPG
-                            // clamps + VCORE_DOWN that UEFI's DeInitHw asserted at EBS.
-                            unaos_kernel::arch::xusb_tegra::jb5_elpg_release();
-                            xusb_alive =
-                                unaos_kernel::arch::xusb_tegra::jb5_fpci_uefi_and_poll();
-                            unaos_kernel::arch::xusb_tegra::jb5_witness("post-uefi-replay");
-                            unaos_kernel::arch::xusb_tegra::jb5_settle_witness(
-                                "post-uefi-replay-300ms",
-                            );
-                        } else {
-                            xusb_alive =
-                                unaos_kernel::arch::bpmp_tegra::jb1c_ungate_xusb(&chan, &ids);
-                            // JB2c: the firmware's ExitBootServices teardown powered the padctl
-                            // USB2 pads DOWN (JB2b root cause: ports read PORTSC=0x2a0 CCS=0,
-                            // electrically dead). Re-program the pad power-up sequence HERE —
-                            // pre-drop at EL2, while the BPMP `chan` is in scope for the bias-pad
-                            // tracking clock — so the pads are live BEFORE the JB2b xHCI attach
-                            // surveys the ports below. Gated on the ungate: padctl is
-                            // always-powered, but there is no point powering pads for a
-                            // controller that never came alive.
-                            // JB9h: with the JB6 shim the pads were never torn down — the RMW
-                            // re-powerup mutates live-pad state the inherited FW is using.
-                            if xusb_alive && !unaos_kernel::arch::xusb_tegra::JB9H_SKIP_CHAIN {
-                                unaos_kernel::arch::xusb_tegra::jb2c_padctl_powerup(&chan);
-                            }
                         }
-                        // JB4 (attended bench): retain the proven channel + ids for the
-                        // Falcon-revival levers below (moved last — no borrow follows).
-                        jb_ids = Some(ids);
-                        jb_chan = Some(chan);
                     }
                     None => serial_println!(":: tegra: JB1c — no usb@3610000 ids in DTB; SKIP ::"),
                 }
@@ -1259,23 +1212,14 @@ fn tegra_early_stop(boot_info: &'static mut BootInfo) -> ! {
                 ([0x0800_0000u64, 0x0700_0000u64], 2, 0x0e)
             }
         };
-        // JB9h: on the inherit path the ENTIRE fabric chain below is skipped — JB9f proved the
-        // inherited state passes the FW's DMA as-is, and every write here (SMMU re-arm with
-        // USFCFG=1, MC SID rewrite, FPCI full-enable, ARU restore, the locked-CSB restart
-        // attempt) mutates a WORKING configuration built by/for the live firmware.
+        // JB9h / JD3: the JB3 "fabric chain" (SMMU re-arm with USFCFG=1, MC SID rewrite, FPCI
+        // full-enable, ARU restore, the locked-CSB Falcon restart) belonged to the halted-Falcon
+        // revival world — dead on the inherit path (JB9f proved the inherited fabric passes the
+        // FW's DMA as-is) and RETIRED in JD3. `jb9h_skip` now gates only the JB9b SID levers below;
+        // the post-attach fault/MC-error diagnostics and the SMMUv3 census stay (read-only).
         let jb9h_skip = unaos_kernel::arch::xusb_tegra::JB9H_SKIP_CHAIN;
         if jb9h_skip {
-            serial_println!(":: tegra: JB9h — JB3 fabric chain SKIPPED (inherit path, fabric untouched) ::");
-        }
-        if !jb9h_skip {
-        unaos_kernel::arch::smmu_tegra::jb3_probe(&jb3_bases[..jb3_n], jb3_sid);
-        // JB3 fix (boot 2): boot 1 read CLIENTPD=1 + zero SMRs + zero faults on both instances
-        // — the ExitBootServices teardown shut the SMMU client port, and with the fabric's
-        // external-bypass path off (MB2), the controller's DMA has nowhere to go. Open ONLY
-        // the XUSB stream (SMR match -> S2CR bypass) and turn the client port back on with
-        // USFCFG=1 so anything unexpected faults-and-logs instead of dying silently.
-        unaos_kernel::arch::smmu_tegra::jb3_open_stream(&jb3_bases[..jb3_n], jb3_sid);
-        unaos_kernel::arch::xusb_tegra::jb5_witness("post-smmu-open");
+            serial_println!(":: tegra: JB9h — inherit path (JB3 fabric chain retired; fabric untouched) ::");
         }
         // JB3 boot-6 (discrimination): the v2 pair is open + fault-free yet DMA still dies —
         // a second killer sits downstream. Census the DTB's smmu/iommu nodes (find any
@@ -1286,55 +1230,9 @@ fn tegra_early_stop(boot_info: &'static mut BootInfo) -> ! {
             unaos_kernel::arch::smmu_tegra::jb3_v3_dump(v3_base);
         }
         unaos_kernel::arch::smmu_tegra::jb3_mc_errs("pre-attach");
-        if !jb9h_skip {
-        // JB3 boot-9: re-program the MC XUSB SID overrides (HOSTR/HOSTW) like the L4T kernel
-        // does every boot — the UEFI exit teardown cleared them; the SMMU chain is proven
-        // clean and this is the remaining torn-down link that assigns the stream its id.
-        unaos_kernel::arch::smmu_tegra::jb3_mc_sid_fix(jb3_sid);
-        unaos_kernel::arch::xusb_tegra::jb5_witness("post-mc-sid");
-        // JB3 boot-10: the FPCI wrapper's bus-master enable — the last torn-down link
-        // (Linux sets it before its first controller touch; JB2b never did).
-        unaos_kernel::arch::xusb_tegra::jb3_fpci_enable();
-        unaos_kernel::arch::xusb_tegra::jb5_witness("post-fpci-full");
-        // JB3 boot-11: with BAR2 routed, probe/restore the ARU-side DMA config
-        // (IFRDMA/STREAMID_FIELD) and send the firmware the MSG_ENABLED handshake.
-        unaos_kernel::arch::xusb_tegra::jb3_aru_probe(jb3_sid);
-        unaos_kernel::arch::xusb_tegra::jb5_witness("post-aru-mbox");
-        // JB3 boot-12: the Falcon (the xHC command engine) — read CPUCTL/BOOTVEC + the
-        // firmware header; restart the halted CPU the ROM-loader way if needed.
-        unaos_kernel::arch::xusb_tegra::jb3_falcon();
-        unaos_kernel::arch::xusb_tegra::jb5_witness("post-jb3falcon");
-        }
-        // JB4 (attended bench): the XUSB Falcon revival levers. Runs AFTER jb3_falcon (BAR2/FPCI
-        // routed, ARU restored) and reuses the JB1c-proven `chan`/`ids`. Two forks:
-        //   * Boot 2 ONLY (JB4_ALLOW_PG_CYCLE — CALL-SITE-enforced; jb4_powergate_cycle does NOT
-        //     self-check it): MRQ_PG partition OFF->ON re-runs the Falcon self-boot but WIPES the
-        //     partition, so re-run the JB3 fabric chain (padctl + SMMU stream + MC-SID + FPCI +
-        //     ARU, the proven order) before polling. jb3_falcon (the CSB restart) is deliberately
-        //     NOT re-run — the wrong path for t234; jb4_falcon_revive polls USBSTS.CNR instead.
-        //   * Boot 1+2 (JB4_ENABLE, self-checked in jb4_falcon_revive): the non-destructive
-        //     readiness poll — makes NO CSB writes; USBSTS.CNR clearing is the one true signal.
-        // JB10: gated behind !jb9h_skip for symmetry with the JB3 chain above — the JB4 revival
-        // levers belong to the halted-Falcon (chain) world, never the inherit path. On an inherit
-        // boot (jb9h_skip=true) the whole block is skipped; its calls were already inert there
-        // anyway (jb4_falcon_revive self-returns on JB4_ENABLE=false, jb9_fw_alive is JB9_PROBE-
-        // gated). The destructive inner cycle stays double-guarded by JB4_ALLOW_PG_CYCLE + the
-        // compile-time assertion in xusb_tegra.rs.
-        if !jb9h_skip {
-            if let (Some(chan), Some(ids)) = (jb_chan.as_ref(), jb_ids.as_ref()) {
-                if unaos_kernel::arch::xusb_tegra::JB4_ALLOW_PG_CYCLE {
-                    unaos_kernel::arch::bpmp_tegra::jb4_powergate_cycle(chan, ids);
-                    unaos_kernel::arch::xusb_tegra::jb2c_padctl_powerup(chan);
-                    unaos_kernel::arch::smmu_tegra::jb3_open_stream(&jb3_bases[..jb3_n], jb3_sid);
-                    unaos_kernel::arch::smmu_tegra::jb3_mc_sid_fix(jb3_sid);
-                    unaos_kernel::arch::xusb_tegra::jb3_fpci_enable();
-                    unaos_kernel::arch::xusb_tegra::jb3_aru_probe(jb3_sid);
-                }
-                unaos_kernel::arch::xusb_tegra::jb4_falcon_revive(chan, ids);
-                // JB9c: judge the cycle by the CPUCTL/CNR-free witness, not the two proven liars.
-                unaos_kernel::arch::xusb_tegra::jb9_fw_alive("post-pg-cycle");
-            }
-        }
+        // (JD3: the JB3 MC-SID/FPCI/ARU/Falcon re-arm chain and the JB4 Falcon-revival levers —
+        // both dead on the inherit path — were retired here. The two firmware-destroying levers
+        // stay guarded by the compile-time asserts in xusb_tegra.rs.)
         let coherent = unaos_kernel::arch::fdt_tegra::xusb_dma_coherent(
             dtb_addr,
             dtb_size,
@@ -1466,6 +1364,13 @@ fn tegra_early_stop(boot_info: &'static mut BootInfo) -> ! {
     // instead of hanging dark. exceptions::install replaces it two lines below.
     unsafe { unaos_kernel::arch::mmu_tegra::arm_el1_fault_vector() };
     unsafe { unaos_kernel::arch::boot_tegra::drop_to_el1(mmu.ttbr0_el1) };
+    // JD3: the drop just disabled the physical timer (CNTP_CTL=0) and the EL1 core has no interrupt
+    // source, so mark the timer NOT-live — `verify_live` set it true at EL2 and that reading is now
+    // stale. From here `arch::hlt()` busy-spins instead of a wake-less WFI-park, which is what lets
+    // the post-drop panel shell's synchronous USB-MSC reads make progress: `ls`/`cat` ->
+    // `block::read_block` -> the BOT pump, whose `crate::hlt()` yields now spin (bounded by the
+    // pump's free-running-counter wall-clock deadline) rather than parking this timerless core.
+    unaos_kernel::arch::timer::set_not_live();
     // Now at EL1 with the MMU live and DAIF masked. Print the landing proof (CurrentEL + the live
     // SCTLR_EL1) — the first EL1 serial line ever on Orin silicon — then re-seed this core's per-CPU
     // block (now TPIDR_EL1) and install the EL1 exception vectors (VBAR_EL1) — both pick the EL from

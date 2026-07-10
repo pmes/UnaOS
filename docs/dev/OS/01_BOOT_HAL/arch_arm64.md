@@ -1630,6 +1630,94 @@ after it, no panic/wedge (vug-on-tegra behaviour beyond survival not formally as
 The first interactive UnaOS session on the Orin: typed on the inherited keyboard, drawn on the
 inherited scanout, dispatched by the shared shell at EL1.
 
+### JD3 — storage behind the hub: real `ls`/`cat` on the panel shell (🔬 QEMU-green, metal-pending)
+
+JD2 gave the Orin an interactive shell, but its `ls`/`cat` had no disk behind them (`storage_slot`
+stayed 0 — JB10 saw the Alcor reader enumerate behind the hub but never claimed it). JD3 brings the
+mass-storage device up, mounts FAT off it, and routes the panel shell's `ls`/`cat` to real files.
+The shell↔FAT↔block wiring is already architecture-neutral (`shell::dispatch_command` → `fs::fat::mount`
+→ `drivers::block::read_block` → the xHCI BOT pump), so **no per-arch shell code was needed** — the
+work is entirely in *when* and *how* the tegra path drives the block device.
+
+**M1 — MSC bring-up in the pre-drop attach window.** `enumerate_downstream` already detects a
+hubbed Mass-Storage interface (`parse_msc_config`, added with the rMBP hub-downstream fix `3bee9d6`)
+and defers its SCSI bring-up to `service_storage`. JD2's `jb2b_attach` pump ran `service_hubs` /
+`service_enum` but **deliberately not** `service_storage`; JD3 adds it. This must happen **pre-drop,
+at EL2, while the JM4 timer is live** — `service_storage → bring_up_storage` runs the driver's
+heaviest synchronous path (SET_CONFIGURATION, TEST-UNIT-READY, INQUIRY, READ CAPACITY, a sanity
+READ(10)), and every stage's BOT/control pump rides `crate::hlt()`, which the *post*-drop timerless
+core cannot wake (the JD2/JB2b rule). Once the disk is up it publishes `drivers::block::BLOCK_DEVICE`
+and the pump returns. Because a hubbed device enumerates *after* the root ports, the pump now keeps
+running for a bounded **storage-settle window** (8 s) once the keyboard is armed — returning the
+instant the disk reports ready, or when the window closes (a keyboard-only boot pays the wait once;
+`service_storage` is a no-op with nothing pending, so JD2 keyboard-only boots are otherwise
+unchanged). Serial evidence: `>>> HUB DOWNSTREAM MASS STORAGE (slot N …) <<<` → `Endpoints Configured
+(Slot N). Storage ready.` → `Disk '…' block_size=512 …` → `JD3 — mass storage ready (slot N); panel
+shell ls/cat live`.
+
+**M2 — post-drop reads on a timerless core (the crux).** The shell runs at EL1 *after* the JM6
+EL2→EL1 drop, and the drop disables the physical timer (`CNTP_CTL=0`) so CAPSTONE can run
+cooperatively. But `boot_tegra::drop_to_el1` left `timer::LIVE` reading **stale-true** (`verify_live`
+set it at EL2), so `arch::hlt()` — which does `if is_live() { wfi } else { spin_loop() }` — would
+**WFI-park the core forever** the first time `ls`/`cat` → `block::read_block` → the BOT pump yielded.
+Two changes fix this:
+
+- **`timer::set_not_live()` after the drop** (`main.rs::tegra_early_stop`, tegra-lane): the timer is
+  genuinely off, so `hlt()` correctly falls back to a busy spin instead of a wake-less park. Verified
+  safe — nothing on the post-drop tegra path relies on `hlt()==WFI` or `is_live()==true` (the boot
+  core's drive loop `spin_loop()`s directly; `yield_now` never `hlt()`s; every other `is_live()`
+  reader is `baremetal`-gated and not compiled for tegra).
+- **`pump_until_bot_done` → wall-clock budget** (shared `drivers/xhci/mod.rs`): a busy-spinning
+  `hlt()` makes the old 2000-**iteration** budget expire in microseconds — before a real DMA
+  completion. The pump now bounds itself with a `now_cycles`/`hw_wait_budget` deadline (the idiom the
+  enumeration FSM already uses), so it is correct whether each `hlt()` waits a tick (x86/Pi/virt,
+  pre-drop tegra) or busy-spins (post-drop tegra). This is the exact pattern the Pi's polled EMMC2
+  driver already relies on — a free-running counter (`CNTVCT`/`CNTPCT`) keeps advancing with the
+  timer *interrupt* off. The change is **arch-neutral** (both primitives are monotonic and
+  IRQ-independent on x86 and aarch64) and strictly more robust for every target; it is guarded by the
+  x86 `UNAOS_HUBSTORAGE=1 test` and aarch64 `test-arm 22` MISSION regressions (both exercise the BOT
+  pump). *This edits the shared xHCI driver — the "xHCI seam" the JD3 brief pre-authorised the jetson
+  track to request from the integrator; it is `cfg`-neutral and benefits all arches.*
+
+**M3 — retire the dead JB3/JB4/JB5 revival machinery.** With storage working through the inherit
+path, the "revive the halted Falcon" code (JB3 fabric chain, JB4 partition-cycle levers, JB5
+UEFI-replay) — dead since the JB9 inherit pivot, gated off by `JB9H_SKIP_CHAIN`/`JB4_ENABLE`/
+`JB5_RUN_E_REPLAY`/`JB4_ALLOW_PG_CYCLE` (all const-false on the working boot, so already
+optimizer-pruned from the binary) — was removed from source: the `!jb9h_skip` / `JB5_RUN_E_REPLAY`
+call blocks in `main.rs` (the live JB1c ungate + JB2c pad power-up kept), and the now-orphaned
+functions in `bpmp_tegra.rs` (`jb5_linux_order_ungate`, `jb5_clocks_on`, `jb5_uefi_pg_cycle`,
+`jb4_reassert_falcon`, `jb4_powergate_cycle`), `xusb_tegra.rs` (`jb3_fpci_enable`, `jb3_aru_probe`,
+`jb3_falcon`, `jb4_falcon_revive`, `xusb_cnr_set`, `jb5_elpg_release`, `jb5_fpci_uefi_and_poll`,
+`jb5_settle_witness`, `JB4_ENABLE`, `FALC_CPUCTL`), and `smmu_tegra.rs` (`jb3_probe`,
+`jb3_open_stream`, `jb3_install_identity_cb0`, `jb3_mc_sid_fix`, `MC_SID_XUSB_HOSTR`). **Explicitly
+KEPT** (still load-bearing on the inherit path): the ⭐ JB9 recipe (`JB9G_NO_HCRST`,
+`JB9H_SKIP_CHAIN`, `context::CTX_WORDS`, `JB5_PROBE` + `jb5_bar2_route`); **both** compile-asserts
+that make the firmware-destroying levers un-co-enable-able (`JB4_ALLOW_PG_CYCLE`/`JB5_RUN_E_REPLAY`
+consts survive to feed them); the shared XUSB register consts (`XUSB_FPCI`, `XUSB_BAR2`, MMU-500
+`GR1_OFF`/`CB0_OFF`/`MC_SID_BASE`, `JB3_IDMAP`); the read-only post-attach diagnostics
+(`jb3_faults`, `jb3_mc_errs`, `jb3_v3_dump`); the JB5/JB6/JB7 witnesses; and the JB9 forensic kit.
+Nothing touching CPUCTL/BOOTVEC or MRQ_PG can be re-enabled without failing the build. (The now-dead
+JB2c re-power-up and the JB9b SID levers are out of the JB3/JB4/JB5 remit and left for the seat.)
+Net: `bpmp_tegra.rs` −217, `xusb_tegra.rs` −405, `smmu_tegra.rs` −220 lines; behaviour-neutral (the
+deleted code was already gated off, and the `tegra:`-string count is unchanged at 107).
+
+**Gate (QEMU):** `./arroyo check` + `UNAOS_TEGRA=1 ./arroyo check` green both arches;
+`UNAOS_HUBSTORAGE=1 ./arroyo test 25` → `MISSION SUCCESS` (`storage_slot=2 note='ready'`, no BOT
+timeout); `./arroyo test-arm 22` → `MISSION SUCCESS`; `UNAOS_GICV3=1 ./arroyo test-arm 40` →
+`CAPSTONE COMPLETE` 6/6; `esp-jetson kernel.elf` links, **107 `tegra:` strings** (JD2 was 105;
+validate tegra media by `tegra:`-string count, not size — the JD2 rule; the elf is ~388 KB, the
+handful of extra KB vs M1+M2 is optimizer inlining re-balancing after the dead code left, not bloat).
+
+**⚠ Metal is the real verdict — QEMU has no Alcor.** The tegra path never compiles under any QEMU
+gate, so the post-drop timerless BOT busy-poll is **metal-unexercised**; QEMU proves only the
+arch-neutral BOT-pump change (on x86/virt, where `hlt()` still waits on an interrupt) and that the
+tegra image links. The attended-bench risks to watch: (a) hub-MSC **power/timing** on the real Alcor
+reader (does its SCSI bring-up complete inside the 8 s settle window?); (b) the wall-clock budget
+sizing for a real USB-MSC read latency (bump `hw_wait_budget()`'s BOT multiple if a real read
+marginally times out); (c) `set_not_live()` + the busy-poll pump actually completing a read on the
+timerless EL1 core. Bench proof = flash, then on the panel shell: `diskinfo` (geometry), `ls` (the
+card's root), `cat <known file>` (its bytes).
+
 ## 4. Jetson Orin Nano headless bring-up (Arc JM2)
 
 The Orin is brought up **headless over serial**. The only console that has ever

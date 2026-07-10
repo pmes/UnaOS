@@ -3216,18 +3216,32 @@ impl XhciController {
             slot_id, in_dci, out_dci, wait_trb_phys,
             done: false, completion_code: 0,
         });
-        let pump = self.pump_until_bot_done(2000);
+        let pump = self.pump_until_bot_done();
         let pending = self.bot_pending.take();
         pump?;
         let p = pending.ok_or(BotError::Timeout)?;
         Ok(p.completion_code)
     }
 
-    /// Pump the event ring until the in-flight BOT transaction reports done, or the
-    /// iteration budget is exhausted. Unrelated events (HID input, command completions)
-    /// are dispatched normally during the wait.
-    fn pump_until_bot_done(&mut self, max_iters: u64) -> Result<(), BotError> {
-        let mut iters: u64 = 0;
+    /// Pump the event ring until the in-flight BOT transaction reports done, or a WALL-CLOCK
+    /// budget is exhausted. Unrelated events (HID input, command completions) are dispatched
+    /// normally during the wait.
+    ///
+    /// The budget is a `now_cycles`/`hw_wait_budget` deadline (the idiom the enumeration FSM
+    /// already uses), NOT a raw iteration count — so the pump is correct regardless of how long
+    /// each `crate::hlt()` yields. On x86 / Pi / aarch64-virt, and on the pre-drop tegra core,
+    /// `hlt()` waits for an interrupt (HLT / WFI with a live timer), so each empty pass costs a
+    /// tick; but on the tegra post-drop core the timer is disabled (JD2/JD3), `hlt()` busy-spins,
+    /// and a fixed iteration budget would then expire in microseconds — long before a real DMA
+    /// completion lands. A wall-clock deadline gives the transfer real time to complete in both
+    /// regimes. (`now_cycles` reads a free-running counter — rdtsc / CNTVCT — that keeps advancing
+    /// even with the timer interrupt off, exactly as the Pi's polled EMMC2 driver relies on.)
+    fn pump_until_bot_done(&mut self) -> Result<(), BotError> {
+        let start = crate::arch::now_cycles();
+        // A BOT data stage can outlast a bare register handshake, so allow a generous multiple of
+        // the base handshake budget; only a FAILING transfer (dead DMA / wedged endpoint) ever pays
+        // the full wait — the happy path returns the instant the completion event drains.
+        let budget = crate::arch::hw_wait_budget().saturating_mul(3);
         loop {
             match &self.bot_pending {
                 Some(p) if p.done => return Ok(()),
@@ -3238,18 +3252,20 @@ impl XhciController {
                 continue; // processed an event; drain any more immediately
             }
             // Yield to QEMU's main loop so it can run the xHC bottom-half / async block-I/O
-            // completion and DMA the event into the ring; a pure spin never exits TCG.
+            // completion and DMA the event into the ring; a pure spin never exits TCG. On the
+            // timerless tegra post-drop core this falls back to a busy spin (arch::hlt), which the
+            // wall-clock deadline below still bounds.
             crate::hlt();
-            iters += 1;
-            if iters >= max_iters {
+            let elapsed = crate::arch::now_cycles().wrapping_sub(start);
+            if elapsed >= budget {
                 unsafe {
                     let ir0 = XHCI_IR0_BASE.load(Ordering::Acquire);
                     let op = XHCI_OP_BASE.load(Ordering::Acquire);
                     let iman = if ir0 != 0 { core::ptr::read_volatile(ir0 as *const u32) } else { 0 };
                     let usbsts = if op != 0 { core::ptr::read_volatile((op + 0x04) as *const u32) } else { 0 };
                     serial_println!(
-                        "xHCI: BOT pump TIMEOUT after {} yields (IRQ_COUNT={} IMAN={:#x} USBSTS={:#x})",
-                        iters, XHCI_IRQ_COUNT.load(Ordering::Relaxed), iman, usbsts);
+                        "xHCI: BOT pump TIMEOUT after {} cycles (IRQ_COUNT={} IMAN={:#x} USBSTS={:#x})",
+                        elapsed, XHCI_IRQ_COUNT.load(Ordering::Relaxed), iman, usbsts);
                 }
                 return Err(BotError::Timeout);
             }
