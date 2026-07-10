@@ -10,6 +10,34 @@ Legend: **✅ metal-confirmed** · **🔬 QEMU-green, metal pending** · dates I
 
 ---
 
+## hw-jetson track — 2026-07-10 (JD4 — read-side navigation + last dead levers + screen-on-boot)
+
+### JD4 — `ls <dir>` / `cd` / `pwd` / `cat <path>` on the panel shell + JB2c/JB9b lever retirement + screen-on-boot 🔬 `hw-jetson`
+- **What (M1, arch-neutral, `5ca6e28`):** the shell grows a working directory and path-aware file
+  commands on the read-only FAT walkers. One seat-granted additive `fat.rs` helper —
+  `pub read_dir(first_cluster)` (0 = root, the `..`-to-root convention; read-only, NO lock; F3 may
+  revisit read-side locking) — everything else in `shell.rs`: cwd as a normalized CANONICAL absolute
+  path string, re-resolved from the root each command (a swapped card can never leave a stale chain
+  head), lexical `.`/`..` normalization, case-insensitive 8.3 component walk, errno-tagged honest
+  errors (`-ENOENT`/`-ENOTDIR`/`-EISDIR`/`-EIO` printed, never swallowed). WRITE path deliberately
+  deferred to JD5 (pi4 F3 is about to churn `fat.rs` and a write path wants F3's locks anyway).
+- **What (M2, behaviour-neutral, `436d7ef`):** retire the four dead levers JD3 left —
+  `jb2c_padctl_powerup`/`jb2c_usb2_trk_clk` + `jb9b_ao_sid_fix`/`jb9b_accept_bypass_sid` (all dead
+  behind the inherit gates `JB9H_SKIP_CHAIN`/`JB9_PROBE`) + their orphaned private helpers, −313
+  lines. The ⭐ JB9 recipe and BOTH firmware-destroying-lever compile-asserts stay untouched.
+- **What (M3, tegra-only, `195ab88`):** screen-on-boot — the panel console appears at the first
+  keystroke OR a ~8 s CNTPCT wall-clock deadline (the JD3 timerless idiom), so a panel boot ends at
+  a visible prompt instead of waiting for a blind keystroke. Headless boots unchanged (JB2b serial
+  evidence contract holds).
+- **Tested (QEMU):** `check` + `UNAOS_TEGRA=1 check` green both arches; `UNAOS_HUBSTORAGE=1 test 25`
+  MISSION (shared shell/fat guard); `test-arm 22` MISSION; `UNAOS_GICV3=1 test-arm 40` CAPSTONE 6/6;
+  `esp-jetson` links, **108 `tegra:` strings** (validate media by count, not size). **Metal
+  pending:** attended bench = watch the shell appear on its own (~8 s), then
+  `diskinfo`/`ls`/`cd <dir>`/`pwd`/`cat <dir>/<file>`/`cd ..` + a `-ENOENT` probe — needs a card
+  with a subdirectory + a file in it (the pristine JD3 card is root-only).
+- **Detail:** [`arch_arm64.md` §JD4](dev/OS/01_BOOT_HAL/arch_arm64.md). **Commits:** `436d7ef` M2 ·
+  `5ca6e28` M1 · `195ab88` M3 (`hw-jetson`).
+
 ## ux track — 2026-07-10
 
 ### TSTE-1 — `tste`: the in-OS self-test suite (x86 + aarch64) 🔬 `ux-tste`
