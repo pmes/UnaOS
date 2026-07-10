@@ -53,6 +53,10 @@ pub fn _print(args: ::core::fmt::Arguments) {
     // ring self-guards (try_lock only, never blocks, drop-oldest on overflow); it never takes the
     // XHCI_CONTROLLER lock or allocates, so this is safe from any print context.
     crate::drivers::xhci::ftdi::mirror(args);
+    // TSTE-1 M2b: capture boot-fixture verdict lines (`-> PASS`/`-> FAIL`) into the selftest ring so
+    // `tste` can replay them. Additive, alloc-free, `try_lock` only; safe from this IRQ-masked
+    // context; zero change to what is printed above.
+    crate::selftest::capture(args);
 }
 
 #[macro_export]

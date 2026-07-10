@@ -31,6 +31,7 @@ pub mod fs;
 
 pub mod allocator;
 pub mod shell;
+pub mod selftest;
 
 pub mod pal;
 pub mod video;
