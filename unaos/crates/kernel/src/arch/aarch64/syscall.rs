@@ -8033,8 +8033,11 @@ fn f2_witness_launcher(demo_cpu: usize) {
 // F3-M4 witness: the NAMESPACE-lock twin of the F2 witness — an in-RAM cross-core stress of the EXACT lock
 // (`ns_lock`) that serializes sys_open/sys_unlink's name sequences, with zero volume risk. Two cores drive a
 // deliberately NON-ATOMIC counter RMW; the LOCKED pass routes every step through `ns_lock()` and must lose
-// nothing, the UNLOCKED control shows what the environment raced away. HONEST SCOPE: this witnesses that the
-// namespace lock serializes cross-core (engaged, correct, no deadlock with the inner locks it nests); the full
+// nothing, the UNLOCKED control shows what the environment raced away. HONEST SCOPE: this witnesses ONLY that
+// the namespace lock is engaged and serializes cross-core — the stress holds ns around a bare counter with NO
+// inner lock taken, so nesting safety against {FAT_MUTATION, DIR_MUTATION, OPEN_FILES, OWNED_FILES,
+// DEFERRED_FREE} rests on the reviewed lock-order discipline (NAMESPACE outermost, never acquired while an
+// inner is held), not on this witness. Likewise the full
 // open-vs-unlink DISK-sequence interleave (two cores mid-syscall in find_located/mark_dir_deleted) is not
 // provokable from the single-EL0-core QEMU battery — that leg is metal-latent and rides the attended bench,
 // exactly the F2/R1 honest-scope pattern.

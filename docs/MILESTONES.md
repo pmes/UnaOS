@@ -208,7 +208,9 @@ Legend: **✅ metal-confirmed** · **🔬 QEMU-green, metal pending** · dates I
 ### F3 — the UnaFS namespace / FS-metadata lock (aarch64) — every F2-ledgered race CLOSED (2026-07-10) `hw-pi4`
 - **What:** F2 serialized the single FAT-sector RMW and ledgered six residual concurrent-FS-mutation
   races (all excluded-by-sequencing today). F3 closes all six, same discipline: behaviorally-transparent
-  single-core (23-PASS battery byte-equivalent), cfg-gated aarch64, zero x86 behavioural change.
+  single-core (23-PASS battery byte-equivalent), cfg-gated aarch64 locks, zero x86 OBSERVABLE-behaviour
+  change (the shared `alloc_cluster` body's on-disk write ORDERING changed on x86 too — claim before
+  zero-fill; end-state identical, crash-window ordering noted in SECURITY.md).
   - **M1 — `alloc_cluster` compare-and-claim** (the F2 flag's last leg, cluster-aliasing CLOSED). The
     free search stays unlocked; the CLAIM re-reads the candidate entry under `FAT_MUTATION` and sets EOC
     only if still free (loser rescans — bounded retry via the new lock-free `set_fat_entry_inner`).
@@ -221,7 +223,8 @@ Legend: **✅ metal-confirmed** · **🔬 QEMU-green, metal pending** · dates I
     sectors and never nest.
   - **M3 — the NAMESPACE lock** (the four sequence races CLOSED: open-races-unlink stale-chain UAF,
     `owned_clear`-vs-`owned_set_owner` recycled-slot ownership theft, create slot-claim/duplicate-name,
-    the `0xE5`-before-mark-pending window). One per-mount IRQ-masked SpinMutex (`NsGuard`, in
+    the `0xE5`-before-mark-pending window's open-vs-unlink half — its last-close half was already U11's
+    mark-pending-before-drop under `OPEN_FILES`; `sys_close` takes no ns). One per-mount IRQ-masked SpinMutex (`NsGuard`, in
     `arch/aarch64/syscall.rs`) spans `sys_open`'s `find_located → ACL → incref/files_alloc` (incl. the
     create path) and `sys_unlink`'s `0xE5 → owned_clear → mark-pending → descriptor-drop`. Held across
     the bounded polled directory I/O BY DESIGN, but never across `mount()`/chain frees —
