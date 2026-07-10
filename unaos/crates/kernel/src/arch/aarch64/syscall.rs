@@ -6333,6 +6333,23 @@ fn sys_fgrant(file_handle: u64, child_handle: u64, rights: u64) -> i64 {
         return EINVAL;
     }
     let rights = req & (CAP_READ | CAP_WRITE);
+    // F2 (SMP-hardening): `grantee_asid` (from `PROCS[pi].asid`) and `grantee_gen` (from `ASID_GEN[grantee_asid]`)
+    // were captured as TWO separate atomic loads. On a multi-core boot the named child could EXIT between them and
+    // its ASID slot be recycled to a DIFFERENT process (a bumped `ASID_GEN`), so the grant would bind the stale
+    // `grantee_asid` to the RECYCLED incarnation's `grantee_gen` — a misdelegation of the owner's file to whatever
+    // process now holds that ASID (privilege escalation / disclosure). Re-validate that `pi` is STILL the same
+    // running incarnation AFTER reading its gen: an ASID's gen bumps only at teardown, which drives `state` off
+    // `PRUNNING` and clears `pid`/`asid` (`proc_free`), so a matching `state`/`pid`/`asid` proves the `(asid, gen)`
+    // pair is a consistent snapshot of ONE incarnation. Any mismatch means the child recycled mid-resolution —
+    // refuse (`-ECHILD`) rather than grant to the wrong principal. (Narrow, metal-only window — QEMU has no
+    // cross-core preemption; behaviourally transparent on the single-core path, where nothing recycles.)
+    if PROCS[pi].state.load(Ordering::Acquire) != PRUNNING
+        || PROCS[pi].pid.load(Ordering::Acquire) != pid
+        || PROCS[pi].asid.load(Ordering::Acquire) != grantee_asid
+        || ASID_GEN[grantee_asid as usize].load(Ordering::Acquire) != grantee_gen
+    {
+        return ECHILD;
+    }
     owned_grant(dir_lba, dir_off, asid, asid_gen, grantee_asid, grantee_gen, rights)
 }
 
