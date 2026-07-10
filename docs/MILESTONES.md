@@ -10,9 +10,9 @@ Legend: **✅ metal-confirmed** · **🔬 QEMU-green, metal pending** · dates I
 
 ---
 
-## hw-jetson track — 2026-07-10 (JD4 — read-side navigation + last dead levers + screen-on-boot)
+## hw-jetson track — 2026-07-10 (JD4 — read-side navigation + last dead levers + screen-on-boot; same-day attended bench)
 
-### JD4 — `ls <dir>` / `cd` / `pwd` / `cat <path>` on the panel shell + JB2c/JB9b lever retirement + screen-on-boot 🔬 `hw-jetson`
+### JD4 — `ls <dir>` / `cd` / `pwd` / `cat <path>` on the panel shell + JB2c/JB9b lever retirement + screen-on-boot ✅ METAL-CONFIRMED (2026-07-10) `hw-jetson`
 - **What (M1, arch-neutral, `5ca6e28`):** the shell grows a working directory and path-aware file
   commands on the read-only FAT walkers. One seat-granted additive `fat.rs` helper —
   `pub read_dir(first_cluster)` (0 = root, the `..`-to-root convention; read-only, NO lock; F3 may
@@ -31,10 +31,14 @@ Legend: **✅ metal-confirmed** · **🔬 QEMU-green, metal pending** · dates I
   evidence contract holds).
 - **Tested (QEMU):** `check` + `UNAOS_TEGRA=1 check` green both arches; `UNAOS_HUBSTORAGE=1 test 25`
   MISSION (shared shell/fat guard); `test-arm 22` MISSION; `UNAOS_GICV3=1 test-arm 40` CAPSTONE 6/6;
-  `esp-jetson` links, **108 `tegra:` strings** (validate media by count, not size). **Metal
-  pending:** attended bench = watch the shell appear on its own (~8 s), then
-  `diskinfo`/`ls`/`cd <dir>`/`pwd`/`cat <dir>/<file>`/`cd ..` + a `-ENOENT` probe — needs a card
-  with a subdirectory + a file in it (the pristine JD3 card is root-only).
+  `esp-jetson` links, **108 `tegra:` strings** (validate media by count, not size).
+- **Metal — ✅ PASS (2026-07-10 attended bench, serial `jetson-serial-2026-07-10-135751.log`):**
+  screen-on-boot fired 3/3 boots (no key, ~8 s, post-CAPSTONE); zero `JB2c`/`JB9b` lines any boot;
+  full navigation sequence on a **FAT16** card (`UNAOSRW` + fresh `DOCS/README.TXT`, Alcor reader
+  slot 5) — `diskinfo`/`ls`/`cd docs`/`ls`/`cat readme.txt`/`pwd`/`cd ..`/`cat /docs/readme.txt` +
+  `-ENOENT`/`-EISDIR` probes, all typed lowercase (case-insensitive 8.3 proven). Boots 1–2
+  reconfirmed the JD3 hub-MSC intermittency (`vid=0000` on route 0x4) with a GRACEFUL settle-window
+  fallthrough each time; the tegra bench pattern is a separate data card, not the boot stick.
 - **Detail:** [`arch_arm64.md` §JD4](dev/OS/01_BOOT_HAL/arch_arm64.md). **Commits:** `436d7ef` M2 ·
   `5ca6e28` M1 · `195ab88` M3 (`hw-jetson`).
 
