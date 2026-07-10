@@ -43,7 +43,10 @@ impl Console {
 
     pub fn println(&mut self, text: &str) {
         self.history.push(String::from(text));
-        if self.history.len() > 25 {
+        // Retain enough scrollback to fill the tallest panels we run on (native 4K ~= 100+ rows at
+        // LINE_H). Bounded so the buffer can't grow without limit; large enough that a full screen
+        // is always drawable (the old 25-line cap starved the bottom third at native resolution).
+        if self.history.len() > Self::HISTORY_MAX {
             self.history.remove(0);
         }
     }
@@ -53,12 +56,23 @@ impl Console {
     // pushes the prompt DOWN; once the screen is full the oldest lines scroll off the top.
     const TOP: usize = 20;
     const LINE_H: usize = 20;
+    /// Retained scrollback cap — generous enough that even a 4K panel's worth of rows is drawable.
+    const HISTORY_MAX: usize = 256;
+
+    /// The single source of truth for page height: rows of history that fit on one screen above the
+    /// prompt line, derived from the panel's real usable height. Reserves the last row for the
+    /// prompt/input line; a sane floor (6) keeps tiny/headless surfaces usable, and there is NO
+    /// small ceiling — a page is exactly one screenful minus the prompt. `selftest::Pager` shares
+    /// this so a pager page and a console screenful are always the same size.
+    pub fn page_rows(pal: &TargetPal) -> usize {
+        let usable = (pal.height() as usize).saturating_sub(Self::TOP) / Self::LINE_H;
+        usable.saturating_sub(1).max(6)
+    }
 
     /// Rows of history shown above the prompt: everything that fits from `TOP` down, reserving the
     /// last row for the prompt/input line itself.
     fn history_rows(&self, pal: &TargetPal) -> usize {
-        let usable = (pal.height() as usize).saturating_sub(Self::TOP) / Self::LINE_H;
-        usable.saturating_sub(1)
+        Self::page_rows(pal)
     }
 
     /// The y of the prompt/input line: directly below the last shown history line (so on a fresh

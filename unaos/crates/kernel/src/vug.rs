@@ -268,6 +268,7 @@ pub fn run_crystal(pal: &mut TargetPal, mode: Mode) {
     for c in 0..ncpu {
         cpu_prev[c] = crate::arch::sched::meter_cpu_ticks(c);
     }
+    let mut demo_core_logged = false;
     let mut prev_top = crate::arch::now_cycles();
     let mut work_acc: u64 = 0;
     let mut total_acc: u64 = 0;
@@ -398,11 +399,32 @@ pub fn run_crystal(pal: &mut TargetPal, mode: Mode) {
             } else {
                 0
             };
+            // Per-core CPU-pulse load. Two honest sources, picked per core by whether the scheduler
+            // is accounting that core this window:
+            //   * db+di > 0  → the core is inside `sched::run()` (dispatching tasks or spinning idle,
+            //     both of which bump the counters). Use the scheduler's busy fraction — this is the
+            //     Orin scheduled-pump path, and per-core APs on x86; do NOT regress it.
+            //   * db+di == 0 → the core is executing OUTSIDE `sched::run()` and the scheduler never
+            //     sees it (the x86 GUI runs this crystal demo in the inline BSP loop). Its counters
+            //     are frozen, so the sched fraction would read a false ~0 even though the core is
+            //     pegged rendering. Credit it instead from the render loop's OWN measured busy-vs-
+            //     yield fraction (`m.load`, work cycles / whole-frame cycles) — the same honest
+            //     number the RENDER meter shows for the core actually doing the work. That core IS
+            //     the demo core (the current CPU); log it once so the label is truthful.
             for c in 0..ncpu {
                 let (b, i) = crate::arch::sched::meter_cpu_ticks(c);
                 let db = b.wrapping_sub(cpu_prev[c].0);
                 let di = i.wrapping_sub(cpu_prev[c].1);
-                cpu_load[c] = if db + di > 0 { ((db * 100) / (db + di)) as u32 } else { 0 };
+                if db + di > 0 {
+                    cpu_load[c] = ((db * 100) / (db + di)) as u32;
+                } else {
+                    // Unscheduled executing core → this is the demo core; show its real render load.
+                    cpu_load[c] = m.load;
+                    if !demo_core_logged {
+                        serial_println!(":: VUG: CPU meter — core {} is the demo core (unscheduled render loop, load from render busy%) ::", c);
+                        demo_core_logged = true;
+                    }
+                }
                 cpu_prev[c] = (b, i);
             }
             win_ms = now_ms;
@@ -420,18 +442,14 @@ pub fn run_crystal(pal: &mut TargetPal, mode: Mode) {
     serial_println!(":: VUG: crystal exit clean — {} frames ::", frame);
 }
 
-/// The heartbeat + title HUD (the existing Vug aesthetic), plus a live frame counter.
+/// The title HUD (the existing Vug aesthetic), plus a live frame counter.
 ///
 /// POLISH-1: the legacy right-edge VU-meter segment stack was removed. It predated the M3b corner
 /// meters and, sitting at the right edge in purple/grey, read as the CPU pulse meter's per-core bars
-/// gone astray (the CPU meter actually lives bottom-left under RENDER, drawn by `draw_meters`). The
-/// red blinking heartbeat, the title, and the live stat line stay.
-fn draw_stats(pal: &mut TargetPal, frame: u64, faces: u32, solid: bool, w: i32, _h: i32) {
-    // The little red heartbeat (intentional — the demo's pulse).
-    if (frame / 15) % 2 == 0 {
-        pal.draw_rect((w as usize) / 2 - 10, 20, 20, 20, 0x00FF0000);
-    }
-
+/// gone astray (the CPU meter actually lives bottom-left under RENDER, drawn by `draw_meters`).
+/// POLISH-2: the blinking red heartbeat square was removed too (Peter's call — not needed; any real
+/// problem will be obvious from the frozen crystal or a dead frame counter). Title + stat line stay.
+fn draw_stats(pal: &mut TargetPal, frame: u64, faces: u32, solid: bool, _w: i32, _h: i32) {
     // Title + live stat line.
     pal.draw_text(20, 20, "VUG // quartz", 0x00FFFFFF);
     let mode = if solid { "solid" } else { "wire " };
