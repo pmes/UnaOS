@@ -150,15 +150,13 @@ pub fn capture(args: fmt::Arguments) {
     }
     let label = label.trim();
 
-    // Copy up to NAME_MAX bytes, stopping on a char boundary so a multibyte char (e.g. an em-dash)
-    // is never split.
-    let n = label
-        .char_indices()
-        .map(|(bi, c)| bi + c.len_utf8())
-        .take_while(|&e| e <= NAME_MAX)
-        .last()
-        .unwrap_or(0);
-    let bytes = &label.as_bytes()[..n];
+    // Fit the label into NAME_MAX. If the whole label fits, store it verbatim. Otherwise truncate
+    // at the last WORD boundary that leaves room for a trailing ellipsis marker, so a clipped
+    // verdict reads as "open+read …" rather than an accidental mid-word chop ("open+read/"). Char-
+    // boundary aware (never splits a multibyte char) and alloc-free (a fixed stack buffer). Fill the
+    // ring slot directly from that buffer.
+    let mut name = [0u8; NAME_MAX];
+    let nlen = fit_label(label, &mut name);
 
     if let Some(mut ring) = BOOT_RING.try_lock() {
         if ring.count >= RING_CAP {
@@ -166,13 +164,44 @@ pub fn capture(args: fmt::Arguments) {
             return;
         }
         let slot = ring.count;
-        ring.entries[slot].name[..bytes.len()].copy_from_slice(bytes);
-        ring.entries[slot].len = bytes.len() as u8;
+        ring.entries[slot].name[..nlen].copy_from_slice(&name[..nlen]);
+        ring.entries[slot].len = nlen as u8;
         ring.entries[slot].pass = pass;
         ring.count += 1;
     }
     // Lock contended -> drop the record silently (a diagnostic ring, not a ledger). Rare: prints are
     // serialised by the serial lock the caller already holds.
+}
+
+/// Fit `label` into `out` (capacity `NAME_MAX`), returning the byte length written. Whole label if it
+/// fits; otherwise truncate at the last word boundary (space) that still leaves room for a trailing
+/// " …" marker when one exists — else a hard char-boundary cut — and append the marker so a clipped
+/// verdict reads as "open+read …" rather than an accidental mid-word chop. Char-boundary aware
+/// (never splits a multibyte char) and alloc-free.
+fn fit_label(label: &str, out: &mut [u8; NAME_MAX]) -> usize {
+    let full = label.as_bytes();
+    if full.len() <= NAME_MAX {
+        out[..full.len()].copy_from_slice(full);
+        return full.len();
+    }
+    const MARK: &str = " \u{2026}"; // " …" — 4 bytes
+    let budget = NAME_MAX - MARK.len();
+    // Largest char-boundary cut that fits the budget.
+    let mut cut = label
+        .char_indices()
+        .map(|(bi, c)| bi + c.len_utf8())
+        .take_while(|&e| e <= budget)
+        .last()
+        .unwrap_or(0);
+    // Prefer the last word boundary (space) within the cut, dropping the trailing space.
+    if let Some(sp) = label[..cut].rfind(' ') {
+        if sp > 0 {
+            cut = sp;
+        }
+    }
+    out[..cut].copy_from_slice(&label.as_bytes()[..cut]);
+    out[cut..cut + MARK.len()].copy_from_slice(MARK.as_bytes());
+    cut + MARK.len()
 }
 
 // =================================================================================================
@@ -199,9 +228,64 @@ impl Tally {
     }
 }
 
+/// Page-at-a-time console output (POLISH-1). `tste`'s table can run well past a screenful; without
+/// paging the older lines scroll off before they can be read. The pager counts console lines and,
+/// after a screen's worth, prints a `-- more (any key) --` line and waits for a keypress — the demo's
+/// `pal::pump_and_poll` idiom (busy-poll + `yield_now`, never WFI/`sleep_ticks`, so it is safe in the
+/// unscheduled x86 GUI loop, the Orin scheduled pump, and the serial console alike) — then continues.
+/// The serial mirror is NOT paginated: `report`'s `serial_println!` lines are emitted independently,
+/// so the serial log (the QEMU gate evidence) still streams in full and never waits on a key.
+struct Pager {
+    rows: usize,
+    on_page: usize,
+}
+
+impl Pager {
+    fn new(pal: &TargetPal) -> Self {
+        // Lines that fit above the prompt (console starts at y=20, 20px/line, ~40px prompt reserve),
+        // bounded to the console's retained-history window (leave a line for the more-prompt).
+        let fit = (pal.height() as usize).saturating_sub(60) / 20;
+        Pager { rows: fit.clamp(6, 24), on_page: 0 }
+    }
+
+    /// Push one line to the console, repaint progressively, and pause at page boundaries. Emitting the
+    /// serial mirror stays the caller's job (serial is a log, not a screen — never paginated).
+    fn line(&mut self, console: &mut Console, pal: &mut TargetPal, text: &str) {
+        console.println(text);
+        console.draw(pal);
+        pal.render();
+        self.on_page += 1;
+        if self.on_page >= self.rows {
+            self.pause(console, pal);
+        }
+    }
+
+    fn pause(&mut self, console: &mut Console, pal: &mut TargetPal) {
+        console.println("-- more (any key) --");
+        console.draw(pal);
+        pal.render();
+        // Wait for a keypress via the demo's pump idiom: busy-poll the input sources + cooperative
+        // yield, never sleep (the post-drop aarch64 rule — no timer to wake a sleeper).
+        loop {
+            if let Some(crate::pal::Event::Key(_)) = crate::pal::pump_and_poll() {
+                break;
+            }
+            sched::yield_now();
+        }
+        self.on_page = 0;
+    }
+}
+
 /// Emit one live-test line to the console (progressively — the table fills in as tests run) and to
 /// serial (the QEMU evidence).
-fn report(console: &mut Console, pal: &mut TargetPal, tally: &mut Tally, name: &str, r: Outcome) {
+fn report(
+    pager: &mut Pager,
+    console: &mut Console,
+    pal: &mut TargetPal,
+    tally: &mut Tally,
+    name: &str,
+    r: Outcome,
+) {
     let line = match &r {
         Outcome::Pass => {
             tally.pass += 1;
@@ -219,11 +303,9 @@ fn report(console: &mut Console, pal: &mut TargetPal, tally: &mut Tally, name: &
             format!("  [SKIP] {}: {}", name, why)
         }
     };
-    console.println(&line);
-    // Progressive present: redraw the console so the user watches the table fill in. Cheap enough
-    // for a handful of lines; `tste` returns `false` so the caller repaints once more at the end.
-    console.draw(pal);
-    pal.render();
+    // Progressive present (the pager redraws so the user watches the table fill in) + page pause at a
+    // screenful. Serial was already mirrored above, unpaginated.
+    pager.line(console, pal, &line);
 }
 
 // =================================================================================================
@@ -234,54 +316,49 @@ fn report(console: &mut Console, pal: &mut TargetPal, tally: &mut Tally, name: &
 /// Safe in every shell context (see the module note): never blocks the coordinator.
 pub fn run(console: &mut Console, pal: &mut TargetPal) {
     let mut tally = Tally::new();
+    let mut pager = Pager::new(pal);
 
-    console.println("tste — UnaOS in-OS self-test suite");
+    pager.line(console, pal, "tste — UnaOS in-OS self-test suite");
     serial_println!(":: TSTE: suite start ::");
 
     // --- [boot-time]: replay the captured fixture verdicts --------------------------------------
-    console.println("[boot-time] (captured at boot; re-run needs TSTE-2)");
-    console.draw(pal);
-    pal.render();
+    pager.line(console, pal, "[boot-time] (captured at boot; re-run needs TSTE-2)");
     let (verdicts, dropped) = snapshot_boot_ring();
     if verdicts.is_empty() {
-        console.println("  (none captured — see the serial boot log)");
+        pager.line(console, pal, "  (none captured — see the serial boot log)");
     } else {
         for (label, pass) in &verdicts {
             tally.boot += 1;
             let tag = if *pass { "PASS" } else { "FAIL" };
-            console.println(&format!("  [{}] {}", tag, label));
+            pager.line(console, pal, &format!("  [{}] {}", tag, label));
             serial_println!(":: TSTE: [boot] {} -> {} ::", label, tag);
         }
         if dropped > 0 {
-            console.println(&format!("  (+{} verdicts dropped: ring full)", dropped));
+            pager.line(console, pal, &format!("  (+{} verdicts dropped: ring full)", dropped));
         }
     }
-    console.draw(pal);
-    pal.render();
 
     // --- [live]: checks that honestly re-run ----------------------------------------------------
-    console.println("[live]");
-    console.draw(pal);
-    pal.render();
+    pager.line(console, pal, "[live]");
 
-    report(console, pal, &mut tally, "sched.introspection", test_sched_introspection());
-    report(console, pal, &mut tally, "heap.roundtrip", test_heap_roundtrip());
-    report(console, pal, &mut tally, "video.geometry", test_video_geometry());
+    report(&mut pager, console, pal, &mut tally, "sched.introspection", test_sched_introspection());
+    report(&mut pager, console, pal, &mut tally, "heap.roundtrip", test_heap_roundtrip());
+    report(&mut pager, console, pal, &mut tally, "video.geometry", test_video_geometry());
 
     // M2 — the six sync primitives, re-verified with fresh worker tasks.
-    run_sync_section(console, pal, &mut tally);
+    run_sync_section(&mut pager, console, pal, &mut tally);
 
     // M3 — storage read checks (READ-ONLY; never mutates the volume).
-    run_storage_section(console, pal, &mut tally);
+    run_storage_section(&mut pager, console, pal, &mut tally);
 
     // --- summary --------------------------------------------------------------------------------
     let summary = format!(
         "{} pass  {} fail  {} skip  (+{} boot-replayed)",
         tally.pass, tally.fail, tally.skip, tally.boot
     );
-    console.println("----");
-    console.println(&summary);
-    console.println("footer: boot-sequenced EL0 fixtures re-run needs TSTE-2 (launcher refactor).");
+    pager.line(console, pal, "----");
+    pager.line(console, pal, &summary);
+    pager.line(console, pal, "footer: boot-sequenced EL0 fixtures re-run needs TSTE-2 (launcher refactor).");
     serial_println!(
         ":: TSTE: {} pass {} fail {} skip (+{} boot) ::",
         tally.pass, tally.fail, tally.skip, tally.boot
@@ -606,7 +683,12 @@ fn sync_probe_worker(cpu: usize) {
 /// Coordinator side: spawn the worker, poll `SYNC_DONE` with a bounded budget (never blocking), and
 /// report each primitive. On no scheduled CPU or a timeout, SKIP the whole section honestly — the
 /// boot CAPSTONE verdicts still appear in [boot-time].
-fn run_sync_section(console: &mut Console, pal: &mut TargetPal, tally: &mut Tally) {
+fn run_sync_section(
+    pager: &mut Pager,
+    console: &mut Console,
+    pal: &mut TargetPal,
+    tally: &mut Tally,
+) {
     let names = [
         ("sync.mutex", BIT_MUTEX),
         ("sync.rwlock", BIT_RWLOCK),
@@ -621,7 +703,7 @@ fn run_sync_section(console: &mut Console, pal: &mut TargetPal, tally: &mut Tall
         None => {
             let why = String::from("no application processor for fresh workers (single core)");
             for (n, _) in names.iter() {
-                report(console, pal, tally, n, Outcome::Skip(why.clone()));
+                report(pager, console, pal, tally, n, Outcome::Skip(why.clone()));
             }
             return;
         }
@@ -631,7 +713,7 @@ fn run_sync_section(console: &mut Console, pal: &mut TargetPal, tally: &mut Tall
     if SYNC_BUSY.swap(true, Ordering::AcqRel) {
         let why = String::from("previous sync probe still in flight");
         for (n, _) in names.iter() {
-            report(console, pal, tally, n, Outcome::Skip(why.clone()));
+            report(pager, console, pal, tally, n, Outcome::Skip(why.clone()));
         }
         return;
     }
@@ -650,7 +732,7 @@ fn run_sync_section(console: &mut Console, pal: &mut TargetPal, tally: &mut Tall
     if !done {
         let why = String::from("scheduler did not complete the probe within budget (needs an active scheduler)");
         for (n, _) in names.iter() {
-            report(console, pal, tally, n, Outcome::Skip(why.clone()));
+            report(pager, console, pal, tally, n, Outcome::Skip(why.clone()));
         }
         return;
     }
@@ -662,7 +744,7 @@ fn run_sync_section(console: &mut Console, pal: &mut TargetPal, tally: &mut Tall
         } else {
             Outcome::Fail(String::from("worker did not confirm (timeout/incorrect)"))
         };
-        report(console, pal, tally, n, r);
+        report(pager, console, pal, tally, n, r);
     }
     let _ = ALL_BITS;
 }
@@ -678,33 +760,38 @@ fn run_sync_section(console: &mut Console, pal: &mut TargetPal, tally: &mut Tall
 
 const KNOWN_FILE: &str = "HELLO.BIN";
 
-fn run_storage_section(console: &mut Console, pal: &mut TargetPal, tally: &mut Tally) {
+fn run_storage_section(
+    pager: &mut Pager,
+    console: &mut Console,
+    pal: &mut TargetPal,
+    tally: &mut Tally,
+) {
     let fs = match crate::fs::fat::mount() {
         Ok(fs) => fs,
         Err(e) => {
             let why = format!("no FAT volume mounted ({:?})", e);
-            report(console, pal, tally, "storage.mount", Outcome::Skip(why.clone()));
-            report(console, pal, tally, "storage.rootwalk", Outcome::Skip(why.clone()));
-            report(console, pal, tally, "storage.readfile", Outcome::Skip(why));
+            report(pager, console, pal, tally, "storage.mount", Outcome::Skip(why.clone()));
+            report(pager, console, pal, tally, "storage.rootwalk", Outcome::Skip(why.clone()));
+            report(pager, console, pal, tally, "storage.readfile", Outcome::Skip(why));
             return;
         }
     };
-    report(console, pal, tally, "storage.mount", Outcome::Pass);
+    report(pager, console, pal, tally, "storage.mount", Outcome::Pass);
 
     // Root-directory walk.
     let entries = match fs.read_root() {
         Ok(es) => es,
         Err(e) => {
             let why = format!("read_root failed ({:?})", e);
-            report(console, pal, tally, "storage.rootwalk", Outcome::Fail(why.clone()));
-            report(console, pal, tally, "storage.readfile", Outcome::Skip(String::from("root walk failed")));
+            report(pager, console, pal, tally, "storage.rootwalk", Outcome::Fail(why.clone()));
+            report(pager, console, pal, tally, "storage.readfile", Outcome::Skip(String::from("root walk failed")));
             return;
         }
     };
     if entries.is_empty() {
-        report(console, pal, tally, "storage.rootwalk", Outcome::Fail(String::from("empty root")));
+        report(pager, console, pal, tally, "storage.rootwalk", Outcome::Fail(String::from("empty root")));
     } else {
-        report(console, pal, tally, "storage.rootwalk", Outcome::Pass);
+        report(pager, console, pal, tally, "storage.rootwalk", Outcome::Pass);
     }
 
     // Known-file read: length + content sanity (READ-ONLY).
@@ -712,7 +799,7 @@ fn run_storage_section(console: &mut Console, pal: &mut TargetPal, tally: &mut T
         Ok(de) => de,
         Err(_) => {
             report(
-                console, pal, tally, "storage.readfile",
+                pager, console, pal, tally, "storage.readfile",
                 Outcome::Skip(format!("{} not present in root", KNOWN_FILE)),
             );
             return;
@@ -735,7 +822,7 @@ fn run_storage_section(console: &mut Console, pal: &mut TargetPal, tally: &mut T
         }
         Err(e) => Outcome::Fail(format!("read_file failed ({:?})", e)),
     };
-    report(console, pal, tally, "storage.readfile", r);
+    report(pager, console, pal, tally, "storage.readfile", r);
 }
 
 fn poll_until_done() -> bool {
