@@ -1820,7 +1820,7 @@ no disk honestly). Boot 3 with the reader re-seated came up clean. Also learned:
 stick itself did not surface as the block device on this bench — plan on a SEPARATE data
 card/reader for tegra storage benches (the pi4-style boot-disk read is not the tegra pattern).
 
-### JD5 — the write path: create / edit / delete files from the panel shell (🔬 QEMU-green, metal-PENDING 2026-07-10)
+### JD5 — the write path: create / edit / delete files from the panel shell (✅ METAL-CONFIRMED 2026-07-10)
 
 JD4 made the panel navigable read-only. JD5 makes the Orin a machine you can DO WORK ON: `touch`,
 `write`, `append`, and `rm` from the shell, through the SAME F3-locked FAT stack the U9/U10/U11
@@ -1895,17 +1895,30 @@ them, invoked only on interactive input (the boot/test path is unperturbed). A h
 SHELL write path is not cleanly reachable in-lane (the shell dispatches only on a keystroke, and tegra
 never runs in QEMU), so the shell-level verdict is attended-pending, exactly as JD2/JD3/JD4.
 
-**Metal verdict — 🔬 metal-PENDING (attended bench).** The money shot: on the panel, with a FAT data
-card present at boot (the tegra pattern — a separate reader, not the boot stick; hub-MSC enumeration
-is intermittent with a graceful fallthrough, so a no-disk boot must degrade to honest "no FAT
-filesystem"):
-1. `write NOTE.TXT hello from the orin` → `wrote N bytes to /NOTE.TXT (N bytes)`;
-2. `cat NOTE.TXT` → the text back;
-3. `append NOTE.TXT more` → grows the file; `cat` shows both;
-4. **power-cycle**, then `cat NOTE.TXT` → the content survives (write-through durability on silicon);
-5. `rm NOTE.TXT` → `removed /NOTE.TXT`; `cat NOTE.TXT` → `-ENOENT`.
-A stalled write must surface `-EIO` (never a hang), and a `write DOCS/X.TXT` must print the root-only
-`-ENOTSUP`. Use a FAT16 card to match the JD4-confirmed metal path.
+**Metal verdict — ✅ METAL-CONFIRMED (2026-07-10, attended bench; Peter at the Orin; serial
+`~/unaos-bench/jetson-serial-2026-07-10-165211.log`). Verdict: PASS** — the whole write battery on
+real silicon, across two boots, on the FAT16 `UNAOSRW` card (29 MiB / 60800 blocks, in the Alcor
+`USB SD Reader` behind the hub, slot 5; enumerated cleanly on BOTH boots — no `vid=0000` intermittency
+this bench):
+
+- **The money shot — write-through durability across a power cycle.** Boot 1: `write hello.txt hello
+  from orin` (create), `cat hello.txt` (read back), `append hello.txt and from peter` (grow),
+  `cat hello.txt` (both). **Power-cycle.** Boot 2: `cat hello.txt` → the content **survived** — the
+  first file written on the Orin panel to persist across a reboot. Write-through durability proven on
+  the real xHCI USB write path.
+- **Delete path:** `rm hello.txt` → freed; `cat hello.txt` → `-ENOENT`.
+- **Root-only guard:** `write docs/x.txt hi` and `write docs/y.txt …` were both REFUSED with
+  `-ENOTSUP`; a follow-up `cat docs/x.txt` confirmed the file was never created, and `ls docs` still
+  lists the subdirectory — JD4's read-side navigation is untouched by the root-only write scope.
+- **Case-insensitive 8.3 on silicon:** every name was typed lowercase (`hello.txt` created/matched
+  `HELLO.TXT`), exactly as JD4.
+- **Health:** both boots reached CAPSTONE 6/6 + screen-on-boot; **zero `BOT pump TIMEOUT`, zero BOT
+  transfer errors, zero panics/aborts** — the bounded write pump and F3's locks held on real hardware.
+
+⚠ Bench logistics: no dedicated jetson boot stick was on hand, so the rMBP `UNAOS` card was repurposed
+as the Orin boot stick (its x86 ESP overwritten with the aarch64 JD5 ESP) — the rMBP track must
+re-flash its own boot media before its next bench. The FAT16 `UNAOSRW` (the pi4 fixture card) served
+as the tegra data card, as in JD4.
 
 ## 4. Jetson Orin Nano headless bring-up (Arc JM2)
 

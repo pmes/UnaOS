@@ -10,9 +10,9 @@ Legend: **✅ metal-confirmed** · **🔬 QEMU-green, metal pending** · dates I
 
 ---
 
-## hw-jetson track — 2026-07-10 (JD5 — the write path: the panel becomes a real workstation shell)
+## hw-jetson track — 2026-07-10 (JD5 — the write path: the panel becomes a real workstation shell; same-day attended bench — PASS)
 
-### JD5 — `touch` / `write` / `append` / `rm` / `sync` on the panel shell 🔬 QEMU-green, metal-PENDING `hw-jetson`
+### JD5 — `touch` / `write` / `append` / `rm` / `sync` on the panel shell ✅ METAL-CONFIRMED (2026-07-10) `hw-jetson`
 - **What (M1, arch-neutral, `3a143f5`):** `touch <path>` creates a 0-length root file (idempotent);
   `write <path> <text>` is create-or-TRUNCATE storing the exact bytes (truncate = `delete_located` +
   `create_in_root` + `write_grow` — the only create-or-truncate through the PUBLIC API; no in-place
@@ -37,10 +37,13 @@ Legend: **✅ metal-confirmed** · **🔬 QEMU-green, metal pending** · dates I
   `el0-u10create`/`u10delete`/`u11close` fixtures (identical `create_in_root`/`write_grow`/
   `delete_located`); the SHELL arms are thin glue, dispatched only on a keystroke, so a headless
   shell-write demo is not in-lane — verdict attended-pending like JD2/JD3/JD4.
-- **Metal — 🔬 PENDING (attended bench):** the money shot — `write NOTE.TXT …` → `cat` →
-  `append` → **power-cycle** → `cat` (content survives) → `rm` → `cat` (`-ENOENT`), on a FAT16 data
-  card present at boot; a stalled write must surface `-EIO`, a `write DOCS/X.TXT` the root-only
-  `-ENOTSUP`.
+- **Metal — ✅ PASS (2026-07-10 attended bench, serial `jetson-serial-2026-07-10-165211.log`):** the
+  whole battery on the FAT16 `UNAOSRW` card (29 MiB, Alcor reader behind the hub, slot 5; clean enum
+  both boots) — boot 1 `write hello.txt` → `cat` → `append` → `cat`, **power-cycle**, boot 2
+  `cat hello.txt` **survives** (write-through durability on silicon), `rm` → `-ENOENT`,
+  `write docs/x.txt`/`docs/y.txt` → `-ENOTSUP` (file confirmed never created; `ls docs` still works),
+  all typed lowercase (case-insensitive 8.3). Zero `BOT pump TIMEOUT`/errors/panics both boots. ⚠ the
+  rMBP `UNAOS` card was repurposed as the Orin boot stick — rMBP must re-flash its boot media.
 - **Detail:** [`arch_arm64.md` §JD5](dev/OS/01_BOOT_HAL/arch_arm64.md). **Commits:** `3a143f5` M1 ·
   `dfaf180` M2 · `2531209` M3 (`hw-jetson`).
 
