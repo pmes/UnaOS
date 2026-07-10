@@ -39,9 +39,9 @@ Legend: **✅ metal-confirmed** · **🔬 QEMU-green, metal pending** · dates I
   Orin bench are where the crystal spins. The `:: VUG: crystal live — 24 faces, solid/wire, exit
   clean ::` and `:: VUG: crystal exit clean — N frames ::` serial lines are emitted by `run_crystal`
   when the demo is invoked (GUI-verified-pending; headless gates never type `vug`).
-## hw-jetson track — 2026-07-10 (JD3 code arc — QEMU-green; metal-pending attended bench)
+## hw-jetson track — 2026-07-10 (JD3 — code arc + same-day attended bench)
 
-### JD3 — storage behind the hub → real `ls`/`cat` on the Orin panel shell (+ dead-code retirement) 🔬 `hw-jetson`
+### JD3 — storage behind the hub → real `ls`/`cat` on the Orin panel shell (+ dead-code retirement) ✅ METAL-CONFIRMED (2026-07-10) `hw-jetson`
 - **What:** JD2's panel shell had no disk behind its `ls`/`cat`. JD3 brings up the hubbed
   mass-storage device (the Alcor reader) and gives the shell real files. The shell↔FAT↔block wiring
   is already architecture-neutral, so the work was *when/how* the tegra path drives the block device:
@@ -67,9 +67,17 @@ Legend: **✅ metal-confirmed** · **🔬 QEMU-green, metal pending** · dates I
   `UNAOS_HUBSTORAGE=1 ./arroyo test 25` → **MISSION SUCCESS** (`storage_slot=2 note='ready'`, no BOT
   timeout — the primary guard for the shared BOT-pump change); `./arroyo test-arm 22` → **MISSION
   SUCCESS** (aarch64 BOT-pump guard); `UNAOS_GICV3=1 ./arroyo test-arm 40` → **CAPSTONE 6/6**;
-  `esp-jetson kernel.elf` links, **107 `tegra:` strings** (JD2 was 105). **Metal-PENDING** — QEMU has
-  no Alcor and never compiles the tegra feature, so the post-drop timerless BOT busy-poll is
-  bench-only; watch hub-MSC power/timing on the real reader + the settle-window/budget sizing.
+  `esp-jetson kernel.elf` links, **107 `tegra:` strings** (JD2 was 105).
+- **Tested — ✅ METAL (2026-07-10, attended; Peter at the Orin):** an SD card in the **Alcor USB reader
+  behind the hub** enumerated (`vid=058f pid=6362 … route 0x4 tier 1` → `HUB DOWNSTREAM MASS STORAGE
+  (slot 5)`); M1's `service_storage` ran the SCSI bring-up pre-drop (`Disk 'Generic' 'USB SD Reader'
+  … 29 MiB` → `READ(10) LBA0 … Passed` → `JD3 — mass storage ready`), and post-drop the panel shell's
+  `diskinfo`/`ls`/`cat` read the FAT card — **PASS**, with **zero `BOT pump TIMEOUT`** anywhere (the M2
+  timerless wall-clock BOT read + `set_not_live()` proven on silicon). First real filesystem content on
+  the Orin panel. Bench note (confirms the flagged risk): the reader's hub-downstream enumeration is
+  intermittent — the first boot the hubbed LS/FS devices failed and the 8 s settle window correctly fell
+  through to `no mass storage … proceeding` (graceful, no wedge); a re-seat + power-cycle brought it up.
+  Serial `~/unaos-bench/jetson-serial-2026-07-10-104357.log`.
 - **Detail:** [`arch_arm64.md` §JD3](dev/OS/01_BOOT_HAL/arch_arm64.md). **Commit:** see `git log` (`hw-jetson`).
 ## hw-rmbp track — 2026-07-10 (U6gx — UnaFS owner/grants ACL, the x86 twin of pi4 U6, Opus-executed)
 

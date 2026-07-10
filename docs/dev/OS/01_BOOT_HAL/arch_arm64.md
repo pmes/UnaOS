@@ -1630,7 +1630,7 @@ after it, no panic/wedge (vug-on-tegra behaviour beyond survival not formally as
 The first interactive UnaOS session on the Orin: typed on the inherited keyboard, drawn on the
 inherited scanout, dispatched by the shared shell at EL1.
 
-### JD3 — storage behind the hub: real `ls`/`cat` on the panel shell (🔬 QEMU-green, metal-pending)
+### JD3 — storage behind the hub: real `ls`/`cat` on the panel shell (✅ METAL-CONFIRMED 2026-07-10)
 
 JD2 gave the Orin an interactive shell, but its `ls`/`cat` had no disk behind them (`storage_slot`
 stayed 0 — JB10 saw the Alcor reader enumerate behind the hub but never claimed it). JD3 brings the
@@ -1717,6 +1717,25 @@ sizing for a real USB-MSC read latency (bump `hw_wait_budget()`'s BOT multiple i
 marginally times out); (c) `set_not_live()` + the busy-poll pump actually completing a read on the
 timerless EL1 core. Bench proof = flash, then on the panel shell: `diskinfo` (geometry), `ls` (the
 card's root), `cat <known file>` (its bytes).
+
+**Metal verdict — ✅ METAL-CONFIRMED (2026-07-10, attended bench; Peter at the Orin).** Serial
+`~/unaos-bench/jetson-serial-2026-07-10-104357.log`. An SD card in the **Alcor USB reader behind the
+hub** enumerated on the retry boot — `HUB downstream slot 5 device … vid=058f pid=6362 (route 0x4 tier
+1)` → `>>> HUB DOWNSTREAM MASS STORAGE (slot 5, bulk in 0x82/512 out 0x1/512) <<<` → M1's
+`service_storage` ran the SCSI bring-up **in the pre-drop pump**: `Disk 'Generic' 'USB SD Reader'
+block_size=512 num_blocks=60800 (29 MiB)` → `READ(10) LBA0 CSW status=Passed residue=0` →
+`JD3 — mass storage ready (slot 5); panel shell ls/cat live` (the disk was up well inside the 8 s
+settle window, so the pump returned keyboard-armed + storage-ready). Then post-drop, on the panel
+shell, `diskinfo` / `ls` / `cat` read the FAT card — the M2 crux: **synchronous BOT reads completing on
+the timerless EL1 core** via `set_not_live()` + the wall-clock `pump_until_bot_done`. Peter's verdict:
+**PASS**, and **zero `BOT pump TIMEOUT` lines** across the whole session — the ×3 `hw_wait_budget`
+budget was ample for the real USB-MSC read latency. The first real filesystem content on the Orin
+panel. ⚠ Bench note confirming the flagged risk: the hub-downstream enumeration of the reader is
+**intermittent** — the *first* boot the hubbed LS/FS devices failed (`ADDRESS_DEVICE code 4`, a
+`vid=0000` descriptor read, an FS `dev-desc` recovery loop) and the settle window correctly fell
+through to `no mass storage within the settle window; proceeding` (graceful, no wedge); a re-seat +
+power-cycle brought the Alcor up cleanly. So the JD3 code path is solid; the residual variability is
+hub-MSC power/timing on the real reader (a direct-root USB stick sidesteps it entirely).
 
 ## 4. Jetson Orin Nano headless bring-up (Arc JM2)
 
