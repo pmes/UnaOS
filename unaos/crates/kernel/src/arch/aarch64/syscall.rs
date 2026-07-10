@@ -7962,6 +7962,9 @@ pub fn u7_launcher(demo_cpu: usize) {
     f2_witness_launcher(demo_cpu);
     // F3 M4: the NAMESPACE-lock twin — same discipline (last, in-RAM, no disk, its own `F3-witness:` line).
     f3_witness_launcher(demo_cpu);
+    // K1 M1: the on-disk owner/grants (UNAFS.ATR) format + round-trip — runs LAST (its disk I/O can never
+    // perturb the 23 fixtures or the witnesses); emits its own `:: K1-atr: ::` line (not a `-> PASS`).
+    k1_atr_selftest();
 }
 
 /// F2 M3 witness worker — the `demo_cpu` half of the cross-core FAT_MUTATION stress. `fn(usize)` for
@@ -8113,6 +8116,498 @@ fn f3_witness_launcher(demo_cpu: usize) {
             demo_cpu, locked_got, want, want - locked_got
         );
     }
+}
+
+// =====================================================================================================
+// K1: on-disk UnaFS owner/grants attributes — the UNAFS.ATR format + M1 round-trip (persist the U6 ACL).
+// =====================================================================================================
+//
+// U6's OWNED_FILES table is in-RAM and BOOT-SCOPED: power-cycle and every private file is public again,
+// because the owner is recorded as an (asid, gen) INCARNATION that means nothing after reboot. K1 makes
+// ownership SURVIVE REBOOT by persisting owner + grants as on-disk attributes INSIDE the FAT volume — a
+// reserved hidden|system file UNAFS.ATR in the root (no dir-entry bytes stolen; foreign OSes hide/skip it).
+//
+// PRINCIPAL-IDENTITY STOP-GATE — this arc's load-bearing design decision (docs/SECURITY.md §K1). The U6
+// owner is (asid, gen), which CANNOT persist (asid = slot+1 is reassigned every boot; gen resets at
+// power-on). A persisted owner must be a PERSISTENT PRINCIPAL, and UnaOS has no persistent-principal model
+// yet: EL0 programs are UNTRUSTED blobs loaded BY NAME with no code-signing / manifest / image hash, there
+// is no RTC / wall-clock and no uid registry. Inventing that model is a TCB-level policy decision ABOVE
+// this aarch64 lane, so M1 STOPS after the FORMAT + round-trip and PROPOSES the model to the seat. The
+// proposal (NOT enforced here): a launcher-assigned, KERNEL-STAMPED principal (never self-asserted by a
+// blob), recorded as the 32-byte kind-tagged, string-projectable `PrincipalRecord` below (default kind
+// PROGRAM_NAME "prog:<name>") that maps 1:1 onto native unafs `owner`/`grants:<name>` string keys at K4.
+//
+// WHAT M1 BUILDS (and ONLY this): the UNAFS.ATR on-disk FORMAT (versioned magic header + 16 bounded rows,
+// per-header + per-row CRC32, volume binding), its (de)serializers, reserved-file read/write helpers
+// composed ENTIRELY from fat.rs's EXISTING public API (ZERO fat.rs edit), and a round-trip self-test that
+// proves the codec + the disk helpers, with the steady-state single-row write done UNDER the F3 NAMESPACE
+// lock. It does NOT stamp principals at spawn, NOT rebuild into OWNED_FILES, NOT wire attr writes into
+// sys_open/unlink/fgrant — all M2, seat-gated on the principal model. The round-trip uses SYNTHETIC
+// principal records precisely because the live owner (asid, gen) is the one thing that must NOT persist.
+// Enforcement-INERT: the 23-PASS battery is byte-identical (K1 emits its own `:: K1-atr: ::` line, never a
+// `-> PASS`), and the disk half leaves UNAFS.ATR a valid EMPTY (all-public) image.
+//
+// FAIL-CLOSED (the read-side rule M2's mount-rebuild inherits): on ANY doubt about a row — bad magic /
+// version / volume binding / header CRC / row CRC / (M2) a name that no longer resolves — revert that file
+// (or the whole volume) to PUBLIC, the well-defined pre-U6 baseline. Owner AND all its grants live in ONE
+// row under ONE row_crc32 and install-or-drop ATOMICALLY, so "fail-closed on grants, fail-open on ownership
+// is not a thing" is STRUCTURALLY foreclosed: a row is never half-trusted; an owner/grant is never forged
+// from garbage. (Honest residual: fail-closed-to-PUBLIC of a torn OWNER row is a confidentiality downgrade
+// on crash; the old-row-survives write-commit-order mitigation is an M2 write-path concern.)
+
+/// K1: the reserved attr file — a hidden|system 8.3 file in the FAT root. `find_located`/`create_in_root`
+/// reach it (attr 0x06 is a real entry, not LFN/vollabel); foreign OSes hide/skip it. The internal magic
+/// (below), NOT this name, is the format's identity — the filename is a seat sub-decision (UNA_ACL.SYS is
+/// the alternative that avoids a human confusing a FAT volume with a native unafs volume).
+const ATR_NAME: &str = "UNAFS.ATR";
+const ATR_DIR_ATTR: u8 = 0x02 | 0x04; // HIDDEN | SYSTEM
+
+/// K1: format identity — deliberately NOT the native unafs superblock magic, so a future kernel tells the
+/// FAT bridge apart from a real unafs volume (migrate-then-delete at K4). Bump `ATR_VERSION` for any
+/// incompatible layout change (widening `PrincipalRecord.value` past 30 bytes is such a change).
+const ATR_MAGIC: [u8; 8] = *b"UNAATR1\0";
+const ATR_VERSION: u16 = 1;
+const ATR_HEADER_LEN: usize = 512; // the header owns file sector 0 alone (no row shares its sector)
+const ATR_ROW_STRIDE: usize = 256; // 2 rows per 512-byte sector, none straddling -> 1 row = 1 sector RMW
+const ATR_ROWS: usize = NOWNED; // 16 — the on-disk bound MIRRORS the in-RAM OWNED_FILES bound (no growth)
+const ATR_FILE_LEN: usize = ATR_HEADER_LEN + ATR_ROW_STRIDE * ATR_ROWS; // 4608 bytes
+
+const ATR_FLAG_COMMITTED: u32 = 1 << 0; // header valid+complete (M2 writes it AFTER the rows, at create)
+const ATR_ROW_VALID: u8 = 1 << 0; // this row records a live owned file (else a free slot)
+
+// principal_record kinds (the PROPOSED model — reserved values keep the format model-agnostic for the seat).
+const PRIN_NONE: u8 = 0; // public / free (no owner)
+const PRIN_PROGRAM_NAME: u8 = 1; // "prog:<name>" — the recommended default
+#[allow(dead_code)]
+const PRIN_IMAGE_SHA256: u8 = 2; // reserved: "sha256:<hex>" once code-signing lands (no format bump)
+#[allow(dead_code)]
+const PRIN_KERNEL_PID: u8 = 3; // reserved: launcher-minted "pid:<hex>"
+const PRIN_VALUE_LEN: usize = 30;
+
+/// K1: a 32-byte kind-tagged persistent principal — the PROPOSED durable owner/grantee identity. Opaque to
+/// M1 (round-tripped, NEVER derived from a live (asid, gen)); `value` holds the canonical string
+/// projection's bytes (e.g. b"prog:VUG"), `len` its significant length.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct PrincipalRecord {
+    kind: u8,
+    len: u8,
+    value: [u8; PRIN_VALUE_LEN],
+}
+
+impl PrincipalRecord {
+    const NONE: Self = PrincipalRecord { kind: PRIN_NONE, len: 0, value: [0u8; PRIN_VALUE_LEN] };
+
+    /// A PROGRAM_NAME principal from a byte string (truncated to the 30-byte value field). M1 test helper —
+    /// M2 derives the real record from the launcher-stamped identity, never from EL0 input.
+    fn program(name: &[u8]) -> Self {
+        let mut value = [0u8; PRIN_VALUE_LEN];
+        let n = core::cmp::min(name.len(), PRIN_VALUE_LEN);
+        value[..n].copy_from_slice(&name[..n]);
+        PrincipalRecord { kind: PRIN_PROGRAM_NAME, len: n as u8, value }
+    }
+
+    fn write(&self, out: &mut [u8]) {
+        out[0] = self.kind;
+        out[1] = self.len;
+        out[2..2 + PRIN_VALUE_LEN].copy_from_slice(&self.value);
+    }
+
+    fn read(b: &[u8]) -> Self {
+        let mut value = [0u8; PRIN_VALUE_LEN];
+        value.copy_from_slice(&b[2..2 + PRIN_VALUE_LEN]);
+        PrincipalRecord { kind: b[0], len: b[1], value }
+    }
+}
+
+/// K1: one grant edge on disk — a principal + the rights it holds (36 bytes: 32 + u32 LE).
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct AtrGrant {
+    prin: PrincipalRecord,
+    rights: u32,
+}
+
+impl AtrGrant {
+    const EMPTY: Self = AtrGrant { prin: PrincipalRecord::NONE, rights: 0 };
+}
+
+/// K1: the parsed form of one 256-byte on-disk row (field offsets documented in `atr_serialize_row`).
+#[derive(Clone, Copy)]
+struct AtrRow {
+    name: [u8; 11], // on-disk 8.3 (space-padded) — the DURABLE identity key (re-resolved by name at mount, M2)
+    first_cluster: u32,
+    size: u32,
+    dir_lba: u64, // runtime-key HINT; authoritatively re-resolved from `name` at mount (M2)
+    dir_off: u32,
+    owner: PrincipalRecord,
+    grants: [AtrGrant; NFGRANT],
+}
+
+/// K1: CRC-32/IEEE (poly 0xEDB88320, init/xorout 0xFFFFFFFF), computed bitwise — no static table, no_std
+/// clean. Guards the header ([0..508)) and each row ([0..252)) INDEPENDENTLY (deliberately no whole-file
+/// CRC, so a single-row update never has to rewrite — and torn — the header sector).
+fn atr_crc32(data: &[u8]) -> u32 {
+    let mut crc: u32 = 0xFFFF_FFFF;
+    for &byte in data {
+        crc ^= byte as u32;
+        for _ in 0..8 {
+            let mask = (crc & 1).wrapping_neg();
+            crc = (crc >> 1) ^ (0xEDB8_8320 & mask);
+        }
+    }
+    !crc
+}
+
+/// K1: serialize a live owned-file row to its 256-byte on-disk form (VALID set). Layout (LE):
+///   [0..11] name · [11] row_flags · [12..16] first_cluster · [16..20] size · [20..28] dir_lba ·
+///   [28..32] dir_off · [32..64] owner principal · [64..208] 4× grant{prin[32], rights u32} ·
+///   [208..252] reserved(0) · [252..256] row_crc32 over [0..252).
+fn atr_serialize_row(row: &AtrRow) -> [u8; ATR_ROW_STRIDE] {
+    let mut b = [0u8; ATR_ROW_STRIDE];
+    b[0..11].copy_from_slice(&row.name);
+    b[11] = ATR_ROW_VALID;
+    b[12..16].copy_from_slice(&row.first_cluster.to_le_bytes());
+    b[16..20].copy_from_slice(&row.size.to_le_bytes());
+    b[20..28].copy_from_slice(&row.dir_lba.to_le_bytes());
+    b[28..32].copy_from_slice(&row.dir_off.to_le_bytes());
+    row.owner.write(&mut b[32..64]);
+    for (j, g) in row.grants.iter().enumerate() {
+        let o = 64 + 36 * j;
+        g.prin.write(&mut b[o..o + 32]);
+        b[o + 32..o + 36].copy_from_slice(&g.rights.to_le_bytes());
+    }
+    let crc = atr_crc32(&b[0..252]);
+    b[252..256].copy_from_slice(&crc.to_le_bytes());
+    b
+}
+
+/// K1: a well-formed FREE row — VALID clear, CRC valid over the zeroed body, so a mount reads it as "free
+/// slot" (not "corrupt"). Used to initialize the image and to clear a row back to public.
+fn atr_empty_row() -> [u8; ATR_ROW_STRIDE] {
+    let mut b = [0u8; ATR_ROW_STRIDE];
+    let crc = atr_crc32(&b[0..252]);
+    b[252..256].copy_from_slice(&crc.to_le_bytes());
+    b
+}
+
+/// K1: parse a 256-byte row. `None` iff the slot is FREE (VALID clear) OR the row_crc32 fails — both mean
+/// NO owner installed => the file is PUBLIC (fail-closed: a corrupt row NEVER yields a forged owner/grant).
+/// A `Some` row is fully trusted: owner AND grants passed the one CRC together (the fail-closed asymmetry,
+/// structural). (M2's mount distinguishes free-vs-corrupt for its one-line log; M1 only needs None=public.)
+fn atr_parse_row(b: &[u8; ATR_ROW_STRIDE]) -> Option<AtrRow> {
+    let stored = u32::from_le_bytes([b[252], b[253], b[254], b[255]]);
+    if atr_crc32(&b[0..252]) != stored {
+        return None; // corrupt -> public (owner AND grants dropped together)
+    }
+    if b[11] & ATR_ROW_VALID == 0 {
+        return None; // a well-formed free slot
+    }
+    let mut name = [0u8; 11];
+    name.copy_from_slice(&b[0..11]);
+    let mut grants = [AtrGrant::EMPTY; NFGRANT];
+    for (j, g) in grants.iter_mut().enumerate() {
+        let o = 64 + 36 * j;
+        g.prin = PrincipalRecord::read(&b[o..o + 32]);
+        g.rights = u32::from_le_bytes([b[o + 32], b[o + 33], b[o + 34], b[o + 35]]);
+    }
+    Some(AtrRow {
+        name,
+        first_cluster: u32::from_le_bytes([b[12], b[13], b[14], b[15]]),
+        size: u32::from_le_bytes([b[16], b[17], b[18], b[19]]),
+        dir_lba: u64::from_le_bytes([b[20], b[21], b[22], b[23], b[24], b[25], b[26], b[27]]),
+        dir_off: u32::from_le_bytes([b[28], b[29], b[30], b[31]]),
+        owner: PrincipalRecord::read(&b[32..64]),
+        grants,
+    })
+}
+
+/// K1: the volume binding — proves an attr file belongs to THIS volume (a swapped card / byte-copied image
+/// is rejected, so a foreign volume's rows never attach to this volume's directory slots). M1 PLACEHOLDER:
+/// binds to the reachable public accessors `cluster_size()` + `num_fats()`; the real fingerprint (BS_VolID
+/// + count_of_clusters) needs a read-only fat.rs accessor that does not exist yet — a SEAT-AUTHORIZED M2
+/// prerequisite (M1 must not edit shared fat.rs). The binding LOGIC (bind + reject-on-mismatch) is complete
+/// and metal-exercised; only the two source fields upgrade at M2.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct AtrBinding {
+    a: u32, // M1: cluster_size()   (M2: BS_VolID)
+    b: u32, // M1: num_fats()       (M2: count_of_clusters)
+}
+
+fn atr_live_binding(fs: &crate::fs::fat::FatFs) -> AtrBinding {
+    AtrBinding { a: fs.cluster_size(), b: fs.num_fats() }
+}
+
+/// K1: serialize the 512-byte header (committed). Layout (LE): [0..8] magic · [8..10] version ·
+/// [10..12] header_len · [12..14] row_stride · [14..16] row_count · [16..20] flags · [20..24] binding.a ·
+/// [24..28] binding.b · [28..508] reserved(0) [M2: bytes/sec, sec/clus, part_lba] · [508..512] header_crc32
+/// over [0..508).
+fn atr_serialize_header(bind: &AtrBinding) -> [u8; ATR_HEADER_LEN] {
+    let mut b = [0u8; ATR_HEADER_LEN];
+    b[0..8].copy_from_slice(&ATR_MAGIC);
+    b[8..10].copy_from_slice(&ATR_VERSION.to_le_bytes());
+    b[10..12].copy_from_slice(&(ATR_HEADER_LEN as u16).to_le_bytes());
+    b[12..14].copy_from_slice(&(ATR_ROW_STRIDE as u16).to_le_bytes());
+    b[14..16].copy_from_slice(&(ATR_ROWS as u16).to_le_bytes());
+    b[16..20].copy_from_slice(&ATR_FLAG_COMMITTED.to_le_bytes());
+    b[20..24].copy_from_slice(&bind.a.to_le_bytes());
+    b[24..28].copy_from_slice(&bind.b.to_le_bytes());
+    let crc = atr_crc32(&b[0..508]);
+    b[508..512].copy_from_slice(&crc.to_le_bytes());
+    b
+}
+
+/// K1: why a header was rejected — each verdict => the WHOLE volume is treated all-public (M2's mount logs
+/// one line). Checked in fail-closed order: magic, then CRC, then version/geometry/committed/binding.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum AtrReject {
+    Magic,
+    Crc,
+    Version,
+    Geometry, // header_len / row_stride / row_count disagree with this build's format
+    Uncommitted,
+    Binding,
+}
+
+/// K1: validate a 512-byte header against the LIVE volume binding. `Ok` ONLY for a committed, CRC-valid,
+/// this-version, this-volume header; anything else is fail-closed (the volume is all-public).
+fn atr_parse_header(b: &[u8; ATR_HEADER_LEN], live: &AtrBinding) -> Result<(), AtrReject> {
+    if b[0..8] != ATR_MAGIC {
+        return Err(AtrReject::Magic);
+    }
+    let stored = u32::from_le_bytes([b[508], b[509], b[510], b[511]]);
+    if atr_crc32(&b[0..508]) != stored {
+        return Err(AtrReject::Crc);
+    }
+    if u16::from_le_bytes([b[8], b[9]]) != ATR_VERSION {
+        return Err(AtrReject::Version);
+    }
+    if u16::from_le_bytes([b[10], b[11]]) as usize != ATR_HEADER_LEN
+        || u16::from_le_bytes([b[12], b[13]]) as usize != ATR_ROW_STRIDE
+        || u16::from_le_bytes([b[14], b[15]]) as usize != ATR_ROWS
+    {
+        return Err(AtrReject::Geometry);
+    }
+    if u32::from_le_bytes([b[16], b[17], b[18], b[19]]) & ATR_FLAG_COMMITTED == 0 {
+        return Err(AtrReject::Uncommitted);
+    }
+    let bind = AtrBinding {
+        a: u32::from_le_bytes([b[20], b[21], b[22], b[23]]),
+        b: u32::from_le_bytes([b[24], b[25], b[26], b[27]]),
+    };
+    if bind != *live {
+        return Err(AtrReject::Binding);
+    }
+    Ok(())
+}
+
+/// K1: the canonical EMPTY image — a committed header + 16 free rows (4608 bytes). The all-public resting
+/// state a fresh volume (or M1's round-trip) leaves behind.
+fn atr_empty_image(bind: &AtrBinding) -> alloc::vec::Vec<u8> {
+    let mut img = alloc::vec::Vec::with_capacity(ATR_FILE_LEN);
+    img.extend_from_slice(&atr_serialize_header(bind));
+    let empty = atr_empty_row();
+    for _ in 0..ATR_ROWS {
+        img.extend_from_slice(&empty);
+    }
+    img
+}
+
+/// K1: ensure UNAFS.ATR exists as a committed, EMPTY 4608-byte image, creating it if absent. Returns the
+/// (first_cluster, size) to address it. The one-time CREATE (create_in_root + a whole-image write_grow) is
+/// done WITHOUT the namespace lock — it is file setup, not a steady-state ACL mutation, and holding ns
+/// across a multi-cluster write_grow would extend the IRQ-masked span (the F3 ns-latency concern). Composed
+/// ENTIRELY from fat.rs's existing public API — no fat.rs edit.
+fn atr_ensure(
+    fs: &crate::fs::fat::FatFs,
+    bind: &AtrBinding,
+) -> Result<(u32, u32), crate::fs::fat::FatError> {
+    use crate::fs::fat::FatError;
+    match fs.find_located(ATR_NAME) {
+        Ok((de, lba, off)) => {
+            if (de.size as usize) >= ATR_FILE_LEN {
+                return Ok((de.first_cluster(), de.size));
+            }
+            // Present but short (a stale/partial image) — (re)grow it to a fresh empty image.
+            let img = atr_empty_image(bind);
+            let (_w, sz, fc) = fs.write_grow(de.first_cluster(), de.size, lba, off, 0, &img)?;
+            Ok((fc, sz))
+        }
+        Err(FatError::NotFound) => {
+            let (de, lba, off) = fs.create_in_root(ATR_NAME, ATR_DIR_ATTR)?;
+            let img = atr_empty_image(bind);
+            let (_w, sz, fc) = fs.write_grow(de.first_cluster(), de.size, lba, off, 0, &img)?;
+            Ok((fc, sz))
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// K1 M1 — the disk half of the round-trip: write ONE synthetic row via the single-row `write_at` path
+/// UNDER the NAMESPACE lock (the exact M2 steady-state discipline — one 256-byte record = one device-sector
+/// RMW), read it back + verify byte- and field-equal, then CLEAR it — leaving UNAFS.ATR a valid EMPTY
+/// (all-public) image. Also re-reads + validates the header (proves the create path). Returns true iff every
+/// step held; robust — every fallible op is matched, never unwrapped, so a disk hiccup FAILs the line, never
+/// faults the core.
+fn k1_atr_disk_roundtrip(fs: &crate::fs::fat::FatFs, fc: u32, size: u32, bind: &AtrBinding) -> bool {
+    const ROW_I: usize = 3; // an arbitrary interior row
+    let row_off = (ATR_HEADER_LEN + ATR_ROW_STRIDE * ROW_I) as u32;
+
+    // A synthetic owned-file row — SYNTHETIC principals ON PURPOSE (the live owner (asid, gen) must not
+    // persist; M1 proves only the container).
+    let mut grants = [AtrGrant::EMPTY; NFGRANT];
+    grants[0] = AtrGrant { prin: PrincipalRecord::program(b"prog:TESTGRANTEE"), rights: CAP_READ };
+    let row = AtrRow {
+        name: *b"K1TEST  BIN",
+        first_cluster: 0x55,
+        size: 512,
+        dir_lba: 0x40,
+        dir_off: 0x20,
+        owner: PrincipalRecord::program(b"prog:TESTOWNER"),
+        grants,
+    };
+    let want = atr_serialize_row(&row);
+
+    // Write the row IN PLACE under the F3 NAMESPACE lock — the seam M2's create/grant/revoke attr writes
+    // use. `write_at` never grows and takes no inner lock, so holding ns across this one bounded polled
+    // sector RMW respects both the lock order and the ns span rule.
+    {
+        let _ns = ns_lock();
+        if fs.write_at(fc, size, row_off, &want).unwrap_or(0) != want.len() {
+            return false;
+        }
+    }
+
+    // Read it back (a read needs no ns) and confirm the exact bytes + a field-equal parse.
+    let mut got: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
+    if fs.read_at(fc, size, row_off, &mut got, ATR_ROW_STRIDE).is_err() || got.len() != ATR_ROW_STRIDE {
+        return false;
+    }
+    if &got[..] != &want[..] {
+        return false;
+    }
+    let mut got_arr = [0u8; ATR_ROW_STRIDE];
+    got_arr.copy_from_slice(&got);
+    let parsed_ok = match atr_parse_row(&got_arr) {
+        Some(r) => r.owner == row.owner && r.grants == row.grants && r.name == row.name,
+        None => false,
+    };
+    if !parsed_ok {
+        return false;
+    }
+
+    // Clear the row back to free (leave UNAFS.ATR a valid, all-public EMPTY image) — again one sector, ns.
+    {
+        let _ns = ns_lock();
+        let empty = atr_empty_row();
+        if fs.write_at(fc, size, row_off, &empty).unwrap_or(0) != empty.len() {
+            return false;
+        }
+    }
+
+    // Re-read + validate the header (proves the create path produced a committed, this-volume header).
+    let mut hdr: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
+    if fs.read_at(fc, size, 0, &mut hdr, ATR_HEADER_LEN).is_err() || hdr.len() != ATR_HEADER_LEN {
+        return false;
+    }
+    let mut hdr_arr = [0u8; ATR_HEADER_LEN];
+    hdr_arr.copy_from_slice(&hdr);
+    atr_parse_header(&hdr_arr, bind).is_ok()
+}
+
+/// K1 M1 — the ATR round-trip self-test. Proves (A) the codec round-trips + fails closed on corruption and
+/// (B) the reserved-file helpers create/write/read UNAFS.ATR on the real volume, the steady-state single-row
+/// update UNDER the F3 NAMESPACE lock. Emits ONE `:: K1-atr: ::` line (NOT a `-> PASS` line — the 23-fixture
+/// count stays byte-equivalent). ENFORCEMENT-INERT: never reads OWNED_FILES, never maps a record to
+/// (asid, gen), never persists a live owner. Runs LAST (after the F2/F3 witnesses) so its disk I/O can never
+/// perturb the battery or the witnesses.
+fn k1_atr_selftest() {
+    // One-shot (u7_launcher's task calls this once; guard defensively — the u7_run DONE idiom).
+    static DONE: AtomicBool = AtomicBool::new(false);
+    if DONE.swap(true, Ordering::Relaxed) {
+        return;
+    }
+
+    // ---- Part A: in-RAM codec round-trip + fail-closed negatives (no disk) -------------------------------
+    let mut codec_ok = true;
+
+    // A representative populated row: PROGRAM_NAME owner + two grants (one full-rights).
+    let mut grants = [AtrGrant::EMPTY; NFGRANT];
+    grants[0] = AtrGrant { prin: PrincipalRecord::program(b"prog:MIDI"), rights: CAP_READ };
+    grants[1] = AtrGrant { prin: PrincipalRecord::program(b"prog:SEQ"), rights: CAP_READ | CAP_WRITE };
+    let row = AtrRow {
+        name: *b"OWNED   BIN",
+        first_cluster: 0x1234,
+        size: 4096,
+        dir_lba: 0x2000,
+        dir_off: 0x60,
+        owner: PrincipalRecord::program(b"prog:VUG"),
+        grants,
+    };
+    let bytes = atr_serialize_row(&row);
+    match atr_parse_row(&bytes) {
+        Some(r) => {
+            codec_ok &= r.name == row.name
+                && r.first_cluster == row.first_cluster
+                && r.size == row.size
+                && r.dir_lba == row.dir_lba
+                && r.dir_off == row.dir_off
+                && r.owner == row.owner
+                && r.grants == row.grants;
+            codec_ok &= atr_serialize_row(&r) == bytes; // re-serializing the parse reproduces the exact bytes
+        }
+        None => codec_ok = false,
+    }
+
+    // Negative: a single flipped bit in the owner field MUST fail the row CRC -> None (drop to public).
+    let mut corrupt = bytes;
+    corrupt[40] ^= 0x01;
+    codec_ok &= atr_parse_row(&corrupt).is_none();
+
+    // Negative: a FREE row (VALID clear) parses to None (a well-formed free slot, not corruption).
+    codec_ok &= atr_parse_row(&atr_empty_row()).is_none();
+
+    // Header: round-trip + reject wrong binding / magic / CRC / uncommitted.
+    let bind = AtrBinding { a: 2048, b: 2 };
+    let hdr = atr_serialize_header(&bind);
+    codec_ok &= atr_parse_header(&hdr, &bind).is_ok();
+    codec_ok &= atr_parse_header(&hdr, &AtrBinding { a: 512, b: 2 }) == Err(AtrReject::Binding);
+    let mut badmagic = hdr;
+    badmagic[0] = b'X';
+    codec_ok &= atr_parse_header(&badmagic, &bind) == Err(AtrReject::Magic);
+    let mut badcrc = hdr;
+    badcrc[100] ^= 0xFF; // a reserved byte — magic still matches, CRC now fails
+    codec_ok &= atr_parse_header(&badcrc, &bind) == Err(AtrReject::Crc);
+    let mut uncommit = hdr;
+    uncommit[16] &= !(ATR_FLAG_COMMITTED as u8); // clear committed, then re-CRC so it fails on Uncommitted
+    let uc = atr_crc32(&uncommit[0..508]);
+    uncommit[508..512].copy_from_slice(&uc.to_le_bytes());
+    codec_ok &= atr_parse_header(&uncommit, &bind) == Err(AtrReject::Uncommitted);
+
+    // ---- Part B: on-disk reserved-file helpers on the real volume ---------------------------------------
+    let mut disk_note = "no SD";
+    if crate::drivers::block::info().is_some() {
+        match crate::fs::fat::mount() {
+            Ok(fs) => {
+                let live = atr_live_binding(&fs);
+                match atr_ensure(&fs, &live) {
+                    Ok((fc, size)) => {
+                        disk_note = if k1_atr_disk_roundtrip(&fs, fc, size, &live) {
+                            "disk PASS"
+                        } else {
+                            "disk FAIL"
+                        };
+                    }
+                    Err(_) => disk_note = "ensure err",
+                }
+            }
+            Err(_) => disk_note = "mount err",
+        }
+    }
+
+    serial_println!(
+        ":: K1-atr: UNAFS.ATR owner/grants format M1 — codec {} (16-row bound, per-row CRC fail-closed, binding-checked), on-disk helpers {} (single-row write_at under NAMESPACE); ENFORCEMENT-INERT — persistence STOPS for the seat's principal decision ::",
+        if codec_ok { "PASS" } else { "FAIL" },
+        disk_note
+    );
 }
 
 fn u7_run(demo_cpu: usize) {

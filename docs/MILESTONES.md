@@ -10,6 +10,36 @@ Legend: **✅ metal-confirmed** · **🔬 QEMU-green, metal pending** · dates I
 
 ---
 
+## hw-pi4 track — 2026-07-10 (K1 M1 — the on-disk owner/grants format; persistence stops for a seat decision)
+
+### K1 M1 — `UNAFS.ATR`: persist the U6 ACL across reboot — FORMAT + round-trip 🔬 `hw-pi4`
+- **What:** U6's owner/grants ACL is in-RAM and boot-scoped (the owner is an `(asid, gen)`
+  incarnation), so a power-cycle reverts every private file to PUBLIC. K1 persists owner + grants
+  as on-disk attributes inside a reserved hidden|system FAT file `UNAFS.ATR`. **M1 lands the on-disk
+  FORMAT** (a versioned magic header + 16 bounded 256-byte rows — mirroring the 16-row in-RAM table
+  — each with a 32-byte kind-tagged owner `PrincipalRecord` + 4 grants, per-header and per-row CRC32,
+  a volume binding; single-row `write_at` = one-sector RMW), **its (de)serializers, reserved-file
+  helpers built entirely on `fat.rs`'s existing public API (zero `fat.rs` edit), and a round-trip
+  self-test** — codec (populated-row byte/field round-trip + CRC-corrupt/bad-magic/wrong-binding
+  fail-closed) and on-disk (create the empty image, write one SYNTHETIC row via `write_at` UNDER the
+  F3 `NAMESPACE` lock, read back byte-equal, clear it → a valid all-public image).
+- **STOP-GATE:** the persistent-principal model is genuinely undefined — a persisted owner cannot be
+  a boot-scoped `(asid, gen)`, and UnaOS has no persistent principal (EL0 blobs loaded by name, no
+  code-signing / manifest / RTC / uid). Defining it is a TCB-level policy decision above the pi4
+  aarch64 lane, so **M1 STOPS and PROPOSES to the seat** a launcher-assigned, kernel-stamped
+  principal (default `PROGRAM_NAME`), and wires NO enforcement (enforcement-inert: the 23-PASS
+  battery is byte-identical; K1 emits its own `:: K1-atr: ::` line, not a `-> PASS`). Persist +
+  mount-rebuild + enforcement are M2/M3/M4, seat-gated.
+- **Tested (QEMU):** `check` green both arches (zero x86 change); `kernel8` compiles baremetal;
+  `kernel8-test 40` → **23 PASS byte-identical** (sorted diff vs base `f2ad34c`) + CAPSTONE 6/6 +
+  F2-witness (240000/240000 locked) + F3-witness (240000/240000 locked) + `:: K1-atr: codec PASS …
+  on-disk helpers disk PASS … ENFORCEMENT-INERT ::`, zero R1/CMD13; `test-arm 30` MISSION SUCCESS.
+- **Metal:** the disk round-trip creates a real `UNAFS.ATR` on the card (valid, empty/all-public) —
+  metal-verify at the next attended bench (a fresh-card re-prep should delete `UNAFS.ATR` too).
+- **Detail:** [`SECURITY.md` §K1 M1](SECURITY.md) (the full design section: principal proposal,
+  format, fail-closed asymmetry, lock discipline, seat question). **Commit:** the single K1 M1
+  commit on `hw-pi4` (see `git log`).
+
 ## hw-jetson track — 2026-07-10 (JD4 — read-side navigation + last dead levers + screen-on-boot; same-day attended bench)
 
 ### JD4 — `ls <dir>` / `cd` / `pwd` / `cat <path>` on the panel shell + JB2c/JB9b lever retirement + screen-on-boot ✅ METAL-CONFIRMED (2026-07-10) `hw-jetson`
