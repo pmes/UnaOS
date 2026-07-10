@@ -530,15 +530,19 @@ test_kernel8() {
     local SDIMG="${UNAOS_SDIMG:-${WORKSPACE_DIR}/target/UnaOS-pi4-baremetal.img}"
     local SD_DRIVE=""
     [ "$SDIMG" != "0" ] && SD_DRIVE="-drive if=sd,format=raw,file=${SDIMG}"
+    # QMP port: default 4463, overridable (UNAOS_QMP_PORT) and auto-bumped past ports already in
+    # use — parallel worktree sessions (hybrid mode) each run their own QEMU and MUST NOT collide.
+    local qmp_port="${UNAOS_QMP_PORT:-4463}"
+    while lsof -iTCP:"$qmp_port" -sTCP:LISTEN >/dev/null 2>&1; do qmp_port=$((qmp_port + 1)); done
     qemu-system-aarch64 \
         -machine raspi4b \
         -kernel "$KERNEL8_DIR/kernel8.img" \
         -serial "file:${logf}" -serial null -display none \
         ${SD_DRIVE} \
-        -qmp tcp:127.0.0.1:4463,server,nowait \
+        -qmp tcp:127.0.0.1:${qmp_port},server,nowait \
         ${UNAOS_QEMU_EXTRA:-} &
     local qpid=$!
-    python3 "${WORKSPACE_DIR}/scripts/qmp_shoot.py" --port 4463 --wait "$((secs - 1))" --out "$png" 2>/dev/null || sleep "$secs"
+    python3 "${WORKSPACE_DIR}/scripts/qmp_shoot.py" --port "$qmp_port" --wait "$((secs - 1))" --out "$png" 2>/dev/null || sleep "$secs"
     kill "$qpid" 2>/dev/null || true
     wait "$qpid" 2>/dev/null || true
     echo -e "${COLOR_GREEN}✅ Serial:${COLOR_RESET} ${logf}    ${COLOR_GREEN}Screen:${COLOR_RESET} ${png}"
@@ -645,7 +649,7 @@ battery() {
     _step "pi4 kernel8-test 35"        "CAPSTONE COMPLETE"   "$blog_dir/kernel8.log:target/serial-pi.log" "$0" kernel8-test 35
     _step "esp-jetson (links)"         ""                    "$blog_dir/esp-jetson.log"   env UNAOS_TEGRA=1 "$0" esp-jetson
 
-    local passes; passes=$(awk '/-> PASS|: PASS/{n++} END{print n+0}' "$blog_dir/test-fat.log" target/serial-pi.log 2>/dev/null)
+    local passes; passes=$(awk '/-> PASS|: PASS/{n++} END{print n+0}' "$blog_dir/test-fat.log" target/serial-pi.log 2>/dev/null || echo '?')
     echo -e "\n${COLOR_PURPLE}════════════ BATTERY SUMMARY ($(( SECONDS - t0 ))s) ════════════${COLOR_RESET}"
     echo -e "$results"
     echo "  PASS lines (fat+pi): $passes   step logs: $blog_dir/"
