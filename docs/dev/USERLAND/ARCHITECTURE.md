@@ -60,6 +60,7 @@ message bus, a selection of handlers, and a GUI window.
 | --- | --- |
 | `lumen` | AI-centric companion. The reference GUI vessel. |
 | `pulse` | System monitor: numbered per-core CPU segment bars (BeOS Pulse heir). Host sampler behind the `PulseSource` seam; a UnaOS-kernel telemetry feed is the banked replacement source. |
+| `phonolite` | Tone vessel: the resonance engine given a face — start/stop, log-scale frequency + gain sliders (quartzite's first input-control surface, `tone_panel`), bus-routed level ladder. Domain logic lifts to `stria` when it becomes a real handler. |
 | `una` | Code-focused IDE. **Currently parked** (excluded from the workspace build). |
 | `facet` | Image / raster viewer. |
 | `apps/cli/*` | Command-line tools: `unafs`, `vertex`, `sentinel`, `unafs_bench`. |
@@ -179,6 +180,7 @@ topology and republishes `MatrixEvent::TopologyMutated` when the tree changes.
 | Quartzite Windows / `unaos` backends | Not implemented |
 | Lumen vessel | Implemented |
 | Pulse vessel (system monitor) | Implemented (macOS backend) |
+| Phonolite vessel (tone generator) | Implemented (macOS backend; resonance engine honest — device-rate graph, live command path, level readback) |
 | Una vessel (IDE) | Parked |
 | Elessar snapshot / packaging pipeline | Not implemented (detection only) |
 

@@ -33,9 +33,15 @@ Responsibilities:
   `process(inputs, outputs, context)` over `[Sample; BLOCK_SIZE]` buffers, plus an
   optional `set_param(id, value)`. `GraphContext` carries the sample rate (and its
   reciprocal) into each node.
-- **`AudioEngine`** (`audio.rs`) — `AudioEngine::new(graph)` moves the graph into a
-  `cpal` output stream and returns the engine together with a producer handle for
-  sending commands. The engine must be kept alive to keep audio running.
+- **`AudioEngine`** (`audio.rs`) — `AudioEngine::new(graph)` re-tunes the graph to
+  the device's real sample rate, moves it into a `cpal` output stream, and returns
+  the engine together with a [`ResonanceHandle`]. The engine must be kept alive to
+  keep audio running.
+- **`ResonanceHandle` / `ResonanceMeter`** (`audio.rs`) — the nameable control-side
+  face of a running engine: `set_frequency`, `set_param`, `stop`/`start`,
+  `is_active`, and `level()` (the per-block output peak the callback publishes via
+  an atomic). `handle.meter()` clones out a `Send` read-only probe for cadence
+  tasks, so a GUI can hold the handle in a field and meter from elsewhere.
 - **`AudioCommand`** (`commands.rs`) — the messages the control thread sends to the
   audio thread: `SetParam { node_id, param_id, value }`, `SetMasterFrequency`, and
   `Stop`.
