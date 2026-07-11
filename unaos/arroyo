@@ -487,6 +487,11 @@ kernel8() {
         [ -s "$out" ] || { echo -e "${COLOR_RED}ERROR: ${b}.bin missing/empty — K2 blob build failed${COLOR_RESET}"; exit 1; }
         sz="$(wc -c < "$out" | tr -d ' ')"
         [ "$sz" -le 4096 ] || { echo -e "${COLOR_RED}ERROR: ${b}.bin ${sz} bytes > USER_CODE_SIZE (4096)${COLOR_RESET}"; exit 1; }
+        # Entry-first assertion (the hello-blob discipline): the kernel enters the flat image at offset 0, so a
+        # toolchain reorder putting a non-entry byte first is a metal-only wrong-entry fault QEMU won't catch.
+        # Both K2 blobs' _start begins `mov x23, xzr` = 0xAA1F03F7 = little-endian bytes f7 03 1f aa. Assert it.
+        head4="$(head -c 4 "$out" | od -An -tx1 | tr -d ' \n')"
+        [ "$head4" = "f7031faa" ] || { echo -e "${COLOR_RED}ERROR: ${b}.bin does not start with _start (mov x23,xzr); first 4 bytes = ${head4}${COLOR_RESET}"; exit 1; }
     done
     echo -e "${COLOR_GREEN}✅ K2 EL0 programs: owner_blob.bin ($(wc -c < "${WORKSPACE_DIR}/target/owner_blob.bin" | tr -d ' ') B) + imp_blob.bin ($(wc -c < "${WORKSPACE_DIR}/target/imp_blob.bin" | tr -d ' ') B)${COLOR_RESET}"
 

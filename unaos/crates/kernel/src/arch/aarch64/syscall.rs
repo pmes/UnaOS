@@ -9929,15 +9929,20 @@ fn k2_liveenf_launcher(demo_cpu: usize) {
         return; // no SD -> the proof loads/creates real files; skip silently (the control-path discipline)
     }
     // Pre-flight: the two programs must be on the card; K2PRIV.BIN must be ABSENT (a stale copy from an
-    // interrupted run would confound the create). Clean a stale K2PRIV.BIN first (metal card hygiene).
+    // interrupted run would confound the create). Clean a stale K2PRIV.BIN FIRST — BEFORE the program-presence
+    // check — because the gate is now LIVE: `atr_maybe_boot_rebuild` reinstalls K2PRIV.BIN's persisted sentinel
+    // row at EVERY boot as long as the file exists, and it never checks that the owning program is present. If a
+    // program later went missing (a partial re-flash) after an interrupted run left K2PRIV.BIN, a program-presence
+    // early-return would strand that reinstalled row forever — violating the self-clean invariant. Cleaning the
+    // stale file unconditionally here neutralizes it (the reinstall-able case is exactly file-present).
     match crate::fs::fat::mount() {
         Ok(fs) => {
+            if fs.find_in_root(K2_PRIV_NAME).is_ok() {
+                k2_cleanup(); // a stale private file from an interrupted run (+ its boot-reinstalled owner row)
+            }
             if fs.find_in_root(K2_OWN_NAME).is_err() || fs.find_in_root(K2_IMP_NAME).is_err() {
                 serial_println!(":: K2-liveenf: K2OWN.BIN/K2IMP.BIN not on card — live-enforcement demo skipped ::");
                 return;
-            }
-            if fs.find_in_root(K2_PRIV_NAME).is_ok() {
-                k2_cleanup(); // a stale private file from an interrupted run
             }
         }
         Err(_) => return, // unmountable -> skip silently
