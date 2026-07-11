@@ -533,7 +533,7 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
             }
         },
         "touch" => {
-            // JD5: create a 0-length ROOT file if absent (idempotent). `touch <path>`.
+            // JD6: create a 0-length file if absent (idempotent), in any reachable dir. `touch <path>`.
             match args.first() {
                 None => console.println("usage: touch <path>"),
                 Some(name) => fs_touch(console, name),
@@ -547,7 +547,7 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
             }
         },
         "rm" | "del" => {
-            // JD5: delete a ROOT file. `rm <path>`.
+            // JD6: delete a file in any reachable dir (directory → -EISDIR). `rm <path>`.
             match args.first() {
                 None => console.println("usage: rm <path>"),
                 Some(name) => fs_rm(console, name),
