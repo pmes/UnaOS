@@ -92,12 +92,17 @@ pub fn on_scroll(bytes: u64, src_base: usize) {
     }
 }
 
-/// Serial-only print: the UART leg of `arch::serial::_print` WITHOUT the fbcon/FTDI/selftest
-/// mirrors. Two reasons this must not touch fbcon: (1) `on_scroll` fires while the FBCON lock is
-/// held — a mirrored line would try to draw (and possibly scroll) recursively; (2) counter values
-/// on screen would differ between the pre- and post-M3 runs and break the screendump compare.
-/// `try_lock` + skip, IRQ-masked — safe from any print context (the serial lock is NOT held when
-/// fbcon draws: `serial::_print` writes the UART and releases before mirroring to fbcon).
+/// Serial-only print: the UART leg AND the FTDI boot-capture-ring leg of `arch::serial::_print`,
+/// but NEVER the fbcon or selftest mirrors. Two reasons this must not touch fbcon: (1) `on_scroll`
+/// fires while the FBCON lock is held — a mirrored line would try to draw (and possibly scroll)
+/// recursively; (2) counter values on screen would differ between the pre- and post-M3 runs and
+/// break the screendump compare. `try_lock` + skip, IRQ-masked — safe from any print context (the
+/// serial lock is NOT held when fbcon draws: `serial::_print` writes the UART and releases before
+/// mirroring). VPERF-OBS: the FTDI ring leg is what makes these readout lines (fbmem/display/
+/// scenario) VISIBLE on a metal rMBP, where `SERIAL1` is `None` (no 16550 — the FTDI console is why)
+/// so the UART leg alone drops them silently; `ftdi::mirror` is `try_lock`-only + never takes the
+/// FBCON lock, so both constraints above still hold. In QEMU (`SERIAL1` present) the UART leg already
+/// reaches `serial.log` and the ring is not replayed there, so QEMU logs are byte-unchanged.
 fn raw_print(args: core::fmt::Arguments) {
     use core::fmt::Write;
     crate::arch::without_interrupts(|| {
@@ -106,6 +111,8 @@ fn raw_print(args: core::fmt::Arguments) {
                 let _ = uart.write_fmt(args);
             }
         }
+        // The SAME leg 3 `serial::_print` uses (never legs 2/4 = fbcon/selftest) — metal visibility.
+        crate::drivers::xhci::ftdi::mirror(args);
     });
 }
 
