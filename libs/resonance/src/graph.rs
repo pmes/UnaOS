@@ -92,6 +92,18 @@ impl AudioGraph {
         inputs[input_index] = Some(src);
     }
 
+    /// Re-tunes the graph to a new sample rate.
+    ///
+    /// Every node reads the rate from the shared [`GraphContext`] on each
+    /// `process` call, so this takes effect from the next processed block.
+    /// [`crate::AudioEngine::new`] calls this with the real device rate before
+    /// the graph moves into the audio callback — a graph built against a
+    /// default rate (e.g. [`crate::create_test_graph`]'s 44 100 Hz) is
+    /// corrected at engine start rather than playing detuned.
+    pub fn set_sample_rate(&mut self, sample_rate: Sample) {
+        self.context = GraphContext::new(sample_rate);
+    }
+
     /// Sets a parameter on a specific node.
     ///
     /// This delegates the call to the node's `set_param` method.

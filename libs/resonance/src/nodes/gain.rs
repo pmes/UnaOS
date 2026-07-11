@@ -76,4 +76,28 @@ impl AudioNode for Gain {
             }
         }
     }
+
+    fn set_param(&mut self, id: usize, value: f64) {
+        match id {
+            // Param 0: Base gain
+            0 => self.base_gain = value,
+            _ => {}
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_gain_set_param() {
+        let mut gain = Gain::new(0.1);
+        assert_eq!(gain.base_gain, 0.1);
+        gain.set_param(0, 0.5);
+        assert_eq!(gain.base_gain, 0.5);
+        // Unknown params are ignored.
+        gain.set_param(7, 9.0);
+        assert_eq!(gain.base_gain, 0.5);
+    }
 }

@@ -60,9 +60,14 @@ for the vessel/handler/library model.
 
 ## Status
 
-Partial — early prototype. The graph evaluation, the built-in oscillator/gain/mixer
+Partial — honest prototype. The graph evaluation, the built-in oscillator/gain/mixer
 nodes, the `cpal` output path, and the FFT are implemented and unit-tested. The
-command path is wired end to end but the handlers in `process_commands` are
-currently stubbed (parameter application is commented out), and `publish` only logs
-rather than driving a real transport. Graph evaluation requires nodes to be added in
-topological order and supports only forward (non-feedback) connections.
+engine re-tunes the graph to the real device sample rate at start (a 440 Hz patch
+plays true 440 Hz on a 48 kHz device), and the command path is live end to end:
+frequency, arbitrary node params, and stop/start all reach the audio thread through
+the lock-free ring, with a per-block peak level readable from the control side via
+`ResonanceHandle`/`ResonanceMeter`. `BandyMember::publish` and `process_frame`
+remain dead code — `publish` only logs, nothing calls `process_frame`; wiring the
+engine to the Synapse for real is the stria handler arc (AV-A2). Graph evaluation
+requires nodes to be added in topological order and supports only forward
+(non-feedback) connections.
