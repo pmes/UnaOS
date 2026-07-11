@@ -680,6 +680,21 @@ show_menu() {
 # --- Full battery: the one-command merge-window suite (seat runs this before every merge) ---
 # Runs every gate serially, prints one ✅/❌ verdict line per step, exits nonzero on any failure.
 # Verdicts come from the serial logs (read with awk — control bytes break plain grep).
+
+# The ledgered test-fat one-line console drop (unaos-hazards; 4 battery re-run cycles on
+# 2026-07-11 alone): under battery load the best-effort console intermittently drops ONE
+# verdict line — always with ZERO explicit FAIL lines. On exactly that signature, re-run the
+# FAT chain once in isolation and let the appended re-run's verdicts stand; a log carrying any
+# real "-> FAIL"/"FAIL ::" line keeps its red (no retry). All output flows through _step's
+# capture, so the pattern + FAIL scans below see the COMBINED log (the PASS-line tally in the
+# summary inflates on a retry day — informational only, the retry announcement line explains).
+test_fat_drop_retry() { # $1 = the logfile _step is capturing (READ here, written via stdout)
+    if "$0" test-fat sf 300; then return 0; fi
+    if ! awk 'BEGIN{f=0} /-> FAIL|FAIL ::/{f=1} END{exit f}' "$1"; then return 1; fi
+    echo "battery: test-fat missed its verdict with ZERO FAIL lines — the ledgered console drop; ONE isolated re-run"
+    UNAOS_FATIMG=sf "$0" test 200
+}
+
 battery() {
     local t0=$SECONDS rc=0 results=""
     local blog_dir="target/battery"; mkdir -p "$blog_dir"
@@ -707,7 +722,7 @@ battery() {
     _step "check (both arches)"        ""                    "$blog_dir/check.log"        "$0" check
     _step "check (tegra)"              ""                    "$blog_dir/check-tegra.log"  env UNAOS_TEGRA=1 "$0" check
     _step "x86 test 25 (MISSION)"      "MISSION SUCCESS"     "$blog_dir/test-x86.log"     "$0" test 25
-    _step "x86 test-fat sf 300"        "U11m2.*-> PASS"      "$blog_dir/test-fat.log"     "$0" test-fat sf 300
+    _step "x86 test-fat sf 300"        "U11m2.*-> PASS"      "$blog_dir/test-fat.log"     test_fat_drop_retry "$blog_dir/test-fat.log"
     _step "arm virt v2 (MISSION)"      "MISSION SUCCESS"     "$blog_dir/test-arm-v2.log"  "$0" test-arm 22
     _step "arm virt v3 (CAPSTONE 6/6)" "CAPSTONE COMPLETE"   "$blog_dir/test-arm-v3.log"  env UNAOS_GICV3=1 "$0" test-arm 40
     _step "pi4 kernel8-test 35"        "CAPSTONE COMPLETE"   "$blog_dir/kernel8.log:target/serial-pi.log" "$0" kernel8-test 35
