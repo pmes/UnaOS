@@ -72,3 +72,10 @@ PENDING vperf: scenario done
 
 # --- zero faults (defaults -> FAIL / FAIL :: / PANIC always on) ----------------------
 FORBID EXCEPTION:
+
+# --- STOR-1 S5 (landed 2026-07-11, never on metal — the bench build is knob-ON so these
+# --- fire on Boot 1; promote to REQUIRE after first capture) ---------------------------
+PENDING S5: cross-process read serves LIVE shared backing
+# The service-task boot line gained ", PRIO_HIGH" — the existing REQUIRE prefix still matches.
+# u6gx's unchanged PASS line is now ALSO the deadlock-closure witness knob-on-FAT (a u6gx
+# hang/FAIL here = the S5 scheduler fix or the service core's LVT timer, NOT plain ACL).

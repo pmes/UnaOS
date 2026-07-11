@@ -43,3 +43,9 @@ OPTIONAL S3: synchronous write-through.*-> PASS
 # --- forbidden: any CPL-0 fault diagnostic (defaults -> FAIL / FAIL :: / PANIC are
 # --- always on; ring-3 intentional faults print nothing — verified on a clean run) --
 FORBID EXCEPTION:
+
+# --- STOR-1 S5 shared-backing witness (knob-ON only — the default sf run is knob-OFF, so
+# --- OPTIONAL here; a dedicated knob-on spec is a ledgered tooling candidate. Knob-on FAT
+# --- ideal PASS count = 25 incl. S5; the S5 FAIL text evades arroyo's detector, so witness
+# --- PRESENCE is the real gate on knob-on runs — seat fold at the S5 merge, 2026-07-11) ----
+OPTIONAL S5: cross-process read serves LIVE shared backing
