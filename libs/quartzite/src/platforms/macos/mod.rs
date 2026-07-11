@@ -16,6 +16,7 @@ use objc2_app_kit::{
 use objc2_foundation::{MainThreadMarker, NSObjectProtocol};
 use std::cell::RefCell;
 
+pub mod meter;
 pub mod spline;
 pub mod window_chrome;
 pub mod workspace;
@@ -35,6 +36,17 @@ type BootstrapFn = Box<
     ) + 'static,
 >;
 
+// The single-view vessel bootstrapping closure (see [`Backend::new_vessel`]).
+type VesselBootstrapFn = Box<dyn FnOnce(&NSWindow) -> Retained<NSView> + 'static>;
+
+/// Configuration for a single-view vessel window (title + initial content size +
+/// the closure that builds its one content view).
+struct VesselConfig {
+    title: String,
+    content_size: (f64, f64),
+    build_view: VesselBootstrapFn,
+}
+
 // -----------------------------------------------------------------------------
 // APP DELEGATE
 // -----------------------------------------------------------------------------
@@ -44,6 +56,10 @@ struct AppDelegateIvars {
     app_state: RefCell<Option<std::sync::Arc<std::sync::RwLock<bandy::state::AppState>>>>,
     rx_synapse: RefCell<Option<tokio::sync::broadcast::Receiver<bandy::SMessage>>>,
     workspace_state: RefCell<Option<bandy::state::WorkspaceState>>,
+
+    // Single-view vessel path (mutually exclusive with `bootstrap` above)
+    vessel: RefCell<Option<VesselConfig>>,
+    vessel_view: RefCell<Option<Retained<NSView>>>,
 
     window: RefCell<Option<Retained<NSWindow>>>,
     // Holding the delegate to prevent dropping
@@ -68,6 +84,9 @@ define_class!(
                 app_state: RefCell::new(None),
                 rx_synapse: RefCell::new(None),
                 workspace_state: RefCell::new(None),
+
+                vessel: RefCell::new(None),
+                vessel_view: RefCell::new(None),
 
                 window: RefCell::new(None),
                 window_delegate: RefCell::new(None),
@@ -144,6 +163,26 @@ define_class!(
                 main_menu.addItem(&edit_menu_item);
 
                 NSApplication::sharedApplication(mtm).setMainMenu(Some(&main_menu));
+            }
+
+            // 0.5 Single-view vessel path: a plain titled window holding one custom view.
+            // Mutually exclusive with the workspace bootstrap below (see `Backend::new_vessel`).
+            if let Some(vessel) = self.ivars().vessel.borrow_mut().take() {
+                let (window, window_delegate) =
+                    window_chrome::create_vessel_window(mtm, &vessel.title, vessel.content_size);
+
+                let view = (vessel.build_view)(&window);
+                window.setContentView(Some(&view));
+
+                *self.ivars().vessel_view.borrow_mut() = Some(view);
+                *self.ivars().window.borrow_mut() = Some(window.clone());
+                *self.ivars().window_delegate.borrow_mut() = Some(window_delegate);
+
+                window.makeKeyAndOrderFront(None::<&AnyObject>);
+                unsafe {
+                    let _: () = msg_send![&window, center];
+                }
+                return;
             }
 
             // 1. Create the native window through our chrome abstraction
@@ -233,6 +272,34 @@ impl Backend {
         *delegate.ivars().app_state.borrow_mut() = Some(app_state);
         *delegate.ivars().rx_synapse.borrow_mut() = Some(rx_synapse);
         *delegate.ivars().workspace_state.borrow_mut() = Some(workspace_state);
+
+        Self { delegate }
+    }
+
+    /// The lightweight sibling of [`Backend::new`] for single-view vessels.
+    ///
+    /// Where `new` boots the full workspace chrome (toolbar, sidebar, comms panes),
+    /// `new_vessel` opens one plain titled window whose entire content is the view
+    /// returned by `build_view`. The closure runs on the main thread once AppKit has
+    /// finished launching; anything the view needs (a Synapse receiver, shared state)
+    /// is captured by the closure — the vessel stays in charge of its own wiring.
+    pub fn new_vessel<F>(
+        _app_id: &str,
+        title: &str,
+        content_size: (f64, f64),
+        build_view: F,
+    ) -> Self
+    where
+        F: FnOnce(&NSWindow) -> Retained<NSView> + 'static,
+    {
+        let delegate: Allocated<AppDelegate> = unsafe { msg_send![AppDelegate::class(), alloc] };
+        let delegate: Retained<AppDelegate> = unsafe { msg_send![delegate, init] };
+
+        *delegate.ivars().vessel.borrow_mut() = Some(VesselConfig {
+            title: title.to_string(),
+            content_size,
+            build_view: Box::new(build_view),
+        });
 
         Self { delegate }
     }

@@ -46,6 +46,8 @@ pub type NativeWindow = objc2_app_kit::NSWindow;
 pub type NativeView = objc2::rc::Retained<objc2_app_kit::NSView>;
 #[cfg(target_os = "macos")]
 pub use platforms::macos::Backend;
+#[cfg(target_os = "macos")]
+pub use platforms::macos::meter;
 
 // --- Windows 11+ (WinUI/Win32) ---
 #[cfg(target_os = "windows")]
