@@ -2626,6 +2626,37 @@ fn sys_write_file(row: usize, file_id: u64, buf: u64, len: u64) -> i64 {
             return n as i64;
         }
     }
+    // STOR-1 S4: an IN-PLACE write to a CREATED/growable file (`FILE_OPNAME != 0`, within EOF — the grow
+    // branch at the top of this fn already handled a past-EOF write) ALSO writes THROUGH synchronously
+    // knob-on: the file is on disk (S4a create + S4b grow), so persist the overwrite in place via `write_at`
+    // and MIRROR it into wstage (reads still serve wstage this arc; S5 makes reads read shared backing).
+    // WITHOUT this the write would land only in wstage + `mark_dirty`, and the created/grown teardown flush
+    // is DISABLED knob-on (`clear_files_row`'s `!s4_sync_storage()` guard), silently DROPPING an
+    // acknowledged write on remount — a knob-on durability regression the grow-only demos never exercise.
+    // The name resolves via `U10_NAMES` (created/growable files are not in `STAGED_NAMES`).
+    #[cfg(feature = "irqstorage")]
+    if FILE_OPNAME[row][idx].load(Ordering::Acquire) != 0 && s4_sync_storage() {
+        if let Some(nameid) = (FILE_OPNAME[row][idx].load(Ordering::Acquire) as usize).checked_sub(1) {
+            if nameid < N_U10_NAMES {
+                let name = U10_NAMES[nameid];
+                let mut kbuf = [0u8; PAGE_SIZE as usize];
+                unsafe {
+                    core::ptr::copy_nonoverlapping(buf as *const u8, kbuf.as_mut_ptr(), want);
+                }
+                let n = unsafe {
+                    crate::drivers::xhci::irqstorage::submit_write_file(
+                        name.as_bytes(), offset, kbuf.as_mut_ptr(), want,
+                    )
+                };
+                if n < 0 {
+                    return EIO;
+                }
+                let w = (n as usize).min(want);
+                wstage_write_at(widx, offset as usize, buf, w); // keep wstage coherent (reads serve it)
+                return w as i64; // no mark_dirty — already on disk
+            }
+        }
+    }
     // Pure memcpy: user bytes -> the writable staging buffer at [offset, offset+want). The ring-3 VA equals the
     // kernel VA in the live CR3 (the sys_write/sys_read discipline), and offset+want <= size <= the buffer
     // length (WSTAGE is seeded to `size` at open), so the store stays inside the descriptor's own buffer.
@@ -2666,6 +2697,41 @@ fn sys_write_grow(row: usize, idx: usize, widx: usize, size: u32, offset: u32, b
     }
     let new_end = offset + want as u32; // <= PAGE_SIZE by the clamp above
     debug_assert!(new_end as usize <= page && new_end > offset, "grow: new_end out of range");
+    // STOR-1 S4b: knob-on, GROW the file SYNCHRONOUSLY on the live volume via the storage service task —
+    // out of the IF-masked handler (`fat::write_grow`: alloc + zero-fill + chain, RMW the data, bump the dir
+    // size LAST) — retiring the deferred U10 Grow op + its causal-fidelity gap. Persist to DISK FIRST; only
+    // on success mirror the extend into the descriptor's wstage + FILE_SIZE (reads still serve wstage this
+    // arc, S5 makes them read shared backing), so a disk failure (`-EIO`) leaves the descriptor UNCHANGED
+    // (never in-memory-ahead-of-disk). Nothing is marked dirty — the write is already durable, so the
+    // teardown flush is a no-op (`clear_files_row` also skips the enqueue knob-on). The on-disk `de.size`
+    // equals this descriptor's `size` (both created 0-length / staged then grown synchronously in lockstep),
+    // so `write_grow` grows from the same base the syscall clamped against.
+    #[cfg(feature = "irqstorage")]
+    if s4_sync_storage() {
+        if let Some(nameid) = (FILE_OPNAME[row][idx].load(Ordering::Acquire) as usize).checked_sub(1) {
+            if nameid < N_U10_NAMES {
+                let name = U10_NAMES[nameid];
+                let mut kbuf = [0u8; PAGE_SIZE as usize];
+                unsafe {
+                    core::ptr::copy_nonoverlapping(buf as *const u8, kbuf.as_mut_ptr(), want);
+                }
+                let n = unsafe {
+                    crate::drivers::xhci::irqstorage::submit_grow(name.as_bytes(), offset, kbuf.as_mut_ptr(), want)
+                };
+                if n < 0 {
+                    return EIO; // disk grow failed -> descriptor untouched
+                }
+                let w = (n as usize).min(want); // bytes actually persisted (== want on a full write)
+                let end2 = offset + w as u32;
+                wstage_write_at(widx, off, buf, w);
+                wstage_set_len_at_least(widx, end2);
+                FILE_SIZE[row][idx].store(core::cmp::max(size, end2), Ordering::Release);
+                FILE_GREW[row][idx].store(true, Ordering::Release);
+                FILE_OFFSET[row][idx].store(end2, Ordering::Release); // offset LAST (size-before-offset)
+                return w as i64; // no mark_dirty — already on disk
+            }
+        }
+    }
     // Copy the bytes into the buffer, THEN publish the extended length + size (Release) — a reader sees the
     // appended tail only after it exists. Size before offset; mark_dirty covers exactly [offset, new_end).
     wstage_write_at(widx, off, buf, want);
@@ -2816,7 +2882,11 @@ fn sys_unlink(handle: u64) -> i64 {
     // claimed, so the ACL row dies exactly when the name does.
     owned_clear(nameid);
     let mut heldslot = 0u32; // +1-biased queue slot of the held op (0 == none)
-    if HELLO_STAGED.load(Ordering::Acquire) {
+    // Knob-off / no-FAT: enqueue the deferred CreateGrowDelete op HELD (a self-contained COPY of the file's
+    // bytes; released at the LAST close). STOR-1 S4c: knob-on, the file is ALREADY ON DISK (S4a create + S4b
+    // grow) and the DELETE runs SYNCHRONOUSLY at the last close (`openf_release`), so NOTHING is enqueued
+    // (heldslot stays 0) — the U10 op-queue + its launcher-replay causal-fidelity gap are RETIRED when on.
+    if !s4_sync_storage() && HELLO_STAGED.load(Ordering::Acquire) {
         let size = FILE_SIZE[row][idx].load(Ordering::Acquire) as usize;
         let slot = match (FILE_WSTAGE[row][idx].load(Ordering::Acquire) as usize).checked_sub(1) {
             Some(w) => {
@@ -3966,6 +4036,23 @@ static FILE_CREATED: [[AtomicBool; NFILE]; crate::arch::memory::USER_SLOTS + 1] 
 static DYN_DELETED_G: [AtomicBool; N_U10_NAMES] =
     [const { AtomicBool::new(false) }; N_U10_NAMES];
 
+/// STOR-1 S4: is the interrupt-driven SYNCHRONOUS-storage path active for created-file mutations
+/// (grow/create/delete)? True iff the `irqstorage` knob is on, a FAT volume is mounted (`HELLO_STAGED`),
+/// AND the storage service task is up (`service_ready()`). When true, `open_create_new`/`sys_write_grow`/
+/// the last-close delete drive `fat.rs` SYNCHRONOUSLY via the service task (out of the IF-masked handler),
+/// and the U10x deferred op-queue is NOT used. When false — knob off, no FAT (the in-memory core), or the
+/// service not yet up — every mutation takes the deferred op-queue / in-memory path BYTE-IDENTICALLY to
+/// pre-S4. The service task provably starts (main loop) before any created-file fixture runs, so this is
+/// stable (monotonic) across a fixture's create/grow/unlink and its launcher's later verdict.
+#[cfg(feature = "irqstorage")]
+fn s4_sync_storage() -> bool {
+    HELLO_STAGED.load(Ordering::Acquire) && crate::drivers::xhci::irqstorage::service_ready()
+}
+#[cfg(not(feature = "irqstorage"))]
+fn s4_sync_storage() -> bool {
+    false
+}
+
 // --- U11x M2: the GLOBAL open-file refcount table — the x86 twin of pi4 U11 M2's `OPEN_FILES`
 // (`SpinMutex<[OpenFileRow; 16]>` keyed by the on-disk `(dir_lba, dir_off)`). x86's created-file identity space
 // is the STATIC `U10_NAMES` table, so the table is indexed DIRECTLY by name-id — no row allocation, no join, and
@@ -4001,22 +4088,74 @@ fn openf_incref(nameid: usize) {
 /// `DYN_DELETED_G` so the name is re-creatable. Atomics only — safe from the IF-masked syscall handler AND the
 /// IF=0 teardown path (`clear_files_row`), exactly the two callers. Defensive on underflow (a pairing bug):
 /// restore 0 and return, never wrap (a wrapped count would strand a held op for the boot).
-fn openf_decref(nameid: usize) {
+fn openf_decref(nameid: usize) -> bool {
     debug_assert!(nameid < N_U10_NAMES, "openf_decref: bad name-id");
     let prev = OPENF_REFS[nameid].fetch_sub(1, Ordering::AcqRel);
     if prev == 0 {
         // Defensive: unpaired decref — undo the wrap without clobbering a concurrent legitimate incref
         // (a plain store(0) could erase it; the CAS only repairs the exact wrapped value).
         let _ = OPENF_REFS[nameid].compare_exchange(u32::MAX, 0, Ordering::AcqRel, Ordering::Acquire);
-        return;
+        return false;
     }
     if prev == 1 && OPENF_PENDING[nameid].swap(false, Ordering::AcqRel) {
         // Last close of an unlinked file — release its deferred DELETE.
-        match (OPENF_HELDSLOT[nameid].swap(0, Ordering::AcqRel) as usize).checked_sub(1) {
+        let held = OPENF_HELDSLOT[nameid].swap(0, Ordering::AcqRel);
+        // STOR-1 S4c: knob-on, the unlinked file is ALREADY ON DISK (S4a create + S4b grow) and `sys_unlink`
+        // enqueued NO op (`held == 0`) — the deferred DELETE runs SYNCHRONOUSLY here at the last close. But
+        // this function is pure atomics precisely because it is callable from an IF=0 self-teardown, where
+        // blocking on the service task is unsafe; so it does NOT block itself — it SIGNALS the caller
+        // (`openf_release`, which knows its context) to perform the on-disk delete, and LEAVES `DYN_DELETED_G`
+        // SET meanwhile so no re-create of the name can alias the still-present on-disk file. Returns true ==
+        // "the caller must now perform the on-disk delete and clear the flag".
+        #[cfg(feature = "irqstorage")]
+        if s4_sync_storage() {
+            debug_assert!(held == 0, "S4c: synchronous unlink should not have enqueued a held op");
+            return true;
+        }
+        // Knob-off / no-FAT: the existing in-memory / deferred-op release (byte-identical).
+        match (held as usize).checked_sub(1) {
             Some(k) => U10_HELD[k].store(false, Ordering::Release), // op now drainable at the launcher's IF=1
             None => DYN_DELETED_G[nameid].store(false, Ordering::Release), // no queued op — delete completes now
         }
     }
+    false
+}
+
+/// STOR-1 S4c: the last-close release for created file `nameid` — decref, and if that was the last close of
+/// an unlink-PENDING file whose deferred on-disk DELETE must now run SYNCHRONOUSLY (knob-on), perform it via
+/// the storage service task. `can_block` MUST be true only where the caller can block on the service task:
+/// `files_free` (always — a syscall handler, or the launcher's direct call), and `clear_files_row` only when
+/// its teardown is NOT the current task's own IF=0 `exit`/reap (it proves this via `current_user_cr3`).
+/// Knob-off / no-FAT: a pure-atomic decref (`openf_decref` returns false) — byte-identical to pre-S4.
+fn openf_release(nameid: usize, can_block: bool) {
+    let need_delete = openf_decref(nameid);
+    #[cfg(feature = "irqstorage")]
+    if need_delete {
+        if can_block {
+            let name = U10_NAMES[nameid];
+            // A wedged transfer surfaces as -EIO; the launcher pre-flight self-heal owns on-disk cleanup on
+            // the next run, so clear the flag regardless (matching the deferred drain's unconditional clear) —
+            // the name is logically deleted and must not be left un-re-creatable.
+            let _ = unsafe { crate::drivers::xhci::irqstorage::submit_delete(name.as_bytes()) };
+            DYN_DELETED_G[nameid].store(false, Ordering::Release);
+        } else {
+            // A last-close release in a NON-blocking teardown context (an IF=0 `exit`/reap of the current
+            // task). REACHABLE — NOT by the unlinking process (its descriptors were swept at unlink), but by
+            // ANOTHER process that opened the file cross-process (a U6 grantee / an O_PUBLIC sharer — the
+            // u6gx/u11m2 pattern) and became the LAST holder, then EXITS or FAULTS without an explicit
+            // SYS_CLOSE. Blocking on the service task here is unsafe (the task's CR3 is being freed / there is
+            // no current task to switch away from). So DEFER the delete the IF=0-safe way — the knob-off
+            // mechanism: enqueue a `U10OP_DELETE` op (the file is on disk; no bytes needed) that a launcher's
+            // IF=1 drain completes, clearing `DYN_DELETED_G` then — and leave the flag SET meanwhile so no
+            // re-create aliases the still-present on-disk file. Best-effort completion (if no drain runs before
+            // boot end the op strands, leaving the name blocked + a chkdsk-reclaimable orphan — fail-safe, no
+            // corruption); the clean fix (shared on-disk backing so reads/deletes need no per-holder blocking)
+            // is S5. Pure atomics + a 0-byte memcpy — IF=0-safe.
+            u10_flush_enqueue(U10OP_DELETE, nameid as u32, 0, &[], false);
+        }
+    }
+    #[cfg(not(feature = "irqstorage"))]
+    let _ = (need_delete, can_block);
 }
 
 // =============================================================================================
@@ -4379,9 +4518,13 @@ const NU10: usize = 1;
 /// U10 op-kinds (in `U10_OP`). GROW: extend an existing file (`write_grow`). CREATE_GROW: create a fresh entry
 /// then grow-from-empty (`create_in_root` if absent + `write_grow`). CREATE_GROW_DELETE: create+grow+delete —
 /// exercises the full on-disk delete path (`delete_located`) for a file the fixture created then unlinked.
+/// DELETE (STOR-1 S4c fallback): delete an ALREADY-ON-DISK file by name — the IF=0-safe deferral for a
+/// last-close release that lands in a NON-blocking teardown context (an `exit`/reap of a cross-process
+/// last-holder; see `openf_release`), where the synchronous `submit_delete` cannot run.
 const U10OP_GROW: u32 = 1;
 const U10OP_CREATE_GROW: u32 = 2;
 const U10OP_CREATE_GROW_DELETE: u32 = 3;
+const U10OP_DELETE: u32 = 4;
 /// The U10 demo file names — the single source of truth an op's `U10_NAMEID` indexes, so the drain re-resolves
 /// the on-disk directory entry by the SAME name the fixture named (`find_located`). GROW.BIN is also a staged
 /// file (idx `GROW_STAGED_IDX`); FRESH.BIN/DELME.BIN/DEFER.BIN are runtime-created (never staged).
@@ -4455,11 +4598,13 @@ fn u10_flush_drain_one(fs: &crate::fs::fat::FatFs) -> Option<bool> {
                 U10OP_GROW => u10_drain_grow(fs, name, start, bytes),
                 U10OP_CREATE_GROW => u10_drain_create_grow(fs, name, bytes),
                 U10OP_CREATE_GROW_DELETE => u10_drain_create_grow_delete(fs, name, bytes),
+                U10OP_DELETE => u10_drain_delete(fs, name),
                 _ => false,
             };
             // U11x M2: a drained DELETE completes the file's lifecycle — the name is re-creatable again
             // (unconditional: on a failed drain the pre-flight self-heal owns the on-disk state anyway).
-            if op == U10OP_CREATE_GROW_DELETE {
+            // S4c: the U10OP_DELETE fallback likewise clears the flag its enqueuer left set.
+            if op == U10OP_CREATE_GROW_DELETE || op == U10OP_DELETE {
                 DYN_DELETED_G[nameid].store(false, Ordering::Release);
             }
             U10_LEN[k].store(0, Ordering::Relaxed);
@@ -4473,6 +4618,28 @@ fn u10_flush_drain_one(fs: &crate::fs::fat::FatFs) -> Option<bool> {
 /// True iff the U10 op-queue holds no pending op — the launcher's post-drain leak check.
 fn u10_flush_all_free() -> bool {
     (0..NU10).all(|k| !U10_USED[k].load(Ordering::Acquire))
+}
+
+/// STOR-1 S4d: drain any pending U10 ops and return `(ok, count)` for a launcher verdict. Knob-OFF
+/// (deferred replay): the launcher requires EXACTLY ONE op drained, every disk step true, the queue then
+/// empty, and no overflow — byte-identical to the pre-S4 inline check. Knob-ON (S4 synchronous): the
+/// create/grow/delete ALREADY persisted in-syscall via the service task, so the op-queue is EMPTY — `ok`
+/// requires `count == 0` (nothing enqueued: the deferred-replay causal-fidelity gap is closed) + no
+/// overflow. `count` is returned so the caller can log the mode. Called ONLY from a U10 launcher at IF=1.
+fn u10_drain_verdict(fs: &crate::fs::fat::FatFs) -> (bool, u32) {
+    let mut all_ok = true;
+    let mut count = 0u32;
+    while let Some(one) = u10_flush_drain_one(fs) {
+        all_ok &= one;
+        count += 1;
+    }
+    let clean = u10_flush_all_free() && !U10_OVERFLOW.load(Ordering::Acquire);
+    let ok = if s4_sync_storage() {
+        count == 0 && clean // synchronous: nothing was ever enqueued
+    } else {
+        all_ok && count == 1 && clean // deferred: exactly one op replayed to disk
+    };
+    (ok, count)
 }
 
 /// U10 GROW drain: extend the existing on-disk file `name` — `find_located` (by name, the x86 stand-in for the
@@ -4550,6 +4717,20 @@ fn u10_drain_create_grow_delete(fs: &crate::fs::fat::FatFs, name: &str, bytes: &
     }
     // Delete: dir entry 0xE5 FIRST, then free the chain (every FAT entry -> 0 in all copies) — crash-safe order.
     fs.delete_located(lba1, off1, de1.first_cluster()).is_ok()
+}
+
+/// STOR-1 S4c DELETE-fallback drain: delete an ALREADY-ON-DISK file `name` (created + grown synchronously by
+/// S4a/S4b) — the IF=1 completion for a last-close release that landed in a NON-blocking teardown context and
+/// deferred the delete (`openf_release` -> `U10OP_DELETE`). No create/grow (the file already exists with its
+/// real content + chain, unlike the CREATE_GROW_DELETE replay): `find_located` then `delete_located`. A `name`
+/// already absent returns `true` (idempotent — a racing drain / self-heal already removed it).
+fn u10_drain_delete(fs: &crate::fs::fat::FatFs, name: &str) -> bool {
+    match fs.find_located(name) {
+        Ok((de, lba, off)) if !de.is_dir => fs.delete_located(lba, off, de.first_cluster()).is_ok(),
+        Ok(_) => false, // a directory under this name — never delete it via the file path
+        Err(crate::fs::fat::FatError::NotFound) => true, // already gone — idempotent
+        Err(_) => false,
+    }
 }
 
 // --- U9x writable staging pool: the write twin of the read-only staged set. A small fixed pool of
@@ -4763,10 +4944,13 @@ fn files_free(row: usize, idx: usize) {
     // file); the rebind window only opens once the slot is both free AND reused.
     FILE_GEN[row][idx].fetch_add(1, Ordering::AcqRel);
     // U11x M2: the descriptor is fully released — drop its global open count. The LAST decref of an
-    // unlink-pending file releases the deferred delete (see `openf_decref`).
+    // unlink-pending file releases the deferred delete (see `openf_release`/`openf_decref`). S4c: `files_free`
+    // is always a BLOCKING-SAFE context (a syscall handler — sys_close / the sys_unlink sweep / revoke /
+    // open-unwind — or the launcher's direct `files_free`; NEVER an IF=0 self-teardown), so the synchronous
+    // on-disk delete may block here.
     if let Some(nameid) = openf_nameid {
         if nameid < N_U10_NAMES {
-            openf_decref(nameid);
+            openf_release(nameid, true);
         }
     }
 }
@@ -4777,6 +4961,20 @@ fn files_free(row: usize, idx: usize) {
 /// is never torn down (its opens persist, like its caps).
 fn clear_files_row(slot: usize) {
     debug_assert!(slot < crate::arch::memory::USER_SLOTS, "clear_files_row: not a private slot");
+    // STOR-1 S4c: may an S4 synchronous last-close DELETE block on the storage service task in THIS teardown?
+    // Only when this is NOT the current task tearing down its OWN address space — `exit`/reap runs IF=0
+    // mid-death (blocking there would resume a task whose CR3 is being freed: corruption) and the scheduler
+    // reaper has no current task at all (an off-scheduler `submit` would fault). A LAUNCHER tearing down
+    // ANOTHER slot is a live scheduled kernel task (its `user_cr3 == 0`, never equal to the slot's CR3), so
+    // it may block. `exit` of a ring-3 task has `current.user_cr3 == slot_cr3(slot)`; the reaper has no
+    // current → both resolve to `false`. (Computed once; the loop below hands it to `openf_release`.)
+    #[cfg(feature = "irqstorage")]
+    let teardown_can_block = match crate::arch::sched::current_user_cr3() {
+        Some(ucr3) => ucr3 != crate::arch::memory::slot_cr3(slot),
+        None => false,
+    };
+    #[cfg(not(feature = "irqstorage"))]
+    let teardown_can_block = false;
     for k in 0..NFILE {
         // U11x M2: capture the created-file identity up front — teardown counts as CLOSE (the pi4 M2b
         // semantics), so each created descriptor decrefs the global open count after its fields clear; the last
@@ -4812,9 +5010,13 @@ fn clear_files_row(slot: usize) {
                     // an unlinked file exiting dirty must NOT re-persist it (its only remaining persistence is
                     // the HELD delete op; a CreateGrow here would both resurrect the file after its delete
                     // drains and overflow the NU10 == 1 queue).
+                    // STOR-1 S4: knob-on, a created file was persisted SYNCHRONOUSLY (S4a create + S4b grow),
+                    // so there is nothing to flush at teardown — skip the enqueue (the op-queue is retired
+                    // when on). `!s4_sync_storage()` keeps the deferred CreateGrow byte-identical knob-off.
                     if let Some(nameid) = nameid {
                         let size = FILE_SIZE[slot][k].load(Ordering::Acquire) as usize;
-                        if HELLO_STAGED.load(Ordering::Acquire)
+                        if !s4_sync_storage()
+                            && HELLO_STAGED.load(Ordering::Acquire)
                             && size <= all.len()
                             && !DYN_DELETED_G[nameid].load(Ordering::Acquire)
                         {
@@ -4825,11 +5027,12 @@ fn clear_files_row(slot: usize) {
                     // A GROWN staged file (GROW.BIN) — persist the extended dirty span via fat::write_grow. Only
                     // when disk-backed: FILE_CLUSTER (== GROW_CLUSTER) is `0` in the in-memory core (no FAT), so
                     // this both gates the enqueue and prevents an in-memory strand (mirrors the U9x cluster gate).
+                    // STOR-1 S4b: knob-on the grow was already persisted synchronously — skip the enqueue.
                     if let Some(nameid) = nameid {
                         let cluster = FILE_CLUSTER[slot][k].load(Ordering::Acquire);
                         let lo = FILE_DIRTY_LO[slot][k].load(Ordering::Acquire);
                         let hi = FILE_DIRTY_HI[slot][k].load(Ordering::Acquire);
-                        if cluster != 0 && lo < hi && (hi as usize) <= all.len() {
+                        if !s4_sync_storage() && cluster != 0 && lo < hi && (hi as usize) <= all.len() {
                             u10_flush_enqueue(U10OP_GROW, nameid as u32, lo, &all[lo as usize..hi as usize], false);
                         }
                     }
@@ -4865,11 +5068,12 @@ fn clear_files_row(slot: usize) {
         // next tenant a stale-gen descriptor that a lingering file-id could rebind to.
         FILE_GEN[slot][k].fetch_add(1, Ordering::AcqRel);
         // U11x M2: teardown counts as CLOSE — the global open-count decref (the pi4 M2b teardown-decrement twin;
-        // the last decref of an unlink-pending file RELEASES its held delete op for the launcher's IF=1 drain —
-        // the x86 reaper). The release itself is one atomic store, so it is legal on this IF=0 dying path.
+        // the last decref of an unlink-pending file RELEASES its deferred delete). Knob-off: one atomic store,
+        // legal on this IF=0 dying path. S4c knob-on: the delete runs SYNCHRONOUSLY, so it may block ONLY when
+        // `teardown_can_block` proved this is a launcher's non-self teardown (never `exit`/reap self-death).
         if let Some(nameid) = openf_nameid {
             if nameid < N_U10_NAMES {
-                openf_decref(nameid);
+                openf_release(nameid, teardown_can_block);
             }
         }
     }
@@ -4996,6 +5200,21 @@ fn open_create_new(row: usize, nameid: u32, public: bool) -> i64 {
     // caller can mint a second live file under a name whose delete has not completed.
     if (nameid as usize) < N_U10_NAMES && DYN_DELETED_G[nameid as usize].load(Ordering::Acquire) {
         return EBUSY;
+    }
+    // STOR-1 S4a: knob-on, create the 0-length directory entry SYNCHRONOUSLY on the live volume via the
+    // storage service task — so the file appears on disk IN-SYSCALL (retiring the U10 deferred CreateGrow
+    // for the create half). Done FIRST, before any descriptor/wstage claim, so a create failure is a clean
+    // -EIO with nothing to unwind (a create that SUCCEEDS but a later slot-alloc fails leaves a harmless
+    // 0-length orphan the idempotent re-submit / the launcher pre-flight self-heal reconciles). The service
+    // task's `Create` is idempotent (`find_located` first), so a re-open of the same created name never
+    // plants a duplicate 8.3 slot. Off (knob off / no FAT / service not up) -> the deferred/in-memory path
+    // below persists at teardown exactly as pre-S4.
+    #[cfg(feature = "irqstorage")]
+    if s4_sync_storage() {
+        let name = U10_NAMES[nameid as usize];
+        if unsafe { crate::drivers::xhci::irqstorage::submit_create(name.as_bytes()) } < 0 {
+            return EIO;
+        }
     }
     let Some(w) = wstage_alloc(&[]) else {
         return EMFILE; // the writable staging pool is full
@@ -8504,13 +8723,10 @@ fn u10x_run(demo_cpu: usize) {
     let (drained, grew_ok) = if disk_backed && cleared {
         match crate::fs::fat::mount() {
             Ok(fs) => {
-                let mut drained = true;
-                let mut count = 0u32;
-                while let Some(one) = u10_flush_drain_one(&fs) {
-                    drained &= one;
-                    count += 1;
-                }
-                drained &= count == 1 && u10_flush_all_free() && !U10_OVERFLOW.load(Ordering::Acquire);
+                // S4d: knob-off drains exactly one deferred Grow op; knob-on the grow already persisted
+                // in-syscall, so the queue is EMPTY (count 0) and `u10x_ondisk_grow_ok` reads the state the
+                // synchronous grow already wrote.
+                let (drained, _count) = u10_drain_verdict(&fs);
                 (drained, u10x_ondisk_grow_ok(&fs))
             }
             Err(_) => (false, false),
@@ -8518,6 +8734,17 @@ fn u10x_run(demo_cpu: usize) {
     } else {
         (false, false) // in-memory mode (drain a no-op) OR !cleared (verdict fails on `cleared`)
     };
+    // STOR-1 S4 witness: knob-on, grow/create/delete run SYNCHRONOUSLY in-syscall via the storage service
+    // task, so the U10 op-queue drained NOTHING (the U10x deferred-replay causal-fidelity gap is closed).
+    // Emitted once here (the first U10 launcher, the S3-witness pattern); each U10 launcher independently
+    // requires `count == 0` knob-on, so this headline is backed by every op in the chain.
+    #[cfg(feature = "irqstorage")]
+    if s4_sync_storage() && disk_backed {
+        serial_println!(
+            ":: S4: grow/create/delete SYNCHRONOUS in-syscall via the storage service task — U10 op-queue drained NOTHING (deferred-replay causal-fidelity gap closed) -> {} ::",
+            if drained && grew_ok { "PASS" } else { "FAIL" }
+        );
+    }
 
     let core_ok = witness == U10X_WITNESS_ALL && cleared && killed == 0;
     let pass = core_ok && (!disk_backed || (drained && grew_ok));
@@ -8707,13 +8934,10 @@ fn u10cx_run(demo_cpu: usize) {
     let (drained, created_ok) = if disk_present && cleared {
         match crate::fs::fat::mount() {
             Ok(fs) => {
-                let mut drained = true;
-                let mut count = 0u32;
-                while let Some(one) = u10_flush_drain_one(&fs) {
-                    drained &= one;
-                    count += 1;
-                }
-                drained &= count == 1 && u10_flush_all_free() && !U10_OVERFLOW.load(Ordering::Acquire);
+                // S4d: knob-off drains exactly one deferred CreateGrow op; knob-on the create+grow already
+                // persisted in-syscall (S4a/S4b), so the queue is EMPTY (count 0) and `u10cx_ondisk_create_ok`
+                // reads the state the synchronous create+grow already wrote.
+                let (drained, _count) = u10_drain_verdict(&fs);
                 (drained, u10cx_ondisk_create_ok(&fs))
             }
             Err(_) => (false, false),
@@ -8877,13 +9101,11 @@ fn u10dx_run(demo_cpu: usize) {
     let (drained, deleted_ok) = if disk_present && cleared {
         match crate::fs::fat::mount() {
             Ok(fs) => {
-                let mut drained = true;
-                let mut count = 0u32;
-                while let Some(one) = u10_flush_drain_one(&fs) {
-                    drained &= one;
-                    count += 1;
-                }
-                drained &= count == 1 && u10_flush_all_free() && !U10_OVERFLOW.load(Ordering::Acquire);
+                // S4d: knob-off drains exactly one deferred CreateGrowDelete op; knob-on the create+grow
+                // persisted in-syscall (S4a/S4b) and the DELETE ran synchronously at the fixture's last close
+                // (S4c: the unlink sweep freed both its descriptors, the last decref submitting the delete),
+                // so the queue is EMPTY (count 0) and DELME.BIN is already gone on disk with its cluster freed.
+                let (drained, _count) = u10_drain_verdict(&fs);
                 (drained, u10dx_ondisk_delete_ok(&fs, U10D_NAME, f0))
             }
             Err(_) => (false, false),
@@ -9145,6 +9367,23 @@ fn u11m2_phase(srow: usize, demo_cpu: usize, via_teardown: bool, want_done: u32)
     wstage_write_at(w, 0, U11M2_PATTERN.as_ptr() as u64, U11M2_PATTERN.len());
     wstage_set_len_at_least(w, U11M2_PATTERN.len() as u32);
     FILE_SIZE[srow][fid].store(U11M2_PATTERN.len() as u32, Ordering::Release);
+    // STOR-1 S4: `open_create_new` above created DEFER.BIN on disk (S4a) as a 0-length entry, but the
+    // launcher populates its wstage DIRECTLY (not through a grow syscall), so knob-on GROW it on disk too —
+    // so the on-disk file owns a REAL cluster (`f0`) that the last-close DELETE frees, keeping the phase's
+    // `u10dx_ondisk_delete_ok(.., f0)` proof NON-vacuous (a 0-length file would leave `f0` untouched, making
+    // the freed/re-allocatable checks vacuously pass). Blocking-safe (the launcher's own scheduled task).
+    #[cfg(feature = "irqstorage")]
+    if s4_sync_storage() {
+        let mut kbuf = U11M2_PATTERN; // a mutable copy the service task can read via *mut u8
+        let _ = unsafe {
+            crate::drivers::xhci::irqstorage::submit_grow(
+                U11M2_NAME.as_bytes(),
+                0,
+                kbuf.as_mut_ptr(),
+                U11M2_PATTERN.len(),
+            )
+        };
+    }
 
     // Spawn the cross-process actor. `srow` is HELD (allocated), so the fixture's slot is necessarily distinct.
     let fix = match u11m2_build() {
@@ -9178,10 +9417,13 @@ fn u11m2_phase(srow: usize, demo_cpu: usize, via_teardown: bool, want_done: u32)
     // C1 — the DEFER is observable: the file is unlink-PENDING at refcount 1 (only srow's open left), the name
     // is globally gone, the delete op sits HELD (disk mode; NU10 == 1 -> entry 0), and srow's descriptor still
     // serves the ORIGINAL bytes (cross-process read-after-unlink — the pi4 A-side witness).
+    // S4c: knob-on there is NO held op (the delete runs synchronously at the last close), so the deferred
+    // state is just PENDING + DYN_DELETED_G — bypass the U10_USED/U10_HELD leg (`s4_sync_storage()` first).
     let c1 = OPENF_REFS[nameid].load(Ordering::Acquire) == 1
         && OPENF_PENDING[nameid].load(Ordering::Acquire)
         && DYN_DELETED_G[nameid].load(Ordering::Acquire)
-        && (!disk_present
+        && (s4_sync_storage()
+            || !disk_present
             || (U10_USED[0].load(Ordering::Acquire) && U10_HELD[0].load(Ordering::Acquire)))
         && wstage_bytes(w).get(..U11M2_PATTERN.len()) == Some(&U11M2_PATTERN[..]);
 
@@ -9193,28 +9435,28 @@ fn u11m2_phase(srow: usize, demo_cpu: usize, via_teardown: bool, want_done: u32)
         handle_clear(srow, h as usize);
     }
 
-    // C2 — the release happened: refcount 0, pending consumed; disk mode: the op is now DRAINABLE (still queued,
-    // hold dropped); no-FAT mode: the in-memory delete completed (the name is re-creatable NOW).
+    // C2 — the release happened: refcount 0, pending consumed. S4c knob-on: the DELETE ran SYNCHRONOUSLY at
+    // the release above (`openf_release` -> `submit_delete` + clears DYN_DELETED_G), so the name is already
+    // re-creatable. Knob-off disk mode: the op is now DRAINABLE (still queued, hold dropped); no-FAT mode: the
+    // in-memory delete completed. `s4_sync_storage()` first so the (empty) U10 queue is not consulted knob-on.
     let c2 = OPENF_REFS[nameid].load(Ordering::Acquire) == 0
         && !OPENF_PENDING[nameid].load(Ordering::Acquire)
-        && if disk_present {
+        && if s4_sync_storage() {
+            !DYN_DELETED_G[nameid].load(Ordering::Acquire)
+        } else if disk_present {
             U10_USED[0].load(Ordering::Acquire) && !U10_HELD[0].load(Ordering::Acquire)
         } else {
             !DYN_DELETED_G[nameid].load(Ordering::Acquire)
         };
 
-    // Drain at IF=1 (disk mode): exactly ONE op (the released delete), every disk step true, then the on-disk
-    // proof + the name re-creatable again (`DYN_DELETED_G` cleared at the drain).
+    // Drain at IF=1: knob-off replays exactly the ONE released delete op, every disk step true; knob-on the
+    // delete already ran synchronously at the release, so the queue is EMPTY (count 0). Either way prove on
+    // disk: DEFER.BIN GONE, its cluster `f0` freed in every FAT copy + re-allocatable, and the name
+    // re-creatable (`DYN_DELETED_G` clear).
     let (drained, deleted_ok) = if disk_present {
         match crate::fs::fat::mount() {
             Ok(fs) => {
-                let mut drained = true;
-                let mut count = 0u32;
-                while let Some(one) = u10_flush_drain_one(&fs) {
-                    drained &= one;
-                    count += 1;
-                }
-                drained &= count == 1 && u10_flush_all_free() && !U10_OVERFLOW.load(Ordering::Acquire);
+                let (drained, _count) = u10_drain_verdict(&fs);
                 let ok = u10dx_ondisk_delete_ok(&fs, U11M2_NAME, f0)
                     && !DYN_DELETED_G[nameid].load(Ordering::Acquire);
                 (drained, ok)

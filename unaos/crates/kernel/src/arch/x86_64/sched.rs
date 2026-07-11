@@ -1914,6 +1914,23 @@ pub fn current_name() -> Option<&'static str> {
     }
 }
 
+/// The CURRENT task's user CR3 (`0` for a kernel task), or `None` if no task is current on this CPU
+/// (the scheduler-reaper context — `current` is `0` there — or the unscheduled BSP). STOR-1 S4c uses
+/// this in the teardown path to tell a SELF-teardown (`exit`/reap of the current ring-3 task, which
+/// runs IF=0 mid-death and MUST NOT block on the storage service task) from a launcher tearing down
+/// ANOTHER slot (a live scheduled task that MAY block): a launcher is a kernel task, so its
+/// `user_cr3` is `0` and never equals the slot's CR3 it is freeing, whereas `exit`'s current task IS
+/// that slot. Keyed to the current CPU (GS already restored in every teardown caller).
+pub fn current_user_cr3() -> Option<u64> {
+    let cpu = percpu::this_cpu().cpu_index as usize;
+    let raw = SCHED[cpu].current.load(Ordering::Acquire) as *const Task;
+    if raw.is_null() {
+        None
+    } else {
+        Some(unsafe { (*raw).user_cr3 })
+    }
+}
+
 /// Id of the task currently running on a CPU, if any (best-effort; for introspection only).
 pub fn current_task_id(cpu: usize) -> Option<u64> {
     if cpu >= MAX_CPUS {
