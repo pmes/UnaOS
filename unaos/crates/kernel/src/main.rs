@@ -996,6 +996,17 @@ fn tegra_early_stop(boot_info: &'static mut BootInfo) -> ! {
         mmu.ttbr0,
         mmu.ram_gib_mask,
     );
+    // JB1f: install the full healed exceptions.rs vectors NOW — before fbcon starts mirroring —
+    // retiring the unhealed early window the 2026-07-11 bench caught: the A78AE-1941500 phantom
+    // struck fbcon's glyph loop (the boot's heaviest ifetch+store stretch) under mmu_tegra's
+    // divergent Part-C probe-and-spin vectors, twice, ms after `panel LIVE`. From here every
+    // EC=0-with-valid-D-side strike heals (`ic iallu` + retry) instead of dying; Part C now
+    // covers only the silent MMU switch itself. Audited safe this early: the handler reads the
+    // EL it booted at (BOOT_EL latches 2 here), serial is live (the banner above printed), the
+    // fatal path busy-spins (timer::LIVE is still false), and the IRQ entries stay dormant —
+    // install()'s HCR_EL2.AMO|IMO|FMO routing changes where a physical IRQ WOULD land, but DAIF
+    // stays fully masked until JM4's enable_irq below, by which point the GIC is up.
+    unaos_kernel::arch::exceptions::install();
     // JM7 (video): report the GOP the firmware handed off (addr=0 = headless boot, fbcon inert).
     // With a monitor connected, fbcon has been mirroring serial output onto this framebuffer since
     // kernel_main step 0 (under the UEFI map), and mmu_tegra just mapped its GiBs into BOTH tables
@@ -1171,13 +1182,12 @@ fn tegra_early_stop(boot_info: &'static mut BootInfo) -> ! {
     //    interrupt-driven. We reuse the shared, EL2-aware interrupt path piece by piece rather than
     //    calling `arch::init()` (which would reprint its own "Core Hardware Init" + boot-diag banner).
     //    `gic::init` now walks the Tegra234 GICD/GICR bases (mapped by mmu_tegra's L1[0] device window);
-    //    everything else — the EL2 vector table, HCR_EL2.IMO routing, the CNTP timer at INTID 30 — is
-    //    identical to the QEMU-virt/Pi path. `exceptions::install` here overwrites the bounded Part-C
-    //    fault vector mmu_tegra set for the switch window; from now on the full exceptions.rs table
-    //    (with the IRQ stub) is the handler. SMP/other cores are a later arc — boot core only.
+    //    everything else — the CNTP timer at INTID 30, the shared IRQ stub — is identical to the
+    //    QEMU-virt/Pi path. The exceptions.rs vector table (VBAR + the HCR_EL2.IMO routing) has been
+    //    live since the JB1f install right after the MMU banner, so `enable_irq` below is the only
+    //    arming step left here. SMP/other cores are a later arc — boot core only.
     serial_println!(":: tegra: JM4 — bringing up Tegra234 GIC-600 + generic timer (boot core) ::");
     unaos_kernel::arch::percpu::init(0);
-    unaos_kernel::arch::exceptions::install();
     unaos_kernel::arch::gic::init();
     unaos_kernel::arch::timer::init();
     unaos_kernel::arch::timer::diagnose();

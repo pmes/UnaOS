@@ -520,6 +520,14 @@ pub fn map_fb_region(pa: u64, size: usize) -> bool {
 // the architectural 0x80 spacing) each funnel to a stub that captures the EL's syndrome/fault-address/
 // return-address and tail-calls the shared Rust printer, which prints one line and spins. This turns a
 // dark post-switch metal hang into a recorded syndrome. Deliberately does not touch `exceptions.rs`.
+//
+// JB1f shrank this table's watch to the switch itself: `tegra_early_stop` installs the full healed
+// `exceptions.rs` vectors right after the mmu-regs banner, so Part C covers only the silent `init`
+// internals plus the first three serial lines. The 2026-07-11 bench proved why the wider window was
+// untenable — the A78AE-1941500 phantom struck fbcon's glyph loop (the boot's heaviest ifetch+store
+// stretch) under THIS divergent handler, twice, where the JB1e heal would have retried straight
+// through. Keep Part C divergent (probe-and-spin): anything that faults inside the switch window has
+// no heal-safe context to return to, and the syndrome+spin IS the design.
 
 unsafe extern "C" {
     static tegra_vectors_el2: u8;
