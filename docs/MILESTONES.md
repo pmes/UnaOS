@@ -302,9 +302,18 @@ Legend: **✅ metal-confirmed** · **🔬 QEMU-green, metal pending** · dates I
   knob-OFF `test 40` = MISSION and `UNAOS_FATIMG=sf test` = BYTE-IDENTICAL (no S3/S4/S5/PRIO_HIGH lines;
   u6gx passes non-preemptibly); `UNAOS_NOSTORAGE` clean both. Lane: `arch/x86_64/syscall.rs` +
   `drivers/xhci/irqstorage.rs`; `fat.rs`/`block.rs` reused unchanged; **zero aarch64**.
-- **Metal:** the shared-backing correctness is deterministic (proven in QEMU); knob-on rides the same
-  attended rMBP bench as S4 (transfer-IRQ I/O + create/grow/delete + the cross-process read/write + `fsck`)
-  — metal-PENDING.
+- **Metal:** ✅ **METAL-CONFIRMED 2026-07-11 (round-6 attended rMBP bench, Boot 1 pristine + pristine
+  re-confirm boot 3′):** `./arroyo mbench` PASS 29/29 required + 0 forbidden + 0 fault on the real 2012 rMBP
+  over FTDI — `:: S5: … LIVE shared backing … -> PASS ::` first-ever on metal, and `:: U6gx: … -> PASS ::` is
+  the DEADLOCK-CLOSURE witness under real SMP (the grantee's live cross-core read completes only via the
+  PRIO_HIGH wake + timer-eviction of the preemptible spinner → the scheduler deadlock fix works on silicon;
+  re-confirmed a 3rd time on the pristine boot 3′). `(irqstorage, PRIO_HIGH)` service line + S4-first-metal +
+  `bx-blockreq: PASS` + full U-chain all PASS; HELLO.BIN intact. A reboot on a NON-re-prepped card showed the
+  documented stateful-fixture `witness=0x0` false-FAIL (forensics: a 0-byte create-then-cut `DELME.BIN` +
+  `FRESH.BIN` + grown `GROW.BIN`); pristine re-prep re-confirmed all-PASS on the SAME kernel → a card-state
+  artifact orthogonal to the mechanism (evidence archived). ⚠ Bench-mechanics lesson: `scripts/card-watch.sh`
+  (the diskutil insert-poller) trips a Claude-app/macOS-TCC security feature that REVOKES the app's
+  removable-volume write access mid-bench — flash all cards FIRST, don't arm it when you still need to write one.
 ## hw-pi4 track — 2026-07-10 (K1 M2–M4 — the U6 ACL SURVIVES REBOOT: persist + rebuild + gated enforcement + proofs)
 
 ### K1 M2.2/M2.3/M2.4 + M3 + M4 — `UNAFS.ATR` persistence LANDED 🔬 `hw-pi4`
