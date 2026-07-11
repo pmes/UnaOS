@@ -169,6 +169,19 @@ impl FbCon {
     fn glyph(&self, ch: u8, cx: usize, cy: usize) {
         let surf = self.draw_fb();
         let bitmap = font8x8::legacy::BASIC_LEGACY[ch as usize];
+        // VPERF M4 (x86): hoist the per-pixel format decode out of the 8x8 bit loop — encode the
+        // foreground once, poke pre-encoded 4-byte pixels (bounds checks stay per pixel).
+        #[cfg(target_arch = "x86_64")]
+        if let Some(raw) = surf.encode4(self.fg) {
+            for (ry, byte) in bitmap.iter().enumerate() {
+                for rx in 0..8 {
+                    if byte & (1 << rx) != 0 {
+                        surf.put_raw4(cx + rx, cy + ry, raw);
+                    }
+                }
+            }
+            return;
+        }
         for (ry, byte) in bitmap.iter().enumerate() {
             for rx in 0..8 {
                 if byte & (1 << rx) != 0 {
