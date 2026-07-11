@@ -1920,7 +1920,7 @@ as the Orin boot stick (its x86 ESP overwritten with the aarch64 JD5 ESP) — th
 re-flash its own boot media before its next bench. The FAT16 `UNAOSRW` (the pi4 fixture card) served
 as the tegra data card, as in JD4.
 
-### JD6 — the write path reaches the whole tree: subdirectory writes (attended-pending)
+### JD6 — the write path reaches the whole tree: subdirectory writes (✅ METAL-CONFIRMED 2026-07-11)
 
 JD4 made the whole tree *navigable* (read); JD5 made the *root* writable; JD6 closes the gap:
 `touch` / `write` / `append` / `rm` in ANY directory the shell can `cd` into. The panel becomes a
@@ -1981,9 +1981,14 @@ in-lane (the shell dispatches only on a keystroke, and tegra never runs in QEMU)
 verdict is **attended-pending**; the write PRIMITIVES the twins call are the same F3-locked
 `create_in_*`/`write_grow`/`delete_located` the U9/U10/U11 fixtures already exercise headless.
 
-**Metal verdict — attended-pending.** The subdir money-shot (`cd DOCS`, `write NOTE.TXT …`,
-power-cycle, `cd DOCS`, `cat`) rides the next attended Orin bench — card
-[`jd6-bench.md`](../../../../unaos/scripts/jd6-bench.md).
+**Metal verdict — ✅ CONFIRMED (attended bench, 2026-07-11 — PASS, panel-observed).** The subdir
+money-shot ran on the round-6 bench, on the JB1f-fixed kernel (`e074518` tip; the JD6 code itself
+was blocked from benching by the §JB1f crash until that fix landed): the bench card
+[`jd6-bench.md`](../../../../unaos/scripts/jd6-bench.md) ran to completion on the FAT16 `UNAOSRW`
+card's pre-existing `DOCS/` subdirectory, including the write → power-cycle → `cat` durability leg.
+Attending-operator verdict: **pass 100%**. ⚠ Same evidence caveat as the §JB1f verdict: the
+host-side serial capture failed mid-bench, so the verdict is the attended panel observation (the
+JD6 card's checks are all panel-visible); no replay log exists for an mbench assert.
 
 ### JB1f — the unhealed early-vector window (the round-6 boot crash), closed (`85f74f8`)
 
@@ -2046,6 +2051,20 @@ video-code change was made (M2 = this note).
 108 `tegra:` strings. Zero x86 delta. **Metal expectation:** survives `panel LIVE` ×3 boots minimum;
 a phantom strike prints a heal line (or a later tally) and CONTINUES; then the JD6 bench card runs to
 completion on the same kernel. A silent hang is a FAIL — screen state + serial silence together decide.
+
+> **✅ JB1f METAL VERDICT (attended bench, 2026-07-11 — PASS, panel-observed).** The JB1f kernel
+> (`e074518` tip, sha-verified media) ran the full bench on the crash-day board: boots survived
+> `panel LIVE` and ran through the boot mirror — the exact stretch that killed `446abd3` 2/2 that
+> morning — to the interactive shell, and the JD6 bench card completed on the same kernel (§JD6
+> verdict below). Attending-operator verdict: **pass 100%**. ⚠ Evidence caveat, recorded honestly:
+> the HOST-side serial capture failed mid-bench (the dated log froze at boot 1's early-UEFI bytes;
+> the bridge stdout caught a later boot's MB2 fragment) — so there is NO replay log for an mbench
+> assert and no per-strike heal-line tally; the verdict rests on the attended panel observation,
+> which is sufficient for the two criteria that matter (boots visibly completed = not a silent
+> hang; the JD6 card visibly completed). Whether any strike was silently healed is unknowable from
+> this capture — irrelevant to the survival criterion, but the NEXT bench should fix the bridge
+> (probe re-enumeration mid-bench is the suspect) and re-capture a serial-asserted boot for the
+> tally record.
 
 ## 4. Jetson Orin Nano headless bring-up (Arc JM2)
 
