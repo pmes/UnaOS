@@ -96,9 +96,16 @@ Legend: **✅ metal-confirmed** · **🔬 QEMU-green, metal pending** · dates I
   rights-checked) after the unchanged `(asid, gen)` checks — structural (NONE never matches). The
   real-boot rebuild is gated on `by_name_spawn_multivalued()` (false today).
 - **M3** (`k1_persist_launcher`): kernel-side two-phase proof — persist an owned+granted file, simulate
-  a reboot, rebuild, enforce with real stamped principals (10-assertion witness `w=0x3ff`).
+  a reboot, rebuild, enforce with real stamped principals (14-assertion witness `w=0x3fff` after F1/F2).
 - **M4** (`k1_corrupt_launcher` + deny-EL0): a TORN on-disk row fails closed to PUBLIC at mount (no
   forged owner); EL0 `SYS_OPEN` of `UNAFS.ATR` denied outright.
+- **F1** (adversarial code-review catches): `owned_grant` by-name owner branch; `atr_ensure` splits a
+  block READ error from a binding MISMATCH (no more wiping rows on a hiccup); M3 persists `fc=0`.
+- **F2** (seat security-tier review, 6/6-refuter must-fixes — all fail-OPEN, latent while gated off):
+  `owned_grant` REVOKE/UPDATE arms match a rebuilt grantee by ppid (revoke was silently a no-op +
+  re-persisted; update double-slotted); owner teardown converts a NAMED owner to the sentinel instead
+  of wiping (a wiped RAM row made `sys_unlink` skip the disk clear → future same-name adoption);
+  `sys_unlink` clears the ATR row before the `0xE5`. M3 witnesses revoke-after-rebuild + teardown (→ `w=0x3fff`).
 - **Tested (QEMU):** `check` BOTH arches (x86 unchanged); `kernel8` baremetal; `kernel8-test` → **23
   PASS byte-identical** to base (the `:: K1-persist: … PASS ::` + `:: K1-corrupt: … PASS ::` witness
   lines are the ONLY additions, UNCOUNTED) + CAPSTONE 6/6 + F2/F3 witnesses + `:: K1-atr: … disk PASS ::`,

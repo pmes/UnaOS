@@ -4325,18 +4325,33 @@ fn owned_clear(dir_lba: u64, dir_off: u32) {
     }
 }
 
-/// U6: at the teardown of ASID `asid`, drop every file it OWNS (the file reverts to PUBLIC — there is no
-/// persistent principal to keep owning it, and the ASID's next tenant is a DIFFERENT process) and sweep
-/// any GRANT naming `asid` (a grantee that exited). Matches on the ASID irrespective of gen — the whole
-/// address space is being torn down. Called from `clear_handle_row` (the IRQ-masked teardown path); keeps
-/// the bounded table self-cleaning across create/exit cycles. (The gen fence in `owned_access_ok` already
-/// makes an UNSWEPT stale entry harmless — this is table hygiene + the owner-exit-reverts-to-public rule.)
+/// U6: at the teardown of ASID `asid`, dispose of every file it OWNS and sweep any GRANT naming `asid` (a
+/// grantee that exited). Matches on the ASID irrespective of gen — the whole address space is being torn down.
+/// Called from `clear_handle_row` (the IRQ-masked teardown path); keeps the bounded table self-cleaning across
+/// create/exit cycles. (The gen fence in `owned_access_ok` already makes an UNSWEPT stale entry harmless.)
+///
+/// K1 M2.4 F2 (security-review MF2): an owner's disposition now depends on whether it is a PERSISTENT
+/// (named) principal:
+///   * ANONYMOUS owner (`owner_ppid == NONE`, the whole pre-K1 / inline-fixture world): WIPE the row — the file
+///     reverts to PUBLIC (there is no durable identity to keep owning it). Unchanged behaviour; battery byte-identical.
+///   * NAMED owner: CONVERT `owner_asid` to the NO-LIVE-OWNER sentinel (keep `owner_ppid` + grants) — the file
+///     STAYS OWNED by the principal (the program can re-spawn and re-acquire; it survives reboot). Wiping it here
+///     would make the in-RAM row disagree with the on-disk `UNAFS.ATR` row, so `sys_unlink`'s `owned_owner_ppid`
+///     gate would read NONE and SKIP the disk clear — leaving a stale owner row a future same-name file would adopt
+///     at the next mount. Keeping the row as a sentinel keeps RAM and disk consistent and lets the unlink-time
+///     `atr_clear_row` fire correctly.
 fn owned_clear_owner_asid(asid: u64) {
     let _irq = IrqGuard::mask_save();
     let mut t = OWNED_FILES.lock();
     for row in t.iter_mut() {
         if row.dir_lba != 0 && row.owner_asid == asid {
-            *row = OwnedFile::EMPTY;
+            if row.owner_ppid.kind != PRIN_NONE {
+                // Named owner exits -> the file persists by principal (sentinel owner, no live incarnation).
+                row.owner_asid = OWNER_ASID_PERSISTED;
+                row.owner_gen = 0;
+            } else {
+                *row = OwnedFile::EMPTY; // anonymous owner exits -> revert to PUBLIC (pre-K1 behaviour)
+            }
         } else {
             for g in row.grants.iter_mut() {
                 if g.rights != 0 && g.asid == asid {
@@ -4477,22 +4492,32 @@ fn owned_grant(
             if !(live_owner || name_owner) {
                 return EACCES;
             }
+            // F2 (security-review MF1/MF3): a grant slot addresses the target grantee by its LIVE `(asid, gen)`
+            // OR — for a slot REBUILT from disk (`asid == OWNER_ASID_PERSISTED`, no live incarnation) — by its
+            // persistent principal. Without the ppid arm, a post-reboot revoke/update of a rebuilt grantee (whose
+            // live handle carries a normal asid 1..=USER_SLOTS) matched NOTHING: revoke returned success while the
+            // grant stayed (and was re-persisted — irrevocable), update claimed a SECOND slot for the same
+            // principal. Structural: a NONE grantee_ppid never matches, so the anonymous path is unchanged.
+            let matches_grantee = |g: &FileGrant| -> bool {
+                (g.asid == grantee_asid && g.asid_gen == grantee_gen)
+                    || (grantee_ppid.kind != PRIN_NONE && g.ppid.kind != PRIN_NONE && g.ppid == grantee_ppid)
+            };
             // REVOKE (rights == 0): drop any existing grant for this grantee incarnation. Future opens deny;
             // a handle the grantee ALREADY holds is unaffected (the ACL gates ACQUISITION, not held caps).
             if rights == 0 {
                 for g in row.grants.iter_mut() {
-                    if g.rights != 0 && g.asid == grantee_asid && g.asid_gen == grantee_gen {
+                    if g.rights != 0 && matches_grantee(g) {
                         *g = FileGrant::EMPTY;
                     }
                 }
                 return 0;
             }
-            // GRANT/UPDATE: if a grant for this grantee already exists, update its rights in place. K1 M2.3:
-            // also refresh its persistent principal (the grantee's stamp is stable, but stay consistent).
+            // GRANT/UPDATE: if a grant for this grantee already exists (live OR by-name rebuilt), update it in
+            // place — refreshing its LIVE `(asid, gen)` too, so a rebuilt slot RE-BINDS to the now-live grantee
+            // rather than leaving a duplicate. K1 M2.3: also refresh the persistent principal (stay consistent).
             for g in row.grants.iter_mut() {
-                if g.rights != 0 && g.asid == grantee_asid && g.asid_gen == grantee_gen {
-                    g.rights = rights;
-                    g.ppid = grantee_ppid;
+                if g.rights != 0 && matches_grantee(g) {
+                    *g = FileGrant { asid: grantee_asid, asid_gen: grantee_gen, rights, ppid: grantee_ppid };
                     return 0;
                 }
             }
@@ -6504,6 +6529,16 @@ fn sys_unlink(handle: u64) -> i64 {
     // persisted UNAFS.ATR row must also be cleared. NONE for a public/anonymous file (the whole battery) => no
     // disk touch below => the anonymous unlink path stays byte-identical. In-RAM read; no lock held here.
     let owner_ppid = owned_owner_ppid(dir_lba, dir_off as u32);
+    // K1 M2.4 F2 (security-review MF2): clear the PERSISTED UNAFS.ATR row FIRST — BEFORE the `0xE5` name delete —
+    // so a crash between the two fails toward PUBLIC (the name still resolves but has no owner row -> the file is
+    // public until re-persisted) instead of stranding a stale owner row that a FUTURE same-name file would adopt
+    // at the next mount (the rebuild is name-primary). Named-owner only (`owner_ppid` captured above): a
+    // public/anonymous file — the whole battery — skips this with ZERO disk I/O, so the anonymous unlink path is
+    // byte-identical. `atr_clear_row` takes its OWN fresh `ns` for the single-row write; done before the main `ns`
+    // hold below (never nested).
+    if owner_ppid.kind != PRIN_NONE {
+        let _ = atr_clear_row(&fs, dir_lba, dir_off as u32);
+    }
     // F3-M3: the NAMESPACE hold — the whole 0xE5 -> owned_clear -> mark-pending -> descriptor-drop sequence
     // runs atomically against any concurrent sys_open's lookup -> ACL -> incref (same lock). This closes the
     // `0xE5`-before-mark-pending window (a cross-core last-close can no longer land between them and miss the
@@ -6536,13 +6571,6 @@ fn sys_unlink(handle: u64) -> i64 {
     drop(ns);
     for &fc in &orphans[..norphans] {
         free_orphan_chain(fc);
-    }
-    // K1 M2.3: the name is gone and its in-RAM ACL row is cleared — clear its PERSISTED UNAFS.ATR row too, so the
-    // file does not re-materialize as owned after a reboot. Only for a file that HAD a named owner (owner_ppid
-    // captured above): a public/anonymous file (the whole battery) skips this with ZERO disk I/O. Done AFTER the
-    // main ns drop (atr_clear_row takes its own fresh ns for the single-row write — never nested).
-    if owner_ppid.kind != PRIN_NONE {
-        let _ = atr_clear_row(&fs, dir_lba, dir_off as u32);
     }
     handle_clear(asid, handle as usize);
     0
@@ -8640,8 +8668,9 @@ fn atr_parse_row(b: &[u8; ATR_ROW_STRIDE]) -> Option<AtrRow> {
     })
 }
 
-/// K1: the volume binding — proves an attr file belongs to THIS volume (a swapped card / byte-copied image
-/// is rejected, so a foreign volume's rows never attach to this volume's directory slots). K1 M2.2: the real
+/// K1: the volume binding — proves an attr file belongs to THIS volume (a FOREIGN volume or a REFORMAT is
+/// rejected, so its rows never attach to this volume's directory slots; a byte-for-byte clone preserves the
+/// fingerprint and is NOT rejected — offline tampering is out of scope). K1 M2.2: the real
 /// fingerprint `(BS_VolID, count_of_clusters)` via the seat-authorized read-only `fat.rs`
 /// `volume_fingerprint()` accessor — the volume serial (fixed at format time) + the cluster count (fixed by
 /// geometry) are far more discriminating than M1's placeholder `cluster_size()` + `num_fats()`. The binding
@@ -9317,7 +9346,7 @@ const K1P_SA_OWN: u64 = 6; // scratch OWNER ASID
 const K1P_SA_GRT: u64 = 7; // scratch GRANTEE ASID
 const K1P_OWNER: &str = "PERSF.BIN"; // the named-owner scratch file
 const K1P_PUBLIC: &str = "PERSPUB.BIN"; // the public scratch file (proves public stays public after rebuild)
-const K1PERSIST_ALL: u32 = 0xFFF; // all 12 assertions held (10 read-side + 2 owner-by-name grant, F1)
+const K1PERSIST_ALL: u32 = 0x3FFF; // all 14 assertions (12 + F2: rebuilt-grant revoke + owner-teardown sentinel)
 
 /// K1 M3: delete the scratch files + clear their persisted UNAFS.ATR rows + scratch stamps, leaving the card
 /// EXACTLY as found (empty UNAFS.ATR, no scratch files). Robust to partial failures — re-resolves each file
@@ -9448,18 +9477,45 @@ fn k1_persist_check() -> u32 {
     if !owned_unlink_permitted(rlba, roff, K1P_SA_OWN, gen_own, p_y) {
         w |= 1 << 9; // impostor cannot delete
     }
+    // F2 (security-review MF1): REVOKE the REBUILT grantee (still a SENTINEL slot — no live incarnation) by-name
+    // and confirm it is ACTUALLY gone. Without the F2 grantee-by-ppid match, owned_grant's revoke arm matched
+    // nothing (the live grantee asid never equals the rebuilt SENTINEL), returned success, and left the grant
+    // admitting — a silent fail-OPEN. Run BEFORE the re-grant below so it tests the pure rebuilt slot.
+    if owned_grant(rlba, roff, K1P_SA_OWN, gen_own, K1P_SA_GRT, gen_grt, 0, p_x, p_z) == 0
+        && !owned_access_ok(rlba, roff, K1P_SA_GRT, gen_grt, CAP_READ, p_z)
+    {
+        w |= 1 << 12; // by-name revoke of a rebuilt grant TRULY revokes (grantee now denied)
+    }
     // F1: the owner-by-name must also be able to MUTATE the ACL (owned_grant) on its rebuilt row — the read-side
     // owner recognition (bit 8) is not enough; owned_grant has its own owner gate. Exercise the by-name owner
     // path directly (the live `(asid, gen)` never matches the rebuilt SENTINEL owner_asid, so admission rests on
-    // the ppid branch). K1P_SA_OWN is a live asid != OWNER_ASID_PERSISTED, so it drives the by-name path.
-    if owned_grant(rlba, roff, K1P_SA_OWN, gen_own, K1P_SA_GRT, gen_grt, CAP_READ | CAP_WRITE, p_x, p_z) == 0 {
+    // the ppid branch). Grant P_Z READ back (a fresh slot, since bit 12 revoked it) and confirm it is admitted.
+    if owned_grant(rlba, roff, K1P_SA_OWN, gen_own, K1P_SA_GRT, gen_grt, CAP_READ, p_x, p_z) == 0
+        && owned_access_ok(rlba, roff, K1P_SA_GRT, gen_grt, CAP_READ, p_z)
+    {
         w |= 1 << 10; // owner-by-name CAN re-grant on its persisted file
     }
     if owned_grant(rlba, roff, K1P_SA_OWN, gen_own, K1P_SA_GRT, gen_grt, CAP_READ, p_y, p_z) == EACCES {
         w |= 1 << 11; // an impostor principal CANNOT grant
     }
-
     owned_clear(rlba, roff);
+
+    // F2 (security-review MF2): a NAMED owner's row must SURVIVE its owner's TEARDOWN as a SENTINEL (owner_ppid
+    // kept), not be wiped to public — else `owned_owner_ppid` reads NONE and `sys_unlink` skips the disk clear,
+    // stranding a stale owner row a future same-name file would adopt. Create a live-owned file, tear the owner
+    // down, and confirm the row persists by principal (named + anonymous still DENIED).
+    if let Ok((de2, l2, o2)) = fs2.create_in_root("MF2F.BIN", 0x20) {
+        owned_set_owner(l2, o2 as u32, K1P_SA_OWN, gen_own, p_x);
+        owned_clear_owner_asid(K1P_SA_OWN); // the OWNER TEARDOWN (clear_handle_row's twin)
+        if owned_owner_ppid(l2, o2 as u32) == p_x
+            && !owned_access_ok(l2, o2 as u32, K1P_SA_OWN, gen_own, CAP_READ, PrincipalRecord::NONE)
+        {
+            w |= 1 << 13; // named owner survives teardown as a sentinel (RAM/disk stay consistent for unlink)
+        }
+        owned_clear(l2, o2 as u32);
+        let _ = fs2.delete_located(l2, o2, de2.first_cluster());
+    }
+
     k1_persist_cleanup();
     w
 }
@@ -9484,7 +9540,7 @@ fn k1_persist_launcher() {
     }
     let w = k1_persist_check();
     serial_println!(
-        ":: K1-persist: UNAFS.ATR owner/grants SURVIVE REBOOT — rebuild+enforce {} (owner-by-name admit+regrant; impostor+anon deny; grantee R admit/W deny; public stays public) [w={:#05x}] ::",
+        ":: K1-persist: UNAFS.ATR owner/grants SURVIVE REBOOT — rebuild+enforce {} (owner-by-name admit+regrant+revoke; impostor+anon deny; grantee R admit/W deny; public stays public; named owner survives teardown) [w={:#06x}] ::",
         if w == K1PERSIST_ALL { "PASS" } else { "FAIL" },
         w
     );

@@ -257,7 +257,9 @@ pub struct FatFs {
     count_of_clusters: u32,
     /// K1 M2.2: `BS_VolID`, the volume serial number the formatter stamped into the boot sector (offset 0x27 on
     /// FAT16, 0x43 on FAT32). Read-only; exposed via [`FatFs::volume_fingerprint`] as one half of the UNAFS.ATR
-    /// volume binding (so a swapped/byte-copied card is rejected — its rows never attach to this volume).
+    /// volume binding (a FOREIGN volume or a REFORMAT — a different serial/cluster-count — is rejected, so its
+    /// rows never attach to this volume; a full byte-for-byte clone preserves both and is NOT rejected — offline
+    /// tampering is out of scope).
     vol_id: u32,
 }
 
@@ -767,9 +769,11 @@ impl FatFs {
     }
 
     /// K1 M2.2: the volume FINGERPRINT — `(BS_VolID, count_of_clusters)`. Read-only; the aarch64 UNAFS.ATR ACL
-    /// store binds to it so a swapped card / byte-copied image (a DIFFERENT serial or size) is rejected and its
-    /// owner rows never attach to this volume's directory slots. Two identity fields chosen for stability under
-    /// non-destructive edits: the serial is fixed at format time and the cluster count is fixed by the geometry.
+    /// store binds to it so a FOREIGN volume or a REFORMAT (a DIFFERENT serial or cluster count) is rejected and
+    /// its owner rows never attach to this volume's directory slots. (A full byte-for-byte clone preserves both
+    /// fields and is NOT rejected — that is offline tampering, explicitly out of scope.) Two identity fields
+    /// chosen for stability under non-destructive edits: the serial is fixed at format time, the cluster count by
+    /// the geometry.
     pub fn volume_fingerprint(&self) -> (u32, u32) {
         (self.vol_id, self.count_of_clusters)
     }
