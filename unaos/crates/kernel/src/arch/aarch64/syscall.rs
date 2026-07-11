@@ -4177,20 +4177,26 @@ static OWNED_FILES: SpinMutex<[OwnedFile; NOWNED]> = SpinMutex::new([OwnedFile::
 /// (only `owned_grant`'s stale-slot scan) range-guards it first.
 const OWNER_ASID_PERSISTED: u64 = u64::MAX;
 
-/// K1 M2.4: is MULTI-PROGRAM by-name spawn live? Cross-reboot persistent-principal ENFORCEMENT — installing
-/// rebuilt-from-disk owner rows at mount (which then DENY every live `(asid, gen)` caller until the owning
-/// program is re-spawned by name and matches by ppid) — is GATED on this. Until the system can launch >= 2
-/// DISTINCT named programs, every spawn is the SAME principal, so a persisted owner could never be re-acquired
-/// by anyone but could DENY everyone — enforcing it would only BRICK the file. Today the card carries ONE
-/// launchable EL0 program (`HELLO.BIN`, via `sys_spawn`/`load_program_into_slot`), so this is FALSE and the
-/// real-boot rebuild installs NO rows (all-public — the pre-K1 baseline, byte-equivalent). The enforcement
-/// MECHANISM is complete and PROVEN by the M3 kernel-side proof (which manufactures distinct principals
-/// directly), so it is READY the instant a second launchable named program lands and this flips true. The
-/// `owned_access_ok`/`owned_is_owner`/`owned_unlink_permitted` ppid branch itself is NOT gated on this — it is
-/// purely structural (a NONE principal never matches), so it is inert in the battery and testable by M3 without
-/// flipping this global.
+/// K1 M2.4 / K2: is MULTI-PROGRAM by-name spawn live? Cross-reboot persistent-principal ENFORCEMENT —
+/// installing rebuilt-from-disk owner rows at mount (which then DENY every live `(asid, gen)` caller until the
+/// owning program is re-spawned by name and matches by ppid) — is GATED on this. It must be false while only ONE
+/// distinct named program can launch, because then every spawn is the SAME principal, so a persisted owner could
+/// never be re-acquired by anyone but could DENY everyone — enforcing it would only BRICK the file.
+///
+/// K2 (make-enforcement-LIVE) landed the honest precondition: the card now carries THREE distinct launchable
+/// named programs (`HELLO.BIN`, `K2OWN.BIN`, `K2IMP.BIN`), each minting its own `prog:<NAME>` principal via the
+/// sole mint path (`load_program_into_slot` -> `slot_ppid_stamp`). So this is now TRUE and the real-boot rebuild
+/// (`atr_maybe_boot_rebuild`, at the head of `u7_launcher`) actually reinstalls persisted owner rows — a
+/// re-spawned owning program re-acquires its file BY NAME; any other principal is denied. The end-to-end proof
+/// through real loaded programs is `k2_liveenf_launcher`; on the metal card a real power-cycle survives.
+///
+/// On QEMU (fresh-per-build FAT) `UNAFS.ATR` does not exist at the head-of-`u7_launcher` rebuild (`k1_atr_selftest`
+/// creates it later in the same chain), so the boot rebuild installs ZERO rows and the 23-fixture battery stays
+/// byte-equivalent — the flip's live effect is exercised on metal. The `owned_access_ok`/`owned_is_owner`/
+/// `owned_unlink_permitted`/`owned_grant` ppid branch is NOT gated on this — it is purely structural (a NONE
+/// principal never matches), so an anonymous caller (the whole battery) is inert regardless.
 fn by_name_spawn_multivalued() -> bool {
-    false // single on-disk EL0 program today; flip when a 2nd launchable named program lands (with its own principal)
+    true // K2: three distinct launchable named programs on the card -> a persisted owner is re-acquirable by name
 }
 
 /// K1 M2.4: install a row REBUILT from `UNAFS.ATR` into `OWNED_FILES` — a persisted owner with NO live
