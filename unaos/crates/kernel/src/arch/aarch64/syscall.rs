@@ -4458,14 +4458,23 @@ fn owned_grant(
     grantee_asid: u64,
     grantee_gen: u64,
     rights: u32,
+    owner_ppid: PrincipalRecord, // K1 M2.4: the CALLER's persistent principal (for by-name owner authority)
     grantee_ppid: PrincipalRecord, // K1 M2.3: grantee's persistent principal (captured by the caller pre-lock)
 ) -> i64 {
     let _irq = IrqGuard::mask_save();
     let mut t = OWNED_FILES.lock();
     for row in t.iter_mut() {
         if row.dir_lba == dir_lba && row.dir_off == dir_off {
-            // Only the file's CURRENT owner (gen-matched) may grant or revoke on it.
-            if !(row.owner_asid == owner_asid && row.owner_gen == owner_gen) {
+            // Only the file's CURRENT owner may grant or revoke on it. K1 M2.4: this is the OWNER-side twin of
+            // the read helpers' by-name branch — a REBUILT row (owner_asid == OWNER_ASID_PERSISTED, matching no
+            // live caller) is mutable by the re-spawned owner identified by its persistent principal, so the
+            // by-name owner has FULL authority incl. re-granting (not just open + unlink). Structural: a NONE
+            // principal never matches, so the anonymous path is unchanged.
+            let live_owner = row.owner_asid == owner_asid && row.owner_gen == owner_gen;
+            let name_owner = owner_ppid.kind != PRIN_NONE
+                && row.owner_ppid.kind != PRIN_NONE
+                && row.owner_ppid == owner_ppid;
+            if !(live_owner || name_owner) {
                 return EACCES;
             }
             // REVOKE (rights == 0): drop any existing grant for this grantee incarnation. Future opens deny;
@@ -6661,7 +6670,7 @@ fn sys_fgrant(file_handle: u64, child_handle: u64, rights: u64) -> i64 {
     // K1 M2.3: the grantee's PERSISTENT principal, captured BEFORE owned_grant (SLOT_PPID never nested under
     // OWNED_FILES). NONE for an anonymous grantee (the battery) — a NONE grant persists nothing.
     let grantee_ppid = slot_ppid_of(grantee_asid);
-    let rc = owned_grant(dir_lba, dir_off, asid, asid_gen, grantee_asid, grantee_gen, rights, grantee_ppid);
+    let rc = owned_grant(dir_lba, dir_off, asid, asid_gen, grantee_asid, grantee_gen, rights, caller_ppid, grantee_ppid);
     // K1 M2.3: if the ACL mutation succeeded on a NAMED-owner file, re-persist the row (owner + grants) so the
     // grant/revoke SURVIVES REBOOT. The named-owner check is an IN-RAM read (owned_owner_ppid) taken BEFORE the
     // mount, so an anonymous owner (the whole battery) does ZERO disk I/O here and the sys_fgrant path stays
@@ -8745,14 +8754,25 @@ fn atr_ensure(
     use crate::fs::fat::FatError;
     match fs.find_located(ATR_NAME) {
         Ok((de, lba, off)) => {
-            if (de.size as usize) >= ATR_FILE_LEN && atr_header_ok(fs, de.first_cluster(), de.size, bind) {
-                return Ok((de.first_cluster(), de.size));
+            if (de.size as usize) < ATR_FILE_LEN {
+                // A partial/truncated image — no complete rows to preserve; (re)grow to a fresh empty image.
+                let img = atr_empty_image(bind);
+                let (_w, sz, fc) = fs.write_grow(de.first_cluster(), de.size, lba, off, 0, &img)?;
+                return Ok((fc, sz));
             }
-            // Short (a stale/partial image) OR a header that does not match the live binding — (re)grow it to a
-            // fresh empty image so the on-disk header binds to THIS volume.
-            let img = atr_empty_image(bind);
-            let (_w, sz, fc) = fs.write_grow(de.first_cluster(), de.size, lba, off, 0, &img)?;
-            Ok((fc, sz))
+            // Full-size: validate the header vs the LIVE binding, and DISTINGUISH a genuine MISMATCH (regrow — a
+            // foreign / stale-binding / torn header must be re-healed to bind to THIS volume) from a transient
+            // READ ERROR (bail — do NOT regrow, which would DISCARD every persisted row over a hiccup; the persist
+            // is non-fatal and the in-RAM ACL still enforces this boot).
+            match atr_header_status(fs, de.first_cluster(), de.size, bind) {
+                Ok(true) => Ok((de.first_cluster(), de.size)),
+                Ok(false) => {
+                    let img = atr_empty_image(bind);
+                    let (_w, sz, fc) = fs.write_grow(de.first_cluster(), de.size, lba, off, 0, &img)?;
+                    Ok((fc, sz))
+                }
+                Err(e) => Err(e), // read error -> preserve the existing rows, fail the persist
+            }
         }
         Err(FatError::NotFound) => {
             let (de, lba, off) = fs.create_in_root(ATR_NAME, ATR_DIR_ATTR)?;
@@ -8764,16 +8784,26 @@ fn atr_ensure(
     }
 }
 
-/// K1 M2.3: does the on-disk UNAFS.ATR header validate against the LIVE binding? Reads sector 0 and runs
-/// `atr_parse_header`. `false` on any read error or reject (=> the caller regrows a fresh, this-volume image).
-fn atr_header_ok(fs: &crate::fs::fat::FatFs, fc: u32, size: u32, bind: &AtrBinding) -> bool {
+/// K1 M2.3: read UNAFS.ATR's sector-0 header and validate it against the LIVE binding. `Ok(true)` = a
+/// this-volume, this-version, committed header; `Ok(false)` = a GENUINE reject (bad magic/version/geometry/
+/// committed/binding/CRC — a foreign/stale/torn header); `Err(_)` = a block READ error (NOT a mismatch). The
+/// caller decides: `atr_ensure` regrows only on `Ok(false)` (never on `Err`, which would wipe rows over a
+/// hiccup); `atr_rebuild_into_owned` treats anything but `Ok(true)` as all-public (fail-closed — a read error
+/// there is non-destructive).
+fn atr_header_status(
+    fs: &crate::fs::fat::FatFs,
+    fc: u32,
+    size: u32,
+    bind: &AtrBinding,
+) -> Result<bool, crate::fs::fat::FatError> {
     let mut hdr: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
-    if fs.read_at(fc, size, 0, &mut hdr, ATR_HEADER_LEN).is_err() || hdr.len() != ATR_HEADER_LEN {
-        return false;
+    fs.read_at(fc, size, 0, &mut hdr, ATR_HEADER_LEN)?;
+    if hdr.len() != ATR_HEADER_LEN {
+        return Err(crate::fs::fat::FatError::Io);
     }
     let mut hdr_arr = [0u8; ATR_HEADER_LEN];
     hdr_arr.copy_from_slice(&hdr);
-    atr_parse_header(&hdr_arr, bind).is_ok()
+    Ok(atr_parse_header(&hdr_arr, bind).is_ok())
 }
 
 /// K1 M2.3: the on-disk 11-byte space-padded 8.3 form of a name (`"OWNED.BIN" -> b"OWNED   BIN"`), the DURABLE
@@ -9042,8 +9072,8 @@ fn atr_rebuild_into_owned(fs: &crate::fs::fat::FatFs) -> usize {
         return 0; // partial/truncated image -> all-public
     }
     let (afc, asz) = (de.first_cluster(), de.size);
-    if !atr_header_ok(fs, afc, asz, &bind) {
-        return 0; // bad magic/version/geometry/committed/binding/CRC -> the whole volume is all-public
+    if atr_header_status(fs, afc, asz, &bind) != Ok(true) {
+        return 0; // bad magic/version/geometry/committed/binding/CRC OR read error -> all-public (fail-closed)
     }
     let mut rows: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
     if fs
@@ -9287,7 +9317,7 @@ const K1P_SA_OWN: u64 = 6; // scratch OWNER ASID
 const K1P_SA_GRT: u64 = 7; // scratch GRANTEE ASID
 const K1P_OWNER: &str = "PERSF.BIN"; // the named-owner scratch file
 const K1P_PUBLIC: &str = "PERSPUB.BIN"; // the public scratch file (proves public stays public after rebuild)
-const K1PERSIST_ALL: u32 = 0x3FF; // all 10 assertions held
+const K1PERSIST_ALL: u32 = 0xFFF; // all 12 assertions held (10 read-side + 2 owner-by-name grant, F1)
 
 /// K1 M3: delete the scratch files + clear their persisted UNAFS.ATR rows + scratch stamps, leaving the card
 /// EXACTLY as found (empty UNAFS.ATR, no scratch files). Robust to partial failures — re-resolves each file
@@ -9356,8 +9386,13 @@ fn k1_persist_check() -> u32 {
     // The real create/grant sequence in-RAM, then persist BOTH via the exact syscall persist helpers.
     owned_set_owner(lba, off as u32, K1P_SA_OWN, gen_own, p_x);
     let empty_grants = [(PrincipalRecord::NONE, 0u32); NFGRANT];
-    let ok_owner = atr_persist_row(&fs, name11, c_persf, sz_persf, lba, off as u32, p_x, &empty_grants);
-    owned_grant(lba, off as u32, K1P_SA_OWN, gen_own, K1P_SA_GRT, gen_grt, CAP_READ, p_z);
+    // Persist matching PRODUCTION's create path FAITHFULLY: `sys_open` persists `de` AT create — a fresh
+    // 0-length entry — so the row's first_cluster/size are 0 and stay 0 (the row is NOT re-persisted on a later
+    // grow this arc). The grown chain (c_persf) exists only for the no-leak cleanup check; it is NOT persisted.
+    // The rebuild's first_cluster cross-check is therefore name-PRIMARY (skipped for a 0 row) here as in production.
+    let _ = (c_persf, sz_persf);
+    let ok_owner = atr_persist_row(&fs, name11, 0, 0, lba, off as u32, p_x, &empty_grants);
+    owned_grant(lba, off as u32, K1P_SA_OWN, gen_own, K1P_SA_GRT, gen_grt, CAP_READ, p_x, p_z);
     let ok_grant = atr_persist_grants(&fs, lba, off as u32);
     let pub_created = fs.create_in_root(K1P_PUBLIC, 0x20).is_ok();
     if !(ok_owner && ok_grant && pub_created) {
@@ -9408,10 +9443,20 @@ fn k1_persist_check() -> u32 {
     if owned_is_owner(rlba, roff, K1P_SA_OWN, gen_own, p_x)
         && owned_unlink_permitted(rlba, roff, K1P_SA_OWN, gen_own, p_x)
     {
-        w |= 1 << 8; // owner-by-name has re-grant + delete authority
+        w |= 1 << 8; // owner-by-name has delete authority (owned_unlink_permitted) + is recognized as owner
     }
     if !owned_unlink_permitted(rlba, roff, K1P_SA_OWN, gen_own, p_y) {
         w |= 1 << 9; // impostor cannot delete
+    }
+    // F1: the owner-by-name must also be able to MUTATE the ACL (owned_grant) on its rebuilt row — the read-side
+    // owner recognition (bit 8) is not enough; owned_grant has its own owner gate. Exercise the by-name owner
+    // path directly (the live `(asid, gen)` never matches the rebuilt SENTINEL owner_asid, so admission rests on
+    // the ppid branch). K1P_SA_OWN is a live asid != OWNER_ASID_PERSISTED, so it drives the by-name path.
+    if owned_grant(rlba, roff, K1P_SA_OWN, gen_own, K1P_SA_GRT, gen_grt, CAP_READ | CAP_WRITE, p_x, p_z) == 0 {
+        w |= 1 << 10; // owner-by-name CAN re-grant on its persisted file
+    }
+    if owned_grant(rlba, roff, K1P_SA_OWN, gen_own, K1P_SA_GRT, gen_grt, CAP_READ, p_y, p_z) == EACCES {
+        w |= 1 << 11; // an impostor principal CANNOT grant
     }
 
     owned_clear(rlba, roff);
@@ -9439,7 +9484,7 @@ fn k1_persist_launcher() {
     }
     let w = k1_persist_check();
     serial_println!(
-        ":: K1-persist: UNAFS.ATR owner/grants SURVIVE REBOOT — rebuild+enforce {} (owner-by-name admit; impostor+anon deny; grantee R admit/W deny; public stays public) [w={:#05x}] ::",
+        ":: K1-persist: UNAFS.ATR owner/grants SURVIVE REBOOT — rebuild+enforce {} (owner-by-name admit+regrant; impostor+anon deny; grantee R admit/W deny; public stays public) [w={:#05x}] ::",
         if w == K1PERSIST_ALL { "PASS" } else { "FAIL" },
         w
     );
