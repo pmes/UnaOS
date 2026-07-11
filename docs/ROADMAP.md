@@ -135,7 +135,7 @@ vessel can exist.
 
 | Arc | Content | Review tier |
 | :--- | :--- | :--- |
-| **AV-A1 phonolite** | Make resonance honest (device sample rate into the graph, live command path, gain param, stop, nameable control handle, level readback) + the `apps/phonolite` tone vessel on the pulse pattern — start/stop, frequency/gain sliders (quartzite's first input-control idiom), level meter. Ear-witness gate: post-fix tone matches a 440 reference; pitch changes live | 2-lens |
+| **AV-A1 phonolite** ✅ landed 2026-07-11 (`us-phonolite`; ear-witness attended-pending) | Make resonance honest (device sample rate into the graph, live command path, gain param, stop, nameable control handle, level readback) + the `apps/phonolite` tone vessel on the pulse pattern — start/stop, frequency/gain sliders (quartzite's first input-control idiom), level meter. Ear-witness gate: post-fix tone matches a 440 reference; pitch changes live | 2-lens |
 | **AV-A2 stria** | Rewrite stria as a real bus-driven handler around the finished engine (`ignite(...)`, SMessage traffic); retire the vestigial window skeleton | 2-lens |
 | **LUX-1** | Common-format decode via decoder crates (`png` + `zune-jpeg` or a trimmed `image`) feeding `RgbBuffer`; fixtures + tests; harden/fence the approximate ARW2 path | 2-lens |
 | **FACET-1** | The viewer vessel: decode via lux, display in a quartzite view first (euclase textured-quad path later), pan/zoom/pixel readout after | direct read |

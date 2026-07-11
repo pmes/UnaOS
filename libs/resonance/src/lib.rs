@@ -24,7 +24,7 @@ pub mod dsp;
 pub mod graph;
 pub mod nodes;
 
-pub use audio::{AudioEngine, create_test_graph};
+pub use audio::{AudioEngine, ResonanceHandle, ResonanceMeter, create_test_graph};
 pub use commands::AudioCommand;
 pub use core::{AudioNode, GraphContext};
 pub use graph::{AudioGraph, NodeId};

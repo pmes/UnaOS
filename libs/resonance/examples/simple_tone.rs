@@ -25,10 +25,14 @@ fn main() -> Result<(), anyhow::Error> {
     let graph = create_test_graph();
 
     // Start the engine
-    // This moves the graph into the audio thread.
-    let _engine = AudioEngine::new(graph)?;
+    // This moves the graph into the audio thread (re-tuned to the device's
+    // real sample rate, so 440 Hz is truly 440 Hz).
+    let (engine, _handle) = AudioEngine::new(graph)?;
 
-    println!("Audio Engine started. Playing 440Hz tone...");
+    println!(
+        "Audio Engine started ({} Hz device). Playing 440Hz tone...",
+        engine.sample_rate
+    );
     println!("Press Ctrl+C to stop.");
 
     // Keep the main thread alive to let the audio stream run.

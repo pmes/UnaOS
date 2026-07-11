@@ -1,0 +1,20 @@
+# =====================================================================
+# CRATE: apps/phonolite/Cargo.toml
+# DESCRIPTION: The Tone Vessel. Resonance given a face: start/stop,
+#              frequency + gain sliders, live level meter.
+# =====================================================================
+
+[package]
+name = "phonolite"
+version = "0.1.0"
+edition = "2024"
+license = "GPL-3.0-or-later"
+
+[dependencies]
+bandy = { path = "../../libs/bandy" }
+quartzite = { path = "../../libs/quartzite", default-features = false }
+gneiss_pal = { path = "../../libs/gneiss_pal" }
+resonance = { path = "../../libs/resonance" }
+
+log = "0.4"
+tokio = { version = "1.49", features = ["rt-multi-thread", "sync", "macros", "time", "signal"] }
