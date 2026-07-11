@@ -113,6 +113,37 @@ G-code to hardware. Sequenced routes:
    interface gets defined during (1)/(2) so they remain the permanent "Make"
    backend. Optional interim: 2.5D polygon-extrusion slicing for flat parts.
 
+## 3a. The creative lane (host-native A/V userspace)
+
+The audio and image/video half of userspace: `libs/resonance` + `handlers/stria`
+(audio), `libs/lux` + `apps/facet` (image). Host-native only — zero kernel scope;
+the kernel-side audio gap (x86 HDA, Pi HDMI/PWM) remains §6's separate row.
+Direction set 2026-07-11 (dedicated A/V design session, ground-truthed on the Mac).
+
+**Ground truth (2026-07-11):** resonance already makes sound — its cpal path drives
+the default output device and its graph/oscillator/FFT are real and tested — but the
+engine is dishonest at the edges: the graph's sample rate is hard-coded 44.1 kHz
+while the device runs 48 kHz (pitch audibly sharp, confirmed by ear against a 440 Hz
+reference), the command path drains and discards every message, and the interactive
+example no longer compiles. stria's window skeleton references a windowing API that
+no longer exists anywhere in the repo and is not a workspace member. lux decodes
+Sony ARW only (no tests, no fixtures); facet is a README.
+
+**Ordering: audio first.** The audio side is one honest arc from a felt,
+controllable instrument; the image side needs decode capability built before its
+vessel can exist.
+
+| Arc | Content | Review tier |
+| :--- | :--- | :--- |
+| **AV-A1 phonolite** | Make resonance honest (device sample rate into the graph, live command path, gain param, stop, nameable control handle, level readback) + the `apps/phonolite` tone vessel on the pulse pattern — start/stop, frequency/gain sliders (quartzite's first input-control idiom), level meter. Ear-witness gate: post-fix tone matches a 440 reference; pitch changes live | 2-lens |
+| **AV-A2 stria** | Rewrite stria as a real bus-driven handler around the finished engine (`ignite(...)`, SMessage traffic); retire the vestigial window skeleton | 2-lens |
+| **LUX-1** | Common-format decode via decoder crates (`png` + `zune-jpeg` or a trimmed `image`) feeding `RgbBuffer`; fixtures + tests; harden/fence the approximate ARW2 path | 2-lens |
+| **FACET-1** | The viewer vessel: decode via lux, display in a quartzite view first (euclase textured-quad path later), pan/zoom/pixel readout after | direct read |
+
+Policy decided: external decoder crates are in-bounds for lux (hand-rolling PNG/JPEG
+is not the lane's value). `SMessage::AudioChunk`/`Spectrum` already exist — audio
+arcs are expected to land with zero bandy changes.
+
 ## 4. ENDURO — the rover (deferred until the desktop chain matures)
 
 Architecture settled 2026-07-02. The OS is the **vehicle computer between the
@@ -159,7 +190,7 @@ and follow-me demos feeding the drive service's AUTO mode.
 | RTC + NTP | Cheap and load-bearing — land before UnaFS kernel writes (real mtimes) | S |
 | Entropy | RDRAND/jitter; prerequisite for any TLS/WPA future | S |
 | VFS layer | Forced by K3/K4 (FAT + UnaFS coexistence) — plan, don't stumble | M |
-| Audio | x86 HDA; Pi HDMI/PWM audio | M each |
+| Audio (kernel) | x86 HDA; Pi HDMI/PWM audio — kernel playback, distinct from the host-native creative lane (§3a) | M each |
 | Power management | Backlight/battery/idle — Lazarus-machine credibility | S–M each |
 | WiFi/BT | SDIO + firmware + supplicant — distant; Ethernet first | L++ |
 | GPU acceleration | Modesetting beyond GOP is L; real 3D is years — own the CPU/SIMD-render choice near-term | L++ |
