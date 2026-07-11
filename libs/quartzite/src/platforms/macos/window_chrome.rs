@@ -111,6 +111,44 @@ unsafe impl NSObjectProtocol for ToolbarDelegate {}
 // -----------------------------------------------------------------------------
 // CHROME ASSEMBLY
 // -----------------------------------------------------------------------------
+
+/// Chrome for a single-view vessel: a plain titled window (no toolbar, no sidebar
+/// machinery) sized to `content_size`. This is the lightweight sibling of
+/// [`create_window`] for vessels — like `pulse` — whose entire UI is one custom view.
+pub fn create_vessel_window(
+    mtm: MainThreadMarker,
+    title: &str,
+    content_size: (f64, f64),
+) -> (Retained<NSWindow>, Retained<WindowDelegate>) {
+    let window_delegate: Allocated<WindowDelegate> =
+        unsafe { msg_send![WindowDelegate::class(), alloc] };
+    let window_delegate: Retained<WindowDelegate> = unsafe { msg_send![window_delegate, init] };
+
+    let frame = NSRect::new(
+        objc2_foundation::NSPoint::new(0.0, 0.0),
+        NSSize::new(content_size.0, content_size.1),
+    );
+    let style = NSWindowStyleMask::Titled
+        | NSWindowStyleMask::Closable
+        | NSWindowStyleMask::Resizable
+        | NSWindowStyleMask::Miniaturizable;
+
+    let window = unsafe {
+        NSWindow::initWithContentRect_styleMask_backing_defer(
+            NSWindow::alloc(mtm),
+            frame,
+            style,
+            NSBackingStoreType::Buffered,
+            false,
+        )
+    };
+
+    window.setTitle(&NSString::from_str(title));
+    window.setDelegate(Some(ProtocolObject::from_ref(&*window_delegate)));
+
+    (window, window_delegate)
+}
+
 pub fn create_window(mtm: MainThreadMarker) -> (Retained<NSWindow>, Retained<WindowDelegate>, Retained<ToolbarDelegate>) {
     // 1. Allocate and initialize the Window Delegate
     let window_delegate: Allocated<WindowDelegate> = unsafe { msg_send![WindowDelegate::class(), alloc] };

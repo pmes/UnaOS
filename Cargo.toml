@@ -21,6 +21,7 @@ members = [
     "apps/cli/unafs_bench",
     "apps/cli/sentinel",
     "apps/lumen",
+    "apps/pulse",
     # "apps/una",   # PARKED — IDE vessel; excluded during GUI-API consolidation
     "libs/lux"
 ]
@@ -30,6 +31,7 @@ members = [
 # It will automatically target Mac (aarch64-apple-darwin).
 default-members = [
     "apps/lumen",
+    "apps/pulse",
     # "apps/una",   # PARKED — see GUI-API consolidation
     "apps/cli/vertex",
     "apps/cli/unafs",

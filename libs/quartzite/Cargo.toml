@@ -63,7 +63,8 @@ objc2-app-kit = { version = "0.3.2", features = [
     "NSOutlineView",
     "NSTableColumn",
     "NSControl",
-    "NSTitlebarAccessoryViewController"
+    "NSTitlebarAccessoryViewController",
+    "NSGraphics"
 ] }
 dispatch2 = "0.3.1"
 block2 = "0.6.2"
