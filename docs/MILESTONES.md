@@ -10,6 +10,45 @@ Legend: **✅ metal-confirmed** · **🔬 QEMU-green, metal pending** · dates I
 
 ---
 
+## ux lane — 2026-07-10 (UI-1 — scale-aware UI, the one-cell cursor, the CPU pulse redesign, `pulse`)
+
+### UI-1 — the UI metrics layer + CPU pulse row + full-screen `pulse` (x86 + aarch64) 🔬 `ux-ui1`
+- **What (M1, `76b1136`):** THE METRICS RULE lands as a standing directive — *no absolute pixel
+  sizes in UI code*. New `ui.rs` derives an integer `SCALE` from the panel height at surface init
+  (`clamp(h/900, 1, 4)`: 1 at ≤900p, 2 at 1800p-class, cap 4) and every UI dimension follows
+  (`cell = 8·scale`, `line_h = cell + cell/2`, `margin = line_h`); `GneissPal` grows a provided
+  `metrics()`; `draw_text` renders each glyph pixel as a `scale`×`scale` block (scale-1 path
+  unchanged). `console.rs` converts off its hardcoded TOP/LINE_H/20-px insets onto the metrics, the
+  prompt/input/cursor drawing is factored into one shared path, and **the cursor is BY CONSTRUCTION
+  exactly one metrics cell** — fixing the 8×16 cursor standing double the 8×8 text height (the
+  clear strip is now exactly `line_h`). `Console::page_rows` (the pager's single source of truth)
+  now computes from the derived `line_h`. Evidence at every surface bring-up:
+  `:: UI1: scale=N cell=WxH line=H ::`.
+- **What (M2, `042eb28`):** the vug CPU meter becomes Peter's sketch — one horizontal row of
+  per-core NUMBERED segment bars `CPU 1 ▮▮▮▮▯▯ 2 ▮▮▯▯▯▯ …` (10 fixed segments; filled ∝ load;
+  empty segments dim so an idle core reads alive-but-empty, never blank), scale-aware, for however
+  many cores `sched::meter_cpu_count()` reports. Sampling factored into the shared `CpuPulse`;
+  the **honest two-source rule (VUG-1 M3b) kept verbatim** (sched busy-fraction for scheduler-
+  accounted cores — the Orin path, not regressed; own render busy% for the unscheduled demo core,
+  logged once). RENDER meter stays.
+- **What (M3, `5527160`):** full-screen system monitor (BeOS Pulse homage), `vug::run_pulse` + a `pulse`
+  shell arm — the M2 widget larger (double-size segments, one row per core, load %), plus the
+  honest system lines available today (core count, uptime ms, live frame counter, frame time +
+  FPS while open). vug loop contract: pump-own-input, one present per frame, busy-poll +
+  `yield_now` (never WFI — the JB2b/JC3 rule), any key exits, `took_screen` honored. Serial:
+  `:: PULSE: live — N cores ::` / `:: PULSE: exit clean — N frames ::`.
+- **How tested (QEMU):** per milestone: `./arroyo check` + `UNAOS_TEGRA=1` check green (both
+  arches); `test 25` → MISSION + 17 PASS (= base); `test-arm 22` → MISSION (= base);
+  `kernel8-test 30` → 23 PASS **set-identical to base** + CAPSTONE 6/6 (UI changes perturb no
+  serial fixture). Scripted headless QMP runs (real usb-kbd path): typed `vug` → crystal live/exit
+  clean + the numbered pulse row on the screendump (core 1 filled, cores 2–4 dim-but-alive); typed
+  `pulse` → live — 4 cores, 963 frames, exit clean, console restored with the one-cell cursor
+  (screendumps at 1280×800; the Pi 640×480 shot covers the small end). Attended visual verdict:
+  Peter's, at the QEMU GUI / next benches (scale=2 needs the Retina rMBP panel — every QEMU
+  target reports ≤900p, so scale>1 is metal-attended).
+- **Docs:** `docs/dev/OS/08_VIDEO/engine.md` §0 (THE METRICS RULE — the standing directive), §4
+  (pulse-row redesign), §4b (`pulse`); this entry.
+
 ## hw-jetson track — 2026-07-10 (JD5 — the write path: the panel becomes a real workstation shell; same-day attended bench — PASS)
 
 ### JD5 — `touch` / `write` / `append` / `rm` / `sync` on the panel shell ✅ METAL-CONFIRMED (2026-07-10) `hw-jetson`

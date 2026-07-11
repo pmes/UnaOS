@@ -9,6 +9,40 @@ capability lands here with a visible artifact.
 This file is the **running ledger of engine primitives** — what the renderer can
 do, where each primitive lives, and its invariants. It grows as the engine does.
 
+---
+
+## 0. THE METRICS RULE (standing directive — UI-1)
+
+**No absolute pixel sizes in UI code.** One metrics layer
+(`unaos/crates/kernel/src/ui.rs`) derives an integer `scale` from the panel's
+real height (`scale = clamp(height / 900, 1, 4)` — 1 at ≤ 900p, 2 at
+1800p-class panels such as the rMBP Retina, capped at 4), and **every** UI
+dimension derives from the resulting [`ui::Metrics`]:
+
+| metric | derivation | meaning |
+|---|---|---|
+| `cell_w` / `cell_h` | `8 · scale` | the glyph cell; the text advance; **the cursor is exactly one cell, by construction** |
+| `line_h` | `cell + cell/2` | text row pitch (1.5-line rhythm); the input-line clear strip |
+| `margin` | `line_h` | page inset of screen-owning views |
+
+With a PAL in hand, `pal.metrics()` (a provided `GneissPal` method) returns the
+surface's metrics; they are a pure function of panel height — nothing to
+initialise, nothing to go stale. `pal::draw_text` is scale-aware: each glyph
+pixel renders as a `scale`×`scale` block (the scale-1 path is the classic
+per-pixel loop). `Console::page_rows` — the single source of truth for page
+height, which `selftest::Pager` shares — computes from the derived `line_h`.
+
+Evidence line, printed once per surface bring-up (`TargetPal::new`), on every
+target, headless-visible:
+
+```
+:: UI1: scale=N cell=WxH line=H ::
+```
+
+The one deliberate exception: the pre-heap boot console (`video/fbcon.rs`)
+keeps its own unscaled 8-px font — it exists before the allocator and is out of
+the GUI's life cycle. Anything else that names a pixel count is a bug.
+
 > **Arch-neutral, float-free.** `vug` compiles on x86_64 and aarch64 and is
 > reachable from the Orin panel shell (JD2), so it carries no `cfg(tegra)` and
 > uses no floating point: all geometry and maths run in **Q16.16 fixed point**
@@ -66,9 +100,9 @@ no timer to wake a sleeper). Modes: `vug` / `vug solid` (default), `vug wire`,
 > the PAL queue; wiring the Pi channel into a full-screen demo is a future
 > `main.rs`-side hook (out of this arc's lane).
 
-## 4. Instrumentation — the corner load meters (M3b)
+## 4. Instrumentation — the load meters (M3b, redesigned UI-1)
 
-Two small meters, kept unobtrusive (the crystal stays the star), both drawn
+Two small corner meters on the demo (the crystal stays the star), both drawn
 through the damage-tracked back buffer (one present per frame still holds):
 
 - **RENDER meter** — the honest software "GPU monitor" (there is no GPU; we render
@@ -78,17 +112,53 @@ through the damage-tracked back buffer (one present per frame still holds):
   filled-pixel count (sum of front-face screen areas). **Seam:** a real GPU
   utilization feed would replace `now_cycles`-derived busy % and the pixel
   estimate.
-- **CPU pulse meter** (BeOS-Pulse style) — per-core busy fraction over the same
-  window. Source: additive, relaxed, lock-free per-CPU counters bumped at the
-  dispatch point (`CPU_BUSY`) and the idle point (`CPU_IDLE`) of **both**
-  schedulers (`arch/x86_64/sched.rs`, `arch/aarch64/sched.rs`), read via
-  `sched::meter_cpu_count()` / `sched::meter_cpu_ticks(cpu)`. These counters are
-  **introspection only** — never read on any scheduling path. **Seam:** a real
-  per-core utilization / PMU feed would replace `meter_cpu_ticks`.
-  - *Caveat:* on x86 the GUI/`vug` context runs in the BSP inline loop (outside
-    `sched::run()`), so the demo core's own load shows in the RENDER meter while
-    the CPU-pulse bars reflect the scheduler-managed cores. On the Orin the pump
-    is a scheduled task, so its core lights up in the CPU-pulse meter directly.
+- **CPU pulse row** (UI-1, Peter's sketch) — one horizontal row of per-core
+  **numbered segment bars**: `CPU 1 ▮▮▮▮▯▯ 2 ▮▮▯▯▯▯ …`, for however many cores
+  `sched::meter_cpu_count()` reports. Each bar is a **fixed 10 segments**
+  (`PULSE_SEGS`); filled ∝ load (rounded; any nonzero load lights at least one);
+  **empty segments draw dim** — an idle core reads *alive-but-empty*, never
+  blank. All geometry derives from the metrics (segments are half-cell wide, one
+  cell tall in the corner form).
+
+**The honest two-source rule (M3b, kept verbatim — do not regress).** Per-core
+load lives in the shared `CpuPulse` sampler (`vug.rs`), used by both the corner
+row and the full-screen `pulse` view. Per ~200 ms window, per core:
+
+- scheduler-accounted core (`Δbusy+Δidle > 0`, i.e. the core is inside
+  `sched::run()`) → the scheduler's busy fraction, from the additive relaxed
+  per-CPU counters (`CPU_BUSY`/`CPU_IDLE` in both `arch/*/sched.rs`, introspection
+  only). This is the Orin scheduled-pump path and the x86 APs.
+- unscheduled executing core (counters frozen — the x86 GUI runs the demo in the
+  inline BSP loop) → that core IS the demo core; credit it with the render loop's
+  own measured busy-vs-yield fraction (the same number the RENDER meter shows),
+  and log it once:
+  `:: VUG|PULSE: CPU meter — core N is the demo core (unscheduled render loop, load from render busy%) ::`
+
+**Seam:** a real per-core utilization / PMU feed would replace `meter_cpu_ticks`.
+
+## 4b. `pulse` — the full-screen system monitor (UI-1 M3)
+
+`pulse` (shell command; `vug::run_pulse`) is the in-kernel half of the BeOS
+Pulse homage — a full-screen monitor view (a host-native `apps/pulse` vessel is
+a separate, future arc). It shows the M2 pulse widget **larger** (double-size
+segments, one row per core, with the load percent), plus the honest system
+lines available today: core count, uptime (`arch::ms()`), live frame counter,
+and frame/present time + FPS measured while the view is open.
+
+The loop follows the vug contract exactly: it runs inside the shell command,
+pumps input itself (`pal::pump_and_poll`), presents **once per frame**,
+busy-polls + `yield_now`s between frames (never WFI/sleeps — the post-drop
+aarch64 rule), and **any key exits** back to the console (`took_screen`
+honored; the shell repaints). Per-core loads ride the same `CpuPulse` sampler —
+two-source rule and all. The bare-metal Pi input caveat from §3 applies to
+`pulse` too.
+
+Serial evidence on entry/exit (headless-gate visible when scripted):
+
+```
+:: PULSE: live — N cores ::
+:: PULSE: exit clean — N frames ::
+```
 
 ## 5. Serial evidence
 
