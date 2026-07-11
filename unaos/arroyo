@@ -473,6 +473,28 @@ kernel8() {
     fi
     echo -e "${COLOR_GREEN}✅ EL0 user blob: $(wc -c < "${WORKSPACE_DIR}/target/user_blob.bin" | tr -d ' ') bytes${COLOR_RESET}"
 
+    # K2 (make-enforcement-LIVE): the SAME `cargo build --release` above builds every [[bin]] in the
+    # user-blob crate, so `owner-blob` + `imp-blob` are already linked (with user-blob.ld) alongside
+    # `user-blob`. objcopy each to a flat binary the kernel8 staging carries onto the card as K2OWN.BIN /
+    # K2IMP.BIN — two more distinct 8.3 names => two more distinct prog:<NAME> principals, the honest
+    # precondition for by_name_spawn_multivalued(). Position-independent like the hello blob (entry first).
+    for b in owner-blob imp-blob; do
+        out="${WORKSPACE_DIR}/target/$(echo "$b" | tr - _).bin"
+        "$TOOLBIN/llvm-objcopy" -O binary --only-section=.text \
+          "${WORKSPACE_DIR}/crates/user-blob/target/aarch64-base/release/${b}" "$out"
+        # A flat EL0 program must be non-empty and fit one code page (USER_CODE_SIZE = 0x1000); an empty
+        # or oversize blob is a build failure the loader would reject at spawn (BadSize) — catch it here.
+        [ -s "$out" ] || { echo -e "${COLOR_RED}ERROR: ${b}.bin missing/empty — K2 blob build failed${COLOR_RESET}"; exit 1; }
+        sz="$(wc -c < "$out" | tr -d ' ')"
+        [ "$sz" -le 4096 ] || { echo -e "${COLOR_RED}ERROR: ${b}.bin ${sz} bytes > USER_CODE_SIZE (4096)${COLOR_RESET}"; exit 1; }
+        # Entry-first assertion (the hello-blob discipline): the kernel enters the flat image at offset 0, so a
+        # toolchain reorder putting a non-entry byte first is a metal-only wrong-entry fault QEMU won't catch.
+        # Both K2 blobs' _start begins `mov x23, xzr` = 0xAA1F03F7 = little-endian bytes f7 03 1f aa. Assert it.
+        head4="$(head -c 4 "$out" | od -An -tx1 | tr -d ' \n')"
+        [ "$head4" = "f7031faa" ] || { echo -e "${COLOR_RED}ERROR: ${b}.bin does not start with _start (mov x23,xzr); first 4 bytes = ${head4}${COLOR_RESET}"; exit 1; }
+    done
+    echo -e "${COLOR_GREEN}✅ K2 EL0 programs: owner_blob.bin ($(wc -c < "${WORKSPACE_DIR}/target/owner_blob.bin" | tr -d ' ') B) + imp_blob.bin ($(wc -c < "${WORKSPACE_DIR}/target/imp_blob.bin" | tr -d ' ') B)${COLOR_RESET}"
+
     echo -e "${COLOR_YELLOW}⚡ Building bare-metal kernel8.img (Pi 4, microSD-slot boot)...${COLOR_RESET}"
     cd "$WORKSPACE_DIR/crates/kernel"
     RUSTFLAGS="-C link-arg=-T${WORKSPACE_DIR}/crates/kernel/pi-baremetal.ld" \
@@ -500,6 +522,13 @@ kernel8() {
     # very file back off the microSD it booted from; in QEMU it rides the same image attached via if=sd.
     # Mirror of the x86 carry (make-fat-img.sh's HELLO_BIN block).
     cp "${WORKSPACE_DIR}/target/user_blob.bin" "$KERNEL8_DIR/HELLO.BIN"
+
+    # K2: carry the two additional EL0 programs onto the boot media (make-pi-img.sh ditto's the whole
+    # staging dir). K2OWN.BIN = the private-create owner; K2IMP.BIN = the non-owner impostor. Re-created
+    # every kernel8 build (KERNEL8_DIR is wiped above), present in every kernel8-test image AND on metal.
+    # NEVER collide with HELLO.BIN/SCRATCH.BIN/GROW.BIN (other fixtures load/mutate those).
+    cp "${WORKSPACE_DIR}/target/owner_blob.bin" "$KERNEL8_DIR/K2OWN.BIN"
+    cp "${WORKSPACE_DIR}/target/imp_blob.bin" "$KERNEL8_DIR/K2IMP.BIN"
 
     # U9: plant a DEDICATED writable scratch file (NEVER HELLO.BIN — other fixtures load that as EL0 code).
     # 1 KiB (> 512 so fat::probe_once never cats it) of a known 0xEE filler; the u9 File-write demo opens it

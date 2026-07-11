@@ -21,6 +21,19 @@ edition = "2021"
 name = "user-blob"
 path = "src/main.rs"
 
+# K2 (make-enforcement-LIVE): two additional flat EL0 programs built by the SAME `cargo build` the
+# `kernel8` arroyo step already runs (all `[[bin]]`s build together; the shared user-blob.ld applies to
+# each). Distinct 8.3 filenames on the card => distinct `prog:<NAME>` principals — the honest precondition
+# for LIVE cross-reboot enforcement. `owner-blob` (K2OWN.BIN) privately creates+owns K2PRIV.BIN; `imp-blob`
+# (K2IMP.BIN) is a non-owner that must be denied. See arch/aarch64/syscall.rs `k2_liveenf_launcher`.
+[[bin]]
+name = "owner-blob"
+path = "src/owner.rs"
+
+[[bin]]
+name = "imp-blob"
+path = "src/imp.rs"
+
 # opt-level "s" (size) per the M6c brief: a tiny flat blob. panic=abort (no unwinder in a no_std EL0
 # program); lto folds the single routine. No dependencies.
 [profile.release]

@@ -278,6 +278,35 @@ Legend: **✅ metal-confirmed** · **🔬 QEMU-green, metal pending** · dates I
   attended bench; M3/M4 self-clean so the stateful card accumulates nothing.
 - **Detail:** [`SECURITY.md` §K1](SECURITY.md). **Commits:** K1 M2.3/M2.4/M3/M2.2/M4 on `hw-pi4` (see `git log`).
 
+## hw-pi4 track — 2026-07-11 (K2 — make cross-reboot enforcement LIVE: 2nd/3rd programs + gate flip + grow-repersist + real-program proof)
+
+### K2 M(a)–M(d) — the U6 reboot-surviving ACL is now ENFORCED, proven end-to-end through REAL programs 🔬 `hw-pi4`
+- **What:** K1 proved the persist→rebuild→enforce mechanism but GATED it off (only one launchable named
+  program existed, so a persisted owner could deny everyone yet be re-acquired by no one — a brick). K2
+  supplies the honest precondition and turns it LIVE. **M(a):** two more EL0 programs on the card —
+  `K2OWN.BIN` (private `O_CREAT` owner) + `K2IMP.BIN` (non-owner), built as extra `[[bin]]`s of
+  `crates/user-blob` and carried by `arroyo kernel8`; three distinct 8.3 names → three distinct
+  `prog:<NAME>` principals. **M(b):** `atr_persist_grow` re-persists a named-owner file's
+  `first_cluster`/`size` on GROW (anonymous-inert → battery byte-equivalent). **M(c):** flipped
+  `by_name_spawn_multivalued()` true, so `atr_maybe_boot_rebuild` reinstalls persisted rows at real boot
+  (a QEMU no-op — `UNAFS.ATR` absent at that point; live effect is metal). **M(d):** `k2_liveenf_launcher`
+  spawns `K2OWN.BIN` (create+own+persist+grow `K2PRIV.BIN`), SIMULATES a reboot (`owned_clear` + remount +
+  `atr_rebuild_into_owned` → sentinel-owned row from disk), re-spawns `K2OWN.BIN` (re-admitted purely BY
+  NAME), spawns `K2IMP.BIN` (refused `-EACCES`), then self-cleans. **F2:** a 13-agent adversarial review
+  (1/9 confirmed) caught a metal self-clean gap (pre-flight skip returned before the stale-`K2PRIV.BIN`
+  cleanup) — fixed.
+- **Tested (QEMU):** `check` BOTH arches (x86 unchanged); `kernel8` baremetal; `kernel8-test` → **23 PASS
+  byte-equivalent** (the `:: K2-liveenf: … rebuild+enforce PASS [w=0x7f] ::` witness — 7 bits: create+stamp,
+  in-RAM owner, disk-survive+rebuild, rebuilt-owned-by-name, owner-re-admitted-by-name, impostor-denied,
+  grow-repersist-landed — is the only addition, UNCOUNTED) + CAPSTONE 6/6 + F2/F3 witnesses locked
+  240000/240000 + the K1-atr/persist/corrupt lines, zero R1/CMD13; `test-arm` MISSION SUCCESS. Zero x86.
+- **Metal:** the true cross-reboot power-cycle survival (a `prog:X` owner file surviving a real power-cycle,
+  admitted-by-name on the next boot, impostor denied) is metal-attended — QEMU can only same-boot SIMULATE
+  the reboot (fresh-per-build FAT, no Group-1 IRQ). Pristine card (delete stale `UNAFS.ATR`) is the bench
+  pre-condition. `k2_liveenf_launcher` self-cleans so the stateful card accumulates nothing.
+- **Detail:** [`SECURITY.md` §K1 (K2 bullet)](SECURITY.md). **Commits:** K2 M(a)/M(b)/M(d)/M(c)/M(d)-F1/F2
+  on `hw-pi4` (see `git log`).
+
 ## hw-jetson track — 2026-07-10 (JD4 — read-side navigation + last dead levers + screen-on-boot; same-day attended bench)
 
 ### JD4 — `ls <dir>` / `cd` / `pwd` / `cat <path>` on the panel shell + JB2c/JB9b lever retirement + screen-on-boot ✅ METAL-CONFIRMED (2026-07-10) `hw-jetson`

@@ -72,7 +72,7 @@ the shared userspace port.
 | Arc | Content | Track |
 | :--- | :--- | :--- |
 | **STOR-1** | Interrupt-driven x86 storage: a scheduled IF=1 service task owns the xHCI BOT pump; syscalls submit a block request + block on a per-request semaphore. Read/write/grow/create/delete synchronous in-syscall, behind the `irqstorage` knob. S1–S4 landed; core transfer-IRQ mechanism metal-confirmed. Next: S5 real shared backing for cross-process opens | rmbp |
-| **K1** | Reboot-surviving ACL: the U6 owner/grants persist to an on-disk `UNAFS.ATR` file (kernel-stamped `PrincipalRecord`, volume-fingerprint bound). Foundation + persistence landed; cross-reboot *enforcement* is proven and gated pending a second launchable named program (K2) | pi4 |
+| **K1+K2** | Reboot-surviving ACL: the U6 owner/grants persist to an on-disk `UNAFS.ATR` file (kernel-stamped `PrincipalRecord`, volume-fingerprint bound). Foundation + persistence landed (K1); **K2 turned cross-reboot enforcement LIVE** — three distinct launchable named programs on the card, the gate flipped, grow-repersist, and an end-to-end proof through REAL programs (`K2OWN.BIN` re-admitted by name after rebuild, `K2IMP.BIN` denied). QEMU same-boot simulates the reboot; true power-cycle survival is metal-attended | pi4 |
 | **UI/gfx** | Scale-aware UI metrics (no absolute pixel sizes), the in-kernel `pulse` monitor + `apps/pulse` host vessel, the `vug` software-rendered crystal engine, and the fbcon cached-RAM shadow that kills the uncached-VRAM scroll on x86 | rmbp/ux |
 
 ## 2. UnaFS: meeting and surpassing BeFS
