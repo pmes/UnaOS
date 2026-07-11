@@ -5171,12 +5171,23 @@ fn sys_open_dynamic(row: usize, name: &str, mode: u64) -> i64 {
         // requested rights follow the open mode (RW or O_CREAT -> R|W; else R); a denial is a clean -EACCES with
         // nothing claimed. The gen fence is the caller's CURRENT SLOT_GEN.
         if let Some((srcrow, existing)) = created_desc_any_row(row, nameid) {
+            // STOR-1 S5b (residual 4, open-vs-unlink TOCTOU): re-check the global deleted flag AFTER resolving. A
+            // concurrent unlink on another core could have claimed the name between the first check above and this
+            // resolve; opening a sibling now would incref a doomed name. Fail closed exactly as the first check (a
+            // plain re-open -> -ENOENT, an O_CREAT re-create -> -EBUSY). Under S5a reads are live shared backing,
+            // so even a slipped-through open reads the deferred (still-on-disk until last close) file — never a
+            // torn/stale snapshot — but this makes the fail-closed semantics explicit and keeps
+            // re-open-after-unlink -> -ENOENT. (The residual re-check -> incref window is narrowed here + by
+            // open_created_sibling's source re-validation; the airtight fix is the S6 namespace lock.)
+            if DYN_DELETED_G[nameid as usize].load(Ordering::Acquire) {
+                return if create { EBUSY } else { ENOENT };
+            }
             let requested = if mode & 1 != 0 || create { CAP_READ | CAP_WRITE } else { CAP_READ };
             let caller_gen = SLOT_GEN[row].load(Ordering::Acquire);
             if !owned_access_ok(nameid as usize, row, caller_gen, requested) {
                 return EACCES;
             }
-            return open_created_sibling(row, srcrow, existing, requested);
+            return open_created_sibling(row, srcrow, existing, nameid as usize, requested);
         }
     }
     // O_CREAT of a creatable name -> a fresh 0-length created file (the first write grows it). U6x: owned-by-
@@ -5241,20 +5252,41 @@ fn open_create_new(row: usize, nameid: u32, public: bool) -> i64 {
 
 /// U10 M2/M3 + U11x M2: open ANOTHER descriptor to a live created file (`[srcrow][existing]`) — the idempotent
 /// second O_CREAT open, the delete fixture's sibling handle, and (U11x M2) the CROSS-PROCESS open (`srcrow !=
-/// row`). COPIES the source descriptor's wstage content so the new descriptor's `WSTAGE_LEN == FILE_SIZE`
-/// invariant holds — a SNAPSHOT: a concurrent writer in the source row could torn-copy (ledgered in SECURITY.md;
-/// the demos sequence opens after writes complete — pi4 has no such window because both processes read the disk,
-/// serialized by the in-handler PIO). A sibling that WRITES and exits would enqueue its own CreateGrow op
-/// (NU10 == 1 overflow) — siblings are read-only in the demos (same ledger entry). Same CREATED identity
-/// (`FILE_OPNAME` name-id) so `sys_unlink` invalidates every sibling of the file in the unlinking row, and the
-/// U11x M2 global refcount counts this open (incref before `install_file_handle` — the unwind-pairing rule).
-fn open_created_sibling(row: usize, srcrow: usize, existing: usize, rights: u32) -> i64 {
-    let seed: &[u8] = match (FILE_WSTAGE[srcrow][existing].load(Ordering::Acquire) as usize).checked_sub(1) {
-        Some(ew) => wstage_bytes(ew),
-        None => &[],
+/// row`). The sibling's identity is stamped from the CALLER-VERIFIED `nameid` (never a re-read of the source
+/// slot), and it reads/writes through the U11x M2 global refcount (incref before `install_file_handle` — the
+/// unwind-pairing rule). **STOR-1 S5a:** knob-on (`s4_sync_storage()`) a created-file descriptor READS the LIVE
+/// shared on-disk backing (`sys_read` -> `created_read_live`), so the sibling seeds its wstage EMPTY — no snapshot
+/// COPY of the source's private buffer — retiring the ledgered torn-copy / cross-file-disclosure residual (U11x
+/// M2 residual 3) by construction. Knob-off / no-FAT / pre-service it keeps snapshot-copying the source wstage
+/// (reads still serve wstage) — byte-identical to pre-S5. `sys_unlink` invalidates every sibling of a name in the
+/// unlinking row via the shared `FILE_OPNAME` name-id.
+fn open_created_sibling(row: usize, srcrow: usize, existing: usize, nameid: usize, rights: u32) -> i64 {
+    // STOR-1 S5b (SF-3, residual 4 recycle-to-wrong-file): `created_desc_any_row` resolved `[srcrow][existing]`
+    // WITHOUT a lock, so on metal it could have been closed since (`files_free` bumps the gen + clears
+    // FILE_OPNAME/FILE_CREATED) and its slot first-fit-REUSED for a DIFFERENT name. Re-validate the source STILL
+    // is a live created descriptor for the caller-verified `nameid`; else the slot was recycled — fail closed
+    // (`-ENOENT`) rather than open a sibling of the WRONG file (which under S5a would read that other file's LIVE
+    // bytes: cross-file disclosure + ACL bypass). Stamping identity from `nameid` (not a re-read of the source's
+    // opname) means the sibling can only ever name the file the ACL admitted. (The source read + this re-check are
+    // not atomic — the airtight fix is the S6 namespace lock; this narrows the window to a couple of loads.)
+    if !(FILE_USED[srcrow][existing].load(Ordering::Acquire)
+        && FILE_CREATED[srcrow][existing].load(Ordering::Acquire)
+        && FILE_OPNAME[srcrow][existing].load(Ordering::Acquire) as usize == nameid + 1)
+    {
+        return ENOENT;
+    }
+    // S5a Change 2: seed EMPTY knob-on (reads go live, no snapshot copy — residual 3 closed by construction); keep
+    // the snapshot seed knob-off (reads serve wstage). The sibling still owns a (0-length knob-on) writable buffer
+    // so an RW sibling's in-place write-through can mirror into it; that mirror is dead weight for reads knob-on.
+    let seed: &[u8] = if s4_sync_storage() {
+        &[]
+    } else {
+        match (FILE_WSTAGE[srcrow][existing].load(Ordering::Acquire) as usize).checked_sub(1) {
+            Some(ew) => wstage_bytes(ew),
+            None => &[],
+        }
     };
     let size = FILE_SIZE[srcrow][existing].load(Ordering::Acquire);
-    let opname = FILE_OPNAME[srcrow][existing].load(Ordering::Acquire); // already +1-biased
     let Some(w) = wstage_alloc(seed) else {
         return EMFILE;
     };
@@ -5263,10 +5295,8 @@ fn open_created_sibling(row: usize, srcrow: usize, existing: usize, rights: u32)
         return EMFILE;
     };
     FILE_CREATED[row][fid].store(true, Ordering::Release);
-    FILE_OPNAME[row][fid].store(opname, Ordering::Release);
-    if let Some(nameid) = (opname as usize).checked_sub(1) {
-        openf_incref(nameid);
-    }
+    FILE_OPNAME[row][fid].store((nameid + 1) as u32, Ordering::Release); // caller-verified identity
+    openf_incref(nameid);
     // U6x: install exactly the ACL-vetted rights the open mode asked for — an RW open (owner, or a WRITE
     // grantee) gets CAP_READ|CAP_WRITE; an RO open (a READ-only grantee) gets CAP_READ. The `sys_open_dynamic`
     // ACL already proved `rights ⊆ granted`, so this never amplifies. (Pre-U6x callers all opened RW, so the
@@ -5385,6 +5415,26 @@ fn sys_open(name_ptr: u64, name_len: u64, mode: u64) -> i64 {
     h as i64
 }
 
+/// STOR-1 S5a: read `want` bytes at byte `offset` of the CREATED/growable file behind descriptor `[row][idx]`
+/// from the LIVE shared on-disk backing — resolve its name (`FILE_OPNAME` name-id -> `U10_NAMES`) and
+/// `submit_read_file` into the KERNEL buffer `kbuf`. This is the created-file READ SOURCE `sys_read` routes to
+/// knob-on (retiring the private wstage snapshot), and the exact function the S5 shared-backing witness exercises.
+/// Returns the byte count read (`>= 0`) or `-EIO`. A descriptor with `FILE_OPNAME == 0` names no created file
+/// (defensive — the `sys_read` caller already gates on `FILE_OPNAME != 0`), returning `-EIO` rather than indexing
+/// `U10_NAMES` out of range. SAFETY: `kbuf` is a live kernel buffer of `>= want` bytes on the caller's stack; the
+/// caller is a scheduled task (so `submit_read_file` can block on the service task).
+#[cfg(feature = "irqstorage")]
+unsafe fn created_read_live(row: usize, idx: usize, offset: u32, kbuf: *mut u8, want: usize) -> i32 {
+    let Some(nameid) = (FILE_OPNAME[row][idx].load(Ordering::Acquire) as usize).checked_sub(1) else {
+        return EIO as i32; // opname 0 -> not a created name; never index U10_NAMES
+    };
+    if nameid >= N_U10_NAMES {
+        return EIO as i32;
+    }
+    let name = U10_NAMES[nameid];
+    unsafe { crate::drivers::xhci::irqstorage::submit_read_file(name.as_bytes(), offset, kbuf, want) }
+}
+
 /// SYS_READ(handle, buf, len) -> the byte count (`0` = EOF), or a negative errno. The object table's
 /// first resource-read CHECK on a non-Console object: `handle_resolve(row, handle, CAP_READ)` must yield
 /// a `File`. A missing right (`Denied`), a non-File kind (Console/Child/Socket), or no handle (Empty/oob)
@@ -5482,6 +5532,40 @@ fn sys_read(handle: u64, buf: u64, len: u64) -> i64 {
             }
             return got as i64;
         }
+    }
+    // STOR-1 S5a (irqstorage): a CREATED-file descriptor reads the LIVE SHARED on-disk backing through the
+    // storage service task (`created_read_live` -> `submit_read_file` BY NAME), retiring its private wstage
+    // snapshot as the read SOURCE. Gate: FILE_CREATED (so GROW.BIN — a growable STAGED file, FILE_CREATED ==
+    // false — keeps its wstage serve, byte-identical) AND FILE_OPNAME != 0 (defensive: names a U10 file; also
+    // keeps a recycled opname-0 created descriptor off `U10_NAMES`). A created file is on disk (S4a create + S4b
+    // grow) and every created-file write writes THROUGH (S4), so the disk is the source of truth: a cross-process
+    // sibling READS a peer's writes (shared backing) instead of a stale open-time snapshot. Same FAT + service
+    // gate as S2/S3; no-FAT / pre-service / knob-off fall through to the wstage serve below unchanged.
+    #[cfg(feature = "irqstorage")]
+    if FILE_CREATED[row][idx].load(Ordering::Acquire)
+        && FILE_OPNAME[row][idx].load(Ordering::Acquire) != 0
+        && HELLO_STAGED.load(Ordering::Acquire)
+        && crate::drivers::xhci::irqstorage::service_ready()
+    {
+        // Bounce through a kernel-stack buffer (as S2/S3): the service task's kernel CR3 cannot reach the ring-3
+        // window. `want <= FILE_SIZE <= PAGE_SIZE` (created files are one-page-bounded by the grow clamp), so one
+        // page suffices.
+        let mut kbuf = [0u8; PAGE_SIZE as usize];
+        let n = unsafe { created_read_live(row, idx, offset, kbuf.as_mut_ptr(), want) };
+        if n < 0 {
+            return EIO; // a live created-file read failure -> fail closed (the disk is the source of truth)
+        }
+        // As S2/S3 (N1): the offset was CAS-advanced by `want`; a live short read delivers `got <= want`. BENIGN
+        // for created files — the descriptor's FILE_SIZE <= the on-disk size ALWAYS (grow persists to disk BEFORE
+        // bumping FILE_SIZE; a sibling captures size <= the source's already-synced size), so `got == want` here.
+        let got = (n as usize).min(want);
+        if got == 0 {
+            return 0; // live EOF / short read
+        }
+        unsafe {
+            core::ptr::copy_nonoverlapping(kbuf.as_ptr(), buf as *mut u8, got);
+        }
+        return got as i64;
     }
     // U9x: serve from the descriptor's WRITABLE staging buffer if it has one (a RW open — so a read-back
     // witnesses prior writes through the same cap), else the read-only staged source (a RO open — written
@@ -9479,6 +9563,130 @@ fn u11m2_phase(srow: usize, demo_cpu: usize, via_teardown: bool, want_done: u32)
     pass
 }
 
+/// STOR-1 S5 witness core (run under `s5_shared_backing_witness`'s row alloc + cleanup): create DEFER.BIN on the
+/// creator row `r1`, grow the disk to P1, open a CROSS-ROW sibling on `r2` through the PRODUCT open path, then
+/// prove — NON-VACUOUSLY — that the sibling reads LIVE SHARED backing (not a private snapshot). Returns `None` for
+/// a clean resource SKIP (no descriptor/wstage slot — no serial line), `Some(true)` PASS, `Some(false)` FAIL
+/// (having printed its own diagnostic). The proof is a CONJUNCTION the old snapshot model fails: (Change 2) the
+/// sibling's wstage is EMPTY (no snapshot copy) AND (Change 1) its read SOURCE (`created_read_live`, the exact fn
+/// `sys_read` routes a created descriptor through) returns a peer's POST-OPEN overwrite — a value that cannot come
+/// from the empty private buffer. `FILE_SIZE == 16` on the sibling proves the production `sys_read` size clamp is
+/// exercised faithfully (a stale-0 size would make the real read EOF). No concurrent stress: read/write file ops
+/// serialize through the SINGLE storage service task, so tearing is impossible by construction (not a metal race).
+#[cfg(feature = "irqstorage")]
+fn s5_witness_run(r1: usize, r2: usize, nameid: usize) -> Option<bool> {
+    const P1: [u8; 16] = *b"S5-SHARED-BEF-01";
+    const P2: [u8; 16] = *b"S5-SHARED-AFT-02";
+    // Create DEFER.BIN PUBLIC on r1 (so the cross-row sibling may open it by name), then GROW the disk to P1.
+    let h1 = open_create_new(r1, nameid as u32, true);
+    if h1 < 0 {
+        return None; // EMFILE/EAGAIN — a resource skip, not a failure
+    }
+    let Some((_, fid1)) = created_desc_any_row(r1, nameid as u32) else {
+        return Some(false); // just created it — a miss is a real bug
+    };
+    let mut p1 = P1;
+    if unsafe { crate::drivers::xhci::irqstorage::submit_grow(U11M2_NAME.as_bytes(), 0, p1.as_mut_ptr(), 16) } < 0 {
+        return Some(false); // disk grow failed
+    }
+    // SF-2 (production-faithful): set the creator's FILE_SIZE so the sibling captures a non-zero size (else the
+    // real `sys_read` clamps `want` to 0 -> EOF while `created_read_live(want=16)` would still read 16 and mask it).
+    FILE_SIZE[r1][fid1].store(16, Ordering::Release);
+    // Open the CROSS-ROW sibling through the product path (`sys_open_dynamic` -> the S5b re-check -> owned_access_ok
+    // -> `open_created_sibling`, which knob-on seeds an EMPTY wstage — no snapshot copy).
+    let h2 = sys_open_dynamic(r2, U11M2_NAME, 1); // RW
+    if h2 < 0 {
+        return if h2 == EMFILE { None } else { Some(false) }; // EMFILE (wstage/rows) -> skip; else fail
+    }
+    let Some((_, fid2)) = created_desc_any_row(r2, nameid as u32) else {
+        return Some(false);
+    };
+    let Some(w2) = (FILE_WSTAGE[r2][fid2].load(Ordering::Acquire) as usize).checked_sub(1) else {
+        return Some(false); // a sibling always owns a wstage
+    };
+    // Change 2 (residual 3): the sibling holds NO snapshot — its wstage is EMPTY. SF-2: it captured size 16.
+    let no_snapshot = WSTAGE_LEN[w2].load(Ordering::Acquire) == 0;
+    let size_ok = FILE_SIZE[r2][fid2].load(Ordering::Acquire) == 16;
+    // Sanity: the sibling's LIVE read source returns the on-disk P1.
+    let mut kbuf = [0u8; 16];
+    let n1 = unsafe { created_read_live(r2, fid2, 0, kbuf.as_mut_ptr(), 16) };
+    let read_p1 = n1 == 16 && kbuf == P1;
+    // A PEER overwrites the disk in place AFTER the sibling opened (a different holder's write). Bytes never touch
+    // the sibling's private wstage.
+    let mut p2 = P2;
+    let wr = unsafe {
+        crate::drivers::xhci::irqstorage::submit_write_file(U11M2_NAME.as_bytes(), 0, p2.as_mut_ptr(), 16)
+    };
+    // Change 1 (residual 3, the payoff): the sibling now READS P2 — the post-open peer overwrite — from the shared
+    // live backing, while its private wstage is STILL EMPTY. The conjunction is the discriminator: under the old
+    // snapshot model `no_snapshot`/`still_empty` would be false (wstage held P1) and this could not observe P2.
+    let mut kbuf2 = [0u8; 16];
+    let n2 = unsafe { created_read_live(r2, fid2, 0, kbuf2.as_mut_ptr(), 16) };
+    let read_p2 = n2 == 16 && kbuf2 == P2;
+    let still_empty = WSTAGE_LEN[w2].load(Ordering::Acquire) == 0;
+    let pass = no_snapshot && size_ok && read_p1 && wr == 16 && read_p2 && still_empty;
+    if !pass {
+        serial_println!(
+            ":: S5 FAIL — no_snapshot={} size_ok={} read_p1={} wr={} read_p2={} still_empty={} (n1={} n2={}) ::",
+            no_snapshot, size_ok, read_p1, wr, read_p2, still_empty, n1, n2
+        );
+    }
+    Some(pass)
+}
+
+/// STOR-1 S5 witness — cross-process reads serve LIVE shared on-disk backing (not a private snapshot). A
+/// deterministic, kernel-side, cross-row proof folded into the u11m2 launcher chain (runs FIRST, so DEFER.BIN and
+/// all three wstage slots are free; it peaks at two and releases before the phases). REUSES DEFER.BIN — no new U10
+/// name, so ZERO knob-off footprint. Requires knob-on + FAT + service (created reads route live); SKIPS SILENTLY
+/// otherwise (no serial line — the DONE gate's `test 40` knob-on stays 18 PASS + MISSION + bx-blockreq). The
+/// u11m2 / u6gx EL0 fixtures supply the production-faithful DISPATCH proof (a real SYS_READ of a cross-process
+/// sibling returns the correct pattern from an EMPTY-wstage sibling -> the read can only be live). Every leg tears
+/// the scratch rows down via the real teardown funnel (decrefs OPENF[DEFER] to 0) + deletes the on-disk file +
+/// asserts the name is left idle — never a force-store of OPENF/DYN_DELETED_G, never a stranded slot/refcount.
+#[cfg(feature = "irqstorage")]
+fn s5_shared_backing_witness() {
+    // Gate: created reads route live ONLY knob-on with a mounted FAT + the service task up. Off -> SILENT skip.
+    if !s4_sync_storage() {
+        return;
+    }
+    let Some(nameid) = u10_name_id(U11M2_NAME).map(|i| i as usize) else {
+        return;
+    };
+    // DEFER.BIN must be idle before the phases; if not (can't happen here — the witness is FIRST), don't interfere.
+    if OPENF_REFS[nameid].load(Ordering::Acquire) != 0 || DYN_DELETED_G[nameid].load(Ordering::Acquire) {
+        return;
+    }
+    // Self-heal a persistent card: remove any stale on-disk DEFER.BIN so the create starts clean.
+    let _ = unsafe { crate::drivers::xhci::irqstorage::submit_delete(U11M2_NAME.as_bytes()) };
+    let Some(r1) = crate::arch::memory::alloc_user_space() else {
+        return; // no scratch address space — silent skip
+    };
+    let Some(r2) = crate::arch::memory::alloc_user_space() else {
+        crate::arch::memory::free_user_space_by_cr3(crate::arch::memory::slot_cr3(r1));
+        return;
+    };
+    let outcome = s5_witness_run(r1, r2, nameid);
+    // Cleanup — release BOTH rows via the real teardown funnel (each created descriptor's `openf_release` decrefs
+    // OPENF[DEFER]; the name was never unlinked, so no last-close delete fires), THEN delete the on-disk file.
+    crate::arch::memory::free_user_space_by_cr3(crate::arch::memory::slot_cr3(r2));
+    crate::arch::memory::free_user_space_by_cr3(crate::arch::memory::slot_cr3(r1));
+    let _ = unsafe { crate::drivers::xhci::irqstorage::submit_delete(U11M2_NAME.as_bytes()) };
+    let cleaned =
+        OPENF_REFS[nameid].load(Ordering::Acquire) == 0 && !DYN_DELETED_G[nameid].load(Ordering::Acquire);
+    match outcome {
+        None => {} // silent resource skip (no line)
+        Some(true) if cleaned => serial_println!(
+            ":: S5: cross-process read serves LIVE shared backing — a created-file sibling holds NO private snapshot (empty wstage) yet its read SOURCE returns a peer's POST-OPEN overwrite (P2); torn-copy (residual 3) closed by construction, open-vs-unlink (residual 4) re-checked; read/write serialize through the single service task -> PASS ::"
+        ),
+        Some(true) => serial_println!(
+            ":: S5 FAIL — witness passed but cleanup left DEFER.BIN state (OPENF={} DYN_DELETED={}) ::",
+            OPENF_REFS[nameid].load(Ordering::Acquire),
+            DYN_DELETED_G[nameid].load(Ordering::Acquire)
+        ),
+        Some(false) => {} // FAIL diagnostic already printed by s5_witness_run
+    }
+}
+
 /// U11x M2 launcher + verdict — cross-process unlink-defers-free, the x86 twin of pi4 U11 M2/M2b (aarch64
 /// `b88d2ba`/`303e271`): a file's deferred on-disk DELETE fires at the LAST close ACROSS PROCESSES, not at
 /// unlink — the launcher's IF=1 drain playing the pi4 reaper. Two phases over the same machinery, one per
@@ -9495,6 +9703,11 @@ fn u11m2_launcher(demo_cpu: usize) {
     if crate::drivers::block::info().is_none() {
         return;
     }
+    // STOR-1 S5: prove cross-process created-file reads serve LIVE shared backing (knob-on + FAT only). Runs
+    // FIRST — DEFER.BIN and all wstage slots are free; it reuses DEFER.BIN and cleans up fully before phase 1
+    // (idempotent self-heal + a post-cleanup OPENF/DYN_DELETED_G assert). SILENT skip off the knob-on FAT path.
+    #[cfg(feature = "irqstorage")]
+    s5_shared_backing_witness();
     let Some(srow) = crate::arch::memory::alloc_user_space() else {
         serial_println!(":: U11m2: no free scratch slot — cross-process unlink demo skipped ::");
         return;
@@ -9615,7 +9828,25 @@ fn u6gx_launcher(_demo_cpu: usize) {
     };
     U6GX_OWNER_WITNESS.store(0, Ordering::Release);
     U6GX_GRANTEE_WITNESS.store(0, Ordering::Release);
-    let b_pid = crate::arch::sched::spawn_user_in_space("u6gx-grantee", b.entry, b.sp, cpu_b, b.cr3);
+    // STOR-1 S5: knob-on, u6gx's created READS route through the storage service task (C2). Owner A busy-spins
+    // on its GO word on the SERVICE TASK'S CORE (both take `online.first()`); a NON-preemptible spin (IF=0,
+    // `spawn_user_in_space`) would then STARVE the service task, so grantee B's cross-core granted read — which
+    // blocks on it — never completes (a deadlock: launcher waits B, B waits the service task, the service task
+    // waits behind A's IF=0 spin; the PRIO_HIGH service task cannot preempt an IF=0 ring-3 task). So spawn the
+    // fixtures PREEMPTIBLE (RFLAGS.IF set — the timer evicts the spinner so the PRIO_HIGH service task runs).
+    // Gated on `s4_sync_storage()` == "reads route live" (knob-on + FAT + service): knob-off / no-FAT reads serve
+    // wstage (no service task, no deadlock) and keep the BYTE-IDENTICAL non-preemptible spawn. u6gx is
+    // register-only (no FP/SIMD across a preemptible switch — the ledgered unsaved-FP gap is not reachable here).
+    // The KillSwitch is a watchdog safety net; the fixtures exit normally (SYS_EXIT), so it is unused.
+    let preempt = s4_sync_storage();
+    let b_pid = if preempt {
+        crate::arch::sched::spawn_user_preemptible(
+            "u6gx-grantee", b.entry, b.sp, cpu_b, b.cr3,
+            alloc::sync::Arc::new(crate::arch::sched::KillSwitch::new()),
+        )
+    } else {
+        crate::arch::sched::spawn_user_in_space("u6gx-grantee", b.entry, b.sp, cpu_b, b.cr3)
+    };
     PROCS[pi].slot.store(b.slot + 1, Ordering::Release); // slot first, then the live pid (the sys_spawn discipline)
     PROCS[pi].pid.store(b_pid, Ordering::Release);
     // Build + pre-endow + spawn A (the owner). Pre-endow A with a Child handle naming B (owner-scoped SYS_FGRANT).
@@ -9629,7 +9860,16 @@ fn u6gx_launcher(_demo_cpu: usize) {
     serial_println!(
         ":: U6gx: UnaFS owner/grants — the by-NAME ACL at SYS_OPEN (owned-by-default) + SYS_FGRANT delegation + F1 owner-only unlink (aarch64 U6 twin) ::"
     );
-    crate::arch::sched::spawn_user_in_space("u6gx-owner", a.entry, a.sp, cpu_a, a.cr3);
+    // A rides the same `preempt` gate as B (above) — knob-on it must be preemptible so the service task can run
+    // while A spins on the service core (A is `online.first()`, == the service task's core).
+    if preempt {
+        crate::arch::sched::spawn_user_preemptible(
+            "u6gx-owner", a.entry, a.sp, cpu_a, a.cr3,
+            alloc::sync::Arc::new(crate::arch::sched::KillSwitch::new()),
+        );
+    } else {
+        crate::arch::sched::spawn_user_in_space("u6gx-owner", a.entry, a.sp, cpu_a, a.cr3);
+    }
 
     // The choreography (single GO/SIG per slot): A creates -> B pre-grant deny -> A grants -> B granted open +
     // negatives (keeps its handle open) -> A revokes -> B post-revoke deny -> A reopen+unlink(deferred)+EBUSY ->
