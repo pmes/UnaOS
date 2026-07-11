@@ -738,6 +738,13 @@ case "${1:-}" in
     battery)
         battery
         ;;
+    mbench)
+        # Metal-bench harness passthrough: assert a serial capture (bridge log or
+        # QEMU target/serial*.log) against a witness spec in scripts/specs/.
+        # See scripts/mbench.py --help (replay / follow / self-test / inject).
+        shift
+        exec python3 "${WORKSPACE_DIR}/scripts/mbench.py" "$@"
+        ;;
     clean)
         clean_all
         ;;

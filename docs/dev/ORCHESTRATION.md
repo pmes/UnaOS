@@ -210,11 +210,19 @@ launchable named program (flips `by_name_spawn_multivalued` live) — so K1's
 survive-reboot metal rides the round that lands K2, not before. The gate applies
 to metal that *can* run given the round's code.
 
-**Tooling to make the gate cheap**: an automated metal-bench harness (scripted
-serial-bridge capture + witness-line assertion, a "metal battery" analog) is a
-standing high-leverage investment — it turns an attended bench from boot-and-
-photograph into run-the-script-get-pass/fail, which is what makes a per-round
-metal gate affordable rather than a tax. See the round-6 candidate slate.
+**Tooling to make the gate cheap**: **`mbench` — landed (round 6)**. The
+metal-bench harness (`unaos/scripts/mbench.py`; witness specs in
+`unaos/scripts/specs/*.spec`) asserts a serial capture — a live bridge log or a
+finished QEMU log — against a checked-in spec and prints one battery-style
+verdict table. Usage:
+`./arroyo mbench --follow ~/pi-serial.log --spec scripts/specs/pi4-regression.spec --timeout 120`
+(`--replay <log>` for finished captures; `--self-test` needs no hardware; spec
+directives are REQUIRE / COUNT / OPTIONAL / FORBID / PENDING — PENDING ships a
+witness ahead of its bench and is promoted to REQUIRE once first captured). It
+reads bridge LOG FILES only, never serial devices, and `--inject` is
+pi/jetson-only (the x86 FTDI console is TX-only). An attended bench is now
+run-the-script-get-pass/fail — which is what makes a per-round metal gate
+affordable rather than a tax.
 
 ## Guardrails specific to this seat
 

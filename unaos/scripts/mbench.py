@@ -626,6 +626,21 @@ def run_self_test():
         check("inject: script parses (CMD/SLEEP/WAIT)",
               [k for k, _ in steps] == ["CMD", "SLEEP", "WAIT", "CMD"])
 
+        # 8. inject FIFO round-trip: hold a FIFO O_RDWR|O_NONBLOCK exactly the
+        #    way the bridges do, send one command, read back `cmd\r`.
+        fifo = os.path.join(td, "test.in")
+        os.mkfifo(fifo)
+        bridge_fd = os.open(fifo, os.O_RDWR | os.O_NONBLOCK)
+        try:
+            inj = Injector(fifo, script, settle=0.0)
+            with contextlib.redirect_stdout(io.StringIO()):
+                inj._send("ver")
+            time.sleep(0.1)
+            got = os.read(bridge_fd, 64)
+            check("inject: FIFO round-trip delivers 'ver\\r'", got == b"ver\r")
+        finally:
+            os.close(bridge_fd)
+
     print("════════════ MBENCH SELF-TEST ════════════")
     for name, cond in results:
         print(f"  {GLYPH['ok'] if cond else GLYPH['fail']} {name}")
