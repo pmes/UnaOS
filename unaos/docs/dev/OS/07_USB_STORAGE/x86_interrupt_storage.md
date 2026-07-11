@@ -1,18 +1,27 @@
 # STOR-D1 — IF-safe interrupt-driven x86 storage (design)
 
-Status: **S1–S4 LANDED** (2026-07-10, `hw-rmbp`, behind the `irqstorage` knob — QEMU-green,
-metal-pending; S1–S3 `7b2f05f`/`b73ba08`/`fd5de85`, ✅ core mechanism metal-confirmed). S1 the storage
-service task + `BlockRequest` submit/block/complete; S2 live in-place reads (`sys_read`); S3 live in-place
-write-through (`sys_write_file`) closing the close-discards-dirty residual; **S4 synchronous
+Status: **S1–S5 LANDED** (S1–S4 2026-07-10, S5 2026-07-11, `hw-rmbp`, behind the `irqstorage` knob —
+QEMU-green, metal-pending; S1–S3 `7b2f05f`/`b73ba08`/`fd5de85`, ✅ core mechanism metal-confirmed). S1 the
+storage service task + `BlockRequest` submit/block/complete; S2 live in-place reads (`sys_read`); S3 live
+in-place write-through (`sys_write_file`) closing the close-discards-dirty residual; **S4 synchronous
 grow/create/delete in-syscall** (`BlockOp::{Create,Grow,Delete}`), retiring the U10x deferred op-queue +
-its launcher-replay causal-fidelity gap when the knob is on — CONSERVATIVE-HYBRID (only the DISK OPS
-synchronous; the created-file wstage-for-reads + snapshot-sibling model + the U11x M2 defer logic
-unchanged; shared-backing cross-process READS remain S5). S4's cross-process delete-at-last-close races
-(u11m2/u6gx) are metal-only-validatable (risk 3); its highest-risk edit — a blocking last-close delete on
-the most load-bearing lifecycle primitive — is made safe by a runtime blocking-safe-teardown check
-(`current_user_cr3() != slot_cr3(slot)`; §4 step S4). **S5–S7 remain future** (below). The original
-design (below) is unchanged. Track: `hw-rmbp` (x86_64, 2012 rMBP). Twin reference: the aarch64 polled
-storage path, which this design brings x86 into semantic parity with **without** copying its mechanism.
+its launcher-replay causal-fidelity gap when the knob is on; **S5 real shared backing for cross-process
+created-file reads** — a created descriptor's `sys_read` now reads the LIVE on-disk volume BY NAME
+(`created_read_live` → `submit_read_file`) instead of a private wstage snapshot, `open_created_sibling`
+stops snapshot-copying (empty seed knob-on), and `sys_open_dynamic` re-checks `DYN_DELETED_G` after
+resolving — closing the U11x M2 torn-copy (residual 3) + open-vs-unlink TOCTOU (residual 4) **when on**.
+S4/S5's cross-process delete-at-last-close + shared-backing races (u11m2/u6gx) are metal-only-validatable
+(risk 3); S4's highest-risk edit — a blocking last-close delete on the most load-bearing lifecycle
+primitive — is made safe by a runtime blocking-safe-teardown check (`current_user_cr3() != slot_cr3(slot)`;
+§4 step S4). **S5 SCHEDULING NOTE:** routing created reads through the single service task exposed a real
+deadlock — a NON-preemptible ring-3 fixture busy-spinning (IF=0) on the service task's core starves it, so a
+cross-core created read blocking on the service task never completes. Fixed by (a) spawning the service task
+`PRIO_HIGH` (a system service other tasks block on must preempt spinning user tasks — a same-priority wake
+only "waits its turn", `poke_for`), and (b) making u6gx's cooperative-spin fixtures preemptible knob-on
+(gated on `s4_sync_storage()`; the timer can then evict the spinner). See §4 step S5 + §5 risk 4. **S6–S7
+remain future** (below). The original design (below) is unchanged. Track: `hw-rmbp` (x86_64, 2012 rMBP).
+Twin reference: the aarch64 polled storage path, which this design brings x86 into semantic parity with
+**without** copying its mechanism.
 
 > Placement note: the STOR-D1 brief names `docs/dev/OS/07_STORAGE/`. The repo's storage doc home
 > is `docs/dev/OS/07_USB_STORAGE/` (alongside `usb_xhci.md`), so this doc lives there. Flagged for
@@ -211,8 +220,8 @@ rides attended benches at arc boundaries (§5).
 | **S1** | **Storage service task + `BlockRequest` submit/complete**, running *beside* the current polled path (no syscall rewired yet). A kernel self-test issues a raw sector read/write through the new path. | nothing yet — adds the primitive | new `bx-blockreq` kernel launcher: read a known sector via `BlockRequest`, compare to the polled read; `test-fat sf` unchanged 21 PASS + 1 |
 | **S2** | **Route `sys_read` through the service task** (real in-place reads); keep U6bx staged open for *open*. | U6bx staged **read** (`SYS_READ` serves live bytes) | `u6bx-file` read path now reads the live volume; verdict byte-identical |
 | **S3** | **Route `sys_write_file` through the service task** (in-place write-through). | U9x `FLUSH_*` queue + `FILE_DIRTY_*` + close-discards-dirty (residual 5) | `u9x-write`: read-back after write with **no launcher drain**; `SYS_CLOSE` of a dirty descriptor now persists |
-| **S4** | **Route grow/create/delete synchronously** (in-syscall `fat.rs` calls under `FAT_MUTATION`). | U10x `U10_*` op-queue + launcher replay (causal-fidelity residual) | `u10x-grow`/`u10cx-create`/`u10dx-delete`: on-disk change visible **within the syscall**, no deferred drain |
-| **S5** | **Real shared backing for cross-process opens** (read shared on-disk/cached, not snapshot). | U11x M2 residuals 3 (torn-copy/disclosure) + 4 (open-vs-unlink TOCTOU) | `u11m2-unlink` cross-row read now reads shared backing; add a concurrent-writer stress that would torn-copy under the old snapshot |
+| **S4** ✅ | **Route grow/create/delete synchronously** (in-syscall `fat.rs` calls via the service task — `submit_create`/`submit_grow`/`submit_delete`; serialization is by the SINGLE service-task BOT owner, **not** `FAT_MUTATION`, which stays an S6 no-op passthrough on x86). | U10x `U10_*` op-queue + launcher replay (causal-fidelity residual) | `u10x-grow`/`u10cx-create`/`u10dx-delete`: on-disk change visible **within the syscall**, no deferred drain |
+| **S5** ✅ | **Real shared backing for cross-process created-file reads** (read the live on-disk volume BY NAME, not a wstage snapshot). `created_read_live`→`submit_read_file`; `open_created_sibling` seeds EMPTY knob-on (no snapshot copy) + re-validates the source names the caller's nameid (recycle fail-closed); `sys_open_dynamic` re-checks `DYN_DELETED_G` after resolving. | U11x M2 residual 3 (torn-copy/disclosure) + residual 4 (open-vs-unlink TOCTOU) — **closed-when-on** (recycle-to-wrong-file leg narrowed; airtight = S6 lock) | `s5_shared_backing_witness`: a cross-row sibling with an EMPTY private wstage reads a peer's POST-OPEN overwrite from the live backing; u11m2/u6gx cross-process reads now serve live shared backing. **Scheduling:** service task `PRIO_HIGH` + u6gx fixtures preemptible knob-on so the service task is not starved by a non-preemptible same-core spinner (§5 risk 4) |
 | **S6** | **Activate `FAT_MUTATION` on x86** (make `with_fat_lock` real). | F2's x86 zero-cost passthrough exclusion | port the aarch64 `f2_witness_rmw` witness to x86 (`fat.rs:369`); LOCKED pass reaches `2*iters`, UNLOCKED control shows loss under contention |
 | **S7** | **Retire U6bx staged-open + the pre-stage buffer** (open resolves any on-disk file). | the BSP-staged set constraint (U6bx) | arbitrary-file open fixture: open a file *not* in the pre-stage set, read it |
 
@@ -251,6 +260,30 @@ sequence with seat review between spine milestones.
    witnesses must be written to prove the *lock holds* (positive) and to report a zero-loss control
    honestly, with the true concurrency proof deferred to the bench. **QEMU-green ≠ correct** applies with
    full force to S5/S6.
+
+   > S5 honesty fold-in: S5 has **no residual read/write race to defer to metal** — the torn-copy is
+   > closed *by construction* (the snapshot COPY is removed, `open_created_sibling` seeds empty), and all
+   > file I/O serializes through the single service-task BOT owner, so a read and a write to the same file
+   > can never interleave (architectural, not a TCG artifact). The S5 witness proves the read SOURCE is the
+   > live shared backing (a sibling with an EMPTY private wstage reads a peer's post-open overwrite) — a
+   > deterministic before/after discriminator, not a race the metal bench must re-run.
+
+4. **Service-task starvation by a non-preemptible same-core spinner (found + fixed in S5, QEMU-reproducible,
+   NOT metal-only).** Routing created reads through the single service task makes a read BLOCK on it. A
+   ring-3 task spawned NON-preemptible (`spawn_user_in_space`, IF=0) that busy-spins — e.g. u6gx's owner A
+   parked on its cooperative GO word — on the service task's core (both take `online.first()` = cpu 1)
+   makes the core UNSCHEDULABLE, so the service task never runs and a cross-core created read (u6gx's
+   grantee B) blocks forever: a deadlock (launcher waits B → B waits the service task → the service task
+   waits behind A's IF=0 spin → A waits the launcher). No priority preempts an IF=0 task. **Fix (landed):**
+   (a) the service task is spawned `PRIO_HIGH` — a system service other tasks block on must out-rank a
+   spinning user task so a cross-core wake sends the preempt IPI (`poke_for`: `prio > running`; a
+   same-priority wake only "waits its turn"); (b) u6gx's cooperative-spin fixtures are spawned PREEMPTIBLE
+   (`spawn_user_preemptible`) knob-on (gated on `s4_sync_storage()`; knob-off keeps the byte-identical
+   non-preemptible spawn), so the timer can evict A and the `PRIO_HIGH` service task runs. **Metal
+   relevance:** a well-behaved program blocks/yields; a *malicious* busy-spinner on the service core could
+   still DoS created reads on this single-service-task architecture — a broader scheduler-fairness concern
+   (a yield syscall, a dedicated service core, or per-core service tasks) noted for future work, out of S5's
+   scope. Ledgered in SECURITY.md (STOR-1 S5).
 
 ---
 

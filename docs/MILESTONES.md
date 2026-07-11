@@ -208,6 +208,44 @@ Legend: **✅ metal-confirmed** · **🔬 QEMU-green, metal pending** · dates I
 - **Metal:** knob-on is metal-PENDING (the S4 cross-process delete-at-last-close races are metal-only —
   QEMU-TCG will not interleave; design risk 3). Rides the next attended rMBP bench (transfer-IRQ I/O + S4
   create/grow/delete under true SMP + `fsck`).
+
+### STOR-1 S5 — real shared backing for cross-process created-file reads (closes the U11x M2 torn-copy/TOCTOU residuals when on) (2026-07-11) `hw-rmbp`
+- **What:** a CREATED-file descriptor's `SYS_READ` now reads the LIVE shared on-disk volume BY NAME
+  (`created_read_live` → `submit_read_file`) instead of a private wstage snapshot — so a cross-process (or
+  same-process sibling) opener reads a peer's writes (shared backing), retiring the U11x M2 residuals 3
+  (torn-copy/disclosure) + 4 (open-vs-unlink TOCTOU) **when the knob is on**. Three coupled changes:
+  **C2** `sys_read`'s created branch (gated `FILE_CREATED && FILE_OPNAME != 0 && HELLO_STAGED &&
+  service_ready`; GROW.BIN — growable STAGED — keeps its wstage serve, byte-identical); **C3**
+  `open_created_sibling` seeds the sibling wstage EMPTY (no snapshot copy — torn-copy closed by
+  construction) + stamps identity from the CALLER-verified `nameid` after re-validating the source names it
+  (recycle fail-closed `-ENOENT`); **C4** `sys_open_dynamic` re-checks `DYN_DELETED_G` after resolving.
+- **Witness:** `s5_shared_backing_witness` (kernel-side, cross-row, reuses DEFER.BIN, silent skip off
+  knob-on-FAT, unconditional cleanup) proves non-vacuously that the read SOURCE is shared/live — a sibling
+  with an EMPTY private wstage (`WSTAGE_LEN == 0`, the discriminator) reads a peer's POST-OPEN overwrite;
+  the u11m2/u6gx EL0 fixtures supply the production-faithful `SYS_READ` DISPATCH proof. NO concurrent stress
+  (read/write serialize through the single service task → tearing impossible by construction, not a metal
+  race).
+- **⚠ Scheduling deadlock found + fixed (QEMU-reproducible):** routing created reads through the single
+  service task makes a read BLOCK on it; a NON-preemptible ring-3 fixture busy-spinning (IF=0) on the
+  service task's core (u6gx's owner A, cpu 1 == the service task's core) starves it, so u6gx's grantee B's
+  cross-core read deadlocks. Fixed by (a) spawning the service task `PRIO_HIGH` (a system service must
+  out-rank a spinning user task so a cross-core wake preempts — `poke_for`), and (b) making u6gx's
+  cooperative-spin fixtures PREEMPTIBLE knob-on (gated on `s4_sync_storage()`; knob-off byte-identical).
+  A malicious busy-spinner on the service core could still DoS created reads on this single-service-task
+  design — future scheduler-fairness work, out of scope. (SECURITY.md STOR-1 S5; design §5 risk 4.)
+- **Residual (honest):** the source read + the C3 re-check are not atomic → a metal-only recycle-to-a-
+  DIFFERENT-name window is NARROWED (sibling names only the caller-verified nameid, so a cross-name recycle
+  is caught) but not eliminated; airtight = the S6 namespace lock. No corruption / freed-chain / wrong-file
+  LIVE read is possible (single service task serializes read-vs-delete).
+- **Gate:** `./arroyo check` both arches (on+off); knob-ON `UNAOS_IRQSTORAGE=1 UNAOS_FATIMG=sf test` = full
+  chain 0 FAIL with `:: S3/S4/S5:` witnesses + u10cx/u11m2/u6gx created reads served LIVE + u6gx PASS (the
+  deadlock fix); knob-ON `test 40` = MISSION + `bx-blockreq`, NO `:: S5:` line (silent skip, no FAT);
+  knob-OFF `test 40` = MISSION and `UNAOS_FATIMG=sf test` = BYTE-IDENTICAL (no S3/S4/S5/PRIO_HIGH lines;
+  u6gx passes non-preemptibly); `UNAOS_NOSTORAGE` clean both. Lane: `arch/x86_64/syscall.rs` +
+  `drivers/xhci/irqstorage.rs`; `fat.rs`/`block.rs` reused unchanged; **zero aarch64**.
+- **Metal:** the shared-backing correctness is deterministic (proven in QEMU); knob-on rides the same
+  attended rMBP bench as S4 (transfer-IRQ I/O + create/grow/delete + the cross-process read/write + `fsck`)
+  — metal-PENDING.
 ## hw-pi4 track — 2026-07-10 (K1 M2–M4 — the U6 ACL SURVIVES REBOOT: persist + rebuild + gated enforcement + proofs)
 
 ### K1 M2.2/M2.3/M2.4 + M3 + M4 — `UNAFS.ATR` persistence LANDED 🔬 `hw-pi4`
