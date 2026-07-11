@@ -208,6 +208,42 @@ Legend: **✅ metal-confirmed** · **🔬 QEMU-green, metal pending** · dates I
 - **Metal:** knob-on is metal-PENDING (the S4 cross-process delete-at-last-close races are metal-only —
   QEMU-TCG will not interleave; design risk 3). Rides the next attended rMBP bench (transfer-IRQ I/O + S4
   create/grow/delete under true SMP + `fsck`).
+## hw-pi4 track — 2026-07-10 (K1 M2–M4 — the U6 ACL SURVIVES REBOOT: persist + rebuild + gated enforcement + proofs)
+
+### K1 M2.2/M2.3/M2.4 + M3 + M4 — `UNAFS.ATR` persistence LANDED 🔬 `hw-pi4`
+- **What:** turn the M1 FORMAT into a real security property — owner/grants SURVIVE REBOOT. The
+  ratified model (Peter + orchestrator seat, 2026-07-10): a launcher-assigned, KERNEL-STAMPED
+  principal (default `prog:<name>`), one per 8.3 name, never EL0-set. Cross-reboot enforcement is
+  GATED on multi-program by-name spawn — PROVEN now, LIVE when a second launchable named program lands.
+- **M2.2** (`fat.rs` + `syscall.rs`): read-only `volume_fingerprint() -> (BS_VolID, count_of_clusters)`
+  — the real volume binding (replacing M1's `cluster_size`/`num_fats` placeholder); x86-neutral.
+- **M2.3** (write-through persist): `OwnedFile.owner_ppid` + `FileGrant.ppid`, captured at create/grant
+  from principals snapshotted before any lock; persist in the syscall handler AFTER the in-RAM update
+  (`sys_open`-create/`sys_fgrant`/`sys_unlink`), gated on `owner_ppid.kind != NONE` so anonymous owners
+  do ZERO disk I/O; `atr_ensure` self-heals a stale/foreign-binding header.
+- **M2.4** (mount-rebuild + gated admission): `atr_rebuild_into_owned` re-resolves each persisted row
+  BY NAME + installs it with a NO-LIVE-OWNER sentinel; `owned_access_ok`/`owned_is_owner`/
+  `owned_unlink_permitted` gain an ADDITIVE ppid branch (owner-by-name full authority; grantee-by-name
+  rights-checked) after the unchanged `(asid, gen)` checks — structural (NONE never matches). The
+  real-boot rebuild is gated on `by_name_spawn_multivalued()` (false today).
+- **M3** (`k1_persist_launcher`): kernel-side two-phase proof — persist an owned+granted file, simulate
+  a reboot, rebuild, enforce with real stamped principals (14-assertion witness `w=0x3fff` after F1/F2).
+- **M4** (`k1_corrupt_launcher` + deny-EL0): a TORN on-disk row fails closed to PUBLIC at mount (no
+  forged owner); EL0 `SYS_OPEN` of `UNAFS.ATR` denied outright.
+- **F1** (adversarial code-review catches): `owned_grant` by-name owner branch; `atr_ensure` splits a
+  block READ error from a binding MISMATCH (no more wiping rows on a hiccup); M3 persists `fc=0`.
+- **F2** (seat security-tier review, 6/6-refuter must-fixes — all fail-OPEN, latent while gated off):
+  `owned_grant` REVOKE/UPDATE arms match a rebuilt grantee by ppid (revoke was silently a no-op +
+  re-persisted; update double-slotted); owner teardown converts a NAMED owner to the sentinel instead
+  of wiping (a wiped RAM row made `sys_unlink` skip the disk clear → future same-name adoption);
+  `sys_unlink` clears the ATR row before the `0xE5`. M3 witnesses revoke-after-rebuild + teardown (→ `w=0x3fff`).
+- **Tested (QEMU):** `check` BOTH arches (x86 unchanged); `kernel8` baremetal; `kernel8-test` → **23
+  PASS byte-identical** to base (the `:: K1-persist: … PASS ::` + `:: K1-corrupt: … PASS ::` witness
+  lines are the ONLY additions, UNCOUNTED) + CAPSTONE 6/6 + F2/F3 witnesses + `:: K1-atr: … disk PASS ::`,
+  zero R1/CMD13; `test-arm` MISSION SUCCESS.
+- **Metal:** survive-reboot (persist under a `prog:X` stamp → power-cycle → re-acquire) rides the next
+  attended bench; M3/M4 self-clean so the stateful card accumulates nothing.
+- **Detail:** [`SECURITY.md` §K1](SECURITY.md). **Commits:** K1 M2.3/M2.4/M3/M2.2/M4 on `hw-pi4` (see `git log`).
 
 ## hw-jetson track — 2026-07-10 (JD4 — read-side navigation + last dead levers + screen-on-boot; same-day attended bench)
 
