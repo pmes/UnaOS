@@ -214,6 +214,99 @@ pub enum Mode {
 /// `sched::meter_cpu_count()` capped here).
 const MAX_METER_CPUS: usize = 16;
 
+/// Fixed segment count of every CPU pulse bar (UI1-M2, Peter's sketch): filled ∝ load, and the
+/// EMPTY segments draw dim — an idle core reads alive-but-empty, never blank.
+const PULSE_SEGS: usize = 10;
+
+// Meter palette (shared by the vug corner meters and the `pulse` full-screen monitor).
+const METER_DIM: u32 = 0x00_2A2432;
+const METER_LILAC: u32 = 0x00_B36BFF;
+const METER_PURPLE: u32 = 0x00_9B59B6;
+const METER_LABEL: u32 = 0x00_8A8296;
+
+/// The per-core CPU load sampler — shared by the vug corner meter and the `pulse` full-screen
+/// monitor (UI1-M2/M3). Holds the previous `(busy, idle)` tick snapshot per core and the last
+/// window's load percents. THE HONEST TWO-SOURCE RULE (VUG-1 M3b) lives in [`CpuPulse::refresh`],
+/// kept verbatim — do not regress the Orin scheduled path.
+struct CpuPulse {
+    ncpu: usize,
+    prev: [(u64, u64); MAX_METER_CPUS],
+    load: [u32; MAX_METER_CPUS],
+    demo_core_logged: bool,
+    /// Serial-evidence tag for the one-shot demo-core log line ("VUG" / "PULSE").
+    tag: &'static str,
+}
+
+impl CpuPulse {
+    fn new(tag: &'static str) -> Self {
+        let ncpu = MAX_METER_CPUS.min(crate::arch::sched::meter_cpu_count());
+        let mut prev = [(0u64, 0u64); MAX_METER_CPUS];
+        for (c, p) in prev.iter_mut().enumerate().take(ncpu) {
+            *p = crate::arch::sched::meter_cpu_ticks(c);
+        }
+        Self { ncpu, prev, load: [0u32; MAX_METER_CPUS], demo_core_logged: false, tag }
+    }
+
+    /// Refresh the per-core loads for one display window. Two honest sources, picked per core by
+    /// whether the scheduler is accounting that core this window:
+    ///   * db+di > 0  → the core is inside `sched::run()` (dispatching tasks or spinning idle,
+    ///     both of which bump the counters). Use the scheduler's busy fraction — this is the
+    ///     Orin scheduled-pump path, and per-core APs on x86; do NOT regress it.
+    ///   * db+di == 0 → the core is executing OUTSIDE `sched::run()` and the scheduler never
+    ///     sees it (the x86 GUI runs the demo/monitor in the inline BSP loop). Its counters
+    ///     are frozen, so the sched fraction would read a false ~0 even though the core is
+    ///     pegged rendering. Credit it instead from the render loop's OWN measured busy-vs-
+    ///     yield fraction (`own_load`, work cycles / whole-frame cycles) — the same honest
+    ///     number the RENDER meter shows for the core actually doing the work. That core IS
+    ///     the demo core (the current CPU); log it once so the label is truthful.
+    fn refresh(&mut self, own_load: u32) {
+        for c in 0..self.ncpu {
+            let (b, i) = crate::arch::sched::meter_cpu_ticks(c);
+            let db = b.wrapping_sub(self.prev[c].0);
+            let di = i.wrapping_sub(self.prev[c].1);
+            if db + di > 0 {
+                self.load[c] = ((db * 100) / (db + di)) as u32;
+            } else {
+                // Unscheduled executing core → this is the demo core; show its real render load.
+                self.load[c] = own_load;
+                if !self.demo_core_logged {
+                    serial_println!(":: {}: CPU meter — core {} is the demo core (unscheduled render loop, load from render busy%) ::", self.tag, c);
+                    self.demo_core_logged = true;
+                }
+            }
+            self.prev[c] = (b, i);
+        }
+    }
+}
+
+/// UI1-M2 — one segmented pulse bar: `PULSE_SEGS` fixed segments at `(x, y)`, filled ∝ `load`
+/// (rounded; any nonzero load lights at least one), the rest drawn `METER_DIM` so an idle bar
+/// reads alive-but-empty. `seg_w`/`seg_h`/`gap` come from the caller's metrics (the corner meter
+/// and the full-screen `pulse` reuse this at two sizes). Returns the x just past the bar.
+fn draw_pulse_bar(
+    pal: &mut TargetPal,
+    x: usize,
+    y: usize,
+    seg_w: usize,
+    seg_h: usize,
+    gap: usize,
+    load: u32,
+    fill_color: u32,
+) -> usize {
+    let filled = if load == 0 {
+        0
+    } else {
+        ((load as usize * PULSE_SEGS + 50) / 100).clamp(1, PULSE_SEGS)
+    };
+    let mut bx = x;
+    for s in 0..PULSE_SEGS {
+        let color = if s < filled { fill_color } else { METER_DIM };
+        pal.draw_rect(bx, y, seg_w, seg_h, color);
+        bx += seg_w + gap;
+    }
+    bx
+}
+
 /// M3b render-load readout, refreshed ~5x/sec. `fps_x10`/`ms_x10` are fixed-point (value*10) to
 /// print one decimal without float. `load` is the render busy-fraction percent; `tris`/`px` are the
 /// current frame's drawn-triangle count and filled-pixel estimate.
@@ -259,16 +352,11 @@ pub fn run_crystal(pal: &mut TargetPal, mode: Mode) {
     // Render-load meter (the honest "GPU monitor" — we render in software): each frame we clock
     // the render span (`now_cycles`) against the whole frame span to get a busy fraction, and time
     // the window with `ms()` to get frame time / FPS. `stats` holds the last window's readout.
-    // CPU-pulse meter: per-core busy/idle counts sampled from the scheduler (see `sched::meter_*`).
+    // CPU-pulse meter: per-core busy/idle counts sampled from the scheduler (see `sched::meter_*`),
+    // via the shared `CpuPulse` sampler (the honest two-source rule lives in its `refresh`).
     // SEAM: both meters read introspection counters; a real GPU/PMU feed would replace the sources.
     let mut m = RenderStats::default();
-    let ncpu = MAX_METER_CPUS.min(crate::arch::sched::meter_cpu_count());
-    let mut cpu_prev = [(0u64, 0u64); MAX_METER_CPUS];
-    let mut cpu_load = [0u32; MAX_METER_CPUS];
-    for c in 0..ncpu {
-        cpu_prev[c] = crate::arch::sched::meter_cpu_ticks(c);
-    }
-    let mut demo_core_logged = false;
+    let mut cpu = CpuPulse::new("VUG");
     let mut prev_top = crate::arch::now_cycles();
     let mut work_acc: u64 = 0;
     let mut total_acc: u64 = 0;
@@ -377,7 +465,7 @@ pub fn run_crystal(pal: &mut TargetPal, mode: Mode) {
         m.tris = n as u32;
         m.px = est_px;
         draw_stats(pal, frame, n as u32, solid, w, h);
-        draw_meters(pal, &m, &cpu_load, ncpu, h);
+        draw_meters(pal, &m, &cpu, h);
 
         pal.render(); // present ONCE per frame
 
@@ -399,34 +487,8 @@ pub fn run_crystal(pal: &mut TargetPal, mode: Mode) {
             } else {
                 0
             };
-            // Per-core CPU-pulse load. Two honest sources, picked per core by whether the scheduler
-            // is accounting that core this window:
-            //   * db+di > 0  → the core is inside `sched::run()` (dispatching tasks or spinning idle,
-            //     both of which bump the counters). Use the scheduler's busy fraction — this is the
-            //     Orin scheduled-pump path, and per-core APs on x86; do NOT regress it.
-            //   * db+di == 0 → the core is executing OUTSIDE `sched::run()` and the scheduler never
-            //     sees it (the x86 GUI runs this crystal demo in the inline BSP loop). Its counters
-            //     are frozen, so the sched fraction would read a false ~0 even though the core is
-            //     pegged rendering. Credit it instead from the render loop's OWN measured busy-vs-
-            //     yield fraction (`m.load`, work cycles / whole-frame cycles) — the same honest
-            //     number the RENDER meter shows for the core actually doing the work. That core IS
-            //     the demo core (the current CPU); log it once so the label is truthful.
-            for c in 0..ncpu {
-                let (b, i) = crate::arch::sched::meter_cpu_ticks(c);
-                let db = b.wrapping_sub(cpu_prev[c].0);
-                let di = i.wrapping_sub(cpu_prev[c].1);
-                if db + di > 0 {
-                    cpu_load[c] = ((db * 100) / (db + di)) as u32;
-                } else {
-                    // Unscheduled executing core → this is the demo core; show its real render load.
-                    cpu_load[c] = m.load;
-                    if !demo_core_logged {
-                        serial_println!(":: VUG: CPU meter — core {} is the demo core (unscheduled render loop, load from render busy%) ::", c);
-                        demo_core_logged = true;
-                    }
-                }
-                cpu_prev[c] = (b, i);
-            }
+            // Per-core CPU-pulse load — the honest two-source pick lives in `CpuPulse::refresh`.
+            cpu.refresh(m.load);
             win_ms = now_ms;
             win_frames = 0;
             work_acc = 0;
@@ -450,35 +512,35 @@ pub fn run_crystal(pal: &mut TargetPal, mode: Mode) {
 /// POLISH-2: the blinking red heartbeat square was removed too (Peter's call — not needed; any real
 /// problem will be obvious from the frozen crystal or a dead frame counter). Title + stat line stay.
 fn draw_stats(pal: &mut TargetPal, frame: u64, faces: u32, solid: bool, _w: i32, _h: i32) {
-    // Title + live stat line.
-    pal.draw_text(20, 20, "VUG // quartz", 0x00FFFFFF);
+    // Title + live stat line. UI-1: all positions derive from the panel metrics.
+    let m = pal.metrics();
+    pal.draw_text(m.margin, m.margin, "VUG // quartz", 0x00FFFFFF);
     let mode = if solid { "solid" } else { "wire " };
     let line = alloc::format!("mode {}  faces {:>2}  frame {}", mode, faces, frame);
-    pal.draw_text(20, 36, &line, 0x00A0A0A0);
-    pal.draw_text(20, 52, "press any key to exit", 0x00707070);
+    pal.draw_text(m.margin, m.margin + m.line_h, &line, 0x00A0A0A0);
+    pal.draw_text(m.margin, m.margin + 2 * m.line_h, "press any key to exit", 0x00707070);
 }
 
-/// M3b — the two corner load meters (kept small; the crystal stays the star). Bottom-left:
+/// M3b/UI1-M2 — the two corner load meters (kept small; the crystal stays the star). Bottom-left:
 /// a RENDER meter (the honest software "GPU monitor" — frame time, FPS, render busy-fraction bar,
-/// triangles + estimated filled pixels this frame) above a CPU pulse meter (per-core scheduler
-/// busy fraction, BeOS-Pulse style). Both draw through the same damage-tracked back buffer, so the
-/// one-present-per-frame contract still holds.
-fn draw_meters(pal: &mut TargetPal, m: &RenderStats, cpu_load: &[u32], ncpu: usize, h: i32) {
-    const DIM: u32 = 0x00_2A2432;
-    const LILAC: u32 = 0x00_B36BFF;
-    const PURPLE: u32 = 0x00_9B59B6;
-    const LABEL: u32 = 0x00_8A8296;
-
-    let x0 = 20usize;
-    let base = (h as usize).saturating_sub(96);
+/// triangles + estimated filled pixels this frame) above the CPU pulse row — Peter's sketch:
+/// `CPU 1 ▮▮▮▮▯▯ 2 ▮▮▯▯▯▯ …` — per-core NUMBERED segment bars, one horizontal row, for however
+/// many cores the scheduler reports. Filled ∝ load; empty segments draw dim, so an idle core reads
+/// alive-but-empty, never blank. All geometry derives from the metrics (THE METRICS RULE). Both
+/// meters draw through the same damage-tracked back buffer, so one-present-per-frame still holds.
+fn draw_meters(pal: &mut TargetPal, m: &RenderStats, cpu: &CpuPulse, h: i32) {
+    let mt = pal.metrics();
+    let x0 = mt.margin;
+    // The block is three text pitches (label / bar / readout) + one pitch of air + the CPU row.
+    let base = (h as usize).saturating_sub(mt.margin + 4 * mt.line_h + mt.cell_h);
 
     // --- RENDER meter --------------------------------------------------------------------
-    pal.draw_text(x0, base, "RENDER", LABEL);
-    let bar_w = 132usize;
-    let bar_h = 8usize;
-    pal.draw_rect(x0, base + 12, bar_w, bar_h, DIM);
+    pal.draw_text(x0, base, "RENDER", METER_LABEL);
+    let bar_w = mt.text_w(16);
+    let bar_h = mt.cell_h;
+    pal.draw_rect(x0, base + mt.line_h, bar_w, bar_h, METER_DIM);
     let fill = (m.load as usize * bar_w) / 100;
-    pal.draw_rect(x0, base + 12, fill, bar_h, LILAC);
+    pal.draw_rect(x0, base + mt.line_h, fill, bar_h, METER_LILAC);
     // Numeric readout: frame time / FPS (one decimal, fixed-point) + triangles + filled pixels.
     let (px_val, px_unit) = if m.px >= 1000 { (m.px / 1000, "Kpx") } else { (m.px, "px ") };
     let line = alloc::format!(
@@ -491,35 +553,156 @@ fn draw_meters(pal: &mut TargetPal, m: &RenderStats, cpu_load: &[u32], ncpu: usi
         px_val,
         px_unit,
     );
-    pal.draw_text(x0, base + 24, &line, LABEL);
+    pal.draw_text(x0, base + 2 * mt.line_h, &line, METER_LABEL);
 
-    // --- CPU pulse meter -----------------------------------------------------------------
-    pal.draw_text(x0, base + 44, "CPU", LABEL);
-    let cw = 8usize; // bar width
-    let gap = 4usize;
-    let ch = 26usize; // bar height
-    let top = base + 56;
-    for c in 0..ncpu {
-        let bx = x0 + c * (cw + gap);
-        pal.draw_rect(bx, top, cw, ch, DIM);
-        let fh = (cpu_load[c] as usize * ch) / 100;
-        if fh > 0 {
-            pal.draw_rect(bx, top + ch - fh, cw, fh, PURPLE);
-        }
+    // --- CPU pulse row (UI1-M2) ------------------------------------------------------------
+    // `CPU 1 ▮▮▮▮▯▯ 2 ▮▮▯▯▯▯ …` — number, then a PULSE_SEGS-segment bar, per core. Corner
+    // sizing: half-cell segments one cell tall; the full-screen `pulse` view draws the same
+    // widget larger.
+    let y = base + 4 * mt.line_h;
+    let seg_w = mt.cell_w / 2;
+    let seg_h = mt.cell_h;
+    let gap = mt.scale;
+    let mut x = x0;
+    pal.draw_text(x, y, "CPU", METER_LABEL);
+    x += mt.text_w(4);
+    for c in 0..cpu.ncpu {
+        let num = alloc::format!("{}", c + 1);
+        pal.draw_text(x, y, &num, METER_LABEL);
+        x += mt.text_w(num.len()) + 2 * gap;
+        x = draw_pulse_bar(pal, x, y, seg_w, seg_h, gap, cpu.load[c], METER_PURPLE);
+        x += mt.cell_w; // inter-core air
     }
 }
 
+/// UI1-M3 — `pulse`: the full-screen system monitor (a BeOS Pulse homage) — the in-kernel half of
+/// the pulse ask (a host-native `apps/pulse` vessel is a separate arc). Big per-core segmented
+/// pulse bars (the M2 widget, larger) plus the honest system lines available today: core count,
+/// uptime, frame/present time while the view is open.
+///
+/// The loop follows the vug contract: it runs INSIDE the shell command, pumps input itself
+/// (`pal::pump_and_poll`), presents exactly ONCE per frame, busy-polls + `yield_now`s between
+/// frames (never WFI/sleeps — the post-drop aarch64 rule), and ANY key exits back to the console
+/// (the caller repaints; `took_screen` honored). Per-core loads ride the shared [`CpuPulse`]
+/// sampler — the honest two-source rule, verbatim; this loop's own busy-vs-yield fraction is the
+/// unscheduled-demo-core fallback, exactly like the crystal's.
+pub fn run_pulse(pal: &mut TargetPal) {
+    let mt = pal.metrics();
+    let mut cpu = CpuPulse::new("PULSE");
+    serial_println!(":: PULSE: live — {} cores ::", cpu.ncpu);
+
+    // Big-bar geometry: double-size segments, one row per core, all metrics-derived.
+    let seg_w = 2 * mt.cell_w;
+    let seg_h = 2 * mt.cell_h;
+    let gap = 2 * mt.scale;
+    let row_pitch = seg_h + mt.line_h;
+    let label_y_off = (seg_h - mt.cell_h) / 2; // centre a text cell on the bar
+
+    let mut frame: u64 = 0;
+    let mut own_load: u32 = 0; // this loop's busy% — the demo-core fallback source
+    let mut fps_x10: u64 = 0;
+    let mut ms_x10: u64 = 0;
+    let mut prev_top = crate::arch::now_cycles();
+    let mut work_acc: u64 = 0;
+    let mut total_acc: u64 = 0;
+    let mut win_frames: u32 = 0;
+    let mut win_ms = crate::arch::ms();
+
+    loop {
+        let top = crate::arch::now_cycles();
+        // --- input: exit on any key ------------------------------------------------------
+        if let Some(Event::Key(_)) = crate::pal::pump_and_poll() {
+            break;
+        }
+
+        // --- draw the monitor ------------------------------------------------------------
+        pal.clear_screen(BG);
+        pal.draw_text(mt.margin, mt.margin, "PULSE // UnaOS system monitor", 0x00FFFFFF);
+        pal.draw_text(mt.margin, mt.margin + mt.line_h, "press any key to exit", 0x00707070);
+
+        // One row per core: `CPU n`, the big segment bar, the load percent.
+        let mut y = mt.margin + 3 * mt.line_h;
+        for c in 0..cpu.ncpu {
+            let label = alloc::format!("CPU {}", c + 1);
+            pal.draw_text(mt.margin, y + label_y_off, &label, METER_LABEL);
+            let bar_x = mt.margin + mt.text_w(7);
+            let end_x = draw_pulse_bar(pal, bar_x, y, seg_w, seg_h, gap, cpu.load[c], METER_PURPLE);
+            let pct = alloc::format!("{:>3}%", cpu.load[c]);
+            pal.draw_text(end_x + mt.cell_w, y + label_y_off, &pct, METER_LABEL);
+            y += row_pitch;
+        }
+
+        // The honest system lines available today.
+        y += mt.line_h;
+        let line = alloc::format!(
+            "cores {}   uptime {} ms   frame {}",
+            cpu.ncpu,
+            crate::arch::ms(),
+            frame
+        );
+        pal.draw_text(mt.margin, y, &line, METER_LABEL);
+        y += mt.line_h;
+        let line = alloc::format!(
+            "frame {}.{} ms   {}.{} fps   (draw+present, while open)",
+            ms_x10 / 10,
+            ms_x10 % 10,
+            fps_x10 / 10,
+            fps_x10 % 10
+        );
+        pal.draw_text(mt.margin, y, &line, METER_LABEL);
+
+        pal.render(); // present ONCE per frame
+
+        // --- window accounting (the M3b render-load idiom) --------------------------------
+        let end = crate::arch::now_cycles();
+        work_acc += end.wrapping_sub(top);
+        total_acc += top.wrapping_sub(prev_top);
+        prev_top = top;
+        win_frames += 1;
+        let now_ms = crate::arch::ms();
+        let dt = now_ms.wrapping_sub(win_ms);
+        if dt >= 200 && win_frames > 0 {
+            fps_x10 = (win_frames as u64 * 10_000) / dt.max(1);
+            ms_x10 = (dt * 10) / win_frames as u64;
+            own_load = if total_acc > 0 {
+                ((work_acc * 100) / total_acc).min(100) as u32
+            } else {
+                0
+            };
+            cpu.refresh(own_load);
+            win_ms = now_ms;
+            win_frames = 0;
+            work_acc = 0;
+            total_acc = 0;
+        }
+
+        frame += 1;
+        crate::arch::sched::yield_now();
+    }
+
+    serial_println!(":: PULSE: exit clean — {} frames ::", frame);
+}
+
 /// The BeBox tribute screen — a static homage (kept from the original demo, dressed up a little).
+/// UI-1: laid out from the panel metrics (no absolute pixel sizes).
 pub fn run_bebox_mode(pal: &mut TargetPal) {
+    let m = pal.metrics();
+    let x0 = 5 * m.margin;
+    let y0 = 5 * m.margin;
     pal.clear_screen(0x00101018);
-    pal.draw_text(60, 60, "BeBox // GeekPort tribute", 0x0066CCFF);
-    pal.draw_text(60, 84, "dual-CPU dreams, one framebuffer", 0x00889AAA);
+    pal.draw_text(x0, y0, "BeBox // GeekPort tribute", 0x0066CCFF);
+    pal.draw_text(x0, y0 + 2 * m.line_h, "dual-CPU dreams, one framebuffer", 0x00889AAA);
     // Two "CPU" LED columns, a nod to the twin BeBox meters.
+    let led_w = 2 * m.cell_w + m.cell_w / 2;
+    let led_h = m.cell_h + m.cell_h / 2;
+    let pitch_x = led_w + m.cell_w;
+    let pitch_y = 2 * m.cell_h;
+    let leds_y = y0 + 5 * m.line_h;
     for col in 0..2 {
         for i in 0..8 {
             let on = (i + col) % 3 != 0;
             let color = if on { 0x0000FF66 } else { 0x00223322 };
-            pal.draw_rect(60 + col * 30, 120 + i * 16, 20, 12, color);
+            pal.draw_rect(x0 + col * pitch_x, leds_y + i * pitch_y, led_w, led_h, color);
         }
     }
     pal.render();
