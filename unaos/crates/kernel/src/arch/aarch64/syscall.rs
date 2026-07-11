@@ -9878,14 +9878,46 @@ fn k2_run_program(name: &str, taskname: &'static str, demo_cpu: usize, want: u32
     Some(stamped)
 }
 
+/// K2: read the `first_cluster` persisted in a file's `UNAFS.ATR` row (None if the store or the row is
+/// absent). Used to PROVE M(b) grow-repersist actually landed the real chain head — a create-only row
+/// carries `first_cluster = 0`, so a nonzero match against the directory entry means the grow re-persisted.
+/// Read-only, no lock (the launcher is single-context here — no EL0 program runs during a rebuild step).
+fn k2_persisted_first_cluster(fs: &crate::fs::fat::FatFs, dir_lba: u64, dir_off: u32) -> Option<u32> {
+    let (de, _l, _o) = fs.find_located(ATR_NAME).ok()?;
+    if (de.size as usize) < ATR_FILE_LEN {
+        return None;
+    }
+    let (afc, asz) = (de.first_cluster(), de.size);
+    let mut rows: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
+    if fs
+        .read_at(afc, asz, ATR_HEADER_LEN as u32, &mut rows, ATR_ROW_STRIDE * ATR_ROWS)
+        .is_err()
+        || rows.len() != ATR_ROW_STRIDE * ATR_ROWS
+    {
+        return None;
+    }
+    for i in 0..ATR_ROWS {
+        let start = ATR_ROW_STRIDE * i;
+        let mut arr = [0u8; ATR_ROW_STRIDE];
+        arr.copy_from_slice(&rows[start..start + ATR_ROW_STRIDE]);
+        if let Some(r) = atr_parse_row(&arr) {
+            if r.dir_lba == dir_lba && r.dir_off == dir_off {
+                return Some(r.first_cluster);
+            }
+        }
+    }
+    None
+}
+
 /// K2 (make-enforcement-LIVE) proof + verdict — the last demo in the U7 chain (after k1_corrupt_launcher).
 /// Rides the U7 kernel task on `vcpu`; the programs run co-located on `demo_cpu`, cooperative under QEMU.
-/// Six-bit witness `w`: (0) the real owner created+owned+wrote its private file, stamped prog:K2OWN.BIN;
+/// Seven-bit witness `w`: (0) the real owner created+owned+wrote its private file, stamped prog:K2OWN.BIN;
 /// (1) its in-RAM owner row is that named principal (persist path engaged); (2) the row survived to
 /// `UNAFS.ATR` + rebuilt at mount; (3) the rebuilt row is owned by prog:K2OWN.BIN (owner_asid = sentinel,
 /// no live incarnation); (4) a FRESH incarnation of the owner re-opened its file purely BY NAME after the
-/// rebuild; (5) the impostor (a distinct real principal) was REFUSED (-EACCES). PASS iff `w == 0x3F` AND
-/// all three programs hit their sentinel exit AND none was killed AND the row self-cleaned. Emits ONE
+/// rebuild; (5) the impostor (a distinct real principal) was REFUSED (-EACCES); (6) M(b) grow-repersist
+/// landed the real chain head in the persisted row (not the create-time 0). PASS iff `w == 0x7F` AND all
+/// three programs hit their sentinel exit AND none was killed AND the row self-cleaned. Emits ONE
 /// uncounted witness line (PASS/FAIL space-flanked mid-sentence — never `-> PASS`/`: PASS`/`-> FAIL`/
 /// `FAIL ::`), so the 23-fixture PASS count stays byte-equivalent.
 fn k2_liveenf_launcher(demo_cpu: usize) {
@@ -9933,8 +9965,8 @@ fn k2_liveenf_launcher(demo_cpu: usize) {
             return;
         }
     };
-    let (priv_lba, priv_off) = match fs2.find_located(K2_PRIV_NAME) {
-        Ok((_, l, o)) => (l, o as u32),
+    let (priv_lba, priv_off, priv_fc) = match fs2.find_located(K2_PRIV_NAME) {
+        Ok((de, l, o)) => (l, o as u32, de.first_cluster()),
         Err(_) => {
             serial_println!(":: K2-liveenf: K2PRIV.BIN not created by the owner — demo aborted ::");
             k2_cleanup();
@@ -9943,6 +9975,11 @@ fn k2_liveenf_launcher(demo_cpu: usize) {
     };
     if owned_owner_ppid(priv_lba, priv_off) == p_own {
         w |= 1 << 1; // bit1: the owner row (in RAM) is the named principal -> the persist path engaged
+    }
+    // bit6: M(b) grow-repersist actually LANDED — the owner grew K2PRIV.BIN, so its persisted row must carry
+    // the real (nonzero) chain head, not the create-time 0 (which would still install name-primary at rebuild).
+    if priv_fc != 0 && k2_persisted_first_cluster(&fs2, priv_lba, priv_off) == Some(priv_fc) {
+        w |= 1 << 6;
     }
 
     // ---- Phase 2: simulate a reboot — WIPE the in-RAM ACL, remount, REBUILD purely from UNAFS.ATR ----
@@ -9994,10 +10031,10 @@ fn k2_liveenf_launcher(demo_cpu: usize) {
         Err(_) => false,
     };
 
-    const K2_ALL: u32 = (1 << 6) - 1; // bits 0..=5
+    const K2_ALL: u32 = (1 << 7) - 1; // bits 0..=6
     if w == K2_ALL && done == 3 && killed == 0 && cleaned {
         serial_println!(
-            ":: K2-liveenf: cross-reboot ACL LIVE via REAL programs — owner prog:K2OWN.BIN re-admitted BY NAME after UNAFS.ATR rebuild, impostor prog:K2IMP.BIN refused (-EACCES); grow-repersist exercised; self-cleaned rebuild+enforce PASS [w={:#04x}] ::",
+            ":: K2-liveenf: cross-reboot ACL LIVE via REAL programs — owner prog:K2OWN.BIN re-admitted BY NAME after UNAFS.ATR rebuild, impostor prog:K2IMP.BIN refused (-EACCES); grow-repersist landed the real chain head; self-cleaned rebuild+enforce PASS [w={:#04x}] ::",
             w
         );
     } else {
