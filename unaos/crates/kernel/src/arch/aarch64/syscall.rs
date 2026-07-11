@@ -8622,19 +8622,21 @@ fn atr_parse_row(b: &[u8; ATR_ROW_STRIDE]) -> Option<AtrRow> {
 }
 
 /// K1: the volume binding — proves an attr file belongs to THIS volume (a swapped card / byte-copied image
-/// is rejected, so a foreign volume's rows never attach to this volume's directory slots). M1 PLACEHOLDER:
-/// binds to the reachable public accessors `cluster_size()` + `num_fats()`; the real fingerprint (BS_VolID
-/// + count_of_clusters) needs a read-only fat.rs accessor that does not exist yet — a SEAT-AUTHORIZED M2
-/// prerequisite (M1 must not edit shared fat.rs). The binding LOGIC (bind + reject-on-mismatch) is complete
-/// and metal-exercised; only the two source fields upgrade at M2.
+/// is rejected, so a foreign volume's rows never attach to this volume's directory slots). K1 M2.2: the real
+/// fingerprint `(BS_VolID, count_of_clusters)` via the seat-authorized read-only `fat.rs`
+/// `volume_fingerprint()` accessor — the volume serial (fixed at format time) + the cluster count (fixed by
+/// geometry) are far more discriminating than M1's placeholder `cluster_size()` + `num_fats()`. The binding
+/// LOGIC (bind + reject-on-mismatch) is unchanged; a UNAFS.ATR written under the M1 placeholder binding now
+/// fails the header check and `atr_ensure` self-heals it (M2.3) — a one-time reheal on the metal card.
 #[derive(Clone, Copy, PartialEq, Eq)]
 struct AtrBinding {
-    a: u32, // M1: cluster_size()   (M2: BS_VolID)
-    b: u32, // M1: num_fats()       (M2: count_of_clusters)
+    a: u32, // BS_VolID (the formatter's volume serial)
+    b: u32, // count_of_clusters (the volume's data-cluster count)
 }
 
 fn atr_live_binding(fs: &crate::fs::fat::FatFs) -> AtrBinding {
-    AtrBinding { a: fs.cluster_size(), b: fs.num_fats() }
+    let (vol_id, clusters) = fs.volume_fingerprint();
+    AtrBinding { a: vol_id, b: clusters }
 }
 
 /// K1: serialize the 512-byte header (committed). Layout (LE): [0..8] magic · [8..10] version ·

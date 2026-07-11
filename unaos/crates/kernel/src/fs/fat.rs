@@ -255,6 +255,10 @@ pub struct FatFs {
     root_dir_sectors: u32,
     /// Number of data clusters. Valid cluster numbers are `2 ..= count_of_clusters + 1`.
     count_of_clusters: u32,
+    /// K1 M2.2: `BS_VolID`, the volume serial number the formatter stamped into the boot sector (offset 0x27 on
+    /// FAT16, 0x43 on FAT32). Read-only; exposed via [`FatFs::volume_fingerprint`] as one half of the UNAFS.ATR
+    /// volume binding (so a swapped/byte-copied card is rejected — its rows never attach to this volume).
+    vol_id: u32,
 }
 
 // ---- little-endian field readers ------------------------------------------------------------
@@ -538,6 +542,10 @@ fn parse_bpb(sec: &[u8; SECTOR_SIZE], part_lba: u64, dev_blocks: u64) -> Result<
     let root_dir_lba = part_lba + (reserved + fat_region) as u64; // FAT16 fixed region (unused on FAT32)
     let data_start = part_lba + first_data_sector as u64;
 
+    // K1 M2.2: BS_VolID — the formatter's volume serial. Extended-BPB field: offset 0x27 on FAT12/16, 0x43 on
+    // FAT32 (both well within the already-read boot sector). Read-only; used only as a UNAFS.ATR binding fingerprint.
+    let vol_id = u32le(sec, if kind == FatKind::Fat32 { 0x43 } else { 0x27 });
+
     Ok(FatFs {
         kind,
         part_lba,
@@ -552,6 +560,7 @@ fn parse_bpb(sec: &[u8; SECTOR_SIZE], part_lba: u64, dev_blocks: u64) -> Result<
         root_dir_lba,
         root_dir_sectors,
         count_of_clusters,
+        vol_id,
     })
 }
 
@@ -755,6 +764,14 @@ impl FatFs {
     /// Number of FAT copies (`num_fats`, usually 2 on FAT32). Public for the launcher's FAT-copy-agreement check.
     pub fn num_fats(&self) -> u32 {
         self.num_fats
+    }
+
+    /// K1 M2.2: the volume FINGERPRINT — `(BS_VolID, count_of_clusters)`. Read-only; the aarch64 UNAFS.ATR ACL
+    /// store binds to it so a swapped card / byte-copied image (a DIFFERENT serial or size) is rejected and its
+    /// owner rows never attach to this volume's directory slots. Two identity fields chosen for stability under
+    /// non-destructive edits: the serial is fixed at format time and the cluster count is fixed by the geometry.
+    pub fn volume_fingerprint(&self) -> (u32, u32) {
+        (self.vol_id, self.count_of_clusters)
     }
 
     /// Bytes per cluster (`sec_per_clus * bytes_per_sec`). Public for the U10 GROW launcher's chain-length
