@@ -18,6 +18,8 @@
 // log (or a red panic screen) stays up.
 
 use crate::video::FrameBuffer;
+#[cfg(target_arch = "x86_64")]
+use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, Ordering};
 use spin::Mutex;
 use unaos_boot_info::FrameBufferInfo;
@@ -44,6 +46,22 @@ struct FbCon {
     /// panic backdrop) still cover the whole real panel.
     #[cfg(all(target_arch = "x86_64", feature = "videocap"))]
     fb_full: FrameBuffer,
+    /// VPERF M3 (x86 only): the cached-RAM shadow. On the 2012 rMBP every CPU *read* of the
+    /// GOP framebuffer is an uncached PCIe round trip, and `scroll_up`'s memmove READS the whole
+    /// surface — ~28 MiB read + ~28 MiB written per 8-px text line. Once attached (late, at the
+    /// post-heap usbdebug seam — fbcon initialises pre-heap by design, so init-time allocation is
+    /// impossible), all text drawing and scrolling go to this heap store and VRAM only ever
+    /// receives whole rows as sequential write-only blits (`flush_dirty`). `None` = direct-VRAM
+    /// (boot-early, GUI builds — which never attach; the `Screen` back buffer owns the heap
+    /// budget — and the panic path, which forcibly detaches).
+    #[cfg(target_arch = "x86_64")]
+    shadow_store: Option<Vec<u8>>,
+    /// A surface handle pointing into `shadow_store` (same geometry as `fb`, including a
+    /// videocap'd height). SAFETY/INVARIANT: the store is allocated once at its final size in
+    /// `attach_shadow` and never grown/shrunk, so its heap buffer never moves (the `Screen`
+    /// back-store idiom).
+    #[cfg(target_arch = "x86_64")]
+    shadow: FrameBuffer,
     cols: usize,
     rows: usize,
     col: usize,
@@ -64,6 +82,10 @@ impl FbCon {
             fb: FrameBuffer::new(),
             #[cfg(all(target_arch = "x86_64", feature = "videocap"))]
             fb_full: FrameBuffer::new(),
+            #[cfg(target_arch = "x86_64")]
+            shadow_store: None,
+            #[cfg(target_arch = "x86_64")]
+            shadow: FrameBuffer::new(),
             cols: 0,
             rows: 0,
             col: 0,
@@ -90,6 +112,19 @@ impl FbCon {
         &self.fb
     }
 
+    /// The surface text drawing and scrolling target: the cached-RAM shadow once attached
+    /// (VRAM then only ever sees write-only blits), the framebuffer itself before/without it.
+    #[cfg(target_arch = "x86_64")]
+    #[inline]
+    fn draw_fb(&self) -> &FrameBuffer {
+        if self.shadow_store.is_some() { &self.shadow } else { &self.fb }
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    #[inline]
+    fn draw_fb(&self) -> &FrameBuffer {
+        &self.fb
+    }
+
     /// Grow the dirty band to include pixel rows `[y0, y1)`.
     fn mark_rows(&mut self, y0: usize, y1: usize) {
         if self.dirty_y0 >= self.dirty_y1 {
@@ -111,6 +146,18 @@ impl FbCon {
         let row_bytes = info.stride * info.bytes_per_pixel;
         let y1 = self.dirty_y1.min(info.height);
         if y1 > self.dirty_y0 {
+            // VPERF M3: with the shadow attached, present the dirty band to VRAM as ONE
+            // contiguous write-only blit (full-width rows, so [y0,y1) is a single byte range).
+            // On a scroll the band is the whole viewport — a sequential ~viewport-sized write,
+            // and zero VRAM reads (the memmove ran in cached RAM).
+            #[cfg(target_arch = "x86_64")]
+            if let Some(store) = &self.shadow_store {
+                let off = self.dirty_y0 * row_bytes;
+                let end = (y1 * row_bytes).min(store.len());
+                if end > off {
+                    self.fb.blit(off, &store[off..end]);
+                }
+            }
             self.fb.flush_range(self.dirty_y0 * row_bytes, (y1 - self.dirty_y0) * row_bytes);
         }
         self.dirty_y0 = 0;
@@ -120,19 +167,22 @@ impl FbCon {
     /// Draw a glyph at pixel (cx, cy). Cells are background-clean when first reached (initial
     /// fill / post-scroll clear), so we only paint the foreground pixels — no per-cell clear.
     fn glyph(&self, ch: u8, cx: usize, cy: usize) {
+        let surf = self.draw_fb();
         let bitmap = font8x8::legacy::BASIC_LEGACY[ch as usize];
         for (ry, byte) in bitmap.iter().enumerate() {
             for rx in 0..8 {
                 if byte & (1 << rx) != 0 {
-                    self.fb.put_pixel(cx + rx, cy + ry, self.fg);
+                    surf.put_pixel(cx + rx, cy + ry, self.fg);
                 }
             }
         }
     }
 
-    /// Scroll the whole framebuffer up by one text row and clear the freed bottom row.
+    /// Scroll the whole (draw-surface) frame up by one text row and clear the freed bottom row.
+    /// With the M3 shadow attached the memmove runs in cached RAM; the following `flush_dirty`
+    /// presents the viewport to VRAM write-only. Without it, this is the direct-VRAM memmove.
     fn scroll(&mut self) {
-        self.fb.scroll_up(CELL_H, self.bg);
+        self.draw_fb().scroll_up(CELL_H, self.bg);
         // A scroll moves the entire surface — the whole visible frame is now dirty.
         self.mark_rows(0, self.fb.info().height);
     }
@@ -260,11 +310,72 @@ pub fn clear() {
             if c.ready {
                 c.col = 0;
                 c.row = 0;
+                // VPERF M3: with the shadow attached, clear the WHOLE store in cached RAM (a
+                // full-geometry handle over the same bytes — the capped `shadow` handle would
+                // leave a videocap'd below-cap band unfilled) and present it as one write-only
+                // blit. VRAM is never read either way.
+                #[cfg(target_arch = "x86_64")]
+                {
+                    let full_info = c.full_fb().info();
+                    let fb = *c.full_fb();
+                    if let Some(store) = &mut c.shadow_store {
+                        let mut whole = FrameBuffer::new();
+                        whole.init(store.as_mut_ptr() as usize, store.len(), full_info);
+                        whole.fill_screen(BG_DEFAULT);
+                        fb.blit(0, store);
+                        return;
+                    }
+                }
                 // Whole real surface, even when the videocap lever caps the text viewport.
                 c.full_fb().fill_screen(BG_DEFAULT);
             }
         }
     });
+}
+
+/// VPERF M3 — attach the cached-RAM shadow (x86 only; LATE-ATTACH by design). fbcon initialises
+/// pre-heap, so this runs at the post-heap seam instead (the usbdebug path calls it right before
+/// its `clear()`). From here on, text drawing and scrolling happen in cached RAM and the real
+/// framebuffer only ever receives sequential write-only blits — eliminating the uncached VRAM
+/// *reads* that made `scroll_up` nightmarishly slow on the rMBP's PCIe-scanned surface.
+///
+/// The shadow is NEVER seeded from VRAM (reading the surface back is the exact cost being
+/// removed): the store starts blank, the cursor is homed, and the panel is repainted from the
+/// blank store, so screen and shadow are coherent from the first byte. GUI builds never call
+/// this (they `detach()` fbcon; the `Screen` back buffer owns the heap budget) and a
+/// belt-and-braces GUI_ACTIVE check keeps it a no-op even if one did. Idempotent.
+#[cfg(target_arch = "x86_64")]
+pub fn attach_shadow() {
+    let mut attached = false;
+    crate::arch::without_interrupts(|| {
+        if let Some(mut c) = FBCON.try_lock() {
+            if !c.ready || c.shadow_store.is_some() || GUI_ACTIVE.load(Ordering::Relaxed) {
+                return;
+            }
+            let len = c.fb.len();
+            if len == 0 {
+                return;
+            }
+            let mut store: Vec<u8> = alloc::vec![0u8; len];
+            let mut sh = FrameBuffer::new();
+            // INVARIANT: the store is at its final size and never grows, so this captured heap
+            // address stays valid for the shadow's lifetime (the Screen back-store idiom).
+            sh.init(store.as_mut_ptr() as usize, len, c.fb.info());
+            c.shadow = sh;
+            c.shadow_store = Some(store);
+            c.col = 0;
+            c.row = 0;
+            // Present the blank store once (write-only), so the panel matches the shadow.
+            let fb = c.fb;
+            if let Some(store) = &c.shadow_store {
+                fb.blit(0, store);
+            }
+            attached = true;
+        }
+    });
+    if attached {
+        serial_println!(":: fbcon: cached-RAM shadow attached — VRAM is now write-only ::");
+    }
 }
 
 /// Repaint the screen as a panic backdrop (dark red) and home the cursor, so the panic message
@@ -276,6 +387,14 @@ pub fn panic_screen() {
     crate::arch::without_interrupts(|| {
         if let Some(mut c) = FBCON.try_lock() {
             if c.ready {
+                // VPERF M3: force DIRECT-VRAM for the whole panic path. A panic mid-blit (or
+                // mid-allocation) must still paint the red screen and its text, so the shadow is
+                // dropped WITHOUT freeing (`mem::forget`) — touching the allocator from a panic
+                // context that may already hold its lock would deadlock a dying machine.
+                #[cfg(target_arch = "x86_64")]
+                if let Some(s) = c.shadow_store.take() {
+                    core::mem::forget(s);
+                }
                 c.bg = PANIC_BG;
                 c.fg = 0x00FF_FFFF;
                 c.col = 0;

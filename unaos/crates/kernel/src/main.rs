@@ -652,6 +652,14 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     // on metal. (Net service is intentionally skipped here so a non-e1000 NIC isn't poked.)
     #[cfg(feature = "usbdebug")]
     {
+        // VPERF M3: attach fbcon's cached-RAM shadow at the post-heap seam. From here the console
+        // scrolls in cached RAM and the framebuffer only receives write-only blits — the
+        // uncached-VRAM-read scroll (the rMBP's "nightmarishly slow" text output) is gone. This
+        // is the LATE-ATTACH site by design: fbcon initialises pre-heap, and GUI builds never
+        // reach this call (they detach fbcon instead; the Screen back buffer owns the heap
+        // budget, so a second ~28 MiB shadow there would OOM the 48 MiB heap on metal).
+        #[cfg(target_arch = "x86_64")]
+        unaos_kernel::video::fbcon::attach_shadow();
         // Clear the boot spam so the (post-boot) hot-plug enumeration + live input own the screen.
         unaos_kernel::video::fbcon::clear();
         serial_println!(":: ============== USB DEBUG MODE ============== ::");
