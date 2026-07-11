@@ -178,6 +178,44 @@ with its twin or passes). What changes and what doesn't:
 - The per-track briefs remain the arc contracts (STATUS flips to LANDED at
   close); when a campaign spans tracks, the campaign plan file names the order.
 
+## The metal-verification gate (Peter's directive, 2026-07-11)
+
+**A round does not CLOSE until every metal-dependent arc in it has been
+bench-verified with the seat LIVE.** The old pattern — land QEMU-green, defer the
+metal confirm to "the next attended bench, someday" — grew an unbounded backlog
+(round 5 closed with S4 races, the S1–S3 re-bench, the VPERF readout, scale-2, and
+the K1 survive-reboot proof all still pending). That stops. Per arc, at brief time,
+the seat picks one of two patterns:
+
+- **(1) bench-FIRST** — when a *metal unknown gates the design*: run the bench
+  before coding the dependent arc. Example: VPERF-WC's whole existence depends on
+  the real framebuffer memory-type readout; a driver bring-up depends on the real
+  device's behavior. Don't write code whose shape a metal fact will decide.
+- **(2) bench-as-CLOSE-gate** (Peter's preference where possible) — the arc codes
+  QEMU-green, then the round's attended metal bench runs as a **required step
+  before round close, with the seat live** so any metal-only fix folds in-round
+  (the STOR-1 precedent: fixes fold + re-gate before the merge proceeds). The seat
+  holds the round open for the bench; it does not declare the round done on
+  QEMU-green alone.
+
+**Batching** (Peter's bench time is the scarce complement): the seat collects a
+round's metal-dependent items into ONE attended bench per platform and runs them
+together — the jetson track already sizes work this way ("attended-boot batches").
+Prep everything offline; batch the questions per boot.
+
+**Code-prerequisite sequencing**: metal that is blocked on a code prerequisite is
+sequenced explicitly, not counted against the gate for the current round. Example:
+K1 survive-reboot enforcement can only be metal-proven once K2 lands a second
+launchable named program (flips `by_name_spawn_multivalued` live) — so K1's
+survive-reboot metal rides the round that lands K2, not before. The gate applies
+to metal that *can* run given the round's code.
+
+**Tooling to make the gate cheap**: an automated metal-bench harness (scripted
+serial-bridge capture + witness-line assertion, a "metal battery" analog) is a
+standing high-leverage investment — it turns an attended bench from boot-and-
+photograph into run-the-script-get-pass/fail, which is what makes a per-round
+metal gate affordable rather than a tax. See the round-6 candidate slate.
+
 ## Guardrails specific to this seat
 
 - Fable reviews **before** merge and **before** metal, always. QEMU-green ≠
