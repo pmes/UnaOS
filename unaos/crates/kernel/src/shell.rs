@@ -101,14 +101,17 @@ fn resolve_path(fs: &FatFs, path: &str) -> Result<Resolved, String> {
 }
 
 // ---------------------------------------------------------------------------------------------
-// JD5 — the WRITE path: create / edit / delete files from the panel shell.
+// JD5/JD6 — the WRITE path: create / edit / delete files from the panel shell (JD6 extends it to
+// any subdirectory the shell can `cd` into; JD5 was root-directory only).
 //
 // DESIGN NOTE (why this rides fat.rs directly, not the SYS_OPEN/WRITE syscall layer):
 // The SVC syscall path is EL0/ASID-keyed and lives in the out-of-lane `arch/aarch64/syscall.rs`;
 // the kernel shell runs at EL1 as ASID 0 (on the tegra post-drop core TTBR0_EL1[63:48] = 0 — it
 // never switches TTBR0 to a user slot), so it cannot invoke the SVC path. The shell therefore rides
-// the SAME F3-locked fat.rs PUBLIC entry points the U9/U10/U11 syscalls call — `create_in_root`,
-// `find_located`, `write_grow`, `delete_located` — never editing fat.rs (call-never-edit this arc).
+// the SAME F3-locked fat.rs PUBLIC entry points the U9/U10/U11 syscalls call — the dir-aware
+// `create_in_dir`/`locate_in_dir` twins (JD6; `first_cluster == 0` ⇒ the root twins
+// `create_in_root`/`find_located`), plus `write_grow`, `delete_located` — never editing fat.rs
+// (call-never-edit this arc; the two JD6 twins are a seat-granted narrow ADDITIVE exception).
 //
 // PRINCIPAL: the shell IS ASID 0, the shared/public principal. By U6's existing rule an ASID-0
 // create is PUBLIC (no owner row), so shell-created files are plain public FAT files. The shell does
@@ -117,10 +120,13 @@ fn resolve_path(fs: &FatFs, path: &str) -> Result<Resolved, String> {
 // (A future arc that runs EL0 tasks and returns to the shell must re-establish ASID 0 before shell
 // FAT ops — today the shell is cooperative EL1 and never installs a user-slot TTBR0.)
 //
-// SCOPE: ROOT-directory only. `create_in_root`/`find_located` are root-only and fat.rs is
-// call-never-edit, so a target whose parent is a subdirectory is an honest `-ENOTSUP` (a subdir
-// create needs a future `create_in_dir`). Bare names resolve against the cwd; only a root parent
-// is writable.
+// SCOPE (JD6): the WHOLE tree the shell can `cd` into. `resolve_write_target` normalizes the path
+// against the cwd and walks to the PARENT directory via the read-only `resolve_path`, then the
+// writes ride the dir-aware `create_in_dir`/`locate_in_dir` twins (`first_cluster == 0` ⇒ root).
+// A parent that is a plain file is `-ENOTDIR`; a missing parent `-ENOENT`; a FULL directory
+// `-ENOSPC` (extending a subdir's cluster chain is out of scope this arc — the twins add a slot but
+// never grow the directory chain). Directory REMOVAL (`rmdir`) stays out of scope: `rm` of a
+// directory is `-EISDIR` (it needs emptiness + `.`/`..` handling and a fat.rs primitive we lack).
 //
 // SAFETY (M3): every fat.rs write returns a `Result`; a stalled USB write surfaces as
 // `FatError::Io` (the block layer's `write_block` rides the SAME JD3 wall-clock-bounded BOT pump as
@@ -140,20 +146,6 @@ fn fat_errno(e: FatError) -> &'static str {
         FatError::Unsupported => "-EINVAL", // not a representable 8.3 name
         FatError::NoDisk | FatError::NotFat => "-ENODEV",
         FatError::Io | FatError::BadChain => "-EIO",
-    }
-}
-
-/// JD5: resolve a shell path argument to a bare ROOT-directory 8.3 name (parent must be the root).
-/// `.`/`..` normalize lexically against the cwd first; a target one level below the root yields its
-/// name, the root itself is rejected, and any deeper target is `-ENOTSUP` (the write path is root-
-/// only this arc — see the module DESIGN NOTE). Returns `Ok(name)` or a ready-to-print error tail.
-fn resolve_root_name(arg: &str) -> Result<String, String> {
-    let path = normalize_path(&cwd_path(), arg);
-    let comps: Vec<&str> = path.split('/').filter(|c| !c.is_empty()).collect();
-    match comps.as_slice() {
-        [name] => Ok(String::from(*name)),
-        [] => Err(String::from("/: is a directory (-EISDIR)")),
-        _ => Err(alloc::format!("{}: writes are root-directory only this arc (-ENOTSUP)", path)),
     }
 }
 
@@ -273,67 +265,79 @@ fn fs_write(console: &mut Console, arg: &str, data: &[u8]) {
     }
 }
 
-/// JD5 `append`: append `data` at the end of a ROOT file, creating it if absent (like `>>`). The
-/// append grows the file from its current EOF via `write_grow` (allocate + zero-fill + chain new
-/// clusters, directory `size` published LAST). A directory target is refused (`-EISDIR`).
+/// JD6 `append`: append `data` at the end of a file at `path` in ANY reachable directory, creating
+/// it if absent (like `>>`). The append grows the file from its current EOF via `write_grow`
+/// (allocate + zero-fill + chain new clusters, directory `size` published LAST). A directory target
+/// is refused (`-EISDIR`). Rides the dir-aware create_in_dir/locate_in_dir twins.
 fn fs_append(console: &mut Console, arg: &str, data: &[u8]) {
-    let name = match resolve_root_name(arg) {
-        Ok(n) => n,
-        Err(msg) => return console.println(&alloc::format!("append: {}", msg)),
-    };
     let fs = match crate::fs::fat::mount() {
         Ok(fs) => fs,
         Err(e) => return console.println(&alloc::format!("append: no FAT filesystem ({:?})", e)),
     };
-    let (first_cluster, size, dir_lba, dir_off) = match fs.find_located(&name) {
+    let (parent, name, canon) = match resolve_write_target(&fs, arg) {
+        Ok(t) => t,
+        Err(msg) => return console.println(&alloc::format!("append: {}", msg)),
+    };
+    let (first_cluster, size, dir_lba, dir_off) = match fs.locate_in_dir(parent, &name) {
         Ok((de, dl, doff)) => {
             if de.is_dir {
-                return console.println(&alloc::format!("append: /{}: is a directory (-EISDIR)", de.name()));
+                return console.println(&alloc::format!(
+                    "append: {}: is a directory (-EISDIR)", joined(&canon, de.name())));
             }
             (de.first_cluster(), de.size, dl, doff)
         }
-        Err(FatError::NotFound) => match fs.create_in_root(&name, 0x20) {
+        Err(FatError::NotFound) => match fs.create_in_dir(parent, &name, 0x20) {
             Ok((de, dl, doff)) => (de.first_cluster(), de.size, dl, doff), // fresh: 0, 0
-            Err(e) => return console.println(&alloc::format!("append: {}: {} ({:?})", name, fat_errno(e), e)),
+            Err(e) => return console.println(&alloc::format!(
+                "append: {}: {} ({:?})", joined(&canon, &name), fat_errno(e), e)),
         },
-        Err(e) => return console.println(&alloc::format!("append: {}: {} ({:?})", name, fat_errno(e), e)),
+        Err(e) => return console.println(&alloc::format!(
+            "append: {}: {} ({:?})", joined(&canon, &name), fat_errno(e), e)),
     };
     if data.is_empty() {
-        return console.println(&alloc::format!("appended 0 bytes to /{} ({} bytes)", name, size));
+        return console.println(&alloc::format!(
+            "appended 0 bytes to {} ({} bytes)", joined(&canon, &name), size));
     }
     // Seek to EOF (`start = size`) and grow: write_grow appends the new bytes past the current end.
     match fs.write_grow(first_cluster, size, dir_lba, dir_off, size, data) {
-        Ok((written, new_size, _)) =>
-            console.println(&alloc::format!("appended {} bytes to /{} ({} bytes)", written, name, new_size)),
-        Err(e) => console.println(&alloc::format!("append: /{}: {} ({:?})", name, fat_errno(e), e)),
+        Ok((written, new_size, _)) => console.println(&alloc::format!(
+            "appended {} bytes to {} ({} bytes)", written, joined(&canon, &name), new_size)),
+        Err(e) => console.println(&alloc::format!(
+            "append: {}: {} ({:?})", joined(&canon, &name), fat_errno(e), e)),
     }
 }
 
-/// JD5 `rm`: delete a ROOT file — `delete_located` marks the directory slot `0xE5` FIRST, then frees
-/// the cluster chain (all FAT copies), the crash-safe order fat.rs guarantees. A directory target is
-/// refused (`-EISDIR` — directory removal is out of scope this arc); an absent name is `-ENOENT`.
+/// JD6 `rm`: delete a file at `path` in ANY reachable directory — `delete_located` marks the
+/// directory slot `0xE5` FIRST, then frees the cluster chain (all FAT copies), the crash-safe order
+/// fat.rs guarantees. A directory target is refused (`-EISDIR` — directory removal / `rmdir` is out
+/// of scope this arc: it needs emptiness + `.`/`..` handling and a fat.rs primitive we don't have);
+/// an absent name is `-ENOENT`. Rides the dir-aware locate_in_dir twin.
 fn fs_rm(console: &mut Console, arg: &str) {
-    let name = match resolve_root_name(arg) {
-        Ok(n) => n,
-        Err(msg) => return console.println(&alloc::format!("rm: {}", msg)),
-    };
     let fs = match crate::fs::fat::mount() {
         Ok(fs) => fs,
         Err(e) => return console.println(&alloc::format!("rm: no FAT filesystem ({:?})", e)),
     };
-    match fs.find_located(&name) {
+    let (parent, name, canon) = match resolve_write_target(&fs, arg) {
+        Ok(t) => t,
+        Err(msg) => return console.println(&alloc::format!("rm: {}", msg)),
+    };
+    match fs.locate_in_dir(parent, &name) {
         Ok((de, dl, doff)) => {
             if de.is_dir {
-                return console.println(&alloc::format!("rm: /{}: is a directory (-EISDIR)", de.name()));
+                return console.println(&alloc::format!(
+                    "rm: {}: is a directory (-EISDIR)", joined(&canon, de.name())));
             }
             match fs.delete_located(dl, doff, de.first_cluster()) {
                 Ok(freed) => console.println(&alloc::format!(
-                    "removed /{} ({} cluster(s) freed)", de.name(), freed.len())),
-                Err(e) => console.println(&alloc::format!("rm: /{}: {} ({:?})", name, fat_errno(e), e)),
+                    "removed {} ({} cluster(s) freed)", joined(&canon, de.name()), freed.len())),
+                Err(e) => console.println(&alloc::format!(
+                    "rm: {}: {} ({:?})", joined(&canon, &name), fat_errno(e), e)),
             }
         }
-        Err(FatError::NotFound) => console.println(&alloc::format!("rm: {}: not found (-ENOENT)", name)),
-        Err(e) => console.println(&alloc::format!("rm: {}: {} ({:?})", name, fat_errno(e), e)),
+        Err(FatError::NotFound) => console.println(&alloc::format!(
+            "rm: {}: not found (-ENOENT)", joined(&canon, &name))),
+        Err(e) => console.println(&alloc::format!(
+            "rm: {}: {} ({:?})", joined(&canon, &name), fat_errno(e), e)),
     }
 }
 
