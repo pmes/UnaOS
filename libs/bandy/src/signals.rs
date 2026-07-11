@@ -20,6 +20,13 @@ pub enum SMessage {
         source: String,
         content: String,
     },
+    /// One beat of the system monitor: per-core CPU load fractions
+    /// (`0.0..=1.0`, one entry per core). Fired by the `pulse` vessel's
+    /// sampler seam (`PulseSource`); a future UnaOS-kernel telemetry feed
+    /// replaces the *source*, not this message.
+    CorePulse {
+        loads: Vec<f32>,
+    },
 
     // --- EUCLASE (The Visual Cortex) ---
     EuclaseResize(u32, u32),

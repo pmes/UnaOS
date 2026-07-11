@@ -22,8 +22,15 @@
 //! UnaOS-kernel telemetry feed can replace the host sampler without touching
 //! the UI.
 
-use bandy::{telemetry, Synapse};
+mod source;
+
+use bandy::{SMessage, Synapse, telemetry};
 use gneiss_pal::paths::UnaPaths;
+use source::{HostPulseSource, PulseSource};
+
+/// The sampling cadence: a calm display, not jitter (and comfortably above
+/// sysinfo's minimum CPU-delta interval).
+const BEAT: std::time::Duration = std::time::Duration::from_millis(250);
 
 fn main() {
     // 0. Ignite the Substrate Reactor (Tokio)
@@ -59,6 +66,29 @@ fn main() {
     // 2. Ignite the Spine
     let synapse = Synapse::new();
 
+    // 2.5 The Heartbeat: PulseSource seam -> Synapse.
+    // The UI never meets the sampler; it only hears SMessage::CorePulse on the
+    // bus. Swapping in a kernel telemetry feed is a one-line change here.
+    let sampler_synapse = synapse.clone();
+    let mut sampler_shutdown = shutdown_tx.subscribe();
+    let sampler_handle = rt.spawn(async move {
+        let mut src: Box<dyn PulseSource> = Box::new(HostPulseSource::new());
+        let mut cadence = tokio::time::interval(BEAT);
+        cadence.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            tokio::select! {
+                _ = sampler_shutdown.recv() => {
+                    log::info!("[PULSE] :: Sampler terminating cleanly.");
+                    break;
+                }
+                _ = cadence.tick() => {
+                    let loads = src.sample();
+                    sampler_synapse.fire(SMessage::CorePulse { loads });
+                }
+            }
+        }
+    });
+
     // 3. The Window (macOS AppKit via quartzite; further backends follow quartzite maturity)
     #[cfg(target_os = "macos")]
     {
@@ -68,7 +98,7 @@ fn main() {
         let cores = std::thread::available_parallelism()
             .map(|n| n.get())
             .unwrap_or(1);
-        let width = (72.0 * cores as f64 + 32.0).clamp(320.0, 1280.0);
+        let width = (88.0 * cores as f64 + 48.0).clamp(320.0, 1600.0);
 
         let rx_synapse = synapse.subscribe();
         quartzite::Backend::new_vessel("org.unaos.pulse", "pulse", (width, 96.0), move |window| {
@@ -85,4 +115,7 @@ fn main() {
 
     // Broadcast shutdown in case the GUI exited naturally instead of via SIGINT/SIGTERM.
     let _ = shutdown_tx.send(());
+    rt.block_on(async {
+        let _ = sampler_handle.await;
+    });
 }
