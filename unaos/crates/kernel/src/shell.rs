@@ -157,23 +157,67 @@ fn resolve_root_name(arg: &str) -> Result<String, String> {
     }
 }
 
-/// JD5 `touch`: ensure a 0-length ROOT file exists (create if absent; idempotent no-op if present).
-fn fs_touch(console: &mut Console, arg: &str) {
-    let name = match resolve_root_name(arg) {
-        Ok(n) => n,
-        Err(msg) => return console.println(&alloc::format!("touch: {}", msg)),
+/// JD6: resolve a shell path argument to its write target `(parent_first_cluster, leaf_name,
+/// parent_canon)`. `.`/`..` normalize lexically against the cwd, then the read-only `resolve_path`
+/// walks to the PARENT directory (the root ⇒ `first_cluster` 0 and `parent_canon` ""). The final
+/// component is the leaf to create/locate — it need NOT exist yet. The root itself is not a writable
+/// target (`-EISDIR`); a parent that is a plain file is `-ENOTDIR`; a missing parent is `-ENOENT`
+/// (both surface from `resolve_path`). The dir-aware fat.rs twins (`create_in_dir`/`locate_in_dir`)
+/// take `parent_first_cluster` directly, so this reaches the whole tree the shell can `cd` into.
+fn resolve_write_target(fs: &FatFs, arg: &str) -> Result<(u32, String, String), String> {
+    let path = normalize_path(&cwd_path(), arg);
+    let comps: Vec<&str> = path.split('/').filter(|c| !c.is_empty()).collect();
+    let (leaf, parent_comps) = match comps.split_last() {
+        Some((last, rest)) => (String::from(*last), rest),
+        None => return Err(String::from("/: is a directory (-EISDIR)")), // path == "/"
     };
+    if parent_comps.is_empty() {
+        return Ok((0, leaf, String::new())); // parent is the volume root
+    }
+    let mut parent_path = String::new();
+    for c in parent_comps {
+        parent_path.push('/');
+        parent_path.push_str(c);
+    }
+    match resolve_path(fs, &parent_path)? {
+        Resolved::Root => Ok((0, leaf, String::new())), // unreachable for a non-empty parent, but honest
+        Resolved::Entry(de, canon) => {
+            if de.is_dir {
+                Ok((de.first_cluster(), leaf, canon))
+            } else {
+                Err(alloc::format!("{}: not a directory (-ENOTDIR)", canon))
+            }
+        }
+    }
+}
+
+/// JD6: an absolute display path for a write target's leaf under `parent_canon` ("" ⇒ the root),
+/// e.g. `("", "NOTE.TXT") → "/NOTE.TXT"`, `("/DOCS", "NOTE.TXT") → "/DOCS/NOTE.TXT"`.
+fn joined(parent_canon: &str, leaf: &str) -> String {
+    alloc::format!("{}/{}", parent_canon, leaf)
+}
+
+/// JD6 `touch`: ensure a 0-length file exists at `path` in ANY directory the shell can reach
+/// (create if absent; idempotent no-op if present). Rides the dir-aware `locate_in_dir` /
+/// `create_in_dir` twins — the parent may be the root or any subdirectory.
+fn fs_touch(console: &mut Console, arg: &str) {
     let fs = match crate::fs::fat::mount() {
         Ok(fs) => fs,
         Err(e) => return console.println(&alloc::format!("touch: no FAT filesystem ({:?})", e)),
     };
-    match fs.find_located(&name) {
-        Ok((de, _, _)) => console.println(&alloc::format!("/{}", de.name())), // already exists
-        Err(FatError::NotFound) => match fs.create_in_root(&name, 0x20) {
-            Ok((de, _, _)) => console.println(&alloc::format!("/{}", de.name())),
-            Err(e) => console.println(&alloc::format!("touch: {}: {} ({:?})", name, fat_errno(e), e)),
+    let (parent, name, canon) = match resolve_write_target(&fs, arg) {
+        Ok(t) => t,
+        Err(msg) => return console.println(&alloc::format!("touch: {}", msg)),
+    };
+    match fs.locate_in_dir(parent, &name) {
+        Ok((de, _, _)) => console.println(&joined(&canon, de.name())), // already exists (canonical name)
+        Err(FatError::NotFound) => match fs.create_in_dir(parent, &name, 0x20) {
+            Ok((de, _, _)) => console.println(&joined(&canon, de.name())),
+            Err(e) => console.println(&alloc::format!(
+                "touch: {}: {} ({:?})", joined(&canon, &name), fat_errno(e), e)),
         },
-        Err(e) => console.println(&alloc::format!("touch: {}: {} ({:?})", name, fat_errno(e), e)),
+        Err(e) => console.println(&alloc::format!(
+            "touch: {}: {} ({:?})", joined(&canon, &name), fat_errno(e), e)),
     }
 }
 
