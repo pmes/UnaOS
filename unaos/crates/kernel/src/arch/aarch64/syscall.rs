@@ -8290,8 +8290,12 @@ pub fn u7_launcher(demo_cpu: usize) {
     // re-admitted by name after the UNAFS.ATR rebuild, impostor refused. Its own uncounted
     // `:: K2-liveenf: … PASS ::` line (the 26th); fully self-cleaning (leaves no owned row on the metal card).
     // Last in the chain — runs after k1_atr/persist/corrupt have left a valid UNAFS.ATR, and its own disk I/O
-    // can never perturb the 23-fixture battery or the witnesses.
+    // can never perturb the 23-fixture battery or the witnesses. The `k2_leave` metal build swaps in the
+    // two-boot money-shot (k2_metal_launcher) instead — same slot, ATTENDED Pi bench only.
+    #[cfg(not(feature = "k2_leave"))]
     k2_liveenf_launcher(demo_cpu);
+    #[cfg(feature = "k2_leave")]
+    k2_metal_launcher(demo_cpu);
 }
 
 /// F2 M3 witness worker — the `demo_cpu` half of the cross-core FAT_MUTATION stress. `fn(usize)` for
@@ -9919,7 +9923,9 @@ fn k2_persisted_first_cluster(fs: &crate::fs::fat::FatFs, dir_lba: u64, dir_off:
 /// landed the real chain head in the persisted row (not the create-time 0). PASS iff `w == 0x7F` AND all
 /// three programs hit their sentinel exit AND none was killed AND the row self-cleaned. Emits ONE
 /// uncounted witness line (PASS/FAIL space-flanked mid-sentence — never `-> PASS`/`: PASS`/`-> FAIL`/
-/// `FAIL ::`), so the 23-fixture PASS count stays byte-equivalent.
+/// `FAIL ::`), so the 23-fixture PASS count stays byte-equivalent. (The `k2_leave` metal build replaces this
+/// same-boot proof with the two-boot `k2_metal_launcher`; see it + the u7_launcher call site.)
+#[cfg(not(feature = "k2_leave"))]
 fn k2_liveenf_launcher(demo_cpu: usize) {
     static DONE: AtomicBool = AtomicBool::new(false);
     if DONE.swap(true, Ordering::Relaxed) {
@@ -10046,6 +10052,146 @@ fn k2_liveenf_launcher(demo_cpu: usize) {
         serial_println!(
             ":: K2-liveenf: rebuild+enforce FAIL — w={:#x}/{:#x} own_w1={:#x} own_w2={:#x} imp_w={:#x} done={} killed={} cleaned={} ::",
             w, K2_ALL, own_w1, own_w2, imp_w, done, killed, cleaned as u8
+        );
+    }
+}
+
+/// K2 metal money-shot (feature `k2_leave`, ATTENDED Pi bench only) — the REAL two-boot cross-reboot
+/// power-cycle proof that replaces the same-boot simulate. ONE image, flashed once, booted twice.
+/// Dispatches on whether `K2PRIV.BIN` is already on the card: ABSENT ⇒ BOOT-1 (`k2_metal_leave`:
+/// create+own+persist+grow, then LEAVE it on disk); PRESENT ⇒ BOOT-2 (`k2_metal_verify`: the LIVE
+/// `atr_maybe_boot_rebuild` at the head of `u7_launcher` has already reinstalled the row across the real
+/// power-cycle — verify + clean). Chained from `u7_launcher` in place of `k2_liveenf_launcher` in this build.
+#[cfg(feature = "k2_leave")]
+fn k2_metal_launcher(demo_cpu: usize) {
+    static DONE: AtomicBool = AtomicBool::new(false);
+    if DONE.swap(true, Ordering::Relaxed) {
+        return;
+    }
+    if crate::drivers::block::info().is_none() {
+        return; // no SD -> skip silently
+    }
+    let fs = match crate::fs::fat::mount() {
+        Ok(f) => f,
+        Err(_) => return,
+    };
+    if fs.find_in_root(K2_OWN_NAME).is_err() || fs.find_in_root(K2_IMP_NAME).is_err() {
+        serial_println!(":: K2-metal: K2OWN.BIN/K2IMP.BIN not on card — money-shot skipped ::");
+        return;
+    }
+    // The row survives a power-cycle as K2PRIV.BIN on disk: absent = the FIRST boot (leave it); present = the
+    // SECOND boot (the boot rebuild reinstalled the row — verify it survived). Dispatch on that single bit.
+    if fs.find_in_root(K2_PRIV_NAME).is_ok() {
+        k2_metal_verify(demo_cpu);
+    } else {
+        k2_metal_leave(demo_cpu);
+    }
+}
+
+/// K2 metal BOOT-1 (feature `k2_leave`): spawn the real owner, let it create+own+persist+grow `K2PRIV.BIN` at
+/// EL0, confirm the in-RAM owner row + the persisted (grown) chain head landed, then LEAVE everything on disk —
+/// NO simulate, NO clean — so a real power-cycle carries the persisted row to boot-2. Prints one uncounted line
+/// telling the operator to power-cycle (or, on an incomplete create, NOT to).
+#[cfg(feature = "k2_leave")]
+fn k2_metal_leave(demo_cpu: usize) {
+    let p_own = PrincipalRecord::program_name(K2_OWN_NAME);
+    K2_OWN_WITNESS.store(0, Ordering::Release);
+    let Some(stamp1) = k2_run_program(K2_OWN_NAME, "el0-k2own", demo_cpu, 1) else {
+        serial_println!(":: K2-metal: owner program failed to load — boot-1 leave aborted (re-prep card) ::");
+        return;
+    };
+    let own_w = K2_OWN_WITNESS.load(Ordering::Acquire);
+    let fs = match crate::fs::fat::mount() {
+        Ok(f) => f,
+        Err(_) => {
+            serial_println!(":: K2-metal: remount failed — boot-1 leave aborted (re-prep card) ::");
+            return;
+        }
+    };
+    let (priv_lba, priv_off, priv_fc) = match fs.find_located(K2_PRIV_NAME) {
+        Ok((de, l, o)) => (l, o as u32, de.first_cluster()),
+        Err(_) => {
+            serial_println!(":: K2-metal: K2PRIV.BIN not created — boot-1 leave aborted (re-prep card) ::");
+            return;
+        }
+    };
+    let owner_ok = stamp1 == p_own && owned_owner_ppid(priv_lba, priv_off) == p_own;
+    // The grow-repersisted chain head must be on disk (nonzero) so boot-2's rebuild identity cross-check engages.
+    let persist_ok = priv_fc != 0 && k2_persisted_first_cluster(&fs, priv_lba, priv_off) == Some(priv_fc);
+    if own_w == K2_OWN_WITNESS_ALL && owner_ok && persist_ok {
+        serial_println!(
+            ":: K2-metal: BOOT-1 left K2PRIV.BIN persisted (owner prog:K2OWN.BIN, fc={:#x}) on disk — POWER-CYCLE NOW; boot-2 verifies the live boot rebuild survived the reboot ::",
+            priv_fc
+        );
+    } else {
+        serial_println!(
+            ":: K2-metal: BOOT-1 leave incomplete — own_w={:#x} owner_ok={} persist_ok={} (do NOT power-cycle; re-prep the card) ::",
+            own_w, owner_ok as u8, persist_ok as u8
+        );
+    }
+    // Deliberately NO owned_clear / atr_clear_row / delete — the row + file STAY for the power-cycle.
+}
+
+/// K2 metal BOOT-2 (feature `k2_leave`): after a real power-cycle, the LIVE `atr_maybe_boot_rebuild` (head of
+/// `u7_launcher`, gate flipped) has already reinstalled `K2PRIV.BIN`'s owner row from `UNAFS.ATR`. PROVE it
+/// SURVIVED the power-cycle: (0) the row is owned by prog:K2OWN.BIN (reinstalled by the BOOT rebuild, not this
+/// fixture — owner_asid = sentinel); (1) a fresh incarnation of the owner is re-admitted BY NAME; (2) the
+/// impostor (a distinct real principal) is refused. Then CLEAN so the card ends pristine. This is the genuine
+/// (not simulated) cross-reboot survival — the true metal money-shot.
+#[cfg(feature = "k2_leave")]
+fn k2_metal_verify(demo_cpu: usize) {
+    let mut w = 0u32;
+    let p_own = PrincipalRecord::program_name(K2_OWN_NAME);
+    let fs = match crate::fs::fat::mount() {
+        Ok(f) => f,
+        Err(_) => {
+            serial_println!(":: K2-metal: BOOT-2 remount failed ::");
+            return;
+        }
+    };
+    let (priv_lba, priv_off) = match fs.find_located(K2_PRIV_NAME) {
+        Ok((_, l, o)) => (l, o as u32),
+        Err(_) => {
+            serial_println!(":: K2-metal: BOOT-2 K2PRIV.BIN vanished — nothing to verify ::");
+            return;
+        }
+    };
+    // bit0: the BOOT rebuild (atr_maybe_boot_rebuild, now GATED LIVE) reinstalled the row across the power-cycle.
+    if owned_owner_ppid(priv_lba, priv_off) == p_own {
+        w |= 1 << 0;
+    }
+    // bit1: a fresh incarnation of the owner is re-admitted BY NAME against the boot-reinstalled (sentinel) row.
+    K2_OWN_WITNESS.store(0, Ordering::Release);
+    if let Some(stamp) = k2_run_program(K2_OWN_NAME, "el0-k2own", demo_cpu, 1) {
+        if K2_OWN_WITNESS.load(Ordering::Acquire) == K2_OWN_WITNESS_ALL && stamp == p_own {
+            w |= 1 << 1;
+        }
+    }
+    // bit2: the impostor (a distinct real principal) is refused.
+    K2_IMP_WITNESS.store(0, Ordering::Release);
+    if let Some(stamp_imp) = k2_run_program(K2_IMP_NAME, "el0-k2imp", demo_cpu, 2) {
+        if K2_IMP_WITNESS.load(Ordering::Acquire) == K2_IMP_WITNESS_ALL && stamp_imp != p_own {
+            w |= 1 << 2;
+        }
+    }
+    let done = EL0_K2_DONE.load(Ordering::Acquire);
+    let killed = EL0_K2_KILLED.load(Ordering::Acquire);
+    // Clean so the card ends pristine — the money-shot is proven; no lingering row bricks a future boot.
+    k2_cleanup();
+    let cleaned = match crate::fs::fat::mount() {
+        Ok(f) => f.find_in_root(K2_PRIV_NAME).is_err(),
+        Err(_) => false,
+    };
+    const K2M_ALL: u32 = (1 << 3) - 1; // bits 0..=2
+    if w == K2M_ALL && done == 2 && killed == 0 && cleaned {
+        serial_println!(
+            ":: K2-metal: BOOT-2 cross-reboot SURVIVED a real power-cycle — owner prog:K2OWN.BIN re-admitted BY NAME against the LIVE-boot-rebuilt UNAFS.ATR row, impostor prog:K2IMP.BIN refused (-EACCES); self-cleaned rebuild+enforce PASS [w={:#04x}] ::",
+            w
+        );
+    } else {
+        serial_println!(
+            ":: K2-metal: BOOT-2 rebuild+enforce FAIL — w={:#x}/{:#x} done={} killed={} cleaned={} ::",
+            w, K2M_ALL, done, killed, cleaned as u8
         );
     }
 }

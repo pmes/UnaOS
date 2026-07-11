@@ -495,11 +495,19 @@ kernel8() {
     done
     echo -e "${COLOR_GREEN}✅ K2 EL0 programs: owner_blob.bin ($(wc -c < "${WORKSPACE_DIR}/target/owner_blob.bin" | tr -d ' ') B) + imp_blob.bin ($(wc -c < "${WORKSPACE_DIR}/target/imp_blob.bin" | tr -d ' ') B)${COLOR_RESET}"
 
+    # K2 metal money-shot: UNAOS_K2_LEAVE=1 adds the `k2_leave` feature — k2_liveenf becomes a two-boot
+    # cross-reboot power-cycle proof (boot-1 leaves a persisted owned file; boot-2 verifies the live boot
+    # rebuild). OFF => the normal same-boot battery (byte-identical). For the ATTENDED Pi bench only.
+    local K8_FEATS="baremetal,skip_xhci"
+    if [ -n "${UNAOS_K2_LEAVE:-}" ]; then
+        K8_FEATS="${K8_FEATS},k2_leave"
+        echo -e "${COLOR_YELLOW}  • UNAOS_K2_LEAVE: k2_liveenf → two-boot money-shot mode (boot-1 leaves K2PRIV.BIN; power-cycle; boot-2 verifies)${COLOR_RESET}"
+    fi
     echo -e "${COLOR_YELLOW}⚡ Building bare-metal kernel8.img (Pi 4, microSD-slot boot)...${COLOR_RESET}"
     cd "$WORKSPACE_DIR/crates/kernel"
     RUSTFLAGS="-C link-arg=-T${WORKSPACE_DIR}/crates/kernel/pi-baremetal.ld" \
       cargo +nightly build --release --target ../../aarch64-base.json \
-      $NIGHTLY_FLAGS --features baremetal,skip_xhci
+      $NIGHTLY_FLAGS --features "$K8_FEATS"
     cd "$WORKSPACE_DIR"
 
     rm -rf "$KERNEL8_DIR"; mkdir -p "$KERNEL8_DIR/overlays"
