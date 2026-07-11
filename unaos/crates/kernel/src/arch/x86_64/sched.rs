@@ -217,7 +217,9 @@ pub struct Task {
     /// U3.5: preemptible ring 3. When true, `user_task_trampoline` drops to ring 3 with RFLAGS.IF
     /// SET, so the timer can preempt this task and other work shares its core (the DoS fix). The
     /// default `false` (U1a/U1b/U2/U2.5/U3) keeps IF clear — cooperative, run-to-completion FIFO — so
-    /// those fixtures stay byte-identical. Only the U3.5 spinner is preemptible.
+    /// those fixtures stay byte-identical. Preemptible: the U3.5 spinner, and — knob-on
+    /// (`s4_sync_storage()`) — the u6gx cooperative-spin fixtures (a non-preemptible spinner on the
+    /// storage service task's core would starve a cross-core live created read; see STOR-1 S5).
     preemptible: bool,
     /// U3.5: external-kill handshake for a `preemptible` task that never yields, or `None` (every
     /// other task). The scheduler checks it on switch-back and REAPS the task (address-space teardown

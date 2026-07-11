@@ -461,9 +461,19 @@ pub fn start_service_once() -> bool {
     x86_64::instructions::interrupts::without_interrupts(|| {
         REQ_QUEUE.lock().reserve(REQ_QUEUE_CAP); // never reallocate under the spinlock
     });
-    sched::spawn("storage-svc", service_task, 0, cpu, PRIO_NORMAL);
+    // STOR-1 S5: the service task runs at PRIO_HIGH, NOT PRIO_NORMAL. It is a SYSTEM SERVICE that arbitrary
+    // ring-3 tasks BLOCK on (a `submit` sleeps its caller until the service task completes the transfer), so it
+    // must PREEMPT a lower-priority user task the moment a request lands — otherwise a cooperatively-spinning
+    // ring-3 fixture co-located on the service task's core (a PRIO_NORMAL peer that never yields its round-robin
+    // slot — e.g. u6gx's owner A parked on its GO word while the grantee B, on another core, awaits a live read)
+    // STARVES the service task, and B's cross-core read never completes (a deadlock: the launcher waits on B, B
+    // waits on the service task, the service task waits behind A's spin). A cross-core wake only sends the preempt
+    // IPI when the new task out-ranks the running one (`poke_for`: `prio > running`), so PRIO_HIGH is what makes
+    // the wake preempt. The task does BOUNDED work per request then blocks on `REQ_READY` (off every run queue),
+    // so it never hogs a core when idle — high priority buys prompt I/O completion, not monopoly.
+    sched::spawn("storage-svc", service_task, 0, cpu, sched::PRIO_HIGH);
     serial_println!(
-        ":: STOR-1: storage service task live on cpu {} (irqstorage) ::",
+        ":: STOR-1: storage service task live on cpu {} (irqstorage, PRIO_HIGH) ::",
         cpu
     );
     true
