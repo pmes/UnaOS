@@ -1920,6 +1920,71 @@ as the Orin boot stick (its x86 ESP overwritten with the aarch64 JD5 ESP) — th
 re-flash its own boot media before its next bench. The FAT16 `UNAOSRW` (the pi4 fixture card) served
 as the tegra data card, as in JD4.
 
+### JD6 — the write path reaches the whole tree: subdirectory writes (attended-pending)
+
+JD4 made the whole tree *navigable* (read); JD5 made the *root* writable; JD6 closes the gap:
+`touch` / `write` / `append` / `rm` in ANY directory the shell can `cd` into. The panel becomes a
+workstation you can *organize*, not just a flat scratchpad. The read side already resolved subdir
+paths (`resolve_path`); JD6 gives the write side the same reach.
+
+**The seam — a seat-granted narrow additive `fat.rs` exception.** JD5 was root-only *because*
+`fat.rs`'s public mutation API (`create_in_root` / `find_located`) hard-codes the root directory, and
+`fat.rs` mutation is the pi4-K1 lane (call-never-edit for this track). JD6 needs a dir-aware entry
+point, so — per the round-6 seat coordination (ccd, GATE-0) — the seat granted a narrow ADDITIVE
+exception, the same shape as JD4's `read_dir` grant: **two new public wrappers, zero edits to any
+existing function, placed adjacent to their root twins:**
+- `locate_in_dir(first_cluster, name)` — `first_cluster == 0` ⇒ `find_located` (root), else the
+  existing private `locate_in_dir_chain` (a read-only bounded directory walk, no lock).
+- `create_in_dir(first_cluster, name, attr)` — `0` ⇒ `create_in_root`, else the existing private
+  `free_slot_in_dir_chain` + a **verbatim** copy of `create_in_root`'s `with_dir_lock` slot-write
+  RMW (both sites cross-referenced "twin — keep in sync"). It rides `DIR_MUTATION`/`FAT_MUTATION`
+  exactly as the root twin: the free-slot SCAN stays outside the lock, only the sector RMW inside;
+  it allocates no clusters and touches no FAT. Nothing else in the write path needed a `fat.rs`
+  change — `delete_located`/`write_grow` already take `(dir_lba, dir_off, first_cluster)` and were
+  parent-agnostic.
+
+**Principal — unchanged.** Subdirectories don't change the principal: the shell is still EL1 ASID 0,
+the PUBLIC principal, and subdir creates are plain public FAT files (the U6 owner ACL still lives
+only on the out-of-lane SVC `sys_open` path; the trusted local console does not consult it — §JD5).
+
+**Scope — the whole tree, with honest edges.** `resolve_write_target` normalizes the path against
+the cwd (`.`/`..` collapse lexically), then walks to the PARENT directory via the read-only
+`resolve_path` and returns `(parent_first_cluster, leaf, parent_canon)` (root ⇒ cluster 0). The
+error map is honest and non-hanging:
+- parent is a plain file → `-ENOTDIR`; a missing parent → `-ENOENT` (both surface from `resolve_path`);
+- the root itself as a target → `-EISDIR`;
+- a FULL directory (no free slot) → `-ENOSPC` — **extending a subdirectory's cluster chain is out of
+  scope this arc** (the twins add a slot but never grow the directory chain), exactly as the root has
+  always been;
+- a directory target for `rm` → `-EISDIR`: **directory removal (`rmdir`) stays out of scope** (it needs
+  emptiness + `.`/`..` handling and a `fat.rs` primitive this track does not have).
+
+**M1 — subdir write plumbing + `touch` (`446b986`).** The two `fat.rs` wrappers + `resolve_write_target`
++ `fs_touch` rewired through `locate_in_dir`/`create_in_dir`. `touch DOCS/NOTE.TXT` creates in a
+subdirectory; success echoes the canonical absolute path (`/DOCS/NOTE.TXT`).
+
+**M2 — `write` (create-or-truncate) in subdirs (`a3bc06a`).** `fs_write` routes through the dir-aware
+twins; create-or-truncate semantics unchanged (truncate = delete chain + fresh 0-length entry + grow).
+The raw `write <lba> <byte>` block command is untouched (dispatched separately, before `fs_write`).
+
+**M3 — `rm` + `append` in subdirs; retire `resolve_root_name` (`2e9ca1b`).** `fs_append`/`fs_rm` routed
+the same way, completing the set. With the last consumers converted, the JD5 root-only resolver
+`resolve_root_name` is removed; the module DESIGN NOTE's scope paragraph is updated to the whole-tree
+reach and the honest error map.
+
+**Gate (QEMU):** `./arroyo check` + `UNAOS_TEGRA=1 ./arroyo check` green both arches;
+`./arroyo test-arm 22` → `MISSION SUCCESS`; `UNAOS_GICV3=1 ./arroyo test-arm 40` → `CAPSTONE COMPLETE`
+6/6; `UNAOS_HUBSTORAGE=1 ./arroyo test 25` → `MISSION SUCCESS` (shared `shell.rs` guard); `esp-jetson
+kernel.elf` links, **108 `tegra:` strings** (unchanged — the subdir-write strings carry no `tegra:`
+token; validate media by count, not size). As in JD2–JD5 the SHELL write path is not headless-reachable
+in-lane (the shell dispatches only on a keystroke, and tegra never runs in QEMU), so the shell-level
+verdict is **attended-pending**; the write PRIMITIVES the twins call are the same F3-locked
+`create_in_*`/`write_grow`/`delete_located` the U9/U10/U11 fixtures already exercise headless.
+
+**Metal verdict — attended-pending.** The subdir money-shot (`cd DOCS`, `write NOTE.TXT …`,
+power-cycle, `cd DOCS`, `cat`) rides the next attended Orin bench — card
+[`jd6-bench.md`](../../../../unaos/scripts/jd6-bench.md).
+
 ## 4. Jetson Orin Nano headless bring-up (Arc JM2)
 
 The Orin is brought up **headless over serial**. The only console that has ever

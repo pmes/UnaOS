@@ -10,6 +10,39 @@ Legend: **✅ metal-confirmed** · **🔬 QEMU-green, metal pending** · dates I
 
 ---
 
+## hw-jetson track — 2026-07-11 (JD6 — the panel write path reaches the whole tree: subdirectory writes)
+
+### JD6 — `touch` / `write` / `append` / `rm` in ANY subdirectory the shell can `cd` into 🔬 `hw-jetson`
+- **What (M1, `446b986`):** JD5 was root-only because `fat.rs`'s public mutation API
+  (`create_in_root`/`find_located`) hard-codes the root; `fat.rs` mutation is the pi4-K1 lane. Under a
+  **round-6 seat-granted narrow ADDITIVE exception** (ccd-coordinated at GATE-0; JD4's `read_dir`
+  precedent), two new public `fat.rs` wrappers land adjacent to their root twins, **zero edits to any
+  existing fn:** `locate_in_dir(first_cluster, name)` (0 ⇒ `find_located`, else the existing private
+  `locate_in_dir_chain`) and `create_in_dir(first_cluster, name, attr)` (0 ⇒ `create_in_root`, else the
+  existing private `free_slot_in_dir_chain` + a **verbatim** copy of `create_in_root`'s
+  `with_dir_lock` slot-write RMW, both sites cross-referenced "twin — keep in sync"). Every mutation
+  rides `DIR_MUTATION`/`FAT_MUTATION` exactly as the root twin; it allocates no clusters, touches no
+  FAT. `shell.rs` gains `resolve_write_target` (walks to the parent dir via the read-only
+  `resolve_path` → `(parent_first_cluster, leaf, parent_canon)`; root ⇒ 0) and rewires `fs_touch`.
+- **What (M2, `a3bc06a`):** `fs_write` routes through the dir-aware twins — `write DOCS/NOTE.TXT hello`
+  creates-or-truncates in a subdir; semantics unchanged; the raw `write <lba> <byte>` block form
+  untouched (dispatched separately). **What (M3, `2e9ca1b`):** `fs_append`/`fs_rm` routed the same way;
+  `resolve_root_name` (the JD5 root-only resolver) retired; DESIGN-NOTE scope updated to whole-tree.
+- **Principal — unchanged:** subdirs don't change the principal (EL1 ASID 0 = PUBLIC; §JD5). **Honest
+  edges:** parent-is-a-file → `-ENOTDIR`, missing parent → `-ENOENT`, root target → `-EISDIR`, FULL
+  directory → `-ENOSPC` (**no subdir-chain extension this arc**), directory `rm` → `-EISDIR` (**`rmdir`
+  out of scope** — needs emptiness + `.`/`..` handling + a `fat.rs` primitive this track lacks).
+- **Tested (QEMU):** `check` + `UNAOS_TEGRA=1 check` green both arches; `test-arm 22` MISSION;
+  `UNAOS_GICV3=1 test-arm 40` CAPSTONE 6/6; `UNAOS_HUBSTORAGE=1 test 25` MISSION (shared `shell.rs`
+  guard); `esp-jetson` links, **108 `tegra:` strings** (unchanged — validate by count, not size). Same
+  as JD2–JD5 the shell arms dispatch only on a keystroke and tegra never runs in QEMU, so the
+  shell-level verdict is **attended-pending**; the twins call the same F3-locked mutation the
+  U9/U10/U11 fixtures already exercise headless.
+- **Metal — attended-pending:** the subdir money-shot (`cd DOCS`, `write NOTE.TXT …`, power-cycle,
+  `cd DOCS`, `cat`) rides the next attended Orin bench (card `unaos/scripts/jd6-bench.md`).
+- **Detail:** [`arch_arm64.md` §JD6](dev/OS/01_BOOT_HAL/arch_arm64.md). **Commits:** `446b986` M1 ·
+  `a3bc06a` M2 · `2e9ca1b` M3 (`hw-jetson`).
+
 ## ux lane — 2026-07-10 (UI-1 — scale-aware UI, the one-cell cursor, the CPU pulse redesign, `pulse`)
 
 ### UI-1 — the UI metrics layer + CPU pulse row + full-screen `pulse` (x86 + aarch64) 🔬 `ux-ui1`

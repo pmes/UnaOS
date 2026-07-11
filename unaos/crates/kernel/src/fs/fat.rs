@@ -1449,6 +1449,77 @@ impl FatFs {
         let (lba, off) = self.find_free_root_slot()?;
         // F3-M2: the slot WRITE is a sector RMW under DIR_MUTATION (the free-slot SCAN above stays outside —
         // per the with_dir_lock span rule; the scan-then-claim slot race itself is the F3-M3 namespace lock's).
+        // JD6: this with_dir_lock slot-write body is TWINNED VERBATIM in `create_in_dir` — keep the two in sync.
+        with_dir_lock(|| {
+            let mut buf = [0u8; SECTOR_SIZE];
+            read_sector(lba, &mut buf)?;
+            // Write a fresh 32-byte entry: 11-byte name, attr, everything else zero (NTRes/times = 0,
+            // first_cluster hi@20 lo@26 = 0, size@28 = 0). Never set the volume-label bit — a file/dir entry.
+            for b in buf[off..off + 32].iter_mut() {
+                *b = 0;
+            }
+            buf[off..off + 11].copy_from_slice(&raw);
+            buf[off + 11] = attr & !0x08;
+            write_sector(lba, &buf)?;
+            // Re-parse the slot we just wrote so the returned DirEntry is byte-for-byte what a reader sees.
+            match classify_dir_slot(&buf[off..off + 32]) {
+                DirSlot::Entry(de) => Ok((de, lba, off)),
+                _ => Err(FatError::Io), // unreachable: we just wrote a valid non-empty, non-LFN entry
+            }
+        })
+    }
+
+    // =============================================================================================
+    // JD6 (seat-granted narrow additive exception, round 6 2026-07-11) — DIR-AWARE write entry points.
+    //
+    // Two ADDITIVE public wrappers that generalize the root-only `find_located` / `create_in_root`
+    // twins to an arbitrary directory identified by its first data cluster (`first_cluster == 0` ⇒
+    // the volume root, dispatching straight back to the root twin). They add NO new traversal or
+    // mutation logic: they reuse the already-general PRIVATE chain-walkers the FAT32-root path
+    // itself exercises (`locate_in_dir_chain`, `free_slot_in_dir_chain`). Every mutation rides
+    // `DIR_MUTATION`/`FAT_MUTATION` exactly as the root twins do. Consumed by the aarch64 panel
+    // shell's subdir write path (shell.rs); no x86 caller passes a non-zero cluster today.
+    // (fat.rs mutation is the pi4-K1 lane — this block is a seat-approved exception, zero edits to
+    //  existing fns, placed adjacent to its root twins for review.)
+    // =============================================================================================
+
+    /// JD6: locate `name` in the directory whose data begins at `first_cluster` (`0` ⇒ the volume
+    /// root). The dir-aware twin of [`FatFs::find_located`]; for a subdirectory it is the existing
+    /// private `locate_in_dir_chain` — a read-only bounded directory walk (no lock).
+    pub fn locate_in_dir(
+        &self,
+        first_cluster: u32,
+        name: &str,
+    ) -> Result<(DirEntry, u64, usize), FatError> {
+        if first_cluster == 0 {
+            self.find_located(name)
+        } else {
+            self.locate_in_dir_chain(first_cluster, name)
+        }
+    }
+
+    /// JD6: create a fresh 0-length entry `name` in the directory at `first_cluster` (`0` ⇒ the
+    /// volume root ⇒ [`FatFs::create_in_root`]). The dir-aware twin of `create_in_root`: the free
+    /// slot comes from the existing private `free_slot_in_dir_chain` (a FULL subdirectory — no free
+    /// slot; extending a subdir's cluster chain is out of scope this arc — is an honest `NoSpace`),
+    /// and the slot WRITE below is a VERBATIM copy of `create_in_root`'s `with_dir_lock` RMW.
+    /// ⚠ TWIN — keep the `with_dir_lock` body in sync with `create_in_root` (the seat review diffs
+    /// the two). Allocates NO clusters and touches NO FAT — only the one directory sector. The
+    /// caller must have confirmed the name is absent (this does not de-duplicate).
+    pub fn create_in_dir(
+        &self,
+        first_cluster: u32,
+        name: &str,
+        attr: u8,
+    ) -> Result<(DirEntry, u64, usize), FatError> {
+        if first_cluster == 0 {
+            return self.create_in_root(name, attr);
+        }
+        let raw = format_83(name).ok_or(FatError::Unsupported)?;
+        let (lba, off) = self.free_slot_in_dir_chain(first_cluster)?;
+        // F3-M2: the slot WRITE is a sector RMW under DIR_MUTATION — the free-slot SCAN above stays
+        // outside, exactly as in `create_in_root`.
+        // ⚠ VERBATIM TWIN of `create_in_root`'s with_dir_lock block — keep in sync (seat review diffs these).
         with_dir_lock(|| {
             let mut buf = [0u8; SECTOR_SIZE];
             read_sector(lba, &mut buf)?;
