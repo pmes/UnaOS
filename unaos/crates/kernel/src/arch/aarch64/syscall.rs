@@ -4170,6 +4170,72 @@ impl OwnedFile {
 /// idiom). Its lock is taken IRQ-masked via `IrqGuard` on EVERY access (syscall + teardown).
 static OWNED_FILES: SpinMutex<[OwnedFile; NOWNED]> = SpinMutex::new([OwnedFile::EMPTY; NOWNED]);
 
+/// K1 M2.4: the NO-LIVE-OWNER sentinel `owner_asid`/`grant.asid` for a row REBUILT from `UNAFS.ATR` at mount.
+/// Deliberately OUT of the live ASID range (`0..=USER_SLOTS`) so the runtime `(asid, gen)` owner/grantee
+/// equality checks match NO live caller — a persisted-owned file is owned by a PRINCIPAL, not a boot
+/// incarnation, and is re-acquired only via the M2.4 ppid branch. Any site that INDEXES an asid by this value
+/// (only `owned_grant`'s stale-slot scan) range-guards it first.
+const OWNER_ASID_PERSISTED: u64 = u64::MAX;
+
+/// K1 M2.4: is MULTI-PROGRAM by-name spawn live? Cross-reboot persistent-principal ENFORCEMENT — installing
+/// rebuilt-from-disk owner rows at mount (which then DENY every live `(asid, gen)` caller until the owning
+/// program is re-spawned by name and matches by ppid) — is GATED on this. Until the system can launch >= 2
+/// DISTINCT named programs, every spawn is the SAME principal, so a persisted owner could never be re-acquired
+/// by anyone but could DENY everyone — enforcing it would only BRICK the file. Today the card carries ONE
+/// launchable EL0 program (`HELLO.BIN`, via `sys_spawn`/`load_program_into_slot`), so this is FALSE and the
+/// real-boot rebuild installs NO rows (all-public — the pre-K1 baseline, byte-equivalent). The enforcement
+/// MECHANISM is complete and PROVEN by the M3 kernel-side proof (which manufactures distinct principals
+/// directly), so it is READY the instant a second launchable named program lands and this flips true. The
+/// `owned_access_ok`/`owned_is_owner`/`owned_unlink_permitted` ppid branch itself is NOT gated on this — it is
+/// purely structural (a NONE principal never matches), so it is inert in the battery and testable by M3 without
+/// flipping this global.
+fn by_name_spawn_multivalued() -> bool {
+    false // single on-disk EL0 program today; flip when a 2nd launchable named program lands (with its own principal)
+}
+
+/// K1 M2.4: install a row REBUILT from `UNAFS.ATR` into `OWNED_FILES` — a persisted owner with NO live
+/// `(asid, gen)` incarnation (that identity is gone across the reboot). `owner_asid = OWNER_ASID_PERSISTED`
+/// (the runtime check then matches no live caller); `owner_ppid` + the grant principals carry the durable
+/// identity the M2.4 ppid branch admits by. Overwrites any existing row for the key, else claims a free row;
+/// `false` iff the table is full (that file simply stays enforced by whatever row already occupies the slot, or
+/// falls back to public — fail-safe). IRQ-masked OWNED_FILES lock; called from the rebuild path OUTSIDE ns.
+fn owned_install_persisted(
+    dir_lba: u64,
+    dir_off: u32,
+    owner_ppid: PrincipalRecord,
+    grants: &[(PrincipalRecord, u32); NFGRANT],
+) -> bool {
+    let mut row_grants = [FileGrant::EMPTY; NFGRANT];
+    for (j, &(p, r)) in grants.iter().enumerate() {
+        if r != 0 && p.kind != PRIN_NONE {
+            row_grants[j] = FileGrant { asid: OWNER_ASID_PERSISTED, asid_gen: 0, rights: r, ppid: p };
+        }
+    }
+    let new = OwnedFile {
+        dir_lba,
+        dir_off,
+        owner_asid: OWNER_ASID_PERSISTED,
+        owner_gen: 0,
+        owner_ppid,
+        grants: row_grants,
+    };
+    let _irq = IrqGuard::mask_save();
+    let mut t = OWNED_FILES.lock();
+    for r in t.iter_mut() {
+        if r.dir_lba == dir_lba && r.dir_off == dir_off {
+            *r = new;
+            return true;
+        }
+    }
+    for r in t.iter_mut() {
+        if r.dir_lba == 0 {
+            *r = new;
+            return true;
+        }
+    }
+    false // table full — leave the file to its existing row / public (fail-safe)
+}
+
 /// U6: record `(owner_asid, owner_gen)` as the OWNER of the file at `(dir_lba, dir_off)` — called at
 /// the O_CREAT of a NEW private name. OVERWRITES any existing row for this key (defensive against a
 /// recycled directory slot whose prior owner row was not yet cleared), else CLAIMS a free row. Returns
@@ -4200,22 +4266,47 @@ fn owned_set_owner(dir_lba: u64, dir_off: u32, owner_asid: u64, owner_gen: u64, 
 /// whose rights COVER the requested access (`requested ⊆ granted`, gen-fenced). `false` = DENY
 /// (-EACCES): the file is owned and the caller is neither owner nor a sufficiently-granted principal.
 /// `requested` is the rights the open mode asks for (CAP_READ, or CAP_READ|CAP_WRITE for RW/O_CREAT).
-fn owned_access_ok(dir_lba: u64, dir_off: u32, asid: u64, caller_gen: u64, requested: u32) -> bool {
+/// K1 M2.4: an ADDITIVE cross-reboot admission branch runs AFTER the unchanged `(asid, gen)` checks — the
+/// caller's PERSISTENT principal `caller_ppid` (captured before the lock) admits it against a REBUILT row whose
+/// live owner is gone (`owner_asid == OWNER_ASID_PERSISTED`): owner-by-name (full authority) or grantee-by-name
+/// (rights-checked). Purely STRUCTURAL — a NONE principal never matches a NONE (`kind != NONE` on both sides is
+/// required), so an anonymous caller (the whole battery) never engages it and byte-equivalence holds.
+fn owned_access_ok(
+    dir_lba: u64,
+    dir_off: u32,
+    asid: u64,
+    caller_gen: u64,
+    requested: u32,
+    caller_ppid: PrincipalRecord,
+) -> bool {
     let _irq = IrqGuard::mask_save();
     let t = OWNED_FILES.lock();
     for row in t.iter() {
         if row.dir_lba == dir_lba && row.dir_off == dir_off {
-            // Owner: full authority over its own file.
+            // Owner (live incarnation): full authority over its own file.
             if row.owner_asid == asid && row.owner_gen == caller_gen {
                 return true;
             }
-            // A grantee: the requested access must be a SUBSET of what it was granted (gen-fenced).
+            // A grantee (live incarnation): the requested access must be a SUBSET of what it was granted.
             for g in row.grants.iter() {
                 if g.rights != 0 && g.asid == asid && g.asid_gen == caller_gen {
                     return (requested & !g.rights) == 0;
                 }
             }
-            return false; // owned, and the caller is neither owner nor sufficiently granted
+            // K1 M2.4: cross-reboot admission by PERSISTENT principal. A re-spawned named program re-acquires
+            // ITS OWN persisted file (owner-by-name = full authority); a named grantee re-acquires its granted
+            // access (rights-checked). NONE never matches NONE, so anonymous callers fall straight through.
+            if caller_ppid.kind != PRIN_NONE {
+                if row.owner_ppid.kind != PRIN_NONE && row.owner_ppid == caller_ppid {
+                    return true;
+                }
+                for g in row.grants.iter() {
+                    if g.rights != 0 && g.ppid.kind != PRIN_NONE && g.ppid == caller_ppid {
+                        return (requested & !g.rights) == 0;
+                    }
+                }
+            }
+            return false; // owned, and the caller is neither owner nor sufficiently granted (live or by-name)
         }
     }
     true // no owner row -> PUBLIC (pre-existing / host-created / O_PUBLIC create)
@@ -4259,12 +4350,18 @@ fn owned_clear_owner_asid(asid: u64) {
 /// U6: is `(asid, gen)` the CURRENT owner of the file at `(dir_lba, dir_off)`? `false` for a public / unknown
 /// file. `sys_fgrant` uses this to refuse a non-owner FAST — before it resolves (and thus before it leaks the
 /// validity of) the named grantee handle, so a non-owner is a clean `-EACCES` regardless of the grantee argument.
-fn owned_is_owner(dir_lba: u64, dir_off: u32, asid: u64, caller_gen: u64) -> bool {
+fn owned_is_owner(dir_lba: u64, dir_off: u32, asid: u64, caller_gen: u64, caller_ppid: PrincipalRecord) -> bool {
     let _irq = IrqGuard::mask_save();
     let t = OWNED_FILES.lock();
     for row in t.iter() {
         if row.dir_lba == dir_lba && row.dir_off == dir_off {
-            return row.owner_asid == asid && row.owner_gen == caller_gen;
+            if row.owner_asid == asid && row.owner_gen == caller_gen {
+                return true;
+            }
+            // K1 M2.4: the by-name owner of a REBUILT row (live owner gone) has full authority — incl. re-granting.
+            return caller_ppid.kind != PRIN_NONE
+                && row.owner_ppid.kind != PRIN_NONE
+                && row.owner_ppid == caller_ppid;
         }
     }
     false
@@ -4275,13 +4372,19 @@ fn owned_is_owner(dir_lba: u64, dir_off: u32, asid: u64, caller_gen: u64) -> boo
 /// content read/write, NEVER delete (else it could `unlink` + `O_CREAT` the name to STEAL ownership and lock the
 /// real owner out). A PUBLIC file (no owner row) keeps the pre-U6 behaviour: anyone holding a `CAP_WRITE` handle
 /// (which, for a public file, any process could obtain) may unlink it — "public" carries no delete protection.
-fn owned_unlink_permitted(dir_lba: u64, dir_off: u32, asid: u64, caller_gen: u64) -> bool {
+fn owned_unlink_permitted(dir_lba: u64, dir_off: u32, asid: u64, caller_gen: u64, caller_ppid: PrincipalRecord) -> bool {
     let _irq = IrqGuard::mask_save();
     let t = OWNED_FILES.lock();
     for row in t.iter() {
         if row.dir_lba == dir_lba && row.dir_off == dir_off {
             // Owned -> only the owner may delete (grants confer content access, not delete).
-            return row.owner_asid == asid && row.owner_gen == caller_gen;
+            if row.owner_asid == asid && row.owner_gen == caller_gen {
+                return true;
+            }
+            // K1 M2.4: the by-name owner of a REBUILT row (live owner gone) may delete its own persisted file.
+            return caller_ppid.kind != PRIN_NONE
+                && row.owner_ppid.kind != PRIN_NONE
+                && row.owner_ppid == caller_ppid;
         }
     }
     true // public (no owner row) -> the pre-U6 CAP_WRITE-gated unlink applies
@@ -6162,7 +6265,7 @@ fn sys_open(name_ptr: u64, name_len: u64, mode: u64) -> i64 {
             let _ = fs.mark_dir_deleted(dir_lba, dir_off);
             return ENOSPC;
         }
-    } else if !owned_access_ok(dir_lba, dir_off as u32, asid, asid_gen, requested) {
+    } else if !owned_access_ok(dir_lba, dir_off as u32, asid, asid_gen, requested, caller_ppid) {
         return EACCES; // an owned file, and the caller is neither its owner nor a sufficiently-granted principal
     }
     // 3. Claim resources — the GLOBAL open-file refcount FIRST, then a per-task descriptor, then a handle.
@@ -6370,7 +6473,10 @@ fn sys_unlink(handle: u64) -> i64 {
     // OWNED file is unlinkable only by its current owner; a PUBLIC file (no owner row) keeps the prior behaviour.
     // Checked BEFORE any on-disk mutation, so a denied unlink changes nothing.
     let asid_gen = ASID_GEN[asid as usize].load(Ordering::Acquire);
-    if !owned_unlink_permitted(dir_lba, dir_off as u32, asid, asid_gen) {
+    // K1 M2.4: the caller's persistent principal admits the by-name owner of a REBUILT row to delete its own
+    // persisted file (its live incarnation is gone). NONE for the anonymous battery -> the branch is inert.
+    let caller_ppid = current_principal();
+    if !owned_unlink_permitted(dir_lba, dir_off as u32, asid, asid_gen, caller_ppid) {
         return EACCES;
     }
     let fs = match crate::fs::fat::mount() {
@@ -6497,7 +6603,10 @@ fn sys_fgrant(file_handle: u64, child_handle: u64, rights: u64) -> i64 {
     }
     // Only the file's OWNER may grant/revoke — check FIRST, before resolving the grantee, so a non-owner is a
     // clean -EACCES whatever it passes as the child handle (and it never learns whether that handle was valid).
-    if !owned_is_owner(dir_lba, dir_off, asid, asid_gen) {
+    // K1 M2.4: `caller_ppid` admits the by-name owner of a REBUILT row (its live incarnation is gone) to re-grant
+    // on its own persisted file. NONE for the anonymous battery -> inert.
+    let caller_ppid = current_principal();
+    if !owned_is_owner(dir_lba, dir_off, asid, asid_gen, caller_ppid) {
         return EACCES;
     }
     // The GRANTEE: named owner-scoped by a Child handle the caller holds (the sys_xfer idiom — EL0 never
@@ -8062,6 +8171,10 @@ pub fn u7_launcher(demo_cpu: usize) {
     // separately spawned launchers is here the program order of one task. Each launcher's verdict waits on its
     // fixture's exit + teardown, so the demo slot is free again before the next builds — no new gate needed.
     // Keeping U9/U10 here (rather than a `sched::spawn` in main.rs) stays wholly inside the aarch64 syscall lane.
+    // K1 M2.4: restore persisted ownership from UNAFS.ATR before any EL0 fixture opens a file (in-lane boot hook).
+    // GATED OFF today (single launchable named program) -> a no-op with zero disk I/O, so the battery is
+    // byte-identical; the mechanism is proven by the M3 kernel-side proof.
+    atr_maybe_boot_rebuild();
     u7_run(demo_cpu);
     u8_launcher(demo_cpu);
     u9_launcher(demo_cpu);
@@ -8676,6 +8789,36 @@ fn atr_name_from_str(name: &str) -> Option<[u8; 11]> {
     Some(out)
 }
 
+/// K1 M2.4: reconstruct the textual `"NAME.EXT"` form from an 11-byte on-disk 8.3 field into `buf`, returning
+/// its length — the inverse of `atr_name_from_str`, used at mount to re-resolve a persisted row BY NAME
+/// (`find_located`, defeating the recycled-directory-slot hazard). Mirrors fat.rs's `classify_dir_slot` (trim
+/// trailing spaces on base + ext, insert a `.` only if the extension is non-empty). A degenerate all-space base
+/// yields length 0 (the caller skips — fail-closed).
+fn atr_name_to_buf(name11: &[u8; 11], buf: &mut [u8; 12]) -> usize {
+    let mut n = 0usize;
+    let mut base = 8usize;
+    while base > 0 && name11[base - 1] == b' ' {
+        base -= 1;
+    }
+    for k in 0..base {
+        buf[n] = name11[k];
+        n += 1;
+    }
+    let mut ext = 3usize;
+    while ext > 0 && name11[8 + ext - 1] == b' ' {
+        ext -= 1;
+    }
+    if ext > 0 {
+        buf[n] = b'.';
+        n += 1;
+        for k in 0..ext {
+            buf[n] = name11[8 + k];
+            n += 1;
+        }
+    }
+    n
+}
+
 /// K1 M2.3: find the row INDEX in UNAFS.ATR whose on-disk `(dir_lba, dir_off)` matches, else the first FREE
 /// (or corrupt) slot — a bounded 16-row scan over the rows region already read into `rows`. `None` iff every
 /// row is a DIFFERENT live owner (the 16-row table is full for a new key — the persist then fails closed).
@@ -8862,6 +9005,95 @@ fn atr_persist_grants(fs: &crate::fs::fat::FatFs, dir_lba: u64, dir_off: u32) ->
         }
     }
     true // no persisted row for this file — nothing to update (create-persist may have failed; in-RAM still holds)
+}
+
+/// K1 M2.4: rebuild the in-RAM owner/grants ACL from `UNAFS.ATR` — the mount-time restore that makes ownership
+/// SURVIVE REBOOT. Reads + validates the header against the LIVE binding (any reject => the WHOLE volume is
+/// all-public, the fail-closed pre-U6 baseline), then for each committed named-owner row RE-RESOLVES the file
+/// BY NAME (`find_located`, defeating the recycled-directory-slot hazard — a stale `(dir_lba, dir_off)` is only a
+/// hint), cross-checks `first_cluster` when both sides are nonzero (identity corroboration; a mismatch skips the
+/// row), and installs an `OwnedFile` with the NO-LIVE-OWNER sentinel + the persisted principals. Returns the
+/// number of rows installed. Runs OUTSIDE the namespace lock (single-core, pre-EL0, or the M3 proof) — NEVER
+/// across `mount()`. FAIL-CLOSED throughout: name-gone / cluster-mismatch / bad-CRC / bad-binding / free row all
+/// yield PUBLIC, never a forged owner (owner AND grants share one row CRC — install-or-drop atomically).
+fn atr_rebuild_into_owned(fs: &crate::fs::fat::FatFs) -> usize {
+    let bind = atr_live_binding(fs);
+    let (de, _lba, _off) = match fs.find_located(ATR_NAME) {
+        Ok(t) => t,
+        _ => return 0, // absent or lookup error -> all-public (fail-closed)
+    };
+    if (de.size as usize) < ATR_FILE_LEN {
+        return 0; // partial/truncated image -> all-public
+    }
+    let (afc, asz) = (de.first_cluster(), de.size);
+    if !atr_header_ok(fs, afc, asz, &bind) {
+        return 0; // bad magic/version/geometry/committed/binding/CRC -> the whole volume is all-public
+    }
+    let mut rows: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
+    if fs
+        .read_at(afc, asz, ATR_HEADER_LEN as u32, &mut rows, ATR_ROW_STRIDE * ATR_ROWS)
+        .is_err()
+        || rows.len() != ATR_ROW_STRIDE * ATR_ROWS
+    {
+        return 0;
+    }
+    let mut installed = 0usize;
+    for i in 0..ATR_ROWS {
+        let start = ATR_ROW_STRIDE * i;
+        let mut arr = [0u8; ATR_ROW_STRIDE];
+        arr.copy_from_slice(&rows[start..start + ATR_ROW_STRIDE]);
+        let Some(row) = atr_parse_row(&arr) else {
+            continue; // free slot or corrupt row -> public (owner AND grants dropped together)
+        };
+        if row.owner.kind == PRIN_NONE {
+            continue; // a valid row with no owner principal is not an ACL to install
+        }
+        // Re-resolve the DURABLE key: the 8.3 name. A name that no longer resolves fails closed (public).
+        let mut buf = [0u8; 12];
+        let n = atr_name_to_buf(&row.name, &mut buf);
+        if n == 0 {
+            continue;
+        }
+        let Ok(name) = core::str::from_utf8(&buf[..n]) else {
+            continue;
+        };
+        let (rde, rlba, roff) = match fs.find_located(name) {
+            Ok(t) => t,
+            _ => continue, // name gone -> fail-closed to public
+        };
+        // Corroborate identity by first_cluster when BOTH are nonzero (a 0-length file has no cluster).
+        if row.first_cluster != 0 && rde.first_cluster() != 0 && row.first_cluster != rde.first_cluster() {
+            continue; // the slot now holds a DIFFERENT file -> fail-closed
+        }
+        let mut grants = [(PrincipalRecord::NONE, 0u32); NFGRANT];
+        for (j, g) in row.grants.iter().enumerate() {
+            if g.rights != 0 && g.prin.kind != PRIN_NONE {
+                grants[j] = (g.prin, g.rights);
+            }
+        }
+        if owned_install_persisted(rlba, roff as u32, row.owner, &grants) {
+            installed += 1;
+        }
+    }
+    installed
+}
+
+/// K1 M2.4: the REAL-BOOT mount-rebuild hook — restore persisted ownership before EL0 programs run. GATED on
+/// `by_name_spawn_multivalued()`: today (a single launchable named program) it returns immediately with ZERO
+/// disk I/O, so the boot path is byte-identical and no persisted-owned file is enforced-then-bricked. Wired at
+/// the head of the demo launcher (in-lane); becomes live the instant a second launchable named program lands.
+/// The MECHANISM is proven independently by the M3 kernel-side proof, which calls `atr_rebuild_into_owned`
+/// directly with manufactured principals (not through this gate).
+fn atr_maybe_boot_rebuild() {
+    if !by_name_spawn_multivalued() {
+        return; // cross-reboot enforcement gated off (single-program world) -> no rebuild, no I/O
+    }
+    if crate::drivers::block::info().is_none() {
+        return;
+    }
+    if let Ok(fs) = crate::fs::fat::mount() {
+        let _ = atr_rebuild_into_owned(&fs);
+    }
 }
 
 /// K1 M1 — the disk half of the round-trip: write ONE synthetic row via the single-row `write_at` path
