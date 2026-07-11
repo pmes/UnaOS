@@ -164,12 +164,50 @@ Legend: **✅ metal-confirmed** · **🔬 QEMU-green, metal pending** · dates I
   S3 write-through overwriting the on-disk executable (honest severity: feature-gated code-image
   regression, not a live ring-3 exploit). N1 offset-over-advance ledgered (rides S4), N2 `submit`
   panics off-scheduler, N3 docs-root paths fixed.
-- **S4 (synchronous grow/create/delete)** stays a deliberately-deferred follow-on (design decision 4;
-  its cross-process races are metal-only, per risk 3).
 - **⚠ test-harness fact:** `./arroyo test-fat sf` is INTERMITTENTLY flaky — the OVMF USB-touch (builder
   ~line 226) sometimes makes the kernel misread the usb-storage geometry as 64 MiB (usb.img size) →
   `parse_bpb` rejects it → `NotFat` → fixtures run in-memory (18 PASS, looks like a regression but
   isn't). `UNAOS_FATIMG=sf ./arroyo test 150` (env at script start) is the RELIABLE FAT form.
+
+### STOR-1 S4 — synchronous grow/create/delete in-syscall (retires the U10x op-queue when on) (2026-07-10) `hw-rmbp`
+- **What:** the CONSERVATIVE-HYBRID completion of the STOR-D1 ladder (step S4): grow/create/delete now
+  run SYNCHRONOUSLY in the syscall via the storage service task (out of the IF-masked handler), retiring
+  the U10x deferred op-queue + its launcher-replay causal-fidelity gap WHEN THE KNOB IS ON. Only the
+  DISK OPS became synchronous — the created-file wstage-for-reads, the snapshot-sibling model, and the
+  U11x M2 defer LOGIC (`DYN_DELETED_G`/`OPENF_*`) are UNCHANGED (shared-backing cross-process reads are
+  S5). **S4a** create — `open_create_new` submits `BlockOp::Create` (idempotent `find_located` →
+  `create_in_root`) FIRST, so the file appears on disk in-syscall. **S4b** grow — `sys_write_grow`
+  submits `BlockOp::Grow` disk-FIRST, then mirrors the extend into wstage + `FILE_SIZE` (reads still
+  serve wstage this arc); no `mark_dirty` (already durable). **S4c** delete at last close — `sys_unlink`
+  no longer enqueues a HELD op; the deferred DELETE runs synchronously via `BlockOp::Delete` at the last
+  close (`openf_release`). **S4d** the launcher verdicts require the U10 op-queue drained NOTHING knob-on
+  (`count == 0`, `u10_drain_verdict`), reading the state the synchronous ops already wrote; a new
+  `:: S4: grow/create/delete SYNCHRONOUS … op-queue drained NOTHING … ::` witness.
+- **The crux (S4c teardown safety):** `openf_decref`'s last-close release runs from THREE contexts — a
+  syscall handler (`files_free`, blocking-safe), the launcher's non-self teardown (blocking-safe), and
+  `exit`/reap self-teardown (IF=0 mid-death / no current task — MUST NOT block: blocking would resume a
+  task whose CR3 is being freed, or `submit` off a scheduler). `openf_decref` stays pure atomics and
+  SIGNALS the caller; `clear_files_row` detects blocking-safety at runtime via `current_user_cr3() !=
+  slot_cr3(slot)` (a launcher is a kernel task, `user_cr3 == 0`; `exit` of the slot has `user_cr3 ==` the
+  slot's CR3; the reaper has no current → both false). Every DEMO delete-trigger is blocking-safe (the
+  unlinkers sweep their own descriptors; the cross-process holders close/tear-down from safe contexts).
+  The unsafe-teardown last-close IS reachable (review catch — a cross-process grantee/sharer that exits
+  or faults without closing): that branch DEFERS the delete via a `U10OP_DELETE` op (the knob-off
+  mechanism), best-effort drained at IF=1, fail-safe if it strands (name blocked + a reclaimable orphan,
+  no corruption). Review also folded a created-file in-place-write-through (else knob-on the write is
+  dropped at teardown). The clean fix (shared on-disk backing) is S5.
+- **Tested (QEMU):** `./arroyo check` both arches, knob on + off. Knob-ON `test 40` (non-FAT) = 18 PASS +
+  MISSION (S4 inert without a FAT volume — the deferred/in-memory path). Knob-ON
+  `UNAOS_IRQSTORAGE=1 UNAOS_FATIMG=sf test 150` = **24 PASS** (22 fixtures + the S3 + S4 witnesses), with
+  u10x-grow / u10cx-create / u10dx-delete / u11m2-unlink / u6gx now SYNCHRONOUS (the U10 op-queue drained
+  NOTHING; zero `U10_OVERFLOW`). Knob-OFF `test 40` = 18 PASS + MISSION, `UNAOS_FATIMG=sf test` = 22 PASS,
+  **byte-identical** (no S4/synchronous lines — the deferred path verbatim). `UNAOS_NOSTORAGE` clean both
+  knob states. Lane: `arch/x86_64/syscall.rs` (routing + launchers) + `drivers/xhci/irqstorage.rs`
+  (`BlockOp::{Create,Grow,Delete}` + `submit_*` + service handlers) + `arch/x86_64/sched.rs`
+  (`current_user_cr3`); `fat.rs`/`block.rs` reused unchanged; **zero aarch64 files**.
+- **Metal:** knob-on is metal-PENDING (the S4 cross-process delete-at-last-close races are metal-only —
+  QEMU-TCG will not interleave; design risk 3). Rides the next attended rMBP bench (transfer-IRQ I/O + S4
+  create/grow/delete under true SMP + `fsck`).
 
 ## hw-jetson track — 2026-07-10 (JD4 — read-side navigation + last dead levers + screen-on-boot; same-day attended bench)
 

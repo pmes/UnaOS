@@ -1,14 +1,18 @@
 # STOR-D1 — IF-safe interrupt-driven x86 storage (design)
 
-Status: **S1–S3 LANDED** (2026-07-10, `hw-rmbp`, behind the `irqstorage` knob — QEMU-green,
-metal-pending; commits `7b2f05f`/`b73ba08`/`fd5de85`). S1 the storage service task +
-`BlockRequest` submit/block/complete; S2 live in-place reads (`sys_read`); S3 live in-place
-write-through (`sys_write_file`) closing the close-discards-dirty residual. **S4 (synchronous
-grow/create/delete) is DEFERRED** to a tightly-scoped follow-on (decision 4 below), since its
-cross-process races are metal-only (risk 3) and it rewrites the most load-bearing lifecycle code.
-The original design (below) is unchanged. Track: `hw-rmbp` (x86_64, 2012 rMBP). Twin reference:
-the aarch64 polled storage path, which this design brings x86 into semantic parity with
-**without** copying its mechanism.
+Status: **S1–S4 LANDED** (2026-07-10, `hw-rmbp`, behind the `irqstorage` knob — QEMU-green,
+metal-pending; S1–S3 `7b2f05f`/`b73ba08`/`fd5de85`, ✅ core mechanism metal-confirmed). S1 the storage
+service task + `BlockRequest` submit/block/complete; S2 live in-place reads (`sys_read`); S3 live in-place
+write-through (`sys_write_file`) closing the close-discards-dirty residual; **S4 synchronous
+grow/create/delete in-syscall** (`BlockOp::{Create,Grow,Delete}`), retiring the U10x deferred op-queue +
+its launcher-replay causal-fidelity gap when the knob is on — CONSERVATIVE-HYBRID (only the DISK OPS
+synchronous; the created-file wstage-for-reads + snapshot-sibling model + the U11x M2 defer logic
+unchanged; shared-backing cross-process READS remain S5). S4's cross-process delete-at-last-close races
+(u11m2/u6gx) are metal-only-validatable (risk 3); its highest-risk edit — a blocking last-close delete on
+the most load-bearing lifecycle primitive — is made safe by a runtime blocking-safe-teardown check
+(`current_user_cr3() != slot_cr3(slot)`; §4 step S4). **S5–S7 remain future** (below). The original
+design (below) is unchanged. Track: `hw-rmbp` (x86_64, 2012 rMBP). Twin reference: the aarch64 polled
+storage path, which this design brings x86 into semantic parity with **without** copying its mechanism.
 
 > Placement note: the STOR-D1 brief names `docs/dev/OS/07_STORAGE/`. The repo's storage doc home
 > is `docs/dev/OS/07_USB_STORAGE/` (alongside `usb_xhci.md`), so this doc lives there. Flagged for

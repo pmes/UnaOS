@@ -54,7 +54,9 @@ pub const NAME_MAX: usize = 12;
 
 /// The kind of transaction a `BlockRequest` carries. S1: the raw single-sector ops (the block-layer
 /// primitive + the `bx-blockreq` self-test). S2: `ReadFile` (a live in-place file-range read,
-/// resolved BY NAME on the live volume). S3..S4 add the write / allocator ops.
+/// resolved BY NAME on the live volume). S3: `WriteFile` (in-place write-through). S4: the ALLOCATOR
+/// ops (`Create`/`Grow`/`Delete`) — grow/create/delete run SYNCHRONOUSLY in-syscall via `fat.rs`, out
+/// of the IF-masked handler, retiring the U10x deferred op-queue when the knob is on.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum BlockOp {
     /// Raw sector read: read one block at `lba` into `buf[..len]`.
@@ -68,6 +70,20 @@ pub enum BlockOp {
     /// buf[..len])` IN PLACE (never grows/allocs/touches the dir or FAT). Returns the byte count
     /// written (`>= 0`), or `-EIO`.
     WriteFile,
+    /// S4a CREATE: idempotently create a 0-length root-directory entry for `name` — `find_located`
+    /// FIRST (idempotent: an already-present name is left untouched), else `create_in_root(name,
+    /// 0x20)`. Allocates NO clusters, touches only the one directory sector. Returns `0` (present or
+    /// created) or `-EIO`.
+    Create,
+    /// S4b GROW: resolve `name`, then `write_grow(first_cluster, on-disk size, dir_lba, dir_off,
+    /// offset, buf[..len])` — extend the file past EOF (alloc + zero-fill + chain, RMW the data, bump
+    /// the dir size LAST), or overwrite in place when the write stays within EOF. Returns the byte
+    /// count written (`>= 0`), or `-EIO`.
+    Grow,
+    /// S4c DELETE: resolve `name`, then `delete_located(dir_lba, dir_off, first_cluster)` (dir entry
+    /// `0xE5` FIRST, then free the whole chain in all FAT copies). Idempotent — a `name` already
+    /// absent returns `0`. Returns `0` (deleted or already gone) or `-EIO`.
+    Delete,
 }
 
 /// A storage transaction submitted to the service task. It lives on the SUBMITTER'S kernel stack:
@@ -221,6 +237,41 @@ pub unsafe fn submit_write_file(name: &[u8], offset: u32, kbuf: *mut u8, len: us
     unsafe { submit(&mut req as *mut BlockRequest) }
 }
 
+/// S4a helper the syscall layer calls: idempotently CREATE a 0-length root-directory entry for `name`
+/// on the LIVE volume. Returns `0` (present or created) or `-EIO`. Blocks the caller on the service
+/// task. No data buffer (a 0-length file owns no clusters).
+///
+/// SAFETY: the caller must be a scheduled task (so it can block on the service task).
+pub unsafe fn submit_create(name: &[u8]) -> i32 {
+    let mut req = BlockRequest::new_file(BlockOp::Create, name, 0, core::ptr::null_mut(), 0);
+    req.done.init();
+    unsafe { submit(&mut req as *mut BlockRequest) }
+}
+
+/// S4b helper the syscall layer calls: GROW file `name` on the LIVE volume — write `len` bytes at byte
+/// `offset` from the KERNEL buffer `kbuf` (into which the handler has already bounced the ring-3
+/// source), extending the file (alloc + chain) when the write runs past EOF. Returns the byte count
+/// written (`>= 0`) or `-EIO`. Blocks the caller on the service task.
+///
+/// SAFETY: `kbuf` must be a live kernel buffer of at least `len` bytes on the caller's stack. The
+/// caller must be a scheduled task.
+pub unsafe fn submit_grow(name: &[u8], offset: u32, kbuf: *mut u8, len: usize) -> i32 {
+    let mut req = BlockRequest::new_file(BlockOp::Grow, name, offset, kbuf, len);
+    req.done.init();
+    unsafe { submit(&mut req as *mut BlockRequest) }
+}
+
+/// S4c helper the syscall layer calls: DELETE file `name` from the LIVE volume (`0xE5` the dir entry,
+/// free the chain in all FAT copies). Idempotent — a `name` already absent returns `0`. Returns `0`
+/// (deleted or already gone) or `-EIO`. Blocks the caller on the service task.
+///
+/// SAFETY: the caller must be a scheduled task (so it can block on the service task).
+pub unsafe fn submit_delete(name: &[u8]) -> i32 {
+    let mut req = BlockRequest::new_file(BlockOp::Delete, name, 0, core::ptr::null_mut(), 0);
+    req.done.init();
+    unsafe { submit(&mut req as *mut BlockRequest) }
+}
+
 /// The service task body: pop one request, run it at IF=1, post the submitter. A normal scheduled
 /// kernel task, so its `hlt` inside the BOT pump wakes on the storage MSI-X. Never returns (the
 /// infinite loop makes the effective type `!`; `spawn` wants a `fn(usize)`, so it is left `()`).
@@ -283,6 +334,9 @@ fn service_one(req: &mut BlockRequest, fs: &mut Option<crate::fs::fat::FatFs>) -
         }
         BlockOp::ReadFile => service_read_file(req, fs),
         BlockOp::WriteFile => service_write_file(req, fs),
+        BlockOp::Create => service_create_file(req, fs),
+        BlockOp::Grow => service_grow_file(req, fs),
+        BlockOp::Delete => service_delete_file(req, fs),
     }
 }
 
@@ -325,6 +379,60 @@ fn service_write_file(req: &mut BlockRequest, fs: &mut Option<crate::fs::fat::Fa
     let data = unsafe { core::slice::from_raw_parts(req.buf, req.len) };
     match fs.write_at(de.first_cluster(), de.size, req.offset, data) {
         Ok(w) => w as i32,
+        Err(_) => EIO,
+    }
+}
+
+/// S4a: idempotently CREATE a 0-length root-directory entry for `name` on the live volume. `find_located`
+/// FIRST — an already-present name (a re-submit, or a metal card that still holds it) is left untouched
+/// (the `create_in_root` "caller must confirm absent" contract; never plant a duplicate 8.3 slot) — else
+/// `create_in_root(name, 0x20)`. Allocates NO clusters. Returns `0` (present or created) or `-EIO`.
+fn service_create_file(req: &mut BlockRequest, fs: &mut Option<crate::fs::fat::FatFs>) -> i32 {
+    let Some(fs) = mounted(fs) else { return EIO };
+    let Ok(name) = core::str::from_utf8(&req.name[..req.name_len]) else { return EIO };
+    match fs.find_located(name) {
+        Ok(_) => 0, // already present — idempotent, no duplicate
+        Err(crate::fs::fat::FatError::NotFound) => match fs.create_in_root(name, 0x20) {
+            Ok(_) => 0,
+            Err(_) => EIO,
+        },
+        Err(_) => EIO, // a real I/O / mount error — do NOT create over it
+    }
+}
+
+/// S4b: GROW file `name` on the live volume via `write_grow` — resolve its on-disk directory location +
+/// chain head + size, then extend (alloc + zero-fill + chain, RMW the data, bump the dir size LAST) or
+/// overwrite in place. Bounded by the caller's one-page grow. Returns the byte count written (`>= 0`) or
+/// `-EIO` (no volume / not found / a directory / an I/O error). `write_grow` publishes the new size +
+/// chain head to the directory itself.
+fn service_grow_file(req: &mut BlockRequest, fs: &mut Option<crate::fs::fat::FatFs>) -> i32 {
+    let Some(fs) = mounted(fs) else { return EIO };
+    let Ok(name) = core::str::from_utf8(&req.name[..req.name_len]) else { return EIO };
+    let (de, lba, off) = match fs.find_located(name) {
+        Ok(loc) if !loc.0.is_dir => loc,
+        _ => return EIO,
+    };
+    let data = unsafe { core::slice::from_raw_parts(req.buf, req.len) };
+    match fs.write_grow(de.first_cluster(), de.size, lba, off, req.offset, data) {
+        Ok((w, _ns, _nf)) => w as i32,
+        Err(_) => EIO,
+    }
+}
+
+/// S4c: DELETE file `name` from the live volume via `delete_located` (dir entry `0xE5` FIRST, then free
+/// the whole chain in ALL FAT copies — crash-safe order). IDEMPOTENT: a `name` already absent returns
+/// `0` (the last-close delete of an already-reaped file, or a metal re-run), so a benign double-delete
+/// never surfaces as an error. Returns `0` (deleted or already gone) or `-EIO` (an I/O error).
+fn service_delete_file(req: &mut BlockRequest, fs: &mut Option<crate::fs::fat::FatFs>) -> i32 {
+    let Some(fs) = mounted(fs) else { return EIO };
+    let Ok(name) = core::str::from_utf8(&req.name[..req.name_len]) else { return EIO };
+    match fs.find_located(name) {
+        Ok((de, lba, off)) if !de.is_dir => match fs.delete_located(lba, off, de.first_cluster()) {
+            Ok(_) => 0,
+            Err(_) => EIO,
+        },
+        Ok(_) => EIO, // a directory under this name — never delete it via the file path
+        Err(crate::fs::fat::FatError::NotFound) => 0, // already gone — idempotent
         Err(_) => EIO,
     }
 }
