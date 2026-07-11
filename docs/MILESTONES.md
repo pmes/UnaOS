@@ -326,10 +326,15 @@ Legend: **✅ metal-confirmed** · **🔬 QEMU-green, metal pending** · dates I
   in-RAM owner, disk-survive+rebuild, rebuilt-owned-by-name, owner-re-admitted-by-name, impostor-denied,
   grow-repersist-landed — is the only addition, UNCOUNTED) + CAPSTONE 6/6 + F2/F3 witnesses locked
   240000/240000 + the K1-atr/persist/corrupt lines, zero R1/CMD13; `test-arm` MISSION SUCCESS. Zero x86.
-- **Metal:** the true cross-reboot power-cycle survival (a `prog:X` owner file surviving a real power-cycle,
-  admitted-by-name on the next boot, impostor denied) is metal-attended — QEMU can only same-boot SIMULATE
-  the reboot (fresh-per-build FAT, no Group-1 IRQ). Pristine card (delete stale `UNAFS.ATR`) is the bench
-  pre-condition. `k2_liveenf_launcher` self-cleans so the stateful card accumulates nothing.
+- **Metal: ✅ CONFIRMED (2026-07-11 attended bench, real Pi 4; this session drove, Peter physical).**
+  **Part A one-boot:** `MBENCH PASS 25/25` required witnesses, 0 forbidden hits (23 PASS + CAPSTONE 6/6 +
+  `K2-liveenf … PASS [w=0x7f]` + K1-persist/corrupt + F2/F3 locked; zero R1/CMD13/EXCEPTION; zero A72 EC=0
+  heal lines). **Part B genuine two-boot power-cycle** (the M(e) `UNAOS_K2_LEAVE` knob): boot-1 left
+  `K2PRIV.BIN` persisted (owner `prog:K2OWN.BIN`, fc=0x12) → REAL power-cut → boot-2 the LIVE boot rebuild
+  reinstalled the row from disk, owner re-admitted BY NAME, impostor refused `-EACCES`, self-cleaned:
+  `:: K2-metal: BOOT-2 … SURVIVED a real power-cycle … PASS [w=0x07] ::`. Logs:
+  `~/unaos-bench/pi-serial-2026-07-11-112106.log` (A) + `…-112529.log` (B). The cross-reboot ACL now
+  survives a real power-cycle on silicon — not just the same-boot simulate.
 - **Detail:** [`SECURITY.md` §K1 (K2 bullet)](SECURITY.md). **Commits:** K2 M(a)/M(b)/M(d)/M(c)/M(d)-F1/F2
   on `hw-pi4` (see `git log`).
 - **M(e) — the metal money-shot knob (`UNAOS_K2_LEAVE`, attended Pi bench only; follow-on commit atop the

@@ -1,5 +1,10 @@
 # K2 metal bench — cross-reboot enforcement on real Pi 4 silicon
 
+> ✅ **RAN 2026-07-11 — BOTH PARTS PASS** (real Pi 4, this session drove, Peter physical). Part A:
+> `MBENCH PASS 25/25`, `K2-liveenf [w=0x7f]`, 0 forbidden. Part B: boot-1 left `K2PRIV.BIN` (fc=0x12) →
+> real power-cut → boot-2 `K2-metal … SURVIVED a real power-cycle … PASS [w=0x07]`. Logs in
+> `~/unaos-bench/pi-serial-2026-07-11-112106.log` (A) + `…-112529.log` (B). Procedure below, for re-runs.
+
 Attended (Peter physical + this executor session drives the software). Two parts: **A** one-boot sanity
 (the mechanism on silicon), **B** the money-shot (a REAL two-boot power-cycle survival via the
 `UNAOS_K2_LEAVE` knob, K2 M(e)).
