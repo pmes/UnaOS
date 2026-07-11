@@ -25,6 +25,12 @@ pi = []
 # entry for a raw `_start` that sets up a stack, zeroes BSS, enables a minimal MMU (so atomics work),
 # builds a BootInfo, and calls kernel_main. Implies `pi`. Enable via `UNAOS_BAREMETAL=1`.
 baremetal = ["pi"]
+# K2 metal money-shot: turn k2_liveenf_launcher into a REAL two-boot cross-reboot power-cycle proof (instead of
+# the same-boot simulate). One image, flashed once, booted twice: boot-1 (K2PRIV.BIN absent) creates+persists+
+# LEAVES an owned file; power-cycle; boot-2 (K2PRIV.BIN present) verifies the LIVE boot rebuild reinstalled the
+# row across the power-cycle (owner admitted BY NAME / impostor denied), then cleans. For the ATTENDED Pi bench
+# only. Enable via `UNAOS_K2_LEAVE=1 ./arroyo kernel8`. OFF => the normal same-boot proof (battery byte-identical).
+k2_leave = []
 # Run the SMP scheduler demo/self-test at boot (spawns demo threads across the APs, incl. the RwLock
 # torn-read check). Opt-in via `UNAOS_SCHED_DEMO=1`: it's a QEMU-verified smoke test whose tick-based
 # timing stalls boot for minutes on real hardware (uncalibrated APIC timer). Off => scheduler still
