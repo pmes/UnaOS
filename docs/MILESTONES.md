@@ -332,6 +332,17 @@ Legend: **✅ metal-confirmed** · **🔬 QEMU-green, metal pending** · dates I
   pre-condition. `k2_liveenf_launcher` self-cleans so the stateful card accumulates nothing.
 - **Detail:** [`SECURITY.md` §K1 (K2 bullet)](SECURITY.md). **Commits:** K2 M(a)/M(b)/M(d)/M(c)/M(d)-F1/F2
   on `hw-pi4` (see `git log`).
+- **M(e) — the metal money-shot knob (`UNAOS_K2_LEAVE`, attended Pi bench only; follow-on commit atop the
+  merged arc):** QEMU can only same-boot SIMULATE the reboot, so the true power-cycle survival needs boot-1
+  to LEAVE the persisted row across a real reboot. A new `k2_leave` cargo feature (arroyo enables from
+  `UNAOS_K2_LEAVE=1`; OFF ⇒ the normal same-boot battery, byte-identical) swaps `k2_liveenf_launcher` for
+  `k2_metal_launcher`: boot-1 (`K2PRIV.BIN` absent) creates+owns+persists+grows then LEAVES the file;
+  power-cycle; boot-2 (`K2PRIV.BIN` present) verifies the LIVE `atr_maybe_boot_rebuild` reinstalled the row
+  across the power-cycle (owner re-admitted BY NAME, impostor refused), then self-cleans. QEMU-proven via
+  same-image `if=sd` write-back (boot-1 `BOOT-1 left … fc=0x14`; boot-2 `BOOT-2 … SURVIVED … PASS [w=0x07]`,
+  0 FAIL, CAPSTONE 6/6; boot-2's battery is stateful-degraded, expected). Bench card:
+  [`unaos/scripts/k2-metal-bench.md`](../unaos/scripts/k2-metal-bench.md). Normal build byte-identical;
+  check both arches OK; zero x86.
 
 ## hw-jetson track — 2026-07-10 (JD4 — read-side navigation + last dead levers + screen-on-boot; same-day attended bench)
 
