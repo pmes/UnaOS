@@ -38,6 +38,12 @@ const PANIC_BG: u32 = 0x0030_0000; // dark red
 
 struct FbCon {
     fb: FrameBuffer,
+    /// VPERF M2 (videocap bench lever): `fb` above is HEIGHT-CAPPED (its `info.height` is
+    /// shrunk, so `scroll_up` — which sizes its memmove from that height — moves proportionally
+    /// fewer bytes). This uncapped twin exists so full-surface paints (init fill, `clear`, the
+    /// panic backdrop) still cover the whole real panel.
+    #[cfg(all(target_arch = "x86_64", feature = "videocap"))]
+    fb_full: FrameBuffer,
     cols: usize,
     rows: usize,
     col: usize,
@@ -56,6 +62,8 @@ impl FbCon {
     const fn new() -> Self {
         FbCon {
             fb: FrameBuffer::new(),
+            #[cfg(all(target_arch = "x86_64", feature = "videocap"))]
+            fb_full: FrameBuffer::new(),
             cols: 0,
             rows: 0,
             col: 0,
@@ -66,6 +74,20 @@ impl FbCon {
             dirty_y0: 0,
             dirty_y1: 0,
         }
+    }
+
+    /// The surface for FULL-SURFACE paints (init fill / `clear` / panic backdrop): the uncapped
+    /// handle under the videocap bench lever, `fb` itself otherwise. Text drawing and scrolling
+    /// always go through the (possibly capped) `fb`.
+    #[cfg(all(target_arch = "x86_64", feature = "videocap"))]
+    #[inline]
+    fn full_fb(&self) -> &FrameBuffer {
+        &self.fb_full
+    }
+    #[cfg(not(all(target_arch = "x86_64", feature = "videocap")))]
+    #[inline]
+    fn full_fb(&self) -> &FrameBuffer {
+        &self.fb
     }
 
     /// Grow the dirty band to include pixel rows `[y0, y1)`.
@@ -160,16 +182,32 @@ pub fn init(fb_addr: u64, fb_len: usize, info: FrameBufferInfo) {
     crate::video::vperf::set_vram_range(fb_addr as usize, fb_len);
     crate::arch::without_interrupts(|| {
         let mut c = FBCON.lock();
-        c.fb.init(fb_addr as usize, fb_len, info);
-        c.cols = info.width / CELL_W;
-        c.rows = info.height / CELL_H;
+        // VPERF M2 (videocap bench lever): cap the fbcon-PRIVATE handle's height. Capping the
+        // `rows` field alone would be a no-op — `scroll_up` sizes its memmove from
+        // `info.height` — so the cap must live in the handle's own info. The uncapped twin
+        // (`fb_full`) keeps full-surface paints covering the whole real panel.
+        #[cfg(all(target_arch = "x86_64", feature = "videocap"))]
+        {
+            c.fb_full.init(fb_addr as usize, fb_len, info);
+            let mut capped = info;
+            capped.height = ((info.height / 2) / CELL_H).max(1) * CELL_H;
+            c.fb.init(fb_addr as usize, fb_len, capped);
+            c.cols = capped.width / CELL_W;
+            c.rows = capped.height / CELL_H;
+        }
+        #[cfg(not(all(target_arch = "x86_64", feature = "videocap")))]
+        {
+            c.fb.init(fb_addr as usize, fb_len, info);
+            c.cols = info.width / CELL_W;
+            c.rows = info.height / CELL_H;
+        }
         c.col = 0;
         c.row = 0;
         c.fg = FG_DEFAULT;
         c.bg = BG_DEFAULT;
         c.ready = true;
-        c.fb.fill_screen(BG_DEFAULT);
-        c.fb.flush_all();
+        c.full_fb().fill_screen(BG_DEFAULT);
+        c.full_fb().flush_all();
     });
 }
 
@@ -222,7 +260,8 @@ pub fn clear() {
             if c.ready {
                 c.col = 0;
                 c.row = 0;
-                c.fb.fill_screen(BG_DEFAULT);
+                // Whole real surface, even when the videocap lever caps the text viewport.
+                c.full_fb().fill_screen(BG_DEFAULT);
             }
         }
     });
@@ -241,8 +280,10 @@ pub fn panic_screen() {
                 c.fg = 0x00FF_FFFF;
                 c.col = 0;
                 c.row = 0;
-                c.fb.fill_screen(PANIC_BG);
-                c.fb.flush_all();
+                // The panic backdrop covers the FULL panel even when the videocap lever caps the
+                // text viewport (the message itself renders within the capped viewport).
+                c.full_fb().fill_screen(PANIC_BG);
+                c.full_fb().flush_all();
             }
         }
     });

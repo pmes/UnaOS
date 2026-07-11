@@ -50,6 +50,8 @@ _feats=""
 # readout, display-BAR probe, scripted scroll scenario). x86_64-only module — aarch64 media are
 # byte-identical with this on or off.
 [ -n "${UNAOS_VIDEOBENCH:-}" ] && _feats="${_feats}videobench,"
+# VPERF M2: the fbcon viewport-cap bench lever (implies videobench). x86_64 only.
+[ -n "${UNAOS_VIDEOCAP:-}" ] && _feats="${_feats}videocap,"
 [ -n "${UNAOS_TEGRA:-}" ] && _feats="${_feats}tegra,"
 if [ -n "$_feats" ]; then
     KERNEL_FEATURES="--features ${_feats%,}"

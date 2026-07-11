@@ -49,6 +49,12 @@ irqstorage = []
 # live PTE + PAT), a PCI class-0x03 display probe, and the deterministic scripted scroll scenario
 # the screendump gates compare. Enable via `UNAOS_VIDEOBENCH=1`. Default OFF => byte-identical.
 videobench = []
+# VPERF M2 viewport-cap bench lever (x86_64 only; implies videobench so the scroll-bytes shrink
+# is measurable): halve the fbcon-PRIVATE FrameBuffer handle's `info.height` (rounded to the 8-px
+# cell), shrinking the scroll memmove by the cap ratio. Full-surface paints (init fill / clear /
+# panic backdrop) still cover the whole real panel via an uncapped twin handle. Enable via
+# `UNAOS_VIDEOCAP=1`. Default OFF => byte-identical.
+videocap = ["videobench"]
 # Jetson Orin Nano (Tegra234) build: point the aarch64 serial at the Tegra UART — a 16550-style
 # controller at a Tegra MMIO base (NOT the QEMU `virt` PL011) — so the board has a real serial
 # console from boot #1 over the carrier's button-header USB-TTL (115200 8N1). Mutually exclusive

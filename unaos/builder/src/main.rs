@@ -51,6 +51,8 @@ fn main() {
     // VPERF: x86 video-path bench instrumentation (scroll/VRAM-read counters, fbmem readout,
     // display-BAR probe, scripted scroll scenario). x86_64-only module; default OFF.
     if std::env::var("UNAOS_VIDEOBENCH").is_ok() { feats.push("videobench"); }
+    // VPERF M2: the fbcon viewport-cap bench lever (implies videobench). x86_64 only.
+    if std::env::var("UNAOS_VIDEOCAP").is_ok() { feats.push("videocap"); }
     // `tegra` (Jetson Orin / Tegra234 UART) is an aarch64 board feature; mapped here for parity with
     // the `pi` knob, though this x86_64 builder never produces aarch64 media (the `arroyo` script does).
     if std::env::var("UNAOS_TEGRA").is_ok() { feats.push("tegra"); }
