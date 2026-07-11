@@ -1920,7 +1920,7 @@ as the Orin boot stick (its x86 ESP overwritten with the aarch64 JD5 ESP) — th
 re-flash its own boot media before its next bench. The FAT16 `UNAOSRW` (the pi4 fixture card) served
 as the tegra data card, as in JD4.
 
-### JD6 — the write path reaches the whole tree: subdirectory writes (attended-pending)
+### JD6 — the write path reaches the whole tree: subdirectory writes (✅ METAL-CONFIRMED 2026-07-11)
 
 JD4 made the whole tree *navigable* (read); JD5 made the *root* writable; JD6 closes the gap:
 `touch` / `write` / `append` / `rm` in ANY directory the shell can `cd` into. The panel becomes a
@@ -1981,9 +1981,90 @@ in-lane (the shell dispatches only on a keystroke, and tegra never runs in QEMU)
 verdict is **attended-pending**; the write PRIMITIVES the twins call are the same F3-locked
 `create_in_*`/`write_grow`/`delete_located` the U9/U10/U11 fixtures already exercise headless.
 
-**Metal verdict — attended-pending.** The subdir money-shot (`cd DOCS`, `write NOTE.TXT …`,
-power-cycle, `cd DOCS`, `cat`) rides the next attended Orin bench — card
-[`jd6-bench.md`](../../../../unaos/scripts/jd6-bench.md).
+**Metal verdict — ✅ CONFIRMED (attended bench, 2026-07-11 — PASS, panel-observed).** The subdir
+money-shot ran on the round-6 bench, on the JB1f-fixed kernel (`e074518` tip; the JD6 code itself
+was blocked from benching by the §JB1f crash until that fix landed): the bench card
+[`jd6-bench.md`](../../../../unaos/scripts/jd6-bench.md) ran to completion on the FAT16 `UNAOSRW`
+card's pre-existing `DOCS/` subdirectory, including the write → power-cycle → `cat` durability leg.
+Attending-operator verdict: **pass 100%**. ⚠ Same evidence caveat as the §JB1f verdict: the
+host-side serial capture failed mid-bench, so the verdict is the attended panel observation (the
+JD6 card's checks are all panel-visible); no replay log exists for an mbench assert.
+
+### JB1f — the unhealed early-vector window (the round-6 boot crash), closed (`85f74f8`)
+
+**The evidence (2026-07-11 attended bench, real Orin).** Kernel `446abd3` (the JD6 tip): 2/2 boots
+FATAL within ms of `panel LIVE`, inside `fbcon::Sink::write_str`'s per-char glyph loop (nm-confirmed).
+Boot A: `ESR=0x2000000` (EC=0 UNDEF-class) at a font-table `ldrb`, EC0-probe D-side readback == the
+ELF word exactly — the proven I/D divergence. Boot B: `ESR=0x96000004` (data abort) with
+`FAR=0xfffffffffffffed0` — x20 (the sink pointer) reloaded as `-0x130`, corrupted silently upstream;
+its ELR sits exactly one A78 I-cache line (0x40) past Boot A's. Kernel `7a126f5` (the JD5-metal
+lineage): 2/2 boots CLEAN — and boot 2 carried a HEALED phantom strike, proving the erratum active on
+the board that day. Both fatal dumps printed SPSR — a format only `mmu_tegra`'s Part-C
+`tegra_fault_handler` emits — pinning both crashes inside the **unhealed window**: the stretch between
+`mmu_tegra::init` (which installs the divergent probe-and-spin Part-C vectors at the MMU switch) and
+`exceptions::install` at JM4, a stretch that mirrors the whole early boot log glyph-by-glyph once
+`fbcon::init` brings the panel up — the boot's heaviest ifetch+store workload, with no heal armed.
+
+**Diagnosis (2-lens + adjudicator panel, unanimous).** One silicon defect, two flavors, plus one
+kernel-side latent gap. The bullet is the documented **A78AE erratum 1941500** (arch_arm64.md "JB1
+result": r0p1 in range, CPUECTLR_EL1[8] ships clear and is EL3-gated): the UNDEF flavor (Boot A) is
+exactly what the JB1e heal retries through; the valid-but-wrong-decode flavor (Boot B — the
+historically proven victim word `0xa9454ff4` decodes to `ldp x20, x19, [sp,#0x50]`, an epilogue-shaped
+stale fetch that loads x20 with stack garbage) corrupts silently and no OS-side heal can catch it.
+**The VPERF fbcon rewrite was exonerated hunk-by-hunk**: every new arithmetic site is compile-time
+`cfg(target_arch = "x86_64")`, the aarch64-visible edits resolve to `&self.fb` (semantically identical
+to the metal-proven lineage), and every reachable span already used the byte-stride with clamp-to-len
+— the Orin's padded stride (2048 px vs 1920 width) was a red herring. What the 7a126f5→446abd3 window
+DID change is ~2,400 aarch64 text lines of **binary layout** (K1 syscall, shell, fat — not VPERF
+semantics), re-rolling which hot PCs sit on vulnerable I-cache lines. **Ledger note (pattern
+sensitivity):** erratum-1941500 strikes are deterministic per binary+flow — treat per-binary layout
+luck as expected variance; a layout shift can move the strike site into ANY hot loop, which is why the
+whole boot must run under healed vectors rather than chasing the loop of the week. No speculative
+video-code change was made (M2 = this note).
+
+**The fix (JB1f, `85f74f8`) — three parts:**
+1. **Install the healed `exceptions.rs` vectors EARLY**: `tegra_early_stop` now calls
+   `exceptions::install()` right after the mmu-regs banner, BEFORE fbcon starts mirroring. Chosen over
+   arming a heal inside the Part-C vectors: one heal implementation (metal-proven, full GPR+FP frame,
+   per-strike serial line, naturally shared budget) beats duplicating frame/heal asm that `global_asm!`
+   macro scoping cannot share. Part C keeps its probe-and-spin role for the (now three-serial-line)
+   switch window itself. Audited safe that early: `BOOT_EL` latches 2, serial is live, the fatal path
+   busy-spins (`timer::LIVE` false), and the IRQ entries stay dormant — the HCR_EL2 routing bits move
+   earlier but DAIF stays fully masked until JM4's `enable_irq`.
+2. **Nest-safety** (panel fold-in #1): `__vec_sync` banks ELR/SPSR/SP_EL0 to its frame and restores
+   them before the heal `eret` — a sync fault nesting inside the handler re-banks the per-core
+   registers and previously retargeted the outer eret (silent PC corruption of exactly the Boot-B
+   shape). The EL bank is a **runtime** `CurrentEL` check, not `__vec_irq`'s compile-time suffix:
+   on tegra this vector genuinely serves EL2 (pre-drop) and EL1 (post-drop CAPSTONE, where a heal
+   has fired on metal), and an `ELR_EL2` access at EL1 itself UNDEFs.
+3. **Heal-storm hardening** (fold-in #2): global budget 64 → 1024 (64 was sized to the
+   isolated-strike era; a hot-loop site can legitimately re-strike across iterations), plus a
+   consecutive-same-PC cap (32) preserving the wedged-core stop — a different healed PC proves
+   progress and resets the streak. The counter is `fetch_add` (the old load-then-store pair was
+   non-atomic); same-PC repeats print every 8th line (~8 ms of 115200-baud UART per line at loop
+   frequency); the fatal path and `install()` print the heal tally when nonzero, so a
+   `try_lock`-skipped heal line can never masquerade as a clean boot.
+
+**Gate:** QEMU byte-equivalent everywhere (the heal never fires in QEMU): `check` +
+`UNAOS_TEGRA=1 check` both arches; `test-arm 22` MISSION; `UNAOS_GICV3=1 test-arm 40` CAPSTONE 6/6;
+`kernel8` + `kernel8-test` 23 PASS 0 FAIL + CAPSTONE 6/6 + K1 witnesses; `esp-jetson` links,
+108 `tegra:` strings. Zero x86 delta. **Metal expectation:** survives `panel LIVE` ×3 boots minimum;
+a phantom strike prints a heal line (or a later tally) and CONTINUES; then the JD6 bench card runs to
+completion on the same kernel. A silent hang is a FAIL — screen state + serial silence together decide.
+
+> **✅ JB1f METAL VERDICT (attended bench, 2026-07-11 — PASS, panel-observed).** The JB1f kernel
+> (`e074518` tip, sha-verified media) ran the full bench on the crash-day board: boots survived
+> `panel LIVE` and ran through the boot mirror — the exact stretch that killed `446abd3` 2/2 that
+> morning — to the interactive shell, and the JD6 bench card completed on the same kernel (§JD6
+> verdict below). Attending-operator verdict: **pass 100%**. ⚠ Evidence caveat, recorded honestly:
+> the HOST-side serial capture failed mid-bench (the dated log froze at boot 1's early-UEFI bytes;
+> the bridge stdout caught a later boot's MB2 fragment) — so there is NO replay log for an mbench
+> assert and no per-strike heal-line tally; the verdict rests on the attended panel observation,
+> which is sufficient for the two criteria that matter (boots visibly completed = not a silent
+> hang; the JD6 card visibly completed). Whether any strike was silently healed is unknowable from
+> this capture — irrelevant to the survival criterion, but the NEXT bench should fix the bridge
+> (probe re-enumeration mid-bench is the suspect) and re-capture a serial-asserted boot for the
+> tally record.
 
 ## 4. Jetson Orin Nano headless bring-up (Arc JM2)
 

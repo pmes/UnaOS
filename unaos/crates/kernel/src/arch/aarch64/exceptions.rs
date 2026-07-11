@@ -306,15 +306,49 @@ __vec_irq:
 __vec_sync:
     SAVE_GPRS
     SAVE_FP
+    // JB1f (panel fold-in #1 — nest-safety): bank ELR/SPSR/SP_EL0 onto the frame, the __vec_irq
+    // discipline. Since JB1e this stub can RETURN (heal -> eret), and the handler runs substantial
+    // Rust (D-side probe, atomics, serial writes) — a sync fault NESTING inside it re-banks the
+    // per-core ELR/SPSR, and without this frame copy the outer eret would resume at the NESTED
+    // fault's PC/PSTATE (silent register/PC corruption). Unlike __vec_irq's compile-time irq_el!
+    // suffix, the EL is a RUNTIME check: on tegra this vector serves EL2 (pre-drop, where the
+    // fbcon boot-mirror window lives) AND EL1 (post-drop CAPSTONE, where a heal has fired on
+    // metal) — and an ELR_EL2 access at EL1 itself UNDEFs. CurrentEL cannot fault; x0-x3 are
+    // scratch here (SAVE_GPRS spilled them).
+    mrs x2, CurrentEL
+    cmp x2, #0x8
+    b.eq 2f
+    mrs x0, ELR_EL1
+    mrs x1, SPSR_EL1
+    b 3f
+2:  mrs x0, ELR_EL2
+    mrs x1, SPSR_EL2
+3:  mrs x2, SP_EL0
+    stp x0, x1, [sp, #-32]!
+    str x2, [sp, #16]
     mov x0, #0
     bl aarch64_fault_handler
     // JB1e (the A78AE erratum-1941500 heal): the handler returns 1 to RETRY the faulting
     // instruction after I-side invalidation (EC=0 with a valid D-side word = the proven stale
     // macro-op/I-side divergence; the chicken bit is EL3-gated on this firmware, so retry is the
-    // only OS-side mitigation). ELR/SPSR are still banked from entry — the handler takes no
-    // nested exception and never unmasks — so a bare eret resumes exactly at the faulting PC.
-    // FP is saved/restored because the handler's Rust may clobber SIMD regs (+neon fmt).
+    // only OS-side mitigation). The banked ELR/SPSR/SP_EL0 are restored from THIS frame (runtime
+    // EL again — heals fire at either EL on tegra) so the eret resumes exactly at the faulting PC
+    // even if the handler itself took (and healed) a nested fault. FP is saved/restored because
+    // the handler's Rust may clobber SIMD regs (+neon fmt); RESTORE_FP scratches x0/x1, which is
+    // why the msr's run first (the __vec_irq epilogue ordering).
     cbz x0, 1f
+    ldp x0, x1, [sp]
+    ldr x2, [sp, #16]
+    add sp, sp, #32
+    mrs x3, CurrentEL
+    cmp x3, #0x8
+    b.eq 4f
+    msr ELR_EL1, x0
+    msr SPSR_EL1, x1
+    b 5f
+4:  msr ELR_EL2, x0
+    msr SPSR_EL2, x1
+5:  msr SP_EL0, x2
     RESTORE_FP
     RESTORE_GPRS
     eret
@@ -369,6 +403,13 @@ pub fn install() {
         core::arch::asm!("isb", options(nomem, nostack, preserves_flags));
     }
     serial_println!(":: AARCH64 exception vectors installed (VBAR_EL{} = {:#x}) ::", el, vbar);
+    // JB1f: surface heals that predate this install — the tegra post-drop re-install runs after
+    // the EL2 boot stretch, so a heal whose per-strike line lost the SERIAL_PORT try_lock still
+    // shows up here. Silent when zero, so QEMU/pi output is byte-identical.
+    let heals = EC0_HEALS.load(Ordering::Relaxed);
+    if heals > 0 {
+        serial_println!(":: JB1f — EC0 heals so far this boot: {} ::", heals);
+    }
 }
 
 /// The current Exception Level (3..0) from CurrentEL[3:2].
@@ -417,9 +458,19 @@ extern "C" fn aarch64_irq_handler() {
 }
 
 /// JB1e: heals applied to the A78AE erratum-1941500 phantom this boot (bounded so a genuinely
-/// broken instruction stream cannot retry forever).
+/// broken instruction stream cannot retry forever). JB1f (panel fold-in #2) split the bound in
+/// two: a raised GLOBAL budget (the phantom relocates with every binary layout, and a hot-loop
+/// site can legitimately re-strike across iterations — 64 was sized to the isolated-strike era)
+/// plus a CONSECUTIVE-same-PC cap that preserves the wedged-core stop: a fault->heal->refault
+/// livelock at one PC burns its streak in microseconds and dies with the full syndrome, instead
+/// of silently draining the global budget. The streak resets whenever a DIFFERENT PC heals
+/// (forward progress proven). Counters are fetch_add/store (the old load-then-store pair was
+/// non-atomic); Relaxed — the boot core is the only writer today.
 static EC0_HEALS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
-const EC0_HEAL_CAP: u32 = 64;
+static EC0_LAST_ELR: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+static EC0_SAME_PC: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+const EC0_HEAL_CAP: u32 = 1024;
+const EC0_SAME_PC_CAP: u32 = 32;
 
 /// Fatal-exception logger (called from the sync/fiq/serror stubs; `kind`: 0=sync, 2=fiq, 3=serror).
 /// Reads the syndrome/return/fault-address registers for the EL we booted at, prints them, and
@@ -451,38 +502,55 @@ extern "C" fn aarch64_fault_handler(kind: u64) -> u64 {
     // budget left. `ic iallu` refreshes the I-side (macro-op cache included) for this core.
     if kind == 0 && (esr >> 26) & 0x3F == 0 && (0x8000_0000..0x40_0000_0000).contains(&elr) {
         let dword = unsafe { core::ptr::read_volatile(elr as *const u32) };
-        let heals = EC0_HEALS.load(Ordering::Relaxed);
-        if dword != 0 && dword != 0xFFFF_FFFF && heals < EC0_HEAL_CAP {
-            EC0_HEALS.store(heals + 1, Ordering::Relaxed);
-            // JB2b hardening: print the heal line WITHOUT a blocking lock. The phantom can strike
-            // an instruction INSIDE an in-progress `_print` on this same core — the serial spin
-            // Mutex is then already held here, and `without_interrupts` cannot mask a SYNCHRONOUS
-            // exception — so the plain serial_println! this used to be would spin-deadlock the
-            // very heal that was about to fix the fault (a dark hang instead of a recovery). The
-            // fatal path below accepts that lock risk as a last-resort diagnostic; the heal is a
-            // continue-running path and must not. try_lock: the uncontended common case prints; a
-            // fault-interrupted holder skips the line — the heal itself needs no lock, and the
-            // EC0_HEALS counter still records it. The fbcon mirror (its own locks) is skipped
-            // too; the headless Orin loses nothing.
-            if let Some(mut port) = super::serial::SERIAL_PORT.try_lock() {
-                use core::fmt::Write;
-                let _ = writeln!(
-                    port,
-                    ":: A78AE-1941500 heal #{}: EC=0 at ELR={:#x} (D-side {:#010x} valid) — ic iallu + retry ::",
-                    heals + 1,
-                    elr,
-                    dword,
-                );
+        if dword != 0 && dword != 0xFFFF_FFFF {
+            // JB1f: consecutive-same-PC streak. A different healed PC proves forward progress and
+            // resets the streak; the same PC re-faulting past EC0_SAME_PC_CAP with no progress in
+            // between is treated as a wedged core and falls through to the fatal print below.
+            let same = if EC0_LAST_ELR.load(Ordering::Relaxed) == elr {
+                EC0_SAME_PC.fetch_add(1, Ordering::Relaxed) + 1
+            } else {
+                EC0_LAST_ELR.store(elr, Ordering::Relaxed);
+                EC0_SAME_PC.store(1, Ordering::Relaxed);
+                1
+            };
+            if EC0_HEALS.load(Ordering::Relaxed) < EC0_HEAL_CAP && same <= EC0_SAME_PC_CAP {
+                let total = EC0_HEALS.fetch_add(1, Ordering::Relaxed) + 1;
+                // JB2b hardening: print the heal line WITHOUT a blocking lock. The phantom can strike
+                // an instruction INSIDE an in-progress `_print` on this same core — the serial spin
+                // Mutex is then already held here, and `without_interrupts` cannot mask a SYNCHRONOUS
+                // exception — so the plain serial_println! this used to be would spin-deadlock the
+                // very heal that was about to fix the fault (a dark hang instead of a recovery). The
+                // fatal path below accepts that lock risk as a last-resort diagnostic; the heal is a
+                // continue-running path and must not. try_lock: the uncontended common case prints; a
+                // fault-interrupted holder skips the line — the heal itself needs no lock, and the
+                // EC0_HEALS counter still records it. The fbcon mirror (its own locks) is skipped
+                // too; the headless Orin loses nothing.
+                // JB1f dedup: a same-PC streak prints its first strike then every 8th — at loop
+                // frequency each ~100-char line costs ~8 ms of 115200-baud UART, which would turn
+                // a heal storm into a serial-throttled crawl. The counters record every heal.
+                if same == 1 || same % 8 == 0 {
+                    if let Some(mut port) = super::serial::SERIAL_PORT.try_lock() {
+                        use core::fmt::Write;
+                        let _ = writeln!(
+                            port,
+                            ":: A78AE-1941500 heal #{}: EC=0 at ELR={:#x} (D-side {:#010x} valid, same-PC x{}) — ic iallu + retry ::",
+                            total,
+                            elr,
+                            dword,
+                            same,
+                        );
+                    }
+                }
+                unsafe {
+                    core::arch::asm!(
+                        "ic iallu",
+                        "dsb ish",
+                        "isb",
+                        options(nostack, preserves_flags)
+                    );
+                }
+                return 1;
             }
-            unsafe {
-                core::arch::asm!(
-                    "ic iallu",
-                    "dsb ish",
-                    "isb",
-                    options(nostack, preserves_flags)
-                );
-            }
-            return 1;
         }
     }
     let what = match kind {
@@ -498,6 +566,20 @@ extern "C" fn aarch64_fault_handler(kind: u64) -> u64 {
     let ec = (esr >> 26) & 0x3F;
     serial_println!("=== AARCH64 EXCEPTION: {} ===", what);
     serial_println!("ESR={:#x} (EC={:#04x})  ELR={:#x}  FAR={:#x}", esr, ec, elr, far);
+    // JB1f: when heals ran this boot, say so at the fatal stop — distinguishes "the budget/streak
+    // cap declared this PC wedged" from "a fresh non-healable fault" without counting serial
+    // lines (a try_lock-skipped heal prints nothing). Silent when zero (QEMU/pi byte-identical).
+    let heals = EC0_HEALS.load(Ordering::Relaxed);
+    if heals > 0 {
+        serial_println!(
+            "EC0 heal tally: {} total (cap {}), same-PC streak {} at ELR={:#x} (cap {})",
+            heals,
+            EC0_HEAL_CAP,
+            EC0_SAME_PC.load(Ordering::Relaxed),
+            EC0_LAST_ELR.load(Ordering::Relaxed),
+            EC0_SAME_PC_CAP,
+        );
+    }
     // EC 0x00 ("unknown reason") probe — the Orin EC=0 phantom (see arch_arm64.md "JB1 result"):
     // an UNDEF at an ELR whose bytes disassemble innocently smells like the I-side fetching
     // different bytes than the D-side holds (stale I-cache class). Read the instruction word back

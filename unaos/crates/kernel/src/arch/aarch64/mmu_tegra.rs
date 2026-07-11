@@ -520,6 +520,14 @@ pub fn map_fb_region(pa: u64, size: usize) -> bool {
 // the architectural 0x80 spacing) each funnel to a stub that captures the EL's syndrome/fault-address/
 // return-address and tail-calls the shared Rust printer, which prints one line and spins. This turns a
 // dark post-switch metal hang into a recorded syndrome. Deliberately does not touch `exceptions.rs`.
+//
+// JB1f shrank this table's watch to the switch itself: `tegra_early_stop` installs the full healed
+// `exceptions.rs` vectors right after the mmu-regs banner, so Part C covers only the silent `init`
+// internals plus the first three serial lines. The 2026-07-11 bench proved why the wider window was
+// untenable — the A78AE-1941500 phantom struck fbcon's glyph loop (the boot's heaviest ifetch+store
+// stretch) under THIS divergent handler, twice, where the JB1e heal would have retried straight
+// through. Keep Part C divergent (probe-and-spin): anything that faults inside the switch window has
+// no heal-safe context to return to, and the syndrome+spin IS the design.
 
 unsafe extern "C" {
     static tegra_vectors_el2: u8;
@@ -622,8 +630,14 @@ extern "C" fn tegra_fault_handler(esr: u64, far: u64, elr: u64, idx: u64, spsr: 
 /// implementation historically INVERTED it (`bic` instead of `orr`), so BL31-lineage firmware may
 /// leave the bit CLEAR — or actively clear it. CPUECTLR_EL1 is IMPLEMENTATION DEFINED
 /// (S3_0_C15_C1_4 on the A78 family, per TF-A cortex_a78.h); EL3 may gate lower-EL access, so an
-/// access here can itself UNDEF — every step prints BEFORE the touch, and an UNDEF lands in the
-/// instrumented Part-C vector with the announce line naming it.
+/// access here can itself UNDEF. Every step prints BEFORE the touch. Since JB1f this runs under
+/// the HEALED exceptions.rs vectors (not Part-C): a gated read's UNDEF is EC=0 with a VALID
+/// D-side word (the mrs encoding itself), indistinguishable from a phantom, so the heal would
+/// retry it up to the 32-consecutive same-PC cap and THEN go fatal — the dump prints ESR/ELR/FAR
+/// plus the heal tally (streak count + streak ELR), so the announce line above + a 32-streak
+/// fatal right after it still names the culprit in one boot. Today's firmware permits the read
+/// (metal-proven: the JB1d value line prints every boot); this margin note is for a future
+/// firmware that regresses it.
 pub fn a78ae_errata_probe() {
     let midr: u64;
     unsafe {
