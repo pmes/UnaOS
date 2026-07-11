@@ -253,15 +253,36 @@ it **delays irqstorage IRQs** (and everything else) for its duration. Known,
 accepted for now; redesigning console locking is explicitly out of the VPERF
 arc's scope.
 
-### Conditional metal expectation (bench-pending)
+### Metal-confirmed result (round-6 attended rMBP bench, 2026-07-11) ✅
 
-Depends on what the `fbmem` readout shows on the rMBP:
-- mapping is **WC**: post-M3 scroll ≈ one ~28 MiB sequential WC write → order
-  **30–100 scrolled lines/s** (panel-size bound);
-- mapping is **UC**: writes are also uncached-serialized → expect roughly
-  another **~10×** from a follow-up that maps the framebuffer WC (a ~50-line
-  PAT-on-PTE or MTRR-WC arc, named **VPERF-WC**, gated on the metal readout).
+Verbatim readout on the real 2012 rMBP (over FTDI serial):
 
-Metal confirm rides the next attended rMBP bench (usbdebug build; watch for
-the `:: fbcon: cached-RAM shadow attached ::` line, the `fbmem` readout, and
-`scenario ... vread=0`).
+```
+:: fbcon: cached-RAM shadow attached — VRAM is now write-only ::
+:: vperf: fbmem mtrr=UC(var-range) pte=0x900000e3(l2) pat=WB eff=UC fb=0x90020000 ::
+:: vperf: display 8086:0166 class 030000 @ 0:2.0 ::            (Intel HD 4000)
+:: vperf: display 10de:0fd5 class 030000 @ 1:0.0 ::            (NVIDIA GT 650M)
+:: vperf: display 10de:0fd5 bar1 owns fb (base=0x90000000) ::  (GT 650M scans out — gmux default)
+:: vperf: scenario scroll=… vread=0 px=… scrolls=… lines=400 ::
+```
+
+- **The M3 cached-RAM shadow is METAL-CONFIRMED**: `fbcon: cached-RAM shadow attached` fired and the
+  scroll scenario measured **`vread=0`** over 400 scrolled lines — zero uncached-VRAM reads on real
+  hardware, matching the QEMU 1.22 GB→0. The shadow works on silicon.
+- **`eff=UC` → VPERF-WC is a GO** (no longer bench-gated): the framebuffer is UNCACHED (var-range MTRR
+  UC, PAT=WB unused in the l2 PTE), NOT write-combining, so the ~10× WC follow-up is real. The metal
+  fact it needed is now in hand (UC; fb in the GT 650M's `bar1` @ `0x90000000`), so **VPERF-WC becomes a
+  normal codable arc verified at the next bench**, not a bench-first one.
+- GPU topology exactly as the interface model predicted: Intel HD 4000 (`8086:0166`) + NVIDIA GT 650M
+  (`10de:0fd5`), the GT 650M owning the framebuffer via the gmux default.
+
+**VPERF-OBS — the raw_print console-path lesson (fix `bfa1711`, 2026-07-11).** On the FIRST bench boot
+NONE of the `:: vperf: …` readout lines printed on metal, though QEMU had shown them all. Root cause:
+`vperf::raw_print` wrote ONLY the SERIAL1 (16550) UART leg, which is `None` on the rMBP (no 16550 — the
+FTDI console exists precisely because of that), so every readout line was computed and silently dropped;
+the surviving lines used `serial_println!`, which hits the FTDI boot-capture ring leg. The fix has
+`raw_print` also feed `ftdi::mirror` (the ring leg), and NEVER the fbcon or selftest mirrors — both
+raw_print constraints preserved (try_lock-only, never the FBCON lock; QEMU logs byte-unchanged, since
+the UART leg already reaches `serial.log` and the ring is not replayed there). **The lesson: QEMU-visible
+≠ metal-visible — a diagnostic must assert the console PATH it will actually reach on the target, not
+merely that its code path ran.**
