@@ -6206,6 +6206,13 @@ fn sys_open(name_ptr: u64, name_len: u64, mode: u64) -> i64 {
     let Ok(name) = core::str::from_utf8(&namebuf[..n]) else {
         return ENOENT; // a non-ASCII/UTF-8 name matches no 8.3 entry
     };
+    // K1 M4: the KERNEL owns UNAFS.ATR — the on-disk ACL store must never be readable or writable through an EL0
+    // File capability (that would let an untrusted blob read every principal or forge a row). Deny the open
+    // outright (case-insensitive, matching find_located's 8.3 semantics), BEFORE any lookup/claim, so it is a
+    // clean -EACCES with nothing to unwind. No EL0 fixture opens it, so the battery path is byte-identical.
+    if name.eq_ignore_ascii_case(ATR_NAME) {
+        return EACCES;
+    }
     // 2. Read-only lookups — nothing claimed yet, so each failure returns cleanly.
     let fs = match crate::fs::fat::mount() {
         Ok(fs) => fs,
@@ -8200,6 +8207,9 @@ pub fn u7_launcher(demo_cpu: usize) {
     // from UNAFS.ATR), and enforce with real stamped principals. Emits its own uncounted `:: K1-persist: … PASS ::`
     // line (the 24th) and fully cleans up. After k1_atr_selftest so it inherits a valid UNAFS.ATR image.
     k1_persist_launcher();
+    // K1 M4: the fail-closed proof — a TORN on-disk row yields a PUBLIC file at mount (never a forged owner).
+    // Its own uncounted `:: K1-corrupt: … PASS ::` line (the 25th); fully self-cleaning.
+    k1_corrupt_launcher();
 }
 
 /// F2 M3 witness worker — the `demo_cpu` half of the cross-core FAT_MUTATION stress. `fn(usize)` for
@@ -9432,6 +9442,151 @@ fn k1_persist_launcher() {
         ":: K1-persist: UNAFS.ATR owner/grants SURVIVE REBOOT — rebuild+enforce {} (owner-by-name admit; impostor+anon deny; grantee R admit/W deny; public stays public) [w={:#05x}] ::",
         if w == K1PERSIST_ALL { "PASS" } else { "FAIL" },
         w
+    );
+}
+
+// K1 M4: the corrupt-attr proof — scratch file whose persisted row is TORN on disk.
+const K1C_FILE: &str = "CORRF.BIN";
+
+/// K1 M4: reset the corrupt-attr scratch state — delete CORRF + REGROW UNAFS.ATR to a fresh empty image (a
+/// torn row's bad CRC makes it un-findable by `atr_clear_row`, so the whole rows region is rewritten to
+/// guarantee no corrupt row lingers on the stateful metal card) + clear the scratch stamp.
+fn k1_corrupt_cleanup() {
+    slot_ppid_clear(K1P_SA_OWN);
+    if let Ok(fs) = crate::fs::fat::mount() {
+        if let Ok((de, lba, off)) = fs.find_located(K1C_FILE) {
+            owned_clear(lba, off as u32);
+            let _ = fs.delete_located(lba, off, de.first_cluster());
+        }
+        let bind = atr_live_binding(&fs);
+        if let Ok((de, lba, off)) = fs.find_located(ATR_NAME) {
+            if de.size as usize >= ATR_FILE_LEN {
+                let img = atr_empty_image(&bind);
+                let _ = fs.write_grow(de.first_cluster(), de.size, lba, off, 0, &img);
+            }
+        }
+    }
+}
+
+/// K1 M4: PROVE the read-side FAIL-CLOSED rule end to end — a TORN owner row on disk must yield a PUBLIC file
+/// at mount, NEVER a forged owner. Persist a named-owner file, flip a byte in its on-disk row (busting the row
+/// CRC), simulate a reboot, rebuild, and assert the rebuild DROPPED the row so an ANONYMOUS caller is now
+/// ADMITTED (the file is public — the well-defined pre-U6 baseline), where a valid row would have DENIED it
+/// (M3). Kernel-side + deterministic; self-cleaning. `true` iff fail-closed held.
+fn k1_corrupt_check() -> bool {
+    let fs = match crate::fs::fat::mount() {
+        Ok(f) => f,
+        Err(_) => return false,
+    };
+    slot_ppid_stamp(K1P_SA_OWN, PrincipalRecord::program_name("PERSCOR"));
+    let p_c = slot_ppid_of(K1P_SA_OWN);
+    let Some(name11) = atr_name_from_str(K1C_FILE) else {
+        k1_corrupt_cleanup();
+        return false;
+    };
+    let (de, lba, off) = match fs.create_in_root(K1C_FILE, 0x20) {
+        Ok(t) => t,
+        Err(_) => {
+            k1_corrupt_cleanup();
+            return false;
+        }
+    };
+    let (c, sz) = match fs.write_grow(de.first_cluster(), de.size, lba, off, 0, &[0xC1u8; 32]) {
+        Ok((_, new_size, first)) => (first, new_size),
+        Err(_) => {
+            k1_corrupt_cleanup();
+            return false;
+        }
+    };
+    let gen_c = ASID_GEN[K1P_SA_OWN as usize].load(Ordering::Acquire);
+    owned_set_owner(lba, off as u32, K1P_SA_OWN, gen_c, p_c);
+    let empty_grants = [(PrincipalRecord::NONE, 0u32); NFGRANT];
+    if !atr_persist_row(&fs, name11, c, sz, lba, off as u32, p_c, &empty_grants) {
+        k1_corrupt_cleanup();
+        return false;
+    }
+
+    // TEAR the persisted row: flip one byte in its owner field so the per-row CRC no longer matches.
+    let torn = k1_tear_persisted_row(&fs, lba, off as u32);
+
+    // Reboot sim -> rebuild. The torn row (bad CRC -> atr_parse_row None) is DROPPED, so no owner installs.
+    owned_clear(lba, off as u32);
+    let fs2 = match crate::fs::fat::mount() {
+        Ok(f) => f,
+        Err(_) => {
+            k1_corrupt_cleanup();
+            return false;
+        }
+    };
+    let _ = atr_rebuild_into_owned(&fs2);
+    let anon_public = match fs2.find_located(K1C_FILE) {
+        Ok((_, rlba, roff)) => {
+            // Fail-closed: the file is PUBLIC now -> an ANONYMOUS caller is ADMITTED (a valid row would DENY).
+            owned_access_ok(rlba, roff as u32, K1P_SA_OWN, gen_c, CAP_READ | CAP_WRITE, PrincipalRecord::NONE)
+        }
+        Err(_) => false,
+    };
+
+    k1_corrupt_cleanup();
+    torn && anon_public
+}
+
+/// K1 M4: flip one byte in the ON-DISK owner field of the UNAFS.ATR row for `(dir_lba, dir_off)`, busting its
+/// per-row CRC (a synthetic torn-write). UNDER ns for the single-row write. `false` if the row isn't found or
+/// the write fails. Test-only.
+fn k1_tear_persisted_row(fs: &crate::fs::fat::FatFs, dir_lba: u64, dir_off: u32) -> bool {
+    let (de, _l, _o) = match fs.find_located(ATR_NAME) {
+        Ok(t) => t,
+        Err(_) => return false,
+    };
+    if (de.size as usize) < ATR_FILE_LEN {
+        return false;
+    }
+    let (afc, asz) = (de.first_cluster(), de.size);
+    let _ns = ns_lock();
+    let mut rows: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
+    if fs
+        .read_at(afc, asz, ATR_HEADER_LEN as u32, &mut rows, ATR_ROW_STRIDE * ATR_ROWS)
+        .is_err()
+        || rows.len() != ATR_ROW_STRIDE * ATR_ROWS
+    {
+        return false;
+    }
+    for i in 0..ATR_ROWS {
+        let start = ATR_ROW_STRIDE * i;
+        let mut arr = [0u8; ATR_ROW_STRIDE];
+        arr.copy_from_slice(&rows[start..start + ATR_ROW_STRIDE]);
+        if let Some(r) = atr_parse_row(&arr) {
+            if r.dir_lba == dir_lba && r.dir_off == dir_off {
+                arr[40] ^= 0xFF; // flip a byte in the owner principal field -> row CRC now fails
+                let o = (ATR_HEADER_LEN + start) as u32;
+                return fs.write_at(afc, asz, o, &arr).unwrap_or(0) == ATR_ROW_STRIDE;
+            }
+        }
+    }
+    false
+}
+
+/// K1 M4 launcher + verdict — the fail-closed corrupt-attr proof, riding the U7 kernel task after
+/// k1_persist_launcher. Emits its own uncounted `:: K1-corrupt: … PASS ::` line (the K1-atr `<noun> PASS`
+/// idiom, never `-> PASS`/`: PASS`), so the fixture count stays 23.
+fn k1_corrupt_launcher() {
+    static DONE: AtomicBool = AtomicBool::new(false);
+    if DONE.swap(true, Ordering::Relaxed) {
+        return;
+    }
+    if crate::drivers::block::info().is_none() {
+        return; // no SD -> skip silently
+    }
+    if let Ok(fs) = crate::fs::fat::mount() {
+        if fs.find_in_root(K1C_FILE).is_ok() {
+            k1_corrupt_cleanup(); // a stale scratch file from an interrupted run
+        }
+    }
+    let ok = k1_corrupt_check();
+    serial_println!(
+        ":: K1-corrupt: UNAFS.ATR torn owner row fails closed to PUBLIC at mount {} — rebuild drops the bad-CRC row; anonymous open admitted (no forged owner) ::",
+        if ok { "PASS" } else { "FAIL" }
     );
 }
 
