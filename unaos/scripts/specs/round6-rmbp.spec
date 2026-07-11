@@ -1,4 +1,7 @@
-# round6-rmbp.spec — the ROUND 6 opening attended rMBP bench, Boot 1.
+# round6-rmbp.spec — the ROUND 6 attended rMBP bench, Boot 1.
+# 2026-07-11 POST-BENCH: ALL former PENDINGs fired on the real rMBP (mbench 29/29 twice,
+# pristine card + pristine re-confirm) and are PROMOTED to REQUIRE; COUNT 24→25 (S5 counted).
+# A 24-with-zero-FAILs remains the ledgered ±1 console drop — eyeball before suspecting.
 #   Source witness list: ~/.claude/plans/unaos-round6-rmbp-bench.md §Boot 1.
 #   Build:  UNAOS_VIDEOBENCH=1 UNAOS_USBDEBUG=1 ./arroyo esp-x86 (knob-ON, built LAST)
 #   Run:    ./arroyo mbench --follow ~/rmbp-serial.log --spec scripts/specs/round6-rmbp.spec --timeout 300
@@ -29,7 +32,7 @@ REQUIRE bx-blockreq: PASS
 REQUIRE S3: synchronous write-through.*-> PASS
 
 # --- the full U-chain, knob-ON (all captured 2026-07-10) ----------------------------
-COUNT 24 -> PASS
+COUNT 25 -> PASS
 REQUIRE U2-0c: self-NMI taken on IST -> PASS
 REQUIRE U2-0c: canonical-rcx guard refuses
 REQUIRE U1a: user exited ok
@@ -54,28 +57,28 @@ REQUIRE U6gx: UnaFS owner/grants.*-> PASS
 REQUIRE xHCI: Disk
 
 # --- S4 first metal (landed 2026-07-10 late — never captured on metal) --------------
-PENDING S4: grow/create/delete SYNCHRONOUS in-syscall.*-> PASS
+REQUIRE S4: grow/create/delete SYNCHRONOUS in-syscall.*-> PASS
 
 # --- VPERF (this boot DECIDES VPERF-WC — all landed post-bench, never on metal) -----
 # THE DECIDER: eff=WC → VPERF-WC dead; eff=UC (or any non-WC) → VPERF-WC triggers
 # bench-FIRST. Record the fbmem line VERBATIM in the seat baton either way.
-PENDING vperf: fbmem mtrr=.*pte=.*pat=.*eff=.*fb=
+REQUIRE vperf: fbmem mtrr=.*pte=.*pat=.*eff=.*fb=
 # Expect BOTH GPUs named (GT 650M scans out via gmux default; HD 4000 also present).
-PENDING vperf: display.*class
-PENDING vperf: display.*owns fb
+REQUIRE vperf: display.*class
+REQUIRE vperf: display.*owns fb
 # WATCH EXPLICITLY: the one-shot try_lock attach can silently skip under AP
 # contention (ledgered review note) — no line = shadow not live.
-PENDING fbcon: cached-RAM shadow attached
+REQUIRE fbcon: cached-RAM shadow attached
 # QEMU showed scenario vread 1.22 GB→0; the metal claim is vread=0.
-PENDING vperf: scenario.*vread=0
-PENDING vperf: scenario done
+REQUIRE vperf: scenario.*vread=0
+REQUIRE vperf: scenario done
 
 # --- zero faults (defaults -> FAIL / FAIL :: / PANIC always on) ----------------------
 FORBID EXCEPTION:
 
 # --- STOR-1 S5 (landed 2026-07-11, never on metal — the bench build is knob-ON so these
 # --- fire on Boot 1; promote to REQUIRE after first capture) ---------------------------
-PENDING S5: cross-process read serves LIVE shared backing
+REQUIRE S5: cross-process read serves LIVE shared backing
 # The service-task boot line gained ", PRIO_HIGH" — the existing REQUIRE prefix still matches.
 # u6gx's unchanged PASS line is now ALSO the deadlock-closure witness knob-on-FAT (a u6gx
 # hang/FAIL here = the S5 scheduler fix or the service core's LVT timer, NOT plain ACL).
