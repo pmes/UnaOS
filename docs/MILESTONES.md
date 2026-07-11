@@ -10,6 +10,27 @@ Legend: **✅ metal-confirmed** · **🔬 QEMU-green, metal pending** · dates I
 
 ---
 
+## hw-jetson track — 2026-07-11 (JB1f — the unhealed early-vector window, closed)
+
+### JB1f — the healed vectors now cover the whole tegra boot; nest-safe, storm-proof EC0 heal 🔬 `hw-jetson`
+- **What (`85f74f8`):** the round-6 bench caught the A78AE-1941500 phantom striking fbcon's glyph loop
+  fatally, 2/2 boots, inside the window between `mmu_tegra`'s probe-and-spin Part-C vectors (installed
+  at the MMU switch) and `exceptions::install` at JM4 — the stretch that mirrors the whole early boot
+  log onto the panel, with no heal armed. Fix: (1) install the healed `exceptions.rs` vectors right
+  after the mmu-regs banner, before fbcon mirrors (Part C keeps the three-line switch window);
+  (2) `__vec_sync` banks ELR/SPSR/SP_EL0 with a runtime-`CurrentEL` bank select, so a nested sync
+  fault inside the handler can't retarget the heal's eret (the diagnosis panel's confirmed latent
+  defect #1); (3) heal budget 64 → 1024 + a consecutive-same-PC cap (32, the wedged-core stop) +
+  `fetch_add` counters + print dedup + a nonzero heal tally at the fatal print and at `install()`
+  (defect #2). The diagnosis panel **exonerated the VPERF video rewrite** (all deltas
+  `cfg(x86_64)`; padded stride already handled) — root cause is erratum 1941500 relocated by binary
+  layout shift; the pattern-sensitivity ledger note lives in `arch_arm64.md §JB1f`.
+- **Tested (QEMU, byte-equivalent — the heal never fires there):** `check` + `UNAOS_TEGRA=1 check`
+  both arches; `test-arm 22` MISSION; `UNAOS_GICV3=1 test-arm 40` CAPSTONE 6/6; `kernel8` +
+  `kernel8-test` 23 PASS 0 FAIL + CAPSTONE 6/6 + K1 witnesses; `esp-jetson` links, 108 `tegra:`
+  strings. Zero x86 delta. **Metal:** attended round-6 bench — ≥3 boots surviving `panel LIVE`
+  (heal lines allowed, silent hang = FAIL), then the JD6 bench card to completion on the same kernel.
+
 ## hw-jetson track — 2026-07-11 (JD6 — the panel write path reaches the whole tree: subdirectory writes)
 
 ### JD6 — `touch` / `write` / `append` / `rm` in ANY subdirectory the shell can `cd` into 🔬 `hw-jetson`
