@@ -1585,7 +1585,7 @@ impl FatFs {
             }
             let next = self.fat_entry(cluster)?;
             if self.is_eoc(next) {
-                return Err(FatError::NoSpace); // root-dir chain full; extending it is out of scope
+                return Err(FatError::NoSpace); // directory chain full (root or subdir); extending it is out of scope
             }
             if self.is_bad(next) || next < 2 {
                 return Err(FatError::BadChain);
