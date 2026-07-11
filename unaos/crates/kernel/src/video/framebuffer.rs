@@ -102,6 +102,9 @@ impl FrameBuffer {
     /// offset is checked against the buffer length.
     #[inline]
     pub fn put_pixel(&self, x: usize, y: usize, color: u32) {
+        // VPERF (bench builds only): count per-pixel pokes — the per-glyph/per-fill cost model.
+        #[cfg(all(target_arch = "x86_64", feature = "videobench"))]
+        crate::video::vperf::on_put_pixel();
         if self.base == 0 || x >= self.info.width || y >= self.info.height {
             return;
         }
@@ -244,6 +247,10 @@ impl FrameBuffer {
         if shift >= total {
             return;
         }
+        // VPERF (bench builds only): count the memmove payload, attributing the source read to
+        // VRAM when this surface IS the real framebuffer (the uncached-PCIe read being measured).
+        #[cfg(all(target_arch = "x86_64", feature = "videobench"))]
+        crate::video::vperf::on_scroll((total - shift) as u64, self.base);
         unsafe {
             core::ptr::copy(
                 (self.base + shift) as *const u8,

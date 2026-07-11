@@ -154,6 +154,10 @@ pub fn init(fb_addr: u64, fb_len: usize, info: FrameBufferInfo) {
     if fb_addr == 0 || fb_len == 0 || info.width == 0 || info.height == 0 {
         return;
     }
+    // VPERF (bench builds only): register the real framebuffer range, so scroll instrumentation
+    // can attribute source reads to VRAM (heap shadows/back buffers never match this range).
+    #[cfg(all(target_arch = "x86_64", feature = "videobench"))]
+    crate::video::vperf::set_vram_range(fb_addr as usize, fb_len);
     crate::arch::without_interrupts(|| {
         let mut c = FBCON.lock();
         c.fb.init(fb_addr as usize, fb_len, info);

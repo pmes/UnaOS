@@ -48,6 +48,9 @@ fn main() {
     // (STOR-1) instead of the staged-buffer path. x86_64 only; a no-op on the aarch64 media the arroyo
     // script builds. Metal-pending, so it stays opt-in.
     if std::env::var("UNAOS_IRQSTORAGE").is_ok() { feats.push("irqstorage"); }
+    // VPERF: x86 video-path bench instrumentation (scroll/VRAM-read counters, fbmem readout,
+    // display-BAR probe, scripted scroll scenario). x86_64-only module; default OFF.
+    if std::env::var("UNAOS_VIDEOBENCH").is_ok() { feats.push("videobench"); }
     // `tegra` (Jetson Orin / Tegra234 UART) is an aarch64 board feature; mapped here for parity with
     // the `pi` knob, though this x86_64 builder never produces aarch64 media (the `arroyo` script does).
     if std::env::var("UNAOS_TEGRA").is_ok() { feats.push("tegra"); }

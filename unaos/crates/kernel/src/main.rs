@@ -706,6 +706,11 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
             #[cfg(target_arch = "x86_64")]
             unaos_kernel::arch::syscall::u6bx_probe_once();
             unaos_kernel::drivers::xhci::log_summary_once();
+            // VPERF (videobench knob, x86 only): the deterministic scripted scroll scenario —
+            // one-shot, fires after the one-shot fixtures above have gone quiet, so the screen
+            // settles on the scenario tail (what the DONE-gate screendump compares).
+            #[cfg(all(target_arch = "x86_64", feature = "videobench"))]
+            unaos_kernel::video::vperf::scenario_tick();
             while let Some(event) = unaos_kernel::pal::next_event() {
                 match event {
                     unaos_kernel::pal::Event::Key(c) => {
