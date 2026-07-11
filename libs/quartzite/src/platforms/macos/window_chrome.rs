@@ -146,6 +146,10 @@ pub fn create_vessel_window(
     window.setTitle(&NSString::from_str(title));
     window.setDelegate(Some(ProtocolObject::from_ref(&*window_delegate)));
 
+    // A sane floor so a resize can never collapse the content into nothing;
+    // everything above this scales from the live bounds.
+    window.setContentMinSize(NSSize::new(160.0, 48.0));
+
     (window, window_delegate)
 }
 

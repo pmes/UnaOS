@@ -59,6 +59,7 @@ message bus, a selection of handlers, and a GUI window.
 | Vessel | Role |
 | --- | --- |
 | `lumen` | AI-centric companion. The reference GUI vessel. |
+| `pulse` | System monitor: numbered per-core CPU segment bars (BeOS Pulse heir). Host sampler behind the `PulseSource` seam; a UnaOS-kernel telemetry feed is the banked replacement source. |
 | `una` | Code-focused IDE. **Currently parked** (excluded from the workspace build). |
 | `facet` | Image / raster viewer. |
 | `apps/cli/*` | Command-line tools: `unafs`, `vertex`, `sentinel`, `unafs_bench`. |
@@ -100,6 +101,10 @@ host and routes user input back to the logic layer as `SMessage`s.
 ### Public API
 - `Backend::new(app_id, …, bootstrap).run()` — creates the host
   application/window and runs the platform event loop.
+- `Backend::new_vessel(app_id, title, content_size, build_view).run()` — the
+  lightweight sibling for single-view vessels (e.g. `pulse`): one plain titled
+  window whose entire content is the view returned by `build_view` (macOS
+  backend; other backends as they mature).
 - `Spline::bootstrap(window, tx_event, app_state, rx_synapse, &workspace_state)
   -> BootstrapPayload` — builds the native view tree for a given workspace and
   wires it to the message bus.
@@ -173,6 +178,7 @@ topology and republishes `MatrixEvent::TopologyMutated` when the tree changes.
 | Quartzite Qt backend | Partial |
 | Quartzite Windows / `unaos` backends | Not implemented |
 | Lumen vessel | Implemented |
+| Pulse vessel (system monitor) | Implemented (macOS backend) |
 | Una vessel (IDE) | Parked |
 | Elessar snapshot / packaging pipeline | Not implemented (detection only) |
 
