@@ -102,6 +102,9 @@ impl FrameBuffer {
     /// offset is checked against the buffer length.
     #[inline]
     pub fn put_pixel(&self, x: usize, y: usize, color: u32) {
+        // VPERF (bench builds only): count per-pixel pokes — the per-glyph/per-fill cost model.
+        #[cfg(all(target_arch = "x86_64", feature = "videobench"))]
+        crate::video::vperf::on_put_pixel();
         if self.base == 0 || x >= self.info.width || y >= self.info.height {
             return;
         }
@@ -133,9 +136,76 @@ impl FrameBuffer {
         }
     }
 
+    /// VPERF M4 (x86 only): encode `color` as the little-endian 4-byte pixel this surface
+    /// stores, when the layout is a full 4-byte pixel (bpp 4, Rgb/Bgr). Lets callers hoist the
+    /// per-pixel format decode out of their inner loops (`put_raw4` / the `fill_rows` fast
+    /// path). The X byte is encoded 0: `put_pixel` leaves it untouched, but every store this
+    /// kernel allocates starts zeroed and scan-out ignores it, so the visible bytes agree.
+    #[cfg(target_arch = "x86_64")]
+    #[inline]
+    pub fn encode4(&self, color: u32) -> Option<u32> {
+        if self.info.bytes_per_pixel != 4 {
+            return None;
+        }
+        let r = (color >> 16) & 0xFF;
+        let g = (color >> 8) & 0xFF;
+        let b = color & 0xFF;
+        match self.info.pixel_format {
+            PixelFormat::Rgb => Some(r | (g << 8) | (b << 16)),
+            PixelFormat::Bgr => Some(b | (g << 8) | (r << 16)),
+            _ => None,
+        }
+    }
+
+    /// VPERF M4 (x86 only): write one pre-encoded 4-byte pixel (from [`encode4`](Self::encode4)
+    /// of this surface). Same bounds checks as `put_pixel`, no per-pixel format match. Unaligned
+    /// write: a heap `Vec<u8>` shadow store only guarantees byte alignment (compiles to a plain
+    /// `mov` on x86 either way).
+    #[cfg(target_arch = "x86_64")]
+    #[inline]
+    pub fn put_raw4(&self, x: usize, y: usize, raw: u32) {
+        #[cfg(feature = "videobench")]
+        crate::video::vperf::on_put_pixel();
+        if self.base == 0 || x >= self.info.width || y >= self.info.height {
+            return;
+        }
+        let offset = (y * self.info.stride + x) * 4;
+        if offset + 4 > self.len {
+            return;
+        }
+        unsafe { core::ptr::write_unaligned((self.base + offset) as *mut u32, raw) };
+    }
+
     /// Fill pixel rows `[y0, y1)` (clamped to the frame) with a colour.
     pub fn fill_rows(&self, y0: usize, y1: usize, color: u32) {
         let y_end = y1.min(self.info.height);
+        // VPERF M4 (x86 only): word-wide band fill for full-4-byte-pixel formats — the format
+        // decode and bounds checks hoisted to once per row instead of once per pixel. Writes
+        // only the visible width (the stride gap stays untouched, like `put_pixel`).
+        #[cfg(target_arch = "x86_64")]
+        if let Some(raw) = self.encode4(color) {
+            if self.base == 0 {
+                return;
+            }
+            let row_bytes = self.info.stride * self.info.bytes_per_pixel;
+            let w = self.info.width;
+            for y in y0..y_end {
+                let off = y * row_bytes;
+                // Clamp to the buffer like `put_pixel` does per pixel, so a firmware-short
+                // framebuffer (len < stride*height*bpp — the Apple Retina GOP quirk) still gets
+                // its partial last row filled instead of dropped.
+                let wmax = (self.len.saturating_sub(off) / 4).min(w);
+                for x in 0..wmax {
+                    unsafe {
+                        core::ptr::write_unaligned((self.base + off + x * 4) as *mut u32, raw)
+                    };
+                }
+                if wmax < w {
+                    break;
+                }
+            }
+            return;
+        }
         for y in y0..y_end {
             for x in 0..self.info.width {
                 self.put_pixel(x, y, color);
@@ -244,6 +314,10 @@ impl FrameBuffer {
         if shift >= total {
             return;
         }
+        // VPERF (bench builds only): count the memmove payload, attributing the source read to
+        // VRAM when this surface IS the real framebuffer (the uncached-PCIe read being measured).
+        #[cfg(all(target_arch = "x86_64", feature = "videobench"))]
+        crate::video::vperf::on_scroll((total - shift) as u64, self.base);
         unsafe {
             core::ptr::copy(
                 (self.base + shift) as *const u8,

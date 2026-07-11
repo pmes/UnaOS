@@ -652,6 +652,14 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     // on metal. (Net service is intentionally skipped here so a non-e1000 NIC isn't poked.)
     #[cfg(feature = "usbdebug")]
     {
+        // VPERF M3: attach fbcon's cached-RAM shadow at the post-heap seam. From here the console
+        // scrolls in cached RAM and the framebuffer only receives write-only blits — the
+        // uncached-VRAM-read scroll (the rMBP's "nightmarishly slow" text output) is gone. This
+        // is the LATE-ATTACH site by design: fbcon initialises pre-heap, and GUI builds never
+        // reach this call (they detach fbcon instead; the Screen back buffer owns the heap
+        // budget, so a second ~28 MiB shadow there would OOM the 48 MiB heap on metal).
+        #[cfg(target_arch = "x86_64")]
+        unaos_kernel::video::fbcon::attach_shadow();
         // Clear the boot spam so the (post-boot) hot-plug enumeration + live input own the screen.
         unaos_kernel::video::fbcon::clear();
         serial_println!(":: ============== USB DEBUG MODE ============== ::");
@@ -706,6 +714,11 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
             #[cfg(target_arch = "x86_64")]
             unaos_kernel::arch::syscall::u6bx_probe_once();
             unaos_kernel::drivers::xhci::log_summary_once();
+            // VPERF (videobench knob, x86 only): the deterministic scripted scroll scenario —
+            // one-shot, fires after the one-shot fixtures above have gone quiet, so the screen
+            // settles on the scenario tail (what the DONE-gate screendump compares).
+            #[cfg(all(target_arch = "x86_64", feature = "videobench"))]
+            unaos_kernel::video::vperf::scenario_tick();
             while let Some(event) = unaos_kernel::pal::next_event() {
                 match event {
                     unaos_kernel::pal::Event::Key(c) => {

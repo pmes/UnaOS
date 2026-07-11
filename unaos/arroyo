@@ -46,6 +46,12 @@ _feats=""
 # STOR-1: route x86 storage syscalls through the interrupt-driven storage service task (opt-in;
 # metal-pending). x86_64 only — a no-op on the aarch64 media below.
 [ -n "${UNAOS_IRQSTORAGE:-}" ] && _feats="${_feats}irqstorage,"
+# VPERF: x86 video-path bench instrumentation (scroll/VRAM-read counters, fbmem memory-type
+# readout, display-BAR probe, scripted scroll scenario). x86_64-only module — aarch64 media are
+# byte-identical with this on or off.
+[ -n "${UNAOS_VIDEOBENCH:-}" ] && _feats="${_feats}videobench,"
+# VPERF M2: the fbcon viewport-cap bench lever (implies videobench). x86_64 only.
+[ -n "${UNAOS_VIDEOCAP:-}" ] && _feats="${_feats}videocap,"
 [ -n "${UNAOS_TEGRA:-}" ] && _feats="${_feats}tegra,"
 if [ -n "$_feats" ]; then
     KERNEL_FEATURES="--features ${_feats%,}"
@@ -289,11 +295,29 @@ test_x86_64() {
     build_user_hello_x86   # U2: target/hello.bin — the builder copies it onto the ESP
     build_kernel_x86_64
 
+    # VPERF: UNAOS_QMP_SHOT=<png path> arms a QMP framebuffer screendump of the headless x86 run
+    # (the same qmp_shoot.py technique kernel8-test uses). The port default (4464) auto-bumps past
+    # busy listeners so parallel worktree sessions never collide (UNAOS_QMP_PORT overrides the
+    # start). The shooter runs in the background: it retries the QMP connect while the builder
+    # compiles, waits UNAOS_QMP_WAIT (default secs-3) after QEMU appears, then dumps — inside the
+    # builder's kill window. `|| true` guards keep this additive under `set -e`.
+    local qmp_pid=""
+    if [ -n "${UNAOS_QMP_SHOT:-}" ]; then
+        local qmp_port="${UNAOS_QMP_PORT:-4464}"
+        while lsof -iTCP:"$qmp_port" -sTCP:LISTEN >/dev/null 2>&1; do qmp_port=$((qmp_port + 1)); done
+        export UNAOS_QEMU_EXTRA="${UNAOS_QEMU_EXTRA:-} -qmp tcp:127.0.0.1:${qmp_port},server,nowait"
+        python3 "${WORKSPACE_DIR}/scripts/qmp_shoot.py" --port "$qmp_port" --connect-timeout 600 \
+            --wait "${UNAOS_QMP_WAIT:-$((secs - 3))}" --out "${UNAOS_QMP_SHOT}" 2>/dev/null &
+        qmp_pid=$!
+        echo -e "${COLOR_YELLOW}⚡ QMP screendump armed: port ${qmp_port} -> ${UNAOS_QMP_SHOT}${COLOR_RESET}"
+    fi
+
     echo -e "${COLOR_CYAN}⚡ Headless x86_64 test (${secs}s). Serial -> ${SERIAL_LOG}${COLOR_RESET}"
     rm -f "$SERIAL_LOG"
     cd "$WORKSPACE_DIR/builder"
     UNAOS_SERIAL_LOG="$SERIAL_LOG" UNAOS_TEST_SECS="$secs" cargo +nightly run --release
     cd "$WORKSPACE_DIR"
+    if [ -n "$qmp_pid" ]; then wait "$qmp_pid" 2>/dev/null || true; fi
 
     echo ""
     echo -e "${COLOR_PURPLE}════════════ SERIAL LOG (${SERIAL_LOG}) ════════════${COLOR_RESET}"

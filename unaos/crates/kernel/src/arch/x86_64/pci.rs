@@ -138,6 +138,14 @@ fn enable_intel_xhci_ports(bus: u8, dev: u8, func: u8) {
 }
 
 pub fn init(_dtb_addr: u64, _dtb_size: usize) {
+    // VPERF (bench builds only): read-only display diagnostics — the effective framebuffer memory
+    // type (MTRR + live PTE + PAT) and which class-0x03 device's BAR owns the fb address. Rides
+    // the PCI-init point so the lines land once, early, in every knob-ON boot log.
+    #[cfg(feature = "videobench")]
+    {
+        crate::video::vperf::report_fbmem();
+        crate::video::vperf::pci_display_probe();
+    }
     if let Some((xhci_phys_addr, bus, dev, func)) = crate::drivers::pci::PciScanner::scan() {
         serial_println!(":: x86_64 PCI Init: Found xHCI at {:#x} ::", xhci_phys_addr);
 

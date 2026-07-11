@@ -31,6 +31,11 @@
 pub mod fbcon;
 pub mod framebuffer;
 pub mod screen;
+// VPERF instrumentation (counters, fbmem readout, PCI display probe, scripted scroll scenario).
+// x86-only AND knob-gated: with the feature off — or on aarch64 regardless — nothing here
+// compiles, so those artifacts stay byte-identical.
+#[cfg(all(target_arch = "x86_64", feature = "videobench"))]
+pub mod vperf;
 
 pub use framebuffer::FrameBuffer;
 pub use screen::Screen;
