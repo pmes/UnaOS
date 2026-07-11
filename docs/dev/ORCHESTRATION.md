@@ -224,6 +224,19 @@ pi/jetson-only (the x86 FTDI console is TX-only). An attended bench is now
 run-the-script-get-pass/fail — which is what makes a per-round metal gate
 affordable rather than a tax.
 
+### The bench-debug boundary (Peter's calibration, 2026-07-11)
+
+Metal debugging is EXECUTOR work. When a bench goes sideways (unexpected fault,
+metal-vs-QEMU divergence), the seat's live role is **triage coordinator**: watch
+serial, decode and adjudicate the evidence, launch read-only diagnosis panels,
+write the fix brief, review and merge the fix. The hands-on loop — building
+candidate kernels, flashing media, driving bisect boots — belongs to the track's
+executor session or, when the bug spans lanes, a **dedicated debugging session**
+(Peter-kickoff, cross-lane grant written in its brief). Precedent: the round-6
+jetson boot-crash triage, where the seat drove the bisect itself — ratified
+afterward as the wrong altitude; the diagnosis was sound but the driving seat
+belonged to a debug session.
+
 ## Guardrails specific to this seat
 
 - Fable reviews **before** merge and **before** metal, always. QEMU-green ≠
