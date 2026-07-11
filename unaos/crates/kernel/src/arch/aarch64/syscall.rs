@@ -8196,6 +8196,10 @@ pub fn u7_launcher(demo_cpu: usize) {
     // K1 M1: the on-disk owner/grants (UNAFS.ATR) format + round-trip — runs LAST (its disk I/O can never
     // perturb the 23 fixtures or the witnesses); emits its own `:: K1-atr: ::` line (not a `-> PASS`).
     k1_atr_selftest();
+    // K1 M3: the two-phase remount-survival proof — persist an owned+granted file, simulate a reboot (rebuild
+    // from UNAFS.ATR), and enforce with real stamped principals. Emits its own uncounted `:: K1-persist: … PASS ::`
+    // line (the 24th) and fully cleans up. After k1_atr_selftest so it inherits a valid UNAFS.ATR image.
+    k1_persist_launcher();
 }
 
 /// F2 M3 witness worker — the `demo_cpu` half of the cross-core FAT_MUTATION stress. `fn(usize)` for
@@ -9262,6 +9266,170 @@ fn k1_atr_selftest() {
         ":: K1-atr: UNAFS.ATR owner/grants format M1 — codec {} (16-row bound, per-row CRC fail-closed, binding-checked), on-disk helpers {} (single-row write_at under NAMESPACE); ENFORCEMENT-INERT — persistence STOPS for the seat's principal decision ::",
         if codec_ok { "PASS" } else { "FAIL" },
         disk_note
+    );
+}
+
+// K1 M3: the two-phase remount-survival proof — scratch state (every demo fixture torn down by the time it runs;
+// the u11_check_gen_rebind convention).
+const K1P_SA_OWN: u64 = 6; // scratch OWNER ASID
+const K1P_SA_GRT: u64 = 7; // scratch GRANTEE ASID
+const K1P_OWNER: &str = "PERSF.BIN"; // the named-owner scratch file
+const K1P_PUBLIC: &str = "PERSPUB.BIN"; // the public scratch file (proves public stays public after rebuild)
+const K1PERSIST_ALL: u32 = 0x3FF; // all 10 assertions held
+
+/// K1 M3: delete the scratch files + clear their persisted UNAFS.ATR rows + scratch stamps, leaving the card
+/// EXACTLY as found (empty UNAFS.ATR, no scratch files). Robust to partial failures — re-resolves each file
+/// fresh and frees PERSF's grown chain (`delete_located` = 0xE5 + free_chain), so nothing leaks on the stateful
+/// metal card.
+fn k1_persist_cleanup() {
+    slot_ppid_clear(K1P_SA_OWN);
+    slot_ppid_clear(K1P_SA_GRT);
+    if let Ok(fs) = crate::fs::fat::mount() {
+        for name in [K1P_OWNER, K1P_PUBLIC] {
+            if let Ok((de, lba, off)) = fs.find_located(name) {
+                let _ = atr_clear_row(&fs, lba, off as u32);
+                owned_clear(lba, off as u32);
+                let _ = fs.delete_located(lba, off, de.first_cluster());
+            }
+        }
+    }
+}
+
+/// K1 M3: PROVE that owner/grants persisted to UNAFS.ATR are rebuilt at mount and ENFORCED across a (simulated)
+/// reboot with real stamped principals. Kernel-side + deterministic (the `u11_check_gen_rebind` idiom — no EL0
+/// fixture; the enforcement logic lives in `owned_access_ok`/`owned_is_owner`/`owned_unlink_permitted`, which this
+/// calls EXACTLY as the syscalls do, only with principals produced by the SAME `slot_ppid_stamp`/`slot_ppid_of`
+/// machinery the loader + syscalls use). Runs in the launcher (kernel-task) context, so block I/O is legal.
+/// Returns a bitmask of the assertions that held; PASS iff `== K1PERSIST_ALL`. Fully self-cleaning.
+fn k1_persist_check() -> u32 {
+    let mut w = 0u32;
+    let fs = match crate::fs::fat::mount() {
+        Ok(f) => f,
+        Err(_) => return 0,
+    };
+    // Principals via the REAL stamp/read machinery (the loader stamps SLOT_PPID; syscalls read it via slot_ppid_of).
+    slot_ppid_stamp(K1P_SA_OWN, PrincipalRecord::program_name("PERSOWN"));
+    slot_ppid_stamp(K1P_SA_GRT, PrincipalRecord::program_name("PERSGRT"));
+    let p_x = slot_ppid_of(K1P_SA_OWN);
+    let p_z = slot_ppid_of(K1P_SA_GRT);
+    let p_y = PrincipalRecord::program_name("PERSIMP"); // an impostor program's principal (never owner/grantee)
+    if p_x.kind == PRIN_PROGRAM_NAME
+        && p_x == PrincipalRecord::program_name("PERSOWN")
+        && p_z == PrincipalRecord::program_name("PERSGRT")
+    {
+        w |= 1 << 0; // the stamp/read round-trip (M2.1 stamping + M2.3 slot_ppid_of)
+    }
+
+    // ---- Phase 1: create a named-owner file + a public file, persist the ACL to UNAFS.ATR ----
+    let Some(name11) = atr_name_from_str(K1P_OWNER) else {
+        k1_persist_cleanup();
+        return w;
+    };
+    let (de, lba, off) = match fs.create_in_root(K1P_OWNER, 0x20) {
+        Ok(t) => t,
+        Err(_) => {
+            k1_persist_cleanup();
+            return w;
+        }
+    };
+    let (c_persf, sz_persf) = match fs.write_grow(de.first_cluster(), de.size, lba, off, 0, &[0xA1u8; 32]) {
+        Ok((_, new_size, first)) => (first, new_size),
+        Err(_) => {
+            k1_persist_cleanup();
+            return w;
+        }
+    };
+    let gen_own = ASID_GEN[K1P_SA_OWN as usize].load(Ordering::Acquire);
+    let gen_grt = ASID_GEN[K1P_SA_GRT as usize].load(Ordering::Acquire);
+    // The real create/grant sequence in-RAM, then persist BOTH via the exact syscall persist helpers.
+    owned_set_owner(lba, off as u32, K1P_SA_OWN, gen_own, p_x);
+    let empty_grants = [(PrincipalRecord::NONE, 0u32); NFGRANT];
+    let ok_owner = atr_persist_row(&fs, name11, c_persf, sz_persf, lba, off as u32, p_x, &empty_grants);
+    owned_grant(lba, off as u32, K1P_SA_OWN, gen_own, K1P_SA_GRT, gen_grt, CAP_READ, p_z);
+    let ok_grant = atr_persist_grants(&fs, lba, off as u32);
+    let pub_created = fs.create_in_root(K1P_PUBLIC, 0x20).is_ok();
+    if !(ok_owner && ok_grant && pub_created) {
+        k1_persist_cleanup();
+        return w;
+    }
+
+    // ---- Phase 2: simulate a reboot (drop the in-RAM ACL), remount, rebuild, enforce ----
+    owned_clear(lba, off as u32); // the in-RAM ACL is gone across a power-cycle
+    let fs2 = match crate::fs::fat::mount() {
+        Ok(f) => f,
+        Err(_) => {
+            k1_persist_cleanup();
+            return w;
+        }
+    };
+    if atr_rebuild_into_owned(&fs2) >= 1 {
+        w |= 1 << 1; // the rebuild re-installed the persisted row
+    }
+    let (rlba, roff) = match fs2.find_located(K1P_OWNER) {
+        Ok((_, l, o)) => (l, o as u32),
+        Err(_) => {
+            k1_persist_cleanup();
+            return w;
+        }
+    };
+    let rw = CAP_READ | CAP_WRITE;
+    if owned_access_ok(rlba, roff, K1P_SA_OWN, gen_own, rw, p_x) {
+        w |= 1 << 2; // owner-by-name: full read/write authority
+    }
+    if !owned_access_ok(rlba, roff, K1P_SA_OWN, gen_own, rw, p_y) {
+        w |= 1 << 3; // impostor: DENIED
+    }
+    if !owned_access_ok(rlba, roff, K1P_SA_OWN, gen_own, rw, PrincipalRecord::NONE) {
+        w |= 1 << 4; // anonymous: DENIED
+    }
+    if owned_access_ok(rlba, roff, K1P_SA_OWN, gen_own, CAP_READ, p_z) {
+        w |= 1 << 5; // grantee-by-name: READ admitted
+    }
+    if !owned_access_ok(rlba, roff, K1P_SA_OWN, gen_own, CAP_WRITE, p_z) {
+        w |= 1 << 6; // grantee-by-name: WRITE denied (granted READ only)
+    }
+    if let Ok((_, plba, poff)) = fs2.find_located(K1P_PUBLIC) {
+        if owned_access_ok(plba, poff as u32, K1P_SA_OWN, gen_own, rw, PrincipalRecord::NONE) {
+            w |= 1 << 7; // public file stays public after rebuild
+        }
+    }
+    if owned_is_owner(rlba, roff, K1P_SA_OWN, gen_own, p_x)
+        && owned_unlink_permitted(rlba, roff, K1P_SA_OWN, gen_own, p_x)
+    {
+        w |= 1 << 8; // owner-by-name has re-grant + delete authority
+    }
+    if !owned_unlink_permitted(rlba, roff, K1P_SA_OWN, gen_own, p_y) {
+        w |= 1 << 9; // impostor cannot delete
+    }
+
+    owned_clear(rlba, roff);
+    k1_persist_cleanup();
+    w
+}
+
+/// K1 M3 launcher + verdict — rides the U7 kernel task AFTER k1_atr_selftest (its disk I/O can never perturb the
+/// 23 fixtures or the witnesses). Emits ONE `:: K1-persist: … PASS ::` line in the K1-atr `<noun> PASS` idiom —
+/// deliberately NOT a `-> PASS` / `: PASS` line, so arroyo's fixture PASS-counter leaves the count at 23 and only
+/// this one uncounted witness line is added (the 24th line; re-baseline the byte-diff on the OTHER 23).
+fn k1_persist_launcher() {
+    static DONE: AtomicBool = AtomicBool::new(false);
+    if DONE.swap(true, Ordering::Relaxed) {
+        return;
+    }
+    if crate::drivers::block::info().is_none() {
+        return; // no SD -> the proof writes real files; skip silently (the control-path discipline)
+    }
+    // Pre-flight: a stale image (scratch files present from an interrupted run) would confound create/rebuild.
+    if let Ok(fs) = crate::fs::fat::mount() {
+        if fs.find_in_root(K1P_OWNER).is_ok() || fs.find_in_root(K1P_PUBLIC).is_ok() {
+            k1_persist_cleanup();
+        }
+    }
+    let w = k1_persist_check();
+    serial_println!(
+        ":: K1-persist: UNAFS.ATR owner/grants SURVIVE REBOOT — rebuild+enforce {} (owner-by-name admit; impostor+anon deny; grantee R admit/W deny; public stays public) [w={:#05x}] ::",
+        if w == K1PERSIST_ALL { "PASS" } else { "FAIL" },
+        w
     );
 }
 
