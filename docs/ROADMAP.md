@@ -4,7 +4,9 @@
 > [`CLAUDE.md`](../CLAUDE.md); the security model and hardening ledger in
 > [`SECURITY.md`](SECURITY.md); subsystem detail in [`dev/OS/`](dev/OS).
 >
-> Last major revision: **2026-07-02** — the multi-user-first redirect.
+> Last major revision: **2026-07-10** — the multi-user capability chain is
+> complete and metal-confirmed on both arches; focus moves to persistence,
+> interrupt-driven storage, and the desktop surface.
 
 ## North star
 
@@ -17,18 +19,18 @@ authority over physical hardware, which is why the privilege/capability work
 comes first rather than being retrofitted (a lesson learned from BeOS, which
 deferred multi-user and paid for it).
 
-## Where we are (2026-07-02)
+## Where we are (2026-07-10)
 
 | Platform | Track | State |
 | :--- | :--- | :--- |
-| x86_64 (2012 rMBP) | `hw-rmbp` | Boots on metal: xHCI USB (kbd/mouse/mass-storage incl. SuperSpeed recovery), GOP video, SMP + full scheduler toolkit, e1000+TCP (QEMU), FAT16/32 read. **Ring 3: not started** (per-CPU GDT/TSS ready; no user segments, syscalls, U/S or NX bits). |
-| aarch64 (Pi 4 B) | `hw-pi4` | Bare-metal from microSD at EL1: GICv2 + timer, mailbox framebuffer GUI, 4-core SMP + scheduler, interrupt-driven input, **EL0 userspace with SVC syscalls, per-page permissions, and fault→task-kill (M6a/M6b)** — the project's first privilege boundary. |
-| aarch64 (Jetson Orin Nano) | `hw-jetson` | Tegra UART serial only. No interrupts yet (needs GICv3). |
+| x86_64 (2012 rMBP) | `hw-rmbp` | Boots on metal: xHCI USB (kbd/mouse/mass-storage incl. SuperSpeed recovery), GOP video, SMP + full scheduler toolkit, e1000+TCP (QEMU), FAT16/32 read+write. **The full capability chain U1a→U11→U6gx** (ring 3, per-page NX, per-process CR3, handle-table capabilities, cross-process transfer + revocation, RW files with grow/create/delete, per-name UnaFS ACL) — metal-confirmed. **STOR-1**: interrupt-driven storage runs read/write/grow/create/delete synchronously in-syscall behind the `irqstorage` knob (core transfer-IRQ mechanism metal-confirmed). |
+| aarch64 (Pi 4 B) | `hw-pi4` | Bare-metal from microSD at EL1: GICv2 + timer, mailbox framebuffer GUI, 4-core SMP + scheduler, interrupt-driven input. **The capability chain (M6a–M6f, U4–U11, U6 owner/grants), SMP-hardened concurrent FS (F2 FAT-mutation + F3 namespace locks), and reboot-surviving ACL persistence foundation (K1)** — metal-confirmed. |
+| aarch64 (Jetson Orin Nano) | `hw-jetson` | GICv3 + PSCI SMP; an interactive panel shell over a hub-attached USB disk with a read/write FAT path (`ls`/`cd`/`cat`/`touch`/`write`/`rm`) — metal-confirmed on real Orin silicon (file survives power-cycle). |
 
-Development runs on all three platforms simultaneously (three executor
-sessions, one per worktree — see `CLAUDE.md`): **rmbp leads** the core arcs,
-**pi follows** with the aarch64 port-backs it largely pioneered, **jetson runs
-catchup** (GICv3 → scheduler) until it joins the shared code.
+Development runs on all three platforms simultaneously (worktree sessions +
+seat-spawned agents in hybrid mode — see `CLAUDE.md`): **rmbp leads** the shared
+kernel-core arcs, **pi** pioneers and hardens the privilege boundary it largely
+invented, **jetson** drives the Tegra bring-up and the workstation-shell surface.
 
 ---
 
@@ -39,6 +41,13 @@ Security model: **capabilities first, POSIX-layerable** — detailed in
 [`dev/OS/04_SECURITY_IMMUNITY/permission_model.md`](dev/OS/04_SECURITY_IMMUNITY/permission_model.md)
 ("no root; apps start with zero permissions; handles are passed, not paths").
 
+> **STATUS (2026-07-10): the whole chain U1→U6 has LANDED and is metal-confirmed
+> on both arches** — the rows below record the design intent as originally
+> planned; per-milestone landing evidence is in [`MILESTONES.md`](MILESTONES.md).
+> Active work has moved past the chain to *persistence* (pi4 K1 — reboot-surviving
+> ACL) and *interrupt-driven storage* (x86 STOR-1). The next section (§1a) tracks
+> those frontiers.
+
 | Arc | Content | Lead | Port-back |
 | :--- | :--- | :--- | :--- |
 | **U1a** | x86 ring-3 round-trip: user GDT descriptors, TSS.RSP0, SYSCALL/SYSRET MSRs, `sys_write`/`sys_exit`, U/S page-walk demotion for the user window. Immediate hardening: EFER.NXE, NX on user data, CR4.SMEP | rmbp | design from Pi M6a (proven) |
@@ -47,16 +56,24 @@ Security model: **capabilities first, POSIX-layerable** — detailed in
 | **U3** | Per-process address spaces: per-process PML4, CR3 switch in the scheduler | rmbp | Pi as **M6d** (per-task TTBR0 + ASID) |
 | **U4** | Process model: PIDs, spawn/wait/exit status, **per-process handle table** — arch-neutral | shared | — |
 | **U5** | **Capability model**: handles are capabilities; every syscall checked at the handle table; grant/attenuate/revoke; bandy handle-transfer semantics | shared | — |
-| **U6** | UnaFS enforcement: `owner`/`grants:*` typed attributes checked on open. **aarch64 enforcement SEAM landed 2026-07-08 (owned-by-default at `SYS_OPEN` + `SYS_FGRANT` delegation, in-kernel; feeds the on-disk attrs once K2/K3/K4 land)**; x86 twin (U6x) future | rmbp+host / **pi led seam** | — |
+| **U6** | UnaFS `owner`/`grants:*` enforcement checked at open — owned-by-default at `SYS_OPEN` + `SYS_FGRANT` delegation, in-kernel. **Landed on BOTH arches: aarch64 seam 2026-07-08 (U6), x86 twin U6gx** (owner-only unlink, generation-fenced grants); both metal-confirmed. On-disk attribute backing is the pi4 K1 persistence work (§1a) | pi led seam / rmbp twin | — |
 | **H1** | Hardening ledger — folded into each track's next brief; tracked in `SECURITY.md` | all | — |
 
-**Pi lane:** M6c loadable blob → M6e preemptible EL0 (metal-gated) → M6d
-(port of U3) → consume U4/U5 → M6f `copy_from_user`.
+**Pi lane:** ✅ complete — M6c → M6e → M6d → U4/U5 → M6f all landed, plus the
+F2/F3 SMP-concurrency hardening and the K1 persistence foundation (§1a).
 
-**Jetson lane:** **JC1** GICv3 (developed against QEMU `virt
--machine gic-version=3`, then Orin metal; parameterizes the shared GIC driver)
-→ **JC2** generic timer + PSCI CPU_ON SMP (6 cores) + scheduler → **JC3** joins
-the shared userspace code.
+**Jetson lane:** ✅ **JC1** GICv3 + **JC2** timer/PSCI SMP + scheduler landed and
+Orin-metal-confirmed; the track now drives the workstation-shell surface (the
+`ls`/`cat`/`touch`/`write`/`rm` panel over a hub-attached USB disk) rather than
+the shared userspace port.
+
+## 1a. Current frontiers (active — the chain above is done)
+
+| Arc | Content | Track |
+| :--- | :--- | :--- |
+| **STOR-1** | Interrupt-driven x86 storage: a scheduled IF=1 service task owns the xHCI BOT pump; syscalls submit a block request + block on a per-request semaphore. Read/write/grow/create/delete synchronous in-syscall, behind the `irqstorage` knob. S1–S4 landed; core transfer-IRQ mechanism metal-confirmed. Next: S5 real shared backing for cross-process opens | rmbp |
+| **K1** | Reboot-surviving ACL: the U6 owner/grants persist to an on-disk `UNAFS.ATR` file (kernel-stamped `PrincipalRecord`, volume-fingerprint bound). Foundation + persistence landed; cross-reboot *enforcement* is proven and gated pending a second launchable named program (K2) | pi4 |
+| **UI/gfx** | Scale-aware UI metrics (no absolute pixel sizes), the in-kernel `pulse` monitor + `apps/pulse` host vessel, the `vug` software-rendered crystal engine, and the fbcon cached-RAM shadow that kills the uncached-VRAM scroll on x86 | rmbp/ux |
 
 ## 2. UnaFS: meeting and surpassing BeFS
 

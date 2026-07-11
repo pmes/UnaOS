@@ -52,7 +52,10 @@ Design-stage: [aether](handlers/aether), [comscan](handlers/comscan),
 
 **Vessels** ([`apps/`](apps)) — the executables: [lumen](apps/lumen) (the AI
 companion and reference GUI vessel), [facet](apps/facet) (raster graphics),
-`una` (IDE, currently parked), and the CLI tools under [`apps/cli/`](apps/cli).
+[pulse](apps/pulse) (the system monitor — live per-core CPU bars, a BeOS Pulse
+homage, fed through a `PulseSource` seam a kernel telemetry feed will later
+back), `una` (IDE, currently parked), and the CLI tools under
+[`apps/cli/`](apps/cli).
 
 The userspace architecture is documented in
 [`docs/dev/USERLAND/ARCHITECTURE.md`](docs/dev/USERLAND/ARCHITECTURE.md).
@@ -66,43 +69,61 @@ The userspace architecture is documented in
 | UEFI boot + GOP framebuffer (both arches) | ✅ |
 | Local-APIC interrupts (timer / xHCI MSI / NIC MSI / IPI) | ✅ |
 | Memory: page tables + heap | ✅ |
-| SMP: x2APIC + ACPI MADT + AP startup; preemptive per-CPU scheduler + sync primitives | ✅ (x86_64) |
+| SMP: preemptive per-CPU scheduler + sync primitives (x86 x2APIC/MADT; aarch64 4-core Pi + PSCI CPU_ON on Jetson) | ✅ |
 | USB/xHCI: interrupt-driven, Bulk-Only-Transport mass storage, HID input | ✅ |
 | Network: e1000 (MSI RX) + hand-rolled TCP/IP (ARP/ICMP/DHCP/UDP/TCP) | ✅ |
-| Video: `FrameBuffer` + double-buffered `Screen` + boot/panic console | ✅ |
+| Storage: FAT16/32 read + write / grow / create / delete; interrupt-driven on x86 (STOR-1, behind the `irqstorage` knob) | ✅ |
+| Video: scale-aware `FrameBuffer` + double-buffered `Screen` + boot/panic console (cached-RAM fbcon shadow on x86) | ✅ |
 
 The USB+scheduler, network, and video tracks were developed in parallel and are
-**integrated and verified booting together** on the `c01-int_combined` branch.
+**integrated and verified booting together** on `main`, exercised each merge by
+the `./arroyo battery` suite (both arches, QEMU x86 + `virt` GICv2/v3 + `raspi4b`).
 
 ### Privilege & security chain — the current focus
 
-The near-term work is a capability-isolated userspace (see *Current direction*
-below). It advances arc-by-arc, x86 leading and aarch64 (the pioneer) porting;
-each row is metal-confirmed on real hardware unless noted. **✅ done · 🔬
-QEMU-green, metal pending · ⬜ next.**
+The capability-isolated userspace (see *Current direction* below) advanced
+arc-by-arc, x86 leading the shared kernel-core and aarch64 (the pioneer of the
+privilege boundary) porting each rung. **The whole chain below is now landed and
+metal-confirmed on both arches.** ✅ metal-confirmed · 🔬 QEMU-green, metal pending.
 
 | Arc | What it lands | x86 (`hw-rmbp`) | aarch64 (`hw-pi4`) |
 | :--- | :--- | :---: | :---: |
 | Privilege round-trip | ring 3 / EL0 with syscalls | ✅ U1a | ✅ M6a |
 | Per-page perms + fault→kill | W^X/NX, faults kill the task not the kernel | ✅ U1b | ✅ M6b |
-| Loadable program | a program run from an embedded/on-disk blob | ✅ U2 *(from FAT disk)* | ✅ M6c |
-| Preemptible userspace | timer preempts a running user task | ⬜ | ✅ M6e |
-| Per-process address space | isolated per-task page tables | ⬜ U3 | ✅ M6d *(TTBR0+ASID)* |
-| Validated user pointers | `copy_from_user`/`copy_to_user` + syscall surface | ⬜ | 🔬 M6f |
-| Process model → capabilities → FS grants | handle table, principals, UnaFS grants | ⬜ U4–U6 | ⬜ |
+| Loadable program | a program run from an on-disk blob | ✅ U2 | ✅ M6c |
+| Preemptible userspace | timer preempts a running user task | ✅ U3.5 | ✅ M6e |
+| Per-process address space | isolated per-task page tables | ✅ U3 *(CR3)* | ✅ M6d *(TTBR0+ASID)* |
+| Process model + handle table | PIDs, spawn/wait/exit, per-process handles | ✅ U4x | ✅ U4 |
+| Capabilities | handles are capabilities; grant/attenuate/revoke | ✅ U5x | ✅ U5 |
+| Cross-process transfer + revocation | inbox transfer, generation-tagged revoke trees | ✅ U7x/U8x | ✅ U7/U8 |
+| File writes → grow / create / delete | RW files on FAT + full lifecycle | ✅ U9x–U11x | ✅ U9–U11 |
+| UnaFS owner/grants ACL | owner-by-default at `open` + `SYS_FGRANT` delegation | ✅ U6gx | ✅ U6 |
 
 Milestone-by-milestone history with test evidence:
-[`docs/MILESTONES.md`](docs/MILESTONES.md).
+[`docs/MILESTONES.md`](docs/MILESTONES.md); hardening ledger in
+[`docs/SECURITY.md`](docs/SECURITY.md).
+
+**Current frontiers** (building on the chain above):
+
+- **Interrupt-driven x86 storage (STOR-1)** — read / write / grow / create /
+  delete run synchronously *in the syscall* via a scheduled storage service
+  task, behind the `irqstorage` knob; the core transfer-IRQ mechanism is
+  metal-confirmed on the real Panther Point xHCI.
+- **ACL persistence (pi4 K1)** — the owner/grants ACL survives reboot via an
+  on-disk `UNAFS.ATR` file; the persistent-principal foundation has landed
+  (cross-reboot *enforcement* is proven and gated pending a second launchable
+  named program).
+- **UI + graphics** — a scale-aware UI metrics layer (no absolute pixel sizes),
+  an in-kernel `pulse` monitor, and the `vug` software-rendered crystal engine.
 
 Beyond `main`, development runs on three hardware tracks in parallel:
-**`hw-rmbp`** (2012 MacBook Pro, x86_64 — boots on metal with USB input and
-mass storage, native video, FAT read, and now a disk-loaded ring-3 program),
-**`hw-pi4`** (Raspberry Pi 4, bare-metal aarch64 — SMP scheduler, GUI, and the
-furthest-along privilege boundary: per-task address spaces with ASIDs), and
-**`hw-jetson`** (Jetson Orin Nano — GICv3 + PSCI SMP on QEMU virt; on real Orin
-silicon the headless boot path now loads and enters the kernel, with a
-kernel-owned MMU for the Tegra peripherals as the next step). Per-platform
-debugging setup:
+**`hw-rmbp`** (2012 MacBook Pro, x86_64 — boots on metal with USB input and mass
+storage, native video, and the full capability chain through disk-backed RW
+files with a per-name ACL), **`hw-pi4`** (Raspberry Pi 4, bare-metal aarch64 —
+SMP scheduler, GUI, the capability chain, SMP-hardened concurrent FS, and
+reboot-surviving ACL persistence), and **`hw-jetson`** (Jetson Orin Nano —
+GICv3 + PSCI SMP, an interactive panel shell with a read/write FAT path,
+metal-confirmed on real Orin silicon). Per-platform debugging setup:
 [`docs/dev/DEBUGGING.md`](docs/dev/DEBUGGING.md).
 
 **Current direction — multi-user first.** UnaOS is designed to hold direct
