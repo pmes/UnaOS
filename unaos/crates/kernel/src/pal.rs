@@ -36,6 +36,13 @@ pub trait GneissPal {
     fn width(&self) -> u32;
     fn height(&self) -> u32;
 
+    /// UI-1: the scale-derived UI geometry for this surface (THE METRICS RULE — no absolute
+    /// pixel sizes in UI code; everything derives from these). A pure function of the panel
+    /// height, so deriving per call is cheap and can never go stale.
+    fn metrics(&self) -> crate::ui::Metrics {
+        crate::ui::Metrics::for_height(self.height() as usize)
+    }
+
     fn clear_screen(&mut self, color: u32) {
         for y in 0..self.height() {
             for x in 0..self.width() {
@@ -98,20 +105,29 @@ pub trait GneissPal {
         }
     }
 
+    /// Draw `text` with the 8×8 base font, scale-aware (UI-1): each glyph pixel renders as a
+    /// `scale`×`scale` block and the advance is one metrics cell, so text set at any panel
+    /// size keeps its proportions. At scale 1 this is the classic per-pixel path, unchanged.
     fn draw_text(&mut self, x: usize, y: usize, text: &str, color: u32) {
+        let m = self.metrics();
+        let s = m.scale;
         let mut curr_x = x;
         for ch in text.chars() {
             if ch.is_ascii() {
                 let glyph = font8x8::legacy::BASIC_LEGACY[ch as usize];
                 for (row, byte) in glyph.iter().enumerate() {
-                    for col in 0..8 {
+                    for col in 0..crate::ui::BASE_CELL {
                         if (byte & (1 << col)) != 0 {
-                            self.draw_pixel((curr_x + col) as u32, (y + row) as u32, color);
+                            if s == 1 {
+                                self.draw_pixel((curr_x + col) as u32, (y + row) as u32, color);
+                            } else {
+                                self.draw_rect(curr_x + col * s, y + row * s, s, s, color);
+                            }
                         }
                     }
                 }
             }
-            curr_x += 8;
+            curr_x += m.cell_w;
         }
     }
 }
@@ -198,6 +214,17 @@ pub struct TargetPal<'a> {
 
 impl<'a> TargetPal<'a> {
     pub fn new(surface: &'a mut Screen) -> Self {
+        // UI-1 evidence: announce the derived metrics once per surface bring-up so headless
+        // gates can verify the scale layer on every target (x86 GUI, arm virt, Pi render
+        // service, Orin panel) without a screen.
+        let m = crate::ui::Metrics::for_height(surface.height());
+        serial_println!(
+            ":: UI1: scale={} cell={}x{} line={} ::",
+            m.scale,
+            m.cell_w,
+            m.cell_h,
+            m.line_h
+        );
         Self { surface }
     }
 }

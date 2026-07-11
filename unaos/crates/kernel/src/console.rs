@@ -43,29 +43,35 @@ impl Console {
 
     pub fn println(&mut self, text: &str) {
         self.history.push(String::from(text));
-        // Retain enough scrollback to fill the tallest panels we run on (native 4K ~= 100+ rows at
-        // LINE_H). Bounded so the buffer can't grow without limit; large enough that a full screen
-        // is always drawable (the old 25-line cap starved the bottom third at native resolution).
+        // Retain enough scrollback to fill the tallest panels we run on (native 4K ~= 90 rows at
+        // the scale-2 line pitch). Bounded so the buffer can't grow without limit; large enough that
+        // a full screen is always drawable (the old 25-line cap starved the bottom third at native
+        // resolution).
         if self.history.len() > Self::HISTORY_MAX {
             self.history.remove(0);
         }
     }
 
-    // Layout constants shared by the full repaint and the per-keystroke fast path so the prompt sits
+    // Layout (UI-1): every dimension — top/left margin, line pitch, text advance, cursor — derives
+    // from the panel's scale metrics (`pal.metrics()`; THE METRICS RULE: no absolute pixel sizes).
+    // The full repaint and the per-keystroke fast path share the same derivation so the prompt sits
     // in the same place in both. Top-down terminal fill: history starts at the top and each new line
     // pushes the prompt DOWN; once the screen is full the oldest lines scroll off the top.
-    const TOP: usize = 20;
-    const LINE_H: usize = 20;
+
     /// Retained scrollback cap — generous enough that even a 4K panel's worth of rows is drawable.
     const HISTORY_MAX: usize = 256;
+    /// The console background (Moonstone).
+    const BG: u32 = 0x2D2B55;
 
     /// The single source of truth for page height: rows of history that fit on one screen above the
-    /// prompt line, derived from the panel's real usable height. Reserves the last row for the
-    /// prompt/input line; a sane floor (6) keeps tiny/headless surfaces usable, and there is NO
-    /// small ceiling — a page is exactly one screenful minus the prompt. `selftest::Pager` shares
-    /// this so a pager page and a console screenful are always the same size.
+    /// prompt line, derived from the panel's real usable height and the metrics' line pitch.
+    /// Reserves the last row for the prompt/input line; a sane floor (6) keeps tiny/headless
+    /// surfaces usable, and there is NO small ceiling — a page is exactly one screenful minus the
+    /// prompt. `selftest::Pager` shares this so a pager page and a console screenful are always the
+    /// same size.
     pub fn page_rows(pal: &TargetPal) -> usize {
-        let usable = (pal.height() as usize).saturating_sub(Self::TOP) / Self::LINE_H;
+        let m = pal.metrics();
+        let usable = (pal.height() as usize).saturating_sub(m.margin) / m.line_h;
         usable.saturating_sub(1).max(6)
     }
 
@@ -79,33 +85,44 @@ impl Console {
     /// screen the prompt sits at the top and walks down as output arrives; once full it pins to the
     /// last usable row because the history is scrolled).
     fn prompt_y(&self, pal: &TargetPal) -> usize {
+        let m = pal.metrics();
         let rows = self.history_rows(pal);
         let shown = self.history.len().min(rows);
-        Self::TOP + shown * Self::LINE_H
+        m.margin + shown * m.line_h
+    }
+
+    /// Draw the prompt + live input + cursor at `prompt_y`. Shared by the full repaint and the
+    /// per-keystroke fast path so the two can never disagree. The cursor is BY CONSTRUCTION exactly
+    /// one metrics cell (`cell_w`×`cell_h`) — the same cell the glyph renderer fills — so it is
+    /// always precisely one character in size, at every scale (the old hardcoded 8×16 block stood
+    /// twice the 8×8 text height).
+    fn draw_prompt_line(&self, pal: &mut TargetPal, prompt_y: usize) {
+        let m = pal.metrics();
+        let prompt = format!("{}@unaos:~$ ", self.session.username);
+        pal.draw_text(m.margin, prompt_y, &prompt, 0x00FF00); // Green Prompt
+
+        let input_x = m.margin + m.text_w(prompt.len());
+        pal.draw_text(input_x, prompt_y, &self.current_input, 0xFFFFFF);
+
+        let cursor_x = input_x + m.text_w(self.current_input.len());
+        pal.draw_rect(cursor_x, prompt_y, m.cell_w, m.cell_h, 0xFFFFFF); // exactly one cell
     }
 
     pub fn draw(&self, pal: &mut TargetPal) {
-        pal.clear_screen(0x2D2B55); // Moonstone Background
+        let m = pal.metrics();
+        pal.clear_screen(Self::BG);
 
         // Show the last `history_rows` lines (scroll the oldest off the top when full), top-down.
         let rows = self.history_rows(pal);
         let skip = self.history.len().saturating_sub(rows);
-        let mut y = Self::TOP;
+        let mut y = m.margin;
         for line in self.history.iter().skip(skip) {
-            pal.draw_text(20, y, line, 0xAAAAAA);
-            y += Self::LINE_H;
+            pal.draw_text(m.margin, y, line, 0xAAAAAA);
+            y += m.line_h;
         }
 
         // Prompt directly below the last output line.
-        let prompt_y = y;
-        let prompt = format!("{}@unaos:~$ ", self.session.username);
-        pal.draw_text(20, prompt_y, &prompt, 0x00FF00); // Green Prompt
-
-        let input_x = 20 + (prompt.len() * 8);
-        pal.draw_text(input_x, prompt_y, &self.current_input, 0xFFFFFF);
-
-        let cursor_x = input_x + (self.current_input.len() * 8);
-        pal.draw_rect(cursor_x, prompt_y, 8, 16, 0xFFFFFF);
+        self.draw_prompt_line(pal, y);
     }
 
     /// Repaint ONLY the prompt/input line. This is the per-keystroke path: typing changes just
@@ -114,17 +131,10 @@ impl Console {
     /// the difference between snappy and unusable at native resolution. Use `draw()` for the full
     /// repaint after command output (history changes).
     pub fn draw_input_line(&self, pal: &mut TargetPal) {
+        let m = pal.metrics();
         let prompt_y = self.prompt_y(pal);
-        // Clear the input-line strip (cursor cells are 16px tall) back to the background.
-        pal.draw_rect(0, prompt_y, pal.width() as usize, 16, 0x2D2B55);
-
-        let prompt = format!("{}@unaos:~$ ", self.session.username);
-        pal.draw_text(20, prompt_y, &prompt, 0x00FF00);
-
-        let input_x = 20 + (prompt.len() * 8);
-        pal.draw_text(input_x, prompt_y, &self.current_input, 0xFFFFFF);
-
-        let cursor_x = input_x + (self.current_input.len() * 8);
-        pal.draw_rect(cursor_x, prompt_y, 8, 16, 0xFFFFFF);
+        // Clear the input-line strip (one full line pitch) back to the background.
+        pal.draw_rect(0, prompt_y, pal.width() as usize, m.line_h, Self::BG);
+        self.draw_prompt_line(pal, prompt_y);
     }
 }

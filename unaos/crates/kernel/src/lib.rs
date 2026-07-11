@@ -34,6 +34,7 @@ pub mod shell;
 pub mod selftest;
 
 pub mod pal;
+pub mod ui;
 pub mod video;
 pub mod console;
 pub mod user;

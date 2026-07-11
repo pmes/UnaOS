@@ -450,12 +450,13 @@ pub fn run_crystal(pal: &mut TargetPal, mode: Mode) {
 /// POLISH-2: the blinking red heartbeat square was removed too (Peter's call — not needed; any real
 /// problem will be obvious from the frozen crystal or a dead frame counter). Title + stat line stay.
 fn draw_stats(pal: &mut TargetPal, frame: u64, faces: u32, solid: bool, _w: i32, _h: i32) {
-    // Title + live stat line.
-    pal.draw_text(20, 20, "VUG // quartz", 0x00FFFFFF);
+    // Title + live stat line. UI-1: all positions derive from the panel metrics.
+    let m = pal.metrics();
+    pal.draw_text(m.margin, m.margin, "VUG // quartz", 0x00FFFFFF);
     let mode = if solid { "solid" } else { "wire " };
     let line = alloc::format!("mode {}  faces {:>2}  frame {}", mode, faces, frame);
-    pal.draw_text(20, 36, &line, 0x00A0A0A0);
-    pal.draw_text(20, 52, "press any key to exit", 0x00707070);
+    pal.draw_text(m.margin, m.margin + m.line_h, &line, 0x00A0A0A0);
+    pal.draw_text(m.margin, m.margin + 2 * m.line_h, "press any key to exit", 0x00707070);
 }
 
 /// M3b — the two corner load meters (kept small; the crystal stays the star). Bottom-left:
@@ -510,16 +511,25 @@ fn draw_meters(pal: &mut TargetPal, m: &RenderStats, cpu_load: &[u32], ncpu: usi
 }
 
 /// The BeBox tribute screen — a static homage (kept from the original demo, dressed up a little).
+/// UI-1: laid out from the panel metrics (no absolute pixel sizes).
 pub fn run_bebox_mode(pal: &mut TargetPal) {
+    let m = pal.metrics();
+    let x0 = 5 * m.margin;
+    let y0 = 5 * m.margin;
     pal.clear_screen(0x00101018);
-    pal.draw_text(60, 60, "BeBox // GeekPort tribute", 0x0066CCFF);
-    pal.draw_text(60, 84, "dual-CPU dreams, one framebuffer", 0x00889AAA);
+    pal.draw_text(x0, y0, "BeBox // GeekPort tribute", 0x0066CCFF);
+    pal.draw_text(x0, y0 + 2 * m.line_h, "dual-CPU dreams, one framebuffer", 0x00889AAA);
     // Two "CPU" LED columns, a nod to the twin BeBox meters.
+    let led_w = 2 * m.cell_w + m.cell_w / 2;
+    let led_h = m.cell_h + m.cell_h / 2;
+    let pitch_x = led_w + m.cell_w;
+    let pitch_y = 2 * m.cell_h;
+    let leds_y = y0 + 5 * m.line_h;
     for col in 0..2 {
         for i in 0..8 {
             let on = (i + col) % 3 != 0;
             let color = if on { 0x0000FF66 } else { 0x00223322 };
-            pal.draw_rect(60 + col * 30, 120 + i * 16, 20, 12, color);
+            pal.draw_rect(x0 + col * pitch_x, leds_y + i * pitch_y, led_w, led_h, color);
         }
     }
     pal.render();
