@@ -5016,6 +5016,13 @@ pub fn record_el0_kill(name: &str, ec: u64, far: u64, far_valid: bool) {
         EL0_UOWNER_KILLED.fetch_add(1, Ordering::AcqRel);
         return;
     }
+    // K2: the two make-enforcement-LIVE programs are well-behaved (register-only, valid syscalls); a kill of
+    // either is a real K2 bug -> its own counter, off the M6b `killed_unexpected` count (the FAIL then falls
+    // out of the launcher's `killed == 0` gate, its missing SYS_REPORT leaving the witness incomplete too).
+    if name == "el0-k2own" || name == "el0-k2imp" {
+        EL0_K2_KILLED.fetch_add(1, Ordering::AcqRel);
+        return;
+    }
     let (base, size) = super::boot::user_region();
     let code = super::boot::USER_CODE_SIZE as u64;
     let expected = far_valid
@@ -5412,6 +5419,7 @@ extern "C" fn aarch64_svc_handler(frame: *mut u64) {
             u11defer_report(a0);
             u11reap_report(a0);
             uowner_report(a0);
+            k2_report(a0);
             0
         }
         SYS_YIELD => sys_yield(),
@@ -5478,6 +5486,24 @@ extern "C" fn aarch64_svc_handler(frame: *mut u64) {
                 if nm == Some("el0-uowner-a") || nm == Some("el0-uowner-b") {
                     if a0 == UOWNER_EXIT_STATUS {
                         EL0_UOWNER_DONE.fetch_add(1, Ordering::AcqRel);
+                    }
+                    if let Some(id) = super::sched::current_id() {
+                        if let Some(i) = proc_find_running(id) {
+                            PROCS[i].state.store(PEXITED, Ordering::Release);
+                        }
+                    }
+                    super::sched::exit(); // never returns
+                }
+            }
+            // K2 (make-enforcement-LIVE): the two REAL loaded programs exit by NAME, BEFORE the Proc
+            // short-circuit. Neither has a launcher-planted Proc entry (no cross-program grants), so the
+            // mark is a no-op for them; they ride this arm only to route the sentinel to EL0_K2_DONE (the
+            // launcher's bounded wait gates on it) rather than the generic child-reap path.
+            {
+                let nm = super::sched::current_name();
+                if nm == Some("el0-k2own") || nm == Some("el0-k2imp") {
+                    if a0 == K2_EXIT_STATUS {
+                        EL0_K2_DONE.fetch_add(1, Ordering::AcqRel);
                     }
                     if let Some(id) = super::sched::current_id() {
                         if let Some(i) = proc_find_running(id) {
@@ -8254,6 +8280,12 @@ pub fn u7_launcher(demo_cpu: usize) {
     // K1 M4: the fail-closed proof — a TORN on-disk row yields a PUBLIC file at mount (never a forged owner).
     // Its own uncounted `:: K1-corrupt: … PASS ::` line (the 25th); fully self-cleaning.
     k1_corrupt_launcher();
+    // K2 (make-enforcement-LIVE): the end-to-end proof through TWO REAL disk-loaded programs — owner
+    // re-admitted by name after the UNAFS.ATR rebuild, impostor refused. Its own uncounted
+    // `:: K2-liveenf: … PASS ::` line (the 26th); fully self-cleaning (leaves no owned row on the metal card).
+    // Last in the chain — runs after k1_atr/persist/corrupt have left a valid UNAFS.ATR, and its own disk I/O
+    // can never perturb the 23-fixture battery or the witnesses.
+    k2_liveenf_launcher(demo_cpu);
 }
 
 /// F2 M3 witness worker — the `demo_cpu` half of the cross-core FAT_MUTATION stress. `fn(usize)` for
@@ -9770,6 +9802,204 @@ fn k1_corrupt_launcher() {
         ":: K1-corrupt: UNAFS.ATR torn owner row fails closed to PUBLIC at mount {} — rebuild drops the bad-CRC row; anonymous open admitted (no forged owner) ::",
         if ok { "PASS" } else { "FAIL" }
     );
+}
+
+// ===================================================================================================
+// K2 (make-enforcement-LIVE): prove the K1 cross-reboot ACL end-to-end through TWO REAL disk-loaded
+// programs with the gate FLIPPED. Unlike `k1_persist_check` (which manufactures principals directly on
+// scratch ASIDs), this drives the enforcement through the SAME path a real boot uses: a program loaded
+// off the card by `load_program_into_slot` (the sole `slot_ppid_stamp` mint site) does a private
+// `O_CREAT` at EL0 -> its `prog:<NAME>` owns + persists the file; a (simulated) reboot rebuilds the row
+// from `UNAFS.ATR`; a fresh incarnation of the SAME named program is re-ADMITTED purely by name; a
+// DISTINCT named program (the impostor) is REFUSED. QEMU regenerates a fresh FAT per build and delivers
+// no Group-1 IRQ, so the reboot is SIMULATED same-boot (owned_clear -> remount -> atr_rebuild_into_owned,
+// the M3 standard) — the true power-cycle survival rides the attended metal bench. Fully self-cleaning so
+// the STATEFUL metal card never accumulates a row that would brick the next real boot.
+const K2_OWN_NAME: &str = "K2OWN.BIN"; // the owner program -> principal prog:K2OWN.BIN
+const K2_IMP_NAME: &str = "K2IMP.BIN"; // the impostor program -> principal prog:K2IMP.BIN
+const K2_PRIV_NAME: &str = "K2PRIV.BIN"; // the private file the owner creates at EL0
+const K2_EXIT_STATUS: u64 = 0x82; // both K2 programs' sentinel exit -> EL0_K2_DONE (distinct from 0x6D..0x81)
+const K2_OWN_WITNESS_ALL: u64 = 0x3; // owner: bit0 open admitted + bit1 owner write OK
+const K2_IMP_WITNESS_ALL: u64 = 0x1; // impostor: bit0 open denied (-EACCES)
+
+static K2_OWN_WITNESS: AtomicU64 = AtomicU64::new(0); // K2OWN.BIN's reported witness (reset before each spawn)
+static K2_IMP_WITNESS: AtomicU64 = AtomicU64::new(0); // K2IMP.BIN's reported witness
+static EL0_K2_DONE: AtomicU32 = AtomicU32::new(0); // count of K2 program sentinel exits (want 3 by the end)
+static EL0_K2_KILLED: AtomicU32 = AtomicU32::new(0); // any K2 program fault-killed (a real bug; must stay 0)
+
+/// K2: record a K2 program's SYS_REPORT, keyed by task name (the `uowner_report` idiom). K2OWN.BIN is
+/// spawned twice under the same name — the launcher resets `K2_OWN_WITNESS` before each spawn and reads
+/// it after that spawn's sentinel exit, so the two reports never confuse.
+fn k2_report(value: u64) {
+    match super::sched::current_name() {
+        Some("el0-k2own") => K2_OWN_WITNESS.store(value, Ordering::Release),
+        Some("el0-k2imp") => K2_IMP_WITNESS.store(value, Ordering::Release),
+        _ => {}
+    }
+}
+
+/// K2: delete `K2PRIV.BIN` + clear its persisted `UNAFS.ATR` row + its in-RAM owner row (the
+/// `k1_persist_cleanup` idiom). Order: clear the attr row BEFORE the directory delete (a crash leaves the
+/// file public, never a dangling owned row); `owned_clear` drops the in-RAM ACL. Missing file/row -> no-op.
+/// Runs at every exit path so the stateful metal card leaves nothing that would deny the file on the next
+/// real boot once the gate is live.
+fn k2_cleanup() {
+    if let Ok(fs) = crate::fs::fat::mount() {
+        if let Ok((de, lba, off)) = fs.find_located(K2_PRIV_NAME) {
+            let _ = atr_clear_row(&fs, lba, off as u32);
+            owned_clear(lba, off as u32);
+            let _ = fs.delete_located(lba, off, de.first_cluster());
+        }
+    }
+}
+
+/// K2: load a real program by NAME off the card (auto-stamped `prog:<NAME>` at `load_program_into_slot`),
+/// capture its freshly-stamped principal (read HERE, while the slot is live — teardown at the program's
+/// exit clears SLOT_PPID), spawn it co-located on `demo_cpu`, and wait (bounded, cooperative) until
+/// `EL0_K2_DONE` reaches `want`. Returns the REAL stamped principal, or None on load/slot failure.
+fn k2_run_program(name: &str, taskname: &'static str, demo_cpu: usize, want: u32) -> Option<PrincipalRecord> {
+    let loaded = load_program_into_slot(name).ok()?;
+    let asid = loaded.ttbr0 >> 48;
+    let stamped = slot_ppid_of(asid); // the real stamp from load_program_into_slot, read before the program runs
+    super::sched::spawn_user_slot(taskname, loaded.base, loaded.sp, loaded.ttbr0, demo_cpu);
+    let start = super::timer::cntpct();
+    let deadline = 5 * super::timer::cntfrq();
+    while EL0_K2_DONE.load(Ordering::Acquire) < want
+        && super::timer::cntpct().wrapping_sub(start) <= deadline
+    {
+        super::sched::yield_now();
+    }
+    Some(stamped)
+}
+
+/// K2 (make-enforcement-LIVE) proof + verdict — the last demo in the U7 chain (after k1_corrupt_launcher).
+/// Rides the U7 kernel task on `vcpu`; the programs run co-located on `demo_cpu`, cooperative under QEMU.
+/// Six-bit witness `w`: (0) the real owner created+owned+wrote its private file, stamped prog:K2OWN.BIN;
+/// (1) its in-RAM owner row is that named principal (persist path engaged); (2) the row survived to
+/// `UNAFS.ATR` + rebuilt at mount; (3) the rebuilt row is owned by prog:K2OWN.BIN (owner_asid = sentinel,
+/// no live incarnation); (4) a FRESH incarnation of the owner re-opened its file purely BY NAME after the
+/// rebuild; (5) the impostor (a distinct real principal) was REFUSED (-EACCES). PASS iff `w == 0x3F` AND
+/// all three programs hit their sentinel exit AND none was killed AND the row self-cleaned. Emits ONE
+/// uncounted witness line (PASS/FAIL space-flanked mid-sentence — never `-> PASS`/`: PASS`/`-> FAIL`/
+/// `FAIL ::`), so the 23-fixture PASS count stays byte-equivalent.
+fn k2_liveenf_launcher(demo_cpu: usize) {
+    static DONE: AtomicBool = AtomicBool::new(false);
+    if DONE.swap(true, Ordering::Relaxed) {
+        return;
+    }
+    if crate::drivers::block::info().is_none() {
+        return; // no SD -> the proof loads/creates real files; skip silently (the control-path discipline)
+    }
+    // Pre-flight: the two programs must be on the card; K2PRIV.BIN must be ABSENT (a stale copy from an
+    // interrupted run would confound the create). Clean a stale K2PRIV.BIN first (metal card hygiene).
+    match crate::fs::fat::mount() {
+        Ok(fs) => {
+            if fs.find_in_root(K2_OWN_NAME).is_err() || fs.find_in_root(K2_IMP_NAME).is_err() {
+                serial_println!(":: K2-liveenf: K2OWN.BIN/K2IMP.BIN not on card — live-enforcement demo skipped ::");
+                return;
+            }
+            if fs.find_in_root(K2_PRIV_NAME).is_ok() {
+                k2_cleanup(); // a stale private file from an interrupted run
+            }
+        }
+        Err(_) => return, // unmountable -> skip silently
+    }
+
+    let mut w = 0u32;
+    let p_own = PrincipalRecord::program_name(K2_OWN_NAME); // the principal the loader stamps for K2OWN.BIN
+
+    // ---- Phase 1: a REAL owner program creates+owns+persists (+grows) K2PRIV.BIN at EL0 ----
+    K2_OWN_WITNESS.store(0, Ordering::Release);
+    let Some(stamp1) = k2_run_program(K2_OWN_NAME, "el0-k2own", demo_cpu, 1) else {
+        serial_println!(":: K2-liveenf: owner program failed to load — demo skipped ::");
+        return;
+    };
+    let own_w1 = K2_OWN_WITNESS.load(Ordering::Acquire);
+    if own_w1 == K2_OWN_WITNESS_ALL && stamp1 == p_own && p_own.kind == PRIN_PROGRAM_NAME {
+        w |= 1 << 0; // bit0: the real loaded owner created+wrote its private file, stamped prog:K2OWN.BIN
+    }
+
+    // Locate the created file + confirm the in-RAM owner row records the owner's PERSISTENT principal.
+    let fs2 = match crate::fs::fat::mount() {
+        Ok(f) => f,
+        Err(_) => {
+            k2_cleanup();
+            return;
+        }
+    };
+    let (priv_lba, priv_off) = match fs2.find_located(K2_PRIV_NAME) {
+        Ok((_, l, o)) => (l, o as u32),
+        Err(_) => {
+            serial_println!(":: K2-liveenf: K2PRIV.BIN not created by the owner — demo aborted ::");
+            k2_cleanup();
+            return;
+        }
+    };
+    if owned_owner_ppid(priv_lba, priv_off) == p_own {
+        w |= 1 << 1; // bit1: the owner row (in RAM) is the named principal -> the persist path engaged
+    }
+
+    // ---- Phase 2: simulate a reboot — WIPE the in-RAM ACL, remount, REBUILD purely from UNAFS.ATR ----
+    owned_clear(priv_lba, priv_off);
+    let fs3 = match crate::fs::fat::mount() {
+        Ok(f) => f,
+        Err(_) => {
+            k2_cleanup();
+            return;
+        }
+    };
+    if atr_rebuild_into_owned(&fs3) >= 1 {
+        w |= 1 << 2; // bit2: the persisted row survived to disk + rebuilt at mount
+    }
+    if owned_owner_ppid(priv_lba, priv_off) == p_own {
+        w |= 1 << 3; // bit3: the rebuilt row is owned by prog:K2OWN.BIN (owner_asid = sentinel, no live owner)
+    }
+
+    // ---- Phase 3a: re-spawn the SAME-named owner -> re-ADMITTED purely BY NAME (owner_asid is the sentinel,
+    //      so the live-(asid,gen) check can never match — only the ppid branch can admit) ----
+    K2_OWN_WITNESS.store(0, Ordering::Release);
+    let Some(stamp2) = k2_run_program(K2_OWN_NAME, "el0-k2own", demo_cpu, 2) else {
+        k2_cleanup();
+        return;
+    };
+    let own_w2 = K2_OWN_WITNESS.load(Ordering::Acquire);
+    if own_w2 == K2_OWN_WITNESS_ALL && stamp2 == p_own {
+        w |= 1 << 4; // bit4: a fresh incarnation of the owner re-opened its own file by name after the rebuild
+    }
+
+    // ---- Phase 3b: the IMPOSTOR (a DISTINCT real program/principal) -> REFUSED -EACCES ----
+    K2_IMP_WITNESS.store(0, Ordering::Release);
+    let Some(stamp_imp) = k2_run_program(K2_IMP_NAME, "el0-k2imp", demo_cpu, 3) else {
+        k2_cleanup();
+        return;
+    };
+    let imp_w = K2_IMP_WITNESS.load(Ordering::Acquire);
+    if imp_w == K2_IMP_WITNESS_ALL && stamp_imp.kind == PRIN_PROGRAM_NAME && stamp_imp != p_own {
+        w |= 1 << 5; // bit5: a distinct real principal was denied the owner's private file by name
+    }
+
+    let done = EL0_K2_DONE.load(Ordering::Acquire);
+    let killed = EL0_K2_KILLED.load(Ordering::Acquire);
+
+    // ---- Cleanup so the STATEFUL metal card leaves NO row that would brick the next real boot ----
+    k2_cleanup();
+    let cleaned = match crate::fs::fat::mount() {
+        Ok(fs) => fs.find_in_root(K2_PRIV_NAME).is_err(),
+        Err(_) => false,
+    };
+
+    const K2_ALL: u32 = (1 << 6) - 1; // bits 0..=5
+    if w == K2_ALL && done == 3 && killed == 0 && cleaned {
+        serial_println!(
+            ":: K2-liveenf: cross-reboot ACL LIVE via REAL programs — owner prog:K2OWN.BIN re-admitted BY NAME after UNAFS.ATR rebuild, impostor prog:K2IMP.BIN refused (-EACCES); grow-repersist exercised; self-cleaned rebuild+enforce PASS [w={:#04x}] ::",
+            w
+        );
+    } else {
+        serial_println!(
+            ":: K2-liveenf: rebuild+enforce FAIL — w={:#x}/{:#x} own_w1={:#x} own_w2={:#x} imp_w={:#x} done={} killed={} cleaned={} ::",
+            w, K2_ALL, own_w1, own_w2, imp_w, done, killed, cleaned as u8
+        );
+    }
 }
 
 fn u7_run(demo_cpu: usize) {
