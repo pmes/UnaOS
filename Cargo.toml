@@ -22,6 +22,7 @@ members = [
     "apps/cli/sentinel",
     "apps/lumen",
     "apps/pulse",
+    "apps/phonolite",
     # "apps/una",   # PARKED — IDE vessel; excluded during GUI-API consolidation
     "libs/lux"
 ]
@@ -32,6 +33,7 @@ members = [
 default-members = [
     "apps/lumen",
     "apps/pulse",
+    "apps/phonolite",
     # "apps/una",   # PARKED — see GUI-API consolidation
     "apps/cli/vertex",
     "apps/cli/unafs",

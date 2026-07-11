@@ -17,7 +17,7 @@
 //! Layout is derived from the live view bounds on every draw — there is no
 //! hardcoded pixel geometry, so the row scales with the window.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::sync::Arc;
 
 use dispatch2::MainThreadBound;
@@ -46,7 +46,7 @@ const LILAC: u32 = 0xB36BFF;
 /// The deep end of the meter ramp.
 const PURPLE: u32 = 0x9B59B6;
 /// Legends and core numbers.
-const LABEL: u32 = 0x8A8296;
+pub(crate) const LABEL: u32 = 0x8A8296;
 
 /// Segments per core bar (the LED-ladder resolution; widths scale with the window).
 const SEGMENTS: usize = 6;
@@ -59,7 +59,7 @@ fn channels(rgb: u32) -> (f64, f64, f64) {
     )
 }
 
-fn ns_color(rgb: u32) -> Retained<NSColor> {
+pub(crate) fn ns_color(rgb: u32) -> Retained<NSColor> {
     let (r, g, b) = channels(rgb);
     NSColor::colorWithSRGBRed_green_blue_alpha(r, g, b, 1.0)
 }
@@ -82,6 +82,12 @@ fn ns_color_lerp(from: u32, to: u32, t: f64) -> Retained<NSColor> {
 pub struct SegmentMeterIvars {
     /// Per-core load fractions in `0.0..=1.0`, one entry per core.
     loads: RefCell<Vec<f32>>,
+    /// The row legend drawn once at the left ("CPU" for pulse; e.g. "LVL"
+    /// for an audio level bar).
+    legend: RefCell<String>,
+    /// Whether each cell carries its 1-based index (per-core bars want it;
+    /// a single level bar does not).
+    numbered: Cell<bool>,
 }
 
 define_class!(
@@ -95,6 +101,8 @@ define_class!(
         fn init_with_frame(this: Allocated<Self>, frame: NSRect) -> Retained<Self> {
             let this = this.set_ivars(SegmentMeterIvars {
                 loads: RefCell::new(Vec::new()),
+                legend: RefCell::new("CPU".to_string()),
+                numbered: Cell::new(true),
             });
             unsafe { msg_send![super(this), initWithFrame: frame] }
         }
@@ -125,6 +133,21 @@ impl SegmentMeterView {
         let _ = mtm; // views must be built on the main thread; the marker proves it
         let this: Allocated<Self> = unsafe { msg_send![Self::class(), alloc] };
         unsafe { msg_send![this, initWithFrame: frame] }
+    }
+
+    /// [`Self::new`] with a custom legend and numbering choice. The defaults
+    /// (`"CPU"`, numbered) are pulse's per-core row; the phonolite level bar
+    /// uses `("LVL", false)`. Main thread only.
+    pub fn new_styled(
+        mtm: MainThreadMarker,
+        frame: NSRect,
+        legend: &str,
+        numbered: bool,
+    ) -> Retained<Self> {
+        let this = Self::new(mtm, frame);
+        *this.ivars().legend.borrow_mut() = legend.to_string();
+        this.ivars().numbered.set(numbered);
+        this
     }
 
     /// Feed the meter a fresh set of per-core loads (`0.0..=1.0` each) and
@@ -181,7 +204,7 @@ impl SegmentMeterView {
         let mid_y = h / 2.0;
 
         // The row legend, once at the left: `CPU 1 ▮▮▮▯ 2 ▮▯▯▯ …`
-        let legend = NSString::from_str("CPU");
+        let legend = NSString::from_str(&self.ivars().legend.borrow());
         let legend_size = measure(&legend, &label_attrs);
         draw_text(
             &legend,
@@ -202,9 +225,15 @@ impl SegmentMeterView {
         let cell_w = avail_w / n as f64;
         let cell_gap = cell_w * 0.10;
 
-        // Widest core number ("12"-class) sets the number column inside a cell.
+        // Widest core number ("12"-class) sets the number column inside a
+        // cell (an unnumbered meter spends that column on the bar instead).
+        let numbered = self.ivars().numbered.get();
         let widest = NSString::from_str(&n.to_string());
-        let num_w = measure(&widest, &label_attrs).width;
+        let num_w = if numbered {
+            measure(&widest, &label_attrs).width
+        } else {
+            0.0
+        };
 
         let bar_h = (h * 0.42).max(4.0);
 
@@ -212,16 +241,18 @@ impl SegmentMeterView {
             let cell_x = row_x + cell_w * i as f64;
 
             // The core number, right-aligned in its column, 1-based.
-            let num = NSString::from_str(&(i + 1).to_string());
-            let num_size = measure(&num, &label_attrs);
-            draw_text(
-                &num,
-                NSPoint::new(
-                    cell_x + num_w - num_size.width,
-                    mid_y - num_size.height / 2.0,
-                ),
-                &label_attrs,
-            );
+            if numbered {
+                let num = NSString::from_str(&(i + 1).to_string());
+                let num_size = measure(&num, &label_attrs);
+                draw_text(
+                    &num,
+                    NSPoint::new(
+                        cell_x + num_w - num_size.width,
+                        mid_y - num_size.height / 2.0,
+                    ),
+                    &label_attrs,
+                );
+            }
 
             // The segment ladder: chunky LED blocks, taller than wide, never
             // barcode stripes — the block proportions derive from the pitch.

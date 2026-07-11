@@ -18,6 +18,7 @@ use std::cell::RefCell;
 
 pub mod meter;
 pub mod spline;
+pub mod tone_panel;
 pub mod window_chrome;
 pub mod workspace;
 
