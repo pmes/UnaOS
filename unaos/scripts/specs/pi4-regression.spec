@@ -48,3 +48,8 @@ REQUIRE F3-witness:.*locked 240000/240000 intact
 FORBID R1 error status
 FORBID programming-busy timeout
 FORBID AARCH64 EXCEPTION
+
+# --- K2 live-enforcement witness (uncounted line — REQUIREd here because the launcher
+# --- has silent no-verdict exit paths: a green battery without this line = proof not run,
+# --- per the K2 security-review note, 2026-07-11) --------------------------------------
+REQUIRE K2-liveenf:.*rebuild\+enforce PASS
