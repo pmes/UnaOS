@@ -332,8 +332,9 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
     let command = parts.next().unwrap_or("");
     let args: Vec<&str> = parts.collect();
 
-    // The `vug` command paints a full-screen demo; everything else leaves the console visible.
-    let took_screen = command == "vug";
+    // The `vug` and `pulse` commands paint full-screen views; everything else leaves the
+    // console visible.
+    let took_screen = command == "vug" || command == "pulse";
 
     match command {
         "ver" | "version" => {
@@ -345,7 +346,7 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
             console.println("FILES:    fatinfo (FAT geometry), ls [dir], cd [dir], pwd, cat <path>");
             console.println("WRITE:    touch <path>, write <path> <text>, append <path> <text>, rm <path>");
             console.println("          (root dir; create/edit/delete files; sync = write-through, always durable)");
-            console.println("SMP:      sched (per-CPU run queues)");
+            console.println("SMP:      sched (per-CPU run queues), pulse (full-screen CPU monitor)");
             console.println("TEST:     tste (in-OS self-test suite: boot-replay + live checks)");
             console.println("NETWORK:  netinfo, ping <ip> [count], arp <ip>");
             console.println("          connect <ip> <port> [message], udpsend <ip> <port> [message]");
@@ -716,6 +717,13 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
                      console.draw(pal); // clean exit: restore the shell over the demo
                  }
              }
+        },
+        "pulse" => {
+            // UI1-M3: the full-screen system monitor (BeOS Pulse homage). Any key exits; the
+            // console repaints over it on the way out (same contract as the vug crystal).
+            console.println("Pulse: system monitor (press any key)...");
+            vug::run_pulse(pal);
+            console.draw(pal); // clean exit: restore the shell over the monitor
         },
         "tste" | "selftest" => {
             // The in-OS self-test suite (TSTE-1). Prints a three-section PASS/FAIL/SKIP table in the

@@ -575,6 +575,114 @@ fn draw_meters(pal: &mut TargetPal, m: &RenderStats, cpu: &CpuPulse, h: i32) {
     }
 }
 
+/// UI1-M3 — `pulse`: the full-screen system monitor (a BeOS Pulse homage) — the in-kernel half of
+/// the pulse ask (a host-native `apps/pulse` vessel is a separate arc). Big per-core segmented
+/// pulse bars (the M2 widget, larger) plus the honest system lines available today: core count,
+/// uptime, frame/present time while the view is open.
+///
+/// The loop follows the vug contract: it runs INSIDE the shell command, pumps input itself
+/// (`pal::pump_and_poll`), presents exactly ONCE per frame, busy-polls + `yield_now`s between
+/// frames (never WFI/sleeps — the post-drop aarch64 rule), and ANY key exits back to the console
+/// (the caller repaints; `took_screen` honored). Per-core loads ride the shared [`CpuPulse`]
+/// sampler — the honest two-source rule, verbatim; this loop's own busy-vs-yield fraction is the
+/// unscheduled-demo-core fallback, exactly like the crystal's.
+pub fn run_pulse(pal: &mut TargetPal) {
+    let mt = pal.metrics();
+    let mut cpu = CpuPulse::new("PULSE");
+    serial_println!(":: PULSE: live — {} cores ::", cpu.ncpu);
+
+    // Big-bar geometry: double-size segments, one row per core, all metrics-derived.
+    let seg_w = 2 * mt.cell_w;
+    let seg_h = 2 * mt.cell_h;
+    let gap = 2 * mt.scale;
+    let row_pitch = seg_h + mt.line_h;
+    let label_y_off = (seg_h - mt.cell_h) / 2; // centre a text cell on the bar
+
+    let mut frame: u64 = 0;
+    let mut own_load: u32 = 0; // this loop's busy% — the demo-core fallback source
+    let mut fps_x10: u64 = 0;
+    let mut ms_x10: u64 = 0;
+    let mut prev_top = crate::arch::now_cycles();
+    let mut work_acc: u64 = 0;
+    let mut total_acc: u64 = 0;
+    let mut win_frames: u32 = 0;
+    let mut win_ms = crate::arch::ms();
+
+    loop {
+        let top = crate::arch::now_cycles();
+        // --- input: exit on any key ------------------------------------------------------
+        if let Some(Event::Key(_)) = crate::pal::pump_and_poll() {
+            break;
+        }
+
+        // --- draw the monitor ------------------------------------------------------------
+        pal.clear_screen(BG);
+        pal.draw_text(mt.margin, mt.margin, "PULSE // UnaOS system monitor", 0x00FFFFFF);
+        pal.draw_text(mt.margin, mt.margin + mt.line_h, "press any key to exit", 0x00707070);
+
+        // One row per core: `CPU n`, the big segment bar, the load percent.
+        let mut y = mt.margin + 3 * mt.line_h;
+        for c in 0..cpu.ncpu {
+            let label = alloc::format!("CPU {}", c + 1);
+            pal.draw_text(mt.margin, y + label_y_off, &label, METER_LABEL);
+            let bar_x = mt.margin + mt.text_w(7);
+            let end_x = draw_pulse_bar(pal, bar_x, y, seg_w, seg_h, gap, cpu.load[c], METER_PURPLE);
+            let pct = alloc::format!("{:>3}%", cpu.load[c]);
+            pal.draw_text(end_x + mt.cell_w, y + label_y_off, &pct, METER_LABEL);
+            y += row_pitch;
+        }
+
+        // The honest system lines available today.
+        y += mt.line_h;
+        let line = alloc::format!(
+            "cores {}   uptime {} ms   frame {}",
+            cpu.ncpu,
+            crate::arch::ms(),
+            frame
+        );
+        pal.draw_text(mt.margin, y, &line, METER_LABEL);
+        y += mt.line_h;
+        let line = alloc::format!(
+            "frame {}.{} ms   {}.{} fps   (draw+present, while open)",
+            ms_x10 / 10,
+            ms_x10 % 10,
+            fps_x10 / 10,
+            fps_x10 % 10
+        );
+        pal.draw_text(mt.margin, y, &line, METER_LABEL);
+
+        pal.render(); // present ONCE per frame
+
+        // --- window accounting (the M3b render-load idiom) --------------------------------
+        let end = crate::arch::now_cycles();
+        work_acc += end.wrapping_sub(top);
+        total_acc += top.wrapping_sub(prev_top);
+        prev_top = top;
+        win_frames += 1;
+        let now_ms = crate::arch::ms();
+        let dt = now_ms.wrapping_sub(win_ms);
+        if dt >= 200 && win_frames > 0 {
+            fps_x10 = (win_frames as u64 * 10_000) / dt.max(1);
+            ms_x10 = (dt * 10) / win_frames as u64;
+            own_load = if total_acc > 0 {
+                ((work_acc * 100) / total_acc).min(100) as u32
+            } else {
+                0
+            };
+            cpu.refresh(own_load);
+            win_ms = now_ms;
+            win_frames = 0;
+            work_acc = 0;
+            total_acc = 0;
+        }
+
+        frame += 1;
+        crate::arch::sched::yield_now();
+    }
+
+    serial_println!(":: PULSE: exit clean — {} frames ::", frame);
+}
+
 /// The BeBox tribute screen — a static homage (kept from the original demo, dressed up a little).
 /// UI-1: laid out from the panel metrics (no absolute pixel sizes).
 pub fn run_bebox_mode(pal: &mut TargetPal) {
