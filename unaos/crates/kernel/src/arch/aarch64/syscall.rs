@@ -5758,6 +5758,13 @@ fn sys_write_file(asid: u64, file_id: u64, buf: u64, len: u64) -> i64 {
     FILE_CLUSTER[asid as usize][idx].store(new_first, Ordering::Release);
     FILE_SIZE[asid as usize][idx].store(new_size, Ordering::Release);
     FILE_OFFSET[asid as usize][idx].store(offset + wrote as u32, Ordering::Release);
+    // K2 M(b): a file just GREW — if it has a NAMED owner (a persisting principal), re-persist its UNAFS.ATR
+    // row's first_cluster/size so the create-time `first_cluster = 0` becomes the real chain head and the
+    // rebuild's identity cross-check engages. NO-OP with ZERO disk I/O for an anonymous owner (the whole
+    // battery, incl. the u10 GROW.BIN fixture), so this path stays byte-identical. Runs AFTER the descriptor
+    // republish, OUTSIDE any inner lock (atr_persist_grow snapshots OWNED_FILES then takes its own fresh ns for
+    // the single-row write). Non-fatal — losing it only weakens the out-of-scope offline-tamper corroboration.
+    let _ = atr_persist_grow(&fs, dir_lba, dir_off as u32, new_first, new_size);
     wrote as i64
 }
 
@@ -9068,6 +9075,80 @@ fn atr_persist_grants(fs: &crate::fs::fat::FatFs, dir_lba: u64, dir_off: u32) ->
                     name: existing.name,
                     first_cluster: existing.first_cluster,
                     size: existing.size,
+                    dir_lba,
+                    dir_off,
+                    owner: owner_ppid,
+                    grants: arow_grants,
+                };
+                let bytes = atr_serialize_row(&row);
+                let off = (ATR_HEADER_LEN + ATR_ROW_STRIDE * i) as u32;
+                return fs.write_at(afc, asz, off, &bytes).unwrap_or(0) == bytes.len();
+            }
+        }
+    }
+    true // no persisted row for this file — nothing to update (create-persist may have failed; in-RAM still holds)
+}
+
+/// K2 M(b): re-persist an existing NAMED-owner file's `first_cluster`/`size` after a GROW in `sys_write` — the
+/// grow twin of `atr_persist_grants`. `sys_write` has no file NAME in scope, so this recovers the durable name
+/// from the row already on disk (written at create) and refreshes it with the file's NEW chain head + size (and
+/// the CURRENT owner + grants snapshotted from OWNED_FILES). Create-time persist writes `first_cluster = 0` (a
+/// fresh 0-length entry), and the rebuild's first_cluster cross-check is SKIPPED for a 0 row; re-persisting on
+/// grow lets that corroboration ENGAGE (a rebuilt row whose on-disk `first_cluster` no longer matches the
+/// directory entry fails closed), strengthening the out-of-scope offline-tamper / non-`sys_unlink`-delete defense.
+/// No-op (returns true, ZERO disk I/O) when the owner is anonymous (NONE) — the whole 23-fixture battery, so the
+/// u10 GROW.BIN path stays byte-identical — or when no persisted row exists yet (a create-persist that had failed;
+/// benign — the in-RAM ACL still holds this boot). Owner/grants snapshotted BEFORE `ns` (OWNED_FILES never nested
+/// under it); the single-row scan + `write_at` run UNDER a fresh `ns` (the M1 seam, `NAMESPACE ⊃ inner`). A
+/// persist failure is non-fatal — the caller `let _ =`s it, matching every other persist site.
+fn atr_persist_grow(
+    fs: &crate::fs::fat::FatFs,
+    dir_lba: u64,
+    dir_off: u32,
+    new_first: u32,
+    new_size: u32,
+) -> bool {
+    let Some((owner_ppid, grants)) = owned_snapshot_row(dir_lba, dir_off) else {
+        return true; // no in-RAM row (public / cleared) — nothing to persist
+    };
+    if owner_ppid.kind == PRIN_NONE {
+        return true; // anonymous owner — nothing persists (the battery path; no disk touch)
+    }
+    let (de, _lba, _off) = match fs.find_located(ATR_NAME) {
+        Ok(t) => t,
+        Err(crate::fs::fat::FatError::NotFound) => return true, // owner was never persisted — nothing to update
+        Err(_) => return false,
+    };
+    if (de.size as usize) < ATR_FILE_LEN {
+        return true;
+    }
+    let (afc, asz) = (de.first_cluster(), de.size);
+    let mut arow_grants = [AtrGrant::EMPTY; NFGRANT];
+    for (j, &(p, r)) in grants.iter().enumerate() {
+        if r != 0 {
+            arow_grants[j] = AtrGrant { prin: p, rights: r };
+        }
+    }
+    let _ns = ns_lock();
+    let mut rows: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
+    if fs
+        .read_at(afc, asz, ATR_HEADER_LEN as u32, &mut rows, ATR_ROW_STRIDE * ATR_ROWS)
+        .is_err()
+        || rows.len() != ATR_ROW_STRIDE * ATR_ROWS
+    {
+        return false;
+    }
+    for i in 0..ATR_ROWS {
+        let start = ATR_ROW_STRIDE * i;
+        let mut arr = [0u8; ATR_ROW_STRIDE];
+        arr.copy_from_slice(&rows[start..start + ATR_ROW_STRIDE]);
+        if let Some(existing) = atr_parse_row(&arr) {
+            if existing.dir_lba == dir_lba && existing.dir_off == dir_off {
+                // Preserve the durable name; refresh first_cluster/size (the grow) + owner/grants (live ACL).
+                let row = AtrRow {
+                    name: existing.name,
+                    first_cluster: new_first,
+                    size: new_size,
                     dir_lba,
                     dir_off,
                     owner: owner_ppid,
