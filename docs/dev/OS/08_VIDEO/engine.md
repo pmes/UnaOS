@@ -101,3 +101,97 @@ through the damage-tracked back buffer (one present per frame still holds):
 
 Headless regression gates never type `vug`, so these are GUI/panel-verified when
 the demo is run (attended); the demo does not perturb headless boots.
+
+## 6. VPERF — the fbcon scroll path (x86)
+
+### Root cause (stride-correct)
+
+On the mid-2012 rMBP (MacBookPro10,1) the EFI GOP surface is 2880×1800,
+**stride 4096 px**, 4 bpp, Bgr, `framebuffer_size` 29,491,200 B, scanned out by
+the GT 650M — every CPU **read** of it is an uncached PCIe round trip.
+`FrameBuffer::scroll_up` was a full-surface `core::ptr::copy` whose *source* is
+that framebuffer: one 8-px text scroll moved `1800×(4096×4) − 8×16,384` ≈
+**28.0 MiB read + 28.0 MiB written**; a full screenful (225 rows) ≈ **6.15 GiB
+of uncached reads**. On top of that, glyphs and fills poked VRAM per pixel.
+QEMU numbers for calibration (1280×800, stride 1280): one scroll moves
+(800−8)×1280×4 = 4,055,040 B; the 400-line scripted scenario = 301 scrolls =
+1,220,567,040 B, pre-fix all of it VRAM-read.
+
+### The fix (M3: cached-RAM shadow, x86-only)
+
+`fbcon` late-attaches a heap shadow (`attach_shadow()`, called at the post-heap
+usbdebug seam right before the usbdebug `clear()` — fbcon itself initialises
+pre-heap by design, so init-time allocation is impossible). Once attached:
+glyphs and scrolls go to the shadow (cached RAM); `flush_dirty` presents the
+dirty row band to VRAM as **one contiguous sequential write-only blit** (on a
+scroll: the whole viewport — every visible row changes on a scroll, so the win
+is *read elimination*, not damage shrink). The shadow is **never seeded from
+VRAM**; it starts blank with the cursor homed. GUI builds never attach (fbcon
+detaches; `Screen`'s ~28 MiB back buffer owns the 48 MiB heap budget — a second
+shadow would OOM on metal). `panic_screen()` force-detaches the shadow without
+freeing (`mem::forget` — no allocator use from a panic context) so the red
+backdrop and panic text always paint direct-to-VRAM. Design choice: a minimal
+`Vec<u8>` + second `FrameBuffer` handle (the `Screen` back-store invariant),
+*not* `Option<Screen>` — fbcon already has row-band damage tracking, and
+`screen.rs` is another lane's file this round. M4 adds `encode4`/`put_raw4`
+(pixel encode hoisted out of glyph/fill inner loops) and a word-wide
+`fill_rows` band fill; with the shadow attached all stores are full 4-byte
+pixels and VRAM receives only whole blitted rows.
+
+### Instrumentation (`videobench` / `videocap` knobs, x86-only, default OFF)
+
+`UNAOS_VIDEOBENCH=1` → feature `videobench` → `video/vperf.rs`: relaxed-atomic
+counters (scroll bytes memmoved / VRAM-read bytes / put_pixel calls), emitted
+**raw-serial-only** (a line mirrored onto fbcon would recurse through the
+scroll path and contaminate screendump compares):
+
+```
+:: vperf: scroll=<B> vread=<B> px=<N> ::                        (cadence)
+:: vperf: fbmem mtrr=<T>(<how>) pte=<raw>(l<N>) pat=<T> eff=<T> fb=<addr> ::
+:: vperf: display <vid>:<did> bar<N> owns fb (base=<addr>) ::
+:: vperf: scenario scroll=<B> vread=<B> px=<N> scrolls=<N> lines=400 ::
+```
+
+The `fbmem` line is the **effective framebuffer memory type**: MTRR coverage
+(RDMSR MTRRCAP/DEF_TYPE + variable ranges, CPUID-guarded), the live
+identity-map leaf PTE (PWT/PCD/PAT bits visible raw), the IA32_PAT entry those
+bits select, and the SDM 11-7 combination. The kernel programs **zero**
+PAT/MTRR state — the WC assumption inherited from firmware
+(`arch/x86_64/mod.rs`) is unverified, and **QEMU's picture is synthetic** (TCG:
+`mtrr=UC(var-range) pte=0x800000e3(l2) pat=WB eff=UC`); only the attended metal
+readout is data. The display probe is read-only (no BAR sizing writes on a
+live-scanned-out panel; ownership = highest display mem-BAR base at/below the
+fb address within 512 MiB). `UNAOS_VIDEOCAP=1` (implies videobench) halves the
+fbcon-private handle's `info.height` — the bench lever that proves scroll cost
+scales with viewport height (capping the `rows` field alone is a no-op:
+`scroll_up` sizes from `info.height`). Full-surface paints (init fill, clear,
+panic backdrop) still cover the whole panel via an uncapped twin handle.
+
+The scripted scenario (usbdebug loop, one-shot ≥15 s so the boot fixtures are
+quiet): clear + 400 fixed-width numbered lines + counter deltas. Deterministic
+final screen → QMP screendump compares (`UNAOS_QMP_SHOT=<png> ./arroyo test 40`,
+port auto-bumps). Measured: pre-M3 `vread=1220567040`, post-M3 **`vread=0`**,
+identical workload, screendumps pixel-identical pre/post M3 and M4.
+
+### Ledger: the scroll runs IF-masked under the console lock
+
+The whole fbcon mirror — scroll included — runs interrupts-masked inside
+`sys_write`'s serial path under the FBCON `try_lock` (`arch::without_interrupts`
+in `serial::_print`/`fbcon::_print`). Post-M3 that window is still
+~10 ms-class per scrolled line on metal (a full-viewport write-only blit), and
+it **delays irqstorage IRQs** (and everything else) for its duration. Known,
+accepted for now; redesigning console locking is explicitly out of the VPERF
+arc's scope.
+
+### Conditional metal expectation (bench-pending)
+
+Depends on what the `fbmem` readout shows on the rMBP:
+- mapping is **WC**: post-M3 scroll ≈ one ~28 MiB sequential WC write → order
+  **30–100 scrolled lines/s** (panel-size bound);
+- mapping is **UC**: writes are also uncached-serialized → expect roughly
+  another **~10×** from a follow-up that maps the framebuffer WC (a ~50-line
+  PAT-on-PTE or MTRR-WC arc, named **VPERF-WC**, gated on the metal readout).
+
+Metal confirm rides the next attended rMBP bench (usbdebug build; watch for
+the `:: fbcon: cached-RAM shadow attached ::` line, the `fbmem` readout, and
+`scenario ... vread=0`).
