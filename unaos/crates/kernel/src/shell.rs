@@ -221,50 +221,55 @@ fn fs_touch(console: &mut Console, arg: &str) {
     }
 }
 
-/// JD5 `write`: create-or-TRUNCATE a ROOT file and store `data` (the exact given bytes). Truncate of
-/// an existing file = free its chain + a fresh 0-length entry, then grow-write — the only create-or-
-/// truncate reachable through fat.rs's PUBLIC API (there is no in-place shrink primitive, and the
-/// directory-field publisher is private). A directory target is refused (`-EISDIR`).
+/// JD6 `write`: create-or-TRUNCATE a file at `path` in ANY reachable directory and store `data`
+/// (the exact given bytes). Truncate of an existing file = free its chain + a fresh 0-length entry,
+/// then grow-write — the only create-or-truncate reachable through fat.rs's PUBLIC API (there is no
+/// in-place shrink primitive, and the directory-field publisher is private). A directory target is
+/// refused (`-EISDIR`). Rides the dir-aware create_in_dir/locate_in_dir twins.
 fn fs_write(console: &mut Console, arg: &str, data: &[u8]) {
-    let name = match resolve_root_name(arg) {
-        Ok(n) => n,
-        Err(msg) => return console.println(&alloc::format!("write: {}", msg)),
-    };
     let fs = match crate::fs::fat::mount() {
         Ok(fs) => fs,
         Err(e) => return console.println(&alloc::format!("write: no FAT filesystem ({:?})", e)),
     };
-    // Locate (root only). Present-as-file -> TRUNCATE (delete then recreate); directory -> refuse;
-    // absent -> create fresh. The result is the fresh entry's on-disk (dir_lba, dir_off).
-    let (dir_lba, dir_off) = match fs.find_located(&name) {
+    let (parent, name, canon) = match resolve_write_target(&fs, arg) {
+        Ok(t) => t,
+        Err(msg) => return console.println(&alloc::format!("write: {}", msg)),
+    };
+    // Locate in the parent dir. Present-as-file -> TRUNCATE (delete then recreate); directory ->
+    // refuse; absent -> create fresh. The result is the fresh entry's on-disk (dir_lba, dir_off).
+    let (dir_lba, dir_off) = match fs.locate_in_dir(parent, &name) {
         Ok((de, dl, doff)) => {
             if de.is_dir {
-                return console.println(&alloc::format!("write: /{}: is a directory (-EISDIR)", de.name()));
+                return console.println(&alloc::format!(
+                    "write: {}: is a directory (-EISDIR)", joined(&canon, de.name())));
             }
             if let Err(e) = fs.delete_located(dl, doff, de.first_cluster()) {
                 return console.println(&alloc::format!(
-                    "write: /{}: truncate failed {} ({:?})", name, fat_errno(e), e));
+                    "write: {}: truncate failed {} ({:?})", joined(&canon, &name), fat_errno(e), e));
             }
-            match fs.create_in_root(&name, 0x20) {
+            match fs.create_in_dir(parent, &name, 0x20) {
                 Ok((_, dl2, doff2)) => (dl2, doff2),
                 Err(e) => return console.println(&alloc::format!(
-                    "write: /{}: recreate failed {} ({:?}) — old file removed", name, fat_errno(e), e)),
+                    "write: {}: recreate failed {} ({:?}) — old file removed", joined(&canon, &name), fat_errno(e), e)),
             }
         }
-        Err(FatError::NotFound) => match fs.create_in_root(&name, 0x20) {
+        Err(FatError::NotFound) => match fs.create_in_dir(parent, &name, 0x20) {
             Ok((_, dl, doff)) => (dl, doff),
-            Err(e) => return console.println(&alloc::format!("write: {}: {} ({:?})", name, fat_errno(e), e)),
+            Err(e) => return console.println(&alloc::format!(
+                "write: {}: {} ({:?})", joined(&canon, &name), fat_errno(e), e)),
         },
-        Err(e) => return console.println(&alloc::format!("write: {}: {} ({:?})", name, fat_errno(e), e)),
+        Err(e) => return console.println(&alloc::format!(
+            "write: {}: {} ({:?})", joined(&canon, &name), fat_errno(e), e)),
     };
     if data.is_empty() {
-        return console.println(&alloc::format!("wrote 0 bytes to /{}", name));
+        return console.println(&alloc::format!("wrote 0 bytes to {}", joined(&canon, &name)));
     }
     // The entry is a fresh 0-length file (first_cluster = 0, size = 0): grow from offset 0.
     match fs.write_grow(0, 0, dir_lba, dir_off, 0, data) {
-        Ok((written, new_size, _)) =>
-            console.println(&alloc::format!("wrote {} bytes to /{} ({} bytes)", written, name, new_size)),
-        Err(e) => console.println(&alloc::format!("write: /{}: {} ({:?})", name, fat_errno(e), e)),
+        Ok((written, new_size, _)) => console.println(&alloc::format!(
+            "wrote {} bytes to {} ({} bytes)", written, joined(&canon, &name), new_size)),
+        Err(e) => console.println(&alloc::format!(
+            "write: {}: {} ({:?})", joined(&canon, &name), fat_errno(e), e)),
     }
 }
 
