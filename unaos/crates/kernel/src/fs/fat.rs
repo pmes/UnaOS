@@ -1698,6 +1698,206 @@ impl FatFs {
         self.delete_located(lba, off, child)
     }
 
+    // =============================================================================================
+    // FATMOVE (pi4-lane, round 9 — seat-granted additive exception, sibling of the FATDIRS block
+    // above): directory-entry RENAME + cross-directory MOVE. Two new public methods + one private
+    // single-sector helper, placed adjacent to FATDIRS, with ZERO edits to any existing fn. They
+    // COMPOSE the reviewed primitives — `locate_in_dir`/`create_in_dir` (JD6 twins),
+    // `write_dir_entry_fields`/`mark_dir_deleted` (each already riding `DIR_MUTATION`) — plus one new
+    // single-sector helper (`write_dir_entry_name`, which rewrites JUST the 11-byte 8.3 name field in
+    // place). Consumed by a future jetson `mv` arc (JD10) AFTER this arc merges: call, never edit.
+    //
+    // THE GENUINELY-NEW PRIMITIVE is MOVE's "unlink the source entry WITHOUT freeing the chain": a
+    // move relinks a file's directory entry into a new parent over the SAME `first_cluster`/`size`,
+    // so the data clusters move BY REFERENCE (no alloc, no copy, no free). It is `mark_dir_deleted`
+    // (0xE5 the source name) but NOT `free_chain` — the chain stays live under the destination name.
+    //
+    // CRASH ORDERING (invariant 2 — NEVER lose the chain): MOVE publishes the DESTINATION entry FIRST
+    // (`create_in_dir` writes a 0-cluster entry, then `write_dir_entry_fields` publishes the shared
+    // chain head + size), and only THEN marks the source entry `0xE5`. A crash/power-loss between the
+    // two leaves a benign DUPLICATE: two directory entries pointing at the SAME chain (the source's
+    // original name and the destination's new name). Both are readable; the operator removes the
+    // unwanted one BY ITS ENTRY (a plain `rm OLDNAME`). The reverse order (`0xE5` the source first)
+    // could ORPHAN the chain if the crash landed before the destination published it — forbidden. FAT
+    // is not journaled, so the window is fundamental; the bias is fail-SAFE (a leaked duplicate name,
+    // never a lost or aliased chain).
+    //
+    // DIRECTORIES (invariant 3): `rename_entry` renames a directory IN PLACE — only the parent's entry
+    // name field changes; the directory's own `.` (self) and its children's `..` (parent) links point
+    // at `first_cluster` values a rename does NOT touch, so they stay correct. MOVE of a directory
+    // ACROSS parents is REFUSED (`IsDirectory`): it would require rewriting the moved directory's `..`
+    // entry to the new parent, which is out of this additive arc's scope.
+    //
+    // LOCKING (invariants 4/5 — SOUND WITHOUT the syscall-layer NAMESPACE lock, the FATDIRS bar):
+    // every SECTOR mutation rides the existing per-RMW `DIR_MUTATION` span, and `DIR_MUTATION` is
+    // NEVER widened to span both of MOVE's two dir-sector RMWs at once (its documented contract is
+    // single-sector; cross-sector atomicity of the two writes is EXCLUDED_BY_SEQUENCING for EL1
+    // callers). The composite locate->mutate sequences are therefore NOT held under one lock; the
+    // residual is the SAME class FATDIRS ledgered (no concurrent EL1 FS mutators today; EL0 rides the
+    // syscall NAMESPACE lock) — see SECURITY.md's FATMOVE entry.
+    //
+    // U6/ACL (invariant 5): `fat.rs` is ACL-blind by layering — the `OWNED_FILES` ACL keys by
+    // `(dir_lba, dir_off)` up in aarch64 `syscall.rs`. A rename/move CHANGES that key, so a future
+    // EL0 rename/move path MUST re-key or refuse an OWNED file (ledgered in SECURITY.md + the JD10
+    // brief). This arc builds NO EL0 plumbing; the EL1 panel runs as ASID 0 (the PUBLIC principal),
+    // so a panel-driven rename/move touches no ACL row.
+    //
+    // ERRNO FIDELITY: the seam reuses existing `FatError` variants (adding one would break the
+    // exhaustive `fat_errno` match in the jetson-lane `shell.rs` — the FATDIRS precedent). The
+    // dest-EXISTS refusal reuses `Unsupported` (shared with a bad 8.3 name); the CALLER confirms the
+    // destination is absent first (as `fs_touch` does for create) and surfaces `-EEXIST` locally, so
+    // the seam's `Unsupported`-on-exists is a defensive backstop that never writes a duplicate. The
+    // dir-target refusal uses `IsDirectory` (the `-EISDIR`-equivalent the JD10 baton names). This
+    // mirrors how JD7's `rmdir` maps `IsDirectory`->`-ENOTEMPTY` locally per call site.
+    // =============================================================================================
+
+    /// FATMOVE: rewrite JUST the 11-byte 8.3 name field (bytes 0..11 of the 32-byte slot) of the
+    /// directory entry at (`lba`, `off`), preserving attr/cluster/size/timestamps. A SINGLE
+    /// directory-sector read-modify-write under `DIR_MUTATION` — exactly the documented single-sector
+    /// span (the twin of `mark_dir_deleted`, which RMWs byte 0 of a slot). The caller supplies the
+    /// already-validated `format_83` raw name, so the rewritten slot re-parses to the same textual
+    /// name a reader's `classify_dir_slot` produces.
+    fn write_dir_entry_name(&self, lba: u64, off: usize, raw: &[u8; 11]) -> Result<(), FatError> {
+        if off + 32 > SECTOR_SIZE {
+            return Err(FatError::Io); // a slot never straddles a sector; a bad offset is a caller bug
+        }
+        with_dir_lock(|| {
+            let mut buf = [0u8; SECTOR_SIZE];
+            read_sector(lba, &mut buf)?;
+            buf[off..off + 11].copy_from_slice(raw);
+            write_sector(lba, &buf)?;
+            Ok(())
+        })
+    }
+
+    /// FATMOVE: rename the entry `old_leaf` to `new_leaf` IN PLACE within the directory at
+    /// `parent_first_cluster` (`0` ⇒ the volume root) — rewrite the 8.3 name in the existing directory
+    /// entry; `first_cluster`, `size`, and `attr` are unchanged (a SINGLE dir-sector RMW). Works on
+    /// BOTH files and directories: an in-place rename leaves `first_cluster` untouched, so a renamed
+    /// directory's own `.` and its children's `..` links stay correct (only a MOVE across parents
+    /// would disturb `..` — see `move_entry`). Returns the entry at its (unchanged) location, now
+    /// bearing `new_leaf` — the `create_in_dir` shape (so a JD10 caller can re-key an ACL row).
+    ///
+    /// Errors (existing `FatError` variants — see the FATMOVE block's errno-fidelity note):
+    ///   * `Unsupported` -> `new_leaf` is not a representable 8.3 name;
+    ///   * `NotFound`    -> `old_leaf` is absent in the parent (caller: -ENOENT);
+    ///   * `Unsupported` -> `new_leaf` ALREADY EXISTS at a DIFFERENT slot (the dest-exists backstop —
+    ///                      the caller confirms absence first and surfaces -EEXIST locally; this seam
+    ///                      also refuses defensively so it NEVER writes a duplicate name);
+    ///   * `Io`/`BadChain`/`NoDisk` propagate from the primitives.
+    /// A rename to the SAME canonical 8.3 name (e.g. `foo.txt` -> `FOO.TXT`, which resolve to the same
+    /// on-disk slot) is a no-op success.
+    pub fn rename_entry(
+        &self,
+        parent_first_cluster: u32,
+        old_leaf: &str,
+        new_leaf: &str,
+    ) -> Result<(DirEntry, u64, usize), FatError> {
+        // Validate the new name up front so a bad name mutates nothing.
+        let raw = format_83(new_leaf).ok_or(FatError::Unsupported)?;
+        // Locate the source (NotFound if absent).
+        let (_de, lba, off) = self.locate_in_dir(parent_first_cluster, old_leaf)?;
+        // Dest-exists check (locate-first, the create discipline). A hit at the SAME slot means the
+        // new canonical name == the old one -> a no-op rename (return the entry as-is); a hit at a
+        // DIFFERENT slot -> refuse (would duplicate the name).
+        match self.locate_in_dir(parent_first_cluster, new_leaf) {
+            Ok((_, nlba, noff)) => {
+                if nlba == lba && noff == off {
+                    return self.locate_in_dir(parent_first_cluster, new_leaf); // already this name
+                }
+                return Err(FatError::Unsupported); // dest exists (caller: -EEXIST via its pre-check)
+            }
+            Err(FatError::NotFound) => {}
+            Err(e) => return Err(e),
+        }
+        // Single dir-sector RMW: rewrite the name field in place.
+        self.write_dir_entry_name(lba, off, &raw)?;
+        // Re-read the finished entry so the returned DirEntry is byte-for-byte what a reader sees.
+        match self.locate_in_dir(parent_first_cluster, new_leaf) {
+            Ok(t) => Ok(t),
+            Err(_) => Err(FatError::Io), // unreachable: we just wrote it
+        }
+    }
+
+    /// FATMOVE: move the FILE entry `leaf` from the directory at `src_parent` to the directory at
+    /// `dst_parent` (each `0` ⇒ the volume root), naming it `new_leaf` there. The file's data moves
+    /// BY REFERENCE: the destination entry is written over the SAME `first_cluster`/`size`, then the
+    /// source entry is marked deleted WITHOUT freeing the chain — no cluster is allocated, copied, or
+    /// freed. Returns the NEW entry with its (LBA, slot-offset) — the `create_in_dir` shape.
+    ///
+    /// CRASH ORDERING (invariant 2 — NEVER lose the chain): the destination entry is fully published
+    /// (`create_in_dir` -> `write_dir_entry_fields`, the shared chain head + size) BEFORE the source
+    /// entry is `0xE5`'d. A crash between the two leaves a benign DUPLICATE (two names, one chain); the
+    /// reverse order could orphan the chain. See the FATMOVE block comment for the full analysis.
+    ///
+    /// DIRECTORIES: refused (`IsDirectory`) — moving a directory across parents needs its `..` entry
+    /// rewritten to the new parent, out of this additive arc's scope. (Rename a directory IN PLACE
+    /// with `rename_entry`, which does not disturb `..`.)
+    ///
+    /// Errors (existing `FatError` variants — see the FATMOVE block's errno-fidelity note):
+    ///   * `Unsupported` -> `new_leaf` not 8.3, OR a `first_cluster == 0` source (a 0-cluster/root-like
+    ///                      entry has no chain to relink by reference — refuse rather than publish a
+    ///                      0-cluster duplicate);
+    ///   * `NotFound`    -> `leaf` absent in `src_parent` (caller: -ENOENT);
+    ///   * `IsDirectory` -> `leaf` is a directory (caller: -EISDIR — cross-parent dir move unsupported);
+    ///   * `Unsupported` -> `new_leaf` already exists in `dst_parent` (the dest-exists backstop — the
+    ///                      caller confirms absence first and surfaces -EEXIST locally);
+    ///   * `NoSpace`     -> `dst_parent` has no free slot; `Io`/`BadChain`/`NoDisk` from the primitives.
+    pub fn move_entry(
+        &self,
+        src_parent: u32,
+        leaf: &str,
+        dst_parent: u32,
+        new_leaf: &str,
+    ) -> Result<(DirEntry, u64, usize), FatError> {
+        // Validate the new name up front so a bad name mutates nothing (create_in_dir re-validates).
+        if format_83(new_leaf).is_none() {
+            return Err(FatError::Unsupported);
+        }
+        // Locate the source (NotFound if absent).
+        let (src_de, src_lba, src_off) = self.locate_in_dir(src_parent, leaf)?;
+        if src_de.is_dir {
+            return Err(FatError::IsDirectory); // cross-parent directory move is out of scope (`..` rewrite)
+        }
+        let head = src_de.first_cluster();
+        if head == 0 {
+            // A 0-cluster/root-like source has no chain to relink by reference. Refuse rather than
+            // publish a 0-cluster duplicate. (The write path allocates on the first byte, so a real
+            // file always has a chain; this is the defensive/malformed corner.)
+            return Err(FatError::Unsupported);
+        }
+        // Dest-exists check (locate-first). Across different parents no self-collision is possible;
+        // within the SAME parent a hit means `new_leaf` canon == `leaf` canon (a same-name move —
+        // the caller routes those to `rename_entry`). Any hit -> refuse; NotFound -> proceed.
+        match self.locate_in_dir(dst_parent, new_leaf) {
+            Ok(_) => return Err(FatError::Unsupported), // dest exists (caller: -EEXIST via its pre-check)
+            Err(FatError::NotFound) => {}
+            Err(e) => return Err(e),
+        }
+        // Preserve the source's exact attribute byte (read-only/hidden/system/archive) — a faithful
+        // move. A plain read of the source slot; the mutations below take their own DIR_MUTATION locks.
+        let attr = {
+            let mut sbuf = [0u8; SECTOR_SIZE];
+            read_sector(src_lba, &mut sbuf)?;
+            sbuf[src_off + 11]
+        };
+        // 1. Publish the DESTINATION entry FIRST (crash order). `create_in_dir` writes a fresh
+        //    0-cluster entry (its own DIR_MUTATION slot RMW); a full `dst_parent` is an honest NoSpace.
+        let (_, dlba, doff) = self.create_in_dir(dst_parent, new_leaf, attr)?;
+        // 2. Publish the SHARED chain head + size into the destination entry (DIR_MUTATION RMW). BOTH
+        //    the source and destination names now point at the same chain (a transient duplicate).
+        self.write_dir_entry_fields(dlba, doff, head, src_de.size)?;
+        // 3. LAST: mark the SOURCE entry deleted (`0xE5`) WITHOUT freeing the chain — the chain stays
+        //    live under the destination name. This is the genuinely-new "unlink-keep-chain" step
+        //    (`mark_dir_deleted`, NOT `delete_located`, which would `free_chain`).
+        self.mark_dir_deleted(src_lba, src_off)?;
+        // Re-read the finished destination entry so the returned DirEntry is what a reader sees.
+        match self.locate_in_dir(dst_parent, new_leaf) {
+            Ok(t) => Ok(t),
+            Err(_) => Err(FatError::Io), // unreachable: we just published it
+        }
+    }
+
     /// U10: the on-disk location of the first FREE root-directory slot (a `0x00` end marker or a `0xE5` deleted
     /// slot). `NoSpace` if the root directory is full — extending the root-directory chain is out of scope this
     /// arc. Writing into the first `0x00` slot preserves the terminator (the slots after it stay `0x00`), and a

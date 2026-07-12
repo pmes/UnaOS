@@ -65,3 +65,10 @@ FORBID IMG-SIG:.*FAIL
 # --- REQUIRE at first capture) — a no-card / 3-of-4-core metal boot must not fail the chain. -----
 PENDING FATDIRS:.*delete_located\) PASS
 FORBID FATDIRS:.*FAIL
+
+# --- FATMOVE rename/move witness (uncounted): rename_entry/move_entry drive the live volume end to
+# --- end (rename in place; move a file across dirs by reference; onto-existing + directory refused).
+# --- Needs a card (the selftest writes real entries), so PENDING (promotes to REQUIRE at first
+# --- capture) — a no-card / 3-of-4-core metal boot must not fail the chain. --------------------------
+PENDING FATMOVE:.*keep-chain\) PASS
+FORBID FATMOVE:.*FAIL

@@ -8398,6 +8398,11 @@ pub fn u7_launcher(demo_cpu: usize) {
     // will use, PINNED + KAT'd ahead of the native unafs mount. Read-only, in-RAM (no disk, no card); its
     // own uncounted `:: K4-ready: … PASS ::` line. LAST in the chain.
     k4_ready_selftest();
+    // FATMOVE: exercise the new fat.rs directory-entry rename + cross-directory move seam
+    // (rename_entry/move_entry) on the live volume — LAST in the chain (its disk I/O can never
+    // perturb the 23 fixtures or the witnesses), fully self-cleaning. Its own uncounted
+    // `:: FATMOVE: … PASS ::` line. Unblocks a future jetson `mv` arc (JD10).
+    fatmove_launcher();
 }
 
 /// F2 M3 witness worker — the `demo_cpu` half of the cross-core FAT_MUTATION stress. `fn(usize)` for
@@ -10707,6 +10712,193 @@ fn fatdirs_launcher() {
     serial_println!(
         ":: FATDIRS: fat.rs directory create/remove — create_dir(child .,..+publish), remove_dir(empty-only via delete_located) {} (new dir `.`/`..` well-formed; file-in-dir; non-empty refused; empty rmdir frees+reuses the cluster; root-like + file targets refused) [w={:#04x}] ::",
         if w == FATDIRS_ALL { "PASS" } else { "FAIL" },
+        w
+    );
+}
+
+// ===================================================================================================
+// FATMOVE: exercise the new fat.rs directory-entry rename + cross-directory move seam
+// (rename_entry / move_entry) end-to-end on the live volume — the aarch64 kernel-side disk-selftest
+// (the k1_atr / fatdirs idiom). Runs LAST in the storage chain so its disk I/O can never perturb the
+// 23-fixture battery or the witnesses; emits ONE uncounted `:: FATMOVE: ... PASS [w=0x..] ::` line
+// (never a `-> PASS` fixture line). Fully self-cleaning: leaves the volume EXACTLY as found. Uses the
+// volume ROOT (parent = 0) plus one scratch subdirectory, so it runs unchanged on the FAT16
+// fixed-root and FAT32 test images. A future jetson `mv` arc (JD10) is the attended-metal money-shot.
+const FATMOVE_A: &str = "FMA.BIN"; // created in root, written, then renamed to FMB.BIN
+const FATMOVE_B: &str = "FMB.BIN"; // the rename target; then moved into the scratch subdir
+const FATMOVE_C: &str = "FMC.BIN"; // a second root file (rename-collision + move-collision source)
+const FATMOVE_SUB: &str = "FMSUB"; // scratch subdirectory (the move destination parent)
+const FATMOVE_D: &str = "FMD.BIN"; // a file inside FMSUB (the move-onto-existing collision target)
+const FATMOVE_DIR: &str = "FMDIR"; // a root subdir (the move-a-directory refusal target)
+const FATMOVE_LEN: usize = 700; // content length — spans >1 sector, so the whole chain moves by ref
+const FATMOVE_ALL: u32 = 0xFF; // all 8 assertions (M1 rename bits 0-3, M2 move bits 4-7)
+
+/// FATMOVE: the deterministic content pattern written into the scratch file, so a byte-for-byte
+/// read-back after a rename and a move proves the cluster chain travelled intact.
+fn fatmove_byte(i: usize) -> u8 {
+    (i.wrapping_mul(37).wrapping_add(11) & 0xFF) as u8
+}
+
+/// FATMOVE: delete any scratch entries this selftest may have left, leaving the volume EXACTLY as
+/// found. Robust to partial failures (re-resolves each name fresh, in both the root and the subdir).
+fn fatmove_cleanup(fs: &crate::fs::fat::FatFs) {
+    // Files that may live inside the scratch subdir (delete them BEFORE removing the subdir).
+    if let Ok((sde, _, _)) = fs.locate_in_dir(0, FATMOVE_SUB) {
+        let sub = sde.first_cluster();
+        if sub != 0 {
+            for name in [FATMOVE_A, FATMOVE_B, FATMOVE_C, FATMOVE_D] {
+                if let Ok((de, lba, off)) = fs.locate_in_dir(sub, name) {
+                    let _ = fs.delete_located(lba, off, de.first_cluster());
+                }
+            }
+        }
+        let _ = fs.remove_dir(0, FATMOVE_SUB);
+    }
+    let _ = fs.remove_dir(0, FATMOVE_DIR);
+    for name in [FATMOVE_A, FATMOVE_B, FATMOVE_C] {
+        if let Ok((de, lba, off)) = fs.locate_in_dir(0, name) {
+            let _ = fs.delete_located(lba, off, de.first_cluster());
+        }
+    }
+}
+
+/// FATMOVE: drive rename_entry/move_entry on the live volume, returning a witness bitmask (PASS iff
+/// `== FATMOVE_ALL`). Kernel-task context, so block I/O is legal. Fully self-cleaning.
+fn fatmove_check() -> u32 {
+    use crate::fs::fat::FatError;
+    let mut w = 0u32;
+    let fs = match crate::fs::fat::mount() {
+        Ok(f) => f,
+        Err(_) => return 0,
+    };
+    fatmove_cleanup(&fs); // pristine start (a stale scratch entry from an interrupted run would confound)
+
+    // The content pattern + a readback helper (byte-for-byte compare against the pattern).
+    let mut content = alloc::vec::Vec::with_capacity(FATMOVE_LEN);
+    for i in 0..FATMOVE_LEN {
+        content.push(fatmove_byte(i));
+    }
+    let reads_back = |first_cluster: u32, size: u32| -> bool {
+        if size as usize != FATMOVE_LEN {
+            return false;
+        }
+        let mut out = alloc::vec::Vec::new();
+        if fs.read_at(first_cluster, size, 0, &mut out, FATMOVE_LEN).is_err() {
+            return false;
+        }
+        out.len() == FATMOVE_LEN && out[..] == content[..]
+    };
+
+    // ---- M1: rename_entry (in the root) ----------------------------------------------------------
+    // Create FMA.BIN, grow it with the content pattern -> it owns a real (multi-cluster) chain.
+    let head = match fs.create_in_dir(0, FATMOVE_A, 0x20) {
+        Ok((_, lba, off)) => match fs.write_grow(0, 0, lba, off, 0, &content) {
+            Ok((_, _sz, new_first)) => new_first,
+            Err(_) => {
+                fatmove_cleanup(&fs);
+                return w;
+            }
+        },
+        Err(_) => {
+            fatmove_cleanup(&fs);
+            return w;
+        }
+    };
+    // bit0: rename FMA.BIN -> FMB.BIN; the returned entry is a FILE named FMB.BIN with the SAME head + size.
+    if let Ok((rde, _, _)) = fs.rename_entry(0, FATMOVE_A, FATMOVE_B) {
+        if rde.name() == FATMOVE_B
+            && !rde.is_dir
+            && rde.first_cluster() == head
+            && rde.size as usize == FATMOVE_LEN
+        {
+            w |= 1 << 0;
+        }
+    }
+    // bit1: the OLD name is gone and the NEW name resolves to the same chain head + size.
+    if matches!(fs.locate_in_dir(0, FATMOVE_A), Err(FatError::NotFound)) {
+        if let Ok((bde, _, _)) = fs.locate_in_dir(0, FATMOVE_B) {
+            if bde.first_cluster() == head && bde.size as usize == FATMOVE_LEN {
+                w |= 1 << 1;
+            }
+        }
+    }
+    // bit2: the content reads back byte-for-byte through the rename (chain intact).
+    if reads_back(head, FATMOVE_LEN as u32) {
+        w |= 1 << 2;
+    }
+    // bit3: rename-onto-EXISTING refused. Create FMC.BIN, then rename FMB.BIN -> FMC.BIN must fail and
+    // leave FMB.BIN intact (still pointing at the same head).
+    let fmc_made = fs.create_in_dir(0, FATMOVE_C, 0x20).is_ok();
+    if fmc_made
+        && matches!(fs.rename_entry(0, FATMOVE_B, FATMOVE_C), Err(FatError::Unsupported))
+        && fs.locate_in_dir(0, FATMOVE_B).map(|(d, _, _)| d.first_cluster()) == Ok(head)
+    {
+        w |= 1 << 3;
+    }
+
+    // ---- M2: move_entry (across directories) -----------------------------------------------------
+    // Make the scratch subdir and move FMB.BIN (root) into it.
+    let sub = match fs.create_dir(0, FATMOVE_SUB) {
+        Ok((sde, _, _)) => sde.first_cluster(),
+        Err(_) => {
+            fatmove_cleanup(&fs);
+            return w;
+        }
+    };
+    // bit4: move root/FMB.BIN -> FMSUB/FMB.BIN; the new entry carries the SAME head, and the root name is gone.
+    if let Ok((mde, _, _)) = fs.move_entry(0, FATMOVE_B, sub, FATMOVE_B) {
+        if mde.first_cluster() == head
+            && !mde.is_dir
+            && matches!(fs.locate_in_dir(0, FATMOVE_B), Err(FatError::NotFound))
+            && fs.locate_in_dir(sub, FATMOVE_B).is_ok()
+        {
+            w |= 1 << 4;
+        }
+    }
+    // bit5: the moved file's content reads back byte-for-byte from its NEW location (chain moved by reference).
+    if let Ok((bde, _, _)) = fs.locate_in_dir(sub, FATMOVE_B) {
+        if bde.first_cluster() == head && reads_back(bde.first_cluster(), bde.size) {
+            w |= 1 << 5;
+        }
+    }
+    // bit6: move-onto-EXISTING refused. Create FMD.BIN inside FMSUB; move root/FMC.BIN -> FMSUB/FMD.BIN
+    // must fail and leave FMC.BIN in the root.
+    let fmd_made = fs.create_in_dir(sub, FATMOVE_D, 0x20).is_ok();
+    if fmd_made
+        && matches!(fs.move_entry(0, FATMOVE_C, sub, FATMOVE_D), Err(FatError::Unsupported))
+        && fs.locate_in_dir(0, FATMOVE_C).is_ok()
+    {
+        w |= 1 << 6;
+    }
+    // bit7: moving a DIRECTORY is refused. Create FMDIR in the root; move it into FMSUB must fail
+    // (`IsDirectory`) and leave FMDIR in the root.
+    let fmdir_made = fs.create_dir(0, FATMOVE_DIR).is_ok();
+    if fmdir_made
+        && matches!(fs.move_entry(0, FATMOVE_DIR, sub, FATMOVE_DIR), Err(FatError::IsDirectory))
+        && fs.locate_in_dir(0, FATMOVE_DIR).is_ok()
+    {
+        w |= 1 << 7;
+    }
+
+    fatmove_cleanup(&fs);
+    w
+}
+
+/// FATMOVE launcher + verdict — rides the U7 kernel task AFTER every prior storage selftest (its disk
+/// I/O can never perturb the 23 fixtures or the witnesses). Emits ONE uncounted `:: FATMOVE: … PASS ::`
+/// line (the k1-atr `<noun> PASS` idiom — NOT a `-> PASS` fixture line, so the count stays at 23).
+fn fatmove_launcher() {
+    static DONE: AtomicBool = AtomicBool::new(false);
+    if DONE.swap(true, Ordering::Relaxed) {
+        return;
+    }
+    if crate::drivers::block::info().is_none() {
+        return; // no SD -> the proof writes real dirs; skip silently (the control-path discipline)
+    }
+    let w = fatmove_check();
+    serial_println!(
+        ":: FATMOVE: fat.rs rename_entry(in-place 8.3 name RMW) + move_entry(dst-entry-first, then 0xE5 src keep-chain) {} (rename: name-swap, old gone/new=same head+size, content intact, onto-existing refused; move: cross-dir by-reference, content intact, onto-existing refused, directory refused) [w={:#04x}] ::",
+        if w == FATMOVE_ALL { "PASS" } else { "FAIL" },
         w
     );
 }
