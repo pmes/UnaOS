@@ -2869,6 +2869,12 @@ fn sys_unlink(handle: u64) -> i64 {
     // FAT volume is present (HELLO_STAGED): the no-FAT in-memory core has nothing to delete on disk, so a queued
     // op would just strand (the launcher skips the drain). The in-memory delete semantics below run either way —
     // the syscall still returns 0 and invalidates the caller's descriptors.
+    // STOR-1 S6a: the unlink name-state transitions (claim -> owned_clear -> pending marks -> invalidate THIS
+    // row's descriptors) run under the NAMESPACE lock, MUTUALLY ATOMIC with sibling-open / create — so no open
+    // can slip between the claim and the descriptor sweep. The last-close on-disk DELETE is lifted OUT of the
+    // lock (below): never a service-task block under the spinlock (the S5 deadlock class). RAII-held to the
+    // explicit `drop(ns)` after the sweep.
+    let ns = ns_lock();
     // U11x M2: CLAIM the unlink atomically (swap) — a SECOND unlink of the same name (e.g. another row's live
     // sibling handle after a cross-row unlink) is -ENOENT (the name is already gone), never a double-enqueue of
     // the delete op (NU10 == 1) or a double pending-mark. The claimer proceeds; its stores below complete the
@@ -2910,15 +2916,37 @@ fn sys_unlink(handle: u64) -> i64 {
     // close/teardown. (`DYN_DELETED_G` was already claimed by the swap above.)
     OPENF_PENDING[nameid].store(true, Ordering::Release);
     OPENF_HELDSLOT[nameid].store(heldslot, Ordering::Release);
+    // S6a: sweep with `files_free_clear` (the atomic clears + gen bump; NO blocking release) and drop the global
+    // open count via `openf_decref` (pure atomics). `openf_decref` returns true only when THIS row held the LAST
+    // open across ALL rows AND the synchronous knob is on — i.e. the on-disk DELETE must now run; we perform it
+    // AFTER releasing the lock. Knob-off / no-FAT: `openf_decref` does the in-memory / deferred-op release itself
+    // and returns false (byte-identical to the pre-S6 `files_free` -> `openf_release` path, whose submit leg was
+    // inert off-knob).
+    let mut need_delete = false;
     for k in 0..NFILE {
         if FILE_USED[row][k].load(Ordering::Acquire)
             && FILE_CREATED[row][k].load(Ordering::Acquire)
             && FILE_OPNAME[row][k].load(Ordering::Acquire) == opname
         {
-            files_free(row, k);
+            if let Some(n) = files_free_clear(row, k) {
+                debug_assert_eq!(n, nameid, "unlink sweep freed a descriptor of a different name");
+                if openf_decref(n) {
+                    need_delete = true;
+                }
+            }
         }
     }
     handle_clear(row, handle as usize);
+    drop(ns); // release NAMESPACE before any service-task block
+    // S6a: the deferred on-disk DELETE runs SYNCHRONOUSLY here (knob-on last close) — OUTSIDE the lock. Item-3
+    // fix (`openf_perform_delete`): the DYN_DELETED_G clear is gated on delete success (a wedged -EIO leaves the
+    // name blocked, fail-safe, rather than adopting a stale on-disk entry on re-create).
+    #[cfg(feature = "irqstorage")]
+    if need_delete {
+        openf_perform_delete(nameid);
+    }
+    #[cfg(not(feature = "irqstorage"))]
+    let _ = need_delete;
     0
 }
 
@@ -4121,6 +4149,29 @@ fn openf_decref(nameid: usize) -> bool {
     false
 }
 
+/// STOR-1 S4c/S6: run the deferred on-disk DELETE for created file `nameid` SYNCHRONOUSLY via the storage
+/// service task, then clear its `DYN_DELETED_G` gate so the name is re-creatable. `can_block` MUST hold (the
+/// caller blocks on the service task). Split out of `openf_release` so the S6 unlink sweep — which runs the
+/// name-state transitions under the NAMESPACE lock — can perform the delete AFTER releasing the lock (never a
+/// service-task block under a spinlock; the S5 deadlock class).
+///
+/// STOR-1 S6 carry-over (S4-review note 3): the flag-clear is now GATED on delete SUCCESS. Pre-S6, `-EIO` cleared
+/// `DYN_DELETED_G` unconditionally (matching the deferred drain's unconditional clear) → after a storage error a
+/// knob-on re-create idempotently ADOPTED the stale on-disk entry (a 0-length descriptor over an N-byte on-disk
+/// file). Now a failed delete LEAVES the name blocked (fail-SAFE: `-EBUSY` re-create + a chkdsk-reclaimable orphan,
+/// never a stale-entry adoption); a successful delete clears it (re-creatable, clean — the common path).
+#[cfg(feature = "irqstorage")]
+fn openf_perform_delete(nameid: usize) {
+    let name = U10_NAMES[nameid];
+    let rc = unsafe { crate::drivers::xhci::irqstorage::submit_delete(name.as_bytes()) };
+    if rc >= 0 {
+        // Delete succeeded (or the file was already absent — `submit_delete` is idempotent, returns 0): the name
+        // is truly gone, so re-open it.
+        DYN_DELETED_G[nameid].store(false, Ordering::Release);
+    }
+    // else -EIO: leave DYN_DELETED_G SET — the on-disk file may still be present, so a re-create must NOT adopt it.
+}
+
 /// STOR-1 S4c: the last-close release for created file `nameid` — decref, and if that was the last close of
 /// an unlink-PENDING file whose deferred on-disk DELETE must now run SYNCHRONOUSLY (knob-on), perform it via
 /// the storage service task. `can_block` MUST be true only where the caller can block on the service task:
@@ -4132,12 +4183,8 @@ fn openf_release(nameid: usize, can_block: bool) {
     #[cfg(feature = "irqstorage")]
     if need_delete {
         if can_block {
-            let name = U10_NAMES[nameid];
-            // A wedged transfer surfaces as -EIO; the launcher pre-flight self-heal owns on-disk cleanup on
-            // the next run, so clear the flag regardless (matching the deferred drain's unconditional clear) —
-            // the name is logically deleted and must not be left un-re-creatable.
-            let _ = unsafe { crate::drivers::xhci::irqstorage::submit_delete(name.as_bytes()) };
-            DYN_DELETED_G[nameid].store(false, Ordering::Release);
+            // Blocking-safe context — run the deferred on-disk DELETE synchronously via the service task.
+            openf_perform_delete(nameid);
         } else {
             // A last-close release in a NON-blocking teardown context (an IF=0 `exit`/reap of the current
             // task). REACHABLE — NOT by the unlinking process (its descriptors were swept at unlink), but by
@@ -4156,6 +4203,85 @@ fn openf_release(nameid: usize, can_block: bool) {
     }
     #[cfg(not(feature = "irqstorage"))]
     let _ = (need_delete, can_block);
+}
+
+// =============================================================================================
+// STOR-1 S6a — the created-file NAMESPACE lock: mutual atomicity for the coupled name SEQUENCES (the x86 twin
+// of the pi4 F3 `NAMESPACE`). S5 narrowed the recycle/open-vs-unlink windows to fail-SAFE (a sibling can only
+// ever name the caller-verified name-id) but left the source-resolve + re-validate NON-atomic. S6 closes them
+// airtight: one lock makes the three created-name sequences mutually atomic, so no unlink/create can interleave
+// inside another sequence's resolve→claim.
+//
+//   * SIBLING OPEN (`sys_open_dynamic` created branch): DYN_DELETED_G check -> `created_desc_any_row` resolve ->
+//     re-check -> ACL -> `open_created_sibling` (re-validate the source + claim a descriptor). No submit — the
+//     whole sequence runs under the lock.
+//   * FRESH CREATE (`open_create_new`): re-check DYN_DELETED_G -> idempotent `created_desc_any_row` (a racing
+//     create won -> open a sibling instead, ACL-checked) -> claim the descriptor + record the owner. The
+//     idempotent on-disk `submit_create` runs BEFORE the lock (see `open_create_new`).
+//   * UNLINK (`sys_unlink`): claim the name (DYN_DELETED_G swap) -> owned_clear -> pending marks -> invalidate
+//     THIS row's descriptors (the atomic clears). The last-close on-disk DELETE runs AFTER the lock drops.
+//
+// ⚠ SPAN — the S5 DEADLOCK LESSON BINDS: the lock is IRQ-masked and held for the O(1) IN-MEMORY namespace
+// decision ONLY, NEVER across a `submit`/BOT pump. Routing a blocking service-task round-trip under this
+// spinlock re-creates the S5 deadlock class (a holder blocked on the service task while other cores spin on the
+// lock). So both blocking disk ops are lifted OUT of the locked region: the idempotent `submit_create` runs
+// before the lock (in `open_create_new`), and the last-close `submit_delete` runs after it (in `sys_unlink` +
+// `openf_release`). The disk create/delete are idempotent AND serialized by the single service-task BOT writer,
+// so lifting them out re-introduces no disk-level race; the lock closes the IN-MEMORY namespace (identity / ACL
+// / refcount / descriptor-slot) race, which is the actual S5 residual.
+//
+// WHY sys_close/`files_free` need NOT take the lock: completing the recycle requires a `files_alloc` REUSE of a
+// freed slot, and every created-file `files_alloc` happens INSIDE a namespace sequence (the open paths) under
+// this lock — so a reuse cannot slip into another sequence's resolve. A bare `files_free` (close) that lands
+// mid-resolve only makes the re-validate fail closed (`-ENOENT`, fail-safe), it cannot rebind a slot to a live
+// different-name descriptor without an alloc. And the unlink+re-create reincarnation leg cannot interleave
+// because unlink and create are themselves namespace sequences (one lock).
+//
+// LOCK ORDER: `NAMESPACE` ⊃ { `OWNED_FILES`, the FILE_*/handle atomics }. Inner accesses (`owned_*`,
+// `files_alloc`/`files_free` clears, `openf_incref`/`openf_decref`, `install_file_handle`) run freely while
+// NAMESPACE is held; NAMESPACE is never re-acquired while held (spin::Mutex is NOT reentrant — the sequences
+// above take it exactly once). x86-only file; no cfg gate needed on the lock itself.
+
+/// STOR-1 S6a: an IRQ-mask RAII (the x86 `IrqGuard` — x86 has only the `without_interrupts` closure form, so
+/// this gives the pi4 RAII shape the namespace sequences need across their early returns). Masks on construct,
+/// restores the PRIOR IF on drop. In a syscall handler IF is already 0 (SFMASK) so this is inert (stays masked);
+/// in a launcher/IF=1 kernel task it masks for the lock hold and restores on release.
+struct IrqGuard {
+    was_enabled: bool,
+}
+
+impl IrqGuard {
+    fn mask_save() -> Self {
+        let was_enabled = x86_64::instructions::interrupts::are_enabled();
+        x86_64::instructions::interrupts::disable();
+        IrqGuard { was_enabled }
+    }
+}
+
+impl Drop for IrqGuard {
+    fn drop(&mut self) {
+        if self.was_enabled {
+            x86_64::instructions::interrupts::enable();
+        }
+    }
+}
+
+/// STOR-1 S6a: the created-file namespace lock (a `()` mutex — it guards SEQUENCES, not data; the tables keep
+/// their own atomics). One volume -> one static, mirroring the pi4 F3 `NAMESPACE`.
+static NAMESPACE: SpinMutex<()> = SpinMutex::new(());
+
+/// STOR-1 S6a: the RAII hold on [`NAMESPACE`]. Field order is load-bearing: `_lock` drops FIRST (release the
+/// mutex), `_irq` LAST (restore IF) — the lock is never held with IRQs unmasked.
+struct NsGuard {
+    _lock: spin::mutex::MutexGuard<'static, (), spin::relax::Spin>,
+    _irq: IrqGuard,
+}
+
+/// STOR-1 S6a: mask IRQs, then take the namespace lock. See the `NAMESPACE` section header for span + ordering.
+fn ns_lock() -> NsGuard {
+    let irq = IrqGuard::mask_save();
+    let lock = NAMESPACE.lock();
+    NsGuard { _lock: lock, _irq: irq }
 }
 
 // =============================================================================================
@@ -4907,8 +5033,14 @@ fn files_alloc(row: usize, staged_idx: u32, size: u32, wstage: u32, cluster: u32
 /// per-handle drop `sys_cap_revoke` performs on a File. Clears the fields then drops `FILE_USED` LAST
 /// (Release), so the slot is never seen free with stale fields. U9x: a RW descriptor's writable staging slot
 /// is freed too (no writable buffer outlives its descriptor — pi4's backing is the disk; x86's is the pool).
-fn files_free(row: usize, idx: usize) {
-    debug_assert!(row < FILE_USED.len() && idx < NFILE, "files_free: out of range");
+/// The FILE_* descriptor clear + generation bump for `[row][idx]` — everything `files_free` does EXCEPT the
+/// final `openf_release`. Returns the created-file name-id (if this was a created descriptor) so the caller can
+/// perform the global-refcount release in the RIGHT context. Pure atomics + a wstage free — no service-task
+/// block. S6: the `sys_unlink` sweep runs THIS under the NAMESPACE lock (atomic slot clears) and defers the
+/// last-close on-disk delete to AFTER the lock (never a submit under the spinlock — the S5 deadlock class);
+/// every other caller uses `files_free` (clear + release together in one blocking-safe step).
+fn files_free_clear(row: usize, idx: usize) -> Option<usize> {
+    debug_assert!(row < FILE_USED.len() && idx < NFILE, "files_free_clear: out of range");
     // U11x M2: capture the created-file identity BEFORE the clears — the decref (below, after the descriptor is
     // fully released) needs it. Every created descriptor was incref'd exactly once at open (before its handle
     // installed), so every release path through here (SYS_CLOSE, revoke, sys_open unwind, the unlink sweep)
@@ -4943,15 +5075,18 @@ fn files_free(row: usize, idx: usize) {
     // validator that observed the slot LIVE with the old gen resolved a genuinely-live descriptor (the same
     // file); the rebind window only opens once the slot is both free AND reused.
     FILE_GEN[row][idx].fetch_add(1, Ordering::AcqRel);
-    // U11x M2: the descriptor is fully released — drop its global open count. The LAST decref of an
-    // unlink-pending file releases the deferred delete (see `openf_release`/`openf_decref`). S4c: `files_free`
-    // is always a BLOCKING-SAFE context (a syscall handler — sys_close / the sys_unlink sweep / revoke /
-    // open-unwind — or the launcher's direct `files_free`; NEVER an IF=0 self-teardown), so the synchronous
-    // on-disk delete may block here.
-    if let Some(nameid) = openf_nameid {
-        if nameid < N_U10_NAMES {
-            openf_release(nameid, true);
-        }
+    // U11x M2: the descriptor is fully released — return the created-file name-id (bounded) so the caller drops
+    // its global open count in the right context (S6 defers the sweep's release out of the namespace lock).
+    openf_nameid.filter(|&n| n < N_U10_NAMES)
+}
+
+/// Release open-file descriptor `[row][idx]`: clear its state, then (created files) drop the global open count.
+/// S4c: `files_free` is always a BLOCKING-SAFE context (a syscall handler — sys_close / revoke / open-unwind — or
+/// a launcher's direct call; NEVER an IF=0 self-teardown, and NEVER under the NAMESPACE lock), so the last-close
+/// synchronous on-disk delete may block here.
+fn files_free(row: usize, idx: usize) {
+    if let Some(nameid) = files_free_clear(row, idx) {
+        openf_release(nameid, true);
     }
 }
 
@@ -5156,12 +5291,19 @@ fn sys_open_dynamic(row: usize, name: &str, mode: u64) -> i64 {
         return EACCES; // a created descriptor is RW; SHARED_ROW is refused (the writable-open discipline)
     }
     if let Some(nameid) = u10_name_id(name) {
+        // STOR-1 S6a: the SIBLING-DECISION sequence runs under the NAMESPACE lock — deleted-check -> resolve ->
+        // ACL -> open-sibling are now MUTUALLY ATOMIC against `sys_unlink` and `open_create_new`, so no unlink or
+        // create can interleave inside the resolve->claim (retiring S5's non-atomic source-resolve + re-validate
+        // residual). No `submit` runs in this region (the sibling path is pure atomics), so the lock is never
+        // held across a service-task block — the S5 deadlock class stays closed. RELEASED before the create path
+        // below (`open_create_new` takes NAMESPACE itself; spin::Mutex is not reentrant).
+        let ns = ns_lock();
         // U11x M2: the DELETED check comes FIRST — before the any-row scan and before any resource claim. An
         // unlinked name is gone for EVERY row the moment `sys_unlink` sets the global flag, even while other
         // rows' descriptors keep the file's content alive (the deferral): a plain re-open is `-ENOENT`, and an
-        // O_CREAT re-create is `-EBUSY` until the deferred on-disk delete completes (drains, or — no-FAT — the
-        // last close releases). Checking the sibling scan first would let ANY process re-open an unlink-pending
-        // file by name (and incref it), un-deleting it — the ordering is load-bearing.
+        // O_CREAT re-create is `-EBUSY` until the deferred on-disk delete completes. Under the S6a lock this and
+        // the resolve below are atomic, so the S5b post-resolve re-check is subsumed (nothing can claim the name
+        // mid-sequence) — the ordering that mattered pre-S6 is now enforced by exclusion.
         if DYN_DELETED_G[nameid as usize].load(Ordering::Acquire) {
             return if create { EBUSY } else { ENOENT };
         }
@@ -5171,17 +5313,6 @@ fn sys_open_dynamic(row: usize, name: &str, mode: u64) -> i64 {
         // requested rights follow the open mode (RW or O_CREAT -> R|W; else R); a denial is a clean -EACCES with
         // nothing claimed. The gen fence is the caller's CURRENT SLOT_GEN.
         if let Some((srcrow, existing)) = created_desc_any_row(row, nameid) {
-            // STOR-1 S5b (residual 4, open-vs-unlink TOCTOU): re-check the global deleted flag AFTER resolving. A
-            // concurrent unlink on another core could have claimed the name between the first check above and this
-            // resolve; opening a sibling now would incref a doomed name. Fail closed exactly as the first check (a
-            // plain re-open -> -ENOENT, an O_CREAT re-create -> -EBUSY). Under S5a reads are live shared backing,
-            // so even a slipped-through open reads the deferred (still-on-disk until last close) file — never a
-            // torn/stale snapshot — but this makes the fail-closed semantics explicit and keeps
-            // re-open-after-unlink -> -ENOENT. (The residual re-check -> incref window is narrowed here + by
-            // open_created_sibling's source re-validation; the airtight fix is the S6 namespace lock.)
-            if DYN_DELETED_G[nameid as usize].load(Ordering::Acquire) {
-                return if create { EBUSY } else { ENOENT };
-            }
             let requested = if mode & 1 != 0 || create { CAP_READ | CAP_WRITE } else { CAP_READ };
             let caller_gen = SLOT_GEN[row].load(Ordering::Acquire);
             if !owned_access_ok(nameid as usize, row, caller_gen, requested) {
@@ -5189,6 +5320,7 @@ fn sys_open_dynamic(row: usize, name: &str, mode: u64) -> i64 {
             }
             return open_created_sibling(row, srcrow, existing, nameid as usize, requested);
         }
+        drop(ns); // not a live sibling — release the lock before the create path re-acquires it
     }
     // O_CREAT of a creatable name -> a fresh 0-length created file (the first write grows it). U6x: owned-by-
     // default unless O_PUBLIC (opt out into world-access).
@@ -5227,6 +5359,28 @@ fn open_create_new(row: usize, nameid: u32, public: bool) -> i64 {
             return EIO;
         }
     }
+    // STOR-1 S6a: the IN-MEMORY claim is atomic against a concurrent sibling-open / unlink under NAMESPACE. The
+    // idempotent `submit_create` above ran BEFORE the lock (never a service-task block under the spinlock — the
+    // S5 deadlock class). RAII-held to function end / every early return.
+    let _ns = ns_lock();
+    // Authoritative deleted re-check under the lock — a concurrent unlink could have claimed the name since the
+    // racy pre-check above (or since this caller's `sys_open_dynamic` resolve found nothing).
+    if (nameid as usize) < N_U10_NAMES && DYN_DELETED_G[nameid as usize].load(Ordering::Acquire) {
+        return EBUSY;
+    }
+    // A racing O_CREAT on another core may have created this name since the caller decided to create (its
+    // `sys_open_dynamic` resolve found nothing, then released the lock before calling here; a direct launcher
+    // create can also target an already-live name). Open a SIBLING idempotently rather than minting a SECOND
+    // descriptor + a second owner row (which would STEAL ownership from the winning creator). ACL-checked — the
+    // winner may have created it private. The demo callers are single-threaded at setup, so this never fires for
+    // them (byte-identical); it closes the create-races-create window on true SMP.
+    if let Some((srcrow, existing)) = created_desc_any_row(row, nameid) {
+        let caller_gen = SLOT_GEN[row].load(Ordering::Acquire);
+        if !owned_access_ok(nameid as usize, row, caller_gen, CAP_READ | CAP_WRITE) {
+            return EACCES;
+        }
+        return open_created_sibling(row, srcrow, existing, nameid as usize, CAP_READ | CAP_WRITE);
+    }
     let Some(w) = wstage_alloc(&[]) else {
         return EMFILE; // the writable staging pool is full
     };
@@ -5261,14 +5415,13 @@ fn open_create_new(row: usize, nameid: u32, public: bool) -> i64 {
 /// (reads still serve wstage) — byte-identical to pre-S5. `sys_unlink` invalidates every sibling of a name in the
 /// unlinking row via the shared `FILE_OPNAME` name-id.
 fn open_created_sibling(row: usize, srcrow: usize, existing: usize, nameid: usize, rights: u32) -> i64 {
-    // STOR-1 S5b (SF-3, residual 4 recycle-to-wrong-file): `created_desc_any_row` resolved `[srcrow][existing]`
-    // WITHOUT a lock, so on metal it could have been closed since (`files_free` bumps the gen + clears
-    // FILE_OPNAME/FILE_CREATED) and its slot first-fit-REUSED for a DIFFERENT name. Re-validate the source STILL
-    // is a live created descriptor for the caller-verified `nameid`; else the slot was recycled — fail closed
-    // (`-ENOENT`) rather than open a sibling of the WRONG file (which under S5a would read that other file's LIVE
-    // bytes: cross-file disclosure + ACL bypass). Stamping identity from `nameid` (not a re-read of the source's
-    // opname) means the sibling can only ever name the file the ACL admitted. (The source read + this re-check are
-    // not atomic — the airtight fix is the S6 namespace lock; this narrows the window to a couple of loads.)
+    // STOR-1 S6a: every caller of `open_created_sibling` now holds the NAMESPACE lock (the `sys_open_dynamic`
+    // sibling branch + the `open_create_new` race fallback), so `created_desc_any_row`'s resolve and this
+    // re-validation are ATOMIC against any close+first-fit-reuse of `[srcrow][existing]` — the recycle window S5
+    // could only NARROW (SF-3) is now CLOSED. This source re-validation is kept as defense-in-depth (provably
+    // passes under the lock): re-check the source STILL is a live created descriptor for the caller-verified
+    // `nameid`; else fail closed (`-ENOENT`). Stamping identity from `nameid` (never a re-read of the source's
+    // opname) keeps the sibling naming only the file the ACL admitted.
     if !(FILE_USED[srcrow][existing].load(Ordering::Acquire)
         && FILE_CREATED[srcrow][existing].load(Ordering::Acquire)
         && FILE_OPNAME[srcrow][existing].load(Ordering::Acquire) as usize == nameid + 1)
@@ -5343,6 +5496,14 @@ fn sys_open(name_ptr: u64, name_len: u64, mode: u64) -> i64 {
     let Some((sidx, size)) = staged_lookup(name) else {
         return sys_open_dynamic(row, name, mode);
     };
+    sys_open_staged(row, sidx, size, mode)
+}
+
+/// The STAGED half of `sys_open` — factored out so the MF2 immutable-code guard is exercisable by a kernel-side
+/// witness (`mf2_witness`) without a ring-3 name pointer. Reached with `sidx`/`size` from `staged_lookup`. Behaviour
+/// is UNCHANGED (a pure extraction of the pre-S6 body): claim resources LAST — a RW open's writable staging slot,
+/// then a descriptor, then a handle — each failure unwinding the prior claims.
+fn sys_open_staged(row: usize, sidx: u32, size: u32, mode: u64) -> i64 {
     // 3. Claim resources LAST — for a RW open, a writable staging slot FIRST (seeded from the file's staged
     //    content, so a read before any write sees the original bytes), then a descriptor, then a handle. RO
     //    (bit0 clear) keeps the U6bx read-only path: no writable slot, `CAP_READ` only.
@@ -9533,6 +9694,18 @@ fn u11m2_phase(srow: usize, demo_cpu: usize, via_teardown: bool, want_done: u32)
             !DYN_DELETED_G[nameid].load(Ordering::Acquire)
         };
 
+    // STOR-1 S6 carry-over (seat fold-in 2): witness WHICH last-close release path fired, so the metal-only
+    // interleaving is mbench-VISIBLE rather than attended-eyeball. Knob-on the SYNCHRONOUS in-syscall delete won
+    // (no held op — `openf_release`/the S6 unlink sweep ran `submit_delete`); the knob-off/deferred held-op
+    // outcome is already implied by the phase PASS line, so only the knob-on distinction is emitted. Uncounted
+    // idiom (no ` PASS`/`FAIL ::`).
+    #[cfg(feature = "irqstorage")]
+    if s4_sync_storage() {
+        serial_println!(
+            ":: S4-race({}): last close took the SYNCHRONOUS in-syscall delete path (no held op) — c2={} — witness OK ::",
+            phase, c2
+        );
+    }
     // Drain at IF=1: knob-off replays exactly the ONE released delete op, every disk step true; knob-on the
     // delete already ran synchronously at the release, so the queue is EMPTY (count 0). Either way prove on
     // disk: DEFER.BIN GONE, its cluster `f0` freed in every FAT copy + re-allocatable, and the name
@@ -9643,6 +9816,39 @@ fn s5_witness_run(r1: usize, r2: usize, nameid: usize) -> Option<bool> {
 /// sibling returns the correct pattern from an EMPTY-wstage sibling -> the read can only be live). Every leg tears
 /// the scratch rows down via the real teardown funnel (decrefs OPENF[DEFER] to 0) + deletes the on-disk file +
 /// asserts the name is left idle — never a force-store of OPENF/DYN_DELETED_G, never a stranded slot/refcount.
+/// STOR-1 S6 carry-over (seat fold-in 1): witness MF2 — a WRITABLE open of HELLO.BIN (staged index 0, immutable
+/// EL0 code) is refused `-EACCES`. Kernel-side: resolve HELLO.BIN's staged index, then drive a RW open through the
+/// REAL staged-open guard (`sys_open_staged`) on a scratch PRIVATE row. A private row proves MF2 in ISOLATION —
+/// NOT SHARED_ROW (whose own RW refusal would mask MF2; MF2 is checked FIRST, so this is faithful). Uncounted idiom
+/// (no ` PASS`/`FAIL ::`). Gated on the knob-on FAT path (bench media is knob-on and HELLO.BIN is staged there);
+/// MF2 itself is knob-INDEPENDENT (immutable code is read-only in both states) — this witness just makes it
+/// mbench-visible on the knob-on bench.
+#[cfg(feature = "irqstorage")]
+fn mf2_witness() {
+    if !s4_sync_storage() {
+        return;
+    }
+    let Some((sidx, size)) = staged_lookup("HELLO.BIN") else {
+        return; // HELLO.BIN not staged — nothing to witness
+    };
+    if sidx != 0 {
+        return; // HELLO.BIN must be staged index 0 (the immutable-code slot MF2 guards)
+    }
+    let Some(r) = crate::arch::memory::alloc_user_space() else {
+        return; // no scratch address space — silent skip
+    };
+    let rc = sys_open_staged(r, sidx, size, 1); // RW (mode bit0) open of immutable staged code
+    // Reclaim the whole scratch row (nothing was installed on the -EACCES path; belt-and-braces if it ever were).
+    crate::arch::memory::free_user_space_by_cr3(crate::arch::memory::slot_cr3(r));
+    if rc == EACCES {
+        serial_println!(
+            ":: S4-mf2: RW open of staged code (HELLO.BIN) refused -EACCES == expected — witness OK ::"
+        );
+    } else {
+        serial_println!(":: S4-mf2 FAIL — RW open of HELLO.BIN returned {} (want -EACCES) ::", rc);
+    }
+}
+
 #[cfg(feature = "irqstorage")]
 fn s5_shared_backing_witness() {
     // Gate: created reads route live ONLY knob-on with a mounted FAT + the service task up. Off -> SILENT skip.
@@ -9687,6 +9893,110 @@ fn s5_shared_backing_witness() {
     }
 }
 
+// =============================================================================================
+// STOR-1 S6b — the NAMESPACE-lock cross-core witness (the pi4 F3 `f3_witness` twin). Proves the S6a lock HOLDS:
+// two cores drive a non-atomic RMW of a scratch counter with a WIDE read->write window, once serialized through
+// the REAL `ns_lock` and once un-serialized. LOCKED must reach `2*N` (no lost update -> the lock serializes);
+// the UNLOCKED control loses increments UNDER TRUE PARALLELISM. In-RAM only (no service task, no disk) — never a
+// submit, so it cannot re-enter the S5 deadlock class, and it runs BEFORE u6gx spawns its cooperative spinners.
+// **QEMU-green ≠ correct (design risk 3):** under RR-TCG the cores rarely interleave, so the unlocked control
+// shows ZERO loss here — the negative is metal-latent; the POSITIVE (the lock engaged + the serialized path
+// reaches `2*N`) is what this proves in QEMU. Emits one `S6-witness:` line — NOT a `-> PASS`/`FAIL ::` line, so
+// the fixture PASS count stays byte-equivalent. Knob-on FAT only (keeps knob-off byte-identical).
+#[cfg(feature = "irqstorage")]
+static S6_WITNESS_COUNTER: AtomicU32 = AtomicU32::new(0);
+
+/// S6b witness — one non-atomic RMW of the scratch counter with a wide read->write window (the F2/F3 step shape).
+#[cfg(feature = "irqstorage")]
+#[inline(never)]
+fn s6_witness_step() {
+    let v = S6_WITNESS_COUNTER.load(Ordering::Relaxed);
+    for _ in 0..48 {
+        core::hint::spin_loop();
+    }
+    S6_WITNESS_COUNTER.store(v.wrapping_add(1), Ordering::Relaxed);
+}
+
+/// S6b witness — drive `iters` steps, optionally serialized through the REAL namespace lock (`ns_lock`).
+#[cfg(feature = "irqstorage")]
+fn s6_witness_rmw(iters: u32, locked: bool) {
+    for _ in 0..iters {
+        if locked {
+            let _ns = ns_lock();
+            s6_witness_step();
+        } else {
+            s6_witness_step();
+        }
+    }
+}
+
+#[cfg(feature = "irqstorage")]
+fn s6_witness_worker_locked(iters: usize) {
+    s6_witness_rmw(iters as u32, true);
+}
+
+#[cfg(feature = "irqstorage")]
+fn s6_witness_worker_unlocked(iters: usize) {
+    s6_witness_rmw(iters as u32, false);
+}
+
+/// S6b — the cross-core witness for the S6a NAMESPACE serialization. This task drives its half inline on its own
+/// core (`vcpu`); a joinable worker runs on `demo_cpu` (a distinct schedulable AP), so the two halves execute on
+/// two cores. Gated on the knob-on FAT path (byte-identical knob-off). Runs from `u11m2_launcher` BEFORE u6gx
+/// spawns its cooperative spinners.
+#[cfg(feature = "irqstorage")]
+fn s6_witness_launcher(demo_cpu: usize) {
+    if !s4_sync_storage() {
+        return;
+    }
+    const N: u32 = 120_000;
+    let want = 2 * N;
+
+    S6_WITNESS_COUNTER.store(0, Ordering::SeqCst);
+    let h = crate::arch::sched::spawn_joinable(
+        "s6-witness-lk",
+        s6_witness_worker_locked,
+        N as usize,
+        demo_cpu,
+        crate::arch::sched::PRIO_NORMAL,
+    );
+    s6_witness_rmw(N, true);
+    h.join();
+    let locked_got = S6_WITNESS_COUNTER.load(Ordering::SeqCst);
+
+    S6_WITNESS_COUNTER.store(0, Ordering::SeqCst);
+    let h2 = crate::arch::sched::spawn_joinable(
+        "s6-witness-ul",
+        s6_witness_worker_unlocked,
+        N as usize,
+        demo_cpu,
+        crate::arch::sched::PRIO_NORMAL,
+    );
+    s6_witness_rmw(N, false);
+    h2.join();
+    let unlocked_got = S6_WITNESS_COUNTER.load(Ordering::SeqCst);
+    let unlocked_lost = want.saturating_sub(unlocked_got);
+
+    if locked_got == want {
+        if unlocked_lost > 0 {
+            serial_println!(
+                ":: S6-witness: NAMESPACE cross-core RMW (worker on cpu {}) — locked {}/{} intact (0 lost); unlocked lost {}/{} -> the created-file open/create/unlink sequence lock serializes under real contention -> witness OK ::",
+                demo_cpu, locked_got, want, unlocked_lost, want
+            );
+        } else {
+            serial_println!(
+                ":: S6-witness: NAMESPACE cross-core RMW (worker on cpu {}) — locked {}/{} intact; unlocked also 0 lost (QEMU RR-TCG did not interleave — cross-core contention is metal-only), lock engaged + serialized path intact -> witness OK ::",
+                demo_cpu, locked_got, want
+            );
+        }
+    } else {
+        serial_println!(
+            ":: S6-witness FAIL — NAMESPACE cross-core RMW (worker on cpu {}) — locked {}/{}, LOST {} increments UNDER the lock -> SERIALIZATION REGRESSION ::",
+            demo_cpu, locked_got, want, want - locked_got
+        );
+    }
+}
+
 /// U11x M2 launcher + verdict — cross-process unlink-defers-free, the x86 twin of pi4 U11 M2/M2b (aarch64
 /// `b88d2ba`/`303e271`): a file's deferred on-disk DELETE fires at the LAST close ACROSS PROCESSES, not at
 /// unlink — the launcher's IF=1 drain playing the pi4 reaper. Two phases over the same machinery, one per
@@ -9708,6 +10018,9 @@ fn u11m2_launcher(demo_cpu: usize) {
     // (idempotent self-heal + a post-cleanup OPENF/DYN_DELETED_G assert). SILENT skip off the knob-on FAT path.
     #[cfg(feature = "irqstorage")]
     s5_shared_backing_witness();
+    // STOR-1 S6 carry-over (seat fold-in 1): witness MF2's immutable-code RW refusal (knob-on FAT, uncounted).
+    #[cfg(feature = "irqstorage")]
+    mf2_witness();
     let Some(srow) = crate::arch::memory::alloc_user_space() else {
         serial_println!(":: U11m2: no free scratch slot — cross-process unlink demo skipped ::");
         return;
@@ -9739,6 +10052,10 @@ fn u11m2_launcher(demo_cpu: usize) {
     } else {
         serial_println!(":: U11m2: cross-process unlink-defers-free FAIL — p1={} p2={} ::", p1, p2);
     }
+    // STOR-1 S6b: prove the NAMESPACE lock HOLDS (cross-core, in-RAM, no submit). Runs BEFORE u6gx spawns its
+    // cooperative spinners (no IF=0 spinner co-located → no deadlock class). Knob-on FAT only (byte-identical off).
+    #[cfg(feature = "irqstorage")]
+    s6_witness_launcher(demo_cpu);
     // U6x: chain the owner/grants ACL demo (program order, the u9x->..->u11m2 idiom; the LAST demo in the chain).
     u6gx_launcher(demo_cpu);
 }
@@ -9922,12 +10239,19 @@ fn u6gx_launcher(_demo_cpu: usize) {
     // OWNED.BIN delete) so nothing strands; on the no-FAT path the last close already cleared DYN_DELETED_G.
     // Either way the name is re-creatable again and the owner/grants row is EMPTY (public).
     let disk_present = HELLO_STAGED.load(Ordering::Acquire);
-    if disk_present {
-        if let Ok(fs) = crate::fs::fat::mount() {
-            while u10_flush_drain_one(&fs).is_some() {}
+    // STOR-1 S6 carry-over (S4-review note 4): tighten the u6gx drain to a VERDICT (u11m2 already asserts it) —
+    // knob-on the delete ran SYNCHRONOUSLY at B's last close, so `count == 0` (nothing enqueued); knob-off exactly
+    // A's OWNED.BIN delete op replayed. Either way `released` now requires the drain verdict, not just a lenient sweep.
+    let drain_ok = if disk_present {
+        match crate::fs::fat::mount() {
+            Ok(fs) => u10_drain_verdict(&fs).0,
+            Err(_) => false,
         }
-    }
-    let released = OPENF_REFS[nameid].load(Ordering::Acquire) == 0
+    } else {
+        true // no-FAT: the last close already cleared DYN_DELETED_G; nothing to drain
+    };
+    let released = drain_ok
+        && OPENF_REFS[nameid].load(Ordering::Acquire) == 0
         && !OPENF_PENDING[nameid].load(Ordering::Acquire)
         && !DYN_DELETED_G[nameid].load(Ordering::Acquire)
         && owned_is_public(nameid);

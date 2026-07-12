@@ -314,6 +314,43 @@ Legend: **✅ metal-confirmed** · **🔬 QEMU-green, metal pending** · dates I
   artifact orthogonal to the mechanism (evidence archived). ⚠ Bench-mechanics lesson: `scripts/card-watch.sh`
   (the diskutil insert-poller) trips a Claude-app/macOS-TCC security feature that REVOKES the app's
   removable-volume write access mid-bench — flash all cards FIRST, don't arm it when you still need to write one.
+
+### STOR-1 S6 — the syscall-layer NAMESPACE lock (closes S5 residual 1 airtight) (2026-07-11) `hw-rmbp`
+- **What:** an IRQ-masked `SpinMutex` (`NAMESPACE`/`ns_lock`, `arch/x86_64/syscall.rs`, the pi4 F3 `NAMESPACE`
+  twin) makes the THREE created-file name sequences MUTUALLY ATOMIC — the sibling-open decision
+  (`sys_open_dynamic`), the fresh create (`open_create_new`, now with an ACL-checked idempotent-sibling
+  fallback that also closes a create-races-create ownership-theft window), and the `sys_unlink` claim + sweep.
+  This closes S5's residual 1 AIRTIGHT: the non-atomic `created_desc_any_row` source-resolve + `== nameid+1`
+  re-validate (a metal-only recycle-to-a-different-name / same-name-reincarnation window) is now impossible —
+  no unlink/create can interleave inside another sequence's resolve→claim.
+- **⚠ The S5 deadlock lesson binds:** the lock is held for the O(1) IN-MEMORY namespace decision ONLY, NEVER
+  across a `submit`/BOT pump. The two blocking disk ops are lifted OUT — the idempotent `submit_create` runs
+  BEFORE the lock, the last-close `submit_delete` AFTER it (`files_free` split into `files_free_clear` [atomic
+  clears, lock-safe] + `openf_release` [blocking, lock-free]; `sys_unlink` performs the delete post-`drop(ns)`).
+  Idempotent + single-service-task-serialized disk ops → lifting them out re-introduces no disk race.
+  `sys_close`/`files_free` need NOT take the lock (a recycle needs a `files_alloc` REUSE, which only runs inside
+  a lock-held open; a bare close mid-resolve just fails the re-validate closed, fail-safe).
+- **§6 decision 2 RESOLVED:** `FAT_MUTATION` is NOT activated on x86 — VACUOUS under the single-service-task-
+  writer invariant (the pi4 FAT lost-update RMW race is unreachable with exactly one BOT writer); the gap was
+  syscall-layer namespace atomicity, not the FAT RMW. `fat.rs` (shared kernel-core) stays untouched — in lane.
+- **Carry-overs folded (seat fold-ins):** the `-EIO` synchronous delete now gates its `DYN_DELETED_G` clear on
+  delete SUCCESS (`openf_perform_delete`) — a wedged delete leaves the name blocked (fail-SAFE) rather than a
+  re-create adopting a stale on-disk entry; + three uncounted mbench witnesses (`S4-mf2` immutable-code RW
+  refusal; `S4-race` last-close synchronous-delete outcome; `S6-witness` lock-holds) + a u6gx drain-verdict
+  tighten (`count==0` knob-on).
+- **Witness:** `s6_witness_launcher` (`:: S6-witness: … witness OK ::`, uncounted, knob-on FAT) — a cross-core
+  in-RAM RMW on the SAME `ns_lock`: LOCKED reaches `2*N` intact, the UNLOCKED control loses under contention.
+  QEMU actually interleaved this run (locked 240000/240000, unlocked lost ~119800/240000) → the lock closes a
+  REAL race (the positive proof; true-parallelism otherwise metal-latent, design risk 3).
+- **Gate:** `./arroyo check` both arches (on+off, zero aarch64); knob-ON `UNAOS_IRQSTORAGE=1 UNAOS_FATIMG=sf
+  test` = full chain 0 FAIL with `:: S3/S4/S5:` + `:: S4-mf2/S4-race/S6-witness:` witnesses + u10c/u11m2/u6gx
+  created reads served LIVE + u6gx PASS; knob-ON `test 40` = MISSION + `bx-blockreq` (no FAT witnesses);
+  knob-OFF `test 40` = MISSION and `UNAOS_FATIMG=sf test` = BYTE-IDENTICAL (no S3/S4/S5/S6/witness lines — the
+  NAMESPACE lock is uncontended-transparent knob-off); `UNAOS_NOSTORAGE` clean both. Lane: `arch/x86_64/
+  syscall.rs` only; `fat.rs`/`block.rs` reused unchanged; **zero aarch64**.
+- **Metal:** the lock's true-parallelism proof is metal-only — rides the same attended rMBP bench as S4/S5
+  (transfer-IRQ I/O + create/grow/delete + cross-process read/write + the namespace-lock witness + fsck).
+
 ## hw-pi4 track — 2026-07-10 (K1 M2–M4 — the U6 ACL SURVIVES REBOOT: persist + rebuild + gated enforcement + proofs)
 
 ### K1 M2.2/M2.3/M2.4 + M3 + M4 — `UNAFS.ATR` persistence LANDED 🔬 `hw-pi4`
