@@ -130,6 +130,10 @@ fn resolve_path(fs: &FatFs, path: &str) -> Result<Resolved, String> {
 // directory — use `rmdir`), and `rmdir` removes an EMPTY directory (non-empty ⇒ `-ENOTEMPTY`, the
 // root refused). The seam's internal F3 locking is sound for these EL1 callers without the syscall
 // NAMESPACE lock (it reaches fat.rs directly) — see fat.rs's FATDIRS block + docs/SECURITY.md.
+// JD8 layers `cp <src> <dst>` (file copy) on the SAME primitives — no new fat.rs surface: it STREAMS
+// the source through the offset-aware `read_at` into the create-or-truncate `create_in_dir`/
+// `write_grow` write path (the `cp FILE DIR/` idiom lands the copy under the source leaf; a directory
+// source is `-EISDIR` — recursive `cp -r` is a JD9 candidate).
 //
 // SAFETY (M3): every fat.rs write returns a `Result`; a stalled USB write surfaces as
 // `FatError::Io` (the block layer's `write_block` rides the SAME JD3 wall-clock-bounded BOT pump as
@@ -426,6 +430,113 @@ fn fs_rmdir(console: &mut Console, arg: &str) {
     }
 }
 
+/// JD8 `cp <src> <dst>`: copy a FILE to a new location, composing the read path (`read_at`) with the
+/// JD6 create-or-truncate write path (`create_in_dir` + `write_grow`) — NO fat.rs mutation, exactly
+/// JD7's nature (it only CALLS existing public API). `src` must be a file (a directory source is
+/// `-EISDIR` — recursive `cp -r` is a JD9 candidate, out of scope this arc). If `dst` resolves to an
+/// existing DIRECTORY the copy lands as `dst/<src-leaf>` (the `cp FILE DIR/` idiom); otherwise `dst`
+/// names the destination file (created, or truncated in place if it already exists). Honest errors:
+/// src missing → `-ENOENT`; src is a dir → `-EISDIR`; dst parent missing → `-ENOENT`; dst parent is a
+/// file → `-ENOTDIR`; the volume/dir full → `-ENOSPC`; copying a file onto itself (same canonical
+/// path) → `-EINVAL`.
+///
+/// SIZE HANDLING (JD8-M2 decision): the copy STREAMS the bytes in fixed windows via the offset-aware
+/// `read_at` (existing public fat.rs API — the U9/read-path twin of `read_file`, so this reaches for
+/// no NEW primitive) feeding `write_grow`, so a file of ANY size copies with a bounded
+/// (`CP_WINDOW`-byte) heap footprint and NO truncation. There is deliberately no size ceiling. The
+/// per-window `write_grow` re-walks the growing destination chain (bounded, and every FAT/data access
+/// rides the JD3 wall-clock BOT pump — a stalled transfer is `-EIO`, never a hang on the timerless EL1
+/// core); a future single-pass primitive could tighten that, tracked as a JD9 note.
+fn fs_cp(console: &mut Console, src: &str, dst: &str) {
+    let fs = match crate::fs::fat::mount() {
+        Ok(fs) => fs,
+        Err(e) => return console.println(&alloc::format!("cp: no FAT filesystem ({:?})", e)),
+    };
+    // --- Resolve the SOURCE to a concrete file (a directory source is out of scope). ---
+    let src_norm = normalize_path(&cwd_path(), src);
+    let (de_src, src_canon) = match resolve_path(&fs, &src_norm) {
+        Ok(Resolved::Root) => return console.println("cp: /: is a directory (-EISDIR)"),
+        Ok(Resolved::Entry(de, canon)) => {
+            if de.is_dir {
+                return console.println(&alloc::format!("cp: {}: is a directory (-EISDIR)", canon));
+            }
+            (de, canon)
+        }
+        Err(msg) => return console.println(&alloc::format!("cp: {}", msg)),
+    };
+    // --- Decide the DESTINATION path (the `cp FILE DIR/` idiom): an existing directory receives the
+    //     copy under the source's canonical leaf name; anything else is the destination file itself. ---
+    let dst_norm = normalize_path(&cwd_path(), dst);
+    let dst_final = match resolve_path(&fs, &dst_norm) {
+        Ok(Resolved::Root) => normalize_path("/", de_src.name()), // into the volume root
+        Ok(Resolved::Entry(ref de, _)) if de.is_dir => normalize_path(&dst_norm, de_src.name()), // into a dir
+        _ => dst_norm.clone(), // an existing file (overwrite) or a new name — resolve_write_target validates the parent
+    };
+    let (dparent, dleaf, dcanon) = match resolve_write_target(&fs, &dst_final) {
+        Ok(t) => t,
+        Err(msg) => return console.println(&alloc::format!("cp: {}", msg)),
+    };
+    let dest_disp = joined(&dcanon, &dleaf);
+    // --- Refuse copying a file onto itself. Canonical paths are unique per file, so a case-insensitive
+    //     full-path compare is complete (FAT 8.3 names are case-insensitive). ---
+    if src_canon.eq_ignore_ascii_case(&dest_disp) {
+        return console.println(&alloc::format!(
+            "cp: {} and {} are the same file (-EINVAL)", src_canon, dest_disp));
+    }
+    // --- Create-or-truncate the destination as a fresh 0-length file (the JD6 write prologue). ---
+    let (dir_lba, dir_off) = match fs.locate_in_dir(dparent, &dleaf) {
+        Ok((de, dl, doff)) => {
+            if de.is_dir {
+                return console.println(&alloc::format!(
+                    "cp: {}: is a directory (-EISDIR)", joined(&dcanon, de.name())));
+            }
+            if let Err(e) = fs.delete_located(dl, doff, de.first_cluster()) {
+                return console.println(&alloc::format!(
+                    "cp: {}: truncate failed {} ({:?})", dest_disp, fat_errno(e), e));
+            }
+            match fs.create_in_dir(dparent, &dleaf, 0x20) {
+                Ok((_, dl2, doff2)) => (dl2, doff2),
+                Err(e) => return console.println(&alloc::format!(
+                    "cp: {}: recreate failed {} ({:?}) — old file removed", dest_disp, fat_errno(e), e)),
+            }
+        }
+        Err(FatError::NotFound) => match fs.create_in_dir(dparent, &dleaf, 0x20) {
+            Ok((_, dl, doff)) => (dl, doff),
+            Err(e) => return console.println(&alloc::format!(
+                "cp: {}: {} ({:?})", dest_disp, fat_errno(e), e)),
+        },
+        Err(e) => return console.println(&alloc::format!(
+            "cp: {}: {} ({:?})", dest_disp, fat_errno(e), e)),
+    };
+    // --- Stream the bytes: read_at windows -> write_grow appends. The destination entry starts as a
+    //     fresh 0-length file (first_cluster 0, size 0); write_grow allocates + publishes as it grows. ---
+    const CP_WINDOW: usize = 32 * 1024;
+    let src_fc = de_src.first_cluster();
+    let src_size = de_src.size;
+    let (mut dst_first, mut dst_size, mut off) = (0u32, 0u32, 0u32);
+    let mut buf: Vec<u8> = Vec::new();
+    while off < src_size {
+        buf.clear();
+        if let Err(e) = fs.read_at(src_fc, src_size, off, &mut buf, CP_WINDOW) {
+            return console.println(&alloc::format!(
+                "cp: {}: read failed {} ({:?})", src_canon, fat_errno(e), e));
+        }
+        if buf.is_empty() {
+            break; // the source chain ended before de.size (malformed) — copy what it holds, honestly
+        }
+        match fs.write_grow(dst_first, dst_size, dir_lba, dir_off, off, &buf) {
+            Ok((_, new_size, new_first)) => {
+                dst_first = new_first;
+                dst_size = new_size;
+                off += buf.len() as u32;
+            }
+            Err(e) => return console.println(&alloc::format!(
+                "cp: {}: write failed {} ({:?})", dest_disp, fat_errno(e), e)),
+        }
+    }
+    console.println(&alloc::format!("copied {} -> {} ({} bytes)", src_canon, dest_disp, dst_size));
+}
+
 /// Print one directory's entries in the `ls` table format, with the file/dir tally.
 fn print_dir_listing(console: &mut Console, entries: &[DirEntry]) {
     let (mut files, mut dirs) = (0u32, 0u32);
@@ -484,7 +595,8 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
             console.println("FILES:    fatinfo (FAT geometry), ls [dir], cd [dir], pwd, cat <path>");
             console.println("WRITE:    touch <path>, write <path> <text>, append <path> <text>, rm <path>");
             console.println("DIRS:     mkdir <path>, rmdir <path>  (create / remove empty directories)");
-            console.println("          (create/edit/delete files & dirs anywhere in the tree; sync = write-through, durable)");
+            console.println("COPY:     cp <src> <dst>  (copy a file; cp FILE DIR/ lands as DIR/<leaf>)");
+            console.println("          (create/edit/delete/copy files & dirs anywhere in the tree; sync = write-through, durable)");
             console.println("SMP:      sched (per-CPU run queues), pulse (full-screen CPU monitor)");
             console.println("TEST:     tste (in-OS self-test suite: boot-replay + live checks)");
             console.println("NETWORK:  netinfo, ping <ip> [count], arp <ip>");
@@ -651,6 +763,13 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
             match args.first() {
                 None => console.println("usage: rmdir <path>"),
                 Some(name) => fs_rmdir(console, name),
+            }
+        },
+        "cp" | "copy" => {
+            // JD8: copy a file (dir source → -EISDIR; `cp FILE DIR/` lands as DIR/<leaf>). `cp <src> <dst>`.
+            match (args.first(), args.get(1)) {
+                (Some(src), Some(dst)) => fs_cp(console, src, dst),
+                _ => console.println("usage: cp <src> <dst>"),
             }
         },
         "sync" => {
