@@ -85,12 +85,12 @@ device layer smoltcp binds to; the hand-rolled `crates/net` protocol crate
 (ARP/ICMP/UDP/DHCP + the Go-Back-N TCP engine) keeps working knob-off and
 remains in-tree as reference until the smoltcp line fully replaces its shell
 surface. There is **no net syscall surface yet** (ring 3 cannot reach the
-network); the socket syscall family is greenfield (next free number: 19).
+network); the socket syscall family opened at number 19 (SOCK-2 landed 19–22; next free number: 23).
 
 | Arc | Content | Track |
 | :--- | :--- | :--- |
 | SOCK-1 ✅ 🔬 | **Landed (round 9, `net-sock1`).** smoltcp 0.13.1 (0BSD, `no_std`, static buffers) + the `E1000Phy` `Device` adapter over the e1000e rings, behind `UNAOS_SMOLNET` (knob-off byte-identical, both arches). Shell `ping`/`arp`/`netinfo` ride smoltcp's ICMP socket + interface knob-on; the boot witness pings slirp's gateway ×4 (`:: SOCK-1: … 4/4 replies — witness OK ::`). No syscalls. See [`08_NET/networking.md`](../unaos/docs/dev/OS/08_NET/networking.md). | x86 first (aarch64 has no wired NIC) |
-| SOCK-2 | The socket syscall family (UDP first) over smoltcp's socket set — ring 3 reaches the network for the first time | x86 |
+| SOCK-2 ✅ 🔬 | **Landed (round 9, `net-sock1`).** The UDP socket syscall family over a persistent smoltcp `SocketSet`, behind `UNAOS_SMOLNET` (knob-off byte-identical, both arches): `sys_socket`(19)/`sys_bind`(20)/`sys_sendto`(21)/`sys_recvfrom`(22). A socket is a capability (`KIND_SOCKET`, send=`CAP_WRITE`/recv=`CAP_READ` at the File `handle_resolve` CHECK); `recvfrom` is non-blocking (`-EAGAIN`). A ring-3 fixture completes a datagram round-trip to slirp's DNS (`:: SOCK-2: ring-3 udp round-trip … -> PASS ::`) + a kernel witness (`:: SOCK-2: … — witness OK ::`). Next free syscall number: **23**. See [`08_NET/networking.md`](../unaos/docs/dev/OS/08_NET/networking.md) + [`SECURITY.md`](SECURITY.md). | x86 |
 | SOCK-3+ | TCP sockets; DHCP via smoltcp; aarch64 NIC bring-up joins here (§6 row) | later |
 
 ## 2. UnaFS: meeting and surpassing BeFS

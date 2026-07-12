@@ -207,7 +207,40 @@ Legend: **✅ metal-confirmed** · **🔬 QEMU-green, metal pending** · dates I
 
 ---
 
-## net-sock1 track — 2026-07-12 (SOCK-1 — smoltcp adopted: `ping`/`arp`/`netinfo` ride the mature stack)
+## net-sock1 track — 2026-07-12 (SOCK-2 — the UDP socket syscall family: ring 3 reaches the network)
+
+### SOCK-2 — `sys_socket`/`bind`/`sendto`/`recvfrom` over a persistent smoltcp `SocketSet` 🔬 `net-sock1`
+- **What:** the second [§1b](ROADMAP.md) arc — the UDP socket syscall family (numbers **19–22**), the
+  first time ring 3 reaches the network. `sys_socket`(19) mints a UDP socket, `sys_bind`(20) names a
+  local port, `sys_sendto`(21)/`sys_recvfrom`(22) move datagrams. Same `UNAOS_SMOLNET` knob, x86-only,
+  byte-identical knob-off / aarch64.
+- **Persistent stack:** `smolnet.rs` gains a persistent `Interface` + `SocketSet` singleton (`STACK`,
+  a `spin::Mutex<Option<SmolStack>>` mirroring `NET_DEVICE`) that outlives individual syscalls (a UDP
+  socket must survive between `bind` and `recvfrom`). **Fully static / BSS:** the socket-set storage,
+  each socket's packet buffers, and the device RX/TX scratch are `&'static mut` (via `addr_of_mut!` +
+  `from_raw_parts_mut`, no autoref-through-raw-deref); no heap. smoltcp's `socket-udp` feature added.
+  The ~3 KiB device scratch lives in BSS so only smoltcp's ~2 KiB poll frames touch the caller stack,
+  and only on the BSP-witness / IF-masked-syscall paths — never an AP scheduler stack.
+- **Sockets as capabilities:** a socket is `KIND_SOCKET` (value word = the set-id, +1-biased) minted
+  with `CAP_READ|CAP_WRITE`; send needs `CAP_WRITE`, recv needs `CAP_READ`, both at the SAME
+  `handle_resolve` CHECK the File syscalls use — so `SYS_CAP` GRANT / `SYS_XFER` attenuate and transfer
+  a socket cap for free. Freed at `clear_handle_row` teardown (`smolnet::free_row_sockets`).
+- **Non-blocking recv:** the IF-masked handler cannot block, so `recvfrom` drives a BOUNDED poll pump
+  and returns `-EAGAIN` when empty. `sendto`/`recvfrom` carry the peer address as an 8-byte header
+  `[ip[4]][port u16 LE][pad]` + payload (fits the 3-arg x86 ABI); user buffers are window-bound-checked
+  like `sys_write`/`sys_open`.
+- **Witnesses (slirp DNS `10.0.2.3:53` — hermetic under default `test`, no injector/netdev change):**
+  a kernel-side M1 witness `:: SOCK-2: smoltcp udp dns query 10.0.2.3:53 -> 64 bytes back — witness OK ::`
+  and a ring-3 M2 fixture (`sock2-udp`, the u9x/u11x inline-blob idiom) that makes all four syscalls and
+  completes a round-trip: `:: SOCK-2: ring-3 udp round-trip — socket/bind/sendto OK, recvfrom returned a
+  datagram FROM 10.0.2.3:53, socket teardown clean -> PASS ::`. The fixture runs on an AP racing the
+  BSP's hand-rolled `service_net` poll, so it loops sendto+recvfrom (retry a stolen reply).
+- **Tested (QEMU):** knob-off — `check` green both arches, `test 25` MISSION, `test-arm 22` MISSION
+  (no SOCK-2 lines, byte-identical). Knob-on — `UNAOS_SMOLNET=1 check` green both arches,
+  `UNAOS_SMOLNET=1 test 60` MISSION + both witness lines above; SOCK-1's ICMP witness intact; zero new
+  warnings. `SECURITY.md` gains its first networking row. Metal pending (needs a wired NIC).
+- **Lane:** `arch/x86_64/syscall.rs` + `smolnet.rs` + `drivers/e1000.rs` (additive) + `Cargo.toml`;
+  `crates/net`/`fat.rs`/`sched.rs`/`main.rs` untouched; zero aarch64.
 
 ### SOCK-1 — smoltcp 0.13.1 + the e1000e `Device` adapter 🔬 `net-sock1`
 - **What:** the first arc of the [§1b](ROADMAP.md) migration off the hand-rolled `crates/net` line
