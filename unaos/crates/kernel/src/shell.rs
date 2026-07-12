@@ -132,8 +132,13 @@ fn resolve_path(fs: &FatFs, path: &str) -> Result<Resolved, String> {
 // NAMESPACE lock (it reaches fat.rs directly) — see fat.rs's FATDIRS block + docs/SECURITY.md.
 // JD8 layers `cp <src> <dst>` (file copy) on the SAME primitives — no new fat.rs surface: it STREAMS
 // the source through the offset-aware `read_at` into the create-or-truncate `create_in_dir`/
-// `write_grow` write path (the `cp FILE DIR/` idiom lands the copy under the source leaf; a directory
-// source is `-EISDIR` — recursive `cp -r` is a JD9 candidate).
+// `write_grow` write path (the `cp FILE DIR/` idiom lands the copy under the source leaf; a plain-`cp`
+// directory source is `-EISDIR`). JD9 adds `cp -r <srcdir> <dst>` — recursive directory copy — by
+// COMPOSING those same primitives: `read_dir` walks the source, the FATDIRS `create_dir` seam rebuilds
+// the tree (call-never-edit, like `mkdir`), and the JD8 per-file streaming leg (`copy_file_into`) copies
+// each file. It creates a FRESH destination tree (top-level target pre-existing ⇒ `-EEXIST`; `.`/`..`
+// filtered at every level; self-into-descendant refused `-EINVAL`; depth bounded `-ELOOP`; a mid-tree
+// failure reports the honest partial count) — still no new fat.rs surface.
 //
 // SAFETY (M3): every fat.rs write returns a `Result`; a stalled USB write surfaces as
 // `FatError::Io` (the block layer's `write_block` rides the SAME JD3 wall-clock-bounded BOT pump as
@@ -483,30 +488,54 @@ fn fs_cp(console: &mut Console, src: &str, dst: &str) {
         return console.println(&alloc::format!(
             "cp: {} and {} are the same file (-EINVAL)", src_canon, dest_disp));
     }
+    // --- Create-or-truncate the destination and stream the bytes (shared with the JD9 `cp -r` per-file
+    //     leg, so the streaming/errno logic lives in exactly one place). ---
+    match copy_file_into(&fs, &de_src, &src_canon, dparent, &dleaf, &dcanon) {
+        Ok(bytes) => console.println(&alloc::format!(
+            "copied {} -> {} ({} bytes)", src_canon, dest_disp, bytes)),
+        Err(msg) => console.println(&alloc::format!("cp: {}", msg)),
+    }
+}
+
+/// JD8/JD9: copy ONE file `de_src` into directory `dparent` under leaf name `dleaf`, create-or-truncating
+/// the destination. Returns the byte count copied, or a fully-formatted (path + errno) error string the
+/// caller prefixes with its command name. This is the streaming core shared by `fs_cp` (the file `cp`) and
+/// the JD9 `cp_tree` recursion — NO fat.rs mutation: it composes the offset-aware read `read_at` with the
+/// JD6 create-or-truncate write path (`locate_in_dir`/`delete_located`/`create_in_dir` + `write_grow`),
+/// all call-never-edit. `dcanon` is the destination parent's canonical path (for messages / the display).
+///
+/// SIZE HANDLING (the JD8-M2 decision, unchanged): STREAMS in fixed `CP_WINDOW`-byte windows, so a file of
+/// ANY size copies with a bounded heap footprint and NO truncation (no size ceiling). Every FAT/data access
+/// rides the JD3 wall-clock BOT pump — a stalled transfer is `-EIO`, never a hang on the timerless EL1 core.
+fn copy_file_into(
+    fs: &FatFs,
+    de_src: &DirEntry,
+    src_canon: &str,
+    dparent: u32,
+    dleaf: &str,
+    dcanon: &str,
+) -> Result<u64, String> {
+    let dest_disp = joined(dcanon, dleaf);
     // --- Create-or-truncate the destination as a fresh 0-length file (the JD6 write prologue). ---
-    let (dir_lba, dir_off) = match fs.locate_in_dir(dparent, &dleaf) {
+    let (dir_lba, dir_off) = match fs.locate_in_dir(dparent, dleaf) {
         Ok((de, dl, doff)) => {
             if de.is_dir {
-                return console.println(&alloc::format!(
-                    "cp: {}: is a directory (-EISDIR)", joined(&dcanon, de.name())));
+                return Err(alloc::format!("{}: is a directory (-EISDIR)", joined(dcanon, de.name())));
             }
-            if let Err(e) = fs.delete_located(dl, doff, de.first_cluster()) {
-                return console.println(&alloc::format!(
-                    "cp: {}: truncate failed {} ({:?})", dest_disp, fat_errno(e), e));
-            }
-            match fs.create_in_dir(dparent, &dleaf, 0x20) {
+            fs.delete_located(dl, doff, de.first_cluster()).map_err(|e| {
+                alloc::format!("{}: truncate failed {} ({:?})", dest_disp, fat_errno(e), e)
+            })?;
+            match fs.create_in_dir(dparent, dleaf, 0x20) {
                 Ok((_, dl2, doff2)) => (dl2, doff2),
-                Err(e) => return console.println(&alloc::format!(
-                    "cp: {}: recreate failed {} ({:?}) — old file removed", dest_disp, fat_errno(e), e)),
+                Err(e) => return Err(alloc::format!(
+                    "{}: recreate failed {} ({:?}) — old file removed", dest_disp, fat_errno(e), e)),
             }
         }
-        Err(FatError::NotFound) => match fs.create_in_dir(dparent, &dleaf, 0x20) {
+        Err(FatError::NotFound) => match fs.create_in_dir(dparent, dleaf, 0x20) {
             Ok((_, dl, doff)) => (dl, doff),
-            Err(e) => return console.println(&alloc::format!(
-                "cp: {}: {} ({:?})", dest_disp, fat_errno(e), e)),
+            Err(e) => return Err(alloc::format!("{}: {} ({:?})", dest_disp, fat_errno(e), e)),
         },
-        Err(e) => return console.println(&alloc::format!(
-            "cp: {}: {} ({:?})", dest_disp, fat_errno(e), e)),
+        Err(e) => return Err(alloc::format!("{}: {} ({:?})", dest_disp, fat_errno(e), e)),
     };
     // --- Stream the bytes: read_at windows -> write_grow appends. The destination entry starts as a
     //     fresh 0-length file (first_cluster 0, size 0); write_grow allocates + publishes as it grows. ---
@@ -517,10 +546,9 @@ fn fs_cp(console: &mut Console, src: &str, dst: &str) {
     let mut buf: Vec<u8> = Vec::new();
     while off < src_size {
         buf.clear();
-        if let Err(e) = fs.read_at(src_fc, src_size, off, &mut buf, CP_WINDOW) {
-            return console.println(&alloc::format!(
-                "cp: {}: read failed {} ({:?})", src_canon, fat_errno(e), e));
-        }
+        fs.read_at(src_fc, src_size, off, &mut buf, CP_WINDOW).map_err(|e| {
+            alloc::format!("{}: read failed {} ({:?})", src_canon, fat_errno(e), e)
+        })?;
         if buf.is_empty() {
             break; // the source chain ended before de.size (malformed) — copy what it holds, honestly
         }
@@ -530,11 +558,155 @@ fn fs_cp(console: &mut Console, src: &str, dst: &str) {
                 dst_size = new_size;
                 off += buf.len() as u32;
             }
-            Err(e) => return console.println(&alloc::format!(
-                "cp: {}: write failed {} ({:?})", dest_disp, fat_errno(e), e)),
+            Err(e) => return Err(alloc::format!(
+                "{}: write failed {} ({:?})", dest_disp, fat_errno(e), e)),
         }
     }
-    console.println(&alloc::format!("copied {} -> {} ({} bytes)", src_canon, dest_disp, dst_size));
+    Ok(dst_size as u64)
+}
+
+/// JD9: true if `path` lies strictly INSIDE `ancestor` — both are canonical absolute 8.3 paths, compared
+/// case-insensitively (short names are stored uppercase). `is_descendant("/DOCS/SUB", "/DOCS") == true`;
+/// `is_descendant("/DOCS", "/DOCS") == false`; `is_descendant("/DOCSX", "/DOCS") == false` (the `/` guard
+/// blocks a false prefix match). Paths are pure ASCII, so byte-indexing at `ancestor.len()` is
+/// char-boundary-safe. Used to refuse `cp -r` of a directory into itself or one of its own descendants.
+fn is_descendant(path: &str, ancestor: &str) -> bool {
+    path.len() > ancestor.len()
+        && path.as_bytes()[ancestor.len()] == b'/'
+        && path[..ancestor.len()].eq_ignore_ascii_case(ancestor)
+}
+
+/// JD9: a running tally of a `cp -r` for the summary / partial-failure report.
+struct CpStats {
+    dirs: u32,
+    files: u32,
+    bytes: u64,
+}
+
+/// JD9: the maximum directory nesting `cp -r` will descend before refusing with `-ELOOP`. A sane bound so a
+/// pathologically deep (or, on a malformed volume, self-referential — though `read_dir`'s own chain-loop
+/// guard already backstops that) tree yields an honest error, never a stack blow-out. FAT paths are shallow
+/// in practice; 32 is far past any real console tree.
+const CP_MAX_DEPTH: u32 = 32;
+
+/// JD9: recursively copy the CONTENTS of the source directory (cluster `src_cluster`, canonical path
+/// `src_canon`) INTO the already-created destination directory (cluster `dst_cluster`, canonical path
+/// `dst_canon`). `.`/`..` are filtered at every level; a child file rides `copy_file_into`, a child
+/// directory is freshly `create_dir`'d and recursed into. `stats` accumulates across the whole tree so the
+/// caller can report an honest partial count if a mid-tree op fails. Returns a fully-formatted error string
+/// (path + errno) on the FIRST failure — the copy stops there, no silent truncation. Every op rides the JD3
+/// BOT pump (bounded, never a hang). The destination subtree is created fresh by the caller's `-EEXIST`
+/// pre-check, so no child name can pre-exist — each `create_dir`/`copy_file_into` writes into empty space.
+fn cp_tree(
+    fs: &FatFs,
+    src_cluster: u32,
+    src_canon: &str,
+    dst_cluster: u32,
+    dst_canon: &str,
+    depth: u32,
+    stats: &mut CpStats,
+) -> Result<(), String> {
+    if depth > CP_MAX_DEPTH {
+        return Err(alloc::format!(
+            "{}: maximum directory depth {} exceeded (-ELOOP)", dst_canon, CP_MAX_DEPTH));
+    }
+    let entries = fs
+        .read_dir(src_cluster)
+        .map_err(|e| alloc::format!("{}: read failed ({:?}, -EIO)", src_canon, e))?;
+    for de in &entries {
+        let nm = de.name();
+        if nm == "." || nm == ".." {
+            continue; // skip the self/parent links a subdirectory cluster carries
+        }
+        let child_src = joined(src_canon, nm);
+        let child_dst = joined(dst_canon, nm);
+        if de.is_dir {
+            let (cde, _, _) = fs.create_dir(dst_cluster, nm).map_err(|e| {
+                alloc::format!("{}: {} ({:?})", child_dst, fat_errno(e), e)
+            })?;
+            stats.dirs += 1;
+            cp_tree(fs, de.first_cluster(), &child_src, cde.first_cluster(), &child_dst, depth + 1, stats)?;
+        } else {
+            let bytes = copy_file_into(fs, de, &child_src, dst_cluster, nm, dst_canon)?;
+            stats.files += 1;
+            stats.bytes += bytes;
+        }
+    }
+    Ok(())
+}
+
+/// JD9 `cp -r <srcdir> <dstdir>`: recursively copy a directory tree. Composes the read walk (`read_dir`),
+/// directory creation (the FATDIRS `create_dir` seam, via the JD7 idiom), and the JD8 per-file streaming
+/// copy — all `shell.rs`-only, NO fat.rs mutation (call-never-edit). Guards, in order:
+///   * a ROOT source is refused (`-EINVAL`) — the volume root has no leaf name to copy AS, and any
+///     in-volume destination is a descendant of it (the next guard would refuse it anyway);
+///   * a FILE source degrades to a plain file copy (`fs_cp`) — POSIX-friendly, honest;
+///   * the destination path follows the `cp DIR DEST` idiom: an existing directory (or root) receives the
+///     tree AS `DEST/<src-leaf>`; a not-yet-existing DEST becomes the new tree; an existing FILE is
+///     `-ENOTDIR`;
+///   * copying a directory into itself or one of its own descendants is refused (`-EINVAL`,
+///     canonical-path prefix compare) — this is what stops an infinite `cp -r DOCS DOCS/SUB`;
+///   * the top-level target must NOT already exist (`-EEXIST`). This is the simple, safe rule: `cp -r`
+///     always creates a FRESH tree, never silently merging into or overwriting an existing one. Because the
+///     top-level target is fresh, every directory `cp_tree` creates below it is inside freshly-created (so
+///     empty) parents — no child can collide, and no existing file is ever clobbered.
+/// A mid-tree failure stops and reports the honest partial count (dirs/files/bytes copied so far) plus the
+/// failing path + errno; nothing is rolled back (a partial tree is left on disk, crash-safe per the
+/// FATDIRS/JD6 ordering — the operator can `rmdir`/`rm` it).
+fn fs_cp_recursive(console: &mut Console, src: &str, dst: &str) {
+    let fs = match crate::fs::fat::mount() {
+        Ok(fs) => fs,
+        Err(e) => return console.println(&alloc::format!("cp: no FAT filesystem ({:?})", e)),
+    };
+    // --- Resolve the SOURCE. Root is refused; a file degrades to the plain file copy. ---
+    let src_norm = normalize_path(&cwd_path(), src);
+    let (de_src, src_canon) = match resolve_path(&fs, &src_norm) {
+        Ok(Resolved::Root) => return console.println("cp: -r /: cannot copy the volume root (-EINVAL)"),
+        Ok(Resolved::Entry(de, canon)) => (de, canon),
+        Err(msg) => return console.println(&alloc::format!("cp: {}", msg)),
+    };
+    if !de_src.is_dir {
+        return fs_cp(console, src, dst); // `cp -r FILE DST` == `cp FILE DST`
+    }
+    // --- Decide the TARGET directory path (the `cp DIR DEST` idiom). ---
+    let dst_norm = normalize_path(&cwd_path(), dst);
+    let target = match resolve_path(&fs, &dst_norm) {
+        Ok(Resolved::Root) => normalize_path("/", de_src.name()), // into the volume root
+        Ok(Resolved::Entry(ref de, _)) if de.is_dir => normalize_path(&dst_norm, de_src.name()), // into a dir
+        Ok(Resolved::Entry(_, canon)) =>
+            return console.println(&alloc::format!("cp: {}: not a directory (-ENOTDIR)", canon)),
+        Err(_) => dst_norm.clone(), // does not exist yet — DEST itself becomes the new tree
+    };
+    // --- Guard: refuse copying a directory into itself or one of its own descendants. ---
+    if target.eq_ignore_ascii_case(&src_canon) || is_descendant(&target, &src_canon) {
+        return console.println(&alloc::format!(
+            "cp: cannot copy directory {} into itself or its own subtree ({}) (-EINVAL)",
+            src_canon, target));
+    }
+    // --- The top-level target must not already exist (fresh-tree rule → honest -EEXIST). ---
+    if resolve_path(&fs, &target).is_ok() {
+        return console.println(&alloc::format!("cp: {}: already exists (-EEXIST)", target));
+    }
+    // --- Create the top-level target directory (its parent must exist), then recurse into it. ---
+    let (tparent, tleaf, tcanon) = match resolve_write_target(&fs, &target) {
+        Ok(t) => t,
+        Err(msg) => return console.println(&alloc::format!("cp: {}", msg)),
+    };
+    let top = match fs.create_dir(tparent, &tleaf) {
+        Ok((de, _, _)) => de,
+        Err(e) => return console.println(&alloc::format!(
+            "cp: {}: {} ({:?})", joined(&tcanon, &tleaf), fat_errno(e), e)),
+    };
+    let target_canon = joined(&tcanon, top.name());
+    let mut stats = CpStats { dirs: 1, files: 0, bytes: 0 }; // the top dir counts
+    match cp_tree(&fs, de_src.first_cluster(), &src_canon, top.first_cluster(), &target_canon, 1, &mut stats) {
+        Ok(()) => console.println(&alloc::format!(
+            "copied {}/ -> {}/ ({} dir(s), {} file(s), {} bytes)",
+            src_canon, target_canon, stats.dirs, stats.files, stats.bytes)),
+        Err(msg) => console.println(&alloc::format!(
+            "cp: {} [partial: {} dir(s), {} file(s), {} bytes copied before the error]",
+            msg, stats.dirs, stats.files, stats.bytes)),
+    }
 }
 
 /// Print one directory's entries in the `ls` table format, with the file/dir tally.
@@ -596,6 +768,7 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
             console.println("WRITE:    touch <path>, write <path> <text>, append <path> <text>, rm <path>");
             console.println("DIRS:     mkdir <path>, rmdir <path>  (create / remove empty directories)");
             console.println("COPY:     cp <src> <dst>  (copy a file; cp FILE DIR/ lands as DIR/<leaf>)");
+            console.println("          cp -r <srcdir> <dst>  (recursively copy a directory tree)");
             console.println("          (create/edit/delete/copy files & dirs anywhere in the tree; sync = write-through, durable)");
             console.println("SMP:      sched (per-CPU run queues), pulse (full-screen CPU monitor)");
             console.println("TEST:     tste (in-OS self-test suite: boot-replay + live checks)");
@@ -766,10 +939,16 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
             }
         },
         "cp" | "copy" => {
-            // JD8: copy a file (dir source → -EISDIR; `cp FILE DIR/` lands as DIR/<leaf>). `cp <src> <dst>`.
-            match (args.first(), args.get(1)) {
+            // JD8: copy a file (`cp FILE DIR/` lands as DIR/<leaf>). JD9: `-r`/`-R` recursively copies a
+            // directory tree. Flags (leading `-`) precede the paths; only `-r`/`-R` are recognized (any
+            // other leading-`-` arg is ignored as an unknown flag — a name literally beginning with `-` is
+            // reachable as `./-name`). `cp <src> <dst>` | `cp -r <srcdir> <dst>`.
+            let recursive = args.iter().any(|a| *a == "-r" || *a == "-R");
+            let paths: Vec<&str> = args.iter().copied().filter(|a| !a.starts_with('-')).collect();
+            match (paths.first(), paths.get(1)) {
+                (Some(src), Some(dst)) if recursive => fs_cp_recursive(console, src, dst),
                 (Some(src), Some(dst)) => fs_cp(console, src, dst),
-                _ => console.println("usage: cp <src> <dst>"),
+                _ => console.println("usage: cp [-r] <src> <dst>"),
             }
         },
         "sync" => {

@@ -10,6 +10,46 @@ Legend: **✅ metal-confirmed** · **🔬 QEMU-green, metal pending** · dates I
 
 ---
 
+## hw-jetson track — 2026-07-12 (JD9 — the panel copies trees: `cp -r`)
+
+### JD9 — `cp -r <srcdir> <dst>` on the Orin panel shell (recursive copy, compose only, no new fat.rs) 🔬 `hw-jetson`
+- **What (`shell.rs` only):** the `cp`/`copy` dispatch arm now parses a `-r`/`-R` flag; `fs_cp_recursive`
+  recursively copies a directory tree. JD8 copied a file; JD9 copies a whole subtree — `cp -r DOCS BACKUP`.
+  Together with `mkdir`/`rmdir` this closes the copy half of the file-manager verb set (`mv` still waits on a
+  future pi4-lane FATMOVE seam). It adds **NO `fat.rs` logic**: it composes primitives that all exist —
+  `read_dir` (JD4) walks the source, the FATDIRS `create_dir` seam (JD7 idiom) rebuilds the tree, and the JD8
+  per-file streaming copy (refactored into the shared `copy_file_into`) copies each file — all **call-never-edit**.
+- **The recursion:** resolve `src` (a ROOT source is `-EINVAL` — no leaf to copy AS; a FILE source degrades
+  to a plain file copy, POSIX-friendly). The destination follows the `cp DIR DEST` idiom: an existing dir (or
+  root) receives the tree AS `DEST/<src-leaf>`, a not-yet-existing DEST becomes the new tree, an existing file
+  is `-ENOTDIR`. `cp_tree` filters `.`/`..` at every level, `create_dir`s each child directory and recurses,
+  and streams each child file.
+- **Guards (M1/M2):** (1) copying a directory into itself or one of its own descendants is refused `-EINVAL`
+  (case-insensitive canonical-path prefix compare — this is what stops an infinite `cp -r DOCS DOCS/SUB`);
+  (2) the top-level target must NOT already exist → `-EEXIST` (**the fresh-tree rule** — `cp -r` always
+  creates a brand-new tree, never silently merging into or overwriting an existing one; because the top is
+  fresh, every directory created below it is inside a freshly-created empty parent, so no child ever collides
+  and no existing file is clobbered); (3) recursion is depth-bounded at 32 → `-ELOOP` (honest error, never a
+  stack blow-out); (4) a mid-tree failure stops and reports the honest partial count (dirs/files/bytes copied
+  before the error) + the failing path + errno — no silent truncation, no hang (every op rides the JD3
+  wall-clock BOT pump).
+- **Errno fidelity is shell-side** (the JD6/JD7/JD8 pattern): src missing → `-ENOENT`; ROOT src → `-EINVAL`;
+  dst is a file → `-ENOTDIR`; self/descendant → `-EINVAL`; target exists → `-EEXIST`; too deep → `-ELOOP`;
+  volume/dir full mid-tree → `-ENOSPC` (partial-reported). On success it echoes
+  `copied /DOCS/ -> /BACKUP/DOCS/ (N dir(s), M file(s), K bytes)`.
+- **Principal — unchanged** (EL1 ASID 0, PUBLIC): `cp -r` reads public sources and creates public
+  destinations, no U6 ACL consulted. No new lock/namespace surface — it composes the same F3-locked
+  `read_dir`/`create_dir`/`create_in_dir`/`write_grow`/`delete_located`/`read_at` primitives already ledgered.
+- **Tested (QEMU):** `check` + `UNAOS_TEGRA=1 check` green both arches; `test-arm 22` MISSION;
+  `UNAOS_GICV3=1 test-arm 40` CAPSTONE 6/6; `UNAOS_HUBSTORAGE=1 test 25` MISSION (shared `shell.rs` guard);
+  `esp-jetson` links, **108 `tegra:` strings** (unchanged — `cp -r` strings carry no `tegra:` token). Zero x86
+  behavioural change (`shell.rs` compiles both arches; the handler dispatches only on a keystroke).
+- **Metal:** attended-pending — the money-shot bench card [`jd9-bench.md`](../unaos/scripts/jd9-bench.md)
+  (`cp -r` a small tree into a new dir → verify tree + contents → power-cycle → verify survival → the guards).
+  ⚠ Verify the serial bridge captures a full boot first (round-6/8 host capture failed mid-bench, §JB1f).
+- **Detail:** [`arch_arm64.md` §JD9](dev/OS/01_BOOT_HAL/arch_arm64.md). **Commit:** on `hw-jetson` (the
+  seat assigns the integration hash at merge).
+
 ## hw-jetson track — 2026-07-12 (JD8 — the panel copies files: `cp`)
 
 ### JD8 — `cp <src> <dst>` on the Orin panel shell (compose read + write, no new fat.rs) 🔬 `hw-jetson`
