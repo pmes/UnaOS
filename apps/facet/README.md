@@ -34,10 +34,19 @@ Landed (FACET-1, MVP):
 - Display it in a Quartzite window, drawn aspect-fit and centered on a dark
   field, rescaling with the window (CPU blit via `NSBitmapImageRep`).
 
+Landed (FACET-2, interaction):
+
+- Zoom about the cursor (scroll wheel or trackpad pinch), drag-to-pan, and
+  reset-to-fit (`0` or `f`).
+- A live per-pixel readout overlay: hover the picture and the source pixel
+  coordinates, the packed 8-bit sRGB value (decimal and hex), and the source
+  *linear* RGB (as `lux` decoded it) follow the cursor.
+
 Intended (later arcs):
 
-- Pan and zoom, and the euclase textured-quad (GPU) presentation path.
-- Inspection: per-pixel RGBA readout and isolation of individual channels.
+- The euclase textured-quad (GPU) presentation path (large images scale/pan
+  without CPU re-blits).
+- Inspection: isolation of individual channels.
 - Participate in the userspace bus: a file opened elsewhere (for example in the
   Matrix file model) can be routed to Facet for viewing.
 
@@ -68,9 +77,11 @@ system canon.
 
 ## Status
 
-**FACET-1 landed (macOS backend).** The MVP viewer works: `facet <image>`
-decodes via `lux`, packs to sRGB, and shows the picture aspect-fit in a
-Quartzite window. Presentation is a CPU blit (`NSBitmapImageRep`), tagged sRGB
-for color-managed display; the euclase textured-quad (GPU) path, pan/zoom, and
-pixel readout are the later arcs (see [`docs/ROADMAP.md`](../../docs/ROADMAP.md)
+**FACET-1 + FACET-2 landed (macOS backend).** The viewer works and has hands:
+`facet <image>` decodes via `lux`, packs to sRGB, and shows the picture in a
+Quartzite window (CPU blit via `NSBitmapImageRep`, tagged sRGB for
+color-managed display), with zoom-about-cursor (scroll / pinch), drag-to-pan,
+reset-to-fit (`0`/`f`), and a live per-pixel readout overlay (source
+coordinates + packed sRGB + source linear RGB). The euclase textured-quad (GPU)
+path is the remaining later arc (see [`docs/ROADMAP.md`](../../docs/ROADMAP.md)
 §3a). Non-macOS backends follow quartzite's platform maturity.

@@ -23,9 +23,10 @@
 //! native Quartzite window that draws them aspect-fit. Decoding and the sRGB
 //! OETF live here, in the vessel; the quartzite image view is a dumb blitter.
 //!
-//! MVP: a static picture on screen, aspect-fit, right-side-up, color-managed.
-//! Pan/zoom, per-pixel readout, and the euclase textured-quad (GPU) path are
-//! the later arcs (ROADMAP §3a).
+//! The picture shows aspect-fit, right-side-up, and color-managed, and the
+//! quartzite view gives it hands: zoom about the cursor, drag-pan, reset-to-fit,
+//! and a live per-pixel readout (FACET-2). The euclase textured-quad (GPU) path
+//! is the remaining later arc (ROADMAP §3a).
 
 use bandy::telemetry;
 use gneiss_pal::paths::UnaPaths;
