@@ -392,6 +392,63 @@ Legend: **✅ metal-confirmed** · **🔬 QEMU-green, metal pending** · dates I
 - **Metal:** the lock's true-parallelism proof is metal-only — rides the same attended rMBP bench as S4/S5
   (transfer-IRQ I/O + create/grow/delete + cross-process read/write + the namespace-lock witness + fsck).
 
+### STOR-1 S7 — retire the U6bx staged-open constraint (open resolves ANY on-disk file) (2026-07-12) `hw-rmbp`
+- **What:** `sys_open` of a PRE-EXISTING on-disk file no longer requires the file to be in the BSP-staged set
+  (`STAGED_NAMES` = HELLO.BIN/SCRATCH.BIN/GROW.BIN). Knob-on, an open of ANY name on the mounted FAT volume that
+  is neither staged nor a U10 created name falls through to DYNAMIC on-disk resolution through the storage
+  service task — retiring the last U6bx staged-set constraint. The read machinery already resolved arbitrary
+  names live (`find_located`); only the OPEN layer was gated to the staged/U10 name tables. A new `BlockOp::Stat`
+  (`submit_stat` → `find_located`) returns the on-disk size — the one fact the IF-masked handler cannot get
+  itself — and the descriptor's reads route live BY NAME through `submit_read_file` (`sys_read`'s new dynamic
+  branch, page-at-a-time so an arbitrary file may exceed the one-page staged bound).
+- **READ-ONLY by construction (MF2 generalized):** an arbitrary on-disk open is refused `-EACCES` if writable.
+  This opens NO write path to arbitrary files (the S3 in-place write-through resolves by name and could otherwise
+  overwrite any resolvable file — the exact hazard MF2 closed for HELLO.BIN, here generalized to every
+  non-staged file), and keeps the ACL surface unchanged: a dynamic on-disk file has no `U10_NAMES` id, so it can
+  never enter `OWNED_FILES` and is inherently PUBLIC. **Staged/U10 names EXCLUDED — CASE-INSENSITIVELY**
+  (security-review CONFIRMED-critical, FIXED before merge): the fallthrough CANONICALIZES the ring-3 name to 8.3
+  UPPERCASE first, then excludes it if the canonical form is a staged or U10 name — because `find_located`
+  matches case-INSENSITIVELY (`eq_name`: equal-length + `eq_ignore_ascii_case`) while the name tables are
+  byte-exact uppercase, so a case-variant like `owned.bin` would otherwise miss both exclusions yet resolve on
+  disk to the OWNED file, bypassing the U6gx owner ACL (a confidentiality break). `eq_name`'s equal-LENGTH
+  requirement makes uppercasing a PROVABLY COMPLETE defense; a closed created file stays `-ENOENT` in any casing.
+  A NEGATIVE witness leg locks it: `sys_open_dynamic("owned.bin")` must be refused. No NAMESPACE lock: a dynamic
+  file is outside the U10 mutation namespace (it can't be created/grown/unlinked via the syscall API), so its
+  `Stat` block never runs under `ns_lock` (the S5 deadlock class stays closed).
+- **The pre-stage buffer became:** retained — knob-OFF it still backs every staged read, and `HELLO_BYTES` still
+  serves `sys_spawn`'s program-image copy in BOTH states (no live alternative for spawning off the IF-masked
+  path). Knob-ON it is no longer the file-open boundary: all reads — staged (S2/S3), created (S5), and now
+  arbitrary on-disk (S7) — serve the live volume.
+- **Witness:** `s7_openany_witness` (`:: S7-openany: … resolved dynamically + read its live content off the
+  pre-stage set … witness OK ::`, uncounted, knob-on FAT). Drives the REAL dispatcher (`sys_open_dynamic`) on a
+  scratch row for README.TXT (a non-staged/non-U10 file every FAT image carries; pre-S7 this exact open was
+  `-ENOENT`), then proves a conjunction: the open minted a DYNAMIC descriptor (`FILE_DYNLEN != 0`) stamped with
+  the resolved name, sized from the LIVE volume (`FILE_SIZE == 57` on sf), and a read BY THE STORED NAME returned
+  the file's known content prefix.
+- **Seat fold (S6 fold-in 1):** `install_file_handle`'s handle-table-full unwind documents the non-local
+  invariant (pending ⟹ deleted ⟹ the open was already `-EBUSY`) that makes its `openf_release` safe against a
+  concurrent last-close; a dynamic descriptor has no name-id, so its unwind skips `openf_release` (vacuous).
+- **Security-tier review (3-lens adversarial, 7 agents, folded before merge):** **1 CRITICAL** — the exclusion
+  was byte-EXACT-case but `find_located` matches case-INSENSITIVELY, so `owned.bin` bypassed the U6gx owner ACL
+  and read the private `OWNED.BIN`; FIXED by uppercase canonicalization + a negative witness leg (above). **2
+  LOW** (same defect, two lenses) — the dynamic multi-page read masked a mid-loop I/O error as a short read
+  (offset over-advanced, silent hole); FIXED to fail the whole read `-EIO` (matching S2/S3, disk-is-truth). **1
+  refuted-but-folded** — `clear_files_row` didn't reset `FILE_DYNLEN` (not exploitable — `files_alloc` resets at
+  reuse — but added for discipline + the field's "reset on every teardown" invariant). Re-verified: check both
+  knobs clean, knob-on chain 0 FAIL + S7 both-legs witness OK, knob-off byte-identical 22 PASS.
+- **Gate:** `./arroyo check` both arches (on+off, zero aarch64, zero new warnings); knob-ON `UNAOS_IRQSTORAGE=1
+  UNAOS_FATIMG=sf test 200` = full chain 0 FAIL (S3/S4/S5/S6 + u6gx + u11m2 witnesses intact) + the new
+  `:: S7-openany: … witness OK ::`; knob-OFF `test 25` = MISSION and `UNAOS_FATIMG=sf test 200` = BYTE-IDENTICAL
+  (all S7 code `irqstorage`-gated or comment-only — no S7/dynamic lines); `UNAOS_NOSTORAGE` clean both. Lane:
+  `arch/x86_64/syscall.rs` + `drivers/xhci/irqstorage.rs` (both x86/irqstorage-gated); `fat.rs` untouched
+  (§6 decision 2 binds); **zero aarch64**.
+- **Residuals (ledgered, out of scope):** arbitrary-file open is READ-ONLY (a writable arbitrary-file path is
+  future work); files > 2 GiB are not openable (the `i32` stat channel); a closed U10 created file stays
+  `-ENOENT` (preserves created-file + owner-ACL semantics); GROW.BIN reads still serve wstage knob-on.
+- **Metal:** S7's arbitrary-file open joins the accrued rMBP bench batch (transfer-IRQ I/O + create/grow/delete +
+  cross-process read/write + the namespace-lock witness + this open-any read + fsck) — attended, not owed by the
+  QEMU gate.
+
 ## hw-pi4 track — 2026-07-10 (K1 M2–M4 — the U6 ACL SURVIVES REBOOT: persist + rebuild + gated enforcement + proofs)
 
 ### K1 M2.2/M2.3/M2.4 + M3 + M4 — `UNAFS.ATR` persistence LANDED 🔬 `hw-pi4`
