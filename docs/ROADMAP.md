@@ -108,7 +108,7 @@ beat it (details and caveats in [`libs/unafs/README.md`](../libs/unafs/README.md
 | F5 | **Live queries** — persistent queries emitting add/remove deltas over bandy; the query-driven UI (the BeOS crown jewel, plus similarity) |
 | F6–F8 | B+tree directories; metadata checksums (beyond BeFS); extent trees for very large files |
 | K1 | **✅ `no_std + alloc` port of the core (landed).** `libs/unafs` compiles `#![no_std]` under `--no-default-features` (host and the kernel's `aarch64-unknown-none-softfloat` target); the host-native surface — `FileDevice`, the mmap reader, the bandy event bus, the `sqrt`-using query engine — sits behind a default-on `std` feature so every downstream consumer builds unchanged. bincode 1.3 → 2.x (its `legacy()` config) with the **on-disk byte layout preserved and pinned by golden-vector KATs** (`tests/kat_vectors.rs`) |
-| K2 | Block adapter (kernel 512 B sectors ↔ unafs 4096 B blocks) + GPT/MBR partition offsets |
+| K2 | **✅ Block adapter (landed).** `libs/unafs/adapter.rs` presents a 512 B-sector kernel device (a generic `SectorDevice` trait, host-tested with `MemSectorDevice`) as unafs's 4096 B `BlockDevice` — one block ↔ eight contiguous sectors at `base_lba + block*8`, all arithmetic `checked_*`. `parse_partitions` reads GPT (protective MBR + LBA-1 header) and MBR tables with signature/entry-size/LBA-order/extent bound checks; `locate_unafs` finds the volume by its `UNAFS` superblock magic. `no_std` + `alloc`; 16 adapter tests + synthetic GPT/MBR fixtures |
 | K3 | **Kernel read-only mount** of a real USB volume — `ls`/`cat`/`query` on metal |
 | K4 | Journaled kernel writes + a minimal VFS (retires read-only FAT as the storage story) |
 
@@ -119,8 +119,8 @@ hardware session.
 The **security-K4 residual** ([`SECURITY.md`](SECURITY.md) §K1 — migrate the
 kernel's `UNAFS.ATR` FAT-bridge sidecar onto native unafs typed attributes,
 then delete it) sits on top of this chain: it needs a unafs filesystem the
-kernel can mount, i.e. this K1 (`no_std` core, ✅ landed) → K2 (block adapter)
-→ K3 (RO mount) → K4 (journaled writes + the migrate pass). The K4-ready
+kernel can mount, i.e. this K1 (`no_std` core, ✅ landed) → K2 (block adapter,
+✅ landed) → K3 (RO mount) → K4 (journaled writes + the migrate pass). The K4-ready
 projection codec (pi4, 2026-07-12) is the layer that migrate pass will call.
 The three K-numbering schemes are distinct — this is BeFS-K1, not the security
 ACL K1 (survive-reboot) nor the U-chain.
