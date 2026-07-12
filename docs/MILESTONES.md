@@ -10,6 +10,40 @@ Legend: **✅ metal-confirmed** · **🔬 QEMU-green, metal pending** · dates I
 
 ---
 
+## hw-jetson track — 2026-07-12 (JD7 — the panel shapes the tree: `mkdir` / `rmdir`)
+
+### JD7 — `mkdir` / `rmdir` on the Orin panel shell (thin FATDIRS glue) 🔬 `hw-jetson`
+- **What (`shell.rs` only):** two new command handlers `fs_mkdir` / `fs_rmdir` + the `mkdir`/`rmdir`
+  dispatch arms (DOS `md`/`rd` aliases). JD4 navigates, JD5/JD6 write; JD7 lets you *shape* the tree —
+  `mkdir DOCS/DRAFTS`, `rmdir DOCS/OLD` — end to end from the console. It adds **NO `fat.rs` logic**:
+  the directory-mutation seam already landed as the pi4-lane FATDIRS arc, and JD7 consumes
+  `fat::create_dir`/`remove_dir` **call-never-edit**, exactly as JD6's write path rides `create_in_dir`.
+- **`mkdir`:** reuses JD6's `resolve_write_target` to reach the parent, `locate_in_dir`s the leaf FIRST
+  (`create_dir` inherits `create_in_dir`'s no-de-dup contract, so an existing name — file OR dir — is an
+  honest `-EEXIST`, never a duplicate slot), then `create_dir` allocates + `.`/`..`-inits the child and
+  links the parent DIR entry. Success echoes `created directory /DOCS/DRAFTS` (canonical spelling).
+- **`rmdir`:** refuses the root LOCALLY first (`-EBUSY` — unnameable, cluster 0 not freeable; also catches
+  `rmdir .` at root / `rmdir ..` popping to it), walks to the parent, pre-checks a FILE target → `-ENOTDIR`
+  from the shell's own `is_dir` check, then `remove_dir` verifies emptiness (`.`/`..` only) and frees the
+  cluster. `rm` stays file-only (a directory is still `-EISDIR`).
+- **Errno fidelity is shell-side** (the seam reuses existing `FatError` variants — a new one would break
+  `shell.rs`'s exhaustive `fat_errno` match): the shell resolves file-vs-dir-vs-root from the parent walk
+  BEFORE the call and emits the POSIX tags itself — `-EEXIST` / `-ENOENT` / `-ENOTDIR` / `-ENOSPC` /
+  `-EINVAL` / `-ENOTEMPTY` (mapped from the seam's `IsDirectory`) / `-EBUSY` (root).
+- **Principal — unchanged** (EL1 ASID 0, PUBLIC). JD7 adds one caller-side ledger note: now that the EL1
+  panel can `create_dir` too, the EL1-panel-vs-EL0 create/create race into the SAME directory is the same
+  EXCLUDED_BY_SEQUENCING class as FATDIRS's ledgered `remove_dir` TOCTOU — no concurrent EL1 FS mutators
+  run today; same future `fat.rs` namespace-lock fix. Recorded in `SECURITY.md`.
+- **Tested (QEMU):** `check` + `UNAOS_TEGRA=1 check` green both arches; `test-arm 22` MISSION;
+  `UNAOS_GICV3=1 test-arm 40` CAPSTONE 6/6; `UNAOS_HUBSTORAGE=1 test 25` MISSION (shared `shell.rs` guard);
+  `esp-jetson` links, **108 `tegra:` strings** (unchanged). Zero x86 behavioural change (`shell.rs` compiles
+  both arches; the `mkdir`/`rmdir` handlers are dispatched only on a keystroke).
+- **Metal:** attended-pending — the money-shot bench card [`jd7-bench.md`](../unaos/scripts/jd7-bench.md)
+  (`mkdir` → `cd` → `write` → power-cycle → `cat` → `rm` → `rmdir`) also flips FATDIRS's metal verdict.
+  ⚠ Verify the serial bridge captures a full boot first (round-6 host capture failed mid-bench, §JB1f).
+- **Detail:** [`arch_arm64.md` §JD7](dev/OS/01_BOOT_HAL/arch_arm64.md) + [`SECURITY.md`](SECURITY.md)
+  FATDIRS ledger note. **Commit:** on `hw-jetson` (the seat assigns the integration hash at merge).
+
 ## hw-pi4 track — 2026-07-12 (FATDIRS — the fat.rs directory-mutation seam: `create_dir` / `remove_dir`)
 
 ### FATDIRS — `create_dir` / `remove_dir`: additive, lock-correct FAT directory create + remove 🔬 `hw-pi4`
