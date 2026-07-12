@@ -396,6 +396,34 @@ Legend: **✅ metal-confirmed** · **🔬 QEMU-green, metal pending** · dates I
   [`unaos/scripts/k2-metal-bench.md`](../unaos/scripts/k2-metal-bench.md). Normal build byte-identical;
   check both arches OK; zero x86.
 
+### K3 — revoke-persist commit-ordering: the fail-OPEN revoke residual RETIRED 🔬 `hw-pi4`
+- **What:** the last fail-OPEN residual in the U6 owner/grants ACL. A `SYS_FGRANT` revoke used to commit
+  in-RAM and THEN re-persist best-effort, so a crash / swallowed disk error during the re-persist left the
+  OLD grant on disk → the revoked grantee was re-admitted at the next mount. K3 reverses the order for a
+  REVOKE of a NAMED grantee on a NAMED-owner file: `sys_fgrant_revoke_2phase` computes the post-revoke grant
+  set from the in-RAM snapshot, writes that NARROWED row to disk FIRST (via the extracted
+  `atr_write_grant_row`), and commits the in-RAM removal ONLY if the durable write held. A persist failure is
+  FAIL-CLOSED — the in-RAM grant is left intact and the caller gets `-EIO`/`-ENODEV`, so RAM and disk never
+  silently diverge. Widen (grant/update) and anonymous grantees keep the byte-identical
+  in-RAM-then-best-effort order (already fail-closed) → the 23-fixture battery is byte-equivalent.
+  **Folded K2-review family items:** `sys_unlink` aborts (`-EIO`) BEFORE the `0xE5` name delete if the
+  durable `atr_clear_row` failed (a swallowed clear can no longer strand a stale owner row); the K2
+  launchers' `cleaned` probe matches `NotFound` specifically rather than `.is_err()`; two stale "GATED OFF
+  today" comments rewritten (the by-name gate is LIVE since K2); bit6's dir-entry-head corroboration noted.
+- **Proof:** `k3_revoke_check` (kernel-side, the `k1_persist_check` idiom, no EL0 fixture) drives the
+  production two-phase path with real stamped principals: a named-owner file with two grantees, one revoked,
+  SURVIVES a simulated reboot (revoked grantee DENIED, kept grantee still admitted) and a FORCED persist
+  failure fails closed (`-EIO`, in-RAM grant intact). Emits an uncounted
+  `:: K3-revoke: … two-phase durable-first PASS … [w=0x7f] ::` line (7 bits).
+- **Tested (QEMU):** `check` BOTH arches (x86 unchanged); `kernel8` baremetal; `kernel8-test` → **29 PASS
+  (23 + CAPSTONE 6) / 0 FAIL byte-equivalent** (the `:: K3-revoke: … PASS [w=0x7f] ::` witness is the only
+  addition, UNCOUNTED) + CAPSTONE 6/6 + F2/F3 witnesses locked 240000/240000 + K1-atr/persist/corrupt +
+  K2-liveenf, zero R1/CMD13; `test-arm` MISSION SUCCESS. Zero x86 (all changes in aarch64 `syscall.rs`).
+- **Metal:** 🔬 QEMU-verified; the two-phase revoke's real disk-write ordering rides the next attended Pi
+  bench (batched with the standing K1-persist/K1-corrupt/K2 metal watch-items).
+- **Detail:** [`SECURITY.md` §K1 (K3 bullet)](SECURITY.md). **Commit:** `syscall(aarch64): K3 — two-phase
+  revoke commit-ordering + fixture` on `hw-pi4` (see `git log`).
+
 ## hw-jetson track — 2026-07-10 (JD4 — read-side navigation + last dead levers + screen-on-boot; same-day attended bench)
 
 ### JD4 — `ls <dir>` / `cd` / `pwd` / `cat <path>` on the panel shell + JB2c/JB9b lever retirement + screen-on-boot ✅ METAL-CONFIRMED (2026-07-10) `hw-jetson`
