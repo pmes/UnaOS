@@ -2108,8 +2108,8 @@ write path (`create_in_dir` + `write_grow`) — all **call-never-edit**. One new
 plus the `cp`/`copy` dispatch arm.
 
 **Source, destination, and the `cp FILE DIR/` idiom.** `fs_cp` resolves `src` via the read-only
-`resolve_path` and requires a FILE — a directory source is `-EISDIR` (recursive `cp -r` is a JD9
-candidate). The destination is decided by resolving `dst`: an existing DIRECTORY (or the root) receives
+`resolve_path` and requires a FILE — a plain-`cp` directory source is `-EISDIR` (recursive `cp -r` is
+JD9, §JD9 below). The destination is decided by resolving `dst`: an existing DIRECTORY (or the root) receives
 the copy under the source's canonical leaf name (`cp A.TXT DOCS` → `/DOCS/A.TXT`); anything else — an
 existing file or a not-yet-existing name — is the destination file itself, validated through JD6's
 `resolve_write_target` (so a missing dst parent is `-ENOENT`, a dst parent that is a plain file is
@@ -2155,6 +2155,86 @@ tegra never runs in QEMU), so the shell-level verdict is **attended-pending**; t
 power-cycle, `cat` the copy again (it survives) with the source left untouched, then the error probes
 (dir source, self-copy, missing parent, file-parent). ⚠ Verify the serial bridge captures a full boot
 BEFORE burning bench time — the round-6/8 host capture failed mid-bench (see §JB1f).
+
+### JD9 — copying trees: panel `cp -r` (🔬 QEMU-green, metal attended-pending)
+
+JD8 duplicates a file; JD9 duplicates a whole subtree — `cp -r DOCS BACKUP` from the panel. It closes the
+copy half of the file-manager verb set (navigate, write, shape, copy; only `mv` remains, gated on a future
+pi4-lane FATMOVE seam). Like JD7/JD8, JD9 is **`shell.rs`-only and adds NO `fat.rs` logic**: it composes
+primitives that all already exist — `read_dir` (JD4) walks the source, the FATDIRS `create_dir` seam (the
+JD7 `mkdir` idiom) rebuilds the destination tree, and the JD8 per-file streaming copy (refactored into a
+shared `copy_file_into` helper) copies each file — all **call-never-edit**. The `cp`/`copy` dispatch arm
+gained a `-r`/`-R` flag; `fs_cp_recursive` is the new handler, `cp_tree` the recursion.
+
+**Source, destination, and the `cp DIR DEST` idiom.** `fs_cp_recursive` resolves `src`:
+- a **ROOT** source (`cp -r /`) is refused `-EINVAL` — the volume root has no leaf name to copy *as*, and
+  every in-volume destination is a descendant of the root anyway (the self/descendant guard would refuse it);
+- a **FILE** source degrades to a plain file copy (`fs_cp`) — POSIX-friendly and honest (`cp -r FILE DST` ==
+  `cp FILE DST`);
+- a **DIRECTORY** source is the recursive case. The destination follows the same idiom as JD8's file copy:
+  if `dst` resolves to an existing **directory** (or the root) the tree lands AS `dst/<src-leaf>`
+  (`cp -r DOCS BACKUP` where `BACKUP/` exists → `/BACKUP/DOCS`); a not-yet-existing `dst` **becomes** the new
+  tree (`cp -r DOCS NEWNAME` → `/NEWNAME`); an existing **file** at `dst` is `-ENOTDIR`.
+
+**The four guards (M1/M2).**
+1. **Self / descendant.** Copying a directory into itself or one of its own descendants is refused `-EINVAL`
+   via a case-insensitive canonical-path prefix compare (`is_descendant`: `path` is inside `ancestor` iff it
+   is strictly longer, shares the prefix, and the next byte is `/` — so `/DOCSX` is *not* inside `/DOCS`).
+   This is what stops an infinite `cp -r DOCS DOCS/SUB` (the destination would be created *inside* the source
+   being walked).
+2. **Fresh-tree `-EEXIST`.** The top-level target directory must NOT already exist; if it does, refuse
+   `-EEXIST`. This is the **simple, safe rule** chosen for the merge-into-vs-refuse decision: `cp -r` always
+   creates a brand-new tree, never silently merging into or overwriting an existing one (FAT + our
+   truncate-overwrite file copy make a silent merge surprising). A useful consequence: because the top-level
+   target is fresh, *every* directory `cp_tree` creates below it sits inside a freshly-created, therefore
+   empty, parent — so no child name can ever collide (`create_dir`/`create_in_dir` do not de-dup, but they
+   never have to here) and no pre-existing file is ever clobbered. The recursion needs no per-node existence
+   check.
+3. **Depth bound.** Recursion is capped at `CP_MAX_DEPTH = 32`; exceeding it is an honest `-ELOOP`, never a
+   stack blow-out. (`read_dir`'s own chain-loop guard already backstops a malformed self-referential volume;
+   the depth cap is the shell-side belt-and-braces.)
+4. **Honest partial failure.** A mid-tree error (e.g. `-ENOSPC` part-way through) stops immediately and
+   reports the running tally — dirs/files/bytes copied *before* the error — plus the failing path and errno.
+   No silent truncation. Nothing is rolled back: the partial tree is left on disk (crash-safe per the
+   FATDIRS/JD6 `0xE5`-then-free and child-before-parent ordering), and the operator can `rmdir`/`rm` it. Every
+   op rides the JD3 wall-clock BOT pump, so a stalled transfer is `-EIO`, never a hang on the timerless EL1
+   core.
+
+`cp_tree` filters the `.`/`..` self/parent links a subdirectory cluster carries (the root has none) at every
+level, `create_dir`s each child directory and recurses, and streams each child file through `copy_file_into`
+(the JD8 streaming core, now shared by both `fs_cp` and `cp_tree` so the create-or-truncate + windowed
+`read_at`→`write_grow` logic lives in exactly one place). On success it echoes
+`copied /DOCS/ -> /BACKUP/DOCS/ (N dir(s), M file(s), K bytes)`.
+
+**Errno fidelity is shell-side** (the JD6/JD7/JD8 pattern, reusing `fat_errno` + shell-owned tags): src
+missing → `-ENOENT`; ROOT src → `-EINVAL`; dst is a plain file → `-ENOTDIR`; self / descendant → `-EINVAL`;
+top-level target already exists → `-EEXIST`; recursion too deep → `-ELOOP`; the volume/dir full mid-tree →
+`-ENOSPC` (partial-reported); a non-8.3 child name in the source (should not occur — `read_dir` only surfaces
+representable names) → `-EINVAL` from `create_dir`.
+
+**Principal — unchanged.** The shell is still EL1 ASID 0, the PUBLIC principal; `cp -r` reads public sources
+and creates public destinations — no U6 owner ACL is consulted, correct for the trusted local console (§JD5).
+JD9 adds no new lock or namespace surface: it composes the same F3-locked
+`read_dir`/`create_dir`/`create_in_dir`/`write_grow`/`delete_located`/`read_at` primitives JD6/JD7/JD8
+already exercise and ledgered, so it inherits their locking analysis unchanged (including the FATDIRS
+`create_dir`-into-the-same-directory TOCTOU, EXCLUDED_BY_SEQUENCING today — no concurrent EL1 FS mutators).
+
+**Gate (QEMU):** `./arroyo check` + `UNAOS_TEGRA=1 ./arroyo check` green both arches; `./arroyo test-arm 22`
+→ `MISSION SUCCESS`; `UNAOS_GICV3=1 ./arroyo test-arm 40` → CAPSTONE 6/6; `UNAOS_HUBSTORAGE=1 ./arroyo test
+25` → `MISSION SUCCESS` (shared `shell.rs` guard); `esp-jetson kernel.elf` links, **108 `tegra:` strings**
+(unchanged — the `cp -r` strings carry no `tegra:` token; validate media by count, not size). As in JD2–JD8
+the SHELL command path is not headless-reachable in-lane (the shell dispatches only on a keystroke, and tegra
+never runs in QEMU), so the shell-level verdict is **attended-pending**; the read/write/dir PRIMITIVES `cp -r`
+composes are already exercised headless by the U9 read path, the U10/U11 write fixtures, and FATDIRS's own
+`fatdirs_check` selftest.
+
+**Metal verdict — attended-pending.** The money-shot is the bench card
+[`jd9-bench.md`](../../../../unaos/scripts/jd9-bench.md): `mkdir` a small source tree with files, `cp -r` it
+into a new destination, `ls`/`cat` to verify the tree structure and file contents match, power-cycle, verify
+the copy survives, then the guards (self-into-descendant `-EINVAL`, missing source `-ENOENT`, pre-existing
+target `-EEXIST`). ⚠ Verify the serial bridge captures a full boot BEFORE burning bench time — the round-6/8
+host capture failed mid-bench (see §JB1f). Repeated `cp -r`/`rmdir` cycles accumulate `0xE5` tombstone slots
+across boots (the FATDIRS cleanup leaves them; harmless — a card re-prep clears them).
 
 ### JB1f — the unhealed early-vector window (the round-6 boot crash), closed (`85f74f8`)
 
