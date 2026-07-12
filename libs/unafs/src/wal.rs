@@ -15,6 +15,8 @@
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 use crate::storage::{BLOCK_SIZE, BlockDevice, Error as StorageError};
+use alloc::collections::BTreeSet;
+use alloc::string::String;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -102,7 +104,7 @@ impl Journal {
     /// Returns true if the FS was dirty (unclosed transaction found).
     pub fn check_recovery<D: BlockDevice>(&mut self, device: &mut D) -> Result<bool, JournalError> {
         let mut offset = 0;
-        let mut open_ops = std::collections::HashSet::new(); // Tracks op_ids
+        let mut open_ops = BTreeSet::new(); // Tracks op_ids
         // For Create/Write ops without explicit ID in Begin, we need a way to track pairing.
         // But `BeginCreate` doesn't have an ID yet. `EndCreate` has the new ID.
         // Wait, if we crash during Create, we might have allocated the ID but not finished.

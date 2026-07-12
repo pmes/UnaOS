@@ -16,6 +16,7 @@
 
 use crate::hash::{FnvHasher, hash_bytes};
 use crate::inode::AttributeValue;
+use alloc::vec::Vec;
 use serde::{Deserialize, Serialize};
 
 /// An entry in the Attribute Catalog.

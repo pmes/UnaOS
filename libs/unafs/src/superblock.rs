@@ -15,6 +15,7 @@
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 use crate::storage::{BLOCK_SIZE, Error as StorageError};
+use alloc::vec::Vec;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 

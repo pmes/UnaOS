@@ -18,7 +18,19 @@
 //!
 //! This library implements a database disguised as a file system, capable of handling
 //! massive streams and semantic queries.
+//!
+//! # no_std
+//!
+//! The crate is `#![no_std]` + `alloc` by default-off: the on-disk format types,
+//! the [`codec`] serialization seam, the [`storage::BlockDevice`] trait, and the
+//! in-memory [`storage::MemDevice`] compile without `std`. The host-native
+//! backends — the `FileDevice` file backend, the [`io`] memory-map reader, the
+//! bandy event bus, and the semantic query engine (which needs floating-point
+//! `sqrt`) — live behind the default-on `std` feature.
 
+#![cfg_attr(not(feature = "std"), no_std)]
+
+#[cfg_attr(not(feature = "std"), macro_use)]
 extern crate alloc;
 
 pub mod bitmap;
@@ -27,6 +39,7 @@ pub mod codec;
 pub mod fs;
 pub mod hash;
 pub mod inode;
+#[cfg(feature = "std")]
 pub mod io;
 pub mod query;
 pub mod storage;
@@ -37,9 +50,12 @@ pub use catalog::{CatalogEntry, deserialize_catalog, serialize_catalog};
 pub use fs::{DirEntry, UnaFS};
 pub use inode::{AttributeValue, Extent, ExtentList, FileKind, Inode, InodeError};
 pub use query::{Query, QueryOp, parse_value};
-pub use storage::{BLOCK_SIZE, BlockDevice, FileDevice, MemDevice};
+#[cfg(feature = "std")]
+pub use storage::FileDevice;
+pub use storage::{BLOCK_SIZE, BlockDevice, MemDevice};
 pub use superblock::Superblock;
 pub use wal::{Journal, JournalOp};
 
 /// The default FileSystem type backed by a host file.
+#[cfg(feature = "std")]
 pub type FileSystem = UnaFS<FileDevice>;

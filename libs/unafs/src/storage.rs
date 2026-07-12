@@ -14,10 +14,16 @@
 // You should have received a copy of the GNU Lesser General Public License
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-use std::fs::{File, OpenOptions};
-use std::io::{Read, Seek, SeekFrom, Write};
-use std::path::Path;
+use alloc::string::String;
+use alloc::vec::Vec;
 use thiserror::Error;
+
+#[cfg(feature = "std")]
+use std::fs::{File, OpenOptions};
+#[cfg(feature = "std")]
+use std::io::{Read, Seek, SeekFrom, Write};
+#[cfg(feature = "std")]
+use std::path::Path;
 
 /// The fundamental atomic unit of the file system.
 /// All reads and writes must be aligned to this size.
@@ -64,10 +70,12 @@ pub trait BlockDevice {
 }
 
 /// A block device backed by a file on the host OS.
+#[cfg(feature = "std")]
 pub struct FileDevice {
     file: File,
 }
 
+#[cfg(feature = "std")]
 impl FileDevice {
     /// Open a file as a block device.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, std::io::Error> {
@@ -89,6 +97,7 @@ impl FileDevice {
     }
 }
 
+#[cfg(feature = "std")]
 impl BlockDevice for FileDevice {
     fn read_block(&mut self, id: u64, buf: &mut [u8]) -> Result<(), Error> {
         if buf.len() as u64 != BLOCK_SIZE {
