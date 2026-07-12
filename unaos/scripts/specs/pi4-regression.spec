@@ -53,3 +53,8 @@ FORBID AARCH64 EXCEPTION
 # --- has silent no-verdict exit paths: a green battery without this line = proof not run,
 # --- per the K2 security-review note, 2026-07-11) --------------------------------------
 REQUIRE K2-liveenf:.*rebuild\+enforce PASS
+
+# --- IMG-SIG code-signing witness (uncounted): the loader mints the IMAGE_SHA256 principal;
+# --- the in-RAM KAT/discrimination bits always run, the file bits need the K2 blobs on the card.
+# --- OPTIONAL so a 3-of-4-core / no-card metal boot doesn't fail the chain on the file leg. -----
+OPTIONAL IMG-SIG:.*residual closed\) PASS

@@ -5992,9 +5992,13 @@ fn load_program_into_slot(name: &str) -> Result<Loaded, SpawnErr> {
     super::cache::icache_sync_range(backing as usize, bytes.len());
     unsafe { super::boot::protect_user_slot_code(slot, super::boot::USER_CODE_SIZE) };
     let ttbr0 = super::boot::slot_ttbr0(slot);
-    // M2.1: stamp this slot's persistent principal from the loader-RESOLVED name (launcher policy v1 — the
-    // ONLY mint path; kernel-derived, never EL0-set). Nothing reads it until M2.3/M2.4 (behaviour-neutral).
-    slot_ppid_stamp(ttbr0 >> 48, PrincipalRecord::program_name(name));
+    // IMAGE_SHA256 (code-signing): stamp this slot's persistent principal from the loaded IMAGE bytes, not the
+    // 8.3 name — the SOLE mint path, kernel-derived from `bytes` (the untrusted image), never EL0-set. This
+    // GRADUATES the U6 owner from PROGRAM_NAME ("same 8.3 name = same principal", the honest residual) to the
+    // image digest: two byte-identical images share a principal (a re-spawn is re-admitted by name+identity),
+    // two DIFFERENT images under the same name do NOT (a swapped blob is refused). `name` still drives
+    // find/read/logging, so it stays live.
+    slot_ppid_stamp(ttbr0 >> 48, PrincipalRecord::image_of(&bytes));
     Ok(Loaded {
         base,
         sp: (base + size as u64) & !0xF, // 16-aligned window top = initial SP_EL0
@@ -6003,6 +6007,26 @@ fn load_program_into_slot(name: &str) -> Result<Loaded, SpawnErr> {
         len: bytes.len(),
         kind,
     })
+}
+
+/// IMAGE_SHA256 (code-signing): the IMAGE_SHA256 principal a program's on-disk image WOULD be stamped with by
+/// `load_program_into_slot`, computed WITHOUT allocating a slot — mount, find, read the same bytes under the
+/// same one-page cap, hash. Mirrors the loader's read EXACTLY so the result is bit-identical to the live stamp.
+/// `None` if the file is absent, mis-sized, or unreadable. Used by the K2 launcher/metal fixtures (the expected
+/// owner principal, now an image digest not a name) and by the IMG-SIG witness.
+fn image_principal_of_file(name: &str) -> Option<PrincipalRecord> {
+    let fs = crate::fs::fat::mount().ok()?;
+    let de = fs.find_in_root(name).ok()?;
+    let cap = super::boot::USER_CODE_SIZE;
+    if de.size == 0 || de.size as u64 > cap as u64 {
+        return None;
+    }
+    let mut bytes: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
+    fs.read_file(&de, &mut bytes, cap).ok()?;
+    if bytes.is_empty() {
+        return None;
+    }
+    Some(PrincipalRecord::image_of(&bytes))
 }
 
 /// SYS_SPAWN(): load the fixed on-disk program (`HELLO.BIN`) into a fresh slot, run it at EL0 as a CHILD of
@@ -8360,6 +8384,10 @@ pub fn u7_launcher(demo_cpu: usize) {
     // BEFORE the in-RAM removal, so it SURVIVES REBOOT and fails CLOSED on a persist failure. Its own uncounted
     // `:: K3-revoke: … PASS ::` line; fully self-cleaning (leaves no owned row on the metal card).
     k3_revoke_launcher();
+    // IMAGE_SHA256 code-signing: prove the SHA-256 primitive (FIPS KATs) + that it discriminates program
+    // IMAGES, closing the "same 8.3 name = same principal" residual (the loader now mints IMAGE_SHA256). Its
+    // own uncounted `:: IMG-SIG: … PASS ::` line; read-only, no disk write.
+    image_sig_selftest();
 }
 
 /// F2 M3 witness worker — the `demo_cpu` half of the cross-core FAT_MUTATION stress. `fn(usize)` for
@@ -8572,9 +8600,8 @@ const ATR_ROW_VALID: u8 = 1 << 0; // this row records a live owned file (else a 
 
 // principal_record kinds (the PROPOSED model — reserved values keep the format model-agnostic for the seat).
 const PRIN_NONE: u8 = 0; // public / free (no owner)
-const PRIN_PROGRAM_NAME: u8 = 1; // "prog:<name>" — the recommended default
-#[allow(dead_code)]
-const PRIN_IMAGE_SHA256: u8 = 2; // reserved: "sha256:<hex>" once code-signing lands (no format bump)
+const PRIN_PROGRAM_NAME: u8 = 1; // "prog:<name>" — the pre-code-signing default (still valid for manual stamps)
+const PRIN_IMAGE_SHA256: u8 = 2; // "sha256:<hex>" — the code-signing principal; the loader mints THIS since IMG-SIG
 #[allow(dead_code)]
 const PRIN_KERNEL_PID: u8 = 3; // reserved: launcher-minted "pid:<hex>"
 const PRIN_VALUE_LEN: usize = 30;
@@ -8616,6 +8643,24 @@ impl PrincipalRecord {
             n += 1;
         }
         PrincipalRecord { kind: PRIN_PROGRAM_NAME, len: n as u8, value }
+    }
+
+    /// IMAGE_SHA256 (code-signing, this arc): the principal a program's IMAGE identity mints — kind
+    /// IMAGE_SHA256, `value` = the 30-byte prefix of the 32-byte SHA-256 digest (240 bits; the `value` field is
+    /// a HARD 30 bytes — widening it is a format bump, so we truncate rather than bump, and 240-bit identity is
+    /// collision-infeasible). On disk we keep the RAW digest prefix; the canonical `"sha256:<hex>"` string
+    /// projection (71 chars, doesn't fit) is derived from these bytes at K4 — the byte-transparent codec is
+    /// unchanged. Equality (derive(PartialEq)) compares all 30 value bytes, so two IMAGE principals match iff
+    /// their digest prefixes match. Kernel-minted; NEVER self-asserted by a blob.
+    fn image_sha256(digest: &[u8; 32]) -> Self {
+        let mut value = [0u8; PRIN_VALUE_LEN];
+        value.copy_from_slice(&digest[..PRIN_VALUE_LEN]);
+        PrincipalRecord { kind: PRIN_IMAGE_SHA256, len: PRIN_VALUE_LEN as u8, value }
+    }
+
+    /// The IMAGE_SHA256 principal for a set of image bytes (hash + wrap). The loader's mint path.
+    fn image_of(bytes: &[u8]) -> Self {
+        Self::image_sha256(&sha256(bytes))
     }
 
     fn write(&self, out: &mut [u8]) {
@@ -8716,6 +8761,90 @@ fn atr_crc32(data: &[u8]) -> u32 {
         }
     }
     !crc
+}
+
+/// IMAGE_SHA256 (code-signing, this arc): the SHA-256 compression function over one 64-byte block (FIPS 180-4
+/// §6.2). Pure, no_std, no heap — the only table is the 64 round constants. Callers: `sha256`.
+fn sha256_compress(h: &mut [u32; 8], block: &[u8; 64]) {
+    const K: [u32; 64] = [
+        0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
+        0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
+        0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
+        0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
+        0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
+        0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
+        0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+        0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2,
+    ];
+    let mut w = [0u32; 64];
+    for i in 0..16 {
+        w[i] = u32::from_be_bytes([block[i * 4], block[i * 4 + 1], block[i * 4 + 2], block[i * 4 + 3]]);
+    }
+    for i in 16..64 {
+        let s0 = w[i - 15].rotate_right(7) ^ w[i - 15].rotate_right(18) ^ (w[i - 15] >> 3);
+        let s1 = w[i - 2].rotate_right(17) ^ w[i - 2].rotate_right(19) ^ (w[i - 2] >> 10);
+        w[i] = w[i - 16].wrapping_add(s0).wrapping_add(w[i - 7]).wrapping_add(s1);
+    }
+    let (mut a, mut b, mut c, mut d, mut e, mut f, mut g, mut hh) =
+        (h[0], h[1], h[2], h[3], h[4], h[5], h[6], h[7]);
+    for i in 0..64 {
+        let s1 = e.rotate_right(6) ^ e.rotate_right(11) ^ e.rotate_right(25);
+        let ch = (e & f) ^ ((!e) & g);
+        let t1 = hh.wrapping_add(s1).wrapping_add(ch).wrapping_add(K[i]).wrapping_add(w[i]);
+        let s0 = a.rotate_right(2) ^ a.rotate_right(13) ^ a.rotate_right(22);
+        let maj = (a & b) ^ (a & c) ^ (b & c);
+        let t2 = s0.wrapping_add(maj);
+        hh = g;
+        g = f;
+        f = e;
+        e = d.wrapping_add(t1);
+        d = c;
+        c = b;
+        b = a;
+        a = t1.wrapping_add(t2);
+    }
+    h[0] = h[0].wrapping_add(a);
+    h[1] = h[1].wrapping_add(b);
+    h[2] = h[2].wrapping_add(c);
+    h[3] = h[3].wrapping_add(d);
+    h[4] = h[4].wrapping_add(e);
+    h[5] = h[5].wrapping_add(f);
+    h[6] = h[6].wrapping_add(g);
+    h[7] = h[7].wrapping_add(hh);
+}
+
+/// IMAGE_SHA256 (code-signing, this arc): FIPS 180-4 SHA-256 over a byte slice → 32-byte digest. no_std, no
+/// heap, single-pass with the standard 0x80/zero-pad/64-bit-length framing. This is an image-IDENTITY digest,
+/// NOT a MAC/signature — it graduates a program's persistent principal from its 8.3 NAME (two same-named blobs
+/// were one principal) to its IMAGE (two byte-identical images are one principal, two different images are not).
+/// Kernel-minted at `load_program_into_slot` from the loaded bytes; never self-asserted by an EL0 blob.
+fn sha256(data: &[u8]) -> [u8; 32] {
+    let mut h: [u32; 8] = [
+        0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19,
+    ];
+    let bitlen = (data.len() as u64).wrapping_mul(8);
+    let mut chunks = data.chunks_exact(64);
+    let mut block = [0u8; 64];
+    for c in chunks.by_ref() {
+        block.copy_from_slice(c);
+        sha256_compress(&mut h, &block);
+    }
+    let rem = chunks.remainder();
+    block = [0u8; 64];
+    block[..rem.len()].copy_from_slice(rem);
+    block[rem.len()] = 0x80;
+    if rem.len() >= 56 {
+        // the 8-byte length won't fit after the 0x80 in this block — flush it, then a fresh zero block.
+        sha256_compress(&mut h, &block);
+        block = [0u8; 64];
+    }
+    block[56..64].copy_from_slice(&bitlen.to_be_bytes());
+    sha256_compress(&mut h, &block);
+    let mut out = [0u8; 32];
+    for (i, word) in h.iter().enumerate() {
+        out[i * 4..i * 4 + 4].copy_from_slice(&word.to_be_bytes());
+    }
+    out
 }
 
 /// K1: serialize a live owned-file row to its 256-byte on-disk form (VALID set). Layout (LE):
@@ -10069,6 +10198,94 @@ fn k3_revoke_launcher() {
     );
 }
 
+/// IMG-SIG (code-signing witness) — prove the IMAGE_SHA256 principal machinery: the SHA-256 primitive is
+/// correct (FIPS 180-4 KATs) AND it discriminates program IMAGES, closing the "same 8.3 name = same principal"
+/// residual the K3 arc last carried. In-RAM (KAT + constant-buffer) bits always run; the file bits run when a
+/// card carries the two K2 programs (present in the QEMU FAT and on the metal card). Emits one UNCOUNTED line
+/// (PASS/FAIL space-flanked, never `-> PASS`/`: PASS`/`-> FAIL`/`FAIL ::`), so the 23-fixture count is
+/// byte-equivalent. Read-only — no disk write, no slot, no lock; cannot perturb the battery. Runs LAST.
+fn image_sig_selftest() {
+    static DONE: AtomicBool = AtomicBool::new(false);
+    if DONE.swap(true, Ordering::Relaxed) {
+        return;
+    }
+    let mut w = 0u32;
+
+    // ---- Known-answer tests: the SHA-256 primitive is FIPS 180-4 correct ----
+    const KAT_EMPTY: [u8; 32] = [
+        0xe3, 0xb0, 0xc4, 0x42, 0x98, 0xfc, 0x1c, 0x14, 0x9a, 0xfb, 0xf4, 0xc8, 0x99, 0x6f, 0xb9, 0x24,
+        0x27, 0xae, 0x41, 0xe4, 0x64, 0x9b, 0x93, 0x4c, 0xa4, 0x95, 0x99, 0x1b, 0x78, 0x52, 0xb8, 0x55,
+    ];
+    const KAT_ABC: [u8; 32] = [
+        0xba, 0x78, 0x16, 0xbf, 0x8f, 0x01, 0xcf, 0xea, 0x41, 0x41, 0x40, 0xde, 0x5d, 0xae, 0x22, 0x23,
+        0xb0, 0x03, 0x61, 0xa3, 0x96, 0x17, 0x7a, 0x9c, 0xb4, 0x10, 0xff, 0x61, 0xf2, 0x00, 0x15, 0xad,
+    ];
+    // 56-byte "a"*56 — exercises the padding-OVERFLOW branch (0x80 + length spill a SECOND compression block),
+    // which the "" / "abc" vectors do NOT reach. A whole-image digest (K2OWN.BIN spans many blocks) depends on
+    // this branch being right, so it is KAT-pinned here.
+    const KAT_56A: [u8; 32] = [
+        0xb3, 0x54, 0x39, 0xa4, 0xac, 0x6f, 0x09, 0x48, 0xb6, 0xd6, 0xf9, 0xe3, 0xc6, 0xaf, 0x0f, 0x5f,
+        0x59, 0x0c, 0xe2, 0x0f, 0x1b, 0xde, 0x70, 0x90, 0xef, 0x79, 0x70, 0x68, 0x6e, 0xc6, 0x73, 0x8a,
+    ];
+    if sha256(b"") == KAT_EMPTY {
+        w |= 1 << 0; // bit0: SHA-256("") KAT — the empty-input / single-pad-block path
+    }
+    if sha256(b"abc") == KAT_ABC && sha256(&[b'a'; 56]) == KAT_56A {
+        w |= 1 << 1; // bit1: SHA-256("abc") + the 56-byte padding-OVERFLOW KAT (2nd compression block)
+    }
+
+    // ---- Image-identity discrimination on constant buffers (no card needed) ----
+    // Two distinct 1-page-ish images, and a byte-identical copy of the first. `[b; N]` differs from the copy in
+    // ONE byte to model a swapped blob.
+    let img_a = [0xA5u8; 200];
+    let img_a_copy = [0xA5u8; 200];
+    let mut img_b = [0xA5u8; 200];
+    img_b[137] = 0x5A; // one flipped byte -> a different image
+    let pa = PrincipalRecord::image_of(&img_a);
+    let pa2 = PrincipalRecord::image_of(&img_a_copy);
+    let pb = PrincipalRecord::image_of(&img_b);
+    if pa.kind == PRIN_IMAGE_SHA256 && pa.len == PRIN_VALUE_LEN as u8 {
+        w |= 1 << 2; // bit2: the minted principal is a well-formed IMAGE_SHA256 (kind + full 30-byte value)
+    }
+    if pa == pa2 {
+        w |= 1 << 3; // bit3: byte-identical images -> the SAME principal (a re-spawn stays the owner)
+    }
+    if pa != pb {
+        w |= 1 << 4; // bit4: a one-byte-different image -> a DISTINCT principal (a swapped blob is NOT the owner)
+    }
+    // bit5: an IMAGE principal is NEVER equal to a PROGRAM_NAME principal — even one whose name string happens
+    // to collide with the digest prefix bytes — because `kind` participates in equality. This is the graduation:
+    // identity moved off the name entirely.
+    if pa != PrincipalRecord::program_name("A5") && pa.kind != PrincipalRecord::program_name("A5").kind {
+        w |= 1 << 5;
+    }
+
+    // ---- Real programs off the card: two DIFFERENT images (K2OWN.BIN vs K2IMP.BIN) -> two DIFFERENT ----
+    // ---- principals, each stable across a re-read; the by-NAME residual is closed for real blobs. ----
+    let have_card = crate::drivers::block::info().is_some();
+    let mut file_all = 0u32;
+    if have_card {
+        file_all = 1 << 6;
+        if let (Some(own1), Some(own2), Some(imp1)) = (
+            image_principal_of_file(K2_OWN_NAME),
+            image_principal_of_file(K2_OWN_NAME),
+            image_principal_of_file(K2_IMP_NAME),
+        ) {
+            if own1.kind == PRIN_IMAGE_SHA256 && own1 == own2 && own1 != imp1 {
+                w |= 1 << 6; // bit6: distinct real images -> distinct principals; same image re-read is stable
+            }
+        }
+    }
+
+    let all = 0x3Fu32 | file_all; // 0x7F with a card, 0x3F without
+    serial_println!(
+        ":: IMG-SIG: code-signing principal = IMAGE_SHA256 (FIPS KATs, image discrimination, name-collision residual closed) {} [w={:#04x}/{:#04x}] ::",
+        if w == all { "PASS" } else { "FAIL" },
+        w,
+        all
+    );
+}
+
 // ===================================================================================================
 // K2 (make-enforcement-LIVE): prove the K1 cross-reboot ACL end-to-end through TWO REAL disk-loaded
 // programs with the gate FLIPPED. Unlike `k1_persist_check` (which manufactures principals directly on
@@ -10215,7 +10432,15 @@ fn k2_liveenf_launcher(demo_cpu: usize) {
     }
 
     let mut w = 0u32;
-    let p_own = PrincipalRecord::program_name(K2_OWN_NAME); // the principal the loader stamps for K2OWN.BIN
+    // IMAGE_SHA256: the owner's expected principal is now its IMAGE DIGEST, not `prog:K2OWN.BIN` — computed
+    // from the on-disk image the same way the loader hashes it. A swapped K2OWN.BIN would mint a different one.
+    let p_own = match image_principal_of_file(K2_OWN_NAME) {
+        Some(p) => p,
+        None => {
+            serial_println!(":: K2-liveenf: cannot hash K2OWN.BIN image — demo skipped ::");
+            return;
+        }
+    };
 
     // ---- Phase 1: a REAL owner program creates+owns+persists (+grows) K2PRIV.BIN at EL0 ----
     K2_OWN_WITNESS.store(0, Ordering::Release);
@@ -10224,8 +10449,8 @@ fn k2_liveenf_launcher(demo_cpu: usize) {
         return;
     };
     let own_w1 = K2_OWN_WITNESS.load(Ordering::Acquire);
-    if own_w1 == K2_OWN_WITNESS_ALL && stamp1 == p_own && p_own.kind == PRIN_PROGRAM_NAME {
-        w |= 1 << 0; // bit0: the real loaded owner created+wrote its private file, stamped prog:K2OWN.BIN
+    if own_w1 == K2_OWN_WITNESS_ALL && stamp1 == p_own && p_own.kind == PRIN_IMAGE_SHA256 {
+        w |= 1 << 0; // bit0: the real loaded owner created+wrote its private file, stamped by IMAGE digest
     }
 
     // Locate the created file + confirm the in-RAM owner row records the owner's PERSISTENT principal.
@@ -10289,8 +10514,8 @@ fn k2_liveenf_launcher(demo_cpu: usize) {
         return;
     };
     let imp_w = K2_IMP_WITNESS.load(Ordering::Acquire);
-    if imp_w == K2_IMP_WITNESS_ALL && stamp_imp.kind == PRIN_PROGRAM_NAME && stamp_imp != p_own {
-        w |= 1 << 5; // bit5: a distinct real principal was denied the owner's private file by name
+    if imp_w == K2_IMP_WITNESS_ALL && stamp_imp.kind == PRIN_IMAGE_SHA256 && stamp_imp != p_own {
+        w |= 1 << 5; // bit5: a distinct real principal (distinct IMAGE digest) was denied the owner's file
     }
 
     let done = EL0_K2_DONE.load(Ordering::Acquire);
@@ -10308,7 +10533,7 @@ fn k2_liveenf_launcher(demo_cpu: usize) {
     const K2_ALL: u32 = (1 << 7) - 1; // bits 0..=6
     if w == K2_ALL && done == 3 && killed == 0 && cleaned {
         serial_println!(
-            ":: K2-liveenf: cross-reboot ACL LIVE via REAL programs — owner prog:K2OWN.BIN re-admitted BY NAME after UNAFS.ATR rebuild, impostor prog:K2IMP.BIN refused (-EACCES); grow-repersist landed the real chain head; self-cleaned rebuild+enforce PASS [w={:#04x}] ::",
+            ":: K2-liveenf: cross-reboot ACL LIVE via REAL programs — owner K2OWN.BIN re-admitted by name+IMAGE-digest after UNAFS.ATR rebuild, impostor K2IMP.BIN (distinct image) refused (-EACCES); grow-repersist landed the real chain head; self-cleaned rebuild+enforce PASS [w={:#04x}] ::",
             w
         );
     } else {
@@ -10357,7 +10582,10 @@ fn k2_metal_launcher(demo_cpu: usize) {
 /// telling the operator to power-cycle (or, on an incomplete create, NOT to).
 #[cfg(feature = "k2_leave")]
 fn k2_metal_leave(demo_cpu: usize) {
-    let p_own = PrincipalRecord::program_name(K2_OWN_NAME);
+    let Some(p_own) = image_principal_of_file(K2_OWN_NAME) else {
+        serial_println!(":: K2-metal: cannot hash K2OWN.BIN image — boot-1 leave aborted (re-prep card) ::");
+        return;
+    };
     K2_OWN_WITNESS.store(0, Ordering::Release);
     let Some(stamp1) = k2_run_program(K2_OWN_NAME, "el0-k2own", demo_cpu, 1) else {
         serial_println!(":: K2-metal: owner program failed to load — boot-1 leave aborted (re-prep card) ::");
@@ -10404,7 +10632,10 @@ fn k2_metal_leave(demo_cpu: usize) {
 #[cfg(feature = "k2_leave")]
 fn k2_metal_verify(demo_cpu: usize) {
     let mut w = 0u32;
-    let p_own = PrincipalRecord::program_name(K2_OWN_NAME);
+    let Some(p_own) = image_principal_of_file(K2_OWN_NAME) else {
+        serial_println!(":: K2-metal: BOOT-2 cannot hash K2OWN.BIN image ::");
+        return;
+    };
     let fs = match crate::fs::fat::mount() {
         Ok(f) => f,
         Err(_) => {
