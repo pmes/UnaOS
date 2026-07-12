@@ -315,6 +315,17 @@ hazard — it is exactly the write-only-framebuffer pattern, just un-accelerated
 `ensure_pat_wc()` into `smp::ap_entry` for uniform WC is a one-line follow-up, left out to keep the
 arc in-lane.
 
+**WC drain — SFENCE at every flush seam (F1, seat-review must-fix).** WC stores buffer in the CPU's
+write-combining buffers and drain only on a store fence / serializing event / buffer pressure
+(SDM Vol. 3A §11.3.1). A streaming console self-evicts under pressure, but the LAST partial WC
+buffer before the CPU idles has no eviction trigger — the tail of the panic screen ahead of
+`hlt_loop()` is the concrete failure surface, and QEMU/TCG cannot witness it (WC buffering is not
+modeled). Fix: the x86 `arch::flush_framebuffer_range` (previously a no-op) now emits **SFENCE**,
+so every existing flush seam is a real drain point: fbcon's per-print `flush_dirty` (after the
+shadow blit), `panic_screen()`'s `flush_all` plus each subsequent panic-text print, and `Screen`'s
+per-frame present. Range-independent (SFENCE drains all WC buffers); negligible next to the blit.
+aarch64's flush (`DC CVAC` + `DSB`) is untouched.
+
 **Witness.** The `videobench` `fbmem` readout is the on-target witness (QEMU + metal): the retype
 flips it from `pte=…00e3 pat=WB eff=UC` to `pte=…10e3 pat=WC eff=WC`, and a boot line
 `:: x86 fb-wc: retyped N leaf(s) WC (PAT PA4) over <base>..<end> ::` fires in every x86 build.
