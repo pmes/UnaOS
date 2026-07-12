@@ -1192,6 +1192,10 @@ pub fn service_net() {
     // lock here would deadlock (spin::Mutex is not reentrant). One-shot; no-op knob-off / no NIC.
     #[cfg(all(feature = "smolnet", target_arch = "x86_64"))]
     crate::smolnet::witness_tick();
+    // SOCK-2 (knob-on): the smoltcp persistent-socket UDP round-trip witness. Same one-shot,
+    // post-guard discipline as SOCK-1's — its pump short-locks NET_DEVICE per ring op.
+    #[cfg(all(feature = "smolnet", target_arch = "x86_64"))]
+    crate::smolnet::witness_tick2();
 }
 
 /// Outcome of a blocking [`ping`] (rendered by the `ping` shell command).

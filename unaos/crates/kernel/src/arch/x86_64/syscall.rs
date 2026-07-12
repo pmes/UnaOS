@@ -112,6 +112,24 @@ const O_PUBLIC: u64 = 1 << 2;
 // (the SYS_XFER idiom — no raw pid/slot from ring 3). The grant is an ACL edge on the FILE (nothing delivered to
 // the grantee's table); the grantee opens the name and the SYS_OPEN ACL admits it. See `sys_fgrant`.
 const SYS_FGRANT: u64 = 18;
+// SOCK-2 (ROADMAP §1b): the UDP socket syscall family — the FIRST time ring 3 reaches the network.
+// A socket is a new object-table kind (`KIND_SOCKET`, already scaffolded as the U6bx/U9x kind
+// negative) whose value word is a persistent-`SocketSet` id; the handle is a capability exactly like a
+// File (`CAP_READ` gates recv, `CAP_WRITE` gates send, so `SYS_CAP` GRANT attenuates a socket to
+// send-only / recv-only). SOCKET() mints one carrying `CAP_READ|CAP_WRITE`; BIND(handle, port) names a
+// local UDP port; SENDTO(handle, msg_ptr, msg_len) sends a datagram whose 8-byte header is
+// `[dst_ip[4]][dst_port u16 LE][pad u16]` followed by the payload; RECVFROM(handle, buf_ptr, buf_len)
+// writes that same header shape (source addr) + payload and returns the total, or `-EAGAIN` when empty
+// (NON-BLOCKING — the IF-masked handler cannot block; smolnet drives a bounded poll pump). x86-only,
+// knob-on (`UNAOS_SMOLNET`); aarch64 / knob-off never compile these arms (byte-identical).
+#[cfg(all(feature = "smolnet", target_arch = "x86_64"))]
+const SYS_SOCKET: u64 = 19;
+#[cfg(all(feature = "smolnet", target_arch = "x86_64"))]
+const SYS_BIND: u64 = 20;
+#[cfg(all(feature = "smolnet", target_arch = "x86_64"))]
+const SYS_SENDTO: u64 = 21;
+#[cfg(all(feature = "smolnet", target_arch = "x86_64"))]
+const SYS_RECVFROM: u64 = 22;
 
 /// Base of the ring-3 window: 1 TiB — a FRESH top-level slot (PML4 index 2) above the firmware
 /// identity map, so mapping it touches no kernel state. `setup` proves it unmapped before use.
@@ -2235,6 +2253,14 @@ pub fn record_ring3_kill(name: &str, vec: u8, err: u64, cr2: u64) {
         U11M2_KILLED.fetch_add(1, Ordering::AcqRel);
         return;
     }
+    // SOCK-2: the UDP round-trip fixture is register + inline-data only (its only user store is the recv
+    // buffer in its own data page) and well-behaved; a kill is a real SOCK-2 bug — its own counter, never
+    // the U1b `killed_unexpected` count. Not in PROCS, so the launcher times out to FAIL on `SOCK2_DONE`.
+    #[cfg(all(feature = "smolnet", target_arch = "x86_64"))]
+    if name == "sock2-udp" {
+        SOCK2_KILLED.fetch_add(1, Ordering::AcqRel);
+        return;
+    }
     // U6x: the owner/grantee fixtures are well-behaved (register-only apart from the grantee's read-back store); a
     // kill is a real U6x bug — its own counter, never the U1b `killed_unexpected` count. The launcher's
     // unconditional cleanup still tears the fixtures' slots + Proc entries down.
@@ -2297,6 +2323,16 @@ extern "C" fn syscall_dispatch(nr: u64, a0: u64, a1: u64, a2: u64) -> i64 {
         SYS_UNLINK => sys_unlink(a0),
         SYS_CLOSE => sys_close(a0),
         SYS_FGRANT => sys_fgrant(a0, a1, a2),
+        // SOCK-2: the UDP socket family (x86-only, knob-on). Knob-off / aarch64 never emit these arms,
+        // so the dispatch match is byte-identical there and an unknown number falls to the default.
+        #[cfg(all(feature = "smolnet", target_arch = "x86_64"))]
+        SYS_SOCKET => sys_socket(a0, a1, a2),
+        #[cfg(all(feature = "smolnet", target_arch = "x86_64"))]
+        SYS_BIND => sys_bind(a0, a1),
+        #[cfg(all(feature = "smolnet", target_arch = "x86_64"))]
+        SYS_SENDTO => sys_sendto(a0, a1, a2),
+        #[cfg(all(feature = "smolnet", target_arch = "x86_64"))]
+        SYS_RECVFROM => sys_recvfrom(a0, a1, a2),
         SYS_EXIT => {
             // U7x: the transfer fixtures exit BY NAME, BEFORE the Proc short-circuit below — the CHILD
             // has a launcher-PLANTED Proc entry (the pid->slot map sys_xfer resolves its dest through),
@@ -2463,6 +2499,15 @@ extern "C" fn syscall_dispatch(nr: u64, a0: u64, a1: u64, a2: u64) -> i64 {
                     U11M2_WITNESS.store(a0 as u32, Ordering::Release);
                     U11M2_DONE.fetch_add(1, Ordering::AcqRel);
                 }
+                #[cfg(all(feature = "smolnet", target_arch = "x86_64"))]
+                Some("sock2-udp") => {
+                    // SOCK-2: the UDP round-trip fixture conveys its 5-bit witness bitmask as its exit STATUS
+                    // (routed by name, the same u5x/u9x/u11x idiom — x86 has no SYS_REPORT). No planted Proc
+                    // entry (a single register + inline-data fixture), so it takes the ordinary by-name path.
+                    // `SOCK2_DONE` gates the launcher's read. Knob-off / aarch64 never emit this arm.
+                    SOCK2_WITNESS.store(a0 as u32, Ordering::Release);
+                    SOCK2_DONE.fetch_add(1, Ordering::AcqRel);
+                }
                 Some(n) if n.starts_with("u3-") => {
                     // U3 per-process-CR3 fixture task exiting (its own accounting, so the U1a/U1b
                     // default counts stay byte-for-byte). The readback verdict reads slot memory.
@@ -2480,6 +2525,154 @@ extern "C" fn syscall_dispatch(nr: u64, a0: u64, a1: u64, a2: u64) -> i64 {
         }
         _ => -38, // -ENOSYS
     }
+}
+
+// =============================================================================
+// SOCK-2: the UDP socket syscall family (x86-only, knob-on). Each is a thin, IF-masked-safe wrapper
+// over the persistent smolnet stack (`crate::smolnet`) with the same object-table capability gate the
+// File syscalls use: a socket handle is `KIND_SOCKET` carrying `CAP_READ|CAP_WRITE`; send needs
+// `CAP_WRITE`, recv needs `CAP_READ`, so `SYS_CAP` GRANT can mint a send-only or recv-only socket cap.
+// User buffers are bound-checked against the ring-3 window EXACTLY like `sys_write`/`sys_open` (no
+// copy_from_user yet — the same cheap window check). The socket-id lives in the handle value word,
+// `+1`-biased so it is never the 0(Empty)/u64::MAX(RESERVING) sentinel.
+// =============================================================================
+
+/// SYS_SOCKET(domain, type, proto) -> a socket HANDLE index, or a negative errno. UDP/IPv4 only this
+/// arc: `domain` (AF_INET=2), `type` (SOCK_DGRAM=2), `proto` (0 or IPPROTO_UDP=17) are validated but
+/// the only supported tuple is a UDP datagram socket. Allocates a socket in the persistent `SocketSet`
+/// (owned by the caller's row for teardown), then mints a `KIND_SOCKET` handle carrying
+/// `CAP_READ|CAP_WRITE`. `SHARED_ROW` (the kernel window) is refused — sockets are process-scoped,
+/// freed at the owning slot's teardown (which `SHARED_ROW` never gets).
+#[cfg(all(feature = "smolnet", target_arch = "x86_64"))]
+fn sys_socket(domain: u64, ty: u64, proto: u64) -> i64 {
+    // AF_INET, SOCK_DGRAM, (0 | IPPROTO_UDP). Anything else is unsupported this arc.
+    if domain != 2 || ty != 2 || (proto != 0 && proto != 17) {
+        return EINVAL;
+    }
+    let row = caller_row();
+    if row == SHARED_ROW {
+        return EACCES; // no process-scoped socket in the shared kernel window (no teardown to free it)
+    }
+    let Some(sid) = crate::smolnet::stack_open(row) else {
+        return EMFILE; // the persistent socket set is full (too many concurrent sockets) / no NIC
+    };
+    let Some(h) = handle_install(row, HANDLE_RESERVING) else {
+        crate::smolnet::stack_close(sid); // no handle slot — release the socket we just claimed (no leak)
+        return EAGAIN;
+    };
+    // Publish kind + rights, then the live value LAST (Release) — a resolver that sees the live value
+    // also sees Socket + its rights. Value = socket-id + 1 (never the 0/RESERVING sentinels).
+    handle_set_kind(row, h, KIND_SOCKET);
+    handle_set_rights(row, h, CAP_READ | CAP_WRITE);
+    handle_set(row, h, (sid as u64) + 1);
+    h as i64
+}
+
+/// Decode a socket HANDLE carrying ALL of `req` into its persistent socket-id, or an errno. The single
+/// enforcement point: a non-Socket kind / a missing right / no handle all fail closed as `-EACCES`
+/// (the `sys_read`/`sys_write` idiom via `handle_resolve`).
+#[cfg(all(feature = "smolnet", target_arch = "x86_64"))]
+fn socket_id_of(row: usize, handle: u64, req: u32) -> Result<usize, i64> {
+    match handle_resolve(row, handle, req) {
+        Ok(HandleTarget::Socket(raw)) => Ok((raw - 1) as usize), // undo the +1 bias
+        _ => Err(EACCES),
+    }
+}
+
+/// SYS_BIND(handle, port) -> 0, or a negative errno. Binds the socket the handle names to a local UDP
+/// `port`. Requires a Socket handle carrying `CAP_WRITE` (binding is a configuring authority). A port
+/// of 0 or an already-bound/open socket is `-EINVAL` (smoltcp refuses it). No I/O — descriptor state
+/// only, IF-masked-handler-safe.
+#[cfg(all(feature = "smolnet", target_arch = "x86_64"))]
+fn sys_bind(handle: u64, port: u64) -> i64 {
+    let row = caller_row();
+    let sid = match socket_id_of(row, handle, CAP_WRITE) {
+        Ok(s) => s,
+        Err(e) => return e,
+    };
+    if port == 0 || port > u16::MAX as u64 {
+        return EINVAL;
+    }
+    match crate::smolnet::stack_bind(sid, port as u16) {
+        Ok(()) => 0,
+        Err(()) => EINVAL,
+    }
+}
+
+/// SYS_SENDTO(handle, msg_ptr, msg_len) -> bytes sent, or a negative errno. `msg` is an 8-byte header
+/// `[dst_ip[4]][dst_port u16 LE][pad u16]` followed by the payload. Requires a Socket handle carrying
+/// `CAP_WRITE`. The WHOLE `msg` range is bound-checked inside the ring-3 window (the `sys_write`
+/// pointer discipline) before any read; the payload is clamped to `UDP_MAX_PAYLOAD`. `-EAGAIN` if the
+/// socket can't accept the datagram (unbound / TX buffer full). Non-blocking: smolnet pumps a bounded
+/// egress loop, never blocks.
+#[cfg(all(feature = "smolnet", target_arch = "x86_64"))]
+fn sys_sendto(handle: u64, msg_ptr: u64, msg_len: u64) -> i64 {
+    let row = caller_row();
+    let sid = match socket_id_of(row, handle, CAP_WRITE) {
+        Ok(s) => s,
+        Err(e) => return e,
+    };
+    if msg_len < 8 {
+        return EINVAL; // no room even for the address header
+    }
+    let window = USER_WINDOW_PAGES * PAGE_SIZE;
+    let end = msg_ptr.wrapping_add(msg_len);
+    if end < msg_ptr || msg_ptr < USER_BASE || end > USER_BASE + window {
+        return EFAULT;
+    }
+    let plen = (msg_len - 8) as usize;
+    if plen > crate::smolnet::UDP_MAX_PAYLOAD {
+        return EINVAL;
+    }
+    // Ring-3 VA == kernel VA in the live CR3 (identity alias); the range is proven in-window above.
+    let hdr = unsafe { core::slice::from_raw_parts(msg_ptr as *const u8, 8) };
+    let ip = [hdr[0], hdr[1], hdr[2], hdr[3]];
+    let port = u16::from_le_bytes([hdr[4], hdr[5]]);
+    let payload = unsafe { core::slice::from_raw_parts((msg_ptr + 8) as *const u8, plen) };
+    match crate::smolnet::stack_sendto(sid, ip, port, payload) {
+        Ok(n) => n as i64,
+        Err(()) => EAGAIN,
+    }
+}
+
+/// SYS_RECVFROM(handle, buf_ptr, buf_len) -> total bytes written (header + payload), or a negative
+/// errno. Writes the same 8-byte `[src_ip[4]][src_port u16 LE][pad u16]` header + payload into the
+/// caller's buffer and returns the total. Requires a Socket handle carrying `CAP_READ`. `buf_len` must
+/// be >= 8 (room for the header); the payload is truncated to fit. `-EAGAIN` when no datagram is
+/// available (NON-BLOCKING — the IF-masked handler drives a bounded poll pump and returns rather than
+/// waiting). The WHOLE dest range is bound-checked writable in the ring-3 window before any store.
+#[cfg(all(feature = "smolnet", target_arch = "x86_64"))]
+fn sys_recvfrom(handle: u64, buf_ptr: u64, buf_len: u64) -> i64 {
+    let row = caller_row();
+    let sid = match socket_id_of(row, handle, CAP_READ) {
+        Ok(s) => s,
+        Err(e) => return e,
+    };
+    if buf_len < 8 {
+        return EINVAL;
+    }
+    let window = USER_WINDOW_PAGES * PAGE_SIZE;
+    let end = buf_ptr.wrapping_add(buf_len);
+    if end < buf_ptr || buf_ptr < USER_BASE || end > USER_BASE + window {
+        return EFAULT;
+    }
+    let cap = ((buf_len - 8) as usize).min(crate::smolnet::UDP_MAX_PAYLOAD);
+    let mut kbuf = [0u8; crate::smolnet::UDP_MAX_PAYLOAD];
+    let Some((ip, port, n)) = crate::smolnet::stack_recvfrom(sid, &mut kbuf[..cap]) else {
+        return EAGAIN;
+    };
+    // Write the source-address header + payload into the (proven in-window) user buffer.
+    let dst = buf_ptr as *mut u8;
+    let pbytes = port.to_le_bytes();
+    unsafe {
+        core::ptr::copy_nonoverlapping(ip.as_ptr(), dst, 4);
+        *dst.add(4) = pbytes[0];
+        *dst.add(5) = pbytes[1];
+        *dst.add(6) = 0;
+        *dst.add(7) = 0;
+        core::ptr::copy_nonoverlapping(kbuf.as_ptr(), dst.add(8), n);
+    }
+    (8 + n) as i64
 }
 
 /// SYS_WRITE(fd, buf, len): write `len` bytes from the ring-3 buffer, returning the count written or a
@@ -7047,6 +7240,11 @@ pub fn clear_handle_row(slot: usize) {
     // descriptor this wipe has already freed) — covers both the exit and the fault-kill path, exactly like
     // the handles (the aarch64 `clear_handle_row` -> `clear_files_row` twin).
     clear_files_row(slot);
+    // SOCK-2: free every persistent UDP socket this dying slot OWNED (the handle wipe above dropped its
+    // Socket handles; this reclaims the smoltcp socket + its static buffers), so a reused slot inherits no
+    // live socket. Knob-off / aarch64 have no persistent stack — the call vanishes.
+    #[cfg(all(feature = "smolnet", target_arch = "x86_64"))]
+    crate::smolnet::free_row_sockets(slot);
 }
 
 /// Claim the first Empty slot in `HANDLES[slot]`, storing `value` (CAS 0->value), and return its index —
@@ -8683,6 +8881,211 @@ fn u8_kernel_check() -> bool {
     ok
 }
 
+// =============================================================================
+// SOCK-2: the ring-3 UDP round-trip fixture + its launcher (x86-only, knob-on). The fixture is an
+// INLINE, position-independent blob (the u9x/u11x idiom — NOT an on-disk bin) that makes the four new
+// socket syscalls from ring 3 and proves an end-to-end datagram round-trip: it opens a UDP socket,
+// binds a local port, sends a DNS query to slirp's resolver (10.0.2.3:53), and recvfroms the reply,
+// conveying a 5-bit witness bitmask as its exit status. The launcher gates on a NIC (network-, not
+// storage-gated), spawns the fixture, awaits its witness + socket teardown, and prints the verdict.
+// =============================================================================
+
+// SOCK-2 ring-3 fixture. Register + inline-data only (its one user store is the recvfrom dest in its own
+// data page). Runs correctly at any VA (RIP-relative). Witness bits (accumulated in r12, exit status):
+//   bit0 socket ok · bit1 bind ok · bit2 sendto ok · bit3 recvfrom returned a datagram · bit4 it came
+//   FROM 10.0.2.3:53. ALL = 0x1F. It LOOPS sendto+recvfrom (up to 16 rounds) so a reply stolen by the
+//   BSP's hand-rolled `service_net` poll (the fixture runs on an AP) is retried — each recvfrom's own
+//   IF-masked bounded pump is where a fresh reply is captured. The callee-saved r12-r15 survive syscalls
+//   (the C dispatcher preserves them; the sysret tail scrubs only rdi/rsi/rdx/r8-r10).
+#[cfg(all(feature = "smolnet", target_arch = "x86_64"))]
+core::arch::global_asm!(
+    r#"
+    .globl unaos_user_sock2_blob_start
+unaos_user_sock2_blob_start:
+    .balign 16
+    .globl unaos_user_sock2
+unaos_user_sock2:
+    xor r12, r12                              // witness = 0
+    mov rax, 19                               // SYS_SOCKET(AF_INET=2, SOCK_DGRAM=2, proto=0)
+    mov rdi, 2
+    mov rsi, 2
+    mov rdx, 0
+    syscall
+    test rax, rax
+    js 8f                                     // socket failed (<0) -> exit witness=0
+    mov r13, rax                              // r13 = socket handle
+    or r12, 1                                 // bit0: socket ok
+    mov rax, 20                               // SYS_BIND(handle, local port 49222)
+    mov rdi, r13
+    mov rsi, 49222
+    syscall
+    test rax, rax
+    jnz 8f                                    // bind != 0 -> exit with current witness
+    or r12, 2                                 // bit1: bind ok
+    lea r14, [rip + unaos_user_sock2_blob_start]
+    add r14, 0x1000                           // r14 -> this blob's data page (recv buffer)
+    mov r15, 16                               // outer sendto+recvfrom retry budget
+2:  mov rax, 21                               // SYS_SENDTO(handle, msg_ptr, 32)
+    mov rdi, r13
+    lea rsi, [rip + unaos_user_sock2_msg]
+    mov rdx, 32
+    syscall
+    test rax, rax
+    js 3f                                     // sendto -EAGAIN -> retry this round
+    or r12, 4                                 // bit2: sendto succeeded
+    mov rax, 22                               // SYS_RECVFROM(handle, buf, 64)
+    mov rdi, r13
+    mov rsi, r14
+    mov rdx, 64
+    syscall
+    cmp rax, 8
+    jge 4f                                    // >= header -> got a datagram
+3:  dec r15
+    jnz 2b
+    jmp 8f                                    // budget exhausted -> exit (no bit3/4)
+4:  or r12, 8                                 // bit3: recvfrom returned a datagram
+    cmp byte ptr [r14 + 0], 10                // verify src ip 10.0.2.3 ...
+    jne 8f
+    cmp byte ptr [r14 + 1], 0
+    jne 8f
+    cmp byte ptr [r14 + 2], 2
+    jne 8f
+    cmp byte ptr [r14 + 3], 3
+    jne 8f
+    cmp byte ptr [r14 + 4], 53                // ... and src port 53 (LE low byte)
+    jne 8f
+    cmp byte ptr [r14 + 5], 0                 // (LE high byte)
+    jne 8f
+    or r12, 16                                // bit4: source is 10.0.2.3:53
+8:  mov rax, 2                                // SYS_EXIT(witness)
+    mov rdi, r12
+    syscall
+1:  jmp 1b                                    // sys_exit never returns; guard
+
+    // SYS_SENDTO message: 8-byte addr header [dst ip 10.0.2.3][dst port 53 LE][pad u16], then the
+    // 24-byte DNS A-query for "una.os" (txn id 0x5343). Inline in the RX code page (a legal SENDTO
+    // source — the whole range is inside the ring-3 window). Total = 32 bytes (matches `mov rdx, 32`).
+    .balign 8
+    .globl unaos_user_sock2_msg
+unaos_user_sock2_msg:
+    .byte 10, 0, 2, 3
+    .byte 53, 0
+    .byte 0, 0
+    .byte 0x53, 0x43, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00
+    .byte 0x03, 0x75, 0x6e, 0x61, 0x02, 0x6f, 0x73, 0x00
+    .byte 0x00, 0x01, 0x00, 0x01
+
+    .globl unaos_user_sock2_blob_end
+unaos_user_sock2_blob_end:
+"#
+);
+
+#[cfg(all(feature = "smolnet", target_arch = "x86_64"))]
+unsafe extern "C" {
+    static unaos_user_sock2_blob_start: u8;
+    static unaos_user_sock2_blob_end: u8;
+    static unaos_user_sock2: u8;
+}
+
+/// The ring-3 fixture's witness bitmask (its exit status), routed by name in `SYS_EXIT`. `SOCK2_DONE`
+/// gates the launcher's read; `SOCK2_KILLED` counts a (bug) fault-kill of the well-behaved fixture.
+#[cfg(all(feature = "smolnet", target_arch = "x86_64"))]
+static SOCK2_WITNESS: AtomicU32 = AtomicU32::new(0);
+#[cfg(all(feature = "smolnet", target_arch = "x86_64"))]
+static SOCK2_DONE: AtomicU32 = AtomicU32::new(0);
+#[cfg(all(feature = "smolnet", target_arch = "x86_64"))]
+static SOCK2_KILLED: AtomicU32 = AtomicU32::new(0);
+/// All five witness bits set = the full ring-3 UDP round-trip landed.
+#[cfg(all(feature = "smolnet", target_arch = "x86_64"))]
+const SOCK2_WITNESS_ALL: u32 = 0x1F;
+
+/// Build the SOCK-2 fixture slot (the `u10x_build` shape): allocate a private slot, scrub the whole
+/// window, copy the blob into its RX-RO code page through the identity alias, return the run params.
+/// `None` on slot-alloc failure. No pre-endowment (the fixture mints its own socket handle at runtime).
+#[cfg(all(feature = "smolnet", target_arch = "x86_64"))]
+fn sock2_build() -> Option<U7xFix> {
+    let slot = crate::arch::memory::alloc_user_space()?;
+    let bstart = &raw const unaos_user_sock2_blob_start as usize;
+    let bend = &raw const unaos_user_sock2_blob_end as usize;
+    let blen = bend - bstart;
+    assert!(blen as u64 <= PAGE_SIZE, "SOCK-2 blob does not fit in a code page");
+    let off = (&raw const unaos_user_sock2 as usize - bstart) as u64;
+    let backing = crate::arch::memory::slot_backing_ptr(slot);
+    unsafe {
+        core::ptr::write_bytes(backing, 0, (USER_WINDOW_PAGES * PAGE_SIZE) as usize);
+        core::ptr::copy_nonoverlapping(bstart as *const u8, backing, blen);
+    }
+    Some(U7xFix {
+        entry: USER_BASE + off,
+        sp: USER_BASE + USER_WINDOW_PAGES * PAGE_SIZE - 16,
+        cr3: crate::arch::memory::slot_cr3(slot),
+        slot,
+    })
+}
+
+/// SOCK-2 launcher + verdict — chained LAST off `u8x_launcher` (after the whole storage chain u9x drives),
+/// so its line lands after every other demo in BOTH storage and no-storage modes. Flow: one-shot; skip
+/// silently with no NIC (NETWORK-gated, not storage-gated); pre-build the persistent smolnet stack on THIS
+/// task's stack (so the fixture's first `sys_socket` never triggers the ~4 KiB build on its own 16 KiB
+/// syscall stack); build + spawn the `sock2-udp` fixture; wait (bounded) for its witness exit + socket
+/// teardown (handle row clear ⇒ the persistent socket + its static buffers reclaimed). PASS iff witness ==
+/// `SOCK2_WITNESS_ALL` (the full round-trip) AND torn down AND no kill.
+#[cfg(all(feature = "smolnet", target_arch = "x86_64"))]
+fn sock2_launcher(demo_cpu: usize) {
+    static DONE: AtomicBool = AtomicBool::new(false);
+    if DONE.swap(true, Ordering::Relaxed) {
+        return;
+    }
+    // NETWORK-gated: no NIC -> no smolnet stack -> skip cleanly (the no-NIC control path stays line-free).
+    if crate::drivers::e1000::hw_addr().is_none() {
+        return;
+    }
+    // Pre-build the persistent stack here (large-stack launcher task), so the ring-3 fixture's first
+    // sys_socket finds it ready and never pays the construction transient on its own syscall stack.
+    if !crate::smolnet::init() {
+        return;
+    }
+    let Some(fix) = sock2_build() else {
+        serial_println!(":: SOCK-2: no free address-space slot — udp round-trip demo skipped ::");
+        return;
+    };
+    serial_println!(
+        ":: SOCK-2: ring-3 udp sockets — sys_socket(19)/bind(20)/sendto(21)/recvfrom(22), a datagram round-trip over the persistent smoltcp stack ::"
+    );
+    crate::arch::sched::spawn_user_in_space("sock2-udp", fix.entry, fix.sp, demo_cpu, fix.cr3);
+
+    // Wait (bounded, yielding) for the fixture's witness exit, then snapshot the witness + kill count.
+    let vdeadline = crate::arch::ticks() + 10_000;
+    while SOCK2_DONE.load(Ordering::Acquire) < 1 && crate::arch::ticks() < vdeadline {
+        crate::arch::sched::yield_now();
+    }
+    let witness = SOCK2_WITNESS.load(Ordering::Acquire);
+    let killed = SOCK2_KILLED.load(Ordering::Acquire);
+
+    // Teardown proof: the fixture exited holding one Socket handle, so its exit cleared the handle row —
+    // and `clear_handle_row` freed the persistent socket + its static buffers. Poll bounded; false->true.
+    let tdeadline = crate::arch::ticks() + 2000;
+    while !handle_row_is_clear(fix.slot) && crate::arch::ticks() < tdeadline {
+        crate::arch::sched::yield_now();
+    }
+    let cleared = handle_row_is_clear(fix.slot);
+
+    if witness == SOCK2_WITNESS_ALL && cleared && killed == 0 {
+        serial_println!(
+            ":: SOCK-2: ring-3 udp round-trip — socket/bind/sendto OK, recvfrom returned a datagram FROM 10.0.2.3:53, socket teardown clean -> PASS ::"
+        );
+    } else {
+        serial_println!(
+            ":: SOCK-2: ring-3 udp round-trip FAIL — witness={:#x} cleared={} killed={} done={} (want {:#x}/true/0/1) ::",
+            witness,
+            cleared,
+            killed,
+            SOCK2_DONE.load(Ordering::Acquire),
+            SOCK2_WITNESS_ALL
+        );
+    }
+}
+
 /// U8x launcher + verdict — called by `u7x_launcher` after the whole U7x flow (program-order gating; see
 /// `u7x_launcher`). Flow: one-shot guard; skip silently with no block device (the control-path discipline —
 /// U8x needs no disk); build + pre-endow + spawn the single fixture (`u8x-tree`: index 2 = a console cap
@@ -8752,6 +9155,13 @@ fn u8x_launcher(demo_cpu: usize) {
     // teardown), so a slot is free for U9x. U9x gates on the block device itself, so the no-storage control
     // path stays free of U9x lines too.
     u9x_launcher(demo_cpu);
+
+    // SOCK-2 (knob-on, x86-only): chain the ring-3 UDP round-trip demo LAST — after the whole storage
+    // chain u9x drives (so its line lands after every other demo, in both storage and no-storage modes,
+    // since U8x is storage-independent). It gates on a NIC internally, so no-NIC configs skip cleanly.
+    // Knob-off / aarch64 never emit this line, so U8x is byte-identical there.
+    #[cfg(all(feature = "smolnet", target_arch = "x86_64"))]
+    sock2_launcher(demo_cpu);
 }
 
 /// Build the U9x fixture slot — the `u8x_build` shape for the U9x blob (allocate, scrub the WHOLE window, copy

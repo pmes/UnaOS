@@ -98,4 +98,5 @@ uart_16550 = "0.6.0"
 #   medium-ethernet — the e1000e is an Ethernet L2 device (built-in ARP neighbor discovery)
 #   proto-ipv4      — IPv4 addressing/routing/checksums for the 10.0.2.0/24 slirp net
 #   socket-icmp     — the ICMP echo socket that `ping`/the boot witness drive
-smoltcp = { version = "=0.13.1", default-features = false, features = ["medium-ethernet", "proto-ipv4", "socket-icmp"], optional = true }
+#   socket-udp      — SOCK-2: the UDP sockets behind the sys_socket/bind/sendto/recvfrom family
+smoltcp = { version = "=0.13.1", default-features = false, features = ["medium-ethernet", "proto-ipv4", "socket-icmp", "socket-udp"], optional = true }
