@@ -215,4 +215,11 @@ fn kat_direntry() {
         enc(&list),
         h("02000000000000000d000000000000006d616e69666573746f2e7478740e000000000000000000000003000000000000007375620f0000000000000001000000"),
     );
+
+    // Empty directory: an empty Vec<DirEntry> is a bare u64 length prefix of 0.
+    // This is the on-disk representation of a freshly created (empty) directory.
+    let empty: Vec<DirEntry> = Vec::new();
+    assert_eq!(enc(&empty), h("0000000000000000"));
+    let decoded: Vec<DirEntry> = dec(&h("0000000000000000"));
+    assert_eq!(decoded, empty);
 }
