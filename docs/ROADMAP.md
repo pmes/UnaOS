@@ -144,6 +144,50 @@ Policy decided: external decoder crates are in-bounds for lux (hand-rolling PNG/
 is not the lane's value). `SMessage::AudioChunk`/`Spectrum` already exist — audio
 arcs are expected to land with zero bandy changes.
 
+## 3b. The on-UnaOS program story: bandy-on-metal (direction, 2026-07-11)
+
+Decided in design discussion (Peter + seat, 2026-07-11). The question "what is a
+real program on UnaOS?" is **not** answered by porting POSIX conventions
+(exec/argv/stdout/exit). Host userspace already rejects that model: the unit of
+behavior is a **handler speaking `SMessage` on the bus**, and executables
+(vessels) are wiring and lifecycle, not domain logic. The on-UnaOS program story
+is therefore: **port the bus, not the binary convention.**
+
+Principles, in force for every arc that touches this seam:
+
+1. **Smart commands, not apps.** Shell commands (`cp`, `cat`, `ls`, …) are
+   *verbs*: midden parses text into typed messages; whoever owns the capability
+   fulfills them — the kernel's FAT machinery on metal, amber_bytes/geode on the
+   host. No process spawn, no PATH, no byte-stream reparsing between pipeline
+   stages. The in-kernel shell's command table is the proto-form; it factors
+   into "midden's verb set, fulfilled by the capability owner."
+2. **Every message carries the caller's principal.** The K1/K2 named-principal
+   ACL (pi4 track) is the security model for smart commands: a verb fulfilled
+   in-kernel runs with the *invoker's* grants, never ambient authority. This is
+   designed in from message one — principal-stamping is not retrofittable.
+3. **The verb/fulfiller seam stays honest.** A command is addressable the same
+   way whether fulfilled in-kernel, by a handler, or by a spawned vessel —
+   "is it an app?" is a deployment detail, not an interface difference.
+   Third-party commands later register as fulfillers.
+4. **Interfaces are verb *generators*, and they are interchangeable.** midden
+   (text), vug and the future spatial desktop (graphical/3D), and an AI (vein,
+   or a small local model managing elessar spaces) all *generate* the same
+   verbs. The AI is one more fulfiller/generator on the bus — never a required
+   layer. AI-off configurations (tinkerer builds, hardened builds) are
+   first-class: unregister vein and everything still works, with every action
+   principal-attributed and ACL-checked.
+5. **Elessar is the declarative source of truth.** A workspace (with principia
+   settings) *exports* to platform apps — `apps/una` on macOS today; on-UnaOS
+   midden+vug is just another export target once the bus runs there. "Shed the
+   weight of apps": the desktop becomes a scene of live capabilities viewed
+   over the bus, not a window manager for monoliths.
+
+First concrete arc (when sequenced): define the on-UnaOS `SMessage` transport
+seam — syscall-backed send/receive, principal-stamped, same wire shape bandy
+uses — and round-trip midden's first verbs (`ls`, `cat`, `cp`) through kernel
+fulfillment in QEMU. K2's named programs supply the principal stamping. Midden
+becomes program #3 — the first real (non-fixture) on-UnaOS program.
+
 ## 4. ENDURO — the rover (deferred until the desktop chain matures)
 
 Architecture settled 2026-07-02. The OS is the **vehicle computer between the
