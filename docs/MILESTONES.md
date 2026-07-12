@@ -44,6 +44,37 @@ Legend: **✅ metal-confirmed** · **🔬 QEMU-green, metal pending** · dates I
 - **Detail:** [`arch_arm64.md` §JD7](dev/OS/01_BOOT_HAL/arch_arm64.md) + [`SECURITY.md`](SECURITY.md)
   FATDIRS ledger note. **Commit:** on `hw-jetson` (the seat assigns the integration hash at merge).
 
+## hw-pi4 track — 2026-07-12 (K4-ready — the native-attribute projection codec, ahead of the mount)
+
+### K4-ready — `PrincipalRecord`→native `owner`/`grants:*` string codec + `UNAATR1`/`UNAFS` discriminator 🔬 `hw-pi4`
+- **Why:** the security K-line's K4 ("migrate-then-delete onto native unafs attributes") is gated on a
+  native unafs FILESYSTEM in the kernel — the ROADMAP §2 BeFS convergence (no_std port → block adapter →
+  read-only mount → journaled writes + a minimal VFS), NONE of which is in-tree (`fs/mod.rs` mounts only
+  FAT; `libs/unafs` is a std Ring-3 crate). So K4 proper is a multi-arc storage epic. This arc lands the
+  ONE piece that needs no mount: the deterministic 1:1 CODEC the migration will use, PINNED + KAT'd now, so
+  the exact projection is proven ahead of the mount (seat pick, Peter 2026-07-12).
+- **What (`34cdb94`):** in-lane in `arch/aarch64/syscall.rs`, ZERO x86 — `principal_native_string`
+  (`PROGRAM_NAME`→ stored `prog:<name>` verbatim; `IMAGE_SHA256`→ `sha256:` + 60 hex of the 30-byte digest
+  PREFIX; `NONE`/reserved→ `None`, fail-closed), `grant_native_key` (`grants:<grantee>`),
+  `rights_native_value` (`rw`/`r`/`w`/`-`), a no-heap `hex_lower_into`, and `classify_volume_magic`
+  (`UNAATR1\0` sidecar vs `UNAFS` native superblock [mirrored from `libs/unafs/src/superblock.rs`] vs
+  Other) — the "tell the FAT bridge apart from a real unafs volume" primitive the FORMAT bullet names. Two
+  stale in-lane comments reconciled (`no on-disk owner format yet`; `image_sha256`'s "71 chars at K4").
+- **The 240-bit-prefix rule (load-bearing):** an `IMAGE_SHA256` principal stores only the 30-byte (240-bit)
+  digest PREFIX; enforcement compares those bytes and `image_of` mints them, so the native `owner` string
+  is the 67-char prefix form (`sha256:` + 60 hex), NOT the 71-char full digest (unreconstructable from
+  disk). A full-digest projection would make a migrated owner mismatch a fresh mint → un-re-acquirable; the
+  prefix form keeps migrated == fresh-mint byte-for-byte. Corrects the earlier IMG-SIG "71 chars" note.
+- **Tested (QEMU):** `check` both arches; `kernel8` compiles; `kernel8-test 90` = **29 PASS (23 + CAPSTONE
+  6) / 0 FAIL byte-equivalent** + all prior witnesses (K1-atr/persist/corrupt/K2-liveenf/K3-revoke/IMG-SIG/
+  FATDIRS + F2/F3 locked 240000/240000) intact + the new uncounted `:: K4-ready: … PASS [w=0xff] ::` (8
+  assertions incl. THE MIGRATION LANDMINE — a row round-tripped through the real `atr_serialize_row`/
+  `atr_parse_row` codec projects identically to fresh mints), zero real R1/CMD13; `test-arm` MISSION
+  SUCCESS. `k4_ready_selftest` is read-only, in-RAM, synthetic (no card, no disk).
+- **Still deferred (K4 proper):** the native mount + the migrate-then-delete pass, gated on the BeFS chain.
+- **Detail:** [`SECURITY.md` §K1 (K4-ready bullet)](SECURITY.md). **Commit:** `34cdb94` (`hw-pi4`); docs in
+  the follow-on.
+
 ## hw-pi4 track — 2026-07-12 (FATDIRS — the fat.rs directory-mutation seam: `create_dir` / `remove_dir`)
 
 ### FATDIRS — `create_dir` / `remove_dir`: additive, lock-correct FAT directory create + remove 🔬 `hw-pi4`
