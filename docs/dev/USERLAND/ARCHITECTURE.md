@@ -62,7 +62,7 @@ message bus, a selection of handlers, and a GUI window.
 | `pulse` | System monitor: numbered per-core CPU segment bars (BeOS Pulse heir). Host sampler behind the `PulseSource` seam; a UnaOS-kernel telemetry feed is the banked replacement source. |
 | `phonolite` | Tone vessel: the resonance engine given a face — start/stop, log-scale frequency + gain sliders (quartzite's first input-control surface, `tone_panel`), bus-routed level ladder. Domain logic lifts to `stria` when it becomes a real handler. |
 | `una` | Code-focused IDE. **Currently parked** (excluded from the workspace build). |
-| `facet` | Image / raster viewer. |
+| `facet` | Image / raster viewer: `facet <image>` decodes via `lux` (PNG/JPEG/ARW), packs linear→sRGB, and shows the picture aspect-fit in a quartzite window (CPU blit via `platforms::macos::image_view`). Pan/zoom, pixel readout, and the euclase GPU path are later arcs. |
 | `apps/cli/*` | Command-line tools: `unafs`, `vertex`, `sentinel`, `unafs_bench`. |
 
 UnaOS deliberately avoids fixed-feature "apps": a vessel composes handlers
@@ -181,6 +181,7 @@ topology and republishes `MatrixEvent::TopologyMutated` when the tree changes.
 | Lumen vessel | Implemented |
 | Pulse vessel (system monitor) | Implemented (macOS backend) |
 | Phonolite vessel (tone generator) | Implemented (macOS backend; resonance engine honest — device-rate graph, live command path, level readback) |
+| Facet vessel (image viewer) | Implemented (macOS backend; FACET-1 MVP — lux decode → sRGB pack → CPU-blit aspect-fit view. Euclase GPU path / pan-zoom / pixel readout later) |
 | Una vessel (IDE) | Parked |
 | Elessar snapshot / packaging pipeline | Not implemented (detection only) |
 
