@@ -8715,7 +8715,10 @@ impl PrincipalRecord {
 /// The native unafs superblock magic — MIRRORED from `libs/unafs/src/superblock.rs` (`pub const MAGIC:
 /// [u8;5] = *b"UNAFS"`), deliberately distinct from the FAT-bridge sidecar's `ATR_MAGIC` (`UNAATR1\0`) so a
 /// kernel can tell a real native volume from the shim and drive migrate-then-delete at K4. Kept LOCAL (the
-/// crate is std/Ring-3, unported); if that native magic ever changes, change it here.
+/// crate is std/Ring-3, unported); if that native magic ever changes, change it here. The classifier below
+/// assumes this lands at byte 0 of the native superblock — true because `libs/unafs` serializes `Superblock`
+/// with bincode fixint (a fixed `[u8;5]` field emits no length prefix); a future serde/codec change there
+/// must be reflected here.
 const UNAFS_SB_MAGIC: [u8; 5] = *b"UNAFS";
 
 /// K4-ready: what a candidate leading byte-slice looks like — the FAT-bridge ACL sidecar (starts with
@@ -8793,8 +8796,10 @@ fn principal_native_string(rec: &PrincipalRecord, out: &mut [u8]) -> Option<usiz
 }
 
 /// K4-ready: the native-attribute KEY for a grant to `grantee` — `grants:<grantee canonical string>`
-/// (e.g. `grants:prog:MIDI`, `grants:sha256:<hex>`). `None` if the grantee has no native projection. The
-/// grant VALUE is the rights, projected by `rights_native_value`.
+/// (e.g. `grants:prog:MIDI`, `grants:sha256:<hex>` — the widest key, exactly `K4_STR_MAX` = 74 bytes).
+/// `None` if the grantee has no native projection OR `out` is too small; on `None` the contents of `out`
+/// are UNSPECIFIED (the `grants:` prefix may already have been written), so a caller must key off the
+/// returned length, never the buffer, when the result is `None`.
 fn grant_native_key(grantee: &PrincipalRecord, out: &mut [u8]) -> Option<usize> {
     const PFX: &[u8] = b"grants:";
     if PFX.len() > out.len() {
@@ -8807,18 +8812,21 @@ fn grant_native_key(grantee: &PrincipalRecord, out: &mut [u8]) -> Option<usize> 
 
 /// K4-ready: the native-attribute VALUE for a grant's rights — a canonical lowercase string over the
 /// `CAP_READ|CAP_WRITE` subset the file-grant model uses: `rw` / `r` / `w` / `-` (no rights). Returns the
-/// length written into `out` (needs >= 2). The `EXEC`/`GRANT` bits are not part of a file grant, so they are
-/// deliberately ignored here.
-fn rights_native_value(rights: u32, out: &mut [u8]) -> usize {
+/// length written, or `None` if `out` is too small — UNIFORM with `principal_native_string`/`grant_native_key`
+/// (it never emits a partial rights string, so a too-small buffer can't silently drop the write bit). The
+/// `EXEC`/`GRANT` bits are not part of a file grant, so they are deliberately ignored here.
+fn rights_native_value(rights: u32, out: &mut [u8]) -> Option<usize> {
     let s: &[u8] = match (rights & CAP_READ != 0, rights & CAP_WRITE != 0) {
         (true, true) => b"rw",
         (true, false) => b"r",
         (false, true) => b"w",
         (false, false) => b"-",
     };
-    let n = core::cmp::min(s.len(), out.len());
-    out[..n].copy_from_slice(&s[..n]);
-    n
+    if s.len() > out.len() {
+        return None;
+    }
+    out[..s.len()].copy_from_slice(s);
+    Some(s.len())
 }
 
 // M2.1: the launcher's principal STAMP table — the persistent PrincipalRecord assigned to each address-space
@@ -10477,19 +10485,28 @@ fn k4_ready_selftest() {
         w |= 1 << 3;
     }
 
-    // bit4: a grant projects to key `grants:<grantee>`; a NONE grantee is un-projectable (fail-closed).
-    let ok_key = grant_native_key(&midi, &mut buf) == Some(16) && &buf[..16] == b"grants:prog:MIDI";
-    if ok_key && grant_native_key(&PrincipalRecord::NONE, &mut buf).is_none() {
+    // bit4: grant key `grants:<grantee>` — a short PROGRAM_NAME grantee (16 bytes), the WIDEST input (an
+    // IMAGE grantee: `grants:sha256:<60hex>` = exactly K4_STR_MAX = 74, the tight-fit boundary), a NONE
+    // grantee (un-projectable), and a 1-too-small buffer (73 < 74) all behave (Some/None) as the pinned
+    // contract says — the exact-fit case an off-by-one in K4_STR_MAX or the composed guards would break.
+    let prog_key = grant_native_key(&midi, &mut buf) == Some(16) && &buf[..16] == b"grants:prog:MIDI";
+    let mut wide = [0u8; K4_STR_MAX];
+    let wide_ok = grant_native_key(&img, &mut wide) == Some(74) && &wide[..14] == b"grants:sha256:";
+    let short_none = grant_native_key(&img, &mut [0u8; 73]).is_none()
+        && grant_native_key(&PrincipalRecord::NONE, &mut buf).is_none();
+    if prog_key && wide_ok && short_none {
         w |= 1 << 4;
     }
 
-    // bit5: rights project to the canonical `rw`/`r`/`w`/`-` value strings.
+    // bit5: rights project to the canonical `rw`/`r`/`w`/`-` value strings; a 1-byte buffer can't hold `rw`
+    // and yields None (the uniform contract — never a partial rights string that would drop the write bit).
     let mut rb = [0u8; 2];
-    let rw_ok = rights_native_value(CAP_READ | CAP_WRITE, &mut rb) == 2 && &rb == b"rw";
-    let r_ok = rights_native_value(CAP_READ, &mut rb) == 1 && rb[0] == b'r';
-    let w_ok = rights_native_value(CAP_WRITE, &mut rb) == 1 && rb[0] == b'w';
-    let none_ok = rights_native_value(0, &mut rb) == 1 && rb[0] == b'-';
-    if rw_ok && r_ok && w_ok && none_ok {
+    let rw_ok = rights_native_value(CAP_READ | CAP_WRITE, &mut rb) == Some(2) && &rb == b"rw";
+    let r_ok = rights_native_value(CAP_READ, &mut rb) == Some(1) && rb[0] == b'r';
+    let w_ok = rights_native_value(CAP_WRITE, &mut rb) == Some(1) && rb[0] == b'w';
+    let none_ok = rights_native_value(0, &mut rb) == Some(1) && rb[0] == b'-';
+    let short_none_r = rights_native_value(CAP_READ | CAP_WRITE, &mut [0u8; 1]).is_none();
+    if rw_ok && r_ok && w_ok && none_ok && short_none_r {
         w |= 1 << 5;
     }
 
@@ -10504,12 +10521,12 @@ fn k4_ready_selftest() {
         w |= 1 << 6;
     }
 
-    // bit7: THE MIGRATION LANDMINE — a row round-tripped through the REAL on-disk codec projects IDENTICALLY
-    // to the fresh-minted principals (migrated owner == fresh-mint owner). Build a row with an IMAGE_SHA256
-    // owner + a PROGRAM_NAME grant, serialize (atr_serialize_row) exactly as a persist would, parse it back
-    // (atr_parse_row) exactly as a mount would, then project the PARSED owner/grant and assert byte-equality
-    // with the projections of the ORIGINALS — proving the 240-bit prefix survives the codec, so a migrated
-    // IMAGE owner still matches a fresh mint of the same program.
+    // bit7: THE MIGRATION LANDMINE — an owner row round-tripped through the REAL on-disk codec
+    // (atr_serialize_row exactly as a persist, atr_parse_row exactly as a mount) projects IDENTICALLY to an
+    // INDEPENDENTLY re-minted principal (NOT the object that was serialized), and the IMAGE owner string is
+    // the 240-bit PREFIX form — length 67, never the 71-char full digest. So a MIGRATED IMAGE owner still
+    // matches a FRESH mint of the same program (re-acquirable across the migration); a regression that
+    // emitted the 71-char full digest instead would fail the `na == 67` check.
     let mut row = AtrRow {
         name: *b"K4READY BIN",
         first_cluster: 3,
@@ -10521,25 +10538,27 @@ fn k4_ready_selftest() {
     };
     row.grants[0] = AtrGrant { prin: midi, rights: CAP_READ | CAP_WRITE };
     if let Some(parsed) = atr_parse_row(&atr_serialize_row(&row)) {
+        let fresh_owner = PrincipalRecord::image_of(b"abc"); // INDEPENDENT re-mint, not the serialized `img`
+        let fresh_grantee = PrincipalRecord::program_name("MIDI");
         let (mut a, mut b) = ([0u8; K4_STR_MAX], [0u8; K4_STR_MAX]);
         let own_stable = match (
             principal_native_string(&parsed.owner, &mut a),
-            principal_native_string(&img, &mut b),
+            principal_native_string(&fresh_owner, &mut b),
         ) {
-            (Some(na), Some(nb)) => na == nb && a[..na] == b[..nb],
+            (Some(na), Some(nb)) => na == 67 && na == nb && a[..na] == b[..nb], // 67 = the 240-bit prefix form
             _ => false,
         };
         let (mut ga, mut gb) = ([0u8; K4_STR_MAX], [0u8; K4_STR_MAX]);
         let grant_stable = match (
             grant_native_key(&parsed.grants[0].prin, &mut ga),
-            grant_native_key(&midi, &mut gb),
+            grant_native_key(&fresh_grantee, &mut gb),
         ) {
             (Some(na), Some(nb)) => na == nb && ga[..na] == gb[..nb],
             _ => false,
         };
         let mut ra = [0u8; 2];
         let rights_stable =
-            rights_native_value(parsed.grants[0].rights, &mut ra) == 2 && &ra == b"rw";
+            rights_native_value(parsed.grants[0].rights, &mut ra) == Some(2) && &ra == b"rw";
         if own_stable && grant_stable && rights_stable {
             w |= 1 << 7;
         }
