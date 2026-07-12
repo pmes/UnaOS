@@ -112,9 +112,12 @@ fn main() {
         image.pixels.len()
     );
 
-    // 4. Pack linear → sRGB RGBA once, here in the vessel.
+    // 4. Pack linear → sRGB RGBA once, here in the vessel. Keep the source
+    //    linear RGB too — the image view surfaces it in the FACET-2 pixel
+    //    readout alongside the packed sRGB.
     let (w, h) = (image.width, image.height);
     let rgba = pack_srgba(&image);
+    let linear = image.pixels;
 
     // 5. The Window (macOS AppKit via quartzite; further backends follow
     //    quartzite maturity).
@@ -133,7 +136,9 @@ fn main() {
                 (h as f64).clamp(160.0, 1000.0),
             ),
             move |window| {
-                quartzite::platforms::macos::image_view::bootstrap_image_view(window, &rgba, w, h)
+                quartzite::platforms::macos::image_view::bootstrap_image_view(
+                    window, &rgba, &linear, w, h,
+                )
             },
         )
         .run();
