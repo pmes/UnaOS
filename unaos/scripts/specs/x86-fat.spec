@@ -61,5 +61,6 @@ OPTIONAL S4-race
 OPTIONAL S6-witness: NAMESPACE cross-core RMW
 OPTIONAL S7-openany: a non-staged on-disk file
 FORBID S4-mf2 FAIL
+FORBID S4-race FAIL
 FORBID S6-witness FAIL
 FORBID S7-openany FAIL
