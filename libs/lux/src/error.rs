@@ -30,6 +30,10 @@ pub enum LuxError {
     UnsupportedCFA,
     /// Data is corrupt
     CorruptData,
+    /// The bytes do not match any format lux can decode
+    UnknownFormat,
+    /// A decoder backend (png/jpeg) rejected the input
+    Decode(String),
 }
 
 impl std::fmt::Display for LuxError {
@@ -44,6 +48,8 @@ impl std::fmt::Display for LuxError {
             }
             LuxError::UnsupportedCFA => write!(f, "Unsupported CFA pattern"),
             LuxError::CorruptData => write!(f, "Data is corrupt"),
+            LuxError::UnknownFormat => write!(f, "Unrecognized image format"),
+            LuxError::Decode(msg) => write!(f, "Decode error: {}", msg),
         }
     }
 }

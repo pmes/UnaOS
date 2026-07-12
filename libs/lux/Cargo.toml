@@ -6,4 +6,7 @@ license = "LGPL-3.0-or-later"
 
 [dependencies]
 memmap2 = "0.9.10"
+png = "0.18.1"
 rayon = "1.11.0"
+zune-core = "0.5.1"
+zune-jpeg = "0.5.15"
