@@ -61,12 +61,12 @@ define_class!(
             self.render();
         }
 
-        // Flipped so origin math reads top-down; the rep is drawn into an
-        // explicit rect so orientation is handled there regardless.
-        #[unsafe(method(isFlipped))]
-        fn is_flipped(&self) -> objc2::runtime::Bool {
-            objc2::runtime::Bool::YES
-        }
+        // NOTE: deliberately NOT flipped. `NSImageRep drawInRect:` does not
+        // compensate for a flipped coordinate context, so an `isFlipped = YES`
+        // override mirrors the picture top-to-bottom (caught by the FACET-1
+        // attended eye-witness). The aspect-fit math in `render` is pure
+        // centering from the live bounds — orientation-independent — so the
+        // default (unflipped) coordinate system is both correct and simplest.
 
         // Any resize re-derives the aspect-fit rect from the live bounds.
         #[unsafe(method(setFrameSize:))]
