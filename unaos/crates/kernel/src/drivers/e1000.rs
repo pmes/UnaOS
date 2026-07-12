@@ -987,6 +987,72 @@ impl E1000 {
     }
 }
 
+// --- SOCK-1: additive raw L2 accessors for the smoltcp `Device` adapter (smolnet.rs) ---
+// x86-only + feature-gated: knob-off / aarch64 builds don't compile any of this, so the driver is
+// byte-identical. These expose the ring at the Ethernet-frame boundary WITHOUT the hand-rolled
+// `observe`/`net::ingress` processing — smoltcp owns the stack when it's driving. Poll-driven only
+// (called from the blocking `smolnet::ping`/`arp`/witness pumps), never from the MSI handler.
+#[cfg(all(feature = "smolnet", target_arch = "x86_64"))]
+impl E1000 {
+    /// Pop one completed RX descriptor's raw Ethernet frame into `out` and recycle the descriptor
+    /// back to hardware (clear DD, advance RDT) — the same head/tail protocol `poll()` uses, minus
+    /// the responder dispatch. Returns the copied length, or `None` if the ring is empty.
+    fn rx_frame_raw(&mut self, out: &mut [u8]) -> Option<usize> {
+        let desc = unsafe { read_volatile(self.rx_ring.add(self.rx_cur)) };
+        if desc.status & RX_STATUS_DD == 0 {
+            return None;
+        }
+        let len = (desc.length as usize).min(RX_BUF_SIZE).min(out.len());
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                self.rx_buffers.add(self.rx_cur * RX_BUF_SIZE),
+                out.as_mut_ptr(),
+                len,
+            );
+        }
+        self.rx_count += 1;
+        let mut d = desc;
+        d.status = 0;
+        unsafe { write_volatile(self.rx_ring.add(self.rx_cur), d) };
+        let old = self.rx_cur;
+        self.rx_cur = (self.rx_cur + 1) % NUM_RX;
+        self.reg_write(REG_RDT, old as u32);
+        Some(len)
+    }
+
+    /// Transmit one raw Ethernet frame (smoltcp already built the full L2 frame). Thin wrapper over
+    /// the existing `transmit` so smolnet shares the TX ring + `tx_count`.
+    fn tx_frame_raw(&mut self, frame: &[u8]) {
+        self.transmit(frame);
+    }
+
+    /// Our current IP (DHCP may have moved it off the static default).
+    fn our_ip_raw(&self) -> [u8; 4] {
+        self.arp_state.our_ip()
+    }
+}
+
+/// SOCK-1: pull one raw L2 frame for the smoltcp Device. Short-locks `NET_DEVICE` (the token-driven
+/// smolnet poll must not hold the lock across a transmit, so each ring op locks independently).
+#[cfg(all(feature = "smolnet", target_arch = "x86_64"))]
+pub fn raw_rx(out: &mut [u8]) -> Option<usize> {
+    NET_DEVICE.lock().as_mut().and_then(|n| n.rx_frame_raw(out))
+}
+
+/// SOCK-1: transmit one raw L2 frame from the smoltcp Device. Short-locks `NET_DEVICE`.
+#[cfg(all(feature = "smolnet", target_arch = "x86_64"))]
+pub fn raw_tx(frame: &[u8]) {
+    if let Some(n) = NET_DEVICE.lock().as_mut() {
+        n.tx_frame_raw(frame);
+    }
+}
+
+/// SOCK-1: `(MAC, current IP, link-up)` for the smolnet interface config / `netinfo`. `None` if no NIC.
+#[cfg(all(feature = "smolnet", target_arch = "x86_64"))]
+pub fn hw_addr() -> Option<([u8; 6], [u8; 4], bool)> {
+    NET_DEVICE.lock().as_ref().map(|n| (n.mac, n.our_ip_raw(), n.link_up()))
+}
+
 /// Read-only snapshot of the NIC state for the shell.
 #[derive(Clone, Copy)]
 pub struct NetInfo {
@@ -1121,6 +1187,11 @@ pub fn service_net() {
         nic.selftest_tick();
         nic.tcp_tick();
     }
+    // SOCK-1 (knob-on): the smoltcp boot connectivity witness. Runs AFTER the NET_DEVICE guard
+    // above is dropped — its blocking ICMP pump short-locks NET_DEVICE per ring op, so holding the
+    // lock here would deadlock (spin::Mutex is not reentrant). One-shot; no-op knob-off / no NIC.
+    #[cfg(all(feature = "smolnet", target_arch = "x86_64"))]
+    crate::smolnet::witness_tick();
 }
 
 /// Outcome of a blocking [`ping`] (rendered by the `ping` shell command).

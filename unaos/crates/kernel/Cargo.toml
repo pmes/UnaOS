@@ -61,6 +61,14 @@ videobench = []
 # panic backdrop) still cover the whole real panel via an uncapped twin handle. Enable via
 # `UNAOS_VIDEOCAP=1`. Default OFF => byte-identical.
 videocap = ["videobench"]
+# SOCK-1: route the shell's ping/arp/netinfo through the mature smoltcp TCP/IP stack (ROADMAP §1b)
+# instead of the hand-rolled `net` engines. Pulls in the x86-only smoltcp optional dependency and
+# compiles the `smolnet` Device adapter over the e1000e rings (the module is additionally
+# target_arch="x86_64"-gated, so aarch64 never pulls smoltcp and its binaries are byte-identical).
+# The hand-rolled stack stays compiled and still owns connect/fetch/udpsend this arc. Poll-driven,
+# static buffers (no heap growth), no syscall surface. Enable via `UNAOS_SMOLNET=1`. Default OFF =>
+# byte-identical. See unaos/docs/dev/OS/08_NET/networking.md.
+smolnet = ["dep:smoltcp"]
 # Jetson Orin Nano (Tegra234) build: point the aarch64 serial at the Tegra UART — a 16550-style
 # controller at a Tegra MMIO base (NOT the QEMU `virt` PL011) — so the board has a real serial
 # console from boot #1 over the carrier's button-header USB-TTL (115200 8N1). Mutually exclusive
@@ -85,3 +93,9 @@ fdt = "0.1.5"
 [target.'cfg(target_arch = "x86_64")'.dependencies]
 x86_64 = "0.15.4"
 uart_16550 = "0.6.0"
+# SOCK-1: mature TCP/IP stack (0BSD, #![no_std], heap-optional). x86-only + optional so aarch64 and
+# knob-off x86 builds never compile it. default-features off; only the three features SOCK-1 uses:
+#   medium-ethernet — the e1000e is an Ethernet L2 device (built-in ARP neighbor discovery)
+#   proto-ipv4      — IPv4 addressing/routing/checksums for the 10.0.2.0/24 slirp net
+#   socket-icmp     — the ICMP echo socket that `ping`/the boot witness drive
+smoltcp = { version = "=0.13.1", default-features = false, features = ["medium-ethernet", "proto-ipv4", "socket-icmp"], optional = true }
