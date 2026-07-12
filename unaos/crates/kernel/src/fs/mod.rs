@@ -16,6 +16,7 @@
 
 //! Filesystem layer. Arch-neutral: it builds only on the generic block device
 //! ([`crate::drivers::block`]), so the same code runs on the x86_64 (Intel xHCI)
-//! and aarch64 (qemu-xhci) storage paths. Currently a read-only FAT16/FAT32 reader.
+//! and aarch64 (qemu-xhci) storage paths. FAT16/FAT32 with read, in-place write,
+//! grow, create/delete, and directory creation/removal (`create_dir`/`remove_dir`).
 
 pub mod fat;

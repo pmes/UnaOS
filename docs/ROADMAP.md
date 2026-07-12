@@ -75,6 +75,24 @@ the shared userspace port.
 | **K1+K2** | Reboot-surviving ACL: the U6 owner/grants persist to an on-disk `UNAFS.ATR` file (kernel-stamped `PrincipalRecord`, volume-fingerprint bound). Foundation + persistence landed (K1); **K2 turned cross-reboot enforcement LIVE** — three distinct launchable named programs on the card, the gate flipped, grow-repersist, and an end-to-end proof through REAL programs (`K2OWN.BIN` re-admitted by name after rebuild, `K2IMP.BIN` denied). **✅ METAL-CONFIRMED on real Pi 4 (2026-07-11): one-boot MBENCH 25/25, and a genuine two-boot power-cycle (`UNAOS_K2_LEAVE`) — the owned file's ACL survived a real power-cut and was enforced on the next boot** | pi4 |
 | **UI/gfx** | Scale-aware UI metrics (no absolute pixel sizes), the in-kernel `pulse` monitor + `apps/pulse` host vessel, the `vug` software-rendered crystal engine, and the fbcon cached-RAM shadow that kills the uncached-VRAM scroll on x86 | rmbp/ux |
 
+## 1b. Networking: sockets on the mature stack (direction, 2026-07-12)
+
+**Decision (Peter): adopt the mature TCP/IP crate — [smoltcp](https://github.com/smoltcp-rs/smoltcp)
+(0.13.x, 0BSD, `no_std`, heap-optional) — and retire the hand-rolled protocol
+line to "possible future items."** What exists today and stays: the e1000e
+driver (`drivers/e1000.rs` — PCI, MSI RX on vector 0x41, DMA rings) is the
+device layer smoltcp binds to; the hand-rolled `crates/net` protocol crate
+(ARP/ICMP/UDP/DHCP + the Go-Back-N TCP engine) keeps working knob-off and
+remains in-tree as reference until the smoltcp line fully replaces its shell
+surface. There is **no net syscall surface yet** (ring 3 cannot reach the
+network); the socket syscall family is greenfield (next free number: 19).
+
+| Arc | Content | Track |
+| :--- | :--- | :--- |
+| SOCK-1 | smoltcp vendored + a `Device` adapter over the e1000e rings, behind a `UNAOS_SMOLNET` build knob (knob-off byte-identical). Shell `ping`/`arp`/`netinfo` ride smoltcp's interface knob-on — the honest QEMU witness (slirp answers ICMP echo at 10.0.2.2) | x86 first (aarch64 has no wired NIC) |
+| SOCK-2 | The socket syscall family (UDP first) over smoltcp's socket set — ring 3 reaches the network for the first time | x86 |
+| SOCK-3+ | TCP sockets; DHCP via smoltcp; aarch64 NIC bring-up joins here (§6 row) | later |
+
 ## 2. UnaFS: meeting and surpassing BeFS
 
 `libs/unafs` already exceeds BeFS on one axis — typed attributes including
@@ -98,14 +116,20 @@ Order: F1 → F2 → K1/K2 → **K3 (metal milestone)** → F3 → F4 → **F5 (
 surpassed)** → K4. The F-arcs are host-native — ideal parallel work needing no
 hardware session.
 
+The **security-K4 residual** ([`SECURITY.md`](SECURITY.md) §K1 — migrate the
+`UNAFS.ATR` FAT-bridge sidecar onto native unafs typed attributes, then delete
+it) sits on top of this chain's K1→K4: it needs the kernel mount before the
+migrate pass can run. The K4-ready projection codec (pi4, 2026-07-12) is the
+layer that migrate pass will call. Don't conflate the two K-numberings.
+
 ## 3. Design → Make (printer)
 
 Canon: [`CODEX.md`](CODEX.md) §5 — Vug computes toolpaths, Comscan pumps
 G-code to hardware. Sequenced routes:
 
 1. **PrusaLink HTTP** (~2 arcs): HTTP client grows PUT + API-key auth over the
-   existing TCP stack → upload G-code to the Prusa CORE One+ and start a print.
-   *"UnaOS prints a part"* early; also a real Go-Back-N stress test.
+   TCP stack (now the smoltcp line — §1b) → upload G-code to the Prusa CORE
+   One+ and start a print. *"UnaOS prints a part"* early.
 2. **USB CDC-ACM + Comscan** (2 arcs): modest USB class driver (two bulk
    endpoints + SET_LINE_CODING) on the existing xHCI stack; stream G-code with
    ok/ack flow control from the rMBP on metal. Comscan's first real capability.
