@@ -61,9 +61,13 @@ aarch64 (Pi 4) track and ports to x86/Jetson after:
   admitted only for the owner or a principal it **granted** (`SYS_FGRANT`, owner-scoped via a `Child`
   handle, mirroring `SYS_XFER`; `rights = 0` revokes) — the grant is an ACL edge on the *file*, so the
   grantee simply opens the name and the check admits it. The store is in-kernel and keyed by the file's
-  identity, fenced by the `(ASID, ASID_GEN)` incarnation; it is the **enforcement seam** the UnaFS
-  `owner`/`grants:*` typed attributes below will feed once the kernel UnaFS mount (K2/K3/K4) lands. The
-  x86 twin (U6x) and a persistent (on-disk) owner form are future.
+  identity, fenced by the `(ASID, ASID_GEN)` incarnation; it is the **enforcement seam** a persisted
+  owner/grants store feeds. That store exists TODAY as the K1 `UNAFS.ATR` FAT-bridge sidecar (an on-disk
+  owner form since K1/K2/K3 — cross-reboot enforcement metal-confirmed on real Pi 4); at **K4** it becomes
+  the NATIVE UnaFS `owner`/`grants:*` typed attributes below, once a kernel UnaFS mount lands (gated on the
+  ROADMAP §2 BeFS convergence: no_std port → block adapter → read-only mount → journaled writes). The
+  K4-ready projection codec (the 1:1 sidecar→native-attribute string mapping) landed 2026-07-12, ahead of
+  that mount. The x86 twin (U6x) is future.
 * **Still ahead** — **revocation trees** (a revoked transfer cascading through the recipient's
   re-grants/re-transfers — today a derived copy escapes single-level revoke; per-cap derivation
   records + the reserved `revoke` right are that arc), the **bandy Ring-3 delegation wrapper** (so

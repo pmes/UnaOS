@@ -4098,9 +4098,10 @@ pub fn orphan_reaper(_: usize) {
 // / derivation machinery uses (ASIDs recycle across process lifetimes; ASID_GEN is bumped at
 // teardown). A stale owner/grant whose gen no longer matches never authorizes a recycled tenant.
 //
-// LIFETIME (in-kernel, VOLATILE — this is the ENFORCEMENT SEAM the on-disk UnaFS owner/grants:*
-// attributes will feed once K2/K3/K4 land; there is no on-disk owner format yet, and fat.rs is
-// shared/off-lane): a row is keyed by the file's directory-slot identity (dir_lba, dir_off). It is
+// LIFETIME (in-kernel, VOLATILE — this is the ENFORCEMENT SEAM the persisted owner/grants feed: TODAY via
+// the K1 `UNAFS.ATR` FAT-bridge sidecar (an on-disk owner format since K1/K2/K3), at K4 via NATIVE unafs
+// `owner`/`grants:*` typed attributes; enforcement is storage-agnostic — it compares `PrincipalRecord`s by
+// value regardless of backing): a row is keyed by the file's directory-slot identity (dir_lba, dir_off). It is
 // CLEARED at unlink (the name is gone; FAT may recycle the slot to a DIFFERENT file — the U11
 // recycled-slot hazard) and at OWNER TEARDOWN (clear_handle_row → the file reverts to PUBLIC, which
 // also keeps the bounded table self-cleaning across create/exit cycles). Because the table is
@@ -8392,6 +8393,11 @@ pub fn u7_launcher(demo_cpu: usize) {
     // volume — LAST in the chain (its disk I/O can never perturb the 23 fixtures or the witnesses), fully
     // self-cleaning. Its own uncounted `:: FATDIRS: … PASS ::` line. Unblocks JD7's Orin-panel mkdir/rmdir.
     fatdirs_launcher();
+    // K4-ready: prove the native-attribute projection codec (owner/grants string forms) + the
+    // UNAATR1-vs-UNAFS volume-magic discriminator — the deterministic 1:1 mapping K4's migrate-then-delete
+    // will use, PINNED + KAT'd ahead of the native unafs mount. Read-only, in-RAM (no disk, no card); its
+    // own uncounted `:: K4-ready: … PASS ::` line. LAST in the chain.
+    k4_ready_selftest();
 }
 
 /// F2 M3 witness worker — the `demo_cpu` half of the cross-core FAT_MUTATION stress. `fn(usize)` for
@@ -8652,9 +8658,10 @@ impl PrincipalRecord {
     /// IMAGE_SHA256 (code-signing, this arc): the principal a program's IMAGE identity mints — kind
     /// IMAGE_SHA256, `value` = the 30-byte prefix of the 32-byte SHA-256 digest (240 bits; the `value` field is
     /// a HARD 30 bytes — widening it is a format bump, so we truncate rather than bump, and 240-bit identity is
-    /// collision-infeasible). On disk we keep the RAW digest prefix; the canonical `"sha256:<hex>"` string
-    /// projection (71 chars, doesn't fit) is derived from these bytes at K4 — the byte-transparent codec is
-    /// unchanged. Equality (derive(PartialEq)) compares all 30 value bytes, so two IMAGE principals match iff
+    /// collision-infeasible). On disk we keep the RAW digest prefix; the native `owner` string projection is
+    /// `sha256:` + 60 lowercase hex of THIS 30-byte prefix (67 chars — the 240-bit identity), NOT the 71-char
+    /// full-digest form which cannot be rebuilt from disk (see `principal_native_string`, the K4-ready codec).
+    /// Equality (derive(PartialEq)) compares all 30 value bytes, so two IMAGE principals match iff
     /// their digest prefixes match. Kernel-minted; NEVER self-asserted by a blob.
     fn image_sha256(digest: &[u8; 32]) -> Self {
         let mut value = [0u8; PRIN_VALUE_LEN];
@@ -8678,6 +8685,148 @@ impl PrincipalRecord {
         value.copy_from_slice(&b[2..2 + PRIN_VALUE_LEN]);
         PrincipalRecord { kind: b[0], len: b[1], value }
     }
+}
+
+// =====================================================================================================
+// K4-READY: the native-attribute PROJECTION CODEC (migration glue) — turn a persisted PrincipalRecord /
+// grant / volume-magic into the string forms a native unafs volume stores, WITHOUT a native mount.
+// =====================================================================================================
+//
+// K4 proper ("migrate-then-delete onto native unafs attributes", docs/SECURITY.md §K1) reads each committed
+// UNAFS.ATR row and re-stores its owner/grants as native unafs TYPED ATTRIBUTES — attribute key `owner`
+// (value = the principal's canonical string) and `grants:<grantee>` (value = the rights) — then deletes the
+// FAT-bridge sidecar. That migration is gated on a native unafs FILESYSTEM existing in the kernel (the
+// ROADMAP §2 "BeFS" convergence: no_std port -> block adapter -> read-only mount -> journaled writes), which
+// does NOT exist in this tree yet (fs/mod.rs mounts only FAT; libs/unafs is a std Ring-3 crate). What DOES
+// land now, in-lane, is the deterministic 1:1 CODEC that migration will use — pure functions + KATs — so the
+// exact projection is PINNED and PROVEN ahead of the mount, and the "tell the sidecar from a native volume"
+// primitive the FORMAT bullet names exists.
+//
+// THE 240-BIT-PREFIX RULE (load-bearing correctness). An IMAGE_SHA256 principal stores only the 30-byte
+// (240-bit) PREFIX of the SHA-256 digest (`value[30]` is a HARD cap — widening it is a format bump).
+// Enforcement compares those 30 bytes, and the loader's mint (`image_of`) stores the SAME 30-byte prefix.
+// So the native `owner` string MUST be the prefix form `sha256:<60 lowercase hex>` (67 chars) — NOT the
+// 71-char full-digest form, which cannot be reconstructed from disk (bytes 30,31 of the digest are not
+// stored). Projecting a full digest would make a MIGRATED owner (60 hex, from the stored prefix) mismatch a
+// FRESH-minted owner (64 hex) of the very same program -> the migrated owner would be permanently
+// un-re-acquirable. The prefix form keeps migrated == fresh-mint, byte-for-byte. (This corrects the earlier
+// `image_sha256` doc note that called the canonical form "71 chars, derived at K4".)
+
+/// The native unafs superblock magic — MIRRORED from `libs/unafs/src/superblock.rs` (`pub const MAGIC:
+/// [u8;5] = *b"UNAFS"`), deliberately distinct from the FAT-bridge sidecar's `ATR_MAGIC` (`UNAATR1\0`) so a
+/// kernel can tell a real native volume from the shim and drive migrate-then-delete at K4. Kept LOCAL (the
+/// crate is std/Ring-3, unported); if that native magic ever changes, change it here. The classifier below
+/// assumes this lands at byte 0 of the native superblock — true because `libs/unafs` serializes `Superblock`
+/// with bincode fixint (a fixed `[u8;5]` field emits no length prefix); a future serde/codec change there
+/// must be reflected here.
+const UNAFS_SB_MAGIC: [u8; 5] = *b"UNAFS";
+
+/// K4-ready: what a candidate leading byte-slice looks like — the FAT-bridge ACL sidecar (starts with
+/// `UNAATR1\0`), a native unafs volume/superblock (starts with `UNAFS`), or neither (a plain FAT boot
+/// sector, an empty buffer, anything else). The `UNAATR1\0` and `UNAFS` prefixes cannot alias (byte 3 is
+/// 'A' vs 'F'), so the order of the two checks is immaterial.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum VolumeMagic {
+    AtrSidecar,
+    NativeUnafs,
+    Other,
+}
+
+/// K4-ready: classify a leading byte-slice by magic — the "tell the FAT bridge apart from a real unafs
+/// volume" primitive the UNAFS.ATR FORMAT bullet names. Pure, panic-free (short buffers -> `Other`); the
+/// caller supplies the head of a candidate file (for the sidecar) or of volume block 0 (native superblock).
+fn classify_volume_magic(head: &[u8]) -> VolumeMagic {
+    if head.starts_with(&ATR_MAGIC) {
+        VolumeMagic::AtrSidecar
+    } else if head.starts_with(&UNAFS_SB_MAGIC) {
+        VolumeMagic::NativeUnafs
+    } else {
+        VolumeMagic::Other
+    }
+}
+
+/// K4-ready: lowercase-hex `src` into `out` (2 chars/byte). Returns bytes written; stops at the smaller of
+/// `out.len()` and `src.len()*2` (never panics on a short buffer). no_std, no heap.
+fn hex_lower_into(src: &[u8], out: &mut [u8]) -> usize {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut n = 0usize;
+    for &b in src {
+        if n + 2 > out.len() {
+            break;
+        }
+        out[n] = HEX[(b >> 4) as usize];
+        out[n + 1] = HEX[(b & 0x0f) as usize];
+        n += 2;
+    }
+    n
+}
+
+/// The widest native-attribute string this codec emits: `grants:` (7) + `sha256:` (7) + 60 hex = 74 bytes.
+const K4_STR_MAX: usize = 74;
+
+/// K4-ready: project a persisted principal to its canonical native-attribute STRING into `out`, returning
+/// the length written, or `None` if it has no native projection. `NONE` = public (a file with no `owner`
+/// attribute). `PROGRAM_NAME` stores the canonical string in `value` already (`prog:<name>`), so projection
+/// is a verbatim copy of `value[..len]`. `IMAGE_SHA256` stores raw digest-prefix bytes, projected as
+/// `sha256:` + 60 lowercase hex (the 240-bit prefix — see THE 240-BIT-PREFIX RULE above). Reserved/unknown
+/// kinds (`PRIN_KERNEL_PID` and any future value) return `None` — fail-closed: an owner the kernel cannot
+/// name is not migrated (matching the ratified "migrate only what the kernel can re-mint" policy).
+fn principal_native_string(rec: &PrincipalRecord, out: &mut [u8]) -> Option<usize> {
+    match rec.kind {
+        PRIN_NONE => None,
+        PRIN_PROGRAM_NAME => {
+            let n = core::cmp::min(rec.len as usize, PRIN_VALUE_LEN);
+            if n > out.len() {
+                return None;
+            }
+            out[..n].copy_from_slice(&rec.value[..n]);
+            Some(n)
+        }
+        PRIN_IMAGE_SHA256 => {
+            const PFX: &[u8] = b"sha256:";
+            if PFX.len() + PRIN_VALUE_LEN * 2 > out.len() {
+                return None; // 7 + 60 = 67
+            }
+            out[..PFX.len()].copy_from_slice(PFX);
+            let w = hex_lower_into(&rec.value, &mut out[PFX.len()..]);
+            Some(PFX.len() + w)
+        }
+        _ => None, // PRIN_KERNEL_PID (reserved) / unknown -> un-projectable, fail-closed
+    }
+}
+
+/// K4-ready: the native-attribute KEY for a grant to `grantee` — `grants:<grantee canonical string>`
+/// (e.g. `grants:prog:MIDI`, `grants:sha256:<hex>` — the widest key, exactly `K4_STR_MAX` = 74 bytes).
+/// `None` if the grantee has no native projection OR `out` is too small; on `None` the contents of `out`
+/// are UNSPECIFIED (the `grants:` prefix may already have been written), so a caller must key off the
+/// returned length, never the buffer, when the result is `None`.
+fn grant_native_key(grantee: &PrincipalRecord, out: &mut [u8]) -> Option<usize> {
+    const PFX: &[u8] = b"grants:";
+    if PFX.len() > out.len() {
+        return None;
+    }
+    out[..PFX.len()].copy_from_slice(PFX);
+    let w = principal_native_string(grantee, &mut out[PFX.len()..])?;
+    Some(PFX.len() + w)
+}
+
+/// K4-ready: the native-attribute VALUE for a grant's rights — a canonical lowercase string over the
+/// `CAP_READ|CAP_WRITE` subset the file-grant model uses: `rw` / `r` / `w` / `-` (no rights). Returns the
+/// length written, or `None` if `out` is too small — UNIFORM with `principal_native_string`/`grant_native_key`
+/// (it never emits a partial rights string, so a too-small buffer can't silently drop the write bit). The
+/// `EXEC`/`GRANT` bits are not part of a file grant, so they are deliberately ignored here.
+fn rights_native_value(rights: u32, out: &mut [u8]) -> Option<usize> {
+    let s: &[u8] = match (rights & CAP_READ != 0, rights & CAP_WRITE != 0) {
+        (true, true) => b"rw",
+        (true, false) => b"r",
+        (false, true) => b"w",
+        (false, false) => b"-",
+    };
+    if s.len() > out.len() {
+        return None;
+    }
+    out[..s.len()].copy_from_slice(s);
+    Some(s.len())
 }
 
 // M2.1: the launcher's principal STAMP table — the persistent PrincipalRecord assigned to each address-space
@@ -10284,6 +10433,140 @@ fn image_sig_selftest() {
     let all = 0x3Fu32 | file_all; // 0x7F with a card, 0x3F without
     serial_println!(
         ":: IMG-SIG: code-signing principal = IMAGE_SHA256 (FIPS KATs, image discrimination, name-collision residual closed) {} [w={:#04x}/{:#04x}] ::",
+        if w == all { "PASS" } else { "FAIL" },
+        w,
+        all
+    );
+}
+
+// =====================================================================================================
+// K4-READY: prove the native-attribute projection codec + the volume-magic discriminator — the
+// deterministic 1:1 mapping K4's migrate-then-delete will use, PINNED + KAT'd ahead of the native mount.
+// Read-only, in-RAM, SYNTHETIC principals (no card, no disk) -> fully byte-equivalent; emits ONE uncounted
+// `:: K4-ready: … PASS [w=0x..] ::` line (never a `-> PASS`/`: PASS` fixture line, so the 23-PASS battery is
+// unchanged). Runs LAST in `u7_launcher`, after `fatdirs_launcher`.
+// =====================================================================================================
+fn k4_ready_selftest() {
+    static DONE: AtomicBool = AtomicBool::new(false);
+    if DONE.swap(true, Ordering::Relaxed) {
+        return;
+    }
+    let mut w = 0u32;
+    let mut buf = [0u8; K4_STR_MAX];
+    let prog = PrincipalRecord::program_name("HELLO.BIN");
+    let midi = PrincipalRecord::program_name("MIDI");
+    let img = PrincipalRecord::image_of(b"abc"); // digest = FIPS SHA-256("abc")
+
+    // bit0: PROGRAM_NAME projects to its stored canonical string verbatim (`prog:<name>`).
+    if principal_native_string(&prog, &mut buf) == Some(14) && &buf[..14] == b"prog:HELLO.BIN" {
+        w |= 1 << 0;
+    }
+
+    // bit1: the lowercase-hex helper is correct (KAT over a known 4-byte pattern, incl. nibble order).
+    let mut hb = [0u8; 8];
+    if hex_lower_into(&[0x00, 0x0f, 0xa5, 0xff], &mut hb) == 8 && &hb == b"000fa5ff" {
+        w |= 1 << 1;
+    }
+
+    // bit2: IMAGE_SHA256 projects to `sha256:` + 60 lowercase hex of the 30-byte digest PREFIX (67 chars),
+    // NOT the 71-char full digest (THE 240-BIT-PREFIX RULE). KAT: SHA-256("abc") = ba7816bf…15ad; its first
+    // 30 bytes hex to the 60 chars below. `image_of` mints the digest; the projection prefixes + hexes it.
+    const IMG_ABC_KEY: &[u8] =
+        b"sha256:ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f200";
+    if img.kind == PRIN_IMAGE_SHA256
+        && principal_native_string(&img, &mut buf) == Some(67)
+        && &buf[..67] == IMG_ABC_KEY
+    {
+        w |= 1 << 2;
+    }
+
+    // bit3: a NONE principal has NO native projection -> the file is public (no `owner` attribute written).
+    if principal_native_string(&PrincipalRecord::NONE, &mut buf).is_none() {
+        w |= 1 << 3;
+    }
+
+    // bit4: grant key `grants:<grantee>` — a short PROGRAM_NAME grantee (16 bytes), the WIDEST input (an
+    // IMAGE grantee: `grants:sha256:<60hex>` = exactly K4_STR_MAX = 74, the tight-fit boundary), a NONE
+    // grantee (un-projectable), and a 1-too-small buffer (73 < 74) all behave (Some/None) as the pinned
+    // contract says — the exact-fit case an off-by-one in K4_STR_MAX or the composed guards would break.
+    let prog_key = grant_native_key(&midi, &mut buf) == Some(16) && &buf[..16] == b"grants:prog:MIDI";
+    let mut wide = [0u8; K4_STR_MAX];
+    let wide_ok = grant_native_key(&img, &mut wide) == Some(74) && &wide[..14] == b"grants:sha256:";
+    let short_none = grant_native_key(&img, &mut [0u8; 73]).is_none()
+        && grant_native_key(&PrincipalRecord::NONE, &mut buf).is_none();
+    if prog_key && wide_ok && short_none {
+        w |= 1 << 4;
+    }
+
+    // bit5: rights project to the canonical `rw`/`r`/`w`/`-` value strings; a 1-byte buffer can't hold `rw`
+    // and yields None (the uniform contract — never a partial rights string that would drop the write bit).
+    let mut rb = [0u8; 2];
+    let rw_ok = rights_native_value(CAP_READ | CAP_WRITE, &mut rb) == Some(2) && &rb == b"rw";
+    let r_ok = rights_native_value(CAP_READ, &mut rb) == Some(1) && rb[0] == b'r';
+    let w_ok = rights_native_value(CAP_WRITE, &mut rb) == Some(1) && rb[0] == b'w';
+    let none_ok = rights_native_value(0, &mut rb) == Some(1) && rb[0] == b'-';
+    let short_none_r = rights_native_value(CAP_READ | CAP_WRITE, &mut [0u8; 1]).is_none();
+    if rw_ok && r_ok && w_ok && none_ok && short_none_r {
+        w |= 1 << 5;
+    }
+
+    // bit6: the magic discriminator tells the FAT-bridge sidecar (`UNAATR1\0`) from a native unafs volume
+    // (`UNAFS`) from anything else (a FAT boot sector, an empty buffer).
+    let fat_boot = [0xEBu8, 0x3C, 0x90, b'M', b'S', b'D', b'O', b'S'];
+    if classify_volume_magic(&ATR_MAGIC) == VolumeMagic::AtrSidecar
+        && classify_volume_magic(&UNAFS_SB_MAGIC) == VolumeMagic::NativeUnafs
+        && classify_volume_magic(&fat_boot) == VolumeMagic::Other
+        && classify_volume_magic(&[]) == VolumeMagic::Other
+    {
+        w |= 1 << 6;
+    }
+
+    // bit7: THE MIGRATION LANDMINE — an owner row round-tripped through the REAL on-disk codec
+    // (atr_serialize_row exactly as a persist, atr_parse_row exactly as a mount) projects IDENTICALLY to an
+    // INDEPENDENTLY re-minted principal (NOT the object that was serialized), and the IMAGE owner string is
+    // the 240-bit PREFIX form — length 67, never the 71-char full digest. So a MIGRATED IMAGE owner still
+    // matches a FRESH mint of the same program (re-acquirable across the migration); a regression that
+    // emitted the 71-char full digest instead would fail the `na == 67` check.
+    let mut row = AtrRow {
+        name: *b"K4READY BIN",
+        first_cluster: 3,
+        size: 512,
+        dir_lba: 0,
+        dir_off: 0,
+        owner: img,
+        grants: [AtrGrant::EMPTY; NFGRANT],
+    };
+    row.grants[0] = AtrGrant { prin: midi, rights: CAP_READ | CAP_WRITE };
+    if let Some(parsed) = atr_parse_row(&atr_serialize_row(&row)) {
+        let fresh_owner = PrincipalRecord::image_of(b"abc"); // INDEPENDENT re-mint, not the serialized `img`
+        let fresh_grantee = PrincipalRecord::program_name("MIDI");
+        let (mut a, mut b) = ([0u8; K4_STR_MAX], [0u8; K4_STR_MAX]);
+        let own_stable = match (
+            principal_native_string(&parsed.owner, &mut a),
+            principal_native_string(&fresh_owner, &mut b),
+        ) {
+            (Some(na), Some(nb)) => na == 67 && na == nb && a[..na] == b[..nb], // 67 = the 240-bit prefix form
+            _ => false,
+        };
+        let (mut ga, mut gb) = ([0u8; K4_STR_MAX], [0u8; K4_STR_MAX]);
+        let grant_stable = match (
+            grant_native_key(&parsed.grants[0].prin, &mut ga),
+            grant_native_key(&fresh_grantee, &mut gb),
+        ) {
+            (Some(na), Some(nb)) => na == nb && ga[..na] == gb[..nb],
+            _ => false,
+        };
+        let mut ra = [0u8; 2];
+        let rights_stable =
+            rights_native_value(parsed.grants[0].rights, &mut ra) == Some(2) && &ra == b"rw";
+        if own_stable && grant_stable && rights_stable {
+            w |= 1 << 7;
+        }
+    }
+
+    let all = 0xFFu32;
+    serial_println!(
+        ":: K4-ready: native owner/grants projection + UNAFS-vs-UNAATR1 magic discriminator (K4 migration codec, sha256 240-bit prefix) {} [w={:#04x}/{:#04x}] ::",
         if w == all { "PASS" } else { "FAIL" },
         w,
         all
