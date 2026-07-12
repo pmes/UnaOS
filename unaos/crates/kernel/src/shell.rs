@@ -124,9 +124,12 @@ fn resolve_path(fs: &FatFs, path: &str) -> Result<Resolved, String> {
 // against the cwd and walks to the PARENT directory via the read-only `resolve_path`, then the
 // writes ride the dir-aware `create_in_dir`/`locate_in_dir` twins (`first_cluster == 0` ⇒ root).
 // A parent that is a plain file is `-ENOTDIR`; a missing parent `-ENOENT`; a FULL directory
-// `-ENOSPC` (extending a subdir's cluster chain is out of scope this arc — the twins add a slot but
-// never grow the directory chain). Directory REMOVAL (`rmdir`) stays out of scope: `rm` of a
-// directory is `-EISDIR` (it needs emptiness + `.`/`..` handling and a fat.rs primitive we lack).
+// `-ENOSPC` (extending a subdir's cluster chain is out of scope — the twins add a slot but never grow
+// the directory chain). JD7 layers `mkdir`/`rmdir` on top via the `fat::create_dir`/`remove_dir`
+// FATDIRS seam (call-never-edit, like JD6's write path): `rm` stays file-only (`-EISDIR` on a
+// directory — use `rmdir`), and `rmdir` removes an EMPTY directory (non-empty ⇒ `-ENOTEMPTY`, the
+// root refused). The seam's internal F3 locking is sound for these EL1 callers without the syscall
+// NAMESPACE lock (it reaches fat.rs directly) — see fat.rs's FATDIRS block + docs/SECURITY.md.
 //
 // SAFETY (M3): every fat.rs write returns a `Result`; a stalled USB write surfaces as
 // `FatError::Io` (the block layer's `write_block` rides the SAME JD3 wall-clock-bounded BOT pump as
@@ -309,8 +312,7 @@ fn fs_append(console: &mut Console, arg: &str, data: &[u8]) {
 
 /// JD6 `rm`: delete a file at `path` in ANY reachable directory — `delete_located` marks the
 /// directory slot `0xE5` FIRST, then frees the cluster chain (all FAT copies), the crash-safe order
-/// fat.rs guarantees. A directory target is refused (`-EISDIR` — directory removal / `rmdir` is out
-/// of scope this arc: it needs emptiness + `.`/`..` handling and a fat.rs primitive we don't have);
+/// fat.rs guarantees. A directory target is refused (`-EISDIR` — use `rmdir` for directories, JD7);
 /// an absent name is `-ENOENT`. Rides the dir-aware locate_in_dir twin.
 fn fs_rm(console: &mut Console, arg: &str) {
     let fs = match crate::fs::fat::mount() {
@@ -338,6 +340,89 @@ fn fs_rm(console: &mut Console, arg: &str) {
             "rm: {}: not found (-ENOENT)", joined(&canon, &name))),
         Err(e) => console.println(&alloc::format!(
             "rm: {}: {} ({:?})", joined(&canon, &name), fat_errno(e), e)),
+    }
+}
+
+/// JD7 `mkdir`: create a new directory `path` in ANY reachable parent. Walks to the parent via
+/// `resolve_write_target` (JD6), locates the leaf FIRST (`fat::create_dir` does NOT de-duplicate —
+/// the inherited `create_in_dir` contract), then calls the `fat::create_dir` FATDIRS seam, which
+/// allocates + `.`/`..`-initializes a fresh directory cluster and links a DIR-attr entry in the
+/// parent. Honest errors: name already taken (file OR dir) → `-EEXIST`; parent missing → `-ENOENT`;
+/// parent is a plain file → `-ENOTDIR` (both from `resolve_write_target`); volume or parent-dir full
+/// → `-ENOSPC`; a non-8.3 name → `-EINVAL`. The root itself as a target → `-EISDIR` (it always exists).
+fn fs_mkdir(console: &mut Console, arg: &str) {
+    let fs = match crate::fs::fat::mount() {
+        Ok(fs) => fs,
+        Err(e) => return console.println(&alloc::format!("mkdir: no FAT filesystem ({:?})", e)),
+    };
+    let (parent, name, canon) = match resolve_write_target(&fs, arg) {
+        Ok(t) => t,
+        Err(msg) => return console.println(&alloc::format!("mkdir: {}", msg)),
+    };
+    // create_dir does NOT de-duplicate — locate first so an existing name (file OR directory) is an
+    // honest -EEXIST, never a duplicate directory slot in the parent.
+    match fs.locate_in_dir(parent, &name) {
+        Ok((de, _, _)) => console.println(&alloc::format!(
+            "mkdir: {}: file exists (-EEXIST)", joined(&canon, de.name()))),
+        Err(FatError::NotFound) => match fs.create_dir(parent, &name) {
+            Ok((de, _, _)) => console.println(&alloc::format!(
+                "created directory {}", joined(&canon, de.name()))),
+            Err(e) => console.println(&alloc::format!(
+                "mkdir: {}: {} ({:?})", joined(&canon, &name), fat_errno(e), e)),
+        },
+        Err(e) => console.println(&alloc::format!(
+            "mkdir: {}: {} ({:?})", joined(&canon, &name), fat_errno(e), e)),
+    }
+}
+
+/// JD7 `rmdir`: remove an EMPTY directory `path` from ANY reachable parent. Walks to the parent via
+/// `resolve_write_target` (JD6), then calls the `fat::remove_dir` FATDIRS seam, which verifies the
+/// target holds only `.`/`..` and frees its single cluster. Errno fidelity is shell-side (the seam
+/// reuses existing `FatError` variants — see FATDIRS): the root is refused LOCALLY (`-EBUSY` — it is
+/// never nameable and cluster 0 is not freeable); a FILE target is `-ENOTDIR` (resolved from the
+/// parent walk BEFORE the call, so the seam's `Unsupported`-for-non-dir never surfaces here); an
+/// absent name is `-ENOENT`; a NON-EMPTY directory maps the seam's `IsDirectory` → `-ENOTEMPTY`.
+/// (`rm` stays file-only — a directory there is still `-EISDIR`; use `rmdir`.)
+///
+/// Note: removing the current working directory (e.g. `rmdir .` in an empty cwd, which normalizes to
+/// the cwd path) succeeds and leaves the JD4 cwd stale — the very next cwd-relative command re-resolves
+/// it and gets an honest `-ENOENT`, exactly the JD4 stale-cwd worst case (the cwd is a re-resolved path
+/// string, not a cached chain head). No corruption — `delete_located` is crash-safe.
+fn fs_rmdir(console: &mut Console, arg: &str) {
+    let fs = match crate::fs::fat::mount() {
+        Ok(fs) => fs,
+        Err(e) => return console.println(&alloc::format!("rmdir: no FAT filesystem ({:?})", e)),
+    };
+    // Refuse the root explicitly, with the honest errno. `resolve_write_target` would report the "/"
+    // path as `-EISDIR`, but the volume root is never a removable directory (it is unnameable and
+    // cluster 0 is not freeable). This also covers `rmdir .` at the root and `rmdir ..` that pops to it.
+    if normalize_path(&cwd_path(), arg) == "/" {
+        return console.println("rmdir: /: cannot remove the root directory (-EBUSY)");
+    }
+    let (parent, name, canon) = match resolve_write_target(&fs, arg) {
+        Ok(t) => t,
+        Err(msg) => return console.println(&alloc::format!("rmdir: {}", msg)),
+    };
+    match fs.locate_in_dir(parent, &name) {
+        Ok((de, _, _)) => {
+            if !de.is_dir {
+                return console.println(&alloc::format!(
+                    "rmdir: {}: not a directory (-ENOTDIR)", joined(&canon, de.name())));
+            }
+            match fs.remove_dir(parent, &name) {
+                Ok(freed) => console.println(&alloc::format!(
+                    "removed directory {} ({} cluster(s) freed)", joined(&canon, de.name()), freed.len())),
+                // The seam maps a NON-EMPTY directory to `IsDirectory`; the shell owns the -ENOTEMPTY tag.
+                Err(FatError::IsDirectory) => console.println(&alloc::format!(
+                    "rmdir: {}: directory not empty (-ENOTEMPTY)", joined(&canon, de.name()))),
+                Err(e) => console.println(&alloc::format!(
+                    "rmdir: {}: {} ({:?})", joined(&canon, &name), fat_errno(e), e)),
+            }
+        }
+        Err(FatError::NotFound) => console.println(&alloc::format!(
+            "rmdir: {}: not found (-ENOENT)", joined(&canon, &name))),
+        Err(e) => console.println(&alloc::format!(
+            "rmdir: {}: {} ({:?})", joined(&canon, &name), fat_errno(e), e)),
     }
 }
 
@@ -398,7 +483,8 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
             console.println("STORAGE:  diskinfo, usbinfo, read <lba>, write <lba> <byte>");
             console.println("FILES:    fatinfo (FAT geometry), ls [dir], cd [dir], pwd, cat <path>");
             console.println("WRITE:    touch <path>, write <path> <text>, append <path> <text>, rm <path>");
-            console.println("          (root dir; create/edit/delete files; sync = write-through, always durable)");
+            console.println("DIRS:     mkdir <path>, rmdir <path>  (create / remove empty directories)");
+            console.println("          (create/edit/delete files & dirs anywhere in the tree; sync = write-through, durable)");
             console.println("SMP:      sched (per-CPU run queues), pulse (full-screen CPU monitor)");
             console.println("TEST:     tste (in-OS self-test suite: boot-replay + live checks)");
             console.println("NETWORK:  netinfo, ping <ip> [count], arp <ip>");
@@ -547,10 +633,24 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
             }
         },
         "rm" | "del" => {
-            // JD6: delete a file in any reachable dir (directory → -EISDIR). `rm <path>`.
+            // JD6: delete a file in any reachable dir (directory → -EISDIR; use `rmdir`). `rm <path>`.
             match args.first() {
                 None => console.println("usage: rm <path>"),
                 Some(name) => fs_rm(console, name),
+            }
+        },
+        "mkdir" | "md" => {
+            // JD7: create a directory in any reachable parent (name exists → -EEXIST). `mkdir <path>`.
+            match args.first() {
+                None => console.println("usage: mkdir <path>"),
+                Some(name) => fs_mkdir(console, name),
+            }
+        },
+        "rmdir" | "rd" => {
+            // JD7: remove an EMPTY directory (non-empty → -ENOTEMPTY; root refused). `rmdir <path>`.
+            match args.first() {
+                None => console.println("usage: rmdir <path>"),
+                Some(name) => fs_rmdir(console, name),
             }
         },
         "sync" => {

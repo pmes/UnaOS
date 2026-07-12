@@ -2031,6 +2031,71 @@ byte-identical + CAPSTONE 6/6 + all prior witnesses + an uncounted `:: FATDIRS: 
 (the `k1_atr` disk-selftest idiom, fully self-cleaning), zero FAIL; `test-arm 22` MISSION. Zero x86
 behavioural change. **Metal:** the attended money-shot rides JD7's Orin panel `mkdir`/`rmdir` bench.
 
+### JD7 — shaping the tree: panel `mkdir` / `rmdir` (🔬 QEMU-green, metal attended-pending)
+
+JD4 made the tree *navigable*, JD5/JD6 made it *writable*; JD7 lets you *shape* it — `mkdir DOCS/DRAFTS`,
+`rmdir DOCS/OLD` from the panel. Together they close the loop: a directory tree you can organize end to
+end from the console. JD7 is **thin panel glue** — it adds NO `fat.rs` logic. The directory-mutation
+seam already landed as the pi4-lane FATDIRS arc (§FATDIRS above); JD7 *consumes* it call-never-edit,
+exactly as JD6's write path rides `create_in_dir`. The whole arc is `shell.rs`-only (two new command
+handlers `fs_mkdir`/`fs_rmdir`, the `mkdir`/`rmdir` dispatch arms with DOS `md`/`rd` aliases, and the
+help/scope-comment refresh).
+
+**`mkdir` — walk, de-dup, create.** `fs_mkdir` reuses JD6's `resolve_write_target` to get
+`(parent_first_cluster, leaf, parent_canon)`, then — because `fat::create_dir` inherits `create_in_dir`'s
+**no-de-dup** contract — `locate_in_dir`s the leaf FIRST: a name already taken (file *or* directory) is an
+honest `-EEXIST`, never a duplicate slot. Absent ⇒ `fat::create_dir(parent, leaf)` allocates + `.`/`..`-
+initializes the child cluster and links the parent DIR entry; success echoes `created directory
+/DOCS/DRAFTS` (the canonical on-disk spelling).
+
+**`rmdir` — walk, pre-check, remove-if-empty.** `fs_rmdir` refuses the root LOCALLY first (`-EBUSY` — the
+volume root is unnameable and cluster 0 is not freeable; this also catches `rmdir .` at root and `rmdir ..`
+that pops to it), then walks to the parent and `locate_in_dir`s the target. A FILE target is rejected with
+`-ENOTDIR` from the shell's own pre-check (so the seam's `Unsupported`-for-non-dir never has to surface);
+otherwise `fat::remove_dir(parent, leaf)` verifies emptiness (only `.`/`..`) and frees the one cluster. The
+seam maps a NON-EMPTY directory to `IsDirectory`, which the shell renders as `-ENOTEMPTY`. `rm` stays
+file-only (a directory is still `-EISDIR`).
+
+**Errno fidelity is shell-side** (the FATDIRS seam reuses existing `FatError` variants — a new variant
+would break `shell.rs`'s exhaustive `fat_errno` match, kernel-core). The shell resolves file-vs-dir-vs-root
+from the parent walk BEFORE calling, so it emits the POSIX-shaped tags itself:
+
+| condition | who decides | tag |
+|---|---|---|
+| name already taken | shell `locate_in_dir` before `create_dir` | `-EEXIST` |
+| parent missing | `resolve_write_target` (`resolve_path`) | `-ENOENT` |
+| parent is a plain file | `resolve_write_target` | `-ENOTDIR` |
+| volume / parent-dir full | `create_dir` → `NoSpace` | `-ENOSPC` |
+| non-8.3 name | `create_dir` → `Unsupported` | `-EINVAL` |
+| `rmdir` a FILE | shell `is_dir` pre-check | `-ENOTDIR` |
+| `rmdir` a NON-EMPTY dir | `remove_dir` → `IsDirectory` | `-ENOTEMPTY` |
+| `rmdir` the root | shell path pre-check | `-EBUSY` |
+| absent name | shell `locate_in_dir` → `NotFound` | `-ENOENT` |
+
+**Principal — unchanged.** The shell is still EL1 ASID 0, the PUBLIC principal; directories don't change
+that. The FATDIRS block's locking is sound for these EL1 callers *without* the syscall `NAMESPACE` lock
+(they reach `fat.rs` directly). JD7 adds one caller-side note to the ledger: now that the EL1 panel can
+`create_dir` (via `mkdir`) as well as remove, the honest residual is symmetric — an EL1-panel-vs-EL0
+create/create into the SAME directory is the same EXCLUDED_BY_SEQUENCING class as FATDIRS's ledgered
+`remove_dir` TOCTOU (no concurrent EL1 FS mutators run today; the fix is the same future `fat.rs` namespace
+lock). Recorded in [`SECURITY.md`](../../SECURITY.md).
+
+**Gate (QEMU):** `./arroyo check` + `UNAOS_TEGRA=1 ./arroyo check` green both arches; `./arroyo test-arm 22`
+→ `MISSION SUCCESS`; `UNAOS_GICV3=1 ./arroyo test-arm 40` → CAPSTONE 6/6; `UNAOS_HUBSTORAGE=1 ./arroyo test
+25` → `MISSION SUCCESS` (shared `shell.rs` guard); `esp-jetson kernel.elf` links, **108 `tegra:` strings**
+(unchanged — the `mkdir`/`rmdir` strings carry no `tegra:` token; validate media by count, not size). As in
+JD2–JD6, the SHELL command path is not headless-reachable in-lane (the shell dispatches only on a keystroke,
+and tegra never runs in QEMU), so the shell-level verdict is **attended-pending**; the directory PRIMITIVES
+that `fs_mkdir`/`fs_rmdir` call — the FATDIRS `create_dir`/`remove_dir` — are already exercised headless by
+their own `fatdirs_check` selftest.
+
+**Metal verdict — attended-pending.** The money-shot is the bench card
+[`jd7-bench.md`](../../../../unaos/scripts/jd7-bench.md): `mkdir DOCS/DRAFTS`, `cd`, `write NOTE.TXT …`,
+power-cycle, `cd DOCS/DRAFTS`, `cat` (the created tree survives), then `rm NOTE.TXT`, `cd ..`, `rmdir DRAFTS`.
+⚠ Verify the serial bridge captures a full boot BEFORE burning bench time — the round-6 host capture failed
+mid-bench (see §JB1f). Repeated `mkdir`/`rmdir` runs accumulate `0xE5` tombstone slots in the parent across
+boots (FATDIRS cleanup leaves them; harmless — don't misread as corruption; a card re-prep clears them).
+
 ### JB1f — the unhealed early-vector window (the round-6 boot crash), closed (`85f74f8`)
 
 **The evidence (2026-07-11 attended bench, real Orin).** Kernel `446abd3` (the JD6 tip): 2/2 boots
