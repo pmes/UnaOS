@@ -64,6 +64,11 @@ the `arp` command still prints `is-at <mac>`.
   shell op (`ping` / `arp`) and the boot witness is a bounded, blocking poll-pump on the caller's
   stack; on this single-CPU main loop, `service_net()`'s hand-rolled `poll()` is not running
   concurrently, so the two RX drains never race.
+- **Frame-stealing window (knob-on residual).** During a smolnet pump, inbound frames are drained by
+  the smolnet `Device`; anything that is not the pump's ICMP/ARP traffic (e.g. a DHCP offer or a
+  packet for the hand-rolled TCP `:7` listener) is dropped by smoltcp rather than served — bounded by
+  the pump (worst case a silent gateway holds it for `PUMP_ITERS`), same single-CPU semantics as the
+  hand-rolled `ping`'s own pump. SOCK-2's persistent `Interface` retires the per-op pump.
 - **Fully static / stack-local — no heap growth.** Each op builds a throwaway `Interface` + one ICMP
   socket with fixed-size (stack) socket storage, neighbor cache (smoltcp-internal, fixed), and RX/TX
   scratch. Nothing reaches the heap allocator. smoltcp's neighbor cache re-ARPs per op — that is the
