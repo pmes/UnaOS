@@ -17,3 +17,7 @@ resonance = { path = "../../libs/resonance" }
 tokio = { version = "1.49", features = ["rt", "sync", "time", "macros"] }
 anyhow = "1.0"
 log = "0.4"
+
+[dev-dependencies]
+# start_paused tests (auto-advancing time through the drain-timeout path)
+tokio = { version = "1.49", features = ["rt", "sync", "time", "macros", "test-util"] }

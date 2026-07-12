@@ -31,11 +31,17 @@
 //!   atomic-direct. A rapid programmatic `stop(); start()` can therefore net
 //!   out *stopped* when the queued `Stop` drains after the direct start.
 //!   Unreachable at GUI timescales, but real at bus-driven rates — which is
-//!   exactly stria's mode. stria **respects the contract** rather than
-//!   assuming ordering: all control flows through a single owning task
-//!   ([`control_loop`]), and a running-state transition that follows a stop
-//!   waits one settle window ([`settle_after_stop`], ≥ one block period) so the
-//!   queued `Stop` has certainly drained before the direct `start`.
+//!   exactly stria's mode. And the drain is *device-buffer paced*, not block
+//!   paced: queued commands drain only inside the cpal callback
+//!   (`process_commands` runs from `write_output_f32`), which fires at the
+//!   device buffer period — commonly 256–4096 frames (~5–85 ms) on CoreAudio
+//!   since the stream uses the default buffer size. No fixed time budget is
+//!   safe. stria therefore **respects the contract timing-free**: all control
+//!   flows through a single owning task ([`control_loop`]), and a resume that
+//!   follows a still-pending stop polls the engine's liveness flag until the
+//!   `Stop` has *observably* drained (`is_active()` reads false) before the
+//!   atomic-direct `start` — bounded by [`STOP_DRAIN_TIMEOUT`], after which it
+//!   starts anyway and logs (a full command ring is the only way there).
 //!
 //! - **No re-entrant borrows.** The AV-A1 panel held a `borrow_mut()` across
 //!   its user callback (safe there, a hazard for any copy). stria sidesteps the
@@ -57,7 +63,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use bandy::{BandyMember, SMessage, Synapse};
-use resonance::{AudioEngine, BLOCK_SIZE, ResonanceMeter, create_test_graph};
+use resonance::{AudioEngine, ResonanceHandle, ResonanceMeter, create_test_graph};
 use tokio::sync::{broadcast, mpsc};
 
 /// The test graph's node layout (see `resonance::create_test_graph`):
@@ -71,9 +77,21 @@ pub const LEVEL_BEAT: Duration = Duration::from_millis(33);
 
 /// How many consecutive desired-but-inactive cadence ticks before stria
 /// concludes the device is gone and says so (once). At [`LEVEL_BEAT`] this is
-/// ~0.25 s — long enough to ride out a stop/start settle, short enough to
-/// notice a dead device promptly.
+/// ~0.25 s — longer than [`STOP_DRAIN_TIMEOUT`], so even the timeout path of a
+/// resume cannot masquerade as a device death; short enough to notice a dead
+/// device promptly.
 const DEATH_GRACE_TICKS: u32 = 8;
+
+/// Upper bound on waiting for a queued `Stop` to observably drain before an
+/// atomic-direct `start`. Queued commands drain at the *device buffer* period
+/// (commonly ~5–85 ms on CoreAudio); 200 ms covers any sane buffer with room
+/// to spare. Hitting it means the callback never drained (full ring or dead
+/// device) — we start anyway and log.
+pub const STOP_DRAIN_TIMEOUT: Duration = Duration::from_millis(200);
+
+/// How often the resume path re-checks the liveness flag while waiting for a
+/// pending `Stop` to drain.
+const DRAIN_POLL: Duration = Duration::from_millis(2);
 
 // ---------------------------------------------------------------------------
 // THE BUS FACE — a real BandyMember (no longer a println stub)
@@ -140,16 +158,39 @@ pub enum StriaControl {
 // PURE LOGIC — unit-tested without a device
 // ---------------------------------------------------------------------------
 
-/// The settle a `start` must wait when it follows a `stop`, so the queued
-/// `Stop` has drained before the atomic-direct `start` (the ordering contract).
-///
-/// One block is `BLOCK_SIZE / sample_rate` seconds; we wait two block periods
-/// plus a 1 ms scheduling margin. A zero/absurd rate falls back to 48 kHz so
-/// this never divides by zero or returns a runaway delay.
-pub fn settle_after_stop(sample_rate: u32) -> Duration {
-    let rate = if sample_rate == 0 { 48_000 } else { sample_rate };
-    let block_secs = BLOCK_SIZE as f64 / rate as f64;
-    Duration::from_secs_f64(block_secs * 2.0) + Duration::from_millis(1)
+/// The engine-control face the control task drives. `resonance::ResonanceHandle`
+/// is the real implementor; tests substitute a mock whose command drain is
+/// arbitrarily delayed, so the ordering guarantee is asserted against the REAL
+/// hazard (drain paced by the device buffer, not by any time constant).
+pub trait EngineControl {
+    /// Queue a master-frequency change. False if the command ring is full.
+    fn set_frequency(&mut self, hz: f64) -> bool;
+    /// Queue an arbitrary node-parameter change. False if the ring is full.
+    fn set_param(&mut self, node: usize, param: usize, value: f64) -> bool;
+    /// Queue a stop (drains at the audio callback). False if the ring is full.
+    fn stop(&mut self) -> bool;
+    /// Atomic-direct resume.
+    fn start(&mut self);
+    /// The shared liveness flag: false once a queued `Stop` has drained.
+    fn is_active(&self) -> bool;
+}
+
+impl EngineControl for ResonanceHandle {
+    fn set_frequency(&mut self, hz: f64) -> bool {
+        ResonanceHandle::set_frequency(self, hz)
+    }
+    fn set_param(&mut self, node: usize, param: usize, value: f64) -> bool {
+        ResonanceHandle::set_param(self, node, param, value)
+    }
+    fn stop(&mut self) -> bool {
+        ResonanceHandle::stop(self)
+    }
+    fn start(&mut self) {
+        ResonanceHandle::start(self)
+    }
+    fn is_active(&self) -> bool {
+        ResonanceHandle::is_active(self)
+    }
 }
 
 /// The level to publish this tick. When the engine is not active — user-stopped
@@ -237,12 +278,7 @@ impl StriaHandler {
 
         // Control task: the sole owner of the ResonanceHandle. No shared
         // mutability, no re-entrant borrows.
-        tokio::spawn(control_loop(
-            handle,
-            control_rx,
-            desired.clone(),
-            settle_after_stop(sample_rate),
-        ));
+        tokio::spawn(control_loop(handle, control_rx, desired.clone()));
 
         // Level cadence: meter -> Synapse, gating level on liveness.
         let bus = StriaBus::new(synapse);
@@ -293,17 +329,20 @@ impl Drop for StriaHandler {
     }
 }
 
-/// The single owner of the [`resonance::ResonanceHandle`]: applies control
-/// intents in arrival order, settling a resume that follows a stop so the
-/// queued `Stop` cannot clobber the direct `start` (the ordering contract).
-async fn control_loop(
-    mut handle: resonance::ResonanceHandle,
+/// The single owner of the engine handle: applies control intents in arrival
+/// order. A resume that follows a still-pending stop waits — timing-free —
+/// until the queued `Stop` has *observably* drained (the liveness flag reads
+/// false) before the atomic-direct `start`, so the late-draining `Stop` cannot
+/// clobber the resume (the ordering contract). The wait is bounded by
+/// [`STOP_DRAIN_TIMEOUT`]; on timeout it starts anyway and logs.
+async fn control_loop<E: EngineControl>(
+    mut handle: E,
     mut rx: mpsc::UnboundedReceiver<StriaControl>,
     desired: Arc<AtomicBool>,
-    settle: Duration,
 ) {
-    // When the last stop happened, so a following start can settle against it.
-    let mut last_stop: Option<tokio::time::Instant> = None;
+    // True while a Stop we successfully queued may still be in flight
+    // (i.e. not yet observed as drained).
+    let mut stop_pending = false;
 
     while let Some(ctrl) = rx.recv().await {
         match ctrl {
@@ -318,23 +357,35 @@ async fn control_loop(
                 }
             }
             StriaControl::Running(true) => {
-                // Respect the contract: if a stop is still possibly in flight,
-                // let it drain before the atomic-direct start.
-                if let Some(t) = last_stop.take() {
-                    let elapsed = t.elapsed();
-                    if elapsed < settle {
-                        tokio::time::sleep(settle - elapsed).await;
+                // Respect the contract: if our Stop may still be queued, wait
+                // for PROOF it drained (liveness flips false) before the
+                // atomic-direct start. Drain pace is the device buffer period,
+                // so no fixed sleep is correct — poll the flag instead.
+                if stop_pending {
+                    let deadline = tokio::time::Instant::now() + STOP_DRAIN_TIMEOUT;
+                    while handle.is_active() {
+                        if tokio::time::Instant::now() >= deadline {
+                            log::warn!(
+                                "[STRIA] :: queued Stop never drained within {:?}; \
+                                 starting anyway (full ring or dead device?)",
+                                STOP_DRAIN_TIMEOUT
+                            );
+                            break;
+                        }
+                        tokio::time::sleep(DRAIN_POLL).await;
                     }
+                    stop_pending = false;
                 }
                 handle.start();
                 desired.store(true, Ordering::Release);
             }
             StriaControl::Running(false) => {
-                if !handle.stop() {
+                if handle.stop() {
+                    stop_pending = true;
+                } else {
                     log::warn!("[STRIA] :: command queue full (stop)");
                 }
                 desired.store(false, Ordering::Release);
-                last_stop = Some(tokio::time::Instant::now());
             }
         }
     }
@@ -383,20 +434,145 @@ async fn level_loop(
 mod tests {
     use super::*;
 
-    #[test]
-    fn settle_covers_at_least_one_block_and_never_divides_by_zero() {
-        // 48 kHz: one block is 64/48000 ≈ 1.333 ms; settle is ~2 blocks + 1 ms.
-        let s48 = settle_after_stop(48_000);
-        let block = Duration::from_secs_f64(BLOCK_SIZE as f64 / 48_000.0);
-        assert!(s48 > block, "settle must exceed one block period");
-        assert!(s48 < Duration::from_millis(10), "settle should stay small");
+    /// A mock engine whose command drain is ARBITRARILY delayed — the real
+    /// hazard: queued commands drain at the device-buffer period (~5–85 ms),
+    /// not at any block-derived constant. `stop()` only queues; the "callback"
+    /// drains it after `drain_after` further `is_active` polls, flipping the
+    /// shared flag false exactly then — later than any fixed settle window
+    /// would have waited.
+    #[derive(Default)]
+    struct MockEngine {
+        active: bool,
+        queued_stop: bool,
+        /// How many `is_active` polls before a queued Stop drains.
+        drain_after: u32,
+        polls: u32,
+        /// Ordered trace of externally visible transitions.
+        trace: Vec<&'static str>,
+    }
 
-        // A zero rate must fall back, not panic or blow up.
-        let s0 = settle_after_stop(0);
-        assert_eq!(s0, s48, "zero rate falls back to 48 kHz");
+    struct MockHandle(std::rc::Rc<std::cell::RefCell<MockEngine>>);
 
-        // Lower rate => longer block => longer settle.
-        assert!(settle_after_stop(44_100) > s48);
+    impl EngineControl for MockHandle {
+        fn set_frequency(&mut self, _hz: f64) -> bool {
+            true
+        }
+        fn set_param(&mut self, _n: usize, _p: usize, _v: f64) -> bool {
+            true
+        }
+        fn stop(&mut self) -> bool {
+            let mut e = self.0.borrow_mut();
+            e.queued_stop = true;
+            e.polls = 0;
+            e.trace.push("stop_queued");
+            true
+        }
+        fn start(&mut self) {
+            let mut e = self.0.borrow_mut();
+            e.active = true;
+            e.trace.push("start");
+        }
+        fn is_active(&self) -> bool {
+            let mut e = self.0.borrow_mut();
+            // Simulate the device-paced callback: the queued Stop drains only
+            // after `drain_after` polls have elapsed.
+            if e.queued_stop {
+                e.polls += 1;
+                if e.polls >= e.drain_after {
+                    e.queued_stop = false;
+                    e.active = false;
+                    e.trace.push("stop_drained");
+                }
+            }
+            e.active
+        }
+    }
+
+    /// THE ordering invariant (AV-A1 note 1, seat must-fix): a rapid
+    /// `stop(); start()` must net RUNNING even when the queued Stop drains
+    /// far later than any block-derived settle window — the control loop must
+    /// wait for OBSERVED drain, not a timed guess.
+    #[tokio::test]
+    async fn stop_then_start_nets_running_despite_delayed_drain() {
+        let engine = std::rc::Rc::new(std::cell::RefCell::new(MockEngine {
+            active: true,
+            drain_after: 25, // drains only after 25 liveness polls (~50 ms real time)
+            ..Default::default()
+        }));
+        let desired = Arc::new(AtomicBool::new(true));
+        let (tx, rx) = mpsc::unbounded_channel();
+
+        // Rapid programmatic stop();start() — the bus-rate pattern.
+        tx.send(StriaControl::Running(false)).unwrap();
+        tx.send(StriaControl::Running(true)).unwrap();
+        drop(tx); // loop exits after processing both
+
+        // control_loop is !Send with MockHandle (Rc) — run it on a LocalSet.
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(control_loop(
+                MockHandle(engine.clone()),
+                rx,
+                desired.clone(),
+            ))
+            .await;
+
+        let e = engine.borrow();
+        assert!(
+            e.active,
+            "stop();start() must net RUNNING — the late Stop must not clobber the start"
+        );
+        assert!(!e.queued_stop, "no Stop may remain in flight after the resume");
+        assert_eq!(
+            e.trace.last().copied(),
+            Some("start"),
+            "start must be issued AFTER the observed drain, not before: {:?}",
+            e.trace
+        );
+        assert!(
+            e.trace.contains(&"stop_drained"),
+            "the queued Stop must have observably drained before start: {:?}",
+            e.trace
+        );
+        assert!(desired.load(Ordering::Acquire), "desired must end true");
+    }
+
+    /// The timeout path: a Stop that NEVER drains (full ring / dead device)
+    /// must not wedge the control loop — after STOP_DRAIN_TIMEOUT the resume
+    /// proceeds anyway.
+    #[tokio::test(start_paused = true)]
+    async fn resume_times_out_if_the_stop_never_drains() {
+        let engine = std::rc::Rc::new(std::cell::RefCell::new(MockEngine {
+            active: true,
+            drain_after: u32::MAX, // never drains
+            ..Default::default()
+        }));
+        let desired = Arc::new(AtomicBool::new(true));
+        let (tx, rx) = mpsc::unbounded_channel();
+
+        tx.send(StriaControl::Running(false)).unwrap();
+        tx.send(StriaControl::Running(true)).unwrap();
+        drop(tx);
+
+        // Paused tokio time auto-advances through the poll sleeps, so this
+        // completes instantly in wall-clock terms while still exercising the
+        // full STOP_DRAIN_TIMEOUT deadline logic.
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(control_loop(
+                MockHandle(engine.clone()),
+                rx,
+                desired.clone(),
+            ))
+            .await;
+
+        let e = engine.borrow();
+        assert_eq!(
+            e.trace.last().copied(),
+            Some("start"),
+            "the loop must not wedge: start proceeds after timeout"
+        );
+        assert!(desired.load(Ordering::Acquire));
     }
 
     #[test]

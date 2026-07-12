@@ -49,13 +49,19 @@ only writes an atomic, and the cadence task turns that into bus traffic.
 
 ## Design notes (carried from the AV-A1 review)
 
-- **Stop/start ordering contract.** `ResonanceHandle::stop()` is queue-routed
-  (drains at the next block boundary); `start()` is atomic-direct. A rapid
-  `stop(); start()` can net out *stopped* when the queued `Stop` drains after
-  the direct start — unreachable at GUI timescales, real at bus rates. stria
-  **respects** the contract: all control flows through one owning task, and a
-  resume that follows a stop waits one settle window (`settle_after_stop`, ≥ one
-  block period) so the `Stop` has drained before the direct `start`.
+- **Stop/start ordering contract.** `ResonanceHandle::stop()` is queue-routed;
+  `start()` is atomic-direct. A rapid `stop(); start()` can net out *stopped*
+  when the queued `Stop` drains after the direct start — unreachable at GUI
+  timescales, real at bus rates. And the drain is *device-buffer paced*, not
+  block paced: queued commands drain only inside the cpal callback, which fires
+  at the device buffer period (commonly ~5–85 ms on CoreAudio), so no fixed time
+  budget is safe. stria **respects** the contract timing-free: all control flows
+  through one owning task, and a resume that follows a still-pending stop polls
+  the engine's liveness flag until the `Stop` has *observably* drained
+  (`is_active()` reads false) before the direct `start`, bounded by
+  `STOP_DRAIN_TIMEOUT` (200 ms — then start anyway and log; only a full command
+  ring or a dead device gets there). The invariant is unit-tested against a mock
+  engine whose drain is arbitrarily delayed (the `EngineControl` seam).
 - **No re-entrant borrows.** The `ResonanceHandle` has exactly one owner (the
   control task), reached only by message — nothing borrows it across a call, so
   the AV-A1 panel's `borrow_mut()`-across-callback hazard cannot arise here.
@@ -64,9 +70,10 @@ only writes an atomic, and the cadence task turns that into bus traffic.
   stops, peak atomic goes stale) still reports a truthful zero, and a persistent
   desired-but-inactive condition is surfaced once (`DeathWatch`).
 
-Pure logic (`settle_after_stop`, `governed_level`, `level_beat`, `DeathWatch`)
-and the live bus face (`StriaBus`) are unit-tested host-side with no audio
-device required (`cargo test -p stria`).
+Pure logic (`governed_level`, `level_beat`, `DeathWatch`), the ordering
+invariant (via a mock `EngineControl` with delayed drain), and the live bus face
+(`StriaBus`) are unit-tested host-side with no audio device required
+(`cargo test -p stria`).
 
 ## Status
 
