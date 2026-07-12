@@ -2236,6 +2236,77 @@ target `-EEXIST`). ⚠ Verify the serial bridge captures a full boot BEFORE burn
 host capture failed mid-bench (see §JB1f). Repeated `cp -r`/`rmdir` cycles accumulate `0xE5` tombstone slots
 across boots (the FATDIRS cleanup leaves them; harmless — a card re-prep clears them).
 
+### JD10 — moving & renaming: panel `mv` (🔬 QEMU-green, metal attended-pending)
+
+`mv` is the last classic file-manager verb, and JD10 closes the set: navigate (JD4), write (JD5/JD6),
+shape (JD7), copy (JD8/JD9), **move/rename** (JD10). Unlike `cp -r`, a move is **O(1) by reference** — the
+file's data never moves; only its directory entry is relinked. JD10 consumes the pi4-lane **FATMOVE** seam
+(`rename_entry`/`move_entry`, landed and merged with the FATDIRS/JD7 split) **call-never-edit**: `shell.rs`
+is the only file with logic, composing the seam with the JD6 path-resolution idioms
+(`resolve_path`/`resolve_write_target`/`normalize_path`) and the JD9 `is_descendant` guard. The
+`mv`/`move`/`ren`/`rename` dispatch arm routes to the new `fs_mv` handler.
+
+**Two dispatches, decided by parent.** `fs_mv` resolves `src` to a concrete entry (a ROOT source is refused
+`-EBUSY` — the volume root has no leaf to move *as*), takes its parent's first-cluster id via
+`resolve_write_target`, and decides the destination with the same `mv SRC DIR/` idiom JD8/JD9 use: an
+existing **directory** (or the root) receives the entry under the source's own leaf; anything else names the
+destination directly (rename / move-with-new-name). Then it dispatches on whether source and destination
+share a parent directory:
+- **SAME parent → `rename_entry`** (rewrites the 8.3 name in the existing directory entry in place — a single
+  dir-sector RMW). It works on **files AND directories**: an in-place rename leaves `first_cluster` untouched,
+  so a renamed directory's own `.`/`..` and its children's `..` links stay correct. **`mv DIR NEWNAME` is
+  O(1)** — one entry relink moves the whole subtree, so no `mv -r` is needed (the contrast with `cp -r`).
+- **DIFFERENT parents → `move_entry`** (publishes the destination entry over the SAME `first_cluster`, then
+  `0xE5`s the source name WITHOUT freeing the chain — the data moves by reference, no copy). **FILES only:**
+  a directory across parents would need its `..` rewritten to the new parent (out of the seam's scope), so
+  the seam returns `IsDirectory` → the shell surfaces `-EISDIR` with the honest remedy (rename it in place,
+  or `cp -r` + `rm -r`).
+
+**The guards (in order).**
+1. **Self / descendant.** If the source is a **directory**, moving it onto itself or into its own subtree is
+   refused `-EINVAL` via the JD9 `is_descendant` case-insensitive canonical-path prefix compare — the right
+   message even though `move_entry` would independently refuse a cross-parent directory move. (`mv DOCS
+   DOCS/SUB` is stopped here before any mutation.)
+2. **No-clobber `-EEXIST`.** The destination must not already exist. Rather than POSIX's silent overwrite,
+   the panel default is no-clobber (`-EEXIST`), mirroring the FATMOVE seam's own dest-exists refusal
+   shell-side. The pre-check is **skipped only when the destination IS the source** (same parent + same
+   canonical leaf, e.g. `mv FOO.TXT foo.txt`) — a rename to the source's own name, which `rename_entry`
+   treats as a no-op success (its documented same-slot contract).
+
+**Errno fidelity is shell-side** (the JD6–JD9 pattern, reusing `fat_errno` + shell-owned tags): src missing
+→ `-ENOENT`; ROOT src → `-EBUSY`; dst parent missing → `-ENOENT`; dst parent is a file → `-ENOTDIR`; dst dir
+full → `-ENOSPC`; a non-8.3 dst name → `-EINVAL`; a directory across parents → `-EISDIR`. On success the
+shell echoes `renamed /OLD.TXT -> /NEW.TXT` (same parent) or `moved /A.TXT -> /DOCS/A.TXT` (across parents),
+using the seam's returned canonical destination name.
+
+**Principal + ACL — unchanged, ACL-neutral by construction.** The shell is still EL1 ASID 0, the PUBLIC
+principal, and consults no U6/K-line `OWNED_FILES` ACL (§JD5). This matters more for `mv` than for the other
+verbs: the pi4 `OWNED_FILES` ACL keys a private file by `(dir_lba, dir_off)`, and `move_entry` writes a NEW
+slot — so an *EL0-owned* file moved from a user path would strand its owner row. But a **panel** `mv` runs as
+the PUBLIC principal (no ACL row is ever consulted or created), so it is ACL-neutral. The owner-row re-key on
+a moved owned file is a future K-line seam, ledgered in the pi4 FATMOVE `SECURITY.md` note; JD10 adds no EL0
+ACL plumbing. **Crash safety is the seam's job:** `move_entry` publishes the destination BEFORE `0xE5`ing the
+source, so a power-cut mid-move leaves a benign duplicate (two names, one chain), never a lost chain. JD10
+adds no new lock or namespace surface — it composes the F3-locked `rename_entry`/`move_entry`/`locate_in_dir`
+/`resolve_path` primitives and inherits their locking analysis unchanged.
+
+**Gate (QEMU):** `./arroyo check` + `UNAOS_TEGRA=1 ./arroyo check` green both arches; `./arroyo test-arm 22`
+→ `MISSION SUCCESS`; `UNAOS_GICV3=1 ./arroyo test-arm 40` → CAPSTONE 6/6; `UNAOS_HUBSTORAGE=1 ./arroyo test
+25` → `MISSION SUCCESS` (shared `shell.rs` guard); `esp-jetson kernel.elf` links, **108 `tegra:` strings**
+(unchanged — the `mv` strings carry no `tegra:` token; validate media by count, not size). As in JD2–JD9 the
+SHELL command path is not headless-reachable in-lane (the shell dispatches only on a keystroke, and tegra
+never runs in QEMU), so the shell-level verdict is **attended-pending**; the FATMOVE primitives `mv` composes
+are already gated headless on the pi4 side (`kernel8-test`'s `FATMOVE` witness).
+
+**Metal verdict — attended-pending.** The money-shot is the bench card
+[`jd10-bench.md`](../../../../unaos/scripts/jd10-bench.md): rename a file in place (`mv A.TXT B.TXT`), move a
+file into a directory (`mv B.TXT DOCS/`), power-cycle, and `cat` the moved file to prove it read intact
+across the cycle (this also flips FATMOVE's own metal verdict — its `move_entry` crash-ordering runs on
+silicon for the first time), then rename a directory in place (`mv DOCS NOTES`, O(1) subtree move) and the
+guard/error probes (self-into-descendant `-EINVAL`, cross-parent dir move `-EISDIR`, missing source
+`-ENOENT`, pre-existing target `-EEXIST`). ⚠ Verify the serial bridge captures a full boot BEFORE burning
+bench time — the round-6/8 host capture failed mid-bench (see §JB1f).
+
 ### JB1f — the unhealed early-vector window (the round-6 boot crash), closed (`85f74f8`)
 
 **The evidence (2026-07-11 attended bench, real Orin).** Kernel `446abd3` (the JD6 tip): 2/2 boots
