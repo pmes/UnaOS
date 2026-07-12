@@ -2651,9 +2651,14 @@ fn sys_recvfrom(handle: u64, buf_ptr: u64, buf_len: u64) -> i64 {
     if buf_len < 8 {
         return EINVAL;
     }
+    // F1: recvfrom is a WRITE path (it stores the source header + payload into `buf_ptr`), so the dest
+    // must be WRITABLE user memory — inside the window AND past the read-only code page (page 0 is
+    // ring3-RX/RO; a kernel store there would fault under CR0.WP or corrupt W^X code). Lower bound is
+    // `USER_BASE + PAGE_SIZE`, matching `sys_read`'s write bound — NOT `sys_write`/`sys_sendto`'s
+    // read-source `< USER_BASE` (those legitimately read the RO code page).
     let window = USER_WINDOW_PAGES * PAGE_SIZE;
     let end = buf_ptr.wrapping_add(buf_len);
-    if end < buf_ptr || buf_ptr < USER_BASE || end > USER_BASE + window {
+    if end < buf_ptr || buf_ptr < USER_BASE + PAGE_SIZE || end > USER_BASE + window {
         return EFAULT;
     }
     let cap = ((buf_len - 8) as usize).min(crate::smolnet::UDP_MAX_PAYLOAD);
