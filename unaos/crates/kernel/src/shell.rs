@@ -709,6 +709,105 @@ fn fs_cp_recursive(console: &mut Console, src: &str, dst: &str) {
     }
 }
 
+/// JD10 `mv <src> <dst>` (aliases `move`/`ren`/`rename`): move OR rename a file or directory by
+/// RELINKING its directory entry — the file's data never moves (O(1), by reference), composing the
+/// FATMOVE `rename_entry`/`move_entry` seam with the JD6 path-resolution idioms (call-never-edit; no
+/// fat.rs mutation of our own). Two dispatches, decided by whether source and destination share a
+/// parent directory:
+///   * SAME parent → `rename_entry` (rewrites the 8.3 name in the existing directory entry in place;
+///     works on files AND directories — an in-place rename leaves `first_cluster` untouched, so a
+///     renamed directory's own `.`/`..` and its children's `..` stay correct: `mv DIR NEWNAME` is
+///     O(1), no `mv -r` needed unlike `cp -r`);
+///   * DIFFERENT parents → `move_entry` (re-publishes the entry over the SAME `first_cluster` in the
+///     new parent, then `0xE5`s the old name WITHOUT freeing the chain — the data moves by reference).
+///     FILES only: a directory across parents needs its `..` rewritten to the new parent (out of the
+///     seam's scope) → honest `-EISDIR` (rename it in place, or `cp -r` + `rm -r`).
+/// The `mv SRC DIR/` idiom lands the entry under DIR as the source's own leaf name; otherwise DST
+/// names the target directly (rename / move-with-new-name). Guards, in order: a DIRECTORY moved onto
+/// itself or into its own subtree is refused (`-EINVAL`, the JD9 `is_descendant` canonical-prefix
+/// compare); the destination must not already exist (no-clobber panel default → `-EEXIST`, mirroring
+/// the FATMOVE seam's own dest-exists refusal shell-side) — EXCEPT a rename to the source's own
+/// canonical name (same parent + same leaf), which the seam treats as a no-op success. Honest errno
+/// surface: src missing → `-ENOENT`; root as src → `-EBUSY`; dst parent missing → `-ENOENT`; dst
+/// parent is a file → `-ENOTDIR`; dst dir full → `-ENOSPC`; a non-8.3 dst name → `-EINVAL`; a
+/// directory across parents → `-EISDIR`.
+///
+/// ACL NOTE: this shell is EL1 ASID 0 = the PUBLIC principal, so a panel `mv` consults no U6/K-line
+/// `OWNED_FILES` ACL and is ACL-neutral by construction (the row re-key for a moved EL0-owned file is
+/// a future K-line seam, ledgered in the pi4 FATMOVE SECURITY note). CRASH SAFETY is the seam's job:
+/// `move_entry` publishes the destination BEFORE `0xE5`ing the source, so a power-cut mid-move leaves
+/// a benign duplicate (two names, one chain), never a lost chain.
+fn fs_mv(console: &mut Console, src: &str, dst: &str) {
+    let fs = match crate::fs::fat::mount() {
+        Ok(fs) => fs,
+        Err(e) => return console.println(&alloc::format!("mv: no FAT filesystem ({:?})", e)),
+    };
+    // --- Resolve the SOURCE to a concrete entry (file or dir). The volume root has no leaf name to
+    //     move AS, so it is refused. ---
+    let src_norm = normalize_path(&cwd_path(), src);
+    let (de_src, src_canon) = match resolve_path(&fs, &src_norm) {
+        Ok(Resolved::Root) => return console.println("mv: /: cannot move the volume root (-EBUSY)"),
+        Ok(Resolved::Entry(de, canon)) => (de, canon),
+        Err(msg) => return console.println(&alloc::format!("mv: {}", msg)),
+    };
+    // The source's parent directory (first-cluster id; 0 ⇒ root). Since SRC exists, its parent walk
+    // succeeds; the returned leaf is the user-typed spelling — we use the canonical `de_src.name()`.
+    let (src_parent, _src_leaf_typed, _src_parent_canon) = match resolve_write_target(&fs, &src_norm) {
+        Ok(t) => t,
+        Err(msg) => return console.println(&alloc::format!("mv: {}", msg)),
+    };
+    let src_leaf = de_src.name(); // the canonical on-disk 8.3 leaf
+    // --- Decide the DESTINATION (the `mv SRC DIR/` idiom): an existing directory (or the root)
+    //     receives the entry under the source's own leaf; anything else names the destination itself. ---
+    let dst_norm = normalize_path(&cwd_path(), dst);
+    let dst_final = match resolve_path(&fs, &dst_norm) {
+        Ok(Resolved::Root) => normalize_path("/", src_leaf), // into the volume root
+        Ok(Resolved::Entry(ref de, _)) if de.is_dir => normalize_path(&dst_norm, src_leaf), // into a dir
+        _ => dst_norm.clone(), // an existing file (→ -EEXIST below) or a new name — validated next
+    };
+    let (dparent, dleaf, dcanon) = match resolve_write_target(&fs, &dst_final) {
+        Ok(t) => t,
+        Err(msg) => return console.println(&alloc::format!("mv: {}", msg)),
+    };
+    let dest_disp = joined(&dcanon, &dleaf);
+    // --- Guard: refuse moving a DIRECTORY onto itself or into its own subtree (the JD9 prefix compare;
+    //     also the right message before the seam would otherwise refuse a cross-parent dir move). ---
+    if de_src.is_dir && (dest_disp.eq_ignore_ascii_case(&src_canon) || is_descendant(&dest_disp, &src_canon)) {
+        return console.println(&alloc::format!(
+            "mv: cannot move directory {} into itself or its own subtree ({}) (-EINVAL)",
+            src_canon, dest_disp));
+    }
+    // --- Dest pre-check (no-clobber). Skip it only when the destination IS the source (same parent +
+    //     same canonical leaf) — a rename to the same name, which `rename_entry` treats as a no-op. ---
+    let same_target = src_parent == dparent && dleaf.eq_ignore_ascii_case(src_leaf);
+    if !same_target {
+        match fs.locate_in_dir(dparent, &dleaf) {
+            Ok((de, _, _)) => return console.println(&alloc::format!(
+                "mv: {}: file exists (-EEXIST)", joined(&dcanon, de.name()))),
+            Err(FatError::NotFound) => {}
+            Err(e) => return console.println(&alloc::format!(
+                "mv: {}: {} ({:?})", dest_disp, fat_errno(e), e)),
+        }
+    }
+    // --- Dispatch by parent: same dir → rename in place (files AND dirs); across dirs → move (files
+    //     only — the seam refuses a directory source with IsDirectory). Both are O(1) entry relinks. ---
+    let (verb, result) = if src_parent == dparent {
+        ("renamed", fs.rename_entry(src_parent, src_leaf, &dleaf))
+    } else {
+        ("moved", fs.move_entry(src_parent, src_leaf, dparent, &dleaf))
+    };
+    match result {
+        Ok((de, _, _)) => console.println(&alloc::format!(
+            "{} {} -> {}", verb, src_canon, joined(&dcanon, de.name()))),
+        // move_entry returns IsDirectory when the SOURCE is a directory crossing parents.
+        Err(FatError::IsDirectory) => console.println(&alloc::format!(
+            "mv: {}: cannot move a directory across directories (-EISDIR); rename it in place or use cp -r + rm -r",
+            src_canon)),
+        Err(e) => console.println(&alloc::format!(
+            "mv: {}: {} ({:?})", dest_disp, fat_errno(e), e)),
+    }
+}
+
 /// Print one directory's entries in the `ls` table format, with the file/dir tally.
 fn print_dir_listing(console: &mut Console, entries: &[DirEntry]) {
     let (mut files, mut dirs) = (0u32, 0u32);
@@ -769,7 +868,8 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
             console.println("DIRS:     mkdir <path>, rmdir <path>  (create / remove empty directories)");
             console.println("COPY:     cp <src> <dst>  (copy a file; cp FILE DIR/ lands as DIR/<leaf>)");
             console.println("          cp -r <srcdir> <dst>  (recursively copy a directory tree)");
-            console.println("          (create/edit/delete/copy files & dirs anywhere in the tree; sync = write-through, durable)");
+            console.println("MOVE:     mv <src> <dst>  (move/rename a file or dir, O(1); mv SRC DIR/ lands as DIR/<leaf>)");
+            console.println("          (create/edit/delete/copy/move files & dirs anywhere in the tree; sync = write-through, durable)");
             console.println("SMP:      sched (per-CPU run queues), pulse (full-screen CPU monitor)");
             console.println("TEST:     tste (in-OS self-test suite: boot-replay + live checks)");
             console.println("NETWORK:  netinfo, ping <ip> [count], arp <ip>");
@@ -949,6 +1049,16 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
                 (Some(src), Some(dst)) if recursive => fs_cp_recursive(console, src, dst),
                 (Some(src), Some(dst)) => fs_cp(console, src, dst),
                 _ => console.println("usage: cp [-r] <src> <dst>"),
+            }
+        },
+        "mv" | "move" | "ren" | "rename" => {
+            // JD10: move OR rename a file or directory by relinking one directory entry (O(1), by
+            // reference — no data copy, so `mv DIR NEWNAME` needs no `-r`). Same parent → rename in
+            // place (files AND dirs); across parents → move (files only, a dir there is -EISDIR). The
+            // `mv SRC DIR/` idiom lands the entry under DIR as the source leaf. `mv <src> <dst>`.
+            match (args.first(), args.get(1)) {
+                (Some(src), Some(dst)) => fs_mv(console, src, dst),
+                _ => console.println("usage: mv <src> <dst>"),
             }
         },
         "sync" => {

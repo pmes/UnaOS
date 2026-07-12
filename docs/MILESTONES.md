@@ -10,6 +10,51 @@ Legend: **✅ metal-confirmed** · **🔬 QEMU-green, metal pending** · dates I
 
 ---
 
+## hw-jetson track — 2026-07-12 (JD10 — the panel moves & renames: `mv`)
+
+### JD10 — `mv <src> <dst>` on the Orin panel shell (move/rename by relinking one entry, no new fat.rs) 🔬 `hw-jetson`
+- **What (`shell.rs` only):** a new `mv`/`move`/`ren`/`rename` dispatch arm routes to `fs_mv`, the last classic
+  file-manager verb. It closes the set — navigate (JD4), write (JD5/JD6), shape (JD7), copy (JD8/JD9),
+  **move/rename (JD10)**. Unlike `cp -r`, a move is **O(1) by reference**: the file's data never moves, only its
+  directory entry is relinked. JD10 consumes the pi4-lane **FATMOVE** seam (`rename_entry`/`move_entry`)
+  **call-never-edit** (the FATDIRS/JD7 split), composing it with the JD6 path idioms and the JD9 `is_descendant`
+  guard — **NO `fat.rs` logic of its own**.
+- **Two dispatches, by parent:** resolve `src` (a ROOT source is `-EBUSY` — no leaf to move AS); decide the
+  destination with the `mv SRC DIR/` idiom (an existing directory receives the entry under the source's leaf;
+  else DST names it directly). **SAME parent → `rename_entry`** (rewrites the 8.3 name in place; works on files
+  AND dirs — an in-place rename leaves `first_cluster`/`.`/`..` correct, so `mv DIR NEWNAME` moves a whole
+  subtree with ONE relink, O(1), no `mv -r` needed). **DIFFERENT parents → `move_entry`** (re-publishes the
+  entry over the SAME `first_cluster`, then `0xE5`s the old name WITHOUT freeing the chain). Files only — a
+  directory across parents needs its `..` rewritten (seam scope) → the seam returns `IsDirectory` → shell
+  surfaces `-EISDIR` with the honest remedy.
+- **Guards (in order):** (1) if the source is a directory, moving it onto itself or into its own subtree is
+  `-EINVAL` (the JD9 `is_descendant` canonical-prefix compare); (2) no-clobber `-EEXIST` — the destination must
+  not already exist (mirrors the FATMOVE seam's own dest-exists refusal), EXCEPT when the destination IS the
+  source (same parent + same canonical leaf, e.g. `mv FOO.TXT foo.txt`), which `rename_entry` treats as a no-op
+  success (its documented same-slot contract).
+- **Errno fidelity is shell-side** (the JD6–JD9 pattern): src missing → `-ENOENT`; ROOT src → `-EBUSY`; dst
+  parent missing → `-ENOENT`; dst parent is a file → `-ENOTDIR`; dst dir full → `-ENOSPC`; a non-8.3 dst name →
+  `-EINVAL`; a directory across parents → `-EISDIR`. On success it echoes `renamed /OLD -> /NEW` (same parent)
+  or `moved /A -> /DOCS/A` (across parents), using the seam's returned canonical name.
+- **Principal — unchanged, ACL-neutral by construction** (EL1 ASID 0, PUBLIC): a panel `mv` consults no U6
+  `OWNED_FILES` ACL. This matters more here — `move_entry` writes a NEW `(dir_lba, dir_off)` slot, so an
+  *EL0-owned* file moved from a user path would strand its owner row; but the shell runs as PUBLIC (no ACL row
+  consulted or created), so it is ACL-neutral. The owner-row re-key is a future K-line seam (ledgered in the pi4
+  FATMOVE `SECURITY.md` note). Crash safety is the seam's job (destination published before the source `0xE5`)
+  → a power-cut mid-move leaves a benign duplicate, never a lost chain. No new lock/namespace surface.
+- **Tested (QEMU):** `check` + `UNAOS_TEGRA=1 check` green both arches; `test-arm 22` MISSION;
+  `UNAOS_GICV3=1 test-arm 40` CAPSTONE 6/6; `UNAOS_HUBSTORAGE=1 test 25` MISSION (shared `shell.rs` guard);
+  `esp-jetson` links, **108 `tegra:` strings** (unchanged — `mv` strings carry no `tegra:` token). Zero x86
+  behavioural change (`shell.rs` compiles both arches; the handler dispatches only on a keystroke). No
+  `kernel8-test` on the jetson side — the FATMOVE primitives are gated headless on the pi4 side.
+- **Metal:** attended-pending — the money-shot bench card [`jd10-bench.md`](../unaos/scripts/jd10-bench.md)
+  (`mv A.TXT B.TXT` rename → `mv B.TXT DOCS/` move → power-cycle → `cat` survives → directory rename `mv DOCS
+  NOTES` → the guards). This also flips FATMOVE's own metal verdict (its `move_entry` crash-ordering runs on
+  silicon for the first time). ⚠ Verify the serial bridge captures a full boot first (round-6/8 host capture
+  failed mid-bench, §JB1f).
+- **Detail:** [`arch_arm64.md` §JD10](dev/OS/01_BOOT_HAL/arch_arm64.md). **Commit:** on `hw-jetson` (the
+  seat assigns the integration hash at merge).
+
 ## hw-jetson track — 2026-07-12 (JD9 — the panel copies trees: `cp -r`)
 
 ### JD9 — `cp -r <srcdir> <dst>` on the Orin panel shell (recursive copy, compose only, no new fat.rs) 🔬 `hw-jetson`
