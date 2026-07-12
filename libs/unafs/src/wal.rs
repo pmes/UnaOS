@@ -15,6 +15,8 @@
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 use crate::storage::{BLOCK_SIZE, BlockDevice, Error as StorageError};
+use alloc::collections::BTreeSet;
+use alloc::string::String;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -56,7 +58,7 @@ pub enum JournalError {
     #[error("Storage error: {0}")]
     Storage(#[from] StorageError),
     #[error("Serialization error: {0}")]
-    Serialization(#[from] bincode::Error),
+    Serialization(#[from] crate::codec::CodecError),
     #[error("Journal full")]
     JournalFull,
 }
@@ -102,7 +104,7 @@ impl Journal {
     /// Returns true if the FS was dirty (unclosed transaction found).
     pub fn check_recovery<D: BlockDevice>(&mut self, device: &mut D) -> Result<bool, JournalError> {
         let mut offset = 0;
-        let mut open_ops = std::collections::HashSet::new(); // Tracks op_ids
+        let mut open_ops = BTreeSet::new(); // Tracks op_ids
         // For Create/Write ops without explicit ID in Begin, we need a way to track pairing.
         // But `BeginCreate` doesn't have an ID yet. `EndCreate` has the new ID.
         // Wait, if we crash during Create, we might have allocated the ID but not finished.
@@ -151,7 +153,7 @@ impl Journal {
             }
 
             let data = &block[offset_in_block + 8..offset_in_block + 8 + (len as usize)];
-            if let Ok(op) = bincode::deserialize::<JournalOp>(data) {
+            if let Ok(op) = crate::codec::deserialize::<JournalOp>(data) {
                 match op {
                     JournalOp::BeginOp { op_id, .. } => {
                         open_ops.insert(op_id);
@@ -184,7 +186,7 @@ impl Journal {
         device: &mut D,
         op: JournalOp,
     ) -> Result<(), JournalError> {
-        let bytes = bincode::serialize(&op)?;
+        let bytes = crate::codec::serialize(&op)?;
         let len = bytes.len() as u64;
         let total_len = 8 + len; // 8 bytes for length prefix
 

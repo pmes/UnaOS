@@ -73,8 +73,45 @@ and file operations, journaled writes, inline and spilled attributes, and the
 attribute/similarity query engine all work over `FileDevice` and `MemDevice`.
 Some areas are early-stage: journal recovery currently detects and reports a
 dirty mount rather than rolling transactions back, and the attribute catalog is
-append-only. The crate runs as an ordinary host process today and is intended to
-converge onto the UnaOS kernel as it matures.
+append-only. The crate runs as an ordinary host process today and is converging
+onto the UnaOS kernel: the **`no_std` core port (BeFS-K1) has landed** (see
+below).
+
+## no_std and the feature matrix
+
+The crate is `#![no_std]` + `alloc` by construction, with a single default-on
+`std` feature that re-enables the host-native surface. Downstream consumers get
+`std` by default and build unchanged; the kernel adapter (a later arc) will
+depend on it with `default-features = false`.
+
+| Surface | `std` (default) | `no_std` (`--no-default-features`) |
+| :--- | :---: | :---: |
+| On-disk types (`Superblock`, `Inode`, `Extent`, `AttributeValue`, `FileKind`, `DirEntry`, `CatalogEntry`, `JournalOp`) | ✅ | ✅ |
+| `codec` (bincode 2.x `legacy()` serialization seam) | ✅ | ✅ |
+| `BlockDevice` trait + `MemDevice` | ✅ | ✅ |
+| `UnaFS` core ops (`format`/`mount`/`read`/`write`/`ls`/`mkdir`/`set_attribute`/`get_attribute`) | ✅ | ✅ |
+| `FileDevice` (host file backend) | ✅ | — |
+| `io::MappedFile` (memmap reader) | ✅ | — |
+| `query` engine + `cosine_similarity` (needs FP `sqrt`, absent in `core`) | ✅ | — |
+| bandy `BandyMember` events on attribute change | ✅ | — |
+
+The `no_std` build is verified against the kernel's own bare target
+(`aarch64-unknown-none-softfloat`), where `std` is genuinely absent from the
+sysroot.
+
+## On-disk format and the KAT contract
+
+The on-disk byte layout is **frozen**. Serialization is bincode 2.x in its
+`legacy()` configuration (little-endian, fixed-int width, no length limit),
+which reproduces the historical bincode 1.3.3 encoding byte-for-byte, routed
+through the single `codec` seam so every write path agrees.
+
+`tests/kat_vectors.rs` holds golden-vector known-answer tests: every struct that
+reaches disk is serialized with representative and boundary values and asserted
+byte-for-byte against baked-in hex literals, in both directions (serialize ==
+golden, and deserialize(golden) == value). Any layout drift — a field reorder, a
+type change, a codec-config regression — fails a KAT immediately. **These vectors
+must never be edited to make a change pass; they are the format contract.**
 
 ## Direction: meeting and surpassing BeFS
 
@@ -108,7 +145,7 @@ Planned arcs (sequencing in [`docs/ROADMAP.md`](../../docs/ROADMAP.md) §2):
 | F4 | Per-attribute B+tree indexes: log-time equality, true range queries |
 | F5 | **Live queries** — delta-emitting persistent queries published over bandy (the query-driven spatial UI, now including similarity) |
 | F6–F8 | B+tree directories; metadata checksums; extent trees |
-| K1–K4 | Kernel convergence: `no_std` core → 512↔4096 block adapter + partitions → read-only kernel mount of a real volume → journaled kernel writes |
+| K1–K4 | Kernel convergence: **`no_std` core (K1, ✅ landed)** → 512↔4096 block adapter + partitions → read-only kernel mount of a real volume → journaled kernel writes |
 
 The capability model (see [`docs/SECURITY.md`](../../docs/SECURITY.md)) stores
 principals and grants as ordinary typed attributes (`owner`, `grants:*`), so

@@ -15,17 +15,25 @@
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 use crate::bitmap::SpaceMap;
-use crate::catalog::{CatalogEntry, deserialize_catalog, hash_value, serialize_catalog};
-use crate::hash::hash_bytes;
+use crate::catalog::{CatalogEntry, deserialize_catalog, serialize_catalog};
 use crate::inode::{AttributeValue, Extent, ExtentList, FileKind, Inode, InodeError};
-use crate::query::{Query, QueryOp};
 use crate::storage::{BLOCK_SIZE, BlockDevice, Error as StorageError};
 use crate::superblock::{Superblock, SuperblockError};
 use crate::wal::{Journal, JournalOp};
-use bandy::{BandyMember, SMessage};
+use alloc::collections::BTreeMap;
+use alloc::string::String;
+use alloc::vec::Vec;
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
 use thiserror::Error;
+
+#[cfg(feature = "std")]
+use crate::catalog::hash_value;
+#[cfg(feature = "std")]
+use crate::hash::hash_bytes;
+#[cfg(feature = "std")]
+use crate::query::{Query, QueryOp};
+#[cfg(feature = "std")]
+use bandy::{BandyMember, SMessage};
 
 #[derive(Error, Debug)]
 pub enum FileSystemError {
@@ -36,7 +44,7 @@ pub enum FileSystemError {
     #[error("Inode error: {0}")]
     Inode(#[from] InodeError),
     #[error("Serialization error: {0}")]
-    Serialization(#[from] bincode::Error),
+    Serialization(#[from] crate::codec::CodecError),
     #[error("No free space available")]
     NoSpace,
     #[error("Root inode missing")]
@@ -159,6 +167,7 @@ impl<D: BlockDevice> UnaFS<D> {
 
         // Check for recovery (Log only for now)
         if journal.check_recovery(&mut device)? {
+            #[cfg(feature = "std")]
             println!("[WARNING] :: DIRTY MOUNT DETECTED. TORN TRANSACTION IN JOURNAL.");
         }
 
@@ -262,7 +271,7 @@ impl<D: BlockDevice> UnaFS<D> {
 
         while data_written < data.len() {
             let block_offset = (current_offset % BLOCK_SIZE) as usize;
-            let to_write = std::cmp::min(
+            let to_write = core::cmp::min(
                 BLOCK_SIZE as usize - block_offset,
                 data.len() - data_written,
             );
@@ -361,7 +370,7 @@ impl<D: BlockDevice> UnaFS<D> {
         let mut current_offset = offset;
 
         let available = total_size.saturating_sub(offset);
-        let to_read_total = std::cmp::min(length, available);
+        let to_read_total = core::cmp::min(length, available);
 
         while read_so_far < to_read_total {
             let mut physical_block = 0;
@@ -386,7 +395,7 @@ impl<D: BlockDevice> UnaFS<D> {
             }
 
             let block_offset = (current_offset % BLOCK_SIZE) as usize;
-            let to_read = std::cmp::min(
+            let to_read = core::cmp::min(
                 BLOCK_SIZE as usize - block_offset,
                 (to_read_total - read_so_far) as usize,
             );
@@ -412,7 +421,7 @@ impl<D: BlockDevice> UnaFS<D> {
             return Ok(Vec::new());
         }
         let data = self.read_data(inode_id, 0, inode.size)?;
-        let entries: Vec<DirEntry> = bincode::deserialize(&data)?;
+        let entries: Vec<DirEntry> = crate::codec::deserialize(&data)?;
         Ok(entries)
     }
 
@@ -480,7 +489,7 @@ impl<D: BlockDevice> UnaFS<D> {
         });
         entries.sort_by(|a, b| a.name.cmp(&b.name));
 
-        let data = bincode::serialize(&entries)?;
+        let data = crate::codec::serialize(&entries)?;
         self.write_data(parent_id, 0, &data)?;
 
         Ok(new_id)
@@ -516,7 +525,7 @@ impl<D: BlockDevice> UnaFS<D> {
         };
 
         if is_large {
-            let data = bincode::serialize(&value)?;
+            let data = crate::codec::serialize(&value)?;
             let extents = self.allocate_and_write_extents(&data)?;
             inode.large_attributes.insert(key.clone(), extents);
             inode.attributes.remove(&key);
@@ -530,11 +539,14 @@ impl<D: BlockDevice> UnaFS<D> {
         self.journal
             .log(&mut self.device, JournalOp::EndOp { op_id: inode_id })?;
 
-        let msg = SMessage::FileEvent {
-            path: format!("inode:{}", inode_id),
-            event: format!("AttributeSet:{}", key),
-        };
-        let _ = self.publish("system/fs/change", msg);
+        #[cfg(feature = "std")]
+        {
+            let msg = SMessage::FileEvent {
+                path: format!("inode:{}", inode_id),
+                event: format!("AttributeSet:{}", key),
+            };
+            let _ = self.publish("system/fs/change", msg);
+        }
 
         Ok(())
     }
@@ -554,7 +566,7 @@ impl<D: BlockDevice> UnaFS<D> {
             let total_size: u64 = extents.iter().map(|e| e.length).sum();
             let data = self.read_from_extents(extents, 0, total_size, total_size)?;
             let val: AttributeValue =
-                bincode::deserialize(&data).map_err(|_| FileSystemError::InvalidAttributeData)?;
+                crate::codec::deserialize(&data).map_err(|_| FileSystemError::InvalidAttributeData)?;
             return Ok(Some(val));
         }
 
@@ -563,6 +575,9 @@ impl<D: BlockDevice> UnaFS<D> {
 
     // --- QUERY ENGINE ---
 
+    /// Semantic query engine. Host-only: the similarity path needs floating-point
+    /// `sqrt`, which is not available in `core`.
+    #[cfg(feature = "std")]
     pub fn query(&mut self, query_str: &str) -> Result<Vec<(Inode, f32)>, FileSystemError> {
         let query = Query::parse(query_str).map_err(|e| FileSystemError::Query(e))?;
 
@@ -609,7 +624,7 @@ impl<D: BlockDevice> UnaFS<D> {
             } else if let Some(extents) = inode.large_attributes.get(&query.key) {
                 let total = extents.iter().map(|e| e.length).sum();
                 let data = self.read_from_extents(extents, 0, total, total)?;
-                if let Ok(v) = bincode::deserialize::<AttributeValue>(&data) {
+                if let Ok(v) = crate::codec::deserialize::<AttributeValue>(&data) {
                     val_opt = Some(v);
                 }
             }
@@ -670,7 +685,7 @@ impl<D: BlockDevice> UnaFS<D> {
                 self.superblock.free_blocks -= 1;
             }
 
-            let to_write = std::cmp::min(BLOCK_SIZE as usize, data.len() - data_written);
+            let to_write = core::cmp::min(BLOCK_SIZE as usize, data.len() - data_written);
 
             let mut block = vec![0u8; BLOCK_SIZE as usize];
             block[..to_write].copy_from_slice(&data[data_written..data_written + to_write]);
@@ -721,6 +736,7 @@ impl<D: BlockDevice> Drop for UnaFS<D> {
     }
 }
 
+#[cfg(feature = "std")]
 impl<D: BlockDevice> BandyMember for UnaFS<D> {
     fn publish(&self, topic: &str, msg: SMessage) -> anyhow::Result<()> {
         println!("[UNAFS] Broadcasting event to '{}': {:?}", topic, msg);
@@ -728,6 +744,8 @@ impl<D: BlockDevice> BandyMember for UnaFS<D> {
     }
 }
 
+/// Cosine similarity. Host-only: needs floating-point `sqrt` (not in `core`).
+#[cfg(feature = "std")]
 pub fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
     if a.len() != b.len() {
         return 0.0;
@@ -741,6 +759,7 @@ pub fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
     dot / (mag_a * mag_b)
 }
 
+#[cfg(feature = "std")]
 fn check_condition(val: &AttributeValue, op: &QueryOp, target: &AttributeValue) -> Option<f32> {
     match op {
         QueryOp::Eq => {
@@ -792,7 +811,9 @@ fn check_condition(val: &AttributeValue, op: &QueryOp, target: &AttributeValue) 
     }
 }
 
-use std::cmp::Ordering;
+#[cfg(feature = "std")]
+use core::cmp::Ordering;
+#[cfg(feature = "std")]
 fn partial_cmp_attr(a: &AttributeValue, b: &AttributeValue) -> Option<Ordering> {
     match (a, b) {
         (AttributeValue::Int(i1), AttributeValue::Int(i2)) => i1.partial_cmp(i2),

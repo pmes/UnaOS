@@ -16,6 +16,7 @@
 
 use crate::hash::{FnvHasher, hash_bytes};
 use crate::inode::AttributeValue;
+use alloc::vec::Vec;
 use serde::{Deserialize, Serialize};
 
 /// An entry in the Attribute Catalog.
@@ -69,14 +70,14 @@ pub fn hash_value(value: &AttributeValue) -> u64 {
 }
 
 /// Helper to serialize a list of catalog entries.
-pub fn serialize_catalog(entries: &[CatalogEntry]) -> Result<Vec<u8>, bincode::Error> {
-    bincode::serialize(entries)
+pub fn serialize_catalog(entries: &[CatalogEntry]) -> Result<Vec<u8>, crate::codec::CodecError> {
+    crate::codec::serialize(entries)
 }
 
 /// Helper to deserialize a list of catalog entries.
-pub fn deserialize_catalog(data: &[u8]) -> Result<Vec<CatalogEntry>, bincode::Error> {
+pub fn deserialize_catalog(data: &[u8]) -> Result<Vec<CatalogEntry>, crate::codec::CodecError> {
     if data.is_empty() {
         return Ok(Vec::new());
     }
-    bincode::deserialize(data)
+    crate::codec::deserialize(data)
 }

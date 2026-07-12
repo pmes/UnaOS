@@ -110,7 +110,7 @@ fn test_soul_logic() {
     // 6. Verify Catalog Persistence (Implicitly tested by query working)
     // But let's verify mount restores it.
 
-    let device_back = fs.device;
+    let device_back = fs.device.clone();
     let mut fs2 = UnaFS::mount(device_back).expect("Mount failed");
 
     let results2 = fs2

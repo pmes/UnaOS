@@ -107,7 +107,7 @@ beat it (details and caveats in [`libs/unafs/README.md`](../libs/unafs/README.md
 | F4 | **Attribute indexes** — log-time equality + true range queries; retires the O(n) catalog scan/rewrite |
 | F5 | **Live queries** — persistent queries emitting add/remove deltas over bandy; the query-driven UI (the BeOS crown jewel, plus similarity) |
 | F6–F8 | B+tree directories; metadata checksums (beyond BeFS); extent trees for very large files |
-| K1 | `no_std + alloc` port of the core |
+| K1 | **✅ `no_std + alloc` port of the core (landed).** `libs/unafs` compiles `#![no_std]` under `--no-default-features` (host and the kernel's `aarch64-unknown-none-softfloat` target); the host-native surface — `FileDevice`, the mmap reader, the bandy event bus, the `sqrt`-using query engine — sits behind a default-on `std` feature so every downstream consumer builds unchanged. bincode 1.3 → 2.x (its `legacy()` config) with the **on-disk byte layout preserved and pinned by golden-vector KATs** (`tests/kat_vectors.rs`) |
 | K2 | Block adapter (kernel 512 B sectors ↔ unafs 4096 B blocks) + GPT/MBR partition offsets |
 | K3 | **Kernel read-only mount** of a real USB volume — `ls`/`cat`/`query` on metal |
 | K4 | Journaled kernel writes + a minimal VFS (retires read-only FAT as the storage story) |
@@ -117,10 +117,13 @@ surpassed)** → K4. The F-arcs are host-native — ideal parallel work needing 
 hardware session.
 
 The **security-K4 residual** ([`SECURITY.md`](SECURITY.md) §K1 — migrate the
-`UNAFS.ATR` FAT-bridge sidecar onto native unafs typed attributes, then delete
-it) sits on top of this chain's K1→K4: it needs the kernel mount before the
-migrate pass can run. The K4-ready projection codec (pi4, 2026-07-12) is the
-layer that migrate pass will call. Don't conflate the two K-numberings.
+kernel's `UNAFS.ATR` FAT-bridge sidecar onto native unafs typed attributes,
+then delete it) sits on top of this chain: it needs a unafs filesystem the
+kernel can mount, i.e. this K1 (`no_std` core, ✅ landed) → K2 (block adapter)
+→ K3 (RO mount) → K4 (journaled writes + the migrate pass). The K4-ready
+projection codec (pi4, 2026-07-12) is the layer that migrate pass will call.
+The three K-numbering schemes are distinct — this is BeFS-K1, not the security
+ACL K1 (survive-reboot) nor the U-chain.
 
 ## 3. Design → Make (printer)
 

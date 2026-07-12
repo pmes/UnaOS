@@ -15,6 +15,7 @@
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 use crate::storage::{BLOCK_SIZE, BlockDevice, Error as StorageError};
+use alloc::vec::Vec;
 
 /// A simple bitmap implementation for managing free space.
 ///
