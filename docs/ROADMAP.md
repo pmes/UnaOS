@@ -89,7 +89,7 @@ beat it (details and caveats in [`libs/unafs/README.md`](../libs/unafs/README.md
 | F4 | **Attribute indexes** — log-time equality + true range queries; retires the O(n) catalog scan/rewrite |
 | F5 | **Live queries** — persistent queries emitting add/remove deltas over bandy; the query-driven UI (the BeOS crown jewel, plus similarity) |
 | F6–F8 | B+tree directories; metadata checksums (beyond BeFS); extent trees for very large files |
-| K1 | `no_std + alloc` port of the core |
+| K1 | **✅ `no_std + alloc` port of the core (landed).** `libs/unafs` compiles `#![no_std]` under `--no-default-features` (host and the kernel's `aarch64-unknown-none-softfloat` target); the host-native surface — `FileDevice`, the mmap reader, the bandy event bus, the `sqrt`-using query engine — sits behind a default-on `std` feature so every downstream consumer builds unchanged. bincode 1.3 → 2.x (its `legacy()` config) with the **on-disk byte layout preserved and pinned by golden-vector KATs** (`tests/kat_vectors.rs`) |
 | K2 | Block adapter (kernel 512 B sectors ↔ unafs 4096 B blocks) + GPT/MBR partition offsets |
 | K3 | **Kernel read-only mount** of a real USB volume — `ls`/`cat`/`query` on metal |
 | K4 | Journaled kernel writes + a minimal VFS (retires read-only FAT as the storage story) |
@@ -97,6 +97,13 @@ beat it (details and caveats in [`libs/unafs/README.md`](../libs/unafs/README.md
 Order: F1 → F2 → K1/K2 → **K3 (metal milestone)** → F3 → F4 → **F5 (BeFS
 surpassed)** → K4. The F-arcs are host-native — ideal parallel work needing no
 hardware session.
+
+This BeFS chain is also the road to **security-K4-proper** (§1a): migrating the
+kernel's `UNAFS.ATR` sidecar onto native unafs attributes and retiring it needs
+a unafs filesystem the kernel can mount, i.e. this K1 (`no_std` core, done) →
+K2 (block adapter) → K3 (RO mount) → K4 (journaled writes + the migrate pass).
+The three K-numbering schemes are distinct — this is BeFS-K1, not the security
+ACL K1 (survive-reboot) nor the U-chain.
 
 ## 3. Design → Make (printer)
 

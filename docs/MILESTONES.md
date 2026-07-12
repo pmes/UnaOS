@@ -10,6 +10,37 @@ Legend: **✅ metal-confirmed** · **🔬 QEMU-green, metal pending** · dates I
 
 ---
 
+## storage lane (`us-unafs1`) — 2026-07-12 (UNAFS-1 — the `no_std` port, format frozen)
+
+### UNAFS-1 — `libs/unafs` → `#![no_std]` + `alloc`, byte layout pinned by golden KATs 🔬 `us-unafs1`
+- **What (host-native, `libs/unafs/**` only):** the road to security-K4-proper starts with a unafs the
+  kernel can mount. This is **BeFS-K1**: make `libs/unafs` compile `#![no_std]` + `alloc` *without changing
+  one byte of the on-disk format*. A default-on `std` feature keeps every downstream consumer building
+  unchanged; the host-native surface (`FileDevice`, the `io::MappedFile` memmap reader, the bandy event
+  bus, the `sqrt`-using semantic query engine) sits behind it, while the on-disk types, the `codec` seam,
+  the `BlockDevice` trait, `MemDevice`, and the core `UnaFS` ops are `no_std`.
+- **Format-frozen migration:** bincode 1.3.3 → bincode 2.0.1, wrapped in its `legacy()` config
+  (little-endian, fixed-int, no limit) behind a single `codec` seam that all 19 call sites route through.
+  The bincode-2 split encode/decode errors are unified as `codec::CodecError` (`core::error::Error`, so
+  thiserror `#[from]` works in both std and no_std).
+- **The anchor — golden-vector KATs first (`tests/kat_vectors.rs`):** every struct that reaches disk —
+  `Superblock`, `FileKind`, `Extent`, `AttributeValue`, `Inode`, `CatalogEntry`(+list), `JournalOp`,
+  `DirEntry`(+list) — is asserted byte-for-byte against baked-in hex golden vectors (forward and
+  roundtrip), with representative and boundary values. The KATs were frozen from the reference bincode-1.3
+  encoding, and **passed unchanged** after the bincode-2 migration and the serde `default-features` change
+  — the proof the format survived. The vectors are the contract; they are never edited to make a change pass.
+- **Tested (host):** `cargo test -p unafs` green — 8 KAT tests + 4 pre-existing integration tests;
+  `cargo check -p unafs --no-default-features` clean on host **and on the kernel's bare
+  `aarch64-unknown-none-softfloat` target** (std genuinely absent); `cargo check` workspace default-members
+  green (downstream unaffected); `./arroyo check` both arches green — **zero `unaos/` (kernel) diff**.
+- **Also fixed (in-lane):** a pre-existing red — commit `44525c1` gave `UnaFS` a `Drop` impl, making
+  `let device_back = fs.device;` illegal (E0509) in two tests and silently breaking `cargo test -p unafs`.
+  Repaired by deriving `Clone` on `MemDevice` (additive) and cloning before the fs drops.
+- **Commits:** `9e198a9` (M1 KATs) · `ac5030c` (M2 bincode 2.x) · `aa1dcd5` (M3 no_std). Metal N/A
+  (host-native library). Next in the BeFS chain: K2 block adapter (512↔4096 + partition offsets).
+
+---
+
 ## hw-jetson track — 2026-07-12 (JD7 — the panel shapes the tree: `mkdir` / `rmdir`)
 
 ### JD7 — `mkdir` / `rmdir` on the Orin panel shell (thin FATDIRS glue) 🔬 `hw-jetson`
