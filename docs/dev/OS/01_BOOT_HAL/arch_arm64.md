@@ -2096,6 +2096,66 @@ power-cycle, `cd DOCS/DRAFTS`, `cat` (the created tree survives), then `rm NOTE.
 mid-bench (see §JB1f). Repeated `mkdir`/`rmdir` runs accumulate `0xE5` tombstone slots in the parent across
 boots (FATDIRS cleanup leaves them; harmless — don't misread as corruption; a card re-prep clears them).
 
+### JD8 — copying files: panel `cp` (🔬 QEMU-green, metal attended-pending)
+
+JD4 navigates, JD5/JD6 write, JD7 shapes; JD8 lets you *duplicate* — `cp README.TXT DOCS/`,
+`cp DOCS/A.TXT B.TXT` from the panel. Together they close the file-manager verb set: create, edit,
+delete, organize, and now **copy**. (`mv` — the last verb — waits on a future pi4-lane FATMOVE seam
+[an "unlink-entry-keep-chain" `fat.rs` op with no existing public twin]; the round-9 seat banked it and
+picked `cp`, which is fully in-lane.) Like JD7, JD8 is **`shell.rs`-only and adds NO `fat.rs` logic**: it
+composes primitives that already exist — the offset-aware read `read_at` and the JD6 create-or-truncate
+write path (`create_in_dir` + `write_grow`) — all **call-never-edit**. One new command handler `fs_cp`
+plus the `cp`/`copy` dispatch arm.
+
+**Source, destination, and the `cp FILE DIR/` idiom.** `fs_cp` resolves `src` via the read-only
+`resolve_path` and requires a FILE — a directory source is `-EISDIR` (recursive `cp -r` is a JD9
+candidate). The destination is decided by resolving `dst`: an existing DIRECTORY (or the root) receives
+the copy under the source's canonical leaf name (`cp A.TXT DOCS` → `/DOCS/A.TXT`); anything else — an
+existing file or a not-yet-existing name — is the destination file itself, validated through JD6's
+`resolve_write_target` (so a missing dst parent is `-ENOENT`, a dst parent that is a plain file is
+`-ENOTDIR`). An existing destination file is truncated in place (delete chain + fresh 0-length entry),
+exactly the JD6 `write` create-or-truncate prologue. Copying a file onto itself is refused with `-EINVAL`
+— canonical paths are unique per file, so a case-insensitive full-path compare is complete (FAT 8.3 names
+are case-insensitive, so `cp A.TXT a.txt` in one directory is honestly the same file).
+
+**Size handling — the M2 decision: streaming, no ceiling.** The copy STREAMS the source in fixed 32 KiB
+windows: `read_at(src_fc, src_size, off, buf, 32K)` fills a window, `write_grow` appends it at `off` to
+the growing destination, and `(first_cluster, size, off)` advance across windows (the fresh entry begins
+at cluster 0 / size 0, and `write_grow` allocates + publishes as it grows). A file of ANY size therefore
+copies with a bounded (window-sized) heap footprint and **no truncation** — deliberately no size cap,
+unlike `cat`'s 8 KiB display bound. `read_at` is existing public `fat.rs` API (the U9/read-path
+offset-aware twin of `read_file`), so streaming reached for no new primitive. The trade-off logged for a
+JD9 follow-up: the per-window `write_grow` re-walks the destination cluster chain from its head, so a very
+large copy is O(windows²) FAT reads — bounded, and every access rides the JD3 wall-clock BOT pump (a
+stalled transfer is `-EIO`, never a hang on the timerless EL1 core), but a future single-pass copy
+primitive could tighten it. An empty source copies as 0 windows → a fresh 0-length destination.
+
+**Errno fidelity is shell-side** (the JD6/JD7 pattern, reusing `fat_errno` + shell-owned tags): src
+missing → `-ENOENT`; src is a directory → `-EISDIR`; dst parent missing → `-ENOENT`; dst parent is a
+file → `-ENOTDIR`; the volume or directory full → `-ENOSPC`; a non-8.3 destination name → `-EINVAL`;
+copy-onto-self → `-EINVAL`. On success it echoes `copied /DOCS/A.TXT -> /DOCS/B.TXT (N bytes)` in the
+canonical on-disk spelling.
+
+**Principal — unchanged.** The shell is still EL1 ASID 0, the PUBLIC principal; `cp` reads a public
+source and creates a public destination — no U6 owner ACL is consulted, correct for the trusted local
+console (§JD5). JD8 adds no new lock or namespace surface: it composes the same F3-locked
+`create_in_dir`/`write_grow`/`delete_located`/`read_at` primitives JD6/JD7 already exercise and ledgered,
+so it inherits their locking analysis unchanged.
+
+**Gate (QEMU):** `./arroyo check` + `UNAOS_TEGRA=1 ./arroyo check` green both arches; `./arroyo test-arm 22`
+→ `MISSION SUCCESS`; `UNAOS_GICV3=1 ./arroyo test-arm 40` → CAPSTONE 6/6; `UNAOS_HUBSTORAGE=1 ./arroyo test
+25` → `MISSION SUCCESS` (shared `shell.rs` guard); `esp-jetson kernel.elf` links, **108 `tegra:` strings**
+(unchanged — the `cp` strings carry no `tegra:` token; validate media by count, not size). As in JD2–JD7
+the SHELL command path is not headless-reachable in-lane (the shell dispatches only on a keystroke, and
+tegra never runs in QEMU), so the shell-level verdict is **attended-pending**; the read/write PRIMITIVES
+`fs_cp` calls are already exercised headless by the U9/read-path and the U10/U11 write fixtures.
+
+**Metal verdict — attended-pending.** The money-shot is the bench card
+[`jd8-bench.md`](../../../../unaos/scripts/jd8-bench.md): `cp` a file into a subdirectory, `cat` the copy,
+power-cycle, `cat` the copy again (it survives) with the source left untouched, then the error probes
+(dir source, self-copy, missing parent, file-parent). ⚠ Verify the serial bridge captures a full boot
+BEFORE burning bench time — the round-6/8 host capture failed mid-bench (see §JB1f).
+
 ### JB1f — the unhealed early-vector window (the round-6 boot crash), closed (`85f74f8`)
 
 **The evidence (2026-07-11 attended bench, real Orin).** Kernel `446abd3` (the JD6 tip): 2/2 boots

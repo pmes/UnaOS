@@ -10,6 +10,41 @@ Legend: **✅ metal-confirmed** · **🔬 QEMU-green, metal pending** · dates I
 
 ---
 
+## hw-jetson track — 2026-07-12 (JD8 — the panel copies files: `cp`)
+
+### JD8 — `cp <src> <dst>` on the Orin panel shell (compose read + write, no new fat.rs) 🔬 `hw-jetson`
+- **What (`shell.rs` only):** one new command handler `fs_cp` + the `cp`/`copy` dispatch arm. JD4
+  navigates, JD5/JD6 write, JD7 shapes; JD8 lets you **duplicate** — `cp README.TXT DOCS/`,
+  `cp DOCS/A.TXT B.TXT`. Together the panel is a file manager with the full verb set (`mv` — the last
+  verb — waits on a future pi4-lane FATMOVE seam, banked by the round-9 seat pick). It adds **NO `fat.rs`
+  logic**: `cp` composes primitives that already exist — the offset-aware read `read_at` and the JD6
+  create-or-truncate write path (`create_in_dir` + `write_grow`), all **call-never-edit**.
+- **The copy:** resolve `src` (must be a file — a directory source is `-EISDIR`; recursive `cp -r` is a
+  JD9 candidate). Decide the destination: if `dst` resolves to an existing DIRECTORY the copy lands as
+  `dst/<src-leaf>` (the `cp FILE DIR/` idiom); otherwise `dst` names the file (created, or truncated in
+  place if it exists). Refuse copying a file onto itself (same canonical path) → `-EINVAL`.
+- **Size handling (M2 decision):** the copy **streams** the source in fixed 32 KiB windows via `read_at`
+  feeding `write_grow` — a file of ANY size copies with a bounded heap footprint and **no truncation** and
+  **no size ceiling**. `read_at` is existing public `fat.rs` API (the U9/read-path twin of `read_file`), so
+  no new primitive was needed; the per-window `write_grow` re-walks the growing destination chain (bounded,
+  BOT-pumped — a stall is `-EIO`, never a hang). A future single-pass copy primitive could tighten that
+  (JD9 note). Empty-file copy works (0 windows → a fresh 0-length destination).
+- **Errno fidelity is shell-side** (same pattern as JD6/JD7, reusing `fat_errno` + shell-owned tags):
+  src missing → `-ENOENT`; src is a dir → `-EISDIR`; dst parent missing → `-ENOENT`; dst parent is a
+  file → `-ENOTDIR`; volume/dir full → `-ENOSPC`; a non-8.3 dst name → `-EINVAL`; copy-onto-self → `-EINVAL`.
+- **Principal — unchanged** (EL1 ASID 0, PUBLIC): `cp` reads a public source and creates a public
+  destination, no U6 ACL consulted (the trusted local console). No new lock/namespace surface — it composes
+  the same F3-locked primitives JD6/JD7 already ledgered.
+- **Tested (QEMU):** `check` + `UNAOS_TEGRA=1 check` green both arches; `test-arm 22` MISSION;
+  `UNAOS_GICV3=1 test-arm 40` CAPSTONE 6/6; `UNAOS_HUBSTORAGE=1 test 25` MISSION (shared `shell.rs` guard);
+  `esp-jetson` links, **108 `tegra:` strings** (unchanged — `cp` strings carry no `tegra:` token). Zero x86
+  behavioural change (`shell.rs` compiles both arches; the `cp` handler is dispatched only on a keystroke).
+- **Metal:** attended-pending — the money-shot bench card [`jd8-bench.md`](../unaos/scripts/jd8-bench.md)
+  (`cp` a file into a subdir → `cat` the copy → power-cycle → `cat` again, source untouched → error probes).
+  ⚠ Verify the serial bridge captures a full boot first (round-6/8 host capture failed mid-bench, §JB1f).
+- **Detail:** [`arch_arm64.md` §JD8](dev/OS/01_BOOT_HAL/arch_arm64.md). **Commit:** on `hw-jetson` (the
+  seat assigns the integration hash at merge).
+
 ## hw-jetson track — 2026-07-12 (JD7 — the panel shapes the tree: `mkdir` / `rmdir`)
 
 ### JD7 — `mkdir` / `rmdir` on the Orin panel shell (thin FATDIRS glue) 🔬 `hw-jetson`
