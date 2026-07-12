@@ -1990,6 +1990,47 @@ Attending-operator verdict: **pass 100%**. ⚠ Same evidence caveat as the §JB1
 host-side serial capture failed mid-bench, so the verdict is the attended panel observation (the
 JD6 card's checks are all panel-visible); no replay log exists for an mbench assert.
 
+### FATDIRS — the `fat.rs` directory-mutation seam: `create_dir` / `remove_dir` (pi4-lane, `cdfe25b`)
+
+JD6 left `mkdir`/`rmdir` explicitly out of scope — its subdir writes reused the existing
+`create_in_dir`/`locate_in_dir`/`free_slot_in_dir_chain` walkers, but creating or removing a *directory*
+needs new `fat.rs` logic (allocate + initialize a directory cluster with `.`/`..`; verify emptiness
+before removal). Because that logic is arch-shared and lock-sensitive, it landed as a **dedicated
+pi4-lane arc** (FATDIRS, 2026-07-12) rather than inside a jetson write arc; **JD7's panel
+`mkdir`/`rmdir` consumes it call-never-edit**, exactly as JD6's write path rides `create_in_dir`.
+
+**The seam (two public methods + one private helper, ZERO edits to any existing `fat.rs` fn — the JD6
+additive-exception pattern):**
+- `pub fn create_dir(parent_first_cluster: u32, name: &str) -> Result<(DirEntry, u64, usize), FatError>`
+  — `alloc_cluster` (compare-and-claim under `FAT_MUTATION`) a child cluster, `init_subdir_cluster`
+  writes `.` (self) and `..` (parent; `0` when the parent is root) into it, then `create_in_dir` links a
+  0-cluster DIR-attr (`0x10`) entry in the parent and `write_dir_entry_fields` publishes the child
+  cluster (the last write). Returns the parent's entry + its on-disk `(lba, off)` — the `create_in_dir`
+  shape, so JD7 can hang a K-lineage ACL row on it. `parent_first_cluster == 0` ⇒ the root, dispatching
+  through the same JD6 twins, so it works on the FAT16 fixed-root and FAT32 images alike.
+- `pub fn remove_dir(parent_first_cluster: u32, name: &str) -> Result<Vec<u32>, FatError>` — locate,
+  refuse a non-directory target and a `first_cluster == 0` root-like entry, verify the target holds
+  ONLY `.`/`..` (the `read_dir` walk), then `delete_located` (mark `0xE5` first, then `free_chain`).
+  Returns the freed clusters.
+
+**Crash order (fail-safe):** the child is fully initialized before the parent link; a crash leaks a
+cluster or leaves a `FstClus==0` entry (the known JD6-ledgered corner), never a live entry over a
+cluster that gets freed/aliased. `remove_dir` inherits `delete_located`'s `0xE5`-then-free order.
+
+**Locking:** every sector RMW is SMP-atomic via the existing `FAT_MUTATION`/`DIR_MUTATION` locks, held
+only over single-sector RMWs (never widened across a scan or `free_chain` — the F3 span rule). Sound
+WITHOUT the syscall `NAMESPACE` lock (the EL1 panel reaches `fat.rs` directly). One honest residual —
+`remove_dir`'s emptiness-scan → delete is not atomic vs a concurrent `create_in_dir` into the same
+target — is EXCLUDED_BY_SEQUENCING today (no concurrent EL1 FS mutators) and ledgered in
+[`SECURITY.md`](../../SECURITY.md) with F3's. **Errno fidelity:** reuses existing `FatError` variants
+(a new one would break shell.rs's exhaustive `fat_errno` match) — `-ENOTDIR`/root map to `Unsupported`,
+`-ENOTEMPTY` to `IsDirectory`; enriching `FatError` is a JD7-side (jetson-lane) follow-up.
+
+**Tested (QEMU):** `check` both arches + `UNAOS_TEGRA=1 check` green; `kernel8-test 30` = 23 PASS
+byte-identical + CAPSTONE 6/6 + all prior witnesses + an uncounted `:: FATDIRS: … PASS [w=0xff] ::`
+(the `k1_atr` disk-selftest idiom, fully self-cleaning), zero FAIL; `test-arm 22` MISSION. Zero x86
+behavioural change. **Metal:** the attended money-shot rides JD7's Orin panel `mkdir`/`rmdir` bench.
+
 ### JB1f — the unhealed early-vector window (the round-6 boot crash), closed (`85f74f8`)
 
 **The evidence (2026-07-11 attended bench, real Orin).** Kernel `446abd3` (the JD6 tip): 2/2 boots

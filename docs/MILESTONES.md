@@ -10,6 +10,47 @@ Legend: **✅ metal-confirmed** · **🔬 QEMU-green, metal pending** · dates I
 
 ---
 
+## hw-pi4 track — 2026-07-12 (FATDIRS — the fat.rs directory-mutation seam: `create_dir` / `remove_dir`)
+
+### FATDIRS — `create_dir` / `remove_dir`: additive, lock-correct FAT directory create + remove 🔬 `hw-pi4`
+- **Why:** the panel's `mkdir`/`rmdir` (jetson JD7) needs directory-mutation logic bigger than JD6's
+  thin additive wrappers, and a dir-mutation bug in arch-shared `fat.rs` hits all three platforms —
+  so the seam lands as a **dedicated pi4-lane arc** (the F2/F3/K* lock lineage is this track's
+  expertise), which JD7 then consumes call-never-edit.
+- **What (`cdfe25b`):** two new public `fat.rs` methods next to JD6's dir-aware twins, **ZERO edits to
+  any existing fn** (the JD6 additive-exception pattern, now in-lane): `create_dir(parent_first_cluster,
+  name) -> (DirEntry, u64, usize)` and `remove_dir(parent_first_cluster, name) -> Vec<u32>` (freed
+  clusters), plus one private `init_subdir_cluster`. `create_dir` composes `alloc_cluster`
+  (compare-and-claim under `FAT_MUTATION`) → writes `.`/`..` into the zero-filled UNLINKED orphan
+  cluster (no lock — unreachable) → `create_in_dir` (0-cluster DIR entry) → `write_dir_entry_fields`
+  (publishes the child cluster). `remove_dir` locates, refuses a non-directory and a `first_cluster==0`
+  root-like target, verifies the target holds ONLY `.`/`..` (the `read_dir` walk), then `delete_located`
+  (0xE5 first, then `free_chain`).
+- **Crash ordering (invariant 2):** the child cluster is fully initialized BEFORE the parent link; a
+  crash leaks a cluster or leaves the JD6-ledgered `FstClus==0` corner — never a live entry over a
+  cluster that later gets freed/aliased.
+- **Locking / honest residual (invariant 3 + 5):** every sector RMW is SMP-atomic via the existing
+  per-RMW locks; `DIR_MUTATION` is never widened past its documented single-sector span. The one
+  residual — `remove_dir`'s emptiness-scan → delete not atomic vs a concurrent `create_in_dir` into
+  the same target — is **EXCLUDED_BY_SEQUENCING** today (no concurrent EL1 FS mutators; EL0 rides the
+  syscall NAMESPACE lock) and ledgered in `SECURITY.md` like F3's interleave. The internal locking is
+  sound WITHOUT the syscall NAMESPACE lock (EL1 shell callers reach `fat.rs` directly). **Error
+  fidelity flag:** reuses existing `FatError` variants (adding one would break shell.rs's exhaustive
+  `fat_errno` match in the jetson lane) — `-ENOTDIR`/`-ENOTEMPTY` map to `Unsupported`/`IsDirectory`
+  today; enriching `FatError` is a future jetson-lane seam change, flagged for JD7.
+- **Tested (QEMU):** `check` + `UNAOS_TEGRA=1 check` green both arches; `kernel8` compiles;
+  `kernel8-test 30` = **23 PASS byte-identical** + CAPSTONE 6/6 + all prior witnesses
+  (K1-persist/K1-corrupt/K2-liveenf/K3-revoke/IMG-SIG/F2/F3) intact + the new uncounted
+  `:: FATDIRS: … PASS [w=0xff] ::` (8 assertions: `.`/`..` well-formed, file-in-dir, non-empty refused,
+  empty rmdir frees+reuses the cluster, root-like + file targets refused), zero FAIL; `test-arm 22`
+  MISSION SUCCESS. Zero x86 behavioural change (additive; no x86 caller). The `fatdirs_check` selftest
+  is fully self-cleaning (leaves the volume pristine).
+- **Metal:** the seam's attended money-shot rides **JD7's Orin panel bench** (`mkdir`/`rmdir` through
+  the shell), sequenced per the code-prerequisite rule; a Pi-side exercise of the witness batches onto
+  the next Pi bench opportunistically.
+- **Detail:** [`SECURITY.md`](SECURITY.md) aarch64 ledger (FATDIRS entry) + [`arch_arm64.md`
+  §FATDIRS](dev/OS/01_BOOT_HAL/arch_arm64.md). **Commit:** `cdfe25b` (`hw-pi4`).
+
 ## hw-jetson track — 2026-07-11 (JB1f — the unhealed early-vector window, closed)
 
 ### JB1f — the healed vectors now cover the whole tegra boot; nest-safe, storm-proof EC0 heal ✅ `hw-jetson`

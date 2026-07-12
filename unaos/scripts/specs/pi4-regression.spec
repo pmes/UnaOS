@@ -59,3 +59,9 @@ REQUIRE K2-liveenf:.*rebuild\+enforce PASS
 # --- OPTIONAL so a 3-of-4-core / no-card metal boot doesn't fail the chain on the file leg. -----
 PENDING IMG-SIG:.*residual closed\) PASS
 FORBID IMG-SIG:.*FAIL
+
+# --- FATDIRS directory create/remove witness (uncounted): create_dir/remove_dir drive the live
+# --- volume end to end. Needs a card (the selftest writes real dirs), so PENDING (promotes to
+# --- REQUIRE at first capture) — a no-card / 3-of-4-core metal boot must not fail the chain. -----
+PENDING FATDIRS:.*delete_located\) PASS
+FORBID FATDIRS:.*FAIL

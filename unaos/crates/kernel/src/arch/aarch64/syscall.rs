@@ -8388,6 +8388,10 @@ pub fn u7_launcher(demo_cpu: usize) {
     // IMAGES, closing the "same 8.3 name = same principal" residual (the loader now mints IMAGE_SHA256). Its
     // own uncounted `:: IMG-SIG: … PASS ::` line; read-only, no disk write.
     image_sig_selftest();
+    // FATDIRS: exercise the new fat.rs directory create/remove seam (create_dir/remove_dir) on the live
+    // volume — LAST in the chain (its disk I/O can never perturb the 23 fixtures or the witnesses), fully
+    // self-cleaning. Its own uncounted `:: FATDIRS: … PASS ::` line. Unblocks JD7's Orin-panel mkdir/rmdir.
+    fatdirs_launcher();
 }
 
 /// F2 M3 witness worker — the `demo_cpu` half of the cross-core FAT_MUTATION stress. `fn(usize)` for
@@ -10283,6 +10287,144 @@ fn image_sig_selftest() {
         if w == all { "PASS" } else { "FAIL" },
         w,
         all
+    );
+}
+
+// ===================================================================================================
+// FATDIRS: exercise the new fat.rs directory-mutation seam (create_dir / remove_dir) end-to-end on the
+// live volume — the aarch64 kernel-side disk-selftest (the k1_atr idiom). Runs LAST in the storage
+// chain so its disk I/O can never perturb the 23-fixture battery or the witnesses; emits ONE uncounted
+// `:: FATDIRS: ... PASS [w=0x..] ::` line (never a `-> PASS` fixture line). Fully self-cleaning: leaves
+// the volume EXACTLY as found (no scratch dir/file), so the STATEFUL metal card never accumulates. Uses
+// the volume ROOT (parent_first_cluster = 0) as the parent, so it runs unchanged on the FAT16 fixed-root
+// and FAT32 test images. JD7's Orin-panel mkdir/rmdir is the attended-metal money-shot for the seam.
+const FATDIRS_SUBD: &str = "FDSUB"; // the created subdirectory
+const FATDIRS_FILE: &str = "FDF.BIN"; // a file created INSIDE the subdirectory
+const FATDIRS_R0: &str = "FDR0"; // a 0-cluster DIR entry (the root-like refuse case)
+const FATDIRS_FT: &str = "FDFT.BIN"; // a plain file (the not-a-directory refuse case)
+const FATDIRS_ALL: u32 = 0xFF; // all 8 assertions (M1 bits 0-2, M2 bits 3-7)
+
+/// FATDIRS: delete any scratch entries this selftest may have left, leaving the root EXACTLY as found.
+/// Robust to partial failures (re-resolves each name fresh). Deleting FDSUB's cluster frees FDF.BIN with
+/// it (FDF.BIN lives inside FDSUB's cluster and owns no clusters of its own).
+fn fatdirs_cleanup(fs: &crate::fs::fat::FatFs) {
+    for name in [FATDIRS_SUBD, FATDIRS_R0, FATDIRS_FT] {
+        if let Ok((de, lba, off)) = fs.locate_in_dir(0, name) {
+            let _ = fs.delete_located(lba, off, de.first_cluster());
+        }
+    }
+}
+
+/// FATDIRS: drive create_dir/remove_dir on the live volume, returning a witness bitmask (PASS iff
+/// `== FATDIRS_ALL`). Kernel-task context, so block I/O is legal. Fully self-cleaning.
+fn fatdirs_check() -> u32 {
+    let mut w = 0u32;
+    let fs = match crate::fs::fat::mount() {
+        Ok(f) => f,
+        Err(_) => return 0,
+    };
+    fatdirs_cleanup(&fs); // pristine start (a stale scratch dir from an interrupted run would confound)
+
+    // ---- M1: create_dir + the mandatory `.`/`..` -------------------------------------------------
+    let (dde, _dlba, _doff) = match fs.create_dir(0, FATDIRS_SUBD) {
+        Ok(t) => t,
+        Err(_) => {
+            fatdirs_cleanup(&fs);
+            return w;
+        }
+    };
+    let child = dde.first_cluster();
+    if dde.is_dir && child != 0 {
+        w |= 1 << 0; // create_dir returned a DIR entry carrying a real first cluster
+    }
+    // read_dir of the new directory: exactly `.` (fc = child) and `..` (fc = 0, parent is root).
+    if let Ok(entries) = fs.read_dir(child) {
+        let mut dot = false;
+        let mut dotdot = false;
+        let mut other = false;
+        for e in &entries {
+            match e.name() {
+                "." => dot = e.is_dir && e.first_cluster() == child,
+                ".." => dotdot = e.is_dir && e.first_cluster() == 0,
+                _ => other = true,
+            }
+        }
+        if dot && dotdot && !other && entries.len() == 2 {
+            w |= 1 << 1; // well-formed `.`/`..`, nothing else
+        }
+    }
+    // Create a file INSIDE the new directory and read it back by locating it.
+    let file_made = fs.create_in_dir(child, FATDIRS_FILE, 0x20).is_ok();
+    if file_made && fs.locate_in_dir(child, FATDIRS_FILE).is_ok() {
+        w |= 1 << 2; // a file created in the new subdir is findable
+    }
+
+    // ---- M2: remove_dir refusals, success, reuse, and the negative targets -----------------------
+    // Non-empty rmdir is REFUSED (the file is still inside).
+    if matches!(fs.remove_dir(0, FATDIRS_SUBD), Err(crate::fs::fat::FatError::IsDirectory)) {
+        w |= 1 << 3; // non-empty directory refused
+    }
+    // Remove the file, then rmdir succeeds and returns the freed cluster.
+    let file_removed = match fs.locate_in_dir(child, FATDIRS_FILE) {
+        Ok((fe, flba, foff)) => fs.delete_located(flba, foff, fe.first_cluster()).is_ok(),
+        Err(_) => false,
+    };
+    let mut removed_ok = false;
+    if file_removed {
+        if let Ok(freed) = fs.remove_dir(0, FATDIRS_SUBD) {
+            removed_ok = true;
+            if freed.len() == 1 && freed[0] == child {
+                w |= 1 << 4; // rmdir of the now-empty dir succeeded, freeing exactly the child cluster
+            }
+        }
+    }
+    // Reusability: the entry is gone AND the child cluster reads free again.
+    if removed_ok
+        && matches!(fs.locate_in_dir(0, FATDIRS_SUBD), Err(crate::fs::fat::FatError::NotFound))
+        && fs.fat_entry_copy(child, 0) == Ok(0)
+    {
+        w |= 1 << 5; // the freed cluster is reusable (FAT entry free) and the name is gone
+    }
+
+    // Root-like refuse: a 0-cluster DIR entry (create_in_dir writes fc=0) -> remove_dir refuses.
+    if fs.create_in_dir(0, FATDIRS_R0, 0x10).is_ok() {
+        if matches!(fs.remove_dir(0, FATDIRS_R0), Err(crate::fs::fat::FatError::Unsupported)) {
+            w |= 1 << 6; // first_cluster==0 / root-like target refused
+        }
+        if let Ok((de, lba, off)) = fs.locate_in_dir(0, FATDIRS_R0) {
+            let _ = fs.delete_located(lba, off, de.first_cluster());
+        }
+    }
+    // Not-a-directory refuse: a plain file target -> remove_dir refuses.
+    if fs.create_in_dir(0, FATDIRS_FT, 0x20).is_ok() {
+        if matches!(fs.remove_dir(0, FATDIRS_FT), Err(crate::fs::fat::FatError::Unsupported)) {
+            w |= 1 << 7; // a file target refused (not a directory)
+        }
+        if let Ok((de, lba, off)) = fs.locate_in_dir(0, FATDIRS_FT) {
+            let _ = fs.delete_located(lba, off, de.first_cluster());
+        }
+    }
+
+    fatdirs_cleanup(&fs);
+    w
+}
+
+/// FATDIRS launcher + verdict — rides the U7 kernel task AFTER the K1/K2/K3/IMG-SIG selftests (its disk
+/// I/O can never perturb the 23 fixtures or the witnesses). Emits ONE uncounted `:: FATDIRS: … PASS ::`
+/// line (the K1-atr `<noun> PASS` idiom — NOT a `-> PASS` fixture line, so the count stays at 23).
+fn fatdirs_launcher() {
+    static DONE: AtomicBool = AtomicBool::new(false);
+    if DONE.swap(true, Ordering::Relaxed) {
+        return;
+    }
+    if crate::drivers::block::info().is_none() {
+        return; // no SD -> the proof writes real dirs; skip silently (the control-path discipline)
+    }
+    let w = fatdirs_check();
+    serial_println!(
+        ":: FATDIRS: fat.rs directory create/remove — create_dir(child .,..+publish), remove_dir(empty-only via delete_located) {} (new dir `.`/`..` well-formed; file-in-dir; non-empty refused; empty rmdir frees+reuses the cluster; root-like + file targets refused) [w={:#04x}] ::",
+        if w == FATDIRS_ALL { "PASS" } else { "FAIL" },
+        w
     );
 }
 
