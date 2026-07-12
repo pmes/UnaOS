@@ -23,14 +23,29 @@ own stack:
   Facet publishes and subscribes here rather than calling other components
   directly.
 
-## Responsibilities (intended)
+## Responsibilities
 
-- Open an image file and decode it via `lux`.
-- Display it in a Quartzite window with pan and zoom.
-- Support inspection: per-pixel RGBA readout and isolation of individual
-  channels.
+Landed (FACET-1, MVP):
+
+- Open an image file named on the command line and decode it via `lux`
+  (`decode` dispatches on magic bytes: PNG, JPEG, or Sony ARW).
+- Pack the linear `RgbBuffer` down to 8-bit sRGB RGBA (the sRGB OETF lives in
+  the vessel; `lux` hands out *linear* f32 RGB).
+- Display it in a Quartzite window, drawn aspect-fit and centered on a dark
+  field, rescaling with the window (CPU blit via `NSBitmapImageRep`).
+
+Intended (later arcs):
+
+- Pan and zoom, and the euclase textured-quad (GPU) presentation path.
+- Inspection: per-pixel RGBA readout and isolation of individual channels.
 - Participate in the userspace bus: a file opened elsewhere (for example in the
   Matrix file model) can be routed to Facet for viewing.
+
+## Usage
+
+```
+facet <image-file>     # PNG, JPEG, or Sony ARW
+```
 
 ## Public API
 
@@ -42,7 +57,8 @@ established pattern: a `main` that constructs a `Synapse`, bootstraps a
 
 ## How it fits into UnaOS
 
-Facet is one of the vessels under `apps/`, alongside `lumen` (the reference GUI
+Facet is one of the vessels under `apps/`, alongside `pulse` and `phonolite`
+(the two other single-view vessels it copies), `lumen` (the reference GUI
 vessel) and the `apps/cli/*` tools. It does not own image infrastructure; that
 lives in the shared libraries (`lux`, `euclase`) so capabilities are not
 duplicated across vessels. See
@@ -52,8 +68,9 @@ system canon.
 
 ## Status
 
-**Design-stage.** This crate currently contains only this README — there is no
-`Cargo.toml` or `src/`, and it is not part of the workspace build. The
-description above states intent, derived from the architecture documents and the
-available libraries, not shipped behavior. The supporting libraries it would
-build on (`lux`, `euclase`, `quartzite`, `bandy`) exist independently.
+**FACET-1 landed (macOS backend).** The MVP viewer works: `facet <image>`
+decodes via `lux`, packs to sRGB, and shows the picture aspect-fit in a
+Quartzite window. Presentation is a CPU blit (`NSBitmapImageRep`), tagged sRGB
+for color-managed display; the euclase textured-quad (GPU) path, pan/zoom, and
+pixel readout are the later arcs (see [`docs/ROADMAP.md`](../../docs/ROADMAP.md)
+§3a). Non-macOS backends follow quartzite's platform maturity.

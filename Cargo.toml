@@ -24,6 +24,7 @@ members = [
     "apps/lumen",
     "apps/pulse",
     "apps/phonolite",
+    "apps/facet",
     # "apps/una",   # PARKED — IDE vessel; excluded during GUI-API consolidation
     "libs/lux"
 ]
@@ -35,6 +36,7 @@ default-members = [
     "apps/lumen",
     "apps/pulse",
     "apps/phonolite",
+    "apps/facet",
     # "apps/una",   # PARKED — see GUI-API consolidation
     "apps/cli/vertex",
     "apps/cli/unafs",

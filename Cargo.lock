@@ -1441,6 +1441,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "facet"
+version = "0.1.0"
+dependencies = [
+ "bandy",
+ "gneiss_pal",
+ "log",
+ "lux",
+ "quartzite",
+]
+
+[[package]]
 name = "faster-hex"
 version = "0.10.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
