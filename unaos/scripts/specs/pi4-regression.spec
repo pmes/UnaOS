@@ -54,21 +54,30 @@ FORBID AARCH64 EXCEPTION
 # --- per the K2 security-review note, 2026-07-11) --------------------------------------
 REQUIRE K2-liveenf:.*rebuild\+enforce PASS
 
-# --- IMG-SIG code-signing witness (uncounted): the loader mints the IMAGE_SHA256 principal;
-# --- the in-RAM KAT/discrimination bits always run, the file bits need the K2 blobs on the card.
-# --- OPTIONAL so a 3-of-4-core / no-card metal boot doesn't fail the chain on the file leg. -----
-PENDING IMG-SIG:.*residual closed\) PASS
+# --- K3 two-phase durable-first revoke witness (uncounted). METAL-CONFIRMED 2026-07-12
+# --- (real Pi 4, kernel a834b8f); promoted from ledger to a hard REQUIRE at that capture. -----
+REQUIRE K3-revoke:.*durable-first PASS
+
+# --- K4-ready native-attr projection codec witness (uncounted). Pure in-RAM codec/selftest
+# --- (runs every boot, no card needed) — METAL-CONFIRMED present 2026-07-12, now REQUIRE. -----
+REQUIRE K4-ready:.*prefix\) PASS
+
+# --- IMG-SIG code-signing witness (uncounted): the loader mints the IMAGE_SHA256 principal.
+# --- METAL-CONFIRMED 2026-07-12 (real Pi 4, kernel a834b8f) → promoted PENDING -> REQUIRE. --------
+REQUIRE IMG-SIG:.*residual closed\) PASS
 FORBID IMG-SIG:.*FAIL
 
 # --- FATDIRS directory create/remove witness (uncounted): create_dir/remove_dir drive the live
-# --- volume end to end. Needs a card (the selftest writes real dirs), so PENDING (promotes to
-# --- REQUIRE at first capture) — a no-card / 3-of-4-core metal boot must not fail the chain. -----
-PENDING FATDIRS:.*delete_located\) PASS
+# --- volume end to end. METAL-CONFIRMED 2026-07-12 → promoted PENDING -> REQUIRE. ----------------
+REQUIRE FATDIRS:.*delete_located\) PASS
 FORBID FATDIRS:.*FAIL
 
 # --- FATMOVE rename/move witness (uncounted): rename_entry/move_entry drive the live volume end to
 # --- end (rename in place; move a file across dirs by reference; onto-existing + directory refused).
-# --- Needs a card (the selftest writes real entries), so PENDING (promotes to REQUIRE at first
-# --- capture) — a no-card / 3-of-4-core metal boot must not fail the chain. --------------------------
-PENDING FATMOVE:.*keep-chain\) PASS
+# --- METAL-CONFIRMED 2026-07-12 (Pi captured it FIRST, freeing the Orin bench) -> REQUIRE. ---------
+REQUIRE FATMOVE:.*keep-chain\) PASS
 FORBID FATMOVE:.*FAIL
+
+# NOTE (bench operators): these five are now hard REQUIREs. On a rare no-card / hub-MSC-vid=0000
+# boot the card-dependent selftests won't emit — re-seat the data card and re-boot (that IS the
+# recovery); don't demote the spec. The 3-of-4-core CAPSTONE variance is separate (see the header).

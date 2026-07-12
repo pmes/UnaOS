@@ -10,6 +10,30 @@ Legend: **✅ metal-confirmed** · **🔬 QEMU-green, metal pending** · dates I
 
 ---
 
+## Pi 4 metal — round-9 attended bench (2026-07-12) — ✅ `hw-pi4`
+
+One boot on a real Pi 4 (kernel `a834b8f`) cleared the whole accrued Pi metal backlog. `mbench`
+vs `pi4-regression.spec` = **30/30 required, 0 forbidden**, CAPSTONE **6/6** (all 4 cores up), the
+23-PASS fixture chain, and **zero** R1/CMD13/AARCH64-EXCEPTION/PANIC or A72 `EC=0` heal lines. Log
+`~/unaos-bench/pi-serial-2026-07-12-174020.log`. Flips to **✅ metal-confirmed** and promotes the
+spec PENDINGs → REQUIRE:
+
+- **K3** two-phase durable-first revoke — `K3-revoke … durable-first PASS [w=0x7f]` (revoke
+  survives reboot; kept grant intact; forced persist-fail → -EIO with the in-RAM grant intact).
+- **IMG-SIG** — `IMG-SIG … residual closed) PASS [w=0x7f/0x7f]`; K2-liveenf re-admit by
+  name + IMAGE-digest confirmed live.
+- **FATDIRS** (create_dir/remove_dir) — `FATDIRS … delete_located) PASS [w=0xff]`.
+- **FATMOVE** (rename_entry/move_entry) — `FATMOVE … keep-chain) PASS [w=0x1ff]`. Pi captured
+  it FIRST, so the Orin JD10 bench no longer owes the FATMOVE witness.
+- **K4-ready** — `K4-ready … prefix) PASS [w=0xff/0xff]` (pure in-RAM codec, rode the boot).
+- **F2/F3 under TRUE 4-core parallelism** — both `locked 240000/240000 intact (0 lost)`;
+  unlocked lost 120000/240000 (exactly 50%). Serialization holds on silicon (QEMU cannot test
+  this leg).
+
+Spec promotions committed here; the granular arc detail is in each arc's own entry below.
+
+---
+
 ## hw-jetson track — 2026-07-12 (JD10 — the panel moves & renames: `mv`)
 
 ### JD10 — `mv <src> <dst>` on the Orin panel shell (move/rename by relinking one entry, no new fat.rs) 🔬 `hw-jetson`
