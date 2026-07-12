@@ -89,7 +89,7 @@ network); the socket syscall family is greenfield (next free number: 19).
 
 | Arc | Content | Track |
 | :--- | :--- | :--- |
-| SOCK-1 | smoltcp vendored + a `Device` adapter over the e1000e rings, behind a `UNAOS_SMOLNET` build knob (knob-off byte-identical). Shell `ping`/`arp`/`netinfo` ride smoltcp's interface knob-on — the honest QEMU witness (slirp answers ICMP echo at 10.0.2.2) | x86 first (aarch64 has no wired NIC) |
+| SOCK-1 ✅ 🔬 | **Landed (round 9, `net-sock1`).** smoltcp 0.13.1 (0BSD, `no_std`, static buffers) + the `E1000Phy` `Device` adapter over the e1000e rings, behind `UNAOS_SMOLNET` (knob-off byte-identical, both arches). Shell `ping`/`arp`/`netinfo` ride smoltcp's ICMP socket + interface knob-on; the boot witness pings slirp's gateway ×4 (`:: SOCK-1: … 4/4 replies — witness OK ::`). No syscalls. See [`08_NET/networking.md`](../unaos/docs/dev/OS/08_NET/networking.md). | x86 first (aarch64 has no wired NIC) |
 | SOCK-2 | The socket syscall family (UDP first) over smoltcp's socket set — ring 3 reaches the network for the first time | x86 |
 | SOCK-3+ | TCP sockets; DHCP via smoltcp; aarch64 NIC bring-up joins here (§6 row) | later |
 

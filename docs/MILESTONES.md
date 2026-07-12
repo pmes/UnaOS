@@ -10,6 +10,33 @@ Legend: **✅ metal-confirmed** · **🔬 QEMU-green, metal pending** · dates I
 
 ---
 
+## net-sock1 track — 2026-07-12 (SOCK-1 — smoltcp adopted: `ping`/`arp`/`netinfo` ride the mature stack)
+
+### SOCK-1 — smoltcp 0.13.1 + the e1000e `Device` adapter 🔬 `net-sock1`
+- **What:** the first arc of the [§1b](ROADMAP.md) migration off the hand-rolled `crates/net` line
+  onto **smoltcp** (0.13.1, 0BSD, `no_std`, static buffers). A new `crates/kernel/src/smolnet.rs`
+  implements a `smoltcp::phy::Device` (`E1000Phy`) over the existing e1000e RX/TX rings, plus a
+  throwaway-per-op `Interface` (10.0.2.15/24, gw 10.0.2.2) carrying an ICMP socket. Knob-on
+  (`UNAOS_SMOLNET=1`) the shell's `ping` / `arp` / `netinfo` route through smoltcp; the hand-rolled
+  engines stay compiled and still own `connect`/`fetch`/`udpsend` (SOCK-2/3 own the socket rewrite).
+- **The Device seam (additive):** three new x86-only, feature-gated accessors on the driver —
+  `e1000::raw_rx` (pop one raw L2 frame + recycle the descriptor, no `net::ingress` dispatch),
+  `raw_tx` (thin wrapper over the private `transmit`), `hw_addr` (MAC / IP / link). The existing
+  `poll()`/`transmit()` paths are untouched. Poll-driven only (never in the MSI handler); fully
+  static / stack-local (no heap growth). ARP MAC surfacing: the Device snoops inbound ARP replies
+  via `net::arp::learn` (read-only), since smoltcp hides the resolved neighbor MAC.
+- **Byte-identical off, x86-only on:** `smoltcp` is an **x86-only optional dependency**; the
+  `smolnet` feature + every call site is `#[cfg(all(feature = "smolnet", target_arch = "x86_64"))]`.
+  Knob-off pulls no smoltcp and is binary-identical to base (both arches); knob-on aarch64 resolves
+  the feature to a no-op (never compiles smoltcp). Knob plumbed in `arroyo` **and**
+  `builder/src/main.rs` (the builder rebuilds the kernel).
+- **Features enabled:** `medium-ethernet`, `proto-ipv4`, `socket-icmp` (`default-features = false`;
+  no `alloc`/`std`). No syscall surface — no `SECURITY.md` row yet (SOCK-2 brings that).
+- **Tested (QEMU):** knob-off — `check` green both arches, `test 25` MISSION, `test-arm 22` MISSION
+  (zero aarch64 impact). Knob-on — `UNAOS_SMOLNET=1 check` green, `UNAOS_SMOLNET=1 test 60` MISSION +
+  the uncounted witness line `:: SOCK-1: smoltcp icmp echo 10.0.2.2 4/4 replies — witness OK ::`
+  (slirp's gateway answered all four smoltcp-originated echoes). Metal pending (needs a wired NIC).
+
 ## hw-jetson track — 2026-07-12 (JD7 — the panel shapes the tree: `mkdir` / `rmdir`)
 
 ### JD7 — `mkdir` / `rmdir` on the Orin panel shell (thin FATDIRS glue) 🔬 `hw-jetson`
