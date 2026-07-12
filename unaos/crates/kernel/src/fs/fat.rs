@@ -1539,6 +1539,165 @@ impl FatFs {
         })
     }
 
+    // =============================================================================================
+    // FATDIRS (pi4-lane, round 8 — seat-granted additive exception, sibling of JD6's block above):
+    // directory CREATE / REMOVE. Two new public methods + one private helper, placed adjacent to the
+    // JD6 dir-aware twins, with ZERO edits to any existing fn. They COMPOSE the reviewed primitives —
+    // `alloc_cluster` (compare-and-claim under FAT_MUTATION), `create_in_dir`/`locate_in_dir` (the JD6
+    // twins), `write_dir_entry_fields`/`read_dir`/`delete_located` — each of which already rides
+    // `FAT_MUTATION`/`DIR_MUTATION`. Consumed by the aarch64 panel's `mkdir`/`rmdir` (JD7) AFTER this
+    // arc merges: call, never edit.
+    //
+    // LOCKING (invariant 5 — SOUND WITHOUT the syscall-layer NAMESPACE lock, because EL1 shell callers
+    // reach fat.rs directly): every SECTOR mutation is SMP-atomic via the existing per-RMW locks, and
+    // `DIR_MUTATION` is never widened past its documented single-sector-RMW span (holding it across a
+    // directory SCAN or across `free_chain`'s block I/O would break the IRQ-masked-non-preemptible span
+    // rule its doc-comment fixes). The COMPOSITE scan->mutate sequences are therefore NOT held under one
+    // lock. That leaves exactly ONE honest-scope residual, ledgered in SECURITY.md like F3's
+    // two-cores-mid-syscall interleave: `remove_dir`'s emptiness-scan -> `delete_located` is not atomic
+    // against a concurrent `create_in_dir` INTO the same target directory (a file linked between the
+    // scan and the free is orphaned in a freed chain). EXCLUDED_BY_SEQUENCING today — the only FS
+    // mutators are the single-threaded EL1 panel shell, EL0 syscalls (serialized by the syscall
+    // NAMESPACE lock), and the await-verdict-sequenced reaper; none races another FS mutator. The fix
+    // when concurrent EL1 mutators appear is a fat.rs namespace lock spanning both sequences — a future
+    // seam change that would have to touch `create_in_dir`, so it is out of this additive grant.
+    // =============================================================================================
+
+    /// FATDIRS: write the two mandatory entries into a freshly allocated directory cluster — `.` (self,
+    /// `first_cluster = self_cluster`) and `..` (parent, `first_cluster = parent_first_cluster`; `0` when
+    /// the parent is the volume root, per the FAT convention the read walkers already honour). Both are
+    /// DIR-attr (`0x10`), size 0. The cluster is a zero-filled UNLINKED orphan (`alloc_cluster` just
+    /// claimed + zeroed it), so the bytes after `..` stay `0x00` — a correct end-of-directory terminator
+    /// — and NO lock is needed: no other core can reach the cluster until `create_dir` publishes it into
+    /// the parent (the same reason `alloc_cluster`'s zero-fill writes unlocked).
+    fn init_subdir_cluster(&self, self_cluster: u32, parent_first_cluster: u32) -> Result<(), FatError> {
+        let mut buf = [0u8; SECTOR_SIZE];
+        // "." = 0x2E + ten spaces (name bytes 0..11); attr 0x10; first_cluster = self.
+        buf[0] = b'.';
+        for b in &mut buf[1..11] {
+            *b = b' ';
+        }
+        buf[11] = 0x10; // ATTR_DIRECTORY
+        buf[20..22].copy_from_slice(&((self_cluster >> 16) as u16).to_le_bytes());
+        buf[26..28].copy_from_slice(&((self_cluster & 0xFFFF) as u16).to_le_bytes());
+        // ".." = two 0x2E + nine spaces (name bytes 32..43); attr 0x10; first_cluster = parent (0 = root).
+        buf[32] = b'.';
+        buf[33] = b'.';
+        for b in &mut buf[34..43] {
+            *b = b' ';
+        }
+        buf[43] = 0x10;
+        buf[52..54].copy_from_slice(&((parent_first_cluster >> 16) as u16).to_le_bytes());
+        buf[58..60].copy_from_slice(&((parent_first_cluster & 0xFFFF) as u16).to_le_bytes());
+        // size@28..32 and @60..64 stay 0 (directories report size 0); the rest of the cluster is already
+        // zero (alloc_cluster), so this one sector fully initializes the directory.
+        write_sector(self.cluster_lba(self_cluster), &buf)
+    }
+
+    /// FATDIRS: create a subdirectory `name` in the directory at `parent_first_cluster` (`0` ⇒ the volume
+    /// root). Allocates ONE cluster for the child, initializes it with the mandatory `.`/`..` entries,
+    /// then links a fresh DIR-attr (`0x10`) entry in the parent and publishes the child cluster into it.
+    /// Returns the PARENT's new directory entry with its on-disk (LBA, slot-offset) — the shape
+    /// `create_in_dir` returns, so a caller (JD7) can hang a K-lineage ACL row on the entry.
+    ///
+    /// CRASH ORDERING (invariant 2 — init the child BEFORE linking the parent): the child cluster is
+    /// fully allocated + `.`/`..`-initialized before the parent entry is written, and the parent link is
+    /// itself two writes — `create_in_dir` writes a 0-cluster DIR entry, then `write_dir_entry_fields`
+    /// publishes the child cluster (the last write). A crash/power-loss fails SAFE at every step:
+    ///   * before/during the child init  -> an orphaned (leaked) cluster, chkdsk-reclaimable;
+    ///   * after `create_in_dir`, before the publish -> a DIR entry with `first_cluster == 0` (the
+    ///     JD6-ledgered FstClus==0 corner — a `cd` into it would list the root via `read_dir(0)`) plus
+    ///     the child cluster leaked. Malformed but NEVER a live entry pointing at a cluster that later
+    ///     gets freed/aliased — the safe-failure invariant holds.
+    ///
+    /// Mirrors `create_in_dir`'s de-dup contract: the CALLER confirms `name` is absent first (as
+    /// shell.rs's `fs_touch` does for files) — this does not de-duplicate. Errors: `Unsupported` (name
+    /// not a representable 8.3 short name), `NoSpace` (no free cluster, or the parent directory is full —
+    /// subdir-chain extension is out of scope), `Io`/`BadChain`/`NoDisk` from the primitives.
+    pub fn create_dir(
+        &self,
+        parent_first_cluster: u32,
+        name: &str,
+    ) -> Result<(DirEntry, u64, usize), FatError> {
+        // Validate the name BEFORE any allocation, so a bad name leaks no cluster.
+        let _ = format_83(name).ok_or(FatError::Unsupported)?;
+        // 1. Allocate + zero-fill the child cluster (compare-and-claim under FAT_MUTATION; EOC-terminated,
+        //    UNLINKED — unreachable by any reader until step 3/4 publish it).
+        let child = self.alloc_cluster()?;
+        // 2. Initialize `.`/`..` in the child. MUST complete before the parent link (crash order). On
+        //    failure, release the just-claimed cluster so nothing leaks.
+        if let Err(e) = self.init_subdir_cluster(child, parent_first_cluster) {
+            let _ = self.set_fat_entry(child, 0);
+            return Err(e);
+        }
+        // 3. Link the parent: a fresh 0-cluster DIR entry (create_in_dir's slot scan + DIR_MUTATION RMW).
+        let (_, lba, off) = match self.create_in_dir(parent_first_cluster, name, 0x10) {
+            Ok(t) => t,
+            Err(e) => {
+                let _ = self.set_fat_entry(child, 0); // release the child (nothing points at it yet)
+                return Err(e);
+            }
+        };
+        // 4. Publish the child cluster into the parent entry (DIR_MUTATION RMW); size stays 0. LAST write.
+        //    A failure here leaves the fail-safe `first_cluster == 0` corner documented above.
+        self.write_dir_entry_fields(lba, off, child, 0)?;
+        // Re-read the finished entry so the returned DirEntry is byte-for-byte what a reader sees.
+        match self.locate_in_dir(parent_first_cluster, name) {
+            Ok(t) => Ok(t),
+            Err(_) => Err(FatError::Io), // unreachable: we just created + published it
+        }
+    }
+
+    /// FATDIRS: remove the EMPTY subdirectory `name` from the directory at `parent_first_cluster` (`0` ⇒
+    /// the volume root). Locates the entry, refuses a non-directory target and a `first_cluster == 0`
+    /// target (a root-like / malformed 0-cluster dir — the volume root is never nameable and must never
+    /// be freed), verifies the directory holds ONLY `.` and `..` (the `read_dir` walk), then deletes it
+    /// exactly as a file (`delete_located` = mark the parent entry `0xE5`, THEN free the chain). Returns
+    /// the freed clusters (the `delete_located` shape).
+    ///
+    /// Errors (existing `FatError` variants — the ENOTDIR/ENOTEMPTY fidelity gap is ledgered for JD7):
+    ///   * `NotFound`    -> `name` is absent in the parent (caller: -ENOENT);
+    ///   * `Unsupported` -> the target is NOT a directory, or is a `first_cluster == 0` root-like entry
+    ///                      (caller: -ENOTDIR / -EBUSY-or-EINVAL for root-refusal);
+    ///   * `IsDirectory` -> the directory is NOT empty (holds an entry beyond `.`/`..`) (caller: today
+    ///                      -EISDIR; -ENOTEMPTY once `FatError` grows a variant, which touches the
+    ///                      jetson-lane shell.rs errno map — a future seam change, not this arc);
+    ///   * `Io`/`BadChain`/`NoDisk` propagate from the primitives.
+    ///
+    /// CRASH ORDERING: `delete_located` marks the parent entry `0xE5` FIRST, then frees the chain — a
+    /// crash leaves the directory GONE with its cluster still marked used (a benign leaked cluster),
+    /// never a live entry pointing at a freed/aliased cluster.
+    ///
+    /// CONCURRENCY (invariant 3): the emptiness-scan -> `delete_located` is NOT atomic against a
+    /// concurrent `create_in_dir` into THIS target (check-then-delete TOCTOU). Honest-scope,
+    /// EXCLUDED_BY_SEQUENCING today (no concurrent EL1 FS mutators; EL0 sequences ride the syscall
+    /// NAMESPACE lock) — ledgered in SECURITY.md alongside F3's residual; see the FATDIRS block comment.
+    pub fn remove_dir(
+        &self,
+        parent_first_cluster: u32,
+        name: &str,
+    ) -> Result<alloc::vec::Vec<u32>, FatError> {
+        let (de, lba, off) = self.locate_in_dir(parent_first_cluster, name)?;
+        if !de.is_dir {
+            return Err(FatError::Unsupported); // not a directory (caller: -ENOTDIR)
+        }
+        let child = de.first_cluster();
+        if child == 0 {
+            // A 0-cluster dir entry (the JD6 FstClus==0 corner) or a root-like target: refuse. read_dir(0)
+            // lists the ROOT and "cluster 0" is not freeable — the root is never removed.
+            return Err(FatError::Unsupported); // (caller: -EBUSY/-EINVAL for root-refusal)
+        }
+        // Emptiness: the child must hold ONLY `.` and `..`. Any third real entry -> refuse.
+        for e in self.read_dir(child)? {
+            let n = e.name();
+            if n != "." && n != ".." {
+                return Err(FatError::IsDirectory); // not empty (caller: -ENOTEMPTY)
+            }
+        }
+        // Delete exactly as a file: 0xE5 the parent entry FIRST, then free the child's chain.
+        self.delete_located(lba, off, child)
+    }
+
     /// U10: the on-disk location of the first FREE root-directory slot (a `0x00` end marker or a `0xE5` deleted
     /// slot). `NoSpace` if the root directory is full — extending the root-directory chain is out of scope this
     /// arc. Writing into the first `0x00` slot preserves the terminator (the slots after it stay `0x00`), and a
