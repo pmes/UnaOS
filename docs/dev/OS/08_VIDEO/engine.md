@@ -276,6 +276,54 @@ Verbatim readout on the real 2012 rMBP (over FTDI serial):
 - GPU topology exactly as the interface model predicted: Intel HD 4000 (`8086:0166`) + NVIDIA GT 650M
   (`10de:0fd5`), the GT 650M owning the framebuffer via the gmux default.
 
+### VPERF-WC — write-combining the framebuffer mapping (x86-only, landed post-round-6)
+
+The M3 shadow removed the *reads* (`vread=0`); VPERF-WC accelerates the *writes*. The round-6
+metal readout showed the framebuffer still **effective-UC** (var-range MTRR UC, PAT=WB in the l2
+PTE), so the shadow's write-only sequential blits were posted **uncombined** — each store its own
+uncached PCIe transaction. Marking the framebuffer **Write-Combining** lets the CPU's WC buffers
+coalesce those sequential stores into burst transactions (~10× on the write path is the metal
+expectation the next attended bench measures).
+
+**Mechanism** (`arch/x86_64/memory.rs`, called from `fbcon::init`):
+
+- `ensure_pat_wc()` programs one **unused IA32_PAT slot** — PA4 — to WC (encoding `0x01`). Power-on
+  PAT is `[WB,WT,UC-,UC]` in entries 0–3 and *duplicates* them in 4–7; no firmware/kernel mapping
+  ever sets a PTE's PAT bit, so entries 4–7 are dead. Writing only PA4 leaves 0–3 — every live
+  mapping — byte-identical. Programmed on the **BSP**; idempotent.
+- `set_framebuffer_wc(base, len)` retypes every identity-map **leaf** covering the fb range to
+  select PA4 — set the PAT bit (bit 7 in a 4 KiB PTE, **bit 12** in a 2 MiB/1 GiB leaf), clear
+  PCD/PWT — under `with_page_tables_writable` (the WP-clear page-table-edit sequence), then
+  `invlpg`s the span. Runs **once**. `wbinvd` is **not** issued: the fb was effective-UC, so no
+  cache line holds fb data to write back.
+
+**Scope (seat-signed).** This is a **memory-TYPE change only**, on the **fb leaves only**. It writes
+no page-permission bit (PRESENT/WRITABLE/USER/NX), no MTRR, and no other mapping — **SMEP/NXE/W^X
+are untouched** (they live in CR4/EFER and the U/W/NX PTE bits, none of which this writes). The
+firmware maps the fb with 2 MiB huge leaves inside the GPU's own BAR aperture (device MMIO, not
+RAM/heap/kernel), so the retyped span *is* the framebuffer's own mapping.
+
+**All x86 builds** carry the retype (GUI blits benefit too), un-gated by `videobench` — it rides
+`fbcon::init`, where the fb range is known. aarch64 is **byte-identical** (every symbol is
+`cfg(target_arch = "x86_64")`; flat-image equivalence holds under the ratified standard —
+default-features virt + `-Ccodegen-units=1` tegra flat images hash-identical base↔tip).
+
+**APs.** An AP that also blits keeps its default PA4=WB, which under the UC MTRR is effective-UC —
+so an AP blit is plain UC (no speedup). This is **correct, not merely tolerated**: WC and UC are
+both uncacheable (no cache line holds fb data), so the mix is *not* the SDM 11.12.4 WB-aliasing
+hazard — it is exactly the write-only-framebuffer pattern, just un-accelerated on the AP. Wiring
+`ensure_pat_wc()` into `smp::ap_entry` for uniform WC is a one-line follow-up, left out to keep the
+arc in-lane.
+
+**Witness.** The `videobench` `fbmem` readout is the on-target witness (QEMU + metal): the retype
+flips it from `pte=…00e3 pat=WB eff=UC` to `pte=…10e3 pat=WC eff=WC`, and a boot line
+`:: x86 fb-wc: retyped N leaf(s) WC (PAT PA4) over <base>..<end> ::` fires in every x86 build.
+QEMU (synthetic bochs fb) already reflects `eff=WC` after the retype — it proves the **code path**;
+only the attended rMBP bench proves the **speed**. QEMU screendumps are **pixel-identical** pre/post
+(same SHA-256): WC changes write buffering, not final memory content. **METAL PENDING** — rides the
+next attended rMBP bench (spec `round6-rmbp.spec` carries the `eff=WC` PENDING line, promoted at
+first metal capture).
+
 **VPERF-OBS — the raw_print console-path lesson (fix `bfa1711`, 2026-07-11).** On the FIRST bench boot
 NONE of the `:: vperf: …` readout lines printed on metal, though QEMU had shown them all. Root cause:
 `vperf::raw_print` wrote ONLY the SERIAL1 (16550) UART leg, which is `None` on the rMBP (no 16550 — the

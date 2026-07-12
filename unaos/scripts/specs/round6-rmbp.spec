@@ -63,6 +63,12 @@ REQUIRE S4: grow/create/delete SYNCHRONOUS in-syscall.*-> PASS
 # THE DECIDER: eff=WC → VPERF-WC dead; eff=UC (or any non-WC) → VPERF-WC triggers
 # bench-FIRST. Record the fbmem line VERBATIM in the seat baton either way.
 REQUIRE vperf: fbmem mtrr=.*pte=.*pat=.*eff=.*fb=
+# VPERF-WC (landed post-round-6, never on metal): the fb mapping is now retyped
+# Write-Combining (PAT PA4). At the NEXT attended bench the readout must flip from
+# the round-6 eff=UC to eff=WC (pat=WC, PTE PAT bit set) and the retype line fires.
+# PENDING: matches once the WC build boots on metal — promote to REQUIRE then.
+PENDING vperf: fbmem .*pat=WC eff=WC
+PENDING x86 fb-wc: retyped .* leaf\(s\) WC \(PAT PA4\)
 # Expect BOTH GPUs named (GT 650M scans out via gmux default; HD 4000 also present).
 REQUIRE vperf: display.*class
 REQUIRE vperf: display.*owns fb
