@@ -23,9 +23,10 @@
 //! native Quartzite window that draws them aspect-fit. Decoding and the sRGB
 //! OETF live here, in the vessel; the quartzite image view is a dumb blitter.
 //!
-//! MVP: a static picture on screen, aspect-fit, right-side-up, color-managed.
-//! Pan/zoom, per-pixel readout, and the euclase textured-quad (GPU) path are
-//! the later arcs (ROADMAP §3a).
+//! The picture shows aspect-fit, right-side-up, and color-managed, and the
+//! quartzite view gives it hands: zoom about the cursor, drag-pan, reset-to-fit,
+//! and a live per-pixel readout (FACET-2). The euclase textured-quad (GPU) path
+//! is the remaining later arc (ROADMAP §3a).
 
 use bandy::telemetry;
 use gneiss_pal::paths::UnaPaths;
@@ -112,9 +113,12 @@ fn main() {
         image.pixels.len()
     );
 
-    // 4. Pack linear → sRGB RGBA once, here in the vessel.
+    // 4. Pack linear → sRGB RGBA once, here in the vessel. Keep the source
+    //    linear RGB too — the image view surfaces it in the FACET-2 pixel
+    //    readout alongside the packed sRGB.
     let (w, h) = (image.width, image.height);
     let rgba = pack_srgba(&image);
+    let linear = image.pixels;
 
     // 5. The Window (macOS AppKit via quartzite; further backends follow
     //    quartzite maturity).
@@ -133,7 +137,9 @@ fn main() {
                 (h as f64).clamp(160.0, 1000.0),
             ),
             move |window| {
-                quartzite::platforms::macos::image_view::bootstrap_image_view(window, &rgba, w, h)
+                quartzite::platforms::macos::image_view::bootstrap_image_view(
+                    window, &rgba, &linear, w, h,
+                )
             },
         )
         .run();
