@@ -10,7 +10,7 @@ license = "LGPL-3.0-or-later"
 gneiss_pal = { path = "../gneiss_pal", optional = true }
 bandy = { path = "../bandy", optional = true }
 serde = { version = "1.0", default-features = false, features = ["derive", "alloc"] }
-bincode = { version = "2", default-features = false, features = ["serde", "alloc"] }
+bincode = { version = "2.0", default-features = false, features = ["serde", "alloc"] }
 thiserror = { version = "2.0", default-features = false }
 anyhow = { version = "1.0.102", optional = true }
 memmap2 = { version = "0.9", optional = true }

@@ -89,6 +89,7 @@ depend on it with `default-features = false`.
 | On-disk types (`Superblock`, `Inode`, `Extent`, `AttributeValue`, `FileKind`, `DirEntry`, `CatalogEntry`, `JournalOp`) | ✅ | ✅ |
 | `codec` (bincode 2.x `legacy()` serialization seam) | ✅ | ✅ |
 | `BlockDevice` trait + `MemDevice` | ✅ | ✅ |
+| `adapter` (512↔4096 `BlockAdapter` over `SectorDevice`; GPT/MBR parse; `MemSectorDevice`) | ✅ | ✅ |
 | `UnaFS` core ops (`format`/`mount`/`read`/`write`/`ls`/`mkdir`/`set_attribute`/`get_attribute`) | ✅ | ✅ |
 | `FileDevice` (host file backend) | ✅ | — |
 | `io::MappedFile` (memmap reader) | ✅ | — |
@@ -98,6 +99,37 @@ depend on it with `default-features = false`.
 The `no_std` build is verified against the kernel's own bare target
 (`aarch64-unknown-none-softfloat`), where `std` is genuinely absent from the
 sysroot.
+
+## The kernel block adapter (BeFS-K2)
+
+`adapter.rs` bridges the kernel's storage primitive to the UnaFS block seam.
+The kernel exposes 512 B logical sectors (USB/SD), possibly at a partition
+offset; UnaFS speaks 4096 B blocks.
+
+- **`SectorDevice`** — the generic 512 B-sector trait the kernel's block driver
+  implements (`read_sector` / `write_sector` / `sector_count` / `flush`). Host
+  tests use `MemSectorDevice`, the 512 B twin of `MemDevice`; the kernel wires
+  its real driver in the K3 mount arc. `&mut S` is itself a `SectorDevice`, so a
+  device can be borrowed for a probe and handed back.
+- **`BlockAdapter<S>`** — implements `BlockDevice` over a `SectorDevice`. Block
+  `id` maps to the eight contiguous sectors `[base_lba + id*8, +8)`, where
+  `base_lba` is the partition offset. `block_count` bounds the exposed volume;
+  reads/writes at or beyond it fail `OutOfBounds` before touching the device,
+  and every `base_lba + id*8 + i` uses `checked_*` so a crafted or corrupt span
+  can never wrap into an in-bounds sector.
+- **`parse_partitions`** — reads the MBR at LBA 0; on a protective GPT entry
+  (type `0xEE`) it parses the GPT header at LBA 1 and its entry array, otherwise
+  the four MBR primaries. It validates the boot/GPT signatures, entry size,
+  entry-count range, and LBA ordering, and rejects any partition whose extent
+  runs past the backing device.
+- **`locate_unafs`** — parses the table, then probes each partition's block 0
+  for the `UNAFS` superblock magic, returning the first match as a
+  `PartitionSpan { base_lba, block_count }` ready for
+  `BlockAdapter::for_partition`. The volume is identified by its on-disk
+  signature, not a reserved partition type, so any partitioning tool works.
+
+The adapter is a pure block-level remap: it never touches serialization, so the
+frozen on-disk format (and its KATs) are unaffected.
 
 ## On-disk format and the KAT contract
 
@@ -145,7 +177,7 @@ Planned arcs (sequencing in [`docs/ROADMAP.md`](../../docs/ROADMAP.md) §2):
 | F4 | Per-attribute B+tree indexes: log-time equality, true range queries |
 | F5 | **Live queries** — delta-emitting persistent queries published over bandy (the query-driven spatial UI, now including similarity) |
 | F6–F8 | B+tree directories; metadata checksums; extent trees |
-| K1–K4 | Kernel convergence: **`no_std` core (K1, ✅ landed)** → 512↔4096 block adapter + partitions → read-only kernel mount of a real volume → journaled kernel writes |
+| K1–K4 | Kernel convergence: **`no_std` core (K1, ✅ landed)** → **512↔4096 block adapter + partitions (K2, ✅ landed)** → read-only kernel mount of a real volume → journaled kernel writes |
 
 The capability model (see [`docs/SECURITY.md`](../../docs/SECURITY.md)) stores
 principals and grants as ordinary typed attributes (`owner`, `grants:*`), so

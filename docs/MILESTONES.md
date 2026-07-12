@@ -87,6 +87,48 @@ Legend: **✅ metal-confirmed** · **🔬 QEMU-green, metal pending** · dates I
 
 ---
 
+## storage lane (`us-unafs2`) — 2026-07-12 (UNAFS-2 — the kernel block adapter)
+
+### UNAFS-2 — 512 B-sector device → unafs 4096 B `BlockDevice`, + GPT/MBR partition offsets 🔬 `us-unafs2`
+- **What (host-native, `libs/unafs/**` only):** the second link in the BeFS convergence chain
+  (**BeFS-K2**). K1 gave a `no_std` unafs with a clean 4096 B `BlockDevice` seam; K2 makes a real kernel
+  device speak it. New `adapter.rs`: a `no_std` + `alloc` module that presents the kernel's 512 B logical
+  sectors (USB/SD, possibly at a partition offset) as unafs's 4096 B blocks. **Zero on-disk-format touch**
+  — a pure block-level remap; the frozen serialization and its KATs are untouched.
+- **The 512↔4096 mapping (M1):** `BlockAdapter<S>` implements `BlockDevice` over a generic `SectorDevice`
+  trait (`read_sector`/`write_sector`/`sector_count`/`flush`). One 4096 B block maps to eight contiguous
+  512 B sectors at `base_lba + block*8`, where `base_lba` is the partition offset. `block_count` bounds the
+  exposed volume: reads/writes at or beyond it fail `OutOfBounds` before touching the device, and every
+  `base_lba + id*8 + i` uses `checked_*` — a crafted or corrupt span can never wrap into an in-bounds
+  sector. The seam is generic so it host-tests with `MemSectorDevice` (the 512 B twin of `MemDevice`) and
+  the kernel wires its real driver in K3; `&mut S` is itself a `SectorDevice` so a device can be borrowed
+  for a probe and handed back.
+- **GPT/MBR partition parse (M2):** `parse_partitions` reads the MBR at LBA 0; on a protective GPT entry
+  (type `0xEE`) it parses the GPT header at LBA 1 + its entry array, otherwise the four MBR primaries. Bound
+  checks throughout: boot signature (`0x55AA`), GPT `"EFI PART"` signature, entry size (≥128) and count
+  (≤65536) ranges, `last ≥ first` LBA ordering, and every partition extent validated against the device
+  sector count (a partition running past the device is rejected `OutOfBounds`). `locate_unafs` parses the
+  table then probes each partition's block 0 for the `UNAFS` superblock magic — identifying the volume by
+  its on-disk signature, not a reserved partition type, so any partitioning tool's layout works — and
+  returns a `PartitionSpan { base_lba, block_count }` for `BlockAdapter::for_partition`.
+- **Seat additions folded in:** bincode pin tightened `"2"` → `"2.0"` (caret-breadth hardening; the 8 KATs
+  pass unchanged after the pin — the format defence holds either way); the missing empty-`Vec<DirEntry>`
+  KAT added (`0000000000000000` — a bare u64 length prefix of 0, the on-disk form of an empty directory).
+- **Tested (host):** `cargo test -p unafs` green — **28 tests**: 6 adapter unit + 10 adapter fixture
+  (synthetic GPT/MBR + bound-check negatives + `locate_unafs` magic-probe) + 8 KAT (unchanged count — the
+  new empty-`Vec<DirEntry>` golden vector rides inside `kat_direntry`) + 4 pre-existing integration;
+  `cargo check -p unafs --no-default-features --target
+  aarch64-unknown-none-softfloat` clean (std genuinely absent — the module is `no_std` by construction);
+  `cargo check` workspace default-members green (downstream unaffected); `./arroyo check` both arches green
+  — **zero `unaos/` (kernel) diff** (K3 wires the driver, not this arc). Metal N/A (host-native library).
+- **Ledger note (carried to K3):** the torn-mount warning in `fs.rs` is a `std`-gated `println!`; a `no_std`
+  logging seam is wanted before the K3 kernel mount so a dirty-volume warning surfaces on metal. Recorded in
+  the K3 next-baton draft.
+- **Commits:** M1 mapping · M2 partitions · M3 no_std + docs (see `git log` on `us-unafs2`). Next in the
+  BeFS chain: K3 read-only kernel mount of a real USB volume.
+
+---
+
 ## storage lane (`us-unafs1`) — 2026-07-12 (UNAFS-1 — the `no_std` port, format frozen)
 
 ### UNAFS-1 — `libs/unafs` → `#![no_std]` + `alloc`, byte layout pinned by golden KATs 🔬 `us-unafs1`

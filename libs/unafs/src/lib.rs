@@ -33,6 +33,7 @@
 #[cfg_attr(not(feature = "std"), macro_use)]
 extern crate alloc;
 
+pub mod adapter;
 pub mod bitmap;
 pub mod catalog;
 pub mod codec;
@@ -46,6 +47,10 @@ pub mod storage;
 pub mod superblock;
 pub mod wal;
 
+pub use adapter::{
+    BlockAdapter, MemSectorDevice, Partition, PartitionScheme, PartitionSpan, PartitionTable,
+    SECTOR_SIZE, SECTORS_PER_BLOCK, SectorDevice, SectorError, locate_unafs, parse_partitions,
+};
 pub use catalog::{CatalogEntry, deserialize_catalog, serialize_catalog};
 pub use fs::{DirEntry, UnaFS};
 pub use inode::{AttributeValue, Extent, ExtentList, FileKind, Inode, InodeError};
