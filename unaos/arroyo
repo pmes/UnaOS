@@ -50,6 +50,10 @@ _feats=""
 # readout, display-BAR probe, scripted scroll scenario). x86_64-only module — aarch64 media are
 # byte-identical with this on or off.
 [ -n "${UNAOS_VIDEOBENCH:-}" ] && _feats="${_feats}videobench,"
+# SOCK-1: route the shell's ping/arp/netinfo + a boot ICMP witness through the smoltcp stack
+# (ROADMAP §1b). x86-only optional dep + x86-gated module — enabling it on the aarch64 `check`
+# invocation is a no-op (smoltcp isn't pulled for that target), so aarch64 stays byte-identical.
+[ -n "${UNAOS_SMOLNET:-}" ] && _feats="${_feats}smolnet,"
 # VPERF M2: the fbcon viewport-cap bench lever (implies videobench). x86_64 only.
 [ -n "${UNAOS_VIDEOCAP:-}" ] && _feats="${_feats}videocap,"
 [ -n "${UNAOS_TEGRA:-}" ] && _feats="${_feats}tegra,"

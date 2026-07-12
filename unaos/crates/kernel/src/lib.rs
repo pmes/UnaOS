@@ -29,6 +29,11 @@ pub mod arch;
 pub mod drivers;
 pub mod fs;
 
+// SOCK-1: the smoltcp Device adapter over the e1000e. x86-only + feature-gated so aarch64 and
+// knob-off builds never see it (byte-identical). See smolnet.rs / docs/dev/OS/08_NET/networking.md.
+#[cfg(all(feature = "smolnet", target_arch = "x86_64"))]
+pub mod smolnet;
+
 pub mod allocator;
 pub mod shell;
 pub mod selftest;

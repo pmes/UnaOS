@@ -1029,6 +1029,9 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
                         n.mmio_base, n.rx_count, n.tx_count, n.irq_count
                     ));
                     console.println(&alloc::format!("TCP listener (:7) active conns: {}", n.tcp_conns));
+                    // SOCK-1 (knob-on): report the smoltcp interface riding the same NIC.
+                    #[cfg(all(feature = "smolnet", target_arch = "x86_64"))]
+                    console.println(&crate::smolnet::info_line());
                 }
                 None => console.println("No network device ready."),
             }
@@ -1043,7 +1046,15 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
                     console.println(&alloc::format!(
                         "PING {}.{}.{}.{} ({} requests)", ip[0], ip[1], ip[2], ip[3], count));
                     // Blocks while it ARP-resolves the target and waits for each reply.
-                    match crate::drivers::e1000::ping(ip, count) {
+                    // SOCK-1 (knob-on): route through the smoltcp ICMP socket instead of the
+                    // hand-rolled engine; the outcome shape + renderer below are unchanged.
+                    let outcome = {
+                        #[cfg(all(feature = "smolnet", target_arch = "x86_64"))]
+                        { crate::smolnet::ping(ip, count) }
+                        #[cfg(not(all(feature = "smolnet", target_arch = "x86_64")))]
+                        { crate::drivers::e1000::ping(ip, count) }
+                    };
+                    match outcome {
                         Some(o) if o.resolved => {
                             let peer = o.mac
                                 .map(|m| crate::drivers::e1000::fmt_mac(&m))
@@ -1060,12 +1071,22 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
         },
         "arp" => {
             match args.first().and_then(|s| parse_ipv4(s)) {
-                Some(ip) => match crate::drivers::e1000::arp_resolve(ip) {
-                    Some(mac) => console.println(&alloc::format!(
-                        "{}.{}.{}.{} is-at {}",
-                        ip[0], ip[1], ip[2], ip[3], crate::drivers::e1000::fmt_mac(&mac))),
-                    None => console.println("no ARP reply (host unreachable / no NIC)"),
-                },
+                Some(ip) => {
+                    // SOCK-1 (knob-on): resolve via smoltcp's neighbor discovery (ARP-triggering
+                    // poll) instead of the hand-rolled cache; the rendering below is unchanged.
+                    let resolved = {
+                        #[cfg(all(feature = "smolnet", target_arch = "x86_64"))]
+                        { crate::smolnet::arp_resolve(ip) }
+                        #[cfg(not(all(feature = "smolnet", target_arch = "x86_64")))]
+                        { crate::drivers::e1000::arp_resolve(ip) }
+                    };
+                    match resolved {
+                        Some(mac) => console.println(&alloc::format!(
+                            "{}.{}.{}.{} is-at {}",
+                            ip[0], ip[1], ip[2], ip[3], crate::drivers::e1000::fmt_mac(&mac))),
+                        None => console.println("no ARP reply (host unreachable / no NIC)"),
+                    }
+                }
                 None => console.println("usage: arp <a.b.c.d>"),
             }
         },

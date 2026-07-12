@@ -53,6 +53,9 @@ fn main() {
     if std::env::var("UNAOS_VIDEOBENCH").is_ok() { feats.push("videobench"); }
     // VPERF M2: the fbcon viewport-cap bench lever (implies videobench). x86_64 only.
     if std::env::var("UNAOS_VIDEOCAP").is_ok() { feats.push("videocap"); }
+    // SOCK-1: route the shell's ping/arp/netinfo + the boot ICMP witness through smoltcp. x86-only
+    // optional dep + module. (The builder rebuilds the kernel, so this MUST mirror arroyo's mapping.)
+    if std::env::var("UNAOS_SMOLNET").is_ok() { feats.push("smolnet"); }
     // `tegra` (Jetson Orin / Tegra234 UART) is an aarch64 board feature; mapped here for parity with
     // the `pi` knob, though this x86_64 builder never produces aarch64 media (the `arroyo` script does).
     if std::env::var("UNAOS_TEGRA").is_ok() { feats.push("tegra"); }
