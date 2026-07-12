@@ -86,7 +86,7 @@ fn test_big_bang() {
     // 6. Verify Persistence (Mount)
     // UnaFS consumes device. We need to extract it back.
     // Since `fs` owns `device` (public), we can take it.
-    let device_back = fs.device;
+    let device_back = fs.device.clone();
 
     let mut fs2 = UnaFS::mount(device_back).expect("Mount failed");
 

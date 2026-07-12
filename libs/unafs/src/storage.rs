@@ -135,6 +135,7 @@ impl BlockDevice for FileDevice {
 /// An in-memory block device backed by a `Vec<u8>`.
 ///
 /// Useful for testing and temporary filesystems.
+#[derive(Clone)]
 pub struct MemDevice {
     data: Vec<u8>,
 }
