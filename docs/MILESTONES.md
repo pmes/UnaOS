@@ -254,6 +254,52 @@ Legend: **✅ metal-confirmed** · **🔬 QEMU-green, metal pending** · dates I
 - **Detail:** [`SECURITY.md` §K1 (K4-ready bullet)](SECURITY.md). **Commit:** `34cdb94` (`hw-pi4`); docs in
   the follow-on.
 
+## hw-pi4 track — 2026-07-12 (FATMOVE — the fat.rs rename/move seam: `rename_entry` / `move_entry`)
+
+### FATMOVE — `rename_entry` / `move_entry`: additive, lock-correct FAT rename + cross-directory move 🔬 `hw-pi4`
+- **Why:** `mv` is the last unimplemented classic file-manager verb on the Orin panel, and its
+  move-across-directories needs a genuinely-new `fat.rs` mutation — "unlink the source dir entry WITHOUT
+  freeing the chain" (no existing public twin). A mutation bug in arch-shared `fat.rs` hits all three
+  platforms, so the seam lands as a **dedicated pi4-lane arc** (the F2/F3/K*/FATDIRS lock lineage is this
+  track's expertise), which a future jetson `mv` arc (JD10) consumes call-never-edit (the FATDIRS/JD7 split).
+- **What:** two new public `fat.rs` methods next to the FATDIRS block, **ZERO edits to any existing fn**:
+  `rename_entry(parent_first_cluster, old_leaf, new_leaf) -> (DirEntry, u64, usize)` (rewrite the 8.3 name
+  IN PLACE — a SINGLE dir-sector RMW; `first_cluster`/`size`/`attr` unchanged; works on files AND dirs,
+  since an in-place rename never disturbs `.`/`..`) and `move_entry(src_parent, leaf, dst_parent, new_leaf)
+  -> (DirEntry, u64, usize)` (write the destination entry over the SAME `first_cluster`/`size`, then `0xE5`
+  the source WITHOUT freeing the chain — the data clusters move BY REFERENCE), plus one private single-sector
+  `write_dir_entry_name`. They compose `locate_in_dir`/`create_in_dir` + `write_dir_entry_fields`/
+  `mark_dir_deleted` (each already riding `DIR_MUTATION`); no `alloc_cluster`, no `free_chain`. The source's
+  exact attribute byte is preserved across a move.
+- **Crash ordering (invariant 2 — NEVER lose the chain):** `move_entry` publishes the DESTINATION entry
+  FIRST, then `0xE5`s the source. A crash between the two leaves a benign DUPLICATE (two names, one chain);
+  the operator removes the unwanted one by its entry (`rm OLDNAME`). The reverse order could orphan the
+  chain — forbidden. Every window fails toward a leaked/duplicate name, never a lost or aliased chain.
+- **Directories (invariant 3):** `rename_entry` renames a directory in place (allowed — `..` untouched);
+  `move_entry` of a directory across parents is REFUSED (`IsDirectory`; the `..` rewrite is out of scope).
+- **Locking / honest residual (invariants 4 + 5):** every sector RMW is SMP-atomic via the existing
+  `DIR_MUTATION` span, never widened to cover both of `move_entry`'s two dir-sector RMWs (cross-sector
+  atomicity is **EXCLUDED_BY_SEQUENCING** for EL1 callers — the SAME class FATDIRS ledgered, closed by the
+  SAME future `fat.rs` namespace lock). Sound WITHOUT the syscall NAMESPACE lock (EL1 shell callers reach
+  `fat.rs` directly). **ACL re-key flag:** the `OWNED_FILES` ACL keys by `(dir_lba, dir_off)` — an in-place
+  rename preserves the key, but a `move_entry` writes a new slot, so a future EL0 move of an OWNED file MUST
+  re-key the ACL row (+ persisted `UNAFS.ATR` fields) or refuse; ledgered for the K-line + JD10 (no EL0
+  plumbing this arc; the EL1 panel is ASID-0 public). **Error fidelity flag:** reuses existing `FatError`
+  variants — dest-exists → `Unsupported` (caller pre-checks + surfaces `-EEXIST` locally), dir-move →
+  `IsDirectory` (`-EISDIR`); enriching `FatError` is a future jetson-lane change.
+- **Tested (QEMU):** `check` green both arches; `kernel8` compiles; `kernel8-test 35` = **23 PASS
+  byte-identical** + CAPSTONE 6/6 + all prior witnesses (K1-atr/persist/corrupt, K2-liveenf, K3-revoke,
+  IMG-SIG, FATDIRS, K4-ready, F2/F3 locked 240000/240000) intact + the new uncounted
+  `:: FATMOVE: … PASS [w=0x1ff] ::` (9 assertions: rename same-head+size / old-gone-new=same-chain / content
+  intact / onto-existing refused; move cross-dir by reference / content intact / onto-existing refused /
+  directory refused / empty 0-cluster file relinked), zero FAIL, zero R1/CMD13; `test-arm 22` MISSION
+  SUCCESS. Zero x86 behavioural change
+  (additive; no x86 caller). The `fatmove_check` selftest is fully self-cleaning (leaves the volume pristine).
+- **Metal:** the seam's attended money-shot rides a future jetson `mv` (JD10) Orin panel bench, sequenced
+  per the code-prerequisite rule; a Pi-side exercise of the witness batches onto the next Pi bench.
+- **Detail:** [`SECURITY.md`](SECURITY.md) aarch64 ledger (FATMOVE entry). **Commit:** on `hw-pi4` (the seat
+  assigns the integration hash at merge).
+
 ## hw-pi4 track — 2026-07-12 (FATDIRS — the fat.rs directory-mutation seam: `create_dir` / `remove_dir`)
 
 ### FATDIRS — `create_dir` / `remove_dir`: additive, lock-correct FAT directory create + remove 🔬 `hw-pi4`
