@@ -424,6 +424,37 @@ Legend: **✅ metal-confirmed** · **🔬 QEMU-green, metal pending** · dates I
 - **Detail:** [`SECURITY.md` §K1 (K3 bullet)](SECURITY.md). **Commit:** `syscall(aarch64): K3 — two-phase
   revoke commit-ordering + fixture` on `hw-pi4` (see `git log`).
 
+### IMG-SIG — code-signing: graduate the principal from PROGRAM_NAME to IMAGE_SHA256; the name-collision residual RETIRED 🔬 `hw-pi4`
+- **What:** the last honest identity residual the U6 ACL carried — "two blobs with the same 8.3 name are the
+  same principal". `load_program_into_slot` (the SOLE principal mint path) now stamps `image_of(&bytes)` =
+  `kind = IMAGE_SHA256` over the SHA-256 of the loaded IMAGE, not `program_name(name)`. Two byte-identical
+  images share a principal (a re-spawn / a reboot-persisted owner is re-admitted); two DIFFERENT images under
+  the same trusted name do NOT (a swapped blob is refused `-EACCES`). In-lane, no new crate: a no_std FIPS
+  180-4 SHA-256 (`sha256`/`sha256_compress`); `PrincipalRecord::image_sha256` stores the 30-byte digest PREFIX
+  in the fixed `value[30]` field (240-bit identity, NO format bump — the on-disk row/CRC/codec are
+  byte-transparent). The K2 launcher/metal fixtures now compute the expected owner via `image_principal_of_file`
+  (mount+read+hash, no slot) rather than a name literal.
+- **Scope (honest):** image IDENTITY, not authentication — a plain digest, so it does NOT resist an OFFLINE
+  attacker who rewrites the plaintext `UNAFS.ATR` row (no HMAC/signature; the Pi 4 has no protected key store).
+  It closes ONLINE / same-boot substitution and the cross-reboot same-name-different-code adoption. The K3 SMP
+  concurrent-repersist window and the torn-row confidentiality-downgrade residual are UNCHANGED (identity, not
+  commit-ordering). Enforcement is principal-agnostic (`PrincipalRecord` compared by value), so the K1/K2/K3
+  fixtures — which manually stamp PROGRAM_NAME on scratch ASIDs — are unaffected and the battery is
+  byte-equivalent.
+- **Proof:** `image_sig_selftest` (last in the U7 chain, read-only, no disk write): FIPS KATs for `""`/`"abc"`
+  /a 56-byte padding-overflow message; constant-buffer discrimination (identical→equal, one-byte-diff→distinct,
+  IMAGE ≠ PROGRAM_NAME by kind); real-image discrimination (`K2OWN.BIN` vs `K2IMP.BIN` → distinct stable
+  IMAGE_SHA256 principals). Emits an uncounted `:: IMG-SIG: … residual closed) PASS [w=0x7f/0x7f] ::`.
+- **Tested (QEMU):** `check` BOTH arches (x86 unchanged); `kernel8` baremetal; `kernel8-test` → **29 PASS
+  (23 + CAPSTONE 6) / 0 FAIL byte-equivalent** (the `:: IMG-SIG: … PASS ::` witness the only addition,
+  UNCOUNTED; K2-liveenf now witnesses re-admit-by-IMAGE-digest, still `PASS [w=0x7f]`) + CAPSTONE 6/6 + F2/F3
+  witnesses locked 240000/240000 + K1-atr/persist/corrupt + K3-revoke, zero R1/CMD13; `test-arm` MISSION
+  SUCCESS. Zero x86 (all changes in aarch64 `syscall.rs` + the regression spec's OPTIONAL IMG-SIG line).
+- **Metal:** 🔬 QEMU-verified; the real-image discrimination through disk-loaded programs rides the next
+  attended Pi bench (batched with the standing K1/K2/K3 metal watch-items).
+- **Detail:** [`SECURITY.md` §K1 (IMG-SIG bullet)](SECURITY.md). **Commit:** `syscall(aarch64): IMG-SIG —
+  IMAGE_SHA256 code-signing principal + witness` on `hw-pi4` (see `git log`).
+
 ## hw-jetson track — 2026-07-10 (JD4 — read-side navigation + last dead levers + screen-on-boot; same-day attended bench)
 
 ### JD4 — `ls <dir>` / `cd` / `pwd` / `cat <path>` on the panel shell + JB2c/JB9b lever retirement + screen-on-boot ✅ METAL-CONFIRMED (2026-07-10) `hw-jetson`
