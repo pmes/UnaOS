@@ -10730,8 +10730,9 @@ const FATMOVE_C: &str = "FMC.BIN"; // a second root file (rename-collision + mov
 const FATMOVE_SUB: &str = "FMSUB"; // scratch subdirectory (the move destination parent)
 const FATMOVE_D: &str = "FMD.BIN"; // a file inside FMSUB (the move-onto-existing collision target)
 const FATMOVE_DIR: &str = "FMDIR"; // a root subdir (the move-a-directory refusal target)
+const FATMOVE_E: &str = "FME.BIN"; // an EMPTY (0-cluster) file — the head==0 move case
 const FATMOVE_LEN: usize = 700; // content length — spans >1 sector, so the whole chain moves by ref
-const FATMOVE_ALL: u32 = 0xFF; // all 8 assertions (M1 rename bits 0-3, M2 move bits 4-7)
+const FATMOVE_ALL: u32 = 0x1FF; // all 9 assertions (M1 rename bits 0-3, M2 move bits 4-8)
 
 /// FATMOVE: the deterministic content pattern written into the scratch file, so a byte-for-byte
 /// read-back after a rename and a move proves the cluster chain travelled intact.
@@ -10746,7 +10747,7 @@ fn fatmove_cleanup(fs: &crate::fs::fat::FatFs) {
     if let Ok((sde, _, _)) = fs.locate_in_dir(0, FATMOVE_SUB) {
         let sub = sde.first_cluster();
         if sub != 0 {
-            for name in [FATMOVE_A, FATMOVE_B, FATMOVE_C, FATMOVE_D] {
+            for name in [FATMOVE_A, FATMOVE_B, FATMOVE_C, FATMOVE_D, FATMOVE_E] {
                 if let Ok((de, lba, off)) = fs.locate_in_dir(sub, name) {
                     let _ = fs.delete_located(lba, off, de.first_cluster());
                 }
@@ -10755,7 +10756,7 @@ fn fatmove_cleanup(fs: &crate::fs::fat::FatFs) {
         let _ = fs.remove_dir(0, FATMOVE_SUB);
     }
     let _ = fs.remove_dir(0, FATMOVE_DIR);
-    for name in [FATMOVE_A, FATMOVE_B, FATMOVE_C] {
+    for name in [FATMOVE_A, FATMOVE_B, FATMOVE_C, FATMOVE_E] {
         if let Ok((de, lba, off)) = fs.locate_in_dir(0, name) {
             let _ = fs.delete_located(lba, off, de.first_cluster());
         }
@@ -10879,6 +10880,22 @@ fn fatmove_check() -> u32 {
     {
         w |= 1 << 7;
     }
+    // bit8: move an EMPTY (0-cluster) file across dirs — create FME.BIN in root (no write, so
+    // first_cluster==0, size==0), move root/FME.BIN -> FMSUB/FME.BIN; the new entry is a 0-length
+    // file, the root name is gone. Proves the head==0 relink path (an empty file has no chain to lose).
+    let fme_made = fs.create_in_dir(0, FATMOVE_E, 0x20).is_ok();
+    if fme_made {
+        if let Ok((ede, _, _)) = fs.move_entry(0, FATMOVE_E, sub, FATMOVE_E) {
+            if ede.first_cluster() == 0
+                && ede.size == 0
+                && !ede.is_dir
+                && matches!(fs.locate_in_dir(0, FATMOVE_E), Err(FatError::NotFound))
+                && fs.locate_in_dir(sub, FATMOVE_E).is_ok()
+            {
+                w |= 1 << 8;
+            }
+        }
+    }
 
     fatmove_cleanup(&fs);
     w
@@ -10897,7 +10914,7 @@ fn fatmove_launcher() {
     }
     let w = fatmove_check();
     serial_println!(
-        ":: FATMOVE: fat.rs rename_entry(in-place 8.3 name RMW) + move_entry(dst-entry-first, then 0xE5 src keep-chain) {} (rename: name-swap, old gone/new=same head+size, content intact, onto-existing refused; move: cross-dir by-reference, content intact, onto-existing refused, directory refused) [w={:#04x}] ::",
+        ":: FATMOVE: fat.rs rename_entry(in-place 8.3 name RMW) + move_entry(dst-entry-first, then 0xE5 src keep-chain) {} (rename: name-swap, old gone/new=same head+size, content intact, onto-existing refused; move: cross-dir by-reference, content intact, onto-existing refused, directory refused, empty-file relink) [w={:#05x}] ::",
         if w == FATMOVE_ALL { "PASS" } else { "FAIL" },
         w
     );

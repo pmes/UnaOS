@@ -186,9 +186,10 @@ Legend: **✅ metal-confirmed** · **🔬 QEMU-green, metal pending** · dates I
 - **Tested (QEMU):** `check` green both arches; `kernel8` compiles; `kernel8-test 35` = **23 PASS
   byte-identical** + CAPSTONE 6/6 + all prior witnesses (K1-atr/persist/corrupt, K2-liveenf, K3-revoke,
   IMG-SIG, FATDIRS, K4-ready, F2/F3 locked 240000/240000) intact + the new uncounted
-  `:: FATMOVE: … PASS [w=0xff] ::` (8 assertions: rename same-head+size / old-gone-new=same-chain / content
+  `:: FATMOVE: … PASS [w=0x1ff] ::` (9 assertions: rename same-head+size / old-gone-new=same-chain / content
   intact / onto-existing refused; move cross-dir by reference / content intact / onto-existing refused /
-  directory refused), zero FAIL, zero R1/CMD13; `test-arm 22` MISSION SUCCESS. Zero x86 behavioural change
+  directory refused / empty 0-cluster file relinked), zero FAIL, zero R1/CMD13; `test-arm 22` MISSION
+  SUCCESS. Zero x86 behavioural change
   (additive; no x86 caller). The `fatmove_check` selftest is fully self-cleaning (leaves the volume pristine).
 - **Metal:** the seam's attended money-shot rides a future jetson `mv` (JD10) Orin panel bench, sequenced
   per the code-prerequisite rule; a Pi-side exercise of the witness batches onto the next Pi bench.

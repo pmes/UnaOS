@@ -1835,9 +1835,7 @@ impl FatFs {
     /// with `rename_entry`, which does not disturb `..`.)
     ///
     /// Errors (existing `FatError` variants — see the FATMOVE block's errno-fidelity note):
-    ///   * `Unsupported` -> `new_leaf` not 8.3, OR a `first_cluster == 0` source (a 0-cluster/root-like
-    ///                      entry has no chain to relink by reference — refuse rather than publish a
-    ///                      0-cluster duplicate);
+    ///   * `Unsupported` -> `new_leaf` is not a representable 8.3 name;
     ///   * `NotFound`    -> `leaf` absent in `src_parent` (caller: -ENOENT);
     ///   * `IsDirectory` -> `leaf` is a directory (caller: -EISDIR — cross-parent dir move unsupported);
     ///   * `Unsupported` -> `new_leaf` already exists in `dst_parent` (the dest-exists backstop — the
@@ -1859,13 +1857,10 @@ impl FatFs {
         if src_de.is_dir {
             return Err(FatError::IsDirectory); // cross-parent directory move is out of scope (`..` rewrite)
         }
+        // The chain head (`0` for a legitimately EMPTY 0-length file — a valid, movable case: an empty
+        // file simply carries no clusters, so the "move the chain by reference" is a no-op relink and
+        // there is no chain to lose).
         let head = src_de.first_cluster();
-        if head == 0 {
-            // A 0-cluster/root-like source has no chain to relink by reference. Refuse rather than
-            // publish a 0-cluster duplicate. (The write path allocates on the first byte, so a real
-            // file always has a chain; this is the defensive/malformed corner.)
-            return Err(FatError::Unsupported);
-        }
         // Dest-exists check (locate-first). Across different parents no self-collision is possible;
         // within the SAME parent a hit means `new_leaf` canon == `leaf` canon (a same-name move —
         // the caller routes those to `rename_entry`). Any hit -> refuse; NotFound -> proceed.
