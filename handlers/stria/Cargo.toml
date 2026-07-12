@@ -1,3 +1,10 @@
+# =====================================================================
+# CRATE: handlers/stria/Cargo.toml
+# DESCRIPTION: The Studio handler. A bus-driven audio handler that owns
+#              the resonance engine lifecycle and speaks SMessage on the
+#              Bandy Synapse. Library crate — no window, no binary.
+# =====================================================================
+
 [package]
 name = "stria"
 version = "0.1.0"
@@ -5,8 +12,8 @@ edition = "2024"
 license = "LGPL-3.0-or-later"
 
 [dependencies]
-gneiss_pal = { path = "../../libs/gneiss_pal" }
-tokio = { version = "1", features = ["full"] }
-crossbeam = "0.8"
-glam = "0.24"
-num_cpus = "1.0"
+bandy = { path = "../../libs/bandy" }
+resonance = { path = "../../libs/resonance" }
+tokio = { version = "1.49", features = ["rt", "sync", "time", "macros"] }
+anyhow = "1.0"
+log = "0.4"
