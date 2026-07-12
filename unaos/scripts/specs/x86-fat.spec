@@ -49,3 +49,17 @@ FORBID EXCEPTION:
 # --- ideal PASS count = 25 incl. S5; the S5 FAIL text evades arroyo's detector, so witness
 # --- PRESENCE is the real gate on knob-on runs — seat fold at the S5 merge, 2026-07-11) ----
 OPTIONAL S5: cross-process read serves LIVE shared backing
+
+# --- STOR-1 knob-ON uncounted witnesses (S4-mf2 / S4-race / S6-witness / S7-openany): they use
+# --- the `— witness OK ::` idiom (NOT `-> PASS`), so they do NOT add to the COUNT above and the
+# --- default FORBIDs (`-> FAIL`, `FAIL ::`, `PANIC`) do NOT catch their `FAIL — …` failure text.
+# --- So on knob-on runs, PRESENCE (OPTIONAL) + an explicit per-witness FORBID on the FAIL variant
+# --- is the gate. Knob-off the sf run omits them entirely, so all stay silent — both builds pass.
+# --- (S7 = STOR-1 S7: an open of an arbitrary on-disk file, off the pre-stage set — 2026-07-12.) --
+OPTIONAL S4-mf2: RW open of staged code
+OPTIONAL S4-race
+OPTIONAL S6-witness: NAMESPACE cross-core RMW
+OPTIONAL S7-openany: a non-staged on-disk file
+FORBID S4-mf2 FAIL
+FORBID S6-witness FAIL
+FORBID S7-openany FAIL

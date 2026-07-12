@@ -84,6 +84,13 @@ pub enum BlockOp {
     /// `0xE5` FIRST, then free the whole chain in all FAT copies). Idempotent — a `name` already
     /// absent returns `0`. Returns `0` (deleted or already gone) or `-EIO`.
     Delete,
+    /// S7 STAT: resolve `name` on the live volume (`find_located`) and return its ON-DISK SIZE (`>= 0`,
+    /// bytes) — the one fact the IF-masked syscall handler cannot get itself (it can't mount/walk the
+    /// FAT). `sys_open`'s arbitrary-file path submits this to size the read-only descriptor it opens over
+    /// a PRE-EXISTING on-disk file that is neither staged nor a U10 name. `-ENOENT` (absent, or a
+    /// directory — the file-open path never opens a dir), `-EIO` (no volume / I/O error / a size that does
+    /// not fit the `i32` result channel). Allocates nothing, touches no sector beyond the directory walk.
+    Stat,
 }
 
 /// A storage transaction submitted to the service task. It lives on the SUBMITTER'S kernel stack:
@@ -154,6 +161,10 @@ impl BlockRequest {
 
 /// Negative errno the block layer's failures map to (matches the syscall layer's `EIO`).
 const EIO: i32 = -5;
+/// S7: "no such file" — a `Stat` of a name absent from the live volume (or naming a directory). Distinct
+/// from `EIO` so the syscall layer maps it to `-ENOENT` (name not found) vs. `-EIO` (a real I/O error).
+/// Matches the syscall layer's `ENOENT`.
+const ENOENT: i32 = -2;
 
 /// The submission queue: raw `*mut BlockRequest` addresses (stored as `usize` so the static is
 /// `Sync` — the scheduler's `park_waiters` idiom). Pushed by submitters (IF already masked in the
@@ -272,6 +283,18 @@ pub unsafe fn submit_delete(name: &[u8]) -> i32 {
     unsafe { submit(&mut req as *mut BlockRequest) }
 }
 
+/// S7 helper the syscall layer calls: STAT file `name` on the LIVE volume — return its on-disk size
+/// (`>= 0`, bytes) or a negative errno (`-ENOENT` absent / a directory, `-EIO` no volume / I/O error /
+/// size overflow). Blocks the caller on the service task. No data buffer (a stat reads only the
+/// directory). The arbitrary-file `sys_open` path uses the size to bound the read-only descriptor's EOF.
+///
+/// SAFETY: the caller must be a scheduled task (so it can block on the service task).
+pub unsafe fn submit_stat(name: &[u8]) -> i32 {
+    let mut req = BlockRequest::new_file(BlockOp::Stat, name, 0, core::ptr::null_mut(), 0);
+    req.done.init();
+    unsafe { submit(&mut req as *mut BlockRequest) }
+}
+
 /// The service task body: pop one request, run it at IF=1, post the submitter. A normal scheduled
 /// kernel task, so its `hlt` inside the BOT pump wakes on the storage MSI-X. Never returns (the
 /// infinite loop makes the effective type `!`; `spawn` wants a `fn(usize)`, so it is left `()`).
@@ -337,6 +360,7 @@ fn service_one(req: &mut BlockRequest, fs: &mut Option<crate::fs::fat::FatFs>) -
         BlockOp::Create => service_create_file(req, fs),
         BlockOp::Grow => service_grow_file(req, fs),
         BlockOp::Delete => service_delete_file(req, fs),
+        BlockOp::Stat => service_stat_file(req, fs),
     }
 }
 
@@ -434,6 +458,29 @@ fn service_delete_file(req: &mut BlockRequest, fs: &mut Option<crate::fs::fat::F
         Ok(_) => EIO, // a directory under this name — never delete it via the file path
         Err(crate::fs::fat::FatError::NotFound) => 0, // already gone — idempotent
         Err(_) => EIO,
+    }
+}
+
+/// S7: STAT file `name` on the live volume — resolve it (`find_located`) and return its on-disk SIZE
+/// (`>= 0`, bytes), the EOF bound `sys_open`'s arbitrary-file path gives the read-only descriptor it
+/// opens. A directory under this name is `-ENOENT` (the file path never opens a dir, mirroring
+/// `service_read_file`'s `!is_dir` gate). A size that would not fit the `i32` result channel (`>
+/// i32::MAX`) is `-EIO` — a >2 GiB arbitrary file is not openable via this path (documented S7 bound;
+/// no demo/test file approaches it). Absent -> `-ENOENT`; a real mount/I/O error -> `-EIO`. Reads only
+/// the directory (via `find_located`), allocates nothing.
+fn service_stat_file(req: &mut BlockRequest, fs: &mut Option<crate::fs::fat::FatFs>) -> i32 {
+    let Some(fs) = mounted(fs) else { return EIO };
+    let Ok(name) = core::str::from_utf8(&req.name[..req.name_len]) else { return EIO };
+    match fs.find_located(name) {
+        Ok((de, _lba, _off)) if !de.is_dir => {
+            if de.size > i32::MAX as u32 {
+                return EIO; // the size does not fit the i32 result channel — not openable via S7
+            }
+            de.size as i32 // >= 0: the on-disk byte size
+        }
+        Ok(_) => ENOENT, // a directory under this name — not an openable file
+        Err(crate::fs::fat::FatError::NotFound) => ENOENT, // absent from the live volume
+        Err(_) => EIO,   // a real mount / I/O error
     }
 }
 
