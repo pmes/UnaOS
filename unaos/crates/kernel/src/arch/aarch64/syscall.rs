@@ -6575,8 +6575,13 @@ fn sys_unlink(handle: u64) -> i64 {
     // public/anonymous file — the whole battery — skips this with ZERO disk I/O, so the anonymous unlink path is
     // byte-identical. `atr_clear_row` takes its OWN fresh `ns` for the single-row write; done before the main `ns`
     // hold below (never nested).
-    if owner_ppid.kind != PRIN_NONE {
-        let _ = atr_clear_row(&fs, dir_lba, dir_off as u32);
+    // K3 (fold): a SWALLOWED clear failure would strand a stale owner row on disk (a dead fail-closed slot a
+    // future same-name file could adopt), so gate the destructive `0xE5` name delete on the durable clear
+    // ACTUALLY landing — abort with `-EIO` if it did not (fail-closed: the name still resolves, the owner
+    // retries; nothing stranded). `atr_clear_row` returns true for every benign case (no store / no row /
+    // partial image), so only a real disk read/write error trips this; the anonymous battery skips it entirely.
+    if owner_ppid.kind != PRIN_NONE && !atr_clear_row(&fs, dir_lba, dir_off as u32) {
+        return EIO;
     }
     // F3-M3: the NAMESPACE hold — the whole 0xE5 -> owned_clear -> mark-pending -> descriptor-drop sequence
     // runs atomically against any concurrent sys_open's lookup -> ACL -> incref (same lock). This closes the
@@ -6737,6 +6742,18 @@ fn sys_fgrant(file_handle: u64, child_handle: u64, rights: u64) -> i64 {
     // K1 M2.3: the grantee's PERSISTENT principal, captured BEFORE owned_grant (SLOT_PPID never nested under
     // OWNED_FILES). NONE for an anonymous grantee (the battery) — a NONE grant persists nothing.
     let grantee_ppid = slot_ppid_of(grantee_asid);
+    // K3: a REVOKE of a NAMED grantee on a NAMED-owner file uses TWO-PHASE commit ordering — persist the
+    // NARROWED row to disk BEFORE the in-RAM removal, so a crash or a swallowed disk error during the re-persist
+    // can never leave the revoked grant on disk to be re-admitted at the next mount (the retired fail-OPEN
+    // residual). Only a NAMED grantee is at risk: an anonymous (NONE) grantee persists as an inert NONE-principal
+    // row a rebuild never re-admits, so it keeps the byte-identical in-RAM-then-best-effort-persist order, as
+    // does every widen (grant/update) — a lost widen persist just drops the new grant (already fail-CLOSED).
+    // The owner authority was already validated by `owned_is_owner` above, so persisting first is sound.
+    if rights == 0 && grantee_ppid.kind != PRIN_NONE && owned_owner_ppid(dir_lba, dir_off).kind != PRIN_NONE {
+        return sys_fgrant_revoke_2phase(
+            dir_lba, dir_off, asid, asid_gen, grantee_asid, grantee_gen, caller_ppid, grantee_ppid,
+        );
+    }
     let rc = owned_grant(dir_lba, dir_off, asid, asid_gen, grantee_asid, grantee_gen, rights, caller_ppid, grantee_ppid);
     // K1 M2.3: if the ACL mutation succeeded on a NAMED-owner file, re-persist the row (owner + grants) so the
     // grant/revoke SURVIVES REBOOT. The named-owner check is an IN-RAM read (owned_owner_ppid) taken BEFORE the
@@ -6748,6 +6765,47 @@ fn sys_fgrant(file_handle: u64, child_handle: u64, rights: u64) -> i64 {
         }
     }
     rc
+}
+
+/// K3: the two-phase REVOKE of a named grantee on a named-owner file — the commit-ordering fix that retires the
+/// fail-OPEN revoke residual. The old order (in-RAM revoke, THEN best-effort re-persist) told the owner the
+/// revoke succeeded, but a crash / swallowed disk error during the re-persist left the OLD grant on disk, so the
+/// revoked grantee was re-admitted at the next mount. Here the durable side commits FIRST: compute the POST-revoke
+/// grant set from the current in-RAM snapshot, write that narrowed row to disk, and commit the in-RAM removal ONLY
+/// if the disk write held. A persist failure is FAIL-CLOSED — the in-RAM grant is left untouched (still enforced
+/// this boot) and the caller gets `-EIO`/`-ENODEV`, so RAM and disk never silently diverge (no false success).
+/// Callers: `sys_fgrant` (owner already validated) and the `k3_revoke_check` proof (manufactured principals).
+fn sys_fgrant_revoke_2phase(
+    dir_lba: u64,
+    dir_off: u32,
+    owner_asid: u64,
+    owner_gen: u64,
+    grantee_asid: u64,
+    grantee_gen: u64,
+    owner_ppid: PrincipalRecord,
+    grantee_ppid: PrincipalRecord,
+) -> i64 {
+    // Snapshot the current ACL and drop the target grantee (matched by its durable persistent principal — the
+    // on-disk key; the snapshot carries ppids only). A vanished row (raced unlink) leaves nothing to revoke.
+    let Some((row_owner, mut grants)) = owned_snapshot_row(dir_lba, dir_off) else {
+        return 0;
+    };
+    for g in grants.iter_mut() {
+        if g.1 != 0 && g.0.kind != PRIN_NONE && g.0 == grantee_ppid {
+            *g = (PrincipalRecord::NONE, 0);
+        }
+    }
+    let fs = match crate::fs::fat::mount() {
+        Ok(fs) => fs,
+        Err(crate::fs::fat::FatError::NoDisk) => return ENODEV,
+        Err(_) => return EIO,
+    };
+    // Phase 1 (durable-first): write the NARROWED row. On failure, do NOT commit in-RAM — fail closed.
+    if !atr_write_grant_row(&fs, dir_lba, dir_off, row_owner, &grants) {
+        return EIO;
+    }
+    // Phase 2: disk now reflects the revoke — commit the in-RAM removal (the owner is already validated).
+    owned_grant(dir_lba, dir_off, owner_asid, owner_gen, grantee_asid, grantee_gen, 0, owner_ppid, grantee_ppid)
 }
 
 // =============================================================================================
@@ -8254,9 +8312,11 @@ pub fn u7_launcher(demo_cpu: usize) {
     // separately spawned launchers is here the program order of one task. Each launcher's verdict waits on its
     // fixture's exit + teardown, so the demo slot is free again before the next builds — no new gate needed.
     // Keeping U9/U10 here (rather than a `sched::spawn` in main.rs) stays wholly inside the aarch64 syscall lane.
-    // K1 M2.4: restore persisted ownership from UNAFS.ATR before any EL0 fixture opens a file (in-lane boot hook).
-    // GATED OFF today (single launchable named program) -> a no-op with zero disk I/O, so the battery is
-    // byte-identical; the mechanism is proven by the M3 kernel-side proof.
+    // K1 M2.4 / K2: restore persisted ownership from UNAFS.ATR before any EL0 fixture opens a file (in-lane boot
+    // hook). The gate is now LIVE (K2 flipped `by_name_spawn_multivalued()` true), but on QEMU the fresh-per-build
+    // FAT has no UNAFS.ATR at this point (`k1_atr_selftest` creates it LATER in the chain), so the rebuild installs
+    // ZERO rows and the battery stays byte-identical; its live effect is on metal (a real power-cycle where a prior
+    // boot left a real row). The mechanism is proven by the M3 kernel-side proof + the K2 real-program launcher.
     atr_maybe_boot_rebuild();
     u7_run(demo_cpu);
     u8_launcher(demo_cpu);
@@ -8296,6 +8356,10 @@ pub fn u7_launcher(demo_cpu: usize) {
     k2_liveenf_launcher(demo_cpu);
     #[cfg(feature = "k2_leave")]
     k2_metal_launcher(demo_cpu);
+    // K3: the revoke-persist commit-ordering proof — a named-owner file's SYS_FGRANT revoke commits to disk
+    // BEFORE the in-RAM removal, so it SURVIVES REBOOT and fails CLOSED on a persist failure. Its own uncounted
+    // `:: K3-revoke: … PASS ::` line; fully self-cleaning (leaves no owned row on the metal card).
+    k3_revoke_launcher();
 }
 
 /// F2 M3 witness worker — the `demo_cpu` half of the cross-core FAT_MUTATION stress. `fn(usize)` for
@@ -9079,8 +9143,31 @@ fn atr_persist_grants(fs: &crate::fs::fat::FatFs, dir_lba: u64, dir_off: u32) ->
     let Some((owner_ppid, grants)) = owned_snapshot_row(dir_lba, dir_off) else {
         return true; // no in-RAM row (public / cleared) — nothing to persist
     };
+    // Refresh the on-disk row with the CURRENT (post-mutation) in-RAM owner + grants. The disk-write mechanics
+    // are shared with the K3 two-phase revoke via `atr_write_grant_row` (a NONE owner is the no-op battery path).
+    atr_write_grant_row(fs, dir_lba, dir_off, owner_ppid, &grants)
+}
+
+/// K3: the disk half of `atr_persist_grants`/the two-phase revoke — rewrite the on-disk UNAFS.ATR row for
+/// `(dir_lba, dir_off)` with an EXPLICIT owner + grant set (rather than re-snapshotting from OWNED_FILES), so a
+/// REVOKE can persist the NARROWED row to disk BEFORE it commits the in-RAM removal (see `sys_fgrant_revoke_2phase`).
+/// Preserves the durable name/first_cluster/size already on disk; refreshes only owner + grants. No-op (true, ZERO
+/// disk I/O) for a NONE owner (the whole battery) or when no persisted row exists yet (a create-persist that had
+/// failed — benign; the in-RAM ACL still holds this boot). UNDER a fresh `ns` for the single-row scan + `write_at`.
+fn atr_write_grant_row(
+    fs: &crate::fs::fat::FatFs,
+    dir_lba: u64,
+    dir_off: u32,
+    owner_ppid: PrincipalRecord,
+    grants: &[(PrincipalRecord, u32); NFGRANT],
+) -> bool {
     if owner_ppid.kind == PRIN_NONE {
         return true; // anonymous owner — nothing persists (the battery path; no disk touch)
+    }
+    // K3: test-only synthetic durable-write failure (set transiently by `k3_revoke_check`, which self-clears).
+    // Placed AFTER the NONE early-return so the anonymous battery path never observes it — byte-identical there.
+    if K3_TEST_FAIL_PERSIST.load(Ordering::Relaxed) {
+        return false;
     }
     let (de, _lba, _off) = match fs.find_located(ATR_NAME) {
         Ok(t) => t,
@@ -9112,7 +9199,7 @@ fn atr_persist_grants(fs: &crate::fs::fat::FatFs, dir_lba: u64, dir_off: u32) ->
         arr.copy_from_slice(&rows[start..start + ATR_ROW_STRIDE]);
         if let Some(existing) = atr_parse_row(&arr) {
             if existing.dir_lba == dir_lba && existing.dir_off == dir_off {
-                // Preserve the durable name/first_cluster/size; refresh owner + grants from the live ACL.
+                // Preserve the durable name/first_cluster/size; refresh owner + grants from the caller's set.
                 let row = AtrRow {
                     name: existing.name,
                     first_cluster: existing.first_cluster,
@@ -9276,12 +9363,12 @@ fn atr_rebuild_into_owned(fs: &crate::fs::fat::FatFs) -> usize {
     installed
 }
 
-/// K1 M2.4: the REAL-BOOT mount-rebuild hook — restore persisted ownership before EL0 programs run. GATED on
-/// `by_name_spawn_multivalued()`: today (a single launchable named program) it returns immediately with ZERO
-/// disk I/O, so the boot path is byte-identical and no persisted-owned file is enforced-then-bricked. Wired at
-/// the head of the demo launcher (in-lane); becomes live the instant a second launchable named program lands.
-/// The MECHANISM is proven independently by the M3 kernel-side proof, which calls `atr_rebuild_into_owned`
-/// directly with manufactured principals (not through this gate).
+/// K1 M2.4 / K2: the REAL-BOOT mount-rebuild hook — restore persisted ownership before EL0 programs run. GATED on
+/// `by_name_spawn_multivalued()`, now TRUE (K2 landed three launchable named programs), so a persisted owner is
+/// re-acquirable by re-spawning its named program and the rebuild is safe to run at boot. On QEMU (fresh-per-build
+/// FAT) `UNAFS.ATR` is absent here, so it installs ZERO rows and the boot path stays byte-identical; the live
+/// effect is on metal. Wired at the head of the demo launcher (in-lane). The MECHANISM is proven independently by
+/// the M3 kernel-side proof + the K2 real-program launcher, which drive `atr_rebuild_into_owned` directly.
 fn atr_maybe_boot_rebuild() {
     if !by_name_spawn_multivalued() {
         return; // cross-reboot enforcement gated off (single-program world) -> no rebuild, no I/O
@@ -9814,6 +9901,174 @@ fn k1_corrupt_launcher() {
     );
 }
 
+// K3: the revoke-persist commit-ordering proof — scratch state (torn down by the time it runs; the
+// u11_check_gen_rebind convention). Retires the LAST fail-OPEN residual: a durable revoke now commits to disk
+// BEFORE the in-RAM removal, so it SURVIVES REBOOT and fails CLOSED when the persist cannot land.
+const K3_SA_OWN: u64 = 6; // scratch OWNER ASID (reused after the K1 fixtures tear down)
+const K3_SA_GRT: u64 = 7; // scratch KEPT-GRANTEE ASID
+const K3_SA_GR2: u64 = 8; // scratch REVOKE-TARGET GRANTEE ASID
+const K3_FILE: &str = "K3REV.BIN"; // the named-owner scratch file
+const K3REVOKE_ALL: u32 = 0x7F; // all 7 assertions
+
+/// K3: delete the scratch file + clear its persisted UNAFS.ATR row + scratch stamps + the test knob, leaving the
+/// card EXACTLY as found. Robust to partial failures (re-resolves fresh, frees the grown chain).
+fn k3_revoke_cleanup() {
+    slot_ppid_clear(K3_SA_OWN);
+    slot_ppid_clear(K3_SA_GRT);
+    slot_ppid_clear(K3_SA_GR2);
+    K3_TEST_FAIL_PERSIST.store(false, Ordering::Relaxed); // belt-and-braces: never leave the fault knob set
+    if let Ok(fs) = crate::fs::fat::mount() {
+        if let Ok((de, lba, off)) = fs.find_located(K3_FILE) {
+            let _ = atr_clear_row(&fs, lba, off as u32);
+            owned_clear(lba, off as u32);
+            let _ = fs.delete_located(lba, off, de.first_cluster());
+        }
+    }
+}
+
+/// K3: PROVE the two-phase revoke commit-ordering end to end with real stamped principals (the `k1_persist_check`
+/// idiom — kernel-side + deterministic, no EL0 fixture). Persist a named-owner file with TWO grantees, revoke one
+/// through the PRODUCTION `sys_fgrant_revoke_2phase` path, and confirm across a (simulated) reboot that (1) the
+/// revoke SURVIVES — the revoked grantee is no longer re-admitted while the kept grantee still is — and (2) a
+/// FORCED persist failure fails CLOSED — the revoke reports `-EIO` and leaves the in-RAM grant intact, so RAM and
+/// disk never silently diverge. Returns a bitmask; PASS iff `== K3REVOKE_ALL`. Fully self-cleaning.
+fn k3_revoke_check() -> u32 {
+    let mut w = 0u32;
+    let fs = match crate::fs::fat::mount() {
+        Ok(f) => f,
+        Err(_) => return 0,
+    };
+    // Principals via the REAL stamp/read machinery.
+    slot_ppid_stamp(K3_SA_OWN, PrincipalRecord::program_name("K3OWN"));
+    slot_ppid_stamp(K3_SA_GRT, PrincipalRecord::program_name("K3GRT"));
+    slot_ppid_stamp(K3_SA_GR2, PrincipalRecord::program_name("K3GR2"));
+    let p_own = slot_ppid_of(K3_SA_OWN);
+    let p_grt = slot_ppid_of(K3_SA_GRT); // the grantee KEPT across the revoke
+    let p_gr2 = slot_ppid_of(K3_SA_GR2); // the grantee REVOKED
+    let Some(name11) = atr_name_from_str(K3_FILE) else {
+        k3_revoke_cleanup();
+        return w;
+    };
+
+    // ---- Phase 1: create a named-owner file, grant BOTH grantees READ, persist the ACL ----
+    let (de, lba, off) = match fs.create_in_root(K3_FILE, 0x20) {
+        Ok(t) => t,
+        Err(_) => {
+            k3_revoke_cleanup();
+            return w;
+        }
+    };
+    if fs.write_grow(de.first_cluster(), de.size, lba, off, 0, &[0xD3u8; 32]).is_err() {
+        k3_revoke_cleanup();
+        return w;
+    }
+    let gen_own = ASID_GEN[K3_SA_OWN as usize].load(Ordering::Acquire);
+    let gen_grt = ASID_GEN[K3_SA_GRT as usize].load(Ordering::Acquire);
+    let gen_gr2 = ASID_GEN[K3_SA_GR2 as usize].load(Ordering::Acquire);
+    owned_set_owner(lba, off as u32, K3_SA_OWN, gen_own, p_own);
+    // Persist matching production's create path (first_cluster/size = 0; name-primary rebuild).
+    let empty_grants = [(PrincipalRecord::NONE, 0u32); NFGRANT];
+    let ok_owner = atr_persist_row(&fs, name11, 0, 0, lba, off as u32, p_own, &empty_grants);
+    owned_grant(lba, off as u32, K3_SA_OWN, gen_own, K3_SA_GRT, gen_grt, CAP_READ, p_own, p_grt);
+    owned_grant(lba, off as u32, K3_SA_OWN, gen_own, K3_SA_GR2, gen_gr2, CAP_READ, p_own, p_gr2);
+    let ok_grants = atr_persist_grants(&fs, lba, off as u32);
+    if !(ok_owner && ok_grants) {
+        k3_revoke_cleanup();
+        return w;
+    }
+
+    // ---- Phase 2: simulate a reboot — rebuild purely from UNAFS.ATR; BOTH grantees admitted ----
+    owned_clear(lba, off as u32);
+    let fs2 = match crate::fs::fat::mount() {
+        Ok(f) => f,
+        Err(_) => {
+            k3_revoke_cleanup();
+            return w;
+        }
+    };
+    let _ = atr_rebuild_into_owned(&fs2);
+    let (rlba, roff) = match fs2.find_located(K3_FILE) {
+        Ok((_, l, o)) => (l, o as u32),
+        Err(_) => {
+            k3_revoke_cleanup();
+            return w;
+        }
+    };
+    if owned_access_ok(rlba, roff, K3_SA_GRT, gen_grt, CAP_READ, p_grt) {
+        w |= 1 << 0; // kept grantee admitted after rebuild (baseline)
+    }
+    if owned_access_ok(rlba, roff, K3_SA_GR2, gen_gr2, CAP_READ, p_gr2) {
+        w |= 1 << 1; // revoke-target grantee admitted after rebuild (baseline — a grant to revoke)
+    }
+
+    // ---- Phase 3: REVOKE the target through the PRODUCTION two-phase path (disk-first, then in-RAM) ----
+    if sys_fgrant_revoke_2phase(rlba, roff, K3_SA_OWN, gen_own, K3_SA_GR2, gen_gr2, p_own, p_gr2) == 0 {
+        w |= 1 << 2; // the two-phase revoke committed (durable write held, in-RAM removed)
+    }
+
+    // ---- Phase 4: simulate a SECOND reboot — the revoke SURVIVED (the retired fail-OPEN residual) ----
+    owned_clear(rlba, roff);
+    let fs3 = match crate::fs::fat::mount() {
+        Ok(f) => f,
+        Err(_) => {
+            k3_revoke_cleanup();
+            return w;
+        }
+    };
+    let _ = atr_rebuild_into_owned(&fs3);
+    let (slba, soff) = match fs3.find_located(K3_FILE) {
+        Ok((_, l, o)) => (l, o as u32),
+        Err(_) => {
+            k3_revoke_cleanup();
+            return w;
+        }
+    };
+    if !owned_access_ok(slba, soff, K3_SA_GR2, gen_gr2, CAP_READ, p_gr2) {
+        w |= 1 << 3; // revoked grantee DENIED after the reboot — the revoke is durable (was fail-OPEN before K3)
+    }
+    if owned_access_ok(slba, soff, K3_SA_GRT, gen_grt, CAP_READ, p_grt) {
+        w |= 1 << 4; // the kept grantee still admitted — the revoke was surgical, not a wholesale drop
+    }
+
+    // ---- Phase 5: a FORCED persist failure must fail CLOSED (no false success, no RAM/disk divergence) ----
+    K3_TEST_FAIL_PERSIST.store(true, Ordering::Relaxed);
+    let rc = sys_fgrant_revoke_2phase(slba, soff, K3_SA_OWN, gen_own, K3_SA_GRT, gen_grt, p_own, p_grt);
+    K3_TEST_FAIL_PERSIST.store(false, Ordering::Relaxed);
+    if rc == EIO {
+        w |= 1 << 5; // the durable write failed -> -EIO (the owner is NOT told the revoke succeeded)
+    }
+    if owned_access_ok(slba, soff, K3_SA_GRT, gen_grt, CAP_READ, p_grt) {
+        w |= 1 << 6; // in-RAM grant left INTACT (not committed) -> RAM agrees with the unchanged disk row
+    }
+
+    k3_revoke_cleanup();
+    w
+}
+
+/// K3 launcher + verdict — rides the U7 kernel task after the K2 launcher (its disk I/O can never perturb the 23
+/// fixtures or the witnesses). Emits ONE uncounted `:: K3-revoke: … PASS ::` line (the K1-atr `<noun> PASS` idiom,
+/// never `-> PASS`/`: PASS`), so the fixture PASS-count stays 23. Fully self-cleaning.
+fn k3_revoke_launcher() {
+    static DONE: AtomicBool = AtomicBool::new(false);
+    if DONE.swap(true, Ordering::Relaxed) {
+        return;
+    }
+    if crate::drivers::block::info().is_none() {
+        return; // no SD -> the proof writes real files; skip silently
+    }
+    if let Ok(fs) = crate::fs::fat::mount() {
+        if fs.find_in_root(K3_FILE).is_ok() {
+            k3_revoke_cleanup(); // a stale scratch file from an interrupted run
+        }
+    }
+    let w = k3_revoke_check();
+    serial_println!(
+        ":: K3-revoke: SYS_FGRANT revoke commit-ordering — two-phase durable-first {} (revoke survives reboot; kept grant intact; forced persist-fail -> -EIO with in-RAM grant left intact, RAM/disk consistent) [w={:#04x}] ::",
+        if w == K3REVOKE_ALL { "PASS" } else { "FAIL" },
+        w
+    );
+}
+
 // ===================================================================================================
 // K2 (make-enforcement-LIVE): prove the K1 cross-reboot ACL end-to-end through TWO REAL disk-loaded
 // programs with the gate FLIPPED. Unlike `k1_persist_check` (which manufactures principals directly on
@@ -9836,6 +10091,11 @@ static K2_OWN_WITNESS: AtomicU64 = AtomicU64::new(0); // K2OWN.BIN's reported wi
 static K2_IMP_WITNESS: AtomicU64 = AtomicU64::new(0); // K2IMP.BIN's reported witness
 static EL0_K2_DONE: AtomicU32 = AtomicU32::new(0); // count of K2 program sentinel exits (want 3 by the end)
 static EL0_K2_KILLED: AtomicU32 = AtomicU32::new(0); // any K2 program fault-killed (a real bug; must stay 0)
+
+// K3: test-only synthetic durable-write failure for `atr_write_grant_row`, set TRANSIENTLY by `k3_revoke_check`
+// (which self-clears) to prove the two-phase revoke fails CLOSED when the persist cannot land. Default false —
+// the production/battery path never sets it, so it is a single default-false relaxed load off the persist path.
+static K3_TEST_FAIL_PERSIST: AtomicBool = AtomicBool::new(false);
 
 /// K2: record a K2 program's SYS_REPORT, keyed by task name (the `uowner_report` idiom). K2OWN.BIN is
 /// spawned twice under the same name — the launcher resets `K2_OWN_WITNESS` before each spawn and reads
@@ -9989,6 +10249,7 @@ fn k2_liveenf_launcher(demo_cpu: usize) {
     }
     // bit6: M(b) grow-repersist actually LANDED — the owner grew K2PRIV.BIN, so its persisted row must carry
     // the real (nonzero) chain head, not the create-time 0 (which would still install name-primary at rebuild).
+    // Corroborated against the DIRECTORY-ENTRY head (`priv_fc` = `de.first_cluster()`), not a FAT-chain walk.
     if priv_fc != 0 && k2_persisted_first_cluster(&fs2, priv_lba, priv_off) == Some(priv_fc) {
         w |= 1 << 6;
     }
@@ -10037,8 +10298,10 @@ fn k2_liveenf_launcher(demo_cpu: usize) {
 
     // ---- Cleanup so the STATEFUL metal card leaves NO row that would brick the next real boot ----
     k2_cleanup();
+    // K3 (fold): match NotFound specifically — the file is genuinely GONE — rather than `.is_err()`, which a
+    // transient read error would also satisfy and so overclaim "self-cleaned" on a double-EIO corner.
     let cleaned = match crate::fs::fat::mount() {
-        Ok(fs) => fs.find_in_root(K2_PRIV_NAME).is_err(),
+        Ok(fs) => matches!(fs.find_in_root(K2_PRIV_NAME), Err(crate::fs::fat::FatError::NotFound)),
         Err(_) => false,
     };
 
@@ -10178,8 +10441,10 @@ fn k2_metal_verify(demo_cpu: usize) {
     let killed = EL0_K2_KILLED.load(Ordering::Acquire);
     // Clean so the card ends pristine — the money-shot is proven; no lingering row bricks a future boot.
     k2_cleanup();
+    // K3 (fold): match NotFound specifically (the file is genuinely GONE) — a transient read error must not
+    // masquerade as "self-cleaned".
     let cleaned = match crate::fs::fat::mount() {
-        Ok(f) => f.find_in_root(K2_PRIV_NAME).is_err(),
+        Ok(f) => matches!(f.find_in_root(K2_PRIV_NAME), Err(crate::fs::fat::FatError::NotFound)),
         Err(_) => false,
     };
     const K2M_ALL: u32 = (1 << 3) - 1; // bits 0..=2
