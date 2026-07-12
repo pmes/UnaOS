@@ -36,7 +36,7 @@ pub enum FileSystemError {
     #[error("Inode error: {0}")]
     Inode(#[from] InodeError),
     #[error("Serialization error: {0}")]
-    Serialization(#[from] bincode::Error),
+    Serialization(#[from] crate::codec::CodecError),
     #[error("No free space available")]
     NoSpace,
     #[error("Root inode missing")]
@@ -412,7 +412,7 @@ impl<D: BlockDevice> UnaFS<D> {
             return Ok(Vec::new());
         }
         let data = self.read_data(inode_id, 0, inode.size)?;
-        let entries: Vec<DirEntry> = bincode::deserialize(&data)?;
+        let entries: Vec<DirEntry> = crate::codec::deserialize(&data)?;
         Ok(entries)
     }
 
@@ -480,7 +480,7 @@ impl<D: BlockDevice> UnaFS<D> {
         });
         entries.sort_by(|a, b| a.name.cmp(&b.name));
 
-        let data = bincode::serialize(&entries)?;
+        let data = crate::codec::serialize(&entries)?;
         self.write_data(parent_id, 0, &data)?;
 
         Ok(new_id)
@@ -516,7 +516,7 @@ impl<D: BlockDevice> UnaFS<D> {
         };
 
         if is_large {
-            let data = bincode::serialize(&value)?;
+            let data = crate::codec::serialize(&value)?;
             let extents = self.allocate_and_write_extents(&data)?;
             inode.large_attributes.insert(key.clone(), extents);
             inode.attributes.remove(&key);
@@ -554,7 +554,7 @@ impl<D: BlockDevice> UnaFS<D> {
             let total_size: u64 = extents.iter().map(|e| e.length).sum();
             let data = self.read_from_extents(extents, 0, total_size, total_size)?;
             let val: AttributeValue =
-                bincode::deserialize(&data).map_err(|_| FileSystemError::InvalidAttributeData)?;
+                crate::codec::deserialize(&data).map_err(|_| FileSystemError::InvalidAttributeData)?;
             return Ok(Some(val));
         }
 
@@ -609,7 +609,7 @@ impl<D: BlockDevice> UnaFS<D> {
             } else if let Some(extents) = inode.large_attributes.get(&query.key) {
                 let total = extents.iter().map(|e| e.length).sum();
                 let data = self.read_from_extents(extents, 0, total, total)?;
-                if let Ok(v) = bincode::deserialize::<AttributeValue>(&data) {
+                if let Ok(v) = crate::codec::deserialize::<AttributeValue>(&data) {
                     val_opt = Some(v);
                 }
             }

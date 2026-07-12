@@ -38,14 +38,15 @@ use unafs::wal::JournalOp;
 use unafs::DirEntry;
 
 // ---- migration seam -------------------------------------------------------
-// M1: bincode 1.3.3 (crate default). M2 flips ONLY these two fns to the
-// bincode 2.x legacy() config; the golden constants below must remain byte-
-// identical for the migration to be accepted.
-fn enc<T: Serialize>(v: &T) -> Vec<u8> {
-    bincode::serialize(v).expect("serialize")
+// This routes through the crate's codec (bincode 2.x, legacy() config). The
+// golden constants below were frozen from the reference bincode 1.3.3 encoding
+// and MUST remain byte-identical: that equality is the proof the bincode 2.x
+// migration preserves the on-disk format.
+fn enc<T: Serialize + ?Sized>(v: &T) -> Vec<u8> {
+    unafs::codec::serialize(v).expect("serialize")
 }
 fn dec<T: for<'de> Deserialize<'de>>(bytes: &[u8]) -> T {
-    bincode::deserialize(bytes).expect("deserialize")
+    unafs::codec::deserialize(bytes).expect("deserialize")
 }
 
 // ---- hex helper -----------------------------------------------------------

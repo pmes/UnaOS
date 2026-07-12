@@ -32,7 +32,7 @@ pub enum SuperblockError {
     #[error("Block size mismatch: expected {0}, found {1}")]
     BlockSizeMismatch(u32, u32),
     #[error("Serialization error: {0}")]
-    Serialization(#[from] bincode::Error),
+    Serialization(#[from] crate::codec::CodecError),
     #[error("Storage error: {0}")]
     Storage(#[from] StorageError),
     #[error("Superblock too large: {0} bytes")]
@@ -109,7 +109,7 @@ impl Superblock {
 
     /// Serialize the Superblock to bytes, ensuring it fits in Block 0.
     pub fn to_bytes(&self) -> Result<Vec<u8>, SuperblockError> {
-        let bytes = bincode::serialize(self)?;
+        let bytes = crate::codec::serialize(self)?;
         if bytes.len() as u64 > BLOCK_SIZE {
             return Err(SuperblockError::TooLarge(bytes.len()));
         }
@@ -118,7 +118,7 @@ impl Superblock {
 
     /// Deserialize a Superblock from bytes and validate it.
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, SuperblockError> {
-        let sb: Superblock = bincode::deserialize(bytes)?;
+        let sb: Superblock = crate::codec::deserialize(bytes)?;
 
         if sb.magic != MAGIC {
             return Err(SuperblockError::InvalidMagic);

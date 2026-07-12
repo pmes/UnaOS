@@ -19,8 +19,11 @@
 //! This library implements a database disguised as a file system, capable of handling
 //! massive streams and semantic queries.
 
+extern crate alloc;
+
 pub mod bitmap;
 pub mod catalog;
+pub mod codec;
 pub mod fs;
 pub mod hash;
 pub mod inode;

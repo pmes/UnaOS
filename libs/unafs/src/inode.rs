@@ -25,7 +25,7 @@ pub enum InodeError {
     #[error("Inode too large: {0} bytes (max {1})")]
     InodeTooLarge(usize, u64),
     #[error("Serialization error: {0}")]
-    Serialization(#[from] bincode::Error),
+    Serialization(#[from] crate::codec::CodecError),
 }
 
 /// The type of file represented by an Inode.
@@ -110,7 +110,7 @@ impl Inode {
 
     /// Serializes the Inode to bytes, ensuring it fits within a block.
     pub fn to_bytes(&self) -> Result<Vec<u8>, InodeError> {
-        let bytes = bincode::serialize(self)?;
+        let bytes = crate::codec::serialize(self)?;
         if bytes.len() as u64 > BLOCK_SIZE {
             return Err(InodeError::InodeTooLarge(bytes.len(), BLOCK_SIZE));
         }
@@ -119,7 +119,7 @@ impl Inode {
 
     /// Deserializes an Inode from bytes.
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, InodeError> {
-        let inode = bincode::deserialize(bytes)?;
+        let inode = crate::codec::deserialize(bytes)?;
         Ok(inode)
     }
 }

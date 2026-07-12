@@ -56,7 +56,7 @@ pub enum JournalError {
     #[error("Storage error: {0}")]
     Storage(#[from] StorageError),
     #[error("Serialization error: {0}")]
-    Serialization(#[from] bincode::Error),
+    Serialization(#[from] crate::codec::CodecError),
     #[error("Journal full")]
     JournalFull,
 }
@@ -151,7 +151,7 @@ impl Journal {
             }
 
             let data = &block[offset_in_block + 8..offset_in_block + 8 + (len as usize)];
-            if let Ok(op) = bincode::deserialize::<JournalOp>(data) {
+            if let Ok(op) = crate::codec::deserialize::<JournalOp>(data) {
                 match op {
                     JournalOp::BeginOp { op_id, .. } => {
                         open_ops.insert(op_id);
@@ -184,7 +184,7 @@ impl Journal {
         device: &mut D,
         op: JournalOp,
     ) -> Result<(), JournalError> {
-        let bytes = bincode::serialize(&op)?;
+        let bytes = crate::codec::serialize(&op)?;
         let len = bytes.len() as u64;
         let total_len = 8 + len; // 8 bytes for length prefix
 
