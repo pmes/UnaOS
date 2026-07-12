@@ -197,6 +197,16 @@ pub fn parse_arw(mmap: &[u8]) -> Result<RgbBuffer, LuxError> {
 
     let raw_data = &mmap[data_offset..data_offset + data_size];
 
+    // Fence the dimensions before any allocation keyed on them. width/height come
+    // straight from file tags; a malicious ARW2 could name enormous dimensions a
+    // tiny compressed strip could never fill, driving a multi-GB allocation in
+    // decompress_raw/demosaic. Reject degenerate and implausibly large images.
+    const MAX_PIXELS: u64 = 512 * 1024 * 1024; // 512 MP — generous headroom
+    let pixel_count = (width as u64) * (height as u64);
+    if width == 0 || height == 0 || pixel_count > MAX_PIXELS {
+        return Err(LuxError::CorruptData);
+    }
+
     // Decode ARW2 or pass through Uncompressed slice
     let bayer_buffer = decompress_raw(compression, raw_data, width, height)?;
 
