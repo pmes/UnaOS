@@ -182,6 +182,12 @@ define_class!(
                 window.makeKeyAndOrderFront(None::<&AnyObject>);
                 unsafe {
                     let _: () = msg_send![&window, center];
+                    // A vessel launched from a background shell inherits no active
+                    // app, so `makeKeyAndOrderFront` alone leaves it buried behind
+                    // whatever had focus. Explicitly activate the app so the vessel
+                    // window comes to the foreground.
+                    let app = NSApplication::sharedApplication(mtm);
+                    let _: () = msg_send![&app, activateIgnoringOtherApps: true];
                 }
                 return;
             }
