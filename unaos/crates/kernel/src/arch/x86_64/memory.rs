@@ -566,3 +566,166 @@ pub fn probe_isolation(
     debug_assert!(a_val != b_val, "U3: isolation probe read identical values — windows not isolated");
     (a_val, b_val, a_val == sent_a && b_val == sent_b)
 }
+
+// =================================================================================================
+// VPERF-WC — write-combining for the framebuffer mapping (x86, memory-TYPE only; seat-signed scope).
+// -------------------------------------------------------------------------------------------------
+// The M3 cached-RAM shadow already turned all VRAM traffic into write-only sequential blits
+// (`vread=0`, metal-confirmed). The metal round-6 rMBP readout showed the fb still effective-UC
+// (var-range MTRR UC, PAT=WB in the l2 PTE) — so those posted writes are NOT coalesced. Marking the
+// framebuffer Write-Combining lets the CPU's WC buffers combine the sequential stores (~10x on the
+// write path is the expectation the next bench measures).
+//
+// SCOPE (matches the seat sign-off verbatim): this changes MEMORY TYPE ONLY, and ONLY on the leaves
+// that map the framebuffer. It touches NO page-permission bit (PRESENT/WRITABLE/USER/NX untouched),
+// NO MTRR, and no other mapping. SMEP/NXE/W^X are unaffected (they live in CR4/EFER and the U/W/NX
+// PTE bits, none of which we write). The mechanism is a single unused PAT slot + the fb leaves'
+// PAT/PCD/PWT selector bits.
+// =================================================================================================
+
+const IA32_PAT_MSR: u32 = 0x277;
+/// PAT slot we repurpose to Write-Combining. Power-on PAT is [WB,WT,UC-,UC] in entries 0..3 and
+/// DUPLICATES them in 4..7. No firmware/kernel mapping ever sets the PTE PAT bit, so entries 4..7 are
+/// unused — we set PA4 = WC (encoding 0x01). A PTE selecting index 4 (PAT=1,PCD=0,PWT=0) then reads
+/// WC; leaving 0..3 alone keeps every live mapping's effective type byte-identical.
+const PAT_WC_INDEX: u64 = 4;
+/// Architectural PAT memory-type encoding for Write-Combining.
+const PAT_TYPE_WC: u64 = 0x01;
+
+/// Program THIS CPU's IA32_PAT so slot `PAT_WC_INDEX` == WC, preserving every other slot. Idempotent
+/// and harmless on any CPU: no live mapping selects that slot until a PTE opts in via the PAT bit.
+/// The BSP is programmed by `set_framebuffer_wc` (it drives the console/scenario — the measured
+/// path). For a uniform effective type on APs that also blit, an AP would call this at bring-up
+/// (a one-line `arch::memory::ensure_pat_wc()` in `smp::ap_entry`); left as a follow-up so this arc
+/// stays in-lane. Not wiring it is CORRECT, not merely tolerated: an AP's fb PTE then selects PA4=WB
+/// (its unmodified default) which, under the UC var-range MTRR, is effective-UC — so an AP blit is
+/// plain UC (no speedup) while the BSP blit is WC. WC and UC are both uncacheable (no cache line
+/// holds fb data), so the mix is not the SDM 11.12.4 WB-aliasing hazard — it is exactly the
+/// write-only-framebuffer access pattern, just un-accelerated on the AP.
+pub fn ensure_pat_wc() {
+    use x86_64::registers::model_specific::Msr;
+    // PAT support: CPUID.01H:EDX[16]. A part without PAT never gets the WRMSR.
+    let has_pat = core::arch::x86_64::__cpuid(1).edx & (1 << 16) != 0;
+    if !has_pat {
+        return;
+    }
+    unsafe {
+        let mut pat = Msr::new(IA32_PAT_MSR);
+        let cur = pat.read();
+        let shift = 8 * PAT_WC_INDEX;
+        let want = (cur & !(0xFFu64 << shift)) | (PAT_TYPE_WC << shift);
+        if want != cur {
+            pat.write(want);
+        }
+    }
+}
+
+/// Runs the fb-leaf retype exactly once (the PAT program is idempotent and re-runs harmlessly).
+static FB_WC_DONE: AtomicBool = AtomicBool::new(false);
+
+/// Mutable pointer to the LEAF entry mapping `va` + its level (1 = 4 KiB, 2 = 2 MiB, 3 = 1 GiB), or
+/// `None` if unmapped. The write-capable twin of `translate` — we need the entry's address to retype
+/// its memory-type selector bits.
+fn leaf_entry_ptr(va: u64) -> Option<(*mut u64, u8)> {
+    unsafe {
+        let pml4e_p = cr3_table().add(pml4_index(va));
+        if *pml4e_p & PTE_PRESENT == 0 {
+            return None;
+        }
+        let pdpte_p = ((*pml4e_p & PTE_ADDR) as *mut u64).add(pdpt_index(va));
+        if *pdpte_p & PTE_PRESENT == 0 {
+            return None;
+        }
+        if *pdpte_p & PTE_HUGE != 0 {
+            return Some((pdpte_p, 3));
+        }
+        let pde_p = ((*pdpte_p & PTE_ADDR) as *mut u64).add(pd_index(va));
+        if *pde_p & PTE_PRESENT == 0 {
+            return None;
+        }
+        if *pde_p & PTE_HUGE != 0 {
+            return Some((pde_p, 2));
+        }
+        let pte_p = ((*pde_p & PTE_ADDR) as *mut u64).add(pt_index(va));
+        if *pte_p & PTE_PRESENT == 0 {
+            return None;
+        }
+        Some((pte_p, 1))
+    }
+}
+
+/// Invalidate the TLB entry covering `va` (works for huge and GLOBAL entries, unlike a CR3 reload —
+/// firmware huge identity leaves may carry the Global bit).
+#[inline]
+unsafe fn invlpg(va: u64) {
+    unsafe { core::arch::asm!("invlpg [{}]", in(reg) va, options(nostack, preserves_flags)) };
+}
+
+/// Mark the framebuffer mapping Write-Combining: program PA4=WC on the BSP, then retype every
+/// identity-map leaf that covers `[fb_base, fb_base+fb_len)` to select that slot (set the PAT bit,
+/// clear PCD/PWT), and flush those TLB entries. Runs once (the retype is guarded; the PAT program is
+/// idempotent).
+///
+/// Granularity honesty: the firmware maps the fb with 2 MiB (metal + QEMU both show `l2`) — sometimes
+/// 1 GiB — leaves, so the retyped span is the SET OF HUGE-PAGE LEAVES that contain the range. Every
+/// such leaf lies inside the GPU's own BAR aperture (device MMIO), never RAM/heap/kernel — so "the
+/// framebuffer's mapping" is exactly what changes; no unrelated mapping is touched. `wbinvd` is NOT
+/// issued: the fb was effective-UC before this (metal-confirmed + firmware default), so no cache line
+/// holds fb data that would need writing back.
+pub fn set_framebuffer_wc(fb_base: u64, fb_len: u64) {
+    if fb_base == 0 || fb_len == 0 {
+        return;
+    }
+    // Program the WC PAT slot on this (BSP) CPU first, so the fb reads WC the instant it is retyped.
+    ensure_pat_wc();
+    if FB_WC_DONE.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    let fb_end = fb_base.saturating_add(fb_len);
+    let mut leaves = 0u32;
+    // Retype the fb leaves. Firmware page-table pages are read-only under CR0.WP=1, so drop WP for
+    // the window (IRQs held off; WP restored on exit) — the exact page-table-edit sequence the U1a
+    // mapper uses. We write ONLY the PAT/PCD/PWT selector bits; every permission bit is preserved.
+    with_page_tables_writable(|| {
+        let mut va = fb_base;
+        while va < fb_end {
+            match leaf_entry_ptr(va) {
+                Some((entry, level)) => {
+                    let leaf_size: u64 = match level {
+                        3 => 1 << 30,
+                        2 => 1 << 21,
+                        _ => 1 << 12,
+                    };
+                    // The PAT bit sits at bit 7 in a 4 KiB PTE but bit 12 in a 2 MiB/1 GiB leaf.
+                    let pat_bit: u64 = if level == 1 { 1 << 7 } else { 1 << 12 };
+                    let pcd: u64 = 1 << 4;
+                    let pwt: u64 = 1 << 3;
+                    unsafe {
+                        let e = *entry;
+                        // Select PAT index 4 = (PAT=1, PCD=0, PWT=0). Memory type only.
+                        let ne = (e | pat_bit) & !(pcd | pwt);
+                        if ne != e {
+                            *entry = ne;
+                            leaves += 1;
+                        }
+                    }
+                    va = (va & !(leaf_size - 1)).saturating_add(leaf_size);
+                }
+                None => va = va.saturating_add(1 << 12), // unmapped gap — step one page
+            }
+        }
+    });
+    // Flush the retyped span from the TLB. Step 4 KiB so any leaf granularity (and any Global huge
+    // entry) is covered; one-time boot cost, invlpg is a couple of cycles each.
+    let mut va = fb_base & !((1u64 << 12) - 1);
+    while va < fb_end {
+        unsafe { invlpg(va) };
+        va = va.saturating_add(1 << 12);
+    }
+    serial_println!(
+        ":: x86 fb-wc: retyped {} leaf(s) WC (PAT PA4) over {:#x}..{:#x} ::",
+        leaves,
+        fb_base,
+        fb_end
+    );
+}

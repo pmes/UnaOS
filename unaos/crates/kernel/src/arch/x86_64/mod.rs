@@ -38,12 +38,22 @@ pub fn hlt() {
     x86_64::instructions::hlt();
 }
 
-/// Counterpart to aarch64's framebuffer cache-clean. On x86 the UEFI framebuffer is presented
-/// through a cache-coherent path (write-combining set up by firmware, snooped by the display
-/// engine), so no explicit maintenance is needed — a no-op that keeps the shared video code
-/// arch-agnostic.
+/// Counterpart to aarch64's framebuffer cache-clean (`DC CVAC` + `DSB`). VPERF-WC made the x86
+/// framebuffer mapping Write-Combining (`memory::set_framebuffer_wc`), so CPU stores to it now
+/// buffer in the WC combining buffers and drain only on a store fence / serializing event /
+/// buffer pressure (SDM Vol. 3A §11.3.1). A streaming console self-evicts under pressure, but the
+/// LAST partial WC buffer before the CPU idles has no eviction trigger — e.g. the tail of the
+/// panic screen ahead of `hlt_loop()` — so every present point must drain explicitly. `SFENCE` is
+/// exactly that drain: it forces all prior WC stores globally visible. This rides the same seam
+/// the Pi's cache-clean uses (`FrameBuffer::flush_range`/`flush_all`, called by fbcon's
+/// per-print `flush_dirty`, the panic path's `flush_all`, and `Screen`'s per-frame present), so
+/// every existing flush call site is a real drain point. Range-independent (SFENCE drains all WC
+/// buffers); negligible cost next to the blit it follows.
 #[inline]
-pub fn flush_framebuffer_range(_addr: usize, _len: usize) {}
+pub fn flush_framebuffer_range(_addr: usize, _len: usize) {
+    // SAFETY: SFENCE has no preconditions; it only orders/drains stores.
+    unsafe { core::arch::asm!("sfence", options(nostack, preserves_flags)) };
+}
 
 /// Monotonic tick counter since boot (the local-APIC timer heartbeat). Arch-neutral entry
 /// point used by drivers and the scheduler for coarse timing (e.g. TCP retransmission RTO,

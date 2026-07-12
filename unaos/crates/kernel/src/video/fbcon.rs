@@ -272,6 +272,14 @@ pub fn init(fb_addr: u64, fb_len: usize, info: FrameBufferInfo) {
         c.full_fb().fill_screen(BG_DEFAULT);
         c.full_fb().flush_all();
     });
+
+    // VPERF-WC (x86, ALL builds — GUI blits benefit too): mark the framebuffer mapping
+    // Write-Combining now that its range is known. The M3 shadow already made VRAM traffic
+    // write-only sequential blits; WC lets the CPU coalesce those posted writes (~10x on the write
+    // path, metal). Memory-TYPE only — no page-permission change (seat-signed). Called OUTSIDE the
+    // FBCON lock (the retype's confirmation line mirrors back through fbcon), after the range is set.
+    #[cfg(target_arch = "x86_64")]
+    crate::arch::memory::set_framebuffer_wc(fb_addr, fb_len as u64);
 }
 
 /// Mirror formatted output to the framebuffer (called from the serial `_print`). Lock-free of
