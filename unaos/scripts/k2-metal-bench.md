@@ -16,6 +16,10 @@ Attended (Peter physical + this executor session drives the software). Two parts
 - **Verify the bridge captures a FULL boot first** — the dated log must visibly grow *past the kernel
   banner* before any witness matters. A log stuck at a few KB mid-bench = probe re-enumeration → re-run
   `pi-bench-connect.sh` (that IS the recovery) and note the gap. Use `stat -Lf %z` for symlink sizes.
+- ⚠ **IMG-SIG boundary (MANDATORY since 2026-07-11):** the card's last K2 bench ran a pre-IMG-SIG kernel — its
+  persisted `prog:K2OWN.BIN` row can NEVER match the new IMAGE_SHA256 principals. Boot an IMG-SIG kernel on an
+  un-re-prepped card and the k2 fixtures FALSE-FAIL, stranding an undeletable `K2PRIV.BIN`. Re-prep FIRST
+  (file-level delete `UNAFS.ATR` + `K2PRIV.BIN`) before the first IMG-SIG boot.
 - **Pristine card:** delete stale `UNAFS.ATR` + `K2PRIV.BIN`; for a clean Part-A/boot-1 battery also
   restore pristine `GROW.BIN` (512×0xC1) + `SCRATCH.BIN` (1024×0xEE) and delete `OWNED/FRESH/DELME/B11.BIN`.
 - **Unmount `UNAOS` before every `kernel8` build.**
