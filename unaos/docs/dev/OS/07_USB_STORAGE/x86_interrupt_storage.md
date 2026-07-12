@@ -1,6 +1,6 @@
 # STOR-D1 — IF-safe interrupt-driven x86 storage (design)
 
-Status: **S1–S5 LANDED** (S1–S4 2026-07-10, S5 2026-07-11, `hw-rmbp`, behind the `irqstorage` knob —
+Status: **S1–S6 LANDED** (S1–S4 2026-07-10, S5–S6 2026-07-11, `hw-rmbp`, behind the `irqstorage` knob —
 QEMU-green, metal-pending; S1–S3 `7b2f05f`/`b73ba08`/`fd5de85`, ✅ core mechanism metal-confirmed). S1 the
 storage service task + `BlockRequest` submit/block/complete; S2 live in-place reads (`sys_read`); S3 live
 in-place write-through (`sys_write_file`) closing the close-discards-dirty residual; **S4 synchronous
@@ -18,8 +18,13 @@ deadlock — a NON-preemptible ring-3 fixture busy-spinning (IF=0) on the servic
 cross-core created read blocking on the service task never completes. Fixed by (a) spawning the service task
 `PRIO_HIGH` (a system service other tasks block on must preempt spinning user tasks — a same-priority wake
 only "waits its turn", `poke_for`), and (b) making u6gx's cooperative-spin fixtures preemptible knob-on
-(gated on `s4_sync_storage()`; the timer can then evict the spinner). See §4 step S5 + §5 risk 4. **S6–S7
-remain future** (below). The original design (below) is unchanged. Track: `hw-rmbp` (x86_64, 2012 rMBP).
+(gated on `s4_sync_storage()`; the timer can then evict the spinner). See §4 step S5 + §5 risk 4. **S6 the
+syscall-layer NAMESPACE lock** (the pi4 F3 twin, `syscall.rs`) makes the created-file open/create/unlink name
+sequences MUTUALLY ATOMIC, closing S5's non-atomic source-resolve + re-validate residual AIRTIGHT — held for the
+O(1) in-memory namespace decision only, with the blocking `submit_create`/`submit_delete` lifted OUT of the lock
+(the S5 deadlock class stays closed). §6 decision 2 is RESOLVED: `FAT_MUTATION` is NOT activated on x86 (vacuous
+under the single-service-task-writer invariant); `fat.rs` stays untouched. **S7 remains future** (below). The
+original design (below) is unchanged. Track: `hw-rmbp` (x86_64, 2012 rMBP).
 Twin reference: the aarch64 polled storage path, which this design brings x86 into semantic parity with
 **without** copying its mechanism.
 
@@ -222,7 +227,7 @@ rides attended benches at arc boundaries (§5).
 | **S3** | **Route `sys_write_file` through the service task** (in-place write-through). | U9x `FLUSH_*` queue + `FILE_DIRTY_*` + close-discards-dirty (residual 5) | `u9x-write`: read-back after write with **no launcher drain**; `SYS_CLOSE` of a dirty descriptor now persists |
 | **S4** ✅ | **Route grow/create/delete synchronously** (in-syscall `fat.rs` calls via the service task — `submit_create`/`submit_grow`/`submit_delete`; serialization is by the SINGLE service-task BOT owner, **not** `FAT_MUTATION`, which stays an S6 no-op passthrough on x86). | U10x `U10_*` op-queue + launcher replay (causal-fidelity residual) | `u10x-grow`/`u10cx-create`/`u10dx-delete`: on-disk change visible **within the syscall**, no deferred drain |
 | **S5** ✅ | **Real shared backing for cross-process created-file reads** (read the live on-disk volume BY NAME, not a wstage snapshot). `created_read_live`→`submit_read_file`; `open_created_sibling` seeds EMPTY knob-on (no snapshot copy) + re-validates the source names the caller's nameid (recycle fail-closed); `sys_open_dynamic` re-checks `DYN_DELETED_G` after resolving. | U11x M2 residual 3 (torn-copy/disclosure) + residual 4 (open-vs-unlink TOCTOU) — **closed-when-on** (recycle-to-wrong-file leg narrowed; airtight = S6 lock) | `s5_shared_backing_witness`: a cross-row sibling with an EMPTY private wstage reads a peer's POST-OPEN overwrite from the live backing; u11m2/u6gx cross-process reads now serve live shared backing. **Scheduling:** service task `PRIO_HIGH` + u6gx fixtures preemptible knob-on so the service task is not starved by a non-preemptible same-core spinner (§5 risk 4) |
-| **S6** | **Activate `FAT_MUTATION` on x86** (make `with_fat_lock` real). | F2's x86 zero-cost passthrough exclusion | port the aarch64 `f2_witness_rmw` witness to x86 (`fat.rs:369`); LOCKED pass reaches `2*iters`, UNLOCKED control shows loss under contention |
+| **S6** ✅ | **The syscall-layer NAMESPACE lock** (`syscall.rs`, the pi4 F3 twin) — an IRQ-masked `SpinMutex` making the three created-file name sequences (sibling-open `created_desc_any_row`+re-check+ACL+`open_created_sibling`; `open_create_new`; the `sys_unlink` sweep) MUTUALLY ATOMIC. Held for the O(1) in-memory namespace decision ONLY — the blocking disk `submit_create`/`submit_delete` are lifted OUT (before/after the lock), so the S5 deadlock class stays closed. **NOT `FAT_MUTATION` (§6 decision 2 = keep the x86 passthrough — vacuous under the single-writer invariant).** | S5 residual 1 (non-atomic source-resolve + re-validate → recycle/open-vs-unlink/reincarnation windows) — **closed airtight** | `s6_witness_launcher` (`S6-witness:` line, uncounted): a cross-core in-RAM RMW on the SAME `ns_lock` — LOCKED reaches `2*N` intact, the UNLOCKED control loses under contention (positive proof the lock holds; true-parallelism metal-latent per risk 3) |
 | **S7** | **Retire U6bx staged-open + the pre-stage buffer** (open resolves any on-disk file). | the BSP-staged set constraint (U6bx) | arbitrary-file open fixture: open a file *not* in the pre-stage set, read it |
 
 Steps S1–S4 are the spine and each is a clean commit-sized milestone; S5–S7 are separable follow-ons
@@ -295,10 +300,14 @@ sequence with seat review between spine milestones.
    scheduling hop (IRQ wakes the core → service task runs → posts submitter) but keeps interrupt context
    lock-free. **Recommendation: wake-only.**
 
-2. **`FAT_MUTATION` weight on x86** (§3.3). Mask IRQs across the RMW like aarch64 (`without_interrupts`,
-   uniform with the pi4 discipline), or rely on the single-service-task-writer invariant for a lighter
-   lock? The single-writer invariant is stronger on x86 than aarch64 (there is exactly one pump owner),
-   so a non-masking lock may suffice — but uniformity with aarch64 has review value.
+2. **`FAT_MUTATION` weight on x86** (§3.3). **RESOLVED (S6, 2026-07-11): do NOT activate `FAT_MUTATION` on
+   x86 — keep `with_fat_lock` the documented zero-cost passthrough.** It is VACUOUS given the
+   single-service-task-writer invariant: there is exactly ONE BOT writer (the service task), so the pi4
+   FAT lost-update RMW race is not reachable on x86 — the lock would guard a race that cannot occur. The
+   real S5 residual is at the SYSCALL layer (namespace atomicity of the created-file open/create/unlink
+   sequences), NOT the FAT-sector RMW, so S6 landed a syscall-layer `NAMESPACE` lock (`syscall.rs`, the pi4
+   F3 twin) instead. This keeps `fat.rs` (shared kernel-core, off the rmbp lane's free edit) untouched.
+   (Activating `FAT_MUTATION` would need a seat call + the pi4 K-track ccd, and buys nothing here.)
 
 3. **Doc/dir placement** — this doc sits in `07_USB_STORAGE/`, not the brief's literal `07_STORAGE/`.
    Confirm or request a rename.
