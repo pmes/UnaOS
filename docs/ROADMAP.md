@@ -234,14 +234,19 @@ FlySky NB4 Plus ──AFHDS3──▶ FGr8B ──i-BUS (UART 115200)──▶ U
 - **PWM out**: Tegra's native PWM is 8-bit duty (insufficient at 50 Hz) →
   either a 333 Hz frame or (recommended) a **PCA9685 over I2C** (12-bit; the
   I2C driver is reusable for sensors).
-- **Drive service** (arch-neutral, designed): bounded command channel, 20 ms
-  control loop, ARM/DISARM state machine, 500 ms deadman, software throttle
-  cap, cross-core watchdog, panic-handler-forces-neutral. A 3-position
-  transmitter channel selects DISARM / MANUAL / AUTO.
+- **Drive service** (arch-neutral): bounded command channel, 20 ms control
+  loop, ARM/DISARM state machine, 500 ms deadman, software throttle cap,
+  cross-core watchdog, panic-handler-forces-neutral. A 3-position transmitter
+  channel selects DISARM / MANUAL / AUTO. **The arch-neutral core now exists
+  host-native** in [`libs/drive`](../libs/drive) (`#![no_std]`, embeds in the
+  kernel later); its safety invariants I1–I8 are proven by the test battery in
+  `libs/drive/tests/invariants.rs`.
 - **Power**: Orin barrel input is 7–20 V → 3S LiPo direct.
 - Milestones: GICv3/scheduler (shared with the Jetson catchup lane) → i-BUS
-  decode demo ("UnaOS sees the transmitter") → actuation gate → drive service →
-  first crawl, each behind a written safety-interlock checklist.
+  decode demo **(host-side landed — the `libs/ibus` codec + format-freeze KATs;
+  synthetic until real FGr8B captures are appended, then silicon)** → actuation
+  gate → drive service → first crawl, each behind a written safety-interlock
+  checklist ([`docs/dev/USERLAND/ENDURO_SAFETY.md`](dev/USERLAND/ENDURO_SAFETY.md)).
 - A Pi-4 fast path (BCM2711 GPIO/PWM, fully specified) is preserved in the
   planning archive if a second vehicle or an earlier wheel-turn is ever wanted.
 
