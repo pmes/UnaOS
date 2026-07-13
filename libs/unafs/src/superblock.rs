@@ -38,6 +38,8 @@ pub enum SuperblockError {
     Storage(#[from] StorageError),
     #[error("Superblock too large: {0} bytes")]
     TooLarge(usize),
+    #[error("Superblock geometry invalid: {0}")]
+    Geometry(&'static str),
 }
 
 /// The Superblock resides at Block 0 and describes the filesystem layout.
@@ -119,7 +121,8 @@ impl Superblock {
 
     /// Deserialize a Superblock from bytes and validate it.
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, SuperblockError> {
-        let sb: Superblock = crate::codec::deserialize(bytes)?;
+        // Block-sized record: block-budgeted decode (BEFS-HARDEN).
+        let sb: Superblock = crate::codec::deserialize_block(bytes)?;
 
         if sb.magic != MAGIC {
             return Err(SuperblockError::InvalidMagic);
@@ -136,6 +139,78 @@ impl Superblock {
             ));
         }
 
+        sb.validate()?;
+
         Ok(sb)
+    }
+
+    /// Bound every on-disk-derived block-count/offset field against the
+    /// volume span the superblock itself declares (BEFS-HARDEN).
+    ///
+    /// The volume is untrusted input: a physically swapped or corrupted card
+    /// reaches this parser in-kernel (BeFS-K3), so any field that later
+    /// drives an allocation or a block address must be rejected here — at
+    /// the boundary — rather than trusted downstream. Validation only: every
+    /// volume `format()` has ever produced passes unchanged (the golden KATs
+    /// pin this).
+    pub fn validate(&self) -> Result<(), SuperblockError> {
+        // The volume byte size must be representable, since read paths bound
+        // lengths against `block_count * BLOCK_SIZE`.
+        let _volume_bytes = self
+            .block_count
+            .checked_mul(BLOCK_SIZE)
+            .ok_or(SuperblockError::Geometry("volume byte size overflows"))?;
+
+        // The WAL addresses the journal via its compile-time layout constants
+        // (`wal::JOURNAL_START`/`JOURNAL_BLOCKS`); a superblock declaring any
+        // other journal placement describes a volume this code never wrote.
+        if self.journal_start != crate::wal::JOURNAL_START
+            || self.journal_blocks != crate::wal::JOURNAL_BLOCKS
+        {
+            return Err(SuperblockError::Geometry("journal layout mismatch"));
+        }
+        let journal_end = self
+            .journal_start
+            .checked_add(self.journal_blocks)
+            .ok_or(SuperblockError::Geometry("journal span overflows"))?;
+        if journal_end > self.block_count {
+            return Err(SuperblockError::Geometry("journal exceeds volume"));
+        }
+
+        // The bitmap must be exactly the size the declared block count
+        // implies (what `Superblock::new` computes), and must lie after the
+        // superblock and inside the volume. `bitmap_blocks` sizes the mount-
+        // time bitmap allocation, so this is the K3-PARSE-1 bound.
+        let expected_bitmap_blocks = self.block_count.div_ceil(8).div_ceil(BLOCK_SIZE);
+        if self.bitmap_blocks != expected_bitmap_blocks {
+            return Err(SuperblockError::Geometry(
+                "bitmap size inconsistent with block count",
+            ));
+        }
+        if self.bitmap_start == 0 {
+            return Err(SuperblockError::Geometry("bitmap overlaps superblock"));
+        }
+        let bitmap_end = self
+            .bitmap_start
+            .checked_add(self.bitmap_blocks)
+            .ok_or(SuperblockError::Geometry("bitmap span overflows"))?;
+        if bitmap_end > self.block_count {
+            return Err(SuperblockError::Geometry("bitmap exceeds volume"));
+        }
+
+        // Inode ids are used directly as block addresses.
+        if self.root_inode == 0 || self.root_inode >= self.block_count {
+            return Err(SuperblockError::Geometry("root inode out of bounds"));
+        }
+        // `catalog_inode == 0` means "no catalog" (checked at every use).
+        if self.catalog_inode >= self.block_count {
+            return Err(SuperblockError::Geometry("catalog inode out of bounds"));
+        }
+
+        if self.free_blocks > self.block_count {
+            return Err(SuperblockError::Geometry("free blocks exceed volume"));
+        }
+
+        Ok(())
     }
 }

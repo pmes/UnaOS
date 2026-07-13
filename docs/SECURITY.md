@@ -26,10 +26,17 @@ Exposure classes, honestly stated:
    in `fs/unafs.rs` + `libs/unafs`) all parse attacker-influenceable bytes with
    full kernel privilege. Until the privilege boundary exists everywhere, these
    are the practical attack surface, and they remain kernel-resident even after.
-   The unafs parser joins on the same basis FAT shipped on: disk-derived
-   sizes/counts are not yet bounds-hardened against a crafted volume (allocation
-   /loop DoS class, no memory-safety break) — the dedicated BEFS-HARDEN arc owns
-   bounding every disk-derived size/count/offset against volume geometry.
+   The unafs parser joined on the same basis FAT shipped on, and is now the
+   first of the four hardened against a crafted volume (BEFS-HARDEN,
+   2026-07-13): every disk-derived size/count/offset is bounded against the
+   volume span at the parse boundary (`Superblock::validate`), disk-sized
+   allocations are fallible (`try_reserve` → graceful `Err`, never a capacity
+   panic or OOM abort), extent arithmetic is `checked_*`
+   (profile-independent), hole-fill/free walks are bounded, and record decodes
+   carry bincode byte budgets so a crafted length prefix fails BEFORE
+   allocating. Residual, honestly stated: for extent-backed records the decode
+   pre-allocation is capped (4 MiB record ceiling — the panel lowered it from 64 MiB, which exceeded the 48 MiB kernel heap and so was itself an abort vector; a passing bincode claim allocates infallibly, so the ceiling IS the max forced allocation), not eliminated. The FAT
+   reader's equivalent audit is still open — see the checklist below.
 2. **Privilege boundary not yet load-bearing (both arches).** The ring-3/EL0
    boundary now exists on BOTH architectures (x86 U1a/U1b: ring-3 round-trip +
    per-page perms + fault→task-kill; aarch64 M6a/M6b, the pioneer). x86 U2 runs
@@ -293,7 +300,7 @@ already performs). That refactor is a separate, review-gated change; **WXN is no
 - [ ] Network stack: header-length/bounds audit (Ethernet/ARP/IP/TCP options/DHCP options)
 - [ ] USB: descriptor parsing bounds (config/interface/endpoint/HID report walks; hub paths)
 - [ ] FAT: BPB/dirent/FAT-chain bounds and loop guards (partially hardened during the read-only arc — re-verify and record)
-- [ ] unafs RO mount (UNAFS-K3): bound every disk-derived size/count/offset vs volume geometry (superblock `bitmap_blocks`, inode `size`, extent arithmetic, codec lengths; `try_reserve` not `with_capacity`, size-limited decode) → the BEFS-HARDEN baton
+- [x] unafs RO mount (UNAFS-K3): bound every disk-derived size/count/offset vs volume geometry (superblock `bitmap_blocks`, inode `size`, extent arithmetic, codec lengths; `try_reserve` not `with_capacity`, size-limited decode) — **DONE (BEFS-HARDEN, 2026-07-13)**: `Superblock::validate` at the parse boundary; `try_reserve` on the bitmap load and `read_from_extents`; `checked_*` extent arithmetic + past-volume extent rejection; bounded bulk hole fill and free walks; checked spilled-extent sums on the query/get_attribute paths (the QSIM-flagged sites); two-tier bincode decode budgets (8 KiB block records / 4 MiB extent-backed records, pinned under the kernel heap by a regression test). 23 hostile-volume fixtures assert `Err`-not-panic (`libs/unafs/tests/hostile_volume.rs`); golden format KATs byte-identical
 
 ### Process & supply chain
 - [ ] Adversarial review before metal and before merge on every arc (standing rule, `CLAUDE.md`)

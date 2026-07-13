@@ -39,17 +39,35 @@ impl SpaceMap {
 
     /// Load the bitmap from the device.
     ///
-    /// Reads from `start_block` for `count` blocks.
+    /// Reads from `start_block` for `count` blocks. `count` is disk-derived
+    /// (the superblock's `bitmap_blocks`), so the backing allocation is
+    /// checked-and-fallible: absurd geometry yields a graceful
+    /// [`StorageError::AllocRefused`], never a capacity-overflow panic or an
+    /// OOM abort (BEFS-HARDEN, K3-PARSE-1).
     pub fn load<D: BlockDevice>(
         device: &mut D,
         start_block: u64,
         count: u64,
     ) -> Result<Self, StorageError> {
-        let mut bits = Vec::with_capacity((count * BLOCK_SIZE) as usize);
+        let byte_len = count
+            .checked_mul(BLOCK_SIZE)
+            .ok_or(StorageError::AllocRefused(u64::MAX))?;
+        let bit_count = byte_len
+            .checked_mul(8)
+            .ok_or(StorageError::AllocRefused(byte_len))?;
+        let byte_len_usize =
+            usize::try_from(byte_len).map_err(|_| StorageError::AllocRefused(byte_len))?;
+
+        let mut bits = Vec::new();
+        bits.try_reserve_exact(byte_len_usize)
+            .map_err(|_| StorageError::AllocRefused(byte_len))?;
         let mut buf = vec![0u8; BLOCK_SIZE as usize];
 
         for i in 0..count {
-            device.read_block(start_block + i, &mut buf)?;
+            let block = start_block
+                .checked_add(i)
+                .ok_or(StorageError::OutOfBounds(start_block))?;
+            device.read_block(block, &mut buf)?;
             bits.extend_from_slice(&buf);
         }
 
@@ -58,7 +76,7 @@ impl SpaceMap {
         // For now, let's assume it covers the disk size implied by the blocks read.
         Ok(Self {
             bits,
-            block_count: count * BLOCK_SIZE * 8,
+            block_count: bit_count,
         })
     }
 
