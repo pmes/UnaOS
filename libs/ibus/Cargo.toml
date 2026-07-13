@@ -1,0 +1,11 @@
+[package]
+name = "ibus"
+version = "0.1.0"
+edition = "2024"
+license = "LGPL-3.0-or-later"
+description = "FlySky i-BUS servo frame codec (no_std, zero-dependency)."
+
+# Zero dependencies by design: the crate is a pure `#![no_std]`,
+# `#![forbid(unsafe_code)]` byte codec. The future kernel UART driver feeds the
+# same `Parser` and the same wire format is frozen by the KATs in `tests/`.
+[dependencies]
