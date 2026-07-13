@@ -43,7 +43,7 @@
 ### 2. THE HANDLERS (`handlers/`)
 *   *Note: [CRATE] = Active Code. [SHELL] = Design/Readme Only.*
 *   **[SHELL] `handlers/aether`:** Web (HTML/PDF).
-*   **[CRATE] `handlers/amber_bytes`:** Disk Manager.
+*   **[BIN] `handlers/amber_bytes`:** The Block. (Forensic disk/partition recovery — bin-only CLI). *The durable-memory vault now lives at `vein::vault`.*
 *   **[CRATE] `handlers/aule`:** Build System Wrapper.
 *   **[SHELL] `handlers/comscan`:** Signal/Hardware Bridge.
 *   **[SHELL] `handlers/geode`:** Archive/Container Manager.

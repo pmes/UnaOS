@@ -56,8 +56,8 @@ The binary is built on three crates:
 [userspace architecture](../../../docs/dev/USERLAND/ARCHITECTURE.md), vessels are
 the executables a user runs; this one composes the `unafs` storage library with
 the `bandy` bus rather than the Quartzite GUI. It is the host-side operator
-counterpart to the in-system storage path that vessels and the `amber_bytes`
-handler use at runtime.
+counterpart to the in-system storage path that vessels and the durable-memory
+vault (`vein::vault`) use at runtime.
 
 ## Status
 

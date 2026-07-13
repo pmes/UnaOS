@@ -1,6 +1,6 @@
 # Lumen
 
-The AI-centric companion vessel for UnaOS, and the reference GUI vessel: it wires together a Tokio runtime, the Bandy message bus, a set of domain handlers (Vein, Matrix, Amber Bytes), and a native Quartzite window into a single runnable application.
+The AI-centric companion vessel for UnaOS, and the reference GUI vessel: it wires together a Tokio runtime, the Bandy message bus, a set of domain handlers (Vein, Matrix) and the durable-memory vault (`vein::vault`), and a native Quartzite window into a single runnable application.
 
 ## What it is
 
@@ -12,7 +12,7 @@ Lumen owns the process boot sequence and the top-level event plumbing:
 
 - **Runtime and lifecycle.** Starts a Tokio runtime, installs the default `rustls` crypto provider, and runs a signal interceptor that converts `SIGINT`/`SIGTERM` into a broadcast shutdown so every spawned task can drain cleanly.
 - **Bus construction.** Creates the `Synapse` — the in-process broadcast bus carrying `SMessage` values — and hands clones to each handler and to the GUI.
-- **Handler ignition.** Spawns the async entry point (`ignite(...)`) of each composed handler as a Tokio task: Amber Bytes (storage), Matrix (workspace topology), and Vein (AI/LLM) via `VeinHandler`. It also runs an internal **cortex** loop that records bus traffic to a UnaFS-backed vault.
+- **Handler ignition.** Spawns the async entry point (`ignite(...)`) of each composed handler as a Tokio task: the Vein durable-memory vault (`vein::vault` — UnaFS-backed engram store), Matrix (workspace topology), and Vein (AI/LLM) via `VeinHandler`. It also runs an internal **cortex** loop that records bus traffic to the UnaFS-backed vault.
 - **GUI wiring.** Builds the initial `WorkspaceState`, constructs a Quartzite `Spline`, and launches the native window through `quartzite::Backend`. UI input flows back to logic as `SMessage`s.
 - **The brain loop.** A central `tokio::select!` loop that mediates between UI events and the bus — handling workspace-structure mutations (topology toggle and graft) locally and forwarding everything else to `VeinHandler`.
 
@@ -55,4 +55,4 @@ Platform GUI backends are selected via Cargo features, each forwarding to the co
 
 ## Status
 
-Implemented. Lumen boots, composes the Vein / Matrix / Amber Bytes handlers over the Synapse, and renders a native Quartzite window with the prompt → AiToken loop wired end to end. GUI backend maturity follows Quartzite (macOS and GTK implemented; Qt partial).
+Implemented. Lumen boots, composes the Vein / Matrix handlers and the Vein vault over the Synapse, and renders a native Quartzite window with the prompt → AiToken loop wired end to end. GUI backend maturity follows Quartzite (macOS and GTK implemented; Qt partial).
