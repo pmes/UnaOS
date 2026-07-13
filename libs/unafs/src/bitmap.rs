@@ -128,6 +128,19 @@ impl SpaceMap {
         None
     }
 
+    /// Report whether `block_id` is currently marked used.
+    ///
+    /// Out-of-range ids (no backing byte) report `false`. Used by the
+    /// fsck-scavenger to diff the allocated set against the reachable set.
+    pub fn is_used(&self, block_id: u64) -> bool {
+        let byte_idx = (block_id / 8) as usize;
+        let bit_idx = (block_id % 8) as usize;
+        self.bits
+            .get(byte_idx)
+            .map(|byte| byte & (1 << bit_idx) != 0)
+            .unwrap_or(false)
+    }
+
     /// Mark a block as used explicitly (e.g., during format).
     pub fn mark_used(&mut self, block_id: u64) {
         let byte_idx = (block_id / 8) as usize;

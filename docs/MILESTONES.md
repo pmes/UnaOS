@@ -10,6 +10,36 @@ Legend: **✅ metal-confirmed** · **🔬 QEMU-green, metal pending** · dates I
 
 ---
 
+## unafs — UNAFS-F1 (dirty-mount recovery: fsck-scavenger + `recover`) — 2026-07-13 🔬 `us-unafs-f1`
+
+**What it does:** gives `libs/unafs` a real crash-recovery pass for the residue the F2 mutation
+engine is *documented* to leave on a program-order power cut. The mutations are crash-**ordered**
+(leak-not-dangle), so a crash leaves only two bounded, structurally sound residues: **leaked
+blocks** (allocated in the bitmap, reachable from no inode) and **query-orphans** (the one
+cross-directory `rename` window where an inode is reachable by the attribute catalog but by no
+name). F1 adds a mark-and-sweep scavenger (`fsck.rs`, `UnaFS::fsck`) that walks the volume from
+its roots (system blocks + the name tree from the root inode + the catalog, cycle-guarded and
+bounded to the volume span, reusing BEFS-HARDEN's `checked_*`/`div_ceil`-clamp extent discipline),
+diffs the reachable set against the allocation bitmap, and — in repair mode — heals query-orphans
+(scrubbing their catalog entries through the same crash-ordered rewrite path so no query dangles,
+then a re-walk sweeps the freed blocks) and returns every leak to the free pool. `UnaFS::recover`
+is the host-side dirty-mount entry point: run the scavenger in repair mode, then reset a dirty
+journal to clear the flag. Exposed on the CLI as `unafs fsck [--repair]`. **Honest boundary
+(carries the F2 fold):** the WAL carries no redo/undo block images, so this is *reconciliation*,
+not log replay — and it is best-effort under program-order writes (no write barriers; a reordering
+write-back cache can still dangle a pointer — a future arc). Zero on-disk format change; the golden
+KATs are byte-identical; the kernel's read-only K3 mount never calls the new paths.
+
+**How it was tested:** 5 new recovery KATs (`libs/unafs/tests/recovery_logic.rs`) craft each
+documented crash window from the crate's public surface (a bare leaked block; an unhooked inode +
+its extents with no name/no catalog; a cross-dir `rename` query-orphan; a leaked block + torn
+journal) and assert exact leak reclamation, orphan heal, dirty-flag clear, free-space round-trip,
+and a clean remount — plus a "never eat live data" control (a healthy nested volume scans clean and
+repair frees nothing). `cargo test -p unafs` 70 green with the format KATs and hostile-volume
+fixtures byte-identical; `no_std` check clean; `./arroyo check` green both arches; `kernel8-test`
+PASS-count byte-equivalent (23/23, trusted K3 fixture still `w=0x1ff`). Metal: none needed
+(host-native lib arc; the kernel consumes it unchanged).
+
 ## unafs — BEFS-HARDEN (bound the on-disk parser against hostile/corrupt volumes) — 2026-07-13 🔬 `us-befs`
 
 **What it does:** closes the DoS class the K3 security-tier review confirmed (and the QSIM panel

@@ -1012,7 +1012,7 @@ impl<D: BlockDevice> UnaFS<D> {
 
     /// Return a single block to the free pool (in-memory; callers persist
     /// via `sync_metadata`).
-    fn free_block(&mut self, block_id: u64) {
+    pub(crate) fn free_block(&mut self, block_id: u64) {
         self.bitmap.free(block_id);
         if self.superblock.free_blocks < self.superblock.block_count {
             self.superblock.free_blocks += 1;
@@ -1079,7 +1079,7 @@ impl<D: BlockDevice> UnaFS<D> {
 
     /// Rewrite the attribute catalog with every entry matching `pred`
     /// removed. No-op (and no rewrite) when nothing matches.
-    fn remove_catalog_entries<F: Fn(&CatalogEntry) -> bool>(
+    pub(crate) fn remove_catalog_entries<F: Fn(&CatalogEntry) -> bool>(
         &mut self,
         pred: F,
     ) -> Result<(), FileSystemError> {
