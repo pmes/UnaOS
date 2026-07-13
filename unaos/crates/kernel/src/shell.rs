@@ -870,6 +870,8 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
             console.println("          cp -r <srcdir> <dst>  (recursively copy a directory tree)");
             console.println("MOVE:     mv <src> <dst>  (move/rename a file or dir, O(1); mv SRC DIR/ lands as DIR/<leaf>)");
             console.println("          (create/edit/delete/copy/move files & dirs anywhere in the tree; sync = write-through, durable)");
+            #[cfg(target_arch = "aarch64")]
+            console.println("UNAFS:    uls [path], ucat <path>  (native unafs volume, read-only)");
             console.println("SMP:      sched (per-CPU run queues), pulse (full-screen CPU monitor)");
             console.println("TEST:     tste (in-OS self-test suite: boot-replay + live checks)");
             console.println("NETWORK:  netinfo, ping <ip> [count], arp <ip>");
@@ -1000,6 +1002,72 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
                         Err(msg) => console.println(&alloc::format!("cat: {}", msg)),
                     },
                     Err(e) => console.println(&alloc::format!("cat: no FAT filesystem ({:?})", e)),
+                },
+            }
+        },
+        #[cfg(target_arch = "aarch64")]
+        "uls" => {
+            // BeFS-K3: list a directory on the native unafs volume (read-only mount; absolute
+            // paths, case-sensitive names — unafs has no shell cwd). `uls` lists the root.
+            let path = args.first().copied().unwrap_or("/");
+            match crate::fs::unafs::mount() {
+                Ok(mut fs) => match fs.resolve_path(path) {
+                    Ok(id) => match fs.ls(id) {
+                        Ok(entries) => {
+                            for de in &entries {
+                                let size = fs.read_inode(de.inode_id).map(|i| i.size).unwrap_or(0);
+                                if de.kind == ::unafs::FileKind::Directory {
+                                    console.println(&alloc::format!("  <DIR>              {}", de.name));
+                                } else {
+                                    console.println(&alloc::format!("  {:>10}  {}", size, de.name));
+                                }
+                            }
+                            console.println(&alloc::format!("  ({} entries)", entries.len()));
+                        }
+                        Err(e) => console.println(&alloc::format!("uls: {}: {:?}", path, e)),
+                    },
+                    Err(e) => console.println(&alloc::format!("uls: {}: {:?}", path, e)),
+                },
+                Err(e) => console.println(&alloc::format!("uls: no unafs volume ({:?})", e)),
+            }
+        },
+        #[cfg(target_arch = "aarch64")]
+        "ucat" => {
+            // BeFS-K3: print a file off the native unafs volume (bounded like `cat`).
+            match args.first() {
+                None => console.println("usage: ucat <path>"),
+                Some(path) => match crate::fs::unafs::mount() {
+                    Ok(mut fs) => match fs.resolve_path(path) {
+                        Ok(id) => match fs.read_inode(id) {
+                            Ok(inode) if inode.kind == ::unafs::FileKind::Directory =>
+                                console.println(&alloc::format!("ucat: {}: is a directory (-EISDIR)", path)),
+                            Ok(inode) => {
+                                const CAP: u64 = 8192;
+                                let want = inode.size.min(CAP);
+                                match fs.read_data(id, 0, want) {
+                                    Ok(data) => {
+                                        let text: String = data.iter().filter_map(|&b| match b {
+                                            b'\n' => Some('\n'),
+                                            b'\r' => None,
+                                            0x20..=0x7e => Some(b as char),
+                                            _ => Some('.'),
+                                        }).collect();
+                                        for line in text.split('\n') {
+                                            console.println(line);
+                                        }
+                                        if inode.size > want {
+                                            console.println(&alloc::format!(
+                                                "[... {} of {} bytes shown]", want, inode.size));
+                                        }
+                                    }
+                                    Err(e) => console.println(&alloc::format!("ucat: {}: {:?}", path, e)),
+                                }
+                            }
+                            Err(e) => console.println(&alloc::format!("ucat: {}: {:?}", path, e)),
+                        },
+                        Err(e) => console.println(&alloc::format!("ucat: {}: {:?}", path, e)),
+                    },
+                    Err(e) => console.println(&alloc::format!("ucat: no unafs volume ({:?})", e)),
                 },
             }
         },

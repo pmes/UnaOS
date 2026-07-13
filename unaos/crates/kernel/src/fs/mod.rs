@@ -18,5 +18,8 @@
 //! ([`crate::drivers::block`]), so the same code runs on the x86_64 (Intel xHCI)
 //! and aarch64 (qemu-xhci) storage paths. FAT16/FAT32 with read, in-place write,
 //! grow, create/delete, and directory creation/removal (`create_dir`/`remove_dir`).
+//! BeFS-K3 adds [`unafs`]: a read-only mount of the native UnaFS volume.
 
 pub mod fat;
+#[cfg(target_arch = "aarch64")]
+pub mod unafs;

@@ -10,6 +10,52 @@ Legend: **✅ metal-confirmed** · **🔬 QEMU-green, metal pending** · dates I
 
 ---
 
+## Pi 4 — UNAFS-K3 (BeFS-K3: kernel read-only mount of a native unafs volume) — 2026-07-12 ✅ `hw-pi4`
+
+**✅ METAL-CONFIRMED (2026-07-12 attended evening bench, real Pi 4, reflashed card with the unafs
+partition):** `:: K3-mount: … mounted RO + ls/cat byte-verified PASS [w=0x1ff] ::` captured in FIVE
+boots on silicon — the first kernel read of the native unafs filesystem on real hardware. Pristine
+boot: 23/23 fixture PASS (U9/U10/U6-grants/U11 all real), F2/F3 parallelism witnesses locked
+240000/240000, **0 forbidden** (no R1/CMD13/exception/heal), dirty-mount warn line absent (clean
+volume) — mbench **28/30**, missing only the CAPSTONE pair. Interactive evidence (HDMI panel,
+serial-FIFO-injected — the pi kernel8 build is `skip_xhci`, no USB keyboard): `uls` → the two
+fixtures + "(2 entries)"; `ucat /K3HELLO.TXT` → the pinned text; `ucat /K3NOPE.TXT` → refused
+(photo witnessed). ⚠ **Bench observations for the ledger:** (1) core 3 failed spin-table release in
+ALL 6 boots this evening (capstone skipped) vs 4/4 cores this morning on `a834b8f` — a flagged
+watch-item (environment vs build-correlated undetermined; scheduler untouched by this arc; CAPSTONE
+6/6 stands metal-confirmed from round-9 the same day); (2) `resolve_path` reports a missing name as
+`FileSystemError::RootMissing` — misleading error name, folded into the BEFS-HARDEN/K4 cleanliness
+list. Logs `~/unaos-bench/pi-serial-2026-07-12-{211701,212337}.log` (+3 earlier stale-media boots
+that still captured K3-mount PASS).
+
+The first time the native unafs filesystem is read by the kernel — the BeFS chain's
+K1 (`no_std` port) → K2 (block adapter) seam consumed end-to-end. Three commits:
+
+- **Warn seam (`libs/unafs`, carried UNAFS-2 ledger item):** `warnlog::set_warn_hook` — a
+  dependency-free `no_std` fn-pointer hook; the torn-journal dirty-mount warning (previously a
+  `std`-gated `println!`, silent in a kernel) now reaches the kernel serial console. Host `std`
+  behavior unchanged; 29 unafs host tests green.
+- **M1 (mount):** kernel `fs/unafs.rs` implements `unafs::adapter::SectorDevice` over
+  `drivers::block::read_block` (512 B LBAs; `write_sector` a deliberate `Io` stub — the RO
+  guarantee is at the seam, so no path can touch the medium; K4 owns writes). `locate_unafs`
+  finds the volume by `UNAFS` superblock magic; `BlockAdapter::for_partition` + `UnaFS::mount`.
+  Staging: `arroyo kernel8` builds a real 4 MB unafs volume with the host `unafs` CLI
+  (deterministic fixtures `K3HELLO.TXT` + 12 KiB patterned `K3PAT.BIN`) and `make-pi-img.sh`
+  carries it as **MBR partition 2** (type 0x7f, written by byte offset — nothing auto-mounts
+  during image build), identical for QEMU `if=sd` and the flashed card.
+- **M2 (read paths):** the uncounted `:: K3-mount: … PASS [w=0x1ff] ::` witness byte-verifies
+  root `ls` (exactly the two fixtures), a single-block read (`K3HELLO.TXT` == pinned text), a
+  multi-block/extent-walking read (all 12 KiB of `K3PAT.BIN` match `(i*7+3)&0xFF`), a negative
+  resolve, and the RO-seam refusal. Shell gains `uls [path]` / `ucat <path>` (absolute,
+  case-sensitive; `ucat` bounded at 8 KiB) over the same mount.
+
+**Tested:** `check` both arches; `kernel8`; `kernel8-test` 29 PASS byte-equivalent + CAPSTONE 6/6 +
+all prior witness lines + `K3-mount PASS [w=0x1ff]`, zero R1/CMD13/exception; `test-arm` MISSION.
+**Metal (M3) attended-pending:** the card must be **reflashed** from the new image (file-level prep
+cannot add partition 2). `query` on metal deferred — the engine is `std`/FP-`sqrt`-gated.
+
+---
+
 ## Pi 4 metal — round-9 attended bench (2026-07-12) — ✅ `hw-pi4`
 
 One boot on a real Pi 4 (kernel `a834b8f`) cleared the whole accrued Pi metal backlog. `mbench`

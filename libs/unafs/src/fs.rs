@@ -169,6 +169,9 @@ impl<D: BlockDevice> UnaFS<D> {
         if journal.check_recovery(&mut device)? {
             #[cfg(feature = "std")]
             println!("[WARNING] :: DIRTY MOUNT DETECTED. TORN TRANSACTION IN JOURNAL.");
+            // K3 observability seam: also surface the warning through the no_std
+            // hook, so a kernel (no println) mount is not silent about a torn journal.
+            crate::warnlog::warn("[WARNING] :: DIRTY MOUNT DETECTED. TORN TRANSACTION IN JOURNAL.");
         }
 
         Ok(Self {

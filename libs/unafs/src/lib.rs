@@ -46,6 +46,7 @@ pub mod query;
 pub mod storage;
 pub mod superblock;
 pub mod wal;
+pub mod warnlog;
 
 pub use adapter::{
     BlockAdapter, MemSectorDevice, Partition, PartitionScheme, PartitionSpan, PartitionTable,
