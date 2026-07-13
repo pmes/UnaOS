@@ -977,6 +977,186 @@ fn print_dir_listing(console: &mut Console, entries: &[DirEntry]) {
     console.println(&alloc::format!("{} file(s), {} dir(s)", files, dirs));
 }
 
+// ---------------------------------------------------------------------------------------------
+// JD12 — wildcard globbing (`ls *.C`, `cat *.MD`, `rm *.TXT`, `cp *.TXT DIR/`, `mv *.LOG ARCH/`).
+//
+// A single TRAILING glob in a path's LAST component is expanded against the parent directory via the
+// read-only `read_dir` (case-insensitive 8.3 matching, already proven for `cd`/`cat`). Expansion is
+// invoked ONLY inside the fs-verb arms below — the shared arg-split at the top of `dispatch_command`
+// is unchanged, and the NET command region (netinfo/ping/arp/connect/udpsend/get — a sockets-arc
+// lane) never sees a glob. A verb loops over the matches (SNAPSHOT-then-act: the match list is
+// captured before any mutation, so a `rm *.TXT` that deletes as it goes never invalidates its own
+// list). A glob with no match is an honest per-pattern "no match" note; a name with no metacharacter
+// passes through literally (byte-identical to pre-JD12). Only the leaf is a pattern — a metacharacter
+// in an earlier component resolves literally (an honest `-ENOENT`), never a mid-path wildcard walk.
+
+/// True if `s` carries a glob metacharacter (`*` = any run, `?` = exactly one char).
+fn has_glob(s: &str) -> bool {
+    s.bytes().any(|b| b == b'*' || b == b'?')
+}
+
+/// Case-insensitive 8.3 wildcard match: `*` matches any run (including empty), `?` exactly one
+/// character; every other byte is literal. Iterative with star-backtrack — no recursion, no
+/// allocation. `name` is a canonical on-disk 8.3 name (e.g. `README.TXT`), `pat` the leaf pattern.
+fn glob_match(pat: &str, name: &str) -> bool {
+    let p = pat.as_bytes();
+    let n = name.as_bytes();
+    let (mut pi, mut ni) = (0usize, 0usize);
+    let (mut star, mut resume) = (usize::MAX, 0usize); // last '*' seen in `p`, and where to resume `n`
+    while ni < n.len() {
+        if pi < p.len() && (p[pi] == b'?' || p[pi].eq_ignore_ascii_case(&n[ni])) {
+            pi += 1;
+            ni += 1;
+        } else if pi < p.len() && p[pi] == b'*' {
+            star = pi;
+            resume = ni;
+            pi += 1; // let '*' match zero chars first; a later mismatch backtracks and extends it
+        } else if star != usize::MAX {
+            pi = star + 1;
+            resume += 1;
+            ni = resume; // '*' swallows one more char of `n`, then retry the rest of the pattern
+        } else {
+            return false;
+        }
+    }
+    while pi < p.len() && p[pi] == b'*' {
+        pi += 1; // any trailing '*'s match the (now empty) tail of `n`
+    }
+    pi == p.len()
+}
+
+/// The result of expanding ONE path argument. `Literal` = no metacharacter in the leaf — the arg
+/// passed through unchanged (byte-identical to pre-JD12; also covers a glob confined to a NON-trailing
+/// component, which resolves literally). `Matched` = a trailing-glob leaf resolved against
+/// `parent_canon`'s directory to zero or more entries; an empty `entries` (including a parent that
+/// does not resolve to a directory) is an honest "no match".
+enum Glob {
+    Literal(String),
+    Matched { parent_canon: String, entries: Vec<DirEntry> },
+}
+
+/// Expand a shell path arg for the fs-verb glob (JD12). A metacharacter is honored ONLY in the LAST
+/// path component; a glob in an earlier component is treated literally (its parent resolve fails ⇒ no
+/// match, an honest error at the verb). Case-insensitive; `.`/`..` filtered; matches sorted so a
+/// listing / serial transcript is deterministic.
+fn glob_expand(fs: &FatFs, arg: &str) -> Glob {
+    let norm = normalize_path(&cwd_path(), arg);
+    let comps: Vec<&str> = norm.split('/').filter(|c| !c.is_empty()).collect();
+    let leaf = match comps.last() {
+        Some(l) => *l,
+        None => return Glob::Literal(norm), // arg normalized to "/" — nothing to glob
+    };
+    if !has_glob(leaf) {
+        return Glob::Literal(String::from(arg)); // pass the ORIGINAL typed arg through unchanged
+    }
+    // Resolve the PARENT (everything but the leaf) to a directory cluster + its canonical path.
+    let (parent_cluster, parent_canon) = if comps.len() == 1 {
+        (0u32, String::new()) // the volume root
+    } else {
+        let mut parent_path = String::new();
+        for c in &comps[..comps.len() - 1] {
+            parent_path.push('/');
+            parent_path.push_str(c);
+        }
+        match resolve_path(fs, &parent_path) {
+            Ok(Resolved::Root) => (0u32, String::new()),
+            Ok(Resolved::Entry(de, canon)) if de.is_dir => (de.first_cluster(), canon),
+            _ => return Glob::Matched { parent_canon: parent_path, entries: Vec::new() }, // no dir → no match
+        }
+    };
+    let mut entries: Vec<DirEntry> = match fs.read_dir(parent_cluster) {
+        Ok(es) => es
+            .into_iter()
+            .filter(|de| {
+                let nm = de.name();
+                nm != "." && nm != ".." && glob_match(leaf, nm)
+            })
+            .collect(),
+        Err(_) => Vec::new(),
+    };
+    entries.sort_by(|a, b| a.name().cmp(b.name()));
+    Glob::Matched { parent_canon, entries }
+}
+
+/// Resolve `path` and print it in the `ls` table format (the single-path `ls` core, shared by the
+/// `ls` arm and the wildcard `ls *.EXT` Literal fall-through). A directory lists its entries; a plain
+/// file prints its one table line (the DOS idiom); errors are errno-tagged.
+fn ls_resolved(console: &mut Console, fs: &FatFs, path: &str) {
+    match resolve_path(fs, path) {
+        Ok(Resolved::Root) => match fs.read_dir(0) {
+            Ok(entries) => print_dir_listing(console, &entries),
+            Err(e) => console.println(&alloc::format!("ls: /: read failed ({:?}, -EIO)", e)),
+        },
+        Ok(Resolved::Entry(de, canon)) => {
+            if de.is_dir {
+                match fs.read_dir(de.first_cluster()) {
+                    Ok(entries) => print_dir_listing(console, &entries),
+                    Err(e) => console.println(&alloc::format!(
+                        "ls: {}: read failed ({:?}, -EIO)", canon, e)),
+                }
+            } else {
+                console.println(&alloc::format!("  {:>10}  {}", de.size, de.name()));
+            }
+        }
+        Err(msg) => console.println(&alloc::format!("ls: {}", msg)),
+    }
+}
+
+/// JD4 `ls`/`ls <dir>` (single path): mount + resolve + print. Extracted so the wildcard `ls *.EXT`
+/// can share the exact resolve/print behaviour for a non-trailing-glob fall-through.
+fn ls_path(console: &mut Console, arg: &str) {
+    match crate::fs::fat::mount() {
+        Ok(fs) => ls_resolved(console, &fs, &normalize_path(&cwd_path(), arg)),
+        Err(e) => console.println(&alloc::format!("ls: no FAT filesystem ({:?})", e)),
+    }
+}
+
+/// JD12 `ls *.EXT`: list every entry matching a wildcard, one `ls`-table line each (sorted), with the
+/// file/dir tally. A directory match shows as `<DIR>` (its contents are not expanded — that mirrors
+/// how a shell hands matched names to `ls`); no match is an honest "no match".
+fn ls_globbed(console: &mut Console, arg: &str) {
+    let fs = match crate::fs::fat::mount() {
+        Ok(fs) => fs,
+        Err(e) => return console.println(&alloc::format!("ls: no FAT filesystem ({:?})", e)),
+    };
+    match glob_expand(&fs, arg) {
+        Glob::Literal(p) => ls_resolved(console, &fs, &normalize_path(&cwd_path(), &p)),
+        Glob::Matched { entries, .. } if entries.is_empty() =>
+            console.println(&alloc::format!("ls: {}: no match", arg)),
+        Glob::Matched { entries, .. } => print_dir_listing(console, &entries),
+    }
+}
+
+/// JD12 `cat *.EXT`: cat every FILE matching a wildcard (concatenate), in sorted order — reusing
+/// `cat_render` per file so the rendering + truncation note are identical to a single-path `cat`. A
+/// directory match is skipped with the classic `-EISDIR` note; no match is an honest "no match". A
+/// glob confined to a non-trailing component falls through to a literal resolve (honest error).
+fn cat_globbed(console: &mut Console, arg: &str) {
+    let fs = match crate::fs::fat::mount() {
+        Ok(fs) => fs,
+        Err(e) => return console.println(&alloc::format!("cat: no FAT filesystem ({:?})", e)),
+    };
+    match glob_expand(&fs, arg) {
+        Glob::Literal(p) => match resolve_path(&fs, &normalize_path(&cwd_path(), &p)) {
+            Ok(Resolved::Root) => console.println("cat: /: is a directory (-EISDIR)"),
+            Ok(Resolved::Entry(de, canon)) => cat_render(console, &fs, &de, &canon),
+            Err(msg) => console.println(&alloc::format!("cat: {}", msg)),
+        },
+        Glob::Matched { entries, .. } if entries.is_empty() =>
+            console.println(&alloc::format!("cat: {}: no match", arg)),
+        Glob::Matched { parent_canon, entries } => {
+            for de in &entries {
+                let canon = joined(&parent_canon, de.name());
+                if de.is_dir {
+                    console.println(&alloc::format!("cat: {}: is a directory (-EISDIR)", canon));
+                } else {
+                    cat_render(console, &fs, de, &canon);
+                }
+            }
+        }
+    }
+}
+
 pub struct History {
     entries: Vec<String>,
     position: usize,
@@ -1069,28 +1249,11 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
         },
         "ls" | "dir" => {
             // JD4: `ls` lists the cwd; `ls <dir>` any path (absolute or cwd-relative). An `ls` of
-            // a plain file prints its one table line (the DOS idiom), not an error.
-            let path = normalize_path(&cwd_path(), args.first().copied().unwrap_or("."));
-            match crate::fs::fat::mount() {
-                Ok(fs) => match resolve_path(&fs, &path) {
-                    Ok(Resolved::Root) => match fs.read_dir(0) {
-                        Ok(entries) => print_dir_listing(console, &entries),
-                        Err(e) => console.println(&alloc::format!("ls: /: read failed ({:?}, -EIO)", e)),
-                    },
-                    Ok(Resolved::Entry(de, canon)) => {
-                        if de.is_dir {
-                            match fs.read_dir(de.first_cluster()) {
-                                Ok(entries) => print_dir_listing(console, &entries),
-                                Err(e) => console.println(&alloc::format!(
-                                    "ls: {}: read failed ({:?}, -EIO)", canon, e)),
-                            }
-                        } else {
-                            console.println(&alloc::format!("  {:>10}  {}", de.size, de.name()));
-                        }
-                    }
-                    Err(msg) => console.println(&alloc::format!("ls: {}", msg)),
-                },
-                Err(e) => console.println(&alloc::format!("ls: no FAT filesystem ({:?})", e)),
+            // a plain file prints its one table line (the DOS idiom), not an error. JD12: `ls *.EXT`
+            // lists the wildcard matches (sorted, with the file/dir tally).
+            match args.first().copied() {
+                Some(a) if has_glob(a) => ls_globbed(console, a),
+                other => ls_path(console, other.unwrap_or(".")),
             }
         },
         "cd" => {
@@ -1124,6 +1287,7 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
             // JD4: `cat` takes a path (absolute or cwd-relative), e.g. `cat DOCS/README.TXT`.
             match args.first() {
                 None => console.println("usage: cat <path>"),
+                Some(name) if has_glob(name) => cat_globbed(console, name),
                 Some(name) => match crate::fs::fat::mount() {
                     Ok(fs) => match resolve_path(&fs, &normalize_path(&cwd_path(), name)) {
                         Ok(Resolved::Root) =>
