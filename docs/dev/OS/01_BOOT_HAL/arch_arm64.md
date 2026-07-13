@@ -2373,7 +2373,12 @@ not size. Zero x86 behavioural change (the sink is `None` off-tegra). As in JD2�
 is not headless-reachable in-lane (dispatch is keystroke-driven; tegra never runs in QEMU), so the verdict
 is **attended-pending**.
 
-**Metal verdict — ⏳ ATTENDED-PENDING.** The payoff is itself a metal artifact: at the next attended Orin
+**Metal verdict — ✅ METAL-CONFIRMED (2026-07-13 attended bench; Peter at the Orin; serial
+`~/unaos-bench/jetson-serial-2026-07-13-133055.log`).** One card session, 4 clean boots / 4 power
+cycles, 0 heals / 0 fatals / 0 BOT-timeouts, erratum-1941500 bit8=0 every boot. The whole session
+is durable on serial — 397 `JD2 — KEY` + 77 `JD2 — OUT` lines; the round-9 "output vanishes, only
+keys echo" gap is CLOSED and every verb is replayable from the capture. (Original expectation kept
+below for the record.) The payoff is itself a metal artifact: at the next attended Orin
 bench, every `ls`/`cat`/verb result appears on the serial log as `:: tegra: JD2 — OUT | … ::`, so the bench
 produces a durable, mbench-able output transcript for the first time (the round-9 bench could not). Bench
 card [`jd11-bench.md`](../../../../unaos/scripts/jd11-bench.md): run any output-producing command
@@ -2437,7 +2442,16 @@ snapshot-then-mutate safety all cleared; two low-severity truncation-note edges 
 (`head` notes when lines remain, not merely when it stopped short of EOF; `tail` keeps a boundary-aligned
 first line).
 
-**Metal verdict — ⏳ ATTENDED-PENDING.** As in JD2–JD11 the interactive path can only be exercised on
+**Metal verdict — ✅ METAL-CONFIRMED (2026-07-13 attended bench; same card session + serial log as
+the JD11 confirm above).** `head`/`tail`: content-read, `-EISDIR`, `-ENOENT`, no-hang all correct on
+silicon. Glob: `ls`/`cat`/`cp`/`mv`/`rm` all expand+sort correctly; the `-ENOTDIR` guard fires on
+multi-source→non-dir; a glob-copied `DOCS/A.TXT` and glob-moved `ARCHIVE/C.LOG` survived a REAL
+power cycle. Coverage note (not a defect): the panel's write/append verbs insert no newline, so
+panel-authored files are single-line and last-N tail truncation was never distinguished from head on
+metal — a true `tail N` witness needs a pre-seeded multi-line file (future bench prep item). ⚠ Bench
+lesson (hazard, cross-track): macOS AppleDouble `._*` sidecars are glob-visible on FAT via 8.3 short
+names (`_~8.TXT` matches `*.TXT`) — `dot_clean` the DATA card too, not just the boot stick.
+(Original expectation kept below for the record.) As in JD2–JD11 the interactive path can only be exercised on
 silicon. Bench card [`jd12-bench.md`](../../../../unaos/scripts/jd12-bench.md): page a file with
 `head`/`tail`, then glob `ls *.TXT` / `cat *.TXT` / `cp *.TXT DOCS/` / `rm *.TMP` / `mv *.LOG ARCHIVE/`, and
 confirm on the JD11 serial transcript that the right files are paged / listed / copied / removed / moved,

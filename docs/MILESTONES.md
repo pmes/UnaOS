@@ -221,7 +221,7 @@ Spec promotions committed here; the granular arc detail is in each arc's own ent
 
 ## hw-jetson track — 2026-07-13 (JD12 — paging & wildcard globbing on the panel shell)
 
-### JD12 — `head`/`tail` paging + `*`/`?` wildcard globbing (`shell.rs`-only, call-never-edit) 🔬 `hw-jetson`
+### JD12 — `head`/`tail` paging + `*`/`?` wildcard globbing (`shell.rs`-only, call-never-edit) ✅ `hw-jetson` (METAL-CONFIRMED 2026-07-13 attended Orin bench, one session with the JD11 confirm; glob copy/move survived a real power cycle)
 - **Why:** the classic file-manager verb set closed at JD10 and JD11 made benches self-documenting; JD12 is
   the polish pass — two user-facing conveniences over that set, no new `fat.rs` surface. Paging lets you read
   a long file's head/tail without flooding the scrollback-less panel; globbing multiplies every fs verb
@@ -255,7 +255,7 @@ Spec promotions committed here; the granular arc detail is in each arc's own ent
 
 ## hw-jetson track — 2026-07-12 (JD11 — mirroring shell command output to serial)
 
-### JD11 — mirror panel command output to serial for a durable bench transcript (`shell.rs`/`console.rs` lane) 🔬 `hw-jetson`
+### JD11 — mirror panel command output to serial for a durable bench transcript (`shell.rs`/`console.rs` lane) ✅ `hw-jetson` (METAL-CONFIRMED 2026-07-13 attended Orin bench: 397 KEY + 77 OUT lines durable on serial; the round-9 output-vanishes gap CLOSED)
 - **Why:** the round-9 Orin bench found the panel console has **no scrollback** and shell command *output*
   (`ls`/`cat`/verb results) drew only to the panel — only *keystrokes* echoed to serial
   (`:: tegra: JD2 — KEY … ::`). So verbatim output was uncapturable over the serial bridge / unreplayable by
