@@ -28,7 +28,7 @@ Shared infrastructure used by handlers and vessels.
 | `bandy` | The message bus (`SMessage`, `Synapse`) and shared domain state (`AppState`, `WorkspaceState`, `HistoryItem`). |
 | `quartzite` | The GUI layer. Renders a workspace natively on the host and routes input back as messages. |
 | `elessar` | Workspace/context detection. |
-| `euclase` | GPU rendering (WGPU): shaders, render graph. |
+| `euclase` | GPU rendering (WGPU): shaders, render graph, and the presentation layer (`Cortex` + textured `quad` over a CAMetalLayer) — first live consumer is `facet`. |
 | `resonance` | Audio engine and DSP. |
 | `unafs` | Virtual filesystem client. |
 | `lux` | Image decoding (incl. camera RAW). |
@@ -62,7 +62,7 @@ message bus, a selection of handlers, and a GUI window.
 | `pulse` | System monitor: numbered per-core CPU segment bars (BeOS Pulse heir). Host sampler behind the `PulseSource` seam; a UnaOS-kernel telemetry feed is the banked replacement source. |
 | `phonolite` | Tone vessel: the resonance engine given a face — start/stop, log-scale frequency + gain sliders (quartzite's first input-control surface, `tone_panel`), bus-routed level ladder. Domain logic lifts to `stria` when it becomes a real handler. |
 | `una` | Code-focused IDE. **Currently parked** (excluded from the workspace build). |
-| `facet` | Image / raster viewer: `facet <image>` decodes via `lux` (PNG/JPEG/ARW), packs linear→sRGB, and shows the picture in a quartzite window (CPU blit via `platforms::macos::image_view`) with zoom-about-cursor, drag-pan, reset-to-fit (`0`/`f`), and a live per-pixel readout (sRGB + source linear). The euclase GPU path is a later arc. |
+| `facet` | Image / raster viewer: `facet <image>` decodes via `lux` (PNG/JPEG/ARW), packs linear→sRGB, and shows the picture in a quartzite window — GPU textured quad via euclase by default (CAMetalLayer, sRGB), CPU `image_view` blit as automatic fallback or via `FACET_CPU=1` — with zoom-about-cursor, drag-pan, reset-to-fit (`0`/`f`), and a live per-pixel readout (sRGB + source linear). |
 | `apps/cli/*` | Command-line tools: `unafs`, `vertex`, `sentinel`, `unafs_bench`. |
 
 UnaOS deliberately avoids fixed-feature "apps": a vessel composes handlers

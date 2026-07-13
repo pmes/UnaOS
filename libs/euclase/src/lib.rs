@@ -16,10 +16,24 @@
 
 pub mod cortex;
 pub mod mat4;
+pub mod quad;
 pub mod quat;
 pub mod utils;
 pub mod vec3;
 pub mod vec4; // <-- Wired into the nervous system
+
+// Alias shims for vug's import shape (`euclase::mat::Mat4`, `euclase::vec::{Vec3, Vec4}`).
+pub mod mat {
+    pub use crate::mat4::Mat4;
+}
+pub mod vec {
+    pub use crate::vec3::Vec3;
+    pub use crate::vec4::Vec4;
+}
+
+/// Re-export wgpu so consumers (facet) can name filter modes, colors, and
+/// surface errors without carrying their own wgpu dependency line.
+pub use wgpu;
 
 pub use mat4::Mat4;
 pub use quat::Quat;

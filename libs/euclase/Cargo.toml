@@ -7,10 +7,12 @@ license = "LGPL-3.0-or-later"
 [dependencies]
 bytemuck = { version = "1.25", features = ["derive"] }
 libm = "0.2"
+log = "0.4"
+# Blocks the async adapter/device handshake for synchronous vessel bootstrap
+# (Cortex::ignite_layer_blocking). Tiny by design.
+pollster = "0.4"
 serde = { version = "1.0", default-features = false, features = ["derive"], optional = true }
 wgpu = "28.0"
-winit = "0.30"
-bandy = { path = "../bandy" }
 
 [features]
 default = []
