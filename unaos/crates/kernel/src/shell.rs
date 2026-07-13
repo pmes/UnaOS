@@ -1157,6 +1157,105 @@ fn cat_globbed(console: &mut Console, arg: &str) {
     }
 }
 
+/// JD12: does `dst` (a shell path arg) resolve to an existing directory (or the root)? A multi-source
+/// `cp`/`mv` requires it — several sources can only land INTO a directory, not onto one target name.
+fn dst_is_dir(fs: &FatFs, dst: &str) -> bool {
+    match resolve_path(fs, &normalize_path(&cwd_path(), dst)) {
+        Ok(Resolved::Root) => true,
+        Ok(Resolved::Entry(de, _)) => de.is_dir,
+        Err(_) => false,
+    }
+}
+
+/// JD12: expand the SOURCE args of a `cp`/`mv` into concrete source paths, printing a per-pattern "no
+/// match" note (tagged with `verb`) for any wildcard that matched nothing. Literal args pass through
+/// unchanged. Returns the flattened, ordered list (SNAPSHOT: taken before any mutation runs).
+fn expand_sources(console: &mut Console, fs: &FatFs, verb: &str, sources: &[&str]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for s in sources {
+        match glob_expand(fs, s) {
+            Glob::Literal(p) => out.push(p),
+            Glob::Matched { entries, .. } if entries.is_empty() =>
+                console.println(&alloc::format!("{}: {}: no match", verb, s)),
+            Glob::Matched { parent_canon, entries } => {
+                for de in &entries {
+                    out.push(joined(&parent_canon, de.name()));
+                }
+            }
+        }
+    }
+    out
+}
+
+/// JD12 `rm` with wildcards: `rm <path...>` — each arg a file target or a trailing glob.
+/// SNAPSHOT-then-delete (`glob_expand` captures the match list before any delete), so a wildcard
+/// delete never invalidates its own list. A wildcard with no match is an honest per-pattern note;
+/// each concrete target rides the existing per-file `fs_rm` (directory → `-EISDIR`, use `rmdir`).
+fn rm_globbed(console: &mut Console, args: &[&str]) {
+    let fs = match crate::fs::fat::mount() {
+        Ok(fs) => fs,
+        Err(e) => return console.println(&alloc::format!("rm: no FAT filesystem ({:?})", e)),
+    };
+    for a in args {
+        match glob_expand(&fs, a) {
+            Glob::Literal(p) => fs_rm(console, &p),
+            Glob::Matched { entries, .. } if entries.is_empty() =>
+                console.println(&alloc::format!("rm: {}: no match", a)),
+            Glob::Matched { parent_canon, entries } => {
+                for de in &entries {
+                    fs_rm(console, &joined(&parent_canon, de.name()));
+                }
+            }
+        }
+    }
+}
+
+/// JD12 `cp` with wildcards / multiple sources: `cp [-r] <src...> <dst>`. Sources expand (globs +
+/// literals); with more than one source the destination MUST be an existing directory (several files
+/// can only land INTO a directory). Each source rides the existing `fs_cp` / `fs_cp_recursive` (the
+/// `FILE DIR/` idiom lands each under `dst/<leaf>`). SNAPSHOT-then-copy.
+fn cp_globbed(console: &mut Console, sources: &[&str], dst: &str, recursive: bool) {
+    let fs = match crate::fs::fat::mount() {
+        Ok(fs) => fs,
+        Err(e) => return console.println(&alloc::format!("cp: no FAT filesystem ({:?})", e)),
+    };
+    let srcs = expand_sources(console, &fs, "cp", sources);
+    if srcs.is_empty() {
+        return; // every pattern was empty (each already reported "no match")
+    }
+    if srcs.len() > 1 && !dst_is_dir(&fs, dst) {
+        return console.println(&alloc::format!("cp: target {}: not a directory (-ENOTDIR)", dst));
+    }
+    for s in &srcs {
+        if recursive {
+            fs_cp_recursive(console, s, dst);
+        } else {
+            fs_cp(console, s, dst);
+        }
+    }
+}
+
+/// JD12 `mv` with wildcards / multiple sources: `mv <src...> <dst>`. Sources expand; with more than
+/// one source the destination MUST be an existing directory. Each source rides the existing `fs_mv`
+/// (the `SRC DIR/` idiom lands each under `dst/<leaf>`). SNAPSHOT-then-move — a wildcard move never
+/// invalidates its own list.
+fn mv_globbed(console: &mut Console, sources: &[&str], dst: &str) {
+    let fs = match crate::fs::fat::mount() {
+        Ok(fs) => fs,
+        Err(e) => return console.println(&alloc::format!("mv: no FAT filesystem ({:?})", e)),
+    };
+    let srcs = expand_sources(console, &fs, "mv", sources);
+    if srcs.is_empty() {
+        return;
+    }
+    if srcs.len() > 1 && !dst_is_dir(&fs, dst) {
+        return console.println(&alloc::format!("mv: target {}: not a directory (-ENOTDIR)", dst));
+    }
+    for s in &srcs {
+        fs_mv(console, s, dst);
+    }
+}
+
 pub struct History {
     entries: Vec<String>,
     position: usize,
@@ -1203,7 +1302,8 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
             console.println("DIRS:     mkdir <path>, rmdir <path>  (create / remove empty directories)");
             console.println("COPY:     cp <src> <dst>  (copy a file; cp FILE DIR/ lands as DIR/<leaf>)");
             console.println("          cp -r <srcdir> <dst>  (recursively copy a directory tree)");
-            console.println("MOVE:     mv <src> <dst>  (move/rename a file or dir, O(1); mv SRC DIR/ lands as DIR/<leaf>)");
+            console.println("MOVE:     mv <src...> <dst>  (move/rename a file or dir, O(1); mv SRC DIR/ lands as DIR/<leaf>)");
+            console.println("WILDCARD: * / ? in the last path component — ls/cat/rm/cp/mv expand it (e.g. rm *.TMP, cp *.TXT DOCS/)");
             console.println("          (create/edit/delete/copy/move files & dirs anywhere in the tree; sync = write-through, durable)");
             #[cfg(target_arch = "aarch64")]
             console.println("UNAFS:    uls [path], ucat <path>  (native unafs volume, read-only)");
@@ -1400,10 +1500,17 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
             }
         },
         "rm" | "del" => {
-            // JD6: delete a file in any reachable dir (directory → -EISDIR; use `rmdir`). `rm <path>`.
-            match args.first() {
-                None => console.println("usage: rm <path>"),
-                Some(name) => fs_rm(console, name),
+            // JD6: delete a file in any reachable dir (directory → -EISDIR; use `rmdir`). JD12: takes
+            // multiple targets and expands trailing wildcards — `rm <path...>`, `rm *.TMP`.
+            if args.is_empty() {
+                console.println("usage: rm <path> [path ...]");
+            } else if !args.iter().any(|a| has_glob(a)) {
+                // No wildcard: delete each literal target (a single arg is byte-identical to pre-JD12).
+                for &a in &args {
+                    fs_rm(console, a);
+                }
+            } else {
+                rm_globbed(console, &args);
             }
         },
         "mkdir" | "md" => {
@@ -1424,23 +1531,39 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
             // JD8: copy a file (`cp FILE DIR/` lands as DIR/<leaf>). JD9: `-r`/`-R` recursively copies a
             // directory tree. Flags (leading `-`) precede the paths; only `-r`/`-R` are recognized (any
             // other leading-`-` arg is ignored as an unknown flag — a name literally beginning with `-` is
-            // reachable as `./-name`). `cp <src> <dst>` | `cp -r <srcdir> <dst>`.
+            // reachable as `./-name`). JD12: sources expand trailing wildcards and there may be several,
+            // the LAST path being the destination (into a directory). `cp [-r] <src...> <dst>`.
             let recursive = args.iter().any(|a| *a == "-r" || *a == "-R");
             let paths: Vec<&str> = args.iter().copied().filter(|a| !a.starts_with('-')).collect();
-            match (paths.first(), paths.get(1)) {
-                (Some(src), Some(dst)) if recursive => fs_cp_recursive(console, src, dst),
-                (Some(src), Some(dst)) => fs_cp(console, src, dst),
-                _ => console.println("usage: cp [-r] <src> <dst>"),
+            if paths.len() < 2 {
+                console.println("usage: cp [-r] <src...> <dst>");
+            } else if paths.len() == 2 && !has_glob(paths[0]) && !has_glob(paths[1]) {
+                // No wildcard, one src: byte-identical to pre-JD12 cp.
+                if recursive {
+                    fs_cp_recursive(console, paths[0], paths[1]);
+                } else {
+                    fs_cp(console, paths[0], paths[1]);
+                }
+            } else {
+                let dst = paths[paths.len() - 1];
+                cp_globbed(console, &paths[..paths.len() - 1], dst, recursive);
             }
         },
         "mv" | "move" | "ren" | "rename" => {
             // JD10: move OR rename a file or directory by relinking one directory entry (O(1), by
             // reference — no data copy, so `mv DIR NEWNAME` needs no `-r`). Same parent → rename in
             // place (files AND dirs); across parents → move (files only, a dir there is -EISDIR). The
-            // `mv SRC DIR/` idiom lands the entry under DIR as the source leaf. `mv <src> <dst>`.
-            match (args.first(), args.get(1)) {
-                (Some(src), Some(dst)) => fs_mv(console, src, dst),
-                _ => console.println("usage: mv <src> <dst>"),
+            // `mv SRC DIR/` idiom lands the entry under DIR as the source leaf. JD12: sources expand
+            // trailing wildcards and there may be several, the LAST path being the destination
+            // directory. `mv <src...> <dst>`.
+            if args.len() < 2 {
+                console.println("usage: mv <src...> <dst>");
+            } else if args.len() == 2 && !has_glob(args[0]) && !has_glob(args[1]) {
+                // No wildcard, one src: byte-identical to pre-JD12 mv.
+                fs_mv(console, args[0], args[1]);
+            } else {
+                let dst = args[args.len() - 1];
+                mv_globbed(console, &args[..args.len() - 1], dst);
             }
         },
         "sync" => {
