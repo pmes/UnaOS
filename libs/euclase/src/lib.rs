@@ -16,6 +16,7 @@
 
 pub mod cortex;
 pub mod mat4;
+pub mod quad;
 pub mod quat;
 pub mod utils;
 pub mod vec3;
