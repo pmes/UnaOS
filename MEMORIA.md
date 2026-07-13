@@ -36,7 +36,7 @@
 *   **[CRATE] `libs/euclase`:** **[NEW]** The Visual Cortex. WGPU Renderer. Shader management. Render Graph.
 *   **[CRATE] `libs/bandy`:** The Nervous System (IPC). Defines `SMessage`.
 *   **[CRATE] `libs/resonance`:** The Voice. Audio Engine & DSP.
-*   **[CRATE] `libs/unafs`:** The Memory. Virtual File System Logic. BeFS modernized. (Note from Architect: UnaBFFS. Our Big Format File System for massive files, memory maps, etc. I named it Big Fucking File System but you said that wasn't family friendly. Ha!)
+*   **[CRATE] `libs/fs/unafs`:** The Memory. Virtual File System Logic. BeFS modernized. (Note from Architect: UnaBFFS. Our Big Format File System for massive files, memory maps, etc. I named it Big Fucking File System but you said that wasn't family friendly. Ha!)
 *   **[CRATE] `libs/elessar`:** The Context Engine. (Spline/Project Detection).
 *   **[CRATE] `libs/lux`:** Images. (Sony raw implemented but crashing).
 
@@ -79,7 +79,7 @@
 
 ## 📝 DECISION LOG
 *   **2026-07-02:** **Multi-user first** (the Be lesson: don't defer it). Security model = capabilities-first, POSIX-layerable — principals and grants live as UnaFS typed attributes. Truck (TALUS) and printer become payloads of the desktop chain, not detours.
-*   **2026-07-02:** Direction docs moved into the repo: `docs/ROADMAP.md`, `docs/SECURITY.md`, root `CLAUDE.md`, `docs/dev/OS/02_KERNEL_CORE/userspace.md`; UnaFS direction (surpass BeFS: indexes → live queries → kernel convergence) in `libs/unafs/README.md`.
+*   **2026-07-02:** Direction docs moved into the repo: `docs/ROADMAP.md`, `docs/SECURITY.md`, root `CLAUDE.md`, `docs/dev/OS/02_KERNEL_CORE/userspace.md`; UnaFS direction (surpass BeFS: indexes → live queries → kernel convergence) in `libs/fs/unafs/README.md`.
 *   **2026-06-26:** Retired the Quartzite JSON-DSL detour; restored the real multi-platform GUI API (`Backend` / `Spline`).
 *   **2026-06-26:** Merged the three kernel tracks (USB+SMP / network / video) onto `c01-int_combined`; verified booting together, both arches green.
 *   **2026-02-18:** Enforced `SMessage` as Monolithic Enum.

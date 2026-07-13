@@ -7,7 +7,7 @@ macOS or Linux.
 ## Responsibilities
 
 `unafs` is a thin executable (`apps/cli/unafs`, binary name `unafs`) that drives
-the [`unafs`](../../../libs/unafs) library against a single vault image file. A
+the [`unafs`](../../../libs/fs/unafs) library against a single vault image file. A
 vault is a self-contained UnaFS volume — an inode-based filesystem that also
 stores semantic attributes and supports content queries. The CLI exposes that
 library through a set of subcommands and is the primary way to move data in and

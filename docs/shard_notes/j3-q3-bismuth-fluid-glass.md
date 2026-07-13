@@ -33,7 +33,7 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 ### 📝 RECOMMENDATIONS FOR J4 :: DEEP SCAN ANALYSIS
 
 **1. Target Anomaly: `[WARNING] :: DIRTY MOUNT DETECTED. TORN TRANSACTION IN JOURNAL.`**
-*   **Analysis:** The `unafs` crate logs this warning upon boot (`libs/unafs/src/fs.rs: mount()`) when the internal journal identifies an incomplete commit or torn transaction sequence across blocks during initialization.
+*   **Analysis:** The `unafs` crate logs this warning upon boot (`libs/fs/unafs/src/fs.rs: mount()`) when the internal journal identifies an incomplete commit or torn transaction sequence across blocks during initialization.
 *   **Investigation:** I confirmed that `UnaFS<D>` already explicitly implements the standard Rust `Drop` trait, correctly invoking `self.sync_metadata()` and `self.device.flush()` to ensure atomic saves during a graceful shutdown sequence. The occurrence of this warning in the console output indicates that the parent application (`lumen` / `vein` reactor) is encountering an ungraceful shutdown. This typically happens when the process panics, is externally killed via SIGKILL, or the Tokio runtime terminates before dropping its static/global variables correctly.
 *   **J4 Strategy:**
     1.  **Intercept Signal Handlers:** Implement explicit OS signal handlers (SIGINT, SIGTERM) inside the primary application binary (`apps/lumen/src/main.rs`). Instead of terminating abruptly, capture the interrupt and initiate a graceful "Drain & Drop" sequence, halting new network traffic and awaiting the `UnaFS` storage `Drop` execution.
