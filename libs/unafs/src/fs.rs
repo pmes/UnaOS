@@ -66,6 +66,8 @@ pub enum FileSystemError {
     AttributeNotFound,
     #[error("Cannot move a directory into itself or its descendants")]
     DirectoryLoop,
+    #[error("Corrupt volume: {0}")]
+    CorruptVolume(&'static str),
 }
 
 /// A directory entry pointing to an inode.
@@ -288,11 +290,18 @@ impl<D: BlockDevice> UnaFS<D> {
             let mut extent_found = false;
 
             for extent in inode.chunks.iter() {
-                let extent_end = extent.logical_offset + extent.length;
+                // Disk-derived extent geometry: checked, like the read path.
+                let extent_end = extent
+                    .logical_offset
+                    .checked_add(extent.length)
+                    .ok_or(FileSystemError::CorruptVolume("extent span overflows"))?;
                 if current_offset >= extent.logical_offset && current_offset < extent_end {
                     let offset_in_extent = current_offset - extent.logical_offset;
                     let block_offset_in_extent = offset_in_extent / BLOCK_SIZE;
-                    physical_block = extent.physical_block + block_offset_in_extent;
+                    physical_block = extent
+                        .physical_block
+                        .checked_add(block_offset_in_extent)
+                        .ok_or(FileSystemError::CorruptVolume("extent target overflows"))?;
                     extent_found = true;
                     break;
                 }
@@ -306,16 +315,26 @@ impl<D: BlockDevice> UnaFS<D> {
 
                 let mut merged = false;
                 if let Some(last) = inode.chunks.last_mut() {
+                    // Checked merge probe: hostile extent geometry simply
+                    // fails to merge instead of wrapping (debug) or aliasing.
                     let last_block_count = last.length.div_ceil(BLOCK_SIZE);
-                    let last_physical_end = last.physical_block + last_block_count - 1;
+                    let last_physical_end = last
+                        .physical_block
+                        .checked_add(last_block_count)
+                        .filter(|_| last_block_count > 0);
+                    let last_logical_end = last.logical_offset.checked_add(last.length);
 
-                    if last.logical_offset + last.length <= current_offset
-                        && last.length % BLOCK_SIZE == 0
-                        && last_physical_end + 1 == new_block
+                    if let (Some(physical_end), Some(logical_end)) =
+                        (last_physical_end, last_logical_end)
                     {
-                        last.length += BLOCK_SIZE;
-                        merged = true;
-                        physical_block = new_block;
+                        if logical_end <= current_offset
+                            && last.length % BLOCK_SIZE == 0
+                            && physical_end == new_block
+                        {
+                            last.length += BLOCK_SIZE;
+                            merged = true;
+                            physical_block = new_block;
+                        }
                     }
                 }
 
@@ -365,7 +384,23 @@ impl<D: BlockDevice> UnaFS<D> {
         self.read_from_extents(&inode.chunks, offset, length, inode.size)
     }
 
+    /// The volume's byte span, per its own superblock — the bound every
+    /// disk-derived size/offset must respect (BEFS-HARDEN). `block_count *
+    /// BLOCK_SIZE` is overflow-checked at mount (`Superblock::validate`);
+    /// saturating here keeps `format()`-fresh instances safe too.
+    fn volume_bytes(&self) -> u64 {
+        self.superblock.block_count.saturating_mul(BLOCK_SIZE)
+    }
+
     /// Internal helper to read data from a specific ExtentList.
+    ///
+    /// `total_size` and the extent geometry are disk-derived (an inode's
+    /// `size`/`chunks` or a spilled attribute's extents), so everything here
+    /// is bounded (BEFS-HARDEN, K3-PARSE-2/4): `total_size` against the
+    /// volume span, the output allocation via `try_reserve_exact` (graceful
+    /// `Err`, never a capacity panic or OOM abort), extent arithmetic via
+    /// `checked_add` (profile-independent), extent targets against the
+    /// volume, and hole fills in bulk runs rather than a byte-at-a-time push.
     fn read_from_extents(
         &mut self,
         chunks: &ExtentList,
@@ -373,33 +408,63 @@ impl<D: BlockDevice> UnaFS<D> {
         length: u64,
         total_size: u64,
     ) -> Result<Vec<u8>, FileSystemError> {
-        let mut buffer = Vec::with_capacity(length as usize);
-        let mut read_so_far = 0;
-        let mut current_offset = offset;
+        if total_size > self.volume_bytes() {
+            return Err(FileSystemError::CorruptVolume("data size exceeds volume"));
+        }
 
         let available = total_size.saturating_sub(offset);
         let to_read_total = core::cmp::min(length, available);
+        let to_read_capacity = usize::try_from(to_read_total)
+            .map_err(|_| StorageError::AllocRefused(to_read_total))?;
+
+        let mut buffer = Vec::new();
+        buffer
+            .try_reserve_exact(to_read_capacity)
+            .map_err(|_| StorageError::AllocRefused(to_read_total))?;
+
+        let mut read_so_far = 0;
+        let mut current_offset = offset;
 
         while read_so_far < to_read_total {
             let mut physical_block = 0;
             let mut found = false;
+            // Nearest extent start beyond the cursor: bounds the hole run.
+            let mut next_start = u64::MAX;
 
             for extent in chunks {
-                let extent_end = extent.logical_offset + extent.length;
+                let extent_end = extent
+                    .logical_offset
+                    .checked_add(extent.length)
+                    .ok_or(FileSystemError::CorruptVolume("extent span overflows"))?;
                 if current_offset >= extent.logical_offset && current_offset < extent_end {
                     let offset_in_extent = current_offset - extent.logical_offset;
                     let block_idx = offset_in_extent / BLOCK_SIZE;
-                    physical_block = extent.physical_block + block_idx;
+                    physical_block = extent
+                        .physical_block
+                        .checked_add(block_idx)
+                        .ok_or(FileSystemError::CorruptVolume("extent target overflows"))?;
                     found = true;
                     break;
+                }
+                if extent.logical_offset > current_offset && extent.logical_offset < next_start {
+                    next_start = extent.logical_offset;
                 }
             }
 
             if !found {
-                buffer.push(0);
-                read_so_far += 1;
-                current_offset += 1;
+                // A hole: zero-fill in one run, up to the next extent start
+                // (or the end of the read). Capacity is already reserved.
+                let remaining = to_read_total - read_so_far;
+                let gap =
+                    core::cmp::min(remaining, next_start.saturating_sub(current_offset));
+                buffer.resize(buffer.len() + gap as usize, 0);
+                read_so_far += gap;
+                current_offset += gap;
                 continue;
+            }
+
+            if physical_block >= self.superblock.block_count {
+                return Err(FileSystemError::CorruptVolume("extent points past volume"));
             }
 
             let block_offset = (current_offset % BLOCK_SIZE) as usize;
@@ -571,7 +636,7 @@ impl<D: BlockDevice> UnaFS<D> {
         }
 
         if let Some(extents) = inode.large_attributes.get(key) {
-            let total_size: u64 = extents.iter().map(|e| e.length).sum();
+            let total_size = checked_extent_total(extents)?;
             let data = self.read_from_extents(extents, 0, total_size, total_size)?;
             let val: AttributeValue =
                 crate::codec::deserialize(&data).map_err(|_| FileSystemError::InvalidAttributeData)?;
@@ -907,7 +972,7 @@ impl<D: BlockDevice> UnaFS<D> {
             if let Some(v) = inode.attributes.get(&query.key) {
                 val_opt = Some(v.clone());
             } else if let Some(extents) = inode.large_attributes.get(&query.key) {
-                let total = extents.iter().map(|e| e.length).sum();
+                let total = checked_extent_total(extents)?;
                 let data = self.read_from_extents(extents, 0, total, total)?;
                 if let Ok(v) = crate::codec::deserialize::<AttributeValue>(&data) {
                     val_opt = Some(v);
@@ -956,9 +1021,17 @@ impl<D: BlockDevice> UnaFS<D> {
 
     fn free_extents(&mut self, extents: &ExtentList) -> Result<(), FileSystemError> {
         for extent in extents {
+            // `length` is disk-derived: bound the walk to the volume so a
+            // hostile extent can neither wrap the block address nor spin the
+            // loop for 2^64 iterations (BEFS-HARDEN). Out-of-volume blocks
+            // have no bitmap bits — skipping them frees nothing real.
             let blocks = extent.length.div_ceil(BLOCK_SIZE);
             for i in 0..blocks {
-                self.free_block(extent.physical_block + i);
+                let block = match extent.physical_block.checked_add(i) {
+                    Some(b) if b < self.superblock.block_count => b,
+                    _ => break,
+                };
+                self.free_block(block);
             }
         }
         self.sync_metadata()?;
@@ -1118,6 +1191,17 @@ pub fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
         return 0.0;
     }
     dot / (mag_a * mag_b)
+}
+
+/// Sum a disk-derived extent list's lengths with overflow checking
+/// (BEFS-HARDEN): a hostile volume's spilled-attribute extents drive the
+/// allocation in `read_from_extents`, so a wrapping sum must be a graceful
+/// `Err`, never a silently small (or debug-panicking) total.
+fn checked_extent_total(extents: &ExtentList) -> Result<u64, FileSystemError> {
+    extents
+        .iter()
+        .try_fold(0u64, |acc, e| acc.checked_add(e.length))
+        .ok_or(FileSystemError::CorruptVolume("extent lengths overflow"))
 }
 
 /// Merge logically and physically contiguous extents into single runs, so a

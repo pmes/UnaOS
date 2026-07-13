@@ -23,14 +23,31 @@
 //! absent: a panic IS the defect class under test.
 
 use unafs::bitmap::SpaceMap;
+use unafs::fs::FileSystemError;
 use unafs::storage::Error as StorageError;
-use unafs::{BLOCK_SIZE, BlockDevice, MemDevice, Superblock, UnaFS};
+use unafs::{
+    AttributeValue, BLOCK_SIZE, BlockDevice, Extent, Inode, MemDevice, Superblock, UnaFS,
+};
 
-/// Format a small valid volume on an in-memory device and hand back the raw
-/// device (post-format, superblock synced).
+/// A pre-sized in-memory device (MemDevice grows on write; reads past the
+/// high-water mark fail, so the raw disk span must exist up front).
+fn sized_device(size_mb: u64) -> MemDevice {
+    let mut device = MemDevice::new();
+    let blocks = size_mb * 1024 * 1024 / BLOCK_SIZE;
+    let empty = vec![0u8; BLOCK_SIZE as usize];
+    device.write_block(blocks - 1, &empty).expect("pre-size device");
+    device
+}
+
+/// Format a small valid volume on an in-memory device.
+fn formatted(size_mb: u64) -> UnaFS<MemDevice> {
+    UnaFS::format(sized_device(size_mb), size_mb).expect("format must succeed")
+}
+
+/// Format a small valid volume and hand back the raw device (post-format,
+/// superblock synced).
 fn valid_volume() -> MemDevice {
-    let fs = UnaFS::format(MemDevice::new(), 16).expect("format must succeed");
-    fs.device.clone()
+    formatted(16).device.clone()
 }
 
 /// Clone `dev` and rewrite its superblock (block 0) after applying `mutate`.
@@ -144,4 +161,156 @@ fn free_blocks_exceeding_volume_refused() {
     let dev = valid_volume();
     let hostile = with_corrupt_sb(&dev, |sb| sb.free_blocks = sb.block_count + 1);
     assert!(UnaFS::mount(hostile).is_err());
+}
+
+// --- Read-path hardening (K3-PARSE-2/4 + the QSIM-flagged query surface) ---
+
+/// Rewrite inode `id` on the live filesystem's device after applying `mutate`.
+fn corrupt_inode(fs: &mut UnaFS<MemDevice>, id: u64, mutate: impl FnOnce(&mut Inode)) {
+    let mut inode = fs.read_inode(id).expect("inode readable before corruption");
+    mutate(&mut inode);
+    let bytes = inode.to_bytes().expect("hostile inode still serializes");
+    let mut block = vec![0u8; BLOCK_SIZE as usize];
+    block[..bytes.len()].copy_from_slice(&bytes);
+    fs.device.write_block(id, &block).expect("write inode block");
+}
+
+#[test]
+fn huge_inode_size_read_is_graceful() {
+    // K3-PARSE-2: inode.size == u64::MAX drove Vec::with_capacity → panic;
+    // near-heap sizes drove OOM aborts. Reached at boot via ls → read_data.
+    let mut fs = formatted(16);
+    let root = fs.superblock.root_inode;
+    let id = fs.create_file(root, "victim".into()).unwrap();
+    fs.write_data(id, 0, b"hello").unwrap();
+
+    corrupt_inode(&mut fs, id, |inode| inode.size = u64::MAX);
+    assert!(matches!(
+        fs.read_data(id, 0, u64::MAX),
+        Err(FileSystemError::CorruptVolume(_))
+    ));
+
+    // The just-under-volume flavor must also be refused (size > volume span).
+    let volume_bytes = fs.superblock.block_count * BLOCK_SIZE;
+    corrupt_inode(&mut fs, id, |inode| inode.size = volume_bytes + 1);
+    assert!(fs.read_data(id, 0, volume_bytes + 1).is_err());
+}
+
+#[test]
+fn huge_directory_size_ls_is_graceful() {
+    // The exact K3 boot shape: k3_mount_selftest calls ls(root).
+    let mut fs = formatted(16);
+    let root = fs.superblock.root_inode;
+    fs.create_file(root, "a".into()).unwrap();
+
+    corrupt_inode(&mut fs, root, |inode| inode.size = u64::MAX);
+    assert!(fs.ls(root).is_err());
+}
+
+#[test]
+fn overflowing_extent_span_read_is_graceful() {
+    // K3-PARSE-4: logical_offset + length wrapped (a panic under a
+    // debug/hardened profile). Now a checked, profile-independent Err.
+    let mut fs = formatted(16);
+    let root = fs.superblock.root_inode;
+    let id = fs.create_file(root, "victim".into()).unwrap();
+    fs.write_data(id, 0, b"hello").unwrap();
+
+    corrupt_inode(&mut fs, id, |inode| {
+        inode.chunks = vec![Extent {
+            logical_offset: u64::MAX - 100,
+            physical_block: 12,
+            length: 4096,
+        }];
+    });
+    assert!(matches!(
+        fs.read_data(id, 0, 5),
+        Err(FileSystemError::CorruptVolume(_))
+    ));
+}
+
+#[test]
+fn extent_pointing_past_volume_read_is_graceful() {
+    let mut fs = formatted(16);
+    let root = fs.superblock.root_inode;
+    let id = fs.create_file(root, "victim".into()).unwrap();
+    fs.write_data(id, 0, b"hello").unwrap();
+
+    let past_end = fs.superblock.block_count + 100;
+    corrupt_inode(&mut fs, id, |inode| {
+        inode.chunks[0].physical_block = past_end;
+    });
+    assert!(matches!(
+        fs.read_data(id, 0, 5),
+        Err(FileSystemError::CorruptVolume(_))
+    ));
+
+    // And the wrapping flavor: physical_block + block_idx overflows.
+    corrupt_inode(&mut fs, id, |inode| {
+        inode.size = 4 * BLOCK_SIZE;
+        inode.chunks = vec![Extent {
+            logical_offset: 0,
+            physical_block: u64::MAX - 1,
+            length: 4 * BLOCK_SIZE,
+        }];
+    });
+    assert!(fs.read_data(id, BLOCK_SIZE * 3, 5).is_err());
+}
+
+#[test]
+fn sparse_hole_read_stays_bounded_and_bulk() {
+    // Holes are legal; the fill must be a bounded bulk run, not a 2^64
+    // byte-push. A wholly sparse inode at a legal size reads back as zeros.
+    let mut fs = formatted(16);
+    let root = fs.superblock.root_inode;
+    let id = fs.create_file(root, "sparse".into()).unwrap();
+
+    let size = 2 * BLOCK_SIZE + 17;
+    corrupt_inode(&mut fs, id, |inode| {
+        inode.size = size;
+        inode.chunks = Vec::new();
+    });
+    let data = fs.read_data(id, 0, size).expect("sparse read succeeds");
+    assert_eq!(data.len() as u64, size);
+    assert!(data.iter().all(|&b| b == 0));
+}
+
+#[test]
+fn hostile_catalog_size_fails_query_not_panic() {
+    // The QSIM addendum surface: UnaFS::query sizes its catalog read from
+    // the catalog inode's disk-derived size.
+    let mut fs = formatted(16);
+    let root = fs.superblock.root_inode;
+    let id = fs.create_file(root, "tagged".into()).unwrap();
+    fs.set_attribute(id, "kind".into(), AttributeValue::String("test".into()))
+        .unwrap();
+
+    let catalog = fs.superblock.catalog_inode;
+    corrupt_inode(&mut fs, catalog, |inode| inode.size = u64::MAX);
+    assert!(fs.query("kind == \"test\"").is_err());
+}
+
+#[test]
+fn hostile_spilled_attribute_extents_fail_query_not_panic() {
+    // The QSIM addendum's second site: query sums a spilled attribute's
+    // extent lengths (hostile sum wraps / exceeds the volume).
+    let mut fs = formatted(16);
+    let root = fs.superblock.root_inode;
+    let id = fs.create_file(root, "vec".into()).unwrap();
+    // > 64 elements spills to large_attributes.
+    let big = AttributeValue::Vector(vec![0.5f32; 128]);
+    fs.set_attribute(id, "embed".into(), big).unwrap();
+
+    corrupt_inode(&mut fs, id, |inode| {
+        let extents = inode.large_attributes.get_mut("embed").unwrap();
+        extents.push(Extent {
+            logical_offset: 0,
+            physical_block: 20,
+            length: u64::MAX - 10,
+        });
+    });
+    // Overflowing sum → graceful Err on the query path...
+    assert!(fs.query("similarity(embed, [0.5, 0.5]) > 0.1").is_err());
+    // ...and on the get_attribute path.
+    assert!(fs.get_attribute(id, "embed").is_err());
 }
