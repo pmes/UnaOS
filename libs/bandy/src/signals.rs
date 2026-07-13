@@ -60,6 +60,13 @@ pub enum SMessage {
         diff: String,
     },
     // Context Telemetry (Lumen HUD)
+    /// NON-WIRE EXCEPTION: `WeightedSkeleton.content` is `#[serde(skip)]` by
+    /// design (in-process `Arc<String>` only — see
+    /// [`crate::ontology::WeightedSkeleton`]). This variant serializes, but
+    /// LOSSILY: the skeleton content is dropped on serialize and comes back
+    /// `Default`-empty on deserialize, so it never crosses a process boundary.
+    /// Inter-process telemetry is deferred to `unafs` shared memory. Frozen by
+    /// the `context_telemetry_*` proofs in `tests/smessage_kats.rs`.
     ContextTelemetry {
         skeletons: Vec<WeightedSkeleton>,
     },
