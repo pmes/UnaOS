@@ -56,6 +56,19 @@
 //! not a general fsck for arbitrary corruption (the on-disk parser is hardened
 //! separately — see `tests/hostile_volume.rs`), and the write-barrier question
 //! is future work.
+//!
+//! ## Load-bearing invariant: liveness == name-reachability
+//!
+//! Repair's "never eat live data" guarantee rests entirely on the invariant
+//! that every live inode is reachable through the name tree, and the catalog
+//! is a purely secondary index — so an inode that is catalog-reachable but
+//! nameless is, by definition, crash residue. That holds today (inode id ==
+//! block id, one namespace, no hard links, no link count). Any future feature
+//! that legitimately makes an inode catalog-only-reachable — hard links, a
+//! second namespace, a catalog-anchored object with no directory entry —
+//! would make [`UnaFS::fsck`]`(true)` / [`UnaFS::recover`] scrub-and-free
+//! LIVE files. Such an arc is a STOP tripwire: it must rework this walk's
+//! root set before it lands.
 
 use crate::catalog::deserialize_catalog;
 use crate::fs::{FileSystemError, UnaFS};
