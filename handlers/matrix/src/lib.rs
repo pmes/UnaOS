@@ -227,47 +227,225 @@ impl MatrixScanner {
         }
     }
 
-    fn strip_comments(content: &str) -> String {
-        let mut result = String::with_capacity(content.len());
-        let mut chars = content.chars().peekable();
-
-        let mut in_line_comment = false;
-        let mut in_block_comment = false;
-
-        while let Some(c) = chars.next() {
-            if in_line_comment {
-                if c == '\n' {
-                    in_line_comment = false;
-                    result.push('\n');
+    /// If `chars[i]` begins a string/char literal, return the index one past
+    /// its end. Handles escape sequences, raw strings (`r"…"`, `r#"…"#`),
+    /// byte strings/chars (`b"…"`, `b'…'`, `br#"…"#`), and distinguishes
+    /// lifetimes (`'a`) from char literals (`'a'`). `prev_ident` must be true
+    /// when the preceding character can continue an identifier, so that e.g.
+    /// the trailing `r` of an identifier is never taken as a raw-string start.
+    /// Unterminated literals run to the end of input.
+    fn literal_end(chars: &[char], i: usize, prev_ident: bool) -> Option<usize> {
+        match chars.get(i)? {
+            '"' => Some(Self::quoted_end(chars, i + 1)),
+            '\'' => {
+                // Distinguish a char literal from a lifetime.
+                match chars.get(i + 1) {
+                    Some('\\') => Some(Self::char_quoted_end(chars, i + 2)),
+                    Some(_) if chars.get(i + 2) == Some(&'\'') => Some(i + 3),
+                    _ => None, // lifetime (`'a`, `'static`) — not a literal
                 }
-                continue;
             }
-            if in_block_comment {
-                if c == '*' && chars.peek() == Some(&'/') {
-                    chars.next(); // Consume '/'
-                    in_block_comment = false;
-                }
-                continue;
-            }
-
-            if c == '/' {
-                if let Some(&next_c) = chars.peek() {
-                    if next_c == '/' {
-                        chars.next(); // Consume second '/'
-                        in_line_comment = true;
-                        continue;
-                    } else if next_c == '*' {
-                        chars.next(); // Consume '*'
-                        in_block_comment = true;
-                        continue;
+            'r' | 'b' if !prev_ident => {
+                // Raw / byte string starts: r"…", r#"…"#, b"…", b'…', br#"…"#
+                let mut j = i;
+                if chars[j] == 'b' {
+                    j += 1;
+                    match chars.get(j) {
+                        Some('"') => return Some(Self::quoted_end(chars, j + 1)),
+                        Some('\'') => {
+                            return match chars.get(j + 1) {
+                                Some('\\') => Some(Self::char_quoted_end(chars, j + 2)),
+                                Some(_) if chars.get(j + 2) == Some(&'\'') => Some(j + 3),
+                                _ => None,
+                            };
+                        }
+                        Some('r') => {} // fall through to raw-string handling
+                        _ => return None,
                     }
                 }
+                if chars.get(j) != Some(&'r') {
+                    return None;
+                }
+                j += 1;
+                let mut hashes = 0;
+                while chars.get(j) == Some(&'#') {
+                    hashes += 1;
+                    j += 1;
+                }
+                if chars.get(j) != Some(&'"') {
+                    return None;
+                }
+                j += 1;
+                // Scan for the closing `"` followed by `hashes` hashes.
+                while j < chars.len() {
+                    if chars[j] == '"' && chars[j + 1..].iter().take(hashes).filter(|&&c| c == '#').count() == hashes {
+                        return Some(j + 1 + hashes);
+                    }
+                    j += 1;
+                }
+                Some(chars.len())
+            }
+            _ => None,
+        }
+    }
+
+    /// End of a `"`-delimited body starting at `j` (past the opening quote),
+    /// honoring `\` escapes. Returns the index one past the closing quote.
+    fn quoted_end(chars: &[char], mut j: usize) -> usize {
+        while j < chars.len() {
+            match chars[j] {
+                '\\' => j += 2,
+                '"' => return j + 1,
+                _ => j += 1,
+            }
+        }
+        chars.len()
+    }
+
+    /// End of a `'`-delimited body starting at `j`, honoring `\` escapes.
+    fn char_quoted_end(chars: &[char], mut j: usize) -> usize {
+        while j < chars.len() {
+            match chars[j] {
+                '\\' => j += 2,
+                '\'' => return j + 1,
+                _ => j += 1,
+            }
+        }
+        chars.len()
+    }
+
+    fn strip_comments(content: &str) -> String {
+        let chars: Vec<char> = content.chars().collect();
+        let mut result = String::with_capacity(content.len());
+        let mut i = 0;
+        let mut prev_ident = false;
+
+        while i < chars.len() {
+            // String/char literals pass through verbatim — `//` or `/*`
+            // inside them are data, not comments.
+            if let Some(end) = Self::literal_end(&chars, i, prev_ident) {
+                result.extend(&chars[i..end]);
+                i = end;
+                prev_ident = false;
+                continue;
+            }
+
+            let c = chars[i];
+            if c == '/' && chars.get(i + 1) == Some(&'/') {
+                // Line comment: drop to (but keep) the newline.
+                while i < chars.len() && chars[i] != '\n' {
+                    i += 1;
+                }
+                prev_ident = false;
+                continue;
+            }
+            if c == '/' && chars.get(i + 1) == Some(&'*') {
+                // Block comment — Rust block comments nest.
+                let mut depth = 1;
+                i += 2;
+                while i < chars.len() && depth > 0 {
+                    if chars[i] == '/' && chars.get(i + 1) == Some(&'*') {
+                        depth += 1;
+                        i += 2;
+                    } else if chars[i] == '*' && chars.get(i + 1) == Some(&'/') {
+                        depth -= 1;
+                        i += 2;
+                    } else {
+                        i += 1;
+                    }
+                }
+                // Replace with a space so adjacent tokens don't glue together.
+                result.push(' ');
+                prev_ident = false;
+                continue;
             }
 
             result.push(c);
+            prev_ident = c.is_alphanumeric() || c == '_';
+            i += 1;
         }
 
         result
+    }
+
+    /// Split comment-free source into statements, literal-aware. `;` splits
+    /// only outside string/char literals. `{` / `}` also act as statement
+    /// boundaries (so `mod x { use y; }` yields `mod x` and `use y`) — except
+    /// inside a `use` statement, where braces are part of the import path and
+    /// stay attached (`use a::{b, c}`).
+    fn split_statements(content: &str) -> Vec<String> {
+        let chars: Vec<char> = content.chars().collect();
+        let mut stmts = Vec::new();
+        let mut current = String::new();
+        let mut i = 0;
+        let mut prev_ident = false;
+        let mut use_brace_depth = 0usize;
+
+        while i < chars.len() {
+            if let Some(end) = Self::literal_end(&chars, i, prev_ident) {
+                current.extend(&chars[i..end]);
+                i = end;
+                prev_ident = false;
+                continue;
+            }
+
+            let c = chars[i];
+            match c {
+                ';' if use_brace_depth == 0 => {
+                    stmts.push(std::mem::take(&mut current));
+                }
+                '{' => {
+                    if use_brace_depth > 0 {
+                        use_brace_depth += 1;
+                        current.push(c);
+                    } else if Self::stmt_is_use(&current) {
+                        use_brace_depth = 1;
+                        current.push(c);
+                    } else {
+                        // Block header (`mod x`, `fn f()`, `impl T`) — emit it;
+                        // the block body continues as further statements.
+                        stmts.push(std::mem::take(&mut current));
+                    }
+                }
+                '}' => {
+                    if use_brace_depth > 0 {
+                        use_brace_depth -= 1;
+                        current.push(c);
+                    } else {
+                        stmts.push(std::mem::take(&mut current));
+                    }
+                }
+                _ => current.push(c),
+            }
+            prev_ident = c.is_alphanumeric() || c == '_';
+            i += 1;
+        }
+        stmts.push(current);
+
+        stmts.retain(|s| !s.trim().is_empty());
+        stmts
+    }
+
+    /// Does this (possibly attribute/visibility-prefixed) statement buffer
+    /// begin a `use` declaration?
+    fn stmt_is_use(buffer: &str) -> bool {
+        let mut s = buffer.trim_start();
+        while s.starts_with("#[") || s.starts_with("#![") {
+            match s.find(']') {
+                Some(end) => s = s[end + 1..].trim_start(),
+                None => return false,
+            }
+        }
+        if let Some(rest) = s.strip_prefix("pub") {
+            s = rest.trim_start();
+            if s.starts_with('(') {
+                match s.find(')') {
+                    Some(end) => s = s[end + 1..].trim_start(),
+                    None => return false,
+                }
+            }
+        }
+        s == "use" || s.starts_with("use ") || s.starts_with("use\n") || s.starts_with("use\t")
     }
 
     fn expand_use_path(path: &str, results: &mut Vec<String>) {
@@ -533,10 +711,12 @@ impl MatrixScanner {
                 }
             }
 
-            // Very simple tokenization by semicolons
-            let statements = no_comments.split(';');
+            // Literal-aware statement tokenization: `;` splits only outside
+            // string/char literals, and inline `mod x { … }` blocks yield the
+            // header plus their inner statements.
+            let statements = Self::split_statements(&no_comments);
 
-            for stmt in statements {
+            for stmt in &statements {
                 // Skip empty or attribute-only lines simply by taking the non-attribute parts
                 // but for now, extract_deps_from_stmt will handle valid keywords.
                 // Note: We might have attributes like `#[cfg(test)] mod tests;`
@@ -573,6 +753,142 @@ impl MatrixScanner {
 }
 
 
+
+#[cfg(test)]
+mod scanner_tests {
+    use super::MatrixScanner;
+
+    // --- strip_comments: literal awareness ---
+
+    #[test]
+    fn strip_keeps_line_comment_marker_inside_string() {
+        // The baton's golden input: `//` inside a string is data.
+        let src = "let s = \"a;b//c\";\nlet t = 1; // real comment\n";
+        let out = MatrixScanner::strip_comments(src);
+        assert!(out.contains("\"a;b//c\""), "string body was mangled: {out}");
+        assert!(!out.contains("real comment"));
+    }
+
+    #[test]
+    fn strip_keeps_block_comment_marker_inside_string() {
+        let src = "let s = \"not /* a */ comment\"; /* gone */ let t = 2;";
+        let out = MatrixScanner::strip_comments(src);
+        assert!(out.contains("\"not /* a */ comment\""));
+        assert!(!out.contains("gone"));
+        assert!(out.contains("let t = 2;"));
+    }
+
+    #[test]
+    fn strip_handles_nested_block_comments() {
+        let src = "a /* outer /* inner */ still outer */ b";
+        let out = MatrixScanner::strip_comments(src);
+        assert!(!out.contains("outer"));
+        assert!(out.contains('a') && out.contains('b'));
+    }
+
+    #[test]
+    fn strip_keeps_raw_string_with_comment_markers() {
+        let src = "let s = r#\"// not \"a\" comment; \"#; // real\n";
+        let out = MatrixScanner::strip_comments(src);
+        assert!(out.contains(r##"r#"// not "a" comment; "#"##));
+        assert!(!out.contains("real"));
+    }
+
+    #[test]
+    fn strip_handles_char_literals_and_lifetimes() {
+        // '/' and ';' as char literals; 'a as a lifetime (no closing quote).
+        let src = "let c = '/'; let d = ';'; fn f<'a>(x: &'a str) {} // tail\n";
+        let out = MatrixScanner::strip_comments(src);
+        assert!(out.contains("'/'") && out.contains("';'"));
+        assert!(out.contains("&'a str"));
+        assert!(!out.contains("tail"));
+    }
+
+    #[test]
+    fn strip_keeps_escaped_quote_in_string() {
+        let src = "let s = \"he said \\\"hi\\\" // ok\"; // real\n";
+        let out = MatrixScanner::strip_comments(src);
+        assert!(out.contains("he said"));
+        assert!(out.contains("// ok"));
+        assert!(!out.contains("real"));
+    }
+
+    // --- split_statements ---
+
+    fn stmts(src: &str) -> Vec<String> {
+        MatrixScanner::split_statements(src)
+            .into_iter()
+            .map(|s| s.trim().replace('\n', " "))
+            .collect()
+    }
+
+    #[test]
+    fn split_ignores_semicolon_inside_string() {
+        // The baton's golden input.
+        assert_eq!(
+            stmts("let s = \"a;b//c\";\nlet t = 1;"),
+            vec!["let s = \"a;b//c\"", "let t = 1"]
+        );
+    }
+
+    #[test]
+    fn split_handles_inline_mod_block() {
+        // The baton's golden input: inline `mod x { ... }`.
+        let out = stmts("mod x { use foo::bar; }\nuse baz::qux;");
+        assert_eq!(out, vec!["mod x", "use foo::bar", "use baz::qux"]);
+    }
+
+    #[test]
+    fn split_keeps_use_braces_attached() {
+        // Braces in a `use` path are part of the statement, not boundaries.
+        assert_eq!(
+            stmts("use a::{b, c};\nmod m;"),
+            vec!["use a::{b, c}", "mod m"]
+        );
+    }
+
+    #[test]
+    fn split_handles_nested_mod_and_use_braces() {
+        let out = stmts("mod outer { mod inner { pub use x::{y, z}; } }\nuse tail::end;");
+        assert_eq!(
+            out,
+            vec!["mod outer", "mod inner", "pub use x::{y, z}", "use tail::end"]
+        );
+    }
+
+    #[test]
+    fn split_ignores_semicolon_in_char_and_raw_string() {
+        assert_eq!(
+            stmts("let a = ';'; let b = r#\"x;y\"#; let c = 3;"),
+            vec!["let a = ';'", "let b = r#\"x;y\"#", "let c = 3"]
+        );
+    }
+
+    // --- end-to-end: deps extracted from tricky source ---
+
+    #[test]
+    fn extract_deps_survive_literals_and_inline_mods() {
+        let src = r##"
+            // A comment with a fake use decoy::path; inside it.
+            use real::dep;
+            let s = "use fake::path; // and a fake comment";
+            mod tests {
+                use inner::helper;
+            }
+        "##;
+        let clean = MatrixScanner::strip_comments(src);
+        let mut deps = Vec::new();
+        for stmt in MatrixScanner::split_statements(&clean) {
+            let one_line = stmt.replace('\n', " ").replace('\r', " ");
+            deps.extend(MatrixScanner::extract_deps_from_stmt(&one_line));
+        }
+        assert!(deps.contains(&"real::dep".to_string()), "deps: {deps:?}");
+        assert!(deps.contains(&"tests".to_string()), "deps: {deps:?}");
+        assert!(deps.contains(&"inner::helper".to_string()), "deps: {deps:?}");
+        assert!(!deps.iter().any(|d| d.contains("fake")), "deps: {deps:?}");
+        assert!(!deps.iter().any(|d| d.contains("decoy")), "deps: {deps:?}");
+    }
+}
 
 /// The Asynchronous Logic Kernel for the Matrix
 pub async fn ignite(synapse: Synapse, absolute_workspace_root: std::sync::Arc<PathBuf>) {
