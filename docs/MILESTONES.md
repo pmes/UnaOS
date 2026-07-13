@@ -10,6 +10,28 @@ Legend: **✅ metal-confirmed** · **🔬 QEMU-green, metal pending** · dates I
 
 ---
 
+## Handlers — VAIRE-RITES-1 (the Loom awakens: Bolt manifest + STATUS/Crystal) — 2026-07-13 🔬 `us-vaire`
+
+**QEMU-green n/a (host-native Ring 3 handler; gate is `cargo test -p vaire`).** Vaire graduates
+from a single-repo status probe to the STATUS half of the Loom: a **Bolt manifest** (register/list
+managed units by kind) and real per-unit **Crystal Color** (Green/Amber/Red).
+
+- **is_dirty un-stubbed (step 0):** `Vaire::look()` reported a hard-coded `is_dirty = false` — a
+  documented lie. Now a real check via `gix`'s `status` feature (index-vs-worktree, tree-vs-index;
+  untracked files excluded, matching porcelain's tracked-change notion). Proven by a tempdir
+  fixture: a freshly committed repo → clean/Green; a modified **tracked** file → dirty/Amber.
+- **Bolt manifest:** `Manifest::{register,list,status_of,status_all}` over `Bolt { name, path,
+  kind }` with `BoltKind::{GitRepo, Vault, NleProject(reserved)}`. Registration is order-preserving;
+  status dispatches on kind and maps to `CrystalColor`.
+- **The vault as the first non-git unit:** a read-only `probe_vault` rides UnaFS's fail-closed
+  mount check — absent/unreadable/unmountable → Red (bytes untouched, opened `open_read_only`),
+  mounts → Green (last-snapshot n/a until SNAP/RITES-2). A corrupt-vault test asserts the on-disk
+  bytes are byte-identical after the probe.
+- **Tested:** `cargo test -p vaire` → 7/7 (2 is_dirty, 2 manifest, 3 vault); `cargo check -p vaire`
+  clean. Lane: `handlers/vaire/**` + its Cargo.toml only (added `gix status` feature, `unafs` dep,
+  `tempfile` dev-dep); zero `unaos/` diff. SYNC/SNAP are RITES-2; UnaFS-native versioning is the
+  Destiny (behind UNAFS-F1).
+
 ## Pi 4 — UNAFS-K3 (BeFS-K3: kernel read-only mount of a native unafs volume) — 2026-07-12 ✅ `hw-pi4`
 
 **✅ METAL-CONFIRMED (2026-07-12 attended evening bench, real Pi 4, reflashed card with the unafs
