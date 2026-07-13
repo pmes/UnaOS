@@ -1,0 +1,19 @@
+[package]
+name = "pca9685"
+version = "0.1.0"
+edition = "2024"
+license = "LGPL-3.0-or-later"
+description = "PCA9685 16-channel 12-bit PWM register/prescale codec (no_std, zero-dependency)."
+
+# Zero runtime dependencies by design: the crate is a pure `#![no_std]`,
+# `#![forbid(unsafe_code)]` register/prescale codec. It computes the bytes; the
+# future kernel I2C driver moves them. The prescale math and register map are
+# frozen by the datasheet known-answer tests in `tests/`.
+[dependencies]
+
+# Dev-only: the seam KAT (`tests/seam_drive.rs`) proves a `drive::Actuation` (µs)
+# composes through this codec's µs→counts helper. A path dep, not crates.io, and
+# it never enters the shipping/no_std artifact — dev-dependencies do not build
+# for `cargo check -p pca9685 --no-default-features`.
+[dev-dependencies]
+drive = { path = "../drive" }

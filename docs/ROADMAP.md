@@ -233,7 +233,11 @@ FlySky NB4 Plus ──AFHDS3──▶ FGr8B ──i-BUS (UART 115200)──▶ U
   TCU-owned debug UART). Verify the FGr8B's i-BUS output option on the bench.
 - **PWM out**: Tegra's native PWM is 8-bit duty (insufficient at 50 Hz) →
   either a 333 Hz frame or (recommended) a **PCA9685 over I2C** (12-bit; the
-  I2C driver is reusable for sensors).
+  I2C driver is reusable for sensors). **The actuation codec now exists
+  host-native** in [`libs/pca9685`](../libs/pca9685) (`#![no_std]`,
+  zero-dependency): prescale + per-channel duty register writes, frozen by
+  datasheet KATs, with the `drive`↔`pca9685` µs→duty seam proven host-side. What
+  remains is the I2C transport + the attended actuation gate.
 - **Drive service** (arch-neutral): bounded command channel, 20 ms control
   loop, ARM/DISARM state machine, 500 ms deadman, software throttle cap,
   cross-core watchdog, panic-handler-forces-neutral. A 3-position transmitter
@@ -245,7 +249,9 @@ FlySky NB4 Plus ──AFHDS3──▶ FGr8B ──i-BUS (UART 115200)──▶ U
 - Milestones: GICv3/scheduler (shared with the Jetson catchup lane) → i-BUS
   decode demo **(host-side landed — the `libs/ibus` codec + format-freeze KATs;
   synthetic until real FGr8B captures are appended, then silicon)** → actuation
-  gate → drive service → first crawl, each behind a written safety-interlock
+  codec **(host-side landed — the `libs/pca9685` prescale/duty codec + datasheet
+  KATs; the I2C transport + attended actuation gate remain)** → drive service →
+  first crawl, each behind a written safety-interlock
   checklist ([`docs/dev/USERLAND/ENDURO_SAFETY.md`](dev/USERLAND/ENDURO_SAFETY.md)).
 - A Pi-4 fast path (BCM2711 GPIO/PWM, fully specified) is preserved in the
   planning archive if a second vehicle or an earlier wheel-turn is ever wanted.
