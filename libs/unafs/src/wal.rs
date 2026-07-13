@@ -153,7 +153,8 @@ impl Journal {
             }
 
             let data = &block[offset_in_block + 8..offset_in_block + 8 + (len as usize)];
-            if let Ok(op) = crate::codec::deserialize::<JournalOp>(data) {
+            // Block-sized record: block-budgeted decode (BEFS-HARDEN).
+            if let Ok(op) = crate::codec::deserialize_block::<JournalOp>(data) {
                 match op {
                     JournalOp::BeginOp { op_id, .. } => {
                         open_ops.insert(op_id);

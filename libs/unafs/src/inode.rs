@@ -120,8 +120,12 @@ impl Inode {
     }
 
     /// Deserializes an Inode from bytes.
+    ///
+    /// An inode is a block-sized record, so this uses the block-budgeted
+    /// decode: a crafted length prefix inside the block fails instead of
+    /// pre-allocating (BEFS-HARDEN, K3-PARSE-3).
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, InodeError> {
-        let inode = crate::codec::deserialize(bytes)?;
+        let inode = crate::codec::deserialize_block(bytes)?;
         Ok(inode)
     }
 }

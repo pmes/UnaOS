@@ -314,3 +314,86 @@ fn hostile_spilled_attribute_extents_fail_query_not_panic() {
     // ...and on the get_attribute path.
     assert!(fs.get_attribute(id, "embed").is_err());
 }
+
+// --- Codec-level hardening (K3-PARSE-3: hostile bincode length prefixes) ---
+//
+// bincode's owned-bytes decode (String / Vec<u8>) allocates from the CLAIMED
+// length before reading any payload; under the old no-limit config a crafted
+// prefix drove an unbounded infallible allocation. The budgeted decodes must
+// refuse the claim instead.
+
+#[test]
+fn hostile_string_prefix_in_inode_block_refused() {
+    // A 4 KiB inode block whose attribute-key length claims ~2^62 bytes.
+    let mut inode = Inode::new(12, unafs::FileKind::File);
+    inode
+        .attributes
+        .insert("kk".into(), AttributeValue::Int(7));
+    let mut bytes = inode.to_bytes().unwrap();
+
+    // Legacy layout: id u64 | kind u32 | size u64 | chunks len u64 |
+    // attributes len u64 | first key len u64 | ...
+    let key_len_off = 8 + 4 + 8 + 8 + 8;
+    assert_eq!(
+        &bytes[key_len_off..key_len_off + 8],
+        &2u64.to_le_bytes(),
+        "layout probe: key length prefix not where expected"
+    );
+    bytes[key_len_off..key_len_off + 8].copy_from_slice(&(u64::MAX / 2).to_le_bytes());
+
+    assert!(Inode::from_bytes(&bytes).is_err());
+}
+
+#[test]
+fn hostile_attribute_value_prefix_refused() {
+    // A spilled attribute decoding as AttributeValue::String with a claimed
+    // length of ~2^62 (variant tag 2 = String, then the u64 length prefix).
+    let mut hostile = Vec::new();
+    hostile.extend_from_slice(&2u32.to_le_bytes());
+    hostile.extend_from_slice(&(u64::MAX / 2).to_le_bytes());
+    assert!(unafs::codec::deserialize::<AttributeValue>(&hostile).is_err());
+}
+
+#[test]
+fn hostile_directory_entry_name_prefix_fails_ls_not_abort() {
+    // End-to-end: a directory whose on-disk entry list claims a ~2^62-byte
+    // name. ls must return Err — under the old config this pre-allocated
+    // unboundedly (an infallible vec! — an abort, not even a panic).
+    let mut fs = formatted(16);
+    let root = fs.superblock.root_inode;
+    fs.create_file(root, "a".into()).unwrap();
+
+    let root_inode = fs.read_inode(root).unwrap();
+    let data_block = root_inode.chunks[0].physical_block;
+
+    let mut block = vec![0u8; BLOCK_SIZE as usize];
+    fs.device.read_block(data_block, &mut block).unwrap();
+    // Vec<DirEntry> layout: count u64 | first name len u64 | ...
+    assert_eq!(&block[0..8], &1u64.to_le_bytes(), "layout probe: entry count");
+    block[8..16].copy_from_slice(&(u64::MAX / 2).to_le_bytes());
+    fs.device.write_block(data_block, &block).unwrap();
+
+    assert!(fs.ls(root).is_err());
+}
+
+#[test]
+fn hostile_collection_count_prefix_refused() {
+    // A directory entry list claiming ~2^61 entries with no payload: the
+    // decode must fail promptly (serde's seq path reads element-wise and runs
+    // out of input; the budget bounds any claimed owned-bytes on the way).
+    let mut hostile = Vec::new();
+    hostile.extend_from_slice(&(u64::MAX / 4).to_le_bytes());
+    assert!(unafs::codec::deserialize::<Vec<unafs::DirEntry>>(&hostile).is_err());
+}
+
+#[test]
+fn valid_records_decode_under_the_budgets() {
+    // Positive control: the budgets must not reject legitimate records.
+    let mut inode = Inode::new(12, unafs::FileKind::File);
+    inode
+        .attributes
+        .insert("name".into(), AttributeValue::String("fixture".into()));
+    let bytes = inode.to_bytes().unwrap();
+    let back = Inode::from_bytes(&bytes).unwrap();
+    assert_eq!(back, inode);
+}

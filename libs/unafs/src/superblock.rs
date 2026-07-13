@@ -121,7 +121,8 @@ impl Superblock {
 
     /// Deserialize a Superblock from bytes and validate it.
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, SuperblockError> {
-        let sb: Superblock = crate::codec::deserialize(bytes)?;
+        // Block-sized record: block-budgeted decode (BEFS-HARDEN).
+        let sb: Superblock = crate::codec::deserialize_block(bytes)?;
 
         if sb.magic != MAGIC {
             return Err(SuperblockError::InvalidMagic);
