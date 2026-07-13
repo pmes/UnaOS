@@ -59,6 +59,15 @@ REQUIRE xHCI: Disk
 # --- S4 first metal (landed 2026-07-10 late — never captured on metal) --------------
 REQUIRE S4: grow/create/delete SYNCHRONOUS in-syscall.*-> PASS
 
+# --- S4/S6/S7 witnesses (landed post-round-6; FIRST captured on metal 2026-07-12 round-9
+# --- bench — promoted straight to REQUIRE). S6 = the true-SMP namespace-lock proof the S6
+# --- review deferred; S7 = arbitrary on-disk open + the negative owned.bin ACL leg; S4-mf2 =
+# --- staged-code RW refusal; S4-race = both close+teardown synchronous-delete legs. --------
+REQUIRE S4-mf2:.*refused -EACCES.*witness OK
+COUNT 2 S4-race.*witness OK
+REQUIRE S6-witness:.*locked 240000/240000 intact.*witness OK
+REQUIRE S7-openany:.*owner ACL not bypassed.*witness OK
+
 # --- VPERF (this boot DECIDES VPERF-WC — all landed post-bench, never on metal) -----
 # THE DECIDER: eff=WC → VPERF-WC dead; eff=UC (or any non-WC) → VPERF-WC triggers
 # bench-FIRST. Record the fbmem line VERBATIM in the seat baton either way.
@@ -66,9 +75,9 @@ REQUIRE vperf: fbmem mtrr=.*pte=.*pat=.*eff=.*fb=
 # VPERF-WC (landed post-round-6, never on metal): the fb mapping is now retyped
 # Write-Combining (PAT PA4). At the NEXT attended bench the readout must flip from
 # the round-6 eff=UC to eff=WC (pat=WC, PTE PAT bit set) and the retype line fires.
-# PENDING: matches once the WC build boots on metal — promote to REQUIRE then.
-PENDING vperf: fbmem .*pat=WC eff=WC
-PENDING x86 fb-wc: retyped .* leaf\(s\) WC \(PAT PA4\)
+# 2026-07-12 round-9 bench: BOTH fired on the real rMBP (eff=UC → eff=WC) — PROMOTED to REQUIRE.
+REQUIRE vperf: fbmem .*pat=WC eff=WC
+REQUIRE x86 fb-wc: retyped .* leaf\(s\) WC \(PAT PA4\)
 # Expect BOTH GPUs named (GT 650M scans out via gmux default; HD 4000 also present).
 REQUIRE vperf: display.*class
 REQUIRE vperf: display.*owns fb
