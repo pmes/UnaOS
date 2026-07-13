@@ -1446,6 +1446,20 @@ fn handle_key(
     false
 }
 
+/// JD11: the tegra command-output serial sink. `console.set_output_sink(jd2_out_sink)` routes every
+/// `Console::println` line here, and it echoes the line on the serial UART framed to pair with the
+/// per-keystroke `:: tegra: JD2 — KEY … ::` markers — so a single `awk '/:: tegra: JD2 —/'` over the
+/// bench log reconstructs the whole interleaved session (keys typed + output produced). This is why
+/// the marker keeps the `JD2` family and the `tegra:` token: it makes the Orin bench self-documenting
+/// (the round-9 finding — panel output was uncapturable over serial). A plain `fn(&str)` with no
+/// captured state; it only touches the serial UART (no re-entrancy into `Console`, no lock the caller
+/// holds). Lives here (tegra-gated), not in the shared `console.rs`, so the marker string compiles
+/// into the tegra kernel alone.
+#[cfg(all(feature = "tegra", target_arch = "aarch64"))]
+fn jd2_out_sink(line: &str) {
+    serial_println!(":: tegra: JD2 — OUT | {} ::", line);
+}
+
 /// JD2 (tegra): the EL1 console pump — the Orin's interactive session, a cooperative kernel task
 /// on the boot core's run queue (spawned pre-drop, dispatched by `run_capstone_boot_core` alongside
 /// the CAPSTONE tasks). Supersedes the JB2b `kbd_pump_body` loop on panel-lit boots.
@@ -1519,6 +1533,10 @@ fn jd2_console_pump(_arg: usize) {
     let mut screen = unaos_kernel::video::Screen::new(front_fb);
     let mut pal = unaos_kernel::pal::TargetPal::new(&mut screen);
     let mut console = unaos_kernel::console::Console::new();
+    // JD11: mirror every command-output line to serial so an attended Orin bench captures a durable,
+    // mbench-able transcript (the panel has no scrollback; before JD11 only keystrokes echoed to
+    // serial). Installed before the banner so the shell-entry lines head the transcript too.
+    console.set_output_sink(jd2_out_sink);
     console.println("UnaOS — Jetson Orin Nano (Tegra234)");
     console.println("JD2: interactive shell on the inherited scanout. Type 'help'.");
     console.draw(&mut pal);

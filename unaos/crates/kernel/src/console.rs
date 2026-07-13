@@ -26,6 +26,14 @@ pub struct Console {
     pub current_input: String,
     pub session: UserSession,
     history: alloc::vec::Vec<String>,
+    /// Optional mirror for command-output lines (JD11). When set, every `println` line is also
+    /// handed to this sink — the tegra console pump installs one that emits the line on the serial
+    /// UART, so an attended Orin bench captures a durable, mbench-able output transcript instead of
+    /// panel-only text (the panel has no scrollback; only keystrokes echoed to serial before JD11).
+    /// `None` on every other surface (x86 / pi render service, headless), so those stay byte-for-byte
+    /// unchanged — the sink is inert unless a caller opts in. Platform-neutral by design: the
+    /// serial-line FORMAT (and the `tegra:` marker) lives in the tegra-gated caller, not here.
+    out_sink: Option<fn(&str)>,
 }
 
 impl Console {
@@ -34,7 +42,18 @@ impl Console {
             current_input: String::new(),
             session: UserSession::new(),
             history: alloc::vec::Vec::new(),
+            out_sink: None,
         }
+    }
+
+    /// JD11: install a sink that receives each `println` line (in addition to the panel history).
+    /// The tegra console pump uses this to mirror shell command output to serial. Opt-in — unset
+    /// surfaces are unaffected. The sink is a plain `fn` pointer (no captured state): it must not
+    /// call back into this `Console` (no re-entrancy) and must be free of any lock this call site
+    /// could already hold; the tegra sink only touches the serial UART, which `println`'s callers
+    /// never hold.
+    pub fn set_output_sink(&mut self, sink: fn(&str)) {
+        self.out_sink = Some(sink);
     }
 
     pub fn clear(&mut self) {
@@ -49,6 +68,12 @@ impl Console {
         // resolution).
         if self.history.len() > Self::HISTORY_MAX {
             self.history.remove(0);
+        }
+        // JD11: mirror the line to the output sink if one is installed (tegra bench transcript).
+        // After the history push so a panic in the sink can't lose the panel line; the sink is a
+        // no-op (`None`) on every non-tegra surface.
+        if let Some(sink) = self.out_sink {
+            sink(text);
         }
     }
 
