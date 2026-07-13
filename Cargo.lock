@@ -3556,6 +3556,7 @@ dependencies = [
  "gtk4",
  "log",
  "serde",
+ "tempfile",
 ]
 
 [[package]]

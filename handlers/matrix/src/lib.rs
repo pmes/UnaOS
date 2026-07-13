@@ -43,8 +43,10 @@ impl MatrixScanner {
         let mut dirs = Vec::new();
         let mut files = Vec::new();
 
-        // 1. First Pass: Collect valid files and calculate children for directories.
-        // We only want to map spatial code logic. Configuration files and other noise are dropped.
+        // 1. First Pass: Collect files and calculate children for directories.
+        // Matrix is the ALL-asset manager: every regular file becomes a node.
+        // Build noise (`target`, `.git`, `node_modules`) is excluded, and symlinks
+        // are never followed (the all-asset scan broadens exposure to cycles).
         for entry in entries {
             if let Ok(entry) = entry {
                 let path = entry.path();
@@ -54,18 +56,24 @@ impl MatrixScanner {
                     continue;
                 }
 
-                if path.is_dir() {
-                    // Recursively process the directory first to see if it holds any logic.
+                // Symlink guard: `path.is_dir()`/`is_file()` follow symlinks, which can
+                // cycle. Use the entry's own file type and skip links entirely.
+                let Ok(file_type) = entry.file_type() else {
+                    continue;
+                };
+                if file_type.is_symlink() {
+                    continue;
+                }
+
+                if file_type.is_dir() {
+                    // Recursively process the directory first to see if it holds anything.
                     let children = Self::build_genesis_tree(&path, absolute_root);
                     // A branch with no leaves is dead weight. Prune it.
                     if !children.is_empty() {
                         dirs.push((path, file_name, children));
                     }
-                } else if path.is_file() {
-                    // J24.8 "Phil": Strictly isolate .rs files. Non-code files must vanish.
-                    if path.extension().and_then(|e| e.to_str()) == Some("rs") {
-                        files.push((path, file_name));
-                    }
+                } else if file_type.is_file() {
+                    files.push((path, file_name));
                 }
             }
         }
