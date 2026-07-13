@@ -1,0 +1,18 @@
+[package]
+name = "drive"
+version = "0.1.0"
+edition = "2024"
+license = "LGPL-3.0-or-later"
+description = "Arch-neutral rover drive-service core: the safety state machine."
+
+# The core is `#![no_std]`, `#![forbid(unsafe_code)]`, and depends only on our
+# own `ibus` crate (a workspace path dep — no crates.io dependencies). The
+# default-on `std` feature adds the `sim` simulation harness (FakeClock +
+# MockSink) used by the invariant tests; the kernel embeds the crate with
+# `default-features = false`.
+[dependencies]
+ibus = { path = "../ibus" }
+
+[features]
+default = ["std"]
+std = []
