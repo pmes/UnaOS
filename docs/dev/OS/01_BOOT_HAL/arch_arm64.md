@@ -2031,7 +2031,7 @@ byte-identical + CAPSTONE 6/6 + all prior witnesses + an uncounted `:: FATDIRS: 
 (the `k1_atr` disk-selftest idiom, fully self-cleaning), zero FAIL; `test-arm 22` MISSION. Zero x86
 behavioural change. **Metal:** the attended money-shot rides JD7's Orin panel `mkdir`/`rmdir` bench.
 
-### JD7 — shaping the tree: panel `mkdir` / `rmdir` (🔬 QEMU-green, metal attended-pending)
+### JD7 — shaping the tree: panel `mkdir` / `rmdir` (✅ METAL-CONFIRMED 2026-07-12)
 
 JD4 made the tree *navigable*, JD5/JD6 made it *writable*; JD7 lets you *shape* it — `mkdir DOCS/DRAFTS`,
 `rmdir DOCS/OLD` from the panel. Together they close the loop: a directory tree you can organize end to
@@ -2089,14 +2089,19 @@ and tegra never runs in QEMU), so the shell-level verdict is **attended-pending*
 that `fs_mkdir`/`fs_rmdir` call — the FATDIRS `create_dir`/`remove_dir` — are already exercised headless by
 their own `fatdirs_check` selftest.
 
-**Metal verdict — attended-pending.** The money-shot is the bench card
+**Metal verdict — ✅ METAL-CONFIRMED (2026-07-12 attended bench; Peter at the Orin; serial
+`~/unaos-bench/jetson-serial-2026-07-12-180110.log`).** The directory tree created on the panel
+(`/DOCS/DRAFTS` + `NOTE.TXT`) SURVIVED a power cycle — `cd` back in and `cat` returned the content
+byte-intact; an empty `rmdir` freed its cluster; the `-ENOTEMPTY` (non-empty) and `-EBUSY` (root) probes
+tagged honestly; zero BOT-timeout/fault/heal on serial. This also flips **FATDIRS**'s `create_dir`/`remove_dir`
+first-silicon verdict — they ran end-to-end on real hardware here for the first time. The money-shot is the bench card
 [`jd7-bench.md`](../../../../unaos/scripts/jd7-bench.md): `mkdir DOCS/DRAFTS`, `cd`, `write NOTE.TXT …`,
 power-cycle, `cd DOCS/DRAFTS`, `cat` (the created tree survives), then `rm NOTE.TXT`, `cd ..`, `rmdir DRAFTS`.
 ⚠ Verify the serial bridge captures a full boot BEFORE burning bench time — the round-6 host capture failed
 mid-bench (see §JB1f). Repeated `mkdir`/`rmdir` runs accumulate `0xE5` tombstone slots in the parent across
 boots (FATDIRS cleanup leaves them; harmless — don't misread as corruption; a card re-prep clears them).
 
-### JD8 — copying files: panel `cp` (🔬 QEMU-green, metal attended-pending)
+### JD8 — copying files: panel `cp` (✅ METAL-CONFIRMED 2026-07-12)
 
 JD4 navigates, JD5/JD6 write, JD7 shapes; JD8 lets you *duplicate* — `cp README.TXT DOCS/`,
 `cp DOCS/A.TXT B.TXT` from the panel. Together they close the file-manager verb set: create, edit,
@@ -2150,13 +2155,16 @@ the SHELL command path is not headless-reachable in-lane (the shell dispatches o
 tegra never runs in QEMU), so the shell-level verdict is **attended-pending**; the read/write PRIMITIVES
 `fs_cp` calls are already exercised headless by the U9/read-path and the U10/U11 write fixtures.
 
-**Metal verdict — attended-pending.** The money-shot is the bench card
+**Metal verdict — ✅ METAL-CONFIRMED (2026-07-12 attended bench; Peter at the Orin; same serial log as
+§JD7).** A file copied on the panel (`README.TXT` → `/COPIES/README.TXT` via the `DIR/` idiom, plus an
+explicit-name `/COPIES/BACKUP.TXT`) SURVIVED a power cycle — both copies `cat`'d intact after re-boot with
+the source left byte-for-byte untouched; zero BOT-timeout/fault on serial. The money-shot is the bench card
 [`jd8-bench.md`](../../../../unaos/scripts/jd8-bench.md): `cp` a file into a subdirectory, `cat` the copy,
 power-cycle, `cat` the copy again (it survives) with the source left untouched, then the error probes
 (dir source, self-copy, missing parent, file-parent). ⚠ Verify the serial bridge captures a full boot
 BEFORE burning bench time — the round-6/8 host capture failed mid-bench (see §JB1f).
 
-### JD9 — copying trees: panel `cp -r` (🔬 QEMU-green, metal attended-pending)
+### JD9 — copying trees: panel `cp -r` (✅ METAL-CONFIRMED 2026-07-12)
 
 JD8 duplicates a file; JD9 duplicates a whole subtree — `cp -r DOCS BACKUP` from the panel. It closes the
 copy half of the file-manager verb set (navigate, write, shape, copy; only `mv` remains, gated on a future
@@ -2228,7 +2236,11 @@ never runs in QEMU), so the shell-level verdict is **attended-pending**; the rea
 composes are already exercised headless by the U9 read path, the U10/U11 write fixtures, and FATDIRS's own
 `fatdirs_check` selftest.
 
-**Metal verdict — attended-pending.** The money-shot is the bench card
+**Metal verdict — ✅ METAL-CONFIRMED (2026-07-12 attended bench; Peter at the Orin; same serial log as
+§JD7).** A directory tree copied recursively on the panel (`SRC` → `DST` and into-dir `SRC` → `/BACKUP/SRC`,
+each `(2 dir(s), 2 file(s), 20 bytes)`) SURVIVED a power cycle — the deep file `DST/SUB/B.TXT` `cat`'d
+`deep beta` after re-boot, source tree untouched; the guards fired honestly (self-into-descendant `-EINVAL`,
+pre-existing target `-EEXIST`, volume-root `-EINVAL`). The money-shot is the bench card
 [`jd9-bench.md`](../../../../unaos/scripts/jd9-bench.md): `mkdir` a small source tree with files, `cp -r` it
 into a new destination, `ls`/`cat` to verify the tree structure and file contents match, power-cycle, verify
 the copy survives, then the guards (self-into-descendant `-EINVAL`, missing source `-ENOENT`, pre-existing
@@ -2236,7 +2248,7 @@ target `-EEXIST`). ⚠ Verify the serial bridge captures a full boot BEFORE burn
 host capture failed mid-bench (see §JB1f). Repeated `cp -r`/`rmdir` cycles accumulate `0xE5` tombstone slots
 across boots (the FATDIRS cleanup leaves them; harmless — a card re-prep clears them).
 
-### JD10 — moving & renaming: panel `mv` (🔬 QEMU-green, metal attended-pending)
+### JD10 — moving & renaming: panel `mv` (✅ METAL-CONFIRMED 2026-07-12)
 
 `mv` is the last classic file-manager verb, and JD10 closes the set: navigate (JD4), write (JD5/JD6),
 shape (JD7), copy (JD8/JD9), **move/rename** (JD10). Unlike `cp -r`, a move is **O(1) by reference** — the
@@ -2298,7 +2310,14 @@ SHELL command path is not headless-reachable in-lane (the shell dispatches only 
 never runs in QEMU), so the shell-level verdict is **attended-pending**; the FATMOVE primitives `mv` composes
 are already gated headless on the pi4 side (`kernel8-test`'s `FATMOVE` witness).
 
-**Metal verdict — attended-pending.** The money-shot is the bench card
+**Metal verdict — ✅ METAL-CONFIRMED (2026-07-12 attended bench; Peter at the Orin; same serial log as
+§JD7).** A file moved on the panel (`A.TXT` →rename→ `B.TXT` →move→ `/DOCS/B.TXT`) SURVIVED a power cycle —
+`cat /DOCS/B.TXT` returned `hello alpha` intact after re-boot; an in-place **directory rename**
+(`mv DOCS NOTES`) carried the whole subtree with one O(1) relink (no copy — `ls NOTES` showed the former
+`DOCS` children); the guards fired honestly (dir self-into-descendant `-EINVAL`, cross-parent dir move
+`-EISDIR`, missing source `-ENOENT`, no-clobber `-EEXIST`, root `-EBUSY`). **This also flips FATMOVE's own
+metal verdict** — its `move_entry` crash-ordering (destination published before the source `0xE5`) ran on
+real silicon for the first time, with zero BOT-timeout/fault on serial. The money-shot is the bench card
 [`jd10-bench.md`](../../../../unaos/scripts/jd10-bench.md): rename a file in place (`mv A.TXT B.TXT`), move a
 file into a directory (`mv B.TXT DOCS/`), power-cycle, and `cat` the moved file to prove it read intact
 across the cycle (this also flips FATMOVE's own metal verdict — its `move_entry` crash-ordering runs on
@@ -2382,6 +2401,19 @@ completion on the same kernel. A silent hang is a FAIL — screen state + serial
 > this capture — irrelevant to the survival criterion, but the NEXT bench should fix the bridge
 > (probe re-enumeration mid-bench is the suspect) and re-capture a serial-asserted boot for the
 > tally record.
+
+> **✅ JB1f HEAL-TALLY CLOSED (round-9 attended bench, 2026-07-12 — the honest gap above is filled).**
+> The JD7–JD10 kernel (`a834b8f`, `540,064 B`, 108 `tegra:` strings) ran on the Orin with the serial
+> bridge verified capturing a FULL boot from byte 0 BEFORE bench time (STEP-0 discipline — the round-6/8
+> fix). Across **4 clean boots / 4 power cycles** (one per JD money-shot), the capture stayed live the whole
+> session (`~/unaos-bench/jetson-serial-2026-07-12-180110.log`, 318 KB, 1365 keystrokes echoed): every boot
+> reached `panel LIVE` → CAPSTONE 6/6 → the interactive shell, and there were **ZERO heal lines and ZERO
+> fatal/panic/BOT-timeout across all four boots** — the tally machinery is silent, which (since the fatal
+> path and `install()` print the tally when nonzero) means the boots took **0 erratum-1941500 strikes** in
+> the healed window, not that strikes were silently absorbed. `JB1d — CPUECTLR_EL1=…(bit8=0)` read cleanly
+> each boot. This is the serial-asserted record the round-6 verdict lacked: the JB1f window is healthy on
+> this binary, and per-binary layout luck (a strike site landing in the window) is the documented variance —
+> none landed here. The bridge survived every board power-cycle without re-enumerating (no re-run needed).
 
 ## 4. Jetson Orin Nano headless bring-up (Arc JM2)
 
