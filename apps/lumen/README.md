@@ -21,7 +21,7 @@ Lumen owns the process boot sequence and the top-level event plumbing:
 1. Start the Tokio runtime and spawn the `SIGINT`/`SIGTERM` → `shutdown_tx` interceptor.
 2. Resolve on-disk paths via `gneiss_pal::paths::UnaPaths` (a primary vault and a subconscious vault) and start telemetry logging.
 3. Create the `Synapse` and install the `rustls` ring provider.
-4. Spawn the handler tasks: `core::ignite` (the cortex recorder), `amber_bytes::ignite`, and `matrix::ignite`. The absolute workspace root is resolved once via `elessar::find_workspace_root()` and shared as an `Arc`.
+4. Spawn the handler tasks: `core::ignite` (the cortex recorder), `vein::vault::ignite` (the Semantic Vault), and `matrix::ignite`. The absolute workspace root is resolved once via `elessar::find_workspace_root()` and shared as an `Arc`.
 5. Construct the shared `AppState`, the UI event channel (`async_channel`), and the initial `WorkspaceState` (a Matrix topology tree in the left pane, a stream view in the right).
 6. Build `VeinHandler::new(...)` and spawn the **brain loop**.
 7. Create the `Spline`, define the platform `bootstrap` closure, and call `Backend::new(...).run()` — this blocks on the native event loop until the window closes.

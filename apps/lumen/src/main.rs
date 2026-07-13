@@ -82,11 +82,11 @@ fn main() {
         core::ignite(cortex_vault, core_synapse, shutdown_rx_core).await;
     });
 
-    // 5.5 Ignite Amber Bytes Storage Rune
-    let amber_synapse = synapse.clone();
-    let amber_vault_path = vein_storage.clone();
-    let amber_handle = rt.spawn(async move {
-        amber_bytes::ignite(amber_vault_path, amber_synapse).await;
+    // 5.5 Ignite the Vein Semantic Vault Storage Rune
+    let vault_synapse = synapse.clone();
+    let vault_path = vein_storage.clone();
+    let vault_handle = rt.spawn(async move {
+        vein::vault::ignite(vault_path, vault_synapse).await;
     });
 
     // J21 PATHFINDER: Resolve absolute workspace root zero-latency anchor exactly once
@@ -260,6 +260,6 @@ fn main() {
         let _ = bg_handle.await;
         let _ = core_handle.await;
         matrix_handle.abort();
-        amber_handle.abort();
+        vault_handle.abort();
     });
 }
