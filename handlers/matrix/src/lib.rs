@@ -241,7 +241,9 @@ impl MatrixScanner {
             '\'' => {
                 // Distinguish a char literal from a lifetime.
                 match chars.get(i + 1) {
-                    Some('\\') => Some(Self::char_quoted_end(chars, i + 2)),
+                    // Start AT the backslash so char_quoted_end's escape arm
+                    // consumes the backslash+escaped-char pair ('\\', '\'').
+                    Some('\\') => Some(Self::char_quoted_end(chars, i + 1)),
                     Some(_) if chars.get(i + 2) == Some(&'\'') => Some(i + 3),
                     _ => None, // lifetime (`'a`, `'static`) — not a literal
                 }
@@ -255,7 +257,8 @@ impl MatrixScanner {
                         Some('"') => return Some(Self::quoted_end(chars, j + 1)),
                         Some('\'') => {
                             return match chars.get(j + 1) {
-                                Some('\\') => Some(Self::char_quoted_end(chars, j + 2)),
+                                // Same as the char-literal arm: start AT the backslash.
+                                Some('\\') => Some(Self::char_quoted_end(chars, j + 1)),
                                 Some(_) if chars.get(j + 2) == Some(&'\'') => Some(j + 3),
                                 _ => None,
                             };
@@ -806,6 +809,18 @@ mod scanner_tests {
     }
 
     #[test]
+    fn strip_handles_escaped_char_literals() {
+        // The panel's must-fix reproduction: '\\' and '\'' must not swallow
+        // the rest of the file (lens A, r12 review — off-by-one past the
+        // backslash lost the escape context).
+        let src = "let a = '\\\\'; use real::one; let b = '\\''; use real::two; // tail\n";
+        let out = MatrixScanner::strip_comments(src);
+        assert!(out.contains("use real::one"));
+        assert!(out.contains("use real::two"));
+        assert!(!out.contains("tail"));
+    }
+
+    #[test]
     fn strip_keeps_escaped_quote_in_string() {
         let src = "let s = \"he said \\\"hi\\\" // ok\"; // real\n";
         let out = MatrixScanner::strip_comments(src);
@@ -862,6 +877,15 @@ mod scanner_tests {
         assert_eq!(
             stmts("let a = ';'; let b = r#\"x;y\"#; let c = 3;"),
             vec!["let a = ';'", "let b = r#\"x;y\"#", "let c = 3"]
+        );
+    }
+
+    #[test]
+    fn split_survives_escaped_char_literals() {
+        // Statements after '\\' / '\'' (and byte-char b'\\') must still split.
+        assert_eq!(
+            stmts("let a = '\\\\'; let b = '\\''; let c = b'\\\\'; let d = 4;"),
+            vec!["let a = '\\\\'", "let b = '\\''", "let c = b'\\\\'", "let d = 4"]
         );
     }
 
