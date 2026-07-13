@@ -12,6 +12,7 @@ pub mod gravity;
 pub mod skeleton;
 pub mod storage;
 pub mod synapse;
+pub mod vault;
 
 use chrono::Local;
 use gneiss_pal::api::{Content, Part, ResilientClient};

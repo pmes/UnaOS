@@ -10,6 +10,38 @@ Legend: **✅ metal-confirmed** · **🔬 QEMU-green, metal pending** · dates I
 
 ---
 
+## Handlers — AMBER-CHARTER (the eviction: engram vault back to vein, amber_bytes back to The Block) — 2026-07-13 🔬 `us-amber`
+
+**QEMU-green n/a (host-native Ring 3 handlers; gates are `cargo test -p vein` + `cargo check -p lumen`).**
+Undoes the March charter derail (`3839cff`, Jules), which had extracted vein's durable-memory
+`DiskManager`/vault actor and bolted it onto `amber_bytes`, contradicting that handler's `docs/CODEX.md`
+charter ("The Block": forensic disk/partition recovery, explicitly *not* a durable-memory service).
+
+- **The eviction (M1):** the whole Semantic Vault actor — `DiskManager` (UnaFS engram store:
+  `save_memory` / `search_memories` / `get_latest_engrams` / `load_paged_memories`) and the `ignite`
+  storage-actor loop over `StorageSave`/`StorageQuery`/`StorageLoadPaged` — moved from
+  `handlers/amber_bytes/src/lib.rs` to a new `handlers/vein/src/vault.rs` (`vein::vault`), its true
+  home. The bandy wire shapes (the `SMessage` storage variants, `DispatchRecord`, `Origin`) were
+  consumed unchanged — no ontology re-cut; the 56 bandy KATs are byte-identical.
+- **AMBER-GUARD moved intact:** the fail-closed mount guard (an existing vault that cannot be
+  mounted is left byte-identical on disk — never truncated, never reformatted) and its four
+  byte-identity tests moved with the actor and stay green at their new home.
+- **amber_bytes returns to The Block (M2):** the crate is now bin-only — the forensic CLI
+  (`inspect`/`image`/`search`/`extract`/`wipe`, which survived the drift on-charter) is its sole
+  surface. Its `unafs`/`bandy`/`anyhow`/`tokio` dependencies (actor-only) were dropped; README
+  restored to the forensic-recovery charter.
+- **Consumer rewire:** Lumen's boot (`apps/lumen/src/main.rs`) now ignites `vein::vault::ignite`
+  instead of `amber_bytes::ignite`; the `amber_bytes` path dependency was removed from Lumen. The
+  live durable-memory seam (Lumen → the vault serving engrams) is preserved.
+
+**How it was tested:** `cargo test -p vein vault` → 4/4 (the moved AMBER-GUARD byte-identity suite:
+fresh-create, corrupt fail-closed, sub-block fail-closed, valid reopen); `cargo test -p amber_bytes`
+builds bin-only clean; `cargo check -p lumen` green; `cargo test -p bandy` 60/60 with the 56 KATs
+byte-identical (bandy untouched — `git status libs/bandy` empty). Metal: none needed (host-native
+Ring 3 arc). Note: vein currently builds on the macOS host (no elessar GTK block encountered).
+
+---
+
 ## unafs — BEFS-HARDEN (bound the on-disk parser against hostile/corrupt volumes) — 2026-07-13 🔬 `us-befs`
 
 **What it does:** closes the DoS class the K3 security-tier review confirmed (and the QSIM panel

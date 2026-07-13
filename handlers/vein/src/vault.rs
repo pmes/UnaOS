@@ -14,13 +14,25 @@
 // You should have received a copy of the GNU Lesser General Public License
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
+//! The Semantic Vault — vein's durable engram store.
+//!
+//! CHARTER PROVENANCE: this is vein's own storage seam. Jules commit `3839cff`
+//! (2026-03-11) extracted this DiskManager/durable-memory actor OUT of vein and
+//! bolted it onto `amber_bytes`, derailing that handler from its "The Block"
+//! forensic-recovery charter. The AMBER-CHARTER arc undoes that: the engram
+//! save/query actor returns HOME to vein; amber_bytes recovers The Block.
+//!
+//! The fail-closed mount guard (AMBER-GUARD) moved with the actor and is
+//! non-negotiable: an existing vault that cannot be mounted is left byte-
+//! identical on disk for recovery — never truncated, never reformatted.
+
 use anyhow::{Context, Result};
-use bandy::{SMessage, Synapse};
 use bandy::state::DispatchRecord;
+use bandy::{SMessage, Synapse};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use tokio::task;
-use unafs::{AttributeValue, FileDevice, FileSystem, UnaFS};
+use unafs::{AttributeValue, FileSystem, UnaFS, FileDevice};
 
 /// The DiskManager is the synchronous guardian of the Semantic Vault.
 ///
@@ -256,7 +268,7 @@ impl DiskManager {
     }
 }
 
-/// Ignite the Amber Bytes Storage Rune.
+/// Ignite the Semantic Vault Storage Rune.
 /// This Rune takes absolute and exclusive ownership of the UnaFS DiskManager.
 /// It listens to the Synapse for incoming storage requests, executes the bare-metal I/O,
 /// and fires the results back into the nervous system.
@@ -274,7 +286,7 @@ pub async fn ignite(vault_path: PathBuf, synapse: Synapse) {
         Ok(dm) => dm,
         Err(e) => {
             eprintln!(
-                ":: AMBER BYTES :: Fatal error: failed to mount UnaFS vault: {}",
+                ":: VEIN VAULT :: Fatal error: failed to mount UnaFS vault: {}",
                 e
             );
             return;
@@ -282,7 +294,7 @@ pub async fn ignite(vault_path: PathBuf, synapse: Synapse) {
     };
 
     println!(
-        ":: AMBER BYTES :: Storage Rune online, holding exclusive lock on Vault at {:?}",
+        ":: VEIN VAULT :: Storage Rune online, holding exclusive lock on Vault at {:?}",
         vault_path
     );
 
@@ -383,11 +395,11 @@ pub async fn ignite(vault_path: PathBuf, synapse: Synapse) {
                 _ => {} // Ignore other messages
             }
             Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
-                eprintln!("Amber Bytes receiver lagged, dropping missed events.");
+                eprintln!("Vein Vault receiver lagged, dropping missed events.");
                 continue;
             }
             Err(tokio::sync::broadcast::error::RecvError::Closed) => {
-                println!(":: AMBER BYTES :: Synapse channel closed, terminating loop.");
+                println!(":: VEIN VAULT :: Synapse channel closed, terminating loop.");
                 break;
             }
         }
