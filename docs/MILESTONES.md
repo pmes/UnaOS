@@ -47,11 +47,13 @@ Legend: **✅ metal-confirmed** · **🔬 QEMU-green, metal pending** · dates I
   `esp-jetson` links, **108 `tegra:` strings** (unchanged — `mv` strings carry no `tegra:` token). Zero x86
   behavioural change (`shell.rs` compiles both arches; the handler dispatches only on a keystroke). No
   `kernel8-test` on the jetson side — the FATMOVE primitives are gated headless on the pi4 side.
-- **Metal:** attended-pending — the money-shot bench card [`jd10-bench.md`](../unaos/scripts/jd10-bench.md)
-  (`mv A.TXT B.TXT` rename → `mv B.TXT DOCS/` move → power-cycle → `cat` survives → directory rename `mv DOCS
-  NOTES` → the guards). This also flips FATMOVE's own metal verdict (its `move_entry` crash-ordering runs on
-  silicon for the first time). ⚠ Verify the serial bridge captures a full boot first (round-6/8 host capture
-  failed mid-bench, §JB1f).
+- **Metal:** ✅ **METAL-CONFIRMED (2026-07-12 attended bench)** — the money-shot bench card
+  [`jd10-bench.md`](../unaos/scripts/jd10-bench.md) PASSED on the Orin: `mv A.TXT B.TXT` rename → `mv B.TXT
+  DOCS/` move → power-cycle → `cat /DOCS/B.TXT` returned `hello alpha` intact; the O(1) directory rename
+  `mv DOCS NOTES` carried the whole subtree with one relink; the guards fired honestly (`-EINVAL` dir
+  self/descendant, `-EISDIR` cross-parent dir move, `-ENOENT`, `-EEXIST`, `-EBUSY`). This also flips
+  **FATMOVE's own metal verdict** — its `move_entry` crash-ordering ran on silicon for the first time,
+  serial-clean. Serial `~/unaos-bench/jetson-serial-2026-07-12-180110.log`; 0 heals across 4 boots.
 - **Detail:** [`arch_arm64.md` §JD10](dev/OS/01_BOOT_HAL/arch_arm64.md). **Commit:** on `hw-jetson` (the
   seat assigns the integration hash at merge).
 
@@ -89,9 +91,11 @@ Legend: **✅ metal-confirmed** · **🔬 QEMU-green, metal pending** · dates I
   `UNAOS_GICV3=1 test-arm 40` CAPSTONE 6/6; `UNAOS_HUBSTORAGE=1 test 25` MISSION (shared `shell.rs` guard);
   `esp-jetson` links, **108 `tegra:` strings** (unchanged — `cp -r` strings carry no `tegra:` token). Zero x86
   behavioural change (`shell.rs` compiles both arches; the handler dispatches only on a keystroke).
-- **Metal:** attended-pending — the money-shot bench card [`jd9-bench.md`](../unaos/scripts/jd9-bench.md)
-  (`cp -r` a small tree into a new dir → verify tree + contents → power-cycle → verify survival → the guards).
-  ⚠ Verify the serial bridge captures a full boot first (round-6/8 host capture failed mid-bench, §JB1f).
+- **Metal:** ✅ **METAL-CONFIRMED (2026-07-12 attended bench)** — the money-shot bench card
+  [`jd9-bench.md`](../unaos/scripts/jd9-bench.md) PASSED on the Orin: `cp -r SRC DST` and into-dir
+  `cp -r SRC BACKUP` (→ `/BACKUP/SRC`), each `(2 dir(s), 2 file(s), 20 bytes)`; power-cycle → `DST/SUB/B.TXT`
+  `cat`'d `deep beta`, source tree untouched; guards fired (self-into-descendant `-EINVAL`, `-EEXIST`,
+  volume-root `-EINVAL`). Serial `…-180110.log`; 0 heals across 4 boots.
 - **Detail:** [`arch_arm64.md` §JD9](dev/OS/01_BOOT_HAL/arch_arm64.md). **Commit:** on `hw-jetson` (the
   seat assigns the integration hash at merge).
 
@@ -124,9 +128,10 @@ Legend: **✅ metal-confirmed** · **🔬 QEMU-green, metal pending** · dates I
   `UNAOS_GICV3=1 test-arm 40` CAPSTONE 6/6; `UNAOS_HUBSTORAGE=1 test 25` MISSION (shared `shell.rs` guard);
   `esp-jetson` links, **108 `tegra:` strings** (unchanged — `cp` strings carry no `tegra:` token). Zero x86
   behavioural change (`shell.rs` compiles both arches; the `cp` handler is dispatched only on a keystroke).
-- **Metal:** attended-pending — the money-shot bench card [`jd8-bench.md`](../unaos/scripts/jd8-bench.md)
-  (`cp` a file into a subdir → `cat` the copy → power-cycle → `cat` again, source untouched → error probes).
-  ⚠ Verify the serial bridge captures a full boot first (round-6/8 host capture failed mid-bench, §JB1f).
+- **Metal:** ✅ **METAL-CONFIRMED (2026-07-12 attended bench)** — the money-shot bench card
+  [`jd8-bench.md`](../unaos/scripts/jd8-bench.md) PASSED on the Orin: `cp README.TXT COPIES/` (DIR/ idiom) +
+  explicit-name `cp README.TXT COPIES/BACKUP.TXT`; power-cycle → both copies `cat`'d intact after re-boot,
+  source byte-untouched. Serial `…-180110.log`; 0 heals across 4 boots.
 - **Detail:** [`arch_arm64.md` §JD8](dev/OS/01_BOOT_HAL/arch_arm64.md). **Commit:** on `hw-jetson` (the
   seat assigns the integration hash at merge).
 
@@ -295,9 +300,12 @@ Legend: **✅ metal-confirmed** · **🔬 QEMU-green, metal pending** · dates I
   `UNAOS_GICV3=1 test-arm 40` CAPSTONE 6/6; `UNAOS_HUBSTORAGE=1 test 25` MISSION (shared `shell.rs` guard);
   `esp-jetson` links, **108 `tegra:` strings** (unchanged). Zero x86 behavioural change (`shell.rs` compiles
   both arches; the `mkdir`/`rmdir` handlers are dispatched only on a keystroke).
-- **Metal:** attended-pending — the money-shot bench card [`jd7-bench.md`](../unaos/scripts/jd7-bench.md)
-  (`mkdir` → `cd` → `write` → power-cycle → `cat` → `rm` → `rmdir`) also flips FATDIRS's metal verdict.
-  ⚠ Verify the serial bridge captures a full boot first (round-6 host capture failed mid-bench, §JB1f).
+- **Metal:** ✅ **METAL-CONFIRMED (2026-07-12 attended bench)** — the money-shot bench card
+  [`jd7-bench.md`](../unaos/scripts/jd7-bench.md) PASSED on the Orin: `mkdir DOCS/DRAFTS` → `cd` → `write
+  NOTE.TXT` → power-cycle → the tree SURVIVED (`cd` back in, `cat` intact) → `rm` → empty `rmdir` freed its
+  cluster; `-ENOTEMPTY`/`-EBUSY` probes honest. This also flips **FATDIRS**'s `create_dir`/`remove_dir`
+  first-silicon verdict (they ran end-to-end on hardware here for the first time). Serial
+  `~/unaos-bench/jetson-serial-2026-07-12-180110.log` (STEP-0 full-boot capture verified); 0 heals across 4 boots.
 - **Detail:** [`arch_arm64.md` §JD7](dev/OS/01_BOOT_HAL/arch_arm64.md) + [`SECURITY.md`](SECURITY.md)
   FATDIRS ledger note. **Commit:** on `hw-jetson` (the seat assigns the integration hash at merge).
 
