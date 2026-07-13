@@ -397,3 +397,35 @@ fn valid_records_decode_under_the_budgets() {
     let back = Inode::from_bytes(&bytes).unwrap();
     assert_eq!(back, inode);
 }
+
+#[test]
+fn hostile_prefix_just_under_budget_stays_bounded() {
+    // r12 panel must-fix regression guard: a claim just UNDER the budget
+    // passes bincode's check and drives an INFALLIBLE internal allocation of
+    // the claimed size — so MAX_RECORD_BYTES itself is the largest alloc a
+    // hostile prefix can force, and it must stay small relative to the
+    // kernel heap. This test pins two things: (1) a just-under claim still
+    // yields a graceful Err (payload absent), (2) the budget constant stays
+    // in the kernel-safe band — if a future arc raises it past 8 MiB, this
+    // fails and forces a deliberate review against the kernel heap.
+    const KERNEL_SAFE_CEILING: usize = 8 * 1024 * 1024;
+    assert!(
+        unafs::codec::MAX_RECORD_BYTES <= KERNEL_SAFE_CEILING,
+        "MAX_RECORD_BYTES ({}) exceeds the kernel-safe ceiling — a passing \
+         bincode claim allocates infallibly; review against the kernel heap",
+        unafs::codec::MAX_RECORD_BYTES
+    );
+
+    // AttributeValue::String (variant tag 2) claiming budget − 1 bytes:
+    // passes the claim, allocates ~4 MiB (host-fine), then fails the read.
+    let mut hostile = Vec::new();
+    hostile.extend_from_slice(&2u32.to_le_bytes());
+    hostile.extend_from_slice(&((unafs::codec::MAX_RECORD_BYTES as u64) - 1).to_le_bytes());
+    assert!(unafs::codec::deserialize::<AttributeValue>(&hostile).is_err());
+
+    // And just OVER the budget: the claim itself is refused.
+    let mut hostile = Vec::new();
+    hostile.extend_from_slice(&2u32.to_le_bytes());
+    hostile.extend_from_slice(&((unafs::codec::MAX_RECORD_BYTES as u64) + 1).to_le_bytes());
+    assert!(unafs::codec::deserialize::<AttributeValue>(&hostile).is_err());
+}

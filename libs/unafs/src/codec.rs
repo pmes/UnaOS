@@ -104,10 +104,15 @@ pub const BLOCK_RECORD_LIMIT: usize = 8192;
 /// These records span extents, so they are not block-bounded — the read layer
 /// already bounds their byte source against the volume span — but their
 /// *claimed* lengths still need a hard ceiling so a crafted prefix cannot
-/// demand an arbitrary pre-allocation. 64 MiB comfortably exceeds any record
-/// the format produces today; raise it deliberately (with review) if a legit
-/// record ever approaches it.
-pub const MAX_RECORD_BYTES: usize = 64 * 1024 * 1024;
+/// demand an arbitrary pre-allocation. The ceiling must sit WELL BELOW the
+/// kernel's guaranteed-free heap: bincode's `with_limit` only refuses claims
+/// ABOVE the budget — a passing claim is followed by an INFALLIBLE internal
+/// allocation, so the budget itself is the largest allocation a hostile
+/// prefix can force (r12 panel: 64 MiB > the 48 MiB kernel heap → abort).
+/// 4 MiB is generous for every record the format produces today (~100k dir
+/// entries) and safe under the kernel heap minus the video back buffer;
+/// raise it deliberately (with review) if a legit record ever approaches it.
+pub const MAX_RECORD_BYTES: usize = 4 * 1024 * 1024;
 
 /// Serialize a value into the frozen on-disk byte layout.
 ///

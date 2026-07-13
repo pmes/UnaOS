@@ -35,7 +35,7 @@ Exposure classes, honestly stated:
    (profile-independent), hole-fill/free walks are bounded, and record decodes
    carry bincode byte budgets so a crafted length prefix fails BEFORE
    allocating. Residual, honestly stated: for extent-backed records the decode
-   pre-allocation is capped (64 MiB record ceiling), not eliminated. The FAT
+   pre-allocation is capped (4 MiB record ceiling — the panel lowered it from 64 MiB, which exceeded the 48 MiB kernel heap and so was itself an abort vector; a passing bincode claim allocates infallibly, so the ceiling IS the max forced allocation), not eliminated. The FAT
    reader's equivalent audit is still open — see the checklist below.
 2. **Privilege boundary not yet load-bearing (both arches).** The ring-3/EL0
    boundary now exists on BOTH architectures (x86 U1a/U1b: ring-3 round-trip +
@@ -300,7 +300,7 @@ already performs). That refactor is a separate, review-gated change; **WXN is no
 - [ ] Network stack: header-length/bounds audit (Ethernet/ARP/IP/TCP options/DHCP options)
 - [ ] USB: descriptor parsing bounds (config/interface/endpoint/HID report walks; hub paths)
 - [ ] FAT: BPB/dirent/FAT-chain bounds and loop guards (partially hardened during the read-only arc — re-verify and record)
-- [x] unafs RO mount (UNAFS-K3): bound every disk-derived size/count/offset vs volume geometry (superblock `bitmap_blocks`, inode `size`, extent arithmetic, codec lengths; `try_reserve` not `with_capacity`, size-limited decode) — **DONE (BEFS-HARDEN, 2026-07-13)**: `Superblock::validate` at the parse boundary; `try_reserve` on the bitmap load and `read_from_extents`; `checked_*` extent arithmetic + past-volume extent rejection; bounded bulk hole fill and free walks; checked spilled-extent sums on the query/get_attribute paths (the QSIM-flagged sites); two-tier bincode decode budgets (8 KiB block records / 64 MiB extent-backed records). 22 hostile-volume fixtures assert `Err`-not-panic (`libs/unafs/tests/hostile_volume.rs`); golden format KATs byte-identical
+- [x] unafs RO mount (UNAFS-K3): bound every disk-derived size/count/offset vs volume geometry (superblock `bitmap_blocks`, inode `size`, extent arithmetic, codec lengths; `try_reserve` not `with_capacity`, size-limited decode) — **DONE (BEFS-HARDEN, 2026-07-13)**: `Superblock::validate` at the parse boundary; `try_reserve` on the bitmap load and `read_from_extents`; `checked_*` extent arithmetic + past-volume extent rejection; bounded bulk hole fill and free walks; checked spilled-extent sums on the query/get_attribute paths (the QSIM-flagged sites); two-tier bincode decode budgets (8 KiB block records / 4 MiB extent-backed records, pinned under the kernel heap by a regression test). 23 hostile-volume fixtures assert `Err`-not-panic (`libs/unafs/tests/hostile_volume.rs`); golden format KATs byte-identical
 
 ### Process & supply chain
 - [ ] Adversarial review before metal and before merge on every arc (standing rule, `CLAUDE.md`)
