@@ -20,7 +20,7 @@ use std::fs;
 use std::time::Instant;
 use unafs::{AttributeValue, BLOCK_SIZE, FileDevice, FileSystem, cosine_similarity};
 
-/// The `swapped_345` golden from `libs/unafs/tests/query_kats.rs`:
+/// The `swapped_345` golden from `libs/fs/unafs/tests/query_kats.rs`:
 /// cosine([3,4], [4,3]) = 24/25 = 0.96, bit pattern 0x3f75_c28f.
 /// A frozen contract — do not edit to make the bench pass.
 const GOLDEN_345_BITS: u32 = 0x3f75_c28f;
@@ -224,7 +224,7 @@ fn main() -> Result<()> {
 
     // Golden-KAT correctness gate: the sentinel's score against [4, 3] is
     // pinned bit-for-bit (0.96 = 0x3f75c28f, the `swapped_345` golden in
-    // libs/unafs/tests/query_kats.rs). The 384-dim random inodes mismatch
+    // libs/fs/unafs/tests/query_kats.rs). The 384-dim random inodes mismatch
     // the 2-dim target (score 0.0), so exactly the sentinel survives.
     println!("-> Executing golden-KAT correctness query...");
     let golden = fs.query("similarity(embedding, [4.0, 3.0]) > 0.5 AND type == \"engram\"")?;

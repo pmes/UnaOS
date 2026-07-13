@@ -14,7 +14,7 @@
 //! Known-answer tests that FREEZE the PCA9685 register/prescale encoding.
 //!
 //! Each contract is pinned two independent ways, the same discipline as
-//! `libs/ibus/tests/kat_vectors.rs`:
+//! `libs/input/ibus/tests/kat_vectors.rs`:
 //!
 //! 1. **Byte / value literals** hand-derived from the datasheet (the prescale
 //!    bytes `0x79`/`0x65`/`0x05`, the 50 Hz servo-pulse counts 205/307/410, the

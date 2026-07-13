@@ -10,7 +10,7 @@ path = "src/main.rs"
 
 [dependencies]
 # The Core Logic
-unafs = { path = "../../../libs/unafs" }
+unafs = { path = "../../../libs/fs/unafs" }
 bandy = { path = "../../../libs/bandy" }
 
 # CLI Utilities

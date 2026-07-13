@@ -17,7 +17,7 @@ default = []
 # The Trinity
 bandy = { path = "../../libs/bandy" }
 gneiss_pal = { path = "../../libs/gneiss_pal" }
-unafs = { path = "../../libs/unafs" }
+unafs = { path = "../../libs/fs/unafs" }
 elessar = { path = "../../libs/elessar" }
 quartzite = { path = "../../libs/quartzite" }
 matrix = { path = "../../handlers/matrix" }

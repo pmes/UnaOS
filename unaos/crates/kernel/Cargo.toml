@@ -96,7 +96,7 @@ fdt = "0.1.5"
 # host-native backends (FileDevice/mmap/bandy/query) — never enable it here.
 # aarch64-only (K3-N1): only the Pi media carries a unafs partition; keeping it
 # out of the x86 kernel protects the tight usbdebug-esp size band.
-unafs = { path = "../../../libs/unafs", default-features = false }
+unafs = { path = "../../../libs/fs/unafs", default-features = false }
 
 [target.'cfg(target_arch = "x86_64")'.dependencies]
 x86_64 = "0.15.4"

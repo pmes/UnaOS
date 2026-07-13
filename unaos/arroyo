@@ -558,7 +558,7 @@ kernel8() {
     head -c 512 /dev/zero | tr '\000' '\301' > "$KERNEL8_DIR/GROW.BIN"
 
     # BeFS-K3: stage a real 4 MB unafs volume with deterministic fixture files, built by the host
-    # `unafs` CLI (the same frozen on-disk format the kernel mounts — KAT-pinned in libs/unafs).
+    # `unafs` CLI (the same frozen on-disk format the kernel mounts — KAT-pinned in libs/fs/unafs).
     # make-pi-img.sh carries it as MBR partition 2 (type 0x7f); the kernel's `locate_unafs` finds it
     # by superblock magic in QEMU (if=sd) and on the flashed card identically. Fixture contents are
     # byte-verified by the K3-mount witness: K3HELLO.TXT (known text) + K3PAT.BIN (12 KiB pattern,

@@ -10,16 +10,16 @@ its on-disk format before any silicon: the wire format and the safety state
 machine are pinned by tests on the host, so the logic is settled before it is
 ever near a 3S LiPo. Two crates hold it:
 
-- [`libs/ibus`](../../../libs/ibus) — the FlySky i-BUS servo frame codec
+- [`libs/input/ibus`](../../../libs/input/ibus) — the FlySky i-BUS servo frame codec
   (`#![no_std]`, zero-dependency). The wire format is frozen by the
-  known-answer tests in `libs/ibus/tests/kat_vectors.rs`.
+  known-answer tests in `libs/input/ibus/tests/kat_vectors.rs`.
 - [`libs/drive`](../../../libs/drive) — the arch-neutral drive-service core: the
   DISARM / MANUAL / AUTO state machine with a FAILSAFE latch. The invariants
   below are proven by the named tests in `libs/drive/tests/invariants.rs`.
-- [`libs/pca9685`](../../../libs/pca9685) — the actuation-output codec
+- [`libs/pwm/pca9685`](../../../libs/pwm/pca9685) — the actuation-output codec
   (`#![no_std]`, zero-dependency). Turns update rates and microsecond pulse
   widths into the PCA9685's I2C register writes; the encoding is frozen by the
-  datasheet known-answer tests in `libs/pca9685/tests/kat_vectors.rs`. It
+  datasheet known-answer tests in `libs/pwm/pca9685/tests/kat_vectors.rs`. It
   computes bytes only — there is no I2C transport here (a later kernel arc).
 
 Both crates are `#![forbid(unsafe_code)]`. The `drive` core is `no_std` (verified
@@ -108,19 +108,19 @@ hardware. The remaining TALUS legs, each behind this checklist, are:
 
 - **i-BUS on a UART.** The FGr8B's i-BUS output option is verify-on-bench; the
   KATs are synthetic until real captures are appended to `CAPTURED_FRAMES` in
-  `libs/ibus/tests/kat_vectors.rs` (the test harness is already wired for the
+  `libs/input/ibus/tests/kat_vectors.rs` (the test harness is already wired for the
   upgrade). The i-BUS line must be a second Tegra UART, never the TCU-owned
   debug UART.
 - **PWM out.** Tegra's native PWM is 8-bit at 50 Hz, insufficient for a servo,
   so actuation goes through a PCA9685 over I2C (12-bit duty). The `drive` sink
   speaks microseconds only — it makes no assumption about the PWM backend. The
-  **codec is now host-frozen**: [`libs/pca9685`](../../../libs/pca9685) computes
+  **codec is now host-frozen**: [`libs/pwm/pca9685`](../../../libs/pwm/pca9685) computes
   the prescale and per-channel duty register writes, pinned by datasheet KATs
   (prescale `0x79` at 50 Hz; the 1.0/1.5/2.0 ms servo pulses at 205/307/410
   counts; the sleep→prescale→wake init order). What remains for metal is the
   **I2C transport** that moves those `(reg, val)` writes onto the wire, plus the
   attended actuation gate — no ESC is energised until every interlock below is
   bench-green. The `drive`↔`pca9685` seam (a `drive::ActuatorSink` that encodes
-  through the codec) is proven host-side in `libs/pca9685/tests/seam_drive.rs`.
+  through the codec) is proven host-side in `libs/pwm/pca9685/tests/seam_drive.rs`.
 - **Power.** The Orin barrel input accepts 7–20 V, so a 3S LiPo drives it
   directly. No actuator is energised until every interlock above is bench-green.

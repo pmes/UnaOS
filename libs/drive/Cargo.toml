@@ -11,7 +11,7 @@ description = "Arch-neutral rover drive-service core: the safety state machine."
 # MockSink) used by the invariant tests; the kernel embeds the crate with
 # `default-features = false`.
 [dependencies]
-ibus = { path = "../ibus" }
+ibus = { path = "../input/ibus" }
 
 [features]
 default = ["std"]

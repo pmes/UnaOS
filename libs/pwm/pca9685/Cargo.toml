@@ -16,4 +16,4 @@ description = "PCA9685 16-channel 12-bit PWM register/prescale codec (no_std, ze
 # it never enters the shipping/no_std artifact — dev-dependencies do not build
 # for `cargo check -p pca9685 --no-default-features`.
 [dev-dependencies]
-drive = { path = "../drive" }
+drive = { path = "../../drive" }
