@@ -16,6 +16,11 @@ ever near a 3S LiPo. Two crates hold it:
 - [`libs/drive`](../../../libs/drive) — the arch-neutral drive-service core: the
   DISARM / MANUAL / AUTO state machine with a FAILSAFE latch. The invariants
   below are proven by the named tests in `libs/drive/tests/invariants.rs`.
+- [`libs/pca9685`](../../../libs/pca9685) — the actuation-output codec
+  (`#![no_std]`, zero-dependency). Turns update rates and microsecond pulse
+  widths into the PCA9685's I2C register writes; the encoding is frozen by the
+  datasheet known-answer tests in `libs/pca9685/tests/kat_vectors.rs`. It
+  computes bytes only — there is no I2C transport here (a later kernel arc).
 
 Both crates are `#![forbid(unsafe_code)]`. The `drive` core is `no_std` (verified
 with `cargo check -p drive --no-default-features`) so the future kernel drive
@@ -61,6 +66,41 @@ kernel fault parks the wheels exactly as a host-side drop does. `force_neutral`
 also latches FAILSAFE and disarms, so nothing resumes without a deliberate
 re-arm.
 
+## Design decision — the deadman is link-liveness, bounded by the tick
+
+The G0 security panel raised a design question about interlock I2: the deadman
+samples `now - last_valid_ms > deadman_ms` at tick cadence, so it checks how
+recently a *valid frame arrived on the link*, not the age of the frame whose
+sticks the output path is *acting on* at emit. The trace: a frame at `t = 0`, a
+tick at `t = 500` (not stale, since `500` is not `> 500`), a fresh frame at
+`t = 505`, a tick at `t = 520` seeing 15 ms — across which the core drove on the
+`t = 0` sticks for ~505 ms. Should the output path instead bound the age of the
+frame actually being acted on (age-of-`latest`-at-emit)?
+
+**Decision (2026-07-13): keep the deadman as link-liveness. Do not add a
+separate age-of-`latest`-at-emit gate.** Rationale:
+
+- The link-liveness check **already bounds** the age of the acted-upon frame.
+  While armed, `latest` can be at most `deadman_ms` old before the very same
+  staleness check latches FAILSAFE and forces neutral. Because the check samples
+  at the 20 ms control tick, the true worst-case age of an acted-upon frame is
+  `deadman_ms + one tick` (≈520 ms), not exactly 500 ms — a bounded, documented
+  slop, not an unbounded hole.
+- Holding the last known-good sticks for under the deadman during a brief
+  dropout **is the deadman's purpose**. A servo or ESC held at its last commanded
+  position for <500 ms across an ordinary RC hiccup is correct behaviour; a
+  tighter per-emit age gate would instead drop to neutral on normal receiver
+  jitter, trading a real safety property (no spurious neutral-slams) for a
+  distinction (500 vs ~520 ms) that a ≤500 ms-class envelope does not need.
+- **If** a future requirement needs a hard emit-age bound — a tighter servo
+  spec, or AUTO commands whose staleness matters more than link liveness (see the
+  drop-oldest note below) — it is a localized, additive change: gate the emit
+  path on `now - last_valid_ms` against a configured `emit_max_age_ms` and force
+  neutral when exceeded. It is deferred until such a requirement is real, so the
+  envelope is not complicated ahead of need. This decision is revisited at the
+  attended actuation bench, where the real servo/ESC response to a held-sticks
+  dropout is observed on a scope.
+
 ## What is deferred to metal
 
 The host foundation freezes the format and the logic; it does not touch
@@ -72,8 +112,15 @@ hardware. The remaining ENDURO legs, each behind this checklist, are:
   upgrade). The i-BUS line must be a second Tegra UART, never the TCU-owned
   debug UART.
 - **PWM out.** Tegra's native PWM is 8-bit at 50 Hz, insufficient for a servo,
-  so actuation goes through a PCA9685 over I2C (12-bit duty; a later
-  `libs/pca9685` arc). The `drive` sink speaks microseconds only — it makes no
-  assumption about the PWM backend.
+  so actuation goes through a PCA9685 over I2C (12-bit duty). The `drive` sink
+  speaks microseconds only — it makes no assumption about the PWM backend. The
+  **codec is now host-frozen**: [`libs/pca9685`](../../../libs/pca9685) computes
+  the prescale and per-channel duty register writes, pinned by datasheet KATs
+  (prescale `0x79` at 50 Hz; the 1.0/1.5/2.0 ms servo pulses at 205/307/410
+  counts; the sleep→prescale→wake init order). What remains for metal is the
+  **I2C transport** that moves those `(reg, val)` writes onto the wire, plus the
+  attended actuation gate — no ESC is energised until every interlock below is
+  bench-green. The `drive`↔`pca9685` seam (a `drive::ActuatorSink` that encodes
+  through the codec) is proven host-side in `libs/pca9685/tests/seam_drive.rs`.
 - **Power.** The Orin barrel input accepts 7–20 V, so a 3S LiPo drives it
   directly. No actuator is energised until every interlock above is bench-green.
