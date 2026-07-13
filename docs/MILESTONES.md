@@ -57,6 +57,46 @@ Spec promotions committed here; the granular arc detail is in each arc's own ent
 
 ---
 
+## hw-jetson track — 2026-07-12 (JD11 — mirroring shell command output to serial)
+
+### JD11 — mirror panel command output to serial for a durable bench transcript (`shell.rs`/`console.rs` lane) 🔬 `hw-jetson`
+- **Why:** the round-9 Orin bench found the panel console has **no scrollback** and shell command *output*
+  (`ls`/`cat`/verb results) drew only to the panel — only *keystrokes* echoed to serial
+  (`:: tegra: JD2 — KEY … ::`). So verbatim output was uncapturable over the serial bridge / unreplayable by
+  mbench, and card readout was the four-verb bench's bottleneck. JD11 mirrors command output to serial too,
+  making every future Orin bench self-documenting — a bench-infrastructure multiplier for the whole metal
+  program, not just the panel.
+- **What (inert, opt-in output sink):** all shell output already converges on one sink, `Console::println`
+  (shell.rs calls it for every result), so JD11 mirrors *there* — complete by construction, no per-command
+  plumbing. `Console` gains `out_sink: Option<fn(&str)>` (`None` on `new()`); `println` pushes the panel-history
+  line as before, then — *after* the push, so a fault in the sink can't lose the panel line — calls the sink if
+  set. Off-tegra surfaces (x86 GUI, pi `render_service`, headless) never set it → `println` is byte-for-byte
+  unchanged, **zero off-tegra behavioural change**. The tegra `jd2_console_pump` installs `jd2_out_sink` (a
+  `cfg(feature = "tegra")` `fn(&str)` in `main.rs`) right after building the `Console`, which emits
+  `:: tegra: JD2 — OUT | <line> ::`. Keeping the marker string in the tegra-gated caller means it compiles into
+  the tegra kernel alone; the shared `console.rs` carries no `tegra:` literal.
+- **Marker format:** shares the `:: tegra: JD2 — …` family with the keystroke marker so one
+  `awk '/:: tegra: JD2 —/'` reconstructs the whole interleaved session (keys + output, in order). A
+  whole-screen command (`gneiss`/vug) paints the framebuffer directly, not via `println`, so it is honestly
+  **not** mirrored — text output only. Ordering/locking: the sink runs synchronously from `println` *after* the
+  triggering `KEY` line has printed and released the UART, touches only the serial UART (no `Console`
+  re-entrancy, no lock the caller holds) → no new lock ordering, no deadlock.
+- **Tested (QEMU):** `check` + `UNAOS_TEGRA=1 check` green both arches; `test-arm 22` MISSION;
+  `UNAOS_GICV3=1 test-arm 40` CAPSTONE 6/6; `UNAOS_HUBSTORAGE=1 test 25` MISSION (shared `shell.rs`/`console.rs`
+  guard); `esp-jetson` links (`540,184 B`), **109 `tegra:` strings** — **up 1** from the JD10 baseline of 108
+  (the single new occurrence is the `:: tegra: JD2 — OUT | {} ::` marker; `strings` splits it on the em-dash so
+  its `:: tegra: JD2 ` prefix is the counted fragment; shared `console.rs` adds none). First `tegra:`-count
+  change since JD2 — validate media by count (109 vs virt ≈ 0/1), not size. Zero x86 behavioural change (sink
+  is `None` off-tegra). No `kernel8-test` on the jetson side.
+- **Metal:** ⏳ **ATTENDED-PENDING** — the payoff is itself the metal artifact: at the next Orin bench every
+  `ls`/`cat`/verb result appears on serial as `:: tegra: JD2 — OUT | … ::`, giving the first durable,
+  mbench-able output transcript. Bench card [`jd11-bench.md`](../unaos/scripts/jd11-bench.md): run an
+  output-producing command and confirm the panel text is reproduced verbatim on the serial capture, paired
+  with its `KEY` lines. ⚠ With JD11 the serial bridge is now the *primary* output-evidence channel — verify it
+  captures a full boot BEFORE bench time (§JB1f); a mid-bench freeze costs the transcript.
+- **Detail:** [`arch_arm64.md` §JD11](dev/OS/01_BOOT_HAL/arch_arm64.md). **Commit:** on `hw-jetson` (the
+  seat assigns the integration hash at merge).
+
 ## hw-jetson track — 2026-07-12 (JD10 — the panel moves & renames: `mv`)
 
 ### JD10 — `mv <src> <dst>` on the Orin panel shell (move/rename by relinking one entry, no new fat.rs) 🔬 `hw-jetson`

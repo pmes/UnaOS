@@ -2326,6 +2326,62 @@ guard/error probes (self-into-descendant `-EINVAL`, cross-parent dir move `-EISD
 `-ENOENT`, pre-existing target `-EEXIST`). ⚠ Verify the serial bridge captures a full boot BEFORE burning
 bench time — the round-6/8 host capture failed mid-bench (see §JB1f).
 
+### JD11 — mirroring shell command output to serial (bench-transcript infrastructure)
+
+The round-9 Orin bench (§JB1f heal-tally, 2026-07-12) surfaced a bench-methodology gap: the panel console
+has **no scrollback**, and shell command **output** (`ls`/`cat`/`pwd`/verb results) is drawn only to the
+panel — only *keystrokes* were echoed to serial (`:: tegra: JD2 — KEY … ::`). So the durable bench record
+was keystrokes + driver markers + heal tally, and verbatim command output could not be captured over the
+serial bridge or replayed by mbench; card readout was the four-verb bench's bottleneck. JD11 closes the gap
+by mirroring command-output lines to serial too, making every future Orin bench self-documenting — a
+bench-infrastructure multiplier for the whole metal program, not just the panel.
+
+**Where the output already converges.** Every shell command result reaches the panel through exactly one
+sink: `Console::println` (shell.rs calls it for all output — `touch`/`write`/`ls`/`cat`/errno lines/etc.).
+JD11 mirrors *there*, so no per-command plumbing is needed and the mirror is complete by construction. A
+command that takes the whole screen (`gneiss`/vug) paints the framebuffer directly rather than via
+`println`, so it is honestly **not** mirrored — the mirror carries text command output only, not graphics.
+
+**Design — an inert, opt-in output sink (platform-neutral).** `Console` gains an
+`out_sink: Option<fn(&str)>` field (`None` on `new()`). `println` pushes the line to the panel history as
+before, then — *after* the history push, so a fault in the sink cannot lose the panel line — calls the sink
+if one is installed. On every non-tegra surface (x86 GUI, pi `render_service`, headless) the sink is unset,
+so `println` is byte-for-byte unchanged and no serial noise appears: **zero off-tegra behavioural change.**
+The serial-line FORMAT lives in the tegra caller, not in the shared `console.rs`: the tegra
+`jd2_console_pump` calls `console.set_output_sink(jd2_out_sink)` right after building the `Console` (before
+the shell-entry banner, so those lines head the transcript), and `jd2_out_sink` — a `cfg(feature = "tegra")`
+`fn(&str)` in `main.rs` — emits `:: tegra: JD2 — OUT | <line> ::`. Keeping the `tegra:` marker string in the
+tegra-gated caller (not the shared crate) means it compiles into the tegra kernel **alone**; the shared
+`console.rs` carries no `tegra:` literal.
+
+**Marker format + why.** The output marker deliberately shares the `:: tegra: JD2 — …` family with the
+keystroke marker (`… — KEY …`), so a single `awk '/:: tegra: JD2 —/' <log>` reconstructs the whole
+interleaved session — keys typed *and* output produced, in order. `OUT | <line>` carries the verbatim
+console line after the pipe. Ordering/locking: `jd2_out_sink` runs synchronously from `println` (called from
+`shell::dispatch_command` → `handle_key`), *after* the per-keystroke `KEY` line has already printed and
+released the UART; it only touches the serial UART (no re-entrancy into `Console`, no lock the caller holds),
+so there is no new lock ordering and no deadlock — output lines simply follow their triggering `KEY` line.
+
+**Gate (QEMU):** `./arroyo check` + `UNAOS_TEGRA=1 ./arroyo check` green both arches; `./arroyo test-arm 22`
+→ `MISSION SUCCESS`; `UNAOS_GICV3=1 ./arroyo test-arm 40` → CAPSTONE 6/6; `UNAOS_HUBSTORAGE=1 ./arroyo test
+25` → `MISSION SUCCESS` (shared `shell.rs`/`console.rs` guard); `esp-jetson kernel.elf` links
+(`540,184 B`), **109 `tegra:` strings** — up 1 from the JD10 baseline of 108. The single new occurrence is
+the `:: tegra: JD2 — OUT | {} ::` marker literal (`strings` splits it on the UTF-8 em-dash, so its
+`:: tegra: JD2 ` prefix is the counted `tegra:` fragment); the shared `console.rs` adds none. This is the
+first `tegra:`-count change since JD2 — validate media by count as before (109 tegra vs virt-clobber ≈ 0/1),
+not size. Zero x86 behavioural change (the sink is `None` off-tegra). As in JD2–JD10 the shell command path
+is not headless-reachable in-lane (dispatch is keystroke-driven; tegra never runs in QEMU), so the verdict
+is **attended-pending**.
+
+**Metal verdict — ⏳ ATTENDED-PENDING.** The payoff is itself a metal artifact: at the next attended Orin
+bench, every `ls`/`cat`/verb result appears on the serial log as `:: tegra: JD2 — OUT | … ::`, so the bench
+produces a durable, mbench-able output transcript for the first time (the round-9 bench could not). Bench
+card [`jd11-bench.md`](../../../../unaos/scripts/jd11-bench.md): run any output-producing command
+(`help`, `ls`, `cat <file>`) and confirm the panel text is reproduced verbatim on the serial capture,
+paired with its `KEY` lines. ⚠ Verify the serial bridge captures a full boot BEFORE burning bench time
+(§JB1f) — with JD11 the bridge is now the *primary* evidence channel for output, so a mid-bench freeze
+costs the transcript.
+
 ### JB1f — the unhealed early-vector window (the round-6 boot crash), closed (`85f74f8`)
 
 **The evidence (2026-07-11 attended bench, real Orin).** Kernel `446abd3` (the JD6 tip): 2/2 boots
