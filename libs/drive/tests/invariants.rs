@@ -203,6 +203,34 @@ fn i4_disarm_from_every_state() {
 }
 
 // ---------------------------------------------------------------------------
+// Fail-toward-safe: a misconfigured (out-of-range) mode-channel index must
+// classify as DISARM, never as an armed-capable state. (Seat-review fold: the
+// generic neutral-on-OOB channel read would classify as MANUAL.)
+// ---------------------------------------------------------------------------
+#[test]
+fn oob_mode_channel_fails_toward_disarm() {
+    let sink = MockSink::new();
+    let log = sink.clone();
+    let clk = FakeClock::new();
+    let cfg = Config {
+        mode_ch: NUM_CHANNELS + 3, // misconfigured: no such channel
+        ..Config::default()
+    };
+    let mut core = DriveCore::new(sink, clk.clone(), cfg);
+
+    // Valid frames with armed-capable stick values arrive; the unreadable mode
+    // channel must keep the core in DISARM — it can never arm.
+    for _ in 0..5 {
+        core.on_frame(&make_frame(&chans(AUTO_US, 1700, 1500)));
+        core.tick();
+        assert_eq!(core.state(), State::Disarm, "OOB mode channel must not arm");
+        assert!(!core.is_armed());
+        clk.advance(20);
+    }
+    assert!(log.always_neutral(1500), "nothing but neutral reached the sink");
+}
+
+// ---------------------------------------------------------------------------
 // I5 — deliberate arm: DISARM→armed requires throttle-at-neutral in the frame.
 // ---------------------------------------------------------------------------
 #[test]
@@ -230,6 +258,42 @@ fn i5_deliberate_arm_requires_throttle_neutral() {
     core2.on_frame(&make_frame(&chans(AUTO_US, 1500, 1500)));
     core2.tick();
     assert_eq!(core2.state(), State::Auto);
+}
+
+// ---------------------------------------------------------------------------
+// I5 (freshness) — arming off a frame older than the deadman window is refused
+// even with throttle at neutral. The deadman itself only runs while armed, so
+// this closes the stale-armed-tick window on the DISARM→armed edge.
+// (Seat-review fold: defense-in-depth for harness starvation.)
+// ---------------------------------------------------------------------------
+#[test]
+fn i5_stale_frame_cannot_arm() {
+    let (mut core, log, clk) = new_core();
+
+    // A perfectly armable frame (MANUAL, throttle neutral) at t=0 ...
+    core.on_frame(&make_frame(&chans(MANUAL_US, 1600, 1500)));
+
+    // ... but the first tick happens past the deadman window (t=501): refused.
+    clk.advance(501);
+    core.tick();
+    assert_eq!(core.state(), State::Disarm, "a stale frame must not arm");
+    assert!(!core.is_armed());
+    assert_eq!(core.last_output(), NEUTRAL);
+    assert!(log.always_neutral(1500), "the stale-arm attempt never actuated");
+
+    // A fresh frame at the same instant arms normally.
+    core.on_frame(&make_frame(&chans(MANUAL_US, 1600, 1500)));
+    core.tick();
+    assert!(core.is_armed(), "a fresh frame arms as usual");
+    assert_eq!(core.last_output().steering_us, 1600);
+
+    // Boundary: exactly deadman_ms old still counts as fresh (<=), matching the
+    // deadman's own strict `>` trip condition.
+    let (mut core2, _l2, clk2) = new_core();
+    core2.on_frame(&make_frame(&chans(MANUAL_US, 1600, 1500)));
+    clk2.advance(core2.config().deadman_ms);
+    core2.tick();
+    assert!(core2.is_armed(), "a frame exactly at the window edge still arms");
 }
 
 // ---------------------------------------------------------------------------
@@ -367,12 +431,34 @@ fn i8_auto_consumes_commands_and_caps() {
     assert_eq!(core.last_output().steering_us, 1550);
     assert!(core.last_output().throttle_us <= cfg.throttle_cap_us);
 
-    // Drain the queue, then AUTO holds neutral when the channel is empty.
+    // Drain the queue. EVERY armed output must respect the cap (I3 at the
+    // output boundary), and the over-cap command (throttle 2000) must be
+    // witnessed at the sink saturated to EXACTLY the cap — not merely absent.
+    let mut saw_exact_cap = false;
     while core.commands_queued() > 0 {
         clk.advance(20);
         core.on_frame(&make_frame(&chans(AUTO_US, 1500, 1500)));
         core.tick();
+        let out = core.last_output();
+        assert!(
+            out.throttle_us <= cfg.throttle_cap_us,
+            "AUTO drain emitted throttle {} above the cap",
+            out.throttle_us
+        );
+        if out.throttle_us == cfg.throttle_cap_us {
+            saw_exact_cap = true;
+        }
     }
+    assert!(
+        saw_exact_cap,
+        "the over-cap AUTO command (2000) must be witnessed clamped to exactly \
+         the cap ({}) at the sink",
+        cfg.throttle_cap_us
+    );
+    // No queued command was under the floor, so exact-cap outputs prove the
+    // 2000 µs request saturated; every other drained value sat in 1607..=1620.
+
+    // Then AUTO holds neutral when the channel is empty.
     clk.advance(20);
     core.on_frame(&make_frame(&chans(AUTO_US, 1500, 1500)));
     core.tick();

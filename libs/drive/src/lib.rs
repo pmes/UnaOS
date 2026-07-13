@@ -44,7 +44,8 @@
 //! - **I4 disarm-from-every-state** — a DISARM mode channel wins immediately,
 //!   from MANUAL, AUTO, and FAILSAFE, in the same tick it is seen.
 //! - **I5 deliberate arm** — DISARM→MANUAL/AUTO requires throttle-at-neutral in
-//!   the same frame; a boot-with-throttle-high must not drive.
+//!   the same frame, and that frame must be fresh (within the deadman window);
+//!   a boot-with-throttle-high must not drive, nor may a stale frame arm.
 //! - **I6 invalid-input-never-actuates** — an out-of-range frame (checksum
 //!   failures never even reach here) never touches the sink and does not refresh
 //!   the deadman; it counts toward it.
@@ -307,11 +308,13 @@ impl<S: ActuatorSink, C: Clock> DriveCore<S, C> {
         }
 
         // Mode transitions from the latest valid frame (I4 disarm-wins,
-        // I5 deliberate-arm).
+        // I5 deliberate-arm). The mode read fails toward DISARM on a
+        // misconfigured channel index, and arming additionally requires the
+        // frame to be fresh (within the deadman window).
         if let Some(ch) = self.latest {
-            let mode_us = self.channel(&ch, self.cfg.mode_ch);
+            let target = self.mode_state(&ch);
             let throttle_us = self.channel(&ch, self.cfg.throttle_ch);
-            self.apply_mode(mode_us, throttle_us);
+            self.apply_mode(target, throttle_us, now);
         }
 
         // Output. I1: exact neutral unless truly armed. I3: throttle cap applied
@@ -358,12 +361,25 @@ impl<S: ActuatorSink, C: Clock> DriveCore<S, C> {
 
     // --- internals ---------------------------------------------------------
 
-    /// Safe channel read: an out-of-range index (misconfiguration) reads as
-    /// neutral rather than panicking — a panic in the control loop is itself a
-    /// hazard.
+    /// Safe channel read for the *stick* channels: an out-of-range index
+    /// (misconfiguration) reads as neutral rather than panicking — a panic in
+    /// the control loop is itself a hazard. The MODE channel deliberately does
+    /// NOT use this (neutral classifies as MANUAL, an armed-capable state);
+    /// it goes through [`mode_state`](Self::mode_state), which fails to DISARM.
     #[inline]
     fn channel(&self, ch: &[u16; NUM_CHANNELS], idx: usize) -> u16 {
         ch.get(idx).copied().unwrap_or(self.cfg.neutral_us)
+    }
+
+    /// Fail-toward-safe mode read: an out-of-range mode-channel index (a
+    /// misconfigured [`Config::mode_ch`]) classifies as DISARM, never as an
+    /// armed-capable state.
+    #[inline]
+    fn mode_state(&self, ch: &[u16; NUM_CHANNELS]) -> State {
+        match ch.get(self.cfg.mode_ch) {
+            Some(&mode_us) => self.classify(mode_us),
+            None => State::Disarm,
+        }
     }
 
     #[inline]
@@ -397,8 +413,19 @@ impl<S: ActuatorSink, C: Clock> DriveCore<S, C> {
         throttle_us.abs_diff(self.cfg.neutral_us) <= self.cfg.arm_neutral_tol_us
     }
 
-    fn apply_mode(&mut self, mode_us: u16, throttle_us: u16) {
-        match self.classify(mode_us) {
+    /// `true` when the last accepted valid frame is fresh, i.e. within the
+    /// deadman window of `now`. Arming off a stale frame is refused (the deadman
+    /// itself only runs while armed, so this is the defense-in-depth guard for
+    /// the DISARM→armed edge).
+    fn frame_fresh(&self, now: u64) -> bool {
+        match self.last_valid_ms {
+            Some(t) => now.saturating_sub(t) <= self.cfg.deadman_ms,
+            None => false,
+        }
+    }
+
+    fn apply_mode(&mut self, target: State, throttle_us: u16, now: u64) {
+        match target {
             State::Disarm => {
                 // I4: DISARM wins immediately from any state and clears the latch.
                 self.state = State::Disarm;
@@ -410,11 +437,14 @@ impl<S: ActuatorSink, C: Clock> DriveCore<S, C> {
                     // Latched: a re-arm requires an explicit DISARM first (I2).
                     // Ignore arm requests until the operator disarms.
                 } else if self.state == State::Disarm {
-                    // I5: deliberate arm — throttle at neutral in THIS frame.
-                    if self.throttle_at_neutral(throttle_us) {
+                    // I5: deliberate arm — throttle at neutral in THIS frame,
+                    // and the frame itself must be fresh (within the deadman
+                    // window). A stale frame must not arm even at neutral.
+                    if self.frame_fresh(now) && self.throttle_at_neutral(throttle_us) {
                         self.state = target;
                     }
-                    // else: refuse; stay DISARM (boot-with-throttle-high case).
+                    // else: refuse; stay DISARM (boot-with-throttle-high case,
+                    // or a stale/frozen receiver feed).
                 } else {
                     // Already armed: MANUAL<->AUTO switching is unrestricted.
                     self.state = target;

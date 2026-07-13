@@ -40,7 +40,7 @@ interlock is considered silicon-confirmed.
 | **I2** | **Deadman** — more than 500 ms without a fresh *valid* frame while armed forces neutral and latches FAILSAFE; a late frame does not silently resume — a re-arm is required. | `i2_deadman_latches_failsafe_and_requires_rearm` | Transmitter off (or out of range) ⇒ wheels neutral within 500 ms and stay neutral until the operator disarms and re-arms. |
 | **I3** | **Throttle cap** — a saturating clamp applied at the output boundary, last, after everything else; no path emits throttle above the configured cap while armed. | `i3_throttle_cap_never_exceeded` | Throttle stick to full forward ⇒ the measured ESC pulse never exceeds the configured cap (scope the PWM line). |
 | **I4** | **Disarm from every state** — a DISARM mode channel wins immediately, from MANUAL, AUTO, and FAILSAFE, in the same tick it is seen. | `i4_disarm_from_every_state` | Flip the mode switch to DISARM at any moment, in any mode ⇒ wheels go neutral immediately. This is the estop. |
-| **I5** | **Deliberate arm** — DISARM→MANUAL/AUTO requires throttle at neutral in the same frame; a boot-with-throttle-high must not drive. | `i5_deliberate_arm_requires_throttle_neutral` | Power on / arm with the throttle stick not centred ⇒ the vehicle does not move; it arms only once the throttle is returned to neutral. |
+| **I5** | **Deliberate arm** — DISARM→MANUAL/AUTO requires throttle at neutral in the same frame, **and** the frame must be fresh (within the deadman window); a boot-with-throttle-high must not drive, and a stale/frozen receiver feed must not arm even at neutral. | `i5_deliberate_arm_requires_throttle_neutral`, `i5_stale_frame_cannot_arm` | Power on / arm with the throttle stick not centred ⇒ the vehicle does not move; it arms only once the throttle is returned to neutral. Attempting to arm off a stalled receiver feed ⇒ refused until frames flow again. |
 | **I6** | **Invalid input never actuates** — an out-of-range frame (checksum failures never even reach the core) never touches the sink and does not refresh the deadman; it counts toward it. | `i6_invalid_input_never_actuates_counts_deadman` | A receiver glitch / corrupt frame ⇒ no twitch on the actuators; sustained glitching ⇒ the deadman trips exactly as a signal loss would. |
 | **I7** | **Panic/drop ⇒ neutral** — the drive core's `Drop` forces the sink neutral on scope exit and on an unwinding panic; the kernel panic handler hooks the same `force_neutral` path. | `i7_drop_forces_neutral`, `i7_panic_unwind_forces_neutral` | A kernel panic or a killed drive service ⇒ the actuator is parked neutral, not left at its last commanded value. |
 | **I8** | **Bounded command channel** — AUTO commands queue in a fixed-capacity, drop-oldest ring; overflow never blocks the control tick. | `i8_command_channel_bounded_drop_oldest`, `i8_auto_consumes_commands_and_caps` | Autonomy flooding commands ⇒ the 20 ms control loop stays real-time; only a bounded backlog is ever held, and stale commands are dropped in favour of fresh ones. |
@@ -48,7 +48,9 @@ interlock is considered silicon-confirmed.
 A companion scenario test, `scenario_full_sink_trace`, drives the whole
 sequence — arm → drive → signal loss → deadman → re-arm — and asserts the exact
 ordered trace of setpoints the sink receives, so the interlocks are verified not
-only in isolation but composed.
+only in isolation but composed. A further fail-toward-safe test,
+`oob_mode_channel_fails_toward_disarm`, proves that a misconfigured
+(out-of-range) mode-channel index classifies as DISARM and can never arm.
 
 ## The kernel seam (I7)
 
