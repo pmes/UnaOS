@@ -20,6 +20,7 @@
 //! round-trips, and a mutated volume that re-mounts clean.
 
 use unafs::fs::FileSystemError;
+use unafs::inode::FileKind;
 use unafs::{AttributeValue, BLOCK_SIZE, BlockDevice, MemDevice, UnaFS};
 
 /// Format a fresh in-memory volume of `block_count` blocks.
@@ -170,6 +171,138 @@ fn unlink_free_space_round_trips_and_blocks_reuse() {
     // And the keeper still resolves and queries.
     assert_eq!(fs.resolve_path("/keeper.txt").unwrap(), keeper_id);
     assert_eq!(fs.query("tag == \"keep\"").unwrap().len(), 1);
+}
+
+// --- M2: rename -------------------------------------------------------------
+
+#[test]
+fn rename_same_directory_old_gone_new_found_content_identical() {
+    let mut fs = fresh_fs(5000);
+    let root_id = fs.superblock.root_inode;
+
+    let file_id = fs.create_file(root_id, "draft.txt".to_string()).unwrap();
+    fs.write_data(file_id, 0, b"the manuscript").unwrap();
+    fs.set_attribute(
+        file_id,
+        "state".to_string(),
+        AttributeValue::String("polished".to_string()),
+    )
+    .unwrap();
+    // A spilled attribute too — must survive the rename untouched.
+    let big: Vec<f32> = (0..100).map(|i| i as f32 * 0.25).collect();
+    fs.set_attribute(
+        file_id,
+        "embedding".to_string(),
+        AttributeValue::Vector(big.clone()),
+    )
+    .unwrap();
+
+    let free_before = fs.superblock.free_blocks;
+    fs.rename(root_id, "draft.txt", root_id, "final.txt")
+        .expect("rename failed");
+
+    // Old name ENOENT, new name found, same inode.
+    assert!(fs.resolve_path("/draft.txt").is_err());
+    assert_eq!(fs.resolve_path("/final.txt").unwrap(), file_id);
+
+    // Inode, data, and attributes untouched.
+    let inode = fs.read_inode(file_id).unwrap();
+    assert_eq!(fs.read_data(file_id, 0, inode.size).unwrap(), b"the manuscript");
+    assert_eq!(
+        fs.get_attribute(file_id, "state").unwrap(),
+        Some(AttributeValue::String("polished".to_string()))
+    );
+    assert_eq!(
+        fs.get_attribute(file_id, "embedding").unwrap(),
+        Some(AttributeValue::Vector(big))
+    );
+
+    // Catalog consistent: the query still returns exactly this inode.
+    let results = fs.query("state == \"polished\"").unwrap();
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].0.id, file_id);
+
+    // A pure rename allocates nothing net (directory rewrite nets to zero).
+    assert_eq!(fs.superblock.free_blocks, free_before);
+}
+
+#[test]
+fn rename_cross_directory_moves_the_entry() {
+    let mut fs = fresh_fs(5000);
+    let root_id = fs.superblock.root_inode;
+    let inbox_id = fs.mkdir(root_id, "inbox".to_string()).unwrap();
+    let archive_id = fs.mkdir(root_id, "archive".to_string()).unwrap();
+
+    let file_id = fs.create_file(inbox_id, "memo.txt".to_string()).unwrap();
+    fs.write_data(file_id, 0, b"move me").unwrap();
+    fs.set_attribute(
+        file_id,
+        "kind".to_string(),
+        AttributeValue::String("memo".to_string()),
+    )
+    .unwrap();
+
+    fs.rename(inbox_id, "memo.txt", archive_id, "memo-2026.txt")
+        .expect("cross-directory rename failed");
+
+    // Gone from the source, present in the destination.
+    assert!(fs.ls(inbox_id).unwrap().is_empty());
+    let dst = fs.ls(archive_id).unwrap();
+    assert_eq!(dst.len(), 1);
+    assert_eq!(dst[0].name, "memo-2026.txt");
+    assert_eq!(dst[0].inode_id, file_id);
+    assert_eq!(dst[0].kind, FileKind::File);
+
+    // Path resolution follows.
+    assert!(fs.resolve_path("/inbox/memo.txt").is_err());
+    assert_eq!(fs.resolve_path("/archive/memo-2026.txt").unwrap(), file_id);
+
+    // Content and query reach the same inode.
+    let inode = fs.read_inode(file_id).unwrap();
+    assert_eq!(fs.read_data(file_id, 0, inode.size).unwrap(), b"move me");
+    let results = fs.query("kind == \"memo\"").unwrap();
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].0.id, file_id);
+}
+
+#[test]
+fn rename_refusals_collision_loop_missing_noop() {
+    let mut fs = fresh_fs(5000);
+    let root_id = fs.superblock.root_inode;
+    let a_id = fs.mkdir(root_id, "a".to_string()).unwrap();
+    let b_id = fs.mkdir(a_id, "b".to_string()).unwrap();
+    fs.create_file(root_id, "x.txt".to_string()).unwrap();
+    fs.create_file(root_id, "y.txt".to_string()).unwrap();
+
+    // Existing destination name: refused, no implicit overwrite.
+    assert!(matches!(
+        fs.rename(root_id, "x.txt", root_id, "y.txt"),
+        Err(FileSystemError::FileExists)
+    ));
+
+    // Directory loop: /a into /a/b (its own descendant) and into itself.
+    assert!(matches!(
+        fs.rename(root_id, "a", b_id, "a-again"),
+        Err(FileSystemError::DirectoryLoop)
+    ));
+    assert!(matches!(
+        fs.rename(root_id, "a", a_id, "a-again"),
+        Err(FileSystemError::DirectoryLoop)
+    ));
+
+    // Missing source.
+    assert!(matches!(
+        fs.rename(root_id, "ghost.txt", root_id, "real.txt"),
+        Err(FileSystemError::NotFound)
+    ));
+
+    // Same-name same-dir rename is a no-op Ok.
+    fs.rename(root_id, "x.txt", root_id, "x.txt").unwrap();
+
+    // Nothing was disturbed by the refusals.
+    let names: Vec<String> = fs.ls(root_id).unwrap().into_iter().map(|e| e.name).collect();
+    assert_eq!(names, vec!["a", "x.txt", "y.txt"]);
+    assert_eq!(fs.resolve_path("/a/b").unwrap(), b_id);
 }
 
 #[test]

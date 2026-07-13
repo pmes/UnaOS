@@ -676,6 +676,119 @@ impl<D: BlockDevice> UnaFS<D> {
         Ok(inode_id)
     }
 
+    /// Rename `old_name` in `parent_id` to `new_name` in `new_parent_id` —
+    /// a same-directory rename when the parents match, a cross-directory
+    /// move otherwise. The inode, its data extents, and its attributes are
+    /// untouched: only directory entries change, and the attribute catalog
+    /// keys on inode id (names are not indexed), so the catalog is
+    /// consistent by construction — queries return the renamed file
+    /// unchanged. The format already models a move this way: directories
+    /// are independent serialized entry lists, and an entry simply switches
+    /// lists. No new format structure is invented.
+    ///
+    /// `new_name` must not already exist — this refuses with `FileExists`
+    /// rather than implicitly unlinking the target (a deliberate divergence
+    /// from POSIX rename's overwrite). Renaming an entry to its own name in
+    /// the same directory is a no-op `Ok`. Moving a DIRECTORY into itself
+    /// or one of its descendants is refused with `DirectoryLoop`: the tree
+    /// has no parent pointers, so a cycle would orphan the whole subtree.
+    ///
+    /// # Crash windows (no journal replay)
+    /// * Same-directory: one crash-ordered directory rewrite — old-or-new,
+    ///   never torn.
+    /// * Cross-directory: the entry leaves the source directory FIRST, then
+    ///   joins the destination. A power cut between the two leaves the file
+    ///   in NEITHER directory — the inode and its blocks are leaked (still
+    ///   allocated, still query-reachable via the catalog, unreachable by
+    ///   name). The reverse order was rejected deliberately: it would
+    ///   briefly give one inode TWO names, and unlinking either name would
+    ///   free blocks the other still references.
+    pub fn rename(
+        &mut self,
+        parent_id: u64,
+        old_name: &str,
+        new_parent_id: u64,
+        new_name: &str,
+    ) -> Result<(), FileSystemError> {
+        let same_dir = parent_id == new_parent_id;
+        if same_dir && old_name == new_name {
+            return Ok(());
+        }
+
+        let mut src_entries = self.ls(parent_id)?;
+        let pos = src_entries
+            .iter()
+            .position(|e| e.name == old_name)
+            .ok_or(FileSystemError::NotFound)?;
+        let moved = src_entries[pos].clone();
+
+        if same_dir {
+            if src_entries.iter().any(|e| e.name == new_name) {
+                return Err(FileSystemError::FileExists);
+            }
+        } else {
+            // `ls` also validates that the destination IS a directory.
+            let dst_entries = self.ls(new_parent_id)?;
+            if dst_entries.iter().any(|e| e.name == new_name) {
+                return Err(FileSystemError::FileExists);
+            }
+            if moved.kind == FileKind::Directory
+                && (moved.inode_id == new_parent_id
+                    || self.is_descendant_of(new_parent_id, moved.inode_id)?)
+            {
+                return Err(FileSystemError::DirectoryLoop);
+            }
+        }
+
+        self.journal.log(
+            &mut self.device,
+            JournalOp::BeginOp {
+                op_id: moved.inode_id,
+                desc: format!("Rename: {} -> {}", old_name, new_name),
+            },
+        )?;
+
+        if same_dir {
+            src_entries[pos].name = new_name.into();
+            src_entries.sort_by(|a, b| a.name.cmp(&b.name));
+            let data = crate::codec::serialize(&src_entries)?;
+            self.rewrite_data(parent_id, &data)?;
+        } else {
+            // Remove-then-add: see the crash-window note above.
+            src_entries.remove(pos);
+            let src_data = crate::codec::serialize(&src_entries)?;
+            self.rewrite_data(parent_id, &src_data)?;
+
+            let mut dst_entries = self.ls(new_parent_id)?;
+            dst_entries.push(DirEntry {
+                name: new_name.into(),
+                inode_id: moved.inode_id,
+                kind: moved.kind,
+            });
+            dst_entries.sort_by(|a, b| a.name.cmp(&b.name));
+            let dst_data = crate::codec::serialize(&dst_entries)?;
+            self.rewrite_data(new_parent_id, &dst_data)?;
+        }
+
+        self.journal.log(
+            &mut self.device,
+            JournalOp::EndOp {
+                op_id: moved.inode_id,
+            },
+        )?;
+
+        #[cfg(feature = "std")]
+        {
+            let msg = SMessage::FileEvent {
+                path: format!("inode:{}", moved.inode_id),
+                event: format!("Renamed:{}->{}", old_name, new_name),
+            };
+            let _ = self.publish("system/fs/change", msg);
+        }
+
+        Ok(())
+    }
+
     // --- QUERY ENGINE ---
 
     /// Semantic query engine. no_std-capable: the similarity path routes its
@@ -802,6 +915,24 @@ impl<D: BlockDevice> UnaFS<D> {
         self.write_inode(&inode)?;
         self.free_extents(&old_chunks)?;
         Ok(())
+    }
+
+    /// Depth-first walk: does directory `dir_id` live anywhere inside the
+    /// subtree rooted at `root_id`? Used by `rename` to refuse moving a
+    /// directory into itself or its descendants.
+    fn is_descendant_of(&mut self, dir_id: u64, root_id: u64) -> Result<bool, FileSystemError> {
+        let mut stack = alloc::vec![root_id];
+        while let Some(id) = stack.pop() {
+            for entry in self.ls(id)? {
+                if entry.kind == FileKind::Directory {
+                    if entry.inode_id == dir_id {
+                        return Ok(true);
+                    }
+                    stack.push(entry.inode_id);
+                }
+            }
+        }
+        Ok(false)
     }
 
     /// Rewrite the attribute catalog with every entry matching `pred`
