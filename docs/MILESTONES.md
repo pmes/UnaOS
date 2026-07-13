@@ -10,6 +10,34 @@ Legend: **✅ metal-confirmed** · **🔬 QEMU-green, metal pending** · dates I
 
 ---
 
+## unafs — BEFS-HARDEN (bound the on-disk parser against hostile/corrupt volumes) — 2026-07-13 🔬 `us-befs`
+
+**What it does:** closes the DoS class the K3 security-tier review confirmed (and the QSIM panel
+re-raised for the future in-kernel query path): every on-disk-derived length/count/offset in
+`libs/unafs` previously flowed into an allocation or loop untrusted, so a physically swapped or
+corrupted card could panic/OOM-abort the kernel at mount (`bitmap_blocks` → `with_capacity`),
+at `ls`/`read` (`inode.size` → capacity overflow; unchecked extent arithmetic), at query time
+(catalog/spilled-extent sizes), or inside bincode itself (a crafted `String`/`Vec<u8>` length
+prefix pre-allocates from the CLAIMED length before reading a byte — confirmed in bincode 2's
+`impl_alloc.rs`, an infallible `vec![0u8; len]`). Now: `Superblock::validate` bounds all geometry
+at the parse boundary (exact bitmap-size consistency, journal layout pinned to the WAL constants,
+in-bounds root/catalog ids, representable volume span); `SpaceMap::load` and `read_from_extents`
+allocate via `try_reserve` (graceful `Err::AllocRefused`); extent arithmetic is `checked_*` with
+past-volume targets rejected; hole fills are bounded bulk runs (not O(size) byte-push);
+`free_extents` clamps its walk to the volume; spilled-attribute extent sums are overflow-checked on
+the query and `get_attribute` paths; and the codec seam decodes under two byte budgets
+(`deserialize_block` 8 KiB for superblock/inode/journal-op; `deserialize` 64 MiB ceiling for
+extent-backed records). Validation only — zero format change; the public API is source-compatible
+(two additive error variants, one additive codec fn).
+
+**How it was tested:** 22 new hostile-volume fixtures (`libs/unafs/tests/hostile_volume.rs`) craft
+corrupt superblocks/inodes/extents/prefixes and assert graceful `Err` — never `#[should_panic]` —
+plus positive controls (pristine mount, sparse bulk-fill, decode-under-budget); `cargo test -p
+unafs` 64 green with the golden format KATs byte-identical; `no_std` check clean on the kernel
+target (`aarch64-unknown-none-softfloat`); `./arroyo check` green both arches; `kernel8-test`
+PASS-count byte-equivalent with the trusted K3 fixture still mounting `w=0x1ff`. Metal: none needed
+(host-native lib arc; the kernel consumes it unchanged).
+
 ## Pi 4 — UNAFS-K3 (BeFS-K3: kernel read-only mount of a native unafs volume) — 2026-07-12 ✅ `hw-pi4`
 
 **✅ METAL-CONFIRMED (2026-07-12 attended evening bench, real Pi 4, reflashed card with the unafs
