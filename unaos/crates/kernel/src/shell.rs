@@ -872,6 +872,7 @@ fn fs_head(console: &mut Console, arg: &str, n: u32) {
     let (mut off, mut lines) = (0u32, 0u32);
     let mut cur = String::new(); // the line under construction (rendered, per `render_text`'s rules)
     let mut buf: Vec<u8> = Vec::new();
+    let mut more = false; // does content remain AFTER the nth line? — drives the truncation note
     'outer: while off < size && off < HEAD_MAX && lines < n {
         buf.clear();
         if let Err(e) = fs.read_at(fc, size, off, &mut buf, WINDOW) {
@@ -880,14 +881,16 @@ fn fs_head(console: &mut Console, arg: &str, n: u32) {
         if buf.is_empty() {
             break; // chain ended before de.size (malformed) — show what we have, honestly
         }
-        off += buf.len() as u32;
-        for &b in &buf {
+        for (i, &b) in buf.iter().enumerate() {
             match b {
                 b'\n' => {
                     console.println(&cur);
                     cur.clear();
                     lines += 1;
                     if lines >= n {
+                        // More remains iff any byte follows this newline — in this window, or the
+                        // file continues past it. (`off` still holds this window's start here.)
+                        more = i + 1 < buf.len() || off + (buf.len() as u32) < size;
                         break 'outer;
                     }
                 }
@@ -896,14 +899,16 @@ fn fs_head(console: &mut Console, arg: &str, n: u32) {
                 _ => cur.push('.'),
             }
         }
+        off += buf.len() as u32;
     }
     // A final line with no trailing newline (we stopped before `n` full lines): print it.
     if lines < n && !cur.is_empty() {
         console.println(&cur);
         lines += 1;
     }
-    // Note if the file continues past what we showed (more lines, or the byte ceiling cut us off).
-    if off < size {
+    // Note when more lines exist than shown: content followed the nth line (`more`), or the byte
+    // ceiling cut a still-growing file before we reached `n` lines.
+    if more || (lines < n && off < size) {
         console.println(&alloc::format!("[... first {} line(s) shown]", lines));
     }
 }
@@ -947,10 +952,17 @@ fn fs_tail(console: &mut Console, arg: &str, n: u32) {
     if text.ends_with('\n') {
         lines.pop();
     }
-    // A window that began mid-file cuts the first line — drop that partial line and note the bound.
+    // A window that began mid-file usually cuts its first line — but not if it happens to start on a
+    // line boundary. Decide precisely: the first line is a partial iff the byte just before `start`
+    // is not a newline (one extra byte read; only when windowed, so essentially never in practice).
     let windowed = start > 0;
-    if windowed && !lines.is_empty() {
-        lines.remove(0);
+    if windowed {
+        let mut probe: Vec<u8> = Vec::new();
+        let cut = fs.read_at(fc, size, start - 1, &mut probe, 1).is_err()
+            || probe.first() != Some(&b'\n');
+        if cut && !lines.is_empty() {
+            lines.remove(0);
+        }
     }
     let from = lines.len().saturating_sub(n as usize);
     if windowed {
