@@ -33,8 +33,9 @@ The crate root (`lib.rs`) re-exports the primary surface:
 - **`UnaFS<D: BlockDevice>`** (`fs.rs`) — the filesystem itself, generic over a
   storage backend. Lifecycle: `format(device, size_mb)` and `mount(device)`.
   Operations include `mkdir`, `create_file`, `ls`, `resolve_path`, `read_data`,
-  `write_data`, `set_attribute` / `get_attribute`, and `query`. The convenience
-  alias `FileSystem = UnaFS<FileDevice>` binds it to a host file.
+  `write_data`, `set_attribute` / `get_attribute` / `remove_attribute`,
+  `unlink`, `rename`, and `query`. The convenience alias
+  `FileSystem = UnaFS<FileDevice>` binds it to a host file.
 - **`BlockDevice`** (`storage.rs`) — the trait every backend implements
   (`read_block`, `write_block`, `block_count`, `flush`), with `BLOCK_SIZE` of
   4096 bytes. Two backends ship: `FileDevice` (host file) and `MemDevice`
@@ -70,13 +71,34 @@ surfaced to other handlers through Bandy (`SMessage` / `Synapse`).
 ## Status
 
 Implemented and functional as a host-native library: format, mount, directory
-and file operations, journaled writes, inline and spilled attributes, and the
-attribute/similarity query engine all work over `FileDevice` and `MemDevice`.
-Some areas are early-stage: journal recovery currently detects and reports a
-dirty mount rather than rolling transactions back, and the attribute catalog is
-append-only. The crate runs as an ordinary host process today and is converging
+and file operations, journaled writes, inline and spilled attributes, the
+mutation set (`unlink`, `rename`, `remove_attribute` — each with full
+attribute-catalog cleanup, so a deleted file or attribute can never be
+returned by a query), and the attribute/similarity query engine all work over
+`FileDevice` and `MemDevice`. Some areas are early-stage: journal recovery
+currently detects and reports a dirty mount rather than rolling transactions
+back, and the attribute catalog is append-only on `set_attribute` (mutations
+scrub it). The crate runs as an ordinary host process today and is converging
 onto the UnaOS kernel: the **`no_std` core port (BeFS-K1) has landed** (see
 below).
+
+### Mutation crash windows (honest note — no journal replay yet)
+
+The mutation operations are crash-**ordered**, not crash-**atomic**. There is
+no journal replay: the WAL detects a torn operation on the next mount and
+reports a dirty volume, but nothing rolls it back. Every mutation is therefore
+sequenced so that no intermediate on-disk state ever references a freed block
+— catalog and directory rewrites go new-extents-first with a single-block
+inode swap last (each rewrite is old-or-new, never torn), and block frees come
+last of all. The failure mode of an ill-timed power cut is a **leak**
+(allocated-but-unreachable blocks, plus in one cross-directory `rename` window
+a file reachable by query but by no name), never a dangling reference and
+never a torn structure. Leaked blocks are reclaimable only by a future
+fsck/scavenger or journal-replay arc (F1). The concrete per-operation windows
+are documented on `unlink`, `rename`, and `remove_attribute` in `fs.rs`.
+Open-handle semantics are equally honest: there is no open-file table, so a
+caller that keeps a raw inode id across `unlink` touches freed (possibly
+reallocated) blocks — the caller's problem, by design.
 
 ## no_std and the feature matrix
 
@@ -93,6 +115,9 @@ depend on it with `default-features = false`.
 | `adapter` (512↔4096 `BlockAdapter` over `SectorDevice`; GPT/MBR parse; `MemSectorDevice`) | ✅ | ✅ |
 | `UnaFS` core ops (`format`/`mount`/`read`/`write`/`ls`/`mkdir`/`set_attribute`/`get_attribute`) | ✅ | ✅ |
 | `query` engine (`Query` parsing, `UnaFS::query`, `cosine_similarity`) | ✅ | ✅ |
+| Mutations: `unlink` (full catalog scrub + extent frees) | ✅ | ✅ |
+| Mutations: `rename` (same-dir and cross-dir; refuses overwrite and directory loops) | ✅ | ✅ |
+| Mutations: `remove_attribute` (inline and spilled; index entries scrubbed) | ✅ | ✅ |
 | `FileDevice` (host file backend) | ✅ | — |
 | `io::MappedFile` (memmap reader) | ✅ | — |
 | bandy `BandyMember` events on attribute change | ✅ | — |
@@ -172,10 +197,9 @@ address:
 - The attribute catalog is a flat, hash-bucketed list, (de)serialized whole:
   every non-equality query scans it, and **every `set_attribute` rewrites the
   entire catalog** — O(n), a scaling cliff rather than an index.
-- Journal recovery is **detect-only** (reports a dirty mount; no rollback).
-- There is **no `unlink`/`rename`/`remove_attribute`** yet; once deletion
-  exists, stale catalog entries would break queries — the index arc fixes
-  both together.
+- Journal recovery is **detect-only** (reports a dirty mount; no rollback) —
+  mutations are crash-ordered (leak-not-dangle), not crash-atomic (see the
+  crash-window note above).
 - Directories are flat serialized vectors; no checksums anywhere; extents are
   a flat inline list (large-file depth limit).
 
@@ -184,7 +208,7 @@ Planned arcs (sequencing in [`docs/ROADMAP.md`](../../docs/ROADMAP.md) §2):
 | Arc | Content |
 | :--- | :--- |
 | F1 | Journal rollback/replay on dirty mount |
-| F2 | `unlink` / `rename` / `remove_attribute` + catalog removal |
+| F2 | `unlink` / `rename` / `remove_attribute` + catalog removal — **✅ landed** (crash-ordered, no replay; see the crash-window note) |
 | F3 | Generic on-disk B+tree (shared by indexes and directories, as BeFS did) |
 | F4 | Per-attribute B+tree indexes: log-time equality, true range queries |
 | F5 | **Live queries** — delta-emitting persistent queries published over bandy (the query-driven spatial UI, now including similarity) |
