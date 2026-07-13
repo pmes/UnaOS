@@ -58,6 +58,12 @@ REQUIRE K2-liveenf:.*rebuild\+enforce PASS
 # --- (real Pi 4, kernel a834b8f); promoted from ledger to a hard REQUIRE at that capture. -----
 REQUIRE K3-revoke:.*durable-first PASS
 
+# --- UNAFS-K3 RO kernel mount witness (uncounted): the native unafs volume is located by magic,
+# --- superblock mounted RO, ls/cat byte-verified against the staged fixture [w=0x1ff]. The BeFS
+# --- storage chain reaches silicon (K1/K2 ACL + K3 mount). METAL-CONFIRMED 2026-07-12 (real Pi 4,
+# --- x5 boots, kernel 1ccd00c) -> promoted to a hard REQUIRE at that capture. ------------------
+REQUIRE K3-mount:.*byte-verified PASS
+
 # --- K4-ready native-attr projection codec witness (uncounted). Pure in-RAM codec/selftest
 # --- (runs every boot, no card needed) — METAL-CONFIRMED present 2026-07-12, now REQUIRE. -----
 REQUIRE K4-ready:.*prefix\) PASS
