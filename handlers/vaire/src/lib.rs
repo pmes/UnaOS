@@ -463,4 +463,20 @@ mod tests {
         let after = fs::read(&vault).expect("still exists");
         assert_eq!(after, garbage, "probe must not touch vault bytes");
     }
+
+    #[test]
+    fn detached_head_reports_red() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        init_repo(dir.path(), "a.txt", "hello\n");
+        let out = Command::new("git")
+            .args(["checkout", "-q", "--detach"])
+            .current_dir(dir.path())
+            .output()
+            .expect("git must be available");
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+
+        let status = Vaire::look_at(dir.path()).expect("look must succeed");
+        assert_eq!(status.branch, "DETACHED");
+        assert_eq!(CrystalColor::from_git(&status), CrystalColor::Red);
+    }
 }
