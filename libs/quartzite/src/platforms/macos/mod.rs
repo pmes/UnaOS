@@ -16,6 +16,7 @@ use objc2_app_kit::{
 use objc2_foundation::{MainThreadMarker, NSObjectProtocol};
 use std::cell::RefCell;
 
+pub mod gpu_view;
 pub mod image_view;
 pub mod meter;
 pub mod spline;
