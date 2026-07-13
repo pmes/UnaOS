@@ -1196,6 +1196,10 @@ pub fn service_net() {
     // post-guard discipline as SOCK-1's — its pump short-locks NET_DEVICE per ring op.
     #[cfg(all(feature = "smolnet", target_arch = "x86_64"))]
     crate::smolnet::witness_tick2();
+    // SOCK-3 (knob-on): the smoltcp persistent-socket TCP round-trip witness. Same one-shot,
+    // post-guard discipline — its connect/recv pumps short-lock NET_DEVICE per ring op.
+    #[cfg(all(feature = "smolnet", target_arch = "x86_64"))]
+    crate::smolnet::witness_tick3();
 }
 
 /// Outcome of a blocking [`ping`] (rendered by the `ping` shell command).

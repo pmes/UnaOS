@@ -37,11 +37,11 @@ use core::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, Ordering};
 
 use smoltcp::iface::{Config, Interface, SocketHandle, SocketSet, SocketStorage};
 use smoltcp::phy::{Device, DeviceCapabilities, Medium, RxToken, TxToken};
-use smoltcp::socket::{icmp, udp};
+use smoltcp::socket::{icmp, tcp, udp};
 use smoltcp::time::Instant;
 use smoltcp::wire::{
     EthernetAddress, HardwareAddress, Icmpv4Packet, Icmpv4Repr, IpAddress, IpCidr, IpEndpoint,
-    Ipv4Address,
+    IpListenEndpoint, Ipv4Address,
 };
 use spin::Mutex as SpinMutex;
 
@@ -357,7 +357,9 @@ const DNS_QUERY: &[u8] = &[
     0x00, 0x01, // QCLASS = IN
 ];
 
-/// Number of concurrent UDP sockets the persistent set holds (process-scoped caps).
+/// Number of concurrent sockets the persistent set holds (process-scoped caps). A slot
+/// backs EITHER a UDP or a TCP socket (never both at once — SOCK-3 shares the id space so
+/// the handle value word's socket-id maps to one registry, one generation counter).
 const NSOCK: usize = 4;
 /// Per-socket packet-buffer capacities (datagrams / payload bytes). A DNS reply is
 /// well under 512 B; 1 KiB payload + 8 packets is ample headroom.
@@ -365,12 +367,27 @@ const UDP_PKTS: usize = 8;
 const UDP_BUF: usize = 1024;
 /// Largest datagram payload a `sys_sendto`/`sys_recvfrom` moves (bounds the user copy).
 pub const UDP_MAX_PAYLOAD: usize = UDP_BUF;
+/// SOCK-3: per-TCP-socket stream ring-buffer capacity (rx / tx), all BSS. 2 KiB each is a
+/// modest window that comfortably carries the witness exchange and a small request/response;
+/// the id space is shared with UDP so only a slot in one role at a time consumes a role's buffers.
+const TCP_BUF: usize = 2048;
+/// Largest stream chunk a single `sys_send`/`sys_recv` moves (bounds the user copy per call —
+/// a stream is resumable, so ring 3 loops for more).
+pub const TCP_MAX_CHUNK: usize = TCP_BUF;
 /// Bounded poll-pump budgets (iteration-bounded to stay clock-free; a slirp reply lands
 /// in a handful of iterations, so these only cap how long an unreachable peer stalls the
 /// IF-masked caller — never a hang). `send` just needs to kick ARP + egress; `recv`
 /// pumps long enough to complete ARP → egress → reply capture in one call.
 const SEND_PUMP: i64 = 20_000;
 const RECV_PUMP: i64 = 400_000;
+/// SOCK-3 TCP pump budgets. A single `sys_connect` call pumps up to `CONNECT_PUMP` chasing the
+/// 3-way handshake (multi-RTT, but slirp's RTT is microseconds), returning `-EINPROGRESS` if the
+/// SYN-ACK has not landed yet so a ring-3 poll loop can re-drive it. `recv`/`send` reuse the UDP
+/// budgets' spirit. Every TCP pump releases the `STACK` lock BETWEEN chunks (see `tcp_pump_chunked`).
+const CONNECT_PUMP: i64 = 400_000;
+/// The chunk size a lock-released TCP pump advances before dropping + re-acquiring `STACK` — short
+/// enough that a concurrent socket syscall on another CPU never spins on `STACK.lock()` for a full pump.
+const TCP_CHUNK: i64 = 4_000;
 
 // --- static socket-set + per-socket packet-buffer storage (all BSS, `&'static mut`) ---
 static mut SOCK_SET_STORAGE: [SocketStorage<'static>; NSOCK] = [SocketStorage::EMPTY; NSOCK];
@@ -380,10 +397,30 @@ static mut UDP_RX_DATA: [[u8; UDP_BUF]; NSOCK] = [[0u8; UDP_BUF]; NSOCK];
 static mut UDP_TX_META: [[udp::PacketMetadata; UDP_PKTS]; NSOCK] =
     [[udp::PacketMetadata::EMPTY; UDP_PKTS]; NSOCK];
 static mut UDP_TX_DATA: [[u8; UDP_BUF]; NSOCK] = [[0u8; UDP_BUF]; NSOCK];
+/// SOCK-3: per-slot TCP stream ring buffers (BSS, borrowed `&'static mut` exactly once when a
+/// TCP socket is built into free slot `sid`, released back when it is removed).
+static mut TCP_RX_DATA: [[u8; TCP_BUF]; NSOCK] = [[0u8; TCP_BUF]; NSOCK];
+static mut TCP_TX_DATA: [[u8; TCP_BUF]; NSOCK] = [[0u8; TCP_BUF]; NSOCK];
+
+/// SOCK-3: per-slot GENERATION counter — the recycled-slot fence carried into the socket handle's
+/// value word `(gen << 32) | (sid + 1)` (the U11x file-id discipline). Bumped every time a slot is
+/// freed (`stack_close` / `free_row_sockets`), so a stale handle carrying an OLD gen fails
+/// `socket_desc_validate` after the slot is first-fit-reused by a different socket — no rebind. This
+/// is the SOCK-2-review REQUIRED fold: it makes a transferable socket (a future `SYS_CAP`/`SYS_XFER`
+/// arc) safe by construction, and closes the UAF the moment a socket outlives its registry slot.
+static SOCK_GEN: [AtomicU32; NSOCK] = [const { AtomicU32::new(0) }; NSOCK];
 
 /// Monotonic millisecond clock fed to `iface.poll` — bumped per poll across ALL callers
 /// so smoltcp's neighbor/ARP timers advance consistently. Iteration-driven, clock-free.
 static POLL_CLOCK: AtomicI64 = AtomicI64::new(1);
+
+/// Which transport a registry slot backs. A UDP handle handed to a stream syscall (or vice versa)
+/// is rejected on this tag BEFORE any `get_mut::<T>` (smoltcp's typed accessor PANICS on a mismatch).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SockKind {
+    Udp,
+    Tcp,
+}
 
 /// The persistent stack singleton. Its fields (incl. the 3 KiB device RX/TX scratch)
 /// live in BSS via this static, so nothing large sits on the caller's stack.
@@ -391,8 +428,8 @@ struct SmolStack {
     iface: Interface,
     sockets: SocketSet<'static>,
     dev: E1000Phy,
-    /// socket-id (index) → (smoltcp handle, owning HANDLES row). `None` = free slot.
-    reg: [Option<(SocketHandle, usize)>; NSOCK],
+    /// socket-id (index) → (smoltcp handle, owning HANDLES row, transport kind). `None` = free slot.
+    reg: [Option<(SocketHandle, usize, SockKind)>; NSOCK],
 }
 
 static STACK: SpinMutex<Option<SmolStack>> = SpinMutex::new(None);
@@ -501,7 +538,7 @@ pub fn stack_open(owner: usize) -> Option<usize> {
         udp::PacketBuffer::new(tx_meta, tx_data),
     );
     let handle = stack.sockets.add(socket);
-    stack.reg[sid] = Some((handle, owner));
+    stack.reg[sid] = Some((handle, owner, SockKind::Udp));
     Some(sid)
 }
 
@@ -510,7 +547,10 @@ pub fn stack_open(owner: usize) -> Option<usize> {
 pub fn stack_bind(sid: usize, port: u16) -> Result<(), ()> {
     let mut g = STACK.lock();
     let stack = g.as_mut().ok_or(())?;
-    let (handle, _) = *stack.reg.get(sid).and_then(|s| s.as_ref()).ok_or(())?;
+    let (handle, _, kind) = *stack.reg.get(sid).and_then(|s| s.as_ref()).ok_or(())?;
+    if kind != SockKind::Udp {
+        return Err(()); // a TCP handle routed to sys_bind — reject before the typed accessor panics
+    }
     stack.sockets.get_mut::<udp::Socket>(handle).bind(port).map_err(|_| ())
 }
 
@@ -520,7 +560,10 @@ pub fn stack_bind(sid: usize, port: u16) -> Result<(), ()> {
 pub fn stack_sendto(sid: usize, ip: [u8; 4], port: u16, payload: &[u8]) -> Result<usize, ()> {
     let mut g = STACK.lock();
     let stack = g.as_mut().ok_or(())?;
-    let (handle, _) = *stack.reg.get(sid).and_then(|s| s.as_ref()).ok_or(())?;
+    let (handle, _, kind) = *stack.reg.get(sid).and_then(|s| s.as_ref()).ok_or(())?;
+    if kind != SockKind::Udp {
+        return Err(()); // a TCP handle routed to sys_sendto — reject before the typed accessor panics
+    }
     let ep = IpEndpoint::new(IpAddress::v4(ip[0], ip[1], ip[2], ip[3]), port);
     {
         let sock = stack.sockets.get_mut::<udp::Socket>(handle);
@@ -540,7 +583,10 @@ pub fn stack_sendto(sid: usize, ip: [u8; 4], port: u16, payload: &[u8]) -> Resul
 pub fn stack_recvfrom(sid: usize, out: &mut [u8]) -> Option<([u8; 4], u16, usize)> {
     let mut g = STACK.lock();
     let stack = g.as_mut()?;
-    let (handle, _) = *stack.reg.get(sid).and_then(|s| s.as_ref())?;
+    let (handle, _, kind) = *stack.reg.get(sid).and_then(|s| s.as_ref())?;
+    if kind != SockKind::Udp {
+        return None; // a TCP handle routed to sys_recvfrom — reject before the typed accessor panics
+    }
     // Pump in chunks, checking for a delivered datagram between chunks so a fast reply
     // returns promptly without burning the whole budget.
     let mut spent = 0i64;
@@ -565,9 +611,14 @@ pub fn stack_recvfrom(sid: usize, out: &mut [u8]) -> Option<([u8; 4], u16, usize
 pub fn stack_close(sid: usize) {
     let mut g = STACK.lock();
     let Some(stack) = g.as_mut() else { return };
-    if let Some(Some((handle, _))) = stack.reg.get(sid).copied() {
+    if let Some(Some((handle, _, _))) = stack.reg.get(sid).copied() {
         stack.sockets.remove(handle);
         stack.reg[sid] = None;
+        // SOCK-3: bump the slot generation so a stale handle carrying the old (gen, sid) fails
+        // `socket_desc_validate` after this slot is first-fit-reused (no rebind — the U11x fence).
+        if sid < NSOCK {
+            SOCK_GEN[sid].fetch_add(1, Ordering::AcqRel);
+        }
     }
 }
 
@@ -578,13 +629,266 @@ pub fn free_row_sockets(row: usize) {
     let mut g = STACK.lock();
     let Some(stack) = g.as_mut() else { return };
     for sid in 0..NSOCK {
-        if let Some((handle, owner)) = stack.reg[sid] {
+        if let Some((handle, owner, _)) = stack.reg[sid] {
             if owner == row {
                 stack.sockets.remove(handle);
                 stack.reg[sid] = None;
+                // SOCK-3: bump the generation on teardown too, so a recycled slot never hands its
+                // next tenant a stale-gen socket-id a lingering handle could rebind to.
+                SOCK_GEN[sid].fetch_add(1, Ordering::AcqRel);
             }
         }
     }
+}
+
+// =============================================================================
+// SOCK-3 (ROADMAP §1b): TCP CLIENT sockets over the SAME persistent stack.
+//
+// A TCP socket rides the existing `STACK` singleton + `reg` (kind-tagged `Tcp`), with its own static
+// stream ring buffers (`TCP_RX_DATA`/`TCP_TX_DATA`, BSS). The three stream syscalls funnel here:
+//
+//  * `stack_connect` — the ACTIVE open. NON-BLOCKING with a ring-3 poll model: the FIRST call (state
+//    Closed) issues the SYN and pumps a bounded loop chasing the 3-way handshake; if the SYN-ACK lands
+//    it returns `Established`, else `InProgress`. A ring-3 caller re-invokes `sys_connect` on
+//    `-EINPROGRESS`; the re-call sees state SynSent, SKIPS re-issuing the SYN (idempotent), and pumps
+//    more. Slirp's RTT is microseconds, so the handshake almost always completes inside the first call
+//    — but the poll model means the IF-masked handler NEVER blocks on a slow/lossy peer.
+//  * `stack_send` — enqueue into the tx ring (once `may_send`) + a short bounded egress pump.
+//  * `stack_recv` — a bounded poll pump returning the first stream bytes, `WouldBlock` (`-EAGAIN`) if
+//    none yet, or `Eof` (a clean `0`) once the peer's FIN is delivered and the rx ring is drained.
+//
+// EVERY TCP pump releases the `STACK` lock BETWEEN chunks (`tcp_pump_chunked`) — the SOCK-2-review
+// REQUIRED fold: another CPU's socket syscall never spins on `STACK.lock()` for a whole ~400k-iter
+// pump. A chunk re-acquires the lock and re-validates the reg slot, so a concurrent teardown is seen
+// as the connection vanishing (returned as `Refused`/`Eof`), never a use-after-free.
+// =============================================================================
+
+/// The current generation of registry slot `sid` — packed into a freshly-minted socket handle's value
+/// word `(gen << 32) | (sid + 1)` at `sys_socket` time (the U11x file-id discipline). A mint reads the
+/// gen the socket is about to live under (no free can intervene between `stack_open*` and this read on
+/// the minting task). `0` for an out-of-range id.
+pub fn sock_gen(sid: usize) -> u32 {
+    if sid >= NSOCK {
+        return 0;
+    }
+    SOCK_GEN[sid].load(Ordering::Acquire)
+}
+
+/// Validate a decoded `(sid, gen)` against the LIVE registry under the `STACK` lock: the slot must be
+/// present, OWNED by `row`, and its CURRENT generation must equal the handle's packed `gen`. `true` =
+/// a live descriptor this caller owns; `false` = stale (freed+reused since the handle was minted),
+/// foreign, or free → the syscall maps that to `-EACCES`. This is the recycled-slot fence the SOCK-2
+/// review made REQUIRED before any socket becomes transferable (mirrors `file_desc_validate`'s gen check).
+pub fn sock_valid(row: usize, sid: usize, generation: u32) -> bool {
+    if sid >= NSOCK {
+        return false;
+    }
+    let g = STACK.lock();
+    let Some(stack) = g.as_ref() else { return false };
+    match stack.reg[sid] {
+        Some((_, owner, _)) => owner == row && SOCK_GEN[sid].load(Ordering::Acquire) == generation,
+        None => false,
+    }
+}
+
+/// SOCK-3: rotating ephemeral local port for active opens (49152..=65535, the IANA dynamic range),
+/// so back-to-back connects on a reused slot never collide in smoltcp's TIME_WAIT.
+static TCP_EPHEMERAL: AtomicU32 = AtomicU32::new(49152);
+fn next_ephemeral() -> u16 {
+    let p = TCP_EPHEMERAL.fetch_add(1, Ordering::Relaxed);
+    (49152 + (p % (65535 - 49152 + 1))) as u16
+}
+
+/// The outcome of a bounded `stack_connect` pump.
+pub enum ConnectOutcome {
+    /// The 3-way handshake completed — the socket is ESTABLISHED (ring 3: return 0).
+    Established,
+    /// Still SYN-SENT at budget exhaustion — the caller re-drives `sys_connect` (ring 3: `-EINPROGRESS`).
+    InProgress,
+    /// The peer refused / reset, or the socket/stack is gone / wrong-kind (ring 3: `-ECONNREFUSED`).
+    Refused,
+}
+
+/// The outcome of a bounded `stack_recv` pump.
+pub enum RecvOutcome {
+    /// `n` stream bytes were copied into the caller's buffer (ring 3: the byte count).
+    Data(usize),
+    /// No bytes yet, connection still open (ring 3: `-EAGAIN`).
+    WouldBlock,
+    /// The peer closed its send half (FIN) and the rx ring is drained, or the connection is gone
+    /// (ring 3: a clean `0` — end of stream).
+    Eof,
+}
+
+/// Allocate a TCP socket in the persistent set, owned by HANDLES row `owner`. Builds the socket from
+/// the free slot's STATIC stream buffers (`TCP_RX_DATA`/`TCP_TX_DATA[sid]`) and records the handle
+/// kind-tagged `Tcp`. Returns the socket-id (the `reg` index) or `None` if all slots are in use / no NIC.
+pub fn stack_open_tcp(owner: usize) -> Option<usize> {
+    let mut g = STACK.lock();
+    if !ensure_stack(&mut g) {
+        return None;
+    }
+    let stack = g.as_mut().unwrap();
+    let sid = stack.reg.iter().position(|s| s.is_none())?;
+    // SAFETY: `sid` is a free `reg` slot, so its two TCP stream buffers are not borrowed by any live
+    // socket; borrow them `&'static mut` disjointly (distinct statics, distinct index) to build the
+    // socket, which then OWNS the borrows until it is removed. `addr_of_mut!(STATIC[sid])` names the
+    // element as a PLACE (no intermediate reference), then `from_raw_parts_mut` re-forms the slice —
+    // the SOCK-2 `stack_open` discipline (no autoref through a raw deref).
+    let (rx_data, tx_data): (&'static mut [u8], &'static mut [u8]) = unsafe {
+        (
+            core::slice::from_raw_parts_mut(
+                core::ptr::addr_of_mut!(TCP_RX_DATA[sid]) as *mut u8,
+                TCP_BUF,
+            ),
+            core::slice::from_raw_parts_mut(
+                core::ptr::addr_of_mut!(TCP_TX_DATA[sid]) as *mut u8,
+                TCP_BUF,
+            ),
+        )
+    };
+    let socket = tcp::Socket::new(tcp::SocketBuffer::new(rx_data), tcp::SocketBuffer::new(tx_data));
+    let handle = stack.sockets.add(socket);
+    stack.reg[sid] = Some((handle, owner, SockKind::Tcp));
+    Some(sid)
+}
+
+/// Look up a TCP registry slot: the handle iff `sid` is present AND kind-tagged `Tcp`. `None` = free /
+/// wrong-kind (a UDP handle routed to a stream syscall — rejected before smoltcp's typed accessor panics).
+fn tcp_handle(stack: &SmolStack, sid: usize) -> Option<SocketHandle> {
+    match stack.reg.get(sid).and_then(|s| s.as_ref()) {
+        Some((h, _, SockKind::Tcp)) => Some(*h),
+        _ => None,
+    }
+}
+
+/// Pump the persistent interface for `budget` iterations, RELEASING the `STACK` lock between
+/// `TCP_CHUNK`-sized chunks (the SOCK-2-review fold: no cross-CPU busy-wait on `STACK.lock()` for a
+/// full pump). `check` runs under the lock after each chunk with the TCP socket; returning
+/// `Some(outcome)` stops early. Re-validates the reg slot each chunk — if the socket vanished
+/// (concurrent teardown), returns `on_gone`.
+fn tcp_pump_chunked<T>(
+    sid: usize,
+    budget: i64,
+    on_gone: T,
+    mut check: impl FnMut(&mut tcp::Socket) -> Option<T>,
+) -> Option<T> {
+    let mut spent = 0i64;
+    while spent < budget {
+        let mut g = STACK.lock();
+        let Some(stack) = g.as_mut() else { return Some(on_gone) };
+        let Some(handle) = tcp_handle(stack, sid) else { return Some(on_gone) };
+        {
+            let SmolStack { iface, sockets, dev, .. } = stack;
+            for _ in 0..TCP_CHUNK {
+                let now = POLL_CLOCK.fetch_add(1, Ordering::Relaxed);
+                iface.poll(Instant::from_millis(now), dev, sockets);
+            }
+            if let Some(out) = check(sockets.get_mut::<tcp::Socket>(handle)) {
+                return Some(out);
+            }
+        }
+        drop(g); // release BETWEEN chunks so another CPU's socket syscall can make progress
+        spent += TCP_CHUNK;
+    }
+    None
+}
+
+/// Active-open TCP socket `sid` to `ip:port`. NON-BLOCKING (ring-3 poll model): issues the SYN if the
+/// socket is Closed (idempotent — a re-call while SYN-SENT just pumps), then pumps a bounded loop
+/// (lock-released chunks) chasing the handshake. Returns `Established` / `InProgress` / `Refused`.
+pub fn stack_connect(sid: usize, ip: [u8; 4], port: u16) -> ConnectOutcome {
+    // (1) Issue the SYN under the lock, but ONLY from state Closed (so a poll re-call is a no-op open).
+    {
+        let mut g = STACK.lock();
+        let Some(stack) = g.as_mut() else { return ConnectOutcome::Refused };
+        let Some(handle) = tcp_handle(stack, sid) else { return ConnectOutcome::Refused };
+        let local = next_ephemeral();
+        let SmolStack { iface, sockets, .. } = stack;
+        let sock = sockets.get_mut::<tcp::Socket>(handle);
+        if !sock.is_open() {
+            // state Closed (fresh, or a prior connection that closed) — issue the active open.
+            let remote = IpEndpoint::new(IpAddress::v4(ip[0], ip[1], ip[2], ip[3]), port);
+            let le = IpListenEndpoint { addr: None, port: local };
+            if sock.connect(iface.context(), remote, le).is_err() {
+                return ConnectOutcome::Refused;
+            }
+        }
+    }
+    // (2) Pump chunked (lock released between chunks) chasing ESTABLISHED.
+    let out = tcp_pump_chunked(sid, CONNECT_PUMP, ConnectOutcome::Refused, |sock| {
+        if sock.state() == tcp::State::Established {
+            Some(ConnectOutcome::Established)
+        } else if !sock.is_active() {
+            // fell out of SYN-SENT without establishing (RST / refused) — Closed again.
+            Some(ConnectOutcome::Refused)
+        } else {
+            None // still SYN-SENT — keep pumping
+        }
+    });
+    out.unwrap_or(ConnectOutcome::InProgress)
+}
+
+/// Stream-send on TCP socket `sid`: enqueue `data` into the tx ring (once the connection may send),
+/// then a short bounded egress pump. `Ok(n)` = bytes queued (`n < data.len()` if the ring filled);
+/// `Err(true)` = would-block (tx ring full right now — ring 3 retries, `-EAGAIN`); `Err(false)` = not
+/// connected / wrong-kind / gone (ring 3 `-ENOTCONN`).
+pub fn stack_send(sid: usize, data: &[u8]) -> Result<usize, bool> {
+    let queued = {
+        let mut g = STACK.lock();
+        let stack = g.as_mut().ok_or(false)?;
+        let handle = tcp_handle(stack, sid).ok_or(false)?;
+        let sock = stack.sockets.get_mut::<tcp::Socket>(handle);
+        if !sock.may_send() {
+            return Err(false); // not ESTABLISHED (still connecting, or the tx half is closed)
+        }
+        match sock.send_slice(data) {
+            Ok(0) => return Err(true), // tx ring momentarily full — would block
+            Ok(n) => n,
+            Err(_) => return Err(false), // send half closed
+        }
+    };
+    // Kick egress (lock released between chunks); the socket vanishing mid-pump is harmless here.
+    let _ = tcp_pump_chunked(sid, SEND_PUMP, (), |_sock| None);
+    Ok(queued)
+}
+
+/// Non-blocking stream-recv on TCP socket `sid`: pump a bounded loop (lock-released chunks) driving the
+/// connection, then return the first stream bytes copied into `out`, `WouldBlock` if none arrived
+/// within the budget, or `Eof` once the peer's FIN is delivered and the rx ring is drained.
+pub fn stack_recv(sid: usize, out: &mut [u8]) -> RecvOutcome {
+    // A closure that tries a dequeue; `Some(outcome)` stops the pump.
+    let try_recv = |sock: &mut tcp::Socket, out: &mut [u8]| -> Option<RecvOutcome> {
+        match sock.recv_slice(out) {
+            Ok(0) => {
+                // Established but no data yet — keep pumping unless the connection is fully gone.
+                if !sock.is_open() { Some(RecvOutcome::Eof) } else { None }
+            }
+            Ok(n) => Some(RecvOutcome::Data(n)),
+            Err(tcp::RecvError::Finished) => Some(RecvOutcome::Eof), // clean FIN, all data delivered
+            Err(tcp::RecvError::InvalidState) => {
+                if !sock.is_open() { Some(RecvOutcome::Eof) } else { None }
+            }
+        }
+    };
+    // First, a lock-held immediate check (a reply may already be buffered from a prior pump).
+    {
+        let mut g = STACK.lock();
+        if let Some(stack) = g.as_mut() {
+            if let Some(handle) = tcp_handle(stack, sid) {
+                if let Some(o) = try_recv(stack.sockets.get_mut::<tcp::Socket>(handle), out) {
+                    return o;
+                }
+            } else {
+                return RecvOutcome::Eof; // gone / wrong-kind
+            }
+        } else {
+            return RecvOutcome::Eof;
+        }
+    }
+    // Then pump chunked (lock released between chunks) until data / EOF / budget.
+    tcp_pump_chunked(sid, RECV_PUMP, RecvOutcome::Eof, |sock| try_recv(sock, out))
+        .unwrap_or(RecvOutcome::WouldBlock)
 }
 
 // --- the boot UDP round-trip witness (M1), driven one-shot from service_net knob-on ---
@@ -640,4 +944,93 @@ fn udp_dns_roundtrip() -> Option<([u8; 4], u16, usize)> {
     let r = stack_recvfrom(sid, &mut buf);
     stack_close(sid);
     r
+}
+
+// --- the boot TCP round-trip witness (SOCK-3 M1), driven one-shot from service_net knob-on ---
+
+/// True once the SOCK-3 witness has run (one-shot).
+static WITNESS3_DONE: AtomicBool = AtomicBool::new(false);
+/// service_net call counter — lets the link/NIC settle before the witness fires.
+static WITNESS3_TICKS: AtomicU32 = AtomicU32::new(0);
+/// Warm up past SOCK-2's witness so the boot self-test + the two UDP/ICMP witnesses settle first.
+const WITNESS3_WARMUP: u32 = 40;
+
+/// slirp forwards a guest TCP connection to its built-in DNS resolver (10.0.2.3:53) out to the host's
+/// resolver over TCP, so a DNS-over-TCP query is a genuine hermetic 3-way-handshake + stream round-trip
+/// under the DEFAULT `./arroyo test` slirp backend — the TCP analogue of SOCK-2's UDP-DNS medium, no
+/// injector and no netdev change. DNS-over-TCP (RFC 7766) prefixes the 24-byte query with its 2-byte
+/// big-endian length. The reply is `[len BE][answer]`, ≥ 2 bytes — either proves the stream round-trip.
+const DNS_TCP_QUERY: [u8; 26] = {
+    let mut q = [0u8; 26];
+    q[0] = 0x00;
+    q[1] = 24; // DNS_QUERY length (big-endian u16)
+    let mut i = 0;
+    while i < 24 {
+        q[2 + i] = DNS_QUERY[i];
+        i += 1;
+    }
+    q
+};
+
+/// One-shot kernel-side TCP round-trip witness (M1): open a TCP socket in the persistent set,
+/// active-open to slirp's resolver over TCP (poll-looping `connect` until ESTABLISHED), send a
+/// DNS-over-TCP query, receive the reply, close, and emit the UNCOUNTED witness line. Proves the
+/// persistent interface + `SocketSet` carry a real byte-stream round-trip end to end from the kernel.
+/// No-op once done / no NIC. Runs from `service_net` on the BSP main loop, AFTER the NET_DEVICE guard
+/// drops (the pump re-locks NET_DEVICE per ring op).
+pub fn witness_tick3() {
+    if WITNESS3_DONE.load(Ordering::Relaxed) {
+        return;
+    }
+    if WITNESS3_TICKS.fetch_add(1, Ordering::Relaxed) < WITNESS3_WARMUP {
+        return;
+    }
+    if e1000::hw_addr().is_none() {
+        return;
+    }
+    WITNESS3_DONE.store(true, Ordering::Relaxed);
+
+    let (established, nbytes) = tcp_dns_roundtrip();
+    serial_println!(
+        ":: SOCK-3: smoltcp tcp connect {}:{} {}, {} bytes back — witness {} ::",
+        e1000::fmt_ip(&DNS_IP),
+        DNS_PORT,
+        if established { "established" } else { "REFUSED" },
+        nbytes,
+        if established && nbytes > 0 { "OK" } else { "INCOMPLETE" }
+    );
+}
+
+/// Kernel-side one-shot TCP round-trip over the persistent stack: open → connect (poll) → send →
+/// recv → close. Returns `(established, bytes_received)`. The `owner` row is kernel ownership
+/// (`usize::MAX`), never a live ring-3 slot, so `free_row_sockets` for a real task never touches it;
+/// it is closed explicitly here.
+fn tcp_dns_roundtrip() -> (bool, usize) {
+    let Some(sid) = stack_open_tcp(usize::MAX) else {
+        return (false, 0);
+    };
+    // Poll-loop the non-blocking connect until ESTABLISHED (each call pumps a bounded chunk).
+    let mut established = false;
+    for _ in 0..8 {
+        match stack_connect(sid, DNS_IP, DNS_PORT) {
+            ConnectOutcome::Established => {
+                established = true;
+                break;
+            }
+            ConnectOutcome::InProgress => continue,
+            ConnectOutcome::Refused => break,
+        }
+    }
+    if !established {
+        stack_close(sid);
+        return (false, 0);
+    }
+    let _ = stack_send(sid, &DNS_TCP_QUERY);
+    let mut buf = [0u8; 64];
+    let n = match stack_recv(sid, &mut buf) {
+        RecvOutcome::Data(n) => n,
+        _ => 0,
+    };
+    stack_close(sid);
+    (true, n)
 }

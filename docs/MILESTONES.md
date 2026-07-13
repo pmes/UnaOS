@@ -299,6 +299,48 @@ Spec promotions committed here; the granular arc detail is in each arc's own ent
 
 ---
 
+## net-sock1 track — 2026-07-12 (SOCK-3 — TCP client sockets: ring 3 gets a byte stream)
+
+### SOCK-3 — `sys_connect`/`sys_send`/`sys_sock_recv` (TCP client) over the persistent smoltcp stack 🔬 `net-sock1`
+- **What:** the third [§1b](ROADMAP.md) arc — TCP **client** sockets (numbers **23–25**), ring 3's first
+  byte stream. `sys_socket` gains `SOCK_STREAM(1)` → TCP; `sys_connect`(23) active-opens to a peer,
+  `sys_send`(24) streams bytes, `sys_sock_recv`(25) reads them (named so — `SYS_RECV = 14` is the
+  capability-transfer inbox recv). Same `UNAOS_SMOLNET` knob, x86-only, byte-identical knob-off / aarch64.
+- **On the SOCK-2 stack:** a TCP socket rides the existing `STACK` singleton + `reg` registry; a slot now
+  carries a `SockKind` tag and, for TCP, its own static stream ring buffers (`TCP_RX/TX_DATA`, 2 KiB each,
+  BSS). UDP + TCP share one id space + one generation counter. smoltcp's `socket-tcp` feature added. A UDP
+  handle routed to a stream syscall (or vice versa) is `-EACCES` on the kind tag — **before** smoltcp's
+  typed accessor can panic (a kernel-integrity guard on a ring-3-chosen syscall/handle pairing).
+- **The two SOCK-2-review REQUIRED folds, designed in:** (1) the socket handle value word is now
+  **gen-fenced** `(gen<<32)|(sid+1)` (`sock_id_pack`), validated in `socket_id_of` → `smolnet::sock_valid`
+  (present, owner-matched, generation-matched — the U11x `file_desc_validate` discipline); `SOCK_GEN[sid]`
+  bumps on every free, so a stale handle to a freed+reused slot is `-EACCES`, no rebind — the recycled-slot
+  UAF is closed for **all** socket kinds before any socket becomes transferable. (2) every TCP pump
+  (`tcp_pump_chunked`) releases the `STACK` lock between `TCP_CHUNK`-sized chunks (re-validating the slot on
+  re-acquire), so a cross-CPU socket syscall never spins on `STACK.lock()` for a full ~400 k-iter pump.
+- **Non-blocking connect (the design crux):** the IF-masked handler cannot block a multi-RTT handshake, so
+  `connect` is non-blocking with a ring-3 poll model — the first call issues the SYN (from state Closed;
+  idempotent) and pumps a bounded loop, returning `0` established / `-EINPROGRESS` still handshaking (ring 3
+  re-drives) / `-ECONNREFUSED` reset. `send` → count / `-EAGAIN` / `-ENOTCONN`; `recv` → count / `-EAGAIN` /
+  `0` at clean end-of-stream (peer FIN + rx drained).
+- **Witnesses (slirp resolver `10.0.2.3:53` over DNS-over-TCP — a hermetic 3-way handshake + stream reply
+  under the DEFAULT `test` backend, no injector/netdev change):** a kernel-side M1 witness
+  `:: SOCK-3: smoltcp tcp connect 10.0.2.3:53 established, 64 bytes back — witness OK ::` and a ring-3 M2
+  fixture (`sock3-tcp`, the inline-blob idiom) that poll-connects/sends/poll-recvs and completes a
+  round-trip: `:: SOCK-3: ring-3 tcp round-trip — socket/connect/send OK, recv returned a byte stream FROM
+  10.0.2.3:53, socket teardown clean -> PASS ::`.
+- **Tested (QEMU):** knob-off — `check` green both arches, `test 25` MISSION, `test-arm 22` MISSION (no
+  SOCK-3 lines, byte-identical). Knob-on — `UNAOS_SMOLNET=1 check` green both arches, `UNAOS_SMOLNET=1 test
+  90` MISSION + both witness lines above; SOCK-1/SOCK-2 witnesses intact; no new warnings. `SECURITY.md`
+  gains its TCP row. Metal pending (SOCK has no metal leg — no wired NIC on any current board; QEMU slirp is
+  the honest gate).
+- **Lane:** `arch/x86_64/syscall.rs` + `smolnet.rs` + `drivers/e1000.rs` (additive) + `Cargo.toml`
+  (`socket-tcp`); `crates/net`/`fat.rs`/`sched.rs`/`main.rs` untouched; zero aarch64.
+- **Commits:** `8f40af6` (M1 — persistent TCP stack + gen-fence + kernel witness), `4db8167` (M2 — the
+  stream syscalls + ring-3 fixture), M3 docs (this entry + `08_NET/networking.md` + `SECURITY.md` + ROADMAP §1b).
+
+---
+
 ## net-sock1 track — 2026-07-12 (SOCK-2 — the UDP socket syscall family: ring 3 reaches the network)
 
 ### SOCK-2 — `sys_socket`/`bind`/`sendto`/`recvfrom` over a persistent smoltcp `SocketSet` 🔬 `net-sock1`

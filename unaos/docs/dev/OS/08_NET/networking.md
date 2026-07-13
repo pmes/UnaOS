@@ -177,10 +177,80 @@ no raw-frame access (the `raw_rx`/`raw_tx` Device accessors are kernel-only), no
 configuration, no promiscuous receive; the peer address is data the kernel copies through the
 bound-checked window; `recvfrom` cannot block the IF-masked handler.
 
+## SOCK-3 — TCP client sockets (ring 3 gets a byte stream)
+
+SOCK-3 adds **TCP client sockets** on the same persistent stack, same knob (`UNAOS_SMOLNET`), x86-only,
+byte-identical knob-off / aarch64. A TCP socket rides the existing `STACK` singleton + `reg` registry —
+a slot now carries a `SockKind` tag (`Udp` / `Tcp`) and, for TCP, its own static stream ring buffers
+(`TCP_RX_DATA` / `TCP_TX_DATA`, 2 KiB each, BSS). The UDP and TCP sockets share one id space and one
+generation counter, so a handle's value word maps to exactly one registry slot.
+
+### Two REQUIRED folds from the SOCK-2 review (designed in from the start)
+
+1. **A slot GENERATION fences the handle value word.** SOCK-2's value word was only `+1`-biased (safe
+   only because sockets are non-transferable). SOCK-3 packs `(gen << 32) | (sid + 1)` (`sock_id_pack`)
+   and validates the generation in `socket_id_of` → `smolnet::sock_valid` (present, owner-matched,
+   generation-matched) — the exact U11x file-id discipline (`file_id_pack` / `file_desc_validate`).
+   `SOCK_GEN[sid]` bumps on every free (`stack_close` / `free_row_sockets`), so a stale handle to a
+   freed-and-reused registry slot resolves to `-EACCES`, never a rebind. A gen-0 socket packs to exactly
+   `sid + 1`, so SOCK-2's UDP fixtures are unchanged. This closes the recycled-slot UAF **before** any
+   arc makes a socket transferable.
+2. **No TCP pump holds the global `STACK` lock across a full pump.** `tcp_pump_chunked` advances the
+   interface in `TCP_CHUNK`-sized chunks and **drops the `STACK` guard between chunks**, so another CPU's
+   socket syscall never spins on `STACK.lock()` for a whole ~400 k-iteration pump. Each chunk re-acquires
+   the lock and re-validates the reg slot, so a concurrent teardown is observed as the connection
+   vanishing (returned `Refused` / `Eof`), never a use-after-free.
+
+### The blocking model (the SOCK-3 design crux, resolved)
+
+The IF-masked syscall handler can never block, but a TCP handshake is multi-RTT. `sys_connect` is
+**non-blocking with a ring-3 poll model**: the first call issues the SYN (from state Closed — idempotent,
+a re-call while SYN-SENT just pumps) and pumps a bounded loop chasing ESTABLISHED. It returns `0`
+(established), `-EINPROGRESS` (still handshaking — ring 3 re-invokes `connect`), or `-ECONNREFUSED` (the
+peer reset). Slirp's RTT is microseconds, so in practice the handshake completes inside the first call;
+the poll model is what keeps a slow/lossy peer from ever wedging the core. `sys_send` enqueues + a short
+egress pump (`-EAGAIN` tx-full, `-ENOTCONN` not connected); `sys_sock_recv` drives a bounded poll pump
+returning the bytes, `-EAGAIN` when none is available yet, or a clean `0` once the peer's FIN is delivered
+and the rx ring is drained (end-of-stream). Nothing blocks.
+
+### The syscalls
+
+| # | Syscall | Gate | Returns |
+| :--- | :--- | :--- | :--- |
+| 23 | `sys_connect(handle, msg_ptr, msg_len)` | TCP socket + `CAP_WRITE` | `0` established / `-EINPROGRESS` / `-ECONNREFUSED` |
+| 24 | `sys_send(handle, buf_ptr, buf_len)` | TCP socket + `CAP_WRITE` | bytes queued, or `-EAGAIN` / `-ENOTCONN` |
+| 25 | `sys_sock_recv(handle, buf_ptr, buf_len)` | TCP socket + `CAP_READ` | bytes read, `0` at end-of-stream, or `-EAGAIN` |
+
+`sys_socket(domain, type, proto)` selects the transport: `type = SOCK_STREAM(1)` → TCP,
+`type = SOCK_DGRAM(2)` → UDP (unchanged). `connect`'s peer address is the same 8-byte header shape SENDTO
+uses (`[ip[4]][port u16 LE][pad]`); send/recv carry **no** per-call address (a stream is connected). A UDP
+handle routed to a stream syscall (or vice versa) is rejected on the `SockKind` tag as `-EACCES` **before**
+smoltcp's typed accessor can panic. Next free syscall number: **26**.
+
+### The round-trip witnesses
+
+The witness medium stays slirp and is **hermetic under the default `./arroyo test` backend**: slirp
+forwards a guest TCP connection to its built-in DNS resolver (`10.0.2.3:53`) out over TCP, so a
+**DNS-over-TCP** query (RFC 7766: a 2-byte big-endian length prefix + the DNS message) is a genuine 3-way
+handshake + stream round-trip — the TCP analogue of SOCK-2's UDP-DNS medium, with no external injector and
+no netdev change. Two witnesses fire knob-on:
+
+- **M1, kernel-side** — `smolnet::witness_tick3()` opens a TCP socket, poll-connects to `10.0.2.3:53`,
+  sends the DNS-over-TCP query, receives the reply, and emits
+  `:: SOCK-3: smoltcp tcp connect 10.0.2.3:53 established, 64 bytes back — witness OK ::`.
+- **M2, ring-3** — an inline position-independent fixture (`sock3-tcp`) makes the three stream syscalls
+  from ring 3 (poll-connect, send, poll-recv) and proves an end-to-end byte-stream round-trip, conveying a
+  5-bit witness (socket/connect-established/send/recv-bytes/real-DNS-reply). Its launcher prints
+  `:: SOCK-3: ring-3 tcp round-trip — socket/connect/send OK, recv returned a byte stream FROM 10.0.2.3:53, socket teardown clean -> PASS ::`.
+
+Reproduce: `UNAOS_SMOLNET=1 ./arroyo test 90` — MISSION SUCCESS plus both lines. The `sock3-tcp` fixture
+runs on an AP; a stolen segment is handled by the same non-blocking poll/retry discipline SOCK-2 uses.
+
 ## The road from here
 
 | Arc | Content |
 | :--- | :--- |
 | SOCK-1 | smoltcp dep + `Device` adapter + `ping`/`arp`/`netinfo` + ICMP witness, knob-gated |
-| **SOCK-2** (this) | the UDP socket syscall family (`sys_socket`/`bind`/`sendto`/`recvfrom`, #19–22) + persistent `SocketSet`, ring 3 reaches the network |
-| SOCK-3+ | TCP sockets; DHCP via smoltcp; aarch64 NIC bring-up; retire the hand-rolled shell surface |
+| SOCK-2 | the UDP socket syscall family (`sys_socket`/`bind`/`sendto`/`recvfrom`, #19–22) + persistent `SocketSet`, ring 3 reaches the network |
+| **SOCK-3** (this) | TCP client sockets (`sys_connect`/`sys_send`/`sys_sock_recv`, #23–25) + gen-fenced socket handles + chunked-lock TCP pump, ring 3 gets a byte stream |
+| SOCK-4+ | TCP server/listen sockets; transferable sockets (the gen fence is in place); DHCP via smoltcp; aarch64 NIC bring-up; retire the hand-rolled shell surface |
