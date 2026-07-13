@@ -46,7 +46,8 @@ The crate root (`lib.rs`) re-exports the primary surface:
 - **`Journal` / `JournalOp`** (`wal.rs`) — the write-ahead log and its operation
   records.
 - **`Query` / `QueryOp` / `parse_value`** (`query.rs`) — the query parser and
-  operators, plus `cosine_similarity` (in `fs.rs`) for vector scoring.
+  operators, plus `cosine_similarity` (in `fs.rs`, re-exported at the crate
+  root) for vector scoring.
 - **`CatalogEntry`, `serialize_catalog`, `deserialize_catalog`** (`catalog.rs`)
   — the FNV-1a-hashed attribute index used to accelerate queries.
 - **`MappedFile`** (`io/mmap.rs`) — a zero-copy memory-mapped file that
@@ -91,14 +92,25 @@ depend on it with `default-features = false`.
 | `BlockDevice` trait + `MemDevice` | ✅ | ✅ |
 | `adapter` (512↔4096 `BlockAdapter` over `SectorDevice`; GPT/MBR parse; `MemSectorDevice`) | ✅ | ✅ |
 | `UnaFS` core ops (`format`/`mount`/`read`/`write`/`ls`/`mkdir`/`set_attribute`/`get_attribute`) | ✅ | ✅ |
+| `query` engine (`Query` parsing, `UnaFS::query`, `cosine_similarity`) | ✅ | ✅ |
 | `FileDevice` (host file backend) | ✅ | — |
 | `io::MappedFile` (memmap reader) | ✅ | — |
-| `query` engine + `cosine_similarity` (needs FP `sqrt`, absent in `core`) | ✅ | — |
 | bandy `BandyMember` events on attribute change | ✅ | — |
 
 The `no_std` build is verified against the kernel's own bare target
 (`aarch64-unknown-none-softfloat`), where `std` is genuinely absent from the
 sysroot.
+
+The query engine's floating-point square roots go through `libm` (pure-Rust,
+`no_std`) on **every** build — the `std` build does not fall back to
+`f32::sqrt` — so there is exactly one scoring path: a similarity query
+answered by the kernel over a mounted volume and the same query answered by a
+host tool produce **bit-identical scores**. `tests/query_kats.rs` pins this
+contract with golden cosine-similarity vectors (bit-exact known answers), a
+std-math-vs-libm identity sweep, and end-to-end `UnaFS::query` score
+assertions, including the extent-spilled vector path. Wiring the engine into
+the kernel's read-only mount (in-kernel similarity queries over the K3 chain)
+is a follow-on kernel arc; this crate side is ready.
 
 ## The kernel block adapter (BeFS-K2)
 
@@ -177,7 +189,7 @@ Planned arcs (sequencing in [`docs/ROADMAP.md`](../../docs/ROADMAP.md) §2):
 | F4 | Per-attribute B+tree indexes: log-time equality, true range queries |
 | F5 | **Live queries** — delta-emitting persistent queries published over bandy (the query-driven spatial UI, now including similarity) |
 | F6–F8 | B+tree directories; metadata checksums; extent trees |
-| K1–K4 | Kernel convergence: **`no_std` core (K1, ✅ landed)** → **512↔4096 block adapter + partitions (K2, ✅ landed)** → read-only kernel mount of a real volume → journaled kernel writes |
+| K1–K4 | Kernel convergence: **`no_std` core (K1, ✅ landed)** → **512↔4096 block adapter + partitions (K2, ✅ landed)** → **read-only kernel mount of a real volume (K3, ✅ landed)** → journaled kernel writes |
 
 The capability model (see [`docs/SECURITY.md`](../../docs/SECURITY.md)) stores
 principals and grants as ordinary typed attributes (`owner`, `grants:*`), so
