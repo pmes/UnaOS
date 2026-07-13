@@ -557,7 +557,24 @@ kernel8() {
     # kernel8-test run gets a pristine 1-cluster file to grow.
     head -c 512 /dev/zero | tr '\000' '\301' > "$KERNEL8_DIR/GROW.BIN"
 
-    bash "${WORKSPACE_DIR}/scripts/make-pi-img.sh" "$KERNEL8_DIR" "${WORKSPACE_DIR}/target/UnaOS-pi4-baremetal.img" 64
+    # BeFS-K3: stage a real 4 MB unafs volume with deterministic fixture files, built by the host
+    # `unafs` CLI (the same frozen on-disk format the kernel mounts — KAT-pinned in libs/unafs).
+    # make-pi-img.sh carries it as MBR partition 2 (type 0x7f); the kernel's `locate_unafs` finds it
+    # by superblock magic in QEMU (if=sd) and on the flashed card identically. Fixture contents are
+    # byte-verified by the K3-mount witness: K3HELLO.TXT (known text) + K3PAT.BIN (12 KiB pattern,
+    # byte i = (i*7+3)&0xFF — spans 3 unafs blocks so extent walking is exercised).
+    echo -e "${COLOR_YELLOW}⚡ Staging unafs K3 volume (host unafs CLI)...${COLOR_RESET}"
+    local UNAFS_K3_IMG="${WORKSPACE_DIR}/target/unafs-k3.img"
+    local UNAFS_CLI_MANIFEST="${WORKSPACE_DIR}/../apps/cli/unafs/Cargo.toml"
+    rm -f "$UNAFS_K3_IMG"
+    printf 'Hello from native UnaFS on the Pi 4!\n' > "${WORKSPACE_DIR}/target/K3HELLO.TXT"
+    python3 -c "import sys; sys.stdout.buffer.write(bytes(((i*7+3) & 0xFF) for i in range(12288)))" \
+        > "${WORKSPACE_DIR}/target/K3PAT.BIN"
+    cargo run -q --manifest-path "$UNAFS_CLI_MANIFEST" -- init -p "$UNAFS_K3_IMG" -s 4
+    cargo run -q --manifest-path "$UNAFS_CLI_MANIFEST" -- put "${WORKSPACE_DIR}/target/K3HELLO.TXT" / -i "$UNAFS_K3_IMG"
+    cargo run -q --manifest-path "$UNAFS_CLI_MANIFEST" -- put "${WORKSPACE_DIR}/target/K3PAT.BIN" / -i "$UNAFS_K3_IMG"
+
+    bash "${WORKSPACE_DIR}/scripts/make-pi-img.sh" "$KERNEL8_DIR" "${WORKSPACE_DIR}/target/UnaOS-pi4-baremetal.img" 64 "$UNAFS_K3_IMG"
     echo -e "${COLOR_GREEN}✅ Flashable image: target/UnaOS-pi4-baremetal.img — Imager → Use custom → microSD → SD slot.${COLOR_RESET}"
 }
 
