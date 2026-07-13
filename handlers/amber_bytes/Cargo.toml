@@ -33,3 +33,7 @@ unafs = { path = "../../libs/unafs" }
 bandy = { path = "../../libs/bandy" }
 anyhow = "1.0.102"
 tokio = { version = "1.49", features = ["full"] }
+
+[dev-dependencies]
+# Isolated temp dirs for the DiskManager fail-closed tests.
+tempfile = "3"
