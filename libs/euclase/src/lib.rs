@@ -22,6 +22,10 @@ pub mod utils;
 pub mod vec3;
 pub mod vec4; // <-- Wired into the nervous system
 
+/// Re-export wgpu so consumers (facet) can name filter modes, colors, and
+/// surface errors without carrying their own wgpu dependency line.
+pub use wgpu;
+
 pub use mat4::Mat4;
 pub use quat::Quat;
 pub use vec3::Vec3;

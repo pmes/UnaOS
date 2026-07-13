@@ -73,6 +73,26 @@ const TRK_MOUSE_MOVED: usize = 0x02;
 const TRK_ACTIVE_IN_KEY_WINDOW: usize = 0x20;
 const TRK_IN_VISIBLE_RECT: usize = 0x200;
 
+// -- opaque CoreFoundation types (objc2 verifies return encodings, so a bare
+//    `*mut c_void` (^v) is rejected where the runtime says ^{CGColorSpace=}) --
+#[repr(C)]
+struct CGColorSpace {
+    _priv: [u8; 0],
+}
+unsafe impl objc2::encode::RefEncode for CGColorSpace {
+    const ENCODING_REF: objc2::encode::Encoding =
+        objc2::encode::Encoding::Pointer(&objc2::encode::Encoding::Struct("CGColorSpace", &[]));
+}
+
+#[repr(C)]
+struct CGColor {
+    _priv: [u8; 0],
+}
+unsafe impl objc2::encode::RefEncode for CGColor {
+    const ENCODING_REF: objc2::encode::Encoding =
+        objc2::encode::Encoding::Pointer(&objc2::encode::Encoding::Struct("CGColor", &[]));
+}
+
 // ---------------------------------------------------------------------------
 // THE RENDERER SEAM (what facet installs; quartzite never names wgpu)
 // ---------------------------------------------------------------------------
@@ -584,7 +604,7 @@ impl FacetGpuView {
                 OVERLAY_BG.2,
                 OVERLAY_BG.3,
             );
-            let cg: *mut c_void = msg_send![&*color, CGColor];
+            let cg: *mut CGColor = msg_send![&*color, CGColor];
             if !cg.is_null() {
                 let _: () = msg_send![&*bg, setBackgroundColor: cg];
             }
@@ -770,7 +790,7 @@ where
         // display — the eye-witness color axis.
         let srgb_ns: *mut AnyObject = msg_send![class!(NSColorSpace), sRGBColorSpace];
         if !srgb_ns.is_null() {
-            let cg: *mut c_void = msg_send![srgb_ns, CGColorSpace];
+            let cg: *mut CGColorSpace = msg_send![srgb_ns, CGColorSpace];
             if !cg.is_null() {
                 let _: () = msg_send![&*layer, setColorspace: cg];
             }

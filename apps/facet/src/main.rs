@@ -25,8 +25,16 @@
 //!
 //! The picture shows aspect-fit, right-side-up, and color-managed, and the
 //! quartzite view gives it hands: zoom about the cursor, drag-pan, reset-to-fit,
-//! and a live per-pixel readout (FACET-2). The euclase textured-quad (GPU) path
-//! is the remaining later arc (ROADMAP §3a).
+//! and a live per-pixel readout (FACET-2).
+//!
+//! FACET-GPU: presentation defaults to the euclase textured quad — quartzite
+//! hosts a `CAMetalLayer` (pinned sRGB) and this vessel builds the wgpu side
+//! over it (`Cortex::ignite_layer_blocking` + `TexturedQuad`, frame uploaded
+//! `Rgba8UnormSrgb`), redrawn on demand with zoom/pan folded into the quad's
+//! `Mat4` uniform. If GPU init fails the vessel logs it and falls back to the
+//! CPU blit automatically; `FACET_CPU=1` forces the CPU path — the knob is the
+//! eye-witness A/B instrument (the two paths must be visually
+//! indistinguishable).
 
 use bandy::telemetry;
 use gneiss_pal::paths::UnaPaths;
@@ -44,6 +52,24 @@ fn linear_to_srgb(c: f32) -> f32 {
         1.055 * c.powf(1.0 / 2.4) - 0.055
     }
 }
+
+/// The sRGB EOTF (sRGB → linear) at f64, for the GPU clear color: wgpu clear
+/// values are linear and the sRGB swapchain encodes on store, so feeding the
+/// linearized Moonstone triple reproduces the CPU path's field bytes exactly.
+#[cfg(target_os = "macos")]
+fn srgb8_to_linear_f64(v: u8) -> f64 {
+    let c = v as f64 / 255.0;
+    if c <= 0.04045 {
+        c / 12.92
+    } else {
+        ((c + 0.055) / 1.055).powf(2.4)
+    }
+}
+
+/// The console field the picture sits on (UnaOS Moonstone, `#2D2B55` —
+/// matching the quartzite CPU view's `FIELD`).
+#[cfg(target_os = "macos")]
+const FIELD_SRGB: (u8, u8, u8) = (0x2D, 0x2B, 0x55);
 
 /// Pack a linear `RgbBuffer` into tightly packed 8-bit sRGB RGBA (opaque),
 /// row-major, top row first — the format the quartzite image view expects.
@@ -70,6 +96,76 @@ fn pack_srgba(buf: &RgbBuffer) -> Vec<u8> {
         }
     }
     out
+}
+
+/// Attempt the GPU presentation path: quartzite hosts the `CAMetalLayer`
+/// (already pinned sRGB), and this vessel builds the whole wgpu side over the
+/// layer pointer it hands back — a presentation-spec `Cortex` (vsync, no extra
+/// features), the `TexturedQuad`, and one `Rgba8UnormSrgb` upload of the same
+/// packed sRGB bytes the CPU path blits (the readout keeps consuming them on
+/// the view side). Returns `None` on any GPU-init failure so the caller can
+/// fall back to the CPU view.
+#[cfg(target_os = "macos")]
+fn bootstrap_gpu(
+    window: &quartzite::NativeWindow,
+    rgba: &[u8],
+    linear: &[f32],
+    w: u32,
+    h: u32,
+) -> Option<quartzite::NativeView> {
+    use euclase::cortex::{Cortex, CortexSpec};
+    use euclase::quad::{view_rect_to_ndc, TexturedQuad};
+    use quartzite::platforms::macos::gpu_view::{self, GpuFrameParams};
+
+    // The Moonstone field, linearized: the sRGB swapchain re-encodes on store,
+    // landing the exact CPU-path field bytes around an aspect-fit picture.
+    let clear = euclase::wgpu::Color {
+        r: srgb8_to_linear_f64(FIELD_SRGB.0),
+        g: srgb8_to_linear_f64(FIELD_SRGB.1),
+        b: srgb8_to_linear_f64(FIELD_SRGB.2),
+        a: 1.0,
+    };
+
+    gpu_view::bootstrap_gpu_view(window, rgba, linear, w, h, |layer, dw, dh| {
+        // SAFETY: `layer` is the view's retained CAMetalLayer; the returned
+        // closure (owning the Cortex and its Surface) is stored in the view's
+        // ivars, which drop before the view releases the layer — the layer
+        // outlives the Cortex<'static> (see gpu_view's module doc).
+        let mut cortex = match unsafe {
+            Cortex::ignite_layer_blocking(layer, dw, dh, CortexSpec::presentation())
+        } {
+            Ok(c) => c,
+            Err(e) => {
+                log::warn!("[FACET] :: GPU cortex ignite failed: {e}");
+                return None;
+            }
+        };
+        log::info!(
+            "[FACET] :: GPU cortex up — {}x{} swapchain, format {:?}.",
+            cortex.config.width,
+            cortex.config.height,
+            cortex.config.format
+        );
+
+        // Linear filtering: closest to the CPU blit's AppKit look (nearest at
+        // high zoom stays an open eye-witness question).
+        let mut quad = TexturedQuad::forge(
+            &cortex.device,
+            cortex.config.format,
+            euclase::wgpu::FilterMode::Linear,
+        );
+        quad.upload_frame(&cortex.device, &cortex.queue, rgba, w, h);
+
+        Some(Box::new(move |p: &GpuFrameParams| {
+            if (cortex.config.width, cortex.config.height) != p.drawable {
+                cortex.resize(p.drawable.0, p.drawable.1);
+            }
+            quad.set_transform(&cortex.queue, &view_rect_to_ndc(p.dest, p.bounds));
+            if let Err(e) = quad.render(&cortex, clear) {
+                log::warn!("[FACET] :: GPU present failed: {e}");
+            }
+        }))
+    })
 }
 
 fn main() {
@@ -137,6 +233,21 @@ fn main() {
                 (h as f64).clamp(160.0, 1000.0),
             ),
             move |window| {
+                // GPU by default; FACET_CPU=1 is the eye-witness A/B knob.
+                let force_cpu = std::env::var("FACET_CPU").is_ok_and(|v| v == "1");
+                if force_cpu {
+                    log::info!("[FACET] :: FACET_CPU=1 — forcing the CPU blit path.");
+                } else if let Some(view) = bootstrap_gpu(window, &rgba, &linear, w, h) {
+                    log::info!(
+                        "[FACET] :: Presentation path: GPU (euclase textured quad on CAMetalLayer)."
+                    );
+                    return view;
+                } else {
+                    log::warn!(
+                        "[FACET] :: GPU presentation unavailable; falling back to the CPU blit."
+                    );
+                }
+                log::info!("[FACET] :: Presentation path: CPU (AppKit NSBitmapImageRep blit).");
                 quartzite::platforms::macos::image_view::bootstrap_image_view(
                     window, &rgba, &linear, w, h,
                 )

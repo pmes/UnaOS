@@ -1310,6 +1310,7 @@ name = "facet"
 version = "0.1.0"
 dependencies = [
  "bandy",
+ "euclase",
  "gneiss_pal",
  "log",
  "lux",

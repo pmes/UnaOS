@@ -12,6 +12,7 @@ license = "GPL-3.0-or-later"
 
 [dependencies]
 bandy = { path = "../../libs/bandy" }
+euclase = { path = "../../libs/euclase" }
 quartzite = { path = "../../libs/quartzite", default-features = false }
 gneiss_pal = { path = "../../libs/gneiss_pal" }
 lux = { path = "../../libs/lux" }
