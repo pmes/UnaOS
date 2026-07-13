@@ -808,6 +808,160 @@ fn fs_mv(console: &mut Console, src: &str, dst: &str) {
     }
 }
 
+/// JD12: render bytes as printable text for the console — LF is kept as a line break, CR is dropped,
+/// and any other non-printing byte renders as `.`. The single rendering rule shared by `cat`/`head`/
+/// `tail` so a file reads identically however it is viewed (and mirrors identically into the JD11
+/// serial transcript). Returns the whole rendered string; the caller splits on `'\n'` to print lines.
+fn render_text(data: &[u8]) -> String {
+    data.iter().filter_map(|&b| match b {
+        b'\n' => Some('\n'),
+        b'\r' => None,
+        0x20..=0x7e => Some(b as char),
+        _ => Some('.'),
+    }).collect()
+}
+
+/// JD12: the `cat` core — read a resolved FILE entry (bounded to `CAP` bytes so a huge file can't
+/// flood the console) and print it as printable text, noting a byte-bounded short read. Shared by the
+/// single-path `cat <file>` and the wildcard `cat *.EXT` (JD12-M2), so the rendering + truncation note
+/// live in exactly one place. `de` must be a file — a directory surfaces `-EISDIR` from `read_file`.
+fn cat_render(console: &mut Console, fs: &FatFs, de: &DirEntry, canon: &str) {
+    const CAP: usize = 8192;
+    let mut data: Vec<u8> = Vec::new();
+    match fs.read_file(de, &mut data, CAP) {
+        Ok(()) => {
+            for line in render_text(&data).split('\n') {
+                console.println(line);
+            }
+            // Bound the read so a huge file (e.g. kernel.elf) can't flood the console.
+            if (de.size as usize) > data.len() {
+                console.println(&alloc::format!(
+                    "[... {} of {} bytes shown]", data.len(), de.size));
+            }
+        }
+        Err(FatError::IsDirectory) =>
+            console.println(&alloc::format!("cat: {}: is a directory (-EISDIR)", canon)),
+        Err(e) => console.println(&alloc::format!("cat: {}: {:?}", canon, e)),
+    }
+}
+
+/// JD12 `head <path> [n]`: print the FIRST `n` lines of a file (default 10). Streams from offset 0 via
+/// the offset-aware `read_at` in bounded windows and STOPS as soon as `n` newlines are seen — so
+/// `head 10` of a huge file reads only the first window(s), never the whole file. A byte ceiling
+/// (`HEAD_MAX`) backstops a file with no (or too few) newlines so an unterminated giant line still
+/// bounds the read and the heap. A directory or the root is `-EISDIR`. Every access rides the JD3
+/// wall-clock BOT pump — a stalled transfer is `-EIO`, never a hang on the timerless EL1 core.
+fn fs_head(console: &mut Console, arg: &str, n: u32) {
+    let fs = match crate::fs::fat::mount() {
+        Ok(fs) => fs,
+        Err(e) => return console.println(&alloc::format!("head: no FAT filesystem ({:?})", e)),
+    };
+    let (de, canon) = match resolve_path(&fs, &normalize_path(&cwd_path(), arg)) {
+        Ok(Resolved::Root) => return console.println("head: /: is a directory (-EISDIR)"),
+        Ok(Resolved::Entry(de, canon)) => {
+            if de.is_dir {
+                return console.println(&alloc::format!("head: {}: is a directory (-EISDIR)", canon));
+            }
+            (de, canon)
+        }
+        Err(msg) => return console.println(&alloc::format!("head: {}", msg)),
+    };
+    const WINDOW: usize = 4096;
+    const HEAD_MAX: u32 = 64 * 1024; // ceiling: an unterminated giant line still bounds the read
+    let (fc, size) = (de.first_cluster(), de.size);
+    let (mut off, mut lines) = (0u32, 0u32);
+    let mut cur = String::new(); // the line under construction (rendered, per `render_text`'s rules)
+    let mut buf: Vec<u8> = Vec::new();
+    'outer: while off < size && off < HEAD_MAX && lines < n {
+        buf.clear();
+        if let Err(e) = fs.read_at(fc, size, off, &mut buf, WINDOW) {
+            return console.println(&alloc::format!("head: {}: {} ({:?})", canon, fat_errno(e), e));
+        }
+        if buf.is_empty() {
+            break; // chain ended before de.size (malformed) — show what we have, honestly
+        }
+        off += buf.len() as u32;
+        for &b in &buf {
+            match b {
+                b'\n' => {
+                    console.println(&cur);
+                    cur.clear();
+                    lines += 1;
+                    if lines >= n {
+                        break 'outer;
+                    }
+                }
+                b'\r' => {}
+                0x20..=0x7e => cur.push(b as char),
+                _ => cur.push('.'),
+            }
+        }
+    }
+    // A final line with no trailing newline (we stopped before `n` full lines): print it.
+    if lines < n && !cur.is_empty() {
+        console.println(&cur);
+        lines += 1;
+    }
+    // Note if the file continues past what we showed (more lines, or the byte ceiling cut us off).
+    if off < size {
+        console.println(&alloc::format!("[... first {} line(s) shown]", lines));
+    }
+}
+
+/// JD12 `tail <path> [n]`: print the LAST `n` lines of a file (default 10). Reads a bounded window at
+/// the END of the file (`TAIL_MAX` bytes ending at EOF) via the offset-aware `read_at`, renders it,
+/// and prints the last `n` lines. If the window began mid-file, its first (cut) line is dropped and a
+/// note records the bound. A directory or the root is `-EISDIR`; an empty file prints nothing. Every
+/// access rides the JD3 wall-clock BOT pump — a stalled transfer is `-EIO`, never a hang.
+fn fs_tail(console: &mut Console, arg: &str, n: u32) {
+    let fs = match crate::fs::fat::mount() {
+        Ok(fs) => fs,
+        Err(e) => return console.println(&alloc::format!("tail: no FAT filesystem ({:?})", e)),
+    };
+    let (de, canon) = match resolve_path(&fs, &normalize_path(&cwd_path(), arg)) {
+        Ok(Resolved::Root) => return console.println("tail: /: is a directory (-EISDIR)"),
+        Ok(Resolved::Entry(de, canon)) => {
+            if de.is_dir {
+                return console.println(&alloc::format!("tail: {}: is a directory (-EISDIR)", canon));
+            }
+            (de, canon)
+        }
+        Err(msg) => return console.println(&alloc::format!("tail: {}", msg)),
+    };
+    const TAIL_MAX: u32 = 64 * 1024; // bounded tail window: only the last TAIL_MAX bytes are scanned
+    let (fc, size) = (de.first_cluster(), de.size);
+    if size == 0 {
+        return; // empty file — tail shows nothing
+    }
+    let start = size.saturating_sub(TAIL_MAX);
+    let mut buf: Vec<u8> = Vec::new();
+    if let Err(e) = fs.read_at(fc, size, start, &mut buf, (size - start) as usize) {
+        return console.println(&alloc::format!("tail: {}: {} ({:?})", canon, fat_errno(e), e));
+    }
+    let text = render_text(&buf);
+    if text.is_empty() {
+        return;
+    }
+    let mut lines: Vec<&str> = text.split('\n').collect();
+    // A file ending in '\n' yields a trailing "" element — it is not a real last line.
+    if text.ends_with('\n') {
+        lines.pop();
+    }
+    // A window that began mid-file cuts the first line — drop that partial line and note the bound.
+    let windowed = start > 0;
+    if windowed && !lines.is_empty() {
+        lines.remove(0);
+    }
+    let from = lines.len().saturating_sub(n as usize);
+    if windowed {
+        console.println(&alloc::format!(
+            "[... tail of {} bytes; last {} line(s)]", size, lines.len() - from));
+    }
+    for line in &lines[from..] {
+        console.println(line);
+    }
+}
+
 /// Print one directory's entries in the `ls` table format, with the file/dir tally.
 fn print_dir_listing(console: &mut Console, entries: &[DirEntry]) {
     let (mut files, mut dirs) = (0u32, 0u32);
@@ -864,6 +1018,7 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
             console.println("COMMANDS: ver, help, clear, echo, panic, gneiss");
             console.println("STORAGE:  diskinfo, usbinfo, read <lba>, write <lba> <byte>");
             console.println("FILES:    fatinfo (FAT geometry), ls [dir], cd [dir], pwd, cat <path>");
+            console.println("PAGING:   head <path> [n], tail <path> [n]  (first / last n lines, default 10)");
             console.println("WRITE:    touch <path>, write <path> <text>, append <path> <text>, rm <path>");
             console.println("DIRS:     mkdir <path>, rmdir <path>  (create / remove empty directories)");
             console.println("COPY:     cp <src> <dst>  (copy a file; cp FILE DIR/ lands as DIR/<leaf>)");
@@ -973,36 +1128,31 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
                     Ok(fs) => match resolve_path(&fs, &normalize_path(&cwd_path(), name)) {
                         Ok(Resolved::Root) =>
                             console.println("cat: /: is a directory (-EISDIR)"),
-                        Ok(Resolved::Entry(de, canon)) => {
-                            // Bound the read so a huge file (e.g. kernel.elf) can't flood the console.
-                            const CAP: usize = 8192;
-                            let mut data: Vec<u8> = Vec::new();
-                            match fs.read_file(&de, &mut data, CAP) {
-                                Ok(()) => {
-                                    // Render printable ASCII; keep LF, drop CR, others -> '.'.
-                                    let text: String = data.iter().filter_map(|&b| match b {
-                                        b'\n' => Some('\n'),
-                                        b'\r' => None,
-                                        0x20..=0x7e => Some(b as char),
-                                        _ => Some('.'),
-                                    }).collect();
-                                    for line in text.split('\n') {
-                                        console.println(line);
-                                    }
-                                    if (de.size as usize) > data.len() {
-                                        console.println(&alloc::format!(
-                                            "[... {} of {} bytes shown]", data.len(), de.size));
-                                    }
-                                }
-                                Err(FatError::IsDirectory) => console.println(&alloc::format!(
-                                    "cat: {}: is a directory (-EISDIR)", canon)),
-                                Err(e) => console.println(&alloc::format!("cat: {}: {:?}", canon, e)),
-                            }
-                        }
+                        Ok(Resolved::Entry(de, canon)) => cat_render(console, &fs, &de, &canon),
                         Err(msg) => console.println(&alloc::format!("cat: {}", msg)),
                     },
                     Err(e) => console.println(&alloc::format!("cat: no FAT filesystem ({:?})", e)),
                 },
+            }
+        },
+        "head" => {
+            // JD12: print the FIRST n lines of a file (default 10). `head <path> [n]`.
+            match args.first() {
+                None => console.println("usage: head <path> [lines]"),
+                Some(path) => {
+                    let n = args.get(1).and_then(|s| s.parse::<u32>().ok()).unwrap_or(10);
+                    fs_head(console, path, n);
+                }
+            }
+        },
+        "tail" => {
+            // JD12: print the LAST n lines of a file (default 10). `tail <path> [n]`.
+            match args.first() {
+                None => console.println("usage: tail <path> [lines]"),
+                Some(path) => {
+                    let n = args.get(1).and_then(|s| s.parse::<u32>().ok()).unwrap_or(10);
+                    fs_tail(console, path, n);
+                }
             }
         },
         #[cfg(target_arch = "aarch64")]
