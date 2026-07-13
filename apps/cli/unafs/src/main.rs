@@ -79,6 +79,40 @@ enum Commands {
         #[arg(short, long, default_value = "unafs.img")]
         img: String,
     },
+    /// Remove a file from the vault (frees its blocks and scrubs its catalog entries)
+    Rm {
+        path: String,
+        #[arg(short, long, default_value = "unafs.img")]
+        img: String,
+    },
+    /// Rename or move a file/directory. If DESTINATION is an existing
+    /// directory, SOURCE moves into it keeping its name; otherwise
+    /// DESTINATION names the new parent + new name. Refuses to overwrite.
+    Mv {
+        source: String,
+        destination: String,
+        #[arg(short, long, default_value = "unafs.img")]
+        img: String,
+    },
+    /// Remove a semantic attribute (and its query-index entries)
+    Rmattr {
+        path: String,
+        key: String,
+        #[arg(short, long, default_value = "unafs.img")]
+        img: String,
+    },
+}
+
+/// Split a vault path into (parent path, entry name). "/a/b/c" -> ("/a/b", "c").
+fn split_parent(path: &str) -> Result<(&str, &str)> {
+    let trimmed = path.trim_end_matches('/');
+    if trimmed.is_empty() {
+        anyhow::bail!("'{}' has no parent (is it the root?)", path);
+    }
+    match trimmed.rfind('/') {
+        Some(idx) => Ok((&trimmed[..idx.max(1)], &trimmed[idx + 1..])),
+        None => Ok(("/", trimmed)),
+    }
 }
 
 #[tokio::main]
@@ -215,6 +249,68 @@ async fn main() -> Result<()> {
                     inode.id, inode.size, score
                 );
             }
+        }
+        Commands::Rm { path, img } => {
+            let device = FileDevice::open(img).context("Failed to open device")?;
+            let mut fs = FileSystem::mount(device).context("Failed to mount filesystem")?;
+
+            let (parent, name) = split_parent(path)?;
+            let parent_id = fs
+                .resolve_path(parent)
+                .context("Parent directory not found")?;
+            let inode_id = fs
+                .unlink(parent_id, name)
+                .map_err(|e| anyhow::anyhow!("Failed to remove '{}': {:?}", path, e))?;
+
+            println!("✅ [OPERATOR] Removed '{}' (was inode {})", path, inode_id);
+        }
+        Commands::Mv {
+            source,
+            destination,
+            img,
+        } => {
+            let device = FileDevice::open(img).context("Failed to open device")?;
+            let mut fs = FileSystem::mount(device).context("Failed to mount filesystem")?;
+
+            let (src_parent, src_name) = split_parent(source)?;
+            let src_parent_id = fs
+                .resolve_path(src_parent)
+                .context("Source parent directory not found")?;
+
+            // If the destination resolves to an existing directory, move the
+            // source into it under its own name; otherwise treat the
+            // destination as parent + new name.
+            let dst_dir_id = fs.resolve_path(destination).ok().filter(|&id| {
+                matches!(fs.read_inode(id), Ok(i) if i.kind == unafs::FileKind::Directory)
+            });
+            let (dst_parent_id, dst_name) = match dst_dir_id {
+                Some(id) => (id, src_name.to_string()),
+                None => {
+                    let (dst_parent, dst_name) = split_parent(destination)?;
+                    let dst_parent_id = fs
+                        .resolve_path(dst_parent)
+                        .context("Destination parent directory not found")?;
+                    (dst_parent_id, dst_name.to_string())
+                }
+            };
+
+            fs.rename(src_parent_id, src_name, dst_parent_id, &dst_name)
+                .map_err(|e| {
+                    anyhow::anyhow!("Failed to move '{}' -> '{}': {:?}", source, destination, e)
+                })?;
+
+            println!("✅ [OPERATOR] Moved '{}' -> '{}'", source, destination);
+        }
+        Commands::Rmattr { path, key, img } => {
+            let device = FileDevice::open(img).context("Failed to open device")?;
+            let mut fs = FileSystem::mount(device).context("Failed to mount filesystem")?;
+
+            let id = fs.resolve_path(path).context("Path not found")?;
+            fs.remove_attribute(id, key).map_err(|e| {
+                anyhow::anyhow!("Failed to remove attribute '{}' on '{}': {:?}", key, path, e)
+            })?;
+
+            println!("✅ [OPERATOR] Removed attribute '{}' from '{}'", key, path);
         }
     }
 
