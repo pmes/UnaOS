@@ -21,7 +21,7 @@
 
 use unafs::fs::FileSystemError;
 use unafs::inode::FileKind;
-use unafs::{AttributeValue, BLOCK_SIZE, BlockDevice, MemDevice, UnaFS};
+use unafs::{AttributeValue, BLOCK_SIZE, BlockDevice, Journal, MemDevice, UnaFS};
 
 /// Format a fresh in-memory volume of `block_count` blocks.
 fn fresh_fs(block_count: u64) -> UnaFS<MemDevice> {
@@ -303,6 +303,179 @@ fn rename_refusals_collision_loop_missing_noop() {
     let names: Vec<String> = fs.ls(root_id).unwrap().into_iter().map(|e| e.name).collect();
     assert_eq!(names, vec!["a", "x.txt", "y.txt"]);
     assert_eq!(fs.resolve_path("/a/b").unwrap(), b_id);
+}
+
+// --- M3: remove_attribute ----------------------------------------------------
+
+#[test]
+fn remove_attribute_inline_query_misses_others_intact() {
+    let mut fs = fresh_fs(5000);
+    let root_id = fs.superblock.root_inode;
+
+    let file_id = fs.create_file(root_id, "tagged.txt".to_string()).unwrap();
+    fs.set_attribute(
+        file_id,
+        "mood".to_string(),
+        AttributeValue::String("bright".to_string()),
+    )
+    .unwrap();
+    // Re-set so the catalog carries a stale duplicate entry for the key.
+    fs.set_attribute(
+        file_id,
+        "mood".to_string(),
+        AttributeValue::String("brighter".to_string()),
+    )
+    .unwrap();
+    fs.set_attribute(file_id, "priority".to_string(), AttributeValue::Int(7))
+        .unwrap();
+
+    fs.remove_attribute(file_id, "mood")
+        .expect("remove_attribute failed");
+
+    // Gone from the inode...
+    assert_eq!(fs.get_attribute(file_id, "mood").unwrap(), None);
+    // ...and from every query path, including the stale duplicate value.
+    assert!(fs.query("mood == \"brighter\"").unwrap().is_empty());
+    assert!(fs.query("mood == \"bright\"").unwrap().is_empty());
+
+    // The other attribute is intact and still queryable.
+    assert_eq!(
+        fs.get_attribute(file_id, "priority").unwrap(),
+        Some(AttributeValue::Int(7))
+    );
+    let results = fs.query("priority == 7").unwrap();
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].0.id, file_id);
+
+    // Removing it again is AttributeNotFound.
+    assert!(matches!(
+        fs.remove_attribute(file_id, "mood"),
+        Err(FileSystemError::AttributeNotFound)
+    ));
+}
+
+#[test]
+fn remove_attribute_spilled_frees_extents() {
+    let mut fs = fresh_fs(5000);
+    let root_id = fs.superblock.root_inode;
+
+    let file_id = fs.create_file(root_id, "vec.bin".to_string()).unwrap();
+    // Seed a small attribute so the catalog data block exists before the
+    // baseline snapshot.
+    fs.set_attribute(file_id, "kept".to_string(), AttributeValue::Int(1))
+        .unwrap();
+
+    let free_before = fs.superblock.free_blocks;
+
+    // 200 floats: over the 64-float inline threshold, spills to extents.
+    let big: Vec<f32> = (0..200).map(|i| i as f32 * 0.5).collect();
+    fs.set_attribute(
+        file_id,
+        "embedding".to_string(),
+        AttributeValue::Vector(big.clone()),
+    )
+    .unwrap();
+    assert!(
+        fs.read_inode(file_id)
+            .unwrap()
+            .large_attributes
+            .contains_key("embedding"),
+        "test premise: the vector must have spilled"
+    );
+    assert!(fs.superblock.free_blocks < free_before);
+
+    fs.remove_attribute(file_id, "embedding")
+        .expect("remove_attribute failed");
+
+    // Gone from the inode maps, the value, and the similarity query path.
+    let inode = fs.read_inode(file_id).unwrap();
+    assert!(!inode.large_attributes.contains_key("embedding"));
+    assert_eq!(fs.get_attribute(file_id, "embedding").unwrap(), None);
+    let target: Vec<String> = big.iter().map(|f| format!("{:?}", f)).collect();
+    let sim_q = format!("similarity(embedding, [{}]) > 0.5", target.join(", "));
+    assert!(fs.query(&sim_q).unwrap().is_empty());
+
+    // The spilled extents came back: free space round-trips exactly.
+    assert_eq!(
+        fs.superblock.free_blocks, free_before,
+        "spilled-attribute extents must be freed"
+    );
+
+    // The untouched attribute survives.
+    assert_eq!(
+        fs.get_attribute(file_id, "kept").unwrap(),
+        Some(AttributeValue::Int(1))
+    );
+}
+
+// --- The full cycle: mount -> mutate -> remount ------------------------------
+
+#[test]
+fn mutated_volume_remounts_clean() {
+    let mut fs = fresh_fs(5000);
+    let root_id = fs.superblock.root_inode;
+
+    // Build a small world...
+    let docs_id = fs.mkdir(root_id, "docs".to_string()).unwrap();
+    let attic_id = fs.mkdir(root_id, "attic".to_string()).unwrap();
+    let keep_id = fs.create_file(docs_id, "keep.txt".to_string()).unwrap();
+    fs.write_data(keep_id, 0, b"kept words").unwrap();
+    fs.set_attribute(
+        keep_id,
+        "state".to_string(),
+        AttributeValue::String("final".to_string()),
+    )
+    .unwrap();
+    let big: Vec<f32> = (0..100).map(|i| i as f32 * 0.1).collect();
+    fs.set_attribute(
+        keep_id,
+        "embedding".to_string(),
+        AttributeValue::Vector(big),
+    )
+    .unwrap();
+    let junk_id = fs.create_file(docs_id, "junk.txt".to_string()).unwrap();
+    fs.write_data(junk_id, 0, b"ephemeral").unwrap();
+    fs.set_attribute(
+        junk_id,
+        "state".to_string(),
+        AttributeValue::String("junk".to_string()),
+    )
+    .unwrap();
+
+    // ...then mutate it: unlink the junk, move + rename the keeper into the
+    // attic, and drop its spilled embedding.
+    fs.unlink(docs_id, "junk.txt").unwrap();
+    fs.rename(docs_id, "keep.txt", attic_id, "treasure.txt").unwrap();
+    fs.remove_attribute(keep_id, "embedding").unwrap();
+
+    // Remount from the raw device bytes.
+    let device = fs.device.clone();
+    drop(fs);
+
+    // The journal witness: every mutation closed its transaction, so a
+    // fresh recovery scan must report the volume CLEAN.
+    let mut probe = device.clone();
+    let dirty = Journal::new()
+        .check_recovery(&mut probe)
+        .expect("recovery scan failed");
+    assert!(!dirty, "mutated volume must re-mount clean, not dirty");
+
+    let mut fs2 = UnaFS::mount(device).expect("re-mount failed");
+
+    // Structure survived: the junk is gone everywhere, the treasure moved.
+    assert!(fs2.resolve_path("/docs/junk.txt").is_err());
+    assert!(fs2.resolve_path("/docs/keep.txt").is_err());
+    assert!(fs2.ls(docs_id).unwrap().is_empty());
+    assert_eq!(fs2.resolve_path("/attic/treasure.txt").unwrap(), keep_id);
+
+    // Content, attributes, and queries all agree with the mutations.
+    let inode = fs2.read_inode(keep_id).unwrap();
+    assert_eq!(fs2.read_data(keep_id, 0, inode.size).unwrap(), b"kept words");
+    assert_eq!(fs2.get_attribute(keep_id, "embedding").unwrap(), None);
+    assert!(fs2.query("state == \"junk\"").unwrap().is_empty());
+    let results = fs2.query("state == \"final\"").unwrap();
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].0.id, keep_id);
 }
 
 #[test]

@@ -789,6 +789,75 @@ impl<D: BlockDevice> UnaFS<D> {
         Ok(())
     }
 
+    /// Remove attribute `key` from `inode_id`: the inline value or the
+    /// spilled extent-backed value goes, and every catalog index entry for
+    /// this (inode, key) pair is scrubbed — including the duplicates that
+    /// `set_attribute` appends on re-set. After completion the attribute is
+    /// gone from `get_attribute` AND from `query`; a spilled value frees
+    /// its extents back to the bitmap. Other attributes on the inode are
+    /// untouched.
+    ///
+    /// Returns [`FileSystemError::AttributeNotFound`] if the inode carries
+    /// no such attribute.
+    ///
+    /// (Catalog entries are matched by 64-bit FNV-1a key hash — the same
+    /// assumption the query engine's candidate selection already rests on.)
+    ///
+    /// # Crash windows (no journal replay; ordered leak-not-dangle)
+    /// 1. After the catalog rewrite, before the inode write: the attribute
+    ///    is still on the inode (`get_attribute` sees it) but invisible to
+    ///    queries — unindexed, not inconsistent.
+    /// 2. After the inode write, before the frees: a spilled value's
+    ///    extents are leaked (allocated, unreferenced).
+    /// The catalog rewrite itself is new-extents-then-inode-swap (old-or-
+    /// new, never torn), and a torn op is reported as a dirty mount.
+    pub fn remove_attribute(&mut self, inode_id: u64, key: &str) -> Result<(), FileSystemError> {
+        let mut inode = self.read_inode(inode_id)?;
+        if !inode.attributes.contains_key(key) && !inode.large_attributes.contains_key(key) {
+            return Err(FileSystemError::AttributeNotFound);
+        }
+
+        self.journal.log(
+            &mut self.device,
+            JournalOp::BeginOp {
+                op_id: inode_id,
+                desc: format!("RemoveAttr: {}", key),
+            },
+        )?;
+
+        // 1. Scrub the index first (see the crash-window note): every entry
+        //    for this inode + key hash, whatever value it recorded.
+        let key_hash = hash_bytes(key.as_bytes());
+        self.remove_catalog_entries(|e| e.inode_id == inode_id && e.key_hash == key_hash)?;
+
+        // 2. Drop the attribute from the inode — a single-block write.
+        inode.attributes.remove(key);
+        let spilled = inode.large_attributes.remove(key);
+        self.write_inode(&inode)?;
+
+        // 3. Free a spilled value's extents, now that nothing references
+        //    them.
+        if let Some(extents) = spilled {
+            self.free_extents(&extents)?;
+        } else {
+            self.sync_metadata()?;
+        }
+
+        self.journal
+            .log(&mut self.device, JournalOp::EndOp { op_id: inode_id })?;
+
+        #[cfg(feature = "std")]
+        {
+            let msg = SMessage::FileEvent {
+                path: format!("inode:{}", inode_id),
+                event: format!("AttributeRemoved:{}", key),
+            };
+            let _ = self.publish("system/fs/change", msg);
+        }
+
+        Ok(())
+    }
+
     // --- QUERY ENGINE ---
 
     /// Semantic query engine. no_std-capable: the similarity path routes its
