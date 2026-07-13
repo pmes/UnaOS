@@ -808,6 +808,172 @@ fn fs_mv(console: &mut Console, src: &str, dst: &str) {
     }
 }
 
+/// JD12: render bytes as printable text for the console — LF is kept as a line break, CR is dropped,
+/// and any other non-printing byte renders as `.`. The single rendering rule shared by `cat`/`head`/
+/// `tail` so a file reads identically however it is viewed (and mirrors identically into the JD11
+/// serial transcript). Returns the whole rendered string; the caller splits on `'\n'` to print lines.
+fn render_text(data: &[u8]) -> String {
+    data.iter().filter_map(|&b| match b {
+        b'\n' => Some('\n'),
+        b'\r' => None,
+        0x20..=0x7e => Some(b as char),
+        _ => Some('.'),
+    }).collect()
+}
+
+/// JD12: the `cat` core — read a resolved FILE entry (bounded to `CAP` bytes so a huge file can't
+/// flood the console) and print it as printable text, noting a byte-bounded short read. Shared by the
+/// single-path `cat <file>` and the wildcard `cat *.EXT` (JD12-M2), so the rendering + truncation note
+/// live in exactly one place. `de` must be a file — a directory surfaces `-EISDIR` from `read_file`.
+fn cat_render(console: &mut Console, fs: &FatFs, de: &DirEntry, canon: &str) {
+    const CAP: usize = 8192;
+    let mut data: Vec<u8> = Vec::new();
+    match fs.read_file(de, &mut data, CAP) {
+        Ok(()) => {
+            for line in render_text(&data).split('\n') {
+                console.println(line);
+            }
+            // Bound the read so a huge file (e.g. kernel.elf) can't flood the console.
+            if (de.size as usize) > data.len() {
+                console.println(&alloc::format!(
+                    "[... {} of {} bytes shown]", data.len(), de.size));
+            }
+        }
+        Err(FatError::IsDirectory) =>
+            console.println(&alloc::format!("cat: {}: is a directory (-EISDIR)", canon)),
+        Err(e) => console.println(&alloc::format!("cat: {}: {:?}", canon, e)),
+    }
+}
+
+/// JD12 `head <path> [n]`: print the FIRST `n` lines of a file (default 10). Streams from offset 0 via
+/// the offset-aware `read_at` in bounded windows and STOPS as soon as `n` newlines are seen — so
+/// `head 10` of a huge file reads only the first window(s), never the whole file. A byte ceiling
+/// (`HEAD_MAX`) backstops a file with no (or too few) newlines so an unterminated giant line still
+/// bounds the read and the heap. A directory or the root is `-EISDIR`. Every access rides the JD3
+/// wall-clock BOT pump — a stalled transfer is `-EIO`, never a hang on the timerless EL1 core.
+fn fs_head(console: &mut Console, arg: &str, n: u32) {
+    let fs = match crate::fs::fat::mount() {
+        Ok(fs) => fs,
+        Err(e) => return console.println(&alloc::format!("head: no FAT filesystem ({:?})", e)),
+    };
+    let (de, canon) = match resolve_path(&fs, &normalize_path(&cwd_path(), arg)) {
+        Ok(Resolved::Root) => return console.println("head: /: is a directory (-EISDIR)"),
+        Ok(Resolved::Entry(de, canon)) => {
+            if de.is_dir {
+                return console.println(&alloc::format!("head: {}: is a directory (-EISDIR)", canon));
+            }
+            (de, canon)
+        }
+        Err(msg) => return console.println(&alloc::format!("head: {}", msg)),
+    };
+    const WINDOW: usize = 4096;
+    const HEAD_MAX: u32 = 64 * 1024; // ceiling: an unterminated giant line still bounds the read
+    let (fc, size) = (de.first_cluster(), de.size);
+    let (mut off, mut lines) = (0u32, 0u32);
+    let mut cur = String::new(); // the line under construction (rendered, per `render_text`'s rules)
+    let mut buf: Vec<u8> = Vec::new();
+    let mut more = false; // does content remain AFTER the nth line? — drives the truncation note
+    'outer: while off < size && off < HEAD_MAX && lines < n {
+        buf.clear();
+        if let Err(e) = fs.read_at(fc, size, off, &mut buf, WINDOW) {
+            return console.println(&alloc::format!("head: {}: {} ({:?})", canon, fat_errno(e), e));
+        }
+        if buf.is_empty() {
+            break; // chain ended before de.size (malformed) — show what we have, honestly
+        }
+        for (i, &b) in buf.iter().enumerate() {
+            match b {
+                b'\n' => {
+                    console.println(&cur);
+                    cur.clear();
+                    lines += 1;
+                    if lines >= n {
+                        // More remains iff any byte follows this newline — in this window, or the
+                        // file continues past it. (`off` still holds this window's start here.)
+                        more = i + 1 < buf.len() || off + (buf.len() as u32) < size;
+                        break 'outer;
+                    }
+                }
+                b'\r' => {}
+                0x20..=0x7e => cur.push(b as char),
+                _ => cur.push('.'),
+            }
+        }
+        off += buf.len() as u32;
+    }
+    // A final line with no trailing newline (we stopped before `n` full lines): print it.
+    if lines < n && !cur.is_empty() {
+        console.println(&cur);
+        lines += 1;
+    }
+    // Note when more lines exist than shown: content followed the nth line (`more`), or the byte
+    // ceiling cut a still-growing file before we reached `n` lines.
+    if more || (lines < n && off < size) {
+        console.println(&alloc::format!("[... first {} line(s) shown]", lines));
+    }
+}
+
+/// JD12 `tail <path> [n]`: print the LAST `n` lines of a file (default 10). Reads a bounded window at
+/// the END of the file (`TAIL_MAX` bytes ending at EOF) via the offset-aware `read_at`, renders it,
+/// and prints the last `n` lines. If the window began mid-file, its first (cut) line is dropped and a
+/// note records the bound. A directory or the root is `-EISDIR`; an empty file prints nothing. Every
+/// access rides the JD3 wall-clock BOT pump — a stalled transfer is `-EIO`, never a hang.
+fn fs_tail(console: &mut Console, arg: &str, n: u32) {
+    let fs = match crate::fs::fat::mount() {
+        Ok(fs) => fs,
+        Err(e) => return console.println(&alloc::format!("tail: no FAT filesystem ({:?})", e)),
+    };
+    let (de, canon) = match resolve_path(&fs, &normalize_path(&cwd_path(), arg)) {
+        Ok(Resolved::Root) => return console.println("tail: /: is a directory (-EISDIR)"),
+        Ok(Resolved::Entry(de, canon)) => {
+            if de.is_dir {
+                return console.println(&alloc::format!("tail: {}: is a directory (-EISDIR)", canon));
+            }
+            (de, canon)
+        }
+        Err(msg) => return console.println(&alloc::format!("tail: {}", msg)),
+    };
+    const TAIL_MAX: u32 = 64 * 1024; // bounded tail window: only the last TAIL_MAX bytes are scanned
+    let (fc, size) = (de.first_cluster(), de.size);
+    if size == 0 {
+        return; // empty file — tail shows nothing
+    }
+    let start = size.saturating_sub(TAIL_MAX);
+    let mut buf: Vec<u8> = Vec::new();
+    if let Err(e) = fs.read_at(fc, size, start, &mut buf, (size - start) as usize) {
+        return console.println(&alloc::format!("tail: {}: {} ({:?})", canon, fat_errno(e), e));
+    }
+    let text = render_text(&buf);
+    if text.is_empty() {
+        return;
+    }
+    let mut lines: Vec<&str> = text.split('\n').collect();
+    // A file ending in '\n' yields a trailing "" element — it is not a real last line.
+    if text.ends_with('\n') {
+        lines.pop();
+    }
+    // A window that began mid-file usually cuts its first line — but not if it happens to start on a
+    // line boundary. Decide precisely: the first line is a partial iff the byte just before `start`
+    // is not a newline (one extra byte read; only when windowed, so essentially never in practice).
+    let windowed = start > 0;
+    if windowed {
+        let mut probe: Vec<u8> = Vec::new();
+        let cut = fs.read_at(fc, size, start - 1, &mut probe, 1).is_err()
+            || probe.first() != Some(&b'\n');
+        if cut && !lines.is_empty() {
+            lines.remove(0);
+        }
+    }
+    let from = lines.len().saturating_sub(n as usize);
+    if windowed {
+        console.println(&alloc::format!(
+            "[... tail of {} bytes; last {} line(s)]", size, lines.len() - from));
+    }
+    for line in &lines[from..] {
+        console.println(line);
+    }
+}
+
 /// Print one directory's entries in the `ls` table format, with the file/dir tally.
 fn print_dir_listing(console: &mut Console, entries: &[DirEntry]) {
     let (mut files, mut dirs) = (0u32, 0u32);
@@ -821,6 +987,285 @@ fn print_dir_listing(console: &mut Console, entries: &[DirEntry]) {
         }
     }
     console.println(&alloc::format!("{} file(s), {} dir(s)", files, dirs));
+}
+
+// ---------------------------------------------------------------------------------------------
+// JD12 — wildcard globbing (`ls *.C`, `cat *.MD`, `rm *.TXT`, `cp *.TXT DIR/`, `mv *.LOG ARCH/`).
+//
+// A single TRAILING glob in a path's LAST component is expanded against the parent directory via the
+// read-only `read_dir` (case-insensitive 8.3 matching, already proven for `cd`/`cat`). Expansion is
+// invoked ONLY inside the fs-verb arms below — the shared arg-split at the top of `dispatch_command`
+// is unchanged, and the NET command region (netinfo/ping/arp/connect/udpsend/get — a sockets-arc
+// lane) never sees a glob. A verb loops over the matches (SNAPSHOT-then-act: the match list is
+// captured before any mutation, so a `rm *.TXT` that deletes as it goes never invalidates its own
+// list). A glob with no match is an honest per-pattern "no match" note; a name with no metacharacter
+// passes through literally (byte-identical to pre-JD12). Only the leaf is a pattern — a metacharacter
+// in an earlier component resolves literally (an honest `-ENOENT`), never a mid-path wildcard walk.
+
+/// True if `s` carries a glob metacharacter (`*` = any run, `?` = exactly one char).
+fn has_glob(s: &str) -> bool {
+    s.bytes().any(|b| b == b'*' || b == b'?')
+}
+
+/// Case-insensitive 8.3 wildcard match: `*` matches any run (including empty), `?` exactly one
+/// character; every other byte is literal. Iterative with star-backtrack — no recursion, no
+/// allocation. `name` is a canonical on-disk 8.3 name (e.g. `README.TXT`), `pat` the leaf pattern.
+fn glob_match(pat: &str, name: &str) -> bool {
+    let p = pat.as_bytes();
+    let n = name.as_bytes();
+    let (mut pi, mut ni) = (0usize, 0usize);
+    let (mut star, mut resume) = (usize::MAX, 0usize); // last '*' seen in `p`, and where to resume `n`
+    while ni < n.len() {
+        if pi < p.len() && (p[pi] == b'?' || p[pi].eq_ignore_ascii_case(&n[ni])) {
+            pi += 1;
+            ni += 1;
+        } else if pi < p.len() && p[pi] == b'*' {
+            star = pi;
+            resume = ni;
+            pi += 1; // let '*' match zero chars first; a later mismatch backtracks and extends it
+        } else if star != usize::MAX {
+            pi = star + 1;
+            resume += 1;
+            ni = resume; // '*' swallows one more char of `n`, then retry the rest of the pattern
+        } else {
+            return false;
+        }
+    }
+    while pi < p.len() && p[pi] == b'*' {
+        pi += 1; // any trailing '*'s match the (now empty) tail of `n`
+    }
+    pi == p.len()
+}
+
+/// The result of expanding ONE path argument. `Literal` = no metacharacter in the leaf — the arg
+/// passed through unchanged (byte-identical to pre-JD12; also covers a glob confined to a NON-trailing
+/// component, which resolves literally). `Matched` = a trailing-glob leaf resolved against
+/// `parent_canon`'s directory to zero or more entries; an empty `entries` (including a parent that
+/// does not resolve to a directory) is an honest "no match".
+enum Glob {
+    Literal(String),
+    Matched { parent_canon: String, entries: Vec<DirEntry> },
+}
+
+/// Expand a shell path arg for the fs-verb glob (JD12). A metacharacter is honored ONLY in the LAST
+/// path component; a glob in an earlier component is treated literally (its parent resolve fails ⇒ no
+/// match, an honest error at the verb). Case-insensitive; `.`/`..` filtered; matches sorted so a
+/// listing / serial transcript is deterministic.
+fn glob_expand(fs: &FatFs, arg: &str) -> Glob {
+    let norm = normalize_path(&cwd_path(), arg);
+    let comps: Vec<&str> = norm.split('/').filter(|c| !c.is_empty()).collect();
+    let leaf = match comps.last() {
+        Some(l) => *l,
+        None => return Glob::Literal(norm), // arg normalized to "/" — nothing to glob
+    };
+    if !has_glob(leaf) {
+        return Glob::Literal(String::from(arg)); // pass the ORIGINAL typed arg through unchanged
+    }
+    // Resolve the PARENT (everything but the leaf) to a directory cluster + its canonical path.
+    let (parent_cluster, parent_canon) = if comps.len() == 1 {
+        (0u32, String::new()) // the volume root
+    } else {
+        let mut parent_path = String::new();
+        for c in &comps[..comps.len() - 1] {
+            parent_path.push('/');
+            parent_path.push_str(c);
+        }
+        match resolve_path(fs, &parent_path) {
+            Ok(Resolved::Root) => (0u32, String::new()),
+            Ok(Resolved::Entry(de, canon)) if de.is_dir => (de.first_cluster(), canon),
+            _ => return Glob::Matched { parent_canon: parent_path, entries: Vec::new() }, // no dir → no match
+        }
+    };
+    let mut entries: Vec<DirEntry> = match fs.read_dir(parent_cluster) {
+        Ok(es) => es
+            .into_iter()
+            .filter(|de| {
+                let nm = de.name();
+                nm != "." && nm != ".." && glob_match(leaf, nm)
+            })
+            .collect(),
+        Err(_) => Vec::new(),
+    };
+    entries.sort_by(|a, b| a.name().cmp(b.name()));
+    Glob::Matched { parent_canon, entries }
+}
+
+/// Resolve `path` and print it in the `ls` table format (the single-path `ls` core, shared by the
+/// `ls` arm and the wildcard `ls *.EXT` Literal fall-through). A directory lists its entries; a plain
+/// file prints its one table line (the DOS idiom); errors are errno-tagged.
+fn ls_resolved(console: &mut Console, fs: &FatFs, path: &str) {
+    match resolve_path(fs, path) {
+        Ok(Resolved::Root) => match fs.read_dir(0) {
+            Ok(entries) => print_dir_listing(console, &entries),
+            Err(e) => console.println(&alloc::format!("ls: /: read failed ({:?}, -EIO)", e)),
+        },
+        Ok(Resolved::Entry(de, canon)) => {
+            if de.is_dir {
+                match fs.read_dir(de.first_cluster()) {
+                    Ok(entries) => print_dir_listing(console, &entries),
+                    Err(e) => console.println(&alloc::format!(
+                        "ls: {}: read failed ({:?}, -EIO)", canon, e)),
+                }
+            } else {
+                console.println(&alloc::format!("  {:>10}  {}", de.size, de.name()));
+            }
+        }
+        Err(msg) => console.println(&alloc::format!("ls: {}", msg)),
+    }
+}
+
+/// JD4 `ls`/`ls <dir>` (single path): mount + resolve + print. Extracted so the wildcard `ls *.EXT`
+/// can share the exact resolve/print behaviour for a non-trailing-glob fall-through.
+fn ls_path(console: &mut Console, arg: &str) {
+    match crate::fs::fat::mount() {
+        Ok(fs) => ls_resolved(console, &fs, &normalize_path(&cwd_path(), arg)),
+        Err(e) => console.println(&alloc::format!("ls: no FAT filesystem ({:?})", e)),
+    }
+}
+
+/// JD12 `ls *.EXT`: list every entry matching a wildcard, one `ls`-table line each (sorted), with the
+/// file/dir tally. A directory match shows as `<DIR>` (its contents are not expanded — that mirrors
+/// how a shell hands matched names to `ls`); no match is an honest "no match".
+fn ls_globbed(console: &mut Console, arg: &str) {
+    let fs = match crate::fs::fat::mount() {
+        Ok(fs) => fs,
+        Err(e) => return console.println(&alloc::format!("ls: no FAT filesystem ({:?})", e)),
+    };
+    match glob_expand(&fs, arg) {
+        Glob::Literal(p) => ls_resolved(console, &fs, &normalize_path(&cwd_path(), &p)),
+        Glob::Matched { entries, .. } if entries.is_empty() =>
+            console.println(&alloc::format!("ls: {}: no match", arg)),
+        Glob::Matched { entries, .. } => print_dir_listing(console, &entries),
+    }
+}
+
+/// JD12 `cat *.EXT`: cat every FILE matching a wildcard (concatenate), in sorted order — reusing
+/// `cat_render` per file so the rendering + truncation note are identical to a single-path `cat`. A
+/// directory match is skipped with the classic `-EISDIR` note; no match is an honest "no match". A
+/// glob confined to a non-trailing component falls through to a literal resolve (honest error).
+fn cat_globbed(console: &mut Console, arg: &str) {
+    let fs = match crate::fs::fat::mount() {
+        Ok(fs) => fs,
+        Err(e) => return console.println(&alloc::format!("cat: no FAT filesystem ({:?})", e)),
+    };
+    match glob_expand(&fs, arg) {
+        Glob::Literal(p) => match resolve_path(&fs, &normalize_path(&cwd_path(), &p)) {
+            Ok(Resolved::Root) => console.println("cat: /: is a directory (-EISDIR)"),
+            Ok(Resolved::Entry(de, canon)) => cat_render(console, &fs, &de, &canon),
+            Err(msg) => console.println(&alloc::format!("cat: {}", msg)),
+        },
+        Glob::Matched { entries, .. } if entries.is_empty() =>
+            console.println(&alloc::format!("cat: {}: no match", arg)),
+        Glob::Matched { parent_canon, entries } => {
+            for de in &entries {
+                let canon = joined(&parent_canon, de.name());
+                if de.is_dir {
+                    console.println(&alloc::format!("cat: {}: is a directory (-EISDIR)", canon));
+                } else {
+                    cat_render(console, &fs, de, &canon);
+                }
+            }
+        }
+    }
+}
+
+/// JD12: does `dst` (a shell path arg) resolve to an existing directory (or the root)? A multi-source
+/// `cp`/`mv` requires it — several sources can only land INTO a directory, not onto one target name.
+fn dst_is_dir(fs: &FatFs, dst: &str) -> bool {
+    match resolve_path(fs, &normalize_path(&cwd_path(), dst)) {
+        Ok(Resolved::Root) => true,
+        Ok(Resolved::Entry(de, _)) => de.is_dir,
+        Err(_) => false,
+    }
+}
+
+/// JD12: expand the SOURCE args of a `cp`/`mv` into concrete source paths, printing a per-pattern "no
+/// match" note (tagged with `verb`) for any wildcard that matched nothing. Literal args pass through
+/// unchanged. Returns the flattened, ordered list (SNAPSHOT: taken before any mutation runs).
+fn expand_sources(console: &mut Console, fs: &FatFs, verb: &str, sources: &[&str]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for s in sources {
+        match glob_expand(fs, s) {
+            Glob::Literal(p) => out.push(p),
+            Glob::Matched { entries, .. } if entries.is_empty() =>
+                console.println(&alloc::format!("{}: {}: no match", verb, s)),
+            Glob::Matched { parent_canon, entries } => {
+                for de in &entries {
+                    out.push(joined(&parent_canon, de.name()));
+                }
+            }
+        }
+    }
+    out
+}
+
+/// JD12 `rm` with wildcards: `rm <path...>` — each arg a file target or a trailing glob.
+/// SNAPSHOT-then-delete (`glob_expand` captures the match list before any delete), so a wildcard
+/// delete never invalidates its own list. A wildcard with no match is an honest per-pattern note;
+/// each concrete target rides the existing per-file `fs_rm` (directory → `-EISDIR`, use `rmdir`).
+fn rm_globbed(console: &mut Console, args: &[&str]) {
+    let fs = match crate::fs::fat::mount() {
+        Ok(fs) => fs,
+        Err(e) => return console.println(&alloc::format!("rm: no FAT filesystem ({:?})", e)),
+    };
+    for a in args {
+        match glob_expand(&fs, a) {
+            Glob::Literal(p) => fs_rm(console, &p),
+            Glob::Matched { entries, .. } if entries.is_empty() =>
+                console.println(&alloc::format!("rm: {}: no match", a)),
+            Glob::Matched { parent_canon, entries } => {
+                for de in &entries {
+                    fs_rm(console, &joined(&parent_canon, de.name()));
+                }
+            }
+        }
+    }
+}
+
+/// JD12 `cp` with wildcards / multiple sources: `cp [-r] <src...> <dst>`. Sources expand (globs +
+/// literals); with more than one source the destination MUST be an existing directory (several files
+/// can only land INTO a directory). Each source rides the existing `fs_cp` / `fs_cp_recursive` (the
+/// `FILE DIR/` idiom lands each under `dst/<leaf>`). SNAPSHOT-then-copy.
+fn cp_globbed(console: &mut Console, sources: &[&str], dst: &str, recursive: bool) {
+    let fs = match crate::fs::fat::mount() {
+        Ok(fs) => fs,
+        Err(e) => return console.println(&alloc::format!("cp: no FAT filesystem ({:?})", e)),
+    };
+    let srcs = expand_sources(console, &fs, "cp", sources);
+    if srcs.is_empty() {
+        return; // every pattern was empty (each already reported "no match")
+    }
+    if srcs.len() > 1 && !dst_is_dir(&fs, dst) {
+        return console.println(&alloc::format!("cp: target {}: not a directory (-ENOTDIR)", dst));
+    }
+    for s in &srcs {
+        if recursive {
+            fs_cp_recursive(console, s, dst);
+        } else {
+            fs_cp(console, s, dst);
+        }
+    }
+}
+
+/// JD12 `mv` with wildcards / multiple sources: `mv <src...> <dst>`. Sources expand; with more than
+/// one source the destination MUST be an existing directory. Each source rides the existing `fs_mv`
+/// (the `SRC DIR/` idiom lands each under `dst/<leaf>`). SNAPSHOT-then-move — a wildcard move never
+/// invalidates its own list.
+fn mv_globbed(console: &mut Console, sources: &[&str], dst: &str) {
+    let fs = match crate::fs::fat::mount() {
+        Ok(fs) => fs,
+        Err(e) => return console.println(&alloc::format!("mv: no FAT filesystem ({:?})", e)),
+    };
+    let srcs = expand_sources(console, &fs, "mv", sources);
+    if srcs.is_empty() {
+        return;
+    }
+    if srcs.len() > 1 && !dst_is_dir(&fs, dst) {
+        return console.println(&alloc::format!("mv: target {}: not a directory (-ENOTDIR)", dst));
+    }
+    for s in &srcs {
+        fs_mv(console, s, dst);
+    }
 }
 
 pub struct History {
@@ -864,11 +1309,13 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
             console.println("COMMANDS: ver, help, clear, echo, panic, gneiss");
             console.println("STORAGE:  diskinfo, usbinfo, read <lba>, write <lba> <byte>");
             console.println("FILES:    fatinfo (FAT geometry), ls [dir], cd [dir], pwd, cat <path>");
+            console.println("PAGING:   head <path> [n], tail <path> [n]  (first / last n lines, default 10)");
             console.println("WRITE:    touch <path>, write <path> <text>, append <path> <text>, rm <path>");
             console.println("DIRS:     mkdir <path>, rmdir <path>  (create / remove empty directories)");
             console.println("COPY:     cp <src> <dst>  (copy a file; cp FILE DIR/ lands as DIR/<leaf>)");
             console.println("          cp -r <srcdir> <dst>  (recursively copy a directory tree)");
-            console.println("MOVE:     mv <src> <dst>  (move/rename a file or dir, O(1); mv SRC DIR/ lands as DIR/<leaf>)");
+            console.println("MOVE:     mv <src...> <dst>  (move/rename a file or dir, O(1); mv SRC DIR/ lands as DIR/<leaf>)");
+            console.println("WILDCARD: * / ? in the last path component — ls/cat/rm/cp/mv expand it (e.g. rm *.TMP, cp *.TXT DOCS/)");
             console.println("          (create/edit/delete/copy/move files & dirs anywhere in the tree; sync = write-through, durable)");
             #[cfg(target_arch = "aarch64")]
             console.println("UNAFS:    uls [path], ucat <path>  (native unafs volume, read-only)");
@@ -914,28 +1361,11 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
         },
         "ls" | "dir" => {
             // JD4: `ls` lists the cwd; `ls <dir>` any path (absolute or cwd-relative). An `ls` of
-            // a plain file prints its one table line (the DOS idiom), not an error.
-            let path = normalize_path(&cwd_path(), args.first().copied().unwrap_or("."));
-            match crate::fs::fat::mount() {
-                Ok(fs) => match resolve_path(&fs, &path) {
-                    Ok(Resolved::Root) => match fs.read_dir(0) {
-                        Ok(entries) => print_dir_listing(console, &entries),
-                        Err(e) => console.println(&alloc::format!("ls: /: read failed ({:?}, -EIO)", e)),
-                    },
-                    Ok(Resolved::Entry(de, canon)) => {
-                        if de.is_dir {
-                            match fs.read_dir(de.first_cluster()) {
-                                Ok(entries) => print_dir_listing(console, &entries),
-                                Err(e) => console.println(&alloc::format!(
-                                    "ls: {}: read failed ({:?}, -EIO)", canon, e)),
-                            }
-                        } else {
-                            console.println(&alloc::format!("  {:>10}  {}", de.size, de.name()));
-                        }
-                    }
-                    Err(msg) => console.println(&alloc::format!("ls: {}", msg)),
-                },
-                Err(e) => console.println(&alloc::format!("ls: no FAT filesystem ({:?})", e)),
+            // a plain file prints its one table line (the DOS idiom), not an error. JD12: `ls *.EXT`
+            // lists the wildcard matches (sorted, with the file/dir tally).
+            match args.first().copied() {
+                Some(a) if has_glob(a) => ls_globbed(console, a),
+                other => ls_path(console, other.unwrap_or(".")),
             }
         },
         "cd" => {
@@ -969,40 +1399,36 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
             // JD4: `cat` takes a path (absolute or cwd-relative), e.g. `cat DOCS/README.TXT`.
             match args.first() {
                 None => console.println("usage: cat <path>"),
+                Some(name) if has_glob(name) => cat_globbed(console, name),
                 Some(name) => match crate::fs::fat::mount() {
                     Ok(fs) => match resolve_path(&fs, &normalize_path(&cwd_path(), name)) {
                         Ok(Resolved::Root) =>
                             console.println("cat: /: is a directory (-EISDIR)"),
-                        Ok(Resolved::Entry(de, canon)) => {
-                            // Bound the read so a huge file (e.g. kernel.elf) can't flood the console.
-                            const CAP: usize = 8192;
-                            let mut data: Vec<u8> = Vec::new();
-                            match fs.read_file(&de, &mut data, CAP) {
-                                Ok(()) => {
-                                    // Render printable ASCII; keep LF, drop CR, others -> '.'.
-                                    let text: String = data.iter().filter_map(|&b| match b {
-                                        b'\n' => Some('\n'),
-                                        b'\r' => None,
-                                        0x20..=0x7e => Some(b as char),
-                                        _ => Some('.'),
-                                    }).collect();
-                                    for line in text.split('\n') {
-                                        console.println(line);
-                                    }
-                                    if (de.size as usize) > data.len() {
-                                        console.println(&alloc::format!(
-                                            "[... {} of {} bytes shown]", data.len(), de.size));
-                                    }
-                                }
-                                Err(FatError::IsDirectory) => console.println(&alloc::format!(
-                                    "cat: {}: is a directory (-EISDIR)", canon)),
-                                Err(e) => console.println(&alloc::format!("cat: {}: {:?}", canon, e)),
-                            }
-                        }
+                        Ok(Resolved::Entry(de, canon)) => cat_render(console, &fs, &de, &canon),
                         Err(msg) => console.println(&alloc::format!("cat: {}", msg)),
                     },
                     Err(e) => console.println(&alloc::format!("cat: no FAT filesystem ({:?})", e)),
                 },
+            }
+        },
+        "head" => {
+            // JD12: print the FIRST n lines of a file (default 10). `head <path> [n]`.
+            match args.first() {
+                None => console.println("usage: head <path> [lines]"),
+                Some(path) => {
+                    let n = args.get(1).and_then(|s| s.parse::<u32>().ok()).unwrap_or(10);
+                    fs_head(console, path, n);
+                }
+            }
+        },
+        "tail" => {
+            // JD12: print the LAST n lines of a file (default 10). `tail <path> [n]`.
+            match args.first() {
+                None => console.println("usage: tail <path> [lines]"),
+                Some(path) => {
+                    let n = args.get(1).and_then(|s| s.parse::<u32>().ok()).unwrap_or(10);
+                    fs_tail(console, path, n);
+                }
             }
         },
         #[cfg(target_arch = "aarch64")]
@@ -1086,10 +1512,17 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
             }
         },
         "rm" | "del" => {
-            // JD6: delete a file in any reachable dir (directory → -EISDIR; use `rmdir`). `rm <path>`.
-            match args.first() {
-                None => console.println("usage: rm <path>"),
-                Some(name) => fs_rm(console, name),
+            // JD6: delete a file in any reachable dir (directory → -EISDIR; use `rmdir`). JD12: takes
+            // multiple targets and expands trailing wildcards — `rm <path...>`, `rm *.TMP`.
+            if args.is_empty() {
+                console.println("usage: rm <path> [path ...]");
+            } else if !args.iter().any(|a| has_glob(a)) {
+                // No wildcard: delete each literal target (a single arg is byte-identical to pre-JD12).
+                for &a in &args {
+                    fs_rm(console, a);
+                }
+            } else {
+                rm_globbed(console, &args);
             }
         },
         "mkdir" | "md" => {
@@ -1110,23 +1543,39 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
             // JD8: copy a file (`cp FILE DIR/` lands as DIR/<leaf>). JD9: `-r`/`-R` recursively copies a
             // directory tree. Flags (leading `-`) precede the paths; only `-r`/`-R` are recognized (any
             // other leading-`-` arg is ignored as an unknown flag — a name literally beginning with `-` is
-            // reachable as `./-name`). `cp <src> <dst>` | `cp -r <srcdir> <dst>`.
+            // reachable as `./-name`). JD12: sources expand trailing wildcards and there may be several,
+            // the LAST path being the destination (into a directory). `cp [-r] <src...> <dst>`.
             let recursive = args.iter().any(|a| *a == "-r" || *a == "-R");
             let paths: Vec<&str> = args.iter().copied().filter(|a| !a.starts_with('-')).collect();
-            match (paths.first(), paths.get(1)) {
-                (Some(src), Some(dst)) if recursive => fs_cp_recursive(console, src, dst),
-                (Some(src), Some(dst)) => fs_cp(console, src, dst),
-                _ => console.println("usage: cp [-r] <src> <dst>"),
+            if paths.len() < 2 {
+                console.println("usage: cp [-r] <src...> <dst>");
+            } else if paths.len() == 2 && !has_glob(paths[0]) && !has_glob(paths[1]) {
+                // No wildcard, one src: byte-identical to pre-JD12 cp.
+                if recursive {
+                    fs_cp_recursive(console, paths[0], paths[1]);
+                } else {
+                    fs_cp(console, paths[0], paths[1]);
+                }
+            } else {
+                let dst = paths[paths.len() - 1];
+                cp_globbed(console, &paths[..paths.len() - 1], dst, recursive);
             }
         },
         "mv" | "move" | "ren" | "rename" => {
             // JD10: move OR rename a file or directory by relinking one directory entry (O(1), by
             // reference — no data copy, so `mv DIR NEWNAME` needs no `-r`). Same parent → rename in
             // place (files AND dirs); across parents → move (files only, a dir there is -EISDIR). The
-            // `mv SRC DIR/` idiom lands the entry under DIR as the source leaf. `mv <src> <dst>`.
-            match (args.first(), args.get(1)) {
-                (Some(src), Some(dst)) => fs_mv(console, src, dst),
-                _ => console.println("usage: mv <src> <dst>"),
+            // `mv SRC DIR/` idiom lands the entry under DIR as the source leaf. JD12: sources expand
+            // trailing wildcards and there may be several, the LAST path being the destination
+            // directory. `mv <src...> <dst>`.
+            if args.len() < 2 {
+                console.println("usage: mv <src...> <dst>");
+            } else if args.len() == 2 && !has_glob(args[0]) && !has_glob(args[1]) {
+                // No wildcard, one src: byte-identical to pre-JD12 mv.
+                fs_mv(console, args[0], args[1]);
+            } else {
+                let dst = args[args.len() - 1];
+                mv_globbed(console, &args[..args.len() - 1], dst);
             }
         },
         "sync" => {

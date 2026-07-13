@@ -219,6 +219,40 @@ Spec promotions committed here; the granular arc detail is in each arc's own ent
 
 ---
 
+## hw-jetson track — 2026-07-13 (JD12 — paging & wildcard globbing on the panel shell)
+
+### JD12 — `head`/`tail` paging + `*`/`?` wildcard globbing (`shell.rs`-only, call-never-edit) 🔬 `hw-jetson`
+- **Why:** the classic file-manager verb set closed at JD10 and JD11 made benches self-documenting; JD12 is
+  the polish pass — two user-facing conveniences over that set, no new `fat.rs` surface. Paging lets you read
+  a long file's head/tail without flooding the scrollback-less panel; globbing multiplies every fs verb
+  (`rm *.TMP`, `cp *.TXT DOCS/`, `mv *.LOG ARCHIVE/`), the biggest remaining in-lane win.
+- **Paging (M1):** `head <path> [n]` / `tail <path> [n]` — first / last `n` lines (default 10). `head` streams
+  from offset 0 via the offset-aware `read_at` and STOPS at `n` newlines (so `head 10` of a huge file never
+  slurps it; a 64 KiB ceiling backstops an unterminated line); `tail` reads a bounded 64 KiB window at EOF,
+  probes the byte before it to keep or drop a boundary line precisely, and prints the last `n`. `cat`/`head`/
+  `tail` share one `render_text`; `cat`'s body moved onto a `cat_render` helper (byte-identical) the wildcard
+  `cat` reuses.
+- **Globbing (M2–M3):** a single TRAILING glob in a path's last component expands against `read_dir` of its
+  parent (case-insensitive 8.3; `*` = any run, `?` = one char, via an iterative star-backtrack matcher).
+  Wired into `ls`/`cat` first (non-destructive), then `rm` (multi-target) and `cp`/`mv` (multi-source, LAST
+  path = destination; `>1` source requires the destination be an existing directory, else `-ENOTDIR`).
+  Expansion is invoked ONLY inside the fs-verb arms — the shared arg-split and the NET arms
+  (`netinfo`/`ping`/`arp`/`connect`/`udpsend`/`get`, a sockets-arc lane) are untouched. **Snapshot-then-act**:
+  the match list is captured before any mutation, so a `rm *.TXT` never invalidates its own list; no match is
+  an honest per-pattern note; the single-source / no-wildcard case is byte-identical to pre-JD12.
+- **Tested (QEMU):** `check` + `UNAOS_TEGRA=1 check` green both arches (no new warnings); `test-arm 22`
+  MISSION; `UNAOS_GICV3=1 test-arm 40` CAPSTONE 6/6; `UNAOS_HUBSTORAGE=1 test 25` MISSION (shared `shell.rs`
+  guard); `esp-jetson` links, **109 `tegra:` strings** — UNCHANGED from JD11 (the new verbs carry no `tegra:`
+  token; the ELF grew to ~725 KB purely from the base's merged SOCK-3/UNAFS-K3, not JD12 — validate by count,
+  not size). Zero x86 behavioural change. A 1-lens adversarial review found no data-correctness bug; two
+  low-severity truncation-note edges were folded in. No `kernel8-test` on the jetson side.
+- **Metal:** ⏳ **ATTENDED-PENDING** — the interactive path only runs on silicon (tegra never runs in QEMU).
+  Bench card [`jd12-bench.md`](../unaos/scripts/jd12-bench.md): page a file, then glob `ls`/`cat`/`cp`/`rm`/`mv`
+  over a set of same-extension files and confirm on the JD11 serial transcript that the right files are
+  touched, a no-match pattern reports honestly, and a multi-source copy onto a non-directory is `-ENOTDIR`.
+- **Detail:** [`arch_arm64.md` §JD12](dev/OS/01_BOOT_HAL/arch_arm64.md). **Commit:** on `hw-jetson` (the seat
+  assigns the integration hash at merge).
+
 ## hw-jetson track — 2026-07-12 (JD11 — mirroring shell command output to serial)
 
 ### JD11 — mirror panel command output to serial for a durable bench transcript (`shell.rs`/`console.rs` lane) 🔬 `hw-jetson`
