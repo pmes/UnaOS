@@ -26,11 +26,8 @@ use alloc::vec::Vec;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-#[cfg(feature = "std")]
 use crate::catalog::hash_value;
-#[cfg(feature = "std")]
 use crate::hash::hash_bytes;
-#[cfg(feature = "std")]
 use crate::query::{Query, QueryOp};
 #[cfg(feature = "std")]
 use bandy::{BandyMember, SMessage};
@@ -578,9 +575,9 @@ impl<D: BlockDevice> UnaFS<D> {
 
     // --- QUERY ENGINE ---
 
-    /// Semantic query engine. Host-only: the similarity path needs floating-point
-    /// `sqrt`, which is not available in `core`.
-    #[cfg(feature = "std")]
+    /// Semantic query engine. no_std-capable: the similarity path routes its
+    /// floating-point `sqrt` through `libm`, so kernel (`no_std`) and host
+    /// (`std`) builds score along the same code path.
     pub fn query(&mut self, query_str: &str) -> Result<Vec<(Inode, f32)>, FileSystemError> {
         let query = Query::parse(query_str).map_err(|e| FileSystemError::Query(e))?;
 
@@ -747,22 +744,29 @@ impl<D: BlockDevice> BandyMember for UnaFS<D> {
     }
 }
 
-/// Cosine similarity. Host-only: needs floating-point `sqrt` (not in `core`).
-#[cfg(feature = "std")]
+/// Cosine similarity between two `f32` vectors.
+///
+/// The square roots go through [`libm::sqrtf`] on every build — `std` and
+/// `no_std` alike — so there is exactly ONE scoring path: a query answered by
+/// the kernel over a mounted volume and the same query answered by a host
+/// tool produce bit-identical scores. (`libm::sqrtf` is correctly rounded per
+/// IEEE 754, matching `f32::sqrt` on hosts; `tests/query_kats.rs` pins both
+/// facts with golden vectors.)
+///
+/// Mismatched lengths and zero-magnitude inputs score `0.0`.
 pub fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
     if a.len() != b.len() {
         return 0.0;
     }
     let dot: f32 = a.iter().zip(b).map(|(x, y)| x * y).sum();
-    let mag_a: f32 = a.iter().map(|x| x * x).sum::<f32>().sqrt();
-    let mag_b: f32 = b.iter().map(|x| x * x).sum::<f32>().sqrt();
+    let mag_a: f32 = libm::sqrtf(a.iter().map(|x| x * x).sum::<f32>());
+    let mag_b: f32 = libm::sqrtf(b.iter().map(|x| x * x).sum::<f32>());
     if mag_a == 0.0 || mag_b == 0.0 {
         return 0.0;
     }
     dot / (mag_a * mag_b)
 }
 
-#[cfg(feature = "std")]
 fn check_condition(val: &AttributeValue, op: &QueryOp, target: &AttributeValue) -> Option<f32> {
     match op {
         QueryOp::Eq => {
@@ -814,9 +818,7 @@ fn check_condition(val: &AttributeValue, op: &QueryOp, target: &AttributeValue) 
     }
 }
 
-#[cfg(feature = "std")]
 use core::cmp::Ordering;
-#[cfg(feature = "std")]
 fn partial_cmp_attr(a: &AttributeValue, b: &AttributeValue) -> Option<Ordering> {
     match (a, b) {
         (AttributeValue::Int(i1), AttributeValue::Int(i2)) => i1.partial_cmp(i2),

@@ -6301,6 +6301,7 @@ dependencies = [
  "bandy",
  "bincode",
  "gneiss_pal",
+ "libm",
  "memmap2",
  "serde",
  "thiserror 2.0.18",

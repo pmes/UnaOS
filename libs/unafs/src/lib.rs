@@ -22,11 +22,12 @@
 //! # no_std
 //!
 //! The crate is `#![no_std]` + `alloc` by default-off: the on-disk format types,
-//! the [`codec`] serialization seam, the [`storage::BlockDevice`] trait, and the
-//! in-memory [`storage::MemDevice`] compile without `std`. The host-native
-//! backends — the `FileDevice` file backend, the [`io`] memory-map reader, the
-//! bandy event bus, and the semantic query engine (which needs floating-point
-//! `sqrt`) — live behind the default-on `std` feature.
+//! the [`codec`] serialization seam, the [`storage::BlockDevice`] trait, the
+//! in-memory [`storage::MemDevice`], and the semantic query engine
+//! ([`Query`] parsing, [`UnaFS::query`], and [`cosine_similarity`] — FP `sqrt`
+//! routed through `libm`) compile without `std`. The host-native backends —
+//! the `FileDevice` file backend, the [`io`] memory-map reader, and the bandy
+//! event bus — live behind the default-on `std` feature.
 
 #![cfg_attr(not(feature = "std"), no_std)]
 
@@ -53,7 +54,7 @@ pub use adapter::{
     SECTOR_SIZE, SECTORS_PER_BLOCK, SectorDevice, SectorError, locate_unafs, parse_partitions,
 };
 pub use catalog::{CatalogEntry, deserialize_catalog, serialize_catalog};
-pub use fs::{DirEntry, UnaFS};
+pub use fs::{DirEntry, UnaFS, cosine_similarity};
 pub use inode::{AttributeValue, Extent, ExtentList, FileKind, Inode, InodeError};
 pub use query::{Query, QueryOp, parse_value};
 #[cfg(feature = "std")]
