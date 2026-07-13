@@ -10,7 +10,23 @@ Legend: **✅ metal-confirmed** · **🔬 QEMU-green, metal pending** · dates I
 
 ---
 
-## Pi 4 — UNAFS-K3 (BeFS-K3: kernel read-only mount of a native unafs volume) — 2026-07-12 🔬 `hw-pi4`
+## Pi 4 — UNAFS-K3 (BeFS-K3: kernel read-only mount of a native unafs volume) — 2026-07-12 ✅ `hw-pi4`
+
+**✅ METAL-CONFIRMED (2026-07-12 attended evening bench, real Pi 4, reflashed card with the unafs
+partition):** `:: K3-mount: … mounted RO + ls/cat byte-verified PASS [w=0x1ff] ::` captured in FIVE
+boots on silicon — the first kernel read of the native unafs filesystem on real hardware. Pristine
+boot: 23/23 fixture PASS (U9/U10/U6-grants/U11 all real), F2/F3 parallelism witnesses locked
+240000/240000, **0 forbidden** (no R1/CMD13/exception/heal), dirty-mount warn line absent (clean
+volume) — mbench **28/30**, missing only the CAPSTONE pair. Interactive evidence (HDMI panel,
+serial-FIFO-injected — the pi kernel8 build is `skip_xhci`, no USB keyboard): `uls` → the two
+fixtures + "(2 entries)"; `ucat /K3HELLO.TXT` → the pinned text; `ucat /K3NOPE.TXT` → refused
+(photo witnessed). ⚠ **Bench observations for the ledger:** (1) core 3 failed spin-table release in
+ALL 6 boots this evening (capstone skipped) vs 4/4 cores this morning on `a834b8f` — a flagged
+watch-item (environment vs build-correlated undetermined; scheduler untouched by this arc; CAPSTONE
+6/6 stands metal-confirmed from round-9 the same day); (2) `resolve_path` reports a missing name as
+`FileSystemError::RootMissing` — misleading error name, folded into the BEFS-HARDEN/K4 cleanliness
+list. Logs `~/unaos-bench/pi-serial-2026-07-12-{211701,212337}.log` (+3 earlier stale-media boots
+that still captured K3-mount PASS).
 
 The first time the native unafs filesystem is read by the kernel — the BeFS chain's
 K1 (`no_std` port) → K2 (block adapter) seam consumed end-to-end. Three commits:
