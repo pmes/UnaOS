@@ -41,6 +41,10 @@ pub enum Error {
     /// Attempted to access a block outside the device boundaries.
     #[error("Block out of bounds: {0}")]
     OutOfBounds(u64),
+    /// A disk-derived length demanded an allocation the host refused
+    /// (corrupt or hostile volume geometry). Graceful `Err`, never an abort.
+    #[error("Allocation of {0} bytes refused (corrupt or hostile geometry)")]
+    AllocRefused(u64),
 }
 
 /// A trait representing a block storage device.
