@@ -1,8 +1,8 @@
-# ENDURO — drive-service safety interlocks
+# TALUS — drive-service safety interlocks
 
-ENDURO (ROADMAP §4) makes UnaOS the vehicle computer between the RC receiver and
+TALUS (ROADMAP §4) makes UnaOS the vehicle computer between the RC receiver and
 the actuators. This document is the **written safety-interlock checklist** that
-gates every ENDURO metal step: no actuator is wired to a powered ESC until each
+gates every TALUS metal step: no actuator is wired to a powered ESC until each
 interlock below is proven in code and then witnessed on the bench.
 
 The host-native foundation lands first, deliberately, the same way UNAFS-1 froze
@@ -104,7 +104,7 @@ separate age-of-`latest`-at-emit gate.** Rationale:
 ## What is deferred to metal
 
 The host foundation freezes the format and the logic; it does not touch
-hardware. The remaining ENDURO legs, each behind this checklist, are:
+hardware. The remaining TALUS legs, each behind this checklist, are:
 
 - **i-BUS on a UART.** The FGr8B's i-BUS output option is verify-on-bench; the
   KATs are synthetic until real captures are appended to `CAPTURED_FRAMES` in

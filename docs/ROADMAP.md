@@ -13,7 +13,7 @@
 A **functioning desktop**: the GUI shell spawns **capability-scoped programs,
 loaded from disk into isolated address spaces**, with storage on UnaFS. Every
 arc below serves that goal. The physical-world payloads — the printer
-("Design → Make"), the ENDURO rover, Jetson depth perception — ride on top of
+("Design → Make"), the TALUS rover, Jetson depth perception — ride on top of
 exactly this foundation and are sequenced after it. UnaOS will hold direct
 authority over physical hardware, which is why the privilege/capability work
 comes first rather than being retrofitted (a lesson learned from BeOS, which
@@ -217,7 +217,7 @@ uses — and round-trip midden's first verbs (`ls`, `cat`, `cp`) through kernel
 fulfillment in QEMU. K2's named programs supply the principal stamping. Midden
 becomes program #3 — the first real (non-fixture) on-UnaOS program.
 
-## 4. ENDURO — the rover (deferred until the desktop chain matures)
+## 4. TALUS — the rover (deferred until the desktop chain matures)
 
 Architecture settled 2026-07-02. The OS is the **vehicle computer between the
 RC receiver and the actuators**; the transmitter remains the human override
@@ -252,11 +252,11 @@ FlySky NB4 Plus ──AFHDS3──▶ FGr8B ──i-BUS (UART 115200)──▶ U
   codec **(host-side landed — the `libs/pca9685` prescale/duty codec + datasheet
   KATs; the I2C transport + attended actuation gate remain)** → drive service →
   first crawl, each behind a written safety-interlock
-  checklist ([`docs/dev/USERLAND/ENDURO_SAFETY.md`](dev/USERLAND/ENDURO_SAFETY.md)).
+  checklist ([`docs/dev/USERLAND/TALUS_SAFETY.md`](dev/USERLAND/TALUS_SAFETY.md)).
 - A Pi-4 fast path (BCM2711 GPIO/PWM, fully specified) is preserved in the
   planning archive if a second vehicle or an earlier wheel-turn is ever wanted.
 
-## 5. Jetson perception (after ENDURO drives)
+## 5. Jetson perception (after TALUS drives)
 
 Tegra XUSB as a platform (non-PCI) xHCI controller — *unknown: whether UEFI
 leaves the XUSB firmware loaded* → SuperSpeed enumeration (the rMBP

@@ -247,6 +247,6 @@ belonged to a debug session.
   fresh brief, not patched by Fable on the track branch.
 - Keep the roadmap/security/userspace docs current *as arcs land* — docs stay
   correct by construction, not in a later sweep.
-- Physical-hardware arcs (truck/ENDURO, printer) are payloads of the multi-user
+- Physical-hardware arcs (truck/TALUS, printer) are payloads of the multi-user
   chain and stay deferred until the desktop foundation is far enough along; see
   ROADMAP §1 for the gating.

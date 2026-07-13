@@ -16,7 +16,7 @@
 
 //! FlySky i-BUS servo frame codec — the rover's receiver-side wire format.
 //!
-//! ENDURO (ROADMAP §4) puts UnaOS between the FGr8B receiver and the actuators.
+//! TALUS (ROADMAP §4) puts UnaOS between the FGr8B receiver and the actuators.
 //! The receiver speaks **i-BUS** over a UART at 115200 baud: 32-byte servo
 //! frames every ~7 ms. This crate decodes that byte stream into
 //! [`Frame`]s of 14 channel values in microseconds, with checksum validation

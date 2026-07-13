@@ -78,7 +78,7 @@
 ?.  **D-0??:** Lux Expansion.
 
 ## 📝 DECISION LOG
-*   **2026-07-02:** **Multi-user first** (the Be lesson: don't defer it). Security model = capabilities-first, POSIX-layerable — principals and grants live as UnaFS typed attributes. Truck (ENDURO) and printer become payloads of the desktop chain, not detours.
+*   **2026-07-02:** **Multi-user first** (the Be lesson: don't defer it). Security model = capabilities-first, POSIX-layerable — principals and grants live as UnaFS typed attributes. Truck (TALUS) and printer become payloads of the desktop chain, not detours.
 *   **2026-07-02:** Direction docs moved into the repo: `docs/ROADMAP.md`, `docs/SECURITY.md`, root `CLAUDE.md`, `docs/dev/OS/02_KERNEL_CORE/userspace.md`; UnaFS direction (surpass BeFS: indexes → live queries → kernel convergence) in `libs/unafs/README.md`.
 *   **2026-06-26:** Retired the Quartzite JSON-DSL detour; restored the real multi-platform GUI API (`Backend` / `Spline`).
 *   **2026-06-26:** Merged the three kernel tracks (USB+SMP / network / video) onto `c01-int_combined`; verified booting together, both arches green.

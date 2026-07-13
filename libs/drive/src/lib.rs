@@ -14,7 +14,7 @@
 // You should have received a copy of the GNU Lesser General Public License
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-//! The arch-neutral rover **drive-service core** — ENDURO's safety state machine.
+//! The arch-neutral rover **drive-service core** — TALUS's safety state machine.
 //!
 //! ROADMAP §4 puts UnaOS between the RC receiver and the actuators. This crate
 //! is the safety-critical middle: it takes decoded [`ibus::Frame`]s in, runs a

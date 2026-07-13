@@ -13,7 +13,7 @@
 
 //! The safety-invariant test battery for the drive-service core.
 //!
-//! Every invariant I1–I8 from `docs/dev/USERLAND/ENDURO_SAFETY.md` gets its own
+//! Every invariant I1–I8 from `docs/dev/USERLAND/TALUS_SAFETY.md` gets its own
 //! named test below; the safety-interlock checklist maps each bench precondition
 //! to the test of the same number. All tests run on a simulated clock and mock
 //! sink — deterministic, zero real sleeps.

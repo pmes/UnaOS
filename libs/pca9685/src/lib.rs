@@ -16,7 +16,7 @@
 
 //! PCA9685 16-channel, 12-bit PWM controller — the actuation-output codec.
 //!
-//! ENDURO (ROADMAP §4) drives the rover's servo and ESC through a **PCA9685
+//! TALUS (ROADMAP §4) drives the rover's servo and ESC through a **PCA9685
 //! over I2C**: Tegra's native PWM is 8-bit at 50 Hz, insufficient for a servo,
 //! so a dedicated 12-bit PWM controller carries the actuation. The PCA9685's
 //! I2C register map and prescale math are fully datasheet-specified, so — like
@@ -86,7 +86,7 @@ pub const MODE1_SLEEP: u8 = 0x10;
 
 // MODE2 bits.
 /// `MODE2` OUTDRV bit (`0x04`): outputs configured as totem-pole (vs open-drain).
-/// This is the power-on default and the ENDURO configuration.
+/// This is the power-on default and the TALUS configuration.
 pub const MODE2_OUTDRV: u8 = 0x04;
 
 /// `MODE1` value used awake: auto-increment on, sleep clear.
@@ -108,7 +108,7 @@ pub const PWM_STEPS: u32 = 4096;
 pub const COUNT_MAX: u16 = 4095;
 
 /// The PCA9685 internal oscillator, 25 MHz (datasheet §7.3.5). The external-clock
-/// path (EXTCLK) is out of scope for ENDURO; the codec assumes the internal clock.
+/// path (EXTCLK) is out of scope for TALUS; the codec assumes the internal clock.
 pub const OSC_CLK_HZ: u32 = 25_000_000;
 
 /// Minimum `PRE_SCALE` value (datasheet §7.3.5): 3, i.e. the ~1526 Hz ceiling.
@@ -289,7 +289,7 @@ pub fn channel_pulse(ch: u8, counts: u16) -> Option<[Write; 4]> {
 
 /// Set channel `ch` to a high pulse of `us` microseconds at `prescale`'s achieved
 /// rate (via [`Prescale::pulse_counts`]). Returns `None` for an out-of-range
-/// channel. This is the ENDURO µs → duty path the `drive` sink feeds.
+/// channel. This is the TALUS µs → duty path the `drive` sink feeds.
 pub fn channel_pulse_us(ch: u8, prescale: &Prescale, us: u32) -> Option<[Write; 4]> {
     channel_pulse(ch, prescale.pulse_counts(us))
 }
