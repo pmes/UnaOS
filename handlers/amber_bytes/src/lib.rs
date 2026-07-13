@@ -32,25 +32,36 @@ pub struct DiskManager {
 }
 
 impl DiskManager {
+    /// Open the vault at `path`: mount it if the file already exists, or
+    /// create and format a fresh vault on true first run (no file present).
+    ///
+    /// FAIL-CLOSED GUARANTEE: if the vault file already exists but cannot be
+    /// mounted (corruption, version skew, transient I/O), this returns the
+    /// error and leaves the on-disk bytes untouched for recovery. It never
+    /// truncates or reformats an existing file.
     pub fn new(path: &Path) -> Result<Self> {
-        // Only mount if the file is at least 1 block long (4096 bytes)
-        let is_valid_disk =
-            path.exists() && std::fs::metadata(path).map(|m| m.len()).unwrap_or(0) >= 4096;
-
-        if is_valid_disk {
-            let device = FileDevice::open(path)?;
-            match UnaFS::mount(device) {
-                Ok(fs) => Ok(Self { fs }),
-                Err(e) => {
-                    eprintln!(":: LIBRARIAN :: Mount failed ({}), reformatting...", e);
-                    std::fs::File::create(path)?.set_len(64 * 1024 * 1024)?;
-                    let device = FileDevice::open(path)?;
-                    let fs = UnaFS::format(device, 64)?;
-                    Ok(Self { fs })
-                }
-            }
+        if path.exists() {
+            // Existing vault: mount it or fail closed. Do NOT reformat.
+            let device = FileDevice::open(path)
+                .with_context(|| format!("failed to open existing vault at {}", path.display()))?;
+            let fs = UnaFS::mount(device).with_context(|| {
+                format!(
+                    "refusing to reformat: existing vault at {} failed to mount \
+                     (its bytes are left untouched for recovery)",
+                    path.display()
+                )
+            })?;
+            Ok(Self { fs })
         } else {
-            std::fs::File::create(path)?.set_len(64 * 1024 * 1024)?;
+            // True first run: create and format a fresh vault. `create_new`
+            // guarantees this can never truncate a file that appeared after
+            // the exists() check above.
+            std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(path)
+                .with_context(|| format!("failed to create fresh vault at {}", path.display()))?
+                .set_len(64 * 1024 * 1024)?;
             let device = FileDevice::open(path)?;
             let fs = UnaFS::format(device, 64)?;
             Ok(Self { fs })
@@ -380,5 +391,112 @@ pub async fn ignite(vault_path: PathBuf, synapse: Synapse) {
                 break;
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+
+    const VAULT_LEN: u64 = 64 * 1024 * 1024;
+
+    /// Fresh path: no file at the vault path -> a new vault is created,
+    /// formatted, and immediately usable for writes and queries.
+    #[test]
+    fn fresh_path_creates_usable_vault() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let vault = dir.path().join("vault.unafs");
+        assert!(!vault.exists());
+
+        let mut dm = DiskManager::new(&vault).expect("first run must create a fresh vault");
+        assert_eq!(fs::metadata(&vault).expect("vault file").len(), VAULT_LEN);
+
+        dm.save_memory(
+            "Architect",
+            "first light",
+            "2026-07-13T00:00:00Z",
+            vec![0.5; 4],
+            "engram",
+        )
+        .expect("fresh vault must accept writes");
+        let engrams = dm
+            .get_latest_engrams(1)
+            .expect("fresh vault must answer queries");
+        assert_eq!(engrams, vec!["first light".to_string()]);
+    }
+
+    /// Guard path: an existing file that fails to mount must return an error
+    /// AND remain byte-identical on disk — never truncated, never reformatted.
+    #[test]
+    fn mount_failure_preserves_existing_bytes() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let vault = dir.path().join("vault.unafs");
+
+        // Garbage large enough to reach the superblock parse (>= 1 block).
+        let garbage: Vec<u8> = (0..8192u32).map(|i| (i % 251) as u8).collect();
+        fs::write(&vault, &garbage).expect("seed garbage vault");
+
+        let result = DiskManager::new(&vault);
+        assert!(
+            result.is_err(),
+            "mounting a corrupt existing vault must fail closed"
+        );
+
+        let after = fs::read(&vault).expect("vault file must still exist");
+        assert_eq!(
+            after, garbage,
+            "existing vault bytes must be byte-identical after a failed mount"
+        );
+    }
+
+    /// Guard path, sub-block variant: an existing file shorter than one block
+    /// used to be silently reformatted by the old size gate; it must now fail
+    /// closed with its bytes untouched.
+    #[test]
+    fn short_existing_file_is_not_reformatted() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let vault = dir.path().join("vault.unafs");
+
+        let stub = b"not a vault".to_vec();
+        fs::write(&vault, &stub).expect("seed stub file");
+
+        let result = DiskManager::new(&vault);
+        assert!(
+            result.is_err(),
+            "an existing sub-block file must fail closed, not be reformatted"
+        );
+
+        let after = fs::read(&vault).expect("vault file must still exist");
+        assert_eq!(
+            after, stub,
+            "stub bytes must be untouched after a failed mount"
+        );
+    }
+
+    /// Happy reopen: a valid vault written by one DiskManager reopens via
+    /// DiskManager::new with its data intact.
+    #[test]
+    fn valid_vault_reopens_with_data_intact() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let vault = dir.path().join("vault.unafs");
+
+        {
+            let mut dm = DiskManager::new(&vault).expect("create fresh vault");
+            dm.save_memory(
+                "Architect",
+                "remember me",
+                "2026-07-13T00:00:00Z",
+                vec![0.25; 4],
+                "engram",
+            )
+            .expect("write memory");
+        }
+
+        let mut dm = DiskManager::new(&vault).expect("valid existing vault must remount");
+        let engrams = dm
+            .get_latest_engrams(1)
+            .expect("reopened vault must answer queries");
+        assert_eq!(engrams, vec!["remember me".to_string()]);
     }
 }
