@@ -101,6 +101,16 @@ enum Commands {
         #[arg(short, long, default_value = "unafs.img")]
         img: String,
     },
+    /// Scan for crash-window residue — leaked blocks and query-orphaned inodes.
+    /// With --repair, reclaim them and clear a dirty journal (dirty-mount
+    /// recovery).
+    Fsck {
+        #[arg(short, long, default_value = "unafs.img")]
+        img: String,
+        /// Actually reclaim leaks, heal orphans, and reset a dirty journal.
+        #[arg(long)]
+        repair: bool,
+    },
 }
 
 /// Split a vault path into (parent path, entry name). "/a/b/c" -> ("/a/b", "c").
@@ -311,6 +321,40 @@ async fn main() -> Result<()> {
             })?;
 
             println!("✅ [OPERATOR] Removed attribute '{}' from '{}'", key, path);
+        }
+        Commands::Fsck { img, repair } => {
+            let device = FileDevice::open(img).context("Failed to open device")?;
+            let mut fs = FileSystem::mount(device).context("Failed to mount filesystem")?;
+
+            if *repair {
+                let report = fs
+                    .recover()
+                    .map_err(|e| anyhow::anyhow!("fsck --repair failed: {:?}", e))?;
+                println!("🔧 [FSCK] recovery complete on '{}'", img);
+                println!("  dirty journal        : {}", report.dirty_journal);
+                println!("  query-orphans healed : {}", report.orphan_inodes.len());
+                println!("  catalog entries scrubbed: {}", report.scrubbed_catalog_entries);
+                println!("  blocks reclaimed     : {}", report.reclaimed_blocks);
+            } else {
+                let dirty = fs
+                    .is_dirty()
+                    .map_err(|e| anyhow::anyhow!("fsck failed: {:?}", e))?;
+                let report = fs
+                    .fsck(false)
+                    .map_err(|e| anyhow::anyhow!("fsck failed: {:?}", e))?;
+                println!(
+                    "🔍 [FSCK] scan of '{}' (dry run — pass --repair to heal)",
+                    img
+                );
+                println!("  dirty journal        : {}", dirty);
+                println!("  blocks in use        : {}", report.blocks_in_use);
+                println!("  reachable blocks     : {}", report.reachable_blocks);
+                println!("  leaked blocks        : {}", report.leaked_blocks.len());
+                println!("  query-orphaned inodes: {}", report.orphan_inodes.len());
+                if report.leaked_blocks.is_empty() && report.orphan_inodes.is_empty() && !dirty {
+                    println!("  ✅ volume is clean");
+                }
+            }
         }
     }
 

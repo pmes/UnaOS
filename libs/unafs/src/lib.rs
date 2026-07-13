@@ -39,6 +39,7 @@ pub mod bitmap;
 pub mod catalog;
 pub mod codec;
 pub mod fs;
+pub mod fsck;
 pub mod hash;
 pub mod inode;
 #[cfg(feature = "std")]
@@ -55,6 +56,7 @@ pub use adapter::{
 };
 pub use catalog::{CatalogEntry, deserialize_catalog, serialize_catalog};
 pub use fs::{DirEntry, UnaFS, cosine_similarity};
+pub use fsck::FsckReport;
 pub use inode::{AttributeValue, Extent, ExtentList, FileKind, Inode, InodeError};
 pub use query::{Query, QueryOp, parse_value};
 #[cfg(feature = "std")]
