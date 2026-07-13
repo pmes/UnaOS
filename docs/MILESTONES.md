@@ -10,6 +10,31 @@ Legend: **✅ metal-confirmed** · **🔬 QEMU-green, metal pending** · dates I
 
 ---
 
+## hw-rmbp track — 2026-07-12 (round-9 attended metal bench: STOR-1 S1–S7 + VPERF-WC)
+
+### STOR-1 S1–S7 (the whole interrupt-driven x86 storage chain) ✅ metal-confirmed `hw-rmbp`
+- **What:** the full S1–S7 IF-safe interrupt-driven storage arc (service task + submit/block/complete,
+  live reads/write-through, synchronous grow/create/delete, shared cross-process backing, the syscall
+  NAMESPACE lock, and open-of-ANY-on-disk-file) behind the `irqstorage` knob.
+- **Tested — metal (real 2012 rMBP, over FTDI serial, TWO clean boots):** `./arroyo mbench --spec
+  round9-rmbp.spec` **PASS 37/37 required + 0 forbidden + 6/6 pending matched, 0 fault**. First metal for
+  **S6** (`S6-witness`: locked 240000/240000 intact, **unlocked lost 119996/240000** under real cross-core
+  contention — the namespace lock serializes on true SMP, the proof risk 3 deferred), **S7** (`S7-openany`:
+  README.TXT resolved dynamically + `owned.bin` refused, the case-insensitive owner-ACL exclusion holds on
+  silicon), and the **S4-race** (close-release + teardown-release synchronous delete) + **S4-mf2** witnesses.
+  S1–S5 re-confirmed (first metal round-6). Knob-ON usbdebug+videobench media, kernel.elf sha `3083b467`.
+
+### VPERF-WC — framebuffer Write-Combining ✅ metal-confirmed `hw-rmbp`
+- **What:** retype the fb identity-map leaves to Write-Combining (PAT PA4) so the CPU coalesces the
+  shadow's write-only blits; F1 SFENCE-drain at every flush seam so a panic's tail can't strand in a WC buffer.
+- **Tested — metal (real 2012 rMBP):** the `vperf: fbmem` readout FLIPPED from round-6's `pat=WB eff=UC` to
+  **`pat=WC eff=WC`** (`fb-wc: retyped 15 leaf(s)`); scroll **dramatically faster (~10×)** and the vug/quartz
+  GUI clocked **53.8 fps** (up from round-6's ~7.6 fps, ~7×) — both attended eyeballs; and a deliberate
+  `panic` at the GUI console rendered the **full red panic screen, no truncated tail** (the F1 WC-drain, the
+  one thing QEMU/TCG cannot witness). VPERF-WC = confirmed.
+
+---
+
 ## hw-jetson track — 2026-07-12 (JD10 — the panel moves & renames: `mv`)
 
 ### JD10 — `mv <src> <dst>` on the Orin panel shell (move/rename by relinking one entry, no new fat.rs) 🔬 `hw-jetson`

@@ -1,7 +1,13 @@
 # STOR-D1 — IF-safe interrupt-driven x86 storage (design)
 
-Status: **S1–S6 LANDED** (S1–S4 2026-07-10, S5–S6 2026-07-11, `hw-rmbp`, behind the `irqstorage` knob —
-QEMU-green, metal-pending; S1–S3 `7b2f05f`/`b73ba08`/`fd5de85`, ✅ core mechanism metal-confirmed). S1 the
+Status: **S1–S7 LANDED + ✅ METAL-CONFIRMED** (S1–S4 2026-07-10, S5–S6 2026-07-11, S7 2026-07-12, `hw-rmbp`,
+behind the `irqstorage` knob). The WHOLE S1–S7 chain rode one knob-ON usbdebug boot on the real 2012 rMBP at
+the round-9 attended bench (2026-07-12, TWO clean boots): `./arroyo mbench` PASS 37/37 required + 0 forbidden
++ 6/6 pending matched, 0 fault — S6's `S6-witness` (locked 240000/240000 intact, unlocked lost 119996/240000
+under real cross-core contention), S7's `S7-openany` (README.TXT resolved dynamically + `owned.bin` refused),
+S4's `S4-race` (close-release + teardown-release synchronous delete) + `S4-mf2`, and S1–S5's `bx-blockreq`/
+`S3`/`S4`/`S5` all fired on silicon (S1–S5 first metal-confirmed round-6 2026-07-11; S1–S3 core mechanism
+`7b2f05f`/`b73ba08`/`fd5de85`). S1 the
 storage service task + `BlockRequest` submit/block/complete; S2 live in-place reads (`sys_read`); S3 live
 in-place write-through (`sys_write_file`) closing the close-discards-dirty residual; **S4 synchronous
 grow/create/delete in-syscall** (`BlockOp::{Create,Grow,Delete}`), retiring the U10x deferred op-queue +

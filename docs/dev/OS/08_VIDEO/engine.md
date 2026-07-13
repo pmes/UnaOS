@@ -331,9 +331,41 @@ flips it from `pte=…00e3 pat=WB eff=UC` to `pte=…10e3 pat=WC eff=WC`, and a 
 `:: x86 fb-wc: retyped N leaf(s) WC (PAT PA4) over <base>..<end> ::` fires in every x86 build.
 QEMU (synthetic bochs fb) already reflects `eff=WC` after the retype — it proves the **code path**;
 only the attended rMBP bench proves the **speed**. QEMU screendumps are **pixel-identical** pre/post
-(same SHA-256): WC changes write buffering, not final memory content. **METAL PENDING** — rides the
-next attended rMBP bench (spec `round6-rmbp.spec` carries the `eff=WC` PENDING line, promoted at
-first metal capture).
+(same SHA-256): WC changes write buffering, not final memory content.
+
+### VPERF-WC — metal-confirmed result (round-9 attended rMBP bench, 2026-07-12) ✅
+
+Verbatim on the real 2012 rMBP (over FTDI serial; knob-ON usbdebug+videobench media, kernel.elf
+sha `3083b467`; TWO clean boots):
+
+```
+:: x86 fb-wc: retyped 15 leaf(s) WC (PAT PA4) over 0x90020000..0x91c40000 ::
+:: vperf: fbmem mtrr=UC(var-range) pte=0x900010e3(l2) pat=WC eff=WC fb=0x90020000 ::
+:: vperf: display 8086:0166 class 030000 @ 0:2.0 ::            (Intel HD 4000)
+:: vperf: display 10de:0fd5 class 030000 @ 1:0.0 ::            (NVIDIA GT 650M)
+:: vperf: display 10de:0fd5 bar1 owns fb (base=0x90000000) ::
+:: vperf: scenario scroll=5167382528 vread=0 px=486060 scrolls=176 lines=400 ::
+```
+
+- **The retype LANDED on silicon.** The fbmem readout FLIPPED from round-6's `pte=…00e3 pat=WB eff=UC`
+  to **`pte=0x900010e3(l2) pat=WC eff=WC`** — the fb mapping is now effective Write-Combining on the
+  GT 650M's `bar1` @ `0x90000000` (15 huge leaves retyped). The `vread=0` shadow win still holds.
+- **~10× scroll — subjective PASS (attended eyeball).** The 400-line scripted scroll rendered
+  **dramatically faster** than round-6's eff=UC boot on the same panel — the WC write-coalescing win
+  is visible, matching the ~10× expectation.
+- **GUI blit win — 53.8 fps (attended, Boot 2 GUI).** The vug/quartz scale-2 Retina render clocked
+  **53.8 fps**, up from round-6's ~7.6 fps (~7×) — WC accelerates the GUI present path too, exactly as
+  "all x86 builds carry the retype" predicts. `:: x86 fb-wc: retyped 15 leaf(s) … ::` fired on the
+  GUI build too.
+- **WC panic-tail (F1 SFENCE drain) — metal PASS (attended eyeball, Boot 2 GUI).** A deliberate
+  `panic` at the GUI console rendered the FULL red panic screen (`=== KERNEL PANIC === / Manual Panic
+  Requested by Architect!` + location) with **NO truncated tail** — the last partial WC buffer drained
+  via `panic_screen()`'s `flush_all`→SFENCE before `hlt_loop()`, confirming the F1 fix on real WC
+  hardware (the one thing QEMU/TCG cannot witness). The FTDI cable shows nothing after the trigger —
+  expected: the panic halts the main loop that pumps `service_ftdi`, so the tail is screen-only.
+
+**Spec:** `round6-rmbp.spec` + `x86-fat.spec` carry the `eff=WC` / `fb-wc: retyped` PENDING lines —
+seat promotes to REQUIRE at this first metal capture.
 
 **VPERF-OBS — the raw_print console-path lesson (fix `bfa1711`, 2026-07-11).** On the FIRST bench boot
 NONE of the `:: vperf: …` readout lines printed on metal, though QEMU had shown them all. Root cause:
