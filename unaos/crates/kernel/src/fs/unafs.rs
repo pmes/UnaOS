@@ -138,7 +138,15 @@ pub fn mount() -> Result<KernelUnaFS, MountError> {
     UnaFS::mount(adapter).map_err(MountError::Fs)
 }
 
-/// K3-mount witness (M1: locate + mount + superblock sanity + RO seam proof).
+/// The K3HELLO.TXT fixture contents, byte-pinned against what `arroyo kernel8`
+/// stages into the unafs volume.
+const K3_HELLO: &[u8] = b"Hello from native UnaFS on the Pi 4!\n";
+/// K3PAT.BIN: 12 KiB, byte i = (i*7+3)&0xFF — three unafs blocks, so reading it
+/// walks extents, not just a single block.
+const K3_PAT_LEN: u64 = 12288;
+
+/// K3-mount witness (M1: locate + mount + superblock sanity + RO seam proof;
+/// M2: root `ls` + byte-verified reads through resolve/extent walking).
 ///
 /// Called at the tail of the aarch64 `u7_launcher` fixture chain (the
 /// `k4_ready_selftest` idiom): one-shot, read-only, and its serial evidence is
@@ -168,7 +176,7 @@ pub fn k3_mount_selftest() {
     }
 
     match mount() {
-        Ok(fs) => {
+        Ok(mut fs) => {
             // bit1: superblock magic is the frozen on-disk signature.
             if fs.superblock.magic == ::unafs::superblock::MAGIC {
                 w |= 1 << 1;
@@ -182,6 +190,54 @@ pub fn k3_mount_selftest() {
             // bit3: the volume fits the partition that carries it.
             if fs.superblock.block_count <= span.block_count {
                 w |= 1 << 3;
+            }
+
+            // --- M2: read paths, byte-verified against the staged fixtures. ---
+
+            // bit5: `ls /` sees exactly the two staged fixture FILES.
+            if let Ok(entries) = fs.ls(fs.superblock.root_inode) {
+                let hello = entries
+                    .iter()
+                    .find(|e| e.name == "K3HELLO.TXT" && e.kind == ::unafs::FileKind::File);
+                let pat = entries
+                    .iter()
+                    .find(|e| e.name == "K3PAT.BIN" && e.kind == ::unafs::FileKind::File);
+                if entries.len() == 2 && hello.is_some() && pat.is_some() {
+                    w |= 1 << 5;
+                }
+            }
+
+            // bit6: resolve + read K3HELLO.TXT — every byte matches the pinned text.
+            if let Ok(id) = fs.resolve_path("/K3HELLO.TXT") {
+                if let (Ok(inode), Ok(data)) =
+                    (fs.read_inode(id), fs.read_data(id, 0, K3_HELLO.len() as u64 + 8))
+                {
+                    if inode.size == K3_HELLO.len() as u64 && data == K3_HELLO {
+                        w |= 1 << 6;
+                    }
+                }
+            }
+
+            // bit7: K3PAT.BIN — all 12 KiB match the (i*7+3)&0xFF pattern, so the
+            // read crossed unafs block (and extent) boundaries intact.
+            if let Ok(id) = fs.resolve_path("/K3PAT.BIN") {
+                if let (Ok(inode), Ok(data)) = (fs.read_inode(id), fs.read_data(id, 0, K3_PAT_LEN))
+                {
+                    if inode.size == K3_PAT_LEN
+                        && data.len() as u64 == K3_PAT_LEN
+                        && data
+                            .iter()
+                            .enumerate()
+                            .all(|(i, &b)| b == ((i * 7 + 3) & 0xFF) as u8)
+                    {
+                        w |= 1 << 7;
+                    }
+                }
+            }
+
+            // bit8: a missing name refuses to resolve (negative witness).
+            if fs.resolve_path("/K3NOPE.TXT").is_err() {
+                w |= 1 << 8;
             }
         }
         Err(e) => {
@@ -201,9 +257,9 @@ pub fn k3_mount_selftest() {
         }
     }
 
-    let verdict = if w == 0x1f { "PASS" } else { "FAIL" };
+    let verdict = if w == 0x1ff { "PASS" } else { "FAIL" };
     serial_println!(
-        ":: K3-mount: native unafs volume located (base_lba={}, {} blocks) + superblock v{} mounted RO {} [w={:#04x}] ::",
+        ":: K3-mount: native unafs volume located (base_lba={}, {} blocks) + superblock v{} mounted RO + ls/cat byte-verified {} [w={:#05x}] ::",
         span.base_lba,
         span.block_count,
         ::unafs::superblock::VERSION,
