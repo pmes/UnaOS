@@ -21,4 +21,5 @@
 //! BeFS-K3 adds [`unafs`]: a read-only mount of the native UnaFS volume.
 
 pub mod fat;
+#[cfg(target_arch = "aarch64")]
 pub mod unafs;

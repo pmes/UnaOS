@@ -25,8 +25,10 @@
 //! carries a UnaFS partition.
 //!
 //! **Read-only arc:** `write_sector` is a deliberate `Io` stub (K4 makes it
-//! real), so no code path — not even a torn-journal recovery — can touch the
-//! medium through this mount.
+//! real), so every write through this mount is REFUSED at the seam. Writes ARE
+//! attempted by the crate (e.g. `UnaFS::drop` → `sync_metadata` → superblock
+//! write-back, its `Err` swallowed) — the stub is what guarantees none reaches
+//! the medium.
 
 use alloc::format;
 use alloc::string::String;

@@ -870,6 +870,7 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
             console.println("          cp -r <srcdir> <dst>  (recursively copy a directory tree)");
             console.println("MOVE:     mv <src> <dst>  (move/rename a file or dir, O(1); mv SRC DIR/ lands as DIR/<leaf>)");
             console.println("          (create/edit/delete/copy/move files & dirs anywhere in the tree; sync = write-through, durable)");
+            #[cfg(target_arch = "aarch64")]
             console.println("UNAFS:    uls [path], ucat <path>  (native unafs volume, read-only)");
             console.println("SMP:      sched (per-CPU run queues), pulse (full-screen CPU monitor)");
             console.println("TEST:     tste (in-OS self-test suite: boot-replay + live checks)");
@@ -1004,6 +1005,7 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
                 },
             }
         },
+        #[cfg(target_arch = "aarch64")]
         "uls" => {
             // BeFS-K3: list a directory on the native unafs volume (read-only mount; absolute
             // paths, case-sensitive names — unafs has no shell cwd). `uls` lists the root.
@@ -1029,6 +1031,7 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
                 Err(e) => console.println(&alloc::format!("uls: no unafs volume ({:?})", e)),
             }
         },
+        #[cfg(target_arch = "aarch64")]
         "ucat" => {
             // BeFS-K3: print a file off the native unafs volume (bounded like `cat`).
             match args.first() {

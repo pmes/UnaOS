@@ -21,10 +21,15 @@ for it; we won't repeat that).
 Exposure classes, honestly stated:
 
 1. **Ring-0-resident parsers.** The network stack (Ethernet/ARP/IP/TCP/DHCP),
-   USB descriptor parsing, and the FAT reader all parse attacker-influenceable
-   bytes with full kernel privilege on both architectures. Until the privilege
-   boundary exists everywhere, these are the practical attack surface, and
-   they remain kernel-resident even after.
+   USB descriptor parsing, the FAT reader, and (since UNAFS-K3, aarch64) the
+   unafs RO-mount parser (partition table / superblock / inode / catalog decode
+   in `fs/unafs.rs` + `libs/unafs`) all parse attacker-influenceable bytes with
+   full kernel privilege. Until the privilege boundary exists everywhere, these
+   are the practical attack surface, and they remain kernel-resident even after.
+   The unafs parser joins on the same basis FAT shipped on: disk-derived
+   sizes/counts are not yet bounds-hardened against a crafted volume (allocation
+   /loop DoS class, no memory-safety break) — the dedicated BEFS-HARDEN arc owns
+   bounding every disk-derived size/count/offset against volume geometry.
 2. **Privilege boundary not yet load-bearing (both arches).** The ring-3/EL0
    boundary now exists on BOTH architectures (x86 U1a/U1b: ring-3 round-trip +
    per-page perms + fault→task-kill; aarch64 M6a/M6b, the pioneer). x86 U2 runs
@@ -287,6 +292,7 @@ already performs). That refactor is a separate, review-gated change; **WXN is no
 - [ ] Network stack: header-length/bounds audit (Ethernet/ARP/IP/TCP options/DHCP options)
 - [ ] USB: descriptor parsing bounds (config/interface/endpoint/HID report walks; hub paths)
 - [ ] FAT: BPB/dirent/FAT-chain bounds and loop guards (partially hardened during the read-only arc — re-verify and record)
+- [ ] unafs RO mount (UNAFS-K3): bound every disk-derived size/count/offset vs volume geometry (superblock `bitmap_blocks`, inode `size`, extent arithmetic, codec lengths; `try_reserve` not `with_capacity`, size-limited decode) → the BEFS-HARDEN baton
 
 ### Process & supply chain
 - [ ] Adversarial review before metal and before merge on every arc (standing rule, `CLAUDE.md`)
