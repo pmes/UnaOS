@@ -5,12 +5,14 @@ tree, derives the dependency structure between files, and publishes that
 structure on the message bus so the GUI can render a navigable map of the
 workspace and the AI handler (Vein) can use it as context.
 
-**Status: implemented (focused scope).** The lexical scanner, workspace
-indexer, and async event loop are working and wired into the `lumen` vessel and
-the `vein` handler. The scope is intentionally narrow: Matrix currently models
-Rust source topology. Richer asset/preview features described in earlier design
-notes (3D model preview, media scrubbing, tag-based smart collections) are not
-implemented.
+**Status: implemented (all-asset genesis, Rust-aware analysis).** The lexical
+scanner, workspace indexer, and async event loop are working and wired into the
+`lumen` vessel and the `vein` handler. The genesis tree maps ALL assets in the
+workspace — every regular file (code, docs, images, config) becomes a node —
+per Matrix's charter as the spatial all-asset manager; the deeper dependency
+analysis (`map_topology`) is currently Rust-source only. Richer asset features
+described in the charter (previews, media scrubbing, tag-based smart
+collections) are not yet implemented.
 
 ## What it does
 
@@ -22,8 +24,12 @@ implemented.
   LLM context. `ScanDepth::Interface` captures public symbols; `ScanDepth::DeepAST`
   captures all definitions including `impl` blocks.
 - **Genesis tree** — `MatrixScanner::build_genesis_tree(dir, root)` produces the
-  nested `bandy::state::TopologyNode` tree the GUI renders, pruning `target`,
-  `.git`, `node_modules`, and any directory containing no `.rs` files.
+  nested `bandy::state::TopologyNode` tree the GUI renders. Every regular file
+  is a node; `target`, `.git`, `node_modules`, and empty directories are
+  pruned, and symlinks are never followed.
+- **Graft decode/apply** — `graft::apply_graft(roots, target_id, payload)`
+  decodes a `GraftTopology` payload and replaces the target node's children
+  with the scanned symbols; vessels call it and re-render on `true`.
 - **Workspace indexing** — `indexer::WorkspaceIndexer` recursively scans for
   `Cargo.toml` files and builds a crate-level dependency DAG (`CrateNode`), used
   by Vein's workspace cortex.
