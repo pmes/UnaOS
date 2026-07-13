@@ -58,6 +58,14 @@ pub enum FileSystemError {
     InvalidAttributeData,
     #[error("Query error: {0}")]
     Query(String),
+    #[error("Entry not found")]
+    NotFound,
+    #[error("Is a directory")]
+    IsADirectory,
+    #[error("Attribute not found")]
+    AttributeNotFound,
+    #[error("Cannot move a directory into itself or its descendants")]
+    DirectoryLoop,
 }
 
 /// A directory entry pointing to an inode.
@@ -573,6 +581,283 @@ impl<D: BlockDevice> UnaFS<D> {
         Ok(None)
     }
 
+    // --- MUTATION ENGINE (unlink / rename / remove_attribute) ---
+    //
+    // Crash-window honesty: there is NO journal replay — the WAL detects a
+    // torn operation on the next mount, it does not roll it back. Every op
+    // below is therefore ordered so that no intermediate on-disk state ever
+    // references a freed block: the failure mode of an ill-timed power cut
+    // is a LEAK (allocated-but-unreachable blocks, reclaimable only by a
+    // future fsck/scavenger arc), never a dangling reference. The concrete
+    // windows are documented on each method.
+
+    /// Remove `name` from directory `parent_id`: the directory entry, every
+    /// attribute-catalog index entry pointing at the inode, the inode's data
+    /// extents, its spilled attribute extents, and the inode block itself
+    /// all go. After completion the file is unreachable by name AND by
+    /// query. Returns the freed inode id.
+    ///
+    /// Only `File` and `Symlink` entries can be unlinked; a directory is
+    /// refused with [`FileSystemError::IsADirectory`].
+    ///
+    /// # Open-handle semantics (honest note)
+    /// unafs has no open-file table — callers address files by raw inode id.
+    /// `unlink` invalidates the id immediately: a caller that keeps the id
+    /// and calls `read_data`/`write_data` afterwards touches freed (and
+    /// possibly reallocated) blocks. That is the caller's problem, by
+    /// design; a host library cannot know who still holds an id.
+    ///
+    /// # Crash windows (no journal replay; ordered leak-not-dangle)
+    /// 1. After the catalog rewrite, before the directory rewrite: the file
+    ///    is still reachable by name but invisible to queries (unindexed).
+    /// 2. After the directory rewrite, before the frees: the inode and all
+    ///    its blocks are leaked (allocated, unreachable by name or query).
+    /// 3. The catalog and directory rewrites each write new extents first
+    ///    and swap the inode last (a single-block write), so each is
+    ///    old-or-new, never torn; an interrupted rewrite leaks the freshly
+    ///    written extents.
+    /// A power cut anywhere inside the op additionally leaves an unmatched
+    /// `BeginOp` in the journal, reported as a dirty mount.
+    pub fn unlink(&mut self, parent_id: u64, name: &str) -> Result<u64, FileSystemError> {
+        let mut entries = self.ls(parent_id)?;
+        let pos = entries
+            .iter()
+            .position(|e| e.name == name)
+            .ok_or(FileSystemError::NotFound)?;
+        if entries[pos].kind == FileKind::Directory {
+            return Err(FileSystemError::IsADirectory);
+        }
+        let inode_id = entries[pos].inode_id;
+
+        self.journal.log(
+            &mut self.device,
+            JournalOp::BeginOp {
+                op_id: inode_id,
+                desc: format!("Unlink: {}", name),
+            },
+        )?;
+
+        // Read the doomed inode up front; its extents are freed at the end.
+        let inode = self.read_inode(inode_id)?;
+
+        // 1. Scrub the attribute index: every catalog entry pointing at this
+        //    inode goes. (`set_attribute` appends on re-set, so duplicate
+        //    entries for one key are expected — all of them are removed.)
+        self.remove_catalog_entries(|e| e.inode_id == inode_id)?;
+
+        // 2. Make the name unreachable.
+        entries.remove(pos);
+        let dir_data = crate::codec::serialize(&entries)?;
+        self.rewrite_data(parent_id, &dir_data)?;
+
+        // 3. Free everything the inode owned: spilled attribute extents,
+        //    data extents, then the inode block itself. The block contents
+        //    are not zeroed — the blocks are simply marked free and will be
+        //    reused by the first-fit allocator.
+        for extents in inode.large_attributes.values() {
+            self.free_extents(extents)?;
+        }
+        self.free_extents(&inode.chunks)?;
+        self.free_block(inode_id);
+        self.sync_metadata()?;
+
+        self.journal
+            .log(&mut self.device, JournalOp::EndOp { op_id: inode_id })?;
+
+        #[cfg(feature = "std")]
+        {
+            let msg = SMessage::FileEvent {
+                path: format!("inode:{}", inode_id),
+                event: format!("Unlinked:{}", name),
+            };
+            let _ = self.publish("system/fs/change", msg);
+        }
+
+        Ok(inode_id)
+    }
+
+    /// Rename `old_name` in `parent_id` to `new_name` in `new_parent_id` —
+    /// a same-directory rename when the parents match, a cross-directory
+    /// move otherwise. The inode, its data extents, and its attributes are
+    /// untouched: only directory entries change, and the attribute catalog
+    /// keys on inode id (names are not indexed), so the catalog is
+    /// consistent by construction — queries return the renamed file
+    /// unchanged. The format already models a move this way: directories
+    /// are independent serialized entry lists, and an entry simply switches
+    /// lists. No new format structure is invented.
+    ///
+    /// `new_name` must not already exist — this refuses with `FileExists`
+    /// rather than implicitly unlinking the target (a deliberate divergence
+    /// from POSIX rename's overwrite). Renaming an entry to its own name in
+    /// the same directory is a no-op `Ok`. Moving a DIRECTORY into itself
+    /// or one of its descendants is refused with `DirectoryLoop`: the tree
+    /// has no parent pointers, so a cycle would orphan the whole subtree.
+    ///
+    /// # Crash windows (no journal replay)
+    /// * Same-directory: one crash-ordered directory rewrite — old-or-new,
+    ///   never torn.
+    /// * Cross-directory: the entry leaves the source directory FIRST, then
+    ///   joins the destination. A power cut between the two leaves the file
+    ///   in NEITHER directory — the inode and its blocks are leaked (still
+    ///   allocated, still query-reachable via the catalog, unreachable by
+    ///   name). The reverse order was rejected deliberately: it would
+    ///   briefly give one inode TWO names, and unlinking either name would
+    ///   free blocks the other still references.
+    pub fn rename(
+        &mut self,
+        parent_id: u64,
+        old_name: &str,
+        new_parent_id: u64,
+        new_name: &str,
+    ) -> Result<(), FileSystemError> {
+        let same_dir = parent_id == new_parent_id;
+        if same_dir && old_name == new_name {
+            return Ok(());
+        }
+
+        let mut src_entries = self.ls(parent_id)?;
+        let pos = src_entries
+            .iter()
+            .position(|e| e.name == old_name)
+            .ok_or(FileSystemError::NotFound)?;
+        let moved = src_entries[pos].clone();
+
+        if same_dir {
+            if src_entries.iter().any(|e| e.name == new_name) {
+                return Err(FileSystemError::FileExists);
+            }
+        } else {
+            // `ls` also validates that the destination IS a directory.
+            let dst_entries = self.ls(new_parent_id)?;
+            if dst_entries.iter().any(|e| e.name == new_name) {
+                return Err(FileSystemError::FileExists);
+            }
+            if moved.kind == FileKind::Directory
+                && (moved.inode_id == new_parent_id
+                    || self.is_descendant_of(new_parent_id, moved.inode_id)?)
+            {
+                return Err(FileSystemError::DirectoryLoop);
+            }
+        }
+
+        self.journal.log(
+            &mut self.device,
+            JournalOp::BeginOp {
+                op_id: moved.inode_id,
+                desc: format!("Rename: {} -> {}", old_name, new_name),
+            },
+        )?;
+
+        if same_dir {
+            src_entries[pos].name = new_name.into();
+            src_entries.sort_by(|a, b| a.name.cmp(&b.name));
+            let data = crate::codec::serialize(&src_entries)?;
+            self.rewrite_data(parent_id, &data)?;
+        } else {
+            // Remove-then-add: see the crash-window note above.
+            src_entries.remove(pos);
+            let src_data = crate::codec::serialize(&src_entries)?;
+            self.rewrite_data(parent_id, &src_data)?;
+
+            let mut dst_entries = self.ls(new_parent_id)?;
+            dst_entries.push(DirEntry {
+                name: new_name.into(),
+                inode_id: moved.inode_id,
+                kind: moved.kind,
+            });
+            dst_entries.sort_by(|a, b| a.name.cmp(&b.name));
+            let dst_data = crate::codec::serialize(&dst_entries)?;
+            self.rewrite_data(new_parent_id, &dst_data)?;
+        }
+
+        self.journal.log(
+            &mut self.device,
+            JournalOp::EndOp {
+                op_id: moved.inode_id,
+            },
+        )?;
+
+        #[cfg(feature = "std")]
+        {
+            let msg = SMessage::FileEvent {
+                path: format!("inode:{}", moved.inode_id),
+                event: format!("Renamed:{}->{}", old_name, new_name),
+            };
+            let _ = self.publish("system/fs/change", msg);
+        }
+
+        Ok(())
+    }
+
+    /// Remove attribute `key` from `inode_id`: the inline value or the
+    /// spilled extent-backed value goes, and every catalog index entry for
+    /// this (inode, key) pair is scrubbed — including the duplicates that
+    /// `set_attribute` appends on re-set. After completion the attribute is
+    /// gone from `get_attribute` AND from `query`; a spilled value frees
+    /// its extents back to the bitmap. Other attributes on the inode are
+    /// untouched.
+    ///
+    /// Returns [`FileSystemError::AttributeNotFound`] if the inode carries
+    /// no such attribute.
+    ///
+    /// (Catalog entries are matched by 64-bit FNV-1a key hash — the same
+    /// assumption the query engine's candidate selection already rests on.)
+    ///
+    /// # Crash windows (no journal replay; ordered leak-not-dangle)
+    /// 1. After the catalog rewrite, before the inode write: the attribute
+    ///    is still on the inode (`get_attribute` sees it) but invisible to
+    ///    queries — unindexed, not inconsistent.
+    /// 2. After the inode write, before the frees: a spilled value's
+    ///    extents are leaked (allocated, unreferenced).
+    /// The catalog rewrite itself is new-extents-then-inode-swap (old-or-
+    /// new, never torn), and a torn op is reported as a dirty mount.
+    pub fn remove_attribute(&mut self, inode_id: u64, key: &str) -> Result<(), FileSystemError> {
+        let mut inode = self.read_inode(inode_id)?;
+        if !inode.attributes.contains_key(key) && !inode.large_attributes.contains_key(key) {
+            return Err(FileSystemError::AttributeNotFound);
+        }
+
+        self.journal.log(
+            &mut self.device,
+            JournalOp::BeginOp {
+                op_id: inode_id,
+                desc: format!("RemoveAttr: {}", key),
+            },
+        )?;
+
+        // 1. Scrub the index first (see the crash-window note): every entry
+        //    for this inode + key hash, whatever value it recorded.
+        let key_hash = hash_bytes(key.as_bytes());
+        self.remove_catalog_entries(|e| e.inode_id == inode_id && e.key_hash == key_hash)?;
+
+        // 2. Drop the attribute from the inode — a single-block write.
+        inode.attributes.remove(key);
+        let spilled = inode.large_attributes.remove(key);
+        self.write_inode(&inode)?;
+
+        // 3. Free a spilled value's extents, now that nothing references
+        //    them.
+        if let Some(extents) = spilled {
+            self.free_extents(&extents)?;
+        } else {
+            self.sync_metadata()?;
+        }
+
+        self.journal
+            .log(&mut self.device, JournalOp::EndOp { op_id: inode_id })?;
+
+        #[cfg(feature = "std")]
+        {
+            let msg = SMessage::FileEvent {
+                path: format!("inode:{}", inode_id),
+                event: format!("AttributeRemoved:{}", key),
+            };
+            let _ = self.publish("system/fs/change", msg);
+        }
+
+        Ok(())
+    }
+
     // --- QUERY ENGINE ---
 
     /// Semantic query engine. no_std-capable: the similarity path routes its
@@ -660,17 +945,85 @@ impl<D: BlockDevice> UnaFS<D> {
 
     // --- HELPERS ---
 
+    /// Return a single block to the free pool (in-memory; callers persist
+    /// via `sync_metadata`).
+    fn free_block(&mut self, block_id: u64) {
+        self.bitmap.free(block_id);
+        if self.superblock.free_blocks < self.superblock.block_count {
+            self.superblock.free_blocks += 1;
+        }
+    }
+
     fn free_extents(&mut self, extents: &ExtentList) -> Result<(), FileSystemError> {
         for extent in extents {
             let blocks = extent.length.div_ceil(BLOCK_SIZE);
             for i in 0..blocks {
-                self.bitmap.free(extent.physical_block + i);
-                if self.superblock.free_blocks < self.superblock.block_count {
-                    self.superblock.free_blocks += 1;
-                }
+                self.free_block(extent.physical_block + i);
             }
         }
         self.sync_metadata()?;
+        Ok(())
+    }
+
+    /// Replace an inode's entire data contents, crash-ordered: the new bytes
+    /// are written to freshly allocated extents FIRST, then the inode is
+    /// swapped to point at them (a single-block write — the atomic point),
+    /// and only then are the old extents freed. A power cut leaves the
+    /// inode's data old-or-new, never torn; an interrupted rewrite leaks
+    /// blocks, never dangles. Unlike `write_data`, the logical size shrinks
+    /// to exactly `data.len()`.
+    fn rewrite_data(&mut self, inode_id: u64, data: &[u8]) -> Result<(), FileSystemError> {
+        let new_chunks = if data.is_empty() {
+            Vec::new()
+        } else {
+            coalesce_extents(self.allocate_and_write_extents(data)?)
+        };
+        let mut inode = self.read_inode(inode_id)?;
+        let old_chunks = core::mem::replace(&mut inode.chunks, new_chunks);
+        inode.size = data.len() as u64;
+        self.write_inode(&inode)?;
+        self.free_extents(&old_chunks)?;
+        Ok(())
+    }
+
+    /// Depth-first walk: does directory `dir_id` live anywhere inside the
+    /// subtree rooted at `root_id`? Used by `rename` to refuse moving a
+    /// directory into itself or its descendants.
+    fn is_descendant_of(&mut self, dir_id: u64, root_id: u64) -> Result<bool, FileSystemError> {
+        let mut stack = alloc::vec![root_id];
+        while let Some(id) = stack.pop() {
+            for entry in self.ls(id)? {
+                if entry.kind == FileKind::Directory {
+                    if entry.inode_id == dir_id {
+                        return Ok(true);
+                    }
+                    stack.push(entry.inode_id);
+                }
+            }
+        }
+        Ok(false)
+    }
+
+    /// Rewrite the attribute catalog with every entry matching `pred`
+    /// removed. No-op (and no rewrite) when nothing matches.
+    fn remove_catalog_entries<F: Fn(&CatalogEntry) -> bool>(
+        &mut self,
+        pred: F,
+    ) -> Result<(), FileSystemError> {
+        let catalog_id = self.superblock.catalog_inode;
+        if catalog_id == 0 {
+            return Ok(());
+        }
+        let inode = self.read_inode(catalog_id)?;
+        let data = self.read_data(catalog_id, 0, inode.size)?;
+        let mut entries = deserialize_catalog(&data)?;
+        let before = entries.len();
+        entries.retain(|e| !pred(e));
+        if entries.len() == before {
+            return Ok(());
+        }
+        let new_data = serialize_catalog(&entries)?;
+        self.rewrite_data(catalog_id, &new_data)?;
         Ok(())
     }
 
@@ -765,6 +1118,27 @@ pub fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
         return 0.0;
     }
     dot / (mag_a * mag_b)
+}
+
+/// Merge logically and physically contiguous extents into single runs, so a
+/// rewritten catalog or directory keeps its extent list (and therefore its
+/// inode, which must fit in one block) small. This is purely an in-memory
+/// shaping of extent VALUES — the on-disk `Extent` encoding is untouched.
+fn coalesce_extents(extents: ExtentList) -> ExtentList {
+    let mut merged: ExtentList = Vec::with_capacity(extents.len());
+    for e in extents {
+        match merged.last_mut() {
+            Some(last)
+                if last.length % BLOCK_SIZE == 0
+                    && last.logical_offset + last.length == e.logical_offset
+                    && last.physical_block + last.length / BLOCK_SIZE == e.physical_block =>
+            {
+                last.length += e.length;
+            }
+            _ => merged.push(e),
+        }
+    }
+    merged
 }
 
 fn check_condition(val: &AttributeValue, op: &QueryOp, target: &AttributeValue) -> Option<f32> {
