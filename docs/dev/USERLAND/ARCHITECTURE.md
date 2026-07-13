@@ -46,7 +46,7 @@ logic. Some are implemented; some are design-stage (README only). Examples:
 | `principia` | System configuration and policy. |
 | `tabula` | Text and code editing. |
 | `vaire` | Version control (Git). |
-| `amber_bytes` | Storage and block-level operations. |
+| `amber_bytes` | Disk forensics: partition/block-level recovery ("The Block"). |
 | `stria` | Audio/video editing. |
 | `junct` | Communications (messaging, email, RSS). |
 

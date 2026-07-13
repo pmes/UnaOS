@@ -43,7 +43,7 @@ capability area. Implemented today: [vein](handlers/vein) (AI/LLM),
 [matrix](handlers/matrix) (spatial files), [midden](handlers/midden) (shell),
 [principia](handlers/principia) (system config), [tabula](handlers/tabula) (text),
 [vaire](handlers/vaire) (version control), [aule](handlers/aule) (build),
-[amber_bytes](handlers/amber_bytes) (storage), [stria](handlers/stria) (A/V).
+[amber_bytes](handlers/amber_bytes) (disk forensics), [stria](handlers/stria) (A/V).
 Design-stage: [aether](handlers/aether), [comscan](handlers/comscan),
 [geode](handlers/geode), [holocron](handlers/holocron), [mica](handlers/mica),
 [obsidian](handlers/obsidian), [xenolith](handlers/xenolith),
