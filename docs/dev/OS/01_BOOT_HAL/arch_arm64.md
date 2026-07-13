@@ -2382,6 +2382,68 @@ paired with its `KEY` lines. ⚠ Verify the serial bridge captures a full boot B
 (§JB1f) — with JD11 the bridge is now the *primary* evidence channel for output, so a mid-bench freeze
 costs the transcript.
 
+### JD12 — paging (`head`/`tail`) and wildcard globbing on the panel shell
+
+The classic file-manager verb set closed at JD10 (`mv`) and JD11 made benches self-documenting; JD12 is the
+polish pass over that set — two user-facing conveniences, both **`shell.rs`-only and call-never-edit** (they
+add NO `fat.rs` logic, riding the existing public read/dir API), so the lane is exactly JD7–JD11's.
+
+**`head <path> [n]` / `tail <path> [n]` — paging (M1).** Print the first / last `n` lines of a file
+(default 10). `head` STREAMS from offset 0 through the offset-aware `read_at` in 4 KiB windows and stops the
+moment it has seen `n` newlines — so `head 10` of a huge file reads only the first window(s), never the whole
+file; a 64 KiB byte ceiling backstops a file with too few newlines so an unterminated giant line still bounds
+the read and the heap. `tail` reads a bounded 64 KiB window ending at EOF, renders it, and prints the last
+`n` lines; if that window began mid-file it probes the byte just before it to decide precisely whether the
+first line is a cut partial (dropped) or a boundary-aligned complete line (kept), and notes the bound. A
+directory or the root is `-EISDIR`; an empty file prints nothing. The three viewers `cat`/`head`/`tail` share
+one `render_text` (LF splits, CR dropped, other non-printing bytes → `.`), and `cat`'s body was refactored
+onto a `cat_render` helper (byte-identical output) that the wildcard `cat` reuses — so a file reads
+identically however it is viewed, and mirrors identically into the JD11 serial transcript.
+
+**Wildcard globbing — `*` / `?` (M2–M3).** A single TRAILING glob in a path's LAST component expands against
+its parent directory via the read-only `read_dir` (the JD4 case-insensitive 8.3 match, now with `*` = any
+run and `?` = one char, via a small iterative star-backtrack matcher — no recursion, no allocation). Matches
+are `.`/`..`-filtered and sorted for a deterministic listing / serial transcript. The engine is invoked ONLY
+inside the fs-verb arms — the shared arg-split at the top of `dispatch_command` is UNCHANGED, and the NET
+command region (`netinfo`/`ping`/`arp`/`connect`/`udpsend`/`get` — a sockets-arc lane) never sees a glob. A
+leaf with no metacharacter, or a glob confined to a non-trailing component, passes through literally
+(byte-identical to pre-JD12; a mid-path wildcard resolves to an honest `-ENOENT`). The verbs it lifts:
+
+- `ls *.EXT` lists the matches (one table line each + the file/dir tally); `cat *.EXT` cats each matching
+  file in order (reusing `cat_render`; a directory match is the classic `-EISDIR`).
+- `rm <path...>` takes multiple targets and expands wildcards (`rm *.TMP`); `cp [-r] <src...> <dst>` and
+  `mv <src...> <dst>` take multiple sources with the LAST path the destination — with more than one source
+  the destination MUST be an existing directory (`-ENOTDIR` otherwise, since several files can only land
+  INTO a directory), and each source rides the existing `fs_cp`/`fs_cp_recursive`/`fs_mv` via the
+  `SRC DIR/ → DIR/<leaf>` idiom. The single-source / no-wildcard case is a fast path, byte-identical to
+  pre-JD12. Expansion is **SNAPSHOT-then-act**: the match list is captured before any mutation, so a
+  `rm *.TXT` / `mv *.LOG ARCHIVE/` that deletes or moves as it goes never invalidates its own list; each
+  concrete target is then re-resolved by its per-file helper (stale-proof, the JD4 cwd model). A wildcard
+  that matches nothing is an honest per-pattern `no match` note.
+
+**PRINCIPAL / ACL unchanged.** The shell is still EL1 ASID 0 = the PUBLIC principal; paging is read-only and
+globbing only multiplies the same per-file operations, so JD12 adds no new `fat.rs` surface, no new lock, and
+no new ACL interaction — it is a pure `shell.rs` composition of primitives JD4–JD11 already ledgered.
+
+**Gate (QEMU):** `./arroyo check` + `UNAOS_TEGRA=1 ./arroyo check` green both arches (no new warnings);
+`./arroyo test-arm 22` → `MISSION SUCCESS`; `UNAOS_GICV3=1 ./arroyo test-arm 40` → CAPSTONE 6/6;
+`UNAOS_HUBSTORAGE=1 ./arroyo test 25` → `MISSION SUCCESS` (the shared `shell.rs` guard); `esp-jetson
+kernel.elf` links, **109 `tegra:` strings** — UNCHANGED from JD11 (the new verbs carry no `tegra:` token;
+validate media by count, not size — the ELF grew to ~725 KB purely from the base's merged SOCK-3/UNAFS-K3
+work, not from JD12). Zero x86 behavioural change (the shell command path is keystroke-driven and not
+headless-reachable in-lane; tegra never runs in QEMU). A 1-lens adversarial review (refute-mode) found no
+data-correctness bug — `glob_match`'s backtrack, `cat_render`/`ls_resolved` byte-identity, and the
+snapshot-then-mutate safety all cleared; two low-severity truncation-note edges it raised were folded in
+(`head` notes when lines remain, not merely when it stopped short of EOF; `tail` keeps a boundary-aligned
+first line).
+
+**Metal verdict — ⏳ ATTENDED-PENDING.** As in JD2–JD11 the interactive path can only be exercised on
+silicon. Bench card [`jd12-bench.md`](../../../../unaos/scripts/jd12-bench.md): page a file with
+`head`/`tail`, then glob `ls *.TXT` / `cat *.TXT` / `cp *.TXT DOCS/` / `rm *.TMP` / `mv *.LOG ARCHIVE/`, and
+confirm on the JD11 serial transcript that the right files are paged / listed / copied / removed / moved,
+that a no-match pattern reports honestly, and that a multi-source copy onto a non-directory is `-ENOTDIR`.
+This bench needs a card with several 8.3-named files sharing an extension (create them on the panel first).
+
 ### JB1f — the unhealed early-vector window (the round-6 boot crash), closed (`85f74f8`)
 
 **The evidence (2026-07-11 attended bench, real Orin).** Kernel `446abd3` (the JD6 tip): 2/2 boots
