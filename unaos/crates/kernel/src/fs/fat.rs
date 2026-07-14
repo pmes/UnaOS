@@ -78,6 +78,36 @@ pub struct DirEntry {
     pub is_dir: bool,
     pub size: u32,
     first_cluster: u32,
+    // JD16: raw FAT last-write timestamp, kept as the two packed on-disk words (time @0x16, date @0x18)
+    // so read-side parsing costs nothing and existing callers stay byte-identical. Decoded on demand via
+    // `mtime()`. An all-zero pair (host tools sometimes leave the field 0, and a kernel-created entry has
+    // no RTC to stamp) means "no timestamp" — see `FatTimestamp::is_zero`.
+    mtime_time: u16,
+    mtime_date: u16,
+}
+
+/// A decoded FAT last-write timestamp (JD16). FAT stores the moment as two packed 16-bit words with
+/// **2-second resolution and NO timezone** (the on-disk value is wall-clock local time as whatever tool
+/// wrote it saw it; there is no stored UTC offset to correct by, so we present the packed fields
+/// verbatim). The FAT epoch is **1980-01-01**; the packed year field is an offset from 1980. An all-zero
+/// on-disk pair decodes to the sentinel year 1980 with month/day 0 — a value that never occurs in a real
+/// stamp — so callers use `is_zero()` to render those honestly rather than printing a bogus date.
+#[derive(Clone, Copy)]
+pub struct FatTimestamp {
+    pub year: u16, // full year, e.g. 2026 (1980 + packed offset)
+    pub month: u8, // 1..=12 (0 only in the all-zero sentinel)
+    pub day: u8,   // 1..=31 (0 only in the all-zero sentinel)
+    pub hour: u8,  // 0..=23
+    pub min: u8,   // 0..=59
+    pub sec: u8,   // 0..=58, even (FAT stores seconds/2)
+}
+
+impl FatTimestamp {
+    /// True when the on-disk stamp was all-zero — no meaningful last-write time was recorded (a host
+    /// tool that left the field 0, or a kernel-written entry, which has no RTC to stamp — see §JD16).
+    pub fn is_zero(&self) -> bool {
+        self.month == 0 && self.day == 0
+    }
 }
 
 impl DirEntry {
@@ -99,6 +129,24 @@ impl DirEntry {
     /// directory). Read-only accessor; `0` for an empty/zero-length file (never a valid data cluster).
     pub fn first_cluster(&self) -> u32 {
         self.first_cluster
+    }
+
+    /// JD16: decode the entry's FAT last-write timestamp from its two packed on-disk words. Packing
+    /// (FAT spec): the DATE word holds `year-1980` in bits 15..9, month (1..12) in bits 8..5, day
+    /// (1..31) in bits 4..0; the TIME word holds hour in bits 15..11, minute in bits 10..5, and
+    /// seconds/2 in bits 4..0 (hence the 2-second resolution). No timezone is stored. An all-zero pair
+    /// decodes to the `is_zero()` sentinel (month/day 0).
+    pub fn mtime(&self) -> FatTimestamp {
+        let d = self.mtime_date;
+        let t = self.mtime_time;
+        FatTimestamp {
+            year: 1980 + (d >> 9),
+            month: ((d >> 5) & 0x0F) as u8,
+            day: (d & 0x1F) as u8,
+            hour: (t >> 11) as u8,
+            min: ((t >> 5) & 0x3F) as u8,
+            sec: ((t & 0x1F) * 2) as u8,
+        }
     }
 }
 
@@ -156,6 +204,10 @@ fn classify_dir_slot(e: &[u8]) -> DirSlot {
         is_dir: attr & 0x10 != 0,
         size: u32le(e, 28),
         first_cluster: ((u16le(e, 20) as u32) << 16) | u16le(e, 26) as u32,
+        // JD16 read-side: last-write time @0x16 (22), last-write date @0x18 (24). Stored raw; decoded
+        // by DirEntry::mtime(). Creation time (@0x0E/0x10) is left unread — mtime is what `ls -l` shows.
+        mtime_time: u16le(e, 22),
+        mtime_date: u16le(e, 24),
     })
 }
 

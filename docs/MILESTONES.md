@@ -274,6 +274,39 @@ Spec promotions committed here; the granular arc detail is in each arc's own ent
 
 ---
 
+## hw-jetson track — 2026-07-14 (JD16 — `ls -l` long listing with real FAT timestamps)
+
+### JD16 — `ls -l`: long listing with REAL FAT last-write timestamps (first `fat.rs` READ-side edit; `shell.rs`) ⏳ attended-pending
+- **Why:** every FAT short directory entry already stores a last-write timestamp (offsets 0x16/0x18), but
+  JD1–JD15 kept `fat.rs` call-never-edit and never surfaced it. JD16 adds `ls -l` — size + modified timestamp
+  + name — by reading (not writing) that field. First arc to touch `fat.rs`, and only its read/parse path.
+- **How (bounded `fat.rs` read-side grant):** `DirEntry` gains `mtime_time`/`mtime_date` (the two packed
+  on-disk words), filled by `classify_dir_slot` from the same 32-byte slot the walkers already parse — **zero
+  extra I/O, every pre-JD16 caller byte-identical**. `DirEntry::mtime()` decodes to a new `FatTimestamp`. No
+  write primitive, no serialization, no lock changed — reconciles cleanly with the concurrent x86 STOR-S8
+  write-side arc. Creation time (0x0E/0x10) deliberately left unread.
+- **FAT format, honest:** epoch **1980-01-01**; resolution **2 seconds** (seconds/2 in the low 5 bits); **no
+  timezone** (local wall-clock, presented verbatim). An all-zero pair is the `is_zero()` sentinel.
+- **Shell (`shell.rs`):** the `ls` arm parses `-l`/`-L` (JD14 flag convention — filtered from the path, a file
+  named `-l` reachable as `./-l`). Plain `ls` unchanged. `ls -l` adds the timestamp column (dir shows `<DIR>`
+  + trailing `/`); threads through the same `print_dir_listing` as the JD12 wildcard, so `ls -l *.TXT` works.
+  `fmt_mtime` renders a zeroed stamp as a dashed placeholder.
+- **⚠ Kernel-written files carry ZERO timestamps (observed, not invented):** the kernel has no RTC; the
+  `fat.rs` create path zeroes the whole entry (time/date = 0) and the write/append paths only republish
+  size + chain-head — so any OS-created/written file shows the dashed placeholder. That is the honest verdict.
+  Host-written files carry their real host timestamp and display faithfully. **A real on-write clock is a
+  named FUTURE arc**, not JD16.
+- **Tested (QEMU):** `check` + `UNAOS_TEGRA=1 check` green both arches (no new warnings); `test-arm 22`
+  MISSION; `kernel8-test` **40 PASS / 0 FAIL** (this battery protects the shared `fat.rs`); `test 25` MISSION
+  (x86, `fat.rs` shared there too). As in JD2–JD15 the shell command path is not headless-reachable, so the
+  `ls -l` verdict is exercised by the `jd16-bench.md` attended card. Lane: `fat.rs` read-side + `shell.rs`.
+- **Metal:** ⏳ **attended-pending** — `jd16-bench.md` checks a host-written file shows its real timestamp,
+  a kernel-`touch`ed file shows the dashed placeholder, and an mtime survives a power-cycle.
+- **Detail:** [`arch_arm64.md` §JD16](dev/OS/01_BOOT_HAL/arch_arm64.md). **Commit:** on `us-jd16` (the seat
+  assigns the integration hash at merge).
+
+---
+
 ## hw-jetson track — 2026-07-14 (JD15 — `-f` tree-replace for `cp -r`/`mv`)
 
 ### JD15 — `-f` tree-replace: forced replace of an existing directory-TREE destination (`shell.rs`-only, call-never-edit) ⏳ attended-pending

@@ -1214,16 +1214,44 @@ fn fs_tail(console: &mut Console, arg: &str, n: u32) {
     }
 }
 
-/// Print one directory's entries in the `ls` table format, with the file/dir tally.
-fn print_dir_listing(console: &mut Console, entries: &[DirEntry]) {
+/// JD16: format one entry's FAT last-write timestamp as a fixed-width `YYYY-MM-DD HH:MM:SS` field for
+/// the `ls -l` long listing. A zeroed on-disk stamp (a host tool that left it 0, or a kernel-written
+/// entry — the kernel has no RTC to stamp with; see §JD16) is shown honestly as a dashed placeholder of
+/// the same width rather than a bogus 1980 date. Precision is 2 seconds, no timezone (FAT stores local
+/// wall-clock; there is no offset to correct by).
+fn fmt_mtime(de: &DirEntry) -> String {
+    let ts = de.mtime();
+    if ts.is_zero() {
+        // 19 chars, same width as "YYYY-MM-DD HH:MM:SS"
+        return String::from("       -           ");
+    }
+    alloc::format!(
+        "{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
+        ts.year, ts.month, ts.day, ts.hour, ts.min, ts.sec
+    )
+}
+
+/// Print one directory's entries in the `ls` table format, with the file/dir tally. `long` selects the
+/// JD16 `-l` long format (size + FAT last-write timestamp + name), otherwise the classic short table.
+fn print_dir_listing(console: &mut Console, entries: &[DirEntry], long: bool) {
     let (mut files, mut dirs) = (0u32, 0u32);
     for de in entries {
         if de.is_dir {
             dirs += 1;
-            console.println(&alloc::format!("  <DIR>         {}", de.name()));
+            if long {
+                console.println(&alloc::format!(
+                    "  <DIR>        {}  {}/", fmt_mtime(de), de.name()));
+            } else {
+                console.println(&alloc::format!("  <DIR>         {}", de.name()));
+            }
         } else {
             files += 1;
-            console.println(&alloc::format!("  {:>10}  {}", de.size, de.name()));
+            if long {
+                console.println(&alloc::format!(
+                    "  {:>10}  {}  {}", de.size, fmt_mtime(de), de.name()));
+            } else {
+                console.println(&alloc::format!("  {:>10}  {}", de.size, de.name()));
+            }
         }
     }
     console.println(&alloc::format!("{} file(s), {} dir(s)", files, dirs));
@@ -1333,19 +1361,22 @@ fn glob_expand(fs: &FatFs, arg: &str) -> Glob {
 /// Resolve `path` and print it in the `ls` table format (the single-path `ls` core, shared by the
 /// `ls` arm and the wildcard `ls *.EXT` Literal fall-through). A directory lists its entries; a plain
 /// file prints its one table line (the DOS idiom); errors are errno-tagged.
-fn ls_resolved(console: &mut Console, fs: &FatFs, path: &str) {
+fn ls_resolved(console: &mut Console, fs: &FatFs, path: &str, long: bool) {
     match resolve_path(fs, path) {
         Ok(Resolved::Root) => match fs.read_dir(0) {
-            Ok(entries) => print_dir_listing(console, &entries),
+            Ok(entries) => print_dir_listing(console, &entries, long),
             Err(e) => console.println(&alloc::format!("ls: /: read failed ({:?}, -EIO)", e)),
         },
         Ok(Resolved::Entry(de, canon)) => {
             if de.is_dir {
                 match fs.read_dir(de.first_cluster()) {
-                    Ok(entries) => print_dir_listing(console, &entries),
+                    Ok(entries) => print_dir_listing(console, &entries, long),
                     Err(e) => console.println(&alloc::format!(
                         "ls: {}: read failed ({:?}, -EIO)", canon, e)),
                 }
+            } else if long {
+                console.println(&alloc::format!(
+                    "  {:>10}  {}  {}", de.size, fmt_mtime(&de), de.name()));
             } else {
                 console.println(&alloc::format!("  {:>10}  {}", de.size, de.name()));
             }
@@ -1356,9 +1387,9 @@ fn ls_resolved(console: &mut Console, fs: &FatFs, path: &str) {
 
 /// JD4 `ls`/`ls <dir>` (single path): mount + resolve + print. Extracted so the wildcard `ls *.EXT`
 /// can share the exact resolve/print behaviour for a non-trailing-glob fall-through.
-fn ls_path(console: &mut Console, arg: &str) {
+fn ls_path(console: &mut Console, arg: &str, long: bool) {
     match crate::fs::fat::mount() {
-        Ok(fs) => ls_resolved(console, &fs, &normalize_path(&cwd_path(), arg)),
+        Ok(fs) => ls_resolved(console, &fs, &normalize_path(&cwd_path(), arg), long),
         Err(e) => console.println(&alloc::format!("ls: no FAT filesystem ({:?})", e)),
     }
 }
@@ -1366,16 +1397,16 @@ fn ls_path(console: &mut Console, arg: &str) {
 /// JD12 `ls *.EXT`: list every entry matching a wildcard, one `ls`-table line each (sorted), with the
 /// file/dir tally. A directory match shows as `<DIR>` (its contents are not expanded — that mirrors
 /// how a shell hands matched names to `ls`); no match is an honest "no match".
-fn ls_globbed(console: &mut Console, arg: &str) {
+fn ls_globbed(console: &mut Console, arg: &str, long: bool) {
     let fs = match crate::fs::fat::mount() {
         Ok(fs) => fs,
         Err(e) => return console.println(&alloc::format!("ls: no FAT filesystem ({:?})", e)),
     };
     match glob_expand(&fs, arg) {
-        Glob::Literal(p) => ls_resolved(console, &fs, &normalize_path(&cwd_path(), &p)),
+        Glob::Literal(p) => ls_resolved(console, &fs, &normalize_path(&cwd_path(), &p), long),
         Glob::Matched { entries, .. } if entries.is_empty() =>
             console.println(&alloc::format!("ls: {}: no match", arg)),
-        Glob::Matched { entries, .. } => print_dir_listing(console, &entries),
+        Glob::Matched { entries, .. } => print_dir_listing(console, &entries, long),
     }
 }
 
@@ -1582,7 +1613,7 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
         "help" => {
             console.println("COMMANDS: ver, help, clear, echo, panic, gneiss");
             console.println("STORAGE:  diskinfo, usbinfo, read <lba>, write <lba> <byte>");
-            console.println("FILES:    fatinfo (FAT geometry), ls [dir], cd [dir], pwd, cat <path>");
+            console.println("FILES:    fatinfo (FAT geometry), ls [-l] [dir], cd [dir], pwd, cat <path>");
             console.println("PAGING:   head <path> [n], tail <path> [n]  (first / last n lines, default 10)");
             console.println("WRITE:    touch <path>, write <path> <text>, append <path> <text>, rm [-r] [-f] <path>");
             console.println("DIRS:     mkdir <path>, rmdir <path>  (create / remove empty directories)");
@@ -1640,10 +1671,20 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
         "ls" | "dir" => {
             // JD4: `ls` lists the cwd; `ls <dir>` any path (absolute or cwd-relative). An `ls` of
             // a plain file prints its one table line (the DOS idiom), not an error. JD12: `ls *.EXT`
-            // lists the wildcard matches (sorted, with the file/dir tally).
-            match args.first().copied() {
-                Some(a) if has_glob(a) => ls_globbed(console, a),
-                other => ls_path(console, other.unwrap_or(".")),
+            // lists the wildcard matches (sorted, with the file/dir tally). JD16: `-l` selects the
+            // long format (size + FAT last-write timestamp + name); flags are filtered from the paths
+            // (a `-`+letters arg — same convention as cp/rm/mv), so a file literally named `-l` is
+            // reachable as `./-l`. `l`/`L` set long; other flag letters are ignored.
+            let long = args.iter().any(|&a|
+                a.len() > 1 && a.starts_with('-')
+                && a[1..].bytes().all(|b| b.is_ascii_alphabetic())
+                && a[1..].bytes().any(|b| b == b'l' || b == b'L'));
+            let path = args.iter().copied().find(|a|
+                !(a.len() > 1 && a.starts_with('-')
+                  && a[1..].bytes().all(|b| b.is_ascii_alphabetic())));
+            match path {
+                Some(a) if has_glob(a) => ls_globbed(console, a, long),
+                other => ls_path(console, other.unwrap_or("."), long),
             }
         },
         "cd" => {
