@@ -263,6 +263,37 @@ Spec promotions committed here; the granular arc detail is in each arc's own ent
 
 ---
 
+## hw-jetson track — 2026-07-14 (JD14 — `-f`/`-n` flag family for `cp`/`mv`/`rm`)
+
+### JD14 — `-f`/force + `-n`/no-clobber flags for `cp`/`mv`/`rm` (`shell.rs`-only, call-never-edit) 🔬 `hw-jetson`
+- **Why:** the verb set closed at JD13, but the everyday POSIX ergonomics were missing — no way to overwrite a
+  destination, and `rm NOSUCH` always complained. JD14 adds the flag family that completes it: `cp -f`/`mv -f`
+  overwrite, `rm -f`/`rm -rf` delete quietly, `-n` makes the no-clobber default explicit.
+- **How (call-never-edit, no `fat.rs` change):** a new `split_flags` parses bundled short flags (`-rf` ==
+  `-r -f`) — which also fixes a latent gap where the old exact-token match never recognized `rm -rf DIR`. The
+  flags only gate which existing primitive runs (`copy_file_into` truncate, `delete_located`,
+  `rename_entry`/`move_entry`).
+- **Semantics (panel-consistent):** no-clobber is now the DEFAULT for `cp` AND `mv` — an existing destination
+  FILE is `-EEXIST` unless `-f`. This aligns `cp` with `mv`'s pre-existing default (a deliberate divergence
+  from POSIX `cp`, which overwrites silently; the panel favours safety + cp/mv symmetry). `-f` overwrites a
+  FILE dest (cp truncates-in-place; mv delete-dst-first); a DIRECTORY dest is never clobbered even with `-f`
+  (needs `rm -r`), and `cp -r`'s fresh-tree `-EEXIST` stands regardless of `-f`. `-n` reasserts the default and
+  overrides `-f`. `rm -f`/`rm -rf` suppress the missing-target error and no-match wildcard quietly (POSIX); two
+  guards are NOT relaxed — `rm -rf /` stays `-EBUSY`, and a wrong-usage `-EISDIR` is still shown.
+- **Tested (QEMU):** `check` + `UNAOS_TEGRA=1 check` green both arches (no new warnings — only the pre-existing
+  `shutdown` double-`hlt_loop`); `test-arm 22` MISSION; `UNAOS_GICV3=1 test-arm 40` CAPSTONE 6/6;
+  `UNAOS_HUBSTORAGE=1 test 25` MISSION (shared `shell.rs` guard); `esp-jetson` links, **109 `tegra:` strings** —
+  UNCHANGED from JD11–JD13 (the flag strings carry no `tegra:` token; validate by count, not size). Zero x86
+  behavioural change. No `kernel8-test` on the jetson side. Lane: only `shell.rs`
+  (fat.rs/console.rs/main.rs/NET arms/unafs verbs untouched).
+- **Metal:** ⏳ **ATTENDED-PENDING** — the interactive path only runs on silicon. Bench card
+  [`jd14-bench.md`](../unaos/scripts/jd14-bench.md): confirm the no-clobber default (`cp A B`/`mv A B` onto an
+  existing B is `-EEXIST`), `-f` overwrite for both, `mv -f` onto a directory refused, `rm -f NOSUCH` /
+  `rm -rf NOSUCH*` quiet, `rm -rf DIR` (bundled flags) removing a tree, `rm -rf /` still `-EBUSY`, with a
+  power-cycle for durability. Pairs with the JD13 bench in one attended session.
+- **Detail:** [`arch_arm64.md` §JD14](dev/OS/01_BOOT_HAL/arch_arm64.md). **Commit:** on `hw-jetson` (the seat
+  assigns the integration hash at merge).
+
 ## hw-jetson track — 2026-07-14 (JD13 — recursive `rm -r` on the panel shell)
 
 ### JD13 — recursive `rm -r <dir>` (`shell.rs`-only, call-never-edit) 🔬 `hw-jetson`
