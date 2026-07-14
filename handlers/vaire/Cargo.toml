@@ -14,7 +14,7 @@ bandy = { path = "../../libs/bandy" }
 # `status` powers the real is_dirty check (index-vs-worktree, tree-vs-index).
 gix = { version = "0.80", default-features = false, features = ["parallel", "revision", "blob-diff", "status"] }
 # The vault-probe rides UnaFS's fail-closed mount check (read-only, host-native).
-unafs = { path = "../../libs/fs/unafs" }
+unafs = { path = "../../unaos/libs/fs/unafs" }
 # elexar uses glib/gtk by default, we need to disable that if we are testing in isolation
 elessar = { path = "../../libs/elessar", default-features = false }
 gtk4 = { version = "0.10.3", features = ["v4_12"], optional = true }

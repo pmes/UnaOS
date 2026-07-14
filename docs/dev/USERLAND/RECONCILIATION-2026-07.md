@@ -118,7 +118,14 @@ and wrapped with host I/O by the userspace `libs/fs/unafs`.
    drift — the survey initially flagged them only because they lack READMEs; READMEs owed).
    **Executed** — the crate is now `helm` (module `rover`) at `unaos/libs/sys/helm`;
    `libs/input` and `libs/pwm` carry READMEs; the helm core has a charter README.
-4. **UnaFS ring-split** per the map.
+4. **UnaFS ring-split** per the map. **Executed** (`us-unafs-ringsplit`): the crate
+   was already `no_std`-capable as a single crate (the kernel consumes it with
+   `default-features = false`; the host-native `FileDevice`/mmap/bandy surface sits
+   behind the default-on `std` feature), so the ring-split is a **move**, not a
+   two-crate fork — `libs/fs/unafs` → `unaos/libs/fs/unafs`, following the helm
+   template (root-workspace member, `unaos/Cargo.toml` still `exclude = ["libs"]`).
+   All workspace members, path dependencies (kernel, tools, handlers, vessels), and
+   doc references updated; the crate's own sibling path deps rebased to `../../../../libs`.
 5. **`libs/views/` extraction** — lift the chat view out of lumen as the first shared view
    crate.
 6. **Handler README pass** — xenolith drops the "containers" scope-bleed (containers are

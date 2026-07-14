@@ -5,7 +5,7 @@ members = [
     "libs/quartzite",
     "libs/elessar",
     "libs/resonance",
-    "libs/fs/unafs",
+    "unaos/libs/fs/unafs",
     "libs/input/ibus",
     "unaos/libs/sys/helm",
     "libs/pwm/pca9685",

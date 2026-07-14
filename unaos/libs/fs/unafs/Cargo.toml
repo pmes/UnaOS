@@ -7,8 +7,8 @@ license = "LGPL-3.0-or-later"
 [dependencies]
 # Host-only backends live behind the default `std` feature; the core on-disk
 # format + BlockDevice seam are no_std + alloc.
-gneiss_pal = { path = "../../gneiss_pal", optional = true }
-bandy = { path = "../../bandy", optional = true }
+gneiss_pal = { path = "../../../../libs/gneiss_pal", optional = true }
+bandy = { path = "../../../../libs/bandy", optional = true }
 serde = { version = "1.0", default-features = false, features = ["derive", "alloc"] }
 bincode = { version = "2.0", default-features = false, features = ["serde", "alloc"] }
 thiserror = { version = "2.0", default-features = false }

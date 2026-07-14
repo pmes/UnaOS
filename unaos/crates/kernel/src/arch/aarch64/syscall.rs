@@ -8714,7 +8714,7 @@ impl PrincipalRecord {
 // (value = the principal's canonical string) and `grants:<grantee>` (value = the rights) — then deletes the
 // FAT-bridge sidecar. That migration is gated on a native unafs FILESYSTEM existing in the kernel (the
 // ROADMAP §2 "BeFS" convergence: no_std port -> block adapter -> read-only mount -> journaled writes), which
-// does NOT exist in this tree yet (fs/mod.rs mounts only FAT; libs/fs/unafs is a std Ring-3 crate). What DOES
+// does NOT exist in this tree yet (fs/mod.rs mounts only FAT; unaos/libs/fs/unafs is a std Ring-3 crate). What DOES
 // land now, in-lane, is the deterministic 1:1 CODEC that migration will use — pure functions + KATs — so the
 // exact projection is PINNED and PROVEN ahead of the mount, and the "tell the sidecar from a native volume"
 // primitive the FORMAT bullet names exists.
@@ -8729,11 +8729,11 @@ impl PrincipalRecord {
 // un-re-acquirable. The prefix form keeps migrated == fresh-mint, byte-for-byte. (This corrects the earlier
 // `image_sha256` doc note that called the canonical form "71 chars, derived at K4".)
 
-/// The native unafs superblock magic — MIRRORED from `libs/fs/unafs/src/superblock.rs` (`pub const MAGIC:
+/// The native unafs superblock magic — MIRRORED from `unaos/libs/fs/unafs/src/superblock.rs` (`pub const MAGIC:
 /// [u8;5] = *b"UNAFS"`), deliberately distinct from the FAT-bridge sidecar's `ATR_MAGIC` (`UNAATR1\0`) so a
 /// kernel can tell a real native volume from the shim and drive migrate-then-delete at K4. Kept LOCAL (the
 /// crate is std/Ring-3, unported); if that native magic ever changes, change it here. The classifier below
-/// assumes this lands at byte 0 of the native superblock — true because `libs/fs/unafs` serializes `Superblock`
+/// assumes this lands at byte 0 of the native superblock — true because `unaos/libs/fs/unafs` serializes `Superblock`
 /// with bincode fixint (a fixed `[u8;5]` field emits no length prefix); a future serde/codec change there
 /// must be reflected here.
 const UNAFS_SB_MAGIC: [u8; 5] = *b"UNAFS";

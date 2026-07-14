@@ -75,7 +75,7 @@ impl Midden {
     }
 
     fn list_files(&self) -> Result<SMessage> {
-        // TODO: Hook into libs/fs/unafs here
+        // TODO: Hook into unaos/libs/fs/unafs here
         // For now, we simulate the response
         Ok(SMessage::TerminalOutput(format!(
             "Listing contents of {}... [STUB]",
