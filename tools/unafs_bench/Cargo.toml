@@ -5,7 +5,7 @@ edition = "2024"
 license = "GPL-3.0-or-later"
 
 [dependencies]
-unafs = { path = "../../libs/fs/unafs" }
+unafs = { path = "../../unaos/libs/fs/unafs" }
 anyhow = "1.0"
 rand = "0.8"
 dirs = "5.0"

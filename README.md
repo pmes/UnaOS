@@ -35,12 +35,12 @@ USB/xHCI storage, Intel e1000 networking, and the UEFI-GOP framebuffer. See
 | [elessar](libs/elessar) | Workspace/context detection. |
 | [euclase](libs/euclase) | WGPU rendering. |
 | [resonance](libs/resonance) | Audio engine & DSP. |
-| [unafs](libs/fs/unafs) | Virtual filesystem client. |
+| [unafs](unaos/libs/fs/unafs) | Virtual filesystem client. |
 | [lux](libs/lux) | Image decoding (incl. camera RAW). |
 
 **Layout convention.** Following Linux precedent, a device-class or domain grows
 its own directory under `libs/` — the directory names the class, the leaf names
-the crate/part: `libs/fs/unafs`, `libs/input/ibus`, `libs/pwm/pca9685` (with
+the crate/part: `unaos/libs/fs/unafs`, `libs/input/ibus`, `libs/pwm/pca9685` (with
 `net/`, `video/`, `media/` to come). A crate stays flat at `libs/<crate>` until a
 second family member joins it, at which point the pair moves under a class
 directory. Crate names never change with the move — only paths.

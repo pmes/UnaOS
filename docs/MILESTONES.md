@@ -12,7 +12,7 @@ Legend: **✅ metal-confirmed** · **🔬 QEMU-green, metal pending** · dates I
 
 ## unafs — UNAFS-F1 (dirty-mount recovery: fsck-scavenger + `recover`) — 2026-07-13 🔬 `us-unafs-f1`
 
-**What it does:** gives `libs/fs/unafs` a real crash-recovery pass for the residue the F2 mutation
+**What it does:** gives `unaos/libs/fs/unafs` a real crash-recovery pass for the residue the F2 mutation
 engine is *documented* to leave on a program-order power cut. The mutations are crash-**ordered**
 (leak-not-dangle), so a crash leaves only two bounded, structurally sound residues: **leaked
 blocks** (allocated in the bitmap, reachable from no inode) and **query-orphans** (the one
@@ -30,7 +30,7 @@ not log replay — and it is best-effort under program-order writes (no write ba
 write-back cache can still dangle a pointer — a future arc). Zero on-disk format change; the golden
 KATs are byte-identical; the kernel's read-only K3 mount never calls the new paths.
 
-**How it was tested:** 5 new recovery KATs (`libs/fs/unafs/tests/recovery_logic.rs`) craft each
+**How it was tested:** 5 new recovery KATs (`unaos/libs/fs/unafs/tests/recovery_logic.rs`) craft each
 documented crash window from the crate's public surface (a bare leaked block; an unhooked inode +
 its extents with no name/no catalog; a cross-dir `rename` query-orphan; a leaked block + torn
 journal) and assert exact leak reclamation, orphan heal, dirty-flag clear, free-space round-trip,
@@ -78,7 +78,7 @@ Ring 3 arc). Note: vein currently builds on the macOS host (no elessar GTK block
 
 **What it does:** closes the DoS class the K3 security-tier review confirmed (and the QSIM panel
 re-raised for the future in-kernel query path): every on-disk-derived length/count/offset in
-`libs/fs/unafs` previously flowed into an allocation or loop untrusted, so a physically swapped or
+`unaos/libs/fs/unafs` previously flowed into an allocation or loop untrusted, so a physically swapped or
 corrupted card could panic/OOM-abort the kernel at mount (`bitmap_blocks` → `with_capacity`),
 at `ls`/`read` (`inode.size` → capacity overflow; unchecked extent arithmetic), at query time
 (catalog/spilled-extent sizes), or inside bincode itself (a crafted `String`/`Vec<u8>` length
@@ -94,7 +94,7 @@ the query and `get_attribute` paths; and the codec seam decodes under two byte b
 extent-backed records). Validation only — zero format change; the public API is source-compatible
 (two additive error variants, one additive codec fn).
 
-**How it was tested:** 22 new hostile-volume fixtures (`libs/fs/unafs/tests/hostile_volume.rs`) craft
+**How it was tested:** 22 new hostile-volume fixtures (`unaos/libs/fs/unafs/tests/hostile_volume.rs`) craft
 corrupt superblocks/inodes/extents/prefixes and assert graceful `Err` — never `#[should_panic]` —
 plus positive controls (pristine mount, sparse bulk-fill, decode-under-budget); `cargo test -p
 unafs` 64 green with the golden format KATs byte-identical; `no_std` check clean on the kernel
@@ -153,14 +153,14 @@ K3 `Io` stub is retired.
   (`uls`/`ucat`/`K3-mount`) never fires the crate's `Drop`-time `sync_metadata` write-back — reads stay
   genuinely read-only. `force_remount` drops the cached instance so the next access re-reads the volume
   from disk (the durability-proof primitive).
-- **M2 — journal audit + honest torn-write scope.** The `libs/fs/unafs` WAL is **intent-logging only**
+- **M2 — journal audit + honest torn-write scope.** The `unaos/libs/fs/unafs` WAL is **intent-logging only**
   (BeginOp/EndOp markers → dirty detection on the next mount; NO undo/redo, NO replay or rollback —
   "Log only for now"). Crash safety therefore comes from write ORDERING inside the crate
   (new-extents-first, single-block metadata swap, free-last → a power cut LEAKS blocks, never dangles a
   reference), not from the journal. The crate's "single-block swap is atomic" claim holds at its 4096 B
   block granularity, but the medium writes 512 B sectors: one `write_block` is eight non-atomic
   `write_sector`s, so a swap is truly atomic only when the live record fits the first 512 B sector.
-  **No `libs/fs/unafs` change** — the audit found the journal partial *by design*, not a gap; the frozen
+  **No `unaos/libs/fs/unafs` change** — the audit found the journal partial *by design*, not a gap; the frozen
   format + KATs stay byte-identical. Recovery on a dirty mount does not write (it warns), so a RO
   consumer can still mount-and-warn. Full scope in `SECURITY.md` §K4.
 - **M3 — shell write verbs + witness.** `utouch`/`uwrite`/`umkdir`/`urm` (write-through, durable;
@@ -202,7 +202,7 @@ that still captured K3-mount PASS).
 The first time the native unafs filesystem is read by the kernel — the BeFS chain's
 K1 (`no_std` port) → K2 (block adapter) seam consumed end-to-end. Three commits:
 
-- **Warn seam (`libs/fs/unafs`, carried UNAFS-2 ledger item):** `warnlog::set_warn_hook` — a
+- **Warn seam (`unaos/libs/fs/unafs`, carried UNAFS-2 ledger item):** `warnlog::set_warn_hook` — a
   dependency-free `no_std` fn-pointer hook; the torn-journal dirty-mount warning (previously a
   `std`-gated `println!`, silent in a kernel) now reaches the kernel serial console. Host `std`
   behavior unchanged; 29 unafs host tests green.
@@ -546,7 +546,7 @@ Spec promotions committed here; the granular arc detail is in each arc's own ent
 ## storage lane (`us-unafs2`) — 2026-07-12 (UNAFS-2 — the kernel block adapter)
 
 ### UNAFS-2 — 512 B-sector device → unafs 4096 B `BlockDevice`, + GPT/MBR partition offsets 🔬 `us-unafs2`
-- **What (host-native, `libs/fs/unafs/**` only):** the second link in the BeFS convergence chain
+- **What (host-native, `unaos/libs/fs/unafs/**` only):** the second link in the BeFS convergence chain
   (**BeFS-K2**). K1 gave a `no_std` unafs with a clean 4096 B `BlockDevice` seam; K2 makes a real kernel
   device speak it. New `adapter.rs`: a `no_std` + `alloc` module that presents the kernel's 512 B logical
   sectors (USB/SD, possibly at a partition offset) as unafs's 4096 B blocks. **Zero on-disk-format touch**
@@ -587,9 +587,9 @@ Spec promotions committed here; the granular arc detail is in each arc's own ent
 
 ## storage lane (`us-unafs1`) — 2026-07-12 (UNAFS-1 — the `no_std` port, format frozen)
 
-### UNAFS-1 — `libs/fs/unafs` → `#![no_std]` + `alloc`, byte layout pinned by golden KATs 🔬 `us-unafs1`
-- **What (host-native, `libs/fs/unafs/**` only):** the road to security-K4-proper starts with a unafs the
-  kernel can mount. This is **BeFS-K1**: make `libs/fs/unafs` compile `#![no_std]` + `alloc` *without changing
+### UNAFS-1 — `unaos/libs/fs/unafs` → `#![no_std]` + `alloc`, byte layout pinned by golden KATs 🔬 `us-unafs1`
+- **What (host-native, `unaos/libs/fs/unafs/**` only):** the road to security-K4-proper starts with a unafs the
+  kernel can mount. This is **BeFS-K1**: make `unaos/libs/fs/unafs` compile `#![no_std]` + `alloc` *without changing
   one byte of the on-disk format*. A default-on `std` feature keeps every downstream consumer building
   unchanged; the host-native surface (`FileDevice`, the `io::MappedFile` memmap reader, the bandy event
   bus, the `sqrt`-using semantic query engine) sits behind it, while the on-disk types, the `codec` seam,
@@ -840,14 +840,14 @@ Spec promotions committed here; the granular arc detail is in each arc's own ent
 - **Why:** the security K-line's K4 ("migrate-then-delete onto native unafs attributes") is gated on a
   native unafs FILESYSTEM in the kernel — the ROADMAP §2 BeFS convergence (no_std port → block adapter →
   read-only mount → journaled writes + a minimal VFS), NONE of which is in-tree (`fs/mod.rs` mounts only
-  FAT; `libs/fs/unafs` is a std Ring-3 crate). So K4 proper is a multi-arc storage epic. This arc lands the
+  FAT; `unaos/libs/fs/unafs` is a std Ring-3 crate). So K4 proper is a multi-arc storage epic. This arc lands the
   ONE piece that needs no mount: the deterministic 1:1 CODEC the migration will use, PINNED + KAT'd now, so
   the exact projection is proven ahead of the mount (seat pick, Peter 2026-07-12).
 - **What (`34cdb94`):** in-lane in `arch/aarch64/syscall.rs`, ZERO x86 — `principal_native_string`
   (`PROGRAM_NAME`→ stored `prog:<name>` verbatim; `IMAGE_SHA256`→ `sha256:` + 60 hex of the 30-byte digest
   PREFIX; `NONE`/reserved→ `None`, fail-closed), `grant_native_key` (`grants:<grantee>`),
   `rights_native_value` (`rw`/`r`/`w`/`-`), a no-heap `hex_lower_into`, and `classify_volume_magic`
-  (`UNAATR1\0` sidecar vs `UNAFS` native superblock [mirrored from `libs/fs/unafs/src/superblock.rs`] vs
+  (`UNAATR1\0` sidecar vs `UNAFS` native superblock [mirrored from `unaos/libs/fs/unafs/src/superblock.rs`] vs
   Other) — the "tell the FAT bridge apart from a real unafs volume" primitive the FORMAT bullet names. Two
   stale in-lane comments reconciled (`no on-disk owner format yet`; `image_sha256`'s "71 chars at K4").
 - **The 240-bit-prefix rule (load-bearing):** an `IMAGE_SHA256` principal stores only the 30-byte (240-bit)
