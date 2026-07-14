@@ -817,6 +817,110 @@ def test_tcp_flow_control(s, guest_mac):
     return True
 
 
+def resolve_guest_mac(s, timeout=45):
+    """ARP who-has 10.0.2.15 and return the guest's MAC, or None. RESENDS the request every ~2s over the
+    whole window: net-inject attaches to the QEMU socket the moment QEMU starts, but the guest's e1000
+    only comes up several seconds into boot, so a single early request would go unanswered."""
+    print("-> ARP request who-has 10.0.2.15 (resent until answered)")
+    deadline = time.time() + timeout
+    last_send = 0.0
+    while time.time() < deadline:
+        if time.time() - last_send > 2.0:
+            send_frame(s, eth(BCAST, MY_MAC, 0x0806, arp_request(GUEST_IP)))
+            last_send = time.time()
+        try:
+            f = recv_frame(s)
+        except socket.timeout:
+            continue
+        if not f or len(f) < 42:
+            continue
+        if struct.unpack(">H", f[12:14])[0] != 0x0806:
+            continue
+        if struct.unpack(">H", f[20:22])[0] == 2 and f[28:32] == GUEST_IP:
+            mac = f[22:28]
+            print("<- ARP reply: 10.0.2.15 is-at %s   [ARP RESPONDER OK]" % macstr(mac))
+            return mac
+    return None
+
+
+def test_smoltcp_server(s, guest_mac, port=8080, budget_s=40.0):
+    """SOCK-6: active-open INTO the guest's smoltcp LISTENER (sys_listen/sys_accept), send a probe, and
+    verify the guest ACCEPTS + ECHOES it. The guest polls accept/recv a bounded amount per main-loop
+    pass, so a SYN/ACK/probe may arrive between pumps; we drive the exchange with SHORT timeouts and
+    RETRANSMIT (SYN until SYN-ACK; probe until echo), retrying the whole handshake with a fresh client
+    port (dodging TIME_WAIT) until one completes or the time budget expires. The guest re-arms after a
+    lost/aborted attempt, so retrying is always safe."""
+    print("--- SOCK-6 server: active-open to smoltcp listener %s:%d ---" % (ipstr(GUEST_IP), port))
+    MASK = 0xFFFFFFFF
+    probe = b"sock6-hello"
+    s.settimeout(0.4)
+    deadline = time.time() + budget_s
+    attempt = 0
+    while time.time() < deadline:
+        attempt += 1
+        cport = 50080 + (attempt % 4000)
+        c_isn = (0x5000 + 0x400 * attempt) & MASK
+
+        def cs(seq, ack, flags, payload=b""):
+            send_frame(s, eth(guest_mac, MY_MAC, 0x0800,
+                              ipv4(MY_IP, GUEST_IP, 6, tcp(cport, port, seq, ack, flags, 4096, MY_IP, GUEST_IP, payload))))
+
+        # Retransmit the SYN until a SYN-ACK comes back (a bare RST => no listener yet, keep trying).
+        sa = None
+        for _ in range(8):
+            cs(c_isn, 0, SYN)
+            r = recv_tcp(s, cport, timeout=0.4)
+            if r is not None and (r[0] & (SYN | ACK)) == (SYN | ACK):
+                sa = r
+                break
+        if sa is None:
+            continue  # no SYN-ACK this round — fresh port, retry
+        s_isn = sa[1]
+        cs((c_isn + 1) & MASK, (s_isn + 1) & MASK, ACK)          # complete the handshake
+        # Send the probe, retransmitting until the echo comes back (or this attempt gives up).
+        echo = None
+        for _ in range(20):
+            cs((c_isn + 1) & MASK, (s_isn + 1) & MASK, PSH | ACK, probe)
+            r = recv_tcp(s, cport, timeout=0.4)
+            if r is not None and r[3] == probe:
+                echo = r
+                break
+            if time.time() >= deadline:
+                break
+        if echo is None:
+            continue  # probe/echo lost — the guest re-arms, so retry the whole exchange
+        nb = len(probe)
+        print("<- guest echoed %r on :%d (attempt %d)   [GUEST SOCK-6 SERVER OK]" % (echo[3], port, attempt))
+        cs((c_isn + 1 + nb) & MASK, (s_isn + 1 + nb) & MASK, FIN | ACK)  # close our half
+        return True
+    print("FAIL: guest smoltcp listener :%d never accepted + echoed within %.0fs" % (port, budget_s))
+    return False
+
+
+def main_sock6():
+    """Focused SOCK-6 witness: connect to the QEMU socket netdev, resolve the guest MAC, and drive the
+    inbound smoltcp-server test. Kept separate from the full hand-rolled-stack suite so the server
+    witness runs on its own (and does not have to wait out the elaborate outbound/echo tests)."""
+    s = None
+    for _ in range(120):
+        try:
+            s = socket.create_connection((HOST, PORT), timeout=2)
+            break
+        except OSError:
+            time.sleep(0.5)
+    if s is None:
+        print("FAIL: could not connect to QEMU socket netdev at %s:%d" % (HOST, PORT))
+        return 1
+    print("connected to %s:%d" % (HOST, PORT))
+    s.settimeout(2)
+    time.sleep(3)  # let the guest bring up e1000 + arm its SOCK-6 listener
+    guest_mac = resolve_guest_mac(s)
+    if guest_mac is None:
+        print("FAIL: no ARP reply from guest (could not resolve 10.0.2.15)")
+        return 1
+    return 0 if test_smoltcp_server(s, guest_mac, port=8080) else 1
+
+
 def main():
     s = None
     for _ in range(80):
@@ -971,4 +1075,8 @@ def main():
 
 
 if __name__ == "__main__":
+    # `net-inject.py [host:port] [sock6]` — with the `sock6` mode arg, run ONLY the focused SOCK-6
+    # server witness (active-open into the guest's smoltcp listener); otherwise the full hand-rolled suite.
+    if "sock6" in sys.argv[1:]:
+        sys.exit(main_sock6())
     sys.exit(main())

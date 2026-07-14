@@ -146,6 +146,12 @@ const SYS_SEND: u64 = 24;
 // `SYS_SOCK_RECV` (not `SYS_RECV` — 14 is the capability-transfer inbox recv) — the stream recv.
 #[cfg(all(feature = "smolnet", target_arch = "x86_64"))]
 const SYS_SOCK_RECV: u64 = 25;
+// SOCK-6: TCP SERVER sockets — `SYS_LISTEN` arms a passive listener, `SYS_ACCEPT` polls for an inbound
+// connection and mints a fresh `KIND_SOCKET` handle for it (the ring 3 now ACCEPTS inbound TCP).
+#[cfg(all(feature = "smolnet", target_arch = "x86_64"))]
+const SYS_LISTEN: u64 = 26;
+#[cfg(all(feature = "smolnet", target_arch = "x86_64"))]
+const SYS_ACCEPT: u64 = 27;
 
 /// Base of the ring-3 window: 1 TiB — a FRESH top-level slot (PML4 index 2) above the firmware
 /// identity map, so mapping it touches no kernel state. `setup` proves it unmapped before use.
@@ -2371,6 +2377,11 @@ extern "C" fn syscall_dispatch(nr: u64, a0: u64, a1: u64, a2: u64) -> i64 {
         SYS_SEND => sys_send(a0, a1, a2),
         #[cfg(all(feature = "smolnet", target_arch = "x86_64"))]
         SYS_SOCK_RECV => sys_sock_recv(a0, a1, a2),
+        // SOCK-6: the TCP server socket family (x86-only, knob-on). Same gating as the client arms.
+        #[cfg(all(feature = "smolnet", target_arch = "x86_64"))]
+        SYS_LISTEN => sys_listen(a0, a1),
+        #[cfg(all(feature = "smolnet", target_arch = "x86_64"))]
+        SYS_ACCEPT => sys_accept(a0),
         SYS_EXIT => {
             // U7x: the transfer fixtures exit BY NAME, BEFORE the Proc short-circuit below — the CHILD
             // has a launcher-PLANTED Proc entry (the pid->slot map sys_xfer resolves its dest through),
@@ -2911,6 +2922,71 @@ fn sys_sock_recv(handle: u64, buf_ptr: u64, buf_len: u64) -> i64 {
         }
         crate::smolnet::RecvOutcome::WouldBlock => EAGAIN,
         crate::smolnet::RecvOutcome::Eof => 0,
+    }
+}
+
+/// SYS_LISTEN(handle, port) -> `0`, or a negative errno. Arms a TCP Socket as a passive LISTENER on a
+/// local `port` (the server side of the stack). Requires a Socket handle carrying `CAP_WRITE` (arming a
+/// listener is a configuring authority, like `bind`/`connect`). `-EINVAL` if the port is 0/out of range,
+/// or smoltcp refuses (the socket is already open / connected / not TCP). No I/O — descriptor state only,
+/// IF-masked-handler-safe. NOTE: `sys_accept` is where the ring 3 first ACCEPTS inbound TCP.
+#[cfg(all(feature = "smolnet", target_arch = "x86_64"))]
+fn sys_listen(handle: u64, port: u64) -> i64 {
+    let row = caller_row();
+    let sid = match socket_id_of(row, handle, CAP_WRITE) {
+        Ok(s) => s,
+        Err(e) => return e,
+    };
+    if port == 0 || port > u16::MAX as u64 {
+        return EINVAL;
+    }
+    match crate::smolnet::stack_listen(sid, port as u16) {
+        Ok(()) => 0,
+        Err(()) => EINVAL,
+    }
+}
+
+/// SYS_ACCEPT(handle) -> a FRESH socket HANDLE for the accepted connection, or a negative errno. Requires
+/// a listening Socket handle carrying `CAP_READ` (accepting an inbound connection is a receiving
+/// authority). NON-BLOCKING with a ring-3 poll model like `sys_connect`: pumps a bounded loop chasing an
+/// inbound handshake; `-EAGAIN` = none yet (ring 3 re-invokes accept); `-EINVAL` = the socket is not
+/// armed for listen (never listened / already closed / wrong kind). On success the listening smoltcp
+/// socket has become the ESTABLISHED connection IN PLACE, so this mints a fresh `KIND_SOCKET` handle
+/// aliasing the SAME gen-fenced socket-id (the SOCK-4 multi-handle-to-one-socket pattern). The minted
+/// rights are the INTERSECTION of `CAP_READ|CAP_WRITE|CAP_GRANT` with the LISTENER handle's current
+/// rights — accept is a derivation, not a mint-from-nothing, so an ATTENUATED listener (e.g. a
+/// `CAP_READ`-only SOCK-4 grantee) cannot amplify itself a full-rights connection (the SOCK-4
+/// attenuation boundary: any bit the holder does not have is an amplification). A full-rights owner
+/// gets the POSIX-like full connection handle and may `SYS_XFER` it to a handler (inetd-style).
+/// Single-accept-per-listen: to accept again, open + listen a fresh socket.
+#[cfg(all(feature = "smolnet", target_arch = "x86_64"))]
+fn sys_accept(handle: u64) -> i64 {
+    let row = caller_row();
+    let sid = match socket_id_of(row, handle, CAP_READ) {
+        Ok(s) => s,
+        Err(e) => return e,
+    };
+    match crate::smolnet::stack_accept(sid) {
+        crate::smolnet::AcceptOutcome::Connected => {
+            // Mint a fresh handle for the now-established connection (an alias of the same gen-fenced
+            // socket-id; the gen fence keeps a later close single-owner-correct). No new registry slot /
+            // buffers are consumed — the connection rides the listener socket's in place.
+            let Some(h) = handle_install(row, HANDLE_RESERVING) else {
+                // No handle slot free — the connection stays reachable via the listener handle (which is
+                // now the established connection), so nothing leaks; ring 3 retries for a slot.
+                return EAGAIN;
+            };
+            handle_set_kind(row, h, KIND_SOCKET);
+            // Derive, don't mint: intersect with the listener handle's CURRENT rights so an attenuated
+            // listener (SOCK-4 reduced-rights transfer) cannot amplify into a full-rights connection.
+            let listener_rights =
+                HANDLE_RIGHTS[row][handle as usize].load(Ordering::Acquire);
+            handle_set_rights(row, h, (CAP_READ | CAP_WRITE | CAP_GRANT) & listener_rights);
+            handle_set(row, h, sock_id_pack(sid));
+            h as i64
+        }
+        crate::smolnet::AcceptOutcome::Pending => EAGAIN,
+        crate::smolnet::AcceptOutcome::NotListening => EINVAL,
     }
 }
 

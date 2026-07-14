@@ -383,6 +383,69 @@ SOCK-1/2/3/4 lines intact.
   single MAC, so slirp hands them the same address. Fully retiring the hand-rolled `crates/net` DHCP is
   part of the eventual "retire the hand-rolled stack" arc, not this one.
 
+## SOCK-6 — TCP server / listen sockets (ring 3 accepts inbound)
+
+SOCK-6 (scope A) gives ring 3 the **server side** of TCP: a socket can be armed as a passive listener and
+accept an inbound connection. Same knob (`UNAOS_SMOLNET`), x86-only, byte-identical knob-off / aarch64. It
+adds **two syscalls** over the persistent stack:
+
+| # | Syscall | Gate | Returns |
+| :--- | :--- | :--- | :--- |
+| 26 | `sys_listen(handle, port)` | TCP socket + `CAP_WRITE` | `0`, or `-EINVAL` (port 0 / not TCP / already open) |
+| 27 | `sys_accept(handle)` | listening socket + `CAP_READ` | a **fresh** socket handle for the connection, `-EAGAIN` (none yet), or `-EINVAL` (not listening) |
+
+`sys_listen` arms the socket passively (`tcp::Socket::listen`), a configuring authority like `bind`/`connect`
+(so it needs `CAP_WRITE`). `sys_accept` is NON-BLOCKING with the same ring-3 poll model as `sys_connect`:
+it pumps a bounded loop chasing an inbound handshake; `-EAGAIN` means none arrived yet (ring 3 re-drives
+accept). Accepting an inbound connection is a receiving authority, so it needs `CAP_READ`.
+
+**smoltcp's listen→established model** is that the listening socket *becomes* the connection in place — it
+does not spawn a child — so on accept the connection rides the listener socket's existing stream buffers.
+`sys_accept` mints a **fresh `KIND_SOCKET` handle** aliasing the same gen-fenced socket-id (the SOCK-4
+multi-handle-to-one-socket pattern), carrying `CAP_READ|CAP_WRITE|CAP_GRANT`, so the caller streams on it
+(`send`/`sock_recv`) and can `SYS_XFER` it to a handler (inetd-style accept→hand-off). It is a
+**single-accept-per-listen** model: to accept another connection, open + listen a fresh socket. Next free
+syscall number: **28**.
+
+### The witness (net-inject, `UNAOS_NET=socket`)
+
+Slirp's NAT will not open a connection **into** the guest, so — unlike SOCK-1..5's guest-initiated,
+hermetic-under-slirp round-trips — the server witness needs a peer that active-opens inward.
+`scripts/net-inject.py sock6` (against `-netdev socket,listen=127.0.0.1:5555`, the `UNAOS_NET=socket`
+builder mode SOCK-1 already wired — **no builder change**) crafts raw Ethernet frames to ARP-resolve the
+guest, complete a 3-way handshake to the listener, send a probe, and verify the guest echoes it.
+
+`smolnet::witness_tick6()` is a **stateful** BSP-main-loop witness (arm → accept → serve → done): it arms a
+listener on port `8080`, polls accept across passes, and on a connection receives the peer's probe, echoes
+it, and closes. Under the **default (hermetic) slirp** backend no peer ever connects, so it prints the
+honest PENDING note once and keeps listening cheaply:
+
+```
+:: SOCK-6: smoltcp tcp listen :8080 armed — awaiting inbound connect (UNAOS_NET=socket injector) — witness PENDING ::
+```
+
+Under `UNAOS_NET=socket` with the injector it completes and emits:
+
+```
+:: SOCK-6: smoltcp tcp accept :8080 — received 11 bytes, echoed 11 back — witness OK ::
+```
+
+Reproduce (hermetic, PENDING): `UNAOS_SMOLNET=1 ./arroyo test 90` — MISSION SUCCESS plus the PENDING line
+and the SOCK-1/2/3/5 lines intact. Reproduce (server round-trip, OK): launch the builder with
+`UNAOS_NET=socket UNAOS_SMOLNET=1 UNAOS_SERIAL_LOG=<log> UNAOS_TEST_SECS=60` and, concurrently,
+`python3 scripts/net-inject.py 127.0.0.1:5555 sock6` — the injector prints `GUEST SOCK-6 SERVER OK` and the
+serial log carries the `witness OK` line.
+
+### Residuals (ledgered)
+
+- **Single-accept-per-listen.** The listener socket becomes the connection; there is no persistent-listener
+  acceptor pool. A future arc can decouple the per-slot stream buffers from the registry slot to keep a
+  listener live across accepts (or pre-arm a listener pool on one port).
+- **The witness is a stateful BSP-loop poll, not a ring-3 fixture.** The two syscalls are the delivered
+  ring-3 surface (cap-gated, `SockKind`-tagged) and wrap the exact `stack_listen`/`stack_accept` seam the
+  witness exercises over the wire; a dedicated ring-3 accept fixture is deferred.
+- **`copy_from_user` for socket buffers** remains the deferred hardening all of SOCK-2..6 carry.
+
 ## The road from here
 
 | Arc | Content |
@@ -391,5 +454,6 @@ SOCK-1/2/3/4 lines intact.
 | SOCK-2 | the UDP socket syscall family (`sys_socket`/`bind`/`sendto`/`recvfrom`, #19–22) + persistent `SocketSet`, ring 3 reaches the network |
 | SOCK-3 | TCP client sockets (`sys_connect`/`sys_send`/`sys_sock_recv`, #23–25) + gen-fenced socket handles + chunked-lock TCP pump, ring 3 gets a byte stream |
 | SOCK-4 | transferable sockets — `sys_socket` mints `CAP_GRANT`, `sys_recv` migrates socket ownership, a socket cap moves cross-row (gen-fenced, single-owner); no new syscall |
-| **SOCK-5** (this) | DHCP via smoltcp — the persistent stack leases its own address with `dhcpv4::Socket`; no new syscall, no ring-3 surface, static fallback |
-| SOCK-6+ | TCP server/listen sockets; aarch64 NIC bring-up; retire the hand-rolled shell surface + `crates/net` DHCP |
+| SOCK-5 | DHCP via smoltcp — the persistent stack leases its own address with `dhcpv4::Socket`; no new syscall, no ring-3 surface, static fallback |
+| **SOCK-6** (this) | TCP server/listen sockets (`sys_listen`/`sys_accept`, #26–27) — ring 3 accepts inbound TCP; accept mints a fresh gen-fenced socket cap; net-inject `UNAOS_NET=socket` witness |
+| SOCK-7+ | persistent-listener acceptor pool; aarch64 NIC bring-up; retire the hand-rolled shell surface + `crates/net` DHCP |
