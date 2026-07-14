@@ -2458,6 +2458,95 @@ confirm on the JD11 serial transcript that the right files are paged / listed / 
 that a no-match pattern reports honestly, and that a multi-source copy onto a non-directory is `-ENOTDIR`.
 This bench needs a card with several 8.3-named files sharing an extension (create them on the panel first).
 
+### JD13 — recursive delete: panel `rm -r <dir>`
+
+The classic file-manager verb set closed at JD10 (`mv`) with a create/copy/move quadrant, but `rm` stayed
+file-only — a directory was `-EISDIR` (use `rmdir`), and `rmdir` removes only an EMPTY directory. JD13 closes
+the **destructive** side: `rm -r DOCS` deletes a whole subtree in one command, and it multiplies with the JD12
+glob (`rm -r OLD*/`). Like JD7–JD12 it is **`shell.rs`-only and adds NO `fat.rs` logic** — it composes
+primitives that all already exist: `read_dir` (JD4) walks each directory, the `fs_rm` file-delete pair
+(`locate_in_dir` + `delete_located`, JD6) unlinks each file, and the `rmdir` primitive (`remove_dir`, FATDIRS)
+removes each emptied directory — all **call-never-edit**. The `rm`/`del` dispatch arm gained a `-r`/`-R` flag;
+`fs_rm_recursive` is the new handler, `rm_tree` the recursion. It is the delete twin of JD9's `cp -r`, inverted:
+where `cp_tree` creates top-down, `rm_tree` deletes bottom-up (a directory is emptied before it is removed).
+
+**`-r` is required — the no-`-r` default is unchanged.** Without `-r`, `rm DIR` is still `-EISDIR` (the JD6
+behaviour, byte-identical); a recursive delete is a footgun, so it must be asked for explicitly. Flags (leading
+`-`) are filtered out of the path list exactly as `cp`/`mv` already do, so `-r`/`-R` may appear anywhere among
+the args; a file literally named `-FOO` is reachable as `./-FOO` (the established convention).
+
+**Source, and the two degrade/refuse cases.** `fs_rm_recursive` refuses the **ROOT** first, LOCALLY, before
+any walk (`-EBUSY` — a recursive delete of the whole volume is a footgun, and the root is never a removable
+directory: cluster 0 is not freeable). This mirrors `fs_rmdir`'s root refusal and also folds `rm -r .` at the
+root and `rm -r ..` that pops to it into the same `-EBUSY` (both normalize to `/`). A **FILE** target degrades
+to a plain `rm` (`rm -r FILE` == `rm FILE`, POSIX-friendly and honest). A **DIRECTORY** target is the recursive
+case: `rm_tree` empties it depth-first, then the now-empty top directory itself is removed via `remove_dir`.
+
+**The recursion (`rm_tree`) — bottom-up, snapshot-safe.** At each level `read_dir` SNAPSHOTS the directory's
+entries before any deletion; `.`/`..` are filtered. A child **file** is unlinked by re-locating its slot by
+name (`locate_in_dir` → `delete_located`) — run quiet (no per-file console line, so a whole tree yields ONE
+summary like `cp -r`, not a flood). A child **directory** is recursed into FIRST (emptied), then `remove_dir`'d
+(it now holds only `.`/`..`, so the seam's emptiness check passes). Deleting one entry never invalidates the
+walk: a `0xE5` mark on one slot does not move another entry's slot, and each child is addressed by name — so
+the SNAPSHOT-then-act property JD12's glob established is carried intact into the recursion (`rm -r *` and
+`rm -r OLD*/` never invalidate their own match list). Recursion is depth-capped at `CP_MAX_DEPTH = 32` (the JD9
+constant, reused) — an over-deep or malformed self-referential tree is an honest `-ELOOP`, never a stack
+blow-out (`read_dir`'s own chain-loop guard is the first line of defence; the cap is belt-and-braces).
+
+**Honest partial failure.** A mid-tree error (e.g. `-EIO` part-way through, or a `-ENOTEMPTY` if a concurrent
+mutator raced a directory non-empty — excluded today, see below) stops immediately and reports the running
+tally — dirs/files removed *before* the error — plus the failing path and errno, mirroring `fs_cp_recursive`.
+Nothing is rolled back: the partial deletion is left on disk (crash-safe per the U10 `0xE5`-then-free ordering
+— a name is unreachable before its chain is freed, so a power-cut mid-delete leaves at worst lost clusters,
+never an aliased chain), and the operator can simply re-run `rm -r` to clear the remainder. Every op rides the
+JD3 wall-clock BOT pump, so a stalled transfer is `-EIO`, never a hang on the timerless EL1 core. On success it
+echoes `removed /DOCS/ (N dir(s), M file(s))` — the tally counts the top directory itself (as `cp -r` counts
+its top dir).
+
+**Note — no `is_descendant` guard.** `cp -r`/`mv` use the JD9 `is_descendant` prefix compare to refuse copying/
+moving a directory into its own subtree (which would otherwise recurse forever, since the destination is created
+*inside* the source being walked). `rm -r` has no destination and creates nothing, so that hazard does not
+exist — termination is bounded by the finite snapshot at each level plus `CP_MAX_DEPTH`. Consistent with
+`rmdir`, `rm -r` also does NOT special-case the current working directory: `rm -r` of the cwd (or an ancestor of
+it) succeeds and leaves the JD4 cwd stale, and the very next cwd-relative command re-resolves it to an honest
+`-ENOENT` — the documented JD4 stale-cwd model, not corruption.
+
+**Errno fidelity is shell-side** (the JD6–JD12 pattern, reusing `fat_errno` + shell-owned tags):
+
+| condition | who decides | tag |
+|---|---|---|
+| `rm -r /` (or `rm -r .`/`..` at the root) | shell path pre-check | `-EBUSY` |
+| source missing | `resolve_path` | `-ENOENT` |
+| `rm DIR` without `-r` | `fs_rm` (`is_dir`) | `-EISDIR` |
+| a mid-tree read/free failure | `read_dir`/`delete_located`/`remove_dir` | `-EIO` (partial-reported) |
+| recursion too deep / malformed | shell `CP_MAX_DEPTH` cap | `-ELOOP` (partial-reported) |
+
+**Principal — unchanged.** The shell is still EL1 ASID 0, the PUBLIC principal; `rm -r` deletes public
+entries and consults no U6/K-line `OWNED_FILES` ACL — correct for the trusted local console (§JD5). JD13 adds
+no new lock or namespace surface: it composes the same F3-locked
+`read_dir`/`locate_in_dir`/`delete_located`/`remove_dir` primitives JD6/JD7/JD9 already exercise and ledger,
+so it inherits their locking analysis unchanged (including the FATDIRS
+`remove_dir`-in-the-same-directory TOCTOU, EXCLUDED_BY_SEQUENCING today — no concurrent EL1 FS mutators run).
+
+**Gate (QEMU):** `./arroyo check` + `UNAOS_TEGRA=1 ./arroyo check` green both arches (no new warnings — only
+the pre-existing `shutdown` double-`hlt_loop`); `./arroyo test-arm 22` → `MISSION SUCCESS`; `UNAOS_GICV3=1
+./arroyo test-arm 40` → CAPSTONE 6/6; `UNAOS_HUBSTORAGE=1 ./arroyo test 25` → `MISSION SUCCESS` (the shared
+`shell.rs` guard); `esp-jetson kernel.elf` links, **109 `tegra:` strings** — UNCHANGED from JD11/JD12 (the
+`rm -r` strings carry no `tegra:` token; validate media by count, not size). Zero x86 behavioural change. As in
+JD2–JD12 the SHELL command path is not headless-reachable in-lane (the shell dispatches only on a keystroke,
+and tegra never runs in QEMU), so the shell-level verdict is **attended-pending**; the delete PRIMITIVES
+`rm -r` composes are already exercised headless by the U10/U11 write/delete fixtures and FATDIRS's own
+`fatdirs_check` selftest.
+
+**Metal verdict — ⏳ ATTENDED-PENDING.** The interactive path can only be exercised on silicon. Bench card
+[`jd13-bench.md`](../../../../unaos/scripts/jd13-bench.md): build a small tree (`mkdir` + `write` a few files
+and a nested subdir), `rm -r` it and confirm the whole tree is gone (`ls` shows nothing left, the summary
+counts every dir/file), then the guards — `rm DIR` without `-r` is `-EISDIR`, `rm -r /` is `-EBUSY`,
+`rm -r NOSUCH` is `-ENOENT`, `rm -r FILE` degrades to a plain delete — and a glob form (`rm -r OLD*/`) removing
+several trees at once, with a power-cycle to confirm the deletions are durable (a re-created same-named tree
+after the cycle proves the clusters were genuinely freed and reused). ⚠ Verify the serial bridge captures a
+full boot BEFORE burning bench time (§JB1f) — with JD11 the transcript is the primary output-evidence channel.
+
 ### JB1f — the unhealed early-vector window (the round-6 boot crash), closed (`85f74f8`)
 
 **The evidence (2026-07-11 attended bench, real Orin).** Kernel `446abd3` (the JD6 tip): 2/2 boots

@@ -219,6 +219,41 @@ Spec promotions committed here; the granular arc detail is in each arc's own ent
 
 ---
 
+## hw-jetson track — 2026-07-14 (JD13 — recursive `rm -r` on the panel shell)
+
+### JD13 — recursive `rm -r <dir>` (`shell.rs`-only, call-never-edit) 🔬 `hw-jetson`
+- **Why:** the create/copy/move/delete quadrant had a gap — `rm` was file-only (a directory was `-EISDIR`) and
+  `rmdir` removes only an EMPTY directory, so there was no one-command way to delete a subtree. JD13 closes the
+  destructive side (`rm -r DOCS`) and multiplies with the JD12 glob (`rm -r OLD*/`). It is the delete twin of
+  JD9's `cp -r`, inverted: `cp_tree` creates top-down, `rm_tree` deletes bottom-up (a directory is emptied
+  before it is removed).
+- **How (call-never-edit, no `fat.rs` change):** the `rm`/`del` arm gained a `-r`/`-R` flag; `fs_rm_recursive`
+  is the handler, `rm_tree` the recursion. It composes existing primitives — `read_dir` (JD4) walks each level,
+  the `fs_rm` pair (`locate_in_dir` + `delete_located`, JD6) unlinks each file quietly (one summary, not a
+  flood), and the `rmdir` primitive (`remove_dir`, FATDIRS) removes each emptied directory. Reuses the JD9
+  `CP_MAX_DEPTH = 32` cap (honest `-ELOOP`) and a `RmStats` partial-count tally.
+- **Footgun rails:** `-r` is REQUIRED for a directory (without it a dir stays `-EISDIR`, byte-identical to
+  pre-JD13); the ROOT is refused `-EBUSY` before any walk (mirrors `rmdir`, folds `rm -r .`/`..` at the root
+  into the same tag); a FILE target degrades to a plain `rm` (`rm -r FILE` == `rm FILE`); a mid-tree failure
+  stops and reports an honest partial count (dirs/files removed so far) + the failing path/errno, nothing rolled
+  back (crash-safe per the U10 `0xE5`-then-free ordering — re-run `rm -r` to clear the remainder).
+  **Snapshot-then-delete:** `read_dir` snapshots each level and children re-locate by name, so a delete never
+  invalidates the walk — the JD12 glob-safety property carried into the recursion. No `is_descendant` guard is
+  needed (no destination ⇒ no self-into-subtree hazard; `CP_MAX_DEPTH` bounds termination).
+- **Tested (QEMU):** `check` + `UNAOS_TEGRA=1 check` green both arches (no new warnings — only the pre-existing
+  `shutdown` double-`hlt_loop`); `test-arm 22` MISSION; `UNAOS_GICV3=1 test-arm 40` CAPSTONE 6/6;
+  `UNAOS_HUBSTORAGE=1 test 25` MISSION (shared `shell.rs` guard); `esp-jetson` links, **109 `tegra:` strings** —
+  UNCHANGED from JD11/JD12 (the `rm -r` strings carry no `tegra:` token; validate by count, not size). Zero x86
+  behavioural change. No `kernel8-test` on the jetson side. Lane: only `shell.rs` (fat.rs/console.rs/main.rs/NET
+  arms untouched).
+- **Metal:** ⏳ **ATTENDED-PENDING** — the interactive path only runs on silicon. Bench card
+  [`jd13-bench.md`](../unaos/scripts/jd13-bench.md): build a small nested tree, `rm -r` it and confirm it is
+  gone (summary counts every dir/file), then the guards (`rm DIR` no-`-r` → `-EISDIR`, `rm -r /` → `-EBUSY`,
+  `rm -r NOSUCH` → `-ENOENT`, `rm -r FILE` → plain delete) and a glob form (`rm -r OLD*/`), with a power-cycle +
+  a re-created same-named tree to prove the freed clusters were genuinely reused.
+- **Detail:** [`arch_arm64.md` §JD13](dev/OS/01_BOOT_HAL/arch_arm64.md). **Commit:** on `hw-jetson` (the seat
+  assigns the integration hash at merge).
+
 ## hw-jetson track — 2026-07-13 (JD12 — paging & wildcard globbing on the panel shell)
 
 ### JD12 — `head`/`tail` paging + `*`/`?` wildcard globbing (`shell.rs`-only, call-never-edit) ✅ `hw-jetson` (METAL-CONFIRMED 2026-07-13 attended Orin bench, one session with the JD11 confirm; glob copy/move survived a real power cycle)

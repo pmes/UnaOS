@@ -709,6 +709,133 @@ fn fs_cp_recursive(console: &mut Console, src: &str, dst: &str) {
     }
 }
 
+/// JD13: a running tally of a `rm -r` for the summary / partial-failure report (the delete twin of
+/// `CpStats`, no byte count — a delete moves no data).
+struct RmStats {
+    dirs: u32,
+    files: u32,
+}
+
+/// JD13: recursively delete the CONTENTS of the directory (cluster `dir_cluster`, canonical path
+/// `dir_canon`) — child FILES then child DIRECTORIES, depth-first, so a directory is emptied before it
+/// is removed. `.`/`..` are filtered at every level (the JD9 `cp_tree` walk shape, inverted for delete).
+/// A child file is unlinked via `locate_in_dir` + `delete_located` (the `fs_rm` primitives, run QUIET —
+/// no per-file console line, so a whole tree yields ONE summary like `cp -r`); a child directory is
+/// recursed into and then `remove_dir`'d (it now holds only `.`/`..`). `stats` accumulates across the
+/// whole tree so the caller reports an honest partial count if a mid-tree op fails. Returns a
+/// fully-formatted error string (path + errno) on the FIRST failure — the delete stops there, nothing
+/// is rolled back (crash-safe per the U10 `0xE5`-then-free ordering; the operator can re-run `rm -r`).
+///
+/// SNAPSHOT-then-delete (the JD12 glob-safety property, carried into the recursion): `read_dir` captures
+/// the entry list before any mutation, and each child is re-located BY NAME (`0xE5`-marking one sibling
+/// never moves another entry's slot), so deleting as we go never invalidates the walk. Every op rides
+/// the JD3 wall-clock BOT pump (bounded — a stalled transfer is `-EIO`, never a hang on the timerless
+/// EL1 core). Depth is capped at `CP_MAX_DEPTH` (honest `-ELOOP`) — the JD9 belt-and-braces backstop
+/// against a malformed self-referential volume (`read_dir`'s own chain-loop guard is the first line).
+fn rm_tree(
+    fs: &FatFs,
+    dir_cluster: u32,
+    dir_canon: &str,
+    depth: u32,
+    stats: &mut RmStats,
+) -> Result<(), String> {
+    if depth > CP_MAX_DEPTH {
+        return Err(alloc::format!(
+            "{}: maximum directory depth {} exceeded (-ELOOP)", dir_canon, CP_MAX_DEPTH));
+    }
+    // SNAPSHOT the directory contents before any deletion (so a delete never invalidates the walk).
+    let entries = fs
+        .read_dir(dir_cluster)
+        .map_err(|e| alloc::format!("{}: read failed ({:?}, -EIO)", dir_canon, e))?;
+    for de in &entries {
+        let nm = de.name();
+        if nm == "." || nm == ".." {
+            continue; // skip the self/parent links a subdirectory cluster carries
+        }
+        let child = joined(dir_canon, nm);
+        if de.is_dir {
+            // Empty the child directory first, THEN remove it (it now holds only `.`/`..`).
+            rm_tree(fs, de.first_cluster(), &child, depth + 1, stats)?;
+            fs.remove_dir(dir_cluster, nm)
+                .map_err(|e| alloc::format!("{}: {} ({:?})", child, fat_errno(e), e))?;
+            stats.dirs += 1;
+        } else {
+            // Unlink the child file BY NAME (re-locate its slot, then delete) — the `fs_rm` primitives.
+            let (fde, dl, doff) = fs
+                .locate_in_dir(dir_cluster, nm)
+                .map_err(|e| alloc::format!("{}: {} ({:?})", child, fat_errno(e), e))?;
+            fs.delete_located(dl, doff, fde.first_cluster())
+                .map_err(|e| alloc::format!("{}: {} ({:?})", child, fat_errno(e), e))?;
+            stats.files += 1;
+        }
+    }
+    Ok(())
+}
+
+/// JD13 `rm -r <path>` (also `rm -R`): recursively delete a directory tree — files then directories,
+/// depth-first, so every directory is emptied before it is removed. `shell.rs`-only, NO fat.rs mutation:
+/// it composes `read_dir` (the walk), the `fs_rm` file-delete primitives (`locate_in_dir` +
+/// `delete_located`), and the `rmdir` primitive (`remove_dir`) — all call-never-edit. Guards, in order:
+///   * the ROOT is refused (`-EBUSY`) — a recursive delete of the whole volume is a footgun, and the
+///     volume root is never a removable directory (cluster 0 is not freeable). Checked LOCALLY before any
+///     walk, mirroring `fs_rmdir`'s root refusal; also catches `rm -r .` at the root and `rm -r ..` that
+///     pops to it;
+///   * a FILE target degrades to a plain file delete (`fs_rm`) — POSIX-friendly (`rm -r FILE` == `rm FILE`);
+///   * a DIRECTORY target is emptied by `rm_tree`, then the now-empty top directory itself is removed
+///     (counted in the summary).
+/// A mid-tree failure stops and reports the honest partial count (dirs/files removed so far) plus the
+/// failing path + errno; nothing is rolled back (crash-safe per the U10 `0xE5`-then-free ordering — the
+/// operator can re-run `rm -r` to clear the remainder). Recursion is depth-capped (`CP_MAX_DEPTH`,
+/// honest `-ELOOP`).
+///
+/// PRINCIPAL — unchanged. The shell is EL1 ASID 0, the PUBLIC principal; `rm -r` consults no U6/K-line
+/// `OWNED_FILES` ACL and composes the same F3-locked `read_dir`/`locate_in_dir`/`delete_located`/
+/// `remove_dir` primitives JD6/JD7/JD9 already exercise and ledger, so it inherits their locking
+/// analysis unchanged (no new fat.rs surface, no new lock, no new namespace interaction).
+fn fs_rm_recursive(console: &mut Console, arg: &str) {
+    let fs = match crate::fs::fat::mount() {
+        Ok(fs) => fs,
+        Err(e) => return console.println(&alloc::format!("rm: no FAT filesystem ({:?})", e)),
+    };
+    // Refuse the root explicitly, with the honest errno, BEFORE any walk. `normalize_path` folds
+    // `rm -r .` at the root and `rm -r ..` that pops to it into "/".
+    let norm = normalize_path(&cwd_path(), arg);
+    if norm == "/" {
+        return console.println("rm: -r /: cannot remove the root directory (-EBUSY)");
+    }
+    // Resolve the target. A FILE degrades to a plain `rm`; a DIRECTORY is the recursive case.
+    let (de_src, src_canon) = match resolve_path(&fs, &norm) {
+        Ok(Resolved::Root) =>
+            return console.println("rm: -r /: cannot remove the root directory (-EBUSY)"),
+        Ok(Resolved::Entry(de, canon)) => (de, canon),
+        Err(msg) => return console.println(&alloc::format!("rm: {}", msg)),
+    };
+    if !de_src.is_dir {
+        return fs_rm(console, arg); // `rm -r FILE` == `rm FILE`
+    }
+    // A directory: walk to its parent so the now-empty top directory can be removed after `rm_tree`.
+    let (parent, leaf, parent_canon) = match resolve_write_target(&fs, &norm) {
+        Ok(t) => t,
+        Err(msg) => return console.println(&alloc::format!("rm: {}", msg)),
+    };
+    let mut stats = RmStats { dirs: 0, files: 0 };
+    match rm_tree(&fs, de_src.first_cluster(), &src_canon, 1, &mut stats) {
+        Ok(()) => match fs.remove_dir(parent, &leaf) {
+            Ok(_) => {
+                stats.dirs += 1; // the top directory itself
+                console.println(&alloc::format!(
+                    "removed {}/ ({} dir(s), {} file(s))", src_canon, stats.dirs, stats.files));
+            }
+            Err(e) => console.println(&alloc::format!(
+                "rm: {}: {} ({:?}) [partial: {} dir(s), {} file(s) removed before the error]",
+                joined(&parent_canon, &leaf), fat_errno(e), e, stats.dirs, stats.files)),
+        },
+        Err(msg) => console.println(&alloc::format!(
+            "rm: {} [partial: {} dir(s), {} file(s) removed before the error]",
+            msg, stats.dirs, stats.files)),
+    }
+}
+
 /// JD10 `mv <src> <dst>` (aliases `move`/`ren`/`rename`): move OR rename a file or directory by
 /// RELINKING its directory entry — the file's data never moves (O(1), by reference), composing the
 /// FATMOVE `rename_entry`/`move_entry` seam with the JD6 path-resolution idioms (call-never-edit; no
@@ -1199,23 +1326,28 @@ fn expand_sources(console: &mut Console, fs: &FatFs, verb: &str, sources: &[&str
     out
 }
 
-/// JD12 `rm` with wildcards: `rm <path...>` — each arg a file target or a trailing glob.
+/// JD12 `rm` with wildcards: `rm [-r] <path...>` — each arg a file/dir target or a trailing glob.
 /// SNAPSHOT-then-delete (`glob_expand` captures the match list before any delete), so a wildcard
 /// delete never invalidates its own list. A wildcard with no match is an honest per-pattern note;
-/// each concrete target rides the existing per-file `fs_rm` (directory → `-EISDIR`, use `rmdir`).
-fn rm_globbed(console: &mut Console, args: &[&str]) {
+/// each concrete target rides the existing per-target handler — `fs_rm` (file-only; a directory is
+/// `-EISDIR`, use `rmdir`) or, when `recursive` (JD13 `rm -r *`), `fs_rm_recursive` (a directory tree,
+/// a file degrades to a plain delete). SNAPSHOT-safety holds through the recursion too: each concrete
+/// match is re-resolved by its canonical path, and a completed `rm -r` never touches a sibling's slot.
+fn rm_globbed(console: &mut Console, args: &[&str], recursive: bool) {
     let fs = match crate::fs::fat::mount() {
         Ok(fs) => fs,
         Err(e) => return console.println(&alloc::format!("rm: no FAT filesystem ({:?})", e)),
     };
     for a in args {
         match glob_expand(&fs, a) {
-            Glob::Literal(p) => fs_rm(console, &p),
+            Glob::Literal(p) =>
+                if recursive { fs_rm_recursive(console, &p) } else { fs_rm(console, &p) },
             Glob::Matched { entries, .. } if entries.is_empty() =>
                 console.println(&alloc::format!("rm: {}: no match", a)),
             Glob::Matched { parent_canon, entries } => {
                 for de in &entries {
-                    fs_rm(console, &joined(&parent_canon, de.name()));
+                    let path = joined(&parent_canon, de.name());
+                    if recursive { fs_rm_recursive(console, &path) } else { fs_rm(console, &path) }
                 }
             }
         }
@@ -1310,8 +1442,9 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
             console.println("STORAGE:  diskinfo, usbinfo, read <lba>, write <lba> <byte>");
             console.println("FILES:    fatinfo (FAT geometry), ls [dir], cd [dir], pwd, cat <path>");
             console.println("PAGING:   head <path> [n], tail <path> [n]  (first / last n lines, default 10)");
-            console.println("WRITE:    touch <path>, write <path> <text>, append <path> <text>, rm <path>");
+            console.println("WRITE:    touch <path>, write <path> <text>, append <path> <text>, rm [-r] <path>");
             console.println("DIRS:     mkdir <path>, rmdir <path>  (create / remove empty directories)");
+            console.println("          rm -r <dir>  (recursively delete a directory tree; root refused)");
             console.println("COPY:     cp <src> <dst>  (copy a file; cp FILE DIR/ lands as DIR/<leaf>)");
             console.println("          cp -r <srcdir> <dst>  (recursively copy a directory tree)");
             console.println("MOVE:     mv <src...> <dst>  (move/rename a file or dir, O(1); mv SRC DIR/ lands as DIR/<leaf>)");
@@ -1512,17 +1645,24 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
             }
         },
         "rm" | "del" => {
-            // JD6: delete a file in any reachable dir (directory → -EISDIR; use `rmdir`). JD12: takes
-            // multiple targets and expands trailing wildcards — `rm <path...>`, `rm *.TMP`.
-            if args.is_empty() {
-                console.println("usage: rm <path> [path ...]");
-            } else if !args.iter().any(|a| has_glob(a)) {
-                // No wildcard: delete each literal target (a single arg is byte-identical to pre-JD12).
-                for &a in &args {
-                    fs_rm(console, a);
+            // JD6: delete a file in any reachable dir (a directory is -EISDIR; use `rmdir`). JD12: takes
+            // multiple targets and expands trailing wildcards — `rm <path...>`, `rm *.TMP`. JD13: `-r`/`-R`
+            // recursively deletes a directory tree (files then directories, depth-first; the root is
+            // refused; an honest partial count on a mid-tree failure). Flags (leading `-`) are filtered
+            // from the paths exactly as `cp`/`mv` do — a name literally beginning with `-` is reachable as
+            // `./-name`. Without `-r`, a directory target stays -EISDIR (byte-identical to pre-JD13).
+            let recursive = args.iter().any(|a| *a == "-r" || *a == "-R");
+            let paths: Vec<&str> = args.iter().copied().filter(|a| !a.starts_with('-')).collect();
+            if paths.is_empty() {
+                console.println("usage: rm [-r] <path> [path ...]");
+            } else if !paths.iter().any(|a| has_glob(a)) {
+                // No wildcard: delete each literal target (a single non-recursive arg is byte-identical
+                // to pre-JD13).
+                for &a in &paths {
+                    if recursive { fs_rm_recursive(console, a); } else { fs_rm(console, a); }
                 }
             } else {
-                rm_globbed(console, &args);
+                rm_globbed(console, &paths, recursive);
             }
         },
         "mkdir" | "md" => {
