@@ -25,7 +25,6 @@ quartzite = { path = "../../libs/quartzite", default-features = false }
 bandy = { path = "../../libs/bandy" }
 gneiss_pal = { path = "../../libs/gneiss_pal" }
 unafs = { path = "../../libs/fs/unafs" }
-junct = { path = "../../handlers/junct" }
 
 # Host UI & System (Platform Agnostic Imports)
 async-channel = "2.5"
