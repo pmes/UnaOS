@@ -103,6 +103,90 @@ Two release mechanisms, selected by platform:
   its entry into that core's release slot and `SEV`. Unchanged by JC2 — the whole
   PSCI path is `#[cfg(not(feature = "pi"))]`, so every Pi image compiles it out.
 
+#### Open investigation: core-3 bring-up vs image size (CORE3-SMP)
+
+**Status: root cause NOT established from static analysis — no code fix shipped.**
+This section records a reproducible, image-size-correlated Pi 4 metal regression and
+the analysis that rules out the kernel-side hypotheses, so the next attended bench can
+resolve it with targeted instrumentation rather than re-deriving the ground.
+
+**Symptom (attended A-B-A bench, real Pi 4 / BCM2711, 2026-07-14).** With the same
+silicon, card, and power supply minutes apart (thermal/environment excluded), the
+spin-table release of **core 3** fails **deterministically as a function of `kernel8.img`
+size**:
+
+| `kernel8.img` size | hex | cores online |
+|---|---|---|
+| 524,232 B | `0x7ffc8` | 1, 2, 3 — **4/4** |
+| 588,936 / 589,960 B | `0x8fc48` / `0x8fc88` | 1, 2 up; **core 3 timeout** |
+| 704,080 B | `0xabdd0` | 1, 2 up; **core 3 timeout** |
+
+Cores 1 and 2 always come up; everything else is healthy on 3 cores. QEMU `raspi4b`
+models the same spin-table and brings up **4/4 at every size** — it never reproduces,
+so the proof burden here is static analysis, not a repro.
+
+**The tell.** Every failing boot (5 logged, across the `0x8fc88` and `0xabdd0` sizes) is
+byte-consistent: cores 1 and 2 log their own ids, then a **phantom `:: AARCH64 SMP:
+core 0 online ::`** appears where core 3's line should be, and `CORE_READY[3]` never
+sets → the wait loop times out. Since only cores {1,2,3} are released and 1/2 report
+correctly, the phantom "core 0" **is** physical core 3: it runs `__secondary_rust(0)`
+end-to-end (per-CPU init, GIC, timer, `CORE_READY[0].store`) with `core_raw == 0`.
+
+**The arithmetic — the boundary is exactly 1 MiB.** The GPU firmware loads `kernel8.img`
+to `0x80000`; `.bss` is `NOLOAD`, so the image file is exactly the loaded sections and
+`img_size == __bss_start - 0x80000`. Image end (`= __bss_start`):
+
+* passing `0x7ffc8`  → `0x80000 + 0x7ffc8 = 0xFFFC8`  (56 B **below** 1 MiB)
+* failing `0x8fc48`  → `0x80000 + 0x8fc48 = 0x10FC48` (**above** 1 MiB)
+
+So the loaded image (`.text`/`.rodata`/`.data`) crossing **`0x100000` (1 MiB)** is the
+threshold. Note the BCM2711 **L2 cache is exactly 1 MiB** — i.e. the image stops fitting
+in L2 at the same point.
+
+**What is ruled out (kernel side):**
+
+1. *No firmware-memory overlap.* The base DTB `/memreserve/` reserves only page 0
+   (`0x0..0x1000`); the firmware relocates the **final** DTB high (observed
+   `0x2eff2700`) and CMA sits at `0x30000000`. All firmware placements are logged
+   **identically in passing and failing boots** — nothing firmware-placed sits at or
+   near 1 MiB, and the layout does not move with image size.
+2. *Release addresses are correct.* The DTB `cpu-release-addr` values
+   (`0xd8/0xe0/0xe8/0xf0` for cores 0-3) match `smp.rs::RELEASE_ADDR`, and all sit in
+   page 0 — never overlapped by an image at `0x80000+`.
+3. *Mailbox cache-clean is correct and size-invariant.* `clean_range(0xe0, 0x18)`
+   covers `0xe0..0xf8`, all within the single 64 B line at `0xc0`, so the one `DC CVAC`
+   flushes core 3's slot (`0xf0`) to PoC. The addresses are fixed constants — identical
+   at every image size.
+4. *Mailbox mapping is identical across sizes.* `0xf0` lies in the L3-paged first 2 MiB
+   block (`USER_REGION` keeps `l2_idx == 0` in both builds); page 0 is `ram_page`
+   (Normal cacheable, EL1) in both — same attributes regardless of size.
+5. *`core_raw` is preserved.* `_secondary_start` reads `MPIDR_EL1` at **EL2** (physical
+   affinity) into `x0` and tail-calls `__secondary_rust(x0)`; `drop_to_el1` clobbers
+   only `x0` and the compiler spills the argument to a callee-saved register across the
+   call. If core 3 entered with `x0 == 3` it would print `3`.
+
+**The paradox that forces the STOP.** The BSP writes one identical entry value to all
+three release slots in a uniform loop and flushes them with one size-invariant sequence;
+cores 1 and 2 read their affinity correctly at EL2 (where `MPIDR_EL1` cannot read 0 for
+core 3). Yet core 3 alone runs as id 0, deterministically, and only once the image
+exceeds 1 MiB. Nothing in the kernel path differs per-core for core 3 or per-size for the
+mailbox. The divergence therefore lies **below the kernel** — in the BCM2711 GPU-firmware
+/ armstub delivery of the last core, or a micro-architectural effect keyed to the 1 MiB =
+L2-size boundary (e.g. the branch-target/mailbox line's visibility to a core that fetches
+MMU-off / cache-off once the image no longer fits L2). This is not resolvable by static
+inspection of `smp.rs`/`boot.rs`, so per the arc's STOP tripwire **no speculative linker
+reservation or stack relocation was shipped** — there is no identified structure at the
+boundary for a reservation to protect.
+
+**Next step (attended Pi bench).** Instrument `_secondary_start` to raw-write to the
+PL011 (`0xFE201000`, Device, MMU-off, among the first instructions, no stack) — for each
+core: raw `MPIDR_EL1`, `CurrentEL`, and the entry value it was branched from — **before**
+any Rust, on a >1 MiB build. That disambiguates the three surviving mechanisms (core 3
+enters past the `mrs` with `x0==0` / `MPIDR` genuinely reads 0 / branch target is wrong)
+and settles whether the cause is firmware delivery or an L2-boundary cache effect. Until
+then, treat core-3 bring-up on >1 MiB images as a known, isolated defect: cores 1-2 plus
+the BSP are unaffected and the 3-core system is otherwise healthy.
+
 **Scheduler on the `virt` path — the boot core, since JC3.** The aarch64 scheduler
 was `#[cfg(feature = "baremetal")]`-gated and coupled to EL1 (`ELR_EL1`/`SPSR_EL1`
 eret paths), while the `virt` kernel runs at EL2. **Arc JC3** un-gates it: after the
