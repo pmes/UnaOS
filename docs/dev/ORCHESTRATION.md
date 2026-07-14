@@ -203,6 +203,17 @@ round's metal-dependent items into ONE attended bench per platform and runs them
 together — the jetson track already sizes work this way ("attended-boot batches").
 Prep everything offline; batch the questions per boot.
 
+**Bench-session etiquette** (Peter, 2026-07-14):
+- **Every platform metal runbook carries a paste-ready OPENER at its top** — the
+  kickoff prompt Peter hands a fresh bench session. Whoever adds a pending item
+  to a runbook refreshes its opener to match; a bench must never start with the
+  session (or Peter) surprised about role, media state, or what's pending.
+- **After a bench session's final landing report, the Maestro replies ONLY if
+  something needs fixing or deciding.** A clean report needs no acknowledgment —
+  the session is expected to be over; the fold happens on the Maestro's side and
+  the docs are the receipt. (Mid-bench questions — a paused board waiting on a
+  call — are the opposite: answer those immediately, they block silicon time.)
+
 **Code-prerequisite sequencing**: metal that is blocked on a code prerequisite is
 sequenced explicitly, not counted against the gate for the current round. Example:
 K1 survive-reboot enforcement can only be metal-proven once K2 lands a second
