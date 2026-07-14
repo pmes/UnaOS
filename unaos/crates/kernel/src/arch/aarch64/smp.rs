@@ -52,10 +52,83 @@ static mut SECONDARY_STACKS: [SecStack; NUM_CORES] =
 // symbol references (adrp/add, and `sym`) resolve to the correct address because the kernel is
 // identity-mapped (VA == PA). Kept out of `.text.boot` on purpose — it's reached by address, not by
 // being first in the image.
+#[cfg(not(feature = "core3probe"))]
 core::arch::global_asm!(
     r#"
     .globl _secondary_start
     _secondary_start:
+        mrs   x0, mpidr_el1
+        and   x0, x0, #0xff          // x0 = core id (Aff0)
+        adrp  x1, {stacks}
+        add   x1, x1, #:lo12:{stacks}
+        mov   x2, #({size} >> 12)
+        lsl   x2, x2, #12            // x2 = SEC_STACK_SIZE
+        madd  x3, x0, x2, x1         // x3 = &SECONDARY_STACKS + core*size
+        add   x3, x3, x2            // + size  => top of this core's stack
+        mov   sp, x3
+        bl    {entry}               // __secondary_rust(core)  — never returns
+    1:  wfe
+        b     1b
+    "#,
+    stacks = sym SECONDARY_STACKS,
+    entry = sym __secondary_rust,
+    size = const SEC_STACK_SIZE,
+);
+
+// CORE3-PROBE (UNAOS_CORE3PROBE=1). Identical to the stub above, but with a raw-PL011 dump prologue
+// that runs FIRST — MMU off, no stack, physical addressing, before the `mrs`/stack setup and any
+// Rust. For each core it emits one record `[<mpidr_lo>E<el>X<x0_lo>]` to the Pi 4 PL011 data
+// register (0xFE201000), polling the FR TXFF bit (base+0x18, bit 5) with a bounded spin so no core
+// can wedge another; interleaving between cores is acceptable — the hex fields disambiguate. This
+// answers the CORE3-SMP paradox: a core-3 record reading `[3E2X0]` means it arrived correctly (bug
+// is in Rust/x0 spill); `[0E2X0]` means MPIDR_EL1 genuinely reads 0 at EL2 (firmware delivery); a
+// missing/garbled record means a wrong branch target. The `.Lc3p_*` helpers are leaf (single-level
+// `bl`, `ret` via x30, no stack) and use only x9-x17 scratch, all overwritten by the real stub.
+#[cfg(feature = "core3probe")]
+core::arch::global_asm!(
+    r#"
+    .globl _secondary_start
+    _secondary_start:
+        // --- core3probe raw dump (MMU off, no stack) ---
+        mov   x9,  #0x1000
+        movk  x9,  #0xFE20, lsl #16   // x9 = PL011 base 0xFE201000
+        mrs   x10, mpidr_el1          // x10 = MPIDR (low byte = Aff0)
+        mrs   x13, currentel          // x13 bits[3:2] = EL
+        mov   x14, x0                 // x14 = arrival x0 (spin-table sets x0..x3 = 0)
+        mov   w11, #0x5B              // '['
+        bl    .Lc3p_putc
+        lsr   x11, x10, #4
+        bl    .Lc3p_hex               // MPIDR low byte, high nibble
+        mov   x11, x10
+        bl    .Lc3p_hex               // MPIDR low byte, low nibble
+        mov   w11, #0x45              // 'E'
+        bl    .Lc3p_putc
+        lsr   x11, x13, #2
+        bl    .Lc3p_hex               // CurrentEL (0..3)
+        mov   w11, #0x58              // 'X'
+        bl    .Lc3p_putc
+        mov   x11, x14
+        bl    .Lc3p_hex               // arrival x0, low nibble
+        mov   w11, #0x5D              // ']'
+        bl    .Lc3p_putc
+        b     .Lc3p_done
+    .Lc3p_hex:
+        and   x11, x11, #0xf
+        cmp   x11, #9
+        add   x12, x11, #0x30         // '0'..'9'
+        add   x15, x11, #0x37         // 'A'..'F'
+        csel  x11, x15, x12, gt
+        // fall through to putc (x30 still = the .Lc3p_hex caller's link)
+    .Lc3p_putc:
+        mov   x16, #0x100000          // bounded TXFF spin
+    2:  ldr   w17, [x9, #0x18]        // PL011 FR
+        tbz   w17, #5, 3f             // TXFF (bit 5) clear => room
+        subs  x16, x16, #1
+        b.ne  2b
+    3:  strb  w11, [x9]               // PL011 DR
+        ret
+    .Lc3p_done:
+        // --- original stub (unchanged) ---
         mrs   x0, mpidr_el1
         and   x0, x0, #0xff          // x0 = core id (Aff0)
         adrp  x1, {stacks}
