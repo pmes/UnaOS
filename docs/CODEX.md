@@ -12,9 +12,12 @@
     *   **Project Mode:** **Elessar** binds multiple Handlers (Code + Terminal + Git) into a workspace.
     *   **Solo Mode:** Opening a single file creates a "Micro-Project." A video file opens **Stria**, but with full metadata capabilities (A-B loops, Bookmarks) because even consumption is an active process.
 
-## 2. The Handler Manifest (The 20)
+## 2. The Handler Manifest (The 21)
 
-**Status:** **LOCKED**.
+**Status:** **LOCKED**, with one amendment by the Architect's hand:
+> *Amendment I (2026-07-14): **Helm** joins the Manifest. The machines grow hands; the
+> Codex grows a wheel. Twenty were The 20; the Manifest is now The 21. The lock stands —
+> it guards against drift, never against the Architect.*
 
 | Handler | Domain | The "App" It Replaces | Technical Role |
 | :--- | :--- | :--- | :--- |
@@ -24,6 +27,7 @@
 | **Comscan** | **Signals** | Terminal, Pronterface | **IO Bridge.** Serial, GPIO, Bluetooth, SDR. Controls hardware. |
 | **Facet** | **Images** | Photoshop, Preview | **The Canvas.** Raster/Vector engine. GPU-accelerated texture editing. |
 | **Geode** | **Archives** | Docker, WinZip | **The Vault.** Container engine. Manages immutable snapshots (`.geode`). |
+| **Helm** | **Control** | (nothing replaces it — nothing did this) | **The Wheel.** Control authority over every physical action an AI initiates. The wheel and the captain's voice at one station: direct human control and commanded intent, one authority deciding which is in effect. Reads Principia's safety levels; decides pass / ask / refuse. Its kernel core (`unaos/libs/sys/helm/`) is the interlock that does not negotiate — DISARM / MANUAL / AUTO, FAILSAFE latch, the human override outranking everything, per-machine domains (rover first) because failsafes do not generalize. |
 | **Holocron** | **Secrets** | 1Password, GPG | **The Key.** Keyring, SSH Agent, Wallet, Biometric Auth. |
 | **Matrix** | **Files** | Finder, Trello | **Spatial Asset Manager.** Visualizes Files and Tasks in a 3D/2D grid. |
 | **Mica** | **Data** | Excel, SQL | **The Ledger.** Structured Data Engine. SQL, CSV, Parquet editor. |
@@ -66,8 +70,9 @@ When **Vug** needs to slice a 3D model, it uses the geometry engine in Gneiss. W
 ## 5. The Hardware Protocol (CNC/3D)
 We kill the middleman.
 1.  **Design:** **Vug** renders the model and calculates the toolpath (Slicing/CAM) via Gneiss.
-2.  **Control:** **Comscan** takes the stream and pumps it directly to the hardware via USB/Serial.
-3.  **Result:** No file exporting. No "Slicer App." Just **Design -> Make**.
+2.  **Authority:** **Helm** holds the wheel — the stream passes its gate (Principia's levels: pass / ask / refuse) before any machine moves.
+3.  **Control:** **Comscan** takes the approved stream and pumps it directly to the hardware via USB/Serial. Telemetry returns through its **Squawk** capability.
+4.  **Result:** No file exporting. No "Slicer App." Just **Design -> Make** — with a hand on the wheel.
 
 ## 6. The Wolfpack Protocol (Kernel Zones)
 
