@@ -58,10 +58,14 @@ write SOLO.TXT two
 mv -f SOLO.TXT DIR/A.TXT     # DIR/A.TXT exists as a FILE -> overwrites it (force, file dest) -> "moved ..."
 mkdir SUB
 mv -f SUB DIR/A.TXT         # target DIR/A.TXT is a FILE, source is a dir -> honest error, not clobbered
-# (cp -r onto an existing tree also stays -EEXIST even with -f — merge/replace is out of scope)
+# (cp -r's fresh-tree -EEXIST fires on the COMPUTED target, not on the destination dir itself:
+#  `cp -r SRC EXISTING_DIR` is the JD9 copy-INTO idiom — target = EXISTING_DIR/SRC — so the refusal
+#  needs the computed target to pre-exist. Metal-corrected 2026-07-14: the first copy NESTS.)
 mkdir T1
 mkdir T2
-cp -rf T1 T2                 # T2 exists (dir) -> "cp: /T2/T1: ..." fresh-tree rule; use rm -r to replace
+cp -rf T1 T2                 # T2 exists (dir) -> copy INTO: "copied /T1/ -> /T2/T1/ (...)" — JD9 idiom, correct
+cp -rf T1 T2                 # NOW /T2/T1 pre-exists -> "cp: /T2/T1: already exists (-EEXIST); remove it
+                             #  first (rm -r) to replace a tree" — the fresh-tree rule, unbypassed by -f
 ```
 Confirm `-f` overwrites only a FILE destination; a directory target is refused honestly (no subtree is ever
 silently destroyed by a single `cp`/`mv`).
