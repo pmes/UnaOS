@@ -37,11 +37,11 @@ use core::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, Ordering};
 
 use smoltcp::iface::{Config, Interface, SocketHandle, SocketSet, SocketStorage};
 use smoltcp::phy::{Device, DeviceCapabilities, Medium, RxToken, TxToken};
-use smoltcp::socket::{icmp, tcp, udp};
+use smoltcp::socket::{dhcpv4, icmp, tcp, udp};
 use smoltcp::time::Instant;
 use smoltcp::wire::{
     EthernetAddress, HardwareAddress, Icmpv4Packet, Icmpv4Repr, IpAddress, IpCidr, IpEndpoint,
-    IpListenEndpoint, Ipv4Address,
+    IpListenEndpoint, Ipv4Address, Ipv4Cidr,
 };
 use spin::Mutex as SpinMutex;
 
@@ -388,9 +388,20 @@ const CONNECT_PUMP: i64 = 400_000;
 /// The chunk size a lock-released TCP pump advances before dropping + re-acquiring `STACK` — short
 /// enough that a concurrent socket syscall on another CPU never spins on `STACK.lock()` for a full pump.
 const TCP_CHUNK: i64 = 4_000;
+/// SOCK-5: bounded poll budget for the one-shot boot DHCP acquisition (iteration-bounded, clock-free
+/// like every other pump). slirp's DHCP server answers a DISCOVER in a handful of frames, so the full
+/// DISCOVER → OFFER → REQUEST → ACK exchange settles well inside this; the budget only caps how long a
+/// silent server stalls the (large-stack) builder before we fall back to the static lease.
+const DHCP_PUMP: i64 = 400_000;
+
+/// SOCK-5: one-shot latch so the DHCP witness line is emitted exactly once (the first stack build).
+static DHCP_WITNESS_DONE: AtomicBool = AtomicBool::new(false);
 
 // --- static socket-set + per-socket packet-buffer storage (all BSS, `&'static mut`) ---
-static mut SOCK_SET_STORAGE: [SocketStorage<'static>; NSOCK] = [SocketStorage::EMPTY; NSOCK];
+// SOCK-5: NSOCK ring-3 socket slots + ONE reserved slot for the kernel-internal DHCP client
+// socket (which never appears in `reg`, so `stack_open*` still sees exactly NSOCK free slots).
+static mut SOCK_SET_STORAGE: [SocketStorage<'static>; NSOCK + 1] =
+    [SocketStorage::EMPTY; NSOCK + 1];
 static mut UDP_RX_META: [[udp::PacketMetadata; UDP_PKTS]; NSOCK] =
     [[udp::PacketMetadata::EMPTY; UDP_PKTS]; NSOCK];
 static mut UDP_RX_DATA: [[u8; UDP_BUF]; NSOCK] = [[0u8; UDP_BUF]; NSOCK];
@@ -430,6 +441,9 @@ struct SmolStack {
     dev: E1000Phy,
     /// socket-id (index) → (smoltcp handle, owning HANDLES row, transport kind). `None` = free slot.
     reg: [Option<(SocketHandle, usize, SockKind)>; NSOCK],
+    /// SOCK-5: the kernel-internal DHCPv4 client socket (in the reserved storage slot, NOT in `reg`).
+    /// It configures the interface's address + default route once at first build (see `configure_via_dhcp`).
+    dhcp: Option<SocketHandle>,
 }
 
 static STACK: SpinMutex<Option<SmolStack>> = SpinMutex::new(None);
@@ -449,28 +463,98 @@ fn ensure_stack(guard: &mut Option<SmolStack>) -> bool {
     let mut dev = E1000Phy::new([0; 4]);
     let mut config = Config::new(HardwareAddress::Ethernet(EthernetAddress(mac)));
     config.random_seed = 0x5343_4B32; // "SCK2"
-    let mut iface = Interface::new(config, &mut dev, Instant::from_millis(0));
-    iface.update_ip_addrs(|addrs| {
-        let _ = addrs.push(IpCidr::new(
-            IpAddress::v4(our_ip[0], our_ip[1], our_ip[2], our_ip[3]),
-            24,
-        ));
-    });
-    let _ = iface.routes_mut().add_default_ipv4_route(Ipv4Address::new(
-        GATEWAY_IP[0],
-        GATEWAY_IP[1],
-        GATEWAY_IP[2],
-        GATEWAY_IP[3],
-    ));
+    let iface = Interface::new(config, &mut dev, Instant::from_millis(0));
+    // SOCK-5: build the interface with NO static address and NO default route — smoltcp's own
+    // DHCPv4 client (added below) obtains the lease and configures both in `configure_via_dhcp`.
+    // This retires the knob-on dependency on the hand-rolled DHCP lease that `hw_addr` returns.
     // SAFETY: the storage statics are borrowed `&'static mut` EXACTLY ONCE, here, under
     // the `STACK` lock with `guard` proven `None` — no aliasing. `SocketSet::new` retains
     // the borrow for the singleton's life; per-socket buffers are borrowed disjointly in
     // `stack_open` (a free `reg` slot ⇒ its buffer set is unborrowed).
     let storage: &'static mut [SocketStorage<'static>] =
         unsafe { &mut *core::ptr::addr_of_mut!(SOCK_SET_STORAGE) };
-    let sockets = SocketSet::new(storage);
-    *guard = Some(SmolStack { iface, sockets, dev, reg: [None; NSOCK] });
+    let mut sockets = SocketSet::new(storage);
+    // The DHCP socket takes the reserved (NSOCK+1-th) storage slot and is NOT recorded in `reg`, so
+    // it never counts against ring-3 socket allocation and no `stack_open*`/`free_row_sockets` touches it.
+    let dhcp_handle = sockets.add(dhcpv4::Socket::new());
+    let mut stack = SmolStack { iface, sockets, dev, reg: [None; NSOCK], dhcp: Some(dhcp_handle) };
+    // Drive DHCP to a lease NOW (bounded) and apply the config; fall back to the static `hw_addr`
+    // lease if the server never answers, so SOCK-1/2/3/4 keep a configured interface either way.
+    configure_via_dhcp(&mut stack, our_ip);
+    *guard = Some(stack);
     true
+}
+
+/// SOCK-5: run the interface's DHCPv4 client to a lease (bounded), then configure the interface's
+/// IPv4 address + default route from it. Called ONCE, right after the persistent stack is built, from
+/// a large-stack context (the boot launcher / BSP witness) so its poll pump never lands on a ring-3
+/// syscall stack. On a silent server (budget exhausted) it applies the static `fallback_ip`/gateway so
+/// the SOCK-1/2/3/4 witnesses never regress. Emits the one-shot SOCK-5 witness line either way.
+fn configure_via_dhcp(stack: &mut SmolStack, fallback_ip: [u8; 4]) {
+    let Some(dhcp_handle) = stack.dhcp else { return };
+    let mut leased: Option<Ipv4Cidr> = None;
+    let mut router: Option<Ipv4Address> = None;
+
+    let mut spent = 0i64;
+    while spent < DHCP_PUMP {
+        {
+            // Split-borrow so `iface.poll` gets `&mut dev` + `&mut sockets` disjointly (the DHCP
+            // socket egresses/ingresses through the ordinary interface poll, like any other socket).
+            let SmolStack { iface, sockets, dev, .. } = stack;
+            let now = POLL_CLOCK.fetch_add(1, Ordering::Relaxed);
+            iface.poll(Instant::from_millis(now), dev, sockets);
+        }
+        // The lease result is delivered as a DHCP socket event; `address`/`router` are Copy, so we
+        // extract them and drop the borrow before applying to the interface.
+        match stack.sockets.get_mut::<dhcpv4::Socket>(dhcp_handle).poll() {
+            Some(dhcpv4::Event::Configured(cfg)) => {
+                leased = Some(cfg.address);
+                router = cfg.router;
+                break;
+            }
+            Some(dhcpv4::Event::Deconfigured) | None => {}
+        }
+        spent += 1;
+    }
+
+    let via_dhcp = leased.is_some();
+    let cidr = leased.unwrap_or_else(|| {
+        Ipv4Cidr::new(
+            Ipv4Address::new(fallback_ip[0], fallback_ip[1], fallback_ip[2], fallback_ip[3]),
+            24,
+        )
+    });
+    let gw = router.unwrap_or(Ipv4Address::new(
+        GATEWAY_IP[0],
+        GATEWAY_IP[1],
+        GATEWAY_IP[2],
+        GATEWAY_IP[3],
+    ));
+    stack.iface.update_ip_addrs(|addrs| {
+        addrs.clear();
+        let _ = addrs.push(IpCidr::Ipv4(cidr));
+    });
+    let _ = stack.iface.routes_mut().remove_default_ipv4_route();
+    let _ = stack.iface.routes_mut().add_default_ipv4_route(gw);
+
+    // One-shot witness (M1): the persistent interface's address now comes from smoltcp's DHCP client,
+    // not the hand-rolled lease. `via_dhcp` distinguishes a real lease from the static fallback.
+    if !DHCP_WITNESS_DONE.swap(true, Ordering::Relaxed) {
+        let addr = cidr.address().octets();
+        if via_dhcp {
+            serial_println!(
+                ":: SOCK-5: smoltcp dhcpv4 lease {}.{}.{}.{}/{} gw {} — witness OK ::",
+                addr[0], addr[1], addr[2], addr[3], cidr.prefix_len(),
+                e1000::fmt_ip(&gw.octets())
+            );
+        } else {
+            serial_println!(
+                ":: SOCK-5: smoltcp dhcpv4 no offer — fell back to static {}.{}.{}.{}/{} gw {} — witness INCOMPLETE ::",
+                addr[0], addr[1], addr[2], addr[3], cidr.prefix_len(),
+                e1000::fmt_ip(&gw.octets())
+            );
+        }
+    }
 }
 
 /// Drive `iters` poll iterations against the persistent interface (bounded, clock-free).
