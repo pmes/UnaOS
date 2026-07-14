@@ -76,6 +76,15 @@ smolnet = ["dep:smoltcp"]
 # on the board) and register layout.
 tegra = []
 
+# CORE3-PROBE: instrument the aarch64 secondary-core entry stub (`_secondary_start`) to raw-dump,
+# MMU-off / no-stack, each core's MPIDR_EL1 low byte, CurrentEL, and its arrival x0 to the Pi 4 PL011
+# (0xFE201000) BEFORE any Rust runs. Disambiguates the CORE3-SMP >1 MiB core-3 regression (firmware
+# delivery vs MPIDR-reads-0 vs wrong entry) on an attended Pi bench. aarch64/`pi` only — the probe
+# asm is emitted only in the Pi secondary stub; x86 and the QEMU `virt` path are untouched. Default
+# OFF => the secondary stub is byte-identical. Enable via `UNAOS_CORE3PROBE=1 UNAOS_PI=1 ./arroyo
+# kernel8`. See unaos/scripts/core3-probe-bench.md and docs .../arch_arm64.md §CORE3-SMP.
+core3probe = ["pi"]
+
 [dependencies]
 # FIX: Use 'spin_no_std' to explicitly disable Standard Library usage
 lazy_static = { version = "1.5.0", features = ["spin_no_std"] }
