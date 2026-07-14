@@ -43,6 +43,32 @@ Principia uses two variants of `SMessage::Principia(PrincipiaCommand)`
 otherwise; the caller is responsible for publishing the returned message on the
 Synapse.
 
+## Safety levels — the law an AI runs under (planned)
+
+Beyond the system-root capability, Principia is chartered to own the **safety
+levels** for anything an AI will drive. This is the *law* layer of the UnaOS
+safety stack, **law → authority → interlock**
+([`docs/dev/USERLAND/RECONCILIATION-2026-07.md`](../../docs/dev/USERLAND/RECONCILIATION-2026-07.md)):
+
+- **Principia states the law.** For each **action-domain**, the user chooses a
+  level along a spectrum — from **never** (the AI may not act), through **ask**
+  (the AI must get human confirmation before each action), to **autonomous
+  within bounds** (the AI may act on its own inside stated limits). Principia is
+  the single, auditable place these choices are declared and persisted. It does
+  not itself carry out or block any action — it publishes the policy.
+- **Helm holds the authority.** The `helm` handler ([`handlers/helm`](../helm))
+  reads Principia's published levels and *enforces* them: every AI-initiated
+  physical action passes through helm, which resolves it against the relevant
+  level to **pass / ask / refuse**.
+- **The kernel helm core is the interlock.** Beneath both, the Ring 0 core at
+  `unaos/libs/sys/helm` is the hard interlock that does not negotiate.
+
+Principia is the law everyone reads; helm is the one place authority over
+consequences lives. Actuators (machines an AI drives through helm) are the first
+action-domain; other consequence domains are added as they arrive. The concrete
+`SMessage` variants that publish and update these levels are defined when the
+first drivable domain lands.
+
 ## Status
 
 **Partial — design-stage beyond the system-root capability.**
@@ -66,3 +92,7 @@ Synapse.
   handlers / vessels) and the Bandy/Synapse bus.
 - `docs/CODEX.md` — handler manifest and the long-term role of Principia.
 - `libs/bandy/src/signals.rs` — `SMessage` and `PrincipiaCommand` definitions.
+- [`handlers/helm`](../helm) — the control-authority handler that enforces the
+  safety levels Principia states.
+- [`docs/dev/USERLAND/RECONCILIATION-2026-07.md`](../../docs/dev/USERLAND/RECONCILIATION-2026-07.md)
+  — the law → authority → interlock safety model.

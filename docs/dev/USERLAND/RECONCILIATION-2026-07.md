@@ -123,8 +123,19 @@ and wrapped with host I/O by the userspace `libs/fs/unafs`.
    crate.
 6. **Handler README pass** — xenolith drops the "containers" scope-bleed (containers are
    geode's, VMs are xenolith's, per CODEX); una's lore-voiced README rewritten professional.
+   **Executed** (`us-handler-readmes`): `handlers/xenolith/README.md` rewritten to the
+   VMs-only charter (The Bridge) with an explicit geode-owns-containers scope note; the
+   `vessels/una/README.md` IDE-vessel README rewritten from the lore register into the
+   professional voice, keeping its substance and stating plainly that it is the `vessels/una`
+   vessel, not a handler.
 7. **helm handler scaffold** — `handlers/helm/` design-stage README against the CODEX
-   amendment; principia README gains the safety-levels surface.
+   amendment; principia README gains the safety-levels surface. **Executed**
+   (`us-handler-readmes`): `handlers/helm/` scaffolded on the junct design-stage convention
+   (charter README + stub `Cargo.toml` (`helm-handler`, no deps, standalone — not a
+   workspace member) + `src/lib.rs` doc-comment stub), distinguishing the Ring 3 authority
+   handler from the Ring 0 `unaos/libs/sys/helm` interlock core; `handlers/principia/README.md`
+   gains the safety-levels surface (user-chosen, per action-domain, "never" → "ask" →
+   "autonomous within bounds") under the law → authority → interlock framing.
 
 ## Still open (deliberately)
 

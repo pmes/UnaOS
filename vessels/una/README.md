@@ -1,37 +1,47 @@
-# UnaIDE
+# Una (UnaIDE)
 
-**Context:** `Context::Code` (IDE Mode)
-**Architecture:** Platinum (S60)
-**Engine:** `libs/elessar`
+The developer-environment vessel for UnaOS: a code-first workspace assembled
+from handlers rather than a monolithic IDE. Una is an instance of the Elessar
+workspace runtime frozen into a `Context::Code` layout — it contributes no
+editor or terminal logic of its own; it acts as the host that composes the
+relevant handlers into one development environment.
 
-## 📖 Overview
+This README covers the **`vessels/una`** IDE vessel. It is not a handler and is
+not one of the 21 locked handler names in [`docs/CODEX.md`](../../docs/CODEX.md);
+it is a source vessel (see the vessel definition in
+[`docs/dev/USERLAND/ARCHITECTURE.md`](../../docs/dev/USERLAND/ARCHITECTURE.md)).
 
-**UnaIDE** is the primary developer environment of the UnaOS ecosystem. It is **not** a monolithic IDE. It is an instance of the **Elessar Polymorphic Editor** explicitly frozen into a **Code-First Context**.
+## What it is
 
-It does not contain editor logic. It does not contain terminal logic. It acts as the **Host**, dynamically loading the required **Handlers** to create a unified development environment.
+In UnaOS terminology a **vessel** is an executable a user runs, composed at
+startup from shared libraries and capability handlers rather than bundling one
+feature set. Una is the code-project vessel:
 
-## 🏗️ Architecture
+- **State.** Uses `libs/gneiss_pal` for headless workspace state.
+- **Window.** Uses `libs/quartzite` to render the native (GTK4) window frame.
+- **Composition.** Uses `libs/elessar` to manage the layout (the Spline) and to
+  bind handlers according to the `Context::Code` context.
 
-Una sits at **Layer 3 (Vessels)** of the Trinity Architecture.
+## Composed handlers
 
-* **The Brain:** It initializes `libs/gneiss_pal` for headless state management.
-* **The Window:** It uses `libs/quartzite` to render the GTK4 window frame.
-* **The Logic:** It uses `libs/elessar` to manage the Spline (layout) and Context.
+Una binds the following handlers into a single workspace layout:
 
-## 🧩 Capabilities (Handlers)
+| Handler          | Role                                                      | Location     |
+| ---------------- | -------------------------------------------------------- | ------------ |
+| `handlers/tabula` | Editor — syntax highlighting (tree-sitter), multi-cursor, LSP. | Top right    |
+| `handlers/midden` | Terminal — shell emulation, process management.          | Bottom right |
+| `handlers/vaire`  | Version control — Git graph, diff view, commit interface. | Left panel   |
+| `handlers/matrix` | Files — workspace navigation.                            | Left panel   |
+| `handlers/aule`   | Builder — Cargo wrapper and task runner.                 | Left panel   |
 
-Una composes the following **Handlers** into a single workspace:
+## Status
 
-| Handler | Role | Screen Location |
-| --- | --- | --- |
-| **`handlers/tabula`** | **The Editor.** Syntax highlighting (TreeSitter), multi-cursor, LSP. | **Top Right** |
-| **`handlers/midden`** | **The Terminal.** Shell emulation, process management. | **Bottom Right** |
-| **`handlers/vairë`** | **The Version Control.** Git graph, diff view, commit interface. | **Left Panel** |
-| **`handlers/matrix`** | **The Files.** Navigate Files. | **Left Panel** |
-| **`handlers/aulë`** | **The Builder.** Cargo wrapper, task runner. | **Left Panel** |
+**Pre-alpha.** Depends on `libs/elessar` and the handlers above being present in
+the workspace.
 
-## ⚠️ Status
+## See also
 
-**Pre-Alpha.**
-
-* *Dependency:* Requires `libs/elessar` and `handlers/*` to be present in the workspace.
+- [`docs/dev/USERLAND/ARCHITECTURE.md`](../../docs/dev/USERLAND/ARCHITECTURE.md)
+  — the vessel / handler / library model and the Elessar runtime.
+- [`docs/CODEX.md`](../../docs/CODEX.md) — the handler manifest and the Elessar
+  protocol.
