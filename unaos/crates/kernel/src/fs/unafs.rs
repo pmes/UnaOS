@@ -14,25 +14,44 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-//! BeFS-K3: read-only kernel mount of a native UnaFS volume.
+//! BeFS-K4: read-WRITE kernel mount of a native UnaFS volume.
 //!
 //! Wires the kernel's 512 B block layer ([`crate::drivers::block`]) into the
 //! `unafs` crate's K2 seam: [`SdSectorDevice`] implements
-//! [`unafs::adapter::SectorDevice`] over `read_block`, `locate_unafs` finds the
-//! UnaFS partition by superblock magic, and [`mount`] returns a live
-//! `UnaFS<BlockAdapter<SdSectorDevice>>`. Arch-neutral like `fs::fat` — it
-//! builds on the generic block layer only — though today only the Pi 4 media
-//! carries a UnaFS partition.
+//! [`unafs::adapter::SectorDevice`] over `read_block`/`write_block`,
+//! `locate_unafs` finds the UnaFS partition by superblock magic, and [`mount`]
+//! returns a live `UnaFS<BlockAdapter<SdSectorDevice>>`. Arch-neutral like
+//! `fs::fat` — it builds on the generic block layer only — though today only
+//! the Pi 4 media carries a UnaFS partition.
 //!
-//! **Read-only arc:** `write_sector` is a deliberate `Io` stub (K4 makes it
-//! real), so every write through this mount is REFUSED at the seam. Writes ARE
-//! attempted by the crate (e.g. `UnaFS::drop` → `sync_metadata` → superblock
-//! write-back, its `Err` swallowed) — the stub is what guarantees none reaches
-//! the medium.
+//! **BeFS-K4 (writable) — the coherence keystone.** `write_sector` now routes
+//! to [`crate::drivers::block::write_block`] (emmc2 CMD24, R1/CMD13-hardened),
+//! so the mount is read-write. K3 mounted per call, which is safe only while
+//! the volume is immutable; writes make a per-call mount a COHERENCE HAZARD
+//! (two live mounts = two independent in-RAM allocation bitmaps + journal
+//! cursors, so a block one frees the other can re-hand-out → corruption).
+//! Every access — read AND write — therefore flows through the single,
+//! process-wide, IRQ-masked mount [`with_unafs`] (one authoritative in-RAM
+//! bitmap/journal, all operations serialized; modelled on the F3 `NAMESPACE`
+//! lock). Keeping one mount live also means a pure read never triggers the
+//! crate's `Drop`-time `sync_metadata` write-back, so reads stay genuinely
+//! read-only.
+//!
+//! **Torn-write scope (honest).** Crash safety comes from write ORDERING
+//! inside the `unafs` crate (new-extents-first, single-block metadata swap,
+//! free-last → a power cut LEAKS blocks, never dangles a reference), NOT from
+//! journal replay: the WAL is intent-logging only (dirty detection, no
+//! rollback). The "single-block swap is atomic" claim holds at the crate's
+//! 4096 B block granularity; the medium writes 512 B sectors, so one
+//! `write_block` is eight non-atomic `write_sector`s — a swap is truly atomic
+//! only when the live record fits the first 512 B sector. See
+//! `docs/SECURITY.md` §K4 for the full scope.
 
 use alloc::format;
 use alloc::string::String;
 use core::sync::atomic::{AtomicBool, Ordering};
+
+use spin::Mutex;
 
 use crate::drivers::block::{self, BlockError};
 use ::unafs::adapter::{
@@ -79,12 +98,22 @@ impl SectorDevice for SdSectorDevice {
         }
     }
 
-    fn write_sector(&mut self, _lba: u64, _buf: &[u8]) -> Result<(), SectorError> {
-        // K3 is a read-only mount: refuse every write at the seam. K4 (journaled
-        // writes) replaces this with the real write path.
-        Err(SectorError::Io(String::from(
-            "unafs mount is read-only (K3); writes land in K4",
-        )))
+    fn write_sector(&mut self, lba: u64, buf: &[u8]) -> Result<(), SectorError> {
+        // K4: the real write path. One 512 B sector -> one hardened block-layer
+        // write (emmc2 CMD24 + R1/CMD13 status checks). `write_block` re-guards
+        // the lba against the device's own num_blocks, so an out-of-range write
+        // is refused (BadLba) before it touches the medium.
+        if buf.len() != 512 {
+            return Err(SectorError::Io(format!(
+                "write buffer {} != sector size 512",
+                buf.len()
+            )));
+        }
+        match block::write_block(lba, buf) {
+            Ok(()) => Ok(()),
+            Err(BlockError::BadLba) => Err(SectorError::OutOfBounds(lba)),
+            Err(e) => Err(SectorError::Io(format!("block layer: {e:?}"))),
+        }
     }
 
     fn sector_count(&self) -> u64 {
@@ -127,17 +156,59 @@ pub fn locate() -> Result<PartitionSpan, MountError> {
         .ok_or(MountError::NoVolume)
 }
 
-/// Locate and mount the UnaFS volume, read-only.
-///
-/// Like `fs::fat::mount`, this constructs a fresh mount per call: the volume is
-/// immutable through this path (the write seam is stubbed), so per-call mounts
-/// cannot diverge from each other or the disk.
+/// Locate and construct a FRESH UnaFS mount. Prefer [`with_unafs`] for all
+/// real access — a fresh mount holds its own in-RAM allocation bitmap and
+/// journal cursor, so two of them live at once (or one alongside the shared
+/// [`MOUNT`]) is a K4 write-coherence hazard. This is the primitive
+/// [`with_unafs`] and [`force_remount`] build on; direct callers must ensure
+/// no other mount is live.
 pub fn mount() -> Result<KernelUnaFS, MountError> {
     install_warn_hook();
     let span = locate()?;
     let dev = SdSectorDevice::open()?;
     let adapter = BlockAdapter::for_partition(dev, &span);
     UnaFS::mount(adapter).map_err(MountError::Fs)
+}
+
+/// The single, process-wide UnaFS mount — the K4 coherence keystone.
+///
+/// Exactly ONE live mount for the volume, so there is one authoritative in-RAM
+/// allocation bitmap and one journal cursor. Populated lazily on first use and
+/// then kept (never dropped in steady state; `Drop`'s metadata write-back would
+/// otherwise fire on a mere read). [`force_remount`] is the only thing that
+/// clears it.
+static MOUNT: Mutex<Option<KernelUnaFS>> = Mutex::new(None);
+
+/// Run `f` against the one coherent mount, mounting on demand.
+///
+/// IRQ-masked around the lock (the F3 `NAMESPACE` discipline): a timer preempt
+/// of a holder followed by a same-core re-entry into a unafs sequence would
+/// deadlock the non-reentrant spinlock, so the whole critical section runs with
+/// IRQs masked. The aarch64 storage path is fully polled (no scheduler yield
+/// under the lock), so holding across the bounded block I/O is sound — the same
+/// reasoning the FAT-side `NAMESPACE`/`FAT_MUTATION` locks rest on. Returns
+/// [`MountError`] if the volume cannot be mounted (the cache stays empty, so a
+/// later call retries).
+pub fn with_unafs<R>(f: impl FnOnce(&mut KernelUnaFS) -> R) -> Result<R, MountError> {
+    crate::arch::without_interrupts(|| {
+        let mut guard = MOUNT.lock();
+        if guard.is_none() {
+            *guard = Some(mount()?);
+        }
+        Ok(f(guard.as_mut().expect("mount just populated")))
+    })
+}
+
+/// Drop the cached live mount so the next [`with_unafs`] re-reads the volume
+/// from disk with a fresh in-RAM bitmap/journal — a genuine remount, not a
+/// RAM-cache re-read. The dropped instance's `Drop` flushes its
+/// already-consistent metadata; the fresh mount then observes only what
+/// actually reached the medium. This is the durability-proof primitive the K4
+/// witness uses to prove a write survived being committed to the block device.
+pub fn force_remount() {
+    crate::arch::without_interrupts(|| {
+        *MOUNT.lock() = None;
+    });
 }
 
 /// The K3HELLO.TXT fixture contents, byte-pinned against what `arroyo kernel8`
@@ -147,14 +218,22 @@ const K3_HELLO: &[u8] = b"Hello from native UnaFS on the Pi 4!\n";
 /// walks extents, not just a single block.
 const K3_PAT_LEN: u64 = 12288;
 
-/// K3-mount witness (M1: locate + mount + superblock sanity + RO seam proof;
-/// M2: root `ls` + byte-verified reads through resolve/extent walking).
+/// K3-mount witness (locate + mount + superblock sanity + seam bound-check;
+/// root `ls` + byte-verified reads through resolve/extent walking).
 ///
 /// Called at the tail of the aarch64 `u7_launcher` fixture chain (the
 /// `k4_ready_selftest` idiom): one-shot, read-only, and its serial evidence is
 /// the uncounted `:: K3-mount: … ::` line — never a `-> PASS` fixture line, so
 /// the 23-PASS battery stays byte-equivalent. On media without a UnaFS
 /// partition it reports a skip, not a failure.
+///
+/// K4 update: the read path now runs through the coherent [`with_unafs`] mount
+/// (no per-call mount → no `Drop`-time metadata write on this pure read), and
+/// bit4 no longer writes to the volume (K3 relied on the RO seam refusing a
+/// write to `base_lba`; with real writes that would zero the superblock).
+/// bit4 instead proves the now-live write seam is bound-checked: a write to an
+/// out-of-range LBA is refused before it can touch the medium. Writes proper
+/// are proven by the `K4-write` witness.
 pub fn k3_mount_selftest() {
     static DONE: AtomicBool = AtomicBool::new(false);
     if DONE.swap(true, Ordering::Relaxed) {
@@ -177,94 +256,224 @@ pub fn k3_mount_selftest() {
         w |= 1 << 0;
     }
 
-    match mount() {
-        Ok(mut fs) => {
-            // bit1: superblock magic is the frozen on-disk signature.
-            if fs.superblock.magic == ::unafs::superblock::MAGIC {
-                w |= 1 << 1;
-            }
-            // bit2: version + block size are the pinned format constants.
-            if fs.superblock.version == ::unafs::superblock::VERSION
-                && fs.superblock.block_size as u64 == ::unafs::BLOCK_SIZE
-            {
-                w |= 1 << 2;
-            }
-            // bit3: the volume fits the partition that carries it.
-            if fs.superblock.block_count <= span.block_count {
-                w |= 1 << 3;
-            }
+    // The read bits, computed against the ONE coherent mount (a pure read: it
+    // never mutates, so it never triggers a metadata write-back).
+    let read_bits = with_unafs(|fs| {
+        let mut r = 0u32;
+        // bit1: superblock magic is the frozen on-disk signature.
+        if fs.superblock.magic == ::unafs::superblock::MAGIC {
+            r |= 1 << 1;
+        }
+        // bit2: version + block size are the pinned format constants.
+        if fs.superblock.version == ::unafs::superblock::VERSION
+            && fs.superblock.block_size as u64 == ::unafs::BLOCK_SIZE
+        {
+            r |= 1 << 2;
+        }
+        // bit3: the volume fits the partition that carries it.
+        if fs.superblock.block_count <= span.block_count {
+            r |= 1 << 3;
+        }
 
-            // --- M2: read paths, byte-verified against the staged fixtures. ---
-
-            // bit5: `ls /` sees exactly the two staged fixture FILES.
-            if let Ok(entries) = fs.ls(fs.superblock.root_inode) {
-                let hello = entries
-                    .iter()
-                    .find(|e| e.name == "K3HELLO.TXT" && e.kind == ::unafs::FileKind::File);
-                let pat = entries
-                    .iter()
-                    .find(|e| e.name == "K3PAT.BIN" && e.kind == ::unafs::FileKind::File);
-                if entries.len() == 2 && hello.is_some() && pat.is_some() {
-                    w |= 1 << 5;
-                }
-            }
-
-            // bit6: resolve + read K3HELLO.TXT — every byte matches the pinned text.
-            if let Ok(id) = fs.resolve_path("/K3HELLO.TXT") {
-                if let (Ok(inode), Ok(data)) =
-                    (fs.read_inode(id), fs.read_data(id, 0, K3_HELLO.len() as u64 + 8))
-                {
-                    if inode.size == K3_HELLO.len() as u64 && data == K3_HELLO {
-                        w |= 1 << 6;
-                    }
-                }
-            }
-
-            // bit7: K3PAT.BIN — all 12 KiB match the (i*7+3)&0xFF pattern, so the
-            // read crossed unafs block (and extent) boundaries intact.
-            if let Ok(id) = fs.resolve_path("/K3PAT.BIN") {
-                if let (Ok(inode), Ok(data)) = (fs.read_inode(id), fs.read_data(id, 0, K3_PAT_LEN))
-                {
-                    if inode.size == K3_PAT_LEN
-                        && data.len() as u64 == K3_PAT_LEN
-                        && data
-                            .iter()
-                            .enumerate()
-                            .all(|(i, &b)| b == ((i * 7 + 3) & 0xFF) as u8)
-                    {
-                        w |= 1 << 7;
-                    }
-                }
-            }
-
-            // bit8: a missing name refuses to resolve (negative witness).
-            if fs.resolve_path("/K3NOPE.TXT").is_err() {
-                w |= 1 << 8;
+        // bit5: `ls /` sees exactly the two staged fixture FILES.
+        if let Ok(entries) = fs.ls(fs.superblock.root_inode) {
+            let hello = entries
+                .iter()
+                .find(|e| e.name == "K3HELLO.TXT" && e.kind == ::unafs::FileKind::File);
+            let pat = entries
+                .iter()
+                .find(|e| e.name == "K3PAT.BIN" && e.kind == ::unafs::FileKind::File);
+            if entries.len() == 2 && hello.is_some() && pat.is_some() {
+                r |= 1 << 5;
             }
         }
+
+        // bit6: resolve + read K3HELLO.TXT — every byte matches the pinned text.
+        if let Ok(id) = fs.resolve_path("/K3HELLO.TXT") {
+            if let (Ok(inode), Ok(data)) =
+                (fs.read_inode(id), fs.read_data(id, 0, K3_HELLO.len() as u64 + 8))
+            {
+                if inode.size == K3_HELLO.len() as u64 && data == K3_HELLO {
+                    r |= 1 << 6;
+                }
+            }
+        }
+
+        // bit7: K3PAT.BIN — all 12 KiB match the (i*7+3)&0xFF pattern, so the
+        // read crossed unafs block (and extent) boundaries intact.
+        if let Ok(id) = fs.resolve_path("/K3PAT.BIN") {
+            if let (Ok(inode), Ok(data)) = (fs.read_inode(id), fs.read_data(id, 0, K3_PAT_LEN)) {
+                if inode.size == K3_PAT_LEN
+                    && data.len() as u64 == K3_PAT_LEN
+                    && data
+                        .iter()
+                        .enumerate()
+                        .all(|(i, &b)| b == ((i * 7 + 3) & 0xFF) as u8)
+                {
+                    r |= 1 << 7;
+                }
+            }
+        }
+
+        // bit8: a missing name refuses to resolve (negative witness).
+        if fs.resolve_path("/K3NOPE.TXT").is_err() {
+            r |= 1 << 8;
+        }
+        r
+    });
+    match read_bits {
+        Ok(r) => w |= r,
         Err(e) => {
             serial_println!(":: K3-mount: located but mount FAILED ({:?}) ::", e);
             return;
         }
     }
 
-    // bit4: the RO seam holds — a raw write at the SectorDevice is refused.
+    // bit4: the write seam is bound-checked — a write to an out-of-range LBA is
+    // refused (BadLba) before it reaches the medium. This touches NO real data
+    // (the target sector does not exist); it replaces the K3 base_lba write,
+    // which with a live write path would have zeroed the superblock.
     if let Ok(mut dev) = SdSectorDevice::open() {
         let sector = [0u8; 512];
-        if matches!(
-            dev.write_sector(span.base_lba, &sector),
-            Err(SectorError::Io(_))
-        ) {
+        let oob = dev.sector_count().saturating_add(1024);
+        if dev.write_sector(oob, &sector).is_err() {
             w |= 1 << 4;
         }
     }
 
     let verdict = if w == 0x1ff { "PASS" } else { "FAIL" };
     serial_println!(
-        ":: K3-mount: native unafs volume located (base_lba={}, {} blocks) + superblock v{} mounted RO + ls/cat byte-verified {} [w={:#05x}] ::",
+        ":: K3-mount: native unafs volume located (base_lba={}, {} blocks) + superblock v{} mounted + ls/cat byte-verified {} [w={:#05x}] ::",
         span.base_lba,
         span.block_count,
         ::unafs::superblock::VERSION,
+        verdict,
+        w
+    );
+}
+
+/// K4-write scratch fixture: a small file the witness creates, writes, remounts,
+/// byte-verifies, then deletes — leaving the volume as it found it (the K2
+/// self-cleaning idiom), so `K3-mount`'s exact-two-entries `ls` still holds on
+/// the next boot.
+const K4_NAME: &str = "K4TEST.TXT";
+const K4_PATH: &str = "/K4TEST.TXT";
+/// Payload spans one 512 B sector (well under a 4096 B block), so the durability
+/// proof rides the single-sector, atomic-swap-clean case.
+const K4_PAYLOAD: &[u8] = b"K4 journaled write on native UnaFS -- durable across a remount.\n";
+
+/// K4-write witness: prove the kernel can WRITE the native unafs volume and that
+/// the write is DURABLE across a genuine remount, all through the one coherent
+/// mount. Runs last in the `u7_launcher` chain (after `k3_mount_selftest`);
+/// self-cleaning (create then delete + journal reset), so a card that carries
+/// the write-back is left with only the staged K3 fixtures.
+///
+/// Sequence (7 bits):
+///   bit0 create /K4TEST.TXT + write the payload;
+///   bit1 force a real remount (fresh in-RAM bitmap/journal, re-read from disk);
+///   bit2 resolve + read back — exact bytes match (WRITE DURABILITY);
+///   bit3 delete it, then reset the (now-clean) journal head;
+///   bit4 remount again — the name no longer resolves (DELETE DURABILITY);
+///   bit5 a missing nested path resolves to Err (negative path);
+///   bit6 the fresh mount reports a CLEAN journal and root `ls` is back to the
+///        staged fixtures (no K4TEST leak).
+///
+/// On media without a unafs partition it skips, like `k3_mount_selftest`.
+pub fn k4_write_selftest() {
+    static DONE: AtomicBool = AtomicBool::new(false);
+    if DONE.swap(true, Ordering::Relaxed) {
+        return;
+    }
+
+    if let Err(e) = locate() {
+        serial_println!(":: K4-write: no unafs volume ({:?}) — skipped ::", e);
+        return;
+    }
+
+    let mut w = 0u32;
+
+    // bit0: create + write through the coherent mount. Clear any stale scratch
+    // from a prior interrupted run first (idempotent).
+    let created = with_unafs(|fs| {
+        let root = fs.superblock.root_inode;
+        let _ = fs.unlink(root, K4_NAME);
+        match fs.create_file(root, String::from(K4_NAME)) {
+            Ok(id) => fs.write_data(id, 0, K4_PAYLOAD).is_ok(),
+            Err(_) => false,
+        }
+    });
+    if matches!(created, Ok(true)) {
+        w |= 1 << 0;
+    }
+
+    // bit1: a genuine remount — the next access re-reads the volume from disk.
+    force_remount();
+
+    // bit2: the file is present after the remount, with the exact bytes — proof
+    // the write reached the block device (not a RAM cache).
+    let verified = with_unafs(|fs| match fs.resolve_path(K4_PATH) {
+        Ok(id) => match (fs.read_inode(id), fs.read_data(id, 0, K4_PAYLOAD.len() as u64)) {
+            (Ok(inode), Ok(data)) => {
+                inode.size == K4_PAYLOAD.len() as u64 && data == K4_PAYLOAD
+            }
+            _ => false,
+        },
+        Err(_) => false,
+    });
+    if matches!(verified, Ok(true)) {
+        // bit1 credits the successful fresh mount; bit2 the byte-verify.
+        w |= 1 << 1;
+    }
+    if matches!(verified, Ok(true)) {
+        w |= 1 << 2;
+    }
+
+    // bit3: delete the scratch file, then reset the (now-clean) journal head so
+    // the next mount's dirty-detection is unambiguously clean. `journal.reset`
+    // and `device` are disjoint fields, so the borrow splits cleanly.
+    let deleted = with_unafs(|fs| {
+        let root = fs.superblock.root_inode;
+        if fs.unlink(root, K4_NAME).is_err() {
+            return false;
+        }
+        fs.journal.reset(&mut fs.device).is_ok()
+    });
+    if matches!(deleted, Ok(true)) {
+        w |= 1 << 3;
+    }
+
+    // bit4: remount; the delete is durable (the name no longer resolves).
+    force_remount();
+    let gone = with_unafs(|fs| fs.resolve_path(K4_PATH).is_err());
+    if matches!(gone, Ok(true)) {
+        w |= 1 << 4;
+    }
+
+    // bit5: negative path — a write/resolve of a missing nested parent is Err,
+    // never a silent success.
+    let neg = with_unafs(|fs| fs.resolve_path("/K4NOPE/DEEP.TXT").is_err());
+    if matches!(neg, Ok(true)) {
+        w |= 1 << 5;
+    }
+
+    // bit6: the fresh mount is CLEAN (balanced/reset journal) and the root is
+    // back to exactly the staged fixtures — no K4TEST leak.
+    let clean = with_unafs(|fs| {
+        let dirty = fs.journal.check_recovery(&mut fs.device).unwrap_or(true);
+        let no_leak = fs
+            .ls(fs.superblock.root_inode)
+            .map(|entries| entries.iter().all(|d| d.name != K4_NAME))
+            .unwrap_or(false);
+        !dirty && no_leak
+    });
+    if matches!(clean, Ok(true)) {
+        w |= 1 << 6;
+    }
+
+    let verdict = if w == 0x7f { "PASS" } else { "FAIL" };
+    serial_println!(
+        ":: K4-write: create+write {} + remount byte-verify + delete + remount + negative + clean-journal {} [w={:#04x}] ::",
+        K4_PATH,
         verdict,
         w
     );

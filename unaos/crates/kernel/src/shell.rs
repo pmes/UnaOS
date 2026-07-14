@@ -1318,7 +1318,9 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
             console.println("WILDCARD: * / ? in the last path component — ls/cat/rm/cp/mv expand it (e.g. rm *.TMP, cp *.TXT DOCS/)");
             console.println("          (create/edit/delete/copy/move files & dirs anywhere in the tree; sync = write-through, durable)");
             #[cfg(target_arch = "aarch64")]
-            console.println("UNAFS:    uls [path], ucat <path>  (native unafs volume, read-only)");
+            console.println("UNAFS:    uls [path], ucat <path>  (native unafs volume, absolute paths)");
+            #[cfg(target_arch = "aarch64")]
+            console.println("          utouch <path>, uwrite <path> <text>, umkdir <path>, urm <path>  (write-through)");
             console.println("SMP:      sched (per-CPU run queues), pulse (full-screen CPU monitor)");
             console.println("TEST:     tste (in-OS self-test suite: boot-replay + live checks)");
             console.println("NETWORK:  netinfo, ping <ip> [count], arp <ip>");
@@ -1433,40 +1435,44 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
         },
         #[cfg(target_arch = "aarch64")]
         "uls" => {
-            // BeFS-K3: list a directory on the native unafs volume (read-only mount; absolute
-            // paths, case-sensitive names — unafs has no shell cwd). `uls` lists the root.
+            // BeFS-K3/K4: list a directory on the native unafs volume (absolute paths,
+            // case-sensitive names — unafs has no shell cwd). `uls` lists the root. Routes through
+            // the single coherent mount (`with_unafs`); a pure read never writes.
             let path = args.first().copied().unwrap_or("/");
-            match crate::fs::unafs::mount() {
-                Ok(mut fs) => match fs.resolve_path(path) {
-                    Ok(id) => match fs.ls(id) {
-                        Ok(entries) => {
-                            for de in &entries {
-                                let size = fs.read_inode(de.inode_id).map(|i| i.size).unwrap_or(0);
-                                if de.kind == ::unafs::FileKind::Directory {
-                                    console.println(&alloc::format!("  <DIR>              {}", de.name));
-                                } else {
-                                    console.println(&alloc::format!("  {:>10}  {}", size, de.name));
-                                }
+            let out = crate::fs::unafs::with_unafs(|fs| match fs.resolve_path(path) {
+                Ok(id) => match fs.ls(id) {
+                    Ok(entries) => {
+                        let mut lines = alloc::vec::Vec::new();
+                        for de in &entries {
+                            let size = fs.read_inode(de.inode_id).map(|i| i.size).unwrap_or(0);
+                            if de.kind == ::unafs::FileKind::Directory {
+                                lines.push(alloc::format!("  <DIR>              {}", de.name));
+                            } else {
+                                lines.push(alloc::format!("  {:>10}  {}", size, de.name));
                             }
-                            console.println(&alloc::format!("  ({} entries)", entries.len()));
                         }
-                        Err(e) => console.println(&alloc::format!("uls: {}: {:?}", path, e)),
-                    },
-                    Err(e) => console.println(&alloc::format!("uls: {}: {:?}", path, e)),
+                        lines.push(alloc::format!("  ({} entries)", entries.len()));
+                        lines
+                    }
+                    Err(e) => alloc::vec![alloc::format!("uls: {}: {:?}", path, e)],
                 },
+                Err(e) => alloc::vec![alloc::format!("uls: {}: {:?}", path, e)],
+            });
+            match out {
+                Ok(lines) => for line in &lines { console.println(line); },
                 Err(e) => console.println(&alloc::format!("uls: no unafs volume ({:?})", e)),
             }
         },
         #[cfg(target_arch = "aarch64")]
         "ucat" => {
-            // BeFS-K3: print a file off the native unafs volume (bounded like `cat`).
+            // BeFS-K3/K4: print a file off the native unafs volume (bounded like `cat`).
             match args.first() {
                 None => console.println("usage: ucat <path>"),
-                Some(path) => match crate::fs::unafs::mount() {
-                    Ok(mut fs) => match fs.resolve_path(path) {
+                Some(path) => {
+                    let out = crate::fs::unafs::with_unafs(|fs| match fs.resolve_path(path) {
                         Ok(id) => match fs.read_inode(id) {
                             Ok(inode) if inode.kind == ::unafs::FileKind::Directory =>
-                                console.println(&alloc::format!("ucat: {}: is a directory (-EISDIR)", path)),
+                                alloc::vec![alloc::format!("ucat: {}: is a directory (-EISDIR)", path)],
                             Ok(inode) => {
                                 const CAP: u64 = 8192;
                                 let want = inode.size.min(CAP);
@@ -1478,23 +1484,64 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
                                             0x20..=0x7e => Some(b as char),
                                             _ => Some('.'),
                                         }).collect();
-                                        for line in text.split('\n') {
-                                            console.println(line);
-                                        }
+                                        let mut lines: alloc::vec::Vec<String> =
+                                            text.split('\n').map(|s| s.into()).collect();
                                         if inode.size > want {
-                                            console.println(&alloc::format!(
+                                            lines.push(alloc::format!(
                                                 "[... {} of {} bytes shown]", want, inode.size));
                                         }
+                                        lines
                                     }
-                                    Err(e) => console.println(&alloc::format!("ucat: {}: {:?}", path, e)),
+                                    Err(e) => alloc::vec![alloc::format!("ucat: {}: {:?}", path, e)],
                                 }
                             }
-                            Err(e) => console.println(&alloc::format!("ucat: {}: {:?}", path, e)),
+                            Err(e) => alloc::vec![alloc::format!("ucat: {}: {:?}", path, e)],
                         },
-                        Err(e) => console.println(&alloc::format!("ucat: {}: {:?}", path, e)),
-                    },
-                    Err(e) => console.println(&alloc::format!("ucat: no unafs volume ({:?})", e)),
-                },
+                        Err(e) => alloc::vec![alloc::format!("ucat: {}: {:?}", path, e)],
+                    });
+                    match out {
+                        Ok(lines) => for line in &lines { console.println(line); },
+                        Err(e) => console.println(&alloc::format!("ucat: no unafs volume ({:?})", e)),
+                    }
+                }
+            }
+        },
+        #[cfg(target_arch = "aarch64")]
+        "utouch" => {
+            // BeFS-K4: create a 0-length file on the native unafs volume (error if it exists or the
+            // parent is missing). Absolute paths. Write-through + durable via the coherent mount.
+            match args.first().copied() {
+                None => console.println("usage: utouch <path>"),
+                Some(path) => console.println(&unafs_verb_touch(path)),
+            }
+        },
+        #[cfg(target_arch = "aarch64")]
+        "uwrite" => {
+            // BeFS-K4: create-or-replace a file on the native unafs volume with the given text
+            // (`uwrite <path> <text...>`). Durable write-through.
+            match args.first().copied() {
+                None => console.println("usage: uwrite <path> <text...>"),
+                Some(path) => {
+                    let text = args[1..].join(" ");
+                    console.println(&unafs_verb_write(path, text.as_bytes()));
+                }
+            }
+        },
+        #[cfg(target_arch = "aarch64")]
+        "umkdir" => {
+            // BeFS-K4: create a directory on the native unafs volume (`umkdir <path>`).
+            match args.first().copied() {
+                None => console.println("usage: umkdir <path>"),
+                Some(path) => console.println(&unafs_verb_mkdir(path)),
+            }
+        },
+        #[cfg(target_arch = "aarch64")]
+        "urm" => {
+            // BeFS-K4: delete a file on the native unafs volume (`urm <path>`). A directory is
+            // refused (the crate's `unlink` returns IsADirectory) — mirrors POSIX `rm` without -r.
+            match args.first().copied() {
+                None => console.println("usage: urm <path>"),
+                Some(path) => console.println(&unafs_verb_rm(path)),
             }
         },
         "touch" => {
@@ -1911,5 +1958,111 @@ fn parse_byte(s: &str) -> Option<u8> {
         u8::from_str_radix(hex, 16).ok()
     } else {
         s.parse::<u8>().ok()
+    }
+}
+
+// --- BeFS-K4 native unafs write verbs -----------------------------------------
+// The native unafs volume uses ABSOLUTE, case-sensitive paths (no shell cwd).
+// Every verb routes through the single coherent mount (`crate::fs::unafs::
+// with_unafs`), so the in-RAM allocation bitmap/journal stay authoritative and
+// each mutation is write-through + durable. Kept in this dedicated region (not
+// among the FAT-verb helpers above) so the pi4 unafs lane stays trivially
+// separable from the concurrent jetson FAT-verb work.
+
+/// Split an absolute unafs path into `(parent_dir, leaf)`. Rejects the bare
+/// root (nothing to create/remove). `"/A.TXT"` -> `("/", "A.TXT")`; `"/D/A"` ->
+/// `("/D", "A")`; a bare `"A"` is treated as root-relative -> `("/", "A")`.
+#[cfg(target_arch = "aarch64")]
+fn unafs_split(path: &str) -> Option<(&str, &str)> {
+    let trimmed = path.trim_end_matches('/');
+    if trimmed.is_empty() {
+        return None;
+    }
+    match trimmed.rfind('/') {
+        Some(0) => Some(("/", &trimmed[1..])),
+        Some(i) => Some((&trimmed[..i], &trimmed[i + 1..])),
+        None => Some(("/", trimmed)),
+    }
+}
+
+/// `utouch <path>`: create a 0-length file (error if it exists / parent missing).
+#[cfg(target_arch = "aarch64")]
+fn unafs_verb_touch(path: &str) -> String {
+    let (parent, leaf) = match unafs_split(path) {
+        Some(pl) => pl,
+        None => return alloc::format!("utouch: {}: invalid path", path),
+    };
+    match crate::fs::unafs::with_unafs(|fs| {
+        let pid = fs.resolve_path(parent).map_err(|e| alloc::format!("{:?}", e))?;
+        fs.create_file(pid, leaf.into())
+            .map(|_| ())
+            .map_err(|e| alloc::format!("{:?}", e))
+    }) {
+        Ok(Ok(())) => alloc::format!("utouch: created {}", path),
+        Ok(Err(msg)) => alloc::format!("utouch: {}: {}", path, msg),
+        Err(e) => alloc::format!("utouch: no unafs volume ({:?})", e),
+    }
+}
+
+/// `uwrite <path> <text>`: create-or-replace a file with `bytes` (durable).
+#[cfg(target_arch = "aarch64")]
+fn unafs_verb_write(path: &str, bytes: &[u8]) -> String {
+    let (parent, leaf) = match unafs_split(path) {
+        Some(pl) => pl,
+        None => return alloc::format!("uwrite: {}: invalid path", path),
+    };
+    let n = bytes.len();
+    match crate::fs::unafs::with_unafs(|fs| {
+        let pid = fs.resolve_path(parent).map_err(|e| alloc::format!("{:?}", e))?;
+        // Replace semantics: drop an existing FILE of this name first (a
+        // directory is left intact, and create_file then reports FileExists).
+        let _ = fs.unlink(pid, leaf);
+        let id = fs
+            .create_file(pid, leaf.into())
+            .map_err(|e| alloc::format!("{:?}", e))?;
+        fs.write_data(id, 0, bytes)
+            .map_err(|e| alloc::format!("{:?}", e))
+    }) {
+        Ok(Ok(())) => alloc::format!("uwrite: wrote {} bytes to {}", n, path),
+        Ok(Err(msg)) => alloc::format!("uwrite: {}: {}", path, msg),
+        Err(e) => alloc::format!("uwrite: no unafs volume ({:?})", e),
+    }
+}
+
+/// `umkdir <path>`: create a directory.
+#[cfg(target_arch = "aarch64")]
+fn unafs_verb_mkdir(path: &str) -> String {
+    let (parent, leaf) = match unafs_split(path) {
+        Some(pl) => pl,
+        None => return alloc::format!("umkdir: {}: invalid path", path),
+    };
+    match crate::fs::unafs::with_unafs(|fs| {
+        let pid = fs.resolve_path(parent).map_err(|e| alloc::format!("{:?}", e))?;
+        fs.mkdir(pid, leaf.into())
+            .map(|_| ())
+            .map_err(|e| alloc::format!("{:?}", e))
+    }) {
+        Ok(Ok(())) => alloc::format!("umkdir: created {}/", path),
+        Ok(Err(msg)) => alloc::format!("umkdir: {}: {}", path, msg),
+        Err(e) => alloc::format!("umkdir: no unafs volume ({:?})", e),
+    }
+}
+
+/// `urm <path>`: delete a file (a directory is refused with IsADirectory).
+#[cfg(target_arch = "aarch64")]
+fn unafs_verb_rm(path: &str) -> String {
+    let (parent, leaf) = match unafs_split(path) {
+        Some(pl) => pl,
+        None => return alloc::format!("urm: {}: invalid path", path),
+    };
+    match crate::fs::unafs::with_unafs(|fs| {
+        let pid = fs.resolve_path(parent).map_err(|e| alloc::format!("{:?}", e))?;
+        fs.unlink(pid, leaf)
+            .map(|_| ())
+            .map_err(|e| alloc::format!("{:?}", e))
+    }) {
+        Ok(Ok(())) => alloc::format!("urm: removed {}", path),
+        Ok(Err(msg)) => alloc::format!("urm: {}: {}", path, msg),
+        Err(e) => alloc::format!("urm: no unafs volume ({:?})", e),
     }
 }
