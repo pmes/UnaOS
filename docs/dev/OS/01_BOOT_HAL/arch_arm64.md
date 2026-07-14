@@ -2705,6 +2705,59 @@ copy-INTO idiom; the refusal needs `EXISTING_DIR/SRC` to pre-exist — confirmed
 bench card's original §4 criterion was wrong and is corrected in-repo, `823b5ba`); (2) `mv -f` in the same
 directory prints `renamed` not `moved` — correct JD10 wording (same-parent = `rename_entry`).
 
+### JD15 — `-f` tree-replace for `cp -r`/`mv`: forced replace of an existing directory-TREE destination
+
+JD14 bounded `-f` to a single FILE destination: an existing directory tree stayed `-EEXIST` (for `cp -r`) or
+`-EISDIR` (for `mv -f` onto a directory), and the operator had to `rm -r` it first. JD15 closes the last gap
+in the flag family — **`cp -rf` and `mv -f` now REPLACE an existing directory-tree destination**, so the
+forced verbs behave uniformly whether the destination is a file or a whole subtree. Still **`shell.rs`-only,
+zero `fat.rs` mutation** (call-never-edit): it composes the JD13 `rm_tree` + `remove_dir` delete primitives
+with the existing JD9 copy / JD10 relink paths.
+
+**The mechanism — delete-dst-first, then a fresh copy/move.** A new `force_remove_existing(fs, de, parent,
+leaf, canon)` helper removes whatever occupies the destination (a FILE via `locate_in_dir` +
+`delete_located`; a DIRECTORY via `rm_tree` to empty it, then `remove_dir`), leaving the destination absent.
+The caller then proceeds down its normal fresh-destination path:
+- **`cp -rf SRC DST`** — where JD14 returned `-EEXIST` on an existing target, JD15 (under `-f`) calls the
+  helper to delete the target first, then builds the FRESH tree exactly as before. Without `-f` the target
+  still stays `-EEXIST` (no-clobber remains the panel default).
+- **`mv -f SRC DST`** — the JD14 dir-dest refusal (`-EISDIR`) is replaced: under `-f` the existing directory
+  destination is tree-deleted, then the entry is relinked (`rename_entry`/`move_entry`) into the freed slot.
+  The JD14 file-overwrite path is unchanged.
+
+**⚠ Crash-safe-PARTIAL — honest, bounded, no rollback (the JD13 discipline).** Because the destination is
+deleted BEFORE the fresh copy/move, a power cut in the delete→recreate window leaves the destination
+**ABSENT** — never a half-overwritten or silently-merged tree. Nothing is rolled back; the operator re-runs
+the `cp -rf`/`mv -f` to complete it. This is the deliberate trade `-f` tree-replace makes: it exchanges the
+plain `-EEXIST`/`-EISDIR` refusal for a bounded, honest destructive window. no-clobber stays the DEFAULT —
+only `-f` opts in; `-n` is unchanged; plain `-f` on a FILE destination is unchanged; a directory destination
+WITHOUT `-f` still returns `-EEXIST` (`cp -r`) / lands the source INSIDE it (`mv` copy-into idiom).
+
+**Guards preserved.** The JD9 self/subtree refusal (`-EINVAL`), the `mv` directory-across-parents refusal
+(`-EISDIR`, surfaced BEFORE any delete-dst-first so `-f` never destroys a destination for a doomed move),
+and the `cp -rf /` / `rm -rf /` volume-root footgun refusals all stand. The volume root is never a
+replace target (a computed target is always a leaf under some parent; a defensive `-EBUSY` covers the
+unreachable root case).
+
+**Errno additions** (shell-side, the JD6–JD14 pattern):
+
+| condition | tag |
+|---|---|
+| `cp -r` onto an existing directory tree WITHOUT `-f` | `-EEXIST` (use `cp -rf`, or `rm -r` it first) |
+| `cp -rf` onto an existing file OR directory tree | (replaced — delete-dst-first, then fresh copy) |
+| `mv -f` onto an existing directory tree | (replaced — delete-dst-first, then relink) |
+| power cut mid-replace | destination ABSENT (crash-safe-partial; re-run to complete) |
+
+**Principal — unchanged.** Still EL1 ASID 0, the PUBLIC principal; JD15 adds no new fat.rs surface, no new
+lock, and no ACL interaction — it only sequences existing call-never-edit primitives.
+
+**Gate (QEMU):** `./arroyo check` + `UNAOS_TEGRA=1 ./arroyo check` green both arches (no new warnings — only
+the pre-existing `shutdown` double-`hlt_loop`); `./arroyo test-arm 22` → `MISSION SUCCESS`; `UNAOS_GICV3=1
+./arroyo test-arm 40` → CAPSTONE 6/6; `UNAOS_HUBSTORAGE=1 ./arroyo test 25` → `MISSION SUCCESS`. Zero x86
+behavioural change. As in JD2–JD14 the shell command path is not headless-reachable in-lane (keystroke-driven,
+tegra-only), so the shell-level verdict is **attended-pending** — the regression suite proves no breakage; the
+new behaviour is exercised by the `jd15-bench.md` attended-bench card.
+
 ### JB1f — the unhealed early-vector window (the round-6 boot crash), closed (`85f74f8`)
 
 **The evidence (2026-07-11 attended bench, real Orin).** Kernel `446abd3` (the JD6 tip): 2/2 boots

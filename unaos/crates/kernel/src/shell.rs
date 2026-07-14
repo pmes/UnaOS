@@ -668,10 +668,12 @@ fn cp_tree(
 ///     `-ENOTDIR`;
 ///   * copying a directory into itself or one of its own descendants is refused (`-EINVAL`,
 ///     canonical-path prefix compare) — this is what stops an infinite `cp -r DOCS DOCS/SUB`;
-///   * the top-level target must NOT already exist (`-EEXIST`). This is the simple, safe rule: `cp -r`
-///     always creates a FRESH tree, never silently merging into or overwriting an existing one. Because the
-///     top-level target is fresh, every directory `cp_tree` creates below it is inside freshly-created (so
-///     empty) parents — no child can collide, and no existing file is ever clobbered.
+///   * the top-level target must NOT already exist — `-EEXIST` under the no-clobber default, so `cp -r`
+///     creates a FRESH tree and never silently merges into an existing one. JD15: `cp -rf` opts into
+///     TREE-REPLACE — the existing target (file or whole directory tree) is deleted first
+///     (delete-dst-first, crash-safe-partial per `force_remove_existing`) and the fresh tree is then
+///     built as normal. Because the top-level target is always fresh at build time, every directory
+///     `cp_tree` creates below it is inside freshly-created (so empty) parents — no child can collide.
 /// A mid-tree failure stops and reports the honest partial count (dirs/files/bytes copied so far) plus the
 /// failing path + errno; nothing is rolled back (a partial tree is left on disk, crash-safe per the
 /// FATDIRS/JD6 ordering — the operator can `rmdir`/`rm` it).
@@ -705,13 +707,28 @@ fn fs_cp_recursive(console: &mut Console, src: &str, dst: &str, force: bool) {
             "cp: cannot copy directory {} into itself or its own subtree ({}) (-EINVAL)",
             src_canon, target));
     }
-    // --- The top-level target must not already exist (fresh-tree rule → honest -EEXIST). JD14: `-f`
-    //     overwrites a FILE destination (the degrade-to-`fs_cp` path above), but a directory-TREE
-    //     merge/replace is out of scope even with `-f` — an existing tree target stays -EEXIST (remove
-    //     it first with `rm -r`, then `cp -r`). Keeps the destructive surface bounded and honest. ---
-    if resolve_path(&fs, &target).is_ok() {
-        return console.println(&alloc::format!(
-            "cp: {}: already exists (-EEXIST); remove it first (rm -r) to replace a tree", target));
+    // --- The top-level target must not already exist (fresh-tree rule → honest -EEXIST). JD15: `-f`
+    //     (`cp -rf`) now opts into TREE-REPLACE — delete whatever exists at the target first
+    //     (delete-dst-first, crash-safe-partial per `force_remove_existing`), then fall through to
+    //     create a FRESH tree. Without `-f` an existing target stays -EEXIST (no-clobber default). ---
+    if let Ok(existing) = resolve_path(&fs, &target) {
+        if !force {
+            return console.println(&alloc::format!(
+                "cp: {}: already exists (-EEXIST); use cp -rf to replace it, or rm -r it first", target));
+        }
+        let de_existing = match existing {
+            Resolved::Entry(de, _) => de,
+            // `target` is never the volume root (it is always a leaf under some parent), so this arm
+            // is unreachable — refuse defensively rather than clobber.
+            Resolved::Root => return console.println("cp: -rf /: refusing to replace the volume root (-EBUSY)"),
+        };
+        let (rp, rl, _rc) = match resolve_write_target(&fs, &target) {
+            Ok(t) => t,
+            Err(msg) => return console.println(&alloc::format!("cp: {}", msg)),
+        };
+        if let Err(msg) = force_remove_existing(&fs, &de_existing, rp, &rl, &target) {
+            return console.println(&alloc::format!("cp: -rf: replace failed: {}", msg));
+        }
     }
     // --- Create the top-level target directory (its parent must exist), then recurse into it. ---
     let (tparent, tleaf, tcanon) = match resolve_write_target(&fs, &target) {
@@ -794,6 +811,45 @@ fn rm_tree(
                 .map_err(|e| alloc::format!("{}: {} ({:?})", child, fat_errno(e), e))?;
             stats.files += 1;
         }
+    }
+    Ok(())
+}
+
+/// JD15 `-f` tree-replace primitive — remove WHATEVER currently occupies a destination so a forced
+/// copy/move can then create a FRESH one. A FILE is unlinked via the `fs_rm` primitives
+/// (`locate_in_dir` + `delete_located`); a DIRECTORY is emptied by the JD13 `rm_tree` and then
+/// `remove_dir`'d (the same call-never-edit composition `rm -r` uses — zero fat.rs mutation). `de` is
+/// the already-resolved destination entry; `parent`/`leaf` locate its slot in the parent directory;
+/// `canon` is its canonical path (for honest error text). Returns Ok when the destination is now
+/// absent, or a formatted `path: reason (errno)` string on the first failure.
+///
+/// ⚠ CRASH-SAFE-PARTIAL (the JD13 honest-count discipline): this deletes the destination BEFORE the
+/// caller's fresh copy/move. A power cut in the delete→recreate window therefore leaves the
+/// destination ABSENT — never a half-overwritten or silently-merged tree. Nothing is rolled back; the
+/// operator re-runs the `cp -rf`/`mv -f` to complete it. `-f` tree-replace trades the plain `-EEXIST`
+/// refusal for this bounded, honest window; no-clobber stays the panel DEFAULT (only `-f` opts in).
+fn force_remove_existing(
+    fs: &FatFs,
+    de: &DirEntry,
+    parent: u32,
+    leaf: &str,
+    canon: &str,
+) -> Result<(), String> {
+    if de.is_dir {
+        // Empty the destination subtree (child files then child dirs, depth-first), then remove the
+        // now-empty directory itself — exactly the `fs_rm_recursive` composition, run QUIET here.
+        let mut stats = RmStats { dirs: 0, files: 0 };
+        rm_tree(fs, de.first_cluster(), canon, 1, &mut stats)?;
+        fs.remove_dir(parent, leaf)
+            .map_err(|e| alloc::format!("{}: {} ({:?})", canon, fat_errno(e), e))?;
+    } else {
+        // A plain FILE destination — re-locate its slot BY NAME (DirEntry carries no slot coords) and
+        // unlink it, the same `fs_rm` primitive pair.
+        let (fde, dl, doff) = fs
+            .locate_in_dir(parent, leaf)
+            .map_err(|e| alloc::format!("{}: {} ({:?})", canon, fat_errno(e), e))?;
+        fs.delete_located(dl, doff, fde.first_cluster())
+            .map_err(|e| alloc::format!("{}: {} ({:?})", canon, fat_errno(e), e))?;
     }
     Ok(())
 }
@@ -883,9 +939,9 @@ fn fs_rm_recursive(console: &mut Console, arg: &str, force: bool) {
 /// compare); the destination must not already exist (no-clobber panel default → `-EEXIST`, mirroring
 /// the FATMOVE seam's own dest-exists refusal shell-side) — EXCEPT a rename to the source's own
 /// canonical name (same parent + same leaf), which the seam treats as a no-op success. JD14: `-f`
-/// (force) opts into overwriting an existing FILE destination — the existing file is deleted first
-/// (delete-dst-first), then the entry is relinked into the freed slot; a DIRECTORY destination is
-/// still refused even under `-f` (clobbering a whole subtree would need `rm -r` — kept out of `mv`). Honest errno
+/// (force) opts into overwriting an existing destination — the existing file (JD14) OR directory
+/// TREE (JD15: emptied via `rm_tree` + `remove_dir`) is deleted first (delete-dst-first,
+/// crash-safe-partial), then the entry is relinked into the freed slot. Honest errno
 /// surface: src missing → `-ENOENT`; root as src → `-EBUSY`; dst parent missing → `-ENOENT`; dst
 /// parent is a file → `-ENOTDIR`; dst dir full → `-ENOSPC`; a non-8.3 dst name → `-EINVAL`; a
 /// directory across parents → `-EISDIR`.
@@ -954,19 +1010,18 @@ fn fs_mv(console: &mut Console, src: &str, dst: &str, force: bool) {
                     return console.println(&alloc::format!(
                         "mv: {}: file exists (-EEXIST); use mv -f to overwrite", joined(&dcanon, de.name())));
                 }
-                // `-f`: overwrite an existing FILE destination by removing it first (delete-dst-first),
-                // then the rename/move below re-publishes the entry into the freed slot. A DIRECTORY
-                // destination is NOT clobbered even with `-f` (that would need a recursive delete) —
-                // refuse it honestly so `-f` can never silently destroy a whole subtree.
-                if de.is_dir {
+                // `-f`: overwrite the existing destination by removing it first (delete-dst-first),
+                // then the rename/move below re-publishes the entry into the freed slot. JD15: a
+                // DIRECTORY destination is now TREE-REPLACED too (emptied via `rm_tree` + `remove_dir`
+                // by `force_remove_existing`), not just a plain FILE — crash-safe-partial per JD13
+                // (a power cut in the window leaves the destination absent, never merged). The `_ = dl,
+                // doff` slot coords are re-derived inside the helper by name.
+                let _ = (dl, doff);
+                let dest_leaf = de.name();
+                let dest_canon = joined(&dcanon, dest_leaf);
+                if let Err(msg) = force_remove_existing(&fs, &de, dparent, dest_leaf, &dest_canon) {
                     return console.println(&alloc::format!(
-                        "mv: {}: is a directory — refusing to overwrite (-EISDIR); remove it first (rm -r)",
-                        joined(&dcanon, de.name())));
-                }
-                if let Err(e) = fs.delete_located(dl, doff, de.first_cluster()) {
-                    return console.println(&alloc::format!(
-                        "mv: {}: overwrite (remove existing) failed {} ({:?})",
-                        joined(&dcanon, de.name()), fat_errno(e), e));
+                        "mv: -f: overwrite (remove existing) failed: {}", msg));
                 }
             }
             Err(FatError::NotFound) => {}
