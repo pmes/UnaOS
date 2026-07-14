@@ -109,7 +109,10 @@ and wrapped with host I/O by the userspace `libs/fs/unafs`.
 2. **junct purge** — the `cpal` + `resonance` audio code in `handlers/junct` is confirmed
    bot hallucination (The Receiver was never implemented; a comms handler has no business
    with microphone deps). Archaeology (who/when), then delete; junct returns to a clean
-   design-stage stub.
+   design-stage stub. **Executed** (`us-junct-purge`): archaeology confirmed the audio path
+   was introduced by a `google-labs-jules[bot]` session (commit `64bace4`, 2026-02-19);
+   the `cpal`/`resonance`/`tokio` deps and the FFT stream code are deleted, `lib.rs` is a
+   charter-accurate design-stage stub, and the README rewritten to the "Receiver" charter.
 3. **`libs/drive` → `unaos/libs/sys/helm/src/rover/`**, with `libs/input`/`libs/pwm`
    documented as the TALUS kernel-lane device-class libs (they are deliberate work, not
    drift — the survey initially flagged them only because they lack READMEs; READMEs owed).

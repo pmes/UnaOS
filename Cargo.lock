@@ -3342,14 +3342,6 @@ dependencies = [
 [[package]]
 name = "junct"
 version = "0.1.0"
-dependencies = [
- "anyhow",
- "bandy",
- "cpal",
- "log",
- "resonance",
- "tokio",
-]
 
 [[package]]
 name = "khronos-egl"
