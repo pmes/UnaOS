@@ -306,7 +306,7 @@ already performs). That refactor is a separate, review-gated change; **WXN is no
 - [ ] FAT: BPB/dirent/FAT-chain bounds and loop guards (partially hardened during the read-only arc — re-verify and record)
 - [x] unafs RO mount (UNAFS-K3): bound every disk-derived size/count/offset vs volume geometry (superblock `bitmap_blocks`, inode `size`, extent arithmetic, codec lengths; `try_reserve` not `with_capacity`, size-limited decode) — **DONE (BEFS-HARDEN, 2026-07-13)**: `Superblock::validate` at the parse boundary; `try_reserve` on the bitmap load and `read_from_extents`; `checked_*` extent arithmetic + past-volume extent rejection; bounded bulk hole fill and free walks; checked spilled-extent sums on the query/get_attribute paths (the QSIM-flagged sites); two-tier bincode decode budgets (8 KiB block records / 4 MiB extent-backed records, pinned under the kernel heap by a regression test). 23 hostile-volume fixtures assert `Err`-not-panic (`libs/fs/unafs/tests/hostile_volume.rs`); golden format KATs byte-identical
 
-#### unafs kernel WRITES — the K4 write-path honest scope (UNAFS-K4, 2026-07-14, QEMU-green)
+#### unafs kernel WRITES — the K4 write-path honest scope (UNAFS-K4, 2026-07-14; ✅ METAL-CONFIRMED 2026-07-14 attended Pi 4 bench — `K4-write PASS [w=0x7f]` on 3 cold boots with a GENUINE power-cut between each, boot-2 remount CLEAN: the journaled write was durable across real power loss)
 
 The UNAFS-K3 mount became read-WRITE at K4: `fs/unafs.rs`'s `write_sector` routes to
 `drivers::block::write_block` (emmc2 CMD24 + R1/CMD13 status checks). Stated honestly:

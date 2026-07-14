@@ -126,9 +126,20 @@ managed units by kind) and real per-unit **Crystal Color** (Green/Amber/Red).
   `tempfile` dev-dep); zero `unaos/` diff. SYNC/SNAP are RITES-2; UnaFS-native versioning is the
   Destiny (behind UNAFS-F1).
 
-## Pi 4 — UNAFS-K4 (BeFS-K4: journaled kernel WRITES on the native unafs volume) — 2026-07-14 🔬 `hw-pi4`
+## Pi 4 — UNAFS-K4 (BeFS-K4: journaled kernel WRITES on the native unafs volume) — 2026-07-14 ✅ metal-confirmed 2026-07-14 `hw-pi4`
 
-**QEMU-green; metal write→power-cycle→boot-2 byte-verify rides the next attended Pi bench.** The
+**✅ METAL-CONFIRMED (2026-07-14 attended Pi 4 bench; kernel at `main 2b7bd2d`, kernel8.img 703,952 B,
+img sha256 `10d1ade7…f1a0a935`, serial `pi-serial-2026-07-14-113721.log`): 3 cold boots with a GENUINE
+power-cut between each — `K4-write PASS [w=0x7f]` on every boot, boot-2 volume remounted CLEAN (no
+dirty-mount, no corruption: the journaled write survived a real power loss), full witness chain intact
+(23 PASS + K3-mount [w=0x1ff] + K1/K2/K3-revoke/IMG-SIG/FATDIRS/FATMOVE/K4-ready + F2/F3 locked
+240000/240000), 0 forbidden. Boot-2 U9/U10/U11/U6-grants showed only the DOCUMENTED stale-fixture
+signature (non-self-cleaning FAT fixtures on an un-re-prepped card) — not regressions. ⚠ Separate open
+watch-item ESCALATED at this bench: core 3 spin-table did NOT come online on any of the 3 cold boots
+(mbench 30/32, the CAPSTONE pair) — now build/size-correlated (up 4/4 on ≤524,232 B builds across 6
+archived logs 07-10..12; down on 589 KB and 704 KB) — the runbook names the a834b8f back-to-back bisect;
+orthogonal to K4 (all K/F/U witnesses pass on 3 cores; CAPSTONE 6/6 itself stands metal-confirmed from
+round-9).** The
 kernel's unafs mount becomes read-WRITE: `fs/unafs.rs`'s `SdSectorDevice::write_sector` now routes to
 the hardened block layer (`drivers::block::write_block` — emmc2 CMD24 + R1/CMD13 status checks), so the
 K3 `Io` stub is retired.
