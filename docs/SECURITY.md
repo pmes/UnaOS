@@ -22,9 +22,11 @@ Exposure classes, honestly stated:
 
 1. **Ring-0-resident parsers.** The network stack (Ethernet/ARP/IP/TCP/DHCP),
    USB descriptor parsing, the FAT reader, and (since UNAFS-K3, aarch64) the
-   unafs RO-mount parser (partition table / superblock / inode / catalog decode
+   unafs mount parser (partition table / superblock / inode / catalog decode
    in `fs/unafs.rs` + `libs/fs/unafs`) all parse attacker-influenceable bytes with
-   full kernel privilege. Until the privilege boundary exists everywhere, these
+   full kernel privilege. As of UNAFS-K4 the unafs mount is read-WRITE (the
+   kernel commits blocks to the medium through it — see the K4 write-path scope
+   at the bottom of this ledger). Until the privilege boundary exists everywhere, these
    are the practical attack surface, and they remain kernel-resident even after.
    The unafs parser joined on the same basis FAT shipped on, and is now the
    first of the four hardened against a crafted volume (BEFS-HARDEN,
@@ -301,6 +303,41 @@ already performs). That refactor is a separate, review-gated change; **WXN is no
 - [ ] USB: descriptor parsing bounds (config/interface/endpoint/HID report walks; hub paths)
 - [ ] FAT: BPB/dirent/FAT-chain bounds and loop guards (partially hardened during the read-only arc — re-verify and record)
 - [x] unafs RO mount (UNAFS-K3): bound every disk-derived size/count/offset vs volume geometry (superblock `bitmap_blocks`, inode `size`, extent arithmetic, codec lengths; `try_reserve` not `with_capacity`, size-limited decode) — **DONE (BEFS-HARDEN, 2026-07-13)**: `Superblock::validate` at the parse boundary; `try_reserve` on the bitmap load and `read_from_extents`; `checked_*` extent arithmetic + past-volume extent rejection; bounded bulk hole fill and free walks; checked spilled-extent sums on the query/get_attribute paths (the QSIM-flagged sites); two-tier bincode decode budgets (8 KiB block records / 4 MiB extent-backed records, pinned under the kernel heap by a regression test). 23 hostile-volume fixtures assert `Err`-not-panic (`libs/fs/unafs/tests/hostile_volume.rs`); golden format KATs byte-identical
+
+#### unafs kernel WRITES — the K4 write-path honest scope (UNAFS-K4, 2026-07-14, QEMU-green)
+
+The UNAFS-K3 mount became read-WRITE at K4: `fs/unafs.rs`'s `write_sector` routes to
+`drivers::block::write_block` (emmc2 CMD24 + R1/CMD13 status checks). Stated honestly:
+
+- **Coherence.** Writes make a per-call mount a corruption hazard — two live mounts hold two
+  independent in-RAM allocation bitmaps + journal cursors, so a block one frees the other can
+  re-hand-out. Closed structurally: exactly ONE process-wide, IRQ-masked mount (`with_unafs`,
+  the F3 `NAMESPACE`-lock discipline) is the sole path for read AND write, so there is one
+  authoritative in-RAM bitmap/journal and every operation is serialized. A pure read never
+  mutates, so it never triggers the crate's `Drop`-time metadata write-back — reads stay
+  genuinely read-only, even against a dirty volume.
+- **Torn-write safety is by ORDERING, not by journal replay.** The `libs/fs/unafs` WAL is
+  **intent-logging only**: it records BeginOp/EndOp markers to DETECT a torn transaction on the
+  next mount (a dirty warning), it does NOT store undo/redo data and there is NO replay or
+  rollback ("Log only for now"). Crash safety comes from the crate's per-mutation ordering
+  (new-extents-first, single-block metadata swap, free-last), so the failure mode of an ill-timed
+  power cut is a LEAK (allocated-but-unreachable blocks, reclaimable by a future fsck/scavenger
+  arc), never a dangling reference to a freed block. Recovery on a dirty mount does NOT write —
+  it warns — so a read-only consumer can still mount-and-warn safely.
+- **The 4096↔512 atomicity gap (residual, ledgered).** The crate's "single-block metadata swap
+  is the atomic point" holds only at its 4096 B block granularity. The medium is 512 B sectors,
+  and `BlockAdapter::write_block` is eight sequential, individually-non-atomic `write_sector`s,
+  so a power cut mid-block tears the 4096 B block across sector boundaries. The swap is therefore
+  truly atomic ONLY when the live record fits the FIRST 512 B sector (inode ≤ 512 B, directory
+  data ≤ 512 B) — true for small files/directories (the K4-write witness's case), NOT guaranteed
+  for a large inode or directory that spans multiple sectors. Closing this needs sector-level
+  journaling or a format change — deferred; the frozen on-disk format + KATs are LOCKED and were
+  NOT touched (the journal is partial *by design*, not a gap this arc fixes).
+- **Proof.** `:: K4-write: … PASS [w=0x7f] ::` (uncounted) — create + write a scratch file, force
+  a genuine remount (fresh in-RAM bitmap/journal re-read from disk), byte-verify the durable
+  write, delete, remount (delete durable), negative path, clean journal. Self-cleaning. Proven
+  under `kernel8-test` via `if=sd` write-back (the K2 M(e) same-image technique). The metal
+  write→REAL power-cycle→boot-2 byte-verify rides the next attended Pi bench (not attempted here).
 
 ### Process & supply chain
 - [ ] Adversarial review before metal and before merge on every arc (standing rule, `CLAUDE.md`)

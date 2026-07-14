@@ -8403,10 +8403,18 @@ pub fn u7_launcher(demo_cpu: usize) {
     // perturb the 23 fixtures or the witnesses), fully self-cleaning. Its own uncounted
     // `:: FATMOVE: … PASS ::` line. Unblocks a future jetson `mv` arc (JD10).
     fatmove_launcher();
-    // BeFS-K3: locate + mount the native unafs partition read-only off the live card and prove the
-    // superblock + the RO seam (write_sector refused). Read-only by construction — LAST is safe. Its
-    // own uncounted `:: K3-mount: … PASS ::` line; an honest skip on media without a unafs partition.
+    // BeFS-K3: locate + mount the native unafs partition off the live card and prove the superblock
+    // + the read paths (ls/cat byte-verified) + the write seam's bound-check. Read-only by
+    // construction — safe here. Its own uncounted `:: K3-mount: … PASS ::` line; an honest skip on
+    // media without a unafs partition.
     crate::fs::unafs::k3_mount_selftest();
+    // BeFS-K4: prove the kernel can WRITE the native unafs volume through the single coherent mount,
+    // and that the write SURVIVES a genuine remount (create+write -> remount -> byte-verify ->
+    // delete -> remount -> negative). Self-cleaning (create then delete + journal reset), so the
+    // card is left with only the staged K3 fixtures — runs AFTER k3_mount_selftest so its scratch
+    // create/delete never perturbs K3-mount's exact-two-entries `ls`. Its own uncounted
+    // `:: K4-write: … PASS ::` line; an honest skip on media without a unafs partition.
+    crate::fs::unafs::k4_write_selftest();
 }
 
 /// F2 M3 witness worker — the `demo_cpu` half of the cross-core FAT_MUTATION stress. `fn(usize)` for

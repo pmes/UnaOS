@@ -64,6 +64,13 @@ REQUIRE K3-revoke:.*durable-first PASS
 # --- x5 boots, kernel 1ccd00c) -> promoted to a hard REQUIRE at that capture. ------------------
 REQUIRE K3-mount:.*byte-verified PASS
 
+# --- UNAFS-K4 journaled kernel-write witness (uncounted): create + write a scratch file through the
+# --- single coherent mount, force a genuine remount, byte-verify the durable write, delete it, remount
+# --- (delete durable), negative path, clean journal. Self-cleaning (leaves only the staged K3 fixtures).
+# --- QEMU-proven via if=sd write-back; the metal write->power-cycle->boot-2 byte-verify rides Peter's bench.
+REQUIRE K4-write:.*clean-journal PASS
+FORBID K4-write:.*FAIL
+
 # --- K4-ready native-attr projection codec witness (uncounted). Pure in-RAM codec/selftest
 # --- (runs every boot, no card needed) — METAL-CONFIRMED present 2026-07-12, now REQUIRE. -----
 REQUIRE K4-ready:.*prefix\) PASS

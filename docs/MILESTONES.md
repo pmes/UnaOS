@@ -126,6 +126,50 @@ managed units by kind) and real per-unit **Crystal Color** (Green/Amber/Red).
   `tempfile` dev-dep); zero `unaos/` diff. SYNC/SNAP are RITES-2; UnaFS-native versioning is the
   Destiny (behind UNAFS-F1).
 
+## Pi 4 — UNAFS-K4 (BeFS-K4: journaled kernel WRITES on the native unafs volume) — 2026-07-14 🔬 `hw-pi4`
+
+**QEMU-green; metal write→power-cycle→boot-2 byte-verify rides the next attended Pi bench.** The
+kernel's unafs mount becomes read-WRITE: `fs/unafs.rs`'s `SdSectorDevice::write_sector` now routes to
+the hardened block layer (`drivers::block::write_block` — emmc2 CMD24 + R1/CMD13 status checks), so the
+K3 `Io` stub is retired.
+
+- **M1 — the coherence keystone (the core of the arc).** K3 mounted per call, which is safe only while
+  the volume is immutable. Writes make a per-call mount a corruption hazard: two live mounts hold two
+  independent in-RAM allocation bitmaps + journal cursors, so a block one frees the other can
+  re-hand-out. Every unafs access — read AND write — now flows through a single, process-wide,
+  IRQ-masked mount (`with_unafs`, modelled on the F3 `NAMESPACE` lock): one authoritative in-RAM
+  bitmap/journal, all operations serialized. Keeping one mount live also means a pure read
+  (`uls`/`ucat`/`K3-mount`) never fires the crate's `Drop`-time `sync_metadata` write-back — reads stay
+  genuinely read-only. `force_remount` drops the cached instance so the next access re-reads the volume
+  from disk (the durability-proof primitive).
+- **M2 — journal audit + honest torn-write scope.** The `libs/fs/unafs` WAL is **intent-logging only**
+  (BeginOp/EndOp markers → dirty detection on the next mount; NO undo/redo, NO replay or rollback —
+  "Log only for now"). Crash safety therefore comes from write ORDERING inside the crate
+  (new-extents-first, single-block metadata swap, free-last → a power cut LEAKS blocks, never dangles a
+  reference), not from the journal. The crate's "single-block swap is atomic" claim holds at its 4096 B
+  block granularity, but the medium writes 512 B sectors: one `write_block` is eight non-atomic
+  `write_sector`s, so a swap is truly atomic only when the live record fits the first 512 B sector.
+  **No `libs/fs/unafs` change** — the audit found the journal partial *by design*, not a gap; the frozen
+  format + KATs stay byte-identical. Recovery on a dirty mount does not write (it warns), so a RO
+  consumer can still mount-and-warn. Full scope in `SECURITY.md` §K4.
+- **M3 — shell write verbs + witness.** `utouch`/`uwrite`/`umkdir`/`urm` (write-through, durable;
+  absolute case-sensitive paths, no shell cwd) route through `with_unafs`. Uncounted `:: K4-write: …
+  PASS [w=0x7f] ::` witness: create+write `/K4TEST.TXT` → force a genuine remount → byte-verify the
+  durable write → delete → remount (delete durable) → negative path → clean journal. Self-cleaning
+  (create then delete + journal-head reset), so the volume is left with only the staged K3 fixtures —
+  the `if=sd` write-back makes the remount proof real (the K2 M(e) same-image technique). `k3_mount_selftest`
+  reworked: its read path now runs through `with_unafs`, and bit4 no longer writes to `base_lba` (with a
+  live write path that would have zeroed the superblock) — it now proves the write seam is bound-checked
+  (an out-of-range LBA is refused).
+- **Gate ALL GREEN:** `check` both arches; `kernel8`; `kernel8-test` mbench **32/32 required witnesses,
+  0 forbidden** (23 fixture PASS + CAPSTONE 6/6 byte-equivalent + `K3-mount PASS [w=0x1ff]` +
+  `K4-write PASS [w=0x7f]` + F2/F3 locked 240000/240000 + K1/K2/K3/IMG-SIG/FATDIRS/FATMOVE/K4-ready), no
+  dirty-mount warning; `test-arm` MISSION SUCCESS; unafs host tests green (kat_vectors 8/8 + hostile_volume
+  23/23 + all suites — **KATs untouched**). Zero x86 (the module + dep are aarch64-only). Lane:
+  `fs/unafs.rs`, `shell.rs` unafs-verb region, `arch/aarch64/syscall.rs` witness tail, `pi4-regression.spec`.
+- **Metal rider (separate, attended — Peter):** write on silicon → REAL power-cycle → boot 2 byte-verifies
+  the write survived (the K2 two-boot idiom, now for data). Not attempted here (split mode).
+
 ## Pi 4 — UNAFS-K3 (BeFS-K3: kernel read-only mount of a native unafs volume) — 2026-07-12 ✅ `hw-pi4`
 
 **✅ METAL-CONFIRMED (2026-07-12 attended evening bench, real Pi 4, reflashed card with the unafs
