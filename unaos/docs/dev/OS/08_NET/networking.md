@@ -340,16 +340,19 @@ slot (`NSOCK + 1`) for a **kernel-internal** DHCP socket that is **never recorde
 never counts against ring-3 socket allocation (`stack_open*` still sees exactly `NSOCK` slots) and no
 `free_row_sockets`/`stack_close` ever touches it. `SmolStack` gains a `dhcp: Option<SocketHandle>`.
 
-`ensure_stack` now builds the interface with **no static address and no default route**, adds the
-`dhcpv4::Socket`, and calls `configure_via_dhcp` **once**, right after the build, from the same
-large-stack context that already builds the stack (the boot launcher / BSP witness) — so its bounded
-poll pump never lands on a ring-3 syscall stack. `configure_via_dhcp` pumps the interface until the DHCP
-socket emits `Event::Configured` (`DISCOVER → OFFER → REQUEST → ACK`), then applies the leased
-`address` (CIDR) and `router` (default gateway) to the interface. It is **iteration-bounded**
-(`DHCP_PUMP`, clock-free like every other pump); on a silent server it **falls back to the static
-`hw_addr` lease + slirp gateway**, so the SOCK-1/2/3/4 witnesses keep a configured interface either
-way. Everything stays **static / BSS** — the `dhcpv4::Socket` carries its own fixed internal storage,
-no heap.
+`ensure_stack` builds the interface **with the static `hw_addr` lease + slirp gateway applied at
+build** (via `apply_ipv4_config`, the one config surface) and adds the `dhcpv4::Socket` — so ANY
+first-touch, including a lazy ring-3 `sys_socket` on a boot where no launcher pre-built the stack,
+yields a configured, working interface with no pump under the lock. The acquisition itself,
+`dhcp_acquire`, runs **only from `init()`** (the large-stack boot path) and is one-shot
+(`DHCP_ATTEMPTED`): it pumps the interface until the DHCP socket emits `Event::Configured`
+(`DISCOVER → OFFER → REQUEST → ACK`), **releasing the `STACK` lock every `TCP_CHUNK` iterations**
+(the same SOCK-2-review lock-release discipline the TCP connect pump follows — the review fix: the
+original landing held the lock, IF-masked, for the whole budget), then REPLACES the static config
+with the leased `address` (CIDR) and `router` (default gateway). It is **iteration-bounded**
+(`DHCP_PUMP`, clock-free like every other pump); on a silent server the build-time **static config
+simply stands**, so the SOCK-1/2/3/4 witnesses keep a configured interface either way. Everything
+stays **static / BSS** — the `dhcpv4::Socket` carries its own fixed internal storage, no heap.
 
 ### The witness
 
