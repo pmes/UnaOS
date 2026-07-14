@@ -44,7 +44,7 @@ checks; `Context::new` is the public entry point that wraps it.
 
 Elessar is one of the shared libraries in `libs/`, alongside `gneiss_pal`
 (platform abstraction), `bandy` (the `SMessage`/`Synapse` message bus), and
-`quartzite` (the GUI layer). Vessels in `apps/` use Elessar to identify the
+`quartzite` (the GUI layer). Vessels in `vessels/` use Elessar to identify the
 workspace they have been pointed at; the resulting `Spline` informs how the
 workspace is assembled and rendered. See
 [`docs/dev/USERLAND/ARCHITECTURE.md`](../../docs/dev/USERLAND/ARCHITECTURE.md)

@@ -62,7 +62,7 @@ charter ("The Block": forensic disk/partition recovery, explicitly *not* a durab
   (`inspect`/`image`/`search`/`extract`/`wipe`, which survived the drift on-charter) is its sole
   surface. Its `unafs`/`bandy`/`anyhow`/`tokio` dependencies (actor-only) were dropped; README
   restored to the forensic-recovery charter.
-- **Consumer rewire:** Lumen's boot (`apps/lumen/src/main.rs`) now ignites `vein::vault::ignite`
+- **Consumer rewire:** Lumen's boot (`vessels/lumen/src/main.rs`) now ignites `vein::vault::ignite`
   instead of `amber_bytes::ignite`; the `amber_bytes` path dependency was removed from Lumen. The
   live durable-memory seam (Lumen → the vault serving engrams) is preserved.
 

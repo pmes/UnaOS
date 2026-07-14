@@ -4,7 +4,7 @@ A command-line self-verification tool for the UnaOS repository.
 
 ## Overview
 
-Sentinel is a CLI vessel (`apps/cli/sentinel`) that audits the integrity of a
+Sentinel is a CLI vessel (`tools/sentinel`) that audits the integrity of a
 UnaOS checkout in a single pass. It confirms that the working tree is in fact a
 UnaOS workspace, that the project manifest matches what is on disk, that the
 on-disk filesystem image is well-formed, and that the full source tree can be
@@ -60,7 +60,7 @@ handling), and `colored` / `directories`.
 
 ## How it fits into UnaOS
 
-Sentinel is one of the command-line vessels under `apps/cli/` described in the
+Sentinel is one of the command-line vessels under `tools/` described in the
 [userspace architecture](../../../docs/dev/USERLAND/ARCHITECTURE.md). Unlike GUI
 vessels such as Lumen, it does not start a Tokio runtime, the Bandy message bus
 (`SMessage` / `Synapse`), or a Quartzite window; it composes only the storage

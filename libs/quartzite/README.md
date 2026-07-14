@@ -68,7 +68,7 @@ The selection is driven by `target_os` and Cargo features (`gtk`, `gnome`, `qt`,
 ## How it fits into UnaOS
 
 Quartzite is one of the userspace libraries under `libs/`. Vessels (the
-executables in `apps/`, e.g. `lumen`) compose a Tokio runtime, the Bandy bus,
+executables in `vessels/`, e.g. `lumen`) compose a Tokio runtime, the Bandy bus,
 and a set of handlers, then call `Backend::new(...).run()` to present the
 window. The same workspace can in principle be compiled per host, which keeps
 the API honest against mature toolkits before it is implemented on bare metal.

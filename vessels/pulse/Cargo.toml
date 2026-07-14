@@ -1,5 +1,5 @@
 # =====================================================================
-# CRATE: apps/pulse/Cargo.toml
+# CRATE: vessels/pulse/Cargo.toml
 # DESCRIPTION: The System Monitor. Per-core CPU pulse, BeOS-Pulse style.
 # =====================================================================
 

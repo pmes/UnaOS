@@ -20,15 +20,15 @@ members = [
     "handlers/amber_bytes",
     "handlers/stria",
     # "handlers/vug",
-    "apps/cli/vertex",
-    "apps/cli/unafs",
-    "apps/cli/unafs_bench",
-    "apps/cli/sentinel",
-    "apps/lumen",
-    "apps/pulse",
-    "apps/phonolite",
-    "apps/facet",
-    # "apps/una",   # PARKED — IDE vessel; excluded during GUI-API consolidation
+    "tools/vertex",
+    "tools/unafs",
+    "tools/unafs_bench",
+    "tools/sentinel",
+    "vessels/lumen",
+    "vessels/pulse",
+    "vessels/phonolite",
+    "vessels/facet",
+    # "vessels/una",   # PARKED — IDE vessel; excluded during GUI-API consolidation
     "libs/lux"
 ]
 
@@ -36,13 +36,13 @@ members = [
 # By default, a bare `cargo build` will ONLY build our host-native tools and their dependencies.
 # It will automatically target Mac (aarch64-apple-darwin).
 default-members = [
-    "apps/lumen",
-    "apps/pulse",
-    "apps/phonolite",
-    "apps/facet",
-    # "apps/una",   # PARKED — see GUI-API consolidation
-    "apps/cli/vertex",
-    "apps/cli/unafs",
-    "apps/cli/unafs_bench",
-    "apps/cli/sentinel"
+    "vessels/lumen",
+    "vessels/pulse",
+    "vessels/phonolite",
+    "vessels/facet",
+    # "vessels/una",   # PARKED — see GUI-API consolidation
+    "tools/vertex",
+    "tools/unafs",
+    "tools/unafs_bench",
+    "tools/sentinel"
 ]

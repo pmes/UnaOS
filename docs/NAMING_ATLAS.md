@@ -10,7 +10,7 @@ a joke could cost a debugging session.
 Compiled from `docs/CODEX.md`, `MEMORIA.md`, `README.md`, `docs/CREDITS.md`,
 `docs/MANIFESTO/*`, `docs/dev/VECTORS_DIRECTIVE.md` and
 `docs/dev/AXIOM_DIRECTIVE.md`, `docs/shard_notes/*`, `unaos/README.md`, and the
-READMEs of every crate under `libs/`, `handlers/`, `apps/`, and `apps/cli/`.
+READMEs of every crate under `libs/`, `handlers/`, `vessels/`, and `tools/`.
 
 ## Ring 0 vs. Ring 3
 

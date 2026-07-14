@@ -6,7 +6,7 @@ several sessions can work in parallel without stepping on each other.
 ## Layout & builds
 
 - Monorepo, two layers: **Ring 0** kernel under `unaos/` (x86_64 + aarch64);
-  **Ring 3** host-native userspace at the root (`libs/`, `handlers/`, `apps/`).
+  **Ring 3** host-native userspace at the root (`libs/`, `handlers/`, `vessels/`, `tools/`).
 - Kernel builds/runs via `unaos/arroyo`: `check` (type-check both arches),
   `test` / `test-arm` (headless QEMU, serial → `target/serial*.log`),
   `x86` / `arm` (QEMU GUI), `esp-x86` / `esp-arm` (metal boot media),

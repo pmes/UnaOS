@@ -576,7 +576,7 @@ fn draw_meters(pal: &mut TargetPal, m: &RenderStats, cpu: &CpuPulse, h: i32) {
 }
 
 /// UI1-M3 — `pulse`: the full-screen system monitor (a BeOS Pulse homage) — the in-kernel half of
-/// the pulse ask (a host-native `apps/pulse` vessel is a separate arc). Big per-core segmented
+/// the pulse ask (a host-native `vessels/pulse` vessel is a separate arc). Big per-core segmented
 /// pulse bars (the M2 widget, larger) plus the honest system lines available today: core count,
 /// uptime, frame/present time while the view is open.
 ///

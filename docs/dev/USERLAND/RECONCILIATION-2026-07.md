@@ -102,7 +102,10 @@ and wrapped with host I/O by the userspace `libs/fs/unafs`.
 
 ## Corrections list (each an arc; none executed yet)
 
-1. **`apps/` split** → `vessels/` + `kits/` + `tools/` per the map above.
+1. **`apps/` split** → `vessels/` + `kits/` + `tools/` per the map above. **Executed**
+   (`us-apps-split`): the vessels moved to `vessels/`, the CLI tools to `tools/`, `kits/`
+   scaffolded with a charter README, and all workspace members, path dependencies, and doc
+   references updated.
 2. **junct purge** — the `cpal` + `resonance` audio code in `handlers/junct` is confirmed
    bot hallucination (The Receiver was never implemented; a comms handler has no business
    with microphone deps). Archaeology (who/when), then delete; junct returns to a clean

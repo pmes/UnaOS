@@ -69,7 +69,7 @@ API. The notable definitions are:
 
 ## How it fits into UnaOS
 
-Vertex is one of the command-line vessels under `apps/cli/` described in the
+Vertex is one of the command-line vessels under `tools/` described in the
 [userspace architecture](../../../docs/dev/USERLAND/ARCHITECTURE.md). Unlike a
 GUI vessel such as Lumen, it does not compose handlers or run on the Bandy
 message bus (`SMessage` / `Synapse`); it is a self-contained utility that emits a

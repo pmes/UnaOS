@@ -16,7 +16,7 @@
 
 //! `stria` — the Studio handler: the resonance engine as a bus-driven service.
 //!
-//! Where `apps/phonolite` gives the engine a face, stria gives it a *nerve
+//! Where `vessels/phonolite` gives the engine a face, stria gives it a *nerve
 //! ending*. It owns the whole engine lifecycle — build the graph, open the
 //! device, keep the stream alive — and integrates it with the rest of UnaOS
 //! over the [`bandy`] Synapse: it publishes the engine's output level as

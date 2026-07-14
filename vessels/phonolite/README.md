@@ -70,7 +70,7 @@ checks.
 
 ## How it fits into UnaOS
 
-Phonolite is one of the vessels under `apps/`, alongside `lumen` (the
+Phonolite is one of the vessels under `vessels/`, alongside `lumen` (the
 reference GUI vessel) and `pulse` (the system monitor whose scaffold and meter
 idioms this vessel reuses). Domain logic does not live in the vessel: sound
 lives in resonance, controls live in quartzite's `tone_panel`, and the level

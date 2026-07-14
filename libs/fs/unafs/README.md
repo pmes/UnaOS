@@ -68,7 +68,7 @@ observe filesystem activity over the message bus.
 [`docs/dev/USERLAND/ARCHITECTURE.md`](../../docs/dev/USERLAND/ARCHITECTURE.md)).
 It is the storage and indexing foundation referenced as the "UnaFS client" in
 the system canon ([`docs/CODEX.md`](../../docs/CODEX.md)); the `amber_bytes`
-handler and the `apps/cli/unafs` vessel build on it, and attribute changes are
+handler and the `tools/unafs` vessel build on it, and attribute changes are
 surfaced to other handlers through Bandy (`SMessage` / `Synapse`).
 
 ## Status
