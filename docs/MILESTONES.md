@@ -274,6 +274,38 @@ Spec promotions committed here; the granular arc detail is in each arc's own ent
 
 ---
 
+## hw-jetson track — 2026-07-14 (JD15 — `-f` tree-replace for `cp -r`/`mv`)
+
+### JD15 — `-f` tree-replace: forced replace of an existing directory-TREE destination (`shell.rs`-only, call-never-edit) ⏳ attended-pending
+- **Why:** JD14 bounded `-f` to a single FILE dest — an existing directory tree stayed `-EEXIST` (`cp -r`) or
+  `-EISDIR` (`mv -f`), and the operator had to `rm -r` it first. JD15 closes the last flag-family gap:
+  `cp -rf` and `mv -f` now REPLACE an existing directory-tree destination, so the forced verbs behave
+  uniformly whether the destination is a file or a whole subtree.
+- **How (call-never-edit, no `fat.rs` change):** a new `force_remove_existing` helper deletes whatever
+  occupies the destination (a FILE via `locate_in_dir` + `delete_located`; a DIRECTORY via the JD13 `rm_tree`
+  to empty it, then `remove_dir`), then the caller proceeds down its normal fresh-destination path — `cp -rf`
+  builds the fresh tree; `mv -f` relinks (`rename_entry`/`move_entry`) into the freed slot. Composes only
+  existing primitives.
+- **Semantics:** no-clobber stays the panel DEFAULT — only `-f` opts in. `-n` unchanged; plain `-f` on a FILE
+  dest unchanged; a directory dest WITHOUT `-f` still `-EEXIST` (`cp -r`) / lands the source inside it (`mv`
+  copy-into idiom). The JD9 self/subtree refusal, the `mv` dir-across-parents refusal (surfaced BEFORE any
+  delete-dst-first), and the `cp -rf /` / `rm -rf /` root footgun refusals all stand.
+- **⚠ Crash-safe-PARTIAL (the JD13 honest-count discipline):** the destination is deleted BEFORE the fresh
+  copy/move, so a power cut in the delete→recreate window leaves the destination ABSENT — never
+  half-overwritten or silently merged. No rollback; re-run `cp -rf`/`mv -f` to complete. `-f` tree-replace
+  deliberately trades the plain `-EEXIST`/`-EISDIR` refusal for this bounded, honest destructive window.
+- **Tested (QEMU):** `check` + `UNAOS_TEGRA=1 check` green both arches (no new warnings — only the pre-existing
+  `shutdown` double-`hlt_loop`); `test-arm 22` MISSION; `UNAOS_GICV3=1 test-arm 40` CAPSTONE 6/6;
+  `UNAOS_HUBSTORAGE=1 test 25` MISSION. Zero x86 behavioural change. No `kernel8-test` on the jetson side. As
+  in JD2–JD14 the shell command path is not headless-reachable (keystroke-driven, tegra-only), so the
+  regression suite proves no breakage and the new behaviour is exercised by the `jd15-bench.md` attended card.
+  Lane: only `shell.rs` (fat.rs/console.rs/main.rs/NET arms/unafs verbs untouched).
+- **Metal:** ⏳ **attended-pending** — pairs cleanly with any next Orin bench (`jd15-bench.md` builds a tree
+  with an existing tree destination, exercises `cp -rf` / `mv -f` replace, and power-cycles for the
+  crash-safe-partial durability check).
+- **Detail:** [`arch_arm64.md` §JD15](dev/OS/01_BOOT_HAL/arch_arm64.md). **Commit:** on `hw-jetson` (the seat
+  assigns the integration hash at merge).
+
 ## hw-jetson track — 2026-07-14 (JD14 — `-f`/`-n` flag family for `cp`/`mv`/`rm`)
 
 ### JD14 — `-f`/force + `-n`/no-clobber flags for `cp`/`mv`/`rm` (`shell.rs`-only, call-never-edit) ✅ metal-confirmed 2026-07-14 `hw-jetson`
