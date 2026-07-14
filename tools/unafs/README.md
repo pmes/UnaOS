@@ -6,7 +6,7 @@ macOS or Linux.
 
 ## Responsibilities
 
-`unafs` is a thin executable (`apps/cli/unafs`, binary name `unafs`) that drives
+`unafs` is a thin executable (`tools/unafs`, binary name `unafs`) that drives
 the [`unafs`](../../../libs/fs/unafs) library against a single vault image file. A
 vault is a self-contained UnaFS volume — an inode-based filesystem that also
 stores semantic attributes and supports content queries. The CLI exposes that
@@ -52,7 +52,7 @@ The binary is built on three crates:
 
 ## Fit within UnaOS
 
-`unafs` is a CLI vessel under `apps/cli/`. Per the
+`unafs` is a CLI vessel under `tools/`. Per the
 [userspace architecture](../../../docs/dev/USERLAND/ARCHITECTURE.md), vessels are
 the executables a user runs; this one composes the `unafs` storage library with
 the `bandy` bus rather than the Quartzite GUI. It is the host-side operator

@@ -139,7 +139,7 @@ row and the full-screen `pulse` view. Per ~200 ms window, per core:
 ## 4b. `pulse` — the full-screen system monitor (UI-1 M3)
 
 `pulse` (shell command; `vug::run_pulse`) is the in-kernel half of the BeOS
-Pulse homage — a full-screen monitor view (a host-native `apps/pulse` vessel is
+Pulse homage — a full-screen monitor view (a host-native `vessels/pulse` vessel is
 a separate, future arc). It shows the M2 pulse widget **larger** (double-size
 segments, one row per core, with the load percent), plus the honest system
 lines available today: core count, uptime (`arch::ms()`), live frame counter,

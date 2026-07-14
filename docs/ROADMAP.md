@@ -73,7 +73,7 @@ the shared userspace port.
 | :--- | :--- | :--- |
 | **STOR-1** | Interrupt-driven x86 storage: a scheduled IF=1 service task owns the xHCI BOT pump; syscalls submit a block request + block on a per-request semaphore. Read/write/grow/create/delete synchronous in-syscall, behind the `irqstorage` knob. S1–S4 landed; core transfer-IRQ mechanism metal-confirmed. Next: S5 real shared backing for cross-process opens | rmbp |
 | **K1+K2** | Reboot-surviving ACL: the U6 owner/grants persist to an on-disk `UNAFS.ATR` file (kernel-stamped `PrincipalRecord`, volume-fingerprint bound). Foundation + persistence landed (K1); **K2 turned cross-reboot enforcement LIVE** — three distinct launchable named programs on the card, the gate flipped, grow-repersist, and an end-to-end proof through REAL programs (`K2OWN.BIN` re-admitted by name after rebuild, `K2IMP.BIN` denied). **✅ METAL-CONFIRMED on real Pi 4 (2026-07-11): one-boot MBENCH 25/25, and a genuine two-boot power-cycle (`UNAOS_K2_LEAVE`) — the owned file's ACL survived a real power-cut and was enforced on the next boot** | pi4 |
-| **UI/gfx** | Scale-aware UI metrics (no absolute pixel sizes), the in-kernel `pulse` monitor + `apps/pulse` host vessel, the `vug` software-rendered crystal engine, and the fbcon cached-RAM shadow that kills the uncached-VRAM scroll on x86 | rmbp/ux |
+| **UI/gfx** | Scale-aware UI metrics (no absolute pixel sizes), the in-kernel `pulse` monitor + `vessels/pulse` host vessel, the `vug` software-rendered crystal engine, and the fbcon cached-RAM shadow that kills the uncached-VRAM scroll on x86 | rmbp/ux |
 
 ## 1b. Networking: sockets on the mature stack (direction, 2026-07-12)
 
@@ -146,7 +146,7 @@ G-code to hardware. Sequenced routes:
 ## 3a. The creative lane (host-native A/V userspace)
 
 The audio and image/video half of userspace: `libs/resonance` + `handlers/stria`
-(audio), `libs/lux` + `apps/facet` (image). Host-native only — zero kernel scope;
+(audio), `libs/lux` + `vessels/facet` (image). Host-native only — zero kernel scope;
 the kernel-side audio gap (x86 HDA, Pi HDMI/PWM) remains §6's separate row.
 Direction set 2026-07-11 (dedicated A/V design session, ground-truthed on the Mac).
 
@@ -165,10 +165,10 @@ vessel can exist.
 
 | Arc | Content | Review tier |
 | :--- | :--- | :--- |
-| **AV-A1 phonolite** ✅ landed 2026-07-11 (`us-phonolite`; ear-witness attended-pending) | Make resonance honest (device sample rate into the graph, live command path, gain param, stop, nameable control handle, level readback) + the `apps/phonolite` tone vessel on the pulse pattern — start/stop, frequency/gain sliders (quartzite's first input-control idiom), level meter. Ear-witness gate: post-fix tone matches a 440 reference; pitch changes live | 2-lens |
+| **AV-A1 phonolite** ✅ landed 2026-07-11 (`us-phonolite`; ear-witness attended-pending) | Make resonance honest (device sample rate into the graph, live command path, gain param, stop, nameable control handle, level readback) + the `vessels/phonolite` tone vessel on the pulse pattern — start/stop, frequency/gain sliders (quartzite's first input-control idiom), level meter. Ear-witness gate: post-fix tone matches a 440 reference; pitch changes live | 2-lens |
 | **AV-A2 stria** ✅ landed 2026-07-11 (`us-stria`) | Rewrote stria as a real bus-driven handler around the finished engine: `StriaHandler::ignite(synapse)` owns the graph + engine lifecycle, a real `BandyMember` publishes `SMessage::Spectrum` level beats (and `AudioChunk` frames) on the Synapse, and a single-owner control task drives frequency/gain/running-state respecting the stop/start ordering contract; vestigial `gneiss_pal::WaylandApp` skeleton retired (crate is now a library). Folds the AV-A1 review notes on ordering, no-re-entry, and liveness-desync | 2-lens |
 | **LUX-1** ✅ landed 2026-07-11 (`us-lux1`) | Common-format decode via `png` + `zune-jpeg` feeding `RgbBuffer`: `decode`/`sniff_format` dispatch on magic bytes, PNG (palette/grayscale/16-bit normalized, alpha dropped) and JPEG (forced RGB) both converted sRGB→linear to honor the linear-`RgbBuffer` contract; tiny committed fixtures + round-trip/fail-closed tests. Fenced the ARW path: tag-named dimensions bounded (`≤ 512 MP`, non-zero) before any allocation, plus fail-closed tests on garbage input | 2-lens |
-| **FACET-1** ✅ landed + merged 2026-07-12 (`main`; eye-witness passed) | The `apps/facet` viewer vessel on the pulse/phonolite single-view idiom: `facet <image>` reads a file, decodes via `lux` (`decode` dispatch on magic bytes), packs the linear `RgbBuffer` through the sRGB OETF to 8-bit RGBA, and shows it aspect-fit/centered in a quartzite window via a new additive `platforms::macos::image_view` module (CPU blit through `NSBitmapImageRep`, tagged sRGB for color-managed display; rescales with the window) | direct read |
+| **FACET-1** ✅ landed + merged 2026-07-12 (`main`; eye-witness passed) | The `vessels/facet` viewer vessel on the pulse/phonolite single-view idiom: `facet <image>` reads a file, decodes via `lux` (`decode` dispatch on magic bytes), packs the linear `RgbBuffer` through the sRGB OETF to 8-bit RGBA, and shows it aspect-fit/centered in a quartzite window via a new additive `platforms::macos::image_view` module (CPU blit through `NSBitmapImageRep`, tagged sRGB for color-managed display; rescales with the window) | direct read |
 | **FACET-2** ✅ landed 2026-07-12 (`us-facet2`; eye-witness attended-pending) | Interaction for the viewer: `FacetImageView` gains a zoom/pan transform and handles its own pointer input directly on the `NSView` (quartzite's first pointer idiom, the twin of tone_panel's control idiom) — scroll-wheel / trackpad-pinch **zoom about the cursor**, click-drag **pan**, `0`/`f` **reset-to-fit**, and a live **pixel readout** overlay (`NSTrackingArea` mouse-move → source pixel coords + packed 8-bit sRGB in decimal/hex + the source linear RGB `lux` decoded). Still an additive extension of `image_view` — `NSEvent`/`NSTrackingArea` reached via `class!`+`msg_send!`, quartzite `Cargo.toml` zero-diff. Euclase textured-quad (GPU) path is the remaining later arc | 2-lens |
 
 Policy decided: external decoder crates are in-bounds for lux (hand-rolling PNG/JPEG
@@ -208,7 +208,7 @@ Principles, in force for every arc that touches this seam:
    first-class: unregister vein and everything still works, with every action
    principal-attributed and ACL-checked.
 5. **Elessar is the declarative source of truth.** A workspace (with principia
-   settings) *exports* to platform apps — `apps/una` on macOS today; on-UnaOS
+   settings) *exports* to platform apps — `vessels/una` on macOS today; on-UnaOS
    midden+vug is just another export target once the bus runs there. "Shed the
    weight of apps": the desktop becomes a scene of live capabilities viewed
    over the bus, not a window manager for monoliths.

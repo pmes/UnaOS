@@ -87,9 +87,9 @@ rather than bundling one monolithic feature set. There is no app grid — the us
 is *anarchy, not total chaos*: no imposed hierarchy, order emerging from composition,
 with principia as the law everyone reads and helm as the one authority over consequences.
 
-> **Migration note (2026-07).** On disk, the vessels and the CLI tools still live under
-> `apps/` — the pre-reconciliation layout. The adopted map is `vessels/` + `kits/` +
-> `tools/` (see RECONCILIATION-2026-07 §directory map); the moves are pending arcs.
+> **Migration note (2026-07).** The `apps/` split (correction 1) is executed: source
+> vessels now live under `vessels/`, the command-line tools under `tools/`, and `kits/`
+> holds the elessar-workspace snapshots (see RECONCILIATION-2026-07 §directory map).
 
 ### Libraries (`libs/` and `unaos/libs/`)
 
@@ -255,7 +255,7 @@ topology and republishes `MatrixEvent::TopologyMutated` when the tree changes.
 | Facet vessel (image viewer) | Implemented (macOS backend; FACET-2 zoom/pan/readout; euclase GPU path) |
 | Una vessel (IDE) | Parked |
 | Elessar snapshot / kit / vessel-compile pipeline | Not implemented (detection seed only) |
-| `vessels/` + `kits/` + `tools/` directory migration | Adopted, pending arcs (still `apps/` on disk) |
+| `vessels/` + `kits/` + `tools/` directory migration | Executed (correction 1; `vessels/`, `tools/`, `kits/` on disk) |
 | `libs/views/` chat-view extraction | Adopted, pending arc |
 | helm handler + `unaos/libs/sys/helm/` move | Adopted, pending arcs (core currently at `libs/drive`) |
 
@@ -265,4 +265,4 @@ topology and republishes `MatrixEvent::TopologyMutated` when the tree changes.
 - [`docs/CODEX.md`](../../CODEX.md) — the system canon and full handler manifest.
 - [`RECONCILIATION-2026-07.md`](RECONCILIATION-2026-07.md) — the decision record behind this model.
 - [`docs/dev/OS/`](../OS) — kernel subsystem documentation.
-- Per-crate `README.md` files under `libs/`, `handlers/`, and (pending migration) `apps/`.
+- Per-crate `README.md` files under `libs/`, `handlers/`, `vessels/`, and `tools/`.

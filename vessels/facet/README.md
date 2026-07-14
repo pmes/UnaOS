@@ -62,13 +62,13 @@ Facet exposes no Rust API yet. As a vessel it is expected to follow the
 established pattern: a `main` that constructs a `Synapse`, bootstraps a
 `WorkspaceState` through `Spline::bootstrap`, and runs the Quartzite
 `Backend::run` event loop — mirroring the `lumen` vessel
-([`apps/lumen`](../lumen)).
+([`vessels/lumen`](../lumen)).
 
 ## How it fits into UnaOS
 
-Facet is one of the vessels under `apps/`, alongside `pulse` and `phonolite`
+Facet is one of the vessels under `vessels/`, alongside `pulse` and `phonolite`
 (the two other single-view vessels it copies), `lumen` (the reference GUI
-vessel) and the `apps/cli/*` tools. It does not own image infrastructure; that
+vessel) and the `tools/*` tools. It does not own image infrastructure; that
 lives in the shared libraries (`lux`, `euclase`) so capabilities are not
 duplicated across vessels. See
 [`docs/dev/USERLAND/ARCHITECTURE.md`](../../docs/dev/USERLAND/ARCHITECTURE.md)

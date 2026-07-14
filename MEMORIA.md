@@ -62,13 +62,13 @@
 *   **[SHELL] `handlers/xenolith`:** VM/Hypervisor.
 *   **[SHELL] `handlers/zircon`:** Project Timer.
 
-### 3. THE VESSELS (`apps/`)
-*   **[BIN] `apps/una`:** The IDE (Code-First).
-*   **[BIN] `apps/lumen`:** The Companion (AI-First).
-*   **[BIN] `apps/cli/unafs`:** The Operator (Host-to-Vault Bridge).
-*   **[BIN] `apps/cli/vertex`:** The Identity CLI.
-*   **[BIN] `apps/cli/sentinel`:** The Guardian (Self-Verification Agent).
-*   **[SHELL] `apps/facet`:** Image Viewing/Editing.
+### 3. THE VESSELS (`vessels/`)
+*   **[BIN] `vessels/una`:** The IDE (Code-First).
+*   **[BIN] `vessels/lumen`:** The Companion (AI-First).
+*   **[BIN] `tools/unafs`:** The Operator (Host-to-Vault Bridge).
+*   **[BIN] `tools/vertex`:** The Identity CLI.
+*   **[BIN] `tools/sentinel`:** The Guardian (Self-Verification Agent).
+*   **[SHELL] `vessels/facet`:** Image Viewing/Editing.
 
 ## ⚡ ACTIVE DIRECTIVES
 1.  **D-045:** Elessar Integration.
@@ -83,6 +83,6 @@
 *   **2026-06-26:** Retired the Quartzite JSON-DSL detour; restored the real multi-platform GUI API (`Backend` / `Spline`).
 *   **2026-06-26:** Merged the three kernel tracks (USB+SMP / network / video) onto `c01-int_combined`; verified booting together, both arches green.
 *   **2026-02-18:** Enforced `SMessage` as Monolithic Enum.
-*   **2026-02-18:** Established `apps/cli/unafs` as the Host-to-Vault bridge.
+*   **2026-02-18:** Established `tools/unafs` as the Host-to-Vault bridge.
 *   **2026-02-18:** Added `libs/elessar` to the Trinity.
 *   **2026-02-18:** **Transitioned Graphics Backend from OpenGL to `wgpu`.**

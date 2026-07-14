@@ -1,5 +1,5 @@
 # =====================================================================
-# CRATE: apps/facet/Cargo.toml
+# CRATE: vessels/facet/Cargo.toml
 # DESCRIPTION: The Image Vessel. A decoded picture given a window:
 #              open a file, decode via lux, present it on screen.
 # =====================================================================

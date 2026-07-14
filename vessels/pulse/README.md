@@ -60,7 +60,7 @@ checks.
 
 ## How it fits into UnaOS
 
-Pulse is one of the vessels under `apps/`, alongside `lumen` (the reference
+Pulse is one of the vessels under `vessels/`, alongside `lumen` (the reference
 GUI vessel) and `facet`. Domain logic does not live in the vessel: sampling
 sits behind the `PulseSource` seam, rendering lives in quartzite's `meter`
 module, and the two only meet on the bus. See

@@ -51,7 +51,7 @@ is the only entry point. It drives the following `unafs` API surface:
 
 ## How it fits into UnaOS
 
-`unafs_bench` is one of the command-line **vessels** under `apps/cli/`
+`unafs_bench` is one of the command-line **vessels** under `tools/`
 (alongside `unafs`, `vertex`, and `sentinel`). It depends only on the `unafs`
 library and is the performance/regression harness for the storage layer rather
 than part of the interactive userspace — it does not use Bandy, Synapse, or

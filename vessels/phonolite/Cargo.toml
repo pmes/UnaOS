@@ -1,5 +1,5 @@
 # =====================================================================
-# CRATE: apps/phonolite/Cargo.toml
+# CRATE: vessels/phonolite/Cargo.toml
 # DESCRIPTION: The Tone Vessel. Resonance given a face: start/stop,
 #              frequency + gain sliders, live level meter.
 # =====================================================================

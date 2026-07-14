@@ -57,12 +57,12 @@ Design-stage: [aether](handlers/aether), [comscan](handlers/comscan),
 [zircon](handlers/zircon), [vug](handlers/vug). The full manifest is in
 [`docs/CODEX.md`](docs/CODEX.md).
 
-**Vessels** ([`apps/`](apps)) — the executables: [lumen](apps/lumen) (the AI
-companion and reference GUI vessel), [facet](apps/facet) (raster graphics),
-[pulse](apps/pulse) (the system monitor — live per-core CPU bars, a BeOS Pulse
+**Vessels** ([`vessels/`](vessels)) — the executables: [lumen](vessels/lumen) (the AI
+companion and reference GUI vessel), [facet](vessels/facet) (raster graphics),
+[pulse](vessels/pulse) (the system monitor — live per-core CPU bars, a BeOS Pulse
 homage, fed through a `PulseSource` seam a kernel telemetry feed will later
 back), `una` (IDE, currently parked), and the CLI tools under
-[`apps/cli/`](apps/cli).
+[`tools/`](tools).
 
 The userspace architecture is documented in
 [`docs/dev/USERLAND/ARCHITECTURE.md`](docs/dev/USERLAND/ARCHITECTURE.md).

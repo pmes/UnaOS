@@ -9,7 +9,7 @@ over the Bandy nervous system: it **publishes** the engine's output level on the
 bus and exposes a **programmatic control surface** for frequency, gain, and
 running-state.
 
-Where `apps/phonolite` gives the engine a *face* (a window and sliders), stria
+Where `vessels/phonolite` gives the engine a *face* (a window and sliders), stria
 gives it a *nerve ending*: a headless, bus-facing service that a generator (a
 shell verb, a UI, an AI) or a test can drive.
 

@@ -69,7 +69,7 @@ and from other handlers.
 ## How it fits into UnaOS
 
 Bandy is the central library that the userspace handlers (`handlers/`) and
-vessels (`apps/`) build on: a vessel wires a Tokio runtime, a `Synapse`, and a
+vessels (`vessels/`) build on: a vessel wires a Tokio runtime, a `Synapse`, and a
 selection of handlers together, and the Quartzite GUI (`libs/quartzite`)
 subscribes to the same bus and routes user input back as `SMessage`s via
 `Spline::bootstrap`. See

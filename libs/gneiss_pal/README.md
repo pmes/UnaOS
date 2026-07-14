@@ -45,7 +45,7 @@ and `utils` modules are always available.
 ## How it fits into UnaOS
 
 `gneiss_pal` is one of the shared libraries in `libs/`. Handlers (domain services
-such as `vein`, `matrix`, `tabula`) and vessels (the runnable apps in `apps/`,
+such as `vein`, `matrix`, `tabula`) and vessels (the runnable vessels in `vessels/`,
 such as `lumen`) depend on it for host services rather than reimplementing them.
 It depends on `bandy` — the inter-component message bus — so that an `AppHandler`
 can consume `SMessage` events and return `DashboardState`. For the full picture
